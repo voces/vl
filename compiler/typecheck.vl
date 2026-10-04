@@ -154,7 +154,7 @@ import {
 } from "./ast"
 // Getter declarations (property-access-design.md §D3a).
 import {
-  fnDeclExported,
+  declExported,
   getDeclExported,
   getDeclLabel,
   getDeclPropOf,
@@ -18387,6 +18387,25 @@ function redunReset() {
   0
 }
 
+// Whether a literal at `ix` takes its type from a declared destination rather than its own parts:
+// any record literal, and a list literal with a `null`, record or list literal element.
+function literalTypedByAnnot(ix: i32) {
+  if P.nodes[ix] is ObjLit { return true }
+  for e in arrayLitElemsOf(ix) {
+    if P.nodes[e] is NullLit || P.nodes[e] is ObjLit || P.nodes[e] is ArrayLit {
+      return true
+    }
+  }
+  false
+}
+
+// The elements of the list literal at `ix`, or none when it is not one.
+function arrayLitElemsOf(ix: i32): i32[] {
+  const nd = P.nodes[ix]
+  if nd is ArrayLit { return nd.arrElems }
+  []
+}
+
 // Record `let <name>: T = init` as redundant when init's own type == the annotation.
 // `declIx` is the LetDecl node (for its name token); `n` carries letName/letInit.
 function recordRedundantAnnot(
@@ -18401,17 +18420,16 @@ function recordRedundantAnnot(
   if isNeverTy(initTy) { return 0 }
   if annot == TY_ERR { return 0 }
   if !tyEq(initTy, annot) { return 0 }
-  // Without its annotation a `const` bound to a string literal holds that literal's type, so a
-  // `string` annotation there is what lets it compare with other strings (D2198).
-  // A `{}` has no type of its own to infer; the annotation is what it completes (D2223).
-  if n.letInit >= 0 {
-    const bin = P.nodes[n.letInit]
-    if bin is ObjLit {
-      if bin.objFields.length == 0 { return 0 }
-    }
-  }
+  // An exported binding's annotation documents the module's API, so it is never redundant (D3597).
+  if declExported(declIx) { return 0 }
+  // A record literal takes the annotation's record type, which can be the nominal type an `is` or
+  // an equality reads, and a list literal holding `null` or a literal of its own takes its element
+  // type from it: the initializer is typed BY the annotation, so the comparison is circular (D3597).
+  if n.letInit >= 0 && literalTypedByAnnot(n.letInit) { return 0 }
   // A call of a function that took this annotation as its result is typed by it, not redundant.
   if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
+  // Without its annotation a `const` bound to a string literal holds that literal's type, so a
+  // `string` annotation there is what lets it compare with other strings (D2198).
   if n.letKw == "const" && n.letInit >= 0 {
     const lin = P.nodes[n.letInit]
     if lin is StrLit { return 0 }
@@ -18494,6 +18512,8 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   if !isClassifiableRetName(rnm) { return 0 }
   // A getter's result type is required, not redundant: the body contract checks against it.
   if getDeclPropOf(n.fnName) != "" { return 0 }
+  // An exported function's return type documents the module's API (D3597).
+  if declExported(fnIx) { return 0 }
   // Skip generic functions: an un-annotated param is a per-call-site hole the inferred-return
   // elaboration does not cover, so a removed string return could mis-lower.
   let gi = 0
@@ -48684,8 +48704,73 @@ function checkCallNode(n: Call, ix: i32) {
     )
     return TY_ERR
   }
+  const shadow = builtinShadowMsg(n.callFn, fnTy)
+  if shadow != "" {
+    tErr(shadow, ix)
+    return TY_ERR
+  }
   tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
   TY_ERR
+}
+
+// The sentence for calling a non-function binding that hides a builtin or a module function of its
+// name, naming the binding and where it is declared; "" when the callee is not such a binding
+// (D3599).
+function builtinShadowMsg(calleeIx: i32, fnTy: i32) {
+  // A literal `const` read is rewritten to its literal, so the name comes from the token.
+  if calleeIx < 0 || calleeIx >= nodeToks.length { return "" }
+  const ctk = nodeToks[calleeIx]
+  if ctk < 0 || ctk >= P.toks.length || P.toks[ctk].kind != "IDENT" {
+    return ""
+  }
+  const raw = P.toks[ctk].text
+  const nm = demangleName(raw)
+  const m = ufcsModOfNode(calleeIx)
+  let hidden = ""
+  const fd = moduleFnDeclOf(raw, m)
+  const lowered = nm == "print"
+    || nm == "Map"
+    || nm == "Set"
+    || nm == "fromCodePoint"
+  if fd >= 0 {
+    hidden = "the function `" + nm + "`" + tokAtSuffix(declNameTokOf(fd))
+  } else if lowered || isNumIntrinsicName(nm) || nameIsEmitterIntrinsic(nm) {
+    hidden = "the builtin `" + nm + "`"
+  }
+  if hidden == "" { return "" }
+  // A module-level binding of a merged compile is scoped under its module's mangled name.
+  let key = raw
+  if lookupDepth(raw) < 0 && m >= 0 { key = raw + "$m" + i32ToStr(m) }
+  let d = constDeclOf(key)
+  if d < 0 { d = recBindDeclOf(calleeIx, key) }
+  let tk = -1
+  if d >= 0 { tk = declNameTokOf(d) }
+  "`"
+    + nm
+    + "` here is the `"
+    + tyToStr(fnTy)
+    + "`"
+    + tokAtSuffix(tk)
+    + ", which shadows "
+    + hidden
+    + "; rename it"
+}
+
+// " declared at L:C" for token `tk`, or "" when it has none.
+function tokAtSuffix(tk: i32) {
+  if tk < 0 || tk >= P.toks.length { return "" }
+  " declared at "
+    + i32ToStr(P.toks[tk].line)
+    + ":"
+    + i32ToStr(P.toks[tk].col + 1)
+}
+
+// The module-level `FuncDecl` named `raw` (or its merged `raw$m<m>`), or -1.
+function moduleFnDeclOf(raw: string, m: i32) {
+  if fnDeclScopes.length == 0 { return -1 }
+  let d = fnDeclScopes[0][raw] ?? -1
+  if d < 0 && m >= 0 { d = fnDeclScopes[0][raw + "$m" + i32ToStr(m)] ?? -1 }
+  d
 }
 
 // `len(x)` with no `len` in scope: refused at the callee with the VL spelling, `x.length`.
@@ -49881,7 +49966,7 @@ function ucNameIsPlain(name: string): boolean {
 function ucIsCandidate(ix: i32): boolean {
   const n = P.nodes[ix]
   if !(n is FuncDecl) { return false }
-  if n.fnRet >= 0 || !ucNameIsPlain(n.fnName) || fnDeclExported(ix) {
+  if n.fnRet >= 0 || !ucNameIsPlain(n.fnName) || declExported(ix) {
     return false
   }
   if n.fnBody < 0 || !(P.nodes[n.fnBody] is Block) { return false }

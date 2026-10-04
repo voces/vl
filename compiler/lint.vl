@@ -55,6 +55,7 @@ import {
   elseIfLink,
   externGlobalLinkOfNode,
   i32ToStr,
+  nodeChildren,
   nodeSpineChildren,
   nodeToks,
   stmtAlwaysExits,
@@ -1695,6 +1696,10 @@ let visReadSeq = 0
 // The stack depth at which the innermost enclosing function's entries begin, or -1
 // outside any function. An entry at or above it belongs to that function.
 let visFnMark = -1
+// The module's top-level functions, by name, each with its name token.
+let lintModFns: {[string]: i32} = Map()
+// The body of the innermost enclosing function, or -1 outside any.
+let visFnBody = -1
 
 // Push one scope entry: `id` is its `declNodes` index, or -1 for a shadowing-only
 // entry. The single writer of the stack and its chain, so the two cannot disagree.
@@ -2071,6 +2076,72 @@ function shadowedLocal(name: string, tok: i32, readMark: i32): i32 {
   1
 }
 
+// Whether `name` is a builtin a call can name: the lowered five and the numeric intrinsics.
+const LINT_BUILTIN_FNS = [
+  "print", "Map", "Set", "fromCodePoint", "fromCodePoints", "sqrt", "abs",
+  "floor", "ceil", "trunc", "nearest", "min", "max", "copysign", "clz", "ctz",
+  "popcnt", "rotl", "rotr",
+]
+function lintBuiltinFnName(name: string) { strListHas(LINT_BUILTIN_FNS, name) }
+
+// Whether the subtree at `root` holds a call of the bare name `name` whose callee token
+// comes before token `before`.
+function lintCallsNameBefore(root: i32, name: string, before: i32) {
+  const work = [root]
+  while work.length > 0 {
+    const ix = work.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const cf = n.callFn
+        if cf >= 0 && cf < P.nodes.length && cf < nodeToks.length {
+          const cn = P.nodes[cf]
+          const ct = nodeToks[cf]
+          if cn is Ident {
+            if cn.identName == name && ct >= 0 && ct < before { return true }
+          }
+        }
+      }
+      for k in nodeChildren(ix) { work.push(k) }
+    }
+  }
+  false
+}
+
+// shadowed-function: warns when a function's binding `name` (token `tok`) hides a function
+// of the module or a builtin that the same function calls above it, since the calls on either
+// side of the binding then mean different things (D3599). A name that already shadows one of
+// the same function is `shadowed-local`'s.
+function shadowedFunction(name: string, tok: i32) {
+  if visFnMark < 0 || tok < 0 { return 0 }
+  if (visHead[name] ?? -1) >= visFnMark { return 0 }
+  if !lintCallsNameBefore(visFnBody, name, tok) { return 0 }
+  const ft = lintModFns[name] ?? -1
+  let what = ""
+  if ft >= 0 {
+    what = "the function `"
+      + name
+      + "` declared at "
+      + i32ToStr(lintTokLine(ft))
+      + ":"
+      + i32ToStr(lintTokCol(ft) + 1)
+  } else if lintBuiltinFnName(name) {
+    what = "the builtin `" + name + "`"
+  }
+  if what == "" { return 0 }
+  lintEmitAtTok(
+    "shadowed-function",
+    "`"
+      + name
+      + "` shadows "
+      + what
+      + ", which this function calls above it; below it the name means the binding, so rename one",
+    "warning",
+    tok,
+  )
+  0
+}
+
 // Scan the initializer (and inert type slot) of the `LetDecl` at `six` without binding
 // its name — the `Program` arm hoists top-level bindings up front, and the sequential
 // arms bind after the initializer, so `let x = x` reads the outer `x`.
@@ -2098,6 +2169,9 @@ function bindScan(ix: i32) {
         const s = P.nodes[six]
         if s is LetDecl {
           bindPush(s.letName, six, 0, -1)
+        } else if s is FuncDecl {
+          const ft = declNameTokOf(six)
+          if ft >= 0 { lintModFns[s.fnName] = ft }
         } else if s is ImportDecl {
           let q = 0
           while q < s.impLocals.length {
@@ -2135,6 +2209,7 @@ function bindScan(ix: i32) {
     // binding — visible until the enclosing scope's trim.
     const readMark = visReadSeq
     bindScanLetInit(ix)
+    shadowedFunction(n.letName, declNameTokOf(ix))
     const shadowed = shadowedLocal(n.letName, declNameTokOf(ix), readMark)
     bindPush(n.letName, ix, 0, -1)
     visShadowed[visNames.length - 1] = shadowed
@@ -2145,7 +2220,9 @@ function bindScan(ix: i32) {
     // `function f(K: i32, b: i32 = K)`'s use to the parameter, which the checker refuses.
     const mark = visNames.length
     const fnMarkSaved = visFnMark
+    const fnBodySaved = visFnBody
     visFnMark = mark
+    visFnBody = n.fnBody
     let pd = 0
     while pd < n.fnParams.length {
       const dix = n.fnParams[pd]
@@ -2162,19 +2239,24 @@ function bindScan(ix: i32) {
       const pix = n.fnParams[p]
       if pix >= 0 && pix < P.nodes.length {
         const pn = P.nodes[pix]
-        if pn is Param { bindPush(pn.parName, pix, 1, -1) }
+        if pn is Param {
+          shadowedFunction(pn.parName, declNameTokOf(pix))
+          bindPush(pn.parName, pix, 1, -1)
+        }
       }
       p = p + 1
     }
     bindScan(n.fnBody)
     bindTrim(mark)
     visFnMark = fnMarkSaved
+    visFnBody = fnBodySaved
   } else if n is ForRange {
     bindScan(n.frFrom)
     bindScan(n.frTo)
     bindScan(n.frStep)
     const mark = visNames.length
     const vTok = declNameTokOf(ix)
+    shadowedFunction(n.frVar, vTok)
     const shadowed = shadowedLocal(n.frVar, vTok, -1)
     visPush(n.frVar, -1, vTok)
     visShadowed[visNames.length - 1] = shadowed
@@ -2184,12 +2266,14 @@ function bindScan(ix: i32) {
     bindScan(n.fiIter)
     const mark = visNames.length
     const vTok = declNameTokOf(ix)
+    shadowedFunction(n.fiVar, vTok)
     const shadowed = shadowedLocal(n.fiVar, vTok, -1)
     visPush(n.fiVar, -1, vTok)
     visShadowed[visNames.length - 1] = shadowed
     if n.fiVar2 != "" {
       let v2Tok = -1
       if vTok >= 0 { v2Tok = vTok + 2 }
+      shadowedFunction(n.fiVar2, v2Tok)
       const shadowed2 = shadowedLocal(n.fiVar2, v2Tok, -1)
       visPush(n.fiVar2, -1, v2Tok)
       visShadowed[visNames.length - 1] = shadowed2
@@ -2235,6 +2319,8 @@ function collectBindingsAndRefs(progRoot: i32) {
   visShadowed = []
   visReadSeq = 0
   visFnMark = -1
+  visFnBody = -1
+  lintModFns = Map()
   lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()
