@@ -474,6 +474,9 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}--shared-memory={r}<pages>
                        Run the program over a SHARED linear memory with that
                        max, as `vl build --shared-memory` would define it
+  {c}--initial-memory={r}<size>, {c}--max-memory={r}<size>
+                       Run the program over a memory of that initial size and
+                       max, as `vl build` would declare it (see `vl help build`)
   {c}{xf}{r} NAME=VALUE
                        The value of the program's `extern let`/`extern const`
                        global NAME; repeat it once per global. i32 and i64
@@ -553,6 +556,18 @@ program verbatim — the only way to pass one that starts with `-`.
                       Every instance may allocate from std:buffer: its
                       pointer lives in the heap's first 8 bytes, so no
                       instance is handed another's Buf. Growth stops at the max
+  {c}--initial-memory={r}<size>
+                      Start the linear memory at <size> (bytes, or with a KiB,
+                      MiB or GiB suffix; a whole number of 64 KiB pages, at
+                      most 4 GiB; default 64 KiB). Growing a memory detaches a
+                      JS host's typed-array views of it, so a std:buffer that
+                      stays under <size> never detaches them. Imported or
+                      defined alike; no effect on a module that touches no
+                      linear memory
+  {c}--max-memory={r}<size> Declare the memory's maximum (same units; at least the
+                      initial size); a Buffer() past it traps. A shared memory
+                      declares its max with --shared-memory=<pages> instead,
+                      and the two flags are refused together
   {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
                       decimal or 0x hex, a nonzero multiple of 8; the first
                       Buf is 8 bytes later under --shared-memory)
@@ -2885,6 +2900,9 @@ struct LinkOpts {
     import_memory: bool,
     /// `--shared-memory=<pages>`: the memory's declared max, which makes it shared.
     shared_pages: Option<i32>,
+    /// `--initial-memory=<size>` / `--max-memory=<size>`, in pages (D3560).
+    initial_pages: Option<i32>,
+    max_pages: Option<i32>,
     /// `(base, limit)`, already validated by `parse_heap_window`.
     heap: Option<(i32, i32)>,
     /// Whether `--heap-base=` was given, rather than defaulted beside a `--heap-limit=`.
@@ -2913,6 +2931,86 @@ fn parse_shared_pages(raw: &str) -> std::result::Result<i32, String> {
 const SHARED_MEMORY_BARE: &str = "`--shared-memory` takes the memory's maximum after `=`: \
      `--shared-memory=<pages>` (a shared memory must declare one)";
 
+/// A wasm page, the unit every memory size is declared in.
+const WASM_PAGE_BYTES: i64 = 65536;
+
+/// `--initial-memory=<size>` / `--max-memory=<size>`'s value: decimal bytes, or with a `KiB`,
+/// `MiB` or `GiB` suffix, naming a whole number of 64 KiB pages in [1, 65536]. Refused rather
+/// than rounded, like every other layout flag; the error names the size to give instead.
+fn parse_memory_size(flag: &str, raw: &str) -> std::result::Result<i32, String> {
+    let (digits, unit) = [("KiB", 1i64 << 10), ("MiB", 1 << 20), ("GiB", 1 << 30)]
+        .iter()
+        .find_map(|&(sfx, u)| raw.strip_suffix(sfx).map(|d| (d, u)))
+        .unwrap_or((raw, 1));
+    let bytes = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse::<i64>().ok())
+        .flatten()
+        .and_then(|n| n.checked_mul(unit));
+    let Some(bytes) = bytes else {
+        let lower = raw.to_ascii_lowercase();
+        let case = ["kib", "mib", "gib"].iter().any(|s| lower.ends_with(s));
+        return Err(format!(
+            "`{flag}={raw}` — expected a size in bytes, or with a KiB, MiB or GiB suffix \
+             (`{flag}=8MiB`){}",
+            if case { "; the suffix is case-sensitive" } else { "" }
+        ));
+    };
+    if bytes > SHARED_PAGES_MAX * WASM_PAGE_BYTES {
+        return Err(format!(
+            "`{flag}={raw}` is past 4 GiB, the most a 32-bit memory can address (VL emits no \
+             memory64)"
+        ));
+    }
+    if bytes == 0 || bytes % WASM_PAGE_BYTES != 0 {
+        let up = (bytes / WASM_PAGE_BYTES + 1) * WASM_PAGE_BYTES;
+        return Err(format!(
+            "`{flag}={raw}` — a memory is a whole number of 64 KiB pages, at least one; \
+             give {up} ({} KiB)",
+            up >> 10
+        ));
+    }
+    Ok((bytes / WASM_PAGE_BYTES) as i32)
+}
+
+/// The sentence for a bare `--initial-memory` / `--max-memory`, shared by `vl build` and `vl run`.
+fn memory_size_bare(flag: &str) -> String {
+    format!("`{flag}` takes its size after `=`: `{flag}=<size>` (bytes, or KiB, MiB, GiB)")
+}
+
+/// The three memory-size flags taken together: `--max-memory` and `--shared-memory` both
+/// declare the max, so they conflict rather than alias; the initial size is at most the max.
+fn memory_sizes_error(link: &LinkOpts) -> Option<String> {
+    if link.max_pages.is_some() && link.shared_pages.is_some() {
+        return Some(
+            "`--max-memory=` and `--shared-memory=` both declare the memory's maximum — give \
+             one: a shared memory's max is `--shared-memory=<pages>`"
+                .to_string(),
+        );
+    }
+    let max = link.max_pages
+        .map(|m| (m, "--max-memory="))
+        .or(link.shared_pages.map(|m| (m, "--shared-memory=")));
+    // A heap that starts at or past the max cannot hand out a single `Buf`.
+    if let (Some((base, _)), Some((max, flag))) = (link.heap, max) {
+        if base as i64 >= max as i64 * WASM_PAGE_BYTES {
+            return Some(format!(
+                "`--heap-base={base:#x}` lies at or past the memory's maximum ({flag}, {max} \
+                 pages = {:#x} bytes) — every Buffer() would trap; lower the base or raise the max",
+                max as i64 * WASM_PAGE_BYTES
+            ));
+        }
+    }
+    let (Some(initial), Some((max, flag))) = (link.initial_pages, max) else {
+        return None;
+    };
+    (initial > max).then(|| {
+        format!(
+            "`--initial-memory=` ({initial} pages) is above `{flag}` ({max} pages) — a memory \
+             cannot start larger than its maximum"
+        )
+    })
+}
+
 /// The refusal for a link flag the seed has no setter for.
 fn stale_seed_for(flag: &str, export: &str) -> Error {
     Error::msg(format!(
@@ -2933,6 +3031,8 @@ const HEAP_LIMIT_DEFAULT: i64 = (i32::MAX as i64) & !7;
 fn parse_link_opts(args: &[String]) -> LinkOpts {
     let mut import_memory = false;
     let mut shared_pages: Option<i32> = None;
+    let mut initial_pages: Option<i32> = None;
+    let mut max_pages: Option<i32> = None;
     let mut base: Option<i64> = None;
     let mut limit: Option<i64> = None;
     let parse = |name: &str, raw: &str| -> i64 {
@@ -2969,6 +3069,17 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             shared_pages = Some(parse_shared_pages(v).unwrap_or_else(|m| usage_exit(&m)));
         } else if a == "--shared-memory" {
             usage_exit(SHARED_MEMORY_BARE);
+        } else if let Some((flag, v, slot)) = a
+            .strip_prefix("--initial-memory=")
+            .map(|v| ("--initial-memory", v, &mut initial_pages))
+            .or_else(|| a.strip_prefix("--max-memory=").map(|v| ("--max-memory", v, &mut max_pages)))
+        {
+            if slot.is_some() {
+                usage_exit(&format!("`{flag}=` is given twice — give it once"));
+            }
+            *slot = Some(parse_memory_size(flag, v).unwrap_or_else(|m| usage_exit(&m)));
+        } else if a == "--initial-memory" || a == "--max-memory" {
+            usage_exit(&memory_size_bare(a));
         } else if let Some(v) = a.strip_prefix("--heap-base=") {
             once(&base, "--heap-base");
             base = Some(parse("--heap-base", v));
@@ -2977,21 +3088,30 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             limit = Some(parse("--heap-limit", v));
         } else if a == "--heap-base" || a == "--heap-limit" {
             usage_exit(&format!("`{a}` takes its value after `=`: `{a}=<addr>`"));
-        } else if a.starts_with("--heap") || a.starts_with("--import") || a.starts_with("--shared")
+        } else if ["--heap", "--import", "--shared", "--initial", "--max-mem"]
+            .iter()
+            .any(|p| a.starts_with(p))
         {
             usage_exit(&format!(
                 "unknown layout flag `{a}` — the layout flags are `--import-memory`, \
-                 `--shared-memory=<pages>`, `--heap-base=<addr>` and `--heap-limit=<addr>`"
+                 `--shared-memory=<pages>`, `--initial-memory=<size>`, `--max-memory=<size>`, \
+                 `--heap-base=<addr>` and `--heap-limit=<addr>`"
             ));
         }
     }
-    LinkOpts {
+    let link = LinkOpts {
         import_memory,
         shared_pages,
+        initial_pages,
+        max_pages,
         heap: heap_window(base, limit),
         heap_base_given: base.is_some(),
         low_memory: None,
+    };
+    if let Some(m) = memory_sizes_error(&link) {
+        usage_exit(&m);
     }
+    link
 }
 
 /// Validates a window from the two optional ends, or `None` when neither is given.
@@ -3348,6 +3468,17 @@ fn compile_vl_instance(
             .map_err(|_| stale_seed_for("--shared-memory", "setSharedMemory"))?;
         if set.call(&mut store, pages)? != 0 {
             bail!("the compiler refused a shared memory of {pages} pages");
+        }
+    }
+    // `--initial-memory=` / `--max-memory=`: refused on an old seed for the same reason — a
+    // module that started at one page would grow, and detach the host's views, after all.
+    if link.initial_pages.is_some() || link.max_pages.is_some() {
+        let (initial, max) = (link.initial_pages.unwrap_or(1), link.max_pages.unwrap_or(0));
+        let set = inst
+            .get_typed_func::<(i32, i32), i32>(&mut store, "setMemoryPages")
+            .map_err(|_| stale_seed_for("--initial-memory / --max-memory", "setMemoryPages"))?;
+        if set.call(&mut store, (initial, max))? != 0 {
+            bail!("the compiler refused a memory of {initial} initial and {max} max pages");
         }
     }
     // `--heap-base=` / `--heap-limit=`: refused on an old seed for the same reason — a
@@ -6572,7 +6703,8 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
     }
     eprintln!(
         "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
---color=<when>, {EXTERN_FLAG} NAME=VALUE, -O/-O3, --names, --wat, --no-validate."
+--color=<when>, {EXTERN_FLAG} NAME=VALUE, --shared-memory=<pages>, --initial-memory=<size>, \
+--max-memory=<size>, -O/-O3, --names, --wat, --no-validate."
     );
     eprintln!("note: `vl help run` shows the full flag list.");
     std::process::exit(2);
@@ -6648,6 +6780,21 @@ fn run_cmd(args: &[String]) -> Result<()> {
                     Some(parse_shared_pages(raw).unwrap_or_else(|m| arg_error(&m, None)));
             }
             "--shared-memory" => arg_error(SHARED_MEMORY_BARE, None),
+            // The memory's sizes shape the module like `--shared-memory` does, so `vl run`
+            // takes them too.
+            a if a.starts_with("--initial-memory=") || a.starts_with("--max-memory=") => {
+                let (flag, raw) = a.split_once('=').unwrap_or((a, ""));
+                let slot = if flag == "--initial-memory" {
+                    &mut link.initial_pages
+                } else {
+                    &mut link.max_pages
+                };
+                if slot.is_some() {
+                    arg_error(&format!("`{flag}=` is given twice — give it once"), None);
+                }
+                *slot = Some(parse_memory_size(flag, raw).unwrap_or_else(|m| arg_error(&m, None)));
+            }
+            "--initial-memory" | "--max-memory" => arg_error(&memory_size_bare(&host[i]), None),
             // `--extern NAME=VALUE`, repeatable: the value an `extern let`/`extern const`
             // global starts with. Its type is the declaration's, so the value stays text until
             // the module is loaded (`register_extern_imports`).
@@ -6691,6 +6838,9 @@ fn run_cmd(args: &[String]) -> Result<()> {
         }
         i += 1;
     }
+    if let Some(m) = memory_sizes_error(&link) {
+        arg_error(&m, None);
+    }
     // The file/argument split, once every positional is known. Program arguments are
     // the positionals that are not the source file, then everything after `--`
     // verbatim — in that order, so `vl run p.vl a -- b` is `a`, `b`.
@@ -6732,10 +6882,15 @@ fn run_cmd(args: &[String]) -> Result<()> {
                 .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
             if raw.starts_with(b"\0asm") {
                 // A prebuilt module's memory type was fixed when it was built.
-                if link.shared_pages.is_some() {
+                let shaping = [
+                    (link.shared_pages, "--shared-memory"),
+                    (link.initial_pages, "--initial-memory"),
+                    (link.max_pages, "--max-memory"),
+                ];
+                if let Some((_, flag)) = shaping.iter().find(|(p, _)| p.is_some()) {
                     arg_error(
                         &format!(
-                            "`--shared-memory` shapes the module `vl run` compiles, and `{f}` is \
+                            "`{flag}` shapes the module `vl run` compiles, and `{f}` is \
                              already built — its memory is whatever `vl build` declared"
                         ),
                         None,
