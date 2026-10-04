@@ -93,11 +93,11 @@ function is silently dead. The dunder spelling makes that unlikely rather than i
 
 ## What is deliberately absent
 
-`sin`, `cos`, `atan2`, `pow`, `exp` and every other transcendental. **No wasm opcode computes one**,
-so any implementation is a library whose last bit is a policy choice — and a program that must match
-another implementation exactly has to own that choice itself. Providing one would not save such a
-program work; it would give it a trap to avoid. A future `std:math` for other users is a separate
-question and nothing here forecloses it.
+`sin`, `cos`, `atan2`, `pow`, `exp` and every other transcendental, **as an intrinsic**. No wasm
+opcode computes one, so any implementation is a library whose last bit is a policy choice, and the
+compiler does not make it. The library is `std:math` (`docs/internals/std-math-design.md`): pure VL
+over these opcodes, the same bits on every host, with a published ulp bound per function. A program
+that must match some other implementation exactly still owns that choice itself.
 
 ## Where the code is
 
