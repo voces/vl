@@ -217,7 +217,7 @@ impl Palette {
 }
 
 /// The subcommands `vl` knows, for existence checks and did-you-mean.
-const COMMANDS: &[&str] = &["run", "build", "check", "fmt", "test", "seed", "std", "help"];
+const COMMANDS: &[&str] = &["run", "build", "check", "fmt", "test", "addr2line", "seed", "std", "help"];
 
 /// The flags of `cmd` that TAKE A VALUE, so a help scan never mistakes a flag's
 /// value for `--help` (`vl run -e --help` compiles the snippet `--help`).
@@ -404,6 +404,8 @@ vl — the VL toolchain: compile, run, check, format and test VL programs
              {d}vl fmt -w main.vl  |  vl fmt --check src/{r}
   {c}test{r}     Discover *.test.vl files and run them in parallel
              {d}vl test  |  vl test src/ -t parser{r}
+  {c}addr2line{r} Map a trap's wasm byte offset back to the source line
+             {d}vl addr2line app.wasm 0x12a  |  node app.mjs 2>&1 | vl addr2line app.wasm -{r}
 
 {b}Toolchain:{r}
   {c}seed{r}     Write the resolved compiler seed (raw wasm bytes) to stdout
@@ -474,6 +476,9 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}--shared-memory={r}<pages>
                        Run the program over a SHARED linear memory with that
                        max, as `vl build --shared-memory` would define it
+  {c}--initial-memory={r}<size>, {c}--max-memory={r}<size>
+                       Run the program over a memory of that initial size and
+                       max, as `vl build` would declare it (see `vl help build`)
   {c}{xf}{r} NAME=VALUE
                        The value of the program's `extern let`/`extern const`
                        global NAME; repeat it once per global. i32 and i64
@@ -553,6 +558,18 @@ program verbatim — the only way to pass one that starts with `-`.
                       Every instance may allocate from std:buffer: its
                       pointer lives in the heap's first 8 bytes, so no
                       instance is handed another's Buf. Growth stops at the max
+  {c}--initial-memory={r}<size>
+                      Start the linear memory at <size> (bytes, or with a KiB,
+                      MiB or GiB suffix; a whole number of 64 KiB pages, at
+                      most 4 GiB; default 64 KiB). Growing a memory detaches a
+                      JS host's typed-array views of it, so a std:buffer that
+                      stays under <size> never detaches them. Imported or
+                      defined alike; no effect on a module that touches no
+                      linear memory
+  {c}--max-memory={r}<size> Declare the memory's maximum (same units; at least the
+                      initial size); a Buffer() past it traps. A shared memory
+                      declares its max with --shared-memory=<pages> instead,
+                      and the two flags are refused together
   {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
                       decimal or 0x hex, a nonzero multiple of 8; the first
                       Buf is 8 bytes later under --shared-memory)
@@ -560,6 +577,10 @@ program verbatim — the only way to pass one that starts with `-`.
                       TRAPS rather than growing into memory the host owns
                       (default 2 GiB). Bytes
                       outside [base, limit) are never touched by VL itself
+  {c}--source-map{r}        Also write <out>.map, a source map from module byte offsets
+                      to source lines that survives -O/-O3, and name it in a
+                      sourceMappingURL section (browser DevTools follow it).
+                      `vl addr2line` reads it to turn a trap's offset into a line
   {c}--wat{r}               Also write a .wat disassembly beside the module
                       (binaryen's wasm-dis; skipped with a note when absent)
   {c}--no-validate{r}       Skip validating the written module
@@ -687,6 +708,33 @@ tests continue in a fresh instance.
 {b}Examples:{r}
   vl test
   vl test src/ -t parser --jobs 4
+"
+        ),
+        // Parser of record: `addr2line_cmd` below.
+        "addr2line" => print!(
+            "\
+{c}vl addr2line{r} — map a wasm byte offset back to the VL source line
+
+{b}Usage:{r} vl addr2line <module.wasm> <location>...
+       ... 2>&1 | vl addr2line <module.wasm> -   {d}annotate a pasted stack trace{r}
+
+A location is a MODULE byte offset, as a trap prints it: `0x12a`, `298`, or a
+V8/Node/Deno frame's `wasm-function[0]:0x12a`. Each one prints
+`file.vl:line:col  in `function`` (the function when the module carries names),
+the line of the trapping instruction rather than the function's first line. An
+offset in no function body prints `??`.
+
+The positions come from, in order: the map the module's sourceMappingURL
+section names, `<module.wasm>.map` beside it (both written by
+`vl build --source-map`, with or without -O/-O3), then the module's own
+`vl-src` section (a `--names` build without -O/-O3).
+
+{b}Exit:{r} 0 every location resolved; 1 a location has no source position, or the
+      module carries none; 2 usage.
+
+{b}Examples:{r}
+  vl build app.vl -O3 --names --source-map
+  vl addr2line app.wasm 'wasm-function[0]:0x5a'    {d}app.vl:5:3  in `pick`{r}
 "
         ),
         // Parser of record: `seed_cmd` below. stdout here is a BYTE CONTRACT —
@@ -2885,6 +2933,9 @@ struct LinkOpts {
     import_memory: bool,
     /// `--shared-memory=<pages>`: the memory's declared max, which makes it shared.
     shared_pages: Option<i32>,
+    /// `--initial-memory=<size>` / `--max-memory=<size>`, in pages (D3560).
+    initial_pages: Option<i32>,
+    max_pages: Option<i32>,
     /// `(base, limit)`, already validated by `parse_heap_window`.
     heap: Option<(i32, i32)>,
     /// Whether `--heap-base=` was given, rather than defaulted beside a `--heap-limit=`.
@@ -2913,6 +2964,86 @@ fn parse_shared_pages(raw: &str) -> std::result::Result<i32, String> {
 const SHARED_MEMORY_BARE: &str = "`--shared-memory` takes the memory's maximum after `=`: \
      `--shared-memory=<pages>` (a shared memory must declare one)";
 
+/// A wasm page, the unit every memory size is declared in.
+const WASM_PAGE_BYTES: i64 = 65536;
+
+/// `--initial-memory=<size>` / `--max-memory=<size>`'s value: decimal bytes, or with a `KiB`,
+/// `MiB` or `GiB` suffix, naming a whole number of 64 KiB pages in [1, 65536]. Refused rather
+/// than rounded, like every other layout flag; the error names the size to give instead.
+fn parse_memory_size(flag: &str, raw: &str) -> std::result::Result<i32, String> {
+    let (digits, unit) = [("KiB", 1i64 << 10), ("MiB", 1 << 20), ("GiB", 1 << 30)]
+        .iter()
+        .find_map(|&(sfx, u)| raw.strip_suffix(sfx).map(|d| (d, u)))
+        .unwrap_or((raw, 1));
+    let bytes = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse::<i64>().ok())
+        .flatten()
+        .and_then(|n| n.checked_mul(unit));
+    let Some(bytes) = bytes else {
+        let lower = raw.to_ascii_lowercase();
+        let case = ["kib", "mib", "gib"].iter().any(|s| lower.ends_with(s));
+        return Err(format!(
+            "`{flag}={raw}` — expected a size in bytes, or with a KiB, MiB or GiB suffix \
+             (`{flag}=8MiB`){}",
+            if case { "; the suffix is case-sensitive" } else { "" }
+        ));
+    };
+    if bytes > SHARED_PAGES_MAX * WASM_PAGE_BYTES {
+        return Err(format!(
+            "`{flag}={raw}` is past 4 GiB, the most a 32-bit memory can address (VL emits no \
+             memory64)"
+        ));
+    }
+    if bytes == 0 || bytes % WASM_PAGE_BYTES != 0 {
+        let up = (bytes / WASM_PAGE_BYTES + 1) * WASM_PAGE_BYTES;
+        return Err(format!(
+            "`{flag}={raw}` — a memory is a whole number of 64 KiB pages, at least one; \
+             give {up} ({} KiB)",
+            up >> 10
+        ));
+    }
+    Ok((bytes / WASM_PAGE_BYTES) as i32)
+}
+
+/// The sentence for a bare `--initial-memory` / `--max-memory`, shared by `vl build` and `vl run`.
+fn memory_size_bare(flag: &str) -> String {
+    format!("`{flag}` takes its size after `=`: `{flag}=<size>` (bytes, or KiB, MiB, GiB)")
+}
+
+/// The three memory-size flags taken together: `--max-memory` and `--shared-memory` both
+/// declare the max, so they conflict rather than alias; the initial size is at most the max.
+fn memory_sizes_error(link: &LinkOpts) -> Option<String> {
+    if link.max_pages.is_some() && link.shared_pages.is_some() {
+        return Some(
+            "`--max-memory=` and `--shared-memory=` both declare the memory's maximum — give \
+             one: a shared memory's max is `--shared-memory=<pages>`"
+                .to_string(),
+        );
+    }
+    let max = link.max_pages
+        .map(|m| (m, "--max-memory="))
+        .or(link.shared_pages.map(|m| (m, "--shared-memory=")));
+    // A heap that starts at or past the max cannot hand out a single `Buf`.
+    if let (Some((base, _)), Some((max, flag))) = (link.heap, max) {
+        if base as i64 >= max as i64 * WASM_PAGE_BYTES {
+            return Some(format!(
+                "`--heap-base={base:#x}` lies at or past the memory's maximum ({flag}, {max} \
+                 pages = {:#x} bytes) — every Buffer() would trap; lower the base or raise the max",
+                max as i64 * WASM_PAGE_BYTES
+            ));
+        }
+    }
+    let (Some(initial), Some((max, flag))) = (link.initial_pages, max) else {
+        return None;
+    };
+    (initial > max).then(|| {
+        format!(
+            "`--initial-memory=` ({initial} pages) is above `{flag}` ({max} pages) — a memory \
+             cannot start larger than its maximum"
+        )
+    })
+}
+
 /// The refusal for a link flag the seed has no setter for.
 fn stale_seed_for(flag: &str, export: &str) -> Error {
     Error::msg(format!(
@@ -2933,6 +3064,8 @@ const HEAP_LIMIT_DEFAULT: i64 = (i32::MAX as i64) & !7;
 fn parse_link_opts(args: &[String]) -> LinkOpts {
     let mut import_memory = false;
     let mut shared_pages: Option<i32> = None;
+    let mut initial_pages: Option<i32> = None;
+    let mut max_pages: Option<i32> = None;
     let mut base: Option<i64> = None;
     let mut limit: Option<i64> = None;
     let parse = |name: &str, raw: &str| -> i64 {
@@ -2969,6 +3102,17 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             shared_pages = Some(parse_shared_pages(v).unwrap_or_else(|m| usage_exit(&m)));
         } else if a == "--shared-memory" {
             usage_exit(SHARED_MEMORY_BARE);
+        } else if let Some((flag, v, slot)) = a
+            .strip_prefix("--initial-memory=")
+            .map(|v| ("--initial-memory", v, &mut initial_pages))
+            .or_else(|| a.strip_prefix("--max-memory=").map(|v| ("--max-memory", v, &mut max_pages)))
+        {
+            if slot.is_some() {
+                usage_exit(&format!("`{flag}=` is given twice — give it once"));
+            }
+            *slot = Some(parse_memory_size(flag, v).unwrap_or_else(|m| usage_exit(&m)));
+        } else if a == "--initial-memory" || a == "--max-memory" {
+            usage_exit(&memory_size_bare(a));
         } else if let Some(v) = a.strip_prefix("--heap-base=") {
             once(&base, "--heap-base");
             base = Some(parse("--heap-base", v));
@@ -2977,21 +3121,30 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             limit = Some(parse("--heap-limit", v));
         } else if a == "--heap-base" || a == "--heap-limit" {
             usage_exit(&format!("`{a}` takes its value after `=`: `{a}=<addr>`"));
-        } else if a.starts_with("--heap") || a.starts_with("--import") || a.starts_with("--shared")
+        } else if ["--heap", "--import", "--shared", "--initial", "--max-mem"]
+            .iter()
+            .any(|p| a.starts_with(p))
         {
             usage_exit(&format!(
                 "unknown layout flag `{a}` — the layout flags are `--import-memory`, \
-                 `--shared-memory=<pages>`, `--heap-base=<addr>` and `--heap-limit=<addr>`"
+                 `--shared-memory=<pages>`, `--initial-memory=<size>`, `--max-memory=<size>`, \
+                 `--heap-base=<addr>` and `--heap-limit=<addr>`"
             ));
         }
     }
-    LinkOpts {
+    let link = LinkOpts {
         import_memory,
         shared_pages,
+        initial_pages,
+        max_pages,
         heap: heap_window(base, limit),
         heap_base_given: base.is_some(),
         low_memory: None,
+    };
+    if let Some(m) = memory_sizes_error(&link) {
+        usage_exit(&m);
     }
+    link
 }
 
 /// Validates a window from the two optional ends, or `None` when neither is given.
@@ -3348,6 +3501,17 @@ fn compile_vl_instance(
             .map_err(|_| stale_seed_for("--shared-memory", "setSharedMemory"))?;
         if set.call(&mut store, pages)? != 0 {
             bail!("the compiler refused a shared memory of {pages} pages");
+        }
+    }
+    // `--initial-memory=` / `--max-memory=`: refused on an old seed for the same reason — a
+    // module that started at one page would grow, and detach the host's views, after all.
+    if link.initial_pages.is_some() || link.max_pages.is_some() {
+        let (initial, max) = (link.initial_pages.unwrap_or(1), link.max_pages.unwrap_or(0));
+        let set = inst
+            .get_typed_func::<(i32, i32), i32>(&mut store, "setMemoryPages")
+            .map_err(|_| stale_seed_for("--initial-memory / --max-memory", "setMemoryPages"))?;
+        if set.call(&mut store, (initial, max))? != 0 {
+            bail!("the compiler refused a memory of {initial} initial and {max} max pages");
         }
     }
     // `--heap-base=` / `--heap-limit=`: refused on an old seed for the same reason — a
@@ -6280,11 +6444,13 @@ fn rename_functions(
 /// The escape step on the module at `path` (holding `bytes`): name the chosen callees apart
 /// from everything else, inline them in one `wasm-opt` run, then give every function back the
 /// name it had, or none. Answers the rewritten bytes (also left at `path`), or `None` when no
-/// callee is chosen and the module is untouched.
+/// callee is chosen and the module is untouched. A `--source-map` build's map at `map` is
+/// carried through the run; the renames touch only the name section, after the code.
 fn escape_inline_step(
     path: &str,
     flag: &str,
     bytes: &[u8],
+    map: Option<&str>,
 ) -> Result<Option<Vec<u8>>> {
     let Some(scan) = ModuleScan::parse(bytes) else {
         return Ok(None);
@@ -6306,7 +6472,7 @@ fn escape_inline_step(
         return Ok(None);
     };
     std::fs::write(path, &named)?;
-    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[])?;
+    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[], map)?;
     let stepped = std::fs::read(path)
         .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
     // Inlining removes functions, so the step's output numbers them anew; the prefixed names
@@ -6343,6 +6509,9 @@ fn escape_inline_step(
             "{flag}: the escape step wrote a module it cannot read"
         ))
     })?;
+    if map.is_some() && code_section_start(&stepped) != code_section_start(&restored) {
+        bail!("{flag}: restoring the escape step's names moved the code its source map describes");
+    }
     std::fs::write(path, &restored)?;
     // `$VL_OPT_ESCAPE_DUMP=<file>`: a copy of the step's output, for tests and diagnosis — the
     // rung overwrites `path` next. Undocumented in `vl help build`: a measurement facility.
@@ -6369,11 +6538,15 @@ const BINARYEN_CORES_DEFAULT: usize = 4;
 /// tests carry hand-written guards that exist only to detect this. A plain
 /// `vl build` never calls this function, so a toolchain without binaryen keeps
 /// working for every build that did not ask to be optimized.
+///
+/// `map`, when given, is the module's source map: binaryen reads it and writes it back
+/// rewritten for the module it writes (`--source-map`, D3561).
 fn optimize_in_place(
     path: &str,
     flag: &str,
     passes: &[&str],
     no_inline: &[String],
+    map: Option<&str>,
 ) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
@@ -6397,6 +6570,9 @@ fn optimize_in_place(
     argv.extend(marks.iter().map(String::as_str));
     argv.extend_from_slice(passes);
     argv.extend_from_slice(BINARYEN_FEATURES);
+    if let Some(m) = map {
+        argv.extend_from_slice(&["--input-source-map", m, "--output-source-map", m]);
+    }
     argv.extend_from_slice(&["-o", path]);
     let mut cmd = std::process::Command::new(&opt);
     cmd.args(&argv);
@@ -6572,7 +6748,8 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
     }
     eprintln!(
         "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
---color=<when>, {EXTERN_FLAG} NAME=VALUE, -O/-O3, --names, --wat, --no-validate."
+--color=<when>, {EXTERN_FLAG} NAME=VALUE, --shared-memory=<pages>, --initial-memory=<size>, \
+--max-memory=<size>, -O/-O3, --names, --wat, --no-validate."
     );
     eprintln!("note: `vl help run` shows the full flag list.");
     std::process::exit(2);
@@ -6648,6 +6825,21 @@ fn run_cmd(args: &[String]) -> Result<()> {
                     Some(parse_shared_pages(raw).unwrap_or_else(|m| arg_error(&m, None)));
             }
             "--shared-memory" => arg_error(SHARED_MEMORY_BARE, None),
+            // The memory's sizes shape the module like `--shared-memory` does, so `vl run`
+            // takes them too.
+            a if a.starts_with("--initial-memory=") || a.starts_with("--max-memory=") => {
+                let (flag, raw) = a.split_once('=').unwrap_or((a, ""));
+                let slot = if flag == "--initial-memory" {
+                    &mut link.initial_pages
+                } else {
+                    &mut link.max_pages
+                };
+                if slot.is_some() {
+                    arg_error(&format!("`{flag}=` is given twice — give it once"), None);
+                }
+                *slot = Some(parse_memory_size(flag, raw).unwrap_or_else(|m| arg_error(&m, None)));
+            }
+            "--initial-memory" | "--max-memory" => arg_error(&memory_size_bare(&host[i]), None),
             // `--extern NAME=VALUE`, repeatable: the value an `extern let`/`extern const`
             // global starts with. Its type is the declaration's, so the value stays text until
             // the module is loaded (`register_extern_imports`).
@@ -6691,6 +6883,9 @@ fn run_cmd(args: &[String]) -> Result<()> {
         }
         i += 1;
     }
+    if let Some(m) = memory_sizes_error(&link) {
+        arg_error(&m, None);
+    }
     // The file/argument split, once every positional is known. Program arguments are
     // the positionals that are not the source file, then everything after `--`
     // verbatim — in that order, so `vl run p.vl a -- b` is `a`, `b`.
@@ -6732,10 +6927,15 @@ fn run_cmd(args: &[String]) -> Result<()> {
                 .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
             if raw.starts_with(b"\0asm") {
                 // A prebuilt module's memory type was fixed when it was built.
-                if link.shared_pages.is_some() {
+                let shaping = [
+                    (link.shared_pages, "--shared-memory"),
+                    (link.initial_pages, "--initial-memory"),
+                    (link.max_pages, "--max-memory"),
+                ];
+                if let Some((_, flag)) = shaping.iter().find(|(p, _)| p.is_some()) {
                     arg_error(
                         &format!(
-                            "`--shared-memory` shapes the module `vl run` compiles, and `{f}` is \
+                            "`{flag}` shapes the module `vl run` compiles, and `{f}` is \
                              already built — its memory is whatever `vl build` declared"
                         ),
                         None,
@@ -8143,6 +8343,590 @@ fn source_frames(err: &Error) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+// ── `--source-map`: the `vl-src` rows as a wasm source map, through binaryen ─────────
+//
+// The `vl-src` rows describe the EMITTER's bytes, which `-O`/`-O3` rewrite (DECISIONS.md,
+// "`vl build --names -O` keeps function names"). A standard source map (v3, the wasm
+// convention: one generated line, each segment's column a MODULE byte offset) is what binaryen
+// can carry through its own rewrite with `--input-source-map`/`--output-source-map`, what
+// DevTools reads off a `sourceMappingURL` section, and what `vl addr2line` reads offline — so
+// the build writes one, and every `wasm-opt` run threads it (D3561).
+
+/// A wasm source map's content, as the positions in force from each byte offset on: `(offset,
+/// Some((source index, 0-based line, 0-based column)))`, or `None` from an offset that has no
+/// source position. Sorted by offset; a lookup takes the last entry at or before its offset.
+type SrcTransitions = Vec<(u32, Option<(u32, u32, u32)>)>;
+
+/// The `vl-src` rows flattened to transitions. Rows NEST (a statement inside its body), so
+/// at each boundary the narrowest row containing it wins, as `SrcMap::locate` decides.
+fn src_transitions(map: &SrcMap) -> SrcTransitions {
+    let mut rows: Vec<&(u32, u32, u32, u32, u32)> =
+        map.rows.iter().filter(|r| r.2 != 0 && r.0 < r.1).collect();
+    // Wider first at one start, so the narrowest row is pushed last and sits on top.
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let mut bounds: Vec<u32> = rows.iter().flat_map(|r| [r.0, r.1]).collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut out: SrcTransitions = Vec::new();
+    let mut stack: Vec<&(u32, u32, u32, u32, u32)> = Vec::new();
+    let mut next = 0usize;
+    for p in bounds {
+        while next < rows.len() && rows[next].0 == p {
+            stack.push(rows[next]);
+            next += 1;
+        }
+        // The top row containing `p`; rows that ended are dropped as they surface.
+        while stack.last().is_some_and(|r| r.1 <= p) {
+            stack.pop();
+        }
+        let here = stack.iter().rev().find(|r| r.1 > p).map(|r| (r.4, r.2 - 1, r.3));
+        if out.last().map(|e| e.1) != Some(here) {
+            out.push((p, here));
+        }
+    }
+    out
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn put_vlq(out: &mut String, n: i64) {
+    let mut v = if n < 0 { ((-n) << 1) | 1 } else { n << 1 } as u64;
+    loop {
+        let mut digit = (v & 31) as usize;
+        v >>= 5;
+        if v != 0 {
+            digit |= 32;
+        }
+        out.push(BASE64[digit] as char);
+        if v == 0 {
+            return;
+        }
+    }
+}
+
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// The source map v3 JSON for `trans` over `sources`. A transition to no position is a
+/// one-field segment, which binaryen reads as "no location from here".
+fn source_map_json(sources: &[String], trans: &SrcTransitions) -> String {
+    let mut mappings = String::new();
+    let (mut off, mut src, mut line, mut col) = (0i64, 0i64, 0i64, 0i64);
+    for (i, (at, pos)) in trans.iter().enumerate() {
+        if i > 0 {
+            mappings.push(',');
+        }
+        put_vlq(&mut mappings, *at as i64 - off);
+        off = *at as i64;
+        if let Some((s, l, c)) = pos {
+            put_vlq(&mut mappings, *s as i64 - src);
+            put_vlq(&mut mappings, *l as i64 - line);
+            put_vlq(&mut mappings, *c as i64 - col);
+            (src, line, col) = (*s as i64, *l as i64, *c as i64);
+        }
+    }
+    let mut out = String::from("{\"version\":3,\"sources\":[");
+    for (i, s) in sources.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_string(&mut out, s);
+    }
+    out.push_str("],\"names\":[],\"mappings\":");
+    json_string(&mut out, &mappings);
+    out.push_str("}\n");
+    out
+}
+
+/// A source map read back: its sources (with `sourceRoot` prefixed) and its transitions.
+struct ReadSourceMap {
+    sources: Vec<String>,
+    trans: SrcTransitions,
+}
+
+/// The JSON subset a source map is: one object whose values this skips or reads. `None` on
+/// anything malformed — the caller then says the map could not be read.
+struct JsonCursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl JsonCursor<'_> {
+    fn ws(&mut self) {
+        while self.b.get(self.i).is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.ws();
+        if self.b.get(self.i) == Some(&c) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn string(&mut self) -> Option<String> {
+        if !self.eat(b'"') {
+            return None;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let c = *self.b.get(self.i)?;
+            self.i += 1;
+            match c {
+                b'"' => return String::from_utf8(out).ok(),
+                b'\\' => {
+                    let e = *self.b.get(self.i)?;
+                    self.i += 1;
+                    let ch = match e {
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'u' => {
+                            let hex = std::str::from_utf8(self.b.get(self.i..self.i + 4)?).ok()?;
+                            self.i += 4;
+                            char::from_u32(u32::from_str_radix(hex, 16).ok()?).unwrap_or('\u{fffd}')
+                        }
+                        other => other as char,
+                    };
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+    /// Skip one value of any kind.
+    fn skip(&mut self) -> Option<()> {
+        self.ws();
+        match *self.b.get(self.i)? {
+            b'"' => self.string().map(|_| ()),
+            open @ (b'[' | b'{') => {
+                let close = if open == b'[' { b']' } else { b'}' };
+                self.i += 1;
+                if self.eat(close) {
+                    return Some(());
+                }
+                loop {
+                    if open == b'{' {
+                        self.string()?;
+                        if !self.eat(b':') {
+                            return None;
+                        }
+                    }
+                    self.skip()?;
+                    if self.eat(close) {
+                        return Some(());
+                    }
+                    if !self.eat(b',') {
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                let start = self.i;
+                while self
+                    .b
+                    .get(self.i)
+                    .is_some_and(|c| !matches!(c, b',' | b']' | b'}') && !c.is_ascii_whitespace())
+                {
+                    self.i += 1;
+                }
+                (self.i > start).then_some(())
+            }
+        }
+    }
+}
+
+fn vlq_digit(c: u8) -> Option<u32> {
+    BASE64.iter().position(|&d| d == c).map(|p| p as u32)
+}
+
+fn parse_source_map(text: &str) -> Option<ReadSourceMap> {
+    let mut j = JsonCursor { b: text.as_bytes(), i: 0 };
+    if !j.eat(b'{') {
+        return None;
+    }
+    let (mut sources, mut root, mut mappings) = (Vec::new(), String::new(), String::new());
+    if !j.eat(b'}') {
+        loop {
+            let key = j.string()?;
+            if !j.eat(b':') {
+                return None;
+            }
+            match key.as_str() {
+                "sources" => {
+                    if !j.eat(b'[') {
+                        return None;
+                    }
+                    if !j.eat(b']') {
+                        loop {
+                            // A `null` source is legal JSON and names nothing.
+                            j.ws();
+                            if j.b.get(j.i) == Some(&b'"') {
+                                sources.push(j.string()?);
+                            } else {
+                                j.skip()?;
+                                sources.push(String::new());
+                            }
+                            if j.eat(b']') {
+                                break;
+                            }
+                            if !j.eat(b',') {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                "sourceRoot" => root = j.string()?,
+                "mappings" => mappings = j.string()?,
+                _ => j.skip()?,
+            }
+            if j.eat(b'}') {
+                break;
+            }
+            if !j.eat(b',') {
+                return None;
+            }
+        }
+    }
+    if !root.is_empty() && !root.ends_with('/') {
+        root.push('/');
+    }
+    let sources = sources
+        .into_iter()
+        .map(|s| if source_is_file(&s) { format!("{root}{s}") } else { s })
+        .collect();
+    // A wasm map has one generated line; anything after a `;` describes no module byte.
+    let line0 = mappings.split(';').next().unwrap_or("");
+    let mut trans: SrcTransitions = Vec::new();
+    let mut st = [0i64; 4];
+    for seg in line0.split(',').filter(|s| !s.is_empty()) {
+        let mut fields: Vec<i64> = Vec::new();
+        let (mut v, mut shift) = (0u64, 0u32);
+        for c in seg.bytes() {
+            let d = vlq_digit(c)? as u64;
+            v |= (d & 31).checked_shl(shift)?;
+            shift += 5;
+            if d & 32 == 0 {
+                let n = (v >> 1) as i64;
+                fields.push(if v & 1 == 1 { -n } else { n });
+                (v, shift) = (0, 0);
+            }
+        }
+        for (k, x) in fields.iter().take(4).enumerate() {
+            st[k] += x;
+        }
+        let pos = (fields.len() >= 4).then(|| (st[1] as u32, st[2] as u32, st[3] as u32));
+        trans.push((st[0] as u32, pos));
+    }
+    trans.sort_by_key(|e| e.0);
+    Some(ReadSourceMap { sources, trans })
+}
+
+/// The position in force at `off`: the last transition at or before it.
+fn transition_at(trans: &SrcTransitions, off: u32) -> Option<(u32, u32, u32)> {
+    let k = trans.partition_point(|e| e.0 <= off);
+    if k == 0 { None } else { trans[k - 1].1 }
+}
+
+/// `bytes` with one more custom section, `sourceMappingURL` naming `url` — the section
+/// DevTools follows to a module's map. Appended, so no other byte moves.
+fn with_source_mapping_url(bytes: &[u8], url: &str) -> Vec<u8> {
+    let mut out = without_custom_section(bytes, "sourceMappingURL").unwrap_or_else(|| bytes.to_vec());
+    let mut sec = Vec::new();
+    put_name(&mut sec, "sourceMappingURL");
+    put_name(&mut sec, url);
+    out.push(0);
+    put_leb_u32(&mut out, sec.len() as u32);
+    out.extend_from_slice(&sec);
+    out
+}
+
+/// The `sourceMappingURL` a module names, or `None`.
+fn source_mapping_url(bytes: &[u8]) -> Option<String> {
+    use wasmparser::{Parser, Payload};
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Ok(Payload::CustomSection(c)) = payload {
+            if c.name() == "sourceMappingURL" {
+                let mut i = 0usize;
+                return wasm_name(c.data(), &mut i);
+            }
+        }
+    }
+    None
+}
+
+/// The code section's first byte, or `None` without one: the anchor a map's offsets hang
+/// from, which a rewrite that keeps a map valid must not move.
+fn code_section_start(bytes: &[u8]) -> Option<usize> {
+    use wasmparser::{Parser, Payload};
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Ok(Payload::CodeSectionStart { range, .. }) = payload {
+            return Some(range.start);
+        }
+    }
+    None
+}
+
+/// `to` written relative to the directory `from`, both resolved against the working
+/// directory, so a map beside the module finds sources beside the input. `None` when
+/// either cannot be resolved; the map then names its sources bare.
+fn relative_dir(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
+    let from = std::fs::canonicalize(from).ok()?;
+    let to = std::fs::canonicalize(to).ok()?;
+    let a: Vec<_> = from.components().collect();
+    let b: Vec<_> = to.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut parts: Vec<String> = vec!["..".to_string(); a.len() - common];
+    parts.extend(b[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+    Some(parts.join("/"))
+}
+
+/// A source spelled with a scheme (`std:str`) names no file, so no directory applies to it.
+fn source_is_file(s: &str) -> bool {
+    !s.is_empty() && !s.contains(':')
+}
+
+/// What `vl build --source-map` writes beside the module, from the emitter's `vl-src` rows.
+/// The rows name files relative to the input's directory (an entry spelled `""` is the input
+/// itself); the map names them relative to its own, as a source map's reader resolves them.
+fn build_source_map(map: &SrcMap, input: &str, out: &str) -> String {
+    let input_path = std::path::Path::new(input);
+    let entry_name = input_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| input.to_string());
+    let parent = |p: &std::path::Path| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    };
+    let root = relative_dir(&parent(std::path::Path::new(out)), &parent(input_path))
+        .unwrap_or_default();
+    let sources: Vec<String> = map
+        .files
+        .iter()
+        .map(|f| if f.is_empty() { entry_name.clone() } else { f.clone() })
+        .map(|f| if root.is_empty() || !source_is_file(&f) { f } else { format!("{root}/{f}") })
+        .collect();
+    source_map_json(&sources, &src_transitions(map))
+}
+
+/// `dir/s` with `.` and `name/..` folded away, so `out/../app.vl` reads `app.vl`.
+fn resolve_source(dir: &std::path::Path, s: &str) -> String {
+    if !source_is_file(s) || std::path::Path::new(s).is_absolute() {
+        return s.to_string();
+    }
+    use std::path::Component;
+    let mut parts: Vec<String> = Vec::new();
+    for c in dir.join(s).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if parts.last().is_some_and(|p| p != ".." && p != "/") => {
+                parts.pop();
+            }
+            Component::RootDir => parts.push("/".to_string()),
+            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
+        }
+    }
+    let joined = parts.join("/");
+    joined.strip_prefix("//").map(|r| format!("/{r}")).unwrap_or(joined)
+}
+
+/// `Some(name)` for the function whose body holds `off`, `Some(None)` when that function has
+/// no name, and `None` when no body holds it. An unnamed function gets no index label: engines
+/// disagree on one (V8 13.6 counts imported functions in `wasm-function[i]`, V8 15 does not).
+fn function_at(bytes: &[u8], off: u32) -> Option<Option<String>> {
+    use wasmparser::{Name, Parser, Payload, TypeRef};
+    let (mut n_imports, mut defined, mut found) = (0u32, 0u32, None);
+    let mut names: std::collections::HashMap<u32, String> = Default::default();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.ok()? {
+            Payload::ImportSection(r) => {
+                for imp in r.into_imports() {
+                    if matches!(imp.ok()?.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
+                        n_imports += 1;
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let range = body.range();
+                if (range.start as u32..range.end as u32).contains(&off) {
+                    found = Some(n_imports + defined);
+                }
+                defined += 1;
+            }
+            Payload::CustomSection(c) => {
+                if let wasmparser::KnownCustom::Name(r) = c.as_known() {
+                    for sub in r {
+                        if let Ok(Name::Function(map)) = sub {
+                            for n in map.into_iter().flatten() {
+                                names.insert(n.index, n.name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let f = found?;
+    // The name section's `@file:line` suffix is the DECLARATION's line; the answer's own
+    // line is the instruction's, so the suffix would read as a contradiction.
+    Some(names.get(&f).map(|n| n.split('@').next().unwrap_or(n).to_string()))
+}
+
+/// A location as a trap prints it: `0x12a`, `298`, or V8's `wasm-function[0]:0x12a` (whose
+/// offset is MODULE-relative, like the map's). `None` for anything else.
+fn parse_wasm_location(s: &str) -> Option<u32> {
+    let s = s.trim().trim_end_matches(')');
+    let tail = match s.rfind(":0x") {
+        Some(k) => &s[k + 1..],
+        None => s,
+    };
+    match tail.strip_prefix("0x").or_else(|| tail.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => tail.parse().ok(),
+    }
+}
+
+/// The source positions a module answers by, best first: the map its `sourceMappingURL`
+/// names, `<module>.map` beside it, then its own `vl-src` section (a `--names` build that
+/// was not optimized). `Err` names what was looked for.
+fn addr2line_source(module: &str, bytes: &[u8]) -> Result<ReadSourceMap> {
+    let dir = std::path::Path::new(module).parent().unwrap_or(std::path::Path::new(""));
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(url) = source_mapping_url(bytes) {
+        if !url.contains("://") {
+            candidates.push(dir.join(url));
+        }
+    }
+    candidates.push(std::path::PathBuf::from(format!("{module}.map")));
+    for c in &candidates {
+        if let Ok(text) = std::fs::read_to_string(c) {
+            let mut map = parse_source_map(&text).ok_or_else(|| {
+                Error::msg(format!("`{}` is not a source map this can read", c.display()))
+            })?;
+            // A map's sources are relative to the map; the answer names them from here.
+            let at = c.parent().unwrap_or(std::path::Path::new(""));
+            map.sources = map.sources.iter().map(|s| resolve_source(at, s)).collect();
+            return Ok(map);
+        }
+    }
+    if let Some(map) = parse_vl_src(bytes) {
+        // `vl-src` names files relative to the entry's directory and a one-file entry as "".
+        // The section does not record the entry, so it is taken to be `<stem>.vl`, the name
+        // `vl build`'s default output implies; when that file sits beside the module, every
+        // path is resolved from there, as a map's are.
+        let stem = std::path::Path::new(module)
+            .file_stem()
+            .map_or_else(|| "entry".to_string(), |s| s.to_string_lossy().into_owned());
+        let entry = format!("{stem}.vl");
+        let beside = dir.join(&entry).is_file();
+        let sources = map
+            .files
+            .iter()
+            .map(|f| {
+                let f = if f.is_empty() { entry.as_str() } else { f.as_str() };
+                if beside { resolve_source(dir, f) } else { f.to_string() }
+            })
+            .collect();
+        return Ok(ReadSourceMap { sources, trans: src_transitions(&map) });
+    }
+    bail!(
+        "`{module}` has no source positions: no `{module}.map`, no map its sourceMappingURL \
+         names, and no `vl-src` section — build it with `vl build --source-map` \
+         (or `--names` without -O/-O3)"
+    )
+}
+
+/// One location's answer: `file:line:col  in `function`` (display columns are 1-based).
+/// `None` for an offset in no function body (a custom section, past the end, a stale
+/// module): a map's last segment holds its position to the end, so it would answer anyway.
+fn addr2line_answer(map: &ReadSourceMap, bytes: &[u8], off: u32) -> Option<String> {
+    let f = function_at(bytes, off)?;
+    let (src, line, col) = transition_at(&map.trans, off)?;
+    let file = map.sources.get(src as usize).map(String::as_str).unwrap_or("");
+    let at = if file.is_empty() {
+        format!("{}:{}", line + 1, col + 1)
+    } else {
+        format!("{file}:{}:{}", line + 1, col + 1)
+    };
+    Some(match f {
+        Some(f) => format!("{at}  in `{f}`"),
+        None => at,
+    })
+}
+
+/// `vl addr2line <module.wasm> <location>...` — see `vl help addr2line`.
+fn addr2line_cmd(args: &[String]) -> Result<()> {
+    let Some((module, locs)) = args.split_first() else {
+        eprintln!("vl addr2line: missing the <module.wasm> input");
+        eprintln!("    usage: vl addr2line <module.wasm> <location>...  —  see `vl help addr2line`");
+        std::process::exit(2);
+    };
+    if locs.is_empty() {
+        eprintln!("vl addr2line: no location given");
+        eprintln!("    give a byte offset (0x12a), a trace's `wasm-function[0]:0x12a`, or `-` for stdin");
+        std::process::exit(2);
+    }
+    let bytes = std::fs::read(module)
+        .map_err(|e| Error::from(e).context(format!("reading `{module}`")))?;
+    let map = addr2line_source(module, &bytes)?;
+    let mut missed = false;
+    if locs.len() == 1 && locs[0] == "-" {
+        // A pasted stack trace: each line passes through, and every line naming a module
+        // offset is followed by the source position it maps to.
+        let mut text = String::new();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut raw)?;
+        // A pasted trace may carry bytes that are not UTF-8; they pass through replaced.
+        text.push_str(&String::from_utf8_lossy(&raw));
+        for line in text.lines() {
+            println!("{line}");
+            let Some(k) = line.find("wasm-function[") else { continue };
+            let Some(off) = parse_wasm_location(&line[k..]) else { continue };
+            match addr2line_answer(&map, &bytes, off) {
+                Some(a) => println!("    => {a}"),
+                None => missed = true,
+            }
+        }
+    } else {
+        for loc in locs {
+            let Some(off) = parse_wasm_location(loc) else {
+                eprintln!("vl addr2line: `{loc}` is not a location (0x12a, 298, or wasm-function[0]:0x12a)");
+                std::process::exit(2);
+            };
+            match addr2line_answer(&map, &bytes, off) {
+                Some(a) => println!("{a}"),
+                None => {
+                    println!("??  (0x{off:x} has no source position)");
+                    missed = true;
+                }
+            }
+        }
+    }
+    if missed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 // ── which module trapped ─────────────────────────────────────────────────────
 //
 // A wasm trap renders identically whichever module raised it, so the COMPILER's
@@ -8388,6 +9172,13 @@ fn real_main() -> Result<()> {
             }
             build_cmd(&args)
         }
+        Some("addr2line") => {
+            if wants_help(&args[2..], "addr2line", false) {
+                print_command_help("addr2line");
+                return Ok(());
+            }
+            addr2line_cmd(&args[2..])
+        }
         Some(other) => unknown_command(other),
     }
 }
@@ -8442,6 +9233,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
             eprintln!("    it cannot combine with `-o -` — give `-o <file.wasm>` instead");
             std::process::exit(2);
         }
+        // `--source-map` writes `<out>.map` beside the module, the same refusal.
+        if args.iter().any(|a| a == "--source-map") {
+            eprintln!("vl build: `--source-map` writes a .map beside the module and needs a path");
+            eprintln!("    it cannot combine with `-o -` — give `-o <file.wasm>` instead");
+            std::process::exit(2);
+        }
     }
     // Everything below writes and optimizes a PATH, so stdout mode borrows a temporary
     // and streams it at the end. `-O`/`-O3` therefore reach stdout optimized, which is
@@ -8457,10 +9254,13 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let names = args.iter().any(|a| a == "--names");
     let optimizing = args.iter().any(|a| a == "-O" || a == "-O3");
     let low_memory = low_memory_unused_flag(args, optimizing);
-    let names_mode = match (names, optimizing) {
+    // `--source-map` needs the `vl-src` rows the map is made from, so it asks the seed for the
+    // `--names` sections and drops whichever the build did not ask for (D3561).
+    let source_map = args.iter().any(|a| a == "--source-map");
+    let names_mode = match (names || source_map, optimizing) {
         (false, _) => Names::Off,
-        (true, false) => Names::Full,
-        (true, true) => Names::NoSrcMap,
+        (true, true) if !source_map => Names::NoSrcMap,
+        (true, _) => Names::Full,
     };
     // `--import-memory`: the module imports `env.memory` instead of defining and exporting
     // it (DECISIONS.md §"Linear memory is a layout contract").
@@ -8545,6 +9345,25 @@ fn build_cmd(args: &[String]) -> Result<()> {
             GC_MAX_LIVE.load(Ordering::Relaxed) >> 10
         );
     }
+    // `--source-map`: the map is made from the rows here, while they still describe these
+    // bytes. Both sections it borrowed are appended after the code, so dropping them moves no
+    // byte the map names; `vl-src` stays only in an unoptimized `--names` build, as before.
+    let map_path = source_map.then(|| format!("{out}.map"));
+    if let Some(mp) = &map_path {
+        let rows = parse_vl_src(&bytes).unwrap_or_default();
+        std::fs::write(mp, build_source_map(&rows, input, &out))
+            .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))?;
+        if optimizing || !names {
+            if let Some(b) = without_custom_section(&bytes, "vl-src") {
+                bytes = b;
+            }
+        }
+        if !names {
+            if let Some(b) = without_custom_section(&bytes, "name") {
+                bytes = b;
+            }
+        }
+    }
     // An optimized build never reads the compiler instance again (a refused module is
     // binaryen's bytes, which the emitter's spans do not describe), so its GC heap is freed
     // here rather than held for the whole of `wasm-opt` (D2311).
@@ -8580,7 +9399,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // The escape step goes first, so the rung's own passes (`--heap2local` among them)
         // see each per-call struct and its uses in one function. It renumbers functions, so
         // the run-once marks are read off its output, not off `bytes`.
-        let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
+        let map = map_path.as_deref();
+        let stepped =
+            phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes, map))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
         let mut passes = rung_passes(passes, names);
         if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
@@ -8588,12 +9409,24 @@ fn build_cmd(args: &[String]) -> Result<()> {
         }
         let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
         passes.extend(extra);
-        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline))?;
+        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline, map))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
     }
     let final_bytes: &[u8] = final_bytes.as_deref().unwrap_or(&bytes);
+    // The `sourceMappingURL` section goes on last, naming the map by its file name: the two
+    // are written side by side, and a module moved with its map still finds it.
+    let mapped = map_path.as_deref().map(|mp| {
+        let url = std::path::Path::new(mp)
+            .file_name()
+            .map_or_else(|| mp.to_string(), |n| n.to_string_lossy().into_owned());
+        with_source_mapping_url(final_bytes, &url)
+    });
+    if let Some(m) = &mapped {
+        std::fs::write(&sink, m)?;
+    }
+    let final_bytes: &[u8] = mapped.as_deref().unwrap_or(final_bytes);
     // STDERR, not stdout: this sentence is chatter about the run, and stdout carries the
     // artifact and nothing else (cli-design.md). On stdout it made `vl build p.vl >
     // out.bin` leave `out.bin` holding the sentence instead of the module (ROADMAP row 9).
@@ -8601,6 +9434,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // (or any path that discards what it's given) reported "wrote ... (0 bytes)"
     // for a build that had in fact produced a full module (D1678).
     eprintln!("wrote {out_label} ({} bytes)", final_bytes.len());
+    if let Some(mp) = &map_path {
+        eprintln!("wrote {mp}");
+    }
     // `--wat`: also write a `.wat` text dump beside the module (wasm-dis,
     // when present). Reflects the `-O`-optimized module if both are given.
     // Refused above under `-o -`, which has no path to write beside.

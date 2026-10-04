@@ -3074,7 +3074,9 @@ in-language GC knobs.
      hand-written `if u is A || u is B { … } else { u.c }`.
 - 🟡 **B-debug. Source maps + trap diagnostics follow-ups.** REMAINING: (1) **full source-mapped
   stack traces** — map every wasm frame in the trap's stack → VL `function (file:L:C)`, not just
-  the top frame; (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
+  the top frame (for a JS host and an optimized build, `vl build --source-map` + `vl addr2line
+  <module> -` now map every frame of a pasted trace, D3561; `vl run` of an optimized module
+  still reads only `vl-src`); (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
   the offending values (e.g. `index 7 out of bounds (length 3)`, `integer division by zero` —
   today both surface as a bare wasm backtrace); (3) an index-assignment LHS has
   no parser span yet — broaden parser span coverage for OOB *write* errors. Also feasible: a
