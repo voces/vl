@@ -40,6 +40,8 @@ CLASSIFIED = {
                              "@log output / @trap reason / @hint text"),
     "cases_wasm_3_test.ts": ("oracle shard", "seed (in-process)",
                              "@log output / @trap reason / @hint text"),
+    "vl_addr2line_test.ts": ("standalone", "native vl build --source-map",
+                             "a V8 trap's wasm offset maps to the line that trapped"),
     "vl_exported_memory_test.ts": ("standalone", "native vl build",
                                    "host reads instance.exports.memory in place"),
     "vl_global_promotion_test.ts": ("standalone", "native vl build",

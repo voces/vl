@@ -7232,8 +7232,8 @@ bytes, and binaryen keeps an unknown custom section with or without `-g` while r
 body under it — so master's `--names -O` already carried them, stale, and a trap printed a wrong
 source line (a 700-line program trapping at line 692 read `at 488:5` at `-O`, `at 419:5` at
 `-O3`). The host strips the section before the first `wasm-opt` run. Remapping the rows through
-binaryen (a source map) is the way to get lines back; until then an optimized build's frames
-carry names and no lines.
+binaryen (a source map) is the way to get lines back. `vl build --source-map` now does that
+(§"`--source-map` is its own flag, and the map is a side channel", D3561).
 
 **Price, `--names` over the same rung without it** (bytes, all of it the name section): the 86
 `bench/` programs +8,837 at `-O` (+9.6%, median +58 per program, range 43–453) and +6,790 at
@@ -9531,3 +9531,41 @@ lane, a probe build counted the joins whose type would change: none in plumb, no
 distilled corpus's if/match/return joins, one in `tests/cases` (`numerics/f32-f64-join-widens.vl`,
 whose values did not change; its `redundant annotation` hints went, since the functions now infer
 a union).
+
+## `--source-map` is its own flag, and the map is a side channel (2026-10-03) — D3561, sunpa SP-010
+
+A `--names` trap frame reads `pick@2`. The name section is per function, so `@2` is the
+DECLARATION's line, and in a 300-line function that leaves the author bisecting by hand. The
+`vl-src` rows have the per-statement answer, but only for the emitter's bytes, so `-O`/`-O3`
+strip them. A JS host never reads them in any build.
+
+**`vl build --source-map` writes `<out>.map`, a source map v3 in the wasm convention.** It has
+one generated line, and each segment's column is a MODULE byte offset: the offset V8, Node and
+Deno print after `wasm-function[i]:`, and the one the `vl-src` rows already use. The rows nest,
+so they are flattened, and the narrowest row wins. Each `wasm-opt` run (the escape step and the
+rung) takes the map as `--input-source-map` and writes it back as `--output-source-map`.
+binaryen keeps an expression's location through its rewrites, and an inlined callee keeps the
+CALLEE's line. A `sourceMappingURL` section names the map, for DevTools. `vl addr2line
+<module> <location>` reads the map back offline. It falls back to the `vl-src` section of an
+unoptimized `--names` build. Given `-`, it annotates a pasted stack trace frame by frame.
+
+**Why a flag of its own, rather than riding `--names`.** The map is a second FILE beside the
+module, and `--names` has only ever changed the module itself. A build that asked for names
+has not asked for an extra artifact, and `-o -` has nowhere to put one (`--source-map -o -`
+is refused, as `--wat` is). The flag still asks the seed for the `--names` sections, since the
+map is made from `vl-src`, and then drops whichever ones the build did not ask for. Both are
+appended after the code, so dropping them moves no byte the map names.
+
+**Price, measured on a 2 MB plumb-shaped unit (`gen-plumb-shape.vl`, under load).** binaryen's
+code is BYTE-IDENTICAL with and without the map at every rung: the module grows by the
+30-byte section and nothing else (`tests/vl_addr2line_test.ts` pins this). The map is 396 KB
+at the plain build, 541 KB at `-O` and 536 KB at `-O3`. CPU: the plain build is unchanged
+(2.87 vs 2.89 s); `-O` reads 10.5 → 11.5 s and 12.6 → 12.3 s (noise to +9%); `-O3` reads
+15.4 → 18.4 s and 15.2 → 18.0 s (+18%), because binaryen tracks a location per expression.
+Peak RSS rises by about 6 MB. A build without the flag is byte-identical to master's: 51
+sources (`bench/` and three probes) × five flag sets, `cmp`-equal, and the seed's fixpoint is
+unchanged.
+
+**Not done.** `vl run <module.wasm>` still reads only `vl-src`, so an optimized module run
+there prints names and no lines. `vl addr2line` gives that line. No DWARF is emitted: DevTools
+reads a source map natively and DWARF needs an extension, so a map is the smaller step.
