@@ -691,14 +691,18 @@ Cranelift compile is cached".
 | `--no-validate` | skip the "will the engine instantiate this" check |
 | `--import-memory` | import the memory as `env.memory` instead of defining and exporting it |
 | `--shared-memory=<pages>` | declare the memory SHARED with a max of `<pages>` (1..65536), imported or defined; every instance allocates from `std:buffer` through one pointer in the memory |
+| `--initial-memory=<size>` | the memory's initial size: bytes or `KiB`/`MiB`/`GiB`, a whole number of 64 KiB pages up to 4 GiB (default 64 KiB); a `std:buffer` under it never grows the memory, so never detaches a host's views (D3560) |
+| `--max-memory=<size>` | the memory's max, same units, at least the initial size; refused beside `--shared-memory`, which declares the max itself |
 | `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
 | `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
 | `--low-memory-unused[=<bytes>]` | with `-O`/`-O3`: promise no access reaches the first `<bytes>` (default 1024; decimal or `0x`, 1..2^31-1), so `p + C` and `(p + C) as% i32` move `C` into the memarg while `C` plus the access's offset is below it; a heap base inside the region exits 2 (DECISIONS.md, "PL-061") |
 | `--compiler <f>` | the compiler module to compile with |
 
-The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*` flag, the
-space-separated `--heap-base 0x10000`, `--import-memory=<anything>`, a bare `--shared-memory` or
-one outside 1..65536, or a repeated layout flag
+The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*`/`--initial*`/
+`--max-mem*` flag, the space-separated `--heap-base 0x10000`, `--import-memory=<anything>`, a bare
+`--shared-memory` or one outside 1..65536, a size that is not a whole number of pages, an initial
+size above the max, `--max-memory` beside `--shared-memory`, a `--heap-base` at or past the max,
+or a repeated layout flag
 exits 2 instead of quietly building the default layout. A unit that allocates from
 `std:buffer` under `--import-memory` with no `--heap-base` builds, with a warning: its heap
 starts at 1024, like every other such unit. With `--shared-memory` there is no warning: shared

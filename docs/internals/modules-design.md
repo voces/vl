@@ -214,7 +214,8 @@ export type Point = { x: f64, y: f64 }
   about a map, a struct, or an export whose public and private types differ — so encapsulated
   exports stay gated on A9, which would generalise the split over every constructor and infer
   it rather than requiring the marker.
-- Re-exports (`export … from`) are **deferred** (not needed to unblock H3).
+- Re-exports (`export … from`) were deferred here and have since landed. What ships,
+  and what is still undecided, is §2.1.1.
 
 **Import — named imports, one line, from a specifier:**
 
@@ -272,7 +273,54 @@ import { distance as dist } from "./geometry"        // rename (in v1)
 - **Import rename (`import { x as y }`) is in v1.** It is cheap and important —
   the escape hatch for cross-module name collisions and a near-necessity for
   *generated* code (the H3 self-hosted compiler) where two modules may export the
-  same name. (Re-export, `export … from`, stays deferred — §2.4.)
+  same name. (Re-export, `export … from`, has since landed — §2.1.1.)
+
+### 2.1.1 Re-exports — what ships, and two open questions
+
+**Shipped (#1196, #1197), pinned by `tests/cases/modules/reexport*/`:**
+
+```
+export { a, b as c } from "./mod"    // publishes `a` and `c`; `b` is NOT published
+```
+
+- The public name is the `as` alias when there is one, else the name; the pre-alias
+  name is not part of the surface (`err-reexport-alias-hides-source`).
+- **A re-export also binds its public name in the re-exporting module**, as an import
+  would: `export { f } from "./m2"` followed by `print(f())` runs with no `import`
+  (`reexport`, `reexport-alongside-import`). JS and TS bind nothing locally here.
+- An `import { f } from "./m2"` beside `export { f } from "./m2"` is accepted with no
+  error and no warning: both reach one declaration, so the D1120 duplicate-binding
+  rule does not fire, and the `duplicate-import` lint compares `import` statements only.
+- Only the ENTRY module's re-exports become wasm exports; a dependency's re-export
+  is a VL-level name and stays out of the wasm ABI (#1197).
+
+**Refused, by the §2.1 rule against a separate export list:** `export { x }` with no
+`from`. Since D3559 it is refused at the listed name, and when `x` is an import the
+message spells the re-export of the same binding:
+`` `export { sinF64 }` names an imported binding; re-export it with `export { sinF64 } from "std:math"` ``.
+A name declared in the module is pointed at the declaration-site `export` keyword.
+
+**Open, for the owner (sunpa SP-014, SP-020).** Nothing written decides these; the
+local binding is pinned by fixtures that describe it, not by a ruling.
+
+1. *Does a re-export bind locally?* (a) Yes, as today: one line both uses and
+   publishes. std relies on it: `std:fs` uses `Buf` throughout with only
+   `export { Buf } from "std:buffer"` and no import. (b) No, as in JS/TS: a module
+   that also calls `f` writes the `import` too (`std:fs` would gain one line), and
+   the import beside the re-export becomes the normal shape instead of a redundant one.
+2. *Is the import beside a re-export a duplicate?* Under (a) it is redundant and the
+   natural answer is the `duplicate-import` warning, extended to compare a re-export
+   with an import of the same name and specifier. That warning would fire on eight
+   names in std today (`std:args` 1, `std:env` 4, `std:process` 3), each imported and
+   re-exported from one module. Under (b) it is required and must stay silent.
+3. *Should `export { x }` of an imported `x` be accepted* as a re-export of the same
+   binding? (a) No, as today: one spelling, `export { x } from "m"`. (b) Yes: the
+   list may name imports (never local declarations), so the specifier is written once.
+
+Recommendation: 1(a), 2 warn, 3(a). Changing 1 breaks working programs for a
+JS-familiarity gain only; given 1(a), the import beside a re-export is pure redundancy,
+which is what the `duplicate-import` lint exists to flag; and 3(b) would reintroduce
+the second export list §2.1 rejected, for a saving of one specifier per line.
 
 ### 2.2 Resolution & loading
 
@@ -691,8 +739,8 @@ each, and the unreviewed item (cross-module init order) stays fully open.
    a flagged dependency**; no parallel readonly mechanism is invented.
 5. **Rename in v1; re-export deferred.** ✅ `import { x as y }` (alias) is **in
    v1** — cheap, important for generated code + collision avoidance.
-   `export … from` (re-export) stays **deferred**. *Remaining:* exact re-export
-   syntax when it lands.
+   `export … from` (re-export) was deferred here and has since landed as
+   `export { a, b as c } from "spec"` (§2.1.1).
 6. **Omit the `.vl` extension in specifiers.** ✅ `import { x } from "./util"` →
    `util.vl`. VL's single-extension / no-registry / no-`node_modules` setup makes
    "append `.vl`" unambiguous and cleaner; **no index/directory guessing.** (Flips

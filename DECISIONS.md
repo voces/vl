@@ -1835,11 +1835,14 @@ it worked.
   (`>>>`). A `u32` would touch the type arena, every rep table, every widening
   rule and every emitter kind code to express something the operand need not
   carry.
-- **No transcendentals, ever, as a language or std primitive.** No wasm opcode
-  computes `sin`/`pow`/`exp`, so any implementation is a library whose last bit
-  is a policy choice. A program that must match another implementation exactly
-  has to own that choice; shipping one would give it a trap to avoid rather than
-  work to save. (`docs/internals/numeric-intrinsics.md`)
+- **No transcendental as a compiler intrinsic; they live in `std:math`.** No wasm
+  opcode computes `sin`/`pow`/`exp`, so any implementation is a library whose last
+  bit is a policy choice, and that library is not the compiler's. This entry first
+  said "no transcendentals, ever, as a language or std primitive"; the std half was
+  superseded by `docs/internals/std-math-design.md`, which owns the choice in
+  `std:math` (pure VL, the same bits on every host, a published ulp bound). A
+  program that must match some other implementation exactly still owns that choice
+  itself. (`docs/internals/numeric-intrinsics.md`)
 
 - **A classifier's "no answer" sentinel is NOT neutral when the caller has a
   default — so a DECLINE LIST is a set of testable claims, and each entry must be
@@ -6671,6 +6674,33 @@ in the shared memory itself (§"std:buffer's allocator over a shared memory", be
 Atomics are a separate lane; wrappers over the raw intrinsics are queued in `ROADMAP.md`, each
 through the std review. Pinned by `tests/vl_shared_memory_test.ts`, which runs one module in two
 Workers over one `WebAssembly.Memory({ shared: true })`.
+
+## A memory's size is a build flag: `--initial-memory=<size>`, `--max-memory=<size>` (owner, 2026-10-03) — sunpa SP-011
+
+**The ask:** a `Buffer()` that grows the memory mid-frame detaches every typed-array view a JS
+host holds of it, so sunpa's draw list read `undefined` after a culling pass allocated. The
+owner chose the answer every other wasm toolchain gives (Emscripten `-sINITIAL_MEMORY`,
+Rust/Zig `--initial-memory`, AssemblyScript `--initialMemory`) over a `std:buffer` API
+(`reserve`, `memoryEpoch`): a build flag, plus a cost-guide note (D3560).
+
+- **Sizes are bytes or `KiB`/`MiB`/`GiB`, a whole number of 64 KiB pages, refused rather than
+  rounded.** Every other layout flag is parsed strictly and exits 2 on a value it cannot take,
+  and a silently rounded size would be a different contract from the one the build line names.
+  The refusal names the next page multiple. Zero and anything past 4 GiB (65536 pages; VL
+  emits no memory64) are refused.
+- **`--max-memory` and `--shared-memory` conflict, they do not alias.** Both declare the max,
+  and `--shared-memory` takes pages where `--max-memory` takes bytes, so accepting both would
+  mean ruling which wins. A shared build keeps `--shared-memory=<pages>` as its one max;
+  `--initial-memory` combines with it, and with `--max-memory`, as long as it is at most the
+  max.
+- **The flags shape the declaration only.** Imported (`--import-memory`) or defined, the
+  limits carry the same min and max; a module that touches no linear memory has none and the
+  flags change nothing. `std:buffer` needs no change: it grows only when an allocation passes
+  `memory.size`, so a memory that starts large enough never grows. `--max-memory` caps growth
+  the way `--shared-memory` does, and a `Buffer()` past it traps.
+- **`vl run` takes both**, like `--shared-memory`, because they change the memory's type and not
+  who supplies it. Pinned by `tests/vl_initial_memory_test.ts`, whose control shows the default
+  one-page memory detaching a view under V8.
 
 ## std:buffer's allocator over a shared memory (owner direction, 2026-09-24) — every instance allocates, none overlap
 

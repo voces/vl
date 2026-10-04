@@ -183,6 +183,33 @@ hot function at 1.3 s against 0.48 s afterwards, and 0.52 s with V8's `--no-lift
 `--v8-flags=--no-liftoff`), which is one workaround.
 Most programs call their hot functions many times and barely notice.
 
+## Host views of linear memory
+
+A JS host reads a `Buf` through a typed array over `memory.buffer`. When wasm memory grows,
+that buffer is **detached**: every view taken before reads `undefined` and has `byteLength` 0.
+`Buffer(n)` grows the memory whenever an allocation passes its current size, so any export
+that allocates can detach views the host took before calling it. The first symptom is often
+far from the cause, such as a GPU call failing on an `undefined` field a few calls later.
+
+Two patterns avoid it:
+
+* **Start the memory large enough.** `vl build --initial-memory=8MiB` (bytes, or `KiB`, `MiB`,
+  `GiB`, a whole number of 64 KiB pages) declares the memory at that size, so allocations that
+  stay under it never grow it and never detach anything. Add `--max-memory=<size>` to make an
+  allocation past a budget trap instead of growing. Emscripten (`-sINITIAL_MEMORY`), Rust and
+  Zig (`--initial-memory`) and AssemblyScript (`--initialMemory`) offer the same setting.
+* **Re-take views after any call that may allocate.** Build each typed array from
+  `memory.buffer` after the call returns, or check `view.byteLength === 0` and rebuild it.
+  wasm-bindgen's generated glue and Go's `wasm_exec.js` both do this.
+
+A memory built with `--shared-memory` never detaches: it is backed by a `SharedArrayBuffer`,
+which grows in place, but a view taken before a growth still covers only the old length.
+
+`memory.toResizableBuffer()` returns a buffer that grows in place instead of detaching. It is a
+JS API extension, shipping in V8; check support in the engines you target. It requires the memory
+to declare a maximum (V8 throws "Memory must have a maximum" otherwise), so build with
+`--max-memory=<size>`, or `--shared-memory=<pages>` for a shared memory.
+
 ## Memory across passes
 
 Observation from a consumer, not yet measured here and with no mechanism claimed: a program that

@@ -48,6 +48,8 @@ CLASSIFIED = {
                                     "GLOBAL section entry count, + output through the OTHER path"),
     "vl_import_memory_test.ts": ("standalone", "native vl build (+ wasm-merge)",
                                  "host-owned env.memory: shape, heap window, two linked units"),
+    "vl_initial_memory_test.ts": ("standalone", "native vl build + vl run",
+                                  "memory limits from --initial/--max-memory; a view kept across an allocation"),
     "vl_instance_state_leak_test.ts": ("standalone", "seed (in-process, shared instance)",
                                        "emission byte-identity vs a fresh-instance oracle"),
     "vl_large_output_test.ts": ("standalone", "native vl build",

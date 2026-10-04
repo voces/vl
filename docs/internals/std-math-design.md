@@ -188,7 +188,18 @@ and flags the open sub-problem rather than final numbers:
 **Shipped (D3476, 2026-10-02): `sin`/`cos` landed first, full range, not bounded.** All
 four take every finite input, however large (integer Payne–Hanek above `2^20·π/2`), within
 1 ulp — 1.2e-16 absolute at f64 and 6e-8 at f32, tighter than the targets above.
-`std-notes.md` §`std:math` has the measurements. `exp`/`pow` remain.
+`std-notes.md` §`std:math` has the measurements.
+
+**Upgraded (sunpa SP-013, 2026-10-03): `atan2` and `hypot` now meet the 1-ulp contract**
+(slice 1 shipped a 1e-7 polynomial `atan2` and a naive `hypot`), and `atan`, `asin` and `acos`
+joined at both widths under it. These changed existing exports' values; `std-notes.md`
+§`std:math` lists the changes.
+
+**Shipped (sunpa SP-005, 2026-10-03): `exp`, `log` and `pow` at both widths**, every finite
+input, within 1 ulp (measured 0.53 ulp at f64, 0.5000x at f32), tighter than the relative
+targets above. `log` is exported rather than private (O2), because sunpa asked for it by name;
+`pow`'s edge cases are IEEE 754's. `std-notes.md` §`std:math` has the algorithms, the
+measurements and the cost.
 
 **Sequencing within slice 2 is not "all four together."** The integer-exponent fast path for
 `pow` has no dependency on `exp`/`ln` and can ship first; the general real-exponent case depends
@@ -258,7 +269,8 @@ review prefers the single name.
 `exp(y * ln(x))` for non-integer exponents, and `ln` is not in the original ask. → **Recommend
 building `ln` as an internal (non-exported) helper for `pow`'s sake in slice 2**, and exporting
 it only if a consumer files a need — `std-api-review.md`'s no-speculative-surface rule argues
-against shipping a fourth name nobody asked for yet.
+against shipping a fourth name nobody asked for yet. **Resolved by the build (SP-005):** a
+consumer filed the need (sunpa asked for `log` by name), so `logF64`/`logF32` are exported.
 
 **O3 — `sin`/`cos`'s documented input range.** §E proposes shipping a bounded-domain v1
 (`|x| ≤ 2^20` or similar) rather than full Payne–Hanek reduction. → **Recommend shipping the
