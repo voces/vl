@@ -1422,6 +1422,37 @@ Deno.test({
   }
 });
 
+// D3559: an export list with no `from` arms the loop (it is an `export {` line) and must
+// be refused for what it is, underlining the listed name, never as a re-export from "".
+Deno.test({
+  name: "wasm-checker: `export { x }` of an import names the re-export to write (D3559)",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const lib = "export function sq(n: i32): i32 { n * n }\n";
+  const siblings = (p: string) => p === "/proj/lib.vl" ? lib : undefined;
+  const src = 'import { sq } from "./lib"\nexport { sq }\nprint(sq(3))\n';
+  const diags = await checker.check(src, "/proj/main.vl", siblings);
+  const want = '`export { sq }` names an imported binding; re-export it with `export { sq } from "./lib"`';
+  const got = diags.map((d) => d.message);
+  if (diags.length !== 1 || diags[0].message !== want) {
+    throw new Error(`want exactly ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  }
+  const r = diags[0].range;
+  if (r.start.line !== 1 || r.start.character !== 9 || r.end.character !== 11) {
+    throw new Error(`want the span of \`sq\` on line 1 (9..11), got ${JSON.stringify(r)}`);
+  }
+  // The control: the suggested spelling, kept beside the import, checks clean.
+  const fixed = await checker.check(
+    'import { sq } from "./lib"\nexport { sq } from "./lib"\nprint(sq(3))\n',
+    "/proj/main.vl",
+    siblings,
+  );
+  if (fixed.length !== 0) {
+    throw new Error(`the suggested re-export must check clean; got ${fixed.map((d) => d.message).join("; ")}`);
+  }
+});
+
 // The interpolation arm's own failure shape: without it the loop never runs, `std:fmt`
 // is never committed, and the injected reference resolves to nothing — an
 // "undeclared identifier" on a program the CLI compiles cleanly, the worst shape
