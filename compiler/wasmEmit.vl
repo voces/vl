@@ -666,6 +666,15 @@ import {
   fbUnreachable,
   fbValtype,
   fbValtypeNullable,
+  lbBack,
+  lbBackTy,
+  lbCap,
+  lbCnt,
+  lbEnd,
+  lbList,
+  lbPush,
+  lbPushOf,
+  lbWrap,
   lhBack,
   lhKind,
   lhLen,
@@ -11773,7 +11782,9 @@ function hoistSafeExpr(ix: i32, fnIx: i32): boolean {
     return hoistSafeExpr(e.binRight, fnIx)
   }
   if e is Call {
-    if !hoistSafeMemCall(ix, fnIx) { return false }
+    // A counted push of an open build region moves only its own fresh list, which nothing
+    // else holds and the region never indexes (D3623).
+    if !hoistSafeMemCall(ix, fnIx) && listBuildRegionOf(ix) < 0 { return false }
     const args = e.callArgs
     let a = 0
     while a < args.length {
@@ -16156,7 +16167,7 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
     let i = 0
     while i + 1 < stmts.length {
       preStmtNarrow(stmts[i])
-      if emitStmt(body, stmts[i], fnIx) < 0 {
+      if emitStmtIn(body, stmts, i, fnIx) < 0 {
         pendingLitUnion = savedLU
         return -1
       }
@@ -21639,6 +21650,30 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
           lIdx = pushRecvLocal(body, callee.memObj, fnIx, base)
           if lIdx < 0 { return -1 }
         }
+        // A counted push of an open build region appends through its locals while under the
+        // reserve, and otherwise syncs `len` and takes the growing append below (D3623).
+        const reg = listBuildRegionOf(callIx)
+        let fast = false
+        if reg >= 0 {
+          fast = !wantValue
+            && lbList[reg] == lIdx
+            && lbWrap[reg] == lTy
+            && lbBackTy[reg] == aTy
+          if fast {
+            fbLocalGet(lbCnt[reg])
+            fbI32Const(lbCap[reg])
+            fbI32Bin(73) // 0x49 i32.lt_u
+            fbIf(64)
+            fbLocalGet(lbBack[reg])
+            fbLocalGet(lbCnt[reg])
+            fbLocalGet(valIdx)
+            fbArraySet(aTy)
+            fbElse()
+          }
+          fbLocalGet(lbList[reg])
+          fbLocalGet(lbCnt[reg])
+          fbStructSet(lbWrap[reg], 1) // len
+        }
         // if len(L) == cap(L)
         pushListLen(body, lIdx, lTy)
         pushListCap(body, lIdx, lTy)
@@ -21686,6 +21721,13 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
         fbI32Const(1)       // i32.const 1
         fbI32Bin(106)       // 0x6a i32.add
         fbStructSet(lTy, 1) // 0xfb 0x05 <lTy> field 1: len
+        if reg >= 0 {
+          if fast { fbEnd() }
+          fbLocalGet(lbCnt[reg])
+          fbI32Const(1)
+          fbI32Bin(106) // 0x6a i32.add
+          fbLocalSet(lbCnt[reg])
+        }
         // D1592 — the new length, read back from the field the line above wrote. Emitted
         // only in value position; a bare `.push` statement leaves the stack empty, and
         // `memberCallYieldsValue` is the one predicate both sides consult.
@@ -24948,7 +24990,272 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // init resolved any same-named OUTER binding), making this binding live for the rest
   // of the block — mirrors the collect pass so resolution matches slot allocation.
   scopeBind(s.letName, slot)
+  emitListReserve(s, stmtIx, idx, slot, fnIx)
   return 0
+}
+
+// The statement list and position of the statement `emitStmt` is about to lower, so a `let`
+// can read the statements after it; `letSibPos` is -1 outside such a call (D3623).
+let letSibStmts: i32[] = []
+let letSibPos = -1
+
+// `emitStmt` on `stmts[i]`, with the list and position published for `emitListReserve`.
+function emitStmtIn(body: u8[], stmts: i32[], i: i32, fnIx: i32): i32 {
+  letSibStmts = stmts
+  letSibPos = i
+  const rc = emitStmt(body, stmts[i], fnIx)
+  letSibPos = -1
+  if rc >= 0 && lbEnd.length > 0 { listBuildClose(stmts[i]) }
+  rc
+}
+
+// The most elements a list reserve allocates up front.
+const LIST_RESERVE_MAX = 65536
+
+// What a reserve scan found: the elements the pushes add, the push nodes counted, and the
+// last statement that pushes.
+type ListReserve = { lrCount: i32, lrPushes: i32[], lrLast: i32 }
+
+// A fresh `[]` binding whose next uses are unconditional `push`es inside constant-trip range
+// loops gets its backing at the final size, and those pushes append through locals while the
+// count is under it (D3623). Each still tests the count, so a wrong one costs a growth, never
+// a wrong answer.
+function emitListReserve(
+  s: LetDecl,
+  stmtIx: i32,
+  idx: i32,
+  slot: i32,
+  fnIx: i32,
+) {
+  const pos = letSibPos
+  letSibPos = -1
+  if pos < 0 || pos >= letSibStmts.length || letSibStmts[pos] != stmtIx {
+    return 0
+  }
+  const init = P.nodes[unwrapParen(s.letInit)]
+  if !(init is ArrayLit) { return 0 }
+  if init is ArrayLit {
+    if init.arrElems.length != 0 { return 0 }
+  }
+  const want = reserveMfKindOfSlot(localIsRef[slot])
+  if want == null { return 0 }
+  const stmts = letSibStmts
+  const r: ListReserve = { lrCount: 0, lrPushes: [], lrLast: -1 }
+  let j = pos + 1
+  while j < stmts.length {
+    const c = reservePushCount(stmts[j], s.letName, r, fnIx)
+    if c < 0 {
+      j = stmts.length
+    } else {
+      r.lrCount = r.lrCount + c
+      if c > 0 { r.lrLast = j }
+      j = j + 1
+    }
+    if r.lrCount > LIST_RESERVE_MAX { return 0 }
+  }
+  if r.lrCount <= 0 || r.lrPushes.length == 0 { return 0 }
+  const recv = listPushRecv(r.lrPushes[0])
+  if mfRecvKindOf(recv, fnIx) != want { return 0 }
+  let row = 0
+  if want == "ref" { row = refListSlotOfExpr(recv, fnIx) }
+  if row < 0 { return 0 }
+  const wrap = spreadWrapIdx(want, row)
+  const back = spreadBackIdx(want, row)
+  if wrap < 0 || back < 0 { return 0 }
+  fbLocalGet(idx)
+  fbI32Const(r.lrCount)
+  fbArrayNewDefault(back)
+  fbStructSet(wrap, 0) // backing
+  fbLocalGet(idx)
+  fbI32Const(r.lrCount)
+  fbStructSet(wrap, 2) // cap
+  // The length is written back after the region's last statement, so one must follow it.
+  if r.lrLast >= stmts.length - 1 { return 0 }
+  liKinds.push(want)
+  liSlots.push(row)
+  liBack.push(3)
+  const bSlot = listIdxScratchBase + liKinds.length
+  const cSlot = strI32Slot()
+  fbLocalGet(idx)
+  fbStructGet(wrap, 0)
+  fbLocalSet(bSlot)
+  fbI32Const(0)
+  fbLocalSet(cSlot)
+  const reg = lbList.length
+  lbList.push(idx)
+  lbEnd.push(stmts[r.lrLast])
+  lbBack.push(bSlot)
+  lbCnt.push(cSlot)
+  lbCap.push(r.lrCount)
+  lbWrap.push(wrap)
+  lbBackTy.push(back)
+  let k = 0
+  while k < r.lrPushes.length {
+    lbPush.push(r.lrPushes[k])
+    lbPushOf.push(reg)
+    k = k + 1
+  }
+  0
+}
+
+// The receiver node of the `push` call at `callIx`.
+function listPushRecv(callIx: i32): i32 {
+  const n = P.nodes[callIx]
+  if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Member { return unwrapParen(cf.memObj) }
+  }
+  -1
+}
+
+// The open build region whose counted pushes include `callIx`, or -1.
+function listBuildRegionOf(callIx: i32): i32 {
+  let k = lbPush.length - 1
+  while k >= 0 {
+    if lbPush[k] == callIx {
+      const reg = lbPushOf[k]
+      if lbEnd[reg] >= 0 { return reg }
+      return -1
+    }
+    k = k - 1
+  }
+  -1
+}
+
+// After statement `ix`: write back the length of every open build region it ends.
+function listBuildClose(ix: i32) {
+  let reg = 0
+  while reg < lbEnd.length {
+    if lbEnd[reg] == ix {
+      fbLocalGet(lbList[reg])
+      fbLocalGet(lbCnt[reg])
+      fbStructSet(lbWrap[reg], 1) // len
+      lbEnd[reg] = -1
+    }
+    reg = reg + 1
+  }
+  0
+}
+
+// The list kind a `push` onto a local of slot kind `k` lowers at, or null for a slot that is
+// not a non-null list local. The scalar lists are `scalarListElemOfListKind`'s to name.
+function reserveMfKindOfSlot(k: VKind): MfKind | null {
+  if k == "strlist" { return "str" }
+  if k == "reflist" { return "ref" }
+  const sk = scalarListElemOfListKind(k)
+  if sk == null { return null }
+  scalarElemMfKind(sk)
+}
+
+// The elements statement `ix` pushes onto `nm`, each push unconditional: `nm.push(x)` is one
+// and a constant-trip range loop multiplies its body's. -1 when it reads, writes or shadows
+// `nm` any other way, or holds a `break`, `continue` or `return`; that ends the scan.
+function reservePushCount(ix: i32, nm: string, r: ListReserve, fnIx: i32): i32 {
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Member {
+      const ro = P.nodes[unwrapParen(cf.memObj)]
+      let onNm = false
+      if ro is Ident { onNm = ro.identName == nm }
+      if cf.memProp == "push" && onNm {
+        if n.callArgs.length != 1 || hasSpreadItem(n.callArgs) { return -1 }
+        if exprMentionsName(n.callArgs[0], nm) || stmtHasExit(n.callArgs[0]) {
+          return -1
+        }
+        r.lrPushes.push(ix)
+        return 1
+      }
+    }
+  }
+  if n is ForRange {
+    if !exprMentionsName(ix, nm) { return reserveNeutral(ix, nm) }
+    if n.frVar == nm { return -1 }
+    const trips = rangeConstTrips(n, fnIx)
+    if trips < 0 { return -1 }
+    if exprMentionsName(n.frFrom, nm) || exprMentionsName(n.frTo, nm) {
+      return -1
+    }
+    const mark = r.lrPushes.length
+    const inner = reserveBodyCount(n.frBody, nm, r, fnIx)
+    if inner < 0 || (trips > 0 && inner > LIST_RESERVE_MAX / trips) {
+      while r.lrPushes.length > mark { r.lrPushes.pop() }
+      return -1
+    }
+    return trips * inner
+  }
+  reserveNeutral(ix, nm)
+}
+
+// `reservePushCount` summed over the statements of the block at `ix`, or -1.
+function reserveBodyCount(ix: i32, nm: string, r: ListReserve, fnIx: i32): i32 {
+  const b = P.nodes[ix]
+  if !(b is Block) { return -1 }
+  let inner = 0
+  if b is Block {
+    let i = 0
+    while i < b.blkStmts.length {
+      const c = reservePushCount(b.blkStmts[i], nm, r, fnIx)
+      if c < 0 { return -1 }
+      inner = inner + c
+      if inner > LIST_RESERVE_MAX { return -1 }
+      i = i + 1
+    }
+  }
+  inner
+}
+
+// 0 for a statement that neither touches `nm` nor can leave early, else -1.
+function reserveNeutral(ix: i32, nm: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  if exprMentionsName(ix, nm) || stmtHasExit(ix) { return -1 }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == nm { return -1 }
+  }
+  0
+}
+
+// Whether the code under `ix` holds a `break`, `continue` or `return`.
+function stmtHasExit(ix: i32): boolean {
+  let cur = ix
+  while cur >= 0 {
+    const n = P.nodes[cur]
+    if n is BreakStmt || n is ContinueStmt || n is RetStmt { return true }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if stmtHasExit(kids[i]) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// The trips of a range loop whose ends and step are constants within 2^30, or -1.
+function rangeConstTrips(n: ForRange, fnIx: i32): i32 {
+  if !forRangeStepIsConst(n.frStep) { return -1 }
+  if !rangeConstIs(n.frFrom, fnIx) || !rangeConstIs(n.frTo, fnIx) { return -1 }
+  let k = 1
+  if n.frStep >= 0 {
+    if !rangeConstIs(n.frStep, fnIx) { return -1 }
+    k = rangeConstVal(n.frStep, fnIx)
+  }
+  const a = rangeConstVal(n.frFrom, fnIx)
+  const b = rangeConstVal(n.frTo, fnIx)
+  const lim = 1073741824
+  if k == 0 || a >= lim || a <= 0 - lim || b >= lim || b <= 0 - lim {
+    return -1
+  }
+  let span = b - a
+  if k < 0 {
+    span = a - b
+    k = 0 - k
+  }
+  if span < 0 { return 0 }
+  if n.frExcl { return (span + k - 1) / k }
+  span / k + 1
 }
 
 function emitCallStmt(body: u8[], s: Call, stmtIx: i32, fnIx: i32) {
@@ -26136,6 +26443,7 @@ function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
 // at; the two limits are chosen in DECISIONS.md, "Small constant range loops are unrolled".
 const UNROLL_MAX_TRIPS = 16
 const UNROLL_MAX_NODES = 640
+const UNROLL_PUSH_NODES = 16
 
 // The range loop fully unrolled: `trips` copies of the body in one block, copy `k` reading the
 // loop var as the constant `A + k*K`. `break` leaves the block and `continue` ends its copy.
@@ -26238,13 +26546,15 @@ function rangeUnrollTrips(
 // The node count of the code under `ix`, a nested constant range loop's body counted once per
 // trip, or -1 when it holds a function, a call that is not an inline memory intrinsic, or exceeds
 // `cap`. A call outweighs the test and step unrolling saves, and the host reads a call inside a
-// loop as hot, which the copies would hide from it.
+// loop as hot. A build region's push is inline, weighing `UNROLL_PUSH_NODES` more (D3623).
 function unrollCost(ix: i32, fnIx: i32, cap: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is FuncDecl { return -1 }
+  let cnt = 1
   if n is Call {
-    if !hoistSafeMemCall(ix, fnIx) { return -1 }
+    if listBuildRegionOf(ix) >= 0 { cnt = cnt + UNROLL_PUSH_NODES }
+    else if !hoistSafeMemCall(ix, fnIx) { return -1 }
   }
   if n is ForRange {
     const inner = rangeStaticTrips(n, fnIx)
@@ -26256,7 +26566,6 @@ function unrollCost(ix: i32, fnIx: i32, cap: i32): i32 {
       return tot
     }
   }
-  let cnt = 1
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
@@ -27038,7 +27347,7 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
           return -1
         }
       } else {
-        if emitStmt(body, stmts[i], fnIx) < 0 {
+        if emitStmtIn(body, stmts, i, fnIx) < 0 {
           scopePop()
           return -1
         }
@@ -27096,7 +27405,7 @@ function emitStmts(body: u8[], blockIx: i32, fnIx: i32) {
       // `emitFuncCode` rebases them onto the module with the rest of this frame's rows.
       const stmtAt = body.length
       preStmtNarrow(stmts[i])
-      if emitStmt(body, stmts[i], fnIx) < 0 {
+      if emitStmtIn(body, stmts, i, fnIx) < 0 {
         scopePop()
         return -1
       }
@@ -27141,7 +27450,7 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32) {
     let cut = false
     while i < n - 1 {
       preStmtNarrow(stmts[i])
-      if emitStmt(body, stmts[i], fnIx) < 0 {
+      if emitStmtIn(body, stmts, i, fnIx) < 0 {
         scopePop()
         return -1
       }

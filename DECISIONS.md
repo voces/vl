@@ -9671,3 +9671,30 @@ functions in that index and V8 15 (Deno 2.9) does not.
 **Not done.** `vl run <module.wasm>` still reads only `vl-src`, so an optimized module run
 there prints names and no lines. `vl addr2line` gives that line. No DWARF is emitted: DevTools
 reads a source map natively and DWARF needs an extension, so a map is the smaller step.
+
+## A list built by pushes of a known count is reserved, and the pushes keep their count test (2026-10-04) — D3623, sunpa SP-036
+
+**When `const o: T[] = []` (or `let`) is followed, before any other use of `o`, by pushes that
+are unconditional statements in constant-trip range loops, with no `break`, `continue` or
+`return` in that region, `o`'s backing is allocated at the product of the trip counts.** The
+region's pushes store through a local copy of the backing at a local count, and `len` is written
+back once, after the region's last statement. A count of zero, a non-constant bound, a push
+under an `if`, or any other mention of `o` ends the region where it stands; whatever is counted
+before it is still reserved.
+
+**Every region push still tests its count against the reserve.** Past it, the push writes the
+count to `len` and takes the ordinary growing append. The analysis is exact by construction,
+so this branch never runs, and it costs about 15% on SP-036's product (a hand-edited build
+without it reads 119–123 ms against 132–137 ms). It stays because the reserve is an
+optimisation whose input is an AST walk, and a walk that is wrong one day should cost a
+growth, not a wrong list: a seed that reserves HALF the count passes the 660-cell grid in D3623
+unchanged. Moving the growing append to an out-of-line helper measured about 7% and is not
+built.
+
+**Two neighbours had to learn about a region push, and they were worth more than the reserve
+itself.** A push is a `Call`, and both the list-header hoist (`hoistSafeExpr`) and the unroller
+(`unrollCost`) refuse a call. A region push moves only its own fresh list, which nothing else
+holds and which the region never indexes, so the hoist may keep other lists' headers in locals
+across it; and it is inline code, so it may unroll, weighing `UNROLL_PUSH_NODES` (16) extra
+nodes for its growing append. Measured on SP-036 (ms, medians): master 168, reserve only 158,
++ locals 150, + hoist 141, + unroll 137; `filled` + index 115.
