@@ -859,6 +859,8 @@ const ACF_TPL = -1
 // A composite argument carrying a hole (`xs: T[]`, `[x]`, `[...xs]`), re-asked at the pin by
 // its own node, as a binding's is, so a literal still adapts element-wise (D3253).
 const ACF_COMP = -2
+// A list index carrying a hole, held at the pin to the direct spelling's `i32` rule (D3584).
+const ACF_INDEX = -3
 
 // D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
 // `print` takes one value of `printDomainStr()`, and the two floors that say so
@@ -4475,6 +4477,13 @@ let cbExpPool: i32[] = [] // flattened expected param-type arena indices
 let cbSeedUsed = 0
 let cbExpRetNode: i32[] = []
 let cbExpRetTy: i32[] = []
+// The type a delivery position expects of the call at a node index (`seedExpected`): what lets
+// a type parameter bound only by literal arguments take the destination's type (D3539).
+let callDstTy: {[i32]: i32} = Map()
+// Whether `callDstTy` holds any row, so a program with no generic call never asks it.
+let callDstAny = false
+// The empty answer of a call no destination binds, shared and never written.
+const NO_DST_NAMES: string[] = []
 
 // Record `retTy` as the expected return type of the lambda at `nodeIx` (latest wins).
 function recordCbExpectedRet(nodeIx: i32, retTy: i32) {
@@ -4914,10 +4923,16 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
         if arm >= 0 { did = seedExpected(u, arm) }
       }
     }
+  } else if en is Call {
+    if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
+  } else if en is IfStmt || en is MatchExpr || en is Block {
+    seedCallDstLeaves(u, expectedTy)
   } else if en is ArrayLit {
     if et is TyArray {
       let i = 0
       while i < en.arrElems.length {
+        const sp = P.nodes[en.arrElems[i]]
+        if sp is Spread { seedCallDstLeaves(sp.spdArg, expectedTy) }
         if seedExpected(en.arrElems[i], et.aElem) != 0 { did = 1 }
         i = i + 1
       }
@@ -5015,6 +5030,8 @@ export function initChecker() {
   cbSeedUsed = 0
   cbExpRetNode = []
   cbExpRetTy = []
+  callDstTy = Map()
+  callDstAny = false
   valBindLambda = []
   voidCtxLambdaNodes = []
   voidCoerceValNodes = []
@@ -41772,6 +41789,14 @@ function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
       ix,
     )
   }
+  if argCstrForm[ci] == ACF_INDEX {
+    return tErr(
+      "array index must be i32, got "
+        + tyToStr(rat)
+        + " (the call's argument types)",
+      ix,
+    )
+  }
   if argCstrForm[ci] == ACF_TPL {
     return tErr(
       "an interpolation hole is `string` or "
@@ -46128,6 +46153,14 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     if p0 is TyVar {
       if !holeDemandOk(p0.tvName, -1, recvTy) { return -1 }
     }
+    // The receiver is the first argument a literal can be, for the destination's binding.
+    const uDst: string[] = []
+    const uArgs: i32[] = []
+    if callDstTyOf(ix) >= 0 && !callHasTyArgs(ix) {
+      uArgs.push(ufcsRecvExpr(n))
+      for a in args { uArgs.push(a) }
+      dstBindLitTyParams(ix, retTy, params, uArgs, bNames, bTys, uDst)
+    }
     bindGenWalk(params[0], recvTy, bNames, bTys)
     // The receiver's half of the `u8[]`-meets-a-generic rule the direct-call spelling already
     // enforces: `bindGenWalk` above declined to bind `T` to storage type `u8`, so the
@@ -46184,6 +46217,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         argMismatchErr(i + 1, expected, at, args[i])
       }
       i = i + 1
+    }
+    if uDst.length > 0 && !inferQuiet {
+      dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)
     }
     // The uninferable-return gate reads the declaration, so `xs.f()` and `f(xs)` answer alike;
     // the receiver is `self`, a parameter like any other for the purpose of binding.
@@ -47680,6 +47716,11 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if explicitTa {
     if !bindExplicitTyArgs(cfn, ix, bNames, bTys) { return TY_ERR }
   }
+  let dstNames = NO_DST_NAMES
+  if !explicitTa && callDstTyOf(ix) >= 0 {
+    dstNames = []
+    dstBindLitTyParams(ix, ft.fnRet, params, args, bNames, bTys, dstNames)
+  }
   const argOrder = lambdaLastOrder(params, args)
   let oi = 0
   while oi < argOrder.length {
@@ -47803,6 +47844,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     }
     oi = oi + 1
   }
+  if dstNames.length > 0 && !inferQuiet {
+    dstRetypeLitArgs(dstNames, params, args, bNames, bTys)
+  }
   // After the arguments, so a mismatched argument gets the more specific diagnostic first;
   // the answer itself is the callee's declaration, not this site's bindings.
   if cfn is Ident {
@@ -47922,6 +47966,275 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     noteEscJoin(retTy, ix, ejWho)
   }
   return cRetTy
+}
+
+function setCallDstTy(ix: i32, ty: i32) {
+  if ix < 0 { return 0 }
+  callDstTy[ix] = ty
+  callDstAny = true
+  0
+}
+
+// The type `setCallDstTy` recorded for the call at `ix`, or -1.
+function callDstTyOf(ix: i32): i32 {
+  if !callDstAny { return -1 }
+  callDstTy[ix] ?? -1
+}
+
+// Whether the call `c` names a declared function with type parameters, or is a method call:
+// the only callees whose instance a destination can choose.
+function callNamesGenericDecl(c: Call): boolean {
+  // A method resolves to its `self`-function only at the call, so it is always recorded.
+  if ufcsRecvExpr(c) >= 0 { return true }
+  const name = calleeIdentName(P.nodes[c.callFn])
+  if name == "" { return false }
+  // A top-level name is one table read; a local takes the scope chain.
+  let d = fnDeclIx[name] ?? -1
+  if d < 0 { d = lookupFnDeclNode(name) }
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return dn.fnTyParams.length > 0 }
+  false
+}
+
+// Whether any argument is literal-only, the precondition a destination binding needs, read
+// before anything costlier.
+function anyArgIsLitOnly(args: i32[]): boolean {
+  for a in args {
+    if argIsLitOnly(a, 4) { return true }
+  }
+  false
+}
+
+// Binds each type parameter of the generic return `ret` from the type the call's destination
+// expects, when every argument that would bind it is a literal adapting to that type, so
+// `const hs: f32[] = filled(4, 0.0)` is `filled<f32>` as an annotated literal is an `f32` (D3539).
+function dstBindLitTyParams(
+  ix: i32,
+  ret: i32,
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+  outNames: string[],
+) {
+  const dst = callDstTyOf(ix)
+  if dst < 0 || ret < 0 || !anyArgIsLitOnly(args) || !tyHasTyVar(ret) {
+    return 0
+  }
+  const dN: string[] = []
+  const dT: i32[] = []
+  bindGenWalk(ret, dst, dN, dT)
+  let k = 0
+  while k < dN.length {
+    if bindOf(bNames, bTys, dN[k]) < 0 {
+      if dstTyParamAdapts(dN[k], dT[k], params, args, ix, ret, dst) {
+        bNames.push(dN[k])
+        bTys.push(dT[k])
+        outNames.push(dN[k])
+        // The annotation chose the instance, so it is not redundant (D1442).
+        cbSeedUsed = cbSeedUsed + 1
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Records each literal argument that bound one of `names` at its parameter's substituted
+// type, which is the type the instance is pinned by (`monoArgPinTyIx`) and the literal emitted at.
+function dstRetypeLitArgs(
+  names: string[],
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+) {
+  let i = 0
+  while i < params.length && i < args.length {
+    let hit = false
+    for nm in names {
+      if tyMentionsTyVarNamed(params[i], nm, 8) { hit = true }
+    }
+    if hit && args[i] >= 0 {
+      const pt = substTyDeep(params[i], bNames, bTys)
+      nodeTyRecord(args[i], pt)
+      nodeTyRecord(parenPeelIx(args[i]), pt)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether the destination's `cand` for type parameter `name` replaces the arguments' own
+// binding: every argument binding it is a literal `cand` holds within the literal's kind, and
+// the instance they would choose cannot be delivered to `dst` at the call `ix`.
+function dstTyParamAdapts(
+  name: string,
+  cand: i32,
+  params: i32[],
+  args: i32[],
+  ix: i32,
+  ret: i32,
+  dst: i32,
+): boolean {
+  if cand < 0 || cand == TY_ERR || isVoidTy(cand) || tyHasTyVar(cand) {
+    return false
+  }
+  // A body computing on `T` can leave a literal union, so the destination never binds one
+  // (D3602 is the same escape with the type argument written).
+  if tyIsLitUnionLike(cand, 4) { return false }
+  const one: string[] = [name]
+  const oneT: i32[] = [cand]
+  let seen = 0
+  let own = -1
+  let i = 0
+  while i < params.length {
+    if tyMentionsTyVarNamed(params[i], name, 8) {
+      if i >= args.length || args[i] < 0 || !argIsLitOnly(args[i], 4) {
+        return false
+      }
+      const want = substTyDeep(params[i], one, oneT)
+      const x = parenPeelIx(args[i])
+      if x < 0 || x >= P.nodes.length { return false }
+      const isCall = P.nodes[x] is Call
+      const savedQ = inferQuiet
+      let at = -1
+      if isCall {
+        // A nested call is asked twice, speculatively: what it binds on its own, and whether the
+        // destination's type, delivered to it in turn, is what it then answers.
+        inferQuiet = true
+        setCallDstTy(x, -1)
+        at = checkNode(args[i])
+        setCallDstTy(x, want)
+        inferQuiet = savedQ
+      } else {
+        at = checkNode(args[i])
+      }
+      const aN: string[] = []
+      const aT: i32[] = []
+      bindGenWalk(params[i], at, aN, aT)
+      if own < 0 { own = bindOf(aN, aT, name) }
+      // Within the literal's kind only: an integer literal never makes `T` a float (B′).
+      const wk = numKindMask(want, 8)
+      if wk == 0 || (wk & ~numKindMask(at, 8)) != 0 { return false }
+      inferQuiet = true
+      if isCall { at = checkNode(args[i]) }
+      const ok = at >= 0 && assignableExpr(args[i], at, want)
+      inferQuiet = savedQ
+      if !ok { return false }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  if seen == 0 || own < 0 || tySame(own, cand) { return false }
+  // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
+  // is the program's, and a body doing arithmetic on `T` must keep computing at it.
+  const savedQ2 = inferQuiet
+  inferQuiet = true
+  const one2: string[] = [name]
+  const own2: i32[] = [own]
+  const ownRet = substTyDeep(ret, one2, own2)
+  // `assignable` alone admits a list into a wider-element list; the delivery refuses that.
+  const deliverable = assignable(ownRet, dst)
+    && !objShapeAdapterlessAt(ix, ownRet, dst)
+  inferQuiet = savedQ2
+  !deliverable
+}
+
+// Whether `ty` is a literal type or a union of them, nullable or not, or a list of one.
+function tyIsLitUnionLike(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyLit { return true }
+  if t is TyNullable { return tyIsLitUnionLike(t.nInner, depth - 1) }
+  if t is TyArray { return tyIsLitUnionLike(t.aElem, depth - 1) }
+  if t is TyUnion {
+    let lits = 0
+    for m in t.uMembers {
+      if !isNullTy(m) {
+        if !tyIsLitUnionLike(m, depth - 1) { return false }
+        lits = lits + 1
+      }
+    }
+    return lits > 0
+  }
+  tyNotLitUnionLike()
+}
+
+// Every other type (a primitive, record, map or function) holds values outside any literal set.
+function tyNotLitUnionLike(): boolean { false }
+
+// The numeric kinds `ty` holds, through lists, nullables and unions: 1 for an integer, 2 for a
+// float, 0 for none.
+function numKindMask(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyArray { return numKindMask(t.aElem, depth - 1) }
+  if t is TyNullable { return numKindMask(t.nInner, depth - 1) }
+  if t is TyLit { return numKindMask(litBaseTy(t), depth - 1) }
+  if t is TyUnion {
+    let m = 0
+    for u in t.uMembers { m = m | numKindMask(u, depth - 1) }
+    return m
+  }
+  const pn = primNameOf(ty)
+  if pn == "f64" || pn == "f32" { return 2 }
+  if isNumericPrimTy(ty) { return 1 }
+  0
+}
+
+// Whether the argument at `ix` is a number literal, an operator tree of them, a literal
+// `const`, or a non-empty list literal of those: a value whose type its destination decides.
+function argIsLitOnly(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth <= 0 { return false }
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  if litTreeOps(x, 8) >= 0 || isFloatLitExpr(x) || readsLitConst(x) {
+    return true
+  }
+  const n = P.nodes[x]
+  if n is ArrayLit {
+    if n.arrElems.length == 0 { return false }
+    for e in n.arrElems {
+      if !argIsLitOnly(e, depth - 1) { return false }
+    }
+    return true
+  }
+  // A call over such values is one too, the destination being delivered on to it in turn.
+  if n is Call {
+    if n.callArgs.length == 0 { return false }
+    for e in n.callArgs {
+      if !argIsLitOnly(e, depth - 1) { return false }
+    }
+    return true
+  }
+  argNotLitOnly()
+}
+
+// Every other node, a name, a lambda or a record literal among them, has a type of its own.
+function argNotLitOnly(): boolean { false }
+
+// Records `ty` as the destination of each call `ix` yields: itself, or a leaf of the `if`,
+// `match` or block it is, so a type parameter its literals bind reads the destination too.
+function seedCallDstLeaves(ix: i32, ty: i32) {
+  const todo: i32[] = [ix]
+  let guard = 0
+  while todo.length > 0 && guard < 64 {
+    guard = guard + 1
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        if !tailPushBlockTail(at, todo) {
+          const cn = P.nodes[at]
+          if cn is Call {
+            if callNamesGenericDecl(cn) { setCallDstTy(at, ty) }
+          }
+        }
+      }
+    }
+  }
+  0
 }
 
 // `p?.f(args)` — one guard over the receiver covers the whole call, so the callee and the
@@ -68716,6 +69029,9 @@ function checkIndexNode(n: Index, ix: i32) {
   }
   if !assignable(idxTy, TY_I32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+  } else if tyHasTyVar(idxTy) {
+    // A hole passes vacuously; the pin asks again at the type it binds (D3584).
+    noteArgCstr(idxTy, TY_I32, "", ACF_INDEX, -1)
   }
   if at is TyUnion {
     // An index that is not an `i32` is already reported above.
