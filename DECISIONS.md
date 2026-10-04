@@ -5894,10 +5894,11 @@ consequences worth writing down rather than discovering. The row now needs the b
 a working seed where a `stat` and a `json.load` needed neither, which is why it sits after the
 build in both callers and cannot report when the seed itself is broken. And the port is graded
 by having RUN BESIDE the Python, output for output, with the three places they could not agree
-named and asserted in `tests/vl_seed_size_port_test.ts` — the one-decimal percentage's rounding
-(there is no fixed-precision renderer in `std:fmt`), the tool its own regressed message names,
-and the stream a loud failure uses (VL has no stderr sink). The two gaps have rulings in
-`open-rulings.md` §D; the port routes around them with comments naming each.
+named and asserted in `tests/vl_seed_size_test.ts` — the one-decimal percentage's rounding
+of an exact tie (`std:fmt`'s `toFixed` breaks it away from zero, the Python's `+.1f` to even),
+the tool its own regressed message names, and the stream a loud failure uses (VL has no stderr
+sink). The stderr gap has a ruling pending in `open-rulings.md` §D; the precision gap was
+ruled 2026-10-03 and `pctStr` now calls `toFixed`.
 
 ### Why +3%, and why it does not block on shrinkage
 
