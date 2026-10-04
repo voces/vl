@@ -788,8 +788,6 @@ let njHeldNodes: {[i32]: boolean} = Map()
 let njFnStack: i32[] = []
 // The deferred return joins of runtime witnesses, which re-join apart wherever they collapse.
 let apartHoleJoins: {[i32]: boolean} = Map()
-// The `HD_COAL` rows whose default is a runtime value, joined apart at the pin (`coalHoleJoin`).
-let coalApartRows: {[i32]: boolean} = Map()
 
 // The uncollapsed deferred join a call site could not decide, parked under that call's node
 // index. `collapseDeferredJoin` hands the emitter-safe collapse out as the call's type — a
@@ -5115,7 +5113,6 @@ export function initChecker() {
   njFnStack = []
   njPinFn = -1
   apartHoleJoins = Map()
-  coalApartRows = Map()
   dJoinNode = []
   dJoinTy = []
   escJoinTy = []
@@ -19953,14 +19950,30 @@ function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
 // The join of a `??`'s non-null left type `l` and its default `d` (typed `dt`) when the two are
 // runtime numbers that could part, joined apart as `joinArmLit` joins the `if` the operator
 // spells; -1 when the ordinary `??` rules decide (a literal or hole default, a gated function).
-function coalJoinApart(l: i32, dt: i32, d: i32): i32 {
+function coalJoinApart(lhs: i32, l: i32, dt: i32, d: i32): i32 {
   if !njMayPart(l, dt) || tyIsHole(dt) || armLit(dt, d) { return -1 }
-  if njJoinGated(l, dt, false) || njFnTyParams(njFnIx) { return -1 }
+  if njJoinGated(l, dt, false) || njFnOpen(njFnIx) || !coalLhsParts(lhs) {
+    return -1
+  }
   joinArmLit(l, false, dt, false)
 }
 
-// Whether function `fx` declares type parameters. A `??` in its body keeps master's widening at
-// every pin, since its instance lowers the result at the left operand's own rep (D2562).
+// Whether a `??` whose left operand is `lhs` may join its default apart: a field, an index or a
+// method call's result keeps master's widening, since the emitter reads those at the operand's
+// own rep (D3451). A `??` in a generic or hole body keeps it too (D2562).
+export function coalLhsParts(lhs: i32): boolean {
+  const x = parenPeelIx(lhs)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = P.nodes[x]
+  if n is Member || n is Index { return false }
+  if n is Call { return !(P.nodes[n.callFn] is Member) }
+  if n is BinExpr {
+    if n.binOp == "??" { return coalLhsParts(n.binLeft) }
+  }
+  true
+}
+
+// Whether function `fx` declares type parameters.
 function njFnTyParams(fx: i32): boolean {
   if fx < 0 || fx >= P.nodes.length { return false }
   const fn = P.nodes[fx]
@@ -19993,19 +20006,6 @@ function njMayPart(a: i32, b: i32): boolean {
   if sa == 0 { return false }
   const sb = njNumSig(b, 0)
   sb != 0 && (sa != sb || sa >= 16)
-}
-
-// The `??` result a pin resolves (`HD_COAL`) from the pin's non-null face `l` and default `d`:
-// a runtime default of another number type joins apart, as the concrete `??` does.
-function coalHoleJoin(row: i32, l: i32, d: i32): i32 {
-  if (coalApartRows.get(row) ?? false) && njMayPart(l, d) {
-    njApart = true
-    const j = joinTys(l, d)
-    njApart = false
-    return j
-  }
-  if assignable(d, l) { return l }
-  joinTys(l, d)
 }
 
 // Marks a join kept apart over a type parameter (`tpJoinUnions`), or the union inside its
@@ -43132,7 +43132,8 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     const cInner = nonNullTy(cPin)
     const cDft = substTyDeep(hdInner[row], bNames, bTys)
     if cDft < 0 || tyHasHole(cDft) { return cInner }
-    return coalHoleJoin(row, cInner, cDft)
+    if assignable(cDft, cInner) { return cInner }
+    return joinTys(cInner, cDft)
   }
   // The `??` result over a hole default: the concrete tail, now that the default has a type.
   if kind == HD_COALD {
@@ -61050,7 +61051,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       }
       if tyIsHole(rt) && !tyIsHole(innerFull) { coalDefNote(ix, innerFull, rt) }
       // A runtime default of another number type joins apart, as the `if` it spells does.
-      const apart = coalJoinApart(innerFull, rt, n.binRight)
+      const apart = coalJoinApart(n.binLeft, innerFull, rt, n.binRight)
       if apart >= 0 { return apart }
       // When the default fits the non-null LHS type (with contextual coercion), the `??` result
       // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
@@ -61062,10 +61063,6 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // floor the pin re-asks then refused a receiver whose type after `??` is non-null (D1693).
     const cd = mkDerivedHole(HD_COAL, "", rt, -1, lt)
     if cd >= 0 {
-      if !armLit(rt, n.binRight) && !njFnReached(njFnIx) {
-        // arena-tick exempt: a per-program mark on a fresh derived row.
-        coalApartRows[hdRowOfTy[cd]] = true
-      }
       noteCoalResultHole(cd)
       return cd
     }

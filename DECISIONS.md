@@ -9526,8 +9526,7 @@ the member's own value.
 the `if q != null { q } else { b }` it spells, and `[a, b]` holds what `[if c { a } else { b }]`
 holds, so rewriting one spelling as the other must not change what a program prints.
 - A runtime default of another number type joins apart (`coalJoinApart`): `q ?? b` over
-  `i32 | null` and `f64` is `i32 | f64`. A literal default still adapts (`q ?? 2.5` is `f64`). A
-  hole's pin resolves the same join (`coalHoleJoin`, from a mark on the `HD_COAL` row).
+  `i32 | null` and `f64` is `i32 | f64`. A literal default still adapts (`q ?? 2.5` is `f64`).
 - A list literal joins its runtime elements apart and then lets each literal element adapt to
   that join (`listJoinApart`), so element order does not decide the type: `[a, b, 4]` over `i32`
   and `f64` is `(i32 | f64)[]` with `4` an `i32`, `[a, 2.5]` over `i32` is `f64[]`, and `[1, 2.5]`
@@ -9535,24 +9534,29 @@ holds, so rewriting one spelling as the other must not change what a program pri
   the literal first types its inner pair before the runtime arm arrives.
 - An annotated destination converts as for any numeric union: `const xs: f64[] = [a, b]` builds
   an `f64[]`, and a member that does not convert exactly is refused.
-- Three positions keep master's widening, each because joining apart there reaches a defect the
-  lane did not fix: a `??` in a body that declares type parameters (its instance lowers the
-  result at the left operand's rep, D2562), a list literal with a literal element in a generic or
-  hole body (the pin's re-join cannot tell the literal's member from a runtime one, D3534), and
-  a list with a nullable runtime element outside such a body (a generic `==` over the resulting
-  `T | U | null` traps or does not lower, D3535).
+- Four positions keep master's widening, each because joining apart there reaches a defect the
+  lane did not fix: a `??` whose left operand is a field, an index or a method call's result
+  (`coalLhsParts`: the emitter's `??` lowerings read those at the operand's own rep), a `??` in a
+  generic or hole body (its instance lowers the result at the left operand's rep, D2562, D3580),
+  a list literal with a literal element in a generic or hole body (the pin's re-join cannot tell
+  the literal's member from a runtime one, D3534), and a list with a nullable runtime element
+  outside such a body (a generic `==` over the resulting `T | U | null` traps or does not lower,
+  D3535).
 - Where a literal sits beside a runtime number, `??` adapts it by its value and the `if` by its
   type (`q ?? 5` over `f32 | null` is `f32`, the `if` is `f32 | i32`). That divergence is older
   than this ruling and is the owner's question in D3536.
 
 Measured on the NJ2 twin grid (7,484 programs: every `??`, list literal and `??` chain beside its
 `if`/`match` twin, over `i32`/`i64`/`f32`/`f64`, their nullables, two-member unions and three
-literals, at 17 positions): master's 1,535 twin disagreements fall to 381, every one of them
-either master's own (332 cells unchanged on both spellings) or a literal tail in a chain (49,
-D3536); 0 runs lost except 5 the ruling's own types refuse (a `+` over `i32 | f64 | f32`, two
-`indexOf` over `(i32 | f32 | f64)[]`, two `is i32` over a list `5` adapts into as `i64` or
-`f64`); 0 new invalid wasm or traps, and 344 master invalid-wasm cells run. The `if` spelling's
-outputs did not move in any cell.
+literals, at 17 positions): master's 1,535 twin disagreements fall to 390, every one of them
+either master's own (341 cells unchanged on both spellings) or a literal tail in a chain (49,
+D3536); 0 new invalid wasm or traps, and 344 master invalid-wasm cells run. The #3353 review's
+left-operand shape grid (192: local, field, index, `.get()`, call, `?.`) loses no run, and its
+1,280-cell grid loses 16, each a `[a(), b()] == [a(), b()]` whose `==` over a list of a number
+union has no lowering (its `if`-spelled twin refuses the same way on master). Runs lost on the
+twin grid are 5, each the ruling's own type: a `+` over `i32 | f64 | f32`, two `indexOf` over
+`(i32 | f32 | f64)[]`, two `is i32` over a list `5` adapts into as `i64` or `f64`. The `if`
+spelling's outputs did not move in any cell.
 
 **`as T` over an all-numeric union converts when no member can fail** (a float target, or `i64`
 over integer members), because that is what the ruling's fix message (`write x as f64`) needs
