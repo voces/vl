@@ -1106,6 +1106,32 @@ Deno.test({ name: "wasm-checker: shadowed-local warns on the inner binding's nam
   if (quiet.length !== 0) throw new Error(`a lambda binding fired: ${JSON.stringify(quiet)}`);
 });
 
+Deno.test({ name: "wasm-checker: shadowed-function warns on a local hiding a function it calls above (D3599)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-029: `over` is called, then a `const over` hides the module's function.
+  const src = "function over(x: i32) { x + 1 }\n" +
+    "export function f(k: i32) {\n" +
+    "  let a = over(k)\n" +
+    "  const over = 3\n" +
+    "  a + over\n" +
+    "}\n";
+  const diags = checker.lint(src).filter((x) => x.code === "shadowed-function");
+  if (diags.length !== 1) throw new Error(`want one shadowed-function, got ${JSON.stringify(diags)}`);
+  const d = diags[0];
+  const want = "`over` shadows the function `over` declared at 1:10, which this function calls " +
+    "above it; below it the name means the binding, so rename one";
+  if (d.severity !== "warning" || d.message !== want) {
+    throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+  }
+  if (d.range.start.line !== 3 || rangeText(src, d.range) !== "over") {
+    throw new Error(`want the range over the \`const\`'s name on line 3, got ${JSON.stringify(d.range)}`);
+  }
+  // The control: a binding named like a builtin the function never calls is quiet.
+  const quiet = checker.lint("function h(max: i32) { max + 1 }\nprint(h(1))\n")
+    .filter((x) => x.code === "shadowed-function");
+  if (quiet.length !== 0) throw new Error(`an uncalled builtin name fired: ${JSON.stringify(quiet)}`);
+});
+
 Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   // The owner's case: `const n = P.nodes[ix]` highlighted `P`, one column, because the

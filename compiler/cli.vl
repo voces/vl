@@ -255,9 +255,19 @@ let cliFix = 0         // check --fix: apply the safe lint fixes in place
 let cliFixCount = 0    // total safe fixes applied across the run
 let cliFixDeclined = 0 // total edits VERIFY-AND-REVERT threw away across the run
 let cliLintGraphed = 0 // 1 = the current file's lint ran module-aware (lintGraph)
-let cliFileFixed = 0   // 1 once the current file's fixes were applied — so
+let cliFileFixed = 0   // 1 once the current file's fixing is finished — so
 // the module-aware re-check (for the report) does not re-fix. Reset per file in
 // `cliStartFile`.
+
+// `--fix` runs in rounds: each re-checks the source the last one wrote, since a fix
+// can expose another (a removed annotation orphans the import that named its type).
+// It stops at the first round that applies nothing, or at the cap.
+const FIX_ROUND_CAP = 10
+let cliFixRound = 0            // rounds applied to the current file
+let cliFixRoundsMax = 0        // the most rounds any file of the run took
+let cliFixCapHit = 0           // files that reached the cap with fixes still pending
+let cliFixKinds: string[] = [] // per-kind tally of the applied fixes, for the summary
+let cliFixKindN: i32[] = []
 
 // ── verify-and-revert (D1091) ────────────────────────────────────────────────
 
@@ -468,6 +478,11 @@ export function cliArgReset() {
   cliFixDeclined = 0
   cliLintGraphed = 0
   cliFileFixed = 0
+  cliFixRound = 0
+  cliFixRoundsMax = 0
+  cliFixCapHit = 0
+  cliFixKinds = []
+  cliFixKindN = []
   cliFixPhase = FIXP_OFF
   cliFixTrial = 0
   cliFixOrig = ""
@@ -1271,13 +1286,16 @@ function cliCheckCurFileRest() {
   }
 
   // `--fix`, module-aware: the redundant-annotation and lint streams are reliable after
-  // the resolved check, so apply the safe edits, write the file and re-check so the
-  // report reflects the fixed source. `cliFileFixed` guards the re-check from re-fixing.
-  // Fixing after imports resolve is what makes it safe; without them the types are not.
+  // the resolved check, so apply the safe edits, write the file and re-check, which is
+  // the next round. Fixing after imports resolve is what makes it safe.
   if cliFix != 0 && cliFileFixed == 0 {
-    cliFileFixed = 1
     cliCollectFixes(cliEntrySrc)
-    if cliFixEditPos.length > 0 {
+    if cliFixEditPos.length > 0 && cliFixRound >= FIX_ROUND_CAP {
+      cliFixCapHit = cliFixCapHit + 1
+      cliFixFileDone()
+    } else if cliFixEditPos.length == 0 {
+      cliFixFileDone()
+    } else {
       cliFixOrig = cliEntrySrc
       // Trial one: every edit at once. On the overwhelming majority of files it
       // holds, and then verification costs exactly one compile.
@@ -1515,16 +1533,37 @@ function cliHiddenNote(n: i32, nWarn: i32, what: string, flag: string) {
 // the per-stage note (`(type error)`) tooling greps for; a directory run aggregates
 // across files and omits it.
 function cliFinishSummary() {
-  // `--fix`: note how many safe fixes this run applied, ahead of the check report. A
-  // declined edit is one verify-and-revert threw away because the rewritten file
-  // stopped building (D1091).
-  if cliFix != 0 && (cliFixCount > 0 || cliFixDeclined > 0) {
-    let note = "Applied " + i32ToStr(cliFixCount) + " fix(es)."
+  // `--fix`: note how many safe fixes this run applied, of which kinds and over how many
+  // rounds, ahead of the check report. A declined edit is one verify-and-revert threw
+  // away because the rewritten file stopped building (D1091).
+  if (
+    cliFix != 0
+    && (cliFixCount > 0 || cliFixDeclined > 0 || cliFixCapHit > 0)
+  ) {
+    let note = "Applied " + i32ToStr(cliFixCount) + " fix(es)"
+    if cliFixCount > 0 {
+      note = note + " in " + i32ToStr(cliFixRoundsMax) + " round(s):"
+      let fk = 0
+      while fk < cliFixKinds.length {
+        if fk > 0 { note = note + "," }
+        note = note + " " + i32ToStr(cliFixKindN[fk]) + " " + cliFixKinds[fk]
+        fk = fk + 1
+      }
+    }
+    note = note + "."
     if cliFixDeclined > 0 {
       note = note
         + " Declined "
         + i32ToStr(cliFixDeclined)
         + " that stopped the file building."
+    }
+    if cliFixCapHit > 0 {
+      note = note
+        + " Stopped after "
+        + i32ToStr(FIX_ROUND_CAP)
+        + " rounds with fixes still to apply in "
+        + i32ToStr(cliFixCapHit)
+        + " file(s); run `--fix` again."
     }
     cliOut.push(cliAnsi(cliColor, "2", note))
   }
@@ -1984,6 +2023,7 @@ function cliStartFile() {
   // file is an error); one the walk found keeps the directory run's shape.
   cliDirMode = cliFileFromDir[cliFileIdx]
   cliFileFixed = 0
+  cliFixRound = 0
   cliFixPhase = FIXP_OFF
   cliFixOrig = ""
   cliFixEditPos = []
@@ -2052,9 +2092,9 @@ function cliBeginCheck() {
 // ── check --fix ──────────────────────────────────────────────────────────────
 
 // Collect the auto-fix edits for `src` into `cliFixEdit*`, ordered by start offset,
-// from the two safe fixes: prefer-const, and a redundant annotation's `: T ` span
-// becoming one space. Unused-variable is not fixed — the `_` prefix silences a
-// warning. Precondition: the module-aware check and `lintSrc` have run over `src`.
+// from the safe fixes: prefer-const, a redundant annotation's `: T ` span becoming one
+// space, and an unused import's specifier removed. Unused-variable is not fixed — the `_`
+// prefix silences a warning. Precondition: the module-aware check and lint ran over `src`.
 function cliCollectFixes(src: string) {
   cliFixEditPos = []
   cliFixEditLen = []
@@ -2076,6 +2116,9 @@ function cliCollectFixes(src: string) {
   const what = cliFixEditWhat
   const eln = cliFixEditLine
   const ecl = cliFixEditCol
+  // The `{` of each import clause holding an unused-import finding, and every finding's offset.
+  const impLb: i32[] = []
+  const impOff: i32[] = []
   let k = 0
   while k < n {
     const code = cliLintCodeAt(k)
@@ -2099,10 +2142,21 @@ function cliCollectFixes(src: string) {
           eln.push(ln + 1)
           ecl.push(col)
         }
+      } else if code == "unused-import" {
+        const lb = cliImportBraceOf(src, off)
+        if lb >= 0 {
+          let seen = false
+          for x in impLb {
+            if x == lb { seen = true }
+          }
+          if !seen { impLb.push(lb) }
+          impOff.push(off)
+        }
       }
     }
     k = k + 1
   }
+  for lb in impLb { cliImportFixEdits(src, lb, impOff, starts) }
   // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by replacing
   // the span from the name end to the `=` with a single space. The checker computed
   // that span with a depth-aware token scan, so a multi-token or function-type
@@ -2155,6 +2209,147 @@ function cliCollectFixes(src: string) {
     ecl[b + 1] = kcl
     a = a + 1
   }
+  0
+}
+
+// Whether `src[i]` is a space or a tab.
+function cliBlankAt(src: string, i: i32) { src[i] == ' ' || src[i] == '\t' }
+
+// Whether `src[i]` is a space, a tab or a line break.
+function cliSpaceAt(src: string, i: i32) {
+  cliBlankAt(src, i) || src[i] == '\n' || src[i] == '\r'
+}
+
+// The `{` of the `import { … } from "…"` clause around offset `off`, where `import` opens
+// its line; -1 when the text is not that plain shape (a comment in the clause, say), which
+// leaves the finding unfixed rather than guessing at an edit.
+function cliImportBraceOf(src: string, off: i32) {
+  let b = off - 1
+  while b >= 0 && src[b] != '{' {
+    if src[b] == '}' || src[b] == '/' || src[b] == '"' { return -1 }
+    b = b - 1
+  }
+  if b < 0 { return -1 }
+  let k = b - 1
+  while k >= 0 && cliBlankAt(src, k) { k = k - 1 }
+  if k < 5 || src.slice(k - 5, k + 1) != "import" { return -1 }
+  if k - 6 >= 0 && src[k - 6] != '\n' { return -1 }
+  b
+}
+
+// The offset of the `}` closing the clause opened at `lb`; -1 past a comment or the end.
+function cliImportRBrace(src: string, lb: i32) {
+  let r = lb + 1
+  while r < src.length && src[r] != '}' {
+    if src[r] == '/' { return -1 }
+    r = r + 1
+  }
+  if r >= src.length { return -1 }
+  r
+}
+
+// The end of the import statement whose clause closes at `rb`: just past its line's newline,
+// or the source end. -1 unless only `from "…"`, blanks and an optional `;` follow the `}`.
+// `cliImportStd` is set to whether the path names a `std:` module.
+let cliImportStd = false
+function cliImportStmtEnd(src: string, rb: i32) {
+  cliImportStd = false
+  let q = rb + 1
+  while q < src.length && cliBlankAt(src, q) { q = q + 1 }
+  if q + 4 > src.length || src.slice(q, q + 4) != "from" { return -1 }
+  q = q + 4
+  while q < src.length && cliBlankAt(src, q) { q = q + 1 }
+  if q >= src.length || src[q] != '"' { return -1 }
+  cliImportStd = q + 5 <= src.length && src.slice(q + 1, q + 5) == "std:"
+  q = q + 1
+  while q < src.length && src[q] != '"' && src[q] != '\n' { q = q + 1 }
+  if q >= src.length || src[q] != '"' { return -1 }
+  q = q + 1
+  while q < src.length && (cliBlankAt(src, q) || src[q] == ';') { q = q + 1 }
+  if q == src.length { return q }
+  if src[q] == '\n' { return q + 1 }
+  if src[q] == '\r' && q + 1 < src.length && src[q + 1] == '\n' { return q + 2 }
+  -1
+}
+
+// The 1-based line holding offset `off`, given each line's start offset.
+function cliLineOfOff(starts: i32[], off: i32) {
+  let i = 0
+  while i + 1 < starts.length && starts[i + 1] <= off { i = i + 1 }
+  i + 1
+}
+
+// Push the edits that remove the unused specifiers of the import clause opened at `lb`; a
+// specifier is unused when an offset in `offs` falls in it. A removal takes one adjacent
+// comma with it. A clause left empty drops the whole statement, but only for a `std:`
+// module: dropping a module of the program's own would skip its top-level statements.
+function cliImportFixEdits(src: string, lb: i32, offs: i32[], starts: i32[]) {
+  const rb = cliImportRBrace(src, lb)
+  if rb < 0 { return 0 }
+  // Each specifier's content span, trimmed of blanks and newlines.
+  const cs: i32[] = []
+  const ce: i32[] = []
+  let seg = lb + 1
+  let i = lb + 1
+  while i <= rb {
+    if i == rb || src[i] == ',' {
+      let a = seg
+      let e = i
+      while a < e && cliSpaceAt(src, a) { a = a + 1 }
+      while e > a && cliSpaceAt(src, e - 1) { e = e - 1 }
+      if e > a {
+        cs.push(a)
+        ce.push(e)
+      }
+      seg = i + 1
+    }
+    i = i + 1
+  }
+  const unused: boolean[] = []
+  let lastKept = -1
+  let j = 0
+  while j < cs.length {
+    let hit = false
+    for o in offs {
+      if o >= cs[j] && o <= ce[j] { hit = true }
+    }
+    unused.push(hit)
+    if !hit { lastKept = j }
+    j = j + 1
+  }
+  if lastKept < 0 {
+    const end = cliImportStmtEnd(src, rb)
+    if end < 0 || !cliImportStd { return 0 }
+    let st = lb
+    while st > 0 && src[st - 1] != '\n' { st = st - 1 }
+    cliPushFixEdit(st, end - st, "unused import", starts)
+    return 0
+  }
+  // Before the last kept specifier, a removal runs to the next one's start; after it, the
+  // trailing run goes as one edit from the kept one's end.
+  j = 0
+  while j < lastKept {
+    if unused[j] {
+      cliPushFixEdit(cs[j], cs[j + 1] - cs[j], "unused import", starts)
+    }
+    j = j + 1
+  }
+  if lastKept < cs.length - 1 {
+    const from = ce[lastKept]
+    cliPushFixEdit(from, ce[cs.length - 1] - from, "unused import", starts)
+  }
+  0
+}
+
+// Append one deletion of `len` code units at `off` to the `cliFixEdit*` rows.
+function cliPushFixEdit(off: i32, len: i32, what: string, starts: i32[]) {
+  const ln = cliLineOfOff(starts, off)
+  cliFixEditPos.push(off)
+  cliFixEditLen.push(len)
+  cliFixEditTxt.push("")
+  cliFixEditWhat.push(what)
+  cliFixEditLine.push(ln)
+  cliFixEditCol.push(off - starts[ln - 1])
   0
 }
 
@@ -2228,6 +2423,30 @@ function cliFixVerdict(ok: i32) {
   cliBeginCheck()
 }
 
+// Count one applied fix of kind `what` toward the summary.
+function cliFixTally(what: string) {
+  let i = 0
+  while i < cliFixKinds.length {
+    if cliFixKinds[i] == what {
+      cliFixKindN[i] = cliFixKindN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  cliFixKinds.push(what)
+  cliFixKindN.push(1)
+  0
+}
+
+// The current file has no round left to run: fold its last round's declined edits and
+// its round count into the run's totals.
+function cliFixFileDone() {
+  cliFileFixed = 1
+  cliFixDeclined = cliFixDeclined + cliFixDeclinedAt.length
+  if cliFixRound > cliFixRoundsMax { cliFixRoundsMax = cliFixRound }
+  0
+}
+
 // The accepted edit set is final: tally it, leave verification, and hand the
 // result to the report path — writing the file only when it actually changed.
 function cliFixCommit() {
@@ -2239,6 +2458,7 @@ function cliFixCommit() {
   while ki < cliFixKeep.length {
     if cliFixKeep[ki] != 0 {
       kept = kept + 1
+      cliFixTally(cliFixEditWhat[ki])
     } else if ki < cliFixEditWhat.length {
       cliFixDeclinedAt.push(cliFixEditWhat[ki])
       cliFixDeclinedLine.push(cliFixEditLine[ki])
@@ -2247,11 +2467,18 @@ function cliFixCommit() {
     ki = ki + 1
   }
   cliFixCount = cliFixCount + kept
-  cliFixDeclined = cliFixDeclined + (cliFixKeep.length - kept)
   cliFixPhase = FIXP_OFF
   const out = cliApplyFixEdits(cliFixOrig, cliFixKeep)
   cliEntrySrc = out
-  if out == cliFixOrig { return cliBeginCheck() }
+  // A round that changed nothing is the last; its declined edits are the report's.
+  if out == cliFixOrig {
+    cliFixFileDone()
+    return cliBeginCheck()
+  }
+  cliFixRound = cliFixRound + 1
+  cliFixDeclinedAt = []
+  cliFixDeclinedLine = []
+  cliFixDeclinedCol = []
   // Keep the per-run source cache coherent with the rewrite the host is
   // about to perform, so later files that import this one see the fix.
   cliSrcCachePut(cliCurFile, out, 1)
@@ -2346,6 +2573,11 @@ export function cliNext() {
     cliFmtBad = 0
     cliFmtBug = 0
     cliFixCount = 0
+    cliFixDeclined = 0
+    cliFixRoundsMax = 0
+    cliFixCapHit = 0
+    cliFixKinds = []
+    cliFixKindN = []
     cliWalkStack = []
     cliWalkRel = []
     cliFiles = []

@@ -61,6 +61,7 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `map-has-guard-reread` | LANGUAGE (decided) | see below | none | everywhere |
 | `union-let-no-melt` | LANGUAGE (decided) | see below | none | everywhere |
 | `shadowed-local` | LANGUAGE | a block-scoped binding hiding one of the same function (D3579) | n/a (new) | everywhere |
+| `shadowed-function` | LANGUAGE | a function's binding hiding a module function or builtin that the function calls above it (D3599) | n/a (new) | everywhere |
 | `prefer-interpolation` | LANGUAGE (decided) | see below; `scripts/interp-budget.py` holds the repo's own debt | not under `compiler/` | everywhere except `compiler/` (unchanged) |
 | `compiler-no-interpolation` | INTERNAL | the seed must load with no host imports (CLAUDE.md "After editing compiler/*.vl") | `compiler/` only | `compiler/` only (unchanged) |
 | `std-comment-audience` | INTERNAL | `docs/internals/std-api-review.md` §4; no baseline, gated at zero by `lint-self.sh` | `std/` / `std:` only | `std/` / `std:` only (unchanged) |
