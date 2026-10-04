@@ -167,6 +167,59 @@ const expectLine = (got: string, want: string, what: string) => {
   }
 };
 
+// A trap inside a producer whose record the caller only reads: at -O/-O3 the call goes to
+// the multi-value step's twin, and the step moved the code the map names, so the map was
+// made again from the moved rows (D3625). The step leaves its output only when it rewrote the
+// module, so the dump's presence is what says there was a twin to trap in.
+for (const flags of [["-O"], ["-O3"], ["-O3", "--names"]]) {
+  Deno.test({
+    name: `vl addr2line: a trap in a multi-value twin keeps its line [${
+      flags.join(" ")
+    }]`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const tmp = await Deno.makeTempDir();
+      try {
+        const wasm = `${tmp}/record.wasm`;
+        const dump = `${tmp}/step.wasm`;
+        const r = await new Deno.Command(VL, {
+          args: [
+            "build",
+            `${DIR}/record.vl`,
+            "--compiler",
+            COMPILER,
+            "-o",
+            wasm,
+            ...flags,
+            "--source-map",
+          ],
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ VL_WASM_OPT: WASM_OPT, VL_OPT_MV_DUMP: dump }),
+        }).output();
+        if (r.code !== 0) {
+          throw new Error(`build: ${new TextDecoder().decode(r.stderr)}`);
+        }
+        try {
+          Deno.statSync(dump);
+        } catch {
+          throw new Error(
+            "the multi-value step changed nothing: no twin to trap in",
+          );
+        }
+        const frame = topFrame(await trapTrace(wasm, "pick", 7));
+        expectLine(
+          await addr2line(wasm, frame),
+          `${DIR}/record.vl:4:`,
+          frame,
+        );
+      } finally {
+        await Deno.remove(tmp, { recursive: true });
+      }
+    },
+  });
+}
+
 for (const flags of [[], ["-O"], ["-O3"], ["--names"], ["-O3", "--names"]]) {
   Deno.test({
     name: `vl addr2line: sunpa's witness traps on line 5 [${
