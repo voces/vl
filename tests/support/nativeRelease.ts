@@ -162,7 +162,11 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // around it is local scalarization across a liveness window: a rep change
   // (`unboxed-union-rep-design.md` §12.4), not a sink.
   { fixture: "union-box-branch-local-read", none: 4, O: 4, O3: 4 },
+  // D3623 split this row. Its unconditional pushes are now counted and the list is reserved,
+  // which melts it outright (10/0/0, `list-wrapper-push-reserved`); the grown worst case keeps
+  // its row, unchanged, by putting the pushes under an `if`.
   { fixture: "list-wrapper-push", none: 9, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push-reserved", none: 10, O: 0, O3: 0 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
@@ -634,6 +638,18 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // out of run-once code"). Timed at `-O3`: V8 1.70 -> 1.42 s, wasmtime 2.27 -> 2.05 s.
     O: { bytes: 694, fns: 2, allocs: 3, indirect: 0 },
     O3: { bytes: 648, fns: 2, allocs: 3, indirect: 0 },
+  },
+  // A KNOWN-SIZE LIST BUILT BY `push` (sunpa SP-036, D3623). The 16 pushes sit in a constant
+  // 4x4 nest, so the list is reserved at 16 and each push appends through two locals while
+  // under it; with the push inline the 4-trip loop unrolls, which is the +900 bytes. `allocs`
+  // 7 -> 10 is the growing append's cold `array.new_default`, kept in each unrolled copy.
+  // Master was 876 / 840 bytes and 7 allocs: no reserve, three growths per product.
+  // SHOULD MOVE IF: the reserve or the region's append stops firing, or a push stops unrolling.
+  {
+    bench: "arrays/push-known-size",
+    axis: "building a list of compile-time-known size with push",
+    O: { bytes: 1787, fns: 2, allocs: 10, indirect: 0 },
+    O3: { bytes: 1721, fns: 2, allocs: 10, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). Adds a `struct.get` per element to the
   // fill-sum shape, and `allocs: 3` says the per-element structs are allocated once during
