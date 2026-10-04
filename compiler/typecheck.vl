@@ -48956,7 +48956,9 @@ function checkCallNode(n: Call, ix: i32) {
 
 // Whether `nm` is a builtin a call reaches with nothing declared or imported: a lowered library
 // value (`print`, `Map`, `Set`, `fromCodePoint`), a numeric intrinsic or an emitter intrinsic.
+// A `__`-spelled intrinsic is the compiler's floor, std's to call, so it is not one.
 export function isBuiltinCallName(nm: string): boolean {
+  if nm.length >= 2 && nm.slice(0, 2) == "__" { return false }
   nm == "print"
     || nm == "Map"
     || nm == "Set"
@@ -65234,51 +65236,48 @@ function castConstDecide(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
 }
 
 // A cast whose operand's own shape bounds it into the target's domain cannot fail (D3622), so it
-// becomes the `as%` it then equals and answers the target in every mode. The bounds are
-// `castBoundBits`'; a float, a union or any other operand keeps its fallible cast.
+// becomes the `as%` it then equals and answers the target in every mode. The bounds read no
+// width, so an operand an `i32` here and an `i64` at a later pin or store is bounded alike.
 function castBoundDecide(n: AsExpr, ix: i32, arg: i32, target: i32): boolean {
   if arg < 0 { return false }
   const sn = primNameStr(primNameOf(arg))
-  let w = 0
-  if sn == "i32" { w = 32 }
-  if sn == "i64" { w = 64 }
   const dom = numCastDomainName(n.asTy, target)
-  if w == 0 || !numCastCanFail(sn, dom) { return false }
+  if (sn != "i32" && sn != "i64") || !numCastCanFail(sn, dom) { return false }
   let room = 63
   if dom == "u8" { room = 8 }
   if dom == "i32" { room = 31 }
-  const b = castBoundBits(n.asObj, w, 0)
+  const b = castBoundBits(n.asObj, 0)
   if b < 0 || b > room { return false }
   arenaSetNode(ix, { asObj: n.asObj, asTy: n.asTy, asMode: "wrap", pos: n.pos })
   true
 }
 
-// The least `b` with the integer expression at `ix` in `0 .. 2^b - 1` on every run, or -1. Its
-// rules: a constant in `0 .. 2^31 - 1`; `a & c` when either side is bounded; `a >>> k` with a
-// literal count `k` in `1 .. w - 1` at the cast's width `w`; `a % c` over a bounded `a`.
-function castBoundBits(ix: i32, w: i32, depth: i32): i32 {
+// The least `b` with the integer expression at `ix` in `0 .. 2^b - 1` at either width, or -1.
+// Its rules: a constant in `0 .. 2^31 - 1`; `a & c` when either side is bounded; `a >>> k` with
+// a literal `k`, below `2^(64-k)` (an `i32` shift is tighter); `a % c` over a bounded `a`.
+function castBoundBits(ix: i32, depth: i32): i32 {
   if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return -1 }
   const e = P.nodes[ix]
-  if e is Paren { return castBoundBits(e.parInner, w, depth + 1) }
+  if e is Paren { return castBoundBits(e.parInner, depth + 1) }
   if e is BinExpr {
     if e.binCompound.length > 0 { return -1 }
     if e.binOp == "&" {
-      const l = castBoundBits(e.binLeft, w, depth + 1)
-      const r = castBoundBits(e.binRight, w, depth + 1)
+      const l = castBoundBits(e.binLeft, depth + 1)
+      const r = castBoundBits(e.binRight, depth + 1)
       if l < 0 || (r >= 0 && r < l) { return r }
       return l
     }
     if e.binOp == ">>>" {
-      const k = castShiftCount(e.binRight, w)
+      const k = castShiftCount(e.binRight)
       if k < 1 { return -1 }
-      let b = w - k
-      const l = castBoundBits(e.binLeft, w, depth + 1)
+      let b = 64 - k
+      const l = castBoundBits(e.binLeft, depth + 1)
       if l >= 0 && l - k < b { b = l - k }
       if b < 0 { b = 0 }
       return b
     }
     if e.binOp == "%" {
-      const l = castBoundBits(e.binLeft, w, depth + 1)
+      const l = castBoundBits(e.binLeft, depth + 1)
       if l < 0 { return -1 }
       if castBoundConst(e.binRight) <= 0 { return l }
       const below = castBoundBitsOf(
@@ -65313,12 +65312,12 @@ function castBoundBitsOf(v: Cex): i32 {
   -1
 }
 
-// A shift's count when it is an integer literal in `1 .. w - 1`, else -1. Only a literal is
-// read because only a literal count is held below its own operand's width (`checkShiftCounts`).
-function castShiftCount(ix: i32, w: i32): i32 {
+// A shift's count when it is an integer literal in `1 .. 63`, else -1. An `i32` operand shifts
+// by the count modulo 32, which leaves it below `2^(64-k)` too.
+function castShiftCount(ix: i32): i32 {
   const lex = intLitLexemeOf(ix)
   if lex == "" || intLitIsNegated(ix) || !numLexFitsI32(lex) { return -1 }
-  if !cexCountBelow(lex, w) { return -1 }
+  if !cexCountBelow(lex, 64) { return -1 }
   parseI32(lex)
 }
 
