@@ -266,7 +266,9 @@ Deno.test({
   // out of run-once code"), `scale-view` collapsed into its once-run driver and melted to 0/1
   // while `scale-seedtwice` kept 5/2. The driver no longer absorbs the kernel, so both now
   // read 5/2; the collapse is still reachable by forcing inlining (test 3 below).
-  name: "descriptor melt: a kernel called from a run-once driver keeps its descriptor",
+  // Since D3625 neither keeps a descriptor at all: `f32view` returns its fields as multi-value
+  // and the accessors take them as fields, so both read 0/0, still alike.
+  name: "descriptor melt: a kernel called from a run-once driver reads no descriptor field",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl-descmelt-" });
@@ -282,18 +284,18 @@ Deno.test({
       const melted = await shapeOf("scale-view");
       const kept = await shapeOf("scale-seedtwice");
       const bad: string[] = [];
-      // `scale-view`'s kernel stays a function its run-once driver calls per trip, so the
-      // descriptor is built and passed like `scale-seedtwice`'s and read per element.
-      if (melted.sget !== 5 || melted.snew !== 2) {
+      // `scale-view`'s kernel stays a function its run-once driver calls per trip, and the
+      // descriptor reaches it as fields, from `f32view`'s multi-value twin.
+      if (melted.sget !== 0 || melted.snew !== 0) {
         bad.push(
-          `scale-view: in-loop struct.get=${melted.sget} (want 5), struct.new=${melted.snew} (want 2)`,
+          `scale-view: in-loop struct.get=${melted.sget} (want 0), struct.new=${melted.snew} (want 0)`,
         );
       }
-      // `scale-seedtwice` does not: the descriptor is built in a surviving callee
-      // and returned, so it cannot be melted and every access reloads it.
-      if (kept.sget !== 5 || kept.snew !== 2) {
+      // `scale-seedtwice` likewise: the descriptor is still built in a surviving callee, but
+      // returned as fields, so no access reloads it.
+      if (kept.sget !== 0 || kept.snew !== 0) {
         bad.push(
-          `scale-seedtwice: in-loop struct.get=${kept.sget} (want 5), struct.new=${kept.snew} (want 2)`,
+          `scale-seedtwice: in-loop struct.get=${kept.sget} (want 0), struct.new=${kept.snew} (want 0)`,
         );
       }
       if (bad.length) {

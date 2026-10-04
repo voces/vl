@@ -7364,6 +7364,80 @@ field-shape bound, `std:fmt`'s `bnCopy` (an `i64[]` wrapper) was chosen and `map
 `tests/fixtures/opt-escape/record-result.vl` in `tests/selfhost_native_release_escape_test.ts`
 pins the melt against the rung's own passes as control.
 
+## `-O` returns a small record's fields as multi-value (2026-10-04) — sunpa, owner ruling (B), D3625
+
+**The defect.** sunpa's fight view made about 2,000 records a frame (12.9 minor GCs a second
+against a target under one), from one-line vector and quaternion helpers (`origin`, `qnorm`,
+`unit`, `qaxis`, `quatOf`, `cross`, `qrot`, `qmul`, `nlerp`) whose callers read the result
+field by field and drop it. The escape step above could not reach them: a module global
+(`UP`) and record fields (`Skeleton.rootRotation`, `TwoBone.hinge`) hold both types, so the
+per-type test refused every producer (D3263), and where it did inline, a producer with two
+results (`unit`) merged them, which `--heap2local` cannot melt (D3625's witness, and D3598).
+
+**The rule.** The step the ruling names, at the call boundary, as a host step before the
+escape step (`scripts/vl-host/src/multivalue.rs`). A record is a struct type of 1 to 8 fields,
+each `i32`/`i64`/`f32`/`f64`, outside subtyping, whose shape no `struct.set` (or atomic write)
+names anywhere in the module. A producer returns a non-null reference to one; a function gets
+a twin per `(field parameters, fields result)` pair a call site asks for. A call calls a twin
+when its result reaches only `struct.get`s, a field-only local (every set from a producer, a
+`struct.new` or another such local, every get a field use), a field-only parameter of another
+call, or, inside a result twin, the exit. A returned `struct.new` is deleted, since its fields
+are already on the stack in order; any other returned value is read field by field at the
+exit. Everything else keeps the struct: a store, a capture, `==`, a cast, an ordinary
+argument, a function value. Chains pass fields through: `qnorm(qmul(qnorm(a), b))` makes no
+record at all.
+
+**Why it is sound.** With no write to the shape anywhere, a record cannot change after it is
+made, so reading its fields at the call reads what each later `struct.get` would; a value
+that reaches only `struct.get`s has no observable identity; and a producer's result is
+non-null, so no trap moves. A local whose type is nullable is scalarized only when its first
+use is a set in the function's own frame. A function that can leave with its result other
+than by `return`/`br`/its end (`br_if`, `br_table`, `br_on_*`, `try`, an indirect tail call,
+or a tail call to such a function) gets no result twin. Producers, field-only parameters and
+locals are greatest fixpoints, so recursion and mutual recursion are covered.
+
+**Why a host step, not the emitter.** The decision is per call site and needs the call's
+operand-stack flow, which wasmparser's validator gives exactly (each op's arity names what it
+consumes); in the emitter it would be a new pass over every construct that can deliver a
+record. The escape step is already a host step on the same module, and an `-O` build is where
+binaryen runs anyway. A `--source-map` build (sunpa's) keeps its map: every row is moved with
+the op it names, and a twin gets a copy of its function's rows.
+
+**The bound is eight fields, measured.** The brief asked for four. Past the return registers
+each field is a store and a load through a return area, which still beats the allocation:
+one producer called from three sites in a hot loop, `-O3`, step off → on, V8 2,000 frames and
+wasmtime 4M calls:
+
+| fields | V8 ms | wasmtime user s |
+| --- | --- | --- |
+| 4 | 45.3 → 11.8 | 0.10 → 0.03 |
+| 5 | 48.3 → 15.4 | 0.17 → 0.03 |
+| 6 | 47.5 → 20.4 | 0.15 → 0.04 |
+| 8 | 69.7 → 25.8 | 0.16 → 0.05 |
+
+Eight is also the size `ESCAPE_RECORD_MAX_FIELDS` already gives this ruling, and plumb's
+`Quat` (five fields) is inside it, so D3262 and D3263 close with this. A 4x4 matrix (16) is
+out of scope.
+
+**Measured.** sunpa's frame rebuilt over its own `src/pose.vl` and `src/ik.vl` (30 bones: a clip
+layer per bone, four `twoBone` limbs, a `fabrik` tail, an aim chain, the per-bone reads of a
+draw list), `-O3`, step off → on: **866 → 44 allocations a frame** (the 44 are `fabrik`'s `V3[]`,
+which does hold its records); V8 19.4 → 15.1 ms per 2,000 frames and 1,342 → 87 scavenges per
+40,000; wasmtime 0.55 → 0.43 s wall per 30,000 frames; the module 17,026 → 18,210 bytes. D3598's
+loop: 34 → 5.2 ms per 10M iterations on V8, the hand-scalarized speed.
+
+Correctness: a 1,050-program grid (2-9 fields of every scalar type × seven producer shapes ×
+five positions × every use, with and without a field write) prints the unoptimized output at
+both rungs, and its non-escaping family's dynamic allocations fall 14,378 → 4,633 at `-O3` with
+none rising (what is left: top-level bindings, which are module globals; closures; the
+nine-field control). All 3,443 `@run` corpus cases and `bench/` mains at both rungs: the step
+rewrote 181, every one prints the plain output; the 48 `bench/` mains and both
+`plumb-shape-cost.py` units are untouched and byte-identical (the step costs them 0 ms). The
+compiler at `-O`: the step takes 102 ms on its 4 MB, rewrites it, and the result self-compiles
+to the seed byte for byte. `--enable-multivalue` is byte-neutral on the compiler at both
+rungs. `tests/selfhost_native_release_multivalue_test.ts` pins sunpa's shapes (against a step-off
+control), escapes, recursion and the bound; `tests/vl_addr2line_test.ts` a trap inside a twin.
+
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
 **The defect.** Binaryen inlines a function with several callers only when its size is at most

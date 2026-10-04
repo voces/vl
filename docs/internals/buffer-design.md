@@ -2435,6 +2435,31 @@ wasmtime gives back the melt on the four one-view kernels that collapsed (`scale
 behind a run-once driver pays under wasmtime, which is where L4 (emit-time scalar replacement of
 a descriptor) would pay off.
 
+### M10. The descriptor travels as fields: no reload left (2026-10-04, D3625)
+
+The `-O`/`-O3` multi-value step (DECISIONS.md, "`-O` returns a small record's fields as
+multi-value") is that scalar replacement, done at the call boundary instead of at emit time.
+A view descriptor is a small record no `struct.set` names, so `f32view` gets a twin returning
+its fields, and `getF32`/`setF32`/`Buf.loadF32` get twins taking the descriptor as fields: the
+kernel holds `base` and `length` in locals and reads no field per element. The `sget` column of
+every `view` and `buf` row in M7's tests is now 0 at both rungs, and M9's run-once driver no
+longer matters for it. Every `trap` cell is unchanged: M2's answer stands, the check is still
+emitted per access, and it is the cheap part.
+
+`vl run` wall seconds, `-O3`, min of 3 (startup included; load 4–12), step off → on, every
+output identical to the unoptimized run:
+
+| kernel | off | on | | kernel | off | on |
+| --- | --- | --- | --- | --- | --- | --- |
+| `scale-view` | 0.38 | 0.23 | | `scale-buf` | 0.28 | 0.23 |
+| `scale-accessor` | 0.36 | 0.24 | | `reduce-buf` | 0.23 | 0.16 |
+| `scale-seedtwice` | 0.36 | 0.22 | | `rows-buf` | 0.35 | 0.24 |
+| `reduce-view` | 0.25 | 0.18 | | `axpy-buf` | 0.34 | 0.27 |
+| `rows-view` | 0.48 | 0.27 | | `scale-hoist` (control) | 0.20 | 0.18 |
+| `axpy-view` | 0.51 | 0.28 | | `axpy-hoist` (control) | 0.23 | 0.24 |
+
+The fenced `view` spelling now runs within 0.05 s of the hand-hoisted one.
+
 ## N. The allocator over a shared memory (2026-09-24)
 
 `vl build --shared-memory=<pages>` (#3120) lets several instances — Web Workers — share one
