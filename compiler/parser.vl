@@ -23,7 +23,7 @@ import {
   mkMatch,
 } from "./ast"
 import {
-  exportFnAdd,
+  exportDeclAdd,
   getDeclAdd,
   getDeclName,
   setCallTyArgs,
@@ -36,6 +36,7 @@ import {
   P,
   Tok,
   dgMarkLossless,
+  dgMarkSpanEnd,
   mkDeclNameTok,
   stmtBraceNodes,
   stmtBraceTails,
@@ -1137,6 +1138,8 @@ function parseTypeAtom() {
   // which pushes `TS_ERR` for the `""` name it returns.
   const tm = tsMark()
   let name = ""
+  const inAs = asTargetCtx
+  asTargetCtx = false
   // `readonly T[]` — the read-only list view. A CONTEXTUAL keyword: only an identifier
   // spelled `readonly` and followed by a token a type can start with reads as the marker,
   // so a declared type named `readonly` still resolves.
@@ -1301,7 +1304,8 @@ function parseTypeAtom() {
       capt = btArgs[btRow]
     }
     const head = name // the identifier alone — the name grows a `<…>` below
-    if peekKind() == "LT" {
+    if peekKind() == "LT" && (!inAs || asTargetTakesTypeArgs(head)) {
+      const gtDiag = P.diags.length
       // A generic-alias application `Box<i32>` — in type position the `<` is unambiguous,
       // since no comparison can appear here. The arguments join into the synthetic name.
       // One trailing comma before the `>` is tolerated, and `>>`/`>>>` close nested
@@ -1320,6 +1324,17 @@ function parseTypeAtom() {
         }
       }
       expectTypeGt() // ">"
+      // In a cast the `<` may have been meant as a comparison; say how to write that.
+      if inAs && P.diags.length > gtDiag {
+        const gd = P.diags[gtDiag]
+        P.diags[gtDiag] = {
+          msg: gd.msg
+            + " — if `<` compares the cast, parenthesize it: `(x as "
+            + head
+            + ") < y`",
+          at: gd.at,
+        }
+      }
       // A body-scoped generic alias that also captured the enclosing function's
       // type parameters takes them as trailing arguments, after its own.
       if capt != "" {
@@ -2148,9 +2163,37 @@ function parseIsType() {
 // `a as i32 | b` is `(a as i32) | b`. The spelling is kept and banked on the `AsExpr` node by
 // the caller, because a cast target may be a user alias whose declaration the merge renames.
 function parseAsType() {
+  asTargetCtx = true
   const nm = parseTypeAtom()
   lastTyTsRoot = tsPop()
   nm
+}
+
+// Set by `parseAsType` for the one `parseTypeAtom` call it makes, and read and cleared at that
+// atom's entry, so a type nested inside the target never sees it.
+let asTargetCtx = false
+
+// Whether a cast target named `head` takes a `<…>` argument list (SP-018). A primitive never
+// does, nor does a type this module declares without parameters, so after either a `<` is a
+// comparison: `y as f64 < h`. A generic declaration, or a name declared elsewhere, keeps it.
+function asTargetTakesTypeArgs(head: string): boolean {
+  if asPrimTypeName(head) { return false }
+  let plain = false
+  let i = 0
+  while i + 2 < P.toks.length {
+    if P.toks[i].kind == "TYPE" && P.toks[i + 1].text == head {
+      if P.toks[i + 2].kind == "LT" { return true }
+      plain = true
+    }
+    i = i + 1
+  }
+  !plain
+}
+
+// The primitive type names, which take no type arguments.
+function asPrimTypeName(n: string): boolean {
+  if n == "i32" || n == "i64" || n == "f32" || n == "f64" { return true }
+  n == "u8" || n == "boolean" || n == "string" || n == "v128"
 }
 
 // One `type N = A | B` variant, and one `type AB = { … } & { … }` operand. A
@@ -2194,6 +2237,10 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
         P.pos = jb
         k = peekKind()
       }
+    }
+    if k == "STAR" && powOpTail() >= 0 {
+      acc = parseNoPowOp(leftPos)
+      k = peekKind()
     }
     let prec = binPrec(k)
     if k == "IDENT" && peekTok().text == "in" { prec = IN_PREC }
@@ -2243,6 +2290,85 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
   }
   if chainN >= ARITH_CHAIN_MIN { markArithRuns(acc) }
   acc
+}
+
+// At a `*`: the token index of the `*` or `*=` written directly after it, so the pair spells
+// `**` or `**=`, else -1. A space between the two stars is a different (also invalid) program.
+function powOpTail(): i32 {
+  const j = P.pos + 1
+  if j >= P.toks.length { return -1 }
+  const nk = P.toks[j].kind
+  if nk != "STAR" && nk != "STAREQ" { return -1 }
+  if P.toks[j].start != peekTok().start + 1 { return -1 }
+  j
+}
+
+// `a ** b` or `a **= b`: VL has no power operator. The diagnostic spans the operator and
+// names the std function, spelled with the author's operands when both are plain; the right
+// operand is still parsed so it raises nothing further.
+function parseNoPowOp(leftPos: i32) {
+  const opTok = P.pos
+  const tail = powOpTail()
+  if tail < 0 { return mkErr("expr", opTok, leftPos) }
+  const isAssign = P.toks[tail].kind == "STAREQ"
+  let li = opTok
+  while li > 0 && P.toks[li - 1].start >= leftPos { li = li - 1 }
+  P.pos = tail + 1
+  skipNewlines()
+  const ri = P.pos
+  parseBinary(parseUnary(), 12, peekTok().start)
+  const l = plainSpelling(li, opTok)
+  const r = plainSpelling(ri, P.pos)
+  let call = "`powF64(a, b)`"
+  if l != "" && r != "" {
+    call = "`powF64(" + l + ", " + r + ")`"
+    if isAssign { call = "`" + l + " = powF64(" + l + ", " + r + ")`" }
+  }
+  let op = "`**`"
+  if isAssign { op = "`**=`" }
+  dgMarkSpanEnd(P.diags.length, tail)
+  P.diags.push(
+    {
+      msg: "VL has no "
+        + op
+        + " operator; use "
+        + call
+        + " from `std:math` (or `powF32`)",
+      at: opTok,
+    },
+  )
+  mkErr("expr", opTok, leftPos)
+}
+
+// The source spelling of tokens `[from, to)` when every one is a name, a number or plain
+// punctuation (whose token text is its lexeme), with one space wherever the source had any;
+// "" for an empty or longer range, or any other token.
+function plainSpelling(from: i32, to: i32): string {
+  if to <= from || to - from > 12 || to > P.toks.length { return "" }
+  let out = ""
+  let i = from
+  while i < to {
+    const t = P.toks[i]
+    const k = t.kind
+    const plain = k == "IDENT"
+      || k == "NUMBER"
+      || k == "DOT"
+      || k == "LPAREN"
+      || k == "RPAREN"
+      || k == "LBRACK"
+      || k == "RBRACK"
+      || k == "COMMA"
+      || k == "PLUS"
+      || k == "MINUS"
+      || k == "SLASH"
+    if !plain { return "" }
+    if i > from && t.start > P.toks[i - 1].start + P.toks[i - 1].text.length {
+      out = out + " "
+    }
+    out = out + t.text
+    i = i + 1
+  }
+  out
 }
 
 // The `binOp` of node `ix` when it is a (non-parenthesized) binary expression, else "".
@@ -4518,10 +4644,9 @@ export function parseStmt() {
     }
     advance()
     if getterFollowsAt(P.pos) { return parseGetter(true) }
-    if peekKind() == "FUNCTION" {
-      const xf = parseFunc()
-      exportFnAdd(xf)
-      return xf
+    if peekKind() == "FUNCTION" { return exportDeclAdd(parseFunc()) }
+    if peekKind() == "LET" || peekKind() == "CONST" {
+      return exportDeclAdd(parseLet())
     }
   }
   const k = peekKind()

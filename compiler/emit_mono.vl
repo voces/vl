@@ -299,6 +299,7 @@ import {
   monoLamShared,
   monoOrigNode,
   monoParamPinTy,
+  monoPinSubLam,
   monoPinSubN,
   monoPinSubRow,
   monoPinSubT,
@@ -2096,8 +2097,9 @@ function monoIfChainRebuildPinned(
           "emitProgram: a join of a `??` with a type parameter drops a member of that parameter at this instance",
         )
       }
-      // A join the checker kept apart as `T | C` is read at the pin wherever it goes (D2906).
-      const tpu = tyIsTpJoinUnion(raw)
+      // A join the checker kept apart as `T | C` is read at the pin wherever it goes (D2906), and
+      // so is a `??` over one, whose result the checker re-joins without the mark (D3568).
+      const tpu = tyIsTpJoinUnion(raw) || monoCoalOverTpJoin(c.ifCond, c.ifThen)
       if monoIfArmsAllTy(at, raw, bN, bT) {
         pty = monoPinnedTyOf(at, bN, bT)
         // Such a join is a union at the pin only as a box registered here.
@@ -2347,6 +2349,15 @@ function monoChainPinnedTys(ix: i32, bN: string[], bT: i32[], out: i32[]): i32 {
     if c is IfStmt {
       const rt = monoArmPinnedTy(c.ifThen, bN, bT, out)
       if rt < 0 || c.ifElse < 0 { return -1 }
+      // A `??` desugars to `if x != null { x } …` over one shared `x`, whose recorded type is
+      // the nullable operand's: past its own test that arm cannot be null (D3568).
+      if (
+        rt == 0
+        && out.length > 0
+        && monoArmIsTestedNonNull(c.ifCond, c.ifThen)
+      ) {
+        out.push(nonNullTy(out.pop() ?? -1))
+      }
       if rt == 1 { nested = 1 }
       if P.nodes[c.ifElse] is IfStmt {
         cur = c.ifElse
@@ -2358,6 +2369,38 @@ function monoChainPinnedTys(ix: i32, bN: string[], bT: i32[], out: i32[]): i32 {
     }
   }
   nested
+}
+
+// Whether body `ix` holds a function literal or a nested function declaration.
+function monoBodyHoldsFn(ix: i32): boolean {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      if P.nodes[at] is FuncDecl { return true }
+      for k in nodeChildren(at) {
+        if k >= 0 { todo.push(k) }
+      }
+    }
+  }
+  false
+}
+
+// Whether the link `cond`/`thenIx` is a desugared `??` whose operand is a join kept apart.
+function monoCoalOverTpJoin(cond: i32, thenIx: i32): boolean {
+  if !monoArmIsTestedNonNull(cond, thenIx) { return false }
+  tyIsTpJoinUnion(nodeTyIxOf(unwrapParen(ifArmValueExpr(thenIx))))
+}
+
+// Whether `cond` is `x != null` and the then arm `thenIx` yields that same `x` node.
+function monoArmIsTestedNonNull(cond: i32, thenIx: i32): boolean {
+  const cn = P.nodes[unwrapParen(cond)]
+  if !(cn is BinExpr) || cn.binOp != "!=" { return false }
+  if !(P.nodes[unwrapParen(cn.binRight)] is NullLit) { return false }
+  const x = unwrapParen(cn.binLeft)
+  const v = unwrapParen(ifArmValueExpr(thenIx))
+  if x < 0 || v < 0 { return false }
+  x == v
 }
 
 // Appends the pinned type of arm block `blockIx`'s tail value to `out`; 0, 1 for an arm that is
@@ -7267,6 +7310,7 @@ export function monoSubTablesReset() {
   monoPinSubRow = Map()
   monoPinSubN = []
   monoPinSubT = []
+  monoPinSubLam = []
   0
 }
 
@@ -8310,6 +8354,7 @@ function monoMakeInstanceGo(
       monoPinSubRow.set(instFe, monoPinSubN.length)
       monoPinSubN.push(letBN)
       monoPinSubT.push(letBT)
+      monoPinSubLam.push(monoBodyHoldsFn(fn.fnBody))
     }
     if instHoleN.length > 0 {
       monoHoleSubRow.set(instFe, monoHoleSubN.length)
