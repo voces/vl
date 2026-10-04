@@ -859,6 +859,8 @@ const ACF_TPL = -1
 // A composite argument carrying a hole (`xs: T[]`, `[x]`, `[...xs]`), re-asked at the pin by
 // its own node, as a binding's is, so a literal still adapts element-wise (D3253).
 const ACF_COMP = -2
+// A list index carrying a hole, held at the pin to the direct spelling's `i32` rule (D3584).
+const ACF_INDEX = -3
 
 // D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
 // `print` takes one value of `printDomainStr()`, and the two floors that say so
@@ -22856,17 +22858,6 @@ function litTreeAdoptDst(ix: i32, dstTy: i32): i32 {
   litTreeAdopt(ix, ty)
 }
 
-// Whether the integer literal leaf at `ix` adopted a float (then which) from a generic call's
-// destination (D3539): the emitter writes it as that float's constant at any magnitude.
-export function litLeafAdoptedFloat(ix: i32): boolean {
-  if litTreeTy.length == 0 { return false }
-  const t = litTreeTyOf(ix)
-  t == TY_F64 || t == TY_F32
-}
-export function litLeafAdoptedF32(ix: i32): boolean {
-  litTreeTyOf(ix) == TY_F32
-}
-
 function litTreeTyOf(ix: i32): i32 {
   if ix >= 0 && ix < litTreeTy.length { return litTreeTy[ix] }
   -1
@@ -41798,6 +41789,14 @@ function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
       ix,
     )
   }
+  if argCstrForm[ci] == ACF_INDEX {
+    return tErr(
+      "array index must be i32, got "
+        + tyToStr(rat)
+        + " (the call's argument types)",
+      ix,
+    )
+  }
   if argCstrForm[ci] == ACF_TPL {
     return tErr(
       "an interpolation hole is `string` or "
@@ -48029,7 +48028,7 @@ function dstBindLitTyParams(
   let k = 0
   while k < dN.length {
     if bindOf(bNames, bTys, dN[k]) < 0 {
-      if dstTyParamAdapts(dN[k], dT[k], params, args) {
+      if dstTyParamAdapts(dN[k], dT[k], params, args, ix, ret, dst) {
         bNames.push(dN[k])
         bTys.push(dT[k])
         outNames.push(dN[k])
@@ -48060,27 +48059,24 @@ function dstRetypeLitArgs(
     if hit && args[i] >= 0 {
       const pt = substTyDeep(params[i], bNames, bTys)
       nodeTyRecord(args[i], pt)
-      const x = parenPeelIx(args[i])
-      nodeTyRecord(x, pt)
-      // A negated integer literal at a float is emitted from its leaf, which then needs the type.
-      const pn = primNameOf(pt)
-      if litTreeOps(x, 8) == 0 && (pn == "f64" || pn == "f32") {
-        litTreeAdopt(x, pt)
-      }
+      nodeTyRecord(parenPeelIx(args[i]), pt)
     }
     i = i + 1
   }
   0
 }
 
-// Whether the destination's `cand` for type parameter `name` is the better binding: at least
-// one argument binds `name`, every one is a literal that `cand` holds, and on their own they
-// would bind something else. false when any of it fails, leaving the arguments to bind.
+// Whether the destination's `cand` for type parameter `name` replaces the arguments' own
+// binding: every argument binding it is a literal `cand` holds within the literal's kind, and
+// the instance they would choose cannot be delivered to `dst` at the call `ix`.
 function dstTyParamAdapts(
   name: string,
   cand: i32,
   params: i32[],
   args: i32[],
+  ix: i32,
+  ret: i32,
+  dst: i32,
 ): boolean {
   if cand < 0 || cand == TY_ERR || isVoidTy(cand) || tyHasTyVar(cand) {
     return false
@@ -48088,7 +48084,7 @@ function dstTyParamAdapts(
   const one: string[] = [name]
   const oneT: i32[] = [cand]
   let seen = 0
-  let differs = false
+  let own = -1
   let i = 0
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name, 8) {
@@ -48115,7 +48111,10 @@ function dstTyParamAdapts(
       const aN: string[] = []
       const aT: i32[] = []
       bindGenWalk(params[i], at, aN, aT)
-      if !tySame(bindOf(aN, aT, name), cand) { differs = true }
+      if own < 0 { own = bindOf(aN, aT, name) }
+      // Within the literal's kind only: an integer literal never makes `T` a float (B′).
+      const wk = numKindMask(want, 8)
+      if wk == 0 || (wk & ~numKindMask(at, 8)) != 0 { return false }
       inferQuiet = true
       if isCall { at = checkNode(args[i]) }
       const ok = at >= 0 && assignableExpr(args[i], at, want)
@@ -48125,7 +48124,38 @@ function dstTyParamAdapts(
     }
     i = i + 1
   }
-  seen > 0 && differs
+  if seen == 0 || own < 0 || tySame(own, cand) { return false }
+  // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
+  // is the program's, and a body doing arithmetic on `T` must keep computing at it.
+  const savedQ2 = inferQuiet
+  inferQuiet = true
+  const one2: string[] = [name]
+  const own2: i32[] = [own]
+  const ownRet = substTyDeep(ret, one2, own2)
+  // `assignable` alone admits a list into a wider-element list; the delivery refuses that.
+  const deliverable = assignable(ownRet, dst)
+    && !objShapeAdapterlessAt(ix, ownRet, dst)
+  inferQuiet = savedQ2
+  !deliverable
+}
+
+// The numeric kinds `ty` holds, through lists, nullables and unions: 1 for an integer, 2 for a
+// float, 0 for none.
+function numKindMask(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyArray { return numKindMask(t.aElem, depth - 1) }
+  if t is TyNullable { return numKindMask(t.nInner, depth - 1) }
+  if t is TyLit { return numKindMask(litBaseTy(t), depth - 1) }
+  if t is TyUnion {
+    let m = 0
+    for u in t.uMembers { m = m | numKindMask(u, depth - 1) }
+    return m
+  }
+  const pn = primNameOf(ty)
+  if pn == "f64" || pn == "f32" { return 2 }
+  if isNumericPrimTy(ty) { return 1 }
+  0
 }
 
 // Whether the argument at `ix` is a number literal, an operator tree of them, a literal
@@ -68973,6 +69003,9 @@ function checkIndexNode(n: Index, ix: i32) {
   }
   if !assignable(idxTy, TY_I32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+  } else if tyHasTyVar(idxTy) {
+    // A hole passes vacuously; the pin asks again at the type it binds (D3584).
+    noteArgCstr(idxTy, TY_I32, "", ACF_INDEX, -1)
   }
   if at is TyUnion {
     // An index that is not an `i32` is already reported above.
