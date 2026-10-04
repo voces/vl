@@ -705,8 +705,9 @@ tests continue in a fresh instance.
 
 A location is a MODULE byte offset, as a trap prints it: `0x12a`, `298`, or a
 V8/Node/Deno frame's `wasm-function[0]:0x12a`. Each one prints
-`file.vl:line:col  in `function``, the line of the trapping instruction rather
-than the function's first line.
+`file.vl:line:col  in `function`` (the function when the module carries names),
+the line of the trapping instruction rather than the function's first line. An
+offset in no function body prints `??`.
 
 The positions come from, in order: the map the module's sourceMappingURL
 section names, `<module.wasm>.map` beside it (both written by
@@ -8592,8 +8593,10 @@ fn resolve_source(dir: &std::path::Path, s: &str) -> String {
     joined.strip_prefix("//").map(|r| format!("/{r}")).unwrap_or(joined)
 }
 
-/// Defined functions' byte ranges and names, for naming the function an offset lands in.
-fn function_at(bytes: &[u8], off: u32) -> Option<String> {
+/// `Some(name)` for the function whose body holds `off`, `Some(None)` when that function has
+/// no name, and `None` when no body holds it. An unnamed function gets no index label: engines
+/// disagree on one (V8 13.6 counts imported functions in `wasm-function[i]`, V8 15 does not).
+fn function_at(bytes: &[u8], off: u32) -> Option<Option<String>> {
     use wasmparser::{Name, Parser, Payload, TypeRef};
     let (mut n_imports, mut defined, mut found) = (0u32, 0u32, None);
     let mut names: std::collections::HashMap<u32, String> = Default::default();
@@ -8630,10 +8633,7 @@ fn function_at(bytes: &[u8], off: u32) -> Option<String> {
     let f = found?;
     // The name section's `@file:line` suffix is the DECLARATION's line; the answer's own
     // line is the instruction's, so the suffix would read as a contradiction.
-    Some(match names.get(&f) {
-        Some(n) => n.split('@').next().unwrap_or(n).to_string(),
-        None => format!("wasm-function[{f}]"),
-    })
+    Some(names.get(&f).map(|n| n.split('@').next().unwrap_or(n).to_string()))
 }
 
 /// A location as a trap prints it: `0x12a`, `298`, or V8's `wasm-function[0]:0x12a` (whose
@@ -8674,7 +8674,24 @@ fn addr2line_source(module: &str, bytes: &[u8]) -> Result<ReadSourceMap> {
         }
     }
     if let Some(map) = parse_vl_src(bytes) {
-        return Ok(ReadSourceMap { sources: map.files.clone(), trans: src_transitions(&map) });
+        // `vl-src` names files relative to the entry's directory and a one-file entry as "".
+        // The section does not record the entry, so it is taken to be `<stem>.vl`, the name
+        // `vl build`'s default output implies; when that file sits beside the module, every
+        // path is resolved from there, as a map's are.
+        let stem = std::path::Path::new(module)
+            .file_stem()
+            .map_or_else(|| "entry".to_string(), |s| s.to_string_lossy().into_owned());
+        let entry = format!("{stem}.vl");
+        let beside = dir.join(&entry).is_file();
+        let sources = map
+            .files
+            .iter()
+            .map(|f| {
+                let f = if f.is_empty() { entry.as_str() } else { f.as_str() };
+                if beside { resolve_source(dir, f) } else { f.to_string() }
+            })
+            .collect();
+        return Ok(ReadSourceMap { sources, trans: src_transitions(&map) });
     }
     bail!(
         "`{module}` has no source positions: no `{module}.map`, no map its sourceMappingURL \
@@ -8684,7 +8701,10 @@ fn addr2line_source(module: &str, bytes: &[u8]) -> Result<ReadSourceMap> {
 }
 
 /// One location's answer: `file:line:col  in `function`` (display columns are 1-based).
+/// `None` for an offset in no function body (a custom section, past the end, a stale
+/// module): a map's last segment holds its position to the end, so it would answer anyway.
 fn addr2line_answer(map: &ReadSourceMap, bytes: &[u8], off: u32) -> Option<String> {
+    let f = function_at(bytes, off)?;
     let (src, line, col) = transition_at(&map.trans, off)?;
     let file = map.sources.get(src as usize).map(String::as_str).unwrap_or("");
     let at = if file.is_empty() {
@@ -8692,7 +8712,7 @@ fn addr2line_answer(map: &ReadSourceMap, bytes: &[u8], off: u32) -> Option<Strin
     } else {
         format!("{file}:{}:{}", line + 1, col + 1)
     };
-    Some(match function_at(bytes, off) {
+    Some(match f {
         Some(f) => format!("{at}  in `{f}`"),
         None => at,
     })
@@ -8718,7 +8738,10 @@ fn addr2line_cmd(args: &[String]) -> Result<()> {
         // A pasted stack trace: each line passes through, and every line naming a module
         // offset is followed by the source position it maps to.
         let mut text = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut raw)?;
+        // A pasted trace may carry bytes that are not UTF-8; they pass through replaced.
+        text.push_str(&String::from_utf8_lossy(&raw));
         for line in text.lines() {
             println!("{line}");
             let Some(k) = line.find("wasm-function[") else { continue };

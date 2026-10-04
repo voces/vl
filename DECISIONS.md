@@ -9566,6 +9566,14 @@ Peak RSS rises by about 6 MB. A build without the flag is byte-identical to mast
 sources (`bench/` and three probes) × five flag sets, `cmp`-equal, and the seed's fixpoint is
 unchanged.
 
+**What a line means after `-O`.** It is the line of the expression binaryen kept for the
+trapping instruction. When binaryen folds a check into a later use, the trap is reported
+there. The #3351 review saw this at `-O`: an `as!` null trap was attributed to the line that
+dereferences the value, not the line of the `as!`. An offset in no function body (a custom section, past the end, a
+stale module) has no answer: the map's last segment would otherwise claim it. An unnamed
+function gets no `wasm-function[i]` label, because V8 13.6 (Node 24) counts imported
+functions in that index and V8 15 (Deno 2.9) does not.
+
 **Not done.** `vl run <module.wasm>` still reads only `vl-src`, so an optimized module run
 there prints names and no lines. `vl addr2line` gives that line. No DWARF is emitted: DevTools
 reads a source map natively and DWARF needs an extension, so a map is the smaller step.

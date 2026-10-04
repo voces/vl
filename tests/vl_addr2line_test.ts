@@ -71,10 +71,13 @@ const trapTrace = async (
   fn: string,
   arg: number,
 ): Promise<string> => {
-  const { instance } = await WebAssembly.instantiate(
-    Deno.readFileSync(wasm),
-    {},
-  );
+  // Every import is stubbed: the cases trap before an import's answer could matter.
+  const module = new WebAssembly.Module(Deno.readFileSync(wasm));
+  const imports: Record<string, Record<string, () => number>> = {};
+  for (const i of WebAssembly.Module.imports(module)) {
+    (imports[i.module] ??= {})[i.name] = () => 0;
+  }
+  const instance = await WebAssembly.instantiate(module, imports);
   try {
     const got = (instance.exports[fn] as (n: number) => number)(arg);
     throw new Error(`${wasm}: ${fn}(${arg}) returned ${got}, want a trap`);
@@ -191,9 +194,10 @@ for (const flags of [[], ["-O"], ["-O3"], ["--names"], ["-O3", "--names"]]) {
         const frame = topFrame(await trapTrace(wasm, "pick", 7));
         const got = await addr2line(wasm, frame);
         expectLine(got, `${DIR}/pick.vl:5:3`, `${frame}`);
-        const fn = flags.includes("--names") ? "`pick`" : "`wasm-function[0]`";
-        if (!got.endsWith(`in ${fn}`)) {
-          throw new Error(`want the frame's function ${fn}, got \`${got}\``);
+        // An unnamed function gets no label (see the imports case).
+        const want = flags.includes("--names") ? "  in `pick`" : "5:3";
+        if (!got.endsWith(want)) {
+          throw new Error(`want the answer to end \`${want}\`, got \`${got}\``);
         }
       } finally {
         await Deno.remove(tmp, { recursive: true });
@@ -352,6 +356,98 @@ Deno.test({
         throw new Error(
           `\`--source-map -o -\` must refuse (rc 2), got rc ${r.code}: ${r.err}`,
         );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl addr2line: an offset in no function body has no answer (rc 1), never the last line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const wasm = `${tmp}/pick.wasm`;
+      await build(`${DIR}/pick.vl`, wasm, ["-O3", "--names", "--source-map"]);
+      const size = Deno.statSync(wasm).size;
+      // The type section, the module's last byte (inside a custom section), and past the end.
+      for (const loc of ["0xa", `${size - 1}`, "999999999"]) {
+        const r = await run(["addr2line", wasm, loc]);
+        if (r.code !== 1 || !r.out.startsWith("??")) {
+          throw new Error(
+            `${loc}: want \`??\` and rc 1, got rc ${r.code}: ${r.out}${r.err}`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl addr2line: an unnamed function in a module with imports gets no index label",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const wasm = `${tmp}/imports.wasm`;
+      await build(`${DIR}/imports.vl`, wasm, ["--source-map"]);
+      const nImports = WebAssembly.Module.imports(
+        new WebAssembly.Module(Deno.readFileSync(wasm)),
+      ).filter((i) => i.kind === "function").length;
+      if (nImports === 0) {
+        throw new Error("the fixture must import a function to test this");
+      }
+      const frame = topFrame(await trapTrace(wasm, "boom", 7));
+      // V8 13.6 (Node 24) counts imported functions in `wasm-function[i]` and V8 15 (Deno
+      // 2.9) does not, so any index addr2line printed would be wrong under one of them.
+      const got = await addr2line(wasm, frame);
+      if (got !== `${DIR}/imports.vl:4:3`) {
+        throw new Error(
+          `want \`${DIR}/imports.vl:4:3\` and no label, got \`${got}\``,
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl addr2line: the `vl-src` fallback names the entry file, and stdin need not be UTF-8",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = Deno.realPathSync(await Deno.makeTempDir());
+    try {
+      Deno.copyFileSync(`${DIR}/pick.vl`, `${tmp}/pick.vl`);
+      const wasm = `${tmp}/pick.wasm`;
+      await build(`${tmp}/pick.vl`, wasm, ["--names"]);
+      const frame = topFrame(await trapTrace(wasm, "pick", 7));
+      expectLine(
+        await addr2line(wasm, frame),
+        `${tmp}/pick.vl:5:3`,
+        "vl-src fallback",
+      );
+      const p = new Deno.Command(VL, {
+        args: ["addr2line", wasm, "-"],
+        stdin: "piped",
+        stdout: "piped",
+        env: nativeEnv(),
+      }).spawn();
+      const w = p.stdin.getWriter();
+      await w.write(new Uint8Array([0x6a, 0xff, 0xfe, 0x0a]));
+      await w.write(new TextEncoder().encode(`    at (${frame})\n`));
+      await w.close();
+      const r = await p.output();
+      const out = new TextDecoder().decode(r.stdout);
+      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:3`)) {
+        throw new Error(`non-UTF-8 stdin: rc ${r.code}, got:\n${out}`);
       }
     } finally {
       await Deno.remove(tmp, { recursive: true });
