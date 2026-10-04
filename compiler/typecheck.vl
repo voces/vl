@@ -48954,6 +48954,19 @@ function checkCallNode(n: Call, ix: i32) {
   TY_ERR
 }
 
+// Whether `nm` is a builtin a call reaches with nothing declared or imported: a lowered library
+// value (`print`, `Map`, `Set`, `fromCodePoint`), a numeric intrinsic or an emitter intrinsic.
+// A `__`-spelled intrinsic is the compiler's floor, std's to call, so it is not one.
+export function isBuiltinCallName(nm: string): boolean {
+  if nm.length >= 2 && nm.slice(0, 2) == "__" { return false }
+  nm == "print"
+    || nm == "Map"
+    || nm == "Set"
+    || nm == "fromCodePoint"
+    || isNumIntrinsicName(nm)
+    || nameIsEmitterIntrinsic(nm)
+}
+
 // The sentence for calling a non-function binding that hides a builtin or a module function of its
 // name, naming the binding and where it is declared; "" when the callee is not such a binding
 // (D3599).
@@ -48969,13 +48982,9 @@ function builtinShadowMsg(calleeIx: i32, fnTy: i32) {
   const m = ufcsModOfNode(calleeIx)
   let hidden = ""
   const fd = moduleFnDeclOf(raw, m)
-  const lowered = nm == "print"
-    || nm == "Map"
-    || nm == "Set"
-    || nm == "fromCodePoint"
   if fd >= 0 {
     hidden = "the function `" + nm + "`" + tokAtSuffix(declNameTokOf(fd))
-  } else if lowered || isNumIntrinsicName(nm) || nameIsEmitterIntrinsic(nm) {
+  } else if isBuiltinCallName(nm) {
     hidden = "the builtin `" + nm + "`"
   }
   if hidden == "" { return "" }
@@ -64674,13 +64683,14 @@ function checkIfTail(
 
 // `x as T` (B2) is an explicit, checked numeric conversion — unlike the implicit
 // lossless-widening rule, it permits every numeric-scalar direction (plus narrowings and
-// int/float conversions); the float->int forms trap at runtime on NaN/out-of-range. The
-// propagation obligation a bare `as` takes on: the one home shared by the union and numeric arms.
+// int/float conversions). The propagation obligation a bare `as` takes on, shared by the union
+// and numeric arms; `src` is the operand's numeric type, or -1 for a union's remainder `rest`.
 function castPropagationFits(
   rest: i32,
   asTy: string,
   ix: i32,
   curRet: i32,
+  src: i32,
 ): boolean {
   // A pending return (-2, still inferring) is refused rather than joined into — a cast that
   // silently widens the function's own signature defeats the point of an explicit cast.
@@ -64691,7 +64701,7 @@ function castPropagationFits(
         + "` propagates "
         + tyToStr(rest)
         + " — use `as!` to trap instead, or `as?` to take the null here"
-        + castWrapNote(asTy)
+        + castWrapNote(asTy, src)
         + "; to propagate it, annotate the enclosing function's return type",
       ix,
     )
@@ -64706,7 +64716,7 @@ function castPropagationFits(
         + "` propagates "
         + tyToStr(rest)
         + " out of the enclosing function, and there is none here — at module scope, use `as!` to trap or `as?` to take a nullable"
-        + castWrapNote(asTy),
+        + castWrapNote(asTy, src),
       ix,
     )
     return false
@@ -64720,7 +64730,7 @@ function castPropagationFits(
         + ", which the enclosing function cannot return (it returns "
         + tyToStr(curRet)
         + ") — use `as!` to trap instead, or `as?` to take the null here"
-        + castWrapNote(asTy),
+        + castWrapNote(asTy, src),
       ix,
     )
     return false
@@ -64729,11 +64739,12 @@ function castPropagationFits(
 }
 
 // The third member of the trio, offered beside `as!`/`as?` only where it can apply: `as%`
-// wraps between integer widths, so the note is for an integer target alone.
-function castWrapNote(asTy: string): string {
-  if asTy == "i32" || asTy == "i64" || asTy == "u8" {
-    return " (`as%` wraps an integer)"
-  }
+// keeps the low bits of an integer, so the note needs an integer operand and target alike.
+function castWrapNote(asTy: string, src: i32): string {
+  if src < 0 { return "" }
+  const sn = primNameStr(primNameOf(src))
+  if sn != "i32" && sn != "i64" { return "" }
+  if asTy == "i32" || asTy == "u8" { return ", or `as%` to keep its low bits" }
   ""
 }
 
@@ -64914,7 +64925,7 @@ function castPinAdjudicate(k: i32, at: i32) {
     const rest = subtractTy(argU, target)
     if rest < 0 { return 0 }
     if mode == "null" { return castPinNullLand(k, castIx, target) }
-    castPropagationFits(rest, holeCastTgtName[k], castIx, holeCastRet[k])
+    castPropagationFits(rest, holeCastTgtName[k], castIx, holeCastRet[k], -1)
     return 0
   }
   const sn = primNameStr(primNameOf(at))
@@ -64924,7 +64935,7 @@ function castPinAdjudicate(k: i32, at: i32) {
   const snNum = sn == "i32" || sn == "i64" || sn == "f32" || sn == "f64"
   if snNum && !numCastCanFail(sn, dom) { return 0 }
   if mode == "null" { return castPinNullLand(k, castIx, target) }
-  castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k])
+  castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k], at)
   0
 }
 
@@ -65143,7 +65154,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
       if n.asMode == "null" { return mkNullableTy(target) }
       // The propagated remainder must fit the enclosing return, because that is where it
       // goes. A pending return (-2) is refused rather than joined into.
-      if !castPropagationFits(rest, n.asTy, ix, T.curRet) { return TY_ERR }
+      if !castPropagationFits(rest, n.asTy, ix, T.curRet, -1) { return TY_ERR }
       return target
     }
   }
@@ -65182,6 +65193,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
   const constCast = castConstDecide(n, ix, arg, target)
   if constCast == 1 { return target }
   if constCast == 2 { return TY_ERR }
+  if castBoundDecide(n, ix, arg, target) { return target }
   // The numeric arm honours the trio too: a cast that can fail owes the same three answers
   // the union arm gives, from the same words — the suffix went unchecked and silently ignored (D1041).
   const castDom = numCastDomainName(n.asTy, target)
@@ -65192,7 +65204,9 @@ function checkCastNode(n: AsExpr, ix: i32) {
     // `as?` re-wraps to `T | null` and the null stays local to the expression.
     if n.asMode == "null" { return mkNullableTy(target) }
     // A bare `as` propagates `null`, so the enclosing return must carry it.
-    if !castPropagationFits(TY_NULL, n.asTy, ix, T.curRet) { return TY_ERR }
+    if !castPropagationFits(TY_NULL, n.asTy, ix, T.curRet, arg) {
+      return TY_ERR
+    }
   }
   target
 }
@@ -65219,6 +65233,95 @@ function castConstDecide(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
   }
   castConstSettle(n, ix, v, arg, dom)
   1
+}
+
+// A cast whose operand's own shape bounds it into the target's domain cannot fail (D3622), so it
+// becomes the `as%` it then equals and answers the target in every mode. The bounds read no
+// width, so an operand an `i32` here and an `i64` at a later pin or store is bounded alike.
+function castBoundDecide(n: AsExpr, ix: i32, arg: i32, target: i32): boolean {
+  if arg < 0 { return false }
+  const sn = primNameStr(primNameOf(arg))
+  const dom = numCastDomainName(n.asTy, target)
+  if (sn != "i32" && sn != "i64") || !numCastCanFail(sn, dom) { return false }
+  let room = 63
+  if dom == "u8" { room = 8 }
+  if dom == "i32" { room = 31 }
+  const b = castBoundBits(n.asObj, 0)
+  if b < 0 || b > room { return false }
+  arenaSetNode(ix, { asObj: n.asObj, asTy: n.asTy, asMode: "wrap", pos: n.pos })
+  true
+}
+
+// The least `b` with the integer expression at `ix` in `0 .. 2^b - 1` at either width, or -1.
+// Its rules: a constant in `0 .. 2^31 - 1`; `a & c` when either side is bounded; `a >>> k` with
+// a literal `k`, below `2^(64-k)` (an `i32` shift is tighter); `a % c` over a bounded `a`.
+function castBoundBits(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return castBoundBits(e.parInner, depth + 1) }
+  if e is BinExpr {
+    if e.binCompound.length > 0 { return -1 }
+    if e.binOp == "&" {
+      const l = castBoundBits(e.binLeft, depth + 1)
+      const r = castBoundBits(e.binRight, depth + 1)
+      if l < 0 || (r >= 0 && r < l) { return r }
+      return l
+    }
+    if e.binOp == ">>>" {
+      const k = castShiftCount(e.binRight)
+      if k < 1 { return -1 }
+      let b = 64 - k
+      // An `i32` operand shifts by `k` modulo 32, so a bounded one sheds only that many bits.
+      let shed = k
+      if shed >= 32 { shed = k - 32 }
+      const l = castBoundBits(e.binLeft, depth + 1)
+      if l >= 0 && l - shed < b { b = l - shed }
+      if b < 0 { b = 0 }
+      return b
+    }
+    if e.binOp == "%" {
+      const l = castBoundBits(e.binLeft, depth + 1)
+      if l < 0 { return -1 }
+      if castBoundConst(e.binRight) <= 0 { return l }
+      const below = castBoundBitsOf(
+        cexAdd(cexEvalAt(e.binRight, 0), cexOfLexeme("1"), true),
+      )
+      if below >= 0 && below < l { return below }
+      return l
+    }
+    return -1
+  }
+  castBoundConst(ix)
+}
+
+// The bit length of the constant at `ix` when it is an integer in `0 .. 2^31 - 1`, else -1. A
+// radix pattern counts only as a lone literal, since a tree over one is read at its use's width.
+function castBoundConst(ix: i32): i32 {
+  if cexTreeShape(ix, 0) != 1 { return -1 }
+  const v = cexEvalAt(ix, 0)
+  if !cexOk(v) || v.cxFloat || v.cxNeg || !cexFitsSigned(v, 32) { return -1 }
+  if v.cxPat && !(P.nodes[parenPeelIx(ix)] is NumLit) { return -1 }
+  castBoundBitsOf(v)
+}
+
+// The least `b` with the non-negative integer `v` below `2^b`, or -1 past 32 bits.
+function castBoundBitsOf(v: Cex): i32 {
+  if !cexOk(v) || v.cxNeg { return -1 }
+  let b = 0
+  while b <= 32 {
+    if cexFitsSigned(v, b + 1) { return b }
+    b = b + 1
+  }
+  -1
+}
+
+// A shift's count when it is an integer literal in `1 .. 63`, else -1. An `i32` operand shifts
+// by the count modulo 32, which leaves it below `2^(64-k)` too.
+function castShiftCount(ix: i32): i32 {
+  const lex = intLitLexemeOf(ix)
+  if lex == "" || intLitIsNegated(ix) || !numLexFitsI32(lex) { return -1 }
+  if !cexCountBelow(lex, 64) { return -1 }
+  parseI32(lex)
 }
 
 // Why the domain `dom` cannot hold the constant `v`, or "" when it holds it exactly. A float
