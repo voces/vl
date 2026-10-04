@@ -656,6 +656,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   monoParamPinTy,
+  monoPinSubLam,
   monoPinSubN,
   monoPinSubRow,
   monoPinSubT,
@@ -13774,6 +13775,17 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
         }
       }
     }
+    // A shared read whose members store the field at different atoms boxes each one, so the
+    // read is the box of the checker's join (`sharedFieldArmsBoxable`).
+    if avi < 0 && nodeTyIsUnionRow(memIx) {
+      const bvis: i32[] = []
+      const bfis: i32[] = []
+      const bcode = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, bvis, bfis)
+      if bcode == FC_UNION && variantFieldTypeAt(bvis[0], bfis[0]) != FC_UNION {
+        const bn = tyToEmitName(nodeTyPinIxOf(memIx))
+        if isValueUnionName(bn) { return bn }
+      }
+    }
   }
   ""
 }
@@ -14378,20 +14390,25 @@ export function moduleHasFcpSpill(): boolean {
   false
 }
 
-// Is `ix` a call of the intrinsic `min` / `max` — not a user function, and (given a frame
-// `fnIx >= 0`) not a parameter, local or closure value of that name, as `emitCall` reads it?
+// Is `ix` a call of the intrinsic `min` / `max` / `abs` — not a user function, and (given a
+// frame `fnIx >= 0`) not a parameter, local or closure value of that name, as `emitCall` reads
+// it? The three take their operands' width, an integer one included.
 export function callIsIntrMinMax(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return false }
   const n = P.nodes[ix]
   if !(n is Call) { return false }
-  if n.callArgs.length != 2 { return false }
+  if n.callArgs.length != 2 && n.callArgs.length != 1 { return false }
   const cf = n.callFn
   if cf < 0 { return false }
   const callee = P.nodes[cf]
   if !(callee is Ident) { return false }
-  // Both names are three bytes: the length test spares every other call its two compares.
+  // The names are three bytes: the length test spares every other call its compares.
   if callee.identName.length != 3 { return false }
-  if callee.identName != "min" && callee.identName != "max" { return false }
+  if n.callArgs.length == 1 {
+    if callee.identName != "abs" { return false }
+  } else if callee.identName != "min" && callee.identName != "max" {
+    return false
+  }
   if fnIndexOfSid(sidOfNode(cf)) >= 0 { return false }
   if fnIx < 0 { return true }
   if identNameIsUserBound(callee.identName, fnIx) { return false }
@@ -14406,7 +14423,7 @@ function minMaxRecordedFloat(ix: i32): string {
   ""
 }
 
-// The width the intrinsic `min` / `max` call at `ix` computes at — "i32", "i64", "f32" or
+// The width the intrinsic `min` / `max` / `abs` call at `ix` computes at — "i32", "i64", "f32" or
 // "f64" — or "" when `ix` is not one. A recorded float type decides; otherwise (a generic
 // instance's clone records none) the operands as they lower: any float operand takes the
 // float rule, else i64 when an operand is i64, else i32.
@@ -14417,7 +14434,7 @@ export function minMaxKind(ix: i32, fnIx: i32): string {
   const n = P.nodes[ix]
   if !(n is Call) { return "" }
   const a = n.callArgs[0]
-  const b = n.callArgs[1]
+  const b = n.callArgs[n.callArgs.length - 1]
   const aF32 = exprIsF32(a, fnIx)
   const bF32 = exprIsF32(b, fnIx)
   if aF32 || bF32 || exprIsF64(a, fnIx) || exprIsF64(b, fnIx) {
@@ -16293,6 +16310,15 @@ export function ifArmIsValue(stmtIx: i32, fnIx: i32) {
 // The single-byte blocktype valtype for a value-position if-expression: the widest
 // numeric rep across its arms (checked f64 → f32 → i64, else the i32 default).
 export function ifExprValtype(ifIx: i32, fnIx: i32) {
+  // A join over an instance's type parameters takes the width of the number they pin, and a
+  // literal arm adapts to it (D3528).
+  const pjt = nodeTyIxOf(ifIx)
+  if pjt >= 0 && tyHasTyVar(pjt) {
+    const pjn = tyPrimNameOf(pinSubJoinTyOf(pjt, fnIx))
+    if pjn == "f64" { return 124 }
+    if pjn == "f32" { return 125 }
+    if pjn == "i64" { return 126 }
+  }
   if exprIsV128(ifIx, fnIx) {
     return 123 // 0x7b v128
   }
@@ -29427,7 +29453,10 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if ifJoinTypedAtom(unwrapParen(exprIx)) { return true }
     // A join `emitIfExpr` lowers as a union box is the box, whatever its arms are alone: a
     // generic's `a ?? 5` pinned at a literal union joins to `K | i32` (D3281).
-    if exprUnion(exprIx, fnIx) && ifJoinUnionName(unwrapParen(exprIx)) != "" {
+    if (
+      exprUnion(exprIx, fnIx)
+      && ifJoinUnionNameIn(unwrapParen(exprIx), fnIx) != ""
+    ) {
       return false
     }
     const tv = ifArmValueExpr(e.ifThen)
@@ -31345,6 +31374,27 @@ export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
     if row >= 0 && row < monoPinSubN.length {
       const st = substTyDeep(ty, monoPinSubN[row], monoPinSubT[row])
       if st < 0 || tyHasTyVar(st) { return -1 }
+      return st
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
+// `pinSubOperandTyOf` for a join's own type, declined in an instance whose body holds a
+// function: a lambda's join of the parameters is not built apart at its call, so the pin
+// would name members its value does not carry (D3520).
+export function pinSubJoinTyOf(ty: i32, fnIx: i32): i32 {
+  const st = pinSubOperandTyOf(ty, fnIx)
+  if st < 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoPinSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoPinSubLam.length {
+      if monoPinSubLam[row] { return -1 }
       return st
     }
     if pos >= fnParent.length { return -1 }
@@ -35488,8 +35538,34 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
         }
       }
     }
+    // A shared read over an un-narrowed struct union: the one row every member's field
+    // targets, the layout the dispatch's result is typed at (D3562).
+    if pvi < 0 { return sharedFieldTgtStructIdx(e.memObj, e.memProp, fnIx) }
   }
   -1
+}
+
+// The struct row a shared field read over a struct union yields, or -1 unless every member
+// stores the field as a nested struct of one row.
+function sharedFieldTgtStructIdx(recvIx: i32, prop: string, fnIx: i32): i32 {
+  // The common receiver, a list or a string, is no union: answered off its recorded type.
+  const rt = nodeTyIxOf(unwrapParen(recvIx))
+  if rt >= 0 && rt < T.tys.length {
+    const rk = T.tys[rt]
+    if !(rk is TyUnion) && !(rk is TyNullable) { return -1 }
+  }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  if sharedUnionFieldPlan(recvIx, prop, fnIx, vis, fis) != FC_STRUCT {
+    return -1
+  }
+  const r0 = uFieldTgtStructIdx(vis[0], fis[0])
+  let i = 1
+  while i < vis.length {
+    if uFieldTgtStructIdx(vis[i], fis[i]) != r0 { return -1 }
+    i = i + 1
+  }
+  r0
 }
 
 // True if the `LetDecl` at `letIx` carries a type annotation — the frame-independent half of
@@ -35777,7 +35853,13 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // where no narrow is active, while `emitIfExpr` lowers the join as the member (D2264). Not
     // in a generic body, whose narrowed list arm is typed at the parameter and lowers as the box.
     const iuTv = ifThenValueIx(exprIx)
-    const ijp = nodeTyPinIxOf(exprIx)
+    let ijp = nodeTyPinIxOf(exprIx)
+    // Inside an instance a join over its type parameters is read at the pin, where it can be
+    // the one primitive both bind (D3528).
+    if ijp >= 0 && tyHasTyVar(ijp) {
+      const ijs = pinSubJoinTyOf(ijp, fnIx)
+      if ijs >= 0 { ijp = ijs }
+    }
     if ijp >= 0 && ijp < T.tys.length {
       const ijt = T.tys[ijp]
       if ijt is TyPrim { return false }
@@ -36498,6 +36580,21 @@ export function tyIsUnionShaped(t: i32): boolean {
   tt is TyUnion
 }
 
+// `ifJoinUnionName` inside function `fnIx`, where a join over an instance's type parameters
+// is named at the pin (D3528).
+export function ifJoinUnionNameIn(ifIx: i32, fnIx: i32): string {
+  const own = ifJoinUnionName(ifIx)
+  if own != "" { return own }
+  const t = nodeTyPinIxOf(ifIx)
+  if t < 0 || !tyHasTyVar(t) { return "" }
+  const ps = pinSubJoinTyOf(t, fnIx)
+  if ps < 0 { return "" }
+  const nm = tyToEmitName(ps)
+  if nm != "" && isValueUnionName(nm) { return nm }
+  if tyIsNulValueUnionBox(ps) { return nm }
+  ""
+}
+
 // The union NAME the expression at `exprIx` produces (the name-typed mirror of the
 // boolean `exprUnion`): a union-returning call's return annotation, a union-typed
 // ident, a parenthesized union. "" when the expression is not union-valued.
@@ -36516,7 +36613,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   }
   // An if-expression names its union from its own recorded type, like the `AsExpr` arm: only
   // a desugared `??` (`nodeTyCarry`) puts a type on an `if` — a source-written one has none. D969.
-  if e is IfStmt { return ifJoinUnionName(unwrapParen(exprIx)) }
+  if e is IfStmt { return ifJoinUnionNameIn(unwrapParen(exprIx), fnIx) }
   // An operator over a numeric union names the union of its member results.
   if numUnionMinted && (e is BinExpr || e is Unary) {
     const nuTy = nodeTyIxOf(unwrapParen(exprIx))
@@ -39256,6 +39353,7 @@ export function sharedUnionFieldPlan(
   if (!msMemberAtomsOfSet(setId, atoms)) { splitUnionAtoms(set, atoms) }
   if atoms.length < 2 { return -1 }
   let code = -1
+  let mixed = false
   let i = 0
   while i < atoms.length {
     // `variantIndexOfTypeName` (D1083), not the exact `variantIndexOf`: the atoms here can be
@@ -39266,12 +39364,71 @@ export function sharedUnionFieldPlan(
     if fi < 0 { return -1 }
     const fc = variantFieldTypeAt(vi, fi)
     if code < 0 { code = fc }
-    else if code != fc { return -1 }
+    else if code != fc { mixed = true }
+    // `boolean` and `i32` share code 0 and are still two atoms of the join.
+    if i > 0 && fc == FC_I32 && code == FC_I32 {
+      const k0 = sharedFieldArmAtomKind(outVis[0], outFis[0])
+      const ki = sharedFieldArmAtomKind(vi, fi)
+      if k0 >= 0 && ki >= 0 && k0 != ki { mixed = true }
+    }
     outVis.push(vi)
     outFis.push(fi)
     i = i + 1
   }
+  if mixed {
+    if !sharedFieldArmsBoxable(outVis, outFis) { return -1 }
+    return FC_UNION
+  }
   code
+}
+
+// Whether a shared field the members store at different reps reads as a value-union box: every
+// member's field is a value atom, which the read boxes under that atom's tag (D3562). The checker
+// types such a read as the union of the members' field types, numbers kept apart.
+export function sharedFieldArmsBoxable(vis: i32[], fis: i32[]): boolean {
+  let i = 0
+  while i < vis.length {
+    if sharedFieldArmAtomKind(vis[i], fis[i]) < 0 { return false }
+    i = i + 1
+  }
+  vis.length > 1
+}
+
+// Whether the checker typed node `ix` as a union: the cheap test ahead of a shared-field plan.
+function nodeTyIsUnionRow(ix: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  t >= 0 && t < T.tys.length && T.tys[t] is TyUnion
+}
+
+// Registers the value union a field read at `memIx` over a union receiver `recvIx` is typed as,
+// so its box and value-box types exist when the read boxes its members' atoms.
+export function registerSharedReadUnion(memIx: i32, recvIx: i32) {
+  const t = nodeTyIxOf(memIx)
+  if t < 0 || t >= T.tys.length { return 0 }
+  if !(T.tys[t] is TyUnion) { return 0 }
+  let r = nodeTyIxOf(unwrapParen(recvIx))
+  if r < 0 || r >= T.tys.length { return 0 }
+  const rt = T.tys[r]
+  if rt is TyNullable { r = rt.nInner }
+  if r < 0 || r >= T.tys.length { return 0 }
+  if !(T.tys[r] is TyUnion) { return 0 }
+  const nm = tyToEmitName(t)
+  if isValueUnionName(nm) { registerValueUnionName(nm) }
+  0
+}
+
+// The scalar or string atom kind member `vi` stores its field `fi` as, or -1 for any other
+// field: a struct, a nullable, a union box, a list, or a literal-typed field (a discriminant,
+// whose reads keep their own lowering), none of which is boxed here.
+export function sharedFieldArmAtomKind(vi: i32, fi: i32): i32 {
+  if variantFieldTypeAt(vi, fi) == FC_UNION { return -1 }
+  const at = uFieldStart[vi] + fi
+  if at < 0 || at >= uFieldTyText.length { return -1 }
+  if at < uFieldLitTyIx.length && uFieldLitTyIx[at] >= 0 { return -1 }
+  if variantFieldIsLitUnion(vi, fi) { return -1 }
+  const k = valueAtomKind(uFieldTyText[at])
+  if k < 0 || k > 5 || k == nullValKind() { return -1 }
+  k
 }
 
 // The opcode narrowing the field read at `memIx` back to the `i32` or `f32` the checker typed it,
@@ -45337,6 +45494,12 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // The join's checked type is arm-order-independent: a `string`-typed join may lead with
     // an atom arm, which widens at `emitRefIfArm` — so the value is still a string.
     if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR { return true }
+    // Inside an instance a join over its type parameters is read at the pin (D3528).
+    const sjt = nodeTyIxOf(exprIx)
+    if sjt >= 0 && tyHasTyVar(sjt) {
+      const sjs = pinSubJoinTyOf(sjt, fnIx)
+      if sjs >= 0 { return tyKindOf(sjs) == TK_STR }
+    }
     // A join the checker kept as a value union is that union's box, whatever its then arm
     // is, so a string then arm does not make the `if` a string (D2839).
     if tyIsValueUnionBox(nodeTyIxOf(exprIx)) { return false }

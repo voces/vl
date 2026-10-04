@@ -66,6 +66,20 @@ This is `i32.div_s`/`i64.div_s`'s own trap; wasm has no wrapping division instru
 divide that would overflow fails loudly the same way a divide by zero does, rather than
 silently producing the wrong (wrapped) quotient.
 
+**The numeric intrinsics `abs`, `min` and `max` keep an integer operand's width**: over `i32`
+operands they compute and return `i32`, over an `i64` one `i64`, and only a float operand makes
+them `f64` (or `f32`). A bare literal argument has no width of its own and adapts like any other
+literal, so `const x: f64 = abs(-3)` is `3.0`. `abs` follows the wrap rule above, being `0 - x`
+for a negative `x`: the one input with no positive counterpart comes back unchanged.
+
+```vl
+const n: i32 = -5
+print(abs(n) / 2)           // 2 — an i32, so `/` is integer division
+const m: i32 = -2147483648
+print(abs(m))               // -2147483648 — INT32_MIN wraps, as `0 - m` does
+print(abs(-2.5))            // 2.5
+```
+
 ### `%` is the truncated remainder — the same one Rust, JavaScript and C compute
 
 `a % b` has the value of `a - b * trunc(a / b)` and **takes the sign of the DIVIDEND**:
