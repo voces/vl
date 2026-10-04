@@ -1045,7 +1045,9 @@ only cross-host variance is IEEE-754 itself.
   pre-rounding error is a few hundredths of an ulp, so any exact result that is a double
   comes back exact (the grid checks every `a^b` for `|a| ≤ 40`, `|b| ≤ 80`). The edge cases
   are IEEE 754 / C99 Annex F `pow`, checked before any arithmetic. **Deviation from JS**:
-  `Math.pow(1, NaN)`, `Math.pow(±1, ±Infinity)` are NaN in JS and 1.0 here.
+  `Math.pow(1, NaN)`, `Math.pow(±1, ±Infinity)` are NaN in JS and 1.0 here. Likewise
+  `atan2F64(-tiny, +large)` (a quotient that underflows) is `-0.0` here, as C99 has it
+  (`atan2(-y, x) = -atan2(y, x)`), where V8's `Math.atan2` gives `+0.0`.
 - **The f32 trio evaluates in f64 and rounds once**, as `sinF32`/`cosF32` do (§C.4's
   deliberate departure, same reason: no f32 pipeline to match, and one rounding from a value
   good to ~2^-41 gives 0.5000x f32 ulp). `expF32` and `logF32` use lighter kernels on the
@@ -1117,9 +1119,11 @@ only cross-host variance is IEEE-754 itself.
   corrects the rounded root with one Newton step whose `r·r` is exact. Outside `[1e-135,
   1e135]` both arguments are first scaled by one power of 2, so nothing overflows or
   underflows before the result does; `hypotF64(x, y)` is infinity only when the length is.
-  Correctly rounded on every graded point except 308 of 250,012 subnormal results (0.5019
-  ulp: a scaled result rounds twice). This differs from V8's Kahan-summed `hypot` in the
-  last bit sometimes; V8's is not correctly rounded either.
+  Correctly rounded on every normal result graded; a subnormal result is scaled back from
+  the tiny path and so rounds twice, which an independent 2.8M-point review measured at up
+  to 0.7496 ulp (this grid's worst was 0.5019 over 250,012 subnormal results). It differs
+  from V8's Kahan-summed `hypot` in the last bit sometimes; V8's is not correctly rounded
+  either.
 - **Edge cases are IEEE 754 / C99 Annex F**, in both `atan2`s: a zero `y` keeps its sign,
   `x = -0` gives `±π`, two infinities give `±π/4` or `±3π/4`; `hypot(±inf, NaN)` is
   infinity. Slice 1 returned `0` for `atan2(0, -0)`; that was the documented deviation and
@@ -1130,7 +1134,7 @@ only cross-host variance is IEEE-754 itself.
   `hypotF32` is `sqrt(x·x + y·y)` in f64, where neither square can overflow.
 - **Measured** (`scripts/std-math/math-check.sh`, mpmath at 256 bits; the same run as
   exp/log/pow above): `atanF64` 0.6149 ulp, `asinF64` 0.6477, `acosF64` 0.6531,
-  `atan2F64` 0.6468, `hypotF64` 0.5000 (0.5019 subnormal); every f32 one 0.5000. The
+  `atan2F64` 0.6468, `hypotF64` 0.5000 (0.7496 for subnormal results); every f32 one 0.5000. The
   exhaustive f32 run (`math-f32-exhaustive.vl`) covers every `atanF32`, `asinF32`,
   `acosF32` input: worst 0.50004 ulp, and 615 / 509 / 179 results differ from the f64 twin
   rounded. The f64 arc functions are within 1 ulp, not correctly rounded: 0.1–0.4% of
