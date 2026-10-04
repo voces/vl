@@ -1042,6 +1042,34 @@ Deno.test({ name: "wasm-checker: a lint range covers what the message names", ig
   }
 });
 
+Deno.test({ name: "wasm-checker: shadowed-local warns on the inner binding's name (D3579)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-021: the loop's scalar `sheet` hides the function's array `sheet`.
+  const src = "function f() {\n" +
+    "  const sheet = [1.0, 2.0]\n" +
+    "  let s = 0.0\n" +
+    "  for k in 0 until 2 { const sheet = 10.0 * k as f64; s += sheet }\n" +
+    "  s + sheet[0]\n" +
+    "}\n" +
+    "print(f())\n";
+  const diags = checker.lint(src).filter((x) => x.code === "shadowed-local");
+  if (diags.length !== 1) throw new Error(`want one shadowed-local, got ${JSON.stringify(diags)}`);
+  const d = diags[0];
+  const want = "`sheet` shadows the `sheet` declared at 2:9 in this function; " +
+    "rename one if they are different values";
+  if (d.severity !== "warning" || d.message !== want) {
+    throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+  }
+  const innerCol = src.split("\n")[3].indexOf("sheet");
+  if (d.range.start.line !== 3 || d.range.start.character !== innerCol || rangeText(src, d.range) !== "sheet") {
+    throw new Error(`want the range over the inner \`sheet\` at 3:${innerCol}, got ${JSON.stringify(d.range)}`);
+  }
+  // The control: a lambda's own binding is not the enclosing function's.
+  const lam = "function g() {\n  const n = 1\n  const h = (k: i32) => { const n = k; n }\n  h(n)\n}\nprint(g())\n";
+  const quiet = checker.lint(lam).filter((x) => x.code === "shadowed-local");
+  if (quiet.length !== 0) throw new Error(`a lambda binding fired: ${JSON.stringify(quiet)}`);
+});
+
 Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   // The owner's case: `const n = P.nodes[ix]` highlighted `P`, one column, because the
