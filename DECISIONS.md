@@ -9543,8 +9543,11 @@ mechanism to carry the union somewhere new:
 
 Each lost programs that ran on master. So the lane holds those positions back instead of fixing
 them in a fourth round:
-- A function is `njFnReached` when it is named inside a generic, hole or lambda body, read as a
-  value, or names itself. Every join in it is master's, and so is its instance (`njPinGated`).
+- A function is `njFnReached` when it is named inside a lambda body, read as a value, names
+  itself, or is named inside a generic or hole body. Every join in it is master's, and so is its
+  instance (`njPinGated`). One exception (D3589, below): a helper that yields only its own
+  parameters, through `return` or an `if`/`else` chain with no `match`, named in a generic or
+  hole body whose own function is not `njFnReached`.
 - A return set holding a literal leaf, or a call of a held-back function, is `njFnGated`. Only
   its return joins are master's.
 - The result of a call to a held-back function whose own inferred return is a join, and a
@@ -9559,6 +9562,20 @@ widens too. That is the conservative direction. On the review's 1,248-cell retur
 held cell prints or refuses as on master: eight that build invalid wasm on master still do,
 first failing at a later line. Every direct, generic and hole cell prints
 the member's own value.
+
+**A generic or hole caller reads its callee's join as a union of its own parameters (D3589).**
+`G(k, a, b)` inside `F<A, B>` returns `G`'s deferred join of `F`'s `A` and `B`, which no call site
+of `F` has pinned yet. It used to collapse to one arm, noted as an escaped join, and every pin
+where the join stayed apart refused it; before that, the gate above held `G` to master's widening,
+so `F(1, 2.5, 3)` read the `i32` as an `f64`. When the callee's arms joined apart, or its return is
+annotated, and every member is the caller's own parameter, the call is typed as a kept-apart
+union of them (`keptParamUnion`), the one an annotated `A | B` return would give, and each pin of
+`F` re-joins it without widening. That is what lets the gate stop holding such a callee: the
+caller's pins read the union the callee builds. The exception is syntactic and narrow on
+purpose: the #3367 review's 18,900-cell wrapper grid lost 274 right cells when every callee a
+generic or hole body names was released, through a `match`-bodied helper and through a wrapper
+that binds the call before returning it, neither of which this union carries. Those, recursive
+and value-read wrappers (D3494), and a join with a `null` arm (D3591) keep master's widening.
 
 **`??` and list literals join the same way (owner ruling, 2026-10-03, A; D3451).** `q ?? b` is
 the `if q != null { q } else { b }` it spells, and `[a, b]` holds what `[if c { a } else { b }]`

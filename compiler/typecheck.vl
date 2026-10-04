@@ -19983,8 +19983,8 @@ export function njFnGated(fx: i32): boolean {
   g
 }
 
-// Whether every join in function `fx` is master's: it is reached other than by a direct call
-// from a concrete context (from a generic, hole or lambda body, by value, or recursively).
+// Whether every join in function `fx` is master's: it is reached from a lambda body, by value,
+// recursively, or from a generic or hole body that is itself reached so (`njGateScan`).
 export function njFnReached(fx: i32): boolean {
   if fx < 0 || fx >= P.nodes.length { return false }
   const fn = P.nodes[fx]
@@ -20131,12 +20131,16 @@ function njRetSetHeld(body: i32): boolean {
   false
 }
 
-// Records every name mentioned in a generic, hole or lambda body, every name read other than as
-// a call's callee or as a member, and every function that mentions itself.
+// Records every name read other than as a call's callee or as a member, every function that
+// mentions itself, every name mentioned in a lambda body or in a gated generic or hole body, and
+// every name such an ungated body mentions other than a helper `njHelperShapeOk` admits: that
+// helper's kept-apart return each pin of the caller re-joins (D3589).
 function njGateScan() {
   njGateScanned = true
   const callee: {[i32]: boolean} = Map()
   const reads: i32[] = []
+  const openNames: string[] = []
+  const openBodies: i32[] = []
   let i = njGateSeen
   while i < P.nodes.length {
     const n = P.nodes[i]
@@ -20147,14 +20151,19 @@ function njGateScan() {
     } else if n is Member {
       njGateNames[n.memProp] = true
     } else if n is FuncDecl {
-      let open = n.fnName == "" || n.fnTyParams.length > 0
+      let open = n.fnTyParams.length > 0
       for pi in n.fnParams {
         const pn = P.nodes[pi]
         if pn is Param {
           if pn.parType < 0 { open = true }
         }
       }
-      njGateBody(n.fnBody, open, n.fnName)
+      njGateBody(n.fnBody, n.fnName == "", n.fnName)
+      if open && n.fnName != "" {
+        openNames.push(n.fnName)
+        openBodies.push(n.fnBody)
+        njGateHelpers(n.fnBody)
+      }
     }
     i = i + 1
   }
@@ -20165,7 +20174,102 @@ function njGateScan() {
       if rn is Ident { njGateNames[rn.identName] = true }
     }
   }
+  // To a fixpoint: an open body gates every name it mentions once its own function is gated.
+  const done: boolean[] = []
+  for _ in openNames { done.push(false) }
+  let grew = true
+  while grew {
+    grew = false
+    let k = 0
+    while k < openNames.length {
+      if !done[k] && (njGateNames.get(openNames[k]) ?? false) {
+        done[k] = true
+        grew = true
+        njGateBody(openBodies[k], true, openNames[k])
+      }
+      k = k + 1
+    }
+  }
   0
+}
+
+// Records each name body `ix` mentions other than a helper `njHelperShapeOk` admits.
+function njGateHelpers(ix: i32) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is Ident {
+        if !njHelperShapeOk(n.identName) { njGateNames[n.identName] = true }
+      }
+      for k in nodeChildren(at) {
+        if k >= 0 { todo.push(k) }
+      }
+    }
+  }
+  0
+}
+
+// Whether top-level function `name` yields only its own parameters, each through `return` or a
+// tail `if`/`else` chain, with no `match` in its body: the shape whose return a call keeps as a
+// union of the caller's parameters (`keptParamUnion`).
+function njHelperShapeOk(name: string): boolean {
+  const d = fnDeclIx[name] ?? -1
+  if d < 0 || d >= P.nodes.length { return false }
+  const fn = P.nodes[d]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length || njBodyHasMatch(fn.fnBody) {
+    return false
+  }
+  const ps: string[] = []
+  for pi in fn.fnParams {
+    const pn = P.nodes[pi]
+    if pn is Param { ps.push(pn.parName) }
+  }
+  const vals: i32[] = []
+  collectValuedReturns(fn.fnBody, vals)
+  const b = P.nodes[fn.fnBody]
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  vals.push(b.blkStmts[b.blkStmts.length - 1])
+  for v in vals {
+    const leaves: i32[] = []
+    tailValueLeaves(v, leaves)
+    for l in leaves {
+      const ln = P.nodes[l]
+      if !(ln is Ident) || !strListHas(ps, ln.identName) { return false }
+    }
+  }
+  true
+}
+
+// Whether body `ix` holds a `match`, before or after `desugarMatchAt` lowered it.
+function njBodyHasMatch(ix: i32): boolean {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      if P.nodes[at] is MatchExpr || njMatchDesugared(at) { return true }
+      for k in nodeChildren(at) {
+        if k >= 0 { todo.push(k) }
+      }
+    }
+  }
+  false
+}
+
+// Whether node `at` is an `if` link `desugarMatchAt` built.
+function njMatchDesugared(at: i32): boolean {
+  if intMatchHead.get(at) ?? false { return true }
+  const n = P.nodes[at]
+  if !(n is IfStmt) { return false }
+  const c = cwPeel(n.ifCond)
+  if c < 0 || c >= P.nodes.length { return false }
+  if matchScrutNode.get(c) ?? false { return true }
+  for k in nodeChildren(c) {
+    if k >= 0 && (matchScrutNode.get(cwPeel(k)) ?? false) { return true }
+  }
+  false
 }
 
 // Walks body `ix`: every name it mentions when `open`, else only `self`.
@@ -21460,6 +21564,46 @@ function collapseDeferredJoin(tyIx: i32) {
     if res >= 0 { return res }
   }
   tyIx
+}
+
+// A call's deferred join `tyIx` as a union each pin of the body being checked re-joins apart,
+// when `keep` (the callee joins its arms apart, or declares its return) and every member is
+// that body's own parameter; -1 for `collapseDeferredJoin` to decide.
+function keptParamUnion(tyIx: i32, keep: boolean): i32 {
+  if tyIx < 0 || tyIx >= T.tys.length || !keep || !tpOwnParamsOnly(tyIx) {
+    return -1
+  }
+  const t = T.tys[tyIx]
+  if !(t is TyUnion) { return -1 }
+  const tc = mkUnionTy(t.uMembers)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[tc] = 2
+  noteHoleTpJoin(tc)
+  tc
+}
+
+// Whether call callee `cfn` names a declared function whose return type is written.
+function calleeRetDeclared(cfn: Node): boolean {
+  const name = calleeIdentName(cfn)
+  if name == "" { return false }
+  let d = fnDeclIx[name] ?? -1
+  if d < 0 { d = lookupFnDeclNode(name) }
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return dn.fnRet >= 0 }
+  false
+}
+
+// Whether union `t`'s members are two or more parameters of the body being checked, declared or
+// holes, and nothing else.
+function tpOwnParamsOnly(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const u = T.tys[t]
+  if !(u is TyUnion) || u.uMembers.length < 2 { return false }
+  for m in u.uMembers {
+    if !tyIsGradualParam(m) || !tyParamOfInnermostBody(m) { return false }
+  }
+  true
 }
 
 // Park the uncollapsed deferred join `tyIx` under call node `nodeIx`, last write winning — the
@@ -48006,16 +48150,21 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
     }
   }
-  // A deferred join the re-fold could not decide here (the callee's arms name a hole this
-  // site does not bind) must not escape as this call's type — the emitter has no rep for a
-  // placeholder union. Collapses to one arm, but parks the uncollapsed join first so a
-  // `return h(w)` relay body can carry the whole join to its own call sites (`inferRetTyOf`).
-  const cRetTy = collapseDeferredJoin(retTy)
+  // A deferred join this site cannot decide has no rep, so it collapses to one arm, parked
+  // whole for a `return h(w)` relay (`inferRetTyOf`); in a body the gate does not hold, one of
+  // that body's own parameters is kept as a union instead, which its pins re-join (D3589).
+  let kept = -1
+  if tyIsDeferredJoin(retTy) && !njFnReached(njFnIx) {
+    const keep = (apartHoleJoins.get(retTy) ?? false) || calleeRetDeclared(cfn)
+    kept = keptParamUnion(retTy, keep)
+  }
+  let cRetTy = kept
+  if kept < 0 { cRetTy = collapseDeferredJoin(retTy) }
   if cRetTy != retTy {
     noteDeferredJoinNode(ix, retTy)
     let ejWho = ""
     if cfn is Ident { ejWho = cfn.identName }
-    noteEscJoin(retTy, ix, ejWho)
+    if kept < 0 { noteEscJoin(retTy, ix, ejWho) }
   }
   return cRetTy
 }
