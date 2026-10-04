@@ -457,11 +457,17 @@ let impSpecCol: i32[] = []
 // The specifier's EXCLUSIVE end column, so the "unsupported specifier" report can
 // underline the whole literal rather than its first character.
 let impSpecEnd: i32[] = []
-// 1 when a char literal (`'std:fs'`) appears where the specifier belongs. A specifier
-// is a string, so this never becomes a resolvable key — recorded rather than skipped
-// so the reader gets "that is a char literal" instead of an empty-specifier message.
-// `impSpec` then carries the literal's raw lexeme for `importSpecCharMsg` to show.
+// What stood where the specifier belongs, one of the `SPEC_*` codes below. Only
+// `SPEC_STRING` resolves; the others are recorded rather than skipped so the reader
+// is told what stood there instead of getting an empty-specifier message (D3559).
 let impSpecChar: i32[] = []
+const SPEC_STRING = 0
+// A char literal (`'std:fs'`); `impSpec` carries its raw lexeme for `importSpecCharMsg`.
+const SPEC_CHAR = 1
+// No path token at all: `import { x } from` or `export { x } from`, cut short.
+const SPEC_ABSENT = 2
+// An export list with no `from`: `export { x }`. Only a re-export takes a list.
+const SPEC_NO_FROM = 3
 // Flat per-module export-name sets (token scan: `export`-modified declarations).
 let expMod: i32[] = []
 let expName: string[] = []
@@ -3542,7 +3548,7 @@ function modScan(m: i32, src: string): i32 {
       let specLine = kwLine
       let specCol = kwCol
       let specEnd = kwCol
-      let specChar = 0
+      let specChar = SPEC_ABSENT
       let scanning = true
       while scanning && i < toks.length {
         const sk = toks[i].kind
@@ -3551,6 +3557,7 @@ function modScan(m: i32, src: string): i32 {
           specLine = toks[i].line
           specCol = toks[i].col
           specEnd = toks[i].col + toks[i].text.length
+          specChar = SPEC_STRING
           if spec.length >= 2 {
             if spec[0] == '"' && spec[spec.length - 1] == '"' {
               spec = spec.slice(1, spec.length - 1)
@@ -3567,7 +3574,7 @@ function modScan(m: i32, src: string): i32 {
           specLine = toks[i].line
           specCol = toks[i].col
           specEnd = toks[i].col + toks[i].text.length
-          specChar = 1
+          specChar = SPEC_CHAR
           i = i + 1
           scanning = false
         } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
@@ -3579,7 +3586,7 @@ function modScan(m: i32, src: string): i32 {
         }
       }
       let key = ""
-      if specChar == 0 { key = modResolveSpecifier(spec, modKeys[m]) }
+      if specChar == SPEC_STRING { key = modResolveSpecifier(spec, modKeys[m]) }
       let n = 0
       while n < names.length {
         impMod.push(m)
@@ -3666,7 +3673,7 @@ function modScan(m: i32, src: string): i32 {
         let rspecLine = rkwLine
         let rspecCol = rkwCol
         let rspecEnd = rkwCol
-        let rspecChar = 0
+        let rspecChar = SPEC_NO_FROM
         let rscan = true
         while rscan && i < toks.length {
           const sk = toks[i].kind
@@ -3675,6 +3682,7 @@ function modScan(m: i32, src: string): i32 {
             rspecLine = toks[i].line
             rspecCol = toks[i].col
             rspecEnd = toks[i].col + toks[i].text.length
+            rspecChar = SPEC_STRING
             if rspec.length >= 2 {
               if rspec[0] == '"' && rspec[rspec.length - 1] == '"' {
                 rspec = rspec.slice(1, rspec.length - 1)
@@ -3687,7 +3695,7 @@ function modScan(m: i32, src: string): i32 {
             rspecLine = toks[i].line
             rspecCol = toks[i].col
             rspecEnd = toks[i].col + toks[i].text.length
-            rspecChar = 1
+            rspecChar = SPEC_CHAR
             i = i + 1
             rscan = false
           } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
@@ -3695,11 +3703,16 @@ function modScan(m: i32, src: string): i32 {
           } else if isStmtKeyword(sk) {
             rscan = false
           } else {
+            if sk == "IDENT" && toks[i].text == "from" {
+              rspecChar = SPEC_ABSENT
+            }
             i = i + 1
           }
         }
         let rkey = ""
-        if rspecChar == 0 { rkey = modResolveSpecifier(rspec, modKeys[m]) }
+        if rspecChar == SPEC_STRING {
+          rkey = modResolveSpecifier(rspec, modKeys[m])
+        }
         let rn = 0
         while rn < rnames.length {
           // Pull the symbol (an import edge) so the merge binds it and the host fetches `spec`.
@@ -3838,6 +3851,36 @@ function modDiagSpan(
   modDiagMod.push(m)
   0
 }
+// The refusal for `export { name }` / `export { name as pub }` with no `from`. An export
+// list only re-exports, so when `m` imports `name` the message spells the re-export of
+// that same binding; otherwise it points at the declaration-site `export` keyword.
+function modExportListNoFromMsg(m: i32, name: string, pub: string): string {
+  let head = "`export { " + name + " }`"
+  if pub != name { head = "`export { " + name + " as " + pub + " }`" }
+  let j = 0
+  while j < impMod.length {
+    if (
+      impMod[j] == m
+      && impLocal[j] == name
+      && impName[j] != ""
+      && impSpecChar[j] == SPEC_STRING
+    ) {
+      let src = impName[j]
+      if src != pub { src = src + " as " + pub }
+      return head
+        + " names an imported binding; re-export it with `export { "
+        + src
+        + " } from \""
+        + impSpec[j]
+        + "\"`"
+    }
+    j = j + 1
+  }
+  head
+    + " has no `from` — an export list only re-exports another module's names; to export `"
+    + name
+    + "` from this module, write `export` on its declaration"
+}
 // Whether `name` is part of module `m`'s public surface — the union of two tables:
 // `expName` for a plain `export` declaration, `reExpPublic` for a re-export. Kept
 // separate rather than merged, since `expName` also means "declared with the
@@ -3947,7 +3990,7 @@ function modVisit(m: i32, depth: i32): i32 {
       if key == "" {
         // Texts mirror the host's `loadProgram` — keep them aligned. Spec-shaped
         // problems anchor at the specifier STRING token of THIS import.
-        if impSpecChar[i] == 1 {
+        if impSpecChar[i] == SPEC_CHAR {
           // A CHAR literal where the specifier belongs — the parser's sentence,
           // shared (`importSpecCharMsg`), because the two scanners must agree.
           modDiagSpan(
@@ -3956,6 +3999,22 @@ function modVisit(m: i32, depth: i32): i32 {
             impSpecCol[i],
             impSpecEnd[i],
             importSpecCharMsg(spec),
+          )
+        } else if impSpecChar[i] == SPEC_NO_FROM {
+          modDiagSpan(
+            m,
+            impNameLine[i],
+            impNameCol[i],
+            impNameCol[i] + impName[i].length,
+            modExportListNoFromMsg(m, impName[i], impLocal[i]),
+          )
+        } else if impSpecChar[i] == SPEC_ABSENT {
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
+            "missing module path — write `from \"./util\"` or `from \"std:math\"` after the name list",
           )
         } else if modKeyIsStd(modKeys[m]) && modIsRelative(spec) {
           modDiagSpan(
