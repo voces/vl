@@ -927,6 +927,19 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   integer read, and `tests/vl_std_bytes_test.ts` pins that composition so it cannot rot.
 - **What the suite grades against.** `DataView`, the platform's own byte reader, not a second
   shift ladder written in TypeScript to agree with the VL one.
+- **`zeroBytes`, the one constructor (D3620, owner ruling 2026-10-04).** sunpa SP-030 and
+  the `u8[]` half of SP-007/D3539: `filled(n, 0)` cannot make a `u8[]` because `u8` is a
+  storage type and a type parameter never binds it, so the spelling was `n` pushes. The
+  ruling chose a std export over a generic rule (D3539's option B) or nothing (C). It lives
+  here, not in `std:array`, because `std:array` is generic and its header says no export
+  applies to a `u8[]`; here is where `u8[]`-specific code already is. The lowering is one
+  `__array_new_default__`, as `std:buffer.loadBytes` allocates; at `n = 4,000,000` it burns
+  4.0M wasmtime fuel (the engine charges the zeroing per element) against 140.6M for the
+  push loop. A negative `n` traps by name, matching `filled`, rather than answering an empty
+  list: a negative length is a caller bug, and silently clamping it is the lossy shape
+  `std-api-review.md` §2 is critical of. Zero only, no fill byte: no consumer asked for one,
+  and a fill byte would be an `i32` the store truncates silently. A non-zero fill is
+  `zeroBytes` plus a loop until a consumer needs more.
 
 ## `std:seed`
 

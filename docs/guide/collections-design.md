@@ -28,7 +28,7 @@ one place.
 | you want | the TYPE | the VALUE |
 | --- | --- | --- |
 | a sequence | `T[]` — `string[]`, `i32[][]` | `[...]` — `["a", "b"]`, `[]` |
-| a byte sequence | `u8[]` | `[...]` of `i32`s, or `std:fs`'s `readFile` |
+| a byte sequence | `u8[]` | `[...]` of `i32`s, `std:bytes`'s `zeroBytes(n)`, or `std:fs`'s `readFile` |
 | a map | `Map<K, V>` or `{[K]: V}` — `Map<string, i32>` | `Map()`, `Map<string, i32>()` |
 | a set | `Set<T>` — `Set<string>` | `Set()`, `Set<string>()` |
 
