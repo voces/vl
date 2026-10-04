@@ -22,14 +22,15 @@
 // `{"bytes": 2319317, "commit": "097eda389"}`. Three places they could NOT agree, all
 // three pinned below as the port's own behaviour rather than left as prose:
 //
-//   1. THE ROUNDING TIE. `std:fmt` renders a float only at full precision
-//      (`open-rulings.md` §D `fmt-fixed-precision`), so the port computes the percentage
-//      in integer TENTHS and rounds half away from zero on the exact ratio, where the
-//      Python rounded the nearest DOUBLE half to even. At 2003 bytes against a 2000-byte
-//      baseline the true ratio is 0.15, whose nearest double is 0.1499999999999999944 —
-//      the Python printed `+0.1%`, the port prints `+0.2%`. One byte, the tenths digit.
-//      Its neighbour at 0.05% agrees, which is what makes this a TIE and not a general
-//      disagreement.
+//   1. THE ROUNDING TIE. Both compute the same double, `(size - base) * 100 / base`, and
+//      round its EXACT value to one place; the port does it with `std:fmt`'s `toFixed`,
+//      which breaks a tie away from zero as JS does, where the Python's `+.1f` broke it to
+//      even. They can therefore disagree only when the double IS a tie: at 2005 bytes
+//      against a 2000-byte baseline it is exactly 0.25, and the Python printed `+0.2%`
+//      where the port prints `+0.3%`. 2003 bytes is the control — 0.15 has no exact
+//      double, its nearest is 0.1499999999999999944, and both print `+0.1%`. (Until
+//      `toFixed` existed the port rounded the exact RATIO in integer tenths and disagreed
+//      at 2003 instead.)
 //   2. THE TOOL THE REGRESSED MESSAGE NAMES. The port says
 //      `vl run scripts/seed-size.vl --write-baseline` where the Python said
 //      `python3 scripts/seed-size.py --write-baseline`. Deliberate: a message naming the
@@ -254,31 +255,31 @@ Deno.test("seed-size: gate.sh and ci-native both run the VL ratchet", async () =
   }
 });
 
-// DIVERGENCE 1 from the Python, asserted rather than described: the rounding tie, and
-// only the tenths digit. The neighbour that does NOT tie is the control — without it
-// this pins a number rather than a rule.
+// DIVERGENCE 1 from the Python, asserted rather than described: an exact binary tie,
+// and only the tenths digit. The neighbour that is NOT an exact double is the control —
+// without it this pins a number rather than a rule.
 Deno.test({
-  name: "seed-size: the one-decimal percentage rounds half away from zero on the exact ratio",
+  name: "seed-size: the one-decimal percentage breaks an exact tie away from zero",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_seed_size_tie_" });
     try {
       const baseline = `${dir}/tie.json`;
       await Deno.writeTextFile(baseline, `{"bytes": 2000, "commit": "aaa"}\n`);
-      // 2003/2000 is exactly +0.15%; 2001/2000 is exactly +0.05%.
-      await Deno.writeFile(`${dir}/tie.wasm`, new Uint8Array(2003));
-      await Deno.writeFile(`${dir}/near.wasm`, new Uint8Array(2001));
+      // 2005/2000 is +0.25%, an exact double; 2003/2000 is +0.15%, which is not.
+      await Deno.writeFile(`${dir}/tie.wasm`, new Uint8Array(2005));
+      await Deno.writeFile(`${dir}/near.wasm`, new Uint8Array(2003));
 
       const tie = await run(["--seed", `${dir}/tie.wasm`, "--baseline", baseline]);
-      if (tie.out !== "seed size 2003 bytes, baseline 2000 (+0.2%)\n") {
+      if (tie.out !== "seed size 2005 bytes, baseline 2000 (+0.3%)\n") {
         throw new Error(`the tie: got ${JSON.stringify(tie.out)}`);
       }
       const near = await run(["--seed", `${dir}/near.wasm`, "--baseline", baseline]);
-      if (near.out !== "seed size 2001 bytes, baseline 2000 (+0.1%)\n") {
-        throw new Error(`the 0.05 neighbour: got ${JSON.stringify(near.out)}`);
+      if (near.out !== "seed size 2003 bytes, baseline 2000 (+0.1%)\n") {
+        throw new Error(`the 0.15 neighbour: got ${JSON.stringify(near.out)}`);
       }
-      // The Python printed `+0.1%` for the tie — its double is 0.1499999999999999944 and
-      // it rounds half to EVEN — and `+0.1%` for the neighbour, agreeing there.
+      // The Python printed `+0.2%` for the tie — it rounds half to EVEN — and `+0.1%`
+      // for the neighbour, whose double 0.1499999999999999944 is below the tie.
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
