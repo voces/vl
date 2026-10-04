@@ -36,6 +36,7 @@ import {
   P,
   Tok,
   dgMarkLossless,
+  dgMarkSpanEnd,
   mkDeclNameTok,
   stmtBraceNodes,
   stmtBraceTails,
@@ -2237,6 +2238,10 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
         k = peekKind()
       }
     }
+    if k == "STAR" && powOpTail() >= 0 {
+      acc = parseNoPowOp(leftPos)
+      k = peekKind()
+    }
     let prec = binPrec(k)
     if k == "IDENT" && peekTok().text == "in" { prec = IN_PREC }
     if prec == 0 || prec < minPrec {
@@ -2285,6 +2290,85 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
   }
   if chainN >= ARITH_CHAIN_MIN { markArithRuns(acc) }
   acc
+}
+
+// At a `*`: the token index of the `*` or `*=` written directly after it, so the pair spells
+// `**` or `**=`, else -1. A space between the two stars is a different (also invalid) program.
+function powOpTail(): i32 {
+  const j = P.pos + 1
+  if j >= P.toks.length { return -1 }
+  const nk = P.toks[j].kind
+  if nk != "STAR" && nk != "STAREQ" { return -1 }
+  if P.toks[j].start != peekTok().start + 1 { return -1 }
+  j
+}
+
+// `a ** b` or `a **= b`: VL has no power operator. The diagnostic spans the operator and
+// names the std function, spelled with the author's operands when both are plain; the right
+// operand is still parsed so it raises nothing further.
+function parseNoPowOp(leftPos: i32) {
+  const opTok = P.pos
+  const tail = powOpTail()
+  if tail < 0 { return mkErr("expr", opTok, leftPos) }
+  const isAssign = P.toks[tail].kind == "STAREQ"
+  let li = opTok
+  while li > 0 && P.toks[li - 1].start >= leftPos { li = li - 1 }
+  P.pos = tail + 1
+  skipNewlines()
+  const ri = P.pos
+  parseBinary(parseUnary(), 12, peekTok().start)
+  const l = plainSpelling(li, opTok)
+  const r = plainSpelling(ri, P.pos)
+  let call = "`powF64(a, b)`"
+  if l != "" && r != "" {
+    call = "`powF64(" + l + ", " + r + ")`"
+    if isAssign { call = "`" + l + " = powF64(" + l + ", " + r + ")`" }
+  }
+  let op = "`**`"
+  if isAssign { op = "`**=`" }
+  dgMarkSpanEnd(P.diags.length, tail)
+  P.diags.push(
+    {
+      msg: "VL has no "
+        + op
+        + " operator; use "
+        + call
+        + " from `std:math` (or `powF32`)",
+      at: opTok,
+    },
+  )
+  mkErr("expr", opTok, leftPos)
+}
+
+// The source spelling of tokens `[from, to)` when every one is a name, a number or plain
+// punctuation (whose token text is its lexeme), with one space wherever the source had any;
+// "" for an empty or longer range, or any other token.
+function plainSpelling(from: i32, to: i32): string {
+  if to <= from || to - from > 12 || to > P.toks.length { return "" }
+  let out = ""
+  let i = from
+  while i < to {
+    const t = P.toks[i]
+    const k = t.kind
+    const plain = k == "IDENT"
+      || k == "NUMBER"
+      || k == "DOT"
+      || k == "LPAREN"
+      || k == "RPAREN"
+      || k == "LBRACK"
+      || k == "RBRACK"
+      || k == "COMMA"
+      || k == "PLUS"
+      || k == "MINUS"
+      || k == "SLASH"
+    if !plain { return "" }
+    if i > from && t.start > P.toks[i - 1].start + P.toks[i - 1].text.length {
+      out = out + " "
+    }
+    out = out + t.text
+    i = i + 1
+  }
+  out
 }
 
 // The `binOp` of node `ix` when it is a (non-parenthesized) binary expression, else "".
