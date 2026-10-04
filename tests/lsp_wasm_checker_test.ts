@@ -1654,3 +1654,24 @@ Deno.test({ name: "wasm-checker: a keyword parameter name is one diagnostic at t
     throw new Error(`want exactly [error 0:11-15 ${want}], got: ${JSON.stringify(got)}`);
   }
 });
+
+// D3484 (owner ruling 2026-10-03) — a key given twice in an object literal is one editor
+// error per repeat, spanning the repeated key and naming the first one's position.
+Deno.test({ name: "wasm-checker: a repeated object key is an error at the repeat", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const diags = await checker.check(
+    "const seq = 1\nconst o = { seq, seq: 5, b: { a: 1, a: 2 } }\nprint(o.seq)\n",
+    "/tmp/x.vl",
+    noSiblings,
+  );
+  const got = diags.map((d) =>
+    `${d.severity} ${d.range.start.line}:${d.range.start.character}-${d.range.end.character} ${d.message}`
+  ).sort();
+  const want = [
+    "error 1:17-20 key `seq` is given twice in this object literal (first at 2:13)",
+    "error 1:36-37 key `a` is given twice in this object literal (first at 2:31)",
+  ];
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`want ${JSON.stringify(want)}, got: ${JSON.stringify(got)}`);
+  }
+});

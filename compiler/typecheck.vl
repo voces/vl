@@ -109,6 +109,7 @@ import {
   mkUnionDecl,
   nodeIsTplHole,
   nodeValueChildren,
+  recDupField,
   restParamIndex,
   spreadArgOf,
   stmtAlwaysExits,
@@ -19558,6 +19559,11 @@ function numUnionOp(op: string): boolean {
     || binIntOnlyOp(op)
 }
 
+// Whether `lt op rt` is `==` or `!=` against `null`: a nullness test, not a numeric comparison.
+function nullTestOp(op: string, lt: i32, rt: i32): boolean {
+  (op == "==" || op == "!=") && (isNullTy(lt) || isNullTy(rt))
+}
+
 // Whether `op` is a comparison, which answers boolean for every member pair.
 function numCmpOp(op: string): boolean {
   op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!="
@@ -38152,6 +38158,10 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
     dT = dst
     sX = srcExpr
   }
+  // A repeated key or a field the record type declares twice is refused at the repeat
+  // itself; its second slot is not a field to drop.
+  if objLitHasDupKey(sX) || objLitHasDupKey(srcExpr) { return 0 }
+  if objTyHasDupField(dT) || objTyHasDupField(dst) { return 0 }
   let through = ""
   if !tyEq(sT, src) || !tyEq(dT, dst) {
     through = " (reached through "
@@ -40811,7 +40821,11 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   if op == OP_AS { return asPinHolds(lt0, rt0) || numUnionAsConverts(lt0, rt0) }
   if op == OP_LITFIT { return primNameOf(lt) != "i32" }
   // A numeric union operand dispatches per member, each pair a scalar one (`numUnionBinTy`).
-  if (numUnionOp(op) && (tyIsNumUnion(lt) || tyIsNumUnion(rt))) {
+  if (
+    numUnionOp(op)
+    && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
+    && !nullTestOp(op, lt, rt)
+  ) {
     return numUnionPinOk(op, lt, rt)
   }
   // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
@@ -55254,6 +55268,7 @@ function checkProgramPass(rootIx: i32) {
     )
   }
   checkerArmed = false
+  recDupFieldErrs()
   // Before the tables below are sized, so every node it mints is checked (D1991).
   hoistMatchScrutinees(rootIx)
   annotateTyArgLambdas()
@@ -60627,6 +60642,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     numUnionMinted
     && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
     && numUnionOp(op)
+    && !nullTestOp(op, lt, rt)
     && !njExprHeld(n.binLeft)
     && !njExprHeld(n.binRight)
   ) {
@@ -68257,7 +68273,116 @@ function checkObjLitNode(n: ObjLit, ix: i32) {
     }
     i = i + 1
   }
+  objLitDupKeyErrs(fields)
   return mkObjTy(fnames, ftys)
+}
+
+// A key given twice in one object literal is refused, shorthand and quoted keys alike: the
+// diagnostic spans the repeated key and names where the first one is (owner ruling, D3484).
+function objLitDupKeyErrs(fields: i32[]) {
+  let i = 1
+  while i < fields.length {
+    const first = objLitEarlierKey(fields, i)
+    if first >= 0 {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit { objLitDupKeyErr(f.fiName, fields[i], first) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The first field before `fields[i]` giving the same key, or -1.
+function objLitEarlierKey(fields: i32[], i: i32): i32 {
+  const f = P.nodes[fields[i]]
+  if f is FieldInit {
+    let j = 0
+    while j < i {
+      const g = P.nodes[fields[j]]
+      if g is FieldInit {
+        if g.fiName == f.fiName { return fields[j] }
+      }
+      j = j + 1
+    }
+  }
+  -1
+}
+
+// Whether type `t` is a record type naming some field twice (D3537).
+function objTyHasDupField(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const o = T.tys[t]
+  if o is TyObj {
+    const ns = o.objFieldNames
+    let i = 1
+    while i < ns.length {
+      let j = 0
+      while j < i {
+        if ns[j] == ns[i] { return true }
+        j = j + 1
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether node `ix` is an object literal giving some key twice.
+function objLitHasDupKey(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const o = P.nodes[ix]
+  if o is ObjLit {
+    let i = 1
+    while i < o.objFields.length {
+      if objLitEarlierKey(o.objFields, i) >= 0 { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Raise the duplicate-key refusal over the key token of `dupIx`, citing `firstIx`'s key.
+function objLitDupKeyErr(name: string, dupIx: i32, firstIx: i32) {
+  dupNameErr(
+    "key `" + name + "` is given twice in this object literal",
+    dupIx,
+    firstIx,
+  )
+}
+
+// Raise `head` plus where the first one is, over the token node `dupIx` starts at.
+function dupNameErr(head: string, dupIx: i32, firstIx: i32) {
+  const ft = nodeStartTok(firstIx)
+  let where = ""
+  if ft >= 0 {
+    where = " (first at "
+      + i32ToStr(P.toks[ft].line)
+      + ":"
+      + i32ToStr(P.toks[ft].col + 1)
+      + ")"
+  }
+  const msg = head + where
+  const dt = nodeStartTok(dupIx)
+  if dt >= 0 { return tErrPushTok(msg, dupIx, dt, "", "") }
+  tErr(msg, dupIx)
+}
+
+// A record type declaring a field twice is refused at the repeated field name, the ruling
+// D3484 made for literals applied to declarations (D3537). The parser records the pairs.
+function recDupFieldErrs() {
+  let i = 0
+  while i + 1 < recDupField.length {
+    const dt = nodeStartTok(recDupField[i])
+    if dt >= 0 {
+      dupNameErr(
+        "field `" + P.toks[dt].text + "` is declared twice in this record type",
+        recDupField[i],
+        recDupField[i + 1],
+      )
+    }
+    i = i + 2
+  }
+  0
 }
 // ── type guard `x is T` ─────────────────────────────────────────────────────
 // Always a `bool`. Checks the operand and that `T` names a known type. The actual narrowing of

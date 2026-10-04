@@ -569,6 +569,38 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `isDigitByte` (which the f64 parser uses further down), because it is the hot loop's
   first test and the negated form lets the refusal return directly. One predicate, two
   spellings — if a third appears, collapse them.
+- **`toFixed` is JS's `Number.prototype.toFixed`, ECMA-262 step for step** (owner ruling
+  2026-10-03 (A) on `open-rulings.md` §`fmt-fixed-precision`; sunpa SP-015; D3565). The
+  choices a reviewer should know were made, not drifted into:
+  - **Exact, not float.** |x| is `m × 2^e`; the answer is `m × 10^digits × 2^e` rounded to
+    an integer with ties upward, which for `e < 0` is "add `2^(-e-1)`, shift right `-e`" on a
+    big natural. No float multiply anywhere, so `1.005` at two places is `"1.00"` because
+    its double is below the tie. A scaled value under one half short-circuits to zero
+    before any shift is materialised, so `5e-324` costs no 1074-bit numbers.
+  - **`digits` outside 0..=100 traps.** JS throws `RangeError`. Clamping was the other
+    candidate the ruling named; it was declined because a clamp hands back a string the
+    caller did not ask for, silently, and the error model's channel for a caller bug is a
+    trap (`std:array`'s `filled` and `std:idtable`'s `set` trap the same way on a negative
+    count). A `T | E` return was not considered: a formatter that can fail gives every call
+    site a second error channel for an argument that is almost always a literal.
+  - **|x| >= 1e21 renders as `toString`**, i.e. exponential (`"1e+21"`), matching JS rather
+    than always printing fixed. The consumers that asked for it port JS, and agreement
+    with JS is the one property a caller can test without reading this module. Non-finite
+    values render `"NaN"` / `"Infinity"` / `"-Infinity"` for the same reason.
+  - **The sign is read with `<`, not off the bit pattern** — the opposite of `renderF64` —
+    because the spec does: `-0` renders `"0"`, but `-0.0001` at two places renders `"-0.00"`.
+  - **`self: f64` only**, where `toString` takes `i32 | i64 | boolean | f64`: an `i64`
+    above 2^53 is not exactly an f64, and an integer at N places is `toString` plus zeros.
+    An `i32` widens in without a cast.
+  - **Locale-free by contract.** Always `.`, never grouped. Display formatting with a
+    locale is a separate, later `std:intl`; `toFixed` must not grow a locale parameter.
+  - **Agreement, measured.** 1,000,000 random doubles × `digits` 0..20 (21M calls) in five
+    families — raw bit patterns, exponents 2^-40..2^72, `n / 10^j`, exact binary ties
+    `n / 2^k`, quarters — plus 20,000 × 0..100 and 50 edge values × 0..100, graded string for
+    string against V8 (node and Deno): 0 mismatches.
+  - **Cost.** Per call, measured as wasmtime fuel by bisection on an unoptimised build:
+    ~1,500 at 0 digits, ~2,200 at 2, ~3,100 at 6, ~6,900 at 20, against ~14,000 for
+    `toString` of the same values. One `-O` program that imports only `toFixed` is 4.5 KB.
 
 ## `std:json`
 

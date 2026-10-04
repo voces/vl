@@ -1033,7 +1033,20 @@ parameter values") is contradicted by `function ld(self: {v: i32}, k: i32 = 5)` 
 `tests/cases/objects/ufcs-shadowed-callee-no-default-fill.vl`. Both should be re-measured
 against the tree and closed or re-worded before they are put to the owner.
 
-### fmt-fixed-precision — how does a VL program render a float to N decimal places? — raised 2026-09-07
+### fmt-fixed-precision — RULED 2026-10-03: (a), `toFixed(self: f64, digits: i32): string` in `std:fmt`
+
+**Ruling (owner, 2026-10-03, (a); sunpa SP-015, D3565).** `toFixed` is the export, with JS
+`Number.prototype.toFixed`'s contract string for string: it rounds the EXACT binary value half
+away from zero (`1.005.toFixed(2)` is `"1.00"`), renders non-finite values and |x| >= 1e21 as
+`toString` does, signs a negative value that rounds to zero (`"-0.00"`) but not `-0`, and is
+locale-free machine text — always `.`, never grouped. Locale-aware display formatting is a
+separate, later `std:intl`. `digits` outside 0..=100 TRAPS (JS throws `RangeError`): a count
+outside the range is a caller bug, the error model's channel for a bug is a trap, and a clamp
+would hand back a string the caller did not ask for. The rationale and the 21M-call agreement
+sweep against V8 are `std-notes.md` §`std:fmt`; `scripts/seed-size.vl`'s `pctStr` now calls it.
+The filing below is kept as it was raised.
+
+#### As raised, 2026-09-07 — how does a VL program render a float to N decimal places?
 
 **It cannot.** `std:fmt` exports `toString(self: i32 | i64 | boolean | f64)` and nothing else
 that renders a number, and `toString` is full precision: `toString(100.0 / 3.0)` prints
