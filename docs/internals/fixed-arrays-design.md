@@ -556,8 +556,10 @@ and is raised **at the call**, never lost at a monomorphisation pin (CLAUDE.md r
 check rejects lost that way).
 
 **std list functions over `T[N][]`** (`map`, `filter`, `sorted`) instantiate with `V = T[N]`
-and work on the flattened list unchanged, since the list's element accessors are the
-compiler's. std functions taking `T[]` do not accept a `T[N]`; there is no sequence interface
+and run correctly on the flattened list, since the list's element accessors are the
+compiler's, **but they allocate one box per element at `-O`**: their callback goes through
+`call_ref`, and the host step twins only direct calls. Fast whole-list passes are written as
+loops until the step learns `call_ref` twins. std functions taking `T[]` do not accept a `T[N]`; there is no sequence interface
 in v1 (Swift made the same call for `InlineArray`, for the same reason: a generic sequence API
 over a value invites hidden copies).
 
@@ -640,12 +642,16 @@ disagree (the two-producers rule):
   loop, or two or more such writes in one function ("each write rebuilds the 16-element array:
   …"); it also fires when a value passes boxed because a signature is past its slot budget.
 
+* `fixed-array-dynamic-index`: an index the emitter cannot make constant, on a value-tier
+  binding, in a loop ("`m[c * 4]` is a switch over 16 locals").
+
 And one **build** report, because a hint cannot predict what the `-O` host step will decline
 (§6.2): `vl build -O`/`-O3` prints, by default, one warning per function in which a
 value-tier `T[N]` box survives the step, with the step's reason (what `VL_MV_EXPLAIN=1`
-prints today for records).
-* `fixed-array-dynamic-index`: an index the emitter cannot make constant, on a value-tier
-  binding, in a loop ("`m[c * 4]` is a switch over 16 locals").
+prints today for records). The wasm alone cannot tell a value-tier box from an intentionally
+boxed one (a map value is the same `(ref $F)`), so the emitter records its value-tier locals
+in a custom section the step reads and strips.
+
 
 ### 5.17 Entry-module exports
 
@@ -731,6 +737,32 @@ fixed arrays, scalarises it at `-O`/`-O3`:
   `i32` (`i64`) local, `c[k]` a shift and a mask and a store one little-endian `i32.store`; the
   choice is invisible to the model and is the build's to measure.
 
+**What the step must be taught** (read against `multivalue.rs`, panel critic (d)):
+
+* **The length is not in the wasm type.** The emitter mints one final, non-subtyped
+  immutable `(array T)` type per (T, N), inside the type section's single rec group, so two
+  identical `(array f64)` at different indices stay different types. Nothing collides today:
+  every array type the emitter mints is mutable, the string backing included. The step learns
+  N by checking that every allocation of the type is `array.new_fixed $F N` (so the fill
+  `[v; N]` is emitted as `array.new_fixed` of N copies, never `array.new`), and its
+  `by_index` table counts array types as well as structs.
+* **D3630's write rule is moot**: `array.set`, `array.fill` and `array.copy` cannot validate
+  against an immutable array type, so qualification is simpler than for records.
+* **"Element-only" is an adjacency test, and the step runs before binaryen.** The step
+  recognises `struct.get` right after the reference; an `array.get` takes its index from the
+  stack, so the pattern is `local.get a; i32.const k; array.get`. Unrolled loop variables reach
+  the step as `i32.const; i32.const; i32.mul; …`, not as one constant. **S1's prerequisite is an
+  emitter constant folder** that emits every static index (`k * 4 + r` after unrolling) as one
+  `i32.const`; the shared static-index predicate (§6.1) is that folder's test, and the matrix
+  carries a `k * 4 + r` row.
+* **The growth bound must be per function.** Today a module over 4,096 twins or 64 KiB plus
+  half its code section gets no step at all; one heavy matrix function could switch #3372 off
+  for every record in sunpa's module. `vl_scaling_shape_test.ts` gains a writes × N axis.
+* **Binaryen already removes intra-function rebuilds.** Probed by the panel: two chained
+  rebuilds of an immutable `(array f64)` with constant indices lose every array op under
+  `wasm-opt -O3` (Heap2Local); a dynamic index keeps three. So at `-O` the step's real new work
+  is cross-call twins, the dynamic-index `br_table`, and the packed-`u8` mask.
+
 The emitter's one-value-one-slot invariant stays true. The price: **`-O0` allocates** (one
 box per rebuild), so a debug build is a correct but garbage-producing build, and the "no
 heap" guarantee is a property of `-O`, not of the type. Revision 2's hand-written lowering of
@@ -798,25 +830,40 @@ destination and read the source, then the reverse, printing values that show ind
 
 | slice | content | agent-days |
 | --- | --- | --- |
-| S0 semantic core | parser (`T[N]`, `[v; N]`), a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently), the rewrite, place rules, literals and adoption, `as`, `==`, `for`, `.length`, constant-index errors, dead writes, joins; EVERY placement boxed (immutable `(array T)`, rebuilt on write). Correct, allocates | 4–5 |
-| S1 value tier | the host multi-value step learns immutable fixed arrays (§6.2), the `br_table` rewrite, the unroll override and the shared static-index predicate, the cap, packed `u8` elements with the mask in the step | 2–3 |
-| S2 inline fields and globals | N struct fields per `T[N]` field; N wasm globals per module-level `T[N]` (boxed until then); `struct.set`/`global.set` element writes; record spread | 2–3 |
-| S3 flattened lists | stride-N backing, `push`/`pop`/index/spread/`slice`, std list functions at `V = T[N]` | 3 |
-| S4 `flat` and `u8` | `flat` fields of `T[N]`, 1-byte `u8` fields and elements, offsets | 1–2 |
-| S5 numeric record elements | by-field storage, copy-in and copy-out | 2 |
+| S0a semantic core | parser (`T[N]`, `[v; N]`); a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently) **and a `nameIsFixedArray` predicate in `tyname.vl`**, because the emitter classifies lists by SPELLING (`nameIsArray`, a trailing-`[]` test, ~180 uses in `emit_*.vl`), where `f64[16]` falls to each ladder's default and `f64[16][]` peels into the ref-list machinery; the rewrite, place rules, literal and fill, index, constant-index errors, `==`, `for`, `.length`, dead writes; locals, parameters, results and fields as an immutable box. `T[N][]`, unions, nullables, map values, adoption and `as` are refused until S0b | 4 |
+| S0b the rest of the semantics | union and nullable members (a new union-box member kind: a rep change, so `rep-fuzz-check.sh` is mandatory), map values, `as`, adoption, joins, closures | 3–4 |
+| S1 value tier | the host step learns immutable fixed arrays (§6.2: per-(T, N) types, the constant folder, per-function growth bound, the custom section), the `br_table` rewrite, the unroll override, the cap, packed `u8` | 2–3 |
+| S2a globals | N wasm globals per module-level `T[N]` | 1 |
+| S2b inline fields | N struct fields per `T[N]` field: a VL-field → wasm-slot-base map threaded through construction, the D1510 evaluation-order stash, record spread, record `==`, D622 prefix subtyping, union boxing and `mAssignTypeIndices` (the emitter assumes one VL field is one wasm field: `sFieldCount` at 78 sites, ~330 raw-ordinal `struct.get`/`set` emissions) | 4–5 |
+| S3 flattened lists | stride-N backing through ~25 list-op emitters (`emitPush`, `PushMany`, `Pop`, `PopOr`, `ArrSlice`, `ArrSpread`, `ListConcat*`, `emitIndex`, …) and D3623's build-region pushes | 5–6 |
+| S4 `flat` and `u8` | `flat` fields of `T[N]`, `u8[N]` fields and elements, folded element offsets | 1–2 |
+| S5 numeric record elements, if Q3 (a) | by-field storage, copy-in and copy-out | 2 |
 
-**About 14–17 agent-days in total**, with S0 + S1 (6–8 days) delivering SP-036's ask 2 for
-locals, parameters and results. Revision 2 priced the same scope at five to six weeks; the
-saving is S0's single boxed representation (no copy invariant, no owned boxes) and S1's reuse
-of the host step instead of a multi-slot emitter.
+**About 22–28 agent-days in total**, with S0a + S1 (6–7 days) delivering SP-036's ask 2 for
+locals, parameters and results. This is the implementer critic's pricing after reading the
+emitter, against the coordinator's first estimate of 14–17; the owner's note that the
+coordinator overestimates is recorded beside it in §11. Revision 2 priced a smaller scope at
+five to six weeks.
 
-**S0 and S1 ship to consumers together.** S0 alone boxes every placement and rebuilds on every
-element write, so a ported `m4MulInto` (16 element writes) would allocate 16 boxes per product
-where today's code allocates one: worse than today. S0 lands behind a flag (or unreleased) and
-the consumer-visible release is S0 + S1.
+**Whether S0 ships alone is measured, not assumed.** At `-O0`, S0 boxes every placement and
+rebuilds on every element write, so a ported `m4MulInto` allocates 16 boxes per product where
+today's code allocates one. At `-O3`, binaryen's Heap2Local already removes the intra-function
+rebuilds when the indices are constant (§6.2), leaving about one box per call, roughly today's
+cost. D21: measure S0a at `-O3` on sunpa's `m4Mul`; if it is no worse than today it ships, and
+otherwise it waits for S1.
+
+**The position matrix needs an optimisation-level face.** `scripts/capability-probes/run.py`
+runs `vl run` with no `-O`, so everything S1 adds would be invisible to it; the matrix grades
+2 faces × 2 levels (`-O0`, `-O3`). Templates, one per placement: local, parameter, result,
+loop-carried, field, global, list element, map value, union member, nullable, capture never
+reassigned, capture reassigned; a generic template that leaves `T` open (`f<T>(m: T[16])`), per
+CLAUDE.md's rule that a matrix with a type parameter needs one; one row per assignment form;
+the evaluation-count row (§4.2); the `k * 4 + r` row; and the aliasing proof in both directions
+in every template.
 
 Compile-time and seed-size: the compiler itself uses no `T[N]`, so the seed grows by the new
-code only. Unrolling at 64 trips grows user modules; `tests/vl_scaling_shape_test.ts` gains an
+code only. The seed-size red line is +3% (about 121 KB on today's 4,035,184-byte baseline);
+S0a and S0b each read `seed-size.vl --check` and rebaseline in the same PR if needed. Unrolling at 64 trips grows user modules; `tests/vl_scaling_shape_test.ts` gains an
 N axis, and the cap is re-measured on the guest-fuel instrument before S1 lands.
 
 ---
@@ -1058,9 +1105,16 @@ S0's matrix carries a payload-NaN row per placement, read back with `reinterpret
 7. **Adoption (§5.2) changes a binding's type from its uses.** Every adoption ruling so far has
    had to be all-or-nothing per binding (D3339); the same discipline applies.
 8. **Seed and compile time.** The new type kind trips `kind-ladder-incomplete` at every closed
-   ladder (the safe failure); unrolling to 64 trips grows user modules. Both are measured
-   before S1 lands.
-9. **The unified model may be one concept too many for newcomers** (`T[]`, `T[N]`, `u8[]`,
+   ladder in the checker (the safe failure); unrolling to 64 trips grows user modules. Both are
+   measured before S1 lands.
+9. **The emitter's spelling ladders are not closed kind sets**, so the kind-ladder lint does
+   not protect them: `f64[16]` fails `nameIsArray` and falls to each ladder's default, and
+   `f64[16][]` passes it and is routed into the ref-list machinery. Control: S0a's
+   `nameIsFixedArray` predicate, an audit of `arrLeafNameOf`, `repKeyOf` and the mono pins, and a
+   probe pass of every list operation on both spellings.
+10. **One heavy function can switch the host step off for a whole module** while its growth
+   bound is module-wide (§6.2). Control: a per-function bound before S1.
+11. **The unified model may be one concept too many for newcomers** (`T[]`, `T[N]`, `u8[]`,
    `Buf`). §5.18's table is the test; the panel's newcomer read it (§11).
 
 ---
@@ -1192,7 +1246,7 @@ fields". *Recommend (a)*; until ruled, `flat` admits `u8[N]` fields and not scal
 | D18 | no std additions in v1; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in. A bulk `storeF32s(b, at, m)` for GPU upload is DEFERRED, not rejected, and goes through `std-api-reviewer` when a consumer measures `put`; its `loadF32s` twin needs length generics or a builtin (§8.2) | the built-in-methods ruling (storage ops only) |
 | D19 | `flat` fields of `T[N]`, including `u8[N]`; `Bone.m[k]` and `Bone.m.length` fold; little-endian, no padding; scalar `u8` fields wait for the adjacent question in §10.1 | the owner's direction, the u8 storage ruling, flat §4/§9 (§8.1) |
 | D20 | `[...v3, 1.0]` builds a `T[4]`; call spread into fixed parameters is later | variadics |
-| D21 | S0 and S1 reach consumers together | §6.7 |
+| D21 | S0a ships to consumers only if it measures no worse than today at `-O3` on sunpa's `m4Mul`; otherwise with S1 | §6.7 |
 | D23 | the unroll override drops the call veto for loops indexing a value-tier array | §6.1 |
 | D24 | construction is the literal, `[v; N]` and element writes; a generator is later and additive | §5.3 |
 | D25 | the size cap (64 slots) is silent placement plus the `fixed-array-boxed-update` hint, never a type error | Julia's and Rust's experience; §6.6 |
