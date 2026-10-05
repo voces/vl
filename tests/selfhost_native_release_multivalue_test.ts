@@ -25,6 +25,7 @@ const DIR = `${ROOT}/tests/fixtures/opt-multivalue`;
 type Want = "melts" | "kept" | "output";
 const FIXTURES: [string, Want][] = [
   ["heap-held", "melts"],
+  ["subtyped", "melts"],
   ["escapes", "output"],
   ["recursion", "output"],
   ["over-bound", "kept"],
@@ -182,6 +183,58 @@ Deno.test({
       ];
       if (multi.length === 0) {
         throw new Error("want a twin with three or more f64 results; got none");
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+// `$VL_MV_EXPLAIN=1` says, per record type and per producer, why the step took it or not, and
+// changes nothing it writes. In `subtyped`, V3 is a declared subtype of Pt and Particle has
+// V3's shape and is written: the report must name V3 a candidate and Particle's writer.
+Deno.test({
+  name: "native-release: VL_MV_EXPLAIN names each refusal and changes no byte",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = `${DIR}/subtyped.vl`;
+    const tmp = await Deno.makeTempDir();
+    try {
+      const build = async (explain: boolean) => {
+        const dump = `${tmp}/step${explain ? "-x" : ""}.wasm`;
+        const b = await vl(
+          ["build", src, "-O3", "--names", "-o", `${tmp}/m.wasm`],
+          { VL_OPT_MV_DUMP: dump, VL_MV_EXPLAIN: explain ? "1" : "" },
+        );
+        if (b.code !== 0) throw new Error(`build: ${b.err.trim()}`);
+        return { err: b.err, bytes: Deno.readFileSync(dump) };
+      };
+      const off = await build(false);
+      const on = await build(true);
+      if (off.err.includes("mv-explain")) {
+        throw new Error(
+          `want no report without the variable; got:\n${off.err}`,
+        );
+      }
+      if (
+        off.bytes.length !== on.bytes.length ||
+        off.bytes.some((b, i) => b !== on.bytes[i])
+      ) {
+        throw new Error(
+          "want the step's output byte-identical with VL_MV_EXPLAIN on and off",
+        );
+      }
+      const wants = [
+        /mv-explain: type \d+ \{f64, f64, f64\} \(returned by add@\S+, scale@\S+\): candidate/,
+        /mv-explain: type \d+ \{f64, f64, f64\} .*refused: its fields are written \(struct\.set \d+ in drift@/,
+        /mv-explain: add@\S+ -> type \d+: result twin; \d+ call site\(s\) read it as fields/,
+      ];
+      for (const w of wants) {
+        if (!w.test(on.err)) {
+          throw new Error(
+            `want a report line matching ${w}\n  got:\n${on.err}`,
+          );
+        }
       }
     } finally {
       await Deno.remove(tmp, { recursive: true });

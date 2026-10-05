@@ -7,9 +7,15 @@
 //! and its escape test is per wasm type: D3262, D3263).
 //!
 //! **What qualifies.** A record is a struct type of 1 to `MV_RECORD_MAX_FIELDS` fields, each
-//! an `i32`, `i64`, `f32` or `f64`, outside any subtyping, whose shape no `struct.set` (or
-//! atomic write) anywhere in the module names. A value of such a type cannot change after it
-//! is made, so reading its fields early reads what a later `struct.get` would.
+//! an `i32`, `i64`, `f32` or `f64`, that no `struct.set` (or atomic write) anywhere in the
+//! module can reach. A value of such a type cannot change after it is made, so reading its
+//! fields early reads what a later `struct.get` would. When every struct type sits in one rec
+//! group (VL's emitter puts them there), two type indices are never one wasm type, so a write
+//! reaches the type it names and that type's subtyping component (a subtype's value stands
+//! where its supertype is expected): sunpa's `V3` is a declared subtype of a `{ x, y }` record
+//! and stays a record while neither is written (D3630). Otherwise a write reaches every type of
+//! its shape, and a type in any subtyping relation is refused. `$VL_MV_EXPLAIN=1` prints why
+//! each record type and producer was taken or refused.
 //! A producer is a function whose one result is a non-null reference to a record. A record
 //! value is used *field-only* when it reaches nothing but `struct.get`s, a field-only local,
 //! a field-only parameter of another call, or (inside a result twin) the twin's own exit. A
@@ -83,8 +89,8 @@ impl Num {
 }
 
 /// A record's fields (type, mutability) and finality. Two record types the module treats as
-/// one wasm type have one shape, so a write is charged to every type of its shape: judging by
-/// shape can only refuse a record, never admit one a write can reach.
+/// one wasm type have one shape, so where indices may alias, a write is charged to every type
+/// of its shape: judging by shape can only refuse a record, never admit one a write can reach.
 type Shape = (Vec<(Num, bool)>, bool);
 
 /// What the op after a recorded one is, for the adjacency tests.
@@ -156,8 +162,17 @@ struct Module<'a> {
     func_type: Vec<u32>,
     /// Per type index: `Some((params, results))` for a function type.
     func_sig: Vec<Option<(Vec<ValType>, Vec<ValType>)>>,
-    /// Per type index: its shape when it is a record.
+    /// Per type index: its shape when it is a record the step may take apart.
     record: Vec<Option<Shape>>,
+    /// Per type index: its shape when it has a record's fields, before any refusal.
+    shape_all: Vec<Option<Shape>>,
+    /// Every struct type sits in one rec group, so two type indices are never one wasm type
+    /// and a write is charged by index rather than by shape.
+    by_index: bool,
+    /// Per type index: the root of its subtyping component (itself when it has none).
+    comp: Vec<u32>,
+    /// Per written struct type: the first function that writes it.
+    writer: HashMap<u32, u32>,
     bodies: Vec<Body>,
     names: bool,
 }
@@ -216,10 +231,17 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
         func_type: Vec::new(),
         func_sig: Vec::new(),
         record: Vec::new(),
+        shape_all: Vec::new(),
+        by_index: false,
+        comp: Vec::new(),
+        writer: HashMap::new(),
         bodies: Vec::new(),
         names: false,
     };
-    let mut subtyped: HashSet<u32> = HashSet::new();
+    let mut supers: Vec<(u32, u32)> = Vec::new();
+    // The rec groups that hold a struct type.
+    let mut struct_groups: HashSet<usize> = HashSet::new();
+    let mut n_groups = 0usize;
     let mut tainted: HashSet<u32> = HashSet::new();
     // First, the types and signatures alone, so a module with nothing to do costs no validation.
     for payload in Parser::new(0).parse_all(bytes) {
@@ -227,13 +249,17 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
             Payload::TypeSection(r) => {
                 for group in r {
                     let group = group.ok()?;
+                    let g = n_groups;
+                    n_groups += 1;
                     for sub in group.into_types() {
                         let ix = m.record.len() as u32;
                         if let Some(sup) = sub.supertype_idx.and_then(|p| p.as_module_index()) {
-                            subtyped.insert(ix);
-                            subtyped.insert(sup);
+                            supers.push((ix, sup));
                         }
                         let ct = &sub.composite_type;
+                        if matches!(ct.inner, CompositeInnerType::Struct(_)) {
+                            struct_groups.insert(g);
+                        }
                         let mut rec = None;
                         let mut sig = None;
                         match &ct.inner {
@@ -281,9 +307,38 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
             _ => {}
         }
     }
-    for t in subtyped {
-        if let Some(slot) = m.record.get_mut(t as usize) {
-            *slot = None;
+    // A subtype's value can stand where its supertype is expected, so a write to any type of
+    // a subtyping component reaches values of every other.
+    m.comp = (0..m.record.len() as u32).collect();
+    fn root(c: &mut [u32], mut t: u32) -> u32 {
+        while c[t as usize] != t {
+            c[t as usize] = c[c[t as usize] as usize];
+            t = c[t as usize];
+        }
+        t
+    }
+    for &(a, b) in &supers {
+        if (a as usize) < m.comp.len() && (b as usize) < m.comp.len() {
+            let (ra, rb) = (root(&mut m.comp, a), root(&mut m.comp, b));
+            m.comp[ra.max(rb) as usize] = ra.min(rb);
+        }
+    }
+    for t in 0..m.comp.len() as u32 {
+        let r = root(&mut m.comp, t);
+        m.comp[t as usize] = r;
+    }
+    m.shape_all = m.record.clone();
+    // In one rec group, distinct indices are distinct wasm types: a record is judged by its
+    // own index and its subtyping component. Otherwise two indices may be one type, so a
+    // record is judged by its shape, and a subtyped one is refused outright.
+    m.by_index = struct_groups.len() <= 1;
+    if !m.by_index {
+        for &(a, b) in &supers {
+            for t in [a, b] {
+                if let Some(slot) = m.record.get_mut(t as usize) {
+                    *slot = None;
+                }
+            }
         }
     }
     let any_candidate = (m.n_imports as usize..m.func_type.len()).any(|f| {
@@ -472,6 +527,7 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                     struct_type_index, ..
                 } => {
                     tainted.insert(*struct_type_index);
+                    m.writer.entry(*struct_type_index).or_insert(f);
                 }
                 Operator::LocalGet { local_index } => {
                     if local_rec.get(*local_index as usize) == Some(&true) {
@@ -570,14 +626,27 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
     if m.bodies.len() + m.n_imports as usize != m.func_type.len() {
         return None;
     }
-    // A write is charged to every record of its shape.
-    let written: HashSet<Shape> = tainted
-        .iter()
-        .filter_map(|&t| m.record.get(t as usize).cloned().flatten())
-        .collect();
-    for slot in &mut m.record {
-        if slot.as_ref().is_some_and(|s| written.contains(s)) {
-            *slot = None;
+    // A write is charged to every record of its subtyping component, or, judging by shape, to
+    // every record of its shape (read before any refusal, so a refused type's write counts).
+    if m.by_index {
+        let written: HashSet<u32> = tainted
+            .iter()
+            .filter_map(|&t| m.comp.get(t as usize).copied())
+            .collect();
+        for (t, slot) in m.record.iter_mut().enumerate() {
+            if written.contains(&m.comp[t]) {
+                *slot = None;
+            }
+        }
+    } else {
+        let written: HashSet<Shape> = tainted
+            .iter()
+            .filter_map(|&t| m.shape_all.get(t as usize).cloned().flatten())
+            .collect();
+        for slot in &mut m.record {
+            if slot.as_ref().is_some_and(|s| written.contains(s)) {
+                *slot = None;
+            }
         }
     }
     Some(m)
@@ -599,9 +668,17 @@ struct Analysis {
     fo_local: Vec<HashSet<u32>>,
 }
 
+/// Whether a value of record type `a` may be taken apart where record type `b` is named: the
+/// same type, or, judging by shape, the same shape.
 fn same_shape(m: &Module, a: u32, b: u32) -> bool {
     match (m.shape_of_type(a), m.shape_of_type(b)) {
-        (Some(x), Some(y)) => x == y,
+        (Some(x), Some(y)) => {
+            if m.by_index {
+                a == b
+            } else {
+                x == y
+            }
+        }
         _ => false,
     }
 }
@@ -1339,9 +1416,22 @@ impl BodyMove {
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
 /// changes nothing.
 pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
-    let m = scan(bytes)?;
+    let explaining = std::env::var_os("VL_MV_EXPLAIN").is_some_and(|v| !v.is_empty() && v != "0");
+    let Some(m) = scan(bytes) else {
+        if explaining {
+            eprintln!(
+                "mv-explain: step skipped: the module does not validate, or no function takes \
+                 or returns a record (a struct of 1 to {MV_RECORD_MAX_FIELDS} numeric fields \
+                 that nothing writes)"
+            );
+        }
+        return None;
+    };
     let a = analyse(&m);
     if a.producer.is_empty() && a.fo_param.is_empty() {
+        if explaining {
+            explain(&m, &a, &[], &[]);
+        }
         return None;
     }
     let n_funcs = m.func_type.len() as u32;
@@ -1365,6 +1455,9 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
             plans.push(plan_context(&m, &a, (f, 0, false), &mut index));
         }
     }
+    if explaining {
+        explain(&m, &a, &plans, &twins);
+    }
     let mut twin_plans: Vec<Plan> = Vec::new();
     while let Some(t) = work.pop_front() {
         if twins.len() > MV_MAX_TWINS {
@@ -1384,6 +1477,9 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
         twin_plans.push(plan_context(&m, &a, t, &mut index));
     }
     if too_many || twins.is_empty() {
+        if explaining && too_many {
+            eprintln!("mv-explain: step abandoned: more than {MV_MAX_TWINS} twins");
+        }
         return None;
     }
     // The bodies: every original one (rewritten where its plan says), then each twin's.
@@ -1422,6 +1518,12 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
         })
         .collect();
     if growth > MV_GROWTH_FLOOR + code_size / 2 {
+        if explaining {
+            eprintln!(
+                "mv-explain: step abandoned: the twins add {growth} bytes, past the bound of \
+                 {MV_GROWTH_FLOOR} plus half the {code_size}-byte code section"
+            );
+        }
         return None;
     }
     // New function types, one per distinct twin signature.
@@ -1532,6 +1634,245 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
         })?;
     }
     Some((out, moved))
+}
+
+/// Why struct type `t` is not one the step takes apart, read off the type section; `None` when
+/// its fields alone would qualify it.
+fn field_refusal(bytes: &[u8], t: u32) -> Option<&'static str> {
+    let mut ix = 0u32;
+    for payload in Parser::new(0).parse_all(bytes) {
+        let Ok(Payload::TypeSection(r)) = payload else {
+            continue;
+        };
+        for group in r.into_iter().flatten() {
+            for sub in group.into_types() {
+                if ix == t {
+                    let ct = &sub.composite_type;
+                    let CompositeInnerType::Struct(st) = &ct.inner else {
+                        return Some("not a struct");
+                    };
+                    if ct.shared || ct.descriptor_idx.is_some() || ct.describes_idx.is_some() {
+                        return Some("shared, or has a descriptor");
+                    }
+                    if st.fields.is_empty() {
+                        return Some("has no fields");
+                    }
+                    if st.fields.len() > MV_RECORD_MAX_FIELDS {
+                        return Some("has more fields than the step's bound");
+                    }
+                    let numeric = |f: &wasmparser::FieldType| match f.element_type {
+                        StorageType::Val(v) => Num::of(v).is_some(),
+                        _ => false,
+                    };
+                    return (!st.fields.iter().all(numeric))
+                        .then_some("has a field that is not i32, i64, f32 or f64");
+                }
+                ix += 1;
+            }
+        }
+    }
+    Some("not a struct")
+}
+
+/// `$VL_MV_EXPLAIN=1`: on stderr, per struct type a function takes or returns, whether the step
+/// may take it apart and why not; per function returning a record, whether it gets a result
+/// twin and why not, and what each of its call sites that keeps the struct does with it.
+fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
+    let names = function_names(m.bytes);
+    let name = |f: u32| {
+        names
+            .get(&f)
+            .cloned()
+            .unwrap_or_else(|| format!("func {f}"))
+    };
+    let n_funcs = m.func_type.len() as u32;
+    let defined = m.n_imports..n_funcs;
+    let ref_type = |v: &ValType| match v {
+        ValType::Ref(r) => concrete_index(r.heap_type()).map(|t| (t, r.is_nullable())),
+        _ => None,
+    };
+    let mut seen: Vec<u32> = Vec::new();
+    for f in defined.clone() {
+        let (ps, rs) = m.sig(f);
+        for (t, _) in ps.iter().chain(rs.iter()).filter_map(ref_type) {
+            if !seen.contains(&t) && m.func_sig.get(t as usize).is_some_and(|s| s.is_none()) {
+                seen.push(t);
+            }
+        }
+    }
+    seen.sort_unstable();
+    eprintln!(
+        "mv-explain: writes are charged by {}",
+        if m.by_index {
+            "type index and subtyping component (every struct type is in one rec group)"
+        } else {
+            "shape (struct types span several rec groups), and a subtyped record is refused"
+        }
+    );
+    for &t in &seen {
+        let fields = m.shape_all.get(t as usize).cloned().flatten();
+        let Some((fs, _)) = &fields else {
+            if let Some(why) = field_refusal(m.bytes, t).filter(|w| *w != "not a struct") {
+                eprintln!("mv-explain: type {t}: refused: {why}");
+            }
+            continue;
+        };
+        let spelled: Vec<&str> = fs
+            .iter()
+            .map(|(n, _)| match n {
+                Num::I32 => "i32",
+                Num::I64 => "i64",
+                Num::F32 => "f32",
+                Num::F64 => "f64",
+            })
+            .collect();
+        let producers: Vec<String> = defined
+            .clone()
+            .filter(|&g| result_record_any(m, g) == Some(t))
+            .take(3)
+            .map(name)
+            .collect();
+        let head = format!(
+            "mv-explain: type {t} {{{}}} (returned by {})",
+            spelled.join(", "),
+            if producers.is_empty() {
+                "no function".to_string()
+            } else {
+                producers.join(", ")
+            }
+        );
+        let comp = m.comp.get(t as usize).copied().unwrap_or(t);
+        let family: Vec<u32> = (0..m.comp.len() as u32)
+            .filter(|&u| u != t && m.comp[u as usize] == comp)
+            .collect();
+        if m.shape_of_type(t).is_some() {
+            eprintln!("{head}: candidate");
+        } else if !m.by_index && !family.is_empty() {
+            eprintln!("{head}: refused: in a subtyping relation with type(s) {family:?}");
+        } else {
+            let culprit = if m.by_index {
+                std::iter::once(t)
+                    .chain(family.iter().copied())
+                    .find(|u| m.writer.contains_key(u))
+            } else {
+                (0..m.shape_all.len() as u32)
+                    .find(|&u| m.writer.contains_key(&u) && m.shape_all[u as usize] == fields)
+            };
+            match culprit {
+                Some(u) if u == t => eprintln!(
+                    "{head}: refused: its fields are written (struct.set {t} in {})",
+                    name(m.writer[&u])
+                ),
+                Some(u) => eprintln!(
+                    "{head}: refused: type {u}, {}, is written (struct.set {u} in {})",
+                    if m.by_index {
+                        "in its subtyping component"
+                    } else {
+                        "of the same shape"
+                    },
+                    name(m.writer[&u])
+                ),
+                None => eprintln!("{head}: refused"),
+            }
+        }
+    }
+    let consumers: Vec<HashMap<u32, (u32, u32)>> = m.bodies.iter().map(arg_consumers).collect();
+    for f in defined.clone() {
+        let rs = &m.sig(f).1;
+        let Some((t, nullable)) = (rs.len() == 1).then(|| ref_type(&rs[0])).flatten() else {
+            continue;
+        };
+        if m.shape_all.get(t as usize).is_none_or(|s| s.is_none()) {
+            continue;
+        }
+        let why = if m.shape_of_type(t).is_none() {
+            Some(format!("its record type {t} is refused (above)"))
+        } else if nullable {
+            Some("its result is nullable (a `T | null` return)".to_string())
+        } else if m.body(f).exits_otherwise {
+            Some(
+                "a br_if, br_table, br_on_*, try, return_call_ref or return_call_indirect can \
+                 leave it with its result"
+                    .to_string(),
+            )
+        } else if !a.producer.contains(&f) {
+            Some("it tail-calls a function that gets no result twin".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            eprintln!("mv-explain: {} -> type {t}: no result twin: {why}", name(f));
+            continue;
+        }
+        // Its call sites in the original bodies: read as fields, or kept and why.
+        let mut served = 0usize;
+        let mut kept: Vec<(String, usize, Vec<String>)> = Vec::new();
+        for (ix, plan) in plans.iter().enumerate() {
+            let g = m.n_imports + ix as u32;
+            let b = &m.bodies[ix];
+            for i in &b.ins {
+                if i.kind != Kind::Call(f) || !i.reach {
+                    continue;
+                }
+                let as_fields = matches!(plan.acts.get(&i.k), Some(Act::Call(to, _))
+                    if *to >= n_funcs
+                        && twins.get((*to - n_funcs) as usize).is_some_and(|t| t.2));
+                if as_fields {
+                    served += 1;
+                    continue;
+                }
+                let reason = match (i.next, consumers[ix].get(&i.k)) {
+                    (Next::StructGet(st, _), _) => format!("read by a struct.get of type {st}"),
+                    (Next::LocalSet(_), _) => {
+                        "held in a local that another use keeps as a struct".to_string()
+                    }
+                    (Next::Exit, _) => {
+                        "returned by the caller (read as fields only inside the caller's own \
+                         result twin)"
+                            .to_string()
+                    }
+                    (_, Some(&(ck, j))) => {
+                        let h = b.at(ck).and_then(callee_of).map_or_else(String::new, name);
+                        format!("passed as argument {j} of {h}, which keeps it as a struct")
+                    }
+                    _ => "stored (field, array, global), cast, compared, or passed to an import"
+                        .to_string(),
+                };
+                let at = match i.next {
+                    Next::LocalSet(l) => format!("{} local {l}", name(g)),
+                    _ => name(g),
+                };
+                match kept.iter_mut().find(|k| k.0 == reason) {
+                    Some(k) => {
+                        k.1 += 1;
+                        if k.2.len() < 3 && !k.2.contains(&at) {
+                            k.2.push(at);
+                        }
+                    }
+                    None => kept.push((reason, 1, vec![at])),
+                }
+            }
+        }
+        let n_kept: usize = kept.iter().map(|k| k.1).sum();
+        eprintln!(
+            "mv-explain: {} -> type {t}: result twin; {served} call site(s) read it as fields, \
+             {n_kept} keep the struct",
+            name(f)
+        );
+        kept.sort_by(|x, y| y.1.cmp(&x.1));
+        for (reason, n, at) in kept {
+            eprintln!("mv-explain:     {n} {reason} (in {})", at.join(", "));
+        }
+    }
+}
+
+/// The record-shaped type a function's single reference result names, before any refusal.
+fn result_record_any(m: &Module, f: u32) -> Option<u32> {
+    let [ValType::Ref(r)] = m.sig(f).1.as_slice() else {
+        return None;
+    };
+    let t = concrete_index(r.heap_type())?;
+    m.shape_all.get(t as usize)?.as_ref().map(|_| t)
 }
 
 /// Each function's name in the module's `name` section.

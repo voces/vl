@@ -7376,8 +7376,8 @@ results (`unit`) merged them, which `--heap2local` cannot melt (D3625's witness,
 
 **The rule.** The step the ruling names, at the call boundary, as a host step before the
 escape step (`scripts/vl-host/src/multivalue.rs`). A record is a struct type of 1 to 8 fields,
-each `i32`/`i64`/`f32`/`f64`, outside subtyping, whose shape no `struct.set` (or atomic write)
-names anywhere in the module. A producer returns a non-null reference to one; a function gets
+each `i32`/`i64`/`f32`/`f64`, that no `struct.set` (or atomic write) anywhere in the module
+can reach (by type and subtyping component since D3630, below). A producer returns a non-null reference to one; a function gets
 a twin per `(field parameters, fields result)` pair a call site asks for. A call calls a twin
 when its result reaches only `struct.get`s, a field-only local (every set from a producer, a
 `struct.new` or another such local, every get a field use), a field-only parameter of another
@@ -7437,6 +7437,17 @@ compiler at `-O`: the step takes 102 ms on its 4 MB, rewrites it, and the result
 to the seed byte for byte. `--enable-multivalue` is byte-neutral on the compiler at both
 rungs. `tests/selfhost_native_release_multivalue_test.ts` pins sunpa's shapes (against a step-off
 control), escapes, recursion and the bound; `tests/vl_addr2line_test.ts` a trap inside a twin.
+
+**A write is charged by type index, not shape, when the indices cannot alias (D3630).** Shape
+and "outside subtyping" were both proxies for "no write can reach this value". After
+re-pinning, sunpa's `V3` still got no twin, for two reasons. First, its in-place 3×f64 records
+share V3's shape. Second, the emitter's width subtyping (D622) makes `V3` a subtype of any
+`{ x, y }` record in the program. VL emits every struct type into one rec group, and there
+distinct indices are distinct wasm types, so the step now asserts that and charges a write to
+the written type's subtyping component. A subtype's value stands where its supertype is
+expected, so a write through either reaches both. A module whose struct types span several
+groups keeps the shape rule. `$VL_MV_EXPLAIN=1` prints each type's and producer's verdict,
+for consumers to find their own disqualifier.
 
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
