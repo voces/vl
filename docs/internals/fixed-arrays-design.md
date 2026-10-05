@@ -39,9 +39,10 @@ immutable value. `r.pose[3] = x` is therefore a write to the field `r.pose`, and
 `type Skeleton = { root: f64[16] }`, `const g: f64[16][] = []`, `xs as! f64[16]`,
 `m as f64[]`, `a == b`, `for x in m`, `m.length` (a constant).
 
-**Six owner questions** remain (§10), in dependency order: Q1 the value model, Q2 the
-spelling, Q3 the element types, Q4 how a non-literal value is built, Q5 whether the size cap
-is visible, Q6 whether "no heap at `-O`" is a guarantee. Everything else is a stated default (§10.2), each following from an existing
+**Five owner questions** remain (§10), in dependency order: Q1 the value model, Q2 the
+spelling of the type and its fill, Q3 the element types, Q4 whether dead writes are errors,
+Q5 whether "no heap" holds at every optimisation level or at `-O` only; plus one adjacent
+question about scalar `u8` record fields. Everything else is a stated default (§10.2), each following from an existing
 ruling or from the model itself.
 
 **Evidence (§7).** The locals placement runs sunpa's `m4Mul` at Rust parity with zero garbage
@@ -324,11 +325,21 @@ equality, so nothing can tell two equal `T[N]` values apart, or tell a copy from
 
 ### 4.2 One rewrite: element assignment replaces the whole value
 
-`p[i] = v`, where `p` is an assignable **place**, means `p = p.with(i, v)`. `p` is assignable
-exactly where `p = e` would be: a `let` binding, a parameter, a loop variable, a record field,
-a list element, a module global. Compound forms nest: `p[i][j] = v` is
-`p[i] = p[i].with(j, v)`, which is `p = p.with(i, p[i].with(j, v))`. `+=` and friends rewrite
-the same way.
+`p[i] = v`, where `p` is an assignable **place**, means `p = p.with(i, v)`. **`with` is
+specification notation, not a name**: there is no `with` method or function a program can
+call, and adding one would be a std export under the built-in-methods ruling and
+`std-api-reviewer`. `p` is assignable exactly where `p = e` would be: a `let` binding, a
+parameter, a loop variable, a record field, a list element, a module global. Compound forms
+nest: `p[i][j] = v` is `p[i] = p[i].with(j, v)`, which is `p = p.with(i, p[i].with(j, v))`.
+`+=` and friends rewrite the same way.
+
+**Each subexpression of a place is evaluated once, left to right**, and then the
+read-modify-write happens: the receiver, every index, and any user index operator (`"[]"` /
+`"[]="`, B14). `g[f()][k] += h()` calls `f` once and `h` once, as `g[f()] += 1.0` on a list
+does today (measured). `idt[k][i] = v` on a B14 container holding `f64[16]` values calls
+`"[]"` once to read the element and `"[]="` once to store the rebuilt one, so it needs both
+operators. The rewrite's nested spelling above is notation for the value written, not the
+evaluation order; the position matrix carries a row that counts evaluations.
 
 Everything else follows from existing rules about `=`:
 
@@ -341,6 +352,15 @@ Everything else follows from existing rules about `=`:
 | `g[j][k] = x` with `g: readonly f64[16][]` | `g[j] = …` is refused through `readonly` | refused |
 | `let b = a; b[0] = 1.0` | `b = …` rebinds `b` only | `a` unchanged |
 | `const h = () => m[0]; m[0] = 1.0; h()` | an assignment to a captured variable (D2339) | `1.0` |
+| `f().pose[3] = x` | `f().pose = …` is a field write on a returned reference | legal, writes that record |
+| `m[k][i] = v` with `m: {[string]: f64[16]}` | `m[k]` is `f64[16] \| null`, which cannot be indexed (as today: "cannot index non-array f64[] \| null") | refused; write `const p = m[k] ?? …; m[k] = …` |
+| `u[0] = 1.0` with `u: f64[4] \| f32[4]`, not narrowed | the place's type is a union | refused, naming `is`; per-member dispatch is additive later |
+| `p: readonly f64[16]` | a value is already unwritable through any other name | a hint: `readonly` is redundant on a value |
+
+**Narrowing.** An element write assigns a value of the binding's own type, so it never
+retires a narrowing of that binding by itself. It *is* a write for D2390's `callMayWrite`: a
+call to a closure that element-writes a captured array ends narrowings of that binding, which
+is new relative to lists (whose element writes are not writes to the binding).
 
 There is no special rule for any of these rows; that is the point of defining the update as a
 rewrite.
@@ -389,9 +409,9 @@ check error naming both lengths. Elements adapt as scalars do: `const v: f64[3] 
 is `[1.0, 2.0, 3.0]`, a runtime `i32` element converts to `f64`, and an `i64` element into
 `f64` is refused with an `as` fix (the numeric lattice).
 
-**Adoption (D3339 style).** A binding whose initialiser is only a literal, and whose uses
-include a delivery to a `T[N]` type, **adopts** that type at the declaration, and every use
-sees it:
+**Adoption (D3339 style), restricted.** A binding whose initialiser is only a literal, whose
+uses include a delivery to a `T[N]` type, and whose OTHER uses are only reads and deliveries,
+**adopts** that type at the declaration, and every use sees it:
 
 ```vl
 const p = [1.0, 2.0, 3.0]
@@ -402,14 +422,26 @@ takesV2(u)                 // error naming both uses: `push` needs a list, `take
 ```
 
 This is the record covariance ruling's "a fresh literal adopts its destination" and D3339's
-"adopts fully, every read sees it". With no fixed-array use, a literal stays a `T[]`, so no
-existing program changes type. An un-annotated `[1.0, 2.0]` passed to a `T[]` parameter is
-unaffected.
+"adopts fully, every read sees it". **The restriction is what keeps it sound**: D3339 and B′
+adopt within one kind (a wider number, a wider field), but list to value changes aliasing,
+which record covariance refused. So a binding that is element-written, aliased into another
+binding, field or list, or captured does **not** adopt; a `T[N]` use of it is refused with the
+annotate fix (`const p: f64[3] = …`). Otherwise a use further down would change what a write
+further up means:
+
+```vl
+let p = [1.0, 2.0]
+const q = p
+q[0] = 9.0                 // a list write, seen through p ...
+takesV2(p)                 // ... unless this use made p a value: refused instead, "annotate p"
+```
+
+With no fixed-array use, a literal stays a `T[]`, so no existing program changes type.
 
 ### 5.3 Construction beyond a literal
 
-Recommended (Q4): the fill `[v; N]`, which evaluates `v` once, plus element writes, which are
-free in the value tier:
+Recommended (part of Q2, since the fill's spelling follows the type's bracket family): the fill
+`[v; N]`, which evaluates `v` once, plus element writes, which are free in the value tier:
 
 ```vl
 let m: f64[16] = [0.0; 16]
@@ -418,8 +450,9 @@ const z: f32[64] = [0.0; 64]
 ```
 
 A lint hint (`fill-evaluates-once`) fires when `v` contains a call. A generator
-(`f64[16].from((i) => …)`) is the alternative Q4 weighs; it needs a type in expression
-position, which VL has nowhere else, and an unroll-and-inline guarantee for its closure.
+(`f64[16].from((i) => …)`) is a later, additive option (stated default D24): it needs a type in
+expression position, which VL has nowhere else, and an unroll-and-inline guarantee for its
+closure, and the fill-plus-loop already compiles to the same code.
 
 `[...a, ...b]` is a literal whose length is known when every spread operand is a `T[N]`, so
 `const h: f64[4] = [...v3, 1.0]` is legal (homogeneous coordinates). A spread of a `T[]`
@@ -433,8 +466,12 @@ const m2: f64[16] = xs as! f64[16]    // in: traps on a length mismatch
 const m3 = xs as? f64[16]             // f64[16] | null
 ```
 
-`as` checks the LENGTH only; element types must already match (`[1.5] as! i32[1]` is refused,
-not converted). Bare `as` propagates null as the numeric trio does. This extends `as` beyond
+`as` checks the length first and then converts **each element under the same trio**, because
+`as` is VL's exact-or-fail conversion operator ("a lossy conversion is a failure"):
+`[1.5] as! i32[1]` traps (1.5 is not exact), `[2.0] as! i32[1]` is `[2]`, and `as%` wraps
+element-wise for integer targets. Implicit delivery converts element-wise only when exact for
+every element type (§5.11), so the explicit operator does at least what the implicit path does.
+Bare `as` propagates null as the numeric trio does. This extends `as` beyond
 numbers for the first time (A9), which is the owner's corollary "when a proposed name is an
 operator the language already has, spelled as a function, the answer is the operator", over a
 `toList()` method. There is no implicit conversion either way: a `T[N]` delivered to a `T[]`
@@ -471,7 +508,8 @@ run time exactly as lists do today.
 
 ### 5.9 Element types
 
-Recommended v1 (Q3):
+Recommended v1 (Q3 (c)): numbers, `u8`, `boolean` and nested arrays. Numeric records are
+Q3 (a), described here so the question is concrete.
 
 * **Numbers**: `i32`, `i64`, `f32`, `f64`, `u32`/`u64` once they exist.
 * **`u8`**, under `u8[]`'s existing rule: packed in storage (`(mut i8)` struct fields, an
@@ -482,22 +520,26 @@ Recommended v1 (Q3):
   the type claims (the owner's "a type must not claim a range it does not enforce").
 * **`boolean`**, except in a `flat` field (flat refuses `boolean` for its own reason).
 * **Nested fixed arrays**: `f64[4][4]`, placed recursively (16 locals, 16 fields, stride 16).
-* **Numeric records** (`type V3 = { x: f64, y: f64, z: f64 }`, every field a number,
+* **Numeric records, if Q3 (a)** (`type V3 = { x: f64, y: f64, z: f64 }`, every field a number,
   `boolean`, `u8` or nested such record): stored **by field** (`V3[4]` is 12 slots in every
   placement), copied in on a write and copied out on a read. `const v = a[0]` is a fresh `V3`;
   `v.x = 1.0` does not change `a`; `a[0].x = 1.0` does, through the rewrite
   (`a = a.with(0, { ...a[0], x: 1.0 })`). A copied-out record that is only read field by field
   never allocates at `-O`, through the existing multi-value step. A `new { … }` record keeps
   its brand through the copy.
-* **Not in v1**: strings, lists, maps, closures, unions, nullable elements. Strings are
+* **Not in v1** (any Q3 answer): strings, lists, maps, closures, unions, nullable elements. Strings are
   immutable and would be sound; lists and maps would make the array a value of shared mutable
   references ("value" in name only). Both are additive later. Each refused element type gets a
   message naming the supported set, graded one member per row before it ships (CLAUDE.md).
 
-Note the asymmetry this leaves: `V3[4]` stores its records by field, but a `V3[]` list stays a
-list of record references, because a list of records is today's reference semantics and is not
-part of this type. Flattening numeric-record lists is a separate follow-up, not a consequence
-of this design.
+**Why records are not recommended for v1.** Stored by field, a record behaves as a value or as
+a reference depending on what holds it: with `a: V3[4]`, `const v = a[0]; v.x = 1.0` leaves
+`a` unchanged; with `a: V3[]`, the same two lines change `a`. That is per-container value
+semantics for records, the copy-on-delivery the record covariance ruling refused because it
+"silently changes aliasing", and `collections-design.md` §VL.6 calls value-versus-reference a
+language-wide call. It may be worth it (`V3[4]` is sunpa's next shape after matrices), but it
+is a second concept and the owner should rule on it knowing that, after v1. Flattening `V3[]`
+lists is a separate question again.
 
 ### 5.10 Generics
 
@@ -562,7 +604,7 @@ function m4MulInto(r: f64[16], a: f64[16], b: f64[16]) { r[0] = a[0] * b[0] }   
 for m in g { m[0] = 9.0 }                                                        // m is a copy
 ```
 
-**Stated default: an element write to a parameter, a loop variable, or a `let` initialised from
+**Proposed (Q4): an element write to a parameter, a loop variable, or a `let` initialised from
 a place, after which the binding is never read, is a check error**, naming the fix ("write
 `g[i][0] = …`, or return the value"). A closure capturing the binding counts as a read. Writes
 followed by reads are untouched, so a parameter used as scratch is fine. This is per-binding
@@ -573,7 +615,7 @@ from list code.
 **The same hazard through a call result.** sunpa's `m4MulInto` writes `r` and then *returns* it,
 and its callers ignore the result (`m4MulInto(viewProj, proj, view)`, `view.vl:697`). The rule
 above does not fire (`r` is read by the return), and today's `unused-pure-expression` lint
-covers only literal and identifier statements. **Stated default: a call statement whose
+covers only literal and identifier statements. **Proposed (Q4): a call statement whose
 result is a `T[N]` and is discarded is a check error**, naming the fix
 (`viewProj = m4Mul(proj, view)`). A message for a dead write through a list element
 (`mulLocalInto(…, out[b])`) names `out[b] = …`.
@@ -623,6 +665,17 @@ ABI chosen for a host is permanent, and no consumer asks yet.
 
 The guide's rule of thumb: **a `T[]` is a container you share; a `T[N]` is a number with
 several parts.**
+
+### 5.19 The amendment `collections-design.md` §VL.7 gets on Q1 (a)
+
+§VL.7 says the fixed-size gap "closes without a second user-facing type", calls its inferred
+lowering "fixed-array", and floats `List<T>`/`Array<T>` forcing names. If Q1 is ruled (a), that
+section gets, in the same PR as the ruling: the lowering renamed **"header-less list"** (never
+"fixed array" in user docs); its "no second type" rationale struck, with a pointer here; the
+`Array<T>` forcing name withdrawn (`T[N]` is the explicit fixed form); and a statement of
+whether the header-less lowering is still planned. This design recommends keeping it as an
+invisible optimisation for never-grown lists that are not small math values, and not
+building it before a consumer measures the header cost.
 
 ---
 
@@ -683,7 +736,7 @@ box per rebuild), so a debug build is a correct but garbage-producing build, and
 heap" guarantee is a property of `-O`, not of the type. Revision 2's hand-written lowering of
 exactly what the step would produce (`e_mvg`) is the measurement (§7.1). If the step declines
 a function (a `br_table` exit, a growth bound), the program still runs, with boxes, and the
-build says so (§5.16). Whether "no heap at `-O`" is a tested guarantee or best effort is Q6.
+build says so (§5.16). Q5 asks whether this route, or the emitter's, carries the no-heap promise.
 
 ### 6.3 Record fields: inline
 
@@ -733,8 +786,8 @@ per-signature budget of 256 parameter slots and 64 result slots (the rest pass b
 the cap the value is boxed. Inline fields and flattened lists have **no cap**: a field's cost
 is the record's size, and a list's stride is arithmetic. Julia's rule of thumb is 100 elements;
 64 is the nearest power of two under it that the measurements support. All three numbers are
-lowering constants recorded in DECISIONS.md, not part of the type system. **Q5** asks whether
-crossing the cap is silent, hinted, or an error.
+lowering constants recorded in DECISIONS.md, not part of the type system. Crossing the cap is
+silent placement plus a hint (D25), never a type error.
 
 ### 6.7 Build slices, sized in agent-days
 
@@ -1024,95 +1077,97 @@ let a: f64[4] = [0.0; 4]
 let b = a
 b[0] = 1.0
 print(a[0])
+const xs: f64[] = [0.0];    xs[0] = 1.0     // a list: legal, as today
+const m: f64[4] = [0.0; 4]; m[0] = 1.0      // a value: refused, as `m = …` is
 ```
 
-* (a) **Value, update by rewrite**: prints `0`. `b[0] = 1.0` is `b = b.with(0, 1.0)`; a
-  `const` refuses it; `f()[0] = 1.0` is not a place.
+* (a) **Value, update by rewrite**: prints `0`. `b[0] = 1.0` means `b = b.with(0, 1.0)` (`with`
+  is notation, not a name); the `const` line is refused, so `const` on a list and on a `T[N]`
+  read differently, which is the most visible consequence; `f()[0] = 1.0` is not a place.
 * (b) **Fixed-length reference** (§VL.7's representation made nameable): prints `1`, and the
   allocation is removed only where an optimiser proves no alias (option B, declined on
   2026-10-04).
-* (c) **Value without element assignment**: `b[0] = 1.0` is refused; `b = b.with(0, 1.0)` is
-  the only update.
+* (c) **Value without element assignment**: `b[0] = 1.0` is refused; an update builds a new
+  value (a literal, or a std function that would need its own review).
 
 *Recommend (a).* (b) is SP-036's complaint; (c) makes every matrix routine (`m4Invert`,
-`jittered`) a chain of `with`, which the rewrite in (a) produces anyway.
+`jittered`) a chain of rebuilds, which the rewrite in (a) produces anyway.
 
-**Q2. How is the type spelled?**
+**Q2. How are the type and its fill spelled?** The fill follows the type's bracket family.
 
 ```vl
-let m: f64[16]          // (a) the T[] suffix family; f64[3][4] is four f64[3]
-let m: [f64; 16]        // (b) Rust; [[f64; 3]; 4]
-let m: [16 of f64]      // (c) Swift 6.2; [4 of [3 of f64]]
+let m: f64[16] = [0.0; 16]        // (a) the T[] suffix family + Rust's fill; f64[3][4] is four f64[3]
+let m: [f64; 16] = [0.0; 16]      // (b) Rust both ways; [[f64; 3]; 4]
+let m: [16 of f64] = [16 of 0.0]  // (c) Swift 6.2 both ways; [4 of [3 of f64]]
 ```
 
-*Recommend (a)*: one bracket family (`f64[16][]` is a list of matrices), D's spelling, and
-the free syntax is already there (A13). Its cost is the inside-out nesting order, the reverse
-of C (`f64[3][4]` is four rows of three); (b) and (c) make the order explicit at the cost of a
-second bracket grammar.
+*Recommend (a)*: one bracket family for types (`f64[16][]` is a list of matrices), D's spelling,
+and the syntax is free (A13). Its cost is the inside-out nesting order, the reverse of C
+(`f64[3][4]` is four rows of three), and a fill borrowed from a different family; (b) and (c)
+make the order explicit and pair the fill with the type, at the cost of a second bracket
+grammar.
 
 **Q3. Which element types are in v1?**
 
 ```vl
-f64[16]  u8[4]  boolean[8]  f64[4][4]      // (a), (b), (c)
-V3[4]                                      // (a), (b): V3 = { x: f64, y: f64, z: f64 }
-string[3]  (f64[])[2]                      // (b) only
+f64[16]  u8[4]  boolean[8]  f64[4][4]      // (a), (c)
+V3[4]                                      // (a) only: V3 = { x: f64, y: f64, z: f64 }
+const v = a[0]; v.x = 1.0                  // a: V3[4] → a unchanged;  a: V3[] → a changed
 ```
 
-* (a) Numbers, `u8` (storage rule), `boolean`, nested, and numeric records stored by field.
-* (b) (a) plus references (strings, lists, maps) in every GC placement; a list element makes
-  the array a value of shared lists.
-* (c) Numbers, `u8`, `boolean` and nested only.
+* (a) (c) plus numeric records stored by field, copied in and out, so a record held in a `T[N]`
+  behaves as a value and one held in a list as a reference.
+* (c) Numbers, `u8`, `boolean` and nested arrays. A value-tier `u8[4]` is four masked `i32`
+  locals (or one packed `i32`): a `u8` held as a local, which the u8 ruling's "illegal as a
+  local or parameter" did not foresee; the storage still enforces 0..255.
 
-*Recommend (a).* `V3[4]` is sunpa's next shape after matrices; references are additive and
-(b)'s lists would make "value" shallow.
+*Recommend (c)* for v1, with records as a later question once the aliasing split above has been
+seen in use. References (strings, lists) are additive under either answer.
 
-**Q4. How is a non-literal value built?**
+**Q4. Are dead element writes and discarded `T[N]` results errors or lint warnings?**
 
 ```vl
-let m: f64[16] = [0.0; 16]; for i in 0 until 4 { m[i * 5] = 1.0 }     // (a) fill + writes
-const m = f64[16].from((i) => if i % 5 == 0 { 1.0 } else { 0.0 })     // (b) generator
+function m4MulInto(r: f64[16], a: f64[16], b: f64[16]): f64[16] { r[0] = a[0] * b[0]; r }
+m4MulInto(viewProj, proj, view)    // result discarded: viewProj never changes
+for m in g { m[0] = 9.0 }          // m is a copy, never read
 ```
 
-* (a) `[v; N]` (evaluates `v` once; a hint when it calls), then element writes.
-* (b) A generator on the type, unrolled when N is constant and the closure is pure.
-* (c) Both.
+* (a) **Check errors** for exactly these two shapes on `T[N]` (the porting hazards), as §5.14
+  proposes.
+* (b) **One general `unused-assignment` lint and one `discarded-value` lint**, at warning tier
+  with fixes, for every type: `s = 5` never read and `r = {…}` never read warn too.
+* (c) Neither.
 
-*Recommend (a)* for v1: element writes are free in the value tier, so the loop is the
-generator; (b) needs a type in expression position, which VL has nowhere else, and can be
-added later.
+*Recommend (a)* for the two `T[N]` shapes: each refused program computes nothing observable,
+and a port from list code is otherwise a silent wrong result. The panel's purist argues (b)
+(§11): a dead store is not a design violation, and `print(r[0])` silences the error while the
+port stays wrong. Census today's dead stores before choosing (b) at error tier.
 
-**Q5. When a value crosses the size cap (64 slots) and becomes boxed, does the user see it?**
-
-```vl
-let big: f64[100] = [0.0; 100]
-for i in 0 until 100 { big[i] = f(i) }    // boxed: each write rebuilds 100 elements
-```
-
-* (a) Silent placement, plus the `fixed-array-boxed-update` hint where a boxed value is written
-  in a loop.
-* (b) A hard limit: `f64[100]` is a check error in value positions.
-* (c) Silent, no hint.
-
-*Recommend (a).* Julia's and Rust's experience is that a hard limit is arbitrary and moves; a
-hint at the site that pays is what users ask for.
-
-**Q6. Is "a value-tier `T[N]` allocates nothing at `-O`" a guarantee or best effort?**
-Rust gives it through the type; this design gives it through the `-O` host step (§6.2).
+**Q5. Is "no heap" a property of the type at every optimisation level, or of `-O` only?**
 
 ```vl
 function m4Mul(a: f64[16], b: f64[16]): f64[16] { … }
-let m: f64[16] = [0.0; 16]
-for i in 0 until n { m = m4Mul(m, t) }    // must this loop allocate nothing at -O3?
+for i in 0 until n { m = m4Mul(m, t) }    // allocates nothing at -O3; at -O0?
 ```
 
-* (a) **A guarantee**: position-matrix fixtures assert zero `array.new` in the emitted `-O`
-  module for every value-tier position, and `vl build -O` warns (by default) for each function
-  where a box survives, naming the step's reason.
-* (b) **Best effort**: the step usually scalarises; `VL_MV_EXPLAIN=1` says when it did not.
+* (a) **`-O` only, through the host step** (§6.2, revision 3): the emitter boxes, the existing
+  multi-value step scalarises; `-O0` allocates. Guaranteed at `-O` by fixtures asserting zero
+  `array.new` in every value-tier position, and `vl build -O` warns by default for each function
+  where a box survives.
+* (b) **Every level, in the emitter** (revision 2's L1): the emitter emits N locals and
+  multi-value itself, VL's first multi-slot representation (A15); `-O0` allocates nothing.
+* (c) **Best effort at `-O`**: as (a) without the guarantee and the warning.
 
-*Recommend (a).* The reason a consumer reaches for this type is the absence of garbage; a
-silent fallback at `-O3` is the failure a perf programmer cannot see. `-O0` allocating stays
-acceptable (sunpa builds `-O3` only).
+*Recommend (a)*: it reuses #3372 and keeps the emitter's one-value-one-slot invariant, and
+sunpa builds `-O3` only. (b) is the cleaner contract and costs the A15 audit; it stays
+available later, since placement is unobservable.
+
+**Adjacent question (not this type, needed for exact `flat` erasure). May an ordinary record
+hold a scalar `u8` field?** `flat type C = { r: u8, g: u8, b: u8, a: u8 }` is legal under the
+owner's u8 ruling; flat's erasure rule (flat §4) needs the same declaration without `flat` to be
+legal too. (a) yes, a packed `(mut i8)` field read as `i32`, the storage-backed argument the
+ruling already makes; (b) no, and flat's erasure becomes "subtracts nothing except `u8`
+fields". *Recommend (a)*; until ruled, `flat` admits `u8[N]` fields and not scalar `u8`.
 
 ### 10.2 Stated defaults (each follows from a ruling or from the model; say so to overturn)
 
@@ -1120,8 +1175,8 @@ acceptable (sunpa builds `-O3` only).
 | --- | --- | --- |
 | D1 | N is a positive integer literal or a `const` bound to one; `T[0]` refused | the exact-const ruling |
 | D2 | an exact-length literal in a `T[N]` position builds one; elements adapt as scalars | numeric rulings |
-| D3 | a literal-only binding with a `T[N]` use adopts the type; conflicting uses are an error naming both | record covariance, D3339 |
-| D4 | `as` both ways, length only; `m as f64[]` infallible; the trio inward | the `as`-trio corollary |
+| D3 | a literal-only binding whose other uses are reads and deliveries adopts a `T[N]` destination; an element-written, aliased or captured one is refused with the annotate fix | record covariance, D3339, restricted so aliasing never changes (§5.2) |
+| D4 | `as` both ways; length first, then each element under the same trio (`as%` wraps integers); `m as f64[]` infallible | the `as`-trio corollary, "a lossy conversion is a failure" |
 | D5 | no implicit `T[N]` ↔ `T[]` conversion | A16, record covariance |
 | D6 | `==` element-wise; `print` refused like lists; not a map key | A11 |
 | D7 | `for` iterates the value at loop start | the model |
@@ -1132,15 +1187,16 @@ acceptable (sunpa builds `-O3` only).
 | D12 | closures capture by reference; an element write is an assignment | D2339 + the rewrite |
 | D13 | `readonly T[N][]` refuses `g[0][3] = x` | the rewrite |
 | D14 | no `inout`; return the value | the model |
-| D15 | a dead element write to a parameter, loop variable or place copy is a check error | A12 |
 | D16 | placement is the compiler's, per §4.3 | the owner's direction |
 | D17 | `T[N]` in an entry-module export or an `extern function` signature is refused in v1, naming `as f64[]` or a `Buf` | its placement changes with `-O`, so no stable ABI exists (§8.6) |
 | D18 | no std additions in v1; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in. A bulk `storeF32s(b, at, m)` for GPU upload is DEFERRED, not rejected, and goes through `std-api-reviewer` when a consumer measures `put`; its `loadF32s` twin needs length generics or a builtin (§8.2) | the built-in-methods ruling (storage ops only) |
-| D19 | `flat` fields of `T[N]`, with `u8` 1-byte fields; `Bone.m[k]` and `Bone.m.length` fold; little-endian, no padding; a scalar `u8` field is legal in every record so flat erasure stays exact | the owner's direction, the u8 storage ruling, flat §4/§9 (§8.1) |
+| D19 | `flat` fields of `T[N]`, including `u8[N]`; `Bone.m[k]` and `Bone.m.length` fold; little-endian, no padding; scalar `u8` fields wait for the adjacent question in §10.1 | the owner's direction, the u8 storage ruling, flat §4/§9 (§8.1) |
 | D20 | `[...v3, 1.0]` builds a `T[4]`; call spread into fixed parameters is later | variadics |
-| D21 | S1 scalarises through the host step; `-O0` allocates; S0 and S1 reach consumers together | §6.2, §6.7 |
-| D22 | discarding a call's `T[N]` result is a check error | §5.14 |
+| D21 | S0 and S1 reach consumers together | §6.7 |
 | D23 | the unroll override drops the call veto for loops indexing a value-tier array | §6.1 |
+| D24 | construction is the literal, `[v; N]` and element writes; a generator is later and additive | §5.3 |
+| D25 | the size cap (64 slots) is silent placement plus the `fixed-array-boxed-update` hint, never a type error | Julia's and Rust's experience; §6.6 |
+| D26 | each place subexpression is evaluated once, left to right; map-read places and un-narrowed union places are refused | §4.2 |
 
 ---
 
