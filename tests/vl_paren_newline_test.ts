@@ -220,14 +220,19 @@ Deno.test({
         "function inParens(a: i32, b: i32) {\n  (a\n    -b)\n}\n" +
         "function spacedOne(a: i32) {\n  const x = a\n  x\n  - 1\n}\n" +
         "function arm(x: i32) {\n  match x {\n    1 => 10\n    - 1 => 20\n    _ => 30\n  }\n}\n" +
+        // A multi-line or-pattern, spaced at statement level and tight inside a call (D3699).
+        "function orSpaced(x: i32) {\n  match x {\n    3 => 10\n    - 1 |\n    - 2 => 20\n    _ => 30\n  }\n}\n" +
+        "const orY = -2\n" +
+        "function orTight() {\n  print(\n    match orY {\n      3 => 10\n      -1 |\n      -2 => 40\n      _ => 30\n    },\n  )\n  0\n}\n" +
         "print(\"\\{cam(2.0, 1.0, 4.0)}\")\nprint(joined(9, 4))\nprint(tight(5))\nprint(neg2(5))\n" +
         "print(neg1(5))\nprint(tabbed(6, 2))\nprint(commented(6, 2))\nprint(ret(5, 2))\n" +
-        "print(inParens(5, 2))\nprint(spacedOne(4))\nprint(arm(-1))\n";
+        "print(inParens(5, 2))\nprint(spacedOne(4))\nprint(arm(-1))\n" +
+        "print(orSpaced(-2))\norTight()\n";
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, src);
       const r = await runVL("run", f);
       if (r.code !== 0) throw new Error(`leading-minus probe failed, code ${r.code}:\n${r.err}`);
-      const want = "1.5\n5\nn\n-5\nm\n105\n5\n4\n4\n3\n3\n3\n20\n";
+      const want = "1.5\n5\nn\n-5\nm\n105\n5\n4\n4\n3\n3\n3\n20\n20\n40\n";
       if (r.out !== want) throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(r.out)}`);
       const fmt = await runVL("fmt", f);
       if (fmt.code !== 0) throw new Error(`fmt failed: ${fmt.err}`);

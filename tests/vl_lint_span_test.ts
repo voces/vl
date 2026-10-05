@@ -139,6 +139,37 @@ Deno.test({
 });
 
 Deno.test({
+  name: "lint span: a `-` line after an `if` statement is told a space will not help (D3698)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "after-if.vl",
+      [
+        "function f(c: boolean, k: i32) {",
+        "  let r = 1",
+        "  if c { r = 2 }",
+        "  - k * 2",
+        "  r = r + 1",
+        "  -k * 2",
+        "  r",
+        "}",
+        "print(f(true, 3))",
+        "",
+      ].join("\n"),
+    );
+    // `- k * 2` after the `if` stays a statement, so the space advice would re-fire; `-k * 2`
+    // after the assignment would continue it with a space, so that one gets the space advice.
+    const got = diags.filter((d) => d.code === "unused-pure-expression")
+      .map((d) => [spanText(src, d), d.message.includes("parentheses") ? "parens" : "space"]);
+    want(
+      JSON.stringify(got),
+      JSON.stringify([["- k * 2", "parens"], ["-k * 2", "space"]]),
+      "unused-pure-expression",
+    );
+  },
+});
+
+Deno.test({
   name: "lint span: sentinel-index-unguarded covers the whole read, not the table",
   ignore: !ENABLED,
   fn: async () => {

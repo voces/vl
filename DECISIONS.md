@@ -5438,7 +5438,11 @@ has no `->`, and `-1` lexes as `-` then `1`, so `- 1` continues and `-1` does no
 exception, at every depth: a line that reads as a negative integer match pattern followed by
 `=>` (`-1 =>`, `- 1 | 2 =>`) is the next arm, never a subtraction from the previous arm's
 body, since no continued expression can be followed by `=>` there (D3699, which was already a
-parse error inside brackets).
+parse error inside brackets). The pattern run may break after an or-pattern's `|`, as
+`parseMatch` allows.
+
+`- b` continues across blank lines and comment-only lines, like the other leading operators:
+the scan is the same `afterNewlines` run.
 
 **Inside brackets nothing changes.** The 2026-09-04 text said a leading `-` inside a bracket
 was a parse error; that was out of date — D1581's bracket gate already let `-` continue there,
