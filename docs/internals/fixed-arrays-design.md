@@ -668,7 +668,15 @@ fixed arrays, scalarises it at `-O`/`-O3`:
   is `array.new_fixed` of N `select(v, a[k], i == k)`, which scalarises to N selects (the
   write half of the `br_table`, without a branch);
 * a dynamic `array.get` on a scalarised box becomes the `br_table`;
-* the bound is per array (64 slots, §6.6), separate from `MV_RECORD_MAX_FIELDS = 8`.
+* the bound is per array (64 slots, §6.6), separate from `MV_RECORD_MAX_FIELDS = 8`;
+* **packed `u8` elements**: today the step admits only full-width storage
+  (`StorageType::Val`), so a `u8[N]` box would never scalarise, and if it were taught packed
+  storage naively a `u8` local could hold 300. S1 teaches it packed `i8` arrays with the mask
+  in the step: `i32.and 255` at every operand of `array.new_fixed` and every rebuild, and
+  `array.get_u` becomes a plain `local.get`. Each value position gets a matrix row that stores
+  300 into a `u8[4]` and prints 44. A `u8[N]` with N ≤ 4 (≤ 8) may instead be packed into one
+  `i32` (`i64`) local, `c[k]` a shift and a mask and a store one little-endian `i32.store`; the
+  choice is invisible to the model and is the build's to measure.
 
 The emitter's one-value-one-slot invariant stays true. The price: **`-O0` allocates** (one
 box per rebuild), so a debug build is a correct but garbage-producing build, and the "no
@@ -738,7 +746,7 @@ destination and read the source, then the reverse, printing values that show ind
 | slice | content | agent-days |
 | --- | --- | --- |
 | S0 semantic core | parser (`T[N]`, `[v; N]`), a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently), the rewrite, place rules, literals and adoption, `as`, `==`, `for`, `.length`, constant-index errors, dead writes, joins; EVERY placement boxed (immutable `(array T)`, rebuilt on write). Correct, allocates | 4–5 |
-| S1 value tier | the host multi-value step learns immutable fixed arrays (§6.2), the `br_table` rewrite, the unroll override and the shared static-index predicate, the cap | 2–3 |
+| S1 value tier | the host multi-value step learns immutable fixed arrays (§6.2), the `br_table` rewrite, the unroll override and the shared static-index predicate, the cap, packed `u8` elements with the mask in the step | 2–3 |
 | S2 inline fields and globals | N struct fields per `T[N]` field; N wasm globals per module-level `T[N]` (boxed until then); `struct.set`/`global.set` element writes; record spread | 2–3 |
 | S3 flattened lists | stride-N backing, `push`/`pop`/index/spread/`slice`, std list functions at `V = T[N]` | 3 |
 | S4 `flat` and `u8` | `flat` fields of `T[N]`, 1-byte `u8` fields and elements, offsets | 1–2 |
@@ -877,7 +885,25 @@ newtype over one, a flat record), laid out as N consecutive elements with no pad
 admits only 4- and 8-byte scalars; **`u8` fields and `u8[N]` come with it** (1-byte storage,
 which the owner ruled legal for flat). A 2-byte type does not exist in VL, so 2-byte fields
 wait for one. `boolean` stays refused. A flat record used as a GC value holds its `T[N]` field
-inline (§6.3), as any record does.
+inline (§6.3), as any record does. The rules that follow from flat's existing ones:
+
+* **Element offsets are derived, never hand-computed** (flat §9's rule). `Bone.m[k]` in a layout
+  expression folds to `Bone.m + k * 4` (a type name cannot be indexed today, so the syntax is
+  free); a constant `k` folds to a constant, a dynamic `k` is arithmetic. `Bone.m.length` folds
+  to 16. Nesting composes: `Skin.j[k] + Joint.x`, and a `Joint[4]` field is `4 * Joint.size`.
+* **The cycle guard covers arrays**: `flat type A = { a: A[2] }` is the same infinite-layout
+  reject as `{ a: A }`.
+* **No alignment, no padding**, as today: an `f64[2]` at offset 4 is legal and the user owns
+  the alignment, which wasm's unaligned loads tolerate.
+* **Little-endian**, as all of wasm. A big-endian field (a network header) is read as `u8[4]`
+  plus shifts; a byte-swap helper is a later std question, filed rather than implied.
+* **Erasure stays exact** (flat §4: "flat adds validation and subtracts nothing"). A `u8[N]`
+  field is legal in every record (§6.3: `(mut i8)` struct fields), so a flat record with one is
+  byte-identical to the same declaration without `flat`. A **scalar** `u8` field breaks that
+  unless plain records admit it too, so this design admits a scalar `u8` field in every record
+  (packed `(mut i8)`, read as `i32`, a computed store keeps the low byte): the same
+  storage-backed argument the `u8` ruling makes for list elements. That amends
+  `collections-design.md`'s "no field may hold a `u8`" (D19).
 
 ### 8.2 `Buf` and views
 
@@ -890,17 +916,32 @@ for i in 0 until 16 { m[i] = b.loadF32(at + i * 4) }      // 16 f32.load into 16
 for i in 0 until 16 { b.storeF32(at + i * 4, m[i]) }      // 16 f32.store
 ```
 
-No new std export is proposed; a later `loadF32s`/`storeF32s` pair would go through
-`std-api-reviewer`.
+For a value-tier N this IS the best code possible, which is why no helper is proposed in v1. A
+later `storeF32s(b, at, m)` can be written today through an un-annotated parameter (one instance
+per N); its twin `loadF32s(b, at): f32[16]` cannot, because no argument carries N and v1 has
+no length generics. It needs length generics or a builtin, which is recorded in D18.
 
-### 8.3 GPU upload
+### 8.3 GPU upload and bulk copies
 
-A flattened `f32[16][]` lives in a GC array, which a host cannot view as bytes (V8 exposes no
-typed-array view of a GC array). The zero-copy path to the GPU stays `Buf` + `flat`; the
-fixed array is the compute-side value that is stored into the `Buf` before upload. WGSL's
-uniform and storage layouts pad a `vec3<f32>` to 16 bytes; flat has no implicit padding, so a
-GPU-bound `flat` type spells its padding (`pos: f32[3], _pad: f32`), which is the existing flat
-rule and the right one (§3.9).
+**There is no bulk path from a GC array to linear memory.** `array.copy` copies only between
+GC arrays and `array.init_data` reads data segments, not memory; a host cannot view a GC array
+as bytes either (V8 exposes no typed-array view of one). So a flattened `f32[16][]` bone
+palette uploads as N·len scalar stores, every time. **Guidance: per-frame GPU data lives in
+`Buf`-backed `flat` rows and is computed in the value tier**; a `T[N][]` list is for data that
+is not uploaded every frame.
+
+**GPU layouts pad where flat does not, and flat will never infer GPU stride.** A tight
+`f32[N]` matches WGSL storage (std430-like) layout for scalars and `mat4x4<f32>`; it does NOT
+match these, and the doc pins the flat spelling that does:
+
+| WGSL type (address space) | size / stride | the matching flat spelling |
+| --- | --- | --- |
+| `mat4x4<f32>` (any) | 64 bytes | `m: f32[16]` |
+| `vec3<f32>` (any) | 12, aligned 16 | `p: f32[3], _p: f32` |
+| `array<vec3<f32>, N>` (any) | stride 16 | `flat type V3p = { v: f32[3], _p: f32 }`, then `ps: V3p[N]` |
+| `mat3x3<f32>` (any) | 48 bytes (three columns of stride 16) | `m: V3p[3]` (not `f32[9]`, which is 36) |
+| `array<f32, N>` (uniform) | stride 16 | `flat type F16 = { v: f32, _p: f32[3] }`, then `a: F16[N]` |
+| `array<f32, N>` (storage) | stride 4 | `a: f32[N]` |
 
 ### 8.4 SIMD
 
@@ -917,6 +958,25 @@ S1 extends the existing step rather than adding a second one: the same twins, th
 growth bound, a separate per-array bound (64). A record with an inline `T[N]` field counts its
 fields after expansion against `MV_RECORD_MAX_FIELDS`, so a `{ root: f64[16] }` record is not
 returned as multi-value; the record's own result rule is unchanged.
+
+### 8.6 What never crosses a boundary
+
+**A `T[N]` does not cross an `extern function` or an entry-module export in v1** (D17), and the
+reason is stronger than "no consumer asks": its placement depends on the build flag (a box at
+`-O0`, N scalars at `-O`, §6.2), so an ABI taken from the placement would change with `-O`. C
+passes arrays by pointer, so the honest mapping is a `Buf` base and length, as
+`docs/guide/extern.md` already does for bytes. If arrays ever cross, it is as a `Buf`, never as
+an expanded N-parameter signature.
+
+### 8.7 Bits are preserved
+
+Every placement keeps exact bits: locals, struct fields, flattened elements, the boxed rebuild
+(including the `select` form), and `f32.store`/`f32.load` through a `Buf`. No placement
+round-trips an element through another width. Element-wise conversions (§5.11) are exactly the
+scalar ones, with the scalar caveats: `f32 → f64` promotion is exact for numbers, and wasm does
+not fix a NaN's payload through `f64.promote_f32`, so sunpa's determinism contract
+(same bits on every host) keeps NaN payloads out of converted arrays as it does for scalars.
+S0's matrix carries a payload-NaN row per placement, read back with `reinterpret`.
 
 ---
 
@@ -1074,9 +1134,9 @@ acceptable (sunpa builds `-O3` only).
 | D14 | no `inout`; return the value | the model |
 | D15 | a dead element write to a parameter, loop variable or place copy is a check error | A12 |
 | D16 | placement is the compiler's, per §4.3 | the owner's direction |
-| D17 | `T[N]` in an entry-module export is refused in v1 | no consumer |
-| D18 | no std additions in v1; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in. A bulk `storeF32s(b, at, m)` for GPU upload is DEFERRED, not rejected, and goes through `std-api-reviewer` when a consumer measures `put` | the built-in-methods ruling (storage ops only) |
-| D19 | `flat` fields of `T[N]`, with `u8` 1-byte fields | the owner's direction, the u8 storage ruling |
+| D17 | `T[N]` in an entry-module export or an `extern function` signature is refused in v1, naming `as f64[]` or a `Buf` | its placement changes with `-O`, so no stable ABI exists (§8.6) |
+| D18 | no std additions in v1; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in. A bulk `storeF32s(b, at, m)` for GPU upload is DEFERRED, not rejected, and goes through `std-api-reviewer` when a consumer measures `put`; its `loadF32s` twin needs length generics or a builtin (§8.2) | the built-in-methods ruling (storage ops only) |
+| D19 | `flat` fields of `T[N]`, with `u8` 1-byte fields; `Bone.m[k]` and `Bone.m.length` fold; little-endian, no padding; a scalar `u8` field is legal in every record so flat erasure stays exact | the owner's direction, the u8 storage ruling, flat §4/§9 (§8.1) |
 | D20 | `[...v3, 1.0]` builds a `T[4]`; call spread into fixed parameters is later | variadics |
 | D21 | S1 scalarises through the host step; `-O0` allocates; S0 and S1 reach consumers together | §6.2, §6.7 |
 | D22 | discarding a call's `T[N]` result is a check error | §5.14 |
