@@ -39,15 +39,17 @@ immutable value. `r.pose[3] = x` is therefore a write to the field `r.pose`, and
 `type Skeleton = { root: f64[16] }`, `const g: f64[16][] = []`, `xs as! f64[16]`,
 `m as f64[]`, `a == b`, `for x in m`, `m.length` (a constant).
 
-**Five owner questions** remain (§10), in dependency order: Q1 the value model, Q2 the
+**Six owner questions** remain (§10), in dependency order: Q1 the value model, Q2 the
 spelling, Q3 the element types, Q4 how a non-literal value is built, Q5 whether the size cap
-is visible. Everything else is a stated default (§10.2), each following from an existing
+is visible, Q6 whether "no heap at `-O`" is a guarantee. Everything else is a stated default (§10.2), each following from an existing
 ruling or from the model itself.
 
 **Evidence (§7).** The locals placement runs sunpa's `m4Mul` at Rust parity with zero garbage
 (re-run today: 93 ms against Rust's 98 ms on V8, 100 against 96 on wasmtime 49; today's
-`f64[]` takes 119 ms with 172 scavenges). An inline record field is 3.4x faster than today's
-`pose: f64[]` field on wasmtime for constant indices. A boxed update that rebuilds costs about
+`f64[]` takes 119 ms with 172 scavenges). **In the browser (V8) the win is the removed
+garbage plus about 1.3x speed**; the larger speed-ups are wasmtime's. An inline record field is
+3.4x faster than today's `pose: f64[]` field on wasmtime for constant indices and ties it on V8.
+A boxed update that rebuilds costs about
 18 ns and one allocation per write, which is why it is the placement of last resort.
 Flattening a list of matrices is worth 1.3–1.4x only once the list leaves the cache; the
 larger win in sunpa's list code is removing the per-product allocation (4x on V8, 8x on
@@ -85,7 +87,8 @@ Usage census of `~/sunpa/src` (read only; `f64[]` in 30 lines of `view.vl`, 27 o
 | matrix inside a record | `Skeleton.root: f64[]` | inline field (§6.3) |
 | module-level matrix | `viewProj`, `lightViewProj` | N globals, or a box (§6.5) |
 | length-generic reader | `put(b: Buf, at, vs: f64[])` over 3, 4 and 16 | an un-annotated parameter, one instance per length (§5.10) |
-| a window into a longer list | `compose(p, o)` reads a pose at STRIDE 10 | stays `f64[]`; the fixed array is the result, not the window |
+| a pose list at STRIDE 10 | `compose(p, o)` reads `p[o + 3]` | `f64[10][]`, flattened at stride 10: `compose(pose[b])` reads constant indices, one bound check per bone |
+| scratch ping-pong | `mA`/`mB` and `scratch()` in `legs.vl`, the push-16-zeros loop in `pose.vl` | disappear: values cannot alias, so `m4MulInto`'s "into `r`, not `a` or `b`" caveat goes too |
 
 ---
 
@@ -491,6 +494,11 @@ Recommended v1 (Q3):
   references ("value" in name only). Both are additive later. Each refused element type gets a
   message naming the supported set, graded one member per row before it ships (CLAUDE.md).
 
+Note the asymmetry this leaves: `V3[4]` stores its records by field, but a `V3[]` list stays a
+list of record references, because a list of records is today's reference semantics and is not
+part of this type. Flattening numeric-record lists is a separate follow-up, not a consequence
+of this design.
+
 ### 5.10 Generics
 
 Element generics work as for any type: `function trace<T>(m: T[16]): T` instantiates per
@@ -562,6 +570,14 @@ liveness within one function. It is an error rather than a warning because every
 program computes nothing observable, and each one is a silent wrong result for a program ported
 from list code.
 
+**The same hazard through a call result.** sunpa's `m4MulInto` writes `r` and then *returns* it,
+and its callers ignore the result (`m4MulInto(viewProj, proj, view)`, `view.vl:697`). The rule
+above does not fire (`r` is read by the return), and today's `unused-pure-expression` lint
+covers only literal and identifier statements. **Stated default: a call statement whose
+result is a `T[N]` and is discarded is a check error**, naming the fix
+(`viewProj = m4Mul(proj, view)`). A message for a dead write through a list element
+(`mulLocalInto(…, out[b])`) names `out[b] = …`.
+
 ### 5.15 Spread
 
 * **List spread**: `[...v3, 1.0]` contributes N elements statically (§5.3); `[...g]` over a
@@ -579,7 +595,13 @@ Two `vl check` hints, each driven by the same predicate the emitter uses, so the
 disagree (the two-producers rule):
 
 * `fixed-array-boxed-update`: an element write to a value in a **boxed** placement inside a
-  loop ("each write rebuilds the 16-element array: …").
+  loop, or two or more such writes in one function ("each write rebuilds the 16-element array:
+  …"); it also fires when a value passes boxed because a signature is past its slot budget.
+
+And one **build** report, because a hint cannot predict what the `-O` host step will decline
+(§6.2): `vl build -O`/`-O3` prints, by default, one warning per function in which a
+value-tier `T[N]` box survives the step, with the step's reason (what `VL_MV_EXPLAIN=1`
+prints today for records).
 * `fixed-array-dynamic-index`: an index the emitter cannot make constant, on a value-tier
   binding, in a loop ("`m[c * 4]` is a switch over 16 locals").
 
@@ -610,9 +632,14 @@ several parts.**
 
 A constant index is `local.get`/`local.set`. The unroller (A3) makes most matrix loops
 constant; this design adds an unroll override for loops indexing a value-tier array with the
-range variable (up to 64 trips and 4,096 nodes, measured in the build), keeping the four
-semantic vetoes. A non-constant index is a `br_table` over the N locals, for reads and writes
-(A2).
+range variable (up to 64 trips and 4,096 nodes, measured in the build). It keeps the three
+semantic vetoes (the body writes the loop variable; the body holds a function; a step would
+wrap) and **drops the call veto** for such loops: that veto is a cost heuristic (a call
+outweighs the saved test), and here the alternative is a `br_table` per access, which §7.1's
+`g_brtable` row prices at 229 ms against today's 119. Without the override, sunpa's
+`frustumPlanesInto` (a `sqrt` call in the outer body) would port about 2x slower than today.
+`std:buffer`'s `storeF32`/`loadF32` must count as inline memory intrinsics for the same reason.
+A non-constant index is a `br_table` over the N locals, for reads and writes (A2).
 
 **`br_table` versus spill (measured, §7.4).** A `br_table` costs about 1 ns per access on V8
 and 1.2–1.6 ns on wasmtime, flat in N, with no allocation. A mutable heap array is about 3x
@@ -636,8 +663,10 @@ fixed arrays, scalarises it at `-O`/`-O3`:
   the role of `struct.get`, and `array.len` folds to N;
 * a box used only element-wise becomes N locals, a producer gets a twin returning N results,
   and loop-carried values (`m = m4Mul(m, t)`) qualify, as they do for records today;
-* the rebuild `a.with(i, v)` is emitted as `array.new_fixed` of N gets with one replaced, which
-  the step sees as one more `struct.new` of fields;
+* the rebuild `a.with(i, v)` with a constant `i` is emitted as `array.new_fixed` of N gets with
+  one replaced, which the step sees as one more `struct.new` of fields; with a run-time `i` it
+  is `array.new_fixed` of N `select(v, a[k], i == k)`, which scalarises to N selects (the
+  write half of the `br_table`, without a branch);
 * a dynamic `array.get` on a scalarised box becomes the `br_table`;
 * the bound is per array (64 slots, §6.6), separate from `MV_RECORD_MAX_FIELDS = 8`.
 
@@ -645,7 +674,8 @@ The emitter's one-value-one-slot invariant stays true. The price: **`-O0` alloca
 box per rebuild), so a debug build is a correct but garbage-producing build, and the "no
 heap" guarantee is a property of `-O`, not of the type. Revision 2's hand-written lowering of
 exactly what the step would produce (`e_mvg`) is the measurement (§7.1). If the step declines
-a function (a `br_table` exit, a growth bound), the program still runs, with boxes.
+a function (a `br_table` exit, a growth bound), the program still runs, with boxes, and the
+build says so (§5.16). Whether "no heap at `-O`" is a tested guarantee or best effort is Q6.
 
 ### 6.3 Record fields: inline
 
@@ -709,7 +739,7 @@ destination and read the source, then the reverse, printing values that show ind
 | --- | --- | --- |
 | S0 semantic core | parser (`T[N]`, `[v; N]`), a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently), the rewrite, place rules, literals and adoption, `as`, `==`, `for`, `.length`, constant-index errors, dead writes, joins; EVERY placement boxed (immutable `(array T)`, rebuilt on write). Correct, allocates | 4–5 |
 | S1 value tier | the host multi-value step learns immutable fixed arrays (§6.2), the `br_table` rewrite, the unroll override and the shared static-index predicate, the cap | 2–3 |
-| S2 inline fields | N struct fields per `T[N]` field; `struct.set` element writes; record spread | 2 |
+| S2 inline fields and globals | N struct fields per `T[N]` field; N wasm globals per module-level `T[N]` (boxed until then); `struct.set`/`global.set` element writes; record spread | 2–3 |
 | S3 flattened lists | stride-N backing, `push`/`pop`/index/spread/`slice`, std list functions at `V = T[N]` | 3 |
 | S4 `flat` and `u8` | `flat` fields of `T[N]`, 1-byte `u8` fields and elements, offsets | 1–2 |
 | S5 numeric record elements | by-field storage, copy-in and copy-out | 2 |
@@ -718,6 +748,11 @@ destination and read the source, then the reverse, printing values that show ind
 locals, parameters and results. Revision 2 priced the same scope at five to six weeks; the
 saving is S0's single boxed representation (no copy invariant, no owned boxes) and S1's reuse
 of the host step instead of a multi-slot emitter.
+
+**S0 and S1 ship to consumers together.** S0 alone boxes every placement and rebuilds on every
+element write, so a ported `m4MulInto` (16 element writes) would allocate 16 boxes per product
+where today's code allocates one: worse than today. S0 lands behind a flag (or unreleased) and
+the consumer-visible release is S0 + S1.
 
 Compile-time and seed-size: the compiler itself uses no `T[N]`, so the seed grows by the new
 code only. Unrolling at 64 trips grows user modules; `tests/vl_scaling_shape_test.ts` gains an
@@ -872,7 +907,9 @@ rule and the right one (§3.9).
 `F32x4` stays the SIMD type: a `v128` with lane-wise operators. A value-tier `f32[4]` *could*
 be held in one `v128` local (constant index = `extract_lane`/`replace_lane`; dynamic index =
 a `br_table`), but VL defines no arithmetic on arrays, so nothing would use the vector
-instructions. Not in v1. The conversions `f32[4]` ↔ `F32x4` are a later std question.
+instructions. Not in v1. The conversions `f32[4]` ↔ `F32x4` are a later std question. Both
+that and an `f64x2`-lane lowering of `m4Mul`'s inner products are **follow-ups, not
+rejections**: the value tier already reaches Rust's scalar speed without them.
 
 ### 8.5 Records and the multi-value step
 
@@ -999,6 +1036,24 @@ for i in 0 until 100 { big[i] = f(i) }    // boxed: each write rebuilds 100 elem
 *Recommend (a).* Julia's and Rust's experience is that a hard limit is arbitrary and moves; a
 hint at the site that pays is what users ask for.
 
+**Q6. Is "a value-tier `T[N]` allocates nothing at `-O`" a guarantee or best effort?**
+Rust gives it through the type; this design gives it through the `-O` host step (§6.2).
+
+```vl
+function m4Mul(a: f64[16], b: f64[16]): f64[16] { … }
+let m: f64[16] = [0.0; 16]
+for i in 0 until n { m = m4Mul(m, t) }    // must this loop allocate nothing at -O3?
+```
+
+* (a) **A guarantee**: position-matrix fixtures assert zero `array.new` in the emitted `-O`
+  module for every value-tier position, and `vl build -O` warns (by default) for each function
+  where a box survives, naming the step's reason.
+* (b) **Best effort**: the step usually scalarises; `VL_MV_EXPLAIN=1` says when it did not.
+
+*Recommend (a).* The reason a consumer reaches for this type is the absence of garbage; a
+silent fallback at `-O3` is the failure a perf programmer cannot see. `-O0` allocating stays
+acceptable (sunpa builds `-O3` only).
+
 ### 10.2 Stated defaults (each follows from a ruling or from the model; say so to overturn)
 
 | # | default | follows from |
@@ -1020,10 +1075,12 @@ hint at the site that pays is what users ask for.
 | D15 | a dead element write to a parameter, loop variable or place copy is a check error | A12 |
 | D16 | placement is the compiler's, per §4.3 | the owner's direction |
 | D17 | `T[N]` in an entry-module export is refused in v1 | no consumer |
-| D18 | no std additions; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in | the built-in-methods ruling (storage ops only) |
+| D18 | no std additions in v1; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in. A bulk `storeF32s(b, at, m)` for GPU upload is DEFERRED, not rejected, and goes through `std-api-reviewer` when a consumer measures `put` | the built-in-methods ruling (storage ops only) |
 | D19 | `flat` fields of `T[N]`, with `u8` 1-byte fields | the owner's direction, the u8 storage ruling |
 | D20 | `[...v3, 1.0]` builds a `T[4]`; call spread into fixed parameters is later | variadics |
-| D21 | S1 scalarises through the host step; `-O0` allocates | §6.2 |
+| D21 | S1 scalarises through the host step; `-O0` allocates; S0 and S1 reach consumers together | §6.2, §6.7 |
+| D22 | discarding a call's `T[N]` result is a check error | §5.14 |
+| D23 | the unroll override drops the call veto for loops indexing a value-tier array | §6.1 |
 
 ---
 
