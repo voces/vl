@@ -19413,6 +19413,15 @@ function asPinRefusal(from: i32, to: i32): string {
   "`as` supports numeric conversions only"
 }
 
+// Whether a `??` over non-null left type `l` with a default typed `d` joins apart: `l` is a
+// declared type parameter and `d` a concrete type, or another declared parameter.
+function coalParamDefault(l: i32, d: i32): boolean {
+  if l < 0 || d < 0 || l == d || !tyIsDeclaredParam(l) { return false }
+  if d >= T.tys.length || isNullTy(d) { return false }
+  if tyIsDeclaredParam(d) { return !sameDeclaredTyParam(l, d) }
+  !tyHasTyVar(d)
+}
+
 // Whether a member of `ms` is a declared type parameter or a parameter hole.
 function unionHasDeclaredParam(ms: i32[]): boolean {
   for m in ms {
@@ -20313,8 +20322,10 @@ function njGateBody(ix: i32, open: boolean, self: string) {
 function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
   if a == b {
     const same = joinArmTys(a, b)
-    // A kept-apart join of runtime arms joined with itself is still one (D3569).
+    // A kept-apart join of runtime arms joined with itself is still one (D3569), and so is a
+    // written union of type parameters, whose runtime members a pin must not fold (D3594).
     if (tpJoinUnions.get(a) ?? 0) == 2 { markTpJoinApart(same) }
+    else if !aLit && !bLit && writtenTpUnion(a) { markTpJoinApart(same) }
     return same
   }
   const apart = !aLit && !bLit && !njJoinGated(a, b, false)
@@ -20325,12 +20336,25 @@ function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
   j
 }
 
+// Whether `t` is a union, or a nullable one, holding a type variable and no join's mark.
+function writtenTpUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || tyIsTpJoinUnion(t) || !tyHasTyVar(t) {
+    return false
+  }
+  const u = nonNullTy(t)
+  u >= 0 && u < T.tys.length && T.tys[u] is TyUnion
+}
+
 // The join of a `??`'s non-null left type `l` and its default `d` (typed `dt`) when the two are
 // runtime numbers that could part, joined apart as `joinArmLit` joins the `if` the operator
 // spells; -1 when the ordinary `??` rules decide (a literal or hole default, a gated function).
 function coalJoinApart(lhs: i32, l: i32, dt: i32, d: i32): i32 {
   if !njMayPart(l, dt) || tyIsHole(dt) || armLit(dt, d) { return -1 }
-  if njJoinGated(l, dt, false) || njFnOpen(njFnIx) || !coalLhsParts(lhs) {
+  if njJoinGated(l, dt, false) || !coalLhsParts(lhs) { return -1 }
+  // A hole body keeps master's widening (D2562), as does a union left operand; a declared
+  // parameter's body joins apart, as its `if` spelling does, and so does its recheck (D3580).
+  if l >= T.tys.length { return -1 }
+  if njFnOpen(njFnIx) && !(njFnTyParams(njFnIx) && !(T.tys[l] is TyUnion)) {
     return -1
   }
   joinArmLit(l, false, dt, false)
@@ -20338,7 +20362,7 @@ function coalJoinApart(lhs: i32, l: i32, dt: i32, d: i32): i32 {
 
 // Whether a `??` whose left operand is `lhs` may join its default apart: a field, an index or a
 // method call's result keeps master's widening, since the emitter reads those at the operand's
-// own rep (D3451). A `??` in a generic or hole body keeps it too (D2562).
+// own rep (D3451).
 export function coalLhsParts(lhs: i32): boolean {
   const x = parenPeelIx(lhs)
   if x < 0 || x >= P.nodes.length { return false }
@@ -62023,6 +62047,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       // A runtime default of another number type joins apart, as the `if` it spells does.
       const apart = coalJoinApart(n.binLeft, innerFull, rt, n.binRight)
       if apart >= 0 { return apart }
+      // A declared parameter takes any default inside its body and its pin need not, so the
+      // operator joins as the `if` it spells and the default keeps its own type (D3580, D3619).
+      if coalParamDefault(innerFull, rt) {
+        return joinArmLit(innerFull, false, rt, armLit(rt, n.binRight))
+      }
       // When the default fits the non-null LHS type (with contextual coercion), the `??` result
       // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
       if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
