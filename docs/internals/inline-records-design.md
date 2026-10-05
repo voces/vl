@@ -1,6 +1,6 @@
 # Inline storage for records nobody writes (sunpa SP-038, SP-039)
 
-**Status: design only, nothing built, no owner ruling yet.** The question is whether a record
+**Status: S1 (inline record fields) is built as a host step, `scripts/vl-host/src/inline.rs` (D3678); D3679–D3681 are what it leaves, S2 among them. No owner ruling yet on §6.** The question is whether a record
 type whose fields are never written can be stored by value: inline in its containing records,
 and flattened in lists. The language would not change; only the compiler's storage choice
 would. The fixed-array design (PR #3375, `fixed-arrays-design.md` §4.3 and §6) makes the same
