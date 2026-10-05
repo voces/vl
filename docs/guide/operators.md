@@ -11,7 +11,23 @@ than left to be re-derived. The precedence ladder is the parser's own
 
 Assignment (`=`, and the compound forms `+= -= *= /= %= &= |= ^= <<= >>= >>>=`) binds
 loosest of all and is right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary operator, so
-`a + b as! i32` is `a + (b as! i32)`. Unary `-` `!` `~` bind tighter still.
+`a + b as! i32` is `a + (b as! i32)`. Every prefix operator — `-` `!` `~` `++` `--` — binds
+tighter still, as in Rust, so `-x as T` is `(-x) as T` and `-x as T + y` is `((-x) as T) + y`;
+postfix operators (`.f`, `[i]`, calls, `x++`) bind tightest. Continuing the ladder above:
+
+```
+…   <   *  /  %   <   as  as?  as!  as%   <   -x  !x  ~x  ++x  --x   <   x.f  x[i]  x(…)  x++
+```
+
+A type guard `x is T` / `x !is T` binds tighter than a prefix operator but takes a whole cast
+chain: `!x is T` is `!(x is T)`, while `x as T is U` is `(x as T) is U`.
+
+The prefix rule decides values at the edges, so they are worth stating. The negation happens at
+the operand's own width, BEFORE the cast sees it: with `m: i32` holding `-2147483648`, `-m as
+i64` is `-2147483648` (the `i32` negation wraps), and `-(m as i64)` is `2147483648`. A negative
+literal is one constant: `-2147483648 as i32` is `i32`'s minimum, and `-1 as u8` and `-0.5 as
+i32` are check errors naming `-1` and `-0.5`, while `-1 as% u8` is 255. (DECISIONS.md §"Prefix
+operators bind tighter than `as`".)
 
 ## Arithmetic
 
@@ -184,7 +200,9 @@ index) for a list, `s.includes(x)` for a string. It parses at the comparisons' p
 | `~` | bitwise not |
 
 These are about BIT PATTERNS, so a float operand is refused: `1.0 & 2` is
-`operator '&' is integer-only, got f64 and i32`. `%` is deliberately **not** in this family —
+`operator '&' is integer-only, got f64 and i32`, and `~2.5` is
+`operator '~' is integer-only, got f64` (also through a type parameter pinned to a float).
+`%` is deliberately **not** in this family —
 a float remainder is a meaningful number, and VL computes it.
 
 ## Compound assignment
@@ -290,7 +308,7 @@ no trap, nothing to propagate. It is how a bit pattern is written down.
 ```vl
 print(0xb81a1aaa as% i32)          // -1206248790 — a hex literal is typed i64, this is its i32 bits
 print(300 as% u8)                  // 44
-print((0 - 1) as% u8)              // 255
+print(-1 as% u8)                   // 255 — the constant -1 (prefix `-` binds tighter than `as`)
 bytes.push((v >>> 24) as% u8)      // the top byte of any word, sign bit included
 ```
 
@@ -301,8 +319,8 @@ casts say what one cannot (`(u as! i32) as% u8`).
 
 A LITERAL operand is folded, so `0xb81a1aaa as% i32` is a constant and can be used as one. And
 `%` here can never be read as the remainder: the suffix is read only directly after `as`, and
-`as` only directly after a postfix operand, so `a % b`, `a as% u8 % b` and a binding named `as`
-all keep their meanings.
+`as` only directly after an operand (a postfix one, or one under prefix operators), so `a % b`,
+`a as% u8 % b` and a binding named `as` all keep their meanings.
 
 ## Breaking a long expression across lines
 

@@ -2039,18 +2039,39 @@ const POSTFIX_BANG_ENDS: TokKind[] = [
   "PERCENTEQ", "AMPEQ", "PIPEEQ", "CARETEQ", "SHLEQ", "SHREQ", "USHREQ",
 ]
 
-// Prefix `!` / `-`, else fall through to postfix, then an optional trailing type
-// guard `<postfix> is TypeName` (A6). `is` binds looser than the postfix operators
-// (so `n.x is A` is `(n.x) is A`) but tighter than the binary operators, matching
-// its use as an `if` condition `if n is A {`. The RHS is a bare type name.
+// A unary operand: prefix operators over a postfix operand, then the `as` cast chain, then an
+// optional type guard. Every prefix operator binds tighter than `as` (Rust's order), so `-x as
+// T` is `(-x) as T`, and `as` binds tighter than every binary operator. A guard binds tighter
+// than a prefix operator: `!x is T` is `!(x is T)`, and `x as T is U` is `(x as T) is U`.
 function parseUnary() {
   // The operator token (or, falling through, the operand's first token) is the
   // construct's start — captured before anything is consumed.
   const p0 = peekTok().start
   const k = peekKind()
+  let node = -1
+  if (
+    k == "BANG"
+    || k == "PLUSPLUS"
+    || k == "MINUSMINUS"
+    || k == "MINUS"
+    || k == "TILDE"
+  ) {
+    node = parsePrefixed()
+  } else {
+    node = parsePostfix()
+  }
+  parseGuardSuffix(parseCastChain(node, p0), p0)
+}
+
+// Prefix `!` / `-` / `~` / `++` / `--` over a prefixed operand, bottoming out in a postfix
+// operand and its type guard. No `as` is read here: a cast after a prefixed operand belongs to
+// `parseUnary`, which applies it to the whole prefixed value.
+function parsePrefixed(): i32 {
+  const p0 = peekTok().start
+  const k = peekKind()
   if k == "BANG" {
     advance()
-    return mkUnary("!", parseUnary(), p0)
+    return mkUnary("!", parsePrefixed(), p0)
   }
   // Prefix `++x` / `--x` desugars to `x = x + 1` / `x = x - 1` (assignment-as-
   // expression yields the new value - the prefix semantics exactly), tagged with
@@ -2059,23 +2080,26 @@ function parseUnary() {
     advance()
     let incr = "++"
     if k == "MINUSMINUS" { incr = "--" }
-    const itgt = parseUnary()
+    const itgt = parsePrefixed()
     return mkPreIncr(incr, itgt, p0)
   }
   if k == "MINUS" {
     advance()
-    return mkUnary("-", parseUnary(), p0)
+    return mkUnary("-", parsePrefixed(), p0)
   }
   // Prefix bitwise not `~x` — flips every bit (lowered as `x ^ -1` in emit).
   if k == "TILDE" {
     advance()
-    return mkUnary("~", parseUnary(), p0)
+    return mkUnary("~", parsePrefixed(), p0)
   }
-  let node = parsePostfix()
-  // `x as T` — an explicit numeric cast. `as` is a contextual keyword: it stays a plain
-  // IDENT token and is special only here, directly after a postfix operand. It shares the
-  // `is` guard's precedence slot, looser than postfix and tighter than every binary
-  // operator, and is chainable. A line may lead with it, so newlines before it are skipped.
+  parseGuardSuffix(parsePostfix(), p0)
+}
+
+// `operand as T`, `operand` starting at `p0` — an explicit numeric cast. `as` is a contextual
+// keyword: it stays a plain IDENT token and is special only here. It is chainable, and a line
+// may lead with it, so newlines before it are skipped.
+function parseCastChain(operand: i32, p0: i32): i32 {
+  let node = operand
   let asAt = asAfterNewlines()
   while asAt >= 0 {
     P.pos = asAt
@@ -2106,6 +2130,13 @@ function parseUnary() {
     node = asIx
     asAt = asAfterNewlines()
   }
+  node
+}
+
+// An optional trailing type guard `node is T` / `node !is T`, `node` starting at `p0` (A6). It
+// binds looser than the postfix operators (so `n.x is A` is `(n.x) is A`) and tighter than the
+// binary operators, matching its use as an `if` condition `if n is A {`.
+function parseGuardSuffix(node: i32, p0: i32): i32 {
   // A line may lead with `is`, which can never begin an expression. `!is` is not in the
   // set: its `!` can, so a leading `!` stays a statement and the pair is left alone.
   const isAt = isAfterNewlines()

@@ -399,6 +399,12 @@ is `-(b as i64)`) — the reverse of Rust, but unobservable for numeric casts
 (`x as i64 as f64`).
 ```
 
+**Amended 2026-10-04 — a prefix operator now binds TIGHTER than `as` (owner ruling A, D3629).**
+The "unobservable" claim above was false: it fails at a widening of INT_MIN (`-m as i64` was
+2147483648), at a `u8` target (`-1 as u8` was the `i32` -1), and for `!` and `~`, where `!x as
+i32` was a type error and `~x as f64` invalid wasm. `parseUnary` is now `parsePrefixed` (prefix
+operators over a postfix operand and its guard), then `parseCastChain`, then `parseGuardSuffix`.
+
 **Amended 2026-09-04 — a line may now LEAD with `as`.** The archived block's last sentence read
 "a newline before `as` ends the statement (no `skipNewlines` here), so a following `as = 1`
 reassignment of the soft-keyword identifier is unaffected". Under the line-continuation ruling
