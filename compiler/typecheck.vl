@@ -65069,6 +65069,7 @@ function holeCastParamName(
     if hn == name { parked = true }
   }
   if !parked { return "" }
+  hcWrittenMemo = Map()
   const ld = holeCastCalleeDeclOf(callFnIx, 8)
   if ld < 0 { return "" }
   const f = P.nodes[ld]
@@ -65081,9 +65082,65 @@ function holeCastParamName(
 function holeCastCalleeDeclOf(callFnIx: i32, depth: i32): i32 {
   const d = cwCalleeDeclOf(callFnIx)
   if d >= 0 || depth <= 0 { return d }
-  const init = cwBoundInitOf(covarRootName(callFnIx), covarRootFrame(callFnIx))
-  if init < 0 || !(P.nodes[init] is Ident) { return -1 }
+  const nm = covarRootName(callFnIx)
+  const fr = covarRootFrame(callFnIx)
+  const init = cwBoundInitOf(nm, fr)
+  if init < 0 { return holeCastWrittenDeclOf(nm, fr, depth) }
+  if !(P.nodes[init] is Ident) { return -1 }
   holeCastCalleeDeclOf(init, depth - 1)
+}
+
+// `holeCastWrittenDeclOf`'s answers within one callee lookup, by `<name>@<frame>`: a chain of
+// bindings each re-pointed several times would otherwise be walked once per path through it.
+let hcWrittenMemo: {[string]: i32} = Map()
+
+// The one `FuncDecl` every write of binding `nm` in frame `fr` reaches, its initialiser and each
+// whole re-pointing `nm = e` alike, or -1 when two writes reach different ones (D3659).
+function holeCastWrittenDeclOf(nm: string, fr: i32, depth: i32): i32 {
+  if nm == "" { return -1 }
+  const key = nm + "@" + i32ToStr(fr)
+  const seen = hcWrittenMemo[key] ?? -2
+  if seen != -2 { return seen }
+  // A cycle (`a = b`, `b = a`) reads as no answer while it is being walked.
+  hcWrittenMemo[key] = -1
+  const r = holeCastWrittenDeclGo(nm, fr, depth)
+  hcWrittenMemo[key] = r
+  r
+}
+
+function holeCastWrittenDeclGo(nm: string, fr: i32, depth: i32): i32 {
+  cwIxBuild()
+  let one = -1
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    let src = -1
+    const k = cwIxKind[r]
+    if k == CW_OCC_BIND || k == CW_OCC_ASG {
+      const w = P.nodes[cwIxNode[r]]
+      if w is LetDecl {
+        src = cwPeel(w.letInit)
+      } else if w is BinExpr {
+        const lhs = P.nodes[cwPeel(w.binLeft)]
+        if !(lhs is Ident) { return -1 }
+        src = cwPeel(w.binRight)
+      }
+      if src < 0 || src >= P.nodes.length { return -1 }
+      let d = -1
+      if P.nodes[src] is FuncDecl { d = src }
+      else if P.nodes[src] is Ident { d = holeCastCalleeDeclOf(src, depth - 1) }
+      if d < 0 || (one >= 0 && d != one) { return -1 }
+      one = d
+    }
+  }
+  one
 }
 
 // Every parked cast on hole `name`, re-asked under the type this call site pinned it to. The
@@ -65295,12 +65352,9 @@ function checkCastNode(n: AsExpr, ix: i32) {
     if argH is TyVar {
       noteCastDemand(argH.tvName, n, ix, target)
       // A pin may make `as?` to a number miss (a union arm, a narrowing number, another type),
-      // so over a type parameter it is `N | null` at every pin, as over a union (D2754).
-      if (
-        n.asMode == "null"
-        && argH.tvName[0] != '?'
-        && isNumericPrimTy(target)
-      ) {
+      // so over a type parameter or a hole it is `N | null` at every pin, as over a union
+      // (D2754, D3654).
+      if n.asMode == "null" && isNumericPrimTy(target) {
         return mkNullableTy(target)
       }
     }
@@ -70419,6 +70473,29 @@ function litBaseMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
+// The members of integer literal set `chk` an integer `obj` can hold, where some but not all
+// fit: `d is C` with `d: i32` and `C = 1 | 3000000000` tests the `1` (D3655). -1 otherwise,
+// and for a float receiver, whose answer against an integer literal waits on D3689.
+function litPrimMeetTy(obj: i32, chk: i32): i32 {
+  if obj < 0 || chk < 0 || !(T.tys[obj] is TyPrim) { return -1 }
+  const pn = primNameOf(obj)
+  if pn != "i32" && pn != "i64" { return -1 }
+  if !allLitMembers(chk) || assignable(chk, obj) { return -1 }
+  const cands: i32[] = []
+  flattenLits(chk, cands)
+  const keep: i32[] = []
+  for c in cands {
+    const ct = T.tys[c]
+    if ct is TyLit {
+      if ct.litKind != "int" { return -1 }
+    }
+    if assignable(c, obj) { keep.push(c) }
+  }
+  if keep.length == 0 { return -1 }
+  if keep.length == 1 { return keep[0] }
+  mkUnionTy(keep)
+}
+
 // Whether a string literal of `ty` (through unions) is spelled with an escape.
 function litSetHasEscape(ty: i32): boolean {
   const lits: i32[] = []
@@ -70540,6 +70617,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   // scalar tests the literal members it is the base of (D3522).
   let meet = litSetMeetTy(objTy, chkTy)
   if meet == -1 && n.isVariant != "null" { meet = litBaseMeetTy(objTy, chkTy) }
+  if meet == -1 { meet = litPrimMeetTy(objTy, chkTy) }
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {
