@@ -158,7 +158,9 @@ Deno.test({
         "    const y = xs[k]",
         "    y",
         "  }",
-        "  f(9)",
+        // Not a tail call: `f` is lambda-lifted (D3663), and a direct call in tail position
+        // is a `return_call`, which leaves `outer` off the backtrace as for any function.
+        "  f(9) + 0",
         "}",
         "",
         "print(outer())",

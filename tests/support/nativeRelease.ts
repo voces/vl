@@ -384,7 +384,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "closure call in a hot loop, four spellings",
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 351 -> 329 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 329, fns: 3, allocs: 1, indirect: 0 },
+    // D3663: `f3` and `f4` are called only directly, so they are lambda-lifted and build no
+    // closure; `-O` now melts phases 3 and 4 as `-O3` does — 329 -> 258 bytes, 3 -> 1 fns,
+    // 1 -> 0 allocs.
+    O: { bytes: 258, fns: 1, allocs: 0, indirect: 0 },
     O3: { bytes: 269, fns: 1, allocs: 0, indirect: 0 },
   },
   // HIGHER-ORDER BUILTINS. `xs.map(f).filter(g)` plus a `reduce`: the one shape where

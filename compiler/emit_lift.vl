@@ -1,0 +1,244 @@
+// `emit_lift.vl` — lambda lifting of local functions that never escape (SP-037). A `const`
+// bound to a lambda, or a block-local `function`, whose every use is a direct call in the
+// frame that declares it (or, for a block-local function, in its own body) is called as a
+// plain function taking its captures as parameters after the env: no closure value and no
+// env struct is built. Anything this scan cannot prove keeps the closure path.
+
+import {
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  Member,
+  OptMember,
+  P,
+  Param,
+  hasNamedArgs,
+  nodeChildren,
+} from "./ast"
+import { unwrapParen } from "./emit_base"
+import {
+  cloLiftCapN,
+  cloLiftFe,
+  cloLiftFrame,
+  cloLiftLet,
+  fnInstOrigin,
+  fnParent,
+  fnStmts,
+  fnValUsed,
+  lfBlockOf,
+  lfCloneHead,
+  lfOriginOf,
+} from "./emit_state"
+import { captureNamesOf, fnHasUnannotatedParam } from "./emit_classify"
+
+// Where the walk stands: the declaring frame's own code, the candidate's own body, or any
+// other nested function (where a use is a capture, so an escape).
+const CL_HOST = 0
+const CL_SELF = 1
+const CL_NESTED = 2
+
+let clName = ""
+let clSelf = -1
+let clLet = -1
+let clIsLocalFn = false
+let clOk = true
+let clCaps: string[] = []
+let clCapDecls: i32[] = []
+
+// Decide every lifted slot. Runs once the arena is final, before any functype is written.
+export function cloLiftScan() {
+  cloLiftCapN = []
+  cloLiftFrame = []
+  cloLiftLet = []
+  cloLiftFe = []
+  let fe = 0
+  while fe < fnStmts.length {
+    let n = -1
+    if fnValUsed { n = cloLiftDecide(fe) }
+    cloLiftCapN.push(n)
+    fe = fe + 1
+  }
+  0
+}
+
+// True when the frame chain from `pos` up holds a generic or monomorphized frame, whose body
+// is shared between pins: lifting is decided per slot, so those keep the closure path.
+function clChainIsGeneric(pos: i32): boolean {
+  let pp = pos
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if pp < fnInstOrigin.length && fnInstOrigin[pp] >= 0 { return true }
+    if lfOriginOf(pp) >= 0 { return true }
+    if pp < lfCloneHead.length && lfCloneHead[pp] >= 0 { return true }
+    const d = P.nodes[fnStmts[pp]]
+    if d is FuncDecl {
+      if d.fnTyParams.length > 0 { return true }
+    }
+    if pp >= fnParent.length { return true }
+    pp = fnParent[pp]
+    steps = steps + 1
+  }
+  false
+}
+
+// The capture count when slot `fe` can be lifted, else -1.
+function cloLiftDecide(fe: i32): i32 {
+  if fe >= fnParent.length { return -1 }
+  const host = fnParent[fe]
+  if host < 0 { return -1 }
+  if fnHasUnannotatedParam(fe) { return -1 }
+  if clChainIsGeneric(fe) { return -1 }
+  const self = fnStmts[fe]
+  const hostNode = P.nodes[fnStmts[host]]
+  if !(hostNode is FuncDecl) { return -1 }
+  clName = ""
+  clSelf = self
+  clLet = -1
+  clIsLocalFn = false
+  const selfNode = P.nodes[self]
+  if lfBlockOf(fe) >= 0 {
+    if selfNode is FuncDecl {
+      clName = selfNode.fnName
+      clIsLocalFn = true
+    }
+  } else {
+    clFindBinding(hostNode.fnBody)
+  }
+  if clName == "" { return -1 }
+  clCaps = captureNamesOf(fe)
+  clCapDecls = []
+  let ci = 0
+  while ci < clCaps.length {
+    if clCaps[ci] == clName { return -1 }
+    clCapDecls.push(0)
+    ci = ci + 1
+  }
+  clOk = true
+  const hps = hostNode.fnParams
+  let pi = 0
+  while pi < hps.length {
+    clWalk(hps[pi], CL_HOST)
+    pi = pi + 1
+  }
+  clWalk(hostNode.fnBody, CL_HOST)
+  if !clOk { return -1 }
+  ci = 0
+  while ci < clCapDecls.length {
+    if clCapDecls[ci] > 1 { return -1 }
+    ci = ci + 1
+  }
+  if clLet >= 0 {
+    cloLiftFrame.push(host)
+    cloLiftLet.push(clLet)
+    cloLiftFe.push(fe)
+  }
+  clCaps.length
+}
+
+// Finds the `const` in the host body whose initializer is the lambda `clSelf`. Nested
+// frames are not searched, since a binding there belongs to that frame.
+function clFindBinding(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length || clName != "" { return 0 }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if (
+      n.letKw == "const"
+      && n.letInit >= 0
+      && unwrapParen(n.letInit) == clSelf
+    ) {
+      clName = n.letName
+      clLet = ix
+      return 0
+    }
+  }
+  if n is FuncDecl { return 0 }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    clFindBinding(kids[k])
+    k = k + 1
+  }
+  0
+}
+
+// Counts a declaration of `nm`: another binding of the candidate's name refuses, and a
+// capture's name declared twice refuses, since a call site reads captures by name.
+function clNoteDecl(nm: string, ix: i32) {
+  if nm == clName && ix != clLet && ix != clSelf { clOk = false }
+  let ci = 0
+  while ci < clCaps.length {
+    if clCaps[ci] == nm { clCapDecls[ci] = clCapDecls[ci] + 1 }
+    ci = ci + 1
+  }
+  0
+}
+
+// Walks `ix`, refusing on any use of the candidate's name that is not the callee of a call
+// in the host frame (or in its own body, for a block-local function).
+function clWalk(ix: i32, where: i32) {
+  if !clOk || ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if n.identName == clName { clOk = false }
+    return 0
+  }
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    if callee is Ident {
+      if callee.identName == clName {
+        if where == CL_NESTED { clOk = false }
+        if where == CL_SELF && !clIsLocalFn { clOk = false }
+        if hasNamedArgs(n.callArgNames) && !clIsLocalFn { clOk = false }
+        let ai = 0
+        while ai < n.callArgs.length {
+          clWalk(n.callArgs[ai], where)
+          ai = ai + 1
+        }
+        return 0
+      }
+    }
+  }
+  if n is Member {
+    if n.memProp == clName { clOk = false }
+  }
+  if n is OptMember {
+    if n.omProp == clName { clOk = false }
+  }
+  if n is LetDecl { clNoteDecl(n.letName, ix) }
+  if n is Param { clNoteDecl(n.parName, ix) }
+  if n is ForRange { clNoteDecl(n.frVar, ix) }
+  if n is ForIn {
+    clNoteDecl(n.fiVar, ix)
+    if n.fiVar2 != "" { clNoteDecl(n.fiVar2, ix) }
+  }
+  let inner = where
+  if n is FuncDecl {
+    clNoteDecl(n.fnName, ix)
+    if ix == clSelf { inner = CL_SELF } else { inner = CL_NESTED }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    clWalk(kids[k], inner)
+    k = k + 1
+  }
+  0
+}
+
+// The lifted slot the `const` binding at `letIx` in frame position `pos` stands for, or -1.
+export function cloLiftLetFe(pos: i32, letIx: i32): i32 {
+  let i = 0
+  while i < cloLiftLet.length {
+    if cloLiftLet[i] == letIx && cloLiftFrame[i] == pos { return cloLiftFe[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether slot `fe` is lambda-lifted.
+export function cloLifted(fe: i32): boolean {
+  fe >= 0 && fe < cloLiftCapN.length && cloLiftCapN[fe] >= 0
+}
