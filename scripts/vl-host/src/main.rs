@@ -592,6 +592,9 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}VL_WASM_OPT{r} / {c}VL_WASM_DIS{r}   Explicit binaryen tool paths (else PATH)
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}    As in `vl help run`
   {c}VL_COMPILE_GC{r}                 As in `vl help run`
+  {c}VL_MV_EXPLAIN{r}=1               With -O/-O3: say on stderr why each small record
+                                type and record-returning function did or did not
+                                get a multi-value twin (output unchanged)
 
 {b}Exit:{r} 0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage;
       70 the compiler itself crashed (a vl bug — please report it).
