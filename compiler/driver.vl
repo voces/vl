@@ -198,6 +198,9 @@ import {
   checkNotIntrinsicName,
   checkProgram,
   demangleMsg,
+  discLeafCollect,
+  discLeafScalarAt,
+  discLeafTokAt,
   esDumpText,
   esTextOfDecl,
   initChecker,
@@ -319,6 +322,7 @@ import {
   lintReset,
   lintSetPath,
   lintSetPlusLinks,
+  lintSetScalarReads,
   lintSetSource,
   lintSetStrIndexes,
   lintSevAt,
@@ -1165,12 +1169,13 @@ export function checkSrc(): i32 {
 }
 
 // ── the typed sites the last check banked, for the lint ─────────────────────────
-// Per module and byte offset, whether each `+` link's left operand and each index read's
-// receiver checked as a string. Only a lint paired with that check reads them
-// (`lintUseCheck`): equal text under another import graph is another program.
+// Per module and byte offset: `+` left operands and index receivers that checked as a string,
+// and reads under a discarded operator statement that checked as a plain scalar. Only a lint
+// paired with that check reads them (`lintUseCheck`): equal text is another program elsewhere.
 let plSrcs: string[] = []
 let plLinks: {[i32]: i32}[] = []
 let plStrIdx: {[i32]: i32}[] = []
+let plScalar: {[i32]: i32}[] = []
 let plGen = 0
 let plBankGen = -1
 let plArmed = false
@@ -1182,6 +1187,7 @@ function plusLinksClear(): i32 {
   plSrcs = []
   plLinks = []
   plStrIdx = []
+  plScalar = []
   0
 }
 
@@ -1199,6 +1205,7 @@ function plusLinksBank(): i32 {
   plSrcs = []
   plLinks = []
   plStrIdx = []
+  plScalar = []
   plBankGen = plGen
   if modKeys.length == 0 {
     plSrcs.push(vcSource())
@@ -1215,28 +1222,44 @@ function plusLinksBank(): i32 {
     plLinks.push(e)
     const x: {[i32]: i32} = Map()
     plStrIdx.push(x)
+    const c: {[i32]: i32} = Map()
+    plScalar.push(c)
     k = k + 1
   }
-  plBankSites(plLinks, true)
-  plBankSites(plStrIdx, false)
+  plBankSites(plLinks, "plus")
+  plBankSites(plStrIdx, "strIdx")
+  plBankSites(plScalar, "scalar")
   0
 }
 
-// Fold the checker's rows into `banks`, one map per module: a site reads 1 only when every
-// check of it answered 1. `plus` picks the `+`-link table, else the index-read one.
-function plBankSites(banks: {[i32]: i32}[], plus: boolean): i32 {
-  let n = strIdxCount()
-  if plus { n = plusLinkCount() }
+// The checker's three site tables `plBankSites` folds.
+type PlTable = "plus" | "strIdx" | "scalar"
+
+// Fold the checker's rows of `table` into `banks`, one map per module: a site reads 1 only
+// when every check of it answered 1.
+function plBankSites(banks: {[i32]: i32}[], table: PlTable): i32 {
+  const n = match table {
+    "plus" => plusLinkCount()
+    "strIdx" => strIdxCount()
+    "scalar" => discLeafCollect()
+  }
   let i = 0
   while i < n {
     let tk = -1
     let v = 0
-    if plus {
-      tk = plusLinkTokAt(i)
-      v = plusLinkStrAt(i)
-    } else {
-      tk = strIdxTokAt(i)
-      v = strIdxStrAt(i)
+    match table {
+      "plus" => {
+        tk = plusLinkTokAt(i)
+        v = plusLinkStrAt(i)
+      }
+      "strIdx" => {
+        tk = strIdxTokAt(i)
+        v = strIdxStrAt(i)
+      }
+      "scalar" => {
+        tk = discLeafTokAt(i)
+        v = discLeafScalarAt(i)
+      }
     }
     if tk >= 0 && tk < P.toks.length {
       const m = modOfTok(tk)
@@ -1255,13 +1278,15 @@ function plBankSites(banks: {[i32]: i32}[], plus: boolean): i32 {
 // Hand the lint module `m`'s banked links when the bank covers `src`, else none.
 function plusLinksFor(m: i32, src: string): i32 {
   const ok = plArmed && m >= 0 && m < plSrcs.length && m < plLinks.length
-  if ok && m < plStrIdx.length && plSrcs[m] == src {
+  if ok && m < plStrIdx.length && m < plScalar.length && plSrcs[m] == src {
     lintSetPlusLinks(plLinks[m], true)
     lintSetStrIndexes(plStrIdx[m], true)
+    lintSetScalarReads(plScalar[m], true)
   } else {
     const none: {[i32]: i32} = Map()
     lintSetPlusLinks(none, false)
     lintSetStrIndexes(none, false)
+    lintSetScalarReads(none, false)
   }
   0
 }

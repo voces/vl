@@ -3933,6 +3933,11 @@ let plusLinkStr: i32[] = []
 // `plusLinkStr`'s rule: a site rechecked with another receiver type records twice.
 let strIdxTok: i32[] = []
 let strIdxStr: i32[] = []
+// Every statement whose value is discarded and which is an operator expression, for the
+// `unused-pure-expression` lint: `discLeafCollect` reads its leaves' checked types.
+let discRoots: i32[] = []
+let discLeafTok: i32[] = []
+let discLeafScalar: i32[] = []
 // ── the type-parameter `self` operator, banked from both ends ────────────────
 
 // D491 — `binOpDeadSelf` refuses a binary-operator declaration whose `self` can never be an
@@ -5262,6 +5267,9 @@ export function initChecker() {
   plusLinkStr = []
   strIdxTok = []
   strIdxStr = []
+  discRoots = []
+  discLeafTok = []
+  discLeafScalar = []
   opBinHoleDeclName = []
   opBinHoleDeclNode = []
   opBinHoleDeclAnn = []
@@ -61534,6 +61542,84 @@ export function strIdxCount() { strIdxTok.length }
 export function strIdxTokAt(i: i32) { strIdxTok[i] }
 export function strIdxStrAt(i: i32) { strIdxStr[i] }
 
+// Fill the discarded statements' leaf table: each name or field read under an operator of a
+// discarded statement, by anchor token, and whether it checked as an unbranded scalar.
+export function discLeafCollect() {
+  discLeafTok = []
+  discLeafScalar = []
+  let i = 0
+  while i < discRoots.length {
+    discLeafWalk(discRoots[i], 0)
+    i = i + 1
+  }
+  discLeafTok.length
+}
+
+export function discLeafTokAt(i: i32) {
+  if i < 0 || i >= discLeafTok.length { return -1 }
+  discLeafTok[i]
+}
+
+export function discLeafScalarAt(i: i32) {
+  if i < 0 || i >= discLeafScalar.length { return 0 }
+  discLeafScalar[i]
+}
+
+// Record the leaves of operator tree `ix`; the lint decides which operators count.
+function discLeafWalk(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return 0 }
+  const n = P.nodes[ix]
+  if n is Paren { return discLeafWalk(n.parInner, depth + 1) }
+  if n is Unary { return discLeafWalk(n.unArg, depth + 1) }
+  if n is BinExpr {
+    if n.binOp == "=" { return 0 }
+    discLeafWalk(n.binLeft, depth + 1)
+    return discLeafWalk(n.binRight, depth + 1)
+  }
+  if !(n is Ident) && !(n is Member) { return 0 }
+  if ix >= nodeToks.length || ix >= nodeTyIx.length { return 0 }
+  const tk = nodeToks[ix]
+  if tk < 0 { return 0 }
+  discLeafTok.push(tk)
+  discLeafScalar.push(if discLeafPure(ix) { 1 } else { 0 })
+  0
+}
+
+// Whether read `ix` is an unbranded scalar no operator overload can take, and, for a field,
+// not a getter, which is the one member read that runs code.
+function discLeafPure(ix: i32): boolean {
+  if ix < 0 || ix >= nodeTyIx.length { return false }
+  const t = nodeTyIx[ix]
+  if t < 0 || t >= T.tys.length || nomNameOfTy(t) != "" { return false }
+  const ty = T.tys[t]
+  let scalar = ty is TyLit
+  if ty is TyPrim {
+    const pn = ty.primName
+    scalar = pn != "void" && pn != "null" && pn != "never" && pn != "v128"
+  }
+  if !scalar { return false }
+  discChainPure(ix, 0)
+}
+
+// Whether read `ix` reads stored values all the way down: a name, `(e)`, or a field read of
+// such a receiver that is not a getter. A call or an index anywhere on the chain runs code.
+function discChainPure(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return false }
+  const n = P.nodes[ix]
+  if n is Member {
+    const ot = nodeTyOf(n.memObj)
+    if ot < 0 { return false }
+    if nomNameOfTy(ot) != "" && getSiteFnOf(ix) != "" { return false }
+    return discChainPure(n.memObj, depth + 1)
+  }
+  if n is Paren { return discChainPure(n.parInner, depth + 1) }
+  discChainRoot(ix)
+}
+
+// The chain's root: only a name reads nothing but a stored value; a call, an index or any
+// other receiver does more.
+function discChainRoot(ix: i32): boolean { P.nodes[ix] is Ident }
+
 // A binary operator's result type, deferred to the pin when the body cannot decide it
 // (D532). The gate is the exact precondition of the correction, not a heuristic: the hole can
 // resolve to anything but `bTy` only through a declared top-level `self`-function named for
@@ -71581,6 +71667,7 @@ function markValDiscard(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is IfStmt || n is Block || n is MatchExpr { valDiscardAt[ix] = true }
+  if n is BinExpr || n is Unary || n is Paren { discRoots.push(ix) }
   if lpOn && (n is WhileStmt || n is ForRange || n is ForIn) {
     valDiscardAt[ix] = true
   }
