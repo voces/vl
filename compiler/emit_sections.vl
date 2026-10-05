@@ -695,6 +695,7 @@ import {
   vtKindOfParam,
   vtKindOfType,
 } from "./emit_classify"
+import { cloLiftScan, cloLifted } from "./emit_lift"
 import {
   buildFnMap,
   collectA,
@@ -6424,6 +6425,7 @@ function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "synthCaptureEmptyListAnns" { return synthCaptureEmptyListAnns() }
   if name == "synthCaptureReadAnns" { return synthCaptureReadAnns() }
   if name == "scanExprArmLocals" { return scanExprArmLocals() }
+  if name == "cloLiftScan" { return cloLiftScan() }
   emitFail("emitProgram: unknown pass in the pass table: " + name)
 }
 
@@ -6637,6 +6639,7 @@ export function emitProgram(rootIx: i32) {
       "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
       "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
       "scanExprArmLocals > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
+      "cloLiftScan > capCacheBuild scanExprArmLocals",
     ]
     // synthVoidTwins mints the void twins for coerced function VALUES — after
     // mono (`fnStmts` positions are final; the twin table stores them) and
@@ -6906,8 +6909,19 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
     // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
     // it. Gated on `fnValUsed` so a no-lambda module's functypes are unchanged.
     if withEnv {
-      wULEB(nParams + 1) // param count incl. the env param
-      wU8(107)           // env param: structref (0x6b)
+      // A lifted function's captures follow the env, in capture order (SP-037).
+      let liftCaps: string[] = []
+      if cloLifted(ti) { liftCaps = captureNamesOf(ti) }
+      wULEB(nParams + 1 + liftCaps.length) // param count incl. the env param
+      wU8(107)                             // env param: structref (0x6b)
+      let lci = 0
+      while lci < liftCaps.length {
+        fbValtype(
+          captureValKind(ti, liftCaps[lci]),
+          captureValStructIdx(ti, liftCaps[lci]),
+        )
+        lci = lci + 1
+      }
     } else {
       wULEB(nParams) // param count
     }
@@ -7919,7 +7933,7 @@ function emitFunctionSection(
     // with that `$fnsig` functype, so a `call_indirect $fnsig` reaching it passes the
     // engine's signature check (its ACTUAL type IS `$fnsig`). Others keep their own
     // functype. Only when `fnValUsed`. (Lambdas.)
-    if fnValUsed && fnSigIsClosure(fi) {
+    if fnValUsed && fnSigIsClosure(fi) && !cloLifted(fi) {
       wULEB(fnSigIdxOfFn(fi))
     } else {
       wULEB(typeOffset + fi) // functype index

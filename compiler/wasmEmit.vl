@@ -913,6 +913,7 @@ import {
   identChainTyMapArmUnion,
   identIsBoundClosure,
   identIsEnvCapture,
+  identLetOfAt,
   identNameIsBoundAt,
   identNameIsLiveBound,
   identNameIsUserBound,
@@ -1224,6 +1225,7 @@ import {
   widenTmpSlot,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
+import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
   mapShapeKeyInt,
@@ -1968,6 +1970,11 @@ export function emitClosureValueCore(body: u8[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
   }
+  if cloLifted(fe) {
+    return emitFail(
+      "emitProgram: a lambda-lifted local function was taken as a value",
+    )
+  }
 
   // a signature not representable as a closure `$fnsig` cannot be soundly called as a
   // value even for a direct-call-only binding: the call site would fall back to the
@@ -2037,9 +2044,7 @@ function emitCapturedRead(
     let fi = 0
     while fi < cnt {
       if capNamesFlat[start + fi] == name {
-        fbLocalGet(0)
-        fbRefCast(envIdx)
-        fbStructGet(envIdx, fi)
+        emitCaptureSlotRead(fe, envIdx, fi)
         if recover { emitCapturedReadRecover(fe, name) }
         return 1
       }
@@ -2051,14 +2056,25 @@ function emitCapturedRead(
   let ci = 0
   while ci < caps.length {
     if caps[ci] == name {
-      fbLocalGet(0)
-      fbRefCast(envIdx)
-      fbStructGet(envIdx, ci)
+      emitCaptureSlotRead(fe, envIdx, ci)
       if recover { emitCapturedReadRecover(fe, name) }
       return 1
     }
     ci = ci + 1
   }
+  0
+}
+
+// Pushes capture `fi` of lifted function `fe`: its own parameter after the env when the
+// function is lambda-lifted (SP-037), else field `fi` of the env struct.
+function emitCaptureSlotRead(fe: i32, envIdx: i32, fi: i32) {
+  if cloLifted(fe) {
+    fbLocalGet(1 + fi)
+    return 0
+  }
+  fbLocalGet(0)
+  fbRefCast(envIdx)
+  fbStructGet(envIdx, fi)
   0
 }
 
@@ -19893,6 +19909,8 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
         }
         return emitFail("emitProgram: call to unknown function")
       }
+      // A lambda-lifted function takes its captures as parameters (SP-037).
+      if cloLifted(target) { return emitDirectCall(body, callIx, fnIx, target) }
       // a direct call to a capturing lifted function (`add(10)` where `add` captures `n`
       // from the enclosing frame): build its closure value and `call_ref` it — a plain
       // `call` would pass a null env and lose the captures. Gated on `fnValUsed` so a
@@ -20011,6 +20029,17 @@ function cloArgIsArmHeapTwin(argIx: i32, vi: i32, fnIx: i32): boolean {
   sHeapIdx[si] == uVarHeap[vi]
 }
 
+// The lifted slot the callee `calleeIx` names when it reads a `const` bound to a
+// lambda-lifted function in frame `fnIx`, else -1.
+function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 || calleeIx < 0 || calleeIx >= P.nodes.length { return -1 }
+  const callee = P.nodes[calleeIx]
+  if !(callee is Ident) { return -1 }
+  const li = identLetOfAt(sidOfNode(calleeIx), fnIx, calleeIx)
+  if li < 0 { return -1 }
+  cloLiftLetFe(fnStmtsPosOf(fnIx), li)
+}
+
 // The slot a function-value call stashes its closure in: the eager `callRefSlot` at depth
 // 0, else a lazy slot of its own depth (D2329). The id is read after the arguments, so a
 // call nested in them must not share the enclosing call's slot.
@@ -20051,6 +20080,8 @@ function emitNonNullParamRecover(pk: VKind | null, argIx: i32, fnIx: i32) {
 function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
+    const liftFe = cloLiftCalleeOf(c.callFn, fnIx)
+    if liftFe >= 0 { return emitDirectCall(body, callIx, fnIx, liftFe) }
     if hasNamedArgs(c.callArgNames) {
       return emitFail(
         "emitProgram: named arguments work only on declared functions, not on a function value",
@@ -24696,6 +24727,15 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
   }
   const idx = paramN + slot
+  // A `const` bound to a lambda-lifted function holds no value: every use calls it directly.
+  if (
+    fnIx >= 0
+    && s.letInit >= 0
+    && cloLiftLetFe(fnStmtsPosOf(fnIx), stmtIx) >= 0
+  ) {
+    scopeBind(s.letName, slot)
+    return 0
+  }
   if s.letInit < 0 {
     // UNINITIALIZED scalar local (validated by `checkLocalI32`): nothing to store
     // — the wasm local's implicit zero-init covers the declaration; bind the name
@@ -30791,6 +30831,15 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   // `structref env` param. A direct call to a top-level function (never capturing)
   // passes a null env. Pushed BEFORE the args, matching the env-leading signature.
   if fnValUsed { fbRefNullStruct() }
+  // A lambda-lifted callee takes its captures next, read in this frame (SP-037).
+  if cloLifted(target) {
+    const lcaps = captureNamesOf(target)
+    let lci = 0
+    while lci < lcaps.length {
+      if emitCaptureRead(body, lcaps[lci], fnIx) < 0 { return -1 }
+      lci = lci + 1
+    }
+  }
   // Each argument's valtype is decided by its parameter (`cParamF32`/`cParamF64`/`cParamI64`
   // below), so an enclosing position's wide-scalar context must not leak into the arg spine —
   // an uncleared `pendingF32` let a bare integer literal lower as `f32.const` into an i32
@@ -31133,6 +31182,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
 // function at index `target`: build its closure value live (reading captures) and
 // `call_ref` it (a plain `call` would pass a null env and lose the captures).
 function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
+  if cloLifted(target) { return emitDirectCall(body, callIx, fnIx, target) }
   // Stash the freshly-built closure, then call_ref it (same shape as emitCallRef
   // but the callee is a value we synthesize here, not an existing binding). `Core`, not
   // `emitClosureValue`: the generic-value floor guards a closure that escapes its pin, and
