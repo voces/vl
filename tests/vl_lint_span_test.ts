@@ -121,6 +121,8 @@ Deno.test({
         "type Cam = { x: f64, y: f64 }",
         "function f(a: f64, b: f64, c: Cam) {",
         "  const w = a * 3.0",
+        "    -b * 3.5",
+        "  const v = a * 3.0",
         "    - b * 3.5",
         "  c.x - c.y",
         "  w",
@@ -129,9 +131,10 @@ Deno.test({
         "",
       ].join("\n"),
     );
-    // The field reads only the check can type: this is the typed face the CLI pairs.
+    // The field reads only the check can type: this is the typed face the CLI pairs. `- b`
+    // with a space continues `v`, so only the `-b` line is a discarded statement.
     const got = diags.filter((d) => d.code === "unused-pure-expression").map((d) => spanText(src, d));
-    want(JSON.stringify(got), JSON.stringify(["- b * 3.5", "c.x - c.y"]), "unused-pure-expression");
+    want(JSON.stringify(got), JSON.stringify(["-b * 3.5", "c.x - c.y"]), "unused-pure-expression");
   },
 });
 

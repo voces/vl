@@ -148,10 +148,10 @@ Deno.test({
 
 // The other half of the same rule, as the 2026-09-04 ruling left it: a line beginning with
 // a token that cannot start an expression continues the previous expression at STATEMENT
-// level too, so the leading `||` now runs. `-` is excluded and keeps the newline a
-// terminator — `a` NEWLINE `-a` is two statements, and joining would silently subtract.
+// level too, so the leading `||` now runs. A `-` touching its operand keeps the newline a
+// terminator — `a` NEWLINE `-a` is two statements (the spaced `- a` is D3698, below).
 Deno.test({
-  name: "vl-parse: statement level joins a leading operator but not a leading `-`",
+  name: "vl-parse: statement level joins a leading operator but not a leading `-x`",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_leadop_" });
@@ -190,6 +190,67 @@ Deno.test({
       if (soft.out !== "6\n12\n") {
         throw new Error(`want "6\\n12\\n", got ${JSON.stringify(soft.out)}`);
       }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// D3698 (sunpa SP-040): a line-leading `-` followed by a space or tab continues the line
+// above; `-x` stays a statement, and so does a `- 1 =>` match arm (D3699). `vl fmt` leads a broken `-` chain with `- b`, prints a
+// negated negation as `-(-x)` (a statement-leading `- -x` would now join), and leaves a `-x`
+// statement tight. Its output must re-parse, mean the same, and be a fixed point.
+Deno.test({
+  name: "vl-parse: a leading `- b` continues, `-x` does not, and fmt round-trips both (D3698)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_leadminus_" });
+    try {
+      const src = "function note(t: string) {\n  print(t)\n  100\n}\n" +
+        "function cam(alphaLonger: f64, betaLonger: f64, gammaLonger: f64) {\n" +
+        "  const w = alphaLonger * 3.0 - betaLonger * 3.5 - gammaLonger * 1.25 + alphaLonger * 2.0\n" +
+        "  w\n}\n" +
+        "function joined(a: i32, b: i32) {\n  a\n  - b\n}\n" +
+        "function tight(x: i32) {\n  note(\"n\")\n  -x\n}\n" +
+        "function neg2(x: i32) {\n  note(\"m\")\n  - -x\n}\n" +
+        "function neg1(x: i32) {\n  - -x\n}\n" +
+        "function tabbed(a: i32, b: i32) {\n  const r = a\n\t-\tb\n  r\n}\n" +
+        "function commented(a: i32, b: i32) {\n  const r = a\n    // the subtrahend\n    - b\n  r\n}\n" +
+        "function ret(a: i32, b: i32) {\n  return a\n    - b\n}\n" +
+        "function inParens(a: i32, b: i32) {\n  (a\n    -b)\n}\n" +
+        "function spacedOne(a: i32) {\n  const x = a\n  x\n  - 1\n}\n" +
+        "function arm(x: i32) {\n  match x {\n    1 => 10\n    - 1 => 20\n    _ => 30\n  }\n}\n" +
+        "print(\"\\{cam(2.0, 1.0, 4.0)}\")\nprint(joined(9, 4))\nprint(tight(5))\nprint(neg2(5))\n" +
+        "print(neg1(5))\nprint(tabbed(6, 2))\nprint(commented(6, 2))\nprint(ret(5, 2))\n" +
+        "print(inParens(5, 2))\nprint(spacedOne(4))\nprint(arm(-1))\n";
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, src);
+      const r = await runVL("run", f);
+      if (r.code !== 0) throw new Error(`leading-minus probe failed, code ${r.code}:\n${r.err}`);
+      const want = "1.5\n5\nn\n-5\nm\n105\n5\n4\n4\n3\n3\n3\n20\n";
+      if (r.out !== want) throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(r.out)}`);
+      const fmt = await runVL("fmt", f);
+      if (fmt.code !== 0) throw new Error(`fmt failed: ${fmt.err}`);
+      if (!fmt.out.includes("\n    - betaLonger * 3.5\n") || !fmt.out.includes("\n    - gammaLonger * 1.25\n")) {
+        throw new Error(`fmt did not lead the broken \`-\` chain with \`- b\`:\n${fmt.out}`);
+      }
+      if (!fmt.out.includes("\n  -x\n")) throw new Error(`fmt changed the \`-x\` statement:\n${fmt.out}`);
+      if (!fmt.out.includes("\n  - b\n") && !fmt.out.includes("a - b")) {
+        throw new Error(`fmt lost the joined subtraction:\n${fmt.out}`);
+      }
+      // `neg1`'s statement is a negated negation (`-(-x)`); `neg2`'s joins as `note("m") - -x`.
+      if (fmt.out.includes("{ - -x") || !fmt.out.includes("-(-x)")) {
+        throw new Error(`fmt printed a negated negation that would join the line above:\n${fmt.out}`);
+      }
+      const g = `${dir}/a.formatted.vl`;
+      await Deno.writeTextFile(g, fmt.out);
+      const again = await runVL("run", g);
+      if (again.code !== 0) throw new Error(`formatted output did not re-parse:\n${again.err}`);
+      if (again.out !== r.out) {
+        throw new Error(`fmt changed the meaning: ${JSON.stringify(r.out)} vs ${JSON.stringify(again.out)}`);
+      }
+      const twice = await runVL("fmt", g);
+      if (twice.out !== fmt.out) throw new Error(`fmt is not a fixed point:\n${twice.out}`);
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
