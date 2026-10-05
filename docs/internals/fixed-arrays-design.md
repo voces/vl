@@ -1,1195 +1,1117 @@
-# Fixed-length value arrays (`f64[16]`)
+# Fixed-length value arrays (`T[N]`)
 
-**Status: DESIGN, not built. IMPLEMENTATION HOLD (owner): no build starts until sunpa's own
-measurements are in and the owner has ruled on §8.** The owner chose direction A on 2026-10-04,
-for sunpa SP-036's asks 2 and 3: VL gets a fixed-length array type that behaves like a value, on
-the model of Rust's `[f64; 16]`, for small math aggregates (4x4 matrices, vectors and
-quaternions written as arrays). Optimiser-only scalar replacement (B) and patterns-only guidance
-(C) were not chosen. The direction's words were "returned via multi-value or out-param". Q7
-asks which.
+**Status: DESIGN, not built. IMPLEMENTATION HOLD (owner, 2026-10-04): no build starts until
+sunpa confirms that the existing approach (records, the #3372 multi-value step, scratch
+buffers) hits a performance limit.** The owner chose direction A on 2026-10-04 for sunpa SP-036
+(asks 2 and 3): VL gets a fixed-length array type for small math aggregates (4x4 matrices,
+vectors, quaternions, colours). This is revision 3. It replaces revision 2's per-decision
+design with ONE model, whose recommendations come from the 2026-10-04 discussion between the
+owner and the coordinator. **The owner has not ruled on any of it**; it is the proposal to
+interrogate. Every measurement from revision 2 that still applies is kept (§7).
 
-This doc proposes the semantics, sketches the lowering, prices it, and gives prototype numbers
-for the lowering. §8 is the question list. Critic agents interrogate the doc before question
-time, so every assumption is numbered in §2, and each one says whether it was measured.
-
-Contents: §0 summary · §1 motivation and sunpa's real usage · §2 assumptions · §3 survey ·
-§4 decisions · §5 lowering sketch and cost · §6 prototype evidence · §7 alternatives
-considered · §8 open questions for the owner · §9 revision log · Appendix: prototype sources.
+Contents: §0 the proposal on one page · §1 motivation · §2 assumptions · §3 survey · §4 the
+unified model · §5 semantics and typing · §6 codegen per placement · §7 measurements · §8
+interop · §9 risks · §10 owner questions and stated defaults · §11 panel dissent · §12
+revision log · Appendix: benchmark sources.
 
 ---
 
-## 0. Summary
+## 0. The proposal on one page
 
-| decision | recommendation (§4 has the options) |
-| --- | --- |
-| F1 value or reference | **value**: `b = a` copies, and a callee's writes to its parameter are never seen by the caller |
-| F2 type spelling | **`f64[16]`**, the existing `T[]` suffix with a length (a literal or a named `const`); `f64[4][]` is a list of `f64[4]` |
-| F3 literal syntax | a list literal of exactly N elements in a `T[N]` position, plus **`[v; N]`** for the fill |
-| F4 element types | numeric scalars, `boolean` and nested fixed arrays in v1 |
-| F5 `const` | `const a: f64[16]` refuses `a[i] = v` (a value that is constant) |
-| F5′ dead writes | an element write to a value that is never read again is an **error**: `f()[0] = …`, a write to a parameter, loop variable or `let` copy that is not read afterwards |
-| F6 non-constant index | allowed, traps out of bounds like a list, and lowers to a **`br_table` over the locals**: no allocation, about 1–2 ns per access. A constant out-of-bounds index (literal or `const` only) is a check error |
-| F7 storage and the copy invariant | locals, parameters and results hold N scalars. A field, global, map value, list element or shared capture cell holds an **owned box** that nothing else can reach. **Every delivery into a box allocates a fresh box or copies into the destination's own box**, unless the source is provably dead. Allocation-free holds for the locals representation only |
-| F8 conversion | the `as` operator both ways: `m as f64[]` (infallible, a fresh list) and the trio `xs as! f64[16]` / `as?` / `as` |
-| F9 generics | `T` may be generic (`T[16]`). Length polymorphism comes through un-annotated parameters, keyed per (element, length), which is new. No const-generic syntax in v1 |
-| F10 size | no limit in the language. **Per-signature** flattening budget (at most 16 slots per array, at most 64 parameter slots and 16 result slots per function type) and a hint at the 17-slot cliff |
-| F11 equality and printing | `==` elementwise like lists. `print` and holes refuse it, like lists and records |
-| F12 iteration | `for x in m` iterates the value `m` held when the loop began (a copy only when the body writes `m`) |
-| F13 closure capture | the existing by-reference rule (D2339). An element write counts as an assignment |
-| F14 lowering route | the compiler emits N locals, N parameters and multi-value results itself, at every rung. This is VL's first representation that spans several wasm values |
-| F15 numeric and literal rulings | literals adapt elementwise. A literal-only binding adopts a fixed-array destination, as the record rulings and D3339 do. A conflicting use is an error naming both uses |
-| F16 std | none. `.length` (a constant), indexing, `==`, `for`, `as` and `[v; N]` are built in |
+**`T[N]` is a fixed-length, immutable VALUE.** It has no identity: copying it and sharing it
+cannot be told apart, so the compiler may do either. **`a[i] = v` on any assignable place
+means "replace the whole value with a copy that differs at `i`"**, defined as the rewrite
+`a = a.with(i, v)`. This is Swift's *mutable value semantics*, specified as sugar over an
+immutable value. `r.pose[3] = x` is therefore a write to the field `r.pose`, and
+`list[k][i] = x` is a write to the list element `list[k]`. Nothing can alias a `T[N]`, ever.
 
-**Prototype result (§6), corrected in revision 2.** On V8 (Deno 2.9.6), hand-written wasm for the
-proposed lowering of sunpa's `m4Mul` runs 10^6 products in 82–95 ms. Rust `[f64; 16]` takes
-89–94 ms, the 16-field struct 87–93 ms with 124 scavenges, `filled` `f64[]` 105–111 ms, and
-`push` `f64[]` 127–129 ms. On wasmtime 47 (`vl run`, which the gates use) the proposed lowering
-takes 85–89 ms. Rust under wasmtime 49 takes 86–89 ms, and the struct 125 ms, `filled` 201 ms
-and `push` 238 ms. The proposed lowering allocates nothing. **The win is Rust parity plus zero
-garbage.** It is not the 2x speed-up revision 1 claimed: that figure came from a benchmark whose
-result read one row of the matrix, and both LLVM and V8 deleted the other three (§9).
+**Placement is the compiler's choice**, and there is no syntax for it:
+
+| where the value lives | placement | an element write costs |
+| --- | --- | --- |
+| local, parameter, result | N wasm locals / parameters / multi-value results | one `local.set` (a `br_table` when the index is dynamic) |
+| record field | INLINE: N struct fields | one `struct.set` |
+| list element `T[N][]` | FLATTENED: one backing array of N·len, stride N | one `array.set` |
+| map value, union member, nullable, uniform generic slot, past the size cap | BOXED: an immutable heap array, shared freely | a rebuild of the box (O(N) and one allocation); a hint names it |
+| `flat type` field | N elements inline in linear memory (offsets and size only) | a store through `std:buffer` |
+
+**What the user writes:** `let m: f64[16] = [0.0; 16]`, `m[5] = 1.0`, `m[k * 4 + r]`,
+`type Skeleton = { root: f64[16] }`, `const g: f64[16][] = []`, `xs as! f64[16]`,
+`m as f64[]`, `a == b`, `for x in m`, `m.length` (a constant).
+
+**Five owner questions** remain (§10), in dependency order: Q1 the value model, Q2 the
+spelling, Q3 the element types, Q4 how a non-literal value is built, Q5 whether the size cap
+is visible. Everything else is a stated default (§10.2), each following from an existing
+ruling or from the model itself.
+
+**Evidence (§7).** The locals placement runs sunpa's `m4Mul` at Rust parity with zero garbage
+(re-run today: 93 ms against Rust's 98 ms on V8, 100 against 96 on wasmtime 49; today's
+`f64[]` takes 119 ms with 172 scavenges). An inline record field is 3.4x faster than today's
+`pose: f64[]` field on wasmtime for constant indices. A boxed update that rebuilds costs about
+18 ns and one allocation per write, which is why it is the placement of last resort.
+Flattening a list of matrices is worth 1.3–1.4x only once the list leaves the cache; the
+larger win in sunpa's list code is removing the per-product allocation (4x on V8, 8x on
+wasmtime), which value semantics gives with or without flattening.
 
 ---
 
 ## 1. Motivation, and what sunpa actually writes
 
 **SP-027** (`~/sunpa/docs/vl-issues.md`): every `f64[]` vector op allocates, about 15x the
-scalar code. The procedural animation toolkit (`src/pose.vl`, `src/ik.vl`, `src/legs.vl`) is
-quaternion, vector and 4x4 matrix math throughout. **SP-036**: a `f64[]` 4x4 matrix is a heap
-object per call. sunpa measured, on their box, 163 ms as written, 115 ms with `filled(16, 0.0)`
-and indexed stores, and 97 ms for Rust `[f64; 16]` `#[inline(never)]`. That was 1,768 scavenges
-over their runs. `cameraFrame` alone leaves about 32 KB a frame, and at 240 Hz each 0.5–1 ms
-scavenge is a visible hitch. Their asks, in order: (1) reserve `push` capacity, done as D3623;
-(2) a fixed-size value type kept in locals or inline in records, with no heap and no bounds
-checks past the static size; (3) scalar replacement for a fresh returned array, if (2) is far off.
+scalar code. **SP-036**: a 4x4 matrix as `f64[]` is a heap object per call. sunpa measured 163
+ms as written, 115 ms with `filled(16, 0.0)`, and 97 ms for Rust `[f64; 16]`, with 1,768
+scavenges. `cameraFrame` alone leaves about 32 KB a frame, and at 240 Hz each 0.5–1 ms
+scavenge is a visible hitch. Asks, in order: (1) reserve `push` capacity (done, D3623); (2) a
+fixed-size value type kept in locals or inline in records, with no heap and no bounds checks
+past the static size; (3) scalar replacement of a fresh returned array, if (2) is far off.
 
-**The vector and quaternion half is already served by records.** `pose.vl` moved `V3` and `Q`
-to records ("they fold into locals"), and D3625's multi-value step returns records of up to
-eight fields with no allocation. What records cannot express is the **matrix half**:
+**Records already serve vectors and quaternions.** `pose.vl` moved `V3` and `Q` to records,
+and D3625's multi-value step (#3372) returns records of up to eight numeric fields without
+allocating. What records cannot express is the matrix half: 16 elements (past
+`MV_RECORD_MAX_FIELDS = 8`), computed indices in loops (`a[k * 4 + r]`), lists of matrices
+(`g: f64[][]`, `cascades: f64[][]`), matrices inside records (`Skeleton.root: f64[]`), and
+helpers written through a parameter (`m4MulInto(r, a, b)`), which is how sunpa avoids
+allocation today.
 
-* it has 16 elements (past `MV_RECORD_MAX_FIELDS = 8`);
-* it is written with **computed indices** in loops (`a[k * 4 + r]`, `o[c * 4 + k] = …`);
-* it lives in **lists** (`g: f64[][]`, one matrix per bone; `cascades: f64[][]`);
-* the same helper serves different lengths (`put(b: Buf, at: i32, vs: f64[])` takes 3-, 4- and
-  16-element arrays);
-* it is written **through a parameter** (the `…Into(r, a, b)` reuse pattern in `view.vl`,
-  `mulLocalInto(a, p, o, out)` in `pose.vl`), which is how sunpa avoids allocation today.
+Usage census of `~/sunpa/src` (read only; `f64[]` in 30 lines of `view.vl`, 27 of `pose.vl`,
+23 of `legs.vl`, 70 of `anim.vl`):
 
-Usage census over `~/sunpa/src` (read only, 22,284 lines). `f64[]` appears in 31 lines of
-`view.vl`, 27 of `pose.vl`, 23 of `legs.vl` and 70 of `anim.vl`. Matrix-shaped uses in
-`view.vl`/`pose.vl`:
-
-| shape | example | what the design must do with it |
+| shape | example | what this design does with it |
 | --- | --- | --- |
-| return a fresh matrix | `m4()`, `perspective`, `ortho`, `lookAt`, `m4Invert`, `compose`, `invertRigid` | multi-value result (F14) |
-| 4x4 product in loops | `m4MulInto`, `mul` | constant indices after unrolling (F6, F12) |
-| write into a caller's matrix | `m4MulInto(r, a, b)`, `mulLocalInto(a, p, o, out)`, `jittered(o, m)` | out-parameters (F5′, Q7) |
-| list of matrices | `g: f64[][]`, `cascades: f64[][]`, `cascadePlanesKept: f64[][]` | `f64[16][]` storage (F7) |
-| matrix inside a record | `Skeleton.root: f64[]` | owned box field (F7) |
-| module-level matrix | `viewProj`, `lightViewProj`, `sunDir: f64[]` | global storage (F7) |
-| length-generic reader | `put(b, at, vs: f64[])` over 3, 4 and 16 | un-annotated parameter (F9) or `as f64[]` (F8) |
-| read a window of a longer list | `mul(a, b, ob)` reads `b[ob + …]`; `compose(p, o)` reads a pose STRIDE | stays `f64[]`; the fixed array is the result, not the window |
-
-The last row matters. sunpa's pose is a flat `f64[]` with STRIDE 10 per bone. That is a
-structure-of-arrays layout, and a fixed array does not replace it. It replaces the 16-number
-products computed from it.
+| return a fresh matrix | `m4()`, `perspective`, `lookAt`, `m4Invert` | multi-value result (§6.2) |
+| 4x4 product in loops | `m4MulInto`, `mul` | constant indices after unrolling (§6.1) |
+| write into a caller's matrix | `m4MulInto(r, a, b)`, `jittered(o, m)` | return the value instead: `sk.root = m4Mul(a, b)` is 16 `struct.set`s (§5.13) |
+| list of matrices | `g: f64[][]`, `cascades: f64[][]` | `f64[16][]`, flattened (§6.4) |
+| matrix inside a record | `Skeleton.root: f64[]` | inline field (§6.3) |
+| module-level matrix | `viewProj`, `lightViewProj` | N globals, or a box (§6.5) |
+| length-generic reader | `put(b: Buf, at, vs: f64[])` over 3, 4 and 16 | an un-annotated parameter, one instance per length (§5.10) |
+| a window into a longer list | `compose(p, o)` reads a pose at STRIDE 10 | stays `f64[]`; the fixed array is the result, not the window |
 
 ---
 
-## 2. Assumptions (critics: attack these first)
+## 2. Assumptions
 
-Each assumption is marked **[measured]** (a program was run, quoted), **[read]** (taken from
-source or a doc and not run), or **[unverified]**.
+Each is **[measured]** (a program was run on today's master seed, `0502ce8f0`), **[read]**
+(from source or a doc), or **[survey]** (from a language's documentation).
 
 * **A1 [read]. WasmGC cannot hold an aggregate inline.** A struct field or an array element is
-  one scalar or one reference. "Inline in a struct" therefore means N fields, and "inline in an
-  array" means a stride over a flat scalar array (`memory-gc-design.md`'s ceiling table).
-* **A2 [measured]. Wasm locals cannot be indexed dynamically**, and a `br_table` switch over
-  them costs about 1–2 ns per access with no allocation (§6, rows `pk_*` and `g_brtable`).
-* **A3 [read + measured]. The existing unroller is the constant-index machine.**
-  `emitRangeUnrolled` fully unrolls a range loop with constant ends of 1–16 trips and at most
-  640 AST nodes, and reads the loop variable as a constant in each copy. It **declines** in five
-  cases (DECISIONS.md, "Small constant range loops are unrolled"): more than 16 trips or 640
-  nodes; the body writes the loop variable; the body holds a function (per-iteration capture);
-  the body makes a call that is not an inline memory intrinsic; or a step would wrap. Measured:
-  in both of today's `f64[]` builds of `m4Mul`, one of the three loops stayed rolled.
+  one scalar or one reference, so "inline in a record" means N struct fields and "inline in a
+  list" means a stride over one scalar array (`memory-gc-design.md`'s ceiling table).
+* **A2 [measured]. Wasm locals cannot be indexed dynamically.** A `br_table` over N locals
+  costs about 1 ns per access on V8 at every N measured (4 to 256), about 3x a mutable
+  `array.get`, and its code grows by about 18 bytes per arm per access site (§7.4).
+* **A3 [read]. The unroller is the constant-index machine.** `emitRangeUnrolled` unrolls a
+  range loop with constant ends of 1–16 trips and at most 640 AST nodes, and declines when the
+  body writes the loop variable, holds a function, makes a call that is not an inline memory
+  intrinsic, or a step would wrap (DECISIONS.md, "Small constant range loops are unrolled").
 * **A4 [read]. Records, lists and maps stay reference types.** Nothing here changes them.
-* **A5 [read]. Two sections of `docs/guide/collections-design.md` are overridden, not
-  extended.** §VL.6 (out of scope) and §OQ.2 hold that value-versus-reference is a
-  **language-wide** call ("there is no sound case for collections being value types while
-  objects stay reference"). F1 answers that a small fixed array of scalars is a numeric
-  aggregate (A15), but adopting F1 is an **owner override of §VL.6/§OQ.2** for this one type, not
-  an inference from them. §VL.7's committed surface ("`T[]` + inference, no user-facing fixed
-  array") is overridden too. Its inferred header-less representation of `T[]` stays a separate
-  optimisation and must not share a name with this type. If this design lands, both sections
-  get a pointer here.
-* **A6 [measured]. Length polymorphism through un-annotated parameters is only half there
-  today.** `function g(vs) { vs.length }` runs for `[1.0, 2.0]` and `[1, 2, 3]` (prints 2 and
-  3), and an index loop over `vs.length` runs. **But `for v in vs` over an un-annotated
-  parameter is refused** ("for-in expects an array, a map or a string, got _"). Instances are
-  keyed per ELEMENT type, never per length, since `T[]` carries no length. F9 needs both fixed.
-* **A7 [read]. Module exports other than the entry module's are whole-program merged**, not
-  wasm exports. Only an entry-module `export` reaches the wasm export section.
-* **A8 [measured]. Both engines cap a function type at 1,000 parameters and 1,000 results.**
-  V8: "param count of 1001 exceeds internal limit of 1000". wasmtime 49: "function params size
-  is out of bounds". The same holds for results. 63 `f64[16]` parameters flattened would be an
-  invalid module, so F10's budget is per signature.
-* **A9 [measured]. `as` is numeric-only today**: `[1.0, 2.0] as f64[]` refuses with "`as`
-  supports numeric conversions only". F8 extends it.
-* **A10 [read]. Closures capture variables by reference** (DECISIONS.md, D2339), with a
-  copy-into-the-closure fast path for bindings never assigned after capture.
-* **A11 [measured]. Printing and equality.** `print` and template holes accept only scalars and
-  strings. `[1.0, 2.0] == [1.0, 2.0]` and record `==` print `true` (structural), and a record
-  with a list field compares structurally too. `[n] == [n]` with `n = 0.0 / 0.0` prints `false`
-  (IEEE elementwise).
-* **A12 [measured]. Today's paths share references, and a fixed array must not inherit that.**
-  Each of these prints the write made through the other name: `let r = s.root; r[0] = 7.0`
-  writes `s.root`; `for m in g { m[0] = 9.0 }` writes `g`; `const h = [...g]; h[0][0] = 9.0`
-  writes `g`; `id<T>(a)` returns `a` itself; pushing a narrowed nullable twice stores one list
-  twice. `f()[0] = 2.0` compiles (for a list it is meaningful). Parameters are assignable, and a
-  `const` list is element-writable (`const xs = [1, 2]; xs[0] = 5` prints 5).
-* **A13 [measured]. `[v; N]` and `T[N]` are free syntax**: `[0.0; 16]` is a parse error today
-  (the list parser skips the `;` and then wants a `,`), and `let a: f64[16] = []` is a parse
-  error ("expected `]` but found `16`").
-* **A14 [measured]. The prototype's lowering is hand-written** (§6), not emitted by a compiler
-  that implements this design. It is the code F14 commits to emitting.
-* **A15 [read]. This is VL's first representation of one value as several wasm values.**
-  `F32x4` is one `v128`, and every other VL value is one scalar or one reference. Every place
-  in the emitter that assumes one value is one stack slot (expression statements' `drop`,
-  `select`, `local.tee`, block result types, call argument counts, globals) is affected. That
-  is the build's main architectural cost (§5).
-* **A16 [measured]. Containers never widen today.** `const b: f64[] = a` with `a: i32[]`, and
-  an `if` joining `f64[]` with `f32[]`, are both refused ("a container never widens
-  implicitly … it would be a copy, and a write through either list would not reach the other").
-  Only `readonly T[]` is covariant.
-* **A17 [measured]. A constant index out of range after unrolling is a run-time trap today,
-  not a check error.** `a[k]` over `for k in 0 until 3` on a 2-element list traps at run time.
-* **A18 [read, unverified end to end]. The host's multi-value step tolerates multi-result
-  functions.** `multivalue.rs` models a call's results by count under wasmparser's validator
-  (`results_pushed = rs.len()`). Its own twins are already multi-result functions that chains
-  call, and it treats only one-result reference-returning functions as producers. A
-  compiler-emitted multi-value function should therefore pass through untouched. This was not
-  run, because no compiler emits one yet. S1's fixtures must push a multi-value module through
-  `-O` and `-O3`, through the escape step as well.
-* **A19 [read]. sunpa SP-032's record spread is ruled**, and `{ ...rec, m }` must deep-copy a
-  fixed-array field. It does not parse today (measured: "expected a field name but found
-  `...`").
+* **A5 [read]. This overrides two sections of `docs/guide/collections-design.md`.** §VL.6 and
+  §OQ.2 hold that value-versus-reference is a language-wide call. Q1 makes `T[N]` the
+  exception: a numeric aggregate, not a collection. §VL.7's "one user-facing collection" is
+  overridden too; its inferred header-less representation of `T[]` stays a separate,
+  invisible optimisation and must never be called a "fixed array" in user docs.
+* **A6 [measured, rev 2]. `for v in vs` over an un-annotated parameter is refused today**
+  ("for-in expects an array, a map or a string, got _"); `vs.length` and index loops work.
+* **A8 [measured, rev 2]. Both engines cap a function type at 1,000 parameters and 1,000
+  results** (V8 and wasmtime 49).
+* **A9 [measured]. `as` is numeric-only**: `[1.0, 2.0] as f64[]` gives "`as` supports numeric
+  conversions only".
+* **A10 [read]. Closures capture variables by reference** (D2339), copying into the closure
+  only bindings never assigned after capture.
+* **A11 [measured]. `==` is structural** on lists and on records, including a list of records
+  (`[p] == [q]` prints `true` for two equal-field records). `print` takes scalars and strings
+  only.
+* **A12 [measured, rev 2]. Today's paths share references**: `let r = s.root; r[0] = 7.0`
+  writes `s.root`, and `for m in g { m[0] = 9.0 }` writes `g`. **Loop variables and
+  parameters are assignable** (measured today: `for m in g { m = 3.0 }` and
+  `for i in 0 until 3 { i = 5 }` both compile and run). A port that keeps these shapes
+  compiles under value semantics and silently does nothing (§5.14).
+* **A13 [measured]. `T[N]` and `[v; N]` are free syntax**: `let a: f64[16] = []` fails with
+  "expected `]` but found `16`", and `[0.0; 16]` with "expected `,` but found `16`".
+* **A15 [read]. No VL value spans several wasm values today** (`F32x4` is one `v128`). The
+  emitter assumes one value is one stack slot everywhere. §6.2 keeps that assumption true in
+  the emitter by doing the scalarisation in the host's multi-value step.
+* **A16 [measured, rev 2]. Containers never widen**: `const b: f64[] = a` with `a: i32[]` is
+  refused because "it would be a copy, and a write through either list would not reach the
+  other". Only `readonly T[]` is covariant.
+* **A18 [read]. The host's multi-value step (`scripts/vl-host/src/multivalue.rs`) already
+  scalarises immutable records**: a struct type no `struct.set` reaches, used only field by
+  field, becomes N locals and N results, with twins per call site, loop-carried locals
+  included. It runs at `-O`/`-O3` only. Its bound is 8 fields.
 
 ---
 
 ## 3. Survey
 
-| language | type | copy on assign / pass | index check | length generics | storage | conversion to a slice |
-| --- | --- | --- | --- | --- | --- | --- |
-| Rust | `[T; N]` | value. `Copy` if `T: Copy`, else moved | panic at run time; a constant out-of-bounds index is a deny-by-default lint | const generics `const N: usize` (1.51) | inline in structs, `Vec`, stack | `&a` coerces to `&[T]`; `<[T; N]>::try_from(slice)` fails on a length mismatch |
-| C | `T a[N]` | **not assignable**; decays to a pointer when passed (no copy); copied inside a struct | none (undefined behaviour) | none (macros) | inline | decay is implicit |
-| C++ | `std::array<T, N>` | value (aggregate) | `[]` unchecked, `.at()` throws | non-type template parameter | inline | `std::span` |
-| Zig | `[N]T` | value, copied | safety-checked panic; a comptime-known out-of-bounds index is a compile error | `comptime N: usize` parameters | inline | `&a` coerces to `[]T` / `*[N]T` |
-| Go | `[N]T` | **value**, copied on assignment and when passed; `range` over an array iterates a copy | panic; a constant out-of-bounds index is a compile error | **none**: generics cannot range over N | inline | `a[:]` makes a slice that **aliases** the array |
-| Swift | no fixed array until **`InlineArray<let count: Int, Element>`** (SE-0453, Swift 6.2), with `[N of T]` sugar (SE-0483). Before that, tuples. `inout` parameters are copy-in, copy-out | value, eagerly copied (no copy-on-write) | trap | integer generic parameters (SE-0452) | inline | `span` |
-| C# | `fixed double b[16]` (unsafe structs, primitives only); C# 12 `[InlineArray(16)] struct`; `ref`/`out` parameters | value (struct) | checked through `Span<T>` | none | inline in the struct | implicit `Span<T>` |
-| AssemblyScript | `StaticArray<T>` | **reference** | trap | none (`length` runtime) | heap, no backing-buffer indirection | copy |
-| GLSL | `float a[16]`, `vec3`, `mat4`; `out`/`inout` parameters (copy-out) | value, copied | arrays: undefined or clamped; ES 1.00 restricts dynamic indexing | none | inline | none |
-| WGSL | `array<f32, 16>`, `vec3<f32>`, `mat4x4<f32>` | value | no trap: an out-of-bounds dynamic access reads some in-bounds value or zero; a constant out-of-bounds index is a creation error | none (pipeline-overridable sizes only) | inline | none |
+Each subsection gives the type, its semantics, its storage, the cost of a dynamic index, and
+what its users complain about. Facts are **[survey]**; the Swift, Julia, Zig and Valhalla
+points were checked against current sources on 2026-10-04 (links in the appendix).
 
-Survey facts are from each language's reference as I know it **[unverified]**. The Swift
-proposal numbers and WGSL's out-of-bounds wording were not re-checked against a toolchain.
+### 3.1 Rust `[T; N]`
 
-**What the survey says for VL.**
+A value. `Copy` when `T: Copy`, otherwise moved. Stored inline everywhere: on the stack, in a
+struct, and contiguously in `Vec<[T; N]>` (the model for §6.4). A dynamic index is
+bounds-checked (a panic); LLVM removes the check when it can prove the range, and a constant
+out-of-range index is a deny-by-default lint. Length generics are const generics (`const N:
+usize`, 1.51). `&a` coerces to `&[T]`, and `<[T; N]>::try_from(slice)` fails on a length
+mismatch. **Complaints:** a large array built on the stack overflows it
+(`Box::new([0; 1 << 20])`); arithmetic on lengths (`[T; N * 2]`) is still unstable; moving a
+large array is a `memcpy` the source never shows; `array::map` and `from_fn` have generated
+poor code for large N.
 
-1. **Every language whose fixed array is fast makes it a value** (Rust, C++, Zig, Go, Swift's
-   `InlineArray`, C#, GLSL, WGSL). The one reference-typed design, AssemblyScript's
-   `StaticArray`, is a heap object, which is SP-036's complaint.
-2. **Value-array languages answer "out-parameter" with a parameter MODE**, never with aliasing
-   the value: Swift `inout`, C# `ref`/`out`, GLSL `out`/`inout`, Rust `&mut`. Q7 asks whether VL
-   wants one.
-3. **The length is part of the type everywhere.** Length generics split: Rust, C++, Zig and
-   Swift have them, while Go and C# shipped without and are usable.
-4. **A constant out-of-bounds index is a compile error everywhere it can be** (Rust, Zig, Go,
-   WGSL). A dynamic one traps everywhere except C and the shading languages.
-5. **The conversion to a growable sequence either aliases (Go's `a[:]`, Rust's `&a`) or copies.**
-   Aliasing needs borrowed references, which VL does not have, so VL's conversion copies (F8).
+### 3.2 C `T[N]` and C++ `std::array`
+
+C's array is not assignable, decays to a pointer when passed (no copy), and is copied only
+inside a struct. No bounds checks. C++'s `std::array<T, N>` is an aggregate value: copied on
+assignment and pass, inline, `[]` unchecked, `.at()` throws. **Complaints:** decay (`sizeof`
+on a parameter), C's missing assignment, and in C++ the verbose spelling and the size
+deduction that needed `std::to_array` (C++20).
+
+### 3.3 Go `[N]T`
+
+**A value**: copied on assignment, when passed, and by `range` (which iterates a copy). Inline
+everywhere. Arrays are comparable with `==` and may be map keys. A dynamic index panics; a
+constant out-of-range index is a compile error. Generics cannot abstract over N. `a[:]` makes
+a slice that **aliases** the array. **Complaints:** silent copies of large arrays on every
+pass (people pass `*[N]T` instead), the `range` copy surprising people who write into the
+array in the loop, and the aliasing slice. Go's arrays are seldom used directly; slices are
+the everyday type. **Lesson:** a value array beside a growable reference sequence is a known,
+workable pairing; the copy cost must be visible somewhere.
+
+### 3.4 Swift `Array` (copy-on-write) and `InlineArray` (Swift 6.2)
+
+`Array` is a value with reference-counted copy-on-write storage: a copy is free until a write,
+which checks uniqueness and copies if shared. `a[i] = v` mutates in place under *mutable
+value semantics*: a `var` of value type is exclusively owned, so a write cannot be observed
+through any other name. **Complaints:** hidden copies when a buffer turns out to be shared,
+the cost of the uniqueness check, and exclusivity-checking surprises. Before 6.2, fixed C
+arrays imported as tuples (`(Int8, Int8, …)`), which cannot be indexed.
+
+`InlineArray<let count: Int, Element>` (SE-0453, with integer generic parameters SE-0452, and
+the sugar `[4 of Int]` from SE-0483) is a fixed-size, inline value: stack-allocated in a local,
+stored inline in a class, never an implicit heap allocation. It is **eagerly** copied (no
+copy-on-write) and deliberately does **not** conform to `Sequence` or `Collection`, because
+those protocols would invite implicit copies. **Lesson:** Swift chose the same "value, inline,
+eager copy" contract and the same element-assignment syntax; its update rule is this design's
+rewrite rule. Its refusal of the sequence protocols is the cautionary note for VL's generic
+list functions over `T[N]` (§5.10).
+
+### 3.5 Zig `[N]T`
+
+A value, copied on assignment, inline. A comptime-known out-of-range index is a compile error;
+a runtime one is a safety-checked panic. Coerces to a slice `[]T`. `comptime N` parameters
+give length generics. Separate SIMD type `@Vector(N, T)`. **Complaints, and the most relevant
+one in the survey:** Zig allows the compiler to pass a by-value parameter **by reference**
+when it judges that safe (the "parameter reference optimisation") and to write results in
+place (result location semantics). When the caller also holds a mutable pointer to the same
+memory, the aliasing becomes observable: the callee sees its "copy" change (ziglang/zig
+#5973, #12251, #22906). **Lesson for VL:** a design that says "value semantics, the compiler
+picks the placement" is only sound if no placement can let a write reach a value another name
+holds. VL's answer is that the value is immutable and every write is a whole-value
+replacement of a *place* (§4.2), so the compiler never needs a no-alias proof to share.
+
+### 3.6 C# `InlineArray`, fixed buffers, `readonly struct`
+
+Arrays are reference types. `fixed double b[16]` exists only in `unsafe` structs over
+primitives. C# 12's `[InlineArray(16)] struct` is an inline value convertible to `Span<T>`.
+**Complaints:** *defensive copies*: calling a method on a non-`readonly` struct held in a
+`readonly` field copies the whole struct first, silently; `readonly struct` and `in`
+parameters exist largely to stop that. **Lesson:** hidden copies of value aggregates are the
+known performance trap; VL's immutable value makes a read never copy (§6.5), and the copies
+that do happen (a boxed update, a whole read of an inline field into locals) are bounded and
+hinted.
+
+### 3.7 Java Valhalla value classes and flattened arrays
+
+JEP 401 (preview) value classes have no identity and only final fields; an update constructs
+a new value. The JVM chooses whether to flatten a value into its containing object or array
+or to keep a reference: **placement is the runtime's choice**, as here. Flattening is limited
+by nullability (null-restricted types are a separate JEP) and by atomicity: a mutable
+flattened field or element must be read and written atomically, which today limits it to
+about 64 bits unless the class opts out of atomicity. **Lesson:** Valhalla is the closest
+large-scale precedent for "immutable, no identity, placement chosen for you". Its two limits
+do not bind VL: wasm has no threads sharing GC objects (tearing is impossible), and VL keeps
+the nullable case boxed (§6.5).
+
+### 3.8 Julia StaticArrays (`SVector`, `MVector`, `setindex`)
+
+`SVector{N, T}` is an immutable `isbits` struct over an `NTuple`. It lives in registers, and a
+`Vector{SVector{3, Float64}}` stores its elements contiguously (flattened). Updates are
+`setindex(v, x, i)`, returning a new value; Accessors.jl adds `@set v[i] = x` as the
+mutable-looking spelling. `MVector` is the mutable variant (heap unless the compiler proves it
+does not escape). Code is fully unrolled. **Complaints:** compile time and code size explode
+with N; the documented rule of thumb is to use an ordinary `Array` past about 100 elements; a
+length the compiler cannot infer makes code type-unstable and slow. **Lesson:** this is the
+nearest design to this one (immutable value, update by rebuild, flattened in arrays, unrolled
+code) and it is a success for small N. Its one hard limit is the same as VL's: past some N,
+unrolling and register placement cost more than they save (§6.6).
+
+### 3.9 GLSL / WGSL `vecN`, `matNxM`, `array<T, N>`
+
+Value types, copied. `out`/`inout` parameters are copy-in copy-out. WGSL never traps: an
+out-of-range dynamic index reads some in-range value or zero, and a constant one is a
+creation-time error. **Complaints:** a dynamic index into a function-local array forces the
+GPU compiler to spill the array to scratch memory (the same choice as §6.1's `br_table`
+versus spill); buffer layout rules (`vec3<f32>` aligned to 16 bytes in uniform and storage
+buffers) produce silent padding mismatches with CPU-side structs. **Lesson:** GPU-bound
+layouts need explicit padding, which VL's `flat` already demands (§8.3).
+
+### 3.10 OCaml `floatarray`
+
+OCaml boxes floats, except in a `float array`, which it stores flat. The representation is
+chosen at **run time** from the element tag, so every polymorphic array access checks for the
+float case; `floatarray` names the flat case explicitly, and a configure flag removes the
+hack. **Complaint:** the hidden representation switch taxes all generic array code.
+**Lesson:** a placement switch must be decided statically. VL monomorphises, so each
+instance knows its placement at compile time.
+
+### 3.11 D, Kotlin and Scala, briefly
+
+**D** is the closest *spelling* precedent: `int[4]` is a static array, a **value** (D2
+changed it from D1's by-reference passing), beside `int[]`, a growable reference slice;
+`a[]` slices (aliases) a static array. Its users' complaint is that `auto a = [1, 2, 3]`
+infers a dynamic array, so a static one needs an annotation or a helper. **Kotlin** has
+reference arrays (`DoubleArray`) and single-field value classes; multi-field value classes
+wait on Valhalla. **Scala** uses JVM arrays. Neither has a fixed-length value array.
+
+### 3.12 Comparison and lessons
+
+| language | semantics | storage | dynamic index | length generics | element update |
+| --- | --- | --- | --- | --- | --- |
+| Rust `[T; N]` | value (copy or move) | inline; contiguous in `Vec` | checked, panic | const generics | in place (`&mut`) |
+| C `T[N]` / C++ `std::array` | C: not assignable, decays; C++: value | inline | unchecked / `.at()` | templates | in place |
+| Go `[N]T` | value, copied on pass and `range` | inline | checked, panic | none | in place on a variable |
+| Swift `InlineArray` | value, eager copy | inline | checked, trap | integer generics | in place under exclusivity |
+| Zig `[N]T` | value; compiler may pass by reference | inline | checked | comptime | in place |
+| C# `InlineArray` | value (struct) | inline | through `Span`, checked | none | in place |
+| Java value class | immutable, no identity | VM's choice; flattened if small and null-restricted | n/a (fields) | none | rebuild |
+| Julia `SVector` | immutable value | registers; flattened in arrays | checked | type parameter | `setindex` rebuild; `@set` sugar |
+| WGSL `array<T, N>` | value | registers or scratch | clamped, no trap | none | in place |
+| OCaml `floatarray` | mutable reference | flat, chosen at run time | checked | n/a | in place |
+| **VL `T[N]` (proposed)** | **immutable value, no identity** | **compiler's choice by placement (§4)** | **checked, trap** | **none in v1** | **rewrite to `a = a.with(i, v)`** |
+
+**What VL should take.**
+
+1. **Every fast fixed array is a value.** The only reference-typed design in the survey that
+   aims at speed (AssemblyScript's `StaticArray`, in revision 2) is a heap object, which is
+   SP-036's complaint.
+2. **Immutable plus a mutable-looking update is a proven pair** (Julia `setindex` + `@set`,
+   Swift's mutable value semantics, Valhalla withers). It gives value semantics without any
+   no-alias proof, which is where Zig went wrong.
+3. **Placement chosen by the implementation works when the value has no identity**
+   (Valhalla, Swift `InlineArray`, Julia), and fails when it does (Zig, OCaml's run-time
+   switch).
+4. **Large N is the universal limit** (Julia's 100, Rust's stack overflows). The cap must be
+   measured and the switch to a heap representation must be priced where it happens.
+5. **Hidden copies are the universal complaint** (Go, C#, Swift CoW). VL's model has two kinds
+   of copy (a boxed rebuild, a whole read of an inline field into locals); §6 bounds both and
+   §5.16 hints the expensive one.
+6. **Length generics are optional.** Go and C# ship without them and are usable; Rust and Swift
+   added them years after the type.
 
 ---
 
-## 4. Decisions
+## 4. The unified model
 
-Each decision gives its options with code, the analysis, and a recommendation. §8 repeats them
-as one question each, ordered by dependency.
+### 4.1 One type
 
-### F1. Value or reference semantics
+`T[N]` is a value of N elements of type `T`, where N is a positive integer literal or a
+`const` bound to one. It is **immutable** and has **no identity**: VL has no reference
+equality, so nothing can tell two equal `T[N]` values apart, or tell a copy from a share.
 
-```vl
-let a: f64[16] = [0.0; 16]
-let b = a
-b[0] = 1.0
-print(a[0])          // value: 0    reference: 1
-```
+### 4.2 One rewrite: element assignment replaces the whole value
 
-* **(a) Value.** Assignment, passing, returning and storing all copy. An element write changes
-  only the variable written. No other name can observe the array, so whether it lives in 16
-  locals, 16 struct fields or a box is unobservable and may differ per position. That freedom
-  is what F7 and F14 spend.
-* **(b) Reference with a fixed length.** This is the header-less GC array that §VL.7 already
-  plans to infer. Removing the allocation then needs escape analysis, which is option B, the
-  one the owner declined.
-* **(c) Immutable value.** No `a[i] = v`; the update is `a.with(i, v)`, as `std:simd`'s
-  `withLane`. That is sound for free, but matrix code writes elements in loops (`m4Invert`,
-  `jittered`, every `…Into`).
+`p[i] = v`, where `p` is an assignable **place**, means `p = p.with(i, v)`. `p` is assignable
+exactly where `p = e` would be: a `let` binding, a parameter, a loop variable, a record field,
+a list element, a module global. Compound forms nest: `p[i][j] = v` is
+`p[i] = p[i].with(j, v)`, which is `p = p.with(i, p[i].with(j, v))`. `+=` and friends rewrite
+the same way.
 
-**Recommendation: (a).** This needs the owner to override `collections-design.md` §VL.6/§OQ.2
-for this type (A5). The argument for the exception is that VL already has one value aggregate
-(`F32x4`), and that this type is a numeric aggregate rather than a collection. The cost is
-that every path that moves references today must copy (F7's copy invariant), and that the
-`…Into` idiom needs a replacement (F5′, Q7).
+Everything else follows from existing rules about `=`:
 
-### F2. Type spelling, nesting order, and how N is written
-
-```vl
-let m: f64[16] = …        // (a) suffix, the T[] family
-let m: [f64; 16] = …      // (b) Rust
-let m: Fixed<f64, 16> = … // (c) a generic name with a value argument
-const SIZE = 16
-let m: f64[SIZE] = …      // N as a named const
-```
-
-* **(a)** reads as a member of the existing `T[]` family: `f64[16][]` is a list of matrices, and
-  sunpa's `g: f64[][]` becomes `g: f64[16][]`. In type position `[` followed by an integer is
-  free (A13). `x as f64[16]` is a cast. Indexing a cast result needs parentheses, as it does today.
-* **(b)** is a second bracket grammar beside `T[]`, and `[f64; 16][]` mixes the two.
-* **(c)** needs const generics (roadmap A10, not built).
-
-**Nesting order.** VL's `T[][]` composes from the inside out: `i32[][]` is a list of `i32[]`,
-and `readonly T[][]` binds the outermost, last suffix. With (a), `f64[3][4]` is four `f64[3]`,
-and `m[i][j]` has `i < 4`, `j < 3`. That is the reverse of C, Java and GLSL, and the same as
-Rust's `[[f64; 3]; 4]`. C order would make `f64[16][]` mean "16 lists".
-
-**N as a name.** `f64[SIZE]` and `[0.0; SIZE]` accept an identifier, which must resolve to a
-module-level or enclosing `const` bound to an integer literal (or to a const-arithmetic
-initialiser under the 2026-09-30 exact-const ruling). The parser accepts an integer literal or
-an identifier inside the brackets, and the checker resolves the identifier to a positive
-integer. Anything else (a `let`, a parameter, a call) is a check error naming the rule.
-
-**Recommendation: (a), composing inside-out like `T[]`, with N a literal or a `const`.** The
-hover and the out-of-range message name both lengths in index order (`m[i][j]: i < 4, j < 3`).
-
-### F3. Literal syntax
-
-```vl
-const id: f64[16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-let o: f64[16] = [0.0; 16]      // fill: value; length
-let o = filled(16, 0.0)         // stays f64[] (a list): filled's length is a runtime i32
-const r = [rand(); 4]           // rand() runs ONCE; the hint below fires
-```
-
-* A **list literal of exactly N elements in a `T[N]` position** is built as `T[N]`, the record
-  covariance ruling's "a fresh literal adopts its destination". A literal of the wrong length is
-  a check error naming both lengths.
-* **Fill `[v; N]`** evaluates `v` once and copies it N times, as Rust does. For scalar elements
-  that is unobservable unless `v` has an effect. A **lint hint** (`fill-evaluates-once`) fires
-  when `v` contains a call, naming `[f(), f(), f(), f()]` or a loop as the spelling for N calls.
-* `;` separates statements elsewhere, but inside `[` … `]` it is currently an error (A13), so
-  there is no clash. The formatter keeps `[0.0; 16]` on one line and never re-spells it.
-
-**Recommendation:** exact-length literals in `T[N]` positions, plus `[v; N]` with the hint.
-
-### F4. Element types
-
-```vl
-f64[16]  f32[16]  i32[4]  i64[2]  boolean[8]   // (a) scalars
-f64[4][4]                                       // nested
-V3[4]   string[3]   (i32 | f64)[2]   u8[16]     // later, each additive
-```
-
-* **(a) Numeric scalars, `boolean` and nested fixed arrays.** Every element is a wasm value type.
-* **(b) Any type.** Go and Swift allow it with shallow copies: `V3[4]` copies four references and
-  the records stay shared. That is "value" in name only, and it multiplies the position matrix
-  by every element representation.
-* **`u8`** is storage-only (owner ruling 2026-08-22). As a value in i32 locals every write would
-  truncate. That is coherent, but no consumer asks for it yet.
-
-**Recommendation: (a) for v1.** Every refused element type gets a message naming the supported
-set, graded one member per row before it ships (CLAUDE.md).
-
-### F5. `const` fixed arrays
-
-```vl
-const m: f64[16] = [0.0; 16]
-m[0] = 1.0                       // refused: m is a constant value
-```
-
-For a value, `const` means the value is fixed, as `const n = 3; n += 1` is refused. A `const`
-list is element-writable (A12) because the binding, not the list, is constant. Under F1(a)
-there is no separate object to be mutable. **Recommendation:** refuse, with a message that says
-a fixed array is a value and to use `let`.
-
-### F5′. Dead writes, and place versus value expressions
-
-Revision 1 refused element writes to a parameter. That was too narrow (a parameter is only one
-way to hold a copy) and too broad (a parameter edited and then read is a legitimate local
-edit). It is replaced by a general rule.
-
-**Place and value expressions.** A **place** names storage that outlives the expression:
-
-* a binding (`m`), a field of any record-valued expression (`sk.root`, `f().root`: a record is
-  a reference, so the field's storage is the record's);
-* an element of a list-valued expression (`g[b]`: a list is a reference);
-* an element of a fixed-array **place** (`m[i]`, `sk.root[i]`, `g[b][k]`).
-
-Every other expression is a **value**: a call result (`f()`), an `if`/`match`/`??` result, a
-literal, `as`, and an element of a fixed-array **value** (`f()[0]`). An assignment target must
-be a place. The new rule is that **an element write whose root is a fixed-array value, not a
-place, is a check error**:
-
-```vl
-f()[0] = 2.0                 // error: f() returns a fixed array, a value; nothing can read this write
-(if c { a } else { b })[0] = 1.0   // error, the same
-```
-
-**Dead writes.** A write to a place whose root binding is a COPY that no later code reads is
-almost always a port of a reference-list idiom:
-
-```vl
-function m4MulInto(r: f64[16], a: f64[16], b: f64[16]) { r[0] = a[0] * b[0] }   // r never read
-for m in g { m[0] = 9.0 }                                        // g: f64[16][]; m is a copy
-let r = s.root
-r[0] = 7.0                                                       // s.root unchanged; r unread
-```
-
-**Rule:** an element write to a fixed-array binding that is a parameter, a `for` variable, or a
-`let` whose initialiser is a place, and after which the binding is never read (a closure
-capturing it counts as a read), is a **check error**: "this writes a copy of … that is never
-read; write the original (`g[i][0] = …`), return the result, or …" (the last clause follows
-Q7's answer). This is per-binding liveness inside one function, which the checker can compute.
-Writes followed by reads are untouched, so a parameter used as a scratch copy is fine.
-
-**Recommendation:** both rules as errors. Rationale: each refused program computes nothing
-observable, and every refused shape compiles today with list semantics and does something
-(A12), so a silent port is a wrong result rather than a slow one. A warning would let it through.
-
-### F6. Non-constant indexing
-
-```vl
-function trace(m: f64[16]): f64 { m[0] + m[5] + m[10] + m[15] }       // constant: local.get
-function col(m: f64[16], c: i32): f64 { m[c * 4] }                    // dynamic: br_table
-for k in 0 until 4 { s = s + a[k * 4 + r] * b[c * 4 + k] }            // constant after unrolling
-m[16]                                                                 // constant, out of range: check error
-const K = 20
-m[K]                                                                  // `const`: check error
-for k in 0 until 20 { s += m[k] }                                     // run-time trap at k = 16, as lists
-```
-
-**Semantics (a).** Any `i32` index. Out of range traps, as `l[i]` does on a list. **"Constant",
-for the check error, means a source integer literal or an identifier bound to a `const` integer
-literal**, and nothing derived by the optimiser. The error is raised once, at the indexing
-expression's source position, never per monomorphized instance or unrolled copy. A range
-variable is not "constant" for the error, even when the loop unrolls. It traps at run time,
-exactly as lists do today (A17), so the check never depends on an unroll budget. Clamping (as
-WGSL does) and static-proof-only indexing (as SIMD's `Lane4`) are the rejected options.
-
-**Lowering (revised).** Revision 1 moved any binding with a dynamic index to a heap box. That
-brings **garbage** back (one allocation per binding per call: `pk_box` makes 124 scavenges per
-10^6 calls), not only slowness, so it is withdrawn. Measured per dynamic read of a 16-f64 value
-held in locals (§6):
-
-| lowering | V8 ns per read | wasmtime ns per read | allocates |
-| --- | --: | --: | --- |
-| `br_table` over the locals | ~2.1 | ~1.0 | no |
-| store 16 locals to a linear-memory scratch, then `f64.load` | ~2.6 | ~3.7 | no |
-| build a heap box, `array.get` | ~6.7 | ~23.6 | **yes** |
-
-**The `br_table` select is the lowering**, for reads and writes alike. Writes go through a
-`br_table` to `local.set`. It never allocates and never changes the binding's representation,
-so there is no cliff to garbage and nothing for the checker and the emitter to disagree about.
-The linear-memory scratch was considered and declined. It needs a memory in modules that have
-none, a fixed scratch address is unsafe under `--shared-memory` (two instances share it), and it
-is slower than the switch on both engines. A loop that indexes densely with dynamic indices
-pays about 2.3 ns per access: `g_brtable`, the triple loop with no unrolling, takes 229 ms
-against 82 ms unrolled on V8. That is the price the unroller exists to remove.
-
-**Unrolling: which vetoes F6/F12 override.** The unroller's five vetoes (A3), and the rule for a
-loop that indexes a locals-held fixed array with its range variable:
-
-| veto | override? | why |
+| program | why | result |
 | --- | --- | --- |
-| over 16 trips or 640 nodes | **yes**, up to a separate cap (proposed 64 trips, 4,096 nodes, measured in S1) | budget, not semantics. sunpa's 4x4x4 nest is 64 inner bodies |
-| the body writes the loop variable | no | the next trip steps from the written value |
-| the body holds a function | no | per-iteration capture (D2339) would change |
-| a call that is not an inline memory intrinsic | no | the run-once/hot heuristics (DECISIONS.md) |
-| a step would wrap | no | the rolled loop never ends and must not start ending |
+| `const m: f64[16] = …; m[0] = 1.0` | `m = …` is refused for a `const` | refused, the `const` message |
+| `f()[0] = 2.0` | `f() = …` is not a place | refused, "not assignable" |
+| `sk.root[12] = 1.0` | `sk.root = …` is a field write | writes `sk`'s field, seen by every name for `sk` |
+| `g[j][k] = x` with `g: f64[16][]` | `g[j] = …` is a list element write | writes the list |
+| `g[j][k] = x` with `g: readonly f64[16][]` | `g[j] = …` is refused through `readonly` | refused |
+| `let b = a; b[0] = 1.0` | `b = …` rebinds `b` only | `a` unchanged |
+| `const h = () => m[0]; m[0] = 1.0; h()` | an assignment to a captured variable (D2339) | `1.0` |
 
-Every declined loop falls back to `br_table` indices: correct, allocation-free, and about 2 ns
-slower per access.
+There is no special rule for any of these rows; that is the point of defining the update as a
+rewrite.
 
-**Two producers.** A `vl check` performance hint ("`m[c * 4]` is not constant: each access is a
-switch") must agree with the emitter, so **one predicate decides both**: an index is "static" if
-it is a literal, a `const`, or a range variable of a loop whose bounds are constants and that
-none of the four semantic vetoes blocks, combined with `+ - *` over constants. The emitter
-unrolls exactly the loops that predicate names (the budget override makes that total), and the
-hint fires exactly where it says no. One function, called from both, so they cannot disagree.
+### 4.3 Storable everywhere; placement by position
 
-**Recommendation:** semantics (a). The lowering is `br_table` for every non-static index, the
-override table above, and one shared predicate.
+| tier | positions | placement | constant-index read / write | dynamic read / write | whole read | whole write |
+| --- | --- | --- | --- | --- | --- | --- |
+| **value** | `let`, `const`, parameter, result, `if`/`match` value, captured-and-never-reassigned | N locals; N params; N multi-value results | `local.get` / `local.set` | `br_table` | N moves | N moves |
+| **record field** | `type R = { m: T[N] }` | inline: N struct fields | `struct.get` / `struct.set` | `br_table` over the fields | N `struct.get` | N `struct.set` |
+| **list element** | `T[N][]` | flattened: one backing of N·len, stride N | `array.get` / `array.set` at `j*N + k` | the same (index arithmetic, no `br_table`) | N `array.get` | N `array.set` |
+| **global** | module `let` | N wasm globals | `global.get` / `global.set` | `br_table` | N | N |
+| **boxed** | map value, union member, `T[N] \| null`, a captured cell that is reassigned, a uniform generic slot, any value past the size cap | an immutable `(array T)` of N, shared, never copied on delivery | `array.get` / **rebuild** | `array.get` / **rebuild** | 1 reference | 1 reference (or one allocation if the source is unboxed) |
+| **linear memory** | a field of a `flat type` | N elements at `Type.field + k * size(T)` | load / store through `std:buffer` | the same | N loads | N stores |
 
-### F7. Storage, and the copy invariant
+The placement of a value is a property of where it is **stored**, never of its type, and it is
+unobservable: every row above implements the same value semantics. That is what lets each
+placement land in its own build slice (§6.7) without any program changing meaning.
 
-```vl
-type Skeleton = { count: i32, root: f64[16] }   // field
-let g: f64[16][] = []                            // list of matrices
-let byName: {[string]: f64[16]} = Map()          // map value
-let viewProj: f64[16] = [0.0; 16]                // module global
-sk.root[12] = 1.0                                // element write in place (sk is a reference)
-const r = sk.root                                // whole read: a copy
-sk.root = m4Mul(a, b)                            // whole write: copied into the existing box
-```
+### 4.4 What is NOT in the model
 
-**Representations.**
+* No reference to a `T[N]`, no `inout`, no `&`. A function that "fills a caller's matrix"
+  returns it (§5.13).
+* No length generics, no const-generic syntax (§5.10).
+* No element-wise arithmetic (`a + b` over arrays). That is a std or SIMD question for later.
+* No printing, hashing or map keys in v1 (§5.5).
 
-| position | representation |
-| --- | --- |
-| local, parameter, result (within F10's per-signature budget) | N wasm locals, parameters or results |
-| `T[N] \| null` local | N locals plus an i32 present flag (so a map read does not allocate) |
-| record field, map value, list element (v1), shared capture cell, union member, value past the budget | an **owned box**: one `(array mut T)` of exactly N |
-| module global | N wasm globals within the budget; a box past it |
-| list `T[N][]` (later) | flattened: one `(array mut T)` of N·len, stride N |
+---
 
-**The copy invariant.** *An owned box is reachable from exactly one slot. Every delivery INTO a
-box-held destination either copies the source's elements into that destination's existing box,
-or allocates a fresh box, unless the source is provably dead after the delivery (a fresh
-literal, a call result, or the last use of a local).* Today's paths that move a reference
-instead, all of which must copy when the element type is a fixed array:
+## 5. Semantics and typing
 
-| path | today, for a list element | must become |
-| --- | --- | --- |
-| list spread `[...g]`, `slice`, `concat`, `filter`, `sorted`, `reverse`, `map(x => x)` | shallow: shares inner lists (measured for spread) | one box per element copied (flattened lists: one `array.copy`) |
-| narrowing a nullable (`if n != null { g.push(n) }`) | keeps the reference (measured: two pushes share one list) | the push copies |
-| generic pins (`id<T>`, `first<T>`, `dup<T>` at a box-held `T`) | returns the same reference (measured) | the instance copies at the box boundary |
-| record spread `{ ...rec, m }` (SP-032, ruled) | not parsed yet (A19) | deep-copies fixed fields |
-| `??` / `if` / `match` yielding a value past the budget | passes the reference | allocates a box, unless the operand is dead |
-| a parameter past the budget, passed as a box | the callee could BORROW the caller's box | **copy on pass**, unless the callee provably cannot observe a write to the source while it runs |
-| `for m in g` (box-held elements) | `m` is the element | `m` reads the element's values into locals (no allocation within the budget) |
+### 5.1 The type and its spelling
 
-The borrowed-parameter row is the subtle one. With a box-held `big: f64[64]` captured by a
-closure that writes it, a callee that borrowed the caller's box would see the write:
+`f64[16]` extends the `T[]` suffix family with a length (Q2 weighs `[f64; 16]` and
+`[16 of f64]`). Suffixes compose inside out, as `T[][]` does: `f64[16][]` is a list of
+matrices, and `f64[3][4]` is **four** `f64[3]`, so `m[i][j]` has `i < 4` and `j < 3`. That is
+Rust's order (`[[f64; 3]; 4]`) and the reverse of C's. `readonly` binds the outermost suffix,
+as today. N may be a name (`f64[SIZE]`) when it resolves to a module-level or enclosing
+`const` whose value is a positive integer literal or exact const arithmetic (owner ruling,
+2026-09-30); anything else is a check error naming the rule. `T[0]` is refused.
 
-```vl
-let big: f64[64] = [0.0; 64]
-const poke = () => { big[0] = 1.0 }
-function f(x: f64[64], k: () => void): f64 { k(); x[0] }   // must print 0: x is a copy
-print(f(big, poke))
-```
+### 5.2 Literals and adoption
 
-So a box-held parameter is copied on pass. Borrowing is an optimisation for later that needs a
-no-write proof (no capture of the source is written, and nothing the callee calls can reach
-it).
+A list literal of exactly N elements in a `T[N]` position builds a `T[N]`; a wrong length is a
+check error naming both lengths. Elements adapt as scalars do: `const v: f64[3] = [1, 2, 3]`
+is `[1.0, 2.0, 3.0]`, a runtime `i32` element converts to `f64`, and an `i64` element into
+`f64` is refused with an `as` fix (the numeric lattice).
 
-**What "allocation-free" covers.** Zero garbage holds **only for values held in locals**:
-locals, parameters and results within the budget, and the `T[N] | null` flag form. Storage
-positions allocate:
-
-| operation | allocations |
-| --- | --- |
-| create a record with a fixed field | +1 box per fixed field, once |
-| `sk.root = m` (overwrite) | 0: copied into the existing box |
-| `g.push(m)` (boxed elements, v1) | +1 box per push (0 once lists are flattened) |
-| `byName.set(k, m)` on a new key / an existing key | +1 / 0 |
-| `byName[k]` read | 0: copied into N locals plus a flag |
-| `[...g]` | +1 box per element (v1) |
-| a box-held value past the budget passed, returned or joined | +1 per copy |
-
-sunpa's per-frame code (products, inverses, projections) lives in locals and allocates
-nothing. Its per-bone list `g` allocates once per bone at creation in v1, and once per list
-when flattened.
-
-**Grading requirement.** Every position-matrix template for this type carries an **aliasing
-proof** in both directions: write through the destination and read the source, then write the
-source and read the destination, each printing a value that shows the two are independent.
-"Runs" without that proof does not grade a copy.
-
-**Recommendation:** the representations and the invariant above. Inline record fields (N struct
-fields) and flattened lists are later representation changes, which value semantics allow
-without any program noticing.
-
-### F8. Conversion to and from `T[]`
+**Adoption (D3339 style).** A binding whose initialiser is only a literal, and whose uses
+include a delivery to a `T[N]` type, **adopts** that type at the declaration, and every use
+sees it:
 
 ```vl
-const xs: f64[] = m as f64[]            // (a) out: infallible, a fresh list
-const xs2: f64[] = m.toList()           // (b) out: a built-in method
-const m2: f64[16] = xs as! f64[16]      // in: trap on a length mismatch
-const m3 = xs as? f64[16]               // in: f64[16] | null
-put(buf, 0, m)                          // put(…, vs: f64[]): refused; the message names both fixes
+const p = [1.0, 2.0, 3.0]
+takesV3(p)                 // takesV3(v: f64[3]): p is f64[3] everywhere
+const u = [1.0, 2.0]
+u.push(3.0)
+takesV2(u)                 // error naming both uses: `push` needs a list, `takesV2` a f64[2]
 ```
 
-* **Out.** Implicit conversion is refused, like every container widening today (A16). It would
-  allocate silently and, into a mutable `T[]`, change aliasing silently. The record covariance
-  ruling refused copy-on-delivery for that reason. For the explicit form, the owner's corollary
-  "when a proposed name is an operator the language already has, spelled as a function, the
-  answer is the operator" favours **`m as f64[]`**. It is infallible: bare `as` never yields
-  null here because nothing can fail. `toList()` is the function spelling the corollary argues
-  against.
-* **In.** A length mismatch is a failure, and VL's failure operator for a conversion that may
-  not hold is the `as` trio (owner ruling, 2026-09-02). Bare `as` propagates null out of the
-  enclosing function, as the numeric trio does.
-* Both directions extend `as` beyond numerics for the first time (A9).
+This is the record covariance ruling's "a fresh literal adopts its destination" and D3339's
+"adopts fully, every read sees it". With no fixed-array use, a literal stays a `T[]`, so no
+existing program changes type. An un-annotated `[1.0, 2.0]` passed to a `T[]` parameter is
+unaffected.
 
-**Recommendation:** `as` both ways, with no `toList`. The refusal at a `T[]` delivery names
-`m as f64[]` and the un-annotated-parameter alternative (F9).
+### 5.3 Construction beyond a literal
 
-### F9. Generics
-
-```vl
-function trace<T>(m: T[16]): T { m[0] + m[5] + m[10] + m[15] }   // generic element: yes
-function put(b: Buf, at: i32, vs) {                              // length via inference
-  for i in 0 until vs.length { storeF32(b, (at + i) * 4, vs[i] as f32) }
-}
-function sum<const N>(vs: f64[N]): f64 { … }                     // const generics: later (A10)
-```
-
-* **(a) No length polymorphism.** Every `T[N]` has a literal N, which is Go's position.
-* **(b) Length polymorphism through un-annotated parameters.** This is **not free today** (A6).
-  `for v in vs` over an un-annotated parameter is refused, and instances are keyed per element
-  type only. Building (b) means: (1) the for-in hole fixed for un-annotated parameters; (2)
-  **instances keyed per (element type, length)**, with `.length` a constant and `for` unrolled
-  in each. The price is one instance per distinct length per function, so sunpa's `put` over 3,
-  4 and 16 becomes three instances. Code size grows linearly in distinct lengths, and the
-  mono grid (`scripts/mono-tyaram-grid.sh`) needs a length axis.
-* **The instantiation-time refusal gap.** An un-annotated body that is legal for `f64[]` and
-  not for `f64[16]` (`vs.push(x)`, `vs = []`) is discovered only when an instance with a fixed
-  array is made. The refusal must name the instance and the call that made it ("`put` called
-  with `f64[16]` at view.vl:955: `push` on a fixed array"), and the checker must raise it at the
-  CALL, not lose it at a monomorphization pin. CLAUDE.md records eleven check rejects that were
-  lost exactly that way.
-* **(c) Const generics** (roadmap A10, not built). They are the general answer, to be designed
-  for `Decimal<10, 8>` too.
-
-**Recommendation: generic element types plus (b) in v1**, priced as above, with (c) left to A10.
-
-### F10. Size: a per-signature budget, not a type limit
-
-```vl
-let m: f64[16]          // 16 locals
-let big: f64[1024]      // a box; `=` is an array.copy
-function f(a: f64[16], b: f64[16], c: f64[16], d: f64[16], e: f64[16]): f64[16]   // 80 parameter slots
-```
-
-* **No limit in the language** (Rust, Go, Zig, Swift); N ≥ 1. `T[0]` has no use and would add a
-  zero-length case to every lowering.
-* **Per value:** an array of at most **16 scalar slots** is held in locals. Past that it is
-  boxed everywhere, so `f64[17]` is a box. A `vl check` **hint at the declaration** names the
-  17-slot cliff ("`f64[17]` is past 16 slots and lives on the heap: copies allocate").
-* **Per signature** (A8: 1,000 parameters is a hard engine limit). A function TYPE flattens its
-  fixed-array parameters left to right while the running total stays at or under **64 parameter
-  slots**. The rest pass as boxes, copied on pass (F7). Its result flattens if it fits in **16
-  result slots**, and is returned as a box otherwise. The budget is a function of the TYPE
-  alone, never of the body, so a closure value, a `call_ref` site and a direct call of the same
-  type agree on one wasm function type. Generic instances compute it per instance type.
-* All three constants are lowering constants, measured and recorded in DECISIONS.md like the
-  unroll budget, and are not part of the type system.
-
-**Recommendation:** as above.
-
-### F10′. The entry-module export ABI
-
-```vl
-export function viewProjection(): f64[16] { … }       // in the entry module: a wasm export
-```
-
-An ABI chosen for a host is permanent. Options: (a) **refused in v1** at entry-module export
-signatures, with a message naming `as f64[]` or a `Buf`; (b) always flattened (N numbers in,
-an Array of N out in JavaScript, which is asymmetric and breaks past 1,000); (c) always a boxed
-`(array f64)`, symmetric and stable, which JavaScript can read through the GC JS API.
-**Recommendation: (a)** until a consumer asks. sunpa's host reads linear memory.
-
-### F11. Equality and printing
-
-```vl
-a == b                 // elementwise ==, like lists and records (A11)
-print(m)               // refused, like lists and records
-```
-
-Elementwise `==` with each element's own `==` (`NaN != NaN`, `-0.0 == 0.0`) matches lists
-(measured, A11). Printing and holes are refused with the list message plus a hint naming
-`m[i]`. Aggregate printing is a separate ruling for all aggregates. There is no hashing in v1,
-so a fixed array cannot be a map key.
-
-### F12. Iteration
-
-```vl
-for x in m { s += x }                                  // value per element
-for x, i in m { if i < 15 { m[i + 1] = 0.0 }; s += x } // iterates the ORIGINAL values
-```
-
-Within the budget, `m` is held in locals and the loop has N trips, so it is unrolled (F6's
-override). Past the budget it stays a loop over the box. **The loop iterates the value `m` held
-when it began** (Go's rule for a range over an array). A `T[]` leaves mutation during iteration
-unspecified. This is the one place value semantics show in a loop.
-
-**The snapshot is not free.** If the body can write `m` (directly, or through a closure that
-captured it), the loop must iterate a copy:
-
-| `m` held in | body does not write `m` | body writes `m` |
-| --- | --- | --- |
-| locals (within the budget, unrolled) | 0 | up to N extra locals, read before the first write (register pressure, no allocation) |
-| a box (a field `for x in sk.root`, or past the budget) | 0 | **one allocation per loop entry** (an N-element copy) |
-
-The compiler proves "does not write" by the same per-function write scan F5′ uses, and a call
-the body makes that might reach `m` (through a captured box, or a record field that a callee can
-write) counts as a write.
-
-**Recommendation:** the snapshot rule, documented with the cost table.
-
-### F13. Closure capture
+Recommended (Q4): the fill `[v; N]`, which evaluates `v` once, plus element writes, which are
+free in the value tier:
 
 ```vl
 let m: f64[16] = [0.0; 16]
-const f = () => m[0]
-m[0] = 1.0
-print(f())     // 1: captured by reference (D2339)
+for i in 0 until 4 { m[i * 5] = 1.0 }          // unrolled: four local.set
+const z: f32[64] = [0.0; 64]
 ```
 
-D2339's rule applies unchanged, with an element write counting as an assignment. A captured
-array never assigned after capture is copied into the environment (N fields within the budget,
-else a box). One assigned after capture lives in a shared box both scopes index, which is the
-one owned box with two readers, and is sound because both readers are the same variable.
+A lint hint (`fill-evaluates-once`) fires when `v` contains a call. A generator
+(`f64[16].from((i) => …)`) is the alternative Q4 weighs; it needs a type in expression
+position, which VL has nowhere else, and an unroll-and-inline guarantee for its closure.
 
-### F14. How it lowers
+`[...a, ...b]` is a literal whose length is known when every spread operand is a `T[N]`, so
+`const h: f64[4] = [...v3, 1.0]` is legal (homogeneous coordinates). A spread of a `T[]`
+operand has a run-time length and is refused in a `T[N]` position, naming `as!`.
 
-| position | proposed (L1: the compiler emits it) | alternative (L2: immutable struct, then the `-O` steps) |
-| --- | --- | --- |
-| local | N wasm locals; a constant index is `local.get`/`local.set`; a dynamic one is a `br_table` | an immutable struct; a write makes a new one; Heap2Local melts what it can |
-| parameter, result | N parameters, N multi-value results (F10's budget) | one struct reference; D3625's step twins it if the bound allows |
-| `if`/`match` value | N result locals written in each arm | a struct |
-| field, list, map, global | §F7 | struct references |
-
-* **L1** gives "no heap" at every rung, `-O0` included, as a property of the type. It is **VL's
-  first value spanning several wasm values** (A15), and it needs multi-result function types in
-  the compiler's emitter, which emits none today.
-* **L2** reuses D3625's step and Heap2Local, but its "no allocation" is an optimiser outcome,
-  bounded at 8 fields today. That is option B. Measured (§6): the struct form keeps 124
-  scavenges per 10^6 products after `wasm-opt -O3`, and on wasmtime 47 it takes 125 ms against
-  L1's 89 ms.
-* The host step must tolerate L1's modules (A18, to be fixture-tested in S1).
-
-**Recommendation: L1.**
-
-### F15. Interaction with the numeric-join and literal rulings
+### 5.4 Conversion: `as` both ways
 
 ```vl
-const v: f64[3] = [1, 2, 3]       // literals adapt: [1.0, 2.0, 3.0]
-const w: f64[3] = [i, y, z]       // i: i32, y: f64. Each element converts if exact: i32 → f64 ok
-const q: f64[2] = [n64, y]        // n64: i64. Refused: i64 → f64 is not exact; the message names `as`
-const p = [1.0, 2.0, 3.0]
-takesFixed(p)                     // p holds only a literal: adopts f64[3] (see below)
-const s = { root: [1.0, 2.0] }
-const t: { root: f64[2] } = s     // s holds only literals: adopts { root: f64[2] } (D3339)
-const u = [1.0, 2.0]
-u.push(3.0)
-takesFixed2(u)                    // conflict: a growing use and a fixed delivery. Error naming both
+const xs: f64[] = m as f64[]          // out: infallible, a fresh list
+const m2: f64[16] = xs as! f64[16]    // in: traps on a length mismatch
+const m3 = xs as? f64[16]             // f64[16] | null
 ```
 
-* **Literals adapt** elementwise (owner, 2026-09-30).
-* **Runtime numerics** converge per element by the union-delivery rule: exact for every member
-  or refused with an `as` fix.
-* **Literal-only bindings adopt the destination.** Revision 1 refused `takesFixed(p)` and asked
-  for an annotation. That contradicted three rulings at once: the record covariance ruling (a
-  binding holding only a literal adopts its destination), **D3339** (owner ruling (A): such a
-  binding adopts the destination fully, and every read sees it, even when that changes a
-  field's width), and the numeric-join ruling's "no required annotations". The consistent rule:
-  a `let` or `const` whose initialiser is only literals (a list literal, or a record literal
-  whose fields are) and whose uses include a delivery to a fixed-array type **adopts that type**
-  at the declaration. Every use then sees the fixed array. A use that the fixed type cannot
-  serve (a `push`, a delivery to `T[]` or to a different length) is a **check error naming both
-  uses**, the "conflicting uses" clause of the literal-binding ruling (B′).
-* **No per-use typing for `const` aggregates.** Revision 1 stretched ruling C (a literal `const`
-  is typed per use) to arrays. For a `const` list that is unsound: a `const` list is
-  element-writable and shared (A12), so building it separately at each use would split one list
-  into several. Ruling C is about scalars, and a `const` aggregate follows the adoption rule
-  above instead.
+`as` checks the LENGTH only; element types must already match (`[1.5] as! i32[1]` is refused,
+not converted). Bare `as` propagates null as the numeric trio does. This extends `as` beyond
+numbers for the first time (A9), which is the owner's corollary "when a proposed name is an
+operator the language already has, spelled as a function, the answer is the operator", over a
+`toList()` method. There is no implicit conversion either way: a `T[N]` delivered to a `T[]`
+parameter is refused with both fixes named (`as f64[]`, or an un-annotated parameter).
 
-### F16. std additions
+### 5.5 Equality, printing, hashing
 
-None. The surface is built in: `.length` (a constant), indexing, `==`, `for`, `as` and `[v; N]`.
-A `std:mat` is a large speculative surface with no deprecation story. `map`/`fold` over `T[N]`
-wait for const generics (A10). Any later std export goes through `std-api-reviewer`.
+`a == b` is element-wise, with each element's own `==` (`NaN != NaN`, `-0.0 == 0.0`), exactly
+as lists and records compare today (A11). `print(m)` and template holes refuse a `T[N]` with
+the list message, naming `m[i]`; aggregate printing is a separate decision for all
+aggregates. A `T[N]` is not a map key in v1 (Go allows it; it is additive later).
 
-### F17. Joins, element conversion, `is`, and `as` over elements
+### 5.6 Iteration
+
+`for x in m` and `for x, i in m` evaluate `m` once and iterate that value. A write to `m` in
+the body rebinds `m` and does not change the iteration: this is not an extra rule, it is what
+"`m` is a value" means. Over a locals-held `m` with constant N the loop unrolls; a body that
+writes `m` costs at most N extra locals (the snapshot), never an allocation. Over an inline
+field (`for x in sk.root`) the loop reads the field's elements as it goes when the body
+cannot write `sk.root`, and snapshots them into locals when it can.
+
+### 5.7 `.length`
+
+A compile-time constant `i32`. `for i in 0 until m.length` therefore has constant bounds and
+unrolls under the existing rule.
+
+### 5.8 Indexing
+
+Any `i32` index. Out of range traps, as a list does. A **constant** out-of-range index (a
+literal or a `const`, at the source position) is a check error, raised once per source
+position and never per instance or unrolled copy. A range variable is not "constant" for this
+rule even when its loop unrolls, so the check never depends on an unroll budget; it traps at
+run time exactly as lists do today.
+
+### 5.9 Element types
+
+Recommended v1 (Q3):
+
+* **Numbers**: `i32`, `i64`, `f32`, `f64`, `u32`/`u64` once they exist.
+* **`u8`**, under `u8[]`'s existing rule: packed in storage (`(mut i8)` struct fields, an
+  `(array (mut i8))` backing, one byte in a `flat` layout), an `i32` when read, and a
+  computed store keeps the low byte while an out-of-range literal is a check error
+  (`collections-design.md`, "u8 is an ELEMENT type only"). In the value tier a `u8[4]` is four
+  `i32` locals, and every write masks to the low byte, so the storage still enforces the range
+  the type claims (the owner's "a type must not claim a range it does not enforce").
+* **`boolean`**, except in a `flat` field (flat refuses `boolean` for its own reason).
+* **Nested fixed arrays**: `f64[4][4]`, placed recursively (16 locals, 16 fields, stride 16).
+* **Numeric records** (`type V3 = { x: f64, y: f64, z: f64 }`, every field a number,
+  `boolean`, `u8` or nested such record): stored **by field** (`V3[4]` is 12 slots in every
+  placement), copied in on a write and copied out on a read. `const v = a[0]` is a fresh `V3`;
+  `v.x = 1.0` does not change `a`; `a[0].x = 1.0` does, through the rewrite
+  (`a = a.with(0, { ...a[0], x: 1.0 })`). A copied-out record that is only read field by field
+  never allocates at `-O`, through the existing multi-value step. A `new { … }` record keeps
+  its brand through the copy.
+* **Not in v1**: strings, lists, maps, closures, unions, nullable elements. Strings are
+  immutable and would be sound; lists and maps would make the array a value of shared mutable
+  references ("value" in name only). Both are additive later. Each refused element type gets a
+  message naming the supported set, graded one member per row before it ships (CLAUDE.md).
+
+### 5.10 Generics
+
+Element generics work as for any type: `function trace<T>(m: T[16]): T` instantiates per
+`T`. **No length generics in v1**: there is no `<const N>`. An **un-annotated parameter**
+instantiates per argument type as it always does, and `f64[3]` and `f64[16]` are different
+types, so sunpa's `put(b, at, vs)` over 3, 4 and 16 elements becomes three instances, each
+with a constant `vs.length` and an unrolled loop. That needs A6's for-in hole fixed; until
+then the index loop over `vs.length` works.
+
+An un-annotated body that is legal for `f64[]` and not for `f64[16]` (`vs.push(x)`) is found
+only when the fixed instance is made. The refusal names the instance and the call that made it
+and is raised **at the call**, never lost at a monomorphisation pin (CLAUDE.md records eleven
+check rejects lost that way).
+
+**std list functions over `T[N][]`** (`map`, `filter`, `sorted`) instantiate with `V = T[N]`
+and work on the flattened list unchanged, since the list's element accessors are the
+compiler's. std functions taking `T[]` do not accept a `T[N]`; there is no sequence interface
+in v1 (Swift made the same call for `InlineArray`, for the same reason: a generic sequence API
+over a value invites hidden copies).
+
+### 5.11 Joins, unions, nullables, implicit conversion
+
+* **Joins** of different fixed types follow the numeric-join ruling: `if c { a16f64 } else {
+  a16f32 }` is the union `f64[16] | f32[16]` (boxed members), discriminated with `is`. Lists
+  refuse such joins because a join would copy; a value is copied anyway, so that objection does
+  not apply.
+* **Element-wise implicit conversion** follows the scalar rule: `i32[2]` delivered to `f64[2]`
+  converts (exact for every element); `i64[2]` to `f64[2]` is refused with an `as` fix. Sound,
+  because there is no aliasing to break.
+* **Nullable** `T[N] | null` is boxed (null is the null reference). A narrowed read
+  (`if p != null { p[0] }`) reads the box.
+* **`is`** discriminates union members as today. There is no run-time length test on a `T[]`:
+  `xs is f64[16]` with `xs: f64[]` is refused and names `as?`.
+
+### 5.12 Closures
+
+D2339 applies unchanged, because an element write IS an assignment (§4.2). A captured array
+never reassigned after capture is copied into the closure environment (N fields within the cap,
+else a box reference). One reassigned after capture lives in a shared cell, which is boxed: its
+element writes rebuild the box (§6.5), and a hint names it.
+
+### 5.13 Out-parameters: return the value
+
+The `…Into(r, a, b)` idiom exists to avoid an allocation. Under value semantics the return
+costs none, and storing it into a place writes in place:
 
 ```vl
-const r = if c { a16f64 } else { a16f32 }  // f64[16] | f32[16]? refused?
-const r2 = if c { a3 } else { a4 }         // f64[3] | f64[4]?
-const w: f64[2] = i2                       // i2: i32[2]. Implicit elementwise i32 → f64?
-if x is f64[16] { … }                      // x: f64[16] | null, or a union
-const m = xs as! i32[4]                    // xs: f64[]. Converts elements too, or length only?
+sk.root = m4Mul(a, b)       // multi-value call, then 16 struct.set into sk's inline field
+g[j] = m4Mul(g[j], t)       // 16 array.get, the call, 16 array.set into the flattened list
 ```
 
-* **Joins of different fixed types.** Lists refuse such joins because a join would copy (A16).
-  A fixed array IS copied, so that objection does not apply. The numeric-join ruling joins
-  runtime values of different numeric types as a union. The consistent answer is a **union**,
-  `f64[16] | f32[16]` (boxed members, F7), discriminated with `is`. The alternative is refusing
-  like lists. Recommendation: union.
-* **Elementwise implicit conversion.** A scalar `i32` delivered to `f64` converts when exact. For
-  a value array the same rule per element is sound (no aliasing to break), so `i32[2]` → `f64[2]`
-  converts implicitly, and `i64[2]` → `f64[2]` is refused with an `as` fix. The alternative is
-  explicit only, like lists. Recommendation: implicit when every element's conversion is exact.
-* **`is`** discriminates union members, as today. `x is f64[16]` is legal where `x`'s type has
-  that member. There is no run-time length test on a `T[]` (`xs is f64[16]` with `xs: f64[]` is
-  refused, and `as?` is the test). Recommendation: as stated.
-* **`as` over elements.** (a) `xs as! f64[16]` checks the LENGTH only, and the element types must
-  already match. (b) It also converts each element with the numeric trio's rule (exact or fail;
-  float targets round). (c) Plus `as%` for a wrapping element conversion. Recommendation: (a)
-  in v1, with (b) additive later.
+There is no `inout` in v1. Swift's `inout`, GLSL's `out` and C#'s `ref` are the precedents if a
+consumer later needs one; each would be additive.
 
-### F18. `readonly` over fixed arrays
+### 5.14 Dead element writes
+
+A ported program that kept a list idiom compiles and computes nothing (A12):
 
 ```vl
-function draw(g: readonly f64[16][]) {
-  g[0][3] = 1.0      // refused: an element of a value element IS the list's storage
-  const m = g[0]     // fine: a copy
-}
+function m4MulInto(r: f64[16], a: f64[16], b: f64[16]) { r[0] = a[0] * b[0] }   // r is never read
+for m in g { m[0] = 9.0 }                                                        // m is a copy
 ```
 
-`readonly f64[][]` allows `g[0][3] = 1.0`, because the inner list is a separate object.
-`readonly f64[16][]` must refuse it: the fixed element is stored IN the list, so writing into it
-writes the list. The same holds for a record: `sk.root[0] = 1.0` is a write to `sk`, and any
-future read-only record view (record covariance ruling, option C) must refuse it.
+**Stated default: an element write to a parameter, a loop variable, or a `let` initialised from
+a place, after which the binding is never read, is a check error**, naming the fix ("write
+`g[i][0] = …`, or return the value"). A closure capturing the binding counts as a read. Writes
+followed by reads are untouched, so a parameter used as scratch is fine. This is per-binding
+liveness within one function. It is an error rather than a warning because every refused
+program computes nothing observable, and each one is a silent wrong result for a program ported
+from list code.
+
+### 5.15 Spread
+
+* **List spread**: `[...v3, 1.0]` contributes N elements statically (§5.3); `[...g]` over a
+  `T[N][]` copies the flattened backing with one `array.copy`.
+* **Record spread** (`docs/internals/record-spread-design.md`, PR #3377): `{ ...sk, root: m }`
+  copies a `T[N]` field like any value field. Revision 2 needed spread to deep-copy fixed
+  fields; under this model a field's value has no identity, so the shallow copy record spread
+  already does is the correct one.
+* **Call spread** into fixed parameters (`lookAt(...eye, ...target)`) is NOT in v1; it is
+  additive later and would expand N arguments statically.
+
+### 5.16 Hints
+
+Two `vl check` hints, each driven by the same predicate the emitter uses, so they cannot
+disagree (the two-producers rule):
+
+* `fixed-array-boxed-update`: an element write to a value in a **boxed** placement inside a
+  loop ("each write rebuilds the 16-element array: …").
+* `fixed-array-dynamic-index`: an index the emitter cannot make constant, on a value-tier
+  binding, in a loop ("`m[c * 4]` is a switch over 16 locals").
+
+### 5.17 Entry-module exports
+
+A `T[N]` in an entry-module export signature is refused in v1, naming `as f64[]` or a `Buf`. An
+ABI chosen for a host is permanent, and no consumer asks yet.
+
+### 5.18 The one-page explanation (for the guide)
+
+| you have | write | it is | copies |
+| --- | --- | --- | --- |
+| a growable sequence, shared between owners | `f64[]` | a list, a reference | never implicitly |
+| a small math value (vector, matrix, colour) | `f64[16]`, `u8[4]` | a value with the length in its type | always (the compiler makes it cheap) |
+| bytes, compactly | `u8[]` | a list of bytes, packed, read as `i32` | never implicitly |
+| memory a host or GPU reads in place | `Buf` (`std:buffer`) | an extent of linear memory | `storeF32` etc. copy in |
+| a byte layout inside a `Buf` | `flat type` | a record whose offsets are constants | through the `Buf` |
+| four f32 lanes in one instruction | `F32x4` (`std:simd`) | one `v128` | a value |
+
+The guide's rule of thumb: **a `T[]` is a container you share; a `T[N]` is a number with
+several parts.**
 
 ---
 
-## 5. Lowering sketch and cost
+## 6. Codegen per placement
 
-**Layers that change.**
+### 6.1 The value tier: N locals
 
-| layer | change | risk |
+A constant index is `local.get`/`local.set`. The unroller (A3) makes most matrix loops
+constant; this design adds an unroll override for loops indexing a value-tier array with the
+range variable (up to 64 trips and 4,096 nodes, measured in the build), keeping the four
+semantic vetoes. A non-constant index is a `br_table` over the N locals, for reads and writes
+(A2).
+
+**`br_table` versus spill (measured, §7.4).** A `br_table` costs about 1 ns per access on V8
+and 1.2–1.6 ns on wasmtime, flat in N, with no allocation. A mutable heap array is about 3x
+faster per access (0.3 ns) but must be allocated, which brings garbage back once per call
+(revision 2's `pk_box`: 124 scavenges per 10^6 calls). The decision: **`br_table`**, and a
+binding whose dynamic access sites would exceed a code budget (N × sites × ~18 bytes, budget
+about 4 KB per function) is demoted to a frame-private box (allocated once per call, mutated in
+place because no other name can reach it), with the `fixed-array-dynamic-index` hint naming the
+allocation.
+
+### 6.2 Parameters and results: reuse the #3372 host step
+
+Revision 2 had the emitter emit N locals and multi-value results itself, VL's first
+multi-slot representation (A15), with an audit of every one-value-one-slot site in the emitter.
+**This revision proposes the cheaper route the owner's direction names**: the emitter emits a
+value-tier `T[N]` as an immutable `(array T)` box (no `array.set` can reach that type, by
+construction), and the host's multi-value step, extended from immutable structs to immutable
+fixed arrays, scalarises it at `-O`/`-O3`:
+
+* `array.new_fixed $F N` plays the role of `struct.new`, `array.get $F` with a constant index
+  the role of `struct.get`, and `array.len` folds to N;
+* a box used only element-wise becomes N locals, a producer gets a twin returning N results,
+  and loop-carried values (`m = m4Mul(m, t)`) qualify, as they do for records today;
+* the rebuild `a.with(i, v)` is emitted as `array.new_fixed` of N gets with one replaced, which
+  the step sees as one more `struct.new` of fields;
+* a dynamic `array.get` on a scalarised box becomes the `br_table`;
+* the bound is per array (64 slots, §6.6), separate from `MV_RECORD_MAX_FIELDS = 8`.
+
+The emitter's one-value-one-slot invariant stays true. The price: **`-O0` allocates** (one
+box per rebuild), so a debug build is a correct but garbage-producing build, and the "no
+heap" guarantee is a property of `-O`, not of the type. Revision 2's hand-written lowering of
+exactly what the step would produce (`e_mvg`) is the measurement (§7.1). If the step declines
+a function (a `br_table` exit, a growth bound), the program still runs, with boxes.
+
+### 6.3 Record fields: inline
+
+The emitter lays a `T[N]` field out as N struct fields (`(mut f64)` × 16; `(mut i8)` × 4 for a
+`u8[4]`). A constant-index element write is one `struct.set`; a dynamic one is a `br_table`
+over the fields (§7.2: about 0.6 ns per access slower than an array on V8, 0.3 on wasmtime). A
+whole read (`const p = sk.root`) is N `struct.get` into the value tier; a whole write
+(`sk.root = m4Mul(a, b)`) is N `struct.set` from the call's results. No box is ever made for
+a field. Revision 2's "owned box per field" and its copy invariant are gone: there is nothing
+for a second name to reach.
+
+### 6.4 List elements: flattened
+
+`T[N][]` is a list whose backing is one `(array (mut T))` of N·capacity, stride N, with the
+list header holding the element count. `g[j]` reads N elements at `j*N`; `g[j] = v` writes N;
+`g[j][k] = x` is one `array.set` at `j*N + k`, with **no `br_table` even for a dynamic `k`**.
+`push` appends N; `pop` reads N; `[...g]`, `slice` and `concat` are one `array.copy`.
+**The bounds check is per element access, not per scalar**: check `j < len` once, then `k < N`
+statically or once. Today's VL codegen for a hand-flattened `f64[]` re-checks the header on
+every `g[b + k]` and so runs *slower* than `f64[][]` in cache (§7.3); the flattened lowering
+must not inherit that.
+
+### 6.5 Boxed placements: immutable, shared, rebuilt on write
+
+A map value, union member, nullable, reassigned capture cell, a value past the cap, and any
+generic slot VL keeps uniform hold an immutable `(array T)`. Because it is immutable it is
+**shared, never copied on delivery**: `byName.set(k, m)` stores the reference if `m` is
+already boxed, and boxes once if `m` was in locals. An element write builds a new box (O(N) and
+one allocation; §7.2 measures about 18 ns per write on V8 and 15 on wasmtime, with garbage),
+which `fixed-array-boxed-update` hints. A later optimisation can mutate in place when the box
+is provably unique (freshly built by this function and not yet stored, passed, captured or
+returned); that is invisible, because nothing else can observe the box.
+
+### 6.6 The size cap
+
+Measured (§7.4):
+
+* `br_table` time does not grow with N, but its code does: about 18 bytes per arm per site,
+  so a dynamic access is ~290 bytes at N = 16, ~1.1 KB at 64 and ~4.6 KB at 256;
+* passing N parameters ties passing one array reference up to N = 64 (V8 29.6 against 27.5 ms
+  per 10^6 calls; wasmtime 36.7 against 36.8) and loses at 256 (148 against 104 on V8);
+* both engines cap a signature at 1,000 parameters and results (A8).
+
+**Stated default: 64 scalar slots** per value for the value tier (locals, parameters,
+results, globals), counted after nesting and records (`V3[16]` is 48 slots), with a
+per-signature budget of 256 parameter slots and 64 result slots (the rest pass boxed). Past
+the cap the value is boxed. Inline fields and flattened lists have **no cap**: a field's cost
+is the record's size, and a list's stride is arithmetic. Julia's rule of thumb is 100 elements;
+64 is the nearest power of two under it that the measurements support. All three numbers are
+lowering constants recorded in DECISIONS.md, not part of the type system. **Q5** asks whether
+crossing the cap is silent, hinted, or an error.
+
+### 6.7 Build slices, sized in agent-days
+
+Each slice is unobservable to programs from the previous one, so each ships alone; the
+position matrix (`scripts/capability-probes/matrix.py`) grades every slice, with a template per
+placement and, in every template, an **aliasing proof** in both directions (write the
+destination and read the source, then the reverse, printing values that show independence).
+
+| slice | content | agent-days |
 | --- | --- | --- |
-| `compiler/parser.vl` | `T[N]` / `T[SIZE]` in the type suffix loop (`parseTypeAtom`'s `[` arm accepts only `]` today); `[v; N]` in the list-literal parser; AST carries N | `vl fmt` must print both and never re-spell them |
-| `compiler/typecheck.vl` | a new type kind; assignability (exact N; elementwise exact conversion F17); index typing and the literal/`const` out-of-range error (F6); literal adoption and conflicts (F15); the `as` extensions (F8, F17); `const`, value-root and dead-write errors (F5, F5′); place/value classification; `==`; `for` and its write scan (F12); capture (F13); `readonly` (F18); unions of fixed types and `is` (F17); the export refusal (F10′) | **`is TyArray` appears 345 times in 7 files** (`typecheck.vl` 236, `emit_classify.vl` 65, `emit_mono.vl` 23). A new kind trips `kind-ladder-incomplete` at every closed ladder, which is the safe failure. Folding the length into `TyArray` would let each of the 345 sites treat a fixed array as a list without saying so. For scale, `TyMap` has 179 |
-| canon / interner | the length joins the type identity | rep-fuzz gate mandatory |
-| `compiler/emit_rep.vl`, `emit_classify.vl` | the multi-slot locals representation (A15), the owned box, the nullable flag form, per-signature budgets (F10) | arena and canon are two producers: both must agree on the representation |
-| `compiler/wasmEmit.vl`, `emit_bytes.vl` | N-slot locals; constant index to `local.get`; `br_table` select and store; multi-result function types; N-parameter calls and `call_ref`; result locals for `if`/`match`; every copy of F7's invariant; the shared static-index predicate and the unroll override (F6); the F12 snapshot | **A15: every one-value-one-slot assumption** (expression `drop`, `select`, `tee`, block types, globals). Multi-value is new to this emitter |
-| `compiler/emit_mono.vl` | instances keyed per (element, length); un-annotated `for` (A6) | mono grid gains a length axis |
-| host | none expected; fixtures for A18 | the multi-value and escape steps over L1 modules |
-| LSP | hover, diagnostics, hints | the ci.yml editor suites |
-| tests | a `capability-probes/matrix/*.matrix.vl` template per representation (locals, box, flag), all 26 positions in both faces, **each with the two-way aliasing proof (F7)**, plus a generic-element twin and a length-generic twin | the main grading instrument |
+| S0 semantic core | parser (`T[N]`, `[v; N]`), a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently), the rewrite, place rules, literals and adoption, `as`, `==`, `for`, `.length`, constant-index errors, dead writes, joins; EVERY placement boxed (immutable `(array T)`, rebuilt on write). Correct, allocates | 4–5 |
+| S1 value tier | the host multi-value step learns immutable fixed arrays (§6.2), the `br_table` rewrite, the unroll override and the shared static-index predicate, the cap | 2–3 |
+| S2 inline fields | N struct fields per `T[N]` field; `struct.set` element writes; record spread | 2 |
+| S3 flattened lists | stride-N backing, `push`/`pop`/index/spread/`slice`, std list functions at `V = T[N]` | 3 |
+| S4 `flat` and `u8` | `flat` fields of `T[N]`, 1-byte `u8` fields and elements, offsets | 1–2 |
+| S5 numeric record elements | by-field storage, copy-in and copy-out | 2 |
 
-**Build order** (CLAUDE.md: build the lowering, wire every delivery, then narrow the gate):
+**About 14–17 agent-days in total**, with S0 + S1 (6–8 days) delivering SP-036's ask 2 for
+locals, parameters and results. Revision 2 priced the same scope at five to six weeks; the
+saving is S0's single boxed representation (no copy invariant, no owned boxes) and S1's reuse
+of the host step instead of a multi-slot emitter.
 
-1. **S1: locals, parameters and results.** Constant and `br_table` indices, the unroll override
-   and its shared predicate, literals and fill, `==`, `for` with the snapshot, F5/F5′,
-   multi-result types, the per-signature budget, and A18's host fixtures. sunpa's `m4Mul`,
-   `m4Invert`, `perspective`, `lookAt` and `compose` port here. Every other position is refused
-   with a capability message until its slice lands.
-2. **S2: owned-box storage and the copy invariant.** Fields, globals, map values (flag form on
-   read), boxed list elements, every row of F7's copy table, captures, unions and `is`. `g`,
-   `Skeleton.root` and `viewProj` port here.
-3. **S3: conversions and adoption.** `as` both ways, elementwise conversion, and F15's adoption.
-4. **S4: length-keyed monomorphization** (F9(b)) and the un-annotated `for`.
-5. **S5: flattened lists**, a representation change.
-
-**Rough size** (agent lane time): S1 about 1.5 weeks (A15's audit is the bulk), S2 about 1.5
-weeks (the copy table's seven paths are each a fixture family), S3 2–3 days, S4 3–4 days, S5 3–5
-days. **About five to six weeks in total**, up from revision 1's three to four, because the copy
-invariant, the dead-write rule and the per-signature budget were unpriced there. Seed size moves
-by the emitter code only, since the compiler uses no fixed arrays.
-
-**Risks, ranked.**
-
-1. **The copy invariant (F7).** Every path that moves a reference today is a place an alias can
-   leak. The two-way aliasing proof in every template is the control.
-2. **A15's audit.** A missed one-value-one-slot assumption is check-clean invalid wasm.
-3. **The position matrix.** Two-plus representations times 26 positions times two faces.
-   Refuse per position until wired, then narrow.
-4. **Instantiation-time refusals (F9).** A refusal lost at a monomorphization pin is the
-   documented failure shape.
-5. **Unroll compile time and code size.** A 64-trip override across many matrix functions
-   grows modules. The cap is measured in S1, and `vl_scaling_shape_test.ts` needs a row.
-6. **Dense dynamic indexing** stays about 2.3 ns per access slower than unrolled. That is
-   correct, but it is a perf surprise without the hint.
+Compile-time and seed-size: the compiler itself uses no `T[N]`, so the seed grows by the new
+code only. Unrolling at 64 trips grows user modules; `tests/vl_scaling_shape_test.ts` gains an
+N axis, and the cap is re-measured on the guest-fuel instrument before S1 lands.
 
 ---
 
-## 6. Prototype evidence
+## 7. Measurements
 
-**What was measured.** sunpa SP-036's benchmark: `m = m4Mul(m, t)` 10^6 times. **Revision 2
-changed the result** from `m[12]` to `m[12] + m[13] + m[14] + m[15]`, one element from each row.
-Row r of a product depends only on row r of the left operand, so `m[12]` alone kept one row
-live, and LLVM and V8 deleted the other three in the inlined kernels (§9). Every variant prints
-`285.2842828502802` for n = 1000, which the harness asserts.
+Everything ran under `nice -n 19` on the shared 24-core box (load 5–14 during the runs). V8 is
+Deno 2.9.6 (3 warm-up calls, then 7 timed calls, 3 rounds; the minimum is quoted, medians are
+in the raw output). wasmtime is the 49.0.0 CLI (`--invoke bench`, the same module at `n = 0`
+subtracted, 5 rounds, minimum quoted). Scavenges are V8 `--trace-gc` lines during one call.
+Only gaps over about 10% are claimed. Sources are in the appendix.
 
-**V8**: Deno 2.9.6, each variant in its own process, 3 warm-up calls of 10^5, then 7 timed calls
-of 10^6, 3 interleaved rounds, min-of-mins and median-of-medians. **wasmtime 47**: `vl run
-x.wasm` (the gates' engine) with the program's start function calling `bench(10^6)`, minus the
-same module with `bench(0)`, 5 rounds. **wasmtime 49**: the CLI's `--invoke`, minus n = 0, 5
-rounds. Everything ran under `nice -n 19` on a shared 24-core box at load 3–9. VL rows used
-master `221c7954f`'s seed and host at `-O3`. Rust: 1.x stable, `wasm32-wasip1`,
-`opt-level=3`, LTO, with `t` behind `black_box`. Sources are in the appendix.
+### 7.1 The prototype (revision 2, re-run today)
 
-| row | what it is | V8 ms (default) | V8 ms (`--no-wasm-inlining`) | V8 scavenges per 10^6 | wasmtime 47 ms (`vl run`) | GC collections (wasmtime 47) |
-| --- | --- | --: | --: | --: | --: | --: |
-| a_push | VL `f64[]`, `push` (SP-036) | 129 / 150 | 127 / 146 | 174 | 238 / 252 | 1 |
-| b_filled | VL `f64[]`, `filled` + stores (`view.vl`) | 111 / 123 | 105 / 116 | 149 | 201 / 211 | 1 |
-| c_rec16 | VL 16-field record (over D3625's bound) | 91 / 108 | 88 / 91 | 124 | 129 / 135 | 1 |
-| f_struct | wasm: immutable 16-f64 struct parameter and result (L2 at a call) | 93 / 105 | 89 / 104 | 124 | 125 / 134 | 1 |
-| f_struct_O3 | the same after `wasm-opt -O3` (inlined; the loop-carried merge stays) | 87 / 117 | 89 / 96 | 124 | — | — |
-| **e_mv** | **wasm: 32 f64 parameters, 16 results, 16 loop-carried locals (L1)** | 95 / 107 | 95 / 101 | **0** | — | — |
-| **e_mvg** | **e_mv with `t` in mutable globals (no constant folding)** | 88 / 107 | 94 / 101 | **0** | **89 / 92** | **0** |
-| e_mvg_O3 | e_mvg after `wasm-opt -O3` (single caller inlined) | 83 / 91 | 82 / 93 | 0 | 85 / 88 | 0 |
-| d_scalar | VL source scalarized by hand (the compiler's output) | 81 / 91 | 87 / 99 | 0 | 86 / 90 | 0 |
-| rust | `[f64; 16]` by value, `#[inline(never)]` | 94 / 103 | 93 / 101 | 0 | (49 CLI) 89 / 93 | — |
-| rust_inl | `[f64; 16]`, `#[inline(always)]` | 90 / 106 | 89 / 100 | 0 | (49 CLI) 86 / 88 | — |
-| g_brtable | L1's locals, loops NOT unrolled: 64 `br_table` reads per product | 229 / 279 | 238 / 309 | 0 | 240 / 250 | 0 |
+sunpa's benchmark: `m = m4Mul(m, t)` 10^6 times, the result reading one element per row (row r
+of a product depends only on row r, so revision 1's single-element result let LLVM and V8
+delete three rows; corrected in revision 2).
 
-On the wasmtime 49 CLI the wasm rows read e_mv 94, e_mvg 90, e_mvg_O3 88 and f_struct 94
-(min). wasmtime 47's `VL_GC_STATS` reports one collection for each heap row, so collections
-are a coarse instrument there. The time gap is the signal.
+| row | what it is | V8 ms rev 2 / **today** | wasmtime rev 2 (47, `vl run`) / **today (49 CLI)** | scavenges |
+| --- | --- | --: | --: | --: |
+| b_filled | VL `f64[]` + `filled`, today's best spelling | 105–111 / **119** | 201 / — (imports `print`) | 149–172 |
+| f_struct | an immutable 16-f64 struct across the call | 87–93 / **97** | 125 / **104** | 124–147 |
+| **e_mvg** | **the value-tier lowering: 32 params, 16 results, 16 loop-carried locals** | 82–95 / **93** | 89 / **100** | **0** |
+| rust | `[f64; 16]` by value, `#[inline(never)]` | 93–94 / **98** | 89 (49) / **96** | 0 |
+| g_brtable | e_mvg with the loops NOT unrolled (64 dynamic reads per product) | 229 | 240 | 0 |
+| a_push | VL `f64[]` + `push` (SP-036 as written) | 127–129 | 238 | 174 |
+| d_scalar | VL source scalarised by hand | 81–87 | 86 | 0 |
 
-**F6's dynamic-read prototypes** (`pk_*`: 10^6 iterations, each one dynamic read of a 16-f64
-value held in locals, plus the same 16-local update in every row; min ms):
+**Finding:** the value tier is at Rust parity on both engines with zero garbage, today as in
+revision 2. `e_mvg` is exactly the code §6.2's host step would produce.
 
-| row | V8 default | V8 no-inline | wasmtime 49 | V8 scavenges | ns per read over `pk_const` (V8 / wasmtime) |
-| --- | --: | --: | --: | --: | --: |
-| pk_const (index 0, the floor) | 1.7 | 4.1 | 3.7 | 0 | — |
-| pk_br (`br_table` over the 16 parameters) | 3.8 | 4.7 | 4.7 | 0 | 2.1 / 1.0 |
-| pk_mem (16 stores to a scratch, one `f64.load`) | 4.3 | 6.7 | 7.4 | 0 | 2.6 / 3.7 |
-| pk_box (`array.new_fixed` 16, `array.get`) | 8.4 | 11.6 | 27.3 | 124 | 6.7 / 23.6 |
+Revision 2's dynamic-read rows (10^6 reads of a 16-f64 locals value, ns per read over a
+constant read): `br_table` 2.1 (V8) / 1.0 (wasmtime); 16 stores to a linear-memory scratch
+then a load, 2.6 / 3.7; a fresh heap box, 6.7 / 23.6 with 124 scavenges.
+
+### 7.2 Inline record field versus boxed (new)
+
+A record `{ count: i32, pose: f64[16] }` held in a module global. **W**: 10^6 iterations, each
+reading and writing all 16 elements at constant indices (`pose[k] = pose[k] * 0.999 + x`).
+**D**: 10^7 iterations, each one dynamic write (`pose[i & 15] += 1`) and one dynamic read
+(`pose[(i * 7) & 15]`).
+
+| placement | W: V8 / wasmtime ms | D: V8 / wasmtime ms | scavenges (W / D) |
+| --- | --: | --: | --: |
+| **inline: 16 struct fields** (§6.3) | **2.8 / 4.3** | **19.1 / 24.5** (`br_table`) | 0 / 0 |
+| mutable box, written in place (revision 2's owned box) | 3.3 / 14.8 | 7.2 / 18.7 | 0 / 0 |
+| immutable box, rebuilt per write (§6.5) | 12.4 / 26.1 | 187.8 / 150.7 | 147 / 1,471 |
+| VL today: `pose: f64[]` field, built by the master seed | 2.8 / 13.1 | 6.5 / 18.8 | 0 / 0 |
 
 **Findings.**
 
-1. **The proposed lowering is at Rust parity on both engines.** V8: L1 82–95 ms against Rust
-   89–94 (called or inlined; the two regimes now agree, because nothing is dead). wasmtime: 85–89
-   ms (wasmtime 47) against Rust 86–89 (wasmtime 49).
-2. **It removes the garbage**: 0 scavenges against 124–174. That is the half of SP-036 that
-   hurts at 240 Hz.
-3. **Against the struct, the speed gain is engine-dependent.** On V8 a 16-f64 struct across a
-   call is about as fast (87–93 ms) and differs only in garbage. On wasmtime 47 the struct is
-   1.4x slower (125 against 89). Against today's `f64[]` spellings, L1 is 1.2–1.6x faster on V8
-   and 2.3–2.7x on wasmtime.
-4. **Unrolling is still load-bearing**, at about 2.3 ns per dynamic access (`g_brtable`). But a
-   single dynamic read costs 1–2 ns through `br_table`, without allocating, which is why F6 now
-   uses it instead of the box.
-5. **The multi-value bound in `multivalue.rs` is not a speed bound at 16 f64.** L1's 16-result
-   call ties the struct call on V8 and beats it on wasmtime 47.
-6. **VL already emits the target code from scalar source** (d_scalar: 81–87 ms on V8, 86 on
-   wasmtime 47, 0 allocations). The work is getting from `a[k * 4 + r]` to that shape.
+1. **Constant-index access: inline wins on wasmtime by 3.0–3.4x** over any box or today's list
+   field. On V8 W is latency-bound (16 independent multiply-add chains) and every non-rebuilding
+   placement ties.
+2. **Dynamic access through `br_table` over fields is the one place inline loses**: about
+   0.6 ns per access on V8 against a mutable array (0.3 on wasmtime). A mutable box is not
+   available under value semantics without a uniqueness proof, so the fair comparison is the
+   immutable box, which inline beats by 10x on V8 and 6x on wasmtime.
+3. **A boxed rebuild costs about 18 ns per write on V8 (15 on wasmtime) and one 16-element
+   allocation.** That is the price §6.5 hints, and why boxing is the placement of last resort.
 
-**Caveats.** The wasm rows are hand-written (A14). The box was shared and loaded, so only gaps
-over about 10% are claimed. The owned-box storage positions (F7) were not prototyped; their
-access cost is assumed to be `b_filled`'s. The host steps were not run over an L1 module (A18).
+### 7.3 Flattened `T[N][]` versus `T[][]` (new)
 
----
+1,024 4x4 matrices. **Stream**: per pass, every element of every matrix is read and written.
+**Bone pass**: per pass, `g[j] = g[j] × t` for every matrix (sunpa's per-bone loop), 1,000
+passes (10^6 products).
 
-## 7. Alternatives considered
+| row | layout | V8 ms | wasmtime ms | scavenges |
+| --- | --- | --: | --: | --: |
+| VL today, stream | hand-flattened `f64[]`, stride 16 | 6.6 | 17.6 | 0 |
+| VL today, stream | `f64[][]` | 4.4 | 19.0 | 0 |
+| VL today, bone pass | hand-flattened, scalar product in locals | 11.2 | 27.7 | 0 |
+| VL today, bone pass | `f64[][]`, product in locals written back in place | 8.2 | 22.5 | 0 |
+| VL today, bone pass | `f64[][]`, `g[j] = m4Mul(g[j], t)` (sunpa's code) | 33.9 | 176.3 | 49 |
+| raw wasm, stream, 1,024 matrices (128 KB) | flat `(array f64)` | 4.2 | 13.4 | 0 |
+| raw wasm, stream, 1,024 matrices | array of 1,024 row arrays | 3.4 | 14.6 | 0 |
+| raw wasm, stream, 65,536 matrices (8 MB), 16 passes | flat | 6.6 | 24.8 | 0 |
+| raw wasm, stream, 65,536 matrices | array of rows | 9.5 | 32.5 | 0 |
 
-* **Raise `MV_RECORD_MAX_FIELDS` to 16 and use a 16-field record.** It helps records at a call
-  boundary (finding 5), but a record has no computed index, no loop and no `T[16][]` list, so
-  sunpa's matrix code cannot be written with it. Worth its own row for records regardless.
-* **Option B, optimiser-only** scalar replacement of a fresh `f64[]`. The owner chose A, and
-  measurement agrees: even a fully visible heap value (f_struct_O3) keeps its allocation through
-  a loop-carried merge.
-* **SIMD (`F32x4`).** It covers f32 4x4 math as four `v128` columns, but not f64. It is
-  complementary: an `f32[16]` could later lower to four `v128` locals.
-* **Tuples.** Held by the multi-value ruling (2026-09-29). A homogeneous fixed array is not a
-  tuple and does not reopen it.
+**Findings.**
 
----
+1. **The allocation, not the layout, is sunpa's cost**: `g[j] = m4Mul(g[j], t)` over `f64[][]`
+   is 4.1x the in-place form on V8 and 7.8x on wasmtime. Value semantics removes it in any
+   placement (the result is written into the element, not a new list).
+2. **Layout alone is a tie in cache** (128 KB) and **1.3–1.4x for flat once the list leaves the
+   cache** (8 MB), plus one GC object instead of 1,025 (today's `f64[][]` is two objects per
+   matrix: header and backing).
+3. **Today's hand-flattened VL code runs slower than `f64[][]` in cache** because every
+   `g[b + k]` reloads the list header and re-checks the bound. The flattened lowering must check
+   `j` once per element access (§6.4), or flattening ships a regression.
 
-## 8. Open questions for the owner
+### 7.4 The size cap (new)
 
-Ordered by dependency: Q1 decides what every later answer means. Each question is one
-decision, with a code sample per option and a recommendation. One question per turn at
-question time.
+Dynamic access: 10^7 iterations of one `br_table` read and one `br_table` write over N locals
+(`dl`), against an `(array (mut f64))` (`db`). Calls: 10^6 calls passing N `f64` parameters
+(`cm`) against one array reference the callee reads N times (`cb`).
 
-**Q1 (F1). Does `b = a` copy?** This overrides `collections-design.md` §VL.6/§OQ.2 for this type.
-* (a) Value: `let b = a; b[0] = 1.0` leaves `a[0]` unchanged.
-* (b) Reference: `b[0] = 1.0` changes `a[0]`, and the allocation is removed only where an optimiser proves no alias.
-* (c) Immutable value: `a[0] = 1.0` is refused, and `a.with(0, 1.0)` makes a new value.
+| N | `dl` V8 / wt | `db` V8 / wt | `dl` module bytes (2 sites) | `cm` V8 / wt | `cb` V8 / wt |
+| --: | --: | --: | --: | --: | --: |
+| 4 | 7.5 / 7.1 | 8.4 / 13.4 | 238 | 2.5 / 3.3 | 2.9 / 1.5 |
+| 16 | 19.3 / 23.1 | 5.8 / 13.6 | 634 | 7.2 / 8.4 | 8.5 / 7.8 |
+| 64 | 19.9 / 26.4 | 5.5 / 13.8 | 2,218 | 29.6 / 36.7 | 27.5 / 36.8 |
+| 256 | 20.0 / 30.4 | 5.4 / 13.7 | 9,473 | 148.0 / 198.6 | 104.1 / 168.5 |
 
-*Recommend (a).*
-
-**Q2 (F2). Spelling and nesting order?**
-* (a) `f64[16]`; `f64[3][4]` is four `f64[3]`; `f64[16][]` is a list of matrices.
-* (b) `[f64; 16]`; `[[f64; 3]; 4]`.
-* (c) `Fixed<f64, 16>`.
-
-*Recommend (a).*
-
-**Q3 (F2). May N be a named constant?**
-* (a) `const SIZE = 16; let m: f64[SIZE]` (literal-bound `const` only).
-* (b) Literals only: `f64[16]`.
-
-*Recommend (a).*
-
-**Q4 (F3). How is a value written?**
-* (a) An exact-length literal in a typed position, plus `[0.0; 16]` (with a hint when the fill calls a function).
-* (b) The literal only.
-
-*Recommend (a).*
-
-**Q5 (F4). Element types in v1?**
-* (a) Scalars, `boolean` and nested fixed arrays.
-* (b) Any type, with shallow copies (`V3[4]` copies four references).
-
-*Recommend (a).*
-
-**Q6 (F5). Is a `const` fixed array element-writable?**
-* (a) No: `const m: f64[16] = …; m[0] = 1.0` is refused.
-* (b) Yes, like a `const` list.
-
-*Recommend (a).*
-
-**Q7 (out-parameters). How does a function fill a caller's matrix?** The direction said "multi-value or out-param".
-* (a) Return only: `sk.root = m4Mul(a, b)` copies 16 values into the existing box, with no allocation and no out-parameter.
-* (b) An `inout` parameter mode, copy-in copy-out (Swift, GLSL): `function m4MulInto(inout r: f64[16], a, b) { … }` called as `m4MulInto(&r, a, b)`, lowered as an extra multi-value result written back.
-* (c) Pass a record that holds the array: `function m4MulInto(h: { m: f64[16] }, a, b) { h.m[0] = … }` (works under F7 with no new feature).
-
-*Recommend (a) plus (c) in v1, with (b) as a later additive mode if a consumer needs it.* Under
-(a), every sunpa `…Into` call site has a return-based spelling that allocates nothing.
-
-**Q8 (F5′). Dead writes and value roots?**
-* (a) Errors: `f()[0] = 2.0`, `for m in g { m[0] = 9.0 }`, and `let r = s.root; r[0] = 7.0` with `r` unread.
-* (b) Warnings (lint tier) for the same three.
-* (c) Neither: they compile and do nothing.
-
-*Recommend (a).*
-
-**Q9 (F6). What does a non-constant index do?**
-* (a) Legal, traps out of range; `m[16]` and `m[K]` (a `const`) are check errors; it lowers to a `br_table`, with no allocation.
-* (b) Only constants, constant-bound range variables and literal-union indices; `col(m, c)` is refused.
-* (c) Clamp, as WGSL.
-
-*Recommend (a).*
-
-**Q10 (F7). Storage and the copy invariant?**
-* (a) Owned boxes for fields, map values, list elements and captures; every delivery copies unless the source is dead (`[...g]` allocates one box per element in v1).
-* (b) Inline record fields from v1 (16 struct fields; dynamic field indices are a `br_table`).
-* (c) Flattened lists from v1 (`f64[16][]` as one stride-16 array).
-
-*Recommend (a)*, with (b) and (c) as later representation changes.
-
-**Q11 (F8). How does it convert to and from `T[]`?**
-* (a) `m as f64[]` out (infallible); `xs as! f64[16]` / `as? f64[16]` / `as f64[16]` in.
-* (b) `m.toList()` out; the `as` trio in.
-* (c) Implicit out into `readonly f64[]` (a hidden copy).
-
-*Recommend (a).* It extends `as` beyond numerics for the first time.
-
-**Q12 (F17). Is `i32[2]` → `f64[2]` implicit?**
-* (a) Yes, when every element converts exactly (`i64[2]` → `f64[2]` is refused with an `as` fix).
-* (b) No: `xs.map(…)` or `as`, like lists.
-
-*Recommend (a).*
-
-**Q13 (F17). What does `if c { a16f64 } else { a16f32 }` produce?**
-* (a) The union `f64[16] | f32[16]`, discriminated with `is`.
-* (b) A check error, like lists.
-
-*Recommend (a)*, consistent with the numeric-join ruling.
-
-**Q14 (F17). Does `as` convert elements?**
-* (a) Length only: `xs as! f64[16]` needs `xs: f64[]`.
-* (b) Elements too, by the numeric trio: `[1.5] as! i32[1]` traps.
-
-*Recommend (a) in v1.*
-
-**Q15 (F9). Can code be generic over the length?**
-* (a) Through un-annotated parameters, keyed per (element, length), after the for-in hole is fixed: `function put(b: Buf, at: i32, vs) { … }`.
-* (b) Const generics now: `function put<const N>(…, vs: f64[N])`.
-* (c) No length polymorphism.
-
-*Recommend (a)*, with (b) designed with roadmap A10.
-
-**Q16 (F10). Is the size budget per signature?**
-* (a) Yes: at most 16 slots per array in locals; at most 64 parameter slots and 16 result slots per function type, the rest boxed; a hint at `f64[17]`.
-* (b) A hard cap on N in the type: `f64[17]` is a check error.
-
-*Recommend (a).*
-
-**Q17 (F10′). May an entry-module export take or return a fixed array?**
-* (a) Not in v1: `export function f(): f64[16]` is refused, naming `as f64[]` or a `Buf`.
-* (b) Flattened: N numbers in, a JavaScript Array out.
-* (c) A boxed `(array f64)` both ways.
-
-*Recommend (a).*
-
-**Q18 (F11). Equality and printing?**
-* (a) `a == b` elementwise; `print(m)` refused, like lists.
-* (b) Also add printing for fixed arrays only.
-
-*Recommend (a).*
-
-**Q19 (F12). Does `for x in m` iterate a snapshot?**
-* (a) Yes: `for x, i in m { if i < 15 { m[i + 1] = 0.0 }; s += x }` sums the original values. It costs extra locals in locals, and one allocation per loop entry for a box-held `m` whose body writes it.
-* (b) Unspecified, like lists.
-
-*Recommend (a).*
-
-**Q20 (F13). Does an element write count as an assignment for capture?**
-* (a) Yes: `const f = () => m[0]; m[0] = 1.0; f()` is 1.0.
-* (b) No: captures copy, and `f()` is 0.0.
-
-*Recommend (a).*
-
-**Q21 (F14). Who removes the heap: the compiler (L1) or the `-O` steps (L2)?**
-* (a) L1: N locals and multi-value emitted at every rung.
-* (b) L2: an immutable struct that the optimiser melts when it can.
-
-*Recommend (a).*
-
-**Q22 (F15). Does a literal-only binding adopt a fixed-array destination?**
-* (a) Yes, like records and D3339: `const p = [1.0, 2.0, 3.0]; takesFixed(p)` makes `p: f64[3]`; `p.push(4.0)` elsewhere is then an error naming both uses.
-* (b) No: an annotation is required.
-
-*Recommend (a)*, which is what the rulings already imply.
-
-**Q23 (F18). Does `readonly` over a list of fixed arrays forbid element writes?**
-* (a) Yes: with `g: readonly f64[16][]`, `g[0][3] = 1.0` is refused.
-* (b) No, as for `readonly f64[][]`.
-
-*Recommend (a)*: the element is the list's storage.
-
-**Q24 (F16). Any std module?**
-* (a) None.
-* (b) A `std:mat` with `mat4Mul`, `identity` and friends.
-
-*Recommend (a).*
+**Findings.** `br_table` time is flat in N (about 1 ns per access on V8); its code grows about
+18 bytes per arm per site. N parameters tie a reference through 64 and lose 1.2–1.4x at 256.
+Hence the 64-slot cap and the per-function code budget for dynamic sites (§6.1, §6.6).
 
 ---
 
-## 9. Revision log
+## 8. Interop
 
-**Revision 2 (2026-10-04, after critic 1).**
+### 8.1 `flat type`
 
-* **Measurement corrected.** Revision 1's "40–44 ms inlined, 2x faster than a call" was dead-code
-  elimination: the benchmark returned `m[12]`, row 0 depends only on row 0, and LLVM (16 of 64
-  multiplies kept) and V8 dropped three rows. With a result reading every row, the inlined and
-  called forms agree (82–95 ms on V8) and Rust is 89–94. The wasmtime 47 rows were added, and
-  they show the same parity.
-* F5's parameter refusal was replaced by F5′'s place/value and dead-write rules.
-* Out-parameters became their own question (Q7).
-* F6: the box fallback was withdrawn (garbage); `br_table` was measured and adopted; the
-  scratch-memory option was measured and declined; the unroll-veto table was added; "constant"
-  was defined as a literal or `const` at the source position; the two-producers rule (one
-  predicate) was added.
-* F7: the copy invariant, the seven reference-moving paths, the borrowed-parameter example, the
-  allocation price table, the nullable flag form for map reads, and the aliasing proof in
-  templates were added.
-* F9 / A6 corrected (for-in over an un-annotated parameter is refused today; length-keyed
-  instances are new) and the instantiation-time refusal gap stated.
-* F10 made per signature (A8 measured on both engines), the 17-slot hint added, and the export
-  ABI split out (F10′).
-* F12's snapshot cost stated. F15 made consistent with D3339 and the record rulings, and the
-  `const` per-use bullet dropped. F17 (joins, elementwise conversion, `is`, `as` over elements)
-  and F18 (`readonly`) added.
-* A5 now names the §VL.6/§OQ.2 override and the correct path; A15 (first multi-slot
-  representation), A16–A19 added; each assumption marked measured, read or unverified.
-* The status line records the implementation hold.
+A `flat` field may be a `T[N]` of flat-able elements (`i32`, `i64`, `f32`, `f64`, `u8`, a
+newtype over one, a flat record), laid out as N consecutive elements with no padding, so
+`flat type Bone = { m: f32[16], tint: u8[4] }` has `Bone.m = 0`, `Bone.tint = 64`,
+`Bone.size = 68`. This extends flat's field rule (`flat-records-design.md` §3), which today
+admits only 4- and 8-byte scalars; **`u8` fields and `u8[N]` come with it** (1-byte storage,
+which the owner ruled legal for flat). A 2-byte type does not exist in VL, so 2-byte fields
+wait for one. `boolean` stays refused. A flat record used as a GC value holds its `T[N]` field
+inline (§6.3), as any record does.
 
----
+### 8.2 `Buf` and views
 
-## Appendix: prototype sources
+A `Buf` is linear memory; a `T[N]` is a GC-side value. Moving one into the other is N loads or
+stores, written as an unrolled loop, which is free in the value tier:
 
-All were written in a scratch directory and run with `nice -n 19`; nothing here is in the
-build. Assemble wat with `node_modules/.bin/wasm-as --enable-gc --enable-reference-types
---enable-multivalue x.wat -o x.wasm` (`wasm-opt … -O3` for the `_O3` rows); build the VL rows
-with `vl build x.vl -O3 -o x.wasm`.
-
-**VL rows.** `a_push.vl` is SP-036's program with the result changed to `m[12] + m[13] + m[14] +
-m[15]` and `print(bench(1000))` appended. `b_filled.vl` is `view.vl`'s
-`m4MulInto(filled(16, 0.0), a, b)` with the same `bench`. `c_rec16.vl` and `d_scalar.vl` are
-generated. For wasmtime 47, each module's start prints `bench(1000000)` or `bench(0)`, and
-`vl run x.wasm` runs the prebuilt module.
-
-**Generator** (`gen.py`, abridged; `I` is the identity, `T` is SP-036's `t`):
-
-```python
-I = [1.0,0,0,0, 0,1.0,0,0, 0,0,1.0,0, 0,0,0,1.0]
-T = [0.999,0.01,0.0,0.0,-0.01,0.999,0.0,0.0,0.0,0.0,1.0,0.0,0.1,0.2,0.3,1.0]
-def fl(x): return repr(float(x))
-# o[c*4+r] = sum_k a[k*4+r] * b[c*4+k]; every bench returns m12 + m13 + m14 + m15 (one per row)
-
-def mv_module():   # e_mv.wat: the proposed L1 ABI
-  w = "(module\n (type $mv (func " + "(param f64) "*32 + "(result " + "f64 "*16 + ")))\n"
-  w += " (func $m4Mul (type $mv)\n"
-  for c in range(4):
-    for r in range(4):
-      terms = [f"(f64.mul (local.get {k*4+r}) (local.get {16+c*4+k}))" for k in range(4)]
-      e = terms[0]
-      for t in terms[1:]: e = f"(f64.add {e} {t})"
-      w += "  " + e + "\n"            # the 16 results, left on the stack in order
-  w += " )\n"
-  w += " (func (export \"bench\") (param $n i32) (result f64)\n  (local $i i32)\n"
-  w += "".join(f"  (local $m{i} f64)\n" for i in range(16))
-  w += "".join(f"  (local.set $m{i} (f64.const {fl(I[i])}))\n" for i in range(16))
-  w += "  (block $done (loop $top\n   (br_if $done (i32.ge_s (local.get $i) (local.get $n)))\n"
-  w += "   (call $m4Mul " + " ".join(f"(local.get $m{i})" for i in range(16)) + " " \
-       + " ".join(f"(f64.const {fl(T[i])})" for i in range(16)) + ")\n"
-  w += "".join(f"   (local.set $m{i})\n" for i in reversed(range(16)))   # pop 16 results
-  w += "   (local.set $i (i32.add (local.get $i) (i32.const 1)))\n   (br $top)))\n"
-  w += "  (f64.add (f64.add (f64.add (local.get $m12) (local.get $m13)) (local.get $m14)) (local.get $m15)))\n)\n"
-  return w
-# e_mvg.wat: mv_module() with `t` in 16 `(mut f64)` globals, an exported `poke` that writes one
-#   (so none is constant), and the call reading 16 locals loaded from them before the loop.
-# f_struct.wat: (type $M (struct (field f64) x16)); m4Mul (ref $M) (ref $M) -> (ref $M) is one
-#   struct.new of the same 16 sums over struct.get; bench carries one (ref $M) local.
-# g_brtable.wat: m4Mul with e_mv's signature but SP-036's three loops kept; every a[k*4+r] and
-#   b[c*4+k] read and o[c*4+r] write is a br_table over 16 blocks selecting the local.
-# pk_{const,br,mem,box}.wat: $pick (16 f64, i32) -> f64 returning param 0 / a br_table select /
-#   16 f64.store to address 0 then f64.load at idx*8 / array.get of array.new_fixed 16. bench
-#   carries 16 locals (from mutable globals), adds pick(m…, (i*7)&15) to s, and updates every
-#   local by s*1e-12 each iteration.
+```vl
+let m: f32[16] = [0.0; 16]
+for i in 0 until 16 { m[i] = b.loadF32(at + i * 4) }      // 16 f32.load into 16 locals
+for i in 0 until 16 { b.storeF32(at + i * 4, m[i]) }      // 16 f32.store
 ```
 
-**Rust** (`cargo build --release --target wasm32-wasip1`, `crate-type = ["cdylib"]`,
-`opt-level = 3`, `lto = true`, `panic = "abort"`):
+No new std export is proposed; a later `loadF32s`/`storeF32s` pair would go through
+`std-api-reviewer`.
 
-```rust
-#[inline(never)]
-fn m4_mul(a: [f64; 16], b: [f64; 16]) -> [f64; 16] {
-    let mut o = [0.0f64; 16];
-    for c in 0..4 { for r in 0..4 {
-        let mut s = 0.0;
-        for k in 0..4 { s = s + a[k * 4 + r] * b[c * 4 + k]; }
-        o[c * 4 + r] = s;
-    } }
-    o
-}
-// m4_mul_inl: the same body, #[inline(always)].
-const I: [f64; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-const T: [f64; 16] = [0.999, 0.01, 0.0, 0.0, -0.01, 0.999, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.1, 0.2, 0.3, 1.0];
-#[no_mangle]
-pub extern "C" fn bench(n: i32) -> f64 {
-    let mut m = I;
-    let t = core::hint::black_box(T);
-    for _ in 0..n { m = m4_mul(m, t); }
-    m[12] + m[13] + m[14] + m[15]
-}
-// bench_inl: the same over m4_mul_inl.
+### 8.3 GPU upload
+
+A flattened `f32[16][]` lives in a GC array, which a host cannot view as bytes (V8 exposes no
+typed-array view of a GC array). The zero-copy path to the GPU stays `Buf` + `flat`; the
+fixed array is the compute-side value that is stored into the `Buf` before upload. WGSL's
+uniform and storage layouts pad a `vec3<f32>` to 16 bytes; flat has no implicit padding, so a
+GPU-bound `flat` type spells its padding (`pos: f32[3], _pad: f32`), which is the existing flat
+rule and the right one (§3.9).
+
+### 8.4 SIMD
+
+`F32x4` stays the SIMD type: a `v128` with lane-wise operators. A value-tier `f32[4]` *could*
+be held in one `v128` local (constant index = `extract_lane`/`replace_lane`; dynamic index =
+a `br_table`), but VL defines no arithmetic on arrays, so nothing would use the vector
+instructions. Not in v1. The conversions `f32[4]` ↔ `F32x4` are a later std question.
+
+### 8.5 Records and the multi-value step
+
+S1 extends the existing step rather than adding a second one: the same twins, the same
+growth bound, a separate per-array bound (64). A record with an inline `T[N]` field counts its
+fields after expansion against `MV_RECORD_MAX_FIELDS`, so a `{ root: f64[16] }` record is not
+returned as multi-value; the record's own result rule is unchanged.
+
+---
+
+## 9. Risks
+
+1. **The rewrite has to reach every assignment form.** `p[i] op= v`, nested places, `++` if it
+   ever exists, places inside closures. A missed form either refuses a legal program or (worse)
+   writes a temporary. Control: one rewrite function in the checker, and a position matrix row
+   per assignment form, each with the aliasing proof.
+2. **`-O0` allocates** (§6.2). A consumer profiling a debug build will see garbage the release
+   build does not have. The S1 alternative is the emitter-level multi-slot representation of
+   revision 2 (A15), deferred, not rejected.
+3. **The host step can decline** (a `br_table` exit, the growth bound, a module it cannot
+   validate). The program then runs with boxes, correctly but with garbage. Control:
+   `VL_MV_EXPLAIN=1` already says why; S1 adds fixed arrays to its report, and the
+   `plumb-shape-cost.py` and fuel instruments gain a fixed-array shape.
+4. **Boxed placements rebuild on every write.** A loop writing a map-held matrix element by
+   element is O(N²) with garbage. Control: the hint (§5.16), and the uniqueness optimisation
+   later (§6.5).
+5. **Flattening can regress in-cache code** if the per-element bound check is per scalar
+   (§7.3, finding 3).
+6. **Dead-write errors may refuse a pattern someone relies on** (a parameter written for its
+   side effect in a closure is a read, so is safe; the risk is a false positive in the liveness
+   scan). Control: the error names the binding and the last write; it is per-function and
+   needs no interprocedural analysis.
+7. **Adoption (§5.2) changes a binding's type from its uses.** Every adoption ruling so far has
+   had to be all-or-nothing per binding (D3339); the same discipline applies.
+8. **Seed and compile time.** The new type kind trips `kind-ladder-incomplete` at every closed
+   ladder (the safe failure); unrolling to 64 trips grows user modules. Both are measured
+   before S1 lands.
+9. **The unified model may be one concept too many for newcomers** (`T[]`, `T[N]`, `u8[]`,
+   `Buf`). §5.18's table is the test; the panel's newcomer read it (§11).
+
+---
+
+## 10. Owner questions and stated defaults
+
+### 10.1 Questions, in dependency order (one per turn at question time)
+
+**Q1. Is `T[N]` an immutable value whose element assignment replaces the whole value?**
+This overrides `collections-design.md` §VL.6/§OQ.2 for this one type.
+
+```vl
+let a: f64[4] = [0.0; 4]
+let b = a
+b[0] = 1.0
+print(a[0])
 ```
 
-**V8 harness** (`deno run -A [--v8-flags=--no-wasm-inlining] bench.ts x.wasm bench 1000000 7`;
-every import is stubbed):
+* (a) **Value, update by rewrite**: prints `0`. `b[0] = 1.0` is `b = b.with(0, 1.0)`; a
+  `const` refuses it; `f()[0] = 1.0` is not a place.
+* (b) **Fixed-length reference** (§VL.7's representation made nameable): prints `1`, and the
+  allocation is removed only where an optimiser proves no alias (option B, declined on
+  2026-10-04).
+* (c) **Value without element assignment**: `b[0] = 1.0` is refused; `b = b.with(0, 1.0)` is
+  the only update.
 
-```ts
-const [file, exp = "bench", nArg = "1000000", runsArg = "9"] = Deno.args;
-const mod = new WebAssembly.Module(await Deno.readFile(file));
-const imports: Record<string, Record<string, unknown>> = {};
-for (const im of WebAssembly.Module.imports(mod)) {
-  imports[im.module] ??= {};
-  if (im.kind === "function") imports[im.module][im.name] = () => 0;
-  else if (im.kind === "memory") imports[im.module][im.name] = new WebAssembly.Memory({ initial: 1 });
-}
-const inst = new WebAssembly.Instance(mod, imports as WebAssembly.Imports);
-const f = inst.exports[exp] as (n: number) => number;
-const check = f(1000);                       // asserted == 285.2842828502802 by the driver
-for (let w = 0; w < 3; w++) f(100000);
-const ts: number[] = [];
-for (let r = 0; r < Number(runsArg); r++) {
-  const t0 = performance.now(); f(Number(nArg)); ts.push(performance.now() - t0);
-}
-ts.sort((a, b) => a - b);
-console.log(JSON.stringify({ file, exp, check, min: ts[0], median: ts[ts.length >> 1] }));
+*Recommend (a).* (b) is SP-036's complaint; (c) makes every matrix routine (`m4Invert`,
+`jittered`) a chain of `with`, which the rewrite in (a) produces anyway.
+
+**Q2. How is the type spelled?**
+
+```vl
+let m: f64[16]          // (a) the T[] suffix family; f64[3][4] is four f64[3]
+let m: [f64; 16]        // (b) Rust; [[f64; 3]; 4]
+let m: [16 of f64]      // (c) Swift 6.2; [4 of [3 of f64]]
 ```
 
-Scavenges were counted with `--v8-flags=--trace-gc`, as the `Scavenge` lines printed between
-two markers around one `bench(1000000)` call. wasmtime 47 collections come from `VL_GC_STATS=1`.
-The engine limits (A8) came from one-function modules of 1,000 and 1,001 `f64` parameters or
-results, compiled by `new WebAssembly.Module` and `wasmtime compile`.
+*Recommend (a)*: one bracket family (`f64[16][]` is a list of matrices), D's spelling, and
+the free syntax is already there (A13). Its cost is the inside-out nesting order, the reverse
+of C (`f64[3][4]` is four rows of three); (b) and (c) make the order explicit at the cost of a
+second bracket grammar.
+
+**Q3. Which element types are in v1?**
+
+```vl
+f64[16]  u8[4]  boolean[8]  f64[4][4]      // (a), (b), (c)
+V3[4]                                      // (a), (b): V3 = { x: f64, y: f64, z: f64 }
+string[3]  (f64[])[2]                      // (b) only
+```
+
+* (a) Numbers, `u8` (storage rule), `boolean`, nested, and numeric records stored by field.
+* (b) (a) plus references (strings, lists, maps) in every GC placement; a list element makes
+  the array a value of shared lists.
+* (c) Numbers, `u8`, `boolean` and nested only.
+
+*Recommend (a).* `V3[4]` is sunpa's next shape after matrices; references are additive and
+(b)'s lists would make "value" shallow.
+
+**Q4. How is a non-literal value built?**
+
+```vl
+let m: f64[16] = [0.0; 16]; for i in 0 until 4 { m[i * 5] = 1.0 }     // (a) fill + writes
+const m = f64[16].from((i) => if i % 5 == 0 { 1.0 } else { 0.0 })     // (b) generator
+```
+
+* (a) `[v; N]` (evaluates `v` once; a hint when it calls), then element writes.
+* (b) A generator on the type, unrolled when N is constant and the closure is pure.
+* (c) Both.
+
+*Recommend (a)* for v1: element writes are free in the value tier, so the loop is the
+generator; (b) needs a type in expression position, which VL has nowhere else, and can be
+added later.
+
+**Q5. When a value crosses the size cap (64 slots) and becomes boxed, does the user see it?**
+
+```vl
+let big: f64[100] = [0.0; 100]
+for i in 0 until 100 { big[i] = f(i) }    // boxed: each write rebuilds 100 elements
+```
+
+* (a) Silent placement, plus the `fixed-array-boxed-update` hint where a boxed value is written
+  in a loop.
+* (b) A hard limit: `f64[100]` is a check error in value positions.
+* (c) Silent, no hint.
+
+*Recommend (a).* Julia's and Rust's experience is that a hard limit is arbitrary and moves; a
+hint at the site that pays is what users ask for.
+
+### 10.2 Stated defaults (each follows from a ruling or from the model; say so to overturn)
+
+| # | default | follows from |
+| --- | --- | --- |
+| D1 | N is a positive integer literal or a `const` bound to one; `T[0]` refused | the exact-const ruling |
+| D2 | an exact-length literal in a `T[N]` position builds one; elements adapt as scalars | numeric rulings |
+| D3 | a literal-only binding with a `T[N]` use adopts the type; conflicting uses are an error naming both | record covariance, D3339 |
+| D4 | `as` both ways, length only; `m as f64[]` infallible; the trio inward | the `as`-trio corollary |
+| D5 | no implicit `T[N]` ↔ `T[]` conversion | A16, record covariance |
+| D6 | `==` element-wise; `print` refused like lists; not a map key | A11 |
+| D7 | `for` iterates the value at loop start | the model |
+| D8 | `.length` is a constant `i32` | the model |
+| D9 | dynamic index traps out of range; a constant out-of-range index is a check error at the source position | lists; Rust/Go/Zig |
+| D10 | element generics yes; NO length generics; un-annotated parameters instantiate per length | the coordinator's recommendation; Go, C# |
+| D11 | joins of different fixed types are unions; element-wise implicit conversion when exact | numeric-join ruling |
+| D12 | closures capture by reference; an element write is an assignment | D2339 + the rewrite |
+| D13 | `readonly T[N][]` refuses `g[0][3] = x` | the rewrite |
+| D14 | no `inout`; return the value | the model |
+| D15 | a dead element write to a parameter, loop variable or place copy is a check error | A12 |
+| D16 | placement is the compiler's, per §4.3 | the owner's direction |
+| D17 | `T[N]` in an entry-module export is refused in v1 | no consumer |
+| D18 | no std additions; `[v; N]`, indexing, `==`, `for`, `as`, `.length` are built in | the built-in-methods ruling (storage ops only) |
+| D19 | `flat` fields of `T[N]`, with `u8` 1-byte fields | the owner's direction, the u8 storage ruling |
+| D20 | `[...v3, 1.0]` builds a `T[4]`; call spread into fixed parameters is later | variadics |
+| D21 | S1 scalarises through the host step; `-O0` allocates | §6.2 |
+
+---
+
+## 11. Panel dissent
+
+(Filled after the panel review.)
+
+---
+
+## 12. Revision log
+
+**Revision 3 (2026-10-04, lane FA2).** Rewritten as one model after the owner and coordinator
+discussion: an immutable value with update-by-rewrite replaces revision 2's mutable value,
+which removes revision 2's copy invariant, owned boxes, F5′'s place/value classification (now
+the existing assignability rule) and the deep-copy requirement on record spread. Storage is
+placement by position (inline fields, flattened lists, immutable shared boxes) instead of an
+owned box for every storage position. The value tier reuses the #3372 host step instead of a
+multi-slot emitter. Added: the survey with Swift `InlineArray`, Zig's aliasing, Valhalla,
+Julia StaticArrays, OCaml, D; the inline-field, flattened-list and size-cap measurements;
+interop with `flat`, `Buf`, GPU and SIMD; numeric-record and `u8` elements; build slices in
+agent-days. 24 owner questions collapsed to 5, with 21 stated defaults.
+
+**Revision 2 (2026-10-04, after critic 1).** Corrected revision 1's dead-code-eliminated
+benchmark (40 ms "inlined" was three deleted rows); measured `br_table`, scratch memory and
+heap boxes for dynamic indices; added the copy invariant and dead-write rules.
+
+---
+
+## Appendix: benchmark sources
+
+All benchmarks were written in a scratch directory; nothing here is in the build. Wat was
+assembled with `node_modules/.bin/wasm-as --enable-gc --enable-reference-types
+--enable-multivalue --enable-bulk-memory`; VL rows were built by the master seed (`0502ce8f0`)
+with `vl build x.vl -O3`. VL modules with no `print` import nothing, so both engines run them
+directly.
+
+**Revision 2's prototype** (`e_mvg`, `f_struct`, `g_brtable`, the Rust crate and the V8
+harness) is unchanged; its generator is summarised here: `m4Mul` with the signature
+`(param f64 × 32) (result f64 × 16)` whose body leaves the 16 sums on the stack; `bench`
+carries 16 locals, loads `t` from 16 mutable globals, calls `m4Mul` and pops 16 results per
+iteration, and returns `m[12] + m[13] + m[14] + m[15]`. `f_struct` is the same over one
+immutable 16-f64 struct. Rust: `fn m4_mul(a: [f64; 16], b: [f64; 16]) -> [f64; 16]` with the
+triple loop, `#[inline(never)]`, `opt-level = 3`, LTO, `t` behind `black_box`.
+
+**§7.2 record field** (`gen2.py`): types `$R` = `(struct (mut i32) (mut f64) × 16)`, `$RB` =
+`(struct (mut i32) (ref $A))` with `$A = (array (mut f64))`, `$RI` = the same with a mutable
+field; the record lives in a mutable global re-read every iteration. W updates 16 elements with
+constant indices; D does `pose[i & 15] += 1` and reads `pose[(i * 7) & 15]`. The inline D row
+selects the field with a 16-arm `br_table` for the write and another for the read. The rebuild
+rows use `array.new_fixed $A 16` (W) and `array.new` + `array.copy` + `array.set` (D), then
+`struct.set`. The VL rows are:
+
+```vl
+import { filled } from "std:array"
+type R = { count: i32, pose: f64[] }
+let g: R = { count: 0, pose: filled(16, 0.0) }
+export function bench(n: i32): f64 {
+  g = { count: 0, pose: filled(16, 0.0) }
+  let s = 0.0
+  for i in 0 until n {
+    const r = g
+    const j = i & 15
+    r.pose[j] = r.pose[j] + 1.0          // W: for k in 0 until 16 { r.pose[k] = r.pose[k] * 0.999 + x }
+    s = s + r.pose[(i * 7) & 15]
+  }
+  let t = s
+  for k in 0 until 16 { t = t + g.pose[k] }
+  t
+}
+```
+
+**§7.3 lists** (`gen2.py`, `gen4.py`): the VL rows build 1,024 identity matrices either as one
+`f64[]` of 16,384 (pushed) or as `f64[][]`; the stream kernel is `g[b + k] = g[b + k] * 0.999
++ x` (flat) or `m[k] = m[k] * 0.999 + x` with `const m = g[j]` (nested); the bone kernels read
+16 elements into `const a0 … a15`, write the 16 products with `t` read once per call into
+`t0 … t15`, and the allocating row is revision 2's `b_filled` `m4Mul` storing into `g[j]`. The
+raw rows are one `(array (mut f64))` of 16·L against `(array (mut (ref null $A)))` of L rows of
+16, with the same 16 updates per matrix, L = 1,024 (1,000 passes) and 65,536 (16 passes).
+
+**§7.4 cap** (`gen3.py`): `dl_N` holds N `f64` locals and per iteration selects the read with
+an N-arm `br_table` into `$v`, then writes `$v + 1` through another; `db_N` does the same with
+`array.get`/`array.set` on one `(array (mut f64))`. `cm_N` calls `$sum` with N `f64`
+parameters (an add chain) from N locals, updating one local per iteration so nothing is
+hoisted; `cb_N` passes one array reference and the callee reads N constant indices.
+
+**Survey sources** checked on 2026-10-04: Swift SE-0453/SE-0483 and the `InlineArray`
+`Sequence` discussion (forums.swift.org, "SE-0483: InlineArray Type Sugar"; Hacking with Swift,
+"What's new in Swift 6.2"); Zig's hidden pass-by-reference (github.com/ziglang/zig issues
+5973, 12251, 22906); JEP 401 and the null-restricted types draft (openjdk.org/jeps/401,
+openjdk.org/jeps/8316779); StaticArrays.jl's 100-element rule of thumb (its README and
+JuliaArrays/StaticArrays.jl issue 506).
