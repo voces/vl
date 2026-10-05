@@ -211,6 +211,7 @@ export function lint(progRoot: i32) {
     // The typed links describe one module's text; a caller that does not hand them in
     // again is judged as having none, never as having the previous module's.
     lintSetPlusLinks(Map(), false)
+    lintSetStrIndexes(Map(), false)
     // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
     // the arena. All four read the source the driver set, and `commentBudget` consumes
     // it, so it runs last — after the std audience pass, which reads the same text.
@@ -808,9 +809,10 @@ const lintRankDivZero = 7
 const lintRankRangeLen = 8
 const lintRankPreferInterp = 9
 const lintRankCompilerNoInterp = 10
-const lintRankCount = 11
+const lintRankByteAsCp = 11
+const lintRankCount = 12
 
-// Offer `ix` to all eleven structural rules, in rank order. Each visitor opens with its
+// Offer `ix` to all twelve structural rules, in rank order. Each visitor opens with its
 // own `is` test, so this is a flat unconditional sequence: there is no rule id to
 // dispatch on and no chain a new rule could be inserted into in the wrong place.
 function lintVisitAll(ix: i32) {
@@ -825,6 +827,7 @@ function lintVisitAll(ix: i32) {
   rangeLenBoundVisit(ix)
   preferInterpVisit(ix)
   compilerNoInterpVisit(ix)
+  byteAsCpVisit(ix)
   0
 }
 
@@ -865,6 +868,7 @@ function lintRankOfCode(code: string) {
   if code == "range-inclusive-length" { return lintRankRangeLen }
   if code == "prefer-interpolation" { return lintRankPreferInterp }
   if code == "compiler-no-interpolation" { return lintRankCompilerNoInterp }
+  if code == "byte-as-code-point" { return lintRankByteAsCp }
   lintRankCount
 }
 
@@ -1297,6 +1301,228 @@ function piOperandSource(ix: i32) {
   out
 }
 
+// ── 4f. a string's byte where a code point is meant (byte-as-code-point) ──────
+
+// `s[i]` over a `string` is a UTF-8 byte, a character only while the text is ASCII, so
+// `glyphOf(face, text[i])` letters `"Hrímey"` as mojibake. Fires where such a read flows
+// straight into a code-point position: `fromCodePoint`'s argument, a parameter of this
+// module named `cp` or `codePoint`, or a comparison with a non-ASCII character literal.
+const bacMsg = "`s[i]` is a byte, not a character; use `for cp in s` or `codePoints(s)[i]`"
+
+// The index reads the check typed, by anchor byte offset: 1 when the receiver checked as a
+// `string` on every check of it. Unknown unless the caller paired this lint with its check;
+// then `bacAstIdx` stands in, marking the reads whose receiver is visibly a string.
+let bacStrIdx: {[i32]: i32} = Map()
+let bacStrIdxKnown = false
+let bacAstIdx: i32[] = []
+
+export function lintSetStrIndexes(sites: {[i32]: i32}, known: boolean) {
+  bacStrIdx = sites
+  bacStrIdxKnown = known
+  0
+}
+
+function bacMark(ix: i32) {
+  if ix < 0 { return 0 }
+  while bacAstIdx.length <= ix { bacAstIdx.push(0) }
+  bacAstIdx[ix] = 1
+  0
+}
+
+// Whether expression `ix` is visibly a `string` without a checker: a literal, a template, a
+// name declared `string` or initialised from one, or a `.slice` of one. Run from the scope
+// scan, so a name resolves to the binding visible at the read.
+function bacAstStr(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 8 { return false }
+  const e = P.nodes[ix]
+  if e is StrLit { return true }
+  if e is Paren { return bacAstStr(e.parInner, depth + 1) }
+  if e is BinExpr { return e.binTpl == 1 }
+  bacSliceStr(ix, depth)
+}
+
+// The `.slice(…)` arm of `bacAstStr`; every other kind is a name or not a string.
+function bacSliceStr(ix: i32, depth: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Call {
+    if e.callFn < 0 || e.callFn >= P.nodes.length { return false }
+    const f = P.nodes[e.callFn]
+    if f is Member {
+      return f.memProp == "slice" && bacAstStr(f.memObj, depth + 1)
+    }
+    return false
+  }
+  bacNameStr(ix, depth)
+}
+
+// The name arm of `bacAstStr`: the binding the name resolves to, read by `bacDeclStr`.
+function bacNameStr(ix: i32, depth: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Ident {
+    const d = lintBindDecl(e.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    return bacDeclStr(d, depth)
+  }
+  false
+}
+
+// Whether declaration `d` binds a string: a parameter by its annotation, else `bacLetStr`.
+function bacDeclStr(d: i32, depth: i32): boolean {
+  const dn = P.nodes[d]
+  if dn is Param { return bacAnnIsStr(dn.parType) }
+  bacLetStr(d, depth)
+}
+
+// Whether `let`/`const` `d` binds a string, by its annotation or else its initialiser.
+function bacLetStr(d: i32, depth: i32): boolean {
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 { return bacAnnIsStr(dn.letType) }
+    return bacAstStr(dn.letInit, depth + 1)
+  }
+  false
+}
+
+// Whether annotation node `t` spells `string`.
+function bacAnnIsStr(t: i32): boolean {
+  if t < 0 || t >= P.nodes.length { return false }
+  const tn = P.nodes[t]
+  if tn is TypeRef { return tn.tyName == "string" }
+  false
+}
+
+// Whether index read `ix` is a string's byte, by the check's types when the caller paired them.
+function bacIsStrIndex(ix: i32): boolean {
+  if bacStrIdxKnown {
+    const tk = nodeLastTok(ix)
+    if tk < 0 { return false }
+    return (bacStrIdx[P.toks[tk].start] ?? 0) == 1
+  }
+  ix >= 0 && ix < bacAstIdx.length && bacAstIdx[ix] == 1
+}
+
+// Whether `ix` is a character literal naming a code point above U+007F, written as the
+// character itself or as a `\u{…}` escape.
+function bacNonAsciiChar(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is CharLit {
+    const t = e.charText
+    if t.length < 3 { return false }
+    if t[1] >= 128 { return true }
+    if t[1] != '\\' || t[2] != 'u' { return false }
+    let v = 0
+    let i = 4
+    while i < t.length && t[i] != '}' {
+      const c = t[i]
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      if v >= 128 { return true }
+      v = v * 16 + d
+      i = i + 1
+    }
+    return v >= 128
+  }
+  false
+}
+
+// Whether parameter name `nm` says the parameter is a code point.
+function bacCpParam(nm: string): boolean {
+  nm == "cp" || nm == "codePoint" || nm == "codepoint"
+}
+
+function byteAsCpVisit(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Call {
+    if n.callFn < 0 || n.callFn >= P.nodes.length { return 0 }
+    const f = P.nodes[n.callFn]
+    let name = ""
+    let shift = 0
+    if f is Ident { name = f.identName }
+    if f is Member {
+      name = f.memProp
+      shift = 1
+    }
+    if name == "fromCodePoint" && shift == 0 {
+      if n.callArgs.length == 1 { bacReport(n.callArgs[0]) }
+      return 0
+    }
+    bacCpArgs(n, name, shift)
+  } else if n is BinExpr {
+    const op = n.binOp
+    const cmp = op == "=="
+      || op == "!="
+      || op == "<"
+      || op == "<="
+      || op == ">"
+      || op == ">="
+    if !cmp { return 0 }
+    if bacNonAsciiChar(lintUnwrapParen(n.binRight)) { bacReport(n.binLeft) }
+    if bacNonAsciiChar(lintUnwrapParen(n.binLeft)) { bacReport(n.binRight) }
+  }
+  0
+}
+
+// Report each argument of call `n` to this module's function `name` that lands on a
+// code-point parameter; `shift` is 1 for a method call, whose receiver is parameter 0.
+function bacCpArgs(n: Call, name: string, shift: i32) {
+  const d = lintModFnDecl[name] ?? -1
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    let a = 0
+    while a < n.callArgs.length {
+      let named = ""
+      if a < n.callArgNames.length { named = n.callArgNames[a] }
+      if named != "" {
+        if bacCpParam(named) { bacReport(n.callArgs[a]) }
+      } else if a + shift < fd.fnParams.length {
+        const pix = fd.fnParams[a + shift]
+        if pix >= 0 && pix < P.nodes.length {
+          const pn = P.nodes[pix]
+          if pn is Param {
+            if pn.parRest == 0 && bacCpParam(pn.parName) {
+              bacReport(n.callArgs[a])
+            }
+          }
+        }
+      }
+      a = a + 1
+    }
+  }
+  0
+}
+
+// Report `ix0` when, under parentheses and `as` conversions, it is a string's byte. The
+// span is the whole `s[i]`.
+function bacReport(ix0: i32) {
+  let ix = lintUnwrapParen(ix0)
+  let more = true
+  while more && ix >= 0 && ix < P.nodes.length {
+    const e = P.nodes[ix]
+    more = false
+    if e is AsExpr {
+      ix = lintUnwrapParen(e.asObj)
+      more = true
+    }
+  }
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if !(P.nodes[ix] is Index) || !bacIsStrIndex(ix) { return 0 }
+  const first = nodeStartTok(ix)
+  if first < 0 { return 0 }
+  lintEmitAtSpan(
+    "byte-as-code-point",
+    bacMsg,
+    "warning",
+    P.toks[first].line,
+    P.toks[first].col,
+    tokFirstLineEndCol(nodeSpanEndTok(ix)),
+  )
+  0
+}
+
 // ── 4e. compiler/ cannot use interpolation (compiler-no-interpolation) ────────
 
 // `compiler/*.vl` becomes the seed (`build/vl-compiler.wasm`), which loads with no
@@ -1698,6 +1924,8 @@ let visReadSeq = 0
 let visFnMark = -1
 // The module's top-level functions, by name, each with its name token.
 let lintModFns: {[string]: i32} = Map()
+// The same functions' declaration nodes, by name.
+let lintModFnDecl: {[string]: i32} = Map()
 // The body of the innermost enclosing function, or -1 outside any.
 let visFnBody = -1
 
@@ -1805,6 +2033,7 @@ function nameVisit(ix: i32) {
     matchPatNamesVisit(n)
   } else if n is Index {
     lintSawIndexRead = true
+    if bacAstStr(n.idxArr, 0) { bacMark(ix) }
   } else if n is Member {
     // A property read may be a getter's use. `.` opens no identifier, so the key cannot
     // collide with a name.
@@ -2172,6 +2401,7 @@ function bindScan(ix: i32) {
         } else if s is FuncDecl {
           const ft = declNameTokOf(six)
           if ft >= 0 { lintModFns[s.fnName] = ft }
+          lintModFnDecl[s.fnName] = six
         } else if s is ImportDecl {
           let q = 0
           while q < s.impLocals.length {
@@ -2321,6 +2551,8 @@ function collectBindingsAndRefs(progRoot: i32) {
   visFnMark = -1
   visFnBody = -1
   lintModFns = Map()
+  lintModFnDecl = Map()
+  bacAstIdx = []
   lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()
