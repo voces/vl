@@ -128,6 +128,7 @@ import {
   truncSatOp,
   tyHasTyVar,
   tyHoldsNumbersApart,
+  tyIntLitWideTexts,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -152,6 +153,7 @@ import {
   tyToEmitName,
   u8LexValue,
   valueAtomKind,
+  valueTailLeaves,
   widenRetagRowsOf,
 } from "./typecheck"
 import {
@@ -2639,12 +2641,33 @@ function emitNumLitEq(body: u8[], recvIx: i32, lv: string, fnIx: i32) {
   return 0
 }
 
-// Whether every numeric literal text in `texts` is an integer that fits an `i32`.
-function numLitTextsFitI32(texts: string[]): boolean {
+// Whether a receiver of base `base` can be read once and compared with every one of `texts`:
+// each is an integer, and fits `i32` where the base is `i32`; any other base declines.
+function numLitOnceReadOk(base: string, texts: string[]): boolean {
+  const narrow = base == "i32"
   for t in texts {
-    if numLexIsFloat(t) || !numLexFitsI32(t) { return false }
+    if numLexIsFloat(t) || narrow && !numLexFitsI32(t) { return false }
   }
-  true
+  narrow || base == "i64"
+}
+
+// A fresh lazy-frame slot holding a receiver of base `base`, `i32` or `i64`.
+function numLitOnceSlot(base: string): i32 {
+  if base == "i64" { return listElemStashSlot("i64", 0) }
+  strI32Slot()
+}
+
+// Compares the `base` value on the stack, `i32` or `i64`, with the literal `lv`.
+function emitNumLitConstEq(base: string, lv: string) {
+  if base == "i64" {
+    const pr = parseI64Pair(lv)
+    fbI64Const(pr[0], pr[1])
+    fbI32Bin(81) // 0x51 i64.eq
+    return 0
+  }
+  fbI32Const(parseI32(lv))
+  fbI32Bin(70) // 0x46 i32.eq
+  0
 }
 
 // The base numeric scalar an `is` receiver reps as in this instance — `"i32"`/`"i64"`/
@@ -3632,10 +3655,14 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   if nd0 is IsExpr {
     if !exprUnion(nd0.isObj, fnIx) {
-      const nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
+      let nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
+      let nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
+      // An integer literal union over two widths compares at `i64`, which holds every member.
+      if nlBase == "" && isNumRecvBaseName(nd0.isObj, fnIx) == "i64" {
+        nlTexts = tyIntLitWideTexts(isVarTyIxOf(isIx))
+        if nlTexts.length > 0 { nlBase = "i64" }
+      }
       if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
-        const nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
-
         let nlOk = nlTexts.length == 1
         if unionEqOperandOk(nd0.isObj) { nlOk = true }
         if nlTexts.length > 0 && nlOk {
@@ -3649,17 +3676,16 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
           }
           return 0
         }
-        // An `i32` receiver that cannot be re-read is read once into a slot; the name fold
-        // below answers by spelling and would say false for a member (D3570).
-        if nlTexts.length > 0 && nlBase == "i32" && numLitTextsFitI32(nlTexts) {
+        // A receiver that cannot be re-read is read once into a slot of its base; the name
+        // fold below answers by spelling and would say false for a member (D3570, D3590).
+        if nlTexts.length > 0 && numLitOnceReadOk(nlBase, nlTexts) {
           if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-          const nlSlot = strI32Slot()
+          const nlSlot = numLitOnceSlot(nlBase)
           fbLocalSet(nlSlot)
           let nsI = 0
           while nsI < nlTexts.length {
             fbLocalGet(nlSlot)
-            fbI32Const(parseI32(nlTexts[nsI]))
-            fbI32Bin(70) // 0x46 i32.eq
+            emitNumLitConstEq(nlBase, nlTexts[nsI])
             if nsI > 0 {
               fbI32Bin(114) // 0x72 i32.or
             }
@@ -5063,7 +5089,7 @@ export function emitUnionCoerce(
   // if-expression that is already a union value hits the raw pass first and is emitted by
   // `emitExpr`, which picks the join's blocktype from the arms' scalar ladder. Only this arm
   // knows the blocktype has to be the box, so it must be asked first.
-  if bare is IfStmt {
+  if bare is IfStmt && !ifJoinAdaptsScalar(bareIx) {
     // A `null`-typed one is the null-tagged box after its arms run for effect (D3355).
     if nodeTyIsNullType(bareIx) {
       fbI32Const(nullBoxTag())
@@ -5899,6 +5925,32 @@ function emitUnionIfValue(body: u8[], unionName: string, ifIx: i32, fnIx: i32) {
   closeIfChainFrames(open, rc, false)
 }
 
+// Whether the value `if` at `ifIx` is typed one number a runtime tail is not, while every
+// literal tail already has that type: delivered as that number, the runtime tail widens and a
+// literal boxes at its own type as the union chain would box it (D3571).
+function ifJoinAdaptsScalar(ifIx: i32): boolean {
+  const pn = tyPrimNameOf(nodeTyIxOf(ifIx))
+  if pn != "i64" && pn != "f64" && pn != "f32" { return false }
+  let widens = false
+  for lf in valueTailLeaves(ifIx) {
+    if tyPrimNameOf(nodeTyIxOf(lf)) != pn {
+      if nodeIsNumLitLeaf(lf) { return false }
+      widens = true
+    }
+  }
+  widens
+}
+
+// Whether `ix` is a number literal, or `-` over one, through parens.
+function nodeIsNumLitLeaf(ix: i32): boolean {
+  const n = P.nodes[unwrapParen(ix)]
+  if n is Unary {
+    if n.unOp != "-" { return false }
+    return P.nodes[unwrapParen(n.unArg)] is NumLit
+  }
+  n is NumLit
+}
+
 // One link of `emitUnionIfValue`: 0 or -1 as that function returns, or 1 when the else is another `if`
 // and this link's frame is left open (its else restore target pushed onto `open`).
 function emitUnionIfValueLink(
@@ -5939,9 +5991,11 @@ function emitUnionIfValueLink(
       fbStructNew(uBoxIdx)
     } else {
       const els = P.nodes[s.ifElse]
-      if els is IfStmt {
+      if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse) {
         if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
         return 1 // `else if`: the next link, which the caller emits into this open frame
+      } else if els is IfStmt {
+        rc = emitUnionBoxArg(body, unionName, s.ifElse, fnIx)
       } else if sg == 1 {
         rc = emitDeadValueArm(s.ifElse)
       } else {
@@ -5981,6 +6035,10 @@ function emitUnionIfArm(
       // this join's own, so every leaf boxes once, whatever the inner `if` alone would type.
       if P.nodes[unwrapParen(tv)] is IfStmt {
         if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        // An inner join typed one wider number is that number, boxed once (D3571).
+        if ifJoinAdaptsScalar(unwrapParen(tv)) {
+          return emitIfArmClose(emitUnionBoxArg(body, unionName, tv, fnIx))
+        }
         return emitIfArmClose(
           emitUnionIfValue(body, unionName, unwrapParen(tv), fnIx),
         )
@@ -16623,9 +16681,11 @@ function emitNullableIfBindingLink(
       erc = emitNulNullToLocal(body, idx, rep)
     } else {
       const els = P.nodes[s.ifElse]
-      if els is IfStmt {
+      if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse) {
         if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
         return 1 // `else if`: the next link, which the caller emits into this open frame
+      } else if els is IfStmt {
+        erc = emitNulArmToLocal(body, s.ifElse, idx, rep, unionName, fnIx)
       } else {
         erc = emitNulArmBlockToLocal(body, s.ifElse, idx, rep, unionName, fnIx)
       }
@@ -16652,7 +16712,10 @@ function unionIfBindingAllBox(ifIx: i32, fnIx: i32) {
     if !unionIfArmBoxes(ifArmValueExpr(s.ifThen), fnIx) { return false }
     if s.ifElse < 0 { return true }
     const els = P.nodes[s.ifElse]
-    if els is IfStmt { return unionIfBindingAllBox(s.ifElse, fnIx) }
+    if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse) {
+      return unionIfBindingAllBox(s.ifElse, fnIx)
+    }
+    if els is IfStmt { return unionIfArmBoxes(s.ifElse, fnIx) }
     return unionIfArmBoxes(ifArmValueExpr(s.ifElse), fnIx)
   }
   false
@@ -16666,7 +16729,7 @@ function unionIfArmBoxes(valIx: i32, fnIx: i32) {
   if valIx < 0 { return false }
   if exprUnion(valIx, fnIx) { return false }
   const v = P.nodes[unwrapParen(valIx)]
-  if v is IfStmt { return false }
+  if v is IfStmt { return ifJoinAdaptsScalar(unwrapParen(valIx)) }
   true
 }
 
@@ -16776,9 +16839,11 @@ function emitUnionIfBindingSinkLink(
       erc = emitUnionNullToPair()
     } else {
       const els = P.nodes[s.ifElse]
-      if els is IfStmt {
+      if els is IfStmt && !ifJoinAdaptsScalar(s.ifElse) {
         if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
         return 1 // `else if`: the next link, which the caller emits into this open frame
+      } else if els is IfStmt {
+        erc = emitUnionArmToPair(body, s.ifElse, idx, unionName, fnIx)
       } else {
         erc = emitUnionArmBlockToPair(body, s.ifElse, idx, unionName, fnIx)
       }
