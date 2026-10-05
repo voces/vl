@@ -7449,6 +7449,45 @@ expected, so a write through either reaches both. A module whose struct types sp
 groups keeps the shape rule. `$VL_MV_EXPLAIN=1` prints each type's and producer's verdict,
 for consumers to find their own disqualifier.
 
+## `-O` stores a never-written small record inline in its parent (2026-10-05) — sunpa SP-039, D3678
+
+**The defect.** A store into a record field (`j.rot = qnorm(…)`) kept a fresh `Q` box per
+store, and the multi-value step above cannot remove it: a store is not a field use. Slice S1
+of `docs/internals/inline-records-design.md`.
+
+**The rule.** A host step before the multi-value step (`scripts/vl-host/src/inline.rs`)
+replaces a struct field of record type `V` with `V`'s fields when nothing can tell a shared
+box from a copy: `V` is never written (the multi-value step's charge, D3630), no `ref.eq` or
+`extern.convert_any` can see it, it is a leaf of the subtyping order, and no value crossing
+the module boundary can reach it (every type reachable from an import, export, exposed table
+or tag, through fields, elements and signatures; a reachable abstract `any`/`eq`/`struct`
+refuses every record some op hands to such a place, as a union box's payload). Following
+fields is the conservative default the design review asked for: a JS host cannot read a
+struct's fields, and sunpa pays for it (below). `$VL_INLINE_BOUNDARY=direct` follows
+signatures only, to measure the owner's question 2 (inline-records-design.md §6). A parent must be made by `struct.new` in a function body (not `new_default`, not
+a constant expression, D3679), never atomically, must not cross the boundary itself, and must
+lay the field out as its sub- and supertypes do. Every store must be non-null by type; a
+nullable record local that validates as non-null is declared so first.
+
+**Why a cost rule, not just a soundness rule.** A read that needs the whole record re-boxes,
+which allocates where sharing the box did not: sunpa's `Skeleton.rootRotation` is stored once
+and read whole every frame. So a field is inlined only when every read is free — field-read,
+held in a once-set local that is only field-read, or passed to a parameter the multi-value
+step takes as fields. That makes the step never add an allocation, at the price of D3680 (a
+whole read returned to a field-reading caller is free too, and not yet counted so).
+`$VL_INLINE_REBOX=1` lifts the rule so a grid can grade the re-box path.
+
+**Why the host and not the emitter.** The design's table: one module rewrite against ~500
+emitter field sites, and a failure mode of "the input is kept" against check-clean invalid
+wasm. Validation does not catch a shifted index that still type-checks, so every fixture
+grades by output, and the step was swept over the 4,514 `tests/cases` programs (104 changed
+by default, 119 with the cost rule lifted, at the store and at the spill path: all agree).
+
+**Measured.** sunpa's feet check (8,394 posed characters), output identical: `Q` boxes
+78,441 → 53,275 (9.3 → 6.3 per character). `V3` stays at 106,805 under the default rule,
+because the export `animationReady` returns a record with a `V3` field to JS; with
+`$VL_INLINE_BOUNDARY=direct` it falls to 89,937 (12.7 → 10.7).
+
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
 **The defect.** Binaryen inlines a function with several callers only when its size is at most

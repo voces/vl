@@ -1,0 +1,251 @@
+// `-O`/`-O3` STORE A NEVER-WRITTEN SMALL RECORD INLINE IN ITS PARENT'S FIELDS (sunpa SP-039;
+// docs/internals/inline-records-design.md, slice S1).
+//
+// The host's inline-record step replaces a struct field holding a record nobody writes with
+// the record's own fields. Pinned here, per fixture and rung, by OUTPUT: the optimized module
+// prints the unoptimized build's `@log` lines, because a field index that shifted wrongly can
+// still validate. And per fixture kind:
+//
+// * `melts`: `struct.new` sites left in function bodies equal the fixture's `@allocs`, and its
+//   CONTROL, the same rung with the step off (`$VL_OPT_NO_INLINE`), has more;
+// * `grid`: proof rows (a read is a copy taken at the read, stores through every position,
+//   width-subtyped parents). Also built with `$VL_INLINE_REBOX` (inline even where a read
+//   re-boxes) and with `$VL_INLINE_SPILL` too (take every store apart at the store), and in
+//   those the step must have inlined something, so the re-box and spill paths are graded;
+// * `kept`: a disqualifier (a write, a nullable field, a subtype, an export) leaves the step
+//   nothing to do, even with `$VL_INLINE_REBOX`.
+//
+// @test-timing opt
+import {
+  ENABLED,
+  logsOf,
+  ROOT,
+  rustList,
+  vl,
+  WASM_DIS,
+} from "./support/nativeRelease.ts";
+
+const DIR = `${ROOT}/tests/fixtures/opt-inline`;
+type Want = "melts" | "grid" | "kept";
+const FIXTURES: [string, Want][] = [
+  ["stored-fields", "melts"],
+  ["proof-rows", "grid"],
+  ["width-subtyped", "grid"],
+  ["kept-written", "kept"],
+  ["kept-nullable", "kept"],
+  ["kept-subtype", "kept"],
+  ["kept-export", "kept"],
+  ["kept-reached-export", "kept"],
+  ["kept-export-union-parent", "kept"],
+  ["kept-export-union-record", "kept"],
+  ["kept-export-union-list", "kept"],
+  ["kept-export-union-holder", "kept"],
+  ["kept-export-union-map", "kept"],
+];
+const RUNGS = ["-O", "-O3"];
+
+// `struct.new` sites in function bodies: a global's initializer runs once and is not counted.
+const allocations = (wat: string): number => {
+  let inFunc = false, n = 0;
+  for (const line of wat.split("\n")) {
+    if (line.startsWith(" (")) inFunc = line.startsWith(" (func ");
+    if (inFunc) n += line.match(/\(struct\.new/g)?.length ?? 0;
+  }
+  return n;
+};
+
+const run = async (bin: string, args: string[]) => {
+  const p = await new Deno.Command(bin, {
+    args,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const dec = new TextDecoder();
+  return { code: p.code, out: dec.decode(p.stdout), err: dec.decode(p.stderr) };
+};
+
+const linesOf = (out: string) => out.replace(/\n$/, "").split("\n");
+
+const exists = (p: string) => {
+  try {
+    Deno.statSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+for (const [fx, want] of FIXTURES) {
+  Deno.test({
+    name: `native-release: a never-written record is stored inline — ${fx}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const src = `${DIR}/${fx}.vl`;
+      const text = Deno.readTextFileSync(src);
+      const logs = logsOf(text);
+      const allocs = Number(text.match(/^\/\/ @allocs (\d+)$/m)?.[1] ?? -1);
+      const features = rustList(
+        Deno.readTextFileSync(`${ROOT}/scripts/vl-host/src/main.rs`),
+        "BINARYEN_FEATURES",
+      );
+      const tmp = await Deno.makeTempDir();
+      try {
+        const plain = `${tmp}/plain.wasm`;
+        const b0 = await vl(["build", src, "-o", plain]);
+        if (b0.code !== 0) {
+          throw new Error(`${fx}: plain vl build failed: ${b0.err.trim()}`);
+        }
+        const r0 = await vl(["run", plain]);
+        if (
+          r0.code !== 0 ||
+          JSON.stringify(linesOf(r0.out)) !== JSON.stringify(logs)
+        ) {
+          throw new Error(
+            `${fx}: the unoptimized build no longer prints the fixture's @log lines\n` +
+              `  want: ${JSON.stringify(logs)}\n  got:  ${
+                JSON.stringify(linesOf(r0.out))
+              } rc=${r0.code}`,
+          );
+        }
+        // One build of a rung under `env`: graded by output; answers its allocation count and
+        // whether the step changed the module.
+        const built = async (
+          rung: string,
+          tag: string,
+          env: Record<string, string>,
+        ) => {
+          const out = `${tmp}/m${rung}-${tag}.wasm`;
+          const dump = `${tmp}/step${rung}-${tag}.wasm`;
+          const b = await vl(["build", src, rung, "-o", out], {
+            VL_OPT_INLINE_DUMP: dump,
+            ...env,
+          });
+          if (b.code !== 0) {
+            throw new Error(
+              `${fx} ${rung} ${tag}: vl build failed: ${b.err.trim()}`,
+            );
+          }
+          const r = await vl(["run", out]);
+          const got = linesOf(r.out);
+          if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(logs)) {
+            throw new Error(
+              `${fx} ${rung} ${tag}: the optimized module prints something else\n` +
+                `  want: ${JSON.stringify(logs)}\n  got:  ${
+                  JSON.stringify(got)
+                } rc=${r.code} ${r.err.trim()}`,
+            );
+          }
+          const n = allocations((await run(WASM_DIS, [out, ...features])).out);
+          return { n, inlined: exists(dump) };
+        };
+        for (const rung of RUNGS) {
+          const step = await built(rung, "step", {});
+          if (want === "melts") {
+            if (!step.inlined) {
+              throw new Error(`${fx} ${rung}: the step inlined no field`);
+            }
+            if (step.n !== allocs) {
+              throw new Error(
+                `${fx} ${rung}: ${step.n} struct.new left in function bodies\n` +
+                  `  want: ${allocs} — every store and read here is of a record held inline`,
+              );
+            }
+            const off = await built(rung, "off", { VL_OPT_NO_INLINE: "1" });
+            if (off.n <= step.n) {
+              throw new Error(
+                `${fx} ${rung}: with the step off ${off.n} struct.new are left, not more than ` +
+                  `with it (${step.n}): the fixture no longer exercises the step`,
+              );
+            }
+          }
+          if (want === "grid") {
+            for (
+              const [tag, env] of [
+                ["rebox", { VL_INLINE_REBOX: "1" }],
+                ["spill", { VL_INLINE_REBOX: "1", VL_INLINE_SPILL: "1" }],
+              ] as const
+            ) {
+              const forced = await built(rung, tag, env);
+              if (!forced.inlined) {
+                throw new Error(
+                  `${fx} ${rung} ${tag}: the step inlined no field`,
+                );
+              }
+            }
+          }
+          if (want === "kept") {
+            const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+            if (step.inlined || forced.inlined) {
+              throw new Error(
+                `${fx} ${rung}: the step inlined a field a disqualifier should keep boxed`,
+              );
+            }
+          }
+        }
+      } finally {
+        await Deno.remove(tmp, { recursive: true });
+      }
+    },
+  });
+}
+
+// `$VL_INLINE_EXPLAIN` names, per record and per field, why it was or was not inlined.
+Deno.test({
+  name:
+    "native-release: VL_INLINE_EXPLAIN says why each field was or was not inlined",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const cases: [string, RegExp][] = [
+        [
+          "stored-fields",
+          /type \d+ field \d+ \(type \d+\): inlined; 2 store\(s\)/,
+        ],
+        ["kept-written", /refused: its fields are written \(struct\.set/],
+        [
+          "kept-nullable",
+          /not inlined: a value whose type admits null is stored into it/,
+        ],
+        [
+          "kept-export",
+          /refused: a value of it can cross the module boundary \(export /,
+        ],
+        [
+          "kept-reached-export",
+          /refused: a value of it can cross the module boundary \(it is stored as an abstract reference .* export either\)/,
+        ],
+        [
+          "kept-export-union-parent",
+          /can cross the module boundary \(it is stored as an abstract reference/,
+        ],
+        [
+          "kept-export-union-record",
+          /refused: a value of it can cross the module boundary \(it is stored as an abstract reference/,
+        ],
+        [
+          "proof-rows",
+          /not inlined: \d+ of its \d+ read\(s\) take the whole record/,
+        ],
+      ];
+      for (const [fx, want] of cases) {
+        const b = await vl([
+          "build",
+          `${DIR}/${fx}.vl`,
+          "-O",
+          "-o",
+          `${tmp}/${fx}.wasm`,
+        ], {
+          VL_INLINE_EXPLAIN: "1",
+        });
+        if (b.code !== 0 || !want.test(b.err)) {
+          throw new Error(
+            `${fx}: VL_INLINE_EXPLAIN\n  want: ${want}\n  got:  ${b.err.trim()}`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});

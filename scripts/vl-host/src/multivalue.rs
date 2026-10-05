@@ -61,7 +61,7 @@ const MV_GROWTH_FLOOR: usize = 64 << 10;
 const NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Num {
+pub(crate) enum Num {
     I32,
     I64,
     F32,
@@ -69,7 +69,7 @@ enum Num {
 }
 
 impl Num {
-    fn val(self) -> ValType {
+    pub(crate) fn val(self) -> ValType {
         match self {
             Num::I32 => ValType::I32,
             Num::I64 => ValType::I64,
@@ -77,7 +77,7 @@ impl Num {
             Num::F64 => ValType::F64,
         }
     }
-    fn of(v: ValType) -> Option<Num> {
+    pub(crate) fn of(v: ValType) -> Option<Num> {
         match v {
             ValType::I32 => Some(Num::I32),
             ValType::I64 => Some(Num::I64),
@@ -214,7 +214,7 @@ impl Module<'_> {
     }
 }
 
-fn concrete_index(h: HeapType) -> Option<u32> {
+pub(crate) fn concrete_index(h: HeapType) -> Option<u32> {
     match h {
         HeapType::Concrete(UnpackedIndex::Module(i))
         | HeapType::Exact(UnpackedIndex::Module(i)) => Some(i),
@@ -1097,7 +1097,7 @@ fn plan_context(
     Plan { acts }
 }
 
-fn put_uleb(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
@@ -1121,7 +1121,7 @@ fn put_sleb(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
-fn put_val(out: &mut Vec<u8>, v: ValType) -> Option<()> {
+pub(crate) fn put_val(out: &mut Vec<u8>, v: ValType) -> Option<()> {
     match v {
         ValType::I32 => out.push(0x7f),
         ValType::I64 => out.push(0x7e),
@@ -1427,6 +1427,12 @@ impl BodyMove {
         let (old, new) = self.pairs[i - 1];
         new + off.saturating_sub(old)
     }
+}
+
+/// The `(function, parameter)` pairs this step would take as fields in `bytes`: the inline-record
+/// step reads it to know which re-boxed arguments the step deletes.
+pub(crate) fn field_only_params(bytes: &[u8]) -> HashSet<(u32, u32)> {
+    scan(bytes).map_or_else(HashSet::new, |m| analyse(&m).fo_param)
 }
 
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
@@ -1892,7 +1898,7 @@ fn result_record_any(m: &Module, f: u32) -> Option<u32> {
 }
 
 /// Each function's name in the module's `name` section.
-fn function_names(bytes: &[u8]) -> HashMap<u32, String> {
+pub(crate) fn function_names(bytes: &[u8]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
     for payload in Parser::new(0).parse_all(bytes) {
         let Ok(Payload::CustomSection(c)) = payload else {
