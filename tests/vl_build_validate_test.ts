@@ -23,8 +23,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D1400 — a cast's pinned type that an
-// annotated binding copied before the pin). If that hole is closed the fixture stops
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D3689 — an `f64` receiver tested
+// against an integer literal compares against an `i32` constant). If that hole is closed the fixture stops
 // producing an invalid module and this pin would silently go inert — so the first
 // assertions check the PRECONDITION and fail loudly with a swap instruction rather than
 // passing vacuously. Swap in any other source that emits an invalid module; the whole
@@ -52,23 +52,16 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: D1400's annotated-binding cell. `a as? i32` inside an
-// un-annotated function is re-typed when the call pins the hole, but the annotated `x` took its
-// copy of the type before the pin, so the store is `(ref $box)` into an `i32` local —
-// `type mismatch: expected i32, found (ref $type)`. Closing D1400 is a checker change the
-// precondition assertions below catch, rather than silently blessing this pin.
+// Type-checks clean, emits invalid wasm: D3689's witness. `d is 1` with `d: f64` lowers the
+// literal as an `i32` constant beside the `f64` operand — `type mismatch: expected i32, found f64`.
+// Closing D3689 is a change the precondition assertions below catch.
 //
-// It REPLACES the member-variance fixture — `const a: {v: i32} = {v: 1}` then `const b: {v: i32
-// | null} = a` — which the checker refuses since the record-covariance ruling (only a fresh
-// record widens). That one had itself replaced the narrowed-litunion-arm fixture, a `.map`
-// callback PARAMETER spelled as the inline member union, and an unread global binding of a
-// generic function's nullable-closure return. The precondition assertion caught all four.
-const INVALID_SRC = `const u: i32 | null = 5\n` +
-  `function take(a) {\n` +
-  `  const x: i32 = a as? i32\n` +
-  `  print(x)\n` +
-  `}\n` +
-  `take(u)\n`;
+// It REPLACES D1400's annotated-binding cell, which the checker refuses since `as?` over a hole
+// is typed `N | null` before any pin (D3654). Before that: the member-variance fixture (refused
+// since the record-covariance ruling), the narrowed-litunion-arm fixture, a `.map` callback
+// PARAMETER spelled as the inline member union, and an unread global binding of a generic
+// function's nullable-closure return. The precondition assertion caught all five.
+const INVALID_SRC = `const d: f64 = 1.0\nprint(d is 1)\n`;
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
