@@ -279,6 +279,8 @@ import {
   fnValUsed,
   invalidateFnChildIndex,
   lambdaCtr,
+  lfNoteClone,
+  lfNoteMinted,
   monoAnonParamPinTy,
   monoExactSubN,
   monoExactSubRow,
@@ -349,8 +351,9 @@ import {
   fnBlockShadowsAt,
   fnHasUnannotatedParam,
   fnIndexOf,
-  fnIndexOfInScope,
+  fnIndexOfAt,
   fnIndexOfInScopeAt,
+  fnIndexOfNode,
   fnRetExprOf,
   fnSigKeyOf,
   fnStmtsPosOf,
@@ -495,7 +498,7 @@ function monoFnNameIsSourceNamed(nm: string) {
 // for an un-annotated lambda argument it inferred the param types from the generic
 // param's substituted expected type, which the syntactic build below cannot recover.
 // The gate is the arena (`nodeTyIsFunc`), and the struct part is nominalized once here.
-function monoArgFnTypeName(argIx: i32, _fnIx: i32) {
+function monoArgFnTypeName(argIx: i32, fnIx: i32) {
   const ax = unwrapParen(argIx)
   const an = P.nodes[ax]
 
@@ -505,7 +508,7 @@ function monoArgFnTypeName(argIx: i32, _fnIx: i32) {
   }
   let fe = -1
   if an is FuncDecl { fe = fnStmtsPosOf(ax) }
-  else if an is Ident { fe = fnIndexOf(an.identName) }
+  else if an is Ident { fe = fnIndexOfAt(sidOfNode(ax), fnIx, ax) }
   if fe < 0 || fe >= fnStmts.length { return "" }
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
@@ -1304,8 +1307,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
       // Scope-aware, for the reason the direct-call resolution below already is: a per-pin
       // clone shares its template's NAME, so the flat map answers the template's signature
       // in every instance and one pin key serves them all (D1795).
-      let cfe = fnIndexOfInScope(ce.identName, fnIx)
-      if cfe < 0 { cfe = fnIndexOf(ce.identName) }
+      let cfe = fnIndexOfInScopeAt(sidOfNode(cax), ce.identName, fnIx, cax)
+      if cfe < 0 { cfe = fnIndexOfAt(sidOfNode(cax), fnIx, cax) }
       if cfe >= 0 {
         const ck = fnSigKeyOf(cfe)
         if ck != "" { return "=>" + ck }
@@ -1335,8 +1338,14 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
     const argCallee = P.nodes[argN.callFn]
     if argCallee is Ident {
       // Scope-aware, as the closure pin above: a nested namesake is not the flat map's first.
-      let acfe = fnIndexOfInScope(argCallee.identName, fnIx)
-      if acfe < 0 { acfe = fnIndexOf(argCallee.identName) }
+      const acx = argN.callFn
+      let acfe = fnIndexOfInScopeAt(
+        sidOfNode(acx),
+        argCallee.identName,
+        fnIx,
+        acx,
+      )
+      if acfe < 0 { acfe = fnIndexOfAt(sidOfNode(acx), fnIx, acx) }
       if acfe >= 0 {
         const acfn = P.nodes[fnStmts[acfe]]
         if acfn is FuncDecl {
@@ -3688,7 +3697,9 @@ function monoCloneLambdaSubst(
     // callback is rebuilt from an argument position, not from a lifted slot of its own.)
     fnParent.push(monoLamParentOf(fnIx))
     const mySlot = fnStmts.length - 1
-    monoCloneKeepsHoles(monoSlotOfLamNode(fnIx), mySlot, clone)
+    const tmplSlot = monoSlotOfLamNode(fnIx)
+    monoCloneKeepsHoles(tmplSlot, mySlot, clone)
+    lfNoteClone(mySlot, tmplSlot)
     monoReparentNestedLams(mark, mySlot)
     monoLamMintedSlots.push(mySlot)
     monoLamCloneSlots.push(mySlot)
@@ -5381,11 +5392,11 @@ function monoBakeCallback(
   ix
 }
 
-// Whether `name` resolves to a lifted slot the pre-pass flagged generic — the condition
-// under which `monoWalk` reaches `monoInstantiate` and renames a callee `Ident` in place.
-// An appended instance slot (past the frozen `monoGen` length) is concrete.
-function monoCalleeIsGeneric(name: string) {
-  const fe = fnIndexOf(name)
+// Whether the callee identifier at `calleeIx` resolves to a lifted slot the pre-pass flagged
+// generic — the condition under which `monoWalk` reaches `monoInstantiate` and renames a callee
+// `Ident` in place. An appended instance slot (past the frozen `monoGen` length) is concrete.
+function monoCalleeIsGeneric(calleeIx: i32) {
+  const fe = fnIndexOfNode(calleeIx)
   if fe < 0 { return false }
   if fe >= monoGen.length { return false }
   monoGen[fe] == 1
@@ -5921,8 +5932,8 @@ function monoRetReachesClash(
   if !(n is Call) { return false }
   const c = P.nodes[n.callFn]
   if !(c is Ident) { return false }
-  if !monoCalleeIsGeneric(c.identName) { return false }
-  const fe = fnIndexOf(c.identName)
+  if !monoCalleeIsGeneric(n.callFn) { return false }
+  const fe = fnIndexOfNode(n.callFn)
   if fe < 0 || fe >= fnStmts.length || monoSeenHas(seen, fe) { return false }
   seen.push(fe)
   const f = P.nodes[fnStmts[fe]]
@@ -5981,10 +5992,12 @@ function monoCloneGenericCallsRaw(ix: i32) {
     const callee = P.nodes[n.callFn]
     let lamCall = false
     if callee is Ident {
-      if monoCalleeIsGeneric(callee.identName) {
+      if monoCalleeIsGeneric(n.callFn) {
         newCallee = mkIdent(callee.identName, callee.pos)
+        lfNoteMinted(newCallee, n.callFn)
       } else if monoStrListHas(monoCgcLamNames, callee.identName) {
         newCallee = mkIdent(callee.identName, callee.pos)
+        lfNoteMinted(newCallee, n.callFn)
         monoLamCallCallees.push(newCallee)
         lamCall = true
       }
@@ -7150,7 +7163,7 @@ function monoTestsTyVar(ix: i32): boolean {
   if n is Call {
     const cf = P.nodes[n.callFn]
     if cf is Ident {
-      if monoCalleeIsGeneric(cf.identName) {
+      if monoCalleeIsGeneric(n.callFn) {
         let passes = callTyArgsOf(ix).length > 0
         let a = 0
         while a < n.callArgs.length && !passes {
@@ -7158,7 +7171,7 @@ function monoTestsTyVar(ix: i32): boolean {
           a = a + 1
         }
         // A callee still being asked is on this walk's own cycle and answers nothing new.
-        if passes && monoNeedsExactKey(fnIndexOf(cf.identName)) { return true }
+        if passes && monoNeedsExactKey(fnIndexOfNode(n.callFn)) { return true }
       }
     }
   }
