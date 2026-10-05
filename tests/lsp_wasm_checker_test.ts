@@ -1190,6 +1190,34 @@ Deno.test({ name: "wasm-checker: byte-as-code-point shows in the editor, over th
   }
 });
 
+Deno.test({ name: "wasm-checker: a discarded line led by `-` shows in the editor, over the statement (D3673)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-040: the second line of `w` is its own statement. The editor lints before it
+  // checks, so this is the untyped face: parameters annotated as scalars fire, while a field
+  // read and a local initialised by a call need the check's types and stay quiet here.
+  const src = "type Cam = { x: f64, y: f64 }\n" +
+    "function mk() { 2.0 }\n" +
+    "function f(a: f64, b: f64, c: Cam): f64 {\n" +
+    "  const w = a * 3.0\n" +
+    "    - b * 3.5\n" +
+    "  a + b\n" +
+    "  c.x - c.y\n" +
+    "  const t = mk()\n" +
+    "  t * 2.0\n" +
+    "  w\n" +
+    "}\n" +
+    "print(f(1.0, 1.0, { x: 1.0, y: 2.0 }))\n";
+  const diags = checker.lint(src).filter((x) => x.code === "unused-pure-expression");
+  const got = diags.map((d) => [rangeText(src, d.range), d.severity, d.message.slice(0, 34)]);
+  const want = [
+    ["- b * 3.5", "warning", "this line is a separate statement;"],
+    ["a + b", "warning", "This expression has no effect: it "],
+  ];
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  }
+});
+
 Deno.test({ name: "wasm-checker: lint returns [] on a parse error", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   if (checker.lint("function f( {\n").length !== 0) {

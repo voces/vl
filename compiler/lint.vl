@@ -212,6 +212,7 @@ export function lint(progRoot: i32) {
     // again is judged as having none, never as having the previous module's.
     lintSetPlusLinks(Map(), false)
     lintSetStrIndexes(Map(), false)
+    lintSetScalarReads(Map(), false)
     // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
     // the arena. All four read the source the driver set, and `commentBudget` consumes
     // it, so it runs last — after the std audience pass, which reads the same text.
@@ -676,9 +677,9 @@ function blockRereads(ix: i32, recvName: string, key: i32) {
 // another after it in the same list can have its value discarded for sure.
 
 // Trivially pure is a closed syntactic whitelist — literals, a bare identifier read,
-// `(e)` over pure, an array or struct literal of pure parts, and an operator
-// expression whose every leaf is a literal. The literal-leaf bound is soundness: VL
-// has operator overloading, and dispatch needs an object-typed left operand.
+// `(e)` over pure, an array or struct literal of pure parts, and an operator tree whose
+// leaves are literals or reads of plain scalars (`upeScalarOperand`). The scalar bound is
+// soundness: VL has operator overloading, and dispatch needs a non-scalar operand.
 function unusedPureExprVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Block { reportUnusedPureIn(n.blkStmts) }
@@ -698,17 +699,164 @@ function reportUnusedPureIn(stmts: i32[]) {
       const nx = P.nodes[nxi]
       if nx is BreakStmt { isBrkVal = nx.brkHasVal == 1 }
     }
-    if !isBrkVal && upeIsPure(stmts[i]) {
-      lintEmit(
-        "unused-pure-expression",
-        "This expression has no effect: it is not the final statement of its block, so its value is discarded",
-        "warning",
-        stmts[i],
-      )
+    const st = stmts[i]
+    // A line led by `-` is reported whatever its operands: the claim is only that its value
+    // is discarded, which holds of every operator statement before the last.
+    const minus = i > 0 && upeLeadsWithMinus(st)
+    if !isBrkVal && (minus || upeIsPure(st) || upeScalarOperand(st, 0)) {
+      let msg = "This expression has no effect: it is not the final statement of its block, so its value is discarded"
+      if minus { msg = upeMinusMsg }
+      const first = nodeStartTok(st)
+      if first < 0 {
+        lintEmit("unused-pure-expression", msg, "warning", st)
+      } else {
+        lintEmitAtSpan(
+          "unused-pure-expression",
+          msg,
+          "warning",
+          P.toks[first].line,
+          P.toks[first].col,
+          tokFirstLineEndCol(nodeSpanEndTok(st)),
+        )
+      }
     }
     i = i + 1
   }
   0
+}
+
+// A leading `-` does not continue the line above (a leading `+` does), so `a * 3.0` over
+// `- b * 3.5` is two statements and the second is thrown away.
+const upeMinusMsg = "this line is a separate statement; its value is discarded. If it continues the expression above, wrap it in parentheses or put the operator at the end of the previous line"
+
+// Whether statement `ix` is an operator expression opening with a `-` on a line of its own,
+// below an earlier token.
+function upeLeadsWithMinus(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  let op = e is Unary
+  if e is BinExpr { op = e.binOp != "=" && e.binTpl == 0 }
+  if !op { return false }
+  const first = nodeStartTok(ix)
+  if first <= 0 || first >= P.toks.length { return false }
+  if P.toks[first].text != "-" { return false }
+  P.toks[first - 1].line < P.toks[first].line
+}
+
+// The reads under a discarded operator statement the check typed, by anchor byte offset: 1
+// when the read checked as an unbranded scalar on every check of it. Unknown unless the
+// caller paired this lint with its check; `upeAstIdx` then marks the names visibly scalar.
+let upeScalarBank: {[i32]: i32} = Map()
+let upeScalarKnown = false
+let upeAstIdx: i32[] = []
+
+export function lintSetScalarReads(sites: {[i32]: i32}, known: boolean) {
+  upeScalarBank = sites
+  upeScalarKnown = known
+  0
+}
+
+// Mark each name read under operator statement `ix` whose binding is visibly a plain scalar.
+// Run from the scope scan just before the statement, so a name resolves as it reads there.
+function upeAstMark(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return 0 }
+  const e = P.nodes[ix]
+  if e is Paren { return upeAstMark(e.parInner, depth + 1) }
+  if e is Unary { return upeAstMark(e.unArg, depth + 1) }
+  if e is BinExpr {
+    if e.binOp == "=" || e.binTpl == 1 { return 0 }
+    upeAstMark(e.binLeft, depth + 1)
+    return upeAstMark(e.binRight, depth + 1)
+  }
+  upeAstMarkName(ix)
+}
+
+// The leaf arm of `upeAstMark`: a name read is marked when its binding is a plain scalar;
+// every other leaf is left for the check's types.
+function upeAstMarkName(ix: i32) {
+  const e = P.nodes[ix]
+  if e is Ident {
+    if upeDeclScalar(lintBindDecl(e.identName)) {
+      while upeAstIdx.length <= ix { upeAstIdx.push(0) }
+      upeAstIdx[ix] = 1
+    }
+  }
+  0
+}
+
+// Whether declaration `d` binds a plain scalar: a parameter by its annotation, else
+// `upeLetScalar`.
+function upeDeclScalar(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is Param { return dn.parRest == 0 && upeAnnScalar(dn.parType) }
+  upeLetScalar(d)
+}
+
+// Whether `let`/`const` `d` binds a plain scalar: by its annotation, else by an initialiser
+// that is a tree of literals other than a bare `null`.
+function upeLetScalar(d: i32): boolean {
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 { return upeAnnScalar(dn.letType) }
+    const init = lintUnwrapParen(dn.letInit)
+    if init < 0 || init >= P.nodes.length || P.nodes[init] is NullLit {
+      return false
+    }
+    return upeLitOperand(init)
+  }
+  false
+}
+
+// Whether annotation node `t` spells a numeric primitive, `boolean` or `string`.
+function upeAnnScalar(t: i32): boolean {
+  if t < 0 || t >= P.nodes.length { return false }
+  const tn = P.nodes[t]
+  if tn is TypeRef {
+    const nm = tn.tyName
+    return nm == "i32"
+      || nm == "i64"
+      || nm == "f32"
+      || nm == "f64"
+      || nm == "boolean"
+      || nm == "string"
+  }
+  false
+}
+
+// Whether read `ix` is a plain scalar: a name `upeAstMark` marked, or a name or field read
+// the paired check typed as one.
+function upeScalarLeaf(ix: i32): boolean {
+  if ix < upeAstIdx.length && upeAstIdx[ix] == 1 { return true }
+  if !upeScalarKnown { return false }
+  const tk = nodeLastTok(ix)
+  if tk < 0 { return false }
+  (upeScalarBank[P.toks[tk].start] ?? 0) == 1
+}
+
+// The operator sub-language over plain scalars: a literal, a scalar read, `(e)`, unary `-` /
+// `!` / `~`, or a whitelisted binary other than `/` and `%` over a read. No overload can take
+// an operator whose operands are scalars, so the whole tree is pure.
+function upeScalarOperand(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return false }
+  const e = P.nodes[ix]
+  if e is Ident || e is Member { return upeScalarLeaf(ix) }
+  if e is Paren { return upeScalarOperand(e.parInner, depth + 1) }
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "!" || e.unOp == "~" {
+      return upeScalarOperand(e.unArg, depth + 1)
+    }
+    return false
+  }
+  if e is BinExpr {
+    if e.binTpl == 1 || !upePureBinOp(e.binOp) { return false }
+    // An integer `/` or `%` by a read can trap on zero; over literals it is decided here.
+    if e.binOp == "/" || e.binOp == "%" { return upeLitOperand(ix) }
+    return upeScalarOperand(e.binLeft, depth + 1)
+      && upeScalarOperand(e.binRight, depth + 1)
+  }
+  // A literal leaf, or nothing this sub-language admits.
+  upeLitOperand(ix)
 }
 
 // The closed binary-operator whitelist: every value-producing operator the parser
@@ -2418,6 +2566,7 @@ function bindScan(ix: i32) {
     while i < n.progStmts.length {
       const six = n.progStmts[i]
       if six >= 0 && six < P.nodes.length {
+        if i + 1 < n.progStmts.length { upeAstMark(six, 0) }
         const s = P.nodes[six]
         if s is LetDecl { bindScanLetInit(six) } else { bindScan(six) }
       }
@@ -2430,6 +2579,7 @@ function bindScan(ix: i32) {
     const mark = visNames.length
     let i = 0
     while i < n.blkStmts.length {
+      if i + 1 < n.blkStmts.length { upeAstMark(n.blkStmts[i], 0) }
       bindScan(n.blkStmts[i])
       i = i + 1
     }
@@ -2553,6 +2703,7 @@ function collectBindingsAndRefs(progRoot: i32) {
   lintModFns = Map()
   lintModFnDecl = Map()
   bacAstIdx = []
+  upeAstIdx = []
   lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()
@@ -3944,16 +4095,18 @@ const klListRepGate = [
 const klRepKeyMode = ["canon", "elem", "mv"]
 // `CliWithheld` — compiler/cli.vl
 const klCliWithheld = ["shown", "std", "import", "exclude"]
+// `PlTable` — compiler/driver.vl
+const klPlTable = ["plus", "strIdx", "scalar"]
 
 // Smallest first, so `klSetOf` can take the first set that holds every arm and land
 // on the same answer the census's "smallest set containing them all" does.
 const klSetNames = [
   "AsMode", "BtKind", "MfKind", "PushKind", "PrimName", "Ty", "RtKind",
   "EqCmpKind", "VKind", "Node", "TokKind", "StashWant", "ListRepGate",
-  "RepKeyMode", "CliWithheld",
+  "RepKeyMode", "CliWithheld", "PlTable",
 ]
 // 1 when the set's members are type names (`x is TyObj`), 0 when string literals.
-const klSetIsType = [0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+const klSetIsType = [0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
 
 // The i-th set's members. A dispatch on an index, not on a kind — the lint's own
 // ladders are over `i32`, so this rule cannot report itself.
@@ -3973,6 +4126,7 @@ function klSetMembers(i: i32): string[] {
   if i == 12 { return klListRepGate }
   if i == 13 { return klRepKeyMode }
   if i == 14 { return klCliWithheld }
+  if i == 15 { return klPlTable }
   []
 }
 

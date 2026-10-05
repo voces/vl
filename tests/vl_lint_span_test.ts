@@ -112,6 +112,30 @@ Deno.test({
 });
 
 Deno.test({
+  name: "lint span: unused-pure-expression covers the discarded statement (D3673)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "discard.vl",
+      [
+        "type Cam = { x: f64, y: f64 }",
+        "function f(a: f64, b: f64, c: Cam) {",
+        "  const w = a * 3.0",
+        "    - b * 3.5",
+        "  c.x - c.y",
+        "  w",
+        "}",
+        "print(f(1.0, 1.0, { x: 1.0, y: 2.0 }))",
+        "",
+      ].join("\n"),
+    );
+    // The field reads only the check can type: this is the typed face the CLI pairs.
+    const got = diags.filter((d) => d.code === "unused-pure-expression").map((d) => spanText(src, d));
+    want(JSON.stringify(got), JSON.stringify(["- b * 3.5", "c.x - c.y"]), "unused-pure-expression");
+  },
+});
+
+Deno.test({
   name: "lint span: sentinel-index-unguarded covers the whole read, not the table",
   ignore: !ENABLED,
   fn: async () => {
