@@ -1098,6 +1098,7 @@ import {
   retNulRefFlag,
   retNulRefIndex,
   retNulVariantFlag,
+  retResultVKind,
   retStructRowIndex,
   retTRFlag,
   retUnionFlag,
@@ -3674,10 +3675,14 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
     if !exprUnion(nd0.isObj, fnIx) {
       let nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
       let nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
-      // An integer literal union over two widths compares at `i64`, which holds every member.
-      if nlBase == "" && isNumRecvBaseName(nd0.isObj, fnIx) == "i64" {
-        nlTexts = tyIntLitWideTexts(isVarTyIxOf(isIx))
-        if nlTexts.length > 0 { nlBase = "i64" }
+      // An `i64` receiver compares at `i64`, which holds every member of an `i32` union and
+      // of an integer union over both widths (D3658).
+      if isNumRecvBaseName(nd0.isObj, fnIx) == "i64" {
+        if nlBase == "" {
+          nlTexts = tyIntLitWideTexts(isVarTyIxOf(isIx))
+          if nlTexts.length > 0 { nlBase = "i64" }
+        }
+        if nlBase == "i32" { nlBase = "i64" }
       }
       if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
         let nlOk = nlTexts.length == 1
@@ -24422,7 +24427,7 @@ function uBoxSinkToPair() {
 function emitReturnExit(body: u8[], retArg: i32, fnIx: i32) {
   if fnUsesUnionSink {
     const bare = P.nodes[unwrapParen(retArg)]
-    if bare is IfStmt {
+    if bare is IfStmt && !tailIfReturnsWhole(unwrapParen(retArg), fnIx) {
       return emitUnionRetIfSink(body, unwrapParen(retArg), fnIx)
     }
   }
@@ -24473,6 +24478,8 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
       // function's own null, exiting like every other arm.
       rc = emitNullForRet(body, fnIx)
       if rc >= 0 { rc = emitUnionRetSink(fnIx) }
+    } else if tailIfReturnsWhole(s.ifElse, fnIx) {
+      rc = emitReturnExit(body, s.ifElse, fnIx)
     } else if P.nodes[s.ifElse] is IfStmt {
       if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
       return 1 // `else if`: the next link, which the caller emits into this open frame
@@ -24486,6 +24493,14 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
     return 0
   }
   emitFail("emitProgram: expected a union if-expression")
+}
+
+// Whether the value `if` at `ifIx`, returned by `fnIx`, is delivered as one value rather than
+// as one return per arm: a union result boxes an inner join typed one wider number once, at
+// that number, as a binding of the same `if` does (D3656).
+function tailIfReturnsWhole(ifIx: i32, fnIx: i32): boolean {
+  if !(P.nodes[ifIx] is IfStmt) || !ifJoinAdaptsScalar(ifIx) { return false }
+  retResultVKind(fnIx, fnStmtsPosOf(fnIx)) == "union"
 }
 
 // One arm of a sunk returned if-expression: the arm's prelude, then its tail-value
@@ -27614,6 +27629,9 @@ function emitStmtTail(body: u8[], stmtIx: i32, fnIx: i32) {
 // position): each arm is lowered with its last statement tail-aware (`emitStmtsTail`).
 // Mirrors `emitStmt`'s void-if shape, but routes the arm bodies through the tail path.
 function emitIfTail(body: u8[], stmtIx: i32, fnIx: i32) {
+  if tailIfReturnsWhole(stmtIx, fnIx) {
+    return emitReturnExit(body, stmtIx, fnIx)
+  }
   // An `else if` chain is lowered along its spine, as `emitIfStmtStmt` lowers one (D1990).
   const open: i32[] = []
   let cur = stmtIx
@@ -27664,12 +27682,14 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
     const els = P.nodes[s.ifElse]
-    if els is IfStmt {
+    if els is IfStmt && !tailIfReturnsWhole(s.ifElse, fnIx) {
       // `else if`: the next link, still in tail position.
       if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
       return 1
     }
-    if els is Block {
+    if els is IfStmt {
+      if emitReturnExit(body, s.ifElse, fnIx) < 0 { return -1 }
+    } else if els is Block {
       if emitStmtsTail(body, s.ifElse, fnIx) < 0 { return -1 }
     } else {
       if emitStmtTail(body, s.ifElse, fnIx) < 0 { return -1 }
