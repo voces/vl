@@ -3577,14 +3577,21 @@ export function tyOfMembers(ms: i32[]): i32 {
 }
 
 function mkUnionTy(members: i32[]) {
+  noteUnionMembers(members)
+  const t: Ty = { uMembers: members }
+  addTy(t)
+}
+
+// Raises the mint gates `members` earns. A declared union's placeholder is minted empty and
+// filled in place, so its fill calls this too, or an alias would skip the hooks (D3543).
+function noteUnionMembers(members: i32[]) {
   let i = 0
   while i < members.length && !tyWideUnionMinted {
     if tyIsWidePrim(members[i]) { tyWideUnionMinted = true }
     i = i + 1
   }
   if !numUnionMinted { noteNumUnionMint(members) }
-  const t: Ty = { uMembers: members }
-  addTy(t)
+  0
 }
 
 function mkNullableTy(inner: i32) {
@@ -28327,10 +28334,24 @@ export function nodeNumScalarBaseName(ix: i32) {
 export function tyNumLitMemberTexts(ty: i32) {
   const out: string[] = []
   if !numLitUnionHasBase(ty) { return out }
+  litMemberTextsInto(numLitPeeled(ty), out)
+}
+
+// The member literal texts of an integer literal union whose members span two widths
+// (`1 | 3000000000`), which has no single base and so no `tyNumLitMemberTexts`; else empty.
+export function tyIntLitWideTexts(ty: i32): string[] {
+  const out: string[] = []
+  const cur = numLitPeeled(ty)
+  if intLitUnionBasesOf(cur).length == 0 { return out }
+  litMemberTextsInto(cur, out)
+}
+
+// `ty` with up to eight one-member union wrappers peeled, or -1.
+function numLitPeeled(ty: i32): i32 {
   let cur = ty
   let peels = 0
   while peels < 8 {
-    if cur < 0 { return out }
+    if cur < 0 { return -1 }
     const t = T.tys[cur]
     let inner = -1
     if t is TyUnion {
@@ -28343,6 +28364,11 @@ export function tyNumLitMemberTexts(ty: i32) {
       peels = peels + 1
     }
   }
+  cur
+}
+
+// The literal texts of `cur`, a literal or a union of them, pushed onto `out`; returns `out`.
+function litMemberTextsInto(cur: i32, out: string[]): string[] {
   if cur < 0 { return out }
   const ct = T.tys[cur]
   if ct is TyUnion {
@@ -31193,6 +31219,14 @@ function cwFnDeclOf(fnName: string): i32 {
 // a binding initialised with anything else — a function-typed parameter, a call result — has
 // no parameter list in the arena and declines. D1683.
 function cwLambdaDeclOf(nm: string, fr: i32): i32 {
+  const init = cwBoundInitOf(nm, fr)
+  if init >= 0 && P.nodes[init] is FuncDecl { return init }
+  -1
+}
+
+// The initialiser, parens peeled, of the binding `nm` bound exactly once in frame `fr` and never
+// re-pointed, or -1.
+function cwBoundInitOf(nm: string, fr: i32): i32 {
   if nm == "" { return -1 }
   cwIxBuild()
   if !cwBoundOnce(nm, fr) { return -1 }
@@ -31210,10 +31244,7 @@ function cwLambdaDeclOf(nm: string, fr: i32): i32 {
       const b = P.nodes[cwIxNode[r]]
       if b is LetDecl {
         const init = cwPeel(b.letInit)
-        if init >= 0 && init < P.nodes.length {
-          const f = P.nodes[init]
-          if f is FuncDecl { return init }
-        }
+        if init >= 0 && init < P.nodes.length { return init }
       }
     }
   }
@@ -46483,6 +46514,12 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     const p0 = T.tys[params[0]]
     if p0 is TyVar {
       if !holeDemandOk(p0.tvName, -1, recvTy) { return -1 }
+      // The receiver pins `self` as an argument pins its parameter, casts parked on it included.
+      holeCastPinCheck(
+        p0.tvName,
+        recvTy,
+        declParamNameAt(declParamsInScope(name), 0),
+      )
     }
     // The receiver is the first argument a literal can be, for the destination's binding.
     const uDst: string[] = []
@@ -48142,7 +48179,11 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         if tyIsListView(at) { holeArgViewErr(i + 1, at, args[i]) }
       }
       // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
-      holeCastPinCheck(pHole.tvName, at, declParamNameAt(dParams, i))
+      holeCastPinCheck(
+        pHole.tvName,
+        at,
+        holeCastParamName(n.callFn, dParams, i, pHole.tvName),
+      )
     }
     // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
     // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
@@ -52329,6 +52370,7 @@ function fillTypeDeclAt(sx: i32) {
           }
           // The 0a placeholder union is just filled in place (`members` is
           // its `uMembers` array) — an existing arena entry changed shape.
+          noteUnionMembers(members)
           tyMutEpoch = tyMutEpoch + 1
           if resolvedAny && members.length == 0 {
             // Explains the empty intersection in source terms: names the two operands and
@@ -64924,6 +64966,38 @@ function declParamNameAt(dParams: i32[], i: i32): string {
   const pn = P.nodes[dParams[i]]
   if pn is Param { return pn.parName }
   ""
+}
+
+// The name of parameter `i` of the callee a parked cast on hole `name` speaks for: the declared
+// function's, else the lambda a `const` binds once, so a call through it re-asks the cast (D3624).
+function holeCastParamName(
+  callFnIx: i32,
+  dParams: i32[],
+  i: i32,
+  name: string,
+): string {
+  const dn = declParamNameAt(dParams, i)
+  if dn != "" { return dn }
+  let parked = false
+  for hn in holeCastNames {
+    if hn == name { parked = true }
+  }
+  if !parked { return "" }
+  const ld = holeCastCalleeDeclOf(callFnIx, 8)
+  if ld < 0 { return "" }
+  const f = P.nodes[ld]
+  if f is FuncDecl { return declParamNameAt(f.fnParams, i) }
+  ""
+}
+
+// The `FuncDecl` a callee reaches, through up to `depth` `const` aliases of a function or a
+// lambda (`const j = k`), or -1.
+function holeCastCalleeDeclOf(callFnIx: i32, depth: i32): i32 {
+  const d = cwCalleeDeclOf(callFnIx)
+  if d >= 0 || depth <= 0 { return d }
+  const init = cwBoundInitOf(covarRootName(callFnIx), covarRootFrame(callFnIx))
+  if init < 0 || !(P.nodes[init] is Ident) { return -1 }
+  holeCastCalleeDeclOf(init, depth - 1)
 }
 
 // Every parked cast on hole `name`, re-asked under the type this call site pinned it to. The
