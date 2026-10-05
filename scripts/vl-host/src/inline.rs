@@ -162,6 +162,8 @@ struct Scan {
     /// The concrete types some op hands to a place typed `any`, `eq` or `struct` (a union
     /// box's payload, say): only a record one of them can hold is carried by `crossing_any`.
     erased: HashMap<u32, u32>,
+    /// Some op handed an abstract place a value whose type could not be mapped back.
+    erased_any: Option<u32>,
     bodies: Vec<Body>,
     reads: HashMap<(u32, u32), ReadTally>,
     /// Reads passed straight to a call, as (parent, field, callee, argument, function).
@@ -177,6 +179,21 @@ fn holder_of(v: ValType) -> Option<Holder> {
         )
         .then_some(Holder::Any),
         h => concrete_index(h).map(Holder::Concrete),
+    }
+}
+
+/// `holder_of` for a type the validator answers: its concrete types are canonical ids, which
+/// `ids` maps back to module type indices. An id it cannot map holds every record.
+fn holder_of_operand(
+    v: ValType,
+    ids: &HashMap<wasmparser::types::CoreTypeId, u32>,
+) -> Option<Holder> {
+    let ValType::Ref(r) = v else { return None };
+    match r.heap_type() {
+        HeapType::Concrete(UnpackedIndex::Id(id)) | HeapType::Exact(UnpackedIndex::Id(id)) => {
+            Some(ids.get(&id).map_or(Holder::Any, |&t| Holder::Concrete(t)))
+        }
+        _ => holder_of(v),
     }
 }
 
@@ -245,6 +262,7 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
         crossing: HashMap::new(),
         crossing_any: None,
         erased: HashMap::new(),
+        erased_any: None,
         bodies: Vec::new(),
         reads: HashMap::new(),
         arg_reads: Vec::new(),
@@ -549,9 +567,17 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
     let mut allocs = FuncValidatorAllocations::default();
     let mut fi = s.n_imports;
     let invalid = |_| "the module does not validate".to_string();
+    // The validator names a concrete operand type by its canonical id, not its module index.
+    let mut ids: HashMap<wasmparser::types::CoreTypeId, u32> = HashMap::new();
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(bad)?;
         let valid = validator.payload(&payload).map_err(invalid)?;
+        if matches!(payload, Payload::TypeSection(_)) {
+            let types = validator.types(0).ok_or("no module types")?;
+            for t in 0..types.core_type_count_in_module() {
+                ids.entry(types.core_type_at_in_module(t)).or_insert(t);
+            }
+        }
         let ValidPayload::Func(to_validate, body) = valid else {
             continue;
         };
@@ -696,9 +722,16 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
                         continue;
                     }
                     let d = above + (n - 1 - i);
-                    if let Some(Some(ValType::Ref(r))) = fv.get_operand_type(d) {
-                        if let Some(c) = concrete_index(r.heap_type()) {
-                            s.erased.entry(c).or_insert(f);
+                    if let Some(Some(v)) = fv.get_operand_type(d) {
+                        match holder_of_operand(v, &ids) {
+                            Some(Holder::Concrete(c)) => {
+                                s.erased.entry(c).or_insert(f);
+                            }
+                            // A type the map does not know: every record may be in it.
+                            Some(Holder::Any) if !matches!(holder_of(v), Some(Holder::Any)) => {
+                                s.erased_any.get_or_insert(f);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -817,7 +850,7 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
                 Operator::RefEq => {
                     for d in 0..2 {
                         if let Some(Some(v)) = fv.get_operand_type(d) {
-                            if let Some(h) = holder_of(v) {
+                            if let Some(h) = holder_of_operand(v, &ids) {
                                 s.identity.push((h, f));
                             }
                         }
@@ -825,7 +858,7 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
                 }
                 Operator::ExternConvertAny => {
                     if let Some(Some(v)) = fv.get_operand_type(0) {
-                        if let Some(h) = holder_of(v) {
+                        if let Some(h) = holder_of_operand(v, &ids) {
                             s.identity.push((h, f));
                         }
                     }
@@ -1180,6 +1213,7 @@ fn crossing(s: &Scan, t: u32, names: &dyn Fn(u32) -> String) -> Option<String> {
             .iter()
             .filter(|(&c, _)| s.holds(Holder::Concrete(c), t))
             .map(|(_, &f)| f)
+            .chain(s.erased_any)
             .min();
         if let Some(f) = erased {
             return Some(format!(

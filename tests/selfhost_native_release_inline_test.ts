@@ -36,6 +36,8 @@ const FIXTURES: [string, Want][] = [
   ["kept-subtype", "kept"],
   ["kept-export", "kept"],
   ["kept-reached-export", "kept"],
+  ["kept-export-union-parent", "kept"],
+  ["kept-export-union-record", "kept"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -208,7 +210,15 @@ Deno.test({
         ],
         [
           "kept-reached-export",
-          /refused: a value of it can cross the module boundary \(export /,
+          /refused: a value of it can cross the module boundary \(it is stored as an abstract reference .* export either\)/,
+        ],
+        [
+          "kept-export-union-parent",
+          /can cross the module boundary \(it is stored as an abstract reference/,
+        ],
+        [
+          "kept-export-union-record",
+          /refused: a value of it can cross the module boundary \(it is stored as an abstract reference/,
         ],
         [
           "proof-rows",
