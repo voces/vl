@@ -688,6 +688,14 @@ fn param_record(m: &Module, f: u32, j: u32) -> Option<u32> {
     m.record_of(*m.sig(f).0.get(j as usize)?).map(|(t, _)| t)
 }
 
+/// Whether `f` and `g` return the same record type, so `g`'s result fields are `f`'s.
+fn same_record_result(m: &Module, f: u32, g: u32) -> bool {
+    match (result_record(m, f), result_record(m, g)) {
+        (Some(a), Some(b)) => same_shape(m, a, b),
+        _ => false,
+    }
+}
+
 fn result_record(m: &Module, f: u32) -> Option<u32> {
     let rs = &m.sig(f).1;
     if rs.len() != 1 {
@@ -725,7 +733,9 @@ fn callee_of(i: &Ins) -> Option<u32> {
 fn analyse(m: &Module) -> Analysis {
     let defined = || m.n_imports..m.n_imports + m.bodies.len() as u32;
     let consumers: Vec<HashMap<u32, (u32, u32)>> = m.bodies.iter().map(arg_consumers).collect();
-    // Producers: a greatest fixpoint, since a tail call hands the result straight on.
+    // Producers: a greatest fixpoint, since a tail call hands the result straight on. A tail
+    // call to a producer of another record type (a subtype's, under width subtyping: D3630)
+    // hands back that type's fields, which are not the caller's, so it keeps the caller out.
     let mut producer: HashSet<u32> = defined()
         .filter(|&f| result_record(m, f).is_some() && !m.body(f).exits_otherwise)
         .collect();
@@ -735,7 +745,7 @@ fn analyse(m: &Module) -> Analysis {
             .copied()
             .filter(|&f| {
                 m.body(f).ins.iter().any(|i| match i.kind {
-                    Kind::ReturnCall(g) => !producer.contains(&g),
+                    Kind::ReturnCall(g) => !producer.contains(&g) || !same_record_result(m, f, g),
                     _ => false,
                 })
             })
@@ -1002,10 +1012,16 @@ fn plan_context(
             }
             let src = (i.reach && i.top != NONE).then(|| b.at(i.top)).flatten();
             match src.map(|s| s.kind) {
-                Some(Kind::Call(h)) if a.producer.contains(&h) && i.top + 1 == i.k => {
+                Some(Kind::Call(h))
+                    if a.producer.contains(&h)
+                        && i.top + 1 == i.k
+                        && same_record_result(m, f, h) =>
+                {
                     r_calls.insert(i.top);
                 }
-                Some(Kind::StructNew(_)) => {
+                Some(Kind::StructNew(st))
+                    if result_record(m, f).is_some_and(|rt| same_shape(m, st, rt)) =>
+                {
                     acts.insert(i.top, Act::Delete);
                 }
                 Some(Kind::LocalGet(l)) if scalar_local(l) && i.top + 1 == i.k => {}

@@ -26,6 +26,7 @@ type Want = "melts" | "kept" | "output";
 const FIXTURES: [string, Want][] = [
   ["heap-held", "melts"],
   ["subtyped", "melts"],
+  ["supertype-producer", "output"],
   ["escapes", "output"],
   ["recursion", "output"],
   ["over-bound", "kept"],
