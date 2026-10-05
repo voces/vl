@@ -65069,6 +65069,7 @@ function holeCastParamName(
     if hn == name { parked = true }
   }
   if !parked { return "" }
+  hcWrittenMemo = Map()
   const ld = holeCastCalleeDeclOf(callFnIx, 8)
   if ld < 0 { return "" }
   const f = P.nodes[ld]
@@ -65089,10 +65090,25 @@ function holeCastCalleeDeclOf(callFnIx: i32, depth: i32): i32 {
   holeCastCalleeDeclOf(init, depth - 1)
 }
 
+// `holeCastWrittenDeclOf`'s answers within one callee lookup, by `<name>@<frame>`: a chain of
+// bindings each re-pointed several times would otherwise be walked once per path through it.
+let hcWrittenMemo: {[string]: i32} = Map()
+
 // The one `FuncDecl` every write of binding `nm` in frame `fr` reaches, its initialiser and each
 // whole re-pointing `nm = e` alike, or -1 when two writes reach different ones (D3659).
 function holeCastWrittenDeclOf(nm: string, fr: i32, depth: i32): i32 {
   if nm == "" { return -1 }
+  const key = nm + "@" + i32ToStr(fr)
+  const seen = hcWrittenMemo[key] ?? -2
+  if seen != -2 { return seen }
+  // A cycle (`a = b`, `b = a`) reads as no answer while it is being walked.
+  hcWrittenMemo[key] = -1
+  const r = holeCastWrittenDeclGo(nm, fr, depth)
+  hcWrittenMemo[key] = r
+  r
+}
+
+function holeCastWrittenDeclGo(nm: string, fr: i32, depth: i32): i32 {
   cwIxBuild()
   let one = -1
   let ixA = cwIxFrHead(nm, fr)
@@ -70457,15 +70473,22 @@ function litBaseMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
-// The members of literal set `chk` a value of primitive `obj` can hold, where some but not all
-// fit: `d is C` with `d: i32` and `C = 1 | 3000000000` tests the `1` (D3655). -1 otherwise.
+// The members of integer literal set `chk` an integer `obj` can hold, where some but not all
+// fit: `d is C` with `d: i32` and `C = 1 | 3000000000` tests the `1` (D3655). -1 otherwise,
+// and for a float receiver, whose answer against an integer literal waits on D3689.
 function litPrimMeetTy(obj: i32, chk: i32): i32 {
   if obj < 0 || chk < 0 || !(T.tys[obj] is TyPrim) { return -1 }
+  const pn = primNameOf(obj)
+  if pn != "i32" && pn != "i64" { return -1 }
   if !allLitMembers(chk) || assignable(chk, obj) { return -1 }
   const cands: i32[] = []
   flattenLits(chk, cands)
   const keep: i32[] = []
   for c in cands {
+    const ct = T.tys[c]
+    if ct is TyLit {
+      if ct.litKind != "int" { return -1 }
+    }
     if assignable(c, obj) { keep.push(c) }
   }
   if keep.length == 0 { return -1 }
