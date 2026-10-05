@@ -438,6 +438,11 @@ s.cpLen()                  ;; count of code points              — O(n), named
 - **`for cp in s` is the canonical loop** and already works — `"héllo→"` yields
   `104, 233, 108, 108, 111, 8594` on today's build. It survives the storage swap with
   its surface unchanged; only its lowering changes.
+- **`s.codePoints()` (`std:str`) is the same walk, kept as a list** (owner ruling,
+  2026-10-04): what `for cp in s` visits, so `codePoints(s)[k]` is the `k`-th code point
+  where `s[k]` is the `k`-th byte. O(n) and allocating, so it is taken once, not per
+  index; its length is `s.cpLen()` by construction. The `byte-as-code-point` lint points
+  at it when a byte `s[i]` reaches `fromCodePoint` or another code-point position.
 - **`s.backwards()` is cheap because UTF-8 self-synchronizes.** Scanning back over
   continuation bytes to the lead byte takes **at most 3 steps**, so reverse iteration
   is O(1) per element with no reversal, no allocation, and no side table.
@@ -780,7 +785,10 @@ as an external crate, Go puts normalization/collation/segmentation in
   `toUpper` that silently ignores non-ASCII is the same class of quiet lie this design
   rejects elsewhere. Full-Unicode case mapping and folding are `std:unicode`. *(The
   previous revision claimed `"hello".toUpper()` was "core and free"; no case-mapping
-  method exists today at all — see §Methods.)*
+  method exists today at all — see §Methods.)* `std:str` also carries
+  **`toUpperLatin1`** (owner ruling, 2026-10-04): the ASCII map plus each Latin letter of
+  Latin-1 to its Latin capital, `ÿ` → `Ÿ` included, and no lower twin — a per-character
+  map the name bounds, not a step toward full case mapping.
 - **`reverse()` is `std:unicode`** (§Reverse).
 - **Comparison stays byte-exact in core**; normalization-aware comparison and collation
   are `std:unicode`.
@@ -895,8 +903,8 @@ Proposed core-vs-`std` line (OQ-3 refines it):
 | `split`, `join`, `trim`/`trimStart`/`trimEnd` | `graphemes()` | pattern compile/match |
 | `startsWith`, `endsWith`, `indexOf`, `lastIndexOf`, `includes` | `toUpper`/`toLower` (full) | capture groups |
 | `replace`, `repeat`, `padStart`, `padEnd` | `normalize` (NFC/NFD) | `split`/`replace` by pattern |
-| `toUpperAscii`, `toLowerAscii` | `collate` | |
-| `slice`, `bytes`, `cpAt`, `cpLen`, `backwards`, `compact`, `isCharBoundary` | `reverse()` | |
+| `toUpperAscii`, `toLowerAscii`, `toUpperLatin1` | `collate` | |
+| `slice`, `bytes`, `cpAt`, `cpLen`, `codePoints`, `backwards`, `compact`, `isCharBoundary` | `reverse()` | |
 
 Splitting returns **views** (§Header), so `s.split(",")` over a large input allocates
 headers, not bytes.

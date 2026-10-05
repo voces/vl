@@ -1164,6 +1164,32 @@ Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", 
   }
 });
 
+Deno.test({ name: "wasm-checker: byte-as-code-point shows in the editor, over the read (D3641)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-029: a glyph looked up per BYTE of a copied `string` parameter. The editor
+  // lints before it checks, so this is the untyped face: the receiver is visibly a string.
+  const src = "function glyphOf(cp: i32) { cp }\n" +
+    "function letter(text0: string, xs: i32[]) {\n" +
+    "  let text = text0\n" +
+    "  text = text + \"\"\n" +
+    "  let n = glyphOf(text[0]) + glyphOf(xs[0])\n" +
+    "  if text.slice(0, 2)[1] == 'í' { n = n + 1 }\n" +
+    "  n + fromCodePoint(xs[1]).length\n" +
+    "}\n" +
+    "print(letter(\"Hrímey\", [1, 2]))\n";
+  const diags = checker.lint(src).filter((x) => x.code === "byte-as-code-point");
+  const got = diags.map((d) => rangeText(src, d.range));
+  if (JSON.stringify(got) !== JSON.stringify(["text[0]", "text.slice(0, 2)[1]"])) {
+    throw new Error(`want the two string reads, not the i32[] ones; got ${JSON.stringify(got)}`);
+  }
+  const want = "`s[i]` is a byte, not a character; use `for cp in s` or `codePoints(s)[i]`";
+  for (const d of diags) {
+    if (d.severity !== "warning" || d.message !== want) {
+      throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+    }
+  }
+});
+
 Deno.test({ name: "wasm-checker: lint returns [] on a parse error", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   if (checker.lint("function f( {\n").length !== 0) {

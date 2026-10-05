@@ -92,6 +92,26 @@ const want = (got: string, expect: string, what: string) => {
 // ── the three ratcheted rules ───────────────────────────────────────────────
 
 Deno.test({
+  name: "lint span: byte-as-code-point covers the whole `s[i]` read (D3641)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "bytes.vl",
+      [
+        "type Named = { name: string }",
+        "function glyphOf(cp: i32) { cp }",
+        "function f(r: Named) { glyphOf(r.name[1]) + fromCodePoint(r.name[0]).length }",
+        "print(f({ name: \"Hrímey\" }))",
+        "",
+      ].join("\n"),
+    );
+    // A field read only the check can type: this is the typed face the CLI pairs.
+    const got = diags.filter((d) => d.code === "byte-as-code-point").map((d) => spanText(src, d));
+    want(JSON.stringify(got), JSON.stringify(["r.name[1]", "r.name[0]"]), "byte-as-code-point");
+  },
+});
+
+Deno.test({
   name: "lint span: sentinel-index-unguarded covers the whole read, not the table",
   ignore: !ENABLED,
   fn: async () => {
