@@ -20,7 +20,8 @@ qnorm(…)` is 52 `Q` a frame on its own.
   1. a field write, through any alias, including a layout twin or a width-subtyping view;
   2. `===` and `IdentityMap`/`IdentitySet`, which are ruled (A15) but not built;
   3. `is` on a supertype-typed value, if a subtype value was sliced into an inline slot;
-  4. a record returned across an entry-module export, where JS has `===`.
+  4. a record reaching a wasm boundary (an export or import), where JS has `===` and a linker
+     assumes a layout.
   §1 turns these into the qualification rule.
 * **Where to build it: a host wasm-to-wasm pass, run before the multi-value step.** The
   qualification is a wasm fact, and the step already computes most of it. A pass that fails
@@ -58,11 +59,13 @@ seed built from master `d2b09774b`, unless marked *design*.
 | `is` / `match` on a record arm | `ref.test` on the wasm type | only through slicing (row below) |
 | `h.a is V3` where `h.a: V2` holds a `V3` | `true` | **yes, if `V2` slots were inlined.** Slicing makes it `false`. |
 | `as` on records | check error: `as` is numeric only | no |
+| `u as! V`, `u as? Q` on a record union | run today; `ref.cast` / `ref.test` | only through slicing (the `is` row), so condition 3 covers them |
 | field write `p.x = …` | visible through every alias, layout twins and width views included (`const p: P3 = v; p.x = 5` changes `v.x`) | **yes**: this is the qualification |
 | closure `==` | table index plus `ref.eq` on the environment | no. The environment's identity is kept; only what it holds changes rep. |
 | generics | instantiated per wasm signature (`last<V3>` takes `(ref $V3[])`) | no |
 | `extern function` | structs do not cross (`docs/guide/extern.md`) | no |
 | entry-module `export function mk(): V3` | crosses as `(ref $V3)`; JS can `===` it or key a `WeakMap` with it | **yes** |
+| the same, through a container: `getU(): V3 \| i32`, `getL(): V3[]`, `getH(): H` | the signatures are `(ref $box)`, `(ref $list)`, `(ref $H)`, with `$V3` absent from all three (entry exports) | **yes**: the `V3` is one `struct.get` away |
 | threads | WasmGC structs are not shareable today | *design*: a shared struct would make an n-field store tearable |
 
 **The rule.** A record type `T` qualifies when all four of these hold over the whole program:
@@ -81,9 +84,19 @@ seed built from master `d2b09774b`, unless marked *design*.
    can only ever hold a `T`, and nothing is sliced. sunpa's `V3` is a subtype of a
    `{x, y}` record (`$85 (sub $51 …)`), which is fine. A `V2` slot would not qualify,
    because a `V3` can sit in it.
-4. **`T` is in no export or import signature, and in no exported global or table.**
-   *Recommended:* the JS identity of a record that crosses the boundary is unspecified,
-   which would drop this condition (§6, owner question 2).
+4. **No value of type `T` reaches a wasm boundary, an export or an import,** at `T` or at any
+   abstract supertype (`anyref`, `eqref`, `structref`; a union box's `anyref` field is one),
+   through any type reachable from the signature: struct fields, array elements, union
+   boxes. Exported globals and tables count (`getU`, `getL`, `getH` above).
+   Inlining also changes a parent `P`'s layout, so `P`, and anything reaching `P`, must
+   not cross a wasm-to-wasm boundary either: separate compilation and linking (plumb)
+   would otherwise see two layouts for one type.
+   *Recommended:* the layout of a record that crosses is unspecified, which would drop
+   this condition (§6, owner question 2).
+
+**These conditions are sufficient, not necessary.** Condition 3 could relax to exact-`T` slots
+(a `V2` slot that provably never holds a `V3`). Condition 2 is vacuous until A15 lands.
+Condition 1 is coarse: one write anywhere disqualifies the whole alias class.
 
 Under these four, no expression can tell a shared box from a copy. Its fields never change,
 so reading them early is reading them late, which is the step's argument for #3372. There
@@ -94,6 +107,8 @@ Two implementation duties keep it that way:
 * **A store computes every field before it writes any.** If the parent is null, the first
   `struct.set` traps before any write. So a trap the embedder catches can never leave a
   half-written slot.
+* **A store reads every source field before the first `struct.set`.** `h.a = h2.a` with `h`
+  and `h2` possibly aliased would otherwise write `a.x`, then read the new `a.x`.
 
 ## 2. Which types qualify, and how the neighbouring features interact
 
@@ -128,10 +143,10 @@ Two implementation duties keep it that way:
 
 | | emitter (layout and representation) | host wasm-to-wasm pass, before `multivalue_step` |
 | --- | --- | --- |
-| sites to change | every site that maps a field to a slot. The tree has 328 `fbStructGet`, 114 `fbStructNew` and 44 `fbStructSet` call sites (grep, 2026-10-05); the share that touches user records is not counted. Add `buildStructSupers`, `emitStructEqRec`, variant boxes, closure environments, map value lists and the one-value-one-slot invariant (`fixed-arrays-design.md` §6.2). | one module rewrite: the type section, then every op on an affected type |
+| sites to change | every site that maps a field to a slot. The tree has 327 `fbStructGet(`, 114 `fbStructNew(` and 44 `fbStructSet(` lines in `compiler/*.vl`, each count including its definition (grep, 2026-10-05); the share that touches user records is not counted. Add `buildStructSupers`, `emitStructEqRec`, variant boxes, closure environments, map value lists and the one-value-one-slot invariant (`fixed-arrays-design.md` §6.2). | one module rewrite: the type section, then every op on an affected type |
 | deciding the qualification | must recompute the `written` set at the VL level, generic instances and std bodies included | the `written` set and the component rule already exist in `multivalue.rs` |
-| failure mode | a site left unwired is check-clean invalid wasm, or wrong values, in the user's build. That is the D965 position-matrix lesson. | the pass validates its own output and keeps the input on failure, as the step does |
-| `-O0` | inline at every level | allocates at `-O0`, the same trade as fixed-arrays Q5 |
+| failure mode | a site left unwired is check-clean invalid wasm, or wrong values, in the user's build. That is the D965 position-matrix lesson. | the pass validates its output and keeps the input if invalid, as the step does. That catches only invalid modules: a shifted field read that still type-checks validates. Grading by output is the real guard (§5). |
+| `-O0` | inline at every level | allocates at `-O0`, in the in-browser playground and in anything not built through the host's `-O` steps: those never get it. Same trade as fixed-arrays Q5. |
 | diagnostics | can name the VL write that disqualified a type | can name the function and op (the `VL_MV_EXPLAIN` style), but not the source line, unless built with `--names` |
 | composes with #3372 | the producer still allocates unless the step makes a twin | yes: after the rewrite, a stored call result is read field by field, so the step gives it a twin |
 
@@ -170,6 +185,14 @@ has the same wasm array type (`$8` in the probe). So flattening the type flatten
 too, and the map's code is rewritten with it. Generic and std bodies are instantiated per
 element type, so no in-module boundary needs a copy. This matters because a list is mutable:
 boxing a copy at a boundary would break aliasing.
+
+**Does binaryen already do this?** No pass in binaryen 130 (`wasm-opt --help`) moves a
+never-written struct's fields into its parent or flattens an array of structs. The nearest:
+`--heap2local` scalarizes an allocation that does not escape, `--cfp`/`--gsi` fold constant
+fields, `--type-merging`/`--unsubtyping`/`--type-ssa` change the type graph but not field
+layout. A stored `V3` escapes into its container, so `--heap2local` leaves it. Binaryen does
+re-run after the rewrite: the host runs the step first and the `-O` rung after
+(`main.rs`, `opt.multivalue_step` then `opt.rung`), so it sees the inlined fields.
 
 **Recommendation: the host, for both (a) and (b).** The emitter's part is the explain line
 and, later, a hint. The emitter route is worth it only if the owner wants the guarantee at
@@ -217,14 +240,10 @@ emits today: a list is a `{backing, len, cap}` header, and each access reloads t
    affected, because it is not built through the host's `-O` steps.
 
 **sunpa, statically** (its `-O` build, post-binaryen, with everything inlined into `animate`):
-* `V3` has 39 `struct.new` sites. Its values are stored by:
-  * 3 `struct.set` sites into one container (`$30`, three `V3` fields);
-  * 6 `array.set` sites into a `V3[]` backing;
-  * 7 constructions of 4 container types.
-* `Q` has 6 `struct.new` sites. Its values are stored by:
-  * 3 `struct.set` sites into `$41`;
-  * 2 `array.set` sites into a `Q[]` backing;
-  * 2 constructions of one container.
+* `V3` has 39 `struct.new` sites, stored by 3 `struct.set` sites into one container (`$30`),
+  6 `array.set` sites into a `V3[]` backing, and 7 constructions of 4 container types.
+* `Q` has 6 `struct.new` sites, stored by 3 `struct.set` sites into `$41`, 2 `array.set`
+  sites into a `Q[]` backing, and 2 constructions of one container.
 
 These are static sites. Which slice removes more *per frame* needs sunpa's counter (S0).
 
@@ -266,9 +285,19 @@ a number in about an hour of sunpa's time.
    * With it, pool resets (SP-032 and PR #3377's build item) become in-place stores.
    * **Recommendation:** yes, but after S1. sunpa's `V3` and `Q` already qualify by
      inference. The declaration is the stable contract once a second consumer leans on it.
-2. **May a record crossing an entry-module export have unspecified identity in JS?**
-   **Recommendation:** yes. A host that needs identity can keep its own handle table. The
-   stated default until a ruling: such types are disqualified.
+2. **Is a record's LAYOUT part of the export ABI** (JS identity and wasm-to-wasm linking)?
+   `export function mk(): V3`: (A) layout and identity unspecified, `V3` may inline; (B)
+   specified, any `V3` reaching a boundary stays boxed.
+   (A) lets a host keep its own handle table if it needs identity; (B) disqualifies the type
+   and everything reaching it, as the default does. **Recommendation:** (A). The stated
+   default until a ruling is (B).
+3. **Once A15 builds `===`, is `===` on a value-qualifying (or declared-value) type a check
+   error,** rather than silently disabling the optimisation program-wide?
+   `a === b` on a `V3`: (A) check error naming the type; (B) allowed, and `V3` loses inline
+   storage everywhere.
+   **Recommendation:** (A) for a declared value type (question 1), where `===` already has
+   no meaning. (B) for an inferred one, with the explain line naming the `===`, because a
+   check error from inference would make a distant write or compare change what compiles.
 
 The `-O`-only question is not new. It is fixed-arrays Q5, and the same answer applies here.
 
@@ -284,7 +313,7 @@ The `-O`-only question is not new. It is fixed-arrays Q5, and the same answer ap
 * **Type-section rewrite:** the rec group has a single parent per type (D622), parents come
   first in index order, and the index of every local, signature and global must be remapped.
   The first new risk class beyond `multivalue.rs` is a module that validates but reads a
-  shifted field. The proof rows above are the guard.
+  shifted field. Validation cannot see it; the proof rows above are the guard.
 * **The growth bound:** a re-boxed escape costs about 12 B per site. Apply the step's
   per-module bound per function, as fixed-arrays §6.2 asks.
 * **The (b) read regression:** a later engine-side bounds-check elimination, or a
@@ -294,14 +323,8 @@ The `-O`-only question is not new. It is fixed-arrays Q5, and the same answer ap
 
 ## Appendix: benchmark modules
 
-Generated WAT. One `rec` group holds:
-* `V3`, three `(mut f64)`;
-* `HB {a: (ref null V3), b}`, the boxed parent;
-* `HI {a_x, a_y, a_z, b}`, the inline parent;
-* `AR`, an array of `(ref null V3)`;
-* `AF`, a `(mut f64)` array;
-* `LB` and `LF`, list headers `{backing, len}` over them.
-
-Every module exports `bench(n) -> f64`, and each pair agrees on its checksum, which every row
-printed. The unit vector is `x = i·10^-6`, `l = sqrt(x² + 5)`, `(x/l, 2/l, 1/l)`. The flat
-read tests `j < len` once per element. The boxed read tests it once and then `ref.as_non_null`s.
+Generated WAT, one `rec` group: `V3` (three `(mut f64)`), `HB {a: (ref null V3), b}` boxed,
+`HI {a_x, a_y, a_z, b}` inline, `AR` of `(ref null V3)`, `AF` of `(mut f64)`, and list headers
+`LB`/`LF` over them. Each exports `bench(n) -> f64`, and each pair agreed on its checksum. The
+unit vector is `x = i·10^-6`, `l = sqrt(x² + 5)`, `(x/l, 2/l, 1/l)`. The flat read tests
+`j < len` once per element; the boxed read tests it once and then `ref.as_non_null`s.
