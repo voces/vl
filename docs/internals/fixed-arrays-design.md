@@ -11,7 +11,7 @@ interrogate. Every measurement from revision 2 that still applies is kept (§7).
 
 Contents: §0 the proposal on one page · §1 motivation · §2 assumptions · §3 survey · §4 the
 unified model · §5 semantics and typing · §6 codegen per placement · §7 measurements · §8
-interop · §9 risks · §10 owner questions and stated defaults · §11 panel dissent · §12
+interop · §9 risks · §10 owner questions and stated defaults · §11 panel review and dissent · §12
 revision log · Appendix: benchmark sources.
 
 ---
@@ -42,16 +42,17 @@ immutable value. `r.pose[3] = x` is therefore a write to the field `r.pose`, and
 **Five owner questions** remain (§10), in dependency order: Q1 the value model, Q2 the
 spelling of the type and its fill, Q3 the element types, Q4 whether dead writes are errors,
 Q5 whether "no heap" holds at every optimisation level or at `-O` only; plus one adjacent
-question about scalar `u8` record fields. Everything else is a stated default (§10.2), each following from an existing
-ruling or from the model itself.
+question about scalar `u8` record fields. Everything else is a stated default (§10.2),
+each following from an existing ruling or from the model itself. A five-persona panel
+reviewed the doc (§11); the model survived, and its dissent is recorded there.
 
 **Evidence (§7).** The locals placement runs sunpa's `m4Mul` at Rust parity with zero garbage
 (re-run today: 93 ms against Rust's 98 ms on V8, 100 against 96 on wasmtime 49; today's
 `f64[]` takes 119 ms with 172 scavenges). **In the browser (V8) the win is the removed
 garbage plus about 1.3x speed**; the larger speed-ups are wasmtime's. An inline record field is
 3.4x faster than today's `pose: f64[]` field on wasmtime for constant indices and ties it on V8.
-A boxed update that rebuilds costs about
-18 ns and one allocation per write, which is why it is the placement of last resort.
+A boxed update that rebuilds costs about 18 ns and one allocation per write, which is why it is
+the placement of last resort.
 Flattening a list of matrices is worth 1.3–1.4x only once the list leaves the cache; the
 larger win in sunpa's list code is removing the per-product allocation (4x on V8, 8x on
 wasmtime), which value semantics gives with or without flattening.
@@ -409,33 +410,22 @@ check error naming both lengths. Elements adapt as scalars do: `const v: f64[3] 
 is `[1.0, 2.0, 3.0]`, a runtime `i32` element converts to `f64`, and an `i64` element into
 `f64` is refused with an `as` fix (the numeric lattice).
 
-**Adoption (D3339 style), restricted.** A binding whose initialiser is only a literal, whose
-uses include a delivery to a `T[N]` type, and whose OTHER uses are only reads and deliveries,
-**adopts** that type at the declaration, and every use sees it:
+**No adoption in v1.** A literal is a `T[N]` only where it is written directly into a `T[N]`
+place (an annotated binding, a typed parameter, field, element or return); otherwise it is a
+`T[]` and a `T[N]` use of it is refused with the annotate fix:
 
 ```vl
 const p = [1.0, 2.0, 3.0]
-takesV3(p)                 // takesV3(v: f64[3]): p is f64[3] everywhere
-const u = [1.0, 2.0]
-u.push(3.0)
-takesV2(u)                 // error naming both uses: `push` needs a list, `takesV2` a f64[2]
+takesV3(p)                 // refused: "p is a list; write `const p: f64[3] = …`"
+takesV3([1.0, 2.0, 3.0])   // fine: the literal is written into the f64[3] parameter
 ```
 
-This is the record covariance ruling's "a fresh literal adopts its destination" and D3339's
-"adopts fully, every read sees it". **The restriction is what keeps it sound**: D3339 and B′
-adopt within one kind (a wider number, a wider field), but list to value changes aliasing,
-which record covariance refused. So a binding that is element-written, aliased into another
-binding, field or list, or captured does **not** adopt; a `T[N]` use of it is refused with the
-annotate fix (`const p: f64[3] = …`). Otherwise a use further down would change what a write
-further up means:
-
-```vl
-let p = [1.0, 2.0]
-const q = p
-q[0] = 9.0                 // a list write, seen through p ...
-takesV2(p)                 // ... unless this use made p a value: refused instead, "annotate p"
-```
-
+Adoption in the D3339 style (a literal-only binding takes its type from a later `T[N]` use) was
+considered and deferred. D3339 and B′ adopt within one kind (a wider number, a wider field);
+list to value changes aliasing, which record covariance refused, so adoption would have to be
+restricted to bindings that are never element-written, aliased or captured, and a newcomer
+cannot predict a rule that stops applying when someone adds `const q = p` ten lines away. The
+one-sentence rule above loses only `const p = […]; takesV3(p)`, and adoption is additive later.
 With no fixed-array use, a literal stays a `T[]`, so no existing program changes type.
 
 ### 5.3 Construction beyond a literal
@@ -606,9 +596,10 @@ function m4MulInto(r: f64[16], a: f64[16], b: f64[16]) { r[0] = a[0] * b[0] }   
 for m in g { m[0] = 9.0 }                                                        // m is a copy
 ```
 
-**Proposed (Q4): an element write to a parameter, a loop variable, or a `let` initialised from
-a place, after which the binding is never read, is a check error**, naming the fix ("write
-`g[i][0] = …`, or return the value"). A closure capturing the binding counts as a read. Writes
+**Proposed (Q4): an element write to any `T[N]` binding that is never read afterwards is a
+check error**, one rule with no list of binding kinds, and the message explains the copy:
+"`m` is a copy of `g`'s element; this write changes only `m`. Write `g[i][0] = …`, or return
+the value". A closure capturing the binding counts as a read. Writes
 followed by reads are untouched, so a parameter used as scratch is fine. This is per-binding
 liveness within one function. It is an error rather than a warning because every refused
 program computes nothing observable, and each one is a silent wrong result for a program ported
@@ -633,25 +624,24 @@ result is a `T[N]` and is discarded is a check error**, naming the fix
 * **Call spread** into fixed parameters (`lookAt(...eye, ...target)`) is NOT in v1; it is
   additive later and would expand N arguments statically.
 
-### 5.16 Hints
+### 5.16 Hints and the build warning
 
-Two `vl check` hints, each driven by the same predicate the emitter uses, so they cannot
-disagree (the two-producers rule):
+Each is driven by the same predicate the emitter uses, so check and build cannot disagree (the
+two-producers rule), and each speaks the user's vocabulary, not the emitter's:
 
-* `fixed-array-boxed-update`: an element write to a value in a **boxed** placement inside a
-  loop, or two or more such writes in one function ("each write rebuilds the 16-element array:
-  …"); it also fires when a value passes boxed because a signature is past its slot budget.
-
-* `fixed-array-dynamic-index`: an index the emitter cannot make constant, on a value-tier
-  binding, in a loop ("`m[c * 4]` is a switch over 16 locals").
-
-And one **build** report, because a hint cannot predict what the `-O` host step will decline
-(§6.2): `vl build -O`/`-O3` prints, by default, one warning per function in which a
-value-tier `T[N]` box survives the step, with the step's reason (what `VL_MV_EXPLAIN=1`
-prints today for records). The wasm alone cannot tell a value-tier box from an intentionally
-boxed one (a map value is the same `(ref $F)`), so the emitter records its value-tier locals
-in a custom section the step reads and strips.
-
+* `fixed-array-boxed-update` (hint): an element write to a value stored in a map, a union, a
+  nullable, a reassigned capture or past the size cap, inside a loop or twice in one function,
+  or a value passed that way because a signature is past its slot budget. It names the fix:
+  "each write here copies all 16 elements; copy `byName[k]` into a local, write the local, and
+  store it back once".
+* `fixed-array-dynamic-index` (**info** tier, and on the cost page, not a hint): an index the
+  compiler cannot make constant on a local array. Often there is no fix, and a hint the user
+  cannot act on teaches them to ignore hints.
+* **The build warning**, because a hint cannot predict what the `-O` host step will decline
+  (§6.2): `vl build -O`/`-O3` prints, by default, one line per function that still allocates for
+  a local `T[N]`, with the reason ("`m4Invert` allocates for `f64[16]` at -O because …"). The wasm
+  alone cannot tell a local array's box from a map value's (both are the same `(ref $F)`), so
+  the emitter records its value-tier locals in a custom section the step reads and strips.
 
 ### 5.17 Entry-module exports
 
@@ -660,26 +650,60 @@ ABI chosen for a host is permanent, and no consumer asks yet.
 
 ### 5.18 The one-page explanation (for the guide)
 
-| you have | write | it is | copies |
-| --- | --- | --- | --- |
-| a growable sequence, shared between owners | `f64[]` | a list, a reference | never implicitly |
-| a small math value (vector, matrix, colour) | `f64[16]`, `u8[4]` | a value with the length in its type | always (the compiler makes it cheap) |
-| bytes, compactly | `u8[]` | a list of bytes, packed, read as `i32` | never implicitly |
-| memory a host or GPU reads in place | `Buf` (`std:buffer`) | an extent of linear memory | `storeF32` etc. copy in |
-| a byte layout inside a `Buf` | `flat type` | a record whose offsets are constants | through the `Buf` |
-| four f32 lanes in one instruction | `F32x4` (`std:simd`) | one `v128` | a value |
+**User-facing text never says "immutable" or `.with`.** A TypeScript reader takes "immutable"
+to mean `m[5] = 1.0` fails, and it compiles. §4's "immutable value plus rewrite" is the
+specification; the guide says **"an `f64[16]` behaves exactly like an `f64`"**, and shows the
+same four lines over both kinds:
 
-The guide's rule of thumb: **a `T[]` is a container you share; a `T[N]` is a number with
-several parts.**
+| line | `xs: f64[]` (a list) | `m: f64[16]` (a value) |
+| --- | --- | --- |
+| `let b = xs; b[0] = 1.0` | `xs[0]` is now 1 | `m[0]` unchanged, as `let y = x; y += 1` leaves `x` |
+| `function fill(r) { r[0] = 1.0 }` then `fill(xs)` | fills the caller's list | refused (dead write): return the value instead |
+| `const c = …; c[0] = 1.0` | allowed: the list is shared, the name is constant | refused, as `const x = 1; x += 1` is |
+| `for v in g { v[0] = 9.0 }` | writes `g`'s inner lists | refused (dead write): write `g[i][0]` |
 
-### 5.19 The amendment `collections-design.md` §VL.7 gets on Q1 (a)
+**Choosing a sequence** (the guide's paragraph, from the newcomer critic):
+
+> Ask two questions. *Is the length part of what the thing IS?* A 4x4 matrix is always 16
+> numbers, so write `f64[16]`. A list of enemies grows, so write `f64[]`. *Does a host or GPU
+> read the bytes in place?* Then they live in a `Buf`, laid out by a `flat type` and read
+> through a typed view (`f32view`). Bytes that stay inside your program are a `u8[]`. **A
+> number inside the brackets changes everything:** `f64[16]` behaves exactly like an `f64`.
+> `let b = a` copies it, a function cannot change the caller's matrix (it returns a new one),
+> `const` forbids `m[0] = 1` just as it forbids `x += 1`, and `m[i] = v` replaces the value
+> held in `m`. `f64[]` is a shared list, like a TypeScript array. `u8[4]` is a value, `u8[]` a
+> list. Use `F32x4` only for lane arithmetic (`a + b`); v1 has no conversion between it and
+> `f32[4]`.
+
+Two more guide lines: "read a nested type right to left: `f64[3][4]` is four `f64[3]`", and on
+the cost page, "`f64[16]` is allocation-free in `-O` builds; debug builds allocate; a matrix
+stored in a map is copied on every element write".
+
+### 5.19 Messages that name the fix
+
+The refusals a newcomer will hit first, each with its wording pinned before it ships:
+
+| program | message names |
+| --- | --- |
+| `const m: f64[16] = [0.0, 16]` | the two lengths, and "did you mean `[0.0; 16]`?" (two elements, the second equal to N) |
+| `const m: f64[16] = filled(16, 0.0)` | "`filled` makes a list; write `[0.0; 16]`" |
+| `m[k][i] = v` with `m` a map | the three-line fix: read with `??`, write the copy, store it back |
+| `f()[0] = 2.0` | "`f()` returns a value; store it in a `let` first" |
+| `ints as f64[]` (list to list) | `.map`, so "`as` converts arrays" is not half-true |
+| `m[3][0]` on `m: f64[3][4]` | the lengths in index order, and "did you mean `m[0][3]`?" when the swapped order fits |
+| `const p = [1.0, 2.0]; takesV2(p)` | "annotate `p`: `const p: f64[2] = …`" |
+
+### 5.20 The amendment `collections-design.md` §VL.7 gets on Q1 (a)
 
 §VL.7 says the fixed-size gap "closes without a second user-facing type", calls its inferred
 lowering "fixed-array", and floats `List<T>`/`Array<T>` forcing names. If Q1 is ruled (a), that
 section gets, in the same PR as the ruling: the lowering renamed **"header-less list"** (never
 "fixed array" in user docs); its "no second type" rationale struck, with a pointer here; the
 `Array<T>` forcing name withdrawn (`T[N]` is the explicit fixed form); and a statement of
-whether the header-less lowering is still planned. This design recommends keeping it as an
+whether the header-less lowering is still planned. Two more guide sentences become false or
+misleading and change with it: "There is no `u8` VALUE — no local, parameter…" (a value-tier
+`u8[4]` is held in locals), and "VL has no tuple type, so a list's length is never known at the
+call" (a `T[N]`'s length is). This design recommends keeping it as an
 invisible optimisation for never-grown lists that are not small math values, and not
 building it before a consumer measures the header cost.
 
@@ -830,8 +854,8 @@ destination and read the source, then the reverse, printing values that show ind
 
 | slice | content | agent-days |
 | --- | --- | --- |
-| S0a semantic core | parser (`T[N]`, `[v; N]`); a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently) **and a `nameIsFixedArray` predicate in `tyname.vl`**, because the emitter classifies lists by SPELLING (`nameIsArray`, a trailing-`[]` test, ~180 uses in `emit_*.vl`), where `f64[16]` falls to each ladder's default and `f64[16][]` peels into the ref-list machinery; the rewrite, place rules, literal and fill, index, constant-index errors, `==`, `for`, `.length`, dead writes; locals, parameters, results and fields as an immutable box. `T[N][]`, unions, nullables, map values, adoption and `as` are refused until S0b | 4 |
-| S0b the rest of the semantics | union and nullable members (a new union-box member kind: a rep change, so `rep-fuzz-check.sh` is mandatory), map values, `as`, adoption, joins, closures | 3–4 |
+| S0a semantic core | parser (`T[N]`, `[v; N]`); a new type kind (not a flag on `TyArray`: 345 `is TyArray` sites would treat it as a list silently) **and a `nameIsFixedArray` predicate in `tyname.vl`**, because the emitter classifies lists by SPELLING (`nameIsArray`, a trailing-`[]` test, ~180 uses in `emit_*.vl`), where `f64[16]` falls to each ladder's default and `f64[16][]` peels into the ref-list machinery; the rewrite, place rules, literal and fill, index, constant-index errors, `==`, `for`, `.length`, dead writes; locals, parameters, results and fields as an immutable box. `T[N][]`, unions, nullables, map values and `as` are refused until S0b | 4 |
+| S0b the rest of the semantics | union and nullable members (a new union-box member kind: a rep change, so `rep-fuzz-check.sh` is mandatory), map values, `as`, joins, closures | 3–4 |
 | S1 value tier | the host step learns immutable fixed arrays (§6.2: per-(T, N) types, the constant folder, per-function growth bound, the custom section), the `br_table` rewrite, the unroll override, the cap, packed `u8` | 2–3 |
 | S2a globals | N wasm globals per module-level `T[N]` | 1 |
 | S2b inline fields | N struct fields per `T[N]` field: a VL-field → wasm-slot-base map threaded through construction, the D1510 evaluation-order stash, record spread, record `==`, D622 prefix subtyping, union boxing and `mAssignTypeIndices` (the emitter assumes one VL field is one wasm field: `sFieldCount` at 78 sites, ~330 raw-ordinal `struct.get`/`set` emissions) | 4–5 |
@@ -1102,8 +1126,9 @@ S0's matrix carries a payload-NaN row per placement, read back with `reinterpret
    side effect in a closure is a read, so is safe; the risk is a false positive in the liveness
    scan). Control: the error names the binding and the last write; it is per-function and
    needs no interprocedural analysis.
-7. **Adoption (§5.2) changes a binding's type from its uses.** Every adoption ruling so far has
-   had to be all-or-nothing per binding (D3339); the same discipline applies.
+7. **Adoption is deferred (§5.2)**, so v1 asks for an annotation where D3339 would infer one.
+   That is a known inconsistency with the record rulings, chosen because list-to-value
+   adoption changes aliasing; lifting it later is additive.
 8. **Seed and compile time.** The new type kind trips `kind-ladder-incomplete` at every closed
    ladder in the checker (the safe failure); unrolling to 64 trips grows user modules. Both are
    measured before S1 lands.
@@ -1176,7 +1201,8 @@ const v = a[0]; v.x = 1.0                  // a: V3[4] → a unchanged;  a: V3[]
   local or parameter" did not foresee; the storage still enforces 0..255.
 
 *Recommend (c)* for v1, with records as a later question once the aliasing split above has been
-seen in use. References (strings, lists) are additive under either answer.
+seen in use. Two critics add that if records ever enter, value-ness should be declared on the
+record TYPE (a "value record"), never inferred from the container (§11). References (strings, lists) are additive under either answer.
 
 **Q4. Are dead element writes and discarded `T[N]` results errors or lint warnings?**
 
@@ -1225,11 +1251,14 @@ fields". *Recommend (a)*; until ruled, `flat` admits `u8[N]` fields and not scal
 
 ### 10.2 Stated defaults (each follows from a ruling or from the model; say so to overturn)
 
+The numbering keeps its gaps so the text's references stay stable: D15 (dead element writes)
+and D22 (discarded results) became Q4.
+
 | # | default | follows from |
 | --- | --- | --- |
 | D1 | N is a positive integer literal or a `const` bound to one; `T[0]` refused | the exact-const ruling |
 | D2 | an exact-length literal in a `T[N]` position builds one; elements adapt as scalars | numeric rulings |
-| D3 | a literal-only binding whose other uses are reads and deliveries adopts a `T[N]` destination; an element-written, aliased or captured one is refused with the annotate fix | record covariance, D3339, restricted so aliasing never changes (§5.2) |
+| D3 | no adoption in v1: a literal is a `T[N]` only where written directly into a `T[N]` place; otherwise annotate | reject when in doubt; D3339-style adoption is additive later (§5.2) |
 | D4 | `as` both ways; length first, then each element under the same trio (`as%` wraps integers); `m as f64[]` infallible | the `as`-trio corollary, "a lossy conversion is a failure" |
 | D5 | no implicit `T[N]` ↔ `T[]` conversion | A16, record covariance |
 | D6 | `==` element-wise; `print` refused like lists; not a map key | A11 |
@@ -1254,9 +1283,88 @@ fields". *Recommend (a)*; until ruled, `flat` admits `u8[N]` fields and not scal
 
 ---
 
-## 11. Panel dissent
+## 11. Panel review and dissent
 
-(Filled after the panel review.)
+Five critics read the doc one at a time, each with a persona, and each critic's fixes were
+folded in before the next one read it: (a) a game and graphics programmer reading sunpa's
+code, (b) a systems and interop programmer, (c) a language-design purist reading the owner's
+rulings, (d) the compiler implementer reading the emitter and the host step, (e) a newcomer
+and guide writer.
+
+**The unified model survived.** No critic proposed a different core. Immutable value,
+element assignment as whole-value replacement, and placement by position were accepted by all
+five; (a) called the value tier "what sunpa needs on the main path", (c) found the rewrite
+coherent once evaluation order and the map, union and narrowing cases were pinned, and (d)
+found it buildable. What changed is around the core: records left v1 (Q3 now recommends (c)),
+adoption was deferred, `as` became element-wise, the dead-write rule became one rule, the
+build reports surviving boxes, the host step's real requirements were written down, the
+slices were re-priced, and the interop section gained the GPU stride table, element offsets,
+the bulk-copy limit, the ABI argument and the bit guarantee.
+
+**Fixes folded in, by critic** (each is in the section named):
+
+* (a) discarded `T[N]` results (§5.14), the call veto dropped for value-array loops (§6.1),
+  the S0-alone hazard (§6.7), globals given a slice (S2a), the V8 headline corrected (§0),
+  sunpa's pose as `f64[10][]` and the idioms that disappear (§1), the `-O` warning (§5.16) and
+  the guarantee question (Q5).
+* (b) packed `u8` in the host step (§6.2), the GPU stride table, the GC-to-memory bulk-copy
+  limit, folded element offsets `Bone.m[k]`, little-endian, the cycle guard, the ABI argument
+  for D17, the bit guarantee (§8), and `loadF32s` needing length generics (D18).
+* (c) evaluation once per place subexpression, the map, union, narrowing, call-result and
+  `readonly` rows (§4.2), `with` as notation only, `as` element-wise (§5.4), the `const` split
+  shown in Q1, Q2 merged with the fill, Q5 reframed as where no-heap lives, scalar `u8` record
+  fields split into an adjacent question, and the §VL.7 amendment (§5.20).
+* (d) the host step's requirements: per-(T, N) types, the constant folder, the per-function
+  growth bound, the custom section (§6.2); the spelling ladders and `nameIsFixedArray` (S0a,
+  risk 9); std `map` allocating per element (§5.10); the matrix's `-O` face and template list;
+  the re-priced slices (§6.7).
+* (e) no "immutable" in user text and the contrast table, the choosing paragraph (§5.18),
+  messages that name the fix (§5.19), the dynamic-index hint moved to info tier (§5.16), a
+  uniform dead-write rule (§5.14), adoption deferred (§5.2), the guide sentences that change
+  (§5.20).
+
+**Dissent the owner should hear.**
+
+1. **Records as fixed-array elements (Q3).** The owner's direction listed "immutable small
+   records (`V3[4]`)". The purist (c) and the newcomer (e) both object: stored by field, one
+   record type behaves as a value inside `V3[4]` and as a reference inside `V3[]`, which is the
+   copy-on-delivery the record covariance ruling refused. (e) goes further: if records ever
+   enter, value-ness must be **declared on the type** (a "value record"), never inferred from
+   the container. The game programmer (a) wants `V3[4]` eventually but did not object to v1
+   leaving it out. The doc now recommends (c).
+2. **Dead writes as errors or lints (Q4).** The coordinator, (a) and (e) want check errors for
+   the `T[N]` shapes, because a port from list code is otherwise a silent no-op exactly where
+   TypeScript habits lead. (c) wants one general `unused-assignment` lint and one
+   `discarded-value` lint for every type, at warning tier: a dead store is not a design
+   violation, a liveness-based error is brittle (`print(r[0])` silences it while the port
+   stays wrong), and the discarded-result error refuses `step()` called for its side effect.
+3. **Where no-heap lives (Q5).** (a) accepts `-O0` allocating (sunpa builds `-O3` only) but not
+   a silent fallback at `-O3`; that became the build warning and the guarantee in Q5 (a). (c)
+   holds that a type's main promise should not depend on an optimisation flag, which is Q5 (b),
+   the emitter route; the doc recommends (a) for cost.
+4. **Does S0 ship alone? (D21).** (a) says S0 alone is worse than today (16 boxes per ported
+   `m4MulInto`). (d) probed binaryen and found Heap2Local removes the intra-function rebuilds at
+   `-O3` when indices are constant, leaving about one box per call, roughly today's cost. The
+   doc now makes it a measurement on sunpa's `m4Mul` at `-O3`.
+5. **Agent-day estimates.** The owner's note says the coordinator overestimates. The
+   coordinator's first estimate was 14–17 agent-days; the implementer (d), after reading the
+   emitter (`sFieldCount` at 78 sites, ~25 stride-1 list-op emitters, spelling-based list
+   classification), priced it at 22–28. The doc quotes (d)'s figure as the honest one and this
+   disagreement beside it. S0a + S1, the part that answers SP-036, is 6–7 days either way.
+6. **Adoption (D3).** The coordinator's first draft adopted D3339-style for consistency with
+   the record rulings. (c) showed that list-to-value adoption changes the meaning of earlier
+   writes, and (e) that its restricted form is unpredictable, so the doc defers it. That
+   leaves an annotation the record rulings would have inferred, a deliberate inconsistency.
+7. **Implicit `f32[N] → f64[N]` (§5.11, §8.7).** (b) would refuse it, or document it as a
+   conversion, because `f64.promote_f32` does not fix a NaN payload and sunpa's determinism
+   contract wants the same bits on every host. The doc keeps the scalar rule (the same caveat
+   applies to scalar promotion) and adds a payload-NaN fixture.
+8. **`u8[4]` as one packed `i32` (§6.2).** (b) argues an RGBA colour should be one word in the
+   value tier (one `i32.store`, little-endian). The doc records it as a lowering option the
+   build measures, not a decision, since it is invisible to the model.
+9. **The unrolled `put` and a bulk store (D18).** (a) wants `storeF32s(b, at, m: f64[N])`
+   scheduled with S4 because uniform upload is sunpa's hottest helper; the doc defers it to a
+   consumer measurement and std review.
 
 ---
 
@@ -1271,7 +1379,9 @@ owned box for every storage position. The value tier reuses the #3372 host step 
 multi-slot emitter. Added: the survey with Swift `InlineArray`, Zig's aliasing, Valhalla,
 Julia StaticArrays, OCaml, D; the inline-field, flattened-list and size-cap measurements;
 interop with `flat`, `Buf`, GPU and SIMD; numeric-record and `u8` elements; build slices in
-agent-days. 24 owner questions collapsed to 5, with 21 stated defaults.
+agent-days. 24 owner questions collapsed to 5 plus one adjacent question, with stated
+defaults for the rest. Then a five-persona panel (§11), whose fixes were folded in one critic
+at a time.
 
 **Revision 2 (2026-10-04, after critic 1).** Corrected revision 1's dead-code-eliminated
 benchmark (40 ms "inlined" was three deleted rows); measured `br_table`, scratch memory and
