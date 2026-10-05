@@ -607,6 +607,13 @@ import {
   globalStmts,
   ia64Used,
   lUsed,
+  lfBlockOf,
+  lfDeclAt,
+  lfDeclBlock,
+  lfDeclLo,
+  lfDeclSid,
+  lfOriginOf,
+  lfPos,
   liBack,
   liKinds,
   liSlots,
@@ -1257,7 +1264,7 @@ function criRelayJoinListTy(rx: i32, i: i32, depth: i32): i32 {
   if !(n is Call) { return -1 }
   if n.callFn < 0 || n.callFn >= P.nodes.length { return -1 }
   if !(P.nodes[n.callFn] is Ident) { return -1 }
-  const cfi = fnIndexOfSid(sidOfNode(n.callFn))
+  const cfi = fnIndexOfNode(n.callFn)
   if cfi < 0 || cfi == i || cfi >= fnStmts.length { return -1 }
   const t = criFnJoinListTy(cfi)
   if t >= 0 { return t }
@@ -1812,7 +1819,7 @@ function recvMakerFnOf(recvIx: i32, fnIx: i32) {
   const ie = P.nodes[initIx]
   if ie is Call {
     const callee = P.nodes[ie.callFn]
-    if callee is Ident { return fnIndexOfSid(sidOfNode(ie.callFn)) }
+    if callee is Ident { return fnIndexOfNode(ie.callFn) }
   }
   -1
 }
@@ -1932,7 +1939,7 @@ function fieldClosureFeOfInit(initIx: i32, prop: string, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 {
         const rx = fnRetExprOf(fnStmts[t])
         if rx >= 0 {
@@ -2468,7 +2475,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const cfe = fnIndexOfSid(sidOfNode(e.callFn))
+      const cfe = fnIndexOfNode(e.callFn)
       if cfe >= 0 {
         if cloRetValKind(cfe) == "nulvariant" { return cloRetValSlot(cfe) }
         return -1
@@ -2730,7 +2737,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
     if popRefElemKind(exprIx, fnIx) == RLK_I32_LIST { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfNode(e.callFn)
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -3111,7 +3118,7 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfNode(e.callFn)
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -5450,6 +5457,121 @@ export function nestedFnDeclaredIn(name: string, pp: i32) {
   -1
 }
 
+// `lfFnAt`'s answer for a read at a node a pass appended past the module root.
+export const LF_UNPLACED = -2
+
+// The block-local function named by `sid` that a read at node `readIx` denotes, as a `fnStmts`
+// position, or -1 when none is in scope there. Lexical, so it needs no frame: the arena is
+// post-order, and a declaration's scope is its own subtree and the rest of its block. The
+// innermost wins (D3608).
+export function lfFnAt(sid: i32, readIx: i32): i32 {
+  if readIx < 0 || emitRootIx < 0 { return LF_UNPLACED }
+  // A callee a rewrite minted (a UFCS call's) stands at the call it came from.
+  let atIx = readIx
+  if atIx > emitRootIx { atIx = callOriginOf(atIx) }
+  if atIx > emitRootIx { return LF_UNPLACED }
+  let best = -1
+  let bestFrom = -1
+  let k = 0
+  while k < lfPos.length {
+    const i = lfPos[k]
+    if lfDeclSid[i] == sid {
+      // A read inside the declaration sees its own name from the subtree's start.
+      let from = -1
+      if lfDeclLo[i] <= atIx && atIx < lfDeclAt[i] {
+        from = lfDeclLo[i]
+      } else if lfDeclAt[i] < atIx && atIx <= lfDeclBlock[i] {
+        from = lfDeclAt[i]
+      }
+      if from > bestFrom {
+        best = i
+        bestFrom = from
+      }
+    }
+    k = k + 1
+  }
+  best
+}
+
+// `lfFnAt` asked from frame `fnIx`: in an instance of the declaring frame, the monomorphizer's
+// per-pin clone of the lexical answer is the one called. A clone no row records is found by
+// name on the frame chain, as before.
+function lfResolveAt(sid: i32, name: string, fnIx: i32, atIx: i32): i32 {
+  const t = lfFnAt(sid, atIx)
+  if t >= 0 && fnIx >= 0 {
+    const c = lfCloneOnChain(t, fnStmtsPosOf(fnIx))
+    if c >= 0 { return c }
+    const h = nestedFnOnChain(name, fnIx)
+    if h >= 0 && h != t && lfBlockOf(h) < 0 { return h }
+  }
+  t
+}
+
+// The clone of the block-local function at `t` that frame position `pos` or a frame enclosing
+// it is, or declares; -1 when none is.
+function lfCloneOnChain(t: i32, pos: i32): i32 {
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  let pp = pos
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if lfOriginOf(pp) == t { return pp }
+    if pp < fnChildHead.length {
+      let c = fnChildHead[pp]
+      while c >= 0 {
+        if lfOriginOf(c) == t { return c }
+        c = fnChildNext[c]
+      }
+    }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  -1
+}
+
+// The function a read of `sid` names once `lfFnAt` found no block-local one in scope: the
+// top-level function of the name, or -1 when the flat map holds only a block-local function,
+// which the read cannot see (D3614).
+function lfFlatAt(sid: i32): i32 {
+  const flat = sidArrGet(fnIndexBySid, sid)
+  if lfBlockOf(flat) >= 0 { return -1 }
+  flat
+}
+
+// `emit_collect.fnIndexOfInScopeChainSid` asked of the read at node `atIx`: a block-local
+// function answers only where its scope covers the read (D3608, D3614). An unplaced read, or a
+// name no block-local function carries, takes the unpositioned answer.
+export function fnIndexOfInScopeChainAt(
+  sid: i32,
+  name: string,
+  fnIx: i32,
+  atIx: i32,
+): i32 {
+  if sidArrGet(nestedNameBySid, sid) == 1 {
+    const hit = lfResolveAt(sid, name, fnIx, atIx)
+    if hit >= 0 { return hit }
+    if hit == -1 { return lfFlatAt(sid) }
+    if fnIx >= 0 {
+      const chain = nestedFnOnChain(name, fnIx)
+      if chain >= 0 { return chain }
+    }
+  }
+  fnIndexOfSid(sid)
+}
+
+// `fnIndexOfSid` asked of the identifier at node `ix`, positioned as `fnIndexOfInScopeChainAt`.
+export function fnIndexOfNode(ix: i32): i32 {
+  const sid = sidOfNode(ix)
+  if sidArrGet(nestedNameBySid, sid) == 1 {
+    const hit = lfResolveAt(sid, sidText(sid), emitCurFnIx, ix)
+    if hit >= 0 { return hit }
+    if hit == -1 { return lfFlatAt(sid) }
+  }
+  fnIndexOfSid(sid)
+}
+
 // The `fnStmts` position of the nearest function named `name` declared by a frame on
 // `fnIx`'s scope chain, innermost first, or -1 when none is. An instance frame declares none
 // of its origin's nested functions, so the chain continues into the origin (D1817). Callers
@@ -5492,14 +5614,23 @@ export function fnIndexOfInScopeAt(
   fnIx: i32,
   atIx: i32,
 ) {
-  // The chain scan can only succeed for a nested function named `name`.
-  if fnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
-    const hit = nestedFnOnChain(name, fnIx)
-    if hit >= 0 { return hit }
+  // The chain scan can only succeed for a nested function named `name`; a placed read asks
+  // the block-local scopes instead, which decide it lexically (D3608).
+  let placed = false
+  if sidArrGet(nestedNameBySid, sid) == 1 {
+    const lf = lfResolveAt(sid, name, fnIx, atIx)
+    if lf >= 0 { return lf }
+    placed = lf == -1
+    if !placed && fnIx >= 0 {
+      const hit = nestedFnOnChain(name, fnIx)
+      if hit >= 0 { return hit }
+    }
   }
   // No frame on the chain declares a function `name`, so the flat answer is a top-level one or
-  // nested off the chain; a binding of `name` on the chain shadows either (D2289).
-  const flat = sidArrGet(fnIndexBySid, sid)
+  // nested off the chain; a binding of `name` on the chain shadows either (D2289). A placed read
+  // no block-local function covers does not see one the flat map holds (D3614).
+  let flat = sidArrGet(fnIndexBySid, sid)
+  if placed { flat = lfFlatAt(sid) }
   if flat >= 0 && fnIx >= 0 {
     let binds = frameBindsCacheGet(fnIx, sid)
     if binds < 0 {
@@ -5873,7 +6004,7 @@ function capRecord(
       // in a top-level loop body addresses the module function instead of the loop variable.
       if moduleLoopEnclosing(capFrame, name) < 0 {
         if cnGlobOn && cnRecording { cnGlobReads[name] = 1 }
-        capSiblingFrees(name, bound, caps)
+        capSiblingFrees(name, bound, caps, atIx)
         return 0
       }
     }
@@ -5895,7 +6026,12 @@ const capSibStack: i32[] = []
 // `k`'s env inside `j`, so every name `k` needs from an outer frame must ride `j`'s env. Depth
 // already works through `capScan`'s `FuncDecl` arm, which folds a nested body's frees upward;
 // this is the sibling direction, which `capRecord` dropped with the function name (D1761).
-function capSiblingFrees(name: string, bound: {[string]: i32}, caps: string[]) {
+function capSiblingFrees(
+  name: string,
+  bound: {[string]: i32},
+  caps: string[],
+  atIx: i32,
+) {
   if capFrame < 0 || capFrame >= fnStmts.length { return 0 }
   // The same outward walk `fnIndexOfInScopeSid` takes, and for the same reason: only a
   // NESTED function is found, so a module-level callee resolves to -1 and folds in nothing.
@@ -5911,6 +6047,17 @@ function capSiblingFrees(name: string, bound: {[string]: i32}, caps: string[]) {
       if pp < fnParent.length { pp = fnParent[pp] } else { pp = 0 - 1 }
     }
     steps = steps + 1
+  }
+  // A placed read takes the block-local scopes' answer instead, so a function declared later
+  // or in a closed block is not it (D3608); a per-pin clone stands in, as in `lfResolveAt`.
+  const lf = lfFnAt(sidOf(name), atIx)
+  if lf != LF_UNPLACED && !(lf >= 0 && fe >= 0 && lfBlockOf(fe) < 0) {
+    fe = 0 - 1
+    if lf >= 0 && lf < fnParent.length && fnParent[lf] >= 0 { fe = lf }
+    if lf >= 0 {
+      const lc = lfCloneOnChain(lf, capFrame)
+      if lc >= 0 { fe = lc }
+    }
   }
   if fe < 0 { return 0 }
   if fe == capFrame { return 0 }
@@ -9127,7 +9274,7 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(c.callFn))
+      const target = fnIndexOfNode(c.callFn)
       if target >= 0 {
         const cFn = P.nodes[fnStmts[target]]
         if cFn is FuncDecl {
@@ -12681,7 +12828,7 @@ export function cloTailRefusal(callIx: i32, fnIx: i32): string {
   if c.callFn < 0 { return "" }
   if !(P.nodes[c.callFn] is Ident) { return "" }
   // A named function is no local closure, and most calls name one.
-  if fnIndexOfSid(sidOfNode(c.callFn)) >= 0 { return "" }
+  if fnIndexOfNode(c.callFn) >= 0 { return "" }
   const t = localCloPinFieldTail(c.callFn, fnIx)
   if t < 0 { return "" }
   const code = memberFieldCode(t, fnIx)
@@ -12733,7 +12880,7 @@ function argTakesPerPin(c: Call, ai: i32): boolean {
   const f = P.nodes[c.callFn]
   if !(f is Ident) { return true }
   if f.identName == "print" { return false }
-  const fe = fnIndexOfSid(sidOfNode(c.callFn))
+  const fe = fnIndexOfNode(c.callFn)
   if fe < 0 || fe >= fnStmts.length { return true }
   const fd = P.nodes[fnStmts[fe]]
   if fd is FuncDecl {
@@ -14332,7 +14479,7 @@ export function exprIsIntegralFloat(exprIx: i32, _fnIx: i32): boolean {
   if e.callArgs.length != 1 { return false }
   const callee = P.nodes[e.callFn]
   if !(callee is Ident) { return false }
-  if fnIndexOfSid(sidOfNode(e.callFn)) >= 0 { return false }
+  if fnIndexOfNode(e.callFn) >= 0 { return false }
   const nm = callee.identName
   nm == "trunc" || nm == "floor" || nm == "ceil" || nm == "nearest"
 }
@@ -14413,7 +14560,7 @@ export function callSpillsFcpArg(ix: i32): boolean {
   if !(callee is Ident) { return false }
   if callee.identName != "fromCodePoints" { return false }
   // A user function of the same name is not the builtin, exactly as `emitCall` reads it.
-  if fnIndexOfSid(sidOfNode(cf)) >= 0 { return false }
+  if fnIndexOfNode(cf) >= 0 { return false }
   const ai = unwrapParen(a0)
   if ai < 0 { return false }
   const a = P.nodes[ai]
@@ -14455,7 +14602,7 @@ export function callIsIntrMinMax(ix: i32, fnIx: i32): boolean {
   } else if callee.identName != "min" && callee.identName != "max" {
     return false
   }
-  if fnIndexOfSid(sidOfNode(cf)) >= 0 { return false }
+  if fnIndexOfNode(cf) >= 0 { return false }
   if fnIx < 0 { return true }
   if identNameIsBoundAt(callee.identName, fnIx, cf) { return false }
   // Unbound here, the name is a module global's or the intrinsic's.
@@ -14519,7 +14666,7 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
     const callee = P.nodes[n.callFn]
     let isVal = false
     if callee is Ident {
-      let t = fnIndexOfSid(sidOfNode(n.callFn))
+      let t = fnIndexOfNode(n.callFn)
       // A live closure binding of the name is what the call denotes, so the frame needs
       // the scratch even though a module function carries the name — without it the
       // `call_ref` spills into a local the vector never declared (D1602).
@@ -17453,9 +17600,7 @@ export function anonLeafRetCallFe(calleeIx: i32): i32 {
   if e is Call {
     const inner = P.nodes[unwrapParen(e.callFn)]
     if inner is Ident {
-      const t = anonLeafFeDeclNode(
-        fnIndexOfSid(sidOfNode(unwrapParen(e.callFn))),
-      )
+      const t = anonLeafFeDeclNode(fnIndexOfNode(unwrapParen(e.callFn)))
       if t >= 0 {
         const rx = fnRetExprOf(t)
         if rx >= 0 { return fieldValueFeOf(unwrapParen(rx)) }
@@ -17992,7 +18137,7 @@ function listAnnNameOf(ix: i32, fnIx: i32) {
   // template's type, and only the callee instance's return names the pinned list (D2820).
   if e is Call {
     if e.callFn >= 0 && P.nodes[e.callFn] is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfNode(e.callFn)
       if target >= 0 && target < fnStmts.length {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -22038,7 +22183,7 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
     if callee is Ident {
       const lct = localCloPinFieldTail(e.callFn, fnIx)
       if lct >= 0 && exprNulBool(lct, fnIx) { return true }
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl {
@@ -22208,7 +22353,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl {
@@ -23372,7 +23517,7 @@ function globalKind(initIx: i32): VKind {
   // top-level function name in value position — is a closure fat-pointer cell (kind 14).
   if e is FuncDecl { return "closure" }
   if e is Ident {
-    if fnIndexOfSid(sidOfNode(initIx)) >= 0 { return "closure" }
+    if fnIndexOfNode(initIx) >= 0 { return "closure" }
   }
   // An un-annotated float `.` literal init (`const a = 1.5`) is an f64 cell (kind 11),
   // lowered as `f64.const`. Bare integer globals stay kind 0.
@@ -29112,7 +29257,7 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if cmv.length > 0 { return cmv }
   // A call of a named function, whose return annotation `exprNulLitUnion` claimed it by.
   if e is Call && e.callFn >= 0 && P.nodes[e.callFn] is Ident {
-    const t = fnIndexOfSid(sidOfNode(e.callFn))
+    const t = fnIndexOfNode(e.callFn)
     if t >= 0 {
       const cf = P.nodes[fnStmts[t]]
       if cf is FuncDecl && cf.fnRet >= 0 {
@@ -29269,7 +29414,7 @@ function callResultAtomTyAt(ix: i32, fnIx: i32, depth: i32): i32 {
     }
     if cn.callFn < 0 { return -1 }
     if P.nodes[cn.callFn] is Ident {
-      const target = fnIndexOfSid(sidOfNode(cn.callFn))
+      const target = fnIndexOfNode(cn.callFn)
       if target >= 0 {
         const cf = P.nodes[fnStmts[target]]
         if cf is FuncDecl {
@@ -29604,7 +29749,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       if cloFe >= 0 && cloFe < fRetLitAtom.length {
         if fRetLitAtom[cloFe] == 1 { return true }
       }
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfNode(e.callFn)
       if target >= 0 {
         const cf = P.nodes[fnStmts[target]]
         if cf is FuncDecl {
@@ -32133,7 +32278,7 @@ function exactCallResultTyOf(callIx: i32, fnIx: i32): i32 {
   if c.callFn < 0 { return -1 }
   const callee = P.nodes[c.callFn]
   if !(callee is Ident) { return -1 }
-  const pos = fnIndexOfSid(sidOfNode(c.callFn))
+  const pos = fnIndexOfNode(c.callFn)
   if pos < 0 { return -1 }
   let orig = -1
   let k = 0
@@ -34215,7 +34360,7 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
       // asked of both the stored kind and the callee's annotation. The annotation is
       // load-bearing: `fRetKind` is seeded before `collectU` fills the variant table, so
       // `variantIndexOf` answers -1 there and the stored kind is stale for a variant return.
-      const nvfe = fnIndexOfSid(sidOfNode(e.callFn))
+      const nvfe = fnIndexOfNode(e.callFn)
       if nvfe >= 0 {
         if repOfFnSlot(nvfe).rdKind == "nulvariant" { return true }
         if nvfe < fnStmts.length {
@@ -34431,7 +34576,7 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   if e is Call {
     const cf = P.nodes[unwrapParen(e.callFn)]
     if cf is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
     }
     return false
@@ -34606,7 +34751,7 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl { return nulCloFlag(cfn.fnRet) == 1 }
@@ -36409,7 +36554,7 @@ function callIsValueCall(callIx: i32): boolean {
   const c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
-    if callee is Ident { return fnIndexOfSid(sidOfNode(c.callFn)) < 0 }
+    if callee is Ident { return fnIndexOfNode(c.callFn) < 0 }
     return true
   }
   false
@@ -36727,7 +36872,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       if popUnionBoxElem(pus) { return rlElemName[pus] }
     }
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 {
         const fn = P.nodes[fnStmts[t]]
         if fn is FuncDecl {
@@ -44526,7 +44671,7 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfNode(e.callFn)
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
@@ -45210,7 +45355,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       }
       // A map-returning function yields its declared map SHAPE (mono ⇒ -1, or a `string`-valued
       // map's mv slot); a `Map()` constructor is the mono map (-1).
-      const fe = fnIndexOfSid(sidOfNode(e.callFn))
+      const fe = fnIndexOfNode(e.callFn)
       if fe >= 0 { return fnRetMapShapeAt(sidOfNode(e.callFn), exprIx) }
     }
     // An i32-keyed constructor/factory result: the key comes off the call's own recorded
@@ -45864,7 +46009,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfNode(e.callFn)
       if t >= 0 { return fnReturnsClosure(t) }
       // A closure-value callee (`f(4)` where `f: (i32) => ((i32) => i32)`) whose result is
       // itself a closure — resolved from `f`'s `$fnsig` result (`>c`). Lets a curried lambda
@@ -47363,7 +47508,7 @@ export function letDeclIsClosureNoLocal(letIx: i32) {
     const u = unwrapParen(d.letInit)
     const ui = P.nodes[u]
     if ui is FuncDecl { return true }
-    if ui is Ident { return fnIndexOfSid(sidOfNode(u)) >= 0 }
+    if ui is Ident { return fnIndexOfNode(u) >= 0 }
   }
   false
 }
@@ -47497,7 +47642,7 @@ function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {
     if mll >= 0 { return letDeclIsClosureNoLocal(mll) }
     const gcl = globalLetOf(e.identName)
     if gcl >= 0 { return letDeclIsClosureNoLocal(gcl) }
-    return fnIndexOfSid(sidOfNode(exprIx)) >= 0
+    return fnIndexOfNode(exprIx) >= 0
   }
   if e is ObjLit { return false }
   false
@@ -47919,7 +48064,7 @@ function mfArrElemIsBool(arrIx: i32, fnIx: i32) {
 export function exprIsBareFnName(ix: i32) {
   if ix < 0 { return false }
   const e = P.nodes[ix]
-  if e is Ident { return fnIndexOfSid(sidOfNode(ix)) >= 0 }
+  if e is Ident { return fnIndexOfNode(ix) >= 0 }
   false
 }
 
