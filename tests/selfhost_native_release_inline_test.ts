@@ -38,6 +38,9 @@ const FIXTURES: [string, Want][] = [
   ["kept-reached-export", "kept"],
   ["kept-export-union-parent", "kept"],
   ["kept-export-union-record", "kept"],
+  ["kept-export-union-list", "kept"],
+  ["kept-export-union-holder", "kept"],
+  ["kept-export-union-map", "kept"],
 ];
 const RUNGS = ["-O", "-O3"];
 

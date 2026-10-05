@@ -186,18 +186,44 @@ fn holder_of(v: ValType) -> Option<Holder> {
 /// `ids` maps back to module type indices. An id it cannot map holds every record.
 fn holder_of_operand(
     v: ValType,
-    ids: &HashMap<wasmparser::types::CoreTypeId, u32>,
+    ids: &HashMap<wasmparser::types::CoreTypeId, Vec<u32>>,
 ) -> Option<Holder> {
     let ValType::Ref(r) = v else { return None };
     match r.heap_type() {
         HeapType::Concrete(UnpackedIndex::Id(id)) | HeapType::Exact(UnpackedIndex::Id(id)) => {
-            Some(ids.get(&id).map_or(Holder::Any, |&t| Holder::Concrete(t)))
+            Some(match ids.get(&id).map(Vec::as_slice) {
+                Some(&[t]) => Holder::Concrete(t),
+                _ => Holder::Any,
+            })
         }
         _ => holder_of(v),
     }
 }
 
 impl Scan {
+    /// The value types a value of type `t` carries: its fields, its element, or its
+    /// signature's (only the signature's when `direct`).
+    fn inner_types(&self, t: u32, direct: bool) -> Vec<ValType> {
+        match &self.subs[t as usize].composite_type.inner {
+            CompositeInnerType::Struct(_) | CompositeInnerType::Array(_) if direct => Vec::new(),
+            CompositeInnerType::Struct(st) => st
+                .fields
+                .iter()
+                .filter_map(|f| match f.element_type {
+                    StorageType::Val(v) => Some(v),
+                    _ => None,
+                })
+                .collect(),
+            CompositeInnerType::Array(at) => match at.0.element_type {
+                StorageType::Val(v) => vec![v],
+                _ => Vec::new(),
+            },
+            CompositeInnerType::Func(ft) => {
+                ft.params().iter().chain(ft.results()).copied().collect()
+            }
+            CompositeInnerType::Cont(_) => Vec::new(),
+        }
+    }
     fn sig(&self, t: u32) -> Option<(Vec<ValType>, Vec<ValType>)> {
         match &self.subs.get(t as usize)?.composite_type.inner {
             CompositeInnerType::Func(ft) => Some((ft.params().to_vec(), ft.results().to_vec())),
@@ -521,26 +547,7 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
             continue;
         }
         s.crossing.insert(t, what.clone());
-        let inner: Vec<ValType> = match &s.subs[t as usize].composite_type.inner {
-            CompositeInnerType::Struct(_) | CompositeInnerType::Array(_) if direct => Vec::new(),
-            CompositeInnerType::Struct(st) => st
-                .fields
-                .iter()
-                .filter_map(|f| match f.element_type {
-                    StorageType::Val(v) => Some(v),
-                    _ => None,
-                })
-                .collect(),
-            CompositeInnerType::Array(at) => match at.0.element_type {
-                StorageType::Val(v) => vec![v],
-                _ => Vec::new(),
-            },
-            CompositeInnerType::Func(ft) => {
-                ft.params().iter().chain(ft.results()).copied().collect()
-            }
-            CompositeInnerType::Cont(_) => Vec::new(),
-        };
-        for v in inner {
+        for v in s.inner_types(t, direct) {
             match holder_of(v) {
                 Some(Holder::Any) => {
                     s.crossing_any.get_or_insert_with(|| what.clone());
@@ -568,14 +575,18 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
     let mut fi = s.n_imports;
     let invalid = |_| "the module does not validate".to_string();
     // The validator names a concrete operand type by its canonical id, not its module index.
-    let mut ids: HashMap<wasmparser::types::CoreTypeId, u32> = HashMap::new();
+    // Two module types the validator canonicalizes to one id stay ambiguous: such an id
+    // holds every record.
+    let mut ids: HashMap<wasmparser::types::CoreTypeId, Vec<u32>> = HashMap::new();
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(bad)?;
         let valid = validator.payload(&payload).map_err(invalid)?;
         if matches!(payload, Payload::TypeSection(_)) {
             let types = validator.types(0).ok_or("no module types")?;
             for t in 0..types.core_type_count_in_module() {
-                ids.entry(types.core_type_at_in_module(t)).or_insert(t);
+                ids.entry(types.core_type_at_in_module(t))
+                    .or_default()
+                    .push(t);
             }
         }
         let ValidPayload::Func(to_validate, body) = valid else {
@@ -951,6 +962,21 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
     if s.bodies.len() + s.n_imports as usize != s.func_type.len() {
         return Err("the function and code sections disagree".into());
     }
+    // An erased value carries what it reaches, as a crossing one does.
+    let mut work: Vec<(u32, u32)> = s.erased.iter().map(|(&t, &f)| (t, f)).collect();
+    let mut reach: HashMap<u32, u32> = HashMap::new();
+    while let Some((t, f)) = work.pop() {
+        if reach.contains_key(&t) || t as usize >= s.subs.len() {
+            continue;
+        }
+        reach.insert(t, f);
+        for v in s.inner_types(t, direct) {
+            if let Some(Holder::Concrete(u)) = holder_of(v) {
+                work.push((u, f));
+            }
+        }
+    }
+    s.erased = reach;
     Ok(Some(s))
 }
 
