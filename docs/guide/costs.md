@@ -71,6 +71,11 @@ Insertion order is part of the contract: iterating a map visits keys in the orde
 first inserted, whatever the key type, and deleting and re-inserting a key moves it to the end.
 A miss (`m[k]` for an absent key) is `null`, and a stored `0` is not a miss.
 
+A map read of a number (`m.get(k)`, `m[k]`), like a number list's `xs.get(i)` and `xs.pop()`,
+is `T | null`. Read with `?? d`, it allocates nothing. Held in a `const` and then only tested
+for `null` and read where it is known not to be, it allocates nothing either. If the `const` is
+also passed on, returned, stored or captured as `T | null`, it is a box.
+
 ## Sets — `Set<T>`
 
 A set costs what a map costs: `s.add(x)` and `s.has(x)` are
