@@ -139,7 +139,15 @@ CMD_PRINT_ERR  5   // write cliCmdData() (+ newline) to stderr; no commit
 CMD_READ_STDIN 6   // slurp stdin; commit via cliFileCommit(found, data)
 CMD_TEST_*   7-9   // see `test` below
 CMD_VALIDATE  10   // validate the module now in rbyte*; commit via cliValidateCommit(ok)
+CMD_TEST_ENQUEUE 11 // queue cliCmdPath() for `vl test`'s compile pool; no commit
+CMD_TEST_COMPILE 12 // compile every queued file; commit each via cliTestCompiledCommit(status)
 ```
+
+11 and 12 are NEGOTIATED rather than covered by the ABI generation below: the brain issues
+them only after the host has called `cliTestPoolStage(1)`, which a host that does not know
+them never calls, and a seed without that export is never asked. Either mismatched pair
+falls back to compiling every test file in the one instance, which is correct output, so
+neither needed a generation bump (`vl-test-design.md`, "The compile pool").
 
 ### The host↔seed ABI generation
 
@@ -597,6 +605,8 @@ needs:
 | 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (`rbyteLen`/`rbyteAt`/`rbyteStore`) |
 | 8 | `CMD_TEST_COLLECT` | instantiate each stashed module across a thread pool, read its `vlt*` registry back |
 | 9 | `CMD_TEST_RUN` | run the brain's plan across the pool, catching a trap per test |
+| 11 | `CMD_TEST_ENQUEUE` | queue one discovered file for the compile pool |
+| 12 | `CMD_TEST_COMPILE` | compile every queued file, each in a fresh compiler instance, and commit the outcomes in queue order |
 
 Everything else — discovery (the same walk with a `*.test.vl` predicate),
 compilation, the plan, `-t` filtering, the report and the exit code — is VL in

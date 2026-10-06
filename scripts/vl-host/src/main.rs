@@ -712,13 +712,16 @@ prints the formatted source to stdout and writes nothing.
 
 {b}Usage:{r} vl test [path] [flags]       {d}default path: the current directory{r}
 
-Files run concurrently; tests within one file run serially in one instance,
-so they can share setup. A trapping test fails alone — the file's remaining
+Files compile and run concurrently, each in its own compiler and its own
+instance; tests within one file run serially in that instance, so they can
+share setup. A trapping test fails alone — the file's remaining
 tests continue in a fresh instance.
 
 {b}Flags:{r}
   {c}-t{r} <name>           Only tests whose name contains <name> (also -t=<name>)
-  {c}--jobs{r} <N>          Worker threads (default: one per core; also --jobs=<N>)
+  {c}--jobs{r} <N>          Worker threads (default: one per core; also --jobs=<N>).
+                      Compiles are also capped by available memory; --jobs 1
+                      compiles every file in one compiler, one at a time
   {c}--exclude{r} <glob>    Skip matching files (repeatable; also --exclude=<glob>)
   {c}--color={r}<when>      always | never | auto (default), for the RUNNER's own
                       report; a test's captured output is always plain
@@ -2136,13 +2139,32 @@ fn std_cmd(rest: &[String]) -> Result<()> {
 /// is armed — before instantiation, since the module's start function is guest code an
 /// unarmed epoch-interrupting store would trap in.
 fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>, Instance)> {
+    Ok(load_compiler_keep(engine, source)?.0)
+}
+
+/// `load_compiler`, also handing back the `Module` so a caller can instantiate it again
+/// (`vl test`'s compile pool) without a second sidecar load.
+fn load_compiler_keep(
+    engine: &Engine,
+    source: &CompilerSource,
+) -> Result<((Store<()>, Instance), Module)> {
     let module = load_compiler_module(engine, source)?;
     start_guest_profile(engine, &module)?;
+    let pair = instantiate_compiler(engine, &module, source)?;
+    Ok((pair, module))
+}
+
+/// One fresh compiler instance in its own store: armed, instantiated, ABI-checked.
+fn instantiate_compiler(
+    engine: &Engine,
+    module: &Module,
+    source: &CompilerSource,
+) -> Result<(Store<()>, Instance)> {
     let mut store = Store::new(engine, ());
     arm_guest_profile(&mut store);
     arm_guest_fuel(&mut store)?;
     let linker = Linker::new(engine);
-    let inst = from_compiler(linker.instantiate(&mut store, &module))?;
+    let inst = from_compiler(linker.instantiate(&mut store, module))?;
     check_seed_abi(&mut store, &inst, source)?;
     Ok((store, inst))
 }
@@ -7069,6 +7091,18 @@ struct TestOutcome {
 /// granularity (one unit of work = one wasm module) a work-stealing scheduler buys
 /// nothing a shared cursor does not.
 fn parallel_map<T: Send>(n: usize, jobs: usize, job: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    parallel_map_stack(n, jobs, None, job)
+}
+
+/// `parallel_map` on threads with a `stack`-byte native stack. A worker that runs the
+/// compiler seed needs `MAIN_THREAD_STACK`, because the seed engine's wasm stack is
+/// sized for the thread `main` runs on.
+fn parallel_map_stack<T: Send>(
+    n: usize,
+    jobs: usize,
+    stack: Option<usize>,
+    job: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
@@ -7081,14 +7115,23 @@ fn parallel_map<T: Send>(n: usize, jobs: usize, job: impl Fn(usize) -> T + Sync)
     let cursor_ref = &cursor;
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(move || loop {
+            let work = move || loop {
                 let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
                 }
                 let value = job_ref(i);
                 *slots_ref[i].lock().unwrap() = Some(value);
-            });
+            };
+            let mut builder = std::thread::Builder::new();
+            if let Some(bytes) = stack {
+                builder = builder.stack_size(bytes);
+            }
+            // A refused reservation runs the work on a default-sized thread instead,
+            // as `main` itself falls back.
+            if builder.spawn_scoped(scope, work).is_err() {
+                scope.spawn(work);
+            }
         }
     });
     slots
@@ -7384,6 +7427,117 @@ fn test_worker_count(requested: i32) -> usize {
         .unwrap_or(1)
 }
 
+/// What one pooled compile is assumed to hold at its peak, for the memory cap below.
+/// Each worker is a whole compiler instance with its own heap. The allowance is about
+/// twice what the largest consumer graph measured (docs/internals/vl-test-design.md,
+/// "The compile pool"), so a smaller graph only leaves the cap conservative.
+const TEST_COMPILE_BUDGET: u64 = 1 << 30;
+
+/// How many compiler instances `vl test`'s compile pool runs at once: the run's worker
+/// count, no more than there are files, and no more than half the memory available
+/// now can hold at `TEST_COMPILE_BUDGET` each, so a wide box with little free memory
+/// compiles fewer files at a time rather than tripping the OOM killer. Never below 1.
+fn test_compile_workers(requested: i32, files: usize) -> usize {
+    let mut workers = test_worker_count(requested).min(files);
+    if let Some(avail) = mem_available_bytes() {
+        workers = workers.min((avail / 2 / TEST_COMPILE_BUDGET) as usize);
+    }
+    workers.max(1)
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes; `None` where there is no such file.
+fn mem_available_bytes() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+/// Whether this pump may stage a compile pool. Not under `$VL_FUEL` or a guest profile:
+/// both instruments read ONE store, and a pool would move the compile out of it.
+fn test_pool_allowed() -> bool {
+    !guest_fuel_on() && guest_profile_path().is_none()
+}
+
+/// One pool worker: a fresh compiler instance on `module`, driven through the same
+/// command loop in compile-one mode (`cliTestPoolStage(2)`) over the single file
+/// `path`. `Ok(Ok(bytes))` is the emitted test module; `Ok(Err(text))` is the file's
+/// report entry when it did not compile; `Err` is the compiler itself failing.
+fn compile_test_file_pooled(
+    engine: &Engine,
+    module: &Module,
+    source: &CompilerSource,
+    path: &str,
+    color_arg: &str,
+) -> Result<std::result::Result<Vec<u8>, String>> {
+    let (mut store, inst) = instantiate_compiler(engine, module, source)?;
+    let arg_reset = inst.get_typed_func::<(), i32>(&mut store, "cliArgReset")?;
+    let arg_push = inst.get_typed_func::<i32, i32>(&mut store, "cliArgPush")?;
+    let arg_commit = inst.get_typed_func::<(), i32>(&mut store, "cliArgCommit")?;
+    arg_reset.call(&mut store, ())?;
+    for a in ["test", path, color_arg] {
+        for ch in a.chars() {
+            arg_push.call(&mut store, ch as i32)?;
+        }
+        arg_commit.call(&mut store, ())?;
+    }
+    stage_vl_root_and_cwd(&mut store, &inst)?;
+    inst.get_typed_func::<i32, i32>(&mut store, "cliTestPoolStage")?
+        .call(&mut store, 2)?;
+    let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
+    let cmd_path = StrOut::probe(&mut store, &inst, "cliCmdPath")?;
+    let cmd_data = StrOut::probe(&mut store, &inst, "cliCmdData")?;
+    let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
+    let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
+    let dir_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliDirCommit")?;
+    let exit_code = inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?;
+    let mut bytes: Option<Vec<u8>> = None;
+    let mut printed = String::new();
+    loop {
+        match from_compiler(next.call(&mut store, ()))? {
+            CMD_DONE => break,
+            CMD_LIST_DIR => {
+                // The target is one file the brain already found, so it never lists.
+                dir_commit.call(&mut store, 0)?;
+            }
+            CMD_READ_FILE => {
+                let key = cmd_path.read(&mut store)?;
+                let data = match key.strip_prefix("std:") {
+                    Some(name) => read_std_module(name),
+                    None => read_utf8(std::path::Path::new(&key)),
+                };
+                match data {
+                    Some(s) => {
+                        result_in.send(&mut store, &s)?;
+                        file_commit.call(&mut store, 1)?;
+                    }
+                    None => {
+                        file_commit.call(&mut store, 0)?;
+                    }
+                }
+            }
+            CMD_PRINT_OUT | CMD_PRINT_ERR => {
+                printed.push_str(&cmd_data.read(&mut store)?);
+                printed.push('\n');
+            }
+            CMD_TEST_STASH => {
+                bytes = Some(BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?);
+            }
+            other => bail!("vl: unknown CLI command {other} from a test compile worker"),
+        }
+    }
+    let code = exit_code.call(&mut store, ())?;
+    Ok(match (code, bytes) {
+        (0, Some(b)) => Ok(b),
+        (1, _) => Err(cmd_data.read(&mut store)?),
+        (code, _) => Err(if printed.trim().is_empty() {
+            format!("the compile worker for `{path}` stopped with exit {code}")
+        } else {
+            printed.trim_end().to_string()
+        }),
+    })
+}
+
 /// Whether `$VL_TEST_TRACE=1` asked for the per-file scheduling trace below.
 fn test_trace_on() -> bool {
     std::env::var("VL_TEST_TRACE").map(|v| v == "1").unwrap_or(false)
@@ -7429,6 +7583,8 @@ const CMD_TEST_STASH: i32 = 7;
 const CMD_TEST_COLLECT: i32 = 8;
 const CMD_TEST_RUN: i32 = 9;
 const CMD_VALIDATE: i32 = 10;
+const CMD_TEST_ENQUEUE: i32 = 11;
+const CMD_TEST_COMPILE: i32 = 12;
 
 // ── TEST-ONLY fault injection ($VL_FAULT_INJECT) ──────────────────────────────
 //
@@ -7894,7 +8050,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
         Some("refcount") => Collector::DeferredReferenceCounting,
         _ => Collector::Auto,
     })?;
-    let (mut store, inst) = load_compiler(&engine, &compiler)?;
+    let ((mut store, inst), compiler_module) = load_compiler_keep(&engine, &compiler)?;
 
     // TTY + NO_COLOR + TERM is host mechanism; the VL formatter can't probe isatty,
     // so the resolved decision rides in as a synthetic `--color=always|never`
@@ -7939,6 +8095,13 @@ fn cli_pump(args: &[String]) -> Result<()> {
     arg_commit.call(&mut store, ())?;
 
     stage_vl_root_and_cwd(&mut store, &inst)?;
+    // `vl test`'s compile pool. A seed without the export compiles every test file in
+    // this one instance, as before the pool existed.
+    if test_pool_allowed() {
+        if let Ok(stage) = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPoolStage") {
+            stage.call(&mut store, 1)?;
+        }
+    }
 
     let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
     let cmd_path = StrOut::probe(&mut store, &inst, "cliCmdPath")?;
@@ -7953,6 +8116,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // `vl test` state: the modules the brain has handed over (CMD_TEST_STASH), then
     // what collection learned about each (CMD_TEST_COLLECT), reused by the run.
     let mut test_files: Vec<TestFile> = Vec::new();
+    let mut test_queue: Vec<String> = Vec::new();
     let mut test_regs: Vec<TestRegistry> = Vec::new();
     let mut test_engine_slot: Option<Engine> = None;
 
@@ -8047,6 +8211,54 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 let path = cmd_path.read(&mut store)?;
                 let bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
                 test_files.push(TestFile { path, bytes });
+            }
+            CMD_TEST_ENQUEUE => {
+                test_queue.push(cmd_path.read(&mut store)?);
+            }
+            CMD_TEST_COMPILE => {
+                // Compile every queued file, each in a fresh compiler instance of its
+                // own, and commit the outcomes back IN QUEUE ORDER — stashing the
+                // modules in that order too, which is the stash order the collect and
+                // run phases attribute by. The first compiler failure, in queue order,
+                // fails the run as the serial compile would have.
+                let jobs = inst.get_typed_func::<(), i32>(&mut store, "cliTestJobsWanted")?;
+                let workers = test_compile_workers(jobs.call(&mut store, ())?, test_queue.len());
+                let commit =
+                    inst.get_typed_func::<i32, i32>(&mut store, "cliTestCompiledCommit")?;
+                let trace = test_trace_on();
+                let epoch = std::time::Instant::now();
+                let queue = std::mem::take(&mut test_queue);
+                let outcomes =
+                    parallel_map_stack(queue.len(), workers, Some(MAIN_THREAD_STACK), |i| {
+                        let start_us = epoch.elapsed().as_micros();
+                        let r = compile_test_file_pooled(
+                            &engine,
+                            &compiler_module,
+                            &compiler,
+                            &queue[i],
+                            color_arg,
+                        );
+                        if trace {
+                            test_trace_stamp("compile", i, start_us, epoch.elapsed().as_micros());
+                        }
+                        r
+                    });
+                for (path, outcome) in queue.into_iter().zip(outcomes) {
+                    match outcome {
+                        Err(e) => {
+                            note_compiling(&path);
+                            return Err(e);
+                        }
+                        Ok(Ok(bytes)) => {
+                            test_files.push(TestFile { path, bytes });
+                            commit.call(&mut store, 0)?;
+                        }
+                        Ok(Err(text)) => {
+                            result_in.send(&mut store, &text)?;
+                            commit.call(&mut store, 1)?;
+                        }
+                    }
+                }
             }
             CMD_TEST_COLLECT => {
                 // Instantiate every stashed module in parallel (this is where the
