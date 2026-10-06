@@ -1456,6 +1456,17 @@ pub(crate) fn field_facts(bytes: &[u8]) -> FieldFacts {
 /// changes nothing.
 pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
     let explaining = std::env::var_os("VL_MV_EXPLAIN").is_some_and(|v| !v.is_empty() && v != "0");
+    step(bytes, explaining).map(|(out, moved, _)| (out, moved))
+}
+
+/// What the step would hold field by field in `bytes`, were it run on it: per defined function
+/// the locals it scalarizes, and the `(function, parameter)` pairs a call passes as fields.
+/// `None` when the step would leave the module untouched, so it scalarizes nothing.
+pub(crate) fn scalarized(bytes: &[u8]) -> Option<(Vec<HashSet<u32>>, HashSet<(u32, u32)>)> {
+    step(bytes, false).map(|(_, _, a)| (a.fo_local, a.fo_param_r))
+}
+
+fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analysis)> {
     let Some(m) = scan(bytes) else {
         if explaining {
             eprintln!(
@@ -1680,7 +1691,7 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
             }
         })?;
     }
-    Some((out, moved))
+    Some((out, moved, a))
 }
 
 /// Why struct type `t` is not one the step takes apart, read off the type section; `None` when

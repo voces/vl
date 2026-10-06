@@ -297,6 +297,8 @@ pub(crate) struct ASite {
     pub(crate) reach: bool,
     pub(crate) ty: u32,
     pub(crate) kind: ArrKind,
+    /// How many `loop`s enclose the op in its function.
+    pub(crate) loops: u32,
 }
 
 /// How one `array.get` of a candidate array type uses the element it reads.
@@ -304,10 +306,9 @@ pub(crate) struct ASite {
 pub(crate) enum AUse {
     /// A field read of field `x` at op `last`, through an optional `ref.as_non_null`.
     Field { last: u32, x: u32 },
-    /// Held in a local that is only field-read or stored into the same array, and only ever
-    /// set to such a read or a fresh record: re-boxed there, and the multi-value step
-    /// scalarizes the local.
-    Local,
+    /// Held in local `l`, predicted to be taken apart (`elem_locals`): re-boxed there, and the
+    /// box deleted, by the multi-value step alone when `needs_mv`.
+    Local { l: u32, needs_mv: bool },
     /// Passed straight to parameter `arg` of `callee`: free when the multi-value step takes
     /// that parameter as fields.
     Arg { callee: u32, arg: u32 },
@@ -990,6 +991,8 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         // Per op that pushed a call's argument: the call's callee and the argument's index.
         let mut arg_of: HashMap<u32, (u32, u32)> = HashMap::new();
         let mut seg: Vec<u32> = vec![0];
+        // Per open control frame, whether it is a `loop` (the function's own frame is not).
+        let mut loop_frames: Vec<bool> = vec![false];
         let mut ops = body.get_operators_reader().map_err(bad)?;
         let mut k: u32 = 0;
         while !ops.eof() {
@@ -1206,6 +1209,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                         reach,
                         ty: a,
                         kind,
+                        loops: loop_frames.iter().filter(|&&lp| lp).count() as u32,
                     });
                 };
                 let mut bad = |a: u32, what: &str| {
@@ -1397,6 +1401,17 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
             owner.truncate(ha);
             post.push(ha as u32);
             match op {
+                Operator::Loop { .. } => loop_frames.push(true),
+                Operator::Block { .. }
+                | Operator::If { .. }
+                | Operator::Try { .. }
+                | Operator::TryTable { .. } => loop_frames.push(false),
+                Operator::End | Operator::Delegate { .. } => {
+                    loop_frames.pop();
+                }
+                _ => {}
+            }
+            match op {
                 Operator::Block { .. }
                 | Operator::Loop { .. }
                 | Operator::If { .. }
@@ -1465,7 +1480,11 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 })
                 .collect();
             let mv = || s.mv.get_or_init(|| field_facts(bytes));
-            let held = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params);
+            // `plain`: locals only field-read, copied or stored back directly, which binaryen's
+            // heap2local takes apart with or without the multi-value step. `held`: also those
+            // the step alone takes apart, so the flattening checks it does (D3736).
+            let plain = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, false);
+            let held = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, true);
             for &(k, a) in &agets {
                 let v = s.arrays[&a];
                 let last = if small.get(k as usize + 1) == Some(&Small::AsNonNull) {
@@ -1479,7 +1498,12 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                     {
                         AUse::Field { last: n as u32, x }
                     }
-                    Some((_, Small::LocalSet(l))) if held.contains(&l) => AUse::Local,
+                    Some((_, Small::LocalSet(l))) if plain.contains(&l) || held.contains(&l) => {
+                        AUse::Local {
+                            l,
+                            needs_mv: !plain.contains(&l),
+                        }
+                    }
                     _ => match arg_of.get(&last) {
                         Some(&(callee, arg)) => AUse::Arg { callee, arg },
                         None => AUse::Whole,
@@ -1614,10 +1638,12 @@ fn elem_locals<'m>(
     arg_of: &HashMap<u32, (u32, u32)>,
     mv: &dyn Fn() -> &'m FieldFacts,
     n_params: u32,
+    wide: bool,
 ) -> HashSet<u32> {
     // Parameter `j` of `g` is a field-only parameter of exactly record type `v`.
     let field_arg = |g: u32, j: u32, v: u32| -> bool {
-        let named = s
+        let named = wide
+            && s
             .func_type
             .get(g as usize)
             .and_then(|&t| s.sig(t))
@@ -1638,7 +1664,7 @@ fn elem_locals<'m>(
     }
     // So is a local an `array.set` of the array stores, or one copied into such a local (the
     // emitter's scratch for `p[0] = base`): grown to a fixpoint, then judged as the rest.
-    loop {
+    while wide {
         let before = arr_of.len();
         for (q, &op) in small.iter().enumerate() {
             let Small::LocalGet(l) = op else { continue };
@@ -1646,6 +1672,7 @@ fn elem_locals<'m>(
                 continue;
             }
             let into = match small.get(q + 1) {
+                Some(&Small::LocalSet(l3)) if l3 == l => None,
                 Some(&Small::LocalSet(l3)) => arr_of.get(&l3).copied(),
                 _ => stored.get(&(q as u32)).copied(),
             };
@@ -1675,8 +1702,10 @@ fn elem_locals<'m>(
                     let ok = match q.checked_sub(1).and_then(|p| small.get(p)) {
                         Some(&Small::StructNew(t)) => t == s.arrays[&a],
                         Some(&Small::AsNonNull) => q >= 2 && from(q - 2),
-                        Some(&Small::LocalGet(l2)) => good(l2, a, &bad),
-                        Some(&Small::Call(g)) => mv().producer.get(&g) == Some(&s.arrays[&a]),
+                        Some(&Small::LocalGet(l2)) => l2 != l && good(l2, a, &bad),
+                        Some(&Small::Call(g)) => {
+                            wide && mv().producer.get(&g) == Some(&s.arrays[&a])
+                        }
                         Some(_) => from(q - 1),
                         None => false,
                     };
@@ -1689,7 +1718,9 @@ fn elem_locals<'m>(
                     let v = s.arrays[&a];
                     let ok = match after_cast(small, q) {
                         Some((_, op)) if field_read_of(s, op, v) => true,
-                        Some((n, Small::LocalSet(l3))) => n == q + 1 && good(l3, a, &bad),
+                        Some((n, Small::LocalSet(l3))) => {
+                            n == q + 1 && l3 != l && good(l3, a, &bad)
+                        }
                         _ => {
                             stored.get(&(q as u32)) == Some(&a)
                                 || arg_of

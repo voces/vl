@@ -28,8 +28,9 @@
 // * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every list boxed;
 // * `flat-stable`: an export hands JS the list: flattened by default, kept under
 //   `--stable-layout`;
-// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, and
-//   `$VL_INLINE_REBOX` flattens it.
+// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed (reads
+//   weighted by their loops), or one whose held reads the multi-value step would not take
+//   apart (D3736), and `$VL_INLINE_REBOX` flattens it.
 //
 // @test-timing opt
 import {
@@ -75,6 +76,9 @@ const FIXTURES: [string, Want][] = [
   ["flat-kept-filled", "flat-kept"],
   ["flat-stable-export", "flat-stable"],
   ["flat-costly", "flat-costly"],
+  ["flat-costly-unscalarized", "flat-costly"],
+  ["flat-costly-self-copy", "flat-costly"],
+  ["flat-costly-loop", "flat-costly"],
 ];
 const RUNGS = ["-O", "-O3"];
 
