@@ -328,7 +328,7 @@ pub(crate) fn flat_step(
                 eprintln!(
                     "inline-explain: array type {a} (of type {}): flattened; {} store(s) ({} \
                      taken apart at the producer, {} spilled), {} read(s) as fields, {} \
-                     re-boxed ({} into a local the multi-value step scalarizes, {} into a field \
+                     re-boxed ({} into a local whose box is taken apart, {} into a field \
                      parameter)",
                     s.arrays[&a],
                     t.stores,

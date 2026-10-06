@@ -1465,10 +1465,8 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 .collect();
             let mv = || s.mv.get_or_init(|| field_facts(bytes));
             // `plain`: locals set once and only field-read, copied or stored back directly, which
-            // binaryen's heap2local takes apart with or without the multi-value step. `held`: also those
-            // the step alone takes apart, so the flattening checks it does (D3736).
-            // heap2local takes a box apart only in a local set once, so a local set again is
-            // judged as `held` and checked against the step.
+            // heap2local takes apart on its own (it leaves a box in a local set twice). `held`:
+            // also those only the multi-value step takes apart, checked against it (D3736).
             let mut plain = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, false);
             let mut sets: HashMap<u32, u32> = HashMap::new();
             for op in &small {
