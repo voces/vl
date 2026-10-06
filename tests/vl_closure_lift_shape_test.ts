@@ -46,12 +46,19 @@ const functionsOf = (wat: string): Map<string, string> => {
   return out;
 };
 
-const disassemble = async (src: string): Promise<Map<string, string>> => {
+// Builds `src` (beside any sibling modules in `libs`, by file name) and disassembles it.
+const disassemble = async (
+  src: string,
+  libs: Record<string, string> = {},
+): Promise<Map<string, string>> => {
   const dir = Deno.makeTempDirSync({ prefix: "vl-closure-lift-" });
   try {
     const file = `${dir}/p.vl`;
     const out = `${dir}/p.wasm`;
     Deno.writeTextFileSync(file, src);
+    for (const [name, text] of Object.entries(libs)) {
+      Deno.writeTextFileSync(`${dir}/${name}`, text);
+    }
     const p = await new Deno.Command(VL, {
       args: ["build", file, "--names", "-o", out, "--compiler", COMPILER],
       env: nativeEnv(),
@@ -75,7 +82,9 @@ const disassemble = async (src: string): Promise<Map<string, string>> => {
 
 // The body of the one function whose name starts with `prefix@`.
 const bodyOf = (fns: Map<string, string>, prefix: string): string => {
-  const hits = [...fns.keys()].filter((n) => n.startsWith(`${prefix}@`));
+  // A multi-module build suffixes each name with its module, `name$m<N>@file`.
+  const own = new RegExp(`^${prefix}(\\$m\\d+)?@`);
+  const hits = [...fns.keys()].filter((n) => own.test(n));
   if (hits.length !== 1) {
     throw new Error(
       `want one function ${prefix}@…, got ${JSON.stringify(hits)} of ${
@@ -174,3 +183,78 @@ Deno.test({
     }
   },
 });
+
+// A host taking a function-typed parameter is specialised per callback, and the specialisations
+// share its statements, so a local function there must not be lifted in one frame and built as a
+// value in another (D3713). Each program must BUILD; a frame with no callback parameter, in the
+// same program, still lifts. The second case puts the host in an imported module.
+const SPECIALISED: [string, string, Record<string, string>][] = [
+  [
+    "one module",
+    [
+      "function host(f: (n: i32) => i32, m: i32): i32 {",
+      "  const drawn = (k: i32) => k + m > 4",
+      "  let s = 0",
+      "  let k = 0",
+      "  while k < 4 && !drawn(k) {",
+      "    s = s + f(k)",
+      "    k = k + 1",
+      "  }",
+      "  s",
+      "}",
+      "function twice(n: i32) { n * 2 }",
+      "export function plain(p: i32): i32 {",
+      "  const c = p * 2",
+      "  const g = (x: i32): i32 => x + c",
+      "  g(1) + g(2)",
+      "}",
+      "export function run(): i32 { host(twice, 3) + host((n: i32) => n + 1, 2) }",
+    ].join("\n"),
+    {},
+  ],
+  [
+    "the host in an imported module",
+    [
+      'import { host } from "./lib"',
+      "function twice(n: i32) { n * 2 }",
+      "export function plain(p: i32): i32 {",
+      "  const c = p * 2",
+      "  const g = (x: i32): i32 => x + c",
+      "  g(1) + g(2)",
+      "}",
+      "export function run(): i32 { host(twice, 3) + host((n: i32) => n + 1, 2) }",
+    ].join("\n"),
+    {
+      "lib.vl": [
+        "export function host(f: (n: i32) => i32, m: i32): i32 {",
+        "  const drawn = (k: i32) => k + m > 4",
+        "  let s = 0",
+        "  let k = 0",
+        "  while k < 4 && !drawn(k) {",
+        "    s = s + f(k)",
+        "    k = k + 1",
+        "  }",
+        "  s",
+        "}",
+      ].join("\n"),
+    },
+  ],
+];
+
+for (const [name, src, libs] of SPECIALISED) {
+  Deno.test({
+    name: `closure lift shape: a callback-specialised host builds (${name})`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const all = await disassemble(src, libs);
+      const plain = bodyOf(all, "plain");
+      const allocs = count(plain, "struct.new");
+      const indirect = count(plain, "call_indirect");
+      if (allocs !== 0 || indirect !== 0) {
+        throw new Error(
+          `plain: want 0 struct.new and 0 call_indirect, got ${allocs} and ${indirect}\n${plain}`,
+        );
+      }
+    },
+  });
+}

@@ -47,6 +47,10 @@ let clIsLocalFn = false
 let clOk = true
 let clCaps: string[] = []
 let clCapDecls: i32[] = []
+// The owning frame of each candidate declaration, and the declarations two frames reach: a
+// callback specialization or a clone shares its host's statements (D3713).
+let clOwner: {[i32]: i32} = Map()
+let clShared: {[i32]: boolean} = Map()
 
 // Decide every lifted slot. Runs once the arena is final, before any functype is written.
 export function cloLiftScan() {
@@ -54,6 +58,14 @@ export function cloLiftScan() {
   cloLiftFrame = []
   cloLiftLet = []
   cloLiftFe = []
+  clOwner = Map()
+  clShared = Map()
+  let pp = 0
+  while fnValUsed && pp < fnStmts.length {
+    const d = P.nodes[fnStmts[pp]]
+    if d is FuncDecl { clNoteWalk(d.fnBody, pp) }
+    pp = pp + 1
+  }
   let fe = 0
   while fe < fnStmts.length {
     let n = -1
@@ -61,6 +73,33 @@ export function cloLiftScan() {
     cloLiftCapN.push(n)
     fe = fe + 1
   }
+  0
+}
+
+// Notes the lambda `const`s frame `pp`'s own code declares. A nested function is neither
+// noted nor entered: its lift is keyed by its own slot, so a shared one lifts correctly.
+function clNoteWalk(ix: i32, pp: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is LetDecl {
+    if n.letInit >= 0 {
+      if P.nodes[unwrapParen(n.letInit)] is FuncDecl { clNoteOwner(ix, pp) }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    clNoteWalk(kids[k], pp)
+    k = k + 1
+  }
+  0
+}
+
+function clNoteOwner(ix: i32, pp: i32) {
+  const was = clOwner.get(ix) ?? -1
+  if was < 0 { clOwner.set(ix, pp) }
+  else if was != pp { clShared.set(ix, true) }
   0
 }
 
@@ -108,6 +147,9 @@ function cloLiftDecide(fe: i32): i32 {
     clFindBinding(hostNode.fnBody)
   }
   if clName == "" { return -1 }
+  // A declaration another frame also emits would be lifted in one frame and built as a
+  // value in the other, so it keeps the closure path.
+  if clShared.has(self) || (clLet >= 0 && clShared.has(clLet)) { return -1 }
   clCaps = captureNamesOf(fe)
   clCapDecls = []
   let ci = 0
