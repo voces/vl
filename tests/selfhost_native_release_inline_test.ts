@@ -22,12 +22,14 @@
 // Slice S2 (D3681) flattens a LIST of such records into one array of their fields, and its
 // kinds read `$VL_OPT_FLAT_DUMP` where S1's read `$VL_OPT_INLINE_DUMP`:
 //
-// * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT`;
+// * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT` (`flat-held-locals`: whole
+//   reads held in locals the multi-value step scalarizes, D3736);
 // * `flat-grid`: every list op, forced by `$VL_INLINE_REBOX` and then `$VL_INLINE_SPILL`;
 // * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every list boxed;
 // * `flat-stable`: an export hands JS the list: flattened by default, kept under
 //   `--stable-layout`;
-// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, and
+// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, or one
+//   whose held reads the multi-value step would not take apart (D3736), and
 //   `$VL_INLINE_REBOX` flattens it.
 //
 // @test-timing opt
@@ -67,12 +69,16 @@ const FIXTURES: [string, Want][] = [
   ["stable-export-union-holder", "stable"],
   ["stable-export-union-map", "stable"],
   ["flat-melts", "flat-melts"],
+  ["flat-held-locals", "flat-melts"],
   ["flat-grid", "flat-grid"],
   ["flat-kept-nullable", "flat-kept"],
   ["flat-kept-written", "flat-kept"],
   ["flat-kept-filled", "flat-kept"],
   ["flat-stable-export", "flat-stable"],
   ["flat-costly", "flat-costly"],
+  ["flat-costly-unscalarized", "flat-costly"],
+  ["flat-costly-self-copy", "flat-costly"],
+  ["flat-costly-replan", "flat-costly"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -377,6 +383,10 @@ Deno.test({
         [
           "flat-costly",
           /not flattened: its reads \(14 of a field, 0 of a whole element\) are more than 6 whole elements' worth per store/,
+        ],
+        [
+          "flat-costly-replan",
+          /not flattened: 1 of its 1 element read\(s\) take the whole element .*\(the multi-value step would not take its held reads apart\)/,
         ],
         [
           "flat-grid",

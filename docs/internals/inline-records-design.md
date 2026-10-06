@@ -376,17 +376,18 @@ out of bounds. A field read through an optional `ref.as_non_null` is one `array.
 read re-boxes with `struct.new V`.
 
 **The cost rule, stated.** `A` is flattened only when
-1. no element read adds an allocation: every read is a field read, or is held in a local that
-   is only field-read or stored back into `A` (directly or through another such local; the
-   multi-value step scalarizes it), or is passed to a parameter the multi-value step takes as
-   fields; and
+1. no element read adds an allocation: every read is a field read, is passed to a parameter
+   the multi-value step takes as fields, or is held in a local that step scalarizes. Such a
+   local is set only to element reads, fresh records, producer results or another such local,
+   and is read only for a field, a store back into `A` (the emitter's scratch local for
+   `p[0] = base` included), such a parameter, or a copy into another such local (D3736); and
 2. its reads, counting a field read as `1/n` of an element, come to at most
    `FLAT_READS_PER_STORE` (6) elements per store site.
 
 Rule 1 is S1's rule, stricter than "no more whole reads than stores". Rule 2 is the break-even
 the bench below measures on V8, applied to static counts. It cannot see a list filled at one
-site and read in a hot loop (D3720), and one whole read anywhere keeps every list of that type
-boxed (D3719).
+site and read in a hot loop (D3720), and one whole read anywhere (a `pop`, a `get`, a
+return) keeps every list of that type boxed (D3719).
 
 **Measured** (the bench is `pushIter`, `iterOnly` and `indexOnly` over 1,024 `V3`s, built from
 VL at `-O` with and without `$VL_OPT_NO_FLAT`; V8 in Deno, minimum of 14 runs; wasmtime 49,
@@ -411,9 +412,12 @@ feet check as #3384 did; feet and gait output byte-identical to master):
 | --- | --: | --: | --: |
 | master | 601,198 | 90,113 | 6 |
 | S2 | **37,120** | 90,113 | 4 |
+| D3736 | 37,120 | **60,155** | 4 |
 
-`Q[]` is flattened (5 stores, 6 reads passed to field parameters). `V3[]` is refused for four
-whole reads in `fabrik` (D3719).
+`Q[]` is flattened (5 stores, 6 reads passed to field parameters). `V3[]` was refused for four
+whole reads in `fabrik`, `legsLayer` and `mantleClip`, each held in a local the multi-value
+step scalarizes; since D3736 it is flattened (14 stores; 3 reads as fields, 5 into such
+locals, 18 into field parameters), and static `V3` sites fall from 25 to 21.
 
 **Graded** by output against the plain build at `-O` and `-O3`, each by default, with
 `$VL_INLINE_REBOX=1` and with `$VL_INLINE_SPILL=1` too: the `flat-*` fixtures, and every

@@ -59,7 +59,8 @@ use wasmparser::{
 };
 
 use crate::multivalue::{
-    concrete_index, function_names, put_uleb, put_val, BodyMove, Num, MV_RECORD_MAX_FIELDS,
+    concrete_index, field_facts, function_names, put_uleb, put_val, BodyMove, FieldFacts, Num,
+    MV_RECORD_MAX_FIELDS,
 };
 
 const NONE: u32 = u32::MAX;
@@ -303,10 +304,9 @@ pub(crate) struct ASite {
 pub(crate) enum AUse {
     /// A field read of field `x` at op `last`, through an optional `ref.as_non_null`.
     Field { last: u32, x: u32 },
-    /// Held in a local that is only field-read or stored into the same array, and only ever
-    /// set to such a read or a fresh record: re-boxed there, and the multi-value step
-    /// scalarizes the local.
-    Local,
+    /// Held in local `l`, predicted to be taken apart (`elem_locals`): re-boxed there, and the
+    /// box deleted, by the multi-value step alone when `needs_mv`.
+    Local { l: u32, needs_mv: bool },
     /// Passed straight to parameter `arg` of `callee`: free when the multi-value step takes
     /// that parameter as fields.
     Arg { callee: u32, arg: u32 },
@@ -351,6 +351,7 @@ pub(crate) struct Body {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Small {
     Other,
+    Call(u32),
     AsNonNull,
     ArrayGet(u32),
     LocalGet(u32),
@@ -425,6 +426,8 @@ pub(crate) struct Scan {
     reads: HashMap<(u32, u32), ReadTally>,
     /// Reads passed straight to a call, as (parent, field, callee, argument, function).
     arg_reads: Vec<(u32, u32, u32, u32, u32)>,
+    /// The multi-value step's facts about the scanned module, made on first use.
+    pub(crate) mv: std::cell::OnceCell<FieldFacts>,
 }
 
 fn holder_of(v: ValType) -> Option<Holder> {
@@ -551,6 +554,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         bodies: Vec::new(),
         reads: HashMap::new(),
         arg_reads: Vec::new(),
+        mv: std::cell::OnceCell::new(),
     };
     let mut struct_groups = 0usize;
     let mut globals: Vec<ValType> = Vec::new();
@@ -1371,6 +1375,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 }
                 Operator::StructNew { struct_type_index } => Small::StructNew(struct_type_index),
                 Operator::ArrayGet { array_type_index } => Small::ArrayGet(array_type_index),
+                Operator::Call { function_index } => Small::Call(function_index),
                 _ => Small::Other,
             });
             // Which stack positions this op wrote, as the multi-value step reads it.
@@ -1458,7 +1463,19 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                     _ => None,
                 })
                 .collect();
-            let held = elem_locals(&s, &small, &agets, &stored, n_params);
+            let mv = || s.mv.get_or_init(|| field_facts(bytes));
+            // `plain`: locals set once and only field-read, copied or stored back directly, which
+            // heap2local takes apart on its own (it leaves a box in a local set twice). `held`:
+            // also those only the multi-value step takes apart, checked against it (D3736).
+            let mut plain = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, false);
+            let mut sets: HashMap<u32, u32> = HashMap::new();
+            for op in &small {
+                if let Small::LocalSet(l) | Small::LocalTee(l) = *op {
+                    *sets.entry(l).or_default() += 1;
+                }
+            }
+            plain.retain(|l| sets.get(l) == Some(&1));
+            let held = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, true);
             for &(k, a) in &agets {
                 let v = s.arrays[&a];
                 let last = if small.get(k as usize + 1) == Some(&Small::AsNonNull) {
@@ -1472,7 +1489,12 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                     {
                         AUse::Field { last: n as u32, x }
                     }
-                    Some((_, Small::LocalSet(l))) if held.contains(&l) => AUse::Local,
+                    Some((_, Small::LocalSet(l))) if plain.contains(&l) || held.contains(&l) => {
+                        AUse::Local {
+                            l,
+                            needs_mv: !plain.contains(&l),
+                        }
+                    }
                     _ => match arg_of.get(&last) {
                         Some(&(callee, arg)) => AUse::Arg { callee, arg },
                         None => AUse::Whole,
@@ -1594,16 +1616,34 @@ fn local_uses(small: &[Small], gets: &[(u32, u32, u32)]) -> HashMap<u32, LocalUs
 
 /// The locals (not parameters) an element read of a candidate array type is stored into that
 /// are never tee'd, are set only to such a read of that same array (through an optional
-/// `ref.as_non_null`) or to a fresh record of its element type, and whose every read is a
-/// field read or the value an `array.set` of that array stores (`stored`, by the op that
-/// pushes it). A re-boxed read stored there is scalarized by the multi-value step.
-fn elem_locals(
+/// `ref.as_non_null`), a fresh record of its element type or a producer's result, and whose
+/// every read is a field read, the value an `array.set` of that array stores (`stored`, by the
+/// op that pushes it) or an argument (`arg_of`) the multi-value step takes as fields. A
+/// re-boxed read stored there is scalarized by the multi-value step (D3719).
+#[allow(clippy::too_many_arguments)]
+fn elem_locals<'m>(
     s: &Scan,
     small: &[Small],
     agets: &[(u32, u32)],
     stored: &HashMap<u32, u32>,
+    arg_of: &HashMap<u32, (u32, u32)>,
+    mv: &dyn Fn() -> &'m FieldFacts,
     n_params: u32,
+    wide: bool,
 ) -> HashSet<u32> {
+    // Parameter `j` of `g` is a field-only parameter of exactly record type `v`.
+    let field_arg = |g: u32, j: u32, v: u32| -> bool {
+        let named = wide
+            && s
+            .func_type
+            .get(g as usize)
+            .and_then(|&t| s.sig(t))
+            .and_then(|(ps, _)| ps.get(j as usize).copied())
+            .is_some_and(
+                |p| matches!(p, ValType::Ref(r) if concrete_index(r.heap_type()) == Some(v)),
+            );
+        named && mv().fo_param.contains(&(g, j))
+    };
     let mut arr_of: HashMap<u32, u32> = HashMap::new();
     let mut bad: HashSet<u32> = HashSet::new();
     for &(k, a) in agets {
@@ -1611,6 +1651,28 @@ fn elem_locals(
             if l >= n_params && *arr_of.entry(l).or_insert(a) != a {
                 bad.insert(l);
             }
+        }
+    }
+    // So is a local an `array.set` of the array stores, or one copied into such a local (the
+    // emitter's scratch for `p[0] = base`): grown to a fixpoint, then judged as the rest.
+    while wide {
+        let before = arr_of.len();
+        for (q, &op) in small.iter().enumerate() {
+            let Small::LocalGet(l) = op else { continue };
+            if l < n_params || arr_of.contains_key(&l) {
+                continue;
+            }
+            let into = match small.get(q + 1) {
+                Some(&Small::LocalSet(l3)) if l3 == l => None,
+                Some(&Small::LocalSet(l3)) => arr_of.get(&l3).copied(),
+                _ => stored.get(&(q as u32)).copied(),
+            };
+            if let Some(a) = into {
+                arr_of.insert(l, a);
+            }
+        }
+        if arr_of.len() == before {
+            break;
         }
     }
     for &op in small {
@@ -1631,7 +1693,10 @@ fn elem_locals(
                     let ok = match q.checked_sub(1).and_then(|p| small.get(p)) {
                         Some(&Small::StructNew(t)) => t == s.arrays[&a],
                         Some(&Small::AsNonNull) => q >= 2 && from(q - 2),
-                        Some(&Small::LocalGet(l2)) => good(l2, a, &bad),
+                        Some(&Small::LocalGet(l2)) => l2 != l && good(l2, a, &bad),
+                        Some(&Small::Call(g)) => {
+                            wide && mv().producer.get(&g) == Some(&s.arrays[&a])
+                        }
                         Some(_) => from(q - 1),
                         None => false,
                     };
@@ -1644,8 +1709,15 @@ fn elem_locals(
                     let v = s.arrays[&a];
                     let ok = match after_cast(small, q) {
                         Some((_, op)) if field_read_of(s, op, v) => true,
-                        Some((n, Small::LocalSet(l3))) => n == q + 1 && good(l3, a, &bad),
-                        _ => stored.get(&(q as u32)) == Some(&a),
+                        Some((n, Small::LocalSet(l3))) => {
+                            n == q + 1 && l3 != l && good(l3, a, &bad)
+                        }
+                        _ => {
+                            stored.get(&(q as u32)) == Some(&a)
+                                || arg_of
+                                    .get(&(q as u32))
+                                    .is_some_and(|&(g, j)| field_arg(g, j, v))
+                        }
                     };
                     if !ok {
                         drop.push(l);
@@ -2034,16 +2106,17 @@ fn fields_step(
     }
     // A read passed to a call is free when the multi-value step takes that parameter as fields.
     if !s.arg_reads.is_empty() {
-        let fo = crate::multivalue::field_only_params(bytes);
+        let facts = s.mv.take().unwrap_or_else(|| field_facts(bytes));
         for (p, j, g, a, f) in std::mem::take(&mut s.arg_reads) {
             let t = s.reads.entry((p, j)).or_default();
-            if fo.contains(&(g, a)) {
+            if facts.fo_param.contains(&(g, a)) {
                 t.arg += 1;
             } else {
                 t.whole += 1;
                 t.whole_in.get_or_insert(f);
             }
         }
+        let _ = s.mv.set(facts);
     }
     let s: &Scan = s;
     let mut refused: HashMap<(u32, u32), String> = HashMap::new();

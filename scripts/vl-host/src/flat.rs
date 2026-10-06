@@ -15,12 +15,13 @@
 //! dataflow proof that the local it is read from holds no null there.
 //!
 //! **The cost rule.** `A` is flattened only when no element read would allocate where today
-//! it shares the box (a read that is field-read, held in a local that is only field-read or
-//! stored back, or passed to a parameter the multi-value step takes as fields is free), and
-//! when its reads come to at most `FLAT_READS_PER_STORE` whole elements per store, statically
-//! (a field read is `1/n` of one): a flat read is one bounds-checked `array.get` per field
-//! where a boxed one is one per element, so a list read far more often than it is written
-//! stays boxed (inline-records-design.md §7).
+//! it shares the box (a read that is field-read, passed to a parameter the multi-value step
+//! takes as fields, or held in a local that step scalarizes is free: one set only to such
+//! reads, fresh records or producer results, and read only for a field, a store back or such
+//! a parameter), and when its reads come to at most `FLAT_READS_PER_STORE` whole elements per
+//! store, statically (a field read is `1/n` of one): a flat read is one bounds-checked
+//! `array.get` per field where a boxed one is one per element, so a list read far more often
+//! than it is written stays boxed (inline-records-design.md §7).
 //!
 //! **The rewrite.** With `n` fields, element `i`'s field `j` is element `i * n + j` of the new
 //! array. An index or length `x` becomes `x * n`, or `-n` (out of bounds) when `x * n` would
@@ -33,7 +34,7 @@
 //! **Safety.** As the inline-record step's: one rec group, the output validated, the input kept
 //! on any failure. Fixtures grade by output. `$VL_INLINE_EXPLAIN=1` explains each array type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasmparser::ValType;
 
 use crate::inline::{
@@ -62,35 +63,38 @@ struct Tally {
     whole_in: Option<u32>,
 }
 
-/// The step on `bytes` (described by `s`): `Some((rewritten module, where each body came
-/// from))`, or `None` when it flattens nothing.
-pub(crate) fn flat_step(
+/// What `tallies` finds: per array its tally, why it is refused outright, and each free read's
+/// local `(array, function, local)` and parameter `(array, callee, parameter)`.
+type Tallies = (
+    HashMap<u32, Tally>,
+    HashMap<u32, String>,
+    Vec<(u32, u32, u32)>,
+    Vec<(u32, u32, u32)>,
+);
+
+/// The tallies of every candidate array. For an array in `unfreed`, where the multi-value step
+/// was found not to take them apart, reads into a local or a field parameter count whole.
+fn tallies(
     s: &Scan,
     bytes: &[u8],
-    explaining: bool,
-    rebox_all: bool,
-    spill_all: bool,
+    unfreed: &HashSet<u32>,
     name: &dyn Fn(u32) -> String,
-) -> Option<(Vec<u8>, Vec<BodyMove>)> {
-    let mut cands: Vec<u32> = s.arrays.keys().copied().collect();
-    cands.sort_unstable();
-    if cands.is_empty() {
-        return None;
-    }
-    // Tallies, from every body's sites.
+) -> Tallies {
     let mut tally: HashMap<u32, Tally> = HashMap::new();
-    let mut nullable: HashMap<u32, String> = HashMap::new();
-    let mut too_long: HashMap<u32, String> = HashMap::new();
+    let mut refused: HashMap<u32, String> = HashMap::new();
+    let mut held: Vec<(u32, u32, u32)> = Vec::new();
+    let mut args: Vec<(u32, u32, u32)> = Vec::new();
     let mut arg_reads: Vec<(u32, u32, u32, u32)> = Vec::new();
     for (bi, b) in s.bodies.iter().enumerate() {
         let f = s.n_imports + bi as u32;
         for site in &b.asites {
-            let t = tally.entry(site.ty).or_default();
-            let n = rec_len(s, s.arrays[&site.ty]);
+            let a = site.ty;
+            let t = tally.entry(a).or_default();
+            let n = rec_len(s, s.arrays[&a]);
             let mut store = |o: &Opnd, op: &str| {
                 t.stores += 1;
                 if site.reach && o.nullable {
-                    nullable.entry(site.ty).or_insert_with(|| {
+                    refused.entry(a).or_insert_with(|| {
                         format!(
                             "a value whose type admits null is stored into it ({op} at byte \
                              {:#x} in {})",
@@ -107,7 +111,7 @@ pub(crate) fn flat_step(
                         store(o, "array.new_fixed");
                     }
                     if os.len() as u32 * n > NEW_FIXED_MAX {
-                        too_long.entry(site.ty).or_insert_with(|| {
+                        refused.entry(a).or_insert_with(|| {
                             format!(
                                 "an array.new_fixed of {} elements would exceed {NEW_FIXED_MAX} \
                                  operands (in {})",
@@ -119,9 +123,16 @@ pub(crate) fn flat_step(
                 }
                 ArrKind::Get => match b.areads.get(&site.k) {
                     Some(AUse::Field { .. }) => t.field += 1,
-                    Some(AUse::Local) => t.local += 1,
-                    Some(&AUse::Arg { callee, arg }) => arg_reads.push((site.ty, callee, arg, f)),
-                    Some(AUse::Whole) | None => {
+                    Some(&AUse::Local { l, needs_mv }) if !(needs_mv && unfreed.contains(&a)) => {
+                        t.local += 1;
+                        if needs_mv {
+                            held.push((a, f, l));
+                        }
+                    }
+                    Some(&AUse::Arg { callee, arg }) if !unfreed.contains(&a) => {
+                        arg_reads.push((a, callee, arg, f))
+                    }
+                    _ => {
                         t.whole += 1;
                         t.whole_in.get_or_insert(f);
                     }
@@ -131,16 +142,38 @@ pub(crate) fn flat_step(
         }
     }
     if !arg_reads.is_empty() {
-        let fo = crate::multivalue::field_only_params(bytes);
+        let fo = &s
+            .mv
+            .get_or_init(|| crate::multivalue::field_facts(bytes))
+            .fo_param;
         for (a, g, j, f) in arg_reads {
             let t = tally.entry(a).or_default();
             if fo.contains(&(g, j)) {
                 t.arg += 1;
+                args.push((a, g, j));
             } else {
                 t.whole += 1;
                 t.whole_in.get_or_insert(f);
             }
         }
+    }
+    (tally, refused, held, args)
+}
+
+/// The step on `bytes` (described by `s`): `Some((rewritten module, where each body came
+/// from))`, or `None` when it flattens nothing.
+pub(crate) fn flat_step(
+    s: &Scan,
+    bytes: &[u8],
+    explaining: bool,
+    rebox_all: bool,
+    spill_all: bool,
+    name: &dyn Fn(u32) -> String,
+) -> Option<(Vec<u8>, Vec<BodyMove>)> {
+    let mut cands: Vec<u32> = s.arrays.keys().copied().collect();
+    cands.sort_unstable();
+    if cands.is_empty() {
+        return None;
     }
     let group_of = |t: u32| -> usize {
         let mut at = 0usize;
@@ -152,108 +185,164 @@ pub(crate) fn flat_step(
         }
         usize::MAX
     };
-    // The plan: each candidate flattened, or why not.
-    let mut flat: HashMap<u32, Num> = HashMap::new();
-    for &a in &cands {
-        let v = s.arrays[&a];
-        let t = tally.get(&a).copied().unwrap_or_default();
-        let why = if let Some(w) = record_refusal(s, v, name) {
-            Some(format!("its element type {v} is refused: {w}"))
-        } else if s.supertype(a).is_some() || s.has_sub[a as usize] {
-            Some("it is in a subtyping relation".into())
-        } else if group_of(a) != group_of(v) {
-            Some(format!(
-                "it is not in the rec group of its element type {v}"
-            ))
-        } else if let Some(w) = crossing(s, a, name) {
-            Some(format!("it can cross the module boundary ({w})"))
-        } else if let Some((w, f)) = s.arr_bad.get(&a) {
-            Some(if *f == NONE {
-                w.clone()
-            } else {
-                format!("{w} (in {})", name(*f))
-            })
-        } else if let Some(w) = nullable.get(&a).or_else(|| too_long.get(&a)) {
-            Some(w.clone())
-        } else if t.whole > 0 && !rebox_all {
-            Some(format!(
-                "{} of its {} element read(s) take the whole element (first in {}), and each \
-                 would allocate a copy where today it shares the box",
-                t.whole,
-                t.field + t.local + t.arg + t.whole,
-                name(t.whole_in.unwrap_or(0))
-            ))
-        } else if t.field + rec_len(s, v) * (t.local + t.arg)
-            > FLAT_READS_PER_STORE * rec_len(s, v) * t.stores
-            && !rebox_all
-        {
-            Some(format!(
-                "its reads ({} of a field, {} of a whole element) are more than \
-                 {FLAT_READS_PER_STORE} whole elements' worth per store ({} store(s)), and a \
-                 flat read costs one bounds-checked array.get per field",
-                t.field,
-                t.local + t.arg,
-                t.stores
-            ))
-        } else {
-            None
-        };
+    let say = |lines: &[String]| {
         if explaining {
-            if let Some(w) = &why {
-                eprintln!("inline-explain: array type {a} (of type {v}): not flattened: {w}");
+            for l in lines {
+                eprintln!("{l}");
             }
         }
-        if why.is_none() {
-            let num = s.rec[v as usize].as_ref().map(|r| r[0])?;
-            flat.insert(a, num);
+    };
+    // A read into a local or a field parameter is free only if the multi-value step takes it
+    // apart, and the step does so only where it rewrites the module at all. So the rewrite is
+    // checked against the step's own answer, and an array it would leave a re-box in is planned
+    // again with those reads counted whole (D3736).
+    let mut unfreed: HashSet<u32> = HashSet::new();
+    loop {
+        let (tally, refused, held, args) = tallies(s, bytes, &unfreed, name);
+        let mut lines: Vec<String> = Vec::new();
+        let mut flat: HashMap<u32, Num> = HashMap::new();
+        for &a in &cands {
+            let v = s.arrays[&a];
+            let t = tally.get(&a).copied().unwrap_or_default();
+            let n = rec_len(s, v) as u64;
+            let why = if let Some(w) = record_refusal(s, v, name) {
+                Some(format!("its element type {v} is refused: {w}"))
+            } else if s.supertype(a).is_some() || s.has_sub[a as usize] {
+                Some("it is in a subtyping relation".into())
+            } else if group_of(a) != group_of(v) {
+                Some(format!(
+                    "it is not in the rec group of its element type {v}"
+                ))
+            } else if let Some(w) = crossing(s, a, name) {
+                Some(format!("it can cross the module boundary ({w})"))
+            } else if let Some((w, f)) = s.arr_bad.get(&a) {
+                Some(if *f == NONE {
+                    w.clone()
+                } else {
+                    format!("{w} (in {})", name(*f))
+                })
+            } else if let Some(w) = refused.get(&a) {
+                Some(w.clone())
+            } else if t.whole > 0 && !rebox_all {
+                Some(format!(
+                    "{} of its {} element read(s) take the whole element (first in {}), and \
+                     each would allocate a copy where today it shares the box{}",
+                    t.whole,
+                    t.field + t.local + t.arg + t.whole,
+                    name(t.whole_in.unwrap_or(0)),
+                    if unfreed.contains(&a) {
+                        " (the multi-value step would not take its held reads apart)"
+                    } else {
+                        ""
+                    }
+                ))
+            } else if t.field as u64 + n * (t.local + t.arg) as u64
+                > FLAT_READS_PER_STORE as u64 * n * t.stores as u64
+                && !rebox_all
+            {
+                Some(format!(
+                    "its reads ({} of a field, {} of a whole element) are more than \
+                     {FLAT_READS_PER_STORE} whole elements' worth per store ({} store(s)), \
+                     and a flat read costs one bounds-checked array.get per field",
+                    t.field,
+                    t.local + t.arg,
+                    t.stores
+                ))
+            } else {
+                None
+            };
+            if let Some(w) = &why {
+                lines.push(format!(
+                    "inline-explain: array type {a} (of type {v}): not flattened: {w}"
+                ));
+            }
+            if why.is_none() {
+                let num = s.rec[v as usize].as_ref().map(|r| r[0])?;
+                flat.insert(a, num);
+            }
         }
-    }
-    if flat.is_empty() {
-        if explaining {
-            eprintln!("inline-explain: no array flattened");
-        }
-        return None;
-    }
-    let out = rewrite(s, bytes, &flat, spill_all);
-    let (out, moved, stats) = match out {
-        Ok(x) => x,
-        Err(why) => {
+        if flat.is_empty() {
+            say(&lines);
             if explaining {
-                eprintln!("inline-explain: flattening abandoned: {why}");
+                eprintln!("inline-explain: no array flattened");
             }
             return None;
         }
-    };
-    if let Err(e) =
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all()).validate_all(&out)
-    {
+        let out = rewrite(s, bytes, &flat, spill_all);
+        let (out, moved, stats) = match out {
+            Ok(x) => x,
+            Err(why) => {
+                say(&lines);
+                if explaining {
+                    eprintln!("inline-explain: flattening abandoned: {why}");
+                }
+                return None;
+            }
+        };
+        if let Err(e) = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&out)
+        {
+            say(&lines);
+            if explaining {
+                eprintln!(
+                    "inline-explain: flattening abandoned: its output does not validate: {e}"
+                );
+            }
+            return None;
+        }
+        // Does the multi-value step take apart every read counted free?
+        let relied = |a: &u32| flat.contains_key(a) && !rebox_all;
+        if held.iter().any(|(a, ..)| relied(a)) || args.iter().any(|(a, ..)| relied(a)) {
+            let took = crate::multivalue::scalarized(&out);
+            let mut left: HashSet<u32> = HashSet::new();
+            for &(a, f, l) in held.iter().filter(|(a, ..)| relied(a)) {
+                let ok = took.as_ref().is_some_and(|(locals, _)| {
+                    locals
+                        .get((f - s.n_imports) as usize)
+                        .is_some_and(|ls| ls.contains(&l))
+                });
+                if !ok {
+                    left.insert(a);
+                }
+            }
+            for &(a, g, j) in args.iter().filter(|(a, ..)| relied(a)) {
+                if !took
+                    .as_ref()
+                    .is_some_and(|(_, params)| params.contains(&(g, j)))
+                {
+                    left.insert(a);
+                }
+            }
+            if !left.is_empty() {
+                unfreed.extend(left);
+                continue;
+            }
+        }
+        say(&lines);
         if explaining {
-            eprintln!("inline-explain: flattening abandoned: its output does not validate: {e}");
+            let mut done: Vec<u32> = flat.keys().copied().collect();
+            done.sort_unstable();
+            for a in done {
+                let t = tally.get(&a).copied().unwrap_or_default();
+                let st = stats.get(&a).copied().unwrap_or_default();
+                eprintln!(
+                    "inline-explain: array type {a} (of type {}): flattened; {} store(s) ({} \
+                     taken apart at the producer, {} spilled), {} read(s) as fields, {} \
+                     re-boxed ({} into a local whose box is taken apart, {} into a field \
+                     parameter)",
+                    s.arrays[&a],
+                    t.stores,
+                    st.at_producer,
+                    st.spilled,
+                    st.field,
+                    st.whole,
+                    t.local,
+                    t.arg
+                );
+            }
         }
-        return None;
+        return Some((out, moved));
     }
-    if explaining {
-        let mut done: Vec<u32> = flat.keys().copied().collect();
-        done.sort_unstable();
-        for a in done {
-            let t = tally.get(&a).copied().unwrap_or_default();
-            let st = stats.get(&a).copied().unwrap_or_default();
-            eprintln!(
-                "inline-explain: array type {a} (of type {}): flattened; {} store(s) ({} taken \
-                 apart at the producer, {} spilled), {} read(s) as fields, {} re-boxed ({} into \
-                 a local the multi-value step scalarizes, {} into a field parameter)",
-                s.arrays[&a],
-                t.stores,
-                st.at_producer,
-                st.spilled,
-                st.field,
-                st.whole,
-                t.local,
-                t.arg
-            );
-        }
-    }
-    Some((out, moved))
 }
 
 fn rec_len(s: &Scan, v: u32) -> u32 {
