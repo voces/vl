@@ -3129,26 +3129,13 @@ seed from current `compiler/*.vl` in ~40s.*
   and it is the convention `vl seed` already set. `docs/internals/cli-design.md`
   §"The output channel is RULED" carries the decision and the alternative.
   REMAINING: surfacing diagnostics with spans once the spans rungs land.
-- ⬜ **C-test-shared-compile. `vl test` compiles a module shared by several test files once per
-  run (sunpa SP-041, ask 2) — NEEDS AN OWNER RULING.** Ask 1 shipped (each file compiles in its own
-  compiler instance, in parallel; `docs/internals/vl-test-design.md` §"The compile pool"), so N
-  files importing `game.vl` now cost one compile of wall time but still N of CPU and memory.
-  Compiling the shared module ONCE has two routes, and both change something:
-  (a) **separate compilation** — compile `game.vl` to a module of its own and link the test files
-  against it. Preserves every per-file semantic, but VL compiles a whole program at a time
-  (monomorphization, return and literal-binding inference, record layout all read every use), so
-  this is plumb's separate-compilation track, not a runner change.
-  (b) **one module per run** — compile every test file into one program, instantiate it once per
-  file. Observable differences: whole-program inference sees all test files' uses at once (a
-  `let` in `game.vl` retyped by one file's stores would be retyped for every file); every file's
-  TOP LEVEL runs in every instance unless the compiler learns to gate a module's top level per
-  instance (registration, prints, writes to shared module state); one file's type error fails the
-  shared compile, so attributing it needs a per-file fallback compile; a test file importing
-  another test file already merges registries (vl-test-design.md known gap 6).
-  **Recommendation: neither now.** (b) trades per-file isolation — which
-  `tests/fixtures/vl-test-shared/` now pins — for CPU a user only pays once ask 1's wall-clock win
-  is in; (a) is the real fix and belongs to separate compilation. The cheaper lever for sunpa is
-  the compile itself (`C-compile-hotspots`) plus a content-hashed cache (`C-test-cache`).
+- ✅ **C-test-shared-compile. CLOSED by owner ruling 2026-10-06 (sunpa SP-041, ask 2): C, with B a
+  strong no.** Test files are fully independent: no shared module state, no cross-file inference
+  coupling, no shared failure, so (b) one module per run is refused, and
+  `tests/fixtures/vl-test-shared/` stays the pinned guarantee. (a) separate compilation stays on
+  plumb's track. The answer for sunpa is a faster compiler (`C-compile-hotspots`) plus the
+  content-hashed compile cache (`C-test-cache`), whose design is
+  `docs/internals/incremental-compilation-design.md`.
 - ⬜ **C-test-cache. A content-hashed compile cache across `vl test` runs (sunpa SP-041, ask 3).**
   Key a test file's emitted module on the bytes of every source in its import graph, the seed's
   content key and the flags that reach the compile, and reuse it when nothing changed, so an
@@ -3157,6 +3144,18 @@ seed from current `compiler/*.vl` in ~40s.*
   only known after the fetch loop, so the brain has to report it (or the host records every
   `CMD_READ_FILE` a worker serviced). Measured 2026-10-06: sunpa's `vl test src/` is 25.7 s, of
   which `rules.test.vl`'s compile is 24.5 s and the tests themselves ~40 ms.
+  **Designed** (lane IC, 2026-10-06): `docs/internals/incremental-compilation-design.md` §4 —
+  this row is its Stage S1. The key is the whole host-to-guest transcript (staging calls, argv,
+  every command reply and read), recorded by the host, plus the resolved seed, host build id,
+  binaryen and environment; no compiler change.
+- ⬜ **C-incremental. Incremental and cached compilation, staged (lane IC; owner direction
+  2026-10-06: compile many at once, watch, file cache).** Plan and gates:
+  `docs/internals/incremental-compilation-design.md` §5 — S0 phase marks, S1 whole-action file
+  cache (`C-test-cache`), S2 `-O` chain cache, S3 `--watch`, S4 compile cost
+  (`C-compile-hotspots`), S5 per-module checker reuse with an interface hash, S6 per-function emit
+  reuse with symbolic indices. Four owner questions in §6: Q1 record adoption across a module
+  boundary (it crosses today, unlike an exported `let`), Q2 cache default and location, Q3 the
+  watch surface, Q4 frozen export signatures.
 - ⬜ **C-compile-hotspots. Two whole-table scans dominate large compiles (sunpa SP-041, ask 4).**
   Guest profile of `vl build src/game.vl` (sunpa, no `-O`, 17.4 s, 2026-10-06, named seed):
   `nameIsStructDecl` (`emit_classify.vl`) is **41.9% of self time** — it walks all of `P.nodes`
