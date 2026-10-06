@@ -46,8 +46,8 @@
 // THE THIRD DISCIPLINE, same file again. `buildFnMap` resumes on the `fnStmts` PREFIX for the
 // same reason, and it reads things a rename cannot touch: `P.nodes[fnStmts[i]]`, `fnParent[i]`
 // and the `FuncDecl`'s own `fnRet`/`fnName`. So every in-place write to one of those must be
-// preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` — or carry the
-// exemption line. A `monoArenaTouch()` is NOT a substitute: it makes `monoRebuild` run, and a
+// preceded, within `NOTE_WINDOW` lines, by `buildFnMapNoteFnSlotWrite()` (or, for a `fnStmts`
+// slot, `buildFnMapNoteFnStmtWrite(slot, node)`) — or carry the exemption line. A `monoArenaTouch()` is NOT a substitute: it makes `monoRebuild` run, and a
 // run whose prefix is still armed re-seeds the stale row rather than re-classifying it.
 //
 // No assertion library, per CLAUDE.md: every failure is a `throw new Error` naming want and got.
@@ -80,6 +80,11 @@ const NOTE_WINDOW = 3;
 const SLOT_WRITE =
   /\b(?:fnStmts|fnParent)\s*\[[^\]]*\]\s*=(?!=)|\.(?:fnRet|fnName)\s*=(?!=)/;
 const SLOT_NOTE_CALL = "buildFnMapNoteFnSlotWrite(";
+// The row-scoped note a same-name `fnStmts` slot write may use instead (D3761).
+const SLOT_ROW_NOTE_CALL = "buildFnMapNoteFnStmtWrite(";
+// The row note covers only a `fnStmts` slot: a `fnParent` or `.fnRet`/`.fnName` write moves what
+// the note assumes stands, so it still needs the retiring note.
+const FN_STMTS_SLOT = /\bfnStmts\s*\[/;
 
 /** The code half of a line: everything before an unquoted `//`. */
 const stripComment = (line: string): string => {
@@ -131,7 +136,9 @@ const classify = (lines: string[]): Hit[] => {
       renames: NAME_WRITE.test(code),
       noted: above.some((l) => l.includes(NOTE_CALL)),
       repoints: SLOT_WRITE.test(code),
-      slotNoted: above.some((l) => l.includes(SLOT_NOTE_CALL)),
+      slotNoted: above.some((l) =>
+        l.includes(SLOT_NOTE_CALL) || (FN_STMTS_SLOT.test(code) && l.includes(SLOT_ROW_NOTE_CALL))
+      ),
       ticked: after.some((l) => l.includes("monoArenaTouch()")),
       exempt: mark === undefined ? null : mark.slice(mark.indexOf(EXEMPT_MARK) + EXEMPT_MARK.length).trim(),
     });
@@ -262,11 +269,20 @@ Deno.test("mono arena tick: the scanner reports a slot write that does not tell 
     "  monoArenaTouch()",
     "  fn.fnRet = synthTypeRef(nm, -1)", //         8 — a classified field, and a bump is not a note
     "  monoArenaTouch()",
+    "  buildFnMapNoteFnStmtWrite(origFe, nfn)",
+    "  fnStmts[origFe] = nfn", //                  11 — the row note covers a `fnStmts` slot
+    "  monoArenaTouch()",
+    "  buildFnMapNoteFnStmtWrite(origFe, nfn)",
+    "  fnParent[origFe] = instFe", //              14 — but not a `fnParent` write
+    "  monoArenaTouch()",
+    "  buildFnMapNoteFnStmtWrite(origFe, nfn)",
+    "  fn.fnName = nm", //                          17 — nor a `.fnName` write
+    "  monoArenaTouch()",
   ];
   const got = classify(control).map((h) =>
     `${h.line}:${h.repoints ? (h.slotNoted ? "noted" : "UNNOTED") : "n/a"}`
   );
-  const want = ["1:UNNOTED", "4:noted", "6:n/a", "8:UNNOTED"];
+  const want = ["1:UNNOTED", "4:noted", "6:n/a", "8:UNNOTED", "11:noted", "14:UNNOTED", "17:UNNOTED"];
   if (got.join(" ") !== want.join(" ")) {
     throw new Error(
       `the slot scanner mis-read its own control — want [${want.join(", ")}], got ` +
