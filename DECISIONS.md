@@ -7533,8 +7533,8 @@ the module boundary can reach it (every type reachable from an import, export, e
 or tag, through fields, elements and signatures; a reachable abstract `any`/`eq`/`struct`
 refuses every record some op hands to such a place, as a union box's payload). Following
 fields is the conservative default the design review asked for: a JS host cannot read a
-struct's fields, and sunpa pays for it (below). `$VL_INLINE_BOUNDARY=direct` follows
-signatures only, to measure the owner's question 2 (inline-records-design.md §6). A parent must be made by `struct.new` in a function body (not `new_default`, not
+struct's fields, and sunpa pays for it (below). The owner ruled it out as the default the
+same day (next paragraph). A parent must be made by `struct.new` in a function body (not `new_default`, not
 a constant expression, D3679), never atomically, must not cross the boundary itself, and must
 lay the field out as its sub- and supertypes do. Every store must be non-null by type; a
 nullable record local that validates as non-null is declared so first.
@@ -7557,6 +7557,18 @@ by default, 119 with the cost rule lifted, at the store and at the spill path: a
 78,441 → 53,275 (9.3 → 6.3 per character). `V3` stays at 106,805 under the default rule,
 because the export `animationReady` returns a record with a `V3` field to JS; with
 `$VL_INLINE_BOUNDARY=direct` it falls to 89,937 (12.7 → 10.7).
+
+**The boundary is the signature (owner ruling 2026-10-05, §6 Q2; D3718).** A record's layout
+is not part of a module's boundary. Only a type a boundary signature names keeps its layout
+and identity, because a JS host can hold that object but cannot read a struct's fields; a
+record nested in one (a field, a list element, a union box's payload) may be inlined. A
+value handed to an `any`/`eq`/`struct` place is still refused while such a reference crosses
+a signature, since JS may then hold that very object. The conservative rule stays available
+as `vl build --stable-layout`, for a unit linked wasm to wasm or read field by field (the
+owner's (C), "unless C is easy": it was, the step already had the mode). The env knob is
+retired, since a flag is the supported spelling and two would drift. sunpa's feet check on
+`ce4e1c3`: `V3` 106,981 → 90,113, feet and gait output identical, and the
+`--stable-layout` module equals master's byte for byte apart from its map's file name.
 
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 

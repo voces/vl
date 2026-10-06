@@ -7,10 +7,18 @@
 //! subtyping component, as the multi-value step charges writes (D3630); no `ref.eq` or
 //! `extern.convert_any` takes an operand whose static type can hold a `V`; no type declares
 //! `V` as its supertype, so a `V` slot only ever holds a `V`; and no value that crosses the
-//! module boundary (an import's or export's signature, an exposed table or a tag, and every
-//! type reachable from one through fields, elements and signatures) can hold a `V`. Under
-//! those four no expression can tell a shared box from a copy, so a read may copy the fields
-//! out and a store may copy them in.
+//! module boundary (an import's or export's signature, an exposed table or a tag, the
+//! signatures those reach, and, under `--stable-layout`, every type reachable from one through
+//! fields and elements too) can hold a `V`. Under those four no expression can tell a shared
+//! box from a copy, so a read may copy the fields out and a store may copy them in.
+//!
+//! **The boundary is the signature (owner ruling 2026-10-05, inline-records-design.md §6 Q2).**
+//! A record's layout is not part of a module's boundary: only a type a boundary signature names
+//! keeps its layout and identity, because a JS host can hold that object but cannot read a
+//! struct's fields. A record nested in one (a field, a list element, a union box's payload) may
+//! be inlined. A value handed to an `any`/`eq`/`struct` place is still refused when such a
+//! reference crosses, since JS may then hold that very object. `vl build --stable-layout`
+//! selects the conservative rule, for units linked wasm to wasm or read field by field.
 //!
 //! A field `j` of a struct `P` is inlined when its type is a reference to such a `V`; every
 //! value stored into it in reachable code is non-null by its static type (a nullable record
@@ -202,7 +210,7 @@ fn holder_of_operand(
 
 impl Scan {
     /// The value types a value of type `t` carries: its fields, its element, or its
-    /// signature's (only the signature's when `direct`).
+    /// signature's (only a signature's when `direct`).
     fn inner_types(&self, t: u32, direct: bool) -> Vec<ValType> {
         match &self.subs[t as usize].composite_type.inner {
             CompositeInnerType::Struct(_) | CompositeInnerType::Array(_) if direct => Vec::new(),
@@ -267,7 +275,7 @@ impl Scan {
 
 /// Parse the module and walk every body under the validator. `None` when it does not parse or
 /// validate, or has no field the step could inline; `Err` names why the step declines outright.
-fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
+fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
     let mut s = Scan {
         subs: Vec::new(),
         groups: Vec::new(),
@@ -528,11 +536,10 @@ fn scan(bytes: &[u8]) -> Result<Option<Scan>, String> {
             }
         }
     }
-    // A value that crosses the boundary carries everything it reaches across with it.
-    // `$VL_INLINE_BOUNDARY=direct` follows signatures only, not fields and elements: a JS host
-    // cannot read a struct's fields, so only a type a signature names can hand it a record.
-    // A measurement facility for the owner's question (inline-records-design.md §6, Q2).
-    let direct = std::env::var_os("VL_INLINE_BOUNDARY").is_some_and(|v| v == "direct");
+    // What crosses: the types a boundary signature names, and the signatures they reach. A JS
+    // host cannot read a struct's fields, so fields and elements are followed only under
+    // `--stable-layout`, where everything a crossing value reaches keeps its layout.
+    let direct = !stable_layout;
     let mut work: Vec<(u32, String)> = Vec::new();
     for (h, what) in &s.boundary {
         match h {
@@ -1288,8 +1295,9 @@ fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) -> Option<Str
 }
 
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
-/// changes nothing.
-pub fn inline_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
+/// changes nothing. `stable_layout` (`vl build --stable-layout`) keeps the layout of every type
+/// a crossing value reaches, not only of the types a boundary signature names.
+pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<BodyMove>)> {
     let flag = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
     let explaining = flag("VL_INLINE_EXPLAIN");
     // `$VL_INLINE_REBOX=1`: inline a field even where a read re-boxes, so a grid can grade the
@@ -1298,7 +1306,7 @@ pub fn inline_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
     // `$VL_INLINE_SPILL=1`: take every store apart at the store, never at its producer, so a
     // grid reaches the path an unknown producer takes. Also a measurement facility.
     let spill_all = flag("VL_INLINE_SPILL");
-    let s = match scan(bytes) {
+    let s = match scan(bytes, stable_layout) {
         Ok(Some(s)) => s,
         Ok(None) => {
             if explaining {
