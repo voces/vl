@@ -150,6 +150,17 @@ const genCallSites = (n: number, k: number): string => {
   return o.join("\n") + "\n";
 };
 
+// EXPORTS: N functions in the entry file, every one `export`-marked, against N/K of them. Both
+// arms declare and call the same N functions; only the size of the export table differs.
+const genExports = (n: number, k: number): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const ex = i % k === 0 ? "export " : "";
+    o.push(`${ex}function f${i}(x: i32): i32 { if x > ${i} { x * ${i} + f${i > 0 ? i - 1 : 0}(x - 1) } else { x + ${i} } }`);
+  }
+  return o.join("\n") + "\n";
+};
+
 // CALLBACK SLOTS: N higher-order functions each taking a callback, against N/K taking the
 // same N callbacks over K call sites each. Both arms declare N callbacks and place N call
 // sites; only the number of function-TYPED PARAMETER SLOTS differs, and that is the entity
@@ -627,6 +638,16 @@ axis(
 // 1.09 / 0.97 / 1.13.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
+
+// The entry file's export table: deduping the staged names and resolving each one's target
+// scanned per export. Fuel reads 1.01; master `4179e4b36` read 4.23 here, and 8x the fuel at
+// 20,000 exports.
+axis(
+  "exports",
+  2.5,
+  "The export staging (`compileSrc`, compiler/driver.vl) or `emitExportSection`'s tables (compiler/emit_sections.vl) are scanning per export.",
+  (d) => twoFiles(d, genExports(8000, 1), genExports(8000, 20)),
+);
 
 // Fuel reads 1.07, so the bar is the family default. It read 3.2 while `modIndexOfKey` and
 // `modRecomputePending` (compiler/driver.vl) scanned the module table by string compare once

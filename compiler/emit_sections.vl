@@ -601,6 +601,7 @@ import {
   blockPushPopBits,
   bodyEndsInReturn,
   callIsPushKind,
+  callNodeIxReset,
   callPushBits,
   capNarrowBuild,
   capNarrowRecordFrame,
@@ -693,6 +694,7 @@ import {
   sidResetStartBlockLet,
   structEmitOrder,
   tyAnnRefListSlot,
+  typeDeclNameIxReset,
   uFieldStorageSlot,
   uVarSTwinAt,
   unionRegistryABSweep,
@@ -6500,6 +6502,8 @@ export function emitProgram(rootIx: i32) {
   modFcpSpillHit = false
   modIntMinMaxSeen = 0
   modIntMinMaxHit = false
+  typeDeclNameIxReset()
+  callNodeIxReset()
   // ── the arena-index sidecar reset (method note 7) ──
   // Every column below holds indices into the checker's `T.tys`, which a fresh program rebuilds
   // from scratch. Each also has its own reset inside the collect pass that clears the name
@@ -8304,53 +8308,61 @@ function captureFoldedConsts(): i32 {
   0
 }
 
-// The `fnStmts` slot an export TARGET name resolves to — the FIRST slot carrying it — or
-// -1. The module's ABI resolution, in one place: #1260's `monoFirstFnIndexNamed` mirrors
-// this same rule inside the monomorphizer, and four sections now depend on it agreeing.
-function exportSlotOfTarget(name: string): i32 {
+// The first `fnStmts` slot carrying each function name — the slot an export TARGET resolves
+// to. The module's ABI resolution in one place: #1260's `monoFirstFnIndexNamed` mirrors the
+// same FIRST-slot rule inside the monomorphizer, and four sections depend on it agreeing.
+function fnFirstSlotByName(): {[string]: i32} {
+  const first: {[string]: i32} = Map()
   let tj = 0
   while tj < fnStmts.length {
     const tfn = P.nodes[fnStmts[tj]]
     if tfn is FuncDecl {
-      if tfn.fnName == name { return tj }
+      if !first.has(tfn.fnName) { first[tfn.fnName] = tj }
     }
     tj = tj + 1
   }
-  -1
+  first
 }
 
-// The PUBLIC names the export section publishes, in section order: every alias-table
-// entry whose target resolves, minus duplicates (a wasm export name must be unique, and
-// a repeated public name keeps its FIRST entry).
-function exportPublicNames(): string[] {
-  const nms: string[] = []
+// The alias-table rows the export section publishes, in section order: every entry whose
+// target resolves, minus duplicates (a wasm export name must be unique, and a repeated
+// public name keeps its FIRST entry). `first` is `fnFirstSlotByName()`.
+function exportPublishedRows(first: {[string]: i32}): i32[] {
+  const rows: i32[] = []
+  const seen: {[string]: boolean} = Map()
   let rxi = 0
   while rxi < reExpName.length {
-    if (
-      exportSlotOfTarget(reExpTarget[rxi]) >= 0
-      && !strListHas(nms, reExpName[rxi])
-    ) {
-      nms.push(reExpName[rxi])
+    if (first[reExpTarget[rxi]] ?? -1) >= 0 && !seen.has(reExpName[rxi]) {
+      seen[reExpName[rxi]] = true
+      rows.push(rxi)
     }
     rxi = rxi + 1
+  }
+  rows
+}
+
+// The PUBLIC names the export section publishes, in section order.
+function exportPublicNames(): string[] {
+  const rows = exportPublishedRows(fnFirstSlotByName())
+  const nms: string[] = []
+  let k = 0
+  while k < rows.length {
+    nms.push(reExpName[rows[k]])
+    k = k + 1
   }
   nms
 }
 
-// The `fnStmts` slot each published name resolves to, PARALLEL to `exportPublicNames`.
-// The two walk `reExpName` in the same order under the same two predicates, so entry k of
-// one belongs to entry k of the other by construction.
+// The `fnStmts` slot each published name resolves to, PARALLEL to `exportPublicNames`:
+// both read the same `exportPublishedRows`, so entry k of one belongs to entry k of the other.
 function exportTargetSlots(): i32[] {
+  const first = fnFirstSlotByName()
+  const rows = exportPublishedRows(first)
   const slots: i32[] = []
-  const seen: string[] = []
-  let rxi = 0
-  while rxi < reExpName.length {
-    const hit = exportSlotOfTarget(reExpTarget[rxi])
-    if hit >= 0 && !strListHas(seen, reExpName[rxi]) {
-      seen.push(reExpName[rxi])
-      slots.push(hit)
-    }
-    rxi = rxi + 1
+  let k = 0
+  while k < rows.length {
+    slots.push(first[reExpTarget[rows[k]]] ?? -1)
+    k = k + 1
   }
   slots
 }
