@@ -18,6 +18,17 @@ command loop the same way it covers `build`'s single `compileSrc`. Profile the c
 actually mean — `vl build` is a poor proxy for `vl check`, which runs the LINT that `build`
 never reaches (0.12 vs 0.84 CPU-s on one 17,600-line file).
 
+**ALLOCATION, NOT TIME: `VL_PROFILE_GUEST_ALLOC=1`.** The host then weights each sample by the
+bytes its resident set grew since the previous one. Under the null collector, which never frees,
+that growth is what the compiler allocated, so `profile-rank.py <p.json> 30 --alloc` ranks
+functions by bytes. Read the INCL column: a sample's leaf is whatever ran when the epoch ticked,
+which is not always the allocator. Under `VL_FUEL=1`, `vl build` also prints `[alloc] guest:
+<bytes>`, the resident growth across the compile call, and `tests/vl_scaling_shape_test.ts`
+grades it under `VL_COMPILE_GC=null`. A compile whose entry file is under 1.5 MiB runs under
+the null collector, so everything it allocates counts against one 4 GiB heap. sunpa's `game.vl`
+filled that heap (D3737). A table reset per function and regrown to the program's size costs
+the heap its full size each time, even where it costs little fuel.
+
 Notes, each of which cost something to learn:
 
 * **`vl run` profiles the COMPILE, not the program it emitted.** The user program runs on a

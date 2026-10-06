@@ -201,6 +201,10 @@ ROWS = [
     ("callNodeIndex", ["cniLen", "cniEpoch"], "no-refined-input",
      ("  if P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }",
       "  if false && P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }")),
+    # `ieeeBytes`' encodings by lexeme and width (D3737): a pure function of its key, never reset.
+    ("ieeeBytesMemo", [], "no-refined-input",
+     ("  if hit != null {\n    gIeeeOverflow",
+      "  if hit != null && false {\n    gIeeeOverflow")),
     # `crNoteSoleRef`'s names a root uses other than as a receiver (D2584): keyed on the root's
     # node index, read from the syntax tree alone, and reset with the checker's state.
     ("crValUseNames", [], "no-refined-input",

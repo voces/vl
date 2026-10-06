@@ -361,7 +361,7 @@ const genReturnChain = (k: number): string => {
 //
 // A RUNTIME pair (the string-append axes, the control) is graded on the child's CPU, because
 // fuel meters only the compiler: that cost lands in the emitted program, which runs unmetered.
-type Cost = { wall: number; cpu: number; fuel: number };
+type Cost = { wall: number; cpu: number; fuel: number; alloc: number };
 
 // `times`' SECOND line is the shell's reaped children — this spawn's `vl` and nothing
 // else, the shell's own cost being the first line. A POSIX builtin, so this needs no
@@ -375,9 +375,14 @@ const childCpu = (out: string): number => {
   return s;
 };
 
-const spawn = async (what: string, argv: string[], fuel: boolean): Promise<Cost> => {
+const spawn = async (
+  what: string,
+  argv: string[],
+  fuel: boolean,
+  extra: Record<string, string> = {},
+): Promise<Cost> => {
   const t0 = Date.now();
-  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` };
+  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...extra };
   if (fuel) env.VL_FUEL = "1";
   const { code, stdout, stderr } = await new Deno.Command("/bin/sh", {
     args: ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
@@ -392,11 +397,44 @@ const spawn = async (what: string, argv: string[], fuel: boolean): Promise<Cost>
   if (fuel && !m) {
     throw new Error(`vl ${what} printed no \`[fuel]\` line: this host predates $VL_FUEL; rebuild scripts/vl-host`);
   }
-  return { wall, cpu: childCpu(new TextDecoder().decode(stdout)), fuel: m ? Number(m[1]) : 0 };
+  const a = err.match(/^\[alloc\] guest: (\d+)$/m);
+  return {
+    wall,
+    cpu: childCpu(new TextDecoder().decode(stdout)),
+    fuel: m ? Number(m[1]) : 0,
+    alloc: a ? Number(a[1]) : 0,
+  };
 };
 
 const build = (src: string, out: string): Promise<Cost> =>
   spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true);
+
+// A build under the NULL collector, which never frees, so its `[alloc]` line is every byte the
+// compile allocated — the quantity the null collector's 4 GiB heap caps. The reading is the
+// process's resident growth, and a process that first compiled the seed for this engine reuses
+// the memory that compile freed, reading up to ~30 MB low; one warm build per file run first.
+let nullWarm: Promise<Cost> | null = null;
+const buildNull = async (src: string, out: string): Promise<Cost> => {
+  nullWarm ??= (async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_warm_" });
+    try {
+      Deno.writeTextFileSync(`${dir}/w.vl`, "print(1)\n");
+      return await spawn("the warm-up build", ["build", `${dir}/w.vl`, "-o", `${dir}/w.wasm`, "--compiler", COMPILER], true, {
+        VL_COMPILE_GC: "null",
+      });
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  })();
+  await nullWarm;
+  const c = await spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true, {
+    VL_COMPILE_GC: "null",
+  });
+  if (!(c.alloc > 0)) {
+    throw new Error(`vl build on ${src} printed no \`[alloc]\` line: this host predates it; rebuild scripts/vl-host`);
+  }
+  return c;
+};
 
 // The floor on a RUNTIME pair's denominator keeps one spike on a sub-second arm from
 // dominating the quotient. A fuel pair has none: no spike can land on a count.
@@ -1784,6 +1822,109 @@ axis(
   (d) => twoFiles(d, genNamedFnAliases(true), genNamedFnAliases(false)),
 );
 
+// ── allocation: the null collector's 4 GiB ───────────────────────────────────
+// A compile whose entry file is under 1.5 MiB runs under the null collector, which never
+// frees, so EVERYTHING the compiler allocates counts against one 4 GiB heap. A per-entity
+// rebuild of a whole-program-sized table is invisible to fuel when the table is cheap to fill
+// and still costs the heap its full size each time: sunpa's `game.vl` (a 2 MB module graph
+// behind a small entry file) filled the heap and trapped the compiler, exit 70 (D3737). These
+// pairs grade the `[alloc]` line, the bytes a null-collector compile allocated, and are GROWTH
+// pairs: `n` against `n/4`, so linear reads under 4 (a fixed cost rides on both arms).
+const gradeAllocPair = async (
+  axis: string,
+  bar: number,
+  note: string,
+  mk: (dir: string) => [string, string],
+): Promise<number> => {
+  const dir = await Deno.makeTempDir({ prefix: `vl_scale_alloc_` });
+  try {
+    const [manySrc, oneSrc] = mk(dir);
+    const [m, o] = await Promise.all([
+      buildNull(manySrc, `${dir}/many.wasm`),
+      buildNull(oneSrc, `${dir}/one.wasm`),
+    ]);
+    const ratio = m.alloc / o.alloc;
+    const reading = `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${(o.alloc / 2 ** 20).toFixed(1)} MiB ` +
+      `(ratio ${ratio.toFixed(3)})`;
+    if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
+    if (ratio > bar) {
+      fail(
+        axis,
+        bar,
+        note,
+        reading,
+        "(The ratio is of what a null-collector compile allocated, which a table reset per entity " +
+          "multiplies even where fuel does not.)",
+      );
+    }
+    return ratio;
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
+  Deno.test({
+    name: `scaling shape: ${name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      await gradeAllocPair(name, bar, note, mk);
+    },
+  });
+
+// `n` functions, each with one `unit` of a shape whose name is its own, so the program's
+// symbol-id space grows with `n` as well.
+const genPerFunction = (n: number, unit: (u: number) => string[]): string => {
+  const o: string[] = [];
+  for (let f = 0; f < n; f++) o.push(`function f${f}(n: i32): i32 {`, "  let t = n", ...unit(f), "  t", "}");
+  o.push("let acc = 0");
+  for (let f = 0; f < Math.min(n, 40); f++) o.push(`acc = acc + f${f}(${f % 5})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+const loopUnit = (u: number) => [`  for v${u} in 0 to n { t = t + v${u} }`];
+const dupUnit = (u: number) => [
+  "  if t > 0 {",
+  `    const d${u} = t + 1`,
+  `    t = d${u}`,
+  "  } else {",
+  `    const d${u} = t + 2`,
+  `    t = d${u}`,
+  "  }",
+];
+const shapeUnit = (u: number) => [
+  `  const r${u}: { a${u}: { b${u}: i32 } } = { a${u}: { b${u}: t } }`,
+  `  t = t + r${u}.a${u}.b${u}`,
+];
+
+// D3737: each function's let/loop plan regrew its sid-indexed loop-variable heads from empty to
+// the program's symbol count. Reads 2.77; master `7529a4ea6` read 5.98.
+allocAxis(
+  "allocation: loop variables across functions",
+  4.5,
+  "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
+  (d) => twoFiles(d, genPerFunction(4000, loopUnit), genPerFunction(1000, loopUnit)),
+);
+
+// D3737: the same for the duplicate-binding heads. Reads 2.85; master `7529a4ea6` read 5.87.
+allocAxis(
+  "allocation: duplicate bindings across functions",
+  4.5,
+  "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
+  (d) => twoFiles(d, genPerFunction(4000, dupUnit), genPerFunction(1000, dupUnit)),
+);
+
+// D3737: the inline-shape intern's re-entrancy memo, keyed by the shape spelling's symbol id,
+// was dropped after each outermost intern and regrown to the whole id space by the next one.
+// Reads 2.51; master `7529a4ea6` read 8.73, and at 5,000 functions (706 KB) trapped the
+// compiler. Fuel on this axis is still super-linear (the struct-row scans of D3738).
+allocAxis(
+  "allocation: nested inline record types across functions",
+  4.5,
+  "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
+  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
@@ -1872,6 +2013,29 @@ Deno.test({
         "the fuel control did not red: 4,000 statements against 200 of the same came in under " +
           `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
           `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+      );
+    }
+  },
+});
+
+// THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
+// (reads about 5.5: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
+Deno.test({
+  name: "scaling shape: control — twenty times the work reds the allocation grader",
+  ignore: !ENABLED,
+  fn: async () => {
+    let red = "";
+    try {
+      await gradeAllocPair("allocation control", 2.5, "unreachable: the control exists to fail.", (d) =>
+        twoFiles(d, genStatements(4000), genStatements(200)));
+    } catch (e) {
+      red = String(e);
+    }
+    if (!red.includes("allocation control: the many-entity arm")) {
+      throw new Error(
+        "the allocation control did not red: 4,000 statements against 200 of the same came in " +
+          "under 2.5x the bytes allocated. The `[alloc]` reading has stopped measuring, so every " +
+          `allocation axis above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
       );
     }
   },
