@@ -72,6 +72,7 @@ tree ungraded.
 | `aliasRootIndex` (`aliasRootLen`, #3300) | `udTsNode.length`; reset by `tsReset` | none: `udTsNode`/`udTsWritten` are push-only, and `udName` is renamed only by the module merge, which runs before the first ask | no-refined-input |
 | `typeDeclNameIndex` (`tdnIxLen`/`tdnIxEpoch`: `nameIsStructDecl`'s set of `TypeDecl` names, lane CH) | `P.nodes.length` (an append extends it), `arenaEpochNow()` (a replacement rebuilds it); reset in `emitProgram` | none: a `TypeDecl`'s name is renamed in place only by the module merge, which runs before emit | no-refined-input |
 | `callNodeIndex` (`cniLen`/`cniEpoch`: `fieldClosureFeOfRecvRaw`'s list of `Call` nodes, lane CH) | `P.nodes.length`, `arenaEpochNow()`; reset in `emitProgram` | none: it holds only WHICH nodes are calls, and the callee and arguments, which rewrites and `monomorphize` do edit in place, are read live | no-refined-input |
+| `ieeeBytesMemo` (`ieeeMemoBytes`/`ieeeMemoOver`: a float lexeme's IEEE bytes and overflow flag by width, lane GH, D3737) | the lexeme and the width; never reset | none: the encoding is a pure function of the key | no-refined-input |
 | `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it (the per-(name, frame) chains of D2688, `cwIxP*`, included); and `nodeRepTyIx`, a checker sidecar written in place | probe |
 | `arithClassifierMemo` (`bcIn`/`bcBits`, D2445) | a SESSION: one classification, or one emission or reservation walk, of the region under a chain root the parser marked (`binRegion`); its tables cover that region's node range and are dropped when it closes | the emitter's local and narrowing state, which a walk could change between a region's first classification and a later one — the region holds only operators, parens and unary minus, whose operands are classified before any of them is emitted | probe |
 
@@ -120,6 +121,7 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | `arithClassifierMemo` (graded 2026-09-30 on lane CT's tree after the review's gating round; all `tests/cases` programs build byte-identical against the disabled seed except the 700-term chain fixture, which the disabled seed cannot compile) | byte-identical | not run against the disabled seed; the enabled seed moved no cell |
 | `fnStmtsPosIndex`, `moduleLocalLetPlan` (graded 2026-09-25, each alone and both together; also all 3,592 `tests/cases` programs built byte-identical, against the disabled seed and against master's) | byte-identical | not run |
 | `typeDeclNameIndex`, `callNodeIndex` (graded 2026-10-06 on lane CH's tree, each alone; sunpa's `game.vl` also builds byte-identical against master's seed, which has neither) | byte-identical | not run against the disabled seed; the enabled seed moved no cell |
+| `ieeeBytesMemo` (graded 2026-10-06 on lane GH's tree; sunpa's `game.vl` builds byte-identical against the disabled seed and against master's) | byte-identical | not run |
 
 **Eighteen of twenty disable edits leave the compiler's own codegen of itself byte-identical
 to master's fixpoint**, and the twelve graded against the corpus — the eleven `probe` rows that

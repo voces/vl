@@ -3425,6 +3425,15 @@ fn guest_fuel_on() -> bool {
     std::env::var("VL_FUEL").ok().as_deref() == Some("1")
 }
 
+/// Under `$VL_FUEL=1`, print `[alloc] guest: <bytes>` to stderr: how far the process's resident
+/// set grew across the compile call. Under the null collector, which never frees, that is the
+/// bytes the compiler allocated, to the page; `tests/vl_scaling_shape_test.ts` grades it.
+fn report_guest_alloc(resident0: u64) {
+    if guest_fuel_on() {
+        eprintln!("[alloc] guest: {}", resident_bytes().saturating_sub(resident0));
+    }
+}
+
 /// Give a store on a fuel engine all the fuel there is, so metering never traps. A NO-OP
 /// without `$VL_FUEL`; like `arm_guest_profile` it must run before the store runs anything.
 fn arm_guest_fuel(store: &mut Store<()>) -> Result<()> {
@@ -3443,6 +3452,14 @@ fn report_guest_fuel(store: &Store<()>) {
     }
 }
 
+/// The process's resident set in bytes, from `/proc/self/statm`; 0 where that is unreadable.
+fn resident_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |pages| pages * 4096)
+}
+
 /// Arm `store` so each epoch bump takes a sample. A NO-OP on an unprofiled run.
 ///
 /// Must run BEFORE the store executes anything: with epoch interruption enabled the
@@ -3455,9 +3472,19 @@ fn arm_guest_profile(store: &mut Store<()>) {
     };
     store.set_epoch_deadline(1);
     let prof = g.profiler.clone();
+    let alloc = std::env::var("VL_PROFILE_GUEST_ALLOC").is_ok_and(|v| v == "1");
+    let mut last = resident_bytes();
     store.epoch_deadline_callback(move |cx| {
         if let Some(p) = prof.lock().unwrap().as_mut() {
-            p.sample(&cx, GUEST_SAMPLE_INTERVAL);
+            let delta = if alloc {
+                let now = resident_bytes();
+                let grew = now.saturating_sub(last);
+                last = now;
+                std::time::Duration::from_nanos(grew)
+            } else {
+                GUEST_SAMPLE_INTERVAL
+            };
+            p.sample(&cx, delta);
         }
         Ok(UpdateDeadline::Continue(1))
     });
@@ -3610,8 +3637,14 @@ fn compile_vl_instance(
     ))?;
     // THE D1500 CALL. A non-zero `rc` is the compiler REPORTING on the program and
     // is not a fault; an `Err` here is the compiler dying mid-compile, which is.
-    let rc = from_compiler(phase!("compile.call", compile.call(&mut store, ())))?;
+    let resident0 = resident_bytes();
+    let called = phase!("compile.call", compile.call(&mut store, ()));
+    if called.is_err() {
+        COMPILE_HEAP_AT_FAULT.store(store.gc_heap_capacity() as u64, Ordering::Relaxed);
+    }
+    let rc = from_compiler(called)?;
     report_guest_fuel(store);
+    report_guest_alloc(resident0);
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
@@ -9230,6 +9263,15 @@ fn addr2line_cmd(args: &[String]) -> Result<()> {
 /// later error to inherit.
 static FAULT_IN_COMPILER: AtomicBool = AtomicBool::new(false);
 
+/// The compile store's GC heap capacity when its compile call failed. wasmtime reports both a
+/// single object past 64 MiB and a heap that cannot grow past its 4 GiB index space as
+/// `AllocationTooLarge`; only the second leaves the heap at the cap.
+static COMPILE_HEAP_AT_FAULT: AtomicU64 = AtomicU64::new(0);
+
+/// The GC heap's 4 GiB index space: wasmtime grows a heap by doubling and saturates here, so a
+/// null-collector compile that failed at this capacity failed by filling it.
+const NULL_HEAP_FULL: u64 = 1 << 32;
+
 /// Set by `compile_engine` when the one-shot compile runs under the null collector, so
 /// a compiler trap on `allocation size too large` can name the collecting escape.
 static COMPILE_UNDER_NULL: AtomicBool = AtomicBool::new(false);
@@ -9329,10 +9371,18 @@ fn report(err: Error) -> ! {
         && matches!(trap, Some(Trap::AllocationTooLarge))
         && COMPILE_UNDER_NULL.load(Ordering::Relaxed)
     {
-        eprintln!(
-            "note: this compile ran under the null collector, which never frees and caps one \
-             object at 64 MiB; `VL_COMPILE_GC=copying` compiles under a collecting one"
-        );
+        if COMPILE_HEAP_AT_FAULT.load(Ordering::Relaxed) >= NULL_HEAP_FULL {
+            eprintln!(
+                "note: this compile ran under the null collector, which never frees: everything \
+                 the compiler allocated filled its 4 GiB heap; `VL_COMPILE_GC=copying` compiles \
+                 under a collecting one"
+            );
+        } else {
+            eprintln!(
+                "note: this compile ran under the null collector, which never frees and caps one \
+                 object at 64 MiB; `VL_COMPILE_GC=copying` compiles under a collecting one"
+            );
+        }
     }
     std::process::exit(if compiler_bug || invalid_module {
         EXIT_COMPILER_BUG
