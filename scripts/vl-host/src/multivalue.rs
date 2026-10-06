@@ -1429,10 +1429,27 @@ impl BodyMove {
     }
 }
 
-/// The `(function, parameter)` pairs this step would take as fields in `bytes`: the inline-record
-/// step reads it to know which re-boxed arguments the step deletes.
-pub(crate) fn field_only_params(bytes: &[u8]) -> HashSet<(u32, u32)> {
-    scan(bytes).map_or_else(HashSet::new, |m| analyse(&m).fo_param)
+/// What this step takes apart in a module, for the inline-record step's cost rule: the
+/// `(function, parameter)` pairs it takes as fields, so a re-boxed argument there is deleted,
+/// and each producer with the record type of its result.
+#[derive(Default)]
+pub(crate) struct FieldFacts {
+    pub(crate) fo_param: HashSet<(u32, u32)>,
+    pub(crate) producer: HashMap<u32, u32>,
+}
+
+pub(crate) fn field_facts(bytes: &[u8]) -> FieldFacts {
+    scan(bytes).map_or_else(FieldFacts::default, |m| {
+        let a = analyse(&m);
+        FieldFacts {
+            producer: a
+                .producer
+                .iter()
+                .filter_map(|&f| result_record(&m, f).map(|t| (f, t)))
+                .collect(),
+            fo_param: a.fo_param,
+        }
+    })
 }
 
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
@@ -1519,7 +1536,11 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
         } else {
             let (body, moves) = emit_body(&m, &a, (f, 0, false), plan)?;
             bodies.push(std::borrow::Cow::Owned(body));
-            body_moves.push(std::iter::once((b.range.0 as u32, 0)).chain(moves).collect());
+            body_moves.push(
+                std::iter::once((b.range.0 as u32, 0))
+                    .chain(moves)
+                    .collect(),
+            );
         }
     }
     let mut growth = 0usize;
@@ -1528,7 +1549,11 @@ pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
         growth += body.len();
         bodies.push(std::borrow::Cow::Owned(body));
         let b = m.body(t.0);
-        body_moves.push(std::iter::once((b.range.0 as u32, 0)).chain(moves).collect());
+        body_moves.push(
+            std::iter::once((b.range.0 as u32, 0))
+                .chain(moves)
+                .collect(),
+        );
     }
     // The input body each output body came from.
     let sources: Vec<(u32, u32)> = (0..m.bodies.len())

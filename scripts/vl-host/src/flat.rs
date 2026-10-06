@@ -15,12 +15,13 @@
 //! dataflow proof that the local it is read from holds no null there.
 //!
 //! **The cost rule.** `A` is flattened only when no element read would allocate where today
-//! it shares the box (a read that is field-read, held in a local that is only field-read or
-//! stored back, or passed to a parameter the multi-value step takes as fields is free), and
-//! when its reads come to at most `FLAT_READS_PER_STORE` whole elements per store, statically
-//! (a field read is `1/n` of one): a flat read is one bounds-checked `array.get` per field
-//! where a boxed one is one per element, so a list read far more often than it is written
-//! stays boxed (inline-records-design.md §7).
+//! it shares the box (a read that is field-read, passed to a parameter the multi-value step
+//! takes as fields, or held in a local that step scalarizes is free: one set only to such
+//! reads, fresh records or producer results, and read only for a field, a store back or such
+//! a parameter), and when its reads come to at most `FLAT_READS_PER_STORE` whole elements per
+//! store, statically (a field read is `1/n` of one): a flat read is one bounds-checked
+//! `array.get` per field where a boxed one is one per element, so a list read far more often
+//! than it is written stays boxed (inline-records-design.md §7).
 //!
 //! **The rewrite.** With `n` fields, element `i`'s field `j` is element `i * n + j` of the new
 //! array. An index or length `x` becomes `x * n`, or `-n` (out of bounds) when `x * n` would
@@ -131,7 +132,10 @@ pub(crate) fn flat_step(
         }
     }
     if !arg_reads.is_empty() {
-        let fo = crate::multivalue::field_only_params(bytes);
+        let fo = &s
+            .mv
+            .get_or_init(|| crate::multivalue::field_facts(bytes))
+            .fo_param;
         for (a, g, j, f) in arg_reads {
             let t = tally.entry(a).or_default();
             if fo.contains(&(g, j)) {

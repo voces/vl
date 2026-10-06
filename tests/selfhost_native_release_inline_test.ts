@@ -22,7 +22,8 @@
 // Slice S2 (D3681) flattens a LIST of such records into one array of their fields, and its
 // kinds read `$VL_OPT_FLAT_DUMP` where S1's read `$VL_OPT_INLINE_DUMP`:
 //
-// * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT`;
+// * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT` (`flat-held-locals`: whole
+//   reads held in locals the multi-value step scalarizes, D3736);
 // * `flat-grid`: every list op, forced by `$VL_INLINE_REBOX` and then `$VL_INLINE_SPILL`;
 // * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every list boxed;
 // * `flat-stable`: an export hands JS the list: flattened by default, kept under
@@ -67,6 +68,7 @@ const FIXTURES: [string, Want][] = [
   ["stable-export-union-holder", "stable"],
   ["stable-export-union-map", "stable"],
   ["flat-melts", "flat-melts"],
+  ["flat-held-locals", "flat-melts"],
   ["flat-grid", "flat-grid"],
   ["flat-kept-nullable", "flat-kept"],
   ["flat-kept-written", "flat-kept"],
