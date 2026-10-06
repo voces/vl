@@ -24427,7 +24427,7 @@ function uBoxSinkToPair() {
 function emitReturnExit(body: u8[], retArg: i32, fnIx: i32) {
   if fnUsesUnionSink {
     const bare = P.nodes[unwrapParen(retArg)]
-    if bare is IfStmt && !tailIfReturnsWhole(unwrapParen(retArg), fnIx) {
+    if bare is IfStmt {
       return emitUnionRetIfSink(body, unwrapParen(retArg), fnIx)
     }
   }
@@ -24479,7 +24479,7 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
       rc = emitNullForRet(body, fnIx)
       if rc >= 0 { rc = emitUnionRetSink(fnIx) }
     } else if tailIfReturnsWhole(s.ifElse, fnIx) {
-      rc = emitReturnExit(body, s.ifElse, fnIx)
+      rc = emitReturnWhole(body, s.ifElse, fnIx)
     } else if P.nodes[s.ifElse] is IfStmt {
       if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
       return 1 // `else if`: the next link, which the caller emits into this open frame
@@ -24495,12 +24495,26 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
   emitFail("emitProgram: expected a union if-expression")
 }
 
-// Whether the value `if` at `ifIx`, returned by `fnIx`, is delivered as one value rather than
-// as one return per arm: a union result boxes an inner join typed one wider number once, at
-// that number, as a binding of the same `if` does (D3656).
+// Whether the value `if` at `ifIx`, NESTED in an arm of `fnIx`'s returned `if`, is returned as
+// one value rather than one return per arm: a union result boxes an inner join typed one wider
+// number once, at that number, as a binding of the same `if` does (D3656). The outermost `if`
+// keeps one return per arm, each delivered to the result as its own value.
 function tailIfReturnsWhole(ifIx: i32, fnIx: i32): boolean {
   if !(P.nodes[ifIx] is IfStmt) || !ifJoinAdaptsScalar(ifIx) { return false }
+  // Only an `i32` tail widens here: a lambda's join over an `f32` tail can read `f64` where
+  // its literal arm adopted `f32` (D3710), and then the join is not the wider number.
+  const pn = tyPrimNameOf(nodeTyIxOf(ifIx))
+  for lf in valueTailLeaves(ifIx) {
+    const lp = tyPrimNameOf(nodeTyIxOf(lf))
+    if lp != pn && !nodeIsNumLitLeaf(lf) && lp != "i32" { return false }
+  }
   retResultVKind(fnIx, fnStmtsPosOf(fnIx)) == "union"
+}
+
+// Return the value at `ix` as one value, never split per arm, and terminate the exit.
+function emitReturnWhole(body: u8[], ix: i32, fnIx: i32) {
+  if emitReturnValue(body, ix, fnIx) < 0 { return -1 }
+  emitUnionRetSink(fnIx)
 }
 
 // One arm of a sunk returned if-expression: the arm's prelude, then its tail-value
@@ -24518,6 +24532,9 @@ function emitUnionRetIfArm(body: u8[], blockIx: i32, fnIx: i32) {
       const inner = P.nodes[unwrapParen(tv)]
       if inner is IfStmt {
         if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        if tailIfReturnsWhole(unwrapParen(tv), fnIx) {
+          return emitIfArmClose(emitReturnWhole(body, tv, fnIx))
+        }
         return emitIfArmClose(emitReturnExit(body, tv, fnIx))
       }
       // A `never` call stands in any arm: its `unreachable` satisfies the join (D1972).
@@ -27613,7 +27630,13 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32) {
 // `emitStmt` (it already exits or falls through on its own). Returns 0, or -1.
 function emitStmtTail(body: u8[], stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
-  if s is IfStmt { return emitIfTail(body, stmtIx, fnIx) }
+  if s is IfStmt {
+    // Reached only for an `if` ending an arm of the returned `if`, so a nested one.
+    if tailIfReturnsWhole(stmtIx, fnIx) {
+      return emitReturnWhole(body, stmtIx, fnIx)
+    }
+    return emitIfTail(body, stmtIx, fnIx)
+  }
   if stmtIsTailValue(stmtIx, fnIx) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
@@ -27629,9 +27652,6 @@ function emitStmtTail(body: u8[], stmtIx: i32, fnIx: i32) {
 // position): each arm is lowered with its last statement tail-aware (`emitStmtsTail`).
 // Mirrors `emitStmt`'s void-if shape, but routes the arm bodies through the tail path.
 function emitIfTail(body: u8[], stmtIx: i32, fnIx: i32) {
-  if tailIfReturnsWhole(stmtIx, fnIx) {
-    return emitReturnExit(body, stmtIx, fnIx)
-  }
   // An `else if` chain is lowered along its spine, as `emitIfStmtStmt` lowers one (D1990).
   const open: i32[] = []
   let cur = stmtIx
@@ -27688,7 +27708,7 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
       return 1
     }
     if els is IfStmt {
-      if emitReturnExit(body, s.ifElse, fnIx) < 0 { return -1 }
+      if emitReturnWhole(body, s.ifElse, fnIx) < 0 { return -1 }
     } else if els is Block {
       if emitStmtsTail(body, s.ifElse, fnIx) < 0 { return -1 }
     } else {
