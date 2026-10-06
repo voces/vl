@@ -297,8 +297,6 @@ pub(crate) struct ASite {
     pub(crate) reach: bool,
     pub(crate) ty: u32,
     pub(crate) kind: ArrKind,
-    /// How many `loop`s enclose the op in its function.
-    pub(crate) loops: u32,
 }
 
 /// How one `array.get` of a candidate array type uses the element it reads.
@@ -991,8 +989,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         // Per op that pushed a call's argument: the call's callee and the argument's index.
         let mut arg_of: HashMap<u32, (u32, u32)> = HashMap::new();
         let mut seg: Vec<u32> = vec![0];
-        // Per open control frame, whether it is a `loop` (the function's own frame is not).
-        let mut loop_frames: Vec<bool> = vec![false];
         let mut ops = body.get_operators_reader().map_err(bad)?;
         let mut k: u32 = 0;
         while !ops.eof() {
@@ -1209,7 +1205,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                         reach,
                         ty: a,
                         kind,
-                        loops: loop_frames.iter().filter(|&&lp| lp).count() as u32,
                     });
                 };
                 let mut bad = |a: u32, what: &str| {
@@ -1401,17 +1396,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
             owner.truncate(ha);
             post.push(ha as u32);
             match op {
-                Operator::Loop { .. } => loop_frames.push(true),
-                Operator::Block { .. }
-                | Operator::If { .. }
-                | Operator::Try { .. }
-                | Operator::TryTable { .. } => loop_frames.push(false),
-                Operator::End | Operator::Delegate { .. } => {
-                    loop_frames.pop();
-                }
-                _ => {}
-            }
-            match op {
                 Operator::Block { .. }
                 | Operator::Loop { .. }
                 | Operator::If { .. }
@@ -1480,10 +1464,19 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 })
                 .collect();
             let mv = || s.mv.get_or_init(|| field_facts(bytes));
-            // `plain`: locals only field-read, copied or stored back directly, which binaryen's
-            // heap2local takes apart with or without the multi-value step. `held`: also those
+            // `plain`: locals set once and only field-read, copied or stored back directly, which
+            // binaryen's heap2local takes apart with or without the multi-value step. `held`: also those
             // the step alone takes apart, so the flattening checks it does (D3736).
-            let plain = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, false);
+            // heap2local takes a box apart only in a local set once, so a local set again is
+            // judged as `held` and checked against the step.
+            let mut plain = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, false);
+            let mut sets: HashMap<u32, u32> = HashMap::new();
+            for op in &small {
+                if let Small::LocalSet(l) | Small::LocalTee(l) = *op {
+                    *sets.entry(l).or_default() += 1;
+                }
+            }
+            plain.retain(|l| sets.get(l) == Some(&1));
             let held = elem_locals(&s, &small, &agets, &stored, &arg_of, &mv, n_params, true);
             for &(k, a) in &agets {
                 let v = s.arrays[&a];

@@ -53,15 +53,6 @@ pub(crate) const FLAT_READS_PER_STORE: u32 = 6;
 /// The most operands an `array.new_fixed` may have after expansion: V8's limit.
 const NEW_FIXED_MAX: u32 = 10_000;
 
-/// A read or store inside `d` loops counts `LOOP_WEIGHT^d` times, at most `LOOP_WEIGHT^4`: the
-/// static counts stand in for executions, so a list stored outside a loop and read inside one
-/// is priced as read many times per store.
-const LOOP_WEIGHT: u64 = 8;
-
-fn weight(loops: u32) -> u64 {
-    LOOP_WEIGHT.pow(loops.min(4))
-}
-
 #[derive(Clone, Copy, Default)]
 struct Tally {
     stores: u32,
@@ -70,9 +61,6 @@ struct Tally {
     arg: u32,
     whole: u32,
     whole_in: Option<u32>,
-    /// Stores, and reads in fields (`n` to a whole element), each weighted by its loops.
-    w_stores: u64,
-    w_reads: u64,
 }
 
 /// What `tallies` finds: per array its tally, why it is refused outright, and each free read's
@@ -96,17 +84,15 @@ fn tallies(
     let mut refused: HashMap<u32, String> = HashMap::new();
     let mut held: Vec<(u32, u32, u32)> = Vec::new();
     let mut args: Vec<(u32, u32, u32)> = Vec::new();
-    let mut arg_reads: Vec<(u32, u32, u32, u32, u64)> = Vec::new();
+    let mut arg_reads: Vec<(u32, u32, u32, u32)> = Vec::new();
     for (bi, b) in s.bodies.iter().enumerate() {
         let f = s.n_imports + bi as u32;
         for site in &b.asites {
             let a = site.ty;
             let t = tally.entry(a).or_default();
             let n = rec_len(s, s.arrays[&a]);
-            let w = weight(site.loops);
             let mut store = |o: &Opnd, op: &str| {
                 t.stores += 1;
-                t.w_stores += w;
                 if site.reach && o.nullable {
                     refused.entry(a).or_insert_with(|| {
                         format!(
@@ -136,19 +122,15 @@ fn tallies(
                     }
                 }
                 ArrKind::Get => match b.areads.get(&site.k) {
-                    Some(AUse::Field { .. }) => {
-                        t.field += 1;
-                        t.w_reads += w;
-                    }
+                    Some(AUse::Field { .. }) => t.field += 1,
                     Some(&AUse::Local { l, needs_mv }) if !(needs_mv && unfreed.contains(&a)) => {
                         t.local += 1;
-                        t.w_reads += w * n as u64;
                         if needs_mv {
                             held.push((a, f, l));
                         }
                     }
                     Some(&AUse::Arg { callee, arg }) if !unfreed.contains(&a) => {
-                        arg_reads.push((a, callee, arg, f, w * n as u64))
+                        arg_reads.push((a, callee, arg, f))
                     }
                     _ => {
                         t.whole += 1;
@@ -164,11 +146,10 @@ fn tallies(
             .mv
             .get_or_init(|| crate::multivalue::field_facts(bytes))
             .fo_param;
-        for (a, g, j, f, w) in arg_reads {
+        for (a, g, j, f) in arg_reads {
             let t = tally.entry(a).or_default();
             if fo.contains(&(g, j)) {
                 t.arg += 1;
-                t.w_reads += w;
                 args.push((a, g, j));
             } else {
                 t.whole += 1;
@@ -255,12 +236,14 @@ pub(crate) fn flat_step(
                         ""
                     }
                 ))
-            } else if t.w_reads > FLAT_READS_PER_STORE as u64 * n * t.w_stores && !rebox_all {
+            } else if t.field as u64 + n * (t.local + t.arg) as u64
+                > FLAT_READS_PER_STORE as u64 * n * t.stores as u64
+                && !rebox_all
+            {
                 Some(format!(
                     "its reads ({} of a field, {} of a whole element) are more than \
                      {FLAT_READS_PER_STORE} whole elements' worth per store ({} store(s)), \
-                     each weighted {LOOP_WEIGHT}x per enclosing loop, and a flat read costs one \
-                     bounds-checked array.get per field",
+                     and a flat read costs one bounds-checked array.get per field",
                     t.field,
                     t.local + t.arg,
                     t.stores

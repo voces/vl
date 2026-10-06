@@ -28,9 +28,9 @@
 // * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every list boxed;
 // * `flat-stable`: an export hands JS the list: flattened by default, kept under
 //   `--stable-layout`;
-// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed (reads
-//   weighted by their loops), or one whose held reads the multi-value step would not take
-//   apart (D3736), and `$VL_INLINE_REBOX` flattens it.
+// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, or one
+//   whose held reads the multi-value step would not take apart (D3736), and
+//   `$VL_INLINE_REBOX` flattens it.
 //
 // @test-timing opt
 import {
@@ -78,7 +78,7 @@ const FIXTURES: [string, Want][] = [
   ["flat-costly", "flat-costly"],
   ["flat-costly-unscalarized", "flat-costly"],
   ["flat-costly-self-copy", "flat-costly"],
-  ["flat-costly-loop", "flat-costly"],
+  ["flat-costly-replan", "flat-costly"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -383,6 +383,10 @@ Deno.test({
         [
           "flat-costly",
           /not flattened: its reads \(14 of a field, 0 of a whole element\) are more than 6 whole elements' worth per store/,
+        ],
+        [
+          "flat-costly-replan",
+          /not flattened: 1 of its 1 element read\(s\) take the whole element .*\(the multi-value step would not take its held reads apart\)/,
         ],
         [
           "flat-grid",
