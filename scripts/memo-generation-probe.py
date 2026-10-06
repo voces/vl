@@ -192,6 +192,15 @@ ROWS = [
     ("moduleLocalLetPlan", [], "probe",
      ("  if off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }",
       "  if false && off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }")),
+    # `nameIsStructDecl`'s set of `TypeDecl` names and `fieldClosureFeOfRecvRaw`'s list of `Call`
+    # nodes: what a node IS changes only by a push (the length) or an in-place replacement (the
+    # epoch), and each reads every other field live; both reset in `emitProgram`.
+    ("typeDeclNameIndex", ["tdnIxLen", "tdnIxEpoch"], "no-refined-input",
+     ("  if P.nodes.length == tdnIxLen && tdnIxEpoch == arenaEpochNow() { return 0 }",
+      "  if false && P.nodes.length == tdnIxLen && tdnIxEpoch == arenaEpochNow() { return 0 }")),
+    ("callNodeIndex", ["cniLen", "cniEpoch"], "no-refined-input",
+     ("  if P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }",
+      "  if false && P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }")),
     # `crNoteSoleRef`'s names a root uses other than as a receiver (D2584): keyed on the root's
     # node index, read from the syntax tree alone, and reset with the checker's state.
     ("crValUseNames", [], "no-refined-input",
