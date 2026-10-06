@@ -280,8 +280,6 @@ impl Assigned {
 /// An op on a candidate array type (slice S2, `flat.rs`).
 #[derive(Clone, Debug)]
 pub(crate) enum ArrKind {
-    /// `array.new`: the value every element is given.
-    New(Opnd),
     NewDefault,
     /// `array.new_fixed`: its operands, bottom first.
     NewFixed(Vec<Opnd>),
@@ -1211,9 +1209,15 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                     }
                 };
                 match op {
+                    // `filled(n, v)` shares one box across every slot; flat, it would hold `n`
+                    // copies of `v`'s fields, `n` times the memory, and V8 refuses large ones.
                     Operator::ArrayNew {
                         array_type_index: a,
-                    } if s.arrays.contains_key(&a) => asite(ArrKind::New(opnd(0, 1)), a),
+                    } => bad(
+                        a,
+                        "an array.new fills it from one shared value, which a flat array would \
+                         copy into every element",
+                    ),
                     Operator::ArrayNewDefault {
                         array_type_index: a,
                     } if s.arrays.contains_key(&a) => asite(ArrKind::NewDefault, a),
@@ -1419,7 +1423,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         }
         for site in &mut b.asites {
             match &mut site.kind {
-                ArrKind::New(o) | ArrKind::Set(o) => refine(o),
+                ArrKind::Set(o) => refine(o),
                 ArrKind::NewFixed(os) => os.iter_mut().for_each(refine),
                 _ => {}
             }

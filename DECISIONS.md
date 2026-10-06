@@ -7573,7 +7573,10 @@ retired, since a flag is the supported spelling and two would drift. sunpa's fee
 **Lists too: slice S2 (2026-10-05; D3681).** A `V[]` of such a record, its fields one number
 type, is flattened to one array of those numbers at `n` times the length
 (`scripts/vl-host/src/flat.rs`, run on S1's output; inline-records-design.md §7). Map value
-lists share the backing type and go with it. Three choices worth keeping:
+lists share the backing type and go with it. A list made by `filled(n, v)` (`array.new`) stays
+boxed: its slots share one box, so flat it would be `n` copies of the fields, `n` times the
+memory, past V8's array-length cap at `filled(40000000, q)` (review of the S2 PR). Three
+choices worth keeping:
 * **Every index is clamped, not trusted.** `i * n` wraps for an `i` the original would have
   trapped on, and a wrapped index can land in bounds, reading a wrong element where the boxed
   list trapped. So `x` becomes `select(x * n, -n, x <u ⌊(2^32 - n)/n⌋ + 1)`. VL's own indices

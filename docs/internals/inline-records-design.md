@@ -346,11 +346,19 @@ field read S1 leaves is seen. `$VL_OPT_NO_FLAT=1` keeps S1 and skips S2.
   export reaches);
 * every field of `V` has one number type, since a wasm array has one element type (D3721);
 * `A` is in no subtyping relation, sits in `V`'s rec group, and does not cross itself;
-* every op on `A` is one the step rewrites: `array.new`, `array.new_default`,
-  `array.new_fixed` (at most 10,000 operands after expansion), `array.get`, `array.set`,
-  `array.len` of an operand typed `A`, and `array.copy` within `A`. A constant expression may
-  make only an empty one. `array.fill`, `array.init_*`, atomics, a copy across types, or an
-  `array.len` of an abstract array reference refuses `A`;
+* every op on `A` is one the step rewrites: `array.new_default`, `array.new_fixed` (at most
+  10,000 operands after expansion), `array.get`, `array.set`, `array.len` of an operand typed
+  `A`, and `array.copy` within `A`. A constant expression may make only an empty one.
+  `array.fill`, `array.init_*`, atomics, a copy across types, or an `array.len` of an abstract
+  array reference refuses `A`;
+* `A` is never made by `array.new`, which is `filled(n, v)`: that list shares one box across
+  every slot, so boxed it is `n` references and one record, and flat it would be `n` copies of
+  the record's fields. A flat list has `n` array elements per list element, and V8 caps a wasm
+  array's length, so a flat 4 × `f64` list tops out near 33 million elements:
+  `filled(40000000, q)` would fail to allocate where the boxed list prints in 87 ms, and on
+  wasmtime it takes 7× the memory. A `filled` list is never a saving: its slots share one value,
+  not one box each. (The same cap bounds a pushed flat list, whose boxes the flat form does
+  save.)
 * no reachable store gives `A` a value whose type admits null, so a `(V | null)[]` stays boxed.
 
 VL declares many record locals `(ref null V)` because they are set inside a nested block. A
@@ -365,7 +373,7 @@ with any field offset is out of bounds, so every access that trapped still traps
 does. `array.len` divides by `n`. A store holds its value in a local set right after the
 producer, then sets `n` slots; the first `array.set` traps before any write when the index is
 out of bounds. A field read through an optional `ref.as_non_null` is one `array.get`; any other
-read re-boxes with `struct.new V`. `array.new` fills the new array in a loop.
+read re-boxes with `struct.new V`.
 
 **The cost rule, stated.** `A` is flattened only when
 1. no element read adds an allocation: every read is a field read, or is held in a local that

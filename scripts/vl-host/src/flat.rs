@@ -7,10 +7,12 @@
 //! the inline-record step would copy (`inline::record_refusal`: never written, no observable
 //! identity, a leaf, not named by a boundary signature), whose fields all have one number type;
 //! `A` is in no subtyping relation, sits in `V`'s rec group, cannot cross the boundary itself,
-//! and every op on it is one the step rewrites: `array.new`, `array.new_default`,
-//! `array.new_fixed`, `array.get`, `array.set`, `array.len` (of an operand typed `A`) and
-//! `array.copy` within `A`. A constant expression may only make an empty one. Every element
-//! stored in reachable code is non-null by its static type or is read from `A` itself.
+//! and every op on it is one the step rewrites: `array.new_default`, `array.new_fixed`,
+//! `array.get`, `array.set`, `array.len` (of an operand typed `A`) and `array.copy` within `A`.
+//! An `array.new` (`filled(n, v)`) refuses `A`: it shares one box across every slot, and a flat
+//! array would hold `n` copies of its fields. A constant expression may only make an empty
+//! one. Every element stored in reachable code is non-null by its static type, or by a
+//! dataflow proof that the local it is read from holds no null there.
 //!
 //! **The cost rule.** `A` is flattened only when no element read would allocate where today
 //! it shares the box (a read that is field-read, held in a local that is only field-read or
@@ -24,10 +26,9 @@
 //! array. An index or length `x` becomes `x * n`, or `-n` (out of bounds) when `x * n` would
 //! wrap, so every access that trapped still traps and no other does. A length read divides by
 //! `n`. A store reads every field of the stored value, held in a local right after its
-//! producer so the multi-value step gives a producer call its twin; a value read from `A`
-//! itself is copied field by field. A field read through an optional `ref.as_non_null` is one
-//! `array.get`; any other read re-boxes with `struct.new V`, a copy taken at the read. An
-//! `array.new` fills the new array in a loop.
+//! producer so the multi-value step gives a producer call its twin. A field read through an
+//! optional `ref.as_non_null` is one `array.get`; any other read re-boxes with `struct.new V`,
+//! a copy taken at the read.
 //!
 //! **Safety.** As the inline-record step's: one rec group, the output validated, the input kept
 //! on any failure. Fixtures grade by output. `$VL_INLINE_EXPLAIN=1` explains each array type.
@@ -101,7 +102,6 @@ pub(crate) fn flat_step(
             };
             match &site.kind {
                 ArrKind::Set(o) => store(o, "array.set"),
-                ArrKind::New(o) => store(o, "array.new"),
                 ArrKind::NewFixed(os) => {
                     for o in os {
                         store(o, "array.new_fixed");
@@ -422,44 +422,6 @@ fn rewrite(
                         gc_op(&mut code, 2, v, Some(j));
                         gc_op(&mut code, 14, a, None);
                     }
-                }
-                ArrKind::New(o) => {
-                    let tn = new_local(ValType::I32, &mut extra);
-                    let tm = new_local(ValType::I32, &mut extra);
-                    let tb = new_local(ValType::I32, &mut extra);
-                    let tarr = new_local(ta()?, &mut extra);
-                    let tv = new_local(ref_ty(false, v).ok_or("ref type")?, &mut extra);
-                    local_op(&mut code, 0x21, tn);
-                    cast_if(&mut code, o.cast);
-                    local_op(&mut code, 0x21, tv);
-                    local_op(&mut code, 0x20, tn);
-                    scale(&mut code, n, ti);
-                    local_op(&mut code, 0x22, tm);
-                    gc_op(&mut code, 7, a, None);
-                    local_op(&mut code, 0x21, tarr);
-                    i32_const(&mut code, 0);
-                    local_op(&mut code, 0x21, tb);
-                    code.extend_from_slice(&[0x02, 0x40, 0x03, 0x40]);
-                    local_op(&mut code, 0x20, tb);
-                    local_op(&mut code, 0x20, tm);
-                    code.push(0x4f);
-                    code.extend_from_slice(&[0x0d, 0x01]);
-                    for j in 0..n {
-                        local_op(&mut code, 0x20, tarr);
-                        local_op(&mut code, 0x20, tb);
-                        plus(&mut code, j);
-                        local_op(&mut code, 0x20, tv);
-                        gc_op(&mut code, 2, v, Some(j));
-                        gc_op(&mut code, 14, a, None);
-                    }
-                    local_op(&mut code, 0x20, tb);
-                    i32_const(&mut code, n as i32);
-                    code.push(0x6a);
-                    local_op(&mut code, 0x21, tb);
-                    code.extend_from_slice(&[0x0c, 0x00, 0x0b, 0x0b]);
-                    local_op(&mut code, 0x20, tarr);
-                    code.push(0xd4);
-                    stats.entry(a).or_default().spilled += 1;
                 }
                 ArrKind::NewDefault => {
                     scale(&mut code, n, ti);

@@ -24,7 +24,7 @@
 //
 // * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT`;
 // * `flat-grid`: every list op, forced by `$VL_INLINE_REBOX` and then `$VL_INLINE_SPILL`;
-// * `flat-kept`: a disqualifier (a null element, a written field) leaves every list boxed;
+// * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every list boxed;
 // * `flat-stable`: an export hands JS the list: flattened by default, kept under
 //   `--stable-layout`;
 // * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, and
@@ -70,6 +70,7 @@ const FIXTURES: [string, Want][] = [
   ["flat-grid", "flat-grid"],
   ["flat-kept-nullable", "flat-kept"],
   ["flat-kept-written", "flat-kept"],
+  ["flat-kept-filled", "flat-kept"],
   ["flat-stable-export", "flat-stable"],
   ["flat-costly", "flat-costly"],
 ];
@@ -364,6 +365,10 @@ Deno.test({
         [
           "flat-kept-written",
           /not flattened: its element type \d+ is refused: its fields are written/,
+        ],
+        [
+          "flat-kept-filled",
+          /not flattened: an array\.new fills it from one shared value/,
         ],
         [
           "flat-stable-export --stable-layout",
