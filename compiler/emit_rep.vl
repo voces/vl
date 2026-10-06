@@ -2243,23 +2243,100 @@ export function repRowOfTyStruct(repTyIx: i32, lim: i32): i32 {
   if !(t is TyObj) { return -1 }
   const key = repCanonId(repTyIx)
   if key < 0 { return -1 }
+  scnSync()
+  let bound = lim
+  if bound > sNames.length { bound = sNames.length }
   let best = -1
-  let si = 0
-  while si < lim && si < sNames.length {
-    if slotCanonId(si) == key {
+  // The indexed rows below `scnLen`, ascending: this key's bucket merged with the rows the
+  // name rung answers, which are asked again since their answer is not stamped.
+  const b = scnRows[key] ?? scnNoRows
+  let bi = 0
+  let li = 0
+  while true {
+    let si = bound
+    let fromB = false
+    if bi < b.length && b[bi] < si {
+      si = b[bi]
+      fromB = true
+    }
+    if li < scnLive.length && scnLive[li] < si {
+      si = scnLive[li]
+      fromB = false
+    }
+    if si >= bound { break }
+    if fromB { bi = bi + 1 } else { li = li + 1 }
+    if fromB || slotCanonId(si) == key {
+      if best < 0 { best = si }
+      else if structFieldCodesEq(best, si) == 0 { return -1 }
+    }
+  }
+  // The rows past the index, in order: each recorded one joins it as it is asked.
+  let si = scnLen
+  while si < bound {
+    let k = -1
+    if si == scnLen && si < sTyIx.length {
+      k = scnAdvance()
+    } else {
+      k = slotCanonId(si)
+    }
+    if k == key {
       if best < 0 {
         best = si
       } else if structFieldCodesEq(best, si) == 0 {
-        // Two canon-key twins with DIVERGENT emitted layouts (the #974
-        // atom-backed litunion field vs a plain scalar row) — this arena type
-        // alone cannot pick the right emission; decline and let the name path
-        // (which reads per-row atom identity) resolve.
+        // Canon-key twins with divergent emitted layouts (#974): the type alone cannot pick.
         return -1
       }
     }
     si = si + 1
   }
   best
+}
+
+// The struct-row canon index (D3738): per canonical id, the rows below `scnLen` whose own arena
+// type (`sTyIx`) has it, ascending, and in `scnLive` the rows the name rung answers. Rows join in
+// scan order as `repRowOfTyStruct` reaches them, so each id is first computed where a full scan
+// computes it. Stamped with `tyMutEpoch`.
+let scnRows: {[i32]: i32[]} = Map()
+let scnLive: i32[] = []
+let scnLen = 0
+let scnEpoch = -1
+const scnNoRows: i32[] = []
+
+export function structCanonIxReset() {
+  scnRows = Map()
+  scnLive = []
+  scnLen = 0
+  scnEpoch = -1
+  0
+}
+
+function scnSync() {
+  if scnEpoch != tyMutEpoch || scnLen > sNames.length || scnLen > sTyIx.length {
+    structCanonIxReset()
+    scnEpoch = tyMutEpoch
+  }
+  0
+}
+
+// Index row `scnLen`, whose arena type is recorded, and return its canonical id.
+function scnAdvance(): i32 {
+  const si = scnLen
+  let own = false
+  const dix = sTyIx[si]
+  if dix >= 0 {
+    const dt = T.tys[dix]
+    if dt is TyObj { own = true }
+  }
+  const k = slotCanonId(si)
+  if !own {
+    scnLive.push(si)
+  } else if k >= 0 {
+    const b = scnRows[k] ?? []
+    if b.length == 0 { scnRows[k] = b }
+    b.push(si)
+  }
+  scnLen = scnLen + 1
+  k
 }
 
 // Normalize a checker render (`tyToStr`) into the canonical spelling the annotation

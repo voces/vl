@@ -11417,10 +11417,12 @@ export function structEmitOrder(): i32[] {
     while c < sNames.length {
       if !done[c] {
         let ready = true
-        let p = 0
-        while p < sNames.length {
+        const ps = structPrefixCands(c, sNames.length)
+        let pi = 0
+        while pi < ps.length {
+          const p = ps[pi]
           if !done[p] && structRowPrefixCheap(p, c) { ready = false }
-          p = p + 1
+          pi = pi + 1
         }
         if ready {
           ord.push(c)
@@ -12462,6 +12464,89 @@ function sNameIxSync() {
   0
 }
 
+// ── the struct-row field-name index (D3738) ─────────────────────────────────
+// Per field name, the rows carrying it and the rows it comes first in, ascending, and the rows
+// with no field at all. A row joins once its names are stored, so a reader takes every row
+// past `sfnLen` as a candidate itself.
+let sfnRows: {[string]: i32[]} = Map()
+let sfnFirst: {[string]: i32[]} = Map()
+let sfnEmpty: i32[] = []
+let sfnLen = 0
+
+export function structFieldNameIxReset() {
+  sfnRows = Map()
+  sfnFirst = Map()
+  sfnEmpty = []
+  sfnLen = 0
+  0
+}
+
+function sfnSync() {
+  if sfnLen > sNames.length { structFieldNameIxReset() }
+  const n = sScanLim()
+  while sfnLen < n {
+    const st = sFieldStart[sfnLen]
+    const cnt = sFieldCount[sfnLen]
+    if st + cnt > sFieldNames.length { return 0 }
+    if cnt == 0 {
+      sfnEmpty.push(sfnLen)
+    } else {
+      const fb = sfnFirst[sFieldNames[st]] ?? []
+      if fb.length == 0 { sfnFirst[sFieldNames[st]] = fb }
+      fb.push(sfnLen)
+    }
+    let j = 0
+    while j < cnt {
+      const nm = sFieldNames[st + j]
+      const b = sfnRows[nm] ?? []
+      if b.length == 0 { sfnRows[nm] = b }
+      if b.length == 0 || b[b.length - 1] != sfnLen { b.push(sfnLen) }
+      j = j + 1
+    }
+    sfnLen = sfnLen + 1
+  }
+  0
+}
+
+// The rows below `lim`, ascending, that can carry every field of the object literal `o`: those
+// holding its first field's name (or no field, for `{}`), then each row the index has not reached.
+// A literal whose first field is not a `name: value` pair matches no row's names.
+function objLitNameCands(o: ObjLit, lim: i32): i32[] {
+  sfnSync()
+  const out: i32[] = []
+  let b = sfnEmpty
+  if o.objFields.length > 0 {
+    const f = P.nodes[o.objFields[0]]
+    if f is FieldInit { b = sfnRows[f.fiName] ?? [] } else { return out }
+  }
+  sfnCands(b, lim, out)
+}
+
+// The rows below `lim`, ascending, that can be a proper prefix of row `c`: those whose first
+// field is `c`'s first, then each row the index has not reached. A row with no field has none.
+export function structPrefixCands(c: i32, lim: i32): i32[] {
+  sfnSync()
+  const out: i32[] = []
+  if c < 0 || c >= sFieldCount.length || c >= sFieldStart.length { return out }
+  if sFieldCount[c] == 0 || sFieldStart[c] >= sFieldNames.length { return out }
+  sfnCands(sfnFirst[sFieldNames[sFieldStart[c]]] ?? [], lim, out)
+}
+
+// Append to `out` the rows of bucket `b` below `lim`, then every row from `sfnLen` to `lim`.
+function sfnCands(b: i32[], lim: i32, out: i32[]): i32[] {
+  let i = 0
+  while i < b.length && b[i] < lim {
+    out.push(b[i])
+    i = i + 1
+  }
+  let si = sfnLen
+  while si < lim {
+    out.push(si)
+    si = si + 1
+  }
+  out
+}
+
 // The struct table index whose name is `name`, or -1 if `name` is not a declared struct type.
 export function structIndexByName(name: string) {
   sNameIxSync()
@@ -13471,9 +13556,11 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // The row this literal's OWN destination names, computed on first need (D1690). -2 is
     // "not asked yet": a literal with no union-box field never pays for the lookup.
     let dstRow = 0 - 2
-    let si = 0
     const sLimA = sScanLim()
-    while si < sLimA {
+    const cands = objLitNameCands(o, sLimA)
+    let ci = 0
+    while ci < cands.length {
+      const si = cands[ci]
       if sFieldCount[si] == nf {
         let ok = true
         let strict = true
@@ -13603,7 +13690,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
           }
         }
       }
-      si = si + 1
+      ci = ci + 1
     }
     // When exactly one candidate's code-15 fields align with code-15/16 fields while
     // others don't (the rest are field-code incompatible), that candidate is definitively
@@ -41150,6 +41237,7 @@ function rsNarrowUseRefuse(letIx: i32, fnIx: i32, nm: string, dst: i32) {
   if letIx < 0 || letIx >= rsDoneLet.length { return 0 }
   if rsDoneLet[letIx] != 0 { return 0 }
   rsDoneLet[letIx] = 1
+  rsMemoTouched.push(letIx)
   const scopeIx = dsScopeRootOf(letIx, nm, fnIx)
   if scopeIx < 0 { return 0 }
   const w: RsWalk = {
@@ -41185,7 +41273,7 @@ function rsNarrowUseRefuse(letIx: i32, fnIx: i32, nm: string, dst: i32) {
 export function objLitBindDestRow(objIx: i32, own: i32): i32 {
   if own < 0 || objIx < 0 || !emitArenaFinal { return -1 }
   if rsRecVer != sNames.length {
-    rsRecRow = []
+    rsRecRowClear()
     rsRecVer = sNames.length
   }
   if objIx < rsRecRow.length {
@@ -41203,6 +41291,20 @@ export function objLitBindDestRow(objIx: i32, own: i32): i32 {
 function rsRecRowPut(objIx: i32, r: i32) {
   while rsRecRow.length <= objIx { rsRecRow.push(-2) }
   rsRecRow[objIx] = r
+  rsRecTouched.push(objIx)
+  0
+}
+
+// Empty `rsRecRow` at the entries written since the last emptying (D3740): a table replaced and
+// regrown to the literal's node index costs the arena's size each time.
+function rsRecRowClear() {
+  let i = 0
+  while i < rsRecTouched.length {
+    const x = rsRecTouched[i]
+    if x >= 0 && x < rsRecRow.length { rsRecRow[x] = -2 }
+    i = i + 1
+  }
+  rsRecTouched = []
   0
 }
 
@@ -41344,8 +41446,12 @@ function rsElemListDestSlot(letIx: i32, fnIx: i32, own: i32): i32 {
   if letIx < 0 || letIx >= rsLetDst.length { return -1 }
   if rsLetDst[letIx] != -2 { return rsLetDst[letIx] }
   rsLetDst[letIx] = -1
+  rsMemoTouched.push(letIx)
   const r = rsElemListDestSlotGo(letIx, fnIx, own)
-  if letIx < rsLetDst.length { rsLetDst[letIx] = r }
+  if letIx < rsLetDst.length {
+    rsLetDst[letIx] = r
+    rsMemoTouched.push(letIx)
+  }
   r
 }
 
@@ -41430,12 +41536,15 @@ type RsWalk = {
   rwCall: boolean,
 }
 
-// The use index `rsUsesOf` reads, built once per final arena like `dsgReady`'s: each node's
-// first parent from the root and its function, each identifier chained by name program-wide and
-// within its function, and each function's nested ones. A list's uses then cost its own
-// function's identifiers; `rsDoneLet` is 1 at a binding already asked.
+// The use index `rsUsesOf` reads, built once per final arena like `dsgReady`'s: each node's first
+// parent from the root and its function, each identifier chained by name program-wide and within
+// its function, and each function's nested ones. `rsDoneLet` is 1 at a binding already asked;
+// `rsMemoTouched` and `rsRetTouched` name the per-binding and per-function entries written.
 let rsIxRoot: i32 = -1
 let rsIxLen: i32 = -1
+let rsIxEpoch: i32 = -1
+let rsMemoTouched: i32[] = []
+let rsRetTouched: i32[] = []
 let rsPar: i32[] = []
 let rsFrame: i32[] = []
 let rsOccNext: i32[] = []
@@ -41446,6 +41555,7 @@ let rsFnKidHead: i32[] = []
 let rsFnKidNext: i32[] = []
 let rsDoneLet: i32[] = []
 let rsRecRow: i32[] = []
+let rsRecTouched: i32[] = []
 let rsRecVer: i32 = -1
 let rsLetDst: i32[] = []
 let rsRetSeenE: i32[] = []
@@ -41456,6 +41566,9 @@ let rsQueryGen: i32 = 0
 export function rsResetUseIx() {
   rsIxRoot = -1
   rsIxLen = -1
+  rsIxEpoch = -1
+  rsMemoTouched = []
+  rsRetTouched = []
   rsPar = []
   rsFrame = []
   rsOccNext = []
@@ -41466,6 +41579,7 @@ export function rsResetUseIx() {
   rsFnKidNext = []
   rsDoneLet = []
   rsRecRow = []
+  rsRecTouched = []
   rsRecVer = -1
   rsLetDst = []
   rsRetSeenE = []
@@ -41480,6 +41594,14 @@ function rsIxReady(): boolean {
   if !emitArenaFinal { return false }
   if emitRootIx < 0 { return false }
   if rsIxRoot == emitRootIx && rsIxLen == P.nodes.length { return true }
+  if (
+    rsIxRoot == emitRootIx
+    && rsIxLen >= 0
+    && rsIxLen < P.nodes.length
+    && rsIxEpoch == arenaEpochNow()
+  ) {
+    return rsIxGrow()
+  }
   rsResetUseIx()
   const n = P.nodes.length
   let i = 0
@@ -41528,6 +41650,52 @@ function rsIxReady(): boolean {
     }
   }
   rsIxRoot = emitRootIx
+  rsIxLen = n
+  rsIxEpoch = arenaEpochNow()
+  true
+}
+
+// Extend the index over an arena that only grew (D3740): with no slot rewritten, no node the root
+// reaches leads to an appended one except a late annotation pin, which no query starts at or
+// climbs through. The per-binding answers are dropped as a rebuild drops them.
+function rsIxGrow(): boolean {
+  let i = 0
+  while i < rsMemoTouched.length {
+    const x = rsMemoTouched[i]
+    if x >= 0 && x < rsDoneLet.length && x < rsLetDst.length {
+      rsDoneLet[x] = 0
+      rsLetDst[x] = -2
+    }
+    i = i + 1
+  }
+  rsMemoTouched = []
+  i = 0
+  while i < rsRetTouched.length {
+    const f = rsRetTouched[i]
+    if f >= 0 && f < rsRetSeenE.length && f < rsRetSeenL.length {
+      rsRetSeenE[f] = -1
+      rsRetSeenL[f] = -1
+    }
+    i = i + 1
+  }
+  rsRetTouched = []
+  rsRecRowClear()
+  rsRecVer = -1
+  const n = P.nodes.length
+  let k = rsIxLen
+  while k < n {
+    rsPar.push(-1)
+    rsFrame.push(-1)
+    rsOccNext.push(-1)
+    rsFnOccNext.push(-1)
+    rsFnKidHead.push(-1)
+    rsFnKidNext.push(-1)
+    rsDoneLet.push(0)
+    rsLetDst.push(-2)
+    rsRetSeenE.push(-1)
+    rsRetSeenL.push(-1)
+    k = k + 1
+  }
   rsIxLen = n
   true
 }
@@ -41797,6 +41965,7 @@ function rsRetCallUse(
     if rsRetSeenL[fr] == rsQueryGen { return -1 }
     rsRetSeenL[fr] = rsQueryGen
   }
+  rsRetTouched.push(fr)
   const fd = P.nodes[fr]
   if fd is FuncDecl {
     const scope = rsPar[fr]
@@ -42345,9 +42514,10 @@ function objLitNamesTwoRows(ix: i32): boolean {
   if o is ObjLit {
     const nf = o.objFields.length
     let hits = 0
-    let si = 0
-    const lim = sScanLim()
-    while si < lim {
+    const cands = objLitNameCands(o, sScanLim())
+    let ci = 0
+    while ci < cands.length {
+      const si = cands[ci]
       if sFieldCount[si] == nf {
         let ok = true
         let k = 0
@@ -42363,7 +42533,7 @@ function objLitNamesTwoRows(ix: i32): boolean {
         if ok { hits = hits + 1 }
         if hits >= 2 { return true }
       }
-      si = si + 1
+      ci = ci + 1
     }
   }
   false

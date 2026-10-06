@@ -24,9 +24,10 @@
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Five are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Six are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
-// `in-function value writes` and the two `if joins` pairs. The CPU readings quoted
+// `in-function value writes`, the two `if joins` pairs and `nested inline record types across
+// functions (fuel)`. The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
@@ -1917,12 +1918,61 @@ allocAxis(
 // D3737: the inline-shape intern's re-entrancy memo, keyed by the shape spelling's symbol id,
 // was dropped after each outermost intern and regrown to the whole id space by the next one.
 // Reads 2.51; master `7529a4ea6` read 8.73, and at 5,000 functions (706 KB) trapped the
-// compiler. Fuel on this axis is still super-linear (the struct-row scans of D3738).
+// compiler.
 allocAxis(
   "allocation: nested inline record types across functions",
   4.5,
   "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
   (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
+// D3738: the same shape on FUEL. Every object literal scanned every struct row, field by field,
+// and the type section compared every row with every row for a prefix. Reads 4.61; master
+// `42c4d4c10` read 11.97.
+axis(
+  "nested inline record types across functions (fuel)",
+  6,
+  "A struct-row question is scanning every row (`objLitNameCands`, `structPrefixCands`, compiler/emit_classify.vl; `repRowOfTyStruct`, compiler/emit_rep.vl).",
+  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
+// D3739: a fresh `const` at the top level asks which names the whole program uses other than as
+// a receiver, and a function's own fresh `const` between two of them used to make it walk the
+// program again. Reads 2.39; master `42c4d4c10` read 12.42.
+const genTopFreshConsts = (n: number): string => {
+  const o: string[] = [];
+  for (let f = 0; f < n; f++) {
+    o.push(`function f${f}(n: i32): i32 {`, "  const p = { v: n }", "  p.v + 1", "}");
+    o.push("if true {", `  const a = { v: f${f}(1) }`, "  print(a.v)", "}");
+  }
+  return o.join("\n") + "\n";
+};
+allocAxis(
+  "allocation: top-level fresh consts between functions",
+  4.5,
+  "The program-wide sole-reference walk (`crValUseEnter`, compiler/typecheck.vl) is walking the program per `const`.",
+  (d) => twoFiles(d, genTopFreshConsts(2000), genTopFreshConsts(500)),
+);
+
+// D3740: a `.get` binding pins its annotation while the module is emitted, which appends to the
+// arena, and the re-seat use index was rebuilt, and its per-literal memo regrown, at the next
+// object literal. Reads 1.86; master `42c4d4c10` read 12.61, and at 800 functions filled the heap.
+const growUnit = (u: number) => [
+  "  let m: Map<i32, i32> = Map()",
+  "  m[n] = n",
+  "  const had = m.get(n)",
+  `  const p = { x: n, y: ${u} }`,
+  "  t = t + keep(p)",
+  "  if had != null { t = t + had }",
+];
+const genArenaGrowth = (n: number): string =>
+  "type A = { x: i32, y: i32 }\ntype B = { x: f64, y: f64 }\nfunction keep(a: A): i32 { a.x + a.y }\n" +
+  genPerFunction(n, growUnit);
+allocAxis(
+  "allocation: map reads beside object literals across functions",
+  4.5,
+  "The re-seat use index (`rsIxReady`, compiler/emit_classify.vl) is being rebuilt as the arena grows.",
+  (d) => twoFiles(d, genArenaGrowth(400), genArenaGrowth(100)),
 );
 
 // ── the instrument's own control ─────────────────────────────────────────────

@@ -73,6 +73,12 @@ ROWS = [
     ("reseatUseIndex", ["rsIxRoot", "rsIxLen"], "pass-stamped",
      ("  if rsIxRoot == emitRootIx && rsIxLen == P.nodes.length { return true }",
       "  if false && rsIxRoot == emitRootIx && rsIxLen == P.nodes.length { return true }")),
+    # D3740: an arena that only GREW since the use index was built (no slot rewritten, so the
+    # epoch is unchanged) extends it rather than rebuilding it; the per-binding answers are
+    # still dropped, at the entries written since, exactly where a rebuild drops them.
+    ("reseatUseIndexGrow", ["rsIxEpoch"], "pass-stamped",
+     ("    && rsIxEpoch == arenaEpochNow()",
+      "    && false && rsIxEpoch == arenaEpochNow()")),
     ("reseatRecordRow", ["rsRecVer"], "pass-stamped",
      ("    if rsRecRow[objIx] != -2 { return rsRecRow[objIx] }",
       "    if false && rsRecRow[objIx] != -2 { return rsRecRow[objIx] }")),
@@ -205,11 +211,23 @@ ROWS = [
     ("ieeeBytesMemo", [], "no-refined-input",
      ("  if hit != null {\n    gIeeeOverflow",
       "  if hit != null && false {\n    gIeeeOverflow")),
-    # `crNoteSoleRef`'s names a root uses other than as a receiver (D2584): keyed on the root's
-    # node index, read from the syntax tree alone, and reset with the checker's state.
-    ("crValUseNames", [], "no-refined-input",
-     ("  if root != crValUseRoot {",
-      "  if true || root != crValUseRoot {")),
+    # `crNoteSoleRef`'s names a root uses other than as a receiver (D2584, D3739): one walk per
+    # root and arena epoch, which the program's root extends by the slots the logged edits
+    # rewrote; the getter and operator sites are read against the checker's banks at each entry,
+    # never cached, since those fill in place as checking proceeds.
+    ("crValUseNames", ["cvuEpoch"], "probe",
+     ("  if cvuEpoch[slot] < 0 || moved {",
+      "  if true || cvuEpoch[slot] < 0 || moved {")),
+    # D3738: per field name, the struct rows carrying it and the rows it comes first in. Field
+    # names are push-only and a row joins once they are stored; reset with the struct table.
+    ("structFieldNameIndex", ["sfnLen"], "no-refined-input",
+     ("  while sfnLen < n {",
+      "  while false && sfnLen < n {")),
+    # D3738: per canonical id, the struct rows whose own arena type has it, joined in scan order
+    # on `tyMutEpoch`, as `repKeyMemo` is; a row the name rung answers is asked again each time.
+    ("structCanonIndex", ["scnLen", "scnEpoch"], "probe",
+     ("    if si == scnLen && si < sTyIx.length {",
+      "    if false && si == scnLen && si < sTyIx.length {")),
 ]
 
 # A stamp is a MODULE-level binding whose name carries one of these markers; the shapes below
