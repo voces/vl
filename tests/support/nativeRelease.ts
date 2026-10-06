@@ -407,8 +407,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "map/filter/reduce callback pipeline",
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 869 -> 809 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 809, fns: 4, allocs: 8, indirect: 0 },
-    O3: { bytes: 688, fns: 1, allocs: 8, indirect: 0 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 8 -> 6 at both rungs, bytes 809 -> 790 and 688 -> 697.
+    O: { bytes: 790, fns: 4, allocs: 6, indirect: 0 },
+    O3: { bytes: 697, fns: 1, allocs: 6, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
   // `meta.json` records that `-O3` does NOT help here (1.469s vs 1.331s) — binaryen cannot
@@ -430,8 +433,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // row discriminating a dynamic target from a devirtualisable one, exactly as intended.
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 672 -> 644 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 644, fns: 5, allocs: 22, indirect: 2 },
-    O3: { bytes: 453, fns: 5, allocs: 14, indirect: 2 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 22 -> 18 and 14 -> 10, bytes 644 -> 654 and 453 -> 468; `indirect`
+    // held at 2.
+    O: { bytes: 654, fns: 5, allocs: 18, indirect: 2 },
+    O3: { bytes: 468, fns: 5, allocs: 10, indirect: 2 },
   },
   // TAIL CALLS. `meta.json` still carries the `vlDefect` entry from when VL emitted a plain
   // `call` in tail position; the emitter now emits `return_call`, and the same entry measures
@@ -487,8 +494,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // reads its header's fields as constants and drops the header allocation, keeping only
     // the backing array: allocs 16 -> 15, bytes 1546 -> 1532. `-O` keeps the header
     // (bytes 1650 -> 1657).
-    O: { bytes: 1657, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
-    O3: { bytes: 1532, fns: 3, allocs: 15, indirect: 0, refEq: 1 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 16 -> 12 and 15 -> 11, bytes 1657 -> 1645 and 1532 -> 1530; `refEq`
+    // held at 1.
+    O: { bytes: 1645, fns: 3, allocs: 12, indirect: 0, refEq: 1 },
+    O3: { bytes: 1530, fns: 3, allocs: 11, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
@@ -544,8 +555,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // `VL_GC=none` (no compaction in either) the whole run is 3.30 -> 3.10 s at 300 passes.
     // D3565: `std:fmt` gained `toFixed`, which `-O` carries unused, and binaryen's `-O` now
     // inlines `std:fmt`'s `bnLen` leaf instead of keeping it: fns 16 -> 15, the rest held.
-    O: { bytes: 8049, fns: 15, allocs: 95, indirect: 0, refEq: 2 },
-    O3: { bytes: 2637, fns: 6, allocs: 46, indirect: 0, refEq: 2 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 95 -> 89 and 46 -> 43, bytes 8049 -> 8259 (8253 before
+    // this change) and 2637 -> 2639.
+    O: { bytes: 8259, fns: 15, allocs: 89, indirect: 0, refEq: 2 },
+    O3: { bytes: 2639, fns: 6, allocs: 43, indirect: 0, refEq: 2 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -561,8 +576,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // — `-O` 1215 -> 1509, `-O3` 1131 -> 1429 bytes, structure unchanged.
     // D2370: the pair index — the probe reads the index alone and no `live`/`hashes` grow is
     // emitted, `allocs` 13 -> 9 at both rungs, `-O` 1509 -> 1367, `-O3` 1429 -> 1283 bytes.
-    O: { bytes: 1367, fns: 3, allocs: 9, indirect: 0 },
-    O3: { bytes: 1283, fns: 3, allocs: 9, indirect: 0 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 9 -> 7 at both rungs, bytes 1367 -> 1372 and 1283 -> 1288.
+    O: { bytes: 1372, fns: 3, allocs: 7, indirect: 0 },
+    O3: { bytes: 1288, fns: 3, allocs: 7, indirect: 0 },
   },
   // MIXED MAP + STRING, the realistic one: tokenize by code-point scan and slice, then a
   // read-modify-write upsert. `meta.json` decomposes VL's cost as ~64% map upsert and ~21%
@@ -607,8 +625,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // `std:fmt`'s digit loop a third: `allocs` 98 -> 104 and 49 -> 54, `refEq` 1 -> 4, bytes
     // +477 / +467. Timed interleaved, 0.77 -> 0.80 s (unchanged within the box's noise).
     // D3565: `-O` fns 16 -> 15, the same `bnLen` inlining as on `collections/map-string`.
-    O: { bytes: 9179, fns: 15, allocs: 104, indirect: 0, refEq: 4 },
-    O3: { bytes: 3745, fns: 6, allocs: 54, indirect: 0, refEq: 4 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 104 -> 98 and 54 -> 51, bytes 9179 -> 9388 (9382 before
+    // this change) and 3745 -> 3746.
+    O: { bytes: 9388, fns: 15, allocs: 98, indirect: 0, refEq: 4 },
+    O3: { bytes: 3746, fns: 6, allocs: 51, indirect: 0, refEq: 4 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been

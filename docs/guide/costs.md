@@ -26,6 +26,11 @@ rises as it outgrows the processor's caches, while its complexity stays the same
 A list is shared, not copied: `const b = a` is a second name for the same list, and a push
 through either is seen through both.
 
+An empty `[]` (and a `Map()`) allocates only its own small header: it starts on a zero-length
+storage that every empty value of its type shares, and its first push allocates storage of its
+own. A lambda that captures nothing is a constant, so passing `(a, b) => a < b` allocates
+nothing either; one that captures allocates each time it is evaluated.
+
 ### The element type sets the cost
 
 The element type decides how each element is stored, and that matters more than any other
