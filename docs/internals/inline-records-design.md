@@ -1,6 +1,6 @@
 # Inline storage for records nobody writes (sunpa SP-038, SP-039)
 
-**Status: S1 (inline record fields) is built as a host step, `scripts/vl-host/src/inline.rs` (D3678); D3679–D3681 are what it leaves, S2 among them. No owner ruling yet on §6.** The question is whether a record
+**Status: S1 (inline record fields) is built as a host step, `scripts/vl-host/src/inline.rs` (D3678), and S2 (flattened lists) as its second slice, `scripts/vl-host/src/flat.rs` (D3681, §7). §6 Q2 is ruled; Q1 and Q3 are open.** The question is whether a record
 type whose fields are never written can be stored by value: inline in its containing records,
 and flattened in lists. The language would not change; only the compiler's storage choice
 would. The fixed-array design (PR #3375, `fixed-arrays-design.md` §4.3 and §6) makes the same
@@ -254,7 +254,7 @@ These are static sites. Which slice removes more *per frame* needs sunpa's count
 | --- | --- | --- | --- |
 | **S0** | the explain line, per type: qualifies, or the write, `ref.eq` or export that disqualifies it; how many stores feed a field and how many feed an array. sunpa then reports its per-frame split. | nothing, but it decides S1 against S2 | small |
 | **S1** | (a) inline record fields, host pass, leaf never-written numeric records of ≤ 8 fields in non-null fields. Includes construction of the parent (`{ rot: qnorm(…), len }`) and closure environments, which are structs too. | **52 `Q` a frame known (SP-039)**, plus the V3/Q fields of the IK records and their constructions. Their share of the other ~200 is unmeasured. | medium: a type-section rewrite, which the step does not do today |
-| S2 | (b) flattened `T[]` for the same types, map value lists included | one allocation per push. sunpa's `let at: V3[] = []` lists are built per call, which is the push-heavy shape that wins. | larger: every array op |
+| S2 | (b) flattened `T[]` for the same types, map value lists included. **Built (D3681, §7).** | one allocation per push. sunpa's `let at: V3[] = []` lists are built per call, which is the push-heavy shape that wins. | larger: every array op |
 | S3 | nullable fields through a presence slot; unions stay boxed | rare in sunpa | later |
 
 **Recommended first slice: S1.** It is the smaller rewrite. Its soundness is the #3372
@@ -334,6 +334,91 @@ The `-O`-only question is not new. It is fixed-arrays Q5, and the same answer ap
   struct-of-arrays layout, could remove it. Neither is assumed here.
 * `plumb-shape-cost.py` and `self-compile-time.sh` gate the pass's own cost. A type rewrite
   over a 10 MB plumb module must stay linear.
+
+## 7. S2 as built: flattened lists (D3681)
+
+`scripts/vl-host/src/flat.rs`, run by the inline-record step on S1's output, so a re-boxed
+field read S1 leaves is seen. `$VL_OPT_NO_FLAT=1` keeps S1 and skips S2.
+
+**What qualifies.** An array type `A` whose element is a reference to a record `V`:
+* `V` qualifies as S1's records do (§1: never written, no `ref.eq`, a leaf, not named by a
+  boundary signature; `--stable-layout` follows fields and elements, so it keeps every list an
+  export reaches);
+* every field of `V` has one number type, since a wasm array has one element type (D3721);
+* `A` is in no subtyping relation, sits in `V`'s rec group, and does not cross itself;
+* every op on `A` is one the step rewrites: `array.new_default`, `array.new_fixed` (at most
+  10,000 operands after expansion), `array.get`, `array.set`, `array.len` of an operand typed
+  `A`, and `array.copy` within `A`. A constant expression may make only an empty one.
+  `array.fill`, `array.init_*`, atomics, a copy across types, or an `array.len` of an abstract
+  array reference refuses `A`;
+* `A` is never made by `array.new`, which is `filled(n, v)`: that list shares one box across
+  every slot, so boxed it is `n` references and one record, and flat it would be `n` copies of
+  the record's fields. A flat list has `n` array elements per list element, and V8 caps a wasm
+  array's length, so a flat 4 × `f64` list tops out near 33 million elements:
+  `filled(40000000, q)` would fail to allocate where the boxed list prints in 87 ms, and on
+  wasmtime it takes 7× the memory. A `filled` list is never a saving: its slots share one value,
+  not one box each. (The same cap bounds a pushed flat list, whose boxes the flat form does
+  save.)
+* no reachable store gives `A` a value whose type admits null, so a `(V | null)[]` stays boxed.
+
+VL declares many record locals `(ref null V)` because they are set inside a nested block. A
+forward dataflow over each body proves which reads of such a local hold no null: every path
+reaches a set of a non-null value, and no set inside an enclosing loop can store null. A store
+from such a read casts it with `ref.as_non_null`, which never traps. S1 uses the same proof, so
+a field fed from such a local is no longer refused as nullable.
+
+**The rewrite.** Element `i`'s field `j` is element `i * n + j`. An index or length `x` becomes
+`select(x * n, -n, x <u ⌊(2^32 - n) / n⌋ + 1)`: a product that would wrap becomes `-n`, which
+with any field offset is out of bounds, so every access that trapped still traps and no other
+does. `array.len` divides by `n`. A store holds its value in a local set right after the
+producer, then sets `n` slots; the first `array.set` traps before any write when the index is
+out of bounds. A field read through an optional `ref.as_non_null` is one `array.get`; any other
+read re-boxes with `struct.new V`.
+
+**The cost rule, stated.** `A` is flattened only when
+1. no element read adds an allocation: every read is a field read, or is held in a local that
+   is only field-read or stored back into `A` (directly or through another such local; the
+   multi-value step scalarizes it), or is passed to a parameter the multi-value step takes as
+   fields; and
+2. its reads, counting a field read as `1/n` of an element, come to at most
+   `FLAT_READS_PER_STORE` (6) elements per store site.
+
+Rule 1 is S1's rule, stricter than "no more whole reads than stores". Rule 2 is the break-even
+the bench below measures on V8, applied to static counts. It cannot see a list filled at one
+site and read in a hot loop (D3720), and one whole read anywhere keeps every list of that type
+boxed (D3719).
+
+**Measured** (the bench is `pushIter`, `iterOnly` and `indexOnly` over 1,024 `V3`s, built from
+VL at `-O` with and without `$VL_OPT_NO_FLAT`; V8 in Deno, minimum of 14 runs; wasmtime 49,
+start-up subtracted, minimum of 3; load 1–3):
+
+| row | V8 boxed / flat (ms) | wasmtime boxed / flat (ms) |
+| --- | --: | --: |
+| push + iterate, 10^4 passes | 58.0 / **42.6** (0.73x) | 456.6 / **62.5** (0.14x) |
+| iterate only, 5·10^4 passes | **22.1** / 36.2 (1.64x) | **39.0** / 67.4 (1.73x) |
+| index `t[i].x * t[i].y`, 5·10^4 passes | **19.8** / 25.9 (1.31x) | **34.2** / 50.9 (1.49x) |
+| the same three without the index select | 41.6 / 31.8 / 22.0 | – / 61.1 / 43.8 |
+
+Per element, push + iterate is 1.5 ns faster on V8 and 38.5 ns on wasmtime with one flat read
+included, and a flat whole-element read costs 0.28 ns and 0.55 ns more than a boxed one. So a
+store alone saves about 1.8 ns and 39 ns, and pays for about 6.5 element reads on V8 and 70 on
+wasmtime; V8's figure is the rule's 6. The index select is 13–16% of a flat read.
+
+**sunpa** (`ce4e1c3`, its `build:vl` flags, `struct.new` of `Q` and `V3` counted over the
+feet check as #3384 did; feet and gait output byte-identical to master):
+
+| | `Q` boxes | `V3` boxes | static `Q` sites |
+| --- | --: | --: | --: |
+| master | 601,198 | 90,113 | 6 |
+| S2 | **37,120** | 90,113 | 4 |
+
+`Q[]` is flattened (5 stores, 6 reads passed to field parameters). `V3[]` is refused for four
+whole reads in `fabrik` (D3719).
+
+**Graded** by output against the plain build at `-O` and `-O3`, each by default, with
+`$VL_INLINE_REBOX=1` and with `$VL_INLINE_SPILL=1` too: the `flat-*` fixtures, and every
+`tests/cases` program the step touches. Of 4,530 programs, 363 flatten a list with the cost rule
+lifted and 247 by default; all 2,178 optimized builds print what the plain build prints.
 
 ## Appendix: benchmark modules
 

@@ -7570,6 +7570,33 @@ retired, since a flag is the supported spelling and two would drift. sunpa's fee
 `ce4e1c3`: `V3` 106,981 → 90,113, feet and gait output identical, and the
 `--stable-layout` module equals master's byte for byte apart from its map's file name.
 
+**Lists too: slice S2 (2026-10-05; D3681).** A `V[]` of such a record, its fields one number
+type, is flattened to one array of those numbers at `n` times the length
+(`scripts/vl-host/src/flat.rs`, run on S1's output; inline-records-design.md §7). Map value
+lists share the backing type and go with it. A list made by `filled(n, v)` (`array.new`) stays
+boxed: its slots share one box, so flat it would be `n` copies of the fields, `n` times the
+memory, past V8's array-length cap at `filled(40000000, q)` (review of the S2 PR). Three
+choices worth keeping:
+* **Every index is clamped, not trusted.** `i * n` wraps for an `i` the original would have
+  trapped on, and a wrapped index can land in bounds, reading a wrong element where the boxed
+  list trapped. So `x` becomes `select(x * n, -n, x <u ⌊(2^32 - n)/n⌋ + 1)`. VL's own indices
+  are already bounded by the list's length, but the step cannot see that from wasm, and the
+  select costs 13–16% of a flat read (D3720).
+* **The cost rule is S1's plus a read budget.** No read may add an allocation, and reads may
+  come to at most six whole elements per store site: on V8 a store saves what 6.5 flat element
+  reads cost over boxed ones (wasmtime 70). Iterate-only over a flat list is 1.6x slower on V8,
+  so a list filled once and read every frame regresses, and the static count cannot tell
+  (D3720). One whole read anywhere keeps every list of that record boxed (D3719).
+* **A nullable local is proved non-null by dataflow, for S1 too.** VL declares many record
+  locals `(ref null V)` because they are set in a nested block, and validating a tightened
+  local fails there. A forward pass over each body (a loop starts without the locals any set
+  inside it may null) shows which reads hold no null; a store casts such a read with
+  `ref.as_non_null`, which never traps. A `(V | null)[]` still stores real nulls and stays boxed.
+
+sunpa `ce4e1c3`'s feet check: `Q` boxes 601,198 → 37,120, feet and gait output byte-identical.
+Graded by output at `-O`/`-O3`, default, re-box-forced and spill-forced, over the `flat-*`
+fixtures and every `tests/cases` program the step touches.
+
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
 **The defect.** Binaryen inlines a function with several callers only when its size is at most

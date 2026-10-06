@@ -46,6 +46,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
+/// The inline-record step's second slice: flattened lists of small records (D3681, S2).
+mod flat;
 /// The `-O`/`-O3` inline-record step (sunpa SP-039, inline-records-design.md S1).
 mod inline;
 /// The `-O`/`-O3` multi-value step (D3625).
@@ -549,7 +551,8 @@ program verbatim — the only way to pass one that starts with `-`.
                       and union boxes, for a module another wasm module links
                       against or reads field by field. By default only a record
                       a signature names directly keeps its layout; one nested
-                      inside it may be stored inline in its parent
+                      inside it may be stored inline in its parent, and a list
+                      of them may hold their fields side by side
   {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces, and
                       function names in profilers instead of `wasm-function[N]`);
                       kept through -O/-O3, at the cost of the section's bytes
@@ -605,7 +608,8 @@ program verbatim — the only way to pass one that starts with `-`.
                                 get a multi-value twin (output unchanged)
   {c}VL_INLINE_EXPLAIN{r}=1           With -O/-O3: say on stderr why each small record
                                 type and record-holding field was or was not stored
-                                inline in its parent (output unchanged)
+                                inline in its parent, and each list of records was
+                                or was not flattened (output unchanged)
 
 {b}Exit:{r} 0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage;
       70 the compiler itself crashed (a vl bug — please report it).
@@ -9462,20 +9466,23 @@ fn build_cmd(args: &[String]) -> Result<()> {
                 .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))
         };
         // The inline-record step goes first: a field holding a small record nobody writes
-        // stores its fields in the parent, so a stored producer's result is then only read
-        // field by field and the multi-value step below gives it a twin.
+        // stores its fields in the parent, and a list of them holds the fields side by side,
+        // so a stored producer's result is then only read field by field and the multi-value
+        // step below gives it a twin.
         if std::env::var_os("VL_OPT_NO_INLINE").is_none_or(|v| v.is_empty()) {
-            if let Some((il, moved)) = phase!("opt.inline_step", inline::inline_step(&bytes, stable_layout)) {
-                bytes = il;
+            if let Some(st) = phase!("opt.inline_step", inline::inline_step(&bytes, stable_layout)) {
+                bytes = st.bytes;
                 std::fs::write(&sink, &bytes)?;
                 if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
-                    remap(rows, &moved, mp)?;
+                    remap(rows, &st.moved, mp)?;
                 }
-                // `$VL_OPT_INLINE_DUMP=<file>`: the step's output, a measurement facility.
-                if let Some(dump) =
-                    std::env::var_os("VL_OPT_INLINE_DUMP").filter(|v| !v.is_empty())
-                {
-                    std::fs::write(dump, &bytes)?;
+                // `$VL_OPT_INLINE_DUMP=<file>` when a record field was inlined, and
+                // `$VL_OPT_FLAT_DUMP=<file>` when a list was flattened: the step's output, a
+                // measurement facility.
+                for (on, var) in [(st.fields, "VL_OPT_INLINE_DUMP"), (st.flat, "VL_OPT_FLAT_DUMP")] {
+                    if let Some(dump) = std::env::var_os(var).filter(|v| on && !v.is_empty()) {
+                        std::fs::write(dump, &bytes)?;
+                    }
                 }
             }
         }

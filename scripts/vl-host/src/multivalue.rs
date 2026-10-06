@@ -1109,7 +1109,7 @@ pub(crate) fn put_uleb(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn put_sleb(out: &mut Vec<u8>, mut v: i64) {
+pub(crate) fn put_sleb(out: &mut Vec<u8>, mut v: i64) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
