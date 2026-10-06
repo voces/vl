@@ -351,6 +351,8 @@ import {
   RLK_STR_LIST,
   RLK_U8_LIST,
   RLK_UNION,
+  SYNTH_CLOSURE,
+  SYNTH_EMPTY_BACKING,
   VKind,
   aTypeIdx,
   aUsed,
@@ -565,6 +567,7 @@ import {
   svPairOn,
   svPairs,
   svViewTy,
+  synthGlobalIdx,
   tailCallEnd,
   tailCallIdx,
   u8PushScratchBase,
@@ -1995,6 +1998,13 @@ export function emitClosureValueCore(body: u8[], fe: i32, fnIx: i32) {
 
   const envIdx = fnEnvIdxOf(fe)
   if envIdx < 0 {
+    // Capture-free: the module's one constant closure of `fe`. Equality reads the id and the
+    // (null) env, never the struct, so sharing it is unobservable from VL.
+    const g = synthGlobalIdx(SYNTH_CLOSURE, fe)
+    if g >= 0 {
+      markFnAddrTaken(fe)
+      return fbGlobalGet(g)
+    }
     fbRefNullStruct()
   } else {
     const caps = captureNamesOf(fe)
@@ -8621,7 +8631,7 @@ function arrLitHoldsNulStr(elems: i32[], fnIx: i32): boolean {
 // Lower an array literal `[e, e, ...]` onto `body` as a growable list value: push each element
 // value in source order, `array.new_fixed $aTypeIdx <count>` for the raw backing, then `count`
 // twice for len and cap and `struct.new $lTypeIdx` to wrap them into `{ backing, len, cap }`. An
-// empty `[]` is `array.new_fixed` of count 0 with len and cap 0.
+// empty `[]` shares its type's empty backing (`fbBacking`) with len and cap 0.
 function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
@@ -8788,10 +8798,10 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         if emitExpr(body, elems[iu8], fnIx) < 0 { return -1 }
         iu8 = iu8 + 1
       }
-      fbArrayNewFixed(ba8TypeIdx, elems.length) // builds the packed byte backing
-      fbI32Const(elems.length)                  // len
-      fbI32Const(elems.length)                  // cap
-      fbStructNew(bl8TypeIdx)                   // the `u8[]` wrapper
+      fbBacking(ba8TypeIdx, elems.length) // builds the packed byte backing
+      fbI32Const(elems.length)            // len
+      fbI32Const(elems.length)            // cap
+      fbStructNew(bl8TypeIdx)             // the `u8[]` wrapper
       return 0
     }
     if isF32Lit {
@@ -8831,7 +8841,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         fbLocalGet(dstF32)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built f32 backing
       } else {
-        fbArrayNewFixed(fa32TypeIdx, elems.length) // builds the f32 backing
+        fbBacking(fa32TypeIdx, elems.length) // builds the f32 backing
       }
       fbI32Const(elems.length) // len
       fbI32Const(elems.length) // cap
@@ -8875,7 +8885,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         fbLocalGet(dstF64)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built f64 backing
       } else {
-        fbArrayNewFixed(fa64TypeIdx, elems.length) // 0xfb 0x08; builds the f64 backing
+        fbBacking(fa64TypeIdx, elems.length) // 0xfb 0x08; builds the f64 backing
       }
       fbI32Const(elems.length) // 0x41 i32.const (len)
       fbI32Const(elems.length) // 0x41 i32.const (cap)
@@ -8919,7 +8929,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         fbLocalGet(dstI64)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built i64 backing
       } else {
-        fbArrayNewFixed(ia64TypeIdx, elems.length) // builds the i64 backing
+        fbBacking(ia64TypeIdx, elems.length) // builds the i64 backing
       }
       fbI32Const(elems.length) // len
       fbI32Const(elems.length) // cap
@@ -8972,7 +8982,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         fbLocalGet(dstStr)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built string-ref backing
       } else {
-        fbArrayNewFixed(mkArrIdx, elems.length) // 0xfb 0x08; builds the string-ref backing
+        fbBacking(mkArrIdx, elems.length) // 0xfb 0x08; builds the string-ref backing
       }
       fbI32Const(elems.length) // 0x41 i32.const (len)
       fbI32Const(elems.length) // 0x41 i32.const (cap)
@@ -9167,7 +9177,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         fbLocalGet(dstRef)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built ref backing
       } else {
-        fbArrayNewFixed(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
+        fbBacking(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
       }
       fbI32Const(elems.length)      // 0x41 i32.const (len)
       fbI32Const(elems.length)      // 0x41 i32.const (cap)
@@ -9257,7 +9267,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       fbLocalGet(dstI32)
       wU8(212) // 0xd4 ref.as_non_null — the chunk-built raw backing
     } else {
-      fbArrayNewFixed(aTypeIdx, elems.length) // 0xfb 0x08; builds the raw backing
+      fbBacking(aTypeIdx, elems.length) // 0xfb 0x08; builds the raw backing
     }
     // Wrap { backing, len = count, cap = count } via struct.new.
     fbI32Const(elems.length) // 0x41 i32.const (len)
@@ -9542,19 +9552,19 @@ function emitMapNew(_body: u8[]) {
   cmSlot = slot
   // keys list: an empty backing → wrapper, in the KEY's own list rep (string-ref for
   // `{[string]: V}`, the i32 list for `{[i32]: V}`).
-  fbArrayNewFixed(cmKeysBack(), 0) // 0 elements
-  fbI32Const(0)                    // len = 0
-  fbI32Const(0)                    // cap = 0
+  fbBacking(cmKeysBack(), 0) // 0 elements
+  fbI32Const(0)              // len = 0
+  fbI32Const(0)              // cap = 0
   fbStructNew(cmKeysWrap())
   cmSlot = savedCm
   // vals list: empty backing → wrapper (the i32 list, or the slot's ref list).
-  fbArrayNewFixed(mvValsBackOf(slot), 0)
+  fbBacking(mvValsBackOf(slot), 0)
   fbI32Const(0)
   fbI32Const(0)
   fbStructNew(mvValsWrapOf(slot))
   // live: empty i32 array (cap 0), parallel to the empty keys/vals entry lists. In a module
   // that deletes it grows in lockstep with the keys backing (a fresh entry is live = 1).
-  fbArrayNewFixed(aTypeIdx, 0)
+  fbBacking(aTypeIdx, 0)
   // index: `INITIAL_CAP * 2` (16) zero-filled slots, 0 meaning empty — an i32 array of 16, or of
   // 32 for an i32 key's pairs. Occupancy, dead markers included, stays under 1/2 by resizing at
   // `count*2 >= cap`, so every probe reaches a free slot under any mix of inserts and deletes (D2280).
@@ -9566,10 +9576,10 @@ function emitMapNew(_body: u8[]) {
   // hashes: empty i32 array (cap 0). A STRING-keyed map grows it in lockstep with the keys
   // (each key's hash, which gates the probe and re-places the entry); an i32 key is its own tag
   // in the pair index, so an i32-keyed map's stays empty.
-  fbArrayNewFixed(aTypeIdx, 0)
+  fbBacking(aTypeIdx, 0)
   // seqs (empty) and the next sequence (0), in a module that deletes (D2315).
   if gMapDeletes {
-    fbArrayNewFixed(ia64TypeIdx, 0)
+    fbBacking(ia64TypeIdx, 0)
     fbI64Const(0, 0)
   }
   // map struct { keys, vals, live, index, count, size, hashes[, seqs, next] } — the mono
@@ -11376,6 +11386,17 @@ function arrLitDataBuild(
   fbI32Const(elems.length) // element count
   fbArrayNewData(backTy, seg)
   1
+}
+
+// A fresh backing array of type `ty` from the `n` elements on the stack. An empty one reads the
+// module's one zero-length array of that type instead: every list and map holding it has
+// capacity 0, so its first store reallocates, and nothing compares backings by identity.
+function fbBacking(ty: i32, n: i32) {
+  if n == 0 {
+    const g = synthGlobalIdx(SYNTH_EMPTY_BACKING, ty)
+    if g >= 0 { return fbGlobalGet(g) }
+  }
+  fbArrayNewFixed(ty, n)
 }
 
 // Wrap the `n`-element backing on the stack as a full list of wrapper type `wrapTy`.

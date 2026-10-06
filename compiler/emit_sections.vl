@@ -165,6 +165,7 @@ import {
   MVK_I64,
   MVK_STR,
   RLK_UNION,
+  SYNTH_EMPTY_BACKING,
   VKind,
   W,
   aTypeIdx,
@@ -198,6 +199,7 @@ import {
   cloSigKeys,
   cloSigRepFn,
   cloSigTwin,
+  cloStructIdx,
   ctrlDepth,
   curBuf,
   declSlotByNode,
@@ -354,6 +356,10 @@ import {
   gStrDataStart,
   gStrPoolIx,
   gStrPoolTexts,
+  gSynthArg,
+  gSynthAt,
+  gSynthBase,
+  gSynthKind,
   genTyParamNames,
   genTyParamSeen,
   globalIndexBySid,
@@ -578,6 +584,7 @@ import {
   wRangeEq,
   wSLEB,
   wSection,
+  wSectionPartsAt,
   wSectionRope,
   wTarget,
   wU8,
@@ -5575,6 +5582,10 @@ function emitModule(_stmts: i32[]) {
   collectStrPool()
   // Placed by `emitGlobalSection`, which runs before any function body is emitted.
   gHeapGlobalIdx = -1
+  gSynthBase = -1
+  gSynthKind = []
+  gSynthArg = []
+  gSynthAt = Map()
 
   // Heap-type indices, in type-section order: standalone structs, then (for the union path)
   // the variant structs + box, the i32 array/list pair, each ref-list pair, the string-list
@@ -5672,6 +5683,7 @@ function emitModule(_stmts: i32[]) {
   if buildCodePayload(codePayload, n, hasStart, memFn, nHelpers) < 0 {
     return -1
   }
+  frameGlobalSection()
 
   // Element section (id 9): one active segment per run of address-taken functions, filling
   // entry `gImports + i` with user function `i` — the index a closure id already holds, so
@@ -8008,6 +8020,12 @@ function emitFunctionSection(
   0
 }
 
+// What `emitGlobalSection` leaves for `frameGlobalSection`: its entry count and bytes, and the
+// module rope chunk the section is framed before.
+let gGlobalFixedN = 0
+let gGlobalEntries: u8[] = []
+let gGlobalRopeAt = 0
+
 function emitGlobalSection() {
   if captureFoldedConsts() < 0 { return -1 }
   // Global section (id 6): one global per top-level `let`/`const`, in declaration
@@ -8035,13 +8053,18 @@ function emitGlobalSection() {
     nProg = 1
     gInitProgIdx = externGlobalCount() + np + nCells + nHeap
   }
+  // The synthetic constants trail everything, and the section is framed once the bodies that
+  // mint them are built (`frameGlobalSection`), at this point of the module.
+  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg
+  gGlobalFixedN = nCells + np + nHeap + nProg
+  gGlobalRopeAt = W.chunks.length
+  gGlobalEntries = []
   if nCells + np + nHeap + nProg > 0 {
-    const globalPayload: u8[] = []
+    const globalPayload: u8[] = gGlobalEntries
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
-    // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
-    // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
+    // each entry's valtype (`fbValtype`), mutability flag, and init constexpr (`fb*`
+    // opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(nCells + np + nHeap + nProg)
     // The string-literal pool first (indices 0..np-1, before the user cells): each entry an
     // immutable non-null string ref whose init constexpr builds the literal once
     // (`array.new_fixed` for the packed backing, then `struct.new` for the header) — every
@@ -8151,9 +8174,39 @@ function emitGlobalSection() {
       fbEnd()
     }
     wTarget(gPrev)
-    wSection(6, globalPayload)
   }
   0
+}
+
+// Frames the global section at the place `emitGlobalSection` left for it: its entries, then
+// one immutable global per synthetic constant the bodies minted, in minting order.
+function frameGlobalSection() {
+  const n = gGlobalFixedN + gSynthKind.length
+  if n == 0 { return 0 }
+  const countBuf: u8[] = []
+  const synthBuf: u8[] = []
+  const prev = wTarget(countBuf)
+  wULEB(n)
+  wTarget(synthBuf)
+  let i = 0
+  while i < gSynthKind.length {
+    let ty = cloStructIdx
+    if gSynthKind[i] == SYNTH_EMPTY_BACKING { ty = gSynthArg[i] }
+    wU8(100) // 0x64 (ref $ty), non-null
+    wSLEB(ty)
+    wU8(0)   // immutable
+    if gSynthKind[i] == SYNTH_EMPTY_BACKING {
+      fbArrayNewFixed(ty, 0)
+    } else {
+      fbRefNullStruct()
+      fbI32Const(gImports + gSynthArg[i])
+      fbStructNew(ty)
+    }
+    fbEnd()
+    i = i + 1
+  }
+  wTarget(prev)
+  wSectionPartsAt(gGlobalRopeAt, 6, [countBuf, gGlobalEntries, synthBuf])
 }
 
 // Lowers the initializer of the constexpr cell at `globalStmts` position `gi` into `buf`, under
