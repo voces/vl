@@ -940,6 +940,11 @@ let letCstrFn: i32[] = []
 // of type string` and can also say the object-literal-into-a-map and lossy-numeric forms; a
 // write to an already-declared place says only `cannot assign i32 to string`. `letAssignMsg` forks.
 let letCstrName: string[] = []
+// The check-order stamp of each `letCstr*` and `bmCstr*` row, from one counter, so the pin pass
+// applies a body's writes in check order wherever each is deferred (D2218).
+let letCstrSeq: i32[] = []
+let bmCstrSeq: i32[] = []
+let cstrSeqNext = 0
 // The right-hand nodes of index writes into a `u8` cell, whose refusal names the byte width
 // rather than the `i32` the cell reads as; kept by node so the pin's re-ask finds it too.
 let u8StoreRhs: i32[] = []
@@ -5202,6 +5207,9 @@ export function initChecker() {
   letCstrIx = []
   letCstrFn = []
   letCstrName = []
+  letCstrSeq = []
+  bmCstrSeq = []
+  cstrSeqNext = 0
   u8StoreRhs = []
   bmCstrGot = []
   bmCstrWant = []
@@ -21305,6 +21313,7 @@ function cstrTablesTruncate(m: i32[]) {
     letCstrIx.pop()
     letCstrFn.pop()
     letCstrName.pop()
+    letCstrSeq.pop()
   }
   while bmCstrGot.length > m[4] {
     bmCstrGot.pop()
@@ -21314,6 +21323,7 @@ function cstrTablesTruncate(m: i32[]) {
     bmCstrFn.pop()
     bmCstrForm.pop()
     bmCstrLabel.pop()
+    bmCstrSeq.pop()
   }
   while memCstrTy.length > m[5] {
     memCstrTy.pop()
@@ -22224,7 +22234,8 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   const noNo: i32[] = []
   const noNode: i32[] = []
   const who = e.identName
-  pinBmCstrElems(bNames, bTys, srcExpr, decl)
+  const noArgs: i32[] = []
+  pinBmCstrElems(bNames, bTys, srcExpr, decl, noArgs)
   validateBinCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
   validatePrintCstrs(bNames, bTys, srcExpr, decl, who)
   validateNestCstrs(bNames, bTys, srcExpr, decl, who)
@@ -40273,6 +40284,8 @@ function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
     letCstrIx.push(ix)
     letCstrFn.push(owner)
     letCstrName.push(name)
+    letCstrSeq.push(cstrSeqNext)
+    cstrSeqNext = cstrSeqNext + 1
   }
   0
 }
@@ -40622,6 +40635,8 @@ function noteBmCstr(
     bmCstrFn.push(owner)
     bmCstrForm.push(form)
     bmCstrLabel.push(label)
+    bmCstrSeq.push(cstrSeqNext)
+    cstrSeqNext = cstrSeqNext + 1
   }
   0
 }
@@ -42493,12 +42508,17 @@ function cnhPinBmElem(
   bTys: i32[],
   at: i32,
   got: i32,
+  pinRows: i32[],
 ) {
   const row = hdRowOf(want)
   if row < 0 || row >= hdKind.length { return 0 }
   if hdKind[row] != HD_ELEM { return 0 }
   const arr = substTyDeep(hdBase[row], bNames, bTys)
   if arr < 0 { return 0 }
+  // A value's own type pins only a list written at the call; a binding's list keeps its own
+  // later writes, which may still widen it.
+  const valPin = isNullTy(got) || nhOpen(got) || i32ListHas(pinRows, arr)
+  if !valPin { return 0 }
   const a = T.tys[arr]
   if a is TyArray {
     if a.aElem < 0 {
@@ -42513,10 +42533,17 @@ function cnhPinBmElem(
   0
 }
 
-// The pins a body's deferred `.push` arguments and element stores owe the open lists this call
-// binds, merged into source order, ahead of every validation that reads those elements: the
-// first write decides the element, as at the direct spelling (D2218, D1471).
-function pinBmCstrElems(bNames: string[], bTys: i32[], ix: i32, calleeFn: i32) {
+// The pins a body's deferred `.push` arguments and element stores owe the open lists written at
+// this call, in check order, ahead of every validation that reads those elements: the first
+// write decides the element, as at the direct spelling (D2218).
+function pinBmCstrElems(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  args: i32[],
+) {
+  const pinRows = callSiteOpenListRows(args)
   const nb = bmCstrGot.length
   const nl = letCstrGot.length
   let ci = 0
@@ -42525,14 +42552,19 @@ function pinBmCstrElems(bNames: string[], bTys: i32[], ix: i32, calleeFn: i32) {
     while ci < nb && !cstrOwnedBy(bmCstrFn[ci], calleeFn) { ci = ci + 1 }
     while li < nl && !cstrOwnedBy(letCstrFn[li], calleeFn) { li = li + 1 }
     let takeBm = ci < nb
-    if ci < nb && li < nl {
-      takeBm = nodeLastTok(bmCstrIx[ci]) <= nodeLastTok(letCstrIx[li])
-    }
+    if ci < nb && li < nl { takeBm = bmCstrSeq[ci] <= letCstrSeq[li] }
     if takeBm && ci < nb {
-      pinOpenElemFrom(bmCstrGot[ci], bmCstrWant[ci], bNames, bTys, ix)
+      pinOpenElemFrom(bmCstrGot[ci], bmCstrWant[ci], bNames, bTys, ix, pinRows)
       ci = ci + 1
     } else if li < nl {
-      pinOpenElemFrom(letCstrGot[li], letCstrWant[li], bNames, bTys, ix)
+      pinOpenElemFrom(
+        letCstrGot[li],
+        letCstrWant[li],
+        bNames,
+        bTys,
+        ix,
+        pinRows,
+      )
       li = li + 1
     }
   }
@@ -42546,13 +42578,39 @@ function pinOpenElemFrom(
   bNames: string[],
   bTys: i32[],
   ix: i32,
+  pinRows: i32[],
 ) {
   const g = substTyDeep(got, bNames, bTys)
   if isNullTy(g) || nhOpen(g) || (g >= 0 && !tyHasTyVar(g)) {
-    cnhPinBmElem(want, bNames, bTys, ix, g)
+    cnhPinBmElem(want, bNames, bTys, ix, g, pinRows)
   }
   0
 }
+
+// The list rows of the arguments written at the call as an empty `[]` or an
+// `__array_new_default__(…)`: the only open lists a callee's writes may decide (D2218).
+function callSiteOpenListRows(args: i32[]): i32[] {
+  const rows: i32[] = []
+  for a in args {
+    const ax = peelParenIx(a)
+    if ax >= 0 && ax < P.nodes.length {
+      if isEmptyArrayLitNode(ax) || arrDefCallNode(ax) {
+        rows.push(nodeTyIxOf(ax))
+      }
+    }
+  }
+  rows
+}
+
+// Whether node `ix` is a `[]` with no elements.
+function isEmptyArrayLitNode(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is ArrayLit { return n.arrElems.length == 0 }
+  false
+}
+
+// Whether node `ix` is a recorded `__array_new_default__(n)` call.
+function arrDefCallNode(ix: i32): boolean { i32ListHas(arrDefCallIx, ix) }
 
 // Whether the deferred builtin-method-argument constraints this binding resolves hold — the
 // twin of `validateLetCstrs` for a `.push`/`.set`/`.add` argument rather than an assignment
@@ -46760,7 +46818,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         const uhArgNo: i32[] = []
         const uhArgNode: i32[] = []
         holeArgOrigins(params, args, 1, uhNames, uhArgNo, uhArgNode)
-        pinBmCstrElems(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL)
+        const pinArgs: i32[] = [ufcsRecvExpr(n)]
+        for a in args { pinArgs.push(a) }
+        pinBmCstrElems(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, pinArgs)
         validateBinCstrs(
           bNames,
           bTys,
@@ -48414,7 +48474,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const dhArgNo: i32[] = []
     const dhArgNode: i32[] = []
     holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
-    pinBmCstrElems(vNames, vTys, ix, cstrCallee)
+    pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
     validateBinCstrs(
       vNames,
       vTys,
