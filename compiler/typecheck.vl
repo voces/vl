@@ -8598,14 +8598,16 @@ function keyStepPrefixTys(key: string, steps: string[]): i32[] {
 // used only as a receiver (`x.f`, `x[i]`) in its root, with the scope depth of its declaration.
 let crSoleNames: string[] = []
 let crSoleDepths: i32[] = []
-// The root `crValUseNames` describes, the names that root uses other than as a receiver, and the
-// receivers of its sites that may read a getter or dispatch an operator (D3760).
+// The root `crValUseNames` describes, the names that root uses other than as a receiver, the
+// receivers of its operator sites, and per receiver the props of its `x.p` sites a getter is
+// named (D3760).
 let crValUseRoot = -2
 let crValUseNames: {[string]: boolean} = Map()
 let crValUseDyn: {[string]: boolean} = Map()
+let crValUseGetProps: {[string]: string[]} = Map()
 // Per root walked (D3739): the arena epoch, logged-edit bump count and edit-log position of its
-// walk, its banking-free names, and the sites `x.p` and `x[i]` whose receiver counts only once
-// the checker banks a getter or an operator there.
+// walk, its banking-free names, and the sites `x.p` and `x[i]` whose receiver counts only where
+// a getter or an operator may run there.
 let cvuSlotOf: {[i32]: i32} = Map()
 let cvuEpoch: i32[] = []
 let cvuBumps: i32[] = []
@@ -8631,9 +8633,34 @@ function crNoteSoleRef(n: LetDecl) {
   }
   if crValUseNames[n.letName] ?? false { return 0 }
   if crValUseDyn[n.letName] ?? false { return 0 }
+  const gps = crValUseGetProps[n.letName] ?? []
+  if gps.length > 0 {
+    const lt = lookup(n.letName)
+    let k = 0
+    while k < gps.length {
+      if crTyMayReadGetter(lt, gps[k]) { return 0 }
+      k = k + 1
+    }
+  }
   crSoleNames.push(n.letName)
   crSoleDepths.push(d)
   0
+}
+
+// Whether a read `.prop` of a value typed `t` may run a getter: `t` or a member of it has one,
+// so a narrowed read does too. A field of that name wins over a getter, as `getterFnFor` says.
+function crTyMayReadGetter(t: i32, prop: string): boolean {
+  if t < 0 { return true }
+  if getterFnFor(t, prop) != "" { return true }
+  const r = T.tys[t]
+  if r is TyUnion {
+    let i = 0
+    while i < r.uMembers.length {
+      if getterFnFor(r.uMembers[i], prop) != "" { return true }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // Forget a record of `name` at depth `d`: a later declaration there binds a different object.
@@ -8668,7 +8695,7 @@ function crSoleRefBinding(name: string): boolean {
   false
 }
 
-// Point `crValUseNames` and `crValUseDyn` at `root`; a site `x.p` counts when a getter is named
+// Point `crValUseNames` and `crValUseDyn` at `root`; a site `x.p` is kept when a getter is named
 // `p`, since the root's own later sites are not banked yet (D3760). A root is walked again only
 // when the arena moved; the program's root instead adds the slots the logged edits rewrote, when
 // those made every bump since its walk.
@@ -8708,6 +8735,7 @@ function crValUseEnter(root: i32) {
   cvuLogAt[slot] = arenaEditCount()
   crValUseNames = cvuNames[slot]
   crValUseDyn = Map()
+  crValUseGetProps = Map()
   const mi = cvuMemIx[slot]
   if getFns.length > 0 {
     const props: {[string]: boolean} = Map()
@@ -8720,7 +8748,10 @@ function crValUseEnter(root: i32) {
     while i < mi.length {
       const m = P.nodes[mi[i]]
       if m is Member && (props[m.memProp] ?? false) {
-        crValUseDyn[cvuMemName[slot][i]] = true
+        const rn = cvuMemName[slot][i]
+        const ps = crValUseGetProps[rn] ?? []
+        if !strListHas(ps, m.memProp) { ps.push(m.memProp) }
+        crValUseGetProps[rn] = ps
       }
       i = i + 1
     }
@@ -9825,6 +9856,7 @@ function crReset() {
   crValUseRoot = -2
   crValUseNames = Map()
   crValUseDyn = Map()
+  crValUseGetProps = Map()
   cvuSlotOf = Map()
   cvuEpoch = []
   cvuBumps = []
