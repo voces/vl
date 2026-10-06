@@ -654,15 +654,17 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     O: { bytes: 1787, fns: 2, allocs: 10, indirect: 0 },
     O3: { bytes: 1721, fns: 2, allocs: 10, indirect: 0 },
   },
-  // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). Adds a `struct.get` per element to the
-  // fill-sum shape, and `allocs: 3` says the per-element structs are allocated once during
-  // setup and never re-materialised inside the scan.
-  // SHOULD MOVE IF: field access lowering changes, or a struct starts being copied per access.
+  // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). The `P[]` is flattened (D3681): four
+  // i32s per element in one array, so setup allocates no `P` (`allocs` 3 -> 2: the list and
+  // its backing) and the scan reads two fields with two `array.get`s, no pointer chase. The
+  // +107 / +120 bytes are the index clamp and the scaled lengths. Timed at `-O3`, 10^6
+  // elements x 500 rounds: V8 0.93 -> 0.62 s, wasmtime 1.51 -> 1.26 s.
+  // SHOULD MOVE IF: the flattening stops firing, or a struct starts being copied per access.
   {
     bench: "arrays/struct-aos",
     axis: "array-of-structs field scan",
-    O: { bytes: 345, fns: 1, allocs: 3, indirect: 0 },
-    O3: { bytes: 287, fns: 1, allocs: 3, indirect: 0 },
+    O: { bytes: 452, fns: 1, allocs: 2, indirect: 0 },
+    O3: { bytes: 407, fns: 1, allocs: 2, indirect: 0 },
   },
   // THE TIGHT SCALAR LOOP — `LOOP_TABLE`'s `scalar-accum-3` is this kernel, and it is the 2.43x
   // loop-rotation row. At 203 bytes with a single loop and no allocation, this is the ONE row

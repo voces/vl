@@ -696,7 +696,7 @@ Cranelift compile is cached".
 | `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
 | `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
 | `--low-memory-unused[=<bytes>]` | with `-O`/`-O3`: promise no access reaches the first `<bytes>` (default 1024; decimal or `0x`, 1..2^31-1), so `p + C` and `(p + C) as% i32` move `C` into the memarg while `C` plus the access's offset is below it; a heap base inside the region exits 2 (DECISIONS.md, "PL-061") |
-| `--stable-layout` | with `-O`/`-O3`: keep the layout of every record an export or import can reach through fields, list elements and union boxes; by default only a record a boundary signature names keeps it (inline-records-design.md §6 Q2); without an optimizing rung exits 2 |
+| `--stable-layout` | with `-O`/`-O3`: keep the layout of every record and list an export or import can reach through fields, list elements and union boxes; by default only a record a boundary signature names keeps it, and a list of nested records may be flattened (inline-records-design.md §6 Q2, S2); without an optimizing rung exits 2 |
 | `--compiler <f>` | the compiler module to compile with |
 
 The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*`/`--initial*`/

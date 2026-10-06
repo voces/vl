@@ -170,7 +170,7 @@ cannot read its fields. So `-O` and `-O3` keep the memory layout and the identit
 type an export's or import's signature names directly (`export function origin(): V3`, or `P |
 null`), and may store a record nested inside one (a field of an exported record, an element of
 an exported list, a union member's payload) inline in its parent, which changes its parent's
-layout.
+layout. An exported list of such records may likewise hold its elements' fields side by side.
 
 A unit that another wasm module links against and reads field by field needs every reachable
 layout to stay as declared. Build it with `vl build -O --stable-layout` (or `-O3`): then no

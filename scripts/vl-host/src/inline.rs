@@ -22,8 +22,8 @@
 //!
 //! A field `j` of a struct `P` is inlined when its type is a reference to such a `V`; every
 //! value stored into it in reachable code is non-null by its static type (a nullable record
-//! local that validates as non-null is declared so first) or is read from another inlined
-//! field; `P` is never made by `struct.new_default`, a constant expression or an atomic op,
+//! local that validates as non-null is declared so first, and a read of one that a dataflow
+//! proves holds no null there is cast) or is read from another inlined field; `P` is never made by `struct.new_default`, a constant expression or an atomic op,
 //! and cannot cross the boundary itself; every type `P` is in a subtyping relation with
 //! inlines the same field the same way; and no read of the field needs the whole record where
 //! it would cost an allocation that sharing the box does not (a read that is field-read, held
@@ -40,6 +40,9 @@
 //! the language's value semantics require. A stored value is held in a non-null local right
 //! after its producer, so the multi-value step, which runs next, sees `call; local.set` with
 //! field reads only and gives the producer its twin.
+//!
+//! **Lists (slice S2).** The same scan finds arrays of such records, and `flat.rs` then
+//! flattens each that qualifies into one array of the records' fields, on this step's output.
 //!
 //! **Safety.** Every struct type must sit in one rec group (VL's emitter puts them there), so
 //! changing a parent's fields cannot make two types equal. The output is validated, and on any
@@ -61,19 +64,256 @@ use crate::multivalue::{
 
 const NONE: u32 = u32::MAX;
 
-/// One value a parent's inlinable field is given at a `struct.new` or `struct.set`.
+/// One value a parent's inlinable field is given at a `struct.new` or `struct.set`, or an
+/// element is given at an array op (`field` is then the operand's position).
 #[derive(Clone, Debug)]
-struct Opnd {
-    field: u32,
+pub(crate) struct Opnd {
+    pub(crate) field: u32,
     /// Its static type admits null (reachable code only; unreachable code is never run).
-    nullable: bool,
+    pub(crate) nullable: bool,
     /// The op that pushed it, when that op's top result is exactly this value and it sits in
     /// the consumer's own block segment; `NONE` otherwise.
-    prod: u32,
+    pub(crate) prod: u32,
     /// The producer is a `struct.new` of this record type.
     prod_new: Option<u32>,
     /// The producer reads this candidate field: non-null exactly when that field is inlined.
     from_get: Option<(u32, u32)>,
+    /// Its static type admits null, but it is read from a local the dataflow proves holds
+    /// none there: a store casts it with `ref.as_non_null`, which never traps.
+    pub(crate) cast: bool,
+}
+
+/// One op the non-null dataflow replays: control flow, a set of a tracked local (and whether
+/// the value stored excludes null), or a read of one.
+enum Flow<'a> {
+    Ctl(Operator<'a>),
+    Set(u32, bool),
+    Get(u32),
+}
+
+/// The `local.get`s (by op) of `flow` that read a non-null value from a nullable local.
+fn non_null_gets(flow: &[(u32, Flow)]) -> HashSet<u32> {
+    let mut killed: HashMap<u32, HashSet<u32>> = HashMap::new();
+    let mut open: Vec<Option<u32>> = Vec::new();
+    for (k, f) in flow {
+        match f {
+            Flow::Ctl(Operator::Loop { .. }) => open.push(Some(*k)),
+            Flow::Ctl(
+                Operator::Block { .. }
+                | Operator::If { .. }
+                | Operator::Try { .. }
+                | Operator::TryTable { .. },
+            ) => open.push(None),
+            Flow::Ctl(Operator::End | Operator::Delegate { .. }) => {
+                open.pop();
+            }
+            Flow::Set(l, false) => {
+                for lk in open.iter().flatten() {
+                    killed.entry(*lk).or_default().insert(*l);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut asg = Assigned::new();
+    let mut out = HashSet::new();
+    for (k, f) in flow {
+        match f {
+            Flow::Ctl(op) => asg.op(op, killed.get(k)),
+            Flow::Set(l, nn) => asg.set(*l, *nn),
+            Flow::Get(l) => {
+                if asg.has(*l) {
+                    out.insert(*k);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Which nullable record locals hold a non-null value, in one forward pass over a body's
+/// structured control flow: a local is in the set where on every path the last `local.set` or
+/// `local.tee` of it stored a value whose type excludes null. A loop's entry state, less the
+/// locals some set inside the loop may make null, holds at every back edge.
+struct Assigned {
+    /// `None` while the current op is unreachable.
+    cur: Option<HashSet<u32>>,
+    frames: Vec<AFrame>,
+}
+
+struct AFrame {
+    is_loop: bool,
+    is_if: bool,
+    has_else: bool,
+    entry: Option<HashSet<u32>>,
+    /// The meet of every reachable path to this frame's end; `None` while there is none.
+    out: Option<HashSet<u32>>,
+}
+
+impl Assigned {
+    fn new() -> Assigned {
+        Assigned {
+            cur: Some(HashSet::new()),
+            frames: vec![AFrame {
+                is_loop: false,
+                is_if: false,
+                has_else: false,
+                entry: Some(HashSet::new()),
+                out: None,
+            }],
+        }
+    }
+    fn meet(out: &mut Option<HashSet<u32>>, s: &Option<HashSet<u32>>) {
+        if let Some(s) = s {
+            match out {
+                None => *out = Some(s.clone()),
+                Some(o) => o.retain(|l| s.contains(l)),
+            }
+        }
+    }
+    fn branch(&mut self, depth: u32) {
+        let n = self.frames.len();
+        if let Some(fr) = n
+            .checked_sub(1 + depth as usize)
+            .map(|i| &mut self.frames[i])
+        {
+            if !fr.is_loop {
+                Self::meet(&mut fr.out, &self.cur);
+            }
+        }
+    }
+    fn push(&mut self, is_loop: bool, is_if: bool) {
+        self.frames.push(AFrame {
+            is_loop,
+            is_if,
+            has_else: false,
+            entry: self.cur.clone(),
+            out: None,
+        });
+    }
+    /// Track control-flow op `op`; a loop starts without the locals in `killed`.
+    fn op(&mut self, op: &Operator, killed: Option<&HashSet<u32>>) {
+        match op {
+            Operator::Block { .. } | Operator::Try { .. } => self.push(false, false),
+            Operator::Loop { .. } => {
+                if let (Some(c), Some(kl)) = (&mut self.cur, killed) {
+                    c.retain(|l| !kl.contains(l));
+                }
+                self.push(true, false)
+            }
+            Operator::If { .. } => self.push(false, true),
+            Operator::TryTable { try_table } => {
+                // A catch may leave from any point inside, where at least the entry holds.
+                for c in &try_table.catches {
+                    let l = match c {
+                        wasmparser::Catch::One { label, .. }
+                        | wasmparser::Catch::OneRef { label, .. }
+                        | wasmparser::Catch::All { label }
+                        | wasmparser::Catch::AllRef { label } => *label,
+                    };
+                    self.branch(l);
+                }
+                self.push(false, false);
+            }
+            Operator::Else => {
+                if let Some(fr) = self.frames.last_mut() {
+                    Self::meet(&mut fr.out, &self.cur);
+                    fr.has_else = true;
+                    self.cur = fr.entry.clone();
+                }
+            }
+            Operator::Catch { .. } | Operator::CatchAll => {
+                if let Some(fr) = self.frames.last_mut() {
+                    Self::meet(&mut fr.out, &self.cur);
+                    self.cur = fr.entry.clone();
+                }
+            }
+            Operator::End | Operator::Delegate { .. } => {
+                if let Some(mut fr) = self.frames.pop() {
+                    if fr.is_if && !fr.has_else {
+                        Self::meet(&mut fr.out, &fr.entry);
+                    }
+                    Self::meet(&mut fr.out, &self.cur);
+                    self.cur = fr.out;
+                }
+            }
+            Operator::Br { relative_depth } => {
+                self.branch(*relative_depth);
+                self.cur = None;
+            }
+            Operator::BrIf { relative_depth }
+            | Operator::BrOnNull { relative_depth }
+            | Operator::BrOnNonNull { relative_depth }
+            | Operator::BrOnCast { relative_depth, .. }
+            | Operator::BrOnCastFail { relative_depth, .. } => self.branch(*relative_depth),
+            Operator::BrTable { targets } => {
+                for d in targets.targets().flatten().chain([targets.default()]) {
+                    self.branch(d);
+                }
+                self.cur = None;
+            }
+            Operator::Return
+            | Operator::Unreachable
+            | Operator::Throw { .. }
+            | Operator::ThrowRef
+            | Operator::Rethrow { .. }
+            | Operator::ReturnCall { .. }
+            | Operator::ReturnCallRef { .. }
+            | Operator::ReturnCallIndirect { .. } => self.cur = None,
+            _ => {}
+        }
+    }
+    fn set(&mut self, l: u32, non_null: bool) {
+        if let Some(c) = &mut self.cur {
+            if non_null {
+                c.insert(l);
+            } else {
+                c.remove(&l);
+            }
+        }
+    }
+    fn has(&self, l: u32) -> bool {
+        self.cur.as_ref().is_some_and(|c| c.contains(&l))
+    }
+}
+
+/// An op on a candidate array type (slice S2, `flat.rs`).
+#[derive(Clone, Debug)]
+pub(crate) enum ArrKind {
+    /// `array.new`: the value every element is given.
+    New(Opnd),
+    NewDefault,
+    /// `array.new_fixed`: its operands, bottom first.
+    NewFixed(Vec<Opnd>),
+    Get,
+    Set(Opnd),
+    Len,
+    Copy,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ASite {
+    pub(crate) k: u32,
+    pub(crate) off: u32,
+    pub(crate) reach: bool,
+    pub(crate) ty: u32,
+    pub(crate) kind: ArrKind,
+}
+
+/// How one `array.get` of a candidate array type uses the element it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AUse {
+    /// A field read of field `x` at op `last`, through an optional `ref.as_non_null`.
+    Field { last: u32, x: u32 },
+    /// Held in a local that is only field-read or stored into the same array, and only ever
+    /// set to such a read or a fresh record: re-boxed there, and the multi-value step
+    /// scalarizes the local.
+    Local,
+    /// Passed straight to parameter `arg` of `callee`: free when the multi-value step takes
+    /// that parameter as fields.
+    Arg { callee: u32, arg: u32 },
+    /// Anything else: the read would allocate where today it shares the box.
+    Whole,
 }
 
 #[derive(Clone, Debug)]
@@ -92,16 +332,21 @@ struct Site {
     kind: SiteKind,
 }
 
-struct Body {
-    range: (usize, usize),
-    ops_start: usize,
+pub(crate) struct Body {
+    pub(crate) range: (usize, usize),
+    pub(crate) ops_start: usize,
     /// The locals header with its record locals declared non-null, when that validated.
-    tightened: Option<Vec<u8>>,
+    pub(crate) tightened: Option<Vec<u8>>,
     /// Parameters plus declared locals.
-    n_locals: u32,
+    pub(crate) n_locals: u32,
     sites: Vec<Site>,
     /// Some op names a candidate parent type, so its field indices may move.
     touches: bool,
+    /// The ops on candidate array types, and how each element read (by op) is used (S2).
+    pub(crate) asites: Vec<ASite>,
+    pub(crate) areads: HashMap<u32, AUse>,
+    /// The element reads (by op) a `ref.as_non_null` directly follows.
+    pub(crate) cast_after: HashSet<u32>,
 }
 
 /// The ops a read's classification looks at; every other op is `Other`.
@@ -109,6 +354,7 @@ struct Body {
 enum Small {
     Other,
     AsNonNull,
+    ArrayGet(u32),
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
@@ -134,25 +380,30 @@ struct ReadTally {
 
 /// What can hold a value whose identity some op observes.
 #[derive(Clone, Copy)]
-enum Holder {
+pub(crate) enum Holder {
     Concrete(u32),
     /// `any`, `eq` or `struct`: every record.
     Any,
 }
 
-struct Scan {
-    subs: Vec<SubType>,
+pub(crate) struct Scan {
+    pub(crate) subs: Vec<SubType>,
     /// Per rec group: whether it was written explicitly, and its type count.
-    groups: Vec<(bool, usize)>,
+    pub(crate) groups: Vec<(bool, usize)>,
     func_type: Vec<u32>,
-    n_imports: u32,
+    pub(crate) n_imports: u32,
     /// Per type: its fields as numbers when it is a record-shaped struct.
-    rec: Vec<Option<Vec<Num>>>,
-    has_sub: Vec<bool>,
+    pub(crate) rec: Vec<Option<Vec<Num>>>,
+    pub(crate) has_sub: Vec<bool>,
     comp: Vec<u32>,
     /// Per (parent, field): the record type the field holds, for every field that could be inlined.
     potential: HashMap<(u32, u32), u32>,
-    /// The record types of `potential`.
+    /// Per array type whose element is a reference to a leaf record of one number type: that
+    /// record (S2).
+    pub(crate) arrays: HashMap<u32, u32>,
+    /// Per candidate array type: an op on it the flattening cannot rewrite, as (op, function).
+    pub(crate) arr_bad: HashMap<u32, (String, u32)>,
+    /// The record types of `potential` and `arrays`.
     records: HashSet<u32>,
     parents: HashSet<u32>,
     writer: HashMap<u32, u32>,
@@ -172,7 +423,7 @@ struct Scan {
     erased: HashMap<u32, u32>,
     /// Some op handed an abstract place a value whose type could not be mapped back.
     erased_any: Option<u32>,
-    bodies: Vec<Body>,
+    pub(crate) bodies: Vec<Body>,
     reads: HashMap<(u32, u32), ReadTally>,
     /// Reads passed straight to a call, as (parent, field, callee, argument, function).
     arg_reads: Vec<(u32, u32, u32, u32, u32)>,
@@ -232,26 +483,26 @@ impl Scan {
             CompositeInnerType::Cont(_) => Vec::new(),
         }
     }
-    fn sig(&self, t: u32) -> Option<(Vec<ValType>, Vec<ValType>)> {
+    pub(crate) fn sig(&self, t: u32) -> Option<(Vec<ValType>, Vec<ValType>)> {
         match &self.subs.get(t as usize)?.composite_type.inner {
             CompositeInnerType::Func(ft) => Some((ft.params().to_vec(), ft.results().to_vec())),
             _ => None,
         }
     }
-    fn fields(&self, t: u32) -> &[FieldType] {
+    pub(crate) fn fields(&self, t: u32) -> &[FieldType] {
         match self.subs.get(t as usize).map(|s| &s.composite_type.inner) {
             Some(CompositeInnerType::Struct(st)) => &st.fields,
             _ => &[],
         }
     }
-    fn supertype(&self, t: u32) -> Option<u32> {
+    pub(crate) fn supertype(&self, t: u32) -> Option<u32> {
         self.subs
             .get(t as usize)?
             .supertype_idx
             .and_then(|p| p.as_module_index())
     }
     /// Whether a value of type `v` may stand where `h` is expected.
-    fn holds(&self, h: Holder, v: u32) -> bool {
+    pub(crate) fn holds(&self, h: Holder, v: u32) -> bool {
         match h {
             Holder::Any => true,
             Holder::Concrete(t) => {
@@ -275,7 +526,7 @@ impl Scan {
 
 /// Parse the module and walk every body under the validator. `None` when it does not parse or
 /// validate, or has no field the step could inline; `Err` names why the step declines outright.
-fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
+pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
     let mut s = Scan {
         subs: Vec::new(),
         groups: Vec::new(),
@@ -285,6 +536,8 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
         has_sub: Vec::new(),
         comp: Vec::new(),
         potential: HashMap::new(),
+        arrays: HashMap::new(),
+        arr_bad: HashMap::new(),
         records: HashSet::new(),
         parents: HashSet::new(),
         writer: HashMap::new(),
@@ -488,10 +741,36 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
             }
         }
     }
-    if s.potential.is_empty() {
+    // S2's candidates: an array of references to a leaf record whose fields share one number
+    // type, so its elements can sit side by side in one array of that number.
+    for (a, sub) in s.subs.iter().enumerate() {
+        let CompositeInnerType::Array(at) = &sub.composite_type.inner else {
+            continue;
+        };
+        let StorageType::Val(ValType::Ref(r)) = at.0.element_type else {
+            continue;
+        };
+        let Some(v) = concrete_index(r.heap_type()) else {
+            continue;
+        };
+        let uniform = s
+            .rec
+            .get(v as usize)
+            .and_then(|x| x.as_ref())
+            .is_some_and(|fs| fs.iter().all(|&n| n == fs[0]));
+        if plain(sub) && uniform && !s.has_sub[v as usize] {
+            s.arrays.insert(a as u32, v);
+        }
+    }
+    if s.potential.is_empty() && s.arrays.is_empty() {
         return Ok(None);
     }
-    s.records = s.potential.values().copied().collect();
+    s.records = s
+        .potential
+        .values()
+        .chain(s.arrays.values())
+        .copied()
+        .collect();
     // What crosses the module boundary, and what constant expressions build.
     for (v, what) in import_tys {
         if let Some(h) = holder_of(v) {
@@ -571,6 +850,24 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
                 Operator::StructNew { struct_type_index }
                 | Operator::StructNewDefault { struct_type_index } => {
                     s.const_made.insert(struct_type_index);
+                }
+                // An empty list's backing is the one array a constant expression may make.
+                Operator::ArrayNewFixed { array_size: 0, .. } => {}
+                Operator::ArrayNew {
+                    array_type_index: a,
+                }
+                | Operator::ArrayNewDefault {
+                    array_type_index: a,
+                }
+                | Operator::ArrayNewFixed {
+                    array_type_index: a,
+                    ..
+                } => {
+                    if s.arrays.contains_key(&a) {
+                        s.arr_bad
+                            .entry(a)
+                            .or_insert(("it is made in a constant expression".into(), NONE));
+                    }
                 }
                 _ => {}
             }
@@ -667,6 +964,9 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
             n_locals,
             sites: Vec::new(),
             touches: false,
+            asites: Vec::new(),
+            areads: HashMap::new(),
+            cast_after: HashSet::new(),
         };
         let mut owner: Vec<u32> = Vec::new();
         let mut post: Vec<u32> = Vec::new();
@@ -674,6 +974,16 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
         let mut small: Vec<Small> = Vec::new();
         let mut gets: Vec<(u32, u32, u32)> = Vec::new();
         let mut get_at: HashMap<u32, (u32, u32)> = HashMap::new();
+        let mut agets: Vec<(u32, u32)> = Vec::new();
+        // A nullable record local holds no null where some set reaches every path and no set
+        // is of a value whose type admits null: per `local.get`, its local when assigned there.
+        let tracked = |l: u32| {
+            l >= n_params
+                && matches!(local_type(l), Some(ValType::Ref(r))
+                    if concrete_index(r.heap_type()).is_some_and(|v| s.records.contains(&v)))
+        };
+        // The ops that dataflow replays after the walk, with their op index.
+        let mut flow: Vec<(u32, Flow)> = Vec::new();
         // Per op that pushed a call's argument: the call's callee and the argument's index.
         let mut arg_of: HashMap<u32, (u32, u32)> = HashMap::new();
         let mut seg: Vec<u32> = vec![0];
@@ -713,6 +1023,7 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
                     prod: q,
                     prod_new: (q != NONE).then(|| new_of.get(&q).copied()).flatten(),
                     from_get: (q != NONE).then(|| get_at.get(&q).copied()).flatten(),
+                    cast: false,
                 }
             };
             if let Operator::Call { function_index } = &op {
@@ -883,6 +1194,117 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
                 }
                 _ => {}
             }
+            // S2: every op on a candidate array type, and the ops the flattening cannot rewrite.
+            if !s.arrays.is_empty() {
+                let mut asite = |kind: ArrKind, a: u32| {
+                    b.asites.push(ASite {
+                        k,
+                        off: off as u32,
+                        reach,
+                        ty: a,
+                        kind,
+                    });
+                };
+                let mut bad = |a: u32, what: &str| {
+                    if s.arrays.contains_key(&a) {
+                        s.arr_bad.entry(a).or_insert((what.to_string(), f));
+                    }
+                };
+                match op {
+                    Operator::ArrayNew {
+                        array_type_index: a,
+                    } if s.arrays.contains_key(&a) => asite(ArrKind::New(opnd(0, 1)), a),
+                    Operator::ArrayNewDefault {
+                        array_type_index: a,
+                    } if s.arrays.contains_key(&a) => asite(ArrKind::NewDefault, a),
+                    Operator::ArrayNewFixed {
+                        array_type_index: a,
+                        array_size: m,
+                    } if s.arrays.contains_key(&a) => {
+                        let opnds = (0..m).map(|i| opnd(i, (m - 1 - i) as usize)).collect();
+                        asite(ArrKind::NewFixed(opnds), a)
+                    }
+                    Operator::ArrayGet {
+                        array_type_index: a,
+                    } if s.arrays.contains_key(&a) => {
+                        agets.push((k, a));
+                        asite(ArrKind::Get, a)
+                    }
+                    Operator::ArraySet {
+                        array_type_index: a,
+                    } if s.arrays.contains_key(&a) => asite(ArrKind::Set(opnd(0, 0)), a),
+                    Operator::ArrayCopy {
+                        array_type_index_dst: a,
+                        array_type_index_src: c,
+                    } => {
+                        if a == c && s.arrays.contains_key(&a) {
+                            asite(ArrKind::Copy, a)
+                        } else {
+                            bad(a, "an array.copy from another array type");
+                            bad(c, "an array.copy into another array type");
+                        }
+                    }
+                    Operator::ArrayLen => match fv.get_operand_type(0) {
+                        Some(Some(v)) => match holder_of_operand(v, &ids) {
+                            Some(Holder::Concrete(a)) if s.arrays.contains_key(&a) => {
+                                asite(ArrKind::Len, a)
+                            }
+                            Some(Holder::Concrete(_)) => {}
+                            _ => {
+                                let mut all: Vec<u32> = s.arrays.keys().copied().collect();
+                                all.sort_unstable();
+                                for a in all {
+                                    bad(a, "an array.len of an abstract array reference");
+                                }
+                            }
+                        },
+                        _ => {}
+                    },
+                    Operator::ArrayNewData {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayNewElem {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayFill {
+                        array_type_index: a,
+                    }
+                    | Operator::ArrayInitData {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayInitElem {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayAtomicGet {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayAtomicSet {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayAtomicRmwXchg {
+                        array_type_index: a,
+                        ..
+                    }
+                    | Operator::ArrayAtomicRmwCmpxchg {
+                        array_type_index: a,
+                        ..
+                    } => bad(a, "an array op the flattening does not rewrite"),
+                    Operator::RefAsNonNull => {
+                        if let Some(&Small::ArrayGet(a)) = small.last() {
+                            if s.arrays.contains_key(&a) {
+                                b.cast_after.insert(k - 1);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Operator::StructNew {
                 struct_type_index: t,
             } = op
@@ -890,6 +1312,43 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
                 if s.rec.get(t as usize).is_some_and(|r| r.is_some()) {
                     new_of.insert(k, t);
                 }
+            }
+            match op {
+                Operator::LocalGet { local_index: l } if tracked(l) => {
+                    flow.push((k, Flow::Get(l)));
+                }
+                Operator::LocalSet { local_index: l } | Operator::LocalTee { local_index: l }
+                    if tracked(l) =>
+                {
+                    // Unreachable code never runs: its sets cannot make a local null.
+                    flow.push((k, Flow::Set(l, !reach || !nullable_at(0))));
+                }
+                Operator::Block { .. }
+                | Operator::Loop { .. }
+                | Operator::If { .. }
+                | Operator::Else
+                | Operator::End
+                | Operator::Try { .. }
+                | Operator::Catch { .. }
+                | Operator::CatchAll
+                | Operator::Delegate { .. }
+                | Operator::TryTable { .. }
+                | Operator::Br { .. }
+                | Operator::BrIf { .. }
+                | Operator::BrTable { .. }
+                | Operator::BrOnNull { .. }
+                | Operator::BrOnNonNull { .. }
+                | Operator::BrOnCast { .. }
+                | Operator::BrOnCastFail { .. }
+                | Operator::Return
+                | Operator::Unreachable
+                | Operator::Throw { .. }
+                | Operator::ThrowRef
+                | Operator::Rethrow { .. }
+                | Operator::ReturnCall { .. }
+                | Operator::ReturnCallRef { .. }
+                | Operator::ReturnCallIndirect { .. } => flow.push((k, Flow::Ctl(op.clone()))),
+                _ => {}
             }
             small.push(match op {
                 Operator::RefAsNonNull => Small::AsNonNull,
@@ -907,6 +1366,7 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
                     Small::StructGet(struct_type_index, field_index)
                 }
                 Operator::StructNew { struct_type_index } => Small::StructNew(struct_type_index),
+                Operator::ArrayGet { array_type_index } => Small::ArrayGet(array_type_index),
                 _ => Small::Other,
             });
             // Which stack positions this op wrote, as the multi-value step reads it.
@@ -943,6 +1403,27 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
             k += 1;
         }
         allocs = fv.into_allocations();
+        // A store read from a nullable local that holds no null there is non-null after all.
+        let non_null = non_null_gets(&flow);
+        let refine = |o: &mut Opnd| {
+            if o.nullable && o.prod != NONE && non_null.contains(&o.prod) {
+                o.nullable = false;
+                o.cast = true;
+            }
+        };
+        for site in &mut b.sites {
+            match &mut site.kind {
+                SiteKind::New(os) => os.iter_mut().for_each(refine),
+                SiteKind::Set(o) => refine(o),
+            }
+        }
+        for site in &mut b.asites {
+            match &mut site.kind {
+                ArrKind::New(o) | ArrKind::Set(o) => refine(o),
+                ArrKind::NewFixed(os) => os.iter_mut().for_each(refine),
+                _ => {}
+            }
+        }
         let uses = local_uses(&small, &gets);
         for &(k, p, j) in &gets {
             let v = s.potential[&(p, j)];
@@ -962,6 +1443,38 @@ fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, String> {
                     t.whole += 1;
                     t.whole_in.get_or_insert(f);
                 }
+            }
+        }
+        if !agets.is_empty() {
+            let stored: HashMap<u32, u32> = b
+                .asites
+                .iter()
+                .filter_map(|x| match &x.kind {
+                    ArrKind::Set(o) if o.prod != NONE => Some((o.prod, x.ty)),
+                    _ => None,
+                })
+                .collect();
+            let held = elem_locals(&s, &small, &agets, &stored, n_params);
+            for &(k, a) in &agets {
+                let v = s.arrays[&a];
+                let last = if small.get(k as usize + 1) == Some(&Small::AsNonNull) {
+                    k + 1
+                } else {
+                    k
+                };
+                let how = match after_cast(&small, k as usize) {
+                    Some((n, Small::StructGet(t, x)))
+                        if field_read_of(&s, Small::StructGet(t, x), v) =>
+                    {
+                        AUse::Field { last: n as u32, x }
+                    }
+                    Some((_, Small::LocalSet(l))) if held.contains(&l) => AUse::Local,
+                    _ => match arg_of.get(&last) {
+                        Some(&(callee, arg)) => AUse::Arg { callee, arg },
+                        None => AUse::Whole,
+                    },
+                };
+                b.areads.insert(k, how);
             }
         }
         s.bodies.push(b);
@@ -1073,6 +1586,76 @@ fn local_uses(small: &[Small], gets: &[(u32, u32, u32)]) -> HashMap<u32, LocalUs
         }
     }
     out
+}
+
+/// The locals (not parameters) an element read of a candidate array type is stored into that
+/// are never tee'd, are set only to such a read of that same array (through an optional
+/// `ref.as_non_null`) or to a fresh record of its element type, and whose every read is a
+/// field read or the value an `array.set` of that array stores (`stored`, by the op that
+/// pushes it). A re-boxed read stored there is scalarized by the multi-value step.
+fn elem_locals(
+    s: &Scan,
+    small: &[Small],
+    agets: &[(u32, u32)],
+    stored: &HashMap<u32, u32>,
+    n_params: u32,
+) -> HashSet<u32> {
+    let mut arr_of: HashMap<u32, u32> = HashMap::new();
+    let mut bad: HashSet<u32> = HashSet::new();
+    for &(k, a) in agets {
+        if let Some((_, Small::LocalSet(l))) = after_cast(small, k as usize) {
+            if l >= n_params && *arr_of.entry(l).or_insert(a) != a {
+                bad.insert(l);
+            }
+        }
+    }
+    for &op in small {
+        if let Small::LocalTee(l) = op {
+            bad.insert(l);
+        }
+    }
+    // A copy from one such local into another keeps both, so drop locals until none changes.
+    loop {
+        let good =
+            |l: u32, a: u32, bad: &HashSet<u32>| arr_of.get(&l) == Some(&a) && !bad.contains(&l);
+        let mut drop: Vec<u32> = Vec::new();
+        for (q, &op) in small.iter().enumerate() {
+            match op {
+                Small::LocalSet(l) if !bad.contains(&l) => {
+                    let Some(&a) = arr_of.get(&l) else { continue };
+                    let from = |i: usize| small.get(i) == Some(&Small::ArrayGet(a));
+                    let ok = match q.checked_sub(1).and_then(|p| small.get(p)) {
+                        Some(&Small::StructNew(t)) => t == s.arrays[&a],
+                        Some(&Small::AsNonNull) => q >= 2 && from(q - 2),
+                        Some(&Small::LocalGet(l2)) => good(l2, a, &bad),
+                        Some(_) => from(q - 1),
+                        None => false,
+                    };
+                    if !ok {
+                        drop.push(l);
+                    }
+                }
+                Small::LocalGet(l) if !bad.contains(&l) => {
+                    let Some(&a) = arr_of.get(&l) else { continue };
+                    let v = s.arrays[&a];
+                    let ok = match after_cast(small, q) {
+                        Some((_, op)) if field_read_of(s, op, v) => true,
+                        Some((n, Small::LocalSet(l3))) => n == q + 1 && good(l3, a, &bad),
+                        _ => stored.get(&(q as u32)) == Some(&a),
+                    };
+                    if !ok {
+                        drop.push(l);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if drop.is_empty() {
+            break;
+        }
+        bad.extend(drop);
+    }
+    arr_of.into_keys().filter(|l| !bad.contains(l)).collect()
 }
 
 /// How the read of a record field at op `k` uses the record: 0 a field read, 1 a local that
@@ -1239,7 +1822,7 @@ fn expected(
 /// How a value of type `t` can cross the module boundary, if it can: through a crossing type
 /// it may stand for, or by being handed to an `any`/`eq`/`struct` place (in the function
 /// named) when such a reference crosses.
-fn crossing(s: &Scan, t: u32, names: &dyn Fn(u32) -> String) -> Option<String> {
+pub(crate) fn crossing(s: &Scan, t: u32, names: &dyn Fn(u32) -> String) -> Option<String> {
     if let Some(w) = &s.crossing_any {
         let erased = s
             .erased
@@ -1263,7 +1846,7 @@ fn crossing(s: &Scan, t: u32, names: &dyn Fn(u32) -> String) -> Option<String> {
 }
 
 /// Why record type `v` may not be stored inline; `None` when it may.
-fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) -> Option<String> {
+pub(crate) fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) -> Option<String> {
     let comp = s.comp[v as usize];
     if let Some((&u, &f)) = s
         .writer
@@ -1297,7 +1880,7 @@ fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) -> Option<Str
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
 /// changes nothing. `stable_layout` (`vl build --stable-layout`) keeps the layout of every type
 /// a crossing value reaches, not only of the types a boundary signature names.
-pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<BodyMove>)> {
+pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<Stepped> {
     let flag = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
     let explaining = flag("VL_INLINE_EXPLAIN");
     // `$VL_INLINE_REBOX=1`: inline a field even where a read re-boxes, so a grid can grade the
@@ -1306,13 +1889,15 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<Bo
     // `$VL_INLINE_SPILL=1`: take every store apart at the store, never at its producer, so a
     // grid reaches the path an unknown producer takes. Also a measurement facility.
     let spill_all = flag("VL_INLINE_SPILL");
-    let s = match scan(bytes, stable_layout) {
+    // `$VL_OPT_NO_FLAT=1`: inline record fields but flatten no list (S2's control).
+    let no_flat = flag("VL_OPT_NO_FLAT");
+    let mut s = match scan(bytes, stable_layout) {
         Ok(Some(s)) => s,
         Ok(None) => {
             if explaining {
                 eprintln!(
-                    "inline-explain: step skipped: no struct field holds a leaf record \
-                     (1 to {MV_RECORD_MAX_FIELDS} numeric fields)"
+                    "inline-explain: step skipped: no struct field or array element holds a \
+                     leaf record (1 to {MV_RECORD_MAX_FIELDS} numeric fields)"
                 );
             }
             return None;
@@ -1335,13 +1920,86 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<Bo
             .cloned()
             .unwrap_or_else(|| format!("func {f}"))
     };
+    let fields = if s.potential.is_empty() {
+        None
+    } else {
+        fields_step(&mut s, bytes, explaining, rebox_all, spill_all, &name)
+    };
+    if s.arrays.is_empty() || no_flat {
+        return fields.map(|(bytes, moved)| Stepped {
+            bytes,
+            moved,
+            fields: true,
+            flat: false,
+        });
+    }
+    // Slice S2 reads the field step's output, so a re-boxed field read it stores is seen.
+    let flat = match &fields {
+        None => crate::flat::flat_step(&s, bytes, explaining, rebox_all, spill_all, &name),
+        Some((out, _)) => match scan(out, stable_layout) {
+            Ok(Some(s2)) => {
+                crate::flat::flat_step(&s2, out, explaining, rebox_all, spill_all, &name)
+            }
+            _ => None,
+        },
+    };
+    match (fields, flat) {
+        (None, None) => None,
+        (Some((bytes, moved)), None) => Some(Stepped {
+            bytes,
+            moved,
+            fields: true,
+            flat: false,
+        }),
+        (None, Some((bytes, moved))) => Some(Stepped {
+            bytes,
+            moved,
+            fields: false,
+            flat: true,
+        }),
+        (Some((_, first)), Some((bytes, second))) => Some(Stepped {
+            bytes,
+            moved: first
+                .into_iter()
+                .zip(second)
+                .map(|(a, b)| BodyMove {
+                    from: a.from,
+                    to: a.to,
+                    pairs: a.pairs.iter().map(|&(o, m)| (o, b.place(m))).collect(),
+                })
+                .collect(),
+            fields: true,
+            flat: true,
+        }),
+    }
+}
+
+/// The step's output: the module, where each body came from, and which slices changed it.
+pub struct Stepped {
+    pub bytes: Vec<u8>,
+    pub moved: Vec<BodyMove>,
+    /// S1 inlined a record field.
+    pub fields: bool,
+    /// S2 flattened a list.
+    pub flat: bool,
+}
+
+/// Slice S1: inline the record fields `s` finds that qualify.
+fn fields_step(
+    s: &mut Scan,
+    bytes: &[u8],
+    explaining: bool,
+    rebox_all: bool,
+    spill_all: bool,
+    name: &dyn Fn(u32) -> String,
+) -> Option<(Vec<u8>, Vec<BodyMove>)> {
     // The records that may be copied, and the fields that may hold one inline.
     let mut records: Vec<u32> = s.potential.values().copied().collect();
     records.sort_unstable();
     records.dedup();
     let mut ok_record: HashSet<u32> = HashSet::new();
     for &v in &records {
-        let why = record_refusal(&s, v, &name);
+        let why = record_refusal(s, v, name);
         if explaining {
             let spelled: Vec<&str> = s.rec[v as usize]
                 .iter()
@@ -1371,7 +2029,6 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<Bo
         }
     }
     // A read passed to a call is free when the multi-value step takes that parameter as fields.
-    let mut s = s;
     if !s.arg_reads.is_empty() {
         let fo = crate::multivalue::field_only_params(bytes);
         for (p, j, g, a, f) in std::mem::take(&mut s.arg_reads) {
@@ -1384,7 +2041,7 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<Bo
             }
         }
     }
-    let s = s;
+    let s: &Scan = s;
     let mut refused: HashMap<(u32, u32), String> = HashMap::new();
     // A store of a value whose type admits null refuses its field, unless the value is read
     // from a field that is itself inlined (a re-box is never null): those wait for the fixpoint.
@@ -1433,7 +2090,7 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<Bo
             ))
         } else if let Some(f) = s.atomic_on.get(&p) {
             Some(format!("type {p} is accessed atomically (in {})", name(*f)))
-        } else if let Some(what) = crossing(&s, p, &name) {
+        } else if let Some(what) = crossing(s, p, name) {
             Some(format!("type {p} can cross the module boundary ({what}), so its layout is not ours to change"))
         } else if s.const_made.contains(&p) {
             Some(format!(
@@ -1514,7 +2171,7 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<(Vec<u8>, Vec<Bo
         }
         return None;
     }
-    let out = rewrite(&s, bytes, &inline, spill_all);
+    let out = rewrite(s, bytes, &inline, spill_all);
     let (out, moved, stats) = match out {
         Ok(x) => x,
         Err(why) => {
@@ -1578,12 +2235,12 @@ struct Stats {
 
 /// Per parent with an inlined field: old field index to new, and the record each inlined
 /// field holds.
-struct Layout {
+pub(crate) struct Layout {
     start: Vec<u32>,
     rec: Vec<Option<u32>>,
 }
 
-fn gc_op(out: &mut Vec<u8>, sub: u32, t: u32, field: Option<u32>) {
+pub(crate) fn gc_op(out: &mut Vec<u8>, sub: u32, t: u32, field: Option<u32>) {
     out.push(0xfb);
     put_uleb(out, sub as u64);
     put_uleb(out, t as u64);
@@ -1592,12 +2249,19 @@ fn gc_op(out: &mut Vec<u8>, sub: u32, t: u32, field: Option<u32>) {
     }
 }
 
-fn local_op(out: &mut Vec<u8>, op: u8, l: u32) {
+/// A `ref.as_non_null` when `cast`: a stored value the dataflow proves non-null.
+pub(crate) fn cast_if(out: &mut Vec<u8>, cast: bool) {
+    if cast {
+        out.push(0xd4);
+    }
+}
+
+pub(crate) fn local_op(out: &mut Vec<u8>, op: u8, l: u32) {
     out.push(op);
     put_uleb(out, l as u64);
 }
 
-fn ref_ty(nullable: bool, t: u32) -> Option<ValType> {
+pub(crate) fn ref_ty(nullable: bool, t: u32) -> Option<ValType> {
     RefType::new(nullable, HeapType::Concrete(UnpackedIndex::Module(t))).map(ValType::Ref)
 }
 
@@ -1665,12 +2329,14 @@ fn rewrite(
                     let mut code = Vec::new();
                     if site.reach && o.prod != NONE && !spill_all {
                         let mut a = Vec::new();
+                        cast_if(&mut a, o.cast);
                         local_op(&mut a, 0x21, tv);
                         if after.insert(o.prod, a).is_some() || replace.contains_key(&o.prod) {
                             return Err(fail("two rewrites claim one producer"));
                         }
                         st.at_producer += 1;
                     } else {
+                        cast_if(&mut code, o.cast);
                         local_op(&mut code, 0x21, tv);
                         st.spilled += 1;
                     }
@@ -1710,6 +2376,7 @@ fn rewrite(
                             } else {
                                 let tv = new_local(ref_ty(false, v).ok_or("ref type")?, &mut extra);
                                 let mut a = Vec::new();
+                                cast_if(&mut a, o.cast);
                                 local_op(&mut a, 0x21, tv);
                                 for i in 0..rec_len(v) {
                                     local_op(&mut a, 0x20, tv);
@@ -1733,7 +2400,9 @@ fn rewrite(
                             ls.push(new_local(t, &mut extra));
                         }
                         let mut code = Vec::new();
-                        for &l in ls.iter().rev() {
+                        for (i, &l) in ls.iter().enumerate().rev() {
+                            let j = (first + i) as u32;
+                            cast_if(&mut code, ins.iter().any(|o| o.field == j && o.cast));
                             local_op(&mut code, 0x21, l);
                         }
                         for (i, &l) in ls.iter().enumerate() {
@@ -1891,39 +2560,59 @@ fn rewrite(
             }
             i += consumed;
         }
-        // The locals header: the old entries, then the new locals.
-        let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0);
-        let n_entries = lr
-            .read_var_u32()
-            .map_err(|_| "a locals header does not decode")?;
-        let entries_start = lr.original_position();
-        let mut out: Vec<u8> = Vec::with_capacity(code.len() + 32);
-        let mut groups: Vec<(u32, ValType)> = Vec::new();
-        for t in extra {
-            match groups.last_mut() {
-                Some((n, gt)) if *gt == t => *n += 1,
-                _ => groups.push((1, t)),
-            }
-        }
-        put_uleb(&mut out, (n_entries as usize + groups.len()) as u64);
-        match &b.tightened {
-            Some(h) => out.extend_from_slice(&h[entries_start - b.range.0..]),
-            None => out.extend_from_slice(&bytes[entries_start..b.ops_start]),
-        }
-        for (n, t) in groups {
-            put_uleb(&mut out, n as u64);
-            put_val(&mut out, t).ok_or("a local's type does not encode")?;
-        }
-        let header = out.len() as u32;
-        out.extend_from_slice(&code);
+        let (out, moves) = finish_body(bytes, b, &code, moved, extra)?;
         bodies.push(std::borrow::Cow::Owned(out));
-        body_moves.push(
-            std::iter::once((b.range.0 as u32, 0))
-                .chain(moved.into_iter().map(|(o, n)| (o, n + header)))
-                .collect(),
-        );
+        body_moves.push(moves);
     }
-    // The type section, every group re-encoded with each parent's new fields.
+    let types = type_section(s, &|out, t| encode_sub(out, s, t, &layout, &HashMap::new()))?;
+    let (out, moved) = assemble(s, bytes, types, &bodies, &body_moves)?;
+    Ok((out, moved, stats))
+}
+
+/// A rewritten body: its locals header (the old entries, tightened when that validated, then
+/// `extra`) followed by `code`, and where each op moved, per `moved`'s offsets into `code`.
+pub(crate) fn finish_body(
+    bytes: &[u8],
+    b: &Body,
+    code: &[u8],
+    moved: Vec<(u32, u32)>,
+    extra: Vec<ValType>,
+) -> Result<(Vec<u8>, Vec<(u32, u32)>), String> {
+    let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0);
+    let n_entries = lr
+        .read_var_u32()
+        .map_err(|_| "a locals header does not decode")?;
+    let entries_start = lr.original_position();
+    let mut out: Vec<u8> = Vec::with_capacity(code.len() + 32);
+    let mut groups: Vec<(u32, ValType)> = Vec::new();
+    for t in extra {
+        match groups.last_mut() {
+            Some((n, gt)) if *gt == t => *n += 1,
+            _ => groups.push((1, t)),
+        }
+    }
+    put_uleb(&mut out, (n_entries as usize + groups.len()) as u64);
+    match &b.tightened {
+        Some(h) => out.extend_from_slice(&h[entries_start - b.range.0..]),
+        None => out.extend_from_slice(&bytes[entries_start..b.ops_start]),
+    }
+    for (n, t) in groups {
+        put_uleb(&mut out, n as u64);
+        put_val(&mut out, t).ok_or("a local's type does not encode")?;
+    }
+    let header = out.len() as u32;
+    out.extend_from_slice(code);
+    let moves = std::iter::once((b.range.0 as u32, 0))
+        .chain(moved.into_iter().map(|(o, n)| (o, n + header)))
+        .collect();
+    Ok((out, moves))
+}
+
+/// The type section with every type re-encoded by `encode`, its rec groups kept.
+pub(crate) fn type_section(
+    s: &Scan,
+    encode: &dyn Fn(&mut Vec<u8>, u32) -> Option<()>,
+) -> Result<Vec<u8>, String> {
     let mut types: Vec<u8> = Vec::new();
     put_uleb(&mut types, s.groups.len() as u64);
     let mut t = 0usize;
@@ -1932,14 +2621,24 @@ fn rewrite(
             types.push(0x4e);
             put_uleb(&mut types, n as u64);
         } else if n != 1 {
-            return Err(fail("an implicit rec group holds several types"));
+            return Err("an implicit rec group holds several types".into());
         }
         for _ in 0..n {
-            encode_sub(&mut types, s, t as u32, &layout).ok_or("a type does not re-encode")?;
+            encode(&mut types, t as u32).ok_or("a type does not re-encode")?;
             t += 1;
         }
     }
-    // Reassemble: the type and code sections are new; every other section is copied.
+    Ok(types)
+}
+
+/// The module with a new type section and new bodies; every other section is copied.
+pub(crate) fn assemble(
+    s: &Scan,
+    bytes: &[u8],
+    mut types: Vec<u8>,
+    bodies: &[std::borrow::Cow<[u8]>],
+    body_moves: &[Vec<(u32, u32)>],
+) -> Result<(Vec<u8>, Vec<BodyMove>), String> {
     let mut out = bytes[..8].to_vec();
     let mut moved: Vec<BodyMove> = Vec::new();
     let mut p = 8usize;
@@ -1962,7 +2661,7 @@ fn rewrite(
                 let mut sec = Vec::with_capacity(len + 1024);
                 put_uleb(&mut sec, bodies.len() as u64);
                 let mut starts = Vec::with_capacity(bodies.len());
-                for b in &bodies {
+                for b in bodies {
                     put_uleb(&mut sec, b.len() as u64);
                     starts.push(sec.len());
                     sec.extend_from_slice(b);
@@ -1993,9 +2692,9 @@ fn rewrite(
         p = section_end;
     }
     if saw != (true, true) {
-        return Err(fail("no type or code section"));
+        return Err("no type or code section".into());
     }
-    Ok((out, moved, stats))
+    Ok((out, moved))
 }
 
 fn encode_field(out: &mut Vec<u8>, f: &FieldType) -> Option<()> {
@@ -2008,8 +2707,15 @@ fn encode_field(out: &mut Vec<u8>, f: &FieldType) -> Option<()> {
     Some(())
 }
 
-/// Type `t` in the binary format, with a parent's inlined fields expanded.
-fn encode_sub(out: &mut Vec<u8>, s: &Scan, t: u32, layout: &HashMap<u32, Layout>) -> Option<()> {
+/// Type `t` in the binary format, with a parent's inlined fields expanded and a flattened
+/// array's element (`flat`) made the number its record's fields share.
+pub(crate) fn encode_sub(
+    out: &mut Vec<u8>,
+    s: &Scan,
+    t: u32,
+    layout: &HashMap<u32, Layout>,
+    flat: &HashMap<u32, Num>,
+) -> Option<()> {
     let sub = &s.subs[t as usize];
     let ct = &sub.composite_type;
     if ct.shared || ct.descriptor_idx.is_some() || ct.describes_idx.is_some() {
@@ -2041,7 +2747,13 @@ fn encode_sub(out: &mut Vec<u8>, s: &Scan, t: u32, layout: &HashMap<u32, Layout>
         }
         CompositeInnerType::Array(at) => {
             out.push(0x5e);
-            encode_field(out, &at.0)?;
+            match flat.get(&t) {
+                Some(n) => {
+                    put_val(out, n.val())?;
+                    out.push(at.0.mutable as u8);
+                }
+                None => encode_field(out, &at.0)?,
+            }
         }
         CompositeInnerType::Struct(st) => {
             out.push(0x5f);

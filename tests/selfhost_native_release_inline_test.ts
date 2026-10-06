@@ -19,6 +19,17 @@
 //   decide it), and kept like `kept` under `--stable-layout` (owner ruling 2026-10-05,
 //   inline-records-design.md §6 Q2).
 //
+// Slice S2 (D3681) flattens a LIST of such records into one array of their fields, and its
+// kinds read `$VL_OPT_FLAT_DUMP` where S1's read `$VL_OPT_INLINE_DUMP`:
+//
+// * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT`;
+// * `flat-grid`: every list op, forced by `$VL_INLINE_REBOX` and then `$VL_INLINE_SPILL`;
+// * `flat-kept`: a disqualifier (a null element, a written field) leaves every list boxed;
+// * `flat-stable`: an export hands JS the list: flattened by default, kept under
+//   `--stable-layout`;
+// * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, and
+//   `$VL_INLINE_REBOX` flattens it.
+//
 // @test-timing opt
 import {
   ENABLED,
@@ -30,7 +41,16 @@ import {
 } from "./support/nativeRelease.ts";
 
 const DIR = `${ROOT}/tests/fixtures/opt-inline`;
-type Want = "melts" | "grid" | "kept" | "stable";
+type Want =
+  | "melts"
+  | "grid"
+  | "kept"
+  | "stable"
+  | "flat-melts"
+  | "flat-grid"
+  | "flat-kept"
+  | "flat-stable"
+  | "flat-costly";
 const FIXTURES: [string, Want][] = [
   ["stored-fields", "melts"],
   ["proof-rows", "grid"],
@@ -46,6 +66,12 @@ const FIXTURES: [string, Want][] = [
   ["stable-export-union-list", "stable"],
   ["stable-export-union-holder", "stable"],
   ["stable-export-union-map", "stable"],
+  ["flat-melts", "flat-melts"],
+  ["flat-grid", "flat-grid"],
+  ["flat-kept-nullable", "flat-kept"],
+  ["flat-kept-written", "flat-kept"],
+  ["flat-stable-export", "flat-stable"],
+  ["flat-costly", "flat-costly"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -122,8 +148,10 @@ for (const [fx, want] of FIXTURES) {
         ) => {
           const out = `${tmp}/m${rung}-${tag}.wasm`;
           const dump = `${tmp}/step${rung}-${tag}.wasm`;
+          const flatDump = `${tmp}/flat${rung}-${tag}.wasm`;
           const b = await vl(["build", src, rung, ...flags, "-o", out], {
             VL_OPT_INLINE_DUMP: dump,
+            VL_OPT_FLAT_DUMP: flatDump,
             ...env,
           });
           if (b.code !== 0) {
@@ -142,7 +170,7 @@ for (const [fx, want] of FIXTURES) {
             );
           }
           const n = allocations((await run(WASM_DIS, [out, ...features])).out);
-          return { n, inlined: exists(dump) };
+          return { n, inlined: exists(dump), flat: exists(flatDump) };
         };
         for (const rung of RUNGS) {
           const step = await built(rung, "step", {});
@@ -205,6 +233,72 @@ for (const [fx, want] of FIXTURES) {
               );
             }
           }
+          if (want === "flat-melts") {
+            if (!step.flat) {
+              throw new Error(`${fx} ${rung}: the step flattened no list`);
+            }
+            if (step.n !== allocs) {
+              throw new Error(
+                `${fx} ${rung}: ${step.n} struct.new left in function bodies\n` +
+                  `  want: ${allocs} — every list here holds its elements' fields`,
+              );
+            }
+            const off = await built(rung, "off", { VL_OPT_NO_FLAT: "1" });
+            if (off.n <= step.n) {
+              throw new Error(
+                `${fx} ${rung}: with no list flattened ${off.n} struct.new are left, not ` +
+                  `more than with it (${step.n}): the fixture no longer exercises the step`,
+              );
+            }
+          }
+          if (want === "flat-grid") {
+            for (
+              const [tag, env] of [
+                ["rebox", { VL_INLINE_REBOX: "1" }],
+                ["spill", { VL_INLINE_REBOX: "1", VL_INLINE_SPILL: "1" }],
+              ] as const
+            ) {
+              if (!(await built(rung, tag, env)).flat) {
+                throw new Error(
+                  `${fx} ${rung} ${tag}: the step flattened no list`,
+                );
+              }
+            }
+          }
+          if (want === "flat-kept") {
+            const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
+            if (step.flat || forced.flat || stable.flat) {
+              throw new Error(
+                `${fx} ${rung}: the step flattened a list a disqualifier should keep boxed`,
+              );
+            }
+          }
+          if (want === "flat-stable") {
+            if (!step.flat) {
+              throw new Error(
+                `${fx} ${rung}: the step flattened no list, though no signature names the record`,
+              );
+            }
+            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
+            const forced = await built(rung, "stable-rebox", {
+              VL_INLINE_REBOX: "1",
+            }, ["--stable-layout"]);
+            if (stable.flat || forced.flat) {
+              throw new Error(
+                `${fx} ${rung}: under --stable-layout the step flattened a list an export reaches`,
+              );
+            }
+          }
+          if (want === "flat-costly") {
+            const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+            if (step.flat || !forced.flat) {
+              throw new Error(
+                `${fx} ${rung}: want the list boxed by the cost rule and flattened under ` +
+                  `VL_INLINE_REBOX; got ${step.flat} and ${forced.flat}`,
+              );
+            }
+          }
         }
       } finally {
         await Deno.remove(tmp, { recursive: true });
@@ -258,6 +352,30 @@ Deno.test({
         [
           "proof-rows",
           /not inlined: \d+ of its \d+ read\(s\) take the whole record/,
+        ],
+        [
+          "flat-melts",
+          /array type \d+ \(of type \d+\): flattened; 3 store\(s\) \(3 taken apart at the producer/,
+        ],
+        [
+          "flat-kept-nullable",
+          /array type \d+ \(of type \d+\): not flattened: a value whose type admits null is stored into it \(array\.set/,
+        ],
+        [
+          "flat-kept-written",
+          /not flattened: its element type \d+ is refused: its fields are written/,
+        ],
+        [
+          "flat-stable-export --stable-layout",
+          /not flattened: its element type \d+ is refused: a value of it can cross the module boundary \(export grab\)/,
+        ],
+        [
+          "flat-costly",
+          /not flattened: its reads \(14 of a field, 0 of a whole element\) are more than 6 whole elements' worth per store/,
+        ],
+        [
+          "flat-grid",
+          /not flattened: \d+ of its \d+ element read\(s\) take the whole element/,
         ],
       ];
       for (const [spec, want] of cases) {
