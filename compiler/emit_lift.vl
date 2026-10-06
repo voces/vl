@@ -2,9 +2,12 @@
 // bound to a lambda, or a block-local `function`, whose every use is a direct call in the
 // frame that declares it (or, for a block-local function, in its own body) is called as a
 // plain function taking its captures as parameters after the env: no closure value and no
-// env struct is built. Anything this scan cannot prove keeps the closure path.
+// env struct is built. Anything this scan cannot prove keeps the closure path. A shared `let`
+// whose every capturer lifts stays a local: a capturer that assigns it returns the new value
+// after its own result, and each call site writes it back (D3664).
 
 import {
+  BinExpr,
   Call,
   ForIn,
   ForRange,
@@ -12,18 +15,29 @@ import {
   Ident,
   LetDecl,
   Member,
+  Node,
   OptMember,
   P,
   Param,
+  Spread,
   hasNamedArgs,
   nodeChildren,
 } from "./ast"
+import { emitFail } from "./emit_bytes"
 import { unwrapParen } from "./emit_base"
+import { nodeTyIxOf, nodeTyReachesClosure, tySame } from "./typecheck"
 import {
   cloLiftCapN,
   cloLiftFe,
   cloLiftFrame,
   cloLiftLet,
+  cloLiftWrIdx,
+  cloLiftWrN,
+  cloLiftWrName,
+  cloLiftWrStart,
+  cloUnboxNeed,
+  cloUnboxWrFn,
+  cloUnboxWrName,
   fnInstOrigin,
   fnParent,
   fnStmts,
@@ -32,7 +46,11 @@ import {
   lfCloneHead,
   lfOriginOf,
 } from "./emit_state"
-import { captureNamesOf, fnHasUnannotatedParam } from "./emit_classify"
+import {
+  captureNamesOf,
+  fnHasUnannotatedParam,
+  fnStmtsPosOf,
+} from "./emit_classify"
 
 // Where the walk stands: the declaring frame's own code, the candidate's own body, or any
 // other nested function (where a use is a capture, so an escape).
@@ -60,6 +78,10 @@ export function cloLiftScan() {
   cloLiftFe = []
   clOwner = Map()
   clShared = Map()
+  cloLiftWrStart = []
+  cloLiftWrN = []
+  cloLiftWrIdx = []
+  cloLiftWrName = []
   let pp = 0
   while fnValUsed && pp < fnStmts.length {
     const d = P.nodes[fnStmts[pp]]
@@ -71,9 +93,267 @@ export function cloLiftScan() {
     let n = -1
     if fnValUsed { n = cloLiftDecide(fe) }
     cloLiftCapN.push(n)
+    if clWritesRow(fe) < 0 { return -1 }
     fe = fe + 1
   }
+  cloUnboxCheck()
+}
+
+// Refuses when a capturer of a binding `captureBoxRewrite` left unboxed is not lifted: that
+// judgement reads only the syntax tree, and a closure value would copy what it assigns.
+function cloUnboxCheck() {
+  let ni = 0
+  while ni < cloUnboxNeed.length {
+    if !cloLifted(fnStmtsPosOf(cloUnboxNeed[ni])) {
+      return emitFail(
+        "emitProgram: a function sharing a captured `let` as a plain local was not lambda-lifted (D3664)",
+      )
+    }
+    ni = ni + 1
+  }
   0
+}
+
+// Appends slot `fe`'s row of the write-back tables: the captures it assigns, if lifted.
+function clWritesRow(fe: i32) {
+  cloLiftWrStart.push(cloLiftWrIdx.length)
+  let n = 0
+  if cloUnboxWrFn.length > 0 && cloLifted(fe) {
+    const caps = captureNamesOf(fe)
+    let wi = 0
+    while wi < cloUnboxWrFn.length {
+      if cloUnboxWrFn[wi] == fnStmts[fe] {
+        let ci = 0
+        while ci < caps.length && caps[ci] != cloUnboxWrName[wi] { ci = ci + 1 }
+        if ci >= caps.length {
+          return emitFail(
+            "emitProgram: a lambda-lifted function assigns a capture it does not take (D3664)",
+          )
+        }
+        cloLiftWrIdx.push(ci)
+        cloLiftWrName.push(cloUnboxWrName[wi])
+        n = n + 1
+      }
+      wi = wi + 1
+    }
+  }
+  cloLiftWrN.push(n)
+  0
+}
+
+// ── keeping a captured `let` off the heap (D3664) ────────────────────────────────────────
+// When every function capturing a shared `let` is lifted, each call passes the value in and
+// takes back what the callee assigned, so the binding needs no cell. `captureBoxRewrite` asks
+// before `cloLiftScan` runs: the answer reads the syntax tree, in frames no later pass clones.
+
+let cuName = ""
+let cuTy = -1
+let cuOk = true
+let cuCur = -1
+let cuFns: i32[] = []
+let cuCallees: string[] = []
+
+// The names among `cands` (bindings of frame `fe` a closure must share, typed `candTys`) that
+// can stay plain locals. Records the capturers `cloLiftScan` must lift and what each assigns.
+export function cloUnboxPick(
+  fe: i32,
+  cands: string[],
+  candTys: i32[],
+): string[] {
+  const out: string[] = []
+  if !fnValUsed || cands.length == 0 || !cuChainOk(fe) { return out }
+  const host = P.nodes[fnStmts[fe]]
+  if !(host is FuncDecl) { return out }
+  let ci = 0
+  while ci < cands.length {
+    cuTy = candTys[ci]
+    if cuPickOne(fe, host.fnBody, cands[ci]) { out.push(cands[ci]) }
+    ci = ci + 1
+  }
+  out
+}
+
+// Whether binding `nm` of frame `fe`, whose body is `body`, can stay a plain local.
+function cuPickOne(fe: i32, body: i32, nm: string): boolean {
+  cuName = nm
+  cuOk = true
+  cuCur = -1
+  cuFns = []
+  cuScan(body, 0)
+  if !cuOk || cuFns.length == 0 { return false }
+  cuCallees = []
+  let fi = 0
+  while fi < cuFns.length {
+    const dfe = fnStmtsPosOf(cuFns[fi])
+    if dfe < 0 || dfe >= fnParent.length || fnParent[dfe] != fe { return false }
+    if !cuChainOk(dfe) { return false }
+    if clChainIsGeneric(dfe) || clSyntax(dfe) < 0 { return false }
+    cuCallees.push(clName)
+    fi = fi + 1
+  }
+  cuArgsScan(body)
+  if !cuOk { return false }
+  fi = 0
+  while fi < cuFns.length {
+    cloUnboxNeed.push(cuFns[fi])
+    const d = P.nodes[cuFns[fi]]
+    if d is FuncDecl {
+      if cuAssigns(d.fnBody) {
+        cloUnboxWrFn.push(cuFns[fi])
+        cloUnboxWrName.push(nm)
+      }
+    }
+    fi = fi + 1
+  }
+  true
+}
+
+// No frame from `fe` outward has type parameters, an un-annotated parameter or a parameter
+// whose type reaches a function, so none is monomorphized or specialised after this pass.
+function cuChainOk(fe: i32): boolean {
+  let pp = fe
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    const d = P.nodes[fnStmts[pp]]
+    if !(d is FuncDecl) { return false }
+    if d.fnTyParams.length > 0 || fnHasUnannotatedParam(pp) { return false }
+    let pi = 0
+    while pi < d.fnParams.length {
+      const p = P.nodes[d.fnParams[pi]]
+      if p is Param {
+        if p.parType >= 0 && nodeTyReachesClosure(p.parType) { return false }
+      }
+      pi = pi + 1
+    }
+    if pp >= fnParent.length { return false }
+    pp = fnParent[pp]
+    steps = steps + 1
+  }
+  true
+}
+
+// Collects in `cuFns` the functions nested directly in the frame that name `cuName`. A use
+// further in, any binding of the name inside a nested function, or an assignment whose value
+// is typed apart from the binding (a cell yields the value, a local re-reads it, D3733) refuses.
+function cuScan(ix: i32, depth: i32) {
+  if !cuOk || ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if cuIsAssign(n) && !tySame(nodeTyIxOf(ix), cuTy) { cuOk = false }
+  if n is Ident {
+    if n.identName == cuName {
+      if depth == 1 {
+        if cuFns.length == 0 || cuFns[cuFns.length - 1] != cuCur {
+          cuFns.push(cuCur)
+        }
+      }
+      if depth > 1 { cuOk = false }
+    }
+    return 0
+  }
+  if depth > 0 {
+    if n is LetDecl {
+      if n.letName == cuName { cuOk = false }
+    }
+    if n is Param {
+      if n.parName == cuName { cuOk = false }
+    }
+    if n is ForRange {
+      if n.frVar == cuName { cuOk = false }
+    }
+    if n is ForIn {
+      if n.fiVar == cuName || n.fiVar2 == cuName { cuOk = false }
+    }
+  }
+  let inner = depth
+  if n is FuncDecl {
+    if depth > 0 && n.fnName == cuName { cuOk = false }
+    inner = depth + 1
+    if depth == 0 { cuCur = ix }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    cuScan(kids[k], inner)
+    k = k + 1
+  }
+  0
+}
+
+// Refuses when an argument of a call to a capturer could change `cuName`: a call to a
+// capturer, an assignment to the name, or a spread. A capturer reads the value before its
+// arguments run, and a cell is read after them.
+function cuArgsScan(ix: i32) {
+  if !cuOk || ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Call {
+    if cuIsCapturerCall(n) {
+      let ai = 0
+      while ai < n.callArgs.length {
+        if cuArgDirty(n.callArgs[ai]) { cuOk = false }
+        ai = ai + 1
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    cuArgsScan(kids[k])
+    k = k + 1
+  }
+  0
+}
+
+function cuIsCapturerCall(n: Call): boolean {
+  const callee = P.nodes[n.callFn]
+  if callee is Ident {
+    let i = 0
+    while i < cuCallees.length {
+      if cuCallees[i] == callee.identName { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether the argument at `ix` could change `cuName` or names a capturer at all.
+function cuArgDirty(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Spread { return true }
+  if n is Call {
+    if cuIsCapturerCall(n) { return true }
+  }
+  if cuIsAssign(n) { return true }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    if cuArgDirty(kids[k]) { return true }
+    k = k + 1
+  }
+  false
+}
+
+// Whether the body at `ix` assigns `cuName`.
+function cuAssigns(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if cuIsAssign(P.nodes[ix]) { return true }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    if cuAssigns(kids[k]) { return true }
+    k = k + 1
+  }
+  false
+}
+
+function cuIsAssign(n: Node): boolean {
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const l = P.nodes[unwrapParen(n.binLeft)]
+      if l is Ident { return l.identName == cuName }
+    }
+  }
+  false
 }
 
 // Notes the lambda `const`s frame `pp`'s own code declares. A nested function is neither
@@ -126,10 +406,28 @@ function clChainIsGeneric(pos: i32): boolean {
 // The capture count when slot `fe` can be lifted, else -1.
 function cloLiftDecide(fe: i32): i32 {
   if fe >= fnParent.length { return -1 }
-  const host = fnParent[fe]
-  if host < 0 { return -1 }
+  if fnParent[fe] < 0 { return -1 }
   if fnHasUnannotatedParam(fe) { return -1 }
   if clChainIsGeneric(fe) { return -1 }
+  const n = clSyntax(fe)
+  if n < 0 { return -1 }
+  // A declaration another frame also emits would be lifted in one frame and built as a
+  // value in the other, so it keeps the closure path.
+  if clShared.has(fnStmts[fe]) || (clLet >= 0 && clShared.has(clLet)) {
+    return -1
+  }
+  if clLet >= 0 {
+    cloLiftFrame.push(fnParent[fe])
+    cloLiftLet.push(clLet)
+    cloLiftFe.push(fe)
+  }
+  n
+}
+
+// The capture count when every use of slot `fe` in its declaring frame is a direct call,
+// else -1; sets `clLet` to the `const` binding it, if any. Reads only the syntax tree.
+function clSyntax(fe: i32): i32 {
+  const host = fnParent[fe]
   const self = fnStmts[fe]
   const hostNode = P.nodes[fnStmts[host]]
   if !(hostNode is FuncDecl) { return -1 }
@@ -147,9 +445,6 @@ function cloLiftDecide(fe: i32): i32 {
     clFindBinding(hostNode.fnBody)
   }
   if clName == "" { return -1 }
-  // A declaration another frame also emits would be lifted in one frame and built as a
-  // value in the other, so it keeps the closure path.
-  if clShared.has(self) || (clLet >= 0 && clShared.has(clLet)) { return -1 }
   clCaps = captureNamesOf(fe)
   clCapDecls = []
   let ci = 0
@@ -171,11 +466,6 @@ function cloLiftDecide(fe: i32): i32 {
   while ci < clCapDecls.length {
     if clCapDecls[ci] > 1 { return -1 }
     ci = ci + 1
-  }
-  if clLet >= 0 {
-    cloLiftFrame.push(host)
-    cloLiftLet.push(clLet)
-    cloLiftFe.push(fe)
   }
   clCaps.length
 }

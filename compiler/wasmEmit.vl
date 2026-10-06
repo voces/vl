@@ -369,6 +369,8 @@ import {
   capStartTbl,
   cboxReadTy,
   cloEqScratchBase,
+  cloLiftWriteCapAt,
+  cloLiftWriteCount,
   cloStructIdx,
   cmSlot,
   coalesceCallBoolSlot,
@@ -474,6 +476,7 @@ import {
   liBack,
   liKinds,
   liSlots,
+  liftWbEnd,
   listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
@@ -655,6 +658,7 @@ import {
   fbRefNullNone,
   fbRefNullOfKind,
   fbRefNullStruct,
+  fbRetExtra,
   fbReturn,
   fbReturnCall,
   fbSelect,
@@ -24352,6 +24356,7 @@ function callBytes(fnIdx: i32) {
 // position by construction. Validity needs no result-type check, since `return_call`
 // imposes the same subtyping `return` already does; the one break is arity.
 function emitTailCallRet(fnIx: i32) {
+  if fbRetExtra.length > 0 { return emitLiftSelfTailRet(fnIx) }
   if fnUsesUnionSink { return false }
   if tailCallIdx < 0 { return false }
   if tailCallEnd != wLen() { return false }
@@ -24371,6 +24376,29 @@ function emitTailCallRet(fnIx: i32) {
   fbReturnCall(tailCallIdx) // 0x12 return_call
   tailCallEnd = -1
   tailCallIdx = -1
+  true
+}
+
+// The tail-call rewrite in a lifted function that hands captures back: only a call to itself
+// returns what the function itself would, so its write-back is dropped with it (D3664).
+function emitLiftSelfTailRet(fnIx: i32) {
+  if fnUsesUnionSink || tailCallIdx < 0 || tailCallEnd < 0 { return false }
+  if liftWbEnd != wLen() { return false }
+  const fnPos = fnStmtsPosOf(fnIx)
+  if fnPos < 0 || tailCallIdx != gImports + fnPos { return false }
+  const wb = wLen() - tailCallEnd
+  const pat = callBytes(tailCallIdx)
+  const np = pat.length
+  let i = 0
+  while i < np {
+    if wPeekBack(wb + i) != pat[np - 1 - i] { return false }
+    i = i + 1
+  }
+  wDropBack(wb + np)
+  fbReturnCall(tailCallIdx) // 0x12 return_call
+  tailCallEnd = -1
+  tailCallIdx = -1
+  liftWbEnd = -1
   true
 }
 
@@ -31171,6 +31199,24 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   // rewrites the pair into `return_call`.
   tailCallIdx = gImports + target
   tailCallEnd = wLen()
+  // A lifted callee hands back the captures it assigned after its result: each goes back
+  // where this frame keeps it, the last result first (D3664).
+  const nWb = cloLiftWriteCount(target)
+  if nWb > 0 {
+    const wbCaps = captureNamesOf(target)
+    let wbi = nWb - 1
+    while wbi >= 0 {
+      const wbIdx = localIndexOf(fnIx, wbCaps[cloLiftWriteCapAt(target, wbi)])
+      if wbIdx < 0 {
+        return emitFail(
+          "emitProgram: a lifted call's assigned capture has no home here",
+        )
+      }
+      fbLocalSet(wbIdx)
+      wbi = wbi - 1
+    }
+    liftWbEnd = wLen()
+  }
   // D1567 — a `nulnone` result at an i32-repped nullable destination. `nullref` subtypes
   // every nullable ref valtype, so struct/variant/string/list/map/closure destinations take
   // the result unchanged; the two niche nullables do not (`boolean | null` is sentinel 2, `K |
