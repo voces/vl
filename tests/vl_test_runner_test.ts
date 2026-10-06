@@ -865,12 +865,12 @@ Deno.test({
   fn: async () => {
     // A pool worker runs the compiler seed, whose engine sizes its wasm stack for
     // the thread `main` runs on. Too small a native stack under it would ABORT the
-    // process where the wasm should trap, so: on the normal stack a 3,000-deep
-    // expression compiles in a worker, and under `VL_SEED_STACK=default` (the
+    // process where the wasm should trap, so: on the normal stack an 8,000-deep
+    // expression (enough to abort a default-stack worker) compiles in a worker, and under `VL_SEED_STACK=default` (the
     // small-stack fallback) pooled and serial both trap into the same banner.
     const dir = await Deno.makeTempDir({ prefix: "vl_test_deep_" });
     try {
-      const n = 3000;
+      const n = 8000;
       await Deno.writeTextFile(
         `${dir}/deep.test.vl`,
         'import { expect, it, toEqual } from "std:test"\n' +
