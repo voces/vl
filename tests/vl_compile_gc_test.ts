@@ -210,12 +210,13 @@ Deno.test({
       const r = await vl(["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`]);
       if (
         r.code !== 70 || !r.err.includes("vl: compile collector: null ") ||
+        !r.err.includes("filled its 4 GiB heap") ||
         !r.err.includes(
           "`VL_COMPILE_GC=copying` compiles under a collecting one",
         )
       ) {
         throw new Error(
-          `want exit 70 under null with the escape named, got ${show(r)}`,
+          `want exit 70 under null, the heap named full and the escape named, got ${show(r)}`,
         );
       }
     });

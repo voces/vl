@@ -2019,7 +2019,7 @@ Deno.test({
 });
 
 // THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
-// (reads 4.75: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
+// (reads about 5.5: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
 Deno.test({
   name: "scaling shape: control — twenty times the work reds the allocation grader",
   ignore: !ENABLED,
