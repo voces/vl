@@ -3145,8 +3145,9 @@ seed from current `compiler/*.vl` in ~40s.*
   `CMD_READ_FILE` a worker serviced). Measured 2026-10-06: sunpa's `vl test src/` is 25.7 s, of
   which `rules.test.vl`'s compile is 24.5 s and the tests themselves ~40 ms.
   **Designed** (lane IC, 2026-10-06): `docs/internals/incremental-compilation-design.md` §4 —
-  this row is its Stage S1, the host keeps a read log per action, so the key is what the compile
-  READ; no compiler change.
+  this row is its Stage S1. The key is the whole host-to-guest transcript (staging calls, argv,
+  every command reply and read), recorded by the host, plus the resolved seed, host build id,
+  binaryen and environment; no compiler change.
 - ⬜ **C-incremental. Incremental and cached compilation, staged (lane IC; owner direction
   2026-10-06: compile many at once, watch, file cache).** Plan and gates:
   `docs/internals/incremental-compilation-design.md` §5 — S0 phase marks, S1 whole-action file

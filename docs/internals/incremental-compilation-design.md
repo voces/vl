@@ -24,9 +24,10 @@ per-module wasm.
 1. VL compiles a whole import graph at a time, and every phase after parsing reads the merged
    program. Today the only result that is a function of fewer inputs than the whole graph is a
    module's token stream.
-2. So the first stage is the coarsest sound one: cache a compile's **output keyed on everything
-   the compile read** (ccache "direct mode", Go's action ID). It needs no compiler change, and
-   it is what `C-test-cache` asks for.
+2. So the first stage is the coarsest sound one: cache a compile's **output keyed on the whole
+   transcript of what the host sent the compiler instance**, plus the seed, host, binaryen and
+   environment (ccache "direct mode", Go's action ID). It needs no compiler change, and it is
+   what `C-test-cache` asks for.
 3. It saves the compiles whose graph did not change. It does nothing for the compile whose
    graph did, and on sunpa that is the expensive one. For that case, profile-and-cut work beats
    caching. sunpa's graph costs about 10 times the compiler's own per-line fuel.
@@ -38,31 +39,38 @@ per-module wasm.
 
 ### sunpa
 
-Measured 2026-10-06, 14:07–14:11, on the shared master host (`vl 0.1.0`, commit `082c36f12`).
-The box had 24 cores at load 10–16. Each figure is a single run, so treat wall times as ±20%.
-Fuel is a count, so load cannot move it.
+Measured 2026-10-06, 14:24–14:25, on sunpa commit **`27e3417`**, pinned with
+`git archive HEAD src` into a scratch directory so that sunpa's own merges during the run could
+not move it. The host was the shared master host (`vl 0.1.0`, commit `082c36f12`) on a 24-core
+box at load 10–22. Each figure is a single run, so treat wall times as ±20%. Fuel is a count,
+so load cannot move it.
 
-| what | figure |
+| what (sunpa `27e3417`) | figure |
 | --- | --- |
-| `src/game.vl`'s import graph | 57 `.vl` files, 35,596 lines; `game.vl` itself is 4,195 |
-| `vl check game.vl` | 5.20 s wall, 3.84 s user CPU, 303 MB peak |
-| `vl build game.vl` (no `-O`) | 27.8 s wall, 25.8 s user CPU, 2.42 GB peak, 1,741,572 bytes out |
-| the same, `VL_FUEL=1` | 82.1 G guest fuel, 2.36 GB guest allocation |
-| `vl build -O3`, `VL_PROFILE=1` | 42.9 s wall: `compile.call` 30.5 s, host `-O` steps 0.73 s, `opt.rung` (wasm-opt) 9.87 s, `stage_program` 0.15 s, `load_compiler` 26 ms |
+| `src/game.vl`'s import graph | 54 `.vl` modules, 34,978 lines, plus `std:array`, `std:buffer`, `std:math` and `std:str`; `game.vl` itself is 4,316 lines |
+| `vl check game.vl` | 4.22 s wall, 4.05 s user CPU, 303 MB peak |
+| `vl build game.vl` (no `-O`) | 25.0 s wall, 23.0 s user CPU, 2.44 GB peak, 1,765,678 bytes out |
+| the same, `VL_FUEL=1` | 83.7 G guest fuel, 2.40 GB guest allocation |
+| `vl build -O3`, `VL_PROFILE=1` | 32.3 s wall: `compile.call` 21.7 s, host `-O` steps 0.49 s, `opt.rung` (wasm-opt) 9.83 s, `stage_program` 0.10 s, `load_compiler` 7 ms |
+
+An earlier pass, 14:07–14:11 on the live checkout, read 27.8 s for a plain build, 82.1 G fuel
+and 42.9 s for `-O3`. sunpa merged `6890dcb` at 14:09:46, inside that window, so those rows
+straddle two commits and are superseded by the table above.
 
 Two readings follow from the table:
 
 - **The front end is the minority.** `vl check` runs parse, the full checker (including the
-  literal-binding fixpoint) and the lint, which `build` never runs. It takes 5.2 s of a build's
-  27.8 s. So monomorphization and emit are at least ~80% of a plain build.
-- **binaryen is about a quarter of an `-O3` build.** Host start-up and staging are noise.
+  literal-binding fixpoint) and the lint, which `build` never runs. It takes 4.2 s of a build's
+  25.0 s. So monomorphization and emit are at least ~80% of a plain build.
+- **binaryen is about 30% of an `-O3` build.** Host start-up and staging are noise.
 
-#3394's commit message measured the same file at **46.3 G** fuel and "~9 s" warm on its own
-box. sunpa merged a large branch at 12:49 that day, after #3394 measured, so the two numbers
-describe different programs. Nobody has re-measured them on one tree, and this doc cites the
-82.1 G figure only for the tree it measured.
+#3394's commit message measured `game.vl` at **46.3 G** fuel and "~9 s" warm on an earlier sunpa
+tree. sunpa merged a large branch at 12:49 that day, after #3394 measured, so the two numbers
+describe different programs. Nobody has measured both compilers on one sunpa commit.
 
-**`vl test`.** From ROADMAP `C-test-cache`, measured 2026-10-06: sunpa's `vl test src/` (3
+**`vl test`.** From ROADMAP `C-test-cache` and #3393, measured 2026-10-06 on a sunpa commit
+those sources do not record (so this row is not comparable with the table above): sunpa's `vl
+test src/` (3
 files, 36 tests) takes 25.7 s, of which `rules.test.vl`'s compile is 24.5 s and the tests
 themselves ~40 ms. #3393's pool (vl-test-design.md §"The compile pool") brought it down from
 33.4 s by compiling the three files at once. The two small files compile in 0.2–0.4 s beside
@@ -71,15 +79,15 @@ the large one, so the run is bounded by one compile of `game.vl`'s graph.
 ### The self-compile
 
 The L2 tripwire's baseline is **54.35 G** fuel for the candidate compiling `compiler/entry.vl`
-(`scripts/self-compile-baseline.json`, commit `93b93319e`). `compiler/*.vl` is 31 modules,
+(`scripts/self-compile-baseline.json`, commit `93b93319e`). `compiler/*.vl` is 35 modules,
 238,578 lines on 2026-10-06.
 
-Compare that with sunpa's 82.1 G over 35,596 lines:
+Compare that with sunpa's 83.7 G over 34,978 lines (`27e3417`):
 
 | graph | fuel per 1,000 lines |
 | --- | --- |
 | the compiler | ≈ 0.23 G |
-| sunpa | ≈ 2.3 G |
+| sunpa (`27e3417`) | ≈ 2.4 G |
 
 That is a 10× gap per line. Lines are a crude unit, but a 10× gap is not noise. It says sunpa's
 program shape still reaches super-linear paths that the self-compile does not, the same family
@@ -270,7 +278,8 @@ every header the compiler REPORTED reading, via `-MD`) plus the compiler binary 
 
 **Reusable.** Two ideas. Bazel: an action is hermetic only if its inputs are DECLARED and the
 sandbox prevents reading anything else; the key is then complete by construction. ccache direct
-mode: let the compiler report what it read, and key on that — the host's `CMD_READ_FILE` log
+mode: let the compiler report what it read, and key on that — the host's transcript of every
+message into the compiler instance
 is exactly this report for VL, and it cannot under-report because the brain has no other way
 to read a file.
 
@@ -411,8 +420,11 @@ struct type the emitter chose.
    `let` and true for record adoption.
 
 3. **Generic instance sets.**
-   - `export function pick(x) { x }` called as `pick(3)` emits 2 functions.
-   - Adding `pick("s")` emits 9.
+   - `export function pick(x) { x }` called as `pick(3)` emits 2 functions: one `pick`
+     instance and the start function.
+   - Adding `pick("s")` emits 9: a second `pick` instance, plus six string-runtime helpers
+     (`__str_hash__`, `__str_eq__`, `__str_concat__` and three UTF-8 helpers), read by
+     name off a `--names` build.
    - The instance set is the importers'.
 
 4. **A generic body's error is reported at the importer's call site.**
@@ -441,7 +453,7 @@ at most the 5 s that `vl check` costs. The build's other 22 s is only reachable 
 **Compiler-internal (no ruling needed):**
 - a stable module id in place of the discovery position;
 - a per-module arena, or a relocatable one;
-- a host read log;
+- a host-side transcript of every message into the compiler instance;
 - symbolic indices in the emitter;
 - every cache in §4.
 
@@ -453,7 +465,7 @@ at most the 5 s that `vl check` costs. The build's other 22 s is only reachable 
 
 ## 4. The design: one mechanism, three modes
 
-### 4.1 The mechanism: an action, its read log, and its key
+### 4.1 The mechanism: an action, its transcript, and its key
 
 An **action** is one invocation of the compiler that produces a result:
 
@@ -463,70 +475,148 @@ An **action** is one invocation of the compiler that produces a result:
 
 Its result is a pure function of its inputs, **provided the inputs are complete**. Every
 miscompile in the §2 survey is an input that was left out. So the key is built from what the
-action actually READ, recorded as it ran, not from a declared list.
+action actually RECEIVED, recorded as it ran, not from a declared list.
 
-**The read log is complete by construction for files.**
-- The guest has no filesystem. Every module reaches it through the host:
-  - `stage_program`'s fetch loop for `build` and `run`;
-  - `CMD_READ_FILE` for `check`, `fmt` and `test`;
-  - `read_std_module` for `std:`.
-- So the host records, per action, the ordered list of `(path as the guest asked for it,
-  resolved path, SHA-256 of the bytes served)`.
-- It also records each **miss**. A probe that found nothing is an input too: a file appearing
-  later at that path changes resolution.
-- This is ccache's direct mode, with the advantage that the compiler cannot read around the log.
+**The key is the whole host-to-guest transcript, not a list of inputs.**
 
-**The non-file inputs are a short list, and each one goes in the key.**
+The guest is deterministic and has no channel to the world except the host. So everything that
+can make two runs of one action differ arrives as a message the host sends into the instance.
+The host can record those messages exactly, at one layer: the wrapper through which it calls the
+compiler instance's exports. The recorded **transcript** is, in order:
+
+- **Every staging call**, with its arguments. Today that is:
+  - `stage_vl_root_and_cwd` (the VL root and the working directory, `main.rs:2812`);
+  - `checkEntryPathPush`/`Commit`;
+  - `cliArgReset`/`Push`/`Commit` (argv, including the host's synthetic `--color=` argument);
+  - `setEmitNames`, `setEmitSrcMap`, `setMemoryPages`, `setImportMemory`, `setSharedMemory`,
+    `setHeapWindow`, `setLowMemoryUnused`, `setRepShadow` and `setOneShot`;
+  - `modReset`, `modCommit`, `srcReset` and the source pushes.
+- **Every reply to a command.**
+  - `CMD_READ_FILE` and `read_std_module`: the path the guest asked for, the resolved path, and
+    the SHA-256 of the bytes served, or **absent**. A probe that found nothing is an input,
+    because a file appearing later at that path changes resolution.
+  - `CMD_LIST_DIR`: the listing, as committed.
+  - `CMD_WRITE_FILE`: the acknowledgement.
+  - `CMD_VALIDATE`: the verdict.
+  - Any later command.
+- **Nothing the host only reads back.** Calls such as `cliCmdDataAt`, `cliExitCode` and the
+  module readback carry host-chosen offsets, and their results are outputs.
+
+**Why the transcript is enough.**
+- The guest's next request is a function of every message it has received so far.
+- So if every host-to-guest message of a new run equals the recorded one, step by step, then
+  every guest request equals the recorded one too, and so does the output. The argument is
+  induction over the transcript.
+- This is ccache's direct mode, with the advantage that the compiler cannot read around the
+  log: it has no other door.
+
+**The lookup replays the transcript against the world, without a guest.**
+1. The host computes the staging calls exactly as it would make them. Staging must be factored
+   so that "compute" is separate from "call"; that is part of S1.
+2. It re-derives each recorded reply from the current filesystem: re-read and re-hash, re-list,
+   re-probe an absent path. A `(mtime, size)` match may skip re-hashing an unchanged file. The
+   content hash is the authority; the stat is only a shortcut.
+3. If every message matches, the result is served. **No compiler instance is created.**
+4. A mismatch at any step is a miss.
+
+**What is keyed beside the transcript.**
 
 | input | how it is keyed | why |
 | --- | --- | --- |
-| the compiler | SHA-256 of the seed bytes (the embedded seed's or `--compiler`'s) | the seed is the brain; `seed_content_key` (`main.rs:1696`) is FNV, fine for a sidecar name but not a cache key |
-| the host | its build id: commit plus a hash of the executable, computed once per process | the `-O` steps, staging and argv handling are host code |
-| flags | the exact argv the guest receives, plus every host flag that reaches an output (`-O*`, `--names`, `--source-map`, layout flags, `--stable-layout`, `--extern` values) | — |
-| environment | **every `VL_*` variable except a named inert list** (`VL_CACHE_*`, `VL_TEST_TRACE`, `VL_PROFILE*`, `VL_GC_STATS`, `VL_FUEL`), plus `BINARYEN_CORES` until it is measured inert | defaults to over-keying: a missing input is a lie, an extra one only a miss |
-| binaryen | the `wasm-opt` path, its `--version`, and a hash of the binary | `binaryen_tool` takes whatever is on `PATH` |
-| paths | the entry path as given, and the canonical working directory | `vl-src` rows and source maps carry file names |
-| std | covered by the read log: `read_std_module` serves bytes, and they are hashed | `$VL_STD` overrides become reads of different bytes |
+| the compiler | SHA-256 of the RESOLVED seed's bytes, whichever rung supplied it: `--compiler`, `$VL_COMPILER_WASM`, `./build/vl-compiler.wasm`, `<tree>/build/vl-compiler.wasm`, or the embedded seed (a hash baked at build time, beside `$VL_SEED_KEY`) | cli-design.md §"Where a `vl` binary finds std and its seed"; `seed_content_key` (`main.rs:1696`) is FNV, fine for a sidecar name but not a cache key |
+| the host | an embedded build id baked by `build.rs`: `VL_BUILD_COMMIT` (already baked) plus a hash of the host sources and `Cargo.lock`, so a dirty local build differs | the `-O` steps, staging and validation are host code. Not a SHA-256 of the 24 MB executable on every run. |
+| binaryen | every `BINARYEN_*` variable, and the resolved `wasm-opt`: its path, its `--version` and a hash of the binary, or **absent** when none was found (the build then differs: `binaryen_missing_note`) | `binaryen_tool` (`main.rs:5431`) takes `$VL_WASM_OPT` or whatever is on `PATH` |
+| colour | the resolved `color_ok()` decision (tty, `NO_COLOR`, `TERM`, `--color`) | on the pump paths it is already in the transcript as the synthetic `--color=` argument. On a path where the host renders diagnostics itself, the host keys its decision explicitly. Storing uncoloured text and styling it at replay is not an option, because the guest does the styling. |
+| `-o`, under `--source-map` only | the output path as given and resolved | the `.map` and its `sourceMappingURL` section name it |
+| environment | see the three classes below | — |
+
+**Environment variables fall into three classes.** Anything not named is keyed.
+
+- **Bypass: no lookup and no store.**
+  - The variables: `VL_FUEL`, `VL_PROFILE*`, `VL_GC_STATS`, `VL_TEST_TRACE`, and every
+    `*_DUMP` and `*_EXPLAIN` variable (`VL_INLINE_EXPLAIN`, …).
+  - They exist to observe a compile. A hit would silently skip the thing being measured, and a
+    store would key a result on an observation.
+- **Inert: invisible to every output.**
+  - The variables: `VL_CACHE_DIR`, `VL_CACHE_MAX_MB`, `VL_COMPILE_CACHE_MAX_MB`,
+    `VL_COMPILE_CACHE_TRACE` and `VL_NO_CACHE`.
+  - The last one controls only the separate Cranelift module cache.
+- **Keyed: every other `VL_*` variable and every `BINARYEN_*` variable,** for example
+  `VL_STD`, `VL_COMPILER_WASM`, `VL_SEED_STACK` and `VL_OPT_NO_FLAT`. Some are also
+  captured through the transcript or the resolved seed hash. Keying them twice costs only
+  misses.
+- The default is over-keying: a missing input is a lie, an extra one only a miss.
+
+**Names.** `VL_NO_CACHE`, `VL_CACHE_TRACE` and `VL_CACHE_MAX_MB` already belong to the
+Cranelift module cache (cli-design.md §"The user-module cache (host)"), so the compile cache
+takes its own:
+
+| variable | meaning |
+| --- | --- |
+| `VL_NO_COMPILE_CACHE=1` | no lookup and no store |
+| `VL_COMPILE_CACHE_TRACE=1` | one stderr line per lookup |
+| `VL_COMPILE_CACHE_MAX_MB` | the prune target |
+| `VL_COMPILE_CACHE_VERIFY` | see §4.2 |
+
+`VL_CACHE_DIR` is shared, because both caches live under one root.
 
 **Two-level lookup** (Go's action ID; ccache's manifest):
 
-- **manifest key** = `H(compiler, host, flags, env, binaryen when -O, entry path, cwd, action
-  kind)`.
-  - It names a small manifest file: the most recent few read logs seen under that key.
-- **result key** = `H(manifest key, the read log's (path, hash-or-absent) list)`.
+- **manifest key** = `H(action kind, seed hash, host build id, binaryen id when -O, keyed
+  environment, colour decision, -o under --source-map)`.
+  - It names a small manifest file: the most recent few transcripts recorded under that key.
+- **result key** = `H(manifest key, the transcript, with file contents replaced by their
+  hashes)`.
   - It names the stored result.
 
-**The lookup:**
-1. Read the manifest.
-2. For each recorded log, newest first, re-hash its files. Most runs use `(mtime, size)` to skip
-   hashing an unchanged file. The content hash is the authority; the stat is only a shortcut.
-3. If every file matches, load the result. **No compiler instance is created.**
-4. On a miss, run the action, then write the result and prepend its log to the manifest.
+**What a result holds, and what is re-run after a hit.**
+- A result holds:
+  - the guest's emitted bytes, or the `-O` chain's output for A2 (§4.6);
+  - the exact stdout and stderr text, already coloured as the transcript decided, with the
+    `wrote …` line excluded;
+  - the exit status.
+- After a hit, the host re-runs its **cheap, output-only steps** on the served bytes:
+  - writing the module to `-o`;
+  - the `--source-map` map and URL step;
+  - `--wat`, which is never cached. `wasm-dis` re-runs on the final bytes, so its identity
+    needs no key.
+- Results that are never stored:
+  - a compiler trap (exit 70);
+  - any action that read stdin;
+  - `-e`;
+  - every run under a bypass variable.
 
-**What a result holds.**
-- the output bytes (the module, or the `.map` beside it);
-- the exact stderr and stdout text the action printed (warnings, the `wrote …` line excluded);
-- the exit status.
+  Each of these is a defect to surface every time, an input the transcript does not see, or a
+  measurement.
 
-A replayed result is therefore indistinguishable from a fresh one. Results that are never
-stored:
-- a compiler trap (exit 70);
-- any action that read stdin;
-- `-e`.
-
-Each of these is either a defect to surface every time or an input the log does not see.
+**Which `vl test` compiles are actions.**
+- An action is a compile in a FRESH instance: a pooled worker in compile-one mode, or a `vl
+  build`/`run`/`check` one-shot.
+- A `--jobs 1` (or single-file) `vl test` compiles every file in one shared instance, so its
+  transcript is the whole run, not one file's. In S1 that path stores and looks up nothing.
+  Making it per-file means a fresh instance per file, which is a scheduling change, not a cache
+  change.
 
 ### 4.2 Correctness: how a cached result is shown equal to a fresh compile
 
 The claim is "a hit is byte-identical to a cold compile of the same inputs". Four gates hold it.
 Each says what it compares.
 
-1. **`VL_CACHE_VERIFY=1`.**
-   - On every hit, the action also runs cold and the two are compared byte for byte (bytes,
-     printed text, exit status).
-   - A mismatch is exit 70 with both keys and the first differing offset. The cached copy is
-     never served on a mismatch.
-   - Agents and CI turn it on. Users do not pay for it.
+1. **`VL_COMPILE_CACHE_VERIFY`.**
+   - When on, a hit also runs the action cold and compares the two byte for byte: bytes,
+     printed text and exit status.
+   - A mismatch is never served. It exits with **a code of its own** (proposed: 71, added to
+     cli-design.md's exit-code table when built), not 70. A mismatch is a cache defect, not a
+     compiler crash, and the two must be separable in a report. The message names both keys,
+     the first differing offset, and the first transcript step whose replay disagreed, if any.
+   - **The schedule (chosen here):**
+     - For Q2's trial week, agents and the CI cache job verify EVERY hit
+       (`VL_COMPILE_CACHE_VERIFY=1`).
+     - After that week they verify a deterministic 1 in 20 (`VL_COMPILE_CACHE_VERIFY=sample:20`,
+       selected by the result key's hash, so a sampled miss reproduces).
+     - Users verify nothing.
+   - So the agent win quoted in §5 is ~95% of the hit savings after the trial week, and zero
+     during it.
 2. **A cold-versus-hit test** (`tests/vl_compile_cache_test.ts`, new).
    - Population: a fixed, named sample of `tests/cases` modules that import (so the fetch loop
      runs), plus `tests/fixtures/vl-test-*`.
@@ -534,35 +624,55 @@ Each says what it compares.
      must `cmp`-equal.
    - The population and its count are printed. This is a check over N named programs, not a
      claim about all programs.
-3. **A mutation matrix**, in the same test.
-   - Each input kind is changed one at a time, and the next lookup must MISS:
-     - the entry;
-     - a dependency;
-     - a new file at a recorded-absent probe path;
-     - `$VL_STD`;
-     - the seed (`--compiler`);
-     - one flag of each class;
-     - one non-inert `VL_*` variable;
-     - `wasm-opt` (a wrapper script on `PATH`);
-     - the host id (a test-only salt).
-   - The control is a run that changes only an inert variable; it must HIT. Without it, a
-     matrix that always misses would pass.
-4. **The gates stay cache-free.** `gate.sh` and CI's compiler gates run with `VL_NO_CACHE=1`.
-   Otherwise a cache defect could hide a compiler regression, and a compiler regression could
-   be served from a cache. Only the cache's own test and the verify-mode agents exercise it.
+3. **A mutation matrix**, in the same test. Each input is changed one at a time, and the next
+   lookup must MISS:
+   - **Sources:** the entry; a dependency; a new file at a recorded-absent probe path; a file
+     added to a listed directory (`CMD_LIST_DIR`, through `vl test` discovery).
+   - **Locations:** the working directory, with relative entry paths; the entry's spelling
+     (`game.vl` against `./game.vl`); the std and dev-tree location (`$VL_STD`, and a binary
+     copied beside another dev tree).
+   - **The seed:** one row per seed rung (`--compiler`, `$VL_COMPILER_WASM`,
+     `./build/vl-compiler.wasm`, `<tree>/build/vl-compiler.wasm`, embedded).
+   - **Flags and output:** one flag of each class; `-o` under `--source-map`; the colour
+     decision (`--color=always` against `never`, and `NO_COLOR`).
+   - **Environment and tools:** one keyed `VL_*` variable; one `BINARYEN_*` variable;
+     `wasm-opt` swapped (a wrapper script on `PATH`) and removed (absent); the host build id
+     (a test-only salt).
+   - **Controls:**
+     - A run changing only an inert variable must HIT. Without it, a matrix that always misses
+       would pass.
+     - A run under each bypass variable must neither hit nor store (`VL_COMPILE_CACHE_TRACE`
+       reads `off`).
+4. **The compiler gates run with the compile cache off.**
+   - `gate.sh` and CI's compiler gates set `VL_NO_COMPILE_CACHE=1`. Otherwise a cache defect
+     could hide a compiler regression, and a compiler regression could be served from a cache.
+     Only the cache's own test and the verify-mode agents exercise it.
+   - The **Cranelift module cache is unchanged in the gates**: on, as it is today.
+     - Its key is the SHA-256 of the exact wasm bytes plus the engine tag.
+     - Every entry is an envelope checked before `Module::deserialize`.
+     - So it cannot serve a module for bytes the compiler did not just produce.
+     - The `VL_NO_CACHE` it answers to keeps its meaning.
 
-**The precondition is determinism.** A compile must be a pure function of its read log. The
+**The guard against a new, unrecorded input.**
+- The transcript is complete only while every host-to-guest channel goes through the recording
+  wrapper.
+- The cache test therefore enumerates every guest export the host calls and every `CMD_*` code
+  the guest can return. It fails on any that its table does not classify as one of: staging
+  (keyed), command reply (keyed), or readback (output). This is the shape of
+  `ladder-budget.py`'s failure on an unclassified kind.
+- A new `set*` flag, a new command, or a new staging call cannot join the host without someone
+  deciding whether it is an input.
+
+**The precondition is determinism.** A compile must be a pure function of its transcript. The
 evidence today is indirect:
 - the fixpoint;
 - the "byte-identical" claims of every perf PR;
 - the memo census.
 
-Two cheap, direct checks belong in gate 2:
-- the same build from two working directories that differ only in name, with relative entry
-  paths;
+Two cheap, direct checks belong in gate 2. Both inputs are KEYED regardless; the checks say
+whether that keying costs hits for nothing:
+- the same build from two working directories that differ only in name;
 - the same `-O3` build under `BINARYEN_CORES=1` and the default.
-
-If either differs, that input joins the key (and the second one leaves the inert list).
 
 ### 4.3 Memory and disk bounds
 
@@ -570,11 +680,12 @@ If either differs, that input joins the key (and the second one leaves the inert
   - Results live beside the existing `modules/` cache: `<cache dir>/compiles/`, same root,
     same 0700 ownership rule, same temp-file and rename writes.
   - They are pruned by the same least-recently-used policy under their own soft budget,
-    `VL_CACHE_COMPILES_MB`, default 512.
-  - For scale: sunpa's unoptimized module is 1.74 MB and its manifest a few KB, so the default
+    `VL_COMPILE_CACHE_MAX_MB`, default 512.
+  - For scale: sunpa's unoptimized module is 1.77 MB (`27e3417`) and its manifest a few KB, so
+    the default
     holds a few hundred builds of that size.
 - **In memory (the watch mode).**
-  - The last result per action and its read log; for sunpa, a few MB.
+  - The last result per action and its transcript; for sunpa, a few MB.
   - At most one warm compiler instance per pool worker.
   - Workers are released after an idle period, because each is budgeted at 1 GiB
     (`TEST_COMPILE_BUDGET`).
@@ -586,9 +697,9 @@ If either differs, that input joins the key (and the second one leaves the inert
 
 - **Lookups first.** The host resolves every queued file's lookup before it sizes the pool.
   Only misses take a worker, so a run where one file changed starts one instance, not three.
-- **One log per worker.** Each pooled worker services its own `CMD_READ_FILE`s, so its log is
-  per file already. A worker that falls back to serial (`--jobs 1`) logs per file too, because
-  the state machine runs file by file.
+- **One transcript per worker.** Each pooled worker is a fresh instance that services its own
+  commands, so its transcript is per file already. The serial `--jobs 1` path is not an action
+  in S1 (§4.1), because its one instance carries state from file to file.
 - **Same key in two processes** (two agents on one cache directory): both compile, and both
   write identical bytes by temp-file and rename. Last writer wins, and either copy is correct;
   verify mode would expose the case where they are not.
@@ -618,7 +729,7 @@ An `-O` build is two actions chained:
 | action | input | key |
 | --- | --- | --- |
 | A1 | source graph | → unoptimized bytes |
-| A2 | unoptimized bytes (with `vl-src` already stripped unless `--source-map`) + optimizing flags + host id + binaryen id | → final bytes |
+| A2 | unoptimized bytes (with `vl-src` already stripped unless `--source-map`) + optimizing flags + host build id + binaryen id (every `BINARYEN_*` variable; `wasm-opt` path, version and hash, or absent) + `-o` when `--source-map` is set | → final bytes |
 
 - A2's key carries no compiler identity: the bytes are the input. So A2 hits across compiler
   changes that do not move the emitted code, the same insight `incremental-build-design.md`
@@ -626,7 +737,7 @@ An `-O` build is two actions chained:
 - It also hits across source edits that change no emitted byte once `vl-src` is stripped, such
   as a comment or formatting edit that moves no line. Which edits qualify is measured by S2's
   savings gate, not assumed.
-- On sunpa that is the 10.6 s of host steps and `wasm-opt` in a 42.9 s `-O3` build.
+- On sunpa (`27e3417`) that is the 10.3 s of host steps and `wasm-opt` in a 32.3 s `-O3` build.
 - Cranelift is already the third link of the chain (`user_module`).
 
 ### 4.7 Mode 3: individual runs with a file cache
@@ -647,7 +758,7 @@ For sunpa:
 The pool already parallelizes. This mode adds, in order of value:
 
 - (a) **Lookups before instances** (§4.4), so a mostly-warm run costs no compiler memory.
-- (b) **Dedupe within a run.** Two queued actions with one manifest key and one read log
+- (b) **Dedupe within a run.** Two queued actions with one manifest key and one transcript
   compile once. This is rare for `vl test` (entries differ) and common for `vl check --batch`
   and gate harnesses.
 - (c) **A shared cache directory across processes**, which is what concurrent agents need.
@@ -659,7 +770,7 @@ per-file CPU and memory of the files that DO need compiling stays what the pool 
 ### 4.9 Mode 2: watching, and small deltas
 
 A resident host process (`--watch`, Q3) runs the same actions and keeps:
-- each action's read log and last result in memory;
+- each action's transcript and last result in memory;
 - the warm instances;
 - each instance's own token cache (`modCache*`, which a one-shot compile throws away).
 
@@ -678,11 +789,12 @@ sidesteps editors that save by rename. A notify-based watcher is a later swap be
 interface.
 
 **What watching does NOT give is speed on the action that changed.** Residency saves:
-- the instance start, 26 ms of `load_compiler`;
-- staging, 0.15 s;
-- re-lexing unchanged modules (a slice of the 5.2 s front end).
+- the instance start, 7 ms of `load_compiler`;
+- staging, 0.10 s;
+- re-lexing unchanged modules (a slice of the 4.2 s front end).
 
-All of that is against a 27.8 s compile. "Optimizing speed for small deltas" therefore has two
+All of that is against a 25.0 s compile (sunpa `27e3417`). "Optimizing speed for small deltas"
+therefore has two
 real levers, and neither is a cache of whole results:
 
 1. **Make the compile cheaper** (Stage 4). sunpa pays 10× the self-compile's fuel per line
@@ -704,12 +816,12 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
 | stage | what | effort | expected win | soundness gate | savings gate |
 | --- | --- | --- | --- | --- | --- |
 | **S0** | Phase marks: the guest reports parse, check, mono, emit and sections boundaries to `VL_PROFILE` (a fuel or clock stamp at each `emitProgram` pass-table step) | ½–1 | none directly; it turns §1's "≥ 80% emit" bound into a split, which decides S4 versus S6 | byte-identical output with marks on (marks are host-side reads) | it prints the split for sunpa and the self-compile |
-| **S1** | The whole-action file cache (§4.1–4.4, 4.7): host read log, two-level key, results with replayed text, `VL_CACHE_VERIFY`, `VL_NO_CACHE`, `VL_CACHE_TRACE`, pruning; for `test`, `build`, `run`, `check` | 4–6 | an unchanged `vl test src/` goes from 25.7 s to under ~1 s (estimate); editing a small test file costs that file's compile; agents re-gating an unchanged tree skip every repeated compile | gates 1–4 of §4.2 | `VL_CACHE_TRACE` hit and miss counts on sunpa's edit loop, and on one agent day's harness compiles |
-| **S2** | The `-O` chain cache (A2 in §4.6) | 1 | up to 10.6 s of sunpa's 42.9 s `-O3` when the emitted bytes did not move | the same verify mode; the mutation matrix gains "one emitted byte" and "one `-O` flag" | the hit rate over a week of sunpa's `-O3` builds |
+| **S1** | The whole-action file cache (§4.1–4.4, 4.7): host transcript, two-level key, results with replayed text, `VL_COMPILE_CACHE_VERIFY`, `VL_NO_COMPILE_CACHE`, `VL_COMPILE_CACHE_TRACE`, pruning; for `test`, `build`, `run`, `check` | 4–6 | an unchanged `vl test src/` goes from 25.7 s to under ~1 s (estimate); editing a small test file costs that file's compile; agents re-gating an unchanged tree skip repeated compiles: none during the trial week, when every hit is verified, and 19 in 20 after it | gates 1–4 of §4.2 | `VL_COMPILE_CACHE_TRACE` hit and miss counts on sunpa's edit loop, and on one agent day's harness compiles |
+| **S2** | The `-O` chain cache (A2 in §4.6) | 1 | up to 10.3 s of sunpa's 32.3 s `-O3` (`27e3417`) when the emitted bytes did not move | the same verify mode; the mutation matrix gains "one emitted byte" and "one `-O` flag" | the hit rate over a week of sunpa's `-O3` builds |
 | **S3** | `--watch` for `test`, `build`, `run` and `check` (§4.9), resident, polling, pool-backed | 3–5 | no per-action speed beyond S1; the loop becomes automatic, and unchanged files cost nothing | a watch session's report must equal a cold run's after each edit in a scripted edit sequence | wall time from save to report for the beast-edit case |
 | **S4** | Keep cutting compile cost on sunpa's shape (`C-compile-hotspots` and its successors) | ongoing | the only stage that speeds the compile whose input changed; headroom suggested by the 10× per-line gap | byte-identical output, which every perf PR already shows | fuel on a committed sunpa-shaped generator, beside `plumb-shape-cost.py` |
-| **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, Q1 ruled, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15, after Q1 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 5.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes | LSP latency on sunpa and on `compiler/entry.vl` |
-| **S6** | Per-function and per-instance emit reuse: the emitter writes bodies against symbolic indices (function, type, global, string, union tag) and a late pass assigns and patches them, inside the one module; cache each body keyed on its typed body and the interface hashes of what it references | months; high risk | the edited graph's compile scales with what changed: most of a 27.8 s build when one function body changes (estimate, pending S0) | cold-versus-incremental byte identity over the whole corpus and the self-compile, run continuously; the memo census's in-place-fill lesson says this is where staleness would hide | S0's split, before and after |
+| **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, Q1 ruled, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15, after Q1 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 4.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes | LSP latency on sunpa and on `compiler/entry.vl` |
+| **S6** | Per-function and per-instance emit reuse: the emitter writes bodies against symbolic indices (function, type, global, string, union tag) and a late pass assigns and patches them, inside the one module; cache each body keyed on its typed body and the interface hashes of what it references | months; high risk | the edited graph's compile scales with what changed: most of a 25.0 s build when one function body changes (estimate, pending S0) | cold-versus-incremental byte identity over the whole corpus and the self-compile, run continuously; the memo census's in-place-fill lesson says this is where staleness would hide | S0's split, before and after |
 | — | separate compilation and linking (plumb) | separate track | — | — | — |
 
 **Why this order.**
@@ -725,11 +837,17 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
 ### Risks
 
 - **An unlogged input.** This is the whole risk of S1, and the survey's every failure.
-  - Mitigations: the host is the only door to files; over-keying of the environment by
-    default; verify mode in agents and CI; the mutation matrix with its control.
-  - Residual exposure: a future host-to-guest channel added without joining the key. The cache
-    test should fail on a new `CMD_*` code it does not classify, the way `ladder-budget.py`
-    fails on a new kind.
+  - Mitigations:
+    - the key is the whole host-to-guest transcript, recorded at the one wrapper the host calls
+      the instance through;
+    - over-keying of the environment by default;
+    - verify mode, full during the trial week and sampled after it;
+    - the mutation matrix with its controls.
+  - Residual exposure: a future host-to-guest channel added without joining the transcript.
+    §4.2's guard fails on any guest export the host calls, and any `CMD_*` code, that its
+    table does not classify. It is the shape of `ladder-budget.py`'s failure on a new kind.
+  - Remaining hole: an input the host reads and acts on WITHOUT telling the guest. The host's
+    own `-O` steps are the example, which is why the host build id is keyed.
 - **Non-determinism we have not seen.** For example, a `Map` iteration order that depends on
   allocation, or binaryen threads. Verify mode is the detector. It turns this into a loud
   error instead of a stale serve.
@@ -749,7 +867,7 @@ Each question lists options with code and a recommendation. None is decided here
 
 **Q1. Should record adoption stop at a module boundary, as literal-binding inference does?**
 
-Today, as probed in §3.2:
+Today, as probed in §3.2, adoption under D3339's ruling (A) reaches across the import:
 
 ```vl
 // r.vl
@@ -764,7 +882,9 @@ take(pt)      // today: r.vl's `pt` becomes { x: i64, y: i64 } in this graph onl
 ```
 
 - **(A) Module-local, like an exported `let`.** An exported binding's record type is fixed by
-  its own module's uses. An importer's delivery to a wider record is an ordinary delivery:
+  its own module's uses. D3339's ruling (A), 2026-09-30 ("the binding adopts the record fully,
+  and every read sees it"), keeps holding inside the module and stops at its edge. An importer's
+  delivery to a wider record is an ordinary delivery:
   - the fresh-record rule does not apply, because `pt` is not fresh to the importer;
   - the existing-record rule then applies: refused, with a fix message naming the annotation.
 
@@ -789,7 +909,7 @@ take(pt)      // today: r.vl's `pt` becomes { x: i64, y: i64 } in this graph onl
 **Q2. Should the compile cache be on by default, and where should it live?**
 
 ```sh
-vl test src/             # (A) cached by default; VL_NO_CACHE=1 or --no-cache opts out
+vl test src/             # (A) cached by default; VL_NO_COMPILE_CACHE=1 or --no-cache opts out
 vl test src/ --cache     # (B) opt-in per run
 ```
 
