@@ -135,6 +135,12 @@ const CMD_TEST_RUN = 9     // run the pushed plan (in parallel); report each res
 // decide for itself: the emitter returning 0 is not the same claim, and the gap between
 // them is the check-clean-invalid-wasm class. The bytes are already in `rbyte*`.
 const CMD_VALIDATE = 10 // validate the module now in rbyte*; report engine verdict
+// `vl test`'s compile pool. Each file's compile is one compiler instance's whole state,
+// so compiling files concurrently needs more instances, and instances are the host's.
+// The brain names the files; each pool worker is a fresh instance running this same
+// state machine in compile-one mode (`cliTestPoolMode == 2`).
+const CMD_TEST_ENQUEUE = 11 // queue test file `cliCmdPath` for the compile pool
+const CMD_TEST_COMPILE = 12 // compile every queued file; commit each outcome in order
 
 // The state-machine states (cliState). `*_RECV` states resume after the host has
 // committed the result of the command the previous `cliNext` returned.
@@ -155,6 +161,8 @@ const ST_TEST_STASH = 13     // the host stashed the compiled test module
 const ST_TEST_COLLECT = 14   // the host reported every stashed file's registry
 const ST_TEST_RUN = 15       // the host reported every planned test's result
 const ST_CHECK_VALIDATE = 16 // the host validated this file's emitted module
+const ST_TEST_ENQUEUED = 17  // the host queued one file for the compile pool
+const ST_TEST_POOLED = 18    // the host committed every queued file's compile outcome
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -301,6 +309,10 @@ let cliFixDeclinedCol: i32[] = []
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
 let cliTestJobs = 0    // --jobs N (0 = let the host pick, one worker per core)
+// Staged by the host after argv: 0 = no compile pool (compile in this instance),
+// 1 = the host compiles queued files in parallel, 2 = this instance IS a pool worker.
+let cliTestPoolMode = 0
+let cliTestEnqIdx = 0 // the next cliFiles index to hand the pool
 // Per collected file (parallel to `cliFiles`): the compile error text, "" when the
 // file compiled. A file that fails to compile is one failing entry in the report and
 // does not stop the run.
@@ -503,6 +515,8 @@ export function cliArgReset() {
   cliDirWasDir = 0
   cliTestFilter = ""
   cliTestJobs = 0
+  cliTestPoolMode = 0
+  cliTestEnqIdx = 0
   cliTestFileErr = []
   cliTestStash = []
   cliTestStashOf = []
@@ -1647,6 +1661,38 @@ function cliTestProtocol() {
   "\nexport { vltCount, vltNameLen, vltNameAt, vltSkipped, vltRun, vltFailLen, vltFailAt } from \"std:test\"\n"
 }
 
+// Compile in the host's pool when it has one and two or more files can share it;
+// `--jobs 1` and a single file compile in this instance, one file at a time.
+function cliTestStart() {
+  if cliTestPoolMode == 1 && cliFiles.length >= 2 && cliTestJobs != 1 {
+    cliTestEnqIdx = 0
+    return cliTestEnqueueNext()
+  }
+  cliStartTestFile()
+}
+
+// Queue the next discovered file for the pool, or — all queued — ask the host to
+// compile them. Outcomes come back through `cliTestCompiledCommit`, in queue order.
+function cliTestEnqueueNext() {
+  if cliTestEnqIdx >= cliFiles.length {
+    cliState = ST_TEST_POOLED
+    return CMD_TEST_COMPILE
+  }
+  cliCmdPath = cliFiles[cliTestEnqIdx]
+  cliTestEnqIdx = cliTestEnqIdx + 1
+  cliState = ST_TEST_ENQUEUED
+  CMD_TEST_ENQUEUE
+}
+
+// A pool worker's end: exit 0 once the host holds its module, 1 with the file's report
+// entry in `cliCmdData` when it did not compile.
+function cliTestWorkerDone(code: i32, msg: string) {
+  cliCmdData = msg
+  cliExit = code
+  cliState = ST_DONE
+  CMD_DONE
+}
+
 // Begin the next test file, or — work-list exhausted — move on to collection.
 function cliStartTestFile() {
   if cliFileIdx >= cliFiles.length { return cliTestBeginCollect() }
@@ -1665,6 +1711,7 @@ function cliStartTestFile() {
 // Record why the current file produced no tests and move to the next one. The message
 // is the file's report entry; the run never stops for it.
 function cliTestFileFailed(msg: string) {
+  if cliTestPoolMode == 2 { return cliTestWorkerDone(1, msg) }
   cliTestFileErr[cliFileIdx] = msg
   cliFileIdx = cliFileIdx + 1
   cliStartTestFile()
@@ -1878,6 +1925,27 @@ export function cliTestPlanTest(k: i32): i32 { cliTestLocal[cliPlanEntry[k]] }
 export function cliTestJobsWanted(): i32 { cliTestJobs }
 
 // ── the `vl test` protocol: what the host commits ────────────────────────────
+// Before the first `cliNext`, after argv: 1 = this host has a compile pool, 2 = this
+// instance is one of its workers (compile the one target, stash or fail, stop).
+export function cliTestPoolStage(mode: i32) {
+  cliTestPoolMode = mode
+  0
+}
+// One pooled file's compile outcome, in queue order: 0 = the host stashed its module,
+// 1 = it did not compile, with the file's report entry on the shared `cliResult`.
+export function cliTestCompiledCommit(status: i32) {
+  const f = cliTestFileErr.length
+  const msg = cpAccTake(cliResultAcc)
+  if f >= cliFiles.length { return 0 }
+  if status == 0 {
+    cliTestFileErr.push("")
+    cliTestStash.push(cliFiles[f])
+    cliTestStashOf.push(f)
+  } else {
+    cliTestFileErr.push(msg)
+  }
+  0
+}
 // A test name, one code point at a time (the `cliDirNamePush` idiom).
 export function cliTestNamePush(c: i32) {
   cliTestNameAcc.push(c)
@@ -2008,7 +2076,7 @@ function cliWalkStep() {
 // reformats.
 function cliStartWork() {
   if cliCmd == 1 { return cliStartFmtFile() }
-  if cliCmd == 2 { return cliStartTestFile() }
+  if cliCmd == 2 { return cliTestStart() }
   cliStartFile()
 }
 // Begin checking cliFiles[cliFileIdx] (read its source), or — work-list done —
@@ -2721,7 +2789,7 @@ export function cliNext() {
     if cliFileFound == 0 {
       // A named target that does not exist is a usage error; a file that vanished
       // between the walk and the read is one failing entry.
-      if cliDirMode == 0 {
+      if cliDirMode == 0 && cliTestPoolMode != 2 {
         cliOut = ["test: cannot read " + cliFile]
         cliExit = 2
         return cliBeginPrint()
@@ -2741,9 +2809,12 @@ export function cliNext() {
   }
   if st == ST_CHECK_VALIDATE { return cliCheckCurFileRest() }
   if st == ST_TEST_STASH {
+    if cliTestPoolMode == 2 { return cliTestWorkerDone(0, "") }
     cliFileIdx = cliFileIdx + 1
     return cliStartTestFile()
   }
+  if st == ST_TEST_ENQUEUED { return cliTestEnqueueNext() }
+  if st == ST_TEST_POOLED { return cliTestBeginCollect() }
   if st == ST_TEST_COLLECT { return cliTestPlanRun() }
   if st == ST_TEST_RUN { return cliTestReport() }
   if st == ST_PRINT { return cliEmitNextOut() }

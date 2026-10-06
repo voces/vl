@@ -3129,6 +3129,54 @@ seed from current `compiler/*.vl` in ~40s.*
   and it is the convention `vl seed` already set. `docs/internals/cli-design.md`
   §"The output channel is RULED" carries the decision and the alternative.
   REMAINING: surfacing diagnostics with spans once the spans rungs land.
+- ⬜ **C-test-shared-compile. `vl test` compiles a module shared by several test files once per
+  run (sunpa SP-041, ask 2) — NEEDS AN OWNER RULING.** Ask 1 shipped (each file compiles in its own
+  compiler instance, in parallel; `docs/internals/vl-test-design.md` §"The compile pool"), so N
+  files importing `game.vl` now cost one compile of wall time but still N of CPU and memory.
+  Compiling the shared module ONCE has two routes, and both change something:
+  (a) **separate compilation** — compile `game.vl` to a module of its own and link the test files
+  against it. Preserves every per-file semantic, but VL compiles a whole program at a time
+  (monomorphization, return and literal-binding inference, record layout all read every use), so
+  this is plumb's separate-compilation track, not a runner change.
+  (b) **one module per run** — compile every test file into one program, instantiate it once per
+  file. Observable differences: whole-program inference sees all test files' uses at once (a
+  `let` in `game.vl` retyped by one file's stores would be retyped for every file); every file's
+  TOP LEVEL runs in every instance unless the compiler learns to gate a module's top level per
+  instance (registration, prints, writes to shared module state); one file's type error fails the
+  shared compile, so attributing it needs a per-file fallback compile; a test file importing
+  another test file already merges registries (vl-test-design.md known gap 6).
+  **Recommendation: neither now.** (b) trades per-file isolation — which
+  `tests/fixtures/vl-test-shared/` now pins — for CPU a user only pays once ask 1's wall-clock win
+  is in; (a) is the real fix and belongs to separate compilation. The cheaper lever for sunpa is
+  the compile itself (`C-compile-hotspots`) plus a content-hashed cache (`C-test-cache`).
+- ⬜ **C-test-cache. A content-hashed compile cache across `vl test` runs (sunpa SP-041, ask 3).**
+  Key a test file's emitted module on the bytes of every source in its import graph, the seed's
+  content key and the flags that reach the compile, and reuse it when nothing changed, so an
+  edit to one test file does not rebuild `game.vl` for the others. The host already keys the
+  seed's `.cwasm` sidecar by content (`load_compiler_module`); the new part is that the graph is
+  only known after the fetch loop, so the brain has to report it (or the host records every
+  `CMD_READ_FILE` a worker serviced). Measured 2026-10-06: sunpa's `vl test src/` is 25.7 s, of
+  which `rules.test.vl`'s compile is 24.5 s and the tests themselves ~40 ms.
+- ⬜ **C-compile-hotspots. Two whole-table scans dominate large compiles (sunpa SP-041, ask 4).**
+  Guest profile of `vl build src/game.vl` (sunpa, no `-O`, 17.4 s, 2026-10-06, named seed):
+  `nameIsStructDecl` (`emit_classify.vl`) is **41.9% of self time** — it walks all of `P.nodes`
+  per call, reached from `sigKeyOfTy` → `structIndexOfTypeName` → `shapeRowScanK` →
+  `shapeFieldTypeCompatK`; `crwAddName` (`typecheck.vl`) is 14.0% — a comma-joined string set
+  grown by `indexOf`, quadratic in names; `fieldClosureFeOfRecvRaw` is 8.7%. Separately, an
+  ENTRY module with N exports builds in O(N²): SP-041's `big.vl` (20,000 exported functions)
+  builds in 10.4 s as the entry but 2.1 s when a one-line importer is the entry; 5k/10k/20k
+  exports read 0.89 / 3.26 / 10.4 s, and 69% of the 10k build is `emitExportSection`
+  (`exportSlotOfTarget`, `exportPublicNames` → `strListHas`, linear list scans). Each is a
+  memo or a name→index map; the scaling guards (`tests/vl_scaling_shape_test.ts`) want an
+  `exports` axis beside them.
+- ⬜ **C-test-std-friction. Two `std:test` asks from sunpa SP-041 — std API, so std-api-reviewer
+  and owner first.** (1) `toBeTrue`/`toBeFalse` take no message, so a check that wants to print
+  the numbers behind a failure is spelled `if !ok { fail("x \{x}") }` (sunpa `src/testflat.vl`
+  `check`). Options: an optional message parameter on the boolean matchers, or a
+  `expect(ok, "context")` form that every matcher's failure carries. (2) the report has no
+  per-test time, only `VL_TEST_TRACE`'s per-file stamps. vl-test-design.md known gap 3 left
+  timings out so the report stays byte-deterministic; an opt-in flag (`--durations`, as pytest)
+  keeps the default report assertable.
 - ⬜ **C-extern-read. `vl run` refuses an unsupplied extern global only when the program READS
   it.** `vl run --extern NAME=VALUE` (plumb PL-046, [D2636](docs/internals/inventory/D2636.md))
   supplies a value, and without one `vl run` refuses every DECLARED extern global, including one

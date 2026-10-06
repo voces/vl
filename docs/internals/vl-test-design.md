@@ -83,13 +83,18 @@ Three commands, all additions to the existing pump (`compiler/cli.vl` ↔
 | 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (read off the driver's own `rbyteLen`/`rbyteAt`/`rbyteStore` channel, exactly as `vl build` does) |
 | 8 | `CMD_TEST_COLLECT` | load + instantiate every stashed module across the pool, read each registry back, commit them in stash order |
 | 9 | `CMD_TEST_RUN` | read the plan, run it across the pool, commit each outcome |
+| 11 | `CMD_TEST_ENQUEUE` | queue one discovered file for the compile pool |
+| 12 | `CMD_TEST_COMPILE` | compile every queued file in a fresh compiler instance each, across the pool; commit each outcome (stashed, or the file's report entry) in queue order |
 
 The brain's phases:
 
 1. **Discover** — the shared walk with a `*.test.vl` predicate (`cliEndsTestVl`).
-2. **Compile**, one file at a time: read → resolve imports → `compileSrc()` →
-   `CMD_TEST_STASH`. A nonzero rc records the rendered diagnostics as that file's
-   one report entry and the loop moves on.
+2. **Compile** — with two or more files and a host that staged a pool, every file
+   is queued (`CMD_TEST_ENQUEUE`) and compiled concurrently (`CMD_TEST_COMPILE`,
+   §"The compile pool"). Otherwise, and always under `--jobs 1`, one file at a time
+   in this instance: read → resolve imports → `compileSrc()` → `CMD_TEST_STASH`.
+   Either way a nonzero rc records the rendered diagnostics as that file's one
+   report entry and the run moves on.
 3. **Collect** — `CMD_TEST_COLLECT`. Instantiating a test module RUNS its start
    function, which is the registration pass; the host then reads
    `vltCount`/`vltNameLen`/`vltNameAt`/`vltSkipped` and commits the registry.
@@ -175,6 +180,69 @@ Building a second engine for the run phase fails at instantiation with
 `incompatible import type for imports::__print_i32__` — the import types are
 structurally identical but engine-local, so the error names the print ABI and is
 nothing to do with it. `test_engine()` builds one lazily and shares it.
+
+### The compile pool
+
+A compile is the whole state of one compiler instance — the arena, the checker's
+tables, the emitter's — so compiling files concurrently needs more instances, and
+instances are the host's. Until SP-041 (sunpa, 2026-10) the brain compiled every
+file itself, serially, while only collection and the runs were parallel: `vl test`
+over N files that import one large module paid N full compiles end to end.
+
+**Shape.** The brain still owns discovery, the order and the report. It queues each
+file, then asks for the compile; the host starts up to `test_compile_workers()`
+fresh instances of the SAME compiled seed module on the SAME engine (no second
+sidecar load), and drives each through this state machine in COMPILE-ONE mode
+(`cliTestPoolStage(2)`): the worker reads its file and imports, compiles, and ends
+with either `CMD_TEST_STASH` (exit 0) or its file's report entry in `cliCmdData`
+(exit 1). The host stashes the modules and commits the outcomes in queue order, so
+stash order, registry attribution and the report are exactly the serial path's —
+`tests/vl_test_runner_test.ts` asserts the report is byte-identical to `--jobs 1`'s
+over the mixed fixture set, and that a module two test files import is FRESH in
+each. A compiler failure (a trap inside a worker) fails the run as the serial
+compile would, naming the first such file in queue order.
+
+**Worker count.** `--jobs`, else one per core, no more than the file count, and no
+more than half the memory headroom divided by `TEST_COMPILE_BUDGET` (1 GiB): each
+worker is a whole compiler heap, and the wide box is not always the empty one. The
+headroom (`memory_headroom`) is the smaller of `/proc/meminfo`'s `MemAvailable` and
+the cgroup v2 headroom, `memory.max` minus `memory.current`, when `memory.max` is not
+`max` — so a container's limit counts as much as the machine's. Where neither can be
+read (off Linux), the pool is capped at 4 workers (`TEST_COMPILE_UNMEASURED_CAP`).
+
+**Worker threads.** Each worker thread is spawned with `MAIN_THREAD_STACK`, because
+the seed engine's wasm stack is sized for the thread `main` runs on. If the OS refuses
+that reservation no smaller thread is started in its place — a 2 MiB native stack
+under a 512 MiB wasm stack aborts the process where a deep compile should trap. The
+workers that did start drain the queue, and with none started the calling thread
+compiles every file. The runner test pins both halves: a 3,000-deep expression
+compiles in a pool worker, and under `VL_SEED_STACK=default` it traps into the same
+exit-70 banner, naming the same file, pooled and serial.
+`--jobs 1` and a one-file run keep the single-instance path, so neither pays an
+extra instance. `$VL_FUEL` and `$VL_PROFILE_GUEST` also keep it, because both read
+the one pump store and a pool would move the compile out of their sight.
+
+**Measured** 2026-10-06 (24 cores, load ~4, `VL_TEST_TRACE=1`, warm `.cwasm`):
+
+| run | before | after | peak RSS before → after |
+| --- | --- | --- | --- |
+| SP-041 reproducer, `vl test a.test.vl` | 3.65 s | 3.65 s | 581 MB |
+| SP-041 reproducer, `vl test .` (2 files) | 7.16 s | 3.79 s | 592 MB → 1.10 GB |
+| sunpa `vl test src/` (3 files, 36 tests) | 33.4 s | 25.7 s | 589 MB → 572 MB |
+
+sunpa's run is now bounded by its one large file: `rules.test.vl` alone is 25.1 s,
+and the other two compile in 0.2–0.4 s beside it. Splitting that file no longer
+multiplies the wall clock, only CPU and memory. Each pooled compile of the
+reproducer adds about 0.5 GB of peak RSS.
+
+**Not done here, and why.** Compiling a module SHARED by several test files once
+per run needs either separate compilation (VL compiles a whole program at a time)
+or one module for all of a run's test files, and the second changes what a test
+file can observe: whole-program inference would see every test file's uses at
+once, and another file's top level would run in each instance unless the
+compiler learns to gate it. That is an owner decision (ROADMAP Track C,
+`C-test-shared-compile`); the shared-state fixture above is the property any
+answer has to keep.
 
 ## The `std:test` tail-type rule
 
@@ -268,10 +336,12 @@ walked), and that files are really SCHEDULED concurrently.
 ### The scheduling witness
 
 The parallelism claim is gated on the schedule itself, not on a wall-clock proxy.
-Under `$VL_TEST_TRACE=1` the host stamps each file's collect/run interval
-(`test_trace_stamp`), and the test asserts both sides: `--jobs 4` runs all four
-files concurrently (peak overlap 4) and `--jobs 1` runs them one at a time (peak
-overlap 1).
+Under `$VL_TEST_TRACE=1` the host stamps each file's compile/collect/run interval
+(`test_trace_stamp`; `compile` only for a pooled compile), and the test asserts both
+sides: `--jobs 4` runs all four files concurrently (peak overlap 4) and `--jobs 1`
+runs them one at a time (peak overlap 1). The compile stamps are graded the same
+way, at peak overlap of at least 2, since the memory cap may honestly allow fewer
+than four compilers on a small runner.
 
 This replaced a ratio assertion — "`--jobs 4` finishes in under 70% of `--jobs
 1`'s wall clock" — on 2026-08-16. Wall clock measures scheduling **times the free

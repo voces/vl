@@ -9,6 +9,8 @@
 //   * a green run exits 0, any failure exits 1, a usage error exits 2;
 //   * files really are SCHEDULED in parallel (their stamped run intervals
 //     overlap under `--jobs 4` and are disjoint under `--jobs 1`);
+//   * files are COMPILED in parallel too, each in a compiler instance of its own,
+//     and the report is byte-identical to the one-instance `--jobs 1` compile;
 //   * a failed `expect` reports WHERE IT WAS WRITTEN (track-caller), and that
 //     position is the `expect` line rather than the `it` line — the claim the
 //     editor's failure anchor is built on.
@@ -22,6 +24,7 @@
 //
 // @test-timing native
 // @test-timing instrument name~"files run in PARALLEL"
+// @test-timing instrument name~"files COMPILE in parallel"
 
 // The extension's own report parser and anchor resolver, so the editor payoff is
 // graded against the RUNNER'S REAL OUTPUT rather than a retyped sample. Pure —
@@ -764,6 +767,180 @@ Deno.test({
         `--jobs 1 ran ${serPeak} files at once, want 1 — serial scheduling is ` +
           `not honoured:\n${ser.err}`,
       );
+    }
+  },
+});
+
+const SHARED = `${ROOT}/tests/fixtures/vl-test-shared`;
+
+/** A report with the scheduling trace taken out — what a user reads. */
+const reportOnly = (stderr: string): string =>
+  stderr.split("\n").filter((l) => !l.startsWith("vl-test-trace ")).join("\n");
+
+Deno.test({
+  name:
+    "vl-test: files COMPILE in parallel — each in its own compiler, stamped per file",
+  ignore: !ENABLED,
+  fn: async () => {
+    // SP-041: the compiles used to run one after another inside the one compiler
+    // instance, so N files importing one large module paid N full compiles in
+    // series. The pool gives each file a fresh compiler instance; `--jobs 1` keeps
+    // the single-instance path. Read off the schedule, as the run-phase test does.
+    const par = await runTest(SLOW, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
+    const ser = await runTest(SLOW, ["--jobs", "1"], { VL_TEST_TRACE: "1" });
+    if (par.code !== 0 || ser.code !== 0) {
+      throw new Error(`the slow fixtures must all pass:\n${par.err}\n${ser.err}`);
+    }
+    const parCompiles = traceIntervals(par.err, "compile");
+    if (parCompiles.length !== 4) {
+      throw new Error(
+        `--jobs 4 stamped ${parCompiles.length} compile intervals, want 4 — ` +
+          `did the brain stop handing files to the compile pool?\n${par.err}`,
+      );
+    }
+    // At least two at once, not four: the host also caps the pool by available
+    // memory, and a small CI runner may honestly hold fewer than four compilers.
+    const peak = peakConcurrency(parCompiles);
+    if (peak < 2) {
+      throw new Error(
+        `--jobs 4 compiled at most ${peak} file(s) at once — the compiles ` +
+          `are serial:\n${par.err}`,
+      );
+    }
+    // `--jobs 1` compiles in the brain's own instance, which stamps nothing.
+    const serCompiles = traceIntervals(ser.err, "compile");
+    if (serCompiles.length !== 0) {
+      throw new Error(
+        `--jobs 1 used the compile pool (${serCompiles.length} stamps); it must ` +
+          `compile every file in one instance:\n${ser.err}`,
+      );
+    }
+    if (reportOnly(par.err) !== reportOnly(ser.err)) {
+      throw new Error(
+        `the pooled and serial reports differ:\n--- jobs 4\n${par.err}\n--- jobs 1\n${ser.err}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-test: a pooled compile reports EXACTLY what the serial compile does — order, failures, exit",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The mixed set: a file that does not compile, a failing one, a trapping one,
+    // skips. Every line of the report — file order, test order, the compile
+    // failure's diagnostic and its position — must not depend on which path
+    // compiled the files.
+    const par = await runTest(FIXTURES, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
+    const ser = await runTest(FIXTURES, ["--jobs", "1"]);
+    if (par.code !== 1 || ser.code !== 1) {
+      throw new Error(`want exit 1 from both, got ${par.code} and ${ser.code}`);
+    }
+    if (traceIntervals(par.err, "compile").length !== 6) {
+      throw new Error(`--jobs 4 did not pool all six files:\n${par.err}`);
+    }
+    if (reportOnly(par.err) !== ser.err) {
+      throw new Error(
+        `the pooled and serial reports differ:\n--- jobs 4\n${par.err}\n--- jobs 1\n${ser.err}`,
+      );
+    }
+    // The order itself, pinned: files sorted, the compile failure in its place.
+    const files = lines(ser.err).filter((l) => l.endsWith(".test.vl"));
+    const want = ["broken", "fail", "generic", "pass", "trap", "union"].map(
+      (n) => `${FIXTURES}/${n}.test.vl`,
+    );
+    if (JSON.stringify(files) !== JSON.stringify(want)) {
+      throw new Error(
+        `file order: want ${want.join(", ")}\ngot ${files.join(", ")}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-test: a pooled compile runs on the seed's stack — deep nesting compiles, and overflows like the serial path",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A pool worker runs the compiler seed, whose engine sizes its wasm stack for
+    // the thread `main` runs on. Too small a native stack under it would ABORT the
+    // process where the wasm should trap, so: on the normal stack an 8,000-deep
+    // expression (enough to abort a default-stack worker) compiles in a worker, and under `VL_SEED_STACK=default` (the
+    // small-stack fallback) pooled and serial both trap into the same banner.
+    const dir = await Deno.makeTempDir({ prefix: "vl_test_deep_" });
+    try {
+      const n = 8000;
+      await Deno.writeTextFile(
+        `${dir}/deep.test.vl`,
+        'import { expect, it, toEqual } from "std:test"\n' +
+          `const x = ${"(".repeat(n)}1${")".repeat(n)}\n` +
+          'it("deep", () => { expect(x).toEqual(1) })\n',
+      );
+      await Deno.writeTextFile(
+        `${dir}/ok.test.vl`,
+        'import { expect, it, toEqual } from "std:test"\n' +
+          'it("ok", () => { expect(1).toEqual(1) })\n',
+      );
+      const big = await runTest(dir, ["--jobs", "2"], { VL_TEST_TRACE: "1" });
+      if (big.code !== 0 || traceIntervals(big.err, "compile").length !== 2) {
+        throw new Error(
+          `the deep file should compile in a pool worker, got ${big.code}:\n${big.err}`,
+        );
+      }
+      const small = { VL_SEED_STACK: "default" };
+      const par = await runTest(dir, ["--jobs", "2"], small);
+      const ser = await runTest(dir, ["--jobs", "1"], small);
+      const head = (s: string) => s.split("\n")[0];
+      for (const [jobs, r] of [["2", par], ["1", ser]] as const) {
+        if (r.code !== 70 || !head(r.err).includes("deep.test.vl")) {
+          throw new Error(
+            `--jobs ${jobs}: want exit 70 and a banner naming deep.test.vl, ` +
+              `got ${r.code}:\n${r.err}`,
+          );
+        }
+      }
+      if (head(par.err) !== head(ser.err)) {
+        throw new Error(
+          `pooled and serial banners differ:\n${head(par.err)}\n${head(ser.err)}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-test: two files importing one stateful module each see it FRESH, pooled or serial",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Per-file isolation of a SHARED module's top-level state: each test file is
+    // its own program, so `counter.vl`'s `count` starts at 0 for each. A later
+    // change that compiles a shared module once per run has to keep this green.
+    for (const jobs of ["4", "1"]) {
+      const r = await runTest(SHARED, ["--jobs", jobs]);
+      if (r.code !== 0) {
+        throw new Error(
+          `--jobs ${jobs}: want exit 0, got ${r.code}:\n${r.err}`,
+        );
+      }
+      const got = lines(r.err).map((l) => l.trim());
+      const want = [
+        `${SHARED}/a.test.vl`,
+        "ok   a sees the shared module fresh",
+        "ok   a keeps its own state across its tests",
+        `${SHARED}/b.test.vl`,
+        "ok   b sees the shared module fresh",
+        "ok   b keeps its own state across its tests",
+        "2 files · 4 passed · 0 failed",
+      ];
+      if (JSON.stringify(got) !== JSON.stringify(want)) {
+        throw new Error(
+          `--jobs ${jobs}: want\n${want.join("\n")}\ngot\n${got.join("\n")}`,
+        );
+      }
     }
   },
 });
