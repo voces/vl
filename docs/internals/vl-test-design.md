@@ -203,8 +203,21 @@ each. A compiler failure (a trap inside a worker) fails the run as the serial
 compile would, naming the first such file in queue order.
 
 **Worker count.** `--jobs`, else one per core, no more than the file count, and no
-more than half of `MemAvailable` divided by `TEST_COMPILE_BUDGET` (1 GiB): each
-worker is a whole compiler heap, and the wide box is not always the empty one.
+more than half the memory headroom divided by `TEST_COMPILE_BUDGET` (1 GiB): each
+worker is a whole compiler heap, and the wide box is not always the empty one. The
+headroom (`memory_headroom`) is the smaller of `/proc/meminfo`'s `MemAvailable` and
+the cgroup v2 headroom, `memory.max` minus `memory.current`, when `memory.max` is not
+`max` — so a container's limit counts as much as the machine's. Where neither can be
+read (off Linux), the pool is capped at 4 workers (`TEST_COMPILE_UNMEASURED_CAP`).
+
+**Worker threads.** Each worker thread is spawned with `MAIN_THREAD_STACK`, because
+the seed engine's wasm stack is sized for the thread `main` runs on. If the OS refuses
+that reservation no smaller thread is started in its place — a 2 MiB native stack
+under a 512 MiB wasm stack aborts the process where a deep compile should trap. The
+workers that did start drain the queue, and with none started the calling thread
+compiles every file. The runner test pins both halves: a 3,000-deep expression
+compiles in a pool worker, and under `VL_SEED_STACK=default` it traps into the same
+exit-70 banner, naming the same file, pooled and serial.
 `--jobs 1` and a one-file run keep the single-instance path, so neither pays an
 extra instance. `$VL_FUEL` and `$VL_PROFILE_GUEST` also keep it, because both read
 the one pump store and a pool would move the compile out of their sight.

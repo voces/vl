@@ -7113,25 +7113,31 @@ fn parallel_map_stack<T: Send>(
     let slots_ref = &slots;
     let job_ref = &job;
     let cursor_ref = &cursor;
+    let work = move || loop {
+        let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
+        if i >= n {
+            break;
+        }
+        let value = job_ref(i);
+        *slots_ref[i].lock().unwrap() = Some(value);
+    };
     std::thread::scope(|scope| {
+        let mut started = 0;
         for _ in 0..workers {
-            let work = move || loop {
-                let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
-                if i >= n {
-                    break;
-                }
-                let value = job_ref(i);
-                *slots_ref[i].lock().unwrap() = Some(value);
-            };
             let mut builder = std::thread::Builder::new();
             if let Some(bytes) = stack {
                 builder = builder.stack_size(bytes);
             }
-            // A refused reservation runs the work on a default-sized thread instead,
-            // as `main` itself falls back.
-            if builder.spawn_scoped(scope, work).is_err() {
-                scope.spawn(work);
+            // A refused reservation starts no thread at all. A smaller native stack
+            // under an engine whose wasm stack was sized for `stack` would abort the
+            // process where the wasm should trap, so the workers that did start drain
+            // the cursor, and with none started the calling thread runs the work.
+            if builder.spawn_scoped(scope, work).is_ok() {
+                started += 1;
             }
+        }
+        if started == 0 {
+            work();
         }
     });
     slots
@@ -7433,24 +7439,45 @@ fn test_worker_count(requested: i32) -> usize {
 /// "The compile pool"), so a smaller graph only leaves the cap conservative.
 const TEST_COMPILE_BUDGET: u64 = 1 << 30;
 
+/// The pool's worker cap when no memory reading is available (off Linux, or neither
+/// file readable): a guess has to be one a small machine survives.
+const TEST_COMPILE_UNMEASURED_CAP: usize = 4;
+
 /// How many compiler instances `vl test`'s compile pool runs at once: the run's worker
-/// count, no more than there are files, and no more than half the memory available
-/// now can hold at `TEST_COMPILE_BUDGET` each, so a wide box with little free memory
-/// compiles fewer files at a time rather than tripping the OOM killer. Never below 1.
+/// count, no more than there are files, and no more than half of `memory_headroom()`
+/// holds at `TEST_COMPILE_BUDGET` each — or `TEST_COMPILE_UNMEASURED_CAP` when there is
+/// no reading. Never below 1.
 fn test_compile_workers(requested: i32, files: usize) -> usize {
-    let mut workers = test_worker_count(requested).min(files);
-    if let Some(avail) = mem_available_bytes() {
-        workers = workers.min((avail / 2 / TEST_COMPILE_BUDGET) as usize);
-    }
-    workers.max(1)
+    let workers = test_worker_count(requested).min(files);
+    let cap = match memory_headroom() {
+        Some(bytes) => (bytes / 2 / TEST_COMPILE_BUDGET) as usize,
+        None => TEST_COMPILE_UNMEASURED_CAP,
+    };
+    workers.min(cap).max(1)
 }
 
-/// `MemAvailable` from `/proc/meminfo`, in bytes; `None` where there is no such file.
-fn mem_available_bytes() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+/// The memory this process may still take, in bytes: the smaller of the system's
+/// `MemAvailable` and its cgroup v2 headroom (`memory.max` minus `memory.current`, when
+/// `memory.max` is not `max`), so a container's limit counts as much as the machine's.
+/// `None` when neither can be read.
+fn memory_headroom() -> Option<u64> {
+    let available = (|| {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    })();
+    let cgroup = (|| {
+        let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+        let max: u64 = max.trim().parse().ok()?; // "max" means no limit
+        let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok()?;
+        let current: u64 = current.trim().parse().ok()?;
+        Some(max.saturating_sub(current))
+    })();
+    match (available, cgroup) {
+        (Some(a), Some(c)) => Some(a.min(c)),
+        (a, c) => a.or(c),
+    }
 }
 
 /// Whether this pump may stage a compile pool. Not under `$VL_FUEL` or a guest profile:

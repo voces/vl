@@ -860,6 +860,59 @@ Deno.test({
 
 Deno.test({
   name:
+    "vl-test: a pooled compile runs on the seed's stack — deep nesting compiles, and overflows like the serial path",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A pool worker runs the compiler seed, whose engine sizes its wasm stack for
+    // the thread `main` runs on. Too small a native stack under it would ABORT the
+    // process where the wasm should trap, so: on the normal stack a 3,000-deep
+    // expression compiles in a worker, and under `VL_SEED_STACK=default` (the
+    // small-stack fallback) pooled and serial both trap into the same banner.
+    const dir = await Deno.makeTempDir({ prefix: "vl_test_deep_" });
+    try {
+      const n = 3000;
+      await Deno.writeTextFile(
+        `${dir}/deep.test.vl`,
+        'import { expect, it, toEqual } from "std:test"\n' +
+          `const x = ${"(".repeat(n)}1${")".repeat(n)}\n` +
+          'it("deep", () => { expect(x).toEqual(1) })\n',
+      );
+      await Deno.writeTextFile(
+        `${dir}/ok.test.vl`,
+        'import { expect, it, toEqual } from "std:test"\n' +
+          'it("ok", () => { expect(1).toEqual(1) })\n',
+      );
+      const big = await runTest(dir, ["--jobs", "2"], { VL_TEST_TRACE: "1" });
+      if (big.code !== 0 || traceIntervals(big.err, "compile").length !== 2) {
+        throw new Error(
+          `the deep file should compile in a pool worker, got ${big.code}:\n${big.err}`,
+        );
+      }
+      const small = { VL_SEED_STACK: "default" };
+      const par = await runTest(dir, ["--jobs", "2"], small);
+      const ser = await runTest(dir, ["--jobs", "1"], small);
+      const head = (s: string) => s.split("\n")[0];
+      for (const [jobs, r] of [["2", par], ["1", ser]] as const) {
+        if (r.code !== 70 || !head(r.err).includes("deep.test.vl")) {
+          throw new Error(
+            `--jobs ${jobs}: want exit 70 and a banner naming deep.test.vl, ` +
+              `got ${r.code}:\n${r.err}`,
+          );
+        }
+      }
+      if (head(par.err) !== head(ser.err)) {
+        throw new Error(
+          `pooled and serial banners differ:\n${head(par.err)}\n${head(ser.err)}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
     "vl-test: two files importing one stateful module each see it FRESH, pooled or serial",
   ignore: !ENABLED,
   fn: async () => {
