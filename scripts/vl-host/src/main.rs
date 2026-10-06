@@ -544,6 +544,12 @@ program verbatim — the only way to pass one that starts with `-`.
                       `(p + C) as% i32` fold C into the access's offset when
                       C plus that offset is below <bytes>. An address whose add
                       would wrap past 4 GiB then traps instead of reading low memory
+  {c}--stable-layout{r}     With -O/-O3: keep the memory layout of every record an
+                      export or import can reach, through fields, list elements
+                      and union boxes, for a module another wasm module links
+                      against or reads field by field. By default only a record
+                      a signature names directly keeps its layout; one nested
+                      inside it may be stored inline in its parent
   {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces, and
                       function names in profilers instead of `wasm-function[N]`);
                       kept through -O/-O3, at the cost of the section's bytes
@@ -5506,6 +5512,21 @@ fn low_memory_unused_flag(args: &[String], optimizing: bool) -> Option<i64> {
     seen
 }
 
+/// `vl build -O --stable-layout`: keep the layout of every record a boundary-crossing value
+/// reaches, not only of the records an export's or import's signature names, for a unit that
+/// another wasm module links against or reads field by field (inline-records-design.md §6 Q2).
+/// Only an optimizing rung changes a layout, and without one the flag says so.
+fn stable_layout_flag(args: &[String], optimizing: bool) -> bool {
+    let given = args.iter().skip(2).any(|a| a == "--stable-layout");
+    if given && !optimizing {
+        usage_exit(
+            "`--stable-layout` keeps record layouts that only `-O` / `-O3` would change, and \
+             neither is given — add one, or drop the flag",
+        );
+    }
+    given
+}
+
 /// The lowest heap base outside a `--low-memory-unused=<bytes>` promise: `bytes` rounded up to
 /// the multiple of 8 every base has to be.
 fn heap_base_above(bytes: i64) -> i64 {
@@ -9278,6 +9299,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let names = args.iter().any(|a| a == "--names");
     let optimizing = args.iter().any(|a| a == "-O" || a == "-O3");
     let low_memory = low_memory_unused_flag(args, optimizing);
+    let stable_layout = stable_layout_flag(args, optimizing);
     // `--source-map` needs the `vl-src` rows the map is made from, so it asks the seed for the
     // `--names` sections and drops whichever the build did not ask for (D3561).
     let source_map = args.iter().any(|a| a == "--source-map");
@@ -9443,7 +9465,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // stores its fields in the parent, so a stored producer's result is then only read
         // field by field and the multi-value step below gives it a twin.
         if std::env::var_os("VL_OPT_NO_INLINE").is_none_or(|v| v.is_empty()) {
-            if let Some((il, moved)) = phase!("opt.inline_step", inline::inline_step(&bytes)) {
+            if let Some((il, moved)) = phase!("opt.inline_step", inline::inline_step(&bytes, stable_layout)) {
                 bytes = il;
                 std::fs::write(&sink, &bytes)?;
                 if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {

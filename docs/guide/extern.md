@@ -161,3 +161,18 @@ string, a list, a struct) is not published to the host at all.
 
 The design and its rationale: `docs/internals/extern-design.md`, and `DECISIONS.md` §"Globals
 cross the wasm boundary".
+
+## Exported records and `--stable-layout`
+
+An entry-module `export function` may take or return a record, a list or a union. A JS host
+receives each as an opaque object: it can keep it, compare it with `===` and hand it back, but it
+cannot read its fields. So `-O` and `-O3` keep the memory layout and the identity of every record
+type an export's or import's signature names directly (`export function origin(): V3`, or `P |
+null`), and may store a record nested inside one (a field of an exported record, an element of
+an exported list, a union member's payload) inline in its parent, which changes its parent's
+layout.
+
+A unit that another wasm module links against and reads field by field needs every reachable
+layout to stay as declared. Build it with `vl build -O --stable-layout` (or `-O3`): then no
+record any export or import can reach, through fields, list elements and union boxes, changes its
+layout. The flag needs `-O` or `-O3`, and a build without either changes no layout anyway.

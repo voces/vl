@@ -91,8 +91,9 @@ seed built from master `d2b09774b`, unless marked *design*.
    Inlining also changes a parent `P`'s layout, so `P`, and anything reaching `P`, must
    not cross a wasm-to-wasm boundary either: separate compilation and linking (plumb)
    would otherwise see two layouts for one type.
-   *Recommended:* the layout of a record that crosses is unspecified, which would drop
-   this condition (§6, owner question 2).
+   *Ruled (§6, owner question 2):* only a type a boundary signature names keeps its layout
+   and identity. Reach through fields, elements and union boxes counts only under
+   `vl build --stable-layout`.
 
 **These conditions are sufficient, not necessary.** Condition 3 could relax to exact-`T` slots
 (a `V2` slot that provably never holds a `V3`). Condition 2 is vacuous until A15 lands.
@@ -289,8 +290,21 @@ a number in about an hour of sunpa's time.
    `export function mk(): V3`: (A) layout and identity unspecified, `V3` may inline; (B)
    specified, any `V3` reaching a boundary stays boxed.
    (A) lets a host keep its own handle table if it needs identity; (B) disqualifies the type
-   and everything reaching it, as the default does. **Recommendation:** (A). The stated
-   default until a ruling is (B).
+   and everything reaching it.
+   **Ruled 2026-10-05: (A) is the default, and (C), the conservative rule, is a build flag.**
+   * Only a record type a boundary signature names directly keeps its layout and identity
+     (`export function origin(): V3`, `P | null`, an exported global or table of it). A
+     record nested inside one (a field of an exported record, an element of an exported
+     list, a union box's payload) may be inlined: JS holds the outer object and cannot read
+     its fields.
+   * A value handed to an `any`/`eq`/`struct` place is still refused while such a reference
+     crosses a signature, because JS may then hold that very object.
+   * `vl build -O --stable-layout` (or `-O3`) selects the conservative rule, everything a
+     crossing value reaches keeps its layout, for a unit linked wasm to wasm or read field by
+     field. The separate-compilation design should make linked-unit builds pass it.
+   * The `$VL_INLINE_BOUNDARY=direct` measurement knob is retired; the flag replaces it.
+   * sunpa's `game.vl` (`ce4e1c3`): `V3` allocations over the feet check fall from 106,981
+     to 90,113, output identical; under `--stable-layout` the module is master's.
 3. **Once A15 builds `===`, is `===` on a value-qualifying (or declared-value) type a check
    error,** rather than silently disabling the optimisation program-wide?
    `a === b` on a `V3`: (A) check error naming the type; (B) allowed, and `V3` loses inline

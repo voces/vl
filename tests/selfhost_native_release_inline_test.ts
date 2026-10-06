@@ -12,8 +12,12 @@
 //   width-subtyped parents). Also built with `$VL_INLINE_REBOX` (inline even where a read
 //   re-boxes) and with `$VL_INLINE_SPILL` too (take every store apart at the store), and in
 //   those the step must have inlined something, so the re-box and spill paths are graded;
-// * `kept`: a disqualifier (a write, a nullable field, a subtype, an export) leaves the step
-//   nothing to do, even with `$VL_INLINE_REBOX`.
+// * `kept`: a disqualifier (a write, a nullable field, a subtype, an export's signature naming
+//   the record) leaves the step nothing to do, even with `$VL_INLINE_REBOX`;
+// * `stable`: the record reaches an export only through a field, an element or a union box,
+//   which JS cannot read: inlined by default (with `$VL_INLINE_REBOX`, so a whole read does not
+//   decide it), and kept like `kept` under `--stable-layout` (owner ruling 2026-10-05,
+//   inline-records-design.md §6 Q2).
 //
 // @test-timing opt
 import {
@@ -26,7 +30,7 @@ import {
 } from "./support/nativeRelease.ts";
 
 const DIR = `${ROOT}/tests/fixtures/opt-inline`;
-type Want = "melts" | "grid" | "kept";
+type Want = "melts" | "grid" | "kept" | "stable";
 const FIXTURES: [string, Want][] = [
   ["stored-fields", "melts"],
   ["proof-rows", "grid"],
@@ -35,12 +39,13 @@ const FIXTURES: [string, Want][] = [
   ["kept-nullable", "kept"],
   ["kept-subtype", "kept"],
   ["kept-export", "kept"],
-  ["kept-reached-export", "kept"],
-  ["kept-export-union-parent", "kept"],
-  ["kept-export-union-record", "kept"],
-  ["kept-export-union-list", "kept"],
-  ["kept-export-union-holder", "kept"],
-  ["kept-export-union-map", "kept"],
+  ["kept-export-nullable", "kept"],
+  ["stable-reached-export", "stable"],
+  ["stable-export-union-parent", "stable"],
+  ["stable-export-union-record", "stable"],
+  ["stable-export-union-list", "stable"],
+  ["stable-export-union-holder", "stable"],
+  ["stable-export-union-map", "stable"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -107,16 +112,17 @@ for (const [fx, want] of FIXTURES) {
               } rc=${r0.code}`,
           );
         }
-        // One build of a rung under `env`: graded by output; answers its allocation count and
-        // whether the step changed the module.
+        // One build of a rung under `env` and `flags`: graded by output; answers its allocation
+        // count and whether the step changed the module.
         const built = async (
           rung: string,
           tag: string,
           env: Record<string, string>,
+          flags: string[] = [],
         ) => {
           const out = `${tmp}/m${rung}-${tag}.wasm`;
           const dump = `${tmp}/step${rung}-${tag}.wasm`;
-          const b = await vl(["build", src, rung, "-o", out], {
+          const b = await vl(["build", src, rung, ...flags, "-o", out], {
             VL_OPT_INLINE_DUMP: dump,
             ...env,
           });
@@ -175,9 +181,27 @@ for (const [fx, want] of FIXTURES) {
           }
           if (want === "kept") {
             const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
-            if (step.inlined || forced.inlined) {
+            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
+            if (step.inlined || forced.inlined || stable.inlined) {
               throw new Error(
                 `${fx} ${rung}: the step inlined a field a disqualifier should keep boxed`,
+              );
+            }
+          }
+          if (want === "stable") {
+            const open = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+            if (!open.inlined) {
+              throw new Error(
+                `${fx} ${rung}: the step inlined no field, though no signature names the record`,
+              );
+            }
+            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
+            const forced = await built(rung, "stable-rebox", {
+              VL_INLINE_REBOX: "1",
+            }, ["--stable-layout"]);
+            if (stable.inlined || forced.inlined) {
+              throw new Error(
+                `${fx} ${rung}: under --stable-layout the step inlined a field an export reaches`,
               );
             }
           }
@@ -212,15 +236,23 @@ Deno.test({
           /refused: a value of it can cross the module boundary \(export /,
         ],
         [
-          "kept-reached-export",
+          "kept-export-nullable",
+          /refused: a value of it can cross the module boundary \(export origin\)/,
+        ],
+        [
+          "stable-reached-export --stable-layout",
           /refused: a value of it can cross the module boundary \(it is stored as an abstract reference .* export either\)/,
         ],
         [
-          "kept-export-union-parent",
+          "stable-export-union-record",
+          /type \d+ field \d+ \(type \d+\): inlined/,
+        ],
+        [
+          "stable-export-union-parent --stable-layout",
           /can cross the module boundary \(it is stored as an abstract reference/,
         ],
         [
-          "kept-export-union-record",
+          "stable-export-union-record --stable-layout",
           /refused: a value of it can cross the module boundary \(it is stored as an abstract reference/,
         ],
         [
@@ -228,11 +260,13 @@ Deno.test({
           /not inlined: \d+ of its \d+ read\(s\) take the whole record/,
         ],
       ];
-      for (const [fx, want] of cases) {
+      for (const [spec, want] of cases) {
+        const [fx, ...flags] = spec.split(" ");
         const b = await vl([
           "build",
           `${DIR}/${fx}.vl`,
           "-O",
+          ...flags,
           "-o",
           `${tmp}/${fx}.wasm`,
         ], {
@@ -240,7 +274,7 @@ Deno.test({
         });
         if (b.code !== 0 || !want.test(b.err)) {
           throw new Error(
-            `${fx}: VL_INLINE_EXPLAIN\n  want: ${want}\n  got:  ${b.err.trim()}`,
+            `${spec}: VL_INLINE_EXPLAIN\n  want: ${want}\n  got:  ${b.err.trim()}`,
           );
         }
       }

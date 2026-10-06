@@ -692,6 +692,9 @@ while Phase 2 proceeds; Phase 3 is purely additive tooling.
 - **Separate compilation + wasm-linking / component model** — adds a cross-module
   ABI + linker, fights monomorphization (forces re-instantiation or boxing), and
   the H-M2 goal is *one* module anyway. Rejected for whole-program compile.
+  If linked units ever arrive, each unit builds with `vl build --stable-layout`:
+  `-O` otherwise stores a record nested in an exported value inline, so two units
+  would see two layouts for one type (inline-records-design.md §6 Q2).
 - **A parallel module-only readonly-export mechanism** — rejected; encapsulated /
   readonly exports are an application of **A9 Readable/Writable** at the boundary
   (⬜ unstarted), not a new feature invented here.
