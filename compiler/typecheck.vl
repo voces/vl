@@ -22224,6 +22224,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   const noNo: i32[] = []
   const noNode: i32[] = []
   const who = e.identName
+  pinBmCstrElems(bNames, bTys, srcExpr, decl)
   validateBinCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
   validatePrintCstrs(bNames, bTys, srcExpr, decl, who)
   validateNestCstrs(bNames, bTys, srcExpr, decl, who)
@@ -42483,8 +42484,9 @@ function validateLetCstrs(
   0
 }
 
-// A deferred `.push(null)` whose receiver pins to an open list: the list's element takes the
-// open `_ | null` a bare-null write mints at a direct spelling, so the caller's writes fill it.
+// A deferred `.push(v)` whose receiver pins to an open list: the list's element takes what the
+// direct spelling's first push gives it (`v`'s widened type, or the open `_ | null` a bare null
+// mints), so the argument's row carries the element the body decided (D2218).
 function cnhPinBmElem(
   want: i32,
   bNames: string[],
@@ -42500,12 +42502,42 @@ function cnhPinBmElem(
   const a = T.tys[arr]
   if a is TyArray {
     if a.aElem < 0 {
-      // An open hole pushed adopts that hole, as the direct spelling's pin does.
       let pin = got
-      if isNullTy(got) { pin = cnhPinTy(TY_NULL, at, -1, false, false) }
+      if !nhOpen(got) { pin = cnhPinTy(got, at, -1, false, false) }
       a.aElem = pin
-      tyMutEpoch = tyMutEpoch + 1 // a hole body's bare-null push pinned the argument in place
+      tyMutEpoch = tyMutEpoch + 1 // a hole body's push pinned the argument in place
+    } else if !nhOpen(got) {
+      cnhFill(a.aElem, got)
     }
+  }
+  0
+}
+
+// The pins a body's deferred `.push` arguments owe the open lists this call binds, in the
+// body's own order, ahead of every validation that reads those elements.
+function pinBmCstrElems(bNames: string[], bTys: i32[], ix: i32, calleeFn: i32) {
+  const n = bmCstrGot.length
+  let ci = 0
+  while ci < n {
+    if cstrOwnedBy(bmCstrFn[ci], calleeFn) {
+      const bg = substTyDeep(bmCstrGot[ci], bNames, bTys)
+      if isNullTy(bg) || nhOpen(bg) || (bg >= 0 && !tyHasTyVar(bg)) {
+        cnhPinBmElem(bmCstrWant[ci], bNames, bTys, ix, bg)
+      }
+    }
+    ci = ci + 1
+  }
+  // …and an element store (`a[i] = v`), the index-write pin's deferred twin (D1471).
+  const nl = letCstrGot.length
+  let li = 0
+  while li < nl {
+    if cstrOwnedBy(letCstrFn[li], calleeFn) {
+      const lg = substTyDeep(letCstrGot[li], bNames, bTys)
+      if isNullTy(lg) || nhOpen(lg) || (lg >= 0 && !tyHasTyVar(lg)) {
+        cnhPinBmElem(letCstrWant[li], bNames, bTys, ix, lg)
+      }
+    }
+    li = li + 1
   }
   0
 }
@@ -42526,9 +42558,6 @@ function validateBmCstrs(
   while ci < nOrigB {
     if cstrOwnedBy(bmCstrFn[ci], calleeFn) {
       const bg = substTyDeep(bmCstrGot[ci], bNames, bTys)
-      if isNullTy(bg) || nhOpen(bg) {
-        cnhPinBmElem(bmCstrWant[ci], bNames, bTys, ix, bg)
-      }
       const bw = substTyDeep(bmCstrWant[ci], bNames, bTys)
       let bc = bmCstrCtx[ci]
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
@@ -46719,6 +46748,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         const uhArgNo: i32[] = []
         const uhArgNode: i32[] = []
         holeArgOrigins(params, args, 1, uhNames, uhArgNo, uhArgNode)
+        pinBmCstrElems(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL)
         validateBinCstrs(
           bNames,
           bTys,
@@ -48372,6 +48402,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const dhArgNo: i32[] = []
     const dhArgNode: i32[] = []
     holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
+    pinBmCstrElems(vNames, vTys, ix, cstrCallee)
     validateBinCstrs(
       vNames,
       vTys,
