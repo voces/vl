@@ -138,6 +138,49 @@ const LIFTED: [string, string, string[]][] = [
     ].join("\n"),
     ["host", "outer"],
   ],
+  [
+    "a lambda assigning a captured let (D3664)",
+    [
+      "export function count(n: i32): i32 {",
+      "  let k = 0",
+      "  const bump = (d: i32) => { k += d }",
+      "  for i in 0 until n { bump(i) }",
+      "  k",
+      "}",
+    ].join("\n"),
+    ["count", "bump"],
+  ],
+  [
+    "two captured lets one lambda assigns, read between calls (D3664)",
+    [
+      "export function host(p: i32): i32 {",
+      "  let a = 0",
+      "  let b: f64 = 1.0",
+      "  const go = (d: i32): i32 => {",
+      "    a += d",
+      "    b = b * 2.0",
+      "    a",
+      "  }",
+      "  go(p) + a + go(1) + (b as! i32)",
+      "}",
+    ].join("\n"),
+    ["host", "go"],
+  ],
+  [
+    "a recursive block-local function assigning a captured let (D3664)",
+    [
+      "export function host(n: i32): i32 {",
+      "  let k = 0",
+      "  function go(m: i32): i32 {",
+      "    if m == 0 { return k }",
+      "    k += 1",
+      "    return go(m - 1)",
+      "  }",
+      "  go(n)",
+      "}",
+    ].join("\n"),
+    ["host", "go"],
+  ],
 ];
 
 for (const [name, src, fns] of LIFTED) {
@@ -180,6 +223,113 @@ Deno.test({
       throw new Error(
         `want the escaping closure built and called through the table, got ${allocs} struct.new and ${indirect} call_indirect\n${host}`,
       );
+    }
+  },
+});
+
+// The write-back keeps a self call in tail position a tail call, so deep recursion that
+// assigns a capture does not grow the stack (D3664).
+Deno.test({
+  name: "closure lift shape: a self tail call that assigns a capture stays return_call",
+  ignore: !ENABLED,
+  fn: async () => {
+    const all = await disassemble([
+      "export function host(n: i32): i32 {",
+      "  let k = 0",
+      "  function go(m: i32): i32 {",
+      "    if m == 0 { return k }",
+      "    k += 1",
+      "    return go(m - 1)",
+      "  }",
+      "  go(n)",
+      "}",
+    ].join("\n"));
+    const go = bodyOf(all, "go");
+    if (count(go, "return_call") !== 1) {
+      throw new Error(`go: want one return_call\n${go}`);
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "closure lift shape: a captured let an escaping closure shares keeps its cell (control)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const all = await disassemble([
+      "function apply(g: () => i32): i32 { g() }",
+      "export function host(): i32 {",
+      "  let k = 0",
+      "  const bump = () => { k += 1 }",
+      "  const get = (): i32 => k",
+      "  bump()",
+      "  apply(get)",
+      "}",
+    ].join("\n"));
+    const host = bodyOf(all, "host");
+    if (count(host, "struct.new") === 0) {
+      throw new Error(`want the shared cell built in host\n${host}`);
+    }
+  },
+});
+
+// The output fixtures, built as written: `lift-written-capture.vl`'s hosts make no cell (each
+// made one before D3664), and `lift-cloned-host-keeps-cell.vl`'s hosts, which a later pass
+// clones, still do, since their capturers cannot be relied on to lift.
+const fixture = (name: string): string =>
+  Deno.readTextFileSync(`${ROOT}/tests/cases/closures/${name}`);
+
+Deno.test({
+  name: "closure lift shape: lift-written-capture.vl's hosts build no cell (D3664)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const all = await disassemble(fixture("lift-written-capture.vl"));
+    for (
+      const fn of [
+        "count",
+        "writeThenRead",
+        "callerWrites",
+        "inArguments",
+        "recurse",
+        "tailDeep",
+        "twoWriters",
+        "multiWritten",
+        "reenter",
+        "widths",
+      ]
+    ) {
+      const body = bodyOf(all, fn);
+      if (count(body, "struct.new") !== 0) {
+        throw new Error(`${fn}: want 0 struct.new\n${body}`);
+      }
+    }
+    if (count(bodyOf(all, "escapes"), "struct.new") === 0) {
+      throw new Error("escapes: want the shared cell its escaping closure needs");
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "closure lift shape: a host a later pass clones keeps its cell (control)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const all = await disassemble(fixture("lift-cloned-host-keeps-cell.vl"));
+    for (const fn of ["optFn", "recFn"]) {
+      if (count(bodyOf(all, fn), "struct.new") === 0) {
+        throw new Error(`${fn}: want the cell kept`);
+      }
+    }
+    // The un-annotated hosts are instances, one per pin, named after their origin.
+    for (const prefix of ["unann", "unannLocalFn", "mixed"]) {
+      const own = new RegExp(`^${prefix}([$@]|$)`);
+      const hits = [...all.keys()].filter((n) => own.test(n));
+      if (hits.length === 0) throw new Error(`no function ${prefix}…`);
+      for (const h of hits) {
+        if (count(all.get(h)!, "struct.new") === 0) {
+          throw new Error(`${h}: want the cell kept\n${all.get(h)}`);
+        }
+      }
     }
   },
 });

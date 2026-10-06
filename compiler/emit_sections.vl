@@ -193,6 +193,8 @@ import {
   caSeenVariants,
   capCacheOn,
   capMemoArmed,
+  cloLiftWriteCapAt,
+  cloLiftWriteCount,
   cloSigKeys,
   cloSigRepFn,
   cloSigTwin,
@@ -363,6 +365,7 @@ import {
   il64TypeIdx,
   lTypeIdx,
   lUsed,
+  liftWbEnd,
   localBlockLet,
   localByNode,
   localDeclIx,
@@ -539,12 +542,14 @@ import {
   fbLoop,
   fbMapSlotOf,
   fbMapTagOfI64,
+  fbPushRetExtra,
   fbRefAsNonNull,
   fbRefCast,
   fbRefNull,
   fbRefNullForKind,
   fbRefNullNone,
   fbRefNullStruct,
+  fbRetExtra,
   fbReturn,
   fbSelect,
   fbStrBack,
@@ -1148,6 +1153,14 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     uBoxNewEnd = -1
     tailCallEnd = -1
     tailCallIdx = -1
+    liftWbEnd = -1
+    // Every exit of a lifted function that assigns captures hands them back (D3664).
+    fbRetExtra = []
+    let rxi = 0
+    while rxi < cloLiftWriteCount(fnPos) {
+      fbRetExtra.push(1 + cloLiftWriteCapAt(fnPos, rxi))
+      rxi = rxi + 1
+    }
     // Lays out every scratch frame after the params + declared locals via the FuncBuilder cursor,
     // which sets `pushScratchBase`/`refPushScratchBase`/`refPushBaseBySlot`/`strPushScratchBase`/
     // `strScratchBase`/`mapScratchBase` from one running offset in frame order. Scratch frames
@@ -1234,6 +1247,8 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
       fbLocalGet(unionSinkBase + 1)
       fbStructNew(uBoxIdx)
     }
+    fbPushRetExtra()
+    fbRetExtra = []
     fbEnd() // 0x0b end
     wTarget(endPrev)
     // Stream the size-prefixed code entry onto `out` (this entry's own buffer, which
@@ -6904,6 +6919,9 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
   if fn is FuncDecl {
     const params = fn.fnParams
     const nParams = params.length
+    // The captures a lifted function assigns are results after its own (D3664).
+    let liftCaps: string[] = []
+    let nRetCaps = 0
     wU8(96) // 0x60 func
     // When a function value exists module-wide, EVERY function carries a hidden
     // leading `structref env` param (local 0). The declared params follow at 1..p.
@@ -6911,8 +6929,10 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
     // it. Gated on `fnValUsed` so a no-lambda module's functypes are unchanged.
     if withEnv {
       // A lifted function's captures follow the env, in capture order (SP-037).
-      let liftCaps: string[] = []
-      if cloLifted(ti) { liftCaps = captureNamesOf(ti) }
+      if cloLifted(ti) {
+        liftCaps = captureNamesOf(ti)
+        nRetCaps = cloLiftWriteCount(ti)
+      }
       wULEB(nParams + 1 + liftCaps.length) // param count incl. the env param
       wU8(107)                             // env param: structref (0x6b)
       let lci = 0
@@ -6932,15 +6952,15 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
       pi = pi + 1
     }
     if fRetVoid[ti] == 1 {
-      wU8(0) // 0 results — a VOID function (`()->()`)
+      wU8(nRetCaps) // no result of its own — a VOID function (`()->()`)
     } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
       // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
-      wU8(1)
+      wU8(1 + nRetCaps)
       fbValtype("closure", -1)
     } else if fn.fnRet < 0 {
       // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
       // stored `fRetKind` slot the annotation path fills). i32 when nothing matched.
-      wU8(1) // 1 result
+      wU8(1 + nRetCaps) // 1 result
       // The inferred result kind from the single shared mapping (`inferredRetKindCore`), so this
       // site and `cloRetValKind` cannot drift on a scalar/list/ref kind. The slot follows the kind:
       // struct index for a struct/nullable-struct ref, the element wrapper for a ref list, the map
@@ -6972,7 +6992,7 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
       }
       fbValtype(infKind, infSlot)
     } else {
-      wU8(1) // 1 result
+      wU8(1 + nRetCaps) // 1 result
       // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
       // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
       // result valtype selects THIS function's element wrapper, not slot 0's.
@@ -7017,6 +7037,12 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
         retSlot = nulVariantIndexOf(fn.fnRet)
       }
       fbValtype(vtKindOfType(fn.fnRet), retSlot)
+    }
+    let rci = 0
+    while rci < nRetCaps {
+      const rcName = liftCaps[cloLiftWriteCapAt(ti, rci)]
+      fbValtype(captureValKind(ti, rcName), captureValStructIdx(ti, rcName))
+      rci = rci + 1
     }
   }
 }

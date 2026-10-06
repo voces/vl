@@ -75,3 +75,4 @@ D2335-D2338  plumb-tail-units  2026-09-24
 D2407-D2410  lane-N  2026-09-25  narrowing invalidation (D2400-D2405 closes; D2407, D2408 filed)
 D2475-D2478  lane-S2  2026-09-25  unreachable self-functions (D2475-D2477 filed and closed)
 D3246-D3248  lane-NB  2026-09-29  literal-binding inference, owner ruling (B), plumb PL-054/PL-056 (D3246 filed and closed)
+D3728-D3735  lane-L2  2026-10-05  sunpa SP-037 step 2, D3664 (D3728-D3734 filed)

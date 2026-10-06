@@ -195,6 +195,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { emitFailAt } from "./emit_bytes"
+import { cloUnboxPick } from "./emit_lift"
 import { assignTags, registerInlineUnion } from "./emit_collect"
 import {
   bodyRebuiltFrom,
@@ -3359,13 +3360,13 @@ function cboxNoInitMsg(nm: string) {
 
 // The frame's bindings `cboxByRef` says a closure must share, from `dlets`. A `let` with no
 // init takes a zero value to box; one whose type has none cannot be boxed and is refused,
-// since capturing it by value would be silently wrong.
-function cboxPick(dlets: string[], alam: string[]) {
+// since capturing it by value would be silently wrong. A name in `unboxed` stays a local.
+function cboxPick(dlets: string[], alam: string[], unboxed: string[]) {
   const boxed: string[] = []
   let di = 0
   while di < dlets.length {
     const nm = dlets[di]
-    if cboxByRef(nm, alam) {
+    if cboxByRef(nm, alam) && !strListHas(unboxed, nm) {
       let ok = true
       const lx = cboxLetIx[nm] ?? -1
       if (cboxKind[nm] ?? CBOX_LET) == CBOX_LET && lx >= 0 {
@@ -3392,6 +3393,45 @@ function cboxPick(dlets: string[], alam: string[]) {
   boxed
 }
 
+// The frame's `let`s of a scalar type that `cboxByRef` says a closure must share: those a
+// lifted closure can take by value and hand back (D3664).
+function cboxScalarLets(dlets: string[], alam: string[], tys: i32[]): string[] {
+  const out: string[] = []
+  let di = 0
+  while di < dlets.length {
+    const nm = dlets[di]
+    const lx = cboxLetIx[nm] ?? -1
+    if (
+      (cboxKind[nm] ?? CBOX_LET) == CBOX_LET
+      && lx >= 0
+      && cboxByRef(nm, alam)
+    ) {
+      const ld = P.nodes[lx]
+      if ld is LetDecl {
+        let ty = -1
+        if ld.letType >= 0 {
+          ty = nodeTyIxOf(ld.letType)
+        } else {
+          ty = nodeTyIxOf(ld.letInit)
+        }
+        const pn = tyPrimNameOf(ty)
+        if (
+          pn == "i32"
+          || pn == "i64"
+          || pn == "f64"
+          || pn == "f32"
+          || pn == "boolean"
+        ) {
+          out.push(nm)
+          tys.push(ty)
+        }
+      }
+    }
+    di = di + 1
+  }
+  out
+}
+
 // Per function frame (top-level or nested): boxes each binding a closure must share with it
 // (`cboxByRef`) — a `let`, a parameter, or a loop variable — and rewrites every use to go
 // through the cell. Usage-gated: a frame with no such binding rewrites nothing.
@@ -3415,7 +3455,9 @@ export function captureBoxRewrite(_stmts: i32[]) {
         pi = pi + 1
       }
       cboxScan(fn.fnBody, 0, dlets, alam)
-      const boxed = cboxPick(dlets, alam)
+      const tys: i32[] = []
+      const cands = cboxScalarLets(dlets, alam, tys)
+      const boxed = cboxPick(dlets, alam, cloUnboxPick(fe, cands, tys))
       if boxed.length > 0 {
         // A parameter's cell is seeded at the top of the body, from the argument. An optional
         // parameter's annotation names only the non-null part, so it takes its recorded type.
@@ -3458,7 +3500,7 @@ function cboxModuleFrame() {
     cboxScan(startStmts[si], 0, dlets, alam)
     si = si + 1
   }
-  const boxed = cboxPick(dlets, alam)
+  const boxed = cboxPick(dlets, alam, [])
   if boxed.length == 0 { return 0 }
   let wi = 0
   while wi < startStmts.length {
