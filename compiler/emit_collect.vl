@@ -821,12 +821,14 @@ import {
   structIndexOfTy,
   structIndexOfTypeName,
   structNameIxReset,
+  structRowOfObjFieldSet,
   structRowOfTy,
   structTyIxReset,
   synthTypeRefTy,
   tailIfNullableIsReal,
   tyAnnRefListSlot,
   tyHasLitDeep,
+  tyRefArrElemOf,
   uFieldElemKeyKindAt,
   uFieldElemTyIxRow,
   uFieldRowKeyKind,
@@ -7527,40 +7529,119 @@ function collectAnonShapes() {
   // holder over (`anonLeafCloBindMark`).
   anonLeafCloBindMark()
   anonGenArgBuilt = false
+  // A holder whose empty-list field a later push pinned to a record keys that field by the
+  // record's row, so it mints after every other literal has minted its row (D2640).
+  const late: i32[] = []
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
     if an is ObjLit {
-      // D833 — a row narrower than this literal's `??` join does not skip the mint;
-      // `anonLeafMergeField`, read before the mint appends a row, redirects onto the merged row.
-      const narrowSi = structIndexOfObj(ai)
-      const mf = anonLeafMergeField(ai, narrowSi)
-      // D953 — the same question one layer down, for a literal that carries a family member in
-      // a nested field rather than being one; without it the carrier's row names the narrow inner.
-      const nmf = anonLeafNestedMergedField(ai)
-      if (
-        (narrowSi < 0 || mf != "" || nmf != "")
-        && (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
-      ) {
-        const rowsBefore = sNames.length
-        anonMintRowFor(ai)
-        if mf != "" || nmf != "" {
-          anonLeafRecordSupersede(narrowSi, sNames.length - 1)
-        }
-        // D872 — the `??`'s left-operand carrier row: `narrowSi` when there is one row per field
-        // set, else the other one — the row the binding cell and the callee's return resolve.
-        if sNames.length > rowsBefore {
-          if anonLeafMergedFieldOf(ai) != "" {
-            anonLeafRecordSupersede(anonLeafCarrierRowOf(ai), sNames.length - 1)
-          }
-        }
+      if anonHolderAwaitsElemRow(ai, 0, false) {
+        late.push(ai)
+      } else {
+        anonMintLiteral(ai, nestOwner)
       }
     }
     ai = ai + 1
   }
+  // Inner holders first: a late holder whose element is itself a late holder's record waits a
+  // round for that row, and a round that mints nothing mints the rest as they stand.
+  let pending = late
+  while pending.length > 0 {
+    const next: i32[] = []
+    for li in pending {
+      if anonHolderAwaitsElemRow(li, 0, true) {
+        next.push(li)
+      } else {
+        anonMintLiteral(li, nestOwner)
+      }
+    }
+    if next.length == pending.length {
+      for li in next { anonMintLiteral(li, nestOwner) }
+      pending = []
+    } else {
+      pending = next
+    }
+  }
   // The index is built for the passes above; a later reader rebuilds it through
   // `anonLeafIxEnsure`, so it does not sit in the heap the rest of the compile runs in (D2319).
   anonLeafIxClear()
+}
+
+// The main loop's body for the object literal at `ai`: mint its row unless one already serves it.
+function anonMintLiteral(ai: i32, nestOwner: i32[]) {
+  // D833 — a row narrower than this literal's `??` join does not skip the mint;
+  // `anonLeafMergeField`, read before the mint appends a row, redirects onto the merged row.
+  const narrowSi = structIndexOfObj(ai)
+  const mf = anonLeafMergeField(ai, narrowSi)
+  // D953 — the same question one layer down, for a literal that carries a family member in
+  // a nested field rather than being one; without it the carrier's row names the narrow inner.
+  const nmf = anonLeafNestedMergedField(ai)
+  if (
+    (narrowSi < 0 || mf != "" || nmf != "")
+    && (objVariantName(ai) == "" || anonNestNeedsRow(ai, nestOwner))
+  ) {
+    const rowsBefore = sNames.length
+    anonMintRowFor(ai)
+    if mf != "" || nmf != "" {
+      anonLeafRecordSupersede(narrowSi, sNames.length - 1)
+    }
+    // D872 — the `??`'s left-operand carrier row: `narrowSi` when there is one row per field
+    // set, else the other one — the row the binding cell and the callee's return resolve.
+    if sNames.length > rowsBefore {
+      if anonLeafMergedFieldOf(ai) != "" {
+        anonLeafRecordSupersede(anonLeafCarrierRowOf(ai), sNames.length - 1)
+      }
+    }
+  }
+  0
+}
+
+// Whether the object literal at `objIx` has a field, directly or through a nested literal, that
+// is an empty list literal whose recorded element is a record type.
+function anonHolderAwaitsElemRow(
+  objIx: i32,
+  depth: i32,
+  unminted: boolean,
+): boolean {
+  if depth > 8 || objIx < 0 || objIx >= P.nodes.length { return false }
+  const o = P.nodes[objIx]
+  if !(o is ObjLit) { return false }
+  for fx in o.objFields {
+    const f = P.nodes[fx]
+    if f is FieldInit {
+      const v = unwrapParen(f.fiValue)
+      if anonEmptyRecordListLit(v, unminted) { return true }
+      if anonHolderAwaitsElemRow(v, depth + 1, unminted) { return true }
+    }
+  }
+  false
+}
+
+// Whether node `ix` is an empty list literal whose recorded element is a record type — with
+// `unminted`, one no struct row holds yet.
+function anonEmptyRecordListLit(ix: i32, unminted: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    if n.arrElems.length > 0 || !anonEmptyListElemIsObj(nodeTyIxOf(ix)) {
+      return false
+    }
+    if !unminted { return true }
+    return structRowOfObjFieldSet(tyRefArrElemOf(nodeTyIxOf(ix))) < 0
+  }
+  false
+}
+
+// Whether list type `ty` has a record element.
+function anonEmptyListElemIsObj(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return false }
+    return T.tys[t.aElem] is TyObj
+  }
+  false
 }
 
 // D924 — marks a family member's other destination: handing a merged-row value to a

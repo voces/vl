@@ -11,9 +11,9 @@
 // that printed it for every program, so the controls below assert that a VALID module is
 // unchanged: rc 0, no banner, and the program's own output.
 //
-// THE WITNESS MUST STILL BE INVALID. This is D1471's filed witness — an un-annotated param
-// giving an empty-collection hole nothing to pin from — and it is check-clean invalid wasm
-// on the current seed. When D1471 is fixed this suite goes RED at the "still invalid"
+// THE WITNESS MUST STILL BE INVALID. This is D1413's filed witness moved into a function — a
+// fused `?? d` over a literal-union list's `pop()` — and it is check-clean invalid wasm
+// on the current seed. When D1413 is fixed this suite goes RED at the "still invalid"
 // assertion rather than silently measuring nothing; the replacement is any other
 // check-clean invalid-wasm program (`scripts/goal-scoreboard.py` names the population).
 //
@@ -33,19 +33,17 @@ if (GATED && !ENABLED) {
 const EXIT_COMPILER_BUG = 70;
 const BUG_LINE = "this is a bug in vl, not in your program";
 
-// D1471's witness, verbatim from docs/internals/inventory/D1471.md: `vl check` rc 0, and
-// the engine refuses the module. `take` is declared on line 1, so the position this suite
-// asserts names its NAME token: `1:10`, ONE literal for all three channels. The host used to
+// D1413's witness from docs/internals/inventory/D1413.md with its list a parameter of `take`
+// (D1471's witness served until that row closed): `vl check` rc 0, and the engine refuses the
+// module. `take` is declared on line 1, so the position this suite asserts names its NAME token: `1:10`, ONE literal for all three channels. The host used to
 // print `1:9` here — the guest's raw 0-based column — while the CLI pump shifted to 1-based,
 // so one diagnostic reached two columns depending on which command found it. `cli-design.md`
 // makes the output 1-based ("`col` (1-based, inclusive)"); the host shifts too now.
 const WANT_AT = "take.vl:1:10";
-const INVALID = `function take(a) {
-  const v = a
-  v[0] = 1.25
-  print(v[0] + 0.25)
+const INVALID = `function take(xs: ("a" | "b")[]) {
+  print(xs.pop() ?? "empty")
 }
-take(__array_new_default__(3))
+take(["a"])
 `;
 
 const VALID = `print(6 * 7)\n`;
@@ -120,7 +118,7 @@ Deno.test({
       const chk = await run(["check", "take.vl"], dir);
       if (chk.code !== 0) {
         throw new Error(
-          `the witness no longer check-cleans (D1471 fixed?) — replace it: ${chk.out}`,
+          `the witness no longer check-cleans (D1413 fixed?) — replace it: ${chk.out}`,
         );
       }
       const r = await run(["check", "--codegen", "take.vl"], dir);
