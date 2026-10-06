@@ -2,6 +2,8 @@
 // SP-043 and its closure twin). An empty `[]` reads its element type's one shared zero-length
 // backing — capacity 0, so the first push reallocates and no list writes it — and a lambda
 // that captures nothing is one constant closure per function. Both live in module globals.
+// And a `const` holding a map read or a scalar list's `.get`/`.pop`, null-tested and read,
+// holds no `S | null` box (SP-046).
 //
 // Pinned per fixture by OUTPUT (`@log`, so a shared backing that leaked a write shows) and by
 // `@allocs`: the `struct.new*` / `array.new*` sites left in the fixture's own function bodies
@@ -13,7 +15,7 @@ const DIR = `${ROOT}/tests/fixtures/shared-constants`;
 const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
 const ENABLED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1" && exists(VL) &&
   exists(COMPILER) && exists(WASM_DIS);
-const FIXTURES = ["empty-lists", "capture-free-closures"];
+const FIXTURES = ["empty-lists", "capture-free-closures", "nullable-scalar-locals"];
 
 const run = async (bin: string, args: string[]) => {
   const p = await new Deno.Command(bin, {
@@ -64,7 +66,7 @@ for (const fx of FIXTURES) {
           throw new Error(
             `${fx}: ${n} allocation sites in function bodies\n  want: ${allocs} — an empty ` +
               "list literal reads its type's shared backing, a capture-free lambda its " +
-              "constant closure",
+              "constant closure, a null-tested scalar local its unboxed value",
           );
         }
       } finally {

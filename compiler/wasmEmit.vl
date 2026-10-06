@@ -21289,8 +21289,8 @@ function listOpStageBase(base: i32, refSlot: i32): i32 {
 
 // The one home for list-op receiver resolution: resolve `objIx` to the wasm local holding
 // the list-wrapper ref, or -1 (loud, already recorded) for a receiver it cannot resolve. A
-// bare identifier is such a local unless it is a narrowed union arm; every other form — a
-// field, a global, an index — is evaluated once into the `recvRef` scratch slot, no write-back needed.
+// bare identifier is such a local unless it is a narrowed union arm; every other receiver is
+// staged once into the `recvRef` scratch slot, which `listOpRecvStages` reserves for it.
 function listOpRecvLocal(
   body: u8[],
   objIx: i32,
@@ -21298,61 +21298,27 @@ function listOpRecvLocal(
   base: i32,
   refSlot: i32,
   op: string,
-  allowIndex: boolean,
 ): i32 {
   const recv = P.nodes[objIx]
   if recv is Ident {
-    if listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
-      const sb = listOpStageBase(base, refSlot)
-      if stageListRecv(body, objIx, fnIx, sb) < 0 { return -1 }
-      return sb + 3
+    if !listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
+      const lIdx = localIndexOf(fnIx, recv.identName)
+      if lIdx >= 0 { return lIdx }
+      // A captured list ident (D1965) or a module global: the env field or global holds
+      // the wrapper ref, so staging it through `emitExpr` mutates that same list in place.
+      if (
+        !identIsEnvCapture(fnIx, recv.identName)
+        && globalIndexOfSid(sidOfNode(objIx)) < 0
+      ) {
+        return emitFail("emitProgram: " + op + " receiver is not a list local")
+      }
     }
-    const lIdx = localIndexOf(fnIx, recv.identName)
-    if lIdx >= 0 { return lIdx }
-    // A CAPTURED list ident (D1965): the env field holds the enclosing frame's wrapper ref,
-    // so staging it through `emitExpr` mutates that same list in place.
-    if identIsEnvCapture(fnIx, recv.identName) {
-      const cb = listOpStageBase(base, refSlot)
-      if stageListRecv(body, objIx, fnIx, cb) < 0 { return -1 }
-      return cb + 3
-    }
-    // A module-GLOBAL list ident: `emitExpr` runs the existing Ident->global read
-    // (`global.get` + `ref.as_non_null` for a non-const ref cell).
-    if globalIndexOfSid(sidOfNode(objIx)) < 0 {
-      return emitFail("emitProgram: " + op + " receiver is not a list local")
-    }
-    const gb = listOpStageBase(base, refSlot)
-    if stageListRecv(body, objIx, fnIx, gb) < 0 { return -1 }
-    return gb + 3
   }
-  if recv is Member {
-    const mb = listOpStageBase(base, refSlot)
-    if stageListRecv(body, objIx, fnIx, mb) < 0 { return -1 }
-    return mb + 3
-  }
-  // A CALL receiver stages exactly as a `Member` one does — the frame's `recvRef` slot holds
-  // the wrapper once, so the bounds compare and the element read share one evaluation (D1677).
-  if recv is Call {
-    const cb = listOpStageBase(base, refSlot)
-    if stageListRecv(body, objIx, fnIx, cb) < 0 { return -1 }
-    return cb + 3
-  }
-  if allowIndex {
-    // An INDEXED receiver (`g[0].push(x)` - push onto an INNER list of a nested array, or
-    // onto a list read from a list-valued map). The classifiers upstream already recognize a
-    // nested `g[i]` read as its inner list, so `lTy`/`aTy`/`base` are the inner list's.
-    if recv is Index {
-      const ib = listOpStageBase(base, refSlot)
-      if stageListRecv(body, objIx, fnIx, ib) < 0 { return -1 }
-      return ib + 3
-    }
-    return emitFail(
-      "emitProgram: "
-        + op
-        + " receiver must be a local, struct field, or index",
-    )
-  }
-  emitFail("emitProgram: " + op + " receiver must be a local or struct field")
+  // A field, an index, a call, or a parenthesised, `??` or `if` value (SP-044): any
+  // expression yielding the wrapper ref, evaluated once so the op's reads share it.
+  const sb = listOpStageBase(base, refSlot)
+  if stageListRecv(body, objIx, fnIx, sb) < 0 { return -1 }
+  sb + 3
 }
 
 // Lower a `recv.push(x)` member-call statement — the growable-list append, inlined rather
@@ -21382,7 +21348,7 @@ function pushDestVKind(rslot: i32): VKind | null {
 // share. Called from two points because a push whose value stages a receiver must resolve
 // its own after that value (D1280); one function so the two cannot pass different arguments.
 function pushRecvLocal(body: u8[], objIx: i32, fnIx: i32, base: i32) {
-  listOpRecvLocal(body, objIx, fnIx, base, -1, ".push", true)
+  listOpRecvLocal(body, objIx, fnIx, base, -1, ".push")
 }
 
 // The `pendingListKind` a list of element kind `k` is built at — the mapping `emitArr`'s own
@@ -22094,7 +22060,6 @@ function emitPopGo(
         base,
         popRefSlot,
         opNm,
-        false,
       )
       if lIdx < 0 { return -1 }
       // A `.get` of a view reads its refreshed snapshot (D3028, D3041).
@@ -22285,7 +22250,6 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
         base,
         clearRefSlot,
         ".clear",
-        false,
       )
       if lIdx < 0 { return -1 }
       // L.len = 0
@@ -22332,11 +22296,12 @@ function emitListGetOrGo(body: u8[], getIx: i32, defIx: i32, fnIx: i32) {
       // The index and the receiver are each emitted twice below, so a non-place operand is
       // staged once in the `.get` stash rather than refused (D1677).
       listGetStageMark(getIx)
-      // cond: idx u< len  (one unsigned compare covers negative + past-len)
-      if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      // cond: len u> idx  (one unsigned compare covers negative + past-len). The receiver
+      // is evaluated before the index, as every other `.get` spelling does (D3756).
       if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
       fbStructGet(lTy, 1)       // field 1: len
-      fbI32Bin(73)              // 0x49 i32.lt_u
+      if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      fbI32Bin(75)              // 0x4b i32.gt_u
       fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
       if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
       fbStructGet(lTy, 0)       // field 0: backing
@@ -22351,8 +22316,8 @@ function emitListGetOrGo(body: u8[], getIx: i32, defIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a list .get call")
 }
 
-// Lower a FUSED `xs.pop() ?? d` over a SCALAR-element (i32 / boolean) list onto
-// `body`: `len != 0` selects the decrement-and-read (the popped element) or the
+// Lower a FUSED `xs.pop() ?? d` over a SCALAR-element list (i32 / boolean, and f64 / i64 / f32)
+// onto `body`: `len != 0` selects the decrement-and-read (the popped element) or the
 // default. The receiver resolves like `emitPop` (bare local, module global, or
 // struct field — the latter two staged into the push frame's `recvRef` scratch).
 function emitPopOr(body: u8[], popIx: i32, defIx: i32, fnIx: i32) {
@@ -22363,27 +22328,25 @@ function emitPopOr(body: u8[], popIx: i32, defIx: i32, fnIx: i32) {
       if c.callArgs.length != 0 {
         return emitFail("emitProgram: .pop takes no arguments")
       }
-      if !lUsed {
+      const ek0 = scalarListElemKind(callee.memObj, fnIx)
+      if ek0 == null || ek0 == "u8list" {
+        return emitFail(
+          "emitProgram: fused .pop ?? d receiver is not an i32/f64/i64/f32 list",
+        )
+      }
+      const ek: VKind = ek0
+      if !scalarListUsed(ek) {
         return emitFail("emitProgram: .pop but list type not collected")
       }
-      const lTy = lTypeIdx
-      const aTy = aTypeIdx
-      const base = pushScratchBase
-      const lIdx = listOpRecvLocal(
-        body,
-        callee.memObj,
-        fnIx,
-        base,
-        -1,
-        ".pop",
-        false,
-      )
-      // the fused `pop ?? d` is i32-family only; no ref frame to defer
-
+      const lTy = scalarListWrap(ek)
+      const aTy = scalarListBack(ek)
+      const base = scalarPushScratchBaseOf(ek)
+      // the fused `pop ?? d` is scalar-only; no ref frame to defer
+      const lIdx = listOpRecvLocal(body, callee.memObj, fnIx, base, -1, ".pop")
       if lIdx < 0 { return -1 }
       // cond: len != 0 (len is never negative)
       pushListLen(body, lIdx, lTy)
-      fbIf(127) // 0x04 if, 0x7f i32 result blocktype
+      fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
       // L.len = len - 1; backing[L.len]
       fbLocalGet(lIdx)
       pushListLen(body, lIdx, lTy)
@@ -22394,7 +22357,7 @@ function emitPopOr(body: u8[], popIx: i32, defIx: i32, fnIx: i32) {
       pushListLen(body, lIdx, lTy)
       fbArrayGet(aTy)     // the popped element
       fbElse()            // 0x05 else — empty list → the default
-      if emitExpr(body, defIx, fnIx) < 0 { return -1 }
+      if emitScalarValue(body, defIx, fnIx, ek) < 0 { return -1 }
       fbEnd()             // 0x0b end
       return 0
     }
@@ -32394,24 +32357,32 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
             fnIx,
           )
         }
-        // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64) is
-        // the FUSED checked read-with-default (B6) — one bounds compare.
+        // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64, and an i64 or
+        // f32 one whose `??` keeps the element type) is the FUSED checked read-with-default
+        // (B6) — one bounds compare.
+        const lgk = scalarListElemKind(lcallee.memObj, fnIx)
+        const lgPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
         if (
           exprF64Array(lcallee.memObj, fnIx)
           || exprArray(lcallee.memObj, fnIx)
+          || (lgk == "i64" && lgPrim == "i64")
+          || (lgk == "f32" && lgPrim == "f32")
         ) {
           return emitListGetOr(body, lhsIx, e.binRight, fnIx)
         }
       }
-      // `xs.pop() ?? d` over an i32-element list is the fused checked pop-with-default:
-      // `len != 0` selects decrement-and-read or `d`.
-
-      // Gated on the one-home discriminator, not an exclusion list. `emitPopOr` reads
-      // `lTypeIdx`/`aTypeIdx` unconditionally, and the hand-written `!ref && !string && !f64`
-      // exclusion let `i64[]`, `f32[]` and `u8[]` into a lowering that reads their wrapper
-      // through the i32 heap type: check-clean invalid wasm. `scalarListElemKind` is the discriminator every other scalar-list op selects a rep with.
+      // `xs.pop() ?? d` over a scalar list is the fused checked pop-with-default: `len != 0`
+      // selects decrement-and-read or `d`. Gated on `scalarListElemKind`, the discriminator
+      // `emitPopOr` selects its rep with; a wide kind only where the `??` keeps the element type.
       if lcallee.memProp == "pop" {
-        if scalarListElemKind(lcallee.memObj, fnIx) == "i32" {
+        const pk = scalarListElemKind(lcallee.memObj, fnIx)
+        const pkPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
+        if (
+          pk == "i32"
+          || (pk == "f64" && pkPrim == "f64")
+          || (pk == "i64" && pkPrim == "i64")
+          || (pk == "f32" && pkPrim == "f32")
+        ) {
           if (
             !exprRefArray(lcallee.memObj, fnIx)
             && !exprStringArray(lcallee.memObj, fnIx)

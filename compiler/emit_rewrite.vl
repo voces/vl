@@ -83,10 +83,12 @@ import {
   strLitRecvTy,
   tyArrayElemIx,
   tyBearsNull,
+  tyEq,
   tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
+  tyIsMap,
   tyIsNulValueUnionBox,
   tyPrimNameOf,
   tySame,
@@ -601,6 +603,326 @@ function lvLeaves(
   brk == label && !shadow
 }
 
+// ── nullable scalar locals (SP-046) ────────────────────────────────────────────────────────
+
+// A function-local `const g = e` of type `S | null`, `S` a wide numeric scalar, whose every use
+// is a null test, a narrowed read or `g ?? d`, becomes `let $np: boolean = true` and
+// `const $nv: S = e ?? (if true { $np = false  0 } else { 0 })`: the fused `??` reads the
+// value without a box. Any other use, a capture or a shadowing name keeps the boxed binding.
+export function nulScalarSplit(rootIx: i32) {
+  const todo: i32[] = [rootIx]
+  const todoMode: i32[] = [0]
+  const blocks: i32[] = []
+  const lets: i32[] = []
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    let mode = todoMode.pop() ?? 0
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is FuncDecl {
+        if n.fnTyParams.length > 0 || mode == 2 { mode = 2 } else { mode = 1 }
+      }
+      if n is Block {
+        if mode == 1 {
+          for s in n.blkStmts {
+            if nssCandidate(s) {
+              blocks.push(ix)
+              lets.push(s)
+            }
+          }
+        }
+      }
+      for k in nodeChildren(ix) {
+        todo.push(k)
+        todoMode.push(mode)
+      }
+    }
+  }
+  let i = 0
+  while i < lets.length {
+    nssTry(blocks[i], lets[i])
+    i = i + 1
+  }
+  if lets.length > 0 {
+    capMemoNoteEdit()
+    plCacheBust()
+  }
+  0
+}
+
+// The scalar `S` of a `const` whose initializer is typed `S | null`, or -1.
+function nssScalarOf(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letKw != "const" || d.letInit < 0 { return -1 }
+    const t = nodeTyIxOf(d.letInit)
+    if t < 0 { return -1 }
+    const s = nonNullTy(t)
+    if s == t { return -1 }
+    const prim = tyPrimNameOf(s)
+    if prim == "i32" || prim == "i64" || prim == "f64" || prim == "f32" {
+      if nssFusedInit(d.letInit) { return s }
+    }
+  }
+  -1
+}
+
+// True when `e ?? d` over the initializer `ix` is a fused read that makes no box: a map read
+// (`m[k]`, `m.get(k)`), a scalar list's `.get(i)` or `.pop()`. Any other
+// producer already hands over a box, and splitting it only hides the box from the optimizer.
+function nssFusedInit(ix: i32): boolean {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Index { return tyIsMap(nodeTyIxOf(e.idxArr)) }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      const rt = nodeTyIxOf(callee.memObj)
+      if callee.memProp == "get" && e.callArgs.length == 1 {
+        return tyIsMap(rt) || tyArrayElemIx(rt) >= 0
+      }
+      if callee.memProp == "pop" && e.callArgs.length == 0 {
+        return tyArrayElemIx(rt) >= 0
+      }
+    }
+  }
+  nssBoxedProducer(ix)
+}
+
+// Every other initializer, a call returning `S | null` among them, is a producer whose value
+// is already a box when it arrives, so it is never split.
+function nssBoxedProducer(_ix: i32): boolean { false }
+
+function nssCandidate(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  nssScalarOf(ix) >= 0
+}
+
+// True when `ix` is the bare name `name`.
+function nssIsName(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  false
+}
+
+// True when node `ix` declares `name` (a shadow the walk does not follow), or is a `match`,
+// which the checker desugars before this pass and so is not expected here.
+function nssDeclares(ix: i32, name: string): boolean {
+  const n = P.nodes[ix]
+  if n is LetDecl { return n.letName == name }
+  if n is Param { return n.parName == name }
+  if n is ForRange { return n.frVar == name }
+  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
+  if n is FuncDecl { return n.fnName == name }
+  if n is MatchExpr { return true }
+  nssBindsNoName(ix)
+}
+
+// Every other node kind binds no name of its own.
+function nssBindsNoName(_ix: i32): boolean { false }
+
+// Classifies every use of the `const` at `letIx`, the statement of block `blk`, and rewrites
+// them and the binding when all qualify.
+function nssTry(blk: i32, letIx: i32) {
+  const b = P.nodes[blk]
+  const d = P.nodes[letIx]
+  if b is Block {
+    if d is LetDecl {
+      const s = nssScalarOf(letIx)
+      const t = nodeTyIxOf(d.letInit)
+      const name = d.letName
+      const st = b.blkStmts
+      let at = -1
+      let i = 0
+      while i < st.length {
+        if st[i] == letIx { at = i }
+        i = i + 1
+      }
+      if at < 0 { return 0 }
+      // The uses, by kind: a test yielding presence, one yielding absence, a read, a `??`.
+      const pres: i32[] = []
+      const abs: i32[] = []
+      const reads: i32[] = []
+      const coals: i32[] = []
+      const todo: i32[] = []
+      const inFn: boolean[] = []
+      let j = st.length - 1
+      while j > at {
+        todo.push(st[j])
+        inFn.push(false)
+        j = j - 1
+      }
+      while todo.length > 0 {
+        const ix = todo.pop() ?? -1
+        const fn = inFn.pop() ?? false
+        if ix >= 0 && ix < P.nodes.length {
+          if nssDeclares(ix, name) { return 0 }
+          const n = P.nodes[ix]
+          let kids = true
+          if n is Ident {
+            if n.identName == name {
+              if fn || !tyEq(nodeTyIxOf(ix), s) { return 0 }
+              reads.push(ix)
+            }
+          } else if n is BinExpr {
+            const op = n.binOp
+            if op == "==" || op == "!=" {
+              let operand = -1
+              if nssIsName(n.binLeft, name) && P.nodes[n.binRight] is NullLit {
+                operand = n.binLeft
+              }
+              if nssIsName(n.binRight, name) && P.nodes[n.binLeft] is NullLit {
+                operand = n.binRight
+              }
+              if operand >= 0 {
+                if fn || !tyEq(nodeTyIxOf(operand), t) { return 0 }
+                if op == "==" { abs.push(ix) } else { pres.push(ix) }
+                kids = false
+              }
+            } else if op == "??" && nssIsName(n.binLeft, name) {
+              if fn || !tyEq(nodeTyIxOf(n.binLeft), t) { return 0 }
+              coals.push(ix)
+              todo.push(n.binRight)
+              inFn.push(fn)
+              kids = false
+            }
+          } else if n is IsExpr {
+            if nssIsName(n.isObj, name) {
+              if fn || !tyEq(nodeTyIxOf(n.isObj), t) { return 0 }
+              if n.isVariant == "null" { abs.push(ix) }
+              else if n.isVariant == tyToStr(s) { pres.push(ix) }
+              else { return 0 }
+              kids = false
+            }
+          }
+          if kids {
+            const inner = fn || n is FuncDecl
+            for k in nodeChildren(ix) {
+              todo.push(k)
+              inFn.push(inner)
+            }
+          }
+        }
+      }
+      nssRewrite(b, at, d, s, pres, abs, reads, coals)
+    }
+  }
+  0
+}
+
+// Applies `nssTry`'s verdict: the two bindings replace the `const` at `st[at]`, and each use
+// is overwritten in place with its read of them.
+function nssRewrite(
+  b: Block,
+  at: i32,
+  d: LetDecl,
+  s: i32,
+  pres: i32[],
+  abs: i32[],
+  reads: i32[],
+  coals: i32[],
+) {
+  const pos = d.pos
+  const np = "$np" + i32ToStr(b.blkStmts[at])
+  const nv = "$nv" + i32ToStr(b.blkStmts[at])
+  const tb = lvTyBool()
+  const init = mkBool(1, pos)
+  nodeTyRecord(init, tb)
+  const npDecl = mkLet("let", np, synthTypeRefTy("boolean", pos, tb), init, pos)
+  nodeTyRecord(npDecl, lvTyVoid())
+  const npT = mkIdent(np, pos)
+  nodeTyRecord(npT, tb)
+  const clr = mkBool(0, pos)
+  nodeTyRecord(clr, tb)
+  const asg = mkBinary("=", npT, clr, pos)
+  nodeTyCarry(asg, clr)
+  const missSt: i32[] = [asg, nssZero(s, pos)]
+  const miss = mkBlock(missSt, pos)
+  nodeTyRecord(miss, s)
+  const otherSt: i32[] = [nssZero(s, pos)]
+  const other = mkBlock(otherSt, pos)
+  nodeTyRecord(other, s)
+  const cond = mkBool(1, -1)
+  nodeTyRecord(cond, tb)
+  const def = mkIf(cond, miss, other, pos)
+  nodeTyRecord(def, s)
+  valueIfAdd(def)
+  const co = mkBinary("??", d.letInit, def, pos)
+  nodeTyRecord(co, s)
+  const nvDecl = mkLet(
+    "const",
+    nv,
+    synthTypeRefTy(tyToEmitName(s), pos, s),
+    co,
+    pos,
+  )
+  nodeTyRecord(nvDecl, lvTyVoid())
+  const old = b.blkStmts
+  const st: i32[] = []
+  let i = 0
+  while i < old.length {
+    if i == at {
+      st.push(npDecl)
+      st.push(nvDecl)
+    } else {
+      st.push(old[i])
+    }
+    i = i + 1
+  }
+  b.blkStmts = st
+  for ix in pres { nssSetName(ix, np, tb) }
+  for ix in abs {
+    const id = mkIdent(np, -1)
+    nodeTyRecord(id, tb)
+    const un: Node = { unOp: "!", unArg: id, pos: P.nodes[ix].pos }
+    arenaSetNode(ix, un)
+    nodeTyRecord(ix, tb)
+  }
+  for ix in reads { nssSetName(ix, nv, s) }
+  for ix in coals {
+    const c = P.nodes[ix]
+    if c is BinExpr {
+      const ty = nodeTyIxOf(ix)
+      const cp = mkIdent(np, -1)
+      nodeTyRecord(cp, tb)
+      const cv = mkIdent(nv, -1)
+      nodeTyRecord(cv, s)
+      const thenSt: i32[] = [cv]
+      const thenB = mkBlock(thenSt, -1)
+      nodeTyRecord(thenB, ty)
+      const elseSt: i32[] = [c.binRight]
+      const elseB = mkBlock(elseSt, -1)
+      nodeTyRecord(elseB, ty)
+      const w: Node = { ifCond: cp, ifThen: thenB, ifElse: elseB, pos: c.pos }
+      arenaSetNode(ix, w)
+      nodeTyRecord(ix, ty)
+      valueIfAdd(ix)
+    }
+  }
+  0
+}
+
+// Overwrites node `ix` with a read of the name `name`, typed `ty`.
+function nssSetName(ix: i32, name: string, ty: i32) {
+  const w: Node = { identName: name, pos: P.nodes[ix].pos }
+  arenaSetNode(ix, w)
+  sidNoteNodeName(ix)
+  nodeTyRecord(ix, ty)
+  0
+}
+
+// A zero of scalar `s`, the value the miss arm yields and nothing reads.
+function nssZero(s: i32, pos: i32): i32 {
+  const prim = tyPrimNameOf(s)
+  let z = -1
+  if prim == "f64" || prim == "f32" {
+    z = mkNum("0.0", pos)
+  } else {
+    z = mkNum("0", pos)
+  }
+  nodeTyRecord(z, s)
+  z
+}
 // ── the build-decided `if` ───────────────────────────────────────────────────
 
 // Whether the statement at `ix` is an else-less `if __memory_shared__() { … }` whose call the
