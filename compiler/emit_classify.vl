@@ -238,6 +238,7 @@ import {
   tyIsNullableLitUnion,
   tyIsNumUnion,
   tyIsNumericBox,
+  tyIsRecord,
   tyIsTpJoinUnion,
   tyIsU8ArrayTy,
   tyIsValueUnionBox,
@@ -1169,6 +1170,19 @@ function lambdaCheckedRetTy(i: i32): i32 {
     if f is TyFunc { return f.fnRet }
   }
   -1
+}
+
+// Settle un-annotated function `i`'s `nulstruct` result at `struct` when the checker typed
+// its return a non-null record: a field read classifies at the field's `(ref null $S)` slot,
+// and a call through the function's type expects `(ref $S)` exactly (D3682). The return
+// boundary then owes, and `retNeedsNonNullRecover` emits, the `ref.as_non_null`.
+export function criSettleNonNullRecordRet(i: i32) {
+  if i < 0 || i >= fRetKind.length || i >= fRetStructIdx.length { return 0 }
+  if fRetKind[i] != "nulstruct" || fRetStructIdx[i] < 0 { return 0 }
+  let t = fnInferredRetTy(i)
+  if t < 0 { t = lambdaCheckedRetTy(i) }
+  if tyIsRecord(t) { fRetKind[i] = "struct" }
+  0
 }
 
 // Whether function `i`'s checker-inferred return is a union, or a nullable one, with a map
@@ -5195,12 +5209,12 @@ export function criClassify(rx0: i32, i: i32) {
   }
   // Scalar f64, f32 and i64 returns detected from the return expression, for a function the
   // checker recorded no inferred-return name for — a monomorphized instance, whose body the
-  // checker only saw with a type variable. Gated on a pure scalar return: a value-union `?? d`
-  // reads as its unboxed atom while its result rep is the union box, classified separately.
+  // checker only saw with a type variable. A `?? d` qualifies unless its result is a union box,
+  // which reads as its unboxed atom and is classified separately (D3692).
   let scalarOk = fRetKind[i] == "i32" && fRetBool[i] == 0
   const rxn = P.nodes[rx]
   if rxn is BinExpr {
-    if rxn.binOp == "??" { scalarOk = false }
+    if rxn.binOp == "??" { scalarOk = scalarOk && !exprUnion(rx, fnStmts[i]) }
   }
   if scalarOk {
     if exprIsV128(rx, fnStmts[i]) { criSetRetKind(i, "v128") }
@@ -13278,6 +13292,14 @@ export function anonHandleTyIx(nm: string): i32 {
   if si < 0 { return -1 }
   if !sIsAnonRow(si) { return -1 }
   if si >= sTyIx.length { return -1 }
+  // A spelled shape reaches the first row of its layout, which may hold `boolean` where the
+  // spelling says `i32`, or the reverse; that row is not the spelling's type (D3693).
+  if nameIsWholeSpanShape(nm) {
+    const fnames: string[] = []
+    const ftypes: string[] = []
+    shapeFieldParse(nm, fnames, ftypes)
+    if !code0SpellingFitsRow(fnames, ftypes, si) { return -1 }
+  }
   sTyIx[si]
 }
 
@@ -21795,13 +21817,11 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
         k = k + 1
       }
       if ok {
-        // A strict match on a declared row whose `i32` or `boolean` field is the other kind is
-        // kept only as a fallback: the two share a layout, but a read formats by the row, and
-        // the spelling's own row may come later in the table (D2866).
+        // A strict match on a row whose `i32` or `boolean` field is the other kind is kept only
+        // as a fallback: the two share a layout, but a read formats by the row, and the
+        // spelling's own row may come later in the table (D2866; an anonymous row, D3693).
         if lenient == 0 {
-          if sIsAnonRow(si2) || code0SpellingFitsRow(fnames, ftypes, si2) {
-            return si2
-          }
+          if code0SpellingFitsRow(fnames, ftypes, si2) { return si2 }
           if uniq < 0 { uniq = si2 }
         } else {
           if lenient < 2 { return si2 }
@@ -21833,12 +21853,34 @@ function code0SpellingFitsRow(
     if ftypes[k] == "i32" { tk = 1 }
     if ftypes[k] == "boolean" { tk = 2 }
     if tk != 0 {
-      let rk = code0KindOf(tyFieldTyOf(sTyIx[si], fnames[k]))
-      if rk == 0 {
-        rk = code0KindOf(tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, fnames[k]))
-      }
+      const rk = rowFieldCode0Kind(si, fnames[k])
       if rk != 0 && rk != tk { return false }
     }
+    k = k + 1
+  }
+  true
+}
+
+// The code-0 kind (`code0KindOf`) of row `si`'s field `name`, off the row's own type and then,
+// for an anonymous row, its minting literal's; 0 when neither says.
+function rowFieldCode0Kind(si: i32, name: string): i32 {
+  if si < 0 || si >= sTyIx.length { return 0 }
+  const rk = code0KindOf(tyFieldTyOf(sTyIx[si], name))
+  if rk != 0 { return rk }
+  code0KindOf(tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, name))
+}
+
+// Whether no field of row `p` is `i32` in one of rows `p` and `c` and `boolean` in the other.
+// The two share a layout, so a supertype edge would validate while relating two records the
+// checker keeps apart; a call pinned to either then reads the other's row (D3693).
+export function rowBoolI32Agree(p: i32, c: i32): boolean {
+  if p < 0 || p >= sFieldCount.length { return true }
+  let k = 0
+  while k < sFieldCount[p] {
+    const nm = sFieldNames[sFieldStart[p] + k]
+    const pk = rowFieldCode0Kind(p, nm)
+    const ck = rowFieldCode0Kind(c, nm)
+    if (pk == 1 && ck == 2) || (pk == 2 && ck == 1) { return false }
     k = k + 1
   }
   true
