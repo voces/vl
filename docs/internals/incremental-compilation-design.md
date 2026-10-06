@@ -496,7 +496,7 @@ compiler instance's exports. The recorded **transcript** is, in order:
     the SHA-256 of the bytes served, or **absent**. A probe that found nothing is an input,
     because a file appearing later at that path changes resolution.
   - `CMD_LIST_DIR`: the listing, as committed.
-  - `CMD_WRITE_FILE`: the acknowledgement.
+  - `CMD_WRITE_FILE`: never keyed: an action that writes is never stored (below).
   - `CMD_VALIDATE`: the verdict.
   - Any later command.
 - **Nothing the host only reads back.** Calls such as `cliCmdDataAt`, `cliExitCode` and the
@@ -524,7 +524,7 @@ compiler instance's exports. The recorded **transcript** is, in order:
 | input | how it is keyed | why |
 | --- | --- | --- |
 | the compiler | SHA-256 of the RESOLVED seed's bytes, whichever rung supplied it: `--compiler`, `$VL_COMPILER_WASM`, `./build/vl-compiler.wasm`, `<tree>/build/vl-compiler.wasm`, or the embedded seed (a hash baked at build time, beside `$VL_SEED_KEY`) | cli-design.md §"Where a `vl` binary finds std and its seed"; `seed_content_key` (`main.rs:1696`) is FNV, fine for a sidecar name but not a cache key |
-| the host | an embedded build id baked by `build.rs`: `VL_BUILD_COMMIT` (already baked) plus a hash of the host sources and `Cargo.lock`, so a dirty local build differs | the `-O` steps, staging and validation are host code. Not a SHA-256 of the 24 MB executable on every run. |
+| the host | an embedded build id baked by `build.rs`: `VL_BUILD_COMMIT` (already baked) plus a hash of the host sources, `build.rs`, `Cargo.toml`, `Cargo.lock` and the active `CARGO_FEATURE_*` set, so a dirty local build differs. `build.rs` must print `rerun-if-changed` for `src`, `build.rs`, `Cargo.toml` and `Cargo.lock` on EVERY path: today it prints one only on the `embed-seed` path, and once any is printed cargo stops re-running the script on other edits, so the release build would keep a stale id. (Hashing `include_bytes!` of the sources, which rustc tracks, is the alternative.) | the `-O` steps, staging and validation are host code. Not a SHA-256 of the 24 MB executable on every run. |
 | binaryen | every `BINARYEN_*` variable, and the resolved `wasm-opt`: its path, its `--version` and a hash of the binary, or **absent** when none was found (the build then differs: `binaryen_missing_note`) | `binaryen_tool` (`main.rs:5431`) takes `$VL_WASM_OPT` or whatever is on `PATH` |
 | colour | the resolved `color_ok()` decision (tty, `NO_COLOR`, `TERM`, `--color`) | on the pump paths it is already in the transcript as the synthetic `--color=` argument. On a path where the host renders diagnostics itself, the host keys its decision explicitly. Storing uncoloured text and styling it at replay is not an option, because the guest does the styling. |
 | `-o`, under `--source-map` only | the output path as given and resolved | the `.map` and its `sourceMappingURL` section name it |
@@ -533,7 +533,8 @@ compiler instance's exports. The recorded **transcript** is, in order:
 **Environment variables fall into three classes.** Anything not named is keyed.
 
 - **Bypass: no lookup and no store.**
-  - The variables: `VL_FUEL`, `VL_PROFILE*`, `VL_GC_STATS`, `VL_TEST_TRACE`, and every
+  - The variables: `VL_FUEL`, `VL_PROFILE*`, `VL_GC_STATS`, `VL_TEST_TRACE`,
+    `VL_COMPILE_GC_TRACE`, `VL_FAULT_INJECT` (it breaks the compile on purpose), and every
     `*_DUMP` and `*_EXPLAIN` variable (`VL_INLINE_EXPLAIN`, …).
   - They exist to observe a compile. A hit would silently skip the thing being measured, and a
     store would key a result on an observation.
@@ -584,6 +585,9 @@ takes its own:
   - a compiler trap (exit 70);
   - any action that read stdin;
   - `-e`;
+  - any action whose transcript contains `CMD_WRITE_FILE` (`vl check --fix` writes partway and
+    re-reads what it wrote; `fmt -w` likewise if it ever becomes an action): replay must never
+    stand in for a write;
   - every run under a bypass variable.
 
   Each of these is a defect to surface every time, an input the transcript does not see, or a
@@ -612,8 +616,10 @@ Each says what it compares.
    - **The schedule (chosen here):**
      - For Q2's trial week, agents and the CI cache job verify EVERY hit
        (`VL_COMPILE_CACHE_VERIFY=1`).
-     - After that week they verify a deterministic 1 in 20 (`VL_COMPILE_CACHE_VERIFY=sample:20`,
-       selected by the result key's hash, so a sampled miss reproduces).
+     - After that week they verify a deterministic 1 in 20 (`VL_COMPILE_CACHE_VERIFY=sample:20`),
+       selected by `H(result key, UTC day)`, not by the key alone: a key-only selector verifies
+       the same 5% of entries forever and never the other 95%. The trace logs the selector so a
+       sampled mismatch reproduces.
      - Users verify nothing.
    - So the agent win quoted in §5 is ~95% of the hit savings after the trial week, and zero
      during it.
@@ -637,7 +643,8 @@ Each says what it compares.
      decision (`--color=always` against `never`, and `NO_COLOR`).
    - **Environment and tools:** one keyed `VL_*` variable; one `BINARYEN_*` variable;
      `wasm-opt` swapped (a wrapper script on `PATH`) and removed (absent); the host build id
-     (a test-only salt).
+     (a test-only salt), and a host source edited and rebuilt with `--features embed-seed`,
+     which must change the id.
    - **Controls:**
      - A run changing only an inert variable must HIT. Without it, a matrix that always misses
        would pass.
