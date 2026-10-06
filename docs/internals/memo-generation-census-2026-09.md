@@ -49,7 +49,7 @@ tree ungraded.
 | `variantSig` | `uFieldNames`/`uFieldStart`/`uFieldCount` lengths | none: it reads field NAMES, and all three tables are push-only | no-refined-input |
 | `objVariantIndex` (`ovn*`) | `uVariants`/`uFieldStart`/`uFieldCount` lengths | none, the same three tables through `variantSig` | no-refined-input |
 | `declStructNodeOf` | top-level `stmts.length` | none: it indexes `TypeDecl` nodes, which no pass rewrites | no-refined-input |
-| `buildFnMapResumable` | 8 collect lengths | `fRetKind` and siblings — and `buildFnMapReseedPrefix` writes the banked seed back over the prefix, which is what makes the resume exact rather than merely cheap | resume-reseeds |
+| `buildFnMapResumable` | 8 collect lengths | `fRetKind` and siblings — and `buildFnMapReseedPrefix` writes the banked seed back over the prefix, which is what makes the resume exact rather than merely cheap; a same-name slot write re-classifies its one row (D3761) | resume-reseeds |
 | `collectAResumable` | `P.nodes.length` + 7 collect lengths | the annotation sidecars; the bank is armed only for a run no arena-editing pass crosses | resume-reseeds |
 | `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen`, `gwBoxedSeen` (the getter walk's once-per-type report mark), `rsRetSeenE`/`rsRetSeenL` (the re-seat return walk's once-per-query function mark, D2922) | — | — | not-a-memo |
 | `repKeyMemo` / `hcCanonMemo` | `tyMutEpoch` | its own canon-key columns | probe |
@@ -66,7 +66,7 @@ tree ungraded.
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
 | `frameBindsCache` (`fcbSidGen`/`fcbGen`, D2289) | the asked FRAME; dropped by `resetParentLetCache` | the frame chain's params, lets and loop variables, which a rewrite could re-point | probe |
 | `paramShadowCache` (`pshSidGen`/`pshGen`, D3293) | the asked FRAME and its body; dropped by `sidResetParentLet` | the frame's params and its body's lets and loop variables, which a rewrite could re-point | probe |
-| `fnStmtsPosIndex` (`fnPos*`) | `fnPosEpoch`, and the `fnStmts`/`monoOrigNode` prefix lengths already indexed | `fnStmts` slots overwritten by `monomorphize` — every such write calls `buildFnMapNoteFnSlotWrite`, which retires the index | probe |
+| `fnStmtsPosIndex` (`fnPos*`) | `fnPosEpoch`, and the `fnStmts`/`monoOrigNode` prefix lengths already indexed | `fnStmts` slots overwritten by `monomorphize` — every such write calls `buildFnMapNoteFnSlotWrite` or `buildFnMapNoteFnStmtWrite` (D3761), each of which retires the index | probe |
 | `moduleLocalLetPlan` (`mllSort*`) | the NAME; dropped with its table by `resetParentLetCache` | none: the module block-local table is built once and reset wholesale | probe |
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
 | `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`, and inside `monoRebuild`'s runs of `computeVoidFns` and `computeRetInference` after it reports an edit (D2771); those passes write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |

@@ -233,6 +233,20 @@ const genPins = (n: number, many: boolean): string => {
   return o.join("\n") + "\n";
 };
 
+// GENERIC FIRST INSTANCES against plain twins: N generics instantiated once each, so every
+// instance is a FIRST one and replaces its template's `fnStmts` slot, against the same N
+// functions written at `i32`. Both arms emit N one-expression functions.
+const genFirstInsts = (n: number, many: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(many ? `function g${i}<T>(x: T): T { x }` : `function g${i}(x: i32): i32 { x }`);
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + g${i}(${i % 97})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
 // COVARIANT BINDINGS: N delivery functions either way, `cov` of them binding a covariant
 // list handle (`const b: Shape[] = a`) and the rest binding the same list at its own type.
 // The alias-closure answer is memoised per (root name, frame), so only the covariant ones
@@ -731,6 +745,17 @@ axis(
 // bar STAYS at the family default rather than tracking a number the harness cannot measure.
 axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
+
+// 1.73 (0.116G / 0.067G fuel) against master `b05991d98`'s 5.75 (0.385G): a first instance's
+// slot write retired `buildFnMap`'s whole banked prefix, so every instance re-classified every
+// function (D3761). Still super-linear in N through the other whole-program passes of
+// `monoRebuild` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
+axis(
+  "generic first instances",
+  2.5,
+  "`buildFnMap` re-classifies the whole program per first instance of a generic (D3761).",
+  (d) => twoFiles(d, genFirstInsts(200, true), genFirstInsts(200, false)),
+);
 
 // 0.78 / 0.91 / 0.86, against 36.51 / 2.82 / 12.95 on the pre-D1657 compiler — the axis the
 // family was blind to. Each covariant binding is one `covarValueWriteState` query, and every

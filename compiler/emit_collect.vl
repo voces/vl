@@ -3061,8 +3061,33 @@ function liftFnsInExpr(ix: i32, parent: i32) {
 // retires it. No length moves, which is why the arena stamp alone cannot see this.
 export function buildFnMapNoteFnSlotWrite() {
   fmSeenFns = -1
+  fmDirtySlots = []
   fnPosIndexDrop()
   0
+}
+
+// Rows of the banked prefix whose `fnStmts` slot now holds a different declaration of the same
+// name; a resume re-classifies each in place instead of the whole prefix (D3761).
+let fmDirtySlots: i32[] = []
+
+// Note `fnStmts[slot] = node` before it lands. When the slot is its own row and `node` keeps the
+// row's name, the name, its sid and the nested mark stand and only that row's return facts move.
+export function buildFnMapNoteFnStmtWrite(slot: i32, node: i32) {
+  if fmSeenFns < 0 || slot >= fmSeenFns {
+    fnPosIndexDrop()
+    return 0
+  }
+  const nd = P.nodes[node]
+  if slot >= 0 && slot < fnIndices.length && fnIndices[slot] == slot {
+    if nd is FuncDecl {
+      if nd.fnName == fnNames[slot] {
+        fmDirtySlots.push(slot)
+        fnPosIndexDrop()
+        return 0
+      }
+    }
+  }
+  buildFnMapNoteFnSlotWrite()
 }
 
 // Can this call re-seed the covered prefix from the row cache instead of re-classifying it?
@@ -3101,14 +3126,49 @@ function buildFnMapReseedPrefix() {
   0
 }
 
-// Bank the row this iteration just produced, AFTER the inferred-return arms have refined it —
-// the seed a full re-mint would leave, not the annotation chain's first answer.
-function buildFnMapBankRow() {
-  fmSeedVoid.push(fRetVoid[fRetVoid.length - 1])
-  fmSeedStructIdx.push(fRetStructIdx[fRetStructIdx.length - 1])
-  fmSeedRArrElem.push(fRetRArrElem[fRetRArrElem.length - 1])
-  fmSeedBool.push(fRetBool[fRetBool.length - 1])
-  fmSeedKind.push(fRetKind[fRetKind.length - 1])
+// Bank row `li` AFTER the inferred-return arms have refined it — the seed a full re-mint would
+// leave, not the annotation chain's first answer. A new row appends; a re-classified one is set.
+function buildFnMapBankRow(li: i32) {
+  if li < fmSeedKind.length {
+    fmSeedVoid[li] = fRetVoid[li]
+    fmSeedStructIdx[li] = fRetStructIdx[li]
+    fmSeedRArrElem[li] = fRetRArrElem[li]
+    fmSeedBool[li] = fRetBool[li]
+    fmSeedKind[li] = fRetKind[li]
+    return 0
+  }
+  fmSeedVoid.push(fRetVoid[li])
+  fmSeedStructIdx.push(fRetStructIdx[li])
+  fmSeedRArrElem.push(fRetRArrElem[li])
+  fmSeedBool.push(fRetBool[li])
+  fmSeedKind.push(fRetKind[li])
+  0
+}
+
+// Write the annotation's return facts to row `li`: appended when it is the next row, else set.
+function buildFnMapPutRow(
+  li: i32,
+  rv: i32,
+  sidx: i32,
+  rae: string,
+  rb: i32,
+  rk: VKind,
+) {
+  if li < fRetKind.length {
+    fRetVoid[li] = rv
+    fRetStructIdx[li] = sidx
+    fRetRArrElem[li] = rae
+    fRetBool[li] = rb
+    fRetKind[li] = rk
+    fRetLitAtom[li] = 0
+    return 0
+  }
+  fRetVoid.push(rv)
+  fRetStructIdx.push(sidx)
+  fRetRArrElem.push(rae)
+  fRetBool.push(rb)
+  fRetKind.push(rk)
+  fRetLitAtom.push(0)
   0
 }
 
@@ -3127,6 +3187,151 @@ function buildFnMapBankPrefix() {
   0
 }
 
+// Classify the return of `s`, the declaration at `fnStmts` slot `i`, into row `li` and bank
+// the row: the annotation's facts first, then the checker's inferred return when unannotated.
+function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
+  // A declared `: void` return seeds the void classification directly: the fixpoint below
+  // (`computeVoidFns`) covers only the un-annotated half, and an unseeded annotation leaves
+  // every `: void` function emitting `(result i32)`.
+  const rv = retVoidAnnFlag(s.fnRet)
+  // The polymorphic slot takes the namespace its `fRetKind` selects, which is the gate
+  // every reader of it already applies: a struct kind takes a struct-TABLE row and
+  // nothing else, since a variant's index in that channel reads as another row (D1737).
+  const rsk = retAnnKindChain(s.fnRet)
+  let sidx = 0
+  if rsk == "struct" || rsk == "nulstruct" {
+    sidx = retStructRowIndex(s.fnRet)
+  } else {
+    sidx = retStructIndex(s.fnRet)
+  }
+  const rae = retRefArrElemName(s.fnRet)
+  const rb = retBoolFlag(s.fnRet)
+  // The stored return kind: one `VKind` slot per function, seeded from the annotation via
+  // `retAnnKindChain`. `computeRetInference` writes the un-annotated facts into the same
+  // slot, so `inferredRetKindCore` is a plain read.
+  buildFnMapPutRow(li, rv, sidx, rae, rb, retAnnKindChain(s.fnRet))
+  // An un-annotated scalar, string or array return is set directly from the checker's
+  // inferred return name: the expression-based fallback below misses a return that is a
+  // plain variable. No AST node is synthesized, so `fmt` is untouched; `i32` needs nothing,
+  // and `string[]` stores `"strlist"`, the module-global string-list wrapper.
+  if s.fnRet < 0 {
+    // An anonymous lambda's inferred return is keyed by node index, since the lambda has no
+    // name the checker saw; fall back to that when the name-keyed lookup misses. One row
+    // lookup, two columns, so the name arms and the arena arms read the same row by
+    // construction rather than by two readers agreeing.
+    let inRow = inferRetRowOf(inferRetFnKey(fnStmts[i], s.fnName))
+    if inRow < 0 { inRow = inferRetRowByNode(fnStmts[i]) }
+    let inm = ""
+    if inRow >= 0 { inm = inferRetTyAt(inRow) }
+    // The five list arms take the array grammar's one cut plus a leaf name rather than
+    // matching a whole spelling. The `i32` and `string` arms compare the leaf directly,
+    // because their sibling homes (`nameIsI32Array` / `nameIsStringArray`) are rep-wide and
+    // also accept `boolean[]`, a litunion `K[]` and the nullable forms.
+
+    // The five scalar arms ask the arena, not the render: `inferRetTyIx` banks the type
+    // beside the name at the one recorder. What makes this sound is the transparency
+    // collapse in `declaredTyOfName` and `isClassifiableRetName`'s admitted set in
+    // `typecheck.vl` — widen that gate and these arms fire where the name arms did not.
+    let retTyIx = -1
+    if inRow >= 0 { retTyIx = inferRetTyIxAt(inRow) }
+    let retPrim = ""
+    if retTyIx >= 0 {
+      const rpt = T.tys[retTyIx]
+      if rpt is TyPrim { retPrim = rpt.primName }
+      // An inferred return whose join is an un-named literal union reps as a string ref,
+      // the same rep its annotated twin gets. A named alias is deliberately excluded: it
+      // reps as the interned i32 atom, and forcing it to `"str"` would put a string-ref
+      // result on a function returning an id. Same seam as `retLitUnionInline`.
+      if retPrim == "" && tyIsLitUnion(retTyIx) {
+        if litUnionAliasNameOfTy(retTyIx) == "" { retPrim = "string" }
+      }
+    }
+    // The five array arms, likewise from the arena, with the recorded array type read off
+    // the same row the name came from. Narrow by construction: exactly the five element
+    // names the cut admits, never the rep-wide helpers, because a `boolean` element is a
+    // `TyArray` of `TyPrim` an arena test would claim while the cascade gives it no arm.
+    let retElem = ""
+    // Five atom compares; the one widening happens only where the name is stored.
+    const raePrim = tyArrayElemPrim(retTyIx)
+    const raeOk = raePrim == "i32"
+      || raePrim == "string"
+      || raePrim == "f64"
+      || raePrim == "i64"
+      || raePrim == "f32"
+    if raeOk { retElem = primNameStr(raePrim) }
+    if retPrim == "null" {
+      // D1567 — the `null` type, from the rung the checker banks for it. Its rep is
+      // `nullref`, the bottom of the GC hierarchy: one value, assignable to every nullable
+      // ref destination with no coercion, and `retKindPri` gives it the top tier so
+      // `criClassify`'s expression facts cannot lower it.
+      fRetKind[li] = "nulnone"
+    } else if retPrim == "string" {
+      fRetKind[li] = "str"
+    } else if retPrim == "i64" {
+      fRetKind[li] = "i64"
+    } else if retPrim == "f64" {
+      fRetKind[li] = "f64"
+    } else if retPrim == "f32" {
+      fRetKind[li] = "f32"
+    } else if retPrim == "boolean" {
+      fRetBool[li] = 1
+    } else if retElem == "i32" {
+      fRetKind[li] = "list"
+    } else if retElem == "string" {
+      fRetKind[li] = "strlist"
+    } else if retElem == "f64" {
+      fRetKind[li] = "f64list"
+    } else if retElem == "i64" {
+      fRetKind[li] = "i64list"
+    } else if retElem == "f32" {
+      fRetKind[li] = "f32list"
+    } else if nameIsBareMap(inm) && mapValNameOf(inm) == "i32" {
+      // A mono `{[string]: i32}` map inferred return. `criClassify`'s `exprMap` can miss it,
+      // since a returned local's kind is not collected during the global return pass, so set
+      // it from the checker's inferred return name.
+      fRetKind[li] = "map"
+    } else if nameIsNulString(inm) {
+      // A `string | null` niche inferred return drives the kind-16 result valtype, the same
+      // kind the annotated path stores. The `boolean | null` niche stores nothing: its
+      // result valtype is plain i32, so it falls through to the default. `nameIsNulString`
+      // is `nullablePartOf(name) == "string"`, the same home the annotation side calls.
+      fRetKind[li] = "nulstr"
+    } else if (nameIsBareMap(nullablePartOf(inm))) {
+      // D937 — the nullable map inferred return, the sibling of the mono-map arm above.
+      // Same pair the annotated path stores (`retNulMapFlag` -> `"nulmap"`), read off the
+      // name the checker recorded. Any string-keyed map, not just the i32-valued one, and
+      // ahead of `inferNulStructRow`, which would otherwise resolve a map as a struct row.
+      fRetKind[li] = "nulmap"
+    } else if inferNulVariantRow(inm) >= 0 {
+      // D1562 — a nullable union-variant inferred return, the twin the `nulstruct` arm below
+      // never had. Ahead of `nulstruct`, which is the annotated ladder's order:
+      // `retAnnKindChain` is last-match-wins and puts the variant after the ref, and this
+      // chain is first-match-wins, so mirroring that precedence means going first.
+      fRetKind[li] = "nulvariant"
+      fRetStructIdx[li] = inferNulVariantRow(inm)
+    } else if inferNulStructRow(inm) >= 0 {
+      // D887 — a nullable-struct inferred return, the same pair the annotated path stores
+      // (`retNulRefFlag` -> `"nulstruct"` + `retStructIndex`), read off the name the checker
+      // recorded, so all four owners of a return row read one answer. Ahead of the two union
+      // arms below because the row is a nullable; both decline anyway.
+      fRetKind[li] = "nulstruct"
+      fRetStructIdx[li] = inferNulStructRow(inm)
+    } else if inferRetIsValueUnionAt(inRow, inm) {
+      fRetKind[li] = "union"
+    } else if (
+      inferRetIsUnionAt(inRow, inm)
+      && !inferRetIsLitUnionAt(inRow, inm)
+    ) {
+      // A registered struct-union inferred return: the variant-boxed rep rides the same
+      // union result valtype as a value union, so store `"union"`. A registered litunion
+      // alias is `isUName` too, but its rep is the interned i32 atom and so the default
+      // kind; the annotation side excludes it at the same seam.
+      fRetKind[li] = "union"
+    }
+  }
+  buildFnMapBankRow(li)
+}
+
 // Map each function name to its wasm function index — its position in `fnStmts` — and record
 // its return facts (voidness, struct index, ref-array element, boolean, kind). Built over all
 // top-level functions before any body is emitted, so forward references and recursion resolve
@@ -3139,6 +3344,13 @@ export function buildFnMap(_stmts: i32[]) {
   fmSeenFns = -1
   if resume {
     buildFnMapReseedPrefix()
+    let d = 0
+    while d < fmDirtySlots.length {
+      const ds = fmDirtySlots[d]
+      const dn = P.nodes[fnStmts[ds]]
+      if dn is FuncDecl { buildFnMapClassifyRow(ds, dn, ds) }
+      d = d + 1
+    }
   } else {
     start = 0
     fnNames = []
@@ -3157,6 +3369,7 @@ export function buildFnMap(_stmts: i32[]) {
     fmSeedBool = []
     fmSeedKind = []
   }
+  fmDirtySlots = []
   let i = start
   while i < fnStmts.length {
     const s = P.nodes[fnStmts[i]]
@@ -3173,146 +3386,7 @@ export function buildFnMap(_stmts: i32[]) {
         sidArrPut(nestedNameBySid, fsid, 1)
       }
       fnIndices.push(i)
-      // A declared `: void` return seeds the void classification directly: the fixpoint below
-      // (`computeVoidFns`) covers only the un-annotated half, and an unseeded annotation leaves
-      // every `: void` function emitting `(result i32)`.
-      fRetVoid.push(retVoidAnnFlag(s.fnRet))
-      // The polymorphic slot takes the namespace its `fRetKind` selects, which is the gate
-      // every reader of it already applies: a struct kind takes a struct-TABLE row and
-      // nothing else, since a variant's index in that channel reads as another row (D1737).
-      const rsk = retAnnKindChain(s.fnRet)
-      if rsk == "struct" || rsk == "nulstruct" {
-        fRetStructIdx.push(retStructRowIndex(s.fnRet))
-      } else {
-        fRetStructIdx.push(retStructIndex(s.fnRet))
-      }
-      fRetRArrElem.push(retRefArrElemName(s.fnRet))
-      fRetBool.push(retBoolFlag(s.fnRet))
-      // The stored return kind: one `VKind` slot per function, seeded from the annotation via
-      // `retAnnKindChain`. `computeRetInference` writes the un-annotated facts into the same
-      // slot, so `inferredRetKindCore` is a plain read.
-      fRetKind.push(retAnnKindChain(s.fnRet))
-      fRetLitAtom.push(0)
-      // An un-annotated scalar, string or array return is set directly from the checker's
-      // inferred return name: the expression-based fallback below misses a return that is a
-      // plain variable. No AST node is synthesized, so `fmt` is untouched; `i32` needs nothing,
-      // and `string[]` stores `"strlist"`, the module-global string-list wrapper.
-      if s.fnRet < 0 {
-        // An anonymous lambda's inferred return is keyed by node index, since the lambda has no
-        // name the checker saw; fall back to that when the name-keyed lookup misses. One row
-        // lookup, two columns, so the name arms and the arena arms read the same row by
-        // construction rather than by two readers agreeing.
-        let inRow = inferRetRowOf(inferRetFnKey(fnStmts[i], s.fnName))
-        if inRow < 0 { inRow = inferRetRowByNode(fnStmts[i]) }
-        let inm = ""
-        if inRow >= 0 { inm = inferRetTyAt(inRow) }
-        // The five list arms take the array grammar's one cut plus a leaf name rather than
-        // matching a whole spelling. The `i32` and `string` arms compare the leaf directly,
-        // because their sibling homes (`nameIsI32Array` / `nameIsStringArray`) are rep-wide and
-        // also accept `boolean[]`, a litunion `K[]` and the nullable forms.
-        const li = fRetKind.length - 1
-        // The five scalar arms ask the arena, not the render: `inferRetTyIx` banks the type
-        // beside the name at the one recorder. What makes this sound is the transparency
-        // collapse in `declaredTyOfName` and `isClassifiableRetName`'s admitted set in
-        // `typecheck.vl` — widen that gate and these arms fire where the name arms did not.
-        let retTyIx = -1
-        if inRow >= 0 { retTyIx = inferRetTyIxAt(inRow) }
-        let retPrim = ""
-        if retTyIx >= 0 {
-          const rpt = T.tys[retTyIx]
-          if rpt is TyPrim { retPrim = rpt.primName }
-          // An inferred return whose join is an un-named literal union reps as a string ref,
-          // the same rep its annotated twin gets. A named alias is deliberately excluded: it
-          // reps as the interned i32 atom, and forcing it to `"str"` would put a string-ref
-          // result on a function returning an id. Same seam as `retLitUnionInline`.
-          if retPrim == "" && tyIsLitUnion(retTyIx) {
-            if litUnionAliasNameOfTy(retTyIx) == "" { retPrim = "string" }
-          }
-        }
-        // The five array arms, likewise from the arena, with the recorded array type read off
-        // the same row the name came from. Narrow by construction: exactly the five element
-        // names the cut admits, never the rep-wide helpers, because a `boolean` element is a
-        // `TyArray` of `TyPrim` an arena test would claim while the cascade gives it no arm.
-        let retElem = ""
-        // Five atom compares; the one widening happens only where the name is stored.
-        const raePrim = tyArrayElemPrim(retTyIx)
-        const raeOk = raePrim == "i32"
-          || raePrim == "string"
-          || raePrim == "f64"
-          || raePrim == "i64"
-          || raePrim == "f32"
-        if raeOk { retElem = primNameStr(raePrim) }
-        if retPrim == "null" {
-          // D1567 — the `null` type, from the rung the checker banks for it. Its rep is
-          // `nullref`, the bottom of the GC hierarchy: one value, assignable to every nullable
-          // ref destination with no coercion, and `retKindPri` gives it the top tier so
-          // `criClassify`'s expression facts cannot lower it.
-          fRetKind[li] = "nulnone"
-        } else if retPrim == "string" {
-          fRetKind[li] = "str"
-        } else if retPrim == "i64" {
-          fRetKind[li] = "i64"
-        } else if retPrim == "f64" {
-          fRetKind[li] = "f64"
-        } else if retPrim == "f32" {
-          fRetKind[li] = "f32"
-        } else if retPrim == "boolean" {
-          fRetBool[li] = 1
-        } else if retElem == "i32" {
-          fRetKind[li] = "list"
-        } else if retElem == "string" {
-          fRetKind[li] = "strlist"
-        } else if retElem == "f64" {
-          fRetKind[li] = "f64list"
-        } else if retElem == "i64" {
-          fRetKind[li] = "i64list"
-        } else if retElem == "f32" {
-          fRetKind[li] = "f32list"
-        } else if nameIsBareMap(inm) && mapValNameOf(inm) == "i32" {
-          // A mono `{[string]: i32}` map inferred return. `criClassify`'s `exprMap` can miss it,
-          // since a returned local's kind is not collected during the global return pass, so set
-          // it from the checker's inferred return name.
-          fRetKind[li] = "map"
-        } else if nameIsNulString(inm) {
-          // A `string | null` niche inferred return drives the kind-16 result valtype, the same
-          // kind the annotated path stores. The `boolean | null` niche stores nothing: its
-          // result valtype is plain i32, so it falls through to the default. `nameIsNulString`
-          // is `nullablePartOf(name) == "string"`, the same home the annotation side calls.
-          fRetKind[li] = "nulstr"
-        } else if (nameIsBareMap(nullablePartOf(inm))) {
-          // D937 — the nullable map inferred return, the sibling of the mono-map arm above.
-          // Same pair the annotated path stores (`retNulMapFlag` -> `"nulmap"`), read off the
-          // name the checker recorded. Any string-keyed map, not just the i32-valued one, and
-          // ahead of `inferNulStructRow`, which would otherwise resolve a map as a struct row.
-          fRetKind[li] = "nulmap"
-        } else if inferNulVariantRow(inm) >= 0 {
-          // D1562 — a nullable union-variant inferred return, the twin the `nulstruct` arm below
-          // never had. Ahead of `nulstruct`, which is the annotated ladder's order:
-          // `retAnnKindChain` is last-match-wins and puts the variant after the ref, and this
-          // chain is first-match-wins, so mirroring that precedence means going first.
-          fRetKind[li] = "nulvariant"
-          fRetStructIdx[li] = inferNulVariantRow(inm)
-        } else if inferNulStructRow(inm) >= 0 {
-          // D887 — a nullable-struct inferred return, the same pair the annotated path stores
-          // (`retNulRefFlag` -> `"nulstruct"` + `retStructIndex`), read off the name the checker
-          // recorded, so all four owners of a return row read one answer. Ahead of the two union
-          // arms below because the row is a nullable; both decline anyway.
-          fRetKind[li] = "nulstruct"
-          fRetStructIdx[li] = inferNulStructRow(inm)
-        } else if inferRetIsValueUnionAt(inRow, inm) {
-          fRetKind[li] = "union"
-        } else if (
-          inferRetIsUnionAt(inRow, inm)
-          && !inferRetIsLitUnionAt(inRow, inm)
-        ) {
-          // A registered struct-union inferred return: the variant-boxed rep rides the same
-          // union result valtype as a value union, so store `"union"`. A registered litunion
-          // alias is `isUName` too, but its rep is the interned i32 atom and so the default
-          // kind; the annotation side excludes it at the same seam.
-          fRetKind[li] = "union"
-        }
-      }
-      buildFnMapBankRow()
+      buildFnMapClassifyRow(i, s, fRetKind.length)
     }
     i = i + 1
   }

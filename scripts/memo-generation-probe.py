@@ -188,7 +188,7 @@ ROWS = [
      ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
       "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),
     # `fnStmtsPosOf`'s arena-node → position index: extended by length on push, retired by
-    # `fnPosIndexDrop` at every in-place slot write (`buildFnMapNoteFnSlotWrite`) and reset.
+    # `fnPosIndexDrop` at every in-place slot write (`buildFnMapNoteFnSlotWrite`, `...FnStmtWrite`) and reset.
     ("fnStmtsPosIndex", ["fnPosEpoch", "fnPosFsLen", "fnPosMoLen", "fnPosFsStamp",
                          "fnPosMoStamp"], "probe",
      ("  if hit != 0 - 2 { return hit }",
