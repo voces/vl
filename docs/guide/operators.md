@@ -337,36 +337,39 @@ const ok2 = a == 1
 ```
 
 Everything in the precedence ladder above continues a line — `|| && ?? == != < <= > >= + * / %`,
-the bitwise and shift operators, and assignment — along with `.`, `?.`, `is`, and the four `as`
-casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
+the bitwise and shift operators, assignment, and `-` with a space after it (below) — along with
+`.`, `?.`, `is`, and the four `as` casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
 `a` ⏎ `|| b` ⏎ `&& c` is `a || (b && c)`. Blank lines and comment lines between the two halves
 are free.
 
-**A leading `-` does not continue a line**, because `-x` is a legal statement and a block's last
-statement is its value:
+**A leading `-` continues a line only when a space or tab follows it.** `- x` is a subtraction
+from the line above; `-x`, with the minus touching its operand, is a statement of its own,
+because `-x` is a legal statement and a block's last statement is its value:
 
 ```vl
+const w = a * 3.0
+  - b * 3.5                // one expression: a * 3.0 - b * 3.5
+
 function f(): i32 {
   work()
   -x                       // the block's value is `-x`; NOT `work() - x`
 }
 ```
 
-Write the `-` at the end of the previous line, or parenthesize, to subtract across a break. The
-same holds for a line beginning with `!`, `(`, `[`, `{`, an identifier or a literal: each can
-start a statement, so each does. Inside an open `(`, `[` or object-literal `{` there is no
-statement a newline could end, so `-` continues there like everything else.
+A `-` at the very end of its line does not count as spaced: write the operand on the same
+line. A line beginning with `!`, `(`, `[`, `{`, an identifier or a literal can start a
+statement, so it does. Inside an open `(`, `[` or object-literal `{` there is no statement a
+newline could end, so `-` continues there with or without the space.
 
 `vl fmt` prints a chain it has to break with the operator at the START of each continuation
-line, one operand per line — except a chain with a `-` in it, which keeps every operator at the
-end of the line for the reason above:
+line, one operand per line, and always with a space after the operator:
 
 ```vl
 const label = prefix
   + ": "
   + describe(value)
 
-const span = end -
-  start +
-  padding
+const span = end
+  - start
+  + padding
 ```

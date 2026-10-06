@@ -555,8 +555,8 @@ function binPrec(kind: TokKind): i32 {
 }
 
 // How many `(`, `[` or object-literal `{` are open around the expression being parsed.
-// Inside one there is no statement a NEWLINE could end, so even `-` continues the line; at
-// depth 0 only a token no expression can begin with does. A block resets it to 0, because a
+// Inside one there is no statement a NEWLINE could end, so even `-x` continues the line; at
+// depth 0 a `-` continues only with whitespace after it. A block resets it to 0, because a
 // `{ … }` inside a call argument holds statements. D1581.
 let brDepth = 0
 
@@ -569,13 +569,55 @@ function afterNewlines(): i32 {
   j
 }
 
-// Whether a line-leading binary operator continues the previous expression rather than
-// starting a statement. Derived from `binPrec` so the set cannot drift: `-` is the only
-// entry that can also begin an expression, and outside brackets a leading `-x` line is a
-// block's value (DECISIONS "A line beginning with a token that cannot start an expression").
-function continuesLine(kind: TokKind): boolean {
+// Whether the line-leading binary operator at token `j` continues the previous expression.
+// Derived from `binPrec` so the set cannot drift. `-` can also begin an expression, so outside
+// brackets it continues only when a space or tab follows it (`- b`), and a `-x` line stays a
+// block's value (D3698).
+function continuesLine(j: i32): boolean {
+  const kind = kindAt(j)
   if binPrec(kind) == 0 { return false }
-  brDepth > 0 || kind != "MINUS"
+  if kind != "MINUS" { return true }
+  if negArmPatternAt(j) { return false }
+  brDepth > 0 || spacedAfter(j)
+}
+
+// Whether the `-` at token `j` opens a match arm's integer pattern: `-1 =>` or `-1 | 2 =>`,
+// the pattern run then `=` `>`. No continued expression can be followed by `=>` there, so the
+// next arm is never read as a subtraction from the previous arm's body (D3699).
+function negArmPatternAt(j: i32): boolean {
+  if kindAt(j + 1) != "NUMBER" { return false }
+  let i = j + 2
+  let going = true
+  while going {
+    const k = kindAt(i)
+    if (
+      k == "PIPE"
+      || k == "MINUS"
+      || k == "NUMBER"
+      || k == "STRING"
+      || k == "IDENT"
+    ) {
+      i = i + 1
+      // `parseMatch` lets an or-pattern break after its `|`.
+      if k == "PIPE" {
+        while kindAt(i) == "NEWLINE" { i = i + 1 }
+      }
+    } else {
+      going = false
+    }
+  }
+  kindAt(i) == "EQUAL" && kindAt(i + 1) == "GT"
+}
+
+// Whether a space or tab separates token `j` from the next token on its own line. The lexer
+// skips only those two between tokens on a line, and a line break is a NEWLINE token, so a
+// gap before a same-line, non-NEWLINE successor is horizontal whitespace.
+function spacedAfter(j: i32): boolean {
+  if j < 0 || j + 1 >= P.toks.length { return false }
+  const t = P.toks[j]
+  const nx = P.toks[j + 1]
+  if nx.kind == "NEWLINE" || nx.kind == "EOF" { return false }
+  nx.line == t.line && nx.start > t.start + t.text.length
 }
 
 // The absolute index of the binary operator a NEWLINE run at the cursor leads to, or -1
@@ -584,7 +626,7 @@ function continuesLine(kind: TokKind): boolean {
 // leading to a closer is left in place for `takeSep` to read off `P.pos - 1`.
 function binOpAfterNewlines(): i32 {
   const j = afterNewlines()
-  if continuesLine(kindAt(j)) { return j }
+  if continuesLine(j) { return j }
   -1
 }
 

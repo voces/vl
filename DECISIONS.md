@@ -5362,7 +5362,8 @@ can begin an expression either — `=` and every compound form (`+= -= *= /= %= 
 `?.`) already joined at every depth; `is` and the four `as` casts join here for the first time.
 A `|>` pipe, if one is ever added, would join for the same reason.
 
-**Why unary minus is EXCLUDED.** `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
+**Why unary minus is EXCLUDED** *(amended 2026-10-05: a `-` followed by a space or tab now
+continues — see "A line-leading `-` continues only when whitespace follows it" below)*. `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
 the block's value is `-x`". Joining would silently turn it into `f() - x` — a value change with
 no diagnostic — so a leading-minus line stays a statement, and a program that wants subtraction
 puts the operator at the end of the previous line or in parentheses, as today. Swift, Kotlin, Go
@@ -5393,6 +5394,74 @@ normalises the layout away and that stays fine — the third ruling on this axis
 the leading dot and D1581.
 
 
+## A line-leading `-` continues only when whitespace follows it (D3698, 2026-10-05)
+
+**Ruling** (owner, on sunpa SP-040; amends the 2026-09-04 ruling above, which excluded `-`
+outright). A line whose first token is `-` FOLLOWED BY A SPACE OR TAB is a binary minus and
+continues the previous expression, like every other continuing operator. A `-` touching its
+operand stays a new statement:
+
+```vl
+const w = a * 3.0
+  - b * 3.5        // one expression: a * 3.0 - b * 3.5
+
+function f(): i32 {
+  g()
+  -x               // two statements: the block's value is -x
+}
+```
+
+sunpa's camera wrote the first form, computed `a * 3.0`, and discarded the second line in
+silence; #3383's lint named it after the fact. The spaced form is how every style guide and
+`vl fmt` itself write a broken subtraction, so it now means what it looks like.
+
+**Why `{ f()` ⏎ `-x }` still holds.** The 2026-09-04 reason for the exclusion is unchanged: a
+`-x` line is a legal statement, and a block's last one is its value. The spacing keeps both
+readings: nobody writes a negation as `- x`, and nobody writes a broken subtraction as `-x`.
+
+**The survey.** JavaScript and Lua continue on a leading `-` unconditionally (JS's ASI has no
+rule for it, Lua has no statement terminator), which is the `{ f() ⏎ -x }` hazard. Swift and
+Scala 3 decide by spacing, as here: Swift treats an operator with whitespace on both sides as
+binary and one touching its operand as prefix, and Scala 3 continues a line on a leading
+infix operator only when whitespace follows it. F# decides by indentation (an offside
+operator continues). Go, Kotlin, Ruby and Python start a new statement and make the author
+put the operator at the end of the line or open a bracket.
+
+**The exact rule.** The test is the next TOKEN, not a character: the `-` continues when the
+following token is on the same line and does not start right after it. The lexer skips only
+spaces and tabs between tokens on a line, so that gap is horizontal whitespace. A `-` at the
+end of its line (followed by a newline, or by a comment and then a newline) does NOT count as
+spaced and keeps its old reading — "space or tab" was chosen over "any whitespace" so that a
+lone `-` cannot join three lines. Compound tokens are unaffected by construction: `-=` already
+continued (it cannot begin an expression), `--` is the decrement and no binary operator, VL
+has no `->`, and `-1` lexes as `-` then `1`, so `- 1` continues and `-1` does not. One more
+exception, at every depth: a line that reads as a negative integer match pattern followed by
+`=>` (`-1 =>`, `- 1 | 2 =>`) is the next arm, never a subtraction from the previous arm's
+body, since no continued expression can be followed by `=>` there (D3699, which was already a
+parse error inside brackets). The pattern run may break after an or-pattern's `|`, as
+`parseMatch` allows.
+
+`- b` continues across blank lines and comment-only lines, like the other leading operators:
+the scan is the same `afterNewlines` run.
+
+**Inside brackets nothing changes.** The 2026-09-04 text said a leading `-` inside a bracket
+was a parse error; that was out of date — D1581's bracket gate already let `-` continue there,
+spaced or not, because no statement can end inside a bracket. Both spellings keep continuing.
+
+**The cost is whitespace significance**, which VL otherwise does not have between tokens
+on a line. It is confined to one token at one position (the first token of a line, outside
+brackets), and the two readings differ only where the space makes the author's intent
+visible. `vl fmt` now leads EVERY broken chain with its operator, `-` included, always as
+`- b` (the 2026-09-24 trailing exception is retired), and prints a negated negation as
+`-(-x)` rather than `- -x`, which at the start of a statement would now continue the line
+above.
+
+**Measured.** Every `.vl` file and `vl` code block in this repo and the consumers' sources
+(sunpa/src, plumb/src, glean) was scanned for a line-leading `-`. 0 spaced lines outside
+brackets existed before this change (the one in sunpa, `terrain.vl`, sits inside a `(`), so
+no existing program changes meaning; the tight `-x` lines (919 in the repo, 104 sunpa, 53
+plumb, 8 glean) parse as before by construction.
+
 ## `vl fmt` puts a broken chain's operator at the start of the line (2026-09-24)
 
 **Ruling** (owner). When `vl fmt` breaks a binary-operator chain that does not fit the width,
@@ -5409,7 +5478,8 @@ Only the operator moves. Which chains break, the flattening by precedence, and t
 indentation are unchanged, and so is the forced-paren form of an over-wide `if`/`while`
 condition, whose operands now lead with `&&` / `||` inside the parens.
 
-**A chain holding a `-` link keeps every operator trailing.** The ruling above excludes `-`
+**A chain holding a `-` link keeps every operator trailing.** *(Retired 2026-10-05 by D3698:
+a spaced `- b` now continues at every depth, so a `-` chain leads like any other.)* The ruling above excludes `-`
 from the line-continuing set: outside brackets `a` ⏎ `- b` is two statements, and at a
 binding it is a silent value change (`const v = a` then a discarded `-b`), not an error.
 The formatter does not track bracket depth, so it cannot know when a leading `-` would be

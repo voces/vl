@@ -1152,9 +1152,9 @@ Deno.test({
       // The width check accounts for the leading indent, so a call (or `+`-chain)
       // that only overflows because it is nested wraps: a call breaks to one
       // argument per line with a trailing comma and `)` on its own line; a `+`-chain
-      // breaks at the operators (operator LEADING each continuation line). A chain with
-      // a `-` link keeps its operators trailing, since a line that begins with `-` is a
-      // new statement. A string literal that can't be split stays long, but the call
+      // breaks at the operators (operator LEADING each continuation line), a `-` link
+      // included, since a line that begins with `- ` continues the one above (D3698). A
+      // string literal that can't be split stays long, but the call
       // AROUND it still wraps.
       const f = `${dir}/w.vl`;
       const src =
@@ -1194,15 +1194,15 @@ Deno.test({
       ) {
         throw new Error(`over-width \`+\`-chain did not wrap at operators:\n${once.out}`);
       }
-      // A chain holding `-` keeps every operator trailing: `- betaLonger` on a line
-      // of its own would be a statement, not a subtraction.
+      // A chain holding `-` leads with its operators too: `- betaLonger` with the space
+      // continues the line above (D3698).
       if (
-        !once.out.includes("  const differenceValue = alphaLonger +\n") ||
-        !once.out.includes("\n    gammaLonger +\n") ||
-        !once.out.includes("\n    alphaLonger -\n") ||
-        !once.out.includes("\n    betaLonger\n")
+        !once.out.includes("  const differenceValue = alphaLonger\n") ||
+        !once.out.includes("\n    - gammaLonger\n") ||
+        !once.out.includes("\n    + alphaLonger\n") ||
+        !once.out.includes("\n    - betaLonger\n")
       ) {
-        throw new Error(`a \`-\` chain did not keep its operators trailing:\n${once.out}`);
+        throw new Error(`a \`-\` chain did not lead with its operators:\n${once.out}`);
       }
       // No emitted non-comment, non-string line exceeds 80 columns.
       for (const line of once.out.split("\n")) {
