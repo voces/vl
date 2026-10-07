@@ -52,7 +52,13 @@ NAMES=(); PIDS=(); STARTS=()
 # returns instantly, so an elapsed computed there is the loop's clock. No stamp falls back
 # to that reading. CPU is the same subshell's `times`, whose second line is its reaped
 # children's user+sys — the whole row's process tree, which the box cannot inflate.
-run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
+# `GATE_MAX_PAR` caps how many rows run at once (unset or 0: all at once), for a box shared
+# with a foreground user. A row's WALL starts when it launches, not while it queues.
+GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
+run() { if [ "$GATE_MAX_PAR" -gt 0 ]; then
+          while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done
+        fi
+        local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
@@ -233,7 +239,7 @@ FAIL=0
 # CPU is the row's own user+sys, which contention cannot inflate: WALL/CPU is the waiting,
 # so a row that is SLOW (high CPU) and one that is STARVED (high WALL, low CPU) separate.
 echo
-echo "WALL = elapsed with all rows running   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
+echo "WALL = elapsed once launched   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
 printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
