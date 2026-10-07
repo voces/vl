@@ -10,7 +10,8 @@
 //   the same rung with the step turned off (`$VL_OPT_NO_MULTIVALUE`) and must find more, so
 //   the fixture exercises this step and not the escape step or binaryen alone;
 // * `kept`: the step writes no twin (the record is past its field bound);
-// * `output`: only the output is pinned (records that escape, and recursion).
+// * `output`: only the output is pinned (records that escape, recursion, and the twin
+//   parameter cap).
 //
 // @test-timing opt
 import {
@@ -34,6 +35,7 @@ const FIXTURES: [string, Want][] = [
   ["wide-argument", "melts"],
   ["if-merge", "melts"],
   ["fallback-local", "melts"],
+  ["twin-param-cap", "output"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -157,6 +159,53 @@ for (const [fx, want] of FIXTURES) {
     },
   });
 }
+
+// A rewrite that does not validate is dropped and the input kept: `$VL_MV_FAULT=1` corrupts
+// the step's output, and the build must still succeed and print the plain output, with no
+// step output written.
+Deno.test({
+  name:
+    "native-release: a multi-value rewrite that does not validate is dropped",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = `${DIR}/heap-held.vl`;
+    const logs = logsOf(Deno.readTextFileSync(src));
+    const tmp = await Deno.makeTempDir();
+    try {
+      const dump = `${tmp}/step.wasm`;
+      const out = `${tmp}/m.wasm`;
+      const b = await vl(["build", src, "-O", "-o", out], {
+        VL_MV_FAULT: "1",
+        VL_OPT_MV_DUMP: dump,
+      });
+      if (b.code !== 0) {
+        throw new Error(`build with a faulted step failed: ${b.err.trim()}`);
+      }
+      const r = await vl(["run", out]);
+      const got = linesOf(r.out);
+      if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(logs)) {
+        throw new Error(
+          `want ${JSON.stringify(logs)}, got ${
+            JSON.stringify(got)
+          } rc=${r.code}`,
+        );
+      }
+      let wrote = true;
+      try {
+        Deno.statSync(dump);
+      } catch {
+        wrote = false;
+      }
+      if (wrote) {
+        throw new Error(
+          "want no step output: the faulted rewrite should be dropped",
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
 
 // A twin carries its function's name with `.mv` after it, so a trap inside one reads as the
 // function it came from in a `--names` build. Read off the step's own output.

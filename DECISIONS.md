@@ -7527,7 +7527,9 @@ fields are ordinary arguments. A record ARGUMENT is now 1 to 64 fields (`MV_ARG_
 each a number or a reference, and a result keeps eight numeric fields. A reference field is
 passed on as the reference, so identity holds; the never-written rule is unchanged, so its
 value cannot change while it is read early. A twin takes at most 128 parameters
-(`MV_TWIN_MAX_PARAMS`; V8 accepts 1,000).
+(`MV_TWIN_MAX_PARAMS`; V8 accepts 1,000), bounded per function when its field-only
+parameters are chosen, so no call site can widen a twin past it. The step validates its own
+output and keeps the input when that fails: a bad rewrite costs an optimization, not a build.
 
 **The bound is where the gain falls off, measured.** An N-field `f64` record built per call at
 two sites and passed to a callee too large to inline that reads every field, 6M calls, `-O3`,

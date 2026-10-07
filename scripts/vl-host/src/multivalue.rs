@@ -67,8 +67,9 @@ pub const MV_RECORD_MAX_FIELDS: usize = 8;
 /// fields"), and a field may be a reference.
 pub const MV_ARG_MAX_FIELDS: usize = 64;
 
-/// The most parameters a twin may take, well under engines' limits (V8 accepts 1000): a call
-/// that would pass more keeps its remaining fresh or produced record arguments as structs.
+/// The most parameters a twin may take, well under engines' limits (V8 accepts 1000): a
+/// function's record parameters, in order, may be taken as fields only while its own
+/// parameters plus their fields stay within it, so every twin of it does.
 const MV_TWIN_MAX_PARAMS: usize = 128;
 
 /// At most this many twins, and at most `MV_GROWTH_FLOOR` plus half the code section in their
@@ -525,6 +526,12 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                         target(t.ok()?);
                     }
                 }
+                // A catch delivers to a label too; refuse every enclosing merge.
+                Operator::TryTable { .. } => {
+                    for f in frames.iter_mut().flatten() {
+                        f.4 = true;
+                    }
+                }
                 _ => {}
             }
             if let Some(li) = last_recorded.take() {
@@ -942,18 +949,26 @@ fn analyse(m: &Module) -> Analysis {
     // reference field may hold a struct nothing writes stays whole for a callee the escape step
     // may inline: that struct may be made fresh beside the record, and the escape step removes
     // both, where taken apart here the inner one is still allocated.
-    let mut fo: HashSet<(u32, u32)> = HashSet::new();
+    // The parameters that may be taken apart at all, within `MV_TWIN_MAX_PARAMS`.
+    let mut allowed: HashSet<(u32, u32)> = HashSet::new();
     for f in defined() {
         let small = {
             let r = m.body(f).range;
             r.1 - r.0 <= crate::ESCAPE_INLINE_MAX_BYTES
         };
+        let mut width = m.sig(f).0.len();
         for j in 0..m.sig(f).0.len().min(64) as u32 {
-            if param_record(m, f, j).is_some_and(|t| !(small && m.nested.contains_key(&t))) {
-                fo.insert((f, j));
+            let Some(t) = param_record(m, f, j) else {
+                continue;
+            };
+            let grow = fields_of(m, t).len() - 1;
+            if !(small && m.nested.contains_key(&t)) && width + grow <= MV_TWIN_MAX_PARAMS {
+                width += grow;
+                allowed.insert((f, j));
             }
         }
     }
+    let mut fo: HashSet<(u32, u32)> = allowed.clone();
     loop {
         let drop: Vec<(u32, u32)> = fo
             .iter()
@@ -982,7 +997,9 @@ fn analyse(m: &Module) -> Analysis {
             continue;
         };
         for j in 0..m.sig(f).0.len().min(64) as u32 {
-            if fo.contains(&(f, j)) || !param_record(m, f, j).is_some_and(|t| same_shape(m, t, rt))
+            if fo.contains(&(f, j))
+                || !allowed.contains(&(f, j))
+                || !param_record(m, f, j).is_some_and(|t| same_shape(m, t, rt))
             {
                 continue;
             }
@@ -1333,9 +1350,8 @@ fn plan_context(
             }
         }
         let fo = if rr { &a.fo_param_r } else { &a.fo_param };
-        // Which arguments it passes as fields, within the twin's parameter budget.
+        // Which arguments it passes as fields.
         let mut s = 0u64;
-        let mut width = m.sig(h).0.len();
         for (j, &q) in b.args_of(i).iter().enumerate() {
             let j = j as u32;
             if q == NONE || j >= 64 || !fo.contains(&(h, j)) {
@@ -1354,14 +1370,9 @@ fn plan_context(
                 }
                 _ => false,
             };
-            // A scalarized local has no box left to pass, so it goes as fields whatever the
-            // budget.
-            let grow = fields_of(m, pt).len() - 1;
-            let held = matches!(src.kind, Kind::LocalGet(_));
-            if !ok || (!held && width + grow > MV_TWIN_MAX_PARAMS) {
+            if !ok {
                 continue;
             }
-            width += grow;
             s |= 1u64 << j;
             match src.kind {
                 Kind::Call(_) => {
@@ -2018,6 +2029,17 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
                 names.get(&o).map(|n| format!("{n}.mv"))
             }
         })?;
+    }
+    // A rewrite the validator refuses is a missed optimization, not a failed build: the input
+    // is kept. `$VL_MV_FAULT=1` corrupts the output first, to prove that path.
+    if std::env::var_os("VL_MV_FAULT").is_some_and(|v| !v.is_empty() && v != "0") {
+        out.push(0xff);
+    }
+    if let Err(e) = Validator::new_with_features(WasmFeatures::all()).validate_all(&out) {
+        if explaining {
+            eprintln!("mv-explain: step abandoned: its output does not validate: {e}");
+        }
+        return None;
     }
     Some((out, moved, a))
 }
