@@ -18825,6 +18825,83 @@ function literalTypedByAnnot(ix: i32) {
   false
 }
 
+// Whether the value the initializer `ix` yields keeps its annotated type only through what the
+// annotation supplies: a literal typed by it in any tail, a list literal holding a union or a
+// function, an alias to a list of more than scalars, a generic call's result holding a union, or
+// a cast to more than a scalar. Each builds differently without the annotation (D3800).
+function initTypedByAnnot(ix: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  for lf in leaves {
+    if literalTypedByAnnot(lf) { return true }
+    const n = P.nodes[lf]
+    const t = nodeTyOf(lf)
+    if n is ArrayLit {
+      for e in n.arrElems {
+        if tyRepVaries(nodeTyOf(e), 4) { return true }
+      }
+    } else if n is Call {
+      const cn = P.nodes[n.callFn]
+      if cn is Ident {
+        const fd = fnDeclIx[cn.identName] ?? -1
+        if fnIsGenericDecl(fd) && tyRepVaries(t, 4) { return true }
+      }
+    } else if n is AsExpr {
+      if !tyIsPlainScalar(t) { return true }
+    } else if n is Ident {
+      const el = tyArrayElemIx(t)
+      if el >= 0 && !tyIsPlainScalar(el) { return true }
+    }
+  }
+  false
+}
+
+// A number, `boolean` or `string`: a type with one rep under any inference.
+function tyIsPlainScalar(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    match t.primName {
+      "i32" | "i64" | "f32" | "f64" | "boolean" | "string" => {
+        return true
+      }
+      "void" | "null" | "never" | "u8" | "v128" => {
+        return false
+      }
+    }
+  }
+  false
+}
+
+// Whether `ty` is or holds, through lists, a union, a nullable or a function: a value whose rep
+// depends on the destination it is built for. Unknown below `depth`.
+function tyRepVaries(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return true }
+  const t = T.tys[ty]
+  match t {
+    TyUnion | TyNullable | TyFunc => true
+    TyArray => tyRepVaries(t.aElem, depth - 1)
+    TyPrim | TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// Whether the declaration `fd` is a generic function: a type parameter, or a parameter without
+// a type, which each call site solves.
+function fnIsGenericDecl(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const n = P.nodes[fd]
+  if n is FuncDecl {
+    if n.fnTyParams.length > 0 { return true }
+    for p in n.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parType < 0 { return true }
+      }
+    }
+  }
+  false
+}
+
 // The elements of the list literal at `ix`, or none when it is not one.
 function arrayLitElemsOf(ix: i32): i32[] {
   const nd = P.nodes[ix]
@@ -18851,7 +18928,7 @@ function recordRedundantAnnot(
   // A record literal takes the annotation's record type, which can be the nominal type an `is` or
   // an equality reads, and a list literal holding `null` or a literal of its own takes its element
   // type from it: the initializer is typed BY the annotation, so the comparison is circular (D3597).
-  if n.letInit >= 0 && literalTypedByAnnot(n.letInit) { return 0 }
+  if n.letInit >= 0 && initTypedByAnnot(n.letInit) { return 0 }
   // A call of a function that took this annotation as its result is typed by it, not redundant.
   if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
   // Without its annotation a `const` bound to a string literal holds that literal's type, so a
@@ -18924,6 +19001,36 @@ function retInfluencedByAnnot(ix: i32) {
     }
   }
   false
+}
+
+// Does the return value `ix`, of natural type `t`, have the annotated type only by something the
+// un-annotated spelling builds differently: an open collection hole the annotation pins, a read
+// through a narrowing, a call of the function itself, or a call through a binding the body
+// reassigns (D3800)?
+function retSiteTypedByAnnot(ix: i32, t: i32): boolean {
+  if t >= 0 && tyReachesEmptyHole(t, 8) { return true }
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length || curFnDeclIx < 0 { return false }
+  if narDeclaredTy(identNameAt(p), -1) >= 0 { return true }
+  const f = P.nodes[curFnDeclIx]
+  const callee = callIdentName(p)
+  if callee == "" || !(f is FuncDecl) { return false }
+  if callee == f.fnName { return true }
+  lookupDepth(callee) >= 0 && crSubtreeAssigns(f.fnBody, callee)
+}
+
+// The name a bare identifier at `ix` reads, or "".
+function identNameAt(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName }
+  ""
+}
+
+// The name a call at `ix` calls when its callee is a bare identifier, or "".
+function callIdentName(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is Call { return identNameAt(n.callFn) }
+  ""
 }
 
 // Record a redundant return-type annotation (`function f(): T { … }` whose body's inferred return
@@ -52464,7 +52571,12 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
           // Redundant-return rule: witness the trailing expression's NATURAL type
           // (before constrainEmpty pins a hole); an annotation-influenced trailing
           // (empty `[]`/`Map()`, `null`) disqualifies the function.
-          if retInfluencedByAnnot(stmts[s]) { retNaturalErr = true }
+          if (
+            retInfluencedByAnnot(stmts[s])
+            || retSiteTypedByAnnot(stmts[s], stTy)
+          ) {
+            retNaturalErr = true
+          }
           noteNaturalRet(stTy)
           constrainEmptyExpr(stmts[s], stTy, ret)
           // Soundness — missing-return / non-exhaustive fall-through: an else-less `is`-chain
@@ -56860,6 +56972,9 @@ export function checkProgram(rootIx: i32) {
   lbiReport()
   recAdForcedReport()
   recAdReport()
+  // A program with errors is typed in part against what its annotations say, so none of them
+  // is reported redundant (D3800).
+  if T.diags.length > 0 { redunTruncate(0) }
 }
 
 // A fresh check of the program after a pass rewrote some declarations' annotations.
@@ -72215,7 +72330,9 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   }
   // Redundant-return rule: witness the explicit return's natural type (before
   // constrainEmpty); an annotation-influenced return disqualifies the function.
-  if retInfluencedByAnnot(n.retArg) { retNaturalErr = true }
+  if retInfluencedByAnnot(n.retArg) || retSiteTypedByAnnot(n.retArg, got) {
+    retNaturalErr = true
+  }
   noteNaturalRet(got)
   // An explicit `return inner` of an empty collection pins its element from the
   // declared return type — usage-driven inference clearing the floor.
