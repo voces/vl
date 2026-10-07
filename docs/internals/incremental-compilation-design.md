@@ -1,7 +1,8 @@
 # Incremental and cached compilation (lane IC)
 
-Status: **S1 built OPT-IN (lane CA, 2026-10-07)** — `VL_COMPILE_CACHE=1`, for `vl build` and
-each pooled `vl test` file; see §5's S1 row and "S1 as built" below it. Written 2026-10-06 for
+Status: **S1 and S2 built OPT-IN (lanes CA and S2, 2026-10-07)** — `VL_COMPILE_CACHE=1`, for
+`vl build` and each pooled `vl test` file, and the `-O` chain; see §5's S1 and S2 rows and "S1 as
+built" and "S2 as built" below them. Written 2026-10-06 for
 the owner's direction of that day:
 
 > We should consider: 1. Compiling multiple things at the same time (in memory caching etc),
@@ -859,6 +860,27 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
   verify-sample schedule (`sample:20`); gate 4 (`VL_NO_COMPILE_CACHE=1` in `gate.sh` and CI);
   the matrix rows for each seed rung, `$VL_STD`, `BINARYEN_*`, a swapped `wasm-opt` and the
   host id; lookups before the pool is sized (§4.4); the trial week.
+
+**S2 as built (opt-in, with S1).** A `vl build -O`/`-O3` is two actions: S1's compile, then
+the chain as action kind `opt` (`opt_cache_action`, `main.rs`), traced as `-O hit`, `-O miss`, ….
+- Key: the bytes the chain is given (after the `vl-src` strip), the rung, `--names`,
+  `--low-memory-unused`, `--stable-layout`, the host build id, every keyed `VL_*` and
+  `BINARYEN_*` variable, and the `wasm-opt` that would run (path, canonical file, its SHA-256
+  and its `--version` output, or `absent`). Under `--source-map` also the emitter's bytes with
+  their rows, the input and `-o` paths, the directories they resolve to and the cwd: the map is
+  made from these. The transcript is empty.
+- Result: the final module before the `sourceMappingURL` step, and the map's text. A hit writes
+  both; the URL step and validation still run. Only a module the engine validates is stored.
+- The chain's variables, classified: `VL_OPT_NO_INLINE`, `VL_OPT_NO_MULTIVALUE`,
+  `VL_OPT_NO_FLAT`, `VL_INLINE_REBOX`, `VL_INLINE_SPILL`, `VL_MV_FAULT`, `VL_WASM_OPT` and
+  `BINARYEN_*` are keyed; `VL_INLINE_EXPLAIN`, `VL_MV_EXPLAIN`, `VL_OPT_{INLINE,FLAT,MV,ESCAPE}_DUMP`
+  and `VL_PROFILE` bypass.
+- Conservative choices: the chain keys EVERY keyed `VL_*` variable, not only the ones it reads,
+  so `VL_STD` or `VL_COMPILER_WASM` moving misses it; `BINARYEN_CORES` is keyed though the
+  output does not depend on it; S1's key now carries the `--version` too.
+- Measured on sunpa `91667c7`'s `build:vl` (`-O3 --names --source-map`, binaryen.js 130): cold
+  39.0 s / 567 MiB RSS; S1 hit with the chain run 30.7 s / 323 MiB; S1+S2 hit 0.2 s / 102 MiB;
+  module and map byte-identical to the cold build, and a verify run agrees.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's

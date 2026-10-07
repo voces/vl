@@ -10,7 +10,11 @@
 //   3. Controls: an INERT variable must still HIT (a matrix that always missed would pass
 //      without it), and a BYPASS variable neither hits nor stores.
 //   4. A forged result that differs from a cold compile exits 71 under verify mode.
-//   5. The guard against an unrecorded input: every guest export the host calls and every
+//   5. Stage S2, the `-O` chain (`-O hit`, `-O miss`, … in the trace): a hit's module and
+//      source map equal a cold run's, and each chain input misses — the rung, a keyed
+//      variable, a `BINARYEN_*` variable, the `wasm-opt` swapped or missing, `-o` under
+//      `--source-map` — while `-o` alone and a comment edit still hit.
+//   6. The guard against an unrecorded input: every guest export the host calls and every
 //      `CMD_*` code is classified below, and an unclassified one fails this file.
 //
 // Evidence is `VL_COMPILE_CACHE_TRACE=1`'s stderr lines and the files on disk, never timing.
@@ -112,10 +116,10 @@ test("a hit is byte-identical to a cold build, and verify mode agrees", async ()
     const ver = await vl(BUILD, p, { VL_COMPILE_CACHE_VERIFY: "1" });
     expect([ver.code, ver.trace], [0, ["hit", "verified"]], "verify mode");
     expect(await Deno.readFile(`${p}/out.wasm`), coldBytes, "verified bytes equal cold bytes");
-    // `-O` re-runs the host's steps on the served bytes: the optimized module is identical too.
+    // `-O` is a second action (S2), the host's chain on the served bytes: identical too.
     const o1 = await vl([...BUILD.slice(0, 2), "-O", "-o", "o1.wasm"], p);
     const o2 = await vl([...BUILD.slice(0, 2), "-O", "-o", "o2.wasm"], p);
-    expect([o1.trace, o2.trace], [["miss", "stored"], ["hit"]], "-O cold then hit");
+    expect([o1.trace, o2.trace], [["miss", "stored", "-O miss", "-O stored"], ["hit", "-O hit"]], "-O cold then hit");
     expect(await Deno.readFile(`${p}/o2.wasm`), await Deno.readFile(`${p}/o1.wasm`), "-O bytes");
   } finally {
     await Deno.remove(tmp, { recursive: true });
@@ -289,6 +293,134 @@ test("verify mode exits 71 when a stored result differs from a cold compile", as
     const v = await vl(BUILD, p, { VL_COMPILE_CACHE_VERIFY: "1" });
     expect([v.code, v.trace[0]], [71, "hit"], "verify mismatch");
     if (!v.err.includes("compile cache MISMATCH")) throw new Error(`no mismatch message:\n${v.err}`);
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+// ── stage S2: the `-O` chain ───────────────────────────────────────────────
+
+/** The `wasm-opt` this test's builds resolve: `$VL_WASM_OPT`, else the first on `PATH`. */
+const realWasmOpt = (): string | undefined =>
+  Deno.env.get("VL_WASM_OPT") ??
+    (Deno.env.get("PATH") ?? "").split(":").map((d) => `${d}/wasm-opt`).find(exists);
+
+const OPT = ["build", "main.vl", "-O3", "-o", "o.wasm"];
+const optTrace = (t: string[]) => t.filter((l) => l.startsWith("-O "));
+
+test("-O3: a chain hit's module and source map equal a cold run's, and verify mode agrees", async () => {
+  const { tmp, p } = await setup();
+  try {
+    const args = [...OPT, "--source-map"];
+    const cold = await vl(args, p);
+    expect([cold.code, optTrace(cold.trace)], [0, ["-O miss", "-O stored"]], "cold");
+    const mod = await Deno.readFile(`${p}/o.wasm`), map = await Deno.readFile(`${p}/o.wasm.map`);
+    await Deno.remove(`${p}/o.wasm`);
+    await Deno.remove(`${p}/o.wasm.map`);
+    const hit = await vl(args, p);
+    expect([hit.code, hit.trace], [0, ["hit", "-O hit"]], "warm");
+    expect(await Deno.readFile(`${p}/o.wasm`), mod, "hit module equals cold module");
+    expect(await Deno.readFile(`${p}/o.wasm.map`), map, "hit map equals cold map");
+    const ver = await vl(args, p, { VL_COMPILE_CACHE_VERIFY: "1" });
+    expect([ver.code, optTrace(ver.trace)], [0, ["-O hit", "-O verified"]], "verify mode");
+    // A comment at the end of a dependency moves no emitted byte: the compile misses, the
+    // chain hits (without a source map, whose rows would carry the edit).
+    await vl(OPT, p);
+    await Deno.writeTextFile(`${p}/lib.vl`, LIB + "// a comment\n");
+    expect((await vl(OPT, p)).trace, ["miss", "stored", "-O hit"], "a comment edit");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("-O3: each chain input misses; -o without --source-map does not", async () => {
+  const opt = realWasmOpt();
+  if (!opt) throw new Error("no wasm-opt to wrap: set $VL_WASM_OPT or put binaryen on PATH");
+  const { tmp, p } = await setup();
+  try {
+    const bin = `${tmp}/bin`;
+    await Deno.mkdir(bin);
+    const wrapper = `${bin}/wasm-opt`;
+    const wrap = async (extra: string) => {
+      await Deno.writeTextFile(wrapper, `#!/bin/sh\n${extra}exec '${opt}' "$@"\n`);
+      await Deno.chmod(wrapper, 0o755);
+    };
+    await wrap("");
+    /** Warm `args`, then run `next`; answer the chain's trace lines and the exit code. */
+    const after = async (args: string[], next: string[], env: Record<string, string> = {}, base = {}) => {
+      await vl(args, p, base);
+      expect(optTrace((await vl(args, p, base)).trace), ["-O hit"], `warm (${args.join(" ")})`);
+      const r = await vl(next, p, { ...base, ...env });
+      return { code: r.code, t: optTrace(r.trace) };
+    };
+    const missRows: [string, string[], string[], Record<string, string>, Record<string, string>?][] = [
+      ["the rung (-O3 → -O)", OPT, ["build", "main.vl", "-O", "-o", "o.wasm"], {}],
+      ["a keyed VL_OPT variable", OPT, OPT, { VL_OPT_NO_MULTIVALUE: "1" }],
+      ["a BINARYEN_* variable", OPT, OPT, { BINARYEN_CORES: "3" }],
+      ["a wasm-opt wrapper as $VL_WASM_OPT", OPT, OPT, { VL_WASM_OPT: wrapper }],
+      ["a wasm-opt wrapper first on PATH", OPT, OPT, { PATH: `${bin}:${Deno.env.get("PATH") ?? ""}` }],
+      [
+        "-o under --source-map",
+        [...OPT, "--source-map"],
+        ["build", "main.vl", "-O3", "-o", "o2.wasm", "--source-map"],
+        {},
+      ],
+    ];
+    for (const [what, args, next, env] of missRows) {
+      const { code, t } = await after(args, next, env);
+      expect([code, t[0]], [0, "-O miss"], what);
+    }
+    // The same wrapper path with different bytes: the file is keyed, not only its path.
+    const viaWrapper = { VL_WASM_OPT: wrapper };
+    await vl(OPT, p, viaWrapper);
+    await wrap(": swapped\n");
+    expect(optTrace((await vl(OPT, p, viaWrapper)).trace)[0], "-O miss", "the wrapper's bytes changed");
+    // No wasm-opt at all: never served, so the build still refuses.
+    const gone = await after(OPT, OPT, { PATH: `${tmp}/empty` });
+    expect([gone.code !== 0, gone.t], [true, ["-O miss"]], "wasm-opt missing");
+    // Control: -o is not an input of the chain unless a source map names it.
+    const o = await after(OPT, ["build", "main.vl", "-O3", "-o", "o3.wasm"]);
+    expect([o.code, o.t], [0, ["-O hit"]], "-o alone");
+    expect(await Deno.readFile(`${p}/o3.wasm`), await Deno.readFile(`${p}/o.wasm`), "-o alone: same bytes");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("-O3: verify mode exits 71 when a stored chain result differs from a cold run", async () => {
+  const { tmp, p } = await setup();
+  try {
+    await vl(OPT, p);
+    const dir = `${tmp}/cache/compile`;
+    // The chain's result is a flag byte and a length before the module; the compile's is
+    // the module itself.
+    let forgedOne = false;
+    for (const r of files(tmp).filter((n) => n.endsWith(".r"))) {
+      const body = (await Deno.readFile(`${dir}/${r}`)).slice(40);
+      if (new TextDecoder().decode(body.slice(10, 13)) !== "asm") continue;
+      body[body.length - 1] ^= 0xff;
+      await Deno.writeFile(`${dir}/${r}`, new Uint8Array([...enc("VLCR0001"), ...await sha(body), ...body]));
+      forgedOne = true;
+    }
+    expect(forgedOne, true, "found the chain's result");
+    const v = await vl(OPT, p, { VL_COMPILE_CACHE_VERIFY: "1" });
+    expect([v.code, optTrace(v.trace)], [71, ["-O hit"]], "verify mismatch");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("-O3: an explain variable bypasses the chain, stores nothing", async () => {
+  const { tmp, p } = await setup();
+  try {
+    await vl(OPT, p);
+    const n = files(tmp).length;
+    const r = await vl(OPT, p, { VL_INLINE_EXPLAIN: "1" });
+    expect(
+      [r.code, optTrace(r.trace), files(tmp).length],
+      [0, ["-O off (bypass VL_INLINE_EXPLAIN)"], n],
+      "bypass",
+    );
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }

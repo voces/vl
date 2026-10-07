@@ -690,7 +690,9 @@ Cranelift compile is cached".
 `VL_COMPILE_CACHE=1` keeps the module a `vl build`, or a pooled `vl test` file, emitted under
 `<cache dir>/compile/`, keyed on the seed, the host build, the keyed environment, what the host
 stages and every module the compiler was handed (incremental-compilation-design.md §4.1, S1).
-Off by default.
+Under `-O`/`-O3` it also keeps the optimized module (and its `--source-map` map), keyed on the
+bytes the `-O` chain was given, so a hit skips the host's steps and `wasm-opt` (S2); its trace
+lines read `-O hit`, `-O miss`, …. Off by default.
 
 | variable | effect |
 | --- | --- |

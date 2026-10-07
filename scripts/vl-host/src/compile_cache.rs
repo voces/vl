@@ -12,7 +12,9 @@
 // told the same things, so it would have emitted the same bytes, and the result is served.
 //
 // Only the guest's emitted bytes are stored. A failed compile, a trap, and any run under a
-// bypass variable store nothing.
+// bypass variable store nothing. Stage S2 adds one more action kind, `opt`: the host's `-O`
+// chain (its own steps and `wasm-opt`), keyed on the bytes it is given rather than on a
+// transcript, whose result is the final module and its source map.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -121,6 +123,13 @@ pub struct Action {
     dir: PathBuf,
     mkey: [u8; 32],
     verify: bool,
+    tag: &'static str,
+}
+
+/// The trace prefix of an action kind: the `-O` chain's lines read `-O hit`, `-O miss`, …,
+/// so a build that runs both actions reports each.
+fn tag_of(kind: &str) -> &'static str {
+    if kind == "opt" { "-O " } else { "" }
 }
 
 /// One length-prefixed field of a key, so no two field lists hash alike.
@@ -223,17 +232,18 @@ impl Action {
     /// for this process, has no private directory, or `parts` cannot be computed. `parts` is
     /// called only when the cache is on, so a default run pays for none of it.
     pub fn new(kind: &str, parts: impl FnOnce() -> Option<Vec<Vec<u8>>>) -> Option<Action> {
+        let tag = tag_of(kind);
         let verify = match mode() {
             Ok(v) => v,
             Err(why) => {
-                trace(&format!("off ({why})"));
+                trace(&format!("{tag}off ({why})"));
                 return None;
             }
         };
         let root = user_cache_root()?;
         let dir = root.join("compile");
         if private_cache_dir(&root).is_err() || private_cache_dir(&dir).is_err() {
-            trace("off (unsafe dir)");
+            trace(&format!("{tag}off (unsafe dir)"));
             return None;
         }
         let mut h = Vec::new();
@@ -247,7 +257,11 @@ impl Action {
         for p in parts()? {
             feed(&mut h, &p);
         }
-        Some(Action { dir, mkey: sha256(&h), verify })
+        Some(Action { dir, mkey: sha256(&h), verify, tag })
+    }
+
+    fn trace(&self, what: &str) {
+        trace(&format!("{}{what}", self.tag));
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -310,7 +324,7 @@ impl Action {
         }
         publish(&mpath, text.as_bytes());
         prune_cache_dir(&self.dir, &rpath, &[".m", ".r"], max_bytes());
-        trace("stored");
+        self.trace("stored");
     }
 }
 
@@ -330,7 +344,7 @@ pub fn serve<T>(
         return compile();
     };
     if let Some((bytes, rkey)) = action.lookup(read) {
-        trace("hit");
+        action.trace("hit");
         if !action.verify {
             return Ok(from_hit(bytes));
         }
@@ -351,10 +365,10 @@ pub fn serve<T>(
             );
             std::process::exit(EXIT_CACHE_MISMATCH);
         }
-        trace("verified");
+        action.trace("verified");
         return Ok(cold);
     }
-    trace("miss");
+    action.trace("miss");
     RECORDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
     let result = compile();
     let reads = RECORDING.with(|r| r.borrow_mut().take()).unwrap_or_default();
