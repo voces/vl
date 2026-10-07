@@ -2189,7 +2189,7 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
         // evicting each other. Price: one read + hash of the ~1.8 MB seed per
         // invocation, measured in `docs/internals/perf-opportunities-2026-09.md` item 4.
         CompilerSource::Path(compiler_path) => {
-            let bytes = std::fs::read(compiler_path).map_err(|e| {
+            let bytes = seed_bytes(compiler_path).map_err(|e| {
                 Error::from(e).context(format!(
                     "loading compiler module `{compiler_path}` (build it with: scripts/refresh-compiler.sh)"
                 ))
@@ -2844,13 +2844,29 @@ fn staged_root_and_cwd() -> (String, String) {
     (root.unwrap_or_default(), cwd.unwrap_or_default())
 }
 
-/// The SHA-256 of the resolved compiler seed, once per process — the compile cache's
-/// compiler identity. `None` when the seed cannot be read (the compile then fails on its own).
+/// The seed file's bytes, read ONCE per process and path: `load_compiler_module` compiles
+/// these and `compiler_hash` hashes these, so a seed replaced on disk mid-run (another
+/// shell's `refresh-compiler.sh`) cannot file one seed's output under the other's key.
+fn seed_bytes(path: &str) -> std::io::Result<Arc<Vec<u8>>> {
+    static SEED: Mutex<Option<(String, Arc<Vec<u8>>)>> = Mutex::new(None);
+    let mut slot = SEED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((p, bytes)) = slot.as_ref() {
+        if p == path {
+            return Ok(bytes.clone());
+        }
+    }
+    let bytes = Arc::new(std::fs::read(path)?);
+    *slot = Some((path.to_string(), bytes.clone()));
+    Ok(bytes)
+}
+
+/// The SHA-256 of the seed bytes this process compiles with — the compile cache's compiler
+/// identity. `None` when the seed cannot be read (the compile then fails on its own).
 fn compiler_hash(source: &CompilerSource) -> Option<[u8; 32]> {
     static HASH: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
     *HASH.get_or_init(|| match source {
         CompilerSource::Embedded(bytes) => Some(sha256(bytes)),
-        CompilerSource::Path(p) => std::fs::read(p).ok().map(|b| sha256(&b)),
+        CompilerSource::Path(p) => seed_bytes(p).ok().map(|b| sha256(&b)),
     })
 }
 
@@ -2988,7 +3004,7 @@ macro_rules! phase {
 /// How a `vl build` module links into its host: `--import-memory` and the `std:buffer`
 /// heap window. The default is the shape every other path emits — a defined memory and
 /// the historical window — so only `build_cmd` ever passes anything else.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 struct LinkOpts {
     import_memory: bool,
     /// `--shared-memory=<pages>`: the memory's declared max, which makes it shared.
@@ -3235,7 +3251,7 @@ fn usage_exit(msg: &str) -> ! {
 }
 
 /// Which `--names` custom sections a compile asks the seed for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Names {
     Off,
     /// The name section and `vl-src`.
@@ -9552,13 +9568,15 @@ fn real_main() -> Result<()> {
     }
 }
 
-/// `vl build`'s compile-cache action: keyed on the whole argv, the resolved colour, what
-/// `stage_program` stages (the VL root, the cwd, the entry's bytes) and, under `-O`/`-O3`,
+/// `vl build`'s compile-cache action: keyed on `staged` (what `compile_vl_instance` stages:
+/// the entry path, the name sections, the link options; and the `-o` a source map names),
+/// the resolved colour, what `stage_program` stages (the VL root, the cwd, the entry's bytes),
+/// the seed bytes that compile and, under `-O`/`-O3`,
 /// the `wasm-opt` that would run. `None` when the cache is off, or when the build reads the
 /// compiler instance after the compile (`reads_session`, the heap-window checks), which a
 /// hit does not have.
 fn build_cache_action(
-    args: &[String],
+    staged: &str,
     source: &str,
     compiler: &CompilerSource,
     optimizing: bool,
@@ -9582,19 +9600,9 @@ fn build_cache_action(
             }
             None => "absent".to_string(),
         };
-        // `-o` reaches no guest; it is keyed only under `--source-map`, whose map names it.
-        let mut argv: Vec<&str> = Vec::new();
-        let mut it = args[1..].iter();
-        while let Some(a) = it.next() {
-            if a == "-o" && !args.iter().any(|a| a == "--source-map") {
-                it.next();
-                continue;
-            }
-            argv.push(a);
-        }
         Some(vec![
             compiler_hash(compiler)?.to_vec(),
-            argv.join("\0").into_bytes(),
+            staged.as_bytes().to_vec(),
             color.as_bytes().to_vec(),
             root.into_bytes(),
             cwd.into_bytes(),
@@ -9711,7 +9719,13 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // refuses is never stored in the compile cache, so a hit never needs one.
     let reads_session = (low_memory.is_some_and(|n| n > HEAP_BASE_DEFAULT) && link.heap.is_none())
         || (link.import_memory && link.heap.is_none() && link.shared_pages.is_none());
-    let action = build_cache_action(args, &source, &compiler, optimizing, reads_session);
+    // Keyed on the values staged, never on a filtered argv: flags are scanned anywhere, so
+    // `-o --names` both names the output and turns names on.
+    let staged = format!(
+        "{input}\0{names_mode:?}\0{link:?}\0{optimizing}\0{}",
+        if source_map { out.as_str() } else { "" }
+    );
+    let action = build_cache_action(&staged, &source, &compiler, optimizing, reads_session);
     let (mut bytes, mut session) = compile_cache::serve(
         action.as_ref(),
         &read_module_key,

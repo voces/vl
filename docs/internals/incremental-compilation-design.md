@@ -843,9 +843,14 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
 - Only the guest's emitted bytes are stored, and only for a compile that succeeded and whose
   module the engine validates. A failed compile is recomputed every time, so no printed text
   is replayed; that is the conservative half of "the exact stdout and stderr text".
-- Staged values (argv with `-o` dropped unless `--source-map`, the resolved colour, the VL root,
-  the cwd, the entry's bytes, the `wasm-opt` path and binary hash under `-O`) go into the
-  manifest key rather than being replayed; the transcript is the module reads.
+- Staged values go into the manifest key rather than being replayed: the entry path, the name
+  sections and link options as STAGED (never a filtered argv; flags are scanned anywhere, so
+  the token after `-o` can be one), `-o` under `--source-map`, the resolved colour, the VL
+  root, the cwd, the entry's bytes, and the `wasm-opt` path and binary hash under `-O`. The
+  transcript is the module reads.
+- The seed's hash is of the bytes that compile: the file is read once per process
+  (`seed_bytes`), so a seed swapped on disk mid-run cannot store one seed's output under the
+  other's key.
 - Conservative choices beyond the doc: `VL_REP_SHADOW` is a bypass variable; a `vl build`
   whose host reads the compiler instance after the compile (the `heapWindowRead` checks under
   `--low-memory-unused` or `--import-memory` without a heap window) bypasses; `wasm-opt`

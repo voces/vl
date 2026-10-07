@@ -192,6 +192,21 @@ test("the mutation matrix: each input class misses", async () => {
   }
 });
 
+test("the token after -o is still a flag: `-o --names` and `-o --initial-memory=` miss", async () => {
+  // Flags are scanned anywhere, so that token is both the output path and a staged flag;
+  // a key built from a filtered argv served the plain build's bytes to it.
+  for (const flag of ["--names", "--initial-memory=2MiB"]) {
+    const { tmp, p } = await setup();
+    try {
+      await vl(BUILD, p);
+      const t = await vl(["build", "main.vl", "-o", flag], p, { VL_COMPILE_CACHE_VERIFY: "1" });
+      expect([t.code, t.trace[0]], [0, "miss"], `-o ${flag}`);
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  }
+});
+
 test("the seed's bytes are keyed, not its path", async () => {
   // The seed is copied with its Cranelift sidecars (content-keyed, so they still apply),
   // and then overwritten in place: the path and every variable stay the same. The lookup
@@ -324,6 +339,18 @@ const COMMANDS: Record<string, "input" | "output" | "uncached"> = {
   CMD_TEST_RUN: "uncached", CMD_VALIDATE: "uncached", CMD_TEST_ENQUEUE: "uncached",
   CMD_TEST_COMPILE: "uncached",
 };
+
+Deno.test("compile cache: the seed is keyed on the bytes that compile, read once", async () => {
+  // A seed replaced mid-run must not file one seed's output under the other's key, so the
+  // key's hash and the compile share one read (`seed_bytes`) and nothing reads the seed file
+  // a second time.
+  const src = await Deno.readTextFile(`${ROOT}/scripts/vl-host/src/main.rs`);
+  const body = (name: string) => src.slice(src.indexOf(`fn ${name}(`), src.indexOf("\n}\n", src.indexOf(`fn ${name}(`)));
+  for (const fn of ["load_compiler_module", "compiler_hash"]) {
+    if (!body(fn).includes("seed_bytes(")) throw new Error(`${fn} does not read the seed through seed_bytes`);
+  }
+  if (/std::fs::read\(compiler_path\)/.test(src)) throw new Error("a second read of the seed file");
+});
 
 Deno.test("compile cache: every guest export and CMD code the host uses is classified", async () => {
   const src = await Deno.readTextFile(`${ROOT}/scripts/vl-host/src/main.rs`);
