@@ -54,7 +54,7 @@ NAMES=(); PIDS=(); STARTS=()
 # children's user+sys — the whole row's process tree, which the box cannot inflate.
 # `GATE_MAX_PAR` caps how many rows run at once (unset or 0: all at once), for a box shared
 # with a foreground user. A row's WALL starts when it launches, not while it queues.
-GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
+GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
 run() { if [ "$GATE_MAX_PAR" -gt 0 ]; then
           while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done
         fi
@@ -239,7 +239,7 @@ FAIL=0
 # CPU is the row's own user+sys, which contention cannot inflate: WALL/CPU is the waiting,
 # so a row that is SLOW (high CPU) and one that is STARVED (high WALL, low CPU) separate.
 echo
-echo "WALL = elapsed with all rows running   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
+echo "WALL = elapsed once launched   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
 printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
