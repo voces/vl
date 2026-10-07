@@ -1721,6 +1721,19 @@ let vecParamId: {[i32]: i32} = Map()
 let vecArgLits: i32[] = []
 let vecArgParams: i32[] = []
 let vecArgTys: string[] = []
+// The module function being scanned (-1 in a lambda or outside any), the returned literals
+// queued against one, each call of one with its node, and the call contexts seen.
+let vecFnDecl = -1
+let vecRetLits: i32[] = []
+let vecRetFns: i32[] = []
+let vecRetTys: string[] = []
+let vecCallIxs: i32[] = []
+let vecCallFns: i32[] = []
+// Per `Call` node: 1 read at a constant index, else the `declNodes` id of the local it binds
+// plus 2. A function named anywhere but as a callee is in `vecFnEscapes`.
+let vecCallCtx: {[i32]: i32} = Map()
+let vecCalleeIx: {[i32]: i32} = Map()
+let vecFnEscapes: {[i32]: i32} = Map()
 
 function vecReset() {
   vecFnRet = -1
@@ -1735,6 +1748,15 @@ function vecReset() {
   vecArgLits = []
   vecArgParams = []
   vecArgTys = []
+  vecFnDecl = -1
+  vecRetLits = []
+  vecRetFns = []
+  vecRetTys = []
+  vecCallIxs = []
+  vecCallFns = []
+  vecCallCtx = Map()
+  vecCalleeIx = Map()
+  vecFnEscapes = Map()
   0
 }
 
@@ -1906,11 +1928,14 @@ function vecLitFloatTy(ix: i32): string {
   ty
 }
 
-// Enter function `n` for this rule: its return annotation, and its body's tail marked as
-// returned. Answers the annotation `vecLeaveFn` restores.
-function vecEnterFn(n: FuncDecl): i32 {
+// Enter function `n` at node `ix` for this rule: its return annotation, whether it is a
+// module function, and its body's tail marked as returned. Answers the annotation
+// `vecLeaveFn` restores.
+function vecEnterFn(n: FuncDecl, ix: i32): i32 {
   const saved = vecFnRet
   vecFnRet = n.fnRet
+  vecFnDecl = -1
+  if n.fnName != "" && (lintModFnDecl[n.fnName] ?? -1) == ix { vecFnDecl = ix }
   vecInFn = true
   let tail = n.fnBody
   if tail >= 0 && tail < P.nodes.length {
@@ -1924,8 +1949,9 @@ function vecEnterFn(n: FuncDecl): i32 {
   saved
 }
 
-function vecLeaveFn(saved: i32, wasInFn: boolean) {
+function vecLeaveFn(saved: i32, wasInFn: boolean, declSaved: i32) {
   vecFnRet = saved
+  vecFnDecl = declSaved
   vecInFn = wasInFn
   0
 }
@@ -1985,7 +2011,12 @@ function vecNoteUse(ix: i32, name: string) {
 // marks it first, since its `BinExpr` is visited before the target, so the write wins.
 function vecNoteIndex(n: Index) {
   const arr = lintUnwrapParen(n.idxArr)
-  if arr < 0 || arr >= P.nodes.length || !(P.nodes[arr] is Ident) { return 0 }
+  if arr < 0 || arr >= P.nodes.length { return 0 }
+  if P.nodes[arr] is Call {
+    if vecIsIntLit(n.idxIndex) { vecCallCtx[arr] = 1 }
+    return 0
+  }
+  if !(P.nodes[arr] is Ident) { return 0 }
   if vecIdxUse.has(arr) { return 0 }
   if vecIsIntLit(n.idxIndex) { vecIdxUse[arr] = 1 }
   0
@@ -2000,26 +2031,90 @@ function vecNoteIndexWrite(lhsIx: i32) {
   0
 }
 
-// A list literal in a returned position: reported when the function's return annotation
-// is `f64[]`/`f32[]`, or it has none and every element is visibly a float.
+// A list literal in a returned position of a module function: queued when the function's
+// return annotation is `f64[]`/`f32[]`, or it has none and every element is visibly a
+// float. Whether every caller reads the result as a vector is known once the scan is done.
 function vecCheckReturned(ix: i32) {
-  if !vecRetLit.has(ix) || vecLitElems(ix).length == 0 { return 0 }
+  if vecFnDecl < 0 || !vecRetLit.has(ix) || vecLitElems(ix).length == 0 {
+    return 0
+  }
   let ty = ""
   if vecFnRet >= 0 {
     ty = vecListElem(lintAnnName(vecFnRet))
   } else {
     ty = vecLitFloatTy(ix)
   }
-  if ty != "" { vecReport(ix, ty, "is returned") }
+  if ty != "" {
+    vecRetLits.push(ix)
+    vecRetFns.push(vecFnDecl)
+    vecRetTys.push(ty)
+  }
   0
+}
+
+// A `let`/`const` at `ix` (`declNodes` id `id`) bound to a call of a module function: the
+// call's context is that local, tracked so its reads are classified.
+function vecNoteCallLet(ix: i32, id: i32) {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    const init = lintUnwrapParen(n.letInit)
+    if init < 0 || init >= P.nodes.length || !(P.nodes[init] is Call) {
+      return 0
+    }
+    if vecCallCtx.has(init) { return 0 }
+    vecCallCtx[init] = id + 2
+    if !vecTy.has(id) { vecTrack(id, "") }
+  }
+  0
+}
+
+// A module function's name read anywhere but as a callee lets its result go unseen.
+function vecNoteFnRef(ix: i32, name: string) {
+  if vecCalleeIx.has(ix) || lintBindDecl(name) >= 0 { return 0 }
+  const d = lintModFnDecl[name] ?? -1
+  if d >= 0 { vecFnEscapes[d] = 1 }
+  0
+}
+
+// Whether every caller of module function `d` reads its result only at constant indexes,
+// directly or through a local read that way. Needs one caller, and a function not exported.
+function vecCallersReadAsVector(d: i32): boolean {
+  if vecFnEscapes.has(d) || declIsExported(d) { return false }
+  let seen = 0
+  let i = 0
+  while i < vecCallIxs.length {
+    if vecCallFns[i] == d {
+      const ctx = vecCallCtx[vecCallIxs[i]] ?? 0
+      if ctx == 0 { return false }
+      if ctx >= 2 && !vecOnlyConstReads(ctx - 2) { return false }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  seen > 0
+}
+
+// Whether every literal queued as returned by `d` has `n` elements.
+function vecRetLengthsAgree(d: i32, n: i32): boolean {
+  let i = 0
+  while i < vecRetLits.length {
+    if vecRetFns[i] == d && vecLitElems(vecRetLits[i]).length != n {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 // Queue each list-literal argument of call `n` whose parameter is a tracked `f64[]` or
 // `f32[]`; whether the callee reads it as a vector is known once the scan is done.
-function vecNoteCall(n: Call) {
+function vecNoteCall(n: Call, ix: i32) {
   if n.callFn < 0 || n.callFn >= P.nodes.length { return 0 }
+  vecCalleeIx[n.callFn] = 1
   const d = vecModFnOf(n.callFn, 1)
   if d < 0 || d >= P.nodes.length { return 0 }
+  vecCallIxs.push(ix)
+  vecCallFns.push(d)
   const fd = P.nodes[d]
   if fd is FuncDecl {
     let shift = 0
@@ -2070,9 +2165,22 @@ function vecOnlyConstReads(id: i32): boolean {
   (vecReads[id] ?? 0) > 0 && (vecOther[id] ?? 1) == 0
 }
 
-// After the scan: report each tracked local, and each queued argument whose parameter the
-// callee reads only as a vector.
+// After the scan: report each tracked local, each queued argument whose parameter the
+// callee reads only as a vector, and each returned literal whose callers all do.
 function vecReportScanned() {
+  let r = 0
+  while r < vecRetLits.length {
+    const d = vecRetFns[r]
+    const n = vecLitElems(vecRetLits[r]).length
+    if vecRetLengthsAgree(d, n) && vecCallersReadAsVector(d) {
+      vecReport(
+        vecRetLits[r],
+        vecRetTys[r],
+        "is returned to callers that read it only at fixed indexes",
+      )
+    }
+    r = r + 1
+  }
   let k = 0
   while k < vecIds.length {
     const id = vecIds[k]
@@ -2080,6 +2188,7 @@ function vecReportScanned() {
       id >= 0
       && id < declNodes.length
       && declKinds[id] == 0
+      && (vecTy[id] ?? "") != ""
       && vecOnlyConstReads(id)
     ) {
       const dn = P.nodes[declNodes[id]]
@@ -2789,12 +2898,13 @@ function nameVisit(ix: i32) {
         propNamesAdd(fn.omProp)
       }
     }
-    vecNoteCall(n)
+    vecNoteCall(n, ix)
   } else if n is Ident {
     // Every occurrence counts as a use, an assignment LHS included, which keeps a
     // write-only binding off the unused-variable list.
     refNamesAdd(n.identName)
     vecNoteUse(ix, n.identName)
+    vecNoteFnRef(ix, n.identName)
     bindMark(n.identName, 0)
   } else if n is Unary {
     // The name is recorded although there is no unary operator dispatch: `n.unOp` is
@@ -3229,6 +3339,7 @@ function bindScan(ix: i32) {
     bindPush(n.letName, ix, 0, -1)
     visShadowed[visNames.length - 1] = shadowed
     if vecTyOf != "" { vecTrack(declNodes.length - 1, vecTyOf) }
+    if vecInFn { vecNoteCallLet(ix, declNodes.length - 1) }
   } else if n is FuncDecl {
     // A function scope: parameter defaults, then parameters, then the body. The defaults
     // are scanned before the parameters bind, because a default's names resolve at the
@@ -3240,7 +3351,8 @@ function bindScan(ix: i32) {
     visFnMark = mark
     visFnBody = n.fnBody
     const vecWasInFn = vecInFn
-    const vecRetSaved = vecEnterFn(n)
+    const vecDeclSaved = vecFnDecl
+    const vecRetSaved = vecEnterFn(n, ix)
     let pd = 0
     while pd < n.fnParams.length {
       const dix = n.fnParams[pd]
@@ -3269,7 +3381,7 @@ function bindScan(ix: i32) {
     bindTrim(mark)
     visFnMark = fnMarkSaved
     visFnBody = fnBodySaved
-    vecLeaveFn(vecRetSaved, vecWasInFn)
+    vecLeaveFn(vecRetSaved, vecWasInFn, vecDeclSaved)
   } else if n is ForRange {
     bindScan(n.frFrom)
     bindScan(n.frTo)
