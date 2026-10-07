@@ -1,13 +1,12 @@
-// THE COMPILER'S COLLECTOR FOLLOWS THE ENTRY FILE'S SIZE (DECISIONS.md, "The compiler's
-// collector is picked by the size of the entry file").
+// THE COMPILER COMPILES UNDER THE COPYING COLLECTOR BY DEFAULT (DECISIONS.md, "The
+// compiler's collector is copying by default").
 //
-// `vl build` and `vl run` compile under the null collector when the ENTRY FILE is under
-// 1.5 MiB (imports do not count) and under the copying collector at or above it;
-// `$VL_COMPILE_GC` overrides the choice.
-// The null collector never frees, so a large source under it costs every byte the
-// compiler ever allocated (~3 GB at 11 MB) and traps near 15.6 MB. What this suite pins:
+// `vl build` and `vl run` compile under the copying collector at every entry-file size;
+// `$VL_COMPILE_GC=null` picks the null collector, which never frees: about as fast, but a
+// build holds every byte it allocated (2.4 GB for sunpa's `game.vl`, against ~0.56 GB).
+// What this suite pins:
 //
-//   * the switch sits exactly at the threshold, measured in UTF-8 bytes;
+//   * an unset variable and `auto` are copying, for a tiny entry file and a large one;
 //   * the override wins both ways, and an unknown value is refused, not ignored;
 //   * the two collectors emit the SAME module bytes (a collector is not semantics), on a
 //     real program with structs, closures, unions and strings as well as a pad;
@@ -15,7 +14,7 @@
 //     There is no automatic retry under copying; DECISIONS.md says why.
 //
 // `$VL_COMPILE_GC_TRACE=1` makes the host name its choice on stderr. The sources are a
-// comment pad, so each build is ~1.5 MB of lexing and nothing else.
+// comment pad, so each build is lexing and nothing else.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 //
@@ -29,24 +28,26 @@ if (GATED && !ENABLED) {
   console.warn("[vl-compile-gc] skipped — missing vl binary or seed wasm.");
 }
 
-// Mirrors `COPYING_COMPILE_THRESHOLD` in scripts/vl-host/src/main.rs, on purpose: a
-// test reading the constant would move with it.
-const THRESHOLD = 1_572_864;
+// Past the 1.5 MiB entry-file threshold that picked the collector until 2026-10-07.
+const LARGE = 2_000_000;
 
 type Res = { code: number; out: string; err: string };
 
-const vl = async (args: string[], gc?: string): Promise<Res> => {
-  const extra: Record<string, string> = {
-    NO_COLOR: "1",
-    VL_COMPILE_GC_TRACE: "1",
+/** `gc` undefined is `auto`; `null` leaves `VL_COMPILE_GC` unset. */
+const vl = async (args: string[], gc?: string | null): Promise<Res> => {
+  const env: Record<string, string> = {
+    ...Deno.env.toObject(),
+    ...nativeEnv({ NO_COLOR: "1", VL_COMPILE_GC_TRACE: "1" }),
   };
-  // Always set, so a VL_COMPILE_GC in the caller's environment cannot leak in.
-  extra.VL_COMPILE_GC = gc ?? "auto";
+  // Set unless asked not to, so a VL_COMPILE_GC in the caller's environment cannot leak in.
+  if (gc === null) delete env.VL_COMPILE_GC;
+  else env.VL_COMPILE_GC = gc ?? "auto";
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv(extra),
+    env,
+    clearEnv: true,
   }).output();
   return {
     code,
@@ -89,7 +90,7 @@ const withDir = async (fn: (dir: string) => Promise<void>): Promise<void> => {
 const buildWith = async (
   dir: string,
   bytes: number,
-  gc: string | undefined,
+  gc: string | null | undefined,
   want: "null" | "copying",
 ): Promise<Uint8Array> => {
   const prog = `${dir}/p${bytes}.vl`;
@@ -100,7 +101,7 @@ const buildWith = async (
   if (r.code !== 0 || !r.err.includes(line)) {
     throw new Error(
       `build ${bytes} B, VL_COMPILE_GC=${
-        gc ?? "auto"
+        gc === null ? "(unset)" : gc ?? "auto"
       }: want rc 0 and "${line}", got ${show(r)}`,
     );
   }
@@ -112,15 +113,16 @@ const same = (a: Uint8Array, b: Uint8Array): boolean =>
 
 Deno.test({
   name:
-    "vl-compile-gc: auto picks null one byte below the threshold and copying at it",
+    "vl-compile-gc: an unset VL_COMPILE_GC and auto pick copying, for a tiny entry file and a large one",
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      const below = await buildWith(dir, THRESHOLD - 1, undefined, "null");
-      const at = await buildWith(dir, THRESHOLD, undefined, "copying");
-      if (!same(below, at)) {
+      const unset = await buildWith(dir, 64, null, "copying");
+      const tiny = await buildWith(dir, 64, undefined, "copying");
+      const large = await buildWith(dir, LARGE, undefined, "copying");
+      if (!same(unset, tiny) || !same(tiny, large)) {
         throw new Error(
-          "the two pads differ only in a comment: want identical modules",
+          "the pads differ only in a comment: want identical modules",
         );
       }
     });
@@ -133,10 +135,14 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      const copying = await buildWith(dir, THRESHOLD, undefined, "copying");
-      const pinned = await buildWith(dir, THRESHOLD, "null", "null");
+      const copying = await buildWith(dir, LARGE, undefined, "copying");
+      const pinned = await buildWith(dir, LARGE, "null", "null");
       const small = await buildWith(dir, 64, "copying", "copying");
-      if (!same(copying, pinned) || !same(copying, small)) {
+      const smallNull = await buildWith(dir, 64, "null", "null");
+      if (
+        !same(copying, pinned) || !same(copying, small) ||
+        !same(copying, smallNull)
+      ) {
         throw new Error(
           "a collector changed the emitted module: want identical bytes",
         );
@@ -198,16 +204,19 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D2780's witness at depth 18: a small entry file, so the null collector, and a record type
-      // whose structural spelling doubles per level, which fills the heap. About 4 s. When
-      // D2780 closes, move this to the next open trap under the null collector.
+      // D2780's witness at depth 18 under the null collector: a record type whose structural
+      // spelling doubles per level, which fills the heap. About 4 s. When D2780 closes, move
+      // this to the next open trap under the null collector.
       const lines = ["type A0 = {x: i32}"];
       for (let i = 1; i <= 18; i++) lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
       lines.push("function f<T>(u: T | string): boolean { u is string }", "const a0: A0 = {x: 1}");
       for (let i = 1; i <= 18; i++) lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
       lines.push("print(f<A18>(a18))");
       await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
-      const r = await vl(["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`]);
+      const r = await vl(
+        ["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`],
+        "null",
+      );
       if (
         r.code !== 70 || !r.err.includes("vl: compile collector: null ") ||
         !r.err.includes("filled its 4 GiB heap") ||

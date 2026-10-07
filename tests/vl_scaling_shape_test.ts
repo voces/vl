@@ -1871,8 +1871,8 @@ axis(
 );
 
 // ── allocation: the null collector's 4 GiB ───────────────────────────────────
-// A compile whose entry file is under 1.5 MiB runs under the null collector, which never
-// frees, so EVERYTHING the compiler allocates counts against one 4 GiB heap. A per-entity
+// These pairs pin the null collector, which never frees, so EVERYTHING the compiler
+// allocates counts against one 4 GiB heap. A per-entity
 // rebuild of a whole-program-sized table is invisible to fuel when the table is cheap to fill
 // and still costs the heap its full size each time: sunpa's `game.vl` (a 2 MB module graph
 // behind a small entry file) filled the heap and trapped the compiler, exit 70 (D3737). These

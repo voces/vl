@@ -507,9 +507,9 @@ program verbatim — the only way to pass one that starts with `-`.
                       commits more memory: a program that allocates past it
                       holds all of it, so under a memory cap of ~256M or less
                       set VL_GC_HEAP=64M
-  {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null when the
-                      ENTRY FILE is under 1.5 MiB, copying at or above; imports do
-                      not count) | null | copying
+  {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: copying, from a
+                      256 MiB first heap) | copying | null (never frees: about as
+                      fast, but a large build holds every byte it allocated)
   {c}VL_COMPILER_WASM{r}    Compiler seed path (when --compiler is not given)
   {c}VL_STD{r}              VL's std/ directory (the only candidate when set)
   {c}NO_COLOR{r}            Disable ANSI in printed values (also off when stdout is
@@ -1246,17 +1246,17 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
 }
 
 /// The engine for a ONE-SHOT compile (`vl build`, `vl run`) whose ENTRY FILE is
-/// `source_len` bytes; imports are loaded later and do not count. `$VL_COMPILE_GC` picks the collector: `null`, `copying`, or
-/// `auto` (the default), which is null below `COPYING_COMPILE_THRESHOLD` and copying
-/// at or above it. An unknown value is a hard error, as `$VL_GC`'s is.
+/// `source_len` bytes (named on stderr under `$VL_COMPILE_GC_TRACE=1`). `$VL_COMPILE_GC`
+/// picks the collector: `auto` (the default) and `copying` are the copying collector from a
+/// `COPYING_COMPILE_HEAP_INITIAL` first heap, `null` the null collector. An unknown value is
+/// a hard error, as `$VL_GC`'s is.
 ///
 /// The null collector never frees, so a compile's peak memory is everything it ever
-/// allocated, and the GC heap's 32-bit index caps that at 4 GiB (a ~15.6 MB source).
-/// Small sources are cheapest under null; above the threshold copying uses less
-/// memory at about the same CPU. DECISIONS.md, "The compiler's collector is picked by
-/// the size of the entry file".
+/// allocated (2.4 GB for sunpa's `game.vl`), capped at the GC heap's 4 GiB. Copying holds
+/// that build to ~0.56 GB at no wall cost. DECISIONS.md, "The compiler's collector is copying
+/// by default".
 fn compile_engine(source_len: usize) -> Result<Engine> {
-    let collector = compile_collector(source_len)?;
+    let collector = compile_collector()?;
     // `$VL_COMPILE_GC_TRACE=1` names the choice on stderr, so a test can see it.
     if std::env::var("VL_COMPILE_GC_TRACE").is_ok_and(|v| v == "1") {
         let name = if matches!(collector, Collector::Copying) { "copying" } else { "null" };
@@ -1270,10 +1270,6 @@ fn compile_engine(source_len: usize) -> Result<Engine> {
         _ => seed_engine(collector),
     }
 }
-
-/// `auto` moves to the copying collector at this entry-file size, where the null
-/// collector's footprint overtakes the copying collector's first heap.
-const COPYING_COMPILE_THRESHOLD: usize = 3 << 19; // 1.5 MiB
 
 /// The copying compile's first GC heap, 128 MiB per semispace; the heap doubles from
 /// here. Starting from 0 costs CPU: the small early heaps collect over and over. The knee
@@ -1294,15 +1290,10 @@ fn compile_heap_initial(default: u64) -> Result<u64> {
     }
 }
 
-fn compile_collector(source_len: usize) -> Result<Collector> {
+fn compile_collector() -> Result<Collector> {
     match std::env::var("VL_COMPILE_GC").ok().as_deref() {
-        None | Some("") | Some("auto") => Ok(if source_len >= COPYING_COMPILE_THRESHOLD {
-            Collector::Copying
-        } else {
-            Collector::Null
-        }),
+        None | Some("") | Some("auto") | Some("copying") => Ok(Collector::Copying),
         Some("null") => Ok(Collector::Null),
-        Some("copying") => Ok(Collector::Copying),
         Some(other) => bail!("unknown $VL_COMPILE_GC `{other}` (auto | null | copying)"),
     }
 }
@@ -1311,12 +1302,8 @@ fn gc_config(collector: Collector) -> Config {
     let mut cfg = Config::new();
     cfg.wasm_gc(true);
     cfg.wasm_function_references(true);
-    // A ONE-SHOT compile (`vl build` / `vl run`) of a small source is batch work: the
-    // null collector (never frees) trades memory for speed — give it a large
-    // reservation to grow into (`compile_engine` owns the choice). Anything that keeps
-    // running gets a real collector: user programs (`vl run`) may be long-lived, and
-    // the CLI pump (`cli_pump`) compiles EVERY file of a directory walk in ONE store,
-    // so its garbage is unbounded in the file count, not the file size.
+    // `$VL_COMPILE_GC=null` (never frees) gets a large reservation to grow into;
+    // `compile_engine` owns the choice for a one-shot compile.
     cfg.collector(collector);
     if matches!(collector, Collector::Null) {
         cfg.gc_heap_reservation(8 << 30); // 8 GiB virtual reservation (lazily committed)
@@ -9365,8 +9352,8 @@ fn report(err: Error) -> ! {
     if let Some(note) = trap.and_then(trap_explanation) {
         eprintln!("\nnote: {note}");
     }
-    // No automatic retry under copying: DECISIONS.md, "The compiler's collector is picked
-    // by the size of the entry file", says why. The escape is named instead.
+    // No automatic retry under copying: DECISIONS.md, "The compiler's collector is copying
+    // by default", says why. The escape is named instead.
     if compiler_bug
         && matches!(trap, Some(Trap::AllocationTooLarge))
         && COMPILE_UNDER_NULL.load(Ordering::Relaxed)
@@ -9539,8 +9526,8 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     let compiler = resolve_compiler(flag("--compiler"));
 
-    // The collector follows the source's size (`compile_engine`), so the source is
-    // read before the engine is built.
+    // `compile_engine` names the entry file's size under `$VL_COMPILE_GC_TRACE`, so the
+    // source is read before the engine is built.
     let source = std::fs::read_to_string(input)
         .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
     let gc_stats = maybe_install_gc_stats();
