@@ -37,7 +37,7 @@ other is written, both carry the whole map surface, and a hover or an error prin
 index-signature spelling. Both shorthands, `{[K]: V}` and `T[]`, name CONCRETE types with
 their full methods, and `T[]` is not a subtype of `{[i32]: T}` (owner ruling Q1, 2026-09-25,
 which retires §C2's interface reading — see the banner there). **`Set<T>` is its own type**
-(ruling Q2): `add`, `has`, `delete`, `keys()`/`values()` (the elements, `T[]`), `length` and
+(ruling Q2): `add`, `has`, `delete`, `clear()`, `keys()`/`values()` (the elements, `T[]`), `length` and
 `for x in s`; no index and no `get`/`set`; and it is neither a list nor a map, so it flows
 to no `T[]` or `{[K]: V}` destination and neither flows to it. It prints as `Set<T>`.
 `{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`; it inserts

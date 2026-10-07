@@ -597,6 +597,7 @@ import {
   emitFail,
   emitFailAt,
   fbArrayCopy,
+  fbArrayFill,
   fbArrayGet,
   fbArrayLen,
   fbArrayNew,
@@ -10683,6 +10684,55 @@ function emitMapResize(body: u8[]) {
     fbCall(gHelpMapResize)
   }
   fbStructSet(cmMapTy(), 3) // struct.set field 3: index
+  0
+}
+
+// Lower `m.clear()` onto `body`: the map keeps its index, backings and capacity, so a refill
+// up to the old size allocates nothing. The index is zeroed, the key and value refs dropped so
+// they can be collected, and the entry counts reset. A never-written map's backings are the
+// shared empty ones; every fill over them has length 0, so none is written.
+function emitMapClear(body: u8[], recvIx: i32, fnIx: i32) {
+  if !mUsed {
+    return emitFail("emitProgram: map op but map type not collected")
+  }
+  const mshape0 = mapShapeOfExpr(recvIx, fnIx)
+  if mshape0 == -3 { return failMapValueType() }
+  if pushMapRecvRef(body, recvIx, fnIx) < 0 { return -1 }
+  cmSlot = mapShapeFoldSet(mshape0)
+  const mslot = cmSlot
+  setMapRef(body)
+  pushMapIndex(body)
+  fbI32Const(0)
+  fbI32Const(0)
+  pushMapIndex(body)
+  fbArrayLen()
+  fbArrayFill(aTypeIdx) // index[0 .. len) = 0, every slot free
+  if !cmKeyInt() {
+    pushMapKeysBacking(body)
+    fbI32Const(0)
+    fbRefNull(sTypeIdx)
+    pushMapKeysLen(body)
+    fbArrayFill(cmKeysBack())
+  }
+  if mslot >= 0 && mvScalarValKind(mslot) == null {
+    pushMapValsBacking(body)
+    fbI32Const(0)
+    fbRefNull(mvValElemHeapOf(mslot))
+    pushMapValsLen(body)
+    fbArrayFill(cmValsBack())
+  }
+  pushMapKeys(body)
+  fbI32Const(0)
+  fbStructSet(cmKeysWrap(), 1) // keys.len = 0
+  pushMapVals(body)
+  fbI32Const(0)
+  fbStructSet(cmValsWrap(), 1) // vals.len = 0
+  pushMapRef(body)
+  fbI32Const(0)
+  fbStructSet(cmMapTy(), 4) // count = 0
+  pushMapRef(body)
+  fbI32Const(0)
+  fbStructSet(cmMapTy(), 5) // size = 0
   0
 }
 
@@ -25556,6 +25606,12 @@ function emitCallStmt(body: u8[], s: Call, stmtIx: i32, fnIx: i32) {
         || scalarListElemKind(callee.memObj, fnIx) != null
       ) {
         return emitClear(body, stmtIx, fnIx)
+      }
+      if exprMap(callee.memObj, fnIx) {
+        if s.callArgs.length != 0 {
+          return emitFail("emitProgram: map clear takes no arguments")
+        }
+        return emitMapClear(body, callee.memObj, fnIx)
       }
     }
     // G8: a map `m.set(k, v)` STATEMENT is the method form of `m[k] = v` — the
