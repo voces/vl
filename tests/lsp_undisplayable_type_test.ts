@@ -175,8 +175,9 @@ print(foobar({ bar: "okie" }))
 
 // The three nesting shapes from the report, ONE VARIABLE APART: same body, only
 // the parameter annotation changes. All three fail to resolve, so all three must
-// show no non-VL type name, and all three report the annotation ALONE: the
-// return inferred from the poisoned parameter is not echoed as a second error (D3771).
+// show no non-VL type name — and (refuting the report's reading) all three keep
+// BOTH diagnostics. The lost second diagnostic in the owner's program is caused
+// by the `is` GUARD, not by the annotation nesting — see the next test.
 Deno.test({
   name: "undisplayable: the three nesting shapes leak no non-VL type name",
   ignore,
@@ -198,17 +199,17 @@ print(1)
     for (const label of await inlayLabels(checker, src)) {
       assertEquals(isDisplayableType(label.slice(2)), true, `${name} label ${label}`);
     }
-    // One diagnostic at every nesting depth: the unknown type, never its echo.
+    // Both diagnostics survive at every nesting depth.
     const diags = await checker.check(src, "/tmp/x.vl", noSiblings);
-    assertEquals(diags.length, 1, `${name} reports the annotation alone`);
+    assertEquals(diags.length, 2, `${name} keeps both diagnostics`);
   }
 });
 
-// The `is` guard once decided whether the echo appeared, against an IDENTICAL
-// annotation. An error type reaching an inferred return is now never reported again
-// (D3771), so both bodies agree.
+// The variable that actually drops the second diagnostic: the `is` guard, held
+// against an IDENTICAL annotation. Not a fix — a pin on the real cause, so the
+// filed producer-side diff is measured against the right thing.
 Deno.test({
-  name: "undisplayable: with or without an `is` guard, the echo is not reported",
+  name: "undisplayable: the `is` guard, not nesting, drops the second diagnostic",
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
@@ -218,15 +219,18 @@ Deno.test({
 
   assertEquals(
     await msgs(`${ann} {\n  if true { return v.foo }\n  return v.bar\n}\nprint(1)\n`),
-    ["unknown type 'any' within '{foo:string}|{bar:any}'"],
-    "plain `if`: the annotation alone",
+    [
+      "unknown type 'any' within '{foo:string}|{bar:any}'",
+      "cannot infer a return type for 'f' — annotate a return type",
+    ],
+    "plain `if`: both diagnostics",
   );
   assertEquals(
     await msgs(
       `${ann} {\n  if v is { foo: string } { return v.foo }\n  return v.bar\n}\nprint(1)\n`,
     ),
     ["unknown type 'any' within '{foo:string}|{bar:any}'"],
-    "`is` guard: the annotation alone",
+    "`is` guard: the second diagnostic is lost",
   );
 });
 

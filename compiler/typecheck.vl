@@ -4486,13 +4486,6 @@ let bareBraceMark: i32[] = []
 let bareBraceSpec = 0
 let inferTentative: string[] = []
 let unresolvedFns: string[] = []
-// The provisional code of a no-basis return refusal until `noBasisFlush` rules on it. Held in
-// `T.diags` itself, so a speculative check's rollback discards it with its other diagnostics.
-const NO_BASIS_PENDING = "#no-basis-pending"
-// Every function a recursive cycle reached while inferring its return, the return pre-pass's
-// included: a cycle break, or a call to a callee whose return is still pending. Its error type may
-// be the cycle's own, which no diagnostic explains, so its refusal is never pending.
-let inferCycleFns: string[] = []
 let fnSawValueRet = false
 
 // Redundant return-type annotation rule: `retNatural` is the body's natural inferred return — the
@@ -5386,7 +5379,6 @@ export function initChecker() {
   bareBraceSpec = 0
   inferTentative = []
   unresolvedFns = []
-  inferCycleFns = []
   fnSawValueRet = false
   retNatural = -1
   retNaturalErr = false
@@ -19060,13 +19052,7 @@ function tErrPush(
   let di = 0
   while di < T.diags.length {
     const d = T.diags[di]
-    if d.tat == at && d.tmsg == msg {
-      // A firm raise of a refusal still pending makes the pending one firm.
-      if d.tcode == NO_BASIS_PENDING && code != NO_BASIS_PENDING {
-        T.diags[di].tcode = code
-      }
-      return 0
-    }
+    if d.tat == at && d.tmsg == msg { return 0 }
     di = di + 1
   }
   numLitNoteQueue(msg, at, T.diags.length)
@@ -48251,9 +48237,6 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   let retTy = ft.fnRet
   if retTy == -2 {
     retTy = TY_ERR
-    if inferStack.length > 0 {
-      noteInferCycle(inferStack[inferStack.length - 1])
-    }
     // A direct self-recursive call resolves to the function's own provisional inferred
     // type (`inferObserved`, already holding the base case since it is checked first) —
     // without this, `TY_ERR` makes `assignable(TY_ERR, string)` vacuously true and a `+`
@@ -48264,12 +48247,6 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
           if inferObserved >= 0 { retTy = inferObserved }
         }
       }
-    }
-  }
-  // A callee a cycle left without a return passes the cycle on to the caller.
-  if cfn is Ident && inferStack.length > 0 {
-    if retTy == TY_ERR && strListHas(inferCycleFns, cfn.identName) {
-      noteInferCycle(inferStack[inferStack.length - 1])
     }
   }
   const params = ft.fnParamTypes
@@ -50913,47 +50890,13 @@ function ifChainHasBareReturn(ifIx: i32): boolean {
 // one raise exempt from the node-span rule. It is a whole-body verdict and usually a
 // consequence of an error inside that body, and the report is position-ordered: at the
 // function's name it would print above its own cause.
-function inferNoBasisErr(name: string, fnIx: i32, body: i32, code: string) {
+function inferNoBasisErr(name: string, fnIx: i32, body: i32) {
   const msg = "cannot infer a return type for '"
     + name
     + "' — annotate a return type"
   const tk = nodeLastTok(body)
-  if tk >= 0 { return tErrPushTok(msg, fnIx, tk, code, "") }
-  tErrCoded(msg, fnIx, code)
-  0
-}
-
-// Record that a cycle reached the inference of `name` (`inferCycleFns`).
-function noteInferCycle(name: string) {
-  if name != "" && !strListHas(inferCycleFns, name) { inferCycleFns.push(name) }
-  0
-}
-
-// Rule on the pending no-basis refusals: dropped when any other error stands, since an error type
-// flows only from a diagnosed error and each is then its echo in a caller or an importer; kept,
-// as plain errors, when none does.
-function noBasisFlush() {
-  let others = false
-  let i = 0
-  while i < T.diags.length {
-    if T.diags[i].tcode != NO_BASIS_PENDING { others = true }
-    i = i + 1
-  }
-  if others {
-    const kept: TDiag[] = []
-    let k = 0
-    while k < T.diags.length {
-      if T.diags[k].tcode != NO_BASIS_PENDING { kept.push(T.diags[k]) }
-      k = k + 1
-    }
-    T.diags = kept
-    return 0
-  }
-  let j = 0
-  while j < T.diags.length {
-    T.diags[j].tcode = ""
-    j = j + 1
-  }
+  if tk >= 0 { return tErrPushTok(msg, fnIx, tk, "", "") }
+  tErr(msg, fnIx)
   0
 }
 
@@ -50981,7 +50924,6 @@ function finishInferredReturn(
   // plain-struct lambda regresses `.map`-collapse / factory / generic-HOF cases).
   let objRetAdopted = false
   const sawCycle = cycleBreakCount > cbBefore
-  if sawCycle { noteInferCycle(n.fnName) }
   if inferObserved >= 0 {
     inferred = inferObserved
   } else if sawCycle && fnSawValueRet {
@@ -50993,13 +50935,8 @@ function finishInferredReturn(
     inferred = TY_VOID
   } else if inferSawErr {
     // Only err-ish types flowed back: no basis. An uninferable param or a bare `{}` in the
-    // body is the root cause. A recursive cycle is a cause of its own and is raised firm; any
-    // other error type comes from a diagnosed error and waits on `noBasisFlush`.
-    if !causeReported {
-      let code = NO_BASIS_PENDING
-      if sawCycle || strListHas(inferCycleFns, n.fnName) { code = "" }
-      inferNoBasisErr(n.fnName, fnIx, n.fnBody, code)
-    }
+    // body already reported the root cause, so suppress the redundant message.
+    if !causeReported { inferNoBasisErr(n.fnName, fnIx, n.fnBody) }
     inferred = TY_ERR
   }
   // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
@@ -53257,12 +53194,11 @@ function checkProgramNode(n: Program) {
     if ufIx >= 0 {
       const ufn = P.nodes[ufIx]
       if ufn is FuncDecl {
-        inferNoBasisErr(unresolvedFns[uf], ufIx, ufn.fnBody, "")
+        inferNoBasisErr(unresolvedFns[uf], ufIx, ufn.fnBody)
       }
     }
     uf = uf + 1
   }
-  noBasisFlush()
   bareBraceUndelivered()
   // LAST, because both of its filters read state this pass fills — see its header.
   annCommitVariantMembers()
@@ -56767,8 +56703,6 @@ function checkProgramPass(rootIx: i32) {
   checkProgramEndGetters()
   voidRetRewrite()
   numLitNotesApply()
-  // A body checked after pass 2 (a deferred instance) may have parked one.
-  noBasisFlush()
   T.diags.length
 }
 
