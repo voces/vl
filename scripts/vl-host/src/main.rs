@@ -46,6 +46,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
+/// The opt-in whole-compile file cache (`VL_COMPILE_CACHE=1`; incremental-compilation-design.md S1).
+mod compile_cache;
 /// The inline-record step's second slice: flattened lists of small records (D3681, S2).
 mod flat;
 /// The `-O`/`-O3` inline-record step (sunpa SP-039, inline-records-design.md S1).
@@ -2366,7 +2368,7 @@ fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
     let module = Module::new(engine, bytes)?;
     if let Ok(artifact) = module.serialize() {
         write_module_cache(&path, &wasm_hash, &tag, &artifact);
-        prune_module_cache(&dir, &path);
+        prune_cache_dir(&dir, &path, &[".cwasm"], module_cache_max_bytes());
     }
     Ok(module)
 }
@@ -2447,13 +2449,13 @@ fn write_module_cache(path: &std::path::Path, wasm_hash: &[u8; 32], tag: &str, a
     }
 }
 
-/// Bring `modules/` back under `module_cache_max_bytes` by deleting the
-/// least-recently-used entries (oldest mtime first; `ours`, just written, is never a
-/// candidate), plus temp files a killed process left behind more than an hour ago.
-/// Called only after a miss wrote an entry, so the warm path never lists the
+/// Bring a cache directory (`modules/`, `compile/`) back under `max` bytes by deleting
+/// the least-recently-used entries named `*<suffix>` (oldest mtime first; `ours`, just
+/// written, is never a candidate), plus temp files a killed process left behind more than
+/// an hour ago. Called only after a miss wrote an entry, so the warm path never lists the
 /// directory, and it passes unless the `.last-prune` stamp is missing or older than
 /// `MODULE_CACHE_PRUNE_EVERY`. Two processes pruning at once is harmless.
-fn prune_module_cache(dir: &std::path::Path, ours: &std::path::Path) {
+fn prune_cache_dir(dir: &std::path::Path, ours: &std::path::Path, suffixes: &[&str], max: u64) {
     let stamp = dir.join(".last-prune");
     let recent = std::fs::metadata(&stamp)
         .and_then(|m| m.modified())
@@ -2463,7 +2465,6 @@ fn prune_module_cache(dir: &std::path::Path, ours: &std::path::Path) {
     if recent || std::fs::write(&stamp, b"").is_err() {
         return;
     }
-    let max = module_cache_max_bytes();
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut live: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = Vec::new();
     for e in entries.flatten() {
@@ -2476,7 +2477,7 @@ fn prune_module_cache(dir: &std::path::Path, ours: &std::path::Path) {
             if mtime.elapsed().is_ok_and(|a| a.as_secs() > 3600) {
                 let _ = std::fs::remove_file(&path);
             }
-        } else if name.ends_with(".cwasm") && path != ours {
+        } else if suffixes.iter().any(|s| name.ends_with(s)) && path != ours {
             live.push((mtime, meta.len(), path));
         }
     }
@@ -2494,6 +2495,19 @@ fn prune_module_cache(dir: &std::path::Path, ours: &std::path::Path) {
             total -= len;
         }
     }
+}
+
+/// The reply to a guest's request for module `key`: a `std:` key maps to `<stdDir>/<name>.vl`
+/// (slash segments are subdirectories), every other key is a filesystem path read as-is, and
+/// `None` is "not found". Every module the compiler is told about comes through here, so a
+/// compile-cache recording on this thread sees each one (`compile_cache::record_read`).
+fn read_module_key(key: &str) -> Option<String> {
+    let data = match key.strip_prefix("std:") {
+        Some(name) => read_std_module(name),
+        None => read_utf8(std::path::Path::new(key)),
+    };
+    compile_cache::record_read(key, data.as_deref());
+    data
 }
 
 /// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but
@@ -2797,17 +2811,13 @@ fn has_template_hole(source: &str) -> bool {
 /// three commands agree. An older seed lacks these exports; `.ok()` then leaves
 /// every such rule declining, same as before them.
 fn stage_vl_root_and_cwd(store: &mut Store<()>, inst: &Instance) -> Result<()> {
+    let (root, cwd) = staged_root_and_cwd();
     if let (Ok(root_push), Ok(root_commit)) = (
         inst.get_typed_func::<i32, i32>(&mut *store, "vlRootPush"),
         inst.get_typed_func::<(), i32>(&mut *store, "vlRootCommit"),
     ) {
-        let (src, _origin) = std_source();
-        if let StdSource::Dir(d) = src {
-            if let Some(root) = d.parent() {
-                for ch in root.to_string_lossy().chars() {
-                    root_push.call(&mut *store, ch as i32)?;
-                }
-            }
+        for ch in root.chars() {
+            root_push.call(&mut *store, ch as i32)?;
         }
         root_commit.call(&mut *store, ())?;
     }
@@ -2815,14 +2825,33 @@ fn stage_vl_root_and_cwd(store: &mut Store<()>, inst: &Instance) -> Result<()> {
         inst.get_typed_func::<i32, i32>(&mut *store, "cwdPush"),
         inst.get_typed_func::<(), i32>(&mut *store, "cwdCommit"),
     ) {
-        if let Ok(cwd) = std::env::current_dir() {
-            for ch in cwd.to_string_lossy().chars() {
-                cwd_push.call(&mut *store, ch as i32)?;
-            }
+        for ch in cwd.chars() {
+            cwd_push.call(&mut *store, ch as i32)?;
         }
         cwd_commit.call(&mut *store, ())?;
     }
     Ok(())
+}
+
+/// The two strings `stage_vl_root_and_cwd` stages, computed apart from the staging so the
+/// compile cache keys exactly what the guest would be told. Empty when there is none.
+fn staged_root_and_cwd() -> (String, String) {
+    let root = match std_source() {
+        (StdSource::Dir(d), _) => d.parent().map(|r| r.to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let cwd = std::env::current_dir().ok().map(|c| c.to_string_lossy().into_owned());
+    (root.unwrap_or_default(), cwd.unwrap_or_default())
+}
+
+/// The SHA-256 of the resolved compiler seed, once per process — the compile cache's
+/// compiler identity. `None` when the seed cannot be read (the compile then fails on its own).
+fn compiler_hash(source: &CompilerSource) -> Option<[u8; 32]> {
+    static HASH: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    *HASH.get_or_init(|| match source {
+        CompilerSource::Embedded(bytes) => Some(sha256(bytes)),
+        CompilerSource::Path(p) => std::fs::read(p).ok().map(|b| sha256(&b)),
+    })
 }
 
 /// command-queue pump.
@@ -2924,15 +2953,9 @@ fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_pa
                     keys.push(key);
                 }
                 for key in keys {
-                    // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments
-                    // are subdirectories: `std:a/b` → `<stdDir>/a/b.vl`); every
-                    // other key is a filesystem path read as-is. A missing file
-                    // commits `found = 0` either way (the compiler's
+                    // A missing file commits `found = 0` (the compiler's
                     // Cannot-resolve diagnostic fires, never the host).
-                    let src = match key.strip_prefix("std:") {
-                        Some(name) => read_std_module(name),
-                        None => read_utf8(std::path::Path::new(&key)),
-                    };
+                    let src = read_module_key(&key);
                     commit_module(store, &key, src.as_deref())?;
                 }
             }
@@ -7510,7 +7533,37 @@ fn test_pool_allowed() -> bool {
 /// command loop in compile-one mode (`cliTestPoolStage(2)`) over the single file
 /// `path`. `Ok(Ok(bytes))` is the emitted test module; `Ok(Err(text))` is the file's
 /// report entry when it did not compile; `Err` is the compiler itself failing.
+///
+/// Each worker is a fresh instance, so it is one compile-cache action: keyed on the seed and
+/// what `compile_test_file_cold` stages, and only a module that compiled is stored. The
+/// worker's `CMD_LIST_DIR` reply is a constant, so its transcript is its module reads.
 fn compile_test_file_pooled(
+    engine: &Engine,
+    module: &Module,
+    source: &CompilerSource,
+    path: &str,
+    color_arg: &str,
+) -> Result<std::result::Result<Vec<u8>, String>> {
+    let action = compile_cache::Action::new("test-pool", || {
+        let (root, cwd) = staged_root_and_cwd();
+        Some(vec![
+            compiler_hash(source)?.to_vec(),
+            ["test", path, color_arg].join("\0").into_bytes(),
+            root.into_bytes(),
+            cwd.into_bytes(),
+            b"cliTestPoolStage=2".to_vec(),
+        ])
+    });
+    compile_cache::serve(
+        action.as_ref(),
+        &read_module_key,
+        || compile_test_file_cold(engine, module, source, path, color_arg),
+        |r| r.as_ref().ok().cloned(),
+        Ok,
+    )
+}
+
+fn compile_test_file_cold(
     engine: &Engine,
     module: &Module,
     source: &CompilerSource,
@@ -7548,11 +7601,7 @@ fn compile_test_file_pooled(
                 dir_commit.call(&mut store, 0)?;
             }
             CMD_READ_FILE => {
-                let key = cmd_path.read(&mut store)?;
-                let data = match key.strip_prefix("std:") {
-                    Some(name) => read_std_module(name),
-                    None => read_utf8(std::path::Path::new(&key)),
-                };
+                let data = read_module_key(&cmd_path.read(&mut store)?);
                 match data {
                     Some(s) => {
                         result_in.send(&mut store, &s)?;
@@ -8206,14 +8255,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 if !path.starts_with("std:") {
                     note_compiling(&path);
                 }
-                // A `std:` key maps to `<stdDir>/<name>.vl` (slash segments are
-                // subdirectories); every other key is a filesystem path read as-is.
                 // A missing file commits `found = 0` (the VL program raises its own
                 // unresolvable-import / cannot-read diagnostic).
-                let data = match path.strip_prefix("std:") {
-                    Some(name) => read_std_module(name),
-                    None => read_utf8(std::path::Path::new(&path)),
-                };
+                let data = read_module_key(&path);
                 match data {
                     Some(s) => {
                         result_in.send(&mut store, &s)?;
@@ -9508,6 +9552,58 @@ fn real_main() -> Result<()> {
     }
 }
 
+/// `vl build`'s compile-cache action: keyed on the whole argv, the resolved colour, what
+/// `stage_program` stages (the VL root, the cwd, the entry's bytes) and, under `-O`/`-O3`,
+/// the `wasm-opt` that would run. `None` when the cache is off, or when the build reads the
+/// compiler instance after the compile (`reads_session`, the heap-window checks), which a
+/// hit does not have.
+fn build_cache_action(
+    args: &[String],
+    source: &str,
+    compiler: &CompilerSource,
+    optimizing: bool,
+    reads_session: bool,
+) -> Option<compile_cache::Action> {
+    use std::io::IsTerminal;
+    if reads_session {
+        if compile_cache::mode().is_ok() {
+            compile_cache::trace("off (the build reads the compiler instance)");
+        }
+        return None;
+    }
+    compile_cache::Action::new("build", || {
+        let (root, cwd) = staged_root_and_cwd();
+        let color = if color_ok(std::io::stderr().is_terminal()) { "color" } else { "plain" };
+        let wasm_opt = match binaryen_tool("wasm-opt", "VL_WASM_OPT").filter(|_| optimizing) {
+            Some(p) => {
+                let real = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone().into());
+                let hash = std::fs::read(&real).map(|b| hex(&sha256(&b))).unwrap_or_default();
+                format!("{p}\0{}\0{hash}", real.display())
+            }
+            None => "absent".to_string(),
+        };
+        // `-o` reaches no guest; it is keyed only under `--source-map`, whose map names it.
+        let mut argv: Vec<&str> = Vec::new();
+        let mut it = args[1..].iter();
+        while let Some(a) = it.next() {
+            if a == "-o" && !args.iter().any(|a| a == "--source-map") {
+                it.next();
+                continue;
+            }
+            argv.push(a);
+        }
+        Some(vec![
+            compiler_hash(compiler)?.to_vec(),
+            argv.join("\0").into_bytes(),
+            color.as_bytes().to_vec(),
+            root.into_bytes(),
+            cwd.into_bytes(),
+            sha256(source.as_bytes()).to_vec(),
+            wasm_opt.into_bytes(),
+        ])
+    })
+}
+
 /// `vl build` — see the header comment and `vl help build`. Takes the FULL argv
 /// (flags are scanned across the whole command line, as they always were).
 fn build_cmd(args: &[String]) -> Result<()> {
@@ -9611,15 +9707,29 @@ fn build_cmd(args: &[String]) -> Result<()> {
         }
     }
     // `_located`, so a written module the engine refuses names the function it came
-    // from (D1578). The instance is read only on that failure path.
-    let (mut bytes, mut session) = compile_vl_located(
-        &compile_engine,
-        &compiler,
-        &source,
-        input,
-        "compileSrc",
-        names_mode,
-        link,
+    // from (D1578). The instance is read only on that failure path, and a module the engine
+    // refuses is never stored in the compile cache, so a hit never needs one.
+    let reads_session = (low_memory.is_some_and(|n| n > HEAP_BASE_DEFAULT) && link.heap.is_none())
+        || (link.import_memory && link.heap.is_none() && link.shared_pages.is_none());
+    let action = build_cache_action(args, &source, &compiler, optimizing, reads_session);
+    let (mut bytes, mut session) = compile_cache::serve(
+        action.as_ref(),
+        &read_module_key,
+        || {
+            compile_vl_located(
+                &compile_engine,
+                &compiler,
+                &source,
+                input,
+                "compileSrc",
+                names_mode,
+                link,
+            )
+        },
+        |r: &(Vec<u8>, Option<(Store<()>, Instance)>)| {
+            Module::validate(&compile_engine, &r.0).is_ok().then(|| r.0.clone())
+        },
+        |b| (b, None),
     )?;
     // A unit sharing a host's memory that allocates with no window of its own starts at
     // the default base, as every other such unit does. Legal, so a warning, not a refusal.
