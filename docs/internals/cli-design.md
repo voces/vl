@@ -685,6 +685,20 @@ temp-file + rename. `tests/vl_module_cache_test.ts` pins hit, each rejection, op
 pruning order and throttle; the safety argument is DECISIONS.md §"A user module's
 Cranelift compile is cached".
 
+### The compile cache (host, opt-in)
+
+`VL_COMPILE_CACHE=1` keeps the module a `vl build`, or a pooled `vl test` file, emitted under
+`<cache dir>/compile/`, keyed on the seed, the host build, the keyed environment, what the host
+stages and every module the compiler was handed (incremental-compilation-design.md §4.1, S1).
+Off by default.
+
+| variable | effect |
+| --- | --- |
+| `VL_NO_COMPILE_CACHE=1` | no lookup and no store, even when enabled |
+| `VL_COMPILE_CACHE_MAX_MB=<n>` | prune target, default 512 |
+| `VL_COMPILE_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `stored`, `verified`, `off (<why>)` |
+| `VL_COMPILE_CACHE_VERIFY=1` | every hit also compiles cold; a difference exits **71** |
+
 ### `build` flags (today's host surface)
 
 `build` is the one command whose flags are still parsed entirely in Rust

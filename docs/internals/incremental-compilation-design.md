@@ -1,6 +1,8 @@
 # Incremental and cached compilation (lane IC)
 
-Status: **design, nothing built.** Written 2026-10-06 for the owner's direction of that day:
+Status: **S1 built OPT-IN (lane CA, 2026-10-07)** — `VL_COMPILE_CACHE=1`, for `vl build` and
+each pooled `vl test` file; see §5's S1 row and "S1 as built" below it. Written 2026-10-06 for
+the owner's direction of that day:
 
 > We should consider: 1. Compiling multiple things at the same time (in memory caching etc),
 > such as with tests 2. Compiling things iteratively with watching, optimizing speed for small
@@ -830,6 +832,33 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
 | **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, Q1 ruled, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15, after Q1 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 4.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes | LSP latency on sunpa and on `compiler/entry.vl` |
 | **S6** | Per-function and per-instance emit reuse: the emitter writes bodies against symbolic indices (function, type, global, string, union tag) and a late pass assigns and patches them, inside the one module; cache each body keyed on its typed body and the interface hashes of what it references | months; high risk | the edited graph's compile scales with what changed: most of a 25.0 s build when one function body changes (estimate, pending S0) | cold-versus-incremental byte identity over the whole corpus and the self-compile, run continuously; the memo census's in-place-fill lesson says this is where staleness would hide | S0's split, before and after |
 | — | separate compilation and linking (plumb) | separate track | — | — | — |
+
+**S1 as built (lane CA, opt-in).** `scripts/vl-host/src/compile_cache.rs`;
+`tests/vl_compile_cache_test.ts` holds gates 2 and 3 and the unclassified-channel guard.
+- Active only under `VL_COMPILE_CACHE=1`; `VL_NO_COMPILE_CACHE`, `VL_COMPILE_CACHE_TRACE`,
+  `VL_COMPILE_CACHE_MAX_MB` and `VL_COMPILE_CACHE_VERIFY=1` (exit 71 on a mismatch) as above.
+  Entries live in `<cache dir>/compile/` (`<manifest key>.m`, `<result key>.r`), not
+  `compiles/`. The host build id is `build.rs`'s `$VL_HOST_BUILD_ID`.
+- Actions: `vl build`, and each pooled `vl test` file. Not yet `vl run` or `vl check`.
+- Only the guest's emitted bytes are stored, and only for a compile that succeeded and whose
+  module the engine validates. A failed compile is recomputed every time, so no printed text
+  is replayed; that is the conservative half of "the exact stdout and stderr text".
+- Staged values go into the manifest key rather than being replayed: the entry path, the name
+  sections and link options as STAGED (never a filtered argv; flags are scanned anywhere, so
+  the token after `-o` can be one), `-o` under `--source-map`, the resolved colour, the VL
+  root, the cwd, the entry's bytes, and the `wasm-opt` path and binary hash under `-O`. The
+  transcript is the module reads.
+- The seed's hash is of the bytes that compile: the file is read once per process
+  (`seed_bytes`), so a seed swapped on disk mid-run cannot store one seed's output under the
+  other's key.
+- Conservative choices beyond the doc: `VL_REP_SHADOW` is a bypass variable; a `vl build`
+  whose host reads the compiler instance after the compile (the `heapWindowRead` checks under
+  `--low-memory-unused` or `--import-memory` without a heap window) bypasses; `wasm-opt`
+  is keyed by path and file hash, without a `--version` spawn.
+- Left for default-on: `vl run`/`vl check` actions; replayed text for failed compiles; the
+  verify-sample schedule (`sample:20`); gate 4 (`VL_NO_COMPILE_CACHE=1` in `gate.sh` and CI);
+  the matrix rows for each seed rung, `$VL_STD`, `BINARYEN_*`, a swapped `wasm-opt` and the
+  host id; lookups before the pool is sized (§4.4); the trial week.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
