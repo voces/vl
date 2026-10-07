@@ -8567,7 +8567,7 @@ fn test_define(defines: &mut Vec<(String, String)>, spec: &str) {
 // The rows are the table `locate_invalid_module` asks the compiler for (D1578/D1594), plus a
 // row per STATEMENT that the compiler's own offset lookup reads past — that diagnostic's
 // position is the declaration's by contract, and a trap frame wants the instruction's.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SrcMap {
     files: Vec<String>,
     /// `(from, to, line, col, file index)`, in emission order — not sorted, and rows NEST:
@@ -9592,14 +9592,7 @@ fn build_cache_action(
     compile_cache::Action::new("build", || {
         let (root, cwd) = staged_root_and_cwd();
         let color = if color_ok(std::io::stderr().is_terminal()) { "color" } else { "plain" };
-        let wasm_opt = match binaryen_tool("wasm-opt", "VL_WASM_OPT").filter(|_| optimizing) {
-            Some(p) => {
-                let real = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone().into());
-                let hash = std::fs::read(&real).map(|b| hex(&sha256(&b))).unwrap_or_default();
-                format!("{p}\0{}\0{hash}", real.display())
-            }
-            None => "absent".to_string(),
-        };
+        let wasm_opt = if optimizing { wasm_opt_id() } else { "absent" };
         Some(vec![
             compiler_hash(compiler)?.to_vec(),
             staged.as_bytes().to_vec(),
@@ -9607,9 +9600,81 @@ fn build_cache_action(
             root.into_bytes(),
             cwd.into_bytes(),
             sha256(source.as_bytes()).to_vec(),
-            wasm_opt.into_bytes(),
+            wasm_opt.as_bytes().to_vec(),
         ])
     })
+}
+
+/// The `wasm-opt` an `-O` build would run, as a compile-cache key part: the path as resolved,
+/// its canonical file, that file's SHA-256 and its `--version` output (a script launcher's
+/// bytes do not name the binaryen it loads), or `absent`. Computed once per process.
+fn wasm_opt_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let Some(p) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
+            return "absent".to_string();
+        };
+        let real = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone().into());
+        let hash = std::fs::read(&real).map(|b| hex(&sha256(&b))).unwrap_or_default();
+        let version = std::process::Command::new(&p)
+            .arg("--version")
+            .output()
+            .map(|o| format!("{:?} {}", o.status.code(), String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default();
+        format!("{p}\0{}\0{hash}\0{version}", real.display())
+    })
+}
+
+/// The `-O` chain's compile-cache action (stage S2): keyed on the bytes the chain is given
+/// (`vl-src` already stripped), the rung, every option the chain reads, the `wasm-opt` that
+/// would run and, under `--source-map`, what the map is made from (the emitter's bytes with
+/// their rows, the input and output paths and the directories they resolve to).
+fn opt_cache_action(
+    input_bytes: &[u8],
+    options: String,
+    map_inputs: Option<(&[u8], &str, &str)>,
+) -> Option<compile_cache::Action> {
+    compile_cache::Action::new("opt", || {
+        let mut parts = vec![
+            wasm_opt_id().as_bytes().to_vec(),
+            options.into_bytes(),
+            sha256(input_bytes).to_vec(),
+        ];
+        if let Some((emitted, input, out)) = map_inputs {
+            let dir = |p: &str| {
+                let parent = std::path::Path::new(p).parent().filter(|d| !d.as_os_str().is_empty());
+                let d = parent.unwrap_or(std::path::Path::new("."));
+                std::fs::canonicalize(d).map(|c| c.display().to_string()).unwrap_or_default()
+            };
+            let (_, cwd) = staged_root_and_cwd();
+            parts.push(sha256(emitted).to_vec());
+            parts.push(format!("{input}\0{out}\0{}\0{}\0{cwd}", dir(input), dir(out)).into_bytes());
+        }
+        Some(parts)
+    })
+}
+
+/// The `-O` chain's result as one stored blob: the module's length, the module, then the
+/// source map's text when there is one.
+fn pack_opt_result(module: &[u8], map: Option<&[u8]>) -> Vec<u8> {
+    let mut v = Vec::with_capacity(9 + module.len() + map.map_or(0, <[u8]>::len));
+    v.push(map.is_some() as u8);
+    v.extend_from_slice(&(module.len() as u64).to_le_bytes());
+    v.extend_from_slice(module);
+    v.extend_from_slice(map.unwrap_or_default());
+    v
+}
+
+/// `pack_opt_result`'s inverse: `None` for a blob it did not write.
+fn unpack_opt_result(blob: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let len = usize::try_from(u64::from_le_bytes(blob.get(1..9)?.try_into().ok()?)).ok()?;
+    let module = blob.get(9..9usize.checked_add(len)?)?.to_vec();
+    let rest = blob[9 + len..].to_vec();
+    match blob[0] {
+        0 if rest.is_empty() => Some((module, None)),
+        1 => Some((module, Some(rest))),
+        _ => None,
+    }
 }
 
 /// `vl build` — see the header comment and `vl help build`. Takes the FULL argv
@@ -9799,6 +9864,8 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // bytes. Both sections it borrowed are appended after the code, so dropping them moves no
     // byte the map names; `vl-src` stays only in an unoptimized `--names` build, as before.
     let map_path = source_map.then(|| format!("{out}.map"));
+    // The emitter's bytes with their rows: what an `-O` build's map is made from, so its key.
+    let emitted_bytes = if source_map && optimizing { bytes.clone() } else { Vec::new() };
     // The rows the map was made from, kept for a step that moves code to make it again.
     let mut map_rows: Option<SrcMap> = None;
     if let Some(mp) = &map_path {
@@ -9849,74 +9916,126 @@ fn build_cmd(args: &[String]) -> Result<()> {
             bytes = stripped;
             std::fs::write(&sink, &bytes)?;
         }
-        // The escape step goes first, so the rung's own passes (`--heap2local` among them)
-        // see each per-call struct and its uses in one function. It renumbers functions, so
-        // the run-once marks are read off its output, not off `bytes`.
         let map = map_path.as_deref();
-        // A step that moves code has the map made again from its rows, each moved with the
-        // op it names; a twin is a copy of its function, so it gets a copy of its rows.
-        let remap = |rows: &mut SrcMap, moved: &[multivalue::BodyMove], mp: &str| -> Result<()> {
-            let old = std::mem::take(&mut rows.rows);
-            for body in moved {
-                for r in old.iter().filter(|r| body.from <= r.0 && r.1 <= body.to) {
-                    rows.rows.push((body.place(r.0), body.place(r.1), r.2, r.3, r.4));
+        let rows_in = map_rows.take();
+        // The chain is a function of these and of `bytes` (stage S2's key); a hit skips it.
+        let options = format!("{flag}\0{names}\0{low_memory:?}\0{stable_layout}");
+        let action = opt_cache_action(
+            &bytes,
+            options,
+            map.map(|_| (emitted_bytes.as_slice(), input, out.as_str())),
+        );
+        let chain = || -> Result<Vec<u8>> {
+            let mut bytes = bytes.clone();
+            let mut map_rows = rows_in.clone();
+            if let (Some(mp), Some(rows)) = (map, map_rows.as_ref()) {
+                std::fs::write(mp, build_source_map(rows, input, &out))
+                    .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))?;
+            }
+            std::fs::write(&sink, &bytes)?;
+            // A step that moves code has the map made again from its rows, each moved with the
+            // op it names; a twin is a copy of its function, so it gets a copy of its rows.
+            let remap =
+                |rows: &mut SrcMap, moved: &[multivalue::BodyMove], mp: &str| -> Result<()> {
+                    let old = std::mem::take(&mut rows.rows);
+                    for body in moved {
+                        for r in old.iter().filter(|r| body.from <= r.0 && r.1 <= body.to) {
+                            rows.rows.push((body.place(r.0), body.place(r.1), r.2, r.3, r.4));
+                        }
+                    }
+                    std::fs::write(mp, build_source_map(rows, input, &out))
+                        .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))
+                };
+            // The inline-record step goes first: a field holding a small record nobody writes
+            // stores its fields in the parent, and a list of them holds the fields side by
+            // side, so a stored producer's result is then only read field by field and the
+            // multi-value step below gives it a twin.
+            if std::env::var_os("VL_OPT_NO_INLINE").is_none_or(|v| v.is_empty()) {
+                if let Some(st) =
+                    phase!("opt.inline_step", inline::inline_step(&bytes, stable_layout))
+                {
+                    bytes = st.bytes;
+                    std::fs::write(&sink, &bytes)?;
+                    if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
+                        remap(rows, &st.moved, mp)?;
+                    }
+                    // `$VL_OPT_INLINE_DUMP=<file>` when a record field was inlined, and
+                    // `$VL_OPT_FLAT_DUMP=<file>` when a list was flattened: the step's output,
+                    // a measurement facility.
+                    for (on, var) in
+                        [(st.fields, "VL_OPT_INLINE_DUMP"), (st.flat, "VL_OPT_FLAT_DUMP")]
+                    {
+                        if let Some(dump) = std::env::var_os(var).filter(|v| on && !v.is_empty()) {
+                            std::fs::write(dump, &bytes)?;
+                        }
+                    }
                 }
             }
-            std::fs::write(mp, build_source_map(rows, input, &out))
-                .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))
-        };
-        // The inline-record step goes first: a field holding a small record nobody writes
-        // stores its fields in the parent, and a list of them holds the fields side by side,
-        // so a stored producer's result is then only read field by field and the multi-value
-        // step below gives it a twin.
-        if std::env::var_os("VL_OPT_NO_INLINE").is_none_or(|v| v.is_empty()) {
-            if let Some(st) = phase!("opt.inline_step", inline::inline_step(&bytes, stable_layout)) {
-                bytes = st.bytes;
-                std::fs::write(&sink, &bytes)?;
-                if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
-                    remap(rows, &st.moved, mp)?;
-                }
-                // `$VL_OPT_INLINE_DUMP=<file>` when a record field was inlined, and
-                // `$VL_OPT_FLAT_DUMP=<file>` when a list was flattened: the step's output, a
-                // measurement facility.
-                for (on, var) in [(st.fields, "VL_OPT_INLINE_DUMP"), (st.flat, "VL_OPT_FLAT_DUMP")] {
-                    if let Some(dump) = std::env::var_os(var).filter(|v| on && !v.is_empty()) {
+            // The multi-value step goes before the escape step: a call site whose small record
+            // is only read calls a twin returning the fields (D3625).
+            if std::env::var_os("VL_OPT_NO_MULTIVALUE").is_none_or(|v| v.is_empty()) {
+                if let Some((mv, moved)) =
+                    phase!("opt.multivalue_step", multivalue::multivalue_step(&bytes))
+                {
+                    bytes = mv;
+                    std::fs::write(&sink, &bytes)?;
+                    if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
+                        remap(rows, &moved, mp)?;
+                    }
+                    // `$VL_OPT_MV_DUMP=<file>`: the step's output, as `$VL_OPT_ESCAPE_DUMP` is
+                    // the escape step's — a measurement facility, undocumented in `vl help build`.
+                    if let Some(dump) =
+                        std::env::var_os("VL_OPT_MV_DUMP").filter(|v| !v.is_empty())
+                    {
                         std::fs::write(dump, &bytes)?;
                     }
                 }
             }
-        }
-        // The multi-value step goes before the escape step: a call site whose small record is
-        // only read calls a twin returning the fields (D3625).
-        if std::env::var_os("VL_OPT_NO_MULTIVALUE").is_none_or(|v| v.is_empty()) {
-            if let Some((mv, moved)) =
-                phase!("opt.multivalue_step", multivalue::multivalue_step(&bytes))
-            {
-                bytes = mv;
-                std::fs::write(&sink, &bytes)?;
-                if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
-                    remap(rows, &moved, mp)?;
-                }
-                // `$VL_OPT_MV_DUMP=<file>`: the step's output, as `$VL_OPT_ESCAPE_DUMP` is the
-                // escape step's — a measurement facility, undocumented in `vl help build`.
-                if let Some(dump) = std::env::var_os("VL_OPT_MV_DUMP").filter(|v| !v.is_empty()) {
-                    std::fs::write(dump, &bytes)?;
-                }
+            // The escape step goes first among the binaryen runs, so the rung's own passes
+            // (`--heap2local` among them) see each per-call struct and its uses in one
+            // function. It renumbers functions, so the run-once marks are read off its output.
+            let stepped =
+                phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes, map))?;
+            let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
+            let mut passes = rung_passes(passes, names);
+            if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
+                passes.insert(0, "--low-memory-unused");
             }
+            let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
+            passes.extend(extra);
+            phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline, map))?;
+            let module = std::fs::read(&sink).map_err(|e| {
+                Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
+            })?;
+            let map_text = map
+                .map(|mp| {
+                    std::fs::read(mp)
+                        .map_err(|e| Error::from(e).context(format!("reading back `{mp}`")))
+                })
+                .transpose()?;
+            Ok(pack_opt_result(&module, map_text.as_deref()))
+        };
+        // Only a module the engine accepts is stored, as for the emitter's bytes.
+        let blob = compile_cache::serve(
+            action.as_ref(),
+            &|_| None,
+            chain,
+            |b: &Vec<u8>| {
+                let (m, _) = unpack_opt_result(b)?;
+                Module::validate(&compile_engine, &m).is_ok().then(|| b.clone())
+            },
+            |b| b,
+        )?;
+        let (module, map_text) = unpack_opt_result(&blob)
+            .ok_or_else(|| Error::msg(format!("{flag}: a malformed cached result")))?;
+        // A hit ran nothing, so the module and its map are written here; after a run this
+        // rewrites the same bytes.
+        std::fs::write(&sink, &module)?;
+        if let (Some(mp), Some(text)) = (map, &map_text) {
+            std::fs::write(mp, text)
+                .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))?;
         }
-        let stepped =
-            phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes, map))?;
-        let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
-        let mut passes = rung_passes(passes, names);
-        if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
-            passes.insert(0, "--low-memory-unused");
-        }
-        let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
-        passes.extend(extra);
-        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline, map))?;
-        final_bytes = Some(std::fs::read(&sink).map_err(|e| {
-            Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
-        })?);
+        final_bytes = Some(module);
     }
     let final_bytes: &[u8] = final_bytes.as_deref().unwrap_or(&bytes);
     // The `sourceMappingURL` section goes on last, naming the map by its file name: the two
