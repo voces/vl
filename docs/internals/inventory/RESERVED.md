@@ -80,3 +80,4 @@ D3742-D3749  lane-UA  2026-10-06  empty-list pins at a hole argument and a recor
 D3760-D3764  lane-GN  2026-10-06  getter-alias narrowing (clause 1) + buildFnMap per-instance perf
 D3770-D3774  lane-DX  2026-10-06  diagnostic cascades, sunpa missing-import report (D3770, D3772, D3773 filed and closed; D3771 filed open)
 D3775-D3779  lane-S3  2026-10-06  soundness: D3757, D3746 closed; D3771 left open (attempt withdrawn); D3775 filed
+D3785-D3789  lane-S4  2026-10-06  hex-literal value-if joins at i64 (D3733, D3734) + caller write after a callee-pinned element (D3775)
