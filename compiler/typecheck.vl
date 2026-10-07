@@ -4489,6 +4489,10 @@ let unresolvedFns: string[] = []
 // The provisional code of a no-basis return refusal until `noBasisFlush` rules on it. Held in
 // `T.diags` itself, so a speculative check's rollback discards it with its other diagnostics.
 const NO_BASIS_PENDING = "#no-basis-pending"
+// Every function a recursive cycle reached while inferring its return, the return pre-pass's
+// included: a cycle break, or a call to a callee whose return is still pending. Its error type may
+// be the cycle's own, which no diagnostic explains, so its refusal is never pending.
+let inferCycleFns: string[] = []
 let fnSawValueRet = false
 
 // Redundant return-type annotation rule: `retNatural` is the body's natural inferred return — the
@@ -5382,6 +5386,7 @@ export function initChecker() {
   bareBraceSpec = 0
   inferTentative = []
   unresolvedFns = []
+  inferCycleFns = []
   fnSawValueRet = false
   retNatural = -1
   retNaturalErr = false
@@ -19025,10 +19030,6 @@ export function tErrBuiltinTyDecl(name: string, at: i32): i32 {
   0
 }
 
-// Every raise, a deduplicated repeat included: a region compares it before and after to ask
-// whether it reported anything, which a `T.diags` length cannot answer for a repeat.
-let tErrRaised = 0
-
 function tErrPush(
   msg0: string,
   at: i32,
@@ -19038,7 +19039,6 @@ function tErrPush(
   code0: string,
   data: string,
 ) {
-  tErrRaised = tErrRaised + 1
   // A misuse of a name a call un-narrowed says so, whichever check refused it (D2390).
   let msg = msg0
   let code = code0
@@ -19060,7 +19060,13 @@ function tErrPush(
   let di = 0
   while di < T.diags.length {
     const d = T.diags[di]
-    if d.tat == at && d.tmsg == msg { return 0 }
+    if d.tat == at && d.tmsg == msg {
+      // A firm raise of a refusal still pending makes the pending one firm.
+      if d.tcode == NO_BASIS_PENDING && code != NO_BASIS_PENDING {
+        T.diags[di].tcode = code
+      }
+      return 0
+    }
     di = di + 1
   }
   numLitNoteQueue(msg, at, T.diags.length)
@@ -48245,6 +48251,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   let retTy = ft.fnRet
   if retTy == -2 {
     retTy = TY_ERR
+    if inferStack.length > 0 {
+      noteInferCycle(inferStack[inferStack.length - 1])
+    }
     // A direct self-recursive call resolves to the function's own provisional inferred
     // type (`inferObserved`, already holding the base case since it is checked first) —
     // without this, `TY_ERR` makes `assignable(TY_ERR, string)` vacuously true and a `+`
@@ -48255,6 +48264,12 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
           if inferObserved >= 0 { retTy = inferObserved }
         }
       }
+    }
+  }
+  // A callee a cycle left without a return passes the cycle on to the caller.
+  if cfn is Ident && inferStack.length > 0 {
+    if retTy == TY_ERR && strListHas(inferCycleFns, cfn.identName) {
+      noteInferCycle(inferStack[inferStack.length - 1])
     }
   }
   const params = ft.fnParamTypes
@@ -50908,6 +50923,12 @@ function inferNoBasisErr(name: string, fnIx: i32, body: i32, code: string) {
   0
 }
 
+// Record that a cycle reached the inference of `name` (`inferCycleFns`).
+function noteInferCycle(name: string) {
+  if name != "" && !strListHas(inferCycleFns, name) { inferCycleFns.push(name) }
+  0
+}
+
 // Rule on the pending no-basis refusals: dropped when any other error stands, since an error type
 // flows only from a diagnosed error and each is then its echo in a caller or an importer; kept,
 // as plain errors, when none does.
@@ -50960,6 +50981,7 @@ function finishInferredReturn(
   // plain-struct lambda regresses `.map`-collapse / factory / generic-HOF cases).
   let objRetAdopted = false
   const sawCycle = cycleBreakCount > cbBefore
+  if sawCycle { noteInferCycle(n.fnName) }
   if inferObserved >= 0 {
     inferred = inferObserved
   } else if sawCycle && fnSawValueRet {
@@ -50970,10 +50992,13 @@ function finishInferredReturn(
     if !strListHas(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
     inferred = TY_VOID
   } else if inferSawErr {
-    // Only err-ish types flowed back: no basis. An uninferable param, a bare `{}` or any
-    // error raised in the body is the root cause; any other is ruled on by `noBasisFlush`.
+    // Only err-ish types flowed back: no basis. An uninferable param or a bare `{}` in the
+    // body is the root cause. A recursive cycle is a cause of its own and is raised firm; any
+    // other error type comes from a diagnosed error and waits on `noBasisFlush`.
     if !causeReported {
-      inferNoBasisErr(n.fnName, fnIx, n.fnBody, NO_BASIS_PENDING)
+      let code = NO_BASIS_PENDING
+      if sawCycle || strListHas(inferCycleFns, n.fnName) { code = "" }
+      inferNoBasisErr(n.fnName, fnIx, n.fnBody, code)
     }
     inferred = TY_ERR
   }
@@ -51985,7 +52010,6 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   const savedDroppedLen = inferDroppedTy.length
   const cbBefore = cycleBreakCount
   const bbBefore = bareBraceCount
-  const raisedBefore = tErrRaised
   const savedValueRet = fnSawValueRet
   const savedRetNatural = retNatural
   const savedRetNaturalErr = retNaturalErr
@@ -52320,9 +52344,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       n,
       fnIx,
       paramTys,
-      paramUninferable
-        || bareBraceCount > bbBefore
-        || tErrRaised > raisedBefore,
+      paramUninferable || bareBraceCount > bbBefore,
       cbBefore,
       savedObserved,
       savedSawErr,
