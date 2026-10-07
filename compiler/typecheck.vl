@@ -40,6 +40,7 @@ import {
   cexOfLexeme,
   cexOk,
   cexPatFits,
+  cexPatternHex,
   cexRem,
   cexScaleBits,
   cexShift,
@@ -15878,6 +15879,69 @@ function cexDeliver(srcExpr: i32, dstTy: i32): boolean {
   true
 }
 
+// An `i64` value delivered into `i32` whose every leaf is an integer constant, through `if`,
+// `match` and block tails and integer operators: it is `i64` only because some constant overflows
+// `i32`, so that constant is refused in its own words (D3780). Answers whether it found one.
+function cexJoinMisfit(srcExpr: i32): boolean {
+  const todo: i32[] = [srcExpr]
+  let bad = -1
+  let badV = cexNotConst()
+  let badLit = -1
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { return false }
+    const e = P.nodes[at]
+    if (
+      tailPushIfArms(at, todo)
+      || tailPushMatchArms(at, todo)
+      || tailPushBlockTail(at, todo)
+    ) {
+      continue
+    }
+    if e is BinExpr {
+      if (
+        !binIntOnlyOp(e.binOp)
+        && e.binOp != "+"
+        && e.binOp != "-"
+        && e.binOp != "*"
+        && e.binOp != "/"
+        && e.binOp != "%"
+      ) {
+        return false
+      }
+      todo.push(e.binLeft)
+      todo.push(e.binRight)
+      continue
+    }
+    const lit = cexLitPeel(at)
+    if lit < 0 {
+      if e is Unary && (e.unOp == "-" || e.unOp == "~") {
+        todo.push(e.unArg)
+        continue
+      }
+      return false
+    }
+    const l = P.nodes[lit]
+    if !(l is NumLit) { return false }
+    if numLexIsFloat(l.numText) { return false }
+    let v = cexOfLexeme(l.numText)
+    if !cexOk(v) { return false }
+    if intLitIsNegated(at) { v = cexNeg(v) }
+    if bad < 0 && !cexFitsAt(v, l.numText, TY_I32) {
+      bad = at
+      badV = v
+      badLit = lit
+    }
+  }
+  if bad < 0 { return false }
+  // A constant already refused is not refused twice, nor is its join's mismatch reported.
+  if !(cexReported[badLit] ?? false) {
+    cexReported[badLit] = true
+    tErr(cexMisfitMsg(badV, "i32", false), bad)
+  }
+  true
+}
+
 // A constant `v` delivered into the union `dstTy` is refused when no number member holds it.
 function cexDeliverUnion(v: Cex, lit: i32, srcExpr: i32, dstTy: i32): boolean {
   const members: i32[] = []
@@ -15934,6 +15998,19 @@ function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
       + " is not a whole number, so "
       + tyName
       + " cannot hold it"
+  }
+  let bits = 0
+  if tyName == "i32" { bits = 32 }
+  else if tyName == "i64" { bits = 64 }
+  const pat = cexPatternHex(v, bits)
+  if pat != "" {
+    return "constant "
+      + shown
+      + " overflows "
+      + tyName
+      + " — write "
+      + pat
+      + " for its bit pattern"
   }
   "constant " + shown + " overflows " + tyName
 }
@@ -18931,6 +19008,11 @@ export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
 // `tErr` for a value delivered to a `want`-typed destination, which lets the numeric-literal note
 // find a literal binding inside a record, list or arithmetic value.
 function tErrWant(msg: string, at: i32, want: i32) {
+  // An `i64` made only of constants, one of which overflows `i32`: that constant is the
+  // error, refused at its own span (D3780).
+  if want == TY_I32 && !inferQuiet && at >= 0 && nodeTyOf(at) == TY_I64 {
+    if cexJoinMisfit(at) { return 0 }
+  }
   nlWantTy = want
   tErr(msg, at)
   nlWantTy = -1
