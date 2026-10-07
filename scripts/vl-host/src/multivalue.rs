@@ -17,6 +17,11 @@
 //! and stays a record while neither is written (D3630). Otherwise a write reaches every type of
 //! its shape, and a type in any subtyping relation is refused. `$VL_MV_EXPLAIN=1` prints why
 //! each record type and producer was taken or refused.
+//! When types are judged by index, a record type that IS written is still taken apart as a
+//! fresh argument (D3765): a `struct.new` handed straight to a parameter its callee uses
+//! field-only has no other reference, so no write can reach it while the call runs. Only that argument, and a field
+//! parameter of a twin it fills, qualifies; a producer's result, a merge, a local and an exit
+//! of a written type keep the struct.
 //! A producer is a function whose one result is a non-null reference to a record. A record
 //! value is used *field-only* when it reaches nothing but `struct.get`s, a field-only local,
 //! a field-only parameter of another call, or (inside a result twin) the twin's own exit. A
@@ -217,6 +222,10 @@ struct Module<'a> {
     record: Vec<Option<Shape>>,
     /// Per type index: its shape when it has a record's fields, before any refusal.
     shape_all: Vec<Option<Shape>>,
+    /// Per type index: its shape when it would be a record but for a write, judged by index
+    /// (D3765). Such a record is taken apart only as a FRESH argument: a `struct.new` handed
+    /// straight to a parameter its callee uses field-only, which nothing else can reach.
+    fresh: Vec<Option<Shape>>,
     /// Every struct type sits in one rec group, so two type indices are never one wasm type
     /// and a write is charged by index rather than by shape.
     by_index: bool,
@@ -250,6 +259,15 @@ impl Module<'_> {
     }
     fn shape_of_type(&self, t: u32) -> Option<&Shape> {
         self.record.get(t as usize)?.as_ref()
+    }
+    /// The shape of a record that may be taken apart as an argument: a record, or a written
+    /// one, which only a fresh argument qualifies (D3765).
+    fn arg_shape(&self, t: u32) -> Option<&Shape> {
+        self.shape_of_type(t)
+            .or_else(|| self.fresh.get(t as usize)?.as_ref())
+    }
+    fn is_fresh_only(&self, t: u32) -> bool {
+        self.fresh.get(t as usize).is_some_and(|s| s.is_some())
     }
     /// The type of local `i` of defined function `f`.
     fn local_type(&self, f: u32, i: u32) -> Option<ValType> {
@@ -286,6 +304,7 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
         func_sig: Vec::new(),
         record: Vec::new(),
         shape_all: Vec::new(),
+        fresh: Vec::new(),
         by_index: false,
         comp: Vec::new(),
         writer: HashMap::new(),
@@ -769,6 +788,7 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
     }
     // A write is charged to every record of its subtyping component, or, judging by shape, to
     // every record of its shape (read before any refusal, so a refused type's write counts).
+    m.fresh = vec![None; m.record.len()];
     if m.by_index {
         let written: HashSet<u32> = tainted
             .iter()
@@ -776,7 +796,7 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
             .collect();
         for (t, slot) in m.record.iter_mut().enumerate() {
             if written.contains(&m.comp[t]) {
-                *slot = None;
+                m.fresh[t] = slot.take();
             }
         }
     } else {
@@ -800,7 +820,7 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
             && (!m.by_index || !written.contains(&m.comp[h as usize]))
     };
     for t in 0..m.record.len() {
-        let inner = m.record[t].as_ref().and_then(|(fs, _)| {
+        let inner = m.arg_shape(t as u32).and_then(|(fs, _)| {
             fs.iter().find_map(|&(v, _)| match v {
                 ValType::Ref(r) => match r.heap_type() {
                     HeapType::Abstract {
@@ -853,6 +873,19 @@ fn same_shape(m: &Module, a: u32, b: u32) -> bool {
 /// The record type a parameter or a function's single result names.
 fn param_record(m: &Module, f: u32, j: u32) -> Option<u32> {
     m.record_of(*m.sig(f).0.get(j as usize)?).map(|(t, _)| t)
+}
+
+/// The record type a parameter names, a written one included: one a fresh argument may fill.
+fn param_arg_record(m: &Module, f: u32, j: u32) -> Option<u32> {
+    let ValType::Ref(r) = *m.sig(f).0.get(j as usize)? else {
+        return None;
+    };
+    concrete_index(r.heap_type()).filter(|&t| m.arg_shape(t).is_some())
+}
+
+/// `same_shape`, or the same written record type, which only a fresh argument fills.
+fn same_arg(m: &Module, a: u32, b: u32) -> bool {
+    same_shape(m, a, b) || (a == b && m.is_fresh_only(a))
 }
 
 /// Whether `f` and `g` return the same record type, so `g`'s result fields are `f`'s.
@@ -933,14 +966,15 @@ fn analyse(m: &Module) -> Analysis {
             return false;
         }
         if let Next::StructGet(st, _) = i.next {
-            return same_shape(m, st, t);
+            return same_arg(m, st, t);
         }
         let ix = (f - m.n_imports) as usize;
         match consumers[ix].get(&i.k) {
             Some(&(ck, j)) => {
                 let c = m.body(f).at(ck).expect("a consumer is recorded");
                 let h = callee_of(c).expect("a consumer is a call");
-                fo.contains(&(h, j)) && param_record(m, h, j).is_some_and(|pt| same_shape(m, pt, t))
+                fo.contains(&(h, j))
+                    && param_arg_record(m, h, j).is_some_and(|pt| same_arg(m, pt, t))
             }
             None => false,
         }
@@ -950,6 +984,8 @@ fn analyse(m: &Module) -> Analysis {
     // may inline: that struct may be made fresh beside the record, and the escape step removes
     // both, where taken apart here the inner one is still allocated.
     // The parameters that may be taken apart at all, within `MV_TWIN_MAX_PARAMS`.
+    // Records first, then written records, so a fresh-only parameter never takes the width
+    // a record parameter had.
     let mut allowed: HashSet<(u32, u32)> = HashSet::new();
     for f in defined() {
         let small = {
@@ -957,14 +993,19 @@ fn analyse(m: &Module) -> Analysis {
             r.1 - r.0 <= crate::ESCAPE_INLINE_MAX_BYTES
         };
         let mut width = m.sig(f).0.len();
-        for j in 0..m.sig(f).0.len().min(64) as u32 {
-            let Some(t) = param_record(m, f, j) else {
-                continue;
-            };
-            let grow = fields_of(m, t).len() - 1;
-            if !(small && m.nested.contains_key(&t)) && width + grow <= MV_TWIN_MAX_PARAMS {
-                width += grow;
-                allowed.insert((f, j));
+        for fresh in [false, true] {
+            for j in 0..m.sig(f).0.len().min(64) as u32 {
+                let Some(t) = param_arg_record(m, f, j) else {
+                    continue;
+                };
+                if m.is_fresh_only(t) != fresh {
+                    continue;
+                }
+                let grow = fields_of(m, t).len() - 1;
+                if !(small && m.nested.contains_key(&t)) && width + grow <= MV_TWIN_MAX_PARAMS {
+                    width += grow;
+                    allowed.insert((f, j));
+                }
             }
         }
     }
@@ -974,7 +1015,7 @@ fn analyse(m: &Module) -> Analysis {
             .iter()
             .copied()
             .filter(|&(f, a)| {
-                let t = param_record(m, f, a).expect("a candidate names a record");
+                let t = param_arg_record(m, f, a).expect("a candidate names a record");
                 m.body(f).ins.iter().any(|i| match i.kind {
                     Kind::LocalSet(l) | Kind::LocalTee(l) => l == a,
                     Kind::LocalGet(l) => l == a && !field_use(f, i, t, &fo),
@@ -1357,16 +1398,22 @@ fn plan_context(
             if q == NONE || j >= 64 || !fo.contains(&(h, j)) {
                 continue;
             }
-            let pt = param_record(m, h, j).expect("a field-only parameter names a record");
+            let pt = param_arg_record(m, h, j).expect("a field-only parameter names a record");
             let Some(src) = b.at(q) else { continue };
+            // A written record qualifies only fresh: a `struct.new` here, or a field parameter
+            // of this twin, which only a fresh argument fills.
             let ok = match src.kind {
                 Kind::Call(g) => {
                     a.producer.contains(&g)
                         && result_record(m, g).is_some_and(|rt| same_shape(m, rt, pt))
                 }
-                Kind::StructNew(st) | Kind::Merge(st) => same_shape(m, st, pt),
+                Kind::StructNew(st) => same_arg(m, st, pt),
+                Kind::Merge(st) => same_shape(m, st, pt),
                 Kind::LocalGet(l) => {
-                    scalar_local(l) && local_record(l).is_some_and(|lt| same_shape(m, lt, pt))
+                    scalar_local(l)
+                        && local_record(l).is_some_and(|lt| {
+                            same_shape(m, lt, pt) || (l < n_params && same_arg(m, lt, pt))
+                        })
                 }
                 _ => false,
             };
@@ -1465,7 +1512,7 @@ fn nullable(v: ValType) -> Option<ValType> {
 }
 
 fn fields_of(m: &Module, t: u32) -> Vec<ValType> {
-    m.shape_of_type(t)
+    m.arg_shape(t)
         .map_or_else(Vec::new, |s| s.0.iter().map(|&(v, _)| v).collect())
 }
 
@@ -1475,7 +1522,7 @@ fn twin_sig(m: &Module, (f, s, r): Twin) -> (Vec<ValType>, Vec<ValType>) {
     let mut params = Vec::new();
     for (j, &p) in ps.iter().enumerate() {
         if j < 64 && s & (1u64 << j) != 0 {
-            let t = param_record(m, f, j as u32).expect("a twin's field parameter is a record");
+            let t = param_arg_record(m, f, j as u32).expect("a twin's field parameter is a record");
             params.extend(fields_of(m, t));
         } else {
             params.push(p);
@@ -1512,7 +1559,7 @@ fn emit_body(
     for j in 0..n_params {
         param_new.push(at);
         at += if j < 64 && s & (1u64 << j) != 0 {
-            fields_of(m, param_record(m, f, j)?).len() as u32
+            fields_of(m, param_arg_record(m, f, j)?).len() as u32
         } else {
             1
         };
@@ -1537,7 +1584,7 @@ fn emit_body(
                 j,
                 (
                     param_new[j as usize],
-                    fields_of(m, param_record(m, f, j)?),
+                    fields_of(m, param_arg_record(m, f, j)?),
                     false,
                 ),
             );
@@ -1765,9 +1812,16 @@ pub(crate) fn field_facts(bytes: &[u8]) -> FieldFacts {
                 .iter()
                 .filter_map(|&f| result_record(&m, f).map(|t| (f, t)))
                 .collect(),
-            fo_param: a.fo_param,
+            fo_param: without_fresh(&m, a.fo_param),
         }
     })
+}
+
+/// `pairs` without the parameters of a written record type: those are taken apart only where
+/// the argument is fresh, so the other steps' cost rules may not count on them.
+fn without_fresh(m: &Module, mut pairs: HashSet<(u32, u32)>) -> HashSet<(u32, u32)> {
+    pairs.retain(|&(f, j)| !param_arg_record(m, f, j).is_some_and(|t| m.is_fresh_only(t)));
+    pairs
 }
 
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
@@ -2041,6 +2095,9 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
         }
         return None;
     }
+    // For `scalarized`, whose callers may count only on what is taken apart at every site.
+    let mut a = a;
+    a.fo_param_r = without_fresh(&m, std::mem::take(&mut a.fo_param_r));
     Some((out, moved, a))
 }
 
@@ -2177,13 +2234,19 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
                 (0..m.shape_all.len() as u32)
                     .find(|&u| m.writer.contains_key(&u) && m.shape_all[u as usize] == fields)
             };
+            let fresh = if m.is_fresh_only(t) {
+                "; still taken apart as a fresh argument (a struct.new passed straight to a \
+                 parameter its callee only reads)"
+            } else {
+                ""
+            };
             match culprit {
                 Some(u) if u == t => eprintln!(
-                    "{head}: refused: its fields are written (struct.set {t} in {})",
+                    "{head}: refused: its fields are written (struct.set {t} in {}){fresh}",
                     name(m.writer[&u])
                 ),
                 Some(u) => eprintln!(
-                    "{head}: refused: type {u}, {}, is written (struct.set {u} in {})",
+                    "{head}: refused: type {u}, {}, is written (struct.set {u} in {}){fresh}",
                     if m.by_index {
                         "in its subtyping component"
                     } else {

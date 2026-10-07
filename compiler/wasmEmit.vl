@@ -741,6 +741,7 @@ import {
   asExprNumFallible,
   asExprNumSrcName,
   asExprNumTgtName,
+  asgRadixWidePrim,
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
@@ -16967,6 +16968,8 @@ export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32) {
     pendingI64 = saved
     return r
   }
+  const rw64 = asgRadixWidePrim(inner, fnIx)
+  if rw64 != "" { return emitAsgRadixAs(body, inner, rw64, "i64", fnIx) }
   if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
     // A join whose wide arm claims `i64` can still be a box of numbers (D3517).
     if njBoxWidens(exprIx, fnIx) {
@@ -16992,6 +16995,8 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
   // arithmetic expression with an f32 operand emits as f32, yet `exprIsF64` also claims it
   // via its float literal — without this check the f64 fast-path would emit f32 into an f64
   // slot and trap. A pure-f64 expression is not `exprIsF32`, so it still takes the fast path.
+  const rw64f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
+  if rw64f != "" { return emitAsgRadixAs(body, exprIx, rw64f, "f64", fnIx) }
   const f64Cls = widenClassifyExpr(exprIx, fnIx)
   if exprIsF32(f64Cls, fnIx) {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -17071,6 +17076,8 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
     fbF32Const(litText)
     return 0
   }
+  const rw32f = asgRadixWidePrim(unwrapParen(exprIx), fnIx)
+  if rw32f != "" { return emitAsgRadixAs(body, exprIx, rw32f, "f32", fnIx) }
   // An already-f32-valued expression (a variable, an f32 arithmetic / call result) emits
   // directly. An assignment classifies by its target cell (`widenClassifyExpr`), as the
   // i64/f64 widenings do, and owns its own width (`emitExprWideCleared`) so an f32 seed
@@ -30358,6 +30365,58 @@ function emitBinExprInRegion(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   rc
 }
 
+// Store the assignment at `asgIx` and re-read its target cell, then apply `unwidenOp` (an
+// opcode, or -1 for none) to take the cell's rep back to the value's (D2512).
+function emitAsgValue(body: u8[], asgIx: i32, fnIx: i32, unwidenOp: i32): i32 {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return emitFail("emitProgram: expected an assignment") }
+  if emitAssign(body, asgIx, fnIx) < 0 { return -1 }
+  // A box cell re-read at the one member the checker typed the value at (`asgReadNarrowTy`).
+  const asgTop = pushAsgReadNarrow(asgIx, fnIx)
+  // The re-read yields the value just stored, so it is never a read before init (D2652).
+  const savedGuardOff = initGuardOff
+  initGuardOff = true
+  const asgRc = emitExpr(body, a.binLeft, fnIx)
+  initGuardOff = savedGuardOff
+  if asgTop >= 0 { restoreNarrow(asgTop) }
+  if asgRc >= 0 && unwidenOp >= 0 { wU8(unwidenOp) }
+  asgRc
+}
+
+// Emit the assignment at `exprIx`, whose right side is built at the wide primitive `wp`
+// (`asgRadixWidePrim`), as a value of primitive `want`: the stored cell where the widths
+// agree, else the 32-bit pattern the checker typed it at, converted as an `i32` is (D3733).
+function emitAsgRadixAs(
+  body: u8[],
+  exprIx: i32,
+  wp: string,
+  want: string,
+  fnIx: i32,
+): i32 {
+  const ix = unwrapParen(exprIx)
+  if wp == want { return emitAsgValue(body, ix, fnIx, -1) }
+  if want == "f64" && wp == "i64" {
+    if emitAsgValue(body, ix, fnIx, -1) < 0 { return -1 }
+    fbF64ConvertI64S()
+    return 0
+  }
+  if emitAsgValue(body, ix, fnIx, asgReadUnwidenOp(ix, fnIx)) < 0 { return -1 }
+  if want == "i64" {
+    fbI64ExtendI32S()
+  } else if want == "f64" {
+    fbF64ConvertI32S()
+  } else if want == "f32" {
+    fbF32ConvertI32S()
+  } else {
+    return emitFail(
+      "emitProgram: a radix assignment value has no "
+        + want
+        + " conversion",
+    )
+  }
+  0
+}
+
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // A mask that only zero-extends a load is the zero-extending load itself (`zextLoadOf`).
   if e.binOp == "&" {
@@ -30373,19 +30432,7 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // the target re-reads through the Ident path (a local or module global). The functype
     // must agree with the target cell's own storage class (`fnAssignRetKind`); D29 is the `string | null` half.
     if assignTargetReReads(exprIx, fnIx) {
-      if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
-      // A box cell re-read at the one member the checker typed the value at (`asgReadNarrowTy`).
-      const asgTop = pushAsgReadNarrow(exprIx, fnIx)
-      // The re-read yields the value just stored, so it is never a read before init (D2652).
-      const savedGuardOff = initGuardOff
-      initGuardOff = true
-      const asgRc = emitExpr(body, e.binLeft, fnIx)
-      initGuardOff = savedGuardOff
-      if asgTop >= 0 { restoreNarrow(asgTop) }
-      // A widened scalar cell is read back at the right side's own rep (D2512).
-      const asgUnw = asgReadUnwidenOp(exprIx, fnIx)
-      if asgRc >= 0 && asgUnw >= 0 { wU8(asgUnw) }
-      return asgRc
+      return emitAsgValue(body, exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
     }
     return emitFail(
       "emitProgram: only an identifier assignment is a value expression",

@@ -2131,6 +2131,54 @@ function fieldCodeRefsElemHeap(code: i32): boolean {
   code == FC_STRUCT || code == FC_REF_LIST || code == FC_NUL_REF_LIST
 }
 
+// The row an element type no row records resolves to by its shape (`repRowOfTyStruct`), or
+// -1. An instance re-spells a declared element structurally, so the declared row is its
+// heap; a re-entry for the same type declines, since a recursive shape asks itself again.
+const reShapeStk: i32[] = []
+function repElemRowByShape(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let k = 0
+  while k < reShapeStk.length {
+    if reShapeStk[k] == ty { return -1 }
+    k = k + 1
+  }
+  reShapeStk.push(ty)
+  const r = repRowOfTyStruct(ty, repScanLim())
+  reShapeStk.pop()
+  r
+}
+
+// How many list layers wrap arena type `ty`: 0 for a non-list or a hole.
+function repListDepth(ty: i32): i32 {
+  let d = 0
+  let t = ty
+  while t >= 0 {
+    const n = T.tys[t]
+    if !(n is TyArray) { return d }
+    d = d + 1
+    t = n.aElem
+  }
+  d
+}
+
+// The type under every list layer of `ty`, or `ty` itself when it is no list.
+function repListLeafTy(ty: i32): i32 {
+  let t = ty
+  while t >= 0 {
+    const n = T.tys[t]
+    if !(n is TyArray) { return t }
+    t = n.aElem
+  }
+  t
+}
+
+// The struct row of a list's leaf element type, by its recorded type then its shape, or -1.
+function repLeafRow(ty: i32): i32 {
+  const r = repStructRowByTy(ty)
+  if r >= 0 { return r }
+  repElemRowByShape(ty)
+}
+
 // True when struct slots `a` and `b` have an identical emitter field-code list, with
 // the referenced-layer guard on every field code whose storage heap is named rather
 // than pinned by the code (`fieldCodeRefsElemHeap`). A layout guard on top of the
@@ -2154,10 +2202,24 @@ function structFieldCodesEq(a: i32, b: i32): i32 {
         // element type through the D0 `sTyIx` scan), the recorded name only for a row the
         // sidecars do not cover — reached in exactly the same cases as the name-based
         // fall-through it replaces. The `ea != eb` trigger stays a name compare; arena-index equality here would newly merge rows the struct table cannot name.
-        let ra = repStructRowByTy(repFieldElemTyIx(a, i))
-        if ra < 0 { ra = repStructRowByName(ea) }
-        let rb = repStructRowByTy(repFieldElemTyIx(b, i))
-        if rb < 0 { rb = repStructRowByName(eb) }
+        const ta = repFieldElemTyIx(a, i)
+        const tb = repFieldElemTyIx(b, i)
+        const da = repListDepth(ta)
+        if da != repListDepth(tb) { return 0 }
+        let ra = -1
+        let rb = -1
+        if da > 0 {
+          // A list-of-lists element: the inner lists share a heap when their leaf rows do.
+          ra = repLeafRow(repListLeafTy(ta))
+          rb = repLeafRow(repListLeafTy(tb))
+        } else {
+          ra = repStructRowByTy(ta)
+          if ra < 0 { ra = repStructRowByName(ea) }
+          if ra < 0 { ra = repElemRowByShape(ta) }
+          rb = repStructRowByTy(tb)
+          if rb < 0 { rb = repStructRowByName(eb) }
+          if rb < 0 { rb = repElemRowByShape(tb) }
+        }
         if ra < 0 || rb < 0 { return 0 }
         if ra != rb {
           let onStack = false

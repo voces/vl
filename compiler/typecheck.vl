@@ -40,6 +40,7 @@ import {
   cexOfLexeme,
   cexOk,
   cexPatFits,
+  cexPatternHex,
   cexRem,
   cexScaleBits,
   cexShift,
@@ -900,6 +901,13 @@ let isCstrFn: i32[] = []
 // unpinned hole to `i32`; `checkArrayNewDefaultElems` refuses a pinned element with no zero.
 let arrDefCallIx: i32[] = []
 let arrDefCallTy: i32[] = []
+// D3746 — a hole callee's write into an open list handed over as a BINDING, which the call may
+// not pin (the binding's own later writes still decide it): the row and the written value's
+// type. The flush gives a row still open at scope close the first write's element.
+let calleeWriteRow: i32[] = []
+let calleeWriteGot: i32[] = []
+// The call node that recorded each `calleeWriteRow` write, where `checkCalleeWrites` reports (D3775).
+let calleeWriteAt: i32[] = []
 
 // D1470 — two open array holes that met at a store (`b = a` between two un-annotated bindings,
 // and every other position `constrainEmpty` covers). Neither pins the other, and a later use
@@ -2818,12 +2826,154 @@ function arrDefPinHoleElem(ty: i32) {
   const t = T.tys[ty]
   if t is TyArray {
     if t.aElem < 0 {
-      t.aElem = TY_I32
+      // A literal-union element is stored at its base primitive, whose zero the intrinsic
+      // writes; the `i32` default only when no callee wrote the row.
+      let el = litMembersBaseTy(calleeWrittenElem(ty))
+      if el < 0 { el = TY_I32 }
+      t.aElem = el
       tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
     }
     return t.aElem
   }
   -1
+}
+
+// The element a hole callee's first write gives an open list row handed to it as a binding,
+// directly or through a chain of hole links, or -1 when no callee wrote it (D3746).
+function calleeWrittenElem(ty: i32): i32 {
+  if calleeWriteRow.length == 0 { return -1 }
+  const rows = holeLinkClosure(ty)
+  let i = 0
+  while i < calleeWriteRow.length {
+    if i32ListHas(rows, calleeWriteRow[i]) {
+      return widenLitTy(calleeWriteGot[i])
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The base primitive of a literal or a union of literals sharing one base (`0 | 1 | 2` is
+// `i32`); any other type, and -1, unchanged.
+function litMembersBaseTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const lb = litBaseOrNeg(ty)
+  if lb >= 0 { return lb }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let base = -1
+    for m in t.uMembers {
+      const b = litBaseOrNeg(m)
+      if b < 0 || (base >= 0 && b != base) { return ty }
+      base = b
+    }
+    if base >= 0 { return base }
+  }
+  ty
+}
+
+// The base primitive of literal type `ty`, or -1 when `ty` is not a literal.
+function litBaseOrNeg(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  -1
+}
+
+// Row `ty` and every row a chain of recorded hole links joins to it.
+function holeLinkClosure(ty: i32): i32[] {
+  const rows: i32[] = [ty]
+  let k = 0
+  while k < rows.length {
+    const r = rows[k]
+    let i = 0
+    while i < holeLinkA.length {
+      if holeLinkA[i] == r && !i32ListHas(rows, holeLinkB[i]) {
+        rows.push(holeLinkB[i])
+      }
+      if holeLinkB[i] == r && !i32ListHas(rows, holeLinkA[i]) {
+        rows.push(holeLinkA[i])
+      }
+      i = i + 1
+    }
+    k = k + 1
+  }
+  rows
+}
+
+// Pin a still-open list binding at scope close to the element a hole callee's write gave it;
+// false when no callee wrote it, which leaves the binding's own diagnostic standing (D3746).
+function calleeWritePin(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem >= 0 { return false }
+    const el = calleeWrittenElem(ty)
+    if el < 0 { return false }
+    t.aElem = el
+    tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+    return true
+  }
+  false
+}
+
+// Before a caller's write of `got` pins open list row `ty`, give the row an earlier hole callee's
+// element when `got`'s element cannot hold that callee's write: the first write decides, as at
+// the direct spelling, and the caller's write is checked against it. A callee write it can hold
+// (a literal `1` beside a later `2.5`) leaves the caller's write to decide (D3775).
+function calleeWritePrePin(ty: i32, got: i32) {
+  if ty < 0 || got < 0 || calleeWriteRow.length == 0 { return 0 }
+  if got == TY_ERR || tyHasHole(got) { return 0 }
+  const el = widenLitTy(got)
+  const rows = holeLinkClosure(ty)
+  let i = 0
+  while i < calleeWriteRow.length {
+    if i32ListHas(rows, calleeWriteRow[i]) {
+      if !assignable(calleeWriteGot[i], el) {
+        calleeWritePin(ty)
+        return 0
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The element of the list row `ty` or of a row a hole link joins to it, or -1 while all are open.
+function linkedRowElem(ty: i32): i32 {
+  const rows = holeLinkClosure(ty)
+  let k = 0
+  while k < rows.length {
+    const t = T.tys[rows[k]]
+    if t is TyArray {
+      if t.aElem >= 0 { return t.aElem }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// Refuse every hole callee's write into a binding's list that the list's final element cannot
+// hold: the callee's instance is built over that element (D3775).
+function checkCalleeWrites() {
+  let i = 0
+  while i < calleeWriteRow.length {
+    const el = linkedRowElem(calleeWriteRow[i])
+    const got = calleeWriteGot[i]
+    if el >= 0 && got >= 0 && !tyHasHole(got) && !tyHasHole(el) {
+      if !assignable(got, el) {
+        tErr(
+          "the callee's body writes "
+            + tyToStr(widenLitTy(got))
+            + " into the list passed here, whose element is "
+            + tyToStr(el),
+          calleeWriteAt[i],
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Record that the two array rows `a` and `b` must carry the same element. Deduped, because
@@ -3037,7 +3187,7 @@ function flushUninferred(depth: i32) {
   while i < pendNames.length {
     if pendDepths[i] == depth {
       if unresolvedHole(pendTys[i]) {
-        if !arrDefHoleToI32(pendTys[i]) {
+        if !arrDefHoleToI32(pendTys[i]) && !calleeWritePin(pendTys[i]) {
           tErr(
             "cannot infer a type for '"
               + pendNames[i]
@@ -5196,6 +5346,9 @@ export function initChecker() {
   isCstrFn = []
   arrDefCallIx = []
   arrDefCallTy = []
+  calleeWriteRow = []
+  calleeWriteGot = []
+  calleeWriteAt = []
   holeLinkA = []
   holeLinkB = []
   retCstrGot = []
@@ -15878,6 +16031,69 @@ function cexDeliver(srcExpr: i32, dstTy: i32): boolean {
   true
 }
 
+// An `i64` value delivered into `i32` whose every leaf is an integer constant, through `if`,
+// `match` and block tails and integer operators: it is `i64` only because some constant overflows
+// `i32`, so that constant is refused in its own words (D3780). Answers whether it found one.
+function cexJoinMisfit(srcExpr: i32): boolean {
+  const todo: i32[] = [srcExpr]
+  let bad = -1
+  let badV = cexNotConst()
+  let badLit = -1
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { return false }
+    const e = P.nodes[at]
+    if (
+      tailPushIfArms(at, todo)
+      || tailPushMatchArms(at, todo)
+      || tailPushBlockTail(at, todo)
+    ) {
+      continue
+    }
+    if e is BinExpr {
+      if (
+        !binIntOnlyOp(e.binOp)
+        && e.binOp != "+"
+        && e.binOp != "-"
+        && e.binOp != "*"
+        && e.binOp != "/"
+        && e.binOp != "%"
+      ) {
+        return false
+      }
+      todo.push(e.binLeft)
+      todo.push(e.binRight)
+      continue
+    }
+    const lit = cexLitPeel(at)
+    if lit < 0 {
+      if e is Unary && (e.unOp == "-" || e.unOp == "~") {
+        todo.push(e.unArg)
+        continue
+      }
+      return false
+    }
+    const l = P.nodes[lit]
+    if !(l is NumLit) { return false }
+    if numLexIsFloat(l.numText) { return false }
+    let v = cexOfLexeme(l.numText)
+    if !cexOk(v) { return false }
+    if intLitIsNegated(at) { v = cexNeg(v) }
+    if bad < 0 && !cexFitsAt(v, l.numText, TY_I32) {
+      bad = at
+      badV = v
+      badLit = lit
+    }
+  }
+  if bad < 0 { return false }
+  // A constant already refused is not refused twice, nor is its join's mismatch reported.
+  if !(cexReported[badLit] ?? false) {
+    cexReported[badLit] = true
+    tErr(cexMisfitMsg(badV, "i32", false), bad)
+  }
+  true
+}
+
 // A constant `v` delivered into the union `dstTy` is refused when no number member holds it.
 function cexDeliverUnion(v: Cex, lit: i32, srcExpr: i32, dstTy: i32): boolean {
   const members: i32[] = []
@@ -15934,6 +16150,19 @@ function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
       + " is not a whole number, so "
       + tyName
       + " cannot hold it"
+  }
+  let bits = 0
+  if tyName == "i32" { bits = 32 }
+  else if tyName == "i64" { bits = 64 }
+  const pat = cexPatternHex(v, bits)
+  if pat != "" {
+    return "constant "
+      + shown
+      + " overflows "
+      + tyName
+      + " — write "
+      + pat
+      + " for its bit pattern"
   }
   "constant " + shown + " overflows " + tyName
 }
@@ -18931,6 +19160,11 @@ export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
 // `tErr` for a value delivered to a `want`-typed destination, which lets the numeric-literal note
 // find a literal binding inside a record, list or arithmetic value.
 function tErrWant(msg: string, at: i32, want: i32) {
+  // An `i64` made only of constants, one of which overflows `i32`: that constant is the
+  // error, refused at its own span (D3780).
+  if want == TY_I32 && !inferQuiet && at >= 0 && nodeTyOf(at) == TY_I64 {
+    if cexJoinMisfit(at) { return 0 }
+  }
   nlWantTy = want
   tErr(msg, at)
   nlWantTy = -1
@@ -21312,6 +21546,7 @@ function cstrTablesMark(): i32[] {
     tpIfFn.length,
     tpIfReFn.length,
     isCstrTy.length,
+    calleeWriteRow.length,
   ]
 }
 
@@ -21328,6 +21563,11 @@ function cstrTablesTruncate(m: i32[]) {
     nestCstrTy.pop()
     nestCstrIx.pop()
     nestCstrFn.pop()
+  }
+  while calleeWriteRow.length > m[12] {
+    calleeWriteRow.pop()
+    calleeWriteGot.pop()
+    calleeWriteAt.pop()
   }
   while isCstrTy.length > m[11] {
     isCstrTy.pop()
@@ -42556,7 +42796,15 @@ function cnhPinBmElem(
   // A value's own type pins only a list written at the call; a binding's list keeps its own
   // later writes, which may still widen it.
   const valPin = isNullTy(got) || nhOpen(got) || i32ListHas(pinRows, arr)
-  if !valPin { return 0 }
+  if !valPin {
+    // A quiet re-check's write is not the program's; the real check records it again.
+    if unresolvedHole(arr) && !inferQuiet {
+      calleeWriteRow.push(arr)
+      calleeWriteGot.push(got)
+      calleeWriteAt.push(at)
+    }
+    return 0
+  }
   const a = T.tys[arr]
   if a is TyArray {
     if a.aElem < 0 {
@@ -47382,6 +47630,7 @@ function checkMemberCallNode(
             const pat = checkNode(margs[mi])
             // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
             // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
+            if rt.aElem < 0 { calleeWritePrePin(recvTy, pat) }
             if rt.aElem < 0 {
               rt.aElem = cnhPinTy(pat, ix, recvIx, false, false)
               tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
@@ -56664,6 +56913,7 @@ function checkProgramPass(rootIx: i32) {
   flushContainerNullHoles()
   // …and with every pin now in, grade what `__array_new_default__` needed to default.
   checkArrayNewDefaultElems()
+  checkCalleeWrites()
   synthInlineLitUnionDecls(rootIx)
   // Rewrite literal/intersection annotation names into the emitter's runtime vocabulary —
   // membership is already enforced above; names without those constructs are untouched.
@@ -61004,6 +61254,7 @@ function monoRecheckBegin(
   sv.push(tpEnvNames.length)
   sv.push(rcoalTok.length)
   sv.push(isvalTok.length)
+  sv.push(calleeWriteRow.length)
   inferQuiet = true
   symEnabled = 0
   njFnStack.push(njFnIx)
@@ -61093,6 +61344,11 @@ function monoRecheckEnd(sv: i32[]) {
   redunTruncate(sv[16])
   rcoalTruncate(sv[18])
   isvalTruncate(sv[19])
+  while calleeWriteRow.length > sv[20] {
+    calleeWriteRow.pop()
+    calleeWriteGot.pop()
+    calleeWriteAt.pop()
+  }
   while T.diags.length > sv[2] { T.diags.pop() }
   symEnabled = sv[1]
   inferQuiet = sv[0] == 1
@@ -62149,6 +62405,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         // the element pin below, which would otherwise infer a hole from a store that never
         // happens; reported and fallen through, so no cascade follows the one diagnostic.
         if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
+        if arrT0.aElem < 0 { calleeWritePrePin(arrTy0, rt) }
         if arrT0.aElem < 0 {
           arrT0.aElem = cnhPinTy(rt, ix, tgt.idxArr, false, false)
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
