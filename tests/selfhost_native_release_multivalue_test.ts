@@ -9,7 +9,8 @@
 //   when it names none: a global's initializer is not a function body). Its CONTROL builds
 //   the same rung with the step turned off (`$VL_OPT_NO_MULTIVALUE`) and must find more, so
 //   the fixture exercises this step and not the escape step or binaryen alone;
-// * `kept`: the step writes no twin (the record is past its field bound);
+// * `kept`: the step writes no twin (the record is past its field bound, or a fresh one
+//   escapes the callee it is passed to);
 // * `output`: only the output is pinned (records that escape, recursion, and the twin
 //   parameter cap).
 //
@@ -36,6 +37,10 @@ const FIXTURES: [string, Want][] = [
   ["if-merge", "melts"],
   ["fallback-local", "melts"],
   ["twin-param-cap", "output"],
+  ["fresh-argument", "melts"],
+  ["fresh-argument-written", "kept"],
+  ["fresh-argument-stored", "kept"],
+  ["fresh-argument-held", "output"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -141,7 +146,7 @@ for (const [fx, want] of FIXTURES) {
             throw new Error(
               `${fx} ${rung}: the step wrote ${twins} multi-value twin(s)\n` +
                 (want === "kept"
-                  ? "  want: none — the record is past the step's field bound"
+                  ? "  want: none — the record is past the step's field bound, or escapes its callee"
                   : "  want: at least one — some call site here only reads its record"),
             );
           }
