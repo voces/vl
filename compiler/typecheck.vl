@@ -261,6 +261,7 @@ import {
   fnTpBoundOf,
   isBodyTyDecl,
   matchPatValueName,
+  restoreAnnTsAll,
   tsFnParamNames,
   tsKidCount,
   tsKidStart,
@@ -4485,6 +4486,9 @@ let bareBraceMark: i32[] = []
 let bareBraceSpec = 0
 let inferTentative: string[] = []
 let unresolvedFns: string[] = []
+// The provisional code of a no-basis return refusal until `noBasisFlush` rules on it. Held in
+// `T.diags` itself, so a speculative check's rollback discards it with its other diagnostics.
+const NO_BASIS_PENDING = "#no-basis-pending"
 let fnSawValueRet = false
 
 // Redundant return-type annotation rule: `retNatural` is the body's natural inferred return — the
@@ -19021,6 +19025,10 @@ export function tErrBuiltinTyDecl(name: string, at: i32): i32 {
   0
 }
 
+// Every raise, a deduplicated repeat included: a region compares it before and after to ask
+// whether it reported anything, which a `T.diags` length cannot answer for a repeat.
+let tErrRaised = 0
+
 function tErrPush(
   msg0: string,
   at: i32,
@@ -19030,6 +19038,7 @@ function tErrPush(
   code0: string,
   data: string,
 ) {
+  tErrRaised = tErrRaised + 1
   // A misuse of a name a call un-narrowed says so, whichever check refused it (D2390).
   let msg = msg0
   let code = code0
@@ -29575,6 +29584,8 @@ export function canonRestoreSpellings(): i32 {
   canonRawNode = []
   canonRawSlot = []
   canonRawText = []
+  // The trees canon dropped describe these restored names again, and a re-check reads them.
+  restoreAnnTsAll()
   0
 }
 
@@ -50887,13 +50898,41 @@ function ifChainHasBareReturn(ifIx: i32): boolean {
 // one raise exempt from the node-span rule. It is a whole-body verdict and usually a
 // consequence of an error inside that body, and the report is position-ordered: at the
 // function's name it would print above its own cause.
-function inferNoBasisErr(name: string, fnIx: i32, body: i32) {
+function inferNoBasisErr(name: string, fnIx: i32, body: i32, code: string) {
   const msg = "cannot infer a return type for '"
     + name
     + "' — annotate a return type"
   const tk = nodeLastTok(body)
-  if tk >= 0 { return tErrPushTok(msg, fnIx, tk, "", "") }
-  tErr(msg, fnIx)
+  if tk >= 0 { return tErrPushTok(msg, fnIx, tk, code, "") }
+  tErrCoded(msg, fnIx, code)
+  0
+}
+
+// Rule on the pending no-basis refusals: dropped when any other error stands, since an error type
+// flows only from a diagnosed error and each is then its echo in a caller or an importer; kept,
+// as plain errors, when none does.
+function noBasisFlush() {
+  let others = false
+  let i = 0
+  while i < T.diags.length {
+    if T.diags[i].tcode != NO_BASIS_PENDING { others = true }
+    i = i + 1
+  }
+  if others {
+    const kept: TDiag[] = []
+    let k = 0
+    while k < T.diags.length {
+      if T.diags[k].tcode != NO_BASIS_PENDING { kept.push(T.diags[k]) }
+      k = k + 1
+    }
+    T.diags = kept
+    return 0
+  }
+  let j = 0
+  while j < T.diags.length {
+    T.diags[j].tcode = ""
+    j = j + 1
+  }
   0
 }
 
@@ -50931,9 +50970,11 @@ function finishInferredReturn(
     if !strListHas(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
     inferred = TY_VOID
   } else if inferSawErr {
-    // Only err-ish types flowed back: no basis. An uninferable param or a bare `{}` in the
-    // body already reported the root cause, so suppress the redundant message.
-    if !causeReported { inferNoBasisErr(n.fnName, fnIx, n.fnBody) }
+    // Only err-ish types flowed back: no basis. An uninferable param, a bare `{}` or any
+    // error raised in the body is the root cause; any other is ruled on by `noBasisFlush`.
+    if !causeReported {
+      inferNoBasisErr(n.fnName, fnIx, n.fnBody, NO_BASIS_PENDING)
+    }
     inferred = TY_ERR
   }
   // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
@@ -51944,6 +51985,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   const savedDroppedLen = inferDroppedTy.length
   const cbBefore = cycleBreakCount
   const bbBefore = bareBraceCount
+  const raisedBefore = tErrRaised
   const savedValueRet = fnSawValueRet
   const savedRetNatural = retNatural
   const savedRetNaturalErr = retNaturalErr
@@ -52278,7 +52320,9 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       n,
       fnIx,
       paramTys,
-      paramUninferable || bareBraceCount > bbBefore,
+      paramUninferable
+        || bareBraceCount > bbBefore
+        || tErrRaised > raisedBefore,
       cbBefore,
       savedObserved,
       savedSawErr,
@@ -53191,11 +53235,12 @@ function checkProgramNode(n: Program) {
     if ufIx >= 0 {
       const ufn = P.nodes[ufIx]
       if ufn is FuncDecl {
-        inferNoBasisErr(unresolvedFns[uf], ufIx, ufn.fnBody)
+        inferNoBasisErr(unresolvedFns[uf], ufIx, ufn.fnBody, "")
       }
     }
     uf = uf + 1
   }
+  noBasisFlush()
   bareBraceUndelivered()
   // LAST, because both of its filters read state this pass fills — see its header.
   annCommitVariantMembers()
@@ -56700,6 +56745,8 @@ function checkProgramPass(rootIx: i32) {
   checkProgramEndGetters()
   voidRetRewrite()
   numLitNotesApply()
+  // A body checked after pass 2 (a deferred instance) may have parked one.
+  noBasisFlush()
   T.diags.length
 }
 
@@ -64310,7 +64357,10 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
       retTailPos = mTail
       return r
     }
-    tErr(matchScrutRejectMsg(st, uMems), ix)
+    // An error-typed scrutinee's own diagnostic is already raised; refusing it again is a cascade.
+    if st < 0 || !(T.tys[st] is TyErr) {
+      tErr(matchScrutRejectMsg(st, uMems), ix)
+    }
     matchInRetTail = savedMatchTail
     retTailPos = mTail
     return TY_ERR
