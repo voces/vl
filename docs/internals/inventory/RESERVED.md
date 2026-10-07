@@ -83,3 +83,4 @@ D3775-D3779  lane-S3  2026-10-06  soundness: D3757, D3746 closed; D3771 left ope
 D3785-D3789  lane-S4  2026-10-06  hex-literal assignment values at i64 (D3733, D3734 closed) + caller write after a callee-pinned element (D3775 closed); D3785, D3786 filed
 D3790-D3794  lane-CC  2026-10-06  sunpa SP-048 (D3790, D3792 filed and closed; D3791, D3793 filed open)
 D3795-D3799  lane-S5  2026-10-06  soundness: D3793, D3762, D3744 closed; D3795 filed and closed; D3796, D3797, D3798 filed open
+D3800-D3802  lane-DG  2026-10-07  redundant-annotation hint at a `??` default (D3798 closed; D3800 filed open)
