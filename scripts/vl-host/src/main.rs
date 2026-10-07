@@ -6130,7 +6130,7 @@ fn run_once_hot_callees(s: &ModuleScan) -> Vec<String> {
 
 /// A callee at most this many body bytes may be inlined to let a caller's struct stay off
 /// the heap (`escape_inline_choice`). It bounds the code a call site can grow by.
-const ESCAPE_INLINE_MAX_BYTES: usize = 320;
+pub(crate) const ESCAPE_INLINE_MAX_BYTES: usize = 320;
 
 /// A record a producer's result is inlined for has at most this many fields; the owner's
 /// ruling (B) on small record results names the size.

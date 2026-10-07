@@ -5,11 +5,13 @@
 // call site whose result does not escape calls the twin. Pinned here, per fixture and rung:
 // the optimized module prints the unoptimized build's `@log` lines, and
 //
-// * `melts`: no `struct.new` is left outside a global's initializer. Its CONTROL builds the
-//   same rung with the step turned off (`$VL_OPT_NO_MULTIVALUE`) and must find one, so the
-//   fixture exercises this step and not the escape step or binaryen alone;
+// * `melts`: the `struct.new` sites left in function bodies are the fixture's `@allocs` (0
+//   when it names none: a global's initializer is not a function body). Its CONTROL builds
+//   the same rung with the step turned off (`$VL_OPT_NO_MULTIVALUE`) and must find more, so
+//   the fixture exercises this step and not the escape step or binaryen alone;
 // * `kept`: the step writes no twin (the record is past its field bound);
-// * `output`: only the output is pinned (records that escape, and recursion).
+// * `output`: only the output is pinned (records that escape, recursion, and the twin
+//   parameter cap).
 //
 // @test-timing opt
 import {
@@ -30,6 +32,10 @@ const FIXTURES: [string, Want][] = [
   ["escapes", "output"],
   ["recursion", "output"],
   ["over-bound", "kept"],
+  ["wide-argument", "melts"],
+  ["if-merge", "melts"],
+  ["fallback-local", "melts"],
+  ["twin-param-cap", "output"],
 ];
 const RUNGS = ["-O", "-O3"];
 
@@ -68,7 +74,9 @@ for (const [fx, want] of FIXTURES) {
     ignore: !ENABLED,
     fn: async () => {
       const src = `${DIR}/${fx}.vl`;
-      const logs = logsOf(Deno.readTextFileSync(src));
+      const text = Deno.readTextFileSync(src);
+      const logs = logsOf(text);
+      const allocs = Number(text.match(/^\/\/ @allocs (\d+)$/m)?.[1] ?? 0);
       const features = rustList(mainRs(), "BINARYEN_FEATURES");
       const tmp = await Deno.makeTempDir();
       try {
@@ -116,11 +124,11 @@ for (const [fx, want] of FIXTURES) {
             return allocations((await run(WASM_DIS, [out, ...features])).out);
           };
           const left = await built(true);
-          if (want === "melts" && left !== 0) {
+          if (want === "melts" && left !== allocs) {
             throw new Error(
               `${fx} ${rung}: ${left} struct.new left in the optimized module\n` +
-                "  want: 0 — every call here only reads the record it gets back\n" +
-                "  got:  an allocation, so some call site kept the struct-returning producer",
+                `  want: ${allocs} — every call here only reads the record it gets\n` +
+                "  got:  more, so some call site kept a record as a struct",
             );
           }
           let twins = 0;
@@ -137,9 +145,9 @@ for (const [fx, want] of FIXTURES) {
                   : "  want: at least one — some call site here only reads its record"),
             );
           }
-          if (want === "melts" && await built(false) === 0) {
+          if (want === "melts" && await built(false) <= allocs) {
             throw new Error(
-              `${fx} ${rung}: CONTROL — with the step off no struct.new is left either,\n` +
+              `${fx} ${rung}: CONTROL — with the step off no more struct.new is left,\n` +
                 "  so this fixture no longer exercises the step; give its producers a record\n" +
                 "  type some heap location holds, as sunpa's are",
             );
@@ -151,6 +159,53 @@ for (const [fx, want] of FIXTURES) {
     },
   });
 }
+
+// A rewrite that does not validate is dropped and the input kept: `$VL_MV_FAULT=1` corrupts
+// the step's output, and the build must still succeed and print the plain output, with no
+// step output written.
+Deno.test({
+  name:
+    "native-release: a multi-value rewrite that does not validate is dropped",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = `${DIR}/heap-held.vl`;
+    const logs = logsOf(Deno.readTextFileSync(src));
+    const tmp = await Deno.makeTempDir();
+    try {
+      const dump = `${tmp}/step.wasm`;
+      const out = `${tmp}/m.wasm`;
+      const b = await vl(["build", src, "-O", "-o", out], {
+        VL_MV_FAULT: "1",
+        VL_OPT_MV_DUMP: dump,
+      });
+      if (b.code !== 0) {
+        throw new Error(`build with a faulted step failed: ${b.err.trim()}`);
+      }
+      const r = await vl(["run", out]);
+      const got = linesOf(r.out);
+      if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(logs)) {
+        throw new Error(
+          `want ${JSON.stringify(logs)}, got ${
+            JSON.stringify(got)
+          } rc=${r.code}`,
+        );
+      }
+      let wrote = true;
+      try {
+        Deno.statSync(dump);
+      } catch {
+        wrote = false;
+      }
+      if (wrote) {
+        throw new Error(
+          "want no step output: the faulted rewrite should be dropped",
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
 
 // A twin carries its function's name with `.mv` after it, so a trap inside one reads as the
 // function it came from in a `--names` build. Read off the step's own output.
