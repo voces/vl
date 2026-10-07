@@ -1082,6 +1082,24 @@ fn analyse(m: &Module) -> Analysis {
         let same_local = |l: u32, t: u32, live: &HashSet<u32>| {
             live.contains(&l) && cands.get(&l).is_some_and(|&(lt, _)| same_shape(m, lt, t))
         };
+        // Whether the value at ordinal `k`, of record type `t`, is an arm's value where the
+        // merge is itself held as fields (read field by field, or set to a field-only local
+        // other than `l`).
+        let arm_held = |k: u32, t: u32, l: u32, live: &HashSet<u32>| {
+            b.arm_end.get(&(k + 1)).is_some_and(|&mi| {
+                let mg = &b.merges[mi];
+                mg.tails.contains(&k)
+                    && same_shape(m, mg.t, t)
+                    && b.at(mg.end_k).is_some_and(|e| {
+                        e.reach
+                            && match e.next {
+                                Next::StructGet(st, _) => same_shape(m, st, mg.t),
+                                Next::LocalSet(q) => q != l && same_local(q, mg.t, live),
+                                _ => false,
+                            }
+                    })
+            })
+        };
         loop {
             let mut first_seen: HashSet<u32> = HashSet::new();
             let mut bad: HashSet<u32> = HashSet::new();
@@ -1093,27 +1111,12 @@ fn analyse(m: &Module) -> Analysis {
                             let copied = matches!(i.next, Next::LocalSet(q)
                                 if q != l && i.reach && same_local(q, t, &live));
                             // An arm's value, where the merge is itself held as fields.
-                            let arm = i.reach
-                                && i.next == Next::ArmEnd
-                                && b.arm_end.get(&(i.k + 1)).is_some_and(|&mi| {
-                                    let mg = &b.merges[mi];
-                                    mg.tails.contains(&i.k)
-                                        && same_shape(m, mg.t, t)
-                                        && b.at(mg.end_k).is_some_and(|e| {
-                                            e.reach
-                                                && match e.next {
-                                                    Next::StructGet(st, _) => {
-                                                        same_shape(m, st, mg.t)
-                                                    }
-                                                    Next::LocalSet(q) => {
-                                                        q != l && same_local(q, mg.t, &live)
-                                                    }
-                                                    _ => false,
-                                                }
-                                        })
-                                });
+                            let arm =
+                                i.reach && i.next == Next::ArmEnd && arm_held(i.k, t, l, &live);
                             // An argument a result twin takes as fields, at a call whose own
-                            // result is held as fields (`unit(v, fallback)` into a local).
+                            // result is held as fields: into a local (`unit(v, fallback)`), an
+                            // arm of a merge held as fields, or straight into a field-only
+                            // parameter (`turn(unit(v, fallback))`).
                             let via_r = i.reach
                                 && consumers[ix].get(&i.k).is_some_and(|&(ck, j)| {
                                     let c = b.at(ck).expect("a consumer is recorded");
@@ -1130,7 +1133,8 @@ fn analyse(m: &Module) -> Analysis {
                                         && match c.next {
                                             Next::StructGet(st, _) => same_shape(m, st, rt),
                                             Next::LocalSet(q) => q != l && same_local(q, rt, &live),
-                                            _ => false,
+                                            Next::ArmEnd => arm_held(c.k, rt, l, &live),
+                                            _ => field_use(f, c, rt, &fo),
                                         }
                                 });
                             (

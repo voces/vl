@@ -36,6 +36,7 @@ const FIXTURES: [string, Want][] = [
   ["wide-argument", "melts"],
   ["if-merge", "melts"],
   ["fallback-local", "melts"],
+  ["fallback-argument", "melts"],
   ["twin-param-cap", "output"],
   ["fresh-argument", "melts"],
   ["fresh-argument-written", "kept"],
