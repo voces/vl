@@ -31,6 +31,11 @@ storage that every empty value of its type shares, and its first push allocates 
 own. A lambda that captures nothing is a constant, so passing `(a, b) => a < b` allocates
 nothing either; one that captures allocates each time it is evaluated.
 
+A list literal of constants that a `for` iterates, `for side in [1.0, -1.0]`, is built once
+for the whole program, so entering the loop allocates nothing. Its elements must be `i32`, `f64`,
+boolean or string literals, or `const`s holding one; `for p in [a, b, c]` builds its list on
+every entry.
+
 ### The element type sets the cost
 
 The element type decides how each element is stored, and that matters more than any other

@@ -15,7 +15,12 @@ const DIR = `${ROOT}/tests/fixtures/shared-constants`;
 const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
 const ENABLED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1" && exists(VL) &&
   exists(COMPILER) && exists(WASM_DIS);
-const FIXTURES = ["empty-lists", "capture-free-closures", "nullable-scalar-locals"];
+const FIXTURES = [
+  "empty-lists",
+  "capture-free-closures",
+  "nullable-scalar-locals",
+  "for-literal-lists",
+];
 
 const run = async (bin: string, args: string[]) => {
   const p = await new Deno.Command(bin, {

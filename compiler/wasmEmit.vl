@@ -567,6 +567,7 @@ import {
   svPairOn,
   svPairs,
   svViewTy,
+  synthConstListIdx,
   synthGlobalIdx,
   tailCallEnd,
   tailCallIdx,
@@ -8855,6 +8856,15 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           "emitProgram: f64 array literal but f64 list type not collected",
         )
       }
+      const hF64 = forLitHoist(
+        arrIx,
+        elems,
+        fnIx,
+        ALD_F64,
+        fa64TypeIdx,
+        fl64TypeIdx,
+      )
+      if hF64 != 0 { return if hF64 < 0 { -1 } else { 0 } }
       let dstF64 = -1
       let coffF64 = 0
       if elems.length > NEW_FIXED_MAX {
@@ -8943,6 +8953,8 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           "emitProgram: string array literal but string list type not collected",
         )
       }
+      const hStr = forLitHoist(arrIx, elems, fnIx, ALD_STR, mkArrIdx, mkListIdx)
+      if hStr != 0 { return if hStr < 0 { -1 } else { 0 } }
       let dstStr = -1
       let coffStr = 0
       if elems.length > allocLitChunk() {
@@ -9206,6 +9218,13 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
     if nlluArr {
       pendingNulLitUnion = true
       pendingLitUnion = 1
+    }
+    const hI32 = forLitHoist(arrIx, elems, fnIx, ALD_I32, aTypeIdx, lTypeIdx)
+    if hI32 != 0 {
+      pendingLitUnion = savedArrLU
+      pendingNulBool = savedArrNB
+      pendingNulLitUnion = savedArrNLLU
+      return if hI32 < 0 { -1 } else { 0 }
     }
     let dstI32 = -1
     let coffI32 = 0
@@ -11398,6 +11417,119 @@ function fbBacking(ty: i32, n: i32) {
     if g >= 0 { return fbGlobalGet(g) }
   }
   fbArrayNewFixed(ty, n)
+}
+
+// The list literal a `for` is iterating, while its iterable is emitted, else -1. Nothing but
+// the loop can reach that list, and the loop only reads it.
+let gForIterLit = -1
+
+// Lowers `for` iterable literal `arrIx` of constants as a read of one module constant list
+// built by the same element lowering (`form`, an `ALD_*` or `ALD_STR`) into `backTy`/`wrapTy`.
+// 1 when it did, 0 when the literal must build as usual (nothing emitted), -1 on failure.
+function forLitHoist(
+  arrIx: i32,
+  elems: i32[],
+  fnIx: i32,
+  form: i32,
+  backTy: i32,
+  wrapTy: i32,
+): i32 {
+  if arrIx != gForIterLit || elems.length == 0 || elems.length > NEW_FIXED_MAX {
+    return 0
+  }
+  let i = 0
+  while i < elems.length {
+    if !forLitElemIsConst(elems[i]) { return 0 }
+    i = i + 1
+  }
+  const init: u8[] = []
+  i = 0
+  while i < elems.length {
+    const one: u8[] = []
+    const prev = wTarget(one)
+    let rc = 0
+    if form == ALD_STR {
+      rc = emitStrValue(one, constStrInitOf(elems[i], fnIx), fnIx)
+    } else {
+      rc = arrLitDataElemEmit(one, elems[i], fnIx, form)
+    }
+    wTarget(prev)
+    if rc < 0 { return -1 }
+    if !isOneConstIns(one) { return 0 }
+    let k = 0
+    while k < one.length {
+      init.push(one[k])
+      k = k + 1
+    }
+    i = i + 1
+  }
+  const prev = wTarget(init)
+  fbArrayNewFixed(backTy, elems.length)
+  arrLitWrap(elems.length, wrapTy)
+  wTarget(prev)
+  const g = synthConstListIdx(wrapTy, init)
+  if g < 0 { return 0 }
+  fbGlobalGet(g)
+  1
+}
+
+// The element form `forLitHoist` lowers through `emitStrValue`.
+const ALD_STR = 5
+
+// Whether element `ix` may lower to one constant: a number or boolean literal, a string
+// literal, or a name (whose lowering `isOneConstIns` then decides).
+function forLitElemIsConst(ix: i32): boolean {
+  if arrLitElemIsConst(ix) { return true }
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const e = P.nodes[x]
+  e is StrLit || e is Ident
+}
+
+// The string literal a module `const` named by `ix` is initialized with, else `ix` itself.
+function constStrInitOf(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length || !(P.nodes[x] is Ident) { return ix }
+  const li = globalLetOfSidIn(fnIx, sidOfNode(x), x)
+  if li < 0 || li >= P.nodes.length { return ix }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letKw == "const" && d.letInit >= 0 {
+      const ini = unwrapParen(d.letInit)
+      if ini >= 0 && ini < P.nodes.length && P.nodes[ini] is StrLit {
+        return ini
+      }
+    }
+  }
+  ix
+}
+
+// Whether `ins` is exactly one instruction valid in a constant initializer that trails every
+// other global: a numeric constant, or a read of a pooled string literal.
+function isOneConstIns(ins: u8[]): boolean {
+  if ins.length < 2 { return false }
+  const op = ins[0] as i32
+  if op == 0x44 {
+    return ins.length == 9 // f64.const
+  }
+  if op == 0x43 {
+    return ins.length == 5 // f32.const
+  }
+  // i32.const, i64.const, global.get: one LEB immediate
+  if op != 0x41 && op != 0x42 && op != 0x23 { return false }
+  let v = 0
+  let sh = 0
+  let k = 1
+  while k < ins.length - 1 {
+    if ((ins[k] as i32) & 0x80) == 0 { return false }
+    v = v | (((ins[k] as i32) & 0x7f) << sh)
+    sh = sh + 7
+    k = k + 1
+  }
+  if ((ins[k] as i32) & 0x80) != 0 { return false }
+  if op != 0x23 { return true }
+  v = v | (((ins[k] as i32) & 0x7f) << sh)
+  v >= externGlobalCount() && v < externGlobalCount() + gStrPoolTexts.length
 }
 
 // Wrap the `n`-element backing on the stack as a full list of wrapper type `wrapTy`.
@@ -23797,7 +23929,11 @@ function emitForInList(
     if forInMapWalksVals(iterIx, fnIx) { return pushMapVals(body) }
     return pushMapKeys(body)
   }
-  if emitExpr(body, iterIx, fnIx) < 0 { return -1 }
+  const prevLit = gForIterLit
+  gForIterLit = unwrapParen(iterIx)
+  const rc = emitExpr(body, iterIx, fnIx)
+  gForIterLit = prevLit
+  if rc < 0 { return -1 }
   svSyncRecv(iterIx, fnIx)
 }
 
