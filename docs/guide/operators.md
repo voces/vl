@@ -195,9 +195,30 @@ index) for a list, `s.includes(x)` for a string. It parses at the comparisons' p
 | --- | --- |
 | `&` `\|` `^` | and / or / xor |
 | `<<` | shift left |
-| `>>` | ARITHMETIC (sign-propagating) shift right — `-16 >> 2` is `-4` |
-| `>>>` | LOGICAL (zero-filling) shift right — `-16 >>> 28` is `15` |
+| `>>` | ARITHMETIC (signed, sign-propagating) shift right — `-16 >> 2` is `-4` |
+| `>>>` | LOGICAL (unsigned, zero-filling) shift right — `-16 >>> 28` is `15` |
 | `~` | bitwise not |
+
+### Unsigned shift / logical shift right: `>>>`
+
+VL has JavaScript's and Java's `>>>`: the unsigned shift right, also called the logical shift
+(Rust and C spell it `>>` on an unsigned type; Go on a `uint`). It shifts in
+zeros, where `>>` shifts in copies of the sign bit. It works on `i32` and `i64` alike, at the
+operand's own width, and has a compound form `>>>=`.
+
+```vl
+const h = -123456789
+print(h >> 13)              // -15071      the sign is copied in
+print(h >>> 13)             // 509217      zeros are shifted in
+print((h >> 13) & 0x7ffff)  // 509217      the same bits, written by hand
+const big: i64 = -1
+print(big >>> 60)           // 15
+```
+
+Masking an arithmetic shift down to its low `32 - k` bits (`64 - k` for an `i64`) is
+`>>>` spelled the long way. `vl check` points it out with the hint
+`shift-mask-is-logical-shift` wherever it can see that the shifted value is an `i32` or an
+`i64`.
 
 These are about BIT PATTERNS, so a float operand is refused: `1.0 & 2` is
 `operator '&' is integer-only, got f64 and i32`, and `~2.5` is

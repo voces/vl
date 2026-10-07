@@ -9,7 +9,7 @@ root. Agent operating instructions are `AGENTS.md` / `CLAUDE.md` at the root.
 The language and CLI as a user mental model.
 
 - [`guide/soundness.md`](guide/soundness.md) — the type-safety guarantees.
-- [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; the `as` / `as?` / `as!` / `as%` family).
+- [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; `>>>` is the unsigned / logical shift right; the `as` / `as?` / `as!` / `as%` family).
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
 - [`guide/loops.md`](guide/loops.md) — loops and labelled blocks, `@B`, `break @B` / `continue @B`, and the value a loop or block carries.
 - [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
@@ -20,6 +20,7 @@ The language and CLI as a user mental model.
 - [`guide/strings-design.md`](guide/strings-design.md) — string representation and API.
 - [`guide/extern.md`](guide/extern.md) — `extern function`: calling a host-provided function, the types that cross, and why the return type (`: void` included) is required.
 - [`guide/bytes.md`](guide/bytes.md) — reading integers out of a `u8[]` (`std:bytes`): the eight widths and byte orders, why there is no `u32le`, floats by bitcast, and what an out-of-range offset does.
+- [`guide/writing-bytes.md`](guide/writing-bytes.md) — writing binary files (PNG, glTF) from a VL tool: building a `u8[]`, `std:fs`'s `writeFile`, and handing a `Buf` to a JS host.
 - [`guide/lambda-param-skip-design.md`](guide/lambda-param-skip-design.md) — lambda param-skip ergonomics.
 - [`guide/language-todo.md`](guide/language-todo.md) — language feature backlog.
 
