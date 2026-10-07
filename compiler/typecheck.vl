@@ -901,6 +901,11 @@ let isCstrFn: i32[] = []
 // unpinned hole to `i32`; `checkArrayNewDefaultElems` refuses a pinned element with no zero.
 let arrDefCallIx: i32[] = []
 let arrDefCallTy: i32[] = []
+// D3746 — a hole callee's write into an open list handed over as a BINDING, which the call may
+// not pin (the binding's own later writes still decide it): the row and the written value's
+// type. The flush gives a row still open at scope close the first write's element.
+let calleeWriteRow: i32[] = []
+let calleeWriteGot: i32[] = []
 
 // D1470 — two open array holes that met at a store (`b = a` between two un-annotated bindings,
 // and every other position `constrainEmpty` covers). Neither pins the other, and a later use
@@ -2819,12 +2824,95 @@ function arrDefPinHoleElem(ty: i32) {
   const t = T.tys[ty]
   if t is TyArray {
     if t.aElem < 0 {
-      t.aElem = TY_I32
+      // A literal-union element is stored at its base primitive, whose zero the intrinsic
+      // writes; the `i32` default only when no callee wrote the row.
+      let el = litMembersBaseTy(calleeWrittenElem(ty))
+      if el < 0 { el = TY_I32 }
+      t.aElem = el
       tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
     }
     return t.aElem
   }
   -1
+}
+
+// The element a hole callee's first write gives an open list row handed to it as a binding,
+// directly or through a chain of hole links, or -1 when no callee wrote it (D3746).
+function calleeWrittenElem(ty: i32): i32 {
+  if calleeWriteRow.length == 0 { return -1 }
+  const rows = holeLinkClosure(ty)
+  let i = 0
+  while i < calleeWriteRow.length {
+    if i32ListHas(rows, calleeWriteRow[i]) {
+      return widenLitTy(calleeWriteGot[i])
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The base primitive of a literal or a union of literals sharing one base (`0 | 1 | 2` is
+// `i32`); any other type, and -1, unchanged.
+function litMembersBaseTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const lb = litBaseOrNeg(ty)
+  if lb >= 0 { return lb }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let base = -1
+    for m in t.uMembers {
+      const b = litBaseOrNeg(m)
+      if b < 0 || (base >= 0 && b != base) { return ty }
+      base = b
+    }
+    if base >= 0 { return base }
+  }
+  ty
+}
+
+// The base primitive of literal type `ty`, or -1 when `ty` is not a literal.
+function litBaseOrNeg(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  -1
+}
+
+// Row `ty` and every row a chain of recorded hole links joins to it.
+function holeLinkClosure(ty: i32): i32[] {
+  const rows: i32[] = [ty]
+  let k = 0
+  while k < rows.length {
+    const r = rows[k]
+    let i = 0
+    while i < holeLinkA.length {
+      if holeLinkA[i] == r && !i32ListHas(rows, holeLinkB[i]) {
+        rows.push(holeLinkB[i])
+      }
+      if holeLinkB[i] == r && !i32ListHas(rows, holeLinkA[i]) {
+        rows.push(holeLinkA[i])
+      }
+      i = i + 1
+    }
+    k = k + 1
+  }
+  rows
+}
+
+// Pin a still-open list binding at scope close to the element a hole callee's write gave it;
+// false when no callee wrote it, which leaves the binding's own diagnostic standing (D3746).
+function calleeWritePin(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem >= 0 { return false }
+    const el = calleeWrittenElem(ty)
+    if el < 0 { return false }
+    t.aElem = el
+    tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+    return true
+  }
+  false
 }
 
 // Record that the two array rows `a` and `b` must carry the same element. Deduped, because
@@ -3038,7 +3126,7 @@ function flushUninferred(depth: i32) {
   while i < pendNames.length {
     if pendDepths[i] == depth {
       if unresolvedHole(pendTys[i]) {
-        if !arrDefHoleToI32(pendTys[i]) {
+        if !arrDefHoleToI32(pendTys[i]) && !calleeWritePin(pendTys[i]) {
           tErr(
             "cannot infer a type for '"
               + pendNames[i]
@@ -5197,6 +5285,8 @@ export function initChecker() {
   isCstrFn = []
   arrDefCallIx = []
   arrDefCallTy = []
+  calleeWriteRow = []
+  calleeWriteGot = []
   holeLinkA = []
   holeLinkB = []
   retCstrGot = []
@@ -21394,6 +21484,7 @@ function cstrTablesMark(): i32[] {
     tpIfFn.length,
     tpIfReFn.length,
     isCstrTy.length,
+    calleeWriteRow.length,
   ]
 }
 
@@ -21410,6 +21501,10 @@ function cstrTablesTruncate(m: i32[]) {
     nestCstrTy.pop()
     nestCstrIx.pop()
     nestCstrFn.pop()
+  }
+  while calleeWriteRow.length > m[12] {
+    calleeWriteRow.pop()
+    calleeWriteGot.pop()
   }
   while isCstrTy.length > m[11] {
     isCstrTy.pop()
@@ -42638,7 +42733,14 @@ function cnhPinBmElem(
   // A value's own type pins only a list written at the call; a binding's list keeps its own
   // later writes, which may still widen it.
   const valPin = isNullTy(got) || nhOpen(got) || i32ListHas(pinRows, arr)
-  if !valPin { return 0 }
+  if !valPin {
+    // A quiet re-check's write is not the program's; the real check records it again.
+    if unresolvedHole(arr) && !inferQuiet {
+      calleeWriteRow.push(arr)
+      calleeWriteGot.push(got)
+    }
+    return 0
+  }
   const a = T.tys[arr]
   if a is TyArray {
     if a.aElem < 0 {
@@ -61086,6 +61188,7 @@ function monoRecheckBegin(
   sv.push(tpEnvNames.length)
   sv.push(rcoalTok.length)
   sv.push(isvalTok.length)
+  sv.push(calleeWriteRow.length)
   inferQuiet = true
   symEnabled = 0
   njFnStack.push(njFnIx)
@@ -61175,6 +61278,10 @@ function monoRecheckEnd(sv: i32[]) {
   redunTruncate(sv[16])
   rcoalTruncate(sv[18])
   isvalTruncate(sv[19])
+  while calleeWriteRow.length > sv[20] {
+    calleeWriteRow.pop()
+    calleeWriteGot.pop()
+  }
   while T.diags.length > sv[2] { T.diags.pop() }
   symEnabled = sv[1]
   inferQuiet = sv[0] == 1
