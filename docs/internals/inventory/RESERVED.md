@@ -79,3 +79,4 @@ D3728-D3735  lane-L2  2026-10-05  sunpa SP-037 step 2, D3664 (D3728-D3734 filed)
 D3742-D3749  lane-UA  2026-10-06  empty-list pins at a hole argument and a record field (D2218, D2640, D1471 closed; D3742-D3746 filed)
 D3760-D3764  lane-GN  2026-10-06  getter-alias narrowing (clause 1) + buildFnMap per-instance perf
 D3770-D3774  lane-DX  2026-10-06  diagnostic cascades, sunpa missing-import report (D3770, D3772, D3773 filed and closed; D3771 filed open)
+D3790-D3794  lane-CC  2026-10-06  sunpa SP-048 (D3790, D3792 filed and closed; D3791 filed open)
