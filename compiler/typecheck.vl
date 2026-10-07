@@ -14994,6 +14994,9 @@ let lbiIsConst: boolean[] = []
 // Whether an annotated literal `const` has a read its literal would take differently: an `f64`
 // meeting an `f32` operand, or a literal tree meeting a type other than the annotation's.
 let lbiConstUnsafe: boolean[] = []
+// Whether an annotated literal binding is read as a `??` default its bare literal would be
+// delivered into at another type: its annotation is load-bearing, `const` or `let` (D3798).
+let lbiCoalUnsafe: boolean[] = []
 // The literal a candidate holds: its initializer, or the literal of the module `const` it copies.
 let lbiLitNode: i32[] = []
 // Module-level un-annotated `const`s holding a numeric literal, written there or copied from
@@ -15191,6 +15194,7 @@ function lbiReset() {
   lbiExpMod = []
   lbiIsConst = []
   lbiConstUnsafe = []
+  lbiCoalUnsafe = []
   lbiLitNode = []
   lbiInitTy = Map()
   lbiReadNode = []
@@ -15278,6 +15282,7 @@ function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
       }
       lbiIsConst.push(ann < 0 && n.letKw == "const")
       lbiConstUnsafe.push(false)
+      lbiCoalUnsafe.push(false)
       lbiLitNode.push(lit)
     }
     const sid = sidOf(name)
@@ -16498,6 +16503,15 @@ function lbiNoteConstContext(ix: i32, ctx: i32) {
   0
 }
 
+// An annotated literal binding read as the `??` default `ix`, whose left operand is `ctx` once
+// null is removed, would be delivered at `ctx` without its annotation, which may not hold it.
+function lbiNoteCoalDefault(ix: i32, ctx: i32) {
+  if lbiBindName.length == 0 || inferQuiet || ctx < 0 { return 0 }
+  const c = lbiOperandCand(ix)
+  if c >= 0 && lbiAnn[c] >= 0 && lbiAnn[c] != ctx { lbiCoalUnsafe[c] = true }
+  0
+}
+
 // Mark the reads in operand `self` whose value does not depend on their width: a binding compared
 // with an `i32` literal, and a constant tree (`16 - c`) that never leaves `i32`, compared with
 // one or met by a typed operand `other`, as though delivered whole.
@@ -16894,7 +16908,11 @@ function lbiRedundant(c: i32, a: i32, t: i32) {
   // Without its annotation a literal `const` is its literal at every read, which differs from the
   // annotated value only where a read met a context the literal adopts differently.
   if n is LetDecl {
-    if it >= 0 && !(n.letKw == "const" && lbiConstUnsafe[c]) {
+    if (
+      it >= 0
+      && !(n.letKw == "const" && lbiConstUnsafe[c])
+      && !lbiCoalUnsafe[c]
+    ) {
       recordRedundantAnnot(n, d, it, a)
     }
   }
@@ -62280,6 +62298,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // The default's destination is the LHS's non-null shape — the one position where a typed
     // slot sits on the LEFT of the operator, which is why this needed its own pin (D1591).
     constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
+    if lt >= 0 { lbiNoteCoalDefault(n.binRight, nonNullTy(lt)) }
   }
   // A radix literal operand takes the other side's width (the ruled literal rule). Assignment is
   // excluded: its destination is `assignableExpr`'s, which pins the narrowing direction too.
