@@ -7519,6 +7519,51 @@ expected, so a write through either reaches both. A module whose struct types sp
 groups keeps the shape rule. `$VL_MV_EXPLAIN=1` prints each type's and producer's verdict,
 for consumers to find their own disqualifier.
 
+## `-O` takes a record argument apart up to 64 fields, and an `if` that chooses a record (2026-10-06) — sunpa, D3754, D3766, D3767
+
+**Arguments get their own bound.** The eight-field bound above was set for results, where each
+field past the return registers goes through a return area. A parameter has no such area: its
+fields are ordinary arguments. A record ARGUMENT is now 1 to 64 fields (`MV_ARG_MAX_FIELDS`),
+each a number or a reference, and a result keeps eight numeric fields. A reference field is
+passed on as the reference, so identity holds; the never-written rule is unchanged, so its
+value cannot change while it is read early. A twin takes at most 128 parameters
+(`MV_TWIN_MAX_PARAMS`; V8 accepts 1,000).
+
+**The bound is where the gain falls off, measured.** An N-field `f64` record built per call at
+two sites and passed to a callee too large to inline that reads every field, 6M calls, `-O3`,
+step off → on: V8 1.48x at 8 fields, 1.61x at 16, 1.70x at 24, 1.67x at 32, 1.50x at 48, 1.55x
+at 64, then 1.41x at 96 and 1.29x at 128; wasmtime 1.97x at 8 and 16, 2.03x at 32, 1.80x at
+64, 1.77x at 96, 1.61x at 128. It never reverses, but past 64 each step costs more than it
+saves relative to the allocation, and sunpa's widest record (36 fields) is well inside. A
+callee reading 5 of the fields gains at every width, since binaryen drops unread parameters.
+
+**A reference field to a struct nothing writes keeps its record whole for a small callee.**
+A value union's box is `{ tag, payload }`, the payload a box of its own. Passed to a callee of
+at most `ESCAPE_INLINE_MAX_BYTES`, the escape step inlines it and `--heap2local` removes both
+boxes; taken apart here, the payload box would still be made. The first cut missed this and
+sunpa's sound table made 12,800 more boxes through a `toString` twin that was no longer
+inlined. For a larger callee both are allocated without the step, so taking it apart still
+saves one.
+
+**An `if` that chooses a record leaves its fields (D3766).** sunpa's IK passes
+`if pb < 0 { sk.rootRotation } else { quatOf(g[pb]) }` to a field-only parameter, and its legs
+choose `if d0.z < d1.z { d1 } else { d0 }`. The step followed a record from its maker to its
+use and an `if`'s `end` was neither, so the producer arm allocated. A non-null single-record
+`if` that no branch targets is now a merge: when its value reaches a field use, its block type
+becomes multi-value and each arm leaves fields (a twin call, a deleted `struct.new`, a
+scalarized local's slots, or a stored record read at the arm's end). Reading early is sound
+for the reason every twin is: nothing writes the type.
+
+**A local handed to a result twin's fallback is a field use (D3767).** `unit(v, fallback)`
+returns `fallback` unchanged, a field use only in its result twin. A local passed there at a
+call whose own result is held as fields always reaches that twin, so it is held as fields too.
+
+**Measured on sunpa** `f81a945` under `feet-test` (10,938 frames), `-O3`, master → this:
+**413.4 → 396.5 `struct.new` a frame**: `qnorm.mv` 3.85 → 0, `cylAlong` 26.4 → 17.6, `unit.mv`
+10.9 → 9.1, the anim `Item` 1 → 0. Feet and gait outputs are byte-identical. What it did not
+reach is filed: the game-side `Item` is written elsewhere (D3765, a decision on fresh
+arguments), a stored record read whole (D3753) and a cache list (D3752).
+
 ## `-O` stores a never-written small record inline in its parent (2026-10-05) — sunpa SP-039, D3678
 
 **The defect.** A store into a record field (`j.rot = qnorm(…)`) kept a fresh `Q` box per

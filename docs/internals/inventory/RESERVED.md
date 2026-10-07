@@ -78,3 +78,4 @@ D3246-D3248  lane-NB  2026-09-29  literal-binding inference, owner ruling (B), p
 D3728-D3735  lane-L2  2026-10-05  sunpa SP-037 step 2, D3664 (D3728-D3734 filed)
 D3742-D3749  lane-UA  2026-10-06  empty-list pins at a hole argument and a record field (D2218, D2640, D1471 closed; D3742-D3746 filed)
 D3760-D3764  lane-GN  2026-10-06  getter-alias narrowing (clause 1) + buildFnMap per-instance perf
+D3765-D3769  lane-RA  2026-10-06  per-frame record allocations in sunpa (D3754 closed; D3765-D3767 filed, D3766-D3767 closed)
