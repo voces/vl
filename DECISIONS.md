@@ -7012,6 +7012,8 @@ every local must have a non-boxing representation, decided from types before emi
 
 ## The compiler's collector is picked by the size of the entry file (2026-09-22) — plumb PL-002 follow-up
 
+*Superseded 2026-10-07: the default is now copying at every size, see "The compiler's collector is copying by default" below.*
+
 `vl build` and `vl run` used to compile under wasmtime's NULL collector always. It never frees,
 so a compile's peak memory is every byte the compiler ever allocated, and the GC heap's 32-bit
 index caps that at 4 GiB, a ~15.6 MB source. plumb compiles 1.16 GB of generated VL in 551 units
@@ -7130,6 +7132,60 @@ Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits. (2026-09-2
 this paragraph asked for now exists, `profiling-the-compiler.md` §"Measured 2026-09-24, second
 pass"; after D2317–D2319 the units sit at ~291 MB, and `P.nodes` plus `P.toks` are two thirds
 of what is left.)
+
+## The compiler's collector is copying by default (2026-10-07) — lane GC, sunpa build memory
+
+**Supersedes the entry-file threshold above.** `vl build` and `vl run` compile under the
+copying collector from a 256 MiB first heap at EVERY entry-file size (`compile_engine`,
+`scripts/vl-host/src/main.rs`). `$VL_COMPILE_GC=null|copying` stay as overrides (`auto` is
+copying), `$VL_COMPILE_GC_HEAP` still sets the first heap, and the self-compile scripts still
+pin null.
+
+**Why.** The threshold read the ENTRY file, so sunpa's `game.vl` — a 260 KB entry over a 2 MB
+module graph — compiled under null and held every byte the compiler allocated: 2.4 GB peak per
+build, and sunpa runs up to five builds at once, so memory set its slot cap. The +11–19% CPU
+that justified null below 1.5 MiB did not reproduce on this workload once the seed's sidecar is
+warm: null's cost is faulting in 2.4 GB of fresh pages, which copying, re-using one semispace
+pair, does not pay. One quiet run per cell unless noted, load 2–6, warm sidecars, wall / peak
+RSS (the vl process's `VmHWM`) / collections (`VL_GC_STATS=1`), all on master's seed:
+
+| input | null (master default) | copying 256 MiB (new default) | 512 MiB | 768 MiB | 1 GiB |
+| --- | --- | --- | --- | --- | --- |
+| sunpa `game.vl`, plain (3 interleaved) | 20.6–23.2 s / 2,440 MiB / 0 | 19.9–20.1 s / 563 MiB / 61 | 19.3 s / 564 / 28 | 19.8 s / 820 / 11 | 20.8 s / 1,075 / 7 |
+| sunpa `game.vl`, `-O3` (its `build:vl`) | 50.4 s / 2,435 MiB / 0 | 50.0 s / 559 MiB / 61 | 50.1 s / 559 / 28 | — | 50.1 s / 1,071 / 7 |
+| self-compile `compiler/entry.vl` (2 interleaved) | 8.4–9.1 s / 2,341 MiB / 0 | 9.7 s / 1,071 MiB / 26 | 10.0 s / 1,072 / 22 | 13.6 s / 815 / 42 | 9.3 s / 1,071 / 12 |
+| `print("hello")` | 0.02 s / 37 MiB | 0.02 s / 38 MiB | 0.02 s / 37 MiB | — | — |
+
+All of them emit the same bytes: sunpa's module and source map (plain and `-O3`) and the
+self-compile, which is the seed itself (`--prove-fixpoint` holds).
+
+**Why 256 MiB and not a bigger first heap.** wasmtime 47's copying heap collects whenever the
+last live size is under half its capacity (`should_collect_first`) and only otherwise doubles,
+and it never returns a semispace's pages, so the peak RSS is the heap's size, not the live set's.
+A first heap just above twice the live set collects over and over while reclaiming little: 384
+MiB on sunpa (192 MiB live, 192 MiB semispace) ran 138 collections at 25.0 s, 768 MiB on the
+self-compile (367 MiB live) 42 at 13.6 s. 256 MiB doubles past that band on both inputs, costs
+the most collections but the least memory, and keeps the engine configuration — and so the seed's
+`.cwasm` sidecar — that `refresh-compiler.sh` already warms. Each distinct value is a fresh
+Cranelift compile of the seed (~9 s, ~1.9 GB peak, once per host binary).
+
+**Why the self-compile stays null.** It is the one input here where null is faster (~10% wall,
+~16% CPU, against 54% less memory), and the gate runs it many times; the scripts pin it, so the
+default does not move it.
+
+**Declined.**
+* *A null start that switches to copying when the heap nears a size.* Impossible mid-instance:
+  the collector is an `Engine` setting, compiled into the seed's code (object headers, barriers,
+  the allocation path). Switching means restarting the compile, which pays the failed attempt's
+  peak first — the retry the section above declined.
+* *DRC (deferred reference counting).* sunpa `game.vl` plain had not finished at 600 s (null:
+  24 s); killed.
+* *A size threshold on the module graph instead of the entry file.* Not needed once copying is
+  no slower; the host also cannot sum imports before it compiles.
+
+**Rows that moved.** D2771, D2780 and D3407 filed a compiler trap that was the null heap filling
+with garbage; under copying their witnesses build in 8–10 s at about 300 MB, and the trap is
+closed while the exponential cost in their titles stays open.
 
 ## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
 
