@@ -70,6 +70,7 @@ A map is a hash table keyed by `string`, `i32` or `i64`.
 | `m[k] = v`, `m[k]`, `m.get(k)`, `m.has(k)` | O(1) expected | 15–43 ns | 19–61 ns | 70–107 ns |
 | `m.delete(k)` | O(1) expected | 46–88 ns | | |
 | `m.length` | O(1) | | | |
+| `m.clear()` | O(capacity), allocates nothing; capacity is kept | | | |
 | `for k, v in m`, `m.keys()`, `m.values()` | O(n), in **insertion order** | 7–10 ns per entry | | |
 
 Insertion order is part of the contract: iterating a map visits keys in the order they were
