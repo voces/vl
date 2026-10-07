@@ -587,7 +587,7 @@ axis(
 
 // Lane AL's pair: 1,200 functions with a parameter against 60, under a `??` family. Fuel reads
 // 1.06; master read 3.11, from `anonLeafNarrowUseMark` scanning every node for each function's
-// name, and `anonLeafDeliversMember` doing the same for each argument it was handed.
+// name. The calls pass literals, so the per-argument scans are not exercised here.
 axis(
   "functions with parameters x identifiers",
   2.0,
