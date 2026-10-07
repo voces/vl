@@ -31,6 +31,14 @@ if (GATED && !ENABLED) {
   console.warn("[vl-compile-cache] skipped — missing vl binary or seed wasm.");
 }
 
+/** The `wasm-opt` this test's builds resolve: `$VL_WASM_OPT`, else the first on `PATH`. */
+const realWasmOpt = (): string | undefined =>
+  Deno.env.get("VL_WASM_OPT") ??
+    (Deno.env.get("PATH") ?? "").split(":").map((d) => `${d}/wasm-opt`).find(exists);
+// The `-O` cases need binaryen; without it (CI's ci-native job) they register ignored, like
+// the other `-O` suites.
+const HAVE_OPT = realWasmOpt() !== undefined;
+
 type Ran = { code: number; out: string; err: string; trace: string[] };
 
 const PREFIX = "vl: compile cache ";
@@ -101,6 +109,8 @@ const enc = (s: string) => new TextEncoder().encode(s);
 
 const test = (name: string, fn: () => Promise<void>) =>
   Deno.test({ name: `native compile cache: ${name}`, ignore: !ENABLED, fn });
+const testOpt = (name: string, fn: () => Promise<void>) =>
+  Deno.test({ name: `native compile cache: ${name}`, ignore: !ENABLED || !HAVE_OPT, fn });
 
 const BUILD = ["build", "main.vl", "-o", "out.wasm"];
 
@@ -117,6 +127,7 @@ test("a hit is byte-identical to a cold build, and verify mode agrees", async ()
     expect([ver.code, ver.trace], [0, ["hit", "verified"]], "verify mode");
     expect(await Deno.readFile(`${p}/out.wasm`), coldBytes, "verified bytes equal cold bytes");
     // `-O` is a second action (S2), the host's chain on the served bytes: identical too.
+    if (!HAVE_OPT) return;
     const o1 = await vl([...BUILD.slice(0, 2), "-O", "-o", "o1.wasm"], p);
     const o2 = await vl([...BUILD.slice(0, 2), "-O", "-o", "o2.wasm"], p);
     expect([o1.trace, o2.trace], [["miss", "stored", "-O miss", "-O stored"], ["hit", "-O hit"]], "-O cold then hit");
@@ -300,15 +311,10 @@ test("verify mode exits 71 when a stored result differs from a cold compile", as
 
 // ── stage S2: the `-O` chain ───────────────────────────────────────────────
 
-/** The `wasm-opt` this test's builds resolve: `$VL_WASM_OPT`, else the first on `PATH`. */
-const realWasmOpt = (): string | undefined =>
-  Deno.env.get("VL_WASM_OPT") ??
-    (Deno.env.get("PATH") ?? "").split(":").map((d) => `${d}/wasm-opt`).find(exists);
-
 const OPT = ["build", "main.vl", "-O3", "-o", "o.wasm"];
 const optTrace = (t: string[]) => t.filter((l) => l.startsWith("-O "));
 
-test("-O3: a chain hit's module and source map equal a cold run's, and verify mode agrees", async () => {
+testOpt("-O3: a chain hit's module and source map equal a cold run's, and verify mode agrees", async () => {
   const { tmp, p } = await setup();
   try {
     const args = [...OPT, "--source-map"];
@@ -333,7 +339,7 @@ test("-O3: a chain hit's module and source map equal a cold run's, and verify mo
   }
 });
 
-test("-O3: each chain input misses; -o without --source-map does not", async () => {
+testOpt("-O3: each chain input misses; -o without --source-map does not", async () => {
   const opt = realWasmOpt();
   if (!opt) throw new Error("no wasm-opt to wrap: set $VL_WASM_OPT or put binaryen on PATH");
   const { tmp, p } = await setup();
@@ -387,7 +393,7 @@ test("-O3: each chain input misses; -o without --source-map does not", async () 
   }
 });
 
-test("-O3: verify mode exits 71 when a stored chain result differs from a cold run", async () => {
+testOpt("-O3: verify mode exits 71 when a stored chain result differs from a cold run", async () => {
   const { tmp, p } = await setup();
   try {
     await vl(OPT, p);
@@ -410,7 +416,7 @@ test("-O3: verify mode exits 71 when a stored chain result differs from a cold r
   }
 });
 
-test("-O3: an explain variable bypasses the chain, stores nothing", async () => {
+testOpt("-O3: an explain variable bypasses the chain, stores nothing", async () => {
   const { tmp, p } = await setup();
   try {
     await vl(OPT, p);
