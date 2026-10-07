@@ -60,6 +60,18 @@ const genFunctions = (nf: number, ns: number): string => {
   return o.join("\n") + "\n";
 };
 
+// `genFunctions` with a `??` over an object-literal default in the module, which is what
+// switches on the anon-leaf narrow-use pass (compiler/emit_collect.vl). That pass asks each
+// function with parameters about its own name; asked by scanning the arena, it is
+// functions x identifiers.
+const genFamilyFunctions = (nf: number, ns: number): string =>
+  [
+    "type Pt = { x: i32 }",
+    "function src(k: i32): Pt | null { if k > 0 { return null } { x: k } }",
+    "const fam = src(1) ?? { x: 2 }",
+    genFunctions(nf, ns).replace("let acc = 0", "let acc = fam.x"),
+  ].join("\n");
+
 // N struct types used once each, against N/K used K times each. Distinct FIELD names,
 // because two structurally identical shapes intern to one row and the axis would vanish.
 const genTypes = (n: number, k: number): string => {
@@ -571,6 +583,16 @@ axis(
   2.5,
   "Memoise it on an arena prefix the way `moduleHasUnionAs` does (compiler/emit_classify.vl), clearing the memo in `emitProgram`.",
   (d) => twoFiles(d, genFunctions(1600, 20), genFunctions(80, 400)),
+);
+
+// Lane AL's pair: 1,200 functions with a parameter against 60, under a `??` family. Fuel reads
+// 1.06; master read 3.11, from `anonLeafNarrowUseMark` scanning every node for each function's
+// name, and `anonLeafDeliversMember` doing the same for each argument it was handed.
+axis(
+  "functions with parameters x identifiers",
+  2.0,
+  "A per-function question in `anonLeafNarrowUseMark` (compiler/emit_collect.vl) is scanning the arena instead of the resolver index.",
+  (d) => twoFiles(d, genFamilyFunctions(1200, 20), genFamilyFunctions(60, 400)),
 );
 
 // D2150's pair: a registry lookup that scans every registered set made the many arm
