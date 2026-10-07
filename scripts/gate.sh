@@ -52,7 +52,13 @@ NAMES=(); PIDS=(); STARTS=()
 # returns instantly, so an elapsed computed there is the loop's clock. No stamp falls back
 # to that reading. CPU is the same subshell's `times`, whose second line is its reaped
 # children's user+sys — the whole row's process tree, which the box cannot inflate.
-run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
+# `GATE_MAX_PAR` caps how many rows run at once (unset or 0: all at once), for a box shared
+# with a foreground user. A row's WALL starts when it launches, not while it queues.
+GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
+run() { if [ "$GATE_MAX_PAR" -gt 0 ]; then
+          while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done
+        fi
+        local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
