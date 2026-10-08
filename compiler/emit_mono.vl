@@ -10486,6 +10486,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if pty >= 0 {
           if !monoFnParamAnnRidesTyParam(dfe, ca) {
             if monoCoerceFnValue(pargs[ca], pty, ctx) < 0 { return -1 }
+            if monoNoteBindDelivery(pargs[ca], pty, ctx) < 0 { return -1 }
           }
         }
         ca = ca + 1
@@ -10581,6 +10582,7 @@ function monoWalk(ix: i32, ctx: i32) {
     // carries that concrete type independent of any call — it may escape where call-driven
     // monomorphization cannot reach.
     if monoCoerceFnValue(n.letInit, n.letType, ctx) < 0 { return -1 }
+    if monoNoteBindDelivery(n.letInit, n.letType, ctx) < 0 { return -1 }
     return monoWalk(n.letInit, ctx)
   }
   if n is IfStmt {
@@ -10678,7 +10680,39 @@ function monoWalkFnBody(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     if monoCoerceFnValue(fn.fnBody, fn.fnRet, fnIx) < 0 { return -1 }
+    if monoNoteRetDeliveries(fn, fnIx) < 0 { return -1 }
     return monoWalk(fn.fnBody, fnIx)
+  }
+  0
+}
+
+// Each binding function `fn` (node `fnIx`) returns, by `return` or as its body's value, is
+// delivered at its annotated function-typed result (D3862).
+function monoNoteRetDeliveries(fn: FuncDecl, fnIx: i32) {
+  const parts: string[] = []
+  if fn.fnRet < 0 || annFnDecompose(tyNameOf(fn.fnRet), parts) == "" {
+    return 0
+  }
+  const b = P.nodes[fn.fnBody]
+  if b is Block {
+    if b.blkStmts.length > 0 {
+      const tail = b.blkStmts[b.blkStmts.length - 1]
+      if monoNoteBindDelivery(tail, fn.fnRet, fnIx) < 0 { return -1 }
+    }
+  }
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is RetStmt {
+        if monoNoteBindDelivery(n.retArg, fn.fnRet, fnIx) < 0 { return -1 }
+      }
+      // A nested function's `return` is its own.
+      if !(n is FuncDecl) {
+        for k in nodeChildren(ix) { stack.push(k) }
+      }
+    }
   }
   0
 }
@@ -10984,7 +11018,46 @@ let monoBindCallFrame: {[i32]: i32} = Map()
 // `ctx`, on that binding and on every binding its initializer chain names.
 function monoNoteBindCall(name: string, at: i32, ctx: i32) {
   if monoLastInstFe < 0 { return 0 }
-  const sig = monoSlotSig(monoLastInstFe)
+  monoNoteBindSig(name, at, ctx, monoSlotSig(monoLastInstFe))
+}
+
+// A binding read at `at` in frame `ctx` and delivered where annotation `tyNode` is a function
+// type with concrete parameters is called at that signature by whoever receives it (D3862).
+function monoNoteBindDelivery(at: i32, tyNode: i32, ctx: i32) {
+  if tyNode < 0 || at < 0 { return 0 }
+  let name = monoIdentNameOf(at)
+  if name == "" { name = monoCellReadName(at) }
+  if name == "" { return 0 }
+  const parts: string[] = []
+  if annFnDecompose(tyNameOf(tyNode), parts) == "" { return 0 }
+  let sig = ""
+  for pt in parts {
+    if pt == "" { return 0 }
+    sig = sig + pt + ","
+  }
+  monoDeliveredArgs.push(monoReadNameNode(at))
+  // A hole lambda the name reaches that nothing has pinned yet takes the signature in place,
+  // as its own contextual type would pin it (D3852).
+  const fe = monoLamValueFe(at, ctx)
+  if (
+    fe >= 0
+    && fe < monoGen.length
+    && monoGen[fe] == 1
+    && !monoInstantiatedAny(fe)
+  ) {
+    if monoInstanceFor(fe, monoSigPins(sig + ";"), fnStmts[fe], -1) < 0 {
+      return -1
+    }
+  }
+  monoNoteBindSig(name, at, ctx, sig + ";")
+}
+
+// The name nodes `monoNoteBindDelivery` recorded: each is a call of what it reads.
+let monoDeliveredArgs: i32[] = []
+
+// Records signature `sig` on binding `name` read at `at` in frame `ctx`, and on every binding
+// its initializer chain names.
+function monoNoteBindSig(name: string, at: i32, ctx: i32, sig: string) {
   if sig == "" { return 0 }
   let nm = name
   let ax = at
@@ -11815,6 +11888,7 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoBindCallFrame = Map()
+  monoDeliveredArgs = []
   monoLastInstFe = -1
   monoFnFieldTwinRow = Map()
   monoTwoListRet = Map()
@@ -12351,6 +12425,7 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
     const ai = monoAliasInitOf(ix)
     if ai >= 0 { aliasInit.push(ai) }
     const nd = P.nodes[ix]
+    if i32ListHas(monoDeliveredArgs, ix) { callees.push(ix) }
     if nd is Call {
       // A call through `v`, `v[i]` or a cell's `v[0]` goes through `v`.
       const cf = P.nodes[nd.callFn]
