@@ -428,6 +428,7 @@ import {
 // same shape hits the registry.
 
 import { i32ListHas, strListHas } from "./listutil"
+import { strContains } from "./strutil"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
 // clone's `fnParent` cannot be set at clone time (its own `FuncDecl` does not exist
@@ -12309,13 +12310,20 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
   let node = fnStmts[fe]
   if fe < monoOrigNode.length { node = monoOrigNode[fe] }
   let name = ""
+  // Each walked node carries the names a nearer scope rebinds there, as `|a|b|`.
   const stack: i32[] = []
-  for r in roots { stack.push(r) }
+  const stackSh: string[] = []
+  for r in roots {
+    stack.push(r)
+    stackSh.push("|")
+  }
   const seen: i32[] = []
+  const seenSh: string[] = []
   let top = -1
   if pf >= 0 && pf < fnStmts.length { top = fnStmts[pf] }
   while stack.length > 0 {
     const ix = stack.pop() ?? -1
+    const sh = stackSh.pop() ?? "|"
     if ix >= 0 && ix < P.nodes.length {
       // Asking about calls, a function nothing names never makes one.
       const dead = calls
@@ -12323,11 +12331,10 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
         && monoWriteFrameDead(ix, top)
       if !dead {
         seen.push(ix)
+        seenSh.push(sh)
         const bn = monoConstInitName(ix, node)
         if bn != "" { name = bn }
-        const body = monoNestedBodyOf(ix)
-        if body >= 0 { stack.push(body) }
-        for k in nodeChildren(ix) { stack.push(k) }
+        monoScopedKids(ix, sh, i32ListHas(roots, ix), stack, stackSh)
       }
     }
   }
@@ -12373,10 +12380,26 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
   }
   const visiting: string[] = []
   if target != "" { name = target }
+  // A read of a frame-level binding that a nearer binding shadows reads that one (D3843).
+  const rootNames: string[] = []
+  for r in roots { monoRootDeclNames(r, rootNames) }
+  const reads: i32[] = []
+  let i = 0
+  while i < seen.length {
+    const nm = monoIdentNameOf(seen[i])
+    if (
+      nm == ""
+      || !strListHas(rootNames, nm)
+      || !strContains(seenSh[i], "|" + nm + "|")
+    ) {
+      reads.push(seen[i])
+    }
+    i = i + 1
+  }
   if calls {
     return !monoNameCalled(
       name,
-      seen,
+      reads,
       aliasInit,
       lhs,
       writeVal,
@@ -12385,7 +12408,86 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
       visiting,
     )
   }
-  monoNameUnread(name, seen, aliasInit, lhs, writeVal, writeTo, visiting)
+  monoNameUnread(name, reads, aliasInit, lhs, writeVal, writeTo, visiting)
+}
+
+// Pushes the children of node `ix`, walked under shadow list `sh`, each with the list it is
+// walked under: a function adds its name and parameters, a loop its variables, and a block
+// below the frame's root each name its statements declare, from that statement on.
+function monoScopedKids(
+  ix: i32,
+  sh: string,
+  root: boolean,
+  stack: i32[],
+  stackSh: string[],
+) {
+  const n = P.nodes[ix]
+  let inner = sh
+  if n is FuncDecl {
+    inner = monoShAdd(inner, n.fnName)
+    for q in n.fnParams {
+      const qp = P.nodes[q]
+      if qp is Param { inner = monoShAdd(inner, qp.parName) }
+    }
+    stack.push(n.fnBody)
+    stackSh.push(inner)
+  } else if n is ForIn {
+    stack.push(n.fiIter)
+    stackSh.push(sh)
+    stack.push(n.fiBody)
+    stackSh.push(monoShAdd(monoShAdd(sh, n.fiVar), n.fiVar2))
+    return 0
+  } else if n is ForRange {
+    inner = monoShAdd(sh, n.frVar)
+  } else if n is Block {
+    if !root {
+      let run = sh
+      for st in n.blkStmts {
+        stack.push(st)
+        stackSh.push(run)
+        run = monoShAdd(run, monoStmtDeclName(st))
+      }
+      return 0
+    }
+  }
+  for k in nodeChildren(ix) {
+    stack.push(k)
+    stackSh.push(inner)
+  }
+  0
+}
+
+// Appends the names root `r` of a frame declares: a statement's own, or each statement's of a
+// function body's block.
+function monoRootDeclNames(r: i32, out: string[]) {
+  const n = P.nodes[r]
+  if n is Block {
+    for st in n.blkStmts { out.push(monoStmtDeclName(st)) }
+    return 0
+  }
+  out.push(monoStmtDeclName(r))
+  0
+}
+
+// Shadow list `sh` with `nm` added; "" adds nothing.
+function monoShAdd(sh: string, nm: string): string {
+  if nm == "" { return sh }
+  sh + nm + "|"
+}
+
+// The name statement `st` declares in its block: a `let`'s, else a function's, else "".
+function monoStmtDeclName(st: i32): string {
+  if st < 0 || st >= P.nodes.length { return "" }
+  const d = P.nodes[st]
+  if d is LetDecl { return d.letName }
+  monoFnDeclName(st)
+}
+
+// The name of function declaration `st`, or "" for any other statement.
+function monoFnDeclName(st: i32): string {
+  const d = P.nodes[st]
+  if d is FuncDecl { return d.fnName }
+  ""
 }
 
 // Whether a call among `seen` goes through `name`, or through a binding a read of `name` seeds
