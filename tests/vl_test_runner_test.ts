@@ -944,3 +944,45 @@ Deno.test({
     }
   },
 });
+
+/** Each pool phase's worker count, from the `vl-test-trace workers` lines. */
+const traceWorkers = (stderr: string): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const line of stderr.split("\n")) {
+    const m = line.match(/^vl-test-trace workers phase=(\w+) n=(\d+)$/);
+    if (m) out[m[1]] = Number(m[2]);
+  }
+  return out;
+};
+
+Deno.test({
+  name: "vl-test: $VL_JOBS sets the worker count when --jobs is absent, and --jobs wins",
+  ignore: !ENABLED,
+  fn: async () => {
+    const env = { VL_TEST_TRACE: "1" };
+    const one = await runTest(SLOW, [], { ...env, VL_JOBS: "1" });
+    const w1 = traceWorkers(one.err);
+    if (one.code !== 0 || w1.collect !== 1 || w1.run !== 1 || w1.compile !== 1) {
+      throw new Error(`VL_JOBS=1: want 1 worker per phase, got ${JSON.stringify(w1)}\n${one.err}`);
+    }
+    if (peakConcurrency(traceIntervals(one.err, "run")) !== 1) {
+      throw new Error(`VL_JOBS=1: want disjoint run intervals\n${one.err}`);
+    }
+    const flag = await runTest(SLOW, ["--jobs", "2"], { ...env, VL_JOBS: "1" });
+    const w2 = traceWorkers(flag.err);
+    if (w2.run !== 2 || w2.collect !== 2) {
+      throw new Error(`--jobs 2 over VL_JOBS=1: want 2, got ${JSON.stringify(w2)}`);
+    }
+    // An invalid value warns once and falls back to the default (one per core).
+    for (const bad of ["0", "-3", "four"]) {
+      const r = await runTest(SLOW, [], { ...env, VL_JOBS: bad });
+      const warns = r.err.split("\n").filter((l) => l.startsWith("vl: ignoring VL_JOBS="));
+      if (r.code !== 0 || warns.length !== 1) {
+        throw new Error(`VL_JOBS=${bad}: want one warning and a passing run, got:\n${r.err}`);
+      }
+      if (!(traceWorkers(r.err).run >= 1)) {
+        throw new Error(`VL_JOBS=${bad}: want a worker count, got:\n${r.err}`);
+      }
+    }
+  },
+});
