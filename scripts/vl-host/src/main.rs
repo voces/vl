@@ -3322,7 +3322,7 @@ fn name_heap_types(
     heap_names::explain(bytes, sentence, &mut |idx| match (&len, &at) {
         (Some(len), Some(at)) => {
             let n = len.call(&mut *store, idx as i32).unwrap_or(0);
-            read_guest_str(n, |j| Ok(at.call(&mut *store, (idx as i32, j))?)).unwrap_or_default()
+            read_guest_str(n, |j| at.call(&mut *store, (idx as i32, j))).unwrap_or_default()
         }
         _ => String::new(),
     })
@@ -7777,6 +7777,10 @@ enum Fault {
     /// one - so it can never reach the start function, whose offsets had no span row
     /// at all until D1594 and printed a bare number.
     CorruptStartFnBody,
+    /// Rewrite the first body with room into an `array.new_fixed` of 2^32-1 elements over a
+    /// ref-element array type, against an empty stack: a count read off the module that must
+    /// never size an allocation in the host (`heap_names`).
+    HugeArrayNewFixed,
 }
 
 /// Read `$VL_FAULT_INJECT`. Unset or empty is `None` (the state every real run is
@@ -7792,9 +7796,11 @@ fn fault_injection() -> Result<Option<Fault>> {
         None | Some("") => Ok(None),
         Some("corrupt-validate-bytes") => Ok(Some(Fault::CorruptValidateBytes)),
         Some("corrupt-start-fn-body") => Ok(Some(Fault::CorruptStartFnBody)),
+        Some("huge-array-new-fixed") => Ok(Some(Fault::HugeArrayNewFixed)),
         Some(other) => bail!(
             "vl: unrecognized $VL_FAULT_INJECT fault `{other}` — the values this binary \
-             knows are `corrupt-validate-bytes` and `corrupt-start-fn-body`. \
+             knows are `corrupt-validate-bytes`, `corrupt-start-fn-body` and \
+             `huge-array-new-fixed`. \
              $VL_FAULT_INJECT is a TEST-ONLY hook for exercising the module-validation \
              path; unset it."
         ),
@@ -7808,7 +7814,75 @@ fn inject_fault(fault: Fault, bytes: &mut [u8]) -> Result<()> {
     match fault {
         Fault::CorruptValidateBytes => corrupt_first_function_body(bytes),
         Fault::CorruptStartFnBody => corrupt_start_function_body(bytes),
+        Fault::HugeArrayNewFixed => huge_array_new_fixed(bytes),
     }
+}
+
+/// The `Fault::HugeArrayNewFixed` rewrite: the first body with room becomes `00` (no locals),
+/// `array.new_fixed $t 0xFFFFFFFF` for the module's first array type whose element is a
+/// concrete reference (so the engine's sentence carries the `$type` the namer reacts to),
+/// `unreachable` filler and `end`. Length-preserving, like the other two.
+fn huge_array_new_fixed(bytes: &mut [u8]) -> Result<()> {
+    use wasmparser::{CompositeInnerType, HeapType, Parser, Payload, StorageType, ValType};
+    const F: &str = "VL_FAULT_INJECT=huge-array-new-fixed";
+    let mut ty: Option<u32> = None;
+    let mut body: Option<(usize, usize)> = None;
+    let mut next = 0u32;
+    let mut code = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| Error::msg(format!("{F}: the module does not decode: {e}")))? {
+            Payload::TypeSection(r) => {
+                for rg in r {
+                    let rg = rg.map_err(|e| Error::msg(format!("{F}: bad type section: {e}")))?;
+                    for st in rg.types() {
+                        if ty.is_none() {
+                            if let CompositeInnerType::Array(a) = &st.composite_type.inner {
+                                if let StorageType::Val(ValType::Ref(rt)) = a.0.element_type {
+                                    if matches!(rt.heap_type(), HeapType::Concrete(_)) {
+                                        ty = Some(next);
+                                    }
+                                }
+                            }
+                        }
+                        next += 1;
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(b) => code.push(b.range()),
+            _ => {}
+        }
+    }
+    let Some(ty) = ty else {
+        bail!("{F}: the module has no array type with a reference element — use a program \
+               with a `string[]`");
+    };
+    let mut instr = vec![0x00, 0xfb, 0x08];
+    let mut v = ty;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            instr.push(b);
+            break;
+        }
+        instr.push(b | 0x80);
+    }
+    instr.extend([0xff, 0xff, 0xff, 0xff, 0x0f]);
+    for r in code {
+        if r.end - r.start > instr.len() {
+            body = Some((r.start, r.end));
+            break;
+        }
+    }
+    let Some((start, end)) = body else {
+        bail!("{F}: no function body of {}+ bytes — nothing to corrupt", instr.len() + 1);
+    };
+    bytes[start..start + instr.len()].copy_from_slice(&instr);
+    for b in &mut bytes[(start + instr.len())..(end - 1)] {
+        *b = 0x00; // unreachable — decodable filler
+    }
+    bytes[end - 1] = 0x0b; // end
+    Ok(())
 }
 
 /// Read a u32 LEB128 at `*p`, advancing `*p`. `None` on a truncated or over-long

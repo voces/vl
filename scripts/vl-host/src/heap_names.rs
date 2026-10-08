@@ -272,7 +272,7 @@ fn expected_operands(
                 BlockType::FuncType(i) => module_ty(i).map(params_of).unwrap_or_default(),
                 _ => Vec::new(),
             }
-        } else if depth as u32 + 1 == fv.control_stack_height() {
+        } else if depth + 1 == fv.control_stack_height() {
             res.type_id_of_function(fv.index())
                 .map(|id| results_of(func_ty(id)))
                 .unwrap_or_default()
@@ -363,7 +363,9 @@ fn expected_operands(
             array_type_index,
             array_size,
         } => match module_ty(*array_type_index) {
-            Some(CompositeInnerType::Array(a)) => {
+            // `array_size` is read straight off the module: past the operand stack's height the
+            // operator fails on arity, not on a type, so there is no pair to name.
+            Some(CompositeInnerType::Array(a)) if *array_size <= fv.operand_stack_height() => {
                 let t = unpack(a.0.element_type);
                 (0..*array_size as usize).map(|d| (d, t)).collect()
             }

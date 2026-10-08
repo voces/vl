@@ -15,25 +15,39 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
-  console.warn("[vl-invalid-module-types] skipped — missing vl binary or seed wasm.");
+  console.warn(
+    "[vl-invalid-module-types] skipped — missing vl binary or seed wasm.",
+  );
 }
 
 const EXIT_COMPILER_BUG = 70;
 
-const run = async (args: string[], cwd: string): Promise<{ code: number; out: string }> => {
+const run = async (
+  args: string[],
+  cwd: string,
+  fault = "",
+): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [...args, "--compiler", COMPILER],
     cwd,
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, VL_FAULT_INJECT: "" },
+    env: {
+      RUST_BACKTRACE: "0",
+      NO_COLOR: "1",
+      VL_STD: `${ROOT}/std`,
+      VL_FAULT_INJECT: fault,
+    },
   }).output();
-  return { code, out: new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr) };
+  return {
+    code,
+    out: new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
+  };
 };
 
 const withDir = async (
@@ -79,7 +93,8 @@ const CASES: Case[] = [
     never: ["$type"],
   },
   {
-    name: "D3816: a nullable string where a string is wanted names `string` and its shape",
+    name:
+      "D3816: a nullable string where a string is wanted names `string` and its shape",
     files: {
       "f.vl": 'function describe(self: string): string { "string " + self }\n' +
         'function f(n: string | null): string { n?.describe() ?? "none" }\n' +
@@ -93,10 +108,13 @@ const CASES: Case[] = [
     never: ["$type"],
   },
   {
-    name: "D3817: a canonical type id is a module index, and a merged function its source name",
+    name:
+      "D3817: a canonical type id is a module index, and a merged function its source name",
     files: {
-      "s.vl": 'export function describe(self: string): string { "string " + self }\n',
-      "main.vl": 'import { describe } from "./s"\nexport function d(x) { x.describe() }\nprint(1)\n',
+      "s.vl":
+        'export function describe(self: string): string { "string " + self }\n',
+      "main.vl":
+        'import { describe } from "./s"\nexport function d(x) { x.describe() }\nprint(1)\n',
     },
     entry: "main.vl",
     want: [
@@ -104,6 +122,25 @@ const CASES: Case[] = [
       "callee returns [(ref $2)]; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
     ],
     never: ["(id ", "d$m0"],
+  },
+  // The string-keyed map struct is one heap type for every string-keyed map and set, so it is
+  // named by its rep: a `Set<string>` must not be called `{[string]: i32}`.
+  {
+    name:
+      "a heap type several VL types share is named by its rep, not by one of them",
+    files: {
+      "s.vl": "type T = Set<string>\n" +
+        'function d(self: T): string { "RS" }\n' +
+        "function h<T>(x: T): string { x.d() }\n" +
+        "const a: T = Set()\n" +
+        "print([a].map((x) => h(x))[0])\n",
+    },
+    entry: "s.vl",
+    want: [
+      "type mismatch: expected (ref $",
+      "is `string-keyed map or set`, struct {",
+    ],
+    never: ["$type", "{[string]: i32}"],
   },
 ];
 
@@ -115,7 +152,9 @@ for (const c of CASES) {
       await withDir(c.files, async (dir) => {
         const chk = await run(["check", c.entry], dir);
         if (chk.code !== 0) {
-          throw new Error(`the witness no longer check-cleans (fixed?) — replace it:\n${chk.out}`);
+          throw new Error(
+            `the witness no longer check-cleans (fixed?) — replace it:\n${chk.out}`,
+          );
         }
         const channels: [string, string[]][] = [
           ["run", ["run", c.entry]],
@@ -125,16 +164,59 @@ for (const c of CASES) {
         for (const [what, args] of channels) {
           const r = await run(args, dir);
           if (r.code !== EXIT_COMPILER_BUG) {
-            throw new Error(`${what}: want exit ${EXIT_COMPILER_BUG}, got ${r.code}\n${r.out}`);
+            throw new Error(
+              `${what}: want exit ${EXIT_COMPILER_BUG}, got ${r.code}\n${r.out}`,
+            );
           }
           for (const w of c.want) {
-            if (!r.out.includes(w)) throw new Error(`${what}: want \`${w}\`, got:\n${r.out}`);
+            if (!r.out.includes(w)) {
+              throw new Error(`${what}: want \`${w}\`, got:\n${r.out}`);
+            }
           }
           for (const n of c.never) {
-            if (r.out.includes(n)) throw new Error(`${what}: must not print \`${n}\`:\n${r.out}`);
+            if (r.out.includes(n)) {
+              throw new Error(`${what}: must not print \`${n}\`:\n${r.out}`);
+            }
           }
         }
       });
     },
   });
 }
+
+// `array.new_fixed`'s element count is read off the module, so a corrupt count must not size
+// the namer's allocation: 2^32-1 aborted the host with `memory allocation of … failed`. The
+// fault rewrites real emitted bytes between emission and validation (`$VL_FAULT_INJECT`).
+Deno.test({
+  name:
+    "vl-invalid-module-types: a corrupt array.new_fixed count is reported, not allocated",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = "function first(xs: string[]): string { xs[0] }\n" +
+      'const xs: string[] = ["a", "b"]\n' +
+      "print(first(xs))\n";
+    await withDir({ "l.vl": src }, async (dir) => {
+      const channels: [string, string[]][] = [
+        ["build", ["build", "l.vl", "-o", `${dir}/out.wasm`]],
+        ["check --codegen", ["check", "--codegen", "l.vl"]],
+      ];
+      for (const [what, args] of channels) {
+        const r = await run(args, dir, "huge-array-new-fixed");
+        if (r.code !== EXIT_COMPILER_BUG) {
+          throw new Error(
+            `${what}: want exit ${EXIT_COMPILER_BUG}, got ${r.code}\n${r.out}`,
+          );
+        }
+        const want = "failed to validate inside `first`";
+        if (!r.out.includes(want)) {
+          throw new Error(`${what}: want \`${want}\`, got:\n${r.out}`);
+        }
+        if (r.out.includes("memory allocation")) {
+          throw new Error(
+            `${what}: the host sized an allocation off the module:\n${r.out}`,
+          );
+        }
+      }
+    });
+  },
+});
