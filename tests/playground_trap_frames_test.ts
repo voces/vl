@@ -76,7 +76,7 @@ Deno.test({
     }
     assertEquals(
       result.sourceFrames,
-      ["at 7:3  in `boom`", "at 11:1  in `__start__`"],
+      ["at main.vl:7:3  in `boom`", "at main.vl:11:1  in `__start__`"],
       "resolved trap frames",
     );
   },
@@ -107,6 +107,6 @@ Deno.test({
     if (!result.diagnostics.some((d) => d.severity === "error")) {
       throw new Error(`expected a runtime-error diagnostic, got ${JSON.stringify(result.diagnostics)}`);
     }
-    assertEquals(result.sourceFrames, ["at 4:1  in `__start__`"], "module-scope frame");
+    assertEquals(result.sourceFrames, ["at main.vl:4:7  in `__start__`"], "module-scope frame");
   },
 });
