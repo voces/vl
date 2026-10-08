@@ -141,6 +141,20 @@ import {
   mkTypeRef,
   nodeToks,
   orderArgsByParamNames,
+  ovCandText,
+  ovCandsText,
+  ovDemangle,
+  ovFnHead,
+  ovHeadsOverlap,
+  ovInstPick,
+  ovInstRecv,
+  ovInstSite,
+  ovPlainSetOf,
+  ovPrimClass,
+  ovSetCands,
+  ovSetMod,
+  ovSetName,
+  ovSiteSetOf,
   paramDefaultIsCallsite,
   tsMentionsAnyName,
   ufcsAliasAtSite,
@@ -1043,6 +1057,16 @@ let ufcsCstrMore: i32[][] = []
 // The member calls of those rows the emitter cannot re-dispatch per instance: inside a closure
 // or a nested function, or on a receiver that is not the generic's own parameter (D2520).
 let ufcsUnpinnedSites: i32[] = []
+// Overloaded member calls whose receiver each instance supplies (`ovHoleCallTy`).
+let ovHoleSites: i32[] = []
+// Functions whose instances pick an overloaded candidate per call, and function names read
+// as values (node, declaration, name): such a value is refused (`ovUnpinnedReport`).
+let ovDepFns: i32[] = []
+let ovFnValIx: i32[] = []
+let ovFnValDecl: i32[] = []
+let ovFnValName: string[] = []
+// The element type a named `map`/`filter` callback is typed by, keyed on its `Ident` node.
+let ovCbElem: {[i32]: i32} = Map()
 // The function declaration whose own body is being checked, -1 at module scope; a lambda's.
 let curFnDeclIx = -1
 
@@ -5402,6 +5426,12 @@ export function initChecker() {
   ufcsCstrP0 = []
   ufcsCstrMore = []
   ufcsUnpinnedSites = []
+  ovHoleSites = []
+  ovDepFns = []
+  ovFnValIx = []
+  ovFnValDecl = []
+  ovFnValName = []
+  ovCbElem = Map()
   curFnDeclIx = -1
   ufcsMissAt = []
   ufcsMissSpecs = []
@@ -41325,6 +41355,7 @@ function ufcsImportEditSuffix(
 // name would collide with. "" when the module binds no such name.
 function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
   if ufcsFreeAliasAt(ix, prop) == prop { return "" }
+  if ovImportCoexists(ix, prop, objTy) { return "" }
   const tn = demangleMsg(tyToStr(objTy))
   let out = prop
   let i = 0
@@ -41342,6 +41373,26 @@ function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
     i = i + 1
   }
   ufcsFreeAliasAt(ix, out)
+}
+
+// Whether an import of `prop` for receiver `objTy` would coexist with the binding the module
+// at `ix` already has: that binding is a function whose first parameter's head is disjoint
+// from the receiver's (receiver overloading), so the plain name is the right import.
+function ovImportCoexists(ix: i32, prop: string, objTy: i32): boolean {
+  const heads = ovRecvHeads(objTy)
+  if heads.length == 0 { return false }
+  const fty = lookup(ufcsSiteFn(ix, prop))
+  if fty < 0 { return false }
+  const ft = T.tys[fty]
+  if ft is TyFunc {
+    let own = "none"
+    if ft.fnParamTypes.length > 0 { own = ovParamHead(ft.fnParamTypes[0]) }
+    for h in heads {
+      if ovHeadsOverlap(own, h) { return false }
+    }
+    return true
+  }
+  false
 }
 
 // `base`, or `base` with the smallest numeric suffix from 2 up, whichever the module at `ix`
@@ -41918,6 +41969,10 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
         }
       }
       k = k + 1
+    }
+    // An overloaded call's row (`p0` -1) makes its owner's instances pick per call.
+    if p0 < 0 && owner >= 0 && !i32ListHas(ovDepFns, owner) {
+      ovDepFns.push(owner)
     }
     ufcsCstrTy.push(recv)
     ufcsCstrProp.push(prop)
@@ -43171,7 +43226,23 @@ function validateUfcsCstrs(
             mi = mi + 1
           }
         }
-        if uRung == 0 {
+        // An overloaded call noted no `self` type: each pin picks its own candidate.
+        if uRung == 0 && ufcsCstrP0[ci] < 0 {
+          let oWho = "the callee's body"
+          if who != "" { oWho = "the body of `" + who + "`" }
+          ovPinCheck(
+            ufcsCstrIx[ci],
+            ur,
+            ufcsCstrProp[ci],
+            bNames,
+            bTys,
+            ix,
+            oWho,
+          )
+          for mo in ufcsCstrMore[ci] {
+            ovPinCheck(mo, ur, ufcsCstrProp[ci], bNames, bTys, ix, oWho)
+          }
+        } else if uRung == 0 {
           if !assignable(ur, ufcsCstrP0[ci]) {
             let uMsg = memberFloorMsg(ur, ufcsCstrProp[ci])
             let uSuggest = ""
@@ -47065,7 +47136,388 @@ function optChainRecvOf(callFn: i32): i32 {
   -1
 }
 
+// `Box$m1<i32>` → `Box$m1`: the declared head of a recovered type name.
+function ovNameHead(nm: string) {
+  let i = 0
+  while i < nm.length {
+    if nm[i] == '<' { return nm.slice(0, i) }
+    i = i + 1
+  }
+  nm
+}
+
+// The class of a receiver's type constructor, or "" when it has none: a nullable, a negation,
+// a record shape no declaration names, a hole, or a union whose members differ in class.
+function ovKindClass(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
+  const t = T.tys[ty]
+  let out = ""
+  match t {
+    TyPrim => {
+      out = ovPrimClass(t.primName)
+    }
+    TyLit => {
+      out = "num"
+      if t.litKind == "str" { out = "str" }
+    }
+    TyArray => {
+      out = "arr"
+    }
+    TyMap => {
+      out = "map"
+      if t.mSet == 1 { out = "set" }
+    }
+    TyFunc => {
+      out = "fn"
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        const c = ovKindClass(t.uMembers[i], depth - 1)
+        if c == "" || (out != "" && c != out) { return "" }
+        out = c
+        i = i + 1
+      }
+    }
+    // None of these determines a constructor a candidate could be declared for.
+    TyErr => {}
+    TyObj => {}
+    TyNullable => {}
+    TyVar => {}
+    TyNeg => {}
+  }
+  out
+}
+
+// The head classes a receiver of `ty` is asked as: its declared names when it has any (a
+// record shape two declarations share answers to both, and then picks neither), else its
+// constructor's class. One level only, so adding a candidate never moves another call.
+function ovRecvHeads(ty: i32): string[] {
+  const out: string[] = []
+  if ty < 0 || ty >= T.tys.length { return out }
+  const nom = nomNameOfTy(ty)
+  if nom != "" {
+    out.push("rec:" + ovNameHead(nom))
+    return out
+  }
+  const t = T.tys[ty]
+  if t is TyObj {
+    let i = 0
+    while i < cStructTyIxs.length {
+      if cStructTyIxs[i] == ty {
+        const h = "rec:" + ovNameHead(cStructNames[i])
+        if !strListHas(out, h) { out.push(h) }
+      }
+      i = i + 1
+    }
+    const ga = genAppNameOfTy(ty)
+    if ga != "" && !strListHas(out, "rec:" + ovNameHead(ga)) {
+      out.push("rec:" + ovNameHead(ga))
+    }
+    return out
+  }
+  const c = ovKindClass(ty, 8)
+  if c != "" { out.push(c) }
+  out
+}
+
+// The `self`-function of set `row` a receiver of `recvTy` selects: the one whose head is the
+// receiver's, else the one whose first parameter accepts it (a wider record), as a lone
+// candidate would. "" when none does, "*" when several do. One lookup, after the receiver is
+// typed, so the choice never feeds back into the receiver's inference.
+export function ovPickFor(row: i32, recvTy: i32): string {
+  const heads = ovRecvHeads(recvTy)
+  let found = ""
+  for c in ovSetCands[row] {
+    if declFirstParamIsSelf(c) && strListHas(heads, ovFnHead[c] ?? "") {
+      if found != "" { return "*" }
+      found = c
+    }
+  }
+  if found != "" || tyHasHole(recvTy) { return found }
+  for c in ovSetCands[row] {
+    if declFirstParamIsSelf(c) && ufcsSelfAccepts(c, lookup(c), recvTy) {
+      if found != "" { return "*" }
+      found = c
+    }
+  }
+  found
+}
+
+// `.prop(…)` refused for set `row`: the one sentence every such refusal opens with.
+function ovChooseMsg(row: i32, prop: string, tail: string): string {
+  "`." + prop + "(…)` cannot choose between " + ovCandsText(row) + tail
+}
+
+// The head class a parameter of type `ty` declares, the arena twin of the merge's
+// `modOvHeadOfTs`: a union, a hole or an undeclared shape overlaps every class.
+function ovParamHead(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "any" }
+  const hs = ovRecvHeads(ty)
+  if hs.length != 1 || T.tys[ty] is TyUnion { return "any" }
+  hs[0]
+}
+
+// A member call whose receiver each instance supplies (an un-annotated or type-parameter
+// receiver): the body types it by the one return type every candidate shares, and each pin
+// picks and checks its own candidate (`ovPinCheck`), the choice the emitter makes per instance.
+function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
+  let ret = -1
+  let why = ""
+  if !ufcsSitePinnable(ix, cstrOwnerTop()) {
+    why = "the receiver is not a parameter of the function the call sits in"
+  }
+  const argc = n.callArgs.length
+  for c in ovSetCands[row] {
+    if why == "" && declFirstParamIsSelf(c) {
+      const fty = lookup(c)
+      if ufcsInferCallee(c, fty) {
+        const ft = T.tys[fty]
+        if ft is TyFunc {
+          const req = fnRequiredArity(fnDeclParamsOf(c))
+          if argc + 1 > ft.fnParamTypes.length || argc + 1 < req {
+            why = "the candidates take different numbers of arguments"
+          } else if (
+            ft.fnRet < 0
+            || tyHasHole(ft.fnRet)
+            || tyHasTyVar(ft.fnRet)
+          ) {
+            why = "a candidate's return type depends on its receiver"
+          } else if ret >= 0 && !tyEq(ret, ft.fnRet) {
+            why = "the candidates return different types"
+          } else {
+            ret = ft.fnRet
+          }
+        }
+      }
+    }
+  }
+  if ret < 0 && why == "" { why = "no candidate takes a receiver" }
+  if why != "" {
+    tErr(
+      ovChooseMsg(
+        row,
+        prop,
+        " for a receiver each call supplies, because "
+          + why
+          + " — annotate the receiver",
+      ),
+      ix,
+    )
+    return TY_ERR
+  }
+  for a in n.callArgs { checkNode(a) }
+  noteUfcsCstr(recvTy, prop, ix, -1)
+  if !i32ListHas(ovHoleSites, ix) { ovHoleSites.push(ix) }
+  ret
+}
+
+// One instance's answer for the overloaded member call `site`, whose receiver this pin
+// binds to `ur`: the candidate its head selects, its receiver and arguments checked under the
+// pin, and the choice recorded per instance (`ovInstSite`) for the editor.
+function ovPinCheck(
+  site: i32,
+  ur: i32,
+  prop: string,
+  bNames: string[],
+  bTys: i32[],
+  at: i32,
+  uWho: string,
+) {
+  const row = ovSiteSetOf(site)
+  if row < 0 { return 0 }
+  let pick = ovPickFor(row, ur)
+  if pick == "" || pick == "*" {
+    tErr(
+      ovRefuseMsg(row, prop, ur, pick)
+        + " ("
+        + uWho
+        + " at the call's argument types)",
+      at,
+    )
+    pick = ""
+  }
+  // Recorded refused or not ("" picks nothing), so the site is not also reported unpinned.
+  const urS = tyToStrUser(ur)
+  let seen = false
+  let k = 0
+  while k < ovInstSite.length {
+    if ovInstSite[k] == site && ovInstRecv[k] == urS { seen = true }
+    k = k + 1
+  }
+  if !seen {
+    ovInstSite.push(site)
+    ovInstRecv.push(urS)
+    ovInstPick.push(pick)
+  }
+  if pick == "" { return 0 }
+  const ft = T.tys[lookup(pick)]
+  const c = P.nodes[site]
+  if ft is TyFunc {
+    if c is Call {
+      const pN: string[] = []
+      const pT: i32[] = []
+      bindGenWalk(ft.fnParamTypes[0], ur, pN, pT)
+      let i = 0
+      while i < c.callArgs.length && i + 1 < ft.fnParamTypes.length {
+        const got = substTyDeep(nodeTyIxOf(c.callArgs[i]), bNames, bTys)
+        if got >= 0 && !tyHasHole(got) {
+          bindGenWalk(ft.fnParamTypes[i + 1], got, pN, pT)
+          const want = substTyDeep(ft.fnParamTypes[i + 1], pN, pT)
+          if !assignable(got, want) {
+            tErr(
+              "argument "
+                + i32ToStr(i + 1)
+                + " of `."
+                + prop
+                + "(…)`: expected "
+                + tyToStr(want)
+                + ", got "
+                + tyToStr(got)
+                + " — the receiver "
+                + tyToStrUser(ur)
+                + " picks "
+                + ovCandText(row, strListIndexOf(ovSetCands[row], pick))
+                + " ("
+                + uWho
+                + " at the call's argument types)",
+              at,
+            )
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// How many candidates of set `row` take a receiver at all (`self`-functions).
+function ovSelfCount(row: i32) {
+  let n = 0
+  for c in ovSetCands[row] {
+    if declFirstParamIsSelf(c) { n = n + 1 }
+  }
+  n
+}
+
+// Whether a list or map receiver still has an unpinned element (`[]`, `Map()`).
+function ovRecvOpen(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  let open = false
+  match t {
+    TyArray => {
+      open = t.aElem < 0
+    }
+    TyMap => {
+      open = t.mKey < 0 || t.mVal < 0
+    }
+    // No element slot an empty literal could leave open.
+    TyPrim => {}
+    TyErr => {}
+    TyObj => {}
+    TyFunc => {}
+    TyUnion => {}
+    TyNullable => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  open
+}
+
+// The tail a plain call to a local function adds when the name also has imported candidates:
+// the call reached the local one, and the imports are reached as methods. "" otherwise.
+function ovPlainHint(callIx: i32): string {
+  const row = ovPlainSetOf(callIx)
+  if row < 0 { return "" }
+  let others = ""
+  let k = 1
+  while k < ovSetCands[row].length {
+    if others != "" { others = others + ", " }
+    others = others + ovCandText(row, k)
+    k = k + 1
+  }
+  " — the plain call reaches the local `"
+    + ovSetName[row]
+    + "`; "
+    + others
+    + " is reached as a method, `x."
+    + ovSetName[row]
+    + "(…)`"
+}
+
+// The refusal for a member call `.prop(…)` on `recvTy` that set `row` cannot answer.
+function ovRefuseMsg(
+  row: i32,
+  prop: string,
+  recvTy: i32,
+  pick: string,
+): string {
+  const cands = ovCandsText(row)
+  const rs = tyToStrUser(recvTy)
+  if pick == "*" {
+    return "`."
+      + prop
+      + "(…)` on "
+      + rs
+      + " matches more than one of "
+      + cands
+      + ": the receiver's shape is declared under more than one name — rename one import with `as`"
+  }
+  if ovRecvHeads(recvTy).length == 0 {
+    let tail = "annotate the receiver with the type to call it on, or rename one import with `as`"
+    if T.tys[recvTy] is TyNullable {
+      tail = "a nullable receiver is called as `x?." + prop + "(…)`"
+    } else if T.tys[recvTy] is TyUnion {
+      tail = "its members span head classes; narrow it (`if x is …`) before the call"
+    }
+    return ovChooseMsg(
+      row,
+      prop,
+      ": the receiver's type " + rs + " does not determine one — " + tail,
+    )
+  }
+  "no `"
+    + prop
+    + "` here takes a receiver of type "
+    + rs
+    + ": the candidates are "
+    + cands
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
+  // Receiver overloading: a member call the merge left to the receiver's head class picks its
+  // candidate here, banking it on the site for every later reader (`ufcsAliasAtSite`).
+  const ovRow = ovSiteSetOf(ix)
+  if ovRow >= 0 {
+    if recvTy < 0 || T.tys[recvTy] is TyErr { return TY_ERR }
+    // The merge banks a lone `self`-function candidate itself; several choose here.
+    if ovSelfCount(ovRow) > 1 {
+      if T.tys[recvTy] is TyVar {
+        return ovHoleCallTy(ovRow, plainName, recvTy, n, ix)
+      }
+      const pick = ovPickFor(ovRow, recvTy)
+      if pick == "" || pick == "*" {
+        tErr(ovRefuseMsg(ovRow, plainName, recvTy, pick), ix)
+        return TY_ERR
+      }
+      ufcsSiteAdd(ix, pick)
+    }
+    // A receiver whose element is still open would take it from the callee the name picked.
+    if ovRecvOpen(recvTy) {
+      tErr(
+        ovChooseMsg(
+          ovRow,
+          plainName,
+          ", because the receiver's element type is not known yet — annotate it (`const xs: string[] = []`)",
+        ),
+        ix,
+      )
+      return TY_ERR
+    }
+  }
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
   // modules may each export the same-named `self`-function.
@@ -47828,6 +48280,8 @@ function checkMemberCallNode(
       // un-annotated function-literal argument infers its param instead of erroring — only
       // when the arg is an anonymous literal and the element type is known, else cleared below.
       const cbArg = P.nodes[cargs[0]]
+      // A named callback is typed by the element, which a refused function value names.
+      if cbArg is Ident && ovSetMod.length > 0 { ovCbElem[cargs[0]] = rt.aElem }
       if cbArg is FuncDecl {
         if cbArg.fnName == "" && rt.aElem >= 0 {
           recordCbExpected(cargs[0], [rt.aElem])
@@ -48710,7 +49164,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         + arityWantText(required, params.length)
         + ", got "
         + i32ToStr(args.length)
-        + tyArgReadHintIfAny(args),
+        + tyArgReadHintIfAny(args)
+        + ovPlainHint(ix),
       ix,
     )
     return retTy
@@ -54975,6 +55430,9 @@ function checkNodeReal(ix: i32) {
     // `ty` is this use's type as the checker resolved it — narrowed when the use
     // sits inside a guarded arm. Threaded in so the occurrence retains it.
     if symEnabled != 0 { symUse(ix, n.identName, ty) }
+    if ovSetMod.length > 0 && ix != ckCalleeIx {
+      ovNoteFnValue(ix, n.identName, ty)
+    }
     if ix != daWriteTarget {
       if crCapLossAny { crNoteLostName(n.identName, ix) }
       const crr = crReadHook(n.identName, ix)
@@ -57005,9 +57463,102 @@ export function checkProgram(rootIx: i32) {
   lbiReport()
   recAdForcedReport()
   recAdReport()
+  ovUnpinnedReport()
   // A program with errors is typed in part against what its annotations say, so none of them
   // is reported redundant (D3800).
   if T.diags.length > 0 { redunTruncate(0) }
+}
+
+// An overloaded member call on a receiver each instance supplies, in a function no call
+// instantiates: no instance picks its candidate, and the body alone cannot.
+function ovUnpinnedReport() {
+  for s in ovHoleSites {
+    // A dependency's uninstantiated function emits nothing, so only the entry's is asked.
+    if !i32ListHas(ovInstSite, s) && ufcsModOfNode(s) <= 0 {
+      const c = P.nodes[s]
+      let prop = ""
+      if c is Call {
+        const cf = P.nodes[c.callFn]
+        if cf is Member { prop = cf.memProp }
+      }
+      const row = ovSiteSetOf(s)
+      if row >= 0 {
+        tErr(
+          ovChooseMsg(
+            row,
+            prop,
+            ": its receiver's type comes from each call of the function it sits in, and nothing calls it — annotate the receiver",
+          ),
+          s,
+        )
+      }
+    }
+  }
+  // An instance made for a function VALUE has no call whose receiver could pick a candidate.
+  let i = 0
+  while i < ovFnValIx.length {
+    if i32ListHas(ovDepFns, ovFnValDecl[i]) {
+      const nm = ovDemangle(ovFnValName[i])
+      tErr(
+        "`"
+          + nm
+          + "` cannot be used as a function value: its body calls an overloaded method on a receiver each call of `"
+          + nm
+          + "` supplies, and a function value makes an instance no call picks for — "
+          + ovFnValFix(ovFnValIx[i], nm),
+        ovFnValIx[i],
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The spelling a refused function value can take instead: a lambda annotated at the concrete
+// parameter types the value is used at, else (still generic there) a direct call.
+function ovFnValFix(ix: i32, nm: string): string {
+  const fallback = "annotate it where its parameter types are concrete, or call `"
+    + nm
+    + "` directly"
+  const el = ovCbElem[ix] ?? -1
+  if el >= 0 && !tyHasHole(el) && !tyHasTyVar(el) {
+    return "pass a lambda, `(x: " + tyToStrUser(el) + ") => " + nm + "(x)`"
+  }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 || ty >= T.tys.length { return fallback }
+  const ft = T.tys[ty]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length == 0 { return fallback }
+    let ps = ""
+    let as = ""
+    let k = 0
+    while k < ft.fnParamTypes.length {
+      const pt = ft.fnParamTypes[k]
+      if pt < 0 || tyHasHole(pt) || tyHasTyVar(pt) { return fallback }
+      let v = "x"
+      if ft.fnParamTypes.length > 1 { v = "x" + i32ToStr(k) }
+      if k > 0 {
+        ps = ps + ", "
+        as = as + ", "
+      }
+      ps = ps + v + ": " + tyToStrUser(pt)
+      as = as + v
+      k = k + 1
+    }
+    return "pass a lambda, `(" + ps + ") => " + nm + "(" + as + ")`"
+  }
+  fallback
+}
+
+// A function name read as a value (not called), kept for `ovUnpinnedReport`.
+function ovNoteFnValue(ix: i32, name: string, ty: i32) {
+  const d = fnDeclIx[name] ?? -1
+  if d < 0 || i32ListHas(ovFnValIx, ix) { return 0 }
+  if T.scopes.length == 0 || (T.scopes[0][name] ?? -1) != ty { return 0 }
+  ovFnValIx.push(ix)
+  ovFnValDecl.push(d)
+  ovFnValName.push(name)
+  0
 }
 
 // A fresh check of the program after a pass rewrote some declarations' annotations.
