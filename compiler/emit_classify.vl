@@ -17646,7 +17646,13 @@ export function exprIsBool(ix: i32, fnIx: i32) {
     // An element read over a boolean-element list prints as true/false: a `.map` result
     // whose callback returns boolean, or a directly declared `boolean[]`.
     if mfArrElemIsBool(e.idxArr, fnIx) { return true }
-    return listElemIsBool(e.idxArr, fnIx)
+    if listElemIsBool(e.idxArr, fnIx) { return true }
+    // An element typed at a type parameter an enclosing instance binds to `boolean`, read in
+    // a nested generic's instance that binds only its own (D3831).
+    if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
+      return true
+    }
+    return tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean"
   }
   if e is Unary { return e.unOp == "!" }
   if e is Ident {
@@ -31881,8 +31887,36 @@ export function exactOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   if ty < 0 { return exactCallResultTyOf(ax, fnIx) }
   if !tyHasTyVar(ty) { return -1 }
   const st = substTyDeep(ty, monoExactSubN[row], monoExactSubT[row])
-  if st < 0 || tyHasTyVar(st) { return -1 }
+  if st < 0 { return -1 }
+  if tyHasTyVar(st) { return exactSubOuterTyOf(st, fnIx) }
   st
+}
+
+// `ty`, left open by the exact instance `fnIx` is, or is lifted inside, substituted through the
+// exact instances enclosing that one: a nested generic's instance binds its own parameters
+// only, and its enclosing instance binds the rest (D3831). -1 where one stays unbound.
+function exactSubOuterTyOf(ty: i32, fnIx: i32): i32 {
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  let seen = false
+  let cur = ty
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoExactSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoExactSubN.length {
+      // The innermost row is the one the caller already applied.
+      if seen {
+        const st = substTyDeep(cur, monoExactSubN[row], monoExactSubT[row])
+        if st < 0 { return -1 }
+        if !tyHasTyVar(st) { return st }
+        cur = st
+      }
+      seen = true
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
 }
 
 // `ty` with the type parameters the instance `fnIx` is, or is lifted inside, binds to its
@@ -31891,12 +31925,15 @@ export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
   if ty < 0 || monoPinSubN.length == 0 { return -1 }
   let pos = fnStmtsPosOf(fnIx)
   let guard = 0
+  let cur = ty
   while pos >= 0 && guard <= fnStmts.length {
     const row = monoPinSubRow.get(pos) ?? -1
     if row >= 0 && row < monoPinSubN.length {
-      const st = substTyDeep(ty, monoPinSubN[row], monoPinSubT[row])
-      if st < 0 || tyHasTyVar(st) { return -1 }
-      return st
+      const st = substTyDeep(cur, monoPinSubN[row], monoPinSubT[row])
+      if st < 0 { return -1 }
+      if !tyHasTyVar(st) { return st }
+      // A nested generic's instance leaves its enclosing instance's parameters open (D3831).
+      cur = st
     }
     if pos >= fnParent.length { return -1 }
     pos = fnParent[pos]
