@@ -250,11 +250,34 @@ fixCase(
 );
 
 fixCase(
-  "one name asked of two modules by two receivers: neither import is added",
+  "a method the file already binds for another receiver kind is imported under its own name",
+  {
+    "s.vl": 'export function d(self: string): string { "S" }\n',
+    "a.vl": 'export function d<T>(self: T[]): string { "A" }\nexport function other(): i32 { 1 }\n',
+    "main.vl": 'import { d } from "./s"\nimport { other } from "./a"\n' +
+      'print("x".d())\nprint([other()].d())\n',
+  },
+  'import { d } from "./s"\nimport { other, d } from "./a"\n' +
+    'print("x".d())\nprint([other()].d())\n',
+);
+
+fixCase(
+  "an import that needs an alias is not applied (the call would need respelling too)",
+  {
+    "ni.vl": 'export function d(self: i32): string { "I" }\n',
+    "nf.vl": 'export function d(self: f64): string { "F" }\nexport function of(): i32 { 1 }\n',
+    "main.vl": 'import { d } from "./ni"\nimport { of } from "./nf"\nconst b = 1.5\nprint(b.d())\nprint(of())\n',
+  },
+  'import { d } from "./ni"\nimport { of } from "./nf"\nconst b = 1.5\nprint(b.d())\nprint(of())\n',
+);
+
+fixCase(
+  "one name asked of two modules by two receivers: both imports are added (receiver overloading)",
   {
     "main.vl": 'const s = "a,b"\nconst xs = [1, 2]\n' +
       'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
   },
-  'const s = "a,b"\nconst xs = [1, 2]\n' +
+  'import { lastIndexOf } from "std:str"\nimport { lastIndexOf } from "std:array"\n' +
+    'const s = "a,b"\nconst xs = [1, 2]\n' +
     'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
 );
