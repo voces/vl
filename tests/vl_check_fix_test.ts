@@ -229,6 +229,15 @@ fixCase(
 );
 
 fixCase(
+  "in a file with no imports, the new import goes after the header comment",
+  {
+    "main.vl": "// hdr: what this file is for\n// second header line\n\nprint(hypotF64(3.0, 4.0))\n",
+  },
+  "// hdr: what this file is for\n// second header line\n\n" +
+    'import { hypotF64 } from "std:math"\nprint(hypotF64(3.0, 4.0))\n',
+);
+
+fixCase(
   "two exporters: the message lists both and nothing is edited",
   {
     "a.vl": "export function dup(): i32 { 1 }\n",
