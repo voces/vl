@@ -356,7 +356,12 @@ const driveCase = (
   // table is still standing: `redunModuleAt` / `rcoalModuleAt` / `isvalModuleAt`
   // resolve each finding's owner through `modOfTok`, and the later `lintSrc`
   // re-parse resets that table.
-  const redun = [...readRedun(exp), ...readRcoal(exp), ...readIsval(exp)];
+  const redun = [
+    ...readRedun(exp),
+    ...readRcoal(exp),
+    ...readIsval(exp),
+    ...readExpInf(exp),
+  ];
   let bytes: Uint8Array | undefined;
   if (emit && rc === 0) {
     const n = exp.rbyteLen();
@@ -469,7 +474,9 @@ const assertCase = async (
     if (!onLine.some((di) => di.col === want.col)) {
       throw new Error(
         `@error-at ${want.line}:${want.col} — the message is on that line but at ` +
-          `column ${onLine.map((di) => di.col).join("/")}. Both numbers are 0-based; ` +
+          `column ${
+            onLine.map((di) => di.col).join("/")
+          }. Both numbers are 0-based; ` +
           `fix the directive or the span, not the base: ${fmtDiags(onLine)}`,
       );
     }
@@ -651,6 +658,27 @@ const readIsval = (exp: Exports): LintDiag[] => {
   return out;
 };
 
+/**
+ * The inferred-export-parameter hints (`expInf*`, D3817): an uncalled entry export's
+ * untyped parameter the checker annotated from its body. Type-informed like the three
+ * above; entry module only, message over `expInfMsg*`. An older seed lacks the exports.
+ */
+const readExpInf = (exp: Exports): LintDiag[] => {
+  const out: LintDiag[] = [];
+  if (typeof exp.expInfCount !== "function") return out;
+  const n = exp.expInfCount();
+  for (let i = 0; i < n; i++) {
+    if (exp.expInfModuleAt(i) !== 0) continue;
+    out.push({
+      sev: "hint",
+      line: exp.expInfLineAt(i),
+      col: exp.expInfColAt(i),
+      msg: readString(exp.expInfMsgLen(i), (j) => exp.expInfMsgByte(i, j)),
+    });
+  }
+  return out;
+};
+
 // No code is filtered here. The repo-policy rules (the comment rubric, the kind-ladder
 // and sentinel-index rules, …) grade only the VL tree's own `compiler/`/`std/`, and a
 // case is linted with no path staged, so they decline by themselves
@@ -803,7 +831,9 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
   Deno.test("EXPECTED_DIVERGENCES entries name existing cases", () => {
     const stale = Object.keys(EXPECTED_DIVERGENCES).filter((k) => !seen.has(k));
     if (stale.length) {
-      throw new Error(`stale EXPECTED_DIVERGENCES entries: ${stale.join(", ")}`);
+      throw new Error(
+        `stale EXPECTED_DIVERGENCES entries: ${stale.join(", ")}`,
+      );
     }
   });
 };
