@@ -250,11 +250,12 @@ fixCase(
 );
 
 fixCase(
-  "one name asked of two modules by two receivers: neither import is added",
+  "one name asked of two modules by two receivers: both imports are added (receiver overloading)",
   {
     "main.vl": 'const s = "a,b"\nconst xs = [1, 2]\n' +
       'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
   },
-  'const s = "a,b"\nconst xs = [1, 2]\n' +
+  'import { lastIndexOf } from "std:str"\nimport { lastIndexOf } from "std:array"\n' +
+    'const s = "a,b"\nconst xs = [1, 2]\n' +
     'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
 );

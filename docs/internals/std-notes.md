@@ -909,10 +909,10 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
 - **Why the names do not reuse `load*`.** Not taste: VL has no namespace import and a UFCS
   call resolves only names in scope, so a file reading both a `Buf` and a `u8[]` must import
   both sets into one scope, and a module that both imports and declares a name is a hard
-  parse error. Two `loadI32`s would not compile UNALIASED —
-  `tests/cases/modules/err-duplicate-import-two-modules/` is that shape. `as` renaming does
-  exist, so the choice is between distinct names, which cost nobody anything, and an alias
-  every caller has to write.
+  parse error. Two `loadI32`s did not compile UNALIASED when this was decided. (Since
+  receiver overloading, O1, a `u8[]` and a `Buf` receiver differ in kind and the two would
+  coexist; the distinct names stand, since renaming a shipped std export has no deprecation
+  path.)
 - **`u8[]` is outside the generic surface** — not a `T[]`, so `std:array`'s helpers do not
   reach it; the loops are written out here, as `std:base64` and `std:utf8` write theirs.
 - **Why nothing bounds-checks.** A read is one array index and the engine already checks it,

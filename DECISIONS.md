@@ -5509,7 +5509,7 @@ the same name imported twice from the same module, or through a re-export chain 
 the same declaration, is redundant and still RUNS; only two DIFFERENT declarations under one
 name are refused. Pinned both ways:
 `tests/cases/modules/duplicate-import-same-declaration/` and
-`tests/cases/modules/err-duplicate-import-two-modules/`.
+`tests/cases/modules/err-duplicate-binding/` (since receiver overloading, O1, two functions whose first parameters differ in kind coexist: `tests/cases/modules/overload-record-receivers/`).
 
 **Why it is a rule and not a lint: the meaning was reader-dependent.** The merge's rename map
 held two rows under one key and its readers disagreed about which won — `modRenamed` (VALUE
