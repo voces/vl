@@ -230,6 +230,17 @@ ROWS = [
     ("structCanonIndex", ["scnLen", "scnEpoch"], "probe",
      ("    if si == scnLen && si < sTyIx.length {",
       "    if false && si == scnLen && si < sTyIx.length {")),
+    # Lane HS: `sigKeyOfTy` by type id and `structIndexOfTypeName` by name, each stamped with the
+    # type-registry generation `tyRegGenNow` read before the computation. The generation moves
+    # on the pass, the arena, type mutation, node-type writes, `tyRegNoteWrite` and the lengths
+    # of the struct, union, variant, map-slot and ref-list tables.
+    ("typeRegistryGen", ["trgStamp"], "not-a-memo", None),
+    ("sigKeyOfTyMemo", ["sktGen"], "probe",
+     ("  if sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }",
+      "  if false && sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }")),
+    ("structIndexOfTypeNameMemo", [], "probe",
+     ("    if hit[0] == gen { return hit[1] }",
+      "    if false && hit[0] == gen { return hit[1] }")),
 ]
 
 # A stamp is a MODULE-level binding whose name carries one of these markers; the shapes below

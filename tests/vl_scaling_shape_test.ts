@@ -84,6 +84,24 @@ const genParamFieldCalls = (n: number): string => {
   return o.join("\n") + "\n";
 };
 
+// `n` calls whose string result is classified, through a callee taking a `w`-field record
+// (`wide`) or a one-field one. Both arms declare both records, so only the callee's signature
+// width differs; a signature key re-derived per call is calls x width x width.
+const genSigWidthCalls = (n: number, w: number, wide: boolean): string => {
+  const o: string[] = [
+    "type Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: f64`).join(", ") + " }",
+    "type Narrow = { f0: f64 }",
+    'function f(p: Wide): string { "a" }',
+    'function g(p: Narrow): string { "a" }',
+    "const qw: Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: ${i}.5`).join(", ") + " }",
+    "const qn: Narrow = { f0: 1.5 }",
+    'let acc = ""',
+  ];
+  for (let i = 0; i < n; i++) o.push(`acc = acc + ${wide ? "f(qw)" : "g(qn)"}`);
+  o.push("print(acc.length)");
+  return o.join("\n") + "\n";
+};
+
 // N struct types used once each, against N/K used K times each. Distinct FIELD names,
 // because two structurally identical shapes intern to one row and the axis would vanish.
 const genTypes = (n: number, k: number): string => {
@@ -615,6 +633,17 @@ axis(
   5.1,
   "`fieldClosureFeOfRecvRaw` (compiler/emit_classify.vl) is scanning the arena for a parameter's call sites instead of `callsOfCallee`.",
   (d) => twoFiles(d, genParamFieldCalls(2400), genParamFieldCalls(600)),
+);
+
+// Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
+// one. Fuel reads 3.38; the #3422 compiler read 6.17, from `sigKeyOfTy` and
+// `structIndexOfTypeName` re-deriving the callee's key per call where the type-registry
+// generation memo answers it once.
+axis(
+  "signature width x calls",
+  4.3,
+  "`sigKeyOfTy` or `structIndexOfTypeName` (compiler/emit_classify.vl) is re-deriving per call instead of reading its `tyRegGenNow` memo.",
+  (d) => twoFiles(d, genSigWidthCalls(2000, 64, true), genSigWidthCalls(2000, 64, false)),
 );
 
 // D2150's pair: a registry lookup that scans every registered set made the many arm

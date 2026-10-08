@@ -194,6 +194,7 @@ import {
   nodeTyPrimName,
   nodeTyReachesMap,
   nodeTyWidenedRepName,
+  nodeTyWrites,
   nodeUnionName,
   nodeUnwidenedTyOf,
   nomErasedTyIx,
@@ -750,6 +751,8 @@ import {
   startStmts,
   topFnNodes,
   topFnOrd,
+  tyRegNoteWrite,
+  tyRegWrites,
   uDeclared,
   uFieldCount,
   uFieldElemKeyKind,
@@ -11598,6 +11601,7 @@ export function setSFieldElemRowTy(ix: i32, tyIx: i32): i32 {
   if ix < 0 { return 0 }
   while sFieldElemTyIx.length <= ix { sFieldElemTyIx.push(-1) }
   sFieldElemTyIx[ix] = tyIx
+  tyRegNoteWrite()
   0
 }
 
@@ -11605,6 +11609,7 @@ export function setUFieldElemRowTy(ix: i32, tyIx: i32): i32 {
   if ix < 0 { return 0 }
   while uFieldElemTyIx.length <= ix { uFieldElemTyIx.push(-1) }
   uFieldElemTyIx[ix] = tyIx
+  tyRegNoteWrite()
   0
 }
 
@@ -21941,6 +21946,21 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
 // object-shape name (`{x:i32,y:i32}`) matched by field-name SET against the interned shapes
 // (the anonymous literals interned the same sets). -1 if neither.
 export function structIndexOfTypeName(name: string) {
+  const gen = tyRegGenNow()
+  const hit = sitnMemo[name]
+  if hit != null {
+    if hit[0] == gen { return hit[1] }
+  }
+  const si = structIndexOfTypeNameGo(name)
+  sitnMemo[name] = [gen, si]
+  si
+}
+
+// `structIndexOfTypeName`'s answers by name, each stamped with the `tyRegGenNow` read before
+// computing it.
+let sitnMemo: {[string]: i32[]} = Map()
+
+function structIndexOfTypeNameGo(name: string) {
   const si = structIndexByName(name)
   if si >= 0 { return si }
   // Only a single shape spanning the whole name is a bare struct — a composite (`{…}|null`,
@@ -46775,6 +46795,74 @@ function fnRetEmitName(ty: i32): string {
 
 export function sigKeyOfTy(funcTyIx: i32): string {
   if funcTyIx < 0 { return "" }
+  const gen = tyRegGenNow()
+  while sktGen.length <= funcTyIx {
+    sktGen.push(-1)
+    sktKey.push("")
+  }
+  if sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }
+  const k = sigKeyOfTyGo(funcTyIx)
+  sktGen[funcTyIx] = gen
+  sktKey[funcTyIx] = k
+  k
+}
+
+// `sigKeyOfTy`'s answers by type id, each stamped with the `tyRegGenNow` read before computing it.
+let sktGen: i32[] = []
+let sktKey: string[] = []
+
+// The type-registry generation: it moves when anything type-name or signature resolution reads
+// may have changed: a table grows, a row or node type is rewritten in place, a type mutates, a
+// pass or the arena moves. A memo stamped with the value at the start of its computation
+// therefore cannot answer from inputs that changed since, including ones that computation changed.
+let trgGen = 0
+let trgStamp: i32[] = []
+
+export function tyRegMemoReset() {
+  trgGen = trgGen + 1
+  trgStamp = []
+  sitnMemo = Map()
+  sktGen = []
+  sktKey = []
+  0
+}
+
+export function tyRegGenNow(): i32 {
+  while trgStamp.length < 21 { trgStamp.push(-1) }
+  let moved = trgMoved(0, emitPassGen)
+  moved = trgMoved(1, tyMutEpoch) || moved
+  moved = trgMoved(2, T.tys.length) || moved
+  moved = trgMoved(3, P.nodes.length) || moved
+  moved = trgMoved(4, arenaEpochNow()) || moved
+  moved = trgMoved(5, arenaRefWritesNow()) || moved
+  moved = trgMoved(6, cUserTypesVer) || moved
+  moved = trgMoved(7, nodeTyWrites) || moved
+  moved = trgMoved(8, msGen) || moved
+  moved = trgMoved(9, tyRegWrites) || moved
+  moved = trgMoved(10, sNames.length) || moved
+  moved = trgMoved(11, sFieldCount.length) || moved
+  moved = trgMoved(12, sFieldNames.length) || moved
+  moved = trgMoved(13, sFieldElemName.length) || moved
+  moved = trgMoved(14, sTyIx.length) || moved
+  moved = trgMoved(15, unNames.length) || moved
+  moved = trgMoved(16, uVariants.length) || moved
+  moved = trgMoved(17, uFieldCount.length) || moved
+  moved = trgMoved(18, uFieldElemName.length) || moved
+  moved = trgMoved(19, mvValKind.length) || moved
+  moved = trgMoved(20, rlElemName.length) || moved
+  if moved { trgGen = trgGen + 1 }
+  trgGen
+}
+
+// Whether stamp `i` differs from `v`, recording `v`. Every stamp is non-negative, so the
+// initial -1 always differs.
+function trgMoved(i: i32, v: i32): boolean {
+  if trgStamp[i] == v { return false }
+  trgStamp[i] = v
+  true
+}
+
+function sigKeyOfTyGo(funcTyIx: i32): string {
   const t = T.tys[funcTyIx]
   if !(t is TyFunc) { return "" }
   let key = ""
