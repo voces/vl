@@ -2,8 +2,10 @@
 //
 // A trap frame is an offset plus a name-section string — `0x118 - vl!boom@3` — and a
 // name-section string can only be per FUNCTION, so the `@3` is where `boom` was DECLARED.
-// The emitter's `vl-src` custom section carries one row per body and per statement over the
-// same module bytes, and a host joins the frame's byte offset against it.
+// The emitter's `vl-src` custom section carries one row per body, per statement and per
+// element read over the same module bytes, and a host joins the frame's byte offset against
+// it. The narrowest row wins, so an out-of-bounds read names its own column, and every frame
+// names its file, a single-file program's included (sunpa's diagnostics D).
 //
 // ONE EXPECTED BLOCK GRADES BOTH HOSTS, which is the point of this file's shape. The native
 // host reads the section in Rust and the Deno host in TypeScript, and two readers of one
@@ -114,7 +116,32 @@ Deno.test({
         "print(xs[9])",
         "",
       ].join("\n"),
-    }, "m.vl", ["at 5:1  in `__start__`"], "module scope"),
+    }, "m.vl", ["at m.vl:5:7  in `__start__`"], "module scope"),
+});
+
+Deno.test({
+  name: "an out-of-bounds read names its own column, the inner one of a nested read, in both hosts",
+  ignore: !ENABLED,
+  fn: async () => {
+    // `a[b[i]]` at columns 38 (`a`) and 40 (`b`): with `i = 2` the inner read is in range and
+    // the outer one (`a[9]`) traps; with `i = 5` the inner one does. The statement starts at 27.
+    const src = (i: number) =>
+      [
+        "const a = [10, 20, 30]",
+        "const b = [0, 1, 9]",
+        "function f(i: i32): i32 { return 1 + a[b[i]] }",
+        `print(f(${i}))`,
+        "",
+      ].join("\n");
+    await bothHosts({ "n.vl": src(2) }, "n.vl", [
+      "at n.vl:3:38  in `f`",
+      "at n.vl:4:1  in `__start__`",
+    ], "outer read");
+    await bothHosts({ "n.vl": src(5) }, "n.vl", [
+      "at n.vl:3:40  in `f`",
+      "at n.vl:4:1  in `__start__`",
+    ], "inner read");
+  },
 });
 
 Deno.test({
@@ -138,8 +165,8 @@ Deno.test({
         "",
       ].join("\n"),
     }, "m.vl", [
-      "at 7:3  in `boom`",
-      "at 11:1  in `__start__`",
+      "at m.vl:7:3  in `boom`",
+      "at m.vl:11:1  in `__start__`",
     ], "inside a function"),
 });
 
@@ -167,9 +194,9 @@ Deno.test({
         "",
       ].join("\n"),
     }, "m.vl", [
-      "at 7:11  in `f`",
-      "at 10:3  in `outer`",
-      "at 13:1  in `__start__`",
+      "at m.vl:7:15  in `f`",
+      "at m.vl:10:3  in `outer`",
+      "at m.vl:13:1  in `__start__`",
     ], "inside a lifted lambda"),
 });
 
