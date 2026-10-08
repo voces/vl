@@ -87,3 +87,4 @@ D3800-D3802  lane-DG  2026-10-07  redundant-annotation hint at a `??` default (D
 D3803-D3807  lane-PF  2026-10-07  sunpa per-frame allocation (item c): D3803 filed and closed; D3804 (list vectors, needs design), D3805 (for-in over a literal) filed open
 D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D3800 closed); D3811, D3812 filed open
 D3855-D3864  lane-SC  2026-10-08  alias residue: D3855-D3858 filed and closed; D3859 filed and closed with D3865; D3860 filed and closed; D3861 filed open; D3862 filed and closed; D3863 filed and closed; D3864 free
+D3869-D3875  lane-SC  2026-10-08  D3869 filed and closed, D3870 filed open; D3871-D3875 for D3866-D3868, D3861, D3827, D3853
