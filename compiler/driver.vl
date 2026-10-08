@@ -8,6 +8,14 @@ import {
   cpAccTake,
   pushCps,
 } from "./strutil"
+import {
+  mimpAddExport,
+  mimpBegin,
+  mimpExportedByNote,
+  mimpNearMisses,
+  mimpNoteMoved,
+  mimpSpecsFor,
+} from "./missing_import"
 // The source-in / bytes-out driver — the interface `scripts/vl-host` embeds against.
 // A real `import`/`export` module that imports the pipeline (lexer → ast → parser →
 // typecheck → wasmEmit → lint → format) and exposes the host ABI
@@ -2978,7 +2986,7 @@ export function diagEndCol(i: i32): i32 {
 // carries "unsupported-lowering" when the program is type-valid but uses a
 // construct codegen cannot lower yet, so tooling can tell an emitter-capability
 // rejection from a soundness verdict. Parse and emit diagnostics carry "".
-function vcDiagCode(i: i32): string {
+export function vcDiagCode(i: i32): string {
   if i < P.diags.length { return "" }
   const j = i - P.diags.length
   if j < T.diags.length { return T.diags[j].tcode }
@@ -2991,7 +2999,7 @@ export function diagCodeByte(i: i32, j: i32): i32 { vcDiagCode(i)[j] }
 // the coded-diagnostic ABI. The code names a bare category (`ufcs-not-imported`)
 // and this carries what that category needs, netstring-encoded so no value's
 // characters can bite the framing (`typecheck.diagDataField` documents it).
-function vcDiagData(i: i32): string {
+export function vcDiagData(i: i32): string {
   if i < P.diags.length { return "" }
   const j = i - P.diags.length
   if j < T.diags.length { return T.diags[j].tdata }
@@ -4159,7 +4167,7 @@ function modVisit(m: i32, depth: i32): i32 {
                   + "\" is not exported by \""
                   + spec
                   + "\""
-                  + modBuiltinImportNote(impName[i]),
+                  + modNotExportedNote(m, d, impName[i], spec),
               )
             } else {
               modDiagDupImport(m, i, d, spec)
@@ -4174,6 +4182,55 @@ function modVisit(m: i32, depth: i32): i32 {
   modOrder.push(m)
   0
 }
+// The tail of the not-exported refusal for `name` imported by module `m` from module `d`
+// as `spec`: the builtin note, else the modules that do export it, else `d`'s near misses.
+// One exporter is recorded for `check --fix`, which moves the name to that module's import.
+function modNotExportedNote(
+  m: i32,
+  d: i32,
+  name: string,
+  spec: string,
+): string {
+  const builtin = modBuiltinImportNote(name)
+  if builtin != "" { return builtin }
+  const specs = mimpSpecsFor(name, m, d)
+  if specs.length > 0 {
+    if specs.length == 1 { mimpNoteMoved(m, name, spec, specs[0]) }
+    return mimpExportedByNote(name, specs, m)
+  }
+  const near = mimpNearMisses(name, d)
+  if near.length == 0 { return "" }
+  let out = " — did you mean `" + near[0] + "`"
+  let i = 1
+  while i < near.length {
+    if i == near.length - 1 { out = out + " or `" } else { out = out + ", `" }
+    out = out + near[i] + "`"
+    i = i + 1
+  }
+  out + "?"
+}
+
+// Fills the missing-import index for this graph, once, before any diagnostic can ask it.
+// A re-export joins only when its origin exports no such name, i.e. under a new name;
+// otherwise it names a declaration already indexed, and the declaring module is the answer.
+function modMissingImportIndex() {
+  mimpBegin(modKeys, impMod, impKey, impSpec)
+  let e = 0
+  while e < expMod.length {
+    mimpAddExport(expName[e], expMod[e])
+    e = e + 1
+  }
+  let r = 0
+  while r < reExpMod.length {
+    const origin = modIndexOfKey(reExpKey[r])
+    if origin < 0 || !modExportsHas(origin, reExpPublic[r]) {
+      mimpAddExport(reExpPublic[r], reExpMod[r])
+    }
+    r = r + 1
+  }
+  0
+}
+
 // The tail of the not-exported refusal when the name is a builtin, which no module exports
 // because every module already sees it (D3621); "" for any other name.
 function modBuiltinImportNote(name: string): string {
@@ -4199,6 +4256,7 @@ function modCompile(emit: i32): i32 {
     modState.push(0)
     s = s + 1
   }
+  modMissingImportIndex()
   modVisit(0, 0)
   if modDiags.length > 0 {
     // Tokenless (no tokens are loaded yet): position, span + owner ride the

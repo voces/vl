@@ -648,7 +648,11 @@ hints only for the file(s) you name, unless asked for (below).
   {c}--fix{r}               Apply safe autofixes, writing files in place:
                       `let` -> `const`, redundant type annotations, and unused
                       imports (a whole import only from std:, since dropping
-                      your own module would skip its top-level code). Runs in
+                      your own module would skip its top-level code), and the
+                      import an error names when exactly one module exports
+                      the name (an undeclared name, a method not imported, a
+                      name imported from a module that does not export it).
+                      Runs in
                       rounds until nothing is left to fix (at most 10), since
                       one fix can expose another. Every round is compiled
                       first, and an edit that stops the file building is

@@ -382,6 +382,7 @@ import {
   stdRecvSpec,
   stdRecvTparams,
 } from "./std_receivers"
+import { mimpClear, mimpExportedByNote, mimpSpecsFor } from "./missing_import"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -528,8 +529,12 @@ const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
 // D1230 — a bare category code whose answer rides the data channel
 // (`ufcsNotImportedData`): `member` (the property as written), `modules` (one field per
 // candidate module, spelled as the file can write it today, dependency-first, deduplicated)
-// and `recv` (the receiver type, demangled). A quick-fix reads the keys, never the sentence.
+// `recv` (the receiver type, demangled) and `alias` when the import needs one. A fix reads the keys.
 const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
+
+// An undeclared name some module of the program or of std exports. Its answer rides the
+// data channel as `ufcs-not-imported`'s does: `member` and one `modules` field per exporter.
+const CODE_MISSING_IMPORT = "missing-import"
 
 // D1570 — the name is a function in scope and is not a method. Its answer rides the data
 // channel under `member`, `recv`, `reason` (`self-name` / `arity` / `receiver`: which gate
@@ -5202,6 +5207,7 @@ function jwReset() {
 // scope. Call once before checking: `checkProgram` assumes it, and this is the only reset
 // surface, so a new checker module table belongs here and nowhere else.
 export function initChecker() {
+  mimpClear()
   jwReset()
   redunReset()
   rcoalReset()
@@ -41148,6 +41154,23 @@ function stdFmtMovedNote(name: string) {
   ""
 }
 
+// Raises the undeclared-name error at `ix` naming the modules that export `name`, under
+// `missing-import`; false, raising nothing, when no module of the program or of std does.
+function undeclaredImportRaise(name: string, ix: i32): boolean {
+  const from = ufcsModOfNode(ix)
+  const specs = mimpSpecsFor(name, from, -1)
+  if specs.length == 0 { return false }
+  let data = diagDataField("member", name)
+  for s in specs { data = data + diagDataField("modules", s) }
+  tErrCodedData(
+    "undeclared identifier '" + name + "'" + mimpExportedByNote(name, specs, from),
+    ix,
+    CODE_MISSING_IMPORT,
+    data,
+  )
+  true
+}
+
 // Raises the member arm's sentence at node `ix` — `memberFloorMsg`'s words, unless the call
 // site banked a missing-import answer for this node, in which case D1230's sentence and its
 // `ufcs-not-imported` code replace them. One home for the raise, since `checkMemberNode`
@@ -41155,16 +41178,12 @@ function stdFmtMovedNote(name: string) {
 function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   const specs = ufcsMissSpecsAt(ix)
   if specs != "" {
+    const alias = ufcsImportAliasAt(ix, prop, objTy)
     return tErrCodedData(
-      ufcsNotImportedMsg(
-        prop,
-        specs,
-        objTy,
-        ufcsImportAliasAt(ix, prop, objTy),
-      ),
+      ufcsNotImportedMsg(prop, specs, objTy, alias),
       ix,
       CODE_UFCS_NOT_IMPORTED,
-      ufcsNotImportedData(prop, specs, objTy),
+      ufcsNotImportedData(prop, specs, objTy, alias),
     )
   }
   // The name is a function in scope that is not a method. Second, so D1230 keeps winning
@@ -41378,11 +41397,12 @@ function ufcsMissRaise(
 ): boolean {
   const specs = ufcsMissingImportSpecs(prop, recvTy, argc, ix)
   if specs != "" {
+    const alias = ufcsImportAliasAt(ix, prop, recvTy)
     tErrCodedData(
-      ufcsNotImportedMsg(prop, specs, recvTy, ufcsImportAliasAt(ix, prop, recvTy)),
+      ufcsNotImportedMsg(prop, specs, recvTy, alias),
       memIx,
       CODE_UFCS_NOT_IMPORTED,
-      ufcsNotImportedData(prop, specs, recvTy),
+      ufcsNotImportedData(prop, specs, recvTy, alias),
     )
     return true
   }
@@ -41404,7 +41424,12 @@ function ufcsMissRaise(
 // `specs` arrives `,`-joined and is split back into one `modules` field per specifier.
 // Demangles its own receiver, since the message is demangled downstream once for every
 // diagnostic while the data never passes through that renderer — a quick-fix would otherwise read a mangled name no source file contains.
-function ufcsNotImportedData(prop: string, specs: string, objTy: i32) {
+function ufcsNotImportedData(
+  prop: string,
+  specs: string,
+  objTy: i32,
+  alias: string,
+) {
   let out = diagDataField("member", prop)
   let start = 0
   let i = 0
@@ -41416,7 +41441,9 @@ function ufcsNotImportedData(prop: string, specs: string, objTy: i32) {
     i = i + 1
   }
   out = out + diagDataField("modules", specs.slice(start, specs.length))
-  out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
+  out = out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
+  if alias != "" { out = out + diagDataField("alias", alias) }
+  out
 }
 
 // The merged spelling of plain `name` that `fnDeclIx` is keyed on, or "". A merge renames
@@ -54930,13 +54957,9 @@ function checkNodeReal(ix: i32) {
         )
         return TY_ERR
       }
-      tErr(
-        "undeclared identifier '"
-          + n.identName
-          + "'"
-          + stdFmtMovedNote(n.identName),
-        ix,
-      )
+      const moved = stdFmtMovedNote(n.identName)
+      if moved == "" && undeclaredImportRaise(n.identName, ix) { return TY_ERR }
+      tErr("undeclared identifier '" + n.identName + "'" + moved, ix)
       return TY_ERR
     }
     // `ty` is this use's type as the checker resolved it — narrowed when the use
