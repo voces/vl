@@ -1065,6 +1065,8 @@ let ovDepFns: i32[] = []
 let ovFnValIx: i32[] = []
 let ovFnValDecl: i32[] = []
 let ovFnValName: string[] = []
+// The element type a named `map`/`filter` callback is typed by, keyed on its `Ident` node.
+let ovCbElem: {[i32]: i32} = Map()
 // The function declaration whose own body is being checked, -1 at module scope; a lambda's.
 let curFnDeclIx = -1
 
@@ -5429,6 +5431,7 @@ export function initChecker() {
   ovFnValIx = []
   ovFnValDecl = []
   ovFnValName = []
+  ovCbElem = Map()
   curFnDeclIx = -1
   ufcsMissAt = []
   ufcsMissSpecs = []
@@ -48277,6 +48280,8 @@ function checkMemberCallNode(
       // un-annotated function-literal argument infers its param instead of erroring — only
       // when the arg is an anonymous literal and the element type is known, else cleared below.
       const cbArg = P.nodes[cargs[0]]
+      // A named callback is typed by the element, which a refused function value names.
+      if cbArg is Ident && ovSetMod.length > 0 { ovCbElem[cargs[0]] = rt.aElem }
       if cbArg is FuncDecl {
         if cbArg.fnName == "" && rt.aElem >= 0 {
           recordCbExpected(cargs[0], [rt.aElem])
@@ -57499,15 +57504,50 @@ function ovUnpinnedReport() {
           + nm
           + "` cannot be used as a function value: its body calls an overloaded method on a receiver each call of `"
           + nm
-          + "` supplies, and a function value makes an instance no call picks for — pass a lambda whose parameter is annotated, `(x: T) => "
-          + nm
-          + "(x)`",
+          + "` supplies, and a function value makes an instance no call picks for — "
+          + ovFnValFix(ovFnValIx[i], nm),
         ovFnValIx[i],
       )
     }
     i = i + 1
   }
   0
+}
+
+// The spelling a refused function value can take instead: a lambda annotated at the concrete
+// parameter types the value is used at, else (still generic there) a direct call.
+function ovFnValFix(ix: i32, nm: string): string {
+  const fallback = "annotate it where its parameter types are concrete, or call `"
+    + nm
+    + "` directly"
+  const el = ovCbElem[ix] ?? -1
+  if el >= 0 && !tyHasHole(el) && !tyHasTyVar(el) {
+    return "pass a lambda, `(x: " + tyToStrUser(el) + ") => " + nm + "(x)`"
+  }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 || ty >= T.tys.length { return fallback }
+  const ft = T.tys[ty]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length == 0 { return fallback }
+    let ps = ""
+    let as = ""
+    let k = 0
+    while k < ft.fnParamTypes.length {
+      const pt = ft.fnParamTypes[k]
+      if pt < 0 || tyHasHole(pt) || tyHasTyVar(pt) { return fallback }
+      let v = "x"
+      if ft.fnParamTypes.length > 1 { v = "x" + i32ToStr(k) }
+      if k > 0 {
+        ps = ps + ", "
+        as = as + ", "
+      }
+      ps = ps + v + ": " + tyToStrUser(pt)
+      as = as + v
+      k = k + 1
+    }
+    return "pass a lambda, `(" + ps + ") => " + nm + "(" + as + ")`"
+  }
+  fallback
 }
 
 // A function name read as a value (not called), kept for `ovUnpinnedReport`.
