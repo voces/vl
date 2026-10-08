@@ -40897,7 +40897,9 @@ function storageListBody(srcIx: i32, got: i32, want: i32): string {
       + " here: `u8` is a storage type, so a generic's `T` is never `u8`. "
     if fillIsLitZero(fill) {
       const call = parenPeelIx(srcIx)
-      if !i32ListHas(zeroBytesFixIx, call) { zeroBytesFixIx.push(call) }
+      if zeroBytesNameFree(call) && !i32ListHas(zeroBytesFixIx, call) {
+        zeroBytesFixIx.push(call)
+      }
       return lead + "For zeroed bytes use " + make
     }
     return lead + "Make the bytes with " + make + ", and fill it by a loop"
@@ -40961,20 +40963,68 @@ function storageFilledFill(ix: i32) {
   cn.callArgs[1]
 }
 
-// Whether `ix` is the literal `0`, bare or converted with `as`.
+// Whether no binding named `zeroBytes` but an import of `std:bytes`'s exists anywhere in the
+// module of node `at`, so rewriting a call there to `zeroBytes(n)` cannot reach another one.
+// A file scan rather than the scope chain: a module binding declared later is not yet in scope.
+function zeroBytesNameFree(at: i32): boolean {
+  const m = rcwModOf(at)
+  if m < 0 { return false }
+  const zb = "zeroBytes"
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let hit = false
+    if n is LetDecl {
+      hit = demangleName(n.letName) == zb
+    } else if n is FuncDecl {
+      hit = demangleName(n.fnName) == zb
+    } else if n is Param {
+      hit = demangleName(n.parName) == zb
+    } else if n is ForRange {
+      hit = demangleName(n.frVar) == zb
+    } else if n is ForIn {
+      hit = demangleName(n.fiVar) == zb || demangleName(n.fiVar2) == zb
+    } else if n is ImportDecl {
+      hit = n.impPath != "std:bytes" && strListHas(n.impLocals, zb)
+    }
+    if hit && rcwModOf(i) == m { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Whether `ix` is a zero integer literal (`0`, `00`, `0x0`, `-0`), bare or converted with `as`.
 function fillIsLitZero(ix: i32): boolean {
   const x = parenPeelIx(ix)
   if x < 0 || x >= P.nodes.length { return false }
   const n = P.nodes[x]
   if n is AsExpr { return fillIsLitZero(n.asObj) }
+  if n is Unary {
+    if n.unOp == "-" || n.unOp == "+" { return fillIsLitZero(n.unArg) }
+    return false
+  }
   numLitIsZero(x)
 }
 
-// Whether node `x` is the number literal `0`.
+// Whether node `x` is an integer number literal whose value is zero, in any base.
 function numLitIsZero(x: i32): boolean {
   const n = P.nodes[x]
-  if n is NumLit { return n.numText == "0" }
-  false
+  if !(n is NumLit) { return false }
+  const t = n.numText
+  let i = 0
+  if t.length > 0 && t[0] == '-' { i = 1 }
+  if t.length > i + 2 && t[i] == '0' {
+    const b = t[i + 1]
+    if b == 'x' || b == 'X' || b == 'b' || b == 'B' || b == 'o' || b == 'O' {
+      i = i + 2
+    }
+  }
+  if i >= t.length { return false }
+  while i < t.length {
+    if t[i] != '0' && t[i] != '_' { return false }
+    i = i + 1
+  }
+  true
 }
 
 // Whether an accepted assignment of right side `rhs`, a `rt` value, into a place of type
@@ -41108,16 +41158,18 @@ function annotTyStr(want: i32, annIx: i32) {
 // A builtin method argument's sentence, in one home because the arm and the pin
 // (`validateBmCstrs`) both have to say it and must not drift. `ctx` is the type a form
 // needs that is neither side of the comparison (the receiver array; the other bound of a string `slice`).
+// `bmArgMsg`'s `push` refusal, whose storage-list note names the pushed value `src` when known.
+function bmPushMsg(label: string, got: i32, want: i32, ctx: i32, src: i32) {
+  label
+    + ": cannot add "
+    + tyToStr(got)
+    + " to "
+    + tyToStr(ctx)
+    + boolForNumberNote(got, want)
+    + storageListNote(src, got, want)
+}
 function bmArgMsg(form: i32, label: string, got: i32, want: i32, ctx: i32) {
-  if form == BM_PUSH {
-    return label
-      + ": cannot add "
-      + tyToStr(got)
-      + " to "
-      + tyToStr(ctx)
-      + boolForNumberNote(got, want)
-      + storageListNote(-1, got, want)
-  }
+  if form == BM_PUSH { return bmPushMsg(label, got, want, ctx, -1) }
   if form == BM_SETVAL || form == BM_SETKEY || form == BM_ADDKEY {
     return label
       + ": expected "
@@ -48381,7 +48433,7 @@ function checkMemberCallNode(
               // re-encodes into an `f32` element exactly as it does at a binding, and defers to
               // the pin when a side is a hole (D582).
               if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi]) {
-                tErr(bmArgMsg(BM_PUSH, "push", pat, rt.aElem, recvTy), ix)
+                tErr(bmPushMsg("push", pat, rt.aElem, recvTy, margs[mi]), ix)
               }
             }
           }
