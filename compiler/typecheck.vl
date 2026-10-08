@@ -27320,6 +27320,60 @@ export function structNameOfTy(ty: i32): string {
   ""
 }
 
+// Whether `ty` holds a record whose emit render two differently-named declared records share,
+// so the render alone cannot name the declaration. `skipTop` exempts `ty` itself, for a caller
+// that names it by its declaration. Depth-bounded; false at the floor.
+export function tyHoldsSharedRecordRender(
+  ty: i32,
+  skipTop: boolean,
+  depth: i32,
+): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyObj => {
+      if !skipTop {
+        const r = tyToEmitName(ty)
+        let named = ""
+        let i = 0
+        while i < cStructTyIxs.length {
+          if tyToEmitName(cStructTyIxs[i]) == r {
+            if named != "" && named != cStructNames[i] { return true }
+            named = cStructNames[i]
+          }
+          i = i + 1
+        }
+      }
+      for ft in t.objFieldTypes {
+        if tyHoldsSharedRecordRender(ft, false, depth - 1) { return true }
+      }
+    }
+    TyArray => {
+      return tyHoldsSharedRecordRender(t.aElem, false, depth - 1)
+    }
+    TyNullable => {
+      return tyHoldsSharedRecordRender(t.nInner, false, depth - 1)
+    }
+    TyMap => {
+      return tyHoldsSharedRecordRender(t.mKey, false, depth - 1)
+        || tyHoldsSharedRecordRender(t.mVal, false, depth - 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyHoldsSharedRecordRender(m, false, depth - 1) { return true }
+      }
+    }
+    TyFunc => {
+      for pt in t.fnParamTypes {
+        if tyHoldsSharedRecordRender(pt, false, depth - 1) { return true }
+      }
+      return tyHoldsSharedRecordRender(t.fnRet, false, depth - 1)
+    }
+    TyPrim | TyErr | TyLit | TyNeg | TyVar => {}
+  }
+  false
+}
+
 // The declared alias name of declared-union arena index `ty` (`type U = A | B` → "U"), or
 // "" when `ty` is not a registered union alias — `litUnionAliasNameOfTy`'s index-match leg,
 // generalized to value unions.
@@ -44316,6 +44370,17 @@ function argIsOwnGenericFnValue(argIx: i32): boolean {
   false
 }
 
+// `params` without its first entry: a member call's argument list starts after `self`.
+function paramsAfterFirstTy(params: i32[]): i32[] {
+  const out: i32[] = []
+  let i = 1
+  while i < params.length {
+    out.push(params[i])
+    i = i + 1
+  }
+  out
+}
+
 // The order `checkCall` checks a call's arguments in: source order, except that a function
 // with an open parameter whose arrow position rides a type variable goes after the rest, so
 // the variable binds from the values and never to the function's own hole. A variable only in
@@ -47866,8 +47931,14 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         )
       }
     }
-    let i = 0
-    while i < args.length {
+    // The direct call's order and seed (`checkCallNode`): a lambda whose parameter meets a hole
+    // is checked after the other arguments, against its parameter under the receiver's binding
+    // and theirs, so `xs.sort((a, b) => …)` types `a` as `sort(xs, (a, b) => …)` does.
+    const uOrder = lambdaLastOrder(paramsAfterFirstTy(params), args)
+    let oi = 0
+    while oi < uOrder.length {
+      const i = uOrder[oi]
+      seedExpected(args[i], substTyDeep(params[i + 1], bNames, bTys))
       const at = checkNode(args[i])
       bindGenWalk(params[i + 1], at, bNames, bTys)
       const expected = substTyDeep(params[i + 1], bNames, bTys)
@@ -47891,7 +47962,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         // never at the call node — see `argMismatchErr`.
         argMismatchErr(i + 1, expected, at, args[i])
       }
-      i = i + 1
+      oi = oi + 1
     }
     if uDst.length > 0 && !inferQuiet {
       dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)

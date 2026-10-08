@@ -108,6 +108,7 @@ import {
   tyFieldTyOf,
   tyHasTyVar,
   tyHasTyVarWasCapped,
+  tyHoldsSharedRecordRender,
   tyIsGradualUnion,
   tyIsLitUnion,
   tyIsLitUnionArray,
@@ -10222,6 +10223,83 @@ function monoAssignedPeerFe(fe: i32) {
   peer
 }
 
+// Instantiate the un-annotated lambda in slot `fe` at the concrete parameter types the checker
+// recorded for it (a callback's contextual type), so a generic its body calls is pinned there
+// rather than at the hole's default (D3820). 0 when it declines, -1 on a failed mint.
+function monoPinLamFromCheckedTy(fe: i32) {
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if !monoSubtreeCallsGeneric(fn.fnBody, fnStmts[fe], 0) { return 0 }
+    const tys = monoFnValueParamTys(nodeTyIxOf(fnStmts[fe]), fn.fnParams.length)
+    if tys.length == 0 || tys.length != fn.fnParams.length { return 0 }
+    const pins: string[] = []
+    let i = 0
+    while i < tys.length {
+      // A declared record pins by its name, as its annotation would: two records of one shape
+      // render alike, and a `self`-function overloaded on them picks by the name. One nested
+      // below the top has no such name, so that lambda keeps the template path.
+      const sn = structNameOfTy(tys[i])
+      if !monoLamPinTyPlain(tys[i], 8) { return 0 }
+      if tyHoldsSharedRecordRender(tys[i], sn != "", 8) { return 0 }
+      const nm = if sn != "" { sn } else { tyToEmitName(tys[i]) }
+      if nm == "" { return 0 }
+      pins.push(nm)
+      i = i + 1
+    }
+    return monoInstanceFor(fe, pins, fnStmts[fe], -1)
+  }
+  0
+}
+
+// Whether `ty` is a primitive, a record, or a list of those: the types whose name alone is
+// the pin. A literal union, a value union, a nullable or a function value carries a rep the
+// name does not, so a lambda at one keeps the template path.
+function monoLamPinTyPlain(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyPrim | TyObj => {
+      return true
+    }
+    TyArray => {
+      return monoLamPinTyPlain(t.aElem, depth - 1)
+    }
+    TyLit | TyUnion | TyNullable | TyFunc | TyMap | TyVar | TyNeg | TyErr => {}
+  }
+  false
+}
+
+// Whether the subtree at `ix`, read in frame `ctx`, calls a named generic or hole function by
+// name. A nested function is its own slot and is not entered. False past the depth floor.
+function monoSubtreeCallsGeneric(ix: i32, ctx: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 256 { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      const fe = fnIndexOfInScopeAt(
+        sidOfNode(n.callFn),
+        cf.identName,
+        ctx,
+        n.callFn,
+      )
+      if (
+        fe >= 0
+        && fe < monoGen.length
+        && monoGen[fe] == 1
+        && !criFnIsAnonLambda(fe)
+      ) {
+        return true
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if monoSubtreeCallsGeneric(k, ctx, depth + 1) { return true }
+  }
+  false
+}
+
 // The concrete parameter spellings a lifted slot's declaration carries, appended to `out`
 // — an instance's pins, read the way `monoPinnedSigsOf` reads them, with `"i32"` for the
 // hole a count-0 all-i32 clone deliberately leaves un-annotated. false when the slot is
@@ -10378,6 +10456,9 @@ export function monomorphize(stmts: i32[]) {
               }
             }
           }
+        }
+        if !monoInstantiatedAny(fe3) {
+          if monoPinLamFromCheckedTy(fe3) < 0 { return -1 }
         }
         // `monoInstanceFor` declines silently on a boundary it cannot reproduce, so the
         // walk is gated on the outcome rather than on having tried — a declined pin
