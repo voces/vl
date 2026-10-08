@@ -81,6 +81,11 @@ import {
 } from "./emit_bytes"
 import {
   W,
+  aTypeIdx,
+  aUsed,
+  ba8TypeIdx,
+  ba8Used,
+  bl8TypeIdx,
   emitErr,
   emitErrAt,
   emitFnSpanEnd,
@@ -96,12 +101,31 @@ import {
   gEmitSrcMap,
   globalNames,
   globalStmts,
+  lTypeIdx,
+  lUsed,
   localNames,
+  mStructIdx,
+  mUsed,
+  mkArrIdx,
+  mkListIdx,
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
   reExpName,
   reExpTarget,
+  rlBackIdx,
+  rlElemName,
+  rlWrapIdx,
+  sBackIdx,
+  sDeclared,
+  sHeapIdx,
+  sNames,
+  sTypeIdx,
+  slUsed,
+  uBoxIdx,
+  uDeclared,
+  uVarHeap,
+  uVariants,
 } from "./emit_state"
 
 import { extCollect } from "./extents"
@@ -217,7 +241,7 @@ import {
   sidOf,
   sidReset,
 } from "./symbols"
-import { nameIdentChar, skipQuotedName } from "./tyname"
+import { demangleSpelling, nameIdentChar, skipQuotedName } from "./tyname"
 import {
   T,
   canonRestoreSpellings,
@@ -2906,6 +2930,90 @@ function emitFnSpanName(i: i32): string {
   ""
 }
 
+// The VL type wasm heap type `idx` of the module just emitted represents, or "" when it is
+// not one this names (a function type, a closure environment) or when several VL types share
+// it. A runtime rep shared by several VL types is named by its rep, never by one of its users.
+function emitTypeLabel(idx: i32): string {
+  if idx < 0 { return "" }
+  const named = emitTypeLabelNamed(idx)
+  if named != "" { return named }
+  if uDeclared && idx == uBoxIdx { return "union box" }
+  if aUsed {
+    if idx == sTypeIdx { return "string" }
+    if idx == sBackIdx { return "string bytes" }
+    if idx == aTypeIdx { return "i32 array (list and map storage)" }
+  }
+  if lUsed && idx == lTypeIdx { return "list of i32-represented elements" }
+  if ba8Used {
+    if idx == bl8TypeIdx { return "u8[]" }
+    if idx == ba8TypeIdx { return "u8[] storage" }
+  }
+  if slUsed || mUsed {
+    if idx == mkListIdx { return "string list" }
+    if idx == mkArrIdx { return "string list storage" }
+  }
+  if mUsed && idx == mStructIdx { return "string-keyed map or set" }
+  ""
+}
+
+// The one VL name a declared struct, union variant or ref-list slot gives heap type `idx`, or
+// "" when none does or two distinct names share it (a struct and its twins share one heap type).
+function emitTypeLabelNamed(idx: i32): string {
+  let found = ""
+  let clash = false
+  if sDeclared {
+    let i = 0
+    while i < sHeapIdx.length && i < sNames.length {
+      if sHeapIdx[i] == idx {
+        const n = demangleSpelling(sNames[i])
+        if found == "" { found = n }
+        else if found != n { clash = true }
+      }
+      i = i + 1
+    }
+  }
+  if uDeclared {
+    let v = 0
+    while v < uVarHeap.length && v < uVariants.length {
+      if uVarHeap[v] == idx {
+        const n = demangleSpelling(uVariants[v])
+        if found == "" { found = n }
+        else if found != n { clash = true }
+      }
+      v = v + 1
+    }
+  }
+  let r = 0
+  while r < rlElemName.length && r < rlWrapIdx.length && r < rlBackIdx.length {
+    if rlWrapIdx[r] == idx || rlBackIdx[r] == idx {
+      let n = emitTypeListOf(demangleSpelling(rlElemName[r]))
+      if rlBackIdx[r] == idx { n = n + " storage" }
+      if found == "" { found = n }
+      else if found != n { clash = true }
+    }
+    r = r + 1
+  }
+  if clash { return "" }
+  found
+}
+
+// The list type of element spelling `el`, parenthesised when it is a union.
+function emitTypeListOf(el: string): string {
+  let i = 0
+  while i < el.length {
+    if el[i] == '|' { return "(" + el + ")[]" }
+    i = i + 1
+  }
+  el + "[]"
+}
+
+export function emitTypeLabelLen(idx: i32): i32 { emitTypeLabel(idx).length }
+export function emitTypeLabelAt(idx: i32, j: i32): i32 {
+  const s = emitTypeLabel(idx)
+  if j >= 0 && j < s.length { return s[j] }
+  0
+}
+
 // The clause a diagnostic puts after "the emitted module failed to validate", for
 // the body at row `i` — "" when no row owns the offset. The host carries the same
 // ladder in Rust (`SpanWhere::what`), since `vl build`/`vl run` never enter the CLI
@@ -2915,16 +3023,19 @@ export function emitFnSpanWhere(i: i32): string {
   if k < 0 { return "" }
   if k == 1 || k == 4 { return " inside the module's top-level code" }
   if k == 2 {
-    return " inside the export wrapper for `" + emitFnSpanName(i) + "`"
+    return " inside the export wrapper for `" + emitFnSpanShown(i) + "`"
   }
   if k == 3 {
-    return " inside the shared runtime helper `" + emitFnSpanName(i) + "`"
+    return " inside the shared runtime helper `" + emitFnSpanShown(i) + "`"
   }
-  " inside `" + emitFnSpanName(i) + "`"
+  " inside `" + emitFnSpanShown(i) + "`"
 }
-export function emitFnSpanNameLen(i: i32): i32 { emitFnSpanName(i).length }
+
+// `emitFnSpanName` as the source spells it: a module merge's `$m1` suffix is not.
+function emitFnSpanShown(i: i32): string { demangleSpelling(emitFnSpanName(i)) }
+export function emitFnSpanNameLen(i: i32): i32 { emitFnSpanShown(i).length }
 export function emitFnSpanNameAt(i: i32, j: i32): i32 {
-  const s = emitFnSpanName(i)
+  const s = emitFnSpanShown(i)
   if j >= 0 && j < s.length { return s[j] }
   0
 }

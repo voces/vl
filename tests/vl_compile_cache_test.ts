@@ -453,6 +453,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   diagModule: "output", diagMsgAt: "output", diagMsgLen: "output", emitFnSpanAt: "output",
   emitFnSpanCol: "output", emitFnSpanKindOf: "output", emitFnSpanLine: "output",
   emitFnSpanModule: "output", emitFnSpanNameAt: "output", emitFnSpanNameLen: "output",
+  emitTypeLabelAt: "output", emitTypeLabelLen: "output",
   heapWindowRead: "output", hostAbi: "output", modCommit: "input", modKey: "input",
   modKeyAtCharAt: "output", modKeyAtLen: "output", modKeyCount: "output",
   modPendingAt: "output", modPendingCount: "output", modPendingLen: "output",
