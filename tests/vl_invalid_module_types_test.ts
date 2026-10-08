@@ -108,20 +108,27 @@ const CASES: Case[] = [
     never: ["$type"],
   },
   {
+    // D3817 is closed, so a module graph's witness is D3852's: a lambda delivered through a
+    // binding to an imported function's typed parameter.
     name:
-      "D3817: a canonical type id is a module index, and a merged function its source name",
+      "D3852: a canonical type id is a module index, and a merged function its source name",
     files: {
       "s.vl":
-        'export function describe(self: string): string { "string " + self }\n',
-      "main.vl":
-        'import { describe } from "./s"\nexport function d(x) { x.describe() }\nprint(1)\n',
+        "export function callIt(f: (y: string) => string, s: string): string { f(s) }\n",
+      "main.vl": 'import { callIt } from "./s"\n' +
+        "function d(x: string) {\n" +
+        '  const e = (y) => y + "E"\n' +
+        "  const d1 = e\n" +
+        "  print(callIt(d1, x))\n" +
+        "}\n" +
+        'd("a")\n',
     },
     entry: "main.vl",
     want: [
-      "failed to validate inside `d`",
-      "callee returns [(ref $2)]; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
+      "failed to validate inside `e`",
+      "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
     ],
-    never: ["(id ", "d$m0"],
+    never: ["(id ", "e$m0", "d$m0"],
   },
   // The string-keyed map struct is one heap type for every string-keyed map and set, so it is
   // named by its rep: a `Set<string>` must not be called `{[string]: i32}`.
