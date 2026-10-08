@@ -736,3 +736,59 @@ Deno.test({
     `applying the fix must clear the file; got ${JSON.stringify(after.map((x) => x.message))}`,
   );
 });
+
+// ---- an undeclared name some module exports (`missing-import`, lane IM) -------
+
+Deno.test("quick-fix: `missing-import` is read like `ufcs-not-imported`", () => {
+  const src = "print(hypotF64(3.0, 4.0))\n";
+  const d = {
+    ...noFieldDiag(src, "hypotF64", 0),
+    code: "missing-import",
+    data: { member: ["hypotF64"], modules: ["std:math"] },
+  };
+  assert(ufcsMissingImportAt(src, d) === "hypotF64", "the range names the member");
+  assert(
+    JSON.stringify(ufcsImportModules(d)) === JSON.stringify(["std:math"]),
+    `one module from data; got ${JSON.stringify(ufcsImportModules(d))}`,
+  );
+});
+
+Deno.test({
+  name: "seed: an undeclared std function carries `missing-import`, and its quick-fix checks clean",
+  ignore,
+}, async () => {
+  const { checker, read } = checkerAndReader();
+  const src = "print(hypotF64(3.0, 4.0))\n";
+  const diags = await checker.check(src, "/proj/main.vl", read);
+  const d = diags.find((x) => x.code === "missing-import");
+  if (d === undefined) {
+    throw new Error(
+      `expected the missing-import diagnostic; got ${JSON.stringify(diags.map((x) => x.message))}`,
+    );
+  }
+  assert(
+    d.message === "undeclared identifier 'hypotF64' — `hypotF64` is exported by \"std:math\"; " +
+        'add `import { hypotF64 } from "std:math"`',
+    `message; got ${JSON.stringify(d.message)}`,
+  );
+  assert(
+    JSON.stringify(d.data) === JSON.stringify({ member: ["hypotF64"], modules: ["std:math"] }),
+    `payload; got ${JSON.stringify(d.data)}`,
+  );
+  const fixes = ufcsImportFixes(
+    src,
+    ufcsMissingImportAt(src, d)!,
+    ufcsImportModules(d),
+    (s, key, n) => importInsertionEdit(s, key, n, (stmt) => checker.formatSrc?.(stmt)),
+  );
+  assert(fixes.length === 1 && fixes[0].isPreferred === true, "one preferred action");
+  const edit = fixes[0].edits[0];
+  const lines = src.split("\n");
+  lines[edit.range.start.line] = lines[edit.range.start.line].slice(0, edit.range.start.character) +
+    edit.newText + lines[edit.range.end.line].slice(edit.range.end.character);
+  const after = await checker.check(lines.join("\n"), "/proj/main.vl", read);
+  assert(
+    after.length === 0,
+    `applying the fix must clear the file; got ${JSON.stringify(after.map((x) => x.message))}`,
+  );
+});

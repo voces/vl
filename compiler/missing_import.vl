@@ -1,0 +1,304 @@
+// Which module exports a name the program uses without importing it, and how the using
+// module spells that import. The driver fills the index once per compile, before any
+// diagnostic is raised (`mimpBegin`, `mimpAddExport`); the undeclared-name and the
+// not-exported diagnostics read it (`mimpSpecsFor`), so a lookup never rebuilds anything.
+
+import { i32ToStr } from "./ast"
+import { stdExpLoad, stdExpName, stdExpSpec } from "./std_receivers"
+
+// The program's exports: one row per (name, module index), chained per name from `mimpHead`.
+let mimpHead: {[string]: i32} = Map()
+let mimpNext: i32[] = []
+let mimpRowName: string[] = []
+let mimpRowMod: i32[] = []
+// The driver's module keys and import rows, shared by reference for the spelling.
+let mimpKeys: string[] = []
+let mimpImpMod: i32[] = []
+let mimpImpKey: string[] = []
+let mimpImpSpec: string[] = []
+// std's declared value exports, chained per name the same way; built on first use.
+const mimpStdHead: {[string]: i32} = Map()
+const mimpStdNext: i32[] = []
+let mimpStdBuilt = false
+
+// One row per not-exported import whose name exactly one other module exports: the
+// importing module, the name, the specifier its import names and the one to use instead.
+export let mimpMovedMod: i32[] = []
+export let mimpMovedName: string[] = []
+export let mimpMovedFrom: string[] = []
+export let mimpMovedTo: string[] = []
+
+// Empties the program half and the moved rows; the checker calls it before every compile.
+export function mimpClear() {
+  mimpMovedMod = []
+  mimpMovedName = []
+  mimpMovedFrom = []
+  mimpMovedTo = []
+  mimpBegin([], [], [], [])
+}
+
+// Records one moved row; the driver calls it from the not-exported refusal.
+export function mimpNoteMoved(m: i32, name: string, from: string, to: string) {
+  mimpMovedMod.push(m)
+  mimpMovedName.push(name)
+  mimpMovedFrom.push(from)
+  mimpMovedTo.push(to)
+  0
+}
+
+// Starts the program half for a module graph: `keys` by module index, and the import
+// rows as (importing module, resolved key, specifier as written).
+export function mimpBegin(
+  keys: string[],
+  impMod: i32[],
+  impKey: string[],
+  impSpec: string[],
+) {
+  mimpHead = Map()
+  mimpNext = []
+  mimpRowName = []
+  mimpRowMod = []
+  mimpKeys = keys
+  mimpImpMod = impMod
+  mimpImpKey = impKey
+  mimpImpSpec = impSpec
+  0
+}
+
+// Records that module `m` exports `name`.
+export function mimpAddExport(name: string, m: i32) {
+  mimpNext.push(mimpHead[name] ?? -1)
+  mimpHead[name] = mimpRowName.length
+  mimpRowName.push(name)
+  mimpRowMod.push(m)
+  0
+}
+
+function mimpStdBuild() {
+  if mimpStdBuilt { return 0 }
+  mimpStdBuilt = true
+  stdExpLoad()
+  let i = 0
+  while i < stdExpName.length {
+    mimpStdNext.push(mimpStdHead[stdExpName[i]] ?? -1)
+    mimpStdHead[stdExpName[i]] = i
+    i = i + 1
+  }
+  0
+}
+
+// Every specifier module `from` (-1 when the program is one file) can write to import
+// `name`, program modules first and then std, without duplicates. Module `skip` is left
+// out, and so is a program module `from` has no correct spelling for.
+export function mimpSpecsFor(name: string, from: i32, skip: i32): string[] {
+  const out: string[] = []
+  const mods: i32[] = []
+  let r = mimpHead[name] ?? -1
+  while r >= 0 {
+    const d = mimpRowMod[r]
+    if d != from && d != skip { mods.push(d) }
+    r = mimpNext[r]
+  }
+  // The chain runs newest first; module order reads better in a sentence.
+  let k = mods.length - 1
+  while k >= 0 {
+    const spec = mimpSpecFrom(from, mods[k])
+    if spec != "" && !mimpHas(out, spec) { out.push(spec) }
+    k = k - 1
+  }
+  let skipKey = ""
+  if skip >= 0 && skip < mimpKeys.length { skipKey = mimpKeys[skip] }
+  mimpStdBuild()
+  const std: string[] = []
+  let s = mimpStdHead[name] ?? -1
+  while s >= 0 {
+    std.push(stdExpSpec[s])
+    s = mimpStdNext[s]
+  }
+  let j = std.length - 1
+  while j >= 0 {
+    if std[j] != skipKey && !mimpHas(out, std[j]) { out.push(std[j]) }
+    j = j - 1
+  }
+  out
+}
+
+// The tail a diagnostic about `name` appends when `specs` (`mimpSpecsFor`'s answer, not
+// empty) export it: the edit itself for one exporter, the first three for several.
+export function mimpExportedByNote(
+  name: string,
+  specs: string[],
+  from: i32,
+): string {
+  let out = " — `" + name + "` is exported by "
+  if specs.length == 1 {
+    out = out + "\"" + specs[0] + "\"; add "
+    if mimpImportsSpec(from, specs[0]) {
+      return out + "it to the existing `import { … } from \"" + specs[0] + "\"`"
+    }
+    return out + "`import { " + name + " } from \"" + specs[0] + "\"`"
+  }
+  let shown = specs.length
+  if shown > 3 { shown = 3 }
+  let i = 0
+  while i < shown {
+    if i > 0 && i == shown - 1 && specs.length <= 3 { out = out + " and " }
+    else if i > 0 { out = out + ", " }
+    out = out + "\"" + specs[i] + "\""
+    i = i + 1
+  }
+  if specs.length > 3 {
+    out = out + " and " + i32ToStr(specs.length - 3) + " more"
+  }
+  out + "; import it from one of them"
+}
+
+// Whether module `from` already imports something from `spec`.
+export function mimpImportsSpec(from: i32, spec: string): boolean {
+  const m = mimpFromIx(from)
+  let i = 0
+  while i < mimpImpMod.length {
+    if mimpImpMod[i] == m && mimpImpSpec[i] == spec { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The names module `d` exports that `name` is a near miss of: equal but for case, else at
+// the smallest edit distance up to 2 and short of `name`'s own length. At most three.
+export function mimpNearMisses(name: string, d: i32): string[] {
+  let out: string[] = []
+  let best = 3
+  let i = 0
+  while i < mimpRowName.length {
+    if (
+      mimpRowMod[i] == d
+      && mimpRowName[i] != name
+      && !mimpHas(out, mimpRowName[i])
+    ) {
+      const dist = mimpEditDist(name, mimpRowName[i])
+      if dist < best && dist < name.length {
+        best = dist
+        out = []
+      }
+      if dist == best && dist <= 2 && dist < name.length && out.length < 3 {
+        out.push(mimpRowName[i])
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+function mimpHas(list: string[], s: string): boolean {
+  for x in list {
+    if x == s { return true }
+  }
+  false
+}
+
+function mimpFromIx(from: i32) {
+  if from < 0 { return 0 }
+  from
+}
+
+// How module `from` spells an import of module `d`: the specifier it already uses for that
+// module, else a `std:` key verbatim, else a relative path between the two keys; "" when
+// neither key is a plain `.vl` path.
+function mimpSpecFrom(from: i32, d: i32): string {
+  if d < 0 || d >= mimpKeys.length { return "" }
+  const key = mimpKeys[d]
+  const m = mimpFromIx(from)
+  let i = 0
+  while i < mimpImpMod.length {
+    if mimpImpMod[i] == m && mimpImpKey[i] == key && mimpImpSpec[i] != "" {
+      return mimpImpSpec[i]
+    }
+    i = i + 1
+  }
+  if key.length > 4 && key.slice(0, 4) == "std:" { return key }
+  if m >= mimpKeys.length { return "" }
+  mimpRelSpec(mimpKeys[m], key)
+}
+
+// The relative specifier that names key `to` from a module at key `from`, both normalised
+// `.vl` paths; "" for a `std:` key, a `..` segment in `from`, or a mix of absolute and not.
+function mimpRelSpec(from: string, to: string): string {
+  if from.length > 4 && from.slice(0, 4) == "std:" { return "" }
+  if to.length < 4 || to.slice(to.length - 3, to.length) != ".vl" { return "" }
+  const fromAbs = from.length > 0 && from[0] == '/'
+  const toAbs = to.length > 0 && to[0] == '/'
+  if fromAbs != toAbs { return "" }
+  const fs = mimpSegs(from)
+  const ts = mimpSegs(to.slice(0, to.length - 3))
+  // `fs` ends in the importing file's own name, which is not a directory.
+  const fdirs = fs.length - 1
+  let c = 0
+  while c < fdirs && c < ts.length - 1 && fs[c] == ts[c] { c = c + 1 }
+  let out = ""
+  let u = c
+  while u < fdirs {
+    if fs[u] == ".." { return "" }
+    out = out + "../"
+    u = u + 1
+  }
+  if out == "" { out = "./" }
+  let t = c
+  while t < ts.length {
+    if t > c { out = out + "/" }
+    out = out + ts[t]
+    t = t + 1
+  }
+  out
+}
+
+function mimpSegs(path: string): string[] {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  while i <= path.length {
+    if i == path.length || path[i] == '/' {
+      if i > start { out.push(path.slice(start, i)) }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+// `c` lowered if it is an ASCII capital, so a case difference costs nothing.
+function mimpLc(c: i32): i32 {
+  if c >= 'A' && c <= 'Z' { return c + 32 }
+  c
+}
+
+// Levenshtein distance ignoring ASCII case, stopping at 3: the callers only ask whether it is at most 2.
+function mimpEditDist(a: string, b: string): i32 {
+  if a.length - b.length > 2 || b.length - a.length > 2 { return 3 }
+  let prev: i32[] = []
+  let j = 0
+  while j <= b.length {
+    prev.push(j)
+    j = j + 1
+  }
+  let i = 1
+  while i <= a.length {
+    const cur: i32[] = [i]
+    let lo = i
+    let k = 1
+    while k <= b.length {
+      let cost = 1
+      if mimpLc(a[i - 1]) == mimpLc(b[k - 1]) { cost = 0 }
+      let v = prev[k - 1] + cost
+      if prev[k] + 1 < v { v = prev[k] + 1 }
+      if cur[k - 1] + 1 < v { v = cur[k - 1] + 1 }
+      cur.push(v)
+      if v < lo { lo = v }
+      k = k + 1
+    }
+    if lo > 2 { return 3 }
+    prev = cur
+    i = i + 1
+  }
+  prev[b.length]
+}

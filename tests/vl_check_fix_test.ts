@@ -128,3 +128,124 @@ Deno.test({
     }
   },
 });
+
+// ---- missing imports (lane IM): an error whose one exporter names the edit ------------
+
+const check = async (path: string): Promise<{ code: number; err: string }> => {
+  const { code, stderr } = await new Deno.Command(VL, {
+    args: ["check", path, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
+  }).output();
+  return { code, err: new TextDecoder().decode(stderr) };
+};
+
+// Writes `files` to a temp dir, runs `--fix` on `main.vl`, and compares the result with
+// `want`. A `want` equal to the input is the no-edit case: nothing may be applied. Else the
+// fixed file must re-check clean, which is the proof the edit was the right one.
+const fixCase = (name: string, files: Record<string, string>, want: string) =>
+  Deno.test({
+    name: `vl-check-fix: ${name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_imp_" });
+      try {
+        for (const [rel, src] of Object.entries(files)) {
+          await Deno.mkdir(`${dir}/${rel}`.replace(/\/[^/]*$/, ""), { recursive: true });
+          await Deno.writeTextFile(`${dir}/${rel}`, src);
+        }
+        const f = `${dir}/main.vl`;
+        const r = await fix(f);
+        const after = await Deno.readTextFile(f);
+        if (after !== want) {
+          throw new Error(`fixed source: want\n${want}\ngot\n${after}\n(stderr:\n${r.err})`);
+        }
+        if (want === files["main.vl"]) {
+          if (r.err.includes("Applied")) throw new Error(`nothing may be applied:\n${r.err}`);
+          if (r.code === 0) throw new Error("the errors must stand");
+          return;
+        }
+        const r2 = await check(f);
+        if (r2.code !== 0) throw new Error(`the fixed file must check clean:\n${r2.err}`);
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
+    },
+  });
+
+const TERRAIN = "export function height(x: i32): i32 { x * 2 }\n" +
+  "export const SEA = 3\nexport function other(): i32 { 1 }\n";
+
+fixCase(
+  "an undeclared name joins its module's existing import, or a new one, local or std",
+  {
+    "terrain.vl": TERRAIN,
+    "sub/side.vl": "export function side(): i32 { 5 }\n",
+    "mid.vl": 'import { side } from "./sub/side"\nexport function mid(): i32 { side() }\n',
+    "main.vl": 'import { mid } from "./mid"\nimport { other } from "./terrain"\n' +
+      "print(mid() + height(2) + SEA + other() + side())\nprint(hypotF64(3.0, 4.0))\n" +
+      "const xs = [1, 2, 3]\nprint(xs.includes(2))\n",
+  },
+  'import { mid } from "./mid"\nimport { other, height, SEA } from "./terrain"\n' +
+    'import { side } from "./sub/side"\nimport { hypotF64 } from "std:math"\n' +
+    'import { includes } from "std:array"\n' +
+    "print(mid() + height(2) + SEA + other() + side())\nprint(hypotF64(3.0, 4.0))\n" +
+    "const xs = [1, 2, 3]\nprint(xs.includes(2))\n",
+);
+
+fixCase(
+  "a name imported from a module that does not export it moves to the one that does",
+  {
+    "terrain.vl": TERRAIN,
+    "mid.vl": 'import { height } from "./terrain"\nexport function mid(): i32 { height(1) }\n',
+    "main.vl": 'import { height } from "./mid"\nimport { mid, SEA } from "./mid"\n' +
+      "print(height(1) + mid() + SEA)\n",
+  },
+  // `height` is its import's only name, so the specifier changes; `SEA` leaves a list and
+  // joins that import in the next round.
+  'import { height, SEA } from "./terrain"\nimport { mid } from "./mid"\n' +
+    "print(height(1) + mid() + SEA)\n",
+);
+
+fixCase(
+  "a std name imported from the wrong std module moves to the one that declares it",
+  {
+    "main.vl": 'import { includes, join } from "std:array"\nconst xs = [1, 2]\n' +
+      'print(xs.includes(1))\nprint(["a", "b"].join("-"))\n',
+  },
+  'import { includes } from "std:array"\nimport { join } from "std:str"\nconst xs = [1, 2]\n' +
+    'print(xs.includes(1))\nprint(["a", "b"].join("-"))\n',
+);
+
+fixCase(
+  "a method's receiver picks the module, and a re-export counts as its declaring module",
+  {
+    "main.vl": 'const s = "a,b"\nconst parts = ["a", "b"]\n' +
+      'print(s.lastIndexOf(","))\nprint(parts.join("/"))\n',
+  },
+  'import { lastIndexOf, join } from "std:str"\nconst s = "a,b"\nconst parts = ["a", "b"]\n' +
+    'print(s.lastIndexOf(","))\nprint(parts.join("/"))\n',
+);
+
+fixCase(
+  "two exporters: the message lists both and nothing is edited",
+  {
+    "a.vl": "export function dup(): i32 { 1 }\n",
+    "b.vl": "export function dup(): i32 { 2 }\n",
+    "main.vl": 'import { dup as one } from "./a"\nimport { dup as two } from "./b"\n' +
+      "print(one() + two() + dup())\n",
+  },
+  'import { dup as one } from "./a"\nimport { dup as two } from "./b"\n' +
+    "print(one() + two() + dup())\n",
+);
+
+fixCase(
+  "one name asked of two modules by two receivers: neither import is added",
+  {
+    "main.vl": 'const s = "a,b"\nconst xs = [1, 2]\n' +
+      'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
+  },
+  'const s = "a,b"\nconst xs = [1, 2]\n' +
+    'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
+);

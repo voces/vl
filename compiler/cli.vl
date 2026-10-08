@@ -75,9 +75,17 @@ import {
   redunModuleAt,
   srcReset,
   srcSetStr,
+  vcDiagCode,
+  vcDiagData,
   vcDiagMsg,
   vcFmtOut,
 } from "./driver"
+import {
+  mimpMovedFrom,
+  mimpMovedMod,
+  mimpMovedName,
+  mimpMovedTo,
+} from "./missing_import"
 import {
   cliAnsi,
   cliDetab,
@@ -305,6 +313,11 @@ let cliFixKeep: i32[] = []        // 1 = this edit is in the current candidate
 let cliFixDeclinedAt: string[] = []
 let cliFixDeclinedLine: i32[] = []
 let cliFixDeclinedCol: i32[] = []
+// The imports this file's own errors ask for, one exporter each (`cliNoteImportFix`): the
+// specifier text to add and the module to add it to.
+let cliImpItem: string[] = []
+let cliImpSpec: string[] = []
+let cliImpClash: string[] = []
 // ── `vl test` (cliCmd == 2) ────────────────────────────────────────────────────
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
@@ -1232,6 +1245,9 @@ function cliCheckCurFileRest() {
   // Error-tier diagnostics — capture them now, straight from the driver stores, before
   // `lintSrc` re-parses the entry source and resets those stores.
   cliClearDiags()
+  cliImpItem = []
+  cliImpSpec = []
+  cliImpClash = []
   const n = diagCount()
   let i = 0
   while i < n {
@@ -1249,6 +1265,7 @@ function cliCheckCurFileRest() {
       vcDiagMsg(i),
       diagModule(i),
     )
+    if cliFix != 0 && diagModule(i) == 0 { cliNoteImportFix(i) }
     i = i + 1
   }
   // The engine rejected the module this file emitted. Positioned: the emitter banks
@@ -2226,7 +2243,10 @@ function cliCollectFixes(src: string) {
     }
     k = k + 1
   }
-  for lb in impLb { cliImportFixEdits(src, lb, impOff, starts) }
+  for lb in impLb {
+    cliImportFixEdits(src, lb, impOff, starts, "unused import")
+  }
+  cliMissingImportEdits(src, starts)
   // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by replacing
   // the span from the name end to the `=` with a single space. The checker computed
   // that span with a depth-aware token scan, so a multi-token or function-type
@@ -2353,7 +2373,13 @@ function cliLineOfOff(starts: i32[], off: i32) {
 // specifier is unused when an offset in `offs` falls in it. A removal takes one adjacent
 // comma with it. A clause left empty drops the whole statement, but only for a `std:`
 // module: dropping a module of the program's own would skip its top-level statements.
-function cliImportFixEdits(src: string, lb: i32, offs: i32[], starts: i32[]) {
+function cliImportFixEdits(
+  src: string,
+  lb: i32,
+  offs: i32[],
+  starts: i32[],
+  what: string,
+) {
   const rb = cliImportRBrace(src, lb)
   if rb < 0 { return 0 }
   // Each specifier's content span, trimmed of blanks and newlines.
@@ -2392,35 +2418,271 @@ function cliImportFixEdits(src: string, lb: i32, offs: i32[], starts: i32[]) {
     if end < 0 || !cliImportStd { return 0 }
     let st = lb
     while st > 0 && src[st - 1] != '\n' { st = st - 1 }
-    cliPushFixEdit(st, end - st, "unused import", starts)
+    cliPushFixEdit(st, end - st, what, starts)
     return 0
   }
   // Before the last kept specifier, a removal runs to the next one's start; after it, the
   // trailing run goes as one edit from the kept one's end.
   j = 0
   while j < lastKept {
-    if unused[j] {
-      cliPushFixEdit(cs[j], cs[j + 1] - cs[j], "unused import", starts)
-    }
+    if unused[j] { cliPushFixEdit(cs[j], cs[j + 1] - cs[j], what, starts) }
     j = j + 1
   }
   if lastKept < cs.length - 1 {
     const from = ce[lastKept]
-    cliPushFixEdit(from, ce[cs.length - 1] - from, "unused import", starts)
+    cliPushFixEdit(from, ce[cs.length - 1] - from, what, starts)
   }
   0
 }
 
 // Append one deletion of `len` code units at `off` to the `cliFixEdit*` rows.
 function cliPushFixEdit(off: i32, len: i32, what: string, starts: i32[]) {
+  cliPushFixRepl(off, len, "", what, starts)
+}
+
+// Append one replacement of `len` code units at `off` by `txt` to the `cliFixEdit*` rows.
+function cliPushFixRepl(
+  off: i32,
+  len: i32,
+  txt: string,
+  what: string,
+  starts: i32[],
+) {
   const ln = cliLineOfOff(starts, off)
   cliFixEditPos.push(off)
   cliFixEditLen.push(len)
-  cliFixEditTxt.push("")
+  cliFixEditTxt.push(txt)
   cliFixEditWhat.push(what)
   cliFixEditLine.push(ln)
   cliFixEditCol.push(off - starts[ln - 1])
   0
+}
+
+// Diagnostic `i` asks for an import with exactly one exporter: note the specifier and the
+// module. An undeclared name and a UFCS method share the payload's `member` and `modules`.
+function cliNoteImportFix(i: i32) {
+  const code = vcDiagCode(i)
+  if code != "missing-import" && code != "ufcs-not-imported" { return 0 }
+  const data = vcDiagData(i)
+  const mods = cliDataVals(data, "modules")
+  const member = cliDataVals(data, "member")
+  if mods.length != 1 || member.length != 1 { return 0 }
+  let item = member[0]
+  const alias = cliDataVals(data, "alias")
+  if alias.length == 1 { item = item + " as " + alias[0] }
+  cliImpAdd(item, mods[0])
+}
+
+// A name two modules are asked for (`s.lastIndexOf` and `xs.lastIndexOf`) is a clash: either
+// import alone would refuse the other call, so neither is added and both errors stand.
+function cliImpAdd(item: string, spec: string) {
+  const local = cliImpLocal(item)
+  let k = 0
+  while k < cliImpItem.length {
+    if cliImpLocal(cliImpItem[k]) == local {
+      if cliImpSpec[k] != spec { cliImpClash.push(local) }
+      return 0
+    }
+    k = k + 1
+  }
+  cliImpItem.push(item)
+  cliImpSpec.push(spec)
+  0
+}
+
+// The name an import specifier binds: the alias after `as`, else the specifier.
+function cliImpLocal(item: string): string {
+  let i = item.length - 1
+  while i >= 0 && item[i] != ' ' { i = i - 1 }
+  item.slice(i + 1, item.length)
+}
+
+// The values of `key` in a diagnostic payload: netstrings read as alternating key and value.
+function cliDataVals(data: string, key: string): string[] {
+  const out: string[] = []
+  let isKey = true
+  let keyHit = false
+  let i = 0
+  while i < data.length {
+    let len = 0
+    while i < data.length && data[i] != ':' {
+      len = len * 10 + (data[i] - '0')
+      i = i + 1
+    }
+    const v = data.slice(i + 1, i + 1 + len)
+    i = i + len + 2
+    if isKey { keyHit = v == key }
+    else if keyHit { out.push(v) }
+    isKey = !isKey
+  }
+  out
+}
+
+// The `}` of the top-level `import { … } from "<spec>"` in `src`, else -1.
+function cliImportClauseOf(src: string, spec: string) {
+  let ls = 0
+  while ls < src.length {
+    const rb = cliImportRBraceAtLine(src, ls)
+    if rb >= 0 && cliImportSpecAfter(src, rb) == spec { return rb }
+    while ls < src.length && src[ls] != '\n' { ls = ls + 1 }
+    ls = ls + 1
+  }
+  -1
+}
+
+// The end of the last top-level `import { … } from "…"` statement in `src`, else 0.
+function cliImportsEnd(src: string) {
+  let end = 0
+  let ls = 0
+  while ls < src.length {
+    const rb = cliImportRBraceAtLine(src, ls)
+    if rb >= 0 {
+      const e = cliImportStmtEnd(src, rb)
+      if e > end { end = e }
+    }
+    while ls < src.length && src[ls] != '\n' { ls = ls + 1 }
+    ls = ls + 1
+  }
+  end
+}
+
+// The `}` closing the clause of an `import {` that opens the line at `ls`, else -1.
+function cliImportRBraceAtLine(src: string, ls: i32) {
+  if ls + 6 > src.length || src.slice(ls, ls + 6) != "import" { return -1 }
+  let q = ls + 6
+  while q < src.length && cliBlankAt(src, q) { q = q + 1 }
+  if q >= src.length || src[q] != '{' { return -1 }
+  cliImportRBrace(src, q)
+}
+
+// The specifier text of the `from "…"` after the clause closing at `rb`, else "".
+function cliImportSpecAfter(src: string, rb: i32): string {
+  if cliImportStmtEnd(src, rb) < 0 { return "" }
+  const q = cliImportSpecStart(src, rb)
+  let e = q
+  while e < src.length && src[e] != '"' { e = e + 1 }
+  src.slice(q, e)
+}
+
+// The offset just inside the opening quote of the `from "…"` after `rb`.
+function cliImportSpecStart(src: string, rb: i32) {
+  let q = rb + 1
+  while q < src.length && src[q] != '"' { q = q + 1 }
+  q + 1
+}
+
+// The edits for the imports this file's errors ask for. A name exported by exactly one other
+// module moves there first. Each added name then joins an existing import of its module, or
+// a new statement after the last import.
+function cliMissingImportEdits(src: string, starts: i32[]) {
+  let mv = 0
+  while mv < mimpMovedMod.length {
+    if mimpMovedMod[mv] == 0 {
+      cliMovedImportEdit(
+        src,
+        starts,
+        mimpMovedName[mv],
+        mimpMovedFrom[mv],
+        mimpMovedTo[mv],
+      )
+    }
+    mv = mv + 1
+  }
+  let fresh = ""
+  const done: string[] = []
+  let k = 0
+  while k < cliImpSpec.length {
+    const spec = cliImpSpec[k]
+    if !cliStrIn(done, spec) {
+      done.push(spec)
+      let list = ""
+      let j = k
+      while j < cliImpSpec.length {
+        if (
+          cliImpSpec[j] == spec
+          && !cliStrIn(cliImpClash, cliImpLocal(cliImpItem[j]))
+        ) {
+          if list != "" { list = list + ", " }
+          list = list + cliImpItem[j]
+        }
+        j = j + 1
+      }
+      const rb = cliImportClauseOf(src, spec)
+      if list == "" {
+        // Every name asked of this module clashed.
+      } else if rb >= 0 {
+        let q = rb - 1
+        while q > 0 && cliSpaceAt(src, q) { q = q - 1 }
+        let txt = ", " + list
+        if src[q] == '{' { txt = " " + list }
+        else if src[q] == ',' { txt = " " + list + "," }
+        cliPushFixRepl(q + 1, 0, txt, "missing import", starts)
+      } else {
+        fresh = fresh + "import { " + list + " } from \"" + spec + "\"\n"
+      }
+    }
+    k = k + 1
+  }
+  if fresh != "" {
+    const at = cliImportsEnd(src)
+    if at > 0 && src[at - 1] != '\n' { fresh = "\n" + fresh }
+    cliPushFixRepl(at, 0, fresh, "missing import", starts)
+  }
+  0
+}
+
+function cliStrIn(list: string[], s: string): boolean {
+  for x in list {
+    if x == s { return true }
+  }
+  false
+}
+
+// The edit for `name`, imported from `from` but exported by `to` alone: the specifier
+// becomes `to` when `name` is the clause's only one, else that one name moves to `to`.
+function cliMovedImportEdit(
+  src: string,
+  starts: i32[],
+  name: string,
+  from: string,
+  to: string,
+) {
+  const rb = cliImportClauseOf(src, from)
+  if rb < 0 { return 0 }
+  let lb = rb - 1
+  while lb >= 0 && src[lb] != '{' { lb = lb - 1 }
+  // Each specifier's trimmed span; the one whose first word is `name` moves.
+  let count = 0
+  let hitAt = -1
+  let hitEnd = -1
+  let seg = lb + 1
+  let i = lb + 1
+  while i <= rb {
+    if i == rb || src[i] == ',' {
+      let a = seg
+      let e = i
+      while a < e && cliSpaceAt(src, a) { a = a + 1 }
+      while e > a && cliSpaceAt(src, e - 1) { e = e - 1 }
+      if e > a {
+        count = count + 1
+        let w = a
+        while w < e && !cliSpaceAt(src, w) { w = w + 1 }
+        if src.slice(a, w) == name {
+          hitAt = a
+          hitEnd = e
+        }
+      }
+      seg = i + 1
+    }
+    i = i + 1
+  }
+  if hitAt < 0 { return 0 }
+  if count == 1 {
+    const q = cliImportSpecStart(src, rb)
+    return cliPushFixRepl(q, from.length, to, "moved import", starts)
+  }
+  cliImportFixEdits(src, lb, [hitAt], starts, "moved import")
+  cliImpAdd(src.slice(hitAt, hitEnd), to)
 }
 
 // `src` with every edit whose `keep` flag is set applied. A single forward pass into a
