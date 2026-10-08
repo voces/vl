@@ -394,6 +394,7 @@ import { elseIfLink, nodeChildren, nodeSpineChildren } from "./ast"
 // The file a node came from, named in a record-covariance refusal that crosses modules.
 import { srcmapModOfTok, srcmapPathOf } from "./srcmap"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import { strContains } from "./strutil"
 import {
   stdRecvLoad,
   stdRecvMax,
@@ -57779,16 +57780,32 @@ let expInfPinLets: i32[] = []
 function expUncalledExports(): i32[] {
   const out: i32[] = []
   if expInfEntryStd { return out }
+  const cands: i32[] = []
+  expShWanted = Map()
   for st in gRootStmts {
     const f = P.nodes[st]
     if f is FuncDecl {
       if f.fnName != "" && ufcsModOfNode(st) <= 0 && expDeclIsExported(st) {
-        if !expNamedOutside(f.fnName, st) { out.push(st) }
+        cands.push(st)
+        expShWanted[f.fnName] = 1
       }
+    }
+  }
+  if cands.length == 0 { return out }
+  const readers = expNameReaders()
+  for st in cands {
+    const f = P.nodes[st]
+    if f is FuncDecl {
+      const r = readers[f.fnName] ?? -1
+      if r == -1 || r == st { out.push(st) }
     }
   }
   out
 }
+
+// The exported function names `expNameReaders` tracks; a shadow list carries only these, so
+// it stays as short as the names a nearer scope can hide.
+let expShWanted: {[string]: i32} = Map()
 
 // Whether function node `fx` is declared `export function name`.
 function expDeclIsExported(fx: i32): boolean {
@@ -57797,22 +57814,121 @@ function expDeclIsExported(fx: i32): boolean {
   P.toks[tk - 1].kind == "FUNCTION" && P.toks[tk - 2].kind == "EXPORT"
 }
 
-// Whether an identifier outside function node `fx` reads the top-level `name`; one a nearer
-// binding shadows reads that binding.
-function expNamedOutside(name: string, fx: i32): boolean {
-  const stack: i32[] = []
-  for st in gRootStmts { stack.push(st) }
-  while stack.length > 0 {
-    const ix = stack.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length && ix != fx {
-      const n = P.nodes[ix]
-      if n is Ident {
-        if n.identName == name { return true }
+// For each tracked export name some identifier reads, the root statement holding the reads, or -2
+// when more than one does; one walk of the program. A read a nearer binding shadows is skipped.
+function expNameReaders(): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  for st in gRootStmts {
+    // Each node carries the names a nearer scope rebinds there, as `|a|b|`.
+    const stack: i32[] = [st]
+    const stackSh: string[] = ["|"]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      const sh = stackSh.pop() ?? "|"
+      if ix >= 0 && ix < P.nodes.length {
+        const nm = expIdentName(ix)
+        if (expShWanted[nm] ?? 0) == 1 && !strContains(sh, "|" + nm + "|") {
+          const prev = out[nm] ?? -1
+          if prev == -1 { out[nm] = st }
+          else if prev != st { out[nm] = -2 }
+        }
+        expShadowKids(ix, sh, stack, stackSh)
       }
-      for k in expScopedKids(ix, name) { stack.push(k) }
     }
   }
-  false
+  out
+}
+
+// Pushes node `ix`'s children walked under shadow list `sh`, each with the list it is walked
+// under: a function adds its name and parameters, a loop its variables, a match arm its
+// bindings, and a block each name its statements declare, from that statement on.
+function expShadowKids(ix: i32, sh: string, stack: i32[], stackSh: string[]) {
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    let inner = expShAdd(sh, n.fnName)
+    for q in n.fnParams {
+      const qp = P.nodes[q]
+      if qp is Param { inner = expShAdd(inner, qp.parName) }
+    }
+    for k in nodeChildren(ix) {
+      stack.push(k)
+      stackSh.push(inner)
+    }
+    return 0
+  } else if n is Block {
+    let run = sh
+    for st in n.blkStmts {
+      stack.push(st)
+      stackSh.push(run)
+      run = expShAdd(run, expStmtDeclName(st))
+    }
+    return 0
+  }
+  let inner = sh
+  if n is ForIn {
+    inner = expShAdd(expShAdd(sh, n.fiVar), n.fiVar2)
+    stack.push(n.fiIter)
+    stackSh.push(sh)
+    stack.push(n.fiBody)
+    stackSh.push(inner)
+    return 0
+  } else if n is ForRange {
+    inner = expShAdd(sh, n.frVar)
+  } else if n is MatchExpr {
+    stack.push(n.matchScrut)
+    stackSh.push(sh)
+    let i = 0
+    while i < n.matchBodies.length {
+      stack.push(n.matchBodies[i])
+      stackSh.push(expArmShadow(n, i, sh))
+      i = i + 1
+    }
+    return 0
+  }
+  for k in nodeChildren(ix) {
+    stack.push(k)
+    stackSh.push(inner)
+  }
+  0
+}
+
+// Shadow list `sh` with the names a pattern of arm `i` of match `n` binds for its body.
+function expArmShadow(n: MatchExpr, i: i32, sh: string): string {
+  let out = sh
+  if i >= n.matchArmStart.length || i >= n.matchArmCount.length { return out }
+  let p = n.matchArmStart[i]
+  while p < n.matchArmStart[i] + n.matchArmCount[i] && p < n.matchBinds.length {
+    const bx = n.matchBinds[p]
+    if bx >= 0 && bx < P.nodes.length {
+      const b = P.nodes[bx]
+      if b is Block {
+        for st in b.blkStmts { out = expShAdd(out, expStmtDeclName(st)) }
+      }
+    }
+    p = p + 1
+  }
+  out
+}
+
+// Shadow list `sh` with `nm` added when it is a tracked export name.
+function expShAdd(sh: string, nm: string): string {
+  if (expShWanted[nm] ?? 0) != 1 { return sh }
+  sh + nm + "|"
+}
+
+// The name statement `st` declares in its block, or "".
+function expStmtDeclName(st: i32): string {
+  if st < 0 || st >= P.nodes.length { return "" }
+  const d = P.nodes[st]
+  if d is LetDecl { return d.letName }
+  expFnDeclName(st)
+}
+
+// The name of function declaration `st`, or "" for any other statement.
+function expFnDeclName(st: i32): string {
+  const d = P.nodes[st]
+  if d is FuncDecl { return d.fnName }
+  ""
 }
 
 // Infers the un-annotated parameters of every uncalled entry export, annotating each that one
@@ -58067,10 +58183,10 @@ function expScopedKids(ix: i32, nm: string): i32[] {
   } else if n is Block {
     // A function declared in the block is visible in all of it.
     for st in n.blkStmts {
-      if expDeclares(st, nm) && P.nodes[st] is FuncDecl { return out }
+      if expFnDeclName(st) == nm { return out }
     }
     for st in n.blkStmts {
-      if expDeclares(st, nm) {
+      if expStmtDeclName(st) == nm {
         const d = P.nodes[st]
         if d is LetDecl { out.push(d.letInit) }
         return out
@@ -58115,22 +58231,6 @@ function expSoleLet(b: i32, nm: string): i32 {
   found
 }
 
-// Whether statement `st` declares `nm` in its block.
-function expDeclares(st: i32, nm: string): boolean {
-  if st < 0 || st >= P.nodes.length { return false }
-  const d = P.nodes[st]
-  if d is LetDecl { return d.letName == nm }
-  expFnNamed(st, nm)
-}
-
-// Whether statement `st` is a function declaration named `nm`; the only other statement that
-// declares a name in its block is a `let`.
-function expFnNamed(st: i32, nm: string): boolean {
-  const d = P.nodes[st]
-  if d is FuncDecl { return d.fnName == nm }
-  false
-}
-
 // Whether a pattern of arm `i` of match `n` binds `nm` for that arm's body.
 function expArmBinds(n: MatchExpr, i: i32, nm: string): boolean {
   if i >= n.matchArmStart.length || i >= n.matchArmCount.length { return false }
@@ -58141,7 +58241,7 @@ function expArmBinds(n: MatchExpr, i: i32, nm: string): boolean {
       const b = P.nodes[bx]
       if b is Block {
         for st in b.blkStmts {
-          if expDeclares(st, nm) { return true }
+          if expStmtDeclName(st) == nm { return true }
         }
       }
     }
