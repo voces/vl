@@ -607,8 +607,6 @@ axis(
   (d) => twoFiles(d, genFamilyFunctions(1200, 20), genFamilyFunctions(60, 400)),
 );
 
-// D2150's pair: a registry lookup that scans every registered set made the many arm
-// quadratic in the sets; the member-set index keeps it linear.
 // Lane HS's GROWTH pair, 2,400 functions against 600, so linear reads 4. Fuel reads 4.07;
 // master read 12.97, from `fieldClosureFeOfRecvRaw` scanning every `Call` for a parameter's
 // call sites where the callee-name index answers them directly.
@@ -619,6 +617,8 @@ axis(
   (d) => twoFiles(d, genParamFieldCalls(2400), genParamFieldCalls(600)),
 );
 
+// D2150's pair: a registry lookup that scans every registered set made the many arm
+// quadratic in the sets; the member-set index keeps it linear.
 axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
   twoFiles(d, genLitSets(3000, 1), genLitSets(3000, 20)));
 
