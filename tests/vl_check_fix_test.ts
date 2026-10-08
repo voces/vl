@@ -281,3 +281,92 @@ fixCase(
     'const s = "a,b"\nconst xs = [1, 2]\n' +
     'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
 );
+
+// ---- `filled(n, 0)` into a `u8[]` (lane DG): `u8` is storage, so the fix is `zeroBytes(n)` ----
+
+fixCase(
+  "a literal-zero `filled` delivered as a `u8[]` becomes `zeroBytes`, with its import",
+  {
+    "main.vl": 'import { filled } from "std:array"\nimport { u16le } from "std:bytes"\n' +
+      "function f(b: u8[]): i32 { return b.length }\n" +
+      "function g(): u8[] { return filled(4 * 2, 0) }\n" +
+      "const a: u8[] = filled(16, 0 as! u8)\n" +
+      "print(f(filled(f(g()), (0))) + a.length + u16le(g(), 0))\n",
+  },
+  // The orphaned `filled` import and the now-redundant annotations go in the next round.
+  'import { u16le, zeroBytes } from "std:bytes"\n' +
+    "function f(b: u8[]) { return b.length }\n" +
+    "function g(): u8[] { return zeroBytes(4 * 2) }\n" +
+    "const a = zeroBytes(16)\nprint(f(zeroBytes(f(g()))) + a.length + u16le(g(), 0))\n",
+);
+
+fixCase(
+  "a non-zero `filled` into a `u8[]` is not rewritten",
+  {
+    "main.vl": 'import { filled } from "std:array"\nconst a: u8[] = filled(16, 7)\nprint(a.length)\n',
+  },
+  'import { filled } from "std:array"\nconst a: u8[] = filled(16, 7)\nprint(a.length)\n',
+);
+
+// The rewrite declines whenever the file binds `zeroBytes` to anything but `std:bytes`'s: the
+// new call would reach that binding (or the added import would clash with it).
+const ZB_FILL = 'import { filled } from "std:array"\n';
+const zbDeclines: [string, Record<string, string>][] = [
+  [
+    "a module function named `zeroBytes`",
+    {
+      "main.vl": ZB_FILL + "function zeroBytes(n: i32) { return n * 100 }\n" +
+        "const a: u8[] = filled(4, 0)\nprint(a.length + zeroBytes(1))\n",
+    },
+  ],
+  [
+    "a `zeroBytes` imported from another module",
+    {
+      "main.vl": ZB_FILL + 'import { zeroBytes } from "./zb"\n' +
+        "const a: u8[] = filled(4, 0)\nprint(a.length + zeroBytes(1))\n",
+      "zb.vl": "export function zeroBytes(n: i32) { return n * 100 }\n",
+    },
+  ],
+  [
+    "a parameter named `zeroBytes` in scope",
+    {
+      "main.vl": ZB_FILL +
+        "function k(zeroBytes: i32) {\n  const a: u8[] = filled(4, 0)\n" +
+        "  return a.length + zeroBytes\n}\nprint(k(5))\n",
+    },
+  ],
+  [
+    "a module `const zeroBytes` declared after the call",
+    {
+      "main.vl": ZB_FILL + "function k() {\n  const a: u8[] = filled(4, 0)\n" +
+        "  return a.length + zeroBytes\n}\nconst zeroBytes = 7\nprint(k())\n",
+    },
+  ],
+  [
+    "a comment inside the call",
+    {
+      "main.vl": ZB_FILL +
+        "const a: u8[] = filled(\n  4, // n\n  0,\n)\nprint(a.length)\n",
+    },
+  ],
+];
+for (const [what, files] of zbDeclines) {
+  fixCase(
+    `a literal-zero \`filled\` into a \`u8[]\` is left alone beside ${what}`,
+    files,
+    files["main.vl"],
+  );
+}
+
+fixCase(
+  "the `vl fmt` trailing-comma `filled` call and every spelling of zero rewrite to `zeroBytes`",
+  {
+    "main.vl": ZB_FILL + "const a: u8[] = filled(\n  4 * 2,\n  0,\n)\n" +
+      "const b: u8[] = filled(2, -0)\nconst c: u8[] = filled(2, 0x0)\n" +
+      "const d: u8[] = filled(2, 00)\nconst e: u8[] = filled(2, 0 as u8)\n" +
+      "print(a.length + b.length + c.length + d.length + e.length)\n",
+  },
+  'import { zeroBytes } from "std:bytes"\nconst a = zeroBytes(4 * 2)\n' +
+    "const b = zeroBytes(2)\nconst c = zeroBytes(2)\nconst d = zeroBytes(2)\n" +
+    "const e = zeroBytes(2)\nprint(a.length + b.length + c.length + d.length + e.length)\n",
+);
