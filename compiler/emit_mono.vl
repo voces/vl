@@ -9939,6 +9939,29 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
   none
 }
 
+// The lifted lambda an un-annotated `let` binding read at `at` in frame `ctx` holds from its
+// initializer, an un-annotated `const` binding of it (`const c = (y) => …; let d = c`), or -1.
+// The binding may be reassigned, so the caller instantiates the lambda without re-spelling (D3833).
+function monoLetAliasLamFe(name: string, at: i32, ctx: i32): i32 {
+  const lf = monoLetFrameOf(name, at, ctx)
+  const fx = lf[0]
+  const li = lf[1]
+  if li < 0 { return -1 }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return -1 }
+  if d.letKw != "let" || d.letType >= 0 || d.letInit < 0 { return -1 }
+  const src = P.nodes[d.letInit]
+  if !(src is Ident) { return -1 }
+  const sfe = identClosureFeAt(sidOfNode(d.letInit), fx, d.letInit)
+  if sfe < 0 || !criFnIsAnonLambda(sfe) { return -1 }
+  const si = identLetOfAt(sidOfNode(d.letInit), fx, d.letInit)
+  if si < 0 { return -1 }
+  const sd = P.nodes[si]
+  if !(sd is LetDecl) { return -1 }
+  if sd.letKw != "const" || sd.letType >= 0 { return -1 }
+  sfe
+}
+
 // Re-spells callee `calleeIx` as the name its chain of un-annotated `const` aliases ends at,
 // when that is an un-annotated `const` binding of a lambda the call reads unshadowed. The
 // chain may live in an enclosing frame, read as a capture (D3825). Any other chain, or one
@@ -10032,6 +10055,7 @@ function monoWalk(ix: i32, ctx: i32) {
         // re-read rather than reused from `dfe`, the coercion loop between having run.
         let afe = identClosureFeAt(sidOfNode(n.callFn), ctx, n.callFn)
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
+        if afe < 0 { afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx) }
         if afe >= 0 {
           if !criFnIsAnonLambda(afe) {
             // The fold below rewrites `f(x)` into a by-name call to the initializer's
@@ -10369,26 +10393,55 @@ function monoAssignedPeerFe(fe: i32) {
   let tgt = -1
   let seen = 0
   let i = 0
+  let ctx = -1
+  if fe < fnParent.length {
+    const pp = fnParent[fe]
+    if pp >= 0 && pp < fnStmts.length { ctx = fnStmts[pp] }
+  }
   while i < P.nodes.length {
     const nd = P.nodes[i]
     if nd is BinExpr {
-      if nd.binOp == "=" && nd.binRight == node {
+      if nd.binOp == "=" {
         const lt = P.nodes[nd.binLeft]
         if lt is Ident {
-          tgt = nd.binLeft
-          seen = seen + 1
+          // The lambda itself, or an un-annotated `const` binding of it (D3833).
+          let hit = nd.binRight == node
+          if !hit {
+            const rn = P.nodes[nd.binRight]
+            if rn is Ident {
+              if (
+                identClosureFeAt(sidOfNode(nd.binRight), ctx, nd.binRight)
+                == fe
+              ) {
+                const ri = identLetOfAt(
+                  sidOfNode(nd.binRight),
+                  ctx,
+                  nd.binRight,
+                )
+                if ri >= 0 {
+                  const rd = P.nodes[ri]
+                  if rd is LetDecl {
+                    hit = rd.letKw == "const" && rd.letType < 0
+                  }
+                }
+              }
+            }
+          }
+          if hit {
+            tgt = nd.binLeft
+            seen = seen + 1
+          }
         }
       }
     }
     i = i + 1
   }
   if seen != 1 || tgt < 0 { return -1 }
-  let ctx = -1
-  if fe < fnParent.length {
-    const pp = fnParent[fe]
-    if pp >= 0 && pp < fnStmts.length { ctx = fnStmts[pp] }
+  let peer = identClosureFeAt(sidOfNode(tgt), ctx, tgt)
+  if peer < 0 {
+    const tn = P.nodes[tgt]
+    if tn is Ident { peer = monoLetAliasLamFe(tn.identName, tgt, ctx) }
   }
-  const peer = identClosureFeAt(sidOfNode(tgt), ctx, tgt)
   if peer == fe { return -1 }
   peer
 }
@@ -10669,6 +10722,7 @@ export function monomorphize(stmts: i32[]) {
     gc = gc + 1
   }
   const cndVal = monoNamesUsedAsValue(cndNm)
+  const deadLams = monoUnreadLamSlots(nDecl)
   let gp = 0
   while gp < nDecl {
     if fnStmts[gp] == monoOrigNode[gp] {
@@ -10701,6 +10755,8 @@ export function monomorphize(stmts: i32[]) {
             if cndFe[ci] == gp && cndVal[ci] == 0 { prune = true }
             ci = ci + 1
           }
+          // A hole lambda no call pinned and no read reaches has nothing to lower at (D3832).
+          if !prune && i32ListHas(deadLams, gp) { prune = true }
           // D426 — the lambda template, the `<T>` arm above one frame down. Each
           // instance mints its own copy with the pin substituted. Gate (1) is inverted
           // here, the property being decided by the annotation rather than by the slot.
@@ -10747,6 +10803,86 @@ export function monomorphize(stmts: i32[]) {
     gp = gp + 1
   }
   0
+}
+
+// The lifted slots below `nDecl` holding an un-instantiated hole lambda that is the initializer
+// of an un-annotated `const` no name in its frame reads. Its parameter has no type but the `i32`
+// default, at which its body need not validate; nothing calls or passes it, so it is stubbed.
+// The frame is searched by name, nested functions included, so a shadowing read keeps it.
+function monoUnreadLamSlots(nDecl: i32): i32[] {
+  const out: i32[] = []
+  let fe = 0
+  while fe < nDecl {
+    if (
+      monoGen[fe] == 1
+      && criFnIsAnonLambda(fe)
+      && fnStmts[fe] == monoOrigNode[fe]
+    ) {
+      if !monoInstantiatedAny(fe) && monoLamUnread(fe) { out.push(fe) }
+    }
+    fe = fe + 1
+  }
+  out
+}
+
+// Whether the lambda in slot `fe` initializes an un-annotated `const` that nothing in its
+// enclosing frame (the program, at top level) reads by name.
+function monoLamUnread(fe: i32): boolean {
+  const roots: i32[] = []
+  let pf = -1
+  if fe < fnParent.length { pf = fnParent[fe] }
+  if pf >= 0 && pf < fnStmts.length {
+    const f = P.nodes[fnStmts[pf]]
+    if f is FuncDecl { roots.push(f.fnBody) } else { return false }
+  } else {
+    for st in monoProgStmts { roots.push(st) }
+  }
+  const node = fnStmts[fe]
+  let name = ""
+  const stack: i32[] = []
+  for r in roots { stack.push(r) }
+  const seen: i32[] = []
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      seen.push(ix)
+      const bn = monoConstInitName(ix, node)
+      if bn != "" { name = bn }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for k in nodeChildren(ix) { stack.push(k) }
+    }
+  }
+  if name == "" { return false }
+  for ix in seen {
+    if monoIdentNameOf(ix) == name { return false }
+  }
+  true
+}
+
+// The name of the un-annotated `const` node `ix` declares with initializer `init`, or "".
+function monoConstInitName(ix: i32, init: i32): string {
+  const nd = P.nodes[ix]
+  if nd is LetDecl {
+    if nd.letInit == init && nd.letKw == "const" && nd.letType < 0 {
+      return nd.letName
+    }
+  }
+  ""
+}
+
+// The body of function node `ix`, which `nodeChildren` does not enter; -1 for any other node.
+function monoNestedBodyOf(ix: i32): i32 {
+  const nd = P.nodes[ix]
+  if nd is FuncDecl { return nd.fnBody }
+  -1
+}
+
+// The name identifier node `ix` reads, or "" for any other node.
+function monoIdentNameOf(ix: i32): string {
+  const nd = P.nodes[ix]
+  if nd is Ident { return nd.identName }
+  ""
 }
 
 // Does the annotation node `ix` mention any of `typarams`? The parser's spelling tree
