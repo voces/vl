@@ -379,6 +379,7 @@ import {
   coalesceCallSlot,
   coalesceCallStrSlot,
   ctrlDepth,
+  curBuf,
   emitFailed,
   emitLetCursor,
   externIdxAt,
@@ -415,6 +416,8 @@ import {
   fsIdxAt,
   gCellIdx,
   gConstExprEmit,
+  gEmitNames,
+  gEmitSrcMap,
   gF32PrintIdx,
   gF64PrintIdx,
   gFnTableIdx,
@@ -16086,6 +16089,9 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
     }
   }
   const e = P.nodes[exprIx]
+  if e is Index && exprIx != idxSpanNode && idxSpanOn() {
+    return emitIndexBanked(body, exprIx, fnIx)
+  }
   if e is NumLit { return emitNumLitNode(body, e, exprIx, fnIx) }
   if e is BoolLit {
     // `boolean` rides in an i32: true=1, false=0 (already decoded into `boolVal`).
@@ -27700,6 +27706,30 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
     return 0
   }
   emitFail("emitProgram: function has no block body")
+}
+
+// The `Index` node `emitExpr` is lowering under `emitIndexBanked`, so the re-entry lowers it.
+let idxSpanNode = -1
+
+// Whether element reads bank their own `vl-src` row: only when the section is written at all.
+function idxSpanOn(): boolean { gEmitNames != 0 && gEmitSrcMap != 0 }
+
+// Lowers element read `exprIx` and banks its byte range as an element-read span row, so a
+// trap in it resolves to the read's own column rather than its statement's. Adds no code:
+// the row lands only in the `vl-src` section, and only when `body` is the buffer written.
+function emitIndexBanked(body: u8[], exprIx: i32, fnIx: i32): i32 {
+  const outer = idxSpanNode
+  const from = body.length
+  const direct = curBuf.length == from
+  idxSpanNode = exprIx
+  const r = emitExpr(body, exprIx, fnIx)
+  idxSpanNode = outer
+  const to = body.length
+  if r < 0 || !direct || to <= from { return r }
+  let pos = -1
+  if fnIx >= 0 { pos = fnStmtsPosOf(fnIx) }
+  bankSpanRow(exprIx, pos, from, to, 6, "")
+  r
 }
 
 // Banks a statement's byte range, so a trap frame resolves to the line the instruction came
