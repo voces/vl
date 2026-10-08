@@ -9960,6 +9960,13 @@ function monoAliasChainWritten(name: string, at: i32, ctx: i32): boolean {
     if lf[1] < 0 { return false }
     const d = P.nodes[lf[1]]
     if !(d is LetDecl) { return false }
+    // A capture cell exists because its binding is written after capture.
+    if (
+      monoGeneratedCellElem(d.letInit) >= 0
+      || monoCellReadName(d.letInit) != ""
+    ) {
+      return true
+    }
     const src = monoIdentNameOf(d.letInit)
     if src == "" { return false }
     nm = src
@@ -10041,16 +10048,22 @@ function monoAliasChainLamFe(
         return sfe
       }
     }
+    // The rewrite's capture cell `let d = [v]` holds `v`, and is written as `d[0] = …`.
+    let initIx = d.letInit
+    const cellEl = monoGeneratedCellElem(initIx)
+    if cellEl >= 0 { initIx = cellEl }
     if d.letKw == "let" {
       sawLet = true
       // A `let` written anywhere with a value that is no hole lambda holds what this walk
       // cannot name; the call stays unresolved and keeps its loud refusal.
-      if !monoLetWritesAreLams(nm, fx, false) { return -1 }
+      if !monoLetWritesAreLams(nm, fx, cellEl >= 0) { return -1 }
     }
-    const src = P.nodes[d.letInit]
-    if !(src is Ident) { return -1 }
-    nm = src.identName
-    ax = d.letInit
+    // A name, or a read through another binding's capture cell (`let d4 = d2[0]`, D3850).
+    let next = monoIdentNameOf(initIx)
+    if next == "" { next = monoCellReadName(initIx) }
+    if next == "" { return -1 }
+    nm = next
+    ax = initIx
     fr = fx
     hops = hops + 1
   }
@@ -10076,6 +10089,8 @@ function monoLamValueFe(vx: i32, fx: i32): i32 {
   }
   let nm = monoIdentNameOf(vx)
   let ax = vx
+  // A read through the rewrite's capture cell, `d[0]`, is a read of `d` (D3850).
+  if nm == "" { nm = monoCellReadName(vx) }
   let fr = fx
   let hops = 0
   while nm != "" && hops < MONO_ALIAS_CHAIN_MAX {
@@ -10095,10 +10110,24 @@ function monoLamValueFe(vx: i32, fx: i32): i32 {
       if ls >= 0 && criFnIsAnonLambda(ls) { return ls }
       return -1
     }
-    nm = monoIdentNameOf(d.letInit)
-    ax = d.letInit
+    // The rewrite's cell `let d = [v]` holds `v`.
+    let init = d.letInit
+    const cellEl = monoGeneratedCellElem(init)
+    if cellEl >= 0 { init = cellEl }
+    nm = monoIdentNameOf(init)
+    ax = init
     fr = lf[0]
     hops = hops + 1
+  }
+  -1
+}
+
+// The one element of the capture cell the rewrite builds (`[v]`, no source position) at node
+// `ix`, or -1 for any other node.
+function monoGeneratedCellElem(ix: i32): i32 {
+  const lit = P.nodes[ix]
+  if lit is ArrayLit {
+    if lit.pos < 0 && lit.arrElems.length == 1 { return lit.arrElems[0] }
   }
   -1
 }
@@ -10641,8 +10670,8 @@ export function monoGenericAliasFe(letIx: i32) {
 function monoAssignedPeerFe(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const node = fnStmts[fe]
-  let tgt = -1
-  let seen = 0
+  const tgts: i32[] = []
+  const tkeys: string[] = []
   let i = 0
   let ctx = -1
   if fe < fnParent.length {
@@ -10665,27 +10694,66 @@ function monoAssignedPeerFe(fe: i32) {
             hit = monoLamValueFe(nd.binRight, wf) == fe
           }
           if hit {
-            tgt = nd.binLeft
-            seen = seen + 1
+            const tkey = monoIdentNameOf(nd.binLeft) + "|" + lcell
+            if !strListHas(tkeys, tkey) {
+              tkeys.push(tkey)
+              tgts.push(nd.binLeft)
+            }
           }
         }
       }
     }
     i = i + 1
   }
-  if seen != 1 || tgt < 0 { return -1 }
-  const tcell = monoCellReadName(tgt)
-  if tcell != "" {
-    const cpeer = monoCellLamFe(tcell, tgt, ctx)
-    if cpeer == fe { return -1 }
-    return cpeer
+  // Each binding the lambda is written into holds one signature. Written into several, it takes
+  // theirs where they agree (D3850); where two settled ones disagree there is no single one.
+  let pick = -1
+  const pickPins: string[] = []
+  for tgt in tgts {
+    const peer = monoTargetPeerFe(tgt, ctx)
+    if peer >= 0 && peer != fe {
+      if pick < 0 { pick = peer }
+      if (
+        peer < monoGen.length
+        && (monoInstantiatedAny(peer) || monoGen[peer] == 0)
+      ) {
+        const pins: string[] = []
+        if monoSlotParamPins(peer, pins) {
+          if pickPins.length == 0 {
+            for pn in pins { pickPins.push(pn) }
+            pick = peer
+          } else if !monoStrListsSame(pins, pickPins) {
+            return -1
+          }
+        }
+      }
+    }
   }
+  pick
+}
+
+// Whether two string lists hold the same strings in the same order.
+function monoStrListsSame(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The lambda the write target `tgt` (a name, or a capture cell's `name[0]`) holds from its
+// initializer chain, read in frame `ctx`; -1 when none.
+function monoTargetPeerFe(tgt: i32, ctx: i32): i32 {
+  if tgt < 0 || tgt >= P.nodes.length { return -1 }
+  const tcell = monoCellReadName(tgt)
+  if tcell != "" { return monoCellLamFe(tcell, tgt, ctx) }
   let peer = identClosureFeAt(sidOfNode(tgt), ctx, tgt)
   if peer < 0 {
     const tn = P.nodes[tgt]
     if tn is Ident { peer = monoLetAliasLamFe(tn.identName, tgt, ctx) }
   }
-  if peer == fe { return -1 }
   peer
 }
 
@@ -10804,6 +10872,35 @@ function monoLiftedDescendants(slot: i32): i32[] {
     }
   }
   out
+}
+
+// A lambda written into a `let` (or its capture cell) that the lambda in slot `fe` initializes:
+// one cell, so `fe` takes that lambda's signature (D3850). Only a peer already instantiated, or
+// with no hole, answers; -1 when no write qualifies.
+function monoInitPeerFe(fe: i32, nDecl: i32): i32 {
+  if fe < 0 || fe >= fnParent.length { return -1 }
+  let ctx = -1
+  const pp = fnParent[fe]
+  if pp >= 0 && pp < fnStmts.length { ctx = fnStmts[pp] }
+  monoLetWritesExtend()
+  for k in monoLetWrites.keys() {
+    for i in monoLetWrites.get(k) ?? [] {
+      const nd = P.nodes[i]
+      if nd is BinExpr {
+        if monoFrameHolds(ctx, i) {
+          let wf = ctx
+          if ctx >= 0 { wf = monoFrameOfNode(i, ctx) }
+          if monoLamValueFe(nd.binLeft, wf) == fe {
+            const peer = monoLamValueFe(nd.binRight, wf)
+            if peer >= 0 && peer != fe && peer < nDecl {
+              if monoInstantiatedAny(peer) || monoGen[peer] == 0 { return peer }
+            }
+          }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // The concrete parameter spellings a lifted slot's declaration carries, appended to `out`
@@ -10954,7 +11051,8 @@ export function monomorphize(stmts: i32[]) {
         // The binding's signature first, where this lambda got its slot from an `f = …`
         // write: pinning it from its peer is what makes the two lambdas one cell. The
         // cascade's catch-all instead puts an i32 parameter under an f64-typed cell.
-        const peer = monoAssignedPeerFe(fe3)
+        let peer = monoAssignedPeerFe(fe3)
+        if peer < 0 { peer = monoInitPeerFe(fe3, nDecl) }
         // A peer with no hole is its own signature: an annotated lambda never instantiates.
         if (
           peer >= 0
@@ -11146,10 +11244,95 @@ function monoLamUnread(fe: i32): boolean {
     }
   }
   if name == "" { return false }
+  // A read that only initializes another un-annotated binding nothing reads does not keep the
+  // lambda: `const d1 = c` with `d1` unread leaves `c` as uncalled as before (D3850).
+  const aliasInit: i32[] = []
+  // A write's target is no read of it, and its value is read only as far as the target is.
+  const lhs: i32[] = []
+  const writeVal: i32[] = []
+  const writeTo: string[] = []
   for ix in seen {
-    if monoIdentNameOf(ix) == name { return false }
+    const ai = monoAliasInitOf(ix)
+    if ai >= 0 { aliasInit.push(ai) }
+    const nd = P.nodes[ix]
+    if nd is BinExpr {
+      if nd.binOp == "=" {
+        let tname = monoIdentNameOf(nd.binLeft)
+        let tnode = nd.binLeft
+        if tname == "" {
+          tname = monoCellReadName(nd.binLeft)
+          const li = P.nodes[nd.binLeft]
+          if li is Index { tnode = li.idxArr }
+        }
+        if tname != "" {
+          lhs.push(tnode)
+          writeVal.push(nd.binRight)
+          writeTo.push(tname)
+        }
+      }
+    }
+  }
+  const visiting: string[] = []
+  monoNameUnread(name, seen, aliasInit, lhs, writeVal, writeTo, visiting)
+}
+
+// The initializer node of the un-annotated binding node `ix` declares when it is a bare name,
+// or -1.
+function monoAliasInitOf(ix: i32): i32 {
+  const nd = P.nodes[ix]
+  if nd is LetDecl {
+    if nd.letType < 0 && nd.letInit >= 0 && monoIdentNameOf(nd.letInit) != "" {
+      return nd.letInit
+    }
+  }
+  -1
+}
+
+// Whether nothing among `seen` reads `name` except as the initializer of a binding that is
+// itself unread by the same test. `visiting` cuts a cycle, answering "read".
+function monoNameUnread(
+  name: string,
+  seen: i32[],
+  aliasInit: i32[],
+  lhs: i32[],
+  writeVal: i32[],
+  writeTo: string[],
+  visiting: string[],
+): boolean {
+  if strListHas(visiting, name) || visiting.length > 64 { return false }
+  visiting.push(name)
+  for ix in seen {
+    if monoIdentNameOf(ix) == name && !i32ListHas(lhs, ix) {
+      let owner = ""
+      if i32ListHas(aliasInit, ix) {
+        owner = monoAliasOwnerName(ix, seen)
+      } else {
+        let w = 0
+        while w < writeVal.length {
+          if writeVal[w] == ix { owner = writeTo[w] }
+          w = w + 1
+        }
+      }
+      if owner == "" { return false }
+      if (
+        !monoNameUnread(owner, seen, aliasInit, lhs, writeVal, writeTo, visiting)
+      ) {
+        return false
+      }
+    }
   }
   true
+}
+
+// The name of the binding among `seen` whose initializer is node `init`, or "".
+function monoAliasOwnerName(init: i32, seen: i32[]): string {
+  for ix in seen {
+    const nd = P.nodes[ix]
+    if nd is LetDecl {
+      if nd.letInit == init { return nd.letName }
+    }
+  }
+  ""
 }
 
 // The name of the un-annotated `const` node `ix` declares with initializer `init`, or "".
