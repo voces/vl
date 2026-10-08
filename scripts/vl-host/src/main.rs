@@ -603,6 +603,8 @@ program verbatim — the only way to pass one that starts with `-`.
 
 {b}Environment:{r}
   {c}VL_WASM_OPT{r} / {c}VL_WASM_DIS{r}   Explicit binaryen tool paths (else PATH)
+  {c}VL_JOBS{r}=<N>                   With -O/-O3: wasm-opt's thread count when
+                                {c}BINARYEN_CORES{r} is unset (else at most 4)
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}    As in `vl help run`
   {c}VL_COMPILE_GC{r}                 As in `vl help run`
   {c}VL_MV_EXPLAIN{r}=1               With -O/-O3: say on stderr why each small record
@@ -725,7 +727,8 @@ tests continue in a fresh instance.
 
 {b}Flags:{r}
   {c}-t{r} <name>           Only tests whose name contains <name> (also -t=<name>)
-  {c}--jobs{r} <N>          Worker threads (default: one per core; also --jobs=<N>).
+  {c}--jobs{r} <N>          Worker threads (default: $VL_JOBS, else one per core;
+                      also --jobs=<N>).
                       Compiles are also capped by available memory; --jobs 1
                       compiles every file in one compiler, one at a time
   {c}--exclude{r} <glob>    Skip matching files (repeatable; also --exclude=<glob>)
@@ -736,7 +739,10 @@ tests continue in a fresh instance.
                       test module declares is refused
 
 {b}Environment:{r}
-  {c}VL_TEST_TRACE{r}=1     Print per-file scheduling stamps to stderr
+  {c}VL_JOBS{r}=<N>         Worker threads when --jobs is not given (a positive integer;
+                      anything else is ignored with a warning)
+  {c}VL_TEST_TRACE{r}=1     Print per-file scheduling stamps and each phase's worker
+                      count to stderr
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}   As in `vl help run`
 
 {b}Exit:{r} 0 all selected tests passed; 1 any failure; 2 usage error;
@@ -6712,10 +6718,16 @@ fn optimize_in_place(
     cmd.args(&argv);
     // Binaryen spins a worker per core by default; past a handful the extra threads buy
     // little wall time and cost CPU and memory, which is what a build farm pays for. An
-    // explicit `$BINARYEN_CORES` wins. The output does not depend on the thread count.
+    // explicit `$BINARYEN_CORES` wins, then `$VL_JOBS`; only with neither set does the cap
+    // apply. The output does not depend on the thread count.
     if std::env::var_os("BINARYEN_CORES").is_none() {
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        cmd.env("BINARYEN_CORES", cores.min(BINARYEN_CORES_DEFAULT).to_string());
+        let cores = match vl_jobs() {
+            Some(n) => n,
+            None => std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(BINARYEN_CORES_DEFAULT),
+        };
+        cmd.env("BINARYEN_CORES", cores.to_string());
     }
     let status = cmd
         .status()
@@ -7484,16 +7496,39 @@ fn test_engine(slot: &mut Option<Engine>) -> Result<Engine> {
     Ok(engine)
 }
 
-/// How many workers to use: the brain's `--jobs` when it asked for one, else one
-/// per available core. (`--jobs` is POLICY the VL side parses; the ncpu default is
-/// mechanism only the host can see.)
+/// How many workers to use: the brain's `--jobs` when it asked for one, else `$VL_JOBS`,
+/// else one per available core. (`--jobs` is POLICY the VL side parses; the environment
+/// and the ncpu default are mechanism only the host can see.)
 fn test_worker_count(requested: i32) -> usize {
     if requested > 0 {
         return requested as usize;
     }
+    if let Some(n) = vl_jobs() {
+        return n;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// `$VL_JOBS` as a positive worker count, or `None` when it is unset. A value that is not a
+/// positive integer is `None` too, after a one-line warning (printed once per process), so a
+/// typo falls back to the default rather than failing the run.
+fn vl_jobs() -> Option<usize> {
+    static JOBS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *JOBS.get_or_init(|| {
+        let raw = std::env::var("VL_JOBS").ok()?;
+        let parsed = parse_vl_jobs(&raw);
+        if parsed.is_none() {
+            eprintln!("vl: ignoring VL_JOBS={raw:?}: want a positive integer");
+        }
+        parsed
+    })
+}
+
+/// A `$VL_JOBS` value as a worker count: a positive integer, surrounding blanks allowed.
+fn parse_vl_jobs(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|n| *n > 0)
 }
 
 /// What one pooled compile is assumed to hold at its peak, for the memory cap below.
@@ -8334,6 +8369,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // fails the run as the serial compile would have.
                 let jobs = inst.get_typed_func::<(), i32>(&mut store, "cliTestJobsWanted")?;
                 let workers = test_compile_workers(jobs.call(&mut store, ())?, test_queue.len());
+                if test_trace_on() {
+                    eprintln!("vl-test-trace workers phase=compile n={workers}");
+                }
                 let commit =
                     inst.get_typed_func::<i32, i32>(&mut store, "cliTestCompiledCommit")?;
                 let trace = test_trace_on();
@@ -8377,6 +8415,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // ORDER — the brain attributes names to files by commit order.
                 let jobs = inst.get_typed_func::<(), i32>(&mut store, "cliTestJobsWanted")?;
                 let workers = test_worker_count(jobs.call(&mut store, ())?);
+                if test_trace_on() {
+                    eprintln!("vl-test-trace workers phase=collect n={workers}");
+                }
                 let name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliTestNamePush")?;
                 let name_commit =
                     inst.get_typed_func::<i32, i32>(&mut store, "cliTestNameCommit")?;
@@ -8413,6 +8454,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // in PLAN order so the report is deterministic.
                 let jobs = inst.get_typed_func::<(), i32>(&mut store, "cliTestJobsWanted")?;
                 let workers = test_worker_count(jobs.call(&mut store, ())?);
+                if test_trace_on() {
+                    eprintln!("vl-test-trace workers phase=run n={workers}");
+                }
                 let plan_count = inst.get_typed_func::<(), i32>(&mut store, "cliTestPlanCount")?;
                 let plan_file = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPlanFile")?;
                 let plan_test = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPlanTest")?;
