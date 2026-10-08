@@ -281,3 +281,29 @@ fixCase(
     'const s = "a,b"\nconst xs = [1, 2]\n' +
     'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
 );
+
+// ---- `filled(n, 0)` into a `u8[]` (lane DG): `u8` is storage, so the fix is `zeroBytes(n)` ----
+
+fixCase(
+  "a literal-zero `filled` delivered as a `u8[]` becomes `zeroBytes`, with its import",
+  {
+    "main.vl": 'import { filled } from "std:array"\nimport { u16le } from "std:bytes"\n' +
+      "function f(b: u8[]): i32 { return b.length }\n" +
+      "function g(): u8[] { return filled(4 * 2, 0) }\n" +
+      "const a: u8[] = filled(16, 0 as! u8)\n" +
+      "print(f(filled(f(g()), (0))) + a.length + u16le(g(), 0))\n",
+  },
+  // The orphaned `filled` import and the now-redundant annotations go in the next round.
+  'import { u16le, zeroBytes } from "std:bytes"\n' +
+    "function f(b: u8[]) { return b.length }\n" +
+    "function g(): u8[] { return zeroBytes(4 * 2) }\n" +
+    "const a = zeroBytes(16)\nprint(f(zeroBytes(f(g()))) + a.length + u16le(g(), 0))\n",
+);
+
+fixCase(
+  "a non-zero `filled` into a `u8[]` is not rewritten",
+  {
+    "main.vl": 'import { filled } from "std:array"\nconst a: u8[] = filled(16, 7)\nprint(a.length)\n',
+  },
+  'import { filled } from "std:array"\nconst a: u8[] = filled(16, 7)\nprint(a.length)\n',
+);

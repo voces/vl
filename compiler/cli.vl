@@ -320,6 +320,12 @@ let cliImpSpec: string[] = []
 let cliImpClash: string[] = []
 // Whether a method call (not a plain use) asked for each `cliImpItem` row (`cliImpAdd`).
 let cliImpMethod: boolean[] = []
+// The spans of this file's `filled(n, 0)` calls refused into a `u8[]` (`cliNoteZeroBytesFix`):
+// 1-based start line and column, then end line and exclusive end column.
+let cliZbLine: i32[] = []
+let cliZbCol: i32[] = []
+let cliZbEndLine: i32[] = []
+let cliZbEndCol: i32[] = []
 // ── `vl test` (cliCmd == 2) ────────────────────────────────────────────────────
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
@@ -1251,6 +1257,10 @@ function cliCheckCurFileRest() {
   cliImpSpec = []
   cliImpClash = []
   cliImpMethod = []
+  cliZbLine = []
+  cliZbCol = []
+  cliZbEndLine = []
+  cliZbEndCol = []
   const n = diagCount()
   let i = 0
   while i < n {
@@ -1268,7 +1278,10 @@ function cliCheckCurFileRest() {
       vcDiagMsg(i),
       diagModule(i),
     )
-    if cliFix != 0 && diagModule(i) == 0 { cliNoteImportFix(i) }
+    if cliFix != 0 && diagModule(i) == 0 {
+      cliNoteImportFix(i)
+      cliNoteZeroBytesFix(i)
+    }
     i = i + 1
   }
   // The engine rejected the module this file emitted. Positioned: the emitter banks
@@ -2249,6 +2262,7 @@ function cliCollectFixes(src: string) {
   for lb in impLb {
     cliImportFixEdits(src, lb, impOff, starts, "unused import")
   }
+  cliZeroBytesEdits(src, starts)
   cliMissingImportEdits(src, starts)
   // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by replacing
   // the span from the name end to the `=` with a single space. The checker computed
@@ -2474,6 +2488,79 @@ function cliNoteImportFix(i: i32) {
   // to the author rather than re-proposed under a fresh alias every round.
   if cliDataVals(data, "alias").length > 0 { return 0 }
   cliImpAdd(member[0], mods[0], code == "ufcs-not-imported")
+}
+
+// Diagnostic `i` refuses a `filled(n, 0)` delivered into a `u8[]`: note the call's span.
+function cliNoteZeroBytesFix(i: i32) {
+  if vcDiagCode(i) != "filled-zero-bytes" { return 0 }
+  cliZbLine.push(diagLine(i))
+  cliZbCol.push(diagCol(i))
+  cliZbEndLine.push(diagEndLine(i))
+  cliZbEndCol.push(diagEndCol(i))
+  0
+}
+
+// The edits for the noted `filled(n, 0)` calls: each becomes `zeroBytes(n)`, and `zeroBytes`
+// is asked of `std:bytes`. A span whose text is not `filled(<n>, <fill>)` is left alone.
+function cliZeroBytesEdits(src: string, starts: i32[]) {
+  let k = 0
+  while k < cliZbLine.length {
+    const sl = cliZbLine[k] - 1
+    const el = cliZbEndLine[k] - 1
+    if sl >= 0 && sl < starts.length && el >= 0 && el < starts.length {
+      const so = starts[sl] + cliZbCol[k]
+      const eo = starts[el] + cliZbEndCol[k]
+      const comma = cliZbCountEnd(src, so, eo)
+      if comma > 0 {
+        const n = src.slice(so + 7, comma)
+        cliPushFixRepl(
+          so,
+          eo - so,
+          "zeroBytes(" + n + ")",
+          "zero bytes",
+          starts,
+        )
+        if !cliZbImported(src) { cliImpAdd("zeroBytes", "std:bytes", false) }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether `src`'s `std:bytes` import clause already names `zeroBytes`.
+function cliZbImported(src: string): boolean {
+  const rb = cliImportClauseOf(src, "std:bytes")
+  if rb < 0 { return false }
+  let lb = rb
+  while lb > 0 && src[lb] != '{' { lb = lb - 1 }
+  src.slice(lb, rb).includes("zeroBytes")
+}
+
+// The offset of the comma ending `n` in a `filled(n, <fill>)` spanning `[so, eo)`, else -1:
+// the only comma outside brackets, with no string or char literal anywhere in the call.
+function cliZbCountEnd(src: string, so: i32, eo: i32) {
+  if so < 0 || eo > src.length || eo - so < 11 { return -1 }
+  if src.slice(so, so + 7) != "filled(" || src[eo - 1] != ')' { return -1 }
+  let depth = 0
+  let comma = -1
+  let q = so + 7
+  while q < eo - 1 {
+    const c = src[q]
+    if c == '(' || c == '[' || c == '{' {
+      depth = depth + 1
+    } else if c == ')' || c == ']' || c == '}' {
+      depth = depth - 1
+    } else if c == '"' || c == '\'' {
+      return -1
+    } else if c == ',' && depth == 0 {
+      if comma >= 0 { return -1 }
+      comma = q
+    }
+    if depth < 0 { return -1 }
+    q = q + 1
+  }
+  comma
 }
 
 // A name two modules are asked for is a clash when a plain use asked: either import alone
