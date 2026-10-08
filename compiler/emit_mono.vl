@@ -124,6 +124,7 @@ import {
   tyToEmitName,
   tyToStr,
   tyToStructStr,
+  tyVarRenameRow,
   uniqueGenericDeclNamed,
   valueUnionRetName,
 } from "./typecheck"
@@ -5848,7 +5849,6 @@ function monoEnclosingPinRow(
   outT: i32[],
 ) {
   if origFe < 0 || origFe >= fnParent.length { return 0 }
-  if monoNestedShadowsOuter(origFe) { return 0 }
   let pos = fnParent[origFe]
   if callFrame >= 0 { pos = callFrame }
   let guard = 0
@@ -5878,6 +5878,151 @@ function monoEnclosingPinRow(
   0
 }
 
+// The declared type parameters a nested generic redeclares, renamed apart: each row of the
+// enclosing declarer's `T` becomes `T__sh<slot>`, which that declarer's instances also bind, so
+// a read typed at the outer `T` inside the nested one takes the outer pin (D3840). Parallel
+// columns: the declarer's slot, the parameter's name, and its alias.
+let monoShAliasSlot: i32[] = []
+let monoShAliasName: string[] = []
+let monoShAliasTo: string[] = []
+
+// Renames apart every declared type parameter a nested generic among the first `nDecl` slots
+// redeclares. -1 when a row belongs to both functions, which no alias can split.
+function monoShadowRename(nDecl: i32): i32 {
+  monoShAliasSlot = []
+  monoShAliasName = []
+  monoShAliasTo = []
+  let fe = 0
+  while fe < nDecl && fe < fnParent.length {
+    const f = P.nodes[fnStmts[fe]]
+    if f is FuncDecl {
+      if f.fnTyParams.length > 0 && monoNestedShadowsOuter(fe) {
+        for tp in f.fnTyParams {
+          let p = fnParent[fe]
+          let guard = 0
+          while p >= 0 && p < fnParent.length && guard <= fnStmts.length {
+            const pf = P.nodes[fnStmts[p]]
+            if pf is FuncDecl {
+              if strListHas(pf.fnTyParams, tp) {
+                if monoShadowRenameDecl(p, fe, tp) < 0 { return -1 }
+              }
+            }
+            p = fnParent[p]
+            guard = guard + 1
+          }
+        }
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// Renames declarer `d`'s rows of type parameter `name` apart from those of nested generic
+// `inner`, which redeclares it. -1, with the failure recorded, when the two share a row.
+function monoShadowRenameDecl(d: i32, inner: i32, name: string): i32 {
+  let k = 0
+  while k < monoShAliasSlot.length {
+    if monoShAliasSlot[k] == d && monoShAliasName[k] == name { return 0 }
+    k = k + 1
+  }
+  const own = monoTyParamRows(fnStmts[d], name)
+  const theirs = monoTyParamRows(fnStmts[inner], name)
+  for r in own {
+    if i32ListHas(theirs, r) {
+      return emitFail(
+        "emitProgram: a nested generic that redeclares its enclosing function's type parameter shares that parameter's type with it — rename the nested one",
+      )
+    }
+  }
+  const alias = name + "__sh" + i32ToStr(d)
+  for r in own { tyVarRenameRow(r, alias) }
+  monoShAliasSlot.push(d)
+  monoShAliasName.push(name)
+  monoShAliasTo.push(alias)
+  0
+}
+
+// The type variable rows named `name` that the annotations of function node `fx` resolve to,
+// its nested functions' included except those redeclaring `name`.
+function monoTyParamRows(fx: i32, name: string): i32[] {
+  const out: i32[] = []
+  const stack: i32[] = [fx]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur >= 0 && cur < P.nodes.length {
+      const nd = P.nodes[cur]
+      let enter = true
+      if nd is FuncDecl {
+        if cur != fx && strListHas(nd.fnTyParams, name) { enter = false }
+      } else if nd is TypeRef {
+        monoTyVarRowsNamed(nodeTyIxOf(cur), name, out, 0)
+      }
+      if enter {
+        for c in nodeChildren(cur) { stack.push(c) }
+      }
+    }
+  }
+  out
+}
+
+// Appends to `out` the type variable rows named `name` that type `t` holds. Bounded by depth.
+function monoTyVarRowsNamed(t: i32, name: string, out: i32[], depth: i32) {
+  if t < 0 || t >= T.tys.length || depth > 16 { return 0 }
+  const ty = T.tys[t]
+  match ty {
+    TyVar => {
+      if ty.tvName == name && !i32ListHas(out, t) { out.push(t) }
+    }
+    TyArray => {
+      monoTyVarRowsNamed(ty.aElem, name, out, depth + 1)
+    }
+    TyNullable => {
+      monoTyVarRowsNamed(ty.nInner, name, out, depth + 1)
+    }
+    TyMap => {
+      monoTyVarRowsNamed(ty.mKey, name, out, depth + 1)
+      monoTyVarRowsNamed(ty.mVal, name, out, depth + 1)
+    }
+    TyUnion => {
+      for m in ty.uMembers { monoTyVarRowsNamed(m, name, out, depth + 1) }
+    }
+    TyObj => {
+      for ft in ty.objFieldTypes {
+        monoTyVarRowsNamed(ft, name, out, depth + 1)
+      }
+    }
+    TyFunc => {
+      for pt in ty.fnParamTypes { monoTyVarRowsNamed(pt, name, out, depth + 1) }
+      monoTyVarRowsNamed(ty.fnRet, name, out, depth + 1)
+    }
+    TyPrim | TyLit | TyNeg | TyErr => {}
+  }
+  0
+}
+
+// Binds, beside each of instance `origFe`'s own parameters in `ns`/`ts`, the alias
+// `monoShadowRename` gave its rows.
+function monoShAliasBind(origFe: i32, ns: string[], ts: i32[]) {
+  let k = 0
+  while k < monoShAliasSlot.length {
+    if monoShAliasSlot[k] == origFe && !strListHas(ns, monoShAliasTo[k]) {
+      let i = 0
+      const n0 = ns.length
+      while i < n0 && i < ts.length {
+        if ns[i] == monoShAliasName[k] {
+          ns.push(monoShAliasTo[k])
+          ts.push(ts[i])
+          i = n0
+        }
+        i = i + 1
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
 // The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
 // generic called from it, consumed (and cleared) where the key is built; -1 for none.
 let monoCallFrameSlot = 0 - 1
@@ -5896,13 +6041,36 @@ function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
   if fe < 0 || fe >= fnParent.length || ctx < 0 { return -1 }
   const p0 = fnParent[fe]
   if p0 < 0 || captureCountOf(fe) == 0 { return -1 }
-  if monoNestedShadowsOuter(fe) { return -1 }
   let sl = fnStmtsPosOf(ctx)
   if sl < 0 || sl >= fnInstOrigin.length || sl >= fnParent.length { return -1 }
   // A recursive call from a frame-keyed instance keeps that instance's frame.
   if fnInstOrigin[sl] == fe { sl = fnParent[sl] }
   if sl < 0 || sl == p0 || sl >= fnInstOrigin.length { return -1 }
   if fnInstOrigin[sl] == p0 { return sl }
+  // A caller nested in another instance of the enclosing function (a sibling function, a
+  // lambda) would reach the template frame's instance, whose env is the wrong instance's:
+  // refused rather than lowered (D3827).
+  let up = sl
+  let guard = 0
+  while up >= 0 && up < fnParent.length && guard <= fnStmts.length {
+    up = fnParent[up]
+    if up == p0 || up == fe { return -1 }
+    // Inside an instance of the nested generic itself: that instance's frame is the answer.
+    if up >= 0 && up < fnInstOrigin.length && fnInstOrigin[up] == fe {
+      const own = fnParent[up]
+      if own >= 0 && own < fnInstOrigin.length && fnInstOrigin[own] == p0 {
+        return own
+      }
+      return -1
+    }
+    if up >= 0 && up < fnInstOrigin.length && fnInstOrigin[up] == p0 {
+      emitFail(
+        "emitProgram: a nested generic that captures its enclosing function's variables, called from a function nested in a second instance of that enclosing function, has no instance to call — call it from the enclosing function's own body, or annotate its type parameters",
+      )
+      return -1
+    }
+    guard = guard + 1
+  }
   -1
 }
 
@@ -7626,6 +7794,7 @@ function monoMakeInstanceGo(
     const exSubT: i32[] = []
     if monoNeedsExactKey(origFe) {
       if (monoExactBind(params, tps, pinTys, exBN, exBT, exSubN, exSubT)) {
+        monoShAliasBind(origFe, exSubN, exSubT)
         let xk = 0
         while xk < exSubN.length {
           key = key
@@ -7852,6 +8021,7 @@ function monoMakeInstanceGo(
     const letBN: string[] = exBN
     const letBT: i32[] = exBT
     monoBindCols(params, letTyCol, letBN, letBT)
+    monoShAliasBind(origFe, letBN, letBT)
     // Substitute a type-param-riding RETURN annotation through the binding —
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
     // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
@@ -11039,6 +11209,7 @@ export function monomorphize(stmts: i32[]) {
     if monoHasConcreteHOFParam() { any = true }
   }
   if !any { return 0 }
+  if monoShadowRename(fnStmts.length) < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
   while i < stmts.length {

@@ -7,7 +7,7 @@
 // module, reads the two types off the failing operator, and writes each module type index with
 // its VL name (asked of the compiler that emitted the module) and its struct or array shape.
 //
-// THE WITNESSES MUST STILL BE INVALID: D3827 (two spellings) and D3817 are
+// THE WITNESSES MUST STILL BE INVALID: D3843 (two spellings) and D3817 are
 // check-clean invalid wasm on the seed this lands on. When one is fixed its case goes red at the
 // "still check-clean" or exit-code assertion; replace it with any other such program.
 //
@@ -77,41 +77,33 @@ type Case = {
 
 const CASES: Case[] = [
   {
-    name: "D3827: a record arriving where an i32 is expected names the record",
+    name: "D3843: a record expected where an i32 arrives names the record",
     files: {
-      "r.vl": "type A = { v: i32 }\n" +
-        "function outer<T>(x: T) {\n" +
-        "  function inner<U>(u: U) { x }\n" +
-        "  function other() { inner(true) }\n" +
-        "  other()\n" +
-        "}\n" +
-        "const a: A = { v: 1 }\n" +
-        "outer(7)\n" +
-        "outer(a)\n",
+      "r.vl": "type A = { x: i32 }\n" +
+        'function tag(self: A): string { "A" }\n' +
+        "const c = (y) => y.tag()\n" +
+        "function k(c: string) { c }\n" +
+        'print(k("z"))\n',
     },
     entry: "r.vl",
     want: [
-      "failed to validate inside `other`",
-      "type mismatch: expected i32, found (ref $0); $0 is `A`, struct {mut i32}",
+      "failed to validate inside `c`",
+      "type mismatch: expected (ref $0), found i32; $0 is `A`, struct {mut i32}",
     ],
     never: ["$type"],
   },
   {
     name:
-      "D3827: a string arriving where an i32 is expected names `string` and its shape",
+      "D3843: a string expected where an i32 arrives names `string` and its shape",
     files: {
-      "s.vl": "function outer<T>(x: T) {\n" +
-        "  function inner<U>(u: U) { print(x) }\n" +
-        "  function other() { inner(true) }\n" +
-        "  other()\n" +
-        "}\n" +
-        "outer(7)\n" +
-        'outer("s")\n',
+      "s.vl": 'const c = (y) => y + "C"\n' +
+        "function k(c: string) { c }\n" +
+        'print(k("z"))\n',
     },
     entry: "s.vl",
     want: [
-      "failed to validate inside `other`",
-      "type mismatch: expected i32, found (ref $2); $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
+      "failed to validate inside `c`",
+      "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
     ],
     never: ["$type"],
   },
