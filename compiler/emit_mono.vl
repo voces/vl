@@ -10972,6 +10972,8 @@ function monoPinLamFromPeer(fe: i32, nDecl: i32): i32 {
 let monoLastInstFe = 0 - 1
 // Per binding node a call goes through, the `;`-joined signatures the calls take.
 let monoBindCallSigs: {[i32]: string} = Map()
+// The frame each of those binding nodes is declared in.
+let monoBindCallFrame: {[i32]: i32} = Map()
 
 // Records the signature of the call just lowered through binding `name` read at `at` in frame
 // `ctx`, on that binding and on every binding its initializer chain names.
@@ -10988,8 +10990,11 @@ function monoNoteBindCall(name: string, at: i32, ctx: i32) {
     if lf[1] < 0 { return 0 }
     const d = P.nodes[lf[1]]
     if !(d is LetDecl) { return 0 }
+    // A call in a function nothing names never runs.
+    if hops == 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
     const had = monoBindCallSigs.get(lf[1]) ?? ""
     if !monoSigListHas(had, sig) { monoBindCallSigs.set(lf[1], had + sig) }
+    monoBindCallFrame.set(lf[1], lf[0])
     if d.letInit < 0 { return 0 }
     let iv = d.letInit
     const ce = monoGeneratedCellElem(iv)
@@ -11055,7 +11060,12 @@ function monoBindingSigConflict(nDecl: i32): i32 {
                   wBind.push(lf[1])
                   wLam.push(sl)
                   wFrame.push(wf)
-                  wDead.push(monoWriteValueUnread(i, tn, wf))
+                  // Only in the frame that declares the binding: another frame's write is read
+                  // after that frame returns.
+                  wDead.push(
+                    (wf == lf[0] && monoWriteValueUnread(i, tn, wf))
+                      || monoWriteInFnUnread(wf, tn, lf[0]),
+                  )
                 }
               }
             }
@@ -11064,6 +11074,24 @@ function monoBindingSigConflict(nDecl: i32): i32 {
       }
     }
     sl = sl + 1
+  }
+  // A binding called through but never written live still holds its initializer, which the
+  // calls' signature renames below.
+  for cb in monoBindCallSigs.keys() {
+    if !i32ListHas(binds, cb) {
+      const cd = P.nodes[cb]
+      if cd is LetDecl {
+        // A `let` some write names keeps its `call_ref`, so its value is what the calls reach.
+        const celled = cd.letInit >= 0 && monoGeneratedCellElem(cd.letInit) >= 0
+        const kept = cd.letKw == "let"
+          && (celled || monoNameIsAssigned(cd.letName))
+        if cd.letType < 0 && cd.letInit >= 0 && kept {
+          binds.push(cb)
+          bindFrames.push(monoBindCallFrame.get(cb) ?? -1)
+          names.push(cd.letName)
+        }
+      }
+    }
   }
   // Each binding's signatures: those its fixed values share. A value read through another such
   // binding is that binding's instance, so a second round reads those signatures back.
@@ -11134,24 +11162,30 @@ function monoBindingSigConflict(nDecl: i32): i32 {
   while b < binds.length {
     let target = monoSigFirst(targets[b])
     const calls = monoBindCallSigs.get(binds[b]) ?? ""
-    const bd = P.nodes[binds[b]]
-    if bd is LetDecl {
-      if bd.letInit >= 0 && calls != "" && target != "" {
-        let iv = bd.letInit
-        const ce = monoGeneratedCellElem(iv)
-        if ce >= 0 { iv = ce }
-        const fe = monoLamValueFe(iv, bindFrames[b])
-        if fe >= 0 && fe < nDecl && monoWriteNamesLam(iv, fe, bindFrames[b]) {
-          if !monoInstantiatedAny(fe) || monoSlotSig(fe) != target {
-            if monoInstanceFor(fe, monoSigPins(target), iv, -1) < 0 {
-              return -1
-            }
-            if !monoSigListHas(monoLamInstSigs(fe), target) {
+    if calls != "" && target != "" {
+      if monoRenameInitAt(binds[b], bindFrames[b], target, nDecl) < 0 {
+        return monoBindSigFail(names[b])
+      }
+    }
+    // A value read through a binding that no call settles is that binding's initializer: it
+    // takes this binding's signature too.
+    let fw = 0
+    while fw < wNode.length && target != "" {
+      if (
+        wBind[fw] == binds[b]
+        && !wDead[fw]
+        && !monoWriteNamesLam(wNode[fw], wLam[fw], wFrame[fw])
+      ) {
+        if !monoSigListHas(monoLamInstSigs(wLam[fw]), target) {
+          const sf = monoWriteSourceFrame(wNode[fw], wFrame[fw])
+          if sf[1] >= 0 && !i32ListHas(binds, sf[1]) {
+            if monoRenameInitAt(sf[1], sf[0], target, nDecl) < 0 {
               return monoBindSigFail(names[b])
             }
           }
         }
       }
+      fw = fw + 1
     }
     let w = 0
     while w < wNode.length {
@@ -11276,6 +11310,49 @@ function monoWriteValueUnread(wx: i32, name: string, fx: i32): boolean {
   true
 }
 
+// Whether a write to binding `name` inside function `wfn`, nested directly in the binding's frame
+// `fx`, is never read: every statement of `fx` naming `wfn` is outside a loop and comes after
+// every other statement naming `name`, and no other function or lambda there names `name`.
+function monoWriteInFnUnread(wfn: i32, name: string, fx: i32): boolean {
+  if wfn < 0 || wfn == fx { return false }
+  const slot = fnStmtsPosOf(wfn)
+  if slot < 0 || slot >= fnParent.length { return false }
+  const ps = fnParent[slot]
+  if ps < 0 || ps >= fnStmts.length || fnStmts[ps] != fx { return false }
+  const b = monoNestedBodyOf(fx)
+  if b < 0 { return false }
+  const bn = P.nodes[b]
+  if !(bn is Block) { return false }
+  const stmts = bn.blkStmts
+  const f = P.nodes[wfn]
+  let wname = ""
+  if f is FuncDecl { wname = f.fnName }
+  if wname == "" || criFnIsAnonLambda(slot) {
+    wname = monoConstNameOfInit(b, wfn)
+  }
+  if wname == "" { return false }
+  let firstCall = -1
+  let lastRead = -1
+  let i = 0
+  while i < stmts.length {
+    const st = stmts[i]
+    const own = st == wfn || monoConstInitName(st, wfn) != ""
+    if !own {
+      if monoSubtreeNamesIdent(st, wname, 0) {
+        const sn = P.nodes[st]
+        if sn is WhileStmt || sn is ForIn || sn is ForRange { return false }
+        if firstCall < 0 { firstCall = i }
+      }
+      if monoSubtreeNamesIdent(st, name, 0) {
+        lastRead = i
+        if monoFnInSubtreeNames(st, name) { return false }
+      }
+    }
+    i = i + 1
+  }
+  firstCall >= 0 && lastRead < firstCall
+}
+
 // Whether a function or lambda in the subtree at `ix` names `name`.
 function monoFnInSubtreeNames(ix: i32, name: string): boolean {
   const stack: i32[] = [ix]
@@ -11322,6 +11399,48 @@ function monoConstNameOfInit(ix: i32, init: i32): string {
     }
   }
   ""
+}
+
+// Instantiates the lambda binding node `li` (declared in frame `fx`) is initialized with, by
+// name, at signature `target`, renaming the initializer and retyping a capture cell it seeds.
+// -1 when that lambda cannot take the signature; 0 otherwise, including no such initializer.
+function monoRenameInitAt(li: i32, fx: i32, target: string, nDecl: i32): i32 {
+  const bd = P.nodes[li]
+  if !(bd is LetDecl) { return 0 }
+  if bd.letInit < 0 { return 0 }
+  let iv = bd.letInit
+  const ce = monoGeneratedCellElem(iv)
+  if ce >= 0 { iv = ce }
+  const fe = monoLamValueFe(iv, fx)
+  if fe < 0 || fe >= nDecl || !monoWriteNamesLam(iv, fe, fx) { return 0 }
+  if monoInstantiatedAny(fe) && monoSlotSig(fe) == target { return 0 }
+  monoLastInstFe = -1
+  if monoInstanceFor(fe, monoSigPins(target), iv, -1) < 0 { return -1 }
+  if !monoSigListHas(monoLamInstSigs(fe), target) { return -1 }
+  // A capture cell it seeds holds that instance, so it takes that instance's type.
+  if ce >= 0 && monoLastInstFe >= 0 {
+    const it = monoPinSubTyOf(
+      monoCellElemTyOf(bd.letInit, ce),
+      fnStmts[monoLastInstFe],
+    )
+    if monoTyConcreteFn(it) {
+      nodeTyRecord(ce, it)
+      nodeTyRecord(bd.letInit, mkArrayTy(it))
+    }
+  }
+  0
+}
+
+// The frame and binding node the written value `vx`, read in frame `fx`, is read from; the
+// binding is -1 for a value that is no name or cell read.
+function monoWriteSourceFrame(vx: i32, fx: i32): i32[] {
+  let nm = monoIdentNameOf(vx)
+  if nm == "" { nm = monoCellReadName(vx) }
+  if nm == "" {
+    const none: i32[] = [0 - 1, 0 - 1]
+    return none
+  }
+  monoLetFrameOf(nm, vx, fx)
 }
 
 // The binding node the written value `vx`, read in frame `fx`, is read from: a name or a capture
@@ -11680,6 +11799,7 @@ export function monomorphize(stmts: i32[]) {
   monoAnonParamPinTy = Map()
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
+  monoBindCallFrame = Map()
   monoLastInstFe = -1
   monoFnFieldTwinRow = Map()
   monoTwoListRet = Map()
@@ -12175,15 +12295,23 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
   const stack: i32[] = []
   for r in roots { stack.push(r) }
   const seen: i32[] = []
+  let top = -1
+  if pf >= 0 && pf < fnStmts.length { top = fnStmts[pf] }
   while stack.length > 0 {
     const ix = stack.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
-      seen.push(ix)
-      const bn = monoConstInitName(ix, node)
-      if bn != "" { name = bn }
-      const body = monoNestedBodyOf(ix)
-      if body >= 0 { stack.push(body) }
-      for k in nodeChildren(ix) { stack.push(k) }
+      // Asking about calls, a function nothing names never makes one.
+      const dead = calls
+        && P.nodes[ix] is FuncDecl
+        && monoWriteFrameDead(ix, top)
+      if !dead {
+        seen.push(ix)
+        const bn = monoConstInitName(ix, node)
+        if bn != "" { name = bn }
+        const body = monoNestedBodyOf(ix)
+        if body >= 0 { stack.push(body) }
+        for k in nodeChildren(ix) { stack.push(k) }
+      }
     }
   }
   if name == "" { return false }
