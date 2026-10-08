@@ -9940,26 +9940,82 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
 }
 
 // The lifted lambda an un-annotated `let` binding read at `at` in frame `ctx` holds from its
-// initializer, an un-annotated `const` binding of it (`const c = (y) => …; let d = c`), or -1.
-// The binding may be reassigned, so the caller instantiates the lambda without re-spelling (D3833).
+// initializer, through a chain of un-annotated `const` and `let` bindings ending at one bound to
+// a hole lambda (`const c = (y) => …; const c2 = c; let d = c2`), or -1. Each link may be read
+// as a capture. The binding may be reassigned, so the caller does not re-spell it (D3833, D3844).
 function monoLetAliasLamFe(name: string, at: i32, ctx: i32): i32 {
-  const lf = monoLetFrameOf(name, at, ctx)
-  const fx = lf[0]
+  monoAliasChainLamFe(name, at, ctx, false)
+}
+
+// The lifted lambda the capture cell `cell` boxing a `let` holds: the rewrite turns a captured
+// `let d = c` that is written after capture into `let d = [c]` and each read into `d[0]`, so a
+// call through it is `d[0](x)` (D3845). -1 for any other binding.
+function monoCellLamFe(cell: string, at: i32, ctx: i32): i32 {
+  const lf = monoLetFrameOf(cell, at, ctx)
   const li = lf[1]
   if li < 0 { return -1 }
   const d = P.nodes[li]
   if !(d is LetDecl) { return -1 }
-  if d.letKw != "let" || d.letType >= 0 || d.letInit < 0 { return -1 }
-  const src = P.nodes[d.letInit]
-  if !(src is Ident) { return -1 }
-  const sfe = identClosureFeAt(sidOfNode(d.letInit), fx, d.letInit)
-  if sfe < 0 || !criFnIsAnonLambda(sfe) { return -1 }
-  const si = identLetOfAt(sidOfNode(d.letInit), fx, d.letInit)
-  if si < 0 { return -1 }
-  const sd = P.nodes[si]
-  if !(sd is LetDecl) { return -1 }
-  if sd.letKw != "const" || sd.letType >= 0 { return -1 }
-  sfe
+  if d.letKw != "let" || d.letInit < 0 { return -1 }
+  const lit = P.nodes[d.letInit]
+  if !(lit is ArrayLit) { return -1 }
+  if lit.arrElems.length != 1 { return -1 }
+  const el = P.nodes[lit.arrElems[0]]
+  if !(el is Ident) { return -1 }
+  monoAliasChainLamFe(el.identName, lit.arrElems[0], lf[0], true)
+}
+
+// The cell a read `cell[0]` at node `ix` names, or "" for any other node.
+function monoCellReadName(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is Index {
+    const a = P.nodes[n.idxArr]
+    const k = P.nodes[n.idxIndex]
+    if a is Ident && k is NumLit {
+      if k.numText == "0" { return a.identName }
+    }
+  }
+  ""
+}
+
+// The walk `monoLetAliasLamFe` takes from the name `nm` read at `ax` in frame `fr`; `viaLet`
+// says a `let` is already behind, the condition for an answer `monoRespellLamAlias` lacks.
+function monoAliasChainLamFe(
+  nm0: string,
+  ax0: i32,
+  fr0: i32,
+  viaLet: boolean,
+): i32 {
+  let nm = nm0
+  let ax = ax0
+  let fr = fr0
+  let sawLet = viaLet
+  let hops = 0
+  while hops < 8 {
+    const lf = monoLetFrameOf(nm, ax, fr)
+    const fx = lf[0]
+    const li = lf[1]
+    if li < 0 { return -1 }
+    const d = P.nodes[li]
+    if !(d is LetDecl) { return -1 }
+    if d.letType >= 0 || d.letInit < 0 { return -1 }
+    if hops > 0 || viaLet {
+      const sfe = identClosureFeAt(sidOf(nm), fx, ax)
+      if sfe >= 0 {
+        if !criFnIsAnonLambda(sfe) || d.letKw != "const" { return -1 }
+        if !sawLet { return -1 }
+        return sfe
+      }
+    }
+    if d.letKw == "let" { sawLet = true }
+    const src = P.nodes[d.letInit]
+    if !(src is Ident) { return -1 }
+    nm = src.identName
+    ax = d.letInit
+    fr = fx
+    hops = hops + 1
+  }
+  -1
 }
 
 // Re-spells callee `calleeIx` as the name its chain of un-annotated `const` aliases ends at,
@@ -10078,6 +10134,14 @@ function monoWalk(ix: i32, ctx: i32) {
         return monoSpecializeConcrete(ix, fe, ctx)
       }
       return 0
+    }
+    // A call through the capture cell of a `let` alias of a hole lambda (D3845).
+    const cellNm = monoCellReadName(n.callFn)
+    if cellNm != "" {
+      const cfe = monoCellLamFe(cellNm, n.callFn, ctx)
+      if cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
+        return monoInstantiate(cfe, ix, ctx)
+      }
     }
     return monoWalk(n.callFn, ctx)
   }
@@ -10403,7 +10467,8 @@ function monoAssignedPeerFe(fe: i32) {
     if nd is BinExpr {
       if nd.binOp == "=" {
         const lt = P.nodes[nd.binLeft]
-        if lt is Ident {
+        const lcell = monoCellReadName(nd.binLeft)
+        if lt is Ident || lcell != "" {
           // The lambda itself, or an un-annotated `const` binding of it (D3833).
           let hit = nd.binRight == node
           if !hit {
@@ -10427,6 +10492,11 @@ function monoAssignedPeerFe(fe: i32) {
               }
             }
           }
+          // A namesake assignment in another function is not this lambda's: the name lookup
+          // above is by name, so the write must sit in the lambda's own frame (D3845).
+          if hit && nd.binRight != node && !monoFrameHolds(ctx, i) {
+            hit = false
+          }
           if hit {
             tgt = nd.binLeft
             seen = seen + 1
@@ -10437,6 +10507,12 @@ function monoAssignedPeerFe(fe: i32) {
     i = i + 1
   }
   if seen != 1 || tgt < 0 { return -1 }
+  const tcell = monoCellReadName(tgt)
+  if tcell != "" {
+    const cpeer = monoCellLamFe(tcell, tgt, ctx)
+    if cpeer == fe { return -1 }
+    return cpeer
+  }
   let peer = identClosureFeAt(sidOfNode(tgt), ctx, tgt)
   if peer < 0 {
     const tn = P.nodes[tgt]
@@ -10519,6 +10595,29 @@ function monoSubtreeCallsGeneric(ix: i32, ctx: i32, depth: i32): boolean {
   }
   for k in nodeChildren(ix) {
     if monoSubtreeCallsGeneric(k, ctx, depth + 1) { return true }
+  }
+  false
+}
+
+// Whether node `ix` lies in the body of function node `fx` (the program, for -1), nested
+// functions included.
+function monoFrameHolds(fx: i32, ix: i32): boolean {
+  const stack: i32[] = []
+  if fx >= 0 {
+    const body = monoNestedBodyOf(fx)
+    if body < 0 { return false }
+    stack.push(body)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur == ix { return true }
+    if cur >= 0 && cur < P.nodes.length {
+      const b = monoNestedBodyOf(cur)
+      if b >= 0 { stack.push(b) }
+      for k in nodeChildren(cur) { stack.push(k) }
+    }
   }
   false
 }
