@@ -9745,33 +9745,61 @@ function monoFnBindsParam(fx: i32, name: string): boolean {
   false
 }
 
+// The binding `name` reads at node `at` in frame `ctx` or the nearest enclosing frame, as
+// `[frame, letIx]`; `[-1, -1]` when a parameter binds it first, or past eight frames.
+function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  const sid = sidOf(name)
+  let fx = ctx
+  let hops = 0
+  while hops < 8 && fx >= 0 {
+    if monoFnBindsParam(fx, name) { return none }
+    const li = identLetOfAt(sid, fx, at)
+    if li >= 0 {
+      const out: i32[] = [fx, li]
+      return out
+    }
+    const slot = fnStmtsPosOf(fx)
+    if slot < 0 || slot >= fnParent.length { return none }
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return none }
+    fx = fnStmts[ps]
+    hops = hops + 1
+  }
+  none
+}
+
 // Re-spells callee `calleeIx` as the name its chain of un-annotated `const` aliases ends at,
-// when that is an un-annotated `const` binding of a lambda the call reads unshadowed. Any other
-// chain, or one longer than eight, leaves the callee as written.
+// when that is an un-annotated `const` binding of a lambda the call reads unshadowed. The
+// chain may live in an enclosing frame, read as a capture (D3825). Any other chain, or one
+// longer than eight, leaves the callee as written.
 function monoRespellLamAlias(calleeIx: i32, ctx: i32) {
   const cal = P.nodes[calleeIx]
   if !(cal is Ident) { return 0 }
   if identClosureFeAt(sidOfNode(calleeIx), ctx, calleeIx) >= 0 { return 0 }
   let at = calleeIx
+  let name = cal.identName
   let hops = 0
   while hops < 8 {
-    const li = identLetOfAt(sidOfNode(at), ctx, at)
+    const lf = monoLetFrameOf(name, at, ctx)
+    const fx = lf[0]
+    const li = lf[1]
     if li < 0 { return 0 }
     const d = P.nodes[li]
     if !(d is LetDecl) { return 0 }
     if d.letKw != "const" || d.letType >= 0 || d.letInit < 0 { return 0 }
     const src = P.nodes[d.letInit]
     if !(src is Ident) { return 0 }
-    const sfe = identClosureFeAt(sidOfNode(d.letInit), ctx, d.letInit)
+    const sfe = identClosureFeAt(sidOfNode(d.letInit), fx, d.letInit)
     if sfe >= 0 {
       if !criFnIsAnonLambda(sfe) { return 0 }
-      const si = identLetOfAt(sidOfNode(d.letInit), ctx, d.letInit)
+      const si = identLetOfAt(sidOfNode(d.letInit), fx, d.letInit)
       if si < 0 { return 0 }
       const sd = P.nodes[si]
       if !(sd is LetDecl) { return 0 }
       if sd.letKw != "const" || sd.letType >= 0 { return 0 }
       // The lambda's name must read the same binding where the call is, not a shadow of it.
-      if identLetOfAt(sidOf(src.identName), ctx, calleeIx) != si { return 0 }
+      if monoLetFrameOf(src.identName, calleeIx, ctx)[1] != si { return 0 }
       collectANoteIdentRename(cal.identName)
       cal.identName = src.identName
       monoArenaTouch()
@@ -9779,6 +9807,7 @@ function monoRespellLamAlias(calleeIx: i32, ctx: i32) {
       return 0
     }
     at = d.letInit
+    name = src.identName
     hops = hops + 1
   }
   0
