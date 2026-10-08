@@ -24,10 +24,11 @@
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Seven are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Eight are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
 // `in-function value writes`, the two `if joins` pairs, `nested inline record types across
-// functions (fuel)` and `record-parameter field calls`. The CPU readings quoted
+// functions (fuel)`, `record-parameter field calls` and `closure arguments in one function`.
+// The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
@@ -81,6 +82,21 @@ const genParamFieldCalls = (n: number): string => {
   o.push("const bx: Box = { get: () => 3 }", "let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(bx)`);
   o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// One function passing the same local closure to a higher-order function `n` times.
+// `monomorphize` asks, at each call, whether the argument is a capture of the frame, and the
+// answer walks the whole frame, so an unmemoised capture set is calls x body.
+const genClosureArgCalls = (n: number): string => {
+  const o: string[] = [
+    "function apply(x: i32, f: (v: i32) => i32): i32 { f(x) }",
+    "function run(k: i32): i32 {",
+    "  let acc = 0",
+    "  const g = (v: i32): i32 => v + k",
+  ];
+  for (let i = 0; i < n; i++) o.push(`  acc = acc + apply(${i % 7}, g)`);
+  o.push("  acc", "}", "print(run(3))");
   return o.join("\n") + "\n";
 };
 
@@ -633,6 +649,15 @@ axis(
   5.1,
   "`fieldClosureFeOfRecvRaw` (compiler/emit_classify.vl) is scanning the arena for a parameter's call sites instead of `callsOfCallee`.",
   (d) => twoFiles(d, genParamFieldCalls(2400), genParamFieldCalls(600)),
+);
+
+// Lane HS's third pair, 1,600 calls against 400, so linear reads 4. Fuel reads 3.92; with the
+// capture memo unarmed in `monomorphize` it read 14.16, every call re-walking the frame.
+axis(
+  "closure arguments in one function",
+  5.0,
+  "`captureNamesOf` is re-walking a frame per query in `monomorphize`; is the pass still in `passKeepsCaptures` (compiler/emit_sections.vl)?",
+  (d) => twoFiles(d, genClosureArgCalls(1600), genClosureArgCalls(400)),
 );
 
 // Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
