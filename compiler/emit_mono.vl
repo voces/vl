@@ -10011,6 +10011,7 @@ function monoCellLamFe(cell: string, at: i32, ctx: i32): i32 {
 
 // The cell a read `cell[0]` at node `ix` names, or "" for any other node.
 function monoCellReadName(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[ix]
   if n is Index {
     const a = P.nodes[n.idxArr]
@@ -10129,6 +10130,7 @@ function monoLamValueFe(vx: i32, fx: i32): i32 {
 // The one element of the capture cell the rewrite builds (`[v]`, no source position) at node
 // `ix`, or -1 for any other node.
 function monoGeneratedCellElem(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
   const lit = P.nodes[ix]
   if lit is ArrayLit {
     if lit.pos < 0 && lit.arrElems.length == 1 { return lit.arrElems[0] }
@@ -11246,8 +11248,9 @@ export function monomorphize(stmts: i32[]) {
   0
 }
 
-// Whether the lambda in slot `fe`, bound by an un-annotated `const`, is named as a list element
-// anywhere in its enclosing frame, the rewrite's capture cells included.
+// Whether the lambda in slot `fe`, bound by an un-annotated `const`, is named as an element of
+// a list or capture cell in its enclosing frame, and every such list is bound to a name that is
+// unread (`monoFrameNameUnread`): no call can go through it.
 function monoLamStoredAsElement(fe: i32): boolean {
   let pf = -1
   if fe < fnParent.length { pf = fnParent[fe] }
@@ -11261,23 +11264,41 @@ function monoLamStoredAsElement(fe: i32): boolean {
   }
   const node = fnStmts[fe]
   let name = ""
-  const elems: i32[] = []
+  const lits: i32[] = []
+  const lets: i32[] = []
   while stack.length > 0 {
     const ix = stack.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
+      const nd = P.nodes[ix]
       const bn = monoConstInitName(ix, node)
       if bn != "" { name = bn }
-      for el in monoArrayElems(ix) { elems.push(el) }
+      if nd is ArrayLit { lits.push(ix) }
+      else if nd is LetDecl { lets.push(ix) }
       const body = monoNestedBodyOf(ix)
       if body >= 0 { stack.push(body) }
       for k in nodeChildren(ix) { stack.push(k) }
     }
   }
   if name == "" { return false }
-  for el in elems {
-    if monoIdentNameOf(el) == name { return true }
+  let stored = false
+  for lx in lits {
+    let holds = false
+    for el in monoArrayElems(lx) {
+      if monoIdentNameOf(el) == name { holds = true }
+    }
+    if holds {
+      stored = true
+      let owner = ""
+      for ld in lets {
+        const d = P.nodes[ld]
+        if d is LetDecl {
+          if d.letInit == lx { owner = d.letName }
+        }
+      }
+      if owner == "" || !monoFrameNameUnread(fe, owner) { return false }
+    }
   }
-  false
+  stored
 }
 
 // Retypes each capture cell in the instantiated lambda `fe`'s frame that still carries a
@@ -11395,6 +11416,10 @@ function monoCellElemTyOf(cell: i32, elem: i32): i32 {
 
 // The elements of list literal node `ix`, or none for any other node.
 function monoArrayElems(ix: i32): i32[] {
+  if ix < 0 || ix >= P.nodes.length {
+    const none: i32[] = []
+    return none
+  }
   const nd = P.nodes[ix]
   if nd is ArrayLit { return nd.arrElems }
   const none: i32[] = []
@@ -11423,7 +11448,11 @@ function monoUnreadLamSlots(nDecl: i32): i32[] {
 
 // Whether the lambda in slot `fe` initializes an un-annotated `const` that nothing in its
 // enclosing frame (the program, at top level) reads by name.
-function monoLamUnread(fe: i32): boolean {
+function monoLamUnread(fe: i32): boolean { monoFrameNameUnread(fe, "") }
+
+// Whether nothing in the enclosing frame of the lambda in slot `fe` reads `target`, or the
+// lambda's own `const` binding for "", but to seed or write bindings that are unread in turn.
+function monoFrameNameUnread(fe: i32, target: string): boolean {
   const roots: i32[] = []
   let pf = -1
   if fe < fnParent.length { pf = fnParent[fe] }
@@ -11472,18 +11501,21 @@ function monoLamUnread(fe: i32): boolean {
         }
         if tname != "" {
           lhs.push(tnode)
-          writeVal.push(nd.binRight)
+          let wv = monoReadNameNode(nd.binRight)
+          if wv < 0 { wv = nd.binRight }
+          writeVal.push(wv)
           writeTo.push(tname)
         }
       }
     }
   }
   const visiting: string[] = []
+  if target != "" { name = target }
   monoNameUnread(name, seen, aliasInit, lhs, writeVal, writeTo, visiting)
 }
 
-// The initializer node of the un-annotated binding node `ix` declares when it is a bare name,
-// or -1.
+// The name node the initializer of the un-annotated binding node `ix` reads when it is a bare
+// name or a cell read, or -1.
 function monoAliasInitOf(ix: i32): i32 {
   const nd = P.nodes[ix]
   if nd is LetDecl {
@@ -11492,9 +11524,18 @@ function monoAliasInitOf(ix: i32): i32 {
       let init = nd.letInit
       const ce = monoGeneratedCellElem(init)
       if ce >= 0 { init = ce }
-      if monoIdentNameOf(init) != "" { return init }
+      return monoReadNameNode(init)
     }
   }
+  -1
+}
+
+// The name node a read `v` or a cell read `v[0]` at `ix` reads, or -1 for any other node.
+function monoReadNameNode(ix: i32): i32 {
+  if monoIdentNameOf(ix) != "" { return ix }
+  if ix < 0 || ix >= P.nodes.length || monoCellReadName(ix) == "" { return -1 }
+  const n = P.nodes[ix]
+  if n is Index { return n.idxArr }
   -1
 }
 
@@ -11543,7 +11584,10 @@ function monoAliasOwnerName(init: i32, seen: i32[]): string {
   for ix in seen {
     const nd = P.nodes[ix]
     if nd is LetDecl {
-      if nd.letInit == init || monoGeneratedCellElem(nd.letInit) == init {
+      let li = nd.letInit
+      const ce = monoGeneratedCellElem(li)
+      if ce >= 0 { li = ce }
+      if li >= 0 && (li == init || monoReadNameNode(li) == init) {
         return nd.letName
       }
     }
@@ -11564,6 +11608,7 @@ function monoConstInitName(ix: i32, init: i32): string {
 
 // The body of function node `ix`, which `nodeChildren` does not enter; -1 for any other node.
 function monoNestedBodyOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
   const nd = P.nodes[ix]
   if nd is FuncDecl { return nd.fnBody }
   -1
@@ -11571,6 +11616,7 @@ function monoNestedBodyOf(ix: i32): i32 {
 
 // The name identifier node `ix` reads, or "" for any other node.
 function monoIdentNameOf(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
   const nd = P.nodes[ix]
   if nd is Ident { return nd.identName }
   ""
