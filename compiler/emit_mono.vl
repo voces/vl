@@ -275,6 +275,7 @@ import {
   emitRootIx,
   fmResumeArmed,
   fnChildHead,
+  fnChildNext,
   fnDispNames,
   fnInstOrigin,
   fnParent,
@@ -9959,9 +9960,12 @@ function monoCellLamFe(cell: string, at: i32, ctx: i32): i32 {
   if d.letKw != "let" || d.letInit < 0 { return -1 }
   const lit = P.nodes[d.letInit]
   if !(lit is ArrayLit) { return -1 }
-  if lit.arrElems.length != 1 { return -1 }
+  // Only the rewrite's own cell, which carries no source position: a list the program wrote
+  // can be reassigned whole or grown, writes this resolver does not follow.
+  if lit.pos >= 0 || lit.arrElems.length != 1 { return -1 }
   const el = P.nodes[lit.arrElems[0]]
   if !(el is Ident) { return -1 }
+  if !monoLetWritesAreLams(cell, lf[0], true) { return -1 }
   monoAliasChainLamFe(el.identName, lit.arrElems[0], lf[0], true)
 }
 
@@ -9991,7 +9995,7 @@ function monoAliasChainLamFe(
   let fr = fr0
   let sawLet = viaLet
   let hops = 0
-  while hops < 8 {
+  while hops < MONO_ALIAS_CHAIN_MAX {
     const lf = monoLetFrameOf(nm, ax, fr)
     const fx = lf[0]
     const li = lf[1]
@@ -10007,7 +10011,12 @@ function monoAliasChainLamFe(
         return sfe
       }
     }
-    if d.letKw == "let" { sawLet = true }
+    if d.letKw == "let" {
+      sawLet = true
+      // A `let` written anywhere with a value that is no hole lambda holds what this walk
+      // cannot name; the call stays unresolved and keeps its loud refusal.
+      if !monoLetWritesAreLams(nm, fx, false) { return -1 }
+    }
     const src = P.nodes[d.letInit]
     if !(src is Ident) { return -1 }
     nm = src.identName
@@ -10015,8 +10024,103 @@ function monoAliasChainLamFe(
     fr = fx
     hops = hops + 1
   }
+  emitFailAt(
+    "emitProgram: a call through a chain of more than "
+      + i32ToStr(MONO_ALIAS_CHAIN_MAX)
+      + " un-annotated aliases of a lambda has no signature to lower at — annotate the lambda's parameters",
+    ax0,
+  )
+}
+
+// The longest alias chain `monoAliasChainLamFe` follows before refusing.
+const MONO_ALIAS_CHAIN_MAX = 64
+
+// The hole lambda the value at node `vx`, read in frame `fx`, is: a lambda literal, or a name
+// bound through un-annotated `const` and `let` bindings to one. -1 for anything else.
+function monoLamValueFe(vx: i32, fx: i32): i32 {
+  const v = P.nodes[vx]
+  if v is FuncDecl {
+    const ls = fnStmtsPosOf(vx)
+    if ls >= 0 && criFnIsAnonLambda(ls) { return ls }
+    return -1
+  }
+  let nm = monoIdentNameOf(vx)
+  let ax = vx
+  let fr = fx
+  let hops = 0
+  while nm != "" && hops < MONO_ALIAS_CHAIN_MAX {
+    const sfe = identClosureFeAt(sidOf(nm), fr, ax)
+    if sfe >= 0 {
+      if criFnIsAnonLambda(sfe) { return sfe }
+      return -1
+    }
+    const lf = monoLetFrameOf(nm, ax, fr)
+    if lf[1] < 0 { return -1 }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) { return -1 }
+    if d.letType >= 0 || d.letInit < 0 { return -1 }
+    const il = monoNestedBodyOf(d.letInit)
+    if il >= 0 {
+      const ls = fnStmtsPosOf(d.letInit)
+      if ls >= 0 && criFnIsAnonLambda(ls) { return ls }
+      return -1
+    }
+    nm = monoIdentNameOf(d.letInit)
+    ax = d.letInit
+    fr = lf[0]
+    hops = hops + 1
+  }
   -1
 }
+
+// The innermost function node among `root` and the functions lifted out of it whose body holds
+// node `ix`; `root` itself when none of them does.
+function monoFrameOfNode(ix: i32, root: i32): i32 {
+  let best = root
+  for k in monoLiftedDescendants(fnStmtsPosOf(root)) {
+    const kb = monoNestedBodyOf(fnStmts[k])
+    if kb >= 0 && monoSubtreeHolds(kb, ix) { best = fnStmts[k] }
+  }
+  best
+}
+
+// Whether node `ix` lies in the subtree at `root`, entering function bodies.
+function monoSubtreeHolds(root: i32, ix: i32): boolean {
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur == ix { return true }
+    if cur >= 0 && cur < P.nodes.length {
+      const b = monoNestedBodyOf(cur)
+      if b >= 0 { stack.push(b) }
+      for k in nodeChildren(cur) { stack.push(k) }
+    }
+  }
+  false
+}
+
+// Whether every write to the `let` named `name` declared in frame `fx` (the program, for -1),
+// in that frame or a function lifted out of it, stores a hole lambda. `cell` reads the writes
+// of the rewrite's capture cell, `name[0] = v`, instead of `name = v`.
+function monoLetWritesAreLams(name: string, fx: i32, cell: boolean): boolean {
+  let key = "n:" + name
+  if cell { key = "c:" + name }
+  for i in monoLetWrites.get(key) ?? [] {
+    const nd = P.nodes[i]
+    if nd is BinExpr {
+      if monoFrameHolds(fx, i) {
+        let wf = fx
+        if fx >= 0 { wf = monoFrameOfNode(i, fx) }
+        if monoLamValueFe(nd.binRight, wf) < 0 { return false }
+      }
+    }
+  }
+  true
+}
+
+// The program's assignments by target, filled once as `monomorphize` starts: `n:<name>` for
+// `name = v`, `c:<name>` for a capture cell's `name[0] = v`; node indices.
+let monoLetWrites: {[string]: i32[]} = Map()
 
 // Re-spells callee `calleeIx` as the name its chain of un-annotated `const` aliases ends at,
 // when that is an un-annotated `const` binding of a lambda the call reads unshadowed. The
@@ -10469,33 +10573,13 @@ function monoAssignedPeerFe(fe: i32) {
         const lt = P.nodes[nd.binLeft]
         const lcell = monoCellReadName(nd.binLeft)
         if lt is Ident || lcell != "" {
-          // The lambda itself, or an un-annotated `const` binding of it (D3833).
+          // The lambda itself, or a name bound to it, read in the write's own frame: the frame
+          // of the lambda or a function lifted out of it, never a namesake elsewhere (D3845).
           let hit = nd.binRight == node
-          if !hit {
-            const rn = P.nodes[nd.binRight]
-            if rn is Ident {
-              if (
-                identClosureFeAt(sidOfNode(nd.binRight), ctx, nd.binRight)
-                == fe
-              ) {
-                const ri = identLetOfAt(
-                  sidOfNode(nd.binRight),
-                  ctx,
-                  nd.binRight,
-                )
-                if ri >= 0 {
-                  const rd = P.nodes[ri]
-                  if rd is LetDecl {
-                    hit = rd.letKw == "const" && rd.letType < 0
-                  }
-                }
-              }
-            }
-          }
-          // A namesake assignment in another function is not this lambda's: the name lookup
-          // above is by name, so the write must sit in the lambda's own frame (D3845).
-          if hit && nd.binRight != node && !monoFrameHolds(ctx, i) {
-            hit = false
+          if !hit && P.nodes[nd.binRight] is Ident && monoFrameHolds(ctx, i) {
+            let wf = ctx
+            if ctx >= 0 { wf = monoFrameOfNode(i, ctx) }
+            hit = monoLamValueFe(nd.binRight, wf) == fe
           }
           if hit {
             tgt = nd.binLeft
@@ -10599,27 +10683,44 @@ function monoSubtreeCallsGeneric(ix: i32, ctx: i32, depth: i32): boolean {
   false
 }
 
-// Whether node `ix` lies in the body of function node `fx` (the program, for -1), nested
-// functions included.
+// Whether node `ix` lies in the body of function node `fx` (the program, for -1), or in the
+// body of a function lifted out of it at any depth.
 function monoFrameHolds(fx: i32, ix: i32): boolean {
-  const stack: i32[] = []
-  if fx >= 0 {
-    const body = monoNestedBodyOf(fx)
-    if body < 0 { return false }
-    stack.push(body)
-  } else {
-    for st in monoProgStmts { stack.push(st) }
-  }
-  while stack.length > 0 {
-    const cur = stack.pop() ?? -1
-    if cur == ix { return true }
-    if cur >= 0 && cur < P.nodes.length {
-      const b = monoNestedBodyOf(cur)
-      if b >= 0 { stack.push(b) }
-      for k in nodeChildren(cur) { stack.push(k) }
+  if fx < 0 {
+    for st in monoProgStmts {
+      if monoSubtreeHolds(st, ix) { return true }
     }
+    return false
+  }
+  const body = monoNestedBodyOf(fx)
+  if body < 0 { return false }
+  if monoSubtreeHolds(body, ix) { return true }
+  for k in monoLiftedDescendants(fnStmtsPosOf(fx)) {
+    const kb = monoNestedBodyOf(fnStmts[k])
+    if kb >= 0 && monoSubtreeHolds(kb, ix) { return true }
   }
   false
+}
+
+// The `fnStmts` positions of the functions lifted out of the one at `slot`, at any depth,
+// parents before children; read off the frame child index.
+function monoLiftedDescendants(slot: i32): i32[] {
+  const out: i32[] = []
+  if slot < 0 { return out }
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  const stack: i32[] = [slot]
+  while stack.length > 0 {
+    const p = stack.pop() ?? -1
+    if p >= 0 && p < fnChildHead.length {
+      let c = fnChildHead[p]
+      while c >= 0 && c < fnChildNext.length && out.length <= fnStmts.length {
+        out.push(c)
+        stack.push(c)
+        c = fnChildNext[c]
+      }
+    }
+  }
+  out
 }
 
 // The concrete parameter spellings a lifted slot's declaration carries, appended to `out`
@@ -10683,6 +10784,26 @@ export function monomorphize(stmts: i32[]) {
   monoExactNext = 0
   monoExactLow = 0
   monoProgStmts = stmts
+  monoLetWrites = Map()
+  let wi = 0
+  while wi < P.nodes.length {
+    const wn = P.nodes[wi]
+    if wn is BinExpr {
+      if wn.binOp == "=" {
+        const wid = monoIdentNameOf(wn.binLeft)
+        const wcell = monoCellReadName(wn.binLeft)
+        let wkey = ""
+        if wid != "" { wkey = "n:" + wid }
+        else if wcell != "" { wkey = "c:" + wcell }
+        if wkey != "" {
+          const wl = monoLetWrites.get(wkey) ?? []
+          wl.push(wi)
+          monoLetWrites.set(wkey, wl)
+        }
+      }
+    }
+    wi = wi + 1
+  }
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
   monoProgLetBySid = []
