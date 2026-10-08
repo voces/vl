@@ -329,6 +329,7 @@ import {
   arrLitElemName,
   capMemoNoteEdit,
   captureCountOf,
+  captureNamesOf,
   cloRetTypeName,
   criFnIsAnonLambda,
   exactBindWalk,
@@ -5877,6 +5878,68 @@ function monoEnclosingPinRow(
   0
 }
 
+// Whether nested function `fe` reads a capture typed at a type variable named like one of its
+// own type parameters: the enclosing function's, which a by-name binding cannot tell apart.
+function monoShadowedCaptureRead(fe: i32): boolean {
+  if fe < 0 || fe >= monoOrigNode.length { return false }
+  const f = P.nodes[monoOrigNode[fe]]
+  if !(f is FuncDecl) { return false }
+  const caps = captureNamesOf(fe)
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur >= 0 && cur < P.nodes.length {
+      const nm = monoIdentNameOf(cur)
+      if nm != "" && strListHas(caps, nm) {
+        if monoTyNamesVar(nodeTyIxOf(cur), f.fnTyParams, 0) { return true }
+      }
+      const b = monoNestedBodyOf(cur)
+      if b >= 0 { stack.push(b) }
+      for k in nodeChildren(cur) { stack.push(k) }
+    }
+  }
+  false
+}
+
+// Whether type `t` holds a type variable named one of `names`. Bounded by depth; false past it.
+function monoTyNamesVar(t: i32, names: string[], depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+  const ty = T.tys[t]
+  match ty {
+    TyVar => {
+      return strListHas(names, ty.tvName)
+    }
+    TyArray => {
+      return monoTyNamesVar(ty.aElem, names, depth + 1)
+    }
+    TyNullable => {
+      return monoTyNamesVar(ty.nInner, names, depth + 1)
+    }
+    TyMap => {
+      return monoTyNamesVar(ty.mKey, names, depth + 1)
+        || monoTyNamesVar(ty.mVal, names, depth + 1)
+    }
+    TyUnion => {
+      for m in ty.uMembers {
+        if monoTyNamesVar(m, names, depth + 1) { return true }
+      }
+    }
+    TyObj => {
+      for ft in ty.objFieldTypes {
+        if monoTyNamesVar(ft, names, depth + 1) { return true }
+      }
+    }
+    TyFunc => {
+      for pt in ty.fnParamTypes {
+        if monoTyNamesVar(pt, names, depth + 1) { return true }
+      }
+      return monoTyNamesVar(ty.fnRet, names, depth + 1)
+    }
+    TyPrim | TyLit | TyNeg | TyErr => {}
+  }
+  false
+}
+
 // The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
 // generic called from it, consumed (and cleared) where the key is built; -1 for none.
 let monoCallFrameSlot = 0 - 1
@@ -5895,13 +5958,45 @@ function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
   if fe < 0 || fe >= fnParent.length || ctx < 0 { return -1 }
   const p0 = fnParent[fe]
   if p0 < 0 || captureCountOf(fe) == 0 { return -1 }
-  if monoNestedShadowsOuter(fe) { return -1 }
+  // Type variables are substituted by name, so a capture typed at the enclosing `T` would
+  // read the nested function's own `T`: refused rather than lowered at the wrong type (D3840).
+  if monoNestedShadowsOuter(fe) {
+    if !monoShadowedCaptureRead(fe) { return -1 }
+    emitFail(
+      "emitProgram: a nested generic that redeclares its enclosing function's type parameter and reads that function's variables typed at it cannot tell the two parameters apart — rename the nested one",
+    )
+    return -1
+  }
   let sl = fnStmtsPosOf(ctx)
   if sl < 0 || sl >= fnInstOrigin.length || sl >= fnParent.length { return -1 }
   // A recursive call from a frame-keyed instance keeps that instance's frame.
   if fnInstOrigin[sl] == fe { sl = fnParent[sl] }
   if sl < 0 || sl == p0 || sl >= fnInstOrigin.length { return -1 }
   if fnInstOrigin[sl] == p0 { return sl }
+  // A caller nested in another instance of the enclosing function (a sibling function, a
+  // lambda) would reach the template frame's instance, whose env is the wrong instance's:
+  // refused rather than lowered (D3827).
+  let up = sl
+  let guard = 0
+  while up >= 0 && up < fnParent.length && guard <= fnStmts.length {
+    up = fnParent[up]
+    if up == p0 || up == fe { return -1 }
+    // Inside an instance of the nested generic itself: that instance's frame is the answer.
+    if up >= 0 && up < fnInstOrigin.length && fnInstOrigin[up] == fe {
+      const own = fnParent[up]
+      if own >= 0 && own < fnInstOrigin.length && fnInstOrigin[own] == p0 {
+        return own
+      }
+      return -1
+    }
+    if up >= 0 && up < fnInstOrigin.length && fnInstOrigin[up] == p0 {
+      emitFail(
+        "emitProgram: a nested generic that captures its enclosing function's variables, called from a function nested in a second instance of that enclosing function, has no instance to call — call it from the enclosing function's own body, or annotate its type parameters",
+      )
+      return -1
+    }
+    guard = guard + 1
+  }
   -1
 }
 
