@@ -32254,6 +32254,23 @@ function holeJoinArmsAllAtom(ix: i32, fnIx: i32, depth: i32): boolean {
   true
 }
 
+// The list type the instance a call `callIx` names declares it returns, or -1 when the callee is
+// no lifted function, or its return is absent, not a list, or still names a type parameter.
+function instCallRetListTy(callIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if !(c is Call) || c.callFn < 0 { return -1 }
+  if !(P.nodes[c.callFn] is Ident) { return -1 }
+  const pos = fnIndexOfNode(c.callFn)
+  if pos < 0 || pos >= fnStmts.length { return -1 }
+  const fd = P.nodes[fnStmts[pos]]
+  if !(fd is FuncDecl) || fd.fnRet < 0 { return -1 }
+  const rt = nodeTyIxOf(fd.fnRet)
+  if rt < 0 || rt >= T.tys.length || tyHasTyVar(rt) || !(T.tys[rt] is TyArray) {
+    return -1
+  }
+  rt
+}
+
 // The element type iterable `iterIx` holds at the pin of the instance `fnIx` is: the hole and
 // exact rungs, an instance parameter's annotation, a local's own or its initializer's recorded
 // type, else its recorded element's hole. -1 anywhere else. Needs no locals table.
@@ -32263,14 +32280,20 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   if own >= 0 { return tyStepElem(own) }
   const ex = exactOperandTyOf(iterIx, fnIx)
   if ex >= 0 { return tyStepElem(ex) }
-  // A captured list typed at a type parameter the enclosing instance binds (D3831).
+  // The iterable's recorded type through the binding chain of the instances `fnIx` is lifted
+  // inside, as the iterable's index read is typed: one rule for any spelling (D3842).
+  const rec = nodeTyIxOf(unwrapParen(iterIx))
+  if rec >= 0 && rec < T.tys.length {
+    let st = rec
+    if tyHasTyVar(rec) { st = pinSubOperandTyOf(rec, fnIx) }
+    if st >= 0 && st < T.tys.length && T.tys[st] is TyArray && !tyHasTyVar(st) {
+      return tyStepElem(st)
+    }
+  }
+  // A captured list of an enclosing hole instance's hole, which no pin row binds (D3831).
   const ci = P.nodes[unwrapParen(iterIx)]
   if ci is Ident {
     if capturedKindOf(fnIx, ci.identName) != null {
-      const cs = pinSubOperandTyOf(nodeTyIxOf(unwrapParen(iterIx)), fnIx)
-      if cs >= 0 && cs < T.tys.length && T.tys[cs] is TyArray {
-        return tyStepElem(cs)
-      }
       const ch = holeCaptureArrElemTyOf(iterIx, fnIx)
       if ch >= 0 { return ch }
     }
@@ -32331,6 +32354,11 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
         if mt >= 0 { return mt }
       }
     }
+  }
+  // A generic call an instance body copied has no recorded type; its instance's return does.
+  if rec < 0 && n is Call {
+    const rt = instCallRetListTy(unwrapParen(iterIx))
+    if rt >= 0 { return tyStepElem(rt) }
   }
   if monoHoleSubN.length == 0 { return -1 }
   const hv = nodeArrayElemTyIx(iterIx)
