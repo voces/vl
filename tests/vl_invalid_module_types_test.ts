@@ -7,7 +7,7 @@
 // module, reads the two types off the failing operator, and writes each module type index with
 // its VL name (asked of the compiler that emitted the module) and its struct or array shape.
 //
-// THE WITNESSES MUST STILL BE INVALID: D3820 (single-file spelling), D3816 and D3817 are
+// THE WITNESSES MUST STILL BE INVALID: D3832 (two spellings) and D3817 are
 // check-clean invalid wasm on the seed this lands on. When one is fixed its case goes red at the
 // "still check-clean" or exit-code assertion; replace it with any other such program.
 //
@@ -77,33 +77,36 @@ type Case = {
 
 const CASES: Case[] = [
   {
-    name: "D3820: a record expected where an i32 arrives names the record",
+    name: "D3832: a record expected where an i32 arrives names the record",
     files: {
-      "h.vl": "type A = { x: i32 }\n" +
-        'function d(self: A): string { "RA" }\n' +
-        "function h<T>(x: T): string { x.d() }\n" +
-        "const a: A = { x: 1 }\n" +
-        "print([a].map((x) => h(x))[0])\n",
+      "r.vl": "type A = { x: i32 }\n" +
+        'function tag(self: A): string { "A" }\n' +
+        "function mk(x: string) {\n" +
+        "  const c = (y) => y.tag()\n" +
+        "  x\n" +
+        "}\n" +
+        'print(mk("a"))\n',
     },
-    entry: "h.vl",
+    entry: "r.vl",
     want: [
-      "failed to validate inside `h`",
+      "failed to validate inside `c`",
       "type mismatch: expected (ref $0), found i32; $0 is `A`, struct {mut i32}",
     ],
     never: ["$type"],
   },
   {
-    name:
-      "D3816: a nullable string where a string is wanted names `string` and its shape",
+    name: "D3832: a string expected where an i32 arrives names `string` and its shape",
     files: {
-      "f.vl": 'function describe(self: string): string { "string " + self }\n' +
-        'function f(n: string | null): string { n?.describe() ?? "none" }\n' +
-        'print(f("nn"))\n',
+      "s.vl": "function mk(x: string) {\n" +
+        '  const c = (y) => y + "C"\n' +
+        "  x\n" +
+        "}\n" +
+        'print(mk("a"))\n',
     },
-    entry: "f.vl",
+    entry: "s.vl",
     want: [
-      "failed to validate inside `f`",
-      "type mismatch: expected (ref $2), found (ref null $2); $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
+      "failed to validate inside `c`",
+      "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
     ],
     never: ["$type"],
   },
