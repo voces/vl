@@ -246,9 +246,9 @@ for (const flags of [[], ["-O"], ["-O3"], ["--names"], ["-O3", "--names"]]) {
         }
         const frame = topFrame(await trapTrace(wasm, "pick", 7));
         const got = await addr2line(wasm, frame);
-        expectLine(got, `${DIR}/pick.vl:5:3`, `${frame}`);
+        expectLine(got, `${DIR}/pick.vl:5:7`, `${frame}`);
         // An unnamed function gets no label (see the imports case).
-        const want = flags.includes("--names") ? "  in `pick`" : "5:3";
+        const want = flags.includes("--names") ? "  in `pick`" : "5:7";
         if (!got.endsWith(want)) {
           throw new Error(`want the answer to end \`${want}\`, got \`${got}\``);
         }
@@ -292,7 +292,7 @@ Deno.test({
       }
       expectLine(
         await addr2line(wasm, topFrame(trace)),
-        `${Deno.realPathSync(tmp)}/big.vl:${trapAt}:3`,
+        `${Deno.realPathSync(tmp)}/big.vl:${trapAt}:11`,
         "300-line body",
       );
     } finally {
@@ -484,7 +484,7 @@ Deno.test({
       const frame = topFrame(await trapTrace(wasm, "pick", 7));
       expectLine(
         await addr2line(wasm, frame),
-        `${tmp}/pick.vl:5:3`,
+        `${tmp}/pick.vl:5:7`,
         "vl-src fallback",
       );
       const p = new Deno.Command(VL, {
@@ -499,7 +499,7 @@ Deno.test({
       await w.close();
       const r = await p.output();
       const out = new TextDecoder().decode(r.stdout);
-      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:3`)) {
+      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:7`)) {
         throw new Error(`non-UTF-8 stdin: rc ${r.code}, got:\n${out}`);
       }
     } finally {

@@ -550,6 +550,10 @@ const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
 // data channel as `ufcs-not-imported`'s does: `member` and one `modules` field per exporter.
 const CODE_MISSING_IMPORT = "missing-import"
 
+// A `std:array` `filled(n, 0)` delivered where a `u8[]` is wanted. The diagnostic spans the
+// call, which `check --fix` rewrites to `zeroBytes(n)` and imports from `std:bytes`.
+const CODE_ZERO_BYTES = "filled-zero-bytes"
+
 // D1570 — the name is a function in scope and is not a method. Its answer rides the data
 // channel under `member`, `recv`, `reason` (`self-name` / `arity` / `receiver`: which gate
 // refused), `param` (the first parameter's declared name, `self-name` only) and
@@ -976,6 +980,13 @@ let cstrSeqNext = 0
 // The right-hand nodes of index writes into a `u8` cell, whose refusal names the byte width
 // rather than the `i32` the cell reads as; kept by node so the pin's re-ask finds it too.
 let u8StoreRhs: i32[] = []
+// The `std:array` `filled(n, 0)` calls delivered where a `u8[]` is wanted: their refusal carries
+// `CODE_ZERO_BYTES`, which `check --fix` answers with `zeroBytes(n)`.
+let zeroBytesFixIx: i32[] = []
+// The modules binding `zeroBytes` other than by importing `std:bytes`'s, over the first
+// `zeroBytesScanned` nodes (`zeroBytesBindScan`).
+let zeroBytesBindMods: i32[] = []
+let zeroBytesScanned = 0
 
 // D582 — deferred builtin-method argument constraints, for the one reason `argCstr*` cannot
 // serve this position: that table is adjudicated against a callee it can name, and a builtin
@@ -5404,6 +5415,9 @@ export function initChecker() {
   bmCstrSeq = []
   cstrSeqNext = 0
   u8StoreRhs = []
+  zeroBytesFixIx = []
+  zeroBytesBindMods = []
+  zeroBytesScanned = 0
   bmCstrGot = []
   bmCstrWant = []
   bmCstrCtx = []
@@ -19450,6 +19464,9 @@ function tErrPush(
     const lnote = crLostNote(msg, at)
     if lnote != "" { msg = msg + lnote }
   }
+  if code == "" && zeroBytesFixIx.length > 0 && i32ListHas(zeroBytesFixIx, at) {
+    code = CODE_ZERO_BYTES
+  }
   // An exact repeat (same message, same anchor) is noise, not information — two passes can resolve
   // the same annotation, the pass-1.5 hoist and the real pass both reporting a generic-alias arity
   // error at the same position. Drop the repeat; the diagnostic count stays small, so the scan is
@@ -25118,11 +25135,11 @@ function unknownTyTextIn(name: string, tail: string) {
 // whole call shape, never a bare name.
 const strMethodSpellFrom = [
   "charat", "substring", "substr", "touppercase", "tolowercase", "size",
-  "count",
+  "count", "contains",
 ]
 const strMethodSpellTo = [
   "slice(i, i + 1)", "slice", "slice", "toUpperAscii", "toLowerAscii", "length",
-  "length",
+  "length", "includes",
 ]
 const listMethodSpellFrom = ["append", "add", "size", "count", "contains"]
 const listMethodSpellTo = ["push", "push", "length", "length", "includes"]
@@ -40386,6 +40403,7 @@ function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
     + charLitForStringNote(argIx, expected)
     + boolForNumberNote(at, expected)
     + numUnionLossNote(at, expected)
+    + storageListNote(argIx, at, expected)
   if argIx >= 0 && argIx < P.nodes.length {
     const n = P.nodes[argIx]
     if n is FuncDecl {
@@ -40857,6 +40875,175 @@ function charLitForStringNote(srcIx: i32, want: i32): string {
   ""
 }
 
+// The fix a list of numbers delivered where a `u8[]` is wanted owes: `u8` is a storage type,
+// so no generic builds one and no value list converts to one. Names `filled` when `srcIx` is
+// its call, and notes a literal-zero fill for `check --fix`. A record is asked of its fields.
+function storageListNote(srcIx: i32, got: i32, want: i32): string {
+  const body = storageListBody(srcIx, got, want)
+  if body == "" { return "" }
+  " — " + body
+}
+function storageListBody(srcIx: i32, got: i32, want: i32): string {
+  if got < 0 || want < 0 { return "" }
+  const ga = T.tys[got]
+  const wa = T.tys[want]
+  if ga is TyObj {
+    if wa is TyObj { return storageListFieldBody(srcIx, ga, wa) }
+  }
+  if !(ga is TyArray) || !(wa is TyArray) { return "" }
+  if primNameStr(primNameOf(wa.aElem)) != "u8" { return "" }
+  const el = softenLitTy(ga.aElem)
+  if !isNumeric(el) || primNameStr(primNameOf(el)) == "" { return "" }
+  const src = "`" + tyToStr(got) + "`"
+  const make = "`zeroBytes(n)` from \"std:bytes\", which returns a `u8[]`"
+  const fill = storageFilledFill(parenPeelIx(srcIx))
+  if fill >= 0 {
+    const lead = "`filled` builds "
+      + src
+      + " here: `u8` is a storage type, so a generic's `T` is never `u8`. "
+    if fillIsLitZero(fill) {
+      const call = parenPeelIx(srcIx)
+      if zeroBytesNameFree(call) && !i32ListHas(zeroBytesFixIx, call) {
+        zeroBytesFixIx.push(call)
+      }
+      return lead + "For zeroed bytes use " + make
+    }
+    return lead + "Make the bytes with " + make + ", and fill it by a loop"
+  }
+  let conv = ""
+  if primNameStr(primNameOf(el)) != "i32" {
+    conv = ", converting each with `as! u8`"
+  }
+  "`u8` is a storage type, so "
+    + src
+    + " is never a `u8[]`; make one with "
+    + make
+    + ", and copy each element in by index"
+    + conv
+}
+
+// `storageListBody` for the first field of record `g` that owes one against `w`, reading the
+// field's own value when `srcIx` is the record literal.
+function storageListFieldBody(srcIx: i32, g: TyObj, w: TyObj): string {
+  const lit = parenPeelIx(srcIx)
+  const names = w.objFieldNames
+  let i = 0
+  while i < names.length {
+    const gf = objFieldType(g, names[i])
+    if gf >= 0 {
+      const body = storageListBody(
+        objLitFieldValue(lit, names[i]),
+        gf,
+        w.objFieldTypes[i],
+      )
+      if body != "" { return "field `" + names[i] + "`: " + body }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The value node of field `name` in record literal `ix`, or -1.
+function objLitFieldValue(ix: i32, name: string) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const o = P.nodes[ix]
+  if !(o is ObjLit) { return -1 }
+  for f in o.objFields {
+    const fi = P.nodes[f]
+    if fi is FieldInit {
+      if fi.fiName == name { return fi.fiValue }
+    }
+  }
+  -1
+}
+
+// The fill argument of `ix` when it is a two-argument call of `std:array`'s `filled`, else -1.
+function storageFilledFill(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const cn = P.nodes[ix]
+  if !(cn is Call) { return -1 }
+  if cn.callArgs.length != 2 { return -1 }
+  if demangleName(calleeNameOf(ix)) != "filled" { return -1 }
+  const d = callDeclFnIx(cn, ix)
+  if d < 0 || srcmapPathOf(rcwModOf(d)) != "std:array" { return -1 }
+  cn.callArgs[1]
+}
+
+// Whether no binding named `zeroBytes` but an import of `std:bytes`'s exists anywhere in the
+// module of node `at`, so rewriting a call there to `zeroBytes(n)` cannot reach another one.
+// A file scan rather than the scope chain: a module binding declared later is not yet in scope.
+function zeroBytesNameFree(at: i32): boolean {
+  const m = rcwModOf(at)
+  if m < 0 { return false }
+  zeroBytesBindScan()
+  !i32ListHas(zeroBytesBindMods, m)
+}
+
+// Extends `zeroBytesBindMods` over the nodes added since the last call, so the arena is
+// walked once however many calls ask.
+function zeroBytesBindScan() {
+  const zb = "zeroBytes"
+  let i = zeroBytesScanned
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let hit = false
+    if n is LetDecl {
+      hit = demangleName(n.letName) == zb
+    } else if n is FuncDecl {
+      hit = demangleName(n.fnName) == zb
+    } else if n is Param {
+      hit = demangleName(n.parName) == zb
+    } else if n is ForRange {
+      hit = demangleName(n.frVar) == zb
+    } else if n is ForIn {
+      hit = demangleName(n.fiVar) == zb || demangleName(n.fiVar2) == zb
+    } else if n is ImportDecl {
+      hit = n.impPath != "std:bytes" && strListHas(n.impLocals, zb)
+    }
+    if hit {
+      const hm = rcwModOf(i)
+      if !i32ListHas(zeroBytesBindMods, hm) { zeroBytesBindMods.push(hm) }
+    }
+    i = i + 1
+  }
+  zeroBytesScanned = P.nodes.length
+  0
+}
+
+// Whether `ix` is a zero integer literal (`0`, `00`, `0x0`, `-0`), bare or converted with `as`.
+function fillIsLitZero(ix: i32): boolean {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = P.nodes[x]
+  if n is AsExpr { return fillIsLitZero(n.asObj) }
+  if n is Unary {
+    if n.unOp == "-" || n.unOp == "+" { return fillIsLitZero(n.unArg) }
+    return false
+  }
+  numLitIsZero(x)
+}
+
+// Whether node `x` is an integer number literal whose value is zero, in any base.
+function numLitIsZero(x: i32): boolean {
+  const n = P.nodes[x]
+  if !(n is NumLit) { return false }
+  const t = n.numText
+  let i = 0
+  if t.length > 0 && t[0] == '-' { i = 1 }
+  if t.length > i + 2 && t[i] == '0' {
+    const b = t[i + 1]
+    if b == 'x' || b == 'X' || b == 'b' || b == 'B' || b == 'o' || b == 'O' {
+      i = i + 2
+    }
+  }
+  if i >= t.length { return false }
+  while i < t.length {
+    if t[i] != '0' && t[i] != '_' { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Whether an accepted assignment of right side `rhs`, a `rt` value, into a place of type
 // `placeTy` yields the place's type: the two are one type in another spelling (a union's member
 // order), or `rhs` is a literal built at the place's type because a `rt` value could reach the
@@ -40927,6 +41114,7 @@ function letAssignMsg(
       + tyToStr(want)
       + charLitForStringNote(srcIx, want)
       + boolForNumberNoteAt(srcIx, got, want)
+      + storageListNote(srcIx, got, want)
   }
   // An object literal (`{}` / `{x: 1}`) assigned to a map type is a category error, not a
   // width mismatch — point at the fix (`Map()`) rather than the opaque
@@ -40963,6 +41151,7 @@ function letAssignMsg(
     + annotTyStr(want, annIx)
     + charLitForStringNote(srcIx, want)
     + boolForNumberNote(got, want)
+    + storageListNote(srcIx, got, want)
 }
 
 // `tyToStr(want)`, except that a function type whose annotation `annIx` named its parameters
@@ -40986,15 +41175,18 @@ function annotTyStr(want: i32, annIx: i32) {
 // A builtin method argument's sentence, in one home because the arm and the pin
 // (`validateBmCstrs`) both have to say it and must not drift. `ctx` is the type a form
 // needs that is neither side of the comparison (the receiver array; the other bound of a string `slice`).
+// `bmArgMsg`'s `push` refusal, whose storage-list note names the pushed value `src` when known.
+function bmPushMsg(label: string, got: i32, want: i32, ctx: i32, src: i32) {
+  label
+    + ": cannot add "
+    + tyToStr(got)
+    + " to "
+    + tyToStr(ctx)
+    + boolForNumberNote(got, want)
+    + storageListNote(src, got, want)
+}
 function bmArgMsg(form: i32, label: string, got: i32, want: i32, ctx: i32) {
-  if form == BM_PUSH {
-    return label
-      + ": cannot add "
-      + tyToStr(got)
-      + " to "
-      + tyToStr(ctx)
-      + boolForNumberNote(got, want)
-  }
+  if form == BM_PUSH { return bmPushMsg(label, got, want, ctx, -1) }
   if form == BM_SETVAL || form == BM_SETKEY || form == BM_ADDKEY {
     return label
       + ": expected "
@@ -48275,7 +48467,7 @@ function checkMemberCallNode(
               // re-encodes into an `f32` element exactly as it does at a binding, and defers to
               // the pin when a side is a hole (D582).
               if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi]) {
-                tErr(bmArgMsg(BM_PUSH, "push", pat, rt.aElem, recvTy), ix)
+                tErr(bmPushMsg("push", pat, rt.aElem, recvTy, margs[mi]), ix)
               }
             }
           }
@@ -50685,7 +50877,8 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
               + ", got "
               + tyToStr(lt)
               + boolForNumberNote(lt, ret)
-              + numUnionLossNote(lt, ret),
+              + numUnionLossNote(lt, ret)
+              + storageListNote(lf, lt, ret),
             lf,
             ret,
           )
@@ -53033,7 +53226,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
                       + ", got "
                       + tyToStr(stTy)
                       + boolForNumberNote(stTy, ret)
-                      + numUnionLossNote(stTy, ret),
+                      + numUnionLossNote(stTy, ret)
+                      + storageListNote(stmts[s], stTy, ret),
                     stmts[s],
                     ret,
                   )
@@ -72947,7 +73141,8 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         + tyToStr(got)
         + bareRetVoidNote(want)
         + charLitForStringNote(n.retArg, want)
-        + boolForNumberNote(got, want),
+        + boolForNumberNote(got, want)
+        + storageListNote(n.retArg, got, want),
       n.retArg,
       want,
     )
