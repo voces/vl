@@ -143,12 +143,16 @@ import {
   orderArgsByParamNames,
   ovCandText,
   ovCandsText,
+  ovDemangle,
   ovFnHead,
+  ovHeadsOverlap,
   ovInstPick,
   ovInstRecv,
   ovInstSite,
   ovPlainSetOf,
+  ovPrimClass,
   ovSetCands,
+  ovSetMod,
   ovSetName,
   ovSiteSetOf,
   paramDefaultIsCallsite,
@@ -1055,6 +1059,12 @@ let ufcsCstrMore: i32[][] = []
 let ufcsUnpinnedSites: i32[] = []
 // Overloaded member calls whose receiver each instance supplies (`ovHoleCallTy`).
 let ovHoleSites: i32[] = []
+// Functions whose instances pick an overloaded candidate per call, and function names read
+// as values (node, declaration, name): such a value is refused (`ovUnpinnedReport`).
+let ovDepFns: i32[] = []
+let ovFnValIx: i32[] = []
+let ovFnValDecl: i32[] = []
+let ovFnValName: string[] = []
 // The function declaration whose own body is being checked, -1 at module scope; a lambda's.
 let curFnDeclIx = -1
 
@@ -5415,6 +5425,10 @@ export function initChecker() {
   ufcsCstrMore = []
   ufcsUnpinnedSites = []
   ovHoleSites = []
+  ovDepFns = []
+  ovFnValIx = []
+  ovFnValDecl = []
+  ovFnValName = []
   curFnDeclIx = -1
   ufcsMissAt = []
   ufcsMissSpecs = []
@@ -41338,6 +41352,7 @@ function ufcsImportEditSuffix(
 // name would collide with. "" when the module binds no such name.
 function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
   if ufcsFreeAliasAt(ix, prop) == prop { return "" }
+  if ovImportCoexists(ix, prop, objTy) { return "" }
   const tn = demangleMsg(tyToStr(objTy))
   let out = prop
   let i = 0
@@ -41355,6 +41370,26 @@ function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
     i = i + 1
   }
   ufcsFreeAliasAt(ix, out)
+}
+
+// Whether an import of `prop` for receiver `objTy` would coexist with the binding the module
+// at `ix` already has: that binding is a function whose first parameter's head is disjoint
+// from the receiver's (receiver overloading), so the plain name is the right import.
+function ovImportCoexists(ix: i32, prop: string, objTy: i32): boolean {
+  const heads = ovRecvHeads(objTy)
+  if heads.length == 0 { return false }
+  const fty = lookup(ufcsSiteFn(ix, prop))
+  if fty < 0 { return false }
+  const ft = T.tys[fty]
+  if ft is TyFunc {
+    let own = "none"
+    if ft.fnParamTypes.length > 0 { own = ovParamHead(ft.fnParamTypes[0]) }
+    for h in heads {
+      if ovHeadsOverlap(own, h) { return false }
+    }
+    return true
+  }
+  false
 }
 
 // `base`, or `base` with the smallest numeric suffix from 2 up, whichever the module at `ix`
@@ -41931,6 +41966,10 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
         }
       }
       k = k + 1
+    }
+    // An overloaded call's row (`p0` -1) makes its owner's instances pick per call.
+    if p0 < 0 && owner >= 0 && !i32ListHas(ovDepFns, owner) {
+      ovDepFns.push(owner)
     }
     ufcsCstrTy.push(recv)
     ufcsCstrProp.push(prop)
@@ -47112,18 +47151,7 @@ function ovKindClass(ty: i32, depth: i32): string {
   let out = ""
   match t {
     TyPrim => {
-      const pn = t.primName
-      if pn == "string" { out = "str" }
-      if pn == "boolean" { out = "bool" }
-      if (
-        pn == "i32"
-        || pn == "i64"
-        || pn == "f32"
-        || pn == "f64"
-        || pn == "u8"
-      ) {
-        out = "num"
-      }
+      out = ovPrimClass(t.primName)
     }
     TyLit => {
       out = "num"
@@ -47185,21 +47213,15 @@ function ovRecvHeads(ty: i32): string[] {
     }
     return out
   }
-  if t is TyUnion {
-    const ua = unionAliasDeclNameOfTy(ty)
-    if ua != "" {
-      out.push("rec:" + ovNameHead(ua))
-      return out
-    }
-  }
   const c = ovKindClass(ty, 8)
   if c != "" { out.push(c) }
   out
 }
 
-// The `self`-function of set `row` a receiver of `recvTy` selects: "" when none takes its
-// head, "*" when several do (two declared names for one record shape). One lookup, after the
-// receiver is typed, so the choice never feeds back into the receiver's inference.
+// The `self`-function of set `row` a receiver of `recvTy` selects: the one whose head is the
+// receiver's, else the one whose first parameter accepts it (a wider record), as a lone
+// candidate would. "" when none does, "*" when several do. One lookup, after the receiver is
+// typed, so the choice never feeds back into the receiver's inference.
 export function ovPickFor(row: i32, recvTy: i32): string {
   const heads = ovRecvHeads(recvTy)
   let found = ""
@@ -47209,7 +47231,28 @@ export function ovPickFor(row: i32, recvTy: i32): string {
       found = c
     }
   }
+  if found != "" || tyHasHole(recvTy) { return found }
+  for c in ovSetCands[row] {
+    if declFirstParamIsSelf(c) && ufcsSelfAccepts(c, lookup(c), recvTy) {
+      if found != "" { return "*" }
+      found = c
+    }
+  }
   found
+}
+
+// `.prop(…)` refused for set `row`: the one sentence every such refusal opens with.
+function ovChooseMsg(row: i32, prop: string, tail: string): string {
+  "`." + prop + "(…)` cannot choose between " + ovCandsText(row) + tail
+}
+
+// The head class a parameter of type `ty` declares, the arena twin of the merge's
+// `modOvHeadOfTs`: a union, a hole or an undeclared shape overlaps every class.
+function ovParamHead(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "any" }
+  const hs = ovRecvHeads(ty)
+  if hs.length != 1 || T.tys[ty] is TyUnion { return "any" }
+  hs[0]
 }
 
 // A member call whose receiver each instance supplies (an un-annotated or type-parameter
@@ -47246,15 +47289,16 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
       }
     }
   }
-  if why != "" || ret < 0 {
+  if ret < 0 && why == "" { why = "no candidate takes a receiver" }
+  if why != "" {
     tErr(
-      "`."
-        + prop
-        + "(…)` cannot choose between "
-        + ovCandsText(row)
-        + " for a receiver each call supplies, because "
-        + why
-        + " — annotate the receiver",
+      ovChooseMsg(
+        row,
+        prop,
+        " for a receiver each call supplies, because "
+          + why
+          + " — annotate the receiver",
+      ),
       ix,
     )
     return TY_ERR
@@ -47423,15 +47467,14 @@ function ovRefuseMsg(
     let tail = "annotate the receiver with the type to call it on, or rename one import with `as`"
     if T.tys[recvTy] is TyNullable {
       tail = "a nullable receiver is called as `x?." + prop + "(…)`"
+    } else if T.tys[recvTy] is TyUnion {
+      tail = "its members span head classes; narrow it (`if x is …`) before the call"
     }
-    return "`."
-      + prop
-      + "(…)` cannot choose between "
-      + cands
-      + ": the receiver's type "
-      + rs
-      + " does not determine one — "
-      + tail
+    return ovChooseMsg(
+      row,
+      prop,
+      ": the receiver's type " + rs + " does not determine one — " + tail,
+    )
   }
   "no `"
     + prop
@@ -47462,11 +47505,11 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // A receiver whose element is still open would take it from the callee the name picked.
     if ovRecvOpen(recvTy) {
       tErr(
-        "`."
-          + plainName
-          + "(…)` names one of "
-          + ovCandsText(ovRow)
-          + ", and the receiver's element type is not known yet — annotate it (`const xs: string[] = []`)",
+        ovChooseMsg(
+          ovRow,
+          plainName,
+          ", because the receiver's element type is not known yet — annotate it (`const xs: string[] = []`)",
+        ),
         ix,
       )
       return TY_ERR
@@ -55382,6 +55425,9 @@ function checkNodeReal(ix: i32) {
     // `ty` is this use's type as the checker resolved it — narrowed when the use
     // sits inside a guarded arm. Threaded in so the occurrence retains it.
     if symEnabled != 0 { symUse(ix, n.identName, ty) }
+    if ovSetMod.length > 0 && ix != ckCalleeIx {
+      ovNoteFnValue(ix, n.identName, ty)
+    }
     if ix != daWriteTarget {
       if crCapLossAny { crNoteLostName(n.identName, ix) }
       const crr = crReadHook(n.identName, ix)
@@ -57422,7 +57468,8 @@ export function checkProgram(rootIx: i32) {
 // instantiates: no instance picks its candidate, and the body alone cannot.
 function ovUnpinnedReport() {
   for s in ovHoleSites {
-    if !i32ListHas(ovInstSite, s) {
+    // A dependency's uninstantiated function emits nothing, so only the entry's is asked.
+    if !i32ListHas(ovInstSite, s) && ufcsModOfNode(s) <= 0 {
       const c = P.nodes[s]
       let prop = ""
       if c is Call {
@@ -57432,16 +57479,45 @@ function ovUnpinnedReport() {
       const row = ovSiteSetOf(s)
       if row >= 0 {
         tErr(
-          "`."
-            + prop
-            + "(…)` cannot choose between "
-            + ovCandsText(row)
-            + ": its receiver's type comes from each call of the function it sits in, and nothing calls it — annotate the receiver",
+          ovChooseMsg(
+            row,
+            prop,
+            ": its receiver's type comes from each call of the function it sits in, and nothing calls it — annotate the receiver",
+          ),
           s,
         )
       }
     }
   }
+  // An instance made for a function VALUE has no call whose receiver could pick a candidate.
+  let i = 0
+  while i < ovFnValIx.length {
+    if i32ListHas(ovDepFns, ovFnValDecl[i]) {
+      const nm = ovDemangle(ovFnValName[i])
+      tErr(
+        "`"
+          + nm
+          + "` cannot be used as a function value: its body calls an overloaded method on a receiver each call of `"
+          + nm
+          + "` supplies, and a function value makes an instance no call picks for — pass a lambda whose parameter is annotated, `(x: T) => "
+          + nm
+          + "(x)`",
+        ovFnValIx[i],
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A function name read as a value (not called), kept for `ovUnpinnedReport`.
+function ovNoteFnValue(ix: i32, name: string, ty: i32) {
+  const d = fnDeclIx[name] ?? -1
+  if d < 0 || i32ListHas(ovFnValIx, ix) { return 0 }
+  if T.scopes.length == 0 || (T.scopes[0][name] ?? -1) != ty { return 0 }
+  ovFnValIx.push(ix)
+  ovFnValDecl.push(d)
+  ovFnValName.push(name)
   0
 }
 

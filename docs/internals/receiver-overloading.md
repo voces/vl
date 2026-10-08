@@ -24,11 +24,17 @@ member's class. Two NONE candidates overlap.
 - **Method calls.** The receiver is typed first, then its head is looked up once among the
   `self`-functions; the choice never feeds back into inference. An unknown head (a nullable, a
   union across classes, an anonymous record) is refused; `x?.f()` resolves on the type under the
-  `?`. A record shape declared under two names matches neither.
+  `?`. A record shape declared under two names matches neither. A receiver no head names (a
+  wider record) takes the one candidate whose first parameter accepts it, as a lone candidate
+  would, so adding a disjoint candidate never moves it; two accepting is refused. A local
+  binding named like the method (a parameter `d`) is no candidate.
 - **Receivers an instance supplies** (a type parameter, an un-annotated parameter) pick per
   monomorphized instance. The body types the call by the one return type every candidate
-  shares; each pin picks and checks its own candidate; a function nothing instantiates is
-  refused. Only a receiver that is the function's own parameter is re-dispatched (D3818).
+  shares; each pin picks and checks its own candidate. A function nothing instantiates is
+  refused in the entry module (a dependency's emits nothing), and one passed as a function
+  value is refused, since the instance a value makes has no call to pick for — an annotated
+  lambda, `(x: A) => h(x)`, is the spelling. Only a receiver that is the function's own
+  parameter is re-dispatched (D3818).
 - **Plain calls** use lexical scope (rule (e), owner-confirmed): the local declaration wins;
   two imports and no local is refused with the method spelling or an `as` alias as the fix.
   Resolving `f(x, …)` as `x.f(…)` (rule (c)) is a possible later widening that breaks nothing;
