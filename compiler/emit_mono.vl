@@ -5813,6 +5813,30 @@ function monoSubstTyArgNodes(tas: i32[]): i32[] {
   out
 }
 
+// The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
+// generic called from it, consumed (and cleared) where the key is built; -1 for none.
+let monoCallFrameSlot = 0 - 1
+// Per template slot, the frame-keyed instances minted while its slot still holds the template;
+// they leave the slot to the template frame's own first instance.
+let monoFramedPushes: {[i32]: i32} = Map()
+
+// The instance of nested function `fe`'s enclosing frame that `ctx` is, when that is not the
+// template's own frame: a capturing nested generic needs one instance per enclosing instance,
+// whose env holds that instance's captures (D3826). -1 otherwise, and for a call from a
+// function nested deeper, which reads the captures through its own env (D3827).
+function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
+  if fe < 0 || fe >= fnParent.length || ctx < 0 { return -1 }
+  const p0 = fnParent[fe]
+  if p0 < 0 || captureCountOf(fe) == 0 { return -1 }
+  let sl = fnStmtsPosOf(ctx)
+  if sl < 0 || sl >= fnInstOrigin.length || sl >= fnParent.length { return -1 }
+  // A recursive call from a frame-keyed instance keeps that instance's frame.
+  if fnInstOrigin[sl] == fe { sl = fnParent[sl] }
+  if sl < 0 || sl == p0 || sl >= fnInstOrigin.length { return -1 }
+  if fnInstOrigin[sl] == p0 { return sl }
+  -1
+}
+
 // The instance-key suffix `monoInstantiate` hands `monoMakeInstance` for a call with explicit
 // type arguments, consumed (and cleared) where the key is built.
 let monoKeyExtra = ""
@@ -7437,6 +7461,8 @@ function monoMakeInstanceGo(
   annotateI32: boolean,
   cbFnNames: string[],
 ) {
+  const callFrame = monoCallFrameSlot
+  monoCallFrameSlot = -1
   // The pin columns are positional and nothing downstream can tell a misaligned one from a
   // correct one — param j would silently read param k's type. Checked once, loudly, here
   // rather than bounds-guarding each read: a guard turns misalignment into a silently wrong
@@ -7455,6 +7481,7 @@ function monoMakeInstanceGo(
     const params = fn.fnParams
     let key = i32ToStr(origFe) + "#" + monoKeyExtra
     monoKeyExtra = ""
+    if callFrame >= 0 { key = key + "^" + i32ToStr(callFrame) }
     const exBN = monoExplicitBN
     const exBT = monoExplicitBT
     const argLit = monoPinArgLit
@@ -8160,7 +8187,17 @@ function monoMakeInstanceGo(
     }
     let instName = fn.fnName
     let instFe = origFe
-    if count > 0 { instName = fn.fnName + "$" + i32ToStr(count) }
+    // A frame-keyed instance never takes the template's slot, whose frame is the template's.
+    const slotFree = count == (monoFramedPushes.get(origFe) ?? 0)
+    const first = slotFree && callFrame < 0
+    if !first {
+      let suffix = count
+      if slotFree {
+        suffix = count + 1
+        monoFramedPushes.set(origFe, count + 1)
+      }
+      instName = fn.fnName + "$" + i32ToStr(suffix)
+    }
     const noTyParams: string[] = []
     // The closure-pinned parameter column this instance binds, read by the body clone's
     // container rung. Rebuilt per instance, since the pin is what differs between them.
@@ -8219,7 +8256,7 @@ function monoMakeInstanceGo(
     // Copy-on-write: a body with no such lambda is the same node index.
     monoLamMintedSlots = []
     monoLamCloneSlots = []
-    monoInstIsFirst = count == 0
+    monoInstIsFirst = first
     monoCgcLamNames = monoInstLamNames(instBody0)
     monoPinUnsafeNames = Map()
     monoPinRetBox = false
@@ -8354,7 +8391,7 @@ function monoMakeInstanceGo(
     // D926 — the return-row twin of the param mark above. `monoOrigNode[origFe]` is the
     // template's own `FuncDecl`, which is what `anonLeafMarkRetMoved` marked.
     anonLeafCarryRetMark(monoOrigNode[origFe], nfn)
-    if count == 0 {
+    if first {
       // First instance: keep the bare name and the original's wasm index.
       buildFnMapNoteFnStmtWrite(origFe, nfn)
       fnStmts[origFe] = nfn
@@ -8381,7 +8418,9 @@ function monoMakeInstanceGo(
       // resolve where the first instance's do and its env fields take their real types (D2749).
       let instParent = -1
       if origFe < fnParent.length { instParent = fnParent[origFe] }
+      if callFrame >= 0 { instParent = callFrame }
       fnParent.push(instParent)
+      if callFrame >= 0 { invalidateFnChildIndex() }
       fnDispNames.push("")
       instFe = fnStmts.length - 1
       // D943 — the clones' frame is this instance, not the template. `captureValKind`
@@ -9446,6 +9485,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         monoPinArgLit.push(P.nodes[unwrapParen(args[li])] is ObjLit)
         li = li + 1
       }
+      monoCallFrameSlot = monoNestedCallFrame(origFe, ctx)
       return monoMakeInstance(
         origFe,
         pinned,
@@ -10347,6 +10387,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstFe = []
   monoParamPinTy = Map()
   monoAnonParamPinTy = Map()
+  monoFramedPushes = Map()
   monoFnFieldTwinRow = Map()
   monoTwoListRet = Map()
   monoSubTablesReset()

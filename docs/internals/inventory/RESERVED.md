@@ -86,4 +86,4 @@ D3795-D3799  lane-S5  2026-10-06  soundness: D3793, D3762, D3744 closed; D3795 f
 D3800-D3802  lane-DG  2026-10-07  redundant-annotation hint at a `??` default (D3798 closed; D3800 filed open)
 D3803-D3807  lane-PF  2026-10-07  sunpa per-frame allocation (item c): D3803 filed and closed; D3804 (list vectors, needs design), D3805 (for-in over a literal) filed open
 D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D3800 closed); D3811, D3812 filed open
-D3825-D3829  lane-SC  2026-10-08  soundness clause 1: D3820, D3816 closed; D3825 filed and closed; D3826 filed
+D3825-D3834  lane-SC  2026-10-08  soundness clause 1: D3820, D3816 closed; D3825, D3826 filed and closed; D3827-D3830 filed
