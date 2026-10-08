@@ -123,6 +123,7 @@ import {
   tyToEmitName,
   tyToStr,
   tyToStructStr,
+  tyVarRenameRow,
   uniqueGenericDeclNamed,
   valueUnionRetName,
 } from "./typecheck"
@@ -329,7 +330,6 @@ import {
   arrLitElemName,
   capMemoNoteEdit,
   captureCountOf,
-  captureNamesOf,
   cloRetTypeName,
   criFnIsAnonLambda,
   exactBindWalk,
@@ -5848,7 +5848,6 @@ function monoEnclosingPinRow(
   outT: i32[],
 ) {
   if origFe < 0 || origFe >= fnParent.length { return 0 }
-  if monoNestedShadowsOuter(origFe) { return 0 }
   let pos = fnParent[origFe]
   if callFrame >= 0 { pos = callFrame }
   let guard = 0
@@ -5878,66 +5877,149 @@ function monoEnclosingPinRow(
   0
 }
 
-// Whether nested function `fe` reads a capture typed at a type variable named like one of its
-// own type parameters: the enclosing function's, which a by-name binding cannot tell apart.
-function monoShadowedCaptureRead(fe: i32): boolean {
-  if fe < 0 || fe >= monoOrigNode.length { return false }
-  const f = P.nodes[monoOrigNode[fe]]
-  if !(f is FuncDecl) { return false }
-  const caps = captureNamesOf(fe)
-  const stack: i32[] = [f.fnBody]
+// The declared type parameters a nested generic redeclares, renamed apart: each row of the
+// enclosing declarer's `T` becomes `T__sh<slot>`, which that declarer's instances also bind, so
+// a read typed at the outer `T` inside the nested one takes the outer pin (D3840). Parallel
+// columns: the declarer's slot, the parameter's name, and its alias.
+let monoShAliasSlot: i32[] = []
+let monoShAliasName: string[] = []
+let monoShAliasTo: string[] = []
+
+// Renames apart every declared type parameter a nested generic among the first `nDecl` slots
+// redeclares. -1 when a row belongs to both functions, which no alias can split.
+function monoShadowRename(nDecl: i32): i32 {
+  monoShAliasSlot = []
+  monoShAliasName = []
+  monoShAliasTo = []
+  let fe = 0
+  while fe < nDecl && fe < fnParent.length {
+    const f = P.nodes[fnStmts[fe]]
+    if f is FuncDecl {
+      if f.fnTyParams.length > 0 && monoNestedShadowsOuter(fe) {
+        for tp in f.fnTyParams {
+          let p = fnParent[fe]
+          let guard = 0
+          while p >= 0 && p < fnParent.length && guard <= fnStmts.length {
+            const pf = P.nodes[fnStmts[p]]
+            if pf is FuncDecl {
+              if strListHas(pf.fnTyParams, tp) {
+                if monoShadowRenameDecl(p, fe, tp) < 0 { return -1 }
+              }
+            }
+            p = fnParent[p]
+            guard = guard + 1
+          }
+        }
+      }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// Renames declarer `d`'s rows of type parameter `name` apart from those of nested generic
+// `inner`, which redeclares it. -1, with the failure recorded, when the two share a row.
+function monoShadowRenameDecl(d: i32, inner: i32, name: string): i32 {
+  let k = 0
+  while k < monoShAliasSlot.length {
+    if monoShAliasSlot[k] == d && monoShAliasName[k] == name { return 0 }
+    k = k + 1
+  }
+  const own = monoTyParamRows(fnStmts[d], name)
+  const theirs = monoTyParamRows(fnStmts[inner], name)
+  for r in own {
+    if i32ListHas(theirs, r) {
+      return emitFail(
+        "emitProgram: a nested generic that redeclares its enclosing function's type parameter shares that parameter's type with it — rename the nested one",
+      )
+    }
+  }
+  const alias = name + "__sh" + i32ToStr(d)
+  for r in own { tyVarRenameRow(r, alias) }
+  monoShAliasSlot.push(d)
+  monoShAliasName.push(name)
+  monoShAliasTo.push(alias)
+  0
+}
+
+// The type variable rows named `name` that the annotations of function node `fx` resolve to,
+// its nested functions' included except those redeclaring `name`.
+function monoTyParamRows(fx: i32, name: string): i32[] {
+  const out: i32[] = []
+  const stack: i32[] = [fx]
   while stack.length > 0 {
     const cur = stack.pop() ?? -1
     if cur >= 0 && cur < P.nodes.length {
-      const nm = monoIdentNameOf(cur)
-      if nm != "" && strListHas(caps, nm) {
-        if monoTyNamesVar(nodeTyIxOf(cur), f.fnTyParams, 0) { return true }
+      const nd = P.nodes[cur]
+      let enter = true
+      if nd is FuncDecl {
+        if cur != fx && strListHas(nd.fnTyParams, name) { enter = false }
+      } else if nd is TypeRef {
+        monoTyVarRowsNamed(nodeTyIxOf(cur), name, out, 0)
       }
-      const b = monoNestedBodyOf(cur)
-      if b >= 0 { stack.push(b) }
-      for k in nodeChildren(cur) { stack.push(k) }
+      if enter {
+        for c in nodeChildren(cur) { stack.push(c) }
+      }
     }
   }
-  false
+  out
 }
 
-// Whether type `t` holds a type variable named one of `names`. Bounded by depth; false past it.
-function monoTyNamesVar(t: i32, names: string[], depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+// Appends to `out` the type variable rows named `name` that type `t` holds. Bounded by depth.
+function monoTyVarRowsNamed(t: i32, name: string, out: i32[], depth: i32) {
+  if t < 0 || t >= T.tys.length || depth > 16 { return 0 }
   const ty = T.tys[t]
   match ty {
     TyVar => {
-      return strListHas(names, ty.tvName)
+      if ty.tvName == name && !i32ListHas(out, t) { out.push(t) }
     }
     TyArray => {
-      return monoTyNamesVar(ty.aElem, names, depth + 1)
+      monoTyVarRowsNamed(ty.aElem, name, out, depth + 1)
     }
     TyNullable => {
-      return monoTyNamesVar(ty.nInner, names, depth + 1)
+      monoTyVarRowsNamed(ty.nInner, name, out, depth + 1)
     }
     TyMap => {
-      return monoTyNamesVar(ty.mKey, names, depth + 1)
-        || monoTyNamesVar(ty.mVal, names, depth + 1)
+      monoTyVarRowsNamed(ty.mKey, name, out, depth + 1)
+      monoTyVarRowsNamed(ty.mVal, name, out, depth + 1)
     }
     TyUnion => {
-      for m in ty.uMembers {
-        if monoTyNamesVar(m, names, depth + 1) { return true }
-      }
+      for m in ty.uMembers { monoTyVarRowsNamed(m, name, out, depth + 1) }
     }
     TyObj => {
       for ft in ty.objFieldTypes {
-        if monoTyNamesVar(ft, names, depth + 1) { return true }
+        monoTyVarRowsNamed(ft, name, out, depth + 1)
       }
     }
     TyFunc => {
-      for pt in ty.fnParamTypes {
-        if monoTyNamesVar(pt, names, depth + 1) { return true }
-      }
-      return monoTyNamesVar(ty.fnRet, names, depth + 1)
+      for pt in ty.fnParamTypes { monoTyVarRowsNamed(pt, name, out, depth + 1) }
+      monoTyVarRowsNamed(ty.fnRet, name, out, depth + 1)
     }
     TyPrim | TyLit | TyNeg | TyErr => {}
   }
-  false
+  0
+}
+
+// Binds, beside each of instance `origFe`'s own parameters in `ns`/`ts`, the alias
+// `monoShadowRename` gave its rows.
+function monoShAliasBind(origFe: i32, ns: string[], ts: i32[]) {
+  let k = 0
+  while k < monoShAliasSlot.length {
+    if monoShAliasSlot[k] == origFe && !strListHas(ns, monoShAliasTo[k]) {
+      let i = 0
+      const n0 = ns.length
+      while i < n0 && i < ts.length {
+        if ns[i] == monoShAliasName[k] {
+          ns.push(monoShAliasTo[k])
+          ts.push(ts[i])
+          i = n0
+        }
+        i = i + 1
+      }
+    }
+    k = k + 1
+  }
+  0
 }
 
 // The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
@@ -5958,15 +6040,6 @@ function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
   if fe < 0 || fe >= fnParent.length || ctx < 0 { return -1 }
   const p0 = fnParent[fe]
   if p0 < 0 || captureCountOf(fe) == 0 { return -1 }
-  // Type variables are substituted by name, so a capture typed at the enclosing `T` would
-  // read the nested function's own `T`: refused rather than lowered at the wrong type (D3840).
-  if monoNestedShadowsOuter(fe) {
-    if !monoShadowedCaptureRead(fe) { return -1 }
-    emitFail(
-      "emitProgram: a nested generic that redeclares its enclosing function's type parameter and reads that function's variables typed at it cannot tell the two parameters apart — rename the nested one",
-    )
-    return -1
-  }
   let sl = fnStmtsPosOf(ctx)
   if sl < 0 || sl >= fnInstOrigin.length || sl >= fnParent.length { return -1 }
   // A recursive call from a frame-keyed instance keeps that instance's frame.
@@ -7720,6 +7793,7 @@ function monoMakeInstanceGo(
     const exSubT: i32[] = []
     if monoNeedsExactKey(origFe) {
       if (monoExactBind(params, tps, pinTys, exBN, exBT, exSubN, exSubT)) {
+        monoShAliasBind(origFe, exSubN, exSubT)
         let xk = 0
         while xk < exSubN.length {
           key = key
@@ -7946,6 +8020,7 @@ function monoMakeInstanceGo(
     const letBN: string[] = exBN
     const letBT: i32[] = exBT
     monoBindCols(params, letTyCol, letBN, letBT)
+    monoShAliasBind(origFe, letBN, letBT)
     // Substitute a type-param-riding RETURN annotation through the binding —
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
     // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
@@ -11107,6 +11182,7 @@ export function monomorphize(stmts: i32[]) {
     if monoHasConcreteHOFParam() { any = true }
   }
   if !any { return 0 }
+  if monoShadowRename(fnStmts.length) < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
   while i < stmts.length {
