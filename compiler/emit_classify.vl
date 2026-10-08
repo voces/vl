@@ -17646,7 +17646,13 @@ export function exprIsBool(ix: i32, fnIx: i32) {
     // An element read over a boolean-element list prints as true/false: a `.map` result
     // whose callback returns boolean, or a directly declared `boolean[]`.
     if mfArrElemIsBool(e.idxArr, fnIx) { return true }
-    return listElemIsBool(e.idxArr, fnIx)
+    if listElemIsBool(e.idxArr, fnIx) { return true }
+    // An element typed at a type parameter an enclosing instance binds to `boolean`, read in
+    // a nested generic's instance that binds only its own (D3831).
+    if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
+      return true
+    }
+    return tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean"
   }
   if e is Unary { return e.unOp == "!" }
   if e is Ident {
@@ -22457,6 +22463,15 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   // …and a loop variable an instance pins to it (D2983).
   if tyIsNulPrim(loopVarPinTyOf(exprIx, fnIx), "boolean") {
     return !narrowedBoxPlace(exprIx, fnIx)
+  }
+  // …and a capture typed at a type parameter its enclosing instance binds to it (D3831).
+  const nbc = P.nodes[unwrapParen(exprIx)]
+  if nbc is Ident {
+    if capturedKindOf(fnIx, nbc.identName) != null {
+      if tyIsNulPrim(pinSubOperandTyOf(nodeTyIxOf(exprIx), fnIx), "boolean") {
+        return !narrowedBoxPlace(exprIx, fnIx)
+      }
+    }
   }
   // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfB = nulIfArmNullableValueIx(exprIx)
@@ -29614,6 +29629,32 @@ function holeNulLitElemTy(arrIx: i32, fnIx: i32): i32 {
   tyStepElem(rt)
 }
 
+// The element a captured list of a hole holds at the pin of the hole instance enclosing lambda
+// `fnIx`, or -1 (D3831).
+function holeCaptureArrElemTyOf(arrIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ty = nodeTyIxOf(unwrapParen(arrIx))
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const at = T.tys[ty]
+  if !(at is TyArray) { return -1 }
+  if at.aElem < 0 || at.aElem >= T.tys.length || !(T.tys[at.aElem] is TyVar) {
+    return -1
+  }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && pos < fnParent.length && guard <= fnStmts.length {
+    pos = fnParent[pos]
+    const row = monoHoleSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoHoleSubN.length {
+      const b = holePinReadOf(at.aElem, monoHoleSubN[row], monoHoleSubT[row])
+      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+      return b
+    }
+    guard = guard + 1
+  }
+  -1
+}
+
 // The element a receiver recorded as a list of a hole (`[x]` over a hole `x`) holds at the pin
 // of the instance `fnIx`, or -1 (D3174).
 function holeArrElemPinTyOf(arrIx: i32, fnIx: i32): i32 {
@@ -31881,8 +31922,36 @@ export function exactOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   if ty < 0 { return exactCallResultTyOf(ax, fnIx) }
   if !tyHasTyVar(ty) { return -1 }
   const st = substTyDeep(ty, monoExactSubN[row], monoExactSubT[row])
-  if st < 0 || tyHasTyVar(st) { return -1 }
+  if st < 0 { return -1 }
+  if tyHasTyVar(st) { return exactSubOuterTyOf(st, fnIx) }
   st
+}
+
+// `ty`, left open by the exact instance `fnIx` is, or is lifted inside, substituted through the
+// exact instances enclosing that one: a nested generic's instance binds its own parameters
+// only, and its enclosing instance binds the rest (D3831). -1 where one stays unbound.
+function exactSubOuterTyOf(ty: i32, fnIx: i32): i32 {
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  let seen = false
+  let cur = ty
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoExactSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoExactSubN.length {
+      // The innermost row is the one the caller already applied.
+      if seen {
+        const st = substTyDeep(cur, monoExactSubN[row], monoExactSubT[row])
+        if st < 0 { return -1 }
+        if !tyHasTyVar(st) { return st }
+        cur = st
+      }
+      seen = true
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
 }
 
 // `ty` with the type parameters the instance `fnIx` is, or is lifted inside, binds to its
@@ -31891,12 +31960,15 @@ export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
   if ty < 0 || monoPinSubN.length == 0 { return -1 }
   let pos = fnStmtsPosOf(fnIx)
   let guard = 0
+  let cur = ty
   while pos >= 0 && guard <= fnStmts.length {
     const row = monoPinSubRow.get(pos) ?? -1
     if row >= 0 && row < monoPinSubN.length {
-      const st = substTyDeep(ty, monoPinSubN[row], monoPinSubT[row])
-      if st < 0 || tyHasTyVar(st) { return -1 }
-      return st
+      const st = substTyDeep(cur, monoPinSubN[row], monoPinSubT[row])
+      if st < 0 { return -1 }
+      if !tyHasTyVar(st) { return st }
+      // A nested generic's instance leaves its enclosing instance's parameters open (D3831).
+      cur = st
     }
     if pos >= fnParent.length { return -1 }
     pos = fnParent[pos]
@@ -32191,6 +32263,18 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   if own >= 0 { return tyStepElem(own) }
   const ex = exactOperandTyOf(iterIx, fnIx)
   if ex >= 0 { return tyStepElem(ex) }
+  // A captured list typed at a type parameter the enclosing instance binds (D3831).
+  const ci = P.nodes[unwrapParen(iterIx)]
+  if ci is Ident {
+    if capturedKindOf(fnIx, ci.identName) != null {
+      const cs = pinSubOperandTyOf(nodeTyIxOf(unwrapParen(iterIx)), fnIx)
+      if cs >= 0 && cs < T.tys.length && T.tys[cs] is TyArray {
+        return tyStepElem(cs)
+      }
+      const ch = holeCaptureArrElemTyOf(iterIx, fnIx)
+      if ch >= 0 { return ch }
+    }
+  }
   // A loop variable over a list of lists holds its iterable's element at the pin (D3115).
   const lv = loopVarElemPinTyOf(iterIx, fnIx)
   if lv >= 0 && !tyHasTyVar(lv) { return tyStepElem(lv) }

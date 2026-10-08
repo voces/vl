@@ -1512,6 +1512,19 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   // through `monoAnnPinName`, the same home the array is named through — the two ends of
   // one cut must claim the same spelling set. The peel is `listElemNameOf`.
   if argN is Index {
+    // An element of a captured list: its recorded type, or the enclosing instance's pin of the
+    // type parameter it names, where the capture's own name rungs know only its default (D3831).
+    const cl = P.nodes[unwrapParen(argN.idxArr)]
+    if cl is Ident && fnIx >= 0 {
+      if monoNameIsCapture(fnIx, cl.identName) {
+        let ep = nodeTyIxOf(unwrapParen(ix))
+        if ep >= 0 && tyHasTyVar(ep) { ep = monoPinSubTyOf(ep, fnIx) }
+        if ep >= 0 && !tyHasTyVar(ep) && !tyIsLitUnion(ep) {
+          const en = monoAnnPinName(monoPinAnnSpelling(ep))
+          if en != "" { return en }
+        }
+      }
+    }
     // The array NAME cannot carry a literal-union element: such an array reps as the
     // interned-atom i32 list, so an INFERRED one is named `i32[]` and this arm would pin the
     // atom's raw width. The element's own recorded type is exact, so it is left to the litunion
@@ -5813,6 +5826,105 @@ function monoSubstTyArgNodes(tas: i32[]): i32[] {
   out
 }
 
+// Whether an instance already minted in this pass carries the name `nm`.
+function monoInstNameTaken(nm: string): boolean {
+  for n in monoInstName {
+    if n == nm { return true }
+  }
+  false
+}
+
+// The bindings the instance enclosing nested function `origFe` holds for type parameters
+// `own` does not redeclare, appended to `outN`/`outT`: that of `callFrame`, else of the
+// template's frame, else the nearest enclosing instance's. Nothing for a function that
+// shadows an enclosing parameter, which a by-name binding cannot tell apart (D3840).
+function monoEnclosingPinRow(
+  origFe: i32,
+  callFrame: i32,
+  own: string[],
+  outN: string[],
+  outT: i32[],
+) {
+  if origFe < 0 || origFe >= fnParent.length { return 0 }
+  if monoNestedShadowsOuter(origFe) { return 0 }
+  let pos = fnParent[origFe]
+  if callFrame >= 0 { pos = callFrame }
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoPinSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoPinSubN.length {
+      const ns = monoPinSubN[row]
+      const ts = monoPinSubT[row]
+      let i = 0
+      while i < ns.length && i < ts.length {
+        if (
+          !strListHas(own, ns[i])
+          && !strListHas(outN, ns[i])
+          && !tyHasTyVar(ts[i])
+        ) {
+          outN.push(ns[i])
+          outT.push(ts[i])
+        }
+        i = i + 1
+      }
+      return 0
+    }
+    if pos >= fnParent.length { return 0 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  0
+}
+
+// The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
+// generic called from it, consumed (and cleared) where the key is built; -1 for none.
+let monoCallFrameSlot = 0 - 1
+// Per template slot, the frame-keyed instances minted while its slot still holds the template;
+// they leave the slot to the template frame's own first instance.
+let monoFramedPushes: {[i32]: i32} = Map()
+
+// The instance of nested function `fe`'s enclosing frame that `ctx` is, when that is not the
+// template's own frame: a capturing nested generic needs one instance per enclosing instance,
+// whose env holds that instance's captures (D3826). -1 otherwise, and for a call from a
+// function nested deeper, which reads the captures through its own env (D3827).
+function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
+  if fe < 0 || fe >= fnParent.length || ctx < 0 { return -1 }
+  const p0 = fnParent[fe]
+  if p0 < 0 || captureCountOf(fe) == 0 { return -1 }
+  if monoNestedShadowsOuter(fe) { return -1 }
+  let sl = fnStmtsPosOf(ctx)
+  if sl < 0 || sl >= fnInstOrigin.length || sl >= fnParent.length { return -1 }
+  // A recursive call from a frame-keyed instance keeps that instance's frame.
+  if fnInstOrigin[sl] == fe { sl = fnParent[sl] }
+  if sl < 0 || sl == p0 || sl >= fnInstOrigin.length { return -1 }
+  if fnInstOrigin[sl] == p0 { return sl }
+  -1
+}
+
+// Whether nested function `fe` declares a type parameter an enclosing function declares too.
+// Type variables are substituted by name, so its instance cannot tell its own `T` from the
+// enclosing one; such a function is left to the shared path (D3832).
+function monoNestedShadowsOuter(fe: i32): boolean {
+  if fe < 0 || fe >= monoOrigNode.length { return false }
+  const f = P.nodes[monoOrigNode[fe]]
+  if !(f is FuncDecl) { return false }
+  let p = -1
+  if fe < fnParent.length { p = fnParent[fe] }
+  let guard = 0
+  while p >= 0 && p < monoOrigNode.length && guard <= fnStmts.length {
+    const pf = P.nodes[monoOrigNode[p]]
+    if pf is FuncDecl {
+      for tp in f.fnTyParams {
+        if strListHas(pf.fnTyParams, tp) { return true }
+      }
+    }
+    if p >= fnParent.length { return false }
+    p = fnParent[p]
+    guard = guard + 1
+  }
+  false
+}
+
 // The instance-key suffix `monoInstantiate` hands `monoMakeInstance` for a call with explicit
 // type arguments, consumed (and cleared) where the key is built.
 let monoKeyExtra = ""
@@ -7339,18 +7451,24 @@ function monoPinSubTyOf(t: i32, ctx: i32): i32 {
   if ctx < 0 { return t }
   let pos = fnStmtsPosOf(ctx)
   let guard = 0
+  // A nested generic's instance binds its own parameters only; what it leaves open is the
+  // enclosing instance's to bind, one frame up (D3831).
+  let cur = t
   while pos >= 0 && guard <= fnStmts.length {
     const row = monoPinSubRow.get(pos) ?? -1
     if row >= 0 && row < monoPinSubN.length {
-      const st = substTyDeep(t, monoPinSubN[row], monoPinSubT[row])
-      if st < 0 || tyHasTyVar(st) { return t }
-      return st
+      const st = substTyDeep(cur, monoPinSubN[row], monoPinSubT[row])
+      if st < 0 { return t }
+      if !tyHasTyVar(st) { return st }
+      cur = st
     }
     // A hole instance binds its holes, which the argument's recorded type may name directly.
     const hrow = monoHoleSubRow.get(pos) ?? -1
     if hrow >= 0 && hrow < monoHoleSubN.length {
-      let ht = holePinReadOf(t, monoHoleSubN[hrow], monoHoleSubT[hrow])
-      if ht < 0 { ht = substTyDeep(t, monoHoleSubN[hrow], monoHoleSubT[hrow]) }
+      let ht = holePinReadOf(cur, monoHoleSubN[hrow], monoHoleSubT[hrow])
+      if ht < 0 {
+        ht = substTyDeep(cur, monoHoleSubN[hrow], monoHoleSubT[hrow])
+      }
       if ht < 0 || tyHasTyVar(ht) { return t }
       return ht
     }
@@ -7437,6 +7555,8 @@ function monoMakeInstanceGo(
   annotateI32: boolean,
   cbFnNames: string[],
 ) {
+  const callFrame = monoCallFrameSlot
+  monoCallFrameSlot = -1
   // The pin columns are positional and nothing downstream can tell a misaligned one from a
   // correct one — param j would silently read param k's type. Checked once, loudly, here
   // rather than bounds-guarding each read: a guard turns misalignment into a silently wrong
@@ -7451,12 +7571,37 @@ function monoMakeInstanceGo(
   // either again, so that test is `monoOrigNode`'s length wearing another name.
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
+    // A nested generic's instance binds what its enclosing instance binds too, so a signature
+    // or a capture naming the enclosing type parameter lowers at that pin (D3829, D3831).
+    const tps: string[] = []
+    for tp in fn.fnTyParams { tps.push(tp) }
+    const outerN: string[] = []
+    const outerT: i32[] = []
+    monoEnclosingPinRow(origFe, callFrame, fn.fnTyParams, outerN, outerT)
     monoCurHasLam = monoFnDeclaresLambda(origFe)
     const params = fn.fnParams
     let key = i32ToStr(origFe) + "#" + monoKeyExtra
     monoKeyExtra = ""
+    if callFrame >= 0 { key = key + "^" + i32ToStr(callFrame) }
     const exBN = monoExplicitBN
     const exBT = monoExplicitBT
+    let on = 0
+    while on < outerN.length {
+      const osp = monoPinAnnSpelling(outerT[on])
+      if osp != "" {
+        tps.push(outerN[on])
+        exBN.push(outerN[on])
+        exBT.push(outerT[on])
+        tvN.push(outerN[on])
+        tvV.push(osp)
+        key = key
+          + "|"
+          + outerN[on]
+          + "="
+          + tyCanonKey(outerT[on], TY_WALK_DEPTH)
+      }
+      on = on + 1
+    }
     const argLit = monoPinArgLit
     monoExplicitBN = []
     monoExplicitBT = []
@@ -7475,9 +7620,7 @@ function monoMakeInstanceGo(
     const exSubN: string[] = []
     const exSubT: i32[] = []
     if monoNeedsExactKey(origFe) {
-      if (
-        monoExactBind(params, fn.fnTyParams, pinTys, exBN, exBT, exSubN, exSubT)
-      ) {
+      if (monoExactBind(params, tps, pinTys, exBN, exBT, exSubN, exSubT)) {
         let xk = 0
         while xk < exSubN.length {
           key = key
@@ -7590,7 +7733,7 @@ function monoMakeInstanceGo(
           if pinned[pj] == tyNameOf(p3.parType) {
             nt = p3.parType
           } else {
-            monoNicheNulListCheck(tyNameOf(p3.parType), fn.fnTyParams, tvN, tvV)
+            monoNicheNulListCheck(tyNameOf(p3.parType), tps, tvN, tvV)
             // The argument's type is one member of a union parameter; the explicit type
             // arguments substituted through the annotation name the union itself (D2679).
             let gateTy = pinTys[pj]
@@ -7705,9 +7848,7 @@ function monoMakeInstanceGo(
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
     // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
     let nret = fn.fnRet
-    if nret >= 0 {
-      monoNicheNulListCheck(tyNameOf(nret), fn.fnTyParams, tvN, tvV)
-    }
+    if nret >= 0 { monoNicheNulListCheck(tyNameOf(nret), tps, tvN, tvV) }
     // A hole-built return list local to annotate in the cloned instance body, so its `[]`
     // build classifies per element type. Captured from the return trace below and threaded
     // into `monoCloneBody`, which clones and annotates just that `LetDecl` per instance.
@@ -7720,9 +7861,9 @@ function monoMakeInstanceGo(
     if fn.fnRet >= 0 {
       // The parameter pin's rule, applied to the RETURN for the same reason: a shadowed
       // return annotation is canon'd out of the arena before this read.
-      const rn = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
-      if monoAnnHasTyParam(rn, fn.fnTyParams) {
-        const rs = monoSubstAnn(rn, fn.fnTyParams, tvN, tvV)
+      const rn = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), tps)
+      if monoAnnHasTyParam(rn, tps) {
+        const rs = monoSubstAnn(rn, tps, tvN, tvV)
         if rs == "" {
           return emitFail(
             "emitProgram: monomorphize: a return type parameter of `"
@@ -8057,9 +8198,9 @@ function monoMakeInstanceGo(
     // An inferred return the checker typed as a bare type parameter is the `: T` annotation's
     // twin: the pin's own spelling, which names a record or map by the argument's row.
     if nret < 0 && fn.fnRet < 0 {
-      const tpRet = monoCheckedRetTyParam(origFe, fn.fnTyParams)
+      const tpRet = monoCheckedRetTyParam(origFe, tps)
       if tpRet != "" {
-        const tpSub = monoSubstAnn(tpRet, fn.fnTyParams, tvN, tvV)
+        const tpSub = monoSubstAnn(tpRet, tps, tvN, tvV)
         if tpSub != "" && tpSub != tpRet {
           const tpName = monoPinUnionName(tpSub)
           if monoRegisterPinUnion(tpName) < 0 { return -1 }
@@ -8160,7 +8301,23 @@ function monoMakeInstanceGo(
     }
     let instName = fn.fnName
     let instFe = origFe
-    if count > 0 { instName = fn.fnName + "$" + i32ToStr(count) }
+    // A frame-keyed instance never takes the template's slot, whose frame is the template's.
+    const slotFree = count == (monoFramedPushes.get(origFe) ?? 0)
+    const first = slotFree && callFrame < 0
+    if !first {
+      let suffix = count
+      if slotFree {
+        suffix = count + 1
+        monoFramedPushes.set(origFe, count + 1)
+      }
+      instName = fn.fnName + "$" + i32ToStr(suffix)
+      // Two nested generics of one name in different functions count their instances apart,
+      // so a suffix the other already minted is skipped: the renamed call would reach it (D3830).
+      while monoInstNameTaken(instName) {
+        suffix = suffix + 1
+        instName = fn.fnName + "$" + i32ToStr(suffix)
+      }
+    }
     const noTyParams: string[] = []
     // The closure-pinned parameter column this instance binds, read by the body clone's
     // container rung. Rebuilt per instance, since the pin is what differs between them.
@@ -8204,7 +8361,7 @@ function monoMakeInstanceGo(
     const svPinFn = njSetPinFn(monoOrigNode[origFe])
     const instBody0 = monoCloneBody(
       fn.fnBody,
-      fn.fnTyParams,
+      tps,
       tvN,
       tvV,
       monoOutName,
@@ -8219,7 +8376,7 @@ function monoMakeInstanceGo(
     // Copy-on-write: a body with no such lambda is the same node index.
     monoLamMintedSlots = []
     monoLamCloneSlots = []
-    monoInstIsFirst = count == 0
+    monoInstIsFirst = first
     monoCgcLamNames = monoInstLamNames(instBody0)
     monoPinUnsafeNames = Map()
     monoPinRetBox = false
@@ -8253,7 +8410,7 @@ function monoMakeInstanceGo(
     monoInstBody = fn.fnBody
     const instBody0L = monoPinBodyLambdas(
       instBody0,
-      fn.fnTyParams,
+      tps,
       tvN,
       tvV,
       bodyBN,
@@ -8313,7 +8470,7 @@ function monoMakeInstanceGo(
     }
     // Per-instance copies of the direct generic calls this body makes, so instantiating
     // them rewrites only this instance's callee `Ident`s. No generic call → the same node.
-    monoCgcTyParams = fn.fnTyParams
+    monoCgcTyParams = tps
     monoCgcTvN = tvN
     monoCgcTvV = tvV
     monoCgcSubN = exSubN
@@ -8335,7 +8492,7 @@ function monoMakeInstanceGo(
     monoCgcSubT = []
     // Per-instance layout constants for the type parameters this body reads
     // (`i * T.size`) — folded HERE because the binding is what makes them exist.
-    const instBody4 = monoFoldTyParamLayout(instBody3, fn.fnTyParams, tvN, tvV)
+    const instBody4 = monoFoldTyParamLayout(instBody3, tps, tvN, tvV)
     // The two questions `dispatchRewrite` asks of a hole, re-asked at the pin. Last in the
     // chain, so it sees the body every rung above produced; copy-on-write, so a body with
     // no such operator is the same node index.
@@ -8354,7 +8511,7 @@ function monoMakeInstanceGo(
     // D926 — the return-row twin of the param mark above. `monoOrigNode[origFe]` is the
     // template's own `FuncDecl`, which is what `anonLeafMarkRetMoved` marked.
     anonLeafCarryRetMark(monoOrigNode[origFe], nfn)
-    if count == 0 {
+    if first {
       // First instance: keep the bare name and the original's wasm index.
       buildFnMapNoteFnStmtWrite(origFe, nfn)
       fnStmts[origFe] = nfn
@@ -8381,7 +8538,9 @@ function monoMakeInstanceGo(
       // resolve where the first instance's do and its env fields take their real types (D2749).
       let instParent = -1
       if origFe < fnParent.length { instParent = fnParent[origFe] }
+      if callFrame >= 0 { instParent = callFrame }
       fnParent.push(instParent)
+      if callFrame >= 0 { invalidateFnChildIndex() }
       fnDispNames.push("")
       instFe = fnStmts.length - 1
       // D943 — the clones' frame is this instance, not the template. `captureValKind`
@@ -9446,6 +9605,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         monoPinArgLit.push(P.nodes[unwrapParen(args[li])] is ObjLit)
         li = li + 1
       }
+      monoCallFrameSlot = monoNestedCallFrame(origFe, ctx)
       return monoMakeInstance(
         origFe,
         pinned,
@@ -9727,6 +9887,16 @@ function monoCapturedLamFe(calleeIx: i32, name: string, ctx: i32) {
     hops = hops + 1
   }
   -1
+}
+
+// Whether `name` read in function `fx` is bound by neither its parameters nor its body's lets.
+function monoNameIsCapture(fx: i32, name: string): boolean {
+  const f = P.nodes[fx]
+  if f is FuncDecl {
+    if monoFnBindsParam(fx, name) { return false }
+    return parentLetOf(f.fnBody, name) < 0
+  }
+  false
 }
 
 // Whether function `fx` declares a parameter named `name`.
@@ -10347,6 +10517,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstFe = []
   monoParamPinTy = Map()
   monoAnonParamPinTy = Map()
+  monoFramedPushes = Map()
   monoFnFieldTwinRow = Map()
   monoTwoListRet = Map()
   monoSubTablesReset()
