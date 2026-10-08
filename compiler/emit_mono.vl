@@ -5880,6 +5880,9 @@ function monoEnclosingPinRow(
 // The enclosing-frame instance `monoInstantiate` hands `monoMakeInstance` for a capturing nested
 // generic called from it, consumed (and cleared) where the key is built; -1 for none.
 let monoCallFrameSlot = 0 - 1
+// Callee identifiers resolved through a `let` alias chain: their calls are never re-spelled to
+// the lambda's instance, since the alias may hold another value at run time (D3849).
+let monoNoRename: i32[] = []
 // Per template slot, the frame-keyed instances minted while its slot still holds the template;
 // they leave the slot to the template frame's own first instance.
 let monoFramedPushes: {[i32]: i32} = Map()
@@ -7666,7 +7669,10 @@ function monoMakeInstanceGo(
             else if monoNameIsAssigned(cal.identName) { keepCallRef = true }
           }
           if !keepCallRef {
-            if cal.identName != monoInstName[k] {
+            if (
+              cal.identName != monoInstName[k]
+              && !i32ListHas(monoNoRename, calleeIx)
+            ) {
               collectANoteIdentRename(cal.identName)
               cal.identName = monoInstName[k]
               monoArenaTouch()
@@ -8563,7 +8569,7 @@ function monoMakeInstanceGo(
       monoLamMintedSlots = []
       const cal2 = P.nodes[calleeIx]
       // R4 writer 6 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
-      if cal2 is Ident {
+      if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
         collectANoteIdentRename(cal2.identName)
         cal2.identName = instName
         monoArenaTouch()
@@ -9846,6 +9852,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
 // keeps its value call, whose env the name would drop; so does a reassigned binding.
 function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
   if !i32ListHas(monoLamCallCallees, calleeIx) { return 0 }
+  if i32ListHas(monoNoRename, calleeIx) { return 0 }
   if !criFnIsAnonLambda(origFe) || captureCountOf(origFe) > 0 { return 0 }
   const cal = P.nodes[calleeIx]
   if cal is Ident {
@@ -9938,6 +9945,29 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
     hops = hops + 1
   }
   none
+}
+
+// Whether any binding on the alias chain from `name` read at `at` in frame `ctx` is assigned
+// anywhere in the program; a name assigned elsewhere answers yes, the safe direction.
+function monoAliasChainWritten(name: string, at: i32, ctx: i32): boolean {
+  let nm = name
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    if monoNameIsAssigned(nm) { return true }
+    const lf = monoLetFrameOf(nm, ax, fr)
+    if lf[1] < 0 { return false }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) { return false }
+    const src = monoIdentNameOf(d.letInit)
+    if src == "" { return false }
+    nm = src
+    ax = d.letInit
+    fr = lf[0]
+    hops = hops + 1
+  }
+  true
 }
 
 // The lifted lambda an un-annotated `let` binding read at `at` in frame `ctx` holds from its
@@ -10073,6 +10103,13 @@ function monoLamValueFe(vx: i32, fx: i32): i32 {
   -1
 }
 
+// Whether node `vx`'s recorded type is a function type naming no type variable.
+function monoValueFnTyConcrete(vx: i32): boolean {
+  const t = nodeTyIxOf(vx)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return false }
+  T.tys[t] is TyFunc
+}
+
 // The innermost function node among `root` and the functions lifted out of it whose body holds
 // node `ix`; `root` itself when none of them does.
 function monoFrameOfNode(ix: i32, root: i32): i32 {
@@ -10103,6 +10140,7 @@ function monoSubtreeHolds(root: i32, ix: i32): boolean {
 // in that frame or a function lifted out of it, stores a hole lambda. `cell` reads the writes
 // of the rewrite's capture cell, `name[0] = v`, instead of `name = v`.
 function monoLetWritesAreLams(name: string, fx: i32, cell: boolean): boolean {
+  monoLetWritesExtend()
   let key = "n:" + name
   if cell { key = "c:" + name }
   for i in monoLetWrites.get(key) ?? [] {
@@ -10111,16 +10149,50 @@ function monoLetWritesAreLams(name: string, fx: i32, cell: boolean): boolean {
       if monoFrameHolds(fx, i) {
         let wf = fx
         if fx >= 0 { wf = monoFrameOfNode(i, fx) }
-        if monoLamValueFe(nd.binRight, wf) < 0 { return false }
+        // A hole lambda, or a value whose function type is already concrete (a typed
+        // parameter, D3848): the call's arguments fit it, so the lambdas pin at them.
+        if (
+          monoLamValueFe(nd.binRight, wf) < 0
+          && !monoValueFnTyConcrete(nd.binRight)
+        ) {
+          return false
+        }
       }
     }
   }
   true
 }
 
-// The program's assignments by target, filled once as `monomorphize` starts: `n:<name>` for
-// `name = v`, `c:<name>` for a capture cell's `name[0] = v`; node indices.
+// The program's assignments by target: `n:<name>` for `name = v`, `c:<name>` for a capture
+// cell's `name[0] = v`; node indices. Banked on an arena prefix, so the writes of an instance
+// body cloned during the pass join it the next time it is asked.
 let monoLetWrites: {[string]: i32[]} = Map()
+let monoLetWritesSeen = 0
+
+// Indexes the assignments the arena gained since the last call.
+function monoLetWritesExtend() {
+  let i = monoLetWritesSeen
+  while i < P.nodes.length {
+    const wn = P.nodes[i]
+    if wn is BinExpr {
+      if wn.binOp == "=" {
+        const wid = monoIdentNameOf(wn.binLeft)
+        const wcell = monoCellReadName(wn.binLeft)
+        let wkey = ""
+        if wid != "" { wkey = "n:" + wid }
+        else if wcell != "" { wkey = "c:" + wcell }
+        if wkey != "" {
+          const wl = monoLetWrites.get(wkey) ?? []
+          wl.push(i)
+          monoLetWrites.set(wkey, wl)
+        }
+      }
+    }
+    i = i + 1
+  }
+  monoLetWritesSeen = P.nodes.length
+  0
+}
 
 // Re-spells callee `calleeIx` as the name its chain of un-annotated `const` aliases ends at,
 // when that is an un-annotated `const` binding of a lambda the call reads unshadowed. The
@@ -10215,7 +10287,18 @@ function monoWalk(ix: i32, ctx: i32) {
         // re-read rather than reused from `dfe`, the coercion loop between having run.
         let afe = identClosureFeAt(sidOfNode(n.callFn), ctx, n.callFn)
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
-        if afe < 0 { afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx) }
+        if afe < 0 {
+          afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx)
+          // The chain names the lambda it is initialized with. Where a link is written, that
+          // need not be the value the alias holds at this call, so the call keeps its
+          // `call_ref` and only the lambda is pinned (D3849); an unwritten chain always holds it.
+          if (
+            afe >= 0
+            && monoAliasChainWritten(callee.identName, n.callFn, ctx)
+          ) {
+            monoNoRename.push(n.callFn)
+          }
+        }
         if afe >= 0 {
           if !criFnIsAnonLambda(afe) {
             // The fold below rewrites `f(x)` into a by-name call to the initializer's
@@ -10784,26 +10867,10 @@ export function monomorphize(stmts: i32[]) {
   monoExactNext = 0
   monoExactLow = 0
   monoProgStmts = stmts
+  monoNoRename = []
   monoLetWrites = Map()
-  let wi = 0
-  while wi < P.nodes.length {
-    const wn = P.nodes[wi]
-    if wn is BinExpr {
-      if wn.binOp == "=" {
-        const wid = monoIdentNameOf(wn.binLeft)
-        const wcell = monoCellReadName(wn.binLeft)
-        let wkey = ""
-        if wid != "" { wkey = "n:" + wid }
-        else if wcell != "" { wkey = "c:" + wcell }
-        if wkey != "" {
-          const wl = monoLetWrites.get(wkey) ?? []
-          wl.push(wi)
-          monoLetWrites.set(wkey, wl)
-        }
-      }
-    }
-    wi = wi + 1
-  }
+  monoLetWritesSeen = 0
+  monoLetWritesExtend()
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
   monoProgLetBySid = []
@@ -10888,7 +10955,12 @@ export function monomorphize(stmts: i32[]) {
         // write: pinning it from its peer is what makes the two lambdas one cell. The
         // cascade's catch-all instead puts an i32 parameter under an f64-typed cell.
         const peer = monoAssignedPeerFe(fe3)
-        if peer >= 0 && peer < nDecl && monoInstantiatedAny(peer) {
+        // A peer with no hole is its own signature: an annotated lambda never instantiates.
+        if (
+          peer >= 0
+          && peer < nDecl
+          && (monoInstantiatedAny(peer) || monoGen[peer] == 0)
+        ) {
           const pins: string[] = []
           if monoSlotParamPins(peer, pins) {
             const own = P.nodes[fnStmts[fe3]]
