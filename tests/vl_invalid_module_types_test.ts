@@ -7,9 +7,9 @@
 // module, reads the two types off the failing operator, and writes each module type index with
 // its VL name (asked of the compiler that emitted the module) and its struct or array shape.
 //
-// THE WITNESSES MUST STILL BE INVALID: D3843 (two spellings) and D3817 are
-// check-clean invalid wasm on the seed this lands on. When one is fixed its case goes red at the
-// "still check-clean" or exit-code assertion; replace it with any other such program.
+// THE WITNESSES MUST STILL BE INVALID: D2416 and D1974 (one module and two) are check-clean
+// invalid wasm on the seed this lands on. When one is fixed its case goes red at the "still
+// check-clean" or exit-code assertion; replace it with any other such program.
 //
 // GATING: `SELFHOST_NATIVE_ALIGN=1` plus the built binary and seed.
 //
@@ -77,58 +77,66 @@ type Case = {
 
 const CASES: Case[] = [
   {
-    name: "D3843: a record expected where an i32 arrives names the record",
+    name: "D2416: a record arriving where an i32 is expected names the record",
     files: {
-      "r.vl": "type A = { x: i32 }\n" +
-        'function tag(self: A): string { "A" }\n' +
-        "const c = (y) => y.tag()\n" +
-        "function k(c: string) { c }\n" +
-        'print(k("z"))\n',
+      "r.vl": "type A = { r: i32 }\n" +
+        "function st(): A { return { r: 8 } }\n" +
+        "function mkB(): boolean | null { return null }\n" +
+        "function take(a) {\n" +
+        "  const f = a ?? st()\n" +
+        "  if f is A { print(f.r) } else { print(0) }\n" +
+        "}\n" +
+        "take(mkB())\n",
     },
     entry: "r.vl",
     want: [
-      "failed to validate inside `c`",
-      "type mismatch: expected (ref $0), found i32; $0 is `A`, struct {mut i32}",
+      "failed to validate inside `take`",
+      "type mismatch: expected i32, found (ref $0); $0 is `A`, struct {mut i32}",
     ],
     never: ["$type"],
   },
   {
     name:
-      "D3843: a string expected where an i32 arrives names `string` and its shape",
+      "D1974: a string expected where an i32 arrives names `string` and its shape",
     files: {
-      "s.vl": 'const c = (y) => y + "C"\n' +
-        "function k(c: string) { c }\n" +
-        'print(k("z"))\n',
+      "s.vl": "function f(k: i32): string {\n" +
+        "  {\n" +
+        '    return "a"\n' +
+        "  }\n" +
+        "  5\n" +
+        "}\n" +
+        "print(f(1))\n",
     },
     entry: "s.vl",
     want: [
-      "failed to validate inside `c`",
+      "failed to validate inside `f`",
       "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
     ],
     never: ["$type"],
   },
   {
-    // D3817 is closed, so a module graph's witness is D3852's: a lambda delivered through a
-    // binding to an imported function's typed parameter.
+    // D1974's function moved into an imported module.
     name:
-      "D3852: a canonical type id is a module index, and a merged function its source name",
+      "D1974: a canonical type id is a module index, and a merged function its source name",
     files: {
-      "s.vl":
-        "export function callIt(f: (y: string) => string, s: string): string { f(s) }\n",
-      "main.vl": 'import { callIt } from "./s"\n' +
-        "function d(x: string) {\n" +
-        '  const e = (y) => y + "E"\n' +
-        "  const d1 = e\n" +
-        "  print(callIt(d1, x))\n" +
+      "s.vl": "export function f(k: i32): string {\n" +
+        "  {\n" +
+        '    return "a"\n' +
+        "  }\n" +
+        "  5\n" +
+        "}\n",
+      "main.vl": 'import { f } from "./s"\n' +
+        "function d(x: i32) {\n" +
+        "  print(f(x))\n" +
         "}\n" +
-        'd("a")\n',
+        "d(1)\n",
     },
     entry: "main.vl",
     want: [
-      "failed to validate inside `e`",
+      "failed to validate inside `f`",
       "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
     ],
-    never: ["(id ", "e$m0", "d$m0"],
+    never: ["(id ", "f$m", "d$m0"],
   },
   // The string-keyed map struct is one heap type for every string-keyed map and set, so it is
   // named by its rep: a `Set<string>` must not be called `{[string]: i32}`.
