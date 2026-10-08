@@ -57797,7 +57797,8 @@ function expDeclIsExported(fx: i32): boolean {
   P.toks[tk - 1].kind == "FUNCTION" && P.toks[tk - 2].kind == "EXPORT"
 }
 
-// Whether an identifier outside function node `fx` reads `name`.
+// Whether an identifier outside function node `fx` reads the top-level `name`; one a nearer
+// binding shadows reads that binding.
 function expNamedOutside(name: string, fx: i32): boolean {
   const stack: i32[] = []
   for st in gRootStmts { stack.push(st) }
@@ -57808,7 +57809,7 @@ function expNamedOutside(name: string, fx: i32): boolean {
       if n is Ident {
         if n.identName == name { return true }
       }
-      for k in nodeChildren(ix) { stack.push(k) }
+      for k in expScopedKids(ix, name) { stack.push(k) }
     }
   }
   false
@@ -57881,16 +57882,7 @@ function expInferParam(fx: i32, px: i32, nm: string): boolean {
     const ix = stack.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
-      let enter = true
-      if n is FuncDecl {
-        // A nested function binding the same name reads its own.
-        for q in n.fnParams {
-          const qp = P.nodes[q]
-          if qp is Param {
-            if qp.parName == nm { enter = false }
-          }
-        }
-      } else if n is Call {
+      if n is Call {
         expPinFromCall(ix, n, nm, pinTy, pinAt, pinUse)
         const cf = P.nodes[n.callFn]
         if cf is Member {
@@ -57929,12 +57921,33 @@ function expInferParam(fx: i32, px: i32, nm: string): boolean {
         if arith && (expIsName(n.binLeft, nm) || expIsName(n.binRight, nm)) {
           numeric = true
         }
+        const lhs = expIdentName(n.binLeft)
+        if (
+          n.binOp == "="
+          && lhs != ""
+          && lhs != nm
+          && expIsName(n.binRight, nm)
+        ) {
+          const ld = expSoleLet(f.fnBody, lhs)
+          if ld >= 0 {
+            const l = P.nodes[ld]
+            if l is LetDecl {
+              expInfPinLets.push(ld)
+              expPinPush(
+                nodeTyIxOf(l.letType),
+                ix,
+                "`" + lhs + " = " + nm + "`",
+                pinTy,
+                pinAt,
+                pinUse,
+              )
+            }
+          }
+        }
       } else if n is Member {
         if n.memProp == "length" && expIsName(n.memObj, nm) { lengthy = true }
       }
-      if enter {
-        for k in nodeChildren(ix) { stack.push(k) }
-      }
+      for k in expScopedKids(ix, nm) { stack.push(k) }
     }
   }
   // The body's tail value, when the function's return is annotated.
@@ -58024,6 +58037,117 @@ function expInferParam(fx: i32, px: i32, nm: string): boolean {
   expInfDone.push(px)
   expInfHintAdd(px, nm, tyToStrUser(pinTy[0]), pinUse[0])
   true
+}
+
+// The children of node `ix` in which `nm` still reads the parameter: a nested function, loop or
+// match arm that binds `nm` is left out, and so is the rest of a block after it declares `nm`.
+function expScopedKids(ix: i32, nm: string): i32[] {
+  const out: i32[] = []
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    if n.fnName == nm { return out }
+    for q in n.fnParams {
+      const qp = P.nodes[q]
+      if qp is Param {
+        if qp.parName == nm { return out }
+      }
+    }
+  } else if n is ForIn {
+    if n.fiVar == nm || n.fiVar2 == nm {
+      out.push(n.fiIter)
+      return out
+    }
+  } else if n is ForRange {
+    if n.frVar == nm {
+      out.push(n.frFrom)
+      out.push(n.frTo)
+      out.push(n.frStep)
+      return out
+    }
+  } else if n is Block {
+    // A function declared in the block is visible in all of it.
+    for st in n.blkStmts {
+      if expDeclares(st, nm) && P.nodes[st] is FuncDecl { return out }
+    }
+    for st in n.blkStmts {
+      if expDeclares(st, nm) {
+        const d = P.nodes[st]
+        if d is LetDecl { out.push(d.letInit) }
+        return out
+      }
+      out.push(st)
+    }
+    return out
+  } else if n is MatchExpr {
+    out.push(n.matchScrut)
+    let i = 0
+    while i < n.matchBodies.length {
+      if !expArmBinds(n, i, nm) { out.push(n.matchBodies[i]) }
+      i = i + 1
+    }
+    return out
+  }
+  nodeChildren(ix)
+}
+
+// The one annotated `let` named `nm` in body `b`, outside nested functions, or -1 when there is
+// none or more than one.
+function expSoleLet(b: i32, nm: string): i32 {
+  let found = -1
+  let count = 0
+  const stack: i32[] = [b]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is LetDecl {
+        if n.letName == nm {
+          count = count + 1
+          if n.letType >= 0 { found = ix }
+        }
+      }
+      if !(n is FuncDecl) || ix == b {
+        for k in nodeChildren(ix) { stack.push(k) }
+      }
+    }
+  }
+  if count != 1 { return -1 }
+  found
+}
+
+// Whether statement `st` declares `nm` in its block.
+function expDeclares(st: i32, nm: string): boolean {
+  if st < 0 || st >= P.nodes.length { return false }
+  const d = P.nodes[st]
+  if d is LetDecl { return d.letName == nm }
+  expFnNamed(st, nm)
+}
+
+// Whether statement `st` is a function declaration named `nm`; the only other statement that
+// declares a name in its block is a `let`.
+function expFnNamed(st: i32, nm: string): boolean {
+  const d = P.nodes[st]
+  if d is FuncDecl { return d.fnName == nm }
+  false
+}
+
+// Whether a pattern of arm `i` of match `n` binds `nm` for that arm's body.
+function expArmBinds(n: MatchExpr, i: i32, nm: string): boolean {
+  if i >= n.matchArmStart.length || i >= n.matchArmCount.length { return false }
+  let p = n.matchArmStart[i]
+  while p < n.matchArmStart[i] + n.matchArmCount[i] && p < n.matchBinds.length {
+    const bx = n.matchBinds[p]
+    if bx >= 0 && bx < P.nodes.length {
+      const b = P.nodes[bx]
+      if b is Block {
+        for st in b.blkStmts {
+          if expDeclares(st, nm) { return true }
+        }
+      }
+    }
+    p = p + 1
+  }
+  false
 }
 
 // Sorts the three pin columns by their use's position in the source, so a refusal quotes the
