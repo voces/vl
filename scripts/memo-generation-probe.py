@@ -198,15 +198,17 @@ ROWS = [
     ("moduleLocalLetPlan", [], "probe",
      ("  if off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }",
       "  if false && off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }")),
-    # `nameIsStructDecl`'s set of `TypeDecl` names and `fieldClosureFeOfRecvRaw`'s list of `Call`
-    # nodes: what a node IS changes only by a push (the length) or an in-place replacement (the
-    # epoch), and each reads every other field live; both reset in `emitProgram`.
+    # `nameIsStructDecl`'s set of `TypeDecl` names: what a node IS changes only by a push (the
+    # length) or an in-place replacement (the epoch), and it reads every other field live.
+    # `fieldClosureFeOfRecvRaw`'s calls by callee name also key a rename or a callee repoint
+    # (`arenaRefWritesNow`, bumped by `sidNoteNodeName` and the callee writes); arguments are
+    # read live. Both reset in `emitProgram`.
     ("typeDeclNameIndex", ["tdnIxLen", "tdnIxEpoch"], "no-refined-input",
      ("  if P.nodes.length == tdnIxLen && tdnIxEpoch == arenaEpochNow() { return 0 }",
       "  if false && P.nodes.length == tdnIxLen && tdnIxEpoch == arenaEpochNow() { return 0 }")),
-    ("callNodeIndex", ["cniLen", "cniEpoch"], "no-refined-input",
-     ("  if P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }",
-      "  if false && P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }")),
+    ("callsByCalleeIndex", ["cbcLen", "cbcEpoch", "cbcRefGen"], "no-refined-input",
+     ("    P.nodes.length == cbcLen\n    && cbcEpoch == arenaEpochNow()",
+      "    false && P.nodes.length == cbcLen\n    && cbcEpoch == arenaEpochNow()")),
     # `ieeeBytes`' encodings by lexeme and width (D3737): a pure function of its key, never reset.
     ("ieeeBytesMemo", [], "no-refined-input",
      ("  if hit != null {\n    gIeeeOverflow",

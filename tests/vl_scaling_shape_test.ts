@@ -24,10 +24,10 @@
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Six are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Seven are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
-// `in-function value writes`, the two `if joins` pairs and `nested inline record types across
-// functions (fuel)`. The CPU readings quoted
+// `in-function value writes`, the two `if joins` pairs, `nested inline record types across
+// functions (fuel)` and `record-parameter field calls`. The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
@@ -71,6 +71,18 @@ const genFamilyFunctions = (nf: number, ns: number): string =>
     "const fam = src(1) ?? { x: 2 }",
     genFunctions(nf, ns).replace("let acc = 0", "let acc = fam.x"),
   ].join("\n");
+
+// `n` functions that each call a closure field of their record parameter, each called once.
+// Resolving `b.get()` follows the parameter to its call sites' arguments, so a lookup that
+// scans every call in the arena for them is functions x calls.
+const genParamFieldCalls = (n: number): string => {
+  const o: string[] = ["type Box = { get: () => i32 }"];
+  for (let i = 0; i < n; i++) o.push(`function f${i}(b: Box): i32 { b.get() + ${i % 13} }`);
+  o.push("const bx: Box = { get: () => 3 }", "let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(bx)`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
 
 // N struct types used once each, against N/K used K times each. Distinct FIELD names,
 // because two structurally identical shapes intern to one row and the axis would vanish.
@@ -597,6 +609,16 @@ axis(
 
 // D2150's pair: a registry lookup that scans every registered set made the many arm
 // quadratic in the sets; the member-set index keeps it linear.
+// Lane HS's GROWTH pair, 2,400 functions against 600, so linear reads 4. Fuel reads 4.07;
+// master read 12.97, from `fieldClosureFeOfRecvRaw` scanning every `Call` for a parameter's
+// call sites where the callee-name index answers them directly.
+axis(
+  "record-parameter field calls",
+  5.1,
+  "`fieldClosureFeOfRecvRaw` (compiler/emit_classify.vl) is scanning the arena for a parameter's call sites instead of `callsOfCallee`.",
+  (d) => twoFiles(d, genParamFieldCalls(2400), genParamFieldCalls(600)),
+);
+
 axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
   twoFiles(d, genLitSets(3000, 1), genLitSets(3000, 20)));
 

@@ -307,6 +307,7 @@ import {
   WhileStmt,
   annTsOf,
   arenaEpochNow,
+  arenaRefWritesNow,
   arithRegionSeen,
   callIsNever,
   elseIfLink,
@@ -1788,26 +1789,20 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
             const rpn = P.nodes[rps[rpi]]
             if rpn is Param {
               if rpn.parName == e.identName {
-                callNodeIxSync()
+                const rcs = callsOfCallee(rf.fnName)
                 let rcj = 0
-                while rcj < callNodeIx.length {
-                  const rci = callNodeIx[rcj]
-                  const rcn = P.nodes[rci]
+                while rcj < rcs.length {
+                  const rcn = P.nodes[rcs[rcj]]
                   if rcn is Call {
-                    const rcf = P.nodes[rcn.callFn]
-                    if rcf is Ident {
-                      if rcf.identName == rf.fnName {
-                        if rpi < rcn.callArgs.length {
-                          // fnIx -1: the argument resolves in module scope, which also
-                          // stops this arm re-entering for a param of the same name.
-                          const rfe = fieldClosureFeOfRecv(
-                            rcn.callArgs[rpi],
-                            prop,
-                            -1,
-                          )
-                          if rfe >= 0 { return rfe }
-                        }
-                      }
+                    if rpi < rcn.callArgs.length {
+                      // fnIx -1: the argument resolves in module scope, which also
+                      // stops this arm re-entering for a param of the same name.
+                      const rfe = fieldClosureFeOfRecv(
+                        rcn.callArgs[rpi],
+                        prop,
+                        -1,
+                      )
+                      if rfe >= 0 { return rfe }
                     }
                   }
                   rcj = rcj + 1
@@ -1823,34 +1818,66 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
   fieldClosureFeOf(structIndexOfExpr(recvIx, fnIx), prop)
 }
 
-// Every `Call` node in the arena, in arena order. A node becomes or stops being a call only by
-// a push or an in-place replacement, so the arena length and epoch key it; the callee and
-// arguments are read live. Reset per program.
-let callNodeIx: i32[] = []
-let cniLen: i32 = -1
-let cniEpoch: i32 = -1
+// Every `Call` whose callee is an identifier, by that identifier's name, in arena order. A
+// slot's call-ness and callee name change only by a push (the length), an in-place replacement
+// (the epoch) or a rename or callee repoint (`arenaRefWritesNow`); the arguments are read live.
+// Reset per program.
+let callsByCallee: {[string]: i32[]} = Map()
+let cbcLen: i32 = -1
+let cbcEpoch: i32 = -1
+let cbcRefGen: i32 = -1
 
-export function callNodeIxReset() {
-  callNodeIx = []
-  cniLen = -1
-  cniEpoch = -1
+export function callsByCalleeReset() {
+  callsByCallee = Map()
+  cbcLen = -1
+  cbcEpoch = -1
+  cbcRefGen = -1
   0
 }
 
-function callNodeIxSync() {
-  if P.nodes.length == cniLen && cniEpoch == arenaEpochNow() { return 0 }
-  // A longer arena with the same epoch only appended, so the scan resumes where it stopped.
-  let i = cniLen
-  if cniEpoch != arenaEpochNow() || i < 0 || i > P.nodes.length {
-    callNodeIx = []
+// The `Call` slots whose callee is the identifier `name`, ascending.
+function callsOfCallee(name: string): i32[] {
+  callsByCalleeSync()
+  callsByCallee[name] ?? []
+}
+
+function callsByCalleeSync() {
+  if (
+    P.nodes.length == cbcLen
+    && cbcEpoch == arenaEpochNow()
+    && cbcRefGen == arenaRefWritesNow()
+  ) {
+    return 0
+  }
+  // A longer arena with no other change only appended, so the scan resumes where it stopped.
+  let i = cbcLen
+  if (
+    cbcEpoch != arenaEpochNow()
+    || cbcRefGen != arenaRefWritesNow()
+    || i < 0
+    || i > P.nodes.length
+  ) {
+    callsByCallee = Map()
     i = 0
   }
   while i < P.nodes.length {
-    if P.nodes[i] is Call { callNodeIx.push(i) }
+    const n = P.nodes[i]
+    if n is Call {
+      const cf = P.nodes[n.callFn]
+      if cf is Ident {
+        const got = callsByCallee[cf.identName]
+        if got == null {
+          callsByCallee[cf.identName] = [i]
+        } else {
+          got.push(i)
+        }
+      }
+    }
     i = i + 1
   }
-  cniLen = P.nodes.length
-  cniEpoch = arenaEpochNow()
+  cbcLen = P.nodes.length
+  cbcEpoch = arenaEpochNow()
+  cbcRefGen = arenaRefWritesNow()
   0
 }
 
@@ -25079,7 +25106,7 @@ function nameIsStructDecl(name: string) {
 }
 
 // Every `TypeDecl` name in the arena, the set `nameIsStructDecl` asks of. Keyed like
-// `callNodeIx`: an append extends it, an in-place replacement rebuilds it, and the one
+// `callsByCallee`: an append extends it, an in-place replacement rebuilds it, and the one
 // in-place rename of a declaration (the module merge) runs before emit. Reset per program.
 let typeDeclNameIx: {[string]: boolean} = Map()
 let tdnIxLen: i32 = -1
