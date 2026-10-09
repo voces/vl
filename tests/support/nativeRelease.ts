@@ -410,8 +410,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
     // zero-length backing from a global, and a capture-free lambda its one constant closure,
     // so those sites leave the function bodies: allocs 8 -> 6 at both rungs, bytes 809 -> 790 and 688 -> 697.
-    O: { bytes: 790, fns: 4, allocs: 6, indirect: 0 },
-    O3: { bytes: 697, fns: 1, allocs: 6, indirect: 0 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 790 -> 834, `-O3` 697 -> 741 bytes.
+    O: { bytes: 834, fns: 4, allocs: 6, indirect: 0 },
+    O3: { bytes: 741, fns: 1, allocs: 6, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
   // `meta.json` records that `-O3` does NOT help here (1.469s vs 1.331s) — binaryen cannot
@@ -498,8 +500,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // zero-length backing from a global, and a capture-free lambda its one constant closure,
     // so those sites leave the function bodies: allocs 16 -> 12 and 15 -> 11, bytes 1657 -> 1645 and 1532 -> 1530; `refEq`
     // held at 1.
-    O: { bytes: 1645, fns: 3, allocs: 12, indirect: 0, refEq: 1 },
-    O3: { bytes: 1530, fns: 3, allocs: 11, indirect: 0, refEq: 1 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 1645 -> 1717, `-O3` 1530 -> 1602 bytes.
+    O: { bytes: 1717, fns: 3, allocs: 12, indirect: 0, refEq: 1 },
+    O3: { bytes: 1602, fns: 3, allocs: 11, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
@@ -559,7 +563,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // zero-length backing from a global, and a capture-free lambda its one constant closure,
     // so those sites leave the function bodies: allocs 95 -> 89 and 46 -> 43, bytes 8049 -> 8259 (8253 before
     // this change) and 2637 -> 2639.
-    O: { bytes: 8259, fns: 15, allocs: 89, indirect: 0, refEq: 2 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 8259 -> 8896 bytes.
+    O: { bytes: 8896, fns: 15, allocs: 89, indirect: 0, refEq: 2 },
     O3: { bytes: 2639, fns: 6, allocs: 43, indirect: 0, refEq: 2 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
@@ -631,8 +637,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // this change) and 3745 -> 3746.
     // SP-056: an `as!` reason is one call of the shared `__as_fail__` helper, which `-O` keeps as
     // a function: fns 15 -> 16, bytes within band. Cold path only.
-    O: { bytes: 9388, fns: 16, allocs: 98, indirect: 0, refEq: 4 },
-    O3: { bytes: 3746, fns: 6, allocs: 51, indirect: 0, refEq: 4 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 9388 -> 9954, `-O3` 3746 -> 3861 bytes.
+    O: { bytes: 9954, fns: 16, allocs: 98, indirect: 0, refEq: 4 },
+    O3: { bytes: 3861, fns: 6, allocs: 51, indirect: 0, refEq: 4 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
@@ -642,8 +650,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "arrays/fill-sum",
     axis: "hot-loop i32 array element write + read; per-access bounds check",
-    O: { bytes: 318, fns: 1, allocs: 2, indirect: 0 },
-    O3: { bytes: 298, fns: 1, allocs: 2, indirect: 0 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 318 -> 346, `-O3` 298 -> 323 bytes.
+    O: { bytes: 346, fns: 1, allocs: 2, indirect: 0 },
+    O3: { bytes: 323, fns: 1, allocs: 2, indirect: 0 },
   },
   // ARRAY READ IN A BRANCHY LOOP. The bench twin of `opt-loop/binsearch-probe`, which pins the
   // loop SHAPE; this pins the code SIZE of the same kernel, and the two are complementary —
@@ -682,8 +692,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "arrays/push-known-size",
     axis: "building a list of compile-time-known size with push",
-    O: { bytes: 2090, fns: 2, allocs: 10, indirect: 0 },
-    O3: { bytes: 2024, fns: 2, allocs: 10, indirect: 0 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 2090 -> 2401, `-O3` 2024 -> 2335 bytes.
+    O: { bytes: 2401, fns: 2, allocs: 10, indirect: 0 },
+    O3: { bytes: 2335, fns: 2, allocs: 10, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). The `P[]` is flattened (D3681): four
   // i32s per element in one array, so setup allocates no `P` (`allocs` 3 -> 2: the list and
@@ -694,8 +706,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "arrays/struct-aos",
     axis: "array-of-structs field scan",
-    O: { bytes: 452, fns: 1, allocs: 2, indirect: 0 },
-    O3: { bytes: 407, fns: 1, allocs: 2, indirect: 0 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 452 -> 473, `-O3` 407 -> 428 bytes.
+    O: { bytes: 473, fns: 1, allocs: 2, indirect: 0 },
+    O3: { bytes: 428, fns: 1, allocs: 2, indirect: 0 },
   },
   // THE TIGHT SCALAR LOOP — `LOOP_TABLE`'s `scalar-accum-3` is this kernel, and it is the 2.43x
   // loop-rotation row. At 203 bytes with a single loop and no allocation, this is the ONE row
