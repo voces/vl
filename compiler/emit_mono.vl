@@ -329,6 +329,7 @@ import {
   anonRowKindsAgree,
   argNichePinTyOf,
   arrLitElemName,
+  bodyLetReadAtSid,
   capMemoNoteEdit,
   captureCountOf,
   cloRetTypeName,
@@ -10119,7 +10120,14 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
     if monoFnBindsParam(fx, name) { return none }
     const li = identLetOfAt(sid, fx, at)
     if li >= 0 {
-      const out: i32[] = [fx, li]
+      // A module-scope binding found from a function is the module's: its initializer reads
+      // names at module scope, not in the function (D3868).
+      let lfx = fx
+      const fn = P.nodes[fx]
+      if fn is FuncDecl {
+        if bodyLetReadAtSid(fn.fnBody, sid, at) != li { lfx = -1 }
+      }
+      const out: i32[] = [lfx, li]
       return out
     }
     const slot = fnStmtsPosOf(fx)
@@ -10517,6 +10525,25 @@ function monoWalk(ix: i32, ctx: i32) {
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
         if afe < 0 {
           afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx)
+          // The call would be re-spelled to the lambda's own name, which a parameter or local
+          // here may rebind: it keeps its `call_ref` through the alias then (D3861).
+          if afe >= 0 && monoNameShadowedAt(monoSlotName(afe), n.callFn, ctx) {
+            monoNoRename.push(n.callFn)
+          }
+          // A `const`-only chain is re-spelled above unless that name is rebound here; then
+          // the lambda is pinned through the chain and the call keeps its `call_ref` (D3861).
+          if afe < 0 {
+            const cfe = monoAliasChainLamFe(
+              callee.identName,
+              n.callFn,
+              ctx,
+              true,
+            )
+            if cfe >= 0 {
+              afe = cfe
+              monoNoRename.push(n.callFn)
+            }
+          }
           // The chain names the lambda it is initialized with. Where a link is written, that
           // need not be the value the alias holds at this call, so the call keeps its
           // `call_ref` and only the lambda is pinned (D3849); an unwritten chain always holds it.
@@ -11099,6 +11126,37 @@ function monoConcreteFnTyName(ty: i32): string {
   tyToEmitName(ty)
 }
 
+// The name function slot `fe` is declared or bound under, "" when it has none.
+function monoSlotName(fe: i32): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const f = P.nodes[fnStmts[fe]]
+  if f is FuncDecl { return f.fnName }
+  ""
+}
+
+// Whether `name`, read at `at` in frame `ctx`, is a parameter or local of `ctx` or of a function
+// enclosing it, and so not the module-scope binding of that name.
+function monoNameShadowedAt(name: string, at: i32, ctx: i32): boolean {
+  if name == "" { return false }
+  const sid = sidOf(name)
+  let fx = ctx
+  let hops = 0
+  while hops < 16 && fx >= 0 {
+    if monoFnBindsParam(fx, name) { return true }
+    const f = P.nodes[fx]
+    if f is FuncDecl {
+      if bodyLetReadAtSid(f.fnBody, sid, at) >= 0 { return true }
+    }
+    const slot = fnStmtsPosOf(fx)
+    if slot < 0 || slot >= fnParent.length { return false }
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return false }
+    fx = fnStmts[ps]
+    hops = hops + 1
+  }
+  false
+}
+
 // The name nodes `monoNoteBindDelivery` recorded: each is a call of what it reads.
 let monoDeliveredArgs: i32[] = []
 
@@ -11116,7 +11174,9 @@ function monoNoteBindSig(name: string, at: i32, ctx: i32, sig: string) {
     const d = P.nodes[lf[1]]
     if !(d is LetDecl) { return 0 }
     // A call in a function nothing names never runs.
-    if hops == 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
+    // A module-scope binding's call in an unnamed module-scope function still counts: that
+    // function is lowered, and with it the call (D3868).
+    if hops == 0 && lf[0] >= 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
     const had = monoBindCallSigs.get(lf[1]) ?? ""
     if !monoSigListHas(had, sig) { monoBindCallSigs.set(lf[1], had + sig) }
     monoBindCallFrame.set(lf[1], lf[0])
