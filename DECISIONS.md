@@ -10119,3 +10119,40 @@ call. `-O3` inlines through binaryen's "lightweight" rule (no call, no loop, siz
 `-O`'s `--always-inline-max-function-size 16`. Raising the flexible size to 40 inlines it, and on
 V8 the kernel is 4–6% SLOWER (259.8 against 243.7 ms), with or without V8's own wasm inliner;
 the game grows 3.2%. The call is not where the gap was.
+
+## A list index's guard is a branch to the trap, not a `select` (2026-10-09) — sunpa SP-056
+
+**The rule.** A list read or write tests `i u< len` and, when it fails, branches to an out-of-line
+read at index -1 of the backing, so the trap is still the engine's own `out of bounds array
+access`. A record list's backing traps by a one-element `array.copy` to -1 instead, which `-O`'s
+flattening rewrites as it does a list's growth, where a read it would box. The guard used to be
+`array.get backing (select -1 i (i u< len))`: the same compare, but on the index's data path.
+A list whose backing this module never typed keeps the `select`.
+
+**Measured** (Deno 2.9.6 / V8 15.0, `-O3`; sunpa's `run.ts track 100000`, medians of 7, load 3–9;
+sums identical):
+
+| | track VL | track Rust | VL / Rust |
+| --- | --- | --- | --- |
+| master | 162.9–165.9 ms | 121.5–126.3 ms | 1.29–1.37x |
+| **the branch guard** | **127.9–133.1 ms** | 122.1–124.4 ms | **1.03–1.09x** |
+
+`bench/arrays/fill-sum` −22% and `binsearch` −7% on V8 (start function, medians of 5); wasmtime
+is flat to slightly faster. `noise` (no list reads) is unchanged.
+
+**The price is bytes.** Each guarded access carries the `if` and its trap: sunpa's game
+(`-O3`, no names) 2,732,385 → 2,895,655 (+6.0%); the seed 4,451,514 → 4,733,984 (+6.3%), its
+baseline rewritten here; the L2 self-compile's guest fuel +8.0% (bar 1.5x). The release-shape
+rows moved in bytes only.
+
+**Rejected: versioning the loop.** SP-056's design was a range loop cloned behind one pre-entry
+check, the clone's candidate indices unguarded. Built and measured, interleaved at low load:
+versioning alone 1.027x master (slower), versioning with the branch guard 0.855x, the branch
+guard alone 0.776x. The hot reads that matter in `sample` are not in counted runs — the
+`while` scans of `k.times[i]`, the span reads, the norm — and the clones cost code the engine
+then has to compile and predict.
+
+**Rejected: `unreachable` in the untaken branch.** Measured equal on speed (0.773x) at +1.5% on
+the game instead of +6.0%, but the trap becomes `unreachable` with the note "a compiler-emitted
+trap" rather than the bounds trap the guide and `std:bytes` promise. Keeping the message was
+chosen; the smaller form is one line if that trade is wanted.

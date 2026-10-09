@@ -11675,10 +11675,33 @@ function arrLitDataPut(ins: u8[], form: i32, out: u8[]): i32 {
 }
 
 // Lower the `len`-bounds guard of a list `xs[i]` read/write: stack holds [wrapper,
-// index] on entry, leaves [backing, safeIndex] where safeIndex is `i` when `i u< len`
-// (one unsigned compare covers negative and past-len) and `-1` otherwise, so the access
-// traps instead of silently reading the zero-init slack `.push` leaves past `len`.
+// index] on entry, leaves [backing, i]. One unsigned compare covers negative and past-len, and
+// a failing one traps (`emitListIdxTrap`) instead of reading the zero-init slack `.push` leaves
+// past `len`. A list whose backing this module never typed keeps the older `select` to -1.
 function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
+  const back = listBackOfWrap(lTy)
+  if back >= 0 {
+    fbLocalSet(listIdxScratchBase)
+    fbLocalSet(wrapSlot)
+    fbLocalGet(listIdxScratchBase)
+    fbLocalGet(wrapSlot)
+    fbStructGet(lTy, 1) // field 1: len
+    fbI32Bin(79) // 0x4f i32.ge_u
+    fbIf(64)
+    fbLocalGet(wrapSlot)
+    fbStructGet(lTy, 0)
+    if listBackIsRecord(back) {
+      fbI32Const(-1)
+      fbLocalGet(wrapSlot)
+      fbStructGet(lTy, 0)
+    }
+    emitListIdxTrap(back)
+    fbEnd()
+    fbLocalGet(wrapSlot)
+    fbStructGet(lTy, 0) // field 0: backing
+    fbLocalGet(listIdxScratchBase)
+    return 0
+  }
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   fbLocalSet(wrapSlot)           // 0x21 local.set — stash the wrapper ref
   fbLocalGet(wrapSlot)
@@ -11693,13 +11716,74 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
   0
 }
 
+// The backing array type of list wrapper `w`, or -1 when no list this module built has it.
+function listBackOfWrap(w: i32): i32 {
+  let k = 0
+  while k < rlWrapIdx.length && k < rlBackIdx.length {
+    if rlWrapIdx[k] == w { return rlBackIdx[k] }
+    k = k + 1
+  }
+  if ba8Used && w == bl8TypeIdx { return ba8TypeIdx }
+  if fa64Used && w == fl64TypeIdx { return fa64TypeIdx }
+  if ia64Used && w == il64TypeIdx { return ia64TypeIdx }
+  if fa32Used && w == fl32TypeIdx { return fa32TypeIdx }
+  if slUsed && w == mkListIdx { return mkArrIdx }
+  if aUsed && w == lTypeIdx { return aTypeIdx }
+  -1
+}
+
+// Whether `back` is a record list's backing, which `-O` may store flattened: its trap is a
+// copy, which the flattening rewrites as it does a list's growth, where a read it would box.
+function listBackIsRecord(back: i32): boolean {
+  let k = 0
+  while k < rlBackIdx.length {
+    if rlBackIdx[k] == back { return true }
+    k = k + 1
+  }
+  false
+}
+
+// Traps with the engine's own out-of-bounds trap, from the guard's untaken branch: a read at
+// index -1 of the backing on the stack, or for a record list (`listBackIsRecord`) a one-element
+// copy to -1 from `[backing, -1, backing]`. A predicted branch, where a `select` to -1 put the
+// compare on the index's data path (SP-056).
+function emitListIdxTrap(back: i32) {
+  if listBackIsRecord(back) {
+    fbI32Const(0)
+    fbI32Const(1)
+    fbArrayCopy(back, back)
+    return 0
+  }
+  fbI32Const(-1)
+  fbArrayGet(back)
+  fbDrop()
+  0
+}
+
 // The hoisted twin of `emitListIdxGuard`, for an access whose receiver is a binding
 // with a live cached header: the backing ref and `len` are already in locals, so the
 // receiver is never (re-)emitted and the stack holds only the index. Leaves the same
 // [backing, safeIndex] pair; an index `idxIx` that `rangeProvenIndex` proves in bounds skips the select.
 function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
-  fbLocalGet(lhBack[row])        // the cached backing (was `struct.get` field 0)
+  const back = listBackOfWrap(hoistWrapTyOfRow(row))
+  if back >= 0 && !rangeProvenIndex(row, idxIx) {
+    fbLocalGet(listIdxScratchBase)
+    fbLocalGet(lhLen[row])
+    fbI32Bin(79) // 0x4f i32.ge_u
+    fbIf(64)
+    fbLocalGet(lhBack[row])
+    if listBackIsRecord(back) {
+      fbI32Const(-1)
+      fbLocalGet(lhBack[row])
+    }
+    emitListIdxTrap(back)
+    fbEnd()
+    fbLocalGet(lhBack[row])
+    fbLocalGet(listIdxScratchBase)
+    return 0
+  }
+  fbLocalGet(lhBack[row]) // the cached backing (was `struct.get` field 0)
   if rangeProvenIndex(row, idxIx) {
     fbLocalGet(listIdxScratchBase)
     return 0
