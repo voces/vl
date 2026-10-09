@@ -25,6 +25,10 @@ use super::{hex, private_cache_dir, prune_cache_dir, sha256, user_cache_root};
 /// crash (70), so the two stay separable in a report.
 pub const EXIT_CACHE_MISMATCH: i32 = 71;
 
+/// The default `$VL_COMPILE_CACHE_MAX_MB`: one large project's test run stores ~290 MiB, so a
+/// smaller bound had dev, release and test builds evicting each other.
+const DEFAULT_MAX_MB: u64 = 4096;
+
 /// The transcripts one manifest keeps, most recent first.
 const MANIFEST_KEEP: usize = 4;
 const MANIFEST_MAGIC: &str = "VLCM1";
@@ -217,12 +221,12 @@ fn touch(path: &Path) {
 }
 
 /// The soft size `<cache>/compile/` is pruned back to: `$VL_COMPILE_CACHE_MAX_MB` MiB,
-/// default 512.
+/// default 4096.
 fn max_bytes() -> u64 {
     std::env::var("VL_COMPILE_CACHE_MAX_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(512)
+        .unwrap_or(DEFAULT_MAX_MB)
         .saturating_mul(1 << 20)
 }
 
@@ -378,4 +382,14 @@ pub fn serve<T>(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_limit_is_4096_mib() {
+        assert_eq!(DEFAULT_MAX_MB, 4096);
+    }
 }

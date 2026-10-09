@@ -697,7 +697,7 @@ lines read `-O hit`, `-O miss`, …. Off by default.
 | variable | effect |
 | --- | --- |
 | `VL_NO_COMPILE_CACHE=1` | no lookup and no store, even when enabled |
-| `VL_COMPILE_CACHE_MAX_MB=<n>` | prune target, default 512 |
+| `VL_COMPILE_CACHE_MAX_MB=<n>` | prune target, default 4096 |
 | `VL_COMPILE_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `stored`, `verified`, `off (<why>)` |
 | `VL_COMPILE_CACHE_VERIFY=1` | every hit also compiles cold; a difference exits **71** |
 
