@@ -329,6 +329,7 @@ import {
   anonRowKindsAgree,
   argNichePinTyOf,
   arrLitElemName,
+  bodyLetReadAtSid,
   capMemoNoteEdit,
   captureCountOf,
   cloRetTypeName,
@@ -10113,7 +10114,14 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
     if monoFnBindsParam(fx, name) { return none }
     const li = identLetOfAt(sid, fx, at)
     if li >= 0 {
-      const out: i32[] = [fx, li]
+      // A module-scope binding found from a function is the module's: its initializer reads
+      // names at module scope, not in the function (D3868).
+      let lfx = fx
+      const fn = P.nodes[fx]
+      if fn is FuncDecl {
+        if bodyLetReadAtSid(fn.fnBody, sid, at) != li { lfx = -1 }
+      }
+      const out: i32[] = [lfx, li]
       return out
     }
     const slot = fnStmtsPosOf(fx)
@@ -10511,6 +10519,25 @@ function monoWalk(ix: i32, ctx: i32) {
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
         if afe < 0 {
           afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx)
+          // The call would be re-spelled to the lambda's own name, which a parameter or local
+          // here may rebind: it keeps its `call_ref` through the alias then (D3861).
+          if afe >= 0 && monoNameShadowedAt(monoSlotName(afe), n.callFn, ctx) {
+            monoNoRename.push(n.callFn)
+          }
+          // A `const`-only chain is re-spelled above unless that name is rebound here; then
+          // the lambda is pinned through the chain and the call keeps its `call_ref` (D3861).
+          if afe < 0 {
+            const cfe = monoAliasChainLamFe(
+              callee.identName,
+              n.callFn,
+              ctx,
+              true,
+            )
+            if cfe >= 0 {
+              afe = cfe
+              monoNoRename.push(n.callFn)
+            }
+          }
           // The chain names the lambda it is initialized with. Where a link is written, that
           // need not be the value the alias holds at this call, so the call keeps its
           // `call_ref` and only the lambda is pinned (D3849); an unwritten chain always holds it.
@@ -11093,6 +11120,37 @@ function monoConcreteFnTyName(ty: i32): string {
   tyToEmitName(ty)
 }
 
+// The name function slot `fe` is declared or bound under, "" when it has none.
+function monoSlotName(fe: i32): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const f = P.nodes[fnStmts[fe]]
+  if f is FuncDecl { return f.fnName }
+  ""
+}
+
+// Whether `name`, read at `at` in frame `ctx`, is a parameter or local of `ctx` or of a function
+// enclosing it, and so not the module-scope binding of that name.
+function monoNameShadowedAt(name: string, at: i32, ctx: i32): boolean {
+  if name == "" { return false }
+  const sid = sidOf(name)
+  let fx = ctx
+  let hops = 0
+  while hops < 16 && fx >= 0 {
+    if monoFnBindsParam(fx, name) { return true }
+    const f = P.nodes[fx]
+    if f is FuncDecl {
+      if bodyLetReadAtSid(f.fnBody, sid, at) >= 0 { return true }
+    }
+    const slot = fnStmtsPosOf(fx)
+    if slot < 0 || slot >= fnParent.length { return false }
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return false }
+    fx = fnStmts[ps]
+    hops = hops + 1
+  }
+  false
+}
+
 // The name nodes `monoNoteBindDelivery` recorded: each is a call of what it reads.
 let monoDeliveredArgs: i32[] = []
 
@@ -11110,7 +11168,9 @@ function monoNoteBindSig(name: string, at: i32, ctx: i32, sig: string) {
     const d = P.nodes[lf[1]]
     if !(d is LetDecl) { return 0 }
     // A call in a function nothing names never runs.
-    if hops == 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
+    // A module-scope binding's call in an unnamed module-scope function still counts: that
+    // function is lowered, and with it the call (D3868).
+    if hops == 0 && lf[0] >= 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
     const had = monoBindCallSigs.get(lf[1]) ?? ""
     if !monoSigListHas(had, sig) { monoBindCallSigs.set(lf[1], had + sig) }
     monoBindCallFrame.set(lf[1], lf[0])
@@ -11219,7 +11279,12 @@ function monoBindingSigConflict(nDecl: i32): i32 {
   // Each binding's signatures: those its fixed values share. A value read through another such
   // binding is that binding's instance, so a second round reads those signatures back.
   const targets: string[] = []
-  for _bx in binds { targets.push("") }
+  // A binding nothing calls through whose values are all renamable reads takes its reader's.
+  const free: boolean[] = []
+  for _bx in binds {
+    targets.push("")
+    free.push(false)
+  }
   let round = 0
   while round < 2 {
     let b = 0
@@ -11236,7 +11301,6 @@ function monoBindingSigConflict(nDecl: i32): i32 {
           const fe = monoLamValueFe(iv, lfx)
           // Read by name, it is renamed to the instance the calls want below, so it fixes nothing.
           const named = monoWriteNamesLam(iv, fe, lfx)
-            && (monoBindCallSigs.get(binds[b]) ?? "") != ""
           if fe >= 0 && fe < nDecl && monoInstantiatedAny(fe) && !named {
             fixed = monoLamInstSigs(fe)
             if monoWriteNamesLam(iv, fe, lfx) { fixed = monoSlotSig(fe) }
@@ -11248,20 +11312,32 @@ function monoBindingSigConflict(nDecl: i32): i32 {
         const byName = monoWriteNamesLam(wNode[w], wLam[w], wFrame[w])
         // A lambda no instance pinned yet takes the binding's signature below.
         const open = !monoInstantiatedAny(wLam[w])
-        if wBind[w] == binds[b] && !byName && !wDead[w] && !open {
+        const src = monoWriteSourceBind(wNode[w], wFrame[w])
+        // A binding copied into itself gains no value.
+        if (
+          wBind[w] == binds[b]
+          && !byName
+          && !wDead[w]
+          && !open
+          && src != binds[b]
+        ) {
           let ws = monoLamInstSigs(wLam[w])
-          const src = monoWriteSourceBind(wNode[w], wFrame[w])
           let si = 0
           while si < binds.length {
+            if binds[si] == src && free[si] { ws = "*" }
             if binds[si] == src && targets[si] != "" { ws = targets[si] }
             si = si + 1
           }
-          if fixed == "*" { fixed = ws } else { fixed = monoSigMeet(fixed, ws) }
+          if ws == "*" { 0 }
+          else if fixed == "*" { fixed = ws }
+          else { fixed = monoSigMeet(fixed, ws) }
         }
         w = w + 1
       }
       // The signatures the calls through the binding take; two of them is two signatures.
       const calls = monoBindCallSigs.get(binds[b]) ?? ""
+      // arena-tick exempt: free is this function's local table, not the arena
+      free[b] = fixed == "*" && calls == ""
       if calls != "" {
         if calls != monoSigFirst(calls) { return monoBindSigFail(names[b]) }
         if fixed == "*" {
@@ -11282,12 +11358,51 @@ function monoBindingSigConflict(nDecl: i32): i32 {
     }
     round = round + 1
   }
+  // A free binding read into a called one takes that one's signature, through a chain of free
+  // bindings too; one feeding two signatures is refused.
+  let hop = 0
+  let moved = true
+  while moved && hop <= binds.length {
+    moved = false
+    let fb = 0
+    while fb < binds.length {
+      const want = monoSigFirst(targets[fb])
+      let fw = 0
+      while fw < wNode.length && want != "" {
+        const src = monoWriteSourceBind(wNode[fw], wFrame[fw])
+        if (
+          wBind[fw] == binds[fb]
+          && !wDead[fw]
+          && src >= 0
+          && src != binds[fb]
+        ) {
+          let si = 0
+          while si < binds.length {
+            if binds[si] == src && free[si] {
+              if targets[si] != "" && targets[si] != want {
+                return monoBindSigFail(names[si])
+              }
+              if targets[si] != want {
+                // arena-tick exempt: targets is this function's local signature table
+                targets[si] = want
+                moved = true
+              }
+            }
+            si = si + 1
+          }
+        }
+        fw = fw + 1
+      }
+      fb = fb + 1
+    }
+    hop = hop + 1
+  }
   // The writes by name take their binding's signature, or settle one among themselves.
   let b = 0
   while b < binds.length {
     let target = monoSigFirst(targets[b])
     const calls = monoBindCallSigs.get(binds[b]) ?? ""
-    if calls != "" && target != "" {
+    if (calls != "" || free[b]) && target != "" {
       if monoRenameInitAt(binds[b], bindFrames[b], target, nDecl) < 0 {
         return monoBindSigFail(names[b])
       }
