@@ -14753,20 +14753,44 @@ export function asExprNumFallible(ix: i32): boolean {
   numCastCanFail(asExprNumSrcName(ix), asExprNumCastDomain(ix))
 }
 
-// Is `exprIx` an expression whose f64/f32 value is integral by construction? `trunc` /
-// `floor` / `ceil` / `nearest` are the four `f64 → f64` intrinsics with no fractional
-// result, so `trunc(d) as! i32` only needs the trapping `i32.trunc_f64_s`'s range check.
-// Exactly these four; a user function named `floor` shadows them, checked via `fnIndexOfSid`.
-export function exprIsIntegralFloat(exprIx: i32, _fnIx: i32): boolean {
+// Is `exprIx` an f64/f32 value integral by construction: a call of the `trunc` / `floor` /
+// `ceil` / `nearest` intrinsic, or a `const` initialised by one? A cast of it to an integer
+// then owes only the range test. A binding, global or function of the callee's name
+// declines, since the call then lowers to that and not to the intrinsic.
+export function exprIsIntegralFloat(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const di = bindingDeclInScope(e.identName)
+    if di < 0 { return false }
+    const d = P.nodes[di]
+    if d is LetDecl {
+      if d.letKw == "const" { return callIsIntegralFloatIntr(d.letInit, fnIx) }
+    }
+    return false
+  }
+  callIsIntegralFloatIntr(exprIx, fnIx)
+}
+
+// The call half of `exprIsIntegralFloat`. A `const` is followed one step only: a name in its
+// initialiser would resolve here at the cast's scope, which can differ from the declaration's.
+function callIsIntegralFloatIntr(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
   if !(e is Call) { return false }
   if e.callArgs.length != 1 { return false }
   const callee = P.nodes[e.callFn]
   if !(callee is Ident) { return false }
-  if fnIndexOfNode(e.callFn) >= 0 { return false }
   const nm = callee.identName
-  nm == "trunc" || nm == "floor" || nm == "ceil" || nm == "nearest"
+  if !(nm == "trunc" || nm == "floor" || nm == "ceil" || nm == "nearest") {
+    return false
+  }
+  if fnIndexOfInScopeChainAt(sidOfNode(e.callFn), nm, fnIx, e.callFn) >= 0 {
+    return false
+  }
+  if globalIndexOf(nm) >= 0 { return false }
+  if identNameIsBoundAt(nm, fnIx, e.callFn) { return false }
+  !identNameIsLiveBound(nm, fnIx)
 }
 
 // Whether `ix` is a list of booleans: typed `boolean[]`, or a literal whose first element is one.
@@ -17683,6 +17707,13 @@ export function exprIsBool(ix: i32, fnIx: i32) {
     // An element typed at a type parameter an enclosing instance binds to `boolean`, read in
     // a nested generic's instance that binds only its own (D3831).
     if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
+      return true
+    }
+    // …and the cell of a written capture, whose read the rewrite minted untyped (D3886).
+    if (
+      tyPrimNameOf(pinSubOperandTyOf(capturedCellElemTy(e.idxArr, fnIx), fnIx))
+      == "boolean"
+    ) {
       return true
     }
     return tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean"
@@ -29712,6 +29743,13 @@ function holeNulLitElemTy(arrIx: i32, fnIx: i32): i32 {
   const rt = holeOperandTyOf(arrIx, fnIx)
   if rt < 0 { return holeArrElemPinTyOf(arrIx, fnIx) }
   tyStepElem(rt)
+}
+
+// The element type of captured list `arrIx` read in `fnIx`, or -1 for any other receiver.
+function capturedCellElemTy(arrIx: i32, fnIx: i32): i32 {
+  const a = P.nodes[unwrapParen(arrIx)]
+  if !(a is Ident) || capturedKindOf(fnIx, a.identName) == null { return -1 }
+  tyArrayElemIx(nodeTyIxOf(unwrapParen(arrIx)))
 }
 
 // The element a captured list of a hole holds at the pin of the hole instance enclosing lambda

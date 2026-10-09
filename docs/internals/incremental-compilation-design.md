@@ -690,10 +690,9 @@ whether that keying costs hits for nothing:
   - Results live beside the existing `modules/` cache: `<cache dir>/compiles/`, same root,
     same 0700 ownership rule, same temp-file and rename writes.
   - They are pruned by the same least-recently-used policy under their own soft budget,
-    `VL_COMPILE_CACHE_MAX_MB`, default 512.
+    `VL_COMPILE_CACHE_MAX_MB`, default 4096.
   - For scale: sunpa's unoptimized module is 1.77 MB (`27e3417`) and its manifest a few KB, so
-    the default
-    holds a few hundred builds of that size.
+    the default holds about 2,300 builds of that size.
 - **In memory (the watch mode).**
   - The last result per action and its transcript; for sunpa, a few MB.
   - At most one warm compiler instance per pool worker.
