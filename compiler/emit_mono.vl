@@ -12080,6 +12080,7 @@ export function monomorphize(stmts: i32[]) {
     sl = sl + 1
   }
 
+  const memberProps = monoMemberPropNames()
   let gp = 0
   while gp < nDecl {
     if fnStmts[gp] == monoOrigNode[gp] {
@@ -12117,6 +12118,9 @@ export function monomorphize(stmts: i32[]) {
           }
           // A hole lambda no call pinned and no read reaches has nothing to lower at (D3832).
           if !prune && i32ListHas(deadLams, gp) { prune = true }
+          // A nested function nothing names never runs, and its calls through a binding may
+          // take a signature the live ones do not (D3864).
+          if !prune && monoNestedFnDead(gp, memberProps) { prune = true }
           // D426 — the lambda template, the `<T>` arm above one frame down. Each
           // instance mints its own copy with the pin substituted. Gate (1) is inverted
           // here, the property being decided by the annotation rather than by the slot.
@@ -12165,6 +12169,63 @@ export function monomorphize(stmts: i32[]) {
   0
 }
 
+// Whether the nested function or `const`-bound lambda in slot `gp` is never called: it, or a
+// function between it and its module-scope function, is not named in its parent's body, and no
+// member call anywhere spells that name, which a `self`-function call would. A module-scope
+// function's own deadness is not asked: a specialised copy shares its nested slots.
+function monoNestedFnDead(gp: i32, memberProps: {[string]: i32}): boolean {
+  let slot = gp
+  let guard = 0
+  while slot >= 0 && slot < fnParent.length && guard <= fnStmts.length {
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return false }
+    const fx = fnStmts[slot]
+    const pb = monoNestedBodyOf(fnStmts[ps])
+    if pb < 0 { return false }
+    let nm = ""
+    const f = P.nodes[fx]
+    if f is FuncDecl { nm = f.fnName }
+    if criFnIsAnonLambda(slot) { nm = monoConstNameOfInit(pb, fx) }
+    else if (memberProps[nm] ?? 0) == 1 { return false }
+    if nm == "" { return false }
+    if !monoSubtreeNamesIdent(pb, nm, 0) { return true }
+    slot = ps
+    guard = guard + 1
+  }
+  false
+}
+
+// The property names member accesses spell anywhere in the program; one walk.
+function monoMemberPropNames(): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  const stack: i32[] = []
+  for st in monoProgStmts { stack.push(st) }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const pn = monoMemberPropOf(ix)
+      // arena-tick exempt: `out` is this function's own result table, not the arena.
+      if pn != "" { out[pn] = 1 }
+      for k in nodeChildren(ix) { stack.push(k) }
+    }
+  }
+  out
+}
+
+// The property member access `ix` spells, or "" for any other node.
+function monoMemberPropOf(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is Member { return n.memProp }
+  monoOptMemberPropOf(ix)
+}
+
+// The property optional member access `ix` spells, or "" for any other node.
+function monoOptMemberPropOf(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is OptMember { return n.omProp }
+  ""
+}
+
 // Whether the lambda in slot `fe`, bound by an un-annotated `const`, is named as an element of
 // a list or capture cell in its enclosing frame, and every such list is bound to a name that is
 // unread (`monoFrameNameUnread`): no call can go through it.
@@ -12172,6 +12233,8 @@ function monoLamStoredAsElement(fe: i32): boolean {
   let pf = -1
   if fe < fnParent.length { pf = fnParent[fe] }
   const stack: i32[] = []
+  let frame = -1
+  if pf >= 0 && pf < fnStmts.length { frame = fnStmts[pf] }
   if pf >= 0 && pf < fnStmts.length {
     const b = monoNestedBodyOf(fnStmts[pf])
     if b < 0 { return false }
@@ -12201,7 +12264,10 @@ function monoLamStoredAsElement(fe: i32): boolean {
   for lx in lits {
     let holds = false
     for el in monoArrayElems(lx) {
-      if monoIdentNameOf(el) == name { holds = true }
+      // By name, or through a binding that holds it (D3864).
+      if monoIdentNameOf(el) == name || monoLamValueFe(el, frame) == fe {
+        holds = true
+      }
     }
     if holds {
       stored = true
