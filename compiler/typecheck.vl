@@ -5495,6 +5495,7 @@ export function initChecker() {
   tvNestOf = Map()
   nestParentOf = Map()
   nestEscapeMemo = Map()
+  nestLoMemo = Map()
   substNestMode = SUBST_ALL
   substNestDecl = -1
   argPinWant = []
@@ -22717,7 +22718,18 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   let st = srcTy
   if st < 0 { st = lookup(e.identName) }
   if st < 0 { return 0 }
-  const decl = fnDeclIx[e.identName] ?? CSTR_NODECL
+  let decl = fnDeclIx[e.identName] ?? CSTR_NODECL
+  // A generic nested in the enclosing function, delivered where that function's own type
+  // parameters type the destination (`return b` at `(T) => void`): its demands are re-recorded
+  // at those parameters, as a call of it in the enclosing body is (D3896).
+  let nested = false
+  if decl < 0 {
+    const nd = lookupFnDeclNode(e.identName)
+    if nestParentOf.has(nd) {
+      decl = nd
+      nested = true
+    }
+  }
   if decl < 0 || decl >= P.nodes.length { return 0 }
   const fd = P.nodes[decl]
   if !(fd is FuncDecl) { return 0 }
@@ -22725,7 +22737,9 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   let dt = dstTy
   const dn = T.tys[dt]
   if dn is TyNullable { dt = dn.nInner }
-  if dt < 0 || tyHasTyVar(dt) { return 0 }
+  // At a concrete destination a nested generic is the function-value adapter's to check, which
+  // reports the same demand as its reason.
+  if dt < 0 || tyHasTyVar(dt) != nested { return 0 }
   const s = T.tys[st]
   const d = T.tys[dt]
   if !(s is TyFunc) || !(d is TyFunc) { return 0 }
@@ -22743,16 +22757,26 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   const noNode: i32[] = []
   const who = e.identName
   const noArgs: i32[] = []
-  pinBmCstrElems(bNames, bTys, srcExpr, decl, noArgs)
-  validateBinCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
-  validatePrintCstrs(bNames, bTys, srcExpr, decl, who)
-  validateNestCstrs(bNames, bTys, srcExpr, decl, who)
-  validateArgCstrs(bNames, bTys, srcExpr, decl, noN, noNode)
-  validateRetCstrs(bNames, bTys, srcExpr, decl, who)
-  validateLetCstrs(bNames, bTys, srcExpr, decl, who)
-  validateBmCstrs(bNames, bTys, srcExpr, decl, who)
-  validateMemCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
-  validateUfcsCstrs(bNames, bTys, srcExpr, decl, who)
+  const modeWas = substNestMode
+  const declWas = substNestDecl
+  let owner = decl
+  if nested {
+    owner = CSTR_NODECL
+    substNestMode = SUBST_NESTED
+    substNestDecl = decl
+  }
+  pinBmCstrElems(bNames, bTys, srcExpr, owner, noArgs)
+  validateBinCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
+  validatePrintCstrs(bNames, bTys, srcExpr, owner, who)
+  validateNestCstrs(bNames, bTys, srcExpr, owner, who)
+  validateArgCstrs(bNames, bTys, srcExpr, owner, noN, noNode)
+  validateRetCstrs(bNames, bTys, srcExpr, owner, who)
+  validateLetCstrs(bNames, bTys, srcExpr, owner, who)
+  validateBmCstrs(bNames, bTys, srcExpr, owner, who)
+  validateMemCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
+  validateUfcsCstrs(bNames, bTys, srcExpr, owner, who)
+  substNestMode = modeWas
+  substNestDecl = declWas
   0
 }
 
@@ -42686,7 +42710,10 @@ function validatePrintCstrs(
   const nOrigP = printCstrTy.length
   let ci = 0
   while ci < nOrigP {
-    if cstrOwnedBy(printCstrFn[ci], calleeFn) {
+    if (
+      cstrOwnedBy(printCstrFn[ci], calleeFn)
+      && !nestCstrOutside(printCstrIx[ci])
+    ) {
       const cpt = substTyDeep(printCstrTy[ci], bNames, bTys)
       if (
         calleeFn >= 0
@@ -43236,7 +43263,7 @@ function validateRetCstrs(
   const nOrigR = retCstrGot.length
   let ci = 0
   while ci < nOrigR {
-    if cstrOwnedBy(retCstrFn[ci], calleeFn) {
+    if cstrOwnedBy(retCstrFn[ci], calleeFn) && !nestCstrOutside(retCstrIx[ci]) {
       const rg = substTyDeep(retCstrGot[ci], bNames, bTys)
       const rw = substTyDeep(retCstrWant[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership
@@ -43294,7 +43321,7 @@ function validateLetCstrs(
   const nOrigL = letCstrGot.length
   let ci = 0
   while ci < nOrigL {
-    if cstrOwnedBy(letCstrFn[ci], calleeFn) {
+    if cstrOwnedBy(letCstrFn[ci], calleeFn) && !nestCstrOutside(letCstrIx[ci]) {
       const lg = substTyDeep(letCstrGot[ci], bNames, bTys)
       const lw = substTyDeep(letCstrWant[ci], bNames, bTys)
       // Re-records only when the callee is named, for the same ownership reason
@@ -43466,7 +43493,7 @@ function validateBmCstrs(
   const nOrigB = bmCstrGot.length
   let ci = 0
   while ci < nOrigB {
-    if cstrOwnedBy(bmCstrFn[ci], calleeFn) {
+    if cstrOwnedBy(bmCstrFn[ci], calleeFn) && !nestCstrOutside(bmCstrIx[ci]) {
       const bg = substTyDeep(bmCstrGot[ci], bNames, bTys)
       const bw = substTyDeep(bmCstrWant[ci], bNames, bTys)
       let bc = bmCstrCtx[ci]
@@ -43526,7 +43553,10 @@ function validateUfcsCstrs(
   const nOrigU = ufcsCstrTy.length
   let ci = 0
   while ci < nOrigU {
-    if cstrOwnedBy(ufcsCstrFn[ci], calleeFn) {
+    if (
+      cstrOwnedBy(ufcsCstrFn[ci], calleeFn)
+      && !nestCstrOutside(ufcsCstrIx[ci])
+    ) {
       const ur = substTyDeep(ufcsCstrTy[ci], bNames, bTys)
       if (
         calleeFn >= 0
@@ -43817,7 +43847,7 @@ function tpDemandTy(recv: i32, calleeFn: i32) {
   let k = 0
   while k < memCstrTy.length {
     if memCstrTy[k] == recv && memCstrDem[k] {
-      if cstrOwnedBy(memCstrFn[k], calleeFn) {
+      if cstrOwnedBy(memCstrFn[k], calleeFn) && !nestCstrOutside(memCstrIx[k]) {
         if !strListHas(names, memCstrProp[k]) {
           names.push(memCstrProp[k])
           tys.push(mkTyVarOwned("?", "#c" + i32ToStr(calleeFn)))
@@ -43847,7 +43877,7 @@ function validateMemCstrs(
   const nOrigM = memCstrTy.length
   let ci = 0
   while ci < nOrigM {
-    if cstrOwnedBy(memCstrFn[ci], calleeFn) {
+    if cstrOwnedBy(memCstrFn[ci], calleeFn) && !nestCstrOutside(memCstrIx[ci]) {
       const mr = substTyDeep(memCstrTy[ci], bNames, bTys)
       if (
         calleeFn >= 0
@@ -45433,6 +45463,36 @@ function namesAllHoles(names: string[]): boolean {
     if nm == "" || nm[0] != '?' { return false }
   }
   true
+}
+
+// Whether constraint node `ix` lies outside the nested generic a `SUBST_NESTED` binding names:
+// a use of that generic in its enclosing body (`const g: (n: i32) => void = b`) is no demand of
+// its body, and each such use binds the generic afresh (D3896).
+function nestCstrOutside(ix: i32): boolean {
+  if substNestMode != SUBST_NESTED || substNestDecl < 0 || ix < 0 {
+    return false
+  }
+  if ix > substNestDecl { return true }
+  ix < nestSubtreeLo(substNestDecl)
+}
+
+// The lowest node index in the subtree of declaration `nd`: the arena is post-order, so the
+// subtree is the contiguous range from it up to `nd`.
+let nestLoMemo: {[i32]: i32} = Map()
+function nestSubtreeLo(nd: i32): i32 {
+  const m = nestLoMemo.get(nd) ?? -1
+  if m >= 0 { return m }
+  let lo = nd
+  const stack: i32[] = [nd]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      if ix < lo { lo = ix }
+      for k in nodeChildren(ix) { stack.push(k) }
+    }
+  }
+  nestLoMemo.set(nd, lo)
+  lo
 }
 
 // Whether the current `substNestMode` binds type-variable row `row`, named `name`. A nested
@@ -55777,7 +55837,7 @@ function validateIsCstrs(
   const nOrig = isCstrTy.length
   let ci = 0
   while ci < nOrig {
-    if cstrOwnedBy(isCstrFn[ci], calleeFn) {
+    if cstrOwnedBy(isCstrFn[ci], calleeFn) && !nestCstrOutside(isCstrIx[ci]) {
       const ct = substTyDeep(isCstrTy[ci], bNames, bTys)
       if tyHasHole(ct) {
         if calleeFn >= 0 && ct != isCstrTy[ci] {
@@ -55830,7 +55890,10 @@ function validateNestCstrs(
   const nOrig = nestCstrTy.length
   let ci = 0
   while ci < nOrig {
-    if cstrOwnedBy(nestCstrFn[ci], calleeFn) {
+    if (
+      cstrOwnedBy(nestCstrFn[ci], calleeFn)
+      && !nestCstrOutside(nestCstrIx[ci])
+    ) {
       const ct = substTyDeep(nestCstrTy[ci], bNames, bTys)
       if tyHasHole(ct) {
         if calleeFn >= 0 && ct != nestCstrTy[ci] {

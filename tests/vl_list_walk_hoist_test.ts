@@ -2,12 +2,15 @@
 // `xs.length` INDEXES WITHOUT A GUARD.
 //
 // Plumb's PL-014 lane L6: a `for b in xs` over `u8[]` re-read the wrapper's backing and `len`
-// every step, and `xs[i]` under `for i in 0 until xs.length` kept its `i u< len` select though
+// every step, and `xs[i]` under `for i in 0 until xs.length` kept its `i u< len` guard though
 // the range proves it. A call-free body cannot push or pop through any alias, so
-// `emitForInStmt` now reads the header once and `rangeProofOpen` drops the select. Each
-// program is compiled, disassembled with `wasm-dis`, and the `struct.get`s and `select`s
+// `emitForInStmt` now reads the header once and `rangeProofOpen` drops the guard. Each
+// program is compiled, disassembled with `wasm-dis`, and the `struct.get`s and index guards
 // INSIDE its loops are counted — both directions, so an optimisation that stopped firing and
 // one that fired on a body that can push are each caught. Every output is asserted too.
+//
+// A guard is counted by its `-1` index: the trap's out-of-range read, or the `select` of -1 the
+// guard was before SP-056, so the count reads one guard per index whichever form it takes.
 //
 // GATING mirrors the other seed-backed suites: `SELFHOST_NATIVE_ALIGN=1` plus the vl binary,
 // the seed and `wasm-dis` (at node_modules/.bin, not on PATH). No assertion library.
@@ -31,7 +34,7 @@ if (GATED && !ENABLED) {
 type Spec = {
   src: string;
   gets: (n: number) => boolean;
-  selects: number;
+  guards: number;
   out: string;
 };
 
@@ -46,7 +49,7 @@ const PROGRAMS: Record<string, Spec> = {
 print(f([1, 2, 250]))
 `,
     gets: (n) => n === 0,
-    selects: 0,
+    guards: 0,
     out: "253\n",
   },
   f64_for_in: {
@@ -58,7 +61,7 @@ print(f([1, 2, 250]))
 print(f([1.5, 2.25]))
 `,
     gets: (n) => n === 0,
-    selects: 0,
+    guards: 0,
     out: "3.75\n",
   },
   // A body that calls `push` keeps the per-step read, so the pushed elements are walked.
@@ -74,7 +77,7 @@ print(f([1.5, 2.25]))
 print(f([1, 2, 3]))
 `,
     gets: (n) => n >= 2,
-    selects: 0,
+    guards: 0,
     out: "29\n",
   },
   range_until_len: {
@@ -86,7 +89,7 @@ print(f([1, 2, 3]))
 print(f([4, 5, 6]))
 `,
     gets: (n) => n === 0,
-    selects: 0,
+    guards: 0,
     out: "15\n",
   },
   range_to_len_minus_one: {
@@ -98,7 +101,7 @@ print(f([4, 5, 6]))
 print(f([4, 5, 6]))
 `,
     gets: (n) => n === 0,
-    selects: 0,
+    guards: 0,
     out: "15\n",
   },
   // Not proofs: an inclusive `to xs.length`, a bound that is not the receiver's length, and a
@@ -114,7 +117,7 @@ print(f([4, 5, 6]))
 print(f([4, 5, 6], 2))
 `,
     gets: (n) => n === 0,
-    selects: 10,
+    guards: 10,
     out: "24\n",
   },
   range_rebound: {
@@ -129,7 +132,7 @@ print(f([4, 5, 6], 2))
 print(f([4, 5, 6, 7]))
 `,
     gets: (n) => n === 0,
-    selects: 1,
+    guards: 1,
     out: "12\n",
   },
 };
@@ -167,7 +170,7 @@ function measure(
   dir: string,
   name: string,
   src: string,
-): { gets: number; selects: number; out: string } {
+): { gets: number; guards: number; out: string } {
   const vl = `${dir}/${name}.vl`;
   const wasm = `${dir}/${name}.wasm`;
   Deno.writeTextFileSync(vl, src);
@@ -192,7 +195,7 @@ function measure(
   const body = loopLines(dis.out);
   return {
     gets: body.filter((l) => l.includes("struct.get")).length,
-    selects: body.filter((l) => l.includes("(select")).length,
+    guards: body.filter((l) => l.trim() === "(i32.const -1)").length,
     out: exec.out,
   };
 }
@@ -211,9 +214,9 @@ Deno.test({
             `${name}: unexpected struct.get count inside loops: ${got.gets} (${spec.gets})`,
           );
         }
-        if (got.selects !== spec.selects) {
+        if (got.guards !== spec.guards) {
           throw new Error(
-            `${name}: want ${spec.selects} select(s) inside loops, got ${got.selects}`,
+            `${name}: want ${spec.guards} index guard(s) inside loops, got ${got.guards}`,
           );
         }
         if (got.out !== spec.out) {
