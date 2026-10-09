@@ -40554,6 +40554,24 @@ function holeHasIsAlt(name: string) {
   false
 }
 
+// The array-demand key of type variable row `row`: a declared type parameter is keyed by
+// its declaring function, since every generic may call its own `T` (D3884); a hole, or a row
+// with no recorded owner, by its name.
+function arrayDemandKey(row: i32): string {
+  const t = T.tys[row]
+  if !(t is TyVar) { return "" }
+  const owner = tyVarOwnerOf(row)
+  if owner == "" || t.tvName == "" || t.tvName[0] == '?' { return t.tvName }
+  "!r!" + owner + "!" + t.tvName
+}
+
+// Whether a parameter typed by row `row` is indexed in its function's body.
+function rowIsArrayDemanded(row: i32): boolean {
+  const t = T.tys[row]
+  if !(t is TyVar) { return false }
+  holeIsArrayDemanded(arrayDemandKey(row)) || holeIsArrayDemanded(t.tvName)
+}
+
 function holeIsArrayDemanded(name: string) {
   let i = 0
   while i < holeArrayDemand.length {
@@ -47976,7 +47994,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         if !holeDemandOk(pHole.tvName, args[i], at) {
           holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
         }
-        if holeIsArrayDemanded(pHole.tvName) {
+        if rowIsArrayDemanded(params[i + 1]) {
           if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
         }
         if holeIsArrayWriteDemanded(name, pHole.tvName) {
@@ -48470,7 +48488,7 @@ function checkMemberCallNode(
   // grow a `{map: any}` struct shape no array argument could satisfy.
   if rt is TyVar && !holeMethodIsSelfFn(prop, ix) {
     if holeArrMethod(prop) {
-      noteArrayDemand(rt.tvName)
+      noteArrayDemand(arrayDemandKey(recvTy))
       // The synthesized receiver below is a MUTABLE list, and nothing re-checks the
       // argument against it — so a write through the hole is filed here, and the pin
       // refuses a view for it.
@@ -49602,8 +49620,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       }
       // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
       // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
-      if holeIsArrayDemanded(pHole.tvName) {
+      if rowIsArrayDemanded(params[i]) {
         if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+        // An enclosing type parameter passed in takes the demand to its own pin.
+        if at >= 0 && T.tys[at] is TyVar { noteArrayDemand(arrayDemandKey(at)) }
       }
       if holeIsArrayWriteDemanded(calleeIdentName(cfn), pHole.tvName) {
         if tyIsListView(at) { holeArgViewErr(i + 1, at, args[i]) }
@@ -71937,7 +71957,7 @@ function checkIndexNode(n: Index, ix: i32) {
       }
       tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
     }
-    noteArrayDemand(at.tvName)
+    noteArrayDemand(arrayDemandKey(arrTy))
     // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
     // receiver and refuses scalars/maps — a record/nullable/function/union pinned reaches the emitter unruled.
     noteMemCstr(arrTy, OP_INDEX_GET, ix, false)
