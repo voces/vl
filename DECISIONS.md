@@ -10071,7 +10071,9 @@ over all 15,413 `.vl` files in the tree; the printer had always emitted `-x as T
 `nearest` of an f64 or f32 — written directly, or as a `const` that one of them initialises —
 the emitter drops the integrality compare (`trunc(d) == d`) and keeps the range test, in all three
 modes. The value is integral by construction, and NaN and ±Inf still fail the range test. An `as!`
-on such an operand traps with a bare `unreachable`, with no `as! i32 at …: not exact` reason.
+on such an operand still prints `as! i32 at <line>:<col>: not exact`; at an i32 or i64 domain it
+then traps at the conversion itself, whose range is exactly the test's, so the host's note names
+the range or NaN, as it did for master's direct spelling. At `u8` it traps at `unreachable`.
 Neither a `let` nor a chain of `const`s is followed (a name in the initialiser would resolve at
 the cast's scope), and a binding, global or function named `floor` declines.
 
@@ -10092,9 +10094,24 @@ medians of 5–9 interleaved rounds of `run.ts`'s 7, load 15–30):
 | bare `i32.trunc_sat_f64_s` | 320 | 1.2x |
 | **range test, then `i32.trunc_f64_s`** | **242–250** | **0.96–0.98x** |
 
-sunpa's game (`src/game.vl` at its `build:vl` flags) is 2,718,883 → 2,728,643 bytes (+0.36%). The
-same rule with the trap reason kept was +2.4%, because the reason is a call per character at
-every site; that is why an integral operand traps bare.
+**Every `as!` reason is one call.** The reason used to be streamed a character at a time at
+each site, about 150 bytes a site, so keeping it on every new integral site cost sunpa's game
++2.4%. It is now printed by one `__as_fail__(line, col << 3 | domain row)` helper, reserved when
+the module has an `as!` with a sad path, so a site pays two constants and a call; binaryen
+specialises the helper on a constant argument. The helper prints the place in decimal at run
+time, so its body is the same for every site.
+
+| sunpa's game, `-O3`, no names | bytes |
+| --- | --- |
+| master | 2,718,883 |
+| the range-only rule, reason kept per character | 2,784,528 (+2.4%) |
+| the range-only rule, no reason on an integral site | 2,728,643 (+0.36%) |
+| **the range-only rule, every reason through `__as_fail__`** | **2,723,550 (+0.17%)** |
+
+On 100 sites in one function, `-O3`: fractional `(x + k) as! i32` 11,114 → 6,435 bytes, and
+`floor(…) as! u8` 10,814 → 5,831. `floor(…) as! i32` is 1,094 → 5,735, because master's sites
+carried neither the range test nor a reason. A module with one or two sites pays the helper's
+body: `bench/arrays/binsearch` `-O3` 648 → 757.
 
 **Rejected: inlining `signed` at `-O3`.** SP-056 also asked why the 10-op leaf `signed` stays a
 call. `-O3` inlines through binaryen's "lightweight" rule (no call, no loop, size ≤ 20), and

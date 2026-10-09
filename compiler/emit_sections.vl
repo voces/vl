@@ -288,6 +288,7 @@ import {
   fsIdxAt,
   fsImportCount,
   fsUsedAt,
+  gAsFailDoms,
   gCellIdx,
   gConstExprEmit,
   gEmitNames,
@@ -305,6 +306,7 @@ import {
   gHeapGlobalIdx,
   gHeapLimit,
   gHeapUsed,
+  gHelpAsFail,
   gHelpF64Rem,
   gHelpInitFail,
   gHelpMapCompact,
@@ -344,6 +346,7 @@ import {
   gMapDeletes,
   gMaxMemPages,
   gMemLogIdx,
+  gNeedsAsFail,
   gNeedsF32Print,
   gNeedsF64Print,
   gNeedsF64Rem,
@@ -4207,6 +4210,82 @@ function emitInitFailFnCode(out: u8[]) {
   helpFrameBody(out, body)
 }
 
+// Prints local `x`, a non-negative i32, in decimal: `p` climbs to x's leading power of ten,
+// then each digit is `x / p % 10` as `p` falls back to zero. Local `p` is scratch.
+function emitAsFailDecimal(x: i32, p: i32) {
+  fbI32Const(1)
+  fbLocalSet(p)
+  fbLoop(64)
+  fbLocalGet(x)
+  fbLocalGet(p)
+  fbI32Bin(110) // 0x6e i32.div_u
+  fbI32Const(10)
+  fbI32Bin(79) // 0x4f i32.ge_u
+  fbIf(64)
+  fbLocalGet(p)
+  fbI32Const(10)
+  fbI32Bin(108) // 0x6c i32.mul
+  fbLocalSet(p)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbLoop(64)
+  fbLocalGet(x)
+  fbLocalGet(p)
+  fbI32Bin(110) // 0x6e i32.div_u
+  fbI32Const(10)
+  fbI32Bin(112) // 0x70 i32.rem_u
+  fbI32Const(48)
+  fbI32Bin(106) // 0x6a i32.add
+  fbCall(2) // __print_char__ (import 2)
+  fbLocalGet(p)
+  fbI32Const(10)
+  fbI32Bin(110) // 0x6e i32.div_u
+  fbLocalTee(p)
+  fbBrIf(0)
+  fbEnd()
+  0
+}
+
+// `__as_fail__(line, colRow)`: prints "as! <domain> at <line>:<col>: not exact" and returns;
+// each site then traps, so a reason costs a site one call rather than a call per character.
+function emitAsFailFnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(1) // one locals run
+  wULEB(1) // p
+  wU8(127) // 0x7f i32
+  emitInitFailText("as! ")
+  let k = 0
+  while k < gAsFailDoms.length {
+    fbLocalGet(1)
+    fbI32Const(7)
+    fbI32Bin(113) // 0x71 i32.and
+    fbI32Const(k)
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+    emitInitFailText(gAsFailDoms[k])
+    fbEnd()
+    k = k + 1
+  }
+  fbLocalGet(0)
+  fbIf(64)
+  emitInitFailText(" at ")
+  emitAsFailDecimal(0, 2)
+  emitInitFailText(":")
+  fbLocalGet(1)
+  fbI32Const(3)
+  fbI32Bin(118) // 0x76 i32.shr_u
+  fbLocalSet(1)
+  emitAsFailDecimal(1, 2)
+  fbEnd()
+  emitInitFailText(": not exact")
+  fbCall(3) // __print_str_flush__ (import 3)
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // —— scalar list views (D3028) ——
 // A view of pair `p` is `{back, len, cap, src}`, a final subtype of its destination's wrapper:
 // the first three fields a snapshot the sync helper refreshes, `src` the list it reads through.
@@ -5118,6 +5197,7 @@ function emitNameSection(n: i32) {
   if gHelpInitFail >= 0 { count = count + 1 }
   count = count + svHelperCount()
   count = count + rvHelperCount()
+  if gHelpAsFail >= 0 { count = count + 1 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -5267,6 +5347,10 @@ function emitNameSection(n: i32) {
   }
   svHelperNames()
   rvHelperNames()
+  if gHelpAsFail >= 0 {
+    wULEB(gHelpAsFail)
+    wName("__as_fail__")
+  }
   wTarget(mapPrev)
 
   // ── assemble the section payload: wName("name") + the two subsections ─────────
@@ -5581,6 +5665,13 @@ function emitModule(_stmts: i32[]) {
     gHelpRvGet = helpBase + nHelpers + 1
     gHelpRvLen = helpBase + nHelpers + 2
     nHelpers = nHelpers + 3
+  }
+  // The `as!` reason (SP-056), after them.
+  gHelpAsFail = -1
+  gAsFailDoms = []
+  if gNeedsAsFail {
+    gHelpAsFail = helpBase + nHelpers
+    nHelpers = nHelpers + 1
   }
 
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
@@ -6116,7 +6207,10 @@ function scanPrintUse() {
         registerValueUnionName(tyToEmitName(nodeTyIxOf(pscan)))
       }
       if asExprNumFallible(pscan) || asExprHoleNumSad(pscan) {
-        if pn.asMode == "trap" { gImports = 4 }
+        if pn.asMode == "trap" {
+          gImports = 4
+          gNeedsAsFail = true
+        }
         if pn.asMode == "null" {
           registerValueUnionName(asExprNumTgtName(pscan) + "|null")
         }
@@ -6504,6 +6598,7 @@ export function emitProgram(rootIx: i32) {
   // helper INDEX is recomputed every compile while a surviving `true` would declare a
   // `__f64_rem__` this module's tail never emits. `scanPrintUse` writes it (D1586).
   gNeedsF64Rem = false
+  gNeedsAsFail = false
   gMapDeletes = false
   // The hole instances' bindings are read by passes that run before `monomorphize` refills
   // them, so an earlier program's rows would name another arena's types (D2921).
@@ -7753,6 +7848,9 @@ function emitTypeSection(
   }
   svHelperFuncTypes()
   rvHelperFuncTypes()
+  if gHelpAsFail >= 0 {
+    helpFuncType("ii", "") // __as_fail__: (line, col << 3 | domain row) -> ()
+  }
   // The export-wrapper functypes last (#1265), one per export entry, each the target's own
   // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
   // `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift from the function it forwards to. Empty unless `fnValUsed`.
@@ -8749,6 +8847,12 @@ function buildCodePayload(
   }
   svPlaceHelpers(codePayload)
   rvPlaceHelpers(codePayload)
+  if gHelpAsFail >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitAsFailFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__as_fail__")
+  }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
   // `file:line:col` of its declaration fall out of the same readers a user body uses.

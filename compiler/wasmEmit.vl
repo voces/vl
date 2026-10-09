@@ -1280,6 +1280,8 @@ import {
   fnDispNames,
   fnInstOrigin,
   fnParent,
+  gAsFailDoms,
+  gHelpAsFail,
   gHelpInitFail,
   gInitAny,
   gInitFnReach,
@@ -17397,26 +17399,31 @@ function emitNumExactConvert(src: string, tgt: string) {
   0
 }
 
-// The `as!` trap's reason, streamed to the host boundary before the abort (the same two
-// imports `__trap__("reason")` uses). Built as characters rather than a synthesized
-// `StrLit`, since a string minted at emit time is invisible to the collect passes that
-// intern `$sTypeIdx` — a program whose only string is this message would `ref.cast` at an unallocated heap index. The wording is kept short since every character costs `i32.const` + `call` per site (D1041).
+// The `as!` trap's reason, `as! <tgt> at <line>:<col>: not exact`, printed by the one
+// `__as_fail__` body from the site's place and the domain's row, so a site costs one call
+// (SP-056). Line 0 names no place. The caller emits the trap itself.
 function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
-  let where = ""
+  if gHelpAsFail < 0 || gImports < 4 {
+    return emitFail(
+      "emitProgram: `as! " + tgt + "` with no `__as_fail__` reserved",
+    )
+  }
+  let row = 0
+  while row < gAsFailDoms.length && gAsFailDoms[row] != tgt { row = row + 1 }
+  if row == gAsFailDoms.length { gAsFailDoms.push(tgt) }
+  if row > 7 { return emitFail("emitProgram: more than eight `as!` domains") }
+  let line = 0
+  let col = 0
   if exprIx >= 0 && exprIx < nodeToks.length {
     const at = nodeToks[exprIx]
     if at >= 0 && at < P.toks.length {
-      where = " at "
-        + i32ToStr(P.toks[at].line)
-        + ":"
-        + i32ToStr(P.toks[at].col + 1)
+      line = P.toks[at].line
+      col = P.toks[at].col + 1
     }
   }
-  for cp in "as! " + tgt + where + ": not exact" {
-    fbI32Const(cp)
-    fbCall(2) // __print_char__ (import 2)
-  }
-  fbCall(3) // __print_str_flush__ (import 3)
+  fbI32Const(line)
+  fbI32Const((col << 3) | row)
+  fbCall(gHelpAsFail)
   0
 }
 
@@ -17495,12 +17502,10 @@ function emitNumExactCastFrom(
   fbIf(64) // if (void) — the SAD path, the only place the two remaining modes differ
   if e.asMode == "trap" {
     // The DOMAIN is what the author wrote, so `x as! u8` says `as! u8`, not `as! i32`. An
-    // integral operand traps bare, as its conversion instruction would: the message costs a
-    // call per character at every `floor(x) as! i32` (SP-056).
-    if !integral {
-      if emitNumCastTrapMsg(exprIx, dom) < 0 { return -1 }
-    }
-    fbUnreachable()
+    // integral float out of i32's or i64's range fails exactly where the conversion below
+    // traps, so it traps there and the host names the range (SP-056).
+    if emitNumCastTrapMsg(exprIx, dom) < 0 { return -1 }
+    if !integral || dom != tgt { fbUnreachable() }
   } else {
     // A bare `as` PROPAGATES. The checker proved the enclosing function returns something
     // `null` fits, so the value to hand back is that function's own null — built through
