@@ -10124,8 +10124,10 @@ the game grows 3.2%. The call is not where the gap was.
 
 **The rule.** A list read or write tests `i u< len` and, when it fails, branches to an out-of-line
 read at index -1 of the backing, so the trap is still the engine's own `out of bounds array
-access`. A record list's backing traps by a one-element `array.copy` to -1 instead, which `-O`'s
-flattening rewrites as it does a list's growth, where a read it would box. The guard used to be
+access`. A record list's backing traps by a one-element `array.copy` to index `array.len` instead,
+which `-O`'s flattening rewrites as it does a list's growth, where a read it would box. A copy to
+-1 also trapped, but flattened to dest -4 with length 4, whose end is exactly 2^32: out of range
+only for an engine that checks the sum without wrapping. At `len` it is out of range by construction. The guard used to be
 `array.get backing (select -1 i (i u< len))`: the same compare, but on the index's data path.
 A list whose backing this module never typed keeps the `select`.
 
@@ -10141,9 +10143,11 @@ sums identical):
 is flat to slightly faster. `noise` (no list reads) is unchanged.
 
 **The price is bytes.** Each guarded access carries the `if` and its trap: sunpa's game
-(`-O3`, no names) 2,732,385 → 2,895,655 (+6.0%); the seed 4,451,514 → 4,733,984 (+6.3%), its
-baseline rewritten here; the L2 self-compile's guest fuel +8.0% (bar 1.5x). The release-shape
-rows moved in bytes only.
+(`-O3`, no names) 2,736,128 → 2,898,196 (+5.9%); the seed 4,453,444 → 4,773,370 (+7.2%), its
+baseline rewritten here. Part of it is binaryen no longer merging repeated checks of one index,
+since a branch to a trap is not a pure `select` it can fold, so `-O` keeps more guards. The L2
+self-compile's guest fuel against master is −1.7% (59.64 G → 58.61 G). The release-shape rows
+moved in bytes only.
 
 **Rejected: versioning the loop.** SP-056's design was a range loop cloned behind one pre-entry
 check, the clone's candidate indices unguarded. Built and measured, interleaved at low load:
