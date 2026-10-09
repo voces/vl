@@ -4617,8 +4617,8 @@ target (`f64 → f32`, `i64 → f64`, `i32 → f32`) ROUNDS and never fails — 
 nearest representable float is the conversion, not a loss of the value's meaning. Loss is
 SPELLED where it happens: `trunc(d) as! i32`, `floor(d) as! i32`, `nearest(d) as! i32`,
 where `trunc`/`floor`/`ceil`/`nearest` are the existing `f64 → f64` intrinsics and the
-`as!` is provably infallible after them (the emitter peepholes the pair to the one
-`i32.trunc_f64_s`). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
+`as!` can then fail only on range (the emitter drops the integrality compare; see
+"An integral operand's cast tests only the range"). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
 would have been `as?` spelled as a function, a std API bent around the ignored-suffix gap
 (D1041), which is exactly what the 2026-09-01 "design is not bounded by the seed" rule
 forbids.
@@ -4769,8 +4769,9 @@ domain. The REP target decides the conversion opcode and the `i32 | null` box ro
 registers, the DOMAIN decides the range test and the `as!` message. Collapsing them either
 loses the range or registers a `u8|null` box that nothing builds — which is why the canon pass
 that rewrites `n.asTy` to the primitive spelling leaves `u8` alone, and why the emitter's
-`trunc(d) as! i32` peephole declines the `u8` domain (its premise is that the conversion
-instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255).
+`trunc(d) as! i32` peephole declined the `u8` domain (its premise was that the conversion
+instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255; the
+range test that replaced it in SP-056 tests the domain's).
 
 **Grading list.** D1587, and D1583 which it supersedes; the 60-cell trio grid on that row;
 `tests/cases/numerics/as-cast-u8-trio.vl`, `as-cast-u8-trap-range.vl`,
@@ -10063,3 +10064,41 @@ expression, and to a whole cast chain.
 `std/` or `scripts/`, and two in consumers (plumb `~255 as% i64`, sunpa `-2.45 as f32`); each
 means the same value under both groupings. `vl fmt` output is byte-identical under both parsers
 over all 15,413 `.vl` files in the tree; the printer had always emitted `-x as T` bare.
+
+## An integral operand's cast tests only the range (2026-10-09) — sunpa SP-056
+
+**The rule.** When the operand of a numeric cast to an integer is `floor`, `ceil`, `trunc` or
+`nearest` of an f64 or f32 — written directly, or as a `const` that one of them initialises —
+the emitter drops the integrality compare (`trunc(d) == d`) and keeps the range test, in all three
+modes. The value is integral by construction, and NaN and ±Inf still fail the range test. An `as!`
+on such an operand traps with a bare `unreachable`, with no `as! i32 at …: not exact` reason.
+Neither a `let` nor a chain of `const`s is followed (a name in the initialiser would resolve at
+the cast's scope), and a binding, global or function named `floor` declines.
+
+**What it replaced.** For the direct spelling only, a peephole skipped the whole test and relied
+on `i32.trunc_f64_s` trapping out of range. It had two faults. Its shadowing test was weaker than
+the call's: with `const floor = (x: f64): f64 => x + 0.5`, `floor(1.0) as! i32` printed `1`
+instead of trapping (`as-cast-integral-operand-trap-shadowed.vl` fails on master). And it was the
+slower code: on V8, a bare `i32.trunc_f64_s` after `f64.floor` costs more than the same conversion
+behind an explicit range test.
+
+**Measured** (Deno 2.9.6 / V8 15.0, `-O3`; sunpa's `vnoise` kernel, 5M points × 4; median of
+medians of 5–9 interleaved rounds of `run.ts`'s 7, load 15–30):
+
+| `vnoise` lowering | ms | vs Rust |
+| --- | --- | --- |
+| master: integral + range test, message, then trunc | 272–308 | 1.07–1.15x |
+| bare `i32.trunc_f64_s` (the peephole, applied to the `const`) | 298–318 | 1.15–1.2x |
+| bare `i32.trunc_sat_f64_s` | 320 | 1.2x |
+| **range test, then `i32.trunc_f64_s`** | **242–250** | **0.96–0.98x** |
+
+sunpa's game (`src/game.vl` at its `build:vl` flags) is 2,718,883 → 2,728,643 bytes (+0.36%). The
+same rule with the trap reason kept was +2.4%, because the reason is a call per character at
+every site; that is why an integral operand traps bare.
+
+**Rejected: inlining `signed` at `-O3`.** SP-056 also asked why the 10-op leaf `signed` stays a
+call. `-O3` inlines through binaryen's "lightweight" rule (no call, no loop, size ≤ 20), and
+`signed` with `hash` inlined into it measures 29–30, so it stays a call; `-O3` also does not carry
+`-O`'s `--always-inline-max-function-size 16`. Raising the flexible size to 40 inlines it, and on
+V8 the kernel is 4–6% SLOWER (259.8 against 243.7 ms), with or without V8's own wasm inliner;
+the game grows 3.2%. The call is not where the gap was.
