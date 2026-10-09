@@ -1131,6 +1131,10 @@ let nestEscapeMemo: {[i32]: i32} = Map()
 const SUBST_ALL = 0
 const SUBST_DECLARED = 1
 const SUBST_NESTED = 2
+// A call binding only inference holes (a hole lambda's, a hole function's), one of them to a type
+// still holding a type variable: it binds the holes alone, and re-records what it leaves undecided
+// under the enclosing owner (D3893).
+const SUBST_HOLES = 3
 let substNestMode = SUBST_ALL
 let substNestDecl = 0 - 1
 // Argument demands parked on a hole: an argument whose type still rides an unsolved hole is
@@ -42684,7 +42688,11 @@ function validatePrintCstrs(
   while ci < nOrigP {
     if cstrOwnedBy(printCstrFn[ci], calleeFn) {
       const cpt = substTyDeep(printCstrTy[ci], bNames, bTys)
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if cpt != printCstrTy[ci] {
           if tyHasHole(cpt) { notePrintCstr(cpt, printCstrIx[ci]) }
         }
@@ -43233,7 +43241,11 @@ function validateRetCstrs(
       const rw = substTyDeep(retCstrWant[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership
       // — and gates on either side still holding a hole, not just the body side.
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if rg != retCstrGot[ci] || rw != retCstrWant[ci] {
           if tyHasHole(rg) || tyHasHole(rw) {
             noteRetCstr(rg, rw, retCstrIx[ci])
@@ -43287,7 +43299,11 @@ function validateLetCstrs(
       const lw = substTyDeep(letCstrWant[ci], bNames, bTys)
       // Re-records only when the callee is named, for the same ownership reason
       // `validateRetCstrs` gates on; also gated on either side holding a hole.
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if lg != letCstrGot[ci] || lw != letCstrWant[ci] {
           if tyHasHole(lg) || tyHasHole(lw) {
             noteLetCstr(lg, lw, letCstrIx[ci], letCstrName[ci])
@@ -43457,7 +43473,11 @@ function validateBmCstrs(
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
       // Re-records only when the callee is named — an unnamed call cannot reassign
       // ownership of the constraint.
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if bg != bmCstrGot[ci] || bw != bmCstrWant[ci] {
           if tyHasHole(bg) || tyHasHole(bw) {
             noteBmCstr(
@@ -43508,7 +43528,11 @@ function validateUfcsCstrs(
   while ci < nOrigU {
     if cstrOwnedBy(ufcsCstrFn[ci], calleeFn) {
       const ur = substTyDeep(ufcsCstrTy[ci], bNames, bTys)
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if ur != ufcsCstrTy[ci] {
           if tyHasHole(ur) {
             noteUfcsCstr(ur, ufcsCstrProp[ci], ufcsCstrIx[ci], ufcsCstrP0[ci])
@@ -43825,7 +43849,11 @@ function validateMemCstrs(
   while ci < nOrigM {
     if cstrOwnedBy(memCstrFn[ci], calleeFn) {
       const mr = substTyDeep(memCstrTy[ci], bNames, bTys)
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if mr != memCstrTy[ci] {
           if tyHasHole(mr) {
             noteMemCstr(mr, memCstrProp[ci], memCstrIx[ci], memCstrDem[ci])
@@ -44058,7 +44086,11 @@ function validateBinCstrs(
       let crt = substTyDeep(binCstrRt[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
       // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
-      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
         if clt != binCstrLt[ci] || crt != binCstrRt[ci] {
           if tyHasHole(clt) || tyHasHole(crt) {
             noteBinCstr(clt, binCstrOp[ci], crt)
@@ -45386,9 +45418,27 @@ export function tyIsNulStrBoxUnion(ty: i32): boolean {
   lit && nul
 }
 
+// Whether one of `tys` still holds a type variable: a binding that leaves a demand undecided.
+function tysHoldVar(tys: i32[]): boolean {
+  for t in tys {
+    if tyHasTyVar(t) { return true }
+  }
+  false
+}
+
+// Whether every one of `names` is an inference hole's, none a declared type parameter's.
+function namesAllHoles(names: string[]): boolean {
+  if names.length == 0 { return false }
+  for nm in names {
+    if nm == "" || nm[0] != '?' { return false }
+  }
+  true
+}
+
 // Whether the current `substNestMode` binds type-variable row `row`, named `name`. A nested
 // generic its enclosing body names other than as a callee binds by name everywhere (D3853).
 function substBindsNestRow(row: i32, name: string): boolean {
+  if substNestMode == SUBST_HOLES { return name != "" && name[0] == '?' }
   const nd = tvNestOf.get(row) ?? -1
   if nd >= 0 {
     if substNestMode == SUBST_NESTED { return nd == substNestDecl }
@@ -49898,6 +49948,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       substNestDecl = nestCallee
     } else if cstrCallee >= 0 {
       substNestMode = SUBST_DECLARED
+    } else if namesAllHoles(vNames) && tysHoldVar(vTys) {
+      substNestMode = SUBST_HOLES
     } else {
       substNestMode = SUBST_ALL
     }
