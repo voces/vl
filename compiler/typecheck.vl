@@ -4477,6 +4477,9 @@ let luAnnTy: {[i32]: i32} = Map()
 // The delivery sites the function-value adapter rewrote, so a second delivery of one does not
 // wrap the adapter again.
 let fvaDone: {[i32]: boolean} = Map()
+// The function declaration a name delivered as a value resolves to in its own scope, or -1,
+// banked for a deferred re-check, which runs outside that scope (D3918).
+let fvaNameDecl: {[i32]: i32} = Map()
 // D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
 // the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
 // narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
@@ -5588,6 +5591,7 @@ export function initChecker() {
   luDeclPos = Map()
   luAnnTy = Map()
   fvaDone = Map()
+  fvaNameDecl = Map()
   pgVoid = []
   joinHead = []
   joinName = []
@@ -71643,6 +71647,7 @@ function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
 function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  fvaNoteNameDecl(srcExpr)
   if srcTy == dstTy || inferQuiet || monoRecheckDepth > 0 { return false }
   if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
   if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
@@ -71695,7 +71700,7 @@ function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // enclosing generic's, pinned per instance.
   if fvaDone[site] ?? false { return false }
   if tyReachesHole(dt, 8) { return false }
-  if !fvaNamesGeneric(pe) {
+  if !fvaNamesGeneric(pe, parenPeelIx(site)) {
     // A hole is pinned later, where the value's use decides it.
     if fnTyHasHole(srcTy) || tyHasTyVar(srcTy) || tyReachesHole(srcTy, 8) {
       return false
@@ -71725,7 +71730,7 @@ function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // A function declaration or a `const` is stable; any other value is read once, as the
   // argument of an enclosing lambda called in place, so the adapter calls the delivered value
   // rather than what a `let` later holds.
-  const stable = fvaStableName(pe)
+  const stable = fvaStableName(pe, parenPeelIx(site))
   let callee = -1
   let fvParam = -1
   if stable {
@@ -71871,10 +71876,27 @@ function fvaRefuseNested(at: i32, srcTy: i32, dstTy: i32) {
   0
 }
 
-// Whether `n` names a generic function declaration.
-function fvaNamesGeneric(n: Node): boolean {
+// Banks, the first time a name reaches `fvaAdapt`, the declaration it resolves to there.
+function fvaNoteNameDecl(srcExpr: i32) {
+  if srcExpr < 0 { return 0 }
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || fvaNameDecl.has(x) { return 0 }
+  const n = P.nodes[x]
+  if n is Ident { fvaNameDecl.set(x, lookupFnDeclNode(n.identName)) }
+  0
+}
+
+// The function declaration name node `ix` resolves to in its own scope, else in this one.
+function fvaDeclOfName(ix: i32, name: string): i32 {
+  const banked = fvaNameDecl.get(ix) ?? -2
+  if banked != -2 { return banked }
+  lookupFnDeclNode(name)
+}
+
+// Whether `n` (node `ix`) names a generic function declaration.
+function fvaNamesGeneric(n: Node, ix: i32): boolean {
   if n is Ident {
-    const gd = lookupFnDeclNode(n.identName)
+    const gd = fvaDeclOfName(ix, n.identName)
     if gd < 0 { return false }
     const gf = P.nodes[gd]
     if gf is FuncDecl { return gf.fnTyParams.length > 0 }
@@ -71882,11 +71904,11 @@ function fvaNamesGeneric(n: Node): boolean {
   false
 }
 
-// Whether `n` names a binding the adapter may read at call time: a function declaration or a
-// `const`, neither of which a later statement can rebind.
-function fvaStableName(n: Node): boolean {
+// Whether `n` (node `ix`) names a binding the adapter may read at call time: a function
+// declaration or a `const`, neither of which a later statement can rebind.
+function fvaStableName(n: Node, ix: i32): boolean {
   if n is Ident {
-    if lookupFnDeclNode(n.identName) >= 0 { return true }
+    if fvaDeclOfName(ix, n.identName) >= 0 { return true }
     return isConstName(n.identName)
   }
   false
