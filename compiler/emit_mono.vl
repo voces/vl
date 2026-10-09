@@ -16,6 +16,9 @@ import {
   arrElemIs,
   arrElemNameRaw,
   arrElemSuffixed,
+  gaeArgsTextOf,
+  gaeHeadNameOf,
+  gaeLtAt,
   listElemNameOf,
   nameIsArray,
   nameIsBraceSpanEnds,
@@ -46,6 +49,7 @@ import {
   cUserTypes,
   canonEmitName,
   collectValuedReturns,
+  declAnnRawTyName,
   flatConstOfNameProp,
   flattenVariantsInto,
   fnResultUnconsumed,
@@ -234,6 +238,8 @@ import {
   annObjFieldSplit,
   annRetNameOf,
   drwDispatchOp,
+  gaeApplyFieldTy,
+  gaeSplitArgs,
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
@@ -6672,6 +6678,17 @@ function monoCloneGenericCallsRaw(ix: i32) {
     if !ochanged { return ix }
     return mkObjLit(fl, n.pos)
   }
+  // A generic function read as a value (a list element, a field, a binding) is renamed to
+  // its instance per enclosing instance, so it gets its own node, typed at this instance (D3909).
+  if n is Ident {
+    if monoCalleeIsGeneric(ix) {
+      const vi = mkIdent(n.identName, n.pos)
+      lfNoteMinted(vi, ix)
+      const vt = monoLamCallTy(nodeTyIxOf(ix))
+      if vt >= 0 { nodeTyRecord(vi, vt) }
+      return vi
+    }
+  }
   ix
 }
 
@@ -9136,7 +9153,68 @@ function monoStructFieldTypes(
     }
     i = i + 1
   }
+  if annGenAppSpanEnds(tname) {
+    if monoGenAliasFieldTypes(tname, outNames, outTexts) { return true }
+  }
   annObjFieldSplit(tname, outNames, outTexts) == 1
+}
+
+// `monoStructFieldTypes` for a generic alias applied at `app` (`R<string>`): each field's
+// declared type with the alias's parameters replaced by the application's arguments. False
+// when no generic `TypeDecl` has that head, or the arity differs (D3909).
+function monoGenAliasFieldTypes(
+  app: string,
+  outNames: string[],
+  outTexts: string[],
+): boolean {
+  const lt = gaeLtAt(app)
+  const head = gaeHeadNameOf(app, lt)
+  const args: string[] = []
+  gaeSplitArgs(gaeArgsTextOf(app, lt), args)
+  let i = 0
+  while i < monoProgStmts.length {
+    const s = P.nodes[monoProgStmts[i]]
+    if s is TypeDecl {
+      if annGenAppSpanEnds(s.tdName) {
+        const dlt = gaeLtAt(s.tdName)
+        if gaeHeadNameOf(s.tdName, dlt) == head {
+          const pnames: string[] = []
+          gaeSplitArgs(gaeArgsTextOf(s.tdName, dlt), pnames)
+          if pnames.length != args.length { return false }
+          monoGenAliasFieldsInto(s.tdFields, pnames, args, outNames, outTexts)
+          return true
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The `FieldDef`s `fs` of a generic alias into `outNames` / `outTexts`, each type read at
+// its declared spelling and substituted at `pnames := args`.
+function monoGenAliasFieldsInto(
+  fs: i32[],
+  pnames: string[],
+  args: string[],
+  outNames: string[],
+  outTexts: string[],
+) {
+  let j = 0
+  while j < fs.length {
+    const fd = P.nodes[fs[j]]
+    if fd is FieldDef {
+      let raw = ""
+      if fd.fdType >= 0 {
+        raw = declAnnRawTyName(fd.fdType)
+        if raw == "" { raw = tyNameOf(fd.fdType) }
+      }
+      outNames.push(fd.fdName)
+      outTexts.push(gaeApplyFieldTy(raw, pnames, args))
+    }
+    j = j + 1
+  }
+  0
 }
 
 // The `fnStmts` slot of the function an `Ident` names — the one resolver every question
@@ -9197,7 +9275,7 @@ function monoCoerceFnValueName(
     return 0
   }
   if e is ArrayLit {
-    if nameIsClosureArray(tname) {
+    if nameIsClosureArray(tname) || monoArrElemHoldsFn(tname) {
       // The `[]` cut stays raw here rather than `listElemNameOf`, whose naive paren
       // strip would mangle a non-wrapped function-type element (`(i32)=>(i32)` →
       // `i32)=>(i32`). `nameIsClosureArray` implies `nameIsArray`.
@@ -10830,6 +10908,14 @@ function monoWalk(ix: i32, ctx: i32) {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
         }
       }
+      // A store into an element or a field of a local binding delivers at that slot's type as
+      // this instance spells it (D3909).
+      if tgt is Index || tgt is Member {
+        const sn = monoStoreAnnName(n.binLeft, ctx, 0)
+        if sn != "" {
+          if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
+        }
+      }
       // An element store into a list or map of functions delivers at the element's type (D3867,
       // D3881).
       if tgt is Index {
@@ -11293,6 +11379,13 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
     return monoNoteBindDeliveryAt(n.callArgs[1], vt, ctx)
   }
   if cf.memProp != "push" { return 0 }
+  const ln = monoStoreAnnName(cf.memObj, ctx, 0)
+  if nameIsArray(ln) {
+    const en = normTypeAtom(arrElemNameRaw(ln))
+    for pa in n.callArgs {
+      if monoCoerceFnValueName(pa, en, ctx, -1) < 0 { return -1 }
+    }
+  }
   const lt = nodeTyIxOf(cf.memObj)
   if lt < 0 || lt >= T.tys.length || !(T.tys[lt] is TyArray) { return 0 }
   const et = monoConcreteFnTyName(tyArrayElemIx(lt))
@@ -11301,6 +11394,67 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
     if monoNoteBindDeliveryAt(a, et, ctx) < 0 { return -1 }
   }
   0
+}
+
+// The type name a store into `e` (`fs[0]`, `r.f`, `fs[1][0]`) delivers at: the annotation of
+// the local binding at its root as this instance spells it, read down each index and field;
+// "" when the root is no annotated local of `ctx`.
+function monoStoreAnnName(e: i32, ctx: i32, depth: i32): string {
+  if e < 0 || ctx < 0 || depth > 16 { return "" }
+  const x = unwrapParen(e)
+  if x < 0 { return "" }
+  const n = P.nodes[x]
+  if n is Index {
+    const an = monoStoreAnnName(n.idxArr, ctx, depth + 1)
+    if !nameIsArray(an) { return "" }
+    return normTypeAtom(arrElemNameRaw(an))
+  }
+  if n is Member {
+    return monoFieldAnnName(
+      monoStoreAnnName(n.memObj, ctx, depth + 1),
+      n.memProp,
+    )
+  }
+  monoLocalAnnName(x, ctx)
+}
+
+// The annotation name of the local of `ctx` that `Ident` `x` reads, as this instance spells
+// it; "" for any other expression, or a local with no annotation.
+function monoLocalAnnName(x: i32, ctx: i32): string {
+  if x < 0 || ctx < 0 { return "" }
+  const n = P.nodes[x]
+  if !(n is Ident) { return "" }
+  const cf = P.nodes[ctx]
+  if !(cf is FuncDecl) { return "" }
+  const li = parentLetOfAt(cf.fnBody, sidOfNode(x), x)
+  if li < 0 { return "" }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letType >= 0 { return tyNameOf(d.letType) }
+  }
+  ""
+}
+
+// The type name of field `prop` of the record type `tname` names, or "".
+function monoFieldAnnName(tname: string, prop: string): string {
+  if tname == "" { return "" }
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  if !monoStructFieldTypes(normTypeAtom(tname), fnames, ftexts) { return "" }
+  let k = 0
+  while k < fnames.length && k < ftexts.length {
+    if fnames[k] == prop { return normTypeAtom(ftexts[k]) }
+    k = k + 1
+  }
+  ""
+}
+
+// Whether list type `tname`'s element can hold a function value a level down: a list or a
+// record, whose literal elements are then coerced at the element type too.
+function monoArrElemHoldsFn(tname: string): boolean {
+  if !nameIsArray(tname) { return false }
+  const en = normTypeAtom(arrElemNameRaw(tname))
+  nameIsArray(en) || annGenAppSpanEnds(en) || nameIsBraceSpanEnds(en)
 }
 
 // The value type of map type `ty`, or -1 for any other type.
