@@ -5705,6 +5705,69 @@ function monoLamBoundNames(ix: i32, out: string[]) {
   0
 }
 
+// Renames the initializer of `const alias = tpl`, read at `at` in frame `ctx`, to instance
+// `inst`, so the alias's value is a closure over this frame's captures. The calls through the
+// alias are renamed to their own instances; the first one names the value.
+function monoRenameGenAliasInit(
+  alias: string,
+  at: i32,
+  ctx: i32,
+  tpl: string,
+  inst: string,
+) {
+  const lf = monoLetFrameOf(alias, at, ctx)
+  if lf[1] < 0 { return 0 }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letInit < 0 { return 0 }
+  if (d.letKw != "const" && monoNameIsAssigned(alias)) || d.letType >= 0 {
+    return 0
+  }
+  const iv = P.nodes[d.letInit]
+  if !(iv is Ident) || iv.identName != tpl { return 0 }
+  collectANoteIdentRename(iv.identName)
+  iv.identName = inst
+  monoArenaTouch()
+  sidNoteNodeName(d.letInit)
+  0
+}
+
+// The names instance body `body` binds once, by an un-annotated binding never written, to a generic function
+// read by name: a call through one is renamed to the instance it reaches, which must be this
+// instance's own copy of the call (D3887).
+let monoCgcGenAliasNames: string[] = []
+
+function monoInstGenAliasNames(body: i32): string[] {
+  const bn: string[] = []
+  const bc: i32[] = []
+  monoBinderCounts(body, bn, bc)
+  const out: string[] = []
+  const stack: i32[] = [body]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const d = P.nodes[ix]
+      if d is LetDecl {
+        if (
+          (d.letKw == "const" || !monoNameIsAssigned(d.letName))
+          && d.letType < 0
+          && d.letInit >= 0
+          && P.nodes[d.letInit] is Ident
+          && monoCalleeIsGeneric(d.letInit)
+          && monoBinderCount(bn, bc, d.letName) <= 1
+          && !monoStrListHas(out, d.letName)
+        ) {
+          out.push(d.letName)
+        }
+      }
+      // A nested function's body is its own instance's, copied there.
+      if !(d is FuncDecl) || ix == body {
+        for k in nodeChildren(ix) { stack.push(k) }
+      }
+    }
+  }
+  out
+}
+
 // The lambda names whose calls instance body `body` copies: the module's and its own, less
 // any name the body binds twice or shadows. A copied call is a node with no source position,
 // so a name that needs one to pick its binding keeps its calls shared, as before.
@@ -6319,6 +6382,10 @@ function monoCloneGenericCallsRaw(ix: i32) {
       if monoCalleeIsGeneric(n.callFn) {
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
+      } else if monoStrListHas(monoCgcGenAliasNames, callee.identName) {
+        // A call through a `const` alias of a generic function is renamed per instance too.
+        newCallee = mkIdent(callee.identName, callee.pos)
+        lfNoteMinted(newCallee, n.callFn)
       } else if monoStrListHas(monoCgcLamNames, callee.identName) {
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
@@ -6365,7 +6432,19 @@ function monoCloneGenericCallsRaw(ix: i32) {
     return mkBlock(ns, n.pos)
   }
   if n is LetDecl {
-    const ci = monoCloneGenericCalls(n.letInit)
+    let ci = monoCloneGenericCalls(n.letInit)
+    // The alias's read of the generic is this instance's own, renamed with its calls (D3887).
+    if (
+      ci == n.letInit
+      && n.letInit >= 0
+      && monoStrListHas(monoCgcGenAliasNames, n.letName)
+    ) {
+      const iv = P.nodes[n.letInit]
+      if iv is Ident {
+        ci = mkIdent(iv.identName, iv.pos)
+        lfNoteMinted(ci, n.letInit)
+      }
+    }
     if ci == n.letInit { return ix }
     return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
   }
@@ -8553,6 +8632,7 @@ function monoMakeInstanceGo(
     monoLamCloneSlots = []
     monoInstIsFirst = first
     monoCgcLamNames = monoInstLamNames(instBody0)
+    monoCgcGenAliasNames = monoInstGenAliasNames(instBody0)
     monoPinUnsafeNames = Map()
     monoPinRetBox = false
     if fn.fnRet < 0 && nret >= 0 {
@@ -8740,6 +8820,23 @@ function monoMakeInstanceGo(
       if mlsWrote { invalidateFnChildIndex() }
       monoLamMintedSlots = []
       const cal2 = P.nodes[calleeIx]
+      // A call through a `const` alias of a capturing nested generic, keyed on its frame: the
+      // alias's own value is that instance's closure, whose env holds this frame's captures.
+      if (
+        cal2 is Ident
+        && callFrame >= 0
+        && callFrame < fnStmts.length
+        && cal2.identName != fn.fnName
+      ) {
+        const actx = fnStmts[callFrame]
+        monoRenameGenAliasInit(
+          cal2.identName,
+          calleeIx,
+          actx,
+          fn.fnName,
+          instName,
+        )
+      }
       // R4 writer 6 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
       if cal2 is Ident && !i32ListHas(monoNoRename, calleeIx) {
         collectANoteIdentRename(cal2.identName)
@@ -10511,6 +10608,12 @@ function monoWalk(ix: i32, ctx: i32) {
         // to the lifted slot and monomorphize per call site. Named functions only, and
         // re-read rather than reused from `dfe`, the coercion loop between having run.
         let afe = identClosureFeAt(sidOfNode(n.callFn), ctx, n.callFn)
+        // An alias renamed to one frame instance of a generic still calls the generic: each
+        // call through it takes its own instance (D3887).
+        if afe >= 0 && afe < fnInstOrigin.length && fnInstOrigin[afe] >= 0 {
+          const ao = fnInstOrigin[afe]
+          if ao < monoGen.length && monoGen[ao] == 1 { afe = ao }
+        }
         // The initializer's lambda, which a reassigned binding need not hold at this call: the
         // call keeps its `call_ref` and only the lambda is pinned (D3849, D3858).
         if afe >= 0 && monoNameIsAssigned(callee.identName) {
