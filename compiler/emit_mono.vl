@@ -10473,6 +10473,7 @@ function monoWalk(ix: i32, ctx: i32) {
       if monoWalk(args[i], ctx) < 0 { return -1 }
       i = i + 1
     }
+    if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
     const callee = P.nodes[n.callFn]
     if callee is Ident {
       // A generic function value passed as an argument to a concrete function-typed
@@ -10626,6 +10627,13 @@ function monoWalk(ix: i32, ctx: i32) {
         const atn = identFnTypeAnnName(tgt.identName, ctx)
         if atn != "" {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
+        }
+      }
+      // An element store into a list of functions delivers at the element's type (D3867).
+      if tgt is Index {
+        const et = monoConcreteFnTyName(nodeTyIxOf(n.binLeft))
+        if et != "" {
+          if monoNoteBindDeliveryAt(n.binRight, et, ctx) < 0 { return -1 }
         }
       }
     }
@@ -11024,12 +11032,19 @@ function monoNoteBindCall(name: string, at: i32, ctx: i32) {
 // A binding read at `at` in frame `ctx` and delivered where annotation `tyNode` is a function
 // type with concrete parameters is called at that signature by whoever receives it (D3862).
 function monoNoteBindDelivery(at: i32, tyNode: i32, ctx: i32) {
-  if tyNode < 0 || at < 0 { return 0 }
+  if tyNode < 0 { return 0 }
+  monoNoteBindDeliveryAt(at, tyNameOf(tyNode), ctx)
+}
+
+// `monoNoteBindDelivery` at the function type spelled `ann`: a list's element type, for a
+// `push` or an element store, has a type and no annotation node (D3867).
+function monoNoteBindDeliveryAt(at: i32, ann: string, ctx: i32) {
+  if at < 0 { return 0 }
   let name = monoIdentNameOf(at)
   if name == "" { name = monoCellReadName(at) }
   if name == "" { return 0 }
   const parts: string[] = []
-  if annFnDecompose(tyNameOf(tyNode), parts) == "" { return 0 }
+  if annFnDecompose(ann, parts) == "" { return 0 }
   let sig = ""
   for pt in parts {
     if pt == "" { return 0 }
@@ -11048,8 +11063,40 @@ function monoNoteBindDelivery(at: i32, tyNode: i32, ctx: i32) {
     if monoInstanceFor(fe, monoSigPins(sig + ";"), fnStmts[fe], -1) < 0 {
       return -1
     }
+  } else if (
+    fe >= 0
+    && fe < monoGen.length
+    && monoGen[fe] == 1
+    && !monoSigListHas(monoLamInstSigs(fe), sig + ";")
+    && monoWriteNamesLam(at, fe, ctx)
+  ) {
+    // One pinned at another signature: the delivered name takes an instance at this one (D3867).
+    if monoInstanceFor(fe, monoSigPins(sig + ";"), at, -1) < 0 { return -1 }
   }
   monoNoteBindSig(name, at, ctx, sig + ";")
+}
+
+// Each argument of `xs.push(…)` on a list of functions is delivered at the element's type (D3867).
+function monoNotePushDeliveries(n: Call, ctx: i32) {
+  const cf = P.nodes[n.callFn]
+  if !(cf is Member) { return 0 }
+  if cf.memProp != "push" { return 0 }
+  const lt = nodeTyIxOf(cf.memObj)
+  if lt < 0 || lt >= T.tys.length || !(T.tys[lt] is TyArray) { return 0 }
+  const et = monoConcreteFnTyName(tyArrayElemIx(lt))
+  if et == "" { return 0 }
+  for a in n.callArgs {
+    if monoNoteBindDeliveryAt(a, et, ctx) < 0 { return -1 }
+  }
+  0
+}
+
+// The spelling of `ty` when it is a function type with no hole, else "".
+function monoConcreteFnTyName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyFunc) || tyHasTyVar(ty) {
+    return ""
+  }
+  tyToEmitName(ty)
 }
 
 // The name nodes `monoNoteBindDelivery` recorded: each is a call of what it reads.
