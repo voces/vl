@@ -379,6 +379,7 @@ import {
   loopVarArgPinTyOf,
   monoExactSubRowOf,
   monoRetRowName,
+  nestedFnDeclaredIn,
   nodeMapArmNominalName,
   nominalizeFnTypeOfTy,
   pinKindOfName,
@@ -5707,6 +5708,61 @@ function monoLamBoundNames(ix: i32, out: string[]) {
   0
 }
 
+// Whether `name`, read in frame `fx`, is a parameter of `fx` or of a frame enclosing it before a
+// frame that declares a nested function of that name.
+function monoNameIsParamOnChain(name: string, fx: i32): boolean {
+  let f = fx
+  let guard = 0
+  while f >= 0 && f < P.nodes.length && guard <= fnStmts.length {
+    if monoFnBindsParam(f, name) { return true }
+    const slot = fnStmtsPosOf(f)
+    if slot < 0 || slot >= fnParent.length { return false }
+    if nestedFnDeclaredIn(name, slot) >= 0 { return false }
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return false }
+    f = fnStmts[ps]
+    guard = guard + 1
+  }
+  false
+}
+
+// The generic function a chain of un-annotated, never-written aliases read at `at` in frame `ctx`
+// ends at by name (`const k = inner; const j = k`), as a slot; -1 for any other chain.
+function monoGenFnAliasChainFe(name: string, at: i32, ctx: i32): i32 {
+  let nm = name
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    const lf = monoLetFrameOf(nm, ax, fr)
+    if lf[1] < 0 { return -1 }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return -1 }
+    if d.letKw != "const" && monoNameIsAssigned(nm) { return -1 }
+    const iv = P.nodes[d.letInit]
+    if !(iv is Ident) { return -1 }
+    let fx = ctx
+    if lf[0] >= 0 { fx = lf[0] }
+    // A parameter of that name, a lambda's included, is the value the alias copies.
+    if monoNameIsParamOnChain(iv.identName, fx) { return -1 }
+    const fe = fnIndexOfInScopeAt(
+      sidOfNode(d.letInit),
+      iv.identName,
+      fx,
+      d.letInit,
+    )
+    if fe >= 0 {
+      if hops == 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
+      return fe
+    }
+    nm = iv.identName
+    ax = d.letInit
+    fr = lf[0]
+    hops = hops + 1
+  }
+  -1
+}
+
 // Renames the initializer of `const alias = tpl`, read at `at` in frame `ctx`, to instance
 // `inst`, so the alias's value is a closure over this frame's captures. The calls through the
 // alias are renamed to their own instances; the first one names the value.
@@ -5725,7 +5781,12 @@ function monoRenameGenAliasInit(
     return 0
   }
   const iv = P.nodes[d.letInit]
-  if !(iv is Ident) || iv.identName != tpl { return 0 }
+  if !(iv is Ident) { return 0 }
+  // An alias of an alias renames the link that names the generic (D3894).
+  if iv.identName != tpl {
+    if iv.identName == alias { return 0 }
+    return monoRenameGenAliasInit(iv.identName, d.letInit, ctx, tpl, inst)
+  }
   collectANoteIdentRename(iv.identName)
   iv.identName = inst
   monoArenaTouch()
@@ -5743,29 +5804,38 @@ function monoInstGenAliasNames(body: i32): string[] {
   const bc: i32[] = []
   monoBinderCounts(body, bn, bc)
   const out: string[] = []
-  const stack: i32[] = [body]
-  while stack.length > 0 {
-    const ix = stack.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const d = P.nodes[ix]
-      if d is LetDecl {
-        if (
-          (d.letKw == "const" || !monoNameIsAssigned(d.letName))
-          && d.letType < 0
-          && d.letInit >= 0
-          && P.nodes[d.letInit] is Ident
-          && monoCalleeIsGeneric(d.letInit)
-          && monoBinderCount(bn, bc, d.letName) <= 1
-          && !monoStrListHas(out, d.letName)
-        ) {
-          out.push(d.letName)
+  // An alias of an alias is found once its target is, so a pass that adds a name runs again.
+  let grew = true
+  let pass = 0
+  while grew && pass < MONO_ALIAS_CHAIN_MAX {
+    grew = false
+    const stack: i32[] = [body]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      if ix >= 0 && ix < P.nodes.length {
+        const d = P.nodes[ix]
+        if d is LetDecl {
+          if (
+            (d.letKw == "const" || !monoNameIsAssigned(d.letName))
+            && d.letType < 0
+            && d.letInit >= 0
+            && P.nodes[d.letInit] is Ident
+            && (monoCalleeIsGeneric(d.letInit)
+              || monoStrListHas(out, monoIdentNameOf(d.letInit)))
+            && monoBinderCount(bn, bc, d.letName) <= 1
+            && !monoStrListHas(out, d.letName)
+          ) {
+            out.push(d.letName)
+            grew = true
+          }
+        }
+        // A nested function's body is its own instance's, copied there.
+        if !(d is FuncDecl) || ix == body {
+          for k in nodeChildren(ix) { stack.push(k) }
         }
       }
-      // A nested function's body is its own instance's, copied there.
-      if !(d is FuncDecl) || ix == body {
-        for k in nodeChildren(ix) { stack.push(k) }
-      }
     }
+    pass = pass + 1
   }
   out
 }
@@ -6385,7 +6455,8 @@ function monoCloneGenericCallsRaw(ix: i32) {
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
       } else if monoStrListHas(monoCgcGenAliasNames, callee.identName) {
-        // A call through a `const` alias of a generic function is renamed per instance too.
+        // A call through an alias never written (`const`, or an unwritten `let`) of a generic
+        // function is renamed per instance too.
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
       } else if monoStrListHas(monoCgcLamNames, callee.identName) {
@@ -8822,8 +8893,8 @@ function monoMakeInstanceGo(
       if mlsWrote { invalidateFnChildIndex() }
       monoLamMintedSlots = []
       const cal2 = P.nodes[calleeIx]
-      // A call through a `const` alias of a capturing nested generic, keyed on its frame: the
-      // alias's own value is that instance's closure, whose env holds this frame's captures.
+      // A call through a never-written alias of a capturing nested generic, keyed on its frame:
+      // the alias's own value is that instance's closure, whose env holds this frame's captures.
       if (
         cal2 is Ident
         && callFrame >= 0
@@ -10622,6 +10693,10 @@ function monoWalk(ix: i32, ctx: i32) {
           monoNoRename.push(n.callFn)
         }
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
+        // A chain of aliases ending at a generic function by name is a call to it (D3894).
+        if afe < 0 {
+          afe = monoGenFnAliasChainFe(callee.identName, n.callFn, ctx)
+        }
         if afe < 0 {
           afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx)
           // The call would be re-spelled to the lambda's own name, which a parameter or local
