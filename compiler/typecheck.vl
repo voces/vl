@@ -1117,6 +1117,22 @@ let holePinSet: {[string]: i32[]} = Map()
 // The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
 // call their variable `T` cannot poison each other's row.
 let tyVarOwner: {[i32]: string} = Map()
+// The declaration node of each type-parameter row of a generic nested in another function.
+// Bindings are by name, so a substitution binds a nested row only at that generic's own calls
+// (`substTyDeep`, D3853).
+let tvNestOf: {[i32]: i32} = Map()
+// Each such nested generic's enclosing declaration node, and whether that body names the
+// generic other than as a callee (1) or not (0), found on first use.
+let nestParentOf: {[i32]: i32} = Map()
+let nestEscapeMemo: {[i32]: i32} = Map()
+// `substTyDeep`'s reach over nested rows: `SUBST_ALL` binds every row by name;
+// `SUBST_DECLARED`, a declared callee's pin, leaves them unbound; `SUBST_NESTED`, a call to the
+// nested generic `substNestDecl`, binds its rows and leaves the others unbound.
+const SUBST_ALL = 0
+const SUBST_DECLARED = 1
+const SUBST_NESTED = 2
+let substNestMode = SUBST_ALL
+let substNestDecl = 0 - 1
 // Argument demands parked on a hole: an argument whose type still rides an unsolved hole is
 // assignable to anything, so the comparison a concrete parameter deserves cannot be answered
 // where it is asked. Each row is re-asked as the hole takes a pin (D1821). `argPinDone` marks
@@ -5472,6 +5488,11 @@ export function initChecker() {
   solvedParamTys = Map()
   holePinSet = Map()
   tyVarOwner = Map()
+  tvNestOf = Map()
+  nestParentOf = Map()
+  nestEscapeMemo = Map()
+  substNestMode = SUBST_ALL
+  substNestDecl = -1
   argPinWant = []
   argPinGot = []
   argPinNode = []
@@ -26610,6 +26631,13 @@ function tyEqGo(a: i32, b: i32) {
         // An inference hole renders `_` regardless of its internal name, except to a caller
         // asking for the same holes (`tyEqSameHoles`).
         if ta.tvName[0] == '?' && !tyEqHolesExact { return tb.tvName[0] == '?' }
+        // Two declarations' parameters of one name substitute apart.
+        if (
+          tyEqHolesExact
+          && (tvNestOf.get(a) ?? -1) != (tvNestOf.get(b) ?? -1)
+        ) {
+          return false
+        }
         return ta.tvName == tb.tvName
       }
       return false
@@ -42656,7 +42684,7 @@ function validatePrintCstrs(
   while ci < nOrigP {
     if cstrOwnedBy(printCstrFn[ci], calleeFn) {
       const cpt = substTyDeep(printCstrTy[ci], bNames, bTys)
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if cpt != printCstrTy[ci] {
           if tyHasHole(cpt) { notePrintCstr(cpt, printCstrIx[ci]) }
         }
@@ -43205,7 +43233,7 @@ function validateRetCstrs(
       const rw = substTyDeep(retCstrWant[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership
       // — and gates on either side still holding a hole, not just the body side.
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if rg != retCstrGot[ci] || rw != retCstrWant[ci] {
           if tyHasHole(rg) || tyHasHole(rw) {
             noteRetCstr(rg, rw, retCstrIx[ci])
@@ -43259,7 +43287,7 @@ function validateLetCstrs(
       const lw = substTyDeep(letCstrWant[ci], bNames, bTys)
       // Re-records only when the callee is named, for the same ownership reason
       // `validateRetCstrs` gates on; also gated on either side holding a hole.
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if lg != letCstrGot[ci] || lw != letCstrWant[ci] {
           if tyHasHole(lg) || tyHasHole(lw) {
             noteLetCstr(lg, lw, letCstrIx[ci], letCstrName[ci])
@@ -43429,7 +43457,7 @@ function validateBmCstrs(
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
       // Re-records only when the callee is named — an unnamed call cannot reassign
       // ownership of the constraint.
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if bg != bmCstrGot[ci] || bw != bmCstrWant[ci] {
           if tyHasHole(bg) || tyHasHole(bw) {
             noteBmCstr(
@@ -43480,7 +43508,7 @@ function validateUfcsCstrs(
   while ci < nOrigU {
     if cstrOwnedBy(ufcsCstrFn[ci], calleeFn) {
       const ur = substTyDeep(ufcsCstrTy[ci], bNames, bTys)
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if ur != ufcsCstrTy[ci] {
           if tyHasHole(ur) {
             noteUfcsCstr(ur, ufcsCstrProp[ci], ufcsCstrIx[ci], ufcsCstrP0[ci])
@@ -43797,7 +43825,7 @@ function validateMemCstrs(
   while ci < nOrigM {
     if cstrOwnedBy(memCstrFn[ci], calleeFn) {
       const mr = substTyDeep(memCstrTy[ci], bNames, bTys)
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if mr != memCstrTy[ci] {
           if tyHasHole(mr) {
             noteMemCstr(mr, memCstrProp[ci], memCstrIx[ci], memCstrDem[ci])
@@ -44030,7 +44058,7 @@ function validateBinCstrs(
       let crt = substTyDeep(binCstrRt[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
       // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
-      if calleeFn >= 0 {
+      if calleeFn >= 0 || substNestMode == SUBST_NESTED {
         if clt != binCstrLt[ci] || crt != binCstrRt[ci] {
           if tyHasHole(clt) || tyHasHole(crt) {
             noteBinCstr(clt, binCstrOp[ci], crt)
@@ -45358,6 +45386,139 @@ export function tyIsNulStrBoxUnion(ty: i32): boolean {
   lit && nul
 }
 
+// Whether the current `substNestMode` binds type-variable row `row`, named `name`. A nested
+// generic its enclosing body names other than as a callee binds by name everywhere (D3853).
+function substBindsNestRow(row: i32, name: string): boolean {
+  const nd = tvNestOf.get(row) ?? -1
+  if nd >= 0 {
+    if substNestMode == SUBST_NESTED { return nd == substNestDecl }
+    return nestEscapes(nd)
+  }
+  if substNestMode != SUBST_NESTED || name == "" || name[0] == '?' {
+    return true
+  }
+  // An unmarked parameter row is another declaration's: the callee's own rows are all marked.
+  false
+}
+
+// Whether nested generic `nd`'s enclosing body reads its name anywhere but as a callee.
+function nestEscapes(nd: i32): boolean {
+  const memo = nestEscapeMemo.get(nd) ?? -1
+  if memo >= 0 { return memo == 1 }
+  let esc = true
+  let known = true
+  const par = nestParentOf.get(nd) ?? -1
+  const f = P.nodes[nd]
+  if par >= 0 && par < P.nodes.length && f is FuncDecl {
+    const pf = P.nodes[par]
+    if pf is FuncDecl {
+      esc = false
+      const callees: {[i32]: i32} = Map()
+      const stack: i32[] = [pf.fnBody]
+      while stack.length > 0 && !esc {
+        const ix = stack.pop() ?? -1
+        if ix >= 0 && ix < P.nodes.length {
+          const nn = P.nodes[ix]
+          if nn is Call { callees.set(nn.callFn, 1) }
+          // A read of the name that is the declaration, by its type: a parameter or loop
+          // variable of the same name is another binding. An unchecked read counts.
+          if identNameAt(ix) == f.fnName && !callees.has(ix) {
+            const it = nodeTyIxOf(ix)
+            if it < 0 {
+              esc = true
+              known = false
+            } else if nestTyHas(it, nd, 0) {
+              esc = true
+            }
+          }
+          for k in nodeChildren(ix) { stack.push(k) }
+        }
+      }
+    }
+  }
+  if known {
+    if esc { nestEscapeMemo.set(nd, 1) } else { nestEscapeMemo.set(nd, 0) }
+  }
+  esc
+}
+
+// Marks the rows of `ty` naming one of `tps`, nested generic `decl`'s own parameters.
+function markNestRows(ty: i32, tps: string[], decl: i32, depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return 0 }
+  const t = T.tys[ty]
+  match t {
+    TyVar => {
+      if strListHas(tps, t.tvName) && !tvNestOf.has(ty) {
+        tvNestOf.set(ty, decl)
+      }
+    }
+    TyArray => {
+      markNestRows(t.aElem, tps, decl, depth + 1)
+    }
+    TyNullable => {
+      markNestRows(t.nInner, tps, decl, depth + 1)
+    }
+    TyMap => {
+      markNestRows(t.mKey, tps, decl, depth + 1)
+      markNestRows(t.mVal, tps, decl, depth + 1)
+    }
+    TyObj => {
+      for ft in t.objFieldTypes { markNestRows(ft, tps, decl, depth + 1) }
+    }
+    TyFunc => {
+      for pt in t.fnParamTypes { markNestRows(pt, tps, decl, depth + 1) }
+      markNestRows(t.fnRet, tps, decl, depth + 1)
+    }
+    TyUnion => {
+      for m in t.uMembers { markNestRows(m, tps, decl, depth + 1) }
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {}
+  }
+  0
+}
+
+// Whether `ty` holds a type-parameter row of nested generic `nd`.
+function nestTyHas(ty: i32, nd: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyVar => {
+      return (tvNestOf.get(ty) ?? -1) == nd
+    }
+    TyArray => {
+      return nestTyHas(t.aElem, nd, depth + 1)
+    }
+    TyNullable => {
+      return nestTyHas(t.nInner, nd, depth + 1)
+    }
+    TyMap => {
+      return nestTyHas(t.mKey, nd, depth + 1)
+        || nestTyHas(t.mVal, nd, depth + 1)
+    }
+    TyObj => {
+      for ft in t.objFieldTypes {
+        if nestTyHas(ft, nd, depth + 1) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      for pt in t.fnParamTypes {
+        if nestTyHas(pt, nd, depth + 1) { return true }
+      }
+      return nestTyHas(t.fnRet, nd, depth + 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if nestTyHas(m, nd, depth + 1) { return true }
+      }
+      return false
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
 // derived return hole collapses to the pinned function's return. Composites rebuild only when
 // a child actually changed, so a concrete type keeps its arena identity (and the in-place
@@ -45366,6 +45527,9 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   if tyIx < 0 || bNames.length == 0 { return tyIx }
   const t = T.tys[tyIx]
   if t is TyVar {
+    if substNestMode != SUBST_ALL && !substBindsNestRow(tyIx, t.tvName) {
+      return tyIx
+    }
     const b = substHoleTy(tyIx, bNames, bTys)
     if b >= 0 { return b }
     return tyIx
@@ -49707,6 +49871,26 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const dhArgNo: i32[] = []
     const dhArgNode: i32[] = []
     holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
+    const modeWas = substNestMode
+    const declWas = substNestDecl
+    let nestCallee = -1
+    if cfn is Ident {
+      // The declaration the callee names, directly or through an alias.
+      nestCallee = lookupFnDeclNode(cfn.identName)
+      if nestCallee < 0 { nestCallee = lookupFnAliasNode(cfn.identName) }
+      if !nestParentOf.has(nestCallee) { nestCallee = -1 }
+    }
+    if nestCallee >= 0 {
+      // A nested generic, named directly or through an alias, owns no constraint: they are its
+      // enclosing function's, and a top-level function of the same name is another declaration.
+      cstrCallee = CSTR_NODECL
+      substNestMode = SUBST_NESTED
+      substNestDecl = nestCallee
+    } else if cstrCallee >= 0 {
+      substNestMode = SUBST_DECLARED
+    } else {
+      substNestMode = SUBST_ALL
+    }
     pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
     validateBinCstrs(
       vNames,
@@ -49754,6 +49938,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
     validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateRcwPins(vNames, vTys, cstrCallee)
+    substNestMode = modeWas
+    substNestDecl = declWas
     // Not a validation: the `??` result holes are substituted here for their BANK, which is
     // the only route the emitter has to the type this call gave the expression (D1702).
     if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
@@ -53133,6 +53319,15 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     // hoist does, so a self-call resolves and `finishInferredReturn` patches this binding.
     declare(n.fnName, mkFuncTy(paramTys, -2))
   }
+  // A generic nested in another function owns its parameter rows (D3853).
+  const nestedDecl = n.fnName != ""
+    && n.fnTyParams.length > 0
+    && (fnDeclIx[n.fnName] ?? -1) != fnIx
+  if nestedDecl {
+    nestParentOf.set(fnIx, curFnDeclIx)
+    for pt in paramTys { markNestRows(pt, n.fnTyParams, fnIx, 0) }
+    markNestRows(ret, n.fnTyParams, fnIx, 0)
+  }
   // Save the inference accumulators (a demand-inference can nest inside another
   // function's body check) and the enclosing return type.
   const savedObserved = inferObserved
@@ -53212,6 +53407,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   while tpBody < n.fnTyParams.length {
     tpEnvNames.push(n.fnTyParams[tpBody])
     tpEnvTys.push(mkTyVar(n.fnTyParams[tpBody]))
+    if nestedDecl { tvNestOf.set(tpEnvTys[tpEnvTys.length - 1], fnIx) }
     // The parameter's bound, for the same span (OQ-5, strict bodies). A row is pushed even
     // when the parameter is unbounded (-1), so the two stacks stay one-to-one with
     // `fnTyParams` and an unbounded `<T>` shadows an enclosing bounded `T` rather than
