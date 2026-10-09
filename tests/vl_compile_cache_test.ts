@@ -164,6 +164,9 @@ test("vl test: a single named file hits on an unchanged rerun, with the same rep
     expect([hit.code, hit.trace, hit.out], [0, ["hit"], cold.out], "warm single-file run");
     const ver = await vl(["test", "a.test.vl"], p, { VL_COMPILE_CACHE_VERIFY: "1" });
     expect([ver.code, ver.trace], [0, ["hit", "verified"]], "verify mode");
+    // A named file that is not there stays a usage error (exit 2), not a report entry.
+    const gone = await vl(["test", "gone.test.vl"], p);
+    expect([gone.code, gone.err.split("\n").filter((l) => !l.startsWith(PREFIX))[0]], [2, "test: cannot read gone.test.vl"], "missing named file");
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }
