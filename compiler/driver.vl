@@ -147,11 +147,13 @@ import {
   TPL_RENDER_LOCAL,
   TS_APP,
   TS_ARR,
+  TS_FIELD,
   TS_FUNC,
   TS_LITNUM,
   TS_LITSTR,
   TS_MAP,
   TS_NAME,
+  TS_OBJ,
   TS_PAREN,
   annTsOf,
   arenaEpochBump,
@@ -5233,8 +5235,7 @@ function modOvRecHeadsSameShape(
   )
 }
 
-// Whether type declarations `da` and `db` are records of one shape: the same field names, each
-// field's type spelled alike or naming records of one shape. A newtype is no record here.
+// Whether type declarations `da` and `db` are records of one shape (`modTsSameShape`).
 function modDeclSameShape(
   da: i32,
   db: i32,
@@ -5243,58 +5244,126 @@ function modDeclSameShape(
 ): boolean {
   if da < 0 || db < 0 || depth <= 0 { return false }
   if da == db { return true }
-  const a = P.nodes[da]
-  const b = P.nodes[db]
-  if !(a is TypeDecl) || !(b is TypeDecl) { return false }
-  if a.tdNew != 0 || b.tdNew != 0 || a.tdFields.length != b.tdFields.length {
+  const an: string[] = []
+  const at: i32[] = []
+  const bn: string[] = []
+  const bt: i32[] = []
+  if (!modRecFields(da, -1, an, at) || !modRecFields(db, -1, bn, bt)) {
     return false
   }
-  for fa in a.tdFields {
-    const f = P.nodes[fa]
-    if !(f is FieldDef) { return false }
-    let found = false
-    for fb in b.tdFields {
-      const g = P.nodes[fb]
-      if g is FieldDef {
-        if g.fdName == f.fdName {
-          found = true
-          if (
-            !modTsSameShape(
-              annTsOf(f.fdType),
-              annTsOf(g.fdType),
-              tyDecls,
-              depth - 1,
-            )
-          ) {
-            return false
-          }
-        }
-      }
-    }
-    if !found { return false }
+  modFieldsSameShape(an, at, bn, bt, tyDecls, depth)
+}
+
+// Whether two field lists name the same fields, in any order, of one type each.
+function modFieldsSameShape(
+  an: string[],
+  at: i32[],
+  bn: string[],
+  bt: i32[],
+  tyDecls: {[string]: i32},
+  depth: i32,
+): boolean {
+  if an.length != bn.length { return false }
+  let i = 0
+  while i < an.length {
+    let j = 0
+    while j < bn.length && bn[j] != an[i] { j = j + 1 }
+    if j >= bn.length { return false }
+    if !modTsSameShape(at[i], bt[j], tyDecls, depth - 1) { return false }
+    i = i + 1
   }
   true
 }
 
-// Whether type spellings `a` and `b` name one type: the same tree, a name in it either equal
-// or naming records of one shape.
+// The fields of a record: declaration `d` when it is a plain record (a newtype is no record),
+// else inline object spelling `ts`; their names into `names`, type spellings into `tys`.
+function modRecFields(d: i32, ts: i32, names: string[], tys: i32[]): boolean {
+  if d >= 0 {
+    const n = P.nodes[d]
+    if !(n is TypeDecl) { return false }
+    if n.tdNew != 0 { return false }
+    for fi in n.tdFields {
+      const f = P.nodes[fi]
+      if !(f is FieldDef) { return false }
+      names.push(f.fdName)
+      tys.push(annTsOf(f.fdType))
+    }
+    return true
+  }
+  if ts < 0 || tsKind[ts] != TS_OBJ { return false }
+  let k = 0
+  while k < tsKidCount[ts] {
+    const fk = tsKids[tsKidStart[ts] + k]
+    if tsKind[fk] != TS_FIELD || tsKidCount[fk] != 1 { return false }
+    names.push(tsText[fk])
+    tys.push(tsKids[tsKidStart[fk]])
+    k = k + 1
+  }
+  true
+}
+
+// Spelling `ts` with its aliases resolved: a parenthesised type is its member, and a name for a
+// one-member alias (`type I = i32`) is that member's spelling.
+function modTsResolved(ts: i32, tyDecls: {[string]: i32}, depth: i32): i32 {
+  let t = ts
+  let n = 0
+  while t >= 0 && n < depth {
+    if tsKind[t] == TS_PAREN && tsKidCount[t] == 1 {
+      t = tsKids[tsKidStart[t]]
+    } else if tsKind[t] == TS_NAME {
+      const d = tyDecls[tsText[t]] ?? -1
+      if d < 0 { return t }
+      const dn = P.nodes[d]
+      if !(dn is UnionDecl) { return t }
+      if dn.udNew != 0 || dn.udVariants.length != 1 { return t }
+      t = udTsRootAt(d, 0)
+    } else {
+      return t
+    }
+    n = n + 1
+  }
+  t
+}
+
+// The record declaration name spelling `ts` resolves to, or -1.
+function modTsRecDecl(ts: i32, tyDecls: {[string]: i32}): i32 {
+  if ts < 0 || tsKind[ts] != TS_NAME { return -1 }
+  const d = tyDecls[tsText[ts]] ?? -1
+  if d < 0 || !(P.nodes[d] is TypeDecl) { return -1 }
+  d
+}
+
+// Whether type spellings `a` and `b` name one type: resolved through aliases, a record by its
+// fields whether named or inline, and a function type by its parameter and result types, whose
+// parameter names are documentation only.
 function modTsSameShape(
-  a: i32,
-  b: i32,
+  a0: i32,
+  b0: i32,
   tyDecls: {[string]: i32},
   depth: i32,
 ): boolean {
-  if a < 0 || b < 0 || depth <= 0 { return false }
-  if tsKind[a] != tsKind[b] || tsKidCount[a] != tsKidCount[b] { return false }
-  if tsText[a] != tsText[b] {
-    if tsKind[a] != TS_NAME { return false }
-    return modDeclSameShape(
-      tyDecls[tsText[a]] ?? -1,
-      tyDecls[tsText[b]] ?? -1,
-      tyDecls,
-      depth - 1,
-    )
+  if a0 < 0 || b0 < 0 || depth <= 0 { return false }
+  const a = modTsResolved(a0, tyDecls, depth)
+  const b = modTsResolved(b0, tyDecls, depth)
+  if a < 0 || b < 0 { return false }
+  const da = modTsRecDecl(a, tyDecls)
+  const db = modTsRecDecl(b, tyDecls)
+  const aRec = da >= 0 || tsKind[a] == TS_OBJ
+  const bRec = db >= 0 || tsKind[b] == TS_OBJ
+  if aRec || bRec {
+    if !aRec || !bRec { return false }
+    if da >= 0 && da == db { return true }
+    const an: string[] = []
+    const at: i32[] = []
+    const bn: string[] = []
+    const bt: i32[] = []
+    if (!modRecFields(da, a, an, at) || !modRecFields(db, b, bn, bt)) {
+      return false
+    }
+    return modFieldsSameShape(an, at, bn, bt, tyDecls, depth)
   }
+  if tsKind[a] != tsKind[b] || tsKidCount[a] != tsKidCount[b] { return false }
+  if tsKind[a] != TS_FUNC && tsText[a] != tsText[b] { return false }
   let k = 0
   while k < tsKidCount[a] {
     const ka = tsKids[tsKidStart[a] + k]
