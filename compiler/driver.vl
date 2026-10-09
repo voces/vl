@@ -5197,7 +5197,9 @@ function modOvCheckSet(
     let j = i + 1
     while j < cands.length {
       const notFns = heads[i] == "" || heads[j] == ""
-      if notFns || ovHeadsOverlap(heads[i], heads[j]) {
+      const sameShape = !notFns
+        && modOvRecHeadsSameShape(heads[i], heads[j], tyDecls)
+      if notFns || ovHeadsOverlap(heads[i], heads[j]) || sameShape {
         ovSetBad[row] = true
         modOvDupDiag(row, i, j, heads, notFns, decls)
         return 0
@@ -5213,6 +5215,96 @@ function modOvCheckSet(
   }
   0
 }
+// Whether heads `a` and `b` are two declared records of one shape. Records are structural, so
+// two names of one shape are one type and one head class (owner ruling on D3870); a newtype
+// (`new { … }`) stays its own.
+function modOvRecHeadsSameShape(
+  a: string,
+  b: string,
+  tyDecls: {[string]: i32},
+): boolean {
+  if a.length < 5 || b.length < 5 || a == b { return false }
+  if a.slice(0, 4) != "rec:" || b.slice(0, 4) != "rec:" { return false }
+  modDeclSameShape(
+    tyDecls[a.slice(4, a.length)] ?? -1,
+    tyDecls[b.slice(4, b.length)] ?? -1,
+    tyDecls,
+    8,
+  )
+}
+
+// Whether type declarations `da` and `db` are records of one shape: the same field names, each
+// field's type spelled alike or naming records of one shape. A newtype is no record here.
+function modDeclSameShape(
+  da: i32,
+  db: i32,
+  tyDecls: {[string]: i32},
+  depth: i32,
+): boolean {
+  if da < 0 || db < 0 || depth <= 0 { return false }
+  if da == db { return true }
+  const a = P.nodes[da]
+  const b = P.nodes[db]
+  if !(a is TypeDecl) || !(b is TypeDecl) { return false }
+  if a.tdNew != 0 || b.tdNew != 0 || a.tdFields.length != b.tdFields.length {
+    return false
+  }
+  for fa in a.tdFields {
+    const f = P.nodes[fa]
+    if !(f is FieldDef) { return false }
+    let found = false
+    for fb in b.tdFields {
+      const g = P.nodes[fb]
+      if g is FieldDef {
+        if g.fdName == f.fdName {
+          found = true
+          if (
+            !modTsSameShape(
+              annTsOf(f.fdType),
+              annTsOf(g.fdType),
+              tyDecls,
+              depth - 1,
+            )
+          ) {
+            return false
+          }
+        }
+      }
+    }
+    if !found { return false }
+  }
+  true
+}
+
+// Whether type spellings `a` and `b` name one type: the same tree, a name in it either equal
+// or naming records of one shape.
+function modTsSameShape(
+  a: i32,
+  b: i32,
+  tyDecls: {[string]: i32},
+  depth: i32,
+): boolean {
+  if a < 0 || b < 0 || depth <= 0 { return false }
+  if tsKind[a] != tsKind[b] || tsKidCount[a] != tsKidCount[b] { return false }
+  if tsText[a] != tsText[b] {
+    if tsKind[a] != TS_NAME { return false }
+    return modDeclSameShape(
+      tyDecls[tsText[a]] ?? -1,
+      tyDecls[tsText[b]] ?? -1,
+      tyDecls,
+      depth - 1,
+    )
+  }
+  let k = 0
+  while k < tsKidCount[a] {
+    const ka = tsKids[tsKidStart[a] + k]
+    const kb = tsKids[tsKidStart[b] + k]
+    if !modTsSameShape(ka, kb, tyDecls, depth - 1) { return false }
+    k = k + 1
+  }
+  true
+}
+
 // The duplicate-binding refusal for candidates `i` and `j` of set `row`, at the later site.
 function modOvDupDiag(
   row: i32,
