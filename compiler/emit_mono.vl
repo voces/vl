@@ -49,6 +49,7 @@ import {
   flatConstOfNameProp,
   flattenVariantsInto,
   fnResultUnconsumed,
+  genAppNameOfTy,
   holeNamesTpJoin,
   holePinReadOf,
   i32TyIx,
@@ -109,7 +110,6 @@ import {
   tyFieldTyOf,
   tyHasTyVar,
   tyHasTyVarWasCapped,
-  tyHoldsSharedRecordRender,
   tyIsGradualUnion,
   tyIsLitUnion,
   tyIsLitUnionArray,
@@ -6036,8 +6036,8 @@ let monoFramedPushes: {[i32]: i32} = Map()
 
 // The instance of nested function `fe`'s enclosing frame that `ctx` is, when that is not the
 // template's own frame: a capturing nested generic needs one instance per enclosing instance,
-// whose env holds that instance's captures (D3826). -1 otherwise, and for a call from a
-// function nested deeper, which reads the captures through its own env (D3827).
+// whose env holds that instance's captures (D3826), and a call from a function or lambda
+// nested deeper in it takes it too, carrying the captures through its own env (D3827).
 function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
   if fe < 0 || fe >= fnParent.length || ctx < 0 { return -1 }
   const p0 = fnParent[fe]
@@ -6048,9 +6048,6 @@ function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
   if fnInstOrigin[sl] == fe { sl = fnParent[sl] }
   if sl < 0 || sl == p0 || sl >= fnInstOrigin.length { return -1 }
   if fnInstOrigin[sl] == p0 { return sl }
-  // A caller nested in another instance of the enclosing function (a sibling function, a
-  // lambda) would reach the template frame's instance, whose env is the wrong instance's:
-  // refused rather than lowered (D3827).
   let up = sl
   let guard = 0
   while up >= 0 && up < fnParent.length && guard <= fnStmts.length {
@@ -6065,10 +6062,7 @@ function monoNestedCallFrame(fe: i32, ctx: i32): i32 {
       return -1
     }
     if up >= 0 && up < fnInstOrigin.length && fnInstOrigin[up] == p0 {
-      emitFail(
-        "emitProgram: a nested generic that captures its enclosing function's variables, called from a function nested in a second instance of that enclosing function, has no instance to call — call it from the enclosing function's own body, or annotate its type parameters",
-      )
-      return -1
+      return up
     }
     guard = guard + 1
   }
@@ -11746,14 +11740,18 @@ function monoPinLamFromCheckedTy(fe: i32) {
     if tys.length == 0 || tys.length != fn.fnParams.length { return 0 }
     const pins: string[] = []
     let i = 0
+    // A callback of a built-in `.map` / `.filter` is called at its element's own spelling; one
+    // handed to a function takes that function's parameter type, keyed by its render (D3834).
+    const builtin = monoIsBuiltinCallback(fnStmts[fe])
     while i < tys.length {
-      // A declared record pins by its name, as its annotation would: two records of one shape
-      // render alike, and a `self`-function overloaded on them picks by the name. One nested
-      // below the top has no such name, so that lambda keeps the template path.
-      const sn = structNameOfTy(tys[i])
       if !monoLamPinTyPlain(tys[i], 8) { return 0 }
-      if tyHoldsSharedRecordRender(tys[i], sn != "", 8) { return 0 }
-      const nm = if sn != "" { sn } else { tyToEmitName(tys[i]) }
+      let nm = ""
+      if builtin {
+        nm = monoLamPinName(tys[i], 8)
+      } else {
+        nm = structNameOfTy(tys[i])
+        if nm == "" { nm = tyToEmitName(tys[i]) }
+      }
       if nm == "" { return 0 }
       pins.push(nm)
       i = i + 1
@@ -11761,6 +11759,59 @@ function monoPinLamFromCheckedTy(fe: i32) {
     return monoInstanceFor(fe, pins, fnStmts[fe], -1)
   }
   0
+}
+
+// The lambda nodes passed straight to a built-in `.map` or `.filter`, found on first use.
+let monoBuiltinCbLams: {[i32]: i32} = Map()
+let monoBuiltinCbLamsBuilt = false
+
+// Whether lambda node `lam` is the callback of a built-in `.map` or `.filter` call.
+function monoIsBuiltinCallback(lam: i32): boolean {
+  if !monoBuiltinCbLamsBuilt {
+    monoBuiltinCbLamsBuilt = true
+    monoBuiltinCbLams = Map()
+    const stack: i32[] = []
+    for st in monoProgStmts { stack.push(st) }
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      if ix >= 0 && ix < P.nodes.length {
+        const n = P.nodes[ix]
+        if n is Call {
+          const cf = P.nodes[n.callFn]
+          if cf is Member {
+            if (
+              (cf.memProp == "map" || cf.memProp == "filter")
+              && n.callArgs.length == 1
+            ) {
+              // arena-tick exempt: this module's own lookup table, not the arena.
+              monoBuiltinCbLams[unwrapParen(n.callArgs[0])] = 1
+            }
+          }
+        }
+        for k in nodeChildren(ix) { stack.push(k) }
+      }
+    }
+  }
+  (monoBuiltinCbLams[lam] ?? 0) == 1
+}
+
+// The annotation spelling a `monoLamPinTyPlain` type pins a lambda parameter at: a declared
+// record by its name at any list depth, and a generic record's instance by its application,
+// so the element keeps the name its annotation would give it (D3834).
+function monoLamPinName(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyArray {
+    const en = monoLamPinName(t.aElem, depth - 1)
+    if en == "" { return "" }
+    return en + "[]"
+  }
+  const sn = structNameOfTy(ty)
+  if sn != "" { return sn }
+  // A generic record's instance by its application (`Box<A>`), which names its arguments.
+  const ga = genAppNameOfTy(ty)
+  if ga != "" { return ga }
+  tyToEmitName(ty)
 }
 
 // Whether `ty` is a primitive, a record, or a list of those: the types whose name alone is
@@ -11934,6 +11985,7 @@ export function monomorphize(stmts: i32[]) {
   monoAnonParamPinTy = Map()
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
+  monoBuiltinCbLamsBuilt = false
   monoBindCallFrame = Map()
   monoDeliveredArgs = []
   monoLastInstFe = -1
