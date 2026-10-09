@@ -89,3 +89,4 @@ D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D38
 D3855-D3864  lane-SC  2026-10-08  alias residue: D3855-D3858 filed and closed; D3859 filed and closed with D3865; D3860 filed and closed; D3861 filed open; D3862 filed and closed; D3863 (#3455); D3864 filed and closed
 D3869-D3875  lane-SC  2026-10-08  D3866-D3868 review rows (D3866 next), D3861, D3827, D3853
 D3880-D3889  lane-SC  2026-10-08  D3881 filed open; the rest for D3827, D3853 and their residue
+D3890-D3899  lane-SC  2026-10-08  lane SC soundness rows (D3853 redesign, D3883)
