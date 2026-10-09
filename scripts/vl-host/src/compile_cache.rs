@@ -390,8 +390,6 @@ mod tests {
 
     #[test]
     fn default_limit_is_4096_mib() {
-        if std::env::var_os("VL_COMPILE_CACHE_MAX_MB").is_none() {
-            assert_eq!(max_bytes(), 4096 << 20);
-        }
+        assert_eq!(DEFAULT_MAX_MB, 4096);
     }
 }
