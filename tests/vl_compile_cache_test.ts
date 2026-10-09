@@ -155,6 +155,28 @@ test("vl test: each pooled file hits on an unchanged rerun, with the same report
   }
 });
 
+test("vl test: a single named file hits on an unchanged rerun, with the same report", async () => {
+  const { tmp, p } = await setup();
+  try {
+    const cold = await vl(["test", "a.test.vl"], p);
+    expect([cold.code, cold.trace], [0, ["miss", "stored"]], "cold single-file run");
+    const hit = await vl(["test", "a.test.vl"], p);
+    expect([hit.code, hit.trace, hit.out], [0, ["hit"], cold.out], "warm single-file run");
+    const ver = await vl(["test", "a.test.vl"], p, { VL_COMPILE_CACHE_VERIFY: "1" });
+    expect([ver.code, ver.trace], [0, ["hit", "verified"]], "verify mode");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+Deno.test("compile cache: the default size limit is 4096 MiB", async () => {
+  const src = await Deno.readTextFile(`${ROOT}/scripts/vl-host/src/compile_cache.rs`);
+  if (!/const DEFAULT_MAX_MB: u64 = 4096;/.test(src)) throw new Error("DEFAULT_MAX_MB is not 4096");
+  if (!/unwrap_or\(DEFAULT_MAX_MB\)/.test(src)) throw new Error("max_bytes does not default to DEFAULT_MAX_MB");
+  const doc = await Deno.readTextFile(`${ROOT}/docs/internals/cli-design.md`);
+  if (!/VL_COMPILE_CACHE_MAX_MB=<n>` \| prune target, default 4096/.test(doc)) throw new Error("cli-design.md default");
+});
+
 /** Warm `args` in `cwd`, apply `mutate`, and return the next lookup's trace. */
 const afterMutation = async (
   p: string,
