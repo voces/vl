@@ -104,7 +104,8 @@ const isGetterFn = (fn: string, getters: [string, string][]): boolean =>
 
 // What a body does that the contract forbids, one entry per fact.
 // `body` with every trap arm removed: a `(then …)` whose last form is `(unreachable)` and whose
-// only calls are to the `__print_*` trap-message helpers.
+// only calls are to the `__print_*` trap-message helpers or `__as_fail__`, or one whose only call
+// is `__as_fail__` (an integral `as!`, which then traps at its conversion).
 const stripTrapArms = (body: string): string => {
   let out = body;
   let from = 0;
@@ -120,9 +121,11 @@ const stripTrapArms = (body: string): string => {
     const arm = out.slice(at, end + 1);
     const inner = arm.slice(0, -1).trimEnd();
     const calls = [...arm.matchAll(/\(call \$(\S+)/g)].map((m) => m[1]);
+    const reason = (c: string) =>
+      c.startsWith("__print_") || c === "__as_fail__";
+    const asFailOnly = calls.length === 1 && calls[0] === "__as_fail__";
     if (
-      inner.endsWith("(unreachable)") &&
-      calls.every((c) => c.startsWith("__print_"))
+      (inner.endsWith("(unreachable)") && calls.every(reason)) || asFailOnly
     ) {
       out = out.slice(0, at) + out.slice(end + 1);
     } else {
@@ -137,7 +140,9 @@ const violations = (body: string): string[] => {
   const alloc = body.match(/\((struct\.new\w*|array\.new\w*)/);
   if (alloc) bad.push(`an allocation (${alloc[1]})`);
   // One instruction each, but their work scales with the length operand.
-  const bulk = body.match(/\((array\.copy|array\.fill|memory\.copy|memory\.fill)\b/);
+  const bulk = body.match(
+    /\((array\.copy|array\.fill|memory\.copy|memory\.fill)\b/,
+  );
   if (bulk) bad.push(`a length-scaled ${bulk[1]}`);
   const indirect = body.match(/\(((?:return_)?call_(?:ref|indirect))/);
   if (indirect) bad.push(`an indirect call (${indirect[1]})`);

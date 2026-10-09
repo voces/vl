@@ -629,7 +629,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // zero-length backing from a global, and a capture-free lambda its one constant closure,
     // so those sites leave the function bodies: allocs 104 -> 98 and 54 -> 51, bytes 9179 -> 9388 (9382 before
     // this change) and 3745 -> 3746.
-    O: { bytes: 9388, fns: 15, allocs: 98, indirect: 0, refEq: 4 },
+    // SP-056: an `as!` reason is one call of the shared `__as_fail__` helper, which `-O` keeps as
+    // a function: fns 15 -> 16, bytes within band. Cold path only.
+    O: { bytes: 9388, fns: 16, allocs: 98, indirect: 0, refEq: 4 },
     O3: { bytes: 3746, fns: 6, allocs: 51, indirect: 0, refEq: 4 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
@@ -661,8 +663,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // Both rungs fns 1 -> 2, allocs 2 -> 3: the search function, called from `main`'s loop, is
     // no longer inlined into `main`, which runs once (DECISIONS.md, "`-O3` keeps hot callees
     // out of run-once code"). Timed at `-O3`: V8 1.70 -> 1.42 s, wasmtime 2.27 -> 2.05 s.
-    O: { bytes: 694, fns: 2, allocs: 3, indirect: 0 },
-    O3: { bytes: 648, fns: 2, allocs: 3, indirect: 0 },
+    //
+    // SP-056: the two setup casts' reasons are calls of the shared `__as_fail__` helper, a
+    // function of its own at both rungs (fns 2 -> 3). In a module this small the helper's body
+    // outweighs the two per-character reasons it replaces: `-O` 694 -> 778, `-O3` 648 -> 757.
+    O: { bytes: 778, fns: 3, allocs: 3, indirect: 0 },
+    O3: { bytes: 757, fns: 3, allocs: 3, indirect: 0 },
   },
   // A KNOWN-SIZE LIST BUILT BY `push` (sunpa SP-036, D3623). The 16 pushes sit in a constant
   // 4x4 nest, so the list is reserved at 16 and each push appends through two locals while
@@ -670,11 +676,14 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   // 7 -> 10 is the growing append's cold `array.new_default`, kept in each unrolled copy.
   // Master was 876 / 840 bytes and 7 allocs: no reserve, three growths per product.
   // SHOULD MOVE IF: the reserve or the region's append stops firing, or a push stops unrolling.
+  // SP-056: the closing `trunc(…) as! i64` tests its range and names its failure through the
+  // `__as_fail__` helper, inlined into its one caller (it was a bare `i64.trunc_f64_s`, with no
+  // reason): `-O` 1787 -> 2090, `-O3` 1721 -> 2024 bytes, a cold branch after the loops.
   {
     bench: "arrays/push-known-size",
     axis: "building a list of compile-time-known size with push",
-    O: { bytes: 1787, fns: 2, allocs: 10, indirect: 0 },
-    O3: { bytes: 1721, fns: 2, allocs: 10, indirect: 0 },
+    O: { bytes: 2090, fns: 2, allocs: 10, indirect: 0 },
+    O3: { bytes: 2024, fns: 2, allocs: 10, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). The `P[]` is flattened (D3681): four
   // i32s per element in one array, so setup allocates no `P` (`allocs` 3 -> 2: the list and

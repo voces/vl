@@ -1280,6 +1280,8 @@ import {
   fnDispNames,
   fnInstOrigin,
   fnParent,
+  gAsFailDoms,
+  gHelpAsFail,
   gHelpInitFail,
   gInitAny,
   gInitFnReach,
@@ -17301,10 +17303,11 @@ function emitExprAsKind(body: u8[], exprIx: i32, k: i32, fnIx: i32) {
 // there, else fails as the trio fails everywhere (`as?` null, `as!` traps, bare `as`
 // propagates). The test is "integral and in range", not a round-trip compare — a round-trip is exact only for `f64 → i32`, not the other three float pairs, since the convert-back rounds and admits a value the target cannot hold; NaN fails integrality for free.
 
-// `dom` is the exactness domain, not the rep target: `u8` names 0..255 inside the `i32`
-// the cast produces (D1587), a third set of bounds over the same two comparisons. Both
-// `u8` bounds convert exactly at f32 and f64, which is why its upper test is `<=` at both.
-function emitNumExactTest(src: string, dom: string) {
+// `dom` is the exactness domain, not the rep target: `u8` names 0..255 inside the `i32` (D1587);
+// both `u8` bounds convert exactly at f32 and f64, so its upper test is `<=` at both.
+// `integral` drops the integrality compare for an operand integral by construction (SP-056);
+// NaN then fails the range test instead.
+function emitNumExactTest(src: string, dom: string, integral: boolean) {
   const u8Dom = dom == "u8"
   if src == "i64" {
     // `i64 -> i32` / `i64 -> u8`: a pure range test, and never a wrap. The bounds are exact
@@ -17331,10 +17334,12 @@ function emitNumExactTest(src: string, dom: string) {
   if isF32 { slot = numCastF32Slot }
   // INTEGRAL: `trunc(d) == d`. A fraction fails it, and so does NaN (no comparison involving
   // NaN is true), which is the ruling's verdict on a NaN cast arriving for free.
-  fbLocalGet(slot)
-  if isF32 { fbF32Trunc() } else { fbF64Trunc() }
-  fbLocalGet(slot)
-  if isF32 { fbF32Eq() } else { fbF64Eq() }
+  if !integral {
+    fbLocalGet(slot)
+    if isF32 { fbF32Trunc() } else { fbF64Trunc() }
+    fbLocalGet(slot)
+    if isF32 { fbF32Eq() } else { fbF64Eq() }
+  }
   // IN RANGE, lower: `d >= convert(<domain>::MIN)`. ±Inf fails one side or the other.
   fbLocalGet(slot)
   if u8Dom {
@@ -17348,7 +17353,7 @@ function emitNumExactTest(src: string, dom: string) {
     if isF32 { fbF32ConvertI64S() } else { fbF64ConvertI64S() }
   }
   if isF32 { fbF32Ge() } else { fbF64Ge() }
-  fbI32And()
+  if !integral { fbI32And() }
   // IN RANGE, upper — `<=` only where the converted maximum is exact (see the table above).
   fbLocalGet(slot)
   if u8Dom {
@@ -17394,26 +17399,31 @@ function emitNumExactConvert(src: string, tgt: string) {
   0
 }
 
-// The `as!` trap's reason, streamed to the host boundary before the abort (the same two
-// imports `__trap__("reason")` uses). Built as characters rather than a synthesized
-// `StrLit`, since a string minted at emit time is invisible to the collect passes that
-// intern `$sTypeIdx` — a program whose only string is this message would `ref.cast` at an unallocated heap index. The wording is kept short since every character costs `i32.const` + `call` per site (D1041).
+// The `as!` trap's reason, `as! <tgt> at <line>:<col>: not exact`, printed by the one
+// `__as_fail__` body from the site's place and the domain's row, so a site costs one call
+// (SP-056). Line 0 names no place. The caller emits the trap itself.
 function emitNumCastTrapMsg(exprIx: i32, tgt: string) {
-  let where = ""
+  if gHelpAsFail < 0 || gImports < 4 {
+    return emitFail(
+      "emitProgram: `as! " + tgt + "` with no `__as_fail__` reserved",
+    )
+  }
+  let row = 0
+  while row < gAsFailDoms.length && gAsFailDoms[row] != tgt { row = row + 1 }
+  if row == gAsFailDoms.length { gAsFailDoms.push(tgt) }
+  if row > 7 { return emitFail("emitProgram: more than eight `as!` domains") }
+  let line = 0
+  let col = 0
   if exprIx >= 0 && exprIx < nodeToks.length {
     const at = nodeToks[exprIx]
     if at >= 0 && at < P.toks.length {
-      where = " at "
-        + i32ToStr(P.toks[at].line)
-        + ":"
-        + i32ToStr(P.toks[at].col + 1)
+      line = P.toks[at].line
+      col = P.toks[at].col + 1
     }
   }
-  for cp in "as! " + tgt + where + ": not exact" {
-    fbI32Const(cp)
-    fbCall(2) // __print_char__ (import 2)
-  }
-  fbCall(3) // __print_str_flush__ (import 3)
+  fbI32Const(line)
+  fbI32Const((col << 3) | row)
+  fbCall(gHelpAsFail)
   0
 }
 
@@ -17461,7 +17471,8 @@ function emitNumExactCastFrom(
     if emitNumIntrArg(body, e.asObj, 4, fnIx) < 0 { return -1 }
     fbLocalSet(numCastF64Slot)
   }
-  if emitNumExactTest(src, dom) < 0 { return -1 }
+  const integral = src != "i64" && exprIsIntegralFloat(e.asObj, fnIx)
+  if emitNumExactTest(src, dom, integral) < 0 { return -1 }
   if e.asMode == "null" {
     const nck = valueAtomKind(tgt)
     const nvb = vbHeapIdxOfKind(nck)
@@ -17490,9 +17501,11 @@ function emitNumExactCastFrom(
   fbI32Eqz()
   fbIf(64) // if (void) — the SAD path, the only place the two remaining modes differ
   if e.asMode == "trap" {
-    // The DOMAIN is what the author wrote, so `x as! u8` says `as! u8`, not `as! i32`.
+    // The DOMAIN is what the author wrote, so `x as! u8` says `as! u8`, not `as! i32`. An
+    // integral float out of i32's or i64's range fails exactly where the conversion below
+    // traps, so it traps there and the host names the range (SP-056).
     if emitNumCastTrapMsg(exprIx, dom) < 0 { return -1 }
-    fbUnreachable()
+    if !integral || dom != tgt { fbUnreachable() }
   } else {
     // A bare `as` PROPAGATES. The checker proved the enclosing function returns something
     // `null` fits, so the value to hand back is that function's own null — built through
@@ -17692,12 +17705,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     return emitHoleNumAsOpt(body, e, _exprIx, fnIx)
   }
   if asExprNumFallible(_exprIx) {
-    // the peephole: `trunc(d) as! i32`/`floor`/`ceil`/`nearest` — the operand is integral, so
-    // only range can fail (excludes `u8`, D1587: `i32.trunc_f64_s` enforces i32's range, not 0..255).
-    const peep = e.asMode == "trap"
-      && asExprNumCastDomain(_exprIx) != "u8"
-      && exprIsIntegralFloat(obj, fnIx)
-    if !peep { return emitNumExactCast(body, e, _exprIx, fnIx) }
+    return emitNumExactCast(body, e, _exprIx, fnIx)
   }
   if asExprIsUnionCastIn(_exprIx, fnIx) {
     // A niche-repped operand carries no tag, so none of the tag machinery below applies to
