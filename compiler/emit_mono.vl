@@ -240,6 +240,7 @@ import {
   drwDispatchOp,
   gaeApplyFieldTy,
   gaeSplitArgs,
+  mapValNameOf,
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
@@ -388,6 +389,7 @@ import {
   nestedFnDeclaredIn,
   nodeMapArmNominalName,
   nominalizeFnTypeOfTy,
+  nonNulBaseOf,
   pinKindOfName,
   readLoopNodeOf,
   sFieldElemNameAt,
@@ -9457,9 +9459,80 @@ function monoCallGenFnToTyParamArrow(
             }
           }
         }
+        // A list of functions riding the type parameters, handed a literal of generics (D3913).
+        if nameIsClosureArray(ann) && monoAnnHasTyParam(ann, typarams) {
+          if monoLitHoldsGenericFn(args[i], 0) { return true }
+        }
       }
     }
     i = i + 1
+  }
+  false
+}
+
+// A call whose callee is a call (`a(x)(x)`, `a(x)(x)(x)`), whose recorded types are the
+// template's: the callee and the call are typed at this instance's own (D3912, D3922).
+function monoTypeCallOfCall(ix: i32, ctx: i32) {
+  const n = P.nodes[ix]
+  if !(n is Call) { return 0 }
+  const cx = unwrapParen(n.callFn)
+  if cx < 0 || !(P.nodes[cx] is Call) { return 0 }
+  const ct = monoCallValueTy(cx, ctx, 0)
+  if ct >= 0 { nodeTyRecord(cx, ct) }
+  const t = monoCallValueTy(ix, ctx, 0)
+  if t >= 0 { nodeTyRecord(ix, t) }
+  0
+}
+
+// The type call `ix` yields at this instance: the result of the function type a call it calls
+// yields, or else a named callee's declared return (`monoNamedCallTy`); -1 when unknown.
+function monoCallValueTy(ix: i32, ctx: i32, depth: i32): i32 {
+  if ix < 0 || depth > 16 { return -1 }
+  const n = P.nodes[ix]
+  if !(n is Call) { return -1 }
+  const cx = unwrapParen(n.callFn)
+  if cx < 0 { return -1 }
+  if P.nodes[cx] is Call {
+    const ct = monoCallValueTy(cx, ctx, depth + 1)
+    if ct < 0 || ct >= T.tys.length { return -1 }
+    const f = T.tys[ct]
+    if f is TyFunc {
+      if f.fnRet >= 0 && !tyHasTyVar(f.fnRet) { return f.fnRet }
+    }
+    return -1
+  }
+  monoNamedCallTy(cx, ctx)
+}
+
+// The declared return of the function callee `cx` names in frame `ctx`; -1 when it is no name, a
+// parameter or local shadows it, or the type still names a type variable.
+function monoNamedCallTy(cx: i32, ctx: i32): i32 {
+  const c = P.nodes[cx]
+  if !(c is Ident) { return -1 }
+  if monoNameShadowedAt(c.identName, cx, ctx) { return -1 }
+  const fe = fnIndexOfInScopeAt(sidOfNode(cx), c.identName, ctx, cx)
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[fe]]
+  if !(fn is FuncDecl) || fn.fnRet < 0 { return -1 }
+  const rt = nodeTyIxOf(fn.fnRet)
+  if rt < 0 || tyHasTyVar(rt) { return -1 }
+  rt
+}
+
+// Whether list literal `ix` holds a generic function value, at any list depth.
+function monoLitHoldsGenericFn(ix: i32, depth: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 || depth > 8 { return false }
+  const n = P.nodes[x]
+  if n is ArrayLit {
+    for e in n.arrElems {
+      if (
+        monoCalleeIsGeneric(unwrapParen(e))
+        || monoLitHoldsGenericFn(e, depth + 1)
+      ) {
+        return true
+      }
+    }
   }
   false
 }
@@ -9928,6 +10001,11 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 let anRowPin = ""
                 if annArrowAt(ann) >= 1 {
                   anC = monoArgFnTypeName(args[i], ctx)
+                  // A generic function value takes the type the value arguments bound (D3913).
+                  if monoCalleeIsGeneric(unwrapParen(args[i])) {
+                    const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+                    if pre != "" { anC = pre }
+                  }
                 } else {
                   anC = monoArgPinName(args[i], ctx)
                   // An anonymous row's `#anonN` has no fields to match the pattern against;
@@ -9943,6 +10021,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                       if !monoSpelledShapeStaysAnon(anSp) { anRowPin = anC }
                       anC = anSp
                     }
+                  }
+                  if anC == "" && monoLitHoldsGenericFn(args[i], 0) {
+                    anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
                   }
                 }
                 if anC == "" {
@@ -9981,7 +10062,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 // The coercion `monoWalk` deferred, since at that point the pin names
                 // would be the type variables themselves. `pinC` is the substituted
                 // spelling, the concrete function type that parameter takes.
-                if annArrowAt(ann) >= 1 {
+                if annArrowAt(ann) >= 1 || nameIsClosureArray(pinC) {
                   if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 {
                     return -1
                   }
@@ -10874,7 +10955,9 @@ function monoWalk(ix: i32, ctx: i32) {
         return rc
       }
     }
-    return monoWalk(n.callFn, ctx)
+    if monoWalk(n.callFn, ctx) < 0 { return -1 }
+    monoTypeCallOfCall(ix, ctx)
+    return 0
   }
   if n is Block {
     const bs = n.blkStmts
@@ -11403,6 +11486,12 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
   const cf = P.nodes[n.callFn]
   if !(cf is Member) { return 0 }
   if cf.memProp == "set" && n.callArgs.length == 2 {
+    const sv = mapValNameOf(monoStoreAnnName(cf.memObj, ctx, 0))
+    if sv != "" {
+      if monoCoerceFnValueName(n.callArgs[1], normTypeAtom(sv), ctx, -1) < 0 {
+        return -1
+      }
+    }
     const vt = monoConcreteFnTyName(monoMapValTy(nodeTyIxOf(cf.memObj)))
     if vt == "" { return 0 }
     return monoNoteBindDeliveryAt(n.callArgs[1], vt, ctx)
@@ -11434,7 +11523,10 @@ function monoStoreAnnName(e: i32, ctx: i32, depth: i32): string {
   if x < 0 { return "" }
   const n = P.nodes[x]
   if n is Index {
-    const an = monoStoreAnnName(n.idxArr, ctx, depth + 1)
+    // A local narrowed from a nullable read is indexed past its `| null` (D3916).
+    const an = nonNulBaseOf(monoStoreAnnName(n.idxArr, ctx, depth + 1))
+    const mv = mapValNameOf(an)
+    if mv != "" { return normTypeAtom(mv) }
     if !nameIsArray(an) { return "" }
     return normTypeAtom(arrElemNameRaw(an))
   }
@@ -11447,8 +11539,9 @@ function monoStoreAnnName(e: i32, ctx: i32, depth: i32): string {
   monoLocalAnnName(x, ctx)
 }
 
-// The annotation name of the local of `ctx` that `Ident` `x` reads, as this instance spells
-// it; "" for any other expression, or a local with no annotation.
+// The type name of the local or parameter of `ctx` that `Ident` `x` reads, as this instance
+// spells it: its annotation, else an un-annotated local's inferred type at the instance's
+// bindings; "" for any other expression, or a type that still names a type variable.
 function monoLocalAnnName(x: i32, ctx: i32): string {
   if x < 0 || ctx < 0 { return "" }
   const n = P.nodes[x]
@@ -11456,12 +11549,25 @@ function monoLocalAnnName(x: i32, ctx: i32): string {
   const cf = P.nodes[ctx]
   if !(cf is FuncDecl) { return "" }
   const li = parentLetOfAt(cf.fnBody, sidOfNode(x), x)
-  if li < 0 { return "" }
-  const d = P.nodes[li]
-  if d is LetDecl {
-    if d.letType >= 0 { return tyNameOf(d.letType) }
+  if li >= 0 {
+    const d = P.nodes[li]
+    if d is LetDecl {
+      if d.letType >= 0 { return tyNameOf(d.letType) }
+      return monoInstTyName(nodeTyIxOf(d.letInit), ctx)
+    }
+    return ""
   }
-  ""
+  const pt = paramTypeNode(ctx, n.identName)
+  if pt < 0 { return "" }
+  tyNameOf(pt)
+}
+
+// Type `t` named at the bindings of the instance `ctx`, or "" while a type variable stays.
+function monoInstTyName(t: i32, ctx: i32): string {
+  if t < 0 { return "" }
+  const st = monoPinSubTyOf(t, ctx)
+  if st < 0 || tyHasTyVar(st) { return "" }
+  tyToEmitName(st)
 }
 
 // The type name of field `prop` of the record type `tname` names, or "".
