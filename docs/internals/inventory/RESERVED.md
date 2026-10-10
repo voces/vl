@@ -89,3 +89,4 @@ D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D38
 D3880-D3889  lane-SC  2026-10-08  D3881 filed open; the rest for D3827, D3853 and their residue
 D3890-D3899  lane-SC  2026-10-08  lane SC soundness rows (D3853 redesign, D3883)
 D3920-D3929  lane-SC  2026-10-09  lane SC rows after D3919
+D3930-D3939  lane-SC  2026-10-09  lane SC rows after D3929

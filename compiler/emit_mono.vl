@@ -6683,7 +6683,10 @@ function monoCloneGenericCallsRaw(ix: i32) {
   // A generic function read as a value (a list element, a field, a binding) is renamed to
   // its instance per enclosing instance, so it gets its own node, typed at this instance (D3909).
   if n is Ident {
-    if monoCalleeIsGeneric(ix) {
+    if (
+      monoCalleeIsGeneric(ix)
+      || monoStrListHas(monoCgcGenAliasNames, n.identName)
+    ) {
       const vi = mkIdent(n.identName, n.pos)
       lfNoteMinted(vi, ix)
       const vt = monoLamCallTy(nodeTyIxOf(ix))
@@ -8875,6 +8878,16 @@ function monoMakeInstanceGo(
         const written = monoNameIsAssigned(cal3.identName)
           || i32ListHas(monoNoRename, calleeIx)
         if cal3.identName != fn.fnName && written {
+          // A frame-keyed instance differs by its enclosing instance, not its argument type.
+          if callFrame >= 0 {
+            return emitFail(
+              "emitProgram: the reassigned function binding `"
+                + cal3.identName
+                + "` holds a nested generic that captures its enclosing generic's values, at "
+                + "more than one instance of it — one binding holds one closure signature. Bind "
+                + "a separate value per instance, or call the nested function by its name",
+            )
+          }
           return emitFail(
             "emitProgram: the reassigned function binding `"
               + cal3.identName
@@ -9310,12 +9323,28 @@ function monoCoerceFnValueName(
     // A bare function name, or a value binding holding a generic function (`const add =
     // (a,b) => a + b`, or `const g = named`) — resolve the binding to its lifted slot so an
     // escaping lambda binding materializes at the boundary type too.
-    const gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
+    let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
+    // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
+    if gfe < 0 { gfe = monoGenFnAliasChainFe(e.identName, exprIx, ctx) }
+    // An alias a call renamed to one instance of a generic still delivers the generic (D3905).
+    if (
+      gfe >= 0
+      && gfe < fnInstOrigin.length
+      && fnInstOrigin[gfe] >= 0
+      && e.identName != monoSlotName(gfe)
+    ) {
+      const go = fnInstOrigin[gfe]
+      if go < monoGen.length && monoGen[go] == 1 { gfe = go }
+    }
     if gfe >= 0 && gfe < monoGen.length {
       if monoGen[gfe] == 1 {
         const pnames: string[] = []
         if monoFnTypeAnnParamsName(tname, pnames) {
-          return monoInstanceFor(gfe, pnames, exprIx, expTy)
+          // A capturing nested generic's value is this frame's instance, as a call is (D3902).
+          monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
+          const vr = monoInstanceFor(gfe, pnames, exprIx, expTy)
+          monoCallFrameSlot = -1
+          return vr
         }
       }
     }
