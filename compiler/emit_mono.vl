@@ -9324,6 +9324,8 @@ function monoCoerceFnValueName(
     // A bare function name, or a value binding holding a generic function (`const add =
     // (a,b) => a + b`, or `const g = named`) — resolve the binding to its lifted slot so an
     // escaping lambda binding materializes at the boundary type too.
+    // A reassigned `let` is read as itself: the generic functions written into it take this type.
+    if monoCoerceWrittenLet(e.identName, exprIx, ctx, tname) { return 0 }
     let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
     // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
     if gfe < 0 { gfe = monoGenFnAliasChainFe(e.identName, exprIx, ctx) }
@@ -9340,7 +9342,10 @@ function monoCoerceFnValueName(
     if gfe >= 0 && gfe < monoGen.length {
       if monoGen[gfe] == 1 {
         const pnames: string[] = []
-        if monoFnTypeAnnParamsName(tname, pnames) {
+        // A nullable function slot (`((t: T) => void) | null`) takes the function's instance (D3932).
+        if (
+          monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames)
+        ) {
           // A capturing nested generic's value is this frame's instance, as a call is (D3902).
           monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
           const vr = monoInstanceFor(gfe, pnames, exprIx, expTy)
@@ -9351,6 +9356,66 @@ function monoCoerceFnValueName(
     }
   }
   0
+}
+
+// For an un-annotated, reassigned `let` read at `at`: instances each named generic function its
+// initializer or a write in its frame names at function type `tname`, and answers true; false
+// for any other name. The read keeps the binding's value (D3930).
+const monoWrittenLetBusy: i32[] = []
+function monoCoerceWrittenLet(
+  name: string,
+  at: i32,
+  ctx: i32,
+  tname: string,
+): boolean {
+  // Asked of every value read, so the cheap tests come first: only a function type delivers a
+  // generic, and the pass indexes every write before it walks (a clone's is spelled the same).
+  if annArrowAt(tname) < 1 { return false }
+  if (monoLetWrites.get("n:" + name) ?? []).length == 0 { return false }
+  monoLetWritesExtend()
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 || i32ListHas(monoWrittenLetBusy, lf[1]) { return false }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return false }
+  monoWrittenLetBusy.push(lf[1])
+  monoCoerceNamedGeneric(d.letInit, tname, lf[0])
+  for i in monoLetWrites.get("n:" + name) ?? [] {
+    const nd = P.nodes[i]
+    if nd is BinExpr {
+      if monoFrameHolds(lf[0], i) {
+        let wf = lf[0]
+        if lf[0] >= 0 {
+          wf = monoFrameOfNode(i, lf[0])
+        } else {
+          wf = monoTopFrameOf(i)
+        }
+        if monoLetFrameOf(name, nd.binLeft, wf)[1] == lf[1] {
+          monoCoerceNamedGeneric(nd.binRight, tname, wf)
+        }
+      }
+    }
+  }
+  monoWrittenLetBusy.pop()
+  true
+}
+
+// `monoCoerceFnValueName` for a value naming a declared generic function; a hole lambda's
+// binding keeps its own signature rules (D3857).
+function monoCoerceNamedGeneric(v: i32, tname: string, ctx: i32) {
+  const x = unwrapParen(v)
+  if x < 0 { return 0 }
+  const n = P.nodes[x]
+  if !(n is Ident) { return 0 }
+  const fe = monoFnFeOfIdent(x, n.identName, ctx)
+  if (
+    fe < 0
+    || fe >= monoGen.length
+    || monoGen[fe] != 1
+    || criFnIsAnonLambda(fe)
+  ) {
+    return 0
+  }
+  monoCoerceFnValueName(x, tname, ctx, -1)
 }
 
 // Is `name` ever the target of an assignment anywhere in the arena? An arena scan rather
@@ -11510,6 +11575,9 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
   const et = monoConcreteFnTyName(tyArrayElemIx(lt))
   if et == "" { return 0 }
   for a in n.callArgs {
+    // A generic function, by name or through a never-written alias, is instanced at the
+    // element's type, whatever list it is pushed into (D3929).
+    if monoCoerceFnValueName(a, et, ctx, -1) < 0 { return -1 }
     if monoNoteBindDeliveryAt(a, et, ctx) < 0 { return -1 }
   }
   0
