@@ -301,6 +301,7 @@ import {
   isvalEnd,
   isvalLine,
   isvalLit,
+  isvalMsg,
   isvalName,
   isvalTok,
   isvalType,
@@ -14786,6 +14787,7 @@ function isvalReset() {
   isvalName = []
   isvalType = []
   isvalLit = []
+  isvalMsg = []
   collBindDepth = []
   collBindName = []
   objLitBindDepth = []
@@ -14829,6 +14831,7 @@ function isvalTruncate(n: i32) {
   while isvalName.length > n { isvalName.pop() }
   while isvalType.length > n { isvalType.pop() }
   while isvalLit.length > n { isvalLit.pop() }
+  while isvalMsg.length > n { isvalMsg.pop() }
   0
 }
 
@@ -18906,6 +18909,54 @@ function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   isvalType.push(tyToStrUser(objTy))
   isvalLit.push(lit)
+  isvalMsg.push("")
+  0
+}
+
+// The hint at an `is` whose tested type is contained in another arm of the operand's union
+// (`is B` over `A | B` with every `B` an `A`): `is` tests whether the value fits the type, so
+// an `A` that fits `B` tests as a `B` (the owner's structural `is`, D3885).
+function recordContainedIsAt(n: IsExpr, ix: i32, objTy: i32, chkTy: i32) {
+  if chkTy < 0 || objTy < 0 { return 0 }
+  const ot = T.tys[objTy]
+  if !(ot is TyUnion) { return 0 }
+  // Two records only: a scalar, literal or list containment is the ordinary narrowing it reads as.
+  if !(T.tys[chkTy] is TyObj) { return 0 }
+  for m in ot.uMembers {
+    if (
+      m != chkTy
+      && m >= 0
+      && T.tys[m] is TyObj
+      && assignable(chkTy, m)
+      && !assignable(m, chkTy)
+    ) {
+      const tk = findingStartTok(ix)
+      if tk < 0 { return 0 }
+      let i = 0
+      while i < isvalTok.length {
+        if isvalTok[i] == tk { return 0 }
+        i = i + 1
+      }
+      const t = P.toks[tk]
+      isvalLine.push(t.line)
+      isvalCol.push(t.col)
+      isvalEnd.push(findingEndCol(ix, tk))
+      isvalTok.push(tk)
+      isvalName.push("")
+      isvalType.push("")
+      isvalLit.push(n.isVariant)
+      isvalMsg.push(
+        "`"
+          + tyToStrUser(chkTy)
+          + "` is contained in `"
+          + tyToStrUser(m)
+          + "`, so `is "
+          + n.isVariant
+          + "` tests the value",
+      )
+      return 0
+    }
+  }
   0
 }
 
@@ -53241,6 +53292,39 @@ let lamCheckDepth = 0
 let lamRefoldDepth = 0
 
 // `checkFuncDeclNode`'s body, counted by it inside a lambda.
+// A function declared directly in a body that has a parameter of its name binds that name twice
+// in one scope, as a `const` of it would: the owner's ruling (D3945). A function in a deeper block,
+// an inner function or a lambda body may still shadow the parameter.
+function checkParamNestedFnClash(n: FuncDecl, params: i32[]) {
+  if inferQuiet || monoRecheckDepth > 0 || n.fnBody < 0 { return 0 }
+  const body = P.nodes[n.fnBody]
+  if !(body is Block) { return 0 }
+  for st in body.blkStmts {
+    const sn = P.nodes[st]
+    if sn is FuncDecl {
+      for pi in params {
+        const pn = P.nodes[pi]
+        if pn is Param {
+          if sn.fnName != "" && pn.parName == sn.fnName {
+            tErr(
+              "redeclared "
+                + sn.fnName
+                + ": the parameter `"
+                + pn.parName
+                + "` and the function `"
+                + sn.fnName
+                + "` declared in the same body are one scope; rename one, or declare the "
+                + "function in an inner block",
+              st,
+            )
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
 function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // A `function` (top-level OR nested) whose name the emitter dispatches on inline is a
   // definition that can never run — reject it at the definition, not at the call site
@@ -53587,6 +53671,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     }
     dj = dj + 1
   }
+  checkParamNestedFnClash(n, params)
   const body = P.nodes[n.fnBody]
   const savedStmtBlk = chkStmtBlk
   chkStmtBlk = n.fnBody
@@ -73289,6 +73374,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
       const twin = mapTwinTestMsg([objTy], chkTy, "`is`")
       if twin != "" { tErr(twin, ix) }
       recordCollapsedIsAt(n, ix, objTy, chkTy)
+      recordContainedIsAt(n, ix, objTy, chkTy)
     }
   }
   return TY_BOOL
