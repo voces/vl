@@ -1,5 +1,5 @@
 // TWO PROGRAMS, ONE INSTANCE, BOTH ORDERS — the shared-instance leaks the corpus oracle found
-// only under a filtered run (D3995, D3996).
+// only under a filtered run (D3995, D3996, D3997).
 //
 // Each pair compiles program B after program A on one instance, and B before A, and requires
 // every emission to be byte-identical to that program's fresh-instance compile and to validate.
@@ -44,6 +44,13 @@ const PAIRS: { row: string; a: string; b: string }[] = [
     row: "D3996",
     a: 'type R = { K: string }\nconst u: i32 | string = 3\nprint(u)\n',
     b: 'import { filled } from "std:array"\ntype Item = { n: i32 }\n' +
+      "const a = filled<Item | null>(2, null)\nprint(a.length)\n",
+  },
+  {
+    // D3996 at a record with a closure field, which that fix excluded.
+    row: "D3997",
+    a: 'type R = { K: string }\nconst u: i32 | string = 3\nprint(u)\n',
+    b: 'import { filled } from "std:array"\ntype Item = { n: i32, f: (x: i32) => i32 }\n' +
       "const a = filled<Item | null>(2, null)\nprint(a.length)\n",
   },
   {
