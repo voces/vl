@@ -696,8 +696,8 @@ hints only for the file(s) you name, unless asked for (below).
 
 {b}Usage:{r} vl fmt [path]... [flags]   {d}no path: format stdin to stdout{r}
 
-One path per run: a file formats that file, a directory walks it. The default
-prints the formatted source to stdout and writes nothing.
+Each path is a file to format or a directory to walk. The default prints the
+formatted source to stdout and writes nothing.
 
 {b}Flags:{r}
   {c}-w, --write{r}         Write the result back in place
@@ -2185,12 +2185,17 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
         // freshness question to ask (different bytes ⇒ different file).
         CompilerSource::Embedded(bytes) => {
             let cache = seed_cache_path(&tag);
-            // A cold cache costs seconds of silence on the first run of a new `vl` (DV-006),
-            // so say what the wait is before it starts.
-            if cache.as_deref().is_none_or(|p| !p.exists()) {
-                eprintln!(
-                    "vl: compiling the compiler for this machine — once per vl version; this takes from seconds to a minute"
-                );
+            // A cache miss costs seconds of silence (DV-006), so say what the wait is before it
+            // starts. Engine configurations cache apart, so a miss is per configuration, not
+            // per `vl` version, and with no cache directory it is every run.
+            match cache.as_deref() {
+                Some(p) if p.exists() => {}
+                Some(_) => eprintln!(
+                    "vl: compiling the compiler for this machine; this takes from seconds to a minute, and the result is cached for later runs"
+                ),
+                None => eprintln!(
+                    "vl: compiling the compiler for this machine; this takes from seconds to a minute, and with no usable cache directory every run does it"
+                ),
             }
             cached_module(engine, cache.as_deref(), true, || {
                 Module::from_binary(engine, bytes)
