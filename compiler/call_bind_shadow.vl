@@ -1,0 +1,128 @@
+// The per-call binding shadow: at each call where the monomorphizer decides an instance, compare
+// what it bound each type parameter to against the checker's per-call binding column
+// (`callBindTyOf`). Off unless a host arms it; armed, it counts each type parameter of each
+// decided call by class, so the column can replace the re-derivation only where they agree
+// (`docs/internals/fn-value-flow-design.md` §(f) step 0b).
+import { P } from "./ast"
+import { anonHandleTyIx, sigKeyOfTy } from "./emit_classify"
+import { repCanonId, repNameCanonId } from "./emit_rep"
+import {
+  callBindHas,
+  callBindTyOf,
+  tyHasTyVar,
+  tyToEmitName,
+} from "./typecheck"
+
+let cbsArmed = false
+let cbsNamed = false
+let cbsMark = 0
+let cbsRowKey: string[] = []
+let cbsRowN: i32[] = []
+
+// Arm (1) or disarm (0) the shadow for the compiles that follow; 2 also names the callee, the
+// type parameter and both answers in each row.
+export function callBindShadowArm(on: i32) {
+  cbsArmed = on != 0
+  cbsNamed = on == 2
+  0
+}
+
+// Start a compile's shadow. A node at or past the arena length taken here is the emitter's own.
+export function callBindShadowBegin() {
+  cbsRowKey = []
+  cbsRowN = []
+  cbsMark = P.nodes.length
+  0
+}
+
+function cbsCount(key: string) {
+  let i = 0
+  while i < cbsRowKey.length {
+    if cbsRowKey[i] == key {
+      cbsRowN[i] = cbsRowN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  cbsRowKey.push(key)
+  cbsRowN.push(1)
+  0
+}
+
+// The class of type parameter `tp` at call `callIx`, where the monomorphizer bound it to `mono`
+// ("" when it bound nothing).
+function cbsClass(callIx: i32, tp: string, mono: string) {
+  if !callBindHas(callIx) {
+    if callIx >= cbsMark { return "no row, call minted by the emitter" }
+    return "no row, call from the checked tree"
+  }
+  const ty = callBindTyOf(callIx, tp)
+  if ty < 0 { return "checker bound nothing" }
+  if tyHasTyVar(ty) { return "checker bound a type variable" }
+  if mono == "" { return "mono bound nothing" }
+  if tyToEmitName(ty) == mono { return "agree" }
+  // Two spellings of one type: a declared record's name against its structural render.
+  // Resolving `mono` may mint arena types, which only an armed compile pays.
+  let mc = -1
+  if mono.length >= 5 && mono.slice(0, 5) == "#anon" {
+    const at = anonHandleTyIx(mono)
+    if at >= 0 { mc = repCanonId(at) }
+  } else {
+    mc = repNameCanonId(mono)
+  }
+  if mc >= 0 && mc == repCanonId(ty) { return "agree up to spelling" }
+  // A function-value pin names the wasm signature, which several function types share.
+  if mono.length >= 2 && mono.slice(0, 2) == "=>" {
+    const sk = sigKeyOfTy(ty)
+    if sk != "" && "=>" + sk == mono { return "agree at the wasm signature" }
+  }
+  "disagree"
+}
+
+// Record the monomorphizer's binding (`tvN` -> `tvV`) of each of `typarams` at call `callIx` to
+// the function `callee`.
+export function callBindShadowNote(
+  callIx: i32,
+  callee: string,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if !cbsArmed { return 0 }
+  let k = 0
+  while k < typarams.length {
+    const tp = typarams[k]
+    let mono = ""
+    let j = 0
+    while j < tvN.length && j < tvV.length {
+      if tvN[j] == tp && mono == "" { mono = tvV[j] }
+      j = j + 1
+    }
+    let key = cbsClass(callIx, tp, mono)
+    if cbsNamed {
+      const ty = callBindTyOf(callIx, tp)
+      let col = "-"
+      if ty >= 0 { col = tyToEmitName(ty) }
+      key = key
+        + " | "
+        + callee
+        + "."
+        + tp
+        + " | checker "
+        + col
+        + " | mono "
+        + mono
+    }
+    cbsCount(key)
+    k = k + 1
+  }
+  0
+}
+
+export function callBindShadowRowCount() { cbsRowKey.length }
+
+export function callBindShadowRowLen(i: i32) { cbsRowKey[i].length }
+
+export function callBindShadowRowAt(i: i32, j: i32) { cbsRowKey[i][j] }
+
+export function callBindShadowRowN(i: i32) { cbsRowN[i] }
