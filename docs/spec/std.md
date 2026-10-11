@@ -43,9 +43,9 @@ print("x;y".split(";").length)   // prints 2
 
 **STD1.3** The names that need no import (`print`, `__trap__` and the rest of the ambient
 set, modules.md §M5.3) are not std. Neither are the built-in methods on lists, strings,
-maps and sets. Those are storage operations only: `push`, `pop`, `clear`, `length`,
-indexing, and the map and set operations. Every other operation on a built-in type is a
-std function and needs its import.
+maps and sets. The ruled set is storage operations only; today's built-in storage set is
+`push`, `pop`, `clear`, `length`, indexing, and the map and set operations. Every other
+operation on a built-in type is a std function and needs its import.
 
 ```vl
 import { includes } from "std:array"
@@ -130,8 +130,9 @@ const v = getEnv("VL_SPEC_UNSET_NAME")
 if v is IoError { print(v.code) } else if v == null { print("unset") } else { print(v) }   // prints unset
 ```
 
-> Ruling: the std review rubric, `docs/internals/std-api-review.md` §3 ("Can the caller
-> spell the error arm?"), which CLAUDE.md makes required for every std export.
+> Source: the std review rubric, `docs/internals/std-api-review.md` §3 ("Can the
+> caller spell the error arm?"), which every std export passes before it merges. No owner
+> ruling states it.
 
 **STD2.6** Findings that `vl check` reports inside std modules are hidden from a user's
 check, and errors are not (diagnostics.md §D4.2).
@@ -146,7 +147,7 @@ marked *(type)* is a type; *(re)* means the module re-exports it from the module
 | `std:args` | the program's command-line arguments | `programArgs`; `Utf8Error` *(re, std:utf8)* |
 | `std:array` | list helpers, generic in the element type | `filled`, `indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`, `reverse`, `mapIndexed`, `extend`, `concat`, `sort`, `sorted` |
 | `std:base64` | RFC 4648 base64, standard alphabet, padded | `Base64Error` *(type)*, `encodeBase64`, `decodeBase64` |
-| `std:buffer` | raw bytes in linear memory | `Buf`, `F32View`, `I32View`, `F32Base`, `I32Base` *(types)*; `Buffer`, `bufferMark`, `bufferRelease`; `load`/`store` for `I8`, `U8`, `I16`, `U16`, `I32`, `I64`, `F32`, `F64`; `fill`, `copyFrom`, `storeBytes`, `loadBytes`, `window`; `f32view`, `i32view`, `getF32`, `setF32`, `getI32`, `setI32`, `byteAddrF32`, `byteAddrI32`, `f32base`, `i32base`, `getF32At`, `setF32At`, `getI32At`, `setI32At` |
+| `std:buffer` | raw bytes in linear memory | `Buf`, `F32View`, `I32View`, `F32Base`, `I32Base` *(types)*; `Buffer`, `bufferMark`, `bufferRelease`; `loadI8`, `loadU8`, `loadI16`, `loadU16`, `loadI32`, `loadI64`, `loadF32`, `loadF64`; `store8`, `store16`, `storeI32`, `storeI64`, `storeF32`, `storeF64`; `fill`, `copyFrom`, `storeBytes`, `loadBytes`, `window`; `f32view`, `i32view`, `getF32`, `setF32`, `getI32`, `setI32`, `byteAddrF32`, `byteAddrI32`, `f32base`, `i32base`, `getF32At`, `setF32At`, `getI32At`, `setI32At` |
 | `std:bytes` | a zeroed `u8[]`, and integers read out of one | `zeroBytes`, `u16le`, `u16be`, `i16le`, `i16be`, `i32le`, `i32be`, `i64le`, `i64be` |
 | `std:env` | the environment the program started with | `getEnv`; `EILSEQ`, `EINVAL`, `IoError`, `errnoName` *(re, std:fs)* |
 | `std:fmt` | numbers as text, and parsing them back | `toString`, `padLeft`, `parseI64`, `parseI32`, `toFixed`, `parseF64`; `join`, `repeat`, `split` *(re, std:str)* |
