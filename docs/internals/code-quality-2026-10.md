@@ -49,7 +49,7 @@ Items whose row count was not measured are ranked on unblocking and cost alone, 
 | --- | --- | --- | --- | --- |
 | [L1](#L1) | Bank the per-call generic binding in the checker; key mono and SC's flow table on it | class B ≈141 of 827, plus S ≈190 of 827 when SC keys into it | 3–5 weeks | nothing; coordinate with SC |
 | [L2](#L2) | Decide a node's rep once, from its type: stop render→parse, then resume RepDesc | class A ≈157 of 827; 30 of 607 clause-1 rows by keyword (lower bound) | ratchet 0.5 d; twins 2–4 d; rep column 2–3 w; RepDesc 4–8 w | two owner rulings for the literal-union and nullable families |
-| [L3](#L3) | Move emit-side legality refusals into the checker | 1 live clause-2 site (D4071) and 1 clause-1 site (D4070) of 9 probed; 140 of 676 sites by regex | 1–2 days per family | SC for one family |
+| [L3](#L3) | Move emit-side legality refusals into the checker | 1 live clause-2 site (D4071) and 1 clause-1 site (D4070) of 9 probed; 140 of 676 sites by hand classification | 1–2 days per family | SC for one family |
 | [L4](#L4) | One `CheckMark` / `checkRollback` for the checker's quiet probes | 12 inventory rows cite the machinery by name | 2 d + 3–4 d | nothing |
 | [L5](#L5) | One pin driver for the checker's solve-and-re-check mechanisms | not measured; time-sensitive (PR #3516 adds a fourth loop) | 3–4 d + 2 d | land before or with #3516 |
 | [L6](#L6) | Key registries by structural id; collapse the eight type-equality notions | class N ≈66 of 827 | 2–4 weeks | aligns with the D3870 ruling |
@@ -193,8 +193,9 @@ supported`). The `checkTopLevel` row is a no-op (`passCheckTopLevel() { 0 }`, `:
 only for the ordering edge `collectFns` declares; it enforced the refusal D1080 retired.
 
 `scripts/emit-refusal-sites.py` reads **676** `emitFail` call sites at 5d4cd14dc
-(533 on 2026-09-05). A regex over each template, hand-checked on a seeded sample (27 of 30
-agree), classifies **140 of 676** as LEGALITY (names a contract about the user program), 108
+(533 on 2026-09-05). A hand classification of each site's template at 5d4cd14dc (keyword
+rules applied by the survey and not recorded as a script, so it is not reproducible as a
+regex; a seeded sample of 30 re-read by hand agreed on 27) puts **140 of 676** in LEGALITY (names a contract about the user program), 108
 LOWERING, 415 FLOOR, 13 UNDECIDED. Every emit-side legality refusal that a `vl check`-clean
 program reaches is a clause-2 violation by construction. The 140 is a class, not a reachability
 count: of nine direct-spelling probes, five were refused by the checker first.
@@ -212,10 +213,12 @@ D4071):**
   ```
 
   `vl check` → `no errors`, rc 0; `vl run` → `type mismatch: expected (ref $type), found (ref
-  $type)`. The guard at `wasmEmit.vl:2348` fails open. The ablation in the row shows the union
-  is not an ingredient (`type A = { k: "a", v: i32 }` alone fails the same way); the literal
-  field type is: with `k: string`, or no `k`, the checker's excess-field rule refuses the
-  literal. So this is a checker rule skipped, and the emitter guard is the second failure.
+  $type)`. The union is not an ingredient: the single record `type A = { k: "a", v: i32 }`
+  gives the same invalid wasm. The literal-typed field is: with `k: string`, or no `k`, the
+  checker's excess-field rule refuses the literal. So this is the checker's excess-field rule
+  skipped for a record with a literal-typed field; where it is skipped is not located. It is
+  not explained by the union-variant guard at `wasmEmit.vl:2348`, since the single-record
+  spelling fails the same way.
 - Clause 2, [D4071](inventory/D4071.md). A value-`if` whose `else` ends in a statement: `const x = if c { 1 } else { let y = 2 }`
   in a function whose `x` is unused. `vl check` reports two warnings and rc 0; `vl run` refuses
   at emit with `if-expression arm ends in a statement, which yields no value`
@@ -223,10 +226,12 @@ D4071):**
   got i32 | void`), so the checker knows the type; it just does not refuse the binding.
 
 **Proposed shape.** Move three families into the checker: value-`if` arms that yield no value
-(6 sites), object-literal shape against a union variant (17 sites; the one above fails open),
+(6 sites), object-literal shape against a union variant (17 sites),
 and the mono function-value one-signature rules (~12 sites in `emit_mono`; lane SC's direction —
 coordinate, do not duplicate). `checkParams`'s valtype-ladder refusal is a fourth candidate:
-whether a check-clean program reaches it is UNDECIDED (not probed). Leave the built-in arity family (~45 sites) as floors behind the
+whether a check-clean program reaches it is UNDECIDED (not probed). D4070 is not an emit
+refusal at all; its fix is the checker's existing excess-field rule, applied where it is
+skipped. Leave the built-in arity family (~45 sites) as floors behind the
 checker rule that already exists, and reword them as internal invariants so a reached one reads
 as a compiler bug. D411 covariance (7 sites) is a DESIGN refusal and stays.
 
@@ -234,7 +239,7 @@ as a compiler bug. D411 covariance (7 sites) is a DESIGN refusal and stays.
 that now `check reject`s with the same contract; `regress.py` with no `runs → not-runs`;
 `check-filed-witnesses.py --strict`.
 
-**Dependencies.** SC for family 4. **Cost.** 1–2 days per family.
+**Dependencies.** SC for family 3 (the mono rules). **Cost.** 1–2 days per family.
 
 <a id="L4"></a>
 ### L4. One `CheckMark` / `checkRollback` for the checker's quiet probes
@@ -508,7 +513,7 @@ the row says otherwise. Line numbers are at 5d4cd14dc.
 
 | group | finding | where | fix | proof |
 | --- | --- | --- | --- | --- |
-| **S-a: checker duplicates** | `canonTyIxOf` and `canonRewroteNode` are one binary search differing only in the return | `typecheck.vl:30294`, `:30307` | one `canonClearedSlot(n)` and two projections | seed |
+| **S-a: checker duplicates** | `canonTyIxOf` and `canonRewroteNode` are one binary search differing only in the return | `typecheck.vl` `canonTyIxOf`, `canonRewroteNode` at 5d4cd14dc | one `canonClearedSlot(n)` and two projections | seed |
 | | 9 identical bounded-column accessors (`nodeTyIxOf`, `isVarTyIxOf`, `asgNarTyIxOf`, `joinHeadOf`, `joinRowTy`, `joinRowNext`, `isParentTyIxOf`, `isParentElseTyIxOf`, `mapUnboxTyOf`) | `typecheck.vl:60214–60380` | one `colAt(col, i)` | seed |
 | | `symDecl` / `symDeclInOuter` share an occurrence tail and diverge: only `symDecl` skips minted `$` names | `typecheck.vl:14507`, `:14569` | `symOccPushDecl`; decide the divergence (UNDECIDED whether a minted name reaches the outer form) | LSP symbol tests + emitted-module identity |
 | | `blockHasBareReturn`: 9 call sites, no memo | `typecheck.vl:52718` | memo stamped by generation, not by length (D1655) | fuel A/B |
