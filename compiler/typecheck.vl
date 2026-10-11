@@ -51570,6 +51570,80 @@ function dstBindLitTyParams(
   0
 }
 
+// The generic `FuncDecl` the call `c` names by a plain identifier or a method name, or -1.
+function callGenericDeclIx(c: Call): i32 {
+  let name = calleeIdentName(P.nodes[c.callFn])
+  const cf = P.nodes[c.callFn]
+  if cf is Member { name = cf.memProp }
+  if name == "" { return -1 }
+  let d = fnDeclIx[name] ?? -1
+  if d < 0 { d = lookupFnDeclNode(name) }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    if dn.fnTyParams.length > 0 { return d }
+  }
+  -1
+}
+
+// Whether `ty` is unknown or mentions a type parameter: a value a generic body may compute on.
+function tyOpenOrTyVar(ty: i32): boolean { ty < 0 || tyHasTyVar(ty) }
+
+// Whether the generic function `d`'s body makes no new value of a type parameter: no operator
+// but a comparison, logic or assignment takes one, no `as` yields one, and each generic it
+// passes one to is closed too. Only such a body keeps a literal-union binding a member (D3602).
+function genericBodyClosed(d: i32, depth: i32): boolean {
+  if depth > 4 || d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return nodeClosedGo(dn.fnBody, d, depth) }
+  false
+}
+
+function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    const op = n.binOp
+    const keeps = (op == "=="
+      || op == "!="
+      || op == "<"
+      || op == ">"
+      || op == "<="
+      || op == ">="
+      || op == "&&"
+      || op == "||"
+      || op == "="
+      || op == "??")
+    if !keeps {
+      if (
+        tyOpenOrTyVar(nodeTyIxOf(n.binLeft))
+        || tyOpenOrTyVar(nodeTyIxOf(n.binRight))
+      ) {
+        return false
+      }
+    }
+  } else if n is Unary {
+    if n.unOp != "!" && tyOpenOrTyVar(nodeTyIxOf(n.unArg)) { return false }
+  } else if n is AsExpr {
+    if tyOpenOrTyVar(nodeTyIxOf(ix)) { return false }
+  } else if n is Call {
+    const g = callGenericDeclIx(n)
+    if g >= 0 && g != d {
+      let passes = false
+      for a in n.callArgs {
+        if tyOpenOrTyVar(nodeTyIxOf(a)) { passes = true }
+      }
+      const r = ufcsRecvExpr(n)
+      if r >= 0 && tyOpenOrTyVar(nodeTyIxOf(r)) { passes = true }
+      if passes && !genericBodyClosed(g, depth + 1) { return false }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if !nodeClosedGo(k, d, depth) { return false }
+  }
+  true
+}
+
 // Whether `t` is still being inferred: it holds a hole, or is an open `_ | null` slot (D2506).
 function dstTyOpen(t: i32): boolean {
   if tyHasHole(t) { return true }
@@ -51647,6 +51721,15 @@ function dstTyParamAdapts(
   // A body computing on `T` can leave a literal union (D3602), so only literal members of it
   // choose one.
   const litU = tyIsLitUnionLike(cand, 4)
+  if litU {
+    if litUnionOneBase(cand, 4) < 0 { return false }
+    const cn = P.nodes[ix]
+    if cn is Call {
+      if !genericBodyClosed(callGenericDeclIx(cn), 0) { return false }
+    } else {
+      return false
+    }
+  }
   const one: string[] = [name]
   const oneT: i32[] = [cand]
   let seen = 0
@@ -51762,6 +51845,31 @@ function tyIsLitUnionLike(ty: i32, depth: i32): boolean {
   }
   tyNotLitUnionLike()
 }
+
+// The one base scalar every literal in `ty` widens to, through lists, nullables and unions;
+// -1 when there is none, or the literals mix bases (`1 | "a"`), a union with no one scalar rep.
+function litUnionOneBase(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyNullable { return litUnionOneBase(t.nInner, depth - 1) }
+  if t is TyArray { return litUnionOneBase(t.aElem, depth - 1) }
+  if t is TyUnion {
+    let b = -1
+    for m in t.uMembers {
+      if !isNullTy(m) {
+        const mb = litUnionOneBase(m, depth - 1)
+        if mb < 0 || (b >= 0 && mb != b) { return -1 }
+        b = mb
+      }
+    }
+    return b
+  }
+  litUnionNoBase()
+}
+
+// Every other type (a primitive, record, map or function) is no literal set, so has no base.
+function litUnionNoBase(): i32 { -1 }
 
 // Every other type (a primitive, record, map or function) holds values outside any literal set.
 function tyNotLitUnionLike(): boolean { false }
