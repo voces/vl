@@ -16,7 +16,7 @@ where one exists, and is marked where the compiler has not caught up.
 | [types.md](types.md) | primitives, literal types, unions, records, nullability, lists, maps and sets, functions, generics, nominal types |
 | [expressions.md](expressions.md) | operators, mixed numeric operands, constant arithmetic, casts, evaluation order, calls, indexing, block values, lambdas, list spread |
 | [statements.md](statements.md) | programs, bindings, scope, blocks, `if`, loops, labels and loop values, `match`, `return` and `never`, local declarations |
-| narrowing.md *(next)* | `is`, null tests, flow facts and what ends them |
+| [narrowing.md](narrowing.md) | narrowable places, null tests, `is`, literal and discriminant tests, where a fact holds, writes and joins, what ends a fact |
 | modules.md *(next)* | imports, exports, re-exports, resolution |
 | diagnostics.md *(next)* | error, warning, hint and info categories; exit codes |
 | std.md *(next)* | the standard library contract |
