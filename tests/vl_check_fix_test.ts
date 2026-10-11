@@ -381,6 +381,15 @@ fixCase(
   },
   "function inner<U>(u: U) { print(u) }\nfunction q(n: i32) { print(n + 1) }\n" +
     "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
+
+fixCase(
+  "a method call on a receiver built from an earlier error imports nothing for it (DV-101)",
+  {
+    "main.vl": 'import { expect } from "std:test"\nconst g: i32[] = []\n' +
+      "expect(g.includes(1)).toEqual(false)\n",
+  },
+  'import { expect } from "std:test"\nimport { includes } from "std:array"\nconst g: i32[] = []\n' +
+    "expect(g.includes(1)).toEqual(false)\n",
 );
 
 // ---- files outside the module graph (diderven DV-004) ----------------------------------
