@@ -191,8 +191,6 @@ literal have a union type. `is` tells them apart, and arithmetic works member by
 
 ## How a union is stored
 
-The compiler chooses a union's representation. A nullable reference is a plain nullable
-reference. A union of scalars, or of references with scalars, is a small tagged box, which
-the optimiser usually removes. None of this is visible to a program. The only promise is
-the one above: `is` and `==` answer from the value. Representation detail is in
+The compiler chooses how a union value is stored, and a program cannot observe the choice.
+The only promise is the one above: `is` and `==` answer from the value. Representation detail is in
 `docs/internals/`.
