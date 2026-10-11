@@ -9460,7 +9460,9 @@ tree read stays an editor reference.
 * **A radix literal is the bit pattern at its use's width under every operator (owner,
   2026-09-30, ruling A on radix arithmetic).** `0x80000000 / 2` at `i32` is -1073741824 and
   `0xFFFFFFFF % 7` at `i32` is -1, as on master and in Java and wasm; an unsigned reading is
-  spelled `divU`, `remU`, `ltU` or `>>>`. The width is the use's, which the fold cannot see, so a
+  spelled `divU`, `remU`, `ltU` or `>>>` (for `i32` and `i64` operands; since U1, a
+  `u32` or `u64` operand reads unsigned under `/`, `%` and `<`, §"`u32` and `u64` are value
+  types"). The width is the use's, which the fold cannot see, so a
   tree whose value depends on it is not folded and computes where it is used, as before:
   arithmetic (`+ - * / %`) over a pattern, `>>` and `~` over a pattern whose top bit is set at
   its own width (32 or 64 bits), any operation over a pattern wider than 32 bits (which an `i32`
@@ -10195,3 +10197,32 @@ and a shift count may be any integer. This is the rule of Rust, Go and Zig, and 
 from U2: `i32 ↔ u32` has no lossless edge.
 
 Questions U5–U14 of the design doc are not yet ruled. Nothing here is built.
+
+
+## A positional argument lands at its written index (Q8, committee on owner delegation, 2026-10-11)
+
+**The rule.** A positional argument may follow named ones only when every named argument
+before it sits in its own parameter position. Naming a parameter that a positional argument
+already filled is refused ("given twice"). In a method call `x.f(…)` the receiver is
+position 0. The principle: a positional argument always lands at its written index. This is
+Kotlin's rule since 1.4.
+
+```vl
+function box(w: i32, h: i32): i32 { w * 10 + h }
+box(w: 3, 2)   // ok: `w` is in position 0, so 2 lands at position 1 — 32
+box(h: 3, 2)   // refused: `h` is not in its own position
+box(3, w: 2)   // refused: `w` is given twice
+box(3, h: 2)   // ok — 32
+```
+
+**Before.** Named arguments bound first, and positional ones then filled the parameters
+still unbound in declaration order, wherever they stood. `box(h: 3, 2)` and `box(3, w: 2)`
+both printed 23: the positional argument moved to a later parameter without a word.
+
+**Why not Python's rule (positional first, always).** It would break 11 calls in diderven,
+`src/craft/recipes.vl`, of the shape `gear("Copper Sword", SN_ANVIL, base: 100, [...])`,
+where the label documents an argument that is already in its own position. This rule keeps
+those and checks the label. No consumer or corpus call relies on the old skip rule.
+
+The committee voted 2–1 for this option, amended from the open question's (b)
+(`docs/spec/OPEN-QUESTIONS.md` Q8). The checker does not enforce it yet (D4061).

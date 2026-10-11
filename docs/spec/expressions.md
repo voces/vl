@@ -478,18 +478,24 @@ function f(a: i32): i32 { a }
 print(f(1, 2))   // refused: wrong number of arguments: expected 1, got 2
 ```
 
-**E11.2** Arguments may be named, `f(h: 2, w: 3)`. Named arguments may follow positional
-ones. They work only on a call to a declared function, not on a function value.
+**E11.2** Arguments may be named, `f(h: 2, w: 3)`. They work only on a call to a declared
+function, not on a function value. A positional argument binds the parameter at its written
+index. It may follow named arguments only when each of them names its own position, and a
+named argument may not name a parameter a positional one already filled. In `x.f(…)` the
+receiver is position 0.
 
 ```vl
 function box(w: i32, h: i32): i32 { w * 10 + h }
 print(box(h: 2, w: 3))   // prints 32
 print(box(3, h: 2))      // prints 32
+print(box(w: 3, 2))      // prints 32
 ```
 
-> Open question (Q8): a positional argument written after a named one is accepted.
-> Named arguments bind first and positional ones fill the remaining parameters in order,
-> so `box(w: 3, 2)` prints 32 and `box(3, w: 2)` prints 23.
+> Ruling: Q8, committee on owner delegation, 2026-10-11, DECISIONS.md §"A positional
+> argument lands at its written index".
+
+> Status: `box(h: 3, 2)` and `box(3, w: 2)` pass `vl check` and print 23, binding the
+> positional argument to a later parameter (D4061).
 
 **E11.3** A default value is a literal, a module-level `const`, or `__callsite__`. Its names
 resolve where the function is declared, and it is evaluated at each call.

@@ -56,6 +56,16 @@ const x = 1
 x = 2   // refused: cannot reassign `const` x
 ```
 
+A parameter is a `let`: the body may assign it, and the caller's value does not change.
+
+```vl
+function f(n: i32): i32 {
+  n = n * 2
+  n
+}
+print(f(4))   // prints 8
+```
+
 **S2.2** A binding's type is its annotation when it has one, and otherwise its initialiser's
 type. A binding with neither is refused.
 
@@ -85,7 +95,9 @@ function f(c: boolean): i32 {
 ```
 
 > Status: at the top level, `let x: i32` with no initialiser passes `vl check` and is then
-> refused at build, "module global has no initializer" (D2020).
+> refused at build, "module global has no initializer" (D2020). A `let` of a record type
+> with no initialiser, inside an `if` arm whose value initialises an unannotated top-level
+> binding, passes `vl check` and is refused at build (D3224).
 
 **S2.4** An unannotated binding initialised by a numeric literal takes its type from how it
 is used. Each read of such a `const` is typed as the literal would be in its place
@@ -234,7 +246,8 @@ if 1 { print(1) }   // refused: if-condition must be boolean, got i32
 if false { print(1) } else print(2)   // refused: an `else` body requires braces: `else { … }`
 ```
 
-> Ruling: owner 2026-09-01, DECISIONS.md §"An `else` body requires braces".
+> Ruling: owner 2026-09-01, DECISIONS.md §"`else` takes a block or an `if` — the brace is
+> required".
 
 ## S5. Loops
 
@@ -263,8 +276,9 @@ for i in 0 to n { print(i) }   // refused: for-range bounds must be i32, got i32
 ```
 
 **S5.3** A range whose bounds and step are all constants, and whose direction contradicts
-its step, is refused, and so is a constant step of 0. Equal bounds run once. A range
-computed at run time that cannot run runs zero times.
+its step, is refused, and so is a constant step of 0. `a to a` runs once. `a until a`
+runs zero times and is not refused. A range computed at run time that cannot run runs zero
+times.
 
 ```vl
 for i in 3 to 0 { print(i) }   // refused: this range never runs: `3 to 0` counts up (step 1) from a start above its end
@@ -280,6 +294,9 @@ print("done")   // prints done
 > runs zero times" (D1588, 2026-09-04).
 
 > Status: `step 0` is reported twice (D4057).
+
+Open question (Q9): should a constant `a until a`, which never runs, be refused like
+`3 to 0`?
 
 **S5.4** A range's variable is a fresh binding for each iteration. The body may assign it,
 and the next iteration steps from the assigned value.
@@ -298,6 +315,18 @@ read at every step, so an element pushed during the walk is visited.
 
 ```vl
 for x, i in [10, 20] { print(x + i) }   // prints 10, 21
+```
+
+The element variable may be assigned. The assignment does not write the list.
+
+```vl
+const xs = [1, 2]
+for x in xs {
+  x = x * 10
+  print(x)
+}
+print(xs[0])
+// prints 10, 20, 1
 ```
 
 ```vl
@@ -441,8 +470,7 @@ const v: i32 = while i < 9 {   // refused: cannot assign i32 | null to 'v' of ty
 ```
 
 > Status: a non-null record value of a loop or block passed straight to an unannotated
-> parameter at module scope is refused at build (D3224). A loop or block value of a
-> function type is refused at build (D3256).
+> parameter at module scope is refused at build (D3224).
 
 ## S7. `match`
 
@@ -613,6 +641,16 @@ function f(c: boolean): i32 {
 
 ```vl
 function f(): i32 { return }   // refused: return needs a value of type i32
+```
+
+Code after a `return` in the same block is legal. It never runs, and `vl check` warns.
+
+```vl
+function f(): i32 {
+  return 1
+  print("never")
+}
+print(f())   // prints 1
 ```
 
 **S8.2** A call to `__trap__()`, or to a function whose declared return type is `never`,
