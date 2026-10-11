@@ -23,6 +23,7 @@ import {
   exitFirstLetCount,
   externValueSeen,
   forInBindTy,
+  identModuleDeclOf,
   ifYieldsNoValue,
   inferRetFnKey,
   inferRetNameByNode,
@@ -209,6 +210,7 @@ import {
   fRetVoid,
   fnDispNames,
   fnParent,
+  fnPosEpochNow,
   fnStmts,
   fnValUsed,
   gSharedMemPages,
@@ -244,7 +246,16 @@ import {
   unRowOfCanon,
 } from "./emit_classify"
 import { paramIsClosure, paramNulClosure } from "./emit_query"
-import { sidNoteNodeName, sidOfNode } from "./symbols"
+import {
+  IDENT_BUILTIN,
+  IDENT_DROP_CBOX_READ,
+  identAuditDrop,
+  identDeclOf,
+  identFrom,
+  identFromDecl,
+  sidNoteNodeName,
+  sidOfNode,
+} from "./symbols"
 import { strListHas } from "./listutil"
 
 // ── loop and labelled-block values ────────────────────────────────────────────────────────────
@@ -357,6 +368,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
   }
   // The loop moves to a fresh node, and the if-expression takes its place.
   const y = addNode(loop)
+  identFrom(y, x)
   if x < nodeToks.length && y < nodeToks.length { nodeToks[y] = nodeToks[x] }
   let init = -1
   if nullable {
@@ -377,6 +389,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
   const decl = mkLet("let", name, synthTypeRefTy(spell, pos, annTy), init, pos)
   nodeTyRecord(decl, lvTyVoid())
   const rd = mkIdent(name, pos)
+  identFromDecl(rd, decl)
   nodeTyRecord(rd, ty)
   let label = ""
   let body = -1
@@ -384,7 +397,9 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
     label = loop.whileLabel
     body = loop.whileBody
     if !nullable { loop.whileLv = name }
-    if loop.whileBlk == 1 { lvRewriteTail(body, loopValTailOf(x), name, ty) }
+    if loop.whileBlk == 1 {
+      lvRewriteTail(body, loopValTailOf(x), name, decl, ty)
+    }
   } else if loop is ForRange {
     label = loop.frLabel
     body = loop.frBody
@@ -392,7 +407,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
     label = loop.fiLabel
     body = loop.fiBody
   }
-  lvRewriteBreaks(body, label, name, ty, 0, false)
+  lvRewriteBreaks(body, label, name, decl, ty, 0, false)
   const thenSt: i32[] = []
   thenSt.push(decl)
   thenSt.push(y)
@@ -400,6 +415,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
   const thenB = mkBlock(thenSt, pos)
   nodeTyRecord(thenB, ty)
   const trapFn = mkIdent("__trap__", pos)
+  identFromDecl(trapFn, IDENT_BUILTIN)
   const trap = mkCall(trapFn, [], pos)
   nodeTyRecord(trap, lvTyNever())
   markCallNever(trap)
@@ -446,7 +462,9 @@ function exitArmsEndNever() {
     if blk < 0 || blk >= P.nodes.length { return 0 }
     const b = P.nodes[blk]
     if b is Block {
-      const trap = mkCall(mkIdent("__trap__", b.pos), [], b.pos)
+      const trapFn = mkIdent("__trap__", b.pos)
+      identFromDecl(trapFn, IDENT_BUILTIN)
+      const trap = mkCall(trapFn, [], b.pos)
       nodeTyRecord(trap, lvTyNever())
       markCallNever(trap)
       b.blkStmts.push(trap)
@@ -485,12 +503,14 @@ function exitFirstLetsAnnotate() {
   0
 }
 
-// `name = v` for the value `v` a loop exit hands over, typed as the checker typed `v`.
-function lvAssign(name: string, v: i32, ty: i32): i32 {
+// `name = v` for the value `v` a loop exit hands over, typed as the checker typed `v`; `decl`
+// declares `name`.
+function lvAssign(name: string, decl: i32, v: i32, ty: i32): i32 {
   // An inner loop value rewritten as a statement is a value from here on, so the collect pass
   // must walk its arms for their locals.
   if v >= 0 && P.nodes[v] is IfStmt { valueIfAdd(v) }
   const t = mkIdent(name, -1)
+  identFromDecl(t, decl)
   nodeTyRecord(t, ty)
   const a = mkBinary("=", t, v, -1)
   nodeTyCarry(a, v)
@@ -498,13 +518,13 @@ function lvAssign(name: string, v: i32, ty: i32): i32 {
 }
 
 // A labelled block's value tail `tail`, the last statement of its body `body`, becomes `name = tail`.
-function lvRewriteTail(body: i32, tail: i32, name: string, ty: i32) {
+function lvRewriteTail(body: i32, tail: i32, name: string, decl: i32, ty: i32) {
   if tail < 0 { return 0 }
   const b = P.nodes[body]
   if b is Block {
     const st = b.blkStmts
     if st.length > 0 && st[st.length - 1] == tail {
-      st[st.length - 1] = lvAssign(name, tail, ty)
+      st[st.length - 1] = lvAssign(name, decl, tail, ty)
     }
   }
   0
@@ -517,6 +537,7 @@ function lvRewriteBreaks(
   root: i32,
   label: string,
   name: string,
+  decl: i32,
   ty: i32,
   depth0: i32,
   shadow0: boolean,
@@ -529,7 +550,7 @@ function lvRewriteBreaks(
     const depth = todoDepth.pop() ?? 0
     const shadow = todoShadow.pop() ?? false
     if ix >= 0 && ix < P.nodes.length && !(P.nodes[ix] is FuncDecl) {
-      lvRewriteBlockBreaks(ix, label, name, ty, depth, shadow)
+      lvRewriteBlockBreaks(ix, label, name, decl, ty, depth, shadow)
       let d = depth
       let sh = shadow
       const inner = lvLabelOf(ix)
@@ -570,6 +591,7 @@ function lvRewriteBlockBreaks(
   ix: i32,
   label: string,
   name: string,
+  decl: i32,
   ty: i32,
   depth: i32,
   shadow: boolean,
@@ -583,7 +605,7 @@ function lvRewriteBlockBreaks(
         const b = P.nodes[st[j]]
         if b is BreakStmt {
           if b.brkHasVal == 1 && lvLeaves(b.brkLabel, label, depth, shadow) {
-            st[j - 1] = lvAssign(name, st[j - 1], ty)
+            st[j - 1] = lvAssign(name, decl, st[j - 1], ty)
           }
         }
       }
@@ -832,6 +854,7 @@ function nssRewrite(
   const npDecl = mkLet("let", np, synthTypeRefTy("boolean", pos, tb), init, pos)
   nodeTyRecord(npDecl, lvTyVoid())
   const npT = mkIdent(np, pos)
+  identFromDecl(npT, npDecl)
   nodeTyRecord(npT, tb)
   const clr = mkBool(0, pos)
   nodeTyRecord(clr, tb)
@@ -871,22 +894,25 @@ function nssRewrite(
     i = i + 1
   }
   b.blkStmts = st
-  for ix in pres { nssSetName(ix, np, tb) }
+  for ix in pres { nssSetName(ix, np, tb, npDecl) }
   for ix in abs {
     const id = mkIdent(np, -1)
+    identFromDecl(id, npDecl)
     nodeTyRecord(id, tb)
     const un: Node = { unOp: "!", unArg: id, pos: P.nodes[ix].pos }
     arenaSetNode(ix, un)
     nodeTyRecord(ix, tb)
   }
-  for ix in reads { nssSetName(ix, nv, s) }
+  for ix in reads { nssSetName(ix, nv, s, nvDecl) }
   for ix in coals {
     const c = P.nodes[ix]
     if c is BinExpr {
       const ty = nodeTyIxOf(ix)
       const cp = mkIdent(np, -1)
+      identFromDecl(cp, npDecl)
       nodeTyRecord(cp, tb)
       const cv = mkIdent(nv, -1)
+      identFromDecl(cv, nvDecl)
       nodeTyRecord(cv, s)
       const thenSt: i32[] = [cv]
       const thenB = mkBlock(thenSt, -1)
@@ -903,11 +929,11 @@ function nssRewrite(
   0
 }
 
-// Overwrites node `ix` with a read of the name `name`, typed `ty`.
-function nssSetName(ix: i32, name: string, ty: i32) {
+// Overwrites node `ix` with a read of the name `name` declared at `decl`, typed `ty`.
+function nssSetName(ix: i32, name: string, ty: i32, decl: i32) {
   const w: Node = { identName: name, pos: P.nodes[ix].pos }
   arenaSetNode(ix, w)
-  sidNoteNodeName(ix)
+  sidNoteNodeName(ix, decl)
   nodeTyRecord(ix, ty)
   0
 }
@@ -1148,6 +1174,44 @@ export function drwMemberDeferred(callIx: i32) {
   memberCallRungOf(callIx) == MC_RUNG_PER_INSTANCE
 }
 
+// A minted callee naming the module function `name`, resolved to its declaration.
+function drwFnRef(name: string) {
+  const id = mkIdent(name, -1)
+  let d = identModuleDeclOf(name)
+  if d < 0 { d = fnDeclNamed(name) }
+  if d < 0 && externLinkOf(name) >= 0 { d = IDENT_BUILTIN }
+  identFromDecl(id, d)
+  id
+}
+
+// `fnDeclNamed`'s index over the `fnStmts` prefix `fdnLen`: name to its one declaration, or -1
+// when several share it. Valid while `fnPosEpochNow()` is `fdnEpoch`.
+let fdnEpoch = -1
+let fdnLen = 0
+let fdnDecl: {[string]: i32} = Map()
+
+// The one function declaration `fnStmts` holds under `name`, or -1 when none or several do.
+export function fnDeclNamed(name: string) {
+  if fdnEpoch != fnPosEpochNow() || fdnLen > fnStmts.length {
+    fdnEpoch = fnPosEpochNow()
+    fdnLen = 0
+    fdnDecl = Map()
+  }
+  while fdnLen < fnStmts.length {
+    const d = fnStmts[fdnLen]
+    const f = P.nodes[d]
+    if f is FuncDecl {
+      if fdnDecl.has(f.fnName) {
+        fdnDecl[f.fnName] = -1
+      } else {
+        fdnDecl[f.fnName] = d
+      }
+    }
+    fdnLen = fdnLen + 1
+  }
+  fdnDecl[name] ?? -1
+}
+
 // A fresh node denoting the same place as `ix`, so the guard's null test and the call never
 // share one arena index. Only the place forms `exprReReadable` admits are minted; anything
 // else is handed back unchanged, its caller having already declined (D1814).
@@ -1156,6 +1220,7 @@ function drwRecvClone(ix: i32) {
   if n is Paren { return drwRecvClone(n.parInner) }
   if n is Ident {
     const cId = mkIdent(n.identName, n.pos)
+    identFrom(cId, ix)
     nodeTyCarry(cId, ix)
     return cId
   }
@@ -1341,7 +1406,7 @@ function drwWalk(ix: i32, ctx: i32) {
           }
           nm[0] = ""
         }
-        const ufcsFn = mkIdent(uName, -1)
+        const ufcsFn = drwFnRef(uName)
         noteCallOrigin(ufcsFn, ix)
         n.callFn = ufcsFn
         arenaNoteRefWrite()
@@ -1455,7 +1520,7 @@ function drwWalk(ix: i32, ctx: i32) {
           woargs.push(tgt.idxArr)
           woargs.push(tgt.idxIndex)
           woargs.push(n.binRight)
-          return mkCall(mkIdent(wOp, -1), woargs, -1)
+          return mkCall(drwFnRef(wOp), woargs, -1)
         }
         const wsi = structIndexOfExpr(tgt.idxArr, ctx)
         if drwFieldClosure(wsi, "[]=") {
@@ -1555,7 +1620,7 @@ function drwWalk(ix: i32, ctx: i32) {
         const oargs: i32[] = []
         oargs.push(n.binLeft)
         oargs.push(n.binRight)
-        return drwOpCall(mkCall(mkIdent(opFn, -1), oargs, -1), ix)
+        return drwOpCall(mkCall(drwFnRef(opFn), oargs, -1), ix)
       }
       if osi >= 0 {
         if drwFieldClosure(osi, n.binOp) {
@@ -1606,7 +1671,7 @@ function drwWalk(ix: i32, ctx: i32) {
       const roargs: i32[] = []
       roargs.push(n.idxArr)
       roargs.push(n.idxIndex)
-      return drwOpCall(mkCall(mkIdent(rOp, -1), roargs, -1), ix)
+      return drwOpCall(mkCall(drwFnRef(rOp), roargs, -1), ix)
     }
     // The index read trap: a struct receiver carrying a "[]" closure field.
     const tsi = structIndexOfExpr(n.idxArr, ctx)
@@ -1897,6 +1962,7 @@ function spillLocal(
   nodeTyCarry(decl, ix)
   out.push(decl)
   const rd = mkIdent(name, pos)
+  identFromDecl(rd, decl)
   nodeTyCarry(rd, ix)
   refViewCarry(ix, rd)
   rd
@@ -1907,6 +1973,7 @@ function spillRead(rd: i32): i32 {
   const n = P.nodes[rd]
   if n is Ident {
     const r2 = mkIdent(n.identName, n.pos)
+    identFrom(r2, rd)
     nodeTyCarry(r2, rd)
     return r2
   }
@@ -3214,9 +3281,11 @@ function cboxYieldTail(blockIx: i32, boxed: string[]) {
   cboxWriteLets[tname] = 1
   const tlet = mkLet("const", tname, -1, tn.binRight, -1)
   const store = mkIdent(tname, -1)
+  identFromDecl(store, tlet)
   nodeTyRecord(store, valTy)
   tn.binRight = store
   const yielded = mkIdent(tname, -1)
+  identFromDecl(yielded, tlet)
   nodeTyRecord(yielded, valTy)
   st[st.length - 1] = tlet
   st.push(tx)
@@ -3322,13 +3391,15 @@ function cboxVecBoxLet(ix: i32, n: LetDecl, key: string): boolean {
 }
 
 // A `let <name>$cb = [<name>]` that seeds the cell of boxed parameter or loop variable `name`,
-// whose value has type `ty` and annotation `annot` (-1 for none). Reads of `name` go through
-// the cell from here on.
-function cboxSeedLet(name: string, annot: i32, ty: i32) {
+// declared at `decl`, whose value has type `ty` and annotation `annot` (-1 for none). Reads of
+// `name` go through the cell from here on, and the cell stands for `decl`.
+function cboxSeedLet(name: string, decl: i32, annot: i32, ty: i32) {
   const src = mkIdent(name, -1)
+  identFromDecl(src, decl)
   if ty >= 0 { nodeTyRecord(src, ty) }
   const cell = name + "$cb"
   const lx = mkLet("let", cell, annot, src, -1)
+  identFromDecl(lx, decl)
   cboxBoxLet(lx, name)
   cboxCellOf[name] = cell
   lx
@@ -3351,17 +3422,27 @@ function cboxPrepend(blk: i32, first: i32) {
   0
 }
 
-// `name = cell[0]`: a boxed range variable handed back to the loop, which steps from it.
-function cboxStoreBack(name: string) {
+// `name = cell[0]`: a boxed range variable, declared by the loop `decl`, handed back to the
+// loop, which steps from it.
+function cboxStoreBack(name: string, decl: i32) {
   const cell = mkIdent(cboxCellOf[name] ?? name, -1)
+  identFromDecl(cell, decl)
   const cellTy = cboxCellTy[name] ?? -1
   if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
-  mkBinary("=", mkIdent(name, -1), mkIndex(cell, mkNum("0", -1), -1), -1)
+  const tgt = mkIdent(name, -1)
+  identFromDecl(tgt, decl)
+  mkBinary("=", tgt, mkIndex(cell, mkNum("0", -1), -1), -1)
 }
 
-// Puts `name = cell[0]` before each `continue` under `ix` that targets the range loop being
-// rewritten: an unlabelled one outside any inner loop (`nest` 0), or one naming `label`.
-function cboxContStoreBack(ix: i32, name: string, label: string, nest: i32) {
+// Puts `name = cell[0]` before each `continue` under `ix` that targets the range loop `decl`
+// being rewritten: an unlabelled one outside any inner loop (`nest` 0), or one naming `label`.
+function cboxContStoreBack(
+  ix: i32,
+  name: string,
+  decl: i32,
+  label: string,
+  nest: i32,
+) {
   let cur = ix
   while cur >= 0 {
     const n = P.nodes[cur]
@@ -3377,10 +3458,10 @@ function cboxContStoreBack(ix: i32, name: string, label: string, nest: i32) {
             (s.contLabel == "" && nest == 0)
             || (s.contLabel != "" && s.contLabel == label)
           ) {
-            out.push(cboxStoreBack(name))
+            out.push(cboxStoreBack(name, decl))
           }
         } else {
-          cboxContStoreBack(bs[i], name, label, nest)
+          cboxContStoreBack(bs[i], name, decl, label, nest)
         }
         out.push(bs[i])
         i = i + 1
@@ -3394,7 +3475,7 @@ function cboxContStoreBack(ix: i32, name: string, label: string, nest: i32) {
     const kids = nodeValueSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      cboxContStoreBack(kids[k], name, label, inner)
+      cboxContStoreBack(kids[k], name, decl, label, inner)
       k = k + 1
     }
     cur = elseIfLink(cur)
@@ -3452,6 +3533,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
       // the binding's declared type to answer from. The read `c[0]` itself is untyped here;
       // only the left of a `??` or `=` is typed, by the `BinExpr` arm.
       const cell = mkIdent(cboxCellOf[n.identName] ?? n.identName, -1)
+      if identAuditDrop != IDENT_DROP_CBOX_READ { identFrom(cell, ix) }
       const cellTy = cboxCellTy[n.identName] ?? -1
       if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
       const rd = mkIndex(cell, mkNum("0", -1), -1)
@@ -3557,14 +3639,14 @@ function cboxWalk(ix: i32, boxed: string[]) {
     // cell's value back to the counter wherever the iteration ends and the loop steps on.
     let rseed = -1
     if cboxDepth == 0 && strListHas(boxed, n.frVar) {
-      rseed = cboxSeedLet(n.frVar, -1, TY_I32)
+      rseed = cboxSeedLet(n.frVar, ix, -1, TY_I32)
     }
     n.frBody = cboxWalk(n.frBody, boxed)
     if rseed >= 0 {
-      cboxContStoreBack(n.frBody, n.frVar, n.frLabel, 0)
+      cboxContStoreBack(n.frBody, n.frVar, ix, n.frLabel, 0)
       const rb = P.nodes[n.frBody]
       if rb is Block {
-        rb.blkStmts.push(cboxStoreBack(n.frVar))
+        rb.blkStmts.push(cboxStoreBack(n.frVar, ix))
         plCacheBust()
       }
       cboxPrepend(n.frBody, rseed)
@@ -3585,10 +3667,10 @@ function cboxWalk(ix: i32, boxed: string[]) {
     if cboxDepth == 0 {
       const iterTy = strLitRecvTy(nodeTyIxOf(n.fiIter))
       if strListHas(boxed, n.fiVar) {
-        iseed = cboxSeedLet(n.fiVar, -1, forInBindTy(iterTy, false))
+        iseed = cboxSeedLet(n.fiVar, ix, -1, forInBindTy(iterTy, false))
       }
       if n.fiVar2 != "" && strListHas(boxed, n.fiVar2) {
-        iseed2 = cboxSeedLet(n.fiVar2, -1, forInBindTy(iterTy, true))
+        iseed2 = cboxSeedLet(n.fiVar2, ix, -1, forInBindTy(iterTy, true))
       }
     }
     n.fiBody = cboxWalk(n.fiBody, boxed)
@@ -3808,7 +3890,9 @@ export function captureBoxRewrite(_stmts: i32[]) {
             if strListHas(boxed, p.parName) {
               let annot = p.parType
               if p.parOpt != 0 { annot = -1 }
-              seeds.push(cboxSeedLet(p.parName, annot, nodeTyIxOf(ps[pi])))
+              seeds.push(
+                cboxSeedLet(p.parName, ps[pi], annot, nodeTyIxOf(ps[pi])),
+              )
             }
           }
           pi = pi + 1
@@ -4075,9 +4159,12 @@ function shrWalkFrame(fnIx: i32) {
           let annot = p.parType
           if p.parOpt != 0 { annot = -1 }
           const src = mkIdent(p.parName, -1)
+          identFromDecl(src, ps[pi])
           const pty = nodeTyIxOf(ps[pi])
           if pty >= 0 { nodeTyRecord(src, pty) }
-          seeds.push(mkLet("let", sp, annot, src, -1))
+          const seed = mkLet("let", sp, annot, src, -1)
+          identFromDecl(seed, ps[pi])
+          seeds.push(seed)
           shrOpen(p.parName, sp)
         } else {
           shrDeclare(p.parName, false)
@@ -4150,7 +4237,7 @@ function shrWalk(ix: i32) {
       const sp = shrCur[n.identName] ?? ""
       if sp != "" && sp != n.identName {
         n.identName = sp
-        sidNoteNodeName(cur)
+        sidNoteNodeName(cur, identDeclOf(cur))
       }
       return 0
     }
@@ -4159,7 +4246,7 @@ function shrWalk(ix: i32) {
       const lsp = shrDeclare(n.letName, true)
       if lsp != n.letName {
         n.letName = lsp
-        sidNoteNodeName(cur)
+        sidNoteNodeName(cur, cur)
       }
       return 0
     }
@@ -4182,7 +4269,7 @@ function shrWalk(ix: i32) {
       const rsp = shrDeclare(n.frVar, true)
       if rsp != n.frVar {
         n.frVar = rsp
-        sidNoteNodeName(cur)
+        sidNoteNodeName(cur, cur)
       }
       shrWalk(n.frBody)
       shrTrim(rmark)
@@ -4194,7 +4281,7 @@ function shrWalk(ix: i32) {
       const isp = shrDeclare(n.fiVar, true)
       if isp != n.fiVar {
         n.fiVar = isp
-        sidNoteNodeName(cur)
+        sidNoteNodeName(cur, cur)
       }
       if n.fiVar2 != "" { n.fiVar2 = shrDeclare(n.fiVar2, true) }
       shrWalk(n.fiBody)
@@ -4354,10 +4441,19 @@ export function synthVoidTwins(_stmts: i32[]) {
               // Fresh Param nodes sharing the original's annotation node, so the twin's
               // param valtypes — and its `$fnsig` param tokens — byte-match the
               // original's (only the result differs: `>v`).
-              nps.push(
-                mkParam(pn.parName, pn.parType, -1, 0, pn.parRest, pn.pos),
+              const np = mkParam(
+                pn.parName,
+                pn.parType,
+                -1,
+                0,
+                pn.parRest,
+                pn.pos,
               )
-              argIds.push(mkIdent(pn.parName, tfn.pos))
+              identFrom(np, tfn.fnParams[pj])
+              nps.push(np)
+              const arg = mkIdent(pn.parName, tfn.pos)
+              identFromDecl(arg, np)
+              argIds.push(arg)
             } else {
               mintable = false
             }
@@ -4365,7 +4461,9 @@ export function synthVoidTwins(_stmts: i32[]) {
           }
           if mintable {
             const noTyParams: string[] = []
-            const callIx = mkCall(mkIdent(name, tfn.pos), argIds, tfn.pos)
+            const callee = mkIdent(name, tfn.pos)
+            identFromDecl(callee, fnStmts[target])
+            const callIx = mkCall(callee, argIds, tfn.pos)
             const bodyIx = mkBlock([callIx], tfn.pos)
             const twin = mkFunc(
               name + "$voidtw",
@@ -4448,7 +4546,7 @@ function extvRespellIn(ix: i32, fnIx: i32) {
         if externValueFe(nm) < 0 { synthExternValueFn(nm, n.pos) }
         if externValueFe(nm) >= 0 {
           n.identName = nm + "$extv"
-          sidNoteNodeName(cur)
+          sidNoteNodeName(cur, fnStmts[externValueFe(nm)])
         }
       }
       return 0
@@ -4493,8 +4591,10 @@ function synthExternValueFn(name: string, pos: i32) {
   while i < n {
     const pn = "__a" + i32ToStr(i)
     const pty = synthTypeRefTy(externParamAt(k, i), pos, -1)
-    ps.push(mkParam(pn, pty, -1, 0, 0, pos))
+    const par = mkParam(pn, pty, -1, 0, 0, pos)
+    ps.push(par)
     const arg = mkIdent(pn, pos)
+    identFromDecl(arg, par)
     recordNodeTyFrom(arg, pty)
     args.push(arg)
     i = i + 1
@@ -4504,7 +4604,7 @@ function synthExternValueFn(name: string, pos: i32) {
   const rty = synthTypeRefTy(ret, pos, -1)
   const noTyParams: string[] = []
   // The minted nodes postdate the checker, so each carries the type its annotation names.
-  const call = mkCall(mkIdent(name, pos), args, pos)
+  const call = mkCall(drwFnRef(name), args, pos)
   recordNodeTyFrom(call, rty)
   const fe = mkFunc(
     name + "$extv",

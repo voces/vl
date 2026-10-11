@@ -229,6 +229,10 @@ import {
 // Monomorphization rewrites a call's callee name on a node the arena already holds;
 // `compiler/symbols.vl` is the discipline that in-place write follows.
 import {
+  IDENT_DROP_MONO_CALLEE,
+  identAuditDrop,
+  identFrom,
+  identFromDecl,
   sidArrGet,
   sidArrPut,
   sidLookup,
@@ -279,6 +283,7 @@ import {
   drwFillDefaults,
   drwMemberDeferred,
   drwSelfFnOf,
+  fnDeclNamed,
   recordedParamPinName,
 } from "./emit_rewrite"
 import {
@@ -2807,7 +2812,7 @@ function monoRemintCall(ix: i32, callee: i32, args: i32[]): i32 {
 // banked row.
 function monoExprMake(ix: i32, kids: i32[]): i32 {
   const n = P.nodes[ix]
-  if n is Ident { return mkIdent(n.identName, n.pos) }
+  if n is Ident { return monoCopyOf(ix, mkIdent(n.identName, n.pos)) }
   if n is Call {
     const args: i32[] = []
     let ai = 1
@@ -3221,7 +3226,7 @@ function monoCloneBodyRaw(
       if nt >= 0 { ninit = monoHoleListLitCopy(n.letInit) }
     }
     if nt == n.letType { return ix }
-    return mkLet(n.letKw, n.letName, nt, ninit, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
   }
   if n is WhileStmt {
     const cb = monoCloneBody(
@@ -3422,6 +3427,7 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
             p0.parRest,
             p0.pos,
           )
+          identFrom(np, a.fnParams[0])
           // The pinned element row is handed over rather than re-parsed out of the
           // element name: `pElemTys` is built beside `pElems` from the same pin, so the
           // row reaches this mint without the name being turned back into a type.
@@ -3619,7 +3625,10 @@ function monoCloneLambdaSubst(
         const nt = monoSubstAnnNode(p.parType, typarams, tvN, tvV, bN, bT)
         if nt >= 0 {
           ps.push(
-            mkParam(p.parName, nt, p.parDefault, p.parOpt, p.parRest, p.pos),
+            monoCopyOf(
+              a.fnParams[i],
+              mkParam(p.parName, nt, p.parDefault, p.parOpt, p.parRest, p.pos),
+            ),
           )
           any = true
         } else if nt == -2 {
@@ -3634,7 +3643,10 @@ function monoCloneLambdaSubst(
           const ipn = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
           if ipn >= 0 {
             ps.push(
-              mkParam(p.parName, ipn, p.parDefault, p.parOpt, p.parRest, p.pos),
+              monoCopyOf(
+                a.fnParams[i],
+                mkParam(p.parName, ipn, p.parDefault, p.parOpt, p.parRest, p.pos),
+              ),
             )
             any = true
           } else {
@@ -3879,7 +3891,7 @@ function monoPinBodyLambdasRaw(
     // not reach, has its annotation substituted here.
     const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
     if ci == n.letInit && nt == n.letType { return ix }
-    return mkLet(n.letKw, n.letName, nt, ci, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ci, n.pos))
   }
   // D1046 — a nested named `function` statement is the declaration form of the same
   // thing, and `collectFns` lifts it exactly like a lambda. The statement itself emits
@@ -5161,7 +5173,7 @@ function monoPinMapLambdas(
   if n is LetDecl {
     const ci = monoPinMapLambdas(n.letInit, pNames, pElems, pElemTys)
     if ci == n.letInit { return ix }
-    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
   }
   if n is WhileStmt {
     const cb = monoPinMapLambdas(n.whileBody, pNames, pElems, pElemTys)
@@ -5397,7 +5409,7 @@ function monoBakeCallback(
   if n is LetDecl {
     const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames, fnDeclIx)
     if ci == n.letInit { return ix }
-    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
   }
   if n is WhileStmt {
     const cb = monoBakeCallback(n.whileBody, cbParamNames, cbFnNames, fnDeclIx)
@@ -5466,6 +5478,7 @@ function monoBakeCallback(
         while bk < cbParamNames.length {
           if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
             newCallee = mkIdent(cbFnNames[bk], callee.pos)
+            identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
           }
           bk = bk + 1
         }
@@ -5875,7 +5888,7 @@ function monoRenameGenAliasInit(
   collectANoteIdentRename(iv.identName)
   iv.identName = inst
   monoArenaTouch()
-  sidNoteNodeName(d.letInit)
+  sidNoteNodeName(d.letInit, monoFnDeclNamed(inst))
   0
 }
 
@@ -6536,6 +6549,7 @@ function monoCopyCellRead(ix: i32): i32 {
   if !(a is Ident) { return ix }
   const ai = mkIdent(a.identName, a.pos)
   lfNoteMinted(ai, n.idxArr)
+  identFrom(ai, n.idxArr)
   if nodeTyIxOf(n.idxArr) >= 0 { nodeTyRecord(ai, nodeTyIxOf(n.idxArr)) }
   const ri = mkIndex(ai, n.idxIndex, n.pos)
   if nodeTyIxOf(ix) >= 0 { nodeTyRecord(ri, nodeTyIxOf(ix)) }
@@ -6554,14 +6568,17 @@ function monoCloneGenericCallsRaw(ix: i32) {
       if monoCalleeIsGeneric(n.callFn) {
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
+        identFrom(newCallee, n.callFn)
       } else if monoStrListHas(monoCgcGenAliasNames, callee.identName) {
         // A call through an alias never written (`const`, or an unwritten `let`) of a generic
         // function is renamed per instance too.
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
+        identFrom(newCallee, n.callFn)
       } else if monoStrListHas(monoCgcLamNames, callee.identName) {
         newCallee = mkIdent(callee.identName, callee.pos)
         lfNoteMinted(newCallee, n.callFn)
+        identFrom(newCallee, n.callFn)
         monoLamCallCallees.push(newCallee)
         lamCall = true
       }
@@ -6623,10 +6640,11 @@ function monoCloneGenericCallsRaw(ix: i32) {
       if iv is Ident {
         ci = mkIdent(iv.identName, iv.pos)
         lfNoteMinted(ci, n.letInit)
+        identFrom(ci, n.letInit)
       }
     }
     if ci == n.letInit { return ix }
-    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
   }
   if n is RetStmt {
     const ca2 = monoCloneGenericCalls(n.retArg)
@@ -6789,6 +6807,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
     ) {
       const vi = mkIdent(n.identName, n.pos)
       lfNoteMinted(vi, ix)
+      identFrom(vi, ix)
       const vt = monoLamCallTy(nodeTyIxOf(ix))
       if vt >= 0 { nodeTyRecord(vi, vt) }
       return vi
@@ -6915,7 +6934,9 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
             const oargs: i32[] = []
             oargs.push(bl)
             oargs.push(br)
-            return mkCall(mkIdent(opFn, -1), oargs, -1)
+            const opCallee = mkIdent(opFn, -1)
+            identFromDecl(opCallee, monoFnDeclNamed(opFn))
+            return mkCall(opCallee, oargs, -1)
           }
         }
       }
@@ -6950,7 +6971,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
   if n is LetDecl {
     const ci = monoPinBinOps(n.letInit, pNames, pTys)
     if ci == n.letInit { return ix }
-    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
   }
   if n is RetStmt {
     const ca = monoPinBinOps(n.retArg, pNames, pTys)
@@ -7041,6 +7062,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
         const pro = P.nodes[pcallee.memObj]
         if nargs.length == 1 && tyIsMap(precvTy) && pro is Ident {
           const prIx = mkIdent(pro.identName, pro.pos)
+          identFrom(prIx, pcallee.memObj)
           nodeTyRecord(prIx, precvTy)
           const pmg = mkIndex(prIx, nargs[0], n.pos)
           nodeTyCarry(pmg, ix)
@@ -7078,6 +7100,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
             }
           }
           const puFn = mkIdent(puName, -1)
+          identFromDecl(puFn, monoFnDeclNamed(puName))
           noteCallOrigin(puFn, ix)
           const puCall = mkCallN(puFn, puArgs, puNames, n.pos)
           drwFillDefaults(puCall, monoPinCtx)
@@ -7240,7 +7263,7 @@ function monoFoldTyParamLayout(
   if n is LetDecl {
     const ci = monoFoldTyParamLayout(n.letInit, typarams, tvN, tvV)
     if ci == n.letInit { return ix }
-    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
   }
   if n is RetStmt {
     const ca = monoFoldTyParamLayout(n.retArg, typarams, tvN, tvV)
@@ -8118,7 +8141,9 @@ function monoMakeInstanceGo(
               cal.identName = monoInstName[k]
               monoArenaTouch()
               // R4 writer 5 of 8 (`compiler/symbols.vl`; census in `perf-program.md`).
-              sidNoteNodeName(calleeIx)
+              let instDecl = fnStmts[monoInstFe[k]]
+              if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
+              sidNoteNodeName(calleeIx, instDecl)
             }
           }
         }
@@ -8260,7 +8285,10 @@ function monoMakeInstanceGo(
           monoAnonParamPinTy.set(nt, pinTys[pj])
         }
         nps.push(
-          mkParam(p3.parName, nt, p3.parDefault, p3.parOpt, p3.parRest, -1),
+          monoCopyOf(
+            params[pj],
+            mkParam(p3.parName, nt, p3.parDefault, p3.parOpt, p3.parRest, -1),
+          ),
         )
         // D926 — and the `??` owner mark, which is keyed by arena node and so does not
         // survive a clone on its own. See `anonLeafCarryParamMark`.
@@ -9064,7 +9092,9 @@ function monoMakeInstanceGo(
         collectANoteIdentRename(cal2.identName)
         cal2.identName = instName
         monoArenaTouch()
-        sidNoteNodeName(calleeIx)
+        let instDecl = fnStmts[instFe]
+        if identAuditDrop == IDENT_DROP_MONO_CALLEE { instDecl = -1 }
+        sidNoteNodeName(calleeIx, instDecl)
       }
     }
     // REGISTER before walking the body, so a recursive self-call at the same
@@ -11999,7 +12029,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
             collectANoteIdentRename(cal.identName)
             cal.identName = monoInstName[r]
             monoArenaTouch()
-            sidNoteNodeName(c.callFn)
+            sidNoteNodeName(c.callFn, fnStmts[monoInstFe[r]])
           }
           return 0
         }
@@ -12036,6 +12066,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
               p3.pos,
             ),
           )
+          identFrom(nps[nps.length - 1], params[pj])
           // D926 — as at the generic clone: the mark is arena-node keyed.
           anonLeafCarryParamMark(params[pj], nps[nps.length - 1])
         }
@@ -12064,7 +12095,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         collectANoteIdentRename(cal2.identName)
         cal2.identName = specName
         monoArenaTouch()
-        sidNoteNodeName(c.callFn)
+        sidNoteNodeName(c.callFn, fnStmts[instFe])
       }
       monoKeys.push(key)
       monoInstOrig.push(fe)
@@ -12078,6 +12109,36 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
     }
   }
   0
+}
+
+// `copy`, a fresh node standing for `orig`, after it takes `orig`'s binding identity.
+function monoCopyOf(orig: i32, copy: i32) {
+  identFrom(copy, orig)
+  copy
+}
+
+// The declaration of the function a minted callee names: a registered instance, else the one
+// function declared under `name`; -1 when none is, or when two are and the name cannot choose.
+function monoFnDeclNamed(name: string) {
+  const inst = monoInstDeclOf(name)
+  if inst >= 0 { return inst }
+  fnDeclNamed(name)
+}
+
+// The declaration of the instance registered as `name`, or -1 when none is.
+function monoInstDeclOf(name: string) {
+  let i = monoInstName.length - 1
+  while i >= 0 {
+    if (
+      monoInstName[i] == name
+      && monoInstFe[i] >= 0
+      && monoInstFe[i] < fnStmts.length
+    ) {
+      return fnStmts[monoInstFe[i]]
+    }
+    i = i - 1
+  }
+  -1
 }
 
 // Points `calleeIx`, an instance's own copy of a call through a lambda binding, at the
@@ -12095,7 +12156,7 @@ function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
     collectANoteIdentRename(cal.identName)
     cal.identName = instName
     monoArenaTouch()
-    sidNoteNodeName(calleeIx)
+    sidNoteNodeName(calleeIx, monoFnDeclNamed(instName))
   }
   0
 }
@@ -12602,7 +12663,7 @@ function monoRespellLamAlias(calleeIx: i32, ctx: i32) {
       collectANoteIdentRename(cal.identName)
       cal.identName = src.identName
       monoArenaTouch()
-      sidNoteNodeName(calleeIx)
+      sidNoteNodeName(calleeIx, si)
       return 0
     }
     at = d.letInit

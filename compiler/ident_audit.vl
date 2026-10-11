@@ -1,0 +1,218 @@
+// The binding-identity audit: after the last arena-rewriting pass, every `Ident` the emitter
+// can reach must carry a declaration in `identDeclOf`. Off unless a host arms it; armed, it
+// counts the identifiers left at -1, by the kind of node holding them and by the pass that
+// minted them (`docs/internals/fn-value-flow-design.md` §(f) step 0).
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  nodeChildren,
+} from "./ast"
+import { identAuditPassSet, identDeclOf, identWritePassOf } from "./symbols"
+
+let iaArmed = false
+let iaNamed = false
+let iaMarkName: string[] = []
+let iaMarkLen: i32[] = []
+let iaRowKey: string[] = []
+let iaRowN: i32[] = []
+let iaUnresolved = 0
+
+// Arm (1) or disarm (0) the audit for the compiles that follow; 2 also names each identifier
+// in its row.
+export function identAuditArm(on: i32) {
+  iaArmed = on != 0
+  iaNamed = on == 2
+  0
+}
+
+// Start a compile's audit: the arena so far is the parser's and the checker's.
+export function identAuditBegin() {
+  iaMarkName = []
+  iaMarkLen = []
+  iaRowKey = []
+  iaRowN = []
+  iaUnresolved = 0
+  if iaArmed { identAuditMark("check") }
+  0
+}
+
+// Record that pass `name` has run, so a node minted since the previous mark is attributed
+// to it.
+export function identAuditMark(name: string) {
+  if !iaArmed { return 0 }
+  iaMarkName.push(name)
+  iaMarkLen.push(P.nodes.length)
+  identAuditPassSet(iaMarkName.length)
+  0
+}
+
+// The pass that last touched identifier `ix`: the later of the one that minted it (the first
+// mark taken after it existed) and the one that last wrote its entry.
+function iaMinter(ix: i32): string {
+  let m = iaMarkLen.length
+  let i = 0
+  while i < iaMarkLen.length {
+    if ix < iaMarkLen[i] && m == iaMarkLen.length { m = i }
+    i = i + 1
+  }
+  const w = identWritePassOf(ix)
+  if w > m { m = w }
+  if m < iaMarkName.length { return iaMarkName[m] }
+  "after the last pass"
+}
+
+function iaCount(key: string) {
+  let i = 0
+  while i < iaRowKey.length {
+    if iaRowKey[i] == key {
+      iaRowN[i] = iaRowN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  iaRowKey.push(key)
+  iaRowN.push(1)
+  0
+}
+
+// The position an `Ident` child of `parent` occupies, named by the holder's kind.
+function iaPosition(parent: i32, child: i32): string {
+  if parent < 0 { return "statement" }
+  const p = P.nodes[parent]
+  match p {
+    NumLit => "NumLit"
+    StrLit => "StrLit"
+    CharLit => "CharLit"
+    BoolLit => "BoolLit"
+    NullLit => "NullLit"
+    Ident => "Ident"
+    Unary => "Unary"
+    BinExpr => if p.binLeft == child { "BinExpr.left" } else { "BinExpr.right" }
+    Call => if p.callFn == child { "Call.callee" } else { "Call.arg" }
+    Member => "Member"
+    OptMember => "OptMember"
+    Paren => "Paren"
+    ErrExpr => "ErrExpr"
+    LetDecl => "LetDecl"
+    Param => "Param.default"
+    TypeRef => "TypeRef"
+    FuncDecl => "FuncDecl"
+    IfStmt => "IfStmt"
+    WhileStmt => "WhileStmt"
+    BreakStmt => "BreakStmt"
+    ContinueStmt => "ContinueStmt"
+    RetStmt => "RetStmt"
+    Block => "Block"
+    Program => "Program"
+    FieldDef => "FieldDef"
+    TypeDecl => "TypeDecl"
+    FieldInit => "FieldInit"
+    ObjLit => "ObjLit"
+    ArrayLit => "ArrayLit"
+    Index => if p.idxArr == child { "Index.base" } else { "Index.index" }
+    UnionDecl => "UnionDecl"
+    IsExpr => "IsExpr"
+    AsExpr => "AsExpr"
+    ForRange => "ForRange"
+    ForIn => "ForIn"
+    MatchExpr => "MatchExpr"
+    ImportDecl => "ImportDecl"
+    Spread => "Spread"
+  }
+}
+
+// Walk from the module's statements `stmts` and every function `fns` names, counting each
+// reachable `Ident` with no recorded declaration once.
+export function identAuditRun(stmts: i32[], fns: i32[]) {
+  if !iaArmed { return 0 }
+  const seen: boolean[] = []
+  while seen.length < P.nodes.length { seen.push(false) }
+  const stack: i32[] = []
+  const parents: i32[] = []
+  let r = 0
+  while r < stmts.length {
+    stack.push(stmts[r])
+    parents.push(-1)
+    r = r + 1
+  }
+  r = 0
+  while r < fns.length {
+    stack.push(fns[r])
+    parents.push(-1)
+    r = r + 1
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    const par = parents.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length && !seen[ix] {
+      seen[ix] = true
+      const id = P.nodes[ix]
+      if id is Ident {
+        if identDeclOf(ix) == -1 {
+          iaUnresolved = iaUnresolved + 1
+          let key = iaPosition(par, ix) + " @ " + iaMinter(ix)
+          if iaNamed { key = key + " '" + id.identName + "'" }
+          iaCount(key)
+        }
+      } else {
+        const kids = nodeChildren(ix)
+        let k = 0
+        while k < kids.length {
+          stack.push(kids[k])
+          parents.push(ix)
+          k = k + 1
+        }
+      }
+    }
+  }
+  0
+}
+
+// The reachable identifiers the last armed compile left without a declaration.
+export function identAuditUnresolved() { iaUnresolved }
+
+// The breakdown rows: `<position> @ <minting pass>` and how many identifiers it holds.
+export function identAuditRowCount() { iaRowKey.length }
+
+export function identAuditRowLen(i: i32) { iaRowKey[i].length }
+
+export function identAuditRowAt(i: i32, j: i32) { iaRowKey[i][j] }
+
+export function identAuditRowN(i: i32) { iaRowN[i] }
