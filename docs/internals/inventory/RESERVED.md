@@ -89,3 +89,4 @@ D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D38
 D3880-D3889  lane-SC  2026-10-08  D3881 filed open; the rest for D3827, D3853 and their residue
 D3890-D3899  lane-SC  2026-10-08  lane SC soundness rows (D3853 redesign, D3883)
 D3960-D3969  lane-CK  2026-10-10  checker soundness: a generic-seeded let written with a concrete function (D3960) and the emit rows its matrix and review found
+D3970-D3979  lane-SC  2026-10-10  lane SC rows for D3948 and the rv3498 residue
