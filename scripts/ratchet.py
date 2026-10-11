@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The shared ratchet core — one baseline schema, one `--check`, one `--why`.
 
-Five scripts hold a count against a committed baseline that may only FALL:
-comment-budget, ladder-budget, sentinel-budget, scan-budget and seed-size. The
-four that count PER FILE PER CODE were the same 41 lines four times over —
+Eight scripts hold a count against a committed baseline that may only FALL:
+comment-budget, ladder-budget, sentinel-budget, scan-budget, export-budget,
+interp-budget, render-parse-budget and seed-size. The per-file ones that came
+first were the same 41 lines four times over —
 `load_baseline`, `write_baseline`, `cmd_check`, `cmd_exempt_codes`, the
 `{file: {code: count}}` schema, the `git archive` tree walk, and the
 `python3 scripts/<self>.py --write-baseline` remedy line. This is that shape,
