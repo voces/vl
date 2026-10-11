@@ -49,7 +49,7 @@ Items whose row count was not measured are ranked on unblocking and cost alone, 
 | --- | --- | --- | --- | --- |
 | [L1](#L1) | Bank the per-call generic binding in the checker; key mono and SC's flow table on it | class B ≈141 of 827, plus S ≈190 of 827 when SC keys into it | 3–5 weeks | nothing; coordinate with SC |
 | [L2](#L2) | Decide a node's rep once, from its type: stop render→parse, then resume RepDesc | class A ≈157 of 827; 30 of 607 clause-1 rows by keyword (lower bound) | ratchet 0.5 d; twins 2–4 d; rep column 2–3 w; RepDesc 4–8 w | two owner rulings for the literal-union and nullable families |
-| [L3](#L3) | Move emit-side legality refusals into the checker | 1 live clause-2 site and 1 unfiled clause-1 site of 9 probed; 140 of 676 sites by regex | 1–2 days per family | SC for one family |
+| [L3](#L3) | Move emit-side legality refusals into the checker | 1 live clause-2 site (D4071) and 1 clause-1 site (D4070) of 9 probed; 140 of 676 sites by regex | 1–2 days per family | SC for one family |
 | [L4](#L4) | One `CheckMark` / `checkRollback` for the checker's quiet probes | 12 inventory rows cite the machinery by name | 2 d + 3–4 d | nothing |
 | [L5](#L5) | One pin driver for the checker's solve-and-re-check mechanisms | not measured; time-sensitive (PR #3516 adds a fourth loop) | 3–4 d + 2 d | land before or with #3516 |
 | [L6](#L6) | Key registries by structural id; collapse the eight type-equality notions | class N ≈66 of 827 | 2–4 weeks | aligns with the D3870 ruling |
@@ -76,7 +76,8 @@ body, so `nodeTyIxOf` on an instance node answers the GENERIC's type
 (`emit_classify.vl:29624` says so; D1693). The emitter then rebuilds the binding:
 `bindGenWalk` runs again at `emit_mono.vl:1824, 4345, 5693` and
 `emit_classify.vl:32818/32823/32846`; `monoArgTyName` (`emit_mono.vl:1261–1785`) is 525 lines,
-81 returns, 24 distinct D-ids, and ends in an `"i32"` catch-all; the pin travels as a spelling
+76 `return`s in code (81 counting the word in comments), 27 distinct D-ids cited in its body
+(comments included), and ends in an `"i32"` catch-all; the pin travels as a spelling
 that `nameToTy` re-parses.
 
 Lane SC found the same fact from the other side: its flow table banks per-call type
@@ -86,8 +87,9 @@ fact would be a new instance of the problem this item removes.
 **Measured cost.** Class B, ≈141 of 827 rows [84–198]; class S, ≈190 of 827 [126–254], is the
 same disagreement in the function-value domain. Growth over 15 days (types-and-reps, 5eee42758
 → 5d4cd14dc): `Pin` functions outside the fn-value family 95 → 224; emitter functions taking
-`(x: i32, fnIx: i32)` 448 → 607; `nodeTyIxOf` calls 310 → 630; `emit_mono.vl` 6,563 → 14,624
-lines.
+`(x: i32, fnIx: i32)` 448 → 607; `nodeTyIxOf(` calls in the emitter files (`emit_*.vl` and
+`wasmEmit.vl`, `emit_mono` included, comment-stripped) 310 → 630, of 815 in the whole compiler
+at 5d4cd14dc; `emit_mono.vl` 6,563 → 14,624 lines.
 
 **Proposed shape.** (a) The checker banks each resolved call's binding in a column keyed by
 call node: type-parameter ordinal → arena type id. (b) Mono's instance key becomes the tuple of
@@ -127,9 +129,15 @@ producers for one answer grew in every pair.
 
 **Measured cost.**
 
-- Emitter files, excluding `emit_mono` (emitter survey, facb9f610 → 5d4cd14dc, comment-stripped
-  call tokens): `tyToEmitName(` 24 → 81; render-then-parse in one expression 8 → 29 (9 more in
-  `emit_mono`, SC territory); the ten type-string parsers 303 → 343 call sites.
+- Emitter files (`emit_*.vl` and `wasmEmit.vl`), excluding `emit_mono` unless stated, with
+  comments stripped. `tyToEmitName(` calls 24 → 81 (emitter survey, facb9f610 → 5d4cd14dc).
+  Render-then-parse, counted at 5d4cd14dc as a call whose first argument is a direct
+  `tyToEmitName(` call (`f(tyToEmitName(…))`, a `push(` excluded): **21** outside `emit_mono`
+  and **19** inside it (SC territory). The survey's earlier "8 → 29, 9 more in mono" used a
+  wider one-expression rule that was not recorded, so it is not reproducible and the trend is
+  not restated here. The ten type-string parsers: **338** call sites at 5d4cd14dc; the
+  survey's 343 also counted the five parser declarations in these files, and its September
+  303 was taken the same way.
 - Rep classifiers (`rep-classifier-census --summary`, 2026-09-06 → 5d4cd14dc): 519 / 2,962 →
   708 / 3,553 classifiers / call sites. Inputs: ARENA 204, NAME 137, SPELLING 33, TABLE 157,
   FRAME 277. Two-producer pairs: ARENA+NAME 33 → 37, ARENA+SPELLING 10 → 12, ARENA+TABLE 33 →
@@ -177,16 +185,25 @@ weeks, 1–3 days per family.
 
 *Source: emitter L4 and §7.*
 
-**Problem.** `scripts/emit-refusal-sites.py` reads **676** `emitFail` call sites at 5d4cd14dc
+**Problem.** The pass table's one legality check is the `checkFnParams` row, which calls
+`checkParams` (`emit_sections.vl:940`) for every function: it refuses a parameter that still
+names an unsubstituted type parameter (`:962`) and any parameter type outside its valtype
+ladder (`only i32, i64, f64, f32, boolean, struct, union, array, or string parameters are
+supported`). The `checkTopLevel` row is a no-op (`passCheckTopLevel() { 0 }`, `:5895`) kept
+only for the ordering edge `collectFns` declares; it enforced the refusal D1080 retired.
+
+`scripts/emit-refusal-sites.py` reads **676** `emitFail` call sites at 5d4cd14dc
 (533 on 2026-09-05). A regex over each template, hand-checked on a seeded sample (27 of 30
 agree), classifies **140 of 676** as LEGALITY (names a contract about the user program), 108
 LOWERING, 415 FLOOR, 13 UNDECIDED. Every emit-side legality refusal that a `vl check`-clean
 program reaches is a clause-2 violation by construction. The 140 is a class, not a reachability
 count: of nine direct-spelling probes, five were refused by the checker first.
 
-**New findings (re-run on 2026-10-11 against the `~/vl` `vl` binary; both NOT FILED):**
+**New findings (re-run on 2026-10-11 against the `~/vl` `vl` binary; filed as D4070 and
+D4071):**
 
-- Clause 1. An excess field delivered into a union variant is check-clean invalid wasm:
+- Clause 1, [D4070](inventory/D4070.md). An excess field in an object literal is check-clean
+  invalid wasm when the destination record has a literal-typed field:
 
   ```vl
   type U = { k: "a", v: i32 } | { k: "b", s: string }
@@ -195,8 +212,11 @@ count: of nine direct-spelling probes, five were refused by the checker first.
   ```
 
   `vl check` → `no errors`, rc 0; `vl run` → `type mismatch: expected (ref $type), found (ref
-  $type)`. The guard at `wasmEmit.vl:2348` fails open.
-- Clause 2. A value-`if` whose `else` ends in a statement: `const x = if c { 1 } else { let y = 2 }`
+  $type)`. The guard at `wasmEmit.vl:2348` fails open. The ablation in the row shows the union
+  is not an ingredient (`type A = { k: "a", v: i32 }` alone fails the same way); the literal
+  field type is: with `k: string`, or no `k`, the checker's excess-field rule refuses the
+  literal. So this is a checker rule skipped, and the emitter guard is the second failure.
+- Clause 2, [D4071](inventory/D4071.md). A value-`if` whose `else` ends in a statement: `const x = if c { 1 } else { let y = 2 }`
   in a function whose `x` is unused. `vl check` reports two warnings and rc 0; `vl run` refuses
   at emit with `if-expression arm ends in a statement, which yields no value`
   (`wasmEmit.vl:16609`). When `x` IS read, the checker already refuses (`print expects a value,
@@ -205,11 +225,12 @@ count: of nine direct-spelling probes, five were refused by the checker first.
 **Proposed shape.** Move three families into the checker: value-`if` arms that yield no value
 (6 sites), object-literal shape against a union variant (17 sites; the one above fails open),
 and the mono function-value one-signature rules (~12 sites in `emit_mono`; lane SC's direction —
-coordinate, do not duplicate). Leave the built-in arity family (~45 sites) as floors behind the
+coordinate, do not duplicate). `checkParams`'s valtype-ladder refusal is a fourth candidate:
+whether a check-clean program reaches it is UNDECIDED (not probed). Leave the built-in arity family (~45 sites) as floors behind the
 checker rule that already exists, and reword them as internal invariants so a reached one reads
 as a compiler bug. D411 covariance (7 sites) is a DESIGN refusal and stays.
 
-**First PR.** File the two findings above as rows, then close the value-`if` family: a witness
+**First PR.** Close the value-`if` family (D4071): a witness
 that now `check reject`s with the same contract; `regress.py` with no `runs → not-runs`;
 `check-filed-witnesses.py --strict`.
 
@@ -309,10 +330,13 @@ fold.
 
 **Problem.** The emitter's registries are keyed by strings: 49 `{[string]: i32}` maps against 20
 `{[i32]: i32}`; `sNames`, `rlElemName`, `unNames`, `uVariants` are `string[]`. Type equality
-has eight public notions — `tyEq` (91 uses), `tyEqSameHoles` (19), `tyEqNoneIsMap`, `tySame` /
+has eight public notions — `tyEq` (73 `tyEq(` calls, whole compiler, comment-stripped; 91
+counting every mention), `tyEqSameHoles` (17 calls), `tyEqNoneIsMap`, `tySame` /
 `tySameAt` ("index equality is construction identity, not type identity"), `tySameSet`,
 `tySameSpelled`, `tySameAnonRow` (field names only), and emit_rep's `repCanonId`. The arena is
-not hash-consed (one push site), so `emit_rep` runs its own interner (`rtIntern`).
+not hash-consed (one push site), so `emit_rep` runs its own interners: the `hc*` identity
+table (`hcIntern`, behind `repCanonId`) and the rep-tree map `rtIntern`, keyed by
+`rtInternKeyOf` (`emit_rep.vl:3141`).
 
 **Measured cost.** Class N, ≈66 of 827 [25–107] (D3024, D3110, D3129, D3653). All 8 sampled N
 rows are closed: the family is being paid row by row, not by mechanism.
@@ -370,8 +394,11 @@ structural type step is written under several prefixes (exact-body duplicates):
 `tyShapeNulPeel`/`tyPeelNul`, `tyIsNullTy`/`tyIsNullPrim` (both also equal the checker's
 `isNullTy`). Four cross-phase twins: `narrowKeyRoot`/`esKeyRoot`,
 `fieldNameOrder`/`objFieldNameOrder`, `tyIsNullTy`/`isNullTy`, `nssIsName`/`crIsIdentNamed`.
-Fourteen emitter functions exceed 400 lines (September: 10), led by `emitCoalesceGo` 1,009,
-`emitAssign` 797, `collectA` 689, `emitArr` 663, `emitCallCore` 629, `emitTypeSection` 619.
+Sixteen emitter functions exceed 400 lines (`emit_*.vl` and `wasmEmit.vl`, `emit_mono`
+included; declaration line to the first column-0 `}`), led by `monoMakeInstanceGo` 1,128
+(`emit_mono`), `emitCoalesceGo` 1,009, `emitAssign` 797, `collectA` 689, `emitArr` 663,
+`emitCallCore` 629, `emitTypeSection` 619. Outside `emit_mono` it is fourteen (September: 10,
+by the emitter survey's count); `monoMakeInstanceGo` and `monoArgTyName` (525) are SC's.
 
 **Proposed shape.** A `tyquery.vl` imported by both phases, holding each structural step once
 (the home for L2's type-taking twins); split classify by its banner regions into modules of at
@@ -386,7 +413,8 @@ seed. **Dependencies.** Whether more modules slow the self-compile is UNDECIDED;
 
 *Source: front-end L2.*
 
-**Problem.** `typecheck.vl` is 74,855 lines, 3,036 functions and 1,288 module lets: 2.2× in five
+**Problem.** `typecheck.vl` is 74,855 lines, 3,036 functions and 1,288 module-scope bindings (1,000
+`let`, 288 `const`): 2.2× in five
 weeks (33,705 on 2026-09-05) and 30% of the compiler. The front-end call-graph census: the
 largest strongly connected component is 508 functions / 22,803 lines including `checkNode`;
 640 functions / 27,617 lines reach `checkNode`; 2,396 functions / 33,763 lines do not. Import
@@ -480,7 +508,7 @@ the row says otherwise. Line numbers are at 5d4cd14dc.
 
 | group | finding | where | fix | proof |
 | --- | --- | --- | --- | --- |
-| **S-a: checker duplicates** | `canonTyIxOf` and `canonRewroteNode` are one binary search differing only in the return | `typecheck.vl:30294`, `:30308` | one `canonClearedSlot(n)` and two projections | seed |
+| **S-a: checker duplicates** | `canonTyIxOf` and `canonRewroteNode` are one binary search differing only in the return | `typecheck.vl:30294`, `:30307` | one `canonClearedSlot(n)` and two projections | seed |
 | | 9 identical bounded-column accessors (`nodeTyIxOf`, `isVarTyIxOf`, `asgNarTyIxOf`, `joinHeadOf`, `joinRowTy`, `joinRowNext`, `isParentTyIxOf`, `isParentElseTyIxOf`, `mapUnboxTyOf`) | `typecheck.vl:60214–60380` | one `colAt(col, i)` | seed |
 | | `symDecl` / `symDeclInOuter` share an occurrence tail and diverge: only `symDecl` skips minted `$` names | `typecheck.vl:14507`, `:14569` | `symOccPushDecl`; decide the divergence (UNDECIDED whether a minted name reaches the outer form) | LSP symbol tests + emitted-module identity |
 | | `blockHasBareReturn`: 9 call sites, no memo | `typecheck.vl:52718` | memo stamped by generation, not by length (D1655) | fuel A/B |
@@ -539,8 +567,8 @@ two RepDesc rulings (open since 2026-09-06).
 
 | topic | figures | why they differ |
 | --- | --- | --- |
-| `tyToEmitName` call growth | emitter survey 24 → 81; types-and-reps 69 → 128 | different baselines (facb9f610 vs 5eee42758) and scopes (emitter files excluding `emit_mono`, comment-stripped tokens, vs a wider set including mono). Both say it roughly tripled or doubled; neither is wrong. |
-| type-string parser calls | emitter 303 → 343; types-and-reps 329 → 364 | the same baseline and scope difference; types-and-reps counts `typecheck.vl` (43) and `emit_mono.vl` (51) too |
+| `tyToEmitName` call growth | emitter survey 24 → 81; types-and-reps 69 → 128; render-then-parse 29 / 9 by the survey's unrecorded rule vs 21 / 19 by direct nesting ([L2](#L2)) | different baselines (facb9f610 vs 5eee42758) and scopes (emitter files excluding `emit_mono`, comment-stripped tokens, vs a wider set including mono). Both say it roughly tripled or doubled; neither is wrong. |
+| type-string parser calls | emitter 303 → 343 (338 call sites once the five declarations are excluded, [L2](#L2)); types-and-reps 329 → 364 | the same baseline and scope difference; types-and-reps counts `typecheck.vl` (43) and `emit_mono.vl` (51) too |
 | `nodeTyIs*` predicates | front end: 44, all in the emitter; types-and-reps: 37 → 42 | different name patterns (`nodeTyIs*` alone vs with `nodeArrayElemIs*`); not reconciled |
 | re-check mechanisms | front end counts four solve-and-re-check loops | the code has a fifth, `jwSecondPass` (`driver.vl:1023`), which re-runs `initChecker` + `checkProgram` after splicing generated walkers ([L5](#L5)) |
 | where `emitProgram` lives | the brief and some survey prose place it in `wasmEmit.vl` | it is `emit_sections.vl:6588`; it runs a declared pass table of 46 rows with dependencies checked by `passNeedsMet`, then `emitModule` |

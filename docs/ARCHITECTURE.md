@@ -15,8 +15,11 @@ each section. Rationale for non-obvious choices lives in `DECISIONS.md`; the for
 
 VL compiles a statically typed language to WebAssembly with the GC proposal (WasmGC). The
 compiler is itself written in VL and compiled by its previous build (the **seed**,
-`build/vl-compiler.wasm`). A Rust host (`scripts/vl-host`) loads the seed, gives it files, and
-runs the module it produces.
+`build/vl-compiler.wasm`). The native host (`scripts/vl-host`, Rust, the `vl` binary) loads the
+seed, gives it files, and runs the module it produces. Emitted modules also run in two
+JavaScript hosts, the Deno test host (`tests/support/runWasm.ts`) and the browser playground
+(`playground/src/runtime.ts`); those two share one import table, `compiler/vlHostImports.ts`
+([§2.5](#25-optimisation-and-the-hosts)).
 
 The standing goal has two clauses, and every architectural decision below is in service of them:
 
@@ -36,9 +39,9 @@ refusal. Progress is counted in programs that **run**, by the instruments named 
 ```
 source ─► lexer ─► parser ─► node arena ─► checker ─────────────────► emitter ─────────► module bytes ─► host
           tokens   AST                     (solve loops, canon)       (pass table:            (-O: binaryen
-                                           types, diagnostics         rewrites, collect,       + host passes)
-                                                                      mono, classify, emit,
-                                                                      sections)
+                                           types, diagnostics         46 ordered rows,         + host passes)
+                                                                      mono among them;
+                                                                      then sections)
 ```
 
 The driver (`compiler/driver.vl`) sequences the phases. `compileSrc` and `checkSrc` are its two
@@ -52,9 +55,12 @@ modules.
 
 `compiler/lexer.vl`, `tokenize(source): LexResult`.
 
-- **In:** source text. **Out:** a token array (`Tok`, `compiler/ast.vl`) and lexical diagnostics.
-- **Contract:** every byte of the source is covered by a token or trivia; token spans are byte
-  offsets into the source, and every later diagnostic span is built from them.
+- **In:** source text. **Out:** a token array and lexical diagnostics. The lexer returns its own
+  `Tok` record (`lexer.vl`: `kind`, `text`, `start`, `line`, `col`); `ast.vl` declares a second
+  `Tok` with a sixth field, a known duplicate ([§7](#7-known-deviations)).
+- **Contract:** every character of the source is covered by a token or trivia; `Tok.start` is an
+  offset into the source and `line`/`col` its position, and every later diagnostic span is
+  built from them.
 - **Must not:** decide anything about meaning. Keywords are lexed whether or not a production
   uses them.
 
@@ -133,37 +139,84 @@ Detail: `docs/internals/check-reject-audit-2026-09.md`, `docs/internals/open-rul
     rendered spelling, from a name, or by re-running inference. Where the checker's answer is
     not available in the needed form, the fix is to bank it in the checker, not to re-derive it.
 
-`emitProgram` runs a **declared pass table**: each row names a pass and the passes it requires,
-and the runner refuses a table reordered so a row runs before its prerequisite. The rows fall into
-four kinds, in order:
+`emitProgram` (`emit_sections.vl`) is the emitter's driver. It runs a **declared pass table**,
+then `emitModule`:
 
-| kind | modules | what it does |
-| --- | --- | --- |
-| rewrite | `emit_rewrite.vl`, parts of `emit_collect.vl` | AST-to-AST normalisations that make lowering uniform (loop-value, capture boxing, dispatch, synthesised annotations) |
-| collect | `emit_collect.vl` | builds the module's registries: struct, union, list and closure shapes, the function map, return kinds, capture tables |
-| monomorphize | `emit_mono.vl` | clones each generic function per distinct instantiation ([§3.5](#35-monomorphization-instances)) |
-| classify | `emit_classify.vl`, `emit_rep.vl`, `emit_query.vl` | the queries the lowering asks: a node's rep, a shape's registry row |
+1. **The pass table** is a dependency-ordered list of 46 rows, each `"<pass> > <prerequisite>…"`.
+   The loop in `emitProgram` reads each row (`passRowName`), refuses to run one whose
+   prerequisites have not all run (`passNeedsMet`, an `emitFail` naming the reordered pass),
+   dispatches it by name (`runEmitPass`), and bumps `emitPassGen` so a cross-pass memo cannot
+   outlive the row that filled it. The order is **not** grouped by kind. Rewrites
+   (`loopValueRewrite`, `dispatchRewrite`, `captureBoxRewrite`, the `synth*` annotation passes)
+   interleave with the collect passes (`collectU`, `collectS`, `collectA`, `collectFns`,
+   `buildFnMap`, `computeRetInference`), because each edge says which pass's output another
+   reads. `monomorphize` is one row in the middle. Rows suffixed `#2` (`collectA#2`,
+   `buildFnMap#2`, `computeVoidFns#2`, `capNarrowBuild#2`, `computeRetInference#2`) re-run a
+   collect pass after mono, over the annotations mono minted. The comment above the table states
+   the edge shapes: a pass that mutates the arena runs before every pass that scans it, and a
+   pass that needs the final arena runs after all of them. The one legality row is
+   `checkFnParams` (`checkParams`); the `checkTopLevel` row is a no-op kept for its ordering
+   edge ([§7](#7-known-deviations)).
+2. **Queries are not passes.** `emit_classify.vl`, `emit_rep.vl` and `emit_query.vl` hold the
+   functions that passes and lowering call to ask a node's rep or a shape's registry row. No
+   table row runs them; they memoise against `emitPassGen` and their own generation keys.
+3. **`emitModule`** writes the sections in wasm order: type (`emitTypeSection`), import,
+   function, table, memory, global, export, start, element, data count, code, data, and the
+   name section (`emitNameSection`, only when names are requested). The code payload (one body
+   per function, built through the function builder in `emit_base.vl`/`emit_bytes.vl`) is built
+   before the global and element sections are framed, because lowering a body is what adds
+   globals and marks the functions whose address is taken (`frameGlobalSection`). The driver
+   appends the `vl-src` custom section (`emitSrcSection`, `driver.vl`), which maps code offsets
+   to source lines for trap frames.
 
-Then `emitModule` writes the sections in wasm order (`emit_sections.vl`): types, imports,
-functions, memory, globals, exports, code (one function body per function, built through the
-function builder in `emit_base.vl`/`emit_bytes.vl`), data, names. Expression and statement
-lowering is `wasmEmit.vl`. Module-level emitter state is in `emit_state.vl`.
+Expression and statement lowering is `wasmEmit.vl`. Module-level emitter state is in
+`emit_state.vl`.
 
-Detail: `docs/internals/codegen-architecture.md`, `docs/internals/emit-sections-notes.md`,
-`docs/internals/emitter-module-state.md`, `docs/internals/rep-descriptor-campaign.md`.
+Detail: `docs/internals/emit-sections-notes.md`, `docs/internals/emitter-module-state.md`,
+`docs/internals/rep-descriptor-campaign.md`. `docs/internals/codegen-architecture.md` is
+**historical**: a pre-landing design for the function builder that still places `emitProgram`
+in `wasmEmit.vl`. Read it for the builder's rationale, not as a map of the current emitter.
 
-### 2.5 Optimisation and the host
+### 2.5 Optimisation and the hosts
 
-`scripts/vl-host` (Rust, `vl` binary).
+Three hosts run emitted modules:
+
+| host | where | imports it provides | `-O` |
+| --- | --- | --- | --- |
+| native | `scripts/vl-host/src/main.rs` (Rust, wasmtime) | print, `extern`, files, process, args and environment, errno | yes |
+| Deno test host | `tests/support/runWasm.ts` | `vlHostImports` | no |
+| playground | `playground/src/runtime.ts` | `vlHostImports` | no |
+
+**The import ABI.** An emitted module imports only what it uses. The shared part, in
+`compiler/vlHostImports.ts`, is the seven `__print_*__` sinks and `extern.nowMillis`. The native
+host defines the rest per module, from the module's own import list and with the module's own
+signatures (`register_fs_imports`, `register_extern_imports`), so a drift between emitter and
+host fails at instantiation and names the import. **Errno** is per instance: an fs handler sets
+a positive WASI errno on failure (`wasi_errno`) and `__fs_errno__` reads it (`std:fs`). The
+seed's own ABI is checked when the host loads it (`check_seed_abi`, against the checker's
+`speaksAbi`), so a seed and a host that disagree refuse rather than miscompile.
+
+**The compile cache** (`scripts/vl-host/src/compile_cache.rs`, opt-in with
+`VL_COMPILE_CACHE=1`) stores the bytes a compile emitted, keyed on what the host knows before
+the guest runs (seed, host build, environment, arguments, entry file) plus a transcript of every
+module the guest asked for and the hash of each reply. A lookup replays the transcript against
+the filesystem instead of running the guest. A failed compile stores nothing, and a verify mode
+recompiles and exits 71 on a mismatch. Separately, the host caches the seed's compiled machine
+code beside it (`seed_cache_path`). Detail: `docs/internals/incremental-compilation-design.md`.
+
+The native host:
 
 - **In:** the module bytes. **Out:** a validated, optionally optimised module, run under the host
-  ABI (files, process, printing).
+  ABI.
 - **Contract:** without `-O`, the host runs exactly what the compiler emitted. With `-O`, it runs
   binaryen's `wasm-opt` and its own passes (inlining, multi-value, flattening); each `-O` pass
   preserves the module's observable behaviour and is graded on that.
 - **Must not:** parse or type VL. A host pass is a wasm-to-wasm transform. It must not depend on
   VL source facts that are not in the module; if it needs one, the emitter writes it into a named
   custom section.
+
+The two JavaScript hosts cannot run `-O`, so an `-O` build runs only natively
+([§7](#7-known-deviations)).
 
 Detail: `docs/internals/opt-profile-design.md`, `docs/internals/binaryen-transition.md`,
 `docs/internals/native-modules-design.md`.
@@ -183,7 +236,8 @@ part of the accessor's contract ([§4.5](#45-sentinels)).
 elements of the `Ty` union: primitive, error, object, function, union, nullable, array, map,
 type variable, literal, negation. A type is identified by its index. The arena is **not
 hash-consed**: two indices can hold structurally equal types, and type equality is a function,
-not an index comparison. Each node's type is `nodeTyIx[node]`.
+not an index comparison. The emitter's interner is separate, in `emit_rep.vl`
+([§3.3](#33-canon-spellings-and-interned-ids)). Each node's type is `nodeTyIx[node]`.
 
 ### 3.3 Canon spellings and interned ids
 
@@ -193,8 +247,9 @@ Two distinct mechanisms carry "the same type" across the phases, and they must n
   name in the arena into the emitter's spelling, and banks the originals so a re-check can restore
   them. It also records which annotation nodes it rewrote and the arena type each spelling stands
   for. Canon is a spelling rewrite, not an interner.
-- **Interned ids** (in the emitter): `emit_rep.vl` interns types structurally (`repCanonId`) and
-  the collect pass interns record shapes. An interned id is the emitter's structural identity
+- **Interned ids** (in the emitter): `emit_rep.vl` hash-conses types in its `hc*` table
+  (`hcIntern`, reset by `hcReset`), which gives `repCanonId` its ids; it interns rep trees in
+  `rtIntern`, keyed by `rtInternKeyOf`; and the collect pass interns record shapes. An interned id is the emitter's structural identity
   for a type.
 
 `tyToEmitName` renders an arena type in the emitter's spelling. Rendering is for **output**:
@@ -287,14 +342,24 @@ value, or a `match`'s `_` arm, is not a default. Detail: `docs/internals/sentine
 
 `std:` modules are resolved by the host, in order: `$VL_STD`; on a development build, the nearest
 ancestor of the **executable** that holds `compiler/entry.vl` and `std/`; otherwise the copy
-embedded in the binary (generated by `deno task gen-std` and gated for freshness). A distribution
+embedded in the binary (`std_source`). A distribution
 build never reads a development tree. The test runners (Deno) resolve `std:` relative to the
 checkout, independently of the host. Consequence: a native probe run from an agent worktree reads
 the main checkout's `std/` unless `VL_STD` points at the worktree.
 
-The seed resolves by a similar ladder (`--compiler`, `$VL_COMPILER_WASM`, the development tree,
-embedded). On a development build the seed's tree rung reads the **working directory**, while
-std's reads the executable's ancestors. See [Known deviations](#7-known-deviations).
+**Embedded std.** `deno task gen-std` (`scripts/gen-std.ts`) walks `std/` once and writes the
+checked-in copies: `scripts/vl-host/src/std_embedded.rs` (the binary's), `std/embedded.ts` (the
+LSP's and the playground's), and `compiler/std_receivers.vl` (std's receiver-style exports,
+which the checker's missing-import hint names without loading the module).
+`tests/std_embedded_test.ts` fails when any of them is stale, so an edit to `std/` is not done
+until it is regenerated.
+
+The seed resolves by a similar ladder (`resolve_compiler_with_origin`): `--compiler`,
+`$VL_COMPILER_WASM`, then, on a development build only, **two** rungs, `build/vl-compiler.wasm`
+in the working directory (`SeedOrigin::Cwd`) and then the one in the executable's tree
+(`SeedOrigin::DevTree`), and last the embedded seed. So on a development build the seed's first
+tree rung reads the **working directory**, while std's reads the executable's ancestors. See
+[Known deviations](#7-known-deviations).
 
 std itself is version-locked to the compiler and is reviewed as API surface:
 `docs/internals/std-design.md`, `docs/internals/std-api-review.md`.
@@ -346,11 +411,14 @@ will drift.
 | --- | --- | --- | --- |
 | CLI | `compiler/cli.vl`, `compiler/cli_util.vl`, host `main.rs` | argument parsing, file discovery, exit codes, output format | everything about VL source |
 | host | `scripts/vl-host/src` | file and process ABI, std and seed resolution, compile cache, running modules, `-O` | compiling |
-| LSP | `lsp/src` (`server.ts`, `wasmChecker*.ts`) | the protocol, editor state | diagnostics, symbols, inlay hints, formatting, via `wasmChecker` |
+| LSP | `lsp/src` (`server.ts`, `wasmChecker*.ts`, `vlRoot.ts`) | the protocol, editor state, finding the VL checkout | diagnostics, symbols, inlay hints, formatting, via `wasmChecker` |
 | playground | `playground/` | the browser UI | the same `wasmChecker` features |
 | formatter | `compiler/format.vl` (`vl fmt`) | layout | — (it is the seed) |
 | lint | `compiler/lint.vl` (`vl lint`) | language and repo rules | — (it is the seed) |
+| test runner | `compiler/cli.vl` (`vl test`), host `main.rs` | executing test modules across a pool | discovery, compiling, planning, reporting |
 | ratchets | `scripts/ratchet.py` and `scripts/*-budget.py` | a per-file count that may only fall, with `--why` | the findings, when the rule exists in `lint.vl` |
+| TS mirrors | `compiler/moduleGate.ts`, `compiler/vlSrcSection.ts` | the module-arming predicate; the `vl-src` section reader | nothing; each is a mirror |
+| TS vocabulary | `compiler/coreTypes.ts`, `compiler/diagnostics.ts`, `compiler/vlHostImports.ts` | shared types for the editor layer; the JS hosts' import table | nothing; leaves with no compiler logic |
 
 Rules:
 
@@ -359,9 +427,49 @@ Rules:
 - **Exit codes are one named table** shared by the CLI and the host. 0 is success and 70
   (`EX_SOFTWARE`) is an internal compiler trap or an invalid emitted module, so a user can tell a
   compiler bug from an error in their program.
-- **The host does not know VL.** Its `-O` passes are wasm transforms ([§2.5](#25-optimisation-and-the-host)).
-- **Gates** are listed in `CLAUDE.md` and run by `scripts/gate.sh`; a tool change is graded by the
-  gate rows that cover it, not by a hand run.
+- **The host does not know VL.** Its `-O` passes are wasm transforms ([§2.5](#25-optimisation-and-the-hosts)).
+- **Mirrors are tested against their original.** `compiler/moduleGate.ts` answers "does this
+  source need the module fetch loop" for the TS hosts; the same predicate is written in
+  `cli_util.vl` (`cliNeedsModules`) and in the native host, and
+  `tests/module_gate_agreement_test.ts` requires the copies to agree. `compiler/vlSrcSection.ts`
+  reads the `vl-src` section for the JS hosts, and the native host reads it in `main.rs`.
+
+**The LSP.** `lsp/src/server.ts` speaks the protocol and owns editor state; every question about
+source goes to a seed instance through `wasmChecker.ts` (`wasmCheckerNode.ts` loads it in Node,
+`playground/src/wasmCheckerBrowser.ts` in the browser). Symbols and references come from the
+compiler's own tables: `compiler/symbols.vl` (the identifier intern table) and
+`compiler/srcmap.vl` (which file a token came from). `lsp/src/vlRoot.ts` decides whether an open
+file belongs to the VL checkout (`vlRootFor`, `lintPathFor`) by walking up from the document's
+own path, never from the workspace folder. The std the editor sees is `std/embedded.ts`
+([§4.6](#46-std-resolution)).
+
+**`vl test`.** The runner's logic is in `compiler/cli.vl`; the host only executes. The CLI
+discovers `*.test.vl` files (`cliEndsTestVl`), compiles each with `compileSrc` (in a pool of
+fresh compiler instances when there are several), and hands the bytes to the host through the
+CLI command queue (`CMD_TEST_STASH`, `CMD_TEST_COLLECT`, `CMD_TEST_RUN`). The host instantiates
+each module, which runs its registrations, reads the registry back through the module's `vlt*`
+exports (`collect_test_file`), and runs the selected tests one instance per file
+(`run_test_file`). A file that does not compile is a failing entry with its real diagnostics,
+and the run continues. Detail: `docs/internals/vl-test-design.md` (what shipped),
+`docs/internals/test-runner-design.md` (the charter).
+
+**Lint path scoping.** Some lint rules apply only to this repository's own `compiler/` or
+`std/` (`compiler-no-interpolation`, `std-comment-audience`). `lint.vl` matches them on a bare
+path prefix (`scaIsCompiler`, `scaIsStd`), set per run by `lintSetPath` and consumed once at the
+top of `lint()`. The caller makes the path checkout-relative against the checkout it actually
+resolves, or passes `""` to decline every scoped rule: the CLI relativizes against the tree
+`std:` resolves from (`lintScopeKeyOf`, `vlRootPush`/`vlRootCommit` in `driver.vl`), and the LSP
+uses `lintPathFor`. An unrelated project's own `src/compiler/` is never in scope.
+
+**Gates.** `scripts/gate.sh` is the merge gate. It refreshes the seed, fans every gate out in
+parallel, and prints a per-gate table of wall time, CPU time and exit code. The rows are the
+Deno suites, the native and seed-backed suites (`ci-native`, including the editor suites whose
+list it reads from `ci.yml`), the native fixpoint, `lint-self.sh`, the distilled corpus
+(`scripts/silent-sweep/distilled/regress.py`, which blocks only on a `runs → not-runs` cell),
+the filed-witness check, the seed-size and fuel ratchets, and the per-file lint ratchets. A tool
+change is graded by the gate rows that cover it, not by a hand run, and a gate is read by its
+exit code or its summary line. `CLAUDE.md` ("Gates") says what each row is for and its time
+budget.
 
 Detail: `docs/internals/cli-design.md`, `docs/internals/test-runner-design.md`,
 `docs/internals/syntax-tree-api-design.md`, `docs/internals/format-notes.md`,
@@ -377,7 +485,11 @@ line in the PR that closes it.
 | --- | --- | --- |
 | §3.5, §4.1 | The checker computes each generic call's binding and discards it; the emitter rebuilds it (`monoArgTyName`, `bindGenWalk` re-runs), and an instance node's checker type is the generic's. | [L1](internals/code-quality-2026-10.md#L1) |
 | §2.4, §3.4, §4.1 | The emitter answers type questions by rendering (`tyToEmitName`) and re-parsing the spelling; rep classifiers read two producers for one answer (arena with name, spelling, table or frame). | [L2](internals/code-quality-2026-10.md#L2) |
-| §2.4, §4.2 | The emitter decides legality: legality-worded refusals at emit, the `checkTopLevel` and `checkFnParams` pass-table rows, one check-clean emit refusal (value-`if` arm), and one fail-open guard producing invalid wasm (excess field into a union variant). | [L3](internals/code-quality-2026-10.md#L3) |
+| §2.4, §4.2 | The emitter decides legality: 140 of 676 `emitFail` sites are legality-worded; the `checkFnParams` pass-table row (`checkParams`) refuses parameter types at emit; a value-`if` arm that yields no value is check-clean and refused at emit (D4071); an excess field into a record with a literal-typed field is check-clean invalid wasm (D4070). The `checkTopLevel` row has been a no-op since D1080 and is not a deviation. | [L3](internals/code-quality-2026-10.md#L3) |
+| §2.1 | The lexer and `ast.vl` each declare a `Tok` record. | [S-c](internals/code-quality-2026-10.md#small-items) |
+| §3.1, §4.5 | Table reads whose index may be a sentinel and is not tested: **312** `sentinel-index-unguarded` findings stand in `scripts/sentinel-budget-baseline.json` (baseline commit `16fd60a24`), a ratchet that may only fall. A finding is not a bug; a seeded sample graded most UNDECIDED. | `docs/internals/sentinel-index-lint.md` |
+| §4.5 | Ladders over a closed kind set with a bare default: **363** `kind-ladder-incomplete` and **8** `kind-ladder-split` findings stand in `scripts/ladder-budget-baseline.json` (baseline commit `16fd60a24`). | `docs/internals/kind-ladder-lint.md` |
+| §4.7 | Module-scope emitter state that no reset clears: `emitter-state-audit.py` counts **209** never-cleared of 1,139 mutables. Not ratcheted. | [L7](internals/code-quality-2026-10.md#L7) |
 | §4.3 | Quiet probes roll back by hand at seven sites with four disagreeing truncation lists. | [L4](internals/code-quality-2026-10.md#L4) |
 | §2.3 | Independent solve-and-re-check mechanisms share a loop condition and a pass budget named after one of them; un-annotated parameters are inferred twice by different methods; the driver re-checks again for generated walkers. | [L5](internals/code-quality-2026-10.md#L5) |
 | §3.3, §4.1 | Emitter registries are keyed by spelling; type equality has eight notions. | [L6](internals/code-quality-2026-10.md#L6) |

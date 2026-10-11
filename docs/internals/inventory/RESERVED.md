@@ -92,3 +92,4 @@ D3960-D3969  lane-CK  2026-10-10  checker soundness: a generic-seeded let writte
 D3970-D3979  lane-SC  2026-10-10  lane SC rows for D3948 and the rv3498 residue
 D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)
 D4000-D4009  lane-PF  2026-10-11  DV-1000/DV-1001 V8 perf (diderven): D4000 range-analysis guard folding, later residues
+D4070-D4079  lane-ARCH  2026-10-11  code-quality-2026-10 L3 witnesses: excess field into a record with a literal-typed field (D4070), value-if arm ending in a statement (D4071)
