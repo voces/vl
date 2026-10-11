@@ -15,6 +15,7 @@
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay private to this module.
 import { TokKind, keywordKind, tplPartStrLex } from "./lexer"
+import { strListHas } from "./listutil"
 import {
   arenaEpochBump,
   externAdd,
@@ -4836,8 +4837,16 @@ function parseImport(): i32 {
   const locals: string[] = []
   const nameToks: i32[] = []
   let path = ""
+  let sawBrace = false
+  let starAt = -1 // a depth-0 `*`: the namespace form
+  let bareAt = -1 // a depth-0 name before any `{`: the default-import form
   while going {
     const k = peekKind()
+    if k == "STAR" && depth == 0 && starAt < 0 { starAt = P.pos }
+    if k == "LBRACE" { sawBrace = true }
+    if k == "IDENT" && depth == 0 && !sawBrace && starAt < 0 && bareAt < 0 {
+      if peekTok().text != "from" { bareAt = P.pos }
+    }
     if k == "STRING" {
       // The path literal — the statement ends here. The STRING token's `text`
       // keeps its surrounding quotes (mirroring `modScan`): strip them.
@@ -4892,7 +4901,92 @@ function parseImport(): i32 {
       { msg: "malformed import: expected a module path string literal", at: kwAt },
     )
   }
+  if path != "" && starAt >= 0 {
+    let alias = ""
+    if (
+      kindAt(starAt + 1) == "IDENT"
+      && textAt(starAt + 1) == "as"
+      && kindAt(starAt + 2) == "IDENT"
+    ) {
+      alias = textAt(starAt + 2)
+    }
+    P.diags.push(
+      {
+        msg: importNamespaceMsg(alias, path, importAliasMembers(alias)),
+        at: starAt,
+      },
+    )
+  } else if path != "" && bareAt >= 0 {
+    P.diags.push(
+      { msg: importDefaultMsg(path, textAt(bareAt), names), at: bareAt },
+    )
+  }
   mkImport(path, names, locals, nameToks, p0)
+}
+
+// The member names a later `alias.name` spells, first-seen order, deduplicated; empty when
+// `alias` is "" or never used.
+function importAliasMembers(alias: string): string[] {
+  const out: string[] = []
+  if alias == "" { return out }
+  let i = P.pos
+  while i + 2 < P.toks.length {
+    // `o.S.z` reads a field named like the alias, not the namespace.
+    const member = i > 0
+      && (kindAt(i - 1) == "DOT" || kindAt(i - 1) == "QUESTION_DOT")
+    if (
+      !member
+      && kindAt(i) == "IDENT"
+      && textAt(i) == alias
+      && kindAt(i + 1) == "DOT"
+      && kindAt(i + 2) == "IDENT"
+    ) {
+      const m = textAt(i + 2)
+      if !strListHas(out, m) { out.push(m) }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The refusal for `import * as alias from "path"`, suggesting the named form over the
+// `members` the file spells as `alias.m` (a placeholder when it spells none).
+function importNamespaceMsg(
+  alias: string,
+  path: string,
+  members: string[],
+): string {
+  let list = "…"
+  let prefix = ""
+  if members.length > 0 && alias != "" {
+    prefix = " and drop the `" + alias + ".` prefix"
+  }
+  if members.length > 0 {
+    list = members[0]
+    let i = 1
+    while i < members.length {
+      list = list + ", " + members[i]
+      i = i + 1
+    }
+  }
+  "namespace imports (`import * as …`) are not supported — import the names you use: `import { "
+    + list
+    + " } from \""
+    + path
+    + "\"`"
+    + prefix
+}
+
+// The refusal for `import S from "path"` (or `import S, { a } from "path"`, `named` being
+// the braced names): a VL module has only named exports.
+function importDefaultMsg(path: string, name: string, named: string[]): string {
+  let list = name
+  for nm in named { list = list + ", " + nm }
+  "default imports are not supported — a VL module has only named exports: `import { "
+    + list
+    + " } from \""
+    + path
+    + "\"`"
 }
 
 // Consume a re-export `export { a, b as c, … } from "path"`, the cursor on the leading

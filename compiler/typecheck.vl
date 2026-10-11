@@ -314,6 +314,7 @@ import {
   redunECol,
   redunELine,
   redunName,
+  redunRet,
   redunSCol,
   redunSLine,
   redunTok,
@@ -405,7 +406,13 @@ import {
   stdRecvSpec,
   stdRecvTparams,
 } from "./std_receivers"
-import { mimpClear, mimpExportedByNote, mimpSpecsFor } from "./missing_import"
+import {
+  mimpAnyProgramSpec,
+  mimpClear,
+  mimpExportedByNote,
+  mimpNoteMiss,
+  mimpSpecsFor,
+} from "./missing_import"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -19517,6 +19524,7 @@ function redunReset() {
   redunName = []
   redunType = []
   redunTok = []
+  redunRet = []
   0
 }
 
@@ -19689,6 +19697,7 @@ function recordRedundantAnnot(
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   redunType.push(tyToStrUser(initTy))
   redunTok.push(nameTok)
+  redunRet.push(false)
   0
 }
 
@@ -19806,6 +19815,7 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   redunType.push(tyToStrUser(ret))
   redunTok.push(nameTok)
+  redunRet.push(true)
   0
 }
 
@@ -42139,6 +42149,31 @@ function memberFloorMsg(objTy: i32, prop: string) {
     + "' on non-object "
     + tyToStr(objTy)
     + stdFmtMovedNote(prop)
+    + builtinMethodNote(objTy, prop)
+}
+
+// When `prop` names a numeric builtin that takes a value of `objTy` first (`x.abs()`,
+// `x.max(y)`), the sentence that says to call it; "" otherwise.
+function builtinMethodNote(objTy: i32, prop: string): string {
+  const pn = primNameOf(objTy)
+  const isFloat = pn == "f32" || pn == "f64"
+  const isInt = pn == "i32" || pn == "i64"
+  let arity = 0
+  if isFloat { arity = floatIntrArity(prop) }
+  if isInt {
+    arity = intIntrArity(prop)
+    if prop == "abs" || prop == "min" || prop == "max" {
+      arity = floatIntrArity(prop)
+    }
+  }
+  if arity == 0 { return "" }
+  let call = prop + "(x)"
+  if arity == 2 { call = prop + "(x, y)" }
+  " — `"
+    + prop
+    + "` is a builtin function, not a method: call it as `"
+    + call
+    + "`"
 }
 
 // The redirect for another language's element-count member read on a list, map, set or
@@ -42168,6 +42203,8 @@ function stdFmtMovedNote(name: string) {
 function undeclaredImportRaise(name: string, ix: i32): boolean {
   const from = ufcsModOfNode(ix)
   const specs = mimpSpecsFor(name, from, -1)
+  // No program module answered: a file the program does not import yet may, beside std.
+  if !mimpAnyProgramSpec(specs) { mimpNoteMiss(name) }
   if specs.length == 0 { return false }
   let data = diagDataField("member", name)
   for s in specs { data = data + diagDataField("modules", s) }
@@ -42185,8 +42222,13 @@ function undeclaredImportRaise(name: string, ix: i32): boolean {
 // `ufcs-not-imported` code replace them. One home for the raise, since `checkMemberNode`
 // refuses from seven arms and a per-arm enrichment would silently miss most of them.
 function memberFloorErr(objTy: i32, prop: string, ix: i32) {
+  // A method lookup over a receiver built from an error already reported is that error's
+  // cascade: its instance differs from the method's only by the error. A missing FIELD is not,
+  // so the floor below still raises for one.
+  const cascade = tyMentionsErr(objTy, 8)
   const specs = ufcsMissSpecsAt(ix)
   if specs != "" {
+    if cascade { return 0 }
     const alias = ufcsImportAliasAt(ix, prop, objTy)
     return tErrCodedData(
       ufcsNotImportedMsg(prop, specs, objTy, alias),
@@ -42199,6 +42241,7 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   // wherever it applies: a name not in scope at all cannot reach this bank (D1570).
   const whyRow = ufcsWhyRow(ix)
   if whyRow >= 0 {
+    if cascade { return 0 }
     return tErrCodedData(
       ufcsWhyMsg[whyRow],
       ix,
@@ -42425,6 +42468,7 @@ function ufcsMissRaise(
   ix: i32,
   memIx: i32,
 ): boolean {
+  if tyMentionsErr(recvTy, 8) { return true }
   const specs = ufcsMissingImportSpecs(prop, recvTy, argc, ix)
   if specs != "" {
     const alias = ufcsImportAliasAt(ix, prop, recvTy)
@@ -48172,6 +48216,52 @@ function tyMentionsTyVarNamed(ty: i32, name: string, depth: i32): boolean {
   false
 }
 
+// Whether type `ty` is, or holds within `depth` levels, the error type an earlier
+// diagnostic produced.
+function tyMentionsErr(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyErr => {
+      return true
+    }
+    TyArray => {
+      return tyMentionsErr(t.aElem, depth - 1)
+    }
+    TyNullable => {
+      return tyMentionsErr(t.nInner, depth - 1)
+    }
+    TyNeg => {
+      return tyMentionsErr(t.negTy, depth - 1)
+    }
+    TyMap => {
+      if tyMentionsErr(t.mKey, depth - 1) { return true }
+      return tyMentionsErr(t.mVal, depth - 1)
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if tyMentionsErr(f, depth - 1) { return true }
+      }
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyMentionsErr(m, depth - 1) { return true }
+      }
+    }
+    TyFunc => {
+      for p in t.fnParamTypes {
+        if tyMentionsErr(p, depth - 1) { return true }
+      }
+      return tyMentionsErr(t.fnRet, depth - 1)
+    }
+    TyPrim => {}
+    TyVar => {}
+    TyLit => {}
+  }
+  false
+}
+
 // Does any parameter's written annotation mention one of `names`? An un-annotated parameter
 // mentions nothing, which is the right answer: its type is a hole the call site pins, and a
 // hole never carries the declared name a return annotation would substitute through.
@@ -51093,6 +51183,14 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
   if cfn is Ident {
     const nm = cfn.identName
     if (nm == "Map" || nm == "Set") && lookupDepth(nm) < 0 { return true }
+    if (
+      arrayCtorNote(nm) != ""
+      && lookupDepth(nm) < 0
+      && lookupFnDeclNode(nm) < 0
+    ) {
+      tErr("explicit type arguments on `Array`" + arrayCtorNote(nm), ix)
+      return false
+    }
     const dIx = lookupFnDeclNode(nm)
     if dIx >= 0 {
       const d = P.nodes[dIx]
@@ -51115,6 +51213,13 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
     ix,
   )
   false
+}
+
+// The redirect for another language's list constructor, keyed on the spelling `Array`; ""
+// for any other name.
+function arrayCtorNote(name: string): string {
+  if name != "Array" { return "" }
+  " — VL has no `Array` constructor: `n` copies of `v` is `filled(n, v)` (`import { filled } from \"std:array\"`), and an empty list is `[]`"
 }
 
 // Appended where a call read as `name<…>(…)` fails: the source may have meant a comparison,
@@ -52394,6 +52499,7 @@ function redunTruncate(n: i32) {
   while redunName.length > n { redunName.pop() }
   while redunType.length > n { redunType.pop() }
   while redunTok.length > n { redunTok.pop() }
+  while redunRet.length > n { redunRet.pop() }
   0
 }
 
@@ -56764,7 +56870,14 @@ function checkNodeReal(ix: i32) {
       }
       const moved = stdFmtMovedNote(n.identName)
       if moved == "" && undeclaredImportRaise(n.identName, ix) { return TY_ERR }
-      tErr("undeclared identifier '" + n.identName + "'" + moved, ix)
+      tErr(
+        "undeclared identifier '"
+          + n.identName
+          + "'"
+          + moved
+          + arrayCtorNote(n.identName),
+        ix,
+      )
       return TY_ERR
     }
     // `ty` is this use's type as the checker resolved it — narrowed when the use
