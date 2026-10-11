@@ -14038,9 +14038,11 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
     } else {
       let tIdx = isTypeTyRead(cond.isVariant, condIx)
       // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
-      const meet = litSetMeetTy(placeCurTy(isPl, names, tys), tIdx)
+      const isCur = placeCurTy(isPl, names, tys)
+      let meet = litSetMeetTy(isCur, tIdx)
+      if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
       if meet >= 0 { tIdx = meet }
-      if tIdx >= 0 {
+      if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
         pushNarrowFact(isPl, tIdx, names, tys)
         pushDiscrimParentFact(
           isPl,
@@ -74241,6 +74243,123 @@ function litPrimMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
+// The part of `obj` that always fits the record type `chk`, where `chk` names none of `obj`'s
+// members: `b is A` over `b: B` or `B | null` with every `B` an `A` tests as `is B`, and over
+// `B | C` with no `C` able to fit `A` it tests the `B` (D4062). -1 otherwise.
+function recFitMeetTy(obj: i32, chk: i32): i32 {
+  if obj < 0 || chk < 0 { return -1 }
+  const ct = T.tys[chk]
+  if !(ct is TyObj) { return -1 }
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  if base < 0 { return -1 }
+  const bt = T.tys[base]
+  if bt is TyObj {
+    if recContainedIn(base, chk) { return base }
+    return -1
+  }
+  if !(bt is TyUnion) { return -1 }
+  let fit = -1
+  for m in bt.uMembers {
+    if m < 0 || tySame(m, chk) { return -1 }
+    if recContainedIn(m, chk) {
+      if fit >= 0 { return -1 }
+      fit = m
+    } else if !recNeverFits(m, ct) {
+      return -1
+    }
+  }
+  fit
+}
+
+// Whether every value of record `a` fits record `b` and not the reverse, the two declaring the
+// same field names. A record with fields the other lacks is no containment D3885 settles.
+function recContainedIn(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  if !(at is TyObj) || !(bt is TyObj) { return false }
+  if at.objFieldNames.length != bt.objFieldNames.length { return false }
+  for f in at.objFieldNames {
+    if strListIndexOf(bt.objFieldNames, f) < 0 { return false }
+  }
+  assignable(a, b) && !assignable(b, a)
+}
+
+// Whether no value of `m` can fit the record `ct`: a scalar, literal, list, map or function, or
+// a record missing a field `ct` declares non-nullable.
+function recNeverFits(m: i32, ct: TyObj): boolean {
+  const mt = T.tys[m]
+  match mt {
+    TyPrim | TyLit | TyArray | TyMap | TyFunc => true
+    TyObj => {
+      let i = 0
+      while i < ct.objFieldNames.length {
+        if (
+          strListIndexOf(mt.objFieldNames, ct.objFieldNames[i]) < 0
+          && !(T.tys[ct.objFieldTypes[i]] is TyNullable)
+        ) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TyNullable | TyUnion | TyErr | TyVar | TyNeg => false
+  }
+}
+
+// Whether narrowing a record `cur` to `chk` keeps its storage: a field narrowed to a string
+// literal set is stored as an atom in `chk` and as a string in `cur`, so the value cannot be
+// delivered as a `chk` (D4058).
+function recFitNarrowKeepsRep(cur: i32, chk: i32): boolean {
+  const names: string[] = []
+  const sets: i32[] = []
+  if recFitNarrowedFields(cur, chk, names, sets) != 1 { return true }
+  for st in sets {
+    for lex in tyLitSetMemberLexes(st) {
+      if nameIsQuotedLeaf(lex) { return false }
+    }
+  }
+  true
+}
+
+// For `r is B` over a single record `r: A` (or `A | null`) where every `B` is an `A` but not
+// the reverse, the fields `B` narrows and the literal set each must hold (D4058). -1 when the
+// test is not that shape, 0 when a narrowed field is not a literal set over `A`'s, else 1.
+export function recFitNarrowedFields(
+  obj: i32,
+  chk: i32,
+  names: string[],
+  sets: i32[],
+): i32 {
+  if obj < 0 || chk < 0 { return -1 }
+  const ct = T.tys[chk]
+  if !(ct is TyObj) { return -1 }
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  if base < 0 { return -1 }
+  const bt = T.tys[base]
+  if !(bt is TyObj) || !recContainedIn(chk, base) { return -1 }
+  let i = 0
+  while i < ct.objFieldNames.length {
+    const fb = ct.objFieldTypes[i]
+    const at = strListIndexOf(bt.objFieldNames, ct.objFieldNames[i])
+    if at < 0 { return 0 }
+    const fa = bt.objFieldTypes[at]
+    if !assignable(fa, fb) {
+      if tyLitSetMemberLexes(fb).length == 0 { return 0 }
+      names.push(ct.objFieldNames[i])
+      sets.push(fb)
+    }
+    i = i + 1
+  }
+  if names.length == 0 { return 0 }
+  1
+}
+
 // Whether a string literal of `ty` (through unions) is spelled with an escape.
 function litSetHasEscape(ty: i32): boolean {
   const lits: i32[] = []
@@ -74363,6 +74482,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   let meet = litSetMeetTy(objTy, chkTy)
   if meet == -1 && n.isVariant != "null" { meet = litBaseMeetTy(objTy, chkTy) }
   if meet == -1 { meet = litPrimMeetTy(objTy, chkTy) }
+  if meet == -1 { meet = recFitMeetTy(objTy, chkTy) }
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {
