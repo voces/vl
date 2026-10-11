@@ -7,6 +7,43 @@ with a recommendation. The spec states only today's behaviour until the owner ru
 ruled question moves to `DECISIONS.md`, and the chapter's `Open question:` line becomes a
 `Ruling:` line.
 
+## The questions in the order to rule them
+
+The order puts first a question whose ruling an open inventory row is waiting on, since
+the row cannot be closed correctly until then. Next come questions where two rulings, or a
+ruling and the compiler, disagree today. Then come std names, which are close to permanent
+once programs use them (std.md §STD2.3), so they are cheapest to settle now. New surface
+comes after that, and lexical spelling last. A **blocked row** is an open inventory row
+whose fix takes a different shape under different options.
+
+| # | question | recommendation | blocked rows |
+| --- | --- | --- | --- |
+| 1 | [Q4](#q4-two-record-arms-with-the-same-field-names-and-no-literal-field-to-tell-them-apart) Two record arms with the same field names and no literal discriminant | (b) admit the union; refuse only an `is` the values cannot answer | D4056 |
+| 2 | [Q10](#q10-does-x--l-narrow-a-literal-union) Does `x == L` narrow a literal union? | (a) yes, as `x is L` does | D4059 |
+| 3 | [Q11](#q11-declaring-a-name-an-ambient-name-has) Declaring a name an ambient name has | (b) the declaration shadows it, for the call and its type | D4066 |
+| 4 | [Q3](#q3-a-list-literal-of-bare-null) A list literal of bare `null` | in `docs/internals/open-rulings.md` §D1832 | D1832 |
+| 5 | [Q2](#q2-does-is-a-hold-of-a-record-with-more-fields-than-a) Does `is A` hold of a record with more fields than `A`? | (b) a record's field set is exact under `is` (today's behaviour) | none |
+| 6 | [Q7](#q7-a-whole-number-float-literal-at-an-integer-type) A whole-number float literal at an integer type | (a) accept it everywhere, so rulings A and C both hold | none |
+| 7 | [Q13](#q13-a-literal-zero-integer-divisor) A literal-zero integer divisor | (a) an error | none |
+| 8 | [Q15](#q15-two-spellings-of-one-std-operation) Two spellings of one std operation | (c) keep same-name re-exports, retire `padLeft` with a targeted refusal | none |
+| 9 | [Q14](#q14-exports-that-their-own-module-disowns) Exports that their own module disowns | (b) exported but not promised; retire `stdSmoke` | none |
+| 10 | [Q5](#q5-boolean-and-negative-integer-literal-types) Boolean and negative integer literal types | (b) both | none |
+| 11 | [Q12](#q12-import-cycles) Import cycles | (a) keep refusing every cycle, for now | none |
+| 12 | [Q9](#q9-a-constant-a-until-a) A constant `a until a` | (b) keep accepting it | none |
+| 13 | [Q6](#q6-the-arrow--as-one-token) The arrow `=>` as one token | (a) one token | none |
+| 14 | [Q1](#q1-block-comments) Block comments | (a) line comments only, with a dedicated refusal | none |
+
+Why this order:
+- Q4, Q10 and Q11 each have a filed row that waits on the ruling.
+- Q3's row is already in open-rulings.md with its options.
+- Q2 states today's behaviour, and the recommendation keeps it. Ruling it confirms the
+  reading D3885 left open.
+- Q7 and Q13 are cases where the checker answers one program two ways.
+
+**Resolved.** [Q8](#q8-a-positional-argument-after-a-named-one), a positional argument after
+a named one, was ruled on 2026-10-11 as (b), amended (Kotlin 1.4). D4061 tracks the checker
+catching up.
+
 ## Q1. Block comments
 
 Raised by lexical.md §L2.2.
