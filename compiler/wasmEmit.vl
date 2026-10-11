@@ -3177,7 +3177,11 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
       "emitProgram: `is` over a record tests a field that is not a literal set narrowed from the declared field, which has no lowering yet",
     )
   }
-  if !unionEqOperandOk(recv) { return emitFailNoMembershipRecv() }
+  // A receiver that is not a re-readable place (a call) is evaluated once into the `?.` stash.
+  const staged = !unionEqOperandOk(recv)
+  if staged && !fnUsesOptRecv {
+    return emitFailAt("emitProgram: `is` receiver stash not reserved", recv)
+  }
   let heap = -1
   const codes: i32[] = []
   const fis: i32[] = []
@@ -3206,13 +3210,17 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
     return emitFail("emitProgram: `is` over a record whose layout is not known")
   }
   const nullable = nodeTyIsNullable(recv)
-  if nullable {
-    if !exprNullableRefNiche(recv, fnIx) {
-      return emitFail(
-        "emitProgram: `is` over a nullable record that is not a nullable reference",
-      )
-    }
+  if nullable && !exprNullableRefNiche(recv, fnIx) {
+    return emitFail(
+      "emitProgram: `is` over a nullable record that is not a nullable reference",
+    )
+  }
+  if staged {
     if emitExpr(body, recv, fnIx) < 0 { return -1 }
+    fbLocalSet(optRecvSlot)
+  }
+  if nullable {
+    if emitRecordFitRecv(body, recv, fnIx, staged, -1) < 0 { return -1 }
     wU8(209) // ref.is_null
     fbIf(127)
     fbI32Const(0)
@@ -3223,8 +3231,8 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
     const lexes = tyLitSetMemberLexes(sets[k])
     let li = 0
     while li < lexes.length {
-      if emitExpr(body, recv, fnIx) < 0 { return -1 }
-      if nullable {
+      if emitRecordFitRecv(body, recv, fnIx, staged, heap) < 0 { return -1 }
+      if nullable && !staged {
         wU8(212) // ref.as_non_null
       }
       fbStructGet(heap, fis[k])
@@ -3241,6 +3249,21 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   if nullable { fbEnd() }
   1
+}
+
+// One read of the record-fit receiver: the stash cast back to `heap` (left uncast when `heap`
+// is -1, for the null test) when `staged`, else the receiver expression itself.
+function emitRecordFitRecv(
+  body: u8[],
+  recv: i32,
+  fnIx: i32,
+  staged: boolean,
+  heap: i32,
+): i32 {
+  if !staged { return emitExpr(body, recv, fnIx) }
+  fbLocalGet(optRecvSlot)
+  if heap >= 0 { fbRefCast(heap) }
+  0
 }
 
 // The outer union's tag for each arm of `tty`, in flatten order, with the arm's variant row
