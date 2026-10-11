@@ -314,6 +314,7 @@ import {
   redunECol,
   redunELine,
   redunName,
+  redunRet,
   redunSCol,
   redunSLine,
   redunTok,
@@ -405,7 +406,13 @@ import {
   stdRecvSpec,
   stdRecvTparams,
 } from "./std_receivers"
-import { mimpClear, mimpExportedByNote, mimpSpecsFor } from "./missing_import"
+import {
+  mimpAnyProgramSpec,
+  mimpClear,
+  mimpExportedByNote,
+  mimpNoteMiss,
+  mimpSpecsFor,
+} from "./missing_import"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -17330,6 +17337,24 @@ let fsbRowDecl: i32[] = []
 let fsbPendName: string[] = []
 let fsbPendIx: i32[] = []
 let fsbPendTy: i32[] = []
+// D3968 — the functions written to a marked binding, as the owners of their deferred constraints
+// (a written generic's declaration, else the body the write stands in), and every call through
+// such a binding with what it bound, so each owner's constraints are re-asked at that call.
+let fsbOwnDecl: i32[] = []
+let fsbOwnFn: i32[] = []
+let fsbOwnTy: i32[] = []
+let fsbCallArgTys: i32[][] = []
+// Per call: how many owner rows it has re-asked, the ones known at its own check.
+let fsbCallOwnN: i32[] = []
+let fsbCallIx: i32[] = []
+let fsbCallDecl: i32[] = []
+let fsbCallUsed: i32[] = []
+let fsbCallWho: string[] = []
+let fsbCallNames: string[][] = []
+let fsbCallTys: i32[][] = []
+let fsbCallHNames: string[][] = []
+let fsbCallHNo: i32[][] = []
+let fsbCallHNode: i32[][] = []
 
 function fsbReset() {
   fsbDepth = []
@@ -17338,6 +17363,20 @@ function fsbReset() {
   fsbPendName = []
   fsbPendIx = []
   fsbPendTy = []
+  fsbOwnDecl = []
+  fsbOwnFn = []
+  fsbOwnTy = []
+  fsbCallArgTys = []
+  fsbCallOwnN = []
+  fsbCallIx = []
+  fsbCallDecl = []
+  fsbCallUsed = []
+  fsbCallWho = []
+  fsbCallNames = []
+  fsbCallTys = []
+  fsbCallHNames = []
+  fsbCallHNo = []
+  fsbCallHNode = []
   0
 }
 
@@ -17372,6 +17411,15 @@ function fsbIsGeneric(ix: i32, ty: i32): boolean {
   if fsbIsHoleLambda(p) || fsbDeclAtNode(p) >= 0 { return true }
   const n = P.nodes[p]
   if n is Ident {
+    // A declared generic is generic whatever its type variables are named, even like the
+    // enclosing generic's own.
+    const gd = fnDeclIx[n.identName] ?? lookupFnDeclNode(n.identName)
+    if gd >= 0 && gd < P.nodes.length {
+      const gn = P.nodes[gd]
+      if gn is FuncDecl {
+        if gn.fnTyParams.length > 0 { return true }
+      }
+    }
     const d = bindMarkDeclOf(
       fnLitBindDepth,
       fnLitBindName,
@@ -17457,7 +17505,8 @@ function fsbMark(name: string, depth: i32, decl: i32, bound: i32) {
 function fsbNoteStore(tgt: i32, rhs: i32, rt: i32, ix: i32) {
   if inferQuiet || rt < 0 || rt >= T.tys.length { return 0 }
   const t = T.tys[rt]
-  if !(t is TyFunc) || fsbIsGeneric(rhs, rt) { return 0 }
+  if !(t is TyFunc) { return 0 }
+  if fsbIsGeneric(rhs, rt) { return fsbNoteOwner(fsbDeclAtNode(tgt), rhs, rt) }
   const d = fsbDeclAtNode(tgt)
   if d >= 0 { return fsbRefuse(d, rt, ix) }
   const g = P.nodes[parenPeelIx(tgt)]
@@ -17471,12 +17520,276 @@ function fsbNoteStore(tgt: i32, rhs: i32, rt: i32, ix: i32) {
   0
 }
 
+// Record the owner of the constraints of the generic `rhs`, of type `rt`, written to the binding
+// `decl`.
+function fsbNoteOwner(decl: i32, rhs: i32, rt: i32) {
+  if decl < 0 { return 0 }
+  // A lambda written in place has holes no other expression shares, so its enclosing body's
+  // constraints over them are its own; a binding of one is left to that binding's own calls.
+  let o = -1
+  const n = P.nodes[parenPeelIx(rhs)]
+  if n is Ident {
+    o = fnDeclIx[n.identName] ?? lookupFnDeclNode(n.identName)
+    if o < 0 { o = lookupFnAliasNode(n.identName) }
+    if o < 0 { return 0 }
+  } else if fsbIsHoleLambda(parenPeelIx(rhs)) {
+    o = cstrOwnerTop()
+  } else {
+    return 0
+  }
+  let i = 0
+  while i < fsbOwnDecl.length {
+    if fsbOwnDecl[i] == decl && fsbOwnFn[i] == o && fsbOwnTy[i] == rt {
+      return 0
+    }
+    i = i + 1
+  }
+  fsbOwnDecl.push(decl)
+  fsbOwnFn.push(o)
+  fsbOwnTy.push(rt)
+  0
+}
+
+// Record call `ix` through the marked binding `decl`, which re-asked the constraints `used` owns,
+// with what it bound; `fsbRecheckCalls` re-asks those of every other function written to it.
+function fsbNoteCall(
+  ix: i32,
+  decl: i32,
+  used: i32,
+  who: string,
+  names: string[],
+  tys: i32[],
+  hNames: string[],
+  hNo: i32[],
+  hNode: i32[],
+  argTys: i32[],
+) {
+  if decl < 0 || inferQuiet { return 0 }
+  fsbCallArgTys.push(argTys)
+  fsbCallIx.push(ix)
+  fsbCallDecl.push(decl)
+  fsbCallUsed.push(used)
+  fsbCallWho.push(who)
+  fsbCallNames.push(names)
+  fsbCallTys.push(tys)
+  fsbCallHNames.push(hNames)
+  fsbCallHNo.push(hNo)
+  fsbCallHNode.push(hNode)
+  fsbCallOwnN.push(0)
+  // The writes already seen are re-asked here, inside the body the call stands in, so a pair
+  // naming that body's type parameter is deferred to its instances as a direct call's is.
+  fsbRecheckFrom(fsbCallIx.length - 1)
+}
+
+// After the walk, when every write is known: each call through a marked binding re-asks the
+// deferred constraints of each function written to it, as a call naming that function would.
+function fsbRecheckCalls() {
+  let c = 0
+  while c < fsbCallIx.length {
+    fsbRecheckFrom(c)
+    c = c + 1
+  }
+  0
+}
+
+// Re-ask, at call `c`, each owner row recorded since it last asked.
+function fsbRecheckFrom(c: i32) {
+  if c < 0 || c >= fsbCallOwnN.length { return 0 }
+  let w = fsbCallOwnN[c]
+  while w < fsbOwnDecl.length {
+    if fsbOwnDecl[w] == fsbCallDecl[c] {
+      fsbRecheckOne(c, fsbOwnFn[w], fsbOwnTy[w])
+    }
+    w = w + 1
+  }
+  fsbCallOwnN[c] = fsbOwnDecl.length
+  0
+}
+
+// Set while a re-ask names one declaration, whose constraints alone it means: an owner-less
+// constraint is the program's, which the call itself already asked.
+let cstrOwnedStrict = false
+
+// One call `c` re-asks owner `o`'s constraints with each type-variable parameter of the written
+// function type `rt` bound, by position, to the argument the call passes there. Only the written
+// function's own parameters are bound: the seed's type variables name another declaration's.
+function fsbRecheckOne(c: i32, o: i32, rt: i32) {
+  const nm: string[] = []
+  const ty: i32[] = []
+  const added = fsbBindParams(rt, fsbCallArgTys[c], nm, ty)
+  if added == 0 || o == fsbCallUsed[c] { return 0 }
+  if !fsbArgsFit(c, rt, nm, ty) { return 0 }
+  const modeWas = substNestMode
+  const declWas = substNestDecl
+  substNestMode = SUBST_ALL
+  if o >= 0 { substNestMode = SUBST_DECLARED }
+  const ix = fsbCallIx[c]
+  const who = fsbCallWho[c]
+  const callee = fsbOwnerCallee(o)
+  cstrOwnedStrict = o >= 0
+  validateBinCstrs(
+    nm,
+    ty,
+    ix,
+    callee,
+    who,
+    fsbCallHNames[c],
+    fsbCallHNo[c],
+    fsbCallHNode[c],
+  )
+  validatePrintCstrs(nm, ty, ix, callee, who)
+  validateIsCstrs(nm, ty, ix, callee, who)
+  validateArgCstrs(nm, ty, ix, callee, fsbCallHNames[c], fsbCallHNode[c])
+  validateRetCstrs(nm, ty, ix, callee, who)
+  validateLetCstrs(nm, ty, ix, callee, who)
+  validateBmCstrs(nm, ty, ix, callee, who)
+  validateMemCstrs(
+    nm,
+    ty,
+    ix,
+    callee,
+    who,
+    fsbCallHNames[c],
+    fsbCallHNo[c],
+    fsbCallHNode[c],
+  )
+  cstrOwnedStrict = false
+  substNestMode = modeWas
+  substNestDecl = declWas
+  0
+}
+
+// A delivery of the marked binding `src` to the concrete function type `dst` is a call at `dst`'s
+// parameters for every function written to it (D3968).
+function fsbNoteFnDelivery(src: i32, dst: i32) {
+  if dst < 0 || dst >= T.tys.length || src < 0 { return 0 }
+  const f = T.tys[dst]
+  // An element of an array literal, or a field of an object literal, is delivered to the
+  // destination's element or field type.
+  const sn = P.nodes[parenPeelIx(src)]
+  if f is TyNullable { return fsbNoteFnDelivery(src, f.nInner) }
+  if sn is ArrayLit {
+    if f is TyArray {
+      for e in sn.arrElems { fsbNoteFnDelivery(e, f.aElem) }
+    }
+    return 0
+  }
+  if sn is ObjLit {
+    if f is TyObj {
+      for fi in sn.objFields {
+        const fn = P.nodes[fi]
+        if fn is FieldInit {
+          fsbNoteFnDelivery(fn.fiValue, objFieldType(f, fn.fiName))
+        }
+      }
+    }
+    return 0
+  }
+  if !(f is TyFunc) || tyHasTyVar(dst) { return 0 }
+  const d = fsbDeclAtNode(src)
+  if d < 0 { return 0 }
+  const args: i32[] = []
+  for p in f.fnParamTypes { args.push(p) }
+  const none: string[] = []
+  const noTys: i32[] = []
+  const noIx: i32[] = []
+  const noNode: i32[] = []
+  fsbNoteCall(src, d, CSTR_ANYFN, "", none, noTys, none, noIx, noNode, args)
+}
+
+// The parameter types of the called type `ft` under the call's bindings.
+function fsbArgTysOf(ft: TyFunc, vNames: string[], vTys: i32[]): i32[] {
+  const out: i32[] = []
+  for p in ft.fnParamTypes { out.push(substTyDeep(p, vNames, vTys)) }
+  out
+}
+
+// Bind the type variables of each parameter of function type `rt` against the argument type at
+// its position, structurally (`A[]`, `A | null`, `Box<A>`, `() => A` all bind `A`), appending to
+// `nm`/`ty`; answers how many it bound.
+function fsbBindParams(rt: i32, args: i32[], nm: string[], ty: i32[]): i32 {
+  if rt < 0 || rt >= T.tys.length { return 0 }
+  const f = T.tys[rt]
+  const was = nm.length
+  if f is TyFunc {
+    let i = 0
+    while i < f.fnParamTypes.length && i < args.length {
+      const p = f.fnParamTypes[i]
+      if p >= 0 && p < T.tys.length && args[i] >= 0 && args[i] < T.tys.length {
+        bindGenWalk(p, args[i], nm, ty)
+      }
+      i = i + 1
+    }
+  }
+  nm.length - was
+}
+
+// Whether each argument of call `c` is assignable to the parameter of `rt` at its position under
+// the bindings `nm`/`ty`; the first that is not is refused at the call, as a direct call would be.
+function fsbArgsFit(c: i32, rt: i32, nm: string[], ty: i32[]): boolean {
+  const f = T.tys[rt]
+  if !(f is TyFunc) { return true }
+  const args = fsbCallArgTys[c]
+  let i = 0
+  while i < f.fnParamTypes.length && i < args.length {
+    const want = substTyDeep(f.fnParamTypes[i], nm, ty)
+    if (
+      want >= 0
+      && args[i] >= 0
+      && !tyHasTyVar(want)
+      && !assignable(args[i], want)
+    ) {
+      tErr(
+        "argument "
+          + i32ToStr(i + 1)
+          + ": expected "
+          + tyToStr(want)
+          + ", got "
+          + tyToStr(args[i])
+          + " (a function written to this binding takes `"
+          + tyToStr(want)
+          + "` there)",
+        fsbCallIx[c],
+      )
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// The callee a re-ask names for owner `o`: its declaration, or none for a module-level write.
+function fsbOwnerCallee(o: i32): i32 {
+  if o >= 0 { return o }
+  CSTR_NODECL
+}
+
 // Refuse at `ix` the concrete function type `rt` written to the binding declared by `decl`, with
 // the annotation `check --fix` inserts after the binding's name when both are in one module.
 function fsbRefuse(decl: i32, rt: i32, ix: i32) {
   const n = P.nodes[decl]
   if !(n is LetDecl) { return 0 }
   const annot = tyToStr(rt)
+  const head = "cannot assign "
+    + annot
+    + " to `"
+    + n.letName
+    + "`: it keeps the generic type of its initializer, so a function written to it must be "
+    + "generic too"
+  // The annotation is a fix only when the initializer fits it too.
+  const it = nodeTyIxOf(n.letInit)
+  if it >= 0 && !assignable(it, rt) {
+    return tErrCoded(
+      head
+        + " — no annotation holds both, since the initializer, "
+        + tyToStr(it)
+        + ", is not "
+        + annot
+        + "; bind this function to a `let` of its own",
+      ix,
+      CODE_GENERIC_BINDING_CONCRETE_WRITE,
+    )
+  }
   let data = ""
   const tk = declNameTokOf(decl)
   if tk >= 0 && tk < P.toks.length && rcwModOf(decl) == rcwModOf(ix) {
@@ -17486,12 +17799,8 @@ function fsbRefuse(decl: i32, rt: i32, ix: i32) {
       + diagDataField("col", i32ToStr(t.col + t.text.length))
   }
   tErrCodedData(
-    "cannot assign "
-      + annot
-      + " to `"
-      + n.letName
-      + "`: it keeps the generic type of its initializer, so a function written to it must be "
-      + "generic too — to hold this one, annotate it, `let "
+    head
+      + " — to hold this one, annotate it, `let "
       + n.letName
       + ": "
       + annot
@@ -17500,6 +17809,366 @@ function fsbRefuse(decl: i32, rt: i32, ix: i32) {
     CODE_GENERIC_BINDING_CONCRETE_WRITE,
     data,
   )
+}
+
+// One rewrite round reaches one more link of a forwarding chain; a chain longer than this is
+// declined whole, and keeps the refusal.
+const WS_MAX_ROUNDS = 8
+
+// D3992 — a record of a wider shape passed to a function's parameter of a declared record type
+// is legal (no field changes type, so the shared value keeps every invariant), and is lowered by
+// making that parameter generic: the function is re-checked as `f<__W0>(p: __W0)` and each
+// instance takes its argument's own layout. Every call is still held to the declared type.
+let wsDecl: i32[] = []
+let wsParam: i32[] = []
+let wsOrigAnn: i32[] = []
+// Declarations declined a rewrite, whose calls keep the width refusal.
+let wsNoDecl: i32[] = []
+let wsPendDecl: i32[] = []
+let wsPendParam: i32[] = []
+// Per pass: declarations whose body refused something, and top-level functions read as values,
+// neither of which is rewritten.
+let wsBodyErr: {[i32]: boolean} = Map()
+let wsValueRead: {[string]: boolean} = Map()
+// Set while an argument a rewrite serves is delivered, so the width refusal stays quiet.
+let wsSuppress = false
+// Rewritten declarations an instance refused something in this pass: the declared parameter
+// accepted it, so the refusal is the rewrite's, and the rewrite is undone.
+let wsInstErr: i32[] = []
+
+function wsReset() {
+  wsDecl = []
+  wsParam = []
+  wsOrigAnn = []
+  wsNoDecl = []
+  wsPassReset()
+}
+
+function wsPassReset() {
+  wsPendDecl = []
+  wsPendParam = []
+  wsBodyErr = Map()
+  wsValueRead = Map()
+  wsSuppress = false
+  wsInstErr = []
+  0
+}
+
+// Whether `t` is the type parameter a rewrite gave a parameter.
+function wsVarTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const v = T.tys[t]
+  if v is TyVar { return v.tvName.length > 3 && v.tvName.slice(0, 3) == "__W" }
+  false
+}
+
+// Note an instance refusal at a call of declaration `d`, when a rewrite made it generic.
+function wsNoteInstErr(d: i32) {
+  if d < 0 || i32ListHas(wsInstErr, d) { return 0 }
+  let k = 0
+  while k < wsDecl.length {
+    if wsDecl[k] == d {
+      wsInstErr.push(d)
+      return 0
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Restore the declared parameters of every declaration noted in `wsInstErr` and decline it.
+// Answers how many it restored.
+function wsUndoInstErr(): i32 {
+  let done = 0
+  for d in wsInstErr {
+    const fd = P.nodes[d]
+    let k = 0
+    while k < wsDecl.length {
+      if wsDecl[k] == d && fd is FuncDecl && wsParam[k] < fd.fnParams.length {
+        const pi = fd.fnParams[wsParam[k]]
+        const pn = P.nodes[pi]
+        if pn is Param {
+          P.nodes[pi] = {
+            parName: pn.parName,
+            parType: wsOrigAnn[k],
+            parDefault: pn.parDefault,
+            parOpt: pn.parOpt,
+            parRest: pn.parRest,
+            pos: pn.pos,
+          }
+        }
+        const nm = "__W" + i32ToStr(wsParam[k])
+        const tps: string[] = []
+        const cur = P.nodes[d]
+        if cur is FuncDecl {
+          for t in cur.fnTyParams {
+            if t != nm { tps.push(t) }
+          }
+          P.nodes[d] = {
+            fnName: cur.fnName,
+            fnTyParams: tps,
+            fnParams: cur.fnParams,
+            fnRet: cur.fnRet,
+            fnBody: cur.fnBody,
+            pos: cur.pos,
+          }
+        }
+        wsDecl[k] = -1
+        done = done + 1
+      }
+      k = k + 1
+    }
+    if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
+  }
+  wsInstErr = []
+  if done > 0 {
+    const kd: i32[] = []
+    const kp: i32[] = []
+    const ka: i32[] = []
+    let r = 0
+    while r < wsDecl.length {
+      if wsDecl[r] >= 0 {
+        kd.push(wsDecl[r])
+        kp.push(wsParam[r])
+        ka.push(wsOrigAnn[r])
+      }
+      r = r + 1
+    }
+    wsDecl = kd
+    wsParam = kp
+    wsOrigAnn = ka
+  }
+  done
+}
+
+// One rewrite step: apply the pending rewrites, or, when there are none, undo the ones an
+// instance refused. A refusal in a pass with rewrites pending may be one they serve.
+function wsStep(): i32 {
+  const applied = wsApplyPending()
+  if applied > 0 {
+    wsInstErr = []
+    return applied
+  }
+  wsUndoInstErr()
+}
+
+// The rewrite row of parameter `i` of declaration `d`, or -1.
+function wsRowOf(d: i32, i: i32): i32 {
+  let k = 0
+  while k < wsDecl.length {
+    if wsDecl[k] == d && wsParam[k] == i { return k }
+    k = k + 1
+  }
+  -1
+}
+
+// The top-level declaration a call's callee names, or -1.
+function wsCalleeDecl(n: Call): i32 {
+  const c = P.nodes[n.callFn]
+  if c is Ident {
+    if lookupDepth(c.identName) != 0 { return -1 }
+    return fnDeclIx[c.identName] ?? -1
+  }
+  -1
+}
+
+// Whether argument `i` of call `n`, of type `at`, is a wider record the parameter's declared
+// record type `expected` would refuse only for its extra fields, and the function can take a
+// generic parameter there: not exported, the type named in no other annotation of its signature.
+// A function read as a value is declined when the rewrite is applied.
+function wsCandidate(
+  n: Call,
+  i: i32,
+  arg: i32,
+  at: i32,
+  expected: i32,
+): boolean {
+  if arg < 0 || at < 0 || expected < 0 || expected >= T.tys.length {
+    return false
+  }
+  if at == expected || !(T.tys[expected] is TyObj) { return false }
+  // Asked of every argument: only a record with more fields, or a parameter this rewrite made
+  // generic, goes on to the declaration and the field-by-field comparison.
+  const pre = T.tys[at]
+  if pre is TyObj {
+    const ew = T.tys[expected]
+    if ew is TyObj {
+      if pre.objFieldNames.length <= ew.objFieldNames.length { return false }
+    }
+  } else if !(pre is TyVar) {
+    return false
+  }
+  const d = wsCalleeDecl(n)
+  if d < 0 || i32ListHas(wsNoDecl, d) { return false }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) || i >= fd.fnParams.length || declHasExportKw(d) {
+    return false
+  }
+  const pn = P.nodes[fd.fnParams[i]]
+  if (
+    !(pn is Param)
+    || pn.parType < 0
+    || pn.parRest == 1
+    || pn.parName == "self"
+  ) {
+    return false
+  }
+  const ann = P.nodes[pn.parType]
+  if !(ann is TypeRef) || !wsIsIdent(ann.tyName) { return false }
+  const et = T.tys[expected]
+  const st = T.tys[at]
+  if !(et is TyObj) { return false }
+  // A parameter this rewrite already made generic, passed on whole, makes this one generic too:
+  // each of its instances is one of the wider records its own calls are held to.
+  if st is TyVar {
+    if st.tvName.length < 3 || st.tvName.slice(0, 3) != "__W" { return false }
+  } else if st is TyObj {
+    let f = 0
+    while f < et.objFieldNames.length {
+      const sf = objFieldType(st, et.objFieldNames[f])
+      if sf < 0 || !tySame(sf, et.objFieldTypes[f]) { return false }
+      f = f + 1
+    }
+    if !objShapeAdapterlessAt(arg, at, expected) { return false }
+  } else {
+    return false
+  }
+  let j = 0
+  while j < fd.fnParams.length {
+    const oj = P.nodes[fd.fnParams[j]]
+    if j != i && oj is Param {
+      if wsAnnMentions(oj.parType, ann.tyName) { return false }
+    }
+    j = j + 1
+  }
+  if fd.fnRet < 0 { return wsInferredRetPrim(fd.fnName) }
+  !wsAnnMentions(fd.fnRet, ann.tyName)
+}
+
+// Whether the un-annotated return of top-level function `name` is inferred as a primitive. Any
+// other return may carry the parameter's record out, which the rewrite would retype.
+function wsInferredRetPrim(name: string): boolean {
+  if name == "" { return false }
+  const h = lookup(name)
+  if h < 0 || h >= T.tys.length { return false }
+  const ht = T.tys[h]
+  if ht is TyFunc { return tyIsPrimIx(ht.fnRet) }
+  false
+}
+
+// Whether `s` is a bare identifier, the spelling of a declared type's name.
+function wsIsIdent(s: string): boolean {
+  if s.length == 0 { return false }
+  for c in s {
+    const ok = (c >= 'a' && c <= 'z')
+      || (c >= 'A' && c <= 'Z')
+      || (c >= '0' && c <= '9')
+      || c == '_'
+    if !ok { return false }
+  }
+  true
+}
+
+// Whether the annotation node `ix` spells the type name `nm`, or has no spelling to read.
+function wsAnnMentions(ix: i32, nm: string): boolean {
+  if ix < 0 { return false }
+  const a = P.nodes[ix]
+  if !(a is TypeRef) { return true }
+  const s = a.tyName
+  let i = 0
+  while i + nm.length <= s.length {
+    if s.slice(i, i + nm.length) == nm {
+      const before = i == 0 || !wsIsIdent(s.slice(i - 1, i))
+      const after = i + nm.length == s.length
+        || !wsIsIdent(s.slice(i + nm.length, i + nm.length + 1))
+      if before && after { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Record parameter `i` of the declaration call `n` names for a rewrite.
+function wsNotePending(n: Call, i: i32) {
+  const d = wsCalleeDecl(n)
+  let k = 0
+  while k < wsPendDecl.length {
+    if wsPendDecl[k] == d && wsPendParam[k] == i { return 0 }
+    k = k + 1
+  }
+  wsPendDecl.push(d)
+  wsPendParam.push(i)
+  0
+}
+
+// Make each pending parameter generic, unless its function's body refused something or it is read
+// as a value, which declines it. Answers how many it changed, which the caller re-checks for.
+function wsApplyPending(): i32 {
+  let done = 0
+  let k = 0
+  while k < wsPendDecl.length {
+    const d = wsPendDecl[k]
+    const i = wsPendParam[k]
+    const fd = P.nodes[d]
+    if fd is FuncDecl {
+      if (
+        !(wsBodyErr[d] ?? false)
+        && !(wsValueRead[fd.fnName] ?? false)
+        && wsRowOf(d, i) < 0
+        && i < fd.fnParams.length
+      ) {
+        const pi = fd.fnParams[i]
+        const pn = P.nodes[pi]
+        if pn is Param {
+          const nm = "__W" + i32ToStr(i)
+          const tps: string[] = []
+          for t in fd.fnTyParams { tps.push(t) }
+          tps.push(nm)
+          wsDecl.push(d)
+          wsParam.push(i)
+          wsOrigAnn.push(pn.parType)
+          P.nodes[pi] = {
+            parName: pn.parName,
+            parType: mkTypeRef(nm, pn.pos),
+            parDefault: pn.parDefault,
+            parOpt: pn.parOpt,
+            parRest: pn.parRest,
+            pos: pn.pos,
+          }
+          P.nodes[d] = {
+            fnName: fd.fnName,
+            fnTyParams: tps,
+            fnParams: fd.fnParams,
+            fnRet: fd.fnRet,
+            fnBody: fd.fnBody,
+            pos: fd.pos,
+          }
+          done = done + 1
+        }
+      } else if wsRowOf(d, i) < 0 && !i32ListHas(wsNoDecl, d) {
+        // Declined: the pass that quieted this call's refusal is re-run, and it speaks.
+        wsNoDecl.push(d)
+        done = done + 1
+      }
+    }
+    k = k + 1
+  }
+  wsPendDecl = []
+  wsPendParam = []
+  done
+}
+
+// The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
+// when it is no rewritten one.
+function wsOrigTyOf(n: Call, i: i32): i32 {
+  if wsDecl.length == 0 { return -1 }
+  const d = wsCalleeDecl(n)
+  if d < 0 { return -1 }
+  const r = wsRowOf(d, i)
+  if r < 0 { return -1 }
+  const a = P.nodes[wsOrigAnn[r]]
+  if a is TypeRef { return resolveAnnot(a.tyName, []) }
+  -1
 }
 
 // Mark the binding `name` declared by `decl` at `depth` when its initializer is a lambda with no
@@ -19157,6 +19826,7 @@ function redunReset() {
   redunName = []
   redunType = []
   redunTok = []
+  redunRet = []
   0
 }
 
@@ -19329,6 +19999,7 @@ function recordRedundantAnnot(
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   redunType.push(tyToStrUser(initTy))
   redunTok.push(nameTok)
+  redunRet.push(false)
   0
 }
 
@@ -19446,6 +20117,7 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   redunType.push(tyToStrUser(ret))
   redunTok.push(nameTok)
+  redunRet.push(true)
   0
 }
 
@@ -24068,6 +24740,9 @@ function binShiftOp(op: string): boolean {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
+  if fsbName.length > 0 && !inferQuiet && srcExpr >= 0 {
+    fsbNoteFnDelivery(srcExpr, dstTy)
+  }
   if numUnionMinted && numUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
     return true
   }
@@ -24117,6 +24792,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if assignable(srcTy, dstTy) {
     if !inferQuiet && srcExpr >= 0 { genFnValueCstrs(srcExpr, srcTy, dstTy) }
     if fvaAdapt(srcExpr, srcTy, dstTy) { return true }
+    // The constraint probe records a hole delivery's pin as well, so a caller whose body is
+    // checked before this one still re-asks it at its own pins.
+    if cstrProbe && srcExpr >= 0 { rcwPinProbe(srcExpr, srcTy, dstTy) }
     // The object-shape floor. `assignable` accepts structural subtyping between two object shapes
     // and the emitter has no adapter for it (`objShapeAdapterless`), so the pair would reach codegen
     // and fail there on a file `vl check` reports clean. It belongs at this seam, the one every
@@ -24147,7 +24825,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       } else if tyWideUnionMinted {
         recordListWidenRetag(srcExpr, srcTy, dstTy)
       }
-      if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
+      if !wsSuppress && objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       } else if srcTy != dstTy {
         let recDst = dstTy
@@ -35811,11 +36489,20 @@ function rcwPinNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   0
 }
 
+// `rcwPend`'s pin half, for the constraint probe, which records nothing else.
+function rcwPinProbe(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy < 0 || srcTy >= T.tys.length || dstTy < 0 { return 0 }
+  if T.tys[srcTy] is TyVar && rcwIsRefTy(dstTy) && cstrOwnerTop() >= 0 {
+    rcwPinNote(srcExpr, srcTy, dstTy)
+  }
+  0
+}
+
 // The deliveries `calleeFn`'s body recorded at a hole, at this call's bindings: a source the pin
 // makes concrete is asked the direct spelling's record rules, and one still open is recorded
 // for the caller's pins.
 function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
-  if inferQuiet { return 0 }
+  if inferQuiet && !cstrProbe { return 0 }
   const n = rcwPinSrc.length
   let i = 0
   while i < n {
@@ -35826,7 +36513,7 @@ function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
           if T.tys[sub] is TyVar && cstrOwnerTop() >= 0 {
             rcwPinNote(rcwPinSrc[i], sub, rcwPinDstTy[i])
           }
-        } else if assignable(sub, rcwPinDstTy[i]) {
+        } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
           // The delivery seam's two record rules, in its order: a shape stored differently,
           // then a widened field something writes.
           if objShapeAdapterlessAt(rcwPinSrc[i], sub, rcwPinDstTy[i]) {
@@ -40990,7 +41677,7 @@ function cstrOwnerTop() {
 // constraint always applies; a call that cannot name its callee consults everything.
 // Scoping the unnamed callee to the enclosing body is wrong: `const f = addT; f(c, c)` has holes that are `addT`'s, not the caller's.
 function cstrOwnedBy(owner: i32, calleeFn: i32) {
-  if owner < 0 { return true }
+  if owner < 0 { return !cstrOwnedStrict }
   if calleeFn == CSTR_ANYFN { return true }
   if calleeFn == CSTR_NODECL { return true }
   owner == calleeFn
@@ -41042,6 +41729,10 @@ function softenBareLitTy(ty: i32): i32 {
 function noteBinCstr(lt: i32, op: string, rt: i32) {
   if tyHasHole(lt) || tyHasHole(rt) {
     const owner = cstrOwnerTop()
+    // An identity comparison of a rewritten parameter would compare two struct types.
+    if (op == "==" || op == "!=") && (wsVarTy(lt) || wsVarTy(rt)) {
+      wsNoteInstErr(owner)
+    }
     // A structurally equal constraint of the same body is the same constraint: a call's
     // substitution mints fresh arena copies, and keying on the index alone let each copy of a
     // callee's constraints re-record in every caller, exponential over a cycle of generics (D2757).
@@ -41763,6 +42454,31 @@ function memberFloorMsg(objTy: i32, prop: string) {
     + "' on non-object "
     + tyToStr(objTy)
     + stdFmtMovedNote(prop)
+    + builtinMethodNote(objTy, prop)
+}
+
+// When `prop` names a numeric builtin that takes a value of `objTy` first (`x.abs()`,
+// `x.max(y)`), the sentence that says to call it; "" otherwise.
+function builtinMethodNote(objTy: i32, prop: string): string {
+  const pn = primNameOf(objTy)
+  const isFloat = pn == "f32" || pn == "f64"
+  const isInt = pn == "i32" || pn == "i64"
+  let arity = 0
+  if isFloat { arity = floatIntrArity(prop) }
+  if isInt {
+    arity = intIntrArity(prop)
+    if prop == "abs" || prop == "min" || prop == "max" {
+      arity = floatIntrArity(prop)
+    }
+  }
+  if arity == 0 { return "" }
+  let call = prop + "(x)"
+  if arity == 2 { call = prop + "(x, y)" }
+  " — `"
+    + prop
+    + "` is a builtin function, not a method: call it as `"
+    + call
+    + "`"
 }
 
 // The redirect for another language's element-count member read on a list, map, set or
@@ -41792,6 +42508,8 @@ function stdFmtMovedNote(name: string) {
 function undeclaredImportRaise(name: string, ix: i32): boolean {
   const from = ufcsModOfNode(ix)
   const specs = mimpSpecsFor(name, from, -1)
+  // No program module answered: a file the program does not import yet may, beside std.
+  if !mimpAnyProgramSpec(specs) { mimpNoteMiss(name) }
   if specs.length == 0 { return false }
   let data = diagDataField("member", name)
   for s in specs { data = data + diagDataField("modules", s) }
@@ -41809,8 +42527,13 @@ function undeclaredImportRaise(name: string, ix: i32): boolean {
 // `ufcs-not-imported` code replace them. One home for the raise, since `checkMemberNode`
 // refuses from seven arms and a per-arm enrichment would silently miss most of them.
 function memberFloorErr(objTy: i32, prop: string, ix: i32) {
+  // A method lookup over a receiver built from an error already reported is that error's
+  // cascade: its instance differs from the method's only by the error. A missing FIELD is not,
+  // so the floor below still raises for one.
+  const cascade = tyMentionsErr(objTy, 8)
   const specs = ufcsMissSpecsAt(ix)
   if specs != "" {
+    if cascade { return 0 }
     const alias = ufcsImportAliasAt(ix, prop, objTy)
     return tErrCodedData(
       ufcsNotImportedMsg(prop, specs, objTy, alias),
@@ -41823,6 +42546,7 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   // wherever it applies: a name not in scope at all cannot reach this bank (D1570).
   const whyRow = ufcsWhyRow(ix)
   if whyRow >= 0 {
+    if cascade { return 0 }
     return tErrCodedData(
       ufcsWhyMsg[whyRow],
       ix,
@@ -42049,6 +42773,7 @@ function ufcsMissRaise(
   ix: i32,
   memIx: i32,
 ): boolean {
+  if tyMentionsErr(recvTy, 8) { return true }
   const specs = ufcsMissingImportSpecs(prop, recvTy, argc, ix)
   if specs != "" {
     const alias = ufcsImportAliasAt(ix, prop, recvTy)
@@ -47796,6 +48521,52 @@ function tyMentionsTyVarNamed(ty: i32, name: string, depth: i32): boolean {
   false
 }
 
+// Whether type `ty` is, or holds within `depth` levels, the error type an earlier
+// diagnostic produced.
+function tyMentionsErr(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyErr => {
+      return true
+    }
+    TyArray => {
+      return tyMentionsErr(t.aElem, depth - 1)
+    }
+    TyNullable => {
+      return tyMentionsErr(t.nInner, depth - 1)
+    }
+    TyNeg => {
+      return tyMentionsErr(t.negTy, depth - 1)
+    }
+    TyMap => {
+      if tyMentionsErr(t.mKey, depth - 1) { return true }
+      return tyMentionsErr(t.mVal, depth - 1)
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if tyMentionsErr(f, depth - 1) { return true }
+      }
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyMentionsErr(m, depth - 1) { return true }
+      }
+    }
+    TyFunc => {
+      for p in t.fnParamTypes {
+        if tyMentionsErr(p, depth - 1) { return true }
+      }
+      return tyMentionsErr(t.fnRet, depth - 1)
+    }
+    TyPrim => {}
+    TyVar => {}
+    TyLit => {}
+  }
+  false
+}
+
 // Does any parameter's written annotation mention one of `names`? An un-annotated parameter
 // mentions nothing, which is the right answer: its type is a hole the call site pins, and a
 // hole never carries the declared name a return annotation would substitute through.
@@ -50175,7 +50946,23 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     widenRetagGenArg = tyWideUnionMinted && tyHasTyVar(params[i])
     const savedLbiGen = lbiNoDest
     lbiNoDest = tyHasTyVar(params[i])
+    // A wider record into a declared record parameter: a parameter already made generic is
+    // still held to its declared type, and a new one is made generic after this pass (D3992).
+    const wsOrig = wsOrigTyOf(n, i)
+    if wsOrig >= 0 && i < args.length && args[i] >= 0 && !tyHasTyVar(at) {
+      wsSuppress = true
+      const wsOk = assignableExpr(args[i], at, wsOrig)
+      wsSuppress = false
+      if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
+    }
+    const wsNew = wsOrig < 0
+      && !inferQuiet
+      && i < args.length
+      && wsCandidate(n, i, args[i], at, expected)
+    if wsNew { wsNotePending(n, i) }
+    wsSuppress = wsNew
     const argOk = assignableExpr(args[i], at, expected)
+    wsSuppress = false
     lbiNoDest = savedLbiGen
     widenRetagGenArg = savedGenArg
     if !argOk {
@@ -50257,7 +51044,22 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     } else {
       substNestMode = SUBST_ALL
     }
+    const wsVd = T.diags.length
     pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
+    if fsbName.length > 0 {
+      fsbNoteCall(
+        ix,
+        fsbDeclAtNode(n.callFn),
+        cstrCallee,
+        cstrWho,
+        vNames,
+        vTys,
+        dhNames,
+        dhArgNo,
+        dhArgNode,
+        fsbArgTysOf(ft, vNames, vTys),
+      )
+    }
     validateBinCstrs(
       vNames,
       vTys,
@@ -50304,6 +51106,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
     validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateRcwPins(vNames, vTys, cstrCallee)
+    if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
     substNestMode = modeWas
     substNestDecl = declWas
     // Not a validation: the `??` result holes are substituted here for their BANK, which is
@@ -50699,6 +51502,14 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
   if cfn is Ident {
     const nm = cfn.identName
     if (nm == "Map" || nm == "Set") && lookupDepth(nm) < 0 { return true }
+    if (
+      arrayCtorNote(nm) != ""
+      && lookupDepth(nm) < 0
+      && lookupFnDeclNode(nm) < 0
+    ) {
+      tErr("explicit type arguments on `Array`" + arrayCtorNote(nm), ix)
+      return false
+    }
     const dIx = lookupFnDeclNode(nm)
     if dIx >= 0 {
       const d = P.nodes[dIx]
@@ -50721,6 +51532,13 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
     ix,
   )
   false
+}
+
+// The redirect for another language's list constructor, keyed on the spelling `Array`; ""
+// for any other name.
+function arrayCtorNote(name: string): string {
+  if name != "Array" { return "" }
+  " — VL has no `Array` constructor: `n` copies of `v` is `filled(n, v)` (`import { filled } from \"std:array\"`), and an empty list is `[]`"
 }
 
 // Appended where a call read as `name<…>(…)` fails: the source may have meant a comparison,
@@ -52000,6 +52818,7 @@ function redunTruncate(n: i32) {
   while redunName.length > n { redunName.pop() }
   while redunType.length > n { redunType.pop() }
   while redunTok.length > n { redunTok.pop() }
+  while redunRet.length > n { redunRet.pop() }
   0
 }
 
@@ -53486,7 +54305,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   lpBase = lpLabels.length
   let r = 0
   if n.fnName != "" {
+    const wsDiags = T.diags.length
     r = checkFuncDeclNodeReal(n, fnIx)
+    if T.diags.length > wsDiags { wsBodyErr[fnIx] = true }
   } else {
     lamCheckDepth = lamCheckDepth + 1
     r = checkFuncDeclNodeReal(n, fnIx)
@@ -53813,6 +54634,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // pushed: a nested function or lambda has no `fnDeclIx` entry for a call site to match
   // against, so its constraints stay owned by the enclosing named function.
   let cstrOwnerPushed = false
+  const fsbCallsAt = fsbCallIx.length
   if n.fnName != "" {
     if (fnDeclIx[n.fnName] ?? -1) == fnIx {
       cstrOwnerStack.push(fnIx)
@@ -54055,6 +54877,13 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   njFnIx = savedNjFn
   curFnBareRetVoid = savedBareRetVoid
   daLeaveFrame(daSavedUnassigned)
+  // A write after a call in source order (a loop's back edge) is re-asked here, inside this body,
+  // so a pair naming its type parameter is deferred to its instances as at the call.
+  let fsbC = fsbCallsAt
+  while fsbC < fsbCallIx.length {
+    fsbRecheckFrom(fsbC)
+    fsbC = fsbC + 1
+  }
   let tpPop = 0
   while tpPop < n.fnTyParams.length {
     tpEnvNames.pop()
@@ -56368,7 +57197,14 @@ function checkNodeReal(ix: i32) {
       }
       const moved = stdFmtMovedNote(n.identName)
       if moved == "" && undeclaredImportRaise(n.identName, ix) { return TY_ERR }
-      tErr("undeclared identifier '" + n.identName + "'" + moved, ix)
+      tErr(
+        "undeclared identifier '"
+          + n.identName
+          + "'"
+          + moved
+          + arrayCtorNote(n.identName),
+        ix,
+      )
       return TY_ERR
     }
     // `ty` is this use's type as the checker resolved it — narrowed when the use
@@ -56389,6 +57225,10 @@ function checkNodeReal(ix: i32) {
     if ix != daWriteTarget { daCheckRead(n.identName, ix) }
     if lbiBindName.length > 0 && ix != daWriteTarget {
       lbiNoteRead(ix, n.identName)
+    }
+    // A top-level function read as a value keeps its declared parameters (D3992).
+    if ix != ckCalleeIx && lookupDepth(n.identName) == 0 {
+      if fnDeclIx.has(n.identName) { wsValueRead[n.identName] = true }
     }
     return ty
   } else if n is Paren {
@@ -58394,12 +59234,19 @@ export function checkProgram(rootIx: i32) {
   expInfReset()
   lbiReset()
   recAdReset()
+  wsReset()
   checkProgramPass(rootIx)
   lbiSolve()
   lbiDropUnobservable()
   recAdSolve()
   // An uncalled entry export's parameters annotated from its body need the body re-checked.
   if expParamInfer() > 0 { checkProgramAgain(rootIx) }
+  // A parameter a wider record is passed to is made generic and the program re-checked (D3992).
+  let wsRounds = 0
+  while wsRounds < WS_MAX_ROUNDS && wsStep() > 0 {
+    checkProgramAgain(rootIx)
+    wsRounds = wsRounds + 1
+  }
   while (
     (lbiPinCand.length > 0 || recAdPinDecl.length > 0)
     && passes < LBI_MAX_PASSES
@@ -58415,6 +59262,15 @@ export function checkProgram(rootIx: i32) {
     if recAdOrigDecl.length > mark && recAdLoose > 0 {
       if recAdUndo(mark) { checkProgramAgain(rootIx) }
     }
+  }
+  // A rewrite still pending after the last pass quieted a refusal nothing will apply: decline it
+  // and re-check, so the refusal is reported (D3992).
+  if wsPendDecl.length > 0 || wsInstErr.length > 0 {
+    for d in wsPendDecl {
+      if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
+    }
+    wsUndoInstErr()
+    checkProgramAgain(rootIx)
   }
   symFlushPending()
   lbiSymTypes()
@@ -59218,6 +60074,7 @@ function checkProgramPass(rootIx: i32) {
     )
   }
   checkerArmed = false
+  wsPassReset()
   recDupFieldErrs()
   // Before the tables below are sized, so every node it mints is checked (D1991).
   hoistMatchScrutinees(rootIx)
@@ -59308,6 +60165,7 @@ function checkProgramPass(rootIx: i32) {
   checkProgramEndGetters()
   voidRetRewrite()
   numLitNotesApply()
+  fsbRecheckCalls()
   T.diags.length
 }
 

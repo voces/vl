@@ -2394,6 +2394,15 @@ in-language GC knobs.
   literal `5.5 % 2.0`, so it is not an inference gap. A `-1` opcode must fail loudly rather
   than fall through; the language-consistent fix lowers `a % b` as `a - trunc(a/b)*b`.
   Workboard D7.
+- ⬜ **B-range. Loop-range facts that fold bounds guards (D4000, diderven DV-1000).** A helper
+  guard such as `if x < 0 || x >= 136 { return 1 }`, called from `for x in 0 until 136`, is
+  tested on every iteration. Most of its compares are decided by the loop's range. V8's
+  JavaScript tier folds them; VL, binaryen and V8's wasm tier keep no range facts. That
+  difference is the whole 2.5–4x gap between DV-1000's scan and hand-written JS. The
+  access-path ingredients the filing named measure 10–20% together. The feature: induction
+  ranges for `for … until`, propagated through the helper once it is inlined (or into a
+  specialised twin), folding compares and list bounds tests the range decides, and keeping
+  every trap message a fold cannot discharge. Grade on node against the JS control.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - ⬜ **B6-ro. The `readonly` sweep of `std:array`'s pure readers.** `extend`'s `other` and
