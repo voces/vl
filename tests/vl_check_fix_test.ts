@@ -370,3 +370,15 @@ fixCase(
     "const b = zeroBytes(2)\nconst c = zeroBytes(2)\nconst d = zeroBytes(2)\n" +
     "const e = zeroBytes(2)\nprint(a.length + b.length + c.length + d.length + e.length)\n",
 );
+
+// ---- a concrete function written to a `let` that keeps its generic type (D3960, ruling C) ----
+
+fixCase(
+  "a concrete function written to a generic `let` gets the annotation that lets it hold one",
+  {
+    "main.vl": "function inner<U>(u: U) { print(u) }\nfunction q(n: i32) { print(n + 1) }\n" +
+      "function main() {\n  let k = inner\n  k = q\n  k(1)\n}\nmain()\n",
+  },
+  "function inner<U>(u: U) { print(u) }\nfunction q(n: i32) { print(n + 1) }\n" +
+    "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
+);
