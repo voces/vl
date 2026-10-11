@@ -188,8 +188,9 @@ const k: i32 = c   // refused: constant 2.5 is not a whole number, so i32 cannot
 > uses" (D3246); owner 2026-09-30 (A), §"Exact constant arithmetic".
 
 > Open question (Q7): the float literal written in place is refused where the `const`
-> holding it is accepted. `const k: i32 = 1e3` and `f(1e3)` with `f(x: i32)` are refused
-> with "f64 doesn't fit in i32", while `const k: i32 = 1e3 * 1` runs.
+> holding it is accepted. `const k: i32 = 1e3` is refused with "f64 doesn't fit in i32",
+> and `f(1e3)` with `f(x: i32)` with "argument 1: expected i32, got f64", while
+> `const k: i32 = 1e3 * 1` runs.
 
 **T2.5** A `let` bound to a literal takes the type of its deliveries and stores: a typed
 parameter, binding, field, element or return it is passed to, and every `x = e` or
@@ -579,8 +580,8 @@ returns several values as a record.
 **T6.4** There is no fixed-length array type. `i32[3]` is a parse error.
 
 > Status: the owner chose a fixed-length array type `T[N]` as a direction on 2026-10-04 and
-> ruled that it is an immutable value (`docs/internals/fixed-arrays-design.md`, PR #3375). It
-> is not built, and is held until a consumer needs it.
+> ruled that it is an immutable value (owner ruling 2026-10-04, Q1 option a). It is not
+> built, and is held until a consumer needs it.
 
 ## T7. Maps and sets
 

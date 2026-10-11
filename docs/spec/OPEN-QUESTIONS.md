@@ -148,16 +148,21 @@ print(show({ v: true }))   // would print bool
 ```
 
 **(c) Admit both, with `is` answered by each field's value.** `u is A` is true when `u.v`
-holds an `i32`. This needs a run-time record of which type a field holds, which D3870's
-"no runtime tags" rules out for records.
+holds an `i32`. Where the two fields' types share a representation, as `i32` and
+`boolean` do, this needs a run-time record of which type the field holds, and D3870's "no
+runtime tags" rules that out for records. Where the representations differ (`i32` against
+`string`), the field's value already answers the test and no tag is needed.
 
 ```vl
+type A = { v: i32 }
+type B = { v: boolean }
 function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
 print(f({ v: true }))   // would print 2
 ```
 
 **Recommendation: (b).** It refuses only the one operation that has no answer, and it
-moves the refusal to the line that needs the discriminant. (c) contradicts D3870. (a) keeps
+moves the refusal to the line that needs the discriminant. (c) contradicts D3870 for
+fields that share a representation, so it could only be given for some field types. (a) keeps
 a refusal of a type that can be used without the test.
 
 ## Q5. Boolean and negative integer literal types
