@@ -10,7 +10,7 @@
 //
 // @test-timing native
 
-import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -21,14 +21,15 @@ if (GATED && !ENABLED) {
 // Run `vl <args>` with a clean, valid probe file available for positional use.
 const run = async (
   args: string[],
-): Promise<{ code: number; err: string }> => {
-  const { code, stderr } = await new Deno.Command(VL, {
+): Promise<{ code: number; out: string; err: string }> => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [...args, "--compiler", COMPILER],
-    stdout: "null",
+    stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
-  return { code, err: new TextDecoder().decode(stderr) };
+  const dec = new TextDecoder();
+  return { code, out: dec.decode(stdout), err: dec.decode(stderr) };
 };
 
 // A tiny valid file to point the positional args at.
@@ -46,16 +47,67 @@ const withProbe = async (
 };
 
 Deno.test({
-  name: "check: a second positional argument is a usage error (exit 2)",
+  name:
+    "check: several paths are each checked in turn, files and directories alike (DV-102)",
   ignore: !ENABLED,
   fn: async () => {
     await withProbe(async (file, dir) => {
       const other = `${dir}/other.vl`;
       await Deno.writeTextFile(other, "print(2)\n");
-      const { code, err } = await run(["check", file, other]);
-      if (code !== 2) throw new Error(`expected exit 2, got ${code}: ${err}`);
-      if (!err.includes("unexpected extra argument")) {
-        throw new Error(`expected extra-argument usage error, got: ${err}`);
+      await Deno.mkdir(`${dir}/sub`);
+      await Deno.writeTextFile(`${dir}/sub/bad.vl`, "print(zz)\n");
+      const two = await run(["check", file, other]);
+      if (two.code !== 0 || !two.err.includes("Checked 2 files, no errors.")) {
+        throw new Error(
+          `two clean files: want rc 0 and "Checked 2 files", got ${two.code}: ${two.err}`,
+        );
+      }
+      const mixed = await run(["check", file, `${dir}/sub`]);
+      if (
+        mixed.code !== 1 || !mixed.err.includes("undeclared identifier 'zz'")
+      ) {
+        throw new Error(
+          `a file and a directory: want the directory's error, got ${mixed.code}: ${mixed.err}`,
+        );
+      }
+      const missing = await run(["check", file, `${dir}/nope.vl`]);
+      if (
+        missing.code !== 2 ||
+        !missing.err.includes(`cannot read ${dir}/nope.vl`)
+      ) {
+        throw new Error(
+          `a missing second path: want exit 2 naming it, got ${missing.code}: ${missing.err}`,
+        );
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "fmt and test: several paths are each handled in turn (DV-102)",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withProbe(async (file, dir) => {
+      const other = `${dir}/other.vl`;
+      await Deno.writeTextFile(other, "const   x=1\nprint(x)\n");
+      const fmt = await run(["fmt", "-w", file, other]);
+      if (fmt.code !== 0) {
+        throw new Error(`fmt -w: want rc 0, got ${fmt.code}: ${fmt.err}`);
+      }
+      const after = await Deno.readTextFile(other);
+      if (after !== "const x = 1\nprint(x)\n") {
+        throw new Error(`fmt -w left: ${after}`);
+      }
+      const t =
+        'import { it, expect } from "std:test"\nit("t", () => { expect(1).toEqual(1) })\n';
+      await Deno.mkdir(`${dir}/sub`);
+      await Deno.writeTextFile(`${dir}/a.test.vl`, t);
+      await Deno.writeTextFile(`${dir}/sub/b.test.vl`, t);
+      const test = await run(["test", `${dir}/a.test.vl`, `${dir}/sub`]);
+      if (test.code !== 0 || !(test.out + test.err).includes("2 files")) {
+        throw new Error(
+          `test: want both files run, got ${test.code}: ${test.out}${test.err}`,
+        );
       }
     });
   },

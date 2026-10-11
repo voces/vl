@@ -448,7 +448,7 @@ per-file ratchets now carry it (`comment-budget`, `ladder-budget`, `sentinel-bud
 has no entries to name). A baseline recording no `commit` falls back to the commit that last
 CHANGED it.
 
-`vl fmt -w` takes **one path per run**; a multi-path call fails and formats nothing.
+`vl fmt -w`, `vl check` and `vl test` take several paths (files or directories) in one run.
 
 ## Disassembly — `wasm-dis` is here, it is just not on `PATH`
 
