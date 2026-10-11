@@ -4868,6 +4868,11 @@ codegen — 18 programs graded against a pristine `origin/master` seed emit byte
 
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
 
+> **Superseded by D3870 (owner ruling C, 2026-10-08) and D3885 (owner ruling A,
+> 2026-10-10).** Records are structural, so two same-shape record types are one type and
+> no tag records the name a value was declared under. `is` tests whether the value fits the
+> type. This section is kept as history. The current reading is `docs/guide/unions.md`.
+
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
 field — `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`
 — are a legal union, and `s is Circle` is true iff the value's tag names the shared shape AND
