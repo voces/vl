@@ -479,3 +479,13 @@ fixCase(
   },
   "function usable(a: i32): boolean {\n  const ok = a > 0\n  return ok\n}\nprint(usable(1))\n",
 );
+
+fixCase(
+  "a concrete function the generic initializer cannot be held at is not annotated",
+  {
+    "main.vl": "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+      "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+  },
+  "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+    "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+);
