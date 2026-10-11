@@ -553,3 +553,92 @@ contains it, and the checker already refuses the same division when the dividend
 to be constant: today whether `x / 0` is legal depends on `x`, not on the division. A
 program that wants to stop has `__trap__` and a `never` function (statements.md §S8.2).
 (a) refuses programs that compile today, but only ones that would trap if the line ran.
+
+## Q14. Exports that their own module disowns
+
+Raised by std.md §STD3.
+
+**Today.** Two std modules export names whose header says they are not for users.
+`std:test`'s header says "The `vlt*` exports at the bottom are the runner's protocol, not
+part of the authoring surface"; `vl test` calls them. `std:seed`'s header says `stdSmoke`
+"is not part of the usable surface and can be retired once any real module stands in for
+it". Both import and run from user code like any export, and modules.md §M1.2 gives no
+visibility between exported and private.
+
+```vl
+import { vltCount } from "std:test"
+print(vltCount())   // prints 0
+```
+
+**(a) Promised surface.** Every std export is std surface, whatever its header says. The
+`vlt*` names and `stdSmoke` stay, and change only as STD2.3 allows any std name to change.
+
+```vl
+import { stdSmoke } from "std:seed"
+print(stdSmoke())   // prints 7, and keeps doing so
+```
+
+**(b) Exported but not promised.** The spec lists these names as outside std's contract: a
+program may import them, and they may change or go without a refusal that names a
+replacement.
+
+```vl
+import { vltRun } from "std:test"   // legal today; the spec makes no promise about it
+```
+
+**(c) Not importable by users.** The names move out of reach: `stdSmoke` is retired, and
+the runner protocol moves to a module or a visibility that only `vl test` can reach.
+
+```vl
+import { vltCount } from "std:test"   // would be refused: not exported
+```
+
+**Recommendation: (b) now, (c) for `stdSmoke`.** (b) states what the headers already say
+and changes no program. `stdSmoke` has no user and its header plans its retirement, so
+retiring it costs nothing. A visibility level for the runner protocol would be a language
+feature for one consumer, against M1.2's decided two-level rule; (b) avoids it.
+
+## Q15. Two spellings of one std operation
+
+Raised by std.md §STD3.
+
+**Today.** `std:fmt` exports `padLeft`, whose comment calls it "This module's older
+spelling of `std:str`'s `padStart`" and says "New code should reach for `padStart`".
+`std:fmt` also re-exports `join`, `repeat` and `split` from `std:str`; these are the same
+functions (std.md §STD3.2). Both spellings run.
+
+```vl
+import { padLeft } from "std:fmt"
+import { padStart } from "std:str"
+print(padLeft("7", 3, "0"))    // prints 007
+print("7".padStart(3, "0"))    // prints 007
+```
+
+**(a) Keep both, permanently.** Each spelling is std surface (std.md §STD2.3), and the
+comments say which one to prefer.
+
+```vl
+import { padLeft, split } from "std:fmt"   // stays legal
+```
+
+**(b) One spelling per operation.** The second spelling and the re-exports are removed,
+and an old import is refused with a message naming the replacement, as `toString` was.
+
+```vl
+import { padLeft } from "std:fmt"   // would be refused, naming `std:str`'s `padStart`
+import { split } from "std:fmt"     // would be refused, naming `std:str`
+```
+
+**(c) Keep re-exports, drop renamed copies.** A re-export of the same function under the
+same name stays; `padLeft`, a second name for `padStart`, is removed as in (b).
+
+```vl
+import { split, toString } from "std:fmt"   // stays legal
+import { padLeft } from "std:fmt"           // would be refused
+```
+
+**Recommendation: (c).** A re-export adds no second behaviour and no second name, so it
+costs nothing to keep. A second name is the duplicated surface the std review rubric
+(`docs/internals/std-api-review.md` §2) asks to avoid, and `padLeft`'s own comment already
+points users away from it. With no deprecation mechanism, a targeted refusal is the only
+way to remove it, and it is cheaper before more callers exist.
