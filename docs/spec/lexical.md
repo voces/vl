@@ -217,6 +217,16 @@ print(n)   // prints 3
 Where several tokens could match, the lexer takes the longest. The lone `?` is used only
 for an optional parameter (`b?: i32`). Their meanings are given in expressions.md.
 
+The arrow of a function type and a lambda, and of a `match` arm, is `=` followed by `>`.
+It is not one token, so `= >` with a space between is accepted.
+
+```vl
+const f = (x: i32): i32 = > x + 1
+print(f(1))   // prints 2
+```
+
+> Open question (Q6): should `=>` be one token, so that `= >` is refused?
+
 **L9.2** `===` and `!==` are not tokens yet.
 
 > Status: not built. Reference identity `===`/`!==` is ruled (owner 2026-09-01,

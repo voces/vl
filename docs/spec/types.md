@@ -1,10 +1,10 @@
 # Types
 
-Examples run on master `1df3c8f91`, 2026-10-11.
+Examples run on master `98a4ed71b`, 2026-10-11.
 
 VL is statically and structurally typed. Every value has one type that `vl check`
-knows. There is no `dynamic` and no runtime type tag beyond what a union needs to tell
-its members apart. Annotations are never required where inference can decide.
+knows, and there is no `dynamic` type. Annotations are never required where inference
+can decide.
 
 > Ruling: DECISIONS.md §"Types & semantics", "Fully typed, no `dynamic`".
 
@@ -25,6 +25,10 @@ its members apart. Annotations are never required where inference can decide.
 | `never` | no values (T1.5) |
 | `u8` | a byte; a storage type only (T1.3) |
 | `v128` | a 128-bit SIMD vector, built through `std:simd` |
+
+> Status: the owner ruled that VL gets the unsigned value types `u32` and `u64` (2026-10-03,
+> U1 = A, `docs/internals/unsigned-types-design.md` §U1). They are not built: `const a: u32 = 3`
+> is refused with "unknown type 'u32'".
 
 **T1.2** Integer arithmetic wraps on overflow. `MIN / -1` and division by zero trap. The
 operators are specified in expressions.md.
@@ -162,9 +166,12 @@ const k: i32 = 3000000000   // refused: constant 3000000000 overflows i32 — wr
 > Ruling: owner 2026-09-04, DECISIONS.md §"Types & semantics" (first bullet, the hex
 > bit-pattern rule).
 
-**T2.4** A `const` bound to a literal has no single type. Each use takes the type its
-context asks for, within the literal's kind (integer or float), and otherwise the default
-of T2.1 or T2.2.
+**T2.4** An unannotated `const` whose initialiser is a literal, or arithmetic over
+literals and such `const`s, is an exact constant with no single type. Every read of it is
+that value written in place, and takes the type its context asks for, or otherwise the
+default of T2.1 or T2.2. A use whose type cannot hold the exact value is refused. A float
+constant at an integer type is accepted when it is a whole number. The operators that
+build a constant are in expressions.md §E9.
 
 ```vl
 const c = 1e3
@@ -172,8 +179,17 @@ const k: i32 = c
 print(k)   // prints 1000
 ```
 
-> Ruling: owner 2026-09-29 (B′ + C), DECISIONS.md §"A literal binding takes its type from
-> its uses" (D3246).
+```vl
+const c = 2.5
+const k: i32 = c   // refused: constant 2.5 is not a whole number, so i32 cannot hold it
+```
+
+> Ruling: owner 2026-09-29 (C), DECISIONS.md §"A literal binding takes its type from its
+> uses" (D3246); owner 2026-09-30 (A), §"Exact constant arithmetic".
+
+> Open question (Q7): the float literal written in place is refused where the `const`
+> holding it is accepted. `const k: i32 = 1e3` and `f(1e3)` with `f(x: i32)` are refused
+> with "f64 doesn't fit in i32", while `const k: i32 = 1e3 * 1` runs.
 
 **T2.5** A `let` bound to a literal takes the type of its deliveries and stores: a typed
 parameter, binding, field, element or return it is passed to, and every `x = e` or
@@ -195,8 +211,20 @@ n = 2.5   // refused: cannot assign f64 to i32 — `n` on line 1 has no annotati
 > Ruling: owner 2026-09-29 (B′ + C), same section as T2.4. The owner called this ruling
 > provisional ("for now").
 
-**T2.6** No implicit conversion loses information. A value moves to a narrower or
-differently-shaped numeric type only through `as` (expressions.md).
+**T2.6** No implicit conversion loses information. Three numeric conversions happen
+implicitly, at every delivery and in mixed arithmetic: `i32` to `i64`, `i32` to `f64`, and
+`f32` to `f64`. Every other numeric conversion is written with `as` (expressions.md §E8).
+
+```vl
+const a: i32 = 3
+const b: i64 = a
+const c: f64 = a
+const d: f32 = 1.5
+const e: f64 = d
+print(b)   // prints 3
+print(c)   // prints 3
+print(e)   // prints 1.5
+```
 
 ```vl
 const a: i64 = 5
@@ -219,7 +247,7 @@ print(y is i32)   // prints true
 > Ruling: owner 2026-09-06, open-rulings.md §D1712 (a union is a set); owner 2026-09-02,
 > DECISIONS.md §"A subsumed literal arm COLLAPSES".
 
-**T3.2** A string, integer or boolean literal is also a type whose one value is that
+**T3.2** A string or non-negative integer literal is also a type whose one value is that
 literal. A union of literal types is VL's enumeration. There is no separate `enum`.
 
 ```vl
@@ -235,6 +263,20 @@ go("e")   // refused: argument 1: expected Dir, got string
 ```
 
 > Ruling: DECISIONS.md §"Types & semantics", "Literal unions are the enum idiom".
+
+Today `true` and `false` are not types, and a negative integer literal type is a parse
+error. `match` does not take a boolean literal as a pattern.
+
+```vl
+type T = true   // refused: expected an identifier but found `true`
+```
+
+```vl
+type T = -1 | 1   // refused: expected an identifier but found `-`
+```
+
+> Open question (Q5): should `true` and `false` be literal types, and should a negative
+> integer literal be one?
 
 **T3.3** A float literal is not a type. An integer literal type does not admit a float.
 
@@ -259,6 +301,10 @@ print(f("ab"))  // prints 2
 ```
 
 > Ruling: owner 2026-10-10 (A), D3885 (`is` is structural).
+
+> Open question (Q4): a union of two records with the same field names, where no field is
+> literal-typed in both, is refused when it is formed (`{ v: i32 } | { v: boolean }`). No
+> live ruling says whether that union is legal.
 
 Open question: does `v is A` hold of a record value that has every field of `A` and more?
 Today it does not. See OPEN-QUESTIONS.md §Q2.
@@ -419,8 +465,7 @@ print(t.left?.v ?? 0)   // prints 2
 ```
 
 **T4.8** `flat type P = { … }` declares a flat record. A flat record's field order is part
-of its type, and it may have `u8` and `f32` fields stored at their own width
-(`docs/internals/flat-records-design.md`).
+of its type, and it may have `u8` fields (T1.3).
 
 ```vl
 flat type P = { x: f32, y: f32, b: u8 }
@@ -525,11 +570,17 @@ function f(xs: readonly i32[]) { xs.push(1) }   // refused: `.push()` writes the
 > ruling requires, but the refusal says the program is type-valid and only codegen is
 > missing (D4051).
 
-**T6.3** There are no tuples. `(1, 2)` is a parse error. A function returns several values
-as a record.
+**T6.3** There are no tuples and no destructuring. `(1, 2)` is a parse error. A function
+returns several values as a record.
 
-> Ruling: owner 2026-09-29 (B), DECISIONS.md §"`-O` returns a small record's fields as
-> multi-value".
+> Ruling: owner 2026-09-29 (B), DECISIONS.md §"`-O` inlines a small record's producer":
+> "No tuple syntax".
+
+**T6.4** There is no fixed-length array type. `i32[3]` is a parse error.
+
+> Status: the owner chose a fixed-length array type `T[N]` as a direction on 2026-10-04 and
+> ruled that it is an immutable value (`docs/internals/fixed-arrays-design.md`, PR #3375). It
+> is not built, and is held until a consumer needs it.
 
 ## T7. Maps and sets
 
