@@ -10226,3 +10226,28 @@ those and checks the label. No consumer or corpus call relies on the old skip ru
 
 The committee voted 2–1 for this option, amended from the open question's (b)
 (`docs/spec/OPEN-QUESTIONS.md` Q8). The checker does not enforce it yet (D4061).
+
+## `is` tests whether the value fits the type (owner ruling (A), 2026-10-10) — D3885
+
+**The rule.** `v is B` asks whether the value `v` holds fits `B` structurally, not which type
+`v` was declared at or built as. With `A = { x: i32 }` and `B = { x: 1 | 2 }`, a value
+`const a: A = { x: 1 }` gives `a is B` true, and `{ x: 7 }` gives false. Values carry no
+runtime declared-type tag.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+function f(v: A | B): string { if v is B { return "B" } "A" }
+const a: A = { x: 1 }
+print(f(a))   // B
+```
+
+**Why.** VL's records are structural (D3870, option C: same-shape records are one type). An
+`is` that answered by declared type would need a hidden tag on every record and would
+contradict that ruling.
+
+**What it adds.** A HINT, not an error, where one arm contains another: `` `B` is contained
+in `A`, so `is B` tests the value `` (code `contained-arm-is-test`). Disjoint literal sets are
+a real discriminant and get no hint. The string-against-integer-literal check reject keeps
+its behaviour. Where the operand's declared type is a single record containing `B`, the
+compiler still answers by the declared type (D4058).
