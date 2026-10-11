@@ -1834,7 +1834,9 @@ it worked.
   (`/` is `div_s`) and already exposed one unsigned instruction as an operator
   (`>>>`). A `u32` would touch the type arena, every rep table, every widening
   rule and every emitter kind code to express something the operand need not
-  carry.
+  carry. *Amended 2026-10-03:* VL adds `u32` and `u64` as value types, and the
+  unsigned operations stay for `i32` and `i64` operands (§"`u32` and `u64` are value
+  types").
 - **No transcendental as a compiler intrinsic; they live in `std:math`.** No wasm
   opcode computes `sin`/`pow`/`exp`, so any implementation is a library whose last
   bit is a policy choice, and that library is not the compiler's. This entry first
@@ -10169,3 +10171,27 @@ then has to compile and predict.
 the game instead of +6.0%, but the trap becomes `unreachable` with the note "a compiler-emitted
 trap" rather than the bounds trap the guide and `std:bytes` promise. Keeping the message was
 chosen; the smaller form is one line if that trade is wanted.
+
+## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
+
+**VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and
+`i64`, and the type picks the unsigned operation: `/`, `%`, comparison, `>>` and widening
+read the bits as unsigned. This amends §"Types & semantics", *"Unsigned integer ops are
+operations, not a `u32` type"*: `divU`, `ltU` and `>>>` stay, for `i32` and `i64` operands.
+Three consumers had built unsigned arithmetic by hand, and the type removes that class of
+bug. Design and options: `docs/internals/unsigned-types-design.md`.
+
+**Implicit conversions are only the lossless ones (U2 = A, 2026-10-03).** The lattice gains
+`u32 → i64`, `u32 → u64` and `u32 → f64`. Every other conversion is written `as` (exact or
+fail) or `as%` (wrap).
+
+**A radix literal with no context stays signed (U3 = A, 2026-10-03).** `print(0xDEADBEEF)`
+prints -559038737, as it does today. A literal is `u32` or `u64` only where its use names
+that type, so no existing program's output changes.
+
+**Mixed signed and unsigned operands are a check error (U4 = A, 2026-10-04).** `u + i` is
+refused, and the message says to write `i as u32` or `u as i32`. A literal operand adapts,
+and a shift count may be any integer. This is the rule of Rust, Go and Zig, and it follows
+from U2: `i32 ↔ u32` has no lossless edge.
+
+Questions U5–U14 of the design doc are not yet ruled. Nothing here is built.
