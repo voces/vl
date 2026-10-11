@@ -65,7 +65,9 @@ print(f("abc"))   // prints 3
 ```
 
 `x is T` is true exactly when the value fits `T`, not when its declared type is `T`. A
-record value fits a record type when each of its fields fits that type's field.
+record value with the same field names as a record type fits it when each field's value
+fits that type's field. Whether a record with more fields than the type fits it is not
+settled by the ruling (D4062).
 
 ```vl
 type A = { x: i32 }

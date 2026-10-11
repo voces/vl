@@ -28,7 +28,8 @@ print(one() + helper())   // prints 11
 
 **M1.2** Visibility has two levels: exported or private. There is no level between them.
 
-> Ruling: owner-reviewed decided direction 8, `docs/internals/modules-design.md` §5.
+> Ruling: owner review 2026-06-06, direction 8, DECISIONS.md §"The module system's eight
+> decided directions".
 
 ## M2. Exports
 
@@ -86,7 +87,8 @@ cfg.n = 9
 print(cfg.n)   // prints 9
 ```
 
-> Ruling: owner-reviewed decided direction 4, `docs/internals/modules-design.md` §5.
+> Ruling: owner review 2026-06-06, direction 4, DECISIONS.md §"The module system's eight
+> decided directions".
 
 > Status: assigning an imported `let` is accepted, and writes the exporter's binding
 > (D4063).
@@ -181,8 +183,8 @@ import { f } from "x"   // refused: Unsupported import specifier "x"
 import { f } from "/abs/x"   // refused: an absolute path is not an import specifier; write the path relative to this file
 ```
 
-> Ruling: owner-reviewed decided directions 1 and 6, `docs/internals/modules-design.md`
-> §5. A package registry is deferred; it would be another `scheme:`.
+> Ruling: owner review 2026-06-06, directions 1 and 6, DECISIONS.md §"The module system's
+> eight decided directions". A package registry is deferred; it would be another `scheme:`.
 
 **M3.4** An import is a top-level statement. It binds its names in the whole module,
 including the code above it.
@@ -343,9 +345,26 @@ print(f())   // prints 5
 ```
 
 **M5.3** There is no prelude. A name is visible in a module only if the module declares
-it, imports it, or it is one of the ambient names: the types `i32`, `i64`, `f32`, `f64`,
-`boolean` and `string`, and the functions `print`, `fromCodePoint`, `fromCodePoints`, `Map`
-and `Set`. Every standard-library name is imported from its `std:` module.
+it, imports it, or it is one of the ambient names. Every standard-library name is imported
+from its `std:` module. The ambient names are:
+
+| kind | names |
+| --- | --- |
+| types | `i32`, `i64`, `f32`, `f64`, `boolean`, `string`, `void`, `null`, `never`, `u8`, `v128` (types.md §T1.1) |
+| functions | `print`, `fromCodePoint`, `fromCodePoints`, `Map`, `Set` |
+| float intrinsics | `abs`, `min`, `max`, `sqrt`, `floor`, `ceil`, `trunc`, `nearest`, `copysign` |
+| integer intrinsics | `clz`, `ctz`, `popcnt`, `rotl`, `rotr`, `divU`, `remU`, `ltU`, `leU`, `gtU`, `geU` |
+| compiler intrinsics | names spelled `__name__`, such as `__trap__` |
+
+`abs`, `min` and `max` also take integers (expressions.md §E2.7). The compiler intrinsics
+are the floor std is written on. They are visible to every program, and std is the
+supported way to reach what they do.
+
+```vl
+print(sqrt(9.0))    // prints 3
+print(popcnt(7))    // prints 3
+print(divU(-2, 2))  // prints 2147483647
+```
 
 ```vl
 print(trim(" a "))   // refused: undeclared identifier 'trim' — `trim` is exported by "std:str"; add `import { trim } from "std:str"`
@@ -358,9 +377,11 @@ print(trim(" a "))   // prints a
 
 > Ruling: owner 2026-10-07, O7, DECISIONS.md §"No prelude: every library name is imported".
 
-> Status: a declaration with an ambient function's name is called, but a call to it is
-> checked against the ambient signature; a local `const` of that name is ignored at a call
-> (D4066).
+> Status: a declaration named like one of the five ambient functions is called, but a call
+> to it is checked against the ambient signature, and a local `const` of that name is
+> ignored at a call (D4066). A declaration named like a float or integer intrinsic shadows
+> it cleanly. A compiler intrinsic cannot be redeclared: `function __trap__()` is refused,
+> "is a compiler intrinsic and cannot be redefined".
 
 Open question (Q11): may a program declare a name that an ambient name already has?
 
@@ -378,7 +399,10 @@ print(" a ".trim())   // refused: 'trim' is not imported — a free `trim(self: 
 **M6.1** Before a module's own top-level code runs, every module it imports has run, each
 once, in the order of the module's import statements. So the entry runs last, and a module
 that several modules import runs once, at its first import. A module runs even when its
-importer uses only its functions or types.
+importer uses only its functions or types, and even when nothing it imports is used. An
+unused import gets a warning, and `vl check --fix` removes it only from a `std:` module,
+since removing an import of the program's own module would skip that module's top-level
+code.
 
 ```vl
 // file: y.vl
@@ -406,6 +430,16 @@ print("b")
 import { m } from "./b"
 print(m)
 // prints a, b, 2
+```
+
+```vl
+// file: a.vl
+print("a runs")
+export function f(): i32 { 1 }
+// file: main.vl
+import { f } from "./a"   // warns: Unused import `f`
+print("main")
+// prints a runs, main
 ```
 
 **M6.2** The imports may not form a cycle, whatever the modules in the cycle declare. The
