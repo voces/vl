@@ -155,7 +155,10 @@ print(max(a, b))    // prints 9
 
 **E3.1** `==` and `!=` compare two values of compatible types and give `boolean`. Lists and
 records compare by value, recursively (types.md §T4.3). Values of unrelated types cannot
-be compared. Two numbers of different types compare by value.
+be compared. Two numbers of different types compare only where E2.2 lets them meet: `i32`
+with `i64`, `i32` with `f64`, and `f32` with `f64` compare by value at the wider type.
+`i32` with `f32` and `i64` with `f64` are refused, for `==` and `!=` as for `<` and the
+other orderings.
 
 ```vl
 print([1, 2] == [1, 2])   // prints true
@@ -166,6 +169,12 @@ print(a == b)             // prints true
 
 ```vl
 print(1 == "1")   // refused: cannot compare i32 with string
+```
+
+```vl
+const a: i64 = 3
+const b: f64 = 3.0
+print(a == b)   // refused: cannot compare i64 with f64
 ```
 
 **E3.2** A float compare follows IEEE 754. NaN is not equal to itself, and `-0.0 == 0.0`.
@@ -244,7 +253,7 @@ print(1.0 & 2)   // refused: operator '&' is integer-only, got f64 and i32
 ```
 
 **E6.2** A shift count that is a constant must be less than the operand's width. A count
-known only at run time is taken modulo the width, as wasm does.
+known only at run time is taken modulo the width.
 
 ```vl
 function sh(x: i32, n: i32): i32 { x << n }
@@ -391,6 +400,9 @@ print(b as i32)       // prints 1
 print(false as f64)   // prints 0
 ```
 
+> Ruling: owner 2026-09-29 (C), DECISIONS.md §"A `boolean` is never a number; `as` converts
+> it" (D3218).
+
 **E8.6** A cast whose operand is a union selects a member, with the same three suffixes.
 `u as? i32` is the `i32` member, or `null` when the value is not an `i32`. A cast over a
 union of numbers to a type that every member converts to without failing (a float type, or
@@ -474,6 +486,10 @@ function box(w: i32, h: i32): i32 { w * 10 + h }
 print(box(h: 2, w: 3))   // prints 32
 print(box(3, h: 2))      // prints 32
 ```
+
+> Open question (Q8): a positional argument written after a named one is accepted.
+> Named arguments bind first and positional ones fill the remaining parameters in order,
+> so `box(w: 3, 2)` prints 32 and `box(3, w: 2)` prints 23.
 
 **E11.3** A default value is a literal, a module-level `const`, or `__callsite__`. Its names
 resolve where the function is declared, and it is evaluated at each call.
@@ -625,9 +641,56 @@ print(g())   // prints 5
 > Ruling: owner 2026-09-24 (a), DECISIONS.md §"Closures capture variables by reference"
 > (D2339).
 
-## E15. What is not an operator
+## E15. List spread
 
-**E15.1** `in` is part of the `for` head only. It is not a membership operator.
+**E15.1** `...xs` in a list literal inserts every element of the list `xs`, in order. The
+literal builds a new list, so a later write to it is not seen through `xs`. The copy is
+shallow: a record element is shared.
+
+```vl
+const xs = [1, 2]
+const ys = [...xs, 3, ...xs]
+ys[0] = 9
+print(ys.length)   // prints 5
+print(xs[0])       // prints 1
+```
+
+**E15.2** The element type of a list literal is the join of its elements' types and its
+spreads' element types.
+
+```vl
+const xs = [1]
+const ys = ["a"]
+const c = [...xs, ...ys]
+print(c[1])   // prints a
+```
+
+> Status: where the join is a union that a spread's elements must be converted into, some
+> element types are refused at build after `vl check` accepts the program: a `u8[]` spread
+> beside an `i32` (D2965), an `f64[]` spread beside a `string` (D2969), and a spread beside
+> `null` in a generic (D2970).
+
+**E15.3** `...` spreads only a list. A string is refused. In a call, a spread fills only a
+rest parameter (types.md §T8.2). `push` takes any number of arguments, so `xs.push(...ys)`
+appends each element of `ys`.
+
+```vl
+const xs = [1]
+xs.push(...[2, 3], 4)
+print(xs.length)   // prints 4
+```
+
+```vl
+function f(a: i32, b: i32): i32 { a + b }
+print(f(...[1, 2]))   // refused: `...` unpacks a list into a rest parameter, and `f` has none
+```
+
+> Ruling: owner 2026-09-06 (A), ROADMAP.md §"Variadics, then spread";
+> `docs/guide/collections-design.md` §"Spread and rest parameters".
+
+## E16. What is not an operator
+
+**E16.1** `in` is part of the `for` head only. It is not a membership operator.
 
 ```vl
 const xs = [1, 2]
@@ -637,4 +700,18 @@ print(1 in xs)   // refused: `in` is not an operator in VL outside a `for` loop'
 > Ruling: owner 2026-09-25 (Q10), DECISIONS.md §"`in` is a for-loop keyword, not an
 > operator".
 
-**E15.2** There is no conditional operator `c ? a : b`. Write `if c { a } else { b }`.
+**E16.2** There is no conditional operator `c ? a : b`. Write `if c { a } else { b }`.
+
+**E16.3** `await` is a reserved keyword. It cannot name a binding, and it has no meaning in
+an expression.
+
+```vl
+const await = 1   // refused: `await` is a keyword and can't name a constant — rename it
+```
+
+> Ruling: owner 2026-08-22, ROADMAP.md B12 and `docs/internals/concurrency-design.md`:
+> `async`/`await` is not VL's concurrency model. `await` stays reserved and `async` stays an
+> ordinary identifier.
+
+> Status: `await f()` is refused as a plain parse error, "expected an expression but found
+> AWAIT", which does not say that `await` is reserved.

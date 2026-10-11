@@ -14,7 +14,7 @@ where one exists, and is marked where the compiler has not caught up.
 | --- | --- |
 | [lexical.md](lexical.md) | source text, comments, identifiers, keywords, literals, operators, line continuation |
 | [types.md](types.md) | primitives, literal types, unions, records, nullability, lists, maps and sets, functions, generics, nominal types |
-| [expressions.md](expressions.md) | operators, mixed numeric operands, constant arithmetic, casts, evaluation order, calls, indexing, block values, lambdas |
+| [expressions.md](expressions.md) | operators, mixed numeric operands, constant arithmetic, casts, evaluation order, calls, indexing, block values, lambdas, list spread |
 | statements.md *(next)* | bindings, blocks, `if`, loops, labels, `match` |
 | narrowing.md *(next)* | `is`, null tests, flow facts and what ends them |
 | modules.md *(next)* | imports, exports, re-exports, resolution |
