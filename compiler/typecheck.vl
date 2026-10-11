@@ -17338,6 +17338,11 @@ let fsbStoreAt: i32[] = []
 // Refusals wait for the end of the walk, where one on a line another check refused is dropped.
 let fsbErrMsg: string[] = []
 let fsbErrAt: i32[] = []
+let fsbErrSite: i32[] = []
+// The types of a call's literal and name arguments, read where a module binding is called above
+// its declaration: that call types none of them, and they cannot be typed later out of scope.
+let fsbEarlyTy: {[i32]: i32} = Map()
+const FSB_NUM_LIT = -2
 let fsbRefused: {[i32]: boolean} = Map()
 
 function fsbReset() {
@@ -17355,6 +17360,8 @@ function fsbReset() {
   fsbStoreAt = []
   fsbErrMsg = []
   fsbErrAt = []
+  fsbErrSite = []
+  fsbEarlyTy = Map()
   fsbRefused = Map()
   0
 }
@@ -17525,6 +17532,7 @@ function fsbFitsHeld(rt: i32, g: i32, h: i32, ix: i32) {
       + fsbWhere(fsbGrpAt[h], ix)
       + " — a binding holds one function type",
     ix,
+    ix,
   )
 }
 
@@ -17567,32 +17575,50 @@ function fsbNodeCol(ix: i32): i32 {
   0
 }
 
-function fsbErr(msg: string, at: i32) {
+// Record a refusal at `at`; `site` is the call or store it belongs to, which another check's
+// refusal of the same use names.
+function fsbErr(msg: string, at: i32, site: i32) {
   if fsbRefused[at] ?? false { return 0 }
   fsbRefused[at] = true
   fsbErrMsg.push(msg)
   fsbErrAt.push(at)
+  fsbErrSite.push(site)
   0
 }
 
-// Push the refusals the walk owed, except on a line another check already refused.
+// Push the refusals the walk owed, in source order, except one whose use another check already
+// refused at the same node.
 function fsbReport() {
   const pre = T.diags.length
+  const order: i32[] = []
   let i = 0
   while i < fsbErrMsg.length {
-    const ln = nodeLineOf(fsbErrAt[i])
+    order.push(i)
+    let j = order.length - 1
+    while j > 0 && fsbTokOf(fsbErrAt[order[j - 1]]) > fsbTokOf(fsbErrAt[i]) {
+      order[j] = order[j - 1]
+      j = j - 1
+    }
+    order[j] = i
+    i = i + 1
+  }
+  for e in order {
     let dup = false
     let k = 0
     while k < pre && !dup {
-      if T.diags[k].tline == ln { dup = true }
+      const d = T.diags[k].tat
+      if d >= 0 && (d == fsbErrAt[e] || d == fsbErrSite[e]) { dup = true }
       k = k + 1
     }
-    if !dup { tErr(fsbErrMsg[i], fsbErrAt[i]) }
-    i = i + 1
+    if !dup { tErr(fsbErrMsg[e], fsbErrAt[e]) }
   }
   0
 }
 
+function fsbTokOf(ix: i32): i32 {
+  if ix >= 0 && ix < nodeToks.length { return nodeToks[ix] }
+  -1
+}
 // A call through, or a delivery of, a marked binding: graded now when its group's type is known,
 // and recorded so a later write or confirmation re-grades it.
 function fsbNoteUse(g: i32, ix: i32, dst: i32) {
@@ -17640,17 +17666,35 @@ function fsbNoteElems(n: Node, d: TyArray, depth: i32) {
   0
 }
 
+// The type a literal or a name argument has without a context, or -1; a number literal is
+// `FSB_NUM_LIT`, since its type is whichever number it is delivered to.
+function fsbEarlyArgTy(a: i32): i32 {
+  const n = P.nodes[parenPeelIx(a)]
+  match n {
+    BoolLit => TY_BOOL
+    StrLit => TY_STR
+    NumLit => FSB_NUM_LIT
+    Ident => {
+      const t = lookup(n.identName)
+      if t < 0 || tyHasTyVar(t) { return -1 }
+      t
+    }
+    _ => fsbUntypedArg(a)
+  }
+}
+
+// A lambda, record or list argument is typed only against the parameter it is delivered to,
+// which a binding called above its declaration does not yet have: it is left ungraded.
+function fsbUntypedArg(_a: i32): i32 { -1 }
+
 // The callee of call `ix` when it is a marked binding.
 function fsbNoteCall(n: Call, ix: i32) {
   if fsbName.length == 0 || inferQuiet { return 0 }
   const g = fsbGrpAtNode(n.callFn)
   if g < 0 { return 0 }
-  // A module binding read above its declaration has no type yet, so the call typed none of its
-  // arguments; they are typed here, in their own scope, for the grade the declaration owes.
   if !fsbGrpLive[g] {
     for a in n.callArgs {
-      const an = P.nodes[a]
-      if nodeTyIxOf(a) < 0 && !(an is Spread) { checkNode(a) }
+      if nodeTyIxOf(a) < 0 { fsbEarlyTy[a] = fsbEarlyArgTy(a) }
     }
   }
   fsbNoteUse(g, ix, -1)
@@ -17680,6 +17724,7 @@ function fsbCheckUse(g: i32, ix: i32, dst: i32) {
           + tyToStr(held)
           + since,
         ix,
+        ix,
       )
     }
     return 0
@@ -17701,15 +17746,33 @@ function fsbCheckUse(g: i32, ix: i32, dst: i32) {
             + " argument(s), and this call passes "
             + i32ToStr(c.callArgs.length),
           ix,
+          ix,
         )
       }
       let i = 0
       while i < c.callArgs.length {
         const a = c.callArgs[i]
-        const at = nodeTyIxOf(a)
+        let at = nodeTyIxOf(a)
+        if at < 0 { at = fsbEarlyTy[a] ?? -1 }
         const pt = ft.fnParamTypes[i]
         const an = P.nodes[a]
-        if at >= 0 && pt >= 0 && !(an is Spread) {
+        if at == FSB_NUM_LIT && pt >= 0 {
+          if !isNumeric(pt) && !assignable(TY_I32, pt) {
+            return fsbErr(
+              "argument "
+                + i32ToStr(i + 1)
+                + ": expected "
+                + tyToStr(pt)
+                + ", got a number — `"
+                + fsbGrpName[g]
+                + "` holds "
+                + tyToStr(held)
+                + since,
+              a,
+              ix,
+            )
+          }
+        } else if at >= 0 && pt >= 0 && !(an is Spread) {
           if tyHasTyVar(at) || tyHasTyVar(pt) {
             noteLetCstr(at, pt, a, "")
           } else if !assignable(at, pt) {
@@ -17726,6 +17789,7 @@ function fsbCheckUse(g: i32, ix: i32, dst: i32) {
                 + tyToStr(held)
                 + since,
               a,
+              ix,
             )
           }
         }
