@@ -921,6 +921,8 @@ the chain as action kind `opt` (`opt_cache_action`, `main.rs`), traced as `-O hi
 ### Owner questions
 
 Each question lists options with code and a recommendation. None is decided here.
+Q1 has since been ruled (B) by the owner, 2026-10-07: DECISIONS.md §"Record adoption
+crosses module boundaries".
 
 **Q1. Should record adoption stop at a module boundary, as literal-binding inference does?**
 

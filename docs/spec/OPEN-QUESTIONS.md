@@ -409,3 +409,95 @@ function f(k: K): string {
   match k { "a" => "x", "b" => "y", "c" => "z" }   // refused: match pattern "a" is not a member of "b" | "c"
 }
 ```
+
+
+## Q11. Declaring a name an ambient name has
+
+Raised by modules.md §M5.3.
+
+**Today.** `print`, `fromCodePoint`, `fromCodePoints`, `Map` and `Set`, and the six
+primitive type names, are visible with no import. A program may declare any of these
+names and nothing refuses it, but the result is inconsistent (D4066). A `function print`
+is what a call runs, while the call is checked against the ambient signature. A `const
+print = …` lambda is not reached at all:
+
+```vl
+const print = (x: i32): i32 => x
+print(5)   // prints 5: the ambient print ran
+```
+
+No ruling covers it. `docs/internals/modules-design.md` §5 calls the ambient floor
+privileged and "not a prelude", and says nothing about declaring its names.
+
+**(a) Refuse the declaration.** An ambient name is reserved in every scope.
+
+```vl
+function print(x: i32): i32 { x }   // would be refused: `print` is an ambient name
+```
+
+**(b) A declaration shadows the ambient name** in its scope, for the call and its type
+alike, as a declaration shadows any outer binding (modules.md §M5.2).
+
+```vl
+function print(x: i32): i32 { x + 100 }
+const y: i32 = print(3)   // would run: y is 103
+```
+
+**Recommendation: (b).** The ambient set is meant to shrink: the design names `print` as
+the first candidate to move into `std:fmt`. Under (b) a program that declared its own
+`print` keeps compiling when that happens; under (a) the refusal it lived with disappears
+and its meaning changes. (b) is also the rule a plain call already follows between a local
+and an import (O1, rule (e): the local wins).
+
+## Q12. Import cycles
+
+Raised by modules.md §M6.2.
+
+**Today.** Every import cycle is refused, including one between modules that declare only
+functions or only types:
+
+```vl
+// file: a.vl
+import { isOdd } from "./main"   // refused: Import cycle detected
+export function isEven(n: i32): boolean { if n == 0 { true } else { isOdd(n - 1) } }
+// file: main.vl
+import { isEven } from "./a"
+export function isOdd(n: i32): boolean { if n == 0 { false } else { isEven(n - 1) } }
+print(isEven(10))
+```
+
+`docs/internals/modules-design.md` §2.3 proposed allowing cycles of types and functions
+and refusing only cycles of value initialisation, and §5 lists cross-module
+initialisation order as an open sub-question that the owner has not reviewed. Without
+cycles the order is fixed by modules.md §M6.1. With them, it needs a rule.
+
+**(a) Keep refusing every cycle.** Mutually recursive functions or types go in one
+module.
+
+**(b) Allow a cycle when no module's top-level code in it reads a binding imported from
+another module of the cycle.** Functions, types, and constants read only inside functions
+qualify. The modules of the cycle run in the order the entry's imports first reach them.
+
+```vl
+// file: a.vl
+import { isOdd } from "./main"
+export function isEven(n: i32): boolean { if n == 0 { true } else { isOdd(n - 1) } }
+// file: main.vl
+import { isEven } from "./a"
+export function isOdd(n: i32): boolean { if n == 0 { false } else { isEven(n - 1) } }
+print(isEven(10))   // would print true
+```
+
+```vl
+// file: a.vl
+import { M } from "./main"
+export const A = M + 1   // would still be refused: top-level code reads M across the cycle
+// file: main.vl
+import { A } from "./a"
+export const M = A + 1
+```
+
+**Recommendation: (a) for now.** It is the two-way door: (b) can be added later without
+changing the meaning of any program that compiles. No consumer has asked for a cycle, and
+the workaround, one module, costs a file split rather than a feature. If one does, (b) is
+the rule to adopt, and its order rule is the one M6.1 already follows.
