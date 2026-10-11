@@ -14,6 +14,7 @@ The language and CLI as a user mental model.
 - [`guide/loops.md`](guide/loops.md) — loops and labelled blocks, `@B`, `break @B` / `continue @B`, and the value a loop or block carries.
 - [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
 - [`guide/objects.md`](guide/objects.md) — object literals and braces: when `{` is an object and when a block, what `{}` completes, and why a `{}` statement is refused.
+- [`guide/methods.md`](guide/methods.md) — `v.f(…)`: which functions a method call finds, and when it needs an import (a built-in receiver always does; a named type's own module does not).
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
 - [`guide/getters.md`](guide/getters.md) — `get x(self: T): R`: read-only properties of a nominal type, where they are found, and the body contract that keeps a read as cheap as a field.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
