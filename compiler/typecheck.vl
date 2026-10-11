@@ -17333,6 +17333,8 @@ let fsbGrpName: string[] = []
 let fsbUseGrp: i32[] = []
 let fsbUseIx: i32[] = []
 let fsbUseDst: i32[] = []
+// Per use: the generic body it stands in, whose instances re-ask a pair naming its parameter.
+let fsbUseOwner: i32[] = []
 // Every concrete write, so a message can tell two writes on one line apart.
 let fsbStoreAt: i32[] = []
 // Refusals wait for the end of the walk, where one on a line another check refused is dropped.
@@ -17356,6 +17358,7 @@ function fsbReset() {
   fsbUseGrp = []
   fsbUseIx = []
   fsbUseDst = []
+  fsbUseOwner = []
   fsbStoreAt = []
   fsbErrMsg = []
   fsbErrAt = []
@@ -17540,7 +17543,7 @@ function fsbFitsHeld(rt: i32, g: i32, h: i32, ix: i32) {
 function fsbRegrade() {
   let i = 0
   while i < fsbUseGrp.length {
-    fsbCheckUse(fsbUseGrp[i], fsbUseIx[i], fsbUseDst[i])
+    fsbCheckUse(fsbUseGrp[i], fsbUseIx[i], fsbUseDst[i], fsbUseOwner[i])
     i = i + 1
   }
   let c = 0
@@ -17625,7 +17628,8 @@ function fsbNoteUse(g: i32, ix: i32, dst: i32) {
   fsbUseGrp.push(g)
   fsbUseIx.push(ix)
   fsbUseDst.push(dst)
-  fsbCheckUse(g, ix, dst)
+  fsbUseOwner.push(cstrOwnerTop())
+  fsbCheckUse(g, ix, dst, cstrOwnerTop())
 }
 
 // A delivery of `src` to `dst`: the binding itself, or each field of a record literal and each
@@ -17670,7 +17674,7 @@ function fsbNoteElems(n: Node, d: TyArray, depth: i32) {
 function fsbEarlyArgTy(a: i32): i32 {
   const n = P.nodes[parenPeelIx(a)]
   match n {
-    Ident => fsbKnownTy(lookup(n.identName))
+    Ident => fsbNameTy(lookup(n.identName))
     Call => {
       const c = P.nodes[n.callFn]
       if c is Ident {
@@ -17684,6 +17688,15 @@ function fsbEarlyArgTy(a: i32): i32 {
     }
     _ => fsbUntypedArg(a)
   }
+}
+
+// A name's type: one naming the enclosing generic's own parameters is kept for its instances to
+// re-ask (D3967); any other type variable has no instance to ask, so it is -1.
+function fsbNameTy(t: i32): i32 {
+  if t >= 0 && t < T.tys.length && tyHasTyVar(t) && fsbTvsInScope(t, 0) {
+    return t
+  }
+  fsbKnownTy(t)
 }
 
 // `t` when it names no type variable, else -1.
@@ -17752,6 +17765,15 @@ function fsbLitText(a: i32): string {
 // which a binding called above its declaration does not yet have: it is left ungraded.
 function fsbUntypedArg(_a: i32): i32 { -1 }
 
+// Record the pair for the instances of `owner` to re-ask, as the use would have where it stands:
+// a use graded later, after a write it preceded, is outside that body by then (D3967).
+function fsbNoteCstr(got: i32, want: i32, ix: i32, owner: i32) {
+  cstrOwnerStack.push(owner)
+  noteLetCstr(got, want, ix, "")
+  cstrOwnerStack.pop()
+  0
+}
+
 // The callee of call `ix` when it is a marked binding.
 function fsbNoteCall(n: Call, ix: i32) {
   if fsbName.length == 0 || inferQuiet { return 0 }
@@ -17768,7 +17790,7 @@ function fsbNoteCall(n: Call, ix: i32) {
 // Grade one use against the type its group holds: a delivery's destination must take it, and a
 // call's arguments must fit its parameters. A pair naming a type variable of the enclosing
 // generic is left for each instance to re-ask (`noteLetCstr`).
-function fsbCheckUse(g: i32, ix: i32, dst: i32) {
+function fsbCheckUse(g: i32, ix: i32, dst: i32, owner: i32) {
   if fsbRefused[ix] ?? false { return 0 }
   const h = fsbOwner(g)
   if h < 0 { return 0 }
@@ -17776,7 +17798,7 @@ function fsbCheckUse(g: i32, ix: i32, dst: i32) {
   const since = " since the write on " + fsbWhere(fsbGrpAt[h], ix)
   if dst >= 0 {
     if tyHasTyVar(dst) || tyHasTyVar(held) {
-      noteLetCstr(held, dst, ix, "")
+      fsbNoteCstr(held, dst, ix, owner)
     } else if !assignable(held, dst) {
       fsbErr(
         "cannot assign "
@@ -17841,7 +17863,7 @@ function fsbCheckUse(g: i32, ix: i32, dst: i32) {
           )
         } else if lf < 0 && at >= 0 && pt >= 0 && !(an is Spread) {
           if tyHasTyVar(at) || tyHasTyVar(pt) {
-            noteLetCstr(at, pt, a, "")
+            fsbNoteCstr(at, pt, a, owner)
           } else if !assignable(at, pt) {
             return fsbErr(
               "argument "
