@@ -402,10 +402,13 @@ const a: Animal = c
 print(a.name)   // prints tom
 ```
 
-> Status: an existing value is accepted only when every dropped field's name sorts after
+> Status: an existing value passed to a declared record parameter is accepted. At a binding,
+> a return or an assignment it is accepted only when every dropped field's name sorts after
 > every kept one. Otherwise `vl check` refuses it with "type-valid (structural width
-> subtyping) but not yet supported by codegen" (D3631). A list of the wider record into a
-> `readonly` list of the narrower one is refused the same way (D4050).
+> subtyping) but not yet supported by codegen" (D4054). Two parameters of one record type
+> that are both handed wider records are refused (D4021), and so is a wider record passed
+> inside a nullable or a list (D4022). A list of the wider record into a `readonly` list of the
+> narrower one is refused the same way (D4050).
 
 **T4.7** A record type may be recursive through a nullable field, a list or a union.
 
