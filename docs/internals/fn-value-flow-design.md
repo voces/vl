@@ -1,7 +1,7 @@
 # Function-value flow — one table instead of per-position pins
 
 Status: **design for review, no code.** Lane SC, 2026-10-11. Measured on master `20fa382fe`
-and re-graded on `5d4cd14dc`. Revision 2 answers the #3531 review. What changed is listed at
+and re-graded on `5d4cd14dc`. Revisions 2 and 3 answer the #3531 review. What changed is listed at
 the end.
 
 ## The problem in one paragraph
@@ -77,9 +77,16 @@ The census establishes these facts:
 
 - **Group A.** The coercion and delivery helpers become READS of the table,
   `fnFlowSigAt(node, inst)`, and are deleted along with their positions.
-- **Group B.** The peer pins, `monoBindingSigConflict`, `monoAssignedPeerFe`,
-  `monoInitPeerFe` and the `monoLetWrites` table are retired. The table's class merge is
-  exactly what they approximate.
+- **Group B.** Group B is retired in two steps.
+  - **Step 3** retires the peer pins (`monoPinLamFromPeer`, `monoAssignedPeerFe`,
+    `monoInitPeerFe`, `monoTargetPeerFe`), and step 2 retires the `monoLetWrites` table. The
+    table's class merge is exactly what they approximate.
+  - **Step 6** retires `monoBindingSigConflict`. Its 6 fail sites become the (c) literal's
+    multi-pin form, which is decided by the table's class, not by re-deriving a binding's
+    signatures (§(e), "Pins decide instances"). Until step 6 it stays, and it fires only on
+    a class the table also calls multi-pin. Shadow mode checks that agreement from step 1
+    on.
+  - **Step 8** decides whether that refusal becomes the instance record (§(g)).
 - **Group C** mostly stays. Callback baking, lambda cloning inside an instance and the
   template ledgers are instancing MECHANICS, not flow decisions. Their name lists switch to
   binding ids.
@@ -154,38 +161,98 @@ That is 35 sites in six passes. The grep is the starting list, not the proof. Th
 the audit below.
 
 **The rule: identity is propagated at the creation site, and the table is still built in
-the checker.** Every site that mints a node standing for an existing binding goes through
-one helper, `identFrom(new, old)`. The helper copies `identDeclIx[old]` and, for a minted
-declaration, sets `declOrig[new] = oldDecl`. The cases:
+the checker.** Identity changes in exactly three ways after the checker. Each has one entry
+point, and nothing else writes the column.
 
-- **In-place renames** (`shadowRespell`) keep the node index, so the column survives with
-  no code. The respelled NAME stops mattering, because nothing reads it for identity.
-- **`cboxWalk`'s cell read.** The new `Index` and its inner `Ident(cell)` take the replaced
-  Ident's entry. A boxed `let` keeps its own LetDecl, so the cell read resolves to it
-  unchanged.
-- **`cboxSeedLet`'s `name$cb`.** This is the cell of a boxed parameter or loop variable.
-  It gets `declOrig = the parameter`, so the cell's reads and writes join the parameter's
-  class. This is m02's shape, and x01's parameter alias.
-- **Fresh temporaries with no source binding** (`$lv`, `$np`/`$nv`, spill and dispatch
-  locals) are their own declarations. A temporary that carries a function value gets a
-  flow edge from the expression it was initialised from, which `identFrom` also records
-  (`flowFrom[new] = oldExpr`).
-- **Mono's own clones** keep their Ident nodes on the statement spine. For the LetDecls
-  that `monoCloneBodyRaw` synthesises (`mkLet`), `declOrig[clone] = orig`;
-  `recordClonedNodeTy*` is the precedent.
+1. **A minted node stands for an existing binding:** `identFrom(new, old)`. It copies
+   `identDeclIx[old]`. For a minted DECLARATION it also sets `declOrig[new] = oldDecl`.
+2. **A minted node stands for a binding that has no old node to copy from:**
+   `identFromDecl(new, declIx)`. `cboxSeedLet` and `cboxStoreBack` are the two sites. Each
+   builds a fresh `Ident(name$cb)` or `Ident(name)` from a NAME. `cboxStoreBack(name)` takes
+   only the name today, so step 0 adds the declaration index to its signature. The
+   declaration is the `for` node that `captureBoxRewrite` is lowering, and
+   `cboxContStoreBack` threads it to the `continue` sites.
+3. **A node is RENAMED in place, so its name now refers to a different binding:**
+   `sidNoteNodeName(ix, declIx)`. Every in-place rename already calls
+   `sidNoteNodeName(ix)` (`symbols.vl`, R4), which invalidates the interned-name cache
+   (21 call references in six files). Step 0 gives it a second argument, the declaration the
+   new name refers to, and makes it the single place a rename updates identity.
+   - A caller that cannot name the declaration passes -1, and the audit counts that node as
+     unresolved. A rename therefore cannot leave a stale entry: it updates the column or
+     the audit fires.
+   - A rename that keeps the binding passes the node's own current entry. These are
+     `shadowRespell`'s `name$s<n>` and `extvRespellIn`'s `nm$extv`. The forwarding function
+     is the new declaration.
+
+**The creation sites, before and after mono:**
+
+- **Pre-mono rewrites,** from the table above:
+  - **In-place renames:** `shadowRespell`'s 2, through `sidNoteNodeName(ix, declIx)`.
+  - **`cboxWalk`'s cell read:** the new `Index` and its inner `Ident(cell)` take the
+    replaced Ident's entry (`identFrom`). A boxed `let` keeps its own LetDecl, so the cell
+    read resolves to it unchanged.
+  - **`cboxSeedLet`'s `name$cb`:** the cell of a boxed parameter or loop variable. It gets
+    `declOrig = the parameter` (`identFromDecl`), so the cell's reads and writes join the
+    parameter's class. This is m02's shape, and x01's parameter alias.
+  - **`cboxStoreBack`'s write-back:** `identFromDecl` to the declaration it stores to.
+  - **Fresh temporaries with no source binding** (`$lv`, `$np`/`$nv`, spill and dispatch
+    locals) are their own declarations. A temporary that carries a function value gets a
+    flow edge from the expression it was initialised from, which `identFrom` also records
+    (`flowFrom[new] = oldExpr`).
+- **Mono itself** mints 11 `mkIdent`, 7 `mkLet` and 5 `mkParam` in `emit_mono.vl`, and renames
+  in place in five functions:
+  - `monoRenameGenAliasInit`;
+  - `monoMakeInstanceGo` and `monoSpecializeConcrete` (`cal.identName = …`);
+  - `monoLamCallByName`;
+  - `monoRespellLamAlias`.
+
+  The rules:
+  - **An instance's Param** gets `declOrig[instParam] = templateParam`. Reads inside the
+    instance body resolve to the instance Param, never to the template's, so two instances
+    of one generic never share a parameter slot.
+  - **An instance's LetDecl** (`monoCloneBodyRaw`'s `mkLet`) gets `declOrig[clone] = orig`.
+    `recordClonedNodeTy*` is the precedent.
+  - **A callee respelled to an instance name** (`cal.identName = instName`) passes the
+    instance FuncDecl to `sidNoteNodeName`.
+- **Post-mono synthesis** also mints nodes, after the point where revision 2's audit ran:
+  - `synthVoidTwins` builds a twin FuncDecl with fresh `mkParam`s and argument
+    `mkIdent`s. Each twin Param gets `declOrig = the original's Param`, and each argument
+    Ident is `identFromDecl` to its twin Param.
+  - `synthExternValues` mints `<name>$extv` and renames reads to it (`extvRespellIn`).
 
 **Why not build the table after the rewrites instead.** That gives up the check-time half:
 a refusal the table owes (D4010, D3975, D3923, step 7) has to be a CHECK error, and only
 the checker can raise one. It also does not remove the propagation work, because emit reads
 the table by node, and the nodes it reads are the rewritten ones.
 
-**The audit is the guard.** After `scanArrLitCommit`, step 0 walks every Ident and Index in
-a function-value position and counts those with no entry. The count is printed per pass of
-origin. **Step 0 does not land until that count is 0 over tests/cases, the distilled
-corpus, the d3960 matrix and the keep-running list.** A rewrite added later that forgets
-`identFrom` shows up in the same count, so the guard outlives step 0. D3993 (on #3516; unfiled: D3993) belongs to the
-same hazard class: a rewrite changed a node's kids, and a later reader indexed the old
-shape. That is a reason to audit the rewritten tree rather than trust the creation list.
+**The audit is the guard. It counts every Ident, in every position, and it runs after the
+LAST arena-mutating pass.**
+
+- **When it runs.** The audit runs after the post-mono synthesis passes (`synthVoidTwins`,
+  `synthExternValues`, `synthParamAnnots`, the `synthCapture*` passes), before any emitter
+  reads a function body.
+- **What it counts.** It walks every Ident reachable from the program's statements and
+  counts those with no entry. That includes callees, write targets, captures and operands,
+  not only function-value positions. The count is broken down by kind of position and by
+  the pass that minted the node (a node id above the checker's arena length names its
+  minting pass through an arena watermark recorded per pass).
+- **When step 0 lands.** **Step 0 does not land until that count is 0 over tests/cases, the
+  distilled corpus, the d3960 matrix and the keep-running list.**
+- **The audit has a control that must fire.**
+  - Step 0's test suite builds a seed with ONE `identFrom` call removed: `cboxWalk`'s cell
+    read.
+  - It asserts that the count on m02 and m04 rises above 0, attributed to
+    `captureBoxRewrite`.
+  - It repeats the check with `sidNoteNodeName`'s new argument forced to -1 at
+    `monoMakeInstanceGo`, where the count must rise on i05.
+
+  An audit that reads 0 on a tree where a site was deliberately broken is measuring
+  nothing. The control is how the 0 means something.
+- **Later rewrites.** A rewrite added later that forgets `identFrom` shows up in the same
+  count, so the guard outlives step 0.
+- **D3993** (on #3516; unfiled: D3993) belongs to the same hazard class. A rewrite changed a
+  node's kids, and a later reader indexed the old shape. That is a reason to audit the
+  rewritten tree rather than trust the creation list.
 
 ### Leaf lambdas shared across instances
 
@@ -234,6 +301,10 @@ the same output, after every step. Witnesses are in `~/.claude/vl-tools/witnesse
 | m05 | `shadowRespell`: an inner `const f` shadows the parameter `f` | `I 10` |
 | x01 | `fs[0] = inner` inside a callee, through a list parameter | `I true` |
 | i05 | an unwritten generic `let` called at two types | `1 s` |
+| u01 | an alias of an unwritten generic `const`, each called at a different type | `1 s` |
+| u04 | an unwritten hole lambda `const` called at two types | `1 s` |
+| f01, f02 | one un-annotated `ap` (a hole lambda; a function) applied to `dbl` and to `up` | `6 s!` |
+| f03 | `id` delivered to an annotated `apply` at `i32`, and aliased and called at `string` | `6 4 z` |
 | i01, i09 | `==` on function values (concrete, and two bindings of `id`) | `true`; `true 1 s` |
 | p05, p07, p10 | record field write, nullable slot, map-index write of a generic | `9`; `4`; `2` |
 | c02, c04, c06, c08, c08b, c08c | the concrete controls of p02, p04, p06, p08 | as today |
@@ -320,32 +391,72 @@ summary is computed by union-find over the body, with callee summaries applied a
 call. Summaries are iterated to a fixpoint in reverse topological order of the call graph's
 strongly connected components:
 
-- A non-generic callee's summary is applied once per call, as edges between the call's
-  argument and result classes.
-- A generic callee's summary is instantiated at the call's banked type arguments (§(h)), so
-  two calls of `id<T>` do not merge their arguments' classes, and x04's `fs[0] = g` still
-  joins `elem(fs)` with `g` in the caller.
-- A closure value carries the summary of its lambda. A call through a class applies the
+- **A generic name is a SOURCE, not a slot.** Each read of `id` starts its own class. In
+  f03, `apply(id, 4)` and `const g = id` are two classes with one pin each (`i32` and
+  `string`). They are not one class with two pins.
+- **An annotated function-typed parameter is a PIN on the argument's class, never an
+  edge.** It cuts the class at the boundary. In f03, `apply(f: (x: i32) => i32)` pins its
+  argument and does not join it with any other caller's argument.
+- **Context sensitivity: a callee is summarised once per INSTANCE, never once per
+  declaration.** These callees are instanced per call today, and the table keeps that:
+  - a generic function;
+  - a function whose parameter is un-annotated (f02's `function ap(f, x)`);
+  - a hole lambda (f01's `const ap = (f, x) => f(x)`).
+
+  Their summary is instantiated at the call's instance key: the banked type arguments for
+  a generic (§(h)), and the argument types at the hole positions for the other two. Their
+  parameters are per-instance slots.
+  - So f01 and f02, which apply one `ap` to `dbl` at `i32` and to `up` at `string`, are two
+    instances with one class each, and both keep running. A context-insensitive summary
+    would merge `f`'s class across the two calls into one class with two sources and two
+    pins, which the rule below refuses. That is why the insensitive version is wrong.
+  - Two calls of `id<T>` likewise never merge their arguments' classes, while x04's
+    `fs[0] = g` still joins `elem(fs)` with `g` in the caller.
+- **A fully annotated non-generic callee** has one instance, so its summary is applied once
+  per call, as edges between the call's argument and result classes. Its function-typed
+  parameters are pins, as above.
+- **A closure value carries the summary of its lambda.** A call through a class applies the
   summaries of all the class's sources (x03).
 
 Module globals are slots of the module frame, so a write from any function is an edge on
 the same slot.
 
-**Cost, restated.** Union-find over one body is near-linear in its nodes. The fixpoint
-re-runs a function only when a callee's summary grows. A summary is a set of edges over that
-function's boundary slots, so it can grow at most `B²` times, where `B` is the function's
-boundary-slot count. In practice it converges in one or two rounds per strongly connected
-component. The total is `O(Σ body × rounds)`, against today's whole-arena scans per name
-(`monoNameIsAssigned`, `monoNamesUsedAsValue`). The pass is GATED by the gate
-`monomorphize` already applies ("any generic, or `monoHasConcreteHOFParam`"), and it skips
-a function whose body touches no function-typed slot. The self-compile holds about 12
-generic functions, and today's mono function-value machinery is 0.33% of its profile
-inclusive, so the self-compile's fuel ratchet is the bound to hold (§(i)), not a cost to be
-recovered.
+**Cost, restated.**
+
+- **Per round.** Union-find over one body is near-linear in its nodes.
+- **Rounds.** The fixpoint re-runs a strongly connected component only when a callee's
+  summary GROWS, and a summary grows only by a class merge among its boundary slots. So the
+  worst case is about **O(N × merges)**: N is the node count of the function-value-bearing
+  bodies, and merges is the number of summary-growing merges. A chain of k higher-order
+  functions, each forwarding its function parameter to the next, is the shape that
+  realises it. One merge at the tail re-runs every link above it.
+- **What it replaces.** Today's whole-arena scans per name (`monoNameIsAssigned`,
+  `monoNamesUsedAsValue`) are O(N) per name asked.
+- **The gate.** The pass is GATED by the gate `monomorphize` already applies ("any generic,
+  or `monoHasConcreteHOFParam`"). It also skips a function whose body touches no
+  function-typed slot.
+
+**No existing cost row bounds this pass, because none of them runs it.**
+
+- The self-compile has **0** generic functions, so it skips the pass entirely. Its fuel
+  ratchet and its 0.33% `mono*` share say nothing about the new code. Revision 2 claimed
+  "about 12 generics", which was wrong.
+- The two plumb-shape units (`scripts/perf/gen-plumb-shape.vl`) are concrete `i64` code
+  with no generics, no hole lambdas and no function values, so they skip it too.
+
+The bound is therefore a NEW `tests/vl_scaling_shape_test.ts` compile pair, `fn-flow`,
+graded on the guest-fuel ratio like the rest. Its "many" arm is a chain of 64 higher-order
+functions with un-annotated function parameters, each forwarding to the next, plus a
+mutually recursive pair (one SCC) that writes the forwarded value into a module global. Its
+"one" arm does the same calls and writes from one function. It lands at step 1, when the
+pass first runs, with the bar set from that measurement. It has a control that must red: a
+fixpoint that re-runs every function on every merge.
 
 ### Per class, the table records
 
 - **sources:** each generic FuncDecl and each hole-lambda node written into the class;
+- **writes:** whether any member is the target of a write after its initialiser (`=`, an
+  element or field store, a write through a callee summary);
 - **pins:** the signature of each call through any member, and of each delivery into a
   concretely function-typed slot (a parameter, an annotated binding, a callback, a union arm
   annotated with a function type);
@@ -356,10 +467,28 @@ recovered.
 
 - **Zero pins:** no instance is needed.
 - **One pin:** the slot's rep is today's funcref or closure, and the output is
-  byte-identical.
-- **Two or more pins:** the multi-pin case. Its rep is a separate decision, §(g). Until
-  §(g) is decided, it keeps today's refusal (`monoBindingSigConflict`), routed through the
-  (c) literal.
+  byte-identical. This holds for any number of sources: m01 writes `k` over `id` and calls
+  once, and it runs.
+- **Two or more pins, one source, no writes:** each READ gets the instance at its own pin.
+  The class's single source is known at every read, so no value has to carry more than one
+  instance. This is what runs today:
+  - i05: an unwritten generic `let` called at `i32` and `string`;
+  - u01: `const g = f` over `const f = id`, called through each;
+  - u04: `const h = (x) => x` called at two types.
+
+  It must keep running. The same rule makes two programs RUN that are emit refusals today,
+  and it claims them at step 4:
+  - **u02**, `const fs = [id]` called through `fs[0]` at two types ("a list holding a
+    generic function is called through its elements at more than one type");
+  - **u03**, `const r = { f: id }` called through `r.f` at two types ("a function-value
+    call has no interned signature").
+
+  Neither is filed yet.
+- **Two or more pins with two or more sources, or a WRITTEN class with two or more pins:**
+  this is the multi-pin case, because a value read at a pin may be any of the sources. Its
+  rep is a separate decision, §(g). Until §(g) is decided it is refused with the (c)
+  literal's multi-pin form, "a function value at <position> is called at <n> signatures
+  and may hold <m> functions". i02 is the witness.
 
 ## (f) Migration, in landable steps
 
@@ -380,9 +509,11 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
 **Steps:**
 
 0. **Identity column.**
-   - Adds `identDeclIx` and `declOrig`, unconditional symbol resolution, and `identFrom` at
-     the 35 rewrite sites.
-   - Adds the post-rewrite audit, which must reach 0 (§(b)).
+   - Adds `identDeclIx` and `declOrig` and makes symbol resolution unconditional.
+   - Adds `identFrom` / `identFromDecl` at the pre-mono, mono and post-mono creation sites,
+     and gives `sidNoteNodeName` its declaration argument at all of its call sites.
+   - Adds the audit, which runs after the last arena-mutating pass, counts every Ident, and
+     must reach 0. It ships with its must-fire controls (§(b)).
    - Nothing reads the column yet.
    - The seed is byte-identical apart from the column's own code, and fuel is within ±1%.
 1. **The table, in shadow mode.** Build it from the shared store (§(h)). Shadow mode logs
@@ -392,7 +523,12 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      WITHOUT deciding, so it lowers at the hole's default. These are the 181 silent
      declines, seen from the outside. A shadow that compared only mono's decisions would
      be blind to exactly the positions that fail silently;
-   - **TOP and UNKNOWN**, with the position that set them.
+   - **TOP and UNKNOWN**, with the position that set them;
+   - **multi-pin agreement**: each class the table calls multi-pin against each
+     `monoBindingSigConflict` firing, in both directions.
+
+   The `fn-flow` scaling pair (§(e)) lands with this step, because this is the first step
+   where the pass runs.
 
    The histogram is the step's deliverable. Over the d3960 grid and the witness corpora,
    every silent cell must appear as a disagreement or as undecided. A silent cell the
@@ -413,12 +549,17 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
+   - Claims u02 (a list element) and u03 (a record field) under the single-source rule:
+     emit refusals today, `runs` after.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
-6. **Refusal.** The remaining fall-throughs in `monoCoerceFnValueName` / `monoInstanceFor`
-   become the (c) literal, and `live-sites.json` gains its row. The shadow comparison is
-   deleted.
+6. **Refusal.**
+   - The remaining fall-throughs in `monoCoerceFnValueName` / `monoInstanceFor` become the
+     (c) literal.
+   - **`monoBindingSigConflict` is retired.** Its refusal becomes the literal's multi-pin
+     form, read from the class.
+   - `live-sites.json` gains the literal's row, and the shadow comparison is deleted.
 7. **Checker refusal.** The checker re-checks each source at its class's pins and refuses
    an ill-typed delivery with both positions named (D4010, D3975, D3923). This step depends
    only on step 1, so it can move ahead of step 3.
@@ -430,7 +571,7 @@ replaces until the step that deletes that code.
 ## (g) The multi-pin case, as its own decision after the table lands
 
 Ruling C makes `let f = id; f = k; f(1); f("s")` legal (i02). One binding then needs two
-instances of whatever it holds. Today `monoBindingSigConflict` refuses it at emit. This
+instances of whatever it holds. Today `monoBindingSigConflict` refuses it at emit. From step 6 the (c) literal's multi-pin form refuses it. This
 section proposes the *instance record* and states what it has to answer. **It is not part
 of steps 0–7.** It is decided once step 1's histogram shows how many multi-pin classes the
 corpus and the fixtures contain.
@@ -567,12 +708,18 @@ instance until (b) lands.
 
 ## (i) Cost
 
-Measured on a guest profile of the self-compile (21,509 samples, `guest-profile.sh`):
+**What the existing rows measure.** The self-compile has 0 generic functions, and the
+plumb-shape units have no generics and no function values. Both skip the gated pass, so
+neither row can bound it.
 
-- **Check side vs emit.** `checkProgram` is 29.6% of the run and `emitProgram` is 64.9%.
-- **Today's mono function-value machinery is 0.33% inclusive** (any `mono*` frame on the
-  stack). Retiring it buys the self-compile nothing measurable.
-- **The new pass** is the gated fixpoint of §(e).
+- They bound the parts of this design that run on EVERY program: the identity column, the
+  unconditional symbol resolution, `identFrom`, and the audit.
+- The fixpoint itself is bounded by the `fn-flow` scaling pair (§(e)): its worst case is
+  about O(N × merges), and it lands at step 1.
+- The self-compile's guest profile (21,509 samples, `guest-profile.sh`) gives
+  `checkProgram` 29.6% and `emitProgram` 64.9%. Its 0.33% `mono*` share is the gate's skip
+  path, not the machinery at work. It says nothing about what retiring that machinery
+  saves on a generic-heavy program.
 - **The identity column** is one `i32` per node: 1.0–1.7 MB on the self-compile arena of
   257k–423k nodes. `declOrig` is sparse.
 - **The plumb-shape RSS bar** is +10% of 296 MB.
@@ -665,3 +812,28 @@ at emit.**
    - `monoCoerceFnValueName` has 15 references.
 9. One checker-side store shared with #3508, #3516 and the survey's L1, with a landing
    order (§(h)).
+
+## Revision 3: what changed, for the rev-2 review
+
+1. **Identity propagation is complete, and it has one entry point per kind of change**
+   (§(b)):
+   - `identFrom` for a minted node;
+   - `identFromDecl` for `cboxSeedLet` / `cboxStoreBack`, which have no old node;
+   - `sidNoteNodeName(ix, declIx)` for every in-place rename, mono's included;
+   - mono's 11 `mkIdent`, 7 `mkLet` and 5 `mkParam`, with an instance Param's `declOrig` set
+     to its template Param;
+   - `synthVoidTwins` / `synthExternValues`.
+
+   The audit now runs after the last arena-mutating pass, counts every Ident in every
+   position, and has must-fire controls.
+2. **The cost is bounded by a new `fn-flow` scaling pair**, because neither the self-compile
+   (0 generics) nor plumb-shape (no function values) runs the pass. The worst case is about
+   O(N × merges). Context sensitivity is per instance, so f01 and f02 keep running (§(e)).
+3. **The interim rule no longer refuses single-source classes.** A single-source unwritten
+   class gets an instance per pin at each read: i05, u01 and u04 keep running, and u02 and
+   u03 are claimed at step 4. The refusal applies only to 2+ pins with 2+ sources, or to a
+   written class with 2+ pins.
+   - The review's wording, "refuse with 2+ sources", is narrowed to 2+ sources AND 2+
+     pins. With only one pin, m01 (two sources) runs today.
+4. **`monoBindingSigConflict` retires at step 6**, the peer pins at step 3 and
+   `monoLetWrites` at step 2. Group B, §(e), §(f) and §(g) now agree.
