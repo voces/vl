@@ -177,3 +177,71 @@ Deno.test({
     });
   },
 });
+
+Deno.test({
+  name:
+    "several paths: two directories with different files, deduplicated, all checked to exist first",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withProbe(async (file, dir) => {
+      await Deno.mkdir(`${dir}/d1`);
+      await Deno.mkdir(`${dir}/d2`);
+      await Deno.writeTextFile(`${dir}/d1/c.vl`, "print(1)\n");
+      await Deno.writeTextFile(`${dir}/d1/e.vl`, "print(2)\n");
+      await Deno.writeTextFile(`${dir}/d2/f.vl`, "print(3)\n");
+      for (const args of [["d1", "d2"], ["d2", "d1"]]) {
+        const r = await run(["check", ...args.map((a) => `${dir}/${a}`)]);
+        if (r.code !== 0 || !r.err.includes("Checked 3 files, no errors.")) {
+          throw new Error(
+            `check ${args.join(" ")}: want 3 files, got ${r.code}: ${r.err}`,
+          );
+        }
+      }
+      const dup = await run([
+        "check",
+        file,
+        file,
+        `${dir}/./probe.vl`,
+        `${dir}/d1`,
+        `${dir}/d1/c.vl`,
+      ]);
+      if (dup.code !== 0 || !dup.err.includes("Checked 3 files, no errors.")) {
+        throw new Error(
+          `repeated paths count once: want 3 files, got ${dup.code}: ${dup.err}`,
+        );
+      }
+      const t = (n: number) =>
+        `import { it, expect } from "std:test"\nit("t${n}", () => { expect(1).toEqual(1) })\n`;
+      await Deno.mkdir(`${dir}/t1`);
+      await Deno.mkdir(`${dir}/t2`);
+      await Deno.writeTextFile(`${dir}/t1/x.test.vl`, t(1));
+      await Deno.writeTextFile(`${dir}/t2/y.test.vl`, t(2));
+      await Deno.writeTextFile(`${dir}/t2/z.test.vl`, t(3));
+      const tt = await run(["test", `${dir}/t1`, `${dir}/t2`, `${dir}/t1`]);
+      const tout = tt.out + tt.err;
+      if (
+        tt.code !== 0 || !tout.includes("3 files · 3 passed · 0 failed") ||
+        tout.includes("cannot read")
+      ) {
+        throw new Error(
+          `test t1 t2 t1: want 3 files passed, got ${tt.code}: ${tout}`,
+        );
+      }
+      const messy = `${dir}/messy.vl`;
+      await Deno.writeTextFile(messy, "const   x=1\nprint(x)\n");
+      const fm = await run(["fmt", "-w", messy, `${dir}/nope.vl`]);
+      if (
+        fm.code !== 2 || !fm.err.includes(`fmt: cannot read ${dir}/nope.vl`)
+      ) {
+        throw new Error(
+          `a missing path: want exit 2 naming it, got ${fm.code}: ${fm.err}`,
+        );
+      }
+      if ((await Deno.readTextFile(messy)) !== "const   x=1\nprint(x)\n") {
+        throw new Error(
+          "a missing path must stop the run before any file is written",
+        );
+      }
+    });
+  },
+});
