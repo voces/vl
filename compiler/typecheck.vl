@@ -3948,9 +3948,6 @@ let tpApartConcrete = false
 let tpIfJoinAt: {[i32]: i32} = Map()
 // The type an `if` or `match` used as a value is delivered to, seeded by `seedExpected`.
 let joinWantAt: {[i32]: i32} = Map()
-// The `if`s whose value initialises an un-annotated `let`: a literal arm there keeps its base
-// type, as a `let` of the literal alone does, so a later store of another string still fits.
-let joinNoAdopt: {[i32]: boolean} = Map()
 // The joins typed by their destination rather than their arms.
 let joinByWant: {[i32]: boolean} = Map()
 // The same joins by owning declaration, re-asked at each call that pins the owner.
@@ -5339,7 +5336,6 @@ export function initChecker() {
   genFnCstrBusy = false
   tpIfJoinAt = Map()
   joinWantAt = Map()
-  joinNoAdopt = Map()
   joinByWant = Map()
   tpIfFn = []
   tpIfJoin = []
@@ -52347,14 +52343,9 @@ function tailPushIfArms(p: i32, todo: i32[]): boolean {
 }
 
 // Banks destination `ty` on every `if` and `match` whose value reaches it through `ix`'s arms.
-function seedJoinWant(ix: i32, ty: i32) { markJoinLeaves(ix, ty) }
-
-// Banks each `if` and `match` whose value is `ix`'s with destination `ty`, or, for `ty` -1,
-// as an un-annotated `let`'s initialiser.
-function markJoinLeaves(ix: i32, ty: i32) {
-  for at in joinLeavesOf(ix) {
-    if ty >= 0 { joinWantAt.set(at, ty) } else { joinNoAdopt.set(at, true) }
-  }
+function seedJoinWant(ix: i32, ty: i32) {
+  if ty < 0 { return 0 }
+  for at in joinLeavesOf(ix) { joinWantAt.set(at, ty) }
   0
 }
 
@@ -52385,58 +52376,20 @@ function joinTypedByWant(ix: i32): boolean {
   false
 }
 
-// The type a valued `if` or `match` at `ix` joined to `join` takes instead, or -1: the one type
-// of its non-literal arms when each string literal arm's literal fits it, else the destination
-// banked for `ix` when every arm fits that (DV-1207). A type parameter's join is left alone.
+// The type a valued `if` or `match` at `ix` joined to `join` takes instead, or -1: the
+// destination banked for `ix` when every arm fits it (DV-1207). A join with no destination keeps
+// its own type, and a type parameter or a `null` in the destination leaves it alone.
 function litJoinOf(ix: i32, join: i32, arms: i32[], tys: i32[]): i32 {
-  let other = -1
-  let lits = 0
-  let i = 0
-  while i < arms.length {
-    const lt = armTailStrLitTy(arms[i])
-    if lt >= 0 { lits = lits + 1 }
-    else if other == -1 { other = tys[i] }
-    else if other != tys[i] { other = -2 }
-    i = i + 1
-  }
-  if (
-    !joinNoAdopt.has(ix)
-    && lits > 0
-    && other >= 0
-    && other != join
-    && !tyHasTyVar(other)
-  ) {
-    let fits = true
-    i = 0
-    while i < arms.length && fits {
-      const lt = armTailStrLitTy(arms[i])
-      if lt >= 0 && !assignable(lt, other) { fits = false }
-      i = i + 1
-    }
-    if fits { return other }
-  }
   const jw = joinWantAt.get(ix) ?? -1
   if jw < 0 || join < 0 || tyHasTyVar(jw) || assignable(join, jw) { return -1 }
-  i = 0
+  if tyHasNullMember(jw) { return -1 }
+  let i = 0
   while i < arms.length {
     if !joinArmFits(arms[i], tys[i], jw) { return -1 }
     i = i + 1
   }
   joinByWant.set(ix, true)
   jw
-}
-
-// The literal type of the string literal arm `armIx` ends in, or -1.
-function armTailStrLitTy(armIx: i32): i32 {
-  if armIx < 0 { return -1 }
-  let tail = armIx
-  const a = P.nodes[armIx]
-  if a is Block {
-    if a.blkStmts.length == 0 { return -1 }
-    tail = a.blkStmts[a.blkStmts.length - 1]
-  }
-  if !(P.nodes[parenPeelIx(tail)] is StrLit) { return -1 }
-  litTyOfExpr(tail)
 }
 
 // Whether arm `armIx`, valued `armTy`, fits destination `want`: by its type, or as the literal
@@ -66819,7 +66772,6 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   }
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
-    if annot < 0 && n.letKw == "let" { markJoinLeaves(n.letInit, -1) }
     initTy = checkNode(n.letInit)
   }
   // A `void` initializer has no value to bind — reject with a source-located message,
