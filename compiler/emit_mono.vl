@@ -331,6 +331,7 @@ import {
   unNames,
 } from "./emit_state"
 import { emitFail, emitFailAt } from "./emit_bytes"
+import { parseI32 } from "./emit_bignum"
 import {
   TY_WALK_DEPTH,
   anonHandleTyIx,
@@ -9531,9 +9532,31 @@ function monoListInitHoldsCellAlias(v: i32, ctx: i32): boolean {
   false
 }
 
-// Whether every read of `name` in frame `fx`'s body is the callee of a call of one element at a
-// literal index (`name[0](…)`).
-function monoListOnlyCalled(fx: i32, name: string): boolean {
+// The element a literal index spelled `text` names in a list of `len` elements, by value in any
+// base the lexer keeps (`0`, `00`, `0x0`); -1 for a fraction, an exponent, or out of range.
+function monoListLitIndex(text: string, len: i32): i32 {
+  if text.length == 0 || text.length > 12 { return -1 }
+  const hex = text.length > 1 && (text[1] == "x"[0] || text[1] == "X"[0])
+  for ch in text {
+    if ch == "."[0] || ch == "-"[0] { return -1 }
+    if !hex && (ch == "e"[0] || ch == "E"[0]) { return -1 }
+  }
+  const v = parseI32(text)
+  if v < 0 || v >= len { return -1 }
+  v
+}
+
+// The element count of the list literal at node `v`; -1 for any other node.
+function monoListLitLength(v: i32): i32 {
+  if v < 0 { return -1 }
+  const lit = P.nodes[v]
+  if lit is ArrayLit { return lit.arrElems.length }
+  -1
+}
+
+// Whether every read of `name` in frame `fx`'s body, a list of `len` elements, is the callee of a
+// call of one element at a literal index that names one (`name[0](…)`).
+function monoListOnlyCalled(fx: i32, name: string, len: i32): boolean {
   const stack: i32[] = []
   const called: i32[] = []
   if fx >= 0 {
@@ -9553,7 +9576,9 @@ function monoListOnlyCalled(fx: i32, name: string): boolean {
           const a = P.nodes[c.idxArr]
           const k = P.nodes[c.idxIndex]
           if a is Ident && k is NumLit {
-            if a.identName == name { called.push(c.idxArr) }
+            if a.identName == name && monoListLitIndex(k.numText, len) >= 0 {
+              called.push(c.idxArr)
+            }
           }
         }
       }
@@ -9583,9 +9608,8 @@ function monoListElemCellRead(callee: i32, ctx: i32): i32[] {
   if !(d is LetDecl) || d.letKw != "const" || d.letInit < 0 { return none }
   const lit = P.nodes[d.letInit]
   if !(lit is ArrayLit) || lit.pos < 0 { return none }
-  let at = 0
-  while at < lit.arrElems.length && i32ToStr(at) != k.numText { at = at + 1 }
-  if at >= lit.arrElems.length { return none }
+  const at = monoListLitIndex(k.numText, lit.arrElems.length)
+  if at < 0 { return none }
   const e = unwrapParen(lit.arrElems[at])
   const nm = monoIdentNameOf(e)
   if nm == "" { return none }
@@ -11768,7 +11792,10 @@ function monoWalk(ix: i32, ctx: i32) {
     // A list holding an alias of a capture cell's read is followed only where every read of it
     // is a call of one element (`fs[0](…)`), which is taken through the cell.
     if monoListInitHoldsCellAlias(n.letInit, ctx) {
-      if n.letKw != "const" || !monoListOnlyCalled(ctx, n.letName) {
+      if (
+        n.letKw != "const"
+        || !monoListOnlyCalled(ctx, n.letName, monoListLitLength(n.letInit))
+      ) {
         return monoCellAliasListFail(n.letInit)
       }
       monoCellAliasListOk = n.letInit
