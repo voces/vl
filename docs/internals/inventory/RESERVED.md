@@ -91,4 +91,4 @@ D3890-D3899  lane-SC  2026-10-08  lane SC soundness rows (D3853 redesign, D3883)
 D3960-D3969  lane-CK  2026-10-10  checker soundness: a generic-seeded let written with a concrete function (D3960) and the emit rows its matrix and review found
 D3970-D3979  lane-SC  2026-10-10  lane SC rows for D3948 and the rv3498 residue
 D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)
-D4010-D4019  lane-CK  2026-10-11  the #3516 review: a hole delivery's pin missed by the constraint probe (D4010 filed and closed), width rewrite gaps (D4011-D4013 filed open)
+D4020-D4029  lane-CK  2026-10-11  the #3516 review: a hole delivery's pin missed by the constraint probe (D4020 filed and closed), width rewrite gaps (D4021-D4023 filed open)
