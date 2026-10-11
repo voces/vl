@@ -523,7 +523,7 @@ the rule to adopt, and its order rule is the one M6.1 already follows.
 Raised by diagnostics.md §D6.4.
 
 **Today.** When both operands are constant, `10 / 0` is an error (`division by zero in a
-constant expression`). When the dividend is not constant, `a / 0` and `a % 0` get the
+constant expression`), and the `divide-by-zero` warning is reported beside it. When the dividend is not constant, `a / 0` and `a % 0` get the
 `divide-by-zero` warning, the program builds, and it traps when the division runs. ROADMAP
 B17 planned "hard **error** for integer division", with `for-step-zero` as precedent; the
 lint that shipped is a warning. A float divisor of `0.0` gets nothing, and gives an

@@ -70,9 +70,10 @@ after `vl check` has accepted the program, at build time, is a compiler defect a
 rule of the language: either the program is legal and must build, or it is illegal and
 `vl check` owed the error.
 
-> Ruling: the owner's standing bar, CLAUDE.md §"The goal is `runs`" (clauses 1 and 2),
-> and `docs/guide/soundness.md`: "if a program type-checks (zero ERROR diagnostics), then
-> no operation will ever see a value of the wrong type at runtime".
+> Source: `docs/guide/soundness.md`: "if a program type-checks (zero ERROR diagnostics),
+> then no operation will ever see a value of the wrong type at runtime". DECISIONS.md
+> applies the bar's two clauses (soundness, and no capability refusals) without a section
+> of its own, for example §"Array covariance over ALIASING lists".
 
 > Status: the compiler has known build-time refusals of check-clean programs, each filed
 > as an inventory row. One found writing this chapter is D4067. `vl check --codegen` also
@@ -82,7 +83,8 @@ rule of the language: either the program is legal and must build, or it is illeg
 
 **D3.1** A warning, info or hint is a finding. Every finding carries a `code`: a stable
 name that `vl check --json` reports and that a later suppression comment (D7) will name.
-The codes in force are:
+The codes in force for user programs are listed below. Rules scoped to the VL tree's own
+sources (`compiler/`, `std/`) are not listed: they report nothing on other programs.
 
 | code | severity | reported for |
 | --- | --- | --- |
@@ -92,7 +94,7 @@ The codes in force are:
 | `duplicate-import` | warning | a name imported twice from one module |
 | `unreachable-code` | warning | a statement after `return`, `break` or a diverging branch |
 | `constant-condition` | warning | an `if` or `while` whose condition is a literal boolean that makes a branch dead |
-| `divide-by-zero` | warning | `/` or `%` by a literal `0` whose dividend is not constant |
+| `divide-by-zero` | warning | `/` or `%` by a literal `0`, also beside the error when the dividend is constant (D2.3) |
 | `range-inclusive-length` | warning | `0 to xs.length`, one step past the last index |
 | `unconditional-recursion` | warning | a function every path of which calls itself again |
 | `unused-pure-expression` | warning | a value computed and dropped, not the last statement of its block |
@@ -101,8 +103,8 @@ The codes in force are:
 | `byte-as-code-point` | warning | a string's byte `s[i]` passed where a code point is expected |
 | `dead-coalesce-default` | warning | `x ?? d` where `x` can never be null |
 | `prefer-const` | info | a `let` never reassigned |
-| `prefer-interpolation` | info | a string built from three or more `+` pieces |
-| `map-has-guard-reread` | info | a `has` test guarding an `as!` read of the same key |
+| `prefer-interpolation` | info | a string built with `+` from three or more pieces that are string literals |
+| `map-has-guard-reread` | info | a `has` test guarding a read of the same key, `m[k]` or `m[k] as!` |
 | `union-let-no-melt` | info | a union-typed `let` written on more than one path inside a loop |
 | `redundant-type` | hint | an annotation equal to what the checker infers |
 | `float-list-as-vector` | hint | a 2-to-4-element float list used only at fixed indexes |
@@ -176,15 +178,18 @@ and shown by `--include-std`. An error inside `std:` is always shown.
 
 **D4.3** `vl run` reports errors and no findings.
 
-**D4.4** `vl check --json` writes one record per diagnostic with the fields `file`,
-`severity`, `stage`, `code`, `line`, `col`, `endLine`, `endCol` and `message`. Lines and
-columns count from 1. `stage` is one of `read`, `import`, `parse`, `type`, `emit`,
-`validate`, `lint` and `fix`. A finding's `code` is its D3.1 code; an error's is `null`.
+**D4.4** `vl check --json` writes one record per diagnostic. Every record has `file`,
+`severity`, `stage`, `line`, `col`, `endCol` and `message`. Two keys are optional: `code`
+is present on a finding, holding its D3.1 code, and absent on an error; `endLine` is
+present only when the diagnostic's span ends on a later line. Lines and columns count from
+1. `stage` is one of `read`, `import`, `parse`, `type`, `emit`, `validate`, `lint` and
+`fix`.
 
 **D4.5** `vl check --fix` applies the safe edits that findings offer: `let` to `const`,
 removing a redundant annotation, removing an unused import (a whole import only from a
-`std:` module, modules.md §M6.1), and adding the import an error names when exactly one
-module exports the name. It compiles the file before keeping each edit, and declines an
+`std:` module, modules.md §M6.1), and adding the import an error names. When several
+modules export the name, it adds the one whose export accepts the receiver's type, so
+`xs.lastIndexOf(1)` on a list gets `std:array`'s and on a string `std:str`'s. It compiles the file before keeping each edit, and declines an
 edit that would stop the file building.
 
 ## D5. Exit codes
@@ -193,13 +198,19 @@ edit that would stop the file building.
 
 | command | 0 | 1 | 2 | other |
 | --- | --- | --- | --- | --- |
-| `vl check` | no diagnostic at or above the gate | some diagnostic at or above the gate | usage error | |
-| `vl run` | the program ran to its end | a compile error or a trap | usage error | the code the program passed to `exit` |
-| `vl build` | wrote a valid module | a compile, optimise or validate failure | usage error | |
+| `vl check` | no diagnostic at or above the gate | some diagnostic at or above the gate | usage error, or a file it cannot read | |
+| `vl run` | the program ran to its end | a compile error, a trap, or a file it cannot read | usage error | the code the program passed to `exit` |
+| `vl build` | wrote a valid module | a compile or optimise failure, or a file it cannot read | usage error | |
 | `vl test` | every selected test passed | some test failed | usage error | |
-| `vl fmt` | already formatted, or formatted | `--check` found a file to format | unreadable input or usage error | 3: the formatter's own output failed to parse |
+| `vl fmt` | already formatted, or formatted | `--check` found a file to format | input that does not parse or cannot be read, or a usage error | 3: the formatter's own output failed to parse |
 
-Every command exits 70 when the compiler itself crashed. That is a compiler defect.
+Every command exits 70 when the compiler itself trapped or emitted a module the engine
+refuses as invalid. Either is a compiler defect.
+
+> Status: `vl build` ignores an unknown flag and exits 0, though it exits 2 with no input
+> file (D4100); `vl check` and `vl run`
+> exit 2. A file that cannot be read exits 2 under `vl check` and 1 under `vl run` and
+> `vl build`.
 
 **D5.2** A program that calls `exit(code)` from `std:process` ends at once, and `vl run`
 exits with `code`. Output printed before the call is kept.
@@ -250,7 +261,7 @@ print(1.0 / 0.0)   // prints Infinity
 
 **D6.4** An integer `/` or `%` whose divisor is the literal `0` and whose dividend is not
 constant is a warning (`divide-by-zero`), and traps when it runs (D6.1). When both
-operands are constant it is an error (D2.3).
+operands are constant it is an error (D2.3), and the same warning is reported beside it.
 
 > Open question (Q13): whether a literal-zero integer divisor is an error, as ROADMAP B17
 > planned, or stays a warning.
