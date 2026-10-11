@@ -517,3 +517,39 @@ export const M = A + 1
 changing the meaning of any program that compiles. No consumer has asked for a cycle, and
 the workaround, one module, costs a file split rather than a feature. If one does, (b) is
 the rule to adopt, and its order rule is the one M6.1 already follows.
+
+## Q13. A literal-zero integer divisor
+
+Raised by diagnostics.md §D6.4.
+
+**Today.** When both operands are constant, `10 / 0` is an error (`division by zero in a
+constant expression`). When the dividend is not constant, `a / 0` and `a % 0` get the
+`divide-by-zero` warning, the program builds, and it traps when the division runs. ROADMAP
+B17 planned "hard **error** for integer division", with `for-step-zero` as precedent; the
+lint that shipped is a warning. A float divisor of `0.0` gets nothing, and gives an
+infinity or NaN.
+
+```vl
+function f(a: i32): i32 { a / 0 }   // warns: `/ 0` traps at run time
+print(f(4))                          // traps: integer divide by zero
+```
+
+**(a) An error.** A literal `0` divisor of an integer `/` or `%` is refused wherever it
+appears, as `step 0` is.
+
+```vl
+function f(a: i32): i32 { a / 0 }   // would be refused: integer division by zero
+```
+
+**(b) A warning, as today.** The division is legal, the warning names the trap, and a
+program that reaches it traps.
+
+```vl
+function f(a: i32): i32 { a / 0 }   // warns, builds, traps if called
+```
+
+**Recommendation: (a).** The expression can never produce a value, so no correct program
+contains it, and the checker already refuses the same division when the dividend happens
+to be constant: today whether `x / 0` is legal depends on `x`, not on the division. A
+program that wants to stop has `__trap__` and a `never` function (statements.md §S8.2).
+(a) refuses programs that compile today, but only ones that would trap if the line ran.

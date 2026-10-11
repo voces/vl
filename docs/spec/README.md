@@ -18,7 +18,7 @@ where one exists, and is marked where the compiler has not caught up.
 | [statements.md](statements.md) | programs, bindings, scope, blocks, `if`, loops, labels and loop values, `match`, `return` and `never`, local declarations |
 | [narrowing.md](narrowing.md) | narrowable places, null tests, `is`, literal and discriminant tests, where a fact holds, writes and joins, what ends a fact |
 | [modules.md](modules.md) | modules and visibility, exports, imports and specifiers, re-exports, names and the ambient set, running order and cycles, inference across modules |
-| diagnostics.md *(next)* | error, warning, hint and info categories; exit codes |
+| [diagnostics.md](diagnostics.md) | severities, errors and the build-time rule, findings and their codes, the `vl check` gate, exit codes, traps, suppression |
 | std.md *(next)* | the standard library contract |
 
 Open questions the sources do not settle are collected in [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
