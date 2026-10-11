@@ -25,6 +25,9 @@ const ALIGN = 8
 // Over a shared memory: where this instance's latest `Buf` ended, from the heap base + 8.
 let bumpOff = 0
 
+// The highest end address any `Buf` of this instance has reached; 0 before the first.
+let bumpPeak = 0
+
 // `n` rounded up to the next multiple of `ALIGN`.
 function alignUp(n: i32): i32 {
   const slack = n & (ALIGN - 1)
@@ -85,6 +88,7 @@ export function Buffer(byteLength: i32): Buf {
         const claimed = ((run as i64) << 32) | ((next - first) as i64)
         if __atomic_rmw_cmpxchg_i64__(heap, word, claimed) == word {
           bumpOff = next - first
+          if next > bumpPeak { bumpPeak = next }
           return { base: base, length: byteLength }
         }
       }
@@ -97,6 +101,7 @@ export function Buffer(byteLength: i32): Buf {
   const next = base + alignUp(byteLength)
   ensureCapacity(next)
   bumpOff = next - heap
+  if next > bumpPeak { bumpPeak = next }
   return { base: base, length: byteLength }
 }
 
@@ -146,6 +151,16 @@ export function bufferRelease(mark: i32) {
   if mark > heap + bumpOff { __trap__() }
   if (mark & 7) != 0 { __trap__() }
   bumpOff = mark - heap
+}
+
+// The highest `bufferMark()` has reached in this instance: the end address of the furthest
+// `Buf` it made, released or not, or the current mark if higher. Rounded up to 64 KiB, it is
+// an `--initial-memory` that holds every such `Buf`. Under `--shared-memory` it misses
+// another instance's `Buf`s that were since released, so it is a lower bound.
+export function bufferPeak(): i32 {
+  const now = bufferMark()
+  if bumpPeak > now { return bumpPeak }
+  return now
 }
 
 // ── loads ────────────────────────────────────────────────────────────────────
