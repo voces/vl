@@ -293,9 +293,10 @@ fixCase(
       "const a: u8[] = filled(16, 0 as! u8)\n" +
       "print(f(filled(f(g()), (0))) + a.length + u16le(g(), 0))\n",
   },
-  // The orphaned `filled` import and the now-redundant annotations go in the next round.
+  // The orphaned `filled` import and the now-redundant binding annotation go in the next
+  // round; `f`'s return annotation stays (DV-103).
   'import { u16le, zeroBytes } from "std:bytes"\n' +
-    "function f(b: u8[]) { return b.length }\n" +
+    "function f(b: u8[]): i32 { return b.length }\n" +
     "function g(): u8[] { return zeroBytes(4 * 2) }\n" +
     "const a = zeroBytes(16)\nprint(f(zeroBytes(f(g()))) + a.length + u16le(g(), 0))\n",
 );
@@ -469,3 +470,12 @@ Deno.test({
     }
   },
 });
+
+fixCase(
+  "a private helper keeps its return annotation while a redundant local annotation goes (DV-103)",
+  {
+    "main.vl": "function usable(a: i32): boolean {\n  const ok: boolean = a > 0\n  return ok\n}\n" +
+      "print(usable(1))\n",
+  },
+  "function usable(a: i32): boolean {\n  const ok = a > 0\n  return ok\n}\nprint(usable(1))\n",
+);

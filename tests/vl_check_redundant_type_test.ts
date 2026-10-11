@@ -201,7 +201,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-check-redundant-type: flags + fixes a redundant RETURN annotation (scalar/string/string[])",
+  name: "vl-check-redundant-type: flags a redundant RETURN annotation (scalar/string/string[]), and --fix keeps it",
   ignore: !ENABLED,
   fn: async () => {
     // `f`/`g`/`ss` infer exactly their annotation; `widen` (i32 body → i64),
@@ -222,16 +222,11 @@ Deno.test({
     if (!hits[0].includes("`f`") || !hits[1].includes("`g`") || !hits[2].includes("`ss`")) {
       throw new Error(`expected f + g + ss, got:\n${hits.join("\n")}`);
     }
+    // The hint stands, but `--fix` keeps every return annotation: a signature is
+    // documentation even on a private helper (diderven DV-103, DV-302, DV-503).
     const r = await fix(src);
-    if (!r.after.includes("function f(a: i32, b: i32) { b }")) {
-      throw new Error(`f's return not removed:\n${r.after}`);
-    }
-    if (!r.after.includes("function g() { \"hi\" }")) {
-      throw new Error(`g's return not removed:\n${r.after}`);
-    }
-    // `ss`'s `string[]` return annotation removed; its load-bearing local kept.
-    if (!r.after.includes("function ss() {") || !r.after.includes("const xs: string[] = []")) {
-      throw new Error(`ss's return not removed (or its local was wrongly stripped):\n${r.after}`);
+    if (r.after !== src) {
+      throw new Error(`--fix must leave return annotations alone:\n${r.after}`);
     }
     if (!r.after.includes("function widen(): i64") || !r.after.includes("function gen(self): i32")) {
       throw new Error(`a load-bearing/excluded return was wrongly removed:\n${r.after}`);
