@@ -6,7 +6,15 @@ A test such as `x != null` or `x is T` gives `x` a narrower type in the code tha
 when the test held, and in the code that runs only when it failed. This chapter says which
 tests narrow, where the narrower type holds, and what ends it. The `is` operator itself is
 in [types.md](types.md) §T3.4, and the `match` arm types in [statements.md](statements.md)
-§S7.4.
+§S7.4. A `match` narrows its scrutinee in each arm as that section says. VL has no `?:`
+conditional operator; an `if` with an `else` is an expression and narrows as N3.1 says.
+
+```vl
+function f(x: i32 | null): i32 {
+  if x != null { x } else { 0 }
+}
+print(f(5))   // prints 5
+```
 
 ## N1. Places
 
@@ -56,11 +64,27 @@ function f(x: i32 | string): i32 {
 print(f("abc"))   // prints 3
 ```
 
+`x is T` is true exactly when the value fits `T`, not when its declared type is `T`. A
+record value fits a record type when each of its fields fits that type's field.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+function f(v: A | B): string { if v is B { return "B" } "A" }
+const a: A = { x: 1 }
+print(f(a))   // prints B
+```
+
+> Ruling: owner 2026-10-10 (A), DECISIONS.md §"`is` tests whether the value fits the type"
+> (D3885).
+
 > Status: when `x`'s declared type is a single record type `A`, or `A | null`, and `T` is
-> a record type contained in `A`, `x is T` is `true` whatever the value (D4058).
+> a record type contained in `A`, `x is T` is `true` whatever the value, and the then-branch
+> reads `x.x` at `1 | 2` while it holds `7` (D4058). When `T` contains `x`'s declared
+> type, so that the test always holds, it is refused as one that "can never match" (D4062).
 
 **N2.3** `x is L`, for a literal or a union of literals `L`, narrows a literal union the same
-way. A compare `x == L` against a literal does not narrow `x`.
+way.
 
 ```vl
 type K = "a" | "b" | "c"
@@ -72,8 +96,10 @@ function f(k: K): string {
 print(f("c"))   // prints c
 ```
 
-> Status: `docs/guide/narrowing.md` says `x == L` narrows as `x is L` does, and the
-> compiler does not (D4059).
+> Status: a compare `x == L` against a literal does not narrow `x` today.
+> `docs/guide/narrowing.md` says it narrows as `x is L` does; no ruling settles it (D4059).
+
+Open question (Q10): should `x == L` narrow a literal union as `x is L` does?
 
 **N2.4** A compare of a record's literal-typed field with a literal, `c.kind == "m"`, narrows
 `c` to the members of its union whose field can hold that literal.
@@ -109,12 +135,22 @@ function f(a: i32 | null, b: i32 | null): i32 {
 print(f(2, 3))   // prints 5
 ```
 
-**N2.6** `x?.y is T` narrows `x` to non-null and `x.y` to `T` where it holds.
+**N2.6** `x?.y is T` narrows `x` to non-null and `x.y` to `T` where it holds. `x?.y != null`
+narrows `x` to non-null and `x.y` to its type without `null`.
 
 ```vl
 type I = { y: i32 | string }
 function f(x: I | null): i32 {
   if x?.y is i32 { return x.y + 1 }
+  0
+}
+print(f({ y: 4 }))   // prints 5
+```
+
+```vl
+type I = { y: i32 | null }
+function f(x: I | null): i32 {
+  if x?.y != null { return x.y + 1 }
   0
 }
 print(f({ y: 4 }))   // prints 5
@@ -293,6 +329,32 @@ function f(o: O): i32 {
 }
 ```
 
+```vl
+let v: i32 | null = 1
+function clr() { v = null }
+function outer() { clr() }
+function f(): i32 {
+  if v != null {
+    outer()
+    return v + 1   // refused: 'v' is no longer narrowed to i32: the call to 'outer' on line 6 may reassign it
+  }
+  0
+}
+```
+
+```vl
+let v: i32 | null = 1
+function noop(): i32 { 3 }
+function f(): i32 {
+  if v != null {
+    noop()
+    return v + 1
+  }
+  0
+}
+print(f())   // prints 2
+```
+
 A read later in the same statement as such a call is refused.
 
 > Ruling: owner 2026-09-25 (a), DECISIONS.md §"A call that may reassign a narrowed binding
@@ -343,7 +405,8 @@ function f(o: O): () => i32 {
 }
 ```
 
-> Ruling: owner 2026-09-25 (a), inventory D2407.
+> Ruling: owner 2026-09-25 (a), DECISIONS.md §"A call that may reassign a narrowed binding
+> ends the narrowing", "An escaping closure loses what it captured" (D2407).
 
 > Status: without the `: i32` annotation, the escaping lambda above is reported with two
 > more errors, which name `<error>` and `''` (D4060).

@@ -347,3 +347,65 @@ refused.
 bounds in the wrong order, which is a confident wrong answer. `a until a` has no right
 order to suggest, and no fix the message could name. In real code its bounds are rarely
 both literals, and when they are computed it already runs zero times silently by design.
+
+
+## Q10. Does `x == L` narrow a literal union?
+
+Raised by narrowing.md §N2.3.
+
+**Today.** `x is L` narrows a literal union in both branches. `x == L` narrows neither,
+although a compare of a record's literal field, `c.kind == "m"`, narrows the record
+(narrowing.md §N2.4). The guide says `x == L` narrows; no ruling says so. The only ruling
+that touches it, DECISIONS.md §"A subsumed literal arm COLLAPSES", reads `x is L` as
+`x == L` with narrowing (D4059).
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k == "a" { return "A" }
+  const j: "b" | "c" = k   // refused: cannot assign K to 'j' of type "b" | "c"
+  j
+}
+```
+
+**(a) `x == L` narrows as `x is L` does,** in the then-branch, the else-branch, after a
+guard that exits, and for `!=` reversed.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k == "a" { return "A" }
+  const j: "b" | "c" = k   // would run: `k` is "b" | "c" here
+  j
+}
+```
+
+**(b) Keep it a plain compare.** Only `is` narrows a bare value; the guide changes.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k is "a" { return "A" }
+  const j: "b" | "c" = k
+  j
+}
+```
+
+**Recommendation: (a).** A literal-field compare already narrows the record it belongs to,
+so (b) makes `c.kind == "m"` narrow and `k == "m"` not. The 2026-09-02 ruling already
+treats a literal `is` as the compare. The flow-narrowing ruling (DECISIONS.md §"Flow
+narrowing: per-path facts meet at joins") lists a null test, an `is` test and a
+discriminant compare among the tests that start each branch; a compare with a literal
+would join that list.
+
+(a) has a price. A narrowed literal union refuses a later test or `match` arm for a member
+it has lost, as it does after `is` today. Code that tests `k == "a"` and then matches `"a"`
+again would stop compiling:
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k is "a" { return "A" }
+  match k { "a" => "x", "b" => "y", "c" => "z" }   // refused: match pattern "a" is not a member of "b" | "c"
+}
+```
