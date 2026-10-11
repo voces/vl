@@ -44,6 +44,9 @@ section of `docs/internals/open-rulings.md`, or an inventory row `D<id>`
 
 > Ruling: owner 2026-09-29 (C), DECISIONS.md §"A `boolean` is never a number".
 
+A rule that rests on a guide, a design document or a std convention rather than a ruling
+carries a `Source:` line instead.
+
 The ruling outranks every other source. Where `docs/guide/` or a design doc says otherwise,
 the spec follows the ruling and the guide is out of date.
 
