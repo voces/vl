@@ -5199,7 +5199,14 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
   const et = T.tys[expectedTy]
   // A nullable expected type (`(i32) => i32 | null`, e.g. a map value slot, which is `V | null`)
   // seeds its inner: the right-hand lambda or literal still wants the non-null shape.
-  if et is TyNullable { return seedExpected(u, et.nInner) }
+  // A generic call keeps the whole nullable type, which only a bare `null` argument binds from.
+  if et is TyNullable {
+    const nr = seedExpected(u, et.nInner)
+    if en is Call {
+      if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
+    }
+    return nr
+  }
   if en is FuncDecl {
     if en.fnName == "" {
       if et is TyFunc {
@@ -51516,9 +51523,16 @@ function callNamesGenericDecl(c: Call): boolean {
 // before anything costlier.
 function anyArgIsLitOnly(args: i32[]): boolean {
   for a in args {
-    if argIsLitOnly(a, 4) { return true }
+    if argIsLitOnly(a, 4) || argIsNullLit(a) || argIsStrLit(a) { return true }
   }
   false
+}
+
+// Whether the argument `ix` is a string literal, through parentheses.
+function argIsStrLit(ix: i32): boolean {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  P.nodes[x] is StrLit
 }
 
 // Binds each type parameter of the generic return `ret` from the type the call's destination
@@ -51533,7 +51547,7 @@ function dstBindLitTyParams(
   bTys: i32[],
   outNames: string[],
 ) {
-  const dst = callDstTyOf(ix)
+  const dst = dstForArgs(callDstTyOf(ix), args, ret)
   if dst < 0 || ret < 0 || !anyArgIsLitOnly(args) || !tyHasTyVar(ret) {
     return 0
   }
@@ -51554,6 +51568,33 @@ function dstBindLitTyParams(
     k = k + 1
   }
   0
+}
+
+// Whether `t` is still being inferred: it holds a hole, or is an open `_ | null` slot (D2506).
+function dstTyOpen(t: i32): boolean {
+  if tyHasHole(t) { return true }
+  const d = T.tys[t]
+  if d is TyNullable { return d.nInner < 0 }
+  false
+}
+
+// The destination `dst` a call's arguments bind from: a nullable one only when the return `ret`
+// is a bare type parameter and some argument is a bare `null`, else its non-null type, which a
+// literal adapts to as an annotated one does.
+function dstForArgs(dst: i32, args: i32[], ret: i32): i32 {
+  if dst < 0 || dst >= T.tys.length { return dst }
+  // A destination still being inferred chooses nothing.
+  if dstTyOpen(dst) { return -1 }
+  const t = T.tys[dst]
+  if t is TyNullable {
+    if ret >= 0 && T.tys[ret] is TyVar {
+      for a in args {
+        if argIsNullLit(a) { return dst }
+      }
+    }
+    return t.nInner
+  }
+  dst
 }
 
 // Records each literal argument that bound one of `names` at its parameter's substituted
@@ -51581,9 +51622,10 @@ function dstRetypeLitArgs(
   0
 }
 
-// Whether the destination's `cand` for type parameter `name` replaces the arguments' own
-// binding: every argument binding it is a literal `cand` holds within the literal's kind, and
-// the instance they would choose cannot be delivered to `dst` at the call `ix`.
+// Whether the destination's `cand` for type parameter `name` replaces the arguments' binding at
+// call `ix`: always for a bare `null` beside arguments `cand` holds; for a literal union only
+// when every argument is a literal member of it; otherwise when every argument is a
+// literal `cand` holds in its kind and the arguments' own instance cannot reach `dst` (D4024).
 function dstTyParamAdapts(
   name: string,
   cand: i32,
@@ -51593,36 +51635,51 @@ function dstTyParamAdapts(
   ret: i32,
   dst: i32,
 ): boolean {
-  if cand < 0 || cand == TY_ERR || isVoidTy(cand) || tyHasTyVar(cand) {
+  if (
+    cand < 0
+    || cand == TY_ERR
+    || isVoidTy(cand)
+    || tyHasTyVar(cand)
+    || dstTyOpen(cand)
+  ) {
     return false
   }
-  // A body computing on `T` can leave a literal union, so the destination never binds one
-  // (D3602 is the same escape with the type argument written).
-  if tyIsLitUnionLike(cand, 4) { return false }
+  // A body computing on `T` can leave a literal union (D3602), so only literal members of it
+  // choose one.
+  const litU = tyIsLitUnionLike(cand, 4)
   const one: string[] = [name]
   const oneT: i32[] = [cand]
   let seen = 0
   let own = -1
   let nulls = 0
+  const others: i32[] = []
   let i = 0
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name, 8) {
-      if i < args.length && args[i] >= 0 && argIsNullLit(args[i]) {
-        // A bare `null` binds `T` to the null type, an instance no destination wants: the
-        // destination's binding is taken whenever it holds `null` (DV-402).
-        if !assignable(TY_NULL, substTyDeep(params[i], one, oneT)) {
-          return false
-        }
+      if i >= args.length || args[i] < 0 { return false }
+      const want = substTyDeep(params[i], one, oneT)
+      if argIsNullLit(args[i]) {
+        // A bare `null` binds `T` to the null type (DV-402).
+        if !assignable(TY_NULL, want) { return false }
         nulls = nulls + 1
         seen = seen + 1
         if own < 0 { own = TY_NULL }
         i = i + 1
         continue
       }
-      if i >= args.length || args[i] < 0 || !argIsLitOnly(args[i], 4) {
-        return false
+      if litU {
+        const lt = litTyOfExpr(parenPeelIx(args[i]))
+        if lt < 0 || !assignable(lt, want) { return false }
+        seen = seen + 1
+        if own < 0 { own = widenLitTy(lt) }
+        i = i + 1
+        continue
       }
-      const want = substTyDeep(params[i], one, oneT)
+      if !argIsLitOnly(args[i], 4) {
+        others.push(i)
+        i = i + 1
+        continue
+      }
       const x = parenPeelIx(args[i])
       if x < 0 || x >= P.nodes.length { return false }
       const isCall = P.nodes[x] is Call
@@ -51655,8 +51712,23 @@ function dstTyParamAdapts(
     }
     i = i + 1
   }
+  // A non-literal argument goes along only beside a `null`, and only one the binding holds.
+  if others.length > 0 {
+    if nulls == 0 { return false }
+    for oi in others {
+      const want = substTyDeep(params[oi], one, oneT)
+      const savedQ = inferQuiet
+      inferQuiet = true
+      let at = nodeTyIxOf(args[oi])
+      if at < 0 { at = checkNode(args[oi]) }
+      const ok = at >= 0 && assignable(at, want)
+      inferQuiet = savedQ
+      if !ok { return false }
+    }
+    return true
+  }
   if seen == 0 || own < 0 || tySame(own, cand) { return false }
-  if nulls == seen { return true }
+  if nulls > 0 || litU { return true }
   // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
   // is the program's, and a body doing arithmetic on `T` must keep computing at it.
   const savedQ2 = inferQuiet
