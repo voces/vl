@@ -5,10 +5,15 @@
 // The audit is off in a normal compile; a host arms it and reads back how many identifiers were
 // left at -1, grouped by the node holding them and the pass that last touched them.
 //
+// Three counts: identifiers with no declaration (-1); identifiers filed as builtin although a
+// reachable declaration binds their name; identifiers resolved to a node that does not declare
+// their name (a shadow resolved to the wrong binding).
+//
 // THREE HALVES, each needed for the others to mean anything:
 //
 //   zero   — witnesses whose identifiers are all minted or renamed by a rewrite (a capture
-//            cell, a boxed parameter, a write inside a closure, monomorphized callees) audit 0.
+//            cell, a boxed parameter, a write inside a closure, monomorphized callees), and
+//            plain declarations and shadows, audit 0 in all three counts.
 //   fires  — switching off ONE propagation site (`identAuditDropSet`) makes the count rise on
 //            the witness that site serves, attributed to the pass that owns it. Without this
 //            an audit that stopped walking would pass the zero half quietly.
@@ -40,8 +45,16 @@ const compiled = ignore
 const DROP_NONE = 0;
 const DROP_CBOX_READ = 1;
 const DROP_MONO_CALLEE = 2;
+const DROP_FN_DECL = 3;
+const DROP_LOOP_MOVE = 4;
 
-type Audit = { rc: number; unresolved: number; rows: string[] };
+type Audit = {
+  rc: number;
+  unresolved: number;
+  builtinDeclared: number;
+  misresolved: number;
+  rows: string[];
+};
 
 /** Compile `src` on a fresh instance with the audit armed (naming each identifier). */
 const audit = (src: string, drop: number): Audit => {
@@ -59,7 +72,13 @@ const audit = (src: string, drop: number): Audit => {
     for (let j = 0; j < b.length; j++) b[j] = exp.identAuditRowAt(i, j);
     rows.push(`${new TextDecoder().decode(b)}=${exp.identAuditRowN(i)}`);
   }
-  return { rc, unresolved: exp.identAuditUnresolved(), rows };
+  return {
+    rc,
+    unresolved: exp.identAuditUnresolved(),
+    builtinDeclared: exp.identAuditBuiltinDeclared(),
+    misresolved: exp.identAuditMisresolved(),
+    rows,
+  };
 };
 
 const compiles = (name: string, a: Audit) => {
@@ -129,6 +148,55 @@ const g = id
 print(g("z"))
 `;
 
+// A function and its parameter: both uses resolve to their declarations, not to builtins.
+const P1 = `function f(x: i32): i32 { return x + 1 }
+print(f(2))
+`;
+
+// A call inside a function to a function declared below it.
+const P3 = `function g(): i32 { return f(1) }
+function f(x: i32): i32 { return x * 2 }
+print(g())
+`;
+
+// A parameter shadowing a module const, and a local lambda shadowing a module function.
+const P6 = `const x = 10
+function f(x: i32): i32 { return x + 1 }
+print(f(2))
+print(x)
+`;
+const P7 = `function f(x: i32): i32 { return x + 1 }
+function main() {
+  const f = (y: i32) => y * 100
+  print(f(2))
+}
+main()
+print(f(2))
+`;
+
+// A lambda parameter shadowing the closure's captured `let` (the D2068 fixture's shape).
+const P8 = `function nestedLambda() {
+  let y = 5
+  const g = () => {
+    const m = (y: string) => { print(y) }
+    m("p")
+    y = y + 10
+    print(y)
+  }
+  g()
+}
+nestedLambda()
+`;
+
+// A `for` loop whose value is used moves to a fresh node; its variable's uses follow it.
+const L1 = `function firstOver(xs: i32[], n: i32): i32 | null {
+  for x in xs { if x > n { break x } }
+}
+print(firstOver([1, 5, 9], 4) ?? 0)
+const v = for i in 0 until 10 { if i * i > 20 { break i } } ?? -1
+print(v)
+`;
+
 const ZERO: [string, string][] = [
   ["m01", M01],
   ["m02", M02],
@@ -136,6 +204,12 @@ const ZERO: [string, string][] = [
   ["i05", I05],
   ["u04", U04],
   ["f03", F03],
+  ["p1", P1],
+  ["p3", P3],
+  ["p6", P6],
+  ["p7", P7],
+  ["p8", P8],
+  ["l1", L1],
 ];
 
 Deno.test({
@@ -146,9 +220,9 @@ Deno.test({
     for (const [name, src] of ZERO) {
       const a = audit(src, DROP_NONE);
       compiles(name, a);
-      if (a.unresolved !== 0) {
+      if (a.unresolved + a.builtinDeclared + a.misresolved !== 0) {
         throw new Error(
-          `${name}: want 0 unresolved, got ${a.unresolved}: ${
+          `${name}: want 0 unresolved / builtin although declared / misresolved, got ${a.unresolved} / ${a.builtinDeclared} / ${a.misresolved}: ${
             a.rows.join("; ")
           }`,
         );
@@ -205,6 +279,77 @@ Deno.test({
   ignore,
   fn() {
     firesAt("i05", audit(I05, DROP_MONO_CALLEE), "monomorphize");
+  },
+});
+
+Deno.test({
+  name:
+    "ident audit fires: a function or parameter use with its declaration unrecorded is counted as builtin although declared",
+  ignore,
+  fn() {
+    for (const [name, src] of [["p1", P1], ["p3", P3]]) {
+      const a = audit(src, DROP_FN_DECL);
+      compiles(name, a);
+      const want = ["f", "x"];
+      for (const id of want) {
+        if (
+          !a.rows.some((r) =>
+            r.startsWith("builtin although declared: ") && r.includes(`'${id}'`)
+          )
+        ) {
+          throw new Error(
+            `${name}: want '${id}' counted as builtin although declared, got ${a.builtinDeclared}: ${
+              a.rows.join("; ")
+            }`,
+          );
+        }
+      }
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "ident audit fires: a lambda parameter with its declaration unrecorded is counted as resolved to the captured binding it shadows",
+  ignore,
+  fn() {
+    const a = audit(P8, DROP_FN_DECL);
+    compiles("p8", a);
+    if (
+      !a.rows.some((r) =>
+        r.startsWith("resolved elsewhere: ") && r.includes("'y'")
+      )
+    ) {
+      throw new Error(
+        `p8: want the lambda's 'y' counted as resolved elsewhere, got ${a.misresolved}: ${
+          a.rows.join("; ")
+        }`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "ident audit fires: a loop variable whose loop moved, its uses left behind, is counted as resolved to a non-declaration",
+  ignore,
+  fn() {
+    const a = audit(L1, DROP_LOOP_MOVE);
+    compiles("l1", a);
+    for (const id of ["x", "i"]) {
+      if (
+        !a.rows.some((r) =>
+          r.startsWith("resolved to a non-declaration (IfStmt): ") &&
+          r.includes(`'${id}'`)
+        )
+      ) {
+        throw new Error(
+          `l1: want '${id}' counted as resolved to a non-declaration, got ${a.misresolved}: ${
+            a.rows.join("; ")
+          }`,
+        );
+      }
+    }
   },
 });
 
