@@ -51572,12 +51572,7 @@ function dstBindLitTyParams(
 
 // The generic `FuncDecl` the call `c` names by a plain identifier or a method name, or -1.
 function callGenericDeclIx(c: Call): i32 {
-  let name = calleeIdentName(P.nodes[c.callFn])
-  const cf = P.nodes[c.callFn]
-  if cf is Member { name = cf.memProp }
-  if name == "" { return -1 }
-  let d = fnDeclIx[name] ?? -1
-  if d < 0 { d = lookupFnDeclNode(name) }
+  const d = cwCalleeDeclOf(c.callFn)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = P.nodes[d]
   if dn is FuncDecl {
@@ -51586,12 +51581,73 @@ function callGenericDeclIx(c: Call): i32 {
   -1
 }
 
+// The declared function the call `c` in the generic `d` names, -2 for a compiler intrinsic or
+// `print`, or -1 when the callee is anything else: an alias, a local, a parameter, a field or
+// an index. A body is proven closed only through calls that resolve here.
+function closedCalleeDecl(c: Call, d: i32): i32 {
+  const cf = P.nodes[c.callFn]
+  let name = ""
+  let dx = -1
+  if cf is Ident {
+    name = cf.identName
+    if isReservedIntrinsicName(name) || name == "print" {
+      if !closedNameBound(d, name) { return -2 }
+      return -1
+    }
+    dx = cwFnDeclOf(name)
+  } else if cf is Member {
+    name = cf.memProp
+    dx = cwUfcsDeclOf(c.callFn)
+  }
+  if dx < 0 || dx >= P.nodes.length || closedNameBound(d, name) { return -1 }
+  if P.nodes[dx] is FuncDecl { return dx }
+  -1
+}
+
+// Whether the function `d` binds `name` itself — a parameter, a local, a loop variable or a
+// nested function — so a call spelled `name` there does not reach the declared function.
+function closedNameBound(d: i32, name: string): boolean {
+  if d < 0 || d >= P.nodes.length { return true }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    for p in dn.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parName == name { return true }
+      }
+    }
+    return nodeBindsNameGo(dn.fnBody, name)
+  }
+  true
+}
+
+function nodeBindsNameGo(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == name { return true }
+  } else if n is Param {
+    if n.parName == name { return true }
+  } else if n is FuncDecl {
+    if n.fnName == name { return true }
+  } else if n is ForRange {
+    if n.frVar == name { return true }
+  } else if n is ForIn {
+    if n.fiVar == name || n.fiVar2 == name { return true }
+  }
+  for k in nodeChildren(ix) {
+    if nodeBindsNameGo(k, name) { return true }
+  }
+  false
+}
+
 // Whether `ty` is unknown or mentions a type parameter: a value a generic body may compute on.
 function tyOpenOrTyVar(ty: i32): boolean { ty < 0 || tyHasTyVar(ty) }
 
 // Whether the generic function `d`'s body makes no new value of a type parameter: no operator
-// but a comparison, logic or assignment takes one, no `as` yields one, and each generic it
-// passes one to is closed too. Only such a body keeps a literal-union binding a member (D3602).
+// but a comparison, logic or assignment takes one, no `as` yields one, and every call resolves
+// to a declared function, closed too when generic. Only such a body keeps a literal-union
+// binding a member (D3602).
 function genericBodyClosed(d: i32, depth: i32): boolean {
   if depth > 4 || d < 0 || d >= P.nodes.length { return false }
   const dn = P.nodes[d]
@@ -51627,15 +51683,18 @@ function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
   } else if n is AsExpr {
     if tyOpenOrTyVar(nodeTyIxOf(ix)) { return false }
   } else if n is Call {
-    const g = callGenericDeclIx(n)
-    if g >= 0 && g != d {
-      let passes = false
-      for a in n.callArgs {
-        if tyOpenOrTyVar(nodeTyIxOf(a)) { passes = true }
+    const g = closedCalleeDecl(n, d)
+    if g == -2 { return true }
+    if g < 0 { return false }
+    const gn = P.nodes[g]
+    if gn is FuncDecl {
+      if (
+        gn.fnTyParams.length > 0
+        && g != d
+        && !genericBodyClosed(g, depth + 1)
+      ) {
+        return false
       }
-      const r = ufcsRecvExpr(n)
-      if r >= 0 && tyOpenOrTyVar(nodeTyIxOf(r)) { passes = true }
-      if passes && !genericBodyClosed(g, depth + 1) { return false }
     }
   }
   for k in nodeChildren(ix) {
