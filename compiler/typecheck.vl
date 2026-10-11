@@ -14801,6 +14801,7 @@ function isvalReset() {
   fnLitBindDepth = []
   fnLitBindName = []
   fnLitBindDecl = []
+  fsbReset()
   nlnDiag = []
   nlnMsg = []
   nlnText = []
@@ -14978,6 +14979,7 @@ function collBindPopTo(depth: i32) {
     bindMarkPopTo(fnLitBindDepth, fnLitBindName, depth)
     while fnLitBindDecl.length > fnLitBindName.length { fnLitBindDecl.pop() }
   }
+  fsbPopTo(depth)
 }
 
 // Is `ix` a numeric literal, possibly negated or parenthesised?
@@ -17309,6 +17311,220 @@ function lbiReport() {
   while i < lbiErrMsg.length {
     tErr(lbiErrMsg[i], lbiErrAt[i])
     i = i + 1
+  }
+  0
+}
+
+// D3960 — a `let` seeded with a generic function holds one function at a time, so once a
+// concrete function is written to it every call through it and every delivery of it is held to
+// that function's type. Rows are depth-tagged like `fnLitBind`; a row's payload is its group, and
+// an un-annotated alias of such a binding joins the group of the binding it reads.
+let fsbDepth: i32[] = []
+let fsbName: string[] = []
+let fsbRowGrp: i32[] = []
+// Per group: the concrete function type written to it (-1 until one is) and that write's node.
+let fsbGrpTy: i32[] = []
+let fsbGrpAt: i32[] = []
+// Per use: its group, the node, and the destination type of a delivery (-1 for a call).
+let fsbUseGrp: i32[] = []
+let fsbUseIx: i32[] = []
+let fsbUseDst: i32[] = []
+// Nodes already refused, so a re-checked use or a later write reports once.
+let fsbRefused: {[i32]: boolean} = Map()
+
+function fsbReset() {
+  fsbDepth = []
+  fsbName = []
+  fsbRowGrp = []
+  fsbGrpTy = []
+  fsbGrpAt = []
+  fsbUseGrp = []
+  fsbUseIx = []
+  fsbUseDst = []
+  fsbRefused = Map()
+  0
+}
+
+function fsbPopTo(depth: i32) {
+  const l = fsbDepth.length
+  if l > 0 && fsbDepth[l - 1] >= depth {
+    bindMarkPopTo(fsbDepth, fsbName, depth)
+    while fsbRowGrp.length > fsbName.length { fsbRowGrp.pop() }
+  }
+  0
+}
+
+// The group the name read at `ix` resolves to, through parentheses, or -1.
+function fsbGrpAtNode(ix: i32): i32 {
+  if fsbName.length == 0 || ix < 0 { return -1 }
+  const n = P.nodes[parenPeelIx(ix)]
+  if n is Ident {
+    return bindMarkDeclOf(fsbDepth, fsbName, fsbRowGrp, n.identName)
+  }
+  -1
+}
+
+// Mark the binding `decl` just declared at `depth` with type `bound`: a `let` whose un-annotated
+// initializer is a function value with a type parameter of its own starts a group, and an
+// un-annotated alias of a marked binding joins that binding's group.
+function fsbMark(name: string, depth: i32, decl: i32, bound: i32) {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letType >= 0 || n.letInit < 0 || inferQuiet { return 0 }
+    let g = fsbGrpAtNode(n.letInit)
+    if g < 0 {
+      if n.letKw != "let" || bound < 0 || bound >= T.tys.length { return 0 }
+      const bt = T.tys[bound]
+      if !(bt is TyFunc) || !tyHasTyVar(bound) || tyHasInferHole(bound, 0) {
+        return 0
+      }
+      g = fsbGrpTy.length
+      fsbGrpTy.push(-1)
+      fsbGrpAt.push(-1)
+    }
+    bindMarkPush(fsbDepth, fsbName, name, depth)
+    fsbRowGrp.push(g)
+  }
+  0
+}
+
+// A write of `rt` into the binding `tgt` names. The first concrete function written fixes the
+// group's type and re-grades the uses already seen; a later one must fit it.
+function fsbNoteStore(tgt: i32, rt: i32, ix: i32) {
+  if inferQuiet || rt < 0 || rt >= T.tys.length { return 0 }
+  const g = fsbGrpAtNode(tgt)
+  if g < 0 { return 0 }
+  const t = T.tys[rt]
+  if !(t is TyFunc) || tyHasTyVar(rt) { return 0 }
+  const held = fsbGrpTy[g]
+  if held < 0 {
+    fsbGrpTy[g] = rt
+    fsbGrpAt[g] = ix
+    let i = 0
+    while i < fsbUseGrp.length {
+      if fsbUseGrp[i] == g { fsbCheckUse(g, fsbUseIx[i], fsbUseDst[i]) }
+      i = i + 1
+    }
+  } else if !assignable(rt, held) && !(fsbRefused[ix] ?? false) {
+    fsbRefused[ix] = true
+    tErr(
+      "cannot assign "
+        + tyToStr(rt)
+        + " to `"
+        + fsbBindName(tgt)
+        + "`, which holds "
+        + tyToStr(held)
+        + " since the write on "
+        + rcwWhere(fsbGrpAt[g], ix)
+        + " — a binding holds one function type",
+      ix,
+    )
+  }
+  0
+}
+
+function fsbBindName(ix: i32): string {
+  const n = P.nodes[parenPeelIx(ix)]
+  if n is Ident { return n.identName }
+  "?"
+}
+
+// A call through, or a delivery of, a marked binding: graded now when its group's type is known,
+// and recorded so a later write re-grades it.
+function fsbNoteUse(g: i32, ix: i32, dst: i32) {
+  if inferQuiet || g < 0 { return 0 }
+  fsbUseGrp.push(g)
+  fsbUseIx.push(ix)
+  fsbUseDst.push(dst)
+  if fsbGrpTy[g] >= 0 { fsbCheckUse(g, ix, dst) }
+  0
+}
+
+// The callee of call `ix` when it is a marked binding.
+function fsbNoteCall(n: Call, ix: i32) {
+  if fsbName.length == 0 || inferQuiet { return 0 }
+  fsbNoteUse(fsbGrpAtNode(n.callFn), ix, -1)
+  0
+}
+
+// Grade one use against the group's function type: a delivery's destination must take it, and a
+// call's arguments must fit its parameters. An argument typed by an enclosing generic's type
+// parameter is left for the instantiation to re-ask (`noteLetCstr`).
+function fsbCheckUse(g: i32, ix: i32, dst: i32) {
+  if fsbRefused[ix] ?? false { return 0 }
+  const held = fsbGrpTy[g]
+  if dst >= 0 {
+    if tyHasTyVar(dst) || assignable(held, dst) { return 0 }
+    fsbRefused[ix] = true
+    tErr(
+      "cannot assign "
+        + tyToStr(held)
+        + " to "
+        + tyToStr(dst)
+        + " — `"
+        + fsbBindName(ix)
+        + "` holds "
+        + tyToStr(held)
+        + " since the write on "
+        + rcwWhere(fsbGrpAt[g], ix),
+      ix,
+    )
+    return 0
+  }
+  const c = P.nodes[ix]
+  const ft = T.tys[held]
+  if c is Call {
+    if ft is TyFunc {
+      if hasNamedArgs(c.callArgNames) { return 0 }
+      const callee = fsbBindName(c.callFn)
+      const since = " since the write on " + rcwWhere(fsbGrpAt[g], ix)
+      if c.callArgs.length != ft.fnParamTypes.length {
+        fsbRefused[ix] = true
+        tErr(
+          "`"
+            + callee
+            + "` holds "
+            + tyToStr(held)
+            + since
+            + ", which takes "
+            + i32ToStr(ft.fnParamTypes.length)
+            + " argument(s), and this call passes "
+            + i32ToStr(c.callArgs.length),
+          ix,
+        )
+        return 0
+      }
+      let i = 0
+      while i < c.callArgs.length {
+        const a = c.callArgs[i]
+        const at = nodeTyIxOf(a)
+        const pt = ft.fnParamTypes[i]
+        const an = P.nodes[a]
+        if at >= 0 && pt >= 0 && !(an is Spread) {
+          if tyHasTyVar(at) {
+            noteLetCstr(at, pt, a, "")
+          } else if !assignable(at, pt) {
+            fsbRefused[ix] = true
+            tErr(
+              "argument "
+                + i32ToStr(i + 1)
+                + ": expected "
+                + tyToStr(pt)
+                + ", got "
+                + tyToStr(widenLitTy(at))
+                + " — `"
+                + callee
+                + "` holds "
+                + tyToStr(held)
+                + since,
+              a,
+            )
+            return 0
+          }
+        }
+        i = i + 1
+      }
+    }
   }
   0
 }
@@ -23879,6 +24095,9 @@ function binShiftOp(op: string): boolean {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
+  if fsbName.length > 0 && srcExpr >= 0 {
+    fsbNoteUse(fsbGrpAtNode(srcExpr), srcExpr, dstTy)
+  }
   if numUnionMinted && numUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
     return true
   }
@@ -56208,6 +56427,7 @@ function checkNodeReal(ix: i32) {
     // Named arguments run in parameter order, so no fact may reach a pop among them (D3558).
     if neKeys.length > 0 && crIsNamedCall(ix) { neKill("") }
     const callTy = checkCallNode(n, ix)
+    fsbNoteCall(n, ix)
     if numUnionMinted { njNoteHeldCall(n, ix, callTy) }
     // A call is where a path narrowing can be falsified by a write the guarded
     // scope never spells. Asked after the arguments are checked so the call's own
@@ -64751,6 +64971,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // The narrowing is a path fact, and a falsifying write ends the path — only an accepted
     // write retires it, since a rejected write did not happen and would cascade a second diagnostic.
     if asgOk { retireNarrowingsForWrite(n.binLeft, rt, ix, asgPreTy) }
+    if asgOk && fsbName.length > 0 { fsbNoteStore(n.binLeft, rt, ix) }
     // Assignment is an expression yielding its right-hand side (host parity;
     // DECISIONS: assignment-as-expression). A right side only the expression seam admits
     // (`[3.5, 4]` into `(i32 | f64)[]`) is built at the place's type, so it yields that (D2394).
@@ -65788,6 +66009,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   }
   if !preHoisted { lbiMark(n.letName, T.scopes.length - 1, ix, bound) }
   if !preHoisted { markFnLitBinding(n.letName, T.scopes.length - 1, ix) }
+  fsbMark(n.letName, T.scopes.length - 1, ix, bound)
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.
   if annotCollapsedHere {
