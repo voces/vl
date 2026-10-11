@@ -17502,6 +17502,10 @@ function fsbRefuse(decl: i32, rt: i32, ix: i32) {
   )
 }
 
+// One rewrite round reaches one more link of a forwarding chain; a chain longer than this is
+// declined whole, and keeps the refusal.
+const WS_MAX_ROUNDS = 8
+
 // D3992 — a record of a wider shape passed to a function's parameter of a declared record type
 // is legal (no field changes type, so the shared value keeps every invariant), and is lowered by
 // making that parameter generic: the function is re-checked as `f<__W0>(p: __W0)` and each
@@ -17519,6 +17523,9 @@ let wsBodyErr: {[i32]: boolean} = Map()
 let wsValueRead: {[string]: boolean} = Map()
 // Set while an argument a rewrite serves is delivered, so the width refusal stays quiet.
 let wsSuppress = false
+// Rewritten declarations an instance refused something in this pass: the declared parameter
+// accepted it, so the refusal is the rewrite's, and the rewrite is undone.
+let wsInstErr: i32[] = []
 
 function wsReset() {
   wsDecl = []
@@ -17534,7 +17541,106 @@ function wsPassReset() {
   wsBodyErr = Map()
   wsValueRead = Map()
   wsSuppress = false
+  wsInstErr = []
   0
+}
+
+// Whether `t` is the type parameter a rewrite gave a parameter.
+function wsVarTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const v = T.tys[t]
+  if v is TyVar { return v.tvName.length > 3 && v.tvName.slice(0, 3) == "__W" }
+  false
+}
+
+// Note an instance refusal at a call of declaration `d`, when a rewrite made it generic.
+function wsNoteInstErr(d: i32) {
+  if d < 0 || i32ListHas(wsInstErr, d) { return 0 }
+  let k = 0
+  while k < wsDecl.length {
+    if wsDecl[k] == d {
+      wsInstErr.push(d)
+      return 0
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Restore the declared parameters of every declaration noted in `wsInstErr` and decline it.
+// Answers how many it restored.
+function wsUndoInstErr(): i32 {
+  let done = 0
+  for d in wsInstErr {
+    const fd = P.nodes[d]
+    let k = 0
+    while k < wsDecl.length {
+      if wsDecl[k] == d && fd is FuncDecl && wsParam[k] < fd.fnParams.length {
+        const pi = fd.fnParams[wsParam[k]]
+        const pn = P.nodes[pi]
+        if pn is Param {
+          P.nodes[pi] = {
+            parName: pn.parName,
+            parType: wsOrigAnn[k],
+            parDefault: pn.parDefault,
+            parOpt: pn.parOpt,
+            parRest: pn.parRest,
+            pos: pn.pos,
+          }
+        }
+        const nm = "__W" + i32ToStr(wsParam[k])
+        const tps: string[] = []
+        const cur = P.nodes[d]
+        if cur is FuncDecl {
+          for t in cur.fnTyParams {
+            if t != nm { tps.push(t) }
+          }
+          P.nodes[d] = {
+            fnName: cur.fnName,
+            fnTyParams: tps,
+            fnParams: cur.fnParams,
+            fnRet: cur.fnRet,
+            fnBody: cur.fnBody,
+            pos: cur.pos,
+          }
+        }
+        wsDecl[k] = -1
+        done = done + 1
+      }
+      k = k + 1
+    }
+    if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
+  }
+  wsInstErr = []
+  if done > 0 {
+    const kd: i32[] = []
+    const kp: i32[] = []
+    const ka: i32[] = []
+    let r = 0
+    while r < wsDecl.length {
+      if wsDecl[r] >= 0 {
+        kd.push(wsDecl[r])
+        kp.push(wsParam[r])
+        ka.push(wsOrigAnn[r])
+      }
+      r = r + 1
+    }
+    wsDecl = kd
+    wsParam = kp
+    wsOrigAnn = ka
+  }
+  done
+}
+
+// One rewrite step: apply the pending rewrites, or, when there are none, undo the ones an
+// instance refused. A refusal in a pass with rewrites pending may be one they serve.
+function wsStep(): i32 {
+  const applied = wsApplyPending()
+  if applied > 0 {
+    wsInstErr = []
+    return applied
+  }
+  wsUndoInstErr()
 }
 
 // The rewrite row of parameter `i` of declaration `d`, or -1.
@@ -17626,7 +17732,19 @@ function wsCandidate(
     }
     j = j + 1
   }
+  if fd.fnRet < 0 { return wsInferredRetPrim(fd.fnName) }
   !wsAnnMentions(fd.fnRet, ann.tyName)
+}
+
+// Whether the un-annotated return of top-level function `name` is inferred as a primitive. Any
+// other return may carry the parameter's record out, which the rewrite would retype.
+function wsInferredRetPrim(name: string): boolean {
+  if name == "" { return false }
+  const h = lookup(name)
+  if h < 0 || h >= T.tys.length { return false }
+  const ht = T.tys[h]
+  if ht is TyFunc { return tyIsPrimIx(ht.fnRet) }
+  false
 }
 
 // Whether `s` is a bare identifier, the spelling of a declared type's name.
@@ -24359,6 +24477,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if assignable(srcTy, dstTy) {
     if !inferQuiet && srcExpr >= 0 { genFnValueCstrs(srcExpr, srcTy, dstTy) }
     if fvaAdapt(srcExpr, srcTy, dstTy) { return true }
+    // The constraint probe records a hole delivery's pin as well, so a caller whose body is
+    // checked before this one still re-asks it at its own pins.
+    if cstrProbe && srcExpr >= 0 { rcwPinProbe(srcExpr, srcTy, dstTy) }
     // The object-shape floor. `assignable` accepts structural subtyping between two object shapes
     // and the emitter has no adapter for it (`objShapeAdapterless`), so the pair would reach codegen
     // and fail there on a file `vl check` reports clean. It belongs at this seam, the one every
@@ -36053,11 +36174,20 @@ function rcwPinNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   0
 }
 
+// `rcwPend`'s pin half, for the constraint probe, which records nothing else.
+function rcwPinProbe(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy < 0 || srcTy >= T.tys.length || dstTy < 0 { return 0 }
+  if T.tys[srcTy] is TyVar && rcwIsRefTy(dstTy) && cstrOwnerTop() >= 0 {
+    rcwPinNote(srcExpr, srcTy, dstTy)
+  }
+  0
+}
+
 // The deliveries `calleeFn`'s body recorded at a hole, at this call's bindings: a source the pin
 // makes concrete is asked the direct spelling's record rules, and one still open is recorded
 // for the caller's pins.
 function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
-  if inferQuiet { return 0 }
+  if inferQuiet && !cstrProbe { return 0 }
   const n = rcwPinSrc.length
   let i = 0
   while i < n {
@@ -36068,7 +36198,7 @@ function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
           if T.tys[sub] is TyVar && cstrOwnerTop() >= 0 {
             rcwPinNote(rcwPinSrc[i], sub, rcwPinDstTy[i])
           }
-        } else if assignable(sub, rcwPinDstTy[i]) {
+        } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
           // The delivery seam's two record rules, in its order: a shape stored differently,
           // then a widened field something writes.
           if objShapeAdapterlessAt(rcwPinSrc[i], sub, rcwPinDstTy[i]) {
@@ -41284,6 +41414,10 @@ function softenBareLitTy(ty: i32): i32 {
 function noteBinCstr(lt: i32, op: string, rt: i32) {
   if tyHasHole(lt) || tyHasHole(rt) {
     const owner = cstrOwnerTop()
+    // An identity comparison of a rewritten parameter would compare two struct types.
+    if (op == "==" || op == "!=") && (wsVarTy(lt) || wsVarTy(rt)) {
+      wsNoteInstErr(owner)
+    }
     // A structurally equal constraint of the same body is the same constraint: a call's
     // substitution mints fresh arena copies, and keying on the index alone let each copy of a
     // callee's constraints re-record in every caller, exponential over a cycle of generics (D2757).
@@ -50515,6 +50649,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     } else {
       substNestMode = SUBST_ALL
     }
+    const wsVd = T.diags.length
     pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
     validateBinCstrs(
       vNames,
@@ -50562,6 +50697,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
     validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateRcwPins(vNames, vTys, cstrCallee)
+    if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
     substNestMode = modeWas
     substNestDecl = declWas
     // Not a validation: the `??` result holes are substituted here for their BANK, which is
@@ -58667,7 +58803,7 @@ export function checkProgram(rootIx: i32) {
   if expParamInfer() > 0 { checkProgramAgain(rootIx) }
   // A parameter a wider record is passed to is made generic and the program re-checked (D3992).
   let wsRounds = 0
-  while wsRounds < 4 && wsApplyPending() > 0 {
+  while wsRounds < WS_MAX_ROUNDS && wsStep() > 0 {
     checkProgramAgain(rootIx)
     wsRounds = wsRounds + 1
   }
@@ -58689,10 +58825,11 @@ export function checkProgram(rootIx: i32) {
   }
   // A rewrite still pending after the last pass quieted a refusal nothing will apply: decline it
   // and re-check, so the refusal is reported (D3992).
-  if wsPendDecl.length > 0 {
+  if wsPendDecl.length > 0 || wsInstErr.length > 0 {
     for d in wsPendDecl {
       if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
     }
+    wsUndoInstErr()
     checkProgramAgain(rootIx)
   }
   symFlushPending()
