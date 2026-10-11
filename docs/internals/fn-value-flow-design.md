@@ -180,9 +180,11 @@ point, and nothing else writes the column.
    - A caller that cannot name the declaration passes -1, and the audit counts that node as
      unresolved. A rename therefore cannot leave a stale entry: it updates the column or
      the audit fires.
-   - A rename that keeps the binding passes the node's own current entry. These are
-     `shadowRespell`'s `name$s<n>` and `extvRespellIn`'s `nm$extv`. The forwarding function
-     is the new declaration.
+   - A rename that keeps the binding passes the node's own current entry. That is
+     `shadowRespell`'s `name$s<n>`.
+   - A rename that CHANGES the binding passes the new declaration. `extvRespellIn`'s
+     `nm$extv` is one: the read now names the forwarding FuncDecl `<name>$extv`, not the
+     extern. It passes that FuncDecl, which becomes the read's class source.
 
 **The creation sites, before and after mono:**
 
@@ -207,9 +209,17 @@ point, and nothing else writes the column.
   - `monoRespellLamAlias`.
 
   The rules:
-  - **An instance's Param** gets `declOrig[instParam] = templateParam`. Reads inside the
-    instance body resolve to the instance Param, never to the template's, so two instances
-    of one generic never share a parameter slot.
+  - **An instance's Param** gets `declOrig[instParam] = templateParam`.
+    - A read on a cloned statement spine resolves to the instance Param.
+    - A LEAF Ident is shared between the template body and every instance (§ "Leaf lambdas
+      shared across instances"). It keeps the TEMPLATE Param in `identDeclIx`, and it maps
+      to the instance Param through `(node, inst)`: the instance's `declOrig` inverse,
+      `instParamOf(templateParam, inst)`. So two instances of one generic never share a
+      parameter slot, although they share the leaf node.
+    - **The audit cannot catch a dropped `(node, inst)` mapping.** The leaf still has an
+      entry, the template's, so it counts as resolved. A dropped mapping shows up instead as
+      a wrong class at run time. The keep-running list's m-programs (m01–m05, which capture
+      and write through instance bodies) are the guard, run at every step.
   - **An instance's LetDecl** (`monoCloneBodyRaw`'s `mkLet`) gets `declOrig[clone] = orig`.
     `recordClonedNodeTy*` is the precedent.
   - **A callee respelled to an instance name** (`cal.identName = instName`) passes the
@@ -264,6 +274,9 @@ inside a generic body is one node for every instance. Its flow entry is keyed by
 - The pins of the lambda's class may mention the enclosing type parameters. They are
   stored symbolically and substituted per instance, so `fnFlowSigAt(node, inst)` is a pure
   read.
+- A leaf Ident inside the lambda that reads an enclosing parameter resolves the same way:
+  the column holds the template Param, and `(node, inst)` maps it to the instance's Param
+  (§ "The creation sites").
 - `inst` is the instance key. Until the survey's L1(b) lands, it is the instance's
   FuncDecl clone index, the `fe` mono already mints. Afterwards it is L1's tuple of type
   ids, and nothing in the table changes except the key's type.
@@ -308,6 +321,13 @@ the same output, after every step. Witnesses are in `~/.claude/vl-tools/witnesse
 | i01, i09 | `==` on function values (concrete, and two bindings of `id`) | `true`; `true 1 s` |
 | p05, p07, p10 | record field write, nullable slot, map-index write of a generic | `9`; `4`; `2` |
 | c02, c04, c06, c08, c08b, c08c | the concrete controls of p02, p04, p06, p08 | as today |
+
+Two programs that do NOT run today, and that the interim rule keeps as they are:
+
+- **w01:** `let f = id; f = id`, called at two types. It is an emit reject today. It is a
+  WRITTEN class with two pins, so it stays refused, and §(g) decides it.
+- **w02:** `let f = id; f(1); f = dbl`. It is a check reject under ruling C, which makes it
+  DESIGN, and it is unchanged.
 
 The d3960 matrix's 99 `runs` cells are on the list too, along with every `tests/cases`
 fixture. `regress.py` covers the corpus.
