@@ -17893,14 +17893,53 @@ function fsbPopTo(depth: i32) {
   0
 }
 
-// The declaration of the marked binding the name read at `ix` resolves to, or -1.
+// The declaration of the marked binding the name read at `ix` resolves to, or -1. A marked list
+// is reached only through an element, `fs[i]`, which stands for every function written to it.
 function fsbDeclAtNode(ix: i32): i32 {
   if fsbName.length == 0 || ix < 0 { return -1 }
-  const n = P.nodes[parenPeelIx(ix)]
-  if n is Ident {
-    return bindMarkDeclOf(fsbDepth, fsbName, fsbRowDecl, n.identName)
+  const p = parenPeelIx(ix)
+  const e = fsbElemBase(p)
+  if e >= 0 {
+    const ld = bindMarkDeclOf(fsbDepth, fsbName, fsbRowDecl, identNameAt(e))
+    if ld >= 0 && fsbDeclIsList(ld) { return ld }
+    return -1
   }
+  const d = bindMarkDeclOf(fsbDepth, fsbName, fsbRowDecl, identNameAt(p))
+  if d >= 0 && fsbDeclIsList(d) { return -1 }
+  d
+}
+
+// The list the element read `a[i]` at `p` indexes, or -1 when `p` is not an element read.
+function fsbElemBase(p: i32): i32 {
+  const n = P.nodes[p]
+  if n is Index { return parenPeelIx(n.idxArr) }
   -1
+}
+
+// Whether the marked binding `decl` is a list of functions rather than a function.
+function fsbDeclIsList(decl: i32): boolean {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letInit >= 0 && P.nodes[parenPeelIx(n.letInit)] is ArrayLit {
+      return true
+    }
+  }
+  false
+}
+
+// Whether the un-annotated list literal `init`, of type `bound`, holds a generic function value.
+function fsbIsGenericList(init: i32, bound: i32): boolean {
+  const bt = T.tys[bound]
+  if !(bt is TyArray) { return false }
+  const et = bt.aElem
+  if et < 0 || et >= T.tys.length || !(T.tys[et] is TyFunc) { return false }
+  const a = P.nodes[parenPeelIx(init)]
+  if a is ArrayLit {
+    for e in a.arrElems {
+      if fsbIsGeneric(e, nodeTyIxOf(e)) { return true }
+    }
+  }
+  false
 }
 
 // Whether the function value `ix` of type `ty` is generic: its type has a type variable of its
@@ -17983,10 +18022,15 @@ function fsbTvsAllInScope(tys: i32[], depth: i32): boolean {
 function fsbMark(name: string, depth: i32, decl: i32, bound: i32) {
   const n = P.nodes[decl]
   if n is LetDecl {
-    if n.letKw != "let" || n.letType >= 0 || n.letInit < 0 || inferQuiet {
+    if n.letType >= 0 || n.letInit < 0 || inferQuiet { return 0 }
+    if bound < 0 || bound >= T.tys.length { return 0 }
+    // A list's elements are written whatever its keyword; its writes are re-asked, not refused.
+    if fsbIsGenericList(n.letInit, bound) {
+      bindMarkPush(fsbDepth, fsbName, name, depth)
+      fsbRowDecl.push(decl)
       return 0
     }
-    if bound < 0 || bound >= T.tys.length { return 0 }
+    if n.letKw != "let" { return 0 }
     const bt = T.tys[bound]
     if !(bt is TyFunc) || !fsbIsGeneric(n.letInit, bound) { return 0 }
     bindMarkPush(fsbDepth, fsbName, name, depth)
@@ -18012,6 +18056,7 @@ function fsbNoteStore(tgt: i32, rhs: i32, rt: i32, ix: i32) {
   if !(t is TyFunc) { return 0 }
   if fsbIsGeneric(rhs, rt) { return fsbNoteOwner(fsbDeclAtNode(tgt), rhs, rt) }
   const d = fsbDeclAtNode(tgt)
+  if d >= 0 && fsbDeclIsList(d) { return 0 }
   if d >= 0 { return fsbRefuse(d, rt, ix) }
   const g = P.nodes[parenPeelIx(tgt)]
   if g is Ident {
