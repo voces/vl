@@ -9509,6 +9509,99 @@ function monoCoerceAliasOfCell(
   monoCoerceWrittenCell(monoCellReadName(ar[0]), ar[0], ar[1], tname)
 }
 
+// Whether node `v`, read in frame `ctx`, is a name `monoAliasCellRead` resolves to a cell.
+function monoNamesCellAlias(v: i32, ctx: i32): boolean {
+  const x = unwrapParen(v)
+  if x < 0 { return false }
+  const nm = monoIdentNameOf(x)
+  nm != "" && monoAliasCellRead(nm, x, ctx)[0] >= 0
+}
+
+// The list literal a `const` initializes, walked while its reads are all element calls.
+let monoCellAliasListOk = 0 - 1
+
+// Whether node `v` is a program's list literal holding an alias of a capture cell's read.
+function monoListInitHoldsCellAlias(v: i32, ctx: i32): boolean {
+  if v < 0 { return false }
+  const lit = P.nodes[v]
+  if !(lit is ArrayLit) || lit.pos < 0 { return false }
+  for e in lit.arrElems {
+    if monoNamesCellAlias(e, ctx) { return true }
+  }
+  false
+}
+
+// Whether every read of `name` in frame `fx`'s body is the callee of a call of one element at a
+// literal index (`name[0](…)`).
+function monoListOnlyCalled(fx: i32, name: string): boolean {
+  const stack: i32[] = []
+  const called: i32[] = []
+  if fx >= 0 {
+    const b = monoNestedBodyOf(fx)
+    if b < 0 { return false }
+    stack.push(b)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const c = P.nodes[n.callFn]
+        if c is Index {
+          const a = P.nodes[c.idxArr]
+          const k = P.nodes[c.idxIndex]
+          if a is Ident && k is NumLit {
+            if a.identName == name { called.push(c.idxArr) }
+          }
+        }
+      }
+      if n is Ident {
+        if n.identName == name && !i32ListHas(called, ix) { return false }
+      }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  true
+}
+
+// For a callee `fs[k]` whose list `fs` a `const` initializes with a literal whose element `k`
+// is an alias of a capture cell's read: that read as `[read, frame]`; `[-1, -1]` otherwise.
+function monoListElemCellRead(callee: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  const c = P.nodes[callee]
+  if !(c is Index) { return none }
+  const a = P.nodes[c.idxArr]
+  const k = P.nodes[c.idxIndex]
+  if !(a is Ident) || !(k is NumLit) { return none }
+  const lf = monoLetFrameOf(a.identName, c.idxArr, ctx)
+  if lf[1] < 0 { return none }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letKw != "const" || d.letInit < 0 { return none }
+  const lit = P.nodes[d.letInit]
+  if !(lit is ArrayLit) || lit.pos < 0 { return none }
+  let at = 0
+  while at < lit.arrElems.length && i32ToStr(at) != k.numText { at = at + 1 }
+  if at >= lit.arrElems.length { return none }
+  const e = unwrapParen(lit.arrElems[at])
+  const nm = monoIdentNameOf(e)
+  if nm == "" { return none }
+  monoAliasCellRead(nm, e, lf[0])
+}
+
+// The refusal for an alias of a capture cell's read stored in a list, at node `at`.
+function monoCellAliasListFail(at: i32): i32 {
+  emitFailAt(
+    "emitProgram: an alias of a captured, reassigned function binding is stored in a list, "
+      + "whose calls the binding's one signature cannot follow — store the binding's value in "
+      + "an annotated local first, or call it directly",
+    at,
+  )
+}
+
 // The capture cell read `[read, frame]` that the name read at `at` in frame `ctx` reaches through
 // a chain of un-annotated aliases never written after their initializer; `[-1, -1]` for none.
 function monoAliasCellRead(name: string, at: i32, ctx: i32): i32[] {
@@ -11645,6 +11738,12 @@ function monoWalk(ix: i32, ctx: i32) {
       }
       return 0
     }
+    // A call of a list element that is an alias of a capture cell's read is a call through it.
+    const le = monoListElemCellRead(n.callFn, ctx)
+    if le[0] >= 0 {
+      const an = monoCellReadName(le[0])
+      if monoCellCall(n, ix, an, le[0], le[1], ctx, true) < 0 { return -1 }
+    }
     // A call through the capture cell of a `let` alias of a hole lambda (D3845).
     const cellNm = monoCellReadName(n.callFn)
     if cellNm != "" {
@@ -11666,6 +11765,14 @@ function monoWalk(ix: i32, ctx: i32) {
     return 0
   }
   if n is LetDecl {
+    // A list holding an alias of a capture cell's read is followed only where every read of it
+    // is a call of one element (`fs[0](…)`), which is taken through the cell.
+    if monoListInitHoldsCellAlias(n.letInit, ctx) {
+      if n.letKw != "const" || !monoListOnlyCalled(ctx, n.letName) {
+        return monoCellAliasListFail(n.letInit)
+      }
+      monoCellAliasListOk = n.letInit
+    }
     // An annotated function-typed binding to a generic named function: materialize the
     // instance for the annotation's param types and point the binding at it, so the value
     // carries that concrete type independent of any call — it may escape where call-driven
@@ -11756,6 +11863,15 @@ function monoWalk(ix: i32, ctx: i32) {
     const es = n.arrElems
     let i3 = 0
     while i3 < es.length {
+      // An alias of a capture cell's read in a program's list is called through the list, which
+      // the cell path does not follow, so it cannot be held to the cell's one signature.
+      if (
+        n.pos >= 0
+        && ix != monoCellAliasListOk
+        && monoNamesCellAlias(es[i3], ctx)
+      ) {
+        return monoCellAliasListFail(es[i3])
+      }
       if monoWalk(es[i3], ctx) < 0 { return -1 }
       i3 = i3 + 1
     }
