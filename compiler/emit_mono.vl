@@ -9358,6 +9358,8 @@ function monoCoerceFnValueName(
     // escaping lambda binding materializes at the boundary type too.
     // A reassigned `let` is read as itself: the generic functions written into it take this type.
     if monoCoerceWrittenLet(e.identName, exprIx, ctx, tname) { return 0 }
+    // An alias of a capture cell's read delivers that cell (D3948).
+    if monoCoerceAliasOfCell(e.identName, exprIx, ctx, tname) { return 0 }
     let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
     // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
     if gfe < 0 { gfe = monoGenFnAliasChainFe(e.identName, exprIx, ctx) }
@@ -9448,6 +9450,36 @@ function monoCellSeedGenFe(name: string, at: i32, ctx: i32): i32 {
   fe
 }
 
+// The hole lambda the capture cell `name` read at `at` is seeded with, as a slot; -1 for any
+// other seed. Read off the seed itself, since the binding's writes make its alias chain decline.
+function monoCellSeedLamFe(name: string, at: i32, ctx: i32): i32 {
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 { return -1 }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return -1 }
+  const cel = monoGeneratedCellElem(d.letInit)
+  if cel < 0 { return -1 }
+  const seed = unwrapParen(cel)
+  if seed < 0 { return -1 }
+  const fe = monoLamValueFe(seed, lf[0])
+  if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
+  fe
+}
+
+// Whether the capture cell `name` read at `at` is seeded with a lambda literal, whose call
+// arguments rather than the callee's recorded type give its signature; a lambda reached by name
+// is instanced per use instead.
+function monoCellSeedIsLamLit(name: string, at: i32, ctx: i32): boolean {
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 { return false }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) { return false }
+  const cel = monoGeneratedCellElem(d.letInit)
+  if cel < 0 { return false }
+  const seed = unwrapParen(cel)
+  seed >= 0 && P.nodes[seed] is FuncDecl
+}
+
 // A function type spelling whose parameters are the pins of signature `sig` (`p1,p2,;`); the
 // return is not read by the coercions this feeds. "" for an empty signature.
 function monoSigFnTyName(sig: string): string {
@@ -9460,6 +9492,40 @@ function monoSigFnTyName(sig: string): string {
     first = false
   }
   out + ")=>void"
+}
+
+// For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
+// after their initializer ends at a capture cell's read (`const r = k[0]`): coerces that cell at
+// `tname` as `monoCoerceWrittenCell` does, and answers true when it finds one.
+function monoCoerceAliasOfCell(
+  name: string,
+  at: i32,
+  ctx: i32,
+  tname: string,
+): boolean {
+  if annArrowAt(tname) < 1 { return false }
+  let nm = name
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    const lf = monoLetFrameOf(nm, ax, fr)
+    if lf[1] < 0 { return false }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return false }
+    if d.letKw != "const" && monoNameIsAssigned(nm) { return false }
+    const iv = unwrapParen(d.letInit)
+    if iv < 0 { return false }
+    const cn = monoCellReadName(iv)
+    if cn != "" { return monoCoerceWrittenCell(cn, iv, lf[0], tname) }
+    const nx = monoIdentNameOf(iv)
+    if nx == "" { return false }
+    nm = nx
+    ax = iv
+    fr = lf[0]
+    hops = hops + 1
+  }
+  false
 }
 
 // The walk both share: `key` is `n:` for writes of the name, `c:` for writes of its cell.
@@ -9606,6 +9672,16 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
   // A hole lambda holds one signature, whichever instance or cell writes it.
   const lfe = monoLamValueFe(x, ctx)
   if lfe >= 0 {
+    // A hole lambda written as a literal is pinned at this type, as a call through the cell pins
+    // it (D3950); the pin annotates it in place, so its parameters are read as first seen.
+    if P.nodes[x] is FuncDecl && monoLamIsHole(lfe) {
+      if !monoCellSigRecord(monoOrigNode[lfe], tname) { return 1 }
+      if lfe < monoGen.length && monoGen[lfe] == 1 {
+        return monoCellLamTake(lfe, x, tname, ctx)
+      }
+      return 0
+    }
+    // One reached by name keeps its binding's rules (D3857), with one signature per lambda.
     const key = monoLamSigKey(lfe)
     if !monoCellSigRecord(key, tname) { return 1 }
     // A lambda with every parameter annotated has its own type to compare.
@@ -9715,6 +9791,29 @@ function monoLamSigKey(lfe: i32): i32 {
   own
 }
 
+// Lambda slots seen with an un-annotated parameter; a pin annotates it in place, so the first
+// answer is kept.
+let monoHoleLamSlots: {[i32]: boolean} = Map()
+
+// Whether lambda slot `lfe` declares an un-annotated parameter, as first read.
+function monoLamIsHole(lfe: i32): boolean {
+  if monoHoleLamSlots.get(lfe) ?? false { return true }
+  if lfe < 0 || lfe >= monoOrigNode.length { return false }
+  const orig = P.nodes[monoOrigNode[lfe]]
+  if orig is FuncDecl {
+    for pi in orig.fnParams {
+      const pn = P.nodes[pi]
+      if pn is Param {
+        if pn.parType < 0 {
+          monoHoleLamSlots.set(lfe, true)
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
 // Whether `name`, read at `at` in frame `ctx`, is a capture cell the rewrite built rather than a
 // list the program declared.
 function monoNamesGeneratedCell(name: string, at: i32, ctx: i32): boolean {
@@ -9744,6 +9843,37 @@ function monoCellConcreteTake(t: i32, tname: string, open: i32): i32 {
   if !(f is TyFunc) { return 2 }
   const want = monoFnNameSig(tname)
   if want == "" || monoFnNameSig(monoConcreteFnTyName(ft)) != want { return 1 }
+  0
+}
+
+// Pins hole lambda `lfe`, the value at node `x` in frame `ctx`, at function type `tname`, where
+// nothing has yet: 0 when the lambda the cell holds then has that signature (and it is the last
+// instance), 1 when it holds another, 2 when it cannot take the type.
+function monoCellLamTake(lfe: i32, x: i32, tname: string, ctx: i32): i32 {
+  const pnames: string[] = []
+  if !monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames) {
+    return 2
+  }
+  let want = ""
+  for pn in pnames { want = want + normTypeAtom(pn) + "," }
+  const had = monoInstantiatedAny(lfe)
+  if !had {
+    monoLastInstFe = -1
+    monoCallFrameSlot = monoNestedCallFrame(lfe, ctx)
+    const r = monoInstanceFor(lfe, pnames, x, -1)
+    monoCallFrameSlot = -1
+    if r < 0 || monoLastInstFe < 0 { return 2 }
+  }
+  const pins: string[] = []
+  if !monoSlotParamPins(lfe, pins) { return 2 }
+  let got = ""
+  for pn in pins { got = got + normTypeAtom(pn) + "," }
+  if got != want {
+    if had { return 1 }
+    return 2
+  }
+  // The cell is retyped to the lambda it holds.
+  monoLastInstFe = lfe
   0
 }
 
@@ -11435,6 +11565,9 @@ function monoWalk(ix: i32, ctx: i32) {
     // A call through the capture cell of a `let` alias of a hole lambda (D3845).
     const cellNm = monoCellReadName(n.callFn)
     if cellNm != "" {
+      // A call in a function nothing names never runs, so it asks nothing of the cell (D3864).
+      const cellFr = monoLetFrameOf(cellNm, n.callFn, ctx)[0]
+      const live = cellFr < 0 || !monoWriteFrameDead(ctx, cellFr)
       const cfe = monoCellLamFe(cellNm, n.callFn, ctx)
       if cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
         monoLastInstFe = -1
@@ -11453,7 +11586,25 @@ function monoWalk(ix: i32, ctx: i32) {
         if monoInstantiate(sfe, ix, ctx) < 0 { return -1 }
         ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
       }
-      if ctn != "" { monoCoerceWrittenCell(cellNm, n.callFn, ctx, ctn) }
+      // A hole lambda seed is pinned by this call's arguments, which the callee's recorded type
+      // need not agree with, and a generic written beside it takes the lambda's signature (D3951).
+      const lfe = monoCellSeedLamFe(cellNm, n.callFn, ctx)
+      if (
+        sfe < 0
+        && live
+        && (ctn == "" || monoCellSeedIsLamLit(cellNm, n.callFn, ctx))
+        && lfe >= 0
+        && lfe < monoGen.length
+        && monoGen[lfe] == 1
+      ) {
+        monoLastInstFe = -1
+        if monoInstantiate(lfe, ix, ctx) < 0 { return -1 }
+        monoNoteBindCall(cellNm, n.callFn, ctx)
+        ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+      }
+      if ctn != "" && (live || sfe >= 0) {
+        monoCoerceWrittenCell(cellNm, n.callFn, ctx, ctn)
+      }
       // One cell holds one signature: a second call type is the binding conflict, refused.
       if ctn != "" && sfe >= 0 {
         if monoNoteBindDeliveryAt(n.callFn, ctn, ctx) < 0 { return -1 }
@@ -13117,6 +13268,7 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoCellCoercedSig = Map()
+  monoHoleLamSlots = Map()
   monoBuiltinCbLamsBuilt = false
   monoBindCallFrame = Map()
   monoDeliveredArgs = []
