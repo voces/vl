@@ -20,6 +20,19 @@ printed no row count never reached the emitter and is reported as UNREACHED, not
 
 Exits non-zero on a disagreement or an unreached kind program. Run from the checkout root;
 the probe build takes about a minute.
+
+The control, which must disagree on every kind: `--rev` instruments `compiler/` as it stood at
+an older commit, where the twin was wrong. A function the sweep calls is imported into the
+sweep's file from whichever module of that tree exports it, so a twin that has since moved
+between modules still resolves:
+
+  python3 scripts/twin-agreement.py --twins vak --rev c114b836f
+
+The sweep runs once, at the top of `emitProgram`, so a row created after that — a
+monomorphization pin, a type an instance substitutes — is never compared. For those, probe
+the CALL SITE instead: patch a copy of the site to `emitFail` when the twin and the original
+answer differently, build that compiler, and build every program in `tests/cases/` and the
+distilled corpus with it, counting both the programs that reach the site and the mismatches.
 """
 import argparse
 import collections
@@ -97,6 +110,25 @@ print(gen(a).length)
 HOOK = "  emitCurFnPos = -1\n  emitCurStmtIx = -1\n"
 
 
+def import_callees(src: pathlib.Path, fname: str, body: str) -> None:
+    """Imports every function `body` calls that `fname` neither defines nor imports, from the
+    module of `src` that exports it."""
+    p = src / fname
+    text = p.read_text()
+    adds = []
+    for name in sorted(set(re.findall(r"\b([a-z]\w*)\(", body))):
+        if re.search(rf"^(export )?function {name}\b", text, re.M):
+            continue
+        if re.search(rf"^\s*{name},?\s*$|import \{{[^}}]*\b{name}\b", text, re.M):
+            continue
+        home = [f for f in sorted(src.glob("*.vl"))
+                if f.name != fname and re.search(rf"^export function {name}\b", f.read_text(), re.M)]
+        if home:
+            adds.append(f'import {{ {name} }} from "./{home[0].stem}"\n')
+    if adds:
+        p.write_text("".join(adds) + text)
+
+
 def instrument(src: pathlib.Path, twins: list[str]) -> None:
     by_file = collections.defaultdict(list)
     for t in twins:
@@ -105,6 +137,7 @@ def instrument(src: pathlib.Path, twins: list[str]) -> None:
     for n, (fname, checks) in enumerate(sorted(by_file.items())):
         fn = f"twinSweep{n}"
         body = "\n".join(checks)
+        import_callees(src, fname, body)
         p = src / fname
         p.write_text(p.read_text() + f'''
 export function {fn}(): string {{
@@ -140,6 +173,7 @@ def main() -> int:
     ap.add_argument("--list", help="a file of extra program paths, one per line")
     ap.add_argument("--source", default="compiler",
                     help="the compiler tree to instrument (a control: an older tree whose twin is known wrong)")
+    ap.add_argument("--rev", help="instrument compiler/ as of this git revision instead (the control)")
     ap.add_argument("--keep", action="store_true", help="leave the scratch tree and print it")
     a = ap.parse_args()
     twins = a.twins.split(",")
@@ -150,7 +184,13 @@ def main() -> int:
     env = dict(os.environ, VL_STD=os.environ.get("VL_STD", str(ROOT / "std")))
     work = pathlib.Path(tempfile.mkdtemp(prefix="twin-agreement-"))
     try:
-        shutil.copytree((ROOT / a.source).resolve(), work / "compiler")
+        if a.rev:
+            arc = subprocess.run(["git", "archive", a.rev, "compiler"], cwd=ROOT, capture_output=True)
+            if arc.returncode != 0:
+                sys.exit(f"twin-agreement: git archive {a.rev} failed: {arc.stderr.decode()[-300:]}")
+            subprocess.run(["tar", "-x", "-C", str(work)], input=arc.stdout, check=True)
+        else:
+            shutil.copytree((ROOT / a.source).resolve(), work / "compiler")
         instrument(work / "compiler", twins)
         probe = work / "probe.wasm"
         r = subprocess.run(["timeout", "300", str(vl), "build", "compiler/entry.vl", "-o", str(probe),
@@ -172,20 +212,31 @@ def main() -> int:
         bad = collections.Counter()
         where = {}
         unreached, rows = [], 0
+        list_total = list_reached = 0
         for label, p, must_reach in progs:
             r = subprocess.run([str(vl), "build", str(p), "-o", str(work / "out.wasm"),
                                 "--compiler", str(probe)], cwd=ROOT, env=env, capture_output=True, text=True)
             m = re.search(r"TWINSWEEP rows=(\d+)(.*)", r.stdout + r.stderr)
+            if not must_reach:
+                list_total += 1
             if not m:
                 if must_reach:
                     unreached.append(label)
                 continue
+            if not must_reach:
+                list_reached += 1
             rows += int(m.group(1))
-            for d in re.findall(r"\[(\w+ .*?) twin=(-?\d+) orig=(-?\d+)\]", m.group(2)):
-                key = f"{d[0]}  twin={d[1]} orig={d[2]}"
+            # One count per program: the same row shape recurs within a program's arena.
+            for key in {f"{d[0]}  twin={d[1]} orig={d[2]}"
+                        for d in re.findall(r"\[(\w+ .*?) twin=(-?\d+) orig=(-?\d+)\]", m.group(2))}:
                 bad[key] += 1
                 where.setdefault(key, label)
-        print(f"twin-agreement [{','.join(twins)}]: {len(progs)} programs, {rows} arena rows compared")
+        reached = len(progs) - len(unreached) - (list_total - list_reached)
+        print(f"twin-agreement [{','.join(twins)}]: {reached} programs reached the emitter, "
+              f"{rows} arena rows compared")
+        if a.list:
+            print(f"  --list: {list_reached} of {list_total} reached the emitter; "
+                  f"{list_total - list_reached} stopped earlier (a check, parse or emit refusal) and compared nothing")
         for key, n in bad.most_common():
             print(f"  DISAGREE {key}   ({n} programs; first {where[key]})")
         for label in unreached:
