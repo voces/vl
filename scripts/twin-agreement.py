@@ -54,6 +54,20 @@ TWINS = {
     if vak1 != vak2 {
       out = out + " [vak " + nm + " twin=" + i32ToStr(vak1) + " orig=" + i32ToStr(vak2) + "]"
     }'''),
+    # Two classes are excluded because the SPELLING is the wrong answer there: a function
+    # returning a list renders with a trailing `[]`, and a `T[]` over an unbound type variable
+    # renders "". The fixtures `*-beside-fn-arm`, `map-or-list-arm-empty-literal` and
+    # `list-of-param-arm-narrow-index` pin the call site over both.
+    "arr": ("emit_classify.vl", '''    if nm != "" && !(T.tys[i] is TyFunc) && tyIsArray(i) != nameIsArray(nm) {
+      let arrT = "0"
+      if tyIsArray(i) { arrT = "1" }
+      let arrO = "0"
+      if nameIsArray(nm) { arrO = "1" }
+      out = out + " [arr " + nm + " twin=" + arrT + " orig=" + arrO + "]"
+    }'''),
+    "nsl": ("emit_classify.vl", '''    const nsl1 = nulScalarListKindOfTy(i)
+    const nsl2 = nulScalarListKind(nm + "|null")
+    if nsl1 != nsl2 { out = out + " [nsl " + nm + " twin=" + (nsl1 ?? "null") + " orig=" + (nsl2 ?? "null") + "]" }'''),
 }
 
 # A prelude, a type, and a value of it. Every kind must reach the emitter: a kind the checker
@@ -228,7 +242,7 @@ def main() -> int:
             rows += int(m.group(1))
             # One count per program: the same row shape recurs within a program's arena.
             for key in {f"{d[0]}  twin={d[1]} orig={d[2]}"
-                        for d in re.findall(r"\[(\w+ .*?) twin=(-?\d+) orig=(-?\d+)\]", m.group(2))}:
+                        for d in re.findall(r"\[(\w+ .*?) twin=(\S*) orig=(\S*)\]", m.group(2))}:
                 bad[key] += 1
                 where.setdefault(key, label)
         reached = len(progs) - len(unreached) - (list_total - list_reached)
