@@ -10276,15 +10276,17 @@ and `std:array`'s included, is imported explicitly. The ambient names a module s
 no import are the intrinsic floor, not a prelude. This supersedes the configurable-prelude
 amendment in `docs/internals/modules-design.md` §2 (`builtin-methods-to-std.md` §O7).
 
-**Why.** `std:str` and `std:array` collide on several names (`lastIndexOf`, and under A′
-`includes`, `indexOf`, `slice`, `get`), so a prelude would need type-directed dispatch or a
-new shadowable scope tier. Tooling carries the typing cost instead: `vl check --fix` adds
-the import, choosing the module by the receiver's type, and the REPL and `vl run` print
-the line to add.
+The owner's words were "stay explicit". The reasoning and the reopen condition below are
+not the owner's. They come from the five-reviewer debate memo the ruling was decided after
+(5–0 for explicit imports), and are recorded as that memo's argument.
 
-**Reopen** only if receiver overloading (O1) and a shadowable prelude tier both exist and
-the default set is versioned, or if agents keep retrying imports after the
-receiver-typed `--fix`.
+**The memo's argument.** `std:str` and `std:array` collide on several names (`lastIndexOf`,
+and under A′ `includes`, `indexOf`, `slice`, `get`), so a prelude would need type-directed
+dispatch or a new shadowable scope tier. Tooling carries the typing cost instead: `vl check
+--fix` adds the import, choosing the module by the receiver's type. The memo would reopen
+the question only if receiver overloading (O1) and a shadowable prelude tier both exist and
+the default set is versioned, or if agents keep retrying imports after the receiver-typed
+`--fix`.
 
 ## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
 
@@ -10297,3 +10299,26 @@ refuses it, and no `--fix` adds an annotation.
 annotations. I rather we have more complex incremental build machinery." An incremental
 build therefore keys a module on the layout demands its importers make
 (`docs/internals/incremental-compilation-design.md` §"Owner questions", Q1).
+
+## The module system's eight decided directions (owner review, 2026-06-06) — modules-design §5
+
+`docs/internals/modules-design.md` §5 lists eight directions the owner reviewed, folded in by
+commit `e295c6986` ("docs(modules): fold in owner review — std: scheme, no prelude,
+fine-grained modules, live-ref/readonly(A9) exports, `as` aliasing, no extension,
+visibility", 2026-06-06). The section says the formal record would land here at
+implementation; this is that record. Each direction in its own words:
+
+1. "Std specifier = the `std:` scheme (colon), not `std/`."
+2. "No implicit library prelude." (Restated and extended by O7, the section above.)
+3. "Fine-grained std modules." One module per concern, flat.
+4. "Export semantics = live references; readonly is A9." "Exported bindings are live
+   references"; "the imported name is read-only (no reassigning another module's `let`)".
+5. "Rename in v1; re-export deferred." `import { x as y }` is in; re-export has since landed
+   (the R1–R3 section above).
+6. "Omit the `.vl` extension in specifiers." "No index/directory guessing."
+7. "LSP cross-file / std navigation = Phase 3, perf-bounded." Tooling, not a module rule.
+8. "Visibility: v1 binary." "v1 = top-level `export` or private."
+
+Items 2 and 8 also carry open sub-questions in §5 (a shadowable convenience name;
+graduated visibility levels). They stay open. `docs/spec/modules.md` cites directions 4
+and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.

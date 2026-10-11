@@ -415,15 +415,28 @@ function f(k: K): string {
 
 Raised by modules.md §M5.3.
 
-**Today.** `print`, `fromCodePoint`, `fromCodePoints`, `Map` and `Set`, and the six
-primitive type names, are visible with no import. A program may declare any of these
-names and nothing refuses it, but the result is inconsistent (D4066). A `function print`
-is what a call runs, while the call is checked against the ambient signature. A `const
-print = …` lambda is not reached at all:
+**Today.** The ambient names (modules.md §M5.3) are the eleven built-in type names, five
+functions (`print`, `fromCodePoint`, `fromCodePoints`, `Map`, `Set`), twenty float and
+integer intrinsics (`abs`, `sqrt`, `clz`, `divU`, …) and the `__name__` compiler
+intrinsics. They fare differently when a program declares one:
+
+- A compiler intrinsic is refused: `function __trap__()` gives "is a compiler intrinsic and
+  cannot be redefined".
+- A float or integer intrinsic is shadowed cleanly: `function abs(x: i32): i32 { x + 100 }`
+  makes `abs(1)` print 101, and `const sqrt = 3` prints 3.
+- A type name is accepted: `const i32 = 3` and `type Map = { a: i32 }` both run.
+- One of the five functions is inconsistent (D4066). A `function print` is what a call
+  runs, while the call is checked against the ambient signature. A `const print = …`
+  lambda is not reached at all.
+
+```vl
+function print(x: i32): i32 { x + 100 }
+const y: i32 = print(3)   // refused: cannot bind the void result of 'y'
+```
 
 ```vl
 const print = (x: i32): i32 => x
-print(5)   // prints 5: the ambient print ran
+print(5)   // prints 5 (the ambient print ran)
 ```
 
 No ruling covers it. `docs/internals/modules-design.md` §5 calls the ambient floor
@@ -448,6 +461,9 @@ the first candidate to move into `std:fmt`. Under (b) a program that declared it
 `print` keeps compiling when that happens; under (a) the refusal it lived with disappears
 and its meaning changes. (b) is also the rule a plain call already follows between a local
 and an import (O1, rule (e): the local wins).
+It is also what the float and integer intrinsics already do, so (b) makes the five
+functions agree with them. The compiler intrinsics stay refused under either option: a
+call to one lowers to inline instructions and never reaches a declaration.
 
 ## Q12. Import cycles
 
