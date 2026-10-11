@@ -53632,7 +53632,7 @@ The conversion took three attempts, and the two failures are more instructive th
 | `cen=[]`, 6 files | false | true |
 | `cen=[((i32)=>f32)[]\|i32]`, 2 files | true | false |
 
-Shipping it broke `functions/error-generic-fn-value-partial-annotation-no-context.vl`: the expected
+Shipping it broke `functions/error-generic-fn-value-partial-annotation-no-context.vl` (since D3977 `generic-fn-value-partial-annotation-list-element-call.vl`, which runs): the expected
 "cannot take the generic function `npadd` as a value" became "ref array literal with no interned
 element type". **An empty render is not a missing answer — it is the checker DECLINING to name the
 element, which is precisely the condition that error reports.** The arena knows the KIND and cannot

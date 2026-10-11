@@ -9514,6 +9514,8 @@ function monoCoerceAliasOfCell(
 function monoNamesCellAlias(v: i32, ctx: i32): boolean {
   const x = unwrapParen(v)
   if x < 0 { return false }
+  const cn = monoCellReadName(x)
+  if cn != "" { return monoNamesGeneratedCell(cn, x, ctx) }
   const nm = monoIdentNameOf(x)
   nm != "" && monoAliasCellRead(nm, x, ctx)[0] >= 0
 }
@@ -9597,6 +9599,25 @@ function monoListOnlyCalled(fx: i32, name: string, len: i32): boolean {
 // is an alias of a capture cell's read: that read as `[read, frame]`; `[-1, -1]` otherwise.
 function monoListElemCellRead(callee: i32, ctx: i32): i32[] {
   const none: i32[] = [0 - 1, 0 - 1]
+  const el = monoListElemOf(callee, ctx)
+  if el[0] < 0 { return none }
+  const e = el[0]
+  // The cell itself placed in the list (`[k]`) is its own read (D3977).
+  const cn = monoCellReadName(e)
+  if cn != "" {
+    if !monoNamesGeneratedCell(cn, e, el[1]) { return none }
+    const out: i32[] = [e, el[1]]
+    return out
+  }
+  const nm = monoIdentNameOf(e)
+  if nm == "" { return none }
+  monoAliasCellRead(nm, e, el[1])
+}
+
+// For a callee `fs[k]` whose list `fs` a `const` initializes with a literal: element `k` and the
+// list's frame, as `[element, frame]`; `[-1, -1]` for any other callee.
+function monoListElemOf(callee: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
   const c = P.nodes[callee]
   if !(c is Index) { return none }
   const a = P.nodes[c.idxArr]
@@ -9610,10 +9631,156 @@ function monoListElemCellRead(callee: i32, ctx: i32): i32[] {
   if !(lit is ArrayLit) || lit.pos < 0 { return none }
   const at = monoListLitIndex(k.numText, lit.arrElems.length)
   if at < 0 { return none }
-  const e = unwrapParen(lit.arrElems[at])
-  const nm = monoIdentNameOf(e)
-  if nm == "" { return none }
-  monoAliasCellRead(nm, e, lf[0])
+  const out: i32[] = [unwrapParen(lit.arrElems[at]), lf[0]]
+  out
+}
+
+// Whether node `v` is a program's list literal one of whose elements names a declared generic
+// function, by name or through never-written aliases.
+function monoListInitHoldsGeneric(v: i32, ctx: i32): boolean {
+  if v < 0 { return false }
+  const lit = P.nodes[v]
+  if !(lit is ArrayLit) || lit.pos < 0 { return false }
+  for e in lit.arrElems {
+    if monoListElemGenFe(e, ctx) >= 0 { return true }
+  }
+  false
+}
+
+// The declared generic function list element `e` names in frame `ctx`, as a slot; -1 otherwise.
+function monoListElemGenFe(e: i32, ctx: i32): i32 {
+  const x = unwrapParen(e)
+  if x < 0 { return -1 }
+  const nm = monoIdentNameOf(x)
+  if nm == "" { return -1 }
+  if monoNamesDeclaredGeneric(x, ctx) { return monoFnFeOfIdent(x, nm, ctx) }
+  monoGenFnAliasChainFe(nm, x, ctx)
+}
+
+// Gives the un-annotated `const` list `d`, which holds a generic function, the
+// function type every call of one of its elements takes, as an annotation: the generics are then
+// instanced at it. Refuses a list read any other way, called at two types, or holding an element
+// whose type is neither: -1 on a refusal.
+function monoPinGenericList(d: LetDecl, ctx: i32): i32 {
+  if d.letInit < 0 { return 0 }
+  const lit = P.nodes[d.letInit]
+  if !(lit is ArrayLit) { return 0 }
+  if (
+    d.letKw != "const"
+    || !monoListOnlyCalled(ctx, d.letName, lit.arrElems.length)
+  ) {
+    return monoGenericListFail(d.letInit)
+  }
+  let sig = ""
+  let ft = -1
+  for c in monoListElemCalls(ctx, d.letName) {
+    const call = P.nodes[c]
+    if !(call is Call) { return monoGenericListFail(d.letInit) }
+    const el = monoListElemOf(call.callFn, ctx)
+    if el[0] < 0 { return monoGenericListFail(d.letInit) }
+    const ret = nodeTyIxOf(c)
+    if ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) {
+      return monoGenericListFail(d.letInit)
+    }
+    let one = ""
+    const g = monoListElemGenFe(el[0], el[1])
+    if g >= 0 {
+      monoLastInstFe = -1
+      if monoInstantiate(g, c, ctx) < 0 { return -1 }
+      if monoLastInstFe < 0 { return monoGenericListFail(d.letInit) }
+      one = monoSlotSig(monoLastInstFe)
+      if ft < 0 {
+        ft = monoPinSubTyOf(nodeTyIxOf(el[0]), fnStmts[monoLastInstFe])
+      }
+    } else {
+      const t = nodeTyIxOf(el[0])
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) || !(T.tys[t] is TyFunc) {
+        return monoGenericListFail(d.letInit)
+      }
+      const ps: string[] = []
+      const tf = T.tys[t]
+      if tf is TyFunc {
+        for pt in tf.fnParamTypes { ps.push(tyToEmitName(pt)) }
+      }
+      for pn in ps { one = one + pn + "," }
+      one = one + ";"
+      if ft < 0 { ft = t }
+    }
+    one = one + tyToEmitName(ret)
+    if sig != "" && sig != one { return monoGenericListFail(d.letInit) }
+    sig = one
+  }
+  if sig == "" { return 0 }
+  const semi = sig.indexOf(";")
+  const fty = monoSigFnTyName(sig.slice(0, semi + 1))
+  const arrow = fty.indexOf("=>")
+  if arrow < 0 { return monoGenericListFail(d.letInit) }
+  const ann = "("
+    + fty.slice(0, arrow)
+    + "=> "
+    + sig.slice(semi + 1, sig.length)
+    + ")[]"
+  // The list and its element calls take the pin's type, which their recorded types lack.
+  if !monoTyConcreteFn(ft) { return monoGenericListFail(d.letInit) }
+  const lt = mkArrayTy(ft)
+  d.letType = synthTypeRefTy(ann, -1, lt)
+  monoArenaTouch()
+  nodeTyRecord(d.letInit, lt)
+  for e in lit.arrElems {
+    const et = nodeTyIxOf(e)
+    if et < 0 || tyHasTyVar(et) { nodeTyRecord(e, ft) }
+  }
+  for c in monoListElemCalls(ctx, d.letName) {
+    const call = P.nodes[c]
+    if call is Call {
+      nodeTyRecord(call.callFn, ft)
+      const ix = P.nodes[call.callFn]
+      if ix is Index { nodeTyRecord(ix.idxArr, lt) }
+    }
+  }
+  0
+}
+
+// The calls `name[k](…)` in frame `fx`'s body, as call nodes.
+function monoListElemCalls(fx: i32, name: string): i32[] {
+  const out: i32[] = []
+  const stack: i32[] = []
+  if fx >= 0 {
+    const b = monoNestedBodyOf(fx)
+    if b < 0 { return out }
+    stack.push(b)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const c = P.nodes[n.callFn]
+        if c is Index {
+          const a = P.nodes[c.idxArr]
+          if a is Ident {
+            if a.identName == name { out.push(ix) }
+          }
+        }
+      }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  out
+}
+
+// The refusal for a list of generic functions whose calls give it no one function type.
+function monoGenericListFail(at: i32): i32 {
+  emitFailAt(
+    "emitProgram: a list holding a generic function is called at more than one type, or read "
+      + "other than by calling its elements, so its elements have no one instance — annotate the "
+      + "list's element type",
+    at,
+  )
 }
 
 // The refusal for an alias of a capture cell's read stored in a list, at node `at`.
@@ -11799,6 +11966,11 @@ function monoWalk(ix: i32, ctx: i32) {
         return monoCellAliasListFail(n.letInit)
       }
       monoCellAliasListOk = n.letInit
+    }
+    // A list of generic functions called only through its elements takes the type the calls give
+    // it, as an annotation would (D3977).
+    if monoListInitHoldsGeneric(n.letInit, ctx) && n.letType < 0 {
+      if monoPinGenericList(n, ctx) < 0 { return -1 }
     }
     // An annotated function-typed binding to a generic named function: materialize the
     // instance for the annotation's param types and point the binding at it, so the value
