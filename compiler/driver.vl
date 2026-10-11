@@ -3691,6 +3691,63 @@ function modExportRecord(
   0
 }
 
+// How far past `export` its declaration keyword sits, given the next two tokens: 2 past a
+// `flat` before `type`, or an `extern` before `function`/`let`/`const`; else 1. `more` says
+// a token follows the second, so a declared name can exist.
+function modExportDeclOff(
+  k1: TokKind,
+  t1: string,
+  k2: TokKind,
+  more: boolean,
+): i32 {
+  const flat = k1 == "IDENT" && t1 == "flat" && k2 == "TYPE"
+  const ext = k1 == "EXTERN" && k2 != "TYPE" && modExportDeclKind(k2)
+  if more && (flat || ext) { return 2 }
+  1
+}
+
+// The brace depth change token kind `k` makes: +1 for `{`, -1 for `}`, else 0.
+function modBraceStep(k: TokKind): i32 {
+  const open = k == "LBRACE"
+  const close = k == "RBRACE"
+  if open { return 1 }
+  if close { return -1 }
+  0
+}
+
+// Whether `k` opens a declaration an `export` names.
+function modExportDeclKind(k: TokKind): boolean {
+  k == "FUNCTION" || k == "LET" || k == "CONST" || k == "TYPE"
+}
+
+// The names `src` exports by a top-level declaration, as `modScan` records them, for a file
+// outside the module graph; null when it does not lex. Re-exports are not included.
+export function modExportNamesOf(src: string): string[] | null {
+  const out: string[] = []
+  const r = tokenize(src)
+  if r.diags.length > 0 { return null }
+  const toks = r.tokens
+  let depth = 0
+  let i = 0
+  while i < toks.length {
+    const k = toks[i].kind
+    depth = depth + modBraceStep(k)
+    if k == "EXPORT" && depth == 0 && i + 2 < toks.length {
+      const dOff = modExportDeclOff(
+        toks[i + 1].kind,
+        toks[i + 1].text,
+        toks[i + 2].kind,
+        i + 3 < toks.length,
+      )
+      if i + dOff + 1 < toks.length && modExportDeclKind(toks[i + dOff].kind) {
+        out.push(toks[i + dOff + 1].text)
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
 function modScan(m: i32, src: string): i32 {
   const r = tokenize(src)
   const toks = r.tokens
@@ -3989,20 +4046,14 @@ function modScan(m: i32, src: string): i32 {
         // and the declaration keyword, so the declared name is one token further
         // along. This token-level scanner runs before any parse, so it must
         // recognize the `flat`/`type` pair itself, the same guard the parser uses.
-        let dOff = 1
-        if toks[i + 1].kind == "IDENT" && toks[i + 1].text == "flat" {
-          if i + 3 < toks.length && toks[i + 2].kind == "TYPE" { dOff = 2 }
-        }
-        // `export extern function n(…)` puts the `extern` keyword in the same slot `flat`
-        // takes, so the declared name is one token further along here too.
-        if toks[i + 1].kind == "EXTERN" {
-          if i + 3 < toks.length {
-            const xk = toks[i + 2].kind
-            if xk == "FUNCTION" || xk == "LET" || xk == "CONST" { dOff = 2 }
-          }
-        }
+        const dOff = modExportDeclOff(
+          toks[i + 1].kind,
+          toks[i + 1].text,
+          toks[i + 2].kind,
+          i + 3 < toks.length,
+        )
         const dk = toks[i + dOff].kind
-        if dk == "FUNCTION" || dk == "LET" || dk == "CONST" || dk == "TYPE" {
+        if modExportDeclKind(dk) {
           const dnt = toks[i + dOff + 1]
           modExportRecord(
             m,

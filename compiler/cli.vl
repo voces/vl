@@ -77,6 +77,7 @@ import {
   lintScopeKeyOf,
   lintSrc,
   lintUseCheck,
+  modExportNamesOf,
   modPendingCount,
   modReset,
   rcoalModuleAt,
@@ -89,10 +90,13 @@ import {
   vcFmtOut,
 } from "./driver"
 import {
+  mimpExtraSet,
+  mimpMissed,
   mimpMovedFrom,
   mimpMovedMod,
   mimpMovedName,
   mimpMovedTo,
+  mimpRelSpec,
 } from "./missing_import"
 import {
   cliAnsi,
@@ -179,6 +183,8 @@ const ST_TEST_RUN = 15       // the host reported every planned test's result
 const ST_CHECK_VALIDATE = 16 // the host validated this file's emitted module
 const ST_TEST_ENQUEUED = 17  // the host queued one file for the compile pool
 const ST_TEST_POOLED = 18    // the host committed every queued file's compile outcome
+const ST_SIB_LIST = 19       // got the listing of the checked file's own directory
+const ST_SIB_READ = 20       // got a file outside the module graph, read for its exports
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -292,6 +298,19 @@ let cliFixRoundsMax = 0        // the most rounds any file of the run took
 let cliFixCapHit = 0           // files that reached the cap with fixes still pending
 let cliFixKinds: string[] = [] // per-kind tally of the applied fixes, for the summary
 let cliFixKindN: i32[] = []
+
+// ── files outside the module graph ───────────────────────────────────────────
+
+// An undeclared name no graph module exports may be exported by a file the program does not
+// import yet. Once per file with such a miss, the CLI reads the candidates — the directory
+// walk's files, or the checked file's own directory — and re-checks with their exports
+// offered as imports, so the diagnostic and `--fix` can name the module.
+let cliSibTried = 0
+let cliSibQueue: string[] = []
+let cliSibScanned: string[] = [] // candidate paths already scanned this run
+let cliSibExpKey: string[] = []  // one row per export: the file's path
+let cliSibExpName: string[] = [] // and the exported name
+let cliSibSkipped: string[] = [] // candidates that do not lex, named once in the summary
 
 // ── verify-and-revert (D1091) ────────────────────────────────────────────────
 
@@ -585,6 +604,13 @@ export function cliArgReset() {
   cliDiagLineCacheMod = -1
   cliDiagLineCache = []
   cliSrcLines = []
+  cliSibTried = 0
+  cliSibQueue = []
+  cliSibScanned = []
+  cliSibExpKey = []
+  cliSibExpName = []
+  cliSibSkipped = []
+  mimpExtraSet([], [])
   0
 }
 export function cliArgPush(c: i32) {
@@ -1265,6 +1291,10 @@ function cliCheckCurFileRest() {
     cliValidateMsg = ""
     return cliFixVerdict(ok)
   }
+  if cliSibTried == 0 && mimpMissed.length > 0 {
+    cliSibTried = 1
+    return cliSibBegin()
+  }
   // Error-tier diagnostics — capture them now, straight from the driver stores, before
   // `lintSrc` re-parses the entry source and resets those stores.
   cliClearDiags()
@@ -1597,6 +1627,15 @@ function cliBatchUnreadable() {
 // never a silent one. It rides `cliOut` (stderr) rather than the report, so a `--json`
 // caller is told too without a non-diagnostic entering the array on stdout (D1601).
 function cliHiddenNotes() {
+  for f in cliSibSkipped {
+    cliOut.push(
+      cliAnsi(
+        cliColor,
+        "2",
+        "(the missing-import lookup skipped " + f + ": it does not lex)",
+      ),
+    )
+  }
   cliHiddenNote(cliImpHidden, cliImpHiddenWarn, "import", "--include-imports")
   cliHiddenNote(cliStdHidden, cliStdHiddenWarn, "std", "--include-std")
 }
@@ -2171,6 +2210,8 @@ function cliStartFile() {
   // A NAMED path is checked as `vl check <file>` checks it (whole-graph lint, a missing
   // file is an error); one the walk found keeps the directory run's shape.
   cliDirMode = cliFileFromDir[cliFileIdx]
+  cliSibTried = 0
+  mimpExtraSet([], [])
   cliFileFixed = 0
   cliFixRound = 0
   cliFixPhase = FIXP_OFF
@@ -2236,6 +2277,99 @@ function cliBeginCheck() {
     cliModMode = 0
   }
   cliFetchOrCheckFile()
+}
+
+// The directory part of `path`, "" when it has none.
+function cliDirOf(path: string): string {
+  let i = path.length - 1
+  while i >= 0 {
+    if path[i] == '/' { return path.slice(0, i) }
+    i = i - 1
+  }
+  ""
+}
+
+// Queue the current file's candidates outside the module graph: every file of a directory
+// run, else the `.vl` files beside it, which needs a listing first.
+function cliSibBegin() {
+  cliSibQueue = []
+  if cliDirMode != 0 {
+    for f in cliFiles {
+      if f != cliCurFile { cliSibQueue.push(f) }
+    }
+    return cliSibReadNext()
+  }
+  cliDirNames = []
+  cliDirIsDirs = []
+  cliCmdPath = cliDirOf(cliCurFile)
+  if cliCmdPath == "" { cliCmdPath = "." }
+  cliState = ST_SIB_LIST
+  CMD_LIST_DIR
+}
+
+// Queue the `.vl` files the listing of the current file's directory named.
+function cliSibListed() {
+  const dir = cliDirOf(cliCurFile)
+  let i = 0
+  while i < cliDirNames.length {
+    if cliDirIsDirs[i] == 0 && cliEndsVl(cliDirNames[i]) {
+      let path = cliDirNames[i]
+      if dir != "" { path = dir + "/" + path }
+      if path != cliCurFile { cliSibQueue.push(path) }
+    }
+    i = i + 1
+  }
+  cliSibReadNext()
+}
+
+// Scan the next unscanned candidate, from the source cache or the host; with none left,
+// offer every scanned export to the checker and re-check the current file.
+function cliSibReadNext() {
+  while cliSibQueue.length > 0 {
+    const key = cliSibQueue[cliSibQueue.length - 1]
+    cliSibQueue = cliPopLast(cliSibQueue)
+    if !cliStrIn(cliSibScanned, key) {
+      const ci = cliSrcCacheGet(key)
+      if ci < 0 {
+        cliFetchKey = key
+        cliCmdPath = key
+        cliState = ST_SIB_READ
+        return CMD_READ_FILE
+      }
+      cliSibScan(key, cliSrcCacheSrcs[ci], cliSrcCacheFound[ci])
+    }
+  }
+  const names: string[] = []
+  const specs: string[] = []
+  let r = 0
+  while r < cliSibExpKey.length {
+    if cliSibExpKey[r] != cliCurFile {
+      const spec = mimpRelSpec(cliCurFile, cliSibExpKey[r])
+      if spec != "" {
+        names.push(cliSibExpName[r])
+        specs.push(spec)
+      }
+    }
+    r = r + 1
+  }
+  mimpExtraSet(names, specs)
+  cliBeginCheck()
+}
+
+// Record candidate `key`'s exported names (none when it could not be read).
+function cliSibScan(key: string, src: string, found: i32) {
+  cliSibScanned.push(key)
+  if found == 0 { return 0 }
+  const names = modExportNamesOf(src)
+  if names == null {
+    cliSibSkipped.push(key)
+    return 0
+  }
+  for n in names {
+    cliSibExpKey.push(key)
+    cliSibExpName.push(n)
+  }
+  0
 }
 
 // ── check --fix ──────────────────────────────────────────────────────────────
@@ -3221,6 +3355,15 @@ export function cliNext() {
     cliEntrySrc = cliFileSrc
     cliSrcCachePut(cliCurFile, cliFileSrc, 1)
     return cliBeginCheck()
+  }
+  if st == ST_SIB_LIST {
+    if cliDirWasDir == 0 { return cliSibReadNext() }
+    return cliSibListed()
+  }
+  if st == ST_SIB_READ {
+    cliSrcCachePut(cliFetchKey, cliFileSrc, cliFileFound)
+    cliSibScan(cliFetchKey, cliFileSrc, cliFileFound)
+    return cliSibReadNext()
   }
   if st == ST_FIX_WROTE {
     // Re-check the fixed source (already in `cliEntrySrc`) module-aware for the report.
