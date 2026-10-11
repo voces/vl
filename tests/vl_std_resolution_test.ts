@@ -149,6 +149,29 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-std: a backslash path names its forward-slash spelling, and a drive path is absolute",
+  ignore: !ENABLED,
+  fn: async () => {
+    const cases: [string, string][] = [
+      [".\\helper", 'an import path uses forward slashes: write "./helper"'],
+      ["..\\lib\\x", 'an import path uses forward slashes: write "../lib/x"'],
+      ["C:/proj/helper", "an absolute path is not an import specifier"],
+    ];
+    for (const [spec, want] of cases) {
+      const { dir, stdDir, entry } = await workspace({}, `import { x } from "${spec}"\n\nprint(x())\n`);
+      try {
+        const r = await check(entry, stdDir);
+        if (r.code === 0 || !r.text.includes(want) || r.text.includes("bare specifiers")) {
+          throw new Error(`${spec}: want rc != 0 and "${want}", got ${r.code}:\n${r.text}`);
+        }
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
+    }
+  },
+});
+
+Deno.test({
   name: "vl-std: malformed std: shapes and bare specifiers stay unsupported",
   ignore: !ENABLED,
   fn: async () => {
