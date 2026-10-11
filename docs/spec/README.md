@@ -17,7 +17,7 @@ where one exists, and is marked where the compiler has not caught up.
 | [expressions.md](expressions.md) | operators, mixed numeric operands, constant arithmetic, casts, evaluation order, calls, indexing, block values, lambdas, list spread |
 | [statements.md](statements.md) | programs, bindings, scope, blocks, `if`, loops, labels and loop values, `match`, `return` and `never`, local declarations |
 | [narrowing.md](narrowing.md) | narrowable places, null tests, `is`, literal and discriminant tests, where a fact holds, writes and joins, what ends a fact |
-| modules.md *(next)* | imports, exports, re-exports, resolution |
+| [modules.md](modules.md) | modules and visibility, exports, imports and specifiers, re-exports, names and the ambient set, running order and cycles, inference across modules |
 | diagnostics.md *(next)* | error, warning, hint and info categories; exit codes |
 | std.md *(next)* | the standard library contract |
 

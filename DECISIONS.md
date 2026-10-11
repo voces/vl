@@ -10251,3 +10251,49 @@ in `A`, so `is B` tests the value `` (code `contained-arm-is-test`). Disjoint li
 a real discriminant and get no hint. The string-against-integer-literal check reject keeps
 its behaviour. Where the operand's declared type is a single record containing `B`, the
 compiler still answers by the declared type (D4058).
+
+## A re-export binds its name locally (owner rulings R1–R3, 2026-10-04) — sunpa SP-014, SP-020
+
+**R1 (A).** `export { X } from "m"` publishes `X` and also binds `X` in the re-exporting
+module, as an import would. This is what shipped (#1196) and what `std:fs` relies on: it
+uses `Buf` in its signatures through `export { Buf } from "std:buffer"` alone. JS and TS
+bind nothing locally here; VL does, so one line both uses and publishes a name.
+
+**R2 (A).** An `import` of a name the same module also re-exports from the same specifier
+is redundant, and gets the duplicate-import WARNING with a `--fix` that removes the
+import. std's eight instances (`std:args` 1, `std:env` 4, `std:process` 3) are cleaned up
+in the change that lands the warning (D4064).
+
+**R3 (A).** `export { x }` without `from` stays refused when `x` is an import. There is one
+spelling for passing an import on, `export { x } from "m"`, and the refusal names it.
+
+The questions and options are `docs/internals/modules-design.md` §2.1.1.
+
+## No prelude: every library name is imported (owner ruling O7, 2026-10-07)
+
+**The rule.** No default prelude and no configurable one. Every library name, `std:str`'s
+and `std:array`'s included, is imported explicitly. The ambient names a module sees with
+no import are the intrinsic floor, not a prelude. This supersedes the configurable-prelude
+amendment in `docs/internals/modules-design.md` §2 (`builtin-methods-to-std.md` §O7).
+
+**Why.** `std:str` and `std:array` collide on several names (`lastIndexOf`, and under A′
+`includes`, `indexOf`, `slice`, `get`), so a prelude would need type-directed dispatch or a
+new shadowable scope tier. Tooling carries the typing cost instead: `vl check --fix` adds
+the import, choosing the module by the receiver's type, and the REPL and `vl run` print
+the line to add.
+
+**Reopen** only if receiver overloading (O1) and a shadowable prelude tier both exist and
+the default set is versioned, or if agents keep retrying imports after the
+receiver-typed `--fix`.
+
+## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
+
+**The rule.** An exported record binding without an annotation takes the field types its
+importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
+an importer to `take(w: { x: i64, y: i64 })` widens `pt`'s layout in that program. Nothing
+refuses it, and no `--fix` adds an annotation.
+
+**Why.** In the owner's words: "don't want an auto fix. vl design principles is minimal
+annotations. I rather we have more complex incremental build machinery." An incremental
+build therefore keys a module on the layout demands its importers make
+(`docs/internals/incremental-compilation-design.md` §"Owner questions", Q1).
