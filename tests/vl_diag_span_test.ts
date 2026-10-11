@@ -437,6 +437,17 @@ const GRID: Row[] = [
     underlines: "n ?? 99",
   },
   {
+    // `print(a == a)` — the `==` node runs from `a` at 7 to the second `a` at 12.
+    name: "deep-record-compare: the warning spans the whole `==`",
+    src: "type R = { c: i32[] }\nconst a: R = { c: [1] }\nprint(a == a)\n",
+    frag: "compares every element of its list field `c`",
+    sev: "warning",
+    line: 3,
+    col: 7,
+    endCol: 13,
+    underlines: "a == a",
+  },
+  {
     // `const isErr = v is "err"` — the `is` node runs from `v` at 15 to the closing
     // quote at 24.
     name: "collapsed-arm-value-test: the hint spans the whole `is`",

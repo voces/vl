@@ -341,7 +341,7 @@ Fields:
   trailing `emitErr` the emitter's one refusal, with the module phase's findings a
   prefix of `P.diags`); the other four are `compiler/cli.vl`'s report. The
   checker's advisory streams — `redundant-type`, `dead-coalesce-default`,
-  `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
+  `dead-null-test`, `deep-record-compare`, `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
   and `severity` is what says whether it refused.
 - `code` — the stable machine id: the lint rule id (`prefer-const`,
   `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
