@@ -9602,7 +9602,12 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
   // A hole lambda holds one signature, whichever instance or cell writes it.
   const lfe = monoLamValueFe(x, ctx)
   if lfe >= 0 {
-    if !monoCellSigRecord(monoLamSigKey(lfe), tname) { return 1 }
+    const key = monoLamSigKey(lfe)
+    if !monoCellSigRecord(key, tname) { return 1 }
+    // A lambda with every parameter annotated has its own type to compare.
+    if key == fnStmts[lfe] {
+      return monoCellConcreteTake(nodeTyIxOf(fnStmts[lfe]), tname, 0)
+    }
     return 0
   }
   // Another cell's read delivers that cell at this type (D3949).
@@ -9635,7 +9640,25 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
       }
     }
   }
+  // A read a test narrowed from a nullable binding keeps that binding's representation.
+  if (
+    nm != ""
+    && nonNulBaseOf(tname) == tname
+    && monoNameDeclNullable(nm, x, ctx)
+  ) {
+    return 2
+  }
   monoCellConcreteTake(nodeTyIxOf(x), tname, 2)
+}
+
+// Whether the binding `name` read at `at` in frame `ctx` is declared with a nullable annotation.
+function monoNameDeclNullable(name: string, at: i32, ctx: i32): boolean {
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 { return false }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letType < 0 { return false }
+  const ann = tyNameOf(d.letType)
+  nonNulBaseOf(ann) != ann
 }
 
 // The node a lambda slot's signature is recorded on: a lambda with an un-annotated parameter is
@@ -9666,13 +9689,24 @@ function monoNamesGeneratedCell(name: string, at: i32, ctx: i32): boolean {
 }
 
 // What `monoCellValueTake` answers for a value of type `t` delivered at function type `tname`:
-// 0 for a concrete function type with `tname`'s parameters or a concrete non-function type, 1 for
-// a concrete function type with others, `open` for a type naming a type variable.
+// 0 for a concrete function type with `tname`'s parameters (nullable where `tname` is), or a
+// primitive such as `null`; 1 for a function type with others; `open` for a type naming a type
+// variable; 2 for any other type.
 function monoCellConcreteTake(t: i32, tname: string, open: i32): i32 {
   if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return open }
-  if !(T.tys[t] is TyFunc) { return 0 }
+  let ft = t
+  const nt = T.tys[t]
+  if nt is TyNullable {
+    // A nullable value, even one a test narrowed, is stored only where the cell admits null.
+    if nonNulBaseOf(tname) == tname { return 2 }
+    ft = nt.nInner
+  }
+  if ft < 0 || ft >= T.tys.length { return 2 }
+  const f = T.tys[ft]
+  if f is TyPrim { return 0 }
+  if !(f is TyFunc) { return 2 }
   const want = monoFnNameSig(tname)
-  if want == "" || monoFnNameSig(monoConcreteFnTyName(t)) != want { return 1 }
+  if want == "" || monoFnNameSig(monoConcreteFnTyName(ft)) != want { return 1 }
   0
 }
 
@@ -9807,6 +9841,17 @@ function monoFnParamAnnRidesTyParam(fe: i32, i: i32) {
     return monoAnnHasTyParam(ann, fn.fnTyParams)
   }
   false
+}
+
+// The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956).
+function monoGenArgOpenFail(ix: i32): i32 {
+  emitFailAt(
+    "emitProgram: a generic function is passed to a function value whose parameter type "
+      + "names a type parameter this closure does not bind, so no instance of it can be "
+      + "chosen — call the function value from the generic function's own body, or pass "
+      + "a function of a concrete type",
+    ix,
+  )
 }
 
 // Whether call `n`, through a function value, hands a declared generic function to a parameter
@@ -11235,6 +11280,9 @@ function monoWalk(ix: i32, ctx: i32) {
     }
     if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
     const callee = P.nodes[n.callFn]
+    if callee is Index && monoGenArgAtOpenParam(n, ctx) {
+      return monoGenArgOpenFail(ix)
+    }
     if callee is Ident {
       // A generic function value passed as an argument to a concrete function-typed
       // parameter: materialize the instance for that declared function type. Only where
@@ -11253,13 +11301,7 @@ function monoWalk(ix: i32, ctx: i32) {
         ca = ca + 1
       }
       if dfe < 0 && monoGenArgAtOpenParam(n, ctx) {
-        return emitFailAt(
-          "emitProgram: a generic function is passed to a function value whose parameter type "
-            + "names a type parameter this closure does not bind, so no instance of it can be "
-            + "chosen — call the function value from the generic function's own body, or pass "
-            + "a function of a concrete type",
-          ix,
-        )
+        return monoGenArgOpenFail(ix)
       }
       // Scope-aware and positioned, as `wasmEmit` resolves this call: the flat `fnIndexOf`
       // would hand a nested `<T>` template to the prune while the emitter calls it, and a
