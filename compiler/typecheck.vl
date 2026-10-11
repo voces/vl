@@ -583,6 +583,11 @@ const CODE_NARROWING_ENDED_BY_CALL = "narrowing-ended-by-call"
 // field, so the member call never reaches it. Data: `member`, `recv`, `rung` (`method`/`field`).
 const CODE_SELF_FN_SHADOWED = "self-fn-shadowed"
 
+// D3960 — a concrete function written to a `let` that keeps its initializer's generic type. Data:
+// `annot` (the written type, as an annotation), `line`/`col` (1-based line and 0-based column
+// just after the binding's name, where `check --fix` inserts `: annot`; absent across modules).
+const CODE_GENERIC_BINDING_CONCRETE_WRITE = "generic-binding-concrete-write"
+
 // ── checker state (one struct, held in the global `T`) ───────────────────────
 
 // `tys` is the type arena; `scopes` the scope chain of `name → type-index` maps (index 0
@@ -14801,6 +14806,7 @@ function isvalReset() {
   fnLitBindDepth = []
   fnLitBindName = []
   fnLitBindDecl = []
+  fsbReset()
   nlnDiag = []
   nlnMsg = []
   nlnText = []
@@ -14978,6 +14984,7 @@ function collBindPopTo(depth: i32) {
     bindMarkPopTo(fnLitBindDepth, fnLitBindName, depth)
     while fnLitBindDecl.length > fnLitBindName.length { fnLitBindDecl.pop() }
   }
+  fsbPopTo(depth)
 }
 
 // Is `ix` a numeric literal, possibly negated or parenthesised?
@@ -17311,6 +17318,188 @@ function lbiReport() {
     i = i + 1
   }
   0
+}
+
+// D3960 — a `let` whose un-annotated initializer is a generic function or an un-annotated lambda
+// keeps that generic type (owner ruling C), so a concrete function written to it is refused with
+// the annotation that would make the binding hold one. Rows are depth-tagged like `fnLitBind`; a
+// write to a module binding above its declaration waits for the declaration in `fsbPend*`.
+let fsbDepth: i32[] = []
+let fsbName: string[] = []
+let fsbRowDecl: i32[] = []
+let fsbPendName: string[] = []
+let fsbPendIx: i32[] = []
+let fsbPendTy: i32[] = []
+
+function fsbReset() {
+  fsbDepth = []
+  fsbName = []
+  fsbRowDecl = []
+  fsbPendName = []
+  fsbPendIx = []
+  fsbPendTy = []
+  0
+}
+
+function fsbPopTo(depth: i32) {
+  const l = fsbDepth.length
+  if l > 0 && fsbDepth[l - 1] >= depth {
+    bindMarkPopTo(fsbDepth, fsbName, depth)
+    while fsbRowDecl.length > fsbName.length { fsbRowDecl.pop() }
+  }
+  0
+}
+
+// The declaration of the marked binding the name read at `ix` resolves to, or -1.
+function fsbDeclAtNode(ix: i32): i32 {
+  if fsbName.length == 0 || ix < 0 { return -1 }
+  const n = P.nodes[parenPeelIx(ix)]
+  if n is Ident {
+    return bindMarkDeclOf(fsbDepth, fsbName, fsbRowDecl, n.identName)
+  }
+  -1
+}
+
+// Whether the function value `ix` of type `ty` is generic: its type has a type variable of its
+// own or an inference hole, it is a lambda with an un-annotated parameter, or it names a binding
+// that is one of those.
+function fsbIsGeneric(ix: i32, ty: i32): boolean {
+  if ty >= 0 && ty < T.tys.length && tyHasTyVar(ty) {
+    if tyHasInferHole(ty, 0) || !fsbTvsInScope(ty, 0) { return true }
+  }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return false }
+  if fsbIsHoleLambda(p) || fsbDeclAtNode(p) >= 0 { return true }
+  const n = P.nodes[p]
+  if n is Ident {
+    const d = bindMarkDeclOf(
+      fnLitBindDepth,
+      fnLitBindName,
+      fnLitBindDecl,
+      n.identName,
+    )
+    if d >= 0 {
+      const l = P.nodes[d]
+      if l is LetDecl { return fsbIsHoleLambda(parenPeelIx(l.letInit)) }
+    }
+  }
+  false
+}
+
+// Whether node `p` is a lambda with a parameter that has no annotation.
+function fsbIsHoleLambda(p: i32): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const f = P.nodes[p]
+  if f is FuncDecl {
+    if f.fnName != "" { return false }
+    for px in f.fnParams {
+      const pn = P.nodes[px]
+      if pn is Param {
+        if pn.parType < 0 { return true }
+      }
+    }
+  }
+  false
+}
+
+// Whether every type variable `ty` names is a parameter of the enclosing generic.
+function fsbTvsInScope(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return true }
+  const t = T.tys[ty]
+  match t {
+    TyVar => strListHas(tpEnvNames, t.tvName)
+    TyArray => fsbTvsInScope(t.aElem, depth + 1)
+    TyNullable => fsbTvsInScope(t.nInner, depth + 1)
+    TyNeg => fsbTvsInScope(t.negTy, depth + 1)
+    TyMap => fsbTvsInScope(t.mKey, depth + 1) && fsbTvsInScope(t.mVal, depth + 1)
+    TyObj => fsbTvsAllInScope(t.objFieldTypes, depth)
+    TyUnion => fsbTvsAllInScope(t.uMembers, depth)
+    TyFunc => fsbTvsAllInScope(t.fnParamTypes, depth) && fsbTvsInScope(t.fnRet, depth + 1)
+    TyPrim | TyErr | TyLit => true
+  }
+}
+
+function fsbTvsAllInScope(tys: i32[], depth: i32): boolean {
+  for x in tys {
+    if !fsbTvsInScope(x, depth + 1) { return false }
+  }
+  true
+}
+
+// Mark the binding `decl` just declared at `depth` with type `bound` when it is an un-annotated
+// `let` of a generic function value, and refuse the writes to it seen above its declaration.
+function fsbMark(name: string, depth: i32, decl: i32, bound: i32) {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letKw != "let" || n.letType >= 0 || n.letInit < 0 || inferQuiet {
+      return 0
+    }
+    if bound < 0 || bound >= T.tys.length { return 0 }
+    const bt = T.tys[bound]
+    if !(bt is TyFunc) || !fsbIsGeneric(n.letInit, bound) { return 0 }
+    bindMarkPush(fsbDepth, fsbName, name, depth)
+    fsbRowDecl.push(decl)
+    if depth == 0 {
+      let i = 0
+      while i < fsbPendName.length {
+        if fsbPendName[i] == name {
+          fsbRefuse(decl, fsbPendTy[i], fsbPendIx[i])
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// A write of `rhs`, of type `rt`, into the binding `tgt` names: refused when the binding is
+// marked and the value is a concrete function. A write to a module binding not declared yet waits.
+function fsbNoteStore(tgt: i32, rhs: i32, rt: i32, ix: i32) {
+  if inferQuiet || rt < 0 || rt >= T.tys.length { return 0 }
+  const t = T.tys[rt]
+  if !(t is TyFunc) || fsbIsGeneric(rhs, rt) { return 0 }
+  const d = fsbDeclAtNode(tgt)
+  if d >= 0 { return fsbRefuse(d, rt, ix) }
+  const g = P.nodes[parenPeelIx(tgt)]
+  if g is Ident {
+    if lookupDepth(g.identName) == 0 {
+      fsbPendName.push(g.identName)
+      fsbPendIx.push(ix)
+      fsbPendTy.push(rt)
+    }
+  }
+  0
+}
+
+// Refuse at `ix` the concrete function type `rt` written to the binding declared by `decl`, with
+// the annotation `check --fix` inserts after the binding's name when both are in one module.
+function fsbRefuse(decl: i32, rt: i32, ix: i32) {
+  const n = P.nodes[decl]
+  if !(n is LetDecl) { return 0 }
+  const annot = tyToStr(rt)
+  let data = ""
+  const tk = declNameTokOf(decl)
+  if tk >= 0 && tk < P.toks.length && rcwModOf(decl) == rcwModOf(ix) {
+    const t = P.toks[tk]
+    data = diagDataField("annot", annot)
+      + diagDataField("line", i32ToStr(t.line))
+      + diagDataField("col", i32ToStr(t.col + t.text.length))
+  }
+  tErrCodedData(
+    "cannot assign "
+      + annot
+      + " to `"
+      + n.letName
+      + "`: it keeps the generic type of its initializer, so a function written to it must be "
+      + "generic too — to hold this one, annotate it, `let "
+      + n.letName
+      + ": "
+      + annot
+      + " = …`",
+    ix,
+    CODE_GENERIC_BINDING_CONCRETE_WRITE,
+    data,
+  )
 }
 
 // Mark the binding `name` declared by `decl` at `depth` when its initializer is a lambda with no
@@ -64751,6 +64940,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // The narrowing is a path fact, and a falsifying write ends the path — only an accepted
     // write retires it, since a rejected write did not happen and would cascade a second diagnostic.
     if asgOk { retireNarrowingsForWrite(n.binLeft, rt, ix, asgPreTy) }
+    if asgOk { fsbNoteStore(n.binLeft, n.binRight, rt, ix) }
     // Assignment is an expression yielding its right-hand side (host parity;
     // DECISIONS: assignment-as-expression). A right side only the expression seam admits
     // (`[3.5, 4]` into `(i32 | f64)[]`) is built at the place's type, so it yields that (D2394).
@@ -65788,6 +65978,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   }
   if !preHoisted { lbiMark(n.letName, T.scopes.length - 1, ix, bound) }
   if !preHoisted { markFnLitBinding(n.letName, T.scopes.length - 1, ix) }
+  fsbMark(n.letName, T.scopes.length - 1, ix, bound)
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.
   if annotCollapsedHere {
