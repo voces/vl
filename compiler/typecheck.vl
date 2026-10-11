@@ -405,7 +405,13 @@ import {
   stdRecvSpec,
   stdRecvTparams,
 } from "./std_receivers"
-import { mimpClear, mimpExportedByNote, mimpSpecsFor } from "./missing_import"
+import {
+  mimpAnyProgramSpec,
+  mimpClear,
+  mimpExportedByNote,
+  mimpNoteMiss,
+  mimpSpecsFor,
+} from "./missing_import"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -41817,6 +41823,8 @@ function stdFmtMovedNote(name: string) {
 function undeclaredImportRaise(name: string, ix: i32): boolean {
   const from = ufcsModOfNode(ix)
   const specs = mimpSpecsFor(name, from, -1)
+  // No program module answered: a file the program does not import yet may, beside std.
+  if !mimpAnyProgramSpec(specs) { mimpNoteMiss(name) }
   if specs.length == 0 { return false }
   let data = diagDataField("member", name)
   for s in specs { data = data + diagDataField("modules", s) }
@@ -50493,9 +50501,22 @@ function dstTyParamAdapts(
   const oneT: i32[] = [cand]
   let seen = 0
   let own = -1
+  let nulls = 0
   let i = 0
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name, 8) {
+      if i < args.length && args[i] >= 0 && argIsNullLit(args[i]) {
+        // A bare `null` binds `T` to the null type, an instance no destination wants: the
+        // destination's binding is taken whenever it holds `null` (DV-402).
+        if !assignable(TY_NULL, substTyDeep(params[i], one, oneT)) {
+          return false
+        }
+        nulls = nulls + 1
+        seen = seen + 1
+        if own < 0 { own = TY_NULL }
+        i = i + 1
+        continue
+      }
       if i >= args.length || args[i] < 0 || !argIsLitOnly(args[i], 4) {
         return false
       }
@@ -50533,6 +50554,7 @@ function dstTyParamAdapts(
     i = i + 1
   }
   if seen == 0 || own < 0 || tySame(own, cand) { return false }
+  if nulls == seen { return true }
   // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
   // is the program's, and a body doing arithmetic on `T` must keep computing at it.
   const savedQ2 = inferQuiet
@@ -50620,6 +50642,13 @@ function argIsLitOnly(ix: i32, depth: i32): boolean {
 // Every other node, a name, a lambda or a record literal among them, has a type of its own.
 function argNotLitOnly(): boolean { false }
 
+// Whether the argument `ix` is the literal `null`, through parentheses.
+function argIsNullLit(ix: i32): boolean {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  P.nodes[x] is NullLit
+}
+
 // Records `ty` as the destination of each call `ix` yields: itself, or a leaf of the `if`,
 // `match` or block it is, so a type parameter its literals bind reads the destination too.
 function seedCallDstLeaves(ix: i32, ty: i32) {
@@ -50703,6 +50732,14 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
   if cfn is Ident {
     const nm = cfn.identName
     if (nm == "Map" || nm == "Set") && lookupDepth(nm) < 0 { return true }
+    if (
+      arrayCtorNote(nm) != ""
+      && lookupDepth(nm) < 0
+      && lookupFnDeclNode(nm) < 0
+    ) {
+      tErr("explicit type arguments on `Array`" + arrayCtorNote(nm), ix)
+      return false
+    }
     const dIx = lookupFnDeclNode(nm)
     if dIx >= 0 {
       const d = P.nodes[dIx]
@@ -50725,6 +50762,13 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
     ix,
   )
   false
+}
+
+// The redirect for another language's list constructor, keyed on the spelling `Array`; ""
+// for any other name.
+function arrayCtorNote(name: string): string {
+  if name != "Array" { return "" }
+  " — VL has no `Array` constructor: `n` copies of `v` is `filled(n, v)` (`import { filled } from \"std:array\"`), and an empty list is `[]`"
 }
 
 // Appended where a call read as `name<…>(…)` fails: the source may have meant a comparison,
@@ -56372,7 +56416,14 @@ function checkNodeReal(ix: i32) {
       }
       const moved = stdFmtMovedNote(n.identName)
       if moved == "" && undeclaredImportRaise(n.identName, ix) { return TY_ERR }
-      tErr("undeclared identifier '" + n.identName + "'" + moved, ix)
+      tErr(
+        "undeclared identifier '"
+          + n.identName
+          + "'"
+          + moved
+          + arrayCtorNote(n.identName),
+        ix,
+      )
       return TY_ERR
     }
     // `ty` is this use's type as the checker resolved it — narrowed when the use
@@ -57115,6 +57166,17 @@ export function nulRecListNominalName(ty: i32): string {
   if el is TyNullable {
     const nom = nominalStructNameOfTy(el.nInner)
     if nom != "" { return "(" + nom + "|null)[]" }
+  }
+  ""
+}
+
+// `Name|null` for a nullable declared record, the spelling its rep is interned under, else "".
+export function nulRecNominalName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const nom = nominalStructNameOfTy(t.nInner)
+    if nom != "" { return nom + "|null" }
   }
   ""
 }

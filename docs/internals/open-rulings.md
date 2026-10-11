@@ -1597,6 +1597,15 @@ all three rungs — so the flag is a convenience over an existing route, not the
 exact failure mode this index exists to catch; it resurfaced as an open blocker on the workboard.
 Recorded here and in `DECISIONS.md`.
 
+**RE-OPENED FOR THE OWNER 2026-10-11 (lane PF, diderven DV-1000/DV-1001).** New evidence:
+V8 scales its own wasm inlining budget by the module's share of small functions, so after
+`-O3` strips VL's small stubs, a helper binaryen leaves alone is often inlined by nobody.
+This is why `-O3` measures slower than the default on both DV kernels. Measurements and four
+options are in `docs/internals/perf/v8-inline-budget-2026-10.md`. The recommendation is
+`--flexible-inline-max-function-size 40` in `RELEASE_PASSES` (+5.7% on the compiler at
+`-O3`, +2.9% on diderven's game, DV-1000 at `-O3` 1.5x faster). The flag ruled here has
+never been built.
+
 ### `N5-variance-defaults-and-surface` (workboard C8) — RULED 2026-08-18: inferred, no surface
 
 **Ruling: the A8/A9 defaults are as the owner already wrote them; the surface is NONE in v1; there

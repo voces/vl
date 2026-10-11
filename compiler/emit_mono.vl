@@ -92,6 +92,7 @@ import {
   nonNullTy,
   nulNumScalarUnionName,
   nulRecListNominalName,
+  nulRecNominalName,
   numLitUnionBaseName,
   numUnionMinted,
   numUnionResultTy,
@@ -331,6 +332,7 @@ import {
   unNames,
 } from "./emit_state"
 import { emitFail, emitFailAt } from "./emit_bytes"
+import { parseI32 } from "./emit_bignum"
 import {
   TY_WALK_DEPTH,
   anonHandleTyIx,
@@ -1162,6 +1164,12 @@ function monoAnonArgSoftens(argIx: i32, ty: i32): boolean {
 // one and const-folds on it; narrowing there would fold a guard this pass cannot decide.
 function monoArgPinName(ix: i32, fnIx: i32) {
   const w = monoArgTyName(ix, fnIx)
+  // A bare `null` typed by its destination (DV-402) pins the declared record's nullable name,
+  // as a binding annotated with it does; its structural render would intern another row.
+  if P.nodes[unwrapParen(ix)] is NullLit {
+    const nn = nulRecNominalName(nodeTyIxOf(unwrapParen(ix)))
+    if nn != "" { return nn }
+  }
   const n = monoNarrowedPinName(unwrapParen(ix), w)
   if n != "" { return n }
   const wd = monoNicheWidenedPinName(unwrapParen(ix), w)
@@ -9358,6 +9366,8 @@ function monoCoerceFnValueName(
     // escaping lambda binding materializes at the boundary type too.
     // A reassigned `let` is read as itself: the generic functions written into it take this type.
     if monoCoerceWrittenLet(e.identName, exprIx, ctx, tname) { return 0 }
+    // An alias of a capture cell's read delivers that cell (D3948).
+    if monoCoerceAliasOfCell(e.identName, exprIx, ctx, tname) { return 0 }
     let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
     // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
     if gfe < 0 { gfe = monoGenFnAliasChainFe(e.identName, exprIx, ctx) }
@@ -9448,6 +9458,36 @@ function monoCellSeedGenFe(name: string, at: i32, ctx: i32): i32 {
   fe
 }
 
+// The hole lambda the capture cell `name` read at `at` is seeded with, as a slot; -1 for any
+// other seed. Read off the seed itself, since the binding's writes make its alias chain decline.
+function monoCellSeedLamFe(name: string, at: i32, ctx: i32): i32 {
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 { return -1 }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return -1 }
+  const cel = monoGeneratedCellElem(d.letInit)
+  if cel < 0 { return -1 }
+  const seed = unwrapParen(cel)
+  if seed < 0 { return -1 }
+  const fe = monoLamValueFe(seed, lf[0])
+  if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
+  fe
+}
+
+// Whether the capture cell `name` read at `at` is seeded with a lambda literal, whose call
+// arguments rather than the callee's recorded type give its signature; a lambda reached by name
+// is instanced per use instead.
+function monoCellSeedIsLamLit(name: string, at: i32, ctx: i32): boolean {
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 { return false }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) { return false }
+  const cel = monoGeneratedCellElem(d.letInit)
+  if cel < 0 { return false }
+  const seed = unwrapParen(cel)
+  seed >= 0 && P.nodes[seed] is FuncDecl
+}
+
 // A function type spelling whose parameters are the pins of signature `sig` (`p1,p2,;`); the
 // return is not read by the coercions this feeds. "" for an empty signature.
 function monoSigFnTyName(sig: string): string {
@@ -9460,6 +9500,365 @@ function monoSigFnTyName(sig: string): string {
     first = false
   }
   out + ")=>void"
+}
+
+// For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
+// after their initializer ends at a capture cell's read (`const r = k[0]`): coerces that cell at
+// `tname` as `monoCoerceWrittenCell` does, and answers true when it finds one.
+function monoCoerceAliasOfCell(
+  name: string,
+  at: i32,
+  ctx: i32,
+  tname: string,
+): boolean {
+  if annArrowAt(tname) < 1 { return false }
+  const ar = monoAliasCellRead(name, at, ctx)
+  if ar[0] < 0 { return false }
+  monoCoerceWrittenCell(monoCellReadName(ar[0]), ar[0], ar[1], tname)
+}
+
+// Whether node `v`, read in frame `ctx`, is a name `monoAliasCellRead` resolves to a cell.
+function monoNamesCellAlias(v: i32, ctx: i32): boolean {
+  const x = unwrapParen(v)
+  if x < 0 { return false }
+  const cn = monoCellReadName(x)
+  if cn != "" { return monoNamesGeneratedCell(cn, x, ctx) }
+  const nm = monoIdentNameOf(x)
+  nm != "" && monoAliasCellRead(nm, x, ctx)[0] >= 0
+}
+
+// The list literal a `const` initializes, walked while its reads are all element calls.
+let monoCellAliasListOk = 0 - 1
+
+// Whether node `v` is a program's list literal holding an alias of a capture cell's read.
+function monoListInitHoldsCellAlias(v: i32, ctx: i32): boolean {
+  if v < 0 { return false }
+  const lit = P.nodes[v]
+  if !(lit is ArrayLit) || lit.pos < 0 { return false }
+  for e in lit.arrElems {
+    if monoNamesCellAlias(e, ctx) { return true }
+  }
+  false
+}
+
+// The element a literal index spelled `text` names in a list of `len` elements, by value in any
+// base the lexer keeps (`0`, `00`, `0x0`); -1 for a fraction, an exponent, or out of range.
+function monoListLitIndex(text: string, len: i32): i32 {
+  if text.length == 0 || text.length > 12 { return -1 }
+  const hex = text.length > 1 && (text[1] == "x"[0] || text[1] == "X"[0])
+  for ch in text {
+    if ch == "."[0] || ch == "-"[0] { return -1 }
+    if !hex && (ch == "e"[0] || ch == "E"[0]) { return -1 }
+  }
+  const v = parseI32(text)
+  if v < 0 || v >= len { return -1 }
+  v
+}
+
+// The element count of the list literal at node `v`; -1 for any other node.
+function monoListLitLength(v: i32): i32 {
+  if v < 0 { return -1 }
+  const lit = P.nodes[v]
+  if lit is ArrayLit { return lit.arrElems.length }
+  -1
+}
+
+// Whether the read `ix` of `name` under frame `fx` (-1 for the module) is of the binding
+// declared at `decl`.
+function monoReadIsBinding(ix: i32, name: string, fx: i32, decl: i32): boolean {
+  let fr = monoTopFrameOf(ix)
+  if fx >= 0 { fr = monoFrameOfNode(ix, fx) }
+  monoLetFrameOf(name, ix, fr)[1] == decl
+}
+
+// Whether every read in frame `fx`'s body of the list `name` declared at `decl`, of `len`
+// elements, is the callee of a call of one element at a literal index that names one.
+function monoListOnlyCalled(
+  fx: i32,
+  name: string,
+  decl: i32,
+  len: i32,
+): boolean {
+  const stack: i32[] = []
+  const called: i32[] = []
+  if fx >= 0 {
+    const b = monoNestedBodyOf(fx)
+    if b < 0 { return false }
+    stack.push(b)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const c = P.nodes[n.callFn]
+        if c is Index {
+          const a = P.nodes[c.idxArr]
+          const k = P.nodes[c.idxIndex]
+          if a is Ident && k is NumLit {
+            if a.identName == name && monoListLitIndex(k.numText, len) >= 0 {
+              called.push(c.idxArr)
+            }
+          }
+        }
+      }
+      if n is Ident {
+        if (
+          n.identName == name
+          && !i32ListHas(called, ix)
+          && monoReadIsBinding(ix, name, fx, decl)
+        ) {
+          return false
+        }
+      }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  true
+}
+
+// For a callee `fs[k]` whose list `fs` a `const` initializes with a literal whose element `k`
+// is an alias of a capture cell's read: that read as `[read, frame]`; `[-1, -1]` otherwise.
+function monoListElemCellRead(callee: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  const el = monoListElemOf(callee, ctx)
+  if el[0] < 0 { return none }
+  const e = el[0]
+  // The cell itself placed in the list (`[k]`) is its own read (D3977).
+  const cn = monoCellReadName(e)
+  if cn != "" {
+    if !monoNamesGeneratedCell(cn, e, el[1]) { return none }
+    const out: i32[] = [e, el[1]]
+    return out
+  }
+  const nm = monoIdentNameOf(e)
+  if nm == "" { return none }
+  monoAliasCellRead(nm, e, el[1])
+}
+
+// For a callee `fs[k]` whose list `fs` a `const` initializes with a literal: element `k` and the
+// list's frame, as `[element, frame]`; `[-1, -1]` for any other callee.
+function monoListElemOf(callee: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  const c = P.nodes[callee]
+  if !(c is Index) { return none }
+  const a = P.nodes[c.idxArr]
+  const k = P.nodes[c.idxIndex]
+  if !(a is Ident) || !(k is NumLit) { return none }
+  const lf = monoLetFrameOf(a.identName, c.idxArr, ctx)
+  if lf[1] < 0 { return none }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letKw != "const" || d.letInit < 0 { return none }
+  const lit = P.nodes[d.letInit]
+  if !(lit is ArrayLit) || lit.pos < 0 { return none }
+  const at = monoListLitIndex(k.numText, lit.arrElems.length)
+  if at < 0 { return none }
+  const out: i32[] = [unwrapParen(lit.arrElems[at]), lf[0]]
+  out
+}
+
+// Whether node `v` is a program's list literal one of whose elements names a declared generic
+// function, by name or through never-written aliases.
+function monoListInitHoldsGeneric(v: i32, ctx: i32): boolean {
+  if v < 0 { return false }
+  const lit = P.nodes[v]
+  if !(lit is ArrayLit) || lit.pos < 0 { return false }
+  for e in lit.arrElems {
+    if monoListElemGenFe(e, ctx) >= 0 { return true }
+  }
+  false
+}
+
+// The declared generic function list element `e` names in frame `ctx`, as a slot; -1 otherwise.
+function monoListElemGenFe(e: i32, ctx: i32): i32 {
+  const x = unwrapParen(e)
+  if x < 0 { return -1 }
+  const nm = monoIdentNameOf(x)
+  if nm == "" { return -1 }
+  // A written `let` holds its latest write, which no pin of the list can follow (D3978).
+  const lf = monoLetFrameOf(nm, x, ctx)
+  if lf[1] >= 0 {
+    const d = P.nodes[lf[1]]
+    if d is LetDecl {
+      if d.letKw != "const" && monoNameIsAssigned(nm) { return -1 }
+    }
+  }
+  if monoNamesDeclaredGeneric(x, ctx) { return monoFnFeOfIdent(x, nm, ctx) }
+  monoGenFnAliasChainFe(nm, x, ctx)
+}
+
+// Gives the un-annotated `const` list `d` declared at `at` the function type its element calls
+// take, as an annotation, so its generics are instanced at it. Leaves alone a list whose element
+// type is concrete, that is read other than by element calls, or whose calls it cannot type; -1
+// when the calls take two types (refused).
+function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
+  if d.letInit < 0 || d.letKw != "const" { return 0 }
+  const lit = P.nodes[d.letInit]
+  if !(lit is ArrayLit) { return 0 }
+  const rt = nodeTyIxOf(d.letInit)
+  if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyArray && !tyHasTyVar(rt) {
+    return 0
+  }
+  if !monoListOnlyCalled(ctx, d.letName, at, lit.arrElems.length) { return 0 }
+  let sig = ""
+  let ft = -1
+  for c in monoListElemCalls(ctx, d.letName, at) {
+    const call = P.nodes[c]
+    if !(call is Call) { return 0 }
+    const el = monoListElemOf(call.callFn, ctx)
+    if el[0] < 0 { return 0 }
+    const ret = nodeTyIxOf(c)
+    if ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) { return 0 }
+    let one = ""
+    const g = monoListElemGenFe(el[0], el[1])
+    if g >= 0 {
+      monoLastInstFe = -1
+      if monoInstantiate(g, c, ctx) < 0 { return -1 }
+      if monoLastInstFe < 0 { return 0 }
+      one = monoSlotSig(monoLastInstFe)
+      if ft < 0 {
+        ft = monoPinSubTyOf(nodeTyIxOf(el[0]), fnStmts[monoLastInstFe])
+      }
+    } else {
+      const t = nodeTyIxOf(el[0])
+      if t < 0 || t >= T.tys.length || tyHasTyVar(t) || !(T.tys[t] is TyFunc) {
+        return 0
+      }
+      const ps: string[] = []
+      const tf = T.tys[t]
+      if tf is TyFunc {
+        for pt in tf.fnParamTypes { ps.push(tyToEmitName(pt)) }
+      }
+      for pn in ps { one = one + pn + "," }
+      one = one + ";"
+      if ft < 0 { ft = t }
+    }
+    one = one + tyToEmitName(ret)
+    if sig != "" && sig != one { return monoGenericListFail(d.letInit) }
+    sig = one
+  }
+  if sig == "" { return 0 }
+  const semi = sig.indexOf(";")
+  const fty = monoSigFnTyName(sig.slice(0, semi + 1))
+  const arrow = fty.indexOf("=>")
+  if arrow < 0 { return 0 }
+  const ann = "("
+    + fty.slice(0, arrow)
+    + "=> "
+    + sig.slice(semi + 1, sig.length)
+    + ")[]"
+  // The list and its element calls take the pin's type, which their recorded types lack.
+  if !monoTyConcreteFn(ft) { return 0 }
+  const lt = mkArrayTy(ft)
+  d.letType = synthTypeRefTy(ann, -1, lt)
+  monoArenaTouch()
+  nodeTyRecord(d.letInit, lt)
+  for e in lit.arrElems {
+    const et = nodeTyIxOf(e)
+    if et < 0 || tyHasTyVar(et) { nodeTyRecord(e, ft) }
+  }
+  for c in monoListElemCalls(ctx, d.letName, at) {
+    const call = P.nodes[c]
+    if call is Call {
+      nodeTyRecord(call.callFn, ft)
+      const ix = P.nodes[call.callFn]
+      if ix is Index { nodeTyRecord(ix.idxArr, lt) }
+    }
+  }
+  0
+}
+
+// The calls `name[k](…)` in frame `fx`'s body of the list declared at `decl`, as call nodes.
+function monoListElemCalls(fx: i32, name: string, decl: i32): i32[] {
+  const out: i32[] = []
+  const stack: i32[] = []
+  if fx >= 0 {
+    const b = monoNestedBodyOf(fx)
+    if b < 0 { return out }
+    stack.push(b)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const c = P.nodes[n.callFn]
+        if c is Index {
+          const a = P.nodes[c.idxArr]
+          if a is Ident {
+            if (
+              a.identName == name
+              && monoReadIsBinding(c.idxArr, name, fx, decl)
+            ) {
+              out.push(ix)
+            }
+          }
+        }
+      }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  out
+}
+
+// The refusal for a list of generic functions whose calls give it no one function type.
+function monoGenericListFail(at: i32): i32 {
+  emitFailAt(
+    "emitProgram: a list holding a generic function is called through its elements at more than "
+      + "one type, so its elements have no one instance — annotate the "
+      + "list's element type",
+    at,
+  )
+}
+
+// The refusal for an alias of a capture cell's read stored in a list, at node `at`.
+function monoCellAliasListFail(at: i32): i32 {
+  emitFailAt(
+    "emitProgram: an alias of a captured, reassigned function binding is stored in a list, "
+      + "whose calls the binding's one signature cannot follow — store the binding's value in "
+      + "an annotated local first, or call it directly",
+    at,
+  )
+}
+
+// The capture cell read `[read, frame]` that the name read at `at` in frame `ctx` reaches through
+// a chain of un-annotated aliases never written after their initializer; `[-1, -1]` for none.
+function monoAliasCellRead(name: string, at: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  let nm = name
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    const lf = monoLetFrameOf(nm, ax, fr)
+    if lf[1] < 0 { return none }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return none }
+    if d.letKw != "const" && monoNameIsAssigned(nm) { return none }
+    const iv = unwrapParen(d.letInit)
+    if iv < 0 { return none }
+    const cn = monoCellReadName(iv)
+    if cn != "" {
+      if !monoNamesGeneratedCell(cn, iv, lf[0]) { return none }
+      const out: i32[] = [iv, lf[0]]
+      return out
+    }
+    const nx = monoIdentNameOf(iv)
+    if nx == "" { return none }
+    nm = nx
+    ax = iv
+    fr = lf[0]
+    hops = hops + 1
+  }
+  none
 }
 
 // The walk both share: `key` is `n:` for writes of the name, `c:` for writes of its cell.
@@ -9606,6 +10005,16 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
   // A hole lambda holds one signature, whichever instance or cell writes it.
   const lfe = monoLamValueFe(x, ctx)
   if lfe >= 0 {
+    // A hole lambda written as a literal is pinned at this type, as a call through the cell pins
+    // it (D3950); the pin annotates it in place, so its parameters are read as first seen.
+    if P.nodes[x] is FuncDecl && monoLamIsHole(lfe) {
+      if !monoCellSigRecord(monoOrigNode[lfe], tname) { return 1 }
+      if lfe < monoGen.length && monoGen[lfe] == 1 {
+        return monoCellLamTake(lfe, x, tname, ctx)
+      }
+      return 0
+    }
+    // One reached by name keeps its binding's rules (D3857), with one signature per lambda.
     const key = monoLamSigKey(lfe)
     if !monoCellSigRecord(key, tname) { return 1 }
     // A lambda with every parameter annotated has its own type to compare.
@@ -9715,6 +10124,29 @@ function monoLamSigKey(lfe: i32): i32 {
   own
 }
 
+// Lambda slots seen with an un-annotated parameter; a pin annotates it in place, so the first
+// answer is kept.
+let monoHoleLamSlots: {[i32]: boolean} = Map()
+
+// Whether lambda slot `lfe` declares an un-annotated parameter, as first read.
+function monoLamIsHole(lfe: i32): boolean {
+  if monoHoleLamSlots.get(lfe) ?? false { return true }
+  if lfe < 0 || lfe >= monoOrigNode.length { return false }
+  const orig = P.nodes[monoOrigNode[lfe]]
+  if orig is FuncDecl {
+    for pi in orig.fnParams {
+      const pn = P.nodes[pi]
+      if pn is Param {
+        if pn.parType < 0 {
+          monoHoleLamSlots.set(lfe, true)
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
 // Whether `name`, read at `at` in frame `ctx`, is a capture cell the rewrite built rather than a
 // list the program declared.
 function monoNamesGeneratedCell(name: string, at: i32, ctx: i32): boolean {
@@ -9744,6 +10176,37 @@ function monoCellConcreteTake(t: i32, tname: string, open: i32): i32 {
   if !(f is TyFunc) { return 2 }
   const want = monoFnNameSig(tname)
   if want == "" || monoFnNameSig(monoConcreteFnTyName(ft)) != want { return 1 }
+  0
+}
+
+// Pins hole lambda `lfe`, the value at node `x` in frame `ctx`, at function type `tname`, where
+// nothing has yet: 0 when the lambda the cell holds then has that signature (and it is the last
+// instance), 1 when it holds another, 2 when it cannot take the type.
+function monoCellLamTake(lfe: i32, x: i32, tname: string, ctx: i32): i32 {
+  const pnames: string[] = []
+  if !monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames) {
+    return 2
+  }
+  let want = ""
+  for pn in pnames { want = want + normTypeAtom(pn) + "," }
+  const had = monoInstantiatedAny(lfe)
+  if !had {
+    monoLastInstFe = -1
+    monoCallFrameSlot = monoNestedCallFrame(lfe, ctx)
+    const r = monoInstanceFor(lfe, pnames, x, -1)
+    monoCallFrameSlot = -1
+    if r < 0 || monoLastInstFe < 0 { return 2 }
+  }
+  const pins: string[] = []
+  if !monoSlotParamPins(lfe, pins) { return 2 }
+  let got = ""
+  for pn in pins { got = got + normTypeAtom(pn) + "," }
+  if got != want {
+    if had { return 1 }
+    return 2
+  }
+  // The cell is retyped to the lambda it holds.
+  monoLastInstFe = lfe
   0
 }
 
@@ -11107,6 +11570,68 @@ function monoAliasChainLamFe(
   )
 }
 
+// The cell half of `monoWalk` for call `n` at `ix` in frame `ctx` through capture cell `cellNm`,
+// read at node `at` in frame `cctx` (the call's own callee, or the read an alias of it is
+// initialized with): -1 on a refusal, 1 when the call is settled, 0 to walk on.
+function monoCellCall(
+  n: Call,
+  ix: i32,
+  cellNm: string,
+  at: i32,
+  cctx: i32,
+  ctx: i32,
+  viaAlias: boolean,
+): i32 {
+  // A call in a function nothing names never runs, so it asks nothing of the cell (D3864).
+  const cellFr = monoLetFrameOf(cellNm, at, cctx)[0]
+  const live = cellFr < 0 || !monoWriteFrameDead(ctx, cellFr)
+  const cfe = monoCellLamFe(cellNm, at, cctx)
+  if !viaAlias && cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
+    monoLastInstFe = -1
+    const rc = monoInstantiate(cfe, ix, ctx)
+    monoNoteBindCall(cellNm, at, cctx)
+    if rc < 0 { return -1 }
+    return 1
+  }
+  // A cell seeded with a named generic is called at the instance this call's arguments take
+  // of the seed, since retyping the cell rewrites the callee's recorded type; any other cell
+  // at the callee's type (D3939).
+  let ctn = ""
+  const sfe = monoCellSeedGenFe(cellNm, at, cctx)
+  if sfe < 0 { ctn = monoConcreteFnTyName(nodeTyIxOf(n.callFn)) }
+  // An alias is a value the cell's writes may have replaced, so its call is never renamed.
+  if viaAlias { monoNoRename.push(n.callFn) }
+  if sfe >= 0 {
+    monoLastInstFe = -1
+    if monoInstantiate(sfe, ix, ctx) < 0 { return -1 }
+    ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+  }
+  // A hole lambda seed is pinned by this call's arguments, which the callee's recorded type
+  // need not agree with, and a generic written beside it takes the lambda's signature (D3951).
+  const lfe = monoCellSeedLamFe(cellNm, at, cctx)
+  if (
+    sfe < 0
+    && live
+    && (ctn == "" || monoCellSeedIsLamLit(cellNm, at, cctx))
+    && lfe >= 0
+    && lfe < monoGen.length
+    && monoGen[lfe] == 1
+  ) {
+    monoLastInstFe = -1
+    if monoInstantiate(lfe, ix, ctx) < 0 { return -1 }
+    monoNoteBindCall(cellNm, at, cctx)
+    ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+  }
+  if ctn != "" && (live || sfe >= 0) {
+    monoCoerceWrittenCell(cellNm, at, cctx, ctn)
+  }
+  // One cell holds one signature: a second call type is the binding conflict, refused.
+  if ctn != "" && sfe >= 0 {
+    if monoNoteBindDeliveryAt(at, ctn, cctx) < 0 { return -1 }
+  }
+  0
+}
+
 // The longest alias chain `monoAliasChainLamFe` follows before refusing.
 const MONO_ALIAS_CHAIN_MAX = 64
 
@@ -11340,6 +11865,14 @@ function monoWalk(ix: i32, ctx: i32) {
       if dfe < 0 && monoGenArgAtOpenParam(n, ctx) {
         return monoGenArgOpenFail(ix)
       }
+      // A call through an alias of a capture cell's read is a call through that cell (D3948).
+      if dfe < 0 {
+        const ar = monoAliasCellRead(callee.identName, n.callFn, ctx)
+        if ar[0] >= 0 {
+          const an = monoCellReadName(ar[0])
+          if monoCellCall(n, ix, an, ar[0], ar[1], ctx, true) < 0 { return -1 }
+        }
+      }
       // Scope-aware and positioned, as `wasmEmit` resolves this call: the flat `fnIndexOf`
       // would hand a nested `<T>` template to the prune while the emitter calls it, and a
       // binding in scope at the call must shadow a namesake nested in another frame (D2759).
@@ -11432,32 +11965,18 @@ function monoWalk(ix: i32, ctx: i32) {
       }
       return 0
     }
+    // A call of a list element that is an alias of a capture cell's read is a call through it.
+    const le = monoListElemCellRead(n.callFn, ctx)
+    if le[0] >= 0 {
+      const an = monoCellReadName(le[0])
+      if monoCellCall(n, ix, an, le[0], le[1], ctx, true) < 0 { return -1 }
+    }
     // A call through the capture cell of a `let` alias of a hole lambda (D3845).
     const cellNm = monoCellReadName(n.callFn)
     if cellNm != "" {
-      const cfe = monoCellLamFe(cellNm, n.callFn, ctx)
-      if cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
-        monoLastInstFe = -1
-        const rc = monoInstantiate(cfe, ix, ctx)
-        monoNoteBindCall(cellNm, n.callFn, ctx)
-        return rc
-      }
-      // A cell seeded with a named generic is called at the instance this call's arguments take
-      // of the seed, since retyping the cell rewrites the callee's recorded type; any other cell
-      // at the callee's type (D3939).
-      let ctn = ""
-      const sfe = monoCellSeedGenFe(cellNm, n.callFn, ctx)
-      if sfe < 0 { ctn = monoConcreteFnTyName(nodeTyIxOf(n.callFn)) }
-      if sfe >= 0 {
-        monoLastInstFe = -1
-        if monoInstantiate(sfe, ix, ctx) < 0 { return -1 }
-        ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
-      }
-      if ctn != "" { monoCoerceWrittenCell(cellNm, n.callFn, ctx, ctn) }
-      // One cell holds one signature: a second call type is the binding conflict, refused.
-      if ctn != "" && sfe >= 0 {
-        if monoNoteBindDeliveryAt(n.callFn, ctn, ctx) < 0 { return -1 }
-      }
+      const cr = monoCellCall(n, ix, cellNm, n.callFn, ctx, ctx, false)
+      if cr < 0 { return -1 }
+      if cr == 1 { return 0 }
     }
     if monoWalk(n.callFn, ctx) < 0 { return -1 }
     monoTypeCallOfCall(ix, ctx)
@@ -11473,6 +11992,22 @@ function monoWalk(ix: i32, ctx: i32) {
     return 0
   }
   if n is LetDecl {
+    // A list holding an alias of a capture cell's read is followed only where every read of it
+    // is a call of one element (`fs[0](…)`), which is taken through the cell.
+    if monoListInitHoldsCellAlias(n.letInit, ctx) {
+      if (
+        n.letKw != "const"
+        || !monoListOnlyCalled(ctx, n.letName, ix, monoListLitLength(n.letInit))
+      ) {
+        return monoCellAliasListFail(n.letInit)
+      }
+      monoCellAliasListOk = n.letInit
+    }
+    // A list of generic functions called only through its elements takes the type the calls give
+    // it, as an annotation would (D3977).
+    if monoListInitHoldsGeneric(n.letInit, ctx) && n.letType < 0 {
+      if monoPinGenericList(n, ix, ctx) < 0 { return -1 }
+    }
     // An annotated function-typed binding to a generic named function: materialize the
     // instance for the annotation's param types and point the binding at it, so the value
     // carries that concrete type independent of any call — it may escape where call-driven
@@ -11563,6 +12098,15 @@ function monoWalk(ix: i32, ctx: i32) {
     const es = n.arrElems
     let i3 = 0
     while i3 < es.length {
+      // An alias of a capture cell's read in a program's list is called through the list, which
+      // the cell path does not follow, so it cannot be held to the cell's one signature.
+      if (
+        n.pos >= 0
+        && ix != monoCellAliasListOk
+        && monoNamesCellAlias(es[i3], ctx)
+      ) {
+        return monoCellAliasListFail(es[i3])
+      }
       if monoWalk(es[i3], ctx) < 0 { return -1 }
       i3 = i3 + 1
     }
@@ -13117,6 +13661,7 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoCellCoercedSig = Map()
+  monoHoleLamSlots = Map()
   monoBuiltinCbLamsBuilt = false
   monoBindCallFrame = Map()
   monoDeliveredArgs = []
