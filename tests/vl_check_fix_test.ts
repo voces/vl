@@ -489,3 +489,13 @@ fixCase(
   "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
     "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
 );
+
+fixCase(
+  "a non-numeric cast to the type its operand already has is dropped, keeping the operand",
+  {
+    "main.vl": "function g(t: string | i32) {\n  if t is string {\n    print((t as! string).length)\n" +
+      "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s as string)\n",
+  },
+  "function g(t: string | i32) {\n  if t is string {\n    print((t).length)\n" +
+    "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s)\n",
+);
