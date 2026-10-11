@@ -431,3 +431,31 @@ Deno.test({
     }
   },
 });
+
+fixCase(
+  "a file beside it exporting a std name is listed with std, and two exporters edit nothing",
+  {
+    "geo.vl": "export function hypotF64(a: f64, b: f64): f64 { a + b }\n",
+    "main.vl": "print(hypotF64(3.0, 4.0))\n",
+  },
+  "print(hypotF64(3.0, 4.0))\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a file beside it that does not lex is named as skipped, and the rest still answer",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_skip_" });
+    try {
+      await Deno.writeTextFile(`${dir}/bad.vl`, 'export const Q = "unterminated\n');
+      await Deno.writeTextFile(`${dir}/ids.vl`, "export const SPR_A: i32 = 1\n");
+      await Deno.writeTextFile(`${dir}/main.vl`, "print(SPR_A)\n");
+      const plain = await check(`${dir}/main.vl`);
+      for (const want of ['`SPR_A` is exported by "./ids"', `skipped ${dir}/bad.vl: it does not lex`]) {
+        if (!plain.err.includes(want)) throw new Error(`want ${want}\ngot\n${plain.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
