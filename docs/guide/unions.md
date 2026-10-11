@@ -99,6 +99,10 @@ print(area({ kind: "square", r: 2.0 }))   // prints 4
 The answer depends on the value only. A `{ kind: "circle", r: 1.0 }` is a `Circle`
 whether or not it was ever declared as one.
 
+Today the arms' other fields must also have the same types. When they differ
+(`{ kind: "a", v: i32 } | { kind: "b", v: string }`), the program passes `vl check` and its
+build fails with "union `A|B` cannot be discriminated" (D3033).
+
 Arms with the same field names and no literal field to tell them apart are refused, and so
 are arms whose literal fields have no common base type (a string beside an integer):
 
@@ -108,6 +112,11 @@ type B = { v: boolean }
 function f(s: A | B): boolean { s is A }
 // refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
 ```
+
+Whether the first of these refusals is a design rule is pending an owner question (Q4 in
+`docs/spec/OPEN-QUESTIONS.md`): the 2026-09-02 ruling that called it one is amended, and
+no later ruling restates it. The second prints the same sentence, which is false there,
+because both literal fields are present (D4056).
 
 ### Two names for one shape are one type
 
@@ -158,8 +167,9 @@ print(f(w))   // prints B
 ```
 
 > Owner ruling 2026-10-10 (A), D3885: `is` tests whether the value fits the type. It
-> replaces the 2026-09-02 reading, in which `is` over same-shape arms decided by which
-> declaration a value came from.
+> amends the 2026-09-02 ruling, which already decided a literal discriminant by its value
+> and fell back to the declaration a value came from only when no literal field could
+> answer. That fallback is gone.
 
 ## Reading a shared field
 

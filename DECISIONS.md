@@ -4868,10 +4868,14 @@ codegen — 18 programs graded against a pristine `origin/master` seed emit byte
 
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
 
-> **Superseded by D3870 (owner ruling C, 2026-10-08) and D3885 (owner ruling A,
-> 2026-10-10).** Records are structural, so two same-shape record types are one type and
-> no tag records the name a value was declared under. `is` tests whether the value fits the
-> type. This section is kept as history. The current reading is `docs/guide/unions.md`.
+> **Amended by D3870 (owner ruling C, 2026-10-08) and D3885 (owner ruling A, 2026-10-10).**
+> The principle stands: `is` asks whether the VALUE is a member of the type, and a
+> literal-typed field is decided by its value. What falls is the fallback to the tag, that
+> is, to the declaration a value was built under. Records are structural, so two same-shape
+> record types are one type and no tag records a value's declared name. The refusal of a
+> same-shape pair with no distinguishing literal field (`{v: i32} | {v: boolean}`), called a
+> design rule below, has no live ruling now. It is pending owner question Q4
+> (`docs/spec/OPEN-QUESTIONS.md`).
 
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
 field — `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`
