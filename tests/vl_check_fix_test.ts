@@ -382,3 +382,80 @@ fixCase(
   "function inner<U>(u: U) { print(u) }\nfunction q(n: i32) { print(n + 1) }\n" +
     "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
 );
+
+// ---- files outside the module graph (diderven DV-004) ----------------------------------
+
+fixCase(
+  "a name only a not-yet-imported file beside it exports gets a new import of that file",
+  {
+    "ids.vl": "export const SPR_A: i32 = 1\nexport function idOf(n: i32): i32 { n }\n",
+    "nested/deeper.vl": "export const SPR_B: i32 = 2\n",
+    "main.vl": "print(idOf(SPR_A))\n",
+  },
+  'import { idOf, SPR_A } from "./ids"\nprint(idOf(SPR_A))\n',
+);
+
+fixCase(
+  "a file beside it that does not export the name adds nothing, and a single-file run reads no subdirectory",
+  {
+    "ids.vl": "export const SPR_A: i32 = 1\n",
+    "nested/deeper.vl": "export const SPR_B: i32 = 2\n",
+    "main.vl": "print(SPR_B)\n",
+  },
+  "print(SPR_B)\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a directory run offers every file the walk found, at its relative path",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_dir_" });
+    try {
+      await Deno.mkdir(`${dir}/src/gen`, { recursive: true });
+      await Deno.mkdir(`${dir}/src/skills`, { recursive: true });
+      await Deno.writeTextFile(`${dir}/src/gen/sprites.vl`, "export const SPR_X: i32 = 7\n");
+      await Deno.writeTextFile(`${dir}/src/skills/use.vl`, "print(SPR_X)\n");
+      const plain = await check(`${dir}/src`);
+      const note = '`SPR_X` is exported by "../gen/sprites"';
+      if (!plain.err.includes(note)) {
+        throw new Error(`the error must name the file: want ${note}\ngot\n${plain.err}`);
+      }
+      await fix(`${dir}/src`);
+      const after = await Deno.readTextFile(`${dir}/src/skills/use.vl`);
+      const want = 'import { SPR_X } from "../gen/sprites"\nprint(SPR_X)\n';
+      if (after !== want) throw new Error(`fixed source: want\n${want}\ngot\n${after}`);
+      const r = await check(`${dir}/src`);
+      if (r.code !== 0) throw new Error(`the fixed tree must check clean:\n${r.err}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+fixCase(
+  "a file beside it exporting a std name is listed with std, and two exporters edit nothing",
+  {
+    "geo.vl": "export function hypotF64(a: f64, b: f64): f64 { a + b }\n",
+    "main.vl": "print(hypotF64(3.0, 4.0))\n",
+  },
+  "print(hypotF64(3.0, 4.0))\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a file beside it that does not lex is named as skipped, and the rest still answer",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_skip_" });
+    try {
+      await Deno.writeTextFile(`${dir}/bad.vl`, 'export const Q = "unterminated\n');
+      await Deno.writeTextFile(`${dir}/ids.vl`, "export const SPR_A: i32 = 1\n");
+      await Deno.writeTextFile(`${dir}/main.vl`, "print(SPR_A)\n");
+      const plain = await check(`${dir}/main.vl`);
+      for (const want of ['`SPR_A` is exported by "./ids"', `skipped ${dir}/bad.vl: it does not lex`]) {
+        if (!plain.err.includes(want)) throw new Error(`want ${want}\ngot\n${plain.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
