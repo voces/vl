@@ -240,7 +240,7 @@ print(b.base > a.base)
 //
 // `fill` stamps every word of a new `Buf`; `stress` makes `count` of them back to back and
 // answers where its record of them starts (the bases, then the lengths, in a `Buf` of its own).
-const TWO = `import { Buffer, Buf, bufferMark, bufferRelease, storeI32 } from "std:buffer"
+const TWO = `import { Buffer, Buf, bufferMark, bufferPeak, bufferRelease, storeI32 } from "std:buffer"
 let bumps = 0
 export function put(addr: i32, v: i32) { __store_i32__(addr, v) }
 export function peek(addr: i32): i32 { __load_i32__(addr) }
@@ -255,6 +255,7 @@ function fill(n: i32, stamp: i32): Buf {
 }
 export function alloc(n: i32, stamp: i32): i32 { fill(n, stamp).base }
 export function mark(): i32 { bufferMark() }
+export function peak(): i32 { bufferPeak() }
 export function release(m: i32) { bufferRelease(m) }
 export function stress(count: i32, stamp: i32): i32 {
   const rec = Buffer(count * 8)
@@ -294,6 +295,7 @@ self.onmessage = async (e) => {
   if (op === "peek") self.postMessage({ v: x.peek(a) });
   if (op === "alloc") self.postMessage({ v: x.alloc(a, b) });
   if (op === "mark") self.postMessage({ v: x.mark() });
+  if (op === "peak") self.postMessage({ v: x.peak() });
   if (op === "release") { x.release(a); self.postMessage({ ok: true }); }
   if (op === "bump") self.postMessage({ v: x.bump() });
   if (op === "stress") { go(); self.postMessage({ v: x.stress(a, b) }); }
@@ -401,6 +403,10 @@ Deno.test({
         eq(bAddr, aAddr + 64, "B's first Buffer follows A's");
         eq(Array.from(new Int32Array(memory.buffer, aAddr, 16)), Array(16).fill(0xaaaa), "A's stamps are intact");
         eq(view[bAddr >> 2], 0xbbbb, "B's stamp");
+        eq(await v(B, { op: "peak" }), bAddr + 64, "B's peak is its own Buffer's end");
+        await call(B, { op: "release", a: bAddr });
+        eq(await v(B, { op: "peak" }), bAddr + 64, "a release does not lower the peak");
+        eq(await v(A, { op: "peak" }), aAddr + 64, "A's peak counts A's Buffer and the shared pointer now");
 
         // A cross-worker handoff through plain stores: B blocks, A writes and signals.
         const got = v(B, { op: "wait", a: GO, b: 4096 });
