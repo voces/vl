@@ -308,13 +308,13 @@ def main(argv):
         return 2
     total = 0
     for f in files(paths):
-        src = open(f, encoding="utf-8").read()
+        src = open(f, encoding="utf-8", newline="").read()
         out, n = rewrite(src)
         if n:
             total += n
             print(f"{f}: {n} site(s) {'to rewrite' if check else 'rewritten'}")
             if not check:
-                open(f, "w", encoding="utf-8").write(out)
+                open(f, "w", encoding="utf-8", newline="").write(out)
     return 1 if total else 0
 
 

@@ -31,6 +31,7 @@
 // `testDiscovery.ts` imports no `vscode` (tests/lsp_test_discovery_test.ts is the
 // unit half of the same pair).
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 import { failureAnchor, parseTestReport } from "../lsp/src/testDiscovery.ts";
@@ -38,10 +39,11 @@ import { failureAnchor, parseTestReport } from "../lsp/src/testDiscovery.ts";
 /**
  * The resolver `failureAnchor` takes as a parameter (the extension passes
  * `node:path`'s). Every path this suite hands it is already absolute, so joining
- * is the only case, and a POSIX join is what this runner's own paths are.
+ * is the only case, and a POSIX join is what this runner's own paths are — a
+ * Windows drive path (`C:/…`, as the host prints it) is absolute too.
  */
 const resolve = (base: string, rel: string): string =>
-  rel.startsWith("/") ? rel : `${base}/${rel}`;
+  rel.startsWith("/") || /^[A-Za-z]:\//.test(rel) ? rel : `${base}/${rel}`;
 
 const FIXTURES = `${ROOT}/tests/fixtures/vl-test`;
 const SLOW = `${ROOT}/tests/fixtures/vl-test-parallel`;
@@ -381,7 +383,7 @@ Deno.test({
       return { line: line + 1, col: src[line].indexOf(token) + 1 };
     };
 
-    const dir = await Deno.makeTempDir({ prefix: "vl_test_caller_" });
+    const dir = await makeTempDir({ prefix: "vl_test_caller_" });
     try {
       await Deno.writeTextFile(`${dir}/helper.vl`, helperSrc.join("\n") + "\n");
       await Deno.writeTextFile(`${dir}/hop.test.vl`, testSrc.join("\n") + "\n");
@@ -612,7 +614,7 @@ Deno.test({
     "vl-test: discovery finds only *.test.vl, and an empty tree is not a failure",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_test_discovery_" });
+    const dir = await makeTempDir({ prefix: "vl_test_discovery_" });
     try {
       // A plain `.vl` that would FAIL to compile: if discovery picked it up the
       // run would go red, so a green exit is the evidence it was skipped.
@@ -868,7 +870,7 @@ Deno.test({
     // process where the wasm should trap, so: on the normal stack an 8,000-deep
     // expression (enough to abort a default-stack worker) compiles in a worker, and under `VL_SEED_STACK=default` (the
     // small-stack fallback) pooled and serial both trap into the same banner.
-    const dir = await Deno.makeTempDir({ prefix: "vl_test_deep_" });
+    const dir = await makeTempDir({ prefix: "vl_test_deep_" });
     try {
       const n = 8000;
       await Deno.writeTextFile(

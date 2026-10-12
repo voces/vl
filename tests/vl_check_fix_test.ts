@@ -11,6 +11,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -31,7 +32,7 @@ Deno.test({
   name: "vl-check-fix: applies prefer-const only; leaves unused var/param (still reported); idempotent",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_" });
     try {
       const f = `${dir}/a.vl`;
       // The `: i64` return is NOT redundant (the i32 body widens to it), so the
@@ -69,7 +70,7 @@ Deno.test({
     "vl-check-fix: iterates to a fixpoint, removes the import it orphaned, keeps exported signatures (D3597)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_rounds_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_rounds_" });
     try {
       const f = `${dir}/a.vl`;
       // Removing `: Buf` orphans the `Buf` import, which only the next round can see. The
@@ -105,7 +106,7 @@ Deno.test({
   name: "vl-check-fix: an unused import of the program's own module stays whole (it may run code)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_own_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_own_" });
     try {
       await Deno.writeTextFile(
         `${dir}/dep.vl`,
@@ -149,7 +150,7 @@ const fixCase = (name: string, files: Record<string, string>, want: string) =>
     name: `vl-check-fix: ${name}`,
     ignore: !ENABLED,
     fn: async () => {
-      const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_imp_" });
+      const dir = await makeTempDir({ prefix: "vl_check_fix_imp_" });
       try {
         for (const [rel, src] of Object.entries(files)) {
           await Deno.mkdir(`${dir}/${rel}`.replace(/\/[^/]*$/, ""), { recursive: true });
@@ -444,7 +445,7 @@ Deno.test({
   name: "vl-check-fix: a directory run offers every file the walk found, at its relative path",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_dir_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_dir_" });
     try {
       await Deno.mkdir(`${dir}/src/gen`, { recursive: true });
       await Deno.mkdir(`${dir}/src/skills`, { recursive: true });
@@ -480,7 +481,7 @@ Deno.test({
   name: "vl-check-fix: a file beside it that does not lex is named as skipped, and the rest still answer",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_skip_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_skip_" });
     try {
       await Deno.writeTextFile(`${dir}/bad.vl`, 'export const Q = "unterminated\n');
       await Deno.writeTextFile(`${dir}/ids.vl`, "export const SPR_A: i32 = 1\n");
