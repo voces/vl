@@ -214,6 +214,7 @@ import {
   pinnedHoleTyOf,
   primNameOf,
   primNameStr,
+  recFitNarrowedFields,
   recordClonedCallRetire,
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
@@ -3468,6 +3469,19 @@ function asNulStructRow(asIx: i32): i32 {
   const tn = T.tys[t]
   if tn is TyNullable { return structIndexOfTy(tn.nInner) }
   -1
+}
+
+// The struct row an `x as! S` yields over a nullable-ref `S | null` operand, where `S` is a
+// standalone struct; else -1 — the first row denoting `S`, as an annotated binding resolves it.
+function asTrapStructRow(asIx: i32): i32 {
+  const n = P.nodes[asIx]
+  if !(n is AsExpr) { return -1 }
+  if n.asMode != "trap" { return -1 }
+  const payload = nulRefNichePayloadTy(nodeTyIxOf(n.asObj))
+  if payload < 0 { return -1 }
+  if !(T.tys[payload] is TyObj) { return -1 }
+  if tyIxIsVariantMember(payload) { return -1 }
+  structIndexOfTy(payload)
 }
 
 // True if evaluating the expression at `exprIx` yields a nullable struct ref — a
@@ -13961,6 +13975,17 @@ export function optChainBaseOf(exprIx: i32) {
   -1
 }
 
+// Is the node at `ix` a record-fit `is` (a literal-set field test) whose receiver is not a
+// re-readable place, so its lowering stages the receiver once in `optRecvSlot`?
+function recordFitIsStagesRecv(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if !(n is IsExpr) { return false }
+  if n.isVariant == "null" || unionEqOperandOk(n.isObj) { return false }
+  const names: string[] = []
+  const sets: i32[] = []
+  recFitNarrowedFields(nodeTyIxOf(n.isObj), isVarTyIxOf(ix), names, sets) > 0
+}
+
 // Is the node at `ix` a `?.` whose chain base must be STAGED — evaluated once into
 // `optRecvSlot` — because it is not a re-readable place? One home for the question, so the
 // slot reserved and the code emitted cannot disagree (D1671).
@@ -14664,9 +14689,9 @@ export function nulRefNichePayloadTy(ty: i32): i32 {
 }
 
 // Does a niche-repped `T | null` reach the `as` trio at EVERY delivery position? A string, a
-// list and a union VARIANT do: their rep classifiers already read a cast node. A standalone
-// struct, a map and a closure do not — every un-annotated face is invalid wasm, so the cast
-// keeps its loud refusal for them rather than trading it for a miscompile (D1812).
+// list, a struct and a union VARIANT do: their rep classifiers read a cast node. A map and a
+// closure do not — every un-annotated face is invalid wasm, so the cast keeps its loud
+// refusal for them rather than trading it for a miscompile (D1812).
 export function nulNicheCastWiredTy(inner: i32): boolean {
   if inner < 0 { return false }
   const it = T.tys[inner]
@@ -14681,7 +14706,7 @@ export function nulNicheCastWiredTy(inner: i32): boolean {
       return true
     }
     TyObj => {
-      return tyIxIsVariantMember(inner)
+      return true
     }
     TyFunc => {}
     TyMap => {}
@@ -15200,6 +15225,8 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
     }
     "optrecv" => {
       if optChainStagesRecv(ix) { return true }
+      // A record-fit `is` over a receiver that is not a re-readable place stages it here too.
+      if recordFitIsStagesRecv(ix) { return true }
       // The `??` niche join stages its operand in the SAME slot: it evaluates the nullable ref
       // once, tests it and reads it back on the non-null path (D1714). Sharing the reservation
       // is sound because the two never stage inside one another — a `?.` operand of a joining
@@ -34807,6 +34834,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ObjLit { return true }
   if e is Paren { return exprStruct(e.parInner, fnIx) }
+  if e is AsExpr { return asTrapStructRow(exprIx) >= 0 }
   // An if-EXPRESSION whose branch join is a struct — an un-annotated binding classifies kind 1
   // (the THEN arm's rep, the arms agreeing by the checker), matching `structIndexOfExpr`.
   if e is IfStmt {
@@ -36083,6 +36111,8 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if e is AsExpr {
     const asr = asNulStructRow(exprIx)
     if asr >= 0 { return asr }
+    const atr = asTrapStructRow(exprIx)
+    if atr >= 0 { return atr }
   }
   // An if-EXPRESSION whose join is a struct (`const b = if c { mk(1) } else { mk(2) }`): the
   // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an

@@ -207,7 +207,8 @@ that buffer is **detached**: every view taken before reads `undefined` and has `
 that allocates can detach views the host took before calling it. The first symptom is often
 far from the cause, such as a GPU call failing on an `undefined` field a few calls later.
 
-Two patterns avoid it:
+Two patterns avoid it. For a game or any program with a known memory budget, the first is the
+whole fix:
 
 * **Start the memory large enough.** `vl build --initial-memory=8MiB` (bytes, or `KiB`, `MiB`,
   `GiB`, a whole number of 64 KiB pages) declares the memory at that size, so allocations that
@@ -216,10 +217,24 @@ Two patterns avoid it:
   Zig (`--initial-memory`) and AssemblyScript (`--initialMemory`) offer the same setting.
 * **Re-take views after any call that may allocate.** Build each typed array from
   `memory.buffer` after the call returns, or check `view.byteLength === 0` and rebuild it.
-  wasm-bindgen's generated glue and Go's `wasm_exec.js` both do this.
+  wasm-bindgen's generated glue and Go's `wasm_exec.js` both do this. A lazy accessor keeps it
+  to one place, and is cheap enough to call before every use:
+
+  ```js
+  let u8 = null
+  // The current byte view of the instance's memory, rebuilt only after a growth detached it.
+  const bytes = () =>
+    u8 !== null && u8.byteLength !== 0 ? u8 : (u8 = new Uint8Array(instance.exports.memory.buffer))
+  ```
+
+  JS evaluates arguments left to right, so `gpu.write(bytes(), vl.render())` takes the view
+  BEFORE `render` runs and may hand over a detached one. Call the export first and take the
+  view in the call that uses it.
 
 A memory built with `--shared-memory` never detaches: it is backed by a `SharedArrayBuffer`,
-which grows in place, but a view taken before a growth still covers only the old length.
+which grows in place, but a view taken before a growth still covers only the old length. The
+`bytes()` accessor above never sees a zero length there, so it would keep the stale view: for a
+shared memory compare `u8.length` with `instance.exports.memory.buffer.byteLength` instead.
 
 `memory.toResizableBuffer()` returns a buffer that grows in place instead of detaching. It is a
 JS API extension, shipping in V8; check support in the engines you target. It requires the memory
