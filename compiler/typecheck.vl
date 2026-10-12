@@ -305,6 +305,7 @@ import {
   isvalName,
   isvalTok,
   isvalType,
+  rcoalCode,
   rcoalCol,
   rcoalEnd,
   rcoalLine,
@@ -14717,6 +14718,7 @@ function rcoalReset() {
   rcoalType = []
   rcoalMsg = []
   rcoalWhy = []
+  rcoalCode = []
   0
 }
 
@@ -14742,6 +14744,7 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
   rcoalType.push(tyToStrUser(lt))
   rcoalMsg.push("")
   rcoalWhy.push(coalNonNullWhy(ix))
+  rcoalCode.push("dead-coalesce-default")
   0
 }
 
@@ -14786,6 +14789,7 @@ function recordDeadNullTest(ix: i32, subjIx: i32, subjTy: i32, op: string) {
   rcoalEnd.push(findingEndCol(ix, tk))
   rcoalTok.push(tk)
   rcoalType.push(tyToStrUser(subjTy))
+  rcoalCode.push("dead-null-test")
   rcoalMsg.push(
     "`"
       + subj
@@ -14803,6 +14807,78 @@ function recordDeadNullTest(ix: i32, subjIx: i32, subjTy: i32, op: string) {
   0
 }
 
+// Record a `==` / `!=` whose operands are records holding a list: the compare walks every
+// element, which reads like an identity test and costs O(n). `path` names the list field.
+function recordDeepRecordEq(ix: i32, ty: i32, path: string, op: string) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  const t = P.toks[tk]
+  const tyS = tyToStrUser(ty)
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
+  rcoalTok.push(tk)
+  rcoalType.push(tyS)
+  rcoalCode.push("deep-record-compare")
+  rcoalMsg.push(
+    "`"
+      + op
+      + "` on `"
+      + tyS
+      + "` compares every element of its list field `"
+      + path
+      + "`, not whether both sides are the same record — compare a field that identifies the record, or the `"
+      + path
+      + "` fields directly when the element-wise compare is the intent",
+  )
+  rcoalWhy.push("")
+  0
+}
+
+// `ty` with one `| null` removed, or `ty` itself when it is not nullable.
+function eqNonNullPart(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const inner = nullableInnerOrNone(ty)
+  if inner >= 0 { return inner }
+  ty
+}
+
+// The dotted path to the first list field a `==` over record `ty` walks, or "" when `ty` is
+// not a record (a nullable one counts) or holds no list.
+function eqListFieldPath(ty: i32, seen: i32[]): string {
+  const rt = eqNonNullPart(ty)
+  if rt < 0 || rt >= T.tys.length { return "" }
+  let si = 0
+  while si < seen.length {
+    if seen[si] == rt { return "" }
+    si = si + 1
+  }
+  const t = T.tys[rt]
+  let out = ""
+  if t is TyObj {
+    seen.push(rt)
+    let i = 0
+    while i < t.objFieldTypes.length && out == "" {
+      const ft = eqNonNullPart(t.objFieldTypes[i])
+      if ft >= 0 && ft < T.tys.length && arrElemTyOrNone(ft) >= 0 {
+        out = t.objFieldNames[i]
+      } else {
+        const sub = eqListFieldPath(ft, seen)
+        if sub != "" { out = t.objFieldNames[i] + "." + sub }
+      }
+      i = i + 1
+    }
+    seen.pop()
+  }
+  out
+}
+
 function rcoalTruncate(n: i32) {
   while rcoalLine.length > n { rcoalLine.pop() }
   while rcoalCol.length > n { rcoalCol.pop() }
@@ -14811,6 +14887,7 @@ function rcoalTruncate(n: i32) {
   while rcoalType.length > n { rcoalType.pop() }
   while rcoalMsg.length > n { rcoalMsg.pop() }
   while rcoalWhy.length > n { rcoalWhy.pop() }
+  while rcoalCode.length > n { rcoalCode.pop() }
   0
 }
 
@@ -66141,6 +66218,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         tErr(eqMsgs[eqM], ix)
       }
       eqM = eqM + 1
+    }
+    if eqMsgs.length == 0 && !isNullTy(lt) && !isNullTy(rt) {
+      let eqTy = lt
+      let eqPath = eqListFieldPath(lt, [])
+      if eqPath == "" {
+        eqTy = rt
+        eqPath = eqListFieldPath(rt, [])
+      }
+      if eqPath != "" { recordDeepRecordEq(ix, eqTy, eqPath, op) }
     }
     return TY_BOOL
   }
