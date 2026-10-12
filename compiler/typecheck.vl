@@ -602,6 +602,12 @@ const CODE_SELF_FN_SHADOWED = "self-fn-shadowed"
 // just after the binding's name, where `check --fix` inserts `: annot`; absent across modules).
 const CODE_GENERIC_BINDING_CONCRETE_WRITE = "generic-binding-concrete-write"
 
+// D4061 — a positional argument after a named one that is not in its own parameter's position.
+// Data, repeated per positional argument after it: `name` (the parameter the call binds it to),
+// `line`/`col` (1-based line, 0-based column of its first token, where `check --fix` inserts
+// `name: `); absent when no naming keeps the call's meaning.
+const CODE_NAMED_ARG_OUT_OF_POSITION = "named-arg-out-of-position"
+
 // ── checker state (one struct, held in the global `T`) ───────────────────────
 
 // `tys` is the type arena; `scopes` the scope chain of `name → type-index` maps (index 0
@@ -16625,11 +16631,13 @@ function braceNameNote(at: i32, want: i32): string {
   if e is Ident && w is TyObj {
     if w.objFieldNames.length != 1 { return "" }
     if assignable(nodeTyOf(at), want) { return "" }
-    if objFieldType(w, e.identName) >= 0 {
+    // The field is the binding's source name, which the merge may have renamed apart.
+    const fld = demangleName(e.identName)
+    if objFieldType(w, fld) >= 0 {
       return " — `{ "
-        + e.identName
+        + fld
         + " }` here is a block, not a record; write `({ "
-        + e.identName
+        + fld
         + " })` for the record"
     }
   }
@@ -48551,6 +48559,7 @@ function orderNamedCallArgs(
     return bad
   }
   const ordered = orderArgsByParamNames(paramNames, args, argNames)
+  if namedOrderRefused(paramNames, args, argNames, ordered) { return bad }
   if ordered.length != paramNames.length {
     tErr("named argument does not match a parameter", ix)
     return bad
@@ -48563,6 +48572,122 @@ function orderNamedCallArgs(
     return bad
   }
   ordered
+}
+
+// The name argument `j` of a call carries, or "" for a positional one.
+function callArgNameAt(argNames: string[], j: i32): string {
+  if j < argNames.length { return argNames[j] }
+  ""
+}
+
+// The parameter index named `nm`, or `paramNames.length` when none is.
+function paramIndexOfName(paramNames: string[], nm: string) {
+  let k = 0
+  while k < paramNames.length && paramNames[k] != nm { k = k + 1 }
+  k
+}
+
+// ", which is `p`'s" for the parameter declared at index `at`, or "" when there is none.
+function namedOrderSlotOwner(paramNames: string[], at: i32): string {
+  if at < 0 || at >= paramNames.length { return "" }
+  ", which is `" + paramNames[at] + "`'s"
+}
+
+// The Q8 rule (D4061): a positional argument lands at its written index, so it may follow named
+// ones only when each sits in its own parameter's position, and a name may not take a parameter
+// a positional argument filled. A method call's `paramNames` leaves the receiver out, which is
+// position 0. Raises the first fault left to right; true when it raised.
+function namedOrderRefused(
+  paramNames: string[],
+  args: i32[],
+  argNames: string[],
+  ordered: i32[],
+) {
+  let outAt = -1
+  let outK = -1
+  let j = 0
+  while j < args.length {
+    const nm = callArgNameAt(argNames, j)
+    if nm == "" {
+      if outAt >= 0 {
+        tErrCodedData(
+          "`"
+            + callArgNameAt(argNames, outAt)
+            + "` is parameter "
+            + i32ToStr(outK + 1)
+            + " but is written in position "
+            + i32ToStr(outAt + 1)
+            + namedOrderSlotOwner(paramNames, outAt)
+            + "; name the arguments after it, or move it",
+          args[j],
+          CODE_NAMED_ARG_OUT_OF_POSITION,
+          namedOrderFixData(paramNames, args, argNames, ordered, outAt),
+        )
+        return true
+      }
+    } else {
+      const k = paramIndexOfName(paramNames, nm)
+      if k < paramNames.length && k != j {
+        if k < j && callArgNameAt(argNames, k) == "" {
+          tErr(
+            "`"
+              + nm
+              + "` is already given by the positional argument in position "
+              + i32ToStr(k + 1)
+              + "; give it once",
+            args[j],
+          )
+          return true
+        }
+        if outAt < 0 {
+          outAt = j
+          outK = k
+        }
+      }
+    }
+    j = j + 1
+  }
+  false
+}
+
+// `check --fix`'s payload for a positional argument after the misplaced name at `from`: for each
+// one, the parameter the binder gave it and where its first token starts. Empty when one binds
+// no parameter, or when naming them all would still give a parameter twice.
+function namedOrderFixData(
+  paramNames: string[],
+  args: i32[],
+  argNames: string[],
+  ordered: i32[],
+  from: i32,
+): string {
+  if ordered.length != paramNames.length { return "" }
+  const names: string[] = []
+  let data = ""
+  let j = 0
+  while j < args.length {
+    let nm = callArgNameAt(argNames, j)
+    if j > from && nm == "" {
+      let k = 0
+      while k < ordered.length && ordered[k] != args[j] { k = k + 1 }
+      const tk = nodeStartTok(args[j])
+      if k >= paramNames.length || tk < 0 || tk >= P.toks.length { return "" }
+      nm = paramNames[k]
+      const t = P.toks[tk]
+      data = data
+        + diagDataField("name", nm)
+        + diagDataField("line", i32ToStr(t.line))
+        + diagDataField("col", i32ToStr(t.col))
+    }
+    names.push(nm)
+    j = j + 1
+  }
+  j = 0
+  while j < names.length {
+    const k = paramIndexOfName(paramNames, names[j])
+    if names[j] != "" && k < j && names[k] == "" { return "" }
+    j = j + 1
+  }
+  data
 }
 
 // —— constraints phase 1: bounds ————————————————————————————————————————————

@@ -466,7 +466,7 @@ Raised by modules.md §M5.3.
 
 **Resolved 2026-10-12: (b), owner ruling.** A declaration named like an ambient name shadows
 it in its scope, for both the call and its type. Compiler intrinsics (`__name__`) stay
-refused. D4066 tracks the build.
+refused. Built by D4066.
 
 **Today.** The ambient names (modules.md §M5.3) are the eleven built-in type names, five
 functions (`print`, `fromCodePoint`, `fromCodePoints`, `Map`, `Set`), twenty float and
