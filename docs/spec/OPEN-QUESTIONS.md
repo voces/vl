@@ -7,6 +7,44 @@ with a recommendation. The spec states only today's behaviour until the owner ru
 ruled question moves to `DECISIONS.md`, and the chapter's `Open question:` line becomes a
 `Ruling:` line.
 
+## The questions in the order to rule them
+
+The order puts first a question whose ruling an open inventory row is waiting on, since
+the row cannot be closed correctly until then. Next come questions where two rulings, or a
+ruling and the compiler, disagree today. Then come std names, which are close to permanent
+once programs use them (std.md §STD2.3), so they are cheapest to settle now. New surface
+comes after that, and lexical spelling last. A **blocked row** is an open inventory row
+whose fix takes a different shape under different options.
+
+| # | question | recommendation | blocked rows |
+| --- | --- | --- | --- |
+| 1 | [Q3](#q3-a-list-literal-of-bare-null) A list literal of bare `null` | in `docs/internals/open-rulings.md` §D1832 | D1832 |
+| 2 | [Q2](#q2-does-is-a-hold-of-a-record-with-more-fields-than-a) Does `is A` hold of a record with more fields than `A`? | (b) a record's field set is exact under `is` (today's behaviour) | none |
+| 3 | [Q7](#q7-a-whole-number-float-literal-at-an-integer-type) A whole-number float literal at an integer type | (a) accept it everywhere, so rulings A and C both hold | none |
+| 4 | [Q13](#q13-a-literal-zero-integer-divisor) A literal-zero integer divisor | (a) an error | none |
+| 5 | [Q15](#q15-two-spellings-of-one-std-operation) Two spellings of one std operation | (c) keep same-name re-exports, retire `padLeft` with a targeted refusal | none |
+| 6 | [Q14](#q14-exports-that-their-own-module-disowns) Exports that their own module disowns | (b) exported but not promised; retire `stdSmoke` | none |
+| 7 | [Q5](#q5-boolean-and-negative-integer-literal-types) Boolean and negative integer literal types | (b) both | none |
+| 8 | [Q12](#q12-import-cycles) Import cycles | (a) keep refusing every cycle, for now | none |
+| 9 | [Q9](#q9-a-constant-a-until-a) A constant `a until a` | (b) keep accepting it | none |
+| 10 | [Q6](#q6-the-arrow--as-one-token) The arrow `=>` as one token | (a) one token | none |
+| 11 | [Q1](#q1-block-comments) Block comments | (a) line comments only, with a dedicated refusal | none |
+
+Why this order:
+- Q3's row is already in open-rulings.md with its options.
+- Q2 states today's behaviour, and the recommendation keeps it. Ruling it confirms the
+  reading D3885 left open.
+- Q7 and Q13 are cases where the checker answers one program two ways.
+
+**Resolved.** [Q8](#q8-a-positional-argument-after-a-named-one), a positional argument after
+a named one, was ruled on 2026-10-11 as (b), amended (Kotlin 1.4). D4061 tracks the checker
+catching up.
+
+[Q4](#q4-two-record-arms-with-the-same-field-names-and-no-literal-field-to-tell-them-apart),
+[Q10](#q10-does-x--l-narrow-a-literal-union) and
+[Q11](#q11-declaring-a-name-an-ambient-name-has) were ruled on 2026-10-12 as (c), (a) and
+(b). D4056, D4059 and D4066 await the build.
+
 ## Q1. Block comments
 
 Raised by lexical.md §L2.2.
@@ -106,6 +144,13 @@ print(e.length)   // passes vl check; the build fails: bare null needs a struct-
 ## Q4. Two record arms with the same field names and no literal field to tell them apart
 
 Raised by types.md §T3.4 and `docs/guide/unions.md`.
+
+**Resolved 2026-10-12: (c), owner ruling.** Record arms that share a field name form a legal
+union. `u is A` answers whether the value structurally fits `A`, field by field. In the
+owner's words, "'is' is not a nominal check; the language is structural", and "We can do a
+nominal check for perf reasons, but fundamentally the language is meant to be structural."
+A tag may serve as a fast path only where it gives the same answer as the structural test.
+D4056 tracks the build. The recommendation below, (b), was not taken.
 
 **Today.** A union of two records with the same field names is refused when it is formed,
 unless some field is literal-typed in both arms. The refusal fires before any `is` is
@@ -347,3 +392,306 @@ refused.
 bounds in the wrong order, which is a confident wrong answer. `a until a` has no right
 order to suggest, and no fix the message could name. In real code its bounds are rarely
 both literals, and when they are computed it already runs zero times silently by design.
+
+
+## Q10. Does `x == L` narrow a literal union?
+
+Raised by narrowing.md §N2.3.
+
+**Resolved 2026-10-12: (a), owner ruling.** `x == L` narrows a literal union exactly as
+`x is L` does: in the then-branch, the else-branch, after an exiting guard, and with `!=`
+reversed. D4059 tracks the build.
+
+**Today.** `x is L` narrows a literal union in both branches. `x == L` narrows neither,
+although a compare of a record's literal field, `c.kind == "m"`, narrows the record
+(narrowing.md §N2.4). The guide says `x == L` narrows; no ruling says so. The only ruling
+that touches it, DECISIONS.md §"A subsumed literal arm COLLAPSES", reads `x is L` as
+`x == L` with narrowing (D4059).
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k == "a" { return "A" }
+  const j: "b" | "c" = k   // refused: cannot assign K to 'j' of type "b" | "c"
+  j
+}
+```
+
+**(a) `x == L` narrows as `x is L` does,** in the then-branch, the else-branch, after a
+guard that exits, and for `!=` reversed.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k == "a" { return "A" }
+  const j: "b" | "c" = k   // would run: `k` is "b" | "c" here
+  j
+}
+```
+
+**(b) Keep it a plain compare.** Only `is` narrows a bare value; the guide changes.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k is "a" { return "A" }
+  const j: "b" | "c" = k
+  j
+}
+```
+
+**Recommendation: (a).** A literal-field compare already narrows the record it belongs to,
+so (b) makes `c.kind == "m"` narrow and `k == "m"` not. The 2026-09-02 ruling already
+treats a literal `is` as the compare. The flow-narrowing ruling (DECISIONS.md §"Flow
+narrowing: per-path facts meet at joins") lists a null test, an `is` test and a
+discriminant compare among the tests that start each branch; a compare with a literal
+would join that list.
+
+(a) has a price. A narrowed literal union refuses a later test or `match` arm for a member
+it has lost, as it does after `is` today. Code that tests `k == "a"` and then matches `"a"`
+again would stop compiling:
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): string {
+  if k is "a" { return "A" }
+  match k { "a" => "x", "b" => "y", "c" => "z" }   // refused: match pattern "a" is not a member of "b" | "c"
+}
+```
+
+
+## Q11. Declaring a name an ambient name has
+
+Raised by modules.md §M5.3.
+
+**Resolved 2026-10-12: (b), owner ruling.** A declaration named like an ambient name shadows
+it in its scope, for both the call and its type. Compiler intrinsics (`__name__`) stay
+refused. D4066 tracks the build.
+
+**Today.** The ambient names (modules.md §M5.3) are the eleven built-in type names, five
+functions (`print`, `fromCodePoint`, `fromCodePoints`, `Map`, `Set`), twenty float and
+integer intrinsics (`abs`, `sqrt`, `clz`, `divU`, …) and the `__name__` compiler
+intrinsics. They fare differently when a program declares one:
+
+- A compiler intrinsic is refused: `function __trap__()` gives "is a compiler intrinsic and
+  cannot be redefined".
+- A float or integer intrinsic is shadowed cleanly: `function abs(x: i32): i32 { x + 100 }`
+  makes `abs(1)` print 101, and `const sqrt = 3` prints 3.
+- A type name is accepted: `const i32 = 3` and `type Map = { a: i32 }` both run.
+- One of the five functions is inconsistent (D4066). A `function print` is what a call
+  runs, while the call is checked against the ambient signature. A `const print = …`
+  lambda is not reached at all.
+
+```vl
+function print(x: i32): i32 { x + 100 }
+const y: i32 = print(3)   // refused: cannot bind the void result of 'y'
+```
+
+```vl
+const print = (x: i32): i32 => x
+print(5)   // prints 5 (the ambient print ran)
+```
+
+No ruling covers it. `docs/internals/modules-design.md` §5 calls the ambient floor
+privileged and "not a prelude", and says nothing about declaring its names.
+
+**(a) Refuse the declaration.** An ambient name is reserved in every scope.
+
+```vl
+function print(x: i32): i32 { x }   // would be refused: `print` is an ambient name
+```
+
+**(b) A declaration shadows the ambient name** in its scope, for the call and its type
+alike, as a declaration shadows any outer binding (modules.md §M5.2).
+
+```vl
+function print(x: i32): i32 { x + 100 }
+const y: i32 = print(3)   // would run: y is 103
+```
+
+**Recommendation: (b).** The ambient set is meant to shrink: the design names `print` as
+the first candidate to move into `std:fmt`. Under (b) a program that declared its own
+`print` keeps compiling when that happens; under (a) the refusal it lived with disappears
+and its meaning changes. (b) is also the rule a plain call already follows between a local
+and an import (O1, rule (e): the local wins).
+It is also what the float and integer intrinsics already do, so (b) makes the five
+functions agree with them. The compiler intrinsics stay refused under either option: a
+call to one lowers to inline instructions and never reaches a declaration.
+
+## Q12. Import cycles
+
+Raised by modules.md §M6.2.
+
+**Today.** Every import cycle is refused, including one between modules that declare only
+functions or only types:
+
+```vl
+// file: a.vl
+import { isOdd } from "./main"   // refused: Import cycle detected
+export function isEven(n: i32): boolean { if n == 0 { true } else { isOdd(n - 1) } }
+// file: main.vl
+import { isEven } from "./a"
+export function isOdd(n: i32): boolean { if n == 0 { false } else { isEven(n - 1) } }
+print(isEven(10))
+```
+
+`docs/internals/modules-design.md` §2.3 proposed allowing cycles of types and functions
+and refusing only cycles of value initialisation, and §5 lists cross-module
+initialisation order as an open sub-question that the owner has not reviewed. Without
+cycles the order is fixed by modules.md §M6.1. With them, it needs a rule.
+
+**(a) Keep refusing every cycle.** Mutually recursive functions or types go in one
+module.
+
+**(b) Allow a cycle when no module's top-level code in it reads a binding imported from
+another module of the cycle.** Functions, types, and constants read only inside functions
+qualify. The modules of the cycle run in the order the entry's imports first reach them.
+
+```vl
+// file: a.vl
+import { isOdd } from "./main"
+export function isEven(n: i32): boolean { if n == 0 { true } else { isOdd(n - 1) } }
+// file: main.vl
+import { isEven } from "./a"
+export function isOdd(n: i32): boolean { if n == 0 { false } else { isEven(n - 1) } }
+print(isEven(10))   // would print true
+```
+
+```vl
+// file: a.vl
+import { M } from "./main"
+export const A = M + 1   // would still be refused: top-level code reads M across the cycle
+// file: main.vl
+import { A } from "./a"
+export const M = A + 1
+```
+
+**Recommendation: (a) for now.** It is the two-way door: (b) can be added later without
+changing the meaning of any program that compiles. No consumer has asked for a cycle, and
+the workaround, one module, costs a file split rather than a feature. If one does, (b) is
+the rule to adopt, and its order rule is the one M6.1 already follows.
+
+## Q13. A literal-zero integer divisor
+
+Raised by diagnostics.md §D6.4.
+
+**Today.** When both operands are constant, `10 / 0` is an error (`division by zero in a
+constant expression`), and the `divide-by-zero` warning is reported beside it. When the dividend is not constant, `a / 0` and `a % 0` get the
+`divide-by-zero` warning, the program builds, and it traps when the division runs. ROADMAP
+B17 planned "hard **error** for integer division", with `for-step-zero` as precedent; the
+lint that shipped is a warning. A float divisor of `0.0` gets nothing, and gives an
+infinity or NaN.
+
+```vl
+function f(a: i32): i32 { a / 0 }   // warns: `/ 0` traps at run time
+print(f(4))                          // traps: integer divide by zero
+```
+
+**(a) An error.** A literal `0` divisor of an integer `/` or `%` is refused wherever it
+appears, as `step 0` is.
+
+```vl
+function f(a: i32): i32 { a / 0 }   // would be refused: integer division by zero
+```
+
+**(b) A warning, as today.** The division is legal, the warning names the trap, and a
+program that reaches it traps.
+
+```vl
+function f(a: i32): i32 { a / 0 }   // warns, builds, traps if called
+```
+
+**Recommendation: (a).** The expression can never produce a value, so no correct program
+contains it, and the checker already refuses the same division when the dividend happens
+to be constant: today whether `x / 0` is legal depends on `x`, not on the division. A
+program that wants to stop has `__trap__` and a `never` function (statements.md §S8.2).
+(a) refuses programs that compile today, but only ones that would trap if the line ran.
+
+## Q14. Exports that their own module disowns
+
+Raised by std.md §STD3.
+
+**Today.** Two std modules export names whose header says they are not for users.
+`std:test`'s header says "The `vlt*` exports at the bottom are the runner's protocol, not
+part of the authoring surface"; `vl test` calls them. `std:seed`'s header says `stdSmoke`
+"is not part of the usable surface and can be retired once any real module stands in for
+it". Both import and run from user code like any export, and modules.md §M1.2 gives no
+visibility between exported and private.
+
+```vl
+import { vltCount } from "std:test"
+print(vltCount())   // prints 0
+```
+
+**(a) Promised surface.** Every std export is std surface, whatever its header says. The
+`vlt*` names and `stdSmoke` stay, and change only as STD2.3 allows any std name to change.
+
+```vl
+import { stdSmoke } from "std:seed"
+print(stdSmoke())   // prints 7, and keeps doing so
+```
+
+**(b) Exported but not promised.** The spec lists these names as outside std's contract: a
+program may import them, and they may change or go without a refusal that names a
+replacement.
+
+```vl
+import { vltRun } from "std:test"   // legal today; the spec makes no promise about it
+```
+
+**(c) Not importable by users.** The names move out of reach: `stdSmoke` is retired, and
+the runner protocol moves to a module or a visibility that only `vl test` can reach.
+
+```vl
+import { vltCount } from "std:test"   // would be refused: not exported
+```
+
+**Recommendation: (b) now, (c) for `stdSmoke`.** (b) states what the headers already say
+and changes no program. `stdSmoke` has no user and its header plans its retirement, so
+retiring it costs nothing. A visibility level for the runner protocol would be a language
+feature for one consumer, against M1.2's decided two-level rule; (b) avoids it.
+
+## Q15. Two spellings of one std operation
+
+Raised by std.md §STD3.
+
+**Today.** `std:fmt` exports `padLeft`, whose comment calls it "This module's older
+spelling of `std:str`'s `padStart`" and says "New code should reach for `padStart`".
+`std:fmt` also re-exports `join`, `repeat` and `split` from `std:str`; these are the same
+functions (std.md §STD3.2). Both spellings run.
+
+```vl
+import { padLeft } from "std:fmt"
+import { padStart } from "std:str"
+print(padLeft("7", 3, "0"))    // prints 007
+print("7".padStart(3, "0"))    // prints 007
+```
+
+**(a) Keep both, permanently.** Each spelling is std surface (std.md §STD2.3), and the
+comments say which one to prefer.
+
+```vl
+import { padLeft, split } from "std:fmt"   // stays legal
+```
+
+**(b) One spelling per operation.** The second spelling and the re-exports are removed,
+and an old import is refused with a message naming the replacement, as `toString` was.
+
+```vl
+import { padLeft } from "std:fmt"   // would be refused, naming `std:str`'s `padStart`
+import { split } from "std:fmt"     // would be refused, naming `std:str`
+```
+
+**(c) Keep re-exports, drop renamed copies.** A re-export of the same function under the
+same name stays; `padLeft`, a second name for `padStart`, is removed as in (b).
+
+```vl
+import { split, toString } from "std:fmt"   // stays legal
+import { padLeft } from "std:fmt"           // would be refused
+```
+
+**Recommendation: (c).** A re-export adds no second behaviour and no second name, so it
+costs nothing to keep. A second name is the duplicated surface the std review rubric
+(`docs/internals/std-api-review.md` §2) asks to avoid, and `padLeft`'s own comment already
+points users away from it. With no deprecation mechanism, a targeted refusal is the only
+way to remove it, and it is cheaper before more callers exist.

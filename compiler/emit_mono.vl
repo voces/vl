@@ -64,6 +64,7 @@ import {
   joinArmIsLit,
   joinPinnedArmLit,
   joinPinnedArmTys,
+  litTyOfExpr,
   litUnionAliasNameOfTy,
   memberRungOnTy,
   mkArrayTy,
@@ -4251,16 +4252,27 @@ function monoPinCoalJoin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
   const pl = monoPinArmSubst(lt, bN, bT)
   const pr = monoPinArmSubst(rt, bN, bT)
   if pl < 0 || pr < 0 { return rb }
-  const ts: i32[] = [nonNullTy(pl), pr]
+  // A literal default that is a member of the pinned literal-union operand keeps that union,
+  // as the concrete `??` types it, so the result stays the operand's atom (D3423).
+  const pnn = nonNullTy(pl)
+  const dl = litTyOfExpr(n.binRight)
+  const keepsLit = tyIsLitUnion(pnn) && dl >= 0 && assignable(dl, pnn)
+  const ts: i32[] = [pnn, pr]
   let j = joinPinnedArmTys(ts)
+  if keepsLit { j = pnn }
   if j < 0 || j >= T.tys.length || tyHasTyVar(j) { return rb }
-  if T.tys[j] is TyUnion && monoPinRetTy >= 0 && monoPinLetReaches {
+  if (
+    !keepsLit
+    && T.tys[j] is TyUnion
+    && monoPinRetTy >= 0
+    && monoPinLetReaches
+  ) {
     if !monoTySameMembers(j, monoPinRetTy) { return rb }
     j = monoPinRetTy
   }
   const cur = nodeTyIxOf(rb)
   if cur == j || (cur >= 0 && tyEq(cur, j)) { return rb }
-  if T.tys[j] is TyUnion {
+  if !keepsLit && T.tys[j] is TyUnion {
     const name = valueUnionRetName(j)
     if name == "" || monoRegisterPinUnion(name) < 0 { return rb }
   }
@@ -5794,6 +5806,46 @@ function monoGenFnAliasChainFe(name: string, at: i32, ctx: i32): i32 {
     hops = hops + 1
   }
   -1
+}
+
+// The un-annotated `let` that a chain of un-annotated, never-written aliases read at `at` in frame
+// `ctx` ends at, when that `let` is written or holds a hole lambda (`let f = g; f = h; const a =
+// f`): [the node naming it, that node's frame, 1 when it is written]. [-1, -1, 0] for any other
+// chain, and for a name that is that `let` itself.
+function monoAliasLetEnd(name: string, at: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1, 0]
+  let nm = name
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    const lf = monoLetFrameOf(nm, ax, fr)
+    if lf[1] < 0 { return none }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return none }
+    if d.letKw == "let" {
+      const written = monoLetWrittenAt(nm, lf)
+      let lam = false
+      if !written && monoNestedBodyOf(d.letInit) >= 0 {
+        const ls = fnStmtsPosOf(d.letInit)
+        lam = ls >= 0 && criFnIsAnonLambda(ls)
+      }
+      if written || lam {
+        if hops == 0 { return none }
+        let w = 0
+        if written { w = 1 }
+        const out: i32[] = [ax, fr, w]
+        return out
+      }
+    }
+    const next = monoIdentNameOf(d.letInit)
+    if next == "" { return none }
+    nm = next
+    ax = d.letInit
+    fr = lf[0]
+    hops = hops + 1
+  }
+  none
 }
 
 // Renames the initializer of `const alias = tpl`, read at `at` in frame `ctx`, to instance
@@ -8925,7 +8977,12 @@ function monoMakeInstanceGo(
         // written itself (D3858).
         const written = monoNameWrittenAt(cal3.identName, calleeIx)
           || i32ListHas(monoNoRename, calleeIx)
-        if cal3.identName != fn.fnName && written && !monoWrittenLetSigCall {
+        if (
+          cal3.identName != fn.fnName
+          && written
+          && !monoWrittenLetSigCall
+          && calleeIx != monoWriteCoercedCall
+        ) {
           // A frame-keyed instance differs by its enclosing instance, not its argument type.
           if callFrame >= 0 {
             return emitFail(
@@ -11763,7 +11820,12 @@ function monoCellCall(
   if viaAlias { monoNoRename.push(n.callFn) }
   if sfe >= 0 {
     monoLastInstFe = -1
-    if monoInstantiate(sfe, ix, ctx) < 0 { return -1 }
+    if monoWritesCoercedFirstCall("c:", cellNm, at, cctx) {
+      monoWriteCoercedCall = n.callFn
+    }
+    const sr = monoInstantiate(sfe, ix, ctx)
+    monoWriteCoercedCall = -1
+    if sr < 0 { return -1 }
     ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
   }
   // A hole lambda seed is pinned by this call's arguments, which the callee's recorded type
@@ -11790,6 +11852,27 @@ function monoCellCall(
     if monoNoteBindDeliveryAt(at, ctn, cctx) < 0 { return -1 }
   }
   0
+}
+
+// The callee of the call `monoWalk` is instancing through a written `let` whose writes it then
+// instances at the same signature, so that instance need not be the generic's first; -1 for none.
+let monoWriteCoercedCall = -1
+
+// Whether the `let` (`key` `n:`) or capture cell (`c:`) `name` read at `at` in frame `ctx` is
+// written and no call has given it a signature yet: its writes then take this call's.
+function monoWritesCoercedFirstCall(
+  key: string,
+  name: string,
+  at: i32,
+  ctx: i32,
+): boolean {
+  monoLetWritesExtend()
+  if (monoLetWrites.get(key + name) ?? []).length == 0 { return false }
+  const lf = monoLetFrameOf(name, at, ctx)
+  if lf[1] < 0 { return false }
+  // A write of another binding of the name does not make this one written (D4016).
+  if key == "n:" && !monoLetWrittenAt(name, lf) { return false }
+  (monoBindCallSigs.get(lf[1]) ?? "") == ""
 }
 
 // The longest alias chain `monoAliasChainLamFe` follows before refusing.
@@ -12045,6 +12128,10 @@ function monoWalk(ix: i32, ctx: i32) {
         ctx,
         n.callFn,
       )
+      const direct = fe >= 0
+      let wlName = callee.identName
+      let wlAt = n.callFn
+      let wlFr = ctx
       if fe < 0 {
         // A call through a `const` alias of a lambda's `const` binding is a call through
         // that binding, so it is re-spelled to it and instantiated per call alike (D2896).
@@ -12100,6 +12187,24 @@ function monoWalk(ix: i32, ctx: i32) {
             monoNoRename.push(n.callFn)
           }
         }
+        // An alias of a `let` calls what the `let` holds: an unwritten one its hole lambda, and a
+        // written one the value last written to it, so the seed is pinned at this call, which
+        // keeps its `call_ref`, and the writes take that signature (D3961).
+        if afe < 0 {
+          const wl = monoAliasLetEnd(callee.identName, n.callFn, ctx)
+          if wl[0] >= 0 {
+            afe = identClosureFeAt(sidOfNode(wl[0]), wl[1], wl[0])
+            if afe >= 0 && afe < fnInstOrigin.length && fnInstOrigin[afe] >= 0 {
+              afe = fnInstOrigin[afe]
+            }
+            if afe >= 0 && wl[2] == 1 {
+              monoNoRename.push(n.callFn)
+              wlName = monoIdentNameOf(wl[0])
+              wlAt = wl[0]
+              wlFr = wl[1]
+            }
+          }
+        }
         if afe >= 0 {
           if !criFnIsAnonLambda(afe) {
             // The fold below rewrites `f(x)` into a by-name call to the initializer's
@@ -12118,8 +12223,18 @@ function monoWalk(ix: i32, ctx: i32) {
       if fe >= 0 && fe < monoGen.length {
         if monoGen[fe] == 1 {
           monoLastInstFe = -1
+          if !direct && monoWritesCoercedFirstCall("n:", wlName, wlAt, wlFr) {
+            monoWriteCoercedCall = n.callFn
+          }
           const ri = monoInstantiate(fe, ix, ctx)
+          monoWriteCoercedCall = -1
           monoNoteBindCall(callee.identName, n.callFn, ctx)
+          // The call keeps its `call_ref` through a written `let`, so each generic written to it
+          // takes the instance's signature, as a delivery of the binding does (D3961).
+          if ri >= 0 && !direct && monoLastInstFe >= 0 {
+            const ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+            if ctn != "" { monoCoerceWrittenLet(wlName, wlAt, wlFr, ctn) }
+          }
           return ri
         }
         // A CONCRETE callee: specialize it per non-capturing callback (no-op if none) — the

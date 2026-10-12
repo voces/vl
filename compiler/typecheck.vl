@@ -9465,19 +9465,14 @@ function retireNarrowingsForWrite(
 
 // Whether a write of `rt` into a place declared `dcl` leaves the place reading at the member
 // its pin lands on (`HD_TVW`): a value typed at a declared type parameter, into a concrete `X |
-// null` of one non-literal member. A declaration naming a parameter strips to it exactly, and a
-// union of several members keeps the template's read, whose box the pin's member unboxes (D3240).
+// null` of one member or of a string-literal union. A declaration naming a parameter strips to
+// it exactly; any other union keeps the template's read, whose box the pin's member unboxes (D3240).
 function tvPlaceWrite(dcl: i32, rt: i32): boolean {
-  if (
-    !tyIsDeclaredParam(rt)
-    || !tyAdmitsNull(dcl)
-    || isLitBearing(dcl)
-    || tyHasTyVar(dcl)
-  ) {
+  if (!tyIsDeclaredParam(rt) || !tyAdmitsNull(dcl) || tyHasTyVar(dcl)) {
     return false
   }
   const nn = nonNullTy(dcl)
-  nn >= 0 && nn < T.tys.length && !(T.tys[nn] is TyUnion)
+  nn >= 0 && nn < T.tys.length && (!(T.tys[nn] is TyUnion) || tyIsLitUnion(nn))
 }
 
 // What a nested function reads a place a write left at `ty` as: the template's non-null face
@@ -9505,9 +9500,14 @@ export function tyIsWriteLandRead(ty: i32): boolean {
 }
 
 // The member of `dcl` a place declared so reads at after a write of a value pinned at `pin`
-// (`writeMemberTy`): `dcl` itself when the pin lands on no narrower member.
+// (`writeMemberTy`): `dcl` itself when the pin lands on no narrower member, and the literal
+// union `nonNullTy(dcl)` when a non-null pin fits it, as no one member names it (D3423).
 export function tvWriteLandTy(dcl: i32, pin: i32): i32 {
-  writeMemberTy(dcl, pin)
+  const m = writeMemberTy(dcl, pin)
+  if m != dcl || pin < 0 || isNullTy(pin) || tyAdmitsNull(pin) { return m }
+  const nn = nonNullTy(dcl)
+  if nn >= 0 && tyIsLitUnion(nn) && assignable(pin, nn) { return nn }
+  m
 }
 
 // Whether `ty` is the `HD_TVW` read of a write of `rt` into a place declared `dcl`; `rt` -1
@@ -13874,7 +13874,7 @@ function concatsAsStr(ty: i32): boolean { isStringTy(softenLitTy(ty)) }
 // parens. The string text is the raw lexeme between the quotes — the same characters a literal-type
 // annotation keeps — so membership compares consistently. The quote peel here is deliberately not
 // `tyname.groupInnerOf`: that is the type-name grammar's cut, and this lexeme is an expression's.
-function litTyOfExpr(ix: i32) {
+export function litTyOfExpr(ix: i32) {
   if ix < 0 { return -1 }
   const e = P.nodes[ix]
   if e is Paren { return litTyOfExpr(e.parInner) }
@@ -43173,6 +43173,7 @@ function memberFloorMsg(objTy: i32, prop: string) {
   if ot is TyErr { return "" }
   if ot is TyUnion {
     if sharedUnionFieldTy(ot, prop) >= 0 { return "" }
+    if prop == "length" && tyIsLitUnion(objTy) { return "" }
     return "field '"
       + prop
       + "' is not on every member of "
@@ -45087,10 +45088,37 @@ function litPinAssignable(
   const sT = litPinT
   litPinN = bNames
   litPinT = bTys
-  const ok = assignableExpr(ix, src, dst)
+  const ok = assignableExpr(ix, src, dst) || joinLitsFitAt(ix, dst)
   litPinN = sN
   litPinT = sT
   ok
+}
+
+// Whether `ix` is an `if` or `match` every value of which is a string literal fitting `dst`: the direct
+// spelling types such a join at its destination (`litJoinOf`), which a generic body cannot (D3423).
+function joinLitsFitAt(ix: i32, dst: i32): boolean {
+  if dst < 0 || dst >= T.tys.length || tyHasTyVar(dst) || tyHasNullMember(dst) {
+    return false
+  }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return false }
+  if !(P.nodes[p] is IfStmt || P.nodes[p] is MatchExpr) { return false }
+  const todo: i32[] = [p]
+  let guard = 0
+  while todo.length > 0 {
+    guard = guard + 1
+    if guard > 64 { return false }
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { return false }
+    if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+      if !tailPushBlockTail(at, todo) {
+        if !(P.nodes[at] is StrLit) { return false }
+        const lt = litTyOfExpr(at)
+        if lt < 0 || !assignable(lt, dst) { return false }
+      }
+    }
+  }
+  true
 }
 
 // Re-validates every deferred return-type constraint this call resolves: substitutes the
@@ -46615,7 +46643,7 @@ function holePinReadAt(
   if kind == HD_TVW {
     const wp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
     if wp < 0 { return -1 }
-    return writeMemberTy(hdInner[row], wp)
+    return tvWriteLandTy(hdInner[row], wp)
   }
   if kind == HD_HWR {
     const hp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
@@ -46717,7 +46745,10 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     const cDft = substTyDeep(hdInner[row], bNames, bTys)
     if cDft < 0 || tyHasHole(cDft) { return cInner }
     if assignable(cDft, cInner) { return cInner }
-    return joinTys(cInner, cDft)
+    // A literal default the face does not hold widens to its base, as the concrete `??` types it.
+    const cDt = T.tys[cDft]
+    if cDt is TyLit { return joinTys(cInner, litBaseTy(cDt)) }
+    return joinTys(cInner, widenLitTy(cDft))
   }
   // The `??` result over a hole default: the concrete tail, now that the default has a type.
   if kind == HD_COALD {
@@ -46734,7 +46765,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     const wPin = substHoleTy(hdBase[row], bNames, bTys)
     if wPin < 0 { return -1 }
     if tyIsHole(wPin) { return rebaseDerivedHole(row, wPin) }
-    return writeMemberTy(hdInner[row], wPin)
+    return tvWriteLandTy(hdInner[row], wPin)
   }
   if kind == HD_HWR {
     const hPin = substHoleTy(hdBase[row], bNames, bTys)
@@ -67149,10 +67180,12 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
       return joinTys(innerFull, rt)
     }
-    // A hole left operand has no non-null part yet, so the whole tail above defers to the pin
-    // (`HD_COAL`); answering `lt` instead kept the null the operator just removed, and every
-    // floor the pin re-asks then refused a receiver whose type after `??` is non-null (D1693).
-    const cd = mkDerivedHole(HD_COAL, "", rt, -1, lt)
+    // A hole left operand defers the whole tail above to the pin (`HD_COAL`): answering `lt` kept
+    // the null `??` removed (D1693). The default is kept unwidened, so a pin whose non-null face
+    // is a literal union holding it answers that union rather than `string`.
+    let cdDft = litTyOfExpr(n.binRight)
+    if cdDft < 0 { cdDft = rt }
+    const cd = mkDerivedHole(HD_COAL, "", cdDft, -1, lt)
     if cd >= 0 {
       noteCoalResultHole(cd)
       return cd
@@ -74555,6 +74588,11 @@ function checkMemberNode(n: Member, ix: i32) {
       return symMem(ix, sf)
     }
     if n.memProp == "length" {
+      // A string-literal union is a string: its length is the member's (D3423).
+      if tyIsLitUnion(objTy) {
+        if lengthWriteRefused(n, ix, 2) { return TY_ERR }
+        return symMem(ix, TY_I32)
+      }
       const lul = luLengthAt(n, ix, objTy)
       if lul >= 0 { return lul }
     }
