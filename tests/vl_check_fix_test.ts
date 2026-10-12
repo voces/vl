@@ -507,3 +507,14 @@ fixCase(
   },
   "function f(n: i32): boolean {\n  return n != 2 && n == 3\n}\nprint(f(1))\n",
 );
+
+fixCase(
+  "an unknown type some module exports is imported, beside its existing import or as a new one (DV-007)",
+  {
+    "world.vl": "export type Level = { n: i32 }\nexport function mk(): Level { return { n: 1 } }\n",
+    "main.vl": 'import { mk } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
+      "print(depth(mk()))\n",
+  },
+  'import { mk, Level } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
+    "print(depth(mk()))\n",
+);

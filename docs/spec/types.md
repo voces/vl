@@ -27,8 +27,8 @@ can decide.
 | `v128` | a 128-bit SIMD vector, built through `std:simd` |
 
 > Status: the owner ruled that VL gets the unsigned value types `u32` and `u64` (2026-10-03,
-> U1 = A, `docs/internals/unsigned-types-design.md` §U1). They are not built: `const a: u32 = 3`
-> is refused with "unknown type 'u32'".
+> U1 = A, DECISIONS.md §"`u32` and `u64` are value types"). They are not built:
+> `const a: u32 = 3` is refused with "unknown type 'u32'".
 
 **T1.2** Integer arithmetic wraps on overflow. `MIN / -1` and division by zero trap. The
 operators are specified in expressions.md.
@@ -79,7 +79,7 @@ const v = f()   // refused: cannot bind the void result of 'v'
 
 > Status: `vl check` refuses a `void` field but accepts `void[]`, `Map<K, void>` and
 > `void | T` written in an annotation. The first two then fail at build time, and the
-> union is refused only when it is read (D4052; the inferred face is D1993).
+> union is refused only when it is read (D4052; the inferred face, D1993, is refused at the binding).
 
 **T1.5** `never` has no values. It may be written only as a function's declared return
 type. A `never` function must end every path in another never-returning call, such as
