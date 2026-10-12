@@ -10301,7 +10301,7 @@ print("x")   // calls the program's own `print`, typed by its own signature
 
 **Why.** A call and its type must agree about which name they mean; today a declared
 `print` is called but typed by the ambient one. Shadowing is how every other scope works.
-The checker does not do it yet (D4066).
+Built by D4066: the merge renames such a binding, so no spelling-matched site sees it.
 
 ## A re-export binds its name locally (owner rulings R1–R3, 2026-10-04) — sunpa SP-014, SP-020
 

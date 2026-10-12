@@ -384,6 +384,30 @@ fixCase(
     "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
 );
 
+// ---- a positional argument after a misplaced named one (D4061, ruling Q8) ----
+
+fixCase(
+  "positional arguments after a misplaced name are named for the parameter they bind today",
+  {
+    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
+      "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
+      "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+      "print(box(h: 3, 2))\nprint(f(c: 5, 1, 7))\nprint((5).m(d: 1, 2))\n",
+  },
+  "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
+    "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
+    "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+    "print(box(h: 3, w: 2))\nprint(f(c: 5, a: 1, b: 7))\nprint((5).m(d: 1, c: 2))\n",
+);
+
+fixCase(
+  "a name given twice has no mechanical fix and is left alone",
+  {
+    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+  },
+  "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+);
+
 fixCase(
   "a method call on a receiver built from an earlier error imports nothing for it (DV-101)",
   {
