@@ -78,6 +78,11 @@ cost no new type, no new widening edge, no second integer rep, and no change to 
 program. A `u32` would touch the type arena, every rep table, every widening rule and every emitter
 kind code, to express something the operand does not need to carry.
 
+*Amended 2026-10-03 and 2026-10-04 (owner rulings U1–U4):* VL adds `u32` and `u64` as value
+types, and the type picks the unsigned operation. `divU`, `remU`, `ltU` and `>>>` stay, for `i32`
+and `i64` operands. See DECISIONS.md §"`u32` and `u64` are value types" and
+[unsigned-types-design.md](unsigned-types-design.md).
+
 ## Shadowing
 
 An intrinsic is a **fallback for a name the program did not define**. The checker skips its arm when

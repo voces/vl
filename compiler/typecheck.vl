@@ -1891,6 +1891,7 @@ function narInstallJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
     // and a call that may write the name ends it (D2390).
     noteNarShadow(key, cur, NAR_KIND_POSTGUARD)
     declare(key, jt)
+    narFitCompanions(key, cur, jt)
     recordArmJoin(ix, key, jt)
   } else if viaChain {
     // The `else if` chain's join reaches the emitter only at this statement (D2627).
@@ -5817,6 +5818,8 @@ export function initChecker() {
   npSettle = []
   npCapBy = []
   npAsg = []
+  nfSlots = []
+  nfNames = []
   npFrames = []
   pgUpKeys = []
   pgUpTys = []
@@ -7897,6 +7900,8 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
       const ld = cwLambdaDeclOf(an.identName, fr)
       if ld >= 0 { return weClosed(fnWriteShapes(ld)) }
     }
+    // A scalar local is no function value, whatever the call hands it to (`clz(m)`).
+    if crTyIsScalar(nodeTyOf(a)) { return "" }
     if strListHas(bound, an.identName) { return "*" }
   }
   if weNeverFn(a) { return "" }
@@ -8130,7 +8135,7 @@ function keyStepTag(step: string, t: i32): string {
 // Whether the place keyed `key` stores exactly the type its live narrowing reads it at.
 function keyStoresNarrowedTy(key: string): boolean {
   const slot = narrowedPathIx(key)
-  if slot < 0 { return false }
+  if slot < 0 || narFitSlot(slot) { return false }
   const nar = npTys[slot]
   const st = keyStoreTy(key)
   if nar < 0 || st < 0 { return false }
@@ -8767,6 +8772,7 @@ function retireAliasedNarrowings(
     if hits && npInvBy[i] < 0 {
       crAliasWr[atIx] = true
       npInvBy[i] = atIx
+      if nfSlots.length > 0 && i >= crFnNpBase() { narFitRetire(i, atIx, -1) }
       if i < crFnNpBase() {
         crAliasNestSlots.push(i)
         crAliasNestDepths.push(crFnBases.length)
@@ -9621,6 +9627,9 @@ function noteCallInvalidations(callIx: i32) {
       // two arms separately and a write in one must not hide a call in the other (D1849).
       if npInvBy[i] < 0 {
         npInvBy[i] = callIx
+        if nfSlots.length > 0 && i >= crFnNpBase() {
+          narFitRetire(i, callIx, -1)
+        }
         if callKillSure(callIx, npKeys[i]) { noteKillSure(callIx, npKeys[i]) }
         crPathCallRetire(i, callIx)
         // Inside a nested body a call ends an enclosing narrowing for the rest of that body
@@ -10969,6 +10978,116 @@ function crRetireAt(
   0
 }
 
+// Overlay slots holding a field of a bare name narrowed to a record, with that name: the
+// narrowing holds only while the field does, so a write that ends the path ends the name.
+let nfSlots: i32[] = []
+let nfNames: string[] = []
+
+// Push a path entry `name.f` for each field the record `nt` stores narrower than another member of
+// the union `declTy` that contains it, so the path rules decide when a write through another place
+// ends `name` too. Members that cannot hold an `nt` cannot hold the object, and need none.
+function narFitCompanions(name: string, declTy: i32, nt: i32) {
+  while nfSlots.length > 0 && nfSlots[nfSlots.length - 1] >= npKeys.length {
+    nfSlots.pop()
+    nfNames.pop()
+  }
+  const r = T.tys[nt]
+  if r is TyObj { narFitFields(name, declTy, nt, r) }
+  0
+}
+
+function narFitFields(name: string, declTy: i32, nt: i32, r: TyObj) {
+  let wide = declTy
+  const dt = T.tys[declTy]
+  if dt is TyNullable { wide = dt.nInner }
+  if wide < 0 { return 0 }
+  const u = T.tys[wide]
+  if u is TyUnion { narFitMembers(name, nt, r, u.uMembers) }
+  0
+}
+
+// The fields of `r` (the record `nt`) a member of `mems` that holds every `nt` stores wider.
+function narFitMembers(name: string, nt: i32, r: TyObj, mems: i32[]) {
+  let f = 0
+  while f < r.objFieldNames.length {
+    const ft = r.objFieldTypes[f]
+    let wider = false
+    for m in mems {
+      if (
+        !wider
+        && m >= 0
+        && m != nt
+        && T.tys[m] is TyObj
+        && assignable(nt, m)
+        && !assignable(m, nt)
+      ) {
+        const mo = T.tys[m]
+        if mo is TyObj {
+          const mt = objFieldType(mo, r.objFieldNames[f])
+          wider = mt >= 0 && ft >= 0 && !tySame(mt, ft)
+        }
+      }
+    }
+    if wider {
+      nfSlots.push(npKeys.length)
+      nfNames.push(name)
+      npKeys.push(name + "." + r.objFieldNames[f])
+      npTys.push(ft)
+      npInvBy.push(-1)
+      npEpochs.push(narFnEpoch)
+      npSettle.push(-2)
+      npCapBy.push(-1)
+      npAsg.push(0)
+    }
+    f = f + 1
+  }
+  0
+}
+
+// Whether overlay slot `slot` is a field entry of a narrowed name: the place stores what the
+// name's declared type does, which its narrowed type does not say.
+function narFitSlot(slot: i32): boolean { narFitNameOf(slot) != "" }
+
+// The bare name whose field entry overlay slot `slot` is, or "" when it is a written path.
+function narFitNameOf(slot: i32): string {
+  let j = nfSlots.length - 1
+  while j >= 0 {
+    if (
+      nfSlots[j] == slot
+      && slot < npKeys.length
+      && keyHasPrefix(npKeys[slot], nfNames[j] + ".")
+    ) {
+      return nfNames[j]
+    }
+    j = j - 1
+  }
+  ""
+}
+
+// End the bare name a field entry in overlay slot `slot` stands for, as the write or call at
+// `atIx` ended the entry: before the loop `loopIx` when it is not -1, else after the open statement.
+function narFitRetire(slot: i32, atIx: i32, loopIx: i32) {
+  let j = nfSlots.length - 1
+  while j >= 0 {
+    if (
+      nfSlots[j] == slot
+      && slot < npKeys.length
+      && keyHasPrefix(npKeys[slot], nfNames[j] + ".")
+    ) {
+      if loopIx >= 0 {
+        crRetire(nfNames[j], atIx, true, loopIx)
+      } else if (
+        crStmtIxs.length > 0
+        && crStmtFns[crStmtFns.length - 1] == crFnBases.length
+      ) {
+        crRetire(nfNames[j], atIx, false, crStmtIxs[crStmtIxs.length - 1])
+      }
+    }
+    j = j - 1
+  }
+  0
+}
+
 // Whether the scope layer `d` of `name` is a narrowing rather than a declaration.
 function crIsNarrowLayer(name: string, d: i32): boolean {
   crFirstBank(name, d) >= 0 || crWidenedAt(name, d)
@@ -12181,6 +12300,7 @@ function crLoopPathPreRetire(loopIx: i32) {
       const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
       if a >= 0 {
         npInvBy[s] = a
+        if nfSlots.length > 0 { narFitRetire(s, a, loopIx) }
         noteKillSure(a, npKeys[s])
         npSettle[s] = -1
         crAliasWr[a] = true
@@ -12890,9 +13010,15 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
   if slot >= 0 && slot < npAsg.length {
     if npAsg[slot] == 1 { cause = "a write of a non-null value" }
   }
+  // A field entry of a narrowed name is the compiler's, not the user's: name the binding.
+  let shown = key
+  if slot >= 0 {
+    const fitName = narFitNameOf(slot)
+    if fitName != "" { shown = fitName }
+  }
   tErr(
     "'"
-      + key
+      + shown
       + "' was narrowed by "
       + cause
       + ", but "
@@ -12900,7 +13026,7 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
       + " on line "
       + i32ToStr(nodeLineOf(byIx))
       + " can write it — re-test '"
-      + key
+      + shown
       + "' after "
       + after,
     at,
@@ -14365,6 +14491,9 @@ function applyNarrows(names: string[], tys: i32[]) {
         noteNarShadow(names[i], declTy, NAR_KIND_GUARD)
       }
       declare(names[i], tys[i])
+      if declTy >= 0 && declTy != tys[i] {
+        narFitCompanions(names[i], declTy, tys[i])
+      }
       if wasConst {
         const ctop = constScopes.length - 1
         if ctop >= 0 { constScopes[ctop][names[i]] = wasDecl }
@@ -14493,6 +14622,10 @@ function popScope() {
       npSettle.pop()
       npCapBy.pop()
       npAsg.pop()
+    }
+    while nfSlots.length > 0 && nfSlots[nfSlots.length - 1] >= npKeys.length {
+      nfSlots.pop()
+      nfNames.pop()
     }
   }
   if asgDeclFrames.length > 0 {
@@ -25870,8 +26003,9 @@ function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
                 nodeTySet(fd.fdType, r)
               }
             } else {
-              tErr(
-                unknownTyTextIn(ftn.tyName, " for field '" + fd.fdName + "'"),
+              unknownTyErr(
+                ftn.tyName,
+                " for field '" + fd.fdName + "'",
                 dfields[fi],
               )
             }
@@ -26434,7 +26568,12 @@ function tySuggestFor(name: string) {
   while bi < builtinTyNames.length {
     const bn = builtinTyNames[bi]
     const bd = tyEditDist(name, bn)
-    if bd < bestD {
+    // A capitalised name is a user type's; a builtin is near it only from the same letter
+    // (`Strng` → `string`), never across one (`Level` is not a typo of `never`).
+    if (
+      bd < bestD
+      && (!(name[0] >= 'A' && name[0] <= 'Z') || tySameInitial(name, bn))
+    ) {
       bestD = bd
       best = bn
     }
@@ -26451,6 +26590,16 @@ function tySuggestFor(name: string) {
     }
   }
   best
+}
+
+// Whether `a` and `b` begin with the same letter, ignoring case.
+function tySameInitial(a: string, b: string): boolean {
+  if a.length == 0 || b.length == 0 { return false }
+  let x = a[0]
+  let y = b[0]
+  if x >= 'A' && x <= 'Z' { x = x + 32 }
+  if y >= 'A' && y <= 'Z' { y = y + 32 }
+  x == y
 }
 
 // The `; did you mean '<name>'?` clause, or "" when nothing is near enough. A suffix by
@@ -26553,6 +26702,34 @@ function foreignGenericRespell(name: string): string {
 // offending component when the bank holds one that is not the whole name. Read
 // immediately after the failing resolution — every call site is a resolve/`tErr` pair.
 function unknownTyText(name: string) { unknownTyTextIn(name, "") }
+
+// Raises the unknown-type sentence for `name` (with the caller's `tail`) at `at`. When a module
+// of the program or std exports the unresolved name, it is the missing-import refusal instead,
+// whose edit `check --fix` applies; with none it is recorded as a miss for the CLI's wider look.
+function unknownTyErr(name: string, tail: string, at: i32) {
+  let part = unkTyPart
+  if part.length == 0 { part = name }
+  if unkTyClash.length == 0 && nameIsBareIdent(part) && !isBuiltinTyName(part) {
+    const from = ufcsModOfNode(at)
+    const specs = mimpSpecsFor(part, from, -1)
+    if !mimpAnyProgramSpec(specs) { mimpNoteMiss(part) }
+    if specs.length > 0 {
+      let data = diagDataField("member", part)
+      for sp in specs { data = data + diagDataField("modules", sp) }
+      return tErrCodedData(
+        "unknown type '"
+          + part
+          + "'"
+          + tail
+          + mimpExportedByNote(part, specs, from),
+        at,
+        CODE_MISSING_IMPORT,
+        data,
+      )
+    }
+  }
+  tErr(unknownTyTextIn(name, tail), at)
+}
 
 // The same text with the caller's own trailing clause (`… for field 'a'`, `… in union
 // 'U'`) placed before the suggestion, so `did you mean` always ends the sentence.
@@ -55498,7 +55675,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
           pt = resolveAnnotAt(ptn.tyName, n.fnTyParams, pNode.parType, n.fnName)
           if pt >= 0 && pt == collapsedTy { ptCollapsed = true }
           if pt < 0 {
-            tErr(unknownTyText(ptn.tyName), pNode.parType)
+            unknownTyErr(ptn.tyName, "", pNode.parType)
             pt = TY_ERR
           }
           // Records the resolved type on the param's type-annotation node too (not just the
@@ -55577,7 +55754,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
         // arm is what covers a NESTED one, which the hoist never walks.
         if ret >= 0 && ret == collapsedTy { markCollapsedRet(fnIx) }
         if ret < 0 {
-          tErr(unknownTyText(rtn.tyName), n.fnRet)
+          unknownTyErr(rtn.tyName, "", n.fnRet)
           ret = TY_ERR
         }
         // Records the resolved return type on the return-annotation node so the emitter can
@@ -56146,8 +56323,9 @@ function fillTypeDeclAt(sx: i32) {
                     nodeTySet(fd.fdType, r)
                   }
                 } else {
-                  tErr(
-                    unknownTyTextIn(ftn.tyName, " for field '" + fd.fdName + "'"),
+                  unknownTyErr(
+                    ftn.tyName,
+                    " for field '" + fd.fdName + "'",
                     dfields[fi],
                   )
                 }
@@ -56226,10 +56404,7 @@ function fillTypeDeclAt(sx: i32) {
                 if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
               }
             } else {
-              tErr(
-                unknownTyTextIn(variants[vi], " in union '" + sd.udName + "'"),
-                sx,
-              )
+              unknownTyErr(variants[vi], " in union '" + sd.udName + "'", sx)
             }
             vi = vi + 1
           }
@@ -67743,7 +67918,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
         if badKey != "" && !mapKeyTySupported(tsLeafTy(badKey)) {
           mapKeyUnsupportedErr(badKey, initMapCtorName(n.letInit), n.letType)
         } else {
-          tErr(unknownTyText(tn.tyName), n.letType)
+          unknownTyErr(tn.tyName, "", n.letType)
         }
         annot = TY_ERR
       }
@@ -69571,10 +69746,12 @@ function checkIfTail(
         pgPreTys.push(lookup(gKey))
         // ...and bank the shadowed declaration under the post-guard kind, so a consumer
         // needing the emitter's union can find it (D1035) — idempotent, banking the widest first.
-        noteNarShadow(gKey, lookup(gKey), NAR_KIND_POSTGUARD)
+        const gDecl = lookup(gKey)
+        noteNarShadow(gKey, gDecl, NAR_KIND_POSTGUARD)
         // One leg for both kinds: a null strip and a union subtraction are the same shadowing
         // `declare` — split only so the strip could skip the subtraction bank, now gone.
         declare(gKey, gTy)
+        if gDecl >= 0 && gDecl != gTy { narFitCompanions(gKey, gDecl, gTy) }
       }
       gi2 = gi2 + 1
     }
@@ -69587,8 +69764,12 @@ function checkIfTail(
         if narClobberedSince(thenLo, pgUpKeys[pu]) {
           recordPgResidualVoid(ix)
         } else {
-          noteNarShadow(pgUpKeys[pu], lookup(pgUpKeys[pu]), NAR_KIND_POSTGUARD)
+          const upDecl = lookup(pgUpKeys[pu])
+          noteNarShadow(pgUpKeys[pu], upDecl, NAR_KIND_POSTGUARD)
           declare(pgUpKeys[pu], pgUpTys[pu])
+          if upDecl >= 0 && upDecl != pgUpTys[pu] {
+            narFitCompanions(pgUpKeys[pu], upDecl, pgUpTys[pu])
+          }
         }
       }
     }
@@ -75699,7 +75880,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
     if chkClash.length > 0 {
       tErr(chkClash, ix)
     } else {
-      tErr(unknownTyTextIn(n.isVariant, " in 'is'"), ix)
+      unknownTyErr(n.isVariant, " in 'is'", ix)
     }
     // `objTy < 0` is the operand's own "no answer", not a type — indexing `T.tys` with it
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.
