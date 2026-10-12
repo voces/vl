@@ -377,14 +377,23 @@ print(trim(" a "))   // prints a
 
 > Ruling: owner 2026-10-07, O7, DECISIONS.md §"No prelude: every library name is imported".
 
-> Status: a declaration named like one of the five ambient functions is called, but a call
-> to it is checked against the ambient signature, and a local `const` of that name is
-> ignored at a call (D4066). A declaration named like a float or integer intrinsic shadows
-> it cleanly. A compiler intrinsic cannot be redeclared: `function __trap__()` is refused,
-> "is a compiler intrinsic and cannot be redefined".
+A declaration named like an ambient function shadows it in its scope, for the call and its
+type, as any inner binding does. After the scope ends the ambient name is visible again.
+
+```vl
+function f(): i32 {
+  const print = (x: i32): i32 => x + 100
+  print(3)          // calls the lambda
+}
+print(f())          // prints 103
+```
+
+A declaration named like a compiler intrinsic is refused: `function __trap__()` is "a
+compiler intrinsic and cannot be redefined". A `type` declaration named like a built-in type
+is refused (D1585); a value named like one, `const i32 = 3`, is accepted.
 
 > Ruling: owner 2026-10-12 (Q11 (b)), DECISIONS.md §"A declaration shadows an ambient name
-> of the same name". Compiler intrinsics stay refused (D4066, not built).
+> of the same name".
 
 **M5.4** A method call `x.f(…)` reaches only a function `f` that is in scope. It never
 finds a function the module has not imported.
