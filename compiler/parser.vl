@@ -33,9 +33,14 @@ import {
 } from "./ast"
 import {
   BinExpr,
+  Block,
+  FuncDecl,
   Ident,
   P,
+  STRICT_EQ_CODE,
   Tok,
+  braceNameStmts,
+  dgMarkCode,
   dgMarkLossless,
   dgMarkSpanEnd,
   mkDeclNameTok,
@@ -2323,6 +2328,7 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
     } else {
       const opTok = P.pos // the operator token (anchors the mixing diagnostic)
       const opText = advance().text
+      if k == "EQ" || k == "NE" { strictEqTail(opTok, opText) }
       // A binary operator at the end of a line continues onto the next, so a NEWLINE or
       // SEMI may sit between the operator and the right operand. Skip it: the operator
       // already commits the expression to continue, so the line break is not a statement
@@ -2364,6 +2370,33 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
   }
   if chainN >= ARITH_CHAIN_MIN { markArithRuns(acc) }
   acc
+}
+
+// After an `==` or `!=` at `opTok`: an `=` written directly after it spells JavaScript's `===` or
+// `!==`. VL's own operator is already strict, so the `=` is consumed and the comparison stands as
+// written without it; the diagnostic spans all three characters and `check --fix` drops the third.
+function strictEqTail(opTok: i32, opText: string) {
+  if peekKind() != "EQUAL" || peekTok().start != P.toks[opTok].start + 2 {
+    return 0
+  }
+  const di = P.diags.length // the index the push below is about to occupy
+  dgMarkLossless(di)
+  dgMarkSpanEnd(di, P.pos)
+  dgMarkCode(di, STRICT_EQ_CODE)
+  P.diags.push(
+    {
+      msg: "VL has no `"
+        + opText
+        + "=`; `"
+        + opText
+        + "` is already strict — write `"
+        + opText
+        + "`",
+      at: opTok,
+    },
+  )
+  advance()
+  0
 }
 
 // At a `*`: the token index of the `*` or `*=` written directly after it, so the pair spells
@@ -3388,7 +3421,13 @@ function parseArrowLambda(p0: i32) {
   expect("EQUAL") // the `=` of `=>`
   expect("GT")    // the `>` of `=>`
   const noTyParams: string[] = []
-  parseFuncBodyAndBuild("", noTyParams, params, ret, -1, p0)
+  const f = parseFuncBodyAndBuild("", noTyParams, params, ret, -1, p0)
+  // `=> { name }` is a body yielding the name, never a record, as in JavaScript.
+  if f >= 0 && f < P.nodes.length {
+    const fn = P.nodes[f]
+    if fn is FuncDecl { noteBraceName(fn.fnBody) }
+  }
+  f
 }
 
 // The operator tokens a function name may be (`function +(self, b)` — a free operator
@@ -4787,7 +4826,7 @@ export function parseStmt() {
       return eb
     }
     if looksLikeObject(P.pos) { return parseExpr() }
-    return parseBlock()
+    return noteBraceName(parseBlock())
   }
   if k == "IDENT" && kindAt(P.pos + 1) == "COLON" {
     const old = oldLabelAt(P.pos)
@@ -4795,6 +4834,18 @@ export function parseStmt() {
     return refuseKeyedStmt()
   }
   valueIfDrop(parseExpr())
+}
+
+// Record block `b`'s statement when it is its only one and a bare name (`braceNameStmts`).
+// Answers `b`.
+function noteBraceName(b: i32): i32 {
+  const n = P.nodes[b]
+  if n is Block {
+    if n.blkStmts.length == 1 && P.nodes[n.blkStmts[0]] is Ident {
+      braceNameStmts.push(n.blkStmts[0])
+    }
+  }
+  b
 }
 
 // `name: value` where a statement starts: the object-literal body of a brace that reads as a
