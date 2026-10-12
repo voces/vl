@@ -206,6 +206,9 @@ Deno.test({
 // buffer the host already holds; the control below proves it reports the SAME byte
 // count a real-file build does, which the old `fs::metadata` read on `/dev/null`
 // (always 0) could not.
+// Windows has no `/dev/null`; its null device is `NUL`, the same unreadable-back sink.
+const NULL_DEV = Deno.build.os === "windows" ? "NUL" : "/dev/null";
+
 Deno.test({
   name:
     "vl-build-validate: -o /dev/null validates the buffer in hand, not a re-read of the path (D1678)",
@@ -222,14 +225,16 @@ Deno.test({
         throw new Error(`expected a "wrote ... (N bytes)" line on stderr, got: ${JSON.stringify(toFile.err)}`);
       }
 
-      const toDevNull = await vl(["build", srcPath, "-o", "/dev/null"]);
+      const toDevNull = await vl(["build", srcPath, "-o", NULL_DEV]);
       if (toDevNull.code !== 0) {
         throw new Error(
           `-o /dev/null must build a check-clean program clean, got rc ${toDevNull.code}:\n` +
             toDevNull.err,
         );
       }
-      const devNullMatch = toDevNull.err.match(/^wrote \/dev\/null \((\d+) bytes\)$/m);
+      const devNullMatch = toDevNull.err.split(/\r?\n/)
+        .map((l) => l.match(/^wrote (.+) \((\d+) bytes\)$/))
+        .find((m) => m?.[1] === NULL_DEV)?.slice(1);
       if (!devNullMatch) {
         throw new Error(
           `expected the "wrote /dev/null (N bytes)" report on stderr, got: ${JSON.stringify(toDevNull.err)}`,

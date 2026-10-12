@@ -16,6 +16,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 import { runWasm } from "./support/runWasm.ts";
 
@@ -105,7 +106,7 @@ Deno.test({
   name: "std:fs: 64 MiB streamed from one Buf in 1 MiB windows, with no second copy",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_write_stream_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_write_stream_" });
     const path = `${dir}/out.bin`;
     try {
       const want = new Uint8Array(SIZE);
@@ -210,7 +211,7 @@ Deno.test({
   name: "std:fs: writeFileRange past 2^32 patches, extends, and refuses a gap",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_write_big_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_write_big_" });
     const path = `${dir}/sparse.bin`;
     const base = 2 ** 32;
     try {
@@ -281,7 +282,7 @@ Deno.test({
   name: "std:fs: appendFile and writeFileRange create a missing file only where they should",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_write_create_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_write_create_" });
     try {
       const got = await run(
         dir,
@@ -330,7 +331,7 @@ Deno.test({
   name: "V8 harness — the two write slots refuse by name",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_write_v8_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_write_v8_" });
     try {
       const cases: [string, string][] = [
         [

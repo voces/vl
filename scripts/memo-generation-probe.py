@@ -261,7 +261,7 @@ def module_stamps():
     """Module-level bindings whose name reads as a generation stamp."""
     out = {}
     for f in sorted(C.glob("*.vl")):
-        for i, ln in enumerate(f.read_text().split("\n"), 1):
+        for i, ln in enumerate(f.read_text(encoding="utf-8").split("\n"), 1):
             m = re.match(r"^(?:export )?(?:let|const) ([A-Za-z_][A-Za-z0-9_]*)\s*(?::|=)", ln)
             if m and STAMP_MARK.search(m.group(1)):
                 out[m.group(1)] = "%s:%d" % (f.name, i)
@@ -271,7 +271,7 @@ def module_stamps():
 def derive(stamps):
     hits = {}
     for f in sorted(C.glob("*.vl")):
-        for i, ln in enumerate(f.read_text().split("\n"), 1):
+        for i, ln in enumerate(f.read_text(encoding="utf-8").split("\n"), 1):
             if ln.strip().startswith("//"):
                 continue
             for g in GUARD:
@@ -300,7 +300,7 @@ def cmd_list():
             bad.append("UNCLASSIFIED stamp `%s` (declared %s) read at %s — add a ROWS row, and "
                        "a disable edit unless its key already reads `emitPassGen`"
                        % (s, stamps[s], ", ".join(hits[s][:3])))
-    src = "\n".join(f.read_text() for f in C.glob("*.vl"))
+    src = "\n".join(f.read_text(encoding="utf-8") for f in C.glob("*.vl"))
     for rid, ss, verdict, ed in ROWS:
         for s in ss:
             if s not in stamps:
@@ -329,12 +329,12 @@ def edits(only=None):
         if isinstance(ed, str):
             old, new = ed[len("ALL:"):].split("\x00")
             for f in sorted(C.glob("*.vl")):
-                if old in f.read_text():
+                if old in f.read_text(encoding="utf-8"):
                     out.append((f, old, new, rid, True))
             continue
         old, new = ed
         for f in sorted(C.glob("*.vl")):
-            if f.read_text().count(old) == 1:
+            if f.read_text(encoding="utf-8").count(old) == 1:
                 out.append((f, old, new, rid, False))
                 break
         else:
@@ -355,11 +355,11 @@ def cmd_run(args):
         if not (BACKUP / f.name).exists():
             shutil.copy(f, BACKUP / f.name)
     for f, old, new, rid, every in todo:
-        s = f.read_text()
+        s = f.read_text(encoding="utf-8")
         if not every and s.count(old) != 1:
             print("SKIP %s (anchor count %d)" % (rid, s.count(old)))
             continue
-        f.write_text(s.replace(old, new))
+        f.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
         print("disabled %-22s %s" % (rid, f.name))
     rc = subprocess.run([args.vl, "build", "compiler/entry.vl", "-o", args.out,
                          "--compiler", args.before], cwd=ROOT).returncode

@@ -22,6 +22,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 const STD = `${ROOT}/std`;
@@ -49,7 +50,7 @@ const makeFile = async (path: string): Promise<void> => {
 
 /** Compile and run `src` through the native `vl`, with `VL_STD` pinned to this tree. */
 const run = async (src: string): Promise<string> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_std_fs_into_" });
+  const dir = await makeTempDir({ prefix: "vl_std_fs_into_" });
   const entry = `${dir}/probe.vl`;
   await Deno.writeTextFile(entry, src);
   try {
@@ -88,7 +89,7 @@ Deno.test({
   name: "std:fs: readFileInto lands a whole 4 MiB file in one Buf, byte for byte",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_into_whole_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_into_whole_" });
     const path = `${dir}/pattern.bin`;
     try {
       await makeFile(path);
@@ -129,7 +130,7 @@ Deno.test({
   name: "std:fs: readFileRangeInto walks a file in windows of one reused Buf",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_into_scan_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_into_scan_" });
     const path = `${dir}/pattern.bin`;
     try {
       await makeFile(path);
@@ -188,7 +189,7 @@ Deno.test({
   name: "std:fs: a Buf smaller than the file fills exactly, and dstOff assembles it",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_into_part_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_into_part_" });
     const path = `${dir}/pattern.bin`;
     try {
       await makeFile(path);
@@ -245,7 +246,7 @@ Deno.test({
   name: "std:fs: readFileRangeInto agrees with readFileRange at a 3 MiB offset",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_into_agree_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_into_agree_" });
     const path = `${dir}/pattern.bin`;
     try {
       await makeFile(path);

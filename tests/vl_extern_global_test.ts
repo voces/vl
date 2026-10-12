@@ -20,12 +20,11 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
+import { binaryen, COMPILER, exists, ROOT, VL } from "./support/tree.ts";
 import { vlHostImports } from "../compiler/vlHostImports.ts";
 
 const STD = `${ROOT}/std`;
 const CASES = `${ROOT}/tests/cases/extern`;
-const BIN = `${ROOT}/node_modules/.bin`;
 const FEATURES = [
   "--enable-reference-types",
   "--enable-gc",
@@ -37,7 +36,7 @@ const FEATURES = [
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 const TOOLS = ENABLED &&
-  ["wasm-merge", "wasm-opt", "wasm-as", "wasm-dis"].every((t) => exists(`${BIN}/${t}`));
+  ["wasm-merge", "wasm-opt", "wasm-as", "wasm-dis"].every((t) => exists(binaryen(t)));
 if (GATED && !ENABLED) {
   console.warn("[vl-extern-global] skipped — missing vl binary or seed wasm.");
 }
@@ -234,12 +233,12 @@ Deno.test({
       const a = await build(dir, EXPORT_UNIT, "a");
       const b = await build(dir, IMPORT_UNIT, "b");
       // Every access is a `global.get`/`global.set` on the import itself, with no wrapper.
-      const dis = await mustExec(`${BIN}/wasm-dis`, [b]);
+      const dis = await mustExec(binaryen("wasm-dis"), [b]);
       for (const want of ["(global.get $gimport$0)", "(global.set $gimport$0"]) {
         if (!dis.includes(want)) throw new Error(`want \`${want}\` in wasm-dis of b:\n${dis}`);
       }
       const merged = `${dir}/merged.wasm`;
-      await mustExec(`${BIN}/wasm-merge`, [a, "extern", b, "b", ...FEATURES, "-o", merged]);
+      await mustExec(binaryen("wasm-merge"), [a, "extern", b, "b", ...FEATURES, "-o", merged]);
       const run = async (w: string): Promise<string> => {
         const logs: string[] = [];
         const mod = new WebAssembly.Module(await Deno.readFile(w));
@@ -250,7 +249,7 @@ Deno.test({
       };
       expectEq("merged", await run(merged), LINKED_LOGS);
       const opt = `${dir}/merged.O3.wasm`;
-      await mustExec(`${BIN}/wasm-opt`, [merged, ...FEATURES, "-O3", "-o", opt]);
+      await mustExec(binaryen("wasm-opt"), [merged, ...FEATURES, "-O3", "-o", opt]);
       expectEq("merged -O3", await run(opt), LINKED_LOGS);
 
       // The facade recipe (`cli-design.md`): a generated module NAMED `extern` imports each
@@ -268,9 +267,9 @@ Deno.test({
 `,
       );
       const facade = `${dir}/facade.wasm`;
-      await mustExec(`${BIN}/wasm-as`, [`${dir}/facade.wat`, ...FEATURES, "-o", facade]);
+      await mustExec(binaryen("wasm-as"), [`${dir}/facade.wat`, ...FEATURES, "-o", facade]);
       const viaFacade = `${dir}/facade-merged.wasm`;
-      await mustExec(`${BIN}/wasm-merge`, [
+      await mustExec(binaryen("wasm-merge"), [
         facade,
         "extern",
         a,
