@@ -229,6 +229,9 @@ Everything above runs natively on Windows, with Git for Windows supplying the sh
   native process resolves on the current drive.
 - `vl` prints paths with `/` separators on every OS, so compare test output against
   `slashed()` from `tests/support/filePath.ts`.
+- If a virus scanner excludes a folder, set `VL_TMP` to it: `gate.sh` then puts every row's
+  temp files there. A scanner that inspects each process launch and new file otherwise costs
+  the gate about 10–15% of its wall time.
 - `gate.sh`'s CPU column reads 0 here. Git Bash's `times` cannot see a native child's CPU,
   and no gate grades on that column.
 
