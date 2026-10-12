@@ -13117,6 +13117,53 @@ function voidSlotExemptExpr(exprIx: i32) {
   false
 }
 
+// The arm of the if-expression at `ix` whose last statement yields no value, or `ix` itself when
+// the expression is not an if or no arm is found.
+function ifNoValueArmAt(ix: i32): i32 {
+  let vi = ix
+  const vp = P.nodes[vi]
+  if vp is Paren { vi = vp.parInner }
+  const vn = P.nodes[vi]
+  if vn is IfStmt {
+    const t = blockNoValueTail(vn.ifThen)
+    if t >= 0 { return t }
+    if vn.ifElse >= 0 {
+      const en = P.nodes[vn.ifElse]
+      if en is IfStmt {
+        const r = ifNoValueArmAt(vn.ifElse)
+        if r != vn.ifElse { return r }
+      } else {
+        const e = blockNoValueTail(vn.ifElse)
+        if e >= 0 { return e }
+      }
+    }
+  }
+  ix
+}
+
+// `match` when the expression at `ix` is a match (or its desugared if), else `if`.
+function valueBranchKeyword(ix: i32): string {
+  let vi = ix
+  const vp = P.nodes[vi]
+  if vp is Paren { vi = vp.parInner }
+  if P.nodes[vi] is MatchExpr || njMatchDesugared(vi) { return "match" }
+  "if"
+}
+
+// The last statement of the block at `b` when it yields no value (the block itself when empty),
+// or -1 when it yields one.
+function blockNoValueTail(b: i32): i32 {
+  if b < 0 { return -1 }
+  const bn = P.nodes[b]
+  if bn is Block {
+    if bn.blkStmts.length == 0 { return b }
+    const last = bn.blkStmts[bn.blkStmts.length - 1]
+    const lt = nodeTyIxOf(last)
+    if lt < 0 || isVoidTy(lt) { return last }
+  }
+  -1
+}
+
 // A `never` value cannot be stored: the expression never returns, so a slot typed by it would
 // take a type no value has. Reports and answers true when `ty` is `never` (D1972).
 function neverValueSlotErr(ty: i32, slot: string, at: i32) {
@@ -14934,7 +14981,7 @@ function recordDeadNullTest(ix: i32, subjIx: i32, subjTy: i32, op: string) {
     i = i + 1
   }
   const t = P.toks[tk]
-  let subj = placeKeyOf(subjIx)
+  let subj = demangleMsg(placeKeyOf(subjIx))
   if subj == "" { subj = "the value" }
   let always = "false"
   if op == "!=" { always = "true" }
@@ -18284,6 +18331,10 @@ let wsBodyErr: {[i32]: boolean} = Map()
 let wsValueRead: {[string]: boolean} = Map()
 // Set while an argument a rewrite serves is delivered, so the width refusal stays quiet.
 let wsSuppress = false
+// The argument being delivered to its parameter, parens peeled, or -1: a literal there that sets
+// a field a record parameter does not declare is passed wider, its extra initializer evaluated.
+// A union parameter has no wider arm to pass, so the literal is refused there (D4070).
+let argLitAt = -1
 // Rewritten declarations an instance refused something in this pass: the declared parameter
 // accepted it, so the refusal is the rewrite's, and the rewrite is undone.
 let wsInstErr: i32[] = []
@@ -18297,6 +18348,7 @@ function wsReset() {
 }
 
 function wsPassReset() {
+  argLitAt = -1
   wsPendDecl = []
   wsPendParam = []
   wsBodyErr = Map()
@@ -25467,6 +25519,19 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           // union field, an i64/f32 field, an omitted nullable field), so record it on the literal
           // node and the emitter's row resolver keys the shape it builds, not the self-inference.
           if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+          // A field the record does not declare is refused where the literal is written, as at
+          // a destination `assignable` accepts by width (#1460). Reported and answered true.
+          if (
+            ok
+            && bareBraceSpec == 0
+            && !inferQuiet
+            && srcExpr != argLitAt
+            && objLitSetsUndeclared(e, dtix)
+          ) {
+            if !objLitHasDupKey(srcExpr) {
+              objLitUndeclaredErr(srcExpr, srcTy, dtix, "")
+            }
+          }
           return ok
         }
         // A struct literal flowing into a union adopts the first struct arm it adapts into
@@ -25480,25 +25545,55 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           // recorded as the concrete arm; canon's union-alias flatten covers both spellings.
           const members: i32[] = []
           flattenVariantsInto(dstTy, members)
+          // An arm declaring every field the literal sets is preferred; an arm that would drop
+          // one is taken only when no other accepts, and then refused as at a record (#1460).
           let mi = 0
-          while mi < members.length {
-            const mt = T.tys[members[mi]]
-            if mt is TyObj && unionArmBoxSafe(members[mi]) {
-              bareBraceSpec = bareBraceSpec + 1
-              const armOk = assignableExpr(srcExpr, srcTy, members[mi])
-              bareBraceSpec = bareBraceSpec - 1
-              if armOk {
-                if !inferQuiet {
-                  while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-                  nodeTySet(srcExpr, members[mi])
-                  // Rep sidecar: the struct literal builds the concrete arm struct's rep — record
-                  // it, recursing into fields, for the row resolver.
-                  recordRepTyAdopt(srcExpr, members[mi], 6)
+          let pass = 0
+          while pass < 2 {
+            mi = 0
+            while mi < members.length {
+              const mt = T.tys[members[mi]]
+              if (
+                mt is TyObj
+                && unionArmBoxSafe(members[mi])
+                && objLitSetsUndeclared(e, members[mi]) == (pass == 1)
+              ) {
+                bareBraceSpec = bareBraceSpec + 1
+                const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+                bareBraceSpec = bareBraceSpec - 1
+                if armOk && pass == 1 {
+                  if (
+                    !inferQuiet
+                    && bareBraceSpec == 0
+                    && !objLitHasDupKey(srcExpr)
+                  ) {
+                    objLitUndeclaredErr(
+                      srcExpr,
+                      srcTy,
+                      members[mi],
+                      " (reached through "
+                        + tyToStr(srcTy)
+                        + " into "
+                        + tyToStr(dstTy)
+                        + ")",
+                    )
+                  }
+                  return true
                 }
-                return true
+                if armOk {
+                  if !inferQuiet {
+                    while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+                    nodeTySet(srcExpr, members[mi])
+                    // Rep sidecar: the struct literal builds the concrete arm struct's rep — record
+                    // it, recursing into fields, for the row resolver.
+                    recordRepTyAdopt(srcExpr, members[mi], 6)
+                  }
+                  return true
+                }
               }
+              mi = mi + 1
             }
-            mi = mi + 1
+            pass = pass + 1
           }
         }
       }
@@ -41149,19 +41244,7 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
     return 0
   }
   if litShapeDropSrcExpr(sX) {
-    tErr(
-      "this object literal sets "
-        + objDroppedFieldList(sT, dT)
-        + ", which "
-        + tyToStr(dT)
-        + " does not declare"
-        + through
-        + ": a literal is built at the shape it flows into, so the extra field would be "
-        + "dropped and its initializer never evaluated — a call there would never run. "
-        + "Remove the field, or declare it on "
-        + tyToStr(dT),
-      srcExpr,
-    )
+    objLitUndeclaredErr(srcExpr, sT, dT, through)
   } else {
     tErrUnsupported(
       "an object value of shape "
@@ -41240,6 +41323,39 @@ function recStorageErr(at: i32, sT: i32, dT: i32, sX: i32, through: string) {
   )
   recAdRaising = false
   0
+}
+
+// The refusal of an object literal setting a field its destination record does not declare.
+function objLitUndeclaredErr(at: i32, sT: i32, dT: i32, through: string) {
+  tErr(
+    "this object literal sets "
+      + objDroppedFieldList(sT, dT)
+      + ", which "
+      + tyToStr(dT)
+      + " does not declare"
+      + through
+      + ": a literal is built at the shape it flows into, so the extra field would be "
+      + "dropped and its initializer never evaluated — a call there would never run. "
+      + "Remove the field, or declare it on "
+      + tyToStr(dT),
+    at,
+  )
+}
+
+// Whether the object literal `e` sets a field the record `dst` does not declare.
+function objLitSetsUndeclared(e: ObjLit, dst: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyObj {
+    let i = 0
+    while i < e.objFields.length {
+      const f = P.nodes[e.objFields[i]]
+      if f is FieldInit {
+        if objFieldType(d, f.fiName) < 0 { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // Is the claimed pair's source (`shapeAdaptSrcExpr`, already peeled) an object literal?
@@ -50051,7 +50167,11 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
       }
       constrainEmptyExpr(args[i], at, expected)
-      if !assignableExpr(args[i], at, expected) {
+      const savedArgLit = argLitAt
+      argLitAt = peelParenIx(args[i])
+      const argOk = assignableExpr(args[i], at, expected)
+      argLitAt = savedArgLit
+      if !argOk {
         // Anchored at the offending argument (or its offending return site),
         // never at the call node — see `argMismatchErr`.
         argMismatchErr(i + 1, expected, at, args[i])
@@ -51710,7 +51830,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const wsOrig = wsOrigTyOf(n, i)
     if wsOrig >= 0 && i < args.length && args[i] >= 0 && !tyHasTyVar(at) {
       wsSuppress = true
+      const savedOrigLit = argLitAt
+      argLitAt = peelParenIx(args[i])
       const wsOk = assignableExpr(args[i], at, wsOrig)
+      argLitAt = savedOrigLit
       wsSuppress = false
       if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
     }
@@ -51720,7 +51843,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       && wsCandidate(n, i, args[i], at, expected)
     if wsNew { wsNotePending(n, i) }
     wsSuppress = wsNew
+    const savedArgLit = argLitAt
+    argLitAt = peelParenIx(args[i])
     const argOk = assignableExpr(args[i], at, expected)
+    argLitAt = savedArgLit
     wsSuppress = false
     lbiNoDest = savedLbiGen
     widenRetagGenArg = savedGenArg
@@ -67833,6 +67959,42 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       )
       initTy = TY_ERR
     }
+  }
+  // An initializer whose type includes `void` has no value to store: refused at the if or match arm
+  // that yields none, else at the initializer (D4071).
+  if (
+    n.letInit >= 0
+    && annot < 0
+    && initTy >= 0
+    && !isVoidTy(initTy)
+    && tyMentionsVoid(initTy, 8)
+    && !symNameIsMinted(n.letName)
+  ) {
+    const arm = ifNoValueArmAt(n.letInit)
+    if arm != n.letInit {
+      const kw = valueBranchKeyword(n.letInit)
+      tErr(
+        "this arm yields no value, but the `"
+          + kw
+          + "` is the value of `"
+          + n.letName
+          + "`: end the arm with a value, or make the `"
+          + kw
+          + "` a statement",
+        arm,
+      )
+    } else {
+      tErr(
+        "`"
+          + n.letName
+          + "` would take the type "
+          + tyToStr(initTy)
+          + ", and a value that may be `void` cannot be stored: test it before binding "
+          + "it, or bind it only where it holds a value",
+        n.letInit,
+      )
+    }
+    initTy = TY_ERR
   }
   // A `never` initializer leaves nothing to bind, and an un-annotated binding would take a type
   // no value has; a declared type gives the dead binding a real one (D1972).
