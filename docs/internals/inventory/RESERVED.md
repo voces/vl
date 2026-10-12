@@ -86,10 +86,8 @@ D3795-D3799  lane-S5  2026-10-06  soundness: D3793, D3762, D3744 closed; D3795 f
 D3800-D3802  lane-DG  2026-10-07  redundant-annotation hint at a `??` default (D3798 closed; D3800 filed open)
 D3803-D3807  lane-PF  2026-10-07  sunpa per-frame allocation (item c): D3803 filed and closed; D3804 (list vectors, needs design), D3805 (for-in over a literal) filed open
 D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D3800 closed); D3811, D3812 filed open
-D3880-D3889  lane-SC  2026-10-08  D3881 filed open; the rest for D3827, D3853 and their residue
-D3890-D3899  lane-SC  2026-10-08  lane SC soundness rows (D3853 redesign, D3883)
-D3970-D3979  lane-SC  2026-10-10  lane SC rows for D3948 and the rv3498 residue
 D3985-D3989  lane-CK  2026-10-10  ruling-C follow-ups: rows the r5 review of #3500 found
 D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)
 D4000-D4009  lane-PF  2026-10-11  DV-1000/DV-1001 V8 perf (diderven): D4000 range-analysis guard folding, later residues
-D4020-D4029  lane-CK  2026-10-11  the #3516 review: a hole delivery's pin missed by the constraint probe (D4020 filed and closed), width rewrite gaps (D4021-D4023 filed open)
+D4040-D4049  lane-L2  2026-10-11  kind-grid findings from `scripts/twin-agreement.py` (D4040-D4044 filed open), stage-2 byte-change rows
+D4120-D4129  lane-SC  2026-10-11  function-name aliases the monomorphizer does not see through: `(id)`, `sel<F>(id)` (D4120-D4122 filed open); a list literal of a generic function (D4123-D4124 filed open)

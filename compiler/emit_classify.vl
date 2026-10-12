@@ -214,6 +214,7 @@ import {
   pinnedHoleTyOf,
   primNameOf,
   primNameStr,
+  recFitNarrowedFields,
   recordClonedCallRetire,
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
@@ -3468,6 +3469,19 @@ function asNulStructRow(asIx: i32): i32 {
   const tn = T.tys[t]
   if tn is TyNullable { return structIndexOfTy(tn.nInner) }
   -1
+}
+
+// The struct row an `x as! S` yields over a nullable-ref `S | null` operand, where `S` is a
+// standalone struct; else -1 — the first row denoting `S`, as an annotated binding resolves it.
+function asTrapStructRow(asIx: i32): i32 {
+  const n = P.nodes[asIx]
+  if !(n is AsExpr) { return -1 }
+  if n.asMode != "trap" { return -1 }
+  const payload = nulRefNichePayloadTy(nodeTyIxOf(n.asObj))
+  if payload < 0 { return -1 }
+  if !(T.tys[payload] is TyObj) { return -1 }
+  if tyIxIsVariantMember(payload) { return -1 }
+  structIndexOfTy(payload)
 }
 
 // True if evaluating the expression at `exprIx` yields a nullable struct ref — a
@@ -10562,6 +10576,9 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     if assignWidensAtomToStr(exprIx, fnIx) { return true }
     if gLitUnionUsed != 0 && e.binOp == "??" {
       if coalesceNulAtomToStr(exprIx, fnIx) { return true }
+      // A literal-union atom default of a `string | null` operand widens through the same
+      // frame (`emitCoalesceAtomStrDefault`); over-reserving costs only locals.
+      if exprIsLitAtom(e.binRight, fnIx) { return true }
     }
     if exprHasStrOp(e.binLeft, fnIx) { return true }
     return exprHasStrOp(e.binRight, fnIx)
@@ -10633,6 +10650,11 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     // An atom arm under a `string`-typed join widens, staging the atom id in the string-op
     // frame. Mirrors the emit decision: the join type recorded by the checker, any arm.
     if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeTyIsNulString(exprIx) {
+      if ifChainHasAtomArm(exprIx, fnIx) { return true }
+    }
+    // A join the generic body shares, typed at a hole: the instance may lower it as a string,
+    // and over-reserving costs only locals.
+    if fnIx >= 0 && nodeTyHasTyVar(exprIx) {
       if ifChainHasAtomArm(exprIx, fnIx) { return true }
     }
     // The same widening reached through the arms, where the join records one arm's type.
@@ -13961,6 +13983,17 @@ export function optChainBaseOf(exprIx: i32) {
   -1
 }
 
+// Is the node at `ix` a record-fit `is` (a literal-set field test) whose receiver is not a
+// re-readable place, so its lowering stages the receiver once in `optRecvSlot`?
+function recordFitIsStagesRecv(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if !(n is IsExpr) { return false }
+  if n.isVariant == "null" || unionEqOperandOk(n.isObj) { return false }
+  const names: string[] = []
+  const sets: i32[] = []
+  recFitNarrowedFields(nodeTyIxOf(n.isObj), isVarTyIxOf(ix), names, sets) > 0
+}
+
 // Is the node at `ix` a `?.` whose chain base must be STAGED — evaluated once into
 // `optRecvSlot` — because it is not a re-readable place? One home for the question, so the
 // slot reserved and the code emitted cannot disagree (D1671).
@@ -14664,9 +14697,9 @@ export function nulRefNichePayloadTy(ty: i32): i32 {
 }
 
 // Does a niche-repped `T | null` reach the `as` trio at EVERY delivery position? A string, a
-// list and a union VARIANT do: their rep classifiers already read a cast node. A standalone
-// struct, a map and a closure do not — every un-annotated face is invalid wasm, so the cast
-// keeps its loud refusal for them rather than trading it for a miscompile (D1812).
+// list, a struct and a union VARIANT do: their rep classifiers read a cast node. A map and a
+// closure do not — every un-annotated face is invalid wasm, so the cast keeps its loud
+// refusal for them rather than trading it for a miscompile (D1812).
 export function nulNicheCastWiredTy(inner: i32): boolean {
   if inner < 0 { return false }
   const it = T.tys[inner]
@@ -14681,7 +14714,7 @@ export function nulNicheCastWiredTy(inner: i32): boolean {
       return true
     }
     TyObj => {
-      return tyIxIsVariantMember(inner)
+      return true
     }
     TyFunc => {}
     TyMap => {}
@@ -15200,6 +15233,8 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
     }
     "optrecv" => {
       if optChainStagesRecv(ix) { return true }
+      // A record-fit `is` over a receiver that is not a re-readable place stages it here too.
+      if recordFitIsStagesRecv(ix) { return true }
       // The `??` niche join stages its operand in the SAME slot: it evaluates the nullable ref
       // once, tests it and reads it back on the non-null path (D1714). Sharing the reservation
       // is sound because the two never stage inside one another — a `?.` operand of a joining
@@ -16202,6 +16237,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   // join (an atom + a string/member-literal arm, either order) is the string ref kind even
   // when the then arm alone doesn't classify stringy; the atom arm widens later.
   if tyKindOf(nodeTyIxOf(ifIx)) == TK_STR { return "str" }
+  if nodeTyIsNulString(ifIx) { return "str" }
   // The same signal read off the ARMS, for the body where the rung above is blind: a hole
   // arm absorbs the join, so the `if` records that arm's type. Both arms are asked, so a join
   // of two atoms keeps the i32 rep its own rungs give it (D1728).
@@ -22777,7 +22813,10 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   // niche is the same i32 atom with `-1` for the missing arm, which is exactly what
   // `emitIfExprAs` writes for this shape.
   const elIfA = nulArmIfThenValueIx(exprIx)
-  if elIfA >= 0 { return exprIsLitAtom(elIfA, fnIx) }
+  // A join typed `string | null` has a string arm beside the atom, so it is the string niche.
+  if elIfA >= 0 && !nodeTyIsNulString(unwrapParen(exprIx)) {
+    return exprIsLitAtom(elIfA, fnIx)
+  }
   // A `(K | null)[]` element read `p[i]` — the niche i32 (a member id or `-1`). Recovered
   // from the array's element type so `p[i] != null` narrows against `-1`, not a bare null.
   if e is Index {
@@ -30187,6 +30226,8 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // types `string` and widens at the string-join seam, so it does not classify here.
     if e.ifElse < 0 { return false }
     if ifJoinTypedAtom(unwrapParen(exprIx)) { return true }
+    // A join typed `string | null` is the nullable string ref, whatever atoms its arms hold.
+    if nodeTyIsNulString(unwrapParen(exprIx)) { return false }
     // A join `emitIfExpr` lowers as a union box is the box, whatever its arms are alone: a
     // generic's `a ?? 5` pinned at a literal union joins to `K | i32` (D3281).
     if (
@@ -34807,6 +34848,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ObjLit { return true }
   if e is Paren { return exprStruct(e.parInner, fnIx) }
+  if e is AsExpr { return asTrapStructRow(exprIx) >= 0 }
   // An if-EXPRESSION whose branch join is a struct — an un-annotated binding classifies kind 1
   // (the THEN arm's rep, the arms agreeing by the checker), matching `structIndexOfExpr`.
   if e is IfStmt {
@@ -36083,6 +36125,8 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if e is AsExpr {
     const asr = asNulStructRow(exprIx)
     if asr >= 0 { return asr }
+    const atr = asTrapStructRow(exprIx)
+    if atr >= 0 { return atr }
   }
   // An if-EXPRESSION whose join is a struct (`const b = if c { mk(1) } else { mk(2) }`): the
   // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an
