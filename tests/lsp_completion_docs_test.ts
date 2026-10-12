@@ -17,6 +17,7 @@
 // playground adapter's `completion` export end to end, since that one renders the
 // `documentation` string itself.
 
+import { fileURLToPath } from "node:url";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
@@ -26,7 +27,7 @@ import {
 import { completion, initLsp } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

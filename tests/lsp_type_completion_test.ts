@@ -13,6 +13,7 @@
 // The multi-module case is not optional (D1863) — the doc table is filled by the lex and the
 // module pipeline serves tokens from a cache, so single-file fixtures cannot see that class.
 
+import { fileURLToPath } from "node:url";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
@@ -22,7 +23,7 @@ import {
 import { completion, initLsp } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

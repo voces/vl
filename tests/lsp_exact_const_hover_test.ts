@@ -7,6 +7,7 @@
 // The unchanged rows are as much the point as the new ones: a `let`, an annotated `const` and
 // a `const` whose initializer is a call each still hover with their one type.
 
+import { fileURLToPath } from "node:url";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   exactConstHover,
@@ -16,7 +17,7 @@ import {
   scopeCompletionsFromBindings,
 } from "../lsp/src/typeFeatures.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

@@ -15,11 +15,12 @@
 // std-resolving reader wrapper the browser uses (`wasmCheckerBrowser.ts`'s
 // `wrapReader`), because a UFCS import fix needs `import "std:test"` to resolve.
 
+import { fileURLToPath } from "node:url";
 import { codeActions, completion, diagnostics, initLsp, organizeImports, setWorkspace } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import { wrapStdReader } from "../lsp/src/editorText.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

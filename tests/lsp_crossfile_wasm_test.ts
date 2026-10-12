@@ -6,11 +6,12 @@
 // (`build/vl-compiler.wasm`); absent (fresh clone, no `refresh-compiler.sh` yet)
 // they self-ignore, the same convention as the rest of the wasm suite.
 
+import { fileURLToPath } from "node:url";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { crossFileUriOf, withStd } from "../lsp/src/moduleGraph.ts";
 import { STD_SOURCES } from "../std/embedded.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

@@ -8,6 +8,7 @@
 // wasm suite. The pure `memberCompletionsFromWasm` conversion runs unconditionally.
 //   deno test -A --no-check tests/lsp_member_completion_wasm_test.ts
 
+import { fileURLToPath } from "node:url";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   builtinCompletionsFromWasm,
@@ -20,7 +21,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
 };
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

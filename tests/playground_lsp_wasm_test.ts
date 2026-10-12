@@ -7,6 +7,7 @@
 // seed (`build/vl-compiler.wasm`) — absent (fresh clone, no `refresh-compiler.sh`
 // yet) they self-ignore, the same convention as the other wasm suites.
 
+import { fileURLToPath } from "node:url";
 import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import * as lsp from "../playground/src/lspAdapter.ts";
 import { runProgram } from "../playground/src/playground.ts";
@@ -18,7 +19,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
 };
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

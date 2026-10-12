@@ -7,10 +7,11 @@
 // corpus oracle drive (`createWasmChecker`), which the single-module leak harness
 // (`vl_instance_state_leak_test.ts`) does not reach.
 
+import { fileURLToPath } from "node:url";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { wrapStdReader } from "../lsp/src/editorText.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

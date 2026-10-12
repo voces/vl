@@ -2894,6 +2894,15 @@ fn compiler_hash(source: &CompilerSource) -> Option<[u8; 32]> {
 
 /// command-queue pump.
 fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
+    // Module keys are `/`-separated: the compiler joins a relative import onto the entry key
+    // by splitting at `/`, so a Windows `compiler\entry.vl` would find no directory.
+    let slashed;
+    let source_path = if cfg!(windows) && source_path.contains('\\') {
+        slashed = source_path.replace('\\', "/");
+        slashed.as_str()
+    } else {
+        source_path
+    };
     let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
     let src_in = StrIn::probe(store, inst, "src")?;
     stage_vl_root_and_cwd(store, inst)?;
@@ -8281,6 +8290,21 @@ fn read_cli_str(
     read_guest_str(n, |j| Ok(at.call(&mut *store, j)?))
 }
 
+/// Windows only: a path argument (`compiler\\entry.vl`) is handed to the guest with `/`
+/// separators. Module keys are `/`-separated (the guest joins a relative import onto its
+/// importer's directory by splitting at `/`), and Windows reads a `/` path as well as a `\\` one.
+/// Only an argument that names a `.vl` file or an existing path is touched, so flag values
+/// that merely contain a backslash pass through.
+fn slash_path_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|a| {
+            let is_path = a.contains('\\')
+                && (a.ends_with(".vl") || std::path::Path::new(a).exists());
+            if cfg!(windows) && is_path { a.replace('\\', "/") } else { a.clone() }
+        })
+        .collect()
+}
+
 /// `vl check` (and, later, every subcommand) over the command-queue pump. The host
 /// performs only raw mechanism: load the compiler module, resolve the compiler
 /// path + TTY colour, stream argv in, then loop servicing file reads and line
@@ -8288,6 +8312,7 @@ fn read_cli_str(
 fn cli_pump(args: &[String]) -> Result<()> {
     use std::io::{IsTerminal, Write};
     let args = &take_test_externs(args)[..];
+    let args = &slash_path_args(args)[..];
     // Resolve the compiler module (host mechanism): --compiler / env / default.
     let mut compiler: Option<String> = None;
     let mut i = 0;

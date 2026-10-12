@@ -8,9 +8,10 @@
 // Loads the real seed (`build/vl-compiler.wasm`); absent (fresh clone, no
 // `refresh-compiler.sh` yet) it self-ignores — the wasm-suite convention.
 
+import { fileURLToPath } from "node:url";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

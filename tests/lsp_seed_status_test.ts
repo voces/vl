@@ -9,13 +9,14 @@
 // (`build/vl-compiler.wasm`) and self-ignore when it is absent, the same
 // convention as the rest of the wasm suite.
 
+import { fileURLToPath } from "node:url";
 import { seedStatusView } from "../lsp/src/typeFeatures.ts";
 import {
   loadWasmChecker,
   type SeedOrigin,
 } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

@@ -11,8 +11,14 @@
 // because it is the tree the TEST file lives in. See CLAUDE.md, "`vl` resolves
 // `std:` from the EXE's checkout — a worktree probe measures the WRONG std".
 
-export const ROOT = new URL("../../", import.meta.url).pathname.replace(/\/$/, "");
-export const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
+import { fileURLToPath } from "node:url";
+export const ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(
+  /[\\/]$/,
+  "",
+);
+export const VL = `${ROOT}/scripts/vl-host/target/release/vl${
+  Deno.build.os === "windows" ? ".exe" : ""
+}`;
 export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 export const STD = `${ROOT}/std`;
 

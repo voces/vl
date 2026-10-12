@@ -19,6 +19,7 @@
 // (fresh clone, no `refresh-compiler.sh` yet) they self-ignore, the same
 // convention as the rest of the wasm suite. The pure tests always run.
 
+import { fileURLToPath } from "node:url";
 import type { ModuleReader } from "../compiler/coreTypes.ts";
 import type { WasmChecker } from "../lsp/src/wasmChecker.ts";
 import type { LspRange } from "../lsp/src/typeFeatures.ts";
@@ -32,7 +33,7 @@ import {
   scanImportSpecifiers,
 } from "../lsp/src/rename.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

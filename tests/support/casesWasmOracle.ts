@@ -74,6 +74,7 @@
 //
 // Run with:  deno test -A --parallel tests/cases_wasm_*_test.ts
 
+import { fileURLToPath } from "node:url";
 import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // The module-arming gate — the SHARED TS copy. `compiler/moduleGate.ts` is a LEAF
 // (it imports nothing and carries no runtime), so this oracle keeps its "no
@@ -85,7 +86,7 @@ import { needsModules } from "../../compiler/moduleGate.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
-const SEED = new URL("../../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = fileURLToPath(new URL("../../build/vl-compiler.wasm", import.meta.url));
 
 const seedExists = (() => {
   try {
@@ -797,7 +798,9 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
       name,
       ignore: skip !== undefined && skip !== null,
       fn: async () => {
-        const entryKey = (c.kind === "single" ? c.url : c.entry).pathname;
+        const entryKey = fileURLToPath(
+          c.kind === "single" ? c.url : c.entry,
+        ).replaceAll("\\", "/");
         const r = driveCase(
           exports!,
           entryKey,
