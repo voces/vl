@@ -167,6 +167,7 @@ import {
   declNameTok,
   declNameTokOf,
   dgAllLossless,
+  dgCodeOf,
   dgLosslessReset,
   dgSpanEndTok,
   extDeclLink,
@@ -288,6 +289,7 @@ import {
   rcoalMsgAt,
   rcoalTokAt,
   redunMsgAt,
+  redunRetAt,
   redunTokAt,
   symConstAt,
   symDefAt,
@@ -2091,6 +2093,8 @@ export function inlayModuleAt(i: i32): i32 { symOccModuleAt(symInlayOccAt(i)) }
 // where every module's AST is merged. Single-file mode has no module table, so
 // `modOfTok` returns 0 throughout (nothing filtered). Mirrors `inlayModuleAt`.
 export function redunModuleAt(i: i32): i32 { modOfTok(redunTokAt(i)) }
+// Whether finding `i` is a function's return annotation, which `check --fix` leaves alone.
+export function redunIsReturnAt(i: i32): boolean { redunRetAt(i) }
 
 // The redundant-annotation finding's message, per code point — the same byte ABI
 // `lintMsg*`/`diagMsg*` use. Type-informed, so it never appears in the parse-only
@@ -3160,12 +3164,11 @@ export function diagEndCol(i: i32): i32 {
   }
   diagCol(i)
 }
-// The diagnostic's stable category code, "" when it has none. A type diagnostic
-// carries "unsupported-lowering" when the program is type-valid but uses a
-// construct codegen cannot lower yet, so tooling can tell an emitter-capability
-// rejection from a soundness verdict. Parse and emit diagnostics carry "".
+// The diagnostic's stable category code, "" when it has none: "unsupported-lowering" on a
+// type-valid construct codegen cannot lower yet, apart from a soundness verdict. A parse
+// diagnostic carries one only when `check --fix` acts on it (`dgMarkCode`), an emit one never.
 export function vcDiagCode(i: i32): string {
-  if i < P.diags.length { return "" }
+  if i < P.diags.length { return dgCodeOf(i) }
   const j = i - P.diags.length
   if j < T.diags.length { return T.diags[j].tcode }
   ""
@@ -3550,6 +3553,35 @@ export function diagModule(i: i32): i32 {
 }
 
 // ── specifier resolution (ports of the host's pure string math) ───────────────
+// Whether import specifier `spec` separates segments with a backslash (`.\\util`, `C:\\x`).
+function modSpecBackslashed(spec: string): boolean {
+  for c in spec {
+    if c == '\\' { return true }
+  }
+  false
+}
+
+// Whether `spec` is an absolute path: a leading separator, or a drive letter and separator.
+function modSpecAbsolute(spec: string): boolean {
+  if spec.length > 0 && (spec[0] == '/' || spec[0] == '\\') { return true }
+  spec.length > 2 && spec[1] == ':' && (spec[2] == '/' || spec[2] == '\\')
+}
+
+// `spec` with each run of backslashes (one, or an escaped pair) a forward slash.
+function modSlashed(spec: string): string {
+  let out = ""
+  let i = 0
+  while i < spec.length {
+    if spec[i] == '\\' {
+      if i == 0 || spec[i - 1] != '\\' { out = out + "/" }
+    } else {
+      out = out + spec.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  out
+}
+
 function modIsRelative(spec: string): boolean {
   if spec.length >= 2 {
     if spec[0] == '.' && spec[1] == '/' { return true }
@@ -3658,7 +3690,7 @@ function modNormalize(path: string): string {
 // is its key verbatim; a relative spec gets `.vl` appended.
 function modResolveSpecifier(spec: string, fromKey: string): string {
   if modIsStdSpec(spec) { return spec }
-  if !modIsRelative(spec) { return "" }
+  if !modIsRelative(spec) || modSpecBackslashed(spec) { return "" }
   if modKeyIsStd(fromKey) { return "" }
   const base = modDirOf(fromKey)
   let joined = spec
@@ -4287,7 +4319,7 @@ function modVisit(m: i32, depth: i32): i32 {
               + spec
               + "\" — std modules import only via `std:` specifiers (relative imports inside std are not allowed)",
           )
-        } else if spec.length > 0 && spec[0] == '/' {
+        } else if modSpecAbsolute(spec) {
           // An absolute path would key the same file apart from its relative spelling, so it
           // could load as two modules; refused until keys are canonical paths.
           modDiagSpan(
@@ -4298,6 +4330,19 @@ function modVisit(m: i32, depth: i32): i32 {
             "Unsupported import specifier \""
               + spec
               + "\" — an absolute path is not an import specifier; write the path relative to this file (`./`, `../`)",
+          )
+        } else if modSpecBackslashed(spec) && !modKeyIsStd(spec) {
+          // A Windows-style separator: the specifier means the forward-slash path.
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
+            "Unsupported import specifier \""
+              + spec
+              + "\" — an import path uses forward slashes: write \""
+              + modSlashed(spec)
+              + "\"",
           )
         } else {
           modDiagSpan(
