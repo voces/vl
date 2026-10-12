@@ -341,7 +341,7 @@ Fields:
   trailing `emitErr` the emitter's one refusal, with the module phase's findings a
   prefix of `P.diags`); the other four are `compiler/cli.vl`'s report. The
   checker's advisory streams — `redundant-type`, `dead-coalesce-default`,
-  `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
+  `dead-null-test`, `deep-record-compare`, `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
   and `severity` is what says whether it refused.
 - `code` — the stable machine id: the lint rule id (`prefer-const`,
   `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
@@ -416,10 +416,18 @@ its ~2,989 per-case `vl check` spawns are 77% process floor
 (`docs/internals/test-timing-2026-09.md` §5a).
 
 `--batch` without `--json` takes the same many paths and prints the ordinary aggregate
-report; the per-file exit code has no human rendering, so it is `--json`'s alone. Every
-other spelling is untouched: without `--batch` a second positional is still the usage
-error `one path per run`, and single-path `--json` is byte-identical to what it was
-apart from the new `stage` key.
+report; the per-file exit code has no human rendering, so it is `--json`'s alone.
+
+**Without `--batch`, several paths are one aggregate run** (`vl check`, `vl fmt` and `vl
+test`; diderven DV-102). Each target is walked in argv order and keeps the shape its own
+target gives it — a named file is graded as `vl check <file>`, a walked one as a directory
+run. A file reached twice (named twice, `./a.vl` beside `a.vl`, or by its directory and by
+name) is checked once; `cliPathKey` compares the two spellings with `.` and `..` segments
+collapsed lexically. Every named file is read before any work starts, so a MISSING one exits
+2 naming it with nothing printed, fixed or formatted. A file that exists but does not PARSE
+is not that: it is reported as its own parse error and the other files still run, exactly as
+one bad file in a directory run does. Single-path `--json` is byte-identical to what it was
+apart from the `stage` key.
 
 ## `std:` diagnostics are withheld unless asked for (`--include-std`)
 

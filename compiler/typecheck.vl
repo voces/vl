@@ -305,12 +305,14 @@ import {
   isvalName,
   isvalTok,
   isvalType,
+  rcoalCode,
   rcoalCol,
   rcoalEnd,
   rcoalLine,
   rcoalMsg,
   rcoalTok,
   rcoalType,
+  rcoalWhy,
   redunECol,
   redunELine,
   redunName,
@@ -569,6 +571,10 @@ const CODE_MISSING_IMPORT = "missing-import"
 // A `std:array` `filled(n, 0)` delivered where a `u8[]` is wanted. The diagnostic spans the
 // call, which `check --fix` rewrites to `zeroBytes(n)` and imports from `std:bytes`.
 const CODE_ZERO_BYTES = "filled-zero-bytes"
+
+// A non-numeric `as` whose operand already has the target type. The diagnostic spans the cast,
+// and its `keep` field is the operand's length from the cast's start: `check --fix` keeps that.
+const CODE_REDUNDANT_CAST = "redundant-cast"
 
 // D1570 — the name is a function in scope and is not a method. Its answer rides the data
 // channel under `member`, `recv`, `reason` (`self-name` / `arity` / `receiver`: which gate
@@ -3946,6 +3952,10 @@ let tpApartConcrete = false
 // An if-join a generic body reads collapsed (`T[]` beside `string[]` is `T[]`) that the
 // return-set rule keeps apart, by `if` node: the apart join, which a pin re-joins (D2832).
 let tpIfJoinAt: {[i32]: i32} = Map()
+// The type an `if` or `match` used as a value is delivered to, seeded by `seedExpected`.
+let joinWantAt: {[i32]: i32} = Map()
+// The joins typed by their destination rather than their arms.
+let joinByWant: {[i32]: boolean} = Map()
 // The same joins by owning declaration, re-asked at each call that pins the owner.
 let tpIfFn: i32[] = []
 let tpIfJoin: i32[] = []
@@ -5189,7 +5199,14 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
   const et = T.tys[expectedTy]
   // A nullable expected type (`(i32) => i32 | null`, e.g. a map value slot, which is `V | null`)
   // seeds its inner: the right-hand lambda or literal still wants the non-null shape.
-  if et is TyNullable { return seedExpected(u, et.nInner) }
+  // A generic call keeps the whole nullable type, which only a bare `null` argument binds from.
+  if et is TyNullable {
+    const nr = seedExpected(u, et.nInner)
+    if en is Call {
+      if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
+    }
+    return nr
+  }
   if en is FuncDecl {
     if en.fnName == "" {
       if et is TyFunc {
@@ -5213,6 +5230,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
     if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
   } else if en is IfStmt || en is MatchExpr || en is Block {
     seedCallDstLeaves(u, expectedTy)
+    seedJoinWant(u, expectedTy)
   } else if en is ArrayLit {
     if et is TyArray {
       let i = 0
@@ -5330,6 +5348,8 @@ export function initChecker() {
   holeTpJoinNames = Map()
   genFnCstrBusy = false
   tpIfJoinAt = Map()
+  joinWantAt = Map()
+  joinByWant = Map()
   tpIfFn = []
   tpIfJoin = []
   tpIfNode = []
@@ -5964,7 +5984,7 @@ export function initChecker() {
   declare("__proc_run__", mkFuncTy([u8Arr], TY_I32))
   declare("__proc_out__", mkFuncTy(noParams, u8Arr))
   declare("__proc_err__", mkFuncTy(noParams, u8Arr))
-  declare("__proc_exit__", mkFuncTy([TY_I32], TY_VOID))
+  declare("__proc_exit__", mkFuncTy([TY_I32], TY_NEVER))
   declare("__env_get__", mkFuncTy([u8Arr], u8Arr))
   0
 }
@@ -14038,9 +14058,11 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
     } else {
       let tIdx = isTypeTyRead(cond.isVariant, condIx)
       // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
-      const meet = litSetMeetTy(placeCurTy(isPl, names, tys), tIdx)
+      const isCur = placeCurTy(isPl, names, tys)
+      let meet = litSetMeetTy(isCur, tIdx)
+      if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
       if meet >= 0 { tIdx = meet }
-      if tIdx >= 0 {
+      if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
         pushNarrowFact(isPl, tIdx, names, tys)
         pushDiscrimParentFact(
           isPl,
@@ -14715,6 +14737,8 @@ function rcoalReset() {
   rcoalTok = []
   rcoalType = []
   rcoalMsg = []
+  rcoalWhy = []
+  rcoalCode = []
   0
 }
 
@@ -14739,7 +14763,29 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   rcoalType.push(tyToStrUser(lt))
   rcoalMsg.push("")
+  rcoalWhy.push(coalNonNullWhy(ix))
+  rcoalCode.push("dead-coalesce-default")
   0
+}
+
+// The narrowing fact that makes `??` node `ix`'s left operand non-null, as a clause, or "" when
+// its declared type does: a first `.pop()` under a non-empty `.length` test (D3558).
+function coalNonNullWhy(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is BinExpr) { return "" }
+  const left = crUnParen(n.binLeft)
+  let i = 0
+  while i < neKeys.length {
+    if neUsedBy[i] == left && neUsedBy[i] >= 0 {
+      return "the `"
+        + neKeys[i]
+        + ".length` test guarantees this first `"
+        + neKeys[i]
+        + ".pop()` returns a value"
+    }
+    i = i + 1
+  }
+  ""
 }
 
 // Record `x == null` / `x != null` over a value the checker proved non-null: the test is dead,
@@ -14763,6 +14809,7 @@ function recordDeadNullTest(ix: i32, subjIx: i32, subjTy: i32, op: string) {
   rcoalEnd.push(findingEndCol(ix, tk))
   rcoalTok.push(tk)
   rcoalType.push(tyToStrUser(subjTy))
+  rcoalCode.push("dead-null-test")
   rcoalMsg.push(
     "`"
       + subj
@@ -14776,7 +14823,80 @@ function recordDeadNullTest(ix: i32, subjIx: i32, subjTy: i32, op: string) {
       + tyToStrUser(subjTy)
       + ")",
   )
+  rcoalWhy.push("")
   0
+}
+
+// Record a `==` / `!=` whose operands are records holding a list: the compare walks every
+// element, which reads like an identity test and costs O(n). `path` names the list field.
+function recordDeepRecordEq(ix: i32, ty: i32, path: string, op: string) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  const t = P.toks[tk]
+  const tyS = tyToStrUser(ty)
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
+  rcoalTok.push(tk)
+  rcoalType.push(tyS)
+  rcoalCode.push("deep-record-compare")
+  rcoalMsg.push(
+    "`"
+      + op
+      + "` on `"
+      + tyS
+      + "` compares every element of its list field `"
+      + path
+      + "`, not whether both sides are the same record — compare a field that identifies the record, or the `"
+      + path
+      + "` fields directly when the element-wise compare is the intent",
+  )
+  rcoalWhy.push("")
+  0
+}
+
+// `ty` with one `| null` removed, or `ty` itself when it is not nullable.
+function eqNonNullPart(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const inner = nullableInnerOrNone(ty)
+  if inner >= 0 { return inner }
+  ty
+}
+
+// The dotted path to the first list field a `==` over record `ty` walks, or "" when `ty` is
+// not a record (a nullable one counts) or holds no list.
+function eqListFieldPath(ty: i32, seen: i32[]): string {
+  const rt = eqNonNullPart(ty)
+  if rt < 0 || rt >= T.tys.length { return "" }
+  let si = 0
+  while si < seen.length {
+    if seen[si] == rt { return "" }
+    si = si + 1
+  }
+  const t = T.tys[rt]
+  let out = ""
+  if t is TyObj {
+    seen.push(rt)
+    let i = 0
+    while i < t.objFieldTypes.length && out == "" {
+      const ft = eqNonNullPart(t.objFieldTypes[i])
+      if ft >= 0 && ft < T.tys.length && arrElemTyOrNone(ft) >= 0 {
+        out = t.objFieldNames[i]
+      } else {
+        const sub = eqListFieldPath(ft, seen)
+        if sub != "" { out = t.objFieldNames[i] + "." + sub }
+      }
+      i = i + 1
+    }
+    seen.pop()
+  }
+  out
 }
 
 function rcoalTruncate(n: i32) {
@@ -14786,6 +14906,8 @@ function rcoalTruncate(n: i32) {
   while rcoalTok.length > n { rcoalTok.pop() }
   while rcoalType.length > n { rcoalType.pop() }
   while rcoalMsg.length > n { rcoalMsg.pop() }
+  while rcoalWhy.length > n { rcoalWhy.pop() }
+  while rcoalCode.length > n { rcoalCode.pop() }
   0
 }
 
@@ -15125,6 +15247,9 @@ let lbiCoalUnsafe: boolean[] = []
 let lbiLitNode: i32[] = []
 // Module-level un-annotated `const`s holding a numeric literal, written there or copied from
 // another such `const` by name: the name to the literal.
+// Top-level names declared both as a function and as a value binding, refused as redeclared;
+// a read of one is that refusal's cascade (DV-401).
+let modClashNames: {[string]: boolean} = Map()
 let lbiModLit: {[string]: i32} = Map()
 // Every read of a candidate, and the type it widens to where it stands when it is delivered whole
 // to a scalar destination or met whole by a scalar operand (-1 otherwise).
@@ -19968,6 +20093,8 @@ function recordRedundantAnnot(
   if n.letInit >= 0 && initTypedByAnnot(n.letInit) { return 0 }
   // A call of a function that took this annotation as its result is typed by it, not redundant.
   if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
+  // So is an `if` or `match` whose literal arms took the annotation's type.
+  if n.letInit >= 0 && joinTypedByWant(n.letInit) { return 0 }
   // Without its annotation a `const` bound to a string literal holds that literal's type, so a
   // `string` annotation there is what lets it compare with other strings (D2198).
   if n.letKw == "const" && n.letInit >= 0 {
@@ -41482,6 +41609,7 @@ function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
     + boolForNumberNote(at, expected)
     + numUnionLossNote(at, expected)
     + storageListNote(argIx, at, expected)
+    + litMemberNote(argIx, expected, 8)
   if argIx >= 0 && argIx < P.nodes.length {
     const n = P.nodes[argIx]
     if n is FuncDecl {
@@ -42215,6 +42343,7 @@ function letAssignMsg(
       + charLitForStringNote(srcIx, want)
       + boolForNumberNoteAt(srcIx, got, want)
       + storageListNote(srcIx, got, want)
+      + litMemberNote(srcIx, want, 8)
   }
   // An object literal (`{}` / `{x: 1}`) assigned to a map type is a category error, not a
   // width mismatch — point at the fix (`Map()`) rather than the opaque
@@ -42252,6 +42381,107 @@ function letAssignMsg(
     + charLitForStringNote(srcIx, want)
     + boolForNumberNote(got, want)
     + storageListNote(srcIx, got, want)
+    + litMemberNote(srcIx, want, 8)
+}
+
+// The first string or integer literal in source `srcIx` that its destination in `want`, a
+// literal union reached through list elements and record fields, does not admit, as a sentence
+// tail naming its path from the source root; "" when every literal fits or none is reached.
+function litMemberNote(srcIx: i32, want: i32, depth: i32): string {
+  litMemberAt(srcIx, want, depth, "")
+}
+
+function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
+  if srcIx < 0 || want < 0 || depth <= 0 { return "" }
+  const x = parenPeelIx(srcIx)
+  if x < 0 || x >= P.nodes.length { return "" }
+  const n = P.nodes[x]
+  let w = T.tys[want]
+  let wIx = want
+  if w is TyNullable {
+    wIx = w.nInner
+    if wIx < 0 { return "" }
+    w = T.tys[wIx]
+  }
+  if n is ArrayLit && w is TyArray {
+    let i = 0
+    while i < n.arrElems.length {
+      const r = litMemberAt(
+        n.arrElems[i],
+        w.aElem,
+        depth - 1,
+        path + "[" + i32ToStr(i) + "]",
+      )
+      if r != "" { return r }
+      i = i + 1
+    }
+    return ""
+  }
+  if n is ObjLit && w is TyObj {
+    for f in n.objFields {
+      const fn = P.nodes[f]
+      if fn is FieldInit {
+        const k = strListIndexOf(w.objFieldNames, fn.fiName)
+        if k >= 0 {
+          let sub = fn.fiName
+          if path != "" { sub = path + "." + fn.fiName }
+          const r = litMemberAt(fn.fiValue, w.objFieldTypes[k], depth - 1, sub)
+          if r != "" { return r }
+        }
+      }
+    }
+    return ""
+  }
+  if !(w is TyUnion) { return "" }
+  let kind = ""
+  let text = ""
+  let shown = ""
+  if n is StrLit {
+    kind = "str"
+    shown = n.strText
+    if shown.length >= 2 { text = shown.slice(1, shown.length - 1) }
+  } else if n is NumLit {
+    kind = "int"
+    shown = n.numText
+    text = canonIntLexeme(n.numText)
+  } else {
+    return ""
+  }
+  // The literal members, `null` aside; any other member means the union is not a literal set.
+  let members = ""
+  let listed = 0
+  let lits = 0
+  for m in w.uMembers {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind == kind && mt.litText == text { return "" }
+      lits = lits + 1
+      if listed < 8 {
+        if members != "" { members = members + " | " }
+        if mt.litKind == "str" {
+          members = members + "\"" + mt.litText + "\""
+        } else {
+          members = members + mt.litText
+        }
+        listed = listed + 1
+      }
+    } else if m != TY_NULL {
+      return ""
+    }
+  }
+  if lits == 0 { return "" }
+  if lits > listed {
+    members = members + " … and " + i32ToStr(lits - listed) + " more"
+  }
+  let named = tyToStr(wIx)
+  if named == members || named.indexOf("|") >= 0 {
+    named = ""
+  } else {
+    named = named + ": "
+  }
+  let at = ""
+  if path != "" { at = " (at `" + path + "`)" }
+  " — `" + shown + "` is not one of " + named + members + at
 }
 
 // `tyToStr(want)`, except that a function type whose annotation `annIx` named its parameters
@@ -42472,12 +42702,12 @@ function memberFloorMsg(objTy: i32, prop: string) {
     + "' on non-object "
     + tyToStr(objTy)
     + stdFmtMovedNote(prop)
-    + builtinMethodNote(objTy, prop)
 }
 
-// When `prop` names a numeric builtin that takes a value of `objTy` first (`x.abs()`,
-// `x.max(y)`), the sentence that says to call it; "" otherwise.
-function builtinMethodNote(objTy: i32, prop: string): string {
+// When member node `ix` calls a numeric builtin as a method of `objTy` (`x.abs()`,
+// `x.max(1.0)`), the sentence naming the call to write, spelled from the source; "" otherwise,
+// and "" when a binding of the builtin's name is in scope, since the call would reach that.
+function builtinMethodNote(objTy: i32, prop: string, ix: i32): string {
   const pn = primNameOf(objTy)
   const isFloat = pn == "f32" || pn == "f64"
   const isInt = pn == "i32" || pn == "i64"
@@ -42489,14 +42719,108 @@ function builtinMethodNote(objTy: i32, prop: string): string {
       arity = floatIntrArity(prop)
     }
   }
-  if arity == 0 { return "" }
+  if arity == 0 || lookup(prop) >= 0 { return "" }
   let call = prop + "(x)"
   if arity == 2 { call = prop + "(x, y)" }
+  const n = P.nodes[ix]
+  if n is Member {
+    const spelled = builtinCallSpelling(prop, n.memObj, ix)
+    if spelled != "" { call = spelled }
+  }
   " — `"
     + prop
     + "` is a builtin function, not a method: call it as `"
     + call
     + "`"
+}
+
+// `prop(<receiver>, <args>)` spelled from the tokens of member call `recv.prop(args)` whose
+// member node is `memIx`; "" when the member is not followed by its argument list.
+function builtinCallSpelling(prop: string, recv: i32, memIx: i32): string {
+  const r0 = nodeStartTok(recv)
+  const r1 = nodeLastTok(recv)
+  const m1 = nodeLastTok(memIx)
+  if r0 < 0 || r1 < r0 || m1 < 0 || m1 + 1 >= P.toks.length { return "" }
+  if P.toks[m1 + 1].kind != "LPAREN" { return "" }
+  let depth = 0
+  let k = m1 + 1
+  let close = -1
+  while k < P.toks.length && close < 0 {
+    const kk = P.toks[k].kind
+    if kk == "LPAREN" { depth = depth + 1 }
+    if kk == "RPAREN" {
+      depth = depth - 1
+      if depth == 0 { close = k }
+    }
+    k = k + 1
+  }
+  if close < 0 { return "" }
+  // A parenthesised receiver needs no parentheses as an argument.
+  let a = r0
+  let b = r1
+  if b > a + 1 && P.toks[a].kind == "LPAREN" && P.toks[b].kind == "RPAREN" {
+    a = a + 1
+    b = b - 1
+  }
+  let out = prop + "(" + tokSpanText(a, b)
+  // A trailing comma (and the line breaks around it) is not part of the last argument.
+  let e = close - 1
+  while (
+    e > m1 + 1
+    && (P.toks[e].kind == "NEWLINE" || P.toks[e].kind == "COMMA")
+  ) {
+    e = e - 1
+  }
+  if e > m1 + 1 { out = out + ", " + tokSpanText(m1 + 2, e) }
+  out + ")"
+}
+
+// The source tokens `a..b` on one line, joined with single spaces: none inside brackets,
+// before a comma, or after a prefix `-` / `!`.
+function tokSpanText(a: i32, b: i32): string {
+  let out = ""
+  let pk = ""
+  let prefix = false
+  let i = a
+  while i <= b {
+    const t = P.toks[i]
+    if t.kind != "NEWLINE" {
+      if pk != "" {
+        const tight = prefix
+          || pk == "LPAREN"
+          || pk == "LBRACK"
+          || pk == "DOT"
+          || t.kind == "RPAREN"
+          || t.kind == "RBRACK"
+          || t.kind == "COMMA"
+          || t.kind == "DOT"
+          || t.kind == "LPAREN"
+          || t.kind == "LBRACK"
+        if !tight { out = out + " " }
+      }
+      prefix = t.kind == "BANG" || (t.kind == "MINUS" && !tokEndsValue(pk))
+      out = out + t.text
+      pk = t.kind
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Whether a token of kind `k` can end an operand, so a `-` after it is binary.
+function tokEndsValue(k: string): boolean {
+  k == "IDENT"
+    || k == "NUMBER"
+    || k == "STRING"
+    || k == "CHAR"
+    || k == "TRUE"
+    || k == "FALSE"
+    || k == "NULL"
+    || k == "RPAREN"
+    || k == "RBRACK"
+    || k == "RBRACE"
+    || k == "TEMPLATE"
+    || k == "TEMPLATE_TAIL"
 }
 
 // The redirect for another language's element-count member read on a list, map, set or
@@ -42580,7 +42904,13 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   if msg == "" {
     return tErr("member access '." + prop + "' on " + tyToStr(objTy), ix)
   }
-  tErr(msg + unkeyedSubscriptNote(ix) + getterNarrowNote(objTy, ix), ix)
+  tErr(
+    msg
+      + unkeyedSubscriptNote(ix)
+      + getterNarrowNote(objTy, ix)
+      + builtinMethodNote(objTy, prop, ix),
+    ix,
+  )
 }
 
 // When member node `ix` reads through a nullable getter result, the sentence that says why a
@@ -43740,13 +44070,24 @@ function validatePrintCstrs(
   0
 }
 
-// Whether `ty` reaches an inference hole (a `TyVar`) anywhere in its tree — through an array
-// element, a map key/value, a struct field, a nullable inner, a union member, or a function
-// type's params/return. Unlike `tyIsHole`, a demanded shape (`{bar: _}`) counts too, since it
-// carries no answer either. Depth-bounded: a recursive type is cyclic in the arena.
+// Whether `ty` reaches an inference hole (a `TyVar`, or a demanded shape like `{bar: _}`)
+// anywhere in its tree. A recursive type is a cycle in the arena: a row met again on the path
+// reaches nothing new, so a cycle is no hole, while running out of `depth` still is (D4038).
 function tyReachesHole(ty: i32, depth: i32): boolean {
   if ty < 0 { return true }
+  if i32ListHas(trhPath, ty) { return false }
   if depth <= 0 { return true }
+  trhPath.push(ty)
+  const r = tyReachesHoleRow(ty, depth)
+  trhPath.pop()
+  r
+}
+
+// The rows `tyReachesHole` is inside, outermost first.
+const trhPath: i32[] = []
+
+// One row of `tyReachesHole`'s walk.
+function tyReachesHoleRow(ty: i32, depth: i32): boolean {
   const t = T.tys[ty]
   if t is TyVar { return true }
   if t is TyArray { return tyReachesHole(t.aElem, depth - 1) }
@@ -51202,9 +51543,16 @@ function callNamesGenericDecl(c: Call): boolean {
 // before anything costlier.
 function anyArgIsLitOnly(args: i32[]): boolean {
   for a in args {
-    if argIsLitOnly(a, 4) { return true }
+    if argIsLitOnly(a, 4) || argIsNullLit(a) || argIsStrLit(a) { return true }
   }
   false
+}
+
+// Whether the argument `ix` is a string literal, through parentheses.
+function argIsStrLit(ix: i32): boolean {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  P.nodes[x] is StrLit
 }
 
 // Binds each type parameter of the generic return `ret` from the type the call's destination
@@ -51219,7 +51567,7 @@ function dstBindLitTyParams(
   bTys: i32[],
   outNames: string[],
 ) {
-  const dst = callDstTyOf(ix)
+  const dst = dstForArgs(callDstTyOf(ix), args, ret)
   if dst < 0 || ret < 0 || !anyArgIsLitOnly(args) || !tyHasTyVar(ret) {
     return 0
   }
@@ -51240,6 +51588,167 @@ function dstBindLitTyParams(
     k = k + 1
   }
   0
+}
+
+// The generic `FuncDecl` the call `c` names by a plain identifier or a method name, or -1.
+function callGenericDeclIx(c: Call): i32 {
+  const d = cwCalleeDeclOf(c.callFn)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    if dn.fnTyParams.length > 0 { return d }
+  }
+  -1
+}
+
+// The declared function the call `c` in the generic `d` names, -2 for a compiler intrinsic or
+// `print`, or -1 when the callee is anything else: an alias, a local, a parameter, a field or
+// an index. A body is proven closed only through calls that resolve here.
+function closedCalleeDecl(c: Call, d: i32): i32 {
+  const cf = P.nodes[c.callFn]
+  let name = ""
+  let dx = -1
+  if cf is Ident {
+    name = cf.identName
+    if isReservedIntrinsicName(name) || name == "print" {
+      if !closedNameBound(d, name) { return -2 }
+      return -1
+    }
+    dx = cwFnDeclOf(name)
+  } else if cf is Member {
+    name = cf.memProp
+    dx = cwUfcsDeclOf(c.callFn)
+  }
+  if dx < 0 || dx >= P.nodes.length || closedNameBound(d, name) { return -1 }
+  if P.nodes[dx] is FuncDecl { return dx }
+  -1
+}
+
+// Whether the function `d` binds `name` itself — a parameter, a local, a loop variable or a
+// nested function — so a call spelled `name` there does not reach the declared function.
+function closedNameBound(d: i32, name: string): boolean {
+  if d < 0 || d >= P.nodes.length { return true }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    for p in dn.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parName == name { return true }
+      }
+    }
+    return nodeBindsNameGo(dn.fnBody, name)
+  }
+  true
+}
+
+function nodeBindsNameGo(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == name { return true }
+  } else if n is Param {
+    if n.parName == name { return true }
+  } else if n is FuncDecl {
+    if n.fnName == name { return true }
+  } else if n is ForRange {
+    if n.frVar == name { return true }
+  } else if n is ForIn {
+    if n.fiVar == name || n.fiVar2 == name { return true }
+  }
+  for k in nodeChildren(ix) {
+    if nodeBindsNameGo(k, name) { return true }
+  }
+  false
+}
+
+// Whether `ty` is unknown or mentions a type parameter: a value a generic body may compute on.
+function tyOpenOrTyVar(ty: i32): boolean { ty < 0 || tyHasTyVar(ty) }
+
+// Whether the generic function `d`'s body makes no new value of a type parameter: no operator
+// but a comparison, logic or assignment takes one, no `as` yields one, and every call resolves
+// to a declared function, closed too when generic. Only such a body keeps a literal-union
+// binding a member (D3602).
+function genericBodyClosed(d: i32, depth: i32): boolean {
+  if depth > 4 || d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return nodeClosedGo(dn.fnBody, d, depth) }
+  false
+}
+
+function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    const op = n.binOp
+    const keeps = (op == "=="
+      || op == "!="
+      || op == "<"
+      || op == ">"
+      || op == "<="
+      || op == ">="
+      || op == "&&"
+      || op == "||"
+      || op == "="
+      || op == "??")
+    if !keeps {
+      if (
+        tyOpenOrTyVar(nodeTyIxOf(n.binLeft))
+        || tyOpenOrTyVar(nodeTyIxOf(n.binRight))
+      ) {
+        return false
+      }
+    }
+  } else if n is Unary {
+    if n.unOp != "!" && tyOpenOrTyVar(nodeTyIxOf(n.unArg)) { return false }
+  } else if n is AsExpr {
+    if tyOpenOrTyVar(nodeTyIxOf(ix)) { return false }
+  } else if n is Call {
+    const g = closedCalleeDecl(n, d)
+    if g != -2 {
+      if g < 0 { return false }
+      const gn = P.nodes[g]
+      if gn is FuncDecl {
+        if (
+          gn.fnTyParams.length > 0
+          && g != d
+          && !genericBodyClosed(g, depth + 1)
+        ) {
+          return false
+        }
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if !nodeClosedGo(k, d, depth) { return false }
+  }
+  true
+}
+
+// Whether `t` is still being inferred: it holds a hole, or is an open `_ | null` slot (D2506).
+function dstTyOpen(t: i32): boolean {
+  if tyHasHole(t) { return true }
+  const d = T.tys[t]
+  if d is TyNullable { return d.nInner < 0 }
+  false
+}
+
+// The destination `dst` a call's arguments bind from: a nullable one only when the return `ret`
+// is a bare type parameter and some argument is a bare `null`, else its non-null type, which a
+// literal adapts to as an annotated one does.
+function dstForArgs(dst: i32, args: i32[], ret: i32): i32 {
+  if dst < 0 || dst >= T.tys.length { return dst }
+  // A destination still being inferred chooses nothing.
+  if dstTyOpen(dst) { return -1 }
+  const t = T.tys[dst]
+  if t is TyNullable {
+    if ret >= 0 && T.tys[ret] is TyVar {
+      for a in args {
+        if argIsNullLit(a) { return dst }
+      }
+    }
+    return t.nInner
+  }
+  dst
 }
 
 // Records each literal argument that bound one of `names` at its parameter's substituted
@@ -51267,9 +51776,10 @@ function dstRetypeLitArgs(
   0
 }
 
-// Whether the destination's `cand` for type parameter `name` replaces the arguments' own
-// binding: every argument binding it is a literal `cand` holds within the literal's kind, and
-// the instance they would choose cannot be delivered to `dst` at the call `ix`.
+// Whether the destination's `cand` for type parameter `name` replaces the arguments' binding at
+// call `ix`: always for a bare `null` beside arguments `cand` holds; for a literal union only
+// when every argument is a literal member of it; otherwise when every argument is a
+// literal `cand` holds in its kind and the arguments' own instance cannot reach `dst` (D4024).
 function dstTyParamAdapts(
   name: string,
   cand: i32,
@@ -51279,36 +51789,60 @@ function dstTyParamAdapts(
   ret: i32,
   dst: i32,
 ): boolean {
-  if cand < 0 || cand == TY_ERR || isVoidTy(cand) || tyHasTyVar(cand) {
+  if (
+    cand < 0
+    || cand == TY_ERR
+    || isVoidTy(cand)
+    || tyHasTyVar(cand)
+    || dstTyOpen(cand)
+  ) {
     return false
   }
-  // A body computing on `T` can leave a literal union, so the destination never binds one
-  // (D3602 is the same escape with the type argument written).
-  if tyIsLitUnionLike(cand, 4) { return false }
+  // A body computing on `T` can leave a literal union (D3602), so only literal members of it
+  // choose one.
+  const litU = tyIsLitUnionLike(cand, 4)
+  if litU {
+    if litUnionOneBase(cand, 4) < 0 { return false }
+    const cn = P.nodes[ix]
+    if cn is Call {
+      if !genericBodyClosed(callGenericDeclIx(cn), 0) { return false }
+    } else {
+      return false
+    }
+  }
   const one: string[] = [name]
   const oneT: i32[] = [cand]
   let seen = 0
   let own = -1
   let nulls = 0
+  const others: i32[] = []
   let i = 0
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name, 8) {
-      if i < args.length && args[i] >= 0 && argIsNullLit(args[i]) {
-        // A bare `null` binds `T` to the null type, an instance no destination wants: the
-        // destination's binding is taken whenever it holds `null` (DV-402).
-        if !assignable(TY_NULL, substTyDeep(params[i], one, oneT)) {
-          return false
-        }
+      if i >= args.length || args[i] < 0 { return false }
+      const want = substTyDeep(params[i], one, oneT)
+      if argIsNullLit(args[i]) {
+        // A bare `null` binds `T` to the null type (DV-402).
+        if !assignable(TY_NULL, want) { return false }
         nulls = nulls + 1
         seen = seen + 1
         if own < 0 { own = TY_NULL }
         i = i + 1
         continue
       }
-      if i >= args.length || args[i] < 0 || !argIsLitOnly(args[i], 4) {
-        return false
+      if litU {
+        const lt = litTyOfExpr(parenPeelIx(args[i]))
+        if lt < 0 || !assignable(lt, want) { return false }
+        seen = seen + 1
+        if own < 0 { own = widenLitTy(lt) }
+        i = i + 1
+        continue
       }
-      const want = substTyDeep(params[i], one, oneT)
+      if !argIsLitOnly(args[i], 4) {
+        others.push(i)
+        i = i + 1
+        continue
+      }
       const x = parenPeelIx(args[i])
       if x < 0 || x >= P.nodes.length { return false }
       const isCall = P.nodes[x] is Call
@@ -51341,8 +51875,23 @@ function dstTyParamAdapts(
     }
     i = i + 1
   }
+  // A non-literal argument goes along only beside a `null`, and only one the binding holds.
+  if others.length > 0 {
+    if nulls == 0 { return false }
+    for oi in others {
+      const want = substTyDeep(params[oi], one, oneT)
+      const savedQ = inferQuiet
+      inferQuiet = true
+      let at = nodeTyIxOf(args[oi])
+      if at < 0 { at = checkNode(args[oi]) }
+      const ok = at >= 0 && assignable(at, want)
+      inferQuiet = savedQ
+      if !ok { return false }
+    }
+    return true
+  }
   if seen == 0 || own < 0 || tySame(own, cand) { return false }
-  if nulls == seen { return true }
+  if nulls > 0 || litU { return true }
   // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
   // is the program's, and a body doing arithmetic on `T` must keep computing at it.
   const savedQ2 = inferQuiet
@@ -51376,6 +51925,31 @@ function tyIsLitUnionLike(ty: i32, depth: i32): boolean {
   }
   tyNotLitUnionLike()
 }
+
+// The one base scalar every literal in `ty` widens to, through lists, nullables and unions;
+// -1 when there is none, or the literals mix bases (`1 | "a"`), a union with no one scalar rep.
+function litUnionOneBase(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyNullable { return litUnionOneBase(t.nInner, depth - 1) }
+  if t is TyArray { return litUnionOneBase(t.aElem, depth - 1) }
+  if t is TyUnion {
+    let b = -1
+    for m in t.uMembers {
+      if !isNullTy(m) {
+        const mb = litUnionOneBase(m, depth - 1)
+        if mb < 0 || (b >= 0 && mb != b) { return -1 }
+        b = mb
+      }
+    }
+    return b
+  }
+  litUnionNoBase()
+}
+
+// Every other type (a primitive, record, map or function) is no literal set, so has no base.
+function litUnionNoBase(): i32 { -1 }
 
 // Every other type (a primitive, record, map or function) holds values outside any literal set.
 function tyNotLitUnionLike(): boolean { false }
@@ -51557,6 +52131,13 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
 function arrayCtorNote(name: string): string {
   if name != "Array" { return "" }
   " — VL has no `Array` constructor: `n` copies of `v` is `filled(n, v)` (`import { filled } from \"std:array\"`), and an empty list is `[]`"
+}
+
+// `arrayCtorNote` for an `Array` that is called (`Array(n, v)`), "" for any other use of the
+// name, such as `Array.isArray(x)`.
+function arrayCtorCallNote(name: string, ix: i32): string {
+  if ix != ckCalleeIx { return "" }
+  arrayCtorNote(name)
 }
 
 // Appended where a call read as `name<…>(…)` fails: the source may have meant a comparison,
@@ -52356,6 +52937,71 @@ function tailPushIfArms(p: i32, todo: i32[]): boolean {
     return true
   }
   false
+}
+
+// Banks destination `ty` on every `if` and `match` whose value reaches it through `ix`'s arms.
+function seedJoinWant(ix: i32, ty: i32) {
+  if ty < 0 { return 0 }
+  for at in joinLeavesOf(ix) { joinWantAt.set(at, ty) }
+  0
+}
+
+// Every `if` and `match` whose value is `ix`'s, through arms and block tails.
+function joinLeavesOf(ix: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [ix]
+  let guard = 0
+  while todo.length > 0 && guard < 64 {
+    guard = guard + 1
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      const an = P.nodes[at]
+      if an is IfStmt || an is MatchExpr { out.push(at) }
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        tailPushBlockTail(at, todo)
+      }
+    }
+  }
+  out
+}
+
+// Whether a join under `ix` took its type from its destination, so is typed by an annotation.
+function joinTypedByWant(ix: i32): boolean {
+  for at in joinLeavesOf(ix) {
+    if joinByWant.has(at) { return true }
+  }
+  false
+}
+
+// The type a valued `if` or `match` at `ix` joined to `join` takes instead, or -1: the
+// destination banked for `ix` when every arm fits it (DV-1207). A `T | null` destination is
+// banked as `T` (`seedExpected`), so only non-null arms adopt; a type parameter, or a `null` the
+// seed left in a union, keeps the join's own type.
+function litJoinOf(ix: i32, join: i32, arms: i32[], tys: i32[]): i32 {
+  const jw = joinWantAt.get(ix) ?? -1
+  if jw < 0 || join < 0 || tyHasTyVar(jw) || assignable(join, jw) { return -1 }
+  if tyHasNullMember(jw) { return -1 }
+  let i = 0
+  while i < arms.length {
+    if !joinArmFits(arms[i], tys[i], jw) { return -1 }
+    i = i + 1
+  }
+  joinByWant.set(ix, true)
+  jw
+}
+
+// Whether arm `armIx`, valued `armTy`, fits destination `want`: by its type, or as the literal
+// its tail spells, which its type has already widened to the literal's base.
+function joinArmFits(armIx: i32, armTy: i32, want: i32): boolean {
+  if armTy < 0 || assignable(armTy, want) { return true }
+  let tail = armIx
+  const a = P.nodes[armIx]
+  if a is Block {
+    if a.blkStmts.length == 0 { return false }
+    tail = a.blkStmts[a.blkStmts.length - 1]
+  }
+  const lt = litTyOfExpr(tail)
+  lt >= 0 && assignable(lt, want)
 }
 
 // When `p` is a `match` not yet desugared, queues each arm's body.
@@ -54821,7 +55467,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
                       + tyToStr(stTy)
                       + boolForNumberNote(stTy, ret)
                       + numUnionLossNote(stTy, ret)
-                      + storageListNote(stmts[s], stTy, ret),
+                      + storageListNote(stmts[s], stTy, ret)
+                      + litMemberNote(stmts[s], ret, 8),
                     stmts[s],
                     ret,
                   )
@@ -55765,6 +56412,7 @@ function checkProgramNode(n: Program) {
   // Initialization order still matters for straight-line top-level code — each global joins
   // the definite-assignment dead-zone here — but a function body runs at call time, so a deferred read from inside one is correctly not flagged.
   lbiScanModLits(stmts)
+  modClashNames = Map()
   let mi = 0
   const phLets: i32[] = []
   while mi < stmts.length {
@@ -55779,6 +56427,7 @@ function checkProgramNode(n: Program) {
         let at = stmts[mi]
         if xfn > at { at = xfn }
         tErr("redeclared " + sm.letName, at)
+        modClashNames[sm.letName] = true
       }
       if moduleGlobals[sm.letName] ?? false {
         // A genuine top-level redeclaration — reported here (pass 2 skips its own
@@ -57208,6 +57857,11 @@ function checkNodeReal(ix: i32) {
       return checkNodeReal(ix)
     }
     const ty = lookup(n.identName)
+    // A module name declared as both a function and a value is refused as redeclared; which
+    // of the two a read means is unknowable, so the read is that error's cascade.
+    if lookupDepth(n.identName) == 0 && (modClashNames[n.identName] ?? false) {
+      return TY_ERR
+    }
     // Only a read at an extern's own type can name one, so the name lookup is asked of those alone.
     if ty >= extFnTyMin && ty < extFnTy.length && !extValueSeen {
       if extFnTy[ty] && ix != ckCalleeIx {
@@ -57244,7 +57898,7 @@ function checkNodeReal(ix: i32) {
           + n.identName
           + "'"
           + moved
-          + arrayCtorNote(n.identName),
+          + arrayCtorCallNote(n.identName, ix),
         ix,
       )
       return TY_ERR
@@ -66042,6 +66696,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       }
       eqM = eqM + 1
     }
+    if eqMsgs.length == 0 && !isNullTy(lt) && !isNullTy(rt) {
+      let eqTy = lt
+      let eqPath = eqListFieldPath(lt, [])
+      if eqPath == "" {
+        eqTy = rt
+        eqPath = eqListFieldPath(rt, [])
+      }
+      if eqPath != "" { recordDeepRecordEq(ix, eqTy, eqPath, op) }
+    }
     return TY_BOOL
   }
   // A gradual union operand is checked at its concrete members; the constraint noted above
@@ -67172,6 +67835,8 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   // sentinel would poison the join, so never seed with it.
   let matchTy = -1
   const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
   const nArms = n.matchArmStart.length
@@ -67234,6 +67899,8 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
         bodyLit,
       )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
       matchValAcc = matchArmTally(
         ix,
         body,
@@ -67248,9 +67915,13 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   }
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
   } else {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
@@ -67539,6 +68210,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
   let matchTy = -1
   const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
   let bi = 0
@@ -67591,6 +68264,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
         bodyLit,
       )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
       matchValAcc = matchArmTally(
         ix,
         body,
@@ -67605,9 +68280,13 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   }
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
   } else {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
@@ -67870,6 +68549,8 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   // sentinel would poison the join (every arm joins back to error), so never seed with it.
   let matchTy = -1
   const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
   let ai = 0
@@ -67983,6 +68664,8 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
         bodyLit,
       )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
       matchValAcc = matchArmTally(
         ix,
         body,
@@ -67999,9 +68682,13 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
   } else {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
@@ -68620,6 +69307,18 @@ function checkIfTail(
       if !ifChainOnFnTail { noteExitArm(n.ifElse) }
     }
     if !f32Keep { f32JoinRevert(ix) }
+    // A string literal arm joins to `string`; beside an arm whose type holds that literal it
+    // takes that type instead, and a destination that holds each arm's value types the `if`, so
+    // `if ok { a.look } else { "none" }` is a `Look` (DV-1207).
+    if !thenExits && !daElseDiverges {
+      const lj = litJoinOf(
+        ix,
+        plainJoin,
+        [n.ifThen, n.ifElse],
+        [thenPlain, elsePlain],
+      )
+      if lj >= 0 { plainJoin = lj }
+    }
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
       if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
@@ -69074,6 +69773,48 @@ function castPinWrapCheck(at: i32, target: i32, castIx: i32) {
   0
 }
 
+// Raises the redundant-cast refusal when cast `n` at `ix` names the type its operand already
+// has (`t as! string` after `t is string`), with the edit that drops it; false otherwise.
+function redundantCastRaise(
+  n: AsExpr,
+  arg: i32,
+  target: i32,
+  ix: i32,
+): boolean {
+  if arg < 0 || target < 0 || arg == TY_ERR || target == TY_ERR { return false }
+  if !tyEq(softenLitTy(arg), target) { return false }
+  let what = "this value"
+  const on = P.nodes[n.asObj]
+  if on is Ident { what = "`" + on.identName + "`" }
+  let form = "as"
+  if n.asMode == "trap" { form = "as!" }
+  if n.asMode == "null" { form = "as?" }
+  if n.asMode == "wrap" { form = "as%" }
+  let data = ""
+  const st = nodeStartTok(ix)
+  const ot = nodeLastTok(n.asObj)
+  // A one-token operand (a literal, `this`) is named as written.
+  if st >= 0 && ot == st && ot < P.toks.length {
+    what = "`" + P.toks[st].text + "`"
+  }
+  if st >= 0 && ot >= st && ot < P.toks.length {
+    const keep = P.toks[ot].start + P.toks[ot].text.length - P.toks[st].start
+    if keep > 0 { data = diagDataField("keep", i32ToStr(keep)) }
+  }
+  tErrCodedData(
+    what
+      + " is already `"
+      + tyToStr(target)
+      + "` here, so the `"
+      + form
+      + "` cast does nothing — drop it",
+    ix,
+    CODE_REDUNDANT_CAST,
+    data,
+  )
+  true
+}
+
 // The `; write `[]` …` clause on the numeric-only `as` refusal, or "" for every other
 // operand. An empty array literal takes its element type from its destination, so a cast to
 // an array type is not merely unsupported but unnecessary, and no other `as` spelling works
@@ -69223,6 +69964,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
     return target
   }
   if !isNumeric(arg) || !targetIsScalar {
+    if redundantCastRaise(n, arg, target, ix) { return TY_ERR }
     tErr(
       "`as` supports numeric conversions only" + emptyArrCastHint(n.asObj, target),
       ix,
@@ -74283,6 +75025,123 @@ function litPrimMeetTy(obj: i32, chk: i32): i32 {
   mkUnionTy(keep)
 }
 
+// The part of `obj` that always fits the record type `chk`, where `chk` names none of `obj`'s
+// members: `b is A` over `b: B` or `B | null` with every `B` an `A` tests as `is B`, and over
+// `B | C` with no `C` able to fit `A` it tests the `B` (D4062). -1 otherwise.
+function recFitMeetTy(obj: i32, chk: i32): i32 {
+  if obj < 0 || chk < 0 { return -1 }
+  const ct = T.tys[chk]
+  if !(ct is TyObj) { return -1 }
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  if base < 0 { return -1 }
+  const bt = T.tys[base]
+  if bt is TyObj {
+    if recContainedIn(base, chk) { return base }
+    return -1
+  }
+  if !(bt is TyUnion) { return -1 }
+  let fit = -1
+  for m in bt.uMembers {
+    if m < 0 || tySame(m, chk) { return -1 }
+    if recContainedIn(m, chk) {
+      if fit >= 0 { return -1 }
+      fit = m
+    } else if !recNeverFits(m, ct) {
+      return -1
+    }
+  }
+  fit
+}
+
+// Whether every value of record `a` fits record `b` and not the reverse, the two declaring the
+// same field names. A record with fields the other lacks is no containment D3885 settles.
+function recContainedIn(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  if !(at is TyObj) || !(bt is TyObj) { return false }
+  if at.objFieldNames.length != bt.objFieldNames.length { return false }
+  for f in at.objFieldNames {
+    if strListIndexOf(bt.objFieldNames, f) < 0 { return false }
+  }
+  assignable(a, b) && !assignable(b, a)
+}
+
+// Whether no value of `m` can fit the record `ct`: a scalar, literal, list, map or function, or
+// a record missing a field `ct` declares non-nullable.
+function recNeverFits(m: i32, ct: TyObj): boolean {
+  const mt = T.tys[m]
+  match mt {
+    TyPrim | TyLit | TyArray | TyMap | TyFunc => true
+    TyObj => {
+      let i = 0
+      while i < ct.objFieldNames.length {
+        if (
+          strListIndexOf(mt.objFieldNames, ct.objFieldNames[i]) < 0
+          && !(T.tys[ct.objFieldTypes[i]] is TyNullable)
+        ) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TyNullable | TyUnion | TyErr | TyVar | TyNeg => false
+  }
+}
+
+// Whether narrowing a record `cur` to `chk` keeps its storage: a field narrowed to a string
+// literal set is stored as an atom in `chk` and as a string in `cur`, so the value cannot be
+// delivered as a `chk` (D4058).
+function recFitNarrowKeepsRep(cur: i32, chk: i32): boolean {
+  const names: string[] = []
+  const sets: i32[] = []
+  if recFitNarrowedFields(cur, chk, names, sets) != 1 { return true }
+  for st in sets {
+    for lex in tyLitSetMemberLexes(st) {
+      if nameIsQuotedLeaf(lex) { return false }
+    }
+  }
+  true
+}
+
+// For `r is B` over a single record `r: A` (or `A | null`) where every `B` is an `A` but not
+// the reverse, the fields `B` narrows and the literal set each must hold (D4058). -1 when the
+// test is not that shape, 0 when a narrowed field is not a literal set over `A`'s, else 1.
+export function recFitNarrowedFields(
+  obj: i32,
+  chk: i32,
+  names: string[],
+  sets: i32[],
+): i32 {
+  if obj < 0 || chk < 0 { return -1 }
+  const ct = T.tys[chk]
+  if !(ct is TyObj) { return -1 }
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  if base < 0 { return -1 }
+  const bt = T.tys[base]
+  if !(bt is TyObj) || !recContainedIn(chk, base) { return -1 }
+  let i = 0
+  while i < ct.objFieldNames.length {
+    const fb = ct.objFieldTypes[i]
+    const at = strListIndexOf(bt.objFieldNames, ct.objFieldNames[i])
+    if at < 0 { return 0 }
+    const fa = bt.objFieldTypes[at]
+    if !assignable(fa, fb) {
+      if tyLitSetMemberLexes(fb).length == 0 { return 0 }
+      names.push(ct.objFieldNames[i])
+      sets.push(fb)
+    }
+    i = i + 1
+  }
+  if names.length == 0 { return 0 }
+  1
+}
+
 // Whether a string literal of `ty` (through unions) is spelled with an escape.
 function litSetHasEscape(ty: i32): boolean {
   const lits: i32[] = []
@@ -74405,6 +75264,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   let meet = litSetMeetTy(objTy, chkTy)
   if meet == -1 && n.isVariant != "null" { meet = litBaseMeetTy(objTy, chkTy) }
   if meet == -1 { meet = litPrimMeetTy(objTy, chkTy) }
+  if meet == -1 { meet = recFitMeetTy(objTy, chkTy) }
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {
@@ -75485,7 +76345,8 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         + bareRetVoidNote(want)
         + charLitForStringNote(n.retArg, want)
         + boolForNumberNote(got, want)
-        + storageListNote(n.retArg, got, want),
+        + storageListNote(n.retArg, got, want)
+        + litMemberNote(n.retArg, want, 8),
       n.retArg,
       want,
     )

@@ -91,4 +91,3 @@ D3970-D3979  lane-SC  2026-10-10  lane SC rows for D3948 and the rv3498 residue
 D3985-D3989  lane-CK  2026-10-10  ruling-C follow-ups: rows the r5 review of #3500 found
 D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)
 D4000-D4009  lane-PF  2026-10-11  DV-1000/DV-1001 V8 perf (diderven): D4000 range-analysis guard folding, later residues
-D4020-D4029  lane-CK  2026-10-11  the #3516 review: a hole delivery's pin missed by the constraint probe (D4020 filed and closed), width rewrite gaps (D4021-D4023 filed open)
