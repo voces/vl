@@ -742,9 +742,8 @@ function monoAnnPinName(name: string) {
   // alias is in `unNames` too. Kept as the rung whose absence a whole family witnessed.
   if nameIsArray(name) {
     const luElem = arrElemNameRaw(name)
-    if luElem != "" && isUName(luElem) && nameIsLitUnionType(luElem) {
-      return name
-    }
+    const luTy = if luElem != "" && isUName(luElem) { cUserTypes.get(luElem) ?? -1 } else { -1 }
+    if luTy >= 0 && tyIsLitUnion(luTy) { return name }
   }
   // A `boolean[]` annotation. Its rep is the i32 list exactly (`nameIsI32Array`), so the
   // cascade cannot spell it and the pin has to be a name. Only a genuine `boolean` leaf
@@ -8997,17 +8996,20 @@ function monoMakeInstanceGo(
           let what = "the reassigned function binding `"
             + cal3.identName
             + "` is"
-          if (monoLetWrites.get("n:" + cal3.identName) ?? []).length == 0 {
+          let wants = "the values written to it want two"
+          if !monoNameWrittenAt(cal3.identName, calleeIx) {
             what = "the function binding `"
               + cal3.identName
               + "`, a copy of a reassigned binding, is"
+            wants = "its calls want two"
           }
           return emitFail(
             "emitProgram: "
               + what
               + " called at more than one argument type — one binding holds one closure "
-              + "signature, and the values written to it want two. Annotate the parameters, or "
-              + "bind a separate value per type",
+              + "signature, and "
+              + wants
+              + ". Annotate the parameters, or bind a separate value per type",
           )
         }
       }
@@ -9541,8 +9543,9 @@ function monoCallWrittenLet(ix: i32, name: string, ctx: i32): i32 {
     ct = monoSigFnTyName(monoSlotSig(monoLastInstFe))
     if ct == "" { return 0 }
   }
-  if !monoCellSigRecord(lf[1], ct) { return monoBindSigFail(name) }
+  monoCellSigByCall = true
   monoCoerceWrittenLet(name, n.callFn, ctx, ct)
+  monoCellSigByCall = false
   0
 }
 
@@ -9966,10 +9969,34 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
     if wb is BinExpr {
       let wf = monoTopFrameOf(w)
       if ctx >= 0 { wf = monoFrameOfNode(w, ctx) }
+      if monoPinWrittenLam(wb.binRight, elemAnn, wf) < 0 { return -1 }
       if monoCoerceFnValueName(wb.binRight, elemAnn, wf, -1) < 0 { return -1 }
     }
   }
   0
+}
+
+// Pins a lambda literal `v` with an un-annotated parameter, written in frame `wf` into a list
+// element or record field of function type `ann`, at that type, as its own contextual type
+// would; -1 when it cannot take it (refused).
+function monoPinWrittenLam(v: i32, ann: string, wf: i32): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || !(P.nodes[x] is FuncDecl) { return 0 }
+  const lfe = monoLamValueFe(x, wf)
+  if (
+    lfe < 0
+    || lfe >= monoGen.length
+    || monoGen[lfe] != 1
+    || !monoLamIsHole(lfe)
+  ) {
+    return 0
+  }
+  if monoCellLamTake(lfe, x, ann, wf) == 0 { return 0 }
+  emitFailAt(
+    "emitProgram: a lambda written into an element or field holding a generic function cannot "
+      + "take the type the calls through it give it — annotate its parameters",
+    x,
+  )
 }
 
 // A pin's call signature: the parameter part `params` (as `monoSlotSig` spells it) and the
@@ -10029,7 +10056,9 @@ function monoPinGenericRecord(d: LetDecl, at: i32, ctx: i32): i32 {
             if sig != "" && sig != one {
               return emitFailAt(
                 "emitProgram: a record field holding a generic function is called at more than "
-                  + "one type, so the field has no one instance — annotate the record's type",
+                  + "one argument type — one field holds one function value, and calls through "
+                  + "it want two. Annotate the field's function type, or bind a separate value "
+                  + "per type",
                 vals[h],
               )
             }
@@ -10065,6 +10094,7 @@ function monoPinGenericRecord(d: LetDecl, at: i32, ctx: i32): i32 {
             if m.memProp == hot[h] {
               let wf = monoTopFrameOf(w)
               if ctx >= 0 { wf = monoFrameOfNode(w, ctx) }
+              if monoPinWrittenLam(wb.binRight, ann, wf) < 0 { return -1 }
               if monoCoerceFnValueName(wb.binRight, ann, wf, -1) < 0 {
                 return -1
               }
@@ -10434,10 +10464,18 @@ function monoCoerceLetValues(
   if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return false }
   // A written binding holds one value at a time, so every call and delivery of it, and of any
   // binding it is copied into, must want one signature.
-  if key == "n:" && !monoCellSigRecord(lf[1], tname) {
-    monoBindSigFail(name)
-    return true
+  if key == "n:" {
+    if monoCellSigByCall { monoCellSigSoft = lf[1] }
+    monoCellSigByCall = false
+    const ok = monoCellSigRecord(lf[1], tname)
+    monoCellSigSoft = -1
+    if !ok {
+      monoBindSigFail(name)
+      return true
+    }
+    if monoCellSigKept { return true }
   }
+  monoCellSigByCall = false
   let seed = d.letInit
   if key == "c:" {
     seed = monoGeneratedCellElem(d.letInit)
@@ -10786,14 +10824,49 @@ function monoFnNameSig(tname: string): string {
   sig
 }
 
+// The binding node whose own call is being recorded: that call converts its argument, so the
+// signature it records does not fix the binding's type. -1 outside such a call.
+let monoCellSigSoft = 0 - 1
+// Set by a call through a written `let` just before it coerces the `let` at the call's type;
+// cleared by the coercion's own record.
+let monoCellSigByCall = false
+// Whether the last `monoCellSigRecord` kept the wider signature already recorded, so the value
+// is not coerced again at the narrower one.
+let monoCellSigKept = false
+// The nodes recorded at a narrower signature by a delivery other than such a call, which no
+// wider signature may replace.
+let monoCellSigFirm: {[i32]: boolean} = Map()
+
 // Records node `v` at the parameter list of function type `tname`; false when it holds another.
+// Two lists equal once string literal unions widen to `string` are one, held at the wider, unless
+// the narrower came from a delivery that fixes a binding's type at it.
 function monoCellSigRecord(v: i32, tname: string): boolean {
+  monoCellSigKept = false
+  const soft = v == monoCellSigSoft
   const sig = monoFnNameSig(tname)
   if sig == "" { return true }
   const had = monoCellCoercedSig.get(v) ?? ""
-  if had != "" && had != sig { return false }
-  monoCellCoercedSig.set(v, sig)
-  true
+  const wide = monoSigWidened(sig)
+  if had == "" || had == sig {
+    monoCellCoercedSig.set(v, sig)
+    if !soft && sig != wide { monoCellSigFirm.set(v, true) }
+    return true
+  }
+  if monoSigWidened(had) != wide { return false }
+  if sig == wide {
+    if monoCellSigFirm.get(v) ?? false { return false }
+    monoCellCoercedSig.set(v, sig)
+    return true
+  }
+  monoCellSigKept = soft && had == wide
+  monoCellSigKept
+}
+
+// Parameter list `sig` (`p1,p2,`) with each string literal union widened to `string`.
+function monoSigWidened(sig: string): string {
+  let out = ""
+  for pt in monoSigPins(sig) { out = out + monoPinWidened(pt) + "," }
+  out
 }
 
 // Whether function node `fx` is an instance of a generic function, or the generic itself.
@@ -12607,7 +12680,11 @@ function monoWalk(ix: i32, ctx: i32) {
           // takes the instance's signature, as a delivery of the binding does (D3961).
           if ri >= 0 && !direct && monoLastInstFe >= 0 {
             const ctn = monoSigFnTyName(monoSlotSig(monoLastInstFe))
-            if ctn != "" { monoCoerceWrittenLet(wlName, wlAt, wlFr, ctn) }
+            if ctn != "" {
+              monoCellSigByCall = true
+              monoCoerceWrittenLet(wlName, wlAt, wlFr, ctn)
+              monoCellSigByCall = false
+            }
           }
           return ri
         }
@@ -13372,7 +13449,7 @@ function monoNoteBindSig(name: string, at: i32, ctx: i32, sig: string) {
     // function is lowered, and with it the call (D3868).
     if hops == 0 && lf[0] >= 0 && monoWriteFrameDead(ctx, lf[0]) { return 0 }
     const had = monoBindCallSigs.get(lf[1]) ?? ""
-    if !monoSigListHas(had, sig) { monoBindCallSigs.set(lf[1], had + sig) }
+    monoBindCallSigs.set(lf[1], monoSigListAdd(had, sig))
     monoBindCallFrame.set(lf[1], lf[0])
     if d.letInit < 0 { return 0 }
     let iv = d.letInit
@@ -13982,6 +14059,31 @@ function monoLamInstSigs(fe: i32): string {
   out
 }
 
+// Signature list `all` with `one` added. Two equal once string literal unions widen to `string`
+// are one signature, held as the wider: a call at the narrower passes its value as a string.
+function monoSigListAdd(all: string, one: string): string {
+  const wide = monoSigWidened(one)
+  let out = ""
+  let st = 0
+  let i = 0
+  let met = false
+  while i < all.length {
+    if all[i] == ";"[0] {
+      const e = all.slice(st, i + 1)
+      if !met && monoSigWidened(e) == wide {
+        met = true
+        if wide + ";" == one { out = out + one } else { out = out + e }
+      } else {
+        out = out + e
+      }
+      st = i + 1
+    }
+    i = i + 1
+  }
+  if met { return out }
+  all + one
+}
+
 // Whether the `;`-joined signature list `all` holds `one`.
 function monoSigListHas(all: string, one: string): boolean {
   let i = 0
@@ -14273,6 +14375,13 @@ function monoInitPeerFe(fe: i32, nDecl: i32): i32 {
   -1
 }
 
+// A parameter pin spelled as its value's type: a string literal union holds strings, so an
+// instance at it and one at `string` are one signature.
+function monoPinWidened(pin: string): string {
+  if nameIsLitUnionType(pin) { return "string" }
+  pin
+}
+
 // The concrete parameter spellings a lifted slot's declaration carries, appended to `out`
 // — an instance's pins, read the way `monoPinnedSigsOf` reads them, with `"i32"` for the
 // hole a count-0 all-i32 clone deliberately leaves un-annotated. false when the slot is
@@ -14323,6 +14432,7 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoCellCoercedSig = Map()
+  monoCellSigFirm = Map()
   monoHoleLamSlots = Map()
   monoBuiltinCbLamsBuilt = false
   monoBindCallFrame = Map()
