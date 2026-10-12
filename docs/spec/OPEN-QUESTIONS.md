@@ -262,3 +262,48 @@ const b: i32 = c   // would be refused: f64 doesn't fit in i32
 **Recommendation: (a).** It is the only option under which ruling A and ruling C both hold
 as written. A literal such as `1e6` is a natural way to write a large whole count, and the
 exactness rule still refuses every literal that has a fraction.
+
+## Q8. A positional argument after a named one
+
+Raised by expressions.md §E11.2.
+
+**Today.** Named arguments bind first. Positional arguments then fill the parameters that
+are still unbound, in declaration order, wherever they stand in the call. So a positional
+argument may follow a named one, and a positional argument written first can land on a
+later parameter:
+
+```vl
+function box(w: i32, h: i32): i32 { w * 10 + h }
+print(box(w: 3, 2))   // prints 32
+print(box(h: 3, 2))   // prints 23
+print(box(3, w: 2))   // prints 23
+```
+
+No ruling covers the order. The guide's statement, "named arguments may follow positional
+ones", says nothing about the reverse.
+
+**(a) Positional arguments come first.** A positional argument after a named one is
+refused, and a named argument may not name a parameter a positional one already filled.
+This is Python's rule.
+
+```vl
+print(box(3, h: 2))   // would print 32
+print(box(w: 3, 2))   // would be refused: a positional argument follows a named one
+print(box(3, w: 2))   // would be refused: `w` is given twice
+```
+
+**(b) Allow a positional argument after a named one only when every named argument before
+it is in its own position.** This is Kotlin's rule since 1.4. `box(w: 3, 2)` is accepted because `w` is the first parameter; `box(h: 3, 2)`
+is refused.
+
+```vl
+print(box(w: 3, 2))   // would print 32
+print(box(h: 3, 2))   // would be refused: `h` is not in position 1
+```
+
+**(c) Keep today's rule,** and state it: named first, then positional in order.
+
+**Recommendation: (a).** Under today's rule `box(3, w: 2)` silently moves `3` from `w` to
+`h`, which no reader of the call would expect, and (a) refuses exactly that. (a) also
+refuses nothing a program needs, since every call it refuses has an order that it accepts.
+
