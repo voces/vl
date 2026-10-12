@@ -1891,6 +1891,7 @@ function narInstallJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
     // and a call that may write the name ends it (D2390).
     noteNarShadow(key, cur, NAR_KIND_POSTGUARD)
     declare(key, jt)
+    narFitCompanions(key, cur, jt)
     recordArmJoin(ix, key, jt)
   } else if viaChain {
     // The `else if` chain's join reaches the emitter only at this statement (D2627).
@@ -5817,6 +5818,8 @@ export function initChecker() {
   npSettle = []
   npCapBy = []
   npAsg = []
+  nfSlots = []
+  nfNames = []
   npFrames = []
   pgUpKeys = []
   pgUpTys = []
@@ -7897,6 +7900,8 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
       const ld = cwLambdaDeclOf(an.identName, fr)
       if ld >= 0 { return weClosed(fnWriteShapes(ld)) }
     }
+    // A scalar local is no function value, whatever the call hands it to (`clz(m)`).
+    if crTyIsScalar(nodeTyOf(a)) { return "" }
     if strListHas(bound, an.identName) { return "*" }
   }
   if weNeverFn(a) { return "" }
@@ -8130,7 +8135,7 @@ function keyStepTag(step: string, t: i32): string {
 // Whether the place keyed `key` stores exactly the type its live narrowing reads it at.
 function keyStoresNarrowedTy(key: string): boolean {
   const slot = narrowedPathIx(key)
-  if slot < 0 { return false }
+  if slot < 0 || narFitSlot(slot) { return false }
   const nar = npTys[slot]
   const st = keyStoreTy(key)
   if nar < 0 || st < 0 { return false }
@@ -8767,6 +8772,7 @@ function retireAliasedNarrowings(
     if hits && npInvBy[i] < 0 {
       crAliasWr[atIx] = true
       npInvBy[i] = atIx
+      if nfSlots.length > 0 && i >= crFnNpBase() { narFitRetire(i, atIx, -1) }
       if i < crFnNpBase() {
         crAliasNestSlots.push(i)
         crAliasNestDepths.push(crFnBases.length)
@@ -9621,6 +9627,9 @@ function noteCallInvalidations(callIx: i32) {
       // two arms separately and a write in one must not hide a call in the other (D1849).
       if npInvBy[i] < 0 {
         npInvBy[i] = callIx
+        if nfSlots.length > 0 && i >= crFnNpBase() {
+          narFitRetire(i, callIx, -1)
+        }
         if callKillSure(callIx, npKeys[i]) { noteKillSure(callIx, npKeys[i]) }
         crPathCallRetire(i, callIx)
         // Inside a nested body a call ends an enclosing narrowing for the rest of that body
@@ -10969,6 +10978,116 @@ function crRetireAt(
   0
 }
 
+// Overlay slots holding a field of a bare name narrowed to a record, with that name: the
+// narrowing holds only while the field does, so a write that ends the path ends the name.
+let nfSlots: i32[] = []
+let nfNames: string[] = []
+
+// Push a path entry `name.f` for each field the record `nt` stores narrower than another member of
+// the union `declTy` that contains it, so the path rules decide when a write through another place
+// ends `name` too. Members that cannot hold an `nt` cannot hold the object, and need none.
+function narFitCompanions(name: string, declTy: i32, nt: i32) {
+  while nfSlots.length > 0 && nfSlots[nfSlots.length - 1] >= npKeys.length {
+    nfSlots.pop()
+    nfNames.pop()
+  }
+  const r = T.tys[nt]
+  if r is TyObj { narFitFields(name, declTy, nt, r) }
+  0
+}
+
+function narFitFields(name: string, declTy: i32, nt: i32, r: TyObj) {
+  let wide = declTy
+  const dt = T.tys[declTy]
+  if dt is TyNullable { wide = dt.nInner }
+  if wide < 0 { return 0 }
+  const u = T.tys[wide]
+  if u is TyUnion { narFitMembers(name, nt, r, u.uMembers) }
+  0
+}
+
+// The fields of `r` (the record `nt`) a member of `mems` that holds every `nt` stores wider.
+function narFitMembers(name: string, nt: i32, r: TyObj, mems: i32[]) {
+  let f = 0
+  while f < r.objFieldNames.length {
+    const ft = r.objFieldTypes[f]
+    let wider = false
+    for m in mems {
+      if (
+        !wider
+        && m >= 0
+        && m != nt
+        && T.tys[m] is TyObj
+        && assignable(nt, m)
+        && !assignable(m, nt)
+      ) {
+        const mo = T.tys[m]
+        if mo is TyObj {
+          const mt = objFieldType(mo, r.objFieldNames[f])
+          wider = mt >= 0 && ft >= 0 && !tySame(mt, ft)
+        }
+      }
+    }
+    if wider {
+      nfSlots.push(npKeys.length)
+      nfNames.push(name)
+      npKeys.push(name + "." + r.objFieldNames[f])
+      npTys.push(ft)
+      npInvBy.push(-1)
+      npEpochs.push(narFnEpoch)
+      npSettle.push(-2)
+      npCapBy.push(-1)
+      npAsg.push(0)
+    }
+    f = f + 1
+  }
+  0
+}
+
+// Whether overlay slot `slot` is a field entry of a narrowed name: the place stores what the
+// name's declared type does, which its narrowed type does not say.
+function narFitSlot(slot: i32): boolean { narFitNameOf(slot) != "" }
+
+// The bare name whose field entry overlay slot `slot` is, or "" when it is a written path.
+function narFitNameOf(slot: i32): string {
+  let j = nfSlots.length - 1
+  while j >= 0 {
+    if (
+      nfSlots[j] == slot
+      && slot < npKeys.length
+      && keyHasPrefix(npKeys[slot], nfNames[j] + ".")
+    ) {
+      return nfNames[j]
+    }
+    j = j - 1
+  }
+  ""
+}
+
+// End the bare name a field entry in overlay slot `slot` stands for, as the write or call at
+// `atIx` ended the entry: before the loop `loopIx` when it is not -1, else after the open statement.
+function narFitRetire(slot: i32, atIx: i32, loopIx: i32) {
+  let j = nfSlots.length - 1
+  while j >= 0 {
+    if (
+      nfSlots[j] == slot
+      && slot < npKeys.length
+      && keyHasPrefix(npKeys[slot], nfNames[j] + ".")
+    ) {
+      if loopIx >= 0 {
+        crRetire(nfNames[j], atIx, true, loopIx)
+      } else if (
+        crStmtIxs.length > 0
+        && crStmtFns[crStmtFns.length - 1] == crFnBases.length
+      ) {
+        crRetire(nfNames[j], atIx, false, crStmtIxs[crStmtIxs.length - 1])
+      }
+    }
+    j = j - 1
+  }
+  0
+}
+
 // Whether the scope layer `d` of `name` is a narrowing rather than a declaration.
 function crIsNarrowLayer(name: string, d: i32): boolean {
   crFirstBank(name, d) >= 0 || crWidenedAt(name, d)
@@ -12181,6 +12300,7 @@ function crLoopPathPreRetire(loopIx: i32) {
       const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
       if a >= 0 {
         npInvBy[s] = a
+        if nfSlots.length > 0 { narFitRetire(s, a, loopIx) }
         noteKillSure(a, npKeys[s])
         npSettle[s] = -1
         crAliasWr[a] = true
@@ -12890,9 +13010,15 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
   if slot >= 0 && slot < npAsg.length {
     if npAsg[slot] == 1 { cause = "a write of a non-null value" }
   }
+  // A field entry of a narrowed name is the compiler's, not the user's: name the binding.
+  let shown = key
+  if slot >= 0 {
+    const fitName = narFitNameOf(slot)
+    if fitName != "" { shown = fitName }
+  }
   tErr(
     "'"
-      + key
+      + shown
       + "' was narrowed by "
       + cause
       + ", but "
@@ -12900,7 +13026,7 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
       + " on line "
       + i32ToStr(nodeLineOf(byIx))
       + " can write it — re-test '"
-      + key
+      + shown
       + "' after "
       + after,
     at,
@@ -14318,6 +14444,9 @@ function applyNarrows(names: string[], tys: i32[]) {
         noteNarShadow(names[i], declTy, NAR_KIND_GUARD)
       }
       declare(names[i], tys[i])
+      if declTy >= 0 && declTy != tys[i] {
+        narFitCompanions(names[i], declTy, tys[i])
+      }
       if wasConst {
         const ctop = constScopes.length - 1
         if ctop >= 0 { constScopes[ctop][names[i]] = wasDecl }
@@ -14446,6 +14575,10 @@ function popScope() {
       npSettle.pop()
       npCapBy.pop()
       npAsg.pop()
+    }
+    while nfSlots.length > 0 && nfSlots[nfSlots.length - 1] >= npKeys.length {
+      nfSlots.pop()
+      nfNames.pop()
     }
   }
   if asgDeclFrames.length > 0 {
@@ -23368,6 +23501,7 @@ function joinVariantTys(a: i32, b: i32) {
     }
     i = i + 1
   }
+  dropStrLitsBesideString(kept)
   if kept.length == 0 { return TY_NULL }
   // A set joined with a map it shares a rep with has no union to become (D2673); the node whose
   // check made the join reports it (`checkNodeDone`).
@@ -23387,6 +23521,30 @@ function joinVariantTys(a: i32, b: i32) {
   }
   if hasNull { return mkNullableTy(res) }
   res
+}
+
+// Removes every string-literal member from `kept` when it also holds `string`, which already
+// holds them: `K | null` beside a `string` joins as `string | null`, as `K` alone joins as `string`.
+function dropStrLitsBesideString(kept: i32[]) {
+  let hasStr = false
+  for k in kept {
+    if isStringTy(k) { hasStr = true }
+  }
+  if !hasStr { return 0 }
+  let w = 0
+  for k in kept {
+    let lit = false
+    if k >= 0 {
+      const kt = T.tys[k]
+      if kt is TyLit { lit = kt.litKind == "str" }
+    }
+    if !lit {
+      kept[w] = k
+      w = w + 1
+    }
+  }
+  while kept.length > w { kept.pop() }
+  0
 }
 
 // Two records sharing a field-name set that D1023 would refuse as union arms join as one
@@ -69384,10 +69542,12 @@ function checkIfTail(
         pgPreTys.push(lookup(gKey))
         // ...and bank the shadowed declaration under the post-guard kind, so a consumer
         // needing the emitter's union can find it (D1035) — idempotent, banking the widest first.
-        noteNarShadow(gKey, lookup(gKey), NAR_KIND_POSTGUARD)
+        const gDecl = lookup(gKey)
+        noteNarShadow(gKey, gDecl, NAR_KIND_POSTGUARD)
         // One leg for both kinds: a null strip and a union subtraction are the same shadowing
         // `declare` — split only so the strip could skip the subtraction bank, now gone.
         declare(gKey, gTy)
+        if gDecl >= 0 && gDecl != gTy { narFitCompanions(gKey, gDecl, gTy) }
       }
       gi2 = gi2 + 1
     }
@@ -69400,8 +69560,12 @@ function checkIfTail(
         if narClobberedSince(thenLo, pgUpKeys[pu]) {
           recordPgResidualVoid(ix)
         } else {
-          noteNarShadow(pgUpKeys[pu], lookup(pgUpKeys[pu]), NAR_KIND_POSTGUARD)
+          const upDecl = lookup(pgUpKeys[pu])
+          noteNarShadow(pgUpKeys[pu], upDecl, NAR_KIND_POSTGUARD)
           declare(pgUpKeys[pu], pgUpTys[pu])
+          if upDecl >= 0 && upDecl != pgUpTys[pu] {
+            narFitCompanions(pgUpKeys[pu], upDecl, pgUpTys[pu])
+          }
         }
       }
     }
