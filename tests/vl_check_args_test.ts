@@ -204,6 +204,7 @@ Deno.test({
         `${dir}/./probe.vl`,
         `${dir}/d1`,
         `${dir}/d1/c.vl`,
+        `${dir}/d2/../d1/c.vl`,
       ]);
       if (dup.code !== 0 || !dup.err.includes("Checked 3 files, no errors.")) {
         throw new Error(
