@@ -61346,6 +61346,7 @@ function checkProgramPass(rootIx: i32) {
   lbiDefaultExpr = Map()
   nolLits = []
   nolTaken = Map()
+  nolOperand = Map()
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
     const pn = P.nodes[ntz]
@@ -74688,14 +74689,17 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   return mkArrayTy(elemTy)
 }
 
-// D1832 — a list literal whose every element is `null`, and those of them a typed destination
-// received. `null[]` has no element rep, so `flushNullOnlyLits` refuses the rest at program end.
+// D1832 — a list literal whose every element is `null`, those of them a typed destination
+// received, and those that sit as a `+` operand or a spread source, which no destination types.
+// `null[]` has no element rep, so `flushNullOnlyLits` refuses the untyped ones at program end.
 let nolLits: i32[] = []
 let nolTaken: {[i32]: boolean} = Map()
+let nolOperand: {[i32]: boolean} = Map()
 
 // Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
-// destination beside the value. A part whose own destination holds a type variable or hole, or
-// is itself `null[]`, types nothing.
+// destination beside the value. A part whose own destination is `null[]`, or holds a type
+// variable that is not the enclosing generic's own, types nothing. A speculative delivery
+// under `inferQuiet` marks too: it names a destination the real check then delivers to.
 function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
   if nolLits.length == 0 || srcExpr < 0 || dstTy < 0 { return 0 }
   const todo: i32[] = [srcExpr]
@@ -74712,11 +74716,14 @@ function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
 
 // The value parts of node `at` a delivery into `dt` reaches, each beside its own destination: a
 // list literal's elements, an object literal's field values, and a value `if`, `match` or
-// block's tails. Marks a list literal taken when `dt` names its element type.
+// block's tails. Marks a list literal taken when `dt` names its element type, and one that is
+// a `+` operand or a spread source as an operand.
 function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
   const e = P.nodes[at]
   if e is ArrayLit {
-    if nolElemOnlyNull(dt) || tyHasTyVar(dt) { return 0 }
+    if nolElemOnlyNull(dt) || (tyHasTyVar(dt) && !fsbTvsInScope(dt, 0)) {
+      return 0
+    }
     nolTaken[at] = true
     const dn = nonNullTy(dt)
     let elDt = dt
@@ -74725,8 +74732,13 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
       if d is TyArray { elDt = d.aElem }
     }
     for el in e.arrElems {
-      todo.push(el)
-      dsts.push(elDt)
+      const sp = P.nodes[el]
+      if sp is Spread {
+        nolMarkOperand(sp.spdArg)
+      } else {
+        todo.push(el)
+        dsts.push(elDt)
+      }
     }
   } else if e is ObjLit {
     const dn = nonNullTy(dt)
@@ -74752,33 +74764,76 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
       }
     }
   } else {
-    nolNoParts()
+    nolOperandParts(at)
   }
   0
 }
 
-// Every other node delivers its value whole, and holds no list literal a destination types.
-function nolNoParts(): i32 { 0 }
+// Every other node delivers its value whole, so a destination types no list literal in it; a
+// `+` is the one whose operands still need recording, for the refusal's wording.
+function nolOperandParts(at: i32) {
+  const e = P.nodes[at]
+  if e is BinExpr && e.binOp == "+" {
+    nolMarkOperand(e.binLeft)
+    nolMarkOperand(e.binRight)
+  }
+  0
+}
 
-// Whether `ty` is a list whose element is the `null` type.
+// Records the null-only list literal at `ix`, if it is one, as a `+` operand or spread source.
+function nolMarkOperand(ix: i32) {
+  const at = parenPeelIx(ix)
+  if at >= 0 && at < P.nodes.length && P.nodes[at] is ArrayLit {
+    nolOperand[at] = true
+  }
+  0
+}
+
+// Whether `ty`, through `null` and union members, offers a list only as `null[]`.
 function nolElemOnlyNull(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray { return t.aElem == TY_NULL }
-  false
+  const dn = nonNullTy(ty)
+  if dn < 0 { return false }
+  const t = T.tys[dn]
+  match t {
+    TyArray => t.aElem == TY_NULL
+    TyUnion => nolMembersOnlyNull(t.uMembers)
+    // None of these is a list, so a destination of one names no element type either way.
+    TyErr | TyPrim | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyNullable | TyObj => false
+  }
+}
+
+// Whether union members `ms` hold a list, and every list among them is `null[]`.
+function nolMembersOnlyNull(ms: i32[]): boolean {
+  let seen = false
+  for m in ms {
+    const mt = T.tys[m]
+    if mt is TyArray {
+      if mt.aElem != TY_NULL { return false }
+      seen = true
+    }
+  }
+  seen
 }
 
 // Refuses every null-only list literal no typed destination received: its element type is
-// `null` alone, which has no rep, and the annotation that names one is the fix.
+// `null` alone, which has no rep. An annotation names one, except on a `+` operand or a spread
+// source, which takes no type from the destination around it.
 function flushNullOnlyLits() {
   const done: {[i32]: boolean} = Map()
   for ix in nolLits {
     if !(nolTaken[ix] ?? false) && !(done[ix] ?? false) {
       done[ix] = true
-      tErr(
-        "a list of only `null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`",
-        ix,
-      )
+      if nolOperand[ix] ?? false {
+        tErr(
+          "a list of only `null` takes no element type from a `+` operand or a spread; bind it to an annotated name first, e.g. `const e: (i32 | null)[] = [null]`",
+          ix,
+        )
+      } else {
+        tErr(
+          "a list of only `null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`",
+          ix,
+        )
+      }
     }
   }
   0
