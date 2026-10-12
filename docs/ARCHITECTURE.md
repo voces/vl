@@ -479,7 +479,8 @@ Detail: `docs/internals/cli-design.md`, `docs/internals/test-runner-design.md`,
 
 Each line is a place the tree does not meet a contract above, measured on 2026-10-11 at
 `5d4cd14dc`. The item it links to has the numbers, the proposed fix and its first PR. Remove a
-line in the PR that closes it.
+line in the PR that closes it. The order in which they are closed is
+[`internals/architecture-refactor-plan.md`](internals/architecture-refactor-plan.md).
 
 | contract | deviation | item |
 | --- | --- | --- |

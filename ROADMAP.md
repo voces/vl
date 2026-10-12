@@ -97,6 +97,14 @@ units: **hours** · **half-day** · **days**.
 
 ## Next (highest leverage)
 
+### Architecture refactor (2026-10-12)
+
+🟡 **Bring the compiler and its tools in line with `docs/ARCHITECTURE.md`.**
+- Plan: [`docs/internals/architecture-refactor-plan.md`](docs/internals/architecture-refactor-plan.md),
+  which gives the order, dependencies, acceptance rules and status of L1–L14 and Track T.
+- Measurements and the shape of each item: `docs/internals/code-quality-2026-10.md`.
+- In progress: L1 (lane SC) and L2. Ready to brief: A1, A3, A5, S-c and C3's first PR.
+
 ### Modernization program (owner, 2026-09-02)
 
 Five items, in order. (0) is shipped; the rest are scheduled against it.
