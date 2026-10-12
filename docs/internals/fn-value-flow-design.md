@@ -345,7 +345,7 @@ true for calls and false for deliveries.**
   with `call2`'s parameters at `(i32) => i32` and `(string) => string`, and so are i08 and
   i08c. The first delivery into a concrete parameter binds the binding's type variables.
   `call2(id, id)` runs, and so does a call through `h` placed before the delivery. Filed as
-  **D4017** (#3533; unfiled: D4017), clause 2. It grades the same with #3508 applied.
+  **D4017** (#3533), clause 2. It grades the same with #3508 applied.
 
 **Ownership.** D4017 belongs to lane CK, as #3508's follow-up. Its fix is the table's own
 notion of a pin, applied in the checker: a delivery into a concretely function-typed slot
@@ -378,7 +378,7 @@ a READ (it asks for the class's signature at a node). The outcome column is mast
 | `?.` member read | edge, field to the nullable result | p09 | emit reject (`?.` has no rep for a closure leaf) |
 | nullable slot `F \| null`, `!= null` narrowing | edge, same slot | p07 | runs |
 | union slot `F \| i32`, `is` narrowing | edge, `arm(s, k)` | p08, D3944 | traps |
-| `as?` / `as!` to a function arm | read at the arm | concrete control | emit reject for ANY function arm (**D4018**, #3533; unfiled: D4018), not this design's |
+| `as?` / `as!` to a function arm | read at the arm | concrete control | emit reject for ANY function arm (**D4018**, #3533), not this design's |
 | if-expr, `match` expression, `??`, labelled-block `break @B v` | edge, each arm to the result | D3941, p12, p04 | traps / emit reject / emit reject |
 | return and tail value | edge to `ret(fn)` | i06, p11 | emit reject |
 | parameter default `= id` | pin at the parameter's type | p01 | check reject: defaults must be a literal or a module `const` (DESIGN, out of scope) |
