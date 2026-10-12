@@ -9974,14 +9974,48 @@ export function monoStubValueOk(fe: i32, at: i32): boolean {
 }
 
 // Records the generic function names in binding `d`'s initializer, directly or as list elements
-// or record fields, when `d` is un-annotated and every use of it is its length or a write to it.
+// or record fields, when `d` is un-annotated and no use of it can reach one: every use is a write,
+// a list's `.length`, or a record field read whose value holds no generic function.
 function monoNoteInertInit(d: LetDecl, at: i32, ctx: i32) {
   if d.letType >= 0 { return 0 }
   const xs: i32[] = []
   monoGenericValuesIn(d.letInit, xs, 0)
   if xs.length == 0 { return 0 }
-  if !monoBindingReadOnlyForLength(ctx, d.letName, at) { return 0 }
+  const cold = monoInertProps(d.letInit)
+  if !monoBindingUsesAreInert(ctx, d.letName, at, cold) { return 0 }
   for x in xs { monoInertValues.push(x) }
+  0
+}
+
+// The properties of value `v` whose read cannot reach a generic function in it: a list's
+// `length`, or a record literal's fields that hold none. A record's `length` is a field (D4123).
+function monoInertProps(v: i32): string[] {
+  const out: string[] = []
+  const x = unwrapParen(v)
+  if x < 0 { return out }
+  const t = nodeTyIxOf(x)
+  if t >= 0 && t < T.tys.length && T.tys[t] is TyArray {
+    out.push("length")
+    return out
+  }
+  monoColdFieldsOf(x, out)
+  out
+}
+
+// The record-literal arm of `monoInertProps`: appends each field of `x` holding no generic
+// function; every other kind has no field a read could name.
+function monoColdFieldsOf(x: i32, out: string[]) {
+  const n = P.nodes[x]
+  if n is ObjLit {
+    for fi in n.objFields {
+      const f = P.nodes[fi]
+      if f is FieldInit {
+        const hot: i32[] = []
+        monoGenericValuesIn(f.fiValue, hot, 1)
+        if hot.length == 0 { out.push(f.fiName) }
+      }
+    }
+  }
   0
 }
 
@@ -10014,12 +10048,13 @@ function monoGenericFieldValuesIn(x: i32, out: i32[], depth: i32) {
   0
 }
 
-// Whether every use in frame `fx`'s body of the binding `name` declared at `decl` is `name.length`
-// or the target of a write.
-function monoBindingReadOnlyForLength(
+// Whether every use in frame `fx`'s body of the binding `name` declared at `decl` is `name.p` for
+// a `p` in `cold`, or the target of a write.
+function monoBindingUsesAreInert(
   fx: i32,
   name: string,
   decl: i32,
+  cold: string[],
 ): boolean {
   const stack: i32[] = []
   const lens: i32[] = []
@@ -10035,7 +10070,7 @@ function monoBindingReadOnlyForLength(
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
       if n is Member {
-        if n.memProp == "length" { lens.push(n.memObj) }
+        if strListHas(cold, n.memProp) { lens.push(n.memObj) }
       }
       if n is BinExpr {
         if n.binOp == "=" { lens.push(n.binLeft) }
