@@ -89,5 +89,4 @@ D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D38
 D3985-D3989  lane-CK  2026-10-10  ruling-C follow-ups: rows the r5 review of #3500 found
 D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)
 D4000-D4009  lane-PF  2026-10-11  DV-1000/DV-1001 V8 perf (diderven): D4000 range-analysis guard folding, later residues
-D4010-D4019  lane-SC  2026-10-11  rv3517 price and residue (D3979 siblings, p01 param shadow)
 D4040-D4049  lane-L2  2026-10-11  kind-grid findings from `scripts/twin-agreement.py` (D4040-D4044 filed open), stage-2 byte-change rows
