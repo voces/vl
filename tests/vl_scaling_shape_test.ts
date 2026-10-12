@@ -457,8 +457,12 @@ const spawn = async (
   const t0 = Date.now();
   const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...extra };
   if (fuel) env.VL_FUEL = "1";
-  const { code, stdout, stderr } = await new Deno.Command("/bin/sh", {
-    args: ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
+  // Windows has no `times` that sees a native child's CPU: cpu-times.ps1 prints the same line.
+  const win = Deno.build.os === "windows";
+  const { code, stdout, stderr } = await new Deno.Command(win ? "powershell" : "/bin/sh", {
+    args: win
+      ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${ROOT}/tests/support/cpu-times.ps1`, VL, ...argv]
+      : ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
     stdout: "piped",
     stderr: "piped",
     env,

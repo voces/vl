@@ -29,7 +29,8 @@ import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-VL = os.environ.get("VL", "scripts/vl-host/target/release/vl")
+# normpath: Windows cannot spawn a relative path spelled with `/`.
+VL = os.path.normpath(os.environ.get("VL", "scripts/vl-host/target/release/vl"))
 # THE `std:` A GRADE READS IS THIS CHECKOUT'S, NOT THE BINARY'S. The host resolves `std:`
 # off the executable's ancestors, and an agent worktree symlinks
 # `scripts/vl-host/target` at the MAIN repo — so without this every cell was graded against

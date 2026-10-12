@@ -3542,7 +3542,36 @@ fn report_guest_fuel(store: &Store<()>) {
     }
 }
 
-/// The process's resident set in bytes, from `/proc/self/statm`; 0 where that is unreadable.
+/// The process's resident set in bytes, from `/proc/self/statm` (on Windows the working set);
+/// 0 where that is unreadable.
+#[cfg(windows)]
+fn resident_bytes() -> u64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+    // SAFETY: a pseudo-handle for this process and a buffer of the size `cb` declares.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    if ok == 0 { 0 } else { c.working_set_size as u64 }
+}
+
+#[cfg(not(windows))]
 fn resident_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
