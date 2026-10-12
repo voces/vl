@@ -147,6 +147,7 @@ import {
   tyLitSetMemberLexes,
   tyLitUnionAliasIx,
   tyNulLitUnionInner,
+  tyNulLitUnionMemberTexts,
   tyNulNumScalarValKind,
   tyNumLitMemberTexts,
   tyPrimNameOf,
@@ -802,6 +803,7 @@ import {
   coalesceNulRefNicheOperand,
   coalesceOperandPinNonNull,
   coalesceResultUnionName,
+  coalesceRetypedAtomToStr,
   criFnIsAnonLambda,
   currentNarrowSetAt,
   currentNarrowSetIdAt,
@@ -1022,6 +1024,7 @@ import {
   memReadNarrowOp,
   memReadUnboxAtomKind,
   memberCallYieldsValue,
+  memberLenWidensAtom,
   memberUnionFieldNameRead,
   mfCallbackCloKey,
   mfCallbackFe,
@@ -16430,6 +16433,13 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
     }
   }
   if scoped { scopePop() }
+  // The same dropped null when a member `??` default keeps the join an atom, typed at the union
+  // or, with no pin, at a bare valtype (D3290).
+  const jpin = nodeTyPinIxOf(ifIx)
+  const atomJoin = tyIsLitUnion(jpin) || (how == 0 && jpin < 0)
+  if how != 1 && atomJoin && strJoinDropsNulAtom(ifIx, fnIx) {
+    return refuseJoinDropsNul(ifIx)
+  }
   if how == 1 { return emitAllNullIf(body, ifIx, fnIx) }
   if how == 2 {
     const savedLU = pendingLitUnion
@@ -16508,15 +16518,7 @@ function emitIfExprRef(
   // An `else if` chain is emitted along its spine, so its depth costs no stack (D1990): each
   // link leaves its frame open for the next, and the frames close innermost-first.
   if kind == "str" && strJoinDropsNulAtom(ifIx, fnIx) {
-    // Anchored at the condition, which an instance shares with the source: a rebuilt `if`
-    // has no token of its own.
-    let at = ifIx
-    const sj = P.nodes[unwrapParen(ifIx)]
-    if sj is IfStmt { at = sj.ifCond }
-    return emitFailAt(
-      "emitProgram: a string join whose arm is a nullable literal union was typed non-null here",
-      at,
-    )
+    return refuseJoinDropsNul(ifIx)
   }
   const open: i32[] = []
   let cur = ifIx
@@ -16533,6 +16535,26 @@ function emitIfExprRef(
   closeIfChainFrames(open, rc, false)
 }
 
+// Whether join arm `armIx` holds a `K | null` atom at this instance: by its pin, or, for a hole
+// operand whose arm records no pin of its own, by the operand's pinned type.
+function joinArmHoldsNulAtom(armIx: i32, fnIx: i32): boolean {
+  if armIx < 0 { return false }
+  if nulAtomWidenTexts(armIx).length > 0 { return true }
+  tyNulLitUnionMemberTexts(holeOperandTyOf(armIx, fnIx)).length > 0
+}
+
+// Refuses the join at `ifIx` that `strJoinDropsNulAtom` names, anchored at its condition, which
+// an instance shares with the source: a rebuilt `if` has no token of its own.
+function refuseJoinDropsNul(ifIx: i32): i32 {
+  let at = ifIx
+  const sj = P.nodes[unwrapParen(ifIx)]
+  if sj is IfStmt { at = sj.ifCond }
+  emitFailAt(
+    "emitProgram: a string join whose arm is a nullable literal union was typed non-null here",
+    at,
+  )
+}
+
 // Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
 // `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
 // as a generic's `??` joined with a nullable pin's other side does (D3290).
@@ -16544,14 +16566,14 @@ function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
     const s = P.nodes[unwrapParen(cur)]
     cur = -1
     if s is IfStmt {
-      const tv = ifArmValueExpr(s.ifThen)
-      if tv >= 0 && nulAtomWidenTexts(tv).length > 0 { widens = true }
+      if joinArmHoldsNulAtom(ifArmValueExpr(s.ifThen), fnIx) { widens = true }
       if s.ifElse >= 0 {
         if P.nodes[s.ifElse] is IfStmt {
           cur = s.ifElse
         } else {
-          const ev = ifArmValueExpr(s.ifElse)
-          if ev >= 0 && nulAtomWidenTexts(ev).length > 0 { widens = true }
+          if joinArmHoldsNulAtom(ifArmValueExpr(s.ifElse), fnIx) {
+            widens = true
+          }
         }
       }
     }
@@ -29995,6 +30017,12 @@ function emitMemberNode(body: u8[], e: Member, exprIx: i32, fnIx: i32) {
   // length field — the list wrapper's `len` (field 1) or the string header's `len`
   // (field 2), a code-point count. `length` over any other receiver falls through to the struct path.
   if e.memProp == "length" {
+    // A string-literal union atom widens to its member's string, whose header holds the length.
+    if memberLenWidensAtom(e.memObj, fnIx) {
+      if emitAtomToStr(body, e.memObj, fnIx) < 0 { return -1 }
+      fbStrLen()
+      return 0
+    }
     if (
       exprArray(e.memObj, fnIx)
       || exprString(e.memObj, fnIx)
@@ -32955,6 +32983,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // same type, has a dead default: the fold the template's rewrite makes of a concrete one.
   if fnInPinnedInstance(fnIx) && coalRetypedDead(exprIx, lhsIx) {
     return emitExpr(body, lhsIx, fnIx)
+  }
+  if coalesceRetypedAtomToStr(exprIx, fnIx) {
+    return emitAtomToStr(body, lhsIx, fnIx)
   }
   // A read the narrowing pins to `null` may have been written since the test (a loop, a
   // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
