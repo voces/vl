@@ -1271,6 +1271,7 @@ import {
   monoInstantiatedAny,
   monoIsClashLit,
   monoPinnedSigsOf,
+  monoStubValueOk,
 } from "./emit_mono"
 import {
   armPreludeBindChain,
@@ -1278,7 +1279,7 @@ import {
   firstLocalDeclIn,
   rvPairOf,
 } from "./emit_collect"
-import { voidTwinForNode } from "./emit_rewrite"
+import { cboxIsWriteLet, voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
 import { monoGradualAsScalar, monoOrigNode } from "./emit_state"
 import {
@@ -20801,6 +20802,11 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
 // flow relies on explicit `return`s rather than block result types: an `if` is a void
 // structured block whose branches `return` on their own, so it never yields a value.
 
+// The value of the binding write being emitted, in place or moved to a local by the capture-cell
+// rewrite. A generic function written to a binding is instanced or refused by the
+// written-binding passes (D3939), so its stub is never called.
+let stubWriteRhs = 0 - 1
+
 // Lower an assignment `target = value` onto `body`: emit the value expression, then
 // `local.set <index>` for the target local. The target must be a bare `Ident` naming a
 // param or declared local (no member/indexed assignment in this slice).
@@ -20821,6 +20827,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
     const target = P.nodes[lhsIx]
     strSiteArm(binIx, fnIx)
     if target is Ident {
+      stubWriteRhs = unwrapParen(a.binRight)
       // the loop-local accumulator: a binding proven by `strAccScan` to append in place
       // into its own buffer's slack instead of allocating a fresh exact-fit string per
       // step — O(n) where the pairwise lowering is O(n^2). An unproven binding never reaches it.
@@ -25303,6 +25310,7 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the local's
   // slot. This `LetDecl`'s slot is the next cursor position, not name-resolved (a name
   // lookup would hit an outer same-named binding still in scope here).
+  if cboxIsWriteLet(s.letName) { stubWriteRhs = unwrapParen(s.letInit) }
   const slot = declSlotTake(stmtIx, 1)
   if slot < 0 || slot >= localIsRef.length {
     return emitFailAt(
@@ -29598,6 +29606,13 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
       // (`voidTwinForNode`), or the `>v`-sig call signature-checks against the wrong functype.
       const vtw = voidTwinForNode(exprIx, fe)
       if vtw >= 0 { return emitClosureValue(body, vtw, fnIx) }
+      if exprIx != stubWriteRhs && !monoStubValueOk(fe, exprIx) {
+        return emitFailAt(
+          "emitProgram: a generic function taken as a value reaches no call that fixes its type "
+            + "— annotate the destination's function type",
+          exprIx,
+        )
+      }
       return emitClosureValue(body, fe, fnIx)
     }
     // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
