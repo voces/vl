@@ -293,9 +293,10 @@ fixCase(
       "const a: u8[] = filled(16, 0 as! u8)\n" +
       "print(f(filled(f(g()), (0))) + a.length + u16le(g(), 0))\n",
   },
-  // The orphaned `filled` import and the now-redundant annotations go in the next round.
+  // The orphaned `filled` import and the now-redundant binding annotation go in the next
+  // round; `f`'s return annotation stays (DV-103).
   'import { u16le, zeroBytes } from "std:bytes"\n' +
-    "function f(b: u8[]) { return b.length }\n" +
+    "function f(b: u8[]): i32 { return b.length }\n" +
     "function g(): u8[] { return zeroBytes(4 * 2) }\n" +
     "const a = zeroBytes(16)\nprint(f(zeroBytes(f(g()))) + a.length + u16le(g(), 0))\n",
 );
@@ -383,6 +384,16 @@ fixCase(
     "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
 );
 
+fixCase(
+  "a method call on a receiver built from an earlier error imports nothing for it (DV-101)",
+  {
+    "main.vl": 'import { expect } from "std:test"\nconst g: i32[] = []\n' +
+      "expect(g.includes(1)).toEqual(false)\n",
+  },
+  'import { expect } from "std:test"\nimport { includes } from "std:array"\nconst g: i32[] = []\n' +
+    "expect(g.includes(1)).toEqual(false)\n",
+);
+
 // ---- files outside the module graph (diderven DV-004) ----------------------------------
 
 fixCase(
@@ -459,3 +470,32 @@ Deno.test({
     }
   },
 });
+
+fixCase(
+  "a private helper keeps its return annotation while a redundant local annotation goes (DV-103)",
+  {
+    "main.vl": "function usable(a: i32): boolean {\n  const ok: boolean = a > 0\n  return ok\n}\n" +
+      "print(usable(1))\n",
+  },
+  "function usable(a: i32): boolean {\n  const ok = a > 0\n  return ok\n}\nprint(usable(1))\n",
+);
+
+fixCase(
+  "a concrete function the generic initializer cannot be held at is not annotated",
+  {
+    "main.vl": "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+      "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+  },
+  "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+    "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+);
+
+fixCase(
+  "a non-numeric cast to the type its operand already has is dropped, keeping the operand",
+  {
+    "main.vl": "function g(t: string | i32) {\n  if t is string {\n    print((t as! string).length)\n" +
+      "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s as string)\n",
+  },
+  "function g(t: string | i32) {\n  if t is string {\n    print((t).length)\n" +
+    "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s)\n",
+);

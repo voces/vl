@@ -81,6 +81,7 @@ import {
   modPendingCount,
   modReset,
   rcoalModuleAt,
+  redunIsReturnAt,
   redunModuleAt,
   srcReset,
   srcSetStr,
@@ -185,6 +186,7 @@ const ST_TEST_ENQUEUED = 17  // the host queued one file for the compile pool
 const ST_TEST_POOLED = 18    // the host committed every queued file's compile outcome
 const ST_SIB_LIST = 19       // got the listing of the checked file's own directory
 const ST_SIB_READ = 20       // got a file outside the module graph, read for its exports
+const ST_VALIDATE_READ = 21  // got a named file's source while checking every path exists
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -247,6 +249,7 @@ let cliBatchUnread = 0
 // order is argv order with each directory's own files sorted inside it.
 let cliTargets: string[] = []
 let cliTargetIdx = 0
+let cliValIdx = 0               // cursor of the all-paths-exist pass (`cliValidateNext`)
 let cliTargetFileBase = 0       // where the current target's slice of cliFiles begins
 let cliDirMode = 0              // 1 = the file being checked came from a directory walk (file-count noun, no per-stage note)
 let cliWalkStack: string[] = [] // directories still to list (DFS work-stack, full paths)
@@ -353,6 +356,13 @@ let cliZbLine: i32[] = []
 let cliZbCol: i32[] = []
 let cliZbEndLine: i32[] = []
 let cliZbEndCol: i32[] = []
+// The spans of this file's redundant casts (`cliNoteCastFix`), as `cliZb*`, and how many
+// characters from each span's start are the operand the fix keeps.
+let cliRcLine: i32[] = []
+let cliRcCol: i32[] = []
+let cliRcEndLine: i32[] = []
+let cliRcEndCol: i32[] = []
+let cliRcKeep: i32[] = []
 // The annotations to insert after a binding's name, from refusals of a concrete function written
 // to a generic `let` (`cliNoteGenBindFix`): 1-based line, 0-based column, and the type text.
 let cliGbLine: i32[] = []
@@ -516,6 +526,7 @@ export function cliArgReset() {
   cliBatch = 0
   cliTargets = []
   cliTargetIdx = 0
+  cliValIdx = 0
   cliTargetFileBase = 0
   cliDirMode = 0
   cliWalkStack = []
@@ -1159,12 +1170,8 @@ function cliParseArgs() {
       cliAddExclude(a.slice(10, a.length))
     } else if cliIsFlag(a) {
       cliUsageErr(sub + ": unknown flag `" + a + "`")
-    } else if a.length > 0 && (cliBatch != 0 || cliTargets.length == 0) {
-      cliTargets.push(a)
     } else if a.length > 0 {
-      cliUsageErr(
-        sub + ": unexpected extra argument `" + a + "` (one path per run)",
-      )
+      cliTargets.push(a)
     }
     i = i + 1
   }
@@ -1232,10 +1239,7 @@ function cliIngestEntries(base: string, relBase: string) {
       // discovery predicate is the one thing the walk does differently.
       let wanted = cliEndsVl(name)
       if cliCmd == 2 { wanted = cliEndsTestVl(name) }
-      if wanted && !cliExcluded(rel, name) {
-        cliFiles.push(child)
-        cliFileFromDir.push(1)
-      }
+      if wanted && !cliExcluded(rel, name) { cliAddFile(child, 1) }
     }
     i = i + 1
   }
@@ -1306,6 +1310,11 @@ function cliCheckCurFileRest() {
   cliZbCol = []
   cliZbEndLine = []
   cliZbEndCol = []
+  cliRcLine = []
+  cliRcCol = []
+  cliRcEndLine = []
+  cliRcEndCol = []
+  cliRcKeep = []
   cliGbLine = []
   cliGbCol = []
   cliGbAnnot = []
@@ -1330,6 +1339,7 @@ function cliCheckCurFileRest() {
       cliNoteImportFix(i)
       cliNoteZeroBytesFix(i)
       cliNoteGenBindFix(i)
+      cliNoteCastFix(i)
     }
     i = i + 1
   }
@@ -1740,7 +1750,13 @@ function cliFinishSummary() {
       note = " (failing at severity " + cliSeverity + ")"
     }
     let stageNote = ""
-    if cliBatch == 0 && cliDirMode == 0 && cliErrors > 0 && cliLastStage != "" {
+    if (
+      cliBatch == 0
+      && cliDirMode == 0
+      && cliFiles.length == 1
+      && cliErrors > 0
+      && cliLastStage != ""
+    ) {
       stageNote = " (" + cliLastStage + " error)"
     }
     const text = "Found " + parts + "." + note + stageNote
@@ -1813,6 +1829,9 @@ function cliTestWorkerDone(code: i32, msg: string) {
 function cliStartTestFile() {
   if cliFileIdx >= cliFiles.length { return cliTestBeginCollect() }
   cliCurFile = cliFiles[cliFileIdx]
+  if cliFileIdx < cliFileFromDir.length {
+    cliDirMode = cliFileFromDir[cliFileIdx]
+  }
   cliTestFileErr.push("")
   const ci = cliSrcCacheGet(cliCurFile)
   if ci >= 0 && cliSrcCacheFound[ci] != 0 {
@@ -2153,6 +2172,8 @@ function cliClassifyTarget() {
     cliFile = cliFile.slice(0, cliFile.length - 1)
   }
   cliTargetFileBase = cliFiles.length
+  cliDirNames = []
+  cliDirIsDirs = []
   cliCmdPath = cliFile
   cliState = ST_CLASSIFY
   CMD_LIST_DIR
@@ -2189,9 +2210,83 @@ function cliWalkStep() {
     cliExit = 0
     return cliBeginPrint()
   }
+  cliValIdx = 0
+  cliValidateNext()
+}
+
+// Several paths: every named file must exist before any is checked, formatted or run, so a
+// typo in the last path cannot leave the first ones half fixed. A read that succeeds is
+// cached for the work loop. One path, or `--batch`, keeps its own per-file answer.
+function cliValidateNext() {
+  if cliBatch == 0 && cliTargets.length > 1 {
+    while cliValIdx < cliFiles.length {
+      const f = cliFiles[cliValIdx]
+      if cliFileFromDir[cliValIdx] == 0 && cliSrcCacheGet(f) < 0 {
+        cliCmdPath = f
+        cliState = ST_VALIDATE_READ
+        return CMD_READ_FILE
+      }
+      cliValIdx = cliValIdx + 1
+    }
+  }
   cliFileIdx = 0
   cliStartWork()
 }
+
+// The subcommand's name, for a usage line.
+function cliSubName(): string {
+  if cliCmd == 1 { return "fmt" }
+  if cliCmd == 2 { return "test" }
+  "check"
+}
+
+// Add `path` to the work-list unless an earlier target already named the same file (the
+// spellings `./a.vl` and `a.vl` are one file). `--batch` keeps every entry: its records
+// line up with the caller's list.
+function cliAddFile(path: string, fromDir: i32) {
+  if cliBatch == 0 {
+    const key = cliPathKey(path)
+    for f in cliFiles {
+      if cliPathKey(f) == key { return 0 }
+    }
+  }
+  cliFiles.push(path)
+  cliFileFromDir.push(fromDir)
+  0
+}
+
+// `path` with `.` and `..` segments and repeated `/`s removed, for comparing two spellings.
+// Lexical: a `..` cancels the segment before it, and one above the root of an absolute path
+// is dropped, so a symlinked directory can make two different files share a key.
+function cliPathKey(path: string): string {
+  const segs: string[] = []
+  const abs = path.length > 0 && path[0] == '/'
+  let start = 0
+  let i = 0
+  while i <= path.length {
+    if i == path.length || path[i] == '/' {
+      const seg = path.slice(start, i)
+      if seg == ".." {
+        if segs.length > 0 && segs[segs.length - 1] != ".." { segs.pop() }
+        else if !abs { segs.push(seg) }
+      } else if seg != "" && seg != "." {
+        segs.push(seg)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  let out = ""
+  if abs { out = "/" }
+  let k = 0
+  while k < segs.length {
+    if k > 0 { out = out + "/" }
+    out = out + segs[k]
+    k = k + 1
+  }
+  out
+}
+
 // Dispatch the per-file loop on the subcommand: `check` runs the checker, `fmt`
 // reformats.
 function cliStartWork() {
@@ -2443,15 +2538,15 @@ function cliCollectFixes(src: string) {
     cliImportFixEdits(src, lb, impOff, starts, "unused import")
   }
   cliZeroBytesEdits(src, starts)
+  cliCastEdits(src, starts)
   cliGenBindEdits(starts, src.length)
   cliMissingImportEdits(src, starts)
-  // Redundant type annotations: rewrite `let x: T = init` → `let x = init` by replacing
-  // the span from the name end to the `=` with a single space. The checker computed
-  // that span with a depth-aware token scan, so a multi-token or function-type
-  // annotation is handled. Entry module only: only the entry's positions map onto `src`.
+  // Redundant binding annotations: `let x: T = init` → `let x = init`, the checker's
+  // depth-aware span replaced by one space; entry module only. A return annotation is
+  // signature documentation, so it is hinted but never removed here.
   let rk = 0
   while rk < redunCount() {
-    if redunModuleAt(rk) == 0 {
+    if redunModuleAt(rk) == 0 && !redunIsReturnAt(rk) {
       const sl = redunSLineAt(rk) - 1
       const el = redunELineAt(rk) - 1
       if sl >= 0 && sl < starts.length && el >= 0 && el < starts.length {
@@ -2672,6 +2767,53 @@ function cliPushFixRepl(
   cliFixEditWhat.push(what)
   cliFixEditLine.push(ln)
   cliFixEditCol.push(off - starts[ln - 1])
+  0
+}
+
+// Diagnostic `i` is a cast that does nothing: note its span and the operand length it keeps.
+function cliNoteCastFix(i: i32) {
+  if vcDiagCode(i) != "redundant-cast" { return 0 }
+  const kv = cliDataVals(vcDiagData(i), "keep")
+  if kv.length != 1 { return 0 }
+  let keep = 0
+  for c in kv[0] {
+    if c < '0' || c > '9' { return 0 }
+    keep = keep * 10 + (c - '0')
+  }
+  cliRcLine.push(diagLine(i))
+  cliRcCol.push(diagCol(i))
+  cliRcEndLine.push(diagEndLine(i))
+  cliRcEndCol.push(diagEndCol(i))
+  cliRcKeep.push(keep)
+  0
+}
+
+// The edits replacing each noted cast with its operand's own text.
+function cliCastEdits(src: string, starts: i32[]) {
+  let k = 0
+  while k < cliRcLine.length {
+    const sl = cliRcLine[k] - 1
+    const el = cliRcEndLine[k] - 1
+    if sl >= 0 && sl < starts.length && el >= 0 && el < starts.length {
+      const so = starts[sl] + cliRcCol[k]
+      const eo = starts[el] + cliRcEndCol[k]
+      if (
+        so >= 0
+        && eo <= src.length
+        && cliRcKeep[k] > 0
+        && so + cliRcKeep[k] < eo
+      ) {
+        cliPushFixRepl(
+          so,
+          eo - so,
+          src.slice(so, so + cliRcKeep[k]),
+          "redundant cast",
+          starts,
+        )
+      }
+    }
+    k = k + 1
+  }
   0
 }
 
@@ -3214,6 +3356,7 @@ function cliFixCommit() {
 function cliStartFmtFile() {
   if cliFileIdx >= cliFiles.length { return cliFmtFinish() }
   cliCurFile = cliFiles[cliFileIdx]
+  cliDirMode = cliFileFromDir[cliFileIdx]
   cliCmdPath = cliCurFile
   cliState = ST_FMT_READ
   CMD_READ_FILE
@@ -3325,11 +3468,20 @@ export function cliNext() {
     // A file, or a missing path — the caller NAMED it, so it goes on the work-list as
     // itself and a read miss is reported against it rather than skipped.
     cliDirMode = 0
-    cliFiles.push(cliFile)
-    cliFileFromDir.push(0)
-    if cliBatch != 0 { return cliWalkStep() }
+    cliAddFile(cliFile, 0)
+    if cliBatch != 0 || cliTargets.length > 1 { return cliWalkStep() }
     cliFileIdx = 0
     return cliStartWork()
+  }
+  if st == ST_VALIDATE_READ {
+    if cliFileFound == 0 {
+      cliOut = [cliSubName() + ": cannot read " + cliFiles[cliValIdx]]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    cliSrcCachePut(cliFiles[cliValIdx], cliFileSrc, 1)
+    cliValIdx = cliValIdx + 1
+    return cliValidateNext()
   }
   if st == ST_WALK {
     cliIngestEntries(cliCurDir, cliCurRel)
@@ -3342,7 +3494,7 @@ export function cliNext() {
       // record of its own, so the caller's file list and the records line up.
       if cliBatch != 0 { return cliBatchUnreadable() }
       if cliDirMode == 0 {
-        cliOut = ["check: cannot read " + cliFile]
+        cliOut = ["check: cannot read " + cliCurFile]
         cliExit = 2
         return cliBeginPrint()
       }
@@ -3404,7 +3556,7 @@ export function cliNext() {
   if st == ST_FMT_READ {
     if cliFileFound == 0 {
       if cliDirMode == 0 {
-        cliOut = ["fmt: cannot read " + cliFile]
+        cliOut = ["fmt: cannot read " + cliCurFile]
         cliExit = 2
         return cliBeginPrint()
       }
@@ -3452,7 +3604,7 @@ export function cliNext() {
       // A named target that does not exist is a usage error; a file that vanished
       // between the walk and the read is one failing entry.
       if cliDirMode == 0 && cliTestPoolMode != 2 {
-        cliOut = ["test: cannot read " + cliFile]
+        cliOut = ["test: cannot read " + cliCurFile]
         cliExit = 2
         return cliBeginPrint()
       }
