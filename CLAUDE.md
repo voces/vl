@@ -382,10 +382,32 @@ row per refusal literal a witness reaches, 21 of them, all invisible to the word
 `run.py --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
 probe. `docs/internals/emit-refusal-wording-2026-09.md`.
 
-**And the distilled corpus contributes ZERO emit-side evidence** — `baseline.jsonl` is 4,620
-`runs` plus 2,944 `loud check reject`, with no emit rejects and no silent cells. That is why
-`goal-scoreboard.py` can print `total against the goal 0` while ~500 refusal sites stand, and
-it is the sharpest available statement of the "name the population in the sentence" rule.
+**The corpus's emit-side evidence comes only from its CURATED half.** On 2026-10-11
+`baseline.jsonl` held 10,065 cells:
+
+* 5,932 `runs` and 3,258 `loud check reject`;
+* 667 `loud emit reject`;
+* 208 clause-1 cells: 144 `runs but wrong value`, 54 `check-clean invalid wasm` and
+  10 `trap_loads`.
+
+All 875 cells against the goal are in `named/`, and every one is a review's PRICE: the cells
+a candidate moved loud→silent into a defect master already had. The 1,477 DERIVED cells are
+still only `runs` (1,223) and `loud check reject` (254). So the census's behavioural classes
+carry no emit reject and no silent cell. The 875 measure what reviews looked at, not how
+often the language fails.
+
+**Triage the clause-1 cells by ablation, not by message.** Their 30 distinct messages fall
+into 12 families, and every family has a row:
+
+* D3423 holds 118 of the 208;
+* D3361 holds 24, and D3367 holds 20;
+* D4046 holds 18;
+* D3336 holds 5;
+* D3357, D3369 and D2594 hold 4 each;
+* D3346, D2595 and D3961 hold 3 each;
+* D3398 holds 2.
+
+The other ~500 refusal sites still have no corpus cell. Name the population in the sentence.
 
 **AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until #2122 the predicate
 matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the

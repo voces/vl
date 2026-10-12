@@ -96,6 +96,7 @@ import {
   arenaEpochNow,
   arenaNoteEdit,
   arenaSetNode,
+  braceNameStmts,
   brkValSeen,
   callIsNever,
   callIsRestPacked,
@@ -14936,6 +14937,9 @@ function isvalReset() {
   fnLitBindName = []
   fnLitBindDecl = []
   fsbReset()
+  callBindRow = Map()
+  callBindNames = []
+  callBindTys = []
   nlnDiag = []
   nlnMsg = []
   nlnText = []
@@ -15281,6 +15285,8 @@ let lbiInlinedName: {[i32]: string} = Map()
 // Each editor occurrence recorded for a rewritten read, and its node, whose type hover shows.
 let lbiOccIx: i32[] = []
 let lbiOccNode: i32[] = []
+// The declaration of the `const` each rewritten read names, by node, for a diagnostic's note.
+let lbiInlinedDecl: {[i32]: i32} = Map()
 // The type a rewritten read meets where it stands, by node, for hover.
 let lbiUseTy: {[i32]: i32} = Map()
 // The same, only where it is the type the read compiles at: a delivery into a number, or an
@@ -15294,6 +15300,7 @@ export function lbiArenaReset() {
   lbiSynth = Map()
   lbiInlined = Map()
   lbiInlinedName = Map()
+  lbiInlinedDecl = Map()
   cexFolded = Map()
   cexNotTree = Map()
   0
@@ -15848,6 +15855,10 @@ function lbiConstLitAt(ix: i32, name: string): i32 {
 // each read of a literal `const` is checked and lowered as the literal written there. Answers `ix`.
 function lbiInlineLit(ix: i32, lit: i32, pos: i32, name: string): i32 {
   lbiInlinedName[ix] = name
+  if !(lbiDefaultExpr[ix] ?? false) {
+    const c = lbiCandOfName(name, sidOfNode(ix))
+    if c >= 0 && c < lbiCands.length { lbiInlinedDecl[ix] = lbiCands[c] }
+  }
   const neg = lbiNegArg(lit)
   if neg < 0 {
     const l = P.nodes[lit]
@@ -16419,6 +16430,143 @@ function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
       + " for its bit pattern"
   }
   "constant " + shown + " overflows " + tyName
+}
+
+// When `at` is the name braced as a whole statement, `{ steps }`, and `want` is a one-field record
+// of that name that the name's own type does not already fit: a note that the braces are a block,
+// not the record shorthand (DV-1216).
+function braceNameNote(at: i32, want: i32): string {
+  if at < 0 || at >= P.nodes.length || want < 0 || want >= T.tys.length {
+    return ""
+  }
+  if !i32ListHas(braceNameStmts, at) { return "" }
+  const e = P.nodes[at]
+  const w = T.tys[want]
+  if e is Ident && w is TyObj {
+    if w.objFieldNames.length != 1 { return "" }
+    if assignable(nodeTyOf(at), want) { return "" }
+    if objFieldType(w, e.identName) >= 0 {
+      return " — `{ "
+        + e.identName
+        + " }` here is a block, not a record; write `({ "
+        + e.identName
+        + " })` for the record"
+    }
+  }
+  ""
+}
+
+// The name braced as the whole last statement of block `body`, `{ steps }`, or -1.
+function braceNameTail(body: i32): i32 {
+  if body < 0 || body >= P.nodes.length { return -1 }
+  const b = P.nodes[body]
+  if b is Block {
+    if b.blkStmts.length == 0 { return -1 }
+    const last = P.nodes[b.blkStmts[b.blkStmts.length - 1]]
+    if last is Block {
+      if (
+        last.blkStmts.length == 1
+        && i32ListHas(braceNameStmts, last.blkStmts[0])
+      ) {
+        return last.blkStmts[0]
+      }
+    }
+  }
+  -1
+}
+
+// For an `i64` value delivered into `i32`: when a read of a literal `const` in it, through integer
+// operators and `if`, `match` and block tails, overflows `i32`, a note naming that constant, its
+// value and its line, since it alone made the value `i64` (DV-1215). "" when there is none.
+function cexWideConstNote(srcExpr: i32): string {
+  const todo: i32[] = [srcExpr]
+  let guard = 0
+  let found = ""
+  let indep = false
+  while todo.length > 0 && guard < CEX_DEPTH * 8 {
+    guard = guard + 1
+    const at = cwPeel(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { continue }
+    const nm = lbiInlinedName[at] ?? ""
+    if nm != "" {
+      const lit = cexLitPeel(at)
+      if lit >= 0 {
+        const l = P.nodes[lit]
+        if l is NumLit {
+          let v = cexOfLexeme(l.numText)
+          if intLitIsNegated(at) { v = cexNeg(v) }
+          if (
+            !numLexIsFloat(l.numText)
+            && cexOk(v)
+            && !cexFitsAt(v, l.numText, TY_I32)
+          ) {
+            if found == "" { found = cexWideConstNoteFor(nm, at, v) }
+          }
+        }
+      }
+      continue
+    }
+    if (
+      tailPushIfArms(at, todo)
+      || tailPushMatchArms(at, todo)
+      || tailPushBlockTail(at, todo)
+    ) {
+      continue
+    }
+    if cexWidePushOperands(at, todo) && nodeTyOf(at) == TY_I64 { indep = true }
+  }
+  if indep { return "" }
+  found
+}
+
+// Queue the integer operands of `at` for `cexWideConstNote`. True when `at` is a leaf that could
+// make the value `i64` by itself: not a literal, not an operator.
+function cexWidePushOperands(at: i32, todo: i32[]): boolean {
+  const e = P.nodes[at]
+  if e is BinExpr {
+    if (
+      binIntOnlyOp(e.binOp)
+      || e.binOp == "+"
+      || e.binOp == "-"
+      || e.binOp == "*"
+      || e.binOp == "/"
+      || e.binOp == "%"
+    ) {
+      todo.push(e.binLeft)
+      todo.push(e.binRight)
+    }
+    return false
+  }
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "~" { todo.push(e.unArg) }
+    return false
+  }
+  if e is NumLit { return false }
+  cexWideLeaf()
+}
+
+// Every other node is a leaf whose `i64` the note does not look inside.
+function cexWideLeaf(): boolean { true }
+
+// The note `cexWideConstNote` gives for the read `at` of the constant `nm`, of value `v`.
+function cexWideConstNoteFor(nm: string, at: i32, v: Cex): string {
+  let where = ""
+  const d = lbiInlinedDecl[at] ?? -1
+  if d >= 0 && ufcsModOfNode(d) == ufcsModOfNode(at) {
+    const ln = nodeLineOf(d)
+    if ln > 0 { where = " (line " + i32ToStr(ln) + ")" }
+  }
+  let tail = ""
+  const pat = cexPatternHex(v, 32)
+  if pat != "" { tail = "; write " + pat + " for its bit pattern" }
+  " — `"
+    + nm
+    + "`"
+    + where
+    + " is the constant "
+    + cexShown(v)
+    + ", which overflows i32, so it reads as i64 here"
+    + tail
 }
 
 // `v` as a diagnostic quotes it: an integer in decimal, a float by its literal when that is short.
@@ -17462,6 +17610,61 @@ let fsbRowDecl: i32[] = []
 let fsbPendName: string[] = []
 let fsbPendIx: i32[] = []
 let fsbPendTy: i32[] = []
+// The per-call binding column: what each generic call bound, by call node, as the type-variable
+// names the callee's signature rides and the arena type each is bound to. Every non-speculative
+// check of the call overwrites its row, so a re-check pass's answer stands; `initChecker` empties it.
+let callBindRow: {[i32]: i32} = Map()
+let callBindNames: string[][] = []
+let callBindTys: i32[][] = []
+
+// The shadow's must-fire control: 1 records nothing, 2 records every type as the error type.
+// Only a host sets it (`callBindDropSet`), and only to prove the shadow sees the column.
+let callBindDrop = 0
+
+export function callBindDropSet(k: i32) {
+  callBindDrop = k
+  0
+}
+
+function callBindNote(ix: i32, names: string[], tys: i32[]) {
+  if inferQuiet || ix < 0 || callBindDrop == 1 { return 0 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  let i = 0
+  while i < names.length && i < tys.length {
+    nm.push(names[i])
+    if callBindDrop == 2 { ty.push(TY_ERR) } else { ty.push(tys[i]) }
+    i = i + 1
+  }
+  const r = callBindRow[ix] ?? -1
+  if r >= 0 {
+    callBindNames[r] = nm
+    callBindTys[r] = ty
+    return 0
+  }
+  callBindRow[ix] = callBindNames.length
+  callBindNames.push(nm)
+  callBindTys.push(ty)
+  0
+}
+
+// Whether call `ix` has a row: a generic call some full check pass resolved.
+export function callBindHas(ix: i32): boolean { (callBindRow[ix] ?? -1) >= 0 }
+
+// The arena type call `ix` bound type variable `name` to, or -1 when it has no row or bound
+// nothing there.
+export function callBindTyOf(ix: i32, name: string): i32 {
+  const r = callBindRow[ix] ?? -1
+  if r < 0 { return -1 }
+  const nm = callBindNames[r]
+  let i = 0
+  while i < nm.length {
+    if nm[i] == name { return callBindTys[r][i] }
+    i = i + 1
+  }
+  -1
+}
+
 // D3968 — the functions written to a marked binding, as the owners of their deferred constraints
 // (a written generic's declaration, else the body the write stands in), and every call through
 // such a binding with what it bound, so each owner's constraints are re-asked at that call.
@@ -17475,8 +17678,6 @@ let fsbCallIx: i32[] = []
 let fsbCallDecl: i32[] = []
 let fsbCallUsed: i32[] = []
 let fsbCallWho: string[] = []
-let fsbCallNames: string[][] = []
-let fsbCallTys: i32[][] = []
 let fsbCallHNames: string[][] = []
 let fsbCallHNo: i32[][] = []
 let fsbCallHNode: i32[][] = []
@@ -17497,8 +17698,6 @@ function fsbReset() {
   fsbCallDecl = []
   fsbCallUsed = []
   fsbCallWho = []
-  fsbCallNames = []
-  fsbCallTys = []
   fsbCallHNames = []
   fsbCallHNo = []
   fsbCallHNode = []
@@ -17682,8 +17881,6 @@ function fsbNoteCall(
   decl: i32,
   used: i32,
   who: string,
-  names: string[],
-  tys: i32[],
   hNames: string[],
   hNo: i32[],
   hNode: i32[],
@@ -17695,8 +17892,6 @@ function fsbNoteCall(
   fsbCallDecl.push(decl)
   fsbCallUsed.push(used)
   fsbCallWho.push(who)
-  fsbCallNames.push(names)
-  fsbCallTys.push(tys)
   fsbCallHNames.push(hNames)
   fsbCallHNo.push(hNo)
   fsbCallHNode.push(hNode)
@@ -17816,10 +18011,9 @@ function fsbNoteFnDelivery(src: i32, dst: i32) {
   const args: i32[] = []
   for p in f.fnParamTypes { args.push(p) }
   const none: string[] = []
-  const noTys: i32[] = []
   const noIx: i32[] = []
   const noNode: i32[] = []
-  fsbNoteCall(src, d, CSTR_ANYFN, "", none, noTys, none, noIx, noNode, args)
+  fsbNoteCall(src, d, CSTR_ANYFN, "", none, noIx, noNode, args)
 }
 
 // The parameter types of the called type `ft` under the call's bindings.
@@ -20451,13 +20645,16 @@ export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
 // `tErr` for a value delivered to a `want`-typed destination, which lets the numeric-literal note
 // find a literal binding inside a record, list or arithmetic value.
 function tErrWant(msg: string, at: i32, want: i32) {
+  let m = msg
   // An `i64` made only of constants, one of which overflows `i32`: that constant is the
-  // error, refused at its own span (D3780).
+  // error, refused at its own span (D3780). Beside other operands, the note names it.
   if want == TY_I32 && !inferQuiet && at >= 0 && nodeTyOf(at) == TY_I64 {
     if cexJoinMisfit(at) { return 0 }
+    m = m + cexWideConstNote(at)
   }
+  m = m + braceNameNote(at, want)
   nlWantTy = want
-  tErr(msg, at)
+  tErr(m, at)
   nlWantTy = -1
   0
 }
@@ -49696,6 +49893,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // constraints too — the same self-arrives-ahead-of-the-argument-loop asymmetry as above.
     if !inferQuiet {
       if bNames.length > 0 {
+        callBindNote(ix, bNames, bTys)
         // `params[0]` is the RECEIVER here, so the origins skip it (`selfOff` 1) and the
         // remaining parameters number from 1 — `xs.plus(y)` blames `argument 1`, not 2.
         const uhNames: string[] = []
@@ -51429,6 +51627,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       substNestMode = SUBST_ALL
     }
     const wsVd = T.diags.length
+    callBindNote(ix, vNames, vTys)
     pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
     if fsbName.length > 0 {
       fsbNoteCall(
@@ -51436,8 +51635,6 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         fsbDeclAtNode(n.callFn),
         cstrCallee,
         cstrWho,
-        vNames,
-        vTys,
         dhNames,
         dhArgNo,
         dhArgNode,
@@ -55688,12 +55885,29 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     && !bodyTotalForRet
     && !retNullableNow
   ) {
-    tErr(
-      "not all code paths return a value in '"
-        + n.fnName
-        + "' — add a `return`, or annotate the return type `| null` to fall through",
-      n.fnBody,
-    )
+    const bn = braceNameTail(n.fnBody)
+    if bn >= 0 && braceNameNote(bn, ret) != "" {
+      const bnm = P.nodes[bn]
+      let nm = ""
+      if bnm is Ident { nm = bnm.identName }
+      tErr(
+        "`{ "
+          + nm
+          + " }` here is a block, not a record — write `return { "
+          + nm
+          + " }` or `({ "
+          + nm
+          + " })`",
+        bn,
+      )
+    } else {
+      tErr(
+        "not all code paths return a value in '"
+          + n.fnName
+          + "' — add a `return`, or annotate the return type `| null` to fall through",
+        n.fnBody,
+      )
+    }
   }
   // Redundant return annotation: the body's natural inferred return already equals the
   // explicit `: T`, so removing it yields the identical type. Conservative: a single
