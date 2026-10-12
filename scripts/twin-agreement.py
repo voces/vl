@@ -54,11 +54,12 @@ TWINS = {
     if vak1 != vak2 {
       out = out + " [vak " + nm + " twin=" + i32ToStr(vak1) + " orig=" + i32ToStr(vak2) + "]"
     }'''),
-    # Two classes are excluded because the SPELLING is the wrong answer there: a function
-    # returning a list renders with a trailing `[]`, and a `T[]` over an unbound type variable
-    # renders "". The fixtures `*-beside-fn-arm`, `map-or-list-arm-empty-literal` and
+    # Two classes are excluded because the SPELLING is the wrong answer there: a function whose
+    # render ends in `[]` (it returns a list), and a list whose render is "" (a `T[]` over an
+    # unbound type variable). Every other row is compared, including a function returning a
+    # non-list and an empty render that is not a list. The fixtures `*-beside-fn-arm`, `map-or-list-arm-empty-literal` and
     # `list-of-param-arm-narrow-index` pin the call site over both.
-    "arr": ("emit_classify.vl", '''    if nm != "" && !(T.tys[i] is TyFunc) && tyIsArray(i) != nameIsArray(nm) {
+    "arr": ("emit_classify.vl", '''    if !(T.tys[i] is TyFunc && nameIsArray(nm)) && !(nm == "" && tyIsArray(i)) && tyIsArray(i) != nameIsArray(nm) {
       let arrT = "0"
       if tyIsArray(i) { arrT = "1" }
       let arrO = "0"
