@@ -8290,15 +8290,18 @@ fn read_cli_str(
     read_guest_str(n, |j| Ok(at.call(&mut *store, j)?))
 }
 
-/// Windows only: a path argument (`compiler\\entry.vl`) is handed to the guest with `/`
+/// Windows only: a host path argument (`compiler\entry.vl`) is handed to the guest with `/`
 /// separators. Module keys are `/`-separated (the guest joins a relative import onto its
-/// importer's directory by splitting at `/`), and Windows reads a `/` path as well as a `\\` one.
-/// Only an argument that names a `.vl` file or an existing path is touched, so flag values
-/// that merely contain a backslash pass through.
+/// importer's directory by splitting at `/`), and Windows reads a `/` path as well as a `\` one.
+/// Only an argument that names a `.vl` file or an existing path is touched, and everything
+/// from a literal `--` onward belongs to the program and passes through unchanged.
 fn slash_path_args(args: &[String]) -> Vec<String> {
+    let sep = args.iter().position(|a| a == "--").unwrap_or(args.len());
     args.iter()
-        .map(|a| {
-            let is_path = a.contains('\\')
+        .enumerate()
+        .map(|(i, a)| {
+            let is_path = i < sep
+                && a.contains('\\')
                 && (a.ends_with(".vl") || std::path::Path::new(a).exists());
             if cfg!(windows) && is_path { a.replace('\\', "/") } else { a.clone() }
         })
