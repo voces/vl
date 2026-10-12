@@ -120,6 +120,7 @@ import {
   numUnionMinted,
   primNameOf,
   primNameStr,
+  recArmPartialFields,
   recFitNarrowedFields,
   refViewReadonlyAt,
   simdRow,
@@ -128,6 +129,7 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
+  tyFitKind,
   tyHasTyVar,
   tyHoldsNumbersApart,
   tyIntLitWideTexts,
@@ -592,6 +594,7 @@ import {
   uSinkFired,
   uTags,
   uVarHeap,
+  uVarTyIx,
   uVariants,
   unionAsSlot,
   unionSinkBase,
@@ -805,6 +808,7 @@ import {
   coalesceResultUnionName,
   coalesceRetypedAtomToStr,
   criFnIsAnonLambda,
+  crossTagFitRows,
   currentNarrowSetAt,
   currentNarrowSetIdAt,
   declaredKind,
@@ -954,6 +958,7 @@ import {
   instancePinnedMaps,
   internAtom,
   internInlineShapeTy,
+  isFitsAcrossTagRows,
   isNulScalarListFieldCode,
   isNulScalarListKind,
   isScalarBackedListRep,
@@ -1246,6 +1251,7 @@ import {
   widenTmpSlot,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
+import { i32ListHas } from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
@@ -4022,7 +4028,12 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
       // runtime chain.
       const foldOk = !exprUnion(nd.isObj, fnIx)
         || (!variantHasDiscrimField(rvi)
-        && !variantHasDiscrimField(vi))
+        && !variantHasDiscrimField(vi)
+        && !isFitsAcrossTagRows(
+        nd.isVariant,
+        isVarTyIxOf(isIx),
+        nd.isObj,
+      ))
       if foldOk {
         if rvi == vi { fbI32Const(1) } else { fbI32Const(0) }
         return 0
@@ -4031,14 +4042,170 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
     if !exprUnion(nd.isObj, fnIx) {
       return emitFail("emitProgram: `is` receiver is not a union value")
     }
-    if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+    // A receiver the cross-arm terms re-read is evaluated once when it is not a place.
+    let ctSlot = -1
+    if (
+      isFitsAcrossTagRows(nd.isVariant, isVarTyIxOf(isIx), nd.isObj)
+      && !unionEqOperandOk(nd.isObj)
+    ) {
+      ctSlot = sharedFieldRecvSlot()
+      if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+      fbLocalSet(ctSlot)
+    }
+    if emitSharedFieldRecv(body, nd.isObj, fnIx, ctSlot) < 0 { return -1 }
     fbStructGet(uBoxIdx, 0)
     fbI32Const(uTags[vi])
     fbI32Bin(70)
     if emitVariantDiscrimTest(body, nd.isObj, vi, fnIx) < 0 { return -1 }
+    const ctIs = emitCrossTagFits(
+      body,
+      nd.isObj,
+      vi,
+      isVarTyIxOf(isIx),
+      fnIx,
+      ctSlot,
+    )
+    if ctIs < 0 { return -1 }
     return 0
   }
   emitFail("emitProgram: expected an `is` expression")
+}
+
+// `recv is X` over a box whose other arms sit under their own tags yet may hold values that fit
+// `X` (D4056): `i32.or`s onto the tag test one term per such arm `Y` — its tag alone when every
+// `Y` fits, else its tag and then, inside an `if`, a test of each field that only some values fit.
+function emitCrossTagFits(
+  body: u8[],
+  recv: i32,
+  vi: i32,
+  xTy: i32,
+  fnIx: i32,
+  slot: i32,
+): i32 {
+  const rows: i32[] = []
+  const kinds: i32[] = []
+  crossTagFitRows(vi, xTy, recv, rows, kinds)
+  let i = 0
+  while i < rows.length {
+    const yi = rows[i]
+    if emitSharedFieldRecv(body, recv, fnIx, slot) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Const(uTags[yi])
+    fbI32Bin(70)
+    if kinds[i] == 2 {
+      fbIf(127)
+      const ff = emitArmFieldsFit(body, recv, yi, uVarTyIx[yi], xTy, fnIx, slot)
+      if ff < 0 { return -1 }
+      fbElse()
+      fbI32Const(0)
+      fbEnd()
+    }
+    fbI32Bin(114) // i32.or
+    i = i + 1
+  }
+  0
+}
+
+// Leaves 1 when the payload of arm `yi` (arena `yTy`) fits record `xTy` field by field, given that
+// its tag already matched. A field only some values fit is either a scalar tested against the
+// literal set `xTy` narrows it to, or a box whose every member fits or does not, answered by its
+// tag. Anything finer is refused by name.
+function emitArmFieldsFit(
+  body: u8[],
+  recv: i32,
+  yi: i32,
+  yTy: i32,
+  xTy: i32,
+  fnIx: i32,
+  slot: i32,
+): i32 {
+  if yi < 0 || yi >= uVarHeap.length {
+    return emitFail(
+      "emitProgram: `is` across record arms names an arm with no row",
+    )
+  }
+  const names: string[] = []
+  const fys: i32[] = []
+  const fxs: i32[] = []
+  recArmPartialFields(xTy, yTy, names, fys, fxs)
+  let i = 0
+  while i < names.length {
+    const fi = variantFieldIndex(yi, names[i])
+    // A field that never holds `null` is tested against the set's non-null members alone.
+    let fxSet = fxs[i]
+    if nonNullTy(fys[i]) == fys[i] { fxSet = nonNullTy(fxSet) }
+    const lexes = tyLitSetMemberLexes(fxSet)
+    if fi >= 0 && variantFieldTypeAt(yi, fi) != FC_UNION && lexes.length > 0 {
+      let li = 0
+      while li < lexes.length {
+        if emitSharedFieldRecv(body, recv, fnIx, slot) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 1)
+        fbRefCast(uVarHeap[yi])
+        fbStructGet(uVarHeap[yi], fi)
+        if (
+          emitFieldLitEq(body, variantFieldTypeAt(yi, fi), lexes[li], fnIx)
+          < 0
+        ) {
+          return -1
+        }
+        if li > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        li = li + 1
+      }
+      if i > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      i = i + 1
+      continue
+    }
+    if fi < 0 || variantFieldTypeAt(yi, fi) != FC_UNION {
+      return emitFail(
+        "emitProgram: `is` across record arms whose shared field holds a value only some of which fit, outside a union box",
+      )
+    }
+    const yes: i32[] = []
+    const no: i32[] = []
+    const mems: i32[] = []
+    flattenVariantsInto(fys[i], mems)
+    for mm in mems {
+      const fk = tyFitKind(mm, fxs[i])
+      const tags: i32[] = []
+      const vis: i32[] = []
+      if fk == 2 || !unionArmTagsOfTy(mm, tags, vis) || tags.length != 1 {
+        return emitFail(
+          "emitProgram: `is` across record arms whose shared field's box holds a member only some of whose values fit",
+        )
+      }
+      if fk == 1 { yes.push(tags[0]) } else { no.push(tags[0]) }
+    }
+    for t in yes {
+      if i32ListHas(no, t) {
+        return emitFail(
+          "emitProgram: `is` across record arms whose shared field's box tags a fitting and a non-fitting member alike",
+        )
+      }
+    }
+    if yes.length == 0 { fbI32Const(0) }
+    let j = 0
+    while j < yes.length {
+      if emitSharedFieldRecv(body, recv, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1)
+      fbRefCast(uVarHeap[yi])
+      fbStructGet(uVarHeap[yi], fi)
+      fbStructGet(uBoxIdx, 0)
+      fbI32Const(yes[j])
+      fbI32Bin(70)
+      if j > 0 { fbI32Bin(114) }
+      j = j + 1
+    }
+    if i > 0 {
+      fbI32Bin(113) // i32.and
+    }
+    i = i + 1
+  }
+  if names.length == 0 { fbI32Const(1) }
+  0
 }
 
 // Lower a narrowed field read `recv.field` where `recv` is narrowed to `narrowVariant` by
@@ -6319,6 +6486,28 @@ function armDestHeapOf(kind: VKind, idx: i32): i32 {
   }
 }
 
+// Whether a box value fitting variant `vi` may be laid out as another arm (D4056), so its payload
+// cannot be cast to `vi`'s struct.
+function variantHasCrossTagFits(vi: i32, exprIx: i32): boolean {
+  if vi < 0 || vi >= uVarTyIx.length { return false }
+  const rows: i32[] = []
+  const kinds: i32[] = []
+  crossTagFitRows(vi, uVarTyIx[vi], exprIx, rows, kinds)
+  rows.length > 0
+}
+
+// The refusal for delivering such a box where `vi`'s own struct is expected: the value would
+// have to be copied into that layout, which would part it from the original.
+function emitFailCrossTagDelivery(exprIx: i32, vi: i32): i32 {
+  emitFailAt(
+    "emitProgram: a value that fits `"
+      + uVariants[vi]
+      + "` may be stored as another arm with that field-name set; delivering it as "
+      + "that arm would copy it",
+    exprIx,
+  )
+}
+
 // Coerce the expression at `exprIx` to the concrete variant `vi`'s rep `(ref $uVarHeap[vi])`.
 // The collapse boundary, where a callback typed as one variant meets a mix of reps: an object
 // literal builds the bare variant, a narrowed union value unboxes, an already-bare variant
@@ -6334,6 +6523,9 @@ function emitVariantCoerce(body: u8[], vi: i32, exprIx: i32, fnIx: i32) {
   }
   // A union BOX (a narrowed receiver still boxed at the wasm level): unbox to the variant.
   if exprUnion(exprIx, fnIx) {
+    if variantHasCrossTagFits(vi, exprIx) {
+      return emitFailCrossTagDelivery(exprIx, vi)
+    }
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     fbRefCast(uVarHeap[vi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
@@ -7641,12 +7833,14 @@ function sharedFieldPlanDispatchable(
     return false
   }
   if vis.length < 1 || fis.length != vis.length { return false }
-  if sharedFieldReadBoxes(code, vis[0], fis[0]) {
+  if sharedFieldAnyArmBoxes(code, vis, fis) {
     let b = 0
     while b < vis.length {
-      const bk = sharedFieldArmAtomKind(vis[b], fis[b])
-      if bk == 14 { return false }
-      if atomKindNeedsValueBox(bk) && vbHeapIdxOfKind(bk) < 0 { return false }
+      if sharedFieldReadBoxes(code, vis[b], fis[b]) {
+        const bk = sharedFieldArmAtomKind(vis[b], fis[b])
+        if bk == 14 { return false }
+        if atomKindNeedsValueBox(bk) && vbHeapIdxOfKind(bk) < 0 { return false }
+      }
       b = b + 1
     }
     return true
@@ -7664,10 +7858,22 @@ function sharedFieldPlanDispatchable(
   true
 }
 
-// Whether the plan `code` boxes each member's field rather than reading one shared rep: the
-// members store the field at different value atoms (`sharedFieldArmsBoxable`).
+// Whether the plan `code` boxes member `vi0`'s field rather than reading it as stored: the
+// members store the field at different value atoms (`sharedFieldArmsBoxable`), or this member
+// stores a scalar where another stores the box (D4056).
 function sharedFieldReadBoxes(code: i32, vi0: i32, fi0: i32): boolean {
   code == FC_UNION && variantFieldTypeAt(vi0, fi0) != FC_UNION
+}
+
+// Whether any member of the plan boxes its field (`sharedFieldReadBoxes`), so the read
+// delivers a box whose narrowed path, if any, unboxes.
+function sharedFieldAnyArmBoxes(code: i32, vis: i32[], fis: i32[]): boolean {
+  let i = 0
+  while i < vis.length && i < fis.length {
+    if sharedFieldReadBoxes(code, vis[i], fis[i]) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Whether value atom `k` is boxed in its own scalar value struct, rather than riding the box's
@@ -7715,7 +7921,9 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
     const fis: i32[] = []
     const code = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, vis, fis)
     if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
-    if sharedFieldReadBoxes(code, vis[0], fis[0]) { return 0 }
+    if sharedFieldAnyArmBoxes(code, vis, fis) {
+      return emitSharedFieldAssignPerArm(body, m.memObj, valIx, fnIx, vis, fis)
+    }
     if !sharedFieldTysIdentical(vis, fis) { return 0 }
     let rslot = -1
     if !(P.nodes[unwrapParen(m.memObj)] is Ident) {
@@ -7757,6 +7965,48 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
     return 1
   }
   0
+}
+
+// `emitSharedFieldAssign` over members storing the field at different reps: the receiver is
+// stashed once, then each tag's arm lowers the value at its own member's field type. Exactly
+// one arm runs, so the value is still evaluated once, after the receiver. 1 lowered, -1 failed.
+function emitSharedFieldAssignPerArm(
+  body: u8[],
+  recvIx: i32,
+  valIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+) {
+  const rslot = sharedFieldRecvSlot()
+  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  fbLocalSet(rslot)
+  let i = 0
+  while i < vis.length {
+    const last = i == vis.length - 1
+    if !last {
+      if emitSharedFieldRecv(body, recvIx, fnIx, rslot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 0) // field 0: tag
+      fbI32Const(uTags[vis[i]])
+      fbI32Bin(70)            // 0x46 i32.eq
+      fbIf(64)                // 0x40 void
+    }
+    if emitSharedFieldRecv(body, recvIx, fnIx, rslot) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(uVarHeap[vis[i]])
+    if emitVariantFieldValue(body, vis[i], fis[i], valIx, fnIx) < 0 {
+      return -1
+    }
+    fbStructSet(uVarHeap[vis[i]], fis[i])
+    if !last { fbElse() }
+    i = i + 1
+  }
+  let e = 0
+  while e < vis.length - 1 {
+    fbEnd()
+    e = e + 1
+  }
+  1
 }
 
 // Whether every member declares the field at one type, with no literal set among them — the
@@ -8161,7 +8411,7 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
       }
       // A boxed read whose path is narrowed to one atom delivers that atom, as a code-16
       // field's does.
-      if sharedFieldReadBoxes(shCode, shVis[0], shFis[0]) {
+      if sharedFieldAnyArmBoxes(shCode, shVis, shFis) {
         return emitUnionFieldNarrowUnbox(memIx, fnIx)
       }
       return 0
@@ -20690,6 +20940,9 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           if emitExprExpect(body, args[i], fnIx, cvCtx) < 0 { return -1 }
           pendingVariantIdx = -1
           if exprUnion(args[i], fnIx) {
+            if variantHasCrossTagFits(cvSlot, args[i]) {
+              return emitFailCrossTagDelivery(args[i], cvSlot)
+            }
             fbStructGet(uBoxIdx, 1)     // 0xfb 0x02 <box ht> field 1: value (anyref)
             fbRefCast(uVarHeap[cvSlot]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
           }
@@ -31818,6 +32071,9 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       }
       if cVi >= 0 {
         if exprUnion(args[i], fnIx) {
+          if variantHasCrossTagFits(cVi, args[i]) {
+            return emitFailCrossTagDelivery(args[i], cVi)
+          }
           fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
           fbRefCast(uVarHeap[cVi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
         }
