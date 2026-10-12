@@ -572,6 +572,10 @@ const CODE_MISSING_IMPORT = "missing-import"
 // call, which `check --fix` rewrites to `zeroBytes(n)` and imports from `std:bytes`.
 const CODE_ZERO_BYTES = "filled-zero-bytes"
 
+// A non-numeric `as` whose operand already has the target type. The diagnostic spans the cast,
+// and its `keep` field is the operand's length from the cast's start: `check --fix` keeps that.
+const CODE_REDUNDANT_CAST = "redundant-cast"
+
 // D1570 — the name is a function in scope and is not a method. Its answer rides the data
 // channel under `member`, `recv`, `reason` (`self-name` / `arity` / `receiver`: which gate
 // refused), `param` (the first parameter's declared name, `self-name` only) and
@@ -69381,6 +69385,48 @@ function castPinWrapCheck(at: i32, target: i32, castIx: i32) {
   0
 }
 
+// Raises the redundant-cast refusal when cast `n` at `ix` names the type its operand already
+// has (`t as! string` after `t is string`), with the edit that drops it; false otherwise.
+function redundantCastRaise(
+  n: AsExpr,
+  arg: i32,
+  target: i32,
+  ix: i32,
+): boolean {
+  if arg < 0 || target < 0 || arg == TY_ERR || target == TY_ERR { return false }
+  if !tyEq(softenLitTy(arg), target) { return false }
+  let what = "this value"
+  const on = P.nodes[n.asObj]
+  if on is Ident { what = "`" + on.identName + "`" }
+  let form = "as"
+  if n.asMode == "trap" { form = "as!" }
+  if n.asMode == "null" { form = "as?" }
+  if n.asMode == "wrap" { form = "as%" }
+  let data = ""
+  const st = nodeStartTok(ix)
+  const ot = nodeLastTok(n.asObj)
+  // A one-token operand (a literal, `this`) is named as written.
+  if st >= 0 && ot == st && ot < P.toks.length {
+    what = "`" + P.toks[st].text + "`"
+  }
+  if st >= 0 && ot >= st && ot < P.toks.length {
+    const keep = P.toks[ot].start + P.toks[ot].text.length - P.toks[st].start
+    if keep > 0 { data = diagDataField("keep", i32ToStr(keep)) }
+  }
+  tErrCodedData(
+    what
+      + " is already `"
+      + tyToStr(target)
+      + "` here, so the `"
+      + form
+      + "` cast does nothing — drop it",
+    ix,
+    CODE_REDUNDANT_CAST,
+    data,
+  )
+  true
+}
+
 // The `; write `[]` …` clause on the numeric-only `as` refusal, or "" for every other
 // operand. An empty array literal takes its element type from its destination, so a cast to
 // an array type is not merely unsupported but unnecessary, and no other `as` spelling works
@@ -69530,6 +69576,7 @@ function checkCastNode(n: AsExpr, ix: i32) {
     return target
   }
   if !isNumeric(arg) || !targetIsScalar {
+    if redundantCastRaise(n, arg, target, ix) { return TY_ERR }
     tErr(
       "`as` supports numeric conversions only" + emptyArrCastHint(n.asObj, target),
       ix,
