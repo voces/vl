@@ -215,6 +215,23 @@ deno task install               # = npm ci
 | `deno task playground` | Build the in-browser playground (Monaco + client-side LSP) and serve it. |
 | `deno task playground:build` / `:verify` | Build / verify just the playground bundle. |
 
+### Developing on Windows
+
+Everything above runs natively on Windows, with Git for Windows supplying the shell.
+
+- Install Git for Windows, Rust, Deno, Node (for `npm ci`) and Python 3.9+.
+- Put `C:\Program Files\Git\bin` on `PATH` ahead of `System32`. A bare `bash` otherwise
+  starts WSL.
+- Run the `.sh` scripts under Git Bash: `bash scripts/gate.sh`, `bash scripts/refresh-compiler.sh`.
+- Set `PYTHONUTF8=1`. The Python tooling reads UTF-8 files, and a Windows Python defaults to
+  cp1252. `gate.sh` exports it for its own rows.
+- Create `<drive>:\tmp` on the checkout's drive. Several fixtures write `/tmp/...`, which a
+  native process resolves on the current drive.
+- `vl` prints paths with `/` separators on every OS, so compare test output against
+  `slashed()` from `tests/support/filePath.ts`.
+- `gate.sh`'s CPU column reads 0 here. Git Bash's `times` cannot see a native child's CPU,
+  and no gate grades on that column.
+
 ### Editor (LSP)
 
 The language server lives in [`lsp/`](./lsp). It type-checks via the wasm seed in-process,
