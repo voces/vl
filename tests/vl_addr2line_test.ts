@@ -22,9 +22,7 @@ import {
   VL,
   WASM_OPT,
 } from "./support/nativeRelease.ts";
-
-// The host prints paths with `/` separators on every OS.
-const slash = (p: string) => p.replaceAll("\\", "/");
+import { slashed as slash } from "./support/filePath.ts";
 
 // Real paths: the map names its sources relative to itself, which addr2line resolves.
 const DIR = ENABLED
