@@ -267,6 +267,15 @@ exactness rule still refuses every literal that has a fraction.
 
 Raised by expressions.md §E11.2.
 
+**Resolved 2026-10-11: (b), amended** — a committee on the owner's delegation, 2–1. A
+positional argument may follow named ones only when every named argument before it sits in
+its own parameter position (Kotlin 1.4). Naming a parameter that a positional argument
+already filled is refused ("given twice"). The method-call receiver counts as position 0.
+A positional argument always lands at its written index. (a) was not chosen because it would
+break 11 diderven calls (`src/craft/recipes.vl`) whose in-position labels (b) also checks.
+DECISIONS.md §"A positional argument lands at its written index"; the checker lags (D4061).
+The text below is the question as it was put.
+
 **Today.** Named arguments bind first. Positional arguments then fill the parameters that
 are still unbound, in declaration order, wherever they stand in the call. So a positional
 argument may follow a named one, and a positional argument written first can land on a
@@ -307,3 +316,34 @@ print(box(h: 3, 2))   // would be refused: `h` is not in position 1
 `h`, which no reader of the call would expect, and (a) refuses exactly that. (a) also
 refuses nothing a program needs, since every call it refuses has an order that it accepts.
 
+
+## Q9. A constant `a until a`
+
+Raised by statements.md §S5.3.
+
+**Today.** A constant range whose direction contradicts its step is refused (D1588), and
+`a to a` runs once. `a until a` runs zero times, and nothing reports it: its bounds do not
+contradict its direction, so D1588's rule does not reach it.
+
+```vl
+for i in 2 until 2 { print(i) }
+print("done")   // prints done
+```
+
+D1588's ruling was written for `to`: "Equal bounds run once in either direction and are not
+touched." It says nothing about `until`.
+
+**(a) Refuse it,** with the D1588 error: every range written with constant bounds that can
+never run is refused.
+
+```vl
+for i in 2 until 2 { print(i) }   // would be refused: this range never runs
+```
+
+**(b) Keep accepting it,** and state that only a contradicted direction or a zero step is
+refused.
+
+**Recommendation: (b).** D1588 refuses a range whose author meant it to run and wrote the
+bounds in the wrong order, which is a confident wrong answer. `a until a` has no right
+order to suggest, and no fix the message could name. In real code its bounds are rarely
+both literals, and when they are computed it already runs zero times silently by design.
