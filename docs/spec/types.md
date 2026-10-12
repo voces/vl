@@ -303,9 +303,12 @@ print(f("ab"))  // prints 2
 
 > Ruling: owner 2026-10-10 (A), D3885 (`is` is structural).
 
-> Open question (Q4): a union of two records with the same field names, where no field is
-> literal-typed in both, is refused when it is formed (`{ v: i32 } | { v: boolean }`). No
-> live ruling says whether that union is legal.
+> Ruling: owner 2026-10-12 (Q4 (c)), DECISIONS.md §"Record arms that share a field name form
+> a legal union". `u is A` tests whether the value fits `A`, field by field.
+
+> Status: not built. A union of two records with the same field names, where no field is
+> literal-typed in both, is still refused when it is formed (`{ v: i32 } | { v: boolean }`)
+> (D4056).
 
 Open question: does `v is A` hold of a record value that has every field of `A` and more?
 Today it does not. See OPEN-QUESTIONS.md §Q2.
