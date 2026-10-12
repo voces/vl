@@ -499,3 +499,11 @@ fixCase(
   "function g(t: string | i32) {\n  if t is string {\n    print((t).length)\n" +
     "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s)\n",
 );
+
+fixCase(
+  "JavaScript's `!==` and `===` become VL's `!=` and `==`, which are already strict (DV-1214)",
+  {
+    "main.vl": "function f(n: i32): boolean {\n  return n !== 2 && n === 3\n}\nprint(f(1))\n",
+  },
+  "function f(n: i32): boolean {\n  return n != 2 && n == 3\n}\nprint(f(1))\n",
+);

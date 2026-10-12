@@ -96,6 +96,7 @@ import {
   arenaEpochNow,
   arenaNoteEdit,
   arenaSetNode,
+  braceNameStmts,
   brkValSeen,
   callIsNever,
   callIsRestPacked,
@@ -15281,6 +15282,8 @@ let lbiInlinedName: {[i32]: string} = Map()
 // Each editor occurrence recorded for a rewritten read, and its node, whose type hover shows.
 let lbiOccIx: i32[] = []
 let lbiOccNode: i32[] = []
+// The declaration of the `const` each rewritten read names, by node, for a diagnostic's note.
+let lbiInlinedDecl: {[i32]: i32} = Map()
 // The type a rewritten read meets where it stands, by node, for hover.
 let lbiUseTy: {[i32]: i32} = Map()
 // The same, only where it is the type the read compiles at: a delivery into a number, or an
@@ -15294,6 +15297,7 @@ export function lbiArenaReset() {
   lbiSynth = Map()
   lbiInlined = Map()
   lbiInlinedName = Map()
+  lbiInlinedDecl = Map()
   cexFolded = Map()
   cexNotTree = Map()
   0
@@ -15848,6 +15852,10 @@ function lbiConstLitAt(ix: i32, name: string): i32 {
 // each read of a literal `const` is checked and lowered as the literal written there. Answers `ix`.
 function lbiInlineLit(ix: i32, lit: i32, pos: i32, name: string): i32 {
   lbiInlinedName[ix] = name
+  if !(lbiDefaultExpr[ix] ?? false) {
+    const c = lbiCandOfName(name, sidOfNode(ix))
+    if c >= 0 && c < lbiCands.length { lbiInlinedDecl[ix] = lbiCands[c] }
+  }
   const neg = lbiNegArg(lit)
   if neg < 0 {
     const l = P.nodes[lit]
@@ -16419,6 +16427,143 @@ function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
       + " for its bit pattern"
   }
   "constant " + shown + " overflows " + tyName
+}
+
+// When `at` is the name braced as a whole statement, `{ steps }`, and `want` is a one-field record
+// of that name that the name's own type does not already fit: a note that the braces are a block,
+// not the record shorthand (DV-1216).
+function braceNameNote(at: i32, want: i32): string {
+  if at < 0 || at >= P.nodes.length || want < 0 || want >= T.tys.length {
+    return ""
+  }
+  if !i32ListHas(braceNameStmts, at) { return "" }
+  const e = P.nodes[at]
+  const w = T.tys[want]
+  if e is Ident && w is TyObj {
+    if w.objFieldNames.length != 1 { return "" }
+    if assignable(nodeTyOf(at), want) { return "" }
+    if objFieldType(w, e.identName) >= 0 {
+      return " — `{ "
+        + e.identName
+        + " }` here is a block, not a record; write `({ "
+        + e.identName
+        + " })` for the record"
+    }
+  }
+  ""
+}
+
+// The name braced as the whole last statement of block `body`, `{ steps }`, or -1.
+function braceNameTail(body: i32): i32 {
+  if body < 0 || body >= P.nodes.length { return -1 }
+  const b = P.nodes[body]
+  if b is Block {
+    if b.blkStmts.length == 0 { return -1 }
+    const last = P.nodes[b.blkStmts[b.blkStmts.length - 1]]
+    if last is Block {
+      if (
+        last.blkStmts.length == 1
+        && i32ListHas(braceNameStmts, last.blkStmts[0])
+      ) {
+        return last.blkStmts[0]
+      }
+    }
+  }
+  -1
+}
+
+// For an `i64` value delivered into `i32`: when a read of a literal `const` in it, through integer
+// operators and `if`, `match` and block tails, overflows `i32`, a note naming that constant, its
+// value and its line, since it alone made the value `i64` (DV-1215). "" when there is none.
+function cexWideConstNote(srcExpr: i32): string {
+  const todo: i32[] = [srcExpr]
+  let guard = 0
+  let found = ""
+  let indep = false
+  while todo.length > 0 && guard < CEX_DEPTH * 8 {
+    guard = guard + 1
+    const at = cwPeel(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { continue }
+    const nm = lbiInlinedName[at] ?? ""
+    if nm != "" {
+      const lit = cexLitPeel(at)
+      if lit >= 0 {
+        const l = P.nodes[lit]
+        if l is NumLit {
+          let v = cexOfLexeme(l.numText)
+          if intLitIsNegated(at) { v = cexNeg(v) }
+          if (
+            !numLexIsFloat(l.numText)
+            && cexOk(v)
+            && !cexFitsAt(v, l.numText, TY_I32)
+          ) {
+            if found == "" { found = cexWideConstNoteFor(nm, at, v) }
+          }
+        }
+      }
+      continue
+    }
+    if (
+      tailPushIfArms(at, todo)
+      || tailPushMatchArms(at, todo)
+      || tailPushBlockTail(at, todo)
+    ) {
+      continue
+    }
+    if cexWidePushOperands(at, todo) && nodeTyOf(at) == TY_I64 { indep = true }
+  }
+  if indep { return "" }
+  found
+}
+
+// Queue the integer operands of `at` for `cexWideConstNote`. True when `at` is a leaf that could
+// make the value `i64` by itself: not a literal, not an operator.
+function cexWidePushOperands(at: i32, todo: i32[]): boolean {
+  const e = P.nodes[at]
+  if e is BinExpr {
+    if (
+      binIntOnlyOp(e.binOp)
+      || e.binOp == "+"
+      || e.binOp == "-"
+      || e.binOp == "*"
+      || e.binOp == "/"
+      || e.binOp == "%"
+    ) {
+      todo.push(e.binLeft)
+      todo.push(e.binRight)
+    }
+    return false
+  }
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "~" { todo.push(e.unArg) }
+    return false
+  }
+  if e is NumLit { return false }
+  cexWideLeaf()
+}
+
+// Every other node is a leaf whose `i64` the note does not look inside.
+function cexWideLeaf(): boolean { true }
+
+// The note `cexWideConstNote` gives for the read `at` of the constant `nm`, of value `v`.
+function cexWideConstNoteFor(nm: string, at: i32, v: Cex): string {
+  let where = ""
+  const d = lbiInlinedDecl[at] ?? -1
+  if d >= 0 && ufcsModOfNode(d) == ufcsModOfNode(at) {
+    const ln = nodeLineOf(d)
+    if ln > 0 { where = " (line " + i32ToStr(ln) + ")" }
+  }
+  let tail = ""
+  const pat = cexPatternHex(v, 32)
+  if pat != "" { tail = "; write " + pat + " for its bit pattern" }
+  " — `"
+    + nm
+    + "`"
+    + where
+    + " is the constant "
+    + cexShown(v)
+    + ", which overflows i32, so it reads as i64 here"
+    + tail
 }
 
 // `v` as a diagnostic quotes it: an integer in decimal, a float by its literal when that is short.
@@ -19803,6 +19948,24 @@ function numLitNotesDisagree(drop: boolean[]) {
   0
 }
 
+// Drop the queued notes of diagnostics at index `mark` or later, which a caller has popped: a
+// note is matched to its diagnostic by index and message, so a later one could inherit it.
+function numLitNotesDropFrom(mark: i32) {
+  while nlnDiag.length > 0 && nlnDiag[nlnDiag.length - 1] >= mark {
+    nlnDiag.pop()
+    nlnMsg.pop()
+    nlnText.pop()
+    nlnDecl.pop()
+    nlnUse.pop()
+    nlnSlot.pop()
+    nlnWant.pop()
+    nlnAnn.pop()
+    nlnLeaf.pop()
+    nlnLeafTy.pop()
+  }
+  0
+}
+
 // Append each queued note whose diagnostic survived. A read's note is dropped when
 // `numLitNamesStoredNonLit` finds a non-literal store to the binding, under its declared or its
 // used name; a store's note when `numLitAsgNotesRefuted` finds a store its annotation refuses.
@@ -20433,13 +20596,16 @@ export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
 // `tErr` for a value delivered to a `want`-typed destination, which lets the numeric-literal note
 // find a literal binding inside a record, list or arithmetic value.
 function tErrWant(msg: string, at: i32, want: i32) {
+  let m = msg
   // An `i64` made only of constants, one of which overflows `i32`: that constant is the
-  // error, refused at its own span (D3780).
+  // error, refused at its own span (D3780). Beside other operands, the note names it.
   if want == TY_I32 && !inferQuiet && at >= 0 && nodeTyOf(at) == TY_I64 {
     if cexJoinMisfit(at) { return 0 }
+    m = m + cexWideConstNote(at)
   }
+  m = m + braceNameNote(at, want)
   nlWantTy = want
-  tErr(msg, at)
+  tErr(m, at)
   nlWantTy = -1
   0
 }
@@ -52408,7 +52574,14 @@ function checkCallNode(n: Call, ix: i32) {
   ckCalleeIx = savedCallee
   const ft = T.tys[fnTy]
   if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
-  if ft is TyErr { return TY_ERR }
+  if ft is TyErr {
+    // A module global called above its declaration, which the hoist could not type: its
+    // arguments are still checked on their own, as a hole callee's are (D3899).
+    if cfn is Ident && globalBeforeDecl(cfn.identName) {
+      for ga in n.callArgs { checkNode(ga) }
+    }
+    return TY_ERR
+  }
   if ft is TyVar {
     // Calling an inference-hole value — an un-annotated parameter used as a function inside
     // its own generic body (`function apply(fn, a, b) { fn(a, b) }`): the arguments are
@@ -53355,13 +53528,10 @@ function globalInitPrePass(lets: i32[]) {
   symEnabled = 0
   for li in lets {
     const ln = P.nodes[li]
-    // A bare lambda binding is typed where it is written: checking one early would fix its
-    // un-annotated parameters before pass 2 marks them as inference holes.
+    // A lambda with an un-annotated parameter is typed where it is written: checking one early
+    // would fix those parameters before pass 2 marks them as inference holes.
     let lambdaInit = false
-    if ln is LetDecl {
-      const lin = P.nodes[parenPeelIx(ln.letInit)]
-      if lin is FuncDecl { lambdaInit = true }
-    }
+    if ln is LetDecl { lambdaInit = fsbIsHoleLambda(parenPeelIx(ln.letInit)) }
     if ln is LetDecl && !lambdaInit {
       const savedDiag = T.diags.length
       // Its own flow frame, so a read of a global still in the dead zone is neither reported
@@ -53371,9 +53541,16 @@ function globalInitPrePass(lets: i32[]) {
       daLeaveFrame(daSaved)
       const clean = T.diags.length == savedDiag
       while T.diags.length > savedDiag { T.diags.pop() }
+      numLitNotesDropFrom(savedDiag)
+      // A bare name of a top-level function is that function's own type, its type parameters
+      // included, and the alias is recorded as pass 2 would record it (D3899).
+      const aDecl = globalInitFnAlias(ln.letInit)
       if clean && it >= 0 && it != TY_ERR && !isVoidTy(it) && !isNullTy(it) {
-        if !isNeverTy(it) && !tyHasHole(it) {
+        if !isNeverTy(it) && (aDecl >= 0 || !tyHasHole(it)) {
           declare(ln.letName, constStrLitBound(ln, it))
+          if aDecl >= 0 && fnAliasScopes.length > 0 {
+            fnAliasScopes[0][ln.letName] = aDecl
+          }
         }
       }
     }
@@ -53384,6 +53561,19 @@ function globalInitPrePass(lets: i32[]) {
   rcoalTruncate(savedRcoal)
   isvalTruncate(savedIsval)
   0
+}
+
+// Whether `name` resolves to a module global whose declaration pass 2 has not reached.
+function globalBeforeDecl(name: string): boolean {
+  lookupDepth(name) == 0 && (moduleBeforeDecl[name] ?? -1) >= 0
+}
+
+// The top-level function declaration a module global's initializer names bare, or -1.
+function globalInitFnAlias(init: i32): i32 {
+  if init < 0 { return -1 }
+  const n = P.nodes[parenPeelIx(init)]
+  if n is Ident { return fnDeclIx[n.identName] ?? -1 }
+  -1
 }
 
 // Pass 1.9: indexes the generic declarations whose bodies `cstrProbeBefore` will walk.
@@ -55621,12 +55811,29 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     && !bodyTotalForRet
     && !retNullableNow
   ) {
-    tErr(
-      "not all code paths return a value in '"
-        + n.fnName
-        + "' — add a `return`, or annotate the return type `| null` to fall through",
-      n.fnBody,
-    )
+    const bn = braceNameTail(n.fnBody)
+    if bn >= 0 && braceNameNote(bn, ret) != "" {
+      const bnm = P.nodes[bn]
+      let nm = ""
+      if bnm is Ident { nm = bnm.identName }
+      tErr(
+        "`{ "
+          + nm
+          + " }` here is a block, not a record — write `return { "
+          + nm
+          + " }` or `({ "
+          + nm
+          + " })`",
+        bn,
+      )
+    } else {
+      tErr(
+        "not all code paths return a value in '"
+          + n.fnName
+          + "' — add a `return`, or annotate the return type `| null` to fall through",
+        n.fnBody,
+      )
+    }
   }
   // Redundant return annotation: the body's natural inferred return already equals the
   // explicit `: T`, so removing it yields the identical type. Conservative: a single
@@ -67549,7 +67756,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   // `const f = addT` — records which declaration this binding aliases, for deferred-constraint
   // ownership alone. A bare Ident initializer naming a declared function is the whole rung.
   if n.letInit >= 0 {
-    const aInit = P.nodes[n.letInit]
+    const aInit = P.nodes[parenPeelIx(n.letInit)]
     if aInit is Ident {
       const aDecl = fnDeclIx[aInit.identName]
         ?? lookupFnDeclNode(aInit.identName)
