@@ -4071,6 +4071,15 @@ fn run_program_with(
 /// numbering and only catches what no kind names. Anything unrecognized becomes `EIO`
 /// (29) rather than passing through as a number `std:fs` cannot interpret — an
 /// unmatchable code reaches the caller as an error that looks like none of them.
+/// `wasi_errno` for a failed open of `p`. Windows answers "access denied" for a directory
+/// opened as a file, where Linux answers EISDIR; asked only after the open has failed.
+fn wasi_errno_at(e: &std::io::Error, p: &std::path::Path) -> i32 {
+    if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied && p.is_dir() {
+        return 31; // EISDIR
+    }
+    wasi_errno(e)
+}
+
 fn wasi_errno(e: &std::io::Error) -> i32 {
     use std::io::ErrorKind;
     match e.kind() {
@@ -4335,7 +4344,7 @@ fn fs_write_mode(p: &std::path::Path, off: i64, data: &[u8], mode: i32) -> i32 {
         Err(err) if mode == 1 && off > 0 && err.kind() == std::io::ErrorKind::NotFound => {
             return 28; // EINVAL — past the end of a file that has no bytes
         }
-        Err(err) => return wasi_errno(&err),
+        Err(err) => return wasi_errno_at(&err, p),
     };
     if mode == 1 {
         match f.metadata() {
@@ -4622,19 +4631,13 @@ fn register_fs_imports(
         let (st, at) = (st.clone(), at.clone());
         linker.func_new("imports", "__fs_read__", ft, move |mut c, args, results| {
             let path = read_u8_list(&mut c, &args[0])?;
-            let out = match os_path(&path).map_err(Ok).and_then(|p| {
-                std::fs::read(&p).map_err(|err| Err::<i32, std::io::Error>(err))
-            }) {
+            let out = match os_path(&path).and_then(|p| std::fs::read(&p).map_err(|err| wasi_errno_at(&err, &p))) {
                 Ok(bytes) => {
                     *e.lock().unwrap() = 0;
                     bytes
                 }
-                Err(Ok(code)) => {
+                Err(code) => {
                     *e.lock().unwrap() = code;
-                    Vec::new()
-                }
-                Err(Err(err)) => {
-                    *e.lock().unwrap() = wasi_errno(&err);
                     Vec::new()
                 }
             };
@@ -4677,7 +4680,7 @@ fn register_fs_imports(
                     match os_path(&path) {
                         Err(bad) => code = bad,
                         Ok(p) => match std::fs::File::open(&p) {
-                            Err(err) => code = wasi_errno(&err),
+                            Err(err) => code = wasi_errno_at(&err, &p),
                             Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
                                 Err(err) => code = wasi_errno(&err),
                                 Ok(_) => {
@@ -4746,7 +4749,7 @@ fn register_fs_imports(
                     match os_path(&path) {
                         Err(bad) => code = bad,
                         Ok(p) => match std::fs::File::open(&p) {
-                            Err(err) => code = wasi_errno(&err),
+                            Err(err) => code = wasi_errno_at(&err, &p),
                             Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
                                 Err(err) => code = wasi_errno(&err),
                                 Ok(_) if cap == 0 => {}
