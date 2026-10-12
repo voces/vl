@@ -1,10 +1,10 @@
 # Unsigned integer types — `u32` and `u64`
 
-**Status: proposal, not ruled.** The owner approved writing this design on 2026-10-03. Nothing here
-is built. If the owner adopts it, it replaces two earlier statements of the opposite position:
-`DECISIONS.md` §"Types & semantics", *"Unsigned integer ops are operations, not a `u32` type"*,
-and `numeric-intrinsics.md` §"Unsigned integer ops: operations, not a type". Section 1.4 explains
-why the question is being reopened.
+**Status: U1–U4 ruled, U5–U14 open, nothing built.** The owner ruled (a) on U1–U3 on
+2026-10-03 and on U4 on 2026-10-04. The rulings are recorded in `DECISIONS.md` §"`u32` and
+`u64` are value types". U1 amends `DECISIONS.md` §"Types & semantics", *"Unsigned integer ops
+are operations, not a `u32` type"*, and `numeric-intrinsics.md` §"Unsigned integer ops:
+operations, not a type". Section 1.4 explains why the question was reopened.
 
 **The idea in one sentence.** `u32` and `u64` are value types that share their wasm valtype with
 `i32` and `i64`. The checker tracks signedness; the emitter uses it to choose the `_u`
@@ -601,6 +601,8 @@ const n = 0xFFFFFFFF
 print(divU(n, 2))       // 2147483647
 ```
 
+**Ruled: (a), owner 2026-10-03.**
+
 **Recommendation: (a).** u32/u64 do not break the 2026-08-22 "no small value types" rule
 (1.1). glean's 231 widen-then-mask sites are the bug class this removes, and (b) stays
 available alongside it (U12).
@@ -620,6 +622,8 @@ function g(i: i32): u32 { i }          // ok — -1 becomes 4294967295 silently
 function h(x: i64): f64 { x }          // ok — rounds silently
 ```
 
+**Ruled: (a), owner 2026-10-03.**
+
 **Recommendation: (a).** It is the existing lattice with three more edges (`u32 → i64`,
 `u32 → u64`, `u32 → f64`).
 
@@ -633,6 +637,8 @@ const k: u32 = 0xDEADBEEF; print(k)    // 3735928559
 // (b) a top-bit radix literal with no context defaults to u32/u64
 print(0xDEADBEEF)                      // 3735928559
 ```
+
+**Ruled: (a), owner 2026-10-03.**
 
 **Recommendation: (a).** It changes no existing program's output. (b) reverses the last row of
 the 2026-09-04 hex ruling.
@@ -649,6 +655,8 @@ u << k             // ok for any integer k
 u + i              // i64
 U + I              // error anyway: u64 + i64 has no common type
 ```
+
+**Ruled: (a), owner 2026-10-04.**
 
 **Recommendation: (a).** It is Rust's, Go's and Zig's rule, and it already falls out of VL's
 lattice.

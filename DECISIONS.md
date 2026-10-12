@@ -1834,7 +1834,9 @@ it worked.
   (`/` is `div_s`) and already exposed one unsigned instruction as an operator
   (`>>>`). A `u32` would touch the type arena, every rep table, every widening
   rule and every emitter kind code to express something the operand need not
-  carry.
+  carry. *Amended 2026-10-03:* VL adds `u32` and `u64` as value types, and the
+  unsigned operations stay for `i32` and `i64` operands (§"`u32` and `u64` are value
+  types").
 - **No transcendental as a compiler intrinsic; they live in `std:math`.** No wasm
   opcode computes `sin`/`pow`/`exp`, so any implementation is a library whose last
   bit is a policy choice, and that library is not the compiler's. This entry first
@@ -9458,7 +9460,9 @@ tree read stays an editor reference.
 * **A radix literal is the bit pattern at its use's width under every operator (owner,
   2026-09-30, ruling A on radix arithmetic).** `0x80000000 / 2` at `i32` is -1073741824 and
   `0xFFFFFFFF % 7` at `i32` is -1, as on master and in Java and wasm; an unsigned reading is
-  spelled `divU`, `remU`, `ltU` or `>>>`. The width is the use's, which the fold cannot see, so a
+  spelled `divU`, `remU`, `ltU` or `>>>` (for `i32` and `i64` operands; since U1, a
+  `u32` or `u64` operand reads unsigned under `/`, `%` and `<`, §"`u32` and `u64` are value
+  types"). The width is the use's, which the fold cannot see, so a
   tree whose value depends on it is not folded and computes where it is used, as before:
   arithmetic (`+ - * / %`) over a pattern, `>>` and `~` over a pattern whose top bit is set at
   its own width (32 or 64 bits), any operation over a pattern wider than 32 bits (which an `i32`
@@ -10169,3 +10173,203 @@ then has to compile and predict.
 the game instead of +6.0%, but the trap becomes `unreachable` with the note "a compiler-emitted
 trap" rather than the bounds trap the guide and `std:bytes` promise. Keeping the message was
 chosen; the smaller form is one line if that trade is wanted.
+
+## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
+
+**VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and
+`i64`, and the type picks the unsigned operation: `/`, `%`, comparison, `>>` and widening
+read the bits as unsigned. This amends §"Types & semantics", *"Unsigned integer ops are
+operations, not a `u32` type"*: `divU`, `ltU` and `>>>` stay, for `i32` and `i64` operands.
+Three consumers had built unsigned arithmetic by hand, and the type removes that class of
+bug. Design and options: `docs/internals/unsigned-types-design.md`.
+
+**Implicit conversions are only the lossless ones (U2 = A, 2026-10-03).** The lattice gains
+`u32 → i64`, `u32 → u64` and `u32 → f64`. Every other conversion is written `as` (exact or
+fail) or `as%` (wrap).
+
+**A radix literal with no context stays signed (U3 = A, 2026-10-03).** `print(0xDEADBEEF)`
+prints -559038737, as it does today. A literal is `u32` or `u64` only where its use names
+that type, so no existing program's output changes.
+
+**Mixed signed and unsigned operands are a check error (U4 = A, 2026-10-04).** `u + i` is
+refused, and the message says to write `i as u32` or `u as i32`. A literal operand adapts,
+and a shift count may be any integer. This is the rule of Rust, Go and Zig, and it follows
+from U2: `i32 ↔ u32` has no lossless edge.
+
+Questions U5–U14 of the design doc are not yet ruled. Nothing here is built.
+
+
+## A positional argument lands at its written index (Q8, committee on owner delegation, 2026-10-11)
+
+**The rule.** A positional argument may follow named ones only when every named argument
+before it sits in its own parameter position. Naming a parameter that a positional argument
+already filled is refused ("given twice"). In a method call `x.f(…)` the receiver is
+position 0. The principle: a positional argument always lands at its written index. This is
+Kotlin's rule since 1.4.
+
+```vl
+function box(w: i32, h: i32): i32 { w * 10 + h }
+box(w: 3, 2)   // ok: `w` is in position 0, so 2 lands at position 1 — 32
+box(h: 3, 2)   // refused: `h` is not in its own position
+box(3, w: 2)   // refused: `w` is given twice
+box(3, h: 2)   // ok — 32
+```
+
+**Before.** Named arguments bound first, and positional ones then filled the parameters
+still unbound in declaration order, wherever they stood. `box(h: 3, 2)` and `box(3, w: 2)`
+both printed 23: the positional argument moved to a later parameter without a word.
+
+**Why not Python's rule (positional first, always).** It would break 11 calls in diderven,
+`src/craft/recipes.vl`, of the shape `gear("Copper Sword", SN_ANVIL, base: 100, [...])`,
+where the label documents an argument that is already in its own position. This rule keeps
+those and checks the label. No consumer or corpus call relies on the old skip rule.
+
+The committee voted 2–1 for this option, amended from the open question's (b)
+(`docs/spec/OPEN-QUESTIONS.md` Q8). The checker does not enforce it yet (D4061).
+
+## `is` tests whether the value fits the type (owner ruling (A), 2026-10-10) — D3885
+
+**The rule.** `v is B` asks whether the value `v` holds fits `B` structurally, not which type
+`v` was declared at or built as. With `A = { x: i32 }` and `B = { x: 1 | 2 }`, a value
+`const a: A = { x: 1 }` gives `a is B` true, and `{ x: 7 }` gives false. Values carry no
+runtime declared-type tag.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+function f(v: A | B): string { if v is B { return "B" } "A" }
+const a: A = { x: 1 }
+print(f(a))   // B
+```
+
+**Why.** VL's records are structural (D3870, option C: same-shape records are one type). An
+`is` that answered by declared type would need a hidden tag on every record and would
+contradict that ruling.
+
+**What it adds.** A HINT, not an error, where one arm contains another: `` `B` is contained
+in `A`, so `is B` tests the value `` (code `contained-arm-is-test`). Disjoint literal sets are
+a real discriminant and get no hint. The string-against-integer-literal check reject keeps
+its behaviour. Where the operand's declared type is a single record containing `B`, the
+compiler still answers by the declared type (D4058).
+
+## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
+
+**The rule.** A union of records whose arms share a field name is legal, whether or not a
+field is literal-typed in both. `u is A` answers whether the value structurally fits `A`,
+field by field. A tag may serve as a fast path only where it gives the same answer as the
+structural test.
+
+```vl
+type A = { v: i32 }
+type B = { v: boolean }
+function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+print(f({ v: true }))   // prints 2
+```
+
+**Why.** The owner: "'is' is not a nominal check; the language is structural", and "We can
+do a nominal check for perf reasons, but fundamentally the language is meant to be
+structural." This is the same principle as D3885 and D3870, applied to the union's formation
+rule. The 2026-09-02 refusal it replaces is retired.
+
+**Before.** The union was refused when formed, whichever way the `is` went. The checker does
+not admit it yet (D4056).
+
+## `x == L` narrows a literal union as `x is L` does (Q10 (a), owner ruling, 2026-10-12) — D4059
+
+**The rule.** For a literal union `K`, `x == L` narrows exactly as `x is L` does: in the
+then-branch, in the else-branch, after an exiting guard, and with `!=` reversed.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } 3 }
+```
+
+**Why.** The guide already said it, and `x is L` reads as `x == L` with narrowing. One
+spelling that narrows and one that does not was a trap. The checker does not do it yet
+(D4059).
+
+## A declaration shadows an ambient name of the same name (Q11 (b), owner ruling, 2026-10-12) — D4066
+
+**The rule.** A declaration named like an ambient name (a built-in type, `print`, `Map`,
+`Set`, a float or integer intrinsic) shadows it in its scope, for both the call and its
+type. Compiler intrinsics (`__name__`) stay refused.
+
+```vl
+function print(s: string): i32 { 7 }
+print("x")   // calls the program's own `print`, typed by its own signature
+```
+
+**Why.** A call and its type must agree about which name they mean; today a declared
+`print` is called but typed by the ambient one. Shadowing is how every other scope works.
+The checker does not do it yet (D4066).
+
+## A re-export binds its name locally (owner rulings R1–R3, 2026-10-04) — sunpa SP-014, SP-020
+
+**R1 (A).** `export { X } from "m"` publishes `X` and also binds `X` in the re-exporting
+module, as an import would. This is what shipped (#1196) and what `std:fs` relies on: it
+uses `Buf` in its signatures through `export { Buf } from "std:buffer"` alone. JS and TS
+bind nothing locally here; VL does, so one line both uses and publishes a name.
+
+**R2 (A).** An `import` of a name the same module also re-exports from the same specifier
+is redundant, and gets the duplicate-import WARNING with a `--fix` that removes the
+import. std's eight instances (`std:args` 1, `std:env` 4, `std:process` 3) are cleaned up
+in the change that lands the warning (D4064).
+
+**R3 (A).** `export { x }` without `from` stays refused when `x` is an import. There is one
+spelling for passing an import on, `export { x } from "m"`, and the refusal names it.
+
+The questions and options are `docs/internals/modules-design.md` §2.1.1.
+
+## No prelude: every library name is imported (owner ruling O7, 2026-10-07)
+
+**The rule.** No default prelude and no configurable one. Every library name, `std:str`'s
+and `std:array`'s included, is imported explicitly. The ambient names a module sees with
+no import are the intrinsic floor, not a prelude. This supersedes the configurable-prelude
+amendment in `docs/internals/modules-design.md` §2 (`builtin-methods-to-std.md` §O7).
+
+The owner's words were "stay explicit". The reasoning and the reopen condition below are
+not the owner's. They come from the five-reviewer debate memo the ruling was decided after
+(5–0 for explicit imports), and are recorded as that memo's argument.
+
+**The memo's argument.** `std:str` and `std:array` collide on several names (`lastIndexOf`,
+and under A′ `includes`, `indexOf`, `slice`, `get`), so a prelude would need type-directed
+dispatch or a new shadowable scope tier. Tooling carries the typing cost instead: `vl check
+--fix` adds the import, choosing the module by the receiver's type. The memo would reopen
+the question only if receiver overloading (O1) and a shadowable prelude tier both exist and
+the default set is versioned, or if agents keep retrying imports after the receiver-typed
+`--fix`.
+
+## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
+
+**The rule.** An exported record binding without an annotation takes the field types its
+importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
+an importer to `take(w: { x: i64, y: i64 })` widens `pt`'s layout in that program. Nothing
+refuses it, and no `--fix` adds an annotation.
+
+**Why.** In the owner's words: "don't want an auto fix. vl design principles is minimal
+annotations. I rather we have more complex incremental build machinery." An incremental
+build therefore keys a module on the layout demands its importers make
+(`docs/internals/incremental-compilation-design.md` §"Owner questions", Q1).
+
+## The module system's eight decided directions (owner review, 2026-06-06) — modules-design §5
+
+`docs/internals/modules-design.md` §5 lists eight directions the owner reviewed, folded in by
+commit `e295c6986` ("docs(modules): fold in owner review — std: scheme, no prelude,
+fine-grained modules, live-ref/readonly(A9) exports, `as` aliasing, no extension,
+visibility", 2026-06-06). The section says the formal record would land here at
+implementation; this is that record. Each direction in its own words:
+
+1. "Std specifier = the `std:` scheme (colon), not `std/`."
+2. "No implicit library prelude." (Restated and extended by O7, the section above.)
+3. "Fine-grained std modules." One module per concern, flat.
+4. "Export semantics = live references; readonly is A9." "Exported bindings are live
+   references"; "the imported name is read-only (no reassigning another module's `let`)".
+5. "Rename in v1; re-export deferred." `import { x as y }` is in; re-export has since landed
+   (the R1–R3 section above).
+6. "Omit the `.vl` extension in specifiers." "No index/directory guessing."
+7. "LSP cross-file / std navigation = Phase 3, perf-bounded." Tooling, not a module rule.
+8. "Visibility: v1 binary." "v1 = top-level `export` or private."
+
+Items 2 and 8 also carry open sub-questions in §5 (a shadowable convenience name;
+graduated visibility levels). They stay open. `docs/spec/modules.md` cites directions 4
+and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.

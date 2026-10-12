@@ -15,11 +15,11 @@ where one exists, and is marked where the compiler has not caught up.
 | [lexical.md](lexical.md) | source text, comments, identifiers, keywords, literals, operators, line continuation |
 | [types.md](types.md) | primitives, literal types, unions, records, nullability, lists, maps and sets, functions, generics, nominal types |
 | [expressions.md](expressions.md) | operators, mixed numeric operands, constant arithmetic, casts, evaluation order, calls, indexing, block values, lambdas, list spread |
-| statements.md *(next)* | bindings, blocks, `if`, loops, labels, `match` |
-| narrowing.md *(next)* | `is`, null tests, flow facts and what ends them |
-| modules.md *(next)* | imports, exports, re-exports, resolution |
-| diagnostics.md *(next)* | error, warning, hint and info categories; exit codes |
-| std.md *(next)* | the standard library contract |
+| [statements.md](statements.md) | programs, bindings, scope, blocks, `if`, loops, labels and loop values, `match`, `return` and `never`, local declarations |
+| [narrowing.md](narrowing.md) | narrowable places, null tests, `is`, literal and discriminant tests, where a fact holds, writes and joins, what ends a fact |
+| [modules.md](modules.md) | modules and visibility, exports, imports and specifiers, re-exports, names and the ambient set, running order and cycles, inference across modules |
+| [diagnostics.md](diagnostics.md) | severities, errors and the build-time rule, findings and their codes, the `vl check` gate, exit codes, traps, suppression |
+| [std.md](std.md) | what std is, what it promises, and an index of its modules and exports |
 
 Open questions the sources do not settle are collected in [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
 
@@ -43,6 +43,9 @@ section of `docs/internals/open-rulings.md`, or an inventory row `D<id>`
 (`docs/internals/inventory/D<id>.md`).
 
 > Ruling: owner 2026-09-29 (C), DECISIONS.md §"A `boolean` is never a number".
+
+A rule that rests on a guide, a design document or a std convention rather than a ruling
+carries a `Source:` line instead.
 
 The ruling outranks every other source. Where `docs/guide/` or a design doc says otherwise,
 the spec follows the ruling and the guide is out of date.

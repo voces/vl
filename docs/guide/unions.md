@@ -113,9 +113,9 @@ function f(s: A | B): boolean { s is A }
 // refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
 ```
 
-Whether the first of these refusals is a design rule is pending an owner question (Q4 in
-`docs/spec/OPEN-QUESTIONS.md`): the 2026-09-02 ruling that called it one is amended, and
-no later ruling restates it. The second prints the same sentence, which is false there,
+The first of these refusals is not a design rule: the owner ruled on 2026-10-12 (Q4 (c),
+DECISIONS.md §"Record arms that share a field name form a legal union") that the union is
+legal and `is` tests the value. The build is pending (D4056). The second prints the same sentence, which is false there,
 because both literal fields are present (D4056).
 
 ### Two names for one shape are one type
