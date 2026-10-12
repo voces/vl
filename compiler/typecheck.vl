@@ -18198,6 +18198,9 @@ let wsBodyErr: {[i32]: boolean} = Map()
 let wsValueRead: {[string]: boolean} = Map()
 // Set while an argument a rewrite serves is delivered, so the width refusal stays quiet.
 let wsSuppress = false
+// The argument expression being delivered to its parameter, or -1: a literal there that sets a
+// field the parameter does not declare is passed wider, its extra initializer evaluated (D4070).
+let argLitAt = -1
 // Rewritten declarations an instance refused something in this pass: the declared parameter
 // accepted it, so the refusal is the rewrite's, and the rewrite is undone.
 let wsInstErr: i32[] = []
@@ -18211,6 +18214,7 @@ function wsReset() {
 }
 
 function wsPassReset() {
+  argLitAt = -1
   wsPendDecl = []
   wsPendParam = []
   wsBodyErr = Map()
@@ -25387,6 +25391,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
             ok
             && bareBraceSpec == 0
             && !inferQuiet
+            && srcExpr != argLitAt
             && objLitSetsUndeclared(e, dtix)
           ) {
             if !objLitHasDupKey(srcExpr) {
@@ -25426,6 +25431,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
                   if (
                     !inferQuiet
                     && bareBraceSpec == 0
+                    && srcExpr != argLitAt
                     && !objLitHasDupKey(srcExpr)
                   ) {
                     objLitUndeclaredErr(
@@ -49984,7 +49990,11 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
       }
       constrainEmptyExpr(args[i], at, expected)
-      if !assignableExpr(args[i], at, expected) {
+      const savedArgLit = argLitAt
+      argLitAt = args[i]
+      const argOk = assignableExpr(args[i], at, expected)
+      argLitAt = savedArgLit
+      if !argOk {
         // Anchored at the offending argument (or its offending return site),
         // never at the call node — see `argMismatchErr`.
         argMismatchErr(i + 1, expected, at, args[i])
@@ -51643,7 +51653,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const wsOrig = wsOrigTyOf(n, i)
     if wsOrig >= 0 && i < args.length && args[i] >= 0 && !tyHasTyVar(at) {
       wsSuppress = true
+      const savedOrigLit = argLitAt
+      argLitAt = args[i]
       const wsOk = assignableExpr(args[i], at, wsOrig)
+      argLitAt = savedOrigLit
       wsSuppress = false
       if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
     }
@@ -51653,7 +51666,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       && wsCandidate(n, i, args[i], at, expected)
     if wsNew { wsNotePending(n, i) }
     wsSuppress = wsNew
+    const savedArgLit = argLitAt
+    argLitAt = args[i]
     const argOk = assignableExpr(args[i], at, expected)
+    argLitAt = savedArgLit
     wsSuppress = false
     lbiNoDest = savedLbiGen
     widenRetagGenArg = savedGenArg
@@ -67769,8 +67785,8 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       initTy = TY_ERR
     }
   }
-  // An if or match whose arm yields no value joins `void` into the binding's type; refused at that arm,
-  // the emitter having no value to store from it (D4071).
+  // An initializer whose type includes `void` has no value to store: refused at the if or match arm
+  // that yields none, else at the initializer (D4071).
   if (
     n.letInit >= 0
     && annot < 0
@@ -67779,17 +67795,30 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     && tyMentionsVoid(initTy, 8)
     && !symNameIsMinted(n.letName)
   ) {
-    const kw = valueBranchKeyword(n.letInit)
-    tErr(
-      "this arm yields no value, but the `"
-        + kw
-        + "` is the value of `"
-        + n.letName
-        + "`: end the arm with a value, or make the `"
-        + kw
-        + "` a statement",
-      ifNoValueArmAt(n.letInit),
-    )
+    const arm = ifNoValueArmAt(n.letInit)
+    if arm != n.letInit {
+      const kw = valueBranchKeyword(n.letInit)
+      tErr(
+        "this arm yields no value, but the `"
+          + kw
+          + "` is the value of `"
+          + n.letName
+          + "`: end the arm with a value, or make the `"
+          + kw
+          + "` a statement",
+        arm,
+      )
+    } else {
+      tErr(
+        "`"
+          + n.letName
+          + "` would take the type "
+          + tyToStr(initTy)
+          + ", and a value that may be `void` cannot be stored: test it before binding "
+          + "it, or bind it only where it holds a value",
+        n.letInit,
+      )
+    }
     initTy = TY_ERR
   }
   // A `never` initializer leaves nothing to bind, and an un-annotated binding would take a type

@@ -79,7 +79,7 @@ const v = f()   // refused: cannot bind the void result of 'v'
 
 > Status: `vl check` refuses a `void` field but accepts `void[]`, `Map<K, void>` and
 > `void | T` written in an annotation. The first two then fail at build time, and the
-> union is refused only when it is read (D4052; the inferred face is D1993).
+> union is refused only when it is read (D4052; the inferred face, D1993, is refused at the binding).
 
 **T1.5** `never` has no values. It may be written only as a function's declared return
 type. A `never` function must end every path in another never-returning call, such as
