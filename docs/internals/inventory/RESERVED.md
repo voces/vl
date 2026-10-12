@@ -87,7 +87,6 @@ D3800-D3802  lane-DG  2026-10-07  redundant-annotation hint at a `??` default (D
 D3803-D3807  lane-PF  2026-10-07  sunpa per-frame allocation (item c): D3803 filed and closed; D3804 (list vectors, needs design), D3805 (for-in over a literal) filed open
 D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D3800 closed); D3811, D3812 filed open
 D3880-D3889  lane-SC  2026-10-08  D3881 filed open; the rest for D3827, D3853 and their residue
-D3890-D3899  lane-SC  2026-10-08  lane SC soundness rows (D3853 redesign, D3883)
 D3970-D3979  lane-SC  2026-10-10  lane SC rows for D3948 and the rv3498 residue
 D3985-D3989  lane-CK  2026-10-10  ruling-C follow-ups: rows the r5 review of #3500 found
 D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)

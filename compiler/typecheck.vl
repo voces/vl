@@ -19803,6 +19803,24 @@ function numLitNotesDisagree(drop: boolean[]) {
   0
 }
 
+// Drop the queued notes of diagnostics at index `mark` or later, which a caller has popped: a
+// note is matched to its diagnostic by index and message, so a later one could inherit it.
+function numLitNotesDropFrom(mark: i32) {
+  while nlnDiag.length > 0 && nlnDiag[nlnDiag.length - 1] >= mark {
+    nlnDiag.pop()
+    nlnMsg.pop()
+    nlnText.pop()
+    nlnDecl.pop()
+    nlnUse.pop()
+    nlnSlot.pop()
+    nlnWant.pop()
+    nlnAnn.pop()
+    nlnLeaf.pop()
+    nlnLeafTy.pop()
+  }
+  0
+}
+
 // Append each queued note whose diagnostic survived. A read's note is dropped when
 // `numLitNamesStoredNonLit` finds a non-literal store to the binding, under its declared or its
 // used name; a store's note when `numLitAsgNotesRefuted` finds a store its annotation refuses.
@@ -52408,7 +52426,14 @@ function checkCallNode(n: Call, ix: i32) {
   ckCalleeIx = savedCallee
   const ft = T.tys[fnTy]
   if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
-  if ft is TyErr { return TY_ERR }
+  if ft is TyErr {
+    // A module global called above its declaration, which the hoist could not type: its
+    // arguments are still checked on their own, as a hole callee's are (D3899).
+    if cfn is Ident && globalBeforeDecl(cfn.identName) {
+      for ga in n.callArgs { checkNode(ga) }
+    }
+    return TY_ERR
+  }
   if ft is TyVar {
     // Calling an inference-hole value — an un-annotated parameter used as a function inside
     // its own generic body (`function apply(fn, a, b) { fn(a, b) }`): the arguments are
@@ -53355,13 +53380,10 @@ function globalInitPrePass(lets: i32[]) {
   symEnabled = 0
   for li in lets {
     const ln = P.nodes[li]
-    // A bare lambda binding is typed where it is written: checking one early would fix its
-    // un-annotated parameters before pass 2 marks them as inference holes.
+    // A lambda with an un-annotated parameter is typed where it is written: checking one early
+    // would fix those parameters before pass 2 marks them as inference holes.
     let lambdaInit = false
-    if ln is LetDecl {
-      const lin = P.nodes[parenPeelIx(ln.letInit)]
-      if lin is FuncDecl { lambdaInit = true }
-    }
+    if ln is LetDecl { lambdaInit = fsbIsHoleLambda(parenPeelIx(ln.letInit)) }
     if ln is LetDecl && !lambdaInit {
       const savedDiag = T.diags.length
       // Its own flow frame, so a read of a global still in the dead zone is neither reported
@@ -53371,9 +53393,16 @@ function globalInitPrePass(lets: i32[]) {
       daLeaveFrame(daSaved)
       const clean = T.diags.length == savedDiag
       while T.diags.length > savedDiag { T.diags.pop() }
+      numLitNotesDropFrom(savedDiag)
+      // A bare name of a top-level function is that function's own type, its type parameters
+      // included, and the alias is recorded as pass 2 would record it (D3899).
+      const aDecl = globalInitFnAlias(ln.letInit)
       if clean && it >= 0 && it != TY_ERR && !isVoidTy(it) && !isNullTy(it) {
-        if !isNeverTy(it) && !tyHasHole(it) {
+        if !isNeverTy(it) && (aDecl >= 0 || !tyHasHole(it)) {
           declare(ln.letName, constStrLitBound(ln, it))
+          if aDecl >= 0 && fnAliasScopes.length > 0 {
+            fnAliasScopes[0][ln.letName] = aDecl
+          }
         }
       }
     }
@@ -53384,6 +53413,19 @@ function globalInitPrePass(lets: i32[]) {
   rcoalTruncate(savedRcoal)
   isvalTruncate(savedIsval)
   0
+}
+
+// Whether `name` resolves to a module global whose declaration pass 2 has not reached.
+function globalBeforeDecl(name: string): boolean {
+  lookupDepth(name) == 0 && (moduleBeforeDecl[name] ?? -1) >= 0
+}
+
+// The top-level function declaration a module global's initializer names bare, or -1.
+function globalInitFnAlias(init: i32): i32 {
+  if init < 0 { return -1 }
+  const n = P.nodes[parenPeelIx(init)]
+  if n is Ident { return fnDeclIx[n.identName] ?? -1 }
+  -1
 }
 
 // Pass 1.9: indexes the generic declarations whose bodies `cstrProbeBefore` will walk.
@@ -67549,7 +67591,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   // `const f = addT` — records which declaration this binding aliases, for deferred-constraint
   // ownership alone. A bare Ident initializer naming a declared function is the whole rung.
   if n.letInit >= 0 {
-    const aInit = P.nodes[n.letInit]
+    const aInit = P.nodes[parenPeelIx(n.letInit)]
     if aInit is Ident {
       const aDecl = fnDeclIx[aInit.identName]
         ?? lookupFnDeclNode(aInit.identName)
