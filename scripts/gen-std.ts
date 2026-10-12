@@ -22,7 +22,7 @@
 // host recomputes it over its own copy (`std_hash` in main.rs), so the two
 // implementations are cross-checked by tests/vl_std_cmd_test.ts rather than
 // trusted.
-import { fileURLToPath } from "node:url";
+import { filePath } from "../tests/support/filePath.ts";
 
 
 const STD_DIR = new URL("../std/", import.meta.url);
@@ -354,8 +354,8 @@ if (import.meta.main) {
   await Deno.writeTextFile(OUT_RS, rust);
   const recv = renderStdReceivers(sources);
   await Deno.writeTextFile(OUT_RECV, recv);
-  console.error(`wrote ${fileURLToPath(OUT)} (${text.length} bytes)`);
-  console.error(`wrote ${fileURLToPath(OUT_RS)} (${rust.length} bytes)`);
-  console.error(`wrote ${fileURLToPath(OUT_RECV)} (${recv.length} bytes)`);
+  console.error(`wrote ${filePath(OUT)} (${text.length} bytes)`);
+  console.error(`wrote ${filePath(OUT_RS)} (${rust.length} bytes)`);
+  console.error(`wrote ${filePath(OUT_RECV)} (${recv.length} bytes)`);
   console.error(`std hash ${stdHash(sources)} over ${sources.length} modules`);
 }

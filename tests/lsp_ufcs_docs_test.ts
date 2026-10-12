@@ -10,7 +10,7 @@
 // shared `docForDeclTok` is for, and one case here asserts the answer is byte-for-byte
 // hover's rather than assuming it.
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
@@ -21,7 +21,7 @@ import {
 import { completion, initLsp } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

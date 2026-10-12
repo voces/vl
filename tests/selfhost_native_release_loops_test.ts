@@ -3,7 +3,7 @@
 // them beside the shape/melt rows; the machinery is in the shared support module.
 //
 // @test-timing opt
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import {
   CASES,
   CASES_LIST,
@@ -74,7 +74,7 @@ for (const rel of CASES_LIST) {
     name: `native-release: ${rel} — vl build -O3 stays valid + reproduces @log`,
     ignore: !ENABLED,
     fn: async () => {
-      const srcPath = fileURLToPath(new URL(rel, CASES));
+      const srcPath = filePath(new URL(rel, CASES));
       const want = logsOf(Deno.readTextFileSync(new URL(rel, CASES)));
       const tmp = await Deno.makeTempDir();
       try {

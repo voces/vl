@@ -50,7 +50,7 @@
 // @test-timing native
 // @test-timing sweep n=2328 name~"native-align setup"
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 const CASES = new URL("./cases/", import.meta.url);
@@ -68,7 +68,7 @@ if (GATED && !ENABLED) {
 }
 
 const src = (rel: string) => Deno.readTextFileSync(new URL(rel, CASES));
-const path = (rel: string) => fileURLToPath(new URL(rel, CASES));
+const path = (rel: string) => filePath(new URL(rel, CASES));
 const base = (rel: string) => rel.split("/").pop()!;
 const head = (s: string, n = 1) => s.trim().split("\n").slice(0, n).join(" / ");
 

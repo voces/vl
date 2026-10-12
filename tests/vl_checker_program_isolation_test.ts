@@ -18,8 +18,8 @@
 // THE INVARIANT IS GENERAL, deliberately: compiling B after A must produce byte-identical
 // output to compiling B first. It does not encode any particular column, so it keeps
 // working for leaks nobody has thought of yet.
-import { fileURLToPath } from "node:url";
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+import { filePath } from "./support/filePath.ts";
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 
 const seedExists = (() => {
   try {

@@ -23,7 +23,7 @@
 //
 // @test-timing native
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -148,7 +148,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const wasmOpt = Deno.env.get("VL_WASM_OPT") ??
-      fileURLToPath(new URL("../node_modules/.bin/wasm-opt", import.meta.url));
+      filePath(new URL("../node_modules/.bin/wasm-opt", import.meta.url));
     if (!exists(wasmOpt)) return; // binaryen absent — the opt rungs have their own gate
     await withDir(async (dir, src) => {
       const env = { VL_WASM_OPT: wasmOpt };

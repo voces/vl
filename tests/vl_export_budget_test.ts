@@ -14,10 +14,10 @@
 //
 // @test-timing sweep n=30
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import { pythonBin } from "./support/tree.ts";
 
-const ROOT = fileURLToPath(new URL("../", import.meta.url)).replace(/[\\/]$/, "");
+const ROOT = filePath(new URL("../", import.meta.url)).replace(/[\\/]$/, "");
 const SCRIPT = `${ROOT}/scripts/export-budget.py`;
 const BASELINE = `${ROOT}/scripts/export-budget-baseline.json`;
 

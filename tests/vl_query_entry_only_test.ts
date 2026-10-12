@@ -5,11 +5,11 @@
 // (D3476's sibling, found when `std/math.vl` grew and an `ax` landed under a fixture's
 // cursor). Loads the real seed; self-ignores without one.
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import type { ModuleReader } from "../compiler/coreTypes.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const ignore = (() => {
   try {
     Deno.statSync(SEED);

@@ -11,8 +11,8 @@
 // because it is the tree the TEST file lives in. See CLAUDE.md, "`vl` resolves
 // `std:` from the EXE's checkout — a worktree probe measures the WRONG std".
 
-import { fileURLToPath } from "node:url";
-export const ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(
+import { filePath } from "./filePath.ts";
+export const ROOT = filePath(new URL("../../", import.meta.url)).replace(
   /[\\/]$/,
   "",
 );

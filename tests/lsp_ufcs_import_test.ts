@@ -23,7 +23,7 @@
 // `ufcsImportModules` / `ufcsImportFixes`) run unconditionally.
 //   deno test -A --no-check tests/lsp_ufcs_import_test.ts
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import {
   importInsertionEdit,
   importSpecifierForKey,
@@ -360,7 +360,7 @@ Deno.test("quick-fix: two candidate modules yield two actions and no preferred o
 
 // ---- seed-backed: the real checker query -------------------------------------
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

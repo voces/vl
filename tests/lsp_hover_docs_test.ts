@@ -12,11 +12,11 @@
 // BARE fence, byte for byte what hover produced before docs existed — no paragraph, no
 // trailing blank line.
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { docMarkdown } from "../lsp/src/typeFeatures.ts";
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

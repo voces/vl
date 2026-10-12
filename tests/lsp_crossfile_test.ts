@@ -10,7 +10,7 @@
 //
 // Run: deno test -A --no-check tests/lsp_crossfile_test.ts
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import type { ModuleReader } from "../compiler/coreTypes.ts";
 import {
   crossFileReferences,
@@ -37,7 +37,7 @@ const memoryReader = (files: Record<string, string>): ModuleReader =>
 // and inject it via `xref`. Absent (fresh clone, no `refresh-compiler.sh`) the
 // find-refs tests self-ignore via `refsIgnore` — the convention of the rest of the
 // wasm suite. The go-to-def tests use the TS module-graph helpers and need no seed.
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const refsIgnore = !((() => {
   try {
     Deno.statSync(SEED);

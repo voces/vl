@@ -28,7 +28,7 @@
 
 // This repo's test files carry their own assert (no `@std/assert` in the import
 // map) — same three lines as `lsp_docxref_test.ts`.
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
   const e = JSON.stringify(expected);
@@ -37,7 +37,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   }
 };
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

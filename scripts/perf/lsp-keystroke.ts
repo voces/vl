@@ -15,10 +15,10 @@
 //
 //   deno run -A scripts/perf/lsp-keystroke.ts [seed.wasm] [reps]
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "../../tests/support/filePath.ts";
 import { loadWasmChecker } from "../../lsp/src/wasmCheckerNode.ts";
 
-const ROOT = fileURLToPath(new URL("../../", import.meta.url)).replace(/[\\/]$/, "");
+const ROOT = filePath(new URL("../../", import.meta.url)).replace(/[\\/]$/, "");
 const SEED = Deno.args[0] ?? `${ROOT}/build/vl-compiler.wasm`;
 const REPS = Number(Deno.args[1] ?? "3");
 

@@ -18,8 +18,8 @@
 // A node written over several LINES spans them: `endLine` rides the report beside `endCol`,
 // which counts from it. `endLine` is emitted only where it differs from `line`, so a row
 // that declares none is also asserting the field is absent.
-import { fileURLToPath } from "node:url";
-const ROOT = fileURLToPath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
+import { filePath } from "./support/filePath.ts";
+const ROOT = filePath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl${
   Deno.build.os === "windows" ? ".exe" : ""
 }`;

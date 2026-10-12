@@ -5,7 +5,7 @@
 // the rest of the wasm suite; the pure conversions run unconditionally.
 //   deno test -A --no-check tests/lsp_getter_wasm_test.ts
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import {
   memberCompletionsFromWasm,
@@ -19,7 +19,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
 };
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

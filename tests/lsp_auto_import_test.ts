@@ -9,7 +9,7 @@
 //
 // Run: deno test -A --no-check tests/lsp_auto_import_test.ts
 
-import { fileURLToPath } from "node:url";
+import { filePath } from "./support/filePath.ts";
 import {
   importInsertionEdit,
   stdAutoImportCompletions,
@@ -221,7 +221,7 @@ Deno.test("auto-import: a re-exporter is offered when it is the only provider", 
 
 // ---- seed-backed: real formatter spelling + the native scopeAt filter --------
 
-const SEED = fileURLToPath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
