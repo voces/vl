@@ -29,9 +29,9 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(WASM_DIS);

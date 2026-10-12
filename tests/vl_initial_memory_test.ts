@@ -10,12 +10,12 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen } from "./support/tree.ts";
 import { memoryLimits } from "./support/wasmMemory.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER);
-const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_OPT = binaryen("wasm-opt");
+const WASM_DIS = binaryen("wasm-dis");
 const HAVE_OPT = exists(WASM_OPT);
 if (!ENABLED) {
   console.warn("[initial-memory] skipped — missing vl binary or seed wasm");

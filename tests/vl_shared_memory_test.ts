@@ -11,11 +11,11 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./support/tree.ts";
 import { memoryLimits, sections } from "./support/wasmMemory.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER);
-const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
+const WASM_OPT = binaryen("wasm-opt");
 const HAVE_OPT = exists(WASM_OPT);
 if (!ENABLED) {
   console.warn(
@@ -169,7 +169,7 @@ Deno.test({
 
 // The shared allocator is decided by the build: a default build of a unit that allocates
 // carries no atomic at all, a shared build allocates through them.
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 Deno.test({
   name: "shared-memory: only a shared build allocates with atomics",
   ignore: !ENABLED || !exists(WASM_DIS),

@@ -20,6 +20,14 @@ export const VL = `${ROOT}/scripts/vl-host/target/release/vl${
   Deno.build.os === "windows" ? ".exe" : ""
 }`;
 export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+
+/** A binaryen CLI tool from `node_modules/.bin` (it is not on PATH). On Windows
+ * npm installs the spawnable shim as `<tool>.cmd`; the bare name is a node script
+ * the OS cannot execute. */
+export const binaryen = (tool: string): string =>
+  `${ROOT}/node_modules/.bin/${tool}${
+    Deno.build.os === "windows" ? ".cmd" : ""
+  }`;
 export const STD = `${ROOT}/std`;
 
 /** Whether `p` exists. `Deno.statSync` throws on a miss; this is the test suite's

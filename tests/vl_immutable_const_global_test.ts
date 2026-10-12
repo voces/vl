@@ -10,9 +10,9 @@
 // GATING: needs the built binary, the seed and `wasm-dis` (`node_modules`). A missing
 // prerequisite self-ignores rather than fails, so read the suite's IGNORED COUNT.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
 if (!ENABLED) console.warn("[immutable-const-global] skipped — missing vl, the seed or wasm-dis");
 

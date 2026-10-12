@@ -2863,7 +2863,10 @@ fn staged_root_and_cwd() -> (String, String) {
         _ => None,
     };
     let cwd = std::env::current_dir().ok().map(|c| c.to_string_lossy().into_owned());
-    (root.unwrap_or_default(), cwd.unwrap_or_default())
+    // The guest compares `/`-separated keys (`checkOriginKeyOf`), so Windows paths are
+    // staged with forward slashes, as `stage_program` stages the entry path.
+    let slash = |s: String| if cfg!(windows) { s.replace('\\', "/") } else { s };
+    (slash(root.unwrap_or_default()), slash(cwd.unwrap_or_default()))
 }
 
 /// The seed file's bytes, read ONCE per process and path: `load_compiler_module` compiles
@@ -5519,14 +5522,16 @@ fn binaryen_tool(tool: &str, env_override: &str) -> Option<String> {
     if let Ok(p) = std::env::var(env_override) {
         return Some(p);
     }
-    let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
-        let cand = format!("{dir}/{tool}");
-        if std::fs::metadata(&cand)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            return Some(cand);
+    // Windows: `;`-separated PATH, and the spawnable file carries an extension
+    // (a native `.exe`, or npm's `.cmd` shim around the node script).
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let cand = dir.join(format!("{tool}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
         }
     }
     None

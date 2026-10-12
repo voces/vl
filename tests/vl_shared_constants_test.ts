@@ -9,10 +9,10 @@
 // `@allocs`: the `struct.new*` / `array.new*` sites left in the fixture's own function bodies
 // in the plain build. A global's initializer runs once, and the shared runtime helpers
 // (`__str_concat__` and kin, present whatever the fixture does) are not the fixture's.
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./support/tree.ts";
 
 const DIR = `${ROOT}/tests/fixtures/shared-constants`;
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1" && exists(VL) &&
   exists(COMPILER) && exists(WASM_DIS);
 const FIXTURES = [

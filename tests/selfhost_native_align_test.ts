@@ -415,6 +415,24 @@ const checkWaves = (rels: string[]): string[][] => {
   const n = Math.min(SPAWN_JOBS, rels.length);
   const out: string[][] = Array.from({ length: n }, () => []);
   rels.forEach((rel, i) => out[i % n].push(rel));
+  return out.flatMap(fitArgv);
+};
+
+// Windows caps a whole command line at 32,767 characters, which one wave of absolute
+// paths exceeds; there a wave runs as several processes. Elsewhere it stays one.
+const ARGV_BUDGET = Deno.build.os === "windows" ? 24_000 : Infinity;
+const fitArgv = (rels: string[]): string[][] => {
+  const out: string[][] = [[]];
+  let len = 0;
+  for (const rel of rels) {
+    const n = path(rel).length + 3;
+    if (len + n > ARGV_BUDGET && out[out.length - 1].length > 0) {
+      out.push([]);
+      len = 0;
+    }
+    out[out.length - 1].push(rel);
+    len += n;
+  }
   return out;
 };
 
