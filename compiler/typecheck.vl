@@ -4791,10 +4791,9 @@ let flFOff: i32[] = []
 let nomLitRelax = 0
 // Litunion alias provenance: the narrowing, join and intersection algebra re-mints a declared
 // litunion alias as a fresh arena copy — a `TyUnion` sharing the alias's `TyLit` members at an
-// index the union-alias registry cannot recognize. These arrays record (copy index → source alias
-// index) at the mint sites; only a copy whose member set is contained in the alias's records.
-let cLitUnionCopyTyIxs: i32[] = []
-let cLitUnionCopyAliasIxs: i32[] = []
+// index the union-alias registry cannot recognize. Indexed by the copy's arena index, this holds
+// its source alias index, or -1; only a copy whose member set is contained in the alias's records.
+let cLitUnionCopyAliasOf: i32[] = []
 // A single placeholder `TyFunc` arena index for monomorphizer `=>sigkey` closure pins (C1 endgame).
 let cFuncPinTyIx = -1
 // A single placeholder `TyObj` arena index for interned anonymous-shape `#anonN` names (C1 endgame).
@@ -5837,8 +5836,7 @@ export function initChecker() {
   flFWidth = []
   flFNest = []
   flFOff = []
-  cLitUnionCopyTyIxs = []
-  cLitUnionCopyAliasIxs = []
+  cLitUnionCopyAliasOf = []
   checkerArmed = true
   TY_I32 = mkPrim("i32")
   TY_I64 = mkPrim("i64")
@@ -5905,6 +5903,13 @@ export function initChecker() {
   pgPreKeys = []
   pgPreTys = []
   weSums = Map()
+  weShapeSums = Map()
+  weShapeIdOf = Map()
+  weShapeText = []
+  weShapeHasAt = []
+  weShapeHasStar = []
+  weShapeParam = []
+  weShapeMark = []
   weUnresSums = Map()
   weUnresAny = false
   weProvSlot = Map()
@@ -7194,14 +7199,14 @@ let weCut = 0
 // that closes it), so it is cached, and the cycle's provisional entries are settled with it.
 let weProvSlot: {[string]: i32} = Map()
 let weProvKeys: string[] = []
-let weProvSums: string[] = []
+let weProvSums: i32[][] = []
 let weProvLows: i32[] = []
 let weLow = 1073741824
 const WE_NO_LOW = 1073741824
 
 // Summaries that read a node with no type recorded yet. Such an answer is the conservative one, and
 // it can only sharpen once another body is checked, so it is kept until a body is entered or left.
-let weUnresSums: {[string]: string} = Map()
+let weUnresSums: {[string]: i32[]} = Map()
 let weUnresAny = false
 
 // Answer a recursive cycle opaque instead of ⊥ — the strictly-fail-closed reading. It is sound but
@@ -7215,6 +7220,91 @@ const ALIAS_CYCLE_OPAQUE = false
 // rules are one code path and one measurement harness. The effect-based rule is what ships;
 // `docs/internals/open-rulings.md`.
 const ALIAS_RULE_BROAD = false
+
+// Write-shape summaries (`fnWriteShapes`) are lists of interned shape ids, each shape text kept
+// once, so a summary is copied and deduplicated without re-splitting a string. `WE_OPAQUE` is the
+// opaque summary; every other list holds ids only.
+let weShapeSums: {[string]: i32[]} = Map()
+let weShapeIdOf: {[string]: i32} = Map()
+let weShapeText: string[] = []
+let weShapeHasAt: boolean[] = []
+let weShapeHasStar: boolean[] = []
+// Per shape id: the parameter an `@i` shape names, -1 when its digits do not parse, -2 for any
+// other shape.
+let weShapeParam: i32[] = []
+// Per shape id: the `weDedupe` pass that last kept it.
+let weShapeMark: i32[] = []
+let weMarkGen = 0
+const WE_OPAQUE: i32[] = [-1]
+const weNoIds: i32[] = []
+
+function weIsOpaque(l: i32[]): boolean { l.length > 0 && l[0] < 0 }
+
+// The id of the shape text `t`, interned on first sight.
+function weShapeId(t: string): i32 {
+  const hit = weShapeIdOf[t] ?? -1
+  if hit >= 0 { return hit }
+  const id = weShapeText.length
+  weShapeIdOf[t] = id
+  weShapeText.push(t)
+  weShapeHasAt.push(t.indexOf("@") >= 0)
+  weShapeHasStar.push(t.indexOf("*") >= 0)
+  let pj = -2
+  if t[0] == '@' { pj = weDigits(t.slice(1, t.length)) }
+  weShapeParam.push(pj)
+  weShapeMark.push(0)
+  id
+}
+
+// Push the ids of the `,`-terminated shapes in `s` onto `out`, split where `weSplit` splits.
+function weInternInto(out: i32[], s: string) {
+  let start = 0
+  let i = 0
+  while i < s.length {
+    if s[i] == ',' {
+      if i > start { out.push(weShapeId(s.slice(start, i))) }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A one-shape summary for the `,`-terminated text `s`.
+function weIdsOf(s: string): i32[] {
+  const out: i32[] = []
+  weInternInto(out, s)
+  out
+}
+
+// Append the shapes of the non-opaque summary `l` to `out`.
+function weAppend(out: i32[], l: i32[]) {
+  let i = 0
+  while i < l.length {
+    out.push(l[i])
+    i = i + 1
+  }
+  0
+}
+
+// Whether a non-opaque summary holds a shape whose text has an `@` (`weShapeHasAt`) or a `*`.
+function weAnyAt(l: i32[]): boolean {
+  let i = 0
+  while i < l.length {
+    if l[i] >= 0 && weShapeHasAt[l[i]] { return true }
+    i = i + 1
+  }
+  false
+}
+
+function weAnyStar(l: i32[]): boolean {
+  let i = 0
+  while i < l.length {
+    if l[i] >= 0 && weShapeHasStar[l[i]] { return true }
+    i = i + 1
+  }
+  false
+}
 
 // Split a `,`-terminated effect summary into its sub-paths.
 function weSplit(s: string) {
@@ -7669,19 +7759,20 @@ function opFreeEffects(ix: i32) {
 // name spelled: `.f` a field stored, `[k]` / `[]` a cell stored, `-[k]` / `-[]` a map cell removed;
 // `,`-terminated, or `"*"` opaque. Keyed on the shape, it sees a write through any alias, argument
 // or receiver (D2461).
-function fnWriteShapes(fnIx: i32) {
+function fnWriteShapes(fnIx: i32): i32[] {
   const key = i32ToStr(fnIx) + "#shape"
-  const hit = weSums[key]
-  if hit is string { return hit }
+  const hit = weShapeSums[key]
+  if hit != null { return hit }
   const uhit = weUnresSums[key]
-  if uhit is string {
+  if uhit != null {
     weUnres = weUnres + 1
     return uhit
   }
   const oi = weOpenIndex(key)
   if oi >= 0 {
     if oi < weLow { weLow = oi }
-    return weCycleAnswer()
+    if weCycleAnswer() == "*" { return WE_OPAQUE }
+    return weNoIds
   }
   const ps = weProvSlot[key] ?? -1
   if ps >= 0 && ps < weProvKeys.length && weProvKeys[ps] == key {
@@ -7713,7 +7804,9 @@ function fnWriteShapes(fnIx: i32) {
     weLow = WE_NO_LOW
     weOpen.push(key)
     weRoots.push(fd.fnBody)
-    const acc = weDedupe(weScanShapes(fd.fnBody, fresh, params, bound))
+    const scan: i32[] = []
+    let acc = WE_OPAQUE
+    if !weScanShapes(fd.fnBody, fresh, params, bound, scan) { acc = weDedupe(scan) }
     weRoots.pop()
     weOpen.pop()
     const low = weLow
@@ -7730,28 +7823,27 @@ function fnWriteShapes(fnIx: i32) {
     }
     weSettleCycle(provMark, acc, settled)
     if settled {
-      weSums[key] = acc
+      weShapeSums[key] = acc
     } else {
       weUnresSums[key] = acc
       weUnresAny = true
     }
     return acc
   }
-  "*"
+  WE_OPAQUE
 }
 
 // `sum` with each shape kept once: a summary is a set, and one that repeats a callee's shapes per
 // call grows with every path through the call graph rather than with what it holds.
-function weDedupe(sum: string): string {
-  if sum == "*" || sum == "" { return sum }
-  const parts = weSplit(sum)
-  const seen: {[string]: boolean} = Map()
-  let out = ""
+function weDedupe(sum: i32[]): i32[] {
+  if weIsOpaque(sum) || sum.length == 0 { return sum }
+  weMarkGen = weMarkGen + 1
+  const out: i32[] = []
   let i = 0
-  while i < parts.length {
-    if !seen.has(parts[i]) {
-      seen[parts[i]] = true
-      out = out + parts[i] + ","
+  while i < sum.length {
+    if weShapeMark[sum[i]] != weMarkGen {
+      weShapeMark[sum[i]] = weMarkGen
+      out.push(sum[i])
     }
     i = i + 1
   }
@@ -7762,13 +7854,13 @@ function weDedupe(sum: string): string {
 // whose summary is `acc`. Every function on one cycle reaches every other, so without a parameter
 // call (`@i`) on either side each one's summary is `acc` itself; any other is dropped, to be asked
 // again.
-function weSettleCycle(mark: i32, acc: string, settled: boolean) {
+function weSettleCycle(mark: i32, acc: i32[], settled: boolean) {
   while weProvKeys.length > mark {
     const k = weProvKeys.pop() ?? ""
-    const pv = weProvSums.pop() ?? "@"
+    const pv = weProvSums.pop()
     weProvLows.pop()
-    if settled && pv.indexOf("@") < 0 && acc.indexOf("@") < 0 {
-      weSums[k] = acc
+    if settled && pv != null && !weAnyAt(pv) && !weAnyAt(acc) {
+      weShapeSums[k] = acc
     }
   }
   0
@@ -7797,24 +7889,22 @@ function weScanShapes(
   fresh: string[],
   params: string[],
   bound: string[],
-) {
-  if ix < 0 || ix >= P.nodes.length { return "" }
-  let acc = ""
+  out: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
   const n = P.nodes[ix]
   if n is BinExpr {
-    if n.binOp == "=" { acc = weTargetShape(n.binLeft, fresh, bound) }
+    if n.binOp == "=" { weInternInto(out, weTargetShape(n.binLeft, fresh, bound)) }
   } else if n is Call {
-    const inner = callWriteShapes(n, ix, fresh, params, bound)
-    if inner == "*" { return "*" }
-    acc = inner
+    if callWriteShapesInto(n, ix, fresh, params, bound, out) { return true }
   }
   const ds = opSiteDecls(ix)
   let d = 0
   while d < ds.length {
-    if ds[d] < 0 { return "*" }
+    if ds[d] < 0 { return true }
     const sub = weClosed(fnWriteShapes(ds[d]))
-    if sub == "*" { return "*" }
-    acc = acc + sub
+    if weIsOpaque(sub) { return true }
+    weAppend(out, sub)
     d = d + 1
   }
   let cur = ix
@@ -7822,14 +7912,12 @@ function weScanShapes(
     const kids = nodeSpineChildren(cur)
     let i = 0
     while i < kids.length {
-      const sub = weScanShapes(kids[i], fresh, params, bound)
-      if sub == "*" { return "*" }
-      acc = acc + sub
+      if weScanShapes(kids[i], fresh, params, bound, out) { return true }
       i = i + 1
     }
     cur = elseIfLink(cur)
   }
-  acc
+  false
 }
 
 // The shape an assignment to the place at `ix` writes: `.f` a field, a cell's shape, `=g` a
@@ -7910,11 +7998,28 @@ function callWriteShapes(
   fresh: string[],
   params: string[],
   bound: string[],
-) {
+): i32[] {
+  const out: i32[] = []
+  if callWriteShapesInto(cn, callIx, fresh, params, bound, out) { return WE_OPAQUE }
+  out
+}
+
+// `callWriteShapes` appending onto `out`; true when the call is opaque, and `out` is then spent.
+function callWriteShapesInto(
+  cn: Call,
+  callIx: i32,
+  fresh: string[],
+  params: string[],
+  bound: string[],
+  out: i32[],
+): boolean {
   const cf = P.nodes[cn.callFn]
   if cf is Ident {
     const pj = strListIndexOf(params, cf.identName)
-    if pj >= 0 { return "@" + i32ToStr(pj) + "," }
+    if pj >= 0 {
+      weInternInto(out, "@" + i32ToStr(pj) + ",")
+      return false
+    }
   }
   const d = callDeclFnIx(cn, callIx)
   // A method spelled like a built-in of its receiver is that built-in.
@@ -7927,63 +8032,69 @@ function callWriteShapes(
     // A call back into a summary still being computed (a recursive edge) cannot say which slot
     // it calls, so every function value it hands on is charged.
     if weIsOpen(i32ToStr(d) + "#shape") {
-      const cyc = fnWriteShapes(d) + weCycleArgShapes(d, args, params, bound)
-      if cyc.indexOf("*") >= 0 { return "*" }
-      return own + cyc
+      // Any `*` in the callee's shapes or the charged arguments' is opaque.
+      const head = fnWriteShapes(d)
+      const tail: i32[] = []
+      const tailOpaque = weCycleArgShapesInto(d, args, params, bound, tail)
+      if weIsOpaque(head) || tailOpaque || weAnyStar(head) || weAnyStar(tail) { return true }
+      weInternInto(out, own)
+      weAppend(out, head)
+      weAppend(out, tail)
+      return false
     }
     const sub = weSubstArgs(fnWriteShapes(d), args, params, bound)
-    if sub == "*" { return "*" }
-    return own + sub
+    if weIsOpaque(sub) { return true }
+    weInternInto(out, own)
+    weAppend(out, sub)
+    return false
   }
   if d == -1 {
     if cf is Member {
       if nodeTyOf(cf.memObj) < 0 { weUnres = weUnres + 1 }
     }
-    return "*"
+    return true
   }
   if cf is Ident {
     // A local the summary cannot see through, named like no built-in.
-    if strListHas(bound, cf.identName) { return "*" }
+    if strListHas(bound, cf.identName) { return true }
   }
-  let acc = own
+  weInternInto(out, own)
   if cf is Member {
-    if !builtinMethodRunsArgs(cf.memProp) { return acc }
+    if !builtinMethodRunsArgs(cf.memProp) { return false }
   } else if cf is Ident {
-    if builtinRunsNoArg(cf.identName) { return acc }
+    if builtinRunsNoArg(cf.identName) { return false }
   }
   let a = 0
   while a < cn.callArgs.length {
     const sub = weArgShapes(cn.callArgs[a], params, bound)
-    if sub == "*" { return "*" }
-    acc = acc + sub
+    if weIsOpaque(sub) { return true }
+    weAppend(out, sub)
     a = a + 1
   }
-  acc
+  false
 }
 
 // `sum` with each `@i` replaced by the write shapes of the call's argument `i` in parameter order,
 // or "*" when one is opaque or missing.
 function weSubstArgs(
-  sum: string,
+  sum: i32[],
   args: i32[],
   params: string[],
   bound: string[],
-) {
-  if sum == "*" { return "*" }
-  if sum.indexOf("@") < 0 { return sum }
-  const parts = weSplit(sum)
-  let acc = ""
+): i32[] {
+  if weIsOpaque(sum) { return WE_OPAQUE }
+  if !weAnyAt(sum) { return sum }
+  const acc: i32[] = []
   let i = 0
-  while i < parts.length {
-    const w = parts[i]
-    if w[0] == '@' {
-      const j = weDigits(w.slice(1, w.length))
-      if j < 0 || j >= args.length { return "*" }
+  while i < sum.length {
+    const j = weShapeParam[sum[i]]
+    if j != -2 {
+      if j < 0 || j >= args.length { return WE_OPAQUE }
       const sub = weArgShapes(args[j], params, bound)
-      if sub == "*" { return "*" }
-      acc = acc + sub
+      if weIsOpaque(sub) { return WE_OPAQUE }
+      weAppend(acc, sub)
     } else {
-      acc = acc + w + ","
+      acc.push(sum[i])
     }
     i = i + 1
   }
@@ -7993,24 +8104,24 @@ function weSubstArgs(
 // The write shapes of every argument in `args` handed to a parameter of `d` that may hold a
 // function, `"*"` when one is opaque. A slot whose declared type holds no function is skipped: a
 // function value reaches a call there only through a field or an element, which is opaque anyway.
-function weCycleArgShapes(
+function weCycleArgShapesInto(
   d: i32,
   args: i32[],
   params: string[],
   bound: string[],
-): string {
+  out: i32[],
+): boolean {
   const pts = weDeclParamTys(d)
-  let acc = ""
   let i = 0
   while i < args.length {
     if weSlotMayHoldFn(pts, i) {
       const sub = weArgShapes(args[i], params, bound)
-      if sub == "*" { return "*" }
-      acc = acc + sub
+      if weIsOpaque(sub) { return true }
+      weAppend(out, sub)
     }
     i = i + 1
   }
-  acc
+  false
 }
 
 // Whether slot `i` of the declared parameter types `pts` may hold a function: its type is one, a
@@ -8053,24 +8164,24 @@ function weDigits(t: string): i32 {
 }
 
 // A summary's own `@i` markers answered opaque: a function whose parameters no call site binds.
-function weClosed(sum: string): string {
-  if sum.indexOf("@") >= 0 { return "*" }
+function weClosed(sum: i32[]): i32[] {
+  if weAnyAt(sum) { return WE_OPAQUE }
   sum
 }
 
 // What a function value handed as an argument writes when called. Inside a summary, a function
 // written in place is part of the subtree walked already, and a parameter of the summary is `@i`;
 // a named function or a `const`-bound lambda is its declaration's; anything else is opaque.
-function weArgShapes(a: i32, params: string[], bound: string[]) {
-  if a < 0 || a >= P.nodes.length { return "" }
+function weArgShapes(a: i32, params: string[], bound: string[]): i32[] {
+  if a < 0 || a >= P.nodes.length { return weNoIds }
   const an = P.nodes[a]
   if an is FuncDecl {
-    if params.length > 0 || bound.length > 0 { return "" }
+    if params.length > 0 || bound.length > 0 { return weNoIds }
     return weClosed(fnWriteShapes(a))
   }
   if an is Ident {
     const pj = strListIndexOf(params, an.identName)
-    if pj >= 0 { return "@" + i32ToStr(pj) + "," }
+    if pj >= 0 { return weIdsOf("@" + i32ToStr(pj) + ",") }
     const d = lookupFnDeclNode(an.identName)
     if d >= 0 { return weClosed(fnWriteShapes(d)) }
     const nd = findFnDeclInRoots(an.identName)
@@ -8081,12 +8192,12 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
       if ld >= 0 { return weClosed(fnWriteShapes(ld)) }
     }
     // A scalar local is no function value, whatever the call hands it to (`clz(m)`).
-    if crTyIsScalar(nodeTyOf(a)) { return "" }
-    if strListHas(bound, an.identName) { return "*" }
+    if crTyIsScalar(nodeTyOf(a)) { return weNoIds }
+    if strListHas(bound, an.identName) { return WE_OPAQUE }
   }
-  if weNeverFn(a) { return "" }
-  if crArgMayBeFn(a) { return "*" }
-  ""
+  if weNeverFn(a) { return weNoIds }
+  if crArgMayBeFn(a) { return WE_OPAQUE }
+  weNoIds
 }
 
 // Whether the expression at `a` can never evaluate to a function, by its form alone: a literal, a
@@ -8263,23 +8374,23 @@ function cellTagsMayAlias(a: string, b: string): boolean {
 // Whether a function with the write shapes `sum` may write the place keyed `key` through some
 // alias of an object on its path. A store into the key's own last step is harmless when the place
 // stores exactly the narrowed type: whatever it writes, the narrowing still holds.
-function shapesHitKey(sum: string, key: string): boolean {
-  if sum == "*" || sum.indexOf("@") >= 0 { return true }
-  if sum == "" { return false }
+function shapesHitKey(sum: i32[], key: string): boolean {
+  if weIsOpaque(sum) || weAnyAt(sum) { return true }
+  if sum.length == 0 { return false }
   const steps = keySteps(key)
   const tags = keyStepTags(key, steps)
-  const parts = weSplit(sum)
   const root = placeRootOf(key)
   let lastSafe = -1
   let i = 0
-  while i < parts.length {
-    if parts[i][0] == '=' {
-      if parts[i].slice(1, parts[i].length) == root { return true }
+  while i < sum.length {
+    const w = weShapeText[sum[i]]
+    if w[0] == '=' {
+      if w.slice(1, w.length) == root { return true }
     }
     let s = 0
     while s < steps.length {
-      if shapeHitsStep(parts[i], steps[s], tags[s]) {
-        if s < steps.length - 1 || parts[i][0] == '-' { return true }
+      if shapeHitsStep(w, steps[s], tags[s]) {
+        if s < steps.length - 1 || w[0] == '-' { return true }
         if lastSafe < 0 {
           lastSafe = 0
           if keyStoresNarrowedTy(key) { lastSafe = 1 }
@@ -13892,8 +14003,8 @@ function noteLitUnionCopy(res: i32, src: i32) {
         if !hit { return 0 }
         i = i + 1
       }
-      cLitUnionCopyTyIxs.push(res)
-      cLitUnionCopyAliasIxs.push(alias)
+      while cLitUnionCopyAliasOf.length <= res { cLitUnionCopyAliasOf.push(-1) }
+      cLitUnionCopyAliasOf[res] = alias
     }
   }
   0
@@ -64763,18 +64874,14 @@ export function tyIxIsVariantMember(ty: i32) {
 }
 // The declared litunion alias a litunion arena index denotes, or -1: the index itself when it
 // is a declared alias, else the recorded source alias when it is a checker-minted copy of one
-// (`cLitUnionCopyTyIxs`), else -1 (a genuinely-inline litunion, position-decided by canon). The
+// (`cLitUnionCopyAliasOf`), else -1 (a genuinely-inline litunion, position-decided by canon). The
 // rep layers read this instead of a copy-blind registry test.
 export function tyLitUnionAliasIx(ty: i32): i32 {
   if ty < 0 { return -1 }
   if !tyIsLitUnion(ty) { return -1 }
   if cTyIxSetHas(cUnionTyIxSet, ty) { return ty }
-  let i = 0
-  while i < cLitUnionCopyTyIxs.length {
-    if cLitUnionCopyTyIxs[i] == ty { return cLitUnionCopyAliasIxs[i] }
-    i = i + 1
-  }
-  -1
+  if ty >= cLitUnionCopyAliasOf.length { return -1 }
+  cLitUnionCopyAliasOf[ty]
 }
 // A `{tag, value}` value/struct union BOX at arena level — `isValueUnionBox`,
 // exposed under the `ty*` naming for the emitter's descriptor arms.
