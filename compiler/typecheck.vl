@@ -25292,6 +25292,7 @@ function binShiftOp(op: string): boolean {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
+  nolNoteDelivery(srcExpr, dstTy)
   if fsbName.length > 0 && !inferQuiet && srcExpr >= 0 {
     fsbNoteFnDelivery(srcExpr, dstTy)
   }
@@ -61343,6 +61344,8 @@ function checkProgramPass(rootIx: i32) {
   nodePinPay = []
   let ntz = 0
   lbiDefaultExpr = Map()
+  nolLits = []
+  nolTaken = Map()
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
     const pn = P.nodes[ntz]
@@ -61358,6 +61361,7 @@ function checkProgramPass(rootIx: i32) {
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
   flushUninferred(0)
+  flushNullOnlyLits()
   flushContainerNullHoles()
   // …and with every pin now in, grade what `__array_new_default__` needed to default.
   checkArrayNewDefaultElems()
@@ -74680,7 +74684,104 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     if f32El >= 0 { elemTy = f32El }
   }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
+  if elemTy == TY_NULL { nolLits.push(_ix) }
   return mkArrayTy(elemTy)
+}
+
+// D1832 — a list literal whose every element is `null`, and those of them a typed destination
+// received. `null[]` has no element rep, so `flushNullOnlyLits` refuses the rest at program end.
+let nolLits: i32[] = []
+let nolTaken: {[i32]: boolean} = Map()
+
+// Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
+// destination beside the value. A part whose own destination holds a type variable or hole, or
+// is itself `null[]`, types nothing.
+function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
+  if nolLits.length == 0 || srcExpr < 0 || dstTy < 0 { return 0 }
+  const todo: i32[] = [srcExpr]
+  const dsts: i32[] = [dstTy]
+  while todo.length > 0 {
+    const at = parenPeelIx(todo.pop() ?? -1)
+    const dt = dsts.pop() ?? -1
+    if at >= 0 && at < P.nodes.length && dt >= 0 {
+      nolPushParts(at, dt, todo, dsts)
+    }
+  }
+  0
+}
+
+// The value parts of node `at` a delivery into `dt` reaches, each beside its own destination: a
+// list literal's elements, an object literal's field values, and a value `if`, `match` or
+// block's tails. Marks a list literal taken when `dt` names its element type.
+function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
+  const e = P.nodes[at]
+  if e is ArrayLit {
+    if nolElemOnlyNull(dt) || tyHasTyVar(dt) { return 0 }
+    nolTaken[at] = true
+    const dn = nonNullTy(dt)
+    let elDt = dt
+    if dn >= 0 {
+      const d = T.tys[dn]
+      if d is TyArray { elDt = d.aElem }
+    }
+    for el in e.arrElems {
+      todo.push(el)
+      dsts.push(elDt)
+    }
+  } else if e is ObjLit {
+    const dn = nonNullTy(dt)
+    if dn < 0 { return 0 }
+    const d = T.tys[dn]
+    if d is TyObj {
+      for fi in e.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          todo.push(f.fiValue)
+          dsts.push(objFieldType(d, f.fiName))
+        }
+      }
+    }
+  } else if e is IfStmt || e is MatchExpr || e is Block {
+    const spine: i32[] = []
+    const leaves: i32[] = []
+    valueTailSplit(at, spine, leaves)
+    for lf in leaves {
+      if lf != at {
+        todo.push(lf)
+        dsts.push(dt)
+      }
+    }
+  } else {
+    nolNoParts()
+  }
+  0
+}
+
+// Every other node delivers its value whole, and holds no list literal a destination types.
+function nolNoParts(): i32 { 0 }
+
+// Whether `ty` is a list whose element is the `null` type.
+function nolElemOnlyNull(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem == TY_NULL }
+  false
+}
+
+// Refuses every null-only list literal no typed destination received: its element type is
+// `null` alone, which has no rep, and the annotation that names one is the fix.
+function flushNullOnlyLits() {
+  const done: {[i32]: boolean} = Map()
+  for ix in nolLits {
+    if !(nolTaken[ix] ?? false) && !(done[ix] ?? false) {
+      done[ix] = true
+      tErr(
+        "a list of only `null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`",
+        ix,
+      )
+    }
+  }
+  0
 }
 
 // The element type of a list literal whose runtime elements `elems` (typed `ets`) hold numbers

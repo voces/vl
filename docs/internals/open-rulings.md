@@ -696,7 +696,15 @@ on top of the dynamic-step work — but it must REQUIRE the step, because the in
 default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
 the trap: it looks like the i32 loop and its count is not a property of the source.
 
-### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — raised 2026-09-06
+### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
+
+**Ruling (owner, 2026-10-12, spec Q3): (a) for now, (c) as the later target.** A null-only
+list literal with no destination that names its element type is a check error: "a list of only
+`null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`". Every typed
+destination (annotated binding, typed parameter, annotated return, record field, nested
+`[[null]]` under one) is unaffected, as is `[null, 42]`. Built; D1832 closed as a check reject.
+(c), inferring the element from the first non-null use, is on ROADMAP.md and not built.
+
 
 `const e = [null]` infers **`null[]`** — pinned by forcing it into a diagnostic, which reads
 `cannot assign null[] to 'bad' of type i32` — and every use of one refuses at the LITERAL with
