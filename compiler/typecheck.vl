@@ -5199,7 +5199,14 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
   const et = T.tys[expectedTy]
   // A nullable expected type (`(i32) => i32 | null`, e.g. a map value slot, which is `V | null`)
   // seeds its inner: the right-hand lambda or literal still wants the non-null shape.
-  if et is TyNullable { return seedExpected(u, et.nInner) }
+  // A generic call keeps the whole nullable type, which only a bare `null` argument binds from.
+  if et is TyNullable {
+    const nr = seedExpected(u, et.nInner)
+    if en is Call {
+      if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
+    }
+    return nr
+  }
   if en is FuncDecl {
     if en.fnName == "" {
       if et is TyFunc {
@@ -51518,9 +51525,16 @@ function callNamesGenericDecl(c: Call): boolean {
 // before anything costlier.
 function anyArgIsLitOnly(args: i32[]): boolean {
   for a in args {
-    if argIsLitOnly(a, 4) { return true }
+    if argIsLitOnly(a, 4) || argIsNullLit(a) || argIsStrLit(a) { return true }
   }
   false
+}
+
+// Whether the argument `ix` is a string literal, through parentheses.
+function argIsStrLit(ix: i32): boolean {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  P.nodes[x] is StrLit
 }
 
 // Binds each type parameter of the generic return `ret` from the type the call's destination
@@ -51535,7 +51549,7 @@ function dstBindLitTyParams(
   bTys: i32[],
   outNames: string[],
 ) {
-  const dst = callDstTyOf(ix)
+  const dst = dstForArgs(callDstTyOf(ix), args, ret)
   if dst < 0 || ret < 0 || !anyArgIsLitOnly(args) || !tyHasTyVar(ret) {
     return 0
   }
@@ -51556,6 +51570,167 @@ function dstBindLitTyParams(
     k = k + 1
   }
   0
+}
+
+// The generic `FuncDecl` the call `c` names by a plain identifier or a method name, or -1.
+function callGenericDeclIx(c: Call): i32 {
+  const d = cwCalleeDeclOf(c.callFn)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    if dn.fnTyParams.length > 0 { return d }
+  }
+  -1
+}
+
+// The declared function the call `c` in the generic `d` names, -2 for a compiler intrinsic or
+// `print`, or -1 when the callee is anything else: an alias, a local, a parameter, a field or
+// an index. A body is proven closed only through calls that resolve here.
+function closedCalleeDecl(c: Call, d: i32): i32 {
+  const cf = P.nodes[c.callFn]
+  let name = ""
+  let dx = -1
+  if cf is Ident {
+    name = cf.identName
+    if isReservedIntrinsicName(name) || name == "print" {
+      if !closedNameBound(d, name) { return -2 }
+      return -1
+    }
+    dx = cwFnDeclOf(name)
+  } else if cf is Member {
+    name = cf.memProp
+    dx = cwUfcsDeclOf(c.callFn)
+  }
+  if dx < 0 || dx >= P.nodes.length || closedNameBound(d, name) { return -1 }
+  if P.nodes[dx] is FuncDecl { return dx }
+  -1
+}
+
+// Whether the function `d` binds `name` itself — a parameter, a local, a loop variable or a
+// nested function — so a call spelled `name` there does not reach the declared function.
+function closedNameBound(d: i32, name: string): boolean {
+  if d < 0 || d >= P.nodes.length { return true }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    for p in dn.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parName == name { return true }
+      }
+    }
+    return nodeBindsNameGo(dn.fnBody, name)
+  }
+  true
+}
+
+function nodeBindsNameGo(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == name { return true }
+  } else if n is Param {
+    if n.parName == name { return true }
+  } else if n is FuncDecl {
+    if n.fnName == name { return true }
+  } else if n is ForRange {
+    if n.frVar == name { return true }
+  } else if n is ForIn {
+    if n.fiVar == name || n.fiVar2 == name { return true }
+  }
+  for k in nodeChildren(ix) {
+    if nodeBindsNameGo(k, name) { return true }
+  }
+  false
+}
+
+// Whether `ty` is unknown or mentions a type parameter: a value a generic body may compute on.
+function tyOpenOrTyVar(ty: i32): boolean { ty < 0 || tyHasTyVar(ty) }
+
+// Whether the generic function `d`'s body makes no new value of a type parameter: no operator
+// but a comparison, logic or assignment takes one, no `as` yields one, and every call resolves
+// to a declared function, closed too when generic. Only such a body keeps a literal-union
+// binding a member (D3602).
+function genericBodyClosed(d: i32, depth: i32): boolean {
+  if depth > 4 || d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return nodeClosedGo(dn.fnBody, d, depth) }
+  false
+}
+
+function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    const op = n.binOp
+    const keeps = (op == "=="
+      || op == "!="
+      || op == "<"
+      || op == ">"
+      || op == "<="
+      || op == ">="
+      || op == "&&"
+      || op == "||"
+      || op == "="
+      || op == "??")
+    if !keeps {
+      if (
+        tyOpenOrTyVar(nodeTyIxOf(n.binLeft))
+        || tyOpenOrTyVar(nodeTyIxOf(n.binRight))
+      ) {
+        return false
+      }
+    }
+  } else if n is Unary {
+    if n.unOp != "!" && tyOpenOrTyVar(nodeTyIxOf(n.unArg)) { return false }
+  } else if n is AsExpr {
+    if tyOpenOrTyVar(nodeTyIxOf(ix)) { return false }
+  } else if n is Call {
+    const g = closedCalleeDecl(n, d)
+    if g != -2 {
+      if g < 0 { return false }
+      const gn = P.nodes[g]
+      if gn is FuncDecl {
+        if (
+          gn.fnTyParams.length > 0
+          && g != d
+          && !genericBodyClosed(g, depth + 1)
+        ) {
+          return false
+        }
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if !nodeClosedGo(k, d, depth) { return false }
+  }
+  true
+}
+
+// Whether `t` is still being inferred: it holds a hole, or is an open `_ | null` slot (D2506).
+function dstTyOpen(t: i32): boolean {
+  if tyHasHole(t) { return true }
+  const d = T.tys[t]
+  if d is TyNullable { return d.nInner < 0 }
+  false
+}
+
+// The destination `dst` a call's arguments bind from: a nullable one only when the return `ret`
+// is a bare type parameter and some argument is a bare `null`, else its non-null type, which a
+// literal adapts to as an annotated one does.
+function dstForArgs(dst: i32, args: i32[], ret: i32): i32 {
+  if dst < 0 || dst >= T.tys.length { return dst }
+  // A destination still being inferred chooses nothing.
+  if dstTyOpen(dst) { return -1 }
+  const t = T.tys[dst]
+  if t is TyNullable {
+    if ret >= 0 && T.tys[ret] is TyVar {
+      for a in args {
+        if argIsNullLit(a) { return dst }
+      }
+    }
+    return t.nInner
+  }
+  dst
 }
 
 // Records each literal argument that bound one of `names` at its parameter's substituted
@@ -51583,9 +51758,10 @@ function dstRetypeLitArgs(
   0
 }
 
-// Whether the destination's `cand` for type parameter `name` replaces the arguments' own
-// binding: every argument binding it is a literal `cand` holds within the literal's kind, and
-// the instance they would choose cannot be delivered to `dst` at the call `ix`.
+// Whether the destination's `cand` for type parameter `name` replaces the arguments' binding at
+// call `ix`: always for a bare `null` beside arguments `cand` holds; for a literal union only
+// when every argument is a literal member of it; otherwise when every argument is a
+// literal `cand` holds in its kind and the arguments' own instance cannot reach `dst` (D4024).
 function dstTyParamAdapts(
   name: string,
   cand: i32,
@@ -51595,36 +51771,60 @@ function dstTyParamAdapts(
   ret: i32,
   dst: i32,
 ): boolean {
-  if cand < 0 || cand == TY_ERR || isVoidTy(cand) || tyHasTyVar(cand) {
+  if (
+    cand < 0
+    || cand == TY_ERR
+    || isVoidTy(cand)
+    || tyHasTyVar(cand)
+    || dstTyOpen(cand)
+  ) {
     return false
   }
-  // A body computing on `T` can leave a literal union, so the destination never binds one
-  // (D3602 is the same escape with the type argument written).
-  if tyIsLitUnionLike(cand, 4) { return false }
+  // A body computing on `T` can leave a literal union (D3602), so only literal members of it
+  // choose one.
+  const litU = tyIsLitUnionLike(cand, 4)
+  if litU {
+    if litUnionOneBase(cand, 4) < 0 { return false }
+    const cn = P.nodes[ix]
+    if cn is Call {
+      if !genericBodyClosed(callGenericDeclIx(cn), 0) { return false }
+    } else {
+      return false
+    }
+  }
   const one: string[] = [name]
   const oneT: i32[] = [cand]
   let seen = 0
   let own = -1
   let nulls = 0
+  const others: i32[] = []
   let i = 0
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name, 8) {
-      if i < args.length && args[i] >= 0 && argIsNullLit(args[i]) {
-        // A bare `null` binds `T` to the null type, an instance no destination wants: the
-        // destination's binding is taken whenever it holds `null` (DV-402).
-        if !assignable(TY_NULL, substTyDeep(params[i], one, oneT)) {
-          return false
-        }
+      if i >= args.length || args[i] < 0 { return false }
+      const want = substTyDeep(params[i], one, oneT)
+      if argIsNullLit(args[i]) {
+        // A bare `null` binds `T` to the null type (DV-402).
+        if !assignable(TY_NULL, want) { return false }
         nulls = nulls + 1
         seen = seen + 1
         if own < 0 { own = TY_NULL }
         i = i + 1
         continue
       }
-      if i >= args.length || args[i] < 0 || !argIsLitOnly(args[i], 4) {
-        return false
+      if litU {
+        const lt = litTyOfExpr(parenPeelIx(args[i]))
+        if lt < 0 || !assignable(lt, want) { return false }
+        seen = seen + 1
+        if own < 0 { own = widenLitTy(lt) }
+        i = i + 1
+        continue
       }
-      const want = substTyDeep(params[i], one, oneT)
+      if !argIsLitOnly(args[i], 4) {
+        others.push(i)
+        i = i + 1
+        continue
+      }
       const x = parenPeelIx(args[i])
       if x < 0 || x >= P.nodes.length { return false }
       const isCall = P.nodes[x] is Call
@@ -51657,8 +51857,23 @@ function dstTyParamAdapts(
     }
     i = i + 1
   }
+  // A non-literal argument goes along only beside a `null`, and only one the binding holds.
+  if others.length > 0 {
+    if nulls == 0 { return false }
+    for oi in others {
+      const want = substTyDeep(params[oi], one, oneT)
+      const savedQ = inferQuiet
+      inferQuiet = true
+      let at = nodeTyIxOf(args[oi])
+      if at < 0 { at = checkNode(args[oi]) }
+      const ok = at >= 0 && assignable(at, want)
+      inferQuiet = savedQ
+      if !ok { return false }
+    }
+    return true
+  }
   if seen == 0 || own < 0 || tySame(own, cand) { return false }
-  if nulls == seen { return true }
+  if nulls > 0 || litU { return true }
   // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
   // is the program's, and a body doing arithmetic on `T` must keep computing at it.
   const savedQ2 = inferQuiet
@@ -51692,6 +51907,31 @@ function tyIsLitUnionLike(ty: i32, depth: i32): boolean {
   }
   tyNotLitUnionLike()
 }
+
+// The one base scalar every literal in `ty` widens to, through lists, nullables and unions;
+// -1 when there is none, or the literals mix bases (`1 | "a"`), a union with no one scalar rep.
+function litUnionOneBase(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyNullable { return litUnionOneBase(t.nInner, depth - 1) }
+  if t is TyArray { return litUnionOneBase(t.aElem, depth - 1) }
+  if t is TyUnion {
+    let b = -1
+    for m in t.uMembers {
+      if !isNullTy(m) {
+        const mb = litUnionOneBase(m, depth - 1)
+        if mb < 0 || (b >= 0 && mb != b) { return -1 }
+        b = mb
+      }
+    }
+    return b
+  }
+  litUnionNoBase()
+}
+
+// Every other type (a primitive, record, map or function) is no literal set, so has no base.
+function litUnionNoBase(): i32 { -1 }
 
 // Every other type (a primitive, record, map or function) holds values outside any literal set.
 function tyNotLitUnionLike(): boolean { false }
