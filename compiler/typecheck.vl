@@ -3952,6 +3952,10 @@ let tpApartConcrete = false
 // An if-join a generic body reads collapsed (`T[]` beside `string[]` is `T[]`) that the
 // return-set rule keeps apart, by `if` node: the apart join, which a pin re-joins (D2832).
 let tpIfJoinAt: {[i32]: i32} = Map()
+// The type an `if` or `match` used as a value is delivered to, seeded by `seedExpected`.
+let joinWantAt: {[i32]: i32} = Map()
+// The joins typed by their destination rather than their arms.
+let joinByWant: {[i32]: boolean} = Map()
 // The same joins by owning declaration, re-asked at each call that pins the owner.
 let tpIfFn: i32[] = []
 let tpIfJoin: i32[] = []
@@ -5219,6 +5223,7 @@ function seedExpected(exprIx: i32, expectedTy: i32) {
     if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
   } else if en is IfStmt || en is MatchExpr || en is Block {
     seedCallDstLeaves(u, expectedTy)
+    seedJoinWant(u, expectedTy)
   } else if en is ArrayLit {
     if et is TyArray {
       let i = 0
@@ -5336,6 +5341,8 @@ export function initChecker() {
   holeTpJoinNames = Map()
   genFnCstrBusy = false
   tpIfJoinAt = Map()
+  joinWantAt = Map()
+  joinByWant = Map()
   tpIfFn = []
   tpIfJoin = []
   tpIfNode = []
@@ -20059,6 +20066,8 @@ function recordRedundantAnnot(
   if n.letInit >= 0 && initTypedByAnnot(n.letInit) { return 0 }
   // A call of a function that took this annotation as its result is typed by it, not redundant.
   if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
+  // So is an `if` or `match` whose literal arms took the annotation's type.
+  if n.letInit >= 0 && joinTypedByWant(n.letInit) { return 0 }
   // Without its annotation a `const` bound to a string literal holds that literal's type, so a
   // `string` annotation there is what lets it compare with other strings (D2198).
   if n.letKw == "const" && n.letInit >= 0 {
@@ -43931,13 +43940,24 @@ function validatePrintCstrs(
   0
 }
 
-// Whether `ty` reaches an inference hole (a `TyVar`) anywhere in its tree — through an array
-// element, a map key/value, a struct field, a nullable inner, a union member, or a function
-// type's params/return. Unlike `tyIsHole`, a demanded shape (`{bar: _}`) counts too, since it
-// carries no answer either. Depth-bounded: a recursive type is cyclic in the arena.
+// Whether `ty` reaches an inference hole (a `TyVar`, or a demanded shape like `{bar: _}`)
+// anywhere in its tree. A recursive type is a cycle in the arena: a row met again on the path
+// reaches nothing new, so a cycle is no hole, while running out of `depth` still is (D4038).
 function tyReachesHole(ty: i32, depth: i32): boolean {
   if ty < 0 { return true }
+  if i32ListHas(trhPath, ty) { return false }
   if depth <= 0 { return true }
+  trhPath.push(ty)
+  const r = tyReachesHoleRow(ty, depth)
+  trhPath.pop()
+  r
+}
+
+// The rows `tyReachesHole` is inside, outermost first.
+const trhPath: i32[] = []
+
+// One row of `tyReachesHole`'s walk.
+function tyReachesHoleRow(ty: i32, depth: i32): boolean {
   const t = T.tys[ty]
   if t is TyVar { return true }
   if t is TyArray { return tyReachesHole(t.aElem, depth - 1) }
@@ -52547,6 +52567,71 @@ function tailPushIfArms(p: i32, todo: i32[]): boolean {
     return true
   }
   false
+}
+
+// Banks destination `ty` on every `if` and `match` whose value reaches it through `ix`'s arms.
+function seedJoinWant(ix: i32, ty: i32) {
+  if ty < 0 { return 0 }
+  for at in joinLeavesOf(ix) { joinWantAt.set(at, ty) }
+  0
+}
+
+// Every `if` and `match` whose value is `ix`'s, through arms and block tails.
+function joinLeavesOf(ix: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [ix]
+  let guard = 0
+  while todo.length > 0 && guard < 64 {
+    guard = guard + 1
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      const an = P.nodes[at]
+      if an is IfStmt || an is MatchExpr { out.push(at) }
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        tailPushBlockTail(at, todo)
+      }
+    }
+  }
+  out
+}
+
+// Whether a join under `ix` took its type from its destination, so is typed by an annotation.
+function joinTypedByWant(ix: i32): boolean {
+  for at in joinLeavesOf(ix) {
+    if joinByWant.has(at) { return true }
+  }
+  false
+}
+
+// The type a valued `if` or `match` at `ix` joined to `join` takes instead, or -1: the
+// destination banked for `ix` when every arm fits it (DV-1207). A `T | null` destination is
+// banked as `T` (`seedExpected`), so only non-null arms adopt; a type parameter, or a `null` the
+// seed left in a union, keeps the join's own type.
+function litJoinOf(ix: i32, join: i32, arms: i32[], tys: i32[]): i32 {
+  const jw = joinWantAt.get(ix) ?? -1
+  if jw < 0 || join < 0 || tyHasTyVar(jw) || assignable(join, jw) { return -1 }
+  if tyHasNullMember(jw) { return -1 }
+  let i = 0
+  while i < arms.length {
+    if !joinArmFits(arms[i], tys[i], jw) { return -1 }
+    i = i + 1
+  }
+  joinByWant.set(ix, true)
+  jw
+}
+
+// Whether arm `armIx`, valued `armTy`, fits destination `want`: by its type, or as the literal
+// its tail spells, which its type has already widened to the literal's base.
+function joinArmFits(armIx: i32, armTy: i32, want: i32): boolean {
+  if armTy < 0 || assignable(armTy, want) { return true }
+  let tail = armIx
+  const a = P.nodes[armIx]
+  if a is Block {
+    if a.blkStmts.length == 0 { return false }
+    tail = a.blkStmts[a.blkStmts.length - 1]
+  }
+  const lt = litTyOfExpr(tail)
+  lt >= 0 && assignable(lt, want)
 }
 
 // When `p` is a `match` not yet desugared, queues each arm's body.
@@ -67362,6 +67447,8 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   // sentinel would poison the join, so never seed with it.
   let matchTy = -1
   const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
   const nArms = n.matchArmStart.length
@@ -67424,6 +67511,8 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
         bodyLit,
       )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
       matchValAcc = matchArmTally(
         ix,
         body,
@@ -67438,9 +67527,13 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   }
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
   } else {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
@@ -67729,6 +67822,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
   let matchTy = -1
   const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
   let bi = 0
@@ -67781,6 +67876,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
         bodyLit,
       )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
       matchValAcc = matchArmTally(
         ix,
         body,
@@ -67795,9 +67892,13 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   }
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
   } else {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
@@ -68060,6 +68161,8 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   // sentinel would poison the join (every arm joins back to error), so never seed with it.
   let matchTy = -1
   const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
   let ai = 0
@@ -68173,6 +68276,8 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
         bodyLit,
       )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
       matchValAcc = matchArmTally(
         ix,
         body,
@@ -68189,9 +68294,13 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
   } else {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
@@ -68810,6 +68919,18 @@ function checkIfTail(
       if !ifChainOnFnTail { noteExitArm(n.ifElse) }
     }
     if !f32Keep { f32JoinRevert(ix) }
+    // A string literal arm joins to `string`; beside an arm whose type holds that literal it
+    // takes that type instead, and a destination that holds each arm's value types the `if`, so
+    // `if ok { a.look } else { "none" }` is a `Look` (DV-1207).
+    if !thenExits && !daElseDiverges {
+      const lj = litJoinOf(
+        ix,
+        plainJoin,
+        [n.ifThen, n.ifElse],
+        [thenPlain, elsePlain],
+      )
+      if lj >= 0 { plainJoin = lj }
+    }
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
       if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
