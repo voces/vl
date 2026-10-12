@@ -8,6 +8,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -67,7 +68,7 @@ Deno.test({
   name: "vl-fmt: a file prints its formatted source to stdout (byte-exact)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, UNFORMATTED);
@@ -282,7 +283,7 @@ Deno.test({
     if (r2.out !== r.out) {
       throw new Error(`integer match formatting not idempotent:\n${r2.out}`);
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_intmatch_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_intmatch_" });
     try {
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, r.out);
@@ -341,7 +342,7 @@ Deno.test({
     }
     // The formatted source must still MEAN the same thing: re-checking it is what catches a
     // clause that round-tripped as text but lost a binding.
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_bind_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_bind_" });
     try {
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, r.out);
@@ -367,7 +368,7 @@ Deno.test({
   name: "vl-fmt: -w rewrites a drifted file in place (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, UNFORMATTED);
@@ -389,7 +390,7 @@ Deno.test({
   name: "vl-fmt: preserves `export` on type decls + doesn't duplicate field comments (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/t.vl`;
       // An exported type with a trailing comment on its opening line + a field
@@ -465,7 +466,7 @@ Deno.test({
   name: "vl-fmt: a wrapped object literal indents fields/`}` to its own depth (no over- or under-indent)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // Each object is wide enough to force the multi-line (wrapped) form. The
       // statement is one indent deep (a function body) and the value is also
@@ -517,7 +518,7 @@ Deno.test({
   name: "vl-fmt: aligns a trailing-comment run only when the author signals intent (≥2 spaces)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // First run: some line has ≥2 spaces before `//` → alignment intent, so the
       // run aligns to (widest fitting code)+1. A comment-LESS line is tolerated; a
@@ -592,7 +593,7 @@ Deno.test({
     const r2 = await run([], r.out);
     if (r2.out !== r.out) throw new Error(`fill not idempotent:\n${r2.out}`);
     // Text equality cannot tell a filled list from a re-spelled one — run it.
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_fill_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_fill_" });
     try {
       const f = `${dir}/a.vl`;
       await Deno.writeTextFile(f, r.out);
@@ -714,7 +715,7 @@ Deno.test({
     const r2 = await run([], r.out);
     if (r2.out !== r.out) throw new Error(`commented list not idempotent:\n${r2.out}`);
     // The pinned spelling still runs, and prints what the unformatted one did.
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_cmtlist_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_cmtlist_" });
     try {
       const f = `${dir}/c.vl`;
       await Deno.writeTextFile(f, r.out);
@@ -761,7 +762,7 @@ Deno.test({
     if (r.out !== src) throw new Error(`a comment moved out of its construct:\n${r.out}`);
     const r2 = await run([], r.out);
     if (r2.out !== r.out) throw new Error(`pinned comments not idempotent:\n${r2.out}`);
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_cmtgap_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_cmtgap_" });
     try {
       const f = `${dir}/g.vl`;
       await Deno.writeTextFile(f, r.out);
@@ -813,7 +814,7 @@ Deno.test({
   name: "vl-fmt: a lone wide comment's spacing does not force-align the narrower lines",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // Only the WIDEST line carries ≥2 spaces; the narrower line has one. That is
       // not an alignment signal (you align by padding the SHORTER lines), so the
@@ -842,7 +843,7 @@ Deno.test({
   name: "vl-fmt: a single-statement while/for body stays inline",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/l.vl`;
       const src =
@@ -875,7 +876,7 @@ Deno.test({
   name: "vl-fmt: a comment inside a block stays in that block (no leak into the next branch)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // The then-branch holds ONLY a comment; the else-if branch has a statement.
       // The comment used to leak out of the empty branch and reappear inside the
@@ -917,7 +918,7 @@ Deno.test({
   name: "vl-fmt: an overflowing if/while condition wraps in forced parens (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // A condition too wide for one line wraps Prettier-style: `if (` / one
       // operand per line / `) {`, so the `)` row separates the condition from the
@@ -969,7 +970,7 @@ Deno.test({
   name: "vl-fmt: a single-statement function body stays inline; a compound one expands",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/f.vl`;
       const src =
@@ -1002,7 +1003,7 @@ Deno.test({
   name: "vl-fmt: keeps a single blank line between/around comments (idempotent)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/b.vl`;
       // A blank separates a section header from the comment after it, and the
@@ -1035,7 +1036,7 @@ Deno.test({
   name: "vl-fmt: a function header wraps its params when the whole line overflows",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // The header is 84 cols including `export ` and ` {` — over the budget — so
       // the params wrap one-per-line with `): T {` on its own row. A short header
@@ -1075,7 +1076,7 @@ Deno.test({
   name: "vl-fmt: an else-if chain of single-statement clauses renders one clause per line",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // Every clause body is one simple statement → switch-like per-clause layout
       // (`else` on its own line, which the parser accepts). A clause with a
@@ -1124,7 +1125,7 @@ Deno.test({
   name: "vl-fmt: --check over a directory flags drift on stderr and exits nonzero",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       await Deno.writeTextFile(`${dir}/ok.vl`, FORMATTED);
       await Deno.mkdir(`${dir}/sub`);
@@ -1147,7 +1148,7 @@ Deno.test({
   name: "vl-fmt: an over-width call / `+`-chain wraps at its indent (one arg / operand per line, idempotent)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // The width check accounts for the leading indent, so a call (or `+`-chain)
       // that only overflows because it is nested wraps: a call breaks to one
@@ -1345,7 +1346,7 @@ Deno.test({
   name: "vl-fmt: unparseable input gets a diagnostic + exit 2 and is never touched",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const bad = "const x =\n";
       const f = `${dir}/bad.vl`;
@@ -1387,7 +1388,7 @@ Deno.test({
   name: "vl-fmt: the round-trip gate — `fmt -w` never leaves a valid program broken",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       // A valid program from the formatter's historic worst case (a comment in a
       // non-collapsible if-expression branch — the N2 corruption repro). The
@@ -1866,7 +1867,7 @@ Deno.test({
       }
     }
 
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_" });
     try {
       const f = `${dir}/w.vl`;
       const src = chain + "\n" + wide + "\n" + call + "\n" +
@@ -2193,7 +2194,7 @@ Deno.test({
     }
     // The broken form must RE-PARSE and RUN. `vl fmt` returns unparseable input
     // verbatim, so idempotency alone passes on a spelling the parser rejects.
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_chain_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_chain_" });
     try {
       const f = `${dir}/chain.vl`;
       await Deno.writeTextFile(f, r.out);
@@ -2382,7 +2383,7 @@ Deno.test({
       throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
     }
     // The output is not merely parseable — it still means the program it came from.
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_lambda_stmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_lambda_stmt_" });
     const file = `${dir}/main.vl`;
     await Deno.writeTextFile(file, r.out);
     const ran = await runOn("run", file);
@@ -2438,7 +2439,7 @@ Deno.test({
     if (again.code !== 0 || again.out !== r.out) {
       throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_opname_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_opname_" });
     const file = `${dir}/main.vl`;
     await Deno.writeTextFile(file, r.out);
     const ran = await runOn("run", file);
@@ -2481,7 +2482,7 @@ Deno.test({
       if (!r.out.includes("export")) {
         throw new Error(`fmt deleted the \`export\` token:\n${r.out}`);
       }
-      const dir = await Deno.makeTempDir({ prefix: "vl_fmt_export_" });
+      const dir = await makeTempDir({ prefix: "vl_fmt_export_" });
       const file = `${dir}/main.vl`;
       await Deno.writeTextFile(file, src);
       const checked = await runOn("check", file);
@@ -2569,7 +2570,7 @@ Deno.test({
     if (again.code !== 0 || again.out !== r.out) {
       throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_match_cmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_match_cmt_" });
     const file = `${dir}/main.vl`;
     await Deno.writeTextFile(file, r.out);
     const ran = await runOn("run", file);
@@ -2715,7 +2716,7 @@ Deno.test({
       if (again.code !== 0 || again.out !== r.out) {
         throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
       }
-      const dir = await Deno.makeTempDir({ prefix: "vl_fmt_chain_cmt_" });
+      const dir = await makeTempDir({ prefix: "vl_fmt_chain_cmt_" });
       const file = `${dir}/main.vl`;
       await Deno.writeTextFile(file, r.out);
       const ran = await runOn("run", file);
@@ -2768,7 +2769,7 @@ Deno.test({
   name: "vl-fmt: an `import` name list is sorted; statements and annotated lists are not",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_imports_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_imports_" });
     await Deno.writeTextFile(
       `${dir}/lib.vl`,
       "export const a = 1\nexport const b = 2\nexport const c = 3\nexport type Box = { v: i32 }\n",
@@ -2881,7 +2882,7 @@ Deno.test({
     // The formatted program is still the same program: it re-parses and type-checks with
     // every extern in scope. (A dropped declaration reads as `undeclared identifier`, not as
     // a formatting difference, which is what made this silent.)
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_extern_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_extern_" });
     try {
       await Deno.writeTextFile(`${dir}/lib.vl`, "export const pi = 3\n");
       await Deno.writeTextFile(`${dir}/main.vl`, r.out);
@@ -3002,7 +3003,7 @@ Deno.test({
     }
     // THE SPELLINGS AGREE, which is what makes the canonicalisation a formatting change and
     // not a rewrite: the same printed output, and the same wasm byte for byte.
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_shorthand_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_shorthand_" });
     try {
       const a = `${dir}/a.vl`;
       const b = `${dir}/b.vl`;
@@ -3128,7 +3129,7 @@ Deno.test({
     }
     const again = await run([], r.out);
     if (again.out !== r.out) throw new Error(`not a fixed point:\n${again.out}`);
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_field_shorthand_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_field_shorthand_" });
     try {
       const a = `${dir}/a.vl`;
       const b = `${dir}/b.vl`;
@@ -3202,7 +3203,7 @@ Deno.test({
     if (again.out !== r.out) {
       throw new Error(`the arrow form is not a fixed point:\n${again.out}`);
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_shorthand_body_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_shorthand_body_" });
     try {
       const a = `${dir}/a.vl`;
       const b = `${dir}/b.vl`;
@@ -3280,7 +3281,7 @@ Deno.test({
         want: "3\n3\n",
       },
     ];
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_call_then_brace_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_call_then_brace_" });
     try {
       for (const [i, c] of cases.entries()) {
         const r = await run([], c.src);
@@ -3357,7 +3358,7 @@ Deno.test({
     if (again.code !== 0 || again.out !== r.out) {
       throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
     }
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_import_cmt_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_import_cmt_" });
     try {
       const file = `${dir}/main.vl`;
       await Deno.writeTextFile(file, r.out);
@@ -3592,7 +3593,7 @@ Deno.test({
         prints: "4\n",
       },
     ];
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_d1998_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_d1998_" });
     try {
       for (const c of cases) {
         const r = await run([], c.src);
@@ -3646,7 +3647,7 @@ Deno.test({
         prints: "11\n",
       },
     ];
-    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_label_" });
+    const dir = await makeTempDir({ prefix: "vl_fmt_label_" });
     try {
       for (const c of cases) {
         const r = await run([], c.src);

@@ -50,7 +50,7 @@ const vl = async (
     out: new TextDecoder().decode(stdout),
     err,
     trace: err.split("\n").filter((l) => l.startsWith("vl: module cache "))
-      .map((l) => l.slice("vl: module cache ".length).replace(/: \/.*$/, "")),
+      .map((l) => l.slice("vl: module cache ".length).replace(/: (?:\/|[A-Za-z]:[\\/]).*$/, "")),
   };
 };
 
@@ -82,8 +82,8 @@ const setup = async (src = 'print("cached")\n') => {
   return { dir, cache: `${dir}/cache`, wasm: `${dir}/prog.wasm` };
 };
 
-const test = (name: string, fn: () => Promise<void>) =>
-  Deno.test({ name: `native module cache: ${name}`, ignore: !ENABLED, fn });
+const test = (name: string, fn: () => Promise<void>, ignore = false) =>
+  Deno.test({ name: `native module cache: ${name}`, ignore: !ENABLED || ignore, fn });
 
 test("a second run of the same module hits and prints the same thing", async () => {
   const { dir, cache, wasm } = await setup();
@@ -255,4 +255,5 @@ test("a cache dir writable by group or others is not used", async () => {
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
-});
+  // Windows has no group/other mode bits to check: `Deno.chmod` cannot set them.
+}, Deno.build.os === "windows");

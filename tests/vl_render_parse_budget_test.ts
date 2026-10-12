@@ -57,7 +57,7 @@ Deno.test("render-parse ratchet: counts the emitter's real calls and nothing els
     await Deno.mkdir(`${dir}/compiler`);
     await Deno.writeTextFile(`${dir}/compiler/emit_x.vl`, EMIT);
     await Deno.writeTextFile(`${dir}/compiler/typecheck.vl`, CHECKER);
-    const got = (await run(["--list", "--root", dir])).trim().split("\n").filter((l) => l);
+    const got = (await run(["--list", "--root", dir])).trim().split(/\r?\n/).filter((l) => l);
     const want = [
       "compiler/emit_x.vl:8  kindOf  nameIsArray",
       "compiler/emit_x.vl:8  kindOf  tyToEmitName",

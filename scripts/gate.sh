@@ -33,6 +33,8 @@ LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 # them. $PYTHON pins an interpreter for every row without editing a script, and the
 # preflight row names the one that answered. Exported for the scripts a row shells.
 PY="${PYTHON:-python3}"; export PYTHON="$PY"
+# Files are UTF-8; without this a Windows Python reads them as cp1252.
+export PYTHONUTF8=1
 # The native binary and the seed, for the rows written in VL. One row is today
 # (`seed size`, ported from Python); the paths are the ones every suite derives.
 VL="${VL:-$PWD/scripts/vl-host/target/release/vl}"
@@ -62,7 +64,7 @@ run() { if [ "$GATE_MAX_PAR" -gt 0 ]; then
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
-           for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(echo "$tot + $m * 60 + $x" | bc); done
+           for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(awk -v t="$tot" -v m="$m" -v x="$x" 'BEGIN { print t + m * 60 + x }'); done
            printf '%s' "$tot"; }
 
 # FIRST ROW, so the table's first line names the cause once instead of ten times.
@@ -249,7 +251,7 @@ for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
   [ -n "$fin" ] || fin=$(date +%s.%N)
-  el=$(echo "$fin - ${STARTS[$i]}" | bc)
+  el=$(awk -v f="$fin" -v s="${STARTS[$i]}" 'BEGIN { print f - s }')
   cpu=$(cpusec $(tail -1 "$LOGS/$i.cpu" 2>/dev/null))
   [ -n "$cpu" ] || cpu=0
   if [ $rc -eq 0 ]; then printf '%-22s %7.1fs %7.1fs  ok\n' "${NAMES[$i]}" "$el" "$cpu"

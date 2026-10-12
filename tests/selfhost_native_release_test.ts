@@ -5,6 +5,7 @@
 //
 // @test-timing opt
 import {
+  binaryen,
   COMPILER,
   ENABLED,
   MELT,
@@ -42,7 +43,7 @@ Deno.test({
     };
     try {
       const base = `${tmp}/tc.wasm`;
-      const asm = await sh(`${ROOT}/node_modules/.bin/wasm-as`, [wat, ...features, "-o", base]);
+      const asm = await sh(binaryen("wasm-as"), [wat, ...features, "-o", base]);
       if (asm.code !== 0) throw new Error(`wasm-as rejected the fixture: ${asm.err.trim()}`);
 
       for (const [label, passes] of [

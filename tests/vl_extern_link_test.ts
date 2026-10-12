@@ -13,12 +13,12 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL, binaryen } from "./support/tree.ts";
 import { vlHostImports } from "../compiler/vlHostImports.ts";
 
 const STD = `${ROOT}/std`;
-const WASM_MERGE = `${ROOT}/node_modules/.bin/wasm-merge`;
-const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
+const WASM_MERGE = binaryen("wasm-merge");
+const WASM_OPT = binaryen("wasm-opt");
 // The host's own `BINARYEN_FEATURES` (scripts/vl-host/src/main.rs); `--all-features` would let
 // `-O3` write exact heap types, which V8 does not parse by default.
 const FEATURES = [

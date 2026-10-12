@@ -45,7 +45,7 @@ Deno.test("the census's cell walk matches the oracle's own — one case per modu
   // `casesWasmOracle`'s walk yields ONE case for a directory holding `entry.vl`. If the two
   // walks drift, a collapse could drop a module's cells and the count would still look right.
   const { out } = await census(["--cells"]);
-  const lines = out.trim().split("\n");
+  const lines = out.trim().split(/\r?\n/);
   const header = lines[0];
   const m = header.match(/^corpus cells graded by the oracle shards: (\d+)$/);
   if (!m) throw new Error(`census --cells header changed: ${header}`);

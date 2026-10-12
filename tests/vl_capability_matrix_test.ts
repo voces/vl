@@ -75,7 +75,7 @@ const runMatrixOnce = async (
   }).output();
   const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
   const cells: Cell[] = [];
-  for (const line of out.split("\n")) {
+  for (const line of out.split(/\r?\n/)) {
     const m = line.match(/^\| `([a-z_0-9]+)` \| ([a-z-]+) \| (.*?) \|$/);
     if (m) cells.push({ position: m[1], face: m[2], grade: m[3].trim() });
   }

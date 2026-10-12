@@ -26,9 +26,9 @@
 //
 // @test-timing opt
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
 if (!ENABLED) {
   console.warn(

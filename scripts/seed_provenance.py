@@ -213,7 +213,7 @@ if __name__ == "__main__":
             seed = os.path.abspath(argv[argv.index("--seed") + 1])
         side = seed + ".src"
         h, n = source_identity()
-        with open(side, "w", encoding="utf-8") as fh:
+        with open(side, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("%s\n# fnv1a-64 over %d compiler/*.vl, `std_hash`'s fold; written by "
                      "scripts/refresh-compiler.sh\n" % (h, n))
         print("wrote %s (%s over %d files)" % (side, h, n))

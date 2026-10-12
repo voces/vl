@@ -2863,7 +2863,10 @@ fn staged_root_and_cwd() -> (String, String) {
         _ => None,
     };
     let cwd = std::env::current_dir().ok().map(|c| c.to_string_lossy().into_owned());
-    (root.unwrap_or_default(), cwd.unwrap_or_default())
+    // The guest compares `/`-separated keys (`checkOriginKeyOf`), so Windows paths are
+    // staged with forward slashes, as `stage_program` stages the entry path.
+    let slash = |s: String| if cfg!(windows) { s.replace('\\', "/") } else { s };
+    (slash(root.unwrap_or_default()), slash(cwd.unwrap_or_default()))
 }
 
 /// The seed file's bytes, read ONCE per process and path: `load_compiler_module` compiles
@@ -3539,7 +3542,36 @@ fn report_guest_fuel(store: &Store<()>) {
     }
 }
 
-/// The process's resident set in bytes, from `/proc/self/statm`; 0 where that is unreadable.
+/// The process's resident set in bytes, from `/proc/self/statm` (on Windows the working set);
+/// 0 where that is unreadable.
+#[cfg(windows)]
+fn resident_bytes() -> u64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+    // SAFETY: a pseudo-handle for this process and a buffer of the size `cb` declares.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    if ok == 0 { 0 } else { c.working_set_size as u64 }
+}
+
+#[cfg(not(windows))]
 fn resident_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -4039,6 +4071,15 @@ fn run_program_with(
 /// numbering and only catches what no kind names. Anything unrecognized becomes `EIO`
 /// (29) rather than passing through as a number `std:fs` cannot interpret — an
 /// unmatchable code reaches the caller as an error that looks like none of them.
+/// `wasi_errno` for a failed open of `p`. Windows answers "access denied" for a directory
+/// opened as a file, where Linux answers EISDIR; asked only after the open has failed.
+fn wasi_errno_at(e: &std::io::Error, p: &std::path::Path) -> i32 {
+    if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied && p.is_dir() {
+        return 31; // EISDIR
+    }
+    wasi_errno(e)
+}
+
 fn wasi_errno(e: &std::io::Error) -> i32 {
     use std::io::ErrorKind;
     match e.kind() {
@@ -4303,7 +4344,7 @@ fn fs_write_mode(p: &std::path::Path, off: i64, data: &[u8], mode: i32) -> i32 {
         Err(err) if mode == 1 && off > 0 && err.kind() == std::io::ErrorKind::NotFound => {
             return 28; // EINVAL — past the end of a file that has no bytes
         }
-        Err(err) => return wasi_errno(&err),
+        Err(err) => return wasi_errno_at(&err, p),
     };
     if mode == 1 {
         match f.metadata() {
@@ -4590,19 +4631,13 @@ fn register_fs_imports(
         let (st, at) = (st.clone(), at.clone());
         linker.func_new("imports", "__fs_read__", ft, move |mut c, args, results| {
             let path = read_u8_list(&mut c, &args[0])?;
-            let out = match os_path(&path).map_err(Ok).and_then(|p| {
-                std::fs::read(&p).map_err(|err| Err::<i32, std::io::Error>(err))
-            }) {
+            let out = match os_path(&path).and_then(|p| std::fs::read(&p).map_err(|err| wasi_errno_at(&err, &p))) {
                 Ok(bytes) => {
                     *e.lock().unwrap() = 0;
                     bytes
                 }
-                Err(Ok(code)) => {
+                Err(code) => {
                     *e.lock().unwrap() = code;
-                    Vec::new()
-                }
-                Err(Err(err)) => {
-                    *e.lock().unwrap() = wasi_errno(&err);
                     Vec::new()
                 }
             };
@@ -4645,7 +4680,7 @@ fn register_fs_imports(
                     match os_path(&path) {
                         Err(bad) => code = bad,
                         Ok(p) => match std::fs::File::open(&p) {
-                            Err(err) => code = wasi_errno(&err),
+                            Err(err) => code = wasi_errno_at(&err, &p),
                             Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
                                 Err(err) => code = wasi_errno(&err),
                                 Ok(_) => {
@@ -4714,7 +4749,7 @@ fn register_fs_imports(
                     match os_path(&path) {
                         Err(bad) => code = bad,
                         Ok(p) => match std::fs::File::open(&p) {
-                            Err(err) => code = wasi_errno(&err),
+                            Err(err) => code = wasi_errno_at(&err, &p),
                             Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
                                 Err(err) => code = wasi_errno(&err),
                                 Ok(_) if cap == 0 => {}
@@ -5519,14 +5554,16 @@ fn binaryen_tool(tool: &str, env_override: &str) -> Option<String> {
     if let Ok(p) = std::env::var(env_override) {
         return Some(p);
     }
-    let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
-        let cand = format!("{dir}/{tool}");
-        if std::fs::metadata(&cand)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            return Some(cand);
+    // Windows: `;`-separated PATH, and the spawnable file carries an extension
+    // (a native `.exe`, or npm's `.cmd` shim around the node script).
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd"] } else { &[""] };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let cand = dir.join(format!("{tool}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
         }
     }
     None
@@ -9253,6 +9290,12 @@ fn relative_dir(from: &std::path::Path, to: &std::path::Path) -> Option<String> 
     let to = std::fs::canonicalize(to).ok()?;
     let a: Vec<_> = from.components().collect();
     let b: Vec<_> = to.components().collect();
+    // Two Windows drives share no root, so there is no relative form: name `to` absolutely,
+    // without `canonicalize`'s `\\?\` prefix and with `/` separators.
+    if a.first() != b.first() {
+        let s = to.to_string_lossy();
+        return Some(s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/"));
+    }
     let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let mut parts: Vec<String> = vec!["..".to_string(); a.len() - common];
     parts.extend(b[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
@@ -9296,19 +9339,34 @@ fn resolve_source(dir: &std::path::Path, s: &str) -> String {
         return s.to_string();
     }
     use std::path::Component;
+    // The root is an empty first segment, so the join spells `/a` (or `C:/a` after a Windows
+    // drive prefix); `roots` counts the segments a `..` cannot climb past.
     let mut parts: Vec<String> = Vec::new();
+    let mut roots = 0;
     for c in dir.join(s).components() {
         match c {
             Component::CurDir => {}
-            Component::ParentDir if parts.last().is_some_and(|p| p != ".." && p != "/") => {
+            Component::ParentDir if parts.len() > roots && parts.last().is_some_and(|p| p != "..") => {
                 parts.pop();
             }
-            Component::RootDir => parts.push("/".to_string()),
+            Component::Prefix(p) => {
+                let p = p.as_os_str().to_string_lossy();
+                parts.push(p.strip_prefix(r"\\?\").unwrap_or(&p).to_string());
+                roots = parts.len();
+            }
+            Component::RootDir => {
+                if parts.is_empty() {
+                    parts.push(String::new());
+                }
+                roots = parts.len();
+            }
             other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
         }
     }
-    let joined = parts.join("/");
-    joined.strip_prefix("//").map(|r| format!("/{r}")).unwrap_or(joined)
+    if parts.len() == 1 && parts[0].is_empty() {
+        return "/".to_string();
+    }
+    parts.join("/")
 }
 
 /// `Some(name)` for the function whose body holds `off`, `Some(None)` when that function has
