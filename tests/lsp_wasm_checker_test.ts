@@ -4,6 +4,7 @@
 // `refresh-compiler.sh` yet) they self-ignore with build instructions, the same
 // convention as the native align suite. The diff helper tests run always.
 
+import { filePath } from "./support/filePath.ts";
 import {
   diffDefinition,
   diffDiagnostics,
@@ -13,7 +14,7 @@ import {
 } from "../lsp/src/wasmCheckerNode.ts";
 import type { VLDiagnostic } from "../compiler/diagnostics.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -1754,7 +1755,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const path = new URL("../std/buffer.vl", import.meta.url).pathname;
+  const path = filePath(new URL("../std/buffer.vl", import.meta.url));
   const source = await Deno.readTextFile(path);
   const diags = await checker.check(source, path, noSiblings);
   const hit = diags.find((d) => d.message.includes("is internal to std"));

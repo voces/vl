@@ -15,6 +15,7 @@
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores, the same
 // convention the other wasm suites use.
 
+import { filePath } from "./support/filePath.ts";
 import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -24,7 +25,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
 };
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

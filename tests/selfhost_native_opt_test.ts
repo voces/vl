@@ -21,6 +21,7 @@
 //
 // @test-timing opt
 
+import { filePath } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
@@ -73,7 +74,7 @@ for (const rel of CASES_LIST) {
     name: `native-opt: ${rel} — vl build -O shrinks + vl run reproduces @log`,
     ignore: !ENABLED,
     fn: async () => {
-      const srcPath = new URL(rel, CASES).pathname;
+      const srcPath = filePath(new URL(rel, CASES));
       const want = logsOf(Deno.readTextFileSync(new URL(rel, CASES)));
       const tmp = await Deno.makeTempDir();
       try {
@@ -125,7 +126,7 @@ Deno.test({
         `#!/bin/sh\necho "\${BINARYEN_CORES-unset}" >> "${log}"\nexec "${WASM_OPT}" "$@"\n`,
       );
       Deno.chmodSync(wrap, 0o755);
-      const src = new URL("arith/ops.vl", CASES).pathname;
+      const src = filePath(new URL("arith/ops.vl", CASES));
       const runs = async (env: Record<string, string>) => {
         try {
           Deno.removeSync(log);

@@ -13,6 +13,7 @@
 //
 // Run via `deno task playground:verify`. Exits non-zero on any failure.
 
+import { filePath } from "../tests/support/filePath.ts";
 import * as esbuild from "esbuild";
 import { denoPlugins } from "esbuild-deno-loader";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
@@ -34,7 +35,7 @@ const DIST = new URL("dist/", HERE);
 // `./scripts/refresh-compiler.sh`; absent on a fresh clone, in which case the
 // seed-backed feature checks self-skip (the same convention as the wasm test
 // suites), and the page would likewise disable those features.
-const SEED = new URL("build/vl-compiler.wasm", ROOT).pathname;
+const SEED = filePath(new URL("build/vl-compiler.wasm", ROOT));
 
 // Build a checker over the on-disk seed (the headless analogue of
 // `wasmCheckerBrowser.ts`'s fetch), or undefined when the seed isn't built.
@@ -54,7 +55,7 @@ const loadSeedChecker = () => {
 };
 
 const binaryenEntry = (): string =>
-  new URL(import.meta.resolve("binaryen")).pathname.replace(
+  filePath(new URL(import.meta.resolve("binaryen"))).replace(
     /index\.d\.ts$/,
     "index.js",
   );
@@ -83,12 +84,12 @@ const bundleCore = async (entry: string): Promise<string> => {
         },
       },
       ...denoPlugins({
-        configPath: new URL("deno.json", ROOT).pathname,
+        configPath: filePath(new URL("deno.json", ROOT)),
         nodeModulesDir: "manual",
       }),
     ],
-    absWorkingDir: ROOT.pathname,
-    entryPoints: [new URL(entry, HERE).pathname],
+    absWorkingDir: filePath(ROOT),
+    entryPoints: [filePath(new URL(entry, HERE))],
     bundle: true,
     format: "esm",
     platform: "browser",
@@ -124,12 +125,12 @@ const verifyFullBundleBuilds = async (): Promise<void> => {
         },
       },
       ...denoPlugins({
-        configPath: new URL("deno.json", ROOT).pathname,
+        configPath: filePath(new URL("deno.json", ROOT)),
         nodeModulesDir: "manual",
       }),
     ],
-    absWorkingDir: ROOT.pathname,
-    entryPoints: [new URL("src/main.ts", HERE).pathname],
+    absWorkingDir: filePath(ROOT),
+    entryPoints: [filePath(new URL("src/main.ts", HERE))],
     bundle: true,
     format: "esm",
     platform: "browser",
@@ -138,7 +139,7 @@ const verifyFullBundleBuilds = async (): Promise<void> => {
     loader: { ".ttf": "dataurl" },
     // An `outdir` (vs an `outfile`) is needed so esbuild has an output path for
     // the CSS asset Monaco's imports produce; `write: false` keeps it in memory.
-    outdir: new URL("dist", HERE).pathname,
+    outdir: filePath(new URL("dist", HERE)),
     write: false,
   });
   const js = out.outputFiles.find((f) => f.path.endsWith(".js"));

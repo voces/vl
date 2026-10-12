@@ -51,6 +51,7 @@
 //   deno test -A --no-check tests/lsp_undisplayable_type_test.ts
 // (also included in `deno task test`).
 
+import { filePath } from "./support/filePath.ts";
 import {
   displayableType,
   inlayHintsFromWasm,
@@ -67,7 +68,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   }
 };
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -351,7 +352,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
-  const root = new URL("./cases/", import.meta.url).pathname;
+  const root = filePath(new URL("./cases/", import.meta.url));
 
   // NO EXCEPTIONS, and the empty set is the assertion. The filter drops a hint only
   // on a file that carries an error diagnostic; a diagnostic-free file keeps every

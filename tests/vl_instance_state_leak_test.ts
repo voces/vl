@@ -54,11 +54,12 @@
 //
 // Run with:  deno test -A --no-check tests/vl_instance_state_leak_test.ts
 
+import { filePath } from "./support/filePath.ts";
 import { runWasm } from "./support/runWasm.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
-const CASES = new URL("./cases/", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const CASES = filePath(new URL("./cases/", import.meta.url));
 
 const seedExists = (() => {
   try {

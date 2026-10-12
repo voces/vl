@@ -15,10 +15,11 @@
 //   deno test -A --no-check tests/playground_completion_test.ts
 // (also included in `deno task test`).
 
+import { filePath } from "./support/filePath.ts";
 import { type CompletionItem, completion, initLsp } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

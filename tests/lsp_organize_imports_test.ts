@@ -12,6 +12,7 @@
 //
 // Run: deno test -A --no-check tests/lsp_organize_imports_test.ts
 
+import { filePath } from "./support/filePath.ts";
 import { organizeImportEdits } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
@@ -229,7 +230,7 @@ Deno.test("organize: side-effect and empty-brace imports are never touched", () 
 
 // ---- seed-backed: the real lint + the real formatter -------------------------
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

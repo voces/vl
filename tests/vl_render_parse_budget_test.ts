@@ -9,9 +9,10 @@
 //
 // Pure Python + a file walk — no seed, no binary.
 
+import { filePath } from "./support/filePath.ts";
 import { pythonBin } from "./support/tree.ts";
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
+const ROOT = filePath(new URL("../", import.meta.url)).replace(/[\\/]$/, "");
 const SCRIPT = `${ROOT}/scripts/render-parse-budget.py`;
 
 const run = async (args: string[]): Promise<string> => {
