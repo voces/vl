@@ -95,6 +95,7 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNulNumLitUnion,
   nodeTyIsNulScalarBox,
+  nodeTyIsNulString,
   nodeTyIsNullType,
   nodeTyIsNullable,
   nodeTyIsStringPrim,
@@ -24625,6 +24626,11 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if fn.fnRet < 0 && fnPos >= 0 {
       if fnAssignRetKind(fnPos) == "nulstr" { retNulString = true }
     }
+    // The inferred `string | null` twin of the `cloRetIsString` widen: an atom arm of a join
+    // the checker typed `string | null` widens to its member text, `null` for the niche (D3336).
+    if fn.fnRet < 0 && retNulString && !retLitUnion && !retNulLitUnion {
+      if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
+    }
   }
   if retF32 {
     const savedF32 = pendingF32
@@ -24688,7 +24694,29 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       retCtx.litUnion = 1
     }
     const retBoxToNulStr = retNulString && boxIsNulStrUnion(retArg, fnIx)
-    if emitExprExpect(body, retArg, fnIx, retCtx) < 0 { return -1 }
+    if retLitUnion || retNulLitUnion {
+      const noMem = retStrLitNoMember(retArg, retNulLitTexts(fnIx), fnIx)
+      if noMem >= 0 {
+        return emitFailAt(
+          "emitProgram: a returned string cannot be shown to be a member of the literal union this instantiation's result is",
+          noMem,
+        )
+      }
+    }
+    if (
+      retNulLitUnion
+      && !retNulString
+      && nodeTyIsNulString(unwrapParen(retArg))
+    ) {
+      if (
+        emitNulStrJoinAsAtom(body, retArg, retNulLitTexts(fnIx), retCtx, fnIx)
+        < 0
+      ) {
+        return -1
+      }
+    } else {
+      if emitExprExpect(body, retArg, fnIx, retCtx) < 0 { return -1 }
+    }
     if retBoxToNulStr { emitBoxToNulStr() }
     // a return is a kind-9 use site that never grew the recover: a nullable-struct/variant
     // read deliberately stays the raw `(ref null $S)` (`emitCapturedReadRecover`'s rule),
@@ -24728,6 +24756,104 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   pendingListSlot = 0
   pendingNulRefHeap = -1
   0
+}
+
+// The member texts of the `K | null` result of function `fnIx`: its annotation's (a
+// synthesized one in an instance), else its inferred return's; empty when neither has any.
+function retNulLitTexts(fnIx: i32): string[] {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return nulLitMemberTexts(nodeTyIxOf(fn.fnRet)) }
+    return nulLitMemberTexts(inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName)))
+  }
+  const none: string[] = []
+  none
+}
+
+// A value join typed `string | null` delivered to a `K | null` atom result: each arm lowers in
+// the atom context, so the result stays the i32 niche. A leaf the niche cannot hold — a string
+// that is no member of `texts`, or a string value that is not an atom — refuses (D4173).
+function emitNulStrJoinAsAtom(
+  body: u8[],
+  ix: i32,
+  texts: string[],
+  ctx: ExpCtx,
+  fnIx: i32,
+) {
+  const u = unwrapParen(ix)
+  if !ifJoinNarrowsPerArm(u) || texts.length == 0 {
+    return emitFailAt(
+      "emitProgram: a `string | null` value is returned where this instantiation's result is a nullable literal union",
+      ix,
+    )
+  }
+  const bad = nulAtomJoinMisfit(u, texts, fnIx, true)
+  if bad >= 0 {
+    return emitFailAt(
+      "emitProgram: a returned string cannot be shown to be a member of the literal union this instantiation's result is",
+      bad,
+    )
+  }
+  const saved = expCtxHere()
+  expCtxApply(ctx)
+  const r = emitIfExprAs(body, u, fnIx, 127)
+  expCtxApply(saved)
+  r
+}
+
+// The string literal `ix` returns, itself or as a leaf of its join, that names none of the
+// non-empty member list `texts`; -1 when there is none.
+function retStrLitNoMember(ix: i32, texts: string[], fnIx: i32): i32 {
+  if texts.length == 0 { return -1 }
+  nulAtomJoinMisfit(ix, texts, fnIx, false)
+}
+
+// The first leaf value of the value join at `ix` that a literal-union atom with member texts
+// `texts` cannot hold, or -1: a string literal naming no member, and when `strict`, any leaf
+// that is neither `null`, a member literal nor an atom.
+function nulAtomJoinMisfit(
+  ix: i32,
+  texts: string[],
+  fnIx: i32,
+  strict: boolean,
+): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 { return ix }
+  const n = P.nodes[u]
+  if n is IfStmt {
+    if n.ifElse < 0 { return u }
+    const t = nulAtomJoinMisfit(ifArmValueExpr(n.ifThen), texts, fnIx, strict)
+    if t >= 0 { return t }
+    if P.nodes[n.ifElse] is IfStmt {
+      return nulAtomJoinMisfit(n.ifElse, texts, fnIx, strict)
+    }
+    return nulAtomJoinMisfit(ifArmValueExpr(n.ifElse), texts, fnIx, strict)
+  }
+  if n is MatchExpr {
+    for b in n.matchBodies {
+      let v = b
+      if b >= 0 && P.nodes[b] is Block { v = ifArmValueExpr(b) }
+      const m = nulAtomJoinMisfit(v, texts, fnIx, strict)
+      if m >= 0 { return m }
+    }
+    return -1
+  }
+  if n is StrLit {
+    let i = 0
+    while i < texts.length {
+      if strLexSameValue(quoteLex(texts[i]), n.strText) { return -1 }
+      i = i + 1
+    }
+    return u
+  }
+  nulAtomLeafMisfit(u, fnIx, strict)
+}
+
+// `u` when the non-string leaf `u` misfits a literal-union atom under `strict` (neither `null`
+// nor an atom), else -1.
+function nulAtomLeafMisfit(u: i32, fnIx: i32, strict: boolean): i32 {
+  if !strict || exprIsNullLike(u) || exprIsLitAtom(u, fnIx) { return -1 }
+  u
 }
 
 // The exact bytes `fbStructNew(uBoxIdx)` writes, produced BY that encoder into a scratch
@@ -32455,8 +32581,29 @@ function emitCoalesceNulRefCtx(
   }
   wU8(214) // 0xd6 br_on_non_null
   wULEB(0) //   non-null → branch to the block end with the (ref $heapIx)
-  if emitExprExpect(body, e.binRight, fnIx, defCtx) < 0 { return -1 }
+  if heapIx == sTypeIdx && exprIsLitAtom(e.binRight, fnIx) {
+    if emitCoalesceAtomStrDefault(body, e.binRight, nulBlock, fnIx) < 0 {
+      return -1
+    }
+  } else {
+    if emitExprExpect(body, e.binRight, fnIx, defCtx) < 0 { return -1 }
+  }
   fbEnd() // 0x0b end
+  0
+}
+
+// The default of a `string | null` `??` when it is a literal-union atom (`K` or `K | null`):
+// widened to its member string, `-1` to `ref.null`, and recovered non-null when the block is.
+function emitCoalesceAtomStrDefault(
+  body: u8[],
+  defIx: i32,
+  nulBlock: boolean,
+  fnIx: i32,
+) {
+  if emitAtomToStr(body, defIx, fnIx) < 0 { return -1 }
+  if !nulBlock && nulAtomWidenTexts(defIx).length > 0 {
+    fbRefAsNonNull() // 0xd4 the block is non-null: the default's null is narrowed away
+  }
   0
 }
 
