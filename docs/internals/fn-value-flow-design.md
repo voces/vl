@@ -260,7 +260,7 @@ LAST arena-mutating pass.**
   nothing. The control is how the 0 means something.
 - **Later rewrites.** A rewrite added later that forgets `identFrom` shows up in the same
   count, so the guard outlives step 0.
-- **D3993** (on #3516; unfiled: D3993) belongs to the same hazard class. A rewrite changed a
+- **D3993** (on #3516) belongs to the same hazard class. A rewrite changed a
   node's kids, and a later reader indexed the old shape. That is a reason to audit the
   rewritten tree rather than trust the creation list.
 
@@ -765,9 +765,7 @@ not claimed, and is out of scope.
 `check-filed-witnesses --strict` grades **55 as filed and 1 moved**: D4010 grades
 `trap_loads` on master, and it was filed `silent_invalid_wasm` against #3517's tree.
 
-D4010–D4016 exist only on #3517's branch, which is held behind #3508. They reach master with
-#3517: unfiled: D4010 unfiled: D4011 unfiled: D4012 unfiled: D4013 unfiled: D4014
-unfiled: D4015 unfiled: D4016.
+D4010–D4016 reached master with #3517.
 
 The attribution below is a prediction, graded at the step named. A row that does not move
 at its step is re-ablated, not re-attributed.
