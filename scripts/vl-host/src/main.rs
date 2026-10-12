@@ -631,7 +631,7 @@ program verbatim — the only way to pass one that starts with `-`.
             "\
 {c}vl check{r} — typecheck; print diagnostics
 
-{b}Usage:{r} vl check [path] [flags]      {d}default path: the current directory{r}
+{b}Usage:{r} vl check [path]... [flags]   {d}default path: the current directory{r}
        vl check --batch [path]... [flags]
 
 A single file checks its whole resolved module graph; a directory walks
@@ -694,10 +694,10 @@ hints only for the file(s) you name, unless asked for (below).
             "\
 {c}vl fmt{r} — format VL source
 
-{b}Usage:{r} vl fmt [path] [flags]        {d}no path: format stdin to stdout{r}
+{b}Usage:{r} vl fmt [path]... [flags]   {d}no path: format stdin to stdout{r}
 
-One path per run: a file formats that file, a directory walks it. The default
-prints the formatted source to stdout and writes nothing.
+Each path is a file to format or a directory to walk. The default prints the
+formatted source to stdout and writes nothing.
 
 {b}Flags:{r}
   {c}-w, --write{r}         Write the result back in place
@@ -720,7 +720,7 @@ prints the formatted source to stdout and writes nothing.
             "\
 {c}vl test{r} — discover *.test.vl files and run them in parallel
 
-{b}Usage:{r} vl test [path] [flags]       {d}default path: the current directory{r}
+{b}Usage:{r} vl test [path]... [flags]   {d}default path: the current directory{r}
 
 Files compile and run concurrently, each in its own compiler and its own
 instance; tests within one file run serially in that instance, so they can
@@ -2183,15 +2183,25 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
         // the user cache dir rather than beside the module, since a distributed `vl`
         // has no `build/` of its own — and it is CONTENT-KEYED, so there is no
         // freshness question to ask (different bytes ⇒ different file).
-        CompilerSource::Embedded(bytes) => cached_module(
-            engine,
-            seed_cache_path(&tag).as_deref(),
-            true,
-            || {
+        CompilerSource::Embedded(bytes) => {
+            let cache = seed_cache_path(&tag);
+            // A cache miss costs seconds of silence (DV-006), so say what the wait is before it
+            // starts. Engine configurations cache apart, so a miss is per configuration, not
+            // per `vl` version, and with no cache directory it is every run.
+            match cache.as_deref() {
+                Some(p) if p.exists() => {}
+                Some(_) => eprintln!(
+                    "vl: compiling the compiler for this machine; this takes from seconds to a minute, and the result is cached for later runs"
+                ),
+                None => eprintln!(
+                    "vl: compiling the compiler for this machine; this takes from seconds to a minute, and with no usable cache directory every run does it"
+                ),
+            }
+            cached_module(engine, cache.as_deref(), true, || {
                 Module::from_binary(engine, bytes)
                     .map_err(|e| e.context("loading the embedded compiler seed"))
-            },
-        )?,
+            })?
+        }
         // On-disk seed: the sidecar sits next to it and is CONTENT-KEYED, exactly as
         // the embedded path above — `<seed>.<seed key>.<engine tag>.cwasm`. It used to
         // be keyed by mtime, which made every byte-identical rewrite of the seed a full
