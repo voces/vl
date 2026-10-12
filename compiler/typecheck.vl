@@ -14937,6 +14937,9 @@ function isvalReset() {
   fnLitBindName = []
   fnLitBindDecl = []
   fsbReset()
+  callBindRow = Map()
+  callBindNames = []
+  callBindTys = []
   nlnDiag = []
   nlnMsg = []
   nlnText = []
@@ -17607,6 +17610,61 @@ let fsbRowDecl: i32[] = []
 let fsbPendName: string[] = []
 let fsbPendIx: i32[] = []
 let fsbPendTy: i32[] = []
+// The per-call binding column: what each generic call bound, by call node, as the type-variable
+// names the callee's signature rides and the arena type each is bound to. Every non-speculative
+// check of the call overwrites its row, so a re-check pass's answer stands; `initChecker` empties it.
+let callBindRow: {[i32]: i32} = Map()
+let callBindNames: string[][] = []
+let callBindTys: i32[][] = []
+
+// The shadow's must-fire control: 1 records nothing, 2 records every type as the error type.
+// Only a host sets it (`callBindDropSet`), and only to prove the shadow sees the column.
+let callBindDrop = 0
+
+export function callBindDropSet(k: i32) {
+  callBindDrop = k
+  0
+}
+
+function callBindNote(ix: i32, names: string[], tys: i32[]) {
+  if inferQuiet || ix < 0 || callBindDrop == 1 { return 0 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  let i = 0
+  while i < names.length && i < tys.length {
+    nm.push(names[i])
+    if callBindDrop == 2 { ty.push(TY_ERR) } else { ty.push(tys[i]) }
+    i = i + 1
+  }
+  const r = callBindRow[ix] ?? -1
+  if r >= 0 {
+    callBindNames[r] = nm
+    callBindTys[r] = ty
+    return 0
+  }
+  callBindRow[ix] = callBindNames.length
+  callBindNames.push(nm)
+  callBindTys.push(ty)
+  0
+}
+
+// Whether call `ix` has a row: a generic call some full check pass resolved.
+export function callBindHas(ix: i32): boolean { (callBindRow[ix] ?? -1) >= 0 }
+
+// The arena type call `ix` bound type variable `name` to, or -1 when it has no row or bound
+// nothing there.
+export function callBindTyOf(ix: i32, name: string): i32 {
+  const r = callBindRow[ix] ?? -1
+  if r < 0 { return -1 }
+  const nm = callBindNames[r]
+  let i = 0
+  while i < nm.length {
+    if nm[i] == name { return callBindTys[r][i] }
+    i = i + 1
+  }
+  -1
+}
+
 // D3968 — the functions written to a marked binding, as the owners of their deferred constraints
 // (a written generic's declaration, else the body the write stands in), and every call through
 // such a binding with what it bound, so each owner's constraints are re-asked at that call.
@@ -17620,8 +17678,6 @@ let fsbCallIx: i32[] = []
 let fsbCallDecl: i32[] = []
 let fsbCallUsed: i32[] = []
 let fsbCallWho: string[] = []
-let fsbCallNames: string[][] = []
-let fsbCallTys: i32[][] = []
 let fsbCallHNames: string[][] = []
 let fsbCallHNo: i32[][] = []
 let fsbCallHNode: i32[][] = []
@@ -17642,8 +17698,6 @@ function fsbReset() {
   fsbCallDecl = []
   fsbCallUsed = []
   fsbCallWho = []
-  fsbCallNames = []
-  fsbCallTys = []
   fsbCallHNames = []
   fsbCallHNo = []
   fsbCallHNode = []
@@ -17827,8 +17881,6 @@ function fsbNoteCall(
   decl: i32,
   used: i32,
   who: string,
-  names: string[],
-  tys: i32[],
   hNames: string[],
   hNo: i32[],
   hNode: i32[],
@@ -17840,8 +17892,6 @@ function fsbNoteCall(
   fsbCallDecl.push(decl)
   fsbCallUsed.push(used)
   fsbCallWho.push(who)
-  fsbCallNames.push(names)
-  fsbCallTys.push(tys)
   fsbCallHNames.push(hNames)
   fsbCallHNo.push(hNo)
   fsbCallHNode.push(hNode)
@@ -17961,10 +18011,9 @@ function fsbNoteFnDelivery(src: i32, dst: i32) {
   const args: i32[] = []
   for p in f.fnParamTypes { args.push(p) }
   const none: string[] = []
-  const noTys: i32[] = []
   const noIx: i32[] = []
   const noNode: i32[] = []
-  fsbNoteCall(src, d, CSTR_ANYFN, "", none, noTys, none, noIx, noNode, args)
+  fsbNoteCall(src, d, CSTR_ANYFN, "", none, noIx, noNode, args)
 }
 
 // The parameter types of the called type `ft` under the call's bindings.
@@ -49819,6 +49868,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // constraints too — the same self-arrives-ahead-of-the-argument-loop asymmetry as above.
     if !inferQuiet {
       if bNames.length > 0 {
+        callBindNote(ix, bNames, bTys)
         // `params[0]` is the RECEIVER here, so the origins skip it (`selfOff` 1) and the
         // remaining parameters number from 1 — `xs.plus(y)` blames `argument 1`, not 2.
         const uhNames: string[] = []
@@ -51552,6 +51602,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       substNestMode = SUBST_ALL
     }
     const wsVd = T.diags.length
+    callBindNote(ix, vNames, vTys)
     pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
     if fsbName.length > 0 {
       fsbNoteCall(
@@ -51559,8 +51610,6 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         fsbDeclAtNode(n.callFn),
         cstrCallee,
         cstrWho,
-        vNames,
-        vTys,
         dhNames,
         dhArgNo,
         dhArgNode,
