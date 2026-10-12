@@ -887,11 +887,11 @@ is no fixed-array literal to fight.
   pitfall) is deferred.
 
 **Explicitly out of scope for v1 (xfail / future):**
-- `insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift) — `push`/`pop`
-  (ends) only in v1.
+- ~~`insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift)~~ — shipped in
+  `std:array` as `insert`, `removeAt`, `swapRemove` and the in-place filter `retain`.
 - `shrinkToFit()` / any auto-shrink — grow-only.
 - **Per-frame pooling / reuse beyond `clear()`** — a heavier "retain this buffer
-  across frames" story (`retain`, `mapInto(dst)`, free-list pooling) is **deferred
+  across frames" story (`mapInto(dst)`, free-list pooling) is **deferred
   past v1**: it is not clearly first-release-critical, and the inferred fixed-array
   representation (§VL.7) already removes the per-frame allocation for the
   fixed-size cases *for free*. The one cheap piece kept in v1 is capacity-retaining
