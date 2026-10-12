@@ -173,6 +173,10 @@ run "dead-export budget"       "$PY" scripts/export-budget.py --check
 # lint itself rather than a python copy of it (a `+` chain is an expression tree), so it
 # needs the seed. The compiler's standing chains are held; a new one reds here.
 run "interp budget"            "$PY" scripts/interp-budget.py --check
+# The render-parse RATCHET, seventh of the same shape: `tyToEmitName(` calls and the ten
+# type-string parsers in the emitter. A rep is decided from the checked type, not from
+# a rendered spelling parsed back (code-quality-2026-10.md L2). A pure file scan, no seed.
+run "render-parse budget"     "$PY" scripts/render-parse-budget.py --check
 # THE SHAPE FAMILY: pairs of the same work, one axis reshaped, graded on the ratio of
 # the compiler's guest FUEL (a count, so load cannot move it; the runtime pairs on CPU).
 # ~40 s, and it reds on the pre-#2419 compiler.
