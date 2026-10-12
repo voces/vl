@@ -75,6 +75,7 @@ import {
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   capWidenOf,
+  cmpLitNodeOf,
   coalLhsParts,
   collectRetValues,
   condNarrowDropOf,
@@ -421,6 +422,7 @@ import {
   setShapeOfTy,
   shapeInnerFieldSplit,
   strLess,
+  subscriptKeyLexemeOf,
   tyGroupWrapsWhole,
   tyIsBool,
   tyIsFuncType,
@@ -19124,6 +19126,290 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   r
 }
 
+// The then-branch narrowing of `obj is variant`, which `obj == L` over a literal union shares
+// (Q10): `condIx` keys the checker's banked answers. False when it pushes nothing.
+function narrowIsThen(
+  objIx: i32,
+  variant: string,
+  condIx: i32,
+  fnIx: i32,
+): boolean {
+  const isObj = asgTestedIdent(objIx)
+  if isObj < 0 { return false }
+  const recv = P.nodes[isObj]
+  if recv is Ident {
+    if identHoldsUnionBox(isObj, recv.identName, fnIx) {
+      pushNarrowIs(recv.identName, variant, condIx)
+      return true
+    }
+  }
+  // `o.y is T` over a UNION-typed struct FIELD narrows the member PATH (the
+  // narrowing key is the path string `o.y`; `emitMem` unboxes under it).
+  const mrecv = P.nodes[unwrapParen(isObj)]
+  if mrecv is Member {
+    if memberUnionFieldNameRead(unwrapParen(isObj), fnIx) != "" {
+      const mk = memberPathKeyOf(unwrapParen(isObj))
+      if mk != "" {
+        pushNarrowIs(mk, variant, condIx)
+        return true
+      }
+    }
+  }
+  // `xs[0] is T` over a union-box element narrows the index place — the index twin of
+  // the member channel above, keyed exactly as the checker's `placeKeyOf` spells it.
+  if mrecv is Index {
+    const iix = unwrapParen(isObj)
+    if indexElemUnionName(iix, fnIx) != "" {
+      const ik = indexPathKeyOf(iix)
+      if ik != "" {
+        pushNarrowIs(ik, variant, condIx)
+        return true
+      }
+    }
+    if pushIndexNicheNarrow(iix, fnIx) { return true }
+    // …and the map read, the same place one container over (D1025): `placeKeyOf` never
+    // distinguished the two receivers, so the checker has always narrowed both.
+    if pushIndexMapNarrow(iix, variant, condIx, fnIx) { return true }
+  }
+  // `x?.y is T` narrows the member path exactly like `x.y is T` — the then-arm only runs
+  // when every chain link held and the union field matched, so plain `x.y` reads unbox
+  // under the same path key.
+  if mrecv is OptMember {
+    const omSi = optChainStructIdxOf(mrecv.omObj, fnIx)
+    if omSi >= 0 {
+      const omFi = sFieldIndex(omSi, mrecv.omProp)
+      if omFi >= 0 {
+        if sFieldTypeAt(omSi, omFi) == FC_UNION {
+          const omRoot = P.nodes[unwrapParen(mrecv.omObj)]
+          if omRoot is Ident {
+            pushNarrowIs(omRoot.identName + "." + mrecv.omProp, variant, condIx)
+            return true
+          }
+        }
+      }
+    }
+  }
+  // `s.kind is KC` — the discriminant: a test on a struct union's field refines the
+  // receiver itself, which the member arm above (for a union-typed field) doesn't cover.
+  // The surviving type is the checker's (`isParentTyIxOf`), not re-derived. Single
+  // survivor only: a test leaving two of three arms pushes nothing and stays loud.
+  pushDiscrimNarrow(unwrapParen(isObj), condIx, fnIx, false)
+}
+
+// The else-branch twin of `narrowIsThen`: what `obj is variant` being false leaves.
+function narrowIsElse(
+  objIx: i32,
+  variant: string,
+  condIx: i32,
+  fnIx: i32,
+): boolean {
+  const isObj = asgTestedIdent(objIx)
+  if isObj < 0 { return false }
+  // Member path checked first, outside the `valueAtomKind` gate: `o.y is T` over a
+  // union-typed struct field strips `T` from the path's current set, unboxing the
+  // else-arm's `o.y`. A struct variant fails `valueAtomKind` and a `Member` isn't an
+  // `Ident`, so this must sit outside both gates or the member path falls between them.
+  const mrecv = P.nodes[unwrapParen(isObj)]
+  // The discriminant complement: `if s.kind is KC {…} else {…}` rules the tested arm out
+  // of the else branch too. Scoped narrower than the general struct-union complement
+  // below (which derives from a rendered set): this pushes only the checker's banked
+  // answer for one condition node.
+  if pushDiscrimNarrow(unwrapParen(isObj), condIx, fnIx, true) { return true }
+  // Ahead of the two PLACE arms below, which subtract from a set canon has already
+  // softened: `"err"` is not a member of `i32|string`, so they push the whole set back and
+  // claim the narrow, leaving no atom to unbox to. An `Ident` receiver reaches this rung
+  // either way, so the order only decides a place's answer (D1729).
+  if litElseNarrow(isObj, variant) { return true }
+  // The index dual of the member complement below: the else of `xs[0] is T` subtracts
+  // `T` from the cell's set, unboxing `match xs[0] { null => … T => … }`'s second arm.
+  if mrecv is Index {
+    const eiix = unwrapParen(isObj)
+    const eiun = indexElemUnionName(eiix, fnIx)
+    if eiun == "" {
+      if pushIndexStructComplement(eiix, variant, condIx) { return true }
+    }
+    if eiun != "" {
+      const eik = indexPathKeyOf(eiix)
+      if eik != "" {
+        let eicur = ""
+        let eisid = -1
+        const eislot = narrowSlotOf(eik)
+        if eislot >= 0 {
+          eicur = narrowVariants[eislot]
+          eisid = narrowSets[eislot]
+        } else {
+          eicur = unionMemberSetOf(eiun)
+          eisid = msSetOfText(eicur)
+        }
+        if pushNarrowComplement(eik, eisid, variant) != "" { return true }
+        const eirst = removeAtomFromSet(eicur, variant)
+        if eirst != "" {
+          pushNarrow(eik, eirst)
+          return true
+        }
+      }
+    }
+    if eiun == "" && variant != "null" {
+      if pushIndexMapComplement(eiix, variant, fnIx) { return true }
+    }
+    if variant == "null" {
+      if pushIndexNicheNarrow(eiix, fnIx) { return true }
+      // The map cell in the else of `m["k"] is null` — the third spelling of the same
+      // guard, beside `!= null` and the else of `== null`, and the one a `match` on a
+      // nullable cell reaches (D1734).
+      if pushIndexMapNullNarrow(eiix, fnIx) { return true }
+    }
+  }
+  if mrecv is Member {
+    const mun = memberUnionFieldNameRead(unwrapParen(isObj), fnIx)
+    if mun != "" {
+      const mk = memberPathKeyOf(unwrapParen(isObj))
+      if mk != "" {
+        let mcur = ""
+        let msid = -1
+        // The member PATH's own narrowing stack slot carries both its rendered
+        // current set and that set's identity — one walk answers both.
+        const mslot = narrowSlotOf(mk)
+        if mslot >= 0 {
+          mcur = narrowVariants[mslot]
+          msid = narrowSets[mslot]
+        } else {
+          mcur = unionMemberSetOf(mun)
+          msid = msSetOfText(mcur)
+        }
+        if pushNarrowComplement(mk, msid, variant) != "" { return true }
+        const mrest = removeAtomFromSet(mcur, variant)
+        if mrest != "" {
+          pushNarrow(mk, mrest)
+          return true
+        }
+      }
+    }
+  }
+  if valueAtomKind(variant) >= 0 {
+    const recv = P.nodes[unwrapParen(isObj)]
+    if recv is Ident {
+      const un = unionNameOfIdentAt(
+        sidOfNode(unwrapParen(isObj)),
+        fnIx,
+        unwrapParen(isObj),
+      )
+      if un != "" {
+        if isValueUnionName(un) {
+          const esid = currentNarrowSetIdAt(
+            recv.identName,
+            fnIx,
+            unwrapParen(isObj),
+          )
+          if pushNarrowComplement(recv.identName, esid, variant) != "" {
+            return true
+          }
+          const rest = removeAtomFromSet(
+            currentNarrowSetAt(
+              recv.identName,
+              fnIx,
+              unwrapParen(isObj),
+            ),
+            variant,
+          )
+          if rest != "" {
+            pushNarrow(recv.identName, rest)
+            return true
+          }
+        }
+      }
+    }
+    // A mixed union — struct arm(s) alongside the tested value atom (`{f: i32} | i32`) —
+    // isn't a value union, so the Ident arm above skipped it. Falls through to the
+    // struct-union complement below: the guard fails, so subtracting the tested atom
+    // leaves the struct arm(s), and the else-arm's `v.f` reads through that downcast.
+    let elseMixed = false
+    if recv is Ident {
+      const mxun = unionNameOfIdentAt(
+        sidOfNode(unwrapParen(isObj)),
+        fnIx,
+        unwrapParen(isObj),
+      )
+      if mxun != "" {
+        if !isValueUnionName(mxun) { elseMixed = true }
+      }
+    }
+    if !elseMixed { return false }
+  }
+  // Struct-union complement (host flow narrowing): the guard fails, so the tested
+  // variant is stripped from the receiver's current set. One member remaining fully
+  // discriminates the else-arm; a multi-member rest keeps a later `else if` narrowing
+  // further. Only a boxed struct union narrows — a 1-struct niche is a nullable ref.
+  const srecv = P.nodes[unwrapParen(isObj)]
+  if srecv is Ident {
+    if identHoldsUnionBox(isObj, srecv.identName, fnIx) {
+      // The subtracted atom is the resolved spelling, not the author's, agreeing with the
+      // three gates that already read it. An inline shape tested against a nominally
+      // spelled union would otherwise clear no bit (`msSubAtom` finds no match), silently
+      // handing the else arm an unchanged, un-narrowed set while the checker did narrow.
+      const sVar = setAtomSpelling(
+        currentStructNarrowSetAt(
+          srecv.identName,
+          fnIx,
+          unwrapParen(isObj),
+        ),
+        isVariantSpelling(variant, isVarTyIxOf(condIx)),
+      )
+      const ssid = currentStructNarrowSetIdAt(
+        srecv.identName,
+        fnIx,
+        unwrapParen(isObj),
+      )
+      if pushNarrowComplement(srecv.identName, ssid, sVar) != "" { return true }
+      const srest = removeAtomFromSet(
+        currentStructNarrowSetAt(
+          srecv.identName,
+          fnIx,
+          unwrapParen(isObj),
+        ),
+        sVar,
+      )
+      if srest != "" {
+        pushNarrow(srecv.identName, srest)
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// `x == L` over a literal union (Q10): the receiver `x`, or -1 when the checker banked no literal
+// test at `condIx` (a plain `string` or `i32` operand, which narrows nothing).
+function litEqRecv(condIx: i32): i32 {
+  if condIx < 0 || isVarTyIxOf(condIx) < 0 { return -1 }
+  const c = P.nodes[condIx]
+  if !(c is BinExpr) { return -1 }
+  if litEqLexeme(c.binRight) != "" { return c.binLeft }
+  if litEqLexeme(c.binLeft) != "" { return c.binRight }
+  -1
+}
+
+// The `is` spelling of an operand the checker reads as a literal (`cmpLitNodeOf`) — its source
+// lexeme — or "" when it is not one.
+function litEqLexeme(ix: i32): string {
+  const lx = cmpLitNodeOf(ix)
+  if lx < 0 { return "" }
+  const e = P.nodes[lx]
+  if e is NumLit { return e.numText }
+  subscriptKeyLexemeOf(lx)
+}
+
+// The tested literal of a comparison `litEqRecv` accepted.
+function litEqVariant(condIx: i32): string {
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    const r = litEqLexeme(c.binRight)
+    if r != "" { return r }
+    return litEqLexeme(c.binLeft)
+  }
+  ""
+}
+
 function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   // A parenthesized condition guards identically (`if (x is A)` ≡ `if x is A`), and
   // the checker's narrowing collectors already peel `Paren` — match them here so the
@@ -19134,72 +19420,8 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   // An `is T` test pins a variant. A loop body pins one too: narrowing is a rule about
   // READS, and the write that flips the variant is checked against the declaration (D1736).
   if c is IsExpr {
-    const isObj = asgTestedIdent(c.isObj)
-    if isObj < 0 { return false }
-    const recv = P.nodes[isObj]
-    if recv is Ident {
-      if identHoldsUnionBox(isObj, recv.identName, fnIx) {
-        pushNarrowIs(recv.identName, c.isVariant, condIx)
-        return true
-      }
-    }
-    // `o.y is T` over a UNION-typed struct FIELD narrows the member PATH (the
-    // narrowing key is the path string `o.y`; `emitMem` unboxes under it).
-    const mrecv = P.nodes[unwrapParen(isObj)]
-    if mrecv is Member {
-      if memberUnionFieldNameRead(unwrapParen(isObj), fnIx) != "" {
-        const mk = memberPathKeyOf(unwrapParen(isObj))
-        if mk != "" {
-          pushNarrowIs(mk, c.isVariant, condIx)
-          return true
-        }
-      }
-    }
-    // `xs[0] is T` over a union-box element narrows the index place — the index twin of
-    // the member channel above, keyed exactly as the checker's `placeKeyOf` spells it.
-    if mrecv is Index {
-      const iix = unwrapParen(isObj)
-      if indexElemUnionName(iix, fnIx) != "" {
-        const ik = indexPathKeyOf(iix)
-        if ik != "" {
-          pushNarrowIs(ik, c.isVariant, condIx)
-          return true
-        }
-      }
-      if pushIndexNicheNarrow(iix, fnIx) { return true }
-      // …and the map read, the same place one container over (D1025): `placeKeyOf` never
-      // distinguished the two receivers, so the checker has always narrowed both.
-      if pushIndexMapNarrow(iix, c.isVariant, condIx, fnIx) { return true }
-    }
-    // `s.kind is KC` — the discriminant: a test on a struct union's field refines the
-    // receiver itself, which the member arm above (for a union-typed field) doesn't cover.
-    // The surviving type is the checker's (`isParentTyIxOf`), not re-derived. Single
-    // survivor only: a test leaving two of three arms pushes nothing and stays loud.
-    if pushDiscrimNarrow(unwrapParen(isObj), condIx, fnIx, false) {
-      return true
-    }
-    // `x?.y is T` narrows the member path exactly like `x.y is T` — the then-arm only runs
-    // when every chain link held and the union field matched, so plain `x.y` reads unbox
-    // under the same path key.
-    if mrecv is OptMember {
-      const omSi = optChainStructIdxOf(mrecv.omObj, fnIx)
-      if omSi >= 0 {
-        const omFi = sFieldIndex(omSi, mrecv.omProp)
-        if omFi >= 0 {
-          if sFieldTypeAt(omSi, omFi) == FC_UNION {
-            const omRoot = P.nodes[unwrapParen(mrecv.omObj)]
-            if omRoot is Ident {
-              pushNarrowIs(
-                omRoot.identName + "." + mrecv.omProp,
-                c.isVariant,
-                condIx,
-              )
-              return true
-            }
-          }
-        }
-      }
-    }
+    if asgTestedIdent(c.isObj) < 0 { return false }
+    if narrowIsThen(c.isObj, c.isVariant, condIx, fnIx) { return true }
   }
   // `a && b` composes: the then-branch sees both conjuncts' narrowings (the RHS is checked
   // under the LHS's narrowing). Pushes stack; the caller's save/restore of `narrowTop`
@@ -19213,6 +19435,16 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
       }
       if pushDiscrimNarrow(unwrapParen(c.binRight), condIx, fnIx, false) {
         return true
+      }
+    }
+    // `x == L` narrows as `x is L` does, and `x != L` as its else (Q10).
+    const ler = litEqRecv(condIx)
+    if ler >= 0 && asgTestedIdent(ler) >= 0 {
+      if c.binOp == "==" {
+        if narrowIsThen(ler, litEqVariant(condIx), condIx, fnIx) { return true }
+      }
+      if c.binOp == "!=" {
+        if narrowIsElse(ler, litEqVariant(condIx), condIx, fnIx) { return true }
       }
     }
     if c.binOp == "&&" {
@@ -19238,6 +19470,13 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
     if cn is BinExpr {
       if cn.binOp == "==" {
         pushNarrow(nm, "null")
+        return true
+      }
+      // An earlier literal test that left literals of one base beside `null` reads at that
+      // base once `null` is ruled out, as the literal complement does without the `null` (D4202).
+      const nlb = nullCmpLitBase(condIx)
+      if nlb >= 0 {
+        pushNarrowRep(nm, tyPrimNameOf(nlb) ?? "", nlb, -1)
         return true
       }
       const nlift = maskNarrowFor(nullPinnedKey(nm))
@@ -19364,6 +19603,41 @@ function asgTestedIdent(ix: i32): i32 {
     }
   }
   ix
+}
+
+// The one base of the literals the checker typed null compare `condIx`'s operand at beside
+// `null`, or -1 when the operand's type is anything else.
+function nullCmpLitBase(condIx: i32): i32 {
+  const ref = nullCmpRefOf(condIx)
+  if ref < 0 { return -1 }
+  const ty = nodeTyIxOf(ref)
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  let inner = ty
+  let sawNull = false
+  const t = T.tys[ty]
+  if t is TyNullable {
+    sawNull = true
+    inner = t.nInner
+    if inner < 0 || inner >= T.tys.length { return -1 }
+  }
+  const it = T.tys[inner]
+  const mems = if it is TyUnion { it.uMembers } else { [inner] }
+  let base = -1
+  for m in mems {
+    if m < 0 || m >= T.tys.length { return -1 }
+    const mt = T.tys[m]
+    if mt is TyLit {
+      const b = litBaseTy(mt)
+      if base >= 0 && base != b { return -1 }
+      base = b
+    } else if tyPrimNameOf(m) == "null" {
+      sawNull = true
+    } else {
+      return -1
+    }
+  }
+  if !sawNull { return -1 }
+  base
 }
 
 // The non-null operand of a `x == null` / `x != null` comparison at `condIx` (parens
@@ -19572,183 +19846,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   const c = P.nodes[condIx]
   // The else of `x is null` strips null (that is how `!(e is null)` narrows); the else of
   // `x is T` subtracts `T`, which pins a variant. A loop body takes both (D1736).
-  if c is IsExpr {
-    const isObj = asgTestedIdent(c.isObj)
-    if isObj < 0 { return false }
-    // Member path checked first, outside the `valueAtomKind` gate: `o.y is T` over a
-    // union-typed struct field strips `T` from the path's current set, unboxing the
-    // else-arm's `o.y`. A struct variant fails `valueAtomKind` and a `Member` isn't an
-    // `Ident`, so this must sit outside both gates or the member path falls between them.
-    const mrecv = P.nodes[unwrapParen(isObj)]
-    // The discriminant complement: `if s.kind is KC {…} else {…}` rules the tested arm out
-    // of the else branch too. Scoped narrower than the general struct-union complement
-    // below (which derives from a rendered set): this pushes only the checker's banked
-    // answer for one condition node.
-    if pushDiscrimNarrow(unwrapParen(isObj), condIx, fnIx, true) { return true }
-    // Ahead of the two PLACE arms below, which subtract from a set canon has already
-    // softened: `"err"` is not a member of `i32|string`, so they push the whole set back and
-    // claim the narrow, leaving no atom to unbox to. An `Ident` receiver reaches this rung
-    // either way, so the order only decides a place's answer (D1729).
-    if litElseNarrow(isObj, c.isVariant) { return true }
-    // The index dual of the member complement below: the else of `xs[0] is T` subtracts
-    // `T` from the cell's set, unboxing `match xs[0] { null => … T => … }`'s second arm.
-    if mrecv is Index {
-      const eiix = unwrapParen(isObj)
-      const eiun = indexElemUnionName(eiix, fnIx)
-      if eiun == "" {
-        if pushIndexStructComplement(eiix, c.isVariant, condIx) { return true }
-      }
-      if eiun != "" {
-        const eik = indexPathKeyOf(eiix)
-        if eik != "" {
-          let eicur = ""
-          let eisid = -1
-          const eislot = narrowSlotOf(eik)
-          if eislot >= 0 {
-            eicur = narrowVariants[eislot]
-            eisid = narrowSets[eislot]
-          } else {
-            eicur = unionMemberSetOf(eiun)
-            eisid = msSetOfText(eicur)
-          }
-          if pushNarrowComplement(eik, eisid, c.isVariant) != "" { return true }
-          const eirst = removeAtomFromSet(eicur, c.isVariant)
-          if eirst != "" {
-            pushNarrow(eik, eirst)
-            return true
-          }
-        }
-      }
-      if eiun == "" && c.isVariant != "null" {
-        if pushIndexMapComplement(eiix, c.isVariant, fnIx) { return true }
-      }
-      if c.isVariant == "null" {
-        if pushIndexNicheNarrow(eiix, fnIx) { return true }
-        // The map cell in the else of `m["k"] is null` — the third spelling of the same
-        // guard, beside `!= null` and the else of `== null`, and the one a `match` on a
-        // nullable cell reaches (D1734).
-        if pushIndexMapNullNarrow(eiix, fnIx) { return true }
-      }
-    }
-    if mrecv is Member {
-      const mun = memberUnionFieldNameRead(unwrapParen(isObj), fnIx)
-      if mun != "" {
-        const mk = memberPathKeyOf(unwrapParen(isObj))
-        if mk != "" {
-          let mcur = ""
-          let msid = -1
-          // The member PATH's own narrowing stack slot carries both its rendered
-          // current set and that set's identity — one walk answers both.
-          const mslot = narrowSlotOf(mk)
-          if mslot >= 0 {
-            mcur = narrowVariants[mslot]
-            msid = narrowSets[mslot]
-          } else {
-            mcur = unionMemberSetOf(mun)
-            msid = msSetOfText(mcur)
-          }
-          if pushNarrowComplement(mk, msid, c.isVariant) != "" { return true }
-          const mrest = removeAtomFromSet(mcur, c.isVariant)
-          if mrest != "" {
-            pushNarrow(mk, mrest)
-            return true
-          }
-        }
-      }
-    }
-    if valueAtomKind(c.isVariant) >= 0 {
-      const recv = P.nodes[unwrapParen(isObj)]
-      if recv is Ident {
-        const un = unionNameOfIdentAt(
-          sidOfNode(unwrapParen(isObj)),
-          fnIx,
-          unwrapParen(isObj),
-        )
-        if un != "" {
-          if isValueUnionName(un) {
-            const esid = currentNarrowSetIdAt(
-              recv.identName,
-              fnIx,
-              unwrapParen(isObj),
-            )
-            if pushNarrowComplement(recv.identName, esid, c.isVariant) != "" {
-              return true
-            }
-            const rest = removeAtomFromSet(
-              currentNarrowSetAt(
-                recv.identName,
-                fnIx,
-                unwrapParen(isObj),
-              ),
-              c.isVariant,
-            )
-            if rest != "" {
-              pushNarrow(recv.identName, rest)
-              return true
-            }
-          }
-        }
-      }
-      // A mixed union — struct arm(s) alongside the tested value atom (`{f: i32} | i32`) —
-      // isn't a value union, so the Ident arm above skipped it. Falls through to the
-      // struct-union complement below: the guard fails, so subtracting the tested atom
-      // leaves the struct arm(s), and the else-arm's `v.f` reads through that downcast.
-      let elseMixed = false
-      if recv is Ident {
-        const mxun = unionNameOfIdentAt(
-          sidOfNode(unwrapParen(isObj)),
-          fnIx,
-          unwrapParen(isObj),
-        )
-        if mxun != "" {
-          if !isValueUnionName(mxun) { elseMixed = true }
-        }
-      }
-      if !elseMixed { return false }
-    }
-    // Struct-union complement (host flow narrowing): the guard fails, so the tested
-    // variant is stripped from the receiver's current set. One member remaining fully
-    // discriminates the else-arm; a multi-member rest keeps a later `else if` narrowing
-    // further. Only a boxed struct union narrows — a 1-struct niche is a nullable ref.
-    const srecv = P.nodes[unwrapParen(isObj)]
-    if srecv is Ident {
-      if identHoldsUnionBox(isObj, srecv.identName, fnIx) {
-        // The subtracted atom is the resolved spelling, not the author's, agreeing with the
-        // three gates that already read it. An inline shape tested against a nominally
-        // spelled union would otherwise clear no bit (`msSubAtom` finds no match), silently
-        // handing the else arm an unchanged, un-narrowed set while the checker did narrow.
-        const sVar = setAtomSpelling(
-          currentStructNarrowSetAt(
-            srecv.identName,
-            fnIx,
-            unwrapParen(isObj),
-          ),
-          isVariantSpelling(c.isVariant, isVarTyIxOf(condIx)),
-        )
-        const ssid = currentStructNarrowSetIdAt(
-          srecv.identName,
-          fnIx,
-          unwrapParen(isObj),
-        )
-        if pushNarrowComplement(srecv.identName, ssid, sVar) != "" {
-          return true
-        }
-        const srest = removeAtomFromSet(
-          currentStructNarrowSetAt(
-            srecv.identName,
-            fnIx,
-            unwrapParen(isObj),
-          ),
-          sVar,
-        )
-        if srest != "" {
-          pushNarrow(srecv.identName, srest)
-          return true
-        }
-      }
-    }
-    return false
-  }
+  if c is IsExpr { return narrowIsElse(c.isObj, c.isVariant, condIx, fnIx) }
   // `a || b` composes in the else direction, the dual of `setNarrowFromCond`'s `&&`
   // recursion: the else-arm runs only when both disjuncts fail, so it sees both of their
   // else-narrowings. Without it a third disjunct in a chain like `e == null || g() || e >= 0`
@@ -19772,6 +19870,19 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
         return true
       }
     }
+    const eler = litEqRecv(condIx)
+    if eler >= 0 && asgTestedIdent(eler) >= 0 {
+      if c.binOp == "==" {
+        if narrowIsElse(eler, litEqVariant(condIx), condIx, fnIx) {
+          return true
+        }
+      }
+      if c.binOp == "!=" {
+        if narrowIsThen(eler, litEqVariant(condIx), condIx, fnIx) {
+          return true
+        }
+      }
+    }
   }
   // `!cond` in the else-arm: the inner condition holds there, so the else sees
   // the inner condition's then-narrowing (`if !(n is Program) {…} else { n.progStmts }`).
@@ -19784,6 +19895,13 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
     if cn is BinExpr {
       if cn.binOp == "!=" {
         pushNarrow(nm, "null")
+        return true
+      }
+      // An earlier literal test that left literals of one base beside `null` reads at that
+      // base once `null` is ruled out, as the literal complement does without the `null` (D4202).
+      const nlb = nullCmpLitBase(condIx)
+      if nlb >= 0 {
+        pushNarrowRep(nm, tyPrimNameOf(nlb) ?? "", nlb, -1)
         return true
       }
       const nlift = maskNarrowFor(nullPinnedKey(nm))
@@ -30316,6 +30434,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
         return false
       }
+      // A box element read under a narrowing unboxes to the member's own rep, which for a
+      // string literal is the string ref, however few literals the narrowing left (D4201).
+      if recvEl >= 0 && tyIsValueUnionBox(nonNullTy(recvEl)) { return false }
     }
     // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
     // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
@@ -39287,10 +39408,21 @@ function pushNarrowWriteReNarrow(name: string, ty: i32, un: string): boolean {
   // declaration, so the member it lands on is one of the declaration's. An `is`-pinned slot
   // carries no set at all (`pushNarrowIs` banks a type), which is the common case here.
   const r = asgReadNarrowSet(un, ty)
-  if r < 0 { return false }
+  // A literal member has no row in the set pool, so it lands as an `is` test of it would (D4200).
+  if r < 0 { return pushNarrowLitMember(name, ty) }
   const txt = msTextOf(r)
   if txt == "" { return false }
   pushNarrowRep(name, txt, -1, r)
+  true
+}
+
+// Push literal type `ty` as `name`'s narrowing, spelled as an `is` test of the literal spells it.
+function pushNarrowLitMember(name: string, ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyLit) { return false }
+  const spell = if t.litKind == "str" { "\"" + t.litText + "\"" } else { t.litText }
+  pushNarrowRep(name, spell, ty, -1)
   true
 }
 

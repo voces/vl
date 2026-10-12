@@ -86,7 +86,8 @@ print(f(a))   // prints B
 > type, so that the test always holds, it is refused as one that "can never match" (D4062).
 
 **N2.3** `x is L`, for a literal or a union of literals `L`, narrows a literal union the same
-way.
+way. A compare `x == L` against one literal narrows exactly as `x is L` does, and `x != L` as
+its negation.
 
 ```vl
 type K = "a" | "b" | "c"
@@ -98,12 +99,11 @@ function f(k: K): string {
 print(f("c"))   // prints c
 ```
 
-> Status: a compare `x == L` against a literal does not narrow `x` today.
-> `docs/guide/narrowing.md` says it narrows as `x is L` does; no ruling settles it (D4059).
-
 > Ruling: owner 2026-10-12 (Q10 (a)), DECISIONS.md §"`x == L` narrows a literal union as
 > `x is L` does". The narrowing covers the then-branch, the else-branch, the fall-through
-> after an exiting guard, and `!=` reversed (D4059, not built).
+> after an exiting guard, and `!=` reversed, and composes under `&&`, `||` and `!` wherever
+> `is` does. As with `is`, a later compare or `match` arm naming a member narrowed away is
+> refused (D4059).
 
 **N2.4** A compare of a record's literal-typed field with a literal, `c.kind == "m"`, narrows
 `c` to the members of its union whose field can hold that literal.
