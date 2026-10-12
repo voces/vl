@@ -9258,6 +9258,12 @@ fn relative_dir(from: &std::path::Path, to: &std::path::Path) -> Option<String> 
     let to = std::fs::canonicalize(to).ok()?;
     let a: Vec<_> = from.components().collect();
     let b: Vec<_> = to.components().collect();
+    // Two Windows drives share no root, so there is no relative form: name `to` absolutely,
+    // without `canonicalize`'s `\\?\` prefix and with `/` separators.
+    if a.first() != b.first() {
+        let s = to.to_string_lossy();
+        return Some(s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/"));
+    }
     let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let mut parts: Vec<String> = vec!["..".to_string(); a.len() - common];
     parts.extend(b[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
@@ -9301,19 +9307,34 @@ fn resolve_source(dir: &std::path::Path, s: &str) -> String {
         return s.to_string();
     }
     use std::path::Component;
+    // The root is an empty first segment, so the join spells `/a` (or `C:/a` after a Windows
+    // drive prefix); `roots` counts the segments a `..` cannot climb past.
     let mut parts: Vec<String> = Vec::new();
+    let mut roots = 0;
     for c in dir.join(s).components() {
         match c {
             Component::CurDir => {}
-            Component::ParentDir if parts.last().is_some_and(|p| p != ".." && p != "/") => {
+            Component::ParentDir if parts.len() > roots && parts.last().is_some_and(|p| p != "..") => {
                 parts.pop();
             }
-            Component::RootDir => parts.push("/".to_string()),
+            Component::Prefix(p) => {
+                let p = p.as_os_str().to_string_lossy();
+                parts.push(p.strip_prefix(r"\\?\").unwrap_or(&p).to_string());
+                roots = parts.len();
+            }
+            Component::RootDir => {
+                if parts.is_empty() {
+                    parts.push(String::new());
+                }
+                roots = parts.len();
+            }
             other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
         }
     }
-    let joined = parts.join("/");
-    joined.strip_prefix("//").map(|r| format!("/{r}")).unwrap_or(joined)
+    if parts.len() == 1 && parts[0].is_empty() {
+        return "/".to_string();
+    }
+    parts.join("/")
 }
 
 /// `Some(name)` for the function whose body holds `off`, `Some(None)` when that function has
