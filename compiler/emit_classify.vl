@@ -228,6 +228,7 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasTyVar,
+  tyIsArray,
   tyIsF32ArrayTy,
   tyIsI32SentinelNullable,
   tyIsLitUnion,
@@ -3186,7 +3187,7 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   // `u as? f64[]` out of a union box: the arm's distinct-backing list or null.
   if e is AsExpr {
     const asl = asUnionNulArmTy(exprIx, fnIx)
-    if asl >= 0 { return nulScalarListKind(tyToEmitName(asl) + "|null") }
+    if asl >= 0 { return nulScalarListKindOfTy(asl) }
   }
   if e is Index {
     // The map read (D1039), the sibling of `exprNullableList`'s map arm, which carries the
@@ -14081,6 +14082,19 @@ export function listGetStagesOperand(ix: i32): boolean {
   if c.callArgs.length != 1 { return false }
   !listGetIdxReReadable(c.callArgs[0])
 }
+// `valueAtomKind` of a type's render. The arena answers for a primitive, list, record or
+// map; any other kind asks the spelling, which reads a literal, a literal union or a
+// one-member alias union as its base atom where `valueRowKind` answers -1.
+export function valueAtomKindOfTy(ty: i32): i32 {
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyPrim || t is TyArray || t is TyObj || t is TyMap {
+      const k = valueRowKind(ty)
+      if k != -2 { return k }
+    }
+  }
+  valueAtomKind(tyToEmitName(ty))
+}
 
 // The value-atom kind the concrete (non-box) side of a union `==` compares under — the
 // same ladder `emitUnionCoerce` uses — or -1 when the operand has no atom rep (a struct,
@@ -16980,11 +16994,8 @@ function coalesceAtomKind(exprIx: i32, fnIx: i32) {
       ) {
         return -1
       }
-      const crn = tyToEmitName(crt)
-      if crn != "" {
-        const crk = valueAtomKind(crn)
-        if crk >= 0 && crk != 6 { return crk }
-      }
+      const crk = valueAtomKindOfTy(crt)
+      if crk >= 0 && crk != 6 { return crk }
       const nm = unionNameOfExpr(e.binLeft, fnIx)
       if nm != "" {
         if isValueUnionName(nm) && unionSetHasNull(nm) {
@@ -20781,7 +20792,7 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
       if d12i >= 0 {
         const d12t = narrowSlotTy(d12i)
         if d12t >= 0 {
-          if nameIsArray(tyToEmitName(d12t)) { return -1 }
+          if tyIsArray(d12t) { return -1 }
         }
       }
       // …and the same for a `string` narrow (D1033): `k[0]` over `k` narrowed to the
@@ -23536,6 +23547,36 @@ export function nulScalarListKind(name: string): VKind | null {
   if nameIsF32Array(b) { return "nulf32list" }
   if nameIsU8Array(b) { return "nulu8list" }
   null
+}
+// `nulScalarListKind` of `ty | null`, asked of the type: a list whose element is one of the
+// five distinct-backing scalars, or a nullable string. Any other shape asks the spelling.
+export function nulScalarListKindOfTy(ty: i32): VKind | null {
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyArray {
+      if t.aElem >= 0 {
+        const el = T.tys[t.aElem]
+        if el is TyPrim {
+          const p = el.primName
+          if p == "string" { return "nulstrlist" }
+          if p == "f64" { return "nulf64list" }
+          if p == "i64" { return "nuli64list" }
+          if p == "f32" { return "nulf32list" }
+          if p == "u8" { return "nulu8list" }
+          if p == "i32" || p == "boolean" { return null }
+        }
+        if el is TyNullable {
+          if el.nInner >= 0 {
+            const inr = T.tys[el.nInner]
+            if inr is TyPrim {
+              if inr.primName == "string" { return "nulstrlist" }
+            }
+          }
+        }
+      }
+    }
+  }
+  nulScalarListKind(tyToEmitName(ty) + "|null")
 }
 // The nullable-scalar-list VKind of annotation node `tyIx`, or `null`. Arena-first and
 // total where it covers: the spelling can't tell the four cases apart any more, since
@@ -28115,6 +28156,12 @@ function tyStepNulIf(ty: i32, full: string, base: string): i32 {
 }
 
 export function internShapeDeep(nm: string) { internShapeDeepTy(nm, -1) }
+
+// `internShapeDeepTy` for an arena type, walked under its emitter render: the one place a
+// caller holding only `ty` turns it into the name the walk still keys on.
+export function internShapeDeepOfTy(ty: i32) {
+  internShapeDeepTy(tyToEmitName(ty), ty)
+}
 
 // Recursively peels the composition wrappers off a type name — grouping parens, a trailing
 // `| null`, and trailing `[]` suffixes, in any order and to any depth — interning the
