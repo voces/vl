@@ -26,6 +26,15 @@ cd "$(dirname "$0")/.."
 # "toString is not exported" read from the main repo's pre-rename std, while the
 # same command with VL_STD pinned passed). Callers may still override.
 export VL_STD="${VL_STD:-$PWD/std}"
+# $VL_TMP: put every row's temp files in one directory, e.g. one the virus scanner skips.
+if [ -n "${VL_TMP:-}" ]; then
+  mkdir -p "$VL_TMP"
+  if command -v cygpath >/dev/null; then
+    export TMPDIR="$(cygpath -u "$VL_TMP")" TMP="$(cygpath -w "$VL_TMP")" TEMP="$(cygpath -w "$VL_TMP")"
+  else
+    export TMPDIR="$VL_TMP" TMP="$VL_TMP" TEMP="$VL_TMP"
+  fi
+fi
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
 # Ten rows below shell a python3, and a broken one exits rc=1 in milliseconds — the same
