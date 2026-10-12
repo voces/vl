@@ -194,6 +194,15 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   check error. The runtime guard's reachability pass (`initGuardScan`) is the analysis the compile
   error would start from; an uninitialized module `let` (D2655) is open beside it.
 
+- **A list of only `null` — RULED (a) for now, (c) later (owner, 2026-10-12, spec Q3,
+  D1832).** *Now:* a null-only list literal no typed destination receives (`const e = [null]`)
+  is a `vl check` error naming the annotation — BUILT ([D1832](docs/internals/inventory/D1832.md)).
+  *Later target, (c):* infer the element from the first non-null USE, so
+  `const e = [null]; e.push(42)` pins `(i32 | null)[]` the way A-infer-null pins a scalar
+  `let x = null`. New checker machinery: an element hole on the literal that a later use fills,
+  with today's `push: cannot add i32 to null[]` site becoming the pin. Rationale and peers:
+  `docs/internals/open-rulings.md` §D1832.
+
 - **Queued (owner, 2026-09-24, plumb):** std wrappers / compiler-level functionality over the raw
   shared-memory and atomics intrinsics (and the raw integer SIMD intrinsics), each through
   `std-api-reviewer`. The raw layer is `vl build --shared-memory=<pages>` plus the atomics lane.
