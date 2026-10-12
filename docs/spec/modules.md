@@ -383,7 +383,8 @@ print(trim(" a "))   // prints a
 > it cleanly. A compiler intrinsic cannot be redeclared: `function __trap__()` is refused,
 > "is a compiler intrinsic and cannot be redefined".
 
-Open question (Q11): may a program declare a name that an ambient name already has?
+> Ruling: owner 2026-10-12 (Q11 (b)), DECISIONS.md §"A declaration shadows an ambient name
+> of the same name". Compiler intrinsics stay refused (D4066, not built).
 
 **M5.4** A method call `x.f(…)` reaches only a function `f` that is in scope. It never
 finds a function the module has not imported.

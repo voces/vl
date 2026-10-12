@@ -10252,6 +10252,57 @@ a real discriminant and get no hint. The string-against-integer-literal check re
 its behaviour. Where the operand's declared type is a single record containing `B`, the
 compiler still answers by the declared type (D4058).
 
+## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
+
+**The rule.** A union of records whose arms share a field name is legal, whether or not a
+field is literal-typed in both. `u is A` answers whether the value structurally fits `A`,
+field by field. A tag may serve as a fast path only where it gives the same answer as the
+structural test.
+
+```vl
+type A = { v: i32 }
+type B = { v: boolean }
+function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+print(f({ v: true }))   // prints 2
+```
+
+**Why.** The owner: "'is' is not a nominal check; the language is structural", and "We can
+do a nominal check for perf reasons, but fundamentally the language is meant to be
+structural." This is the same principle as D3885 and D3870, applied to the union's formation
+rule. The 2026-09-02 refusal it replaces is retired.
+
+**Before.** The union was refused when formed, whichever way the `is` went. The checker does
+not admit it yet (D4056).
+
+## `x == L` narrows a literal union as `x is L` does (Q10 (a), owner ruling, 2026-10-12) — D4059
+
+**The rule.** For a literal union `K`, `x == L` narrows exactly as `x is L` does: in the
+then-branch, in the else-branch, after an exiting guard, and with `!=` reversed.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } 3 }
+```
+
+**Why.** The guide already said it, and `x is L` reads as `x == L` with narrowing. One
+spelling that narrows and one that does not was a trap. The checker does not do it yet
+(D4059).
+
+## A declaration shadows an ambient name of the same name (Q11 (b), owner ruling, 2026-10-12) — D4066
+
+**The rule.** A declaration named like an ambient name (a built-in type, `print`, `Map`,
+`Set`, a float or integer intrinsic) shadows it in its scope, for both the call and its
+type. Compiler intrinsics (`__name__`) stay refused.
+
+```vl
+function print(s: string): i32 { 7 }
+print("x")   // calls the program's own `print`, typed by its own signature
+```
+
+**Why.** A call and its type must agree about which name they mean; today a declared
+`print` is called but typed by the ambient one. Shadowing is how every other scope works.
+The checker does not do it yet (D4066).
+
 ## A re-export binds its name locally (owner rulings R1–R3, 2026-10-04) — sunpa SP-014, SP-020
 
 **R1 (A).** `export { X } from "m"` publishes `X` and also binds `X` in the re-exporting

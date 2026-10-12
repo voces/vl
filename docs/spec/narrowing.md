@@ -101,7 +101,9 @@ print(f("c"))   // prints c
 > Status: a compare `x == L` against a literal does not narrow `x` today.
 > `docs/guide/narrowing.md` says it narrows as `x is L` does; no ruling settles it (D4059).
 
-Open question (Q10): should `x == L` narrow a literal union as `x is L` does?
+> Ruling: owner 2026-10-12 (Q10 (a)), DECISIONS.md §"`x == L` narrows a literal union as
+> `x is L` does". The narrowing covers the then-branch, the else-branch, the fall-through
+> after an exiting guard, and `!=` reversed (D4059, not built).
 
 **N2.4** A compare of a record's literal-typed field with a literal, `c.kind == "m"`, narrows
 `c` to the members of its union whose field can hold that literal.
