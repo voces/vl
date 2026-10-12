@@ -1642,6 +1642,67 @@ function narKeyNowTy(key: string): i32 {
   placeElemTy(pt)
 }
 
+// The in-place writes a join has to see past: a scope binding retired in place (`atScope`, at
+// depth `narIpAt`) or a path slot's invalidation (`npInvBy[narIpAt]`), with both values.
+let narIpScope: boolean[] = []
+let narIpAt: i32[] = []
+let narIpName: string[] = []
+let narIpOld: i32[] = []
+let narIpNew: i32[] = []
+
+// Rebinds `name` at scope depth `d` in place, journalled for `narHeadTy`.
+function narSetScope(d: i32, name: string, ty: i32) {
+  narIpScope.push(true)
+  narIpAt.push(d)
+  narIpName.push(name)
+  narIpOld.push(T.scopes[d][name] ?? -1)
+  narIpNew.push(ty)
+  T.scopes[d][name] = ty
+  0
+}
+
+// Sets path slot `i`'s invalidation in place, journalled for `narHeadTy`.
+function narSetInv(i: i32, by: i32) {
+  narIpScope.push(false)
+  narIpAt.push(i)
+  narIpName.push("")
+  narIpOld.push(npInvBy[i])
+  narIpNew.push(by)
+  npInvBy[i] = by
+  0
+}
+
+// Applies journal row `j`'s old value (`undo`) or its new one, when it touches a scope or slot
+// that existed at `f`'s head.
+function narIpApply(f: IfChk, j: i32, undo: boolean) {
+  let v = narIpNew[j]
+  if undo { v = narIpOld[j] }
+  const at = narIpAt[j]
+  if narIpScope[j] {
+    if at < f.headDepth && v >= 0 { T.scopes[at][narIpName[j]] = v }
+  } else if at < f.headNp {
+    npInvBy[at] = v
+  }
+  0
+}
+
+// What `key` read at the head of the `if` behind `f`: its type now with every in-place write
+// since then undone, then redone. -1 where the key does not resolve.
+function narHeadTy(f: IfChk, key: string): i32 {
+  let j = narIpAt.length - 1
+  while j >= f.ipMark {
+    narIpApply(f, j, true)
+    j = j - 1
+  }
+  const t = narKeyNowTy(key)
+  j = f.ipMark
+  while j < narIpAt.length {
+    narIpApply(f, j, false)
+    j = j + 1
+  }
+  t
+}
+
 // The flow-narrowing join at the end of an `if` (DECISIONS.md, "Flow narrowing: per-path facts
 // meet at joins"). Each path through the `if` starts at the condition's fact for a key, or at its
 // entry type, and folds its arm's ledger rows; the key reads at the meet of the surviving paths
@@ -1681,10 +1742,12 @@ function applyArmJoins(
         slot[nm] = k
         keys.push(nm)
         // A key the condition tests starts each arm at that arm's fact, from the entry the head
-        // saw. Any other key enters both arms at its first row's before-type.
+        // saw. Any other key enters both arms at what it held on entry, which a row inside an
+        // arm's own narrowing cannot tell (D4198).
         const ti = strListLastIx(f.tnNames, nm)
         const ei = strListLastIx(f.enNames, nm)
-        let ent = narClobPrev[i]
+        let ent = narHeadTy(f, nm)
+        if ent < 0 { ent = narClobPrev[i] }
         let ts = ent
         let es = ent
         const cond = ti >= 0 || ei >= 0
@@ -2017,7 +2080,7 @@ function narRetireLayers(name: string, now: i32, store: i32) {
     const d = ds[j]
     if d < base || d < bar || crFirstBank(name, d) < 0 { return 0 }
     const t = T.scopes[d][name] ?? -1
-    if t >= 0 && !assignable(now, t) { T.scopes[d][name] = store }
+    if t >= 0 && !assignable(now, t) { narSetScope(d, name, store) }
     j = j - 1
   }
   0
@@ -5820,6 +5883,11 @@ export function initChecker() {
   npKeys = []
   npTys = []
   npInvBy = []
+  narIpScope = []
+  narIpAt = []
+  narIpName = []
+  narIpOld = []
+  narIpNew = []
   npEpochs = []
   npSettle = []
   npCapBy = []
@@ -5834,6 +5902,11 @@ export function initChecker() {
   pgPreKeys = []
   pgPreTys = []
   weSums = Map()
+  weProvSlot = Map()
+  weProvKeys = []
+  weProvSums = []
+  weProvLows = []
+  weLow = WE_NO_LOW
   weOpen = []
   weRoots = []
   weFnDecls = Map()
@@ -7110,6 +7183,17 @@ let weRoots: i32[] = []
 // missing `f`'s own writes, so caching it would answer a later query with too small a summary.
 let weCut = 0
 
+// Shape summaries on a cycle through a frame still open, with the shallowest open depth each
+// reached, so each is computed once instead of once per path to it. A frame whose walk reached no
+// shallower open frame is complete (the first pass of a ⊥-cut cycle is the fixpoint for the key
+// that closes it), so it is cached, and the cycle's provisional entries are settled with it.
+let weProvSlot: {[string]: i32} = Map()
+let weProvKeys: string[] = []
+let weProvSums: string[] = []
+let weProvLows: i32[] = []
+let weLow = 1073741824
+const WE_NO_LOW = 1073741824
+
 // Answer a recursive cycle opaque instead of ⊥ — the strictly-fail-closed reading. It is sound but
 // costs every read-only recursive callee, newly rejecting correct programs of that one shape where
 // the fixpoint rejects none. Kept as a switch, the conservative fallback if the fixpoint argument
@@ -7579,7 +7663,17 @@ function fnWriteShapes(fnIx: i32) {
   const key = i32ToStr(fnIx) + "#shape"
   const hit = weSums[key]
   if hit is string { return hit }
-  if weIsOpen(key) { return weCycleAnswer() }
+  const oi = weOpenIndex(key)
+  if oi >= 0 {
+    if oi < weLow { weLow = oi }
+    return weCycleAnswer()
+  }
+  const ps = weProvSlot[key] ?? -1
+  if ps >= 0 && ps < weProvKeys.length && weProvKeys[ps] == key {
+    if weProvLows[ps] < weLow { weLow = weProvLows[ps] }
+    weCut = weCut + 1
+    return weProvSums[ps]
+  }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     const bound: string[] = []
@@ -7597,17 +7691,77 @@ function fnWriteShapes(fnIx: i32) {
       params.push(nm)
       pi = pi + 1
     }
-    const cutBefore = weCut
     const unresBefore = weUnres
+    const depth = weOpen.length
+    const lowBefore = weLow
+    const provMark = weProvKeys.length
+    weLow = WE_NO_LOW
     weOpen.push(key)
     weRoots.push(fd.fnBody)
-    const acc = weScanShapes(fd.fnBody, fresh, params, bound)
+    const acc = weDedupe(weScanShapes(fd.fnBody, fresh, params, bound))
     weRoots.pop()
     weOpen.pop()
-    if weUnres == unresBefore { weCache(key, acc, cutBefore) }
+    const low = weLow
+    weLow = lowBefore
+    const settled = weUnres == unresBefore
+    if low < depth {
+      // On a cycle through a frame still open: complete only once that frame is.
+      if low < weLow { weLow = low }
+      weProvSlot[key] = weProvKeys.length
+      weProvKeys.push(key)
+      weProvSums.push(acc)
+      weProvLows.push(low)
+      return acc
+    }
+    weSettleCycle(provMark, acc, settled)
+    if settled { weSums[key] = acc }
     return acc
   }
   "*"
+}
+
+// `sum` with each shape kept once: a summary is a set, and one that repeats a callee's shapes per
+// call grows with every path through the call graph rather than with what it holds.
+function weDedupe(sum: string): string {
+  if sum == "*" || sum == "" { return sum }
+  const parts = weSplit(sum)
+  const seen: {[string]: boolean} = Map()
+  let out = ""
+  let i = 0
+  while i < parts.length {
+    if !seen.has(parts[i]) {
+      seen[parts[i]] = true
+      out = out + parts[i] + ","
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Retire the provisional summaries recorded since `mark`: the cycle they sat on closed at a frame
+// whose summary is `acc`. Every function on one cycle reaches every other, so without a parameter
+// call (`@i`) on either side each one's summary is `acc` itself; any other is dropped, to be asked
+// again.
+function weSettleCycle(mark: i32, acc: string, settled: boolean) {
+  while weProvKeys.length > mark {
+    const k = weProvKeys.pop() ?? ""
+    const pv = weProvSums.pop() ?? "@"
+    weProvLows.pop()
+    if settled && pv.indexOf("@") < 0 && acc.indexOf("@") < 0 {
+      weSums[k] = acc
+    }
+  }
+  0
+}
+
+// The depth of `key` among the summaries being computed, or -1.
+function weOpenIndex(key: string): i32 {
+  let i = 0
+  while i < weOpen.length {
+    if weOpen[i] == key { return i }
+    i = i + 1
+  }
+  -1
 }
 
 // Counts answers given without a receiver or container type recorded, so a summary asked before
@@ -8777,7 +8931,7 @@ function retireAliasedNarrowings(
     }
     if hits && npInvBy[i] < 0 {
       crAliasWr[atIx] = true
-      npInvBy[i] = atIx
+      narSetInv(i, atIx)
       if nfSlots.length > 0 && i >= crFnNpBase() { narFitRetire(i, atIx, -1) }
       if i < crFnNpBase() {
         crAliasNestSlots.push(i)
@@ -9186,7 +9340,7 @@ function retireNarrowingsForWrite(
       if keyHasPrefix(npKeys[r], pfx) {
         let rprev = -1
         if npInvBy[r] < 0 { rprev = npTys[r] }
-        npInvBy[r] = atIx
+        narSetInv(r, atIx)
         noteKillSure(atIx, npKeys[r])
         // Unknown after the write, which an arm join must not merge a fact back over.
         narClobKeys.push(npKeys[r])
@@ -9270,7 +9424,7 @@ function retireNarrowingsForWrite(
       narClobDecl.push(-1)
     }
     if hit {
-      npInvBy[i] = atIx
+      narSetInv(i, atIx)
       noteKillSure(atIx, npKeys[i])
       // The target's OWN narrowing going is what the emitter has to mirror; a path below it
       // goes through the prefix rule both sides already apply. Reads-only narrowing states one
@@ -9429,7 +9583,7 @@ function retireNarrowingsForWrite(
         // write: a narrowing the write falsified must not resurrect at that block's `}`.
         const d = lookupDepth(nm)
         if guarded { narRetireLayers(nm, rn, dcl) }
-        if d >= 0 { T.scopes[d][nm] = dcl }
+        if d >= 0 { narSetScope(d, nm, dcl) }
         // The RE-NARROW — the one member of the declaration the written value can be — is a
         // shadow in the CURRENT block instead, because that is exactly how long the emitter's
         // own push lives (its `restoreNarrow` unwinds at the same `}`). Banked at the
@@ -9632,7 +9786,7 @@ function noteCallInvalidations(callIx: i32) {
       // the diagnostic reads. The LEDGER row is unconditional, because the arm JOIN reads the
       // two arms separately and a write in one must not hide a call in the other (D1849).
       if npInvBy[i] < 0 {
-        npInvBy[i] = callIx
+        narSetInv(i, callIx)
         if nfSlots.length > 0 && i >= crFnNpBase() {
           narFitRetire(i, callIx, -1)
         }
@@ -10213,7 +10367,7 @@ function crFnLeave() {
     if ns >= 0 && ns < npInvBy.length {
       const nb = npInvBy[ns]
       if (crAliasWr[nb] ?? false) || (crNestCallRet[nb] ?? false) {
-        npInvBy[ns] = -1
+        narSetInv(ns, -1)
       }
     }
     crAliasNestSlots.pop()
@@ -10951,7 +11105,7 @@ function crRetireAt(
   }
   let k = 0
   while k < depths.length {
-    T.scopes[depths[k]][name] = wide
+    narSetScope(depths[k], name, wide)
     k = k + 1
   }
   // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
@@ -12305,7 +12459,7 @@ function crLoopPathPreRetire(loopIx: i32) {
     ) {
       const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
       if a >= 0 {
-        npInvBy[s] = a
+        narSetInv(s, a)
         if nfSlots.length > 0 { narFitRetire(s, a, loopIx) }
         noteKillSure(a, npKeys[s])
         npSettle[s] = -1
@@ -12564,7 +12718,8 @@ function loopWriteCallTy(ix: i32): i32 {
 
 // Record at the `&&`/`||` node `ix` the left operand's facts its right operand retired, by a write
 // or a call: the arm the whole condition guards must not hold them (D2589). Runs while the
-// scope the facts live in is still open.
+// scope the facts live in is still open. A name faced twice is judged by its last fact, the one
+// its scope holds.
 function crNoteRhsRetired(
   ix: i32,
   rhs: i32,
@@ -12582,7 +12737,7 @@ function crNoteRhsRetired(
         if npKeys[s] == names[i] && npInvBy[s] >= 0 { by = npInvBy[s] }
         s = s + 1
       }
-    } else if lookup(names[i]) != tys[i] {
+    } else if !crNameFacedLater(names, i) && lookup(names[i]) != tys[i] {
       by = crFirstAssignOf(rhs, names[i])
       if by < 0 { by = crFirstWritingCall(rhs, names[i]) }
       if by < 0 { by = rhs }
@@ -12601,6 +12756,16 @@ function crNoteRhsRetired(
   }
   crRhsRetired[ix] = "," + out
   0
+}
+
+// Whether a fact after index `i` names the same place as `names[i]`.
+function crNameFacedLater(names: string[], i: i32): boolean {
+  let j = i + 1
+  while j < names.length {
+    if names[j] == names[i] { return true }
+    j = j + 1
+  }
+  false
 }
 
 // The first assignment in the subtree at `ix` whose target is the bare name `name`, or -1.
@@ -13690,10 +13855,10 @@ function noteLitUnionCopy(res: i32, src: i32) {
     if at is TyUnion {
       let i = 0
       while i < rt.uMembers.length {
-        let hit = false
+        let hit = i32ListHas(at.uMembers, rt.uMembers[i])
         let j = 0
-        while j < at.uMembers.length {
-          if sameVariantTy(rt.uMembers[i], at.uMembers[j]) { hit = true }
+        while j < at.uMembers.length && !hit {
+          hit = sameVariantTy(rt.uMembers[i], at.uMembers[j])
           j = j + 1
         }
         if !hit { return 0 }
@@ -14213,6 +14378,42 @@ function litCmpTy(condIx: i32) {
   litTyOfExpr(c.binLeft)
 }
 
+// `x == L` over a literal union narrows `x` as `x is L` does (Q10): to the literal where the test
+// holds, to the union less the literal where it fails. `holds` names the side being collected.
+// Only an operand whose every member is a literal narrows; a plain `string` or `i32` stays as is.
+function pushLitEqFact(
+  condIx: i32,
+  holds: boolean,
+  names: string[],
+  tys: i32[],
+) {
+  const lp = litCmpPlace(condIx)
+  if lp < 0 { return 0 }
+  const lit = litCmpTy(condIx)
+  if lit < 0 { return 0 }
+  const place = asgTestedPlace(lp)
+  if !holds && placeHasOptionalHop(place) { return 0 }
+  const cur = placeCurTy(place, names, tys)
+  if cur < 0 { return 0 }
+  let base = cur
+  const ct = T.tys[cur]
+  if ct is TyNullable { base = ct.nInner }
+  if !allLitMembers(base) { return 0 }
+  if isWideLitJoin(base) { return 0 }
+  // The tested literal, banked as an `is` node banks its type: the emitter narrows a boxed
+  // receiver through the same `is` channel, keyed on this comparison node.
+  recordClonedIsVarTyIx(condIx, lit)
+  if holds {
+    const meet = litSetMeetTy(cur, lit)
+    if meet >= 0 { return pushNarrowFact(place, meet, names, tys) }
+    if meet == -1 && assignable(lit, base) {
+      return pushNarrowFact(place, lit, names, tys)
+    }
+    return 0
+  }
+  pushNarrowFact(place, subtractTy(cur, lit), names, tys)
+}
+
 // Collect the narrowings that hold when `cond` is true into the parallel `names`/`tys` arrays,
 // keyed by place path: `x != null` strips x's null, `x is T` pins x to T (`is null` pins to the
 // null type), `a && b` contributes both conjuncts, `!(e)` contributes e's false narrowings, and
@@ -14275,6 +14476,7 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           pushNarrowFact(placeIx, inner, names, tys)
         }
       }
+      pushLitEqFact(condIx, false, names, tys)
     }
     // `s.kind == "circle"` — the discriminant in the spelling a user reaches for without
     // declaring a tag alias first, since `is KC` needs a name to test against. Only the parent is
@@ -14296,6 +14498,7 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           )
         }
       }
+      pushLitEqFact(condIx, true, names, tys)
     }
     return 0
   }
@@ -14434,7 +14637,9 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           )
         }
       }
+      pushLitEqFact(condIx, false, names, tys)
     }
+    if cond.binOp == "!=" { pushLitEqFact(condIx, true, names, tys) }
     return 0
   }
   // Inferred type-guard call: `if absent(p) { … } else { /* p != null */ }` — non-null in the else
@@ -69555,6 +69760,9 @@ type IfChk = {
   isElseArm: boolean,
   pgUpMark: i32,
   clobMark: i32,
+  ipMark: i32,
+  headDepth: i32,
+  headNp: i32,
   ifTail: boolean,
   ifInRetArg: boolean,
   seedLogMark: i32,
@@ -69651,6 +69859,10 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const pgUpMark = pgUpKeys.length
   // What this `if`'s own subtree writes; read by the post-guard leg below (D1736).
   const clobMark = narClobKeys.length
+  // Where its places stood on entry, for a key the join first meets inside an arm (`narHeadTy`).
+  const ipMark = narIpAt.length
+  const headDepth = T.scopes.length
+  const headNp = npKeys.length
   // An `if`/`else` in value position is an expression whose value is the join of its branch
   // tail values — capture whether THIS `if` sits in the function's return-tail position.
   const ifTail = retTailPos
@@ -69790,6 +70002,9 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
     isElseArm: isElseArm,
     pgUpMark: pgUpMark,
     clobMark: clobMark,
+    ipMark: ipMark,
+    headDepth: headDepth,
+    headNp: headNp,
     ifTail: ifTail,
     ifInRetArg: ifInRetArg,
     seedLogMark: seedLogMark,

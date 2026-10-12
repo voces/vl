@@ -43,7 +43,7 @@ catching up.
 [Q4](#q4-two-record-arms-with-the-same-field-names-and-no-literal-field-to-tell-them-apart),
 [Q10](#q10-does-x--l-narrow-a-literal-union) and
 [Q11](#q11-declaring-a-name-an-ambient-name-has) were ruled on 2026-10-12 as (c), (a) and
-(b). D4056, D4059 and D4066 await the build.
+(b). D4059 is built; D4056 and D4066 await the build.
 
 ## Q1. Block comments
 
@@ -400,9 +400,9 @@ Raised by narrowing.md §N2.3.
 
 **Resolved 2026-10-12: (a), owner ruling.** `x == L` narrows a literal union exactly as
 `x is L` does: in the then-branch, the else-branch, after an exiting guard, and with `!=`
-reversed. D4059 tracks the build.
+reversed. Built (D4059).
 
-**Today.** `x is L` narrows a literal union in both branches. `x == L` narrows neither,
+**Before the build.** `x is L` narrowed a literal union in both branches. `x == L` narrowed neither,
 although a compare of a record's literal field, `c.kind == "m"`, narrows the record
 (narrowing.md §N2.4). The guide says `x == L` narrows; no ruling says so. The only ruling
 that touches it, DECISIONS.md §"A subsumed literal arm COLLAPSES", reads `x is L` as
