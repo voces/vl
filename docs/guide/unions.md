@@ -1,106 +1,196 @@
-# Unions — representation & discrimination
+# Unions
 
-How VL represents and discriminates union types at runtime. Implementation: the
-union-representation classifier, `coerceUnion`, and the global tag registry in the WasmGC emitter
-(`compiler/wasmEmit.vl`); the type side (`isEquatable`, soften, narrowing) in the checker
-(`compiler/typecheck.vl`). Roadmap items A6 / A16.
+A union type `A | B` holds a value that is an `A` or a `B`. VL has no `enum` and no class
+hierarchy, so unions do that work: a nullable value, a set of named constants and a tree of
+node kinds are all unions. This guide shows how to write them and how to tell their members
+apart. The normative rules are in `docs/spec/types.md` §T3.
 
-## Three encodings (chosen by the representation classifier)
+## Testing a member with `is`
 
-1. **Niche** — when one variant is "free", no box and no tag:
-   - `T | null` where `T` is a reference → a WasmGC nullable ref; `is null` is `ref.is_null`.
-   - `boolean | null` → an i32 with a sentinel value for `null`.
-2. **Value-kind tagged struct** `{ tag: i32, value: <rep> }` — members share one scalar wasm rep
-   (`boolean | i32`, `i32 | null`): `value` *is* that rep. binaryen's **Heap2Local** usually
-   scalarizes the box away, so it costs no allocation in the common case.
-3. **Boxed tagged struct** `{ tag: i32, value: anyref }` — reference or mixed-rep members
-   (`string | i32`, `{x} | {y}`, `i32 | f64`): a reference is stored as-is, a scalar is wrapped in a
-   one-field `{ rep }` box, recovered by `ref.cast` (+ a `struct.get` for value members).
+`x is T` is true when the value of `x` fits `T`. Inside the branch where it is true, `x` has
+type `T`. After an `if` that returns, the rest of the function sees the remaining members.
+`x !is T` is the negation.
 
-## Tags are global
+```vl
+function describe(x: i32 | string): string {
+  if x is i32 { return "number \{x + 1}" }
+  "text of length \{x.length}"
+}
+print(describe(41))   // prints number 42
+print(describe("hi")) // prints text of length 2
+```
 
-Variant tags are interned in a **global** registry keyed by the variant (not per-union), so a value
-keeps its tag identity as it flows between a union and its sub-/super-unions — `is T` is a `tag`
-compare. This is what lets a value boxed as `string | i32` pass through unchanged into
-`string | i32 | null` (same box type, same tags), instead of being re-boxed at each boundary.
+`null` is tested with `==`, and each test narrows what is left:
 
-The key (`variantKey`) is **field-name aware** for struct members: it keys on `structSig` (the
-shape signature including field names + recursive structure), **not** on the lowered wasm type.
-WasmGC erases field names — `{tag, x}` and `{tag, y}` both lower to `(struct i32 i32)` and binaryen
-interns them to ONE heap type — so a wasm-type key would hand two distinct struct variants the SAME
-tag, and `v is A` would wrongly be true for a `B`. Keying on the field-name shape keeps distinct
-shapes apart, so the tag a value is boxed with matches what `is A` tests (soundness). Other reference
-members (string, list, map, closure) have no field-name shape, so `structSig` falls back to their
-interned wasm ref type — a sound discriminant for them.
+```vl
+function f(x: i32 | string | null): string {
+  if x == null { return "none" }
+  if x is string { return x }
+  "\{x * 2}"
+}
+print(f(null))   // prints none
+print(f("s"))    // prints s
+print(f(4))      // prints 8
+```
 
-## Discrimination is by structural shape
+## A union is a set
 
-VL is **structurally typed**, so a struct variant's tag identity is its *shape*, not its `type`
-name. Two `type` aliases with the *same* field shape are the **same variant** — under structural
-typing a `B` value genuinely IS an `A` — so `v is A` is (soundly) always true over a same-shape
-`A | B`, and its `else` is dead. A union whose members share a shape needs an explicit
-**discriminant field** (a `kind`/`tag` set to distinct values per variant) to tell them apart; the
-shape alone cannot. Distinct-shaped variants (the AST-node `NumLit | BinExpr | Call` pattern) are
-discriminated directly.
+Member order does not matter, and a member that another member contains adds nothing.
+`string | "err"` is `string`.
 
-**`is` over same-shape arms tests the discriminant's VALUE** (ruled 2026-09-02, DECISIONS.md
-§"`is A` over same-shape struct arms is a DISCRIMINANT-VALUE test"). For
-`type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`,
-`s is Circle` is true iff the tag names the shared shape **and** `s.kind` is a member of
-`Circle`'s literal set — the same arm set `s.kind == "circle"` narrows to, so the two
-spellings agree by construction. A literal-typed field is a type that is also a value, and
-membership is decided by the value:
+```vl
+const a: i32 | string = "s"
+const b: string | i32 = a
+print(b is string)   // prints true
+```
+
+## Literal unions are enumerations
+
+A string or integer literal is also a type with one value. A union of literals is VL's
+enumeration, and `match` over it must cover every member.
+
+```vl
+type Dir = "north" | "south" | "east" | "west"
+function turn(d: Dir): Dir {
+  match d {
+    "north" => "east",
+    "east" => "south",
+    "south" => "west",
+    "west" => "north",
+  }
+}
+print(turn("north"))   // prints east
+```
+
+## Unions of records
+
+Records are structural. A record type is its fields, not its name. A union of records with
+different field names is told apart by those names, and `match` can name the arms:
+
+```vl
+type Num = { n: i32 }
+type Add = { l: i32, r: i32 }
+function eval(e: Num | Add): i32 {
+  match e {
+    Num => e.n,
+    Add => e.l + e.r,
+  }
+}
+print(eval({ n: 4 }))         // prints 4
+print(eval({ l: 1, r: 2 }))   // prints 3
+```
+
+### A discriminant field
+
+When the arms have the same field names, give each a literal-typed field, by convention
+`kind`. `is` then reads that field's value, and so does a plain `==` test on it:
 
 ```vl
 type Circle = { kind: "circle", r: f64 }
 type Square = { kind: "square", r: f64 }
-
 function area(s: Circle | Square): f64 {
-  if s is Circle { return s.r * s.r * 3.14159 }
-  return s.r * s.r
+  if s is Circle { return s.r * s.r * 3 }
+  s.r * s.r
 }
+print(area({ kind: "circle", r: 1.0 }))   // prints 3
+print(area({ kind: "square", r: 2.0 }))   // prints 4
 ```
 
-The answer is the value's, never the name it was built under: a `{ kind: "circle", r: 1.0 }`
-written straight into a `Circle | Square` binding, with no `Circle` anywhere, is a `Circle`.
+The answer depends on the value only. A `{ kind: "circle", r: 1.0 }` is a `Circle`
+whether or not it was ever declared as one.
 
-Overlapping sets are legal and answer truthfully — a `kind: "y"` value is a member of both a
-`"x" | "y"` arm and a `"y" | "z"` one, because under structural typing it really is both, and
-`else` narrows to the remainder. A same-shape pair with no literal-typed field to distinguish
-it (`{v: i32} | {v: boolean}`) is refused by the checker: *arms `A` and `B` share a field-name
-set and no literal-typed field distinguishes them — add a discriminant field.* So is a pair
-whose literal fields share no base (`{k: "a"} | {k: 1}`), since no single comparison answers
-across a string and an integer.
+Today the arms' other fields must also have the same types. When they differ
+(`{ kind: "a", v: i32 } | { kind: "b", v: string }`), the program passes `vl check` and its
+build fails with "union `A|B` cannot be discriminated" (D3033).
 
-One spelling is still refused that the rule says should work: a named literal-union alias in
-one arm beside an inline set in the other (`{kind: K1} | {kind: "x" | "y"}`). The two spellings
-have different representations, so the arms cannot share a layout — spell both the same way
-(D1050).
+Arms with the same field names and no literal field to tell them apart are refused, and so
+are arms whose literal fields have no common base type (a string beside an integer):
 
-## Shared-field access
+```vl
+type A = { v: i32 }
+type B = { v: boolean }
+function f(s: A | B): boolean { s is A }
+// refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
+```
 
-A field present on **every** member of a struct union with the **same** type is readable on the
-union directly, without narrowing — `(A | B).tag`. The type side (`sharedUnionField` in
-`typecheck.vl`) admits the access only when every member is a struct carrying that field at a
-mutually-assignable type; codegen (`sharedUnionFieldRead` in `wasmEmit.vl`) dispatches on the variant
-tag and reads the field at **that member's own index** (members may store a shared field at
-different struct indices, since fields are sorted by name per shape). A field that is not shared — or
-shared at a differing rep — still requires an `is`/`==` narrowing.
+Whether the first of these refusals is a design rule is pending an owner question (Q4 in
+`docs/spec/OPEN-QUESTIONS.md`): the 2026-09-02 ruling that called it one is amended, and
+no later ruling restates it. The second prints the same sentence, which is false there,
+because both literal fields are present (D4056).
 
-## Boxing happens at value-flow boundaries
+### Two names for one shape are one type
 
-One hook — `coerceUnion` (in the emitter) — boxes a value into the desired union representation at every
-boundary: assignment, argument, return. So discrimination works across function boundaries. The
-typed core `coerceToUnion(value, fromType, toType)` is shared by that hook and the `?.`/`??` lowering.
+Two record types with the same fields are the same type, whatever they are called. `A | B`
+is then just `A`, and both `is A` and `is B` are true of every value.
 
-## Known limits / remaining
+```vl
+type A = { x: i32 }
+type B = { x: i32 }
+function f(v: A | B): string {
+  if v is A { return "A" }
+  "B"
+}
+const b: B = { x: 1 }
+print(f(b))   // prints A
+```
 
-- **Reference-vs-reference** discrimination uses the tag, not `ref.test`. A `ref.test` fast-path could
-  drop the tag for all-distinct-heap-type ref unions. (It could not replace the tag for *struct*
-  members, though — binaryen interns same-shape-different-name structs to one heap type, so
-  `ref.test` cannot tell `{tag,x}` from `{tag,y}` apart; the field-name-aware tag is what does.)
-- **Union arrays** (`[boolean | i32]`) hit the single-element-type WasmGC array wall.
-- **Literal-union enum representation** is not built: a closed union of same-base literals could be a
-  bare i32 tag (intern each literal, materialize the value at print/coercion boundaries). Today
-  literal unions soften to their base at the value level, so a string union stores whole strings.
-  (Roadmap A16.)
+> Owner ruling 2026-10-08 (C), D3870: records are structural, so same-shape records are
+> one type and no runtime tag records the name a value was declared under.
+
+### Overlapping arms
+
+When one arm's values are all values of another, `is` still asks about the value. An `A`
+whose field happens to lie in `B`'s literal set is a `B`. The checker adds a hint at such an
+`is`, because the test reads a value rather than telling two kinds apart:
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+function f(v: A | B): string { if v is B { return "B" } "A" }
+const a: A = { x: 1 }
+print(f(a))   // prints B
+const c: A = { x: 7 }
+print(f(c))   // prints A
+// hint: `B` is contained in `A`, so `is B` tests the value
+```
+
+Overlapping literal sets are legal too. A value in both sets is a member of both arms:
+
+```vl
+type A = { k: "x" | "y" }
+type B = { k: "y" | "z" }
+function f(s: A | B): string { if s is A { return "A" } "B" }
+const v: B = { k: "y" }
+print(f(v))   // prints A
+const w: B = { k: "z" }
+print(f(w))   // prints B
+```
+
+> Owner ruling 2026-10-10 (A), D3885: `is` tests whether the value fits the type. It
+> amends the 2026-09-02 ruling, which already decided a literal discriminant by its value
+> and fell back to the declaration a value came from only when no literal field could
+> answer. That fallback is gone.
+
+## Reading a shared field
+
+A field that every arm has can be read without narrowing first. Its type is the union of
+the arms' field types.
+
+```vl
+type Circle = { kind: "circle", r: f64 }
+type Square = { kind: "square", side: f64 }
+function k(s: Circle | Square): string { s.kind }
+print(k({ kind: "square", side: 1.0 }))   // prints square
+```
+
+## Numbers of different types
+
+Two numeric values of different types that meet at an `if`, a `match`, a `??` or a list
+literal have a union type. `is` tells them apart, and arithmetic works member by member
+(`docs/spec/types.md` §T3.6).
+
+## How a union is stored
+
+The compiler chooses how a union value is stored, and a program cannot observe the choice.
+The only promise is the one above: `is` and `==` answer from the value. Representation detail is in
+`docs/internals/`.
