@@ -20,11 +20,13 @@
 //
 // @test-timing native
 
-import { COMPILER, VL, exists } from "./support/tree.ts";
+import { COMPILER, exists, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
-if (GATED && !ENABLED) console.warn("[vl-std-resolution] skipped — missing vl binary or seed wasm.");
+if (GATED && !ENABLED) {
+  console.warn("[vl-std-resolution] skipped — missing vl binary or seed wasm.");
+}
 
 /** `vl check <entry>` with `VL_STD` pinned to a fixture std dir. */
 const check = async (
@@ -60,19 +62,25 @@ const workspace = async (
 };
 
 Deno.test({
-  name: "vl-std: a well-formed std: chain (incl. std-importing-std) resolves clean",
+  name:
+    "vl-std: a well-formed std: chain (incl. std-importing-std) resolves clean",
   ignore: !ENABLED,
   fn: async () => {
     const { dir, stdDir, entry } = await workspace(
       {
-        outerseed: 'import { inner } from "std:innerseed"\n\nexport function outer(): i32 {\n  return inner() + 1\n}\n',
+        outerseed:
+          'import { inner } from "std:innerseed"\n\nexport function outer(): i32 {\n  return inner() + 1\n}\n',
         innerseed: "export function inner(): i32 {\n  return 41\n}\n",
       },
       'import { outer } from "std:outerseed"\n\nprint(outer())\n',
     );
     try {
       const r = await check(entry, stdDir);
-      if (r.code !== 0) throw new Error(`std-to-std chain should check clean, got code ${r.code}:\n${r.text}`);
+      if (r.code !== 0) {
+        throw new Error(
+          `std-to-std chain should check clean, got code ${r.code}:\n${r.text}`,
+        );
+      }
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
@@ -80,26 +88,97 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-std: a relative import INSIDE a std module is rejected (the std-internal guard)",
+  name:
+    "vl-std: a relative import INSIDE a std module is rejected (the std-internal guard)",
   ignore: !ENABLED,
   fn: async () => {
     const { dir, stdDir, entry } = await workspace(
       {
-        badseed: 'import { helper } from "./helper"\n\nexport function broken(): i32 {\n  return helper()\n}\n',
+        badseed:
+          'import { helper } from "./helper"\n\nexport function broken(): i32 {\n  return helper()\n}\n',
       },
       'import { broken } from "std:badseed"\n\nprint(broken())\n',
     );
     try {
       const r = await check(entry, stdDir);
-      if (r.code === 0) throw new Error(`expected the std-internal guard error, but check passed:\n${r.text}`);
+      if (r.code === 0) {
+        throw new Error(
+          `expected the std-internal guard error, but check passed:\n${r.text}`,
+        );
+      }
       if (
         !r.text.includes('Unsupported import specifier "./helper"') ||
         !r.text.includes("std modules import only via `std:` specifiers")
       ) {
-        throw new Error(`expected the std-internal guard diagnostic, got:\n${r.text}`);
+        throw new Error(
+          `expected the std-internal guard diagnostic, got:\n${r.text}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-std: an absolute path is refused as one, naming the relative spelling (DV-003)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { dir, stdDir, entry } = await workspace(
+      {},
+      `import { x } from "/abs/helper"\n\nprint(x())\n`,
+    );
+    try {
+      const r = await check(entry, stdDir);
+      const want =
+        'Unsupported import specifier "/abs/helper" — an absolute path is not an import ' +
+        "specifier; write the path relative to this file";
+      if (r.code === 0 || !r.text.includes(want)) {
+        throw new Error(
+          `want rc != 0 and "${want}", got ${r.code}:\n${r.text}`,
+        );
+      }
+      if (r.text.includes("bare specifiers")) {
+        throw new Error(`an absolute path is not bare:\n${r.text}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-std: a backslash path names its forward-slash spelling, and a drive path is absolute",
+  ignore: !ENABLED,
+  fn: async () => {
+    const cases: [string, string][] = [
+      [".\\helper", 'an import path uses forward slashes: write "./helper"'],
+      ["..\\lib\\x", 'an import path uses forward slashes: write "../lib/x"'],
+      ["./lib\\x", 'an import path uses forward slashes: write "./lib/x"'],
+      ["C:/proj/helper", "an absolute path is not an import specifier"],
+      ["C:\\proj\\helper", "an absolute path is not an import specifier"],
+      ["std:a\\b", "Unsupported import specifier"],
+    ];
+    for (const [spec, want] of cases) {
+      const { dir, stdDir, entry } = await workspace(
+        {},
+        `import { x } from "${spec}"\n\nprint(x())\n`,
+      );
+      try {
+        const r = await check(entry, stdDir);
+        const wrong = spec.startsWith("std:")
+          ? r.text.includes("std:a/b")
+          : r.text.includes("bare specifiers") || r.text.includes('write "C:');
+        if (r.code === 0 || !r.text.includes(want) || wrong) {
+          throw new Error(
+            `${spec}: want rc != 0 and "${want}", got ${r.code}:\n${r.text}`,
+          );
+        }
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
     }
   },
 });
@@ -117,9 +196,15 @@ Deno.test({
       );
       try {
         const r = await check(entry, stdDir);
-        if (r.code === 0) throw new Error(`\`${spec}\` should be unsupported, but check passed:\n${r.text}`);
+        if (r.code === 0) {
+          throw new Error(
+            `\`${spec}\` should be unsupported, but check passed:\n${r.text}`,
+          );
+        }
         if (!r.text.includes("Unsupported import specifier")) {
-          throw new Error(`\`${spec}\` should report an unsupported specifier, got:\n${r.text}`);
+          throw new Error(
+            `\`${spec}\` should report an unsupported specifier, got:\n${r.text}`,
+          );
         }
       } finally {
         await Deno.remove(dir, { recursive: true });

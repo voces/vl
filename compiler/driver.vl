@@ -288,6 +288,7 @@ import {
   rcoalMsgAt,
   rcoalTokAt,
   redunMsgAt,
+  redunRetAt,
   redunTokAt,
   symConstAt,
   symDefAt,
@@ -2091,6 +2092,8 @@ export function inlayModuleAt(i: i32): i32 { symOccModuleAt(symInlayOccAt(i)) }
 // where every module's AST is merged. Single-file mode has no module table, so
 // `modOfTok` returns 0 throughout (nothing filtered). Mirrors `inlayModuleAt`.
 export function redunModuleAt(i: i32): i32 { modOfTok(redunTokAt(i)) }
+// Whether finding `i` is a function's return annotation, which `check --fix` leaves alone.
+export function redunIsReturnAt(i: i32): boolean { redunRetAt(i) }
 
 // The redundant-annotation finding's message, per code point — the same byte ABI
 // `lintMsg*`/`diagMsg*` use. Type-informed, so it never appears in the parse-only
@@ -3550,6 +3553,35 @@ export function diagModule(i: i32): i32 {
 }
 
 // ── specifier resolution (ports of the host's pure string math) ───────────────
+// Whether import specifier `spec` separates segments with a backslash (`.\\util`, `C:\\x`).
+function modSpecBackslashed(spec: string): boolean {
+  for c in spec {
+    if c == '\\' { return true }
+  }
+  false
+}
+
+// Whether `spec` is an absolute path: a leading separator, or a drive letter and separator.
+function modSpecAbsolute(spec: string): boolean {
+  if spec.length > 0 && (spec[0] == '/' || spec[0] == '\\') { return true }
+  spec.length > 2 && spec[1] == ':' && (spec[2] == '/' || spec[2] == '\\')
+}
+
+// `spec` with each run of backslashes (one, or an escaped pair) a forward slash.
+function modSlashed(spec: string): string {
+  let out = ""
+  let i = 0
+  while i < spec.length {
+    if spec[i] == '\\' {
+      if i == 0 || spec[i - 1] != '\\' { out = out + "/" }
+    } else {
+      out = out + spec.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  out
+}
+
 function modIsRelative(spec: string): boolean {
   if spec.length >= 2 {
     if spec[0] == '.' && spec[1] == '/' { return true }
@@ -3658,7 +3690,7 @@ function modNormalize(path: string): string {
 // is its key verbatim; a relative spec gets `.vl` appended.
 function modResolveSpecifier(spec: string, fromKey: string): string {
   if modIsStdSpec(spec) { return spec }
-  if !modIsRelative(spec) { return "" }
+  if !modIsRelative(spec) || modSpecBackslashed(spec) { return "" }
   if modKeyIsStd(fromKey) { return "" }
   const base = modDirOf(fromKey)
   let joined = spec
@@ -3689,6 +3721,63 @@ function modExportRecord(
   expKwLine.push(kwLine)
   expKwCol.push(kwCol)
   0
+}
+
+// How far past `export` its declaration keyword sits, given the next two tokens: 2 past a
+// `flat` before `type`, or an `extern` before `function`/`let`/`const`; else 1. `more` says
+// a token follows the second, so a declared name can exist.
+function modExportDeclOff(
+  k1: TokKind,
+  t1: string,
+  k2: TokKind,
+  more: boolean,
+): i32 {
+  const flat = k1 == "IDENT" && t1 == "flat" && k2 == "TYPE"
+  const ext = k1 == "EXTERN" && k2 != "TYPE" && modExportDeclKind(k2)
+  if more && (flat || ext) { return 2 }
+  1
+}
+
+// The brace depth change token kind `k` makes: +1 for `{`, -1 for `}`, else 0.
+function modBraceStep(k: TokKind): i32 {
+  const open = k == "LBRACE"
+  const close = k == "RBRACE"
+  if open { return 1 }
+  if close { return -1 }
+  0
+}
+
+// Whether `k` opens a declaration an `export` names.
+function modExportDeclKind(k: TokKind): boolean {
+  k == "FUNCTION" || k == "LET" || k == "CONST" || k == "TYPE"
+}
+
+// The names `src` exports by a top-level declaration, as `modScan` records them, for a file
+// outside the module graph; null when it does not lex. Re-exports are not included.
+export function modExportNamesOf(src: string): string[] | null {
+  const out: string[] = []
+  const r = tokenize(src)
+  if r.diags.length > 0 { return null }
+  const toks = r.tokens
+  let depth = 0
+  let i = 0
+  while i < toks.length {
+    const k = toks[i].kind
+    depth = depth + modBraceStep(k)
+    if k == "EXPORT" && depth == 0 && i + 2 < toks.length {
+      const dOff = modExportDeclOff(
+        toks[i + 1].kind,
+        toks[i + 1].text,
+        toks[i + 2].kind,
+        i + 3 < toks.length,
+      )
+      if i + dOff + 1 < toks.length && modExportDeclKind(toks[i + dOff].kind) {
+        out.push(toks[i + dOff + 1].text)
+      }
+    }
+    i = i + 1
+  }
+  out
 }
 
 function modScan(m: i32, src: string): i32 {
@@ -3989,20 +4078,14 @@ function modScan(m: i32, src: string): i32 {
         // and the declaration keyword, so the declared name is one token further
         // along. This token-level scanner runs before any parse, so it must
         // recognize the `flat`/`type` pair itself, the same guard the parser uses.
-        let dOff = 1
-        if toks[i + 1].kind == "IDENT" && toks[i + 1].text == "flat" {
-          if i + 3 < toks.length && toks[i + 2].kind == "TYPE" { dOff = 2 }
-        }
-        // `export extern function n(…)` puts the `extern` keyword in the same slot `flat`
-        // takes, so the declared name is one token further along here too.
-        if toks[i + 1].kind == "EXTERN" {
-          if i + 3 < toks.length {
-            const xk = toks[i + 2].kind
-            if xk == "FUNCTION" || xk == "LET" || xk == "CONST" { dOff = 2 }
-          }
-        }
+        const dOff = modExportDeclOff(
+          toks[i + 1].kind,
+          toks[i + 1].text,
+          toks[i + 2].kind,
+          i + 3 < toks.length,
+        )
         const dk = toks[i + dOff].kind
-        if dk == "FUNCTION" || dk == "LET" || dk == "CONST" || dk == "TYPE" {
+        if modExportDeclKind(dk) {
           const dnt = toks[i + dOff + 1]
           modExportRecord(
             m,
@@ -4235,6 +4318,31 @@ function modVisit(m: i32, depth: i32): i32 {
             "Unsupported import specifier \""
               + spec
               + "\" — std modules import only via `std:` specifiers (relative imports inside std are not allowed)",
+          )
+        } else if modSpecAbsolute(spec) {
+          // An absolute path would key the same file apart from its relative spelling, so it
+          // could load as two modules; refused until keys are canonical paths.
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
+            "Unsupported import specifier \""
+              + spec
+              + "\" — an absolute path is not an import specifier; write the path relative to this file (`./`, `../`)",
+          )
+        } else if modSpecBackslashed(spec) && !modKeyIsStd(spec) {
+          // A Windows-style separator: the specifier means the forward-slash path.
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
+            "Unsupported import specifier \""
+              + spec
+              + "\" — an import path uses forward slashes: write \""
+              + modSlashed(spec)
+              + "\"",
           )
         } else {
           modDiagSpan(

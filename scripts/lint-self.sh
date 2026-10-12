@@ -143,7 +143,7 @@ FMT_CRASH=$(grep -c '^crash' "$FMT_LOG" || true)
 echo "fmt: $FMT_DRIFT drifting, $FMT_UNPARSED unparseable (out of scope), $FMT_CRASH crashed"
 if [ "$FMT_DRIFT" != 0 ] || [ "$FMT_CRASH" != 0 ]; then
   grep -E '^(drift|crash)' "$FMT_LOG" | sort | sed 's/^/  /'
-  echo "  run: vl fmt -w <path>   (one path per run)"
+  echo "  run: vl fmt -w <path>   (or several paths)"
   FMT_RC=1
 fi
 
