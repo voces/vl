@@ -75,6 +75,7 @@ import {
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   capWidenOf,
+  cmpLitNodeOf,
   coalLhsParts,
   collectRetValues,
   condNarrowDropOf,
@@ -119,7 +120,6 @@ import {
   letNullHoleFilledTy,
   letNullHoleUnfilled,
   litBaseTy,
-  litTyOfExpr,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
   luDeclPosOf,
@@ -19389,13 +19389,14 @@ function litEqRecv(condIx: i32): i32 {
   -1
 }
 
-// The `is` spelling of an operand the checker reads as a literal (`litTyOfExpr`) — its source
+// The `is` spelling of an operand the checker reads as a literal (`cmpLitNodeOf`) — its source
 // lexeme — or "" when it is not one.
 function litEqLexeme(ix: i32): string {
-  if litTyOfExpr(ix) < 0 { return "" }
-  const e = P.nodes[unwrapParen(ix)]
+  const lx = cmpLitNodeOf(ix)
+  if lx < 0 { return "" }
+  const e = P.nodes[lx]
   if e is NumLit { return e.numText }
-  subscriptKeyLexemeOf(ix)
+  subscriptKeyLexemeOf(lx)
 }
 
 // The tested literal of a comparison `litEqRecv` accepted.
@@ -19469,6 +19470,13 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
     if cn is BinExpr {
       if cn.binOp == "==" {
         pushNarrow(nm, "null")
+        return true
+      }
+      // An earlier literal test that left literals of one base beside `null` reads at that
+      // base once `null` is ruled out, as the literal complement does without the `null` (D4202).
+      const nlb = nullCmpLitBase(condIx)
+      if nlb >= 0 {
+        pushNarrowRep(nm, tyPrimNameOf(nlb) ?? "", nlb, -1)
         return true
       }
       const nlift = maskNarrowFor(nullPinnedKey(nm))
@@ -19595,6 +19603,41 @@ function asgTestedIdent(ix: i32): i32 {
     }
   }
   ix
+}
+
+// The one base of the literals the checker typed null compare `condIx`'s operand at beside
+// `null`, or -1 when the operand's type is anything else.
+function nullCmpLitBase(condIx: i32): i32 {
+  const ref = nullCmpRefOf(condIx)
+  if ref < 0 { return -1 }
+  const ty = nodeTyIxOf(ref)
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  let inner = ty
+  let sawNull = false
+  const t = T.tys[ty]
+  if t is TyNullable {
+    sawNull = true
+    inner = t.nInner
+    if inner < 0 || inner >= T.tys.length { return -1 }
+  }
+  const it = T.tys[inner]
+  const mems = if it is TyUnion { it.uMembers } else { [inner] }
+  let base = -1
+  for m in mems {
+    if m < 0 || m >= T.tys.length { return -1 }
+    const mt = T.tys[m]
+    if mt is TyLit {
+      const b = litBaseTy(mt)
+      if base >= 0 && base != b { return -1 }
+      base = b
+    } else if tyPrimNameOf(m) == "null" {
+      sawNull = true
+    } else {
+      return -1
+    }
+  }
+  if !sawNull { return -1 }
+  base
 }
 
 // The non-null operand of a `x == null` / `x != null` comparison at `condIx` (parens
@@ -19852,6 +19895,13 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
     if cn is BinExpr {
       if cn.binOp == "!=" {
         pushNarrow(nm, "null")
+        return true
+      }
+      // An earlier literal test that left literals of one base beside `null` reads at that
+      // base once `null` is ruled out, as the literal complement does without the `null` (D4202).
+      const nlb = nullCmpLitBase(condIx)
+      if nlb >= 0 {
+        pushNarrowRep(nm, tyPrimNameOf(nlb) ?? "", nlb, -1)
         return true
       }
       const nlift = maskNarrowFor(nullPinnedKey(nm))
@@ -30384,6 +30434,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
         return false
       }
+      // A box element read under a narrowing unboxes to the member's own rep, which for a
+      // string literal is the string ref, however few literals the narrowing left (D4201).
+      if recvEl >= 0 && tyIsValueUnionBox(nonNullTy(recvEl)) { return false }
     }
     // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
     // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
@@ -39355,10 +39408,21 @@ function pushNarrowWriteReNarrow(name: string, ty: i32, un: string): boolean {
   // declaration, so the member it lands on is one of the declaration's. An `is`-pinned slot
   // carries no set at all (`pushNarrowIs` banks a type), which is the common case here.
   const r = asgReadNarrowSet(un, ty)
-  if r < 0 { return false }
+  // A literal member has no row in the set pool, so it lands as an `is` test of it would (D4200).
+  if r < 0 { return pushNarrowLitMember(name, ty) }
   const txt = msTextOf(r)
   if txt == "" { return false }
   pushNarrowRep(name, txt, -1, r)
+  true
+}
+
+// Push literal type `ty` as `name`'s narrowing, spelled as an `is` test of the literal spells it.
+function pushNarrowLitMember(name: string, ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyLit) { return false }
+  const spell = if t.litKind == "str" { "\"" + t.litText + "\"" } else { t.litText }
+  pushNarrowRep(name, spell, ty, -1)
   true
 }
 

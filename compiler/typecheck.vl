@@ -3704,8 +3704,8 @@ function ifCondIsDiscriminating(ifCondIx: i32) {
   if fc is BinExpr {
     if fc.binOp == "==" {
       let eqPlace = -1
-      if litTyOfExpr(fc.binRight) >= 0 { eqPlace = fc.binLeft }
-      else if litTyOfExpr(fc.binLeft) >= 0 { eqPlace = fc.binRight }
+      if cmpLitTyOf(fc.binRight) >= 0 { eqPlace = fc.binLeft }
+      else if cmpLitTyOf(fc.binLeft) >= 0 { eqPlace = fc.binRight }
       if eqPlace >= 0 {
         const eqObj = P.nodes[eqPlace]
         if eqObj is Ident {
@@ -4558,6 +4558,8 @@ let matchScrutNode: {[i32]: boolean} = Map()
 // A `const` arm pattern (D3271): the pattern node, rewritten to a read of the constant, to the
 // literal node of that constant's initializer, where its value is read (`matchConstPatLitAt`).
 let matchConstPatLit: {[i32]: i32} = Map()
+// Per comparison operand naming a `const` with a literal value, that literal's node (Q10).
+let cmpConstLit: {[i32]: i32} = Map()
 // The arm patterns a `const`-pattern refusal already reported, so the vocabulary does not again.
 let matchPatRefused: {[i32]: boolean} = Map()
 // The `Index` and `Member` nodes an assignment writes through, which the list-union read
@@ -5678,6 +5680,7 @@ export function initChecker() {
   intMatchHead = Map()
   matchScrutNode = Map()
   matchConstPatLit = Map()
+  cmpConstLit = Map()
   matchPatRefused = Map()
   chainProvenCond = []
   optCallRetIx = []
@@ -5902,6 +5905,8 @@ export function initChecker() {
   pgPreKeys = []
   pgPreTys = []
   weSums = Map()
+  weUnresSums = Map()
+  weUnresAny = false
   weProvSlot = Map()
   weProvKeys = []
   weProvSums = []
@@ -7194,6 +7199,11 @@ let weProvLows: i32[] = []
 let weLow = 1073741824
 const WE_NO_LOW = 1073741824
 
+// Summaries that read a node with no type recorded yet. Such an answer is the conservative one, and
+// it can only sharpen once another body is checked, so it is kept until a body is entered or left.
+let weUnresSums: {[string]: string} = Map()
+let weUnresAny = false
+
 // Answer a recursive cycle opaque instead of ⊥ — the strictly-fail-closed reading. It is sound but
 // costs every read-only recursive callee, newly rejecting correct programs of that one shape where
 // the fixpoint rejects none. Kept as a switch, the conservative fallback if the fixpoint argument
@@ -7663,6 +7673,11 @@ function fnWriteShapes(fnIx: i32) {
   const key = i32ToStr(fnIx) + "#shape"
   const hit = weSums[key]
   if hit is string { return hit }
+  const uhit = weUnresSums[key]
+  if uhit is string {
+    weUnres = weUnres + 1
+    return uhit
+  }
   const oi = weOpenIndex(key)
   if oi >= 0 {
     if oi < weLow { weLow = oi }
@@ -7714,7 +7729,12 @@ function fnWriteShapes(fnIx: i32) {
       return acc
     }
     weSettleCycle(provMark, acc, settled)
-    if settled { weSums[key] = acc }
+    if settled {
+      weSums[key] = acc
+    } else {
+      weUnresSums[key] = acc
+      weUnresAny = true
+    }
     return acc
   }
   "*"
@@ -10337,6 +10357,10 @@ function crReset() {
 // Enter a function body, before its scope is pushed. A registered top-level function is its own
 // root; a nested function or a lambda reads the closures of the root it sits in.
 function crFnEnter(fnIx: i32) {
+  if weUnresAny {
+    weUnresSums = Map()
+    weUnresAny = false
+  }
   crFnIxs.push(fnIx)
   crFnBases.push(T.scopes.length)
   crFnNpBases.push(npKeys.length)
@@ -10352,6 +10376,10 @@ function crFnEnter(fnIx: i32) {
 }
 
 function crFnLeave() {
+  if weUnresAny {
+    weUnresSums = Map()
+    weUnresAny = false
+  }
   if crFnBases.length > 0 {
     crFnIxs.pop()
     crFnBases.pop()
@@ -14061,6 +14089,36 @@ export function litTyOfExpr(ix: i32) {
   -1
 }
 
+// The literal node comparison operand `ix` tests for: the literal itself, or the initializer
+// literal of the unannotated `const` it names, as a `match` arm reads one. -1 otherwise.
+export function cmpLitNodeOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const k = parenPeelIx(ix)
+  if litTyOfExpr(k) >= 0 { return k }
+  cmpConstLit[k] ?? -1
+}
+
+// The literal type comparison operand `ix` tests for, through a literal `const` (`cmpLitNodeOf`).
+export function cmpLitTyOf(ix: i32): i32 { litTyOfExpr(cmpLitNodeOf(ix)) }
+
+// Bank the literal a `const` named by comparison operand `ix` holds, read where the name resolves.
+function noteCmpConstLit(ix: i32) {
+  const k = parenPeelIx(ix)
+  if k < 0 || k >= P.nodes.length { return 0 }
+  const e = P.nodes[k]
+  if !(e is Ident) { return 0 }
+  const d = constDeclOf(e.identName)
+  if d < 0 { return 0 }
+  const dn = P.nodes[d]
+  // An annotation declares the values the const may take, so only an unannotated one is its literal.
+  if dn is LetDecl {
+    if dn.letType >= 0 { return 0 }
+    const lit = matchConstLitOf(dn.letInit)
+    if lit >= 0 && litTyOfExpr(lit) >= 0 { cmpConstLit[k] = lit }
+  }
+  0
+}
+
 // `A & !B` under an intersection fold: drop B's variants from A. It differs from the narrowing
 // `subtractTy` in its edges — nothing concrete dropped leaves A unchanged (open-world negation,
 // `i32 & !2`), everything dropped folds to `never`, an empty intersection.
@@ -14361,8 +14419,8 @@ function guardCallPlace(cond: Call, wantThen: i32) {
 function litCmpPlace(condIx: i32) {
   const c = P.nodes[condIx]
   if !(c is BinExpr) { return -1 }
-  if litTyOfExpr(c.binRight) >= 0 { return condUnderParens(c.binLeft) }
-  if litTyOfExpr(c.binLeft) >= 0 { return condUnderParens(c.binRight) }
+  if cmpLitTyOf(c.binRight) >= 0 { return condUnderParens(c.binLeft) }
+  if cmpLitTyOf(c.binLeft) >= 0 { return condUnderParens(c.binRight) }
   -1
 }
 
@@ -14373,9 +14431,9 @@ function litCmpPlace(condIx: i32) {
 function litCmpTy(condIx: i32) {
   const c = P.nodes[condIx]
   if !(c is BinExpr) { return -1 }
-  const r = litTyOfExpr(c.binRight)
+  const r = cmpLitTyOf(c.binRight)
   if r >= 0 { return r }
-  litTyOfExpr(c.binLeft)
+  cmpLitTyOf(c.binLeft)
 }
 
 // `x == L` over a literal union narrows `x` as `x is L` does (Q10): to the literal where the test
@@ -42608,7 +42666,7 @@ function cstrOwnedBy(owner: i32, calleeFn: i32) {
 // does (`eqLitMemberOk`), else `ty`.
 function eqCstrOperandTy(op: string, opIx: i32, ty: i32): i32 {
   if op != "==" && op != "!=" { return ty }
-  const lit = litTyOfExpr(opIx)
+  const lit = cmpLitTyOf(opIx)
   if lit < 0 { return ty }
   lit
 }
@@ -54570,10 +54628,10 @@ function ifChainExhausts(ifIx: i32) {
         let armLit = -1
         let armObj = -1
         if cond.binOp == "==" {
-          armLit = litTyOfExpr(cond.binRight)
+          armLit = cmpLitTyOf(cond.binRight)
           armObj = cond.binLeft
           if armLit < 0 {
-            armLit = litTyOfExpr(cond.binLeft)
+            armLit = cmpLitTyOf(cond.binLeft)
             armObj = cond.binRight
           }
         }
@@ -54681,9 +54739,9 @@ function checkTrailingChainTotal(stmtIx: i32, retTy: i32) {
     } else if firstCond is BinExpr {
       if firstCond.binOp == "==" {
         let eqPlace = -1
-        if litTyOfExpr(firstCond.binRight) >= 0 {
+        if cmpLitTyOf(firstCond.binRight) >= 0 {
           eqPlace = firstCond.binLeft
-        } else if litTyOfExpr(firstCond.binLeft) >= 0 {
+        } else if cmpLitTyOf(firstCond.binLeft) >= 0 {
           eqPlace = firstCond.binRight
         }
         if eqPlace >= 0 {
@@ -60617,24 +60675,22 @@ function vbUnionMemberName(mIx: i32): string {
   ""
 }
 
-// True if node `ix`'s recorded type is a pure literal union (every member a `TyLit`): it reps
-// as the interned i32 atom or the string ref, never the value-union box, so the emitter's
-// union-box classifiers must not claim it. Gates `exprUnion`'s checker-typed `Call` fallback,
-// without which a litunion-result call classified as a box and the atom store mismatched.
+// True if node `ix`'s recorded type is a pure literal union (every member a `TyLit` of one
+// base scalar): it reps as the interned i32 atom or that scalar, never the value-union box, so
+// the emitter's union-box classifiers must not claim it. A mixed-base one (`1 | "a"`, or two
+// integer widths) is the box, exactly as `isValueUnionBox` decides (D3491, D4199).
 export function nodeTyIsPureLitUnion(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyUnion {
     if t.uMembers.length < 2 { return false }
-    // Integer members of two widths are the value box, not an atom or a scalar (D3491).
-    if intLitUnionBasesOf(ty).length > 0 { return false }
     let i = 0
     while i < t.uMembers.length {
       if !(T.tys[t.uMembers[i]] is TyLit) { return false }
       i = i + 1
     }
-    return true
+    return !isValueUnionBox(ty)
   }
   false
 }
@@ -67594,6 +67650,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   }
   // Equality: result bool; requires mutual compatibility.
   if op == "==" || op == "!=" {
+    noteCmpConstLit(n.binLeft)
+    noteCmpConstLit(n.binRight)
     // A void operand leaves nothing to compare (a call to a `: void` function or extern).
     if voidValueSlotErr(lt, n.binLeft, "`" + op + "`", n.binLeft) {
       return TY_BOOL
@@ -67620,7 +67678,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // Closed set (literal unions): comparing a literal-union place against a literal outside
     // its set can never be true — reject rather than compile an always-false test.
     if isLitBearing(lt) {
-      const eqR = litTyOfExpr(n.binRight)
+      const eqR = cmpLitTyOf(n.binRight)
       if eqR >= 0 {
         if !assignable(eqR, lt) {
           tErr(
@@ -67637,7 +67695,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         return TY_BOOL
       }
     } else if isLitBearing(rt) {
-      const eqL = litTyOfExpr(n.binLeft)
+      const eqL = cmpLitTyOf(n.binLeft)
       if eqL >= 0 {
         if !assignable(eqL, rt) {
           tErr(
