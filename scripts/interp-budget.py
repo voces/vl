@@ -23,7 +23,16 @@ and seed — and counts its findings. It therefore needs `build/vl-compiler.wasm
 Every target is passed RELATIVE to the checkout root (`cwd=root` below): the lint's
 own compiler/std scoping reads the literal path `vl check` was invoked with, so an
 absolute target would silently defeat it.
+
+THE GATE ROW IS `vl check --budget scripts/interp-budget-baseline.json` (L11 /
+architecture-refactor-plan T2): the same lint, one process, its targets and excludes
+read from the baseline's `targets` and `exclude`, and its `--budget-why` naming each
+entry exactly as `named` below does. This script stays as the reference implementation
+and the baseline's writer; tests/vl_budget_mode_test.ts holds the two to the same
+verdict and the same names.
 """
+
+import functools
 
 import json
 import os
@@ -42,6 +51,14 @@ SKIP = ("scripts/silent-sweep/distilled/", "scripts/capability-probes/matrix/")
 VL = os.environ.get("VL", os.path.join(ratchet.ROOT, "scripts", "vl-host", "target",
                                        "release", "vl.exe" if os.name == "nt" else "vl"))
 SEED = os.path.join(ratchet.ROOT, "build", "vl-compiler.wasm")
+# What `vl check --budget` walks: the same population as `targets` below, spelled as
+# CLI paths and `--exclude` globs (relative to each walked directory, or a basename).
+CLI_TARGETS = ("compiler/entry.vl", "std", "scripts")
+CLI_EXCLUDE = ("silent-sweep/distilled", "capability-probes/matrix", "*.matrix.vl",
+               "target", "__pycache__")
+
+
+ONLY = ()
 
 
 def targets(root):
@@ -51,7 +68,9 @@ def targets(root):
     runs with `cwd=root`, and a relative path is what lets the lint's own
     `compiler/`/`std/` prefix scoping recognise the tree; an absolute path never
     starts with either prefix and the exclusion silently would not apply (see the
-    module docstring)."""
+    module docstring). `--only` replaces the list."""
+    if ONLY:
+        return list(ONLY)
     out = ["compiler/entry.vl", "std"]
     top = os.path.join(root, "scripts")
     for dirpath, dirnames, filenames in os.walk(top):
@@ -66,6 +85,7 @@ def targets(root):
     return out
 
 
+@functools.lru_cache(maxsize=None)
 def findings(root):
     """{(rel, line, col): source line} for every finding in the three trees. A script
     that imports another reports the imported file's findings too; the position key
@@ -97,7 +117,10 @@ def findings(root):
                 if rel.split("/")[0] not in TREES or rel.startswith(SKIP):
                     continue
                 try:
-                    line = ratchet.read_source(path).split("\n")[d["line"] - 1].strip()
+                    # UTF-8, not `read_source`'s latin-1: the line is a NAME, stored in
+                    # the baseline and compared by `vl check --budget-why` as written.
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        line = fh.read().split("\n")[d["line"] - 1].strip()
                 except (OSError, IndexError):
                     line = ""
                 out[(rel, d["line"], d["col"])] = line
@@ -135,18 +158,31 @@ R = ratchet.Ratchet(
            "are held so the seed does not move for a spelling. After a rewrite, lower the\n"
            "baseline with",
     wrote_line=lambda t: f"{t[CODE]} {CODE}",
-    extras=lambda: (("commit", ratchet.head_commit()),),
+    extras=lambda: (("label", "interp"),
+                    ("writer", "scripts/interp-budget.py"),
+                    ("commit", ratchet.head_commit()),
+                    ("targets", list(CLI_TARGETS)),
+                    ("exclude", list(CLI_EXCLUDE))),
     named=named,
     tree_paths=TREES,
+    store_entries=True,
 )
 
 
 def main():
+    global ONLY
     args = sys.argv[1:]
+    # `--baseline <path>` and `--only <path,…>` exist for tests/vl_budget_mode_test.ts:
+    # a doctored baseline, and a population narrowed as `vl check --budget X <paths>` is.
+    if "--baseline" in args:
+        R.baseline = os.path.abspath(ratchet.flag_value(args, "--baseline"))
+    if "--only" in args:
+        ONLY = tuple(p for p in ratchet.flag_value(args, "--only").split(",") if p)
     if "--exempt-codes" in args:
         return R.exempt_codes()
     if "--why" in args:
-        return R.why(ratchet.flag_value(args, "--why"))
+        rev = ratchet.flag_value(args, "--why")
+        return R.why("" if rev.startswith("-") else rev)
     if "--list" in args:
         for (rel, line, col), text in sorted(findings(ratchet.ROOT).items()):
             print(f"{rel}:{line}:{col}  {text}")

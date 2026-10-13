@@ -114,7 +114,8 @@ class Ratchet:
     has no `--why` and `--check` offers none."""
 
     def __init__(self, script, label, baseline, codes, ok_line, remedy,
-                 wrote_line, extras=None, named=None, tree_paths=("compiler",)):
+                 wrote_line, extras=None, named=None, tree_paths=("compiler",),
+                 store_entries=False):
         self.script = script
         self.label = label
         self.baseline = baseline
@@ -125,6 +126,7 @@ class Ratchet:
         self.extras = extras or (lambda: ())
         self.named = named
         self.tree_paths = tree_paths
+        self.store_entries = store_entries
 
     @property
     def stem(self):
@@ -147,9 +149,17 @@ class Ratchet:
             f'"total": {json.dumps(total)},',
             '"files": {',
             ",\n".join(rows),
-            "}",
-            "}",
         ]
+        if self.store_entries:
+            # The named entries, one per line, so `--why` and `vl check --budget-why`
+            # compare against the file instead of rebuilding the baseline's tree from
+            # git. `ensure_ascii=False`: a name is source text, compared as written.
+            ents = [json.dumps([c, n, k], ensure_ascii=False)
+                    for c, names in sorted(self.named(ROOT).items())
+                    for n, k in sorted(names.items())]
+            body += ["},", '"entries": [', ",\n".join(ents), "]", "}"]
+        else:
+            body += ["}", "}"]
         with open(self.baseline, "w", encoding="utf-8") as fh:
             fh.write("\n".join(body) + "\n")
         print(f"wrote {self.baseline}: {self.wrote_line(total)}")
@@ -214,8 +224,15 @@ class Ratchet:
         The baseline's `commit` says which tree its numbers describe; `--why <rev>`
         overrides it. Both sides are re-derived by the SAME walk, so a name that
         left is a name that stopped qualifying — not a parser that stopped
-        matching."""
+        matching. A baseline that stores its `entries` (written by that walk) is
+        read instead of re-deriving its tree, unless a `<rev>` is passed."""
         at = since or self.baseline_commit()
+        stored = None if since else self.load_baseline().get("entries")
+        if stored is not None:
+            was = {c: {} for c in self.codes}
+            for code, name, hits in stored:
+                was.setdefault(code, {})[name] = hits
+            return self.report_why(at, was, self.named(ROOT))
         if not at:
             raise SystemExit(
                 f"{self.stem}: the baseline records no `commit`, so a fall cannot be\n"
@@ -226,11 +243,14 @@ class Ratchet:
             was = self.named(tmp)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        now = self.named(ROOT)
+        return self.report_why(at, was, self.named(ROOT))
+
+    def report_why(self, at, was, now):
+        """Print what moved from `was` to `now`, each `{code: {name: hits}}`."""
         print(f"{self.label}: {at} -> working tree\n")
         moved = 0
         for code in self.codes:
-            a, b = was[code], now[code]
+            a, b = was.get(code, {}), now.get(code, {})
             print(f"{code}  {sum(a.values())} hits over {len(a)} names -> "
                   f"{sum(b.values())} over {len(b)}")
             for n in sorted(set(a) - set(b)):
