@@ -31837,11 +31837,28 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   return 0
 }
 
-// The direct-call lowering for an `Ident` callee resolved to function index
-// `target` (env-leading when `fnValUsed`): arguments reordered into parameter
-// order and emitted per-parameter with the full coercion suite (struct/variant
-// hints, union boxing, nullable bridging, float/i64 widening), then `call`.
+// The direct call to function index `target`: arguments in parameter order, each emitted
+// under its parameter's context with the full coercion suite, then `call`. The caller's
+// context is restored before the `call`, and on every failure exit.
 function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
+  const saved = expCtxHere()
+  if (
+    expCtxLeave(saved, emitDirectCallArgsUnder(body, callIx, fnIx, target))
+    < 0
+  ) {
+    return -1
+  }
+  emitDirectCallTail(target, fnIx)
+}
+
+// `emitDirectCall`'s operands: each argument applies its parameter's context and leaves it
+// for the caller's exit to undo.
+function emitDirectCallArgsUnder(
+  body: u8[],
+  callIx: i32,
+  fnIx: i32,
+  target: i32,
+) {
   // The callee's FuncDecl lives at `fnStmts[target]` (the function index is the fnStmts
   // position). Its parameter list lets a struct-literal argument construct as the callee's
   // declared param struct type rather than a field-name guess, fixing a struct argument
@@ -31868,32 +31885,24 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       lci = lci + 1
     }
   }
-  // Each argument's valtype is decided by its parameter (`cParamF32`/`cParamF64`/`cParamI64`
-  // below), so an enclosing position's wide-scalar context must not leak into the arg spine —
-  // an uncleared `pendingF32` let a bare integer literal lower as `f32.const` into an i32
-  // parameter, `vl check`-clean and unparseable. The litunion seeds follow the same rule.
-  const savedArgF32 = pendingF32
-  const savedArgF64 = pendingF64
-  const savedArgLU = pendingLitUnion
-  const savedArgNulLU = pendingNulLitUnion
-  pendingF32 = false
-  pendingF64 = false
-  pendingLitUnion = 0
-  pendingNulLitUnion = false
+  // Every argument starts from the caller's context with the wide-scalar, litunion, struct,
+  // list and map seeds cleared: each is its parameter's, never the enclosing position's, or
+  // an integer literal lowers as `f32.const` into an i32 parameter, or a bare `Map()` builds
+  // an outer destination's shape (D1223). The parameter's own seeds are applied below.
+  const argBase = expCtxHere()
+  argBase.wantF32 = false
+  argBase.wantF64 = false
+  argBase.litUnion = 0
+  argBase.nulLitUnion = false
+  argBase.structIdx = -1
+  argBase.listKind = LBK_I32_LIST
+  argBase.listSlot = 0
+  argBase.wantI64 = false
+  argBase.mapSlot = -1
   let i = 0
   while i < args.length {
-    // If this argument position is a struct-typed parameter, hint `emitObj` with the
-    // callee's struct index (consumed by the immediately-following object-literal
-    // lowering; a non-literal argument simply ignores it). Default -1 = infer.
-    pendingStructIdx = -1
-    pendingListKind = LBK_I32_LIST
-    pendingListSlot = 0
-    pendingI64 = false
-    // D1223 — the map shape is the parameter's, never the enclosing position's. A bare
-    // `Map()` self-identifies nothing and builds whatever `pendingMapSlot` names, so the
-    // ambient seed is cleared here and re-seeded from the callee's own parameter below;
-    // otherwise an outer destination's shape reaches an argument whose parameter is a different map.
-    pendingMapSlot = -1
+    expCtxApply(argBase)
+    const ac = expCtxHere()
     // A variant-typed param position (kind 8): the callee wants the concrete variant struct
     // ref, but a union-valued argument (a narrowed local/param, a union-returning call) is the
     // box `{tag, value}`. Unbox to the param's variant struct — `struct.get $box 1 ; ref.cast
@@ -31986,14 +31995,14 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
           vtKindOfParam(cParams[i]) == "struct"
           || vtKindOfParam(cParams[i]) == "nulstruct"
         ) {
-          pendingStructIdx = paramStructIdxOf(cParams[i])
+          ac.structIdx = paramStructIdxOf(cParams[i])
         }
         // A NULLABLE map param position (`{[string]: V} | null`, kind `nulmap`): a `null` argument
         // lowers as `ref.null $mapStruct` (the generic ref-null seed over THIS map's heap type). A
         // map-value argument is a variable that self-identifies its shape (`exprMap`), so it ignores
-        // the seed. Mirrors the nulstruct `pendingStructIdx` seed above.
+        // the seed. Mirrors the nulstruct struct seed above.
         if vtKindOfParam(cParams[i]) == "nulmap" {
-          pendingNulRefHeap = mapTypeIdxOf(paramStructIdxOf(cParams[i]))
+          ac.nulRefHeap = mapTypeIdxOf(paramStructIdxOf(cParams[i]))
         }
         // D1223 — the `Map()` constructor's shape at the argument boundary, the seed its
         // sibling deliveries all have (`emitLetDeclStmt`'s annotation, `emitAssign`'s global
@@ -32001,7 +32010,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         // (the mono i32 map) while the param slot is the value-typed map struct: check-clean invalid wasm for every non-mono value type.
         const cpMapK = vtKindOfParam(cParams[i])
         if cpMapK == "map" || cpMapK == "nulmap" {
-          pendingMapSlot = paramStructIdxOf(cParams[i])
+          ac.mapSlot = paramStructIdxOf(cParams[i])
         }
         const cpvk = vtKindOfParam(cParams[i])
         cRecoverKind = cpvk
@@ -32016,17 +32025,18 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         // let / return / global seeding (consumed by `emitArr`).
         const cp = P.nodes[cParams[i]]
         if cp is Param {
-          pendingListKind = tyAnnRefListKind(cp.parType)
-          pendingListSlot = tyAnnRefListSlot(cp.parType)
+          ac.listKind = tyAnnRefListKind(cp.parType)
+          ac.listSlot = tyAnnRefListSlot(cp.parType)
           if vtKindOfParam(cParams[i]) == "reflist" {
             cParamRlSlot = tyAnnRefListSlot(cp.parType)
           }
           cParamSLKind = vtKindOfParam(cParams[i])
         }
         // An i64 param position lowers an integer-literal argument as `i64.const`.
-        if vtKindOfParam(cParams[i]) == "i64" { pendingI64 = true }
+        if vtKindOfParam(cParams[i]) == "i64" { ac.wantI64 = true }
       }
     }
+    expCtxApply(ac)
     // An f64 / f32 param position lowers the argument coerced to that float type
     // (a float literal re-encodes; an i32/i64/f32 source converts via the lattice
     // helper). (Slice 3 f64; Slice 5 f32.)
@@ -32046,35 +32056,22 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       }
     }
     if cParamF32 {
-      const savedF32 = pendingF32
-      pendingF32 = true
+      ac.wantF32 = true
+      expCtxApply(ac)
       if emitExprAsF32(body, args[i], fnIx) < 0 { return -1 }
-      pendingF32 = savedF32
-      pendingStructIdx = -1
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
-      pendingI64 = false
       i = i + 1
     } else if cParamF64 {
       if emitExprAsF64(body, args[i], fnIx) < 0 { return -1 }
-      pendingStructIdx = -1
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
-      pendingI64 = false
       i = i + 1
     } else if cParamI64 {
       if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
-      pendingStructIdx = -1
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
-      pendingI64 = false
       i = i + 1
     } else {
       if (cParamStr || cParamNulString) && exprIsLitAtom(args[i], fnIx) {
         // A literal-union atom flowing into a `string` param widens to its member string — and
         // into a `string | null` param for the same reason, the slot being that same reference
         // with a null permitted and a widened member string non-null. A `null` argument is not a
-        // lit atom and still takes the `nulString`-seeded context below. (Shared tail resets `pending*` hints and advances `i`.)
+        // lit atom and still takes the `nulString`-seeded context below.
         if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
       } else if cUNm != "" {
         // `cUNm` is set only for a kind-4 union-BOX param (see above), so a concrete
@@ -32083,7 +32080,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       } else {
         const argCtx = expCtxHere()
         // The parameter's nullability is assigned, never or'd with the enclosing position's.
-        // `expCtxHere()` snapshots the ambient `pending*` seeds, which at a `return f(x)` are
+        // `expCtxHere()` snapshots the ambient seeds, which at a `return f(x)` are
         // the return boundary's; setting them only to true let a nullable result expectation
         // reach a non-nullable argument, keeping a narrowed value's `(ref null $s)` rep under a `(ref $s)` param.
         argCtx.nulBool = cParamNulBool
@@ -32114,7 +32111,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         // The non-null half of that niche (D22): an object literal builds the concrete
         // variant struct, which subtypes the `(ref null $uVarHeap[vi])` slot. Seeded
         // unconditionally, like the `cVi` variant-param seed below — `emitObj` alone consumes
-        // the hint (`pendingVariantIdx`, cleared on use), so a variant/niche value argument ignores it.
+        // the hint (cleared on use), so a variant/niche value argument ignores it.
         if cParamNulVariantIdx >= 0 { argCtx.variantIdx = cParamNulVariantIdx }
         if cParamLitUnion { argCtx.litUnion = 1 }
         if cParamNulLitUnion {
@@ -32144,7 +32141,6 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         if cParamSLKind != null {
           emitScalarListWidenSite(body, args[i], fnIx, cParamSLKind)
         }
-        pendingVariantIdx = -1
         emitNonNullParamRecover(cRecoverKind, args[i], fnIx)
       }
       // The niche parameter's unbox (D1031) — `g(r)` into `g(x: Circle | null)` under `if r
@@ -32180,17 +32176,15 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
           )
         }
       }
-      pendingStructIdx = -1
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
-      pendingI64 = false
       i = i + 1
     }
   }
-  pendingF32 = savedArgF32
-  pendingF64 = savedArgF64
-  pendingLitUnion = savedArgLU
-  pendingNulLitUnion = savedArgNulLU
+  0
+}
+
+// The `call` and what follows it, under the caller's restored context: the tail-call
+// cursor, a lifted callee's capture write-back, and the `nulnone` result's niche re-rep.
+function emitDirectCallTail(target: i32, fnIx: i32) {
   fbCall(gImports + target) // 0x10 call (imports occupy indices 0..gImports-1)
   // Arm the tail-call cursor: if this call is still the last thing written when the
   // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
