@@ -69,7 +69,15 @@ NAMES=(); PIDS=(); STARTS=()
 # "Developing on Windows").
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) : "${GATE_MAX_PAR:=6}" ;; esac
 GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
-run() { if [ "$GATE_MAX_PAR" -gt 0 ]; then
+# `--fast`: a local pre-push check, NOT the merge gate. It skips the rows whose cost is the
+# slow tail of the gate (whole-corpus grades, timing measurements, the fixpoints, the full
+# native suite) and ends with a line no merge tooling reads as a pass.
+FAST=0
+for a in "$@"; do [ "$a" = --fast ] && FAST=1; done
+SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|survey measurements|native-fixpoint|self-compile time|rep-fuzz|plumb-shape cost|"
+SKIPPED=()
+run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1"); return 0; fi
+        if [ "$GATE_MAX_PAR" -gt 0 ]; then
           while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done
         fi
         local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
@@ -277,5 +285,9 @@ if [ $FAIL -ne 0 ]; then
   # once, here, rather than leaving ten identical `rc=1` rows to be read as a regression.
   [ -s "$LOGS/python.diag" ] && { echo; cat "$LOGS/python.diag"; }
   echo; echo "GATE FAILED — logs in $LOGS"; exit 1
+fi
+if [ "$FAST" = 1 ]; then
+  echo; echo "FAST TIER PASSED — not the merge gate; skipped: ${SKIPPED[*]}  (logs in $LOGS)"
+  exit 0
 fi
 echo; echo "ALL GATES PASS ✅  (logs in $LOGS)"
