@@ -248,7 +248,9 @@ run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py b
 # reads the baseline, under-reported `runs` by six until an agent noticed while diffing its
 # own corpus run.
 if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
-  run "baseline freshness"     "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh
+  # Its own --json: the `distilled corpus` row runs regress.py concurrently, and two runs
+  # writing the default `.last.json` read each other's truncated files.
+  run "baseline freshness"     "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh --json "$LOGS/fresh.json"
 fi
 
 FAIL=0

@@ -244,7 +244,15 @@ warm_copying() {
     --compiler "$OUT" > /dev/null 2>&1 ||
     echo "  note: could not warm the copying-compile sidecar — its first use re-JITs the seed" >&2
 }
-warm run & warm check & warm_copying & wait
+# The two fuel-metered tags (`$VL_FUEL=1`, under each compile collector) are what the
+# measurement rows compile under — scaling shape, self-compile time, plumb-shape — so
+# warming them keeps that JIT out of the gate.
+warm_fuel() {
+  VL_FUEL=1 VL_COMPILE_GC="$1" "$VL" build "$WORK/hello.vl" -o "$WORK/warm-fuel-$1.wasm" \
+    --compiler "$OUT" > /dev/null 2>&1 ||
+    echo "  note: could not warm the fuel/$1 sidecar — its first use re-JITs the seed" >&2
+}
+warm run & warm check & warm_copying & warm_fuel copying & warm_fuel null & wait
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
