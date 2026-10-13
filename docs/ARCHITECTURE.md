@@ -497,7 +497,7 @@ line in the PR that closes it. The order in which they are closed is
 | §4.7 | Expected types reach the expression emitter through ambient module state; the return and `let` boundaries (`emitReturnValue`, `emitLetDeclStmt`) no longer write it, each building an `ExpCtx` and restoring the caller's on every exit, while the other delivery functions still do. Memos carry their own generation keys. | [L7](internals/code-quality-2026-10.md#L7) |
 | §2.3, §2.4 | Structural type steps are written separately in the checker and the emitter. The emitter's own exact twins now have one copy each in `compiler/tyquery.vl`; the checker's copies (`isNullTy`) and the four cross-phase twins are still separate. | [L8](internals/code-quality-2026-10.md#L8) |
 | §2.5, §6 | The host carries a wasm optimizer that its own manifest describes as absent, and the Deno and playground hosts cannot run `-O`. | [L10](internals/code-quality-2026-10.md#L10) |
-| §6 | Repo lint rules are written in both `lint.vl` and Python. | [L11](internals/code-quality-2026-10.md#L11) |
+| §6 | Repo lint rules are written in both `lint.vl` and Python; the interp ratchet is now held and written by `vl check --budget` with no script, the other five still by Python. | [L11](internals/code-quality-2026-10.md#L11) |
 | §6 | The LSP server and the playground each implement the feature ladder. | [L12](internals/code-quality-2026-10.md#L12) |
 | §6 | Errno numbers are stated in three places with no agreement check. | [L13](internals/code-quality-2026-10.md#L13) |
 | §6 | Exit codes are bare literals; the LSP carries a lexer and a module resolver with no agreement test against the seed. | [S-i, S-j](internals/code-quality-2026-10.md#small-items) |
