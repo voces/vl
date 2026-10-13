@@ -5032,8 +5032,8 @@ refusals, no check refusal moved.
 
 **What is left at that site is a FLOOR, and its message says so.** It used to concede a
 capability and prescribe "spell both arms the same way" — an edit that fixed neither program
-it was shown to. The refusal beside it (arms nothing tells apart, pinned by
-`same-field-names-i32-vs-boolean-reject.vl`) is live and keeps a sentence about the program.
+it was shown to. The refusal beside it (arms nothing tells apart) was retired by Q4 (c); its fixture,
+`same-field-names-i32-vs-boolean.vl`, now runs.
 
 **THE ADMISSION AND THE ACTION ARE ONE PREDICATE ASKED TWICE.** `assignTags` runs at the end of
 `collectU`, one pass before the struct table exists, so it cannot do the re-lay; it admits on
@@ -10271,8 +10271,13 @@ do a nominal check for perf reasons, but fundamentally the language is meant to 
 structural." This is the same principle as D3885 and D3870, applied to the union's formation
 rule. The 2026-09-02 refusal it replaces is retired.
 
-**Before.** The union was refused when formed, whichever way the `is` went. The checker does
-not admit it yet (D4056).
+**Before.** The union was refused when formed, whichever way the `is` went.
+
+**How it is built (D4056).** Arms are tagged by their field types, a literal set read as its
+base scalar, so arms whose values cannot overlap keep the tag test alone. Where another arm's
+values may fit `A`, `is A` adds that arm's tag and a test of each field only some of its values
+fit. A value that passes is still laid out as the arm it was built as, so the then arm keeps
+the union type there (D4262).
 
 ## `x == L` narrows a literal union as `x is L` does (Q10 (a), owner ruling, 2026-10-12) — D4059
 

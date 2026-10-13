@@ -14494,7 +14494,11 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
       let meet = litSetMeetTy(isCur, tIdx)
       if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
       if meet >= 0 { tIdx = meet }
-      if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
+      // A value that passed may be laid out as another arm (D4056): only `null` leaves.
+      if tIdx >= 0 && recIsFitsAcrossTags(isCur, tIdx) {
+        const nn = nonNullNarrowTy(isCur)
+        if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
+      } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
         pushNarrowFact(isPl, tIdx, names, tys)
         pushDiscrimParentFact(
           isPl,
@@ -20676,13 +20680,7 @@ function recordContainedIsAt(n: IsExpr, ix: i32, objTy: i32, chkTy: i32) {
   // Two records only: a scalar, literal or list containment is the ordinary narrowing it reads as.
   if !(T.tys[chkTy] is TyObj) { return 0 }
   for m in ot.uMembers {
-    if (
-      m != chkTy
-      && m >= 0
-      && T.tys[m] is TyObj
-      && assignable(chkTy, m)
-      && !assignable(m, chkTy)
-    ) {
+    if (m != chkTy && m >= 0 && T.tys[m] is TyObj && recArmContains(m, chkTy)) {
       const tk = findingStartTok(ix)
       if tk < 0 { return 0 }
       let i = 0
@@ -20704,7 +20702,7 @@ function recordContainedIsAt(n: IsExpr, ix: i32, objTy: i32, chkTy: i32) {
           + "` is contained in `"
           + tyToStrUser(m)
           + "`, so `is "
-          + n.isVariant
+          + tyToStrUser(chkTy)
           + "` tests the value",
       )
       return 0
@@ -21577,6 +21575,8 @@ export function mapValIsI32Cell(v: i32): boolean {
 // annotation. A union spells the set as that map, so the box could not tell which member it
 // holds (D2673). "" when `members` has no such pair.
 function setMapUnionClashMsg(members: i32[], isJoin: boolean): string {
+  const rec = setMapRecordClashMsg(members, isJoin)
+  if rec != "" { return rec }
   let i = 0
   while i < members.length {
     const a = members[i]
@@ -21610,6 +21610,49 @@ function setMapUnionClashMsg(members: i32[], isJoin: boolean): string {
       }
     }
     i = i + 1
+  }
+  ""
+}
+
+// The same refusal one level down: two record arms with one field-name set whose field holds a
+// Set in one and a same-rep map in the other. The box keys an anonymous arm by that shared
+// spelling, so `is` could not tell them apart (D4056). "" when `members` has no such pair.
+function setMapRecordClashMsg(members: i32[], isJoin: boolean): string {
+  let i = 0
+  while i < members.length {
+    let j = i + 1
+    while j < members.length {
+      const f = setMapRecordClashField(members[i], members[j], isJoin)
+      if f != "" {
+        return "a union cannot hold both "
+          + tyToStr(members[i])
+          + " and "
+          + tyToStr(members[j])
+          + " yet: field `"
+          + f
+          + "` is a Set in one and a map in the other, which share one representation, so `is` could not tell them apart — rename the field in one arm"
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The first field of same-name records `a` and `b` whose two types clash as a Set and a map,
+// or "" when they are not two such records or a literal field tells them apart.
+function setMapRecordClashField(a: i32, b: i32, isJoin: boolean): string {
+  if a < 0 || b < 0 { return "" }
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  if !(at is TyObj) || !(bt is TyObj) { return "" }
+  if !objSigSame(at, bt) || !objSigSame(bt, at) { return "" }
+  if objArmsDiscriminable(at, bt) { return "" }
+  let k = 0
+  while k < at.objFieldNames.length {
+    const pair = [at.objFieldTypes[k], objFieldType(bt, at.objFieldNames[k])]
+    if setMapUnionClashMsg(pair, isJoin) != "" { return at.objFieldNames[k] }
+    k = k + 1
   }
   ""
 }
@@ -29784,7 +29827,7 @@ function flatFieldTyName(fdIx: i32) {
 // The base scalar of a literal-set type — `TY_STR` for `"a"|"b"`, a numeric `TY_I32`/
 // `TY_I64`/`TY_F64` — or -1 when `ty` is not a literal set, lifted from one member to the
 // whole set since two arms are discriminable at a field only when both sets are comparable (D1023).
-function litSetBaseTy(ty: i32): i32 {
+export function litSetBaseTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   if tyLitSetMemberLexes(ty).length == 0 { return -1 }
   const t = T.tys[ty]
@@ -29856,63 +29899,158 @@ function objArmsSameType(a: TyObj, b: TyObj): boolean {
   true
 }
 
-// The design rule `docs/guide/unions.md` promises, owed by the checker: VL's structural
-// unions discriminate on the field-name set, so two arms sharing that set need a literal-typed
-// field to part them, or the pair is refused. "" when `ty` is fine, or the message — a check
-// error, not an emit one, since it is a rule, not a gap (D1023). One message per union, not per pair.
-function unionDiscrimMsgNamed(ty: i32, spellings: string[]): string {
-  if ty < 0 { return "" }
-  const pt = T.tys[ty]
-  if pt is TyUnion {
-    const ms = pt.uMembers
-    const named = spellings.length == ms.length
-    let i = 1
-    while i < ms.length {
-      let j = 0
-      while j < i {
-        const mi = T.tys[ms[i]]
-        const mj = T.tys[ms[j]]
-        if mi is TyObj {
-          if mj is TyObj {
-            if (
-              objSigSame(mi, mj)
-              && !objArmsSameType(mi, mj)
-              && !objArmsDiscriminable(mi, mj)
-            ) {
-              let na = tyToStrUser(ms[j])
-              let nb = tyToStrUser(ms[i])
-              if named {
-                na = spellings[j]
-                nb = spellings[i]
-              }
-              return "arms `"
-                + na
-                + "` and `"
-                + nb
-                + "` share a field-name set and no literal-typed field "
-                + "distinguishes them — add a discriminant field"
-            }
-          }
-        }
-        j = j + 1
-      }
-      i = i + 1
-    }
+// How a value of record arm `y` fits record arm `x` when both carry the same field names: 0
+// when some field's types share no value, 1 when every field of `y` is assignable to `x`'s,
+// 2 when a field overlaps without containment, so only the stored value can answer (D4056).
+export function recArmFitKind(x: i32, y: i32): i32 {
+  if x < 0 || y < 0 { return 0 }
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if !(tx is TyObj) || !(ty is TyObj) { return 0 }
+  if !objSigSame(tx, ty) || !objSigSame(ty, tx) { return 0 }
+  let all = true
+  let i = 0
+  while i < ty.objFieldNames.length {
+    const fy = ty.objFieldTypes[i]
+    const k = tyFitKind(fy, objFieldType(tx, ty.objFieldNames[i]))
+    if k == 0 { return 0 }
+    if k == 2 { all = false }
+    i = i + 1
   }
-  ""
+  if all { 1 } else { 2 }
 }
 
-// The no-spellings form, for a caller holding only the arena type (an inline `A | B`
-// annotation, which has no declaration to read arm names off).
-function unionDiscrimMsg(ty: i32): string {
-  const none: string[] = []
-  unionDiscrimMsgNamed(ty, none)
+// Whether record arm `x` holds every value of arm `y` but not the reverse: field by field for
+// arms of one field-name set, where a narrower number is not contained in a wider one, else by
+// assignability.
+function recArmContains(x: i32, y: i32): boolean {
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if tx is TyObj && ty is TyObj && objSigSame(tx, ty) && objSigSame(ty, tx) {
+    return recArmFitKind(x, y) == 1 && recArmFitKind(y, x) != 1
+  }
+  assignable(y, x) && !assignable(x, y)
+}
+
+// How a value of type `src` fits `dst`: 1 always (assignable), 0 never (no shared value), 2
+// only for some values, so a test has to read the value.
+export function tyFitKind(src: i32, dst: i32): i32 {
+  if numericRepsApart(src, dst) { return 0 }
+  if assignable(src, dst) { return 1 }
+  if tysShareValue(src, dst) { 2 } else { 0 }
+}
+
+// Two numeric scalars (or literals over them, or lists of them) of different widths:
+// assignable by widening, yet no value is both, as `is i32` against an `i64` answers.
+function numericRepsApart(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyArray && tb is TyArray {
+    return numericRepsApart(ta.aElem, tb.aElem)
+  }
+  const ab = litSetBaseTy(a)
+  const bb = litSetBaseTy(b)
+  const x = if ab >= 0 { ab } else { a }
+  const y = if bb >= 0 { bb } else { b }
+  isNumericPrimTy(x) && isNumericPrimTy(y) && !tyEq(x, y)
+}
+
+// The fields of record arm `y` that only some values fit at record `x`'s type: each name with
+// `y`'s field type in `fys` and `x`'s in `fxs`. Empty for a non-record either side.
+export function recArmPartialFields(
+  x: i32,
+  y: i32,
+  names: string[],
+  fys: i32[],
+  fxs: i32[],
+) {
+  if x < 0 || y < 0 { return 0 }
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if !(tx is TyObj) || !(ty is TyObj) { return 0 }
+  let i = 0
+  while i < ty.objFieldNames.length {
+    const fx = objFieldType(tx, ty.objFieldNames[i])
+    if fx >= 0 && tyFitKind(ty.objFieldTypes[i], fx) == 2 {
+      names.push(ty.objFieldNames[i])
+      fys.push(ty.objFieldTypes[i])
+      fxs.push(fx)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Can one value inhabit both `a` and `b`? Member-wise: a pair where either side is assignable to
+// the other, or two same-shape records whose arms fit (`recArmFitKind`).
+function tysShareValue(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const ams: i32[] = []
+  const bms: i32[] = []
+  flattenVariantsInto(a, ams)
+  flattenVariantsInto(b, bms)
+  for ma in ams {
+    for mb in bms {
+      if ma >= 0 && mb >= 0 && !numericRepsApart(ma, mb) {
+        if assignable(ma, mb) || assignable(mb, ma) { return true }
+        if recArmFitKind(ma, mb) != 0 { return true }
+      }
+    }
+  }
+  false
+}
+
+// Is record arm `y` laid out under a different box tag from `x` — same field names, and some
+// field whose base type differs, a literal set read as the scalar it softens to. The checker's
+// conservative reading of the emitter's `variantTagKey`.
+function recArmsTagApart(x: i32, y: i32): boolean {
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if !(tx is TyObj) || !(ty is TyObj) { return false }
+  let i = 0
+  while i < tx.objFieldNames.length {
+    const fy = objFieldType(ty, tx.objFieldNames[i])
+    if fy < 0 { return false }
+    if !tySame(recFieldBaseTy(tx.objFieldTypes[i]), recFieldBaseTy(fy)) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The type a record field is tagged by: a literal set's base scalar, else the field's own type.
+function recFieldBaseTy(f: i32): i32 {
+  const b = litSetBaseTy(f)
+  if b >= 0 { b } else { f }
+}
+
+// Does some arm of `cur` other than `chk` sit under its own tag and still hold values that fit
+// `chk`? Then `is chk` answers from the value, and the then arm keeps `cur`, since a value that
+// passed may be laid out as either arm (D4056).
+export function recIsFitsAcrossTags(cur: i32, chk: i32): boolean {
+  if cur < 0 || chk < 0 { return false }
+  if !(T.tys[chk] is TyObj) { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(cur, ms)
+  let records = 0
+  for m in ms {
+    if m >= 0 && T.tys[m] is TyObj { records = records + 1 }
+  }
+  // A lone record, nullable or not, sits under no box tag.
+  if records < 2 { return false }
+  for m in ms {
+    if m >= 0 && m != chk && !tySame(m, chk) {
+      if recArmsTagApart(chk, m) && recArmFitKind(chk, m) != 0 { return true }
+    }
+  }
+  false
 }
 
 // Reports `msg` unless already reported, at any anchor — `tErrPush`'s own dedupe keys on
 // `(message, anchor)`, too weak here since one bad union is reachable from its declaration
-// and every annotation naming it. The message alone is the key. First writer wins: pass 0d
-// runs before any annotation resolves, naming arms from the declaration's own spellings.
+// and every annotation naming it. The message alone is the key; the first writer wins.
 function tErrOncePerMsg(msg: string, at: i32) {
   let di = 0
   while di < T.diags.length {
@@ -29922,15 +30060,13 @@ function tErrOncePerMsg(msg: string, at: i32) {
   tErr(msg, at)
 }
 
-function checkUnionDiscriminable(stmts: i32[]) {
+function checkUnionSetMapClash(stmts: i32[]) {
   let si = 0
   while si < stmts.length {
     const sd = P.nodes[stmts[si]]
     if sd is UnionDecl {
       const declIx = cUserTypes[sd.udName] ?? -1
       if declIx >= 0 {
-        const m = unionDiscrimMsgNamed(declIx, sd.udVariants)
-        if m != "" { tErrOncePerMsg(m, stmts[si]) }
         const flat: i32[] = []
         flattenVariantsInto(declIx, flat)
         const sm = setMapUnionClashMsg(flat, false)
@@ -53750,12 +53886,6 @@ function resolveAnnotAt(
   const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
   annotDiagAt = saved
   if name.length > 0 && name.slice(0, 1) == "{" { recAnnObjs.push(r) }
-  // D1023 at the inline spelling: pass 0d catches a union with a declaration to walk, but an
-  // inline `function f(): A | B` has none, so the arm-discriminability rule is asked again
-  // here, at the annotation — the checker's own route, which keeps this out of the emit
-  // phase. `tErrOncePerMsg` dedups the case where a declared union reaches it from both routes.
-  const dm = unionDiscrimMsg(r)
-  if dm != "" { tErrOncePerMsg(dm, at) }
   // A container of vectors named by an annotation alone (a param, a field of a struct only
   // ever passed around, `v?: F32x4`) reaches no expression node, so it is refused here.
   if !inferQuiet {
@@ -57280,10 +57410,9 @@ function checkProgramNode(n: Program) {
   // is what makes a newtype over a scalar work for free) and must precede any
   // expression checking, since `N.size` / `N.field` fold against this sidecar.
   resolveFlatLayouts(stmts)
-  // Pass 0d: REFUSE a union whose arms nothing can tell apart (D1023). Runs here, after 0b
-  // has filled every arm's `TyObj`, because the rule reads field names and field TYPES and a
-  // declaration cycle can still leave a member an empty placeholder inside the fill itself.
-  checkUnionDiscriminable(stmts)
+  // Pass 0d: refuse a declared union whose set and map arms clash. Runs after 0b has filled
+  // every arm, since a declaration cycle can leave a member a placeholder inside the fill.
+  checkUnionSetMapClash(stmts)
   // Pass 1: hoist top-level function signatures so call-before-decl and mutual
   // recursion type-check.
   let hi = 0
@@ -63501,20 +63630,12 @@ function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       nodeRepTyIx[srcExpr] = dtix
       return 1
     }
-    // A nested `ObjLit` whose destination is a union: recurse against the first member whose
-    // field-name set corresponds (best-effort, keeps the recorder side-effect free).
+    // An `ObjLit` whose destination is a union: recurse against the first member whose
+    // field-name set corresponds and that the literal's own type fits, else the first whose
+    // names correspond — arms may share every field name and differ in a field's type.
     if d is TyUnion {
-      const members = d.uMembers
-      let mi = 0
-      while mi < members.length {
-        const mt = T.tys[members[mi]]
-        if mt is TyObj {
-          if objLitFieldsCorrespond(e, mt) {
-            return recordRepTyAdopt(srcExpr, members[mi], depth)
-          }
-        }
-        mi = mi + 1
-      }
+      const am = objLitUnionArm(e, nodeTyIxOf(srcExpr), d.uMembers)
+      if am >= 0 { return recordRepTyAdopt(srcExpr, am, depth) }
       return 0
     }
     return 0
@@ -63546,6 +63667,29 @@ function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
     return 0
   }
   0
+}
+// The member of `members` an object literal `e` of checked type `srcTy` is stored as: the
+// first record whose field names correspond and that `srcTy` is assignable to, else the first
+// whose names correspond, else -1.
+function objLitUnionArm(e: ObjLit, srcTy: i32, members: i32[]): i32 {
+  let first = -1
+  let mi = 0
+  while mi < members.length {
+    const m = members[mi]
+    if m >= 0 && m < T.tys.length {
+      const mt = T.tys[m]
+      if mt is TyObj {
+        if objLitFieldsCorrespond(e, mt) {
+          if srcTy >= 0 && srcTy < T.tys.length && assignable(srcTy, m) {
+            return m
+          }
+          if first < 0 { first = m }
+        }
+      }
+    }
+    mi = mi + 1
+  }
+  first
 }
 // True when the `ObjLit` `e`'s field-name set corresponds one-to-one with the struct type
 // `mt`'s declared field names (order-independent) — `recordRepTyAdopt`'s light dual of
@@ -68461,11 +68605,6 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       if annot >= 0 && annot == collapsedTy { annotCollapsedHere = true }
       if tn.tyName.length > 0 && tn.tyName.slice(0, 1) == "{" {
         recAnnObjs.push(annot)
-      }
-      // D1023 at a binding's inline union, as `resolveAnnotAt` asks it of a parameter's.
-      if annot >= 0 {
-        const ldm = unionDiscrimMsg(annot)
-        if ldm != "" { tErrOncePerMsg(ldm, n.letType) }
       }
       if annot < 0 {
         // A map shape whose key is neither `string` nor `i32` has no hash in the map rep —
