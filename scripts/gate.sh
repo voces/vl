@@ -167,6 +167,9 @@ run "comment budget"           "$PY" scripts/comment-budget.py --check
 # first orchestrator script the language runs on itself — and it is why the row sits
 # after the build rather than beside the file scans.
 run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
+# The PYTHON ratchet, written in VL: tracked .py files and lines may only fall (the owner's
+# directive is zero; docs/internals/python-removal.md is the census it works down).
+run "py budget"                "$VL" run scripts/py-budget.vl -- --check
 # THE COST OF GENERATED CODE: guest fuel and peak RSS of one `-O` build of each of two 2 MB
 # plumb-shaped units (a median one, and a one-function tail one), against a committed
 # baseline, plus two exact facts about the rung input. Fuel is a count, so the fan-out's
