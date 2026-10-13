@@ -203,7 +203,6 @@ import {
   aUsed,
   annRlNul,
   annRlSlot,
-  anonLeafEmitPhase,
   armPreludeBlocks,
   arrLitCommitName,
   ba8TypeIdx,
@@ -223,7 +222,6 @@ import {
   caSeenUnNames,
   caSeenUnSets,
   caSeenVariants,
-  capCacheOn,
   capMemoArmed,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
@@ -238,7 +236,6 @@ import {
   dupScanActive,
   dupSlotBias,
   dupSlotMore,
-  emitArenaFinal,
   emitCurFnIx,
   emitCurFnPos,
   emitCurStmtIx,
@@ -253,6 +250,7 @@ import {
   emitFnSpanTag,
   emitLetCursor,
   emitPassGen,
+  emitPhase,
   emitRootIx,
   externIdxAt,
   fRetRArrElem,
@@ -464,7 +462,6 @@ import {
   narrowTys,
   narrowVariants,
   nestedNameBySid,
-  postMonoShapes,
   raUsed,
   reExpName,
   reExpTarget,
@@ -6707,9 +6704,10 @@ export function emitProgram(rootIx: i32) {
   narrowRetired = []
   narrowTop = 0
   narrowIdxReset()
-  // The capture cache is only valid for a FINAL AST — drop it before the
-  // rewrite/monomorphize passes run (they mutate bodies and `fnStmts` slots).
-  capCacheOn = false
+  // Back to the start of the timeline: the capture cache is only valid for a FINAL AST, and a
+  // phase left by the previous program on a shared instance would arm every later-phase reader
+  // over this program's whole pass table. See `EmitPhase`.
+  emitPhase = "passes"
   capMemoArmed = false
   // The in-flight map-return stack holds `fnStmts` positions, the same arena-keyed index this
   // block exists to stop leaking across programs. It is push/pop-balanced
@@ -6720,12 +6718,6 @@ export function emitProgram(rootIx: i32) {
   // ARENA index, so a value surviving into the next program on a shared instance names a
   // node that program never minted.
   emitRootIx = rootIx
-  postMonoShapes = false
-  // D882 — the `??`-merge row redirect is armed at `emitModule`, not here. Cleared beside
-  // `postMonoShapes` for the same reason: a flag left set by the previous program on a shared
-  // instance would arm it over the next program's whole pass table. See `anonLeafEmitPhase`.
-  anonLeafEmitPhase = false
-  emitArenaFinal = false
   stubWriteRhsReset()
   if rootIx < 0 { return emitFail("emitProgram: empty arena (root index < 0)") }
   const root = P.nodes[rootIx]
@@ -6815,9 +6807,9 @@ export function emitProgram(rootIx: i32) {
       capMemoArmed = false
       if prc < 0 { return -1 }
       identAuditMark(pname)
-      // Every shape interned from here on is an instance's RE-SPELLING, not an author's
-      // type — see `postMonoShapes`.
-      if pname == "monomorphize" { postMonoShapes = true }
+      // The two phases a pass row advances; see `EmitPhase`.
+      if pname == "monomorphize" { emitPhase = "monomorphized" }
+      if pname == "capCacheBuild" { emitPhase = "capsCached" }
       passDone.push(pname)
       // The generation a cross-pass classifier memo stamps: a row that fills a table the
       // ladder reads is invisible to an arena-shaped staleness test, so an answer may not
@@ -6831,13 +6823,13 @@ export function emitProgram(rootIx: i32) {
     }
     // D882 — the mint is over. From here a `??`-joined literal resolves to the merged row at
     // every reader (`anonLeafJoinRowOf`); before here `collectAnonShapes` needs the pre-merge answer to decide what to mint.
-    anonLeafEmitPhase = true
+    emitPhase = "minted"
     identAuditRun(stmts, fnStmts)
     fnFlowShadowSweep(stmts)
     // The last row has run, so nothing rewrites the arena from here on and a whole-program
     // index is safe to build. Its own contract is on the declaration.
     mapTwinSettle()
-    emitArenaFinal = true
+    emitPhase = "arenaFinal"
     const rc = emitModule(stmts)
     if rc < 0 { return rc }
     // An `emitFail` whose -1 a deep helper swallowed (e.g. inside a valtype write)
