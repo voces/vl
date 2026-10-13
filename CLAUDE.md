@@ -484,8 +484,8 @@ result indistinguishable from the right one's, so say what was compared. And a r
 is not self-explaining: "it went down" and "it went down because #2465 added the arm" are
 different confidence levels, and only the second rules out a detector that stopped seeing
 something — the ratchets with stored entries name what left since the baseline's commit:
-`vl check --budget <baseline> --budget-why` for comment, scan, sentinel and interp, and
-`--why` on `ladder-budget.py`/`export-budget.py` (sharing `scripts/ratchet.py`; `seed-size` is
+`vl check --budget <baseline> --budget-why` for comment, scan, sentinel, interp, ladder and
+export (`render-parse-budget.py --why` on `scripts/ratchet.py`; `seed-size` is
 a scalar and has no entries to name). A baseline recording no `commit` falls back to the commit that last
 CHANGED it.
 
@@ -706,9 +706,9 @@ what the `_` clause now prevents. The rule, the pilot's table and the two `vl fm
 found (D1646/D1647) are `docs/internals/kind-ladder-lint.md`.
 
 `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
-across two functions where only one hands back. Ratchet: `python3 scripts/ladder-budget.py
---check` (a gate row; it also re-derives every closed set from its `export type` and fails on
-drift). `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
+across two functions where only one hands back. Ratchet: `vl check --budget
+scripts/ladder-budget-baseline.json` (a gate row), and `vl run scripts/ladder-sets.vl` beside it
+re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
 for the form with no kind literal in it, which is the only place #2400's hole is visible.
 
 ## A TABLE READ BOUND-TESTS ITS INDEX, OR TAKES A READER WHOSE MISS CANNOT BE A REAL ROW

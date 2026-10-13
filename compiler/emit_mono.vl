@@ -408,7 +408,6 @@ import {
   identClosureFeAt,
   identFnTypeAnnName,
   identIsBoundClosure,
-  identLetOfAt,
   isSName,
   isUName,
   letRefListDestSlot,
@@ -12254,44 +12253,6 @@ function monoFnBindsParam(fx: i32, name: string): boolean {
   false
 }
 
-// The binding `name` reads at node `at` in frame `ctx` or the nearest enclosing frame, as
-// `[frame, letIx]`; `[-1, -1]` when a parameter binds it first, or past eight frames.
-function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
-  const none: i32[] = [0 - 1, 0 - 1]
-  const sid = sidOf(name)
-  // A read at module scope names a global `let` (D3847).
-  if ctx < 0 {
-    const gi = identLetOfAt(sid, -1, at)
-    if gi < 0 { return none }
-    const top: i32[] = [0 - 1, gi]
-    return top
-  }
-  let fx = ctx
-  let hops = 0
-  while hops < 8 && fx >= 0 {
-    if monoFnBindsParamAt(fx, name, at) { return none }
-    const li = identLetOfAt(sid, fx, at)
-    if li >= 0 {
-      // A module-scope binding found from a function is the module's: its initializer reads
-      // names at module scope, not in the function (D3868).
-      let lfx = fx
-      const fn = P.nodes[fx]
-      if fn is FuncDecl {
-        if bodyLetReadAtSid(fn.fnBody, sid, at) != li { lfx = -1 }
-      }
-      const out: i32[] = [lfx, li]
-      return out
-    }
-    const slot = fnStmtsPosOf(fx)
-    if slot < 0 || slot >= fnParent.length { return none }
-    const ps = fnParent[slot]
-    if ps < 0 || ps >= fnStmts.length { return none }
-    fx = fnStmts[ps]
-    hops = hops + 1
-  }
-  none
-}
-
 // The lifted lambda the binding read at `at` in frame `ctx` holds, where the flow table names a
 // chain of un-annotated aliases ending at a hole lambda's `const` (`fnFlowAliasLam`); `viaLet`
 // counts a `let` already behind. -1 for none, a loud refusal past the table's longest chain.
@@ -12702,24 +12663,28 @@ function monoWritesOf(key: string, d: i32): i32[] {
   monoDeclWrites.get(monoDeclCanon(d)) ?? none
 }
 
-// Re-spells callee `calleeIx` as the un-annotated `const` binding of a lambda the flow table says
-// its chain of un-annotated `const` aliases ends at (`fnFlowRespellLam`), when the call reads that
-// binding unshadowed. The chain may live in an enclosing frame, read as a capture (D3825).
-function monoRespellToLam(calleeIx: i32, ctx: i32) {
+// The lambda a call through callee `calleeIx` reaches, where the flow table says its chain of
+// un-annotated `const` aliases ends at a lambda's un-annotated `const` binding
+// (`fnFlowRespellLam`), possibly in an enclosing frame (D3825); -1 for none. A non-capturing
+// lambda's call is pointed at the lambda's own function, which no binding can shadow.
+function monoRespellLamFe(calleeIx: i32, ctx: i32): i32 {
   const cal = P.nodes[calleeIx]
-  if !(cal is Ident) { return 0 }
-  if identClosureFeAt(sidOfNode(calleeIx), ctx, calleeIx) >= 0 { return 0 }
-  const si = monoDeclCopyIn(fnFlowRespellLam(calleeIx), ctx)
-  if si < 0 { return 0 }
-  const sd = P.nodes[si]
-  if !(sd is LetDecl) { return 0 }
-  // The lambda's name must read the same binding where the call is, not a shadow of it.
-  if monoLetFrameOf(sd.letName, calleeIx, ctx)[1] != si { return 0 }
+  if !(cal is Ident) { return -1 }
+  if identClosureFeAt(sidOfNode(calleeIx), ctx, calleeIx) >= 0 { return -1 }
+  const sf = monoDeclFrameIn(fnFlowRespellLam(calleeIx), ctx)
+  if sf[1] < 0 { return -1 }
+  const sd = P.nodes[sf[1]]
+  if !(sd is LetDecl) || sd.letInit < 0 { return -1 }
+  const fe = fieldValueFeOfIn(sd.letInit, sf[0])
+  if fe < 0 || !criFnIsAnonLambda(fe) { return -1 }
+  if captureCountOf(fe) > 0 { return fe }
+  const name = monoSlotName(fe)
+  if name == "" || name == cal.identName { return fe }
   collectANoteIdentRename(cal.identName)
-  cal.identName = sd.letName
+  cal.identName = name
   monoArenaTouch()
-  sidNoteNodeName(calleeIx, si)
-  0
+  sidNoteNodeName(calleeIx, fnStmts[fe])
+  fe
 }
 
 // Walk the statement/expression tree at `ix` (inside function `ctx`, -1 = top level) and
@@ -12785,13 +12750,15 @@ function monoWalk(ix: i32, ctx: i32) {
       let wlAt = n.callFn
       let wlFr = ctx
       if fe < 0 {
-        // A call through a `const` alias of a lambda's `const` binding is a call through
-        // that binding, so it is re-spelled to it and instantiated per call alike (D2896).
-        monoRespellToLam(n.callFn, ctx)
+        // A call through a `const` alias of a lambda's `const` binding calls that lambda, and is
+        // instantiated per call alike (D2896).
+        let afe = monoRespellLamFe(n.callFn, ctx)
         // A direct call through a value binding to a generic named function: resolve it
         // to the lifted slot and monomorphize per call site. Named functions only, and
         // re-read rather than reused from `dfe`, the coercion loop between having run.
-        let afe = identClosureFeAt(sidOfNode(n.callFn), ctx, n.callFn)
+        if afe < 0 {
+          afe = identClosureFeAt(sidOfNode(n.callFn), ctx, n.callFn)
+        }
         // An alias renamed to one frame instance of a generic still calls the generic: each
         // call through it takes its own instance (D3887).
         if afe >= 0 && afe < fnInstOrigin.length && fnInstOrigin[afe] >= 0 {
