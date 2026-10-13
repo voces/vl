@@ -11,7 +11,8 @@
 //              agreement, a multi-pin class against mono's own refusal, an undecided
 //              return, and the two disagreements that were silent wrong code.
 //   identity — armed and disarmed compiles emit the same bytes and the same diagnostics.
-//   off      — disarmed, the table records no row and does no work.
+//   off      — disarmed, the table records no row, and a program with no generic does no work
+//              (the monomorphizer builds it, armed or not, whenever a generic exists).
 //
 // The cost bound is the `fn-flow` pair in tests/vl_scaling_shape_test.ts.
 //
@@ -163,14 +164,22 @@ Deno.test({
 });
 
 Deno.test({
-  name: "fn-flow shadow: disarmed, it records no row and does no work",
+  name: "fn-flow shadow: disarmed, it records no row, and does no work without a generic",
   ignore,
   fn() {
     for (const [name, src] of CASES) {
       const off = compile(src, OFF);
-      if (off.rows.size !== 0 || off.work !== 0) {
-        throw new Error(`${name}: want no rows and work 0 disarmed, got ${show(off.rows)} work ${off.work}`);
+      if (off.rows.size !== 0) {
+        throw new Error(`${name}: want no rows disarmed, got ${show(off.rows)}`);
       }
+    }
+    const plain = compile(`const inc = (x: i32): i32 => x + 1\nprint(inc(2))\n`, OFF);
+    if (plain.rows.size !== 0 || plain.work !== 0) {
+      throw new Error(`generic-free: want no rows and work 0, got ${show(plain.rows)} work ${plain.work}`);
+    }
+    const generic = compile(AGREE, OFF);
+    if (generic.work === 0) {
+      throw new Error("AGREE: want the table built disarmed (work > 0), got work 0");
     }
   },
 });
