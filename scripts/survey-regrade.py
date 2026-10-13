@@ -67,6 +67,7 @@ indented too, and a block with no label is not a measurement.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -168,7 +169,10 @@ def run_shell(cmd):
     claim about the toolchain wearing a claim about the tree.
     """
     env = dict(os.environ, PYTHON=sys.executable)
-    p = subprocess.run(cmd, shell=True, cwd=ROOT, capture_output=True, text=True,
+    # The blocks are POSIX shell; Windows' `shell=True` is cmd.exe, so run them under bash there
+    # (by PATH: a bare "bash" resolves to System32's, which is WSL's).
+    argv = [shutil.which("bash") or "bash", "-c", cmd] if os.name == "nt" else cmd
+    p = subprocess.run(argv, shell=os.name != "nt", cwd=ROOT, capture_output=True, text=True,
                        timeout=600, env=env)
     if p.returncode != 0:
         return None, "command exited %d: %s" % (p.returncode,

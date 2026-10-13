@@ -9,6 +9,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -34,7 +35,7 @@ Deno.test({
   name: "vl-check-dir: walks recursively, aggregates a multi-file summary, skips SKIP_DIRS",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_dir_" });
+    const dir = await makeTempDir({ prefix: "vl_check_dir_" });
     try {
       await Deno.writeTextFile(`${dir}/a.vl`, "print(1)\n");
       await Deno.mkdir(`${dir}/sub`);
@@ -64,7 +65,7 @@ Deno.test({
   name: "vl-check-dir: a type error under the tree fails the run",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_dir_" });
+    const dir = await makeTempDir({ prefix: "vl_check_dir_" });
     try {
       await Deno.writeTextFile(`${dir}/ok.vl`, "print(1)\n");
       await Deno.writeTextFile(`${dir}/bad.vl`, "let q: string = 5\n");
@@ -89,7 +90,7 @@ Deno.test({
   name: "vl-check-dir: --exclude gates a subtree and a basename glob",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_dir_" });
+    const dir = await makeTempDir({ prefix: "vl_check_dir_" });
     try {
       await Deno.writeTextFile(`${dir}/a.vl`, "print(1)\n");
       await Deno.mkdir(`${dir}/sub`);
@@ -121,7 +122,7 @@ Deno.test({
   name: "vl-check-dir: no path defaults to the current directory",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_dir_" });
+    const dir = await makeTempDir({ prefix: "vl_check_dir_" });
     try {
       await Deno.writeTextFile(`${dir}/only.vl`, "print(42)\n");
       const { code, stderr } = await new Deno.Command(VL, {

@@ -16,6 +16,7 @@
 //
 // @test-timing native
 
+import { filePath } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const CASES = new URL("./cases/", import.meta.url);
@@ -65,7 +66,7 @@ for (const rel of CASES_LIST) {
     name: `native-gc: ${rel} — every $VL_GC collector reproduces @log`,
     ignore: !ENABLED,
     fn: async () => {
-      const srcPath = new URL(rel, CASES).pathname;
+      const srcPath = filePath(new URL(rel, CASES));
       const want = logsOf(Deno.readTextFileSync(new URL(rel, CASES)));
       const tmp = await Deno.makeTempDir();
       try {

@@ -696,7 +696,15 @@ on top of the dynamic-step work — but it must REQUIRE the step, because the in
 default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
 the trap: it looks like the i32 loop and its count is not a property of the source.
 
-### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — raised 2026-09-06
+### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
+
+**Ruling (owner, 2026-10-12, spec Q3): (a) for now, (c) as the later target.** A null-only
+list literal with no destination that names its element type is a check error: "a list of only
+`null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`". Every typed
+destination (annotated binding, typed parameter, annotated return, record field, nested
+`[[null]]` under one) is unaffected, as is `[null, 42]`. Built; D1832 closed as a check reject.
+(c), inferring the element from the first non-null use, is on ROADMAP.md and not built.
+
 
 `const e = [null]` infers **`null[]`** — pinned by forcing it into a diagnostic, which reads
 `cannot assign null[] to 'bad' of type i32` — and every use of one refuses at the LITERAL with
@@ -1596,6 +1604,15 @@ all three rungs — so the flag is a convenience over an existing route, not the
 **Filing note.** This had been ruled in conversation before and never written down, which is the
 exact failure mode this index exists to catch; it resurfaced as an open blocker on the workboard.
 Recorded here and in `DECISIONS.md`.
+
+**RE-OPENED FOR THE OWNER 2026-10-11 (lane PF, diderven DV-1000/DV-1001).** New evidence:
+V8 scales its own wasm inlining budget by the module's share of small functions, so after
+`-O3` strips VL's small stubs, a helper binaryen leaves alone is often inlined by nobody.
+This is why `-O3` measures slower than the default on both DV kernels. Measurements and four
+options are in `docs/internals/perf/v8-inline-budget-2026-10.md`. The recommendation is
+`--flexible-inline-max-function-size 40` in `RELEASE_PASSES` (+5.7% on the compiler at
+`-O3`, +2.9% on diderven's game, DV-1000 at `-O3` 1.5x faster). The flag ruled here has
+never been built.
 
 ### `N5-variance-defaults-and-surface` (workboard C8) — RULED 2026-08-18: inferred, no surface
 

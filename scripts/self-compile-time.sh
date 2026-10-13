@@ -23,9 +23,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# The self-compile's collector is a CHOICE, not the size heuristic's accident: pinned so the
+# The self-compile's collector is a CHOICE, not the default's accident: pinned so the
 # committed baseline always prices the same collector (DECISIONS.md, "The compiler's
-# collector is picked by the size of the entry file").
+# collector is copying by default").
 export VL_COMPILE_GC=null
 SEED="${SEED:-build/vl-compiler.wasm}"
 SRC="${SRC:-compiler/entry.vl}"

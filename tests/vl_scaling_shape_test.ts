@@ -24,9 +24,11 @@
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Five are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Eight are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
-// `in-function value writes` and the two `if joins` pairs. The CPU readings quoted
+// `in-function value writes`, the two `if joins` pairs, `nested inline record types across
+// functions (fuel)`, `record-parameter field calls` and `closure arguments in one function`.
+// The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
@@ -56,6 +58,63 @@ const genFunctions = (nf: number, ns: number): string => {
   o.push("let acc = 0");
   for (let i = 0; i < 40; i++) o.push(`acc = acc + f${i}(${i % 5})`);
   o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// `genFunctions` with a `??` over an object-literal default in the module, which is what
+// switches on the anon-leaf narrow-use pass (compiler/emit_collect.vl). That pass asks each
+// function with parameters about its own name; asked by scanning the arena, it is
+// functions x identifiers.
+const genFamilyFunctions = (nf: number, ns: number): string =>
+  [
+    "type Pt = { x: i32 }",
+    "function src(k: i32): Pt | null { if k > 0 { return null } { x: k } }",
+    "const fam = src(1) ?? { x: 2 }",
+    genFunctions(nf, ns).replace("let acc = 0", "let acc = fam.x"),
+  ].join("\n");
+
+// `n` functions that each call a closure field of their record parameter, each called once.
+// Resolving `b.get()` follows the parameter to its call sites' arguments, so a lookup that
+// scans every call in the arena for them is functions x calls.
+const genParamFieldCalls = (n: number): string => {
+  const o: string[] = ["type Box = { get: () => i32 }"];
+  for (let i = 0; i < n; i++) o.push(`function f${i}(b: Box): i32 { b.get() + ${i % 13} }`);
+  o.push("const bx: Box = { get: () => 3 }", "let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(bx)`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// One function passing the same local closure to a higher-order function `n` times.
+// `monomorphize` asks, at each call, whether the argument is a capture of the frame, and the
+// answer walks the whole frame, so an unmemoised capture set is calls x body.
+const genClosureArgCalls = (n: number): string => {
+  const o: string[] = [
+    "function apply(x: i32, f: (v: i32) => i32): i32 { f(x) }",
+    "function run(k: i32): i32 {",
+    "  let acc = 0",
+    "  const g = (v: i32): i32 => v + k",
+  ];
+  for (let i = 0; i < n; i++) o.push(`  acc = acc + apply(${i % 7}, g)`);
+  o.push("  acc", "}", "print(run(3))");
+  return o.join("\n") + "\n";
+};
+
+// `n` calls whose string result is classified, through a callee taking a `w`-field record
+// (`wide`) or a one-field one. Both arms declare both records, so only the callee's signature
+// width differs; a signature key re-derived per call is calls x width x width.
+const genSigWidthCalls = (n: number, w: number, wide: boolean): string => {
+  const o: string[] = [
+    "type Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: f64`).join(", ") + " }",
+    "type Narrow = { f0: f64 }",
+    'function f(p: Wide): string { "a" }',
+    'function g(p: Narrow): string { "a" }',
+    "const qw: Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: ${i}.5`).join(", ") + " }",
+    "const qn: Narrow = { f0: 1.5 }",
+    'let acc = ""',
+  ];
+  for (let i = 0; i < n; i++) o.push(`acc = acc + ${wide ? "f(qw)" : "g(qn)"}`);
+  o.push("print(acc.length)");
   return o.join("\n") + "\n";
 };
 
@@ -150,6 +209,17 @@ const genCallSites = (n: number, k: number): string => {
   return o.join("\n") + "\n";
 };
 
+// EXPORTS: N functions in the entry file, every one `export`-marked, against N/K of them. Both
+// arms declare and call the same N functions; only the size of the export table differs.
+const genExports = (n: number, k: number): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const ex = i % k === 0 ? "export " : "";
+    o.push(`${ex}function f${i}(x: i32): i32 { if x > ${i} { x * ${i} + f${i > 0 ? i - 1 : 0}(x - 1) } else { x + ${i} } }`);
+  }
+  return o.join("\n") + "\n";
+};
+
 // CALLBACK SLOTS: N higher-order functions each taking a callback, against N/K taking the
 // same N callbacks over K call sites each. Both arms declare N callbacks and place N call
 // sites; only the number of function-TYPED PARAMETER SLOTS differs, and that is the entity
@@ -217,6 +287,20 @@ const genPins = (n: number, many: boolean): string => {
     o.push(`acc = acc + ${many ? "idg" : `idm${i}`}(p${i}).w${i}`);
     fill(o, i, 30);
   }
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// GENERIC FIRST INSTANCES against plain twins: N generics instantiated once each, so every
+// instance is a FIRST one and replaces its template's `fnStmts` slot, against the same N
+// functions written at `i32`. Both arms emit N one-expression functions.
+const genFirstInsts = (n: number, many: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(many ? `function g${i}<T>(x: T): T { x }` : `function g${i}(x: i32): i32 { x }`);
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + g${i}(${i % 97})`);
   o.push("print(acc)");
   return o.join("\n") + "\n";
 };
@@ -350,7 +434,7 @@ const genReturnChain = (k: number): string => {
 //
 // A RUNTIME pair (the string-append axes, the control) is graded on the child's CPU, because
 // fuel meters only the compiler: that cost lands in the emitted program, which runs unmetered.
-type Cost = { wall: number; cpu: number; fuel: number };
+type Cost = { wall: number; cpu: number; fuel: number; alloc: number };
 
 // `times`' SECOND line is the shell's reaped children — this spawn's `vl` and nothing
 // else, the shell's own cost being the first line. A POSIX builtin, so this needs no
@@ -364,12 +448,21 @@ const childCpu = (out: string): number => {
   return s;
 };
 
-const spawn = async (what: string, argv: string[], fuel: boolean): Promise<Cost> => {
+const spawn = async (
+  what: string,
+  argv: string[],
+  fuel: boolean,
+  extra: Record<string, string> = {},
+): Promise<Cost> => {
   const t0 = Date.now();
-  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` };
+  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...extra };
   if (fuel) env.VL_FUEL = "1";
-  const { code, stdout, stderr } = await new Deno.Command("/bin/sh", {
-    args: ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
+  // Windows has no `times` that sees a native child's CPU: cpu-times.ps1 prints the same line.
+  const win = Deno.build.os === "windows";
+  const { code, stdout, stderr } = await new Deno.Command(win ? "powershell" : "/bin/sh", {
+    args: win
+      ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${ROOT}/tests/support/cpu-times.ps1`, VL, ...argv]
+      : ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
     stdout: "piped",
     stderr: "piped",
     env,
@@ -381,11 +474,44 @@ const spawn = async (what: string, argv: string[], fuel: boolean): Promise<Cost>
   if (fuel && !m) {
     throw new Error(`vl ${what} printed no \`[fuel]\` line: this host predates $VL_FUEL; rebuild scripts/vl-host`);
   }
-  return { wall, cpu: childCpu(new TextDecoder().decode(stdout)), fuel: m ? Number(m[1]) : 0 };
+  const a = err.match(/^\[alloc\] guest: (\d+)$/m);
+  return {
+    wall,
+    cpu: childCpu(new TextDecoder().decode(stdout)),
+    fuel: m ? Number(m[1]) : 0,
+    alloc: a ? Number(a[1]) : 0,
+  };
 };
 
 const build = (src: string, out: string): Promise<Cost> =>
   spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true);
+
+// A build under the NULL collector, which never frees, so its `[alloc]` line is every byte the
+// compile allocated — the quantity the null collector's 4 GiB heap caps. The reading is the
+// process's resident growth, and a process that first compiled the seed for this engine reuses
+// the memory that compile freed, reading up to ~30 MB low; one warm build per file run first.
+let nullWarm: Promise<Cost> | null = null;
+const buildNull = async (src: string, out: string): Promise<Cost> => {
+  nullWarm ??= (async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_warm_" });
+    try {
+      Deno.writeTextFileSync(`${dir}/w.vl`, "print(1)\n");
+      return await spawn("the warm-up build", ["build", `${dir}/w.vl`, "-o", `${dir}/w.wasm`, "--compiler", COMPILER], true, {
+        VL_COMPILE_GC: "null",
+      });
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  })();
+  await nullWarm;
+  const c = await spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true, {
+    VL_COMPILE_GC: "null",
+  });
+  if (!(c.alloc > 0)) {
+    throw new Error(`vl build on ${src} printed no \`[alloc]\` line: this host predates it; rebuild scripts/vl-host`);
+  }
+  return c;
+};
 
 // The floor on a RUNTIME pair's denominator keeps one spike on a sub-second arm from
 // dominating the quotient. A fuel pair has none: no spike can land on a count.
@@ -509,6 +635,46 @@ axis(
   (d) => twoFiles(d, genFunctions(1600, 20), genFunctions(80, 400)),
 );
 
+// Lane AL's pair: 1,200 functions with a parameter against 60, under a `??` family. Fuel reads
+// 1.06; master read 3.11, from `anonLeafNarrowUseMark` scanning every node for each function's
+// name. The calls pass literals, so the per-argument scans are not exercised here.
+axis(
+  "functions with parameters x identifiers",
+  2.0,
+  "A per-function question in `anonLeafNarrowUseMark` (compiler/emit_collect.vl) is scanning the arena instead of the resolver index.",
+  (d) => twoFiles(d, genFamilyFunctions(1200, 20), genFamilyFunctions(60, 400)),
+);
+
+// Lane HS's GROWTH pair, 2,400 functions against 600, so linear reads 4. Fuel reads 4.07;
+// master read 12.97, from `fieldClosureFeOfRecvRaw` scanning every `Call` for a parameter's
+// call sites where the callee-name index answers them directly.
+axis(
+  "record-parameter field calls",
+  5.1,
+  "`fieldClosureFeOfRecvRaw` (compiler/emit_classify.vl) is scanning the arena for a parameter's call sites instead of `callsOfCallee`.",
+  (d) => twoFiles(d, genParamFieldCalls(2400), genParamFieldCalls(600)),
+);
+
+// Lane HS's third pair, 1,600 calls against 400, so linear reads 4. Fuel reads 3.92; with the
+// capture memo unarmed in `monomorphize` it read 14.16, every call re-walking the frame.
+axis(
+  "closure arguments in one function",
+  5.0,
+  "`captureNamesOf` is re-walking a frame per query in `monomorphize`; is the pass still in `passKeepsCaptures` (compiler/emit_sections.vl)?",
+  (d) => twoFiles(d, genClosureArgCalls(1600), genClosureArgCalls(400)),
+);
+
+// Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
+// one. Fuel reads 3.38; the #3422 compiler read 6.17, from `sigKeyOfTy` and
+// `structIndexOfTypeName` re-deriving the callee's key per call where the type-registry
+// generation memo answers it once.
+axis(
+  "signature width x calls",
+  4.3,
+  "`sigKeyOfTy` or `structIndexOfTypeName` (compiler/emit_classify.vl) is re-deriving per call instead of reading its `tyRegGenNow` memo.",
+  (d) => twoFiles(d, genSigWidthCalls(2000, 64, true), genSigWidthCalls(2000, 64, false)),
+);
+
 // D2150's pair: a registry lookup that scans every registered set made the many arm
 // quadratic in the sets; the member-set index keeps it linear.
 axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
@@ -628,6 +794,16 @@ axis(
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
 
+// The entry file's export table: deduping the staged names and resolving each one's target
+// scanned per export. Fuel reads 1.01; master `4179e4b36` read 4.23 here, and 8x the fuel at
+// 20,000 exports.
+axis(
+  "exports",
+  2.5,
+  "The export staging (`compileSrc`, compiler/driver.vl) or `emitExportSection`'s tables (compiler/emit_sections.vl) are scanning per export.",
+  (d) => twoFiles(d, genExports(8000, 1), genExports(8000, 20)),
+);
+
 // Fuel reads 1.07, so the bar is the family default. It read 3.2 while `modIndexOfKey` and
 // `modRecomputePending` (compiler/driver.vl) scanned the module table by string compare once
 // per commit: a key is an absolute path, so that ratio also grew with the length of $TMPDIR
@@ -671,6 +847,17 @@ axis(
 // bar STAYS at the family default rather than tracking a number the harness cannot measure.
 axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
+
+// 1.73 (0.116G / 0.067G fuel) against master `b05991d98`'s 5.75 (0.385G): a first instance's
+// slot write retired `buildFnMap`'s whole banked prefix, so every instance re-classified every
+// function (D3761). Still super-linear in N through the other whole-program passes of
+// `monoRebuild` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
+axis(
+  "generic first instances",
+  2.5,
+  "`buildFnMap` re-classifies the whole program per first instance of a generic (D3761).",
+  (d) => twoFiles(d, genFirstInsts(200, true), genFirstInsts(200, false)),
+);
 
 // 0.78 / 0.91 / 0.86, against 36.51 / 2.82 / 12.95 on the pre-D1657 compiler — the axis the
 // family was blind to. Each covariant binding is one `covarValueWriteState` query, and every
@@ -1763,6 +1950,158 @@ axis(
   (d) => twoFiles(d, genNamedFnAliases(true), genNamedFnAliases(false)),
 );
 
+// ── allocation: the null collector's 4 GiB ───────────────────────────────────
+// These pairs pin the null collector, which never frees, so EVERYTHING the compiler
+// allocates counts against one 4 GiB heap. A per-entity
+// rebuild of a whole-program-sized table is invisible to fuel when the table is cheap to fill
+// and still costs the heap its full size each time: sunpa's `game.vl` (a 2 MB module graph
+// behind a small entry file) filled the heap and trapped the compiler, exit 70 (D3737). These
+// pairs grade the `[alloc]` line, the bytes a null-collector compile allocated, and are GROWTH
+// pairs: `n` against `n/4`, so linear reads under 4 (a fixed cost rides on both arms).
+const gradeAllocPair = async (
+  axis: string,
+  bar: number,
+  note: string,
+  mk: (dir: string) => [string, string],
+): Promise<number> => {
+  const dir = await Deno.makeTempDir({ prefix: `vl_scale_alloc_` });
+  try {
+    const [manySrc, oneSrc] = mk(dir);
+    const [m, o] = await Promise.all([
+      buildNull(manySrc, `${dir}/many.wasm`),
+      buildNull(oneSrc, `${dir}/one.wasm`),
+    ]);
+    const ratio = m.alloc / o.alloc;
+    const reading = `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${(o.alloc / 2 ** 20).toFixed(1)} MiB ` +
+      `(ratio ${ratio.toFixed(3)})`;
+    if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
+    if (ratio > bar) {
+      fail(
+        axis,
+        bar,
+        note,
+        reading,
+        "(The ratio is of what a null-collector compile allocated, which a table reset per entity " +
+          "multiplies even where fuel does not.)",
+      );
+    }
+    return ratio;
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
+  Deno.test({
+    name: `scaling shape: ${name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      await gradeAllocPair(name, bar, note, mk);
+    },
+  });
+
+// `n` functions, each with one `unit` of a shape whose name is its own, so the program's
+// symbol-id space grows with `n` as well.
+const genPerFunction = (n: number, unit: (u: number) => string[]): string => {
+  const o: string[] = [];
+  for (let f = 0; f < n; f++) o.push(`function f${f}(n: i32): i32 {`, "  let t = n", ...unit(f), "  t", "}");
+  o.push("let acc = 0");
+  for (let f = 0; f < Math.min(n, 40); f++) o.push(`acc = acc + f${f}(${f % 5})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+const loopUnit = (u: number) => [`  for v${u} in 0 to n { t = t + v${u} }`];
+const dupUnit = (u: number) => [
+  "  if t > 0 {",
+  `    const d${u} = t + 1`,
+  `    t = d${u}`,
+  "  } else {",
+  `    const d${u} = t + 2`,
+  `    t = d${u}`,
+  "  }",
+];
+const shapeUnit = (u: number) => [
+  `  const r${u}: { a${u}: { b${u}: i32 } } = { a${u}: { b${u}: t } }`,
+  `  t = t + r${u}.a${u}.b${u}`,
+];
+
+// D3737: each function's let/loop plan regrew its sid-indexed loop-variable heads from empty to
+// the program's symbol count. Reads 2.77; master `7529a4ea6` read 5.98.
+allocAxis(
+  "allocation: loop variables across functions",
+  4.5,
+  "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
+  (d) => twoFiles(d, genPerFunction(4000, loopUnit), genPerFunction(1000, loopUnit)),
+);
+
+// D3737: the same for the duplicate-binding heads. Reads 2.85; master `7529a4ea6` read 5.87.
+allocAxis(
+  "allocation: duplicate bindings across functions",
+  4.5,
+  "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
+  (d) => twoFiles(d, genPerFunction(4000, dupUnit), genPerFunction(1000, dupUnit)),
+);
+
+// D3737: the inline-shape intern's re-entrancy memo, keyed by the shape spelling's symbol id,
+// was dropped after each outermost intern and regrown to the whole id space by the next one.
+// Reads 2.51; master `7529a4ea6` read 8.73, and at 5,000 functions (706 KB) trapped the
+// compiler.
+allocAxis(
+  "allocation: nested inline record types across functions",
+  4.5,
+  "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
+  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
+// D3738: the same shape on FUEL. Every object literal scanned every struct row, field by field,
+// and the type section compared every row with every row for a prefix. Reads 4.61; master
+// `42c4d4c10` read 11.97.
+axis(
+  "nested inline record types across functions (fuel)",
+  6,
+  "A struct-row question is scanning every row (`objLitNameCands`, `structPrefixCands`, compiler/emit_classify.vl; `repRowOfTyStruct`, compiler/emit_rep.vl).",
+  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
+// D3739: a fresh `const` at the top level asks which names the whole program uses other than as
+// a receiver, and a function's own fresh `const` between two of them used to make it walk the
+// program again. Reads 2.39; master `42c4d4c10` read 12.42.
+const genTopFreshConsts = (n: number): string => {
+  const o: string[] = [];
+  for (let f = 0; f < n; f++) {
+    o.push(`function f${f}(n: i32): i32 {`, "  const p = { v: n }", "  p.v + 1", "}");
+    o.push("if true {", `  const a = { v: f${f}(1) }`, "  print(a.v)", "}");
+  }
+  return o.join("\n") + "\n";
+};
+allocAxis(
+  "allocation: top-level fresh consts between functions",
+  4.5,
+  "The program-wide sole-reference walk (`crValUseEnter`, compiler/typecheck.vl) is walking the program per `const`.",
+  (d) => twoFiles(d, genTopFreshConsts(2000), genTopFreshConsts(500)),
+);
+
+// D3740: a `.get` binding pins its annotation while the module is emitted, which appends to the
+// arena, and the re-seat use index was rebuilt, and its per-literal memo regrown, at the next
+// object literal. Reads 1.86; master `42c4d4c10` read 12.61, and at 800 functions filled the heap.
+const growUnit = (u: number) => [
+  "  let m: Map<i32, i32> = Map()",
+  "  m[n] = n",
+  "  const had = m.get(n)",
+  `  const p = { x: n, y: ${u} }`,
+  "  t = t + keep(p)",
+  "  if had != null { t = t + had }",
+];
+const genArenaGrowth = (n: number): string =>
+  "type A = { x: i32, y: i32 }\ntype B = { x: f64, y: f64 }\nfunction keep(a: A): i32 { a.x + a.y }\n" +
+  genPerFunction(n, growUnit);
+allocAxis(
+  "allocation: map reads beside object literals across functions",
+  4.5,
+  "The re-seat use index (`rsIxReady`, compiler/emit_classify.vl) is being rebuilt as the arena grows.",
+  (d) => twoFiles(d, genArenaGrowth(400), genArenaGrowth(100)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
@@ -1851,6 +2190,29 @@ Deno.test({
         "the fuel control did not red: 4,000 statements against 200 of the same came in under " +
           `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
           `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+      );
+    }
+  },
+});
+
+// THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
+// (reads about 5.5: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
+Deno.test({
+  name: "scaling shape: control — twenty times the work reds the allocation grader",
+  ignore: !ENABLED,
+  fn: async () => {
+    let red = "";
+    try {
+      await gradeAllocPair("allocation control", 2.5, "unreachable: the control exists to fail.", (d) =>
+        twoFiles(d, genStatements(4000), genStatements(200)));
+    } catch (e) {
+      red = String(e);
+    }
+    if (!red.includes("allocation control: the many-entity arm")) {
+      throw new Error(
+        "the allocation control did not red: 4,000 statements against 200 of the same came in " +
+          "under 2.5x the bytes allocated. The `[alloc]` reading has stopped measuring, so every " +
+          `allocation axis above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
       );
     }
   },

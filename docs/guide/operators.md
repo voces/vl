@@ -131,7 +131,7 @@ function lerp(a: f32): f32 { a * h + 7.0 }   // h is the f32 0.5 here
 const K = 7
 function take64(x: i64): i64 { x }
 print(take64(K) * 1000000000)                 // 7000000000 — K is an i64 7 here
-print(K * 1000000000)                         // -1589934592 — no context: an i32 7, which wraps
+print(K * 1000000000)                         // 7000000000 — a tree of constants is computed exactly
 ```
 
 A read the literal does not fit is the literal's own error there (`const B = 3000000000` read as
@@ -195,9 +195,30 @@ index) for a list, `s.includes(x)` for a string. It parses at the comparisons' p
 | --- | --- |
 | `&` `\|` `^` | and / or / xor |
 | `<<` | shift left |
-| `>>` | ARITHMETIC (sign-propagating) shift right — `-16 >> 2` is `-4` |
-| `>>>` | LOGICAL (zero-filling) shift right — `-16 >>> 28` is `15` |
+| `>>` | ARITHMETIC (signed, sign-propagating) shift right — `-16 >> 2` is `-4` |
+| `>>>` | LOGICAL (unsigned, zero-filling) shift right — `-16 >>> 28` is `15` |
 | `~` | bitwise not |
+
+### Unsigned shift / logical shift right: `>>>`
+
+VL has JavaScript's and Java's `>>>`: the unsigned shift right, also called the logical shift
+(Rust and C spell it `>>` on an unsigned type; Go on a `uint`). It shifts in
+zeros, where `>>` shifts in copies of the sign bit. It works on `i32` and `i64` alike, at the
+operand's own width, and has a compound form `>>>=`.
+
+```vl
+const h = -123456789
+print(h >> 13)              // -15071      the sign is copied in
+print(h >>> 13)             // 509217      zeros are shifted in
+print((h >> 13) & 0x7ffff)  // 509217      the same bits, written by hand
+const big: i64 = -1
+print(big >>> 60)           // 15
+```
+
+Masking an arithmetic shift down to its low `32 - k` bits (`64 - k` for an `i64`) is
+`>>>` spelled the long way. `vl check` points it out with the hint
+`shift-mask-is-logical-shift` wherever it can see that the shifted value is an `i32` or an
+`i64`.
 
 These are about BIT PATTERNS, so a float operand is refused: `1.0 & 2` is
 `operator '&' is integer-only, got f64 and i32`, and `~2.5` is
@@ -247,10 +268,15 @@ fourth, `as%`, cannot fail at all and has its own section below:
 | `x as T` | `T` | returns `null` from the enclosing function, which must return `\| null` |
 
 ```vl
-print(3.9 as? i32)                 // null — 3.9 is not an integer
-print(3.0 as? i32)                 // 3
-print(5000000000 as? i32)          // null — out of i32's range
+function toI32(d: f64): i32 | null { d as? i32 }
+print(toI32(3.9))                  // null — 3.9 is not an integer
+print(toI32(3.0))                  // 3
+print(toI32(5000000000.0))         // null — out of i32's range
 ```
+
+A cast of a constant that can never succeed is refused when the program is checked:
+`3.9 as? i32` is refused with "constant 3.9 is not a whole number, so `i32` cannot hold
+it — `as?` on it would be null on every run".
 
 A **fraction fails the same way an out-of-range value does** — a float-to-integer cast
 never rounds, so it needs an *exact* integer value. `2.5 as! i32` traps
@@ -337,36 +363,39 @@ const ok2 = a == 1
 ```
 
 Everything in the precedence ladder above continues a line — `|| && ?? == != < <= > >= + * / %`,
-the bitwise and shift operators, and assignment — along with `.`, `?.`, `is`, and the four `as`
-casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
+the bitwise and shift operators, assignment, and `-` with a space after it (below) — along with
+`.`, `?.`, `is`, and the four `as` casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
 `a` ⏎ `|| b` ⏎ `&& c` is `a || (b && c)`. Blank lines and comment lines between the two halves
 are free.
 
-**A leading `-` does not continue a line**, because `-x` is a legal statement and a block's last
-statement is its value:
+**A leading `-` continues a line only when a space or tab follows it.** `- x` is a subtraction
+from the line above; `-x`, with the minus touching its operand, is a statement of its own,
+because `-x` is a legal statement and a block's last statement is its value:
 
 ```vl
+const w = a * 3.0
+  - b * 3.5                // one expression: a * 3.0 - b * 3.5
+
 function f(): i32 {
   work()
   -x                       // the block's value is `-x`; NOT `work() - x`
 }
 ```
 
-Write the `-` at the end of the previous line, or parenthesize, to subtract across a break. The
-same holds for a line beginning with `!`, `(`, `[`, `{`, an identifier or a literal: each can
-start a statement, so each does. Inside an open `(`, `[` or object-literal `{` there is no
-statement a newline could end, so `-` continues there like everything else.
+A `-` at the very end of its line does not count as spaced: write the operand on the same
+line. A line beginning with `!`, `(`, `[`, `{`, an identifier or a literal can start a
+statement, so it does. Inside an open `(`, `[` or object-literal `{` there is no statement a
+newline could end, so `-` continues there with or without the space.
 
 `vl fmt` prints a chain it has to break with the operator at the START of each continuation
-line, one operand per line — except a chain with a `-` in it, which keeps every operator at the
-end of the line for the reason above:
+line, one operand per line, and always with a space after the operator:
 
 ```vl
 const label = prefix
   + ": "
   + describe(value)
 
-const span = end -
-  start +
-  padding
+const span = end
+  - start
+  + padding
 ```

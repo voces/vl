@@ -11,6 +11,7 @@
 //   deno test -A --no-check tests/lsp_semantic_tokens_test.ts
 // (also included in `deno task test`).
 
+import { filePath } from "./support/filePath.ts";
 import {
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
@@ -62,7 +63,7 @@ const decode = (data: number[]): Decoded[] => {
 // Seed-gated (mirrors tests/lsp_wasm_checker_test.ts): the wasm `tokensAt` must
 // classify identifiers variable / parameter / function.
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

@@ -165,6 +165,9 @@ import {
   MVK_I64,
   MVK_STR,
   RLK_UNION,
+  SYNTH_CLOSURE,
+  SYNTH_CONST_LIST,
+  SYNTH_EMPTY_BACKING,
   VKind,
   W,
   aTypeIdx,
@@ -193,9 +196,12 @@ import {
   caSeenVariants,
   capCacheOn,
   capMemoArmed,
+  cloLiftWriteCapAt,
+  cloLiftWriteCount,
   cloSigKeys,
   cloSigRepFn,
   cloSigTwin,
+  cloStructIdx,
   ctrlDepth,
   curBuf,
   declSlotByNode,
@@ -282,6 +288,7 @@ import {
   fsIdxAt,
   fsImportCount,
   fsUsedAt,
+  gAsFailDoms,
   gCellIdx,
   gConstExprEmit,
   gEmitNames,
@@ -299,6 +306,7 @@ import {
   gHeapGlobalIdx,
   gHeapLimit,
   gHeapUsed,
+  gHelpAsFail,
   gHelpF64Rem,
   gHelpInitFail,
   gHelpMapCompact,
@@ -338,6 +346,7 @@ import {
   gMapDeletes,
   gMaxMemPages,
   gMemLogIdx,
+  gNeedsAsFail,
   gNeedsF32Print,
   gNeedsF64Print,
   gNeedsF64Rem,
@@ -352,6 +361,11 @@ import {
   gStrDataStart,
   gStrPoolIx,
   gStrPoolTexts,
+  gSynthArg,
+  gSynthAt,
+  gSynthBase,
+  gSynthInit,
+  gSynthKind,
   genTyParamNames,
   genTyParamSeen,
   globalIndexBySid,
@@ -363,6 +377,7 @@ import {
   il64TypeIdx,
   lTypeIdx,
   lUsed,
+  liftWbEnd,
   localBlockLet,
   localByNode,
   localDeclIx,
@@ -539,12 +554,14 @@ import {
   fbLoop,
   fbMapSlotOf,
   fbMapTagOfI64,
+  fbPushRetExtra,
   fbRefAsNonNull,
   fbRefCast,
   fbRefNull,
   fbRefNullForKind,
   fbRefNullNone,
   fbRefNullStruct,
+  fbRetExtra,
   fbReturn,
   fbSelect,
   fbStrBack,
@@ -573,6 +590,7 @@ import {
   wRangeEq,
   wSLEB,
   wSection,
+  wSectionPartsAt,
   wSectionRope,
   wTarget,
   wU8,
@@ -597,6 +615,7 @@ import {
   bodyEndsInReturn,
   callIsPushKind,
   callPushBits,
+  callsByCalleeReset,
   capNarrowBuild,
   capNarrowRecordFrame,
   capNarrowSeed,
@@ -676,6 +695,7 @@ import {
   retStructRowIndex,
   retVariantFlag,
   rlSlotByName,
+  rowBoolI32Agree,
   rsResetUseIx,
   sFieldTypeAt,
   scopePop,
@@ -686,7 +706,10 @@ import {
   sidResetGlobalDestIx,
   sidResetStartBlockLet,
   structEmitOrder,
+  structPrefixCands,
   tyAnnRefListSlot,
+  tyRegMemoReset,
+  typeDeclNameIxReset,
   uFieldStorageSlot,
   uVarSTwinAt,
   unionRegistryABSweep,
@@ -695,6 +718,8 @@ import {
   vtKindOfParam,
   vtKindOfType,
 } from "./emit_classify"
+import { callBindShadowBegin } from "./call_bind_shadow"
+import { cloLiftScan, cloLifted } from "./emit_lift"
 import {
   buildFnMap,
   collectA,
@@ -738,6 +763,7 @@ import {
   dispatchRewrite,
   foldMemShared,
   loopValueRewrite,
+  nulScalarSplit,
   shadowRespell,
   synthExternValues,
   synthNulListRetAnns,
@@ -776,6 +802,7 @@ import {
   mvValsWrapOf,
   sFieldStorageSlot,
   strAccScanStart,
+  stubWriteRhsReset,
   userGlobalIdx,
 } from "./wasmEmit"
 import { strListHas } from "./listutil"
@@ -1146,6 +1173,14 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     uBoxNewEnd = -1
     tailCallEnd = -1
     tailCallIdx = -1
+    liftWbEnd = -1
+    // Every exit of a lifted function that assigns captures hands them back (D3664).
+    fbRetExtra = []
+    let rxi = 0
+    while rxi < cloLiftWriteCount(fnPos) {
+      fbRetExtra.push(1 + cloLiftWriteCapAt(fnPos, rxi))
+      rxi = rxi + 1
+    }
     // Lays out every scratch frame after the params + declared locals via the FuncBuilder cursor,
     // which sets `pushScratchBase`/`refPushScratchBase`/`refPushBaseBySlot`/`strPushScratchBase`/
     // `strScratchBase`/`mapScratchBase` from one running offset in frame order. Scratch frames
@@ -1232,6 +1267,8 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
       fbLocalGet(unionSinkBase + 1)
       fbStructNew(uBoxIdx)
     }
+    fbPushRetExtra()
+    fbRetExtra = []
     fbEnd() // 0x0b end
     wTarget(endPrev)
     // Stream the size-prefixed code entry onto `out` (this entry's own buffer, which
@@ -4175,6 +4212,82 @@ function emitInitFailFnCode(out: u8[]) {
   helpFrameBody(out, body)
 }
 
+// Prints local `x`, a non-negative i32, in decimal: `p` climbs to x's leading power of ten,
+// then each digit is `x / p % 10` as `p` falls back to zero. Local `p` is scratch.
+function emitAsFailDecimal(x: i32, p: i32) {
+  fbI32Const(1)
+  fbLocalSet(p)
+  fbLoop(64)
+  fbLocalGet(x)
+  fbLocalGet(p)
+  fbI32Bin(110) // 0x6e i32.div_u
+  fbI32Const(10)
+  fbI32Bin(79) // 0x4f i32.ge_u
+  fbIf(64)
+  fbLocalGet(p)
+  fbI32Const(10)
+  fbI32Bin(108) // 0x6c i32.mul
+  fbLocalSet(p)
+  fbBr(1)
+  fbEnd()
+  fbEnd()
+  fbLoop(64)
+  fbLocalGet(x)
+  fbLocalGet(p)
+  fbI32Bin(110) // 0x6e i32.div_u
+  fbI32Const(10)
+  fbI32Bin(112) // 0x70 i32.rem_u
+  fbI32Const(48)
+  fbI32Bin(106) // 0x6a i32.add
+  fbCall(2) // __print_char__ (import 2)
+  fbLocalGet(p)
+  fbI32Const(10)
+  fbI32Bin(110) // 0x6e i32.div_u
+  fbLocalTee(p)
+  fbBrIf(0)
+  fbEnd()
+  0
+}
+
+// `__as_fail__(line, colRow)`: prints "as! <domain> at <line>:<col>: not exact" and returns;
+// each site then traps, so a reason costs a site one call rather than a call per character.
+function emitAsFailFnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(1) // one locals run
+  wULEB(1) // p
+  wU8(127) // 0x7f i32
+  emitInitFailText("as! ")
+  let k = 0
+  while k < gAsFailDoms.length {
+    fbLocalGet(1)
+    fbI32Const(7)
+    fbI32Bin(113) // 0x71 i32.and
+    fbI32Const(k)
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+    emitInitFailText(gAsFailDoms[k])
+    fbEnd()
+    k = k + 1
+  }
+  fbLocalGet(0)
+  fbIf(64)
+  emitInitFailText(" at ")
+  emitAsFailDecimal(0, 2)
+  emitInitFailText(":")
+  fbLocalGet(1)
+  fbI32Const(3)
+  fbI32Bin(118) // 0x76 i32.shr_u
+  fbLocalSet(1)
+  emitAsFailDecimal(1, 2)
+  fbEnd()
+  emitInitFailText(": not exact")
+  fbCall(3) // __print_str_flush__ (import 3)
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // —— scalar list views (D3028) ——
 // A view of pair `p` is `{back, len, cap, src}`, a final subtype of its destination's wrapper:
 // the first three fields a snapshot the sync helper refreshes, `src` the list it reads through.
@@ -5086,6 +5199,7 @@ function emitNameSection(n: i32) {
   if gHelpInitFail >= 0 { count = count + 1 }
   count = count + svHelperCount()
   count = count + rvHelperCount()
+  if gHelpAsFail >= 0 { count = count + 1 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -5235,6 +5349,10 @@ function emitNameSection(n: i32) {
   }
   svHelperNames()
   rvHelperNames()
+  if gHelpAsFail >= 0 {
+    wULEB(gHelpAsFail)
+    wName("__as_fail__")
+  }
   wTarget(mapPrev)
 
   // ── assemble the section payload: wName("name") + the two subsections ─────────
@@ -5550,12 +5668,24 @@ function emitModule(_stmts: i32[]) {
     gHelpRvLen = helpBase + nHelpers + 2
     nHelpers = nHelpers + 3
   }
+  // The `as!` reason (SP-056), after them.
+  gHelpAsFail = -1
+  gAsFailDoms = []
+  if gNeedsAsFail {
+    gHelpAsFail = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
 
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
   // user-global index below rides `userGlobalIdx`).
   collectStrPool()
   // Placed by `emitGlobalSection`, which runs before any function body is emitted.
   gHeapGlobalIdx = -1
+  gSynthBase = -1
+  gSynthKind = []
+  gSynthArg = []
+  gSynthInit = []
+  gSynthAt = Map()
 
   // Heap-type indices, in type-section order: standalone structs, then (for the union path)
   // the variant structs + box, the i32 array/list pair, each ref-list pair, the string-list
@@ -5653,6 +5783,7 @@ function emitModule(_stmts: i32[]) {
   if buildCodePayload(codePayload, n, hasStart, memFn, nHelpers) < 0 {
     return -1
   }
+  frameGlobalSection()
 
   // Element section (id 9): one active segment per run of address-taken functions, filling
   // entry `gImports + i` with user function `i` — the index a closure id already holds, so
@@ -6078,7 +6209,10 @@ function scanPrintUse() {
         registerValueUnionName(tyToEmitName(nodeTyIxOf(pscan)))
       }
       if asExprNumFallible(pscan) || asExprHoleNumSad(pscan) {
-        if pn.asMode == "trap" { gImports = 4 }
+        if pn.asMode == "trap" {
+          gImports = 4
+          gNeedsAsFail = true
+        }
         if pn.asMode == "null" {
           registerValueUnionName(asExprNumTgtName(pscan) + "|null")
         }
@@ -6369,6 +6503,7 @@ function checkFnParams() {
 // `capMemoNoteEdit`. A pass joins only once that is true of everything it calls.
 function passKeepsCaptures(name: string): boolean {
   if name == "dispatchRewrite" { return true }
+  if name == "monomorphize" { return true }
   if name == "computeRetInference" { return true }
   name == "computeRetInference#2"
 }
@@ -6379,6 +6514,7 @@ function passKeepsCaptures(name: string): boolean {
 function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "foldMemShared" { return foldMemShared() }
   if name == "loopValueRewrite" { return loopValueRewrite(rootIx) }
+  if name == "nulScalarSplit" { return nulScalarSplit(rootIx) }
   if name == "collectTyParams" { return collectTyParamNames() }
   if name == "collectU" { return collectU(stmts) }
   if name == "collectS" { return collectS(stmts) }
@@ -6424,6 +6560,7 @@ function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "synthCaptureEmptyListAnns" { return synthCaptureEmptyListAnns() }
   if name == "synthCaptureReadAnns" { return synthCaptureReadAnns() }
   if name == "scanExprArmLocals" { return scanExprArmLocals() }
+  if name == "cloLiftScan" { return cloLiftScan() }
   emitFail("emitProgram: unknown pass in the pass table: " + name)
 }
 
@@ -6463,6 +6600,7 @@ export function emitProgram(rootIx: i32) {
   // helper INDEX is recomputed every compile while a surviving `true` would declare a
   // `__f64_rem__` this module's tail never emits. `scanPrintUse` writes it (D1586).
   gNeedsF64Rem = false
+  gNeedsAsFail = false
   gMapDeletes = false
   // The hole instances' bindings are read by passes that run before `monomorphize` refills
   // them, so an earlier program's rows would name another arena's types (D2921).
@@ -6482,6 +6620,9 @@ export function emitProgram(rootIx: i32) {
   modFcpSpillHit = false
   modIntMinMaxSeen = 0
   modIntMinMaxHit = false
+  typeDeclNameIxReset()
+  callsByCalleeReset()
+  tyRegMemoReset()
   // ── the arena-index sidecar reset (method note 7) ──
   // Every column below holds indices into the checker's `T.tys`, which a fresh program rebuilds
   // from scratch. Each also has its own reset inside the collect pass that clears the name
@@ -6583,6 +6724,7 @@ export function emitProgram(rootIx: i32) {
   // instance would arm it over the next program's whole pass table. See `anonLeafEmitPhase`.
   anonLeafEmitPhase = false
   emitArenaFinal = false
+  stubWriteRhsReset()
   if rootIx < 0 { return emitFail("emitProgram: empty arena (root index < 0)") }
   const root = P.nodes[rootIx]
   if root is Program {
@@ -6601,9 +6743,9 @@ export function emitProgram(rootIx: i32) {
     // mutates the arena runs before every pass that scans it (`dispatchRewrite`,
     // `captureBoxRewrite`, the synth-annotation passes, `monomorphize`); a pass needing a final arena runs after all of them; and a `#2` row re-scans what monomorphization's late-minted annotations invalidated.
     const passTable = [
-      "loopValueRewrite", "foldMemShared", "shadowRespell > foldMemShared",
-      "collectTyParams", "collectU > collectTyParams",
-      "collectS > collectU collectTyParams",
+      "loopValueRewrite", "nulScalarSplit > loopValueRewrite", "foldMemShared",
+      "shadowRespell > foldMemShared nulScalarSplit", "collectTyParams",
+      "collectU > collectTyParams", "collectS > collectU collectTyParams",
       "collectA > collectS collectTyParams", "assignValueSpill > shadowRespell",
       "collectFns > collectU collectS shadowRespell assignValueSpill",
       "checkTopLevel > collectFns", "buildFnMap > collectFns",
@@ -6637,6 +6779,7 @@ export function emitProgram(rootIx: i32) {
       "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
       "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
       "scanExprArmLocals > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
+      "cloLiftScan > capCacheBuild scanExprArmLocals",
     ]
     // synthVoidTwins mints the void twins for coerced function VALUES — after
     // mono (`fnStmts` positions are final; the twin table stores them) and
@@ -6650,6 +6793,7 @@ export function emitProgram(rootIx: i32) {
     // An instance's binding is read before `monomorphize` refills it (D3528), so the previous
     // program's must not survive into this one's early passes.
     monoSubTablesReset()
+    callBindShadowBegin()
     const passDone: string[] = []
     let pi = 0
     while pi < passTable.length {
@@ -6900,14 +7044,30 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
   if fn is FuncDecl {
     const params = fn.fnParams
     const nParams = params.length
+    // The captures a lifted function assigns are results after its own (D3664).
+    let liftCaps: string[] = []
+    let nRetCaps = 0
     wU8(96) // 0x60 func
     // When a function value exists module-wide, EVERY function carries a hidden
     // leading `structref env` param (local 0). The declared params follow at 1..p.
     // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
     // it. Gated on `fnValUsed` so a no-lambda module's functypes are unchanged.
     if withEnv {
-      wULEB(nParams + 1) // param count incl. the env param
-      wU8(107)           // env param: structref (0x6b)
+      // A lifted function's captures follow the env, in capture order (SP-037).
+      if cloLifted(ti) {
+        liftCaps = captureNamesOf(ti)
+        nRetCaps = cloLiftWriteCount(ti)
+      }
+      wULEB(nParams + 1 + liftCaps.length) // param count incl. the env param
+      wU8(107)                             // env param: structref (0x6b)
+      let lci = 0
+      while lci < liftCaps.length {
+        fbValtype(
+          captureValKind(ti, liftCaps[lci]),
+          captureValStructIdx(ti, liftCaps[lci]),
+        )
+        lci = lci + 1
+      }
     } else {
       wULEB(nParams) // param count
     }
@@ -6917,15 +7077,15 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
       pi = pi + 1
     }
     if fRetVoid[ti] == 1 {
-      wU8(0) // 0 results — a VOID function (`()->()`)
+      wU8(nRetCaps) // no result of its own — a VOID function (`()->()`)
     } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
       // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
-      wU8(1)
+      wU8(1 + nRetCaps)
       fbValtype("closure", -1)
     } else if fn.fnRet < 0 {
       // UN-ANNOTATED return: the INFERRED kind (computeRetInference set the same
       // stored `fRetKind` slot the annotation path fills). i32 when nothing matched.
-      wU8(1) // 1 result
+      wU8(1 + nRetCaps) // 1 result
       // The inferred result kind from the single shared mapping (`inferredRetKindCore`), so this
       // site and `cloRetValKind` cannot drift on a scalar/list/ref kind. The slot follows the kind:
       // struct index for a struct/nullable-struct ref, the element wrapper for a ref list, the map
@@ -6957,7 +7117,7 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
       }
       fbValtype(infKind, infSlot)
     } else {
-      wU8(1) // 1 result
+      wU8(1 + nRetCaps) // 1 result
       // A `T[]` return is kind 5 — its second `fbValtype` arg is the ref-list TABLE
       // SLOT for the element type (`retStructIndex` is -1 for a ref array), so the
       // result valtype selects THIS function's element wrapper, not slot 0's.
@@ -7002,6 +7162,12 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
         retSlot = nulVariantIndexOf(fn.fnRet)
       }
       fbValtype(vtKindOfType(fn.fnRet), retSlot)
+    }
+    let rci = 0
+    while rci < nRetCaps {
+      const rcName = liftCaps[cloLiftWriteCapAt(ti, rci)]
+      fbValtype(captureValKind(ti, rcName), captureValStructIdx(ti, rcName))
+      rci = rci + 1
     }
   }
 }
@@ -7052,17 +7218,26 @@ export function buildStructSupers() {
     if sTwin[c] == c {
       let best = -1
       let bestLen = 0
-      let p = 0
-      while p < sNames.length {
+      let bestAgrees = false
+      const ps = structPrefixCands(c, sNames.length)
+      let pi = 0
+      while pi < ps.length {
+        const p = ps[pi]
         if sTwin[p] == p {
           if structRowIsProperPrefix(p, c) {
-            if sFieldCount[p] > bestLen {
+            // Of two prefixes of one length, the one agreeing on `i32` against `boolean` (D3693).
+            const agrees = rowBoolI32Agree(p, c)
+            if (
+              sFieldCount[p] > bestLen
+              || (sFieldCount[p] == bestLen && agrees && !bestAgrees)
+            ) {
               best = p
               bestLen = sFieldCount[p]
+              bestAgrees = agrees
             }
           }
         }
-        p = p + 1
+        pi = pi + 1
       }
       if best >= 0 {
         sSuper[c] = best
@@ -7677,6 +7852,9 @@ function emitTypeSection(
   }
   svHelperFuncTypes()
   rvHelperFuncTypes()
+  if gHelpAsFail >= 0 {
+    helpFuncType("ii", "") // __as_fail__: (line, col << 3 | domain row) -> ()
+  }
   // The export-wrapper functypes last (#1265), one per export entry, each the target's own
   // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
   // `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift from the function it forwards to. Empty unless `fnValUsed`.
@@ -7919,7 +8097,7 @@ function emitFunctionSection(
     // with that `$fnsig` functype, so a `call_indirect $fnsig` reaching it passes the
     // engine's signature check (its ACTUAL type IS `$fnsig`). Others keep their own
     // functype. Only when `fnValUsed`. (Lambdas.)
-    if fnValUsed && fnSigIsClosure(fi) {
+    if fnValUsed && fnSigIsClosure(fi) && !cloLifted(fi) {
       wULEB(fnSigIdxOfFn(fi))
     } else {
       wULEB(typeOffset + fi) // functype index
@@ -7956,6 +8134,12 @@ function emitFunctionSection(
   0
 }
 
+// What `emitGlobalSection` leaves for `frameGlobalSection`: its entry count and bytes, and the
+// module rope chunk the section is framed before.
+let gGlobalFixedN = 0
+let gGlobalEntries: u8[] = []
+let gGlobalRopeAt = 0
+
 function emitGlobalSection() {
   if captureFoldedConsts() < 0 { return -1 }
   // Global section (id 6): one global per top-level `let`/`const`, in declaration
@@ -7983,13 +8167,18 @@ function emitGlobalSection() {
     nProg = 1
     gInitProgIdx = externGlobalCount() + np + nCells + nHeap
   }
+  // The synthetic constants trail everything, and the section is framed once the bodies that
+  // mint them are built (`frameGlobalSection`), at this point of the module.
+  gSynthBase = externGlobalCount() + np + nCells + nHeap + nProg
+  gGlobalFixedN = nCells + np + nHeap + nProg
+  gGlobalRopeAt = W.chunks.length
+  gGlobalEntries = []
   if nCells + np + nHeap + nProg > 0 {
-    const globalPayload: u8[] = []
+    const globalPayload: u8[] = gGlobalEntries
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
-    // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
-    // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
+    // each entry's valtype (`fbValtype`), mutability flag, and init constexpr (`fb*`
+    // opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(nCells + np + nHeap + nProg)
     // The string-literal pool first (indices 0..np-1, before the user cells): each entry an
     // immutable non-null string ref whose init constexpr builds the literal once
     // (`array.new_fixed` for the packed backing, then `struct.new` for the header) — every
@@ -8099,9 +8288,41 @@ function emitGlobalSection() {
       fbEnd()
     }
     wTarget(gPrev)
-    wSection(6, globalPayload)
   }
   0
+}
+
+// Frames the global section at the place `emitGlobalSection` left for it: its entries, then
+// one immutable global per synthetic constant the bodies minted, in minting order.
+function frameGlobalSection() {
+  const n = gGlobalFixedN + gSynthKind.length
+  if n == 0 { return 0 }
+  const countBuf: u8[] = []
+  const synthBuf: u8[] = []
+  const prev = wTarget(countBuf)
+  wULEB(n)
+  wTarget(synthBuf)
+  let i = 0
+  while i < gSynthKind.length {
+    let ty = cloStructIdx
+    if gSynthKind[i] != SYNTH_CLOSURE { ty = gSynthArg[i] }
+    wU8(100) // 0x64 (ref $ty), non-null
+    wSLEB(ty)
+    wU8(0)   // immutable
+    if gSynthKind[i] == SYNTH_EMPTY_BACKING {
+      fbArrayNewFixed(ty, 0)
+    } else if gSynthKind[i] == SYNTH_CONST_LIST {
+      wBytes(gSynthInit[i])
+    } else {
+      fbRefNullStruct()
+      fbI32Const(gImports + gSynthArg[i])
+      fbStructNew(ty)
+    }
+    fbEnd()
+    i = i + 1
+  }
+  wTarget(prev)
+  wSectionPartsAt(gGlobalRopeAt, 6, [countBuf, gGlobalEntries, synthBuf])
 }
 
 // Lowers the initializer of the constexpr cell at `globalStmts` position `gi` into `buf`, under
@@ -8256,53 +8477,61 @@ function captureFoldedConsts(): i32 {
   0
 }
 
-// The `fnStmts` slot an export TARGET name resolves to — the FIRST slot carrying it — or
-// -1. The module's ABI resolution, in one place: #1260's `monoFirstFnIndexNamed` mirrors
-// this same rule inside the monomorphizer, and four sections now depend on it agreeing.
-function exportSlotOfTarget(name: string): i32 {
+// The first `fnStmts` slot carrying each function name — the slot an export TARGET resolves
+// to. The module's ABI resolution in one place: #1260's `monoFirstFnIndexNamed` mirrors the
+// same FIRST-slot rule inside the monomorphizer, and four sections depend on it agreeing.
+function fnFirstSlotByName(): {[string]: i32} {
+  const first: {[string]: i32} = Map()
   let tj = 0
   while tj < fnStmts.length {
     const tfn = P.nodes[fnStmts[tj]]
     if tfn is FuncDecl {
-      if tfn.fnName == name { return tj }
+      if !first.has(tfn.fnName) { first[tfn.fnName] = tj }
     }
     tj = tj + 1
   }
-  -1
+  first
 }
 
-// The PUBLIC names the export section publishes, in section order: every alias-table
-// entry whose target resolves, minus duplicates (a wasm export name must be unique, and
-// a repeated public name keeps its FIRST entry).
-function exportPublicNames(): string[] {
-  const nms: string[] = []
+// The alias-table rows the export section publishes, in section order: every entry whose
+// target resolves, minus duplicates (a wasm export name must be unique, and a repeated
+// public name keeps its FIRST entry). `first` is `fnFirstSlotByName()`.
+function exportPublishedRows(first: {[string]: i32}): i32[] {
+  const rows: i32[] = []
+  const seen: {[string]: boolean} = Map()
   let rxi = 0
   while rxi < reExpName.length {
-    if (
-      exportSlotOfTarget(reExpTarget[rxi]) >= 0
-      && !strListHas(nms, reExpName[rxi])
-    ) {
-      nms.push(reExpName[rxi])
+    if (first[reExpTarget[rxi]] ?? -1) >= 0 && !seen.has(reExpName[rxi]) {
+      seen[reExpName[rxi]] = true
+      rows.push(rxi)
     }
     rxi = rxi + 1
+  }
+  rows
+}
+
+// The PUBLIC names the export section publishes, in section order.
+function exportPublicNames(): string[] {
+  const rows = exportPublishedRows(fnFirstSlotByName())
+  const nms: string[] = []
+  let k = 0
+  while k < rows.length {
+    nms.push(reExpName[rows[k]])
+    k = k + 1
   }
   nms
 }
 
-// The `fnStmts` slot each published name resolves to, PARALLEL to `exportPublicNames`.
-// The two walk `reExpName` in the same order under the same two predicates, so entry k of
-// one belongs to entry k of the other by construction.
+// The `fnStmts` slot each published name resolves to, PARALLEL to `exportPublicNames`:
+// both read the same `exportPublishedRows`, so entry k of one belongs to entry k of the other.
 function exportTargetSlots(): i32[] {
+  const first = fnFirstSlotByName()
+  const rows = exportPublishedRows(first)
   const slots: i32[] = []
-  const seen: string[] = []
-  let rxi = 0
-  while rxi < reExpName.length {
-    const hit = exportSlotOfTarget(reExpTarget[rxi])
-    if hit >= 0 && !strListHas(seen, reExpName[rxi]) {
-      seen.push(reExpName[rxi])
-      slots.push(hit)
-    }
-    rxi = rxi + 1
+  let k = 0
+  while k < rows.length {
+    slots.push(first[reExpTarget[rows[k]]] ?? -1)
+    k = k + 1
   }
   slots
 }
@@ -8622,6 +8851,12 @@ function buildCodePayload(
   }
   svPlaceHelpers(codePayload)
   rvPlaceHelpers(codePayload)
+  if gHelpAsFail >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitAsFailFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__as_fail__")
+  }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
   // `file:line:col` of its declaration fall out of the same readers a user body uses.

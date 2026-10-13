@@ -17,7 +17,7 @@
 //
 // Run with:  deno test -A tests/selfhost_native_diag_code_test.ts
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -33,6 +33,7 @@ if (ignore) {
   );
 }
 
+import { filePath } from "./support/filePath.ts";
 import { decodeDiagData } from "../compiler/diagnostics.ts";
 import type { VLDiagnosticData } from "../compiler/diagnostics.ts";
 

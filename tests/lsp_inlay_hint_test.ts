@@ -7,6 +7,7 @@
 //   deno test -A --no-check tests/lsp_inlay_hint_test.ts
 // (also included in `deno task test`).
 
+import { filePath } from "./support/filePath.ts";
 import { inlayHintsFromWasm } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
@@ -23,7 +24,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 // `inlayHintsFromWasm` applies the same source-scan annotation/range filters as
 // the TS path. Seed-gated; self-ignores when the seed is absent.
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

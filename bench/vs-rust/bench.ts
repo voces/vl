@@ -14,6 +14,7 @@
 // and its provenance (rustc version, build date, exact command) is read from
 // k-rs.build-info.json rather than assumed. `--no-rustc` forces the committed path even when a
 // toolchain is present, for testing that path or for a stable A/B against `vl` changes alone.
+import { filePath } from "../../tests/support/filePath.ts";
 import { vlHostImports } from "../../compiler/vlHostImports.ts";
 
 const DIR = new URL(".", import.meta.url);
@@ -87,8 +88,8 @@ const findVl = async (explicit?: string): Promise<string> => {
   const envVl = Deno.env.get("VL");
   if (envVl) return envVl;
   const candidates = [
-    new URL("../../scripts/vl-host/target/release/vl", DIR).pathname,
-    new URL("../../dist/vl", DIR).pathname,
+    filePath(new URL("../../scripts/vl-host/target/release/vl", DIR)),
+    filePath(new URL("../../dist/vl", DIR)),
   ];
   for (const c of candidates) {
     try {
@@ -136,7 +137,7 @@ const rustcVersionOf = async (rustc: string): Promise<string> => {
  * data address — none of the kernels call `Buffer()`, so heap-base/limit are inert here, kept
  * only so the build command matches the filed repro exactly. */
 const buildVl = async (vl: string, out: string): Promise<void> => {
-  const src = new URL("k.vl", DIR).pathname;
+  const src = filePath(new URL("k.vl", DIR));
   const { code, stderr } = await runCmd(vl, [
     "build",
     src,
@@ -156,7 +157,7 @@ const buildVl = async (vl: string, out: string): Promise<void> => {
  * (verified: identical results and ns/op to an unstripped build), only the size of what wasip1
  * pulls in around them (1.8 MB unstripped → 38 KB). Keep this in sync with that file's `command`. */
 const buildRust = async (rustc: string, out: string): Promise<void> => {
-  const src = new URL("k.rs", DIR).pathname;
+  const src = filePath(new URL("k.rs", DIR));
   const { code, stderr } = await runCmd(rustc, [
     "--edition",
     "2021",
@@ -195,8 +196,8 @@ const resolveRust = async (opts: Opts, workDir: string): Promise<RustSource> => 
     const version = await rustcVersionOf(opts.rustc);
     return { path: out, describe: `built fresh with ${version}` };
   }
-  const path = new URL("k-rs.wasm", DIR).pathname;
-  const infoPath = new URL("k-rs.build-info.json", DIR).pathname;
+  const path = filePath(new URL("k-rs.wasm", DIR));
+  const infoPath = filePath(new URL("k-rs.build-info.json", DIR));
   const info = JSON.parse(await Deno.readTextFile(infoPath)) as {
     rustcVersion: string;
     date: string;
@@ -292,7 +293,7 @@ const printCheck = (rows: Row[], baseline: Baseline): void => {
 };
 
 const writeBaseline = async (rows: Row[]): Promise<void> => {
-  const path = new URL("baseline.json", DIR).pathname;
+  const path = filePath(new URL("baseline.json", DIR));
   const { code, stdout } = await runCmd("git", ["rev-parse", "--short=9", "HEAD"]);
   const commit = code === 0 ? stdout.trim() : "(unknown)";
   const baseline: Baseline & { _comment: string } = {
@@ -337,7 +338,7 @@ const main = async (): Promise<void> => {
     }
 
     if (opts.check) {
-      const baselinePath = new URL("baseline.json", DIR).pathname;
+      const baselinePath = filePath(new URL("baseline.json", DIR));
       const baseline = JSON.parse(await Deno.readTextFile(baselinePath)) as Baseline;
       printCheck(rows, baseline);
     }

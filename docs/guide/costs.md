@@ -26,6 +26,16 @@ rises as it outgrows the processor's caches, while its complexity stays the same
 A list is shared, not copied: `const b = a` is a second name for the same list, and a push
 through either is seen through both.
 
+An empty `[]` (and a `Map()`) allocates only its own small header: it starts on a zero-length
+storage that every empty value of its type shares, and its first push allocates storage of its
+own. A lambda that captures nothing is a constant, so passing `(a, b) => a < b` allocates
+nothing either; one that captures allocates each time it is evaluated.
+
+A list literal of constants that a `for` iterates, `for side in [1.0, -1.0]`, is built once
+for the whole program, so entering the loop allocates nothing. Its elements must be `i32`, `f64`,
+boolean or string literals, or `const`s holding one; `for p in [a, b, c]` builds its list on
+every entry.
+
 ### The element type sets the cost
 
 The element type decides how each element is stored, and that matters more than any other
@@ -60,11 +70,17 @@ A map is a hash table keyed by `string`, `i32` or `i64`.
 | `m[k] = v`, `m[k]`, `m.get(k)`, `m.has(k)` | O(1) expected | 15–43 ns | 19–61 ns | 70–107 ns |
 | `m.delete(k)` | O(1) expected | 46–88 ns | | |
 | `m.length` | O(1) | | | |
+| `m.clear()` | O(capacity), allocates nothing; capacity is kept | | | |
 | `for k, v in m`, `m.keys()`, `m.values()` | O(n), in **insertion order** | 7–10 ns per entry | | |
 
 Insertion order is part of the contract: iterating a map visits keys in the order they were
 first inserted, whatever the key type, and deleting and re-inserting a key moves it to the end.
 A miss (`m[k]` for an absent key) is `null`, and a stored `0` is not a miss.
+
+A map read of a number (`m.get(k)`, `m[k]`), like a number list's `xs.get(i)` and `xs.pop()`,
+is `T | null`. Read with `?? d`, it allocates nothing. Held in a `const` and then only tested
+for `null` and read where it is known not to be, it allocates nothing either. If the `const` is
+also passed on, returned, stored or captured as `T | null`, it is a box.
 
 ## Sets — `Set<T>`
 
@@ -191,7 +207,8 @@ that buffer is **detached**: every view taken before reads `undefined` and has `
 that allocates can detach views the host took before calling it. The first symptom is often
 far from the cause, such as a GPU call failing on an `undefined` field a few calls later.
 
-Two patterns avoid it:
+Two patterns avoid it. For a game or any program with a known memory budget, the first is the
+whole fix:
 
 * **Start the memory large enough.** `vl build --initial-memory=8MiB` (bytes, or `KiB`, `MiB`,
   `GiB`, a whole number of 64 KiB pages) declares the memory at that size, so allocations that
@@ -200,10 +217,24 @@ Two patterns avoid it:
   Zig (`--initial-memory`) and AssemblyScript (`--initialMemory`) offer the same setting.
 * **Re-take views after any call that may allocate.** Build each typed array from
   `memory.buffer` after the call returns, or check `view.byteLength === 0` and rebuild it.
-  wasm-bindgen's generated glue and Go's `wasm_exec.js` both do this.
+  wasm-bindgen's generated glue and Go's `wasm_exec.js` both do this. A lazy accessor keeps it
+  to one place, and is cheap enough to call before every use:
+
+  ```js
+  let u8 = null
+  // The current byte view of the instance's memory, rebuilt only after a growth detached it.
+  const bytes = () =>
+    u8 !== null && u8.byteLength !== 0 ? u8 : (u8 = new Uint8Array(instance.exports.memory.buffer))
+  ```
+
+  JS evaluates arguments left to right, so `gpu.write(bytes(), vl.render())` takes the view
+  BEFORE `render` runs and may hand over a detached one. Call the export first and take the
+  view in the call that uses it.
 
 A memory built with `--shared-memory` never detaches: it is backed by a `SharedArrayBuffer`,
-which grows in place, but a view taken before a growth still covers only the old length.
+which grows in place, but a view taken before a growth still covers only the old length. The
+`bytes()` accessor above never sees a zero length there, so it would keep the stale view: for a
+shared memory compare `u8.length` with `instance.exports.memory.buffer.byteLength` instead.
 
 `memory.toResizableBuffer()` returns a buffer that grows in place instead of detaching. It is a
 JS API extension, shipping in V8; check support in the engines you target. It requires the memory

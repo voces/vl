@@ -37,7 +37,7 @@ other is written, both carry the whole map surface, and a hover or an error prin
 index-signature spelling. Both shorthands, `{[K]: V}` and `T[]`, name CONCRETE types with
 their full methods, and `T[]` is not a subtype of `{[i32]: T}` (owner ruling Q1, 2026-09-25,
 which retires §C2's interface reading — see the banner there). **`Set<T>` is its own type**
-(ruling Q2): `add`, `has`, `delete`, `keys()`/`values()` (the elements, `T[]`), `length` and
+(ruling Q2): `add`, `has`, `delete`, `clear()`, `keys()`/`values()` (the elements, `T[]`), `length` and
 `for x in s`; no index and no `get`/`set`; and it is neither a list nor a map, so it flows
 to no `T[]` or `{[K]: V}` destination and neither flows to it. It prints as `Set<T>`.
 `{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`; it inserts
@@ -887,11 +887,11 @@ is no fixed-array literal to fight.
   pitfall) is deferred.
 
 **Explicitly out of scope for v1 (xfail / future):**
-- `insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift) — `push`/`pop`
-  (ends) only in v1.
+- ~~`insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift)~~ — shipped in
+  `std:array` as `insert`, `removeAt`, `swapRemove` and the in-place filter `retain`.
 - `shrinkToFit()` / any auto-shrink — grow-only.
 - **Per-frame pooling / reuse beyond `clear()`** — a heavier "retain this buffer
-  across frames" story (`retain`, `mapInto(dst)`, free-list pooling) is **deferred
+  across frames" story (`mapInto(dst)`, free-list pooling) is **deferred
   past v1**: it is not clearly first-release-critical, and the inferred fixed-array
   representation (§VL.7) already removes the per-frame allocation for the
   fixed-size cases *for free*. The one cheap piece kept in v1 is capacity-retaining

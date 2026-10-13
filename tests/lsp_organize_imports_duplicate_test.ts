@@ -13,10 +13,11 @@
 // (`organizeImports`: server 1 use, adapter 0) — that gap is a `subBehaviours` row in
 // `playground_lsp_parity_test.ts`, not something this file can grade.
 
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { organizeImportEdits } from "../lsp/src/typeFeatures.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

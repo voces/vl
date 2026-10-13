@@ -119,7 +119,8 @@ Byte order means nothing for one byte, which is the other reason these would not
 
 **Writing.** There is no `put*` family yet, because the two shapes a caller wants —
 storing into an existing array at an offset, and appending to one being built — are
-different functions and no consumer has needed both.
+different functions and no consumer has needed both. Building a `u8[]` and writing it to a file
+or a host is [`writing-bytes.md`](writing-bytes.md).
 
 **A cursor.** These take an explicit offset. A type that carries a position and advances
 it is a fine thing to write over them, and `std:buffer`'s `Buf` is the linear-memory tier

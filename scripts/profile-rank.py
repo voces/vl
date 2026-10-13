@@ -12,6 +12,14 @@ one thread of stack samples. A frame's
 SELF time is the samples whose LEAF is that frame; INCL is the samples with the
 frame anywhere on the stack, counted once per sample so recursion cannot
 double-count.  Without a `--names` seed every frame reads `wasm-function[N]`.
+
+    VL_PROFILE_GUEST=/tmp/p.json VL_PROFILE_GUEST_ALLOC=1 vl build ...
+    python3 scripts/profile-rank.py /tmp/p.json 30 --alloc
+
+ranks ALLOCATION instead: the host weights each sample by the bytes the process's resident set
+grew since the one before (the bytes allocated, under the null collector, which never frees),
+and `--alloc` sums those weights. A sample's leaf is whatever ran when the epoch ticked, not
+always the allocator, so read the INCL column.
 """
 import collections
 import json
@@ -19,6 +27,8 @@ import sys
 
 
 def main(argv: list[str]) -> int:
+    alloc = "--alloc" in argv
+    argv = [a for a in argv if a != "--alloc"]
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
@@ -57,15 +67,27 @@ def main(argv: list[str]) -> int:
             ancestors[node] = acc
         return ancestors[s]
 
-    for s in th["samples"]["stack"]:
+    stacks = th["samples"]["stack"]
+    weights = th["samples"].get("threadCPUDelta") if alloc else None
+    if alloc and weights is None:
+        print("--alloc: this profile carries no per-sample weights", file=sys.stderr)
+        return 2
+    for i, s in enumerate(stacks):
         if s is None or s < 0:
             continue
-        total += 1
-        self_t[name_of_stack(s)] += 1
+        w = (weights[i] or 0) if weights is not None else 1
+        total += w
+        self_t[name_of_stack(s)] += w
         for nm in anc(s):
-            incl_t[nm] += 1
+            incl_t[nm] += w
 
-    print(f"{total} samples")
+    if total == 0:
+        print("no samples")
+        return 0
+    if alloc:
+        print(f"{total / 1000:.1f} MB allocated")
+    else:
+        print(f"{total} samples")
     print(f"{'self%':>7} {'incl%':>7}  function")
     for nm, n in self_t.most_common(top):
         print(f"{100.0 * n / total:7.2f} {100.0 * incl_t[nm] / total:7.2f}  {nm}")

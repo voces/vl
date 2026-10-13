@@ -1,5 +1,9 @@
 # VL incremental builds & caching
 
+> **Superseded (2026-10-06)** by `incremental-compilation-design.md` (lane IC). This page
+> describes the retired TypeScript pipeline: `compiler/buildCache.ts`, `toWasm` and
+> binaryen.js `optimize()` no longer exist. It is kept as a record; do not schedule from it.
+
 > Status: **partially landed; direction revised after review.** Landed: L0 (the
 > content-addressed cache primitive), the **binaryen-`optimize()` stage cache**
 > (hardened), and **L1** (CI caching). L2–L4 are proposal. The final word lands in

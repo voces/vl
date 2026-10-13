@@ -75,3 +75,21 @@ D2335-D2338  plumb-tail-units  2026-09-24
 D2407-D2410  lane-N  2026-09-25  narrowing invalidation (D2400-D2405 closes; D2407, D2408 filed)
 D2475-D2478  lane-S2  2026-09-25  unreachable self-functions (D2475-D2477 filed and closed)
 D3246-D3248  lane-NB  2026-09-29  literal-binding inference, owner ruling (B), plumb PL-054/PL-056 (D3246 filed and closed)
+D3728-D3735  lane-L2  2026-10-05  sunpa SP-037 step 2, D3664 (D3728-D3734 filed)
+D3742-D3749  lane-UA  2026-10-06  empty-list pins at a hole argument and a record field (D2218, D2640, D1471 closed; D3742-D3746 filed)
+D3760-D3764  lane-GN  2026-10-06  getter-alias narrowing (clause 1) + buildFnMap per-instance perf
+D3770-D3774  lane-DX  2026-10-06  diagnostic cascades, sunpa missing-import report (D3770, D3772, D3773 filed and closed; D3771 filed open)
+D3775-D3779  lane-S3  2026-10-06  soundness: D3757, D3746 closed; D3771 left open (attempt withdrawn); D3775 filed
+D3785-D3789  lane-S4  2026-10-06  hex-literal assignment values at i64 (D3733, D3734 closed) + caller write after a callee-pinned element (D3775 closed); D3785, D3786 filed
+D3790-D3794  lane-CC  2026-10-06  sunpa SP-048 (D3790, D3792 filed and closed; D3791, D3793 filed open)
+D3795-D3799  lane-S5  2026-10-06  soundness: D3793, D3762, D3744 closed; D3795 filed and closed; D3796, D3797, D3798 filed open
+D3800-D3802  lane-DG  2026-10-07  redundant-annotation hint at a `??` default (D3798 closed; D3800 filed open)
+D3803-D3807  lane-PF  2026-10-07  sunpa per-frame allocation (item c): D3803 filed and closed; D3804 (list vectors, needs design), D3805 (for-in over a literal) filed open
+D3811-D3813  lane-DH  2026-10-07  load-bearing annotations hinted redundant (D3800 closed); D3811, D3812 filed open
+D3985-D3989  lane-CK  2026-10-10  ruling-C follow-ups: rows the r5 review of #3500 found
+D3990-D3999  lane-CK  2026-10-10  diderven DV-402 (null fill typed by its destination) and DV-400 (record width subtyping into a parameter)
+D4000-D4009  lane-PF  2026-10-11  DV-1000/DV-1001 V8 perf (diderven): D4000 range-analysis guard folding, later residues
+D4040-D4049  lane-L2  2026-10-11  kind-grid findings from `scripts/twin-agreement.py` (D4040-D4044 filed open), stage-2 byte-change rows
+D4120-D4129  lane-SC  2026-10-11  function-name aliases the monomorphizer does not see through: `(id)`, `sel<F>(id)` (D4120-D4122 filed open); a list literal of a generic function (D4123-D4124 filed open); D4123 closed, D4125-D4127 its price (filed open)
+D4190-D4195  lane-CK  2026-10-12  D1832 ruling (a): D4190, D4191 typed-destination emit gaps; review of #3574: D4192 `??` default, D4193 double diagnostic, D4194 alias-of-list member access (all filed open)
+D4199-D4205  lane-CK  2026-10-12  review of #3577: mixed-literal-union element rep, narrowed-arm writes, index-place compares

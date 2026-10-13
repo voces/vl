@@ -98,17 +98,21 @@ print(f"generated {n} cells", file=sys.stderr)
 PY
 
 : > "$OUT/results.txt"
-for f in "$OUT"/cells/*.vl; do
+mkdir -p "$OUT/res"
+# Cells are independent, so they run in parallel; each writes its own line to its own file.
+export VL COMP OUT
+printf '%s\0' "$OUT"/cells/*.vl | xargs -0 -n 1 -P "${JOBS:-4}" bash -c '
+  f=$1
   "$VL" check --codegen "$f" --compiler "$COMP" >/dev/null 2>&1 && c=0 || c=$?
   # OK is decided by the EXIT CODE, not by the absence of an "Error:" line: a run the box
   # killed under load prints nothing, matched no pattern and scored OK, so the grid reported
   # a cell as passing that had not run. Seen as 163/98 once against 162/99 twice, same seed.
   out="$("$VL" run "$f" --compiler "$COMP" 2>&1)" && rc=0 || rc=$?
-  if printf '%s' "$out" | grep -q "Invalid input WebAssembly\|index outside the bounds"; then k=BAD
+  if printf "%s" "$out" | grep -q "Invalid input WebAssembly\|index outside the bounds"; then k=BAD
   elif [ "$rc" -ne 0 ]; then k=REJECT
   else k=OK; fi
-  printf '%s\t%s\tcheck=%s\n' "$k" "$(basename "$f" .vl)" "$c" >> "$OUT/results.txt"
-done
+  printf "%s\t%s\tcheck=%s\n" "$k" "$(basename "$f" .vl)" "$c" > "$OUT/res/$(basename "$f" .vl)"' _
+cat "$OUT"/res/* >> "$OUT/results.txt"
 
 sort -o "$OUT/results.txt" "$OUT/results.txt"
 echo "== mono type-parameter grid ($COMP) =="

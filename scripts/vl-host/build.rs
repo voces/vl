@@ -33,8 +33,46 @@ fn stamp_commit() {
     println!("cargo:rustc-env=VL_BUILD_COMMIT={commit}");
 }
 
+/// The host's identity for the compile cache, baked as `$VL_HOST_BUILD_ID`: an FNV-1a hash
+/// of every host source, `build.rs`, the manifest, the lock file and the active feature set,
+/// so a dirty local build differs from a clean one. The `rerun-if-changed` lines are printed
+/// on every path, because once any is printed cargo re-runs this script only for the files
+/// they name, and a stale id would serve one host's results to another.
+fn stamp_host_build_id() {
+    let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("src"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    files.extend(["build.rs", "Cargo.toml", "Cargo.lock"].iter().map(|f| dir.join(f)));
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes.iter().chain((bytes.len() as u64).to_le_bytes().iter()) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for f in &files {
+        eat(f.file_name().unwrap_or_default().to_string_lossy().as_bytes());
+        eat(&std::fs::read(f).unwrap_or_default());
+    }
+    let mut features: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with("CARGO_FEATURE_"))
+        .collect();
+    features.sort();
+    for f in &features {
+        eat(f.as_bytes());
+    }
+    println!("cargo:rustc-env=VL_HOST_BUILD_ID={h:016x}");
+    for f in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
+        println!("cargo:rerun-if-changed={f}");
+    }
+}
+
 fn main() {
     stamp_commit();
+    stamp_host_build_id();
 
     // Cargo sets CARGO_FEATURE_<NAME> for each active feature.
     if std::env::var_os("CARGO_FEATURE_EMBED_SEED").is_none() {

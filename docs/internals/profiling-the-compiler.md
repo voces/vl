@@ -18,6 +18,25 @@ command loop the same way it covers `build`'s single `compileSrc`. Profile the c
 actually mean — `vl build` is a poor proxy for `vl check`, which runs the LINT that `build`
 never reaches (0.12 vs 0.84 CPU-s on one 17,600-line file).
 
+**ALLOCATION, NOT TIME: `VL_PROFILE_GUEST_ALLOC=1`.** The host then weights each sample by the
+bytes its resident set grew since the previous one. Under the null collector, which never frees,
+that growth is what the compiler allocated, so `profile-rank.py <p.json> 30 --alloc` ranks
+functions by bytes. Read the INCL column: a sample's leaf is whatever ran when the epoch ticked,
+which is not always the allocator. Under `VL_FUEL=1`, `vl build` also prints `[alloc] guest:
+<bytes>`, the resident growth across the compile call, and `tests/vl_scaling_shape_test.ts`
+grades it under `VL_COMPILE_GC=null`. The default compile collector is COPYING (since
+2026-10-07), so an allocation profile or `[alloc]` reading needs `VL_COMPILE_GC=null` set
+by hand; under copying the resident set stops growing once the heap is sized. Under null
+everything a compile allocates counts against one 4 GiB heap, and sunpa's `game.vl` filled it
+(D3737). A table reset per function and regrown to the program's size costs the heap its full
+size each time, even where it costs little fuel.
+
+**WHICH COLLECTOR, AND WHAT IT COSTS.** `vl build` and `vl run` compile under the copying
+collector from a 256 MiB first heap; `VL_COMPILE_GC=null` and `=copying` are the overrides,
+`VL_COMPILE_GC_HEAP` sets the first heap, and `VL_GC_STATS=1` prints the collection count and
+the peak live set. The self-compile scripts pin null, which is ~10% faster there. Measurements
+and the options declined: DECISIONS.md, "The compiler's collector is copying by default".
+
 Notes, each of which cost something to learn:
 
 * **`vl run` profiles the COMPILE, not the program it emitted.** The user program runs on a

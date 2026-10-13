@@ -97,6 +97,14 @@ units: **hours** · **half-day** · **days**.
 
 ## Next (highest leverage)
 
+### Architecture refactor (2026-10-12)
+
+🟡 **Bring the compiler and its tools in line with `docs/ARCHITECTURE.md`.**
+- Plan: [`docs/internals/architecture-refactor-plan.md`](docs/internals/architecture-refactor-plan.md),
+  which gives the order, dependencies, acceptance rules and status of L1–L14 and Track T.
+- Measurements and the shape of each item: `docs/internals/code-quality-2026-10.md`.
+- In progress: L1 (lane SC) and L2. Ready to brief: A1, A3, A5, S-c and C3's first PR.
+
 ### Modernization program (owner, 2026-09-02)
 
 Five items, in order. (0) is shipped; the rest are scheduled against it.
@@ -193,6 +201,15 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   traps with "`g` written before its initializer ran", and the direct top-level spelling is a
   check error. The runtime guard's reachability pass (`initGuardScan`) is the analysis the compile
   error would start from; an uninitialized module `let` (D2655) is open beside it.
+
+- **A list of only `null` — RULED (a) for now, (c) later (owner, 2026-10-12, spec Q3,
+  D1832).** *Now:* a null-only list literal no typed destination receives (`const e = [null]`)
+  is a `vl check` error naming the annotation — BUILT ([D1832](docs/internals/inventory/D1832.md)).
+  *Later target, (c):* infer the element from the first non-null USE, so
+  `const e = [null]; e.push(42)` pins `(i32 | null)[]` the way A-infer-null pins a scalar
+  `let x = null`. New checker machinery: an element hole on the literal that a later use fills,
+  with today's `push: cannot add i32 to null[]` site becoming the pin. Rationale and peers:
+  `docs/internals/open-rulings.md` §D1832.
 
 - **Queued (owner, 2026-09-24, plumb):** std wrappers / compiler-level functionality over the raw
   shared-memory and atomics intrinsics (and the raw integer SIMD intrinsics), each through
@@ -2394,6 +2411,15 @@ in-language GC knobs.
   literal `5.5 % 2.0`, so it is not an inference gap. A `-1` opcode must fail loudly rather
   than fall through; the language-consistent fix lowers `a % b` as `a - trunc(a/b)*b`.
   Workboard D7.
+- ⬜ **B-range. Loop-range facts that fold bounds guards (D4000, diderven DV-1000).** A helper
+  guard such as `if x < 0 || x >= 136 { return 1 }`, called from `for x in 0 until 136`, is
+  tested on every iteration. Most of its compares are decided by the loop's range. V8's
+  JavaScript tier folds them; VL, binaryen and V8's wasm tier keep no range facts. That
+  difference is the whole 2.5–4x gap between DV-1000's scan and hand-written JS. The
+  access-path ingredients the filing named measure 10–20% together. The feature: induction
+  ranges for `for … until`, propagated through the helper once it is inlined (or into a
+  specialised twin), folding compares and list bounds tests the range decides, and keeping
+  every trap message a fold cannot discharge. Grade on node against the JS control.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - ⬜ **B6-ro. The `readonly` sweep of `std:array`'s pure readers.** `extend`'s `other` and
@@ -3129,6 +3155,53 @@ seed from current `compiler/*.vl` in ~40s.*
   and it is the convention `vl seed` already set. `docs/internals/cli-design.md`
   §"The output channel is RULED" carries the decision and the alternative.
   REMAINING: surfacing diagnostics with spans once the spans rungs land.
+- ✅ **C-test-shared-compile. CLOSED by owner ruling 2026-10-06 (sunpa SP-041, ask 2): C, with B a
+  strong no.** Test files are fully independent: no shared module state, no cross-file inference
+  coupling, no shared failure, so (b) one module per run is refused, and
+  `tests/fixtures/vl-test-shared/` stays the pinned guarantee. (a) separate compilation stays on
+  plumb's track. The answer for sunpa is a faster compiler (`C-compile-hotspots`) plus the
+  content-hashed compile cache (`C-test-cache`), whose design is
+  `docs/internals/incremental-compilation-design.md`.
+- ⬜ **C-test-cache. A content-hashed compile cache across `vl test` runs (sunpa SP-041, ask 3).**
+  Key a test file's emitted module on the bytes of every source in its import graph, the seed's
+  content key and the flags that reach the compile, and reuse it when nothing changed, so an
+  edit to one test file does not rebuild `game.vl` for the others. The host already keys the
+  seed's `.cwasm` sidecar by content (`load_compiler_module`); the new part is that the graph is
+  only known after the fetch loop, so the brain has to report it (or the host records every
+  `CMD_READ_FILE` a worker serviced). Measured 2026-10-06: sunpa's `vl test src/` is 25.7 s, of
+  which `rules.test.vl`'s compile is 24.5 s and the tests themselves ~40 ms.
+  **Designed** (lane IC, 2026-10-06): `docs/internals/incremental-compilation-design.md` §4 —
+  this row is its Stage S1. The key is the whole host-to-guest transcript (staging calls, argv,
+  every command reply and read), recorded by the host, plus the resolved seed, host build id,
+  binaryen and environment; no compiler change.
+- ⬜ **C-incremental. Incremental and cached compilation, staged (lane IC; owner direction
+  2026-10-06: compile many at once, watch, file cache).** Plan and gates:
+  `docs/internals/incremental-compilation-design.md` §5 — S0 phase marks, S1 whole-action file
+  cache (`C-test-cache`), S2 `-O` chain cache, S3 `--watch`, S4 compile cost
+  (`C-compile-hotspots`), S5 per-module checker reuse with an interface hash, S6 per-function emit
+  reuse with symbolic indices. Four owner questions in §6: Q1 record adoption across a module
+  boundary (it crosses today, unlike an exported `let`), Q2 cache default and location, Q3 the
+  watch surface, Q4 frozen export signatures.
+- ⬜ **C-compile-hotspots. Two whole-table scans dominate large compiles (sunpa SP-041, ask 4).**
+  Guest profile of `vl build src/game.vl` (sunpa, no `-O`, 17.4 s, 2026-10-06, named seed):
+  `nameIsStructDecl` (`emit_classify.vl`) is **41.9% of self time** — it walks all of `P.nodes`
+  per call, reached from `sigKeyOfTy` → `structIndexOfTypeName` → `shapeRowScanK` →
+  `shapeFieldTypeCompatK`; `crwAddName` (`typecheck.vl`) is 14.0% — a comma-joined string set
+  grown by `indexOf`, quadratic in names; `fieldClosureFeOfRecvRaw` is 8.7%. Separately, an
+  ENTRY module with N exports builds in O(N²): SP-041's `big.vl` (20,000 exported functions)
+  builds in 10.4 s as the entry but 2.1 s when a one-line importer is the entry; 5k/10k/20k
+  exports read 0.89 / 3.26 / 10.4 s, and 69% of the 10k build is `emitExportSection`
+  (`exportSlotOfTarget`, `exportPublicNames` → `strListHas`, linear list scans). Each is a
+  memo or a name→index map; the scaling guards (`tests/vl_scaling_shape_test.ts`) want an
+  `exports` axis beside them.
+- ⬜ **C-test-std-friction. Two `std:test` asks from sunpa SP-041 — std API, so std-api-reviewer
+  and owner first.** (1) `toBeTrue`/`toBeFalse` take no message, so a check that wants to print
+  the numbers behind a failure is spelled `if !ok { fail("x \{x}") }` (sunpa `src/testflat.vl`
+  `check`). Options: an optional message parameter on the boolean matchers, or a
+  `expect(ok, "context")` form that every matcher's failure carries. (2) the report has no
+  per-test time, only `VL_TEST_TRACE`'s per-file stamps. vl-test-design.md known gap 3 left
+  timings out so the report stays byte-deterministic; an opt-in flag (`--durations`, as pytest)
+  keeps the default report assertable.
 - ⬜ **C-extern-read. `vl run` refuses an unsupplied extern global only when the program READS
   it.** `vl run --extern NAME=VALUE` (plumb PL-046, [D2636](docs/internals/inventory/D2636.md))
   supplies a value, and without one `vl run` refuses every DECLARED extern global, including one
