@@ -1,7 +1,8 @@
 # `kind-ladder-incomplete` / `kind-ladder-split` — a dispatch that answers about part of a closed set
 
 Rule in `compiler/lint.vl`, tree-wide census in `scripts/ladder-census.py`, ratchet in
-`scripts/ladder-budget.py`, agreement pinned by `tests/vl_kind_ladder_test.ts`. The survey that
+`vl check --budget scripts/ladder-budget-baseline.json`, set drift in `scripts/ladder-sets.vl`,
+fixtures pinned by `tests/vl_kind_ladder_test.ts`. The survey that
 sized the population is `ladder-audit-2026-09.md`; the arena half's prior sweep is
 `per-rep-ladder-audit.md`.
 
@@ -195,7 +196,7 @@ gate works over a litunion by name. The refusal is filed as [D1898](inventory/D1
 
 ### What the closed set is, and what a sub-domain may leave unnamed
 
-The set is the `export type`'s members, derived exactly as `ladder-budget.py --check` derives it
+The set is the `export type`'s members, derived exactly as `scripts/ladder-sets.vl` derives it
 — **31 for `VKind`, 15 for `RtKind`, 17 for `EqCmpKind`** — never the sub-domain a site happens
 to answer about. A chain answering for twelve of `VKind`'s thirty-one is still a chain over
 `VKind`.
@@ -312,9 +313,8 @@ A parameter's set is in the signature the lint is handed; a field's is in `type 
 which lives in another module the lint cannot see. So the census derives a `{field -> set}`
 index from every such declaration in the tree (`field_set_index`), keeping only a field whose
 type is exactly one closed set, and the lint carries the same table as two parallel arrays
-(`klFieldNames` / `klFieldSetNames`) consulted by `klFieldSetOf`. `check_fields` in
-`ladder-budget.py` compares the lint's copy to the tree the same way `check_sets` does the
-closed-set copy, so the hardcoded table cannot drift from the declarations. Eight fields
+(`klFieldNames` / `klFieldSetNames`) consulted by `klFieldSetOf`. `scripts/ladder-sets.vl`
+compares the lint's field copy to the tree the same way it compares the closed-set copy, so the hardcoded table cannot drift from the declarations. Eight fields
 resolve: `primName -> PrimName`, `kind -> TokKind`, `litKind -> LitKind`, `next`/`nodes ->
 Node`, `rdKind -> VKind`, `asMode -> AsMode`, `tys -> Ty`.
 
@@ -397,13 +397,14 @@ four are the litunion residue the sweep read to the end. The set column's per-si
 is the discovery half — `scripts/ladder-census.py --list kind-ladder-incomplete` — and this table
 is what it grades against.
 
-## Agreement, and why there are two implementations
+## One implementation, and the set copy it keeps
 
-`compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
-tree for the ratchet. Nothing else ties them together, so a change to either that moves a count
-silently un-ratchets the tree. `tests/vl_kind_ladder_test.ts` runs BOTH over ten fixtures and
-compares the hit LINES, and `ladder-budget.py --check` re-derives every closed set from the
-`export type` that declares it and refuses to run when the lint's copy has drifted.
+`compiler/lint.vl` grades one module from the source the driver hands it, and `vl check --budget`
+counts those same findings per file for the ratchet, so the lint is the only walk the gate runs.
+`tests/vl_kind_ladder_test.ts` grades it over the fixtures against pinned LINES, and
+`scripts/ladder-sets.vl` re-derives every closed set from the `export type` that declares it
+and fails when the lint's copy has drifted. `ladder-census.py` is a second walk kept for
+discovery only; nothing gates on it agreeing.
 
 **And ten fixtures is not the tree.** Comparing both walks over every compiler module, filtered
 to that module's own diagnostics, finds one site where they name different LINES for the same
@@ -419,12 +420,10 @@ python3 scripts/ladder-census.py                      # the ladder table, by set
 python3 scripts/ladder-census.py --sets               # every closed set, its members, its home
 python3 scripts/ladder-census.py --split              # the split walks
 python3 scripts/ladder-census.py --pred               # the form with no kind literal in it
-python3 scripts/ladder-budget.py                      # the per-file table
-python3 scripts/ladder-budget.py --check              # the gate: a file may only go down
-python3 scripts/ladder-budget.py --list <code> [n]    # name the sites
-python3 scripts/ladder-budget.py --why                # what LEFT since the baseline's commit
-python3 scripts/ladder-budget.py --grade <file>       # one file's hits as JSON, the suite's input
-python3 scripts/ladder-budget.py --write-baseline     # after a real fix, in the same PR
+vl check --budget scripts/ladder-budget-baseline.json                   # the gate: a file may only go down
+vl check --budget-why scripts/ladder-budget-baseline.json               # what LEFT since the baseline's commit
+vl check --budget scripts/ladder-budget-baseline.json --write-baseline  # after a real fix, in the same PR
+vl run scripts/ladder-sets.vl                                           # the lint's set copy against the tree
 ```
 
 ## Cost

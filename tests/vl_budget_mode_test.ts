@@ -230,7 +230,9 @@ Deno.test({
 });
 
 // `--findings` COUNTS A `--json` REPORT INSTEAD OF WALKING. A report with one finding more
-// than a file's baseline reds on exactly that file; an out-of-target file is ignored.
+// than a file's baseline reds on exactly that file; an out-of-target file is ignored. A
+// finding names its entry only through an optional `text`, so `--budget-why` refuses a
+// report without one rather than naming every entry by its file alone.
 Deno.test({
   name: "vl check --budget --findings counts a report, not a walk",
   ignore: !ENABLED,
@@ -271,7 +273,12 @@ Deno.test({
         "--findings",
         ok,
       ]);
-      expectEq("--budget-why refuses --findings", 2, refused.code);
+      expectEq("--budget-why refuses findings with no `text`", 2, refused.code);
+      expectEq(
+        "the refusal says why",
+        true,
+        (refused.out + refused.err).includes("carry no `text`"),
+      );
     } finally {
       await Deno.remove(dir, { recursive: true });
     }

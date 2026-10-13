@@ -21,7 +21,7 @@ Four sections, in the order a reader wants them:
               `nulvariant` hole is here and in no other section
 
 The lint in compiler/lint.vl is the same walk over the first three, per module,
-and `scripts/ladder-budget.py` is its per-file ratchet. The rule and its controls
+and `vl check --budget scripts/ladder-budget-baseline.json` is its per-file ratchet. The rule and its controls
 are docs/internals/kind-ladder-lint.md; see also CLAUDE.md, "A LADDER OVER A CLOSED
 KIND SET".
 """

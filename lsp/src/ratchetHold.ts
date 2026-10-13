@@ -20,7 +20,7 @@ import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
  * are `compiler/` only (a std comment is graded by `std-comment-audience` instead),
  * and the arena-scan baseline's are `compiler/` and `std/`. Holding a code for a file its own
  * ratchet never reads would report "+N over baseline" for a baseline that does not
- * cover it. `tests/lsp_ratchet_hold_test.ts` re-derives this table from the scripts
+ * cover it. `tests/lsp_ratchet_hold_test.ts` re-derives this table from the baselines
  * and fails on drift.
  */
 export type RatchetScope = {
