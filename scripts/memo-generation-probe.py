@@ -238,6 +238,10 @@ ROWS = [
     ("sigKeyOfTyMemo", ["sktGen"], "probe",
      ("  if sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }",
       "  if false && sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }")),
+    # D4056: a variant row's tag key; `uFieldReLays` counts the in-place literal-field re-lays
+    # that move no table length.
+    ("variantTagKey", ["uTagKeyStartLen", "uTagKeyTyLen"], "probe",
+     ("  if (\n    uTagKeyStartLen != uFieldStart.length\n", "  if (\n    true\n")),
     ("structIndexOfTypeNameMemo", [], "probe",
      ("    if hit[0] == gen { return hit[1] }",
       "    if false && hit[0] == gen { return hit[1] }")),

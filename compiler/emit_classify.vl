@@ -767,6 +767,7 @@ import {
   uFieldElemTyIx,
   uFieldLitTyIx,
   uFieldNames,
+  uFieldReLays,
   uFieldStart,
   uFieldTyText,
   uFieldTypes,
@@ -14285,6 +14286,9 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
         if variantFieldTypeAt(nvi, vfi) == FC_UNION {
           return variantFieldElemName(nvi, vfi)
         }
+        // The narrowed arm stores the field unboxed, whatever a same-named field of a
+        // sibling arm stores.
+        return ""
       }
     }
     // Narrowing-blind last resort (the frame pre-pass runs before narrowing is active): an
@@ -14387,8 +14391,9 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       }
     }
     // A shared read whose members store the field at different atoms boxes each one, so the
-    // read is the box of the checker's join (`sharedFieldArmsBoxable`).
-    if avi < 0 {
+    // read is the box of the checker's join (`sharedFieldArmsBoxable`). A receiver narrowed to
+    // one arm reads that arm's own field instead.
+    if avi < 0 && memNarrowVariantIndex(memIx) < 0 {
       const bvis: i32[] = []
       const bfis: i32[] = []
       const bcode = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, bvis, bfis)
@@ -31058,6 +31063,7 @@ export function variantSigMemoDrop() {
   uVarSigCountLen = -1
   uTagKeyStartLen = -1
   uTagKeyTyLen = -1
+  uTagKeyReLays = -1
   0
 }
 
@@ -31107,12 +31113,19 @@ function variantSigGo(vi: i32) {
 // sharing a field-name set share a tag only when they agree field by field, so `{v: i32}` and
 // `{v: string}` are told apart by the tag (D4056).
 export function variantTagKey(vi: i32): string {
-  if uTagKeyStartLen != uFieldStart.length || uTagKeyTyLen != uVarTyIx.length {
+  // Stamped on the tables' lengths and on the re-lay generation: a literal field re-laid in
+  // place moves no length (D1655).
+  if (
+    uTagKeyStartLen != uFieldStart.length
+    || uTagKeyTyLen != uVarTyIx.length
+    || uTagKeyReLays != uFieldReLays
+  ) {
     uTagKeyMemo = []
     uTagKeyGroups = Map()
     uTagKeyGroupOf = []
     uTagKeyStartLen = uFieldStart.length
     uTagKeyTyLen = uVarTyIx.length
+    uTagKeyReLays = uFieldReLays
   }
   if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
     return variantSig(vi)
@@ -31154,6 +31167,7 @@ let uTagKeyGroups: {[string]: i32[]} = Map()
 let uTagKeyGroupOf: i32[][] = []
 let uTagKeyStartLen = -1
 let uTagKeyTyLen = -1
+let uTagKeyReLays = -1
 
 // Whether rows `a` and `b`, which share a field-name set, hold the same values in every field.
 // A row with no arena type compares by its type text; a map field also by its element, key
@@ -31266,18 +31280,16 @@ export function crossTagFitRows(
   for j in peers {
     const yTy = if j < uVarTyIx.length { uVarTyIx[j] } else { -1 }
     const k = if j != vi { variantTagKey(j) } else { keys[0] }
-    if yTy >= 0 && !strListHas(keys, k) && tyIsRecord(yTy) {
+    const kind = if yTy >= 0 && !strListHas(keys, k) && tyIsRecord(yTy) { recArmFitKind(xTy, yTy) } else { 0 }
+    if kind != 0 {
       if !holdsRead {
         holds = recvRecordMembers(recvIx)
         holdsRead = true
       }
       if recvCanHold(holds, yTy) {
-        const kind = recArmFitKind(xTy, yTy)
-        if kind != 0 {
-          keys.push(k)
-          rows.push(j)
-          kinds.push(kind)
-        }
+        keys.push(k)
+        rows.push(j)
+        kinds.push(kind)
       }
     }
   }
@@ -40446,17 +40458,25 @@ function variantFieldKindFits(objIx: i32, name: string, vi: i32): boolean {
   if rk == 0 && litSetBaseTy(rft) >= 0 {
     rk = fieldScalarKindOf(litSetBaseTy(rft))
   }
-  if rk == 0 { return true }
+  // The field value's own type refutes across kind classes only: a literal typed by its
+  // union destination may carry the destination's arm, while a width still adapts. A record
+  // value is no scalar field, and a scalar value no record one.
+  const fv = objFieldVal(objIx, name)
+  let vk = 0
+  if fv >= 0 { vk = fieldScalarKindOf(nodeRepTyIxOf(fv)) }
+  if rk == 0 {
+    if fv >= 0 && fieldValueIsRecord(fv) {
+      return tyHoldsRecord(nonNullTy(rft))
+    }
+    if !tyIsRecord(nonNullTy(rft)) { return true }
+    return vk == 0 && !fieldValueIsScalarLit(fv)
+  }
+  if fv >= 0 && fieldValueIsRecord(fv) { return false }
   let lk = 0
   const ot = nodeRepTyIxOf(objIx)
   if ot >= 0 && ot < T.tys.length {
     lk = fieldScalarKindOf(tyFieldTyOf(ot, name))
   }
-  // The field value's own type refutes across kind classes only: a literal typed by its
-  // union destination may carry the destination's arm, while a width still adapts.
-  const fv = objFieldVal(objIx, name)
-  let vk = 0
-  if fv >= 0 { vk = fieldScalarKindOf(nodeRepTyIxOf(fv)) }
   if vk != 0 && fieldKindClass(vk) != fieldKindClass(rk) { return false }
   if lk == 0 { lk = vk }
   if lk == 0 { return true }
@@ -40470,6 +40490,36 @@ function variantFieldKindFits(objIx: i32, name: string, vi: i32): boolean {
     return true
   }
   fieldKindWidens(lk, rk)
+}
+
+// Whether field value node `fv` is a record: an object literal, or typed as a record.
+function fieldValueIsRecord(fv: i32): boolean {
+  if P.nodes[unwrapParen(fv)] is ObjLit { return true }
+  const t = nodeRepTyIxOf(fv)
+  t >= 0 && tyIsRecord(t)
+}
+
+// Whether field value node `fv` is a number, string, char or boolean literal.
+function fieldValueIsScalarLit(fv: i32): boolean {
+  if fv < 0 { return false }
+  const n = P.nodes[unwrapParen(fv)]
+  n is NumLit || n is StrLit || n is CharLit || n is BoolLit
+}
+
+// Whether type `t` is a record or a union with a record member.
+function tyHoldsRecord(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  if tyIsRecord(t) { return true }
+  const u = T.tys[t]
+  if u is TyUnion {
+    let i = 0
+    while i < u.uMembers.length {
+      const m = u.uMembers[i]
+      if m >= 0 && m < T.tys.length && tyIsRecord(m) { return true }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // The class of a `fieldScalarKindOf` kind, nullability dropped: 1 numeric, 2 `boolean`,
@@ -40538,6 +40588,7 @@ function objMatchesVariantIdx(objIx: i32, vi: i32, fnIx: i32): boolean {
             uFieldNames[start + fj],
             uFieldElemName[start + fj],
           )
+          || !variantFieldKindFits(objIx, uFieldNames[start + fj], vi)
         ) {
           allMatch = false
         }

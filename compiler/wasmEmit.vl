@@ -2422,10 +2422,23 @@ function seedFieldListBuild(code: i32, refSlot: i32) {
   0
 }
 
-// A field store's right-hand value with the scalar widening its field code demands — f64
-// (17), i64 (23), f32 (24) re-encode at the boundary, any other code emits plainly. The
-// store-side twin of the construct paths' widening, shared by all three `emitAssign`
-// member-assignment branches (narrowed union, variant param, plain struct).
+// The store-side value of variant `vi`'s field `fi`, shared by the three `emitAssign` member
+// stores: a box-union field boxes the right-hand side, f64 / i64 / f32 fields re-encode it,
+// and any other code emits it plainly.
+function emitVariantFieldStoreVal(
+  body: u8[],
+  vi: i32,
+  fi: i32,
+  valIx: i32,
+  fnIx: i32,
+) {
+  const code = variantFieldTypeAt(vi, fi)
+  if code == FC_UNION {
+    return emitUnionBoxArg(body, variantFieldElemName(vi, fi), valIx, fnIx)
+  }
+  emitScalarFieldStoreVal(body, valIx, fnIx, code)
+}
+
 function emitScalarFieldStoreVal(body: u8[], valIx: i32, fnIx: i32, code: i32) {
   if code == FC_F64 { return emitExprAsF64(body, valIx, fnIx) }
   if code == FC_I64 { return emitExprAsI64(body, valIx, fnIx) }
@@ -3241,7 +3254,23 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   let k = 0
   while k < names.length {
-    const lexes = tyLitSetMemberLexes(sets[k])
+    // A nullable string field answers its null apart, then compares only non-null strings.
+    const nulStr = codes[k] == FC_NUL_STR
+    const lexes = tyLitSetMemberLexes(
+      if nulStr { nonNullTy(sets[k]) } else { sets[k] },
+    )
+    if nulStr {
+      if emitRecordFitRecv(body, recv, fnIx, staged, heap) < 0 { return -1 }
+      if nullable && !staged {
+        wU8(212) // ref.as_non_null
+      }
+      fbStructGet(heap, fis[k])
+      wU8(209) // ref.is_null
+      fbIf(127)
+      fbI32Const(if nonNullTy(sets[k]) != sets[k] { 1 } else { 0 })
+      fbElse()
+      if lexes.length == 0 { fbI32Const(0) }
+    }
     let li = 0
     while li < lexes.length {
       if emitRecordFitRecv(body, recv, fnIx, staged, heap) < 0 { return -1 }
@@ -3249,12 +3278,16 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
         wU8(212) // ref.as_non_null
       }
       fbStructGet(heap, fis[k])
+      if nulStr {
+        wU8(212) // ref.as_non_null
+      }
       if emitFieldLitEq(body, codes[k], lexes[li], fnIx) < 0 { return -1 }
       if li > 0 {
         fbI32Bin(114) // i32.or
       }
       li = li + 1
     }
+    if nulStr { fbEnd() }
     if k > 0 {
       fbI32Bin(113) // i32.and
     }
@@ -4134,14 +4167,40 @@ function emitArmFieldsFit(
     // A field that never holds `null` is tested against the set's non-null members alone.
     let fxSet = fxs[i]
     if nonNullTy(fys[i]) == fys[i] { fxSet = nonNullTy(fxSet) }
-    const lexes = tyLitSetMemberLexes(fxSet)
-    if fi >= 0 && variantFieldTypeAt(yi, fi) != FC_UNION && lexes.length > 0 {
+    // A nullable string field answers its null apart, then tests only non-null strings: all
+    // fit, none does, or they are compared against the set's string members.
+    const nulStr = fi >= 0 && variantFieldTypeAt(yi, fi) == FC_NUL_STR
+    let nnKind = 2
+    if nulStr { nnKind = tyFitKind(nonNullTy(fys[i]), fxSet) }
+    const lexes = tyLitSetMemberLexes(
+      if nulStr { nonNullTy(fxSet) } else { fxSet },
+    )
+    if (
+      fi >= 0
+      && variantFieldTypeAt(yi, fi) != FC_UNION
+      && (lexes.length > 0 || nnKind != 2)
+    ) {
+      if nulStr {
+        if emitSharedFieldRecv(body, recv, fnIx, slot) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 1)
+        fbRefCast(uVarHeap[yi])
+        fbStructGet(uVarHeap[yi], fi)
+        wU8(209) // ref.is_null
+        fbIf(127)
+        fbI32Const(if nonNullTy(fxSet) != fxSet { 1 } else { 0 })
+        fbElse()
+        if nnKind != 2 { fbI32Const(nnKind) }
+      }
       let li = 0
+      if nnKind != 2 { li = lexes.length }
       while li < lexes.length {
         if emitSharedFieldRecv(body, recv, fnIx, slot) < 0 { return -1 }
         fbStructGet(uBoxIdx, 1)
         fbRefCast(uVarHeap[yi])
         fbStructGet(uVarHeap[yi], fi)
+        if nulStr {
+          wU8(212) // ref.as_non_null
+        }
         if (
           emitFieldLitEq(body, variantFieldTypeAt(yi, fi), lexes[li], fnIx)
           < 0
@@ -4153,6 +4212,7 @@ function emitArmFieldsFit(
         }
         li = li + 1
       }
+      if nulStr { fbEnd() }
       if i > 0 {
         fbI32Bin(113) // i32.and
       }
@@ -21670,7 +21730,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           // A SCALAR f64/i64/f32 variant field widens its RHS at the store boundary,
           // exactly as the construct does (`v.f = 9` into an i64 field emitted a raw
           // `i32.const` — invalid wasm at `struct.set`).
-          if emitScalarFieldStoreVal(body, a.binRight, fnIx, nvCode) < 0 {
+          if emitVariantFieldStoreVal(body, nvi, nfi, a.binRight, fnIx) < 0 {
             return -1
           }
           pendingListKind = LBK_I32_LIST
@@ -21698,7 +21758,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           if seedFieldListBuild(pwCode, variantFieldRefSlot(pwvi, pwfi)) < 0 {
             return -1
           }
-          if emitScalarFieldStoreVal(body, a.binRight, fnIx, pwCode) < 0 {
+          if emitVariantFieldStoreVal(body, pwvi, pwfi, a.binRight, fnIx) < 0 {
             return -1
           }
           pendingListKind = LBK_I32_LIST
@@ -21724,7 +21784,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         if seedFieldListBuild(nwCode, variantFieldRefSlot(nwvi, nwfi)) < 0 {
           return -1
         }
-        if emitScalarFieldStoreVal(body, a.binRight, fnIx, nwCode) < 0 {
+        if emitVariantFieldStoreVal(body, nwvi, nwfi, a.binRight, fnIx) < 0 {
           return -1
         }
         pendingListKind = LBK_I32_LIST

@@ -93,4 +93,3 @@ D4040-D4049  lane-L2  2026-10-11  kind-grid findings from `scripts/twin-agreemen
 D4120-D4129  lane-SC  2026-10-11  function-name aliases the monomorphizer does not see through: `(id)`, `sel<F>(id)` (D4120-D4122 filed open); a list literal of a generic function (D4123-D4124 filed open); D4123 closed, D4125-D4127 its price (filed open)
 D4190-D4195  lane-CK  2026-10-12  D1832 ruling (a): D4190, D4191 typed-destination emit gaps; review of #3574: D4192 `??` default, D4193 double diagnostic, D4194 alias-of-list member access (all filed open)
 D4199-D4205  lane-CK  2026-10-12  review of #3577: mixed-literal-union element rep, narrowed-arm writes, index-place compares
-D4260-D4269  lane-CK  2026-10-12  Q4 (c) D4056 build: same-field record arms, residue rows (D4260–D4264 filed open; D4265–D4269 unused)
