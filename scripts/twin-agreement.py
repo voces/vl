@@ -111,6 +111,25 @@ KINDS = {
     "lu_int_str": ("", '1 | 2 | "a" | "b"', "1"),
     "vu_fn": ("", "((x: i32) => i32) | i32", "3"),
     "rec": ("type L = { v: i32, next: L | null }\n", "L", "{ v: 1, next: null }"),
+    # Unions whose members share a kind, and lists whose element is itself a union.
+    "fn2": ("", "((x: i32) => i32) | ((s: string) => i32)", "(x: i32) => x"),
+    "fn_ret_arr": ("", "(x: i32) => i32[]", "(x: i32) => [x]"),
+    "fn_ret_vu": ("", "(x: i32) => i32 | string", "(x: i32) => x"),
+    "arr_lu_alias": ("type K = 0 | 1\n", "i32[] | K[]", "[1]"),
+    "arr_vu_same": ("", "i32[] | i32[]", "[1]"),
+    "arr_f64_str": ("", "f64[] | string[]", "[1.5]"),
+    "arr_str_nulstr": ("", "string[] | (string | null)[]", '["a"]'),
+    "arr_nulstr_rev": ("", "(null | string)[]", '["a"]'),
+    "arr_nulbool": ("", "(boolean | null)[]", "[true]"),
+    "arr_nulf64": ("", "(f64 | null)[]", "[1.5]"),
+    "arr_nuli32": ("", "(i32 | null)[]", "[1]"),
+    "arr_vu": ("", "(i32 | string)[]", "[1]"),
+    "arr_fn": ("", "((x: i32) => i32)[]", "[(x: i32) => x]"),
+    "arr_map": ("", "{ [string]: i32 }[]", "[Map()]"),
+    "arr_nullu": ("", "((0 | 1) | null)[]", "[1]"),
+    "arr_luint": ("", "(0 | 1)[]", "[1]"),
+    "vu_lists": ("", "i32[] | string", "[1]"),
+    "vu_strlists": ("", "string[] | string[][]", '["a"]'),
 }
 
 TEMPLATE = """{pre}type A = {ty}
