@@ -4962,12 +4962,6 @@ let flFOff: i32[] = []
 // brand test stands down. Only ever raised around a walk whose source is a scalar literal, which
 // is what makes waiving the whole walk equivalent to waiving the destination's own brand.
 let nomLitRelax = 0
-// Litunion alias provenance: the narrowing, join and intersection algebra re-mints a declared
-// litunion alias as a fresh arena copy — a `TyUnion` sharing the alias's `TyLit` members at an
-// index the union-alias registry cannot recognize. These arrays record (copy index → source alias
-// index) at the mint sites; only a copy whose member set is contained in the alias's records.
-let cLitUnionCopyTyIxs: i32[] = []
-let cLitUnionCopyAliasIxs: i32[] = []
 // A single placeholder `TyFunc` arena index for monomorphizer `=>sigkey` closure pins (C1 endgame).
 let cFuncPinTyIx = -1
 // A single placeholder `TyObj` arena index for interned anonymous-shape `#anonN` names (C1 endgame).
@@ -6013,8 +6007,6 @@ export function initChecker() {
   flFWidth = []
   flFNest = []
   flFOff = []
-  cLitUnionCopyTyIxs = []
-  cLitUnionCopyAliasIxs = []
   checkerArmed = true
   TY_I32 = mkPrim("i32")
   TY_I64 = mkPrim("i64")
@@ -14015,67 +14007,6 @@ function sameVariantTy(a: i32, b: i32) {
   assignable(b, a)
 }
 
-// The declared litunion alias `src` derives from, or -1: a nullable wrapper unwraps to its inner,
-// since narrowing a `K | null` subtracts from the nullable, and a copy's own recorded provenance
-// chains. The stamp itself is `noteLitUnionCopy`; the rep layers read it at emit.
-function litUnionProvSrcAlias(src: i32): i32 {
-  if src < 0 { return -1 }
-  const t = T.tys[src]
-  if t is TyNullable { return litUnionProvSrcAlias(t.nInner) }
-  if t is TyUnion {
-    if !tyIsLitUnion(src) { return litUnionMemberAlias(t.uMembers) }
-  }
-  tyLitUnionAliasIx(src)
-}
-
-// The one litunion alias kept as a member of a wider union (`K | i32`), or -1 when there is
-// none or more than one: narrowing the wider union to `K`'s members is then a copy of `K` (D3098).
-function litUnionMemberAlias(ms: i32[]): i32 {
-  let found = -1
-  let i = 0
-  while i < ms.length {
-    const a = tyLitUnionAliasIx(ms[i])
-    if a >= 0 {
-      if found >= 0 && found != a { return -1 }
-      found = a
-    }
-    i = i + 1
-  }
-  found
-}
-
-// Stamp `res` as a copy of the litunion alias `src` derives from. Records only when `res` is an
-// alias-less litunion and every member of it is a member of that alias — narrowing, subtraction
-// and dedup only ever keep members, so a copy is contained, while a join that widened past the
-// alias is not the alias. A miss records nothing and the index simply stays alias-less.
-function noteLitUnionCopy(res: i32, src: i32) {
-  if res < 0 { return 0 }
-  if !tyIsLitUnion(res) { return 0 }
-  if tyLitUnionAliasIx(res) >= 0 { return 0 }
-  const alias = litUnionProvSrcAlias(src)
-  if alias < 0 { return 0 }
-  const rt = T.tys[res]
-  const at = T.tys[alias]
-  if rt is TyUnion {
-    if at is TyUnion {
-      let i = 0
-      while i < rt.uMembers.length {
-        let hit = i32ListHas(at.uMembers, rt.uMembers[i])
-        let j = 0
-        while j < at.uMembers.length && !hit {
-          hit = sameVariantTy(rt.uMembers[i], at.uMembers[j])
-          j = j + 1
-        }
-        if !hit { return 0 }
-        i = i + 1
-      }
-      cLitUnionCopyTyIxs.push(res)
-      cLitUnionCopyAliasIxs.push(alias)
-    }
-  }
-  0
-}
-
 // Remove a variant from a union or nullable, returning the residual type — the else-branch
 // narrowing of `if x is A { … } else { … }`, where `x` is `U − A`. Returns -1 both when nothing
 // concrete is removed (open-world negation is not tracked) and when nothing remains, a dead branch
@@ -14111,12 +14042,7 @@ function subtractTy(ty: i32, removed: i32) {
   }
   if core.length == 0 { return TY_NULL }
   let res = core[0]
-  if core.length > 1 {
-    res = mkUnionTy(core)
-    // A narrowed litunion alias (`K` minus some members, `K | null` minus the null) is a fresh
-    // copy of the alias — stamp its provenance.
-    noteLitUnionCopy(res, ty)
-  }
+  if core.length > 1 { res = mkUnionTy(core) }
   if hasNull { return mkNullableTy(res) }
   res
 }
@@ -14329,11 +14255,7 @@ function isectSubtract(ty: i32, removed: i32) {
   }
   if core.length == 0 { return TY_NULL }
   let res = core[0]
-  if core.length > 1 {
-    res = mkUnionTy(core)
-    // `K & !"a"` — an intersection-subtracted litunion alias is a copy.
-    noteLitUnionCopy(res, ty)
-  }
+  if core.length > 1 { res = mkUnionTy(core) }
   if hasNull { return mkNullableTy(res) }
   res
 }
@@ -14348,17 +14270,8 @@ function intersectTy(a: i32, b: i32) {
   if tb is TyNeg { return isectSubtract(a, tb.negTy) }
   const ta = T.tys[a]
   if ta is TyNeg { return isectSubtract(b, ta.negTy) }
-  if ta is TyUnion {
-    const du = isectDistribute(ta.uMembers, b)
-    // A distributed litunion alias (`K & <lit>`) re-mints a subset copy.
-    noteLitUnionCopy(du, a)
-    return du
-  }
-  if tb is TyUnion {
-    const du2 = isectDistribute(tb.uMembers, a)
-    noteLitUnionCopy(du2, b)
-    return du2
-  }
+  if ta is TyUnion { return isectDistribute(ta.uMembers, b) }
+  if tb is TyUnion { return isectDistribute(tb.uMembers, a) }
   if ta is TyObj {
     if tb is TyObj {
       // Structural field-wise merge: the value that is both carries every field of each side, and
@@ -24554,14 +24467,7 @@ function joinVariantTys(a: i32, b: i32) {
     return TY_ERR
   }
   let res = kept[0]
-  if kept.length > 1 {
-    res = mkUnionTy(kept)
-    // A joined litunion alias (`if c { k1 } else { k2 }`, `k ?? "a"`, both sides the same alias or
-    // a member of it) re-mints the alias as a copy; the subset gate inside the stamp rejects a
-    // join that widened past it.
-    noteLitUnionCopy(res, a)
-    noteLitUnionCopy(res, b)
-  }
+  if kept.length > 1 { res = mkUnionTy(kept) }
   if hasNull { return mkNullableTy(res) }
   res
 }
@@ -64711,10 +64617,10 @@ export function nodeTyIsLitUnionAlias(ix: i32) {
   tyIsLitUnionAlias(nodeTyIxOf(ix))
 }
 
-// The type-taking twin of `nodeTyIsLitUnionAlias`, written in terms of it — the one question
-// "does this literal union rep as the interned i32 atom": a registered union type does, an
-// unregistered fresh join does not (reps as a string ref). Not the same question as
-// `litUnionAliasNameOfTy(ty) != ""`, which consults a different table and can disagree.
+// Whether `ty` is a REGISTERED literal union: a declared alias or an annotated inline set. Every
+// string literal union reps as the atom (`tyIsLitUnion`); this narrower test serves node
+// consumers whose producer may still deliver a string ref, such as a generic instance whose
+// pin softened a single literal to `string` (D2827).
 export function tyIsLitUnionAlias(ty: i32): boolean {
   if ty < 0 { return false }
   if !cTyIxSetHas(cUnionTyIxSet, ty) { return false }
@@ -64954,21 +64860,6 @@ export function nodeTyIsNulClosure(ix: i32) {
 export function tyIxIsVariantMember(ty: i32) {
   if ty < 0 { return false }
   cTyIxSetHas(cVariantMemberTyIxSet, ty)
-}
-// The declared litunion alias a litunion arena index denotes, or -1: the index itself when it
-// is a declared alias, else the recorded source alias when it is a checker-minted copy of one
-// (`cLitUnionCopyTyIxs`), else -1 (a genuinely-inline litunion, position-decided by canon). The
-// rep layers read this instead of a copy-blind registry test.
-export function tyLitUnionAliasIx(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  if !tyIsLitUnion(ty) { return -1 }
-  if cTyIxSetHas(cUnionTyIxSet, ty) { return ty }
-  let i = 0
-  while i < cLitUnionCopyTyIxs.length {
-    if cLitUnionCopyTyIxs[i] == ty { return cLitUnionCopyAliasIxs[i] }
-    i = i + 1
-  }
-  -1
 }
 // A `{tag, value}` value/struct union BOX at arena level — `isValueUnionBox`,
 // exposed under the `ty*` naming for the emitter's descriptor arms.
@@ -72204,7 +72095,7 @@ function gwConcatMarkInner(ix: i32) {
 
 // Whether `==` operand `ix` is a value the emitter compares as an interned atom: a string
 // literal, a value whose type is one string literal (`tyIsOneStrLit`, known at compile time),
-// or one whose type reps as the atom (`tyLitUnionAliasIx`). The getter contract prices a
+// or one whose type is a string literal union, which reps as the atom. The getter contract prices a
 // compare of two of these at 0 because the emitter lowers it to one `i32.eq` or a constant.
 export function nodeCmpsByTag(ix: i32): boolean {
   const u = cwPeel(ix)
@@ -72214,7 +72105,7 @@ export function nodeCmpsByTag(ix: i32): boolean {
   const ty = nodeTyIxOf(u)
   if ty < 0 { return false }
   const e = nomErasedTyIx(ty)
-  tyIsOneStrLit(e) || tyLitUnionAliasIx(e) >= 0
+  tyIsOneStrLit(e) || tyIsLitUnion(e)
 }
 
 // Whether `ty` is exactly one string literal: a bare `"z"`, or a literal union of one member.
@@ -72322,9 +72213,7 @@ function gwErasedIs(ty: i32): string {
   }
   if t is TyUnion {
     if !getterLitUnionOk(t.uMembers) { return "union" }
-    if tyLitUnionAliasIx(e) >= 0 || gwErasedIs(t.uMembers[0]) == "lit" {
-      return "lit"
-    }
+    if tyIsLitUnion(e) || gwErasedIs(t.uMembers[0]) == "lit" { return "lit" }
     return "string"
   }
   if t is TyNullable {
@@ -76362,9 +76251,7 @@ function litSetMeetTy(obj: i32, chk: i32): i32 {
   // The whole set survives: the operand keeps its own type, and with it its rep.
   if keep.length == own.length && allLitMembers(base) { return base }
   if keep.length == 1 { return keep[0] }
-  const res = mkUnionTy(keep)
-  noteLitUnionCopy(res, base)
-  res
+  mkUnionTy(keep)
 }
 
 // The members of the literal-bearing union `obj` (or its nullable) whose base scalar is the
