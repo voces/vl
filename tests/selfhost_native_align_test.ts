@@ -322,8 +322,11 @@ let batchP: Promise<Map<string, BatchResult>> | null = null;
 const batchResults = (): Promise<Map<string, BatchResult>> =>
   batchP ??= (async () => {
     const results = new Map<string, BatchResult>();
+    // Through `spawnGate`, like every other spawn here: there are as many waves as the
+    // most repeated basename has copies (about a hundred), and launching them all at
+    // once starves every other process on the box.
     await Promise.all(
-      partitionWaves([...TIERS.run, ...TIERS.trap]).map(async (wave) => {
+      partitionWaves([...TIERS.run, ...TIERS.trap]).map((wave) => spawnGate(async () => {
         const dir = await Deno.makeTempDir({ prefix: "vl-native-align-batch-" });
         try {
           const { code, stderr } = await new Deno.Command(VL, {
@@ -360,7 +363,7 @@ const batchResults = (): Promise<Map<string, BatchResult>> =>
         } finally {
           await Deno.remove(dir, { recursive: true }).catch(() => {});
         }
-      }),
+      })),
     );
     return results;
   })();
