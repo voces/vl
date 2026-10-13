@@ -11,6 +11,11 @@ and codegen refuses. Every probe here **must eventually run**; until it does it 
 clause-2 violation with a name.
 
     python3 scripts/capability-probes/run.py
+    scripts/vl-host/target/release/vl run scripts/capability-probes.vl \
+        --compiler build/vl-compiler.wasm --        # the VL port; the gate rows run this one
+
+The port prints the same report and exits the same way, held to it byte for byte by
+`tests/vl_capability_probes_port_test.ts`; `run.py` stays because other scripts import it.
 
 Exit 0 when every probe runs and prints what its header says. Non-zero names the ones that
 still refuse — which today is the point of the directory, so **it is not a merge gate.** It is

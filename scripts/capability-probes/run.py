@@ -20,6 +20,8 @@ SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
 # binary at the main repo — so an unpinned probe grades THIS tree's seed against the main
 # checkout's `std/`. `matrix.py` pins it; the default here is what every caller gets.
 ENV = dict(os.environ, VL_STD=os.path.join(ROOT, "std"))
+# Seconds each `vl` call may take before it grades TIMEOUT; a test sets it short.
+TIMEOUT = int(os.environ.get("VL_PROBE_TIMEOUT", "120"))
 
 
 def matches(want, out):
@@ -93,7 +95,7 @@ def classify(chk_rc, err):
     return where, detail
 
 
-def grade_full(path, compiler, want, vl=VL, env=None, timeout=120):
+def grade_full(path, compiler, want, vl=VL, env=None, timeout=TIMEOUT):
     """Grade one program: (verdict, detail, stdout, the WHOLE refusal text).
 
     ONE `vl` invocation per healthy cell — `run` first, and `check` only when the run
@@ -127,7 +129,7 @@ def grade_full(path, compiler, want, vl=VL, env=None, timeout=120):
     return where, detail, out, err
 
 
-def grade(path, compiler, want, vl=VL, env=None, timeout=120):
+def grade(path, compiler, want, vl=VL, env=None, timeout=TIMEOUT):
     """`grade_full` without the refusal text — the shape `matrix.py` and the runner use."""
     verdict, detail, out, _err = grade_full(path, compiler, want, vl, env, timeout)
     return verdict, detail, out
