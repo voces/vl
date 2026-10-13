@@ -280,6 +280,35 @@ import {
   RLK_STR_LIST,
   RLK_U8_LIST,
   RLK_UNION,
+  TSK_CLOSURE,
+  TSK_CLO_ENV,
+  TSK_CLO_SIG,
+  TSK_F32_ARRAY,
+  TSK_F32_LIST,
+  TSK_F64_ARRAY,
+  TSK_F64_LIST,
+  TSK_I32_ARRAY,
+  TSK_I32_LIST,
+  TSK_I64_ARRAY,
+  TSK_I64_LIST,
+  TSK_MAP,
+  TSK_MAP_I32,
+  TSK_MAP_I64,
+  TSK_MV_MAP,
+  TSK_REF_BACK,
+  TSK_REF_WRAP,
+  TSK_RV_VIEW,
+  TSK_STRLIST_BACK,
+  TSK_STRLIST_WRAP,
+  TSK_STRUCT,
+  TSK_STR_BACK,
+  TSK_STR_HEADER,
+  TSK_SV_VIEW,
+  TSK_U8_ARRAY,
+  TSK_U8_LIST,
+  TSK_UNION_BOX,
+  TSK_VALUE_BOX,
+  TSK_VARIANT,
   VKind,
   aTypeIdx,
   aUsed,
@@ -408,6 +437,8 @@ import {
   localByNode,
   localDeclIx,
   localLitUnion,
+  mAllocKind,
+  mAllocSlot,
   mI32Used,
   mI64Used,
   mIntMonoArmUsed,
@@ -5245,15 +5276,19 @@ export function mfScan(ix: i32, fnIx: i32) {
 // Reset the interning counter (call once per module, before assigning indices).
 function mResetTypeIntern() {
   mNextType = 0
+  mAllocKind = []
+  mAllocSlot = []
   0
 }
 
 // Allocate the next heap-type index (interning in emit order): return the current
-// counter, then advance it by one. This is the single auditable place a type index
-// is minted — every `mIntern*` below funnels through here.
-function mAllocType() {
+// counter, then advance it by one, recording which family and row it is for
+// `emitTypeSection`. This is the single place a type index is minted.
+function mAllocType(kind: i32, slot: i32) {
   const idx = mNextType
   mNextType = mNextType + 1
+  mAllocKind.push(kind)
+  mAllocSlot.push(slot)
   idx
 }
 
@@ -5324,7 +5359,7 @@ function rvAssignViews() {
           rvSrcSlot.push(s)
           rvVariant.push(vi)
           rvNul.push(0)
-          rvViewTy.push(mAllocType())
+          rvViewTy.push(mAllocType(TSK_RV_VIEW, p))
         }
         // A nullable row twins its non-null one, so the view it shares tests for `null`.
         if rlElemNullable[s0] == 1 { rvNul[p] = 1 }
@@ -5346,21 +5381,21 @@ export function rvPairOf(s: i32, vi: i32): i32 {
 }
 
 // Walk the type-section emit order with the `mAllocType` counter, assigning each type's heap
-// index into the module-global index state; returns the functype base index (`typeOffset`). The
-// order must match the type-section emission exactly. An absent type family mints nothing, and
-// its index globals still take the counter position they would have occupied.
+// index into the module-global index state; returns the functype base index (`typeOffset`).
+// `mAllocKind`/`mAllocSlot` record the order for `emitTypeSection`. An absent family mints
+// nothing, and its index globals still take the counter position they would have occupied.
 export function mAssignTypeIndices(_n: i32) {
   mResetTypeIntern()
 
   // Standalone structs occupy the first indices, one heap type per distinct structure:
   // structural twins share a slot's heap index rather than minting a fresh one, so a `B`-value
   // and an `A`-slot use the same `(ref $S)`. `sTwin[i] < i` marks slot `i` a twin of an earlier
-  // one, and `emitTypeSection` skips the same twins in lock-step, keeping the counts in sync.
+  // one; a twin allocates nothing, so it has no entry in the recorded order.
   buildStructTwins()
   // Assigned in `structEmitOrder`, not in declaration order (D622): wasm requires a declared
   // supertype to hold a lower type index than its subtype, and a supertype here is a shorter
   // field list. The order function holds a row back until every proper prefix has an index and
-  // degenerates to declaration order otherwise. `emitTypeSection` walks the same function.
+  // degenerates to declaration order otherwise.
   sHeapIdx = []
   let shi = 0
   while shi < sNames.length {
@@ -5370,7 +5405,7 @@ export function mAssignTypeIndices(_n: i32) {
   const sOrd = structEmitOrder()
   let soi = 0
   while soi < sOrd.length {
-    sHeapIdx[sOrd[soi]] = mAllocType()
+    sHeapIdx[sOrd[soi]] = mAllocType(TSK_STRUCT, sOrd[soi])
     soi = soi + 1
   }
   // Twins take their representative's index; the representative is always in `sOrd`, so it
@@ -5395,36 +5430,40 @@ export function mAssignTypeIndices(_n: i32) {
       } else if uVarSTwinAt(vi) >= 0 {
         // The cross-table merge: this arm's layout IS a declared struct's, so it takes
         // that row's already-allocated heap index instead of minting a second one. The
-        // type section skips it in lock-step (`emitTypeSection`'s variant loop).
+        // type section has no entry for it.
         uVarHeap.push(sHeapIdx[uVarSTwinAt(vi)])
       } else {
-        uVarHeap.push(mAllocType())
+        uVarHeap.push(mAllocType(TSK_VARIANT, vi))
       }
       vi = vi + 1
     }
-    uBoxIdx = mAllocType()
+    uBoxIdx = mAllocType(TSK_UNION_BOX, 0)
     // The per-rep value boxes (`{ i32 }` / `{ i64 }` / `{ f32 }` / `{ f64 }`), in this fixed
     // rep order — only the reps a registered value union uses.
-    if vbI32Used { vbI32Idx = mAllocType() }
-    if vbI64Used { vbI64Idx = mAllocType() }
-    if vbF32Used { vbF32Idx = mAllocType() }
-    if vbF64Used { vbF64Idx = mAllocType() }
-    if vbV128Used { vbV128Idx = mAllocType() }
+    if vbI32Used { vbI32Idx = mAllocType(TSK_VALUE_BOX, 0) }
+    if vbI64Used { vbI64Idx = mAllocType(TSK_VALUE_BOX, 1) }
+    if vbF32Used { vbF32Idx = mAllocType(TSK_VALUE_BOX, 2) }
+    if vbF64Used { vbF64Idx = mAllocType(TSK_VALUE_BOX, 3) }
+    if vbV128Used { vbV128Idx = mAllocType(TSK_VALUE_BOX, 4) }
   }
   // The raw i32 array (list and map backing), then `string`'s own backing array, then the string
   // header struct `{backing, start, len}`, then the i32-list wrapper. All three string-side
   // indices are minted from the one `aUsed` flag, which string use and list use both force, and
   // every string lowering already guards on it. The type section emits the triple in this order.
   if aUsed {
-    aTypeIdx = mAllocType()
-    sBackIdx = mAllocType()
-    sTypeIdx = mAllocType()
+    aTypeIdx = mAllocType(TSK_I32_ARRAY, 0)
+    sBackIdx = mAllocType(TSK_STR_BACK, 0)
+    sTypeIdx = mAllocType(TSK_STR_HEADER, 0)
   } else {
     aTypeIdx = mNextType
     sBackIdx = mNextType
     sTypeIdx = mNextType
   }
-  if lUsed { lTypeIdx = mAllocType() } else { lTypeIdx = mNextType }
+  if lUsed {
+    lTypeIdx = mAllocType(TSK_I32_LIST, 0)
+  } else {
+    lTypeIdx = mNextType
+  }
   // Ref-list slot dedup, the `sTwin` analogue: two slots emit identical (backing, wrapper) pairs
   // exactly when they resolve to the same element heap, so after struct dedup `A[]` and `B[]`
   // must share one wrapper. `rlTwin[s]` is `s`'s representative, from a signature knowable up
@@ -5506,8 +5545,8 @@ export function mAssignTypeIndices(_n: i32) {
       rlBackIdx[rs] = rlBackIdx[rlTwin[rs]]
       rlWrapIdx[rs] = rlWrapIdx[rlTwin[rs]]
     } else {
-      rlBackIdx[rs] = mAllocType()
-      rlWrapIdx[rs] = mAllocType()
+      rlBackIdx[rs] = mAllocType(TSK_REF_BACK, rs)
+      rlWrapIdx[rs] = mAllocType(TSK_REF_WRAP, rs)
     }
     if rlElemKindTbl[rs] == RLK_UNION {
       rlElemHeap[rs] = uBoxIdx
@@ -5581,28 +5620,32 @@ export function mAssignTypeIndices(_n: i32) {
   // The string-ref list (keys backing + keys wrapper), shared by the map's keys
   // list AND any `string[]` field (present when `slUsed || mUsed`).
   if slUsed || mUsed {
-    mkArrIdx = mAllocType()
-    mkListIdx = mAllocType()
+    mkArrIdx = mAllocType(TSK_STRLIST_BACK, 0)
+    mkListIdx = mAllocType(TSK_STRLIST_WRAP, 0)
   } else {
     mkArrIdx = mNextType
     mkListIdx = mNextType + 1
   }
   // The map struct (present only when `mUsed`); `mStructIdxPre` is this counter
   // position, precomputed above for the ref-pair loop.
-  if mUsed { mStructIdx = mAllocType() } else { mStructIdx = mStructIdxPre }
+  if mUsed {
+    mStructIdx = mAllocType(TSK_MAP, 0)
+  } else {
+    mStructIdx = mStructIdxPre
+  }
   // The i32-KEYED map struct, immediately after its string-keyed twin (present only
   // when `mI32Used`, so no index moves in a program without one). Identical 7 fields
   // with `keys` re-typed to the i32 list wrapper — both of whose heap types are
   // already assigned above, so it needs no forward reference.
   if mI32Used {
-    mStructI32Idx = mAllocType()
+    mStructI32Idx = mAllocType(TSK_MAP_I32, 0)
   } else {
     mStructI32Idx = mStructIdx
   }
   // The i64-KEYED map struct, after its i32-keyed twin and gated the same way; its `keys` field
   // is the i64 list wrapper, whose heap types `ia64Used` mints further down.
   if mI64Used {
-    mStructI64Idx = mAllocType()
+    mStructI64Idx = mAllocType(TSK_MAP_I64, 0)
   } else {
     mStructI64Idx = mStructIdx
   }
@@ -5610,8 +5653,8 @@ export function mAssignTypeIndices(_n: i32) {
   // shifts: the `(array (mut f64))` backing first, then its `{backing,len,cap}` wrapper struct,
   // which references the backing. Present only when `fa64Used`.
   if fa64Used {
-    fa64TypeIdx = mAllocType()
-    fl64TypeIdx = mAllocType()
+    fa64TypeIdx = mAllocType(TSK_F64_ARRAY, 0)
+    fl64TypeIdx = mAllocType(TSK_F64_LIST, 0)
   } else {
     fa64TypeIdx = mNextType
     fl64TypeIdx = mNextType + 1
@@ -5620,8 +5663,8 @@ export function mAssignTypeIndices(_n: i32) {
   // index shifts" discipline): the `(array (mut i64))` backing then its `{backing,len,cap}`
   // wrapper. Present only when `ia64Used`; aliases its slots otherwise (zero types minted).
   if ia64Used {
-    ia64TypeIdx = mAllocType()
-    il64TypeIdx = mAllocType()
+    ia64TypeIdx = mAllocType(TSK_I64_ARRAY, 0)
+    il64TypeIdx = mAllocType(TSK_I64_LIST, 0)
   } else {
     ia64TypeIdx = mNextType
     il64TypeIdx = mNextType + 1
@@ -5630,8 +5673,8 @@ export function mAssignTypeIndices(_n: i32) {
   // `(array (mut f32))` backing then its `{backing,len,cap}` wrapper. Present only when
   // `fa32Used`; aliases its slots otherwise (zero types minted).
   if fa32Used {
-    fa32TypeIdx = mAllocType()
-    fl32TypeIdx = mAllocType()
+    fa32TypeIdx = mAllocType(TSK_F32_ARRAY, 0)
+    fl32TypeIdx = mAllocType(TSK_F32_LIST, 0)
   } else {
     fa32TypeIdx = mNextType
     fl32TypeIdx = mNextType + 1
@@ -5641,8 +5684,8 @@ export function mAssignTypeIndices(_n: i32) {
   // wrapper. Present only when `ba8Used`; aliases its slots otherwise, so a program with
   // no `u8[]` mints nothing and every earlier heap-type index is untouched.
   if ba8Used {
-    ba8TypeIdx = mAllocType()
-    bl8TypeIdx = mAllocType()
+    ba8TypeIdx = mAllocType(TSK_U8_ARRAY, 0)
+    bl8TypeIdx = mAllocType(TSK_U8_LIST, 0)
   } else {
     ba8TypeIdx = mNextType
     bl8TypeIdx = mNextType + 1
@@ -5650,7 +5693,7 @@ export function mAssignTypeIndices(_n: i32) {
   // The scalar list views (D3028), after every wrapper they subtype or keep a source of.
   let svk = 0
   while svk < 3 {
-    if svPairOn(svk) { svViewTy[svk] = mAllocType() }
+    if svPairOn(svk) { svViewTy[svk] = mAllocType(TSK_SV_VIEW, svk) }
     svk = svk + 1
   }
   rvAssignViews()
@@ -5679,7 +5722,7 @@ export function mAssignTypeIndices(_n: i32) {
   // per capturing lifted function, capture order being field order. Only when `fnValUsed`.
   fnEnvIdx = []
   if fnValUsed {
-    cloStructIdx = mAllocType()
+    cloStructIdx = mAllocType(TSK_CLOSURE, 0)
     // A CLOSURE-element ref-list slot (kind 5, `((i32) => i32)[]`) backs onto the closure
     // fat-pointer struct. `cloStructIdx` is interned HERE (after the ref-pair loop above),
     // so backfill those slots' element heap type now — the backing array `(array (mut (ref
@@ -5693,7 +5736,7 @@ export function mAssignTypeIndices(_n: i32) {
     cloSigBase = mNextType
     let sa = 0
     while sa < cloSigKeys.length {
-      mAllocType()
+      mAllocType(TSK_CLO_SIG, sa)
       sa = sa + 1
     }
     // One env struct per capturing lifted function (in `fnStmts` order). A
@@ -5701,7 +5744,11 @@ export function mAssignTypeIndices(_n: i32) {
     let fe = 0
     while fe < fnStmts.length {
       const ncap = captureCountOf(fe)
-      if ncap > 0 { fnEnvIdx.push(mAllocType()) } else { fnEnvIdx.push(-1) }
+      if ncap > 0 {
+        fnEnvIdx.push(mAllocType(TSK_CLO_ENV, fe))
+      } else {
+        fnEnvIdx.push(-1)
+      }
       fe = fe + 1
     }
   } else {
@@ -5733,7 +5780,7 @@ export function mAssignTypeIndices(_n: i32) {
       }
       mvMapTypeIdx[mvi] = mvMapTypeIdx[mvRep]
     } else {
-      mvMapTypeIdx[mvi] = mAllocType()
+      mvMapTypeIdx[mvi] = mAllocType(TSK_MV_MAP, mvi)
     }
     mvi = mvi + 1
   }

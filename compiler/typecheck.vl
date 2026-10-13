@@ -15080,16 +15080,20 @@ function symDecl(name: string, declNode: i32, ty: i32, kind: i32) {
   // Visibility for completion: a binding is visible across its own innermost scope. Stamped
   // before the occurrence dedup so a demand-inference re-check refreshes the span.
   symStampVis(name, declNode, kind, scopeSL.length - 1)
+  symOccPushDecl(declNode)
+}
+
+// Record the declaration occurrence of `declNode`, once per source token: a function body
+// re-checked during demand-inference would otherwise stamp the same identifier twice. A
+// declaration is never narrowed — it is the binding, and its type is the one `symRetainType`
+// just banked. See `symOccTy` in `check_state`.
+function symOccPushDecl(declNode: i32) {
   const tok = symDeclTok(declNode)
-  // Idempotent by token: a function body re-checked during demand-inference would
-  // otherwise stamp the same source identifier twice.
   if symOccSkipTok(tok) { return 0 }
   symOccTok.push(tok)
   symOccRecordTok(tok)
   symOccDecl.push(declNode)
   symOccIsDecl.push(1)
-  // A declaration is never narrowed — it is the binding, and its type is the one `symRetainType`
-  // just banked. See `symOccTy` in `check_state`.
   symOccTy.push(-1)
   0
 }
@@ -15146,14 +15150,7 @@ function symDeclInOuter(name: string, declNode: i32, ty: i32, kind: i32) {
   let outerSpan = scopeSL.length - 2
   if outerSpan < 0 { outerSpan = scopeSL.length - 1 }
   symStampVis(name, declNode, kind, outerSpan)
-  const tok = symDeclTok(declNode)
-  if symOccSkipTok(tok) { return 0 }
-  symOccTok.push(tok)
-  symOccRecordTok(tok)
-  symOccDecl.push(declNode)
-  symOccIsDecl.push(1)
-  symOccTy.push(-1) // a declaration is never narrowed (see `symDecl`)
-  0
+  symOccPushDecl(declNode)
 }
 
 // Resolve `name` to its binding's decl node through the decl-scope chain
@@ -32653,30 +32650,27 @@ let canonCleared: i32[] = []
 // emitter's collect-site gate.
 export let canonTyIxCol: i32[] = []
 
-export function canonTyIxOf(ix: i32): i32 {
+// The slot of node `ix` in `canonCleared` (and so in `canonTyIxCol`), or -1 when canon left it alone.
+function canonClearedSlot(ix: i32): i32 {
   let lo = 0
   let hi = canonCleared.length - 1
   while lo <= hi {
     const mid = lo + (hi - lo) / 2
     const at = canonCleared[mid]
-    if at == ix { return canonTyIxCol[mid] }
+    if at == ix { return mid }
     if at < ix { lo = mid + 1 } else { hi = mid - 1 }
   }
   -1
 }
 
-// Did `canonEmitTypeNames` rewrite node `ix` in place (and drop its spelling tree)?
-export function canonRewroteNode(ix: i32): boolean {
-  let lo = 0
-  let hi = canonCleared.length - 1
-  while lo <= hi {
-    const mid = lo + (hi - lo) / 2
-    const at = canonCleared[mid]
-    if at == ix { return true }
-    if at < ix { lo = mid + 1 } else { hi = mid - 1 }
-  }
-  false
+export function canonTyIxOf(ix: i32): i32 {
+  const s = canonClearedSlot(ix)
+  if s < 0 { return -1 }
+  canonTyIxCol[s]
 }
+
+// Did `canonEmitTypeNames` rewrite node `ix` in place (and drop its spelling tree)?
+export function canonRewroteNode(ix: i32): boolean { canonClearedSlot(ix) >= 0 }
 
 // The spelling each rewrite below replaced, as a node column, a member slot and the text
 // that stood there. `driver.vl`'s parse bank writes them back, so the lint reads the names
@@ -33359,9 +33353,19 @@ export function binPlusIsListByTy(lt: i32, rt: i32) {
 function fnSlotAssignable(src: i32, dst: i32) {
   if numWidens(src, dst) { return false }
   if objNumWidens(src, dst) { return false }
+  if fnSlotAtomToString(src, dst) { return assignable(src, dst) }
   if containerElemClassDiffers(src, dst) { return false }
   if fnSlotNulDiffers(src, dst) { return false }
   assignable(src, dst)
+}
+
+// Whether a function slot widens a string literal union's atom to `string` (or `string | null`).
+// The reps differ, so a delivered function value is wrapped in an adapter that converts at the
+// call (`fvaAdapt`); a function held inside a container is refused there instead (D4351).
+function fnSlotAtomToString(src: i32, dst: i32): boolean {
+  if elemStoreClassOf(src, 8) != ESC_ATOM { return false }
+  const d = nonNullTy(dst)
+  d >= 0 && primNameOf(d) == "string"
 }
 
 // The half of a function slot's valtype `elemStoreClassOf` deliberately does not carry:
@@ -33371,6 +33375,13 @@ function fnSlotAssignable(src: i32, dst: i32) {
 function fnSlotNulDiffers(src: i32, dst: i32) {
   if elemStoreClassOf(src, 8) == ESC_UNKNOWN { return false }
   if elemStoreClassOf(dst, 8) == ESC_UNKNOWN { return false }
+  // A nullable atom is the atom's own i32 with a reserved null id, so the valtype agrees.
+  if (
+    elemStoreClassOf(src, 8) == ESC_ATOM
+    && elemStoreClassOf(dst, 8) == ESC_ATOM
+  ) {
+    return false
+  }
   tyBearsNull(src) != tyBearsNull(dst)
 }
 
@@ -44142,9 +44153,9 @@ function bmArgPred(form: i32, got: i32, want: i32, argIx: i32) {
   if form == BM_PUSH || form == BM_SETVAL || form == BM_KEYMUST {
     return assignableExpr(argIx, got, want)
   }
-  if form == BM_SETKEY {
+  if form == BM_SETKEY || form == BM_ADDKEY {
     // The expression form first: a MEMBER literal is a legal key of a literal-union-keyed
-    // map, and its own type is the member, not the `string` `checkNode` hands back (D1748).
+    // map or set, and its own type is the member, not the `string` `checkNode` hands back (D1748).
     if assignableExpr(argIx, got, want) { return true }
     return nomSlotAccepts(argIx, got, want)
   }
@@ -62782,15 +62793,16 @@ export function optCallRestamp(ix: i32) {
   0
 }
 
+// Element `i` of a per-node column, or -1 when `i` is outside it.
+function colAt(col: i32[], i: i32): i32 {
+  if i >= 0 && i < col.length { return col[i] }
+  -1
+}
+
 // The resolved type-arena index the checker recorded for AST node `ix`, or -1 if none (an
 // emitter-synthesized node, or a node never checked). The emitter reads the `Ty` at this
 // index to lower the node by its checked type rather than re-deriving it syntactically.
-export function nodeTyIxOf(ix: i32) {
-  if ix >= 0 {
-    if ix < nodeTyIx.length { return nodeTyIx[ix] }
-  }
-  -1
-}
+export function nodeTyIxOf(ix: i32) { colAt(nodeTyIx, ix) }
 // Annotation atom count (#1055): how many top-level `|`-joined atoms the annotation node
 // `ix`'s emit-time spelling has, banked by `canonEmitTypeNames`. -1 for a node that is not a
 // `TypeRef` or that postdates the bank (an emitter-synthesized annotation); >= 1 otherwise.
@@ -62801,12 +62813,7 @@ export function annUnionAtomsOf(ix: i32) {
 // The arena type the `is` test at node `ix` checks AGAINST — what the narrowing binds the
 // tested place to — or -1 for a node the checker never resolved (an emitter-synthesized
 // `is`, or a non-`IsExpr` node). Recorded by `checkIsExprNode`.
-export function isVarTyIxOf(ix: i32) {
-  if ix >= 0 {
-    if ix < isVarTyIx.length { return isVarTyIx[ix] }
-  }
-  -1
-}
+export function isVarTyIxOf(ix: i32) { colAt(isVarTyIx, ix) }
 // Whether the write at assignment node `ix` into a guard-narrowed bare name kept the narrowing it
 // found, so the reads after it lower at the member they already did.
 export function asgKeepsNarrowOf(ix: i32): boolean {
@@ -62816,12 +62823,7 @@ export function asgKeepsNarrowOf(ix: i32): boolean {
 // The type the assignment at node `ix` re-narrows its bare-name target to, or -1 when the
 // write retired no narrowing and the reads after it are at the declared type. The emitter's
 // half of the reads-only rule: it pushes the member this names (D1736).
-export function asgNarTyIxOf(ix: i32) {
-  if ix >= 0 {
-    if ix < asgNarTyIx.length { return asgNarTyIx[ix] }
-  }
-  -1
-}
+export function asgNarTyIxOf(ix: i32) { colAt(asgNarTyIx, ix) }
 // Whether the place the assignment at node `ix` writes reads at the member its pin lands on:
 // the reads after it carry the pin, not the template's narrowing (D3240).
 export function asgTvWriteOf(ix: i32): boolean {
@@ -62878,30 +62880,15 @@ function recordPgResidualVoid(ix: i32) {
 // The first arm-join row of the `if` at node `ix`, or -1. The emitter walks the chain with
 // `joinRowNext` and pushes each name at `joinRowTy`, so the reads below the `if` lower at the
 // join the checker typed them with (D1846).
-export function joinHeadOf(ix: i32) {
-  if ix >= 0 {
-    if ix < joinHead.length { return joinHead[ix] }
-  }
-  -1
-}
+export function joinHeadOf(ix: i32) { colAt(joinHead, ix) }
 export function joinRowName(r: i32) {
   if r >= 0 {
     if r < joinName.length { return joinName[r] }
   }
   ""
 }
-export function joinRowTy(r: i32) {
-  if r >= 0 {
-    if r < joinTy.length { return joinTy[r] }
-  }
-  -1
-}
-export function joinRowNext(r: i32) {
-  if r >= 0 {
-    if r < joinNext.length { return joinNext[r] }
-  }
-  -1
-}
+export function joinRowTy(r: i32) { colAt(joinTy, r) }
+export function joinRowNext(r: i32) { colAt(joinNext, r) }
 // Rename arm-join row `r`: a binding a closure writes is read through its cell once the
 // capture rewrite runs, and the emitter's push has to name what the reads name.
 export function joinRowRename(r: i32, name: string) {
@@ -62922,21 +62909,11 @@ function recordArmJoin(ix: i32, name: string, ty: i32) {
 // The type the receiver of a member-path `is` test narrows to in the then branch — the
 // discriminant rule's answer, banked at the `is` node. -1 when the test does not discriminate
 // a parent union, which is when the emitter should push nothing.
-export function isParentTyIxOf(ix: i32) {
-  if ix >= 0 {
-    if ix < isParentTyIx.length { return isParentTyIx[ix] }
-  }
-  -1
-}
+export function isParentTyIxOf(ix: i32) { colAt(isParentTyIx, ix) }
 // The else-branch twin: the type the receiver of a member-path test narrows to when the test
 // is false. -1 when the complement does not refine the parent, which is when the emitter
 // should push nothing.
-export function isParentElseTyIxOf(ix: i32) {
-  if ix >= 0 {
-    if ix < isParentElseTyIx.length { return isParentElseTyIx[ix] }
-  }
-  -1
-}
+export function isParentElseTyIxOf(ix: i32) { colAt(isParentElseTyIx, ix) }
 // The context-resolved companion of `nodeTyIxOf`: returns the destination type recorded by
 // `recordRepTyAdopt` at an adoption site when present, else the naive `nodeTyIxOf`. The
 // emitter's rep/layer resolvers key on this so a widened literal's row resolves to the shape
@@ -62951,10 +62928,7 @@ export function nodeRepTyIxOf(ix: i32) {
   nodeTyIxOf(ix)
 }
 // The map type a union of maps at `ix` is delivered as, or -1 (`recordMapUnbox`).
-export function mapUnboxTyOf(ix: i32): i32 {
-  if ix >= 0 && ix < mapUnboxTyIx.length { return mapUnboxTyIx[ix] }
-  -1
-}
+export function mapUnboxTyOf(ix: i32): i32 { colAt(mapUnboxTyIx, ix) }
 
 // Records `dstTy` for a delivery of `srcExpr` whose type `srcTy` is a union of maps and whose
 // destination is one map, or that map's nullable: every member is assignable to it, so every
@@ -74339,6 +74313,10 @@ export function luSpell(ty: i32): string {
   if luSpellsAs(dn, ty) { return dn }
   const en = tyToEmitName(ty)
   if en != "" && luSpellsAs(en, ty) { return en }
+  // A function type's display name spaces its arrow, which no annotation name does; its emit
+  // name spells a literal-union parameter by its old base scalar.
+  const an = luArrowTight(dn)
+  if an != dn && luSpellsAs(an, ty) { return an }
   // A union naming a type parameter, whose written form resolves to one member when its lists
   // meet: spelled for the pin to substitute, and typed through `luAnnTy`.
   if luUnionSpellsByMember(ty) { return dn }
@@ -74368,6 +74346,28 @@ function luPipeTight(s: string): string {
     if i + 2 < s.length && s[i] == ' ' && s[i + 1] == '|' && s[i + 2] == ' ' {
       out = out + "|"
       i = i + 3
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// `s` with the spaces around each ` => ` dropped, the form an annotation's function type takes.
+function luArrowTight(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if (
+      i + 3 < s.length
+      && s[i] == ' '
+      && s[i + 1] == '='
+      && s[i + 2] == '>'
+      && s[i + 3] == ' '
+    ) {
+      out = out + "=>"
+      i = i + 4
     } else {
       out = out + s.slice(i, i + 1)
       i = i + 1
@@ -74749,6 +74749,21 @@ function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
   tr
 }
 
+// The function arm of union `u` that a value of function type `src` converts into; -1 when no
+// arm needs a conversion to take it, -2 when more than one converting arm would.
+function fvaUnionArm(u: TyUnion, src: i32): i32 {
+  let found = -1
+  for m in u.uMembers {
+    if m == src || tyEq(m, src) { return -1 }
+    if T.tys[m] is TyFunc && assignable(src, m) {
+      if !fvaFnMayDiffer(src, m, 8) { return -1 }
+      if found >= 0 { return -2 }
+      found = m
+    }
+  }
+  found
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
@@ -74786,6 +74801,20 @@ function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if dt < 0 { return false }
   const d = T.tys[dt]
   const s = T.tys[srcTy]
+  if s is TyFunc && d is TyUnion {
+    // A function delivered into a union lands in the one function arm it converts to.
+    const arm = fvaUnionArm(d, srcTy)
+    if arm >= 0 { return fvaAdapt(srcExpr, srcTy, arm) }
+    if arm == -2 {
+      fvaRefuse(
+        srcExpr,
+        srcTy,
+        dt,
+        "it converts into more than one function arm of the union",
+      )
+      return true
+    }
+  }
   if !(s is TyFunc) || !(d is TyFunc) {
     // A function inside a container is not rewritten on the way, so a call through the
     // destination's function type would reach it at another signature.
