@@ -361,7 +361,7 @@ The probes in §3.2 were run on that commit the same day.
 
 **Host after the compile.**
 - `-O`/`-O3` run, in order: strip `vl-src`, the inline-record step, the multi-value step, the
-  escape-inline step, `rung_scan`, then `wasm-opt` (`optimize_in_place`, `main.rs:6648`).
+  escape-inline step, `rung_argv` (the compiler's `optRungArgv`), then `wasm-opt` (`optimize_in_place`, `main.rs:6648`).
 - `wasm-opt` is found on `PATH` or through `$VL_WASM_OPT` (`binaryen_tool`, 5431).
 - `run` and `test` compile the result with Cranelift.
 

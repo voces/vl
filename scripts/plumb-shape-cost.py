@@ -346,7 +346,7 @@ def main(argv: list[str]) -> int:
     # A host before D2336 has no size rule; it passes locally, and CI (`--require-fuel`) grades it.
     with open(vl, "rb") as fh:
         host_bytes = fh.read()
-        host_skips = b"--skip-pass=ssa-nomerge" in host_bytes or b"optRungScan" in host_bytes
+        host_skips = b"--skip-pass=ssa-nomerge" in host_bytes or b"optRung" in host_bytes
     for uname, m in units.items():
         b = bases[uname]
         tag = f"{uname} "

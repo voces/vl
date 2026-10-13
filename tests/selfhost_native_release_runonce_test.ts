@@ -19,6 +19,7 @@ import {
   logsOf,
   ROOT,
   rustList,
+  vlList,
   vl,
   WASM_DIS,
   WASM_OPT,
@@ -115,7 +116,7 @@ for (const fx of FIXTURES) {
         }
         const opt = await run(WASM_OPT, [
           plain,
-          ...rustList(mainRs, "RELEASE_PASSES"),
+          ...vlList("RELEASE_PASSES"),
           ...features,
           "-o",
           `${tmp}/c.wasm`,

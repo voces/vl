@@ -16,6 +16,7 @@ import {
   exists,
   nativeEnv,
   rustList,
+  vlList,
   vl,
 } from "./support/nativeRelease.ts";
 import { wasmDis } from "./support/tree.ts";
@@ -47,8 +48,8 @@ Deno.test({
       if (asm.code !== 0) throw new Error(`wasm-as rejected the fixture: ${asm.err.trim()}`);
 
       for (const [label, passes] of [
-        ["-O", rustList(mainRs, "OPT_PASSES")],
-        ["-O3", rustList(mainRs, "RELEASE_PASSES")],
+        ["-O", vlList("OPT_PASSES")],
+        ["-O3", vlList("RELEASE_PASSES")],
       ] as const) {
         const out = `${tmp}/opt${label}.wasm`;
         const r = await sh(WASM_OPT, [base, ...passes, ...features, "-o", out]);

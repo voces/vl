@@ -297,13 +297,14 @@ either flag set. §7.
 
 ## 6. Where this is wired
 
-- `scripts/vl-host/src/main.rs` — `RELEASE_PASSES` (the flag set), `OPT_PASSES`,
-  `BINARYEN_FEATURES` (shared with `--wat` so the binaryen call sites cannot
-  drift), `optimize_in_place`, and `rung_scan`, whose answer from the compiler's `optRungScan`
-  (`compiler/opt_scan.vl`) prefixes both rungs with a
+- `compiler/opt_scan.vl` — `RELEASE_PASSES` (the flag set), `OPT_PASSES`, and `optRungArgv`,
+  which builds the rung's whole argv and prefixes both rungs with a
   `--no-inline=<f>` per hot callee of run-once code (DECISIONS.md, "`-O3` keeps hot callees
   out of run-once code"; pinned by `tests/selfhost_native_release_runonce_test.ts` over
   `tests/fixtures/opt-runonce/`).
+- `scripts/vl-host/src/main.rs` — `BINARYEN_FEATURES` (shared with `--wat` so the binaryen
+  call sites cannot drift), `rung_argv`, which asks the compiler for that argv, and
+  `optimize_in_place`.
 - `tests/fixtures/opt-melt/*.vl` — the melt fixtures.
 - `tests/fixtures/opt-loop/*.vl` — the loop-shape fixtures (§7).
 - `tests/selfhost_native_release_test.ts` — the melt table and the loop-shape table
