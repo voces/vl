@@ -11,8 +11,8 @@
 //      without it), and a BYPASS variable neither hits nor stores.
 //   4. A forged result that differs from a cold compile exits 71 under verify mode.
 //   5. Stage S2, the `-O` chain (`-O hit`, `-O miss`, … in the trace): a hit's module and
-//      source map equal a cold run's, and each chain input misses — the rung, a keyed
-//      variable, a `BINARYEN_*` variable, the `wasm-opt` swapped or missing, `-o` under
+//      source map equal a cold run's, and each chain input misses — the rung, the seed, a
+//      keyed variable, a `BINARYEN_*` variable, the `wasm-opt` swapped or missing, `-o` under
 //      `--source-map` — while `-o` alone and a comment edit still hit.
 //   6. The guard against an unrecorded input: every guest export the host calls and every
 //      `CMD_*` code is classified below, and an unclassified one fails this file.
@@ -419,6 +419,27 @@ testOpt("-O3: each chain input misses; -o without --source-map does not", async 
     const o = await after(OPT, ["build", "main.vl", "-O3", "-o", "o3.wasm"]);
     expect([o.code, o.t], [0, ["-O hit"]], "-o alone");
     expect(await Deno.readFile(`${p}/o3.wasm`), await Deno.readFile(`${p}/o.wasm`), "-o alone: same bytes");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+testOpt("-O3: the seed is a chain input, since its optRungScan reads the rung's input", async () => {
+  const { tmp, p } = await setup();
+  try {
+    // The same compiler with one empty custom section appended: every emitted byte is the
+    // same, so only the seed's own key can make the chain miss.
+    const seed = `${tmp}/seed.wasm`;
+    await Deno.writeFile(seed, new Uint8Array([...await Deno.readFile(COMPILER), 0, 2, 1, 0x78]));
+    // `--compiler`, not `$VL_COMPILER_WASM`: a `VL_*` variable is keyed on its own.
+    const a = await vl(["build", "main.vl", "-O3", "-o", "a.wasm", "--compiler", COMPILER], p);
+    const b = await vl(["build", "main.vl", "-O3", "-o", "b.wasm", "--compiler", seed], p);
+    expect(
+      [a.code, optTrace(a.trace), b.code, optTrace(b.trace)],
+      [0, ["-O miss", "-O stored"], 0, ["-O miss", "-O stored"]],
+      "another seed",
+    );
+    expect(await Deno.readFile(`${p}/b.wasm`), await Deno.readFile(`${p}/a.wasm`), "same module");
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }
