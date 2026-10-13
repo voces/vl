@@ -681,6 +681,17 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      the instance. In `captured-lambda-alias-call`, the closures no longer capture the
      renamed binding. `monoCoerceLetValues` still picks the pin from the first read rather
      than from the let slot.
+   - Ninth PR: `monoCoerceLetValues` is split by job, and its `n:`/`c:` key goes.
+     `monoCoerceWrittenLetValues` records the written `let`'s signature and instances the
+     generics its initializer and writes name. `monoCoerceWrittenCell` takes and retypes a
+     capture cell's seed and writes. `monoLetWriteFrame` is the one walk both use to find the
+     live writes. Neither half reads its pin from the let slot yet. In shadow over
+     `tests/cases`, a pin read from the class disagreed with the recorded signature in 25
+     files, 7 of them running fixtures. The class is an undirected union: the
+     lambda copied into a binding and the other bindings it reaches share its class, so a
+     call through any of them pins the binding (`closures/delivered-alias-pins-written-lambda`
+     calls `e` at `string` directly while `d` is held at `i32`). The let slot can decide the
+     pin once its pins are the ones the binding's value flows to, not every pin in the class.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
