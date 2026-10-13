@@ -1,0 +1,550 @@
+// `cli_budget.vl` — `vl check --budget <baseline>`: a per-file lint ratchet held by the
+// lint itself. The baseline is a JSON file naming a `label`, the `writer` that rewrites
+// it, the `targets`/`exclude` to walk, the per-code `total`, the per-file counts and the
+// named `entries`; the CLI feeds every finding of a budgeted code through `budgetNote`
+// and prints `budgetCheckLines` or `budgetWhyLines`. It reads a baseline, never writes
+// one. docs/internals/architecture-refactor-plan.md T2.
+
+import { pushCps } from "./strutil"
+import { i32ToStr } from "./ast"
+import { cliStrGt } from "./cli_util"
+
+let bgLabel = ""
+let bgWriter = ""
+let bgCommit = ""
+let bgTargets: string[] = []
+let bgExclude: string[] = []
+let bgCodes: string[] = []
+let bgTotal: i32[] = []
+let bgFileRel: string[] = []
+let bgFileCode: string[] = []
+let bgFileN: i32[] = []
+let bgHasEntries = false
+let bgEntCode: string[] = []
+let bgEntName: string[] = []
+let bgEntN: i32[] = []
+let bgSeen: {[string]: boolean} = Map()
+let bgHitCode: string[] = []
+let bgHitRel: string[] = []
+let bgHitName: string[] = []
+
+// The JSON reader's cursor: the baseline as code points, a position, the first error.
+let bjCps: i32[] = []
+let bjPos = 0
+let bjErr = ""
+
+function bjFail(msg: string) {
+  if bjErr == "" { bjErr = msg + " at offset " + i32ToStr(bjPos) }
+  0
+}
+function bjPeek(): i32 {
+  while (
+    bjPos < bjCps.length
+    && (bjCps[bjPos] == ' '
+      || bjCps[bjPos] == '\n'
+      || bjCps[bjPos] == '\r'
+      || bjCps[bjPos] == '\t')
+  ) {
+    bjPos = bjPos + 1
+  }
+  if bjPos < bjCps.length { return bjCps[bjPos] }
+  -1
+}
+function bjExpect(c: i32): boolean {
+  if bjPeek() == c {
+    bjPos = bjPos + 1
+    return true
+  }
+  bjFail("expected `" + fromCodePoints([c]) + "`")
+  false
+}
+function bjHex(c: i32): i32 {
+  if c >= '0' && c <= '9' { return c - '0' }
+  if c >= 'a' && c <= 'f' { return c - 'a' + 10 }
+  if c >= 'A' && c <= 'F' { return c - 'A' + 10 }
+  bjFail("bad `\\u` escape")
+  0
+}
+// Four hex digits after a `\u`, the cursor left on the last one.
+function bjU4(): i32 {
+  if bjPos + 4 >= bjCps.length {
+    bjFail("short `\\u` escape")
+    return 0
+  }
+  let v = 0
+  let k = 0
+  while k < 4 {
+    bjPos = bjPos + 1
+    v = v * 16 + bjHex(bjCps[bjPos])
+    k = k + 1
+  }
+  v
+}
+function bjString(): string {
+  if bjPeek() != '"' {
+    bjFail("expected a string")
+    return ""
+  }
+  bjPos = bjPos + 1
+  const out: i32[] = []
+  while bjPos < bjCps.length && bjCps[bjPos] != '"' {
+    let c = bjCps[bjPos]
+    if c == '\\' && bjPos + 1 < bjCps.length {
+      bjPos = bjPos + 1
+      const e = bjCps[bjPos]
+      c = e
+      if e == 'n' { c = '\n' }
+      if e == 't' { c = '\t' }
+      if e == 'r' { c = '\r' }
+      if e == 'b' { c = 8 }
+      if e == 'f' { c = 12 }
+      if e == 'u' {
+        c = bjU4()
+        // A surrogate pair: `ensure_ascii` output spells one astral code point as two.
+        if (
+          c >= 55296
+          && c < 56320
+          && bjPos + 2 < bjCps.length
+          && bjCps[bjPos + 1] == '\\'
+          && bjCps[bjPos + 2] == 'u'
+        ) {
+          bjPos = bjPos + 2
+          const lo = bjU4()
+          c = 65536 + (c - 55296) * 1024 + (lo - 56320)
+        }
+      }
+    }
+    out.push(c)
+    bjPos = bjPos + 1
+  }
+  if bjPos >= bjCps.length {
+    bjFail("unterminated string")
+    return ""
+  }
+  bjPos = bjPos + 1
+  fromCodePoints(out)
+}
+function bjInt(): i32 {
+  let neg = false
+  if bjPeek() == '-' {
+    neg = true
+    bjPos = bjPos + 1
+  }
+  if bjPos >= bjCps.length || bjCps[bjPos] < '0' || bjCps[bjPos] > '9' {
+    bjFail("expected a count")
+    return 0
+  }
+  let v = 0
+  while bjPos < bjCps.length && bjCps[bjPos] >= '0' && bjCps[bjPos] <= '9' {
+    v = v * 10 + (bjCps[bjPos] - '0')
+    bjPos = bjPos + 1
+  }
+  if neg { return 0 - v }
+  v
+}
+// Step over one value of any shape — a field this reader has no use for.
+function bjSkip() {
+  const c = bjPeek()
+  if c == '"' {
+    bjString()
+  } else if c == '{' || c == '[' {
+    let close = ']'
+    if c == '{' { close = '}' }
+    bjPos = bjPos + 1
+    if bjPeek() == close {
+      bjPos = bjPos + 1
+      return 0
+    }
+    while bjErr == "" {
+      if c == '{' {
+        bjString()
+        bjExpect(':')
+      }
+      bjSkip()
+      if bjPeek() != ',' { break }
+      bjPos = bjPos + 1
+    }
+    bjExpect(close)
+  } else {
+    const start = bjPos
+    while (
+      bjPos < bjCps.length
+      && bjCps[bjPos] != ','
+      && bjCps[bjPos] != '}'
+      && bjCps[bjPos] != ']'
+      && bjCps[bjPos] != ' '
+      && bjCps[bjPos] != '\n'
+    ) {
+      bjPos = bjPos + 1
+    }
+    if bjPos == start { bjFail("expected a value") }
+  }
+  0
+}
+// `[<string>, …]` onto `into`.
+function bjStrList(into: string[]) {
+  if !bjExpect('[') { return 0 }
+  if bjPeek() == ']' {
+    bjPos = bjPos + 1
+    return 0
+  }
+  while bjErr == "" {
+    into.push(bjString())
+    if bjPeek() != ',' { break }
+    bjPos = bjPos + 1
+  }
+  bjExpect(']')
+  0
+}
+// `{<code>: <count>, …}`, each pair handed to `bgCountPair` under `rel` ("" = the total).
+function bjCounts(rel: string) {
+  if !bjExpect('{') { return 0 }
+  if bjPeek() == '}' {
+    bjPos = bjPos + 1
+    return 0
+  }
+  while bjErr == "" {
+    const code = bjString()
+    bjExpect(':')
+    const n = bjInt()
+    if rel == "" {
+      bgCodes.push(code)
+      bgTotal.push(n)
+    } else {
+      bgFileRel.push(rel)
+      bgFileCode.push(code)
+      bgFileN.push(n)
+    }
+    if bjPeek() != ',' { break }
+    bjPos = bjPos + 1
+  }
+  bjExpect('}')
+  0
+}
+function bjFiles() {
+  if !bjExpect('{') { return 0 }
+  if bjPeek() == '}' {
+    bjPos = bjPos + 1
+    return 0
+  }
+  while bjErr == "" {
+    const rel = bjString()
+    bjExpect(':')
+    bjCounts(rel)
+    if bjPeek() != ',' { break }
+    bjPos = bjPos + 1
+  }
+  bjExpect('}')
+  0
+}
+// `[[<code>, <name>, <hits>], …]`.
+function bjEntries() {
+  bgHasEntries = true
+  if !bjExpect('[') { return 0 }
+  if bjPeek() == ']' {
+    bjPos = bjPos + 1
+    return 0
+  }
+  while bjErr == "" {
+    bjExpect('[')
+    bgEntCode.push(bjString())
+    bjExpect(',')
+    bgEntName.push(bjString())
+    bjExpect(',')
+    bgEntN.push(bjInt())
+    bjExpect(']')
+    if bjPeek() != ',' { break }
+    bjPos = bjPos + 1
+  }
+  bjExpect(']')
+  0
+}
+
+// Read baseline `src`, replacing any earlier one and every finding noted against it.
+// Returns "" or what is wrong with the file; a baseline must name a `label` and a `total`.
+export function budgetLoad(src: string): string {
+  bgLabel = ""
+  bgWriter = ""
+  bgCommit = ""
+  bgTargets = []
+  bgExclude = []
+  bgCodes = []
+  bgTotal = []
+  bgFileRel = []
+  bgFileCode = []
+  bgFileN = []
+  bgHasEntries = false
+  bgEntCode = []
+  bgEntName = []
+  bgEntN = []
+  bgSeen = Map()
+  bgHitCode = []
+  bgHitRel = []
+  bgHitName = []
+  bjCps = []
+  pushCps(bjCps, src)
+  bjPos = 0
+  bjErr = ""
+  if bjExpect('{') && bjPeek() != '}' {
+    while bjErr == "" {
+      const key = bjString()
+      bjExpect(':')
+      if key == "label" { bgLabel = bjString() }
+      else if key == "writer" { bgWriter = bjString() }
+      else if key == "commit" { bgCommit = bjString() }
+      else if key == "targets" { bjStrList(bgTargets) }
+      else if key == "exclude" { bjStrList(bgExclude) }
+      else if key == "total" { bjCounts("") }
+      else if key == "files" { bjFiles() }
+      else if key == "entries" { bjEntries() }
+      else { bjSkip() }
+      if bjPeek() != ',' { break }
+      bjPos = bjPos + 1
+    }
+  }
+  bjExpect('}')
+  if bjErr == "" && bgLabel == "" { bjErr = "it names no `label`" }
+  if bjErr == "" && bgCodes.length == 0 {
+    bjErr = "it budgets no code (`total`)"
+  }
+  bjCps = []
+  bjErr
+}
+
+// The paths and `--exclude` globs the baseline says to walk.
+export function budgetTargets(): string[] { bgTargets }
+export function budgetExcludes(): string[] { bgExclude }
+
+// Whether findings of lint `code` count against the loaded budget.
+export function budgetWants(code: string): boolean {
+  for c in bgCodes {
+    if c == code { return true }
+  }
+  false
+}
+
+// One finding of `code` at `line:col` of checkout-relative `rel`, whose source line is
+// `text`. A position already noted (one module reached from two targets) counts once.
+export function budgetNote(
+  code: string,
+  rel: string,
+  line: i32,
+  col: i32,
+  text: string,
+) {
+  const key = code + " " + rel + ":" + i32ToStr(line) + ":" + i32ToStr(col)
+  if bgSeen[key] ?? false { return 0 }
+  bgSeen[key] = true
+  bgHitCode.push(code)
+  bgHitRel.push(rel)
+  bgHitName.push(rel + ": " + bgTrim(text))
+  0
+}
+// `s` without leading or trailing ASCII whitespace — how an entry's source line is named.
+function bgTrim(s: string): string {
+  let a = 0
+  let b = s.length
+  while a < b && bgIsSpace(s[a]) { a = a + 1 }
+  while b > a && bgIsSpace(s[b - 1]) { b = b - 1 }
+  s.slice(a, b)
+}
+function bgIsSpace(c: i32): boolean {
+  c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 11 || c == 12
+}
+
+// `xs` sorted by code point and with repeats dropped.
+function bgSortedUniq(xs: string[]): string[] {
+  const out: string[] = []
+  for x in xs {
+    let j = out.length
+    out.push(x)
+    while j > 0 && cliStrGt(out[j - 1], x) {
+      out[j] = out[j - 1]
+      j = j - 1
+    }
+    out[j] = x
+  }
+  const uniq: string[] = []
+  for x in out {
+    if uniq.length == 0 || uniq[uniq.length - 1] != x { uniq.push(x) }
+  }
+  uniq
+}
+function bgBaseCount(rel: string, code: string): i32 {
+  let i = 0
+  while i < bgFileRel.length {
+    if bgFileRel[i] == rel && bgFileCode[i] == code { return bgFileN[i] }
+    i = i + 1
+  }
+  0
+}
+function bgNowCount(rel: string, code: string): i32 {
+  let n = 0
+  let i = 0
+  while i < bgHitRel.length {
+    if bgHitRel[i] == rel && bgHitCode[i] == code { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+// The `--budget` report, one line per element; `budgetFailed()` says whether it red.
+// A file may only hold its baseline's count of a code or fewer.
+let bgFailed = false
+export function budgetFailed(): boolean { bgFailed }
+export function budgetCheckLines(baselinePath: string): string[] {
+  const bad: string[] = []
+  for rel in bgSortedUniq(bgHitRel) {
+    for code in bgCodes {
+      const now = bgNowCount(rel, code)
+      const was = bgBaseCount(rel, code)
+      if now > was {
+        bad.push(
+          "  "
+            + rel
+            + "  "
+            + code
+            + ": "
+            + i32ToStr(now)
+            + " (baseline "
+            + i32ToStr(was)
+            + ")",
+        )
+      }
+    }
+  }
+  const out: string[] = []
+  bgFailed = bad.length > 0
+  if bgFailed {
+    out.push(bgLabel + " budget REGRESSED — a file may only go down or stay:")
+    for b in bad { out.push(b) }
+    out.push("")
+    out.push("After a rewrite, lower the baseline with")
+    out.push("  python3 " + bgWriter + " --write-baseline")
+    return out
+  }
+  let ok = bgLabel + " budget ok — "
+  let below = false
+  let ci = 0
+  while ci < bgCodes.length {
+    let now = 0
+    for c in bgHitCode {
+      if c == bgCodes[ci] { now = now + 1 }
+    }
+    if ci > 0 { ok = ok + ", " }
+    ok = ok
+      + i32ToStr(now)
+      + " "
+      + bgCodes[ci]
+      + " (baseline "
+      + i32ToStr(bgTotal[ci])
+      + " or below)"
+    if now < bgTotal[ci] { below = true }
+    ci = ci + 1
+  }
+  out.push(ok)
+  if below {
+    out.push(
+      "  below baseline — `vl check --budget-why "
+        + baselinePath
+        + "` names which entries left",
+    )
+  }
+  out
+}
+
+// The `--budget-why` report: per code, the entries that `LEFT`, `ENTERED` or changed count
+// between the baseline's stored `entries` and this run. Without stored entries it is one
+// line saying so, and `budgetFailed()` is true.
+export function budgetWhyLines(): string[] {
+  const out: string[] = []
+  bgFailed = !bgHasEntries
+  if bgFailed {
+    out.push(
+      bgLabel
+        + ": the baseline stores no `entries`; re-run `python3 "
+        + bgWriter
+        + " --write-baseline`",
+    )
+    return out
+  }
+  out.push(bgLabel + ": " + bgCommit + " -> working tree")
+  out.push("")
+  let moved = 0
+  for code in bgCodes {
+    const was: {[string]: i32} = Map()
+    const wasNames: string[] = []
+    let wasSum = 0
+    let i = 0
+    while i < bgEntCode.length {
+      if bgEntCode[i] == code {
+        was[bgEntName[i]] = (was[bgEntName[i]] ?? 0) + bgEntN[i]
+        wasNames.push(bgEntName[i])
+        wasSum = wasSum + bgEntN[i]
+      }
+      i = i + 1
+    }
+    const now: {[string]: i32} = Map()
+    const nowNames: string[] = []
+    let nowSum = 0
+    let h = 0
+    while h < bgHitCode.length {
+      if bgHitCode[h] == code {
+        now[bgHitName[h]] = (now[bgHitName[h]] ?? 0) + 1
+        nowNames.push(bgHitName[h])
+        nowSum = nowSum + 1
+      }
+      h = h + 1
+    }
+    const a = bgSortedUniq(wasNames)
+    const b = bgSortedUniq(nowNames)
+    out.push(
+      code
+        + "  "
+        + i32ToStr(wasSum)
+        + " hits over "
+        + i32ToStr(a.length)
+        + " names -> "
+        + i32ToStr(nowSum)
+        + " over "
+        + i32ToStr(b.length),
+    )
+    let setMoved = 0
+    for n in a {
+      if (now[n] ?? 0) == 0 {
+        out.push("  LEFT     " + n + bgTimes(was[n] ?? 0))
+        setMoved = setMoved + 1
+      }
+    }
+    for n in b {
+      if (was[n] ?? 0) == 0 {
+        out.push("  ENTERED  " + n + bgTimes(now[n] ?? 0))
+        setMoved = setMoved + 1
+      }
+    }
+    let countMoved = 0
+    for n in a {
+      const k = now[n] ?? 0
+      if k > 0 && k != (was[n] ?? 0) {
+        out.push("  " + n + "  " + i32ToStr(was[n] ?? 0) + " -> " + i32ToStr(k))
+        countMoved = countMoved + 1
+      }
+    }
+    if wasSum == nowSum && setMoved == 0 {
+      out.push("  (the same entries, by name)")
+    }
+    out.push("")
+    moved = moved + setMoved + countMoved
+  }
+  if moved == 0 {
+    out.push(
+      "Nothing moved by name. A count that differs without a name moving is the "
+        + "instrument, not the tree.",
+    )
+  }
+  out
+}
+function bgTimes(k: i32): string {
+  if k > 1 { return "  (x" + i32ToStr(k) + ")" }
+  ""
+}

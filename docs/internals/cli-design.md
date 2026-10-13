@@ -429,6 +429,19 @@ is not that: it is reported as its own parse error and the other files still run
 one bad file in a directory run does. Single-path `--json` is byte-identical to what it was
 apart from the `stage` key.
 
+## `check --budget` — a per-file lint ratchet held by the lint
+
+`vl check --budget <baseline.json>` reads the baseline first (`ST_BUDGET_READ`), walks its
+`targets` with its `exclude` globs (named paths narrow that population), forces
+`--include-imports`, and counts every shown finding of a code the baseline's `total` names,
+once per position, named `"<checkout-relative path>: <trimmed source line>"`. Its stdout is
+the ratchet's verdict — `<label> budget ok — …` (exit 0) or `<label> budget REGRESSED — …`
+with one line per file whose count rose (exit 1) — and no diagnostics. `--budget-why`
+compares the baseline's stored `entries` with this run, by name (`LEFT`, `ENTERED`, count
+moved). It reads a baseline and never writes one: the `writer` the baseline names does.
+`compiler/cli_budget.vl`; the first ratchet on it is interp (architecture-refactor-plan T2),
+held to `scripts/interp-budget.py` by `tests/vl_budget_mode_test.ts`.
+
 ## `std:` diagnostics are withheld unless asked for (`--include-std`)
 
 A `vl check` target resolves its whole module graph, so every `import … from
@@ -491,7 +504,8 @@ The boundaries, and why each is where it is:
   not announced; errors survive it for the reason above.
 - **The whole-graph lint is still one flag away.** `scripts/lint-self.sh` and
   `scripts/interp-budget.py` pass `--include-imports` on `compiler/entry.vl`, so
-  the self-lint still covers every compiler module through the entry.
+  the self-lint still covers every compiler module through the entry; so does
+  `vl check --budget`, which sets it itself.
 - **The editor is unaffected.** The LSP lints the open document and reports
   per document; it never went through this report.
 
