@@ -66,6 +66,7 @@ import {
   asgTvWriteOf,
   atomicIntrinsicIsVoid,
   bindGenWalk,
+  cUserTypes,
   cUserTypesVer,
   callRetireAfterOf,
   callRetireBeforeOf,
@@ -16654,9 +16655,258 @@ function joinRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   const r = structIndexOfTy(ty)
   if r >= 0 { return r }
+  const s = joinRowScanOfTy(ty)
+  if s != -2 { return s }
   const nm = tyToEmitName(ty)
   if nm == "" { return -1 }
   structIndexOfTypeName(nm)
+}
+
+// `structIndexOfTypeName`'s field-set scan asked of the record type `ty`, for a record whose
+// every field is a primitive, a nullable primitive or a union of primitives: the row, or -1.
+// -2 for any other record, whose fields this does not decide.
+function joinRowScanOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -2 }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return -2 }
+  const ftys = t.objFieldTypes
+  if ftys.length == 0 { return -2 }
+  const wants: i32[] = []
+  for f in ftys {
+    const w = jrWantOf(f)
+    if w < 0 { return -2 }
+    wants.push(w)
+  }
+  const strict = jrScanK(t.objFieldNames, ftys, wants, 0)
+  if strict != -1 { return strict }
+  const box = jrScanK(t.objFieldNames, ftys, wants, 1)
+  if box != -1 { return box }
+  jrScanK(t.objFieldNames, ftys, wants, 2)
+}
+
+// `shapeRowScanK` over field types, at the same three leniencies and with the same strict-pass
+// preference and unique-claimant rule; -2 where a row's field is one `jrFieldFits` declines.
+function jrScanK(
+  fnames: string[],
+  ftys: i32[],
+  wants: i32[],
+  lenient: i32,
+): i32 {
+  let uniq = -1
+  let nHit = 0
+  let si = 0
+  const lim = sScanLim()
+  while si < lim {
+    // A row whose field rows are still being appended is skipped, as the name scan does.
+    if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
+      si = si + 1
+      continue
+    }
+    if sFieldCount[si] == fnames.length {
+      let ok = true
+      let k = 0
+      while ok && k < fnames.length {
+        const fj = sFieldIndex(si, fnames[k])
+        if fj < 0 {
+          ok = false
+        } else {
+          const f = jrFieldFits(ftys[k], wants[k], si, fj, lenient)
+          if f == -2 { return -2 }
+          if f == 0 { ok = false }
+        }
+        k = k + 1
+      }
+      if ok {
+        if lenient == 0 {
+          if jrCode0Fits(fnames, ftys, si) { return si }
+          if uniq < 0 { uniq = si }
+        } else {
+          if lenient < 2 { return si }
+          if uniq < 0 { uniq = si }
+          nHit = nHit + 1
+        }
+      }
+    }
+    si = si + 1
+  }
+  if lenient == 0 { return uniq }
+  if lenient >= 2 {
+    if nHit == 1 { return uniq }
+  }
+  -1
+}
+
+// The field code `nameFieldCode` gives the spelling of field type `f`, for the shapes
+// `joinRowScanOfTy` decides; -2 for any other.
+function jrWantOf(f: i32): i32 {
+  const seq: PrimName[] = []
+  const shape = jrPrimSeqOf(f, seq)
+  for p in seq {
+    if jrPrimShadowed(p) { return -2 }
+  }
+  if shape == 1 { return jrPrimCode(seq[0]) }
+  if shape == 2 {
+    match seq[0] {
+      "string" => {
+        return FC_NUL_STR
+      }
+      "boolean" => {
+        return FC_NUL_BOOL
+      }
+      "i32" | "f64" | "i64" | "f32" => {
+        return FC_UNION
+      }
+      "v128" | "void" | "null" | "never" | "u8" => {
+        return -2
+      }
+    }
+  }
+  if shape != 3 || seq.length < 2 { return -2 }
+  for p in seq {
+    if jrPrimCode(p) < 0 { return -2 }
+  }
+  FC_UNION
+}
+
+// The field code of a field spelled as the primitive `p`, -2 for one outside this domain.
+function jrPrimCode(p: PrimName): i32 {
+  match p {
+    "i32" | "boolean" => {
+      return FC_I32
+    }
+    "f64" => {
+      return FC_F64
+    }
+    "i64" => {
+      return FC_I64
+    }
+    "f32" => {
+      return FC_F32
+    }
+    "string" => {
+      return FC_STR
+    }
+    "v128" | "void" | "null" | "never" | "u8" => {
+      return -2
+    }
+  }
+}
+
+// Whether a declared type takes the primitive's name, so its spelling names that declaration.
+function jrPrimShadowed(p: PrimName): boolean { cUserTypes[p] != null }
+
+// Appends the primitives `f` spells, in order and with duplicates dropped as the render drops
+// them, and answers its shape: 1 a primitive, 2 a nullable primitive (`p`, then `null`), 3 a
+// union of primitives, 0 any other type.
+function jrPrimSeqOf(f: i32, out: PrimName[]): i32 {
+  if f < 0 || f >= T.tys.length { return 0 }
+  const t = T.tys[f]
+  // Exhaustive over `Ty` and `_`-less: only the three primitive shapes answer.
+  match t {
+    TyPrim => {
+      if t.primName == "never" { return 0 }
+      out.push(t.primName)
+      return 1
+    }
+    TyNullable => {
+      if t.nInner < 0 { return 0 }
+      const it = T.tys[t.nInner]
+      if !(it is TyPrim) || it.primName == "never" { return 0 }
+      out.push(it.primName)
+      out.push("null")
+      return 2
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if m < 0 || m >= T.tys.length { return 0 }
+        const mt = T.tys[m]
+        if !(mt is TyPrim) || mt.primName == "never" { return 0 }
+        let dup = false
+        for q in out {
+          if q == mt.primName { dup = true }
+        }
+        if !dup { out.push(mt.primName) }
+      }
+      if out.length == 0 { return 0 }
+      return 3
+    }
+    TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return 0
+    }
+  }
+}
+
+// `shapeFieldTypeCompatK` for field type `fty` coded `want` against row `si`'s field `fj`:
+// 1 compatible, 0 a proven mismatch, -2 a union box whose row member sequence is unknown here.
+function jrFieldFits(fty: i32, want: i32, si: i32, fj: i32, lenient: i32): i32 {
+  const code = sFieldTypeAt(si, fj)
+  if code < 0 { return 1 }
+  const elem = sFieldElemNameAt(si, fj)
+  if want != code {
+    if lenient >= 1 && code == FC_UNION { return 1 }
+    if lenient >= 2 {
+      if want == FC_I32 {
+        if code == FC_I64 || code == FC_F32 || code == FC_NUL_LIT_UNION {
+          return 1
+        }
+        // Only the spelling `boolean` widens into the `boolean | null` niche.
+        if code == FC_NUL_BOOL {
+          const ft = T.tys[fty]
+          if ft is TyPrim {
+            if ft.primName == "boolean" { return 1 }
+          }
+          return 0
+        }
+      }
+      if want == FC_STR {
+        if code == FC_NUL_STR || code == FC_NUL_LIT_UNION { return 1 }
+        if code == FC_I32 {
+          if elem != "" { return 1 }
+          return 0
+        }
+      }
+    }
+    return 0
+  }
+  // A primitive spelling is never a literal union, so it takes no atom row.
+  if want == FC_I32 {
+    if elemIsLitUnion(elem) { return 0 }
+    return 1
+  }
+  if want == FC_UNION && elem != "" {
+    const et = sFieldElemTyIxAt(si, fj)
+    const qs: PrimName[] = []
+    const rs: PrimName[] = []
+    if jrPrimSeqOf(fty, qs) == 0 || jrPrimSeqOf(et, rs) == 0 { return -2 }
+    if qs.length != rs.length { return 0 }
+    let i = 0
+    while i < qs.length {
+      if qs[i] != rs[i] { return 0 }
+      i = i + 1
+    }
+  }
+  1
+}
+
+// Whether a field shaped `{…, n: i32}` or `{…, n: boolean}` meets that same code-0 kind in row
+// `si`'s own type for every such field — `code0SpellingFitsRow` asked of field types.
+function jrCode0Fits(fnames: string[], ftys: i32[], si: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  let k = 0
+  while k < fnames.length {
+    let tk = 0
+    const ft = T.tys[ftys[k]]
+    if ft is TyPrim {
+      if ft.primName == "i32" { tk = 1 }
+      if ft.primName == "boolean" { tk = 2 }
+    }
+    if tk != 0 {
+      const rk = rowFieldCode0Kind(si, fnames[k])
+      if rk != 0 && rk != tk { return false }
+    }
+    k = k + 1
+  }
+  true
 }
 
 // Whether the non-literal record arm `tv` of a join built at struct row `slot` is built at a row
@@ -22902,7 +23152,7 @@ function shapeFieldTypeCompatK(
     // litunion-atom slots): a `{f: K0}` spelling must not adopt a plain row (a member
     // literal would emit as a string into an i32 slot), and a plain spelling must not
     // adopt an atom row (ids read back as booleans). Both sides decidable, proven-mismatch only.
-    if nameIsLitUnionType(t) != nameIsLitUnionType(elem) { return false }
+    if nameIsLitUnionType(t) != elemIsLitUnion(elem) { return false }
     return true
   }
   if want == FC_I32_LIST {
@@ -22938,6 +23188,9 @@ function shapeFieldTypeCompatK(
   }
   true
 }
+
+// Whether a row's recorded field type-name `elem` is a literal union.
+function elemIsLitUnion(elem: string): boolean { nameIsLitUnionType(elem) }
 
 // True unless the two nested-struct type spellings `ta` / `elem` are proven to denote
 // distinct structures: both resolve through the checker's canonical structural key
