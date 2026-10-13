@@ -260,10 +260,10 @@ done
 # RECORD WHAT THIS SEED WAS BUILT FROM. A grade taken against `$OUT` is a grade of these
 # sources and nothing else could say so: a timestamp cannot, because `git archive`, `cp`, a
 # rebase and a checkout all hand a stale artifact a fresh mtime — CLAUDE.md's cargo rule,
-# verify behaviourally never by timestamp. `scripts/seed_provenance.py` recomputes the same
+# verify behaviourally never by timestamp. `scripts/seed-provenance.vl` recomputes the same
 # fold over the working tree, so a tool grading against a seed can refuse when they differ.
 # A miss here is LOUD, not a note: a seed shipped with no sidecar is provenance-blind and
-# grades against whatever tree is checked out. `record-seed-provenance.sh` owns the interpreter
-# fallback and the sentence; `set -e` carries its refusal out of this script.
-"$(dirname "$0")/record-seed-provenance.sh" "$OUT"
+# grades against whatever tree is checked out. `record-seed-provenance.sh` runs that VL script
+# with the seed just built ($OUT exists and is warm here); `set -e` carries its refusal out.
+VL="$VL" "$(dirname "$0")/record-seed-provenance.sh" "$OUT"
 echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl; $sidecars engine-tag sidecar(s) warm"

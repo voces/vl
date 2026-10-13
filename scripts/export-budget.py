@@ -7,8 +7,8 @@ whose only consumer is the tree itself, it is a blind spot the size of the expor
 list, and 14 emitter exports plus 5 front-end ones sat in it
 (docs/internals/code-quality-survey-2026-09/emitter.md 8.1, front-end 4.2).
 
-Sibling of scripts/comment-budget.py, scripts/scan-budget.py,
-scripts/ladder-budget.py and `vl check --budget` (sentinel). The baseline schema,
+Sibling of scripts/ladder-budget.py and `vl check --budget` (comment, scan,
+interp, sentinel). The baseline schema,
 the `--check`/`--why` commands and the exit codes are scripts/ratchet.py, shared
 with the other four ratchets; this file is the census — the reference count and
 the dead-export walk. This baseline starts AT ZERO: the tree it landed on had

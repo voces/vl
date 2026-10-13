@@ -473,7 +473,7 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   to resume, and its bar fell 6.0 to 2.5 with it. **An axis is only a guard for an entity it HAS**:
   D1514 was cubic in the callback-parameter count for a year of this file's life and every
   pair here was green, because none of them varied that count.
-* **`arena-scan-outside-pass`** (compiler/lint.vl) with `scripts/scan-budget.py`'s ratchet —
+* **`arena-scan-outside-pass`** (compiler/lint.vl) with `vl check --budget scripts/scan-budget-baseline.json` —
   a loop bounded by a whole-program table inside a function that is neither a pass nor
   allow-listed. Fires at REVIEW time, before the cost exists: 107 stand today, and the
   per-file count may only fall. A scan resuming from a memo is exempt, since that is the fix.

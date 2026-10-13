@@ -923,7 +923,23 @@ one step wider and costs a heap type per negation. **Recommendation: (a)** — a
 constraint on a type, not a type with a runtime shape, and (b) buys a boxed `i32` for a feature
 almost nothing uses. If (a), the checker owes the sentence and D1773 closes as DESIGN.
 
-### one-literal-union-rep — should a literal union's TYPE carry its REP?
+### one-literal-union-rep — should a literal union's TYPE carry its REP? — RULED 2026-10-13
+
+**Ruling (owner, 2026-10-13): (c) for strings.** Every STRING literal union reps as the interned
+i32 atom whatever its spelling, `type K = "a" | "b"` and inline `("a" | "b")` alike, because a
+string compare is expensive and an atom compare is one `i32.eq`. A NUMERIC literal union
+(`1 | 2`) keeps its base scalar. The rep is a function of the TYPE, never of alias-ness. A mixed
+union (`"a" | string`, `"a" | 1`) is not ruled and keeps today's rep.
+
+**Applied 2026-10-13.** The rep layer and the `$fnsig` producers ask the structural
+`tyIsLitUnion`; the checker's copy-provenance table, which existed only so a narrowed copy of
+an alias could be recognised as one, is retired. No module under `tests/` or in the corpus moved
+a byte: an annotated inline spelling was already an atom through the D2150 hidden-alias
+registration. The one inline union nothing registered, the inferred join of two different
+literal unions, was D4039's invalid wasm and now runs. Three `inline-litunion-*` position
+matrices grade every position in both faces. One narrower predicate stays registry-gated, `tyIsLitUnionAlias`, for node consumers
+whose producer can still deliver a string ref (a generic instance whose pin softened a single
+literal to `string`, D2827).
 
 Raised 2026-09-06 by the "one rep per node" campaign
 (`docs/internals/rep-descriptor-campaign.md`), whose first converted classifier measured the

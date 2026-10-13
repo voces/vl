@@ -347,7 +347,8 @@ def main(argv):
     # A spliced row (two status lines, a duplicated id, a status too far from its
     # heading) splits into a bad file; refuse before reading a single row (#2431).
     if mode & {"--verify", "--apply"}:
-        scan = subprocess.run([sys.executable, "scripts/inventory/splice-scan.py"],
+        scan = subprocess.run(["scripts/vl-host/target/release/vl", "run",
+                               "scripts/inventory/splice-scan.vl"],
                               capture_output=True, text=True)
         if scan.returncode != 0:
             return die("splice-scan found a spliced row — fix it before splitting:\n"

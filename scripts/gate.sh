@@ -153,10 +153,10 @@ run "native-fixpoint"          bash scripts/native-fixpoint.sh
 # self-compile against a row that already does two costs the table nothing.
 run "self-compile time"        bash scripts/self-compile-time.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
-# The comment-budget RATCHET: per-file counts of the two comment lint codes may only
+# The comment-budget RATCHET: per-file counts of the four comment lint codes may only
 # fall. lint-self.sh holds those codes out of its own `info` gate while the baseline
-# is non-zero, so this is what stops the tree drifting back up meanwhile.
-run "comment budget"           "$PY" scripts/comment-budget.py --check
+# is non-zero (it is at zero now, so they gate there outright); held by the lint itself.
+run "comment budget"           "$VL" check --budget scripts/comment-budget-baseline.json --compiler "$SEED"
 # The seed-size RATCHET: the compiler's own bytes, against a committed baseline, so a
 # jump names the landing that bought it rather than being found weeks later. It reads
 # the seed built above — ONE self-compile, which off a stale seed is the OLD codegen's
@@ -180,7 +180,7 @@ run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler 
 # The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.
-run "arena-scan budget"        "$PY" scripts/scan-budget.py --check
+run "arena-scan budget"        "$VL" check --budget scripts/scan-budget-baseline.json --compiler "$SEED"
 # The kind-ladder RATCHET, third of the same shape: a ladder over a closed kind set is
 # exhaustive over it or its default NAMES what it excludes. Also re-derives the lint's
 # copy of every closed set from the `export type` that declares it and FAILS on drift.
@@ -250,7 +250,7 @@ run "survey measurements"      bash scripts/survey-profile.sh
 # Both run on `scripts/capability-probes.vl`, the VL port of `run.py`.
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
-run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
+run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
 run "distilled corpus"         "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
