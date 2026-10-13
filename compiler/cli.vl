@@ -122,6 +122,16 @@ import {
   cliUpper,
   cliVisualWidth,
 } from "./cli_util"
+import {
+  budgetCheckLines,
+  budgetExcludes,
+  budgetFailed,
+  budgetLoad,
+  budgetNote,
+  budgetTargets,
+  budgetWants,
+  budgetWhyLines,
+} from "./cli_budget"
 
 // ── `vl` CLI — the brain in VL (docs/cli-design.md) ──────────────────────────
 // The command-queue half of the CLI. The host (`scripts/vl-host`) is a thin pump: it
@@ -187,6 +197,7 @@ const ST_TEST_POOLED = 18    // the host committed every queued file's compile o
 const ST_SIB_LIST = 19       // got the listing of the checked file's own directory
 const ST_SIB_READ = 20       // got a file outside the module graph, read for its exports
 const ST_VALIDATE_READ = 21  // got a named file's source while checking every path exists
+const ST_BUDGET_READ = 22    // got the `--budget` baseline's source
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -222,6 +233,8 @@ let cliExcludes: string[] = [] // --exclude glob patterns (normalized)
 let cliIncludeStd = 0          // --include-std: report std's own warnings too
 let cliIncludeImports = 0      // --include-imports: report imported modules' warnings too
 let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
+let cliBudget = 0              // 1 = --budget <baseline>, 2 = --budget-why <baseline>
+let cliBudgetPath = ""         // that baseline's path
 
 // ── work + output ──────────────────────────────────────────────────────────────
 let cliEntrySrc = ""      // the entry file's source
@@ -1147,6 +1160,15 @@ function cliParseArgs() {
       cliFmtCheck = 1
     } else if sub == "check" && a == "--fix" {
       cliFix = 1
+    } else if sub == "check" && (a == "--budget" || a == "--budget-why") {
+      cliBudget = 1
+      if a == "--budget-why" { cliBudget = 2 }
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliBudgetPath = cliArgs[i + 1]
+        i = i + 1
+      } else {
+        cliUsageErr("check: " + a + " requires a baseline file")
+      }
     } else if sub == "test" && a == "-t" {
       if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
         cliTestFilter = cliArgs[i + 1]
@@ -1180,6 +1202,13 @@ function cliParseArgs() {
       cliTargets.push(a)
     }
     i = i + 1
+  }
+  if (
+    cliArgErr == ""
+    && cliBudget != 0
+    && (cliFix != 0 || cliJson != 0 || cliBatch != 0)
+  ) {
+    cliArgErr = "check: --budget reports a verdict of its own; it takes no --fix, --json or --batch"
   }
   if cliArgErr == "" && cliTestJobs < 0 {
     cliArgErr = "test: --jobs expects a positive count"
@@ -1552,6 +1581,11 @@ function cliCheckCurFileRest() {
   }
 
   cliSrcLines = cliSplitLines(cliEntrySrc)
+  if cliBudget != 0 {
+    cliBudgetCollect()
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFile()
+  }
   const thr = cliSevRank(cliSeverity)
   let disp = 0
   if cliSeverityGiven != 0 { disp = thr }
@@ -1613,6 +1647,50 @@ function cliCheckCurFileRest() {
   // This file is done (reported); advance to the next.
   cliFileIdx = cliFileIdx + 1
   cliStartFile()
+}
+
+// `--budget`: note this file's findings of every budgeted code, at any severity, that the
+// report would show, named by checkout-relative path and source line and kept only
+// inside the trees the baseline's targets name.
+function cliBudgetCollect() {
+  const tops: string[] = []
+  for t in budgetTargets() { tops.push(cliTopSeg(cliPathKey(t))) }
+  let d = 0
+  while d < dgSev.length {
+    if budgetWants(dgCode[d]) && cliDiagWithheld(d) == "shown" {
+      const rel = cliPathKey(cliDiagFile(d))
+      let inside = false
+      for t in tops {
+        if t == cliTopSeg(rel) { inside = true }
+      }
+      const lines = cliDiagSrcLines(d)
+      let text = ""
+      if dgLine[d] >= 1 && dgLine[d] <= lines.length {
+        text = lines[dgLine[d] - 1]
+      }
+      if inside { budgetNote(dgCode[d], rel, dgLine[d], dgCol[d], text) }
+    }
+    d = d + 1
+  }
+  0
+}
+// The first `/`-separated segment of `path`.
+function cliTopSeg(path: string): string {
+  let i = 0
+  while i < path.length && path[i] != '/' { i = i + 1 }
+  path.slice(0, i)
+}
+// `--budget`'s verdict, or `--budget-why`'s names, as the run's stdout.
+function cliBudgetFinish() {
+  let lines = budgetWhyLines()
+  if cliBudget == 1 { lines = budgetCheckLines(cliBudgetPath) }
+  let text = ""
+  for l in lines { text = text + l + "\n" }
+  cliJsonOut = text
+  cliExit = 0
+  if budgetFailed() { cliExit = 1 }
+  if cliBudget == 2 && budgetFailed() { cliExit = 2 }
+  0
 }
 
 // A `--batch` entry the host could not read. It gets its OWN record — exit 2, the code
@@ -2299,6 +2377,13 @@ function cliPathKey(path: string): string {
   out
 }
 
+// Expand the targets (the working directory when none is named) and walk the first.
+function cliBeginTargets() {
+  if cliTargets.length == 0 { cliTargets = ["."] }
+  cliTargetIdx = 0
+  cliClassifyTarget()
+}
+
 // Dispatch the per-file loop on the subcommand: `check` runs the checker, `fmt`
 // reformats.
 function cliStartWork() {
@@ -2310,7 +2395,7 @@ function cliStartWork() {
 // build the summary and start printing.
 function cliStartFile() {
   if cliFileIdx >= cliFiles.length {
-    cliFinishSummary()
+    if cliBudget != 0 { cliBudgetFinish() } else { cliFinishSummary() }
     return cliBeginPrint()
   }
   cliCurFile = cliFiles[cliFileIdx]
@@ -3530,9 +3615,26 @@ export function cliNext() {
       cliState = ST_FMT_STDIN
       return CMD_READ_STDIN
     }
-    if cliTargets.length == 0 { cliTargets = ["."] }
-    cliTargetIdx = 0
-    return cliClassifyTarget() // — classify the target (dir vs file)
+    if cliBudget != 0 {
+      cliCmdPath = cliBudgetPath
+      cliState = ST_BUDGET_READ
+      return CMD_READ_FILE
+    }
+    return cliBeginTargets()
+  }
+  if st == ST_BUDGET_READ {
+    let err = "cannot read it"
+    if cliFileFound != 0 { err = budgetLoad(cliFileSrc) }
+    if err != "" {
+      cliOut = ["check: --budget " + cliBudgetPath + ": " + err]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    // The baseline names the population it counts; a named path narrows it.
+    if cliTargets.length == 0 { cliTargets = budgetTargets() }
+    for g in budgetExcludes() { cliAddExclude(g) }
+    cliIncludeImports = 1
+    return cliBeginTargets()
   }
   if st == ST_CLASSIFY {
     if cliDirWasDir != 0 {
