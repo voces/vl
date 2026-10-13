@@ -17082,11 +17082,11 @@ function assignParamNode(fnIx: i32, name: string): i32 {
   -1
 }
 
-// Seed an array literal returned from the un-annotated function at `fnPos` with that
-// function's inferred list kind, as an annotation seeds it. An empty `[]` inside a generic
+// Seed `ctx` for an array literal returned from the un-annotated function at `fnPos` with
+// that function's inferred list kind, as an annotation seeds it. An empty `[]` inside a generic
 // instance records the template's `T[]` (D2209); a `return ["s"]` beside a `return [1, "s"]`
 // records `string[]` while the joined result is `(i32 | string)[]` (D2716).
-function arrLitRetSeedFromKind(retArg: i32, fnPos: i32) {
+function arrLitRetSeedFromKind(retArg: i32, fnPos: i32, ctx: ExpCtx) {
   const ra = P.nodes[unwrapParen(retArg)]
   if !(ra is ArrayLit) { return 0 }
   if fnPos < 0 || fnPos >= fRetKind.length || fnPos >= fRetStructIdx.length {
@@ -17101,8 +17101,8 @@ function arrLitRetSeedFromKind(retArg: i32, fnPos: i32) {
   }
   const jk = listBuildKindOfVKind(fRetKind[fnPos], rs)
   if jk == LBK_I32_LIST { return 0 }
-  pendingListKind = jk
-  if fRetKind[fnPos] == "reflist" && rs >= 0 { pendingListSlot = rs }
+  ctx.listKind = jk
+  if fRetKind[fnPos] == "reflist" && rs >= 0 { ctx.listSlot = rs }
   0
 }
 
@@ -24603,12 +24603,13 @@ function retNullIntoNonNullRef(retArg: i32, fnIx: i32, fnPos: i32): boolean {
   rk == "struct" || rk == "variant"
 }
 
-// Lower a return-value expression `retArg` for function `fnIx`: seed the return context
-// from the function's return type, emit through the matching helper, then reset the
-// pending seeds. Does not emit `return` itself — the caller appends `fbReturn` or leaves
-// the value on the stack. Unifies explicit `return e` with implicit tail-position returns.
+// Lower a return-value expression `retArg` for function `fnIx`: build the return's `ExpCtx`
+// from the function's return type, emit through the matching helper under it, then restore
+// the caller's context. Does not emit `return` itself — the caller appends `fbReturn` or
+// leaves the value on the stack. Unifies explicit `return e` with implicit tail returns.
 function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   const fn = P.nodes[fnIx]
+  const ctx = expCtxHere()
   // the heap a niche struct/variant result names (`Circle | null`, `Dot | null`) — the
   // narrowed-arm unbox's destination at this boundary (D1031). A bare `: Circle` result
   // needs none: `retVi` routes it through `emitVariantCoerce`.
@@ -24642,23 +24643,21 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   if fn is FuncDecl {
     const rsi = retStructRowIndex(fn.fnRet)
     if rsi >= 0 {
-      if retTRFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
-      if retNulRefFlag(fn.fnRet) == 1 { pendingStructIdx = rsi }
+      if retTRFlag(fn.fnRet) == 1 { ctx.structIdx = rsi }
+      if retNulRefFlag(fn.fnRet) == 1 { ctx.structIdx = rsi }
       // D911 — the `??` merge redirect, on the returned value: the signature moved to the
       // merged row (gated on `anonLeafRetMovedOf`, a field-set row another function can
       // also resolve to), so without this the callee hands a narrow `struct.new` back
       // through a merged `(result (ref $merged))`. The three call sites read one kind so they cannot drift.
       const rvk = vtKindOfType(fn.fnRet)
       if rvk == "struct" || rvk == "nulstruct" {
-        if anonLeafRetMovedOf(fnIx) {
-          pendingStructIdx = anonLeafSupersedeOf(rsi)
-        }
+        if anonLeafRetMovedOf(fnIx) { ctx.structIdx = anonLeafSupersedeOf(rsi) }
       }
     }
     // A `: Cat` variant return: seed the variant index so a `return { … }` object literal
     // builds the bare variant struct (kind 8) instead of boxing into the union.
     if retVariantFlag(fn.fnRet) == 1 {
-      pendingVariantIdx = variantIndexOf(tyNameOf(fn.fnRet))
+      ctx.variantIdx = variantIndexOf(tyNameOf(fn.fnRet))
     }
     // A `: Circle | null` return seeds BOTH halves of its niche, as the nullable
     // boundaries elsewhere do: the variant index so a `return { … }` literal builds the
@@ -24667,8 +24666,8 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if retNulVariantFlag(fn.fnRet) == 1 {
       const rnvi = nulVariantIndexOf(fn.fnRet)
       if rnvi >= 0 && rnvi < uVarHeap.length {
-        pendingVariantIdx = rnvi
-        pendingNulRefHeap = uVarHeap[rnvi]
+        ctx.variantIdx = rnvi
+        ctx.nulRefHeap = uVarHeap[rnvi]
       }
       retArmHeap = armDestHeapOf("nulvariant", rnvi)
     }
@@ -24699,7 +24698,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if fn.fnRet < 0 {
       const rvi = cbRetVariantIdx(fnPos)
       if rvi >= 0 {
-        pendingVariantIdx = rvi
+        ctx.variantIdx = rvi
       } else if fnPos >= 0 && fnPos < fRetKind.length {
         // the classified pair, when the collapse arm has nothing — the same fact
         // `emitOneFuncType`'s inferred `variant` arm emits the result valtype from, so
@@ -24707,7 +24706,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
         // otherwise the literal still boxes into a `(ref $uVarHeap[vi])` result, invalid wasm.
         if fRetKind[fnPos] == "variant" {
           if fnPos < fRetStructIdx.length {
-            pendingVariantIdx = fRetStructIdx[fnPos]
+            ctx.variantIdx = fRetStructIdx[fnPos]
           }
         }
       }
@@ -24722,9 +24721,9 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
           if fnPos < fRetStructIdx.length {
             const nsi = fRetStructIdx[fnPos]
             if nsi >= 0 {
-              pendingStructIdx = nsi
+              ctx.structIdx = nsi
               if anonLeafRetMovedOf(fnIx) {
-                pendingStructIdx = anonLeafSupersedeOf(nsi)
+                ctx.structIdx = anonLeafSupersedeOf(nsi)
               }
             }
           }
@@ -24734,7 +24733,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
         if fRetKind[fnPos] == "nulvariant" && fnPos < fRetStructIdx.length {
           const nvr = fRetStructIdx[fnPos]
           if nvr >= 0 && nvr < uVarHeap.length {
-            pendingNulRefHeap = uVarHeap[nvr]
+            ctx.nulRefHeap = uVarHeap[nvr]
           }
         }
         // D937 — the nullable-map twin of the arm above: a map's null is not a struct
@@ -24746,13 +24745,13 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
           // `{[string]: string} | null` return needs its own slot, from the same home that
           // also seeds the constructor inside the body.
           const nmSlot = inferredRetMapSlot(fnPos)
-          pendingMapSlot = nmSlot
-          pendingNulRefHeap = mapTypeIdxOf(nmSlot)
+          ctx.mapSlot = nmSlot
+          ctx.nulRefHeap = mapTypeIdxOf(nmSlot)
         }
       }
     }
-    pendingListKind = tyAnnRefListKind(fn.fnRet)
-    pendingListSlot = tyAnnRefListSlot(fn.fnRet)
+    ctx.listKind = tyAnnRefListKind(fn.fnRet)
+    ctx.listSlot = tyAnnRefListSlot(fn.fnRet)
     // an un-annotated return has no annotation node for the two lines above to read, so an
     // empty `[]` needs its own seed (D16): the checker recorded the hole's real type on the
     // literal itself, and `criClassify`'s hole arm mints the result valtype from that same
@@ -24760,10 +24759,10 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if fn.fnRet < 0 {
       const hbk = emptyArrHoleBuildKind(retArg)
       if hbk != LBK_I32_LIST {
-        pendingListKind = hbk
-        pendingListSlot = emptyArrHoleBuildSlot(retArg)
+        ctx.listKind = hbk
+        ctx.listSlot = emptyArrHoleBuildSlot(retArg)
       } else {
-        arrLitRetSeedFromKind(retArg, fnPos)
+        arrLitRetSeedFromKind(retArg, fnPos, ctx)
       }
     }
   }
@@ -24885,7 +24884,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     // route the value through `emitVariantCoerce` so a mixed-rep value-`if` (a narrowed
     // union arm + a literal arm) lands in ONE variant rep. Overrides the `pendingVariantIdx`
     // literal seeding above — `emitVariantCoerce` builds the literal itself.
-    if retVi >= 0 { pendingVariantIdx = -1 }
+    if retVi >= 0 { ctx.variantIdx = -1 }
     if tyIsNulBool(fn.fnRet) { retNulBool = true }
     if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
     // A nullable-closure return (`((i32) => i32) | null`, kind 19): a `return null` lowers
@@ -24983,32 +24982,40 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
     }
   }
+  // A float literal in an f32 result lowers as `f32.const`.
+  if retF32 { ctx.wantF32 = true }
+  const saved = expCtxHere()
+  expCtxApply(ctx)
   if retF32 {
-    const savedF32 = pendingF32
-    pendingF32 = true
-    if emitExprAsF32(body, retArg, fnIx) < 0 { return -1 }
-    pendingF32 = savedF32
+    if emitExprAsF32(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
   } else if retF64 {
-    if emitExprAsF64(body, retArg, fnIx) < 0 { return -1 }
+    if emitExprAsF64(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
   } else if retI64 {
-    if emitExprAsI64(body, retArg, fnIx) < 0 { return -1 }
+    if emitExprAsI64(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
   } else if retVi >= 0 {
-    if emitVariantCoerce(body, retVi, retArg, fnIx) < 0 { return -1 }
+    if emitVariantCoerce(body, retVi, retArg, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if retUNm != "" {
     // `retUNm` is the union-BOX return (kind 4); a concrete variant `return s` (where `s: S`
     // and the return type is `C | S`) is boxed into the shared `{tag, payload}` rep here.
-    if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 { return -1 }
+    if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if retStrWiden {
     // A literal-union atom returned from a `string`-typed function widens to its member string.
     // A `K | null` value needs a result that holds `null`, which an inferred one does not
     // declare here (D3198).
     if !retNulString && retInferred && nulAtomWidenTexts(retArg).length > 0 {
-      return emitFailAt(
-        "emitProgram: an inferred return of a nullable literal union has no string result to widen into",
-        retArg,
+      return expCtxLeave(
+        saved,
+        emitFailAt(
+          "emitProgram: an inferred return of a nullable literal union has no string result to widen into",
+          retArg,
+        ),
       )
     }
-    if emitAtomToStr(body, retArg, fnIx) < 0 { return -1 }
+    if emitAtomToStr(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
   } else {
     const retCtx = expCtxHere()
     if retNulBool { retCtx.nulBool = true }
@@ -25048,9 +25055,12 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if retLitUnion || retNulLitUnion {
       const noMem = retStrLitNoMember(retArg, retNulLitTexts(fnIx), fnIx)
       if noMem >= 0 {
-        return emitFailAt(
-          "emitProgram: a returned string cannot be shown to be a member of the literal union this instantiation's result is",
-          noMem,
+        return expCtxLeave(
+          saved,
+          emitFailAt(
+            "emitProgram: a returned string cannot be shown to be a member of the literal union this instantiation's result is",
+            noMem,
+          ),
         )
       }
     }
@@ -25063,10 +25073,12 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
         emitNulStrJoinAsAtom(body, retArg, retNulLitTexts(fnIx), retCtx, fnIx)
         < 0
       ) {
-        return -1
+        return expCtxLeave(saved, -1)
       }
     } else {
-      if emitExprExpect(body, retArg, fnIx, retCtx) < 0 { return -1 }
+      if emitExprExpect(body, retArg, fnIx, retCtx) < 0 {
+        return expCtxLeave(saved, -1)
+      }
     }
     if retBoxToNulStr { emitBoxToNulStr() }
     // a return is a kind-9 use site that never grew the recover: a nullable-struct/variant
@@ -25099,14 +25111,9 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       emitNarrowedArmUnboxTo(retArmHeap, retArg)
     }
   }
-  // The null heap is one-shot, and only a bare `null` consumes it: a `return { … }` or
-  // `return Map()` leaves the seed set, and it would type the next function's `null` (D2564).
-  pendingStructIdx = -1
-  pendingVariantIdx = -1
-  pendingListKind = LBK_I32_LIST
-  pendingListSlot = 0
-  pendingNulRefHeap = -1
-  0
+  // The caller's context comes back whole: a seed a `return { … }` or `return Map()` leaves
+  // unconsumed would otherwise type the next function's `null` (D2564).
+  expCtxLeave(saved, 0)
 }
 
 // The member texts of the `K | null` result of function `fnIx`: its annotation's (a
@@ -28962,6 +28969,13 @@ export function expCtxApply(c: ExpCtx) {
   pendingRawNullRead = c.rawNullRead
   pendingLitUnion = c.litUnion
   0
+}
+
+// Restore the context `saved` and hand back `r`: the exit of a site that applied its own
+// context, on its success and its failure paths alike.
+function expCtxLeave(saved: ExpCtx, r: i32): i32 {
+  expCtxApply(saved)
+  r
 }
 
 // Emit `exprIx` under the explicit expected-type context `ctx`: the ambient
