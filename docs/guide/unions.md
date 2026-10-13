@@ -99,24 +99,32 @@ print(area({ kind: "square", r: 2.0 }))   // prints 4
 The answer depends on the value only. A `{ kind: "circle", r: 1.0 }` is a `Circle`
 whether or not it was ever declared as one.
 
-Today the arms' other fields must also have the same types. When they differ
-(`{ kind: "a", v: i32 } | { kind: "b", v: string }`), the program passes `vl check` and its
-build fails with "union `A|B` cannot be discriminated" (D3033).
+The arms' other fields may have different types too
+(`{ kind: "a", v: i32 } | { kind: "b", v: string }`).
 
-Arms with the same field names and no literal field to tell them apart are refused, and so
-are arms whose literal fields have no common base type (a string beside an integer):
+A discriminant is a convention, not a requirement. Arms with the same field names and no
+literal field form a legal union as well, and `is` tests whether each field's value fits the
+arm. When a value fits both arms, both tests are true:
 
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function f(s: A | B): boolean { s is A }
-// refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
+function f(s: A | B): string {
+  if s is A { return "A" }
+  "B"
+}
+print(f({ v: 3 }))      // prints A
+print(f({ v: true }))   // prints B
+
+type Wide = { v: i32 | string }
+type Text = { v: string }
+const w: Wide = { v: "hi" }
+const u: Wide | Text = w
+print(u is Text)   // prints true
 ```
 
-The first of these refusals is not a design rule: the owner ruled on 2026-10-12 (Q4 (c),
-DECISIONS.md §"Record arms that share a field name form a legal union") that the union is
-legal and `is` tests the value. The build is pending (D4056). The second prints the same sentence, which is false there,
-because both literal fields are present (D4056).
+Inside `if u is Text` over arms like these, `u` keeps the type `Wide | Text`: the value
+passed the test, but it is still laid out as the arm it was built as.
 
 ### Two names for one shape are one type
 

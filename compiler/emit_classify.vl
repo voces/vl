@@ -120,6 +120,7 @@ import {
   letNullHoleFilledTy,
   letNullHoleUnfilled,
   litBaseTy,
+  litSetBaseTy,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
   luDeclPosOf,
@@ -215,6 +216,7 @@ import {
   pinnedHoleTyOf,
   primNameOf,
   primNameStr,
+  recArmFitKind,
   recFitNarrowedFields,
   recordClonedCallRetire,
   recordClonedNodeTyFb,
@@ -228,6 +230,7 @@ import {
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
+  tyFitKind,
   tyHasTyVar,
   tyIsArray,
   tyIsF32ArrayTy,
@@ -764,6 +767,7 @@ import {
   uFieldElemTyIx,
   uFieldLitTyIx,
   uFieldNames,
+  uFieldReLays,
   uFieldStart,
   uFieldTyText,
   uFieldTypes,
@@ -8843,6 +8847,10 @@ function pushNarrow(name: string, variant: string) {
 // monomorphized clone, which lands on the name path).
 function pushNarrowIs(name: string, variant: string, condIx: i32) {
   const ity = isVarTyIxOf(condIx)
+  const cn = P.nodes[condIx]
+  if cn is IsExpr && isFitsAcrossTagRows(variant, ity, cn.isObj) {
+    return narrowTop
+  }
   pushNarrowRep(name, isVariantSpelling(variant, ity), ity, -1)
 }
 
@@ -14278,6 +14286,9 @@ export function memberUnionFieldName(memIx: i32, fnIx: i32) {
         if variantFieldTypeAt(nvi, vfi) == FC_UNION {
           return variantFieldElemName(nvi, vfi)
         }
+        // The narrowed arm stores the field unboxed, whatever a same-named field of a
+        // sibling arm stores.
+        return ""
       }
     }
     // Narrowing-blind last resort (the frame pre-pass runs before narrowing is active): an
@@ -14380,14 +14391,20 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       }
     }
     // A shared read whose members store the field at different atoms boxes each one, so the
-    // read is the box of the checker's join (`sharedFieldArmsBoxable`).
-    if avi < 0 && nodeTyIsUnionRow(memIx) {
+    // read is the box of the checker's join (`sharedFieldArmsBoxable`). A receiver narrowed to
+    // one arm reads that arm's own field instead.
+    if avi < 0 && memNarrowVariantIndex(memIx) < 0 {
       const bvis: i32[] = []
       const bfis: i32[] = []
       const bcode = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, bvis, bfis)
-      if bcode == FC_UNION && variantFieldTypeAt(bvis[0], bfis[0]) != FC_UNION {
-        const bn = tyToEmitName(nodeTyPinIxOf(memIx))
-        if isValueUnionName(bn) { return bn }
+      if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
+        if nodeTyIsUnionRow(memIx) {
+          const bn = tyToEmitName(nodeTyPinIxOf(memIx))
+          if isValueUnionName(bn) { return bn }
+        } else {
+          // A read the checker typed at one atom of the box (a then arm over a type parameter).
+          return sharedPlanBoxName(bvis, bfis)
+        }
       }
     }
   }
@@ -31037,13 +31054,16 @@ let uVarSigNamesLen = -1
 let uVarSigStartLen = -1
 let uVarSigCountLen = -1
 
-// Drops the memo. `collectU` rebuilds the variant tables from empty and a second module can
+// Drops the memo and `variantTagKey`'s. `collectU` rebuilds the variant tables from empty and a second module can
 // refill them to the same three lengths with different names, which the stamp cannot see.
 export function variantSigMemoDrop() {
   uVarSigMemo = []
   uVarSigNamesLen = -1
   uVarSigStartLen = -1
   uVarSigCountLen = -1
+  uTagKeyStartLen = -1
+  uTagKeyTyLen = -1
+  uTagKeyReLays = -1
   0
 }
 
@@ -31086,6 +31106,250 @@ function variantSigGo(vi: i32) {
     j = j + 1
   }
   out
+}
+
+// The tag key of variant `vi`: its signature, then the first row with that signature whose
+// fields hold exactly the same values, a literal set read as the scalar it softens to. Arms
+// sharing a field-name set share a tag only when they agree field by field, so `{v: i32}` and
+// `{v: string}` are told apart by the tag (D4056).
+export function variantTagKey(vi: i32): string {
+  // Stamped on the tables' lengths and on the re-lay generation: a literal field re-laid in
+  // place moves no length (D1655).
+  if (
+    uTagKeyStartLen != uFieldStart.length
+    || uTagKeyTyLen != uVarTyIx.length
+    || uTagKeyReLays != uFieldReLays
+  ) {
+    uTagKeyMemo = []
+    uTagKeyGroups = Map()
+    uTagKeyGroupOf = []
+    uTagKeyStartLen = uFieldStart.length
+    uTagKeyTyLen = uVarTyIx.length
+    uTagKeyReLays = uFieldReLays
+  }
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return variantSig(vi)
+  }
+  while uTagKeyMemo.length <= vi {
+    const r = uTagKeyMemo.length
+    const sig = variantSig(r)
+    let peers = uTagKeyGroups.get(sig)
+    if peers == null {
+      peers = []
+      uTagKeyGroups.set(sig, peers)
+    }
+    let rep = r
+    for q in peers {
+      if rep == r && variantRowsTagEqual(q, r) { rep = q }
+    }
+    peers.push(r)
+    uTagKeyGroupOf.push(peers)
+    uTagKeyMemo.push(sig + "#" + i32ToStr(rep))
+  }
+  uTagKeyMemo[vi]
+}
+
+// The rows sharing row `vi`'s field-name set, `vi` among them; empty for a row outside the
+// span tables.
+function variantSigPeers(vi: i32): i32[] {
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return []
+  }
+  variantTagKey(uFieldStart.length - 1)
+  if vi >= uTagKeyGroupOf.length { return [] }
+  uTagKeyGroupOf[vi]
+}
+
+// `variantTagKey`'s rows, filled in row order, with the rows met so far per signature; refilled
+// when a span table grows.
+let uTagKeyMemo: string[] = []
+let uTagKeyGroups: {[string]: i32[]} = Map()
+let uTagKeyGroupOf: i32[][] = []
+let uTagKeyStartLen = -1
+let uTagKeyTyLen = -1
+let uTagKeyReLays = -1
+
+// Whether rows `a` and `b`, which share a field-name set, hold the same values in every field.
+// A row with no arena type compares by its type text; a map field also by its element, key
+// kind and set flag, which that text does not carry.
+function variantRowsTagEqual(a: i32, b: i32): boolean {
+  let j = 0
+  while j < uFieldCount[a] {
+    const ra = uFieldStart[a] + j
+    if ra >= uFieldNames.length { return false }
+    const name = uFieldNames[ra]
+    const jb = variantFieldIndex(b, name)
+    if jb < 0 { return false }
+    const rb = uFieldStart[b] + jb
+    const code = variantFieldTypeAt(a, j)
+    if code != variantFieldTypeAt(b, jb) {
+      if !litFieldRowsReLaidAlike(ra, rb) { return false }
+    } else if code == FC_MAP || code == FC_NUL_MAP {
+      if ra >= uFieldElemName.length || rb >= uFieldElemName.length {
+        return false
+      }
+      if uFieldElemName[ra] != uFieldElemName[rb] { return false }
+      if uFieldElemKeyKindAt(a, j) != uFieldElemKeyKindAt(b, jb) {
+        return false
+      }
+      if variantFieldSetFlag(a, name) != variantFieldSetFlag(b, name) {
+        return false
+      }
+    }
+    const fa = variantFieldArenaBase(a, name)
+    const fb = variantFieldArenaBase(b, name)
+    if fa < 0 || fb < 0 {
+      if variantFieldBaseKey(a, ra) != variantFieldBaseKey(b, rb) {
+        return false
+      }
+    } else if tyFitKind(fa, fb) != 1 || tyFitKind(fb, fa) != 1 {
+      return false
+    }
+    j = j + 1
+  }
+  true
+}
+
+// Whether field rows `ra` and `rb`, stored at different codes, are a literal set beside another
+// set or beside its plain `string` base, which `unifyMixedLitRepArms` re-lays onto one rep.
+export function litFieldRowsReLaidAlike(ra: i32, rb: i32): boolean {
+  if litFieldRowIsAtomisable(ra) {
+    return litFieldRowIsAtomisable(rb)
+      || litFieldRowIsStrSetBesideString(ra, rb)
+  }
+  litFieldRowIsAtomisable(rb) && litFieldRowIsStrSetBesideString(rb, ra)
+}
+
+// Is row `set` a string literal set and row `base` a plain `string` — the one literal-beside-
+// base pair that shares the string rep? An integer set beside `string` is laid out apart.
+function litFieldRowIsStrSetBesideString(set: i32, base: i32): boolean {
+  if !litFieldRowIsPlainString(base) { return false }
+  tyPrimNameOf(litSetBaseTy(uFieldLitTyIx[set])) == "string"
+}
+
+// Row `vi`'s arena type for field `name`, a literal set read as the scalar it softens to; -1
+// when the row has no arena type.
+function variantFieldArenaBase(vi: i32, name: string): i32 {
+  if vi < 0 || vi >= uVarTyIx.length || uVarTyIx[vi] < 0 { return -1 }
+  const ft = tyFieldTyOf(uVarTyIx[vi], name)
+  if ft < 0 { return -1 }
+  const b = litSetBaseTy(ft)
+  if b >= 0 { b } else { ft }
+}
+
+// The set flag of variant row `v`'s field `name` from its arena type: 1 for a `Set<K>`, 0 for
+// a map, -1 when the field is not a map or the row has no arena type.
+export function variantFieldSetFlag(v: i32, name: string): i32 {
+  if v < 0 || v >= uVarTyIx.length { return -1 }
+  const vt = uVarTyIx[v]
+  if vt < 0 { return -1 }
+  const t = T.tys[vt]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldNames.length {
+      if t.objFieldNames[i] == name {
+        const ft = t.objFieldTypes[i]
+        if ft < 0 { return -1 }
+        const f = T.tys[ft]
+        if f is TyMap { return f.mSet }
+        return -1
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// The variant rows laid out under a tag other than row `vi`'s that still hold values fitting
+// record `xTy`, one row per tag, with each row's `recArmFitKind` in `kinds` (D4056). Only rows
+// whose values the receiver node `recvIx`'s type can hold count; a receiver with no known type,
+// or one typed at a type parameter, counts every row.
+export function crossTagFitRows(
+  vi: i32,
+  xTy: i32,
+  recvIx: i32,
+  rows: i32[],
+  kinds: i32[],
+) {
+  if vi < 0 || xTy < 0 || vi >= uVarTyIx.length { return 0 }
+  const peers = variantSigPeers(vi)
+  if peers.length < 2 || !tyIsRecord(xTy) { return 0 }
+  const keys: string[] = [variantTagKey(vi)]
+  let holds: i32[] = []
+  let holdsRead = false
+  for j in peers {
+    const yTy = if j < uVarTyIx.length { uVarTyIx[j] } else { -1 }
+    const k = if j != vi { variantTagKey(j) } else { keys[0] }
+    const kind = if yTy >= 0 && !strListHas(keys, k) && tyIsRecord(yTy) { recArmFitKind(xTy, yTy) } else { 0 }
+    if kind != 0 {
+      if !holdsRead {
+        holds = recvRecordMembers(recvIx)
+        holdsRead = true
+      }
+      if recvCanHold(holds, yTy) {
+        keys.push(k)
+        rows.push(j)
+        kinds.push(kind)
+      }
+    }
+  }
+  0
+}
+
+// Whether an `is` of variant spelling `variant` (arena `ity`) answers from the value because
+// another tag's row may fit it, so its then arm cannot treat the receiver as that row.
+export function isFitsAcrossTagRows(
+  variant: string,
+  ity: i32,
+  recvIx: i32,
+): boolean {
+  const vi = variantIndexOf(isVariantSpelling(variant, ity))
+  if vi < 0 { return false }
+  const rows: i32[] = []
+  const kinds: i32[] = []
+  crossTagFitRows(vi, ity, recvIx, rows, kinds)
+  rows.length > 0
+}
+
+// The record members of node `ix`'s type, or `[-1]` when that type is unknown or open (a type
+// parameter), which `recvCanHold` reads as holding every row. A type that is one record is a
+// narrowing the checker made, which it makes only when no other arm fits, so it holds none.
+function recvRecordMembers(ix: i32): i32[] {
+  const out: i32[] = []
+  const ty = if ix >= 0 { nodeTyIxOf(ix) } else { -1 }
+  if ty < 0 || tyHasTyVar(ty) { return [-1] }
+  const mems: i32[] = []
+  flattenVariantsInto(ty, mems)
+  if mems.length == 1 && tyIsRecord(mems[0]) { return out }
+  for m in mems {
+    if m < 0 { return [-1] }
+    if tyIsRecord(m) { out.push(m) }
+  }
+  out
+}
+
+// Whether a value laid out as record `yTy` can sit in a receiver whose record members are
+// `holds`: some member every `yTy` value fits.
+function recvCanHold(holds: i32[], yTy: i32): boolean {
+  for m in holds {
+    if m < 0 || recArmFitKind(m, yTy) == 1 { return true }
+  }
+  false
+}
+
+// The base half of one field row's tag key: a literal set's softened scalar, else the row's type text.
+function variantFieldBaseKey(vi: i32, r: i32): string {
+  if r < 0 || r >= uFieldTyText.length { return "" }
+  if r < uFieldLitTyIx.length && uFieldLitTyIx[r] >= 0 {
+    const b = litSetBaseTy(uFieldLitTyIx[r])
+    if b >= 0 { return tyToStr(b) }
+  }
+  if vi >= 0 && vi < uVarTyIx.length && r < uFieldNames.length {
+    const ft = tyFieldTyOf(uVarTyIx[vi], uFieldNames[r])
+    const ab = litSetBaseTy(ft)
+    if ab >= 0 { return tyToStr(ab) }
+  }
+  uFieldTyText[r]
 }
 
 // ── D1023: the discriminant column's three queries ──
@@ -31132,10 +31396,11 @@ function variantFieldLitSetSame(a: i32, b: i32, fi: i32): boolean {
 export function variantDiscrimFieldNeeded(vi: i32, fi: i32): boolean {
   if variantFieldLitLexes(vi, fi).length == 0 { return false }
   const sig = variantSig(vi)
+  const key = variantTagKey(vi)
   let vj = 0
   while vj < uVariants.length {
     if vj != vi {
-      if variantSig(vj) == sig {
+      if variantSig(vj) == sig && variantTagKey(vj) == key {
         if !variantFieldLitSetSame(vi, vj, fi) { return true }
       }
     }
@@ -31167,6 +31432,7 @@ function variantLitPairKind(a: i32, b: i32): i32 {
   if a < 0 || b < 0 { return 0 }
   if a >= uFieldCount.length || b >= uFieldCount.length { return 0 }
   if uFieldCount[a] != uFieldCount[b] { return 0 }
+  if variantTagKey(a) != variantTagKey(b) { return 0 }
   let sawLit = false
   let sawMixed = false
   let sawStrMixed = false
@@ -31236,7 +31502,7 @@ export function variantFieldLitRepMixed(a: i32, b: i32, fi: i32): boolean {
 // Can variant field ROW `ix` carry the interned-atom rep? Code 0 already does; code 3 is the
 // inline spelling of the same members and can be made to. Any other code is a different
 // storage entirely and is not this seam.
-function litFieldRowIsAtomisable(ix: i32): boolean {
+export function litFieldRowIsAtomisable(ix: i32): boolean {
   if ix < 0 || ix >= uFieldTypes.length { return false }
   const code = uFieldTypes[ix]
   if code != FC_I32 && code != FC_STR { return false }
@@ -31254,8 +31520,12 @@ export function variantFieldLitRepStrMixed(a: i32, b: i32, fi: i32): boolean {
   const ra = uFieldStart[a] + fi
   const rb = uFieldStart[b] + fi
   if uFieldTypes[ra] == uFieldTypes[rb] { return false }
-  if litFieldRowIsAtomisable(ra) { return litFieldRowIsPlainString(rb) }
-  if litFieldRowIsAtomisable(rb) { return litFieldRowIsPlainString(ra) }
+  if litFieldRowIsAtomisable(ra) {
+    return litFieldRowIsStrSetBesideString(ra, rb)
+  }
+  if litFieldRowIsAtomisable(rb) {
+    return litFieldRowIsStrSetBesideString(rb, ra)
+  }
   false
 }
 
@@ -39993,6 +40263,24 @@ function objMapFieldCompat(objIx: i32, fname: string, elem: string): boolean {
   mvValNamesCompat(nodeTyMapValName(valIx), elem)
 }
 
+// Whether a literal's map-typed field value has variant `vi`'s key type and is a `Set` exactly
+// when that field is — the columns the value rep alone cannot see (D2493, D4056). True when
+// either side's arena type is unknown, open, or not a map.
+function objMapFieldKeyFits(objIx: i32, fname: string, vi: i32): boolean {
+  const valIx = objFieldVal(objIx, fname)
+  if valIx < 0 || vi < 0 || vi >= uVarTyIx.length { return true }
+  const vt = nodeRepTyIxOf(valIx)
+  const ft = tyFieldTyOf(uVarTyIx[vi], fname)
+  if vt < 0 || vt >= T.tys.length || ft < 0 || ft >= T.tys.length {
+    return true
+  }
+  const t = T.tys[vt]
+  const f = T.tys[ft]
+  if !(t is TyMap) || !(f is TyMap) { return true }
+  if t.mKey < 0 || tyHasTyVar(t.mKey) || tyHasTyVar(vt) { return true }
+  t.mSet == f.mSet && tySame(t.mKey, f.mKey)
+}
+
 // The nested-struct compat of an object literal's field value against a candidate
 // variant's code-15 field: a nested literal value fits the target struct by
 // `objLitFitsRow`. A non-literal value stays lenient (it fails loudly downstream if wrong).
@@ -40164,13 +40452,85 @@ function variantFieldKindFits(objIx: i32, name: string, vi: i32): boolean {
   if vi < 0 || vi >= uVarTyIx.length { return true }
   const vt = uVarTyIx[vi]
   if vt < 0 || vt >= T.tys.length { return true }
-  const rk = fieldScalarKindOf(tyFieldTyOf(vt, name))
-  if rk == 0 { return true }
+  const rft = tyFieldTyOf(vt, name)
+  let rk = fieldScalarKindOf(rft)
+  // An integer literal set stores as its base scalar.
+  if rk == 0 && litSetBaseTy(rft) >= 0 {
+    rk = fieldScalarKindOf(litSetBaseTy(rft))
+  }
+  // The field value's own type refutes across kind classes only: a literal typed by its
+  // union destination may carry the destination's arm, while a width still adapts. A record
+  // value is no scalar field, and a scalar value no record one.
+  const fv = objFieldVal(objIx, name)
+  let vk = 0
+  if fv >= 0 { vk = fieldScalarKindOf(nodeRepTyIxOf(fv)) }
+  if rk == 0 {
+    if fv >= 0 && fieldValueIsRecord(fv) {
+      return tyHoldsRecord(nonNullTy(rft))
+    }
+    if !tyIsRecord(nonNullTy(rft)) { return true }
+    return vk == 0 && !fieldValueIsScalarLit(fv)
+  }
+  if fv >= 0 && fieldValueIsRecord(fv) { return false }
+  let lk = 0
   const ot = nodeRepTyIxOf(objIx)
-  if ot < 0 || ot >= T.tys.length { return true }
-  const lk = fieldScalarKindOf(tyFieldTyOf(ot, name))
+  if ot >= 0 && ot < T.tys.length {
+    lk = fieldScalarKindOf(tyFieldTyOf(ot, name))
+  }
+  if vk != 0 && fieldKindClass(vk) != fieldKindClass(rk) { return false }
+  if lk == 0 { lk = vk }
   if lk == 0 { return true }
+  // A string value may be a member of a string literal set; a literal one is asked.
+  if (lk == 6 || lk == 14) && (rk == 7 || rk == 15) {
+    if fv < 0 { return true }
+    const lit = P.nodes[unwrapParen(fv)]
+    if lit is StrLit {
+      return strListHas(tyLitSetMemberLexes(nonNullTy(rft)), lit.strText)
+    }
+    return true
+  }
   fieldKindWidens(lk, rk)
+}
+
+// Whether field value node `fv` is a record: an object literal, or typed as a record.
+function fieldValueIsRecord(fv: i32): boolean {
+  if P.nodes[unwrapParen(fv)] is ObjLit { return true }
+  const t = nodeRepTyIxOf(fv)
+  t >= 0 && tyIsRecord(t)
+}
+
+// Whether field value node `fv` is a number, string, char or boolean literal.
+function fieldValueIsScalarLit(fv: i32): boolean {
+  if fv < 0 { return false }
+  const n = P.nodes[unwrapParen(fv)]
+  n is NumLit || n is StrLit || n is CharLit || n is BoolLit
+}
+
+// Whether type `t` is a record or a union with a record member.
+function tyHoldsRecord(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  if tyIsRecord(t) { return true }
+  const u = T.tys[t]
+  if u is TyUnion {
+    let i = 0
+    while i < u.uMembers.length {
+      const m = u.uMembers[i]
+      if m >= 0 && m < T.tys.length && tyIsRecord(m) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The class of a `fieldScalarKindOf` kind, nullability dropped: 1 numeric, 2 `boolean`,
+// 3 a string or string literal set, 0 none.
+function fieldKindClass(k: i32): i32 {
+  let b = k
+  if b > 8 { b = b - 8 }
+  if b == 1 || b == 3 || b == 4 || b == 5 { return 1 }
+  if b == 2 { return 2 }
+  if b == 6 || b == 7 { return 3 }
+  0
 }
 
 // The first variant row whose signature is `sig`, or -1. Rebuilds first when the stamp
@@ -40215,6 +40575,7 @@ function objMatchesVariantIdx(objIx: i32, vi: i32, fnIx: i32): boolean {
             uFieldNames[start + fj],
             uFieldElemName[start + fj],
           )
+          || !objMapFieldKeyFits(objIx, uFieldNames[start + fj], vi)
         ) {
           allMatch = false
         }
@@ -40227,6 +40588,7 @@ function objMatchesVariantIdx(objIx: i32, vi: i32, fnIx: i32): boolean {
             uFieldNames[start + fj],
             uFieldElemName[start + fj],
           )
+          || !variantFieldKindFits(objIx, uFieldNames[start + fj], vi)
         ) {
           allMatch = false
         }
@@ -40416,10 +40778,16 @@ export function sharedUnionFieldPlan(
   let code = -1
   let mixed = false
   let i = 0
+  // A receiver the checker proved non-null reads no field off its `null` atom.
+  const skipNull = !nodeTyIsNullable(recvIx)
   while i < atoms.length {
     // `variantIndexOfTypeName` (D1083), not the exact `variantIndexOf`: the atoms here can be
     // structural renders (a narrowed complement's fallback), which `variantIndexOf` can't match.
     const vi = variantIndexOfTypeName(atoms[i])
+    if vi < 0 && skipNull && atoms[i] == "null" {
+      i = i + 1
+      continue
+    }
     if vi < 0 { return -1 }
     const fi = variantFieldIndex(vi, prop)
     if fi < 0 { return -1 }
@@ -40436,6 +40804,7 @@ export function sharedUnionFieldPlan(
     outFis.push(fi)
     i = i + 1
   }
+  if outVis.length < 2 { return -1 }
   if mixed {
     if !sharedFieldArmsBoxable(outVis, outFis) { return -1 }
     return FC_UNION
@@ -40447,12 +40816,43 @@ export function sharedUnionFieldPlan(
 // member's field is a value atom, which the read boxes under that atom's tag (D3562). The checker
 // types such a read as the union of the members' field types, numbers kept apart.
 export function sharedFieldArmsBoxable(vis: i32[], fis: i32[]): boolean {
+  let atoms = 0
   let i = 0
   while i < vis.length {
-    if sharedFieldArmAtomKind(vis[i], fis[i]) < 0 { return false }
+    if sharedFieldArmAtomKind(vis[i], fis[i]) >= 0 { atoms = atoms + 1 }
+    else if !sharedFieldArmValueBox(vis[i], fis[i]) { return false }
     i = i + 1
   }
-  vis.length > 1
+  vis.length > 1 && atoms > 0
+}
+
+// Whether some member of a shared read stores its field as a scalar the read boxes.
+function sharedPlanBoxesSome(vis: i32[], fis: i32[]): boolean {
+  let i = 0
+  while i < vis.length && i < fis.length {
+    if variantFieldTypeAt(vis[i], fis[i]) != FC_UNION { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The value-union name of the first member of a shared read storing the field as a box, or "".
+function sharedPlanBoxName(vis: i32[], fis: i32[]): string {
+  let i = 0
+  while i < vis.length && i < fis.length {
+    if sharedFieldArmValueBox(vis[i], fis[i]) {
+      return variantFieldElemName(vis[i], fis[i])
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether member `vi` stores its field `fi` as a value-union box, which a mixed shared read
+// delivers as stored beside the members it boxes (D4056).
+function sharedFieldArmValueBox(vi: i32, fi: i32): boolean {
+  variantFieldTypeAt(vi, fi) == FC_UNION
+    && isValueUnionName(variantFieldElemName(vi, fi))
 }
 
 // Whether the checker typed node `ix` as a union: the cheap test ahead of a shared-field plan.

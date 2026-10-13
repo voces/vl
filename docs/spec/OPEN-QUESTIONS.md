@@ -150,16 +150,17 @@ union. `u is A` answers whether the value structurally fits `A`, field by field.
 owner's words, "'is' is not a nominal check; the language is structural", and "We can do a
 nominal check for perf reasons, but fundamentally the language is meant to be structural."
 A tag may serve as a fast path only where it gives the same answer as the structural test.
-D4056 tracks the build. The recommendation below, (b), was not taken.
+Built by D4056 (2026-10-12): the union below now runs. The recommendation below, (b), was
+not taken.
 
-**Today.** A union of two records with the same field names is refused when it is formed,
-unless some field is literal-typed in both arms. The refusal fires before any `is` is
-written:
+**Before the build.** A union of two records with the same field names was refused when it
+was formed, unless some field was literal-typed in both arms. The refusal fired before any
+`is` was written:
 
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function f(u: A | B): i32 { 1 }   // refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
+function f(u: A | B): i32 { 1 }   // was refused: arms `A` and `B` share a field-name set and no literal-typed field distinguishes them — add a discriminant field
 ```
 
 The 2026-09-02 ruling that this refusal came from is amended by D3870 (same-shape records
