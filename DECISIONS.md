@@ -1207,7 +1207,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
   * **A FLAG ON `TyArray`, NOT A `Ty` VARIANT.** `TyArray = { aElem, aRead }`. A variant
     would owe an arm in eighteen `TyArray` ladders and in every `_`-less `match` over `Ty`,
-    and `ladder-budget.py` re-derives the closed set from the `export type` and would demand
+    and `scripts/ladder-sets.vl` re-derives the closed set from the `export type` and would demand
     each one. A flag is invisible to every ladder that does not ask.
 
   * **`repCanonId` IGNORES IT, SO A VIEW IS THE SAME VALUE.** No copy, no new heap type, and
@@ -7237,8 +7237,8 @@ function and pinned it to Liftoff (`docs/internals/perf-decoder-gap-2026-09.md` 
 Cranelift has one tier, so wasmtime never showed it; plumb ships to browsers, where it is the
 common case.
 
-**The rule.** Before calling `wasm-opt`, the host (`run_once_hot_callees` in
-`scripts/vl-host/src/main.rs`) reads the emitted module's call graph with `wasmparser` and
+**The rule.** Before calling `wasm-opt`, the host has the compiler (`optRungScan` in
+`compiler/opt_scan.vl`) read the emitted module's call graph, and
 passes `--no-inline=<name>` for every function that:
 
 1. is called directly from inside a `loop` of RUN-ONCE code — the start function, plus, to a
@@ -7464,7 +7464,7 @@ master in the same time.
 A caller holding a chosen producer's record counts as allocating it, so a helper it is passed
 to (`score(r)`) is chosen by the existing rule. And any tiny loop-free callee (at most
 `RUN_ONCE_INLINE_LEAF_BYTES`, no call to a defined function) may be chosen although run-once code
-calls it — a producer or a struct-TAKING helper alike — as `run_once_hot_callees` already
+calls it — a producer or a struct-TAKING helper alike — as `optRungScan` already
 leaves such a leaf inlinable: its per-call work is too small for V8's baseline tier to matter,
 and the top-level loop is where a benchmark calls it.
 
@@ -7881,7 +7881,7 @@ single-assignment locals and re-walks the rest of the block per `if`, and `inlin
 re-runs all of it after inlining the PL-027 leaf helpers. D2336 has the per-pass readings.
 
 **The rule.** The host adds `--skip-pass=ssa-nomerge` to either rung when some function of the
-rung input holds more than 8,192 `local.set`/`local.tee` (`SSA_SPLIT_MAX_SETS`). The count is an
+rung input holds more than 8,192 `local.set`/`local.tee` (`SSA_SPLIT_MAX_SETS` in `compiler/opt_scan.vl`). The count is an
 upper bound on the locals `ssa-nomerge` can make, so a module under the bar can never reach the
 hash-map matrix through it, and such a module gets exactly the pass list it had.
 

@@ -343,10 +343,10 @@ def main(argv: list[str]) -> int:
         if over:
             bad.append(name)
 
-    # A host built before D2336 has no size rule to apply; like one without `$VL_FUEL`, it
-    # passes locally until the shared binary is rebuilt, and `--require-fuel` (CI) grades it.
+    # A host before D2336 has no size rule; it passes locally, and CI (`--require-fuel`) grades it.
     with open(vl, "rb") as fh:
-        host_skips = b"--skip-pass=ssa-nomerge" in fh.read()
+        host_bytes = fh.read()
+        host_skips = b"--skip-pass=ssa-nomerge" in host_bytes or b"optRungScan" in host_bytes
     for uname, m in units.items():
         b = bases[uname]
         tag = f"{uname} "
