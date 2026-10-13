@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
+| L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) landed as #3542. Step 1, the function-value flow table, runs in shadow (`fn_flow_shadow.vl`, off by default): graded against mono, it flags 60 of 69 silent review witnesses (the 9 others are D3923/D3972/D3973, outside its domain) and filed D4300–D4304. Step 2 is next. |
 | L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. The second read `valueAtomKindOfTy` and `nulScalarListKindOfTy` off the type (`tyEmitElemPrimOf`, `tyEmitElemNulPrimOf`, `tyEmitNamesOf`): 112 → 111. `valueAtomKindOfTy` still renders a union of members that share a list or closure rep (D4320), and `mapTyValKindLowerable` still renders an anonymous shape or a nullable union of shapes. Next: `armFieldUnionName`, `joinRowOfTy`, `listUnionEmitName`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
 | L4 one rollback for the quiet probes | first PR (A1) **in review** | The assertion and its measured list are in code-quality-2026-10.md L4. A2 (`CheckMark`) is next. |
@@ -91,7 +91,7 @@ order, subject to the one-writer rule.
 
 ### Wave A: enablers (no behaviour change)
 
-| step | item | file owner | proof |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | the fixpoint reproduces master's seed from master's source, and `vl check` text and emitted modules are identical over `tests/cases` and the corpus with the flag off |
 | A2 | L4: one `CheckMark` / `checkRollback`; each constraint family becomes a record of columns with one `truncate` | `typecheck.vl` | `vl check` and module identity; fuel A/B |
@@ -103,7 +103,7 @@ order, subject to the one-writer rule.
 
 ### Wave B: one producer per fact
 
-| step | item | owner | prerequisite |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | B1 | L1, executed as SC's migration (`fn-value-flow-design.md` §(f), steps 0–4). SC's checker-side store (§(h)) **is** L1's banked binding; there is no second bank. Mono's instance key becomes the type-id tuple, and a per-instance node-type column retires `monoArgTyName`. | lane SC (`emit_mono.vl`, the SC parts of `typecheck.vl`) | #3542 (step 0) |
 | B2 | L2 stage 2: the type-taking twins land in `tyquery.vl` | `emit_classify.vl` | A3 |
@@ -111,7 +111,7 @@ order, subject to the one-writer rule.
 
 ### Wave C: each decision at the phase that owns it
 
-| step | item | owner | prerequisite |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | C1 | L3, in order: (a) object-literal shape against a union variant; (b) probe `checkParams`' valtype ladder with a check-clean witness; (c) reword the built-in arity floors as internal invariants; (d) the mono function-value rules | checker; `emit_sections.vl` | (d) needs B1 step 4 |
 | C2 | L5: one `pinDriver` in `check_pins.vl`; D3817 becomes a policy over `solveUnannotParams` | `typecheck.vl` | A2. Fold #3516's width-subtype rewrite in as a solver if it is still open. |
@@ -119,7 +119,7 @@ order, subject to the one-writer rule.
 
 ### Wave D: structure
 
-| step | item | owner | prerequisite |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | D1 | L9: callee-closed carves of `typecheck.vl`. `check_pins.vl` (from C2) is the first; leaves follow. | `typecheck.vl` | A2, A6 (S-c), C2 |
 | D2 | L8: split `emit_classify.vl` by banner region; split the 400-line functions at low-liveness seams | `emit_classify.vl` | a priced self-compile A/B before the first split |
@@ -179,5 +179,5 @@ These have no unmet prerequisite and touch disjoint files:
 - **A6 / S-c**: one `./ast` import block in `typecheck.vl`. This conflicts with A1, so run it
   first; it is small.
 - **C3 first PR**: `emitReturnValue` through `ExpCtx` (`wasmEmit.vl`).
-- **B1**: continues in lane SC (#3542).
+- **B1**: continues in lane SC; step 1 (the flow table in shadow) is landing, step 2 next.
 - **T3, first port — done**: `check-filed-witnesses.vl` prints the Python's report byte for byte on both inventories and now runs the `filed witnesses` gate row; the Python stays beside it (`scripts/inventory/rows.py` imports its row grammar). It found D4290 (a compiler trap) and one new `dogfood:` row (`runProgram` waits). Next: `regress.py` + `gradecensus.py`.

@@ -2102,6 +2102,91 @@ allocAxis(
   (d) => twoFiles(d, genArenaGrowth(400), genArenaGrowth(100)),
 );
 
+// ── fn-flow: the flow table's own work (fn-value-flow-design.md §(e)) ──────────
+// The table runs only when a host arms it, so the CLI's fuel never meters it; the pair is
+// graded on `fnFlowShadowWork`, the nodes it visited plus the classes it merged, which is a
+// count like fuel. The many arm is a chain of 64 higher-order functions with un-annotated
+// function parameters, each calling the link below it twice, plus a recursive pair writing
+// the forwarded value into a module global; the one arm makes the same calls and the same
+// write from one function. Reads 1.64. Keyed by call path instead of by instance (mode 3) the
+// chain is exponential, and the control below must red on it.
+const genFnFlowChain = (n: number): string => {
+  const o = ["let g = (x: i32): i32 => x", "function h0(f, x: i32): i32 { f(x) }"];
+  for (let i = 1; i < n; i++) o.push(`function h${i}(f, x: i32): i32 { h${i - 1}(f, x) + h${i - 1}(f, x + 1) }`);
+  o.push(
+    "function pa(f, n: i32): i32 {",
+    "  if n <= 0 {",
+    "    g = f",
+    "    return 0",
+    "  }",
+    "  pb(f, n - 1)",
+    "}",
+    "function pb(f, n: i32): i32 { pa(f, n - 1) }",
+    `print(h${n - 1}((x: i32): i32 => x + 1, 3))`,
+    "print(pa((x: i32): i32 => x + 2, 4))",
+    "print(g(1))",
+  );
+  return o.join("\n") + "\n";
+};
+const genFnFlowOne = (n: number): string => {
+  const o = [
+    "let g = (x: i32): i32 => x",
+    "function h0(f, x: i32): i32 { f(x) }",
+    "function run(f, n: i32): i32 {",
+    "  let acc = 0",
+  ];
+  for (let i = 1; i < n; i++) o.push(`  acc = acc + h0(f, ${i}) + h0(f, ${i + 1})`);
+  o.push("  g = f", "  acc", "}", "print(run((x: i32): i32 => x + 1, 3))", "print(g(1))");
+  return o.join("\n") + "\n";
+};
+
+/** The flow table's work for one compile of `src` with the shadow armed at `mode`. */
+const fnFlowWork = (mod: WebAssembly.Module, src: string, mode: number): number => {
+  const e = new WebAssembly.Instance(mod, {}).exports as unknown as Record<string, (...a: number[]) => number>;
+  e.fnFlowShadowArm(mode);
+  e.modReset();
+  e.srcReset();
+  for (const ch of src) e.srcPush(ch.codePointAt(0)!);
+  const rc = e.compileSrc();
+  if (rc !== 0) throw new Error(`fn-flow: the pair's program did not compile (rc ${rc})`);
+  e.fnFlowShadowFinish();
+  return e.fnFlowShadowWork();
+};
+
+const fnFlowRatio = (mode: number): number => {
+  const mod = new WebAssembly.Module(Deno.readFileSync(COMPILER));
+  return fnFlowWork(mod, genFnFlowChain(64), mode) / fnFlowWork(mod, genFnFlowOne(64), mode);
+};
+
+Deno.test({
+  name: "scaling shape: fn-flow",
+  ignore: !exists(COMPILER),
+  fn() {
+    const ratio = fnFlowRatio(1);
+    if (ratio > 2.5) {
+      throw new Error(
+        `fn-flow: the many-entity arm did ${ratio.toFixed(2)}x the one arm's flow-table work ` +
+          "(bar 2.5). The table is re-walking a function per caller or per merge " +
+          "(`ffEnsureWalked`, compiler/fn_flow_shadow.vl).",
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "scaling shape: control — a flow table keyed by call path reds fn-flow",
+  ignore: !exists(COMPILER),
+  fn() {
+    const ratio = fnFlowRatio(3);
+    if (ratio <= 2.5) {
+      throw new Error(
+        `the fn-flow control did not red: keyed by call path the chain read ${ratio.toFixed(2)}x, ` +
+          "under the 2.5 bar, so the work count has stopped measuring the walk.",
+      );
+    }
+  },
+});
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
