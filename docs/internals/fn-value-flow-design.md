@@ -55,7 +55,7 @@ The census establishes these facts:
   | 4 | `monoAliasedParam` |
   | 8 | `monoLetFrameOf`, `monoCapturedLamFe`, `monoListLeaf`, `monoNoteBindSig`, `monoRespellLamAlias`, `monoWriteNamesLam` |
   | 16 | `monoNameShadowedAt`, `monoRetReadsHoleParam` |
-  | 64 (`MONO_ALIAS_CHAIN_MAX`) | `monoAliasChainLamFe`, `monoGenFnAliasChainFe`, `monoAliasChainWritten`, `monoAliasCellRead`, `monoCellValueTakeAt`, `monoInstGenAliasNames`, `monoLamValueFe` |
+  | 64 (`MONO_ALIAS_CHAIN_MAX`) | `monoAliasChainLamFe`, `monoAliasCellRead`, `monoCellValueTakeAt`, `monoInstGenAliasNames`, `monoLamValueFe` |
 
   A chain of 5 to 64 links resolves in some helpers and falls through in others.
 - **There is no analysis phase.** `monomorphize` indexes `=` writes by name, walks the
@@ -621,6 +621,17 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      condition the table also answered lambdas inside annotated closure results, and six
      fixtures trapped on an indirect call, so the condition stays until the let slot owns
      those.
+   - Fourth PR: the let slot answers two alias-chain questions by declaration identity.
+     The table records, per declaration, the binding its initializer reads (`ffDeclFrom`)
+     and whether an `=` writes it (`ffDeclWr`). `fnFlowReadWritten` replaces
+     `monoAliasChainWritten`, and `fnFlowReadGenFn` replaces `monoGenFnAliasChainFe` at all
+     four of its callers. Both are deleted. `monomorphize` now builds the table whenever a
+     generic exists, and one generic's calls mint at most 64 contexts, so a generic that calls
+     itself at a larger type (D2721) still reaches its refusal. Over 15,334 files nothing
+     moved. `monoAliasChainLamFe`, `monoRespellLamAlias` and `monoCoerceWrittenLet` stay:
+     they name a lambda as the instance frame spells it, and a cloned read resolves to the
+     template's declaration, so the slot also needs a frame-copy answer first. The
+     annotated-closure-result condition is not touched.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
