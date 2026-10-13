@@ -160,7 +160,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   the same day, which is how fast a quoted ratchet goes stale.
 - ✅ **8b. A table read bound-tests its index, or takes a reader whose miss cannot be a
   real row — DONE.** `sentinel-index-unguarded` / `sentinel-index-strict-untested` in
-  `compiler/lint.vl`, the ratchet `scripts/sentinel-budget.py --check` (386 + 0 today),
+  `compiler/lint.vl`, the ratchet `vl check --budget scripts/sentinel-budget-baseline.json` (386 + 0 today),
   the census `scripts/sentinel-census.py`. The shape behind D1440, D1462, D1500 and
   #2498 — four compiler traps in one day, all `vl check` rc 0 — with each of those graded
   as a control on its own pre-fix tree and D1513 as the negative control.

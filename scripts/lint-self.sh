@@ -87,7 +87,7 @@ lint_graded() { # <target> <json path>
     $("$VL" check --budget scripts/interp-budget-baseline.json --exempt-codes) \
     $("$PY" scripts/scan-budget.py --exempt-codes) \
     $("$PY" scripts/ladder-budget.py --exempt-codes) \
-    $("$PY" scripts/sentinel-budget.py --exempt-codes)
+    $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes)
 }
 
 # std/ goes first: it is near-instant AND its module load warms the seed's

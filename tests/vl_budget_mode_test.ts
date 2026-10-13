@@ -176,3 +176,55 @@ Deno.test({
     }
   },
 });
+
+// THE SENTINEL RATCHET RIDES THE SAME MODE, WITH ITS OWN SENTENCES. Its baseline names an
+// `ok` template and a `remedy` paragraph, and the census (scripts/sentinel-census.py, an
+// independent implementation) must agree with the lint's count file by file.
+Deno.test({
+  name:
+    "vl check --budget holds the sentinel-index baseline with its own sentences",
+  ignore: !ENABLED,
+  async fn() {
+    const path = `${ROOT}/scripts/sentinel-budget-baseline.json`;
+    const committed = JSON.parse(await Deno.readTextFile(path));
+    const dir = await Deno.makeTempDir({ prefix: "vl_budget_sentinel_" });
+    try {
+      const full = `${dir}/full.json`;
+      await Deno.copyFile(path, full);
+      const [w, check, ex] = await Promise.all([
+        vl(["--budget", full, "--write-baseline"]),
+        vl(["--budget", path]),
+        vl(["--budget", path, "--exempt-codes"]),
+      ]);
+      expectEq("--write-baseline: exit", 0, w.code);
+      expectEq("--budget: exit", 0, check.code);
+      const [u, s] = [
+        "sentinel-index-unguarded",
+        "sentinel-index-strict-untested",
+      ];
+      expectEq(
+        "--budget: the baseline's own ok sentence",
+        `sentinel-index budget ok — ${committed.total[u]} unguarded reads, ` +
+          `${committed.total[s]} untested strict reads (baseline or below)\n`,
+        check.out,
+      );
+      expectEq(
+        "--exempt-codes",
+        Object.keys(committed.total).filter((c) => committed.total[c] > 0).join(
+          " ",
+        ) + "\n",
+        ex.out,
+      );
+      // The write is a fixed point of the committed file but for `commit`.
+      const strip = (t: string) =>
+        t.split("\n").filter((l) => !l.startsWith('"commit"')).join("\n");
+      expectEq(
+        "a fresh write equals the committed baseline but for commit",
+        strip(await Deno.readTextFile(path)),
+        strip(await Deno.readTextFile(full)),
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
