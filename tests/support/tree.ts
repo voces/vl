@@ -21,13 +21,19 @@ export const VL = `${ROOT}/scripts/vl-host/target/release/vl${
 }`;
 export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 
-/** A binaryen CLI tool from `node_modules/.bin` (it is not on PATH). On Windows
- * npm installs the spawnable shim as `<tool>.cmd`; the bare name is a node script
- * the OS cannot execute. */
-export const binaryen = (tool: string): string =>
-  `${ROOT}/node_modules/.bin/${tool}${
-    Deno.build.os === "windows" ? ".cmd" : ""
-  }`;
+/** A binaryen CLI tool: from `$VL_BINARYEN` (a directory of the native release
+ * binaries, the same version as package.json's) when set, else from
+ * `node_modules/.bin`, which is not on PATH. npm's build is binaryen compiled to
+ * JS/wasm under node: the modules it writes are byte-identical, but each call pays
+ * node's start-up and `-O` runs about 5x slower. `wasm-dis` always comes from npm:
+ * the native one prints `\r\n` on Windows, and the shape suites match text by line.
+ * On Windows npm's spawnable shim is `<tool>.cmd`. */
+export const binaryen = (tool: string): string => {
+  const win = Deno.build.os === "windows";
+  const native = Deno.env.get("VL_BINARYEN");
+  if (native && tool !== "wasm-dis") return `${native}/${tool}${win ? ".exe" : ""}`;
+  return `${ROOT}/node_modules/.bin/${tool}${win ? ".cmd" : ""}`;
+};
 export const STD = `${ROOT}/std`;
 
 /** Whether `p` exists. `Deno.statSync` throws on a miss; this is the test suite's
