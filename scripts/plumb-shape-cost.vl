@@ -1,0 +1,1058 @@
+// The compile-cost ratchet on generated code: guest fuel, peak RSS and CPU of one
+// `vl build --names -O --import-memory` of each of two plumb-shaped units, against
+// `scripts/plumb-shape-baseline.json`. The VL port of `scripts/plumb-shape-cost.py`, whose
+// docstring is the contract; the two print the same report for the same measurements.
+//
+//     vl run scripts/plumb-shape-cost.vl -- [--check | --write-baseline | --samples] [--require-fuel]
+//
+// Run it from the checkout root. CPU and peak RSS come from GNU `time` around each build,
+// `wasm-opt` is timed by a shell wrapper this writes, and the quiet-box control is a fixed
+// workload run by a build of this file. `$PLUMB_SHAPE_RECORD` names a file that receives
+// every raw reading, in order, so another grader can replay the same measurement.
+
+import {
+  IoError,
+  appendTextFile,
+  pathExists,
+  pathKind,
+  readFile,
+  writeTextFile,
+} from "std:fs"
+import { exit, runProgram } from "std:process"
+import { getEnv } from "std:env"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseF64, parseI32, parseI64, toFixed, toString } from "std:fmt"
+import { join, padEnd, padStart, split, startsWith } from "std:str"
+import { Json, parseJson } from "std:json"
+
+const BASELINE = "scripts/plumb-shape-baseline.json"
+const GEN = "scripts/perf/gen-plumb-shape.vl"
+const CONTROL = "scripts/perf/plumb-shape-control.vl"
+const TIME = "/usr/bin/time"
+const UNIT_BYTES = 2000000
+const BUILD_TIMEOUT = 300
+const BAR_FUEL = 0.05
+const BAR_RSS = 0.10
+const BAR_COMPILE_CPU = 0.15
+const BAR_OPT_CPU = 0.25
+const QUIET = 1.15
+const MIN_QUIET = 2
+const REWRITE = "  vl run scripts/plumb-shape-cost.vl -- --write-baseline"
+
+type JsonMap = { [string]: Json }
+
+// Temp directories to remove before any exit.
+let temps: string[] = []
+let lastBusy = 0.0
+let record = ""
+let haveTime = false
+
+function cleanup() {
+  for t in temps { runProgram("rm", ["-rf", t]) }
+  temps = []
+}
+
+function die(msg: string, code: i32) {
+  print(msg)
+  cleanup()
+  exit(code)
+}
+
+// ── Python's number spellings ─────────────────────────────────────────────────────
+
+// `x` to `d` places as Python's `%.{d}f` writes it: the exact double, ties to even.
+function pyFixed(x: f64, d: i32): string {
+  const s = toFixed(x, d)
+  const full = toFixed(x, 100)
+  const dot = full.indexOf(".")
+  if dot < 0 { return s }
+  const tail = full.slice(dot + 1 + d, full.length)
+  if tail.length == 0 || tail[0] != 53 { return s }
+  let i = 1
+  while i < tail.length {
+    if tail[i] != 48 { return s }
+    i = i + 1
+  }
+  let trunc = full.slice(0, dot + 1 + d)
+  if d == 0 { trunc = full.slice(0, dot) }
+  const last = trunc[trunc.length - 1]
+  if (last - 48) % 2 == 0 { return trunc }
+  s
+}
+
+// Python's `round(x, d)`.
+function pyRound(x: f64, d: i32): f64 {
+  const p = parseF64(pyFixed(x, d))
+  if p == null { return x }
+  p
+}
+
+// Python's `repr` of a float in 1e-4..1e16 (no exponent): the fewest digits that read back.
+function pyRepr(x: f64): string {
+  let d = 1
+  while d <= 30 {
+    const s = pyFixed(x, d)
+    const p = parseF64(s)
+    if p != null && p == x {
+      let e = s.length
+      while e > 0 && s[e - 1] == 48 && s[e - 2] != 46 { e = e - 1 }
+      return s.slice(0, e)
+    }
+    d = d + 1
+  }
+  toString(x)
+}
+
+// An integral double as Python prints the int it was.
+function pyInt(x: f64): string { toFixed(x, 0) }
+
+// `s` (a `%f` spelling) with its integer digits grouped by commas, as `,` asks.
+function commas(s: string): string {
+  let sign = ""
+  let body = s
+  if startsWith(s, "-") {
+    sign = "-"
+    body = s.slice(1, s.length)
+  }
+  let dot = body.indexOf(".")
+  if dot < 0 { dot = body.length }
+  const intPart = body.slice(0, dot)
+  let out = ""
+  let i = 0
+  while i < intPart.length {
+    if i > 0 && (intPart.length - i) % 3 == 0 { out = out + "," }
+    out = out + intPart.slice(i, i + 1)
+    i = i + 1
+  }
+  sign + out + body.slice(dot, body.length)
+}
+
+function pyBool(b: boolean | null): string {
+  if b == null { return "None" }
+  if b { return "True" }
+  "False"
+}
+
+function pyOptInt(v: i32 | null): string {
+  if v == null { return "None" }
+  toString(v)
+}
+
+function pyOptStr(v: string | null): string {
+  if v == null { return "None" }
+  v
+}
+
+// A JSON value as Python prints it after `json.load`: ints stay ints.
+function pyJson(v: Json | null): string {
+  if v == null { return "None" }
+  if v is boolean { return pyBool(v) }
+  if v is f64 {
+    if v == pyRound(v, 0) && v < 1e16 && v > -1e16 { return pyInt(v) }
+    return pyRepr(v)
+  }
+  if v is string { return v }
+  "?"
+}
+
+function hexDigits(v: i32, n: i32): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = n - 1
+  while k >= 0 {
+    const d = (v >> (k * 4)) & 15
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+// The code point starting at byte `i` and its byte length, of valid UTF-8.
+type Cp = { cp: i32, n: i32 }
+
+function cpAt(s: string, i: i32): Cp {
+  const b = s[i]
+  if b < 0x80 { return { cp: b, n: 1 } }
+  let cp = 0
+  let n = 1
+  if b >= 0xF0 {
+    n = 4
+    cp = b & 7
+  } else if b >= 0xE0 {
+    n = 3
+    cp = b & 15
+  } else {
+    n = 2
+    cp = b & 31
+  }
+  let k = 1
+  while k < n && i + k < s.length {
+    cp = (cp << 6) | (s[i + k] & 63)
+    k = k + 1
+  }
+  { cp: cp, n: n }
+}
+
+function uEsc(cp: i32): string { "\\u" + hexDigits(cp, 4) }
+
+// `json.dumps(s)` with its default `ensure_ascii`: everything outside space..`~` escaped.
+function jsonStr(s: string): string {
+  const parts = ["\""]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == 34 { parts.push("\\\"") }
+      else if b == 92 { parts.push("\\\\") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 8 { parts.push("\\b") }
+      else if b == 12 { parts.push("\\f") }
+      else if b < 32 || b == 127 { parts.push(uEsc(b)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    const c = cpAt(s, i)
+    if c.cp > 0xFFFF {
+      const v = c.cp - 0x10000
+      parts.push(uEsc(0xD800 | (v >> 10)))
+      parts.push(uEsc(0xDC00 | (v & 0x3FF)))
+    } else {
+      parts.push(uEsc(c.cp))
+    }
+    i = i + c.n
+  }
+  parts.push("\"")
+  join(parts, "")
+}
+
+// ── processes and files ───────────────────────────────────────────────────────────
+
+type Proc = { code: i32, out: string, err: string }
+
+function spawn(cmd: string, args: string[]): Proc {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("plumb-shape: cannot run \{cmd} (\{r.msg})", 1)
+    return { code: -1, out: "", err: "" }
+  }
+  {
+    code: r.code,
+    out: decodeUtf8Lossy(r.stdout),
+    err: decodeUtf8Lossy(r.stderr),
+  }
+}
+
+function stripWs(s: string): string {
+  let a = 0
+  while a < s.length && (s[a] == 32 || (s[a] >= 9 && s[a] <= 13)) { a = a + 1 }
+  let b = s.length
+  while b > a && (s[b - 1] == 32 || (s[b - 1] >= 9 && s[b - 1] <= 13)) {
+    b = b - 1
+  }
+  s.slice(a, b)
+}
+
+function readText(path: string): string | null {
+  const t = readFile(path)
+  if t is IoError { return null }
+  decodeUtf8Lossy(t)
+}
+
+function exists(path: string): boolean {
+  const e = pathExists(path)
+  if e is IoError { return false }
+  e
+}
+
+function isFile(path: string): boolean {
+  const k = pathKind(path)
+  if k is IoError { return false }
+  k == "file"
+}
+
+function envOr(name: string, dflt: string): string {
+  const v = getEnv(name)
+  if v is string { return v }
+  dflt
+}
+
+function note(line: string) {
+  if record != "" { appendTextFile(record, line + "\n") }
+}
+
+// (busy, total) jiffies over every CPU since boot.
+type Ticks = { busy: i64, total: i64 }
+
+function boxTicks(): Ticks {
+  const t = readText("/proc/stat")
+  let busy: i64 = 0
+  let total: i64 = 0
+  if t != null {
+    const f = split(t.split("\n")[0], " ").filter((x) => x != "")
+    let i = 1
+    while i < f.length {
+      total = total + (parseI64(f[i]) ?? 0)
+      i = i + 1
+    }
+    let idle: i64 = 0
+    if f.length > 4 { idle = parseI64(f[4]) ?? 0 }
+    if f.length > 5 { idle = idle + (parseI64(f[5]) ?? 0) }
+    busy = total - idle
+  }
+  note("ticks " + toString(busy) + " " + toString(total))
+  { busy: busy, total: total }
+}
+
+// One timed child: its process tree's CPU seconds, peak RSS in MB, and stderr.
+type Run = { cpu: f64 | null, rss: f64 | null, err: string }
+
+// Run `cmd` in `cwd` under `timeout`, with `env` (`K=V`) set and `$VL_FUEL` unset. A
+// failure prints the stderr's tail and exits 1. `traced` runs are the Python's `run()`.
+function runTimed(
+  cmd: string[],
+  env: string[],
+  cwd: string,
+  traced: boolean,
+): Run {
+  const tfile = temps[0] + "/time.out"
+  const args = ["-C", cwd, "-u", "VL_FUEL"]
+  for e in env { args.push(e) }
+  if haveTime {
+    for a in [TIME, "-f", "%U %S %M", "-o", tfile] { args.push(a) }
+  }
+  args.push("timeout")
+  args.push(toString(BUILD_TIMEOUT))
+  for c in cmd { args.push(c) }
+  let t0: Ticks = { busy: 0, total: 0 }
+  if traced { t0 = boxTicks() }
+  const p = spawn("env", args)
+  if traced {
+    const t1 = boxTicks()
+    lastBusy = 0.0
+    if t1.total > t0.total {
+      lastBusy = ((t1.busy - t0.busy) as! f64) / ((t1.total - t0.total) as! f64)
+    }
+  }
+  if p.code != 0 {
+    let tail = p.err
+    if tail.length > 2000 { tail = tail.slice(tail.length - 2000, tail.length) }
+    const line = join(cmd, " ")
+    die(
+      "\{tail}plumb-shape: `\{line}` failed (rc \{p.code}; 124 is the \{BUILD_TIMEOUT}s timeout)",
+      1,
+    )
+  }
+  let cpu: f64 | null = null
+  let rss: f64 | null = null
+  if haveTime {
+    const lines = (readText(tfile) ?? "").split("\n").filter((l) => l != "")
+    const f = split(lines[lines.length - 1], " ")
+    cpu = (parseF64(f[0]) ?? 0.0) + (parseF64(f[1]) ?? 0.0)
+    rss = ((parseI64(f[2]) ?? 0) as! f64) / 1024.0
+    if traced { note("run " + pyRepr(cpu ?? 0.0) + " " + f[2]) }
+  }
+  { cpu: cpu, rss: rss, err: p.err }
+}
+
+// ── the wasm-opt wrapper and its log ──────────────────────────────────────────────
+
+const WRAPPER = "#!/bin/sh
+rung=False; skip=False
+for a in \"$@\"; do
+  case \"$a\" in -O|-O3) rung=True ;; --skip-pass=ssa-nomerge) skip=True ;; esac
+done
+if [ $rung = True ]; then cp \"$1\" \"$PLUMB_SHAPE_OPT_LOG.rung\" || exit 1; fi
+cpu=\"0 0\"; code=0
+if [ -n \"$PLUMB_SHAPE_REAL_WASM_OPT\" ]; then
+  if [ -x /usr/bin/time ]; then
+    /usr/bin/time -f \"%U %S\" -o \"$PLUMB_SHAPE_OPT_LOG.time\" \"$PLUMB_SHAPE_REAL_WASM_OPT\" \"$@\"
+    code=$?
+    cpu=$(tail -n 1 \"$PLUMB_SHAPE_OPT_LOG.time\")
+  else
+    \"$PLUMB_SHAPE_REAL_WASM_OPT\" \"$@\"
+    code=$?
+  fi
+fi
+echo \"$rung $skip $cpu\" >> \"$PLUMB_SHAPE_OPT_LOG\"
+exit $code
+"
+
+// The rung call's two input facts; `has` is false when no call ran with `-O`.
+type Facts = { has: boolean, skip: boolean, ifs: i32 }
+type OptLog = { cpu: f64, facts: Facts }
+
+// How many `i32.const 1; if` frames (41 01 04 40) `bytes` holds.
+function countConstIfs(bytes: u8[]): i32 {
+  let n = 0
+  let i = 0
+  const end = bytes.length - 3
+  while i < end {
+    if (
+      bytes[i] == 0x41
+      && bytes[i + 1] == 1
+      && bytes[i + 2] == 4
+      && bytes[i + 3] == 0x40
+    ) {
+      n = n + 1
+      i = i + 4
+    } else {
+      i = i + 1
+    }
+  }
+  n
+}
+
+function readOptLog(log: string): OptLog {
+  let total = 0.0
+  let facts: Facts = { has: false, skip: false, ifs: 0 }
+  for line in (readText(log) ?? "").split("\n") {
+    if line == "" { continue }
+    const f = split(line, " ")
+    total = total + ((parseF64(f[2]) ?? 0.0) + (parseF64(f[3]) ?? 0.0))
+    if f[0] == "True" { facts = { has: true, skip: f[1] == "True", ifs: 0 } }
+  }
+  if facts.has {
+    const b = readFile(log + ".rung")
+    if b is IoError {
+      die("plumb-shape: cannot read the rung input (\{b.msg})", 1)
+    } else {
+      facts = { has: true, skip: facts.skip, ifs: countConstIfs(b) }
+    }
+  }
+  note("opt " + pyRepr(total))
+  { cpu: total, facts: facts }
+}
+
+function truncate(path: string) { writeTextFile(path, "") }
+
+// The first `wasm-opt` on PATH that is a native binary, not binaryen's JS build.
+function nativeWasmOpt(): string | null {
+  for d in split(envOr("PATH", ""), ":") {
+    const cand = d + "/wasm-opt"
+    if !isFile(cand) { continue }
+    const b = readFile(cand)
+    if b is IoError { continue }
+    if b.length >= 2 && b[0] == 35 && b[1] == 33 { continue }
+    return cand
+  }
+  null
+}
+
+function cpuModel(): string {
+  const t = readText("/proc/cpuinfo")
+  if t == null { return "unknown" }
+  for line in t.split("\n") {
+    if startsWith(line, "model name") {
+      const i = line.indexOf(":")
+      return stripWs(line.slice(i + 1, line.length))
+    }
+  }
+  "unknown"
+}
+
+// The control's CPU seconds, from one run of its build.
+function control(vl: string, self: string, root: string): f64 {
+  const r = runTimed([vl, "run", self], [], root, false)
+  const c = r.cpu ?? 0.0
+  note("ctl " + pyRepr(c))
+  c
+}
+
+// ── one unit ──────────────────────────────────────────────────────────────────────
+
+type Meas = {
+  fuel: f64 | null,
+  rss: f64 | null,
+  compile: f64 | null,
+  opt: f64 | null,
+  control: f64,
+  quiet: i32,
+  done: i32,
+  sha: string,
+  skip: boolean | null,
+  ifs: i32 | null,
+  wasmOpt: string | null,
+  host: string,
+}
+
+type Row = {
+  ctl: f64,
+  cpu: f64 | null,
+  opt: f64,
+  rss: f64 | null,
+  quiet: boolean,
+}
+
+function fuelOf(err: string): f64 | null {
+  for line in err.split("\n") {
+    if startsWith(line, "[fuel] guest: ") {
+      const n = line.slice(14, line.length)
+      if n.length == 0 { continue }
+      let ok = true
+      let j = 0
+      while j < n.length {
+        if n[j] < 48 || n[j] > 57 { ok = false }
+        j = j + 1
+      }
+      if ok { return parseF64(n) }
+    }
+  }
+  null
+}
+
+function makeTemp(): string {
+  const p = spawn("mktemp", ["-d", "-t", "plumb-shape.XXXXXXXX"])
+  if p.code != 0 { die("plumb-shape: mktemp -d failed: " + p.err, 1) }
+  stripWs(p.out)
+}
+
+function measure(
+  vl: string,
+  seed: string,
+  root: string,
+  self: string,
+  runs: i32,
+  baseCtl: f64 | null,
+  samples: boolean,
+  shape: string[],
+): Meas {
+  const real = nativeWasmOpt()
+  const work = makeTemp()
+  temps.push(work)
+  const std = envOr("VL_STD", root + "/std")
+  const unit = work + "/unit.vl"
+  const gen = [
+    vl,
+    "run",
+    root + "/" + GEN,
+    "--compiler",
+    seed,
+    "--",
+    "--bytes",
+    toString(UNIT_BYTES),
+  ]
+  for s in shape { gen.push(s) }
+  gen.push("-o")
+  gen.push(unit)
+  runTimed(gen, ["VL_STD=" + std], root, true)
+  const sum = spawn("sha256sum", [unit])
+  if sum.code != 0 { die("plumb-shape: sha256sum failed: " + sum.err, 1) }
+  const sha = sum.out.slice(0, 16)
+  const log = work + "/opt.log"
+  const wrapper = work + "/wasm-opt.sh"
+  writeTextFile(wrapper, WRAPPER)
+  spawn("chmod", ["+x", wrapper])
+  const build = [
+    vl,
+    "build",
+    "unit.vl",
+    "--names",
+    "-O",
+    "--import-memory",
+    "--compiler",
+    seed,
+    "-o",
+    "unit.wasm",
+  ]
+  const benv = [
+    "VL_STD=" + std,
+    "VL_WASM_OPT=" + wrapper,
+    "PLUMB_SHAPE_OPT_LOG=" + log,
+  ]
+  const realEnv = "PLUMB_SHAPE_REAL_WASM_OPT=" + (real ?? "")
+
+  truncate(log)
+  const fenv = benv.slice(0, benv.length)
+  fenv.push("VL_FUEL=1")
+  fenv.push("PLUMB_SHAPE_REAL_WASM_OPT=")
+  const fr = runTimed(build, fenv, work, true)
+  const fuel = fuelOf(fr.err)
+  const facts = readOptLog(log).facts
+
+  const tenv = benv.slice(0, benv.length)
+  tenv.push(realEnv)
+  runTimed(build, tenv, work, true)
+  const rows: Row[] = []
+  let i = 0
+  while i < runs {
+    const ctl = control(vl, self, root)
+    truncate(log)
+    const r = runTimed(build, tenv, work, true)
+    const opt = readOptLog(log).cpu
+    const quiet = baseCtl != null && ctl <= (baseCtl ?? 0.0) * QUIET
+    let comp: f64 | null = null
+    const c = r.cpu
+    if c != null { comp = c - opt }
+    rows.push({ ctl: ctl, cpu: comp, opt: opt, rss: r.rss, quiet: quiet })
+    if samples {
+      const lt = stripWs(readText("/proc/loadavg") ?? "0")
+      note("load " + split(lt, " ")[0])
+      const load = parseF64(split(lt, " ")[0]) ?? 0.0
+      let q = ""
+      if quiet { q = "  quiet" }
+      const c3 = pyFixed(ctl, 3)
+      const cc = pyFixed(comp ?? 0.0, 2)
+      const oc = pyFixed(opt, 2)
+      const rm = pyFixed(r.rss ?? 0.0, 0)
+      const bz = pyFixed(100.0 * lastBusy, 0)
+      const ld = pyFixed(load, 1)
+      print(
+        "  run \{i}: control \{c3}s  compile \{cc}s  -O \{oc}s  rss \{rm} MB  busy \{bz}%  load \{ld}\{q}",
+      )
+    } else if baseCtl != null {
+      let nq = 0
+      for row in rows {
+        if row.quiet { nq = nq + 1 }
+      }
+      if nq + runs - i - 1 < MIN_QUIET { break }
+    }
+    i = i + 1
+  }
+  const q: Row[] = []
+  for row in rows {
+    if baseCtl == null || row.quiet { q.push(row) }
+  }
+  let rss: f64 | null = null
+  let allRss = true
+  let minRss = 0.0
+  let minCtl = 0.0
+  let k = 0
+  for row in rows {
+    const rr = row.rss
+    if rr == null { allRss = false }
+    else if k == 0 || rr < minRss { minRss = rr }
+    if k == 0 || row.ctl < minCtl { minCtl = row.ctl }
+    k = k + 1
+  }
+  if allRss { rss = pyRound(minRss, 1) }
+  let compile: f64 | null = null
+  let optCpu: f64 | null = null
+  if q.length > 0 && q[0].cpu != null {
+    let m = q[0].cpu ?? 0.0
+    for row in q {
+      if (row.cpu ?? 0.0) < m { m = row.cpu ?? 0.0 }
+    }
+    compile = pyRound(m, 3)
+  }
+  if q.length > 0 && real != null {
+    let m = q[0].opt
+    for row in q {
+      if row.opt < m { m = row.opt }
+    }
+    optCpu = pyRound(m, 3)
+  }
+  let version: string | null = null
+  if real != null { version = stripWs(spawn(real, ["--version"]).out) }
+  let skip: boolean | null = null
+  let ifs: i32 | null = null
+  if facts.has {
+    skip = facts.skip
+    ifs = facts.ifs
+  }
+  spawn("rm", ["-rf", work])
+  temps = temps.filter((t) => t != work)
+  {
+    fuel: fuel,
+    rss: rss,
+    compile: compile,
+    opt: optCpu,
+    control: pyRound(minCtl, 3),
+    quiet: q.length,
+    done: rows.length,
+    sha: sha,
+    skip: skip,
+    ifs: ifs,
+    wasmOpt: version,
+    host: cpuModel(),
+  }
+}
+
+// ── the report ────────────────────────────────────────────────────────────────────
+
+function fmtOpt(v: f64 | null, unit: string, nd: i32): string {
+  if v == null { return "-" }
+  pyFixed(v, nd) + unit
+}
+
+function summary(name: string, m: Meas): string {
+  let fuel = "-"
+  const f = m.fuel
+  if f != null { fuel = pyInt(f) }
+  const rss = fmtOpt(m.rss, " MB", 0)
+  const comp = fmtOpt(m.compile, "s", 2)
+  const opt = fmtOpt(m.opt, "s", 2)
+  const ctl = pyFixed(m.control, 3)
+  const skip = pyBool(m.skip)
+  const ifs = pyOptInt(m.ifs)
+  const runs = "\{m.quiet} quiet of \{m.done} runs; control \{ctl}s"
+  "plumb-shape \{name} unit: fuel \{fuel}, peak RSS \{rss}, compile \{comp} CPU, -O \{opt} (\{runs}), skip ssa-nomerge \{skip}, const-1 ifs \{ifs}"
+}
+
+function numJson(v: f64 | null): string {
+  if v == null { return "null" }
+  pyRepr(v)
+}
+
+function measJson(m: Meas): string {
+  let fuel = "null"
+  const f = m.fuel
+  if f != null { fuel = pyInt(f) }
+  let skip = "null"
+  const s = m.skip
+  if s != null { skip = if s { "true" } else { "false" } }
+  let ifs = "null"
+  const n = m.ifs
+  if n != null { ifs = toString(n) }
+  let wo = "null"
+  const w = m.wasmOpt
+  if w != null { wo = jsonStr(w) }
+  const rss = numJson(m.rss)
+  const comp = numJson(m.compile)
+  const opt = numJson(m.opt)
+  const ctl = pyRepr(m.control)
+  const sha = jsonStr(m.sha)
+  const host = jsonStr(m.host)
+  const cpu = "\"compile_cpu\": \{comp}, \"opt_cpu\": \{opt}, \"control_cpu\": \{ctl}"
+  const facts = "\"skip_ssa\": \{skip}, \"const_ifs\": \{ifs}"
+  "\"fuel\": \{fuel}, \"rss_mb\": \{rss}, \{cpu}, \"unit_sha\": \{sha}, \{facts}, \"wasm_opt\": \{wo}, \"cpu_host\": \{host}"
+}
+
+const bad: string[] = []
+
+function gradeSkip(name: string, why: string) {
+  print("  " + padEnd(name, 15, " ") + " not graded: " + why)
+}
+
+function grade(name: string, cur: f64, was: f64, bar: f64, unit: string) {
+  let pct = 0.0
+  if was != 0.0 { pct = 100.0 * (cur - was) / was }
+  const over = cur > was * (1.0 + bar)
+  let nd = 2
+  if unit == "" { nd = 0 }
+  let sp = pyFixed(pct, 1)
+  if !startsWith(sp, "-") { sp = "+" + sp }
+  let verdict = "ok"
+  if over { verdict = "OVER" }
+  const label = padEnd(name, 15, " ")
+  const now = padStart(commas(pyFixed(cur, nd)), 14, " ")
+  const then = commas(pyFixed(was, nd))
+  const pb = pyFixed(100.0 * bar, 0)
+  print(
+    "  \{label} \{now}\{unit} against \{then}\{unit} (\{sp}%, bar +\{pb}%) \{verdict}",
+  )
+  if over { bad.push(name) }
+}
+
+function field(m: JsonMap, key: string): Json | null {
+  if !m.has(key) { return null }
+  m[key]
+}
+
+function numOf(m: JsonMap, key: string): f64 {
+  const v = field(m, key)
+  if v is f64 { return v }
+  die("plumb-shape: the baseline's " + key + " is not a number", 1)
+  0.0
+}
+
+function strOf(m: JsonMap, key: string): string | null {
+  const v = field(m, key)
+  if v is string { return v }
+  null
+}
+
+function hostSkips(vl: string): boolean {
+  const b = readFile(vl)
+  if b is IoError { return false }
+  const needle = "--skip-pass=ssa-nomerge"
+  const end = b.length - needle.length
+  let i = 0
+  while i <= end {
+    if b[i] == 45 && b[i + 1] == 45 {
+      let j = 2
+      while j < needle.length && b[i + j] == needle[j] { j = j + 1 }
+      if j == needle.length { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+function sameJson(a: Json | null, s: boolean | null): boolean {
+  if a == null { return s == null }
+  if a is boolean { return s != null && a == (s ?? false) }
+  false
+}
+
+function checkUnit(
+  uname: string,
+  m: Meas,
+  b: JsonMap,
+  base: JsonMap,
+  sameHost: boolean,
+  skips: boolean,
+  requireFuel: boolean,
+) {
+  const tag = uname + " "
+  const fuel = m.fuel
+  if fuel == null {
+    if requireFuel {
+      die(
+        "plumb-shape: this host prints no `[fuel]` line and --require-fuel was given",
+        1,
+      )
+    }
+    gradeSkip(
+      tag + "fuel",
+      "this host predates $VL_FUEL (rebuild scripts/vl-host)",
+    )
+  } else {
+    grade(tag + "fuel", fuel, numOf(b, "fuel"), BAR_FUEL, "")
+  }
+  const rss = m.rss
+  if rss == null {
+    gradeSkip(tag + "peak RSS", "no " + TIME + " to read rusage with")
+  } else {
+    grade(tag + "peak RSS", rss, numOf(b, "rss_mb"), BAR_RSS, " MB")
+  }
+  if !skips && !requireFuel {
+    gradeSkip(
+      tag + "skips ssa-nomerge",
+      "this host predates D2336 (rebuild scripts/vl-host)",
+    )
+  } else {
+    const ok = sameJson(field(b, "skip_ssa"), m.skip)
+    let v = "ok"
+    if !ok { v = "CHANGED" }
+    const label = padEnd(tag + "skips ssa-nomerge", 15, " ")
+    const now = pyBool(m.skip)
+    const then = pyJson(field(b, "skip_ssa"))
+    print("  \{label} \{now} against \{then} \{v}")
+    if !ok { bad.push(tag + "skips ssa-nomerge") }
+  }
+  {
+    const bv = field(b, "const_ifs")
+    let was = 0.0
+    if bv is f64 { was = bv }
+    const ok = ((m.ifs ?? 0) as! f64) <= was
+    let v = "ok"
+    if !ok { v = "CHANGED" }
+    const label = padEnd(tag + "const-1 ifs", 15, " ")
+    const now = pyOptInt(m.ifs)
+    const then = pyJson(bv)
+    print("  \{label} \{now} against \{then} \{v}")
+    if !ok { bad.push(tag + "const-1 ifs") }
+  }
+  let cpuWhy = ""
+  if m.compile == null {
+    cpuWhy = "this OS reports no rusage"
+  } else if !sameHost {
+    const here = cpuModel()
+    const there = pyOptStr(strOf(base, "cpu_host"))
+    cpuWhy = "CPU is `\{here}`, the baseline's `\{there}`"
+  } else if m.quiet < MIN_QUIET {
+    const pq = pyFixed(100.0 * (QUIET - 1.0), 0)
+    const bc = pyFixed(numOf(base, "control_cpu"), 3)
+    cpuWhy = "box busy — \{m.quiet} of \{m.done} runs had the control within \{pq}% of its \{bc}s"
+  }
+  if cpuWhy != "" {
+    gradeSkip(tag + "compile", cpuWhy)
+  } else {
+    grade(
+      tag + "compile",
+      m.compile ?? 0.0,
+      numOf(b, "compile_cpu"),
+      BAR_COMPILE_CPU,
+      "s",
+    )
+  }
+  let optWhy = cpuWhy
+  const bskip = field(b, "skip_ssa")
+  if optWhy == "" && bskip is boolean && bskip && !skips {
+    optWhy = "this host predates D2336 (rebuild scripts/vl-host)"
+  }
+  const bwo = strOf(b, "wasm_opt")
+  if optWhy == "" && pyOptStr(m.wasmOpt) != pyOptStr(bwo) {
+    const here = pyOptStr(m.wasmOpt)
+    const there = pyOptStr(bwo)
+    optWhy = "wasm-opt is `\{here}`, the baseline's `\{there}`"
+  }
+  if optWhy != "" {
+    gradeSkip(tag + "-O", optWhy)
+  } else {
+    grade(tag + "-O", m.opt ?? 0.0, numOf(b, "opt_cpu"), BAR_OPT_CPU, "s")
+  }
+}
+
+function usage() {
+  die(
+    "usage: vl run scripts/plumb-shape-cost.vl -- [--check | --write-baseline | --samples] [--require-fuel]",
+    2,
+  )
+}
+
+function main() {
+  const argv = programArgs()
+  let args: string[] = []
+  if argv is Utf8Error { usage() } else { args = argv }
+  const pwd = spawn("pwd", ["-P"])
+  const root = stripWs(pwd.out)
+  record = envOr("PLUMB_SHAPE_RECORD", "")
+  haveTime = isFile(TIME)
+  const vl = envOr("VL", root + "/scripts/vl-host/target/release/vl")
+  const seed = envOr("SEED", root + "/build/vl-compiler.wasm")
+  const requireFuel = args.filter((a) => a == "--require-fuel").length > 0
+  args = args.filter((a) => a != "--require-fuel")
+  let mode = "--check"
+  if args.length > 0 { mode = args[0] }
+  if (
+    (mode != "--check" && mode != "--write-baseline" && mode != "--samples")
+    || args.length > 1
+  ) {
+    usage()
+  }
+  if !exists(vl) {
+    die(
+      "plumb-shape: missing \{vl} (cd scripts/vl-host && cargo build --release)",
+      1,
+    )
+  }
+  if requireFuel && !haveTime {
+    die(
+      "plumb-shape: no \{TIME} to read rusage with, and --require-fuel was given",
+      1,
+    )
+  }
+  if !exists(seed) {
+    die("plumb-shape: missing " + seed + " (scripts/refresh-compiler.sh)", 1)
+  }
+
+  const basePath = root + "/" + BASELINE
+  let base: JsonMap = Map()
+  let haveBase = false
+  if mode != "--write-baseline" {
+    const t = readText(basePath)
+    let why = ""
+    if t == null {
+      why = "[Errno 2] No such file or directory: '" + basePath + "'"
+    } else {
+      const j = parseJson(t)
+      if j is JsonMap {
+        base = j
+        haveBase = true
+      } else {
+        why = "not a JSON object"
+      }
+    }
+    if !haveBase && mode == "--check" {
+      die(
+        "plumb-shape: cannot read \{basePath} (\{why}); write one with\n\{REWRITE}",
+        1,
+      )
+    }
+  }
+  const host = cpuModel()
+  const sameHost = haveBase && strOf(base, "cpu_host") == host
+  let dflt = "3"
+  if mode == "--write-baseline" { dflt = "7" }
+  const runs = parseI32(stripWs(envOr("PLUMB_SHAPE_RUNS", dflt))) ?? 3
+  let ctl: f64 | null = null
+  if sameHost { ctl = numOf(base, "control_cpu") }
+
+  const scratch = makeTemp()
+  temps = [scratch]
+  const self = scratch + "/control.wasm"
+  const sb = spawn(vl, ["build", CONTROL, "--compiler", seed, "-o", self])
+  if sb.code != 0 {
+    die("plumb-shape: cannot build " + CONTROL + ":\n" + sb.out + sb.err, 1)
+  }
+  runTimed([vl, "run", self], [], root, false)
+
+  const mm = measure(vl, seed, root, self, runs, ctl, mode == "--samples", [])
+  const mt = measure(
+    vl,
+    seed,
+    root,
+    self,
+    runs,
+    ctl,
+    mode == "--samples",
+    ["--shape", "tail"],
+  )
+  print(summary("main", mm))
+  print(summary("tail", mt))
+  if mode == "--samples" {
+    cleanup()
+    return
+  }
+  if mode == "--write-baseline" {
+    if mm.fuel == null || mt.fuel == null {
+      die(
+        "plumb-shape: this host prints no `[fuel]` line (it predates $VL_FUEL); rebuild it first",
+        1,
+      )
+    }
+    const g = spawn("git", ["rev-parse", "--short", "HEAD"])
+    let commit = stripWs(g.out)
+    if commit == "" { commit = "unknown" }
+    const top = measJson(mm)
+    const nested = measJson(mt)
+    const cj = jsonStr(commit)
+    writeTextFile(
+      basePath,
+      "{\{top}, \"tail\": {\{nested}}, \"commit\": \{cj}}\n",
+    )
+    print("wrote " + BASELINE)
+    cleanup()
+    return
+  }
+  const tb = field(base, "tail")
+  let tail: JsonMap = Map()
+  if tb is JsonMap {
+    tail = tb
+  } else {
+    die(
+      "plumb-shape: the baseline has no tail unit; re-baseline with\n" + REWRITE,
+      1,
+    )
+  }
+  for pair in [["main", mm.sha], ["tail", mt.sha]] {
+    let b = base
+    if pair[0] == "tail" { b = tail }
+    const was = pyOptStr(strOf(b, "unit_sha"))
+    if pair[1] != was {
+      const now = pair[1]
+      const which = pair[0]
+      die(
+        "PLUMB-SHAPE UNIT CHANGED: the generator wrote \{now} for the \{which} unit, the baseline priced \{was}. It is deterministic, so either scripts/perf/gen-plumb-shape.vl changed (re-baseline in the same PR) or the seed now compiles it differently.",
+        1,
+      )
+    }
+  }
+  const skips = hostSkips(vl)
+  checkUnit("main", mm, base, base, sameHost, skips, requireFuel)
+  checkUnit("tail", mt, tail, base, sameHost, skips, requireFuel)
+  cleanup()
+  if bad.length > 0 {
+    const names = join(bad, ", ")
+    print(
+      "PLUMB-SHAPE COST REGRESSION (\{names}): building generated code got dearer.",
+    )
+    print(
+      "  Profile the unit (docs/internals/profiling-the-compiler.md; write it with",
+    )
+    print(
+      "  scripts/perf/gen-plumb-shape.vl). If the cost is accepted, or the compiler got",
+    )
+    print("  cheaper, re-baseline in the same PR, on a quiet box:")
+    print(REWRITE)
+    exit(1)
+  }
+  print("plumb-shape cost ok")
+}
+
+main()

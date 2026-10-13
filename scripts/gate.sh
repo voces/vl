@@ -173,7 +173,7 @@ run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED"
 # contention cannot move it; CPU is graded only from runs a control says were quiet,
 # which inside this fan-out is usually none. ~20 s, plus ~12 s once per new seed while
 # the fuel engine's sidecar compiles. #3108, #3112, D2335 and D2336 are what it holds.
-run "plumb-shape cost"         "$PY" scripts/plumb-shape-cost.py --check
+run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler "$SEED" -- --check
 # The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.

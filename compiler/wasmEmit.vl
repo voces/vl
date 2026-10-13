@@ -6855,12 +6855,18 @@ function emitUnionConcreteEq(
   // would refuse `v == "b"` over a `Json` carrying list and map arms. Widened only where the
   // other operand names an atom the union actually carries: `unionEqArmPresent` is the same
   // membership test the static-false fold below trusts.
-  const eqMixedOk = unionEqArmPresent(usid, unmArms, atom, eak)
+
+  // A `string`-repped other operand has an arm whenever the box can carry it as a string ref — a
+  // plain `string` arm or a literal-union arm, `unionTakesAtomAsStr`'s question and
+  // `emitUnionLitIs`'s second leg. The gate asks it too: an alias arm beside a record (`K | E`)
+  // has no banked string kind, and the box carries it as one (D4340).
+  let eqHasArm = unionEqArmPresent(usid, unmArms, atom, eak)
+  if !eqHasArm && eak == 2 && unionTakesAtomAsStr(unmArms) { eqHasArm = true }
   if (
     uname == ""
     || (!isValueUnionOfSet(usid, uname)
       && !unionCarriesLitUnionArm(uname)
-      && !eqMixedOk)
+      && !eqHasArm)
   ) {
     // The second door to the variant compare, for an operand the arena declined to type
     // (`valueRowKind` -2) and which therefore still carries the ladder's i32 default. The
@@ -6873,12 +6879,8 @@ function emitUnionConcreteEq(
       "emitProgram: `==` over a struct union is not supported yet",
     )
   }
-  // A `string`-repped other operand has an arm whenever the box can carry it as a string ref — a
-  // plain `string` arm or a literal-union arm, `unionTakesAtomAsStr`'s question and
-  // `emitUnionLitIs`'s second leg. Without it a `K | i32` box statically answers `u == k` false:
-  // the banked member kinds carry only `i32`, so the arm that holds the value looks absent.
-  let eqHasArm = unionEqArmPresent(usid, unmArms, atom, eak)
-  if !eqHasArm && eak == 2 && unionTakesAtomAsStr(unmArms) { eqHasArm = true }
+  // Without the string leg above a `K | i32` box statically answers `u == k` false: the banked
+  // member kinds carry only `i32`, so the arm that holds the value looks absent.
   if !eqHasArm {
     // No arm has the other operand's rep: the box can never hold such a value.
     if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
@@ -25710,14 +25712,15 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // un-annotated one takes its destination's instead (D381), and `letRefListSlot` is the
   // cell half that must agree.
   const letLb = letListBuild(stmtIx, fnIx)
-  pendingListKind = letLb.lbKind
-  pendingListSlot = letLb.lbSlot
+  const ctx = expCtxHere()
+  ctx.listKind = letLb.lbKind
+  ctx.listSlot = letLb.lbSlot
   // a kind-18 nullable ref-array binding: the list seeds above build the non-null list,
   // this seeds the null arm — the #964 seed-leak gate at the binding boundary.
   if localIsRef[slot] == "nulreflist" {
-    if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
+    if ctx.listSlot >= 0 && ctx.listSlot < rlWrapIdx.length {
       const nraInit = P.nodes[unwrapParen(s.letInit)]
-      if nraInit is NullLit { pendingNulRefHeap = rlWrapIdx[pendingListSlot] }
+      if nraInit is NullLit { ctx.nulRefHeap = rlWrapIdx[ctx.listSlot] }
     }
   }
   // A kind-15 nullable i32-list binding (`i32[] | null = null`): a bare `null` init lowers as
@@ -25728,46 +25731,45 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // an un-annotated empty `[]` whose usage pins a string element (`const out = [];
   // out.push(self[i])`): seed the string-list kind matching the slot `collectLocals`
   // typed, else the inferred `[]` defaults to the i32 list and the slot store mismatches.
-  if pendingListKind == LBK_I32_LIST && letInfStrListByUseV(stmtIx, fnIx) {
-    pendingListKind = LBK_STR_LIST
+  if ctx.listKind == LBK_I32_LIST && letInfStrListByUseV(stmtIx, fnIx) {
+    ctx.listKind = LBK_STR_LIST
   }
   // a `let b: B = { … }` struct literal must build the annotation's struct, not a
   // first-field-name match — seed `pendingStructIdx` from the annotation when it names a
   // standalone struct. A union annotation names none, so a variant literal still boxes.
-  pendingStructIdx = letAnnStructIdx(stmtIx)
+  ctx.structIdx = letAnnStructIdx(stmtIx)
   // A NULLABLE-struct binding (`let b: P | null = …`, slot kind 9) seeds the SAME struct
   // context from the slot's recorded struct index — a bare `null` init lowers as
   // `ref.null $P` (the union annotation names no `sNames` entry, so `letAnnStructIdx`
   // gave -1), a struct literal builds that struct. Mirrors the kind-9 global cell's seeding.
-  if pendingStructIdx < 0 {
-    if localIsRef[slot] == "nulstruct" {
-      pendingStructIdx = localStructIdx[slot]
-    }
+  if ctx.structIdx < 0 {
+    if localIsRef[slot] == "nulstruct" { ctx.structIdx = localStructIdx[slot] }
   }
   // A `const c: Cat = { … }` variant-typed binding seeds the VARIANT index so the object
   // literal builds the bare variant struct (kind 8) instead of boxing into the union.
-  pendingVariantIdx = letAnnVariantIdx(stmtIx)
+  ctx.variantIdx = letAnnVariantIdx(stmtIx)
   // the slot-kind twin of `letAnnVariantIdx`, exactly as `nulstruct` is `letAnnStructIdx`'s
   // twin above: the annotation is one route to a kind-8 cell and `collectLocals` is the
   // other, so a seed reading only the annotation is blind to a binding classified from its
   // init (D51). Unseeded, the literal builds a `{tag, value}` box into a variant cell — invalid wasm.
-  if pendingVariantIdx < 0 {
-    if localIsRef[slot] == "variant" {
-      pendingVariantIdx = localStructIdx[slot]
-    }
+  if ctx.variantIdx < 0 {
+    if localIsRef[slot] == "variant" { ctx.variantIdx = localStructIdx[slot] }
   }
   // A map-typed binding seeds the map SHAPE so a `Map()` initializer constructs
   // THIS binding's map struct (mono, or the annotation's ref-valued mv slot).
-  if letIsMap(stmtIx, fnIx) { pendingMapSlot = letMapShapeOf(stmtIx, fnIx) }
+  if letIsMap(stmtIx, fnIx) { ctx.mapSlot = letMapShapeOf(stmtIx, fnIx) }
   // A NULLABLE map binding (`let m: {[string]: V} | null = …`, slot kind `nulmap`): a `Map()` init
   // builds THIS map's struct (`pendingMapSlot` = the shape), and a bare `null` init lowers as
   // `ref.null $mapStruct` (`pendingNulRefHeap` = the map heap type, the generic ref-null seed). The
   // map twin of the kind-9 nulstruct seed above.
   if localIsRef[slot] == "nulmap" {
     const nmShape = nulMapShapeOf(stmtIx, fnIx)
-    pendingMapSlot = nmShape
-    pendingNulRefHeap = mapTypeIdxOf(nmShape)
+    ctx.mapSlot = nmShape
+    ctx.nulRefHeap = mapTypeIdxOf(nmShape)
   }
+  // The init emits under `ctx`; every exit below restores the caller's context.
+  const saved = expCtxHere()
+  expCtxApply(ctx)
   // numeric widening at the binding boundary: an `: f64`/`: f32`/`: i64` slot coerces a
   // narrower init value; an i32-only binding keeps the bytes it had. A union-annotated
   // binding (kind 4) coerces a raw init into the box; an already-union init passes
@@ -25819,30 +25821,32 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
       if nulRep == 0 && fnUsesUnionLetSink {
         if unionIfBindingAllBox(s.letInit, fnIx) {
           if emitUnionIfBindingSink(body, s.letInit, idx, nulNm, fnIx) < 0 {
-            return -1
+            return expCtxLeave(saved, -1)
           }
           fbLocalGet(unionSinkBase)
           fbLocalGet(unionSinkBase + 1)
           fbStructNew(uBoxIdx) // the binding's ONE box
           fbLocalSet(idx)
           scopeBind(s.letName, slot)
-          return 0
+          return expCtxLeave(saved, 0)
         }
       }
       // the value-union box local (kind 4) is a non-null `(ref $uBoxIdx)` — non-
       // defaultable, so the validator needs it definitely assigned before a void-`if`
       // merge; pre-seed the rep's null first. `string | null` is defaultable and needs none.
       if nulRep == 0 {
-        if emitNulNullToLocal(body, idx, 0) < 0 { return -1 }
+        if emitNulNullToLocal(body, idx, 0) < 0 {
+          return expCtxLeave(saved, -1)
+        }
       }
       if (
         emitNullableIfBinding(body, s.letInit, idx, nulRep, nulNm, fnIx)
         < 0
       ) {
-        return -1
+        return expCtxLeave(saved, -1)
       }
       scopeBind(s.letName, slot)
-      return 0
+      return expCtxLeave(saved, 0)
     }
   }
   if localIsRef[slot] == "nulclosure" {
@@ -25851,14 +25855,18 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     // ref directly. Takes priority over the union-coerce path, since this is a niche
     // nullable ref, not a box.
     const ncCtx = expCtxForCell(localIsRef[slot])
-    if emitExprExpect(body, s.letInit, fnIx, ncCtx) < 0 { return -1 }
+    if emitExprExpect(body, s.letInit, fnIx, ncCtx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if isNulScalarListKind(localIsRef[slot]) {
     // A DISTINCT-backing nullable scalar list binding (`string[]|null`, `f64[]|null`,
     // `i64[]|null`, `f32[]|null`): a bare `null` init lowers as `ref.null $wrapper`
     // (`nulRefHeap`), a list value builds the leaf list (`listKind`) which subtypes the
     // nullable slot. Priority over the union-coerce path (the niche is not a box).
     const nslCtx = expCtxForCell(localIsRef[slot])
-    if emitExprExpect(body, s.letInit, fnIx, nslCtx) < 0 { return -1 }
+    if emitExprExpect(body, s.letInit, fnIx, nslCtx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if (
     localIsRef[slot] == "union"
     && letNulMapReadUnionBox(stmtIx, fnIx)
@@ -25870,11 +25878,14 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     const umr = P.nodes[unwrapParen(s.letInit)]
     if umr is Index {
       if emitMapGetUnionBox(body, umr.idxArr, umr.idxIndex, fnIx) < 0 {
-        return -1
+        return expCtxLeave(saved, -1)
       }
     } else {
-      return emitFail(
-        "emitProgram: union-valued map read binding's init is not an index read",
+      return expCtxLeave(
+        saved,
+        emitFail(
+          "emitProgram: union-valued map read binding's init is not an index read",
+        ),
       )
     }
   } else if letUNm != "" {
@@ -25884,24 +25895,32 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     let letArmBoxed = 0
     if localIsRef[slot] == "union" {
       letArmBoxed = emitUnionArmValueBox(body, s.letInit, fnIx)
-      if letArmBoxed < 0 { return -1 }
+      if letArmBoxed < 0 { return expCtxLeave(saved, -1) }
     }
     if letArmBoxed == 0 {
-      if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 { return -1 }
+      if emitUnionCoerce(body, letUNm, s.letInit, fnIx) < 0 {
+        return expCtxLeave(saved, -1)
+      }
     }
   } else if letIsF32(stmtIx) || letInfersF32(stmtIx, fnIx) {
     // `letIsF32` is annotation-only; `collectLocals` types the slot with `letIsF32 ||
     // letInfersF32`, so an un-annotated `const g = fv * 1.0` needs the same pair here —
     // else this ladder falls to the f64 arm, whose fallback over-claims a mixed
     // f32/float-literal init and stores an f64 into the f32 slot, invalid wasm.
-    const savedF32 = pendingF32
-    pendingF32 = true
-    if emitExprAsF32(body, s.letInit, fnIx) < 0 { return -1 }
-    pendingF32 = savedF32
+    const f32Ctx = expCtxHere()
+    f32Ctx.wantF32 = true
+    expCtxApply(f32Ctx)
+    if emitExprAsF32(body, s.letInit, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if letIsF64(stmtIx, fnIx) {
-    if emitExprAsF64(body, s.letInit, fnIx) < 0 { return -1 }
+    if emitExprAsF64(body, s.letInit, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if letIsI64(stmtIx, fnIx) {
-    if emitExprAsI64(body, s.letInit, fnIx) < 0 { return -1 }
+    if emitExprAsI64(body, s.letInit, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if (
     letAnnNm == "string"
     && exprIsLitAtom(s.letInit, fnIx)
@@ -25910,46 +25929,45 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     // A literal-union atom initializing a `string` local widens to its member string. Not
     // where the SLOT is the atom: an inline literal-union annotation renders as `string`, so
     // the rendered name alone would widen into an atom cell (D1752).
-    if emitAtomToStr(body, s.letInit, fnIx) < 0 { return -1 }
+    if emitAtomToStr(body, s.letInit, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if letIsNulString(stmtIx, fnIx) && exprIsLitAtom(s.letInit, fnIx) {
     // a literal-union atom initializing a `string | null` binding widens to its member
     // string: the slot is the nullable string reference and the atom's rep is an i32 id.
     // The non-nullable form needs no arm: `collectLocals` classifies a non-nullable atom
     // init as an atom slot, so nothing widens at the init and each read widens instead.
-    if emitStrValue(body, s.letInit, fnIx) < 0 { return -1 }
+    if emitStrValue(body, s.letInit, fnIx) < 0 { return expCtxLeave(saved, -1) }
   } else {
     // The enclosing value's seeds come back after, since a binding in an if-arm prelude
     // precedes that arm's own value (D3352).
-    const outerNulBool = pendingNulBool
-    const outerNulString = pendingNulString
-    const outerLitUnion = pendingLitUnion
-    const outerNulLitUnion = pendingNulLitUnion
+    const valCtx = expCtxHere()
     // A NICHE `X | null` binding seeds its null rep for a bare `null` init (the table at
     // `emitNullLitNode`). Keyed on `letNulBool`/`letIsNulString` rather than the annotation
     // alone, so an INFERRED niche binding (`const r = f()` where `f` returns `boolean |
     // null`) seeds it too.
-    pendingNulBool = letNulBool(stmtIx, fnIx)
-    pendingNulString = letIsNulString(stmtIx, fnIx)
+    valCtx.nulBool = letNulBool(stmtIx, fnIx)
+    valCtx.nulString = letIsNulString(stmtIx, fnIx)
     if s.letType >= 0 {
-      if nodeTyIsLitUnionAlias(s.letType) { pendingLitUnion = 1 }
+      if nodeTyIsLitUnionAlias(s.letType) { valCtx.litUnion = 1 }
       // an atom-array annotation (`const xs: K[]`) — the let twin of `emitObj`'s
       // `sFieldIsLitUnionArray` arm: the value is the i32 list of atom ids, so the atom
       // context must reach the literal, paired with the `K[]` reject in `letIsStringArray`
       // so the slot and the literal build agree (#1852). A non-literal init is unaffected.
-      if tyIsLitUnionArray(nodeTyIxOf(s.letType)) { pendingLitUnion = 1 }
+      if tyIsLitUnionArray(nodeTyIxOf(s.letType)) { valCtx.litUnion = 1 }
       // `K | null` is dual-natured — a member init is an atom id, only a `null` is the
       // sentinel — so seed BOTH, as the param-arg / return boundaries do.
       if nodeTyIsNulLitUnion(s.letType) {
-        pendingLitUnion = 1
-        pendingNulLitUnion = true
+        valCtx.litUnion = 1
+        valCtx.nulLitUnion = true
       }
     } else if narrowedNulLitBoxKey(s.letInit, fnIx) != "" {
       // The un-annotated twin: the niche cell `letNulLitUnion` gave it converts the box (D3118).
-      pendingLitUnion = 1
-      pendingNulLitUnion = true
+      valCtx.litUnion = 1
+      valCtx.nulLitUnion = true
     }
-    const savedNulList = pendingNulList
-    if letNulList15 { pendingNulList = true }
+    if letNulList15 { valCtx.nulList = true }
+    expCtxApply(valCtx)
     // The declaration-time address fold: a `const p = K + bounded` later used as a memory
     // address needs its bounded part kept in its own scratch local — `const`-only, since a
     // `let` can be reassigned. The checks are `maFoldCandidateCount`'s own, in the same
@@ -25965,24 +25983,13 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     }
     if mfK >= 0 {
       if emitMemConstFoldLet(body, s.letInit, mfK, fnIx, stmtIx) < 0 {
-        return -1
+        return expCtxLeave(saved, -1)
       }
     } else if emitExpr(body, s.letInit, fnIx) < 0 {
-      return -1
+      return expCtxLeave(saved, -1)
     }
-    pendingNulBool = outerNulBool
-    pendingNulString = outerNulString
-    pendingNulList = savedNulList
-    pendingLitUnion = outerLitUnion
-    pendingNulLitUnion = outerNulLitUnion
   }
-  pendingI64 = false
-  pendingStructIdx = -1
-  pendingVariantIdx = -1
-  pendingListKind = LBK_I32_LIST
-  pendingListSlot = 0
-  pendingMapSlot = -1
-  pendingNulRefHeap = -1
+  expCtxApply(saved)
   // read-only covariance at the BINDING boundary (D791): the value on the stack is a
   // ref list at one row and this binding's cell is another. `const b: Shape[] = a` over
   // a `Circle[]` — D773's witness — is `vl check` rc 0 and INVALID WASM on master, and
