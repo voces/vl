@@ -33353,9 +33353,19 @@ export function binPlusIsListByTy(lt: i32, rt: i32) {
 function fnSlotAssignable(src: i32, dst: i32) {
   if numWidens(src, dst) { return false }
   if objNumWidens(src, dst) { return false }
+  if fnSlotAtomToString(src, dst) { return assignable(src, dst) }
   if containerElemClassDiffers(src, dst) { return false }
   if fnSlotNulDiffers(src, dst) { return false }
   assignable(src, dst)
+}
+
+// Whether a function slot widens a string literal union's atom to `string` (or `string | null`).
+// The reps differ, so a delivered function value is wrapped in an adapter that converts at the
+// call (`fvaAdapt`); a function held inside a container is refused there instead (D4351).
+function fnSlotAtomToString(src: i32, dst: i32): boolean {
+  if elemStoreClassOf(src, 8) != ESC_ATOM { return false }
+  const d = nonNullTy(dst)
+  d >= 0 && primNameOf(d) == "string"
 }
 
 // The half of a function slot's valtype `elemStoreClassOf` deliberately does not carry:
@@ -33365,6 +33375,13 @@ function fnSlotAssignable(src: i32, dst: i32) {
 function fnSlotNulDiffers(src: i32, dst: i32) {
   if elemStoreClassOf(src, 8) == ESC_UNKNOWN { return false }
   if elemStoreClassOf(dst, 8) == ESC_UNKNOWN { return false }
+  // A nullable atom is the atom's own i32 with a reserved null id, so the valtype agrees.
+  if (
+    elemStoreClassOf(src, 8) == ESC_ATOM
+    && elemStoreClassOf(dst, 8) == ESC_ATOM
+  ) {
+    return false
+  }
   tyBearsNull(src) != tyBearsNull(dst)
 }
 
@@ -44136,9 +44153,9 @@ function bmArgPred(form: i32, got: i32, want: i32, argIx: i32) {
   if form == BM_PUSH || form == BM_SETVAL || form == BM_KEYMUST {
     return assignableExpr(argIx, got, want)
   }
-  if form == BM_SETKEY {
+  if form == BM_SETKEY || form == BM_ADDKEY {
     // The expression form first: a MEMBER literal is a legal key of a literal-union-keyed
-    // map, and its own type is the member, not the `string` `checkNode` hands back (D1748).
+    // map or set, and its own type is the member, not the `string` `checkNode` hands back (D1748).
     if assignableExpr(argIx, got, want) { return true }
     return nomSlotAccepts(argIx, got, want)
   }
@@ -74296,6 +74313,10 @@ export function luSpell(ty: i32): string {
   if luSpellsAs(dn, ty) { return dn }
   const en = tyToEmitName(ty)
   if en != "" && luSpellsAs(en, ty) { return en }
+  // A function type's display name spaces its arrow, which no annotation name does; its emit
+  // name spells a literal-union parameter by its old base scalar.
+  const an = luArrowTight(dn)
+  if an != dn && luSpellsAs(an, ty) { return an }
   // A union naming a type parameter, whose written form resolves to one member when its lists
   // meet: spelled for the pin to substitute, and typed through `luAnnTy`.
   if luUnionSpellsByMember(ty) { return dn }
@@ -74325,6 +74346,28 @@ function luPipeTight(s: string): string {
     if i + 2 < s.length && s[i] == ' ' && s[i + 1] == '|' && s[i + 2] == ' ' {
       out = out + "|"
       i = i + 3
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// `s` with the spaces around each ` => ` dropped, the form an annotation's function type takes.
+function luArrowTight(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if (
+      i + 3 < s.length
+      && s[i] == ' '
+      && s[i + 1] == '='
+      && s[i + 2] == '>'
+      && s[i + 3] == ' '
+    ) {
+      out = out + "=>"
+      i = i + 4
     } else {
       out = out + s.slice(i, i + 1)
       i = i + 1
@@ -74706,6 +74749,21 @@ function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
   tr
 }
 
+// The function arm of union `u` that a value of function type `src` converts into; -1 when no
+// arm needs a conversion to take it, -2 when more than one converting arm would.
+function fvaUnionArm(u: TyUnion, src: i32): i32 {
+  let found = -1
+  for m in u.uMembers {
+    if m == src || tyEq(m, src) { return -1 }
+    if T.tys[m] is TyFunc && assignable(src, m) {
+      if !fvaFnMayDiffer(src, m, 8) { return -1 }
+      if found >= 0 { return -2 }
+      found = m
+    }
+  }
+  found
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
@@ -74743,6 +74801,20 @@ function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if dt < 0 { return false }
   const d = T.tys[dt]
   const s = T.tys[srcTy]
+  if s is TyFunc && d is TyUnion {
+    // A function delivered into a union lands in the one function arm it converts to.
+    const arm = fvaUnionArm(d, srcTy)
+    if arm >= 0 { return fvaAdapt(srcExpr, srcTy, arm) }
+    if arm == -2 {
+      fvaRefuse(
+        srcExpr,
+        srcTy,
+        dt,
+        "it converts into more than one function arm of the union",
+      )
+      return true
+    }
+  }
   if !(s is TyFunc) || !(d is TyFunc) {
     // A function inside a container is not rewritten on the way, so a call through the
     // destination's function type would reach it at another signature.
