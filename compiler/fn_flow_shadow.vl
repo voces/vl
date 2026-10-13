@@ -83,6 +83,12 @@ let ffLocalRead: {[i32]: i32} = Map()
 // its binding is written), and whether an `=` writes it.
 let ffDeclFrom: {[i32]: i32} = Map()
 let ffDeclWr: {[i32]: boolean} = Map()
+// Per pre-mono declaration (`ffOrigDecl`): its node in the walked tree, the function declaring it
+// (-1 at module scope), and the `=` writes of it and of its capture cell (`d[0] = v`), by node.
+let ffDeclNode: {[i32]: i32} = Map()
+let ffDeclFnOf: {[i32]: i32} = Map()
+let ffDeclWrites: {[i32]: i32[]} = Map()
+let ffCellWrites: {[i32]: i32[]} = Map()
 let ufPar: i32[] = []
 let ufSrc: i32[][] = []
 let ufPin: i32[][] = []
@@ -143,6 +149,10 @@ export function fnFlowShadowBegin() {
   ffLocalRead = Map()
   ffDeclFrom = Map()
   ffDeclWr = Map()
+  ffDeclNode = Map()
+  ffDeclFnOf = Map()
+  ffDeclWrites = Map()
+  ffCellWrites = Map()
   ufPar = []
   ufSrc = []
   ufPin = []
@@ -550,6 +560,9 @@ function ffStmt(ix: i32) {
   const n = P.nodes[ix]
   if n is LetDecl {
     declCtx[ix] = ffCtx
+    const o = ffOrigDecl(ix)
+    ffDeclNode[o] = ix
+    ffDeclFnOf[o] = ffFn
     const s = ffSlot(ffDeclKey(ix, ffCtx))
     ffAddDecl(s, ix)
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
@@ -629,6 +642,27 @@ function ffIsCellRead(ix: i32): boolean {
 function ffKids(ix: i32): i32 {
   for k in nodeChildren(ix) { ffFlow(k, "operand") }
   -1
+}
+
+// Bank write `w` against the binding its target `ix` names, or the capture cell it writes.
+function ffNoteWrite(w: i32, ix: i32) {
+  const n = P.nodes[ix]
+  let d = -1
+  let into = ffDeclWrites
+  if n is Ident {
+    d = identDeclOf(ix)
+  } else if n is Index {
+    if ffIsCellRead(ix) {
+      d = identDeclOf(n.idxArr)
+      into = ffCellWrites
+    }
+  }
+  if d < 0 { return 0 }
+  const o = ffOrigDecl(d)
+  const ws = into[o] ?? []
+  ws.push(w)
+  into[o] = ws
+  0
 }
 
 // The flow of the value of a block: its last statement's, when that is an expression.
@@ -736,6 +770,7 @@ function ffFlow(ix: i32, pos: string): i32 {
   if n is OptMember { return ffKid(ffFlow(n.omObj, "member"), "f." + n.omProp) }
   if n is BinExpr {
     if n.binOp == "=" {
+      ffNoteWrite(ix, n.binLeft)
       const pl = ffPlace(n.binLeft)
       ffMarkWritten(pl)
       return ffUnion(pl, ffFlow(n.binRight, "write"))
@@ -1145,6 +1180,216 @@ export function fnFlowReadGenFn(at: i32): i32 {
     hops = hops + 1
   }
   -1
+}
+
+// Whether an `=` writes the binding the read `at` names (a capture cell's `d[0] = v` aside).
+export function fnFlowDeclWritten(at: i32): boolean {
+  const d = identDeclOf(at)
+  if !ffBuilt || d < 0 { return false }
+  (ffDeclWrites[ffOrigDecl(d)] ?? []).length > 0
+}
+
+// The function declaring the binding declaration `d` stands for, -1 at module scope, and -2
+// when the walk saw no such declaration.
+export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
+
+// The longest alias chain the lambda answers below follow; `FF_CHAIN_LONG` reports one longer.
+const FF_CHAIN_MAX = 64
+export const FF_CHAIN_LONG = -3
+
+// The un-annotated `const` binding of a hole lambda the binding read `at` holds through a chain
+// of un-annotated `const` and `let` bindings, each `let` written only with lambdas and at least one
+// on the chain (`viaLet` counts one already behind), as its declaration; -1 for none, and
+// `FF_CHAIN_LONG` past `FF_CHAIN_MAX` links.
+export function fnFlowAliasLam(at: i32, viaLet: boolean): i32 {
+  if !ffBuilt { return -1 }
+  ffAliasLamFrom(ffReadLet(at), viaLet)
+}
+
+// The hole lambda's binding the capture cell read at `at` (`d[0]`, or `d` itself) holds: the
+// rewrite's `let d = [v]`, written only with lambdas, whose `v` is such a chain.
+export function fnFlowCellLam(at: i32): i32 {
+  if !ffBuilt || at < 0 || at >= P.nodes.length { return -1 }
+  let r = at
+  const rn = P.nodes[at]
+  if rn is Index { r = rn.idxArr }
+  const d = ffLetOf(identDeclOf(r))
+  if d < 0 { return -1 }
+  const n = P.nodes[d]
+  if !(n is LetDecl) || n.letKw != "let" || n.letInit < 0 { return -1 }
+  const lit = P.nodes[n.letInit]
+  if !(lit is ArrayLit) { return -1 }
+  if lit.pos >= 0 || lit.arrElems.length != 1 { return -1 }
+  if !ffWritesAreLams(ffCellWrites[ffOrigDecl(d)] ?? []) { return -1 }
+  ffAliasLamFrom(ffReadLet(lit.arrElems[0]), true)
+}
+
+// The un-annotated `const` binding the call through read `at` is re-spelled to: the end of a chain
+// of at most eight un-annotated `const` aliases (`const c2 = c`), each link's name read in the
+// frame declaring the link, when it binds a lambda. -1 for any other read.
+export function fnFlowRespellLam(at: i32): i32 {
+  if !ffBuilt { return -1 }
+  let d = ffReadLet(at)
+  let hops = 0
+  while hops < 8 && d >= 0 {
+    const n = P.nodes[d]
+    if !(n is LetDecl) { return -1 }
+    if n.letKw != "const" || n.letType >= 0 || n.letInit < 0 { return -1 }
+    if !(P.nodes[n.letInit] is Ident) { return -1 }
+    const s = ffLetOf(identDeclOf(n.letInit))
+    if s < 0 { return -1 }
+    const sf = ffDeclFnOf[ffOrigDecl(s)] ?? -2
+    // A link read from the frame declaring it, or a module-scope binding.
+    if sf == -1 || sf == (ffDeclFnOf[ffOrigDecl(d)] ?? -2) {
+      const c = ffClosureOf(s)
+      if c == -2 { return -1 }
+      if c >= 0 {
+        const sn = P.nodes[s]
+        if sn is LetDecl {
+          if sn.letKw != "const" || sn.letType >= 0 { return -1 }
+        }
+        return s
+      }
+    }
+    d = s
+    hops = hops + 1
+  }
+  -1
+}
+
+// The declaration node the walk saw for the binding read at `ix` (a name, or a cell read
+// `d[0]`), or -1.
+function ffReadLet(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  let d = -1
+  if n is Ident {
+    d = identDeclOf(ix)
+  } else if n is Index {
+    if ffIsCellRead(ix) { d = identDeclOf(n.idxArr) }
+  }
+  ffLetOf(d)
+}
+
+// The `LetDecl` node the walk saw for declaration `d`, else `d` when it is one; -1 otherwise.
+function ffLetOf(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const t = ffDeclNode[ffOrigDecl(d)] ?? -1
+  if t >= 0 { return t }
+  if P.nodes[d] is LetDecl { return d }
+  -1
+}
+
+// The binding of a lambda that declaration node `d`'s initializer names: its own lambda, or a
+// module-scope un-annotated `const` of one it reads. -2 when it names a named function, else -1.
+function ffClosureOf(d: i32): i32 {
+  const n = P.nodes[d]
+  if !(n is LetDecl) || n.letInit < 0 { return -1 }
+  const iv = P.nodes[n.letInit]
+  if iv is FuncDecl {
+    if ffIsLambdaName(iv.fnName) { return d }
+    return -2
+  }
+  if !(iv is Ident) { return -1 }
+  const nd = identDeclOf(n.letInit)
+  if nd < 0 || nd >= P.nodes.length { return -1 }
+  if P.nodes[nd] is FuncDecl { return -2 }
+  const t = ffLetOf(nd)
+  if t < 0 || (ffDeclFnOf[ffOrigDecl(t)] ?? -2) != -1 { return -1 }
+  const tn = P.nodes[t]
+  if tn is LetDecl {
+    if tn.letKw == "const" && tn.letType < 0 && tn.letInit >= 0 {
+      const tl = P.nodes[tn.letInit]
+      if tl is FuncDecl {
+        if ffIsLambdaName(tl.fnName) { return t }
+        return -2
+      }
+    }
+  }
+  -1
+}
+
+// `fnFlowAliasLam` from declaration node `d0`.
+function ffAliasLamFrom(d0: i32, viaLet: boolean): i32 {
+  let d = d0
+  let sawLet = viaLet
+  let hops = 0
+  while hops < FF_CHAIN_MAX {
+    if d < 0 { return -1 }
+    const n = P.nodes[d]
+    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
+    const o = ffOrigDecl(d)
+    const top = (ffDeclFnOf[o] ?? -2) == -1
+    // A module-scope `let` is a link, walked on with its writes checked (D3847, D3856).
+    if (hops > 0 || viaLet) && !(n.letKw == "let" && top) {
+      const c = ffClosureOf(d)
+      if c != -1 {
+        if c < 0 || n.letKw != "const" || !sawLet { return -1 }
+        return c
+      }
+    }
+    let init = n.letInit
+    let cell = false
+    const lit = P.nodes[n.letInit]
+    if lit is ArrayLit {
+      if lit.pos < 0 && lit.arrElems.length == 1 {
+        init = lit.arrElems[0]
+        cell = true
+      }
+    }
+    if n.letKw == "let" {
+      sawLet = true
+      let ws = ffDeclWrites[o] ?? []
+      if cell { ws = ffCellWrites[o] ?? [] }
+      if !ffWritesAreLams(ws) { return -1 }
+    }
+    d = ffReadLet(init)
+    hops = hops + 1
+  }
+  FF_CHAIN_LONG
+}
+
+// Whether every write in `ws` stores a lambda, or a value whose function type is concrete (a
+// typed parameter, D3848): a call's arguments fit it, so the lambdas pin at them.
+function ffWritesAreLams(ws: i32[]): boolean {
+  for w in ws {
+    const b = P.nodes[w]
+    if b is BinExpr {
+      if !ffIsLamValue(b.binRight) && !ffFnTyConcrete(b.binRight) {
+        return false
+      }
+    }
+  }
+  true
+}
+
+// Whether value `v` is a lambda, or a name bound through un-annotated bindings to one.
+function ffIsLamValue(v: i32): boolean {
+  const vn = P.nodes[v]
+  if vn is FuncDecl { return ffIsLambdaName(vn.fnName) }
+  let d = ffReadLet(v)
+  let hops = 0
+  while d >= 0 && hops < FF_CHAIN_MAX {
+    const c = ffClosureOf(d)
+    if c != -1 { return c >= 0 }
+    const n = P.nodes[d]
+    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return false }
+    let init = n.letInit
+    const lit = P.nodes[n.letInit]
+    if lit is ArrayLit {
+      if lit.pos < 0 && lit.arrElems.length == 1 { init = lit.arrElems[0] }
+    }
+    d = ffReadLet(init)
+    hops = hops + 1
+  }
+  false
+}
+
+// Whether node `v`'s recorded type is a function type naming no type variable.
+function ffFnTyConcrete(v: i32): boolean {
+  const t = nodeTyIxOf(v)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return false }
+  T.tys[t] is TyFunc
 }
 
 // The pre-mono declaration minted declaration `d` stands for, else `d`.

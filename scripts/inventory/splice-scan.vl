@@ -1,0 +1,457 @@
+// Refuse an inventory whose rows have been SPLICED by a merge resolution. The VL port of
+// `scripts/inventory/splice-scan.py`; the two print the same report for the same input.
+//
+//     vl run scripts/inventory/splice-scan.vl                    # both inventories
+//     vl run scripts/inventory/splice-scan.vl -- <file-or-dir> ...
+//     vl run scripts/inventory/splice-scan.vl -- --self-test
+//
+// Non-zero exit on any finding, so it can gate. "Keep both sides" on a merge of the
+// inventory's tail can leave a row carrying a second row's body, which the witness grader
+// and the rows test both pass (they read the FIRST status line and repro block).
+//
+// Three checks: a DUPLICATE ID (two headings, one id); a DUPLICATED STATUS (a later bold
+// outcome line opening the same as the row's first); STATUS TOO FAR (the grader joins at
+// most `scanned < N` lines looking for the status, N read from check-filed-witnesses.vl).
+// Run from the checkout root. The row grammar below is copied from check-filed-witnesses.vl,
+// whose top level runs on import and so cannot be imported.
+
+import { IoError, listDir, readTextFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import {
+  endsWith,
+  join,
+  lastIndexOf,
+  split,
+  startsWith,
+  toLowerAscii,
+} from "std:str"
+import {
+  cpPrefix,
+  die,
+  exists,
+  findFrom,
+  isDigit,
+  isDir,
+  lstripWs,
+  rstripWs,
+  univNl,
+  wsLen,
+} from "../lib/common"
+
+const GRADER = "scripts/check-filed-witnesses.vl"
+const STATUS_HEAD = 48
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+function isAlpha(b: i32): boolean {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+}
+
+function isUpper(b: i32): boolean { b >= 65 && b <= 90 }
+
+// The count of leading `#`.
+function hashes(s: string): i32 {
+  let n = 0
+  while n < s.length && s[n] == 35 { n = n + 1 }
+  n
+}
+
+// Whether `s` is `^#{lo,hi}\s`: lo to hi hashes, then whitespace.
+function headOf(s: string, lo: i32, hi: i32): boolean {
+  const n = hashes(s)
+  n >= lo && n <= hi && wsLen(s, n) > 0
+}
+
+// The index past a run of whitespace starting at `i`.
+function skipWs(s: string, i: i32): i32 {
+  let j = i
+  while wsLen(s, j) > 0 { j = j + wsLen(s, j) }
+  j
+}
+
+// A row heading's id, or "" when `ln` is not one. The grammar is
+// `^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$`.
+function rowId(ln: string): string {
+  if !headOf(ln, 2, 4) { return "" }
+  const a = skipWs(ln, hashes(ln))
+  if a >= ln.length || !isUpper(ln[a]) { return "" }
+  let i = a + 1
+  while i < ln.length && isDigit(ln[i]) { i = i + 1 }
+  if i == a + 1 { return "" }
+  if ln[a] == 68 && i < ln.length {
+    let j = i
+    if ln[j] == 45 { j = j + 1 }
+    if j < ln.length && isAlpha(ln[j]) {
+      j = j + 1
+      while j < ln.length && (isAlpha(ln[j]) || isDigit(ln[j])) { j = j + 1 }
+      if wsLen(ln, j) > 0 { i = j }
+    }
+  }
+  if wsLen(ln, i) == 0 { return "" }
+  let k = skipWs(ln, i)
+  if startsWith(ln.slice(k, ln.length), "—") { k = k + 3 }
+  else if k < ln.length && ln[k] == 45 { k = k + 1 }
+  else { return "" }
+  if wsLen(ln, k) == 0 { return "" }
+  ln.slice(a, i)
+}
+
+// ── the declared-status vocabulary ─────────────────────────────────────────────
+
+const DECLARED_NEEDLE = [
+  "now a loud check reject", "now a loud emit reject",
+  "runs today and must keep running", "closed", "loads then traps",
+  "trap after load", "check-clean invalid wasm", "check-clean silently wrong",
+  "check-clean wrong evaluation", "compiler trap", "loud emit reject",
+  "loud check reject",
+]
+const NEGATIONS = [
+  " not ", " never ", " no longer ", " isn't ", " is not ", " nor ",
+  " rather than ",
+]
+const CLAUSE_SEPS = [".", ";", "·", "—", ","]
+
+// Whether a negation in the same clause governs the match at byte `pos` of `low`.
+function negatedBefore(low: string, pos: i32): boolean {
+  let window = low.slice(0, pos)
+  for sep in CLAUSE_SEPS {
+    const cut = lastIndexOf(window, sep)
+    if cut != -1 { window = window.slice(cut + sep.length, window.length) }
+  }
+  window = " " + window + " "
+  for n in NEGATIONS {
+    if contains(window, n) { return true }
+  }
+  false
+}
+
+// Whether a status line names an outcome in the grader's vocabulary and does not negate it.
+function declaresOutcome(status: string): boolean {
+  const low = toLowerAscii(status)
+  for needle in DECLARED_NEEDLE {
+    const pos = findFrom(low, needle, 0)
+    if pos != -1 { return !negatedBefore(low, pos) }
+  }
+  false
+}
+
+function isStatus(line: string): boolean {
+  startsWith(line, "**") && declaresOutcome(line)
+}
+
+// ── resolving the arguments ─────────────────────────────────────────────────────
+
+function normPath(p: string): string {
+  const segs: string[] = []
+  for s in p.split("/") {
+    if s != "" && s != "." { segs.push(s) }
+  }
+  const body = join(segs, "/")
+  if startsWith(p, "/") { return "/" + body }
+  if body == "" { return "." }
+  body
+}
+
+// A row file's sort key: `D9` before `D10`, and `D661` before `D661A`.
+type IdKey = { pre: string, num: i64, rest: string, path: string }
+
+function idKey(stem: string, path: string): IdKey {
+  let i = 0
+  while i < stem.length && isAlpha(stem[i]) { i = i + 1 }
+  let j = i
+  while j < stem.length && isDigit(stem[j]) { j = j + 1 }
+  if i == 0 || j == i { return { pre: stem, num: 0, rest: "", path: path } }
+  let n: i64 = 0
+  let k = i
+  while k < j {
+    n = n * 10 + ((stem[k] - 48) as i64)
+    k = k + 1
+  }
+  {
+    pre: stem.slice(0, i),
+    num: n,
+    rest: stem.slice(j, stem.length),
+    path: path,
+  }
+}
+
+function idLess(a: IdKey, b: IdKey): boolean {
+  if a.pre != b.pre { return a.pre < b.pre }
+  if a.num != b.num { return a.num < b.num }
+  a.rest < b.rest
+}
+
+// `keys` in `idLess` order, stably (a hand merge sort: a function value makes the
+// compiler trap, D4290).
+function sortKeys(keys: IdKey[]): IdKey[] {
+  if keys.length <= 1 { return keys }
+  const mid = keys.length / 2
+  const a = sortKeys(keys.slice(0, mid))
+  const b = sortKeys(keys.slice(mid, keys.length))
+  const out: IdKey[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !idLess(b[j], a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// The source a split directory's README names, from its `inventory-split` marker, or "".
+function sourceMark(text: string): string {
+  for ln in text.split("\n") {
+    let s = ln
+    if !startsWith(s, "<!--") { continue }
+    s = lstripWs(s.slice(4, s.length))
+    if !startsWith(s, "inventory-split:") { continue }
+    s = lstripWs(s.slice(16, s.length))
+    if !startsWith(s, "source") || wsLen(s, 6) == 0 { continue }
+    s = lstripWs(s.slice(6, s.length))
+    let e = 0
+    while e < s.length && wsLen(s, e) == 0 { e = e + 1 }
+    const src = s.slice(0, e)
+    const rest = rstripWs(lstripWs(s.slice(e, s.length)))
+    if src == "" || rest != "-->" { continue }
+    return src
+  }
+  ""
+}
+
+function readText(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("splice-scan: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(t)
+}
+
+// A doc path as given, or the row files under a directory, in id order.
+function resolve(arg: string): string[] {
+  if !isDir(arg) { return [arg] }
+  const dir = normPath(arg)
+  const names = listDir(arg)
+  if names is IoError {
+    die("splice-scan: cannot list \{arg} (\{names.msg})", 1)
+    return []
+  }
+  const keys: IdKey[] = []
+  for n in names {
+    if startsWith(n, "D") && endsWith(n, ".md") {
+      const path = if dir == "." { n } else { dir + "/" + n }
+      keys.push(idKey(n.slice(0, n.length - 3), path))
+    }
+  }
+  if keys.length > 0 {
+    const out: string[] = []
+    for k in sortKeys(keys) { out.push(k.path) }
+    return out
+  }
+  const readme = (if dir == "." { "" } else { dir + "/" }) + "README.md"
+  let mark = ""
+  if exists(readme) { mark = sourceMark(readText(readme)) }
+  if mark == "" {
+    die(
+      arg
+        + ": holds no `D*.md` rows, and "
+        + readme
+        + " carries no `<!-- inventory-split: source ... -->` line to fall back to",
+      1,
+    )
+  }
+  [mark]
+}
+
+// ── the scan ───────────────────────────────────────────────────────────────────
+
+type Finding = { kind: string, id: string, line: i32, detail: string }
+
+// The grader's own `scanned < N` bound, read from its source so the two cannot disagree;
+// 6 when the source does not say.
+function statusJoinLimit(): i32 {
+  const src = readTextFile(GRADER)
+  if src is IoError { return 6 }
+  const at = findFrom(src, "scanned < ", 0)
+  if at < 0 { return 6 }
+  let i = at + 10
+  while i < src.length && wsLen(src, i) > 0 { i = i + 1 }
+  let j = i
+  while j < src.length && isDigit(src[j]) { j = j + 1 }
+  if j == i { return 6 }
+  const n = parseI32(src.slice(i, j))
+  if n is i32 { return n }
+  6
+}
+
+type SeenId = { id: string, line: i32 }
+
+// Every splice symptom in `text`, a row at a time. A row runs from its heading to the
+// next row heading or the next `#`/`##` heading.
+function findingsOf(text: string, limit: i32): Finding[] {
+  const lines = text.split("\n")
+  const out: Finding[] = []
+  const seen: SeenId[] = []
+  let i = 0
+  while i < lines.length {
+    const id = rowId(lines[i])
+    if id == "" {
+      i = i + 1
+      continue
+    }
+    const start = i + 1
+    let end = i + 1
+    while end < lines.length {
+      if rowId(lines[end]) != "" || headOf(lines[end], 1, 2) { break }
+      end = end + 1
+    }
+    for s in seen {
+      if s.id == id {
+        out.push(
+          {
+            kind: "duplicate-id",
+            id: id,
+            line: start,
+            detail: "also at line \{toString(s.line)}",
+          },
+        )
+      }
+    }
+    // Python keeps the LAST line seen for an id.
+    let found = false
+    let k = 0
+    while k < seen.length {
+      if seen[k].id == id {
+        seen[k] = { id: id, line: start }
+        found = true
+      }
+      k = k + 1
+    }
+    if !found { seen.push({ id: id, line: start }) }
+    const statuses: i32[] = []
+    let b = i + 1
+    while b < end {
+      if isStatus(lines[b]) { statuses.push(b - (i + 1)) }
+      b = b + 1
+    }
+    if statuses.length > 0 {
+      const head = cpPrefix(lines[i + 1 + statuses[0]], STATUS_HEAD)
+      let s = 1
+      while s < statuses.length {
+        if cpPrefix(lines[i + 1 + statuses[s]], STATUS_HEAD) == head {
+          out.push(
+            {
+              kind: "duplicated-status",
+              id: id,
+              line: start + 1 + statuses[s],
+              detail: "repeats the row's own status line — a spliced body",
+            },
+          )
+        }
+        s = s + 1
+      }
+      if statuses[0] >= limit {
+        out.push(
+          {
+            kind: "status-too-far",
+            id: id,
+            line: start + 1 + statuses[0],
+            detail: "status starts \{toString(statuses[0])} lines in; the grader joins at most \{toString(limit)} and reads a later one as ABSENT",
+          },
+        )
+      }
+    }
+    i = end
+  }
+  out
+}
+
+// Scanning every file as one text is what makes a duplicate id across two row FILES
+// visible.
+function findings(path: string, limit: i32): Finding[] {
+  const parts: string[] = []
+  for f in resolve(path) { parts.push(readText(f)) }
+  findingsOf(join(parts, "\n"), limit)
+}
+
+const SPECIMEN_KIND = ["duplicated-status", "duplicate-id", "status-too-far"]
+const SPECIMEN_TEXT = [
+  "### D9001 — spliced\n\n**closed · was check-clean invalid wasm · clause 1 · `t.vl`**\n\nprose\n\n**closed · was check-clean invalid wasm · clause 1 · `t.vl`**\n\nmore\n\nRepro:\n\n    print(1)\n",
+  "### D9002 — first\n\n**closed · runs**\n\nRepro:\n\n    print(1)\n\n### D9002 — second\n\n**closed · runs**\n\nRepro:\n\n    print(2)\n",
+  "### D9003 — far\n\n1\n2\n3\n4\n5\n6\n7\n\n**closed · runs**\n\nRepro:\n\n    print(1)\n",
+]
+
+// "[a, b]" the way Python prints a list of strings.
+function pyList(xs: string[]): string {
+  const q: string[] = []
+  for x in xs { q.push("'" + x + "'") }
+  "[" + join(q, ", ") + "]"
+}
+
+// Each check must FIRE on a specimen built to trip it.
+function selfTest(limit: i32): i32 {
+  let bad = 0
+  let n = 0
+  while n < SPECIMEN_KIND.length {
+    const kinds: string[] = []
+    let ok = false
+    for f in findingsOf(SPECIMEN_TEXT[n], limit) {
+      kinds.push(f.kind)
+      if f.kind == SPECIMEN_KIND[n] { ok = true }
+    }
+    let label = SPECIMEN_KIND[n]
+    while label.length < 20 { label = label + " " }
+    const verdict = if ok { "fires" } else { "DID NOT FIRE" }
+    print("  \{label} \{verdict}  \{pyList(kinds)}")
+    if !ok { bad = bad + 1 }
+    n = n + 1
+  }
+  print(
+    "\{toString(SPECIMEN_KIND.length)} specimens · \{toString(SPECIMEN_KIND.length - bad)} fire · \{toString(bad)} silent",
+  )
+  if bad > 0 { return 1 }
+  0
+}
+
+function main(args: string[]): i32 {
+  const limit = statusJoinLimit()
+  if args.length > 0 && args[0] == "--self-test" { return selfTest(limit) }
+  let targets = args
+  if targets.length == 0 {
+    targets = [
+      "docs/internals/silent-class-inventory.md",
+      "docs/internals/silent-class-inventory-2.md",
+    ]
+  }
+  let bad = 0
+  for t in targets {
+    if !exists(t) { continue }
+    for f in findings(t, limit) {
+      print("\{t}:\{toString(f.line)}  \{f.kind}  \{f.id} — \{f.detail}")
+      bad = bad + 1
+    }
+  }
+  if bad == 0 {
+    print("\nsplice scan: 0 finding(s) — clean")
+    return 0
+  }
+  print("\nsplice scan: \{toString(bad)} finding(s)")
+  1
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("splice-scan: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

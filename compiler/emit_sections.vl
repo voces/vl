@@ -198,6 +198,7 @@ import {
   capMemoArmed,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
+  cloSigBase,
   cloSigKeys,
   cloSigRepFn,
   cloSigTwin,
@@ -396,6 +397,9 @@ import {
   lvFrameName,
   mI32Used,
   mI64Used,
+  mStructI32Idx,
+  mStructI64Idx,
+  mStructIdx,
   mUsed,
   memLogUsed,
   memUsed,
@@ -437,13 +441,8 @@ import {
   pendingListKind,
   pendingListSlot,
   pendingMapSlot,
-  pendingNulBool,
-  pendingNulClosure,
-  pendingNulList,
   pendingNulLitUnion,
-  pendingNulNone,
   pendingNulRefHeap,
-  pendingNulString,
   pendingStructIdx,
   pendingVariantIdx,
   postMonoShapes,
@@ -514,10 +513,15 @@ import {
   unRowByMemberSid,
   unRowBySid,
   unionSinkBase,
+  vbF32Idx,
   vbF32Used,
+  vbF64Idx,
   vbF64Used,
+  vbI32Idx,
   vbI32Used,
+  vbI64Idx,
   vbI64Used,
+  vbV128Idx,
   vbV128Used,
   wStray,
 } from "./emit_state"
@@ -2179,13 +2183,15 @@ function emitStartFnCode(out: u8[]) {
           // matches the cell valtype. An i32 cell is untouched. (Slice 5 widening.)
           const gck = globalCellKind(globalStmts[gi])
           if gck == "f32" {
-            const savedF32 = pendingF32
-            pendingF32 = true
+            const f32Saved = expCtxHere()
+            const f32Ctx = expCtxHere()
+            f32Ctx.wantF32 = true
+            expCtxApply(f32Ctx)
             if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
               wTarget(exprPrev)
               return -1
             }
-            pendingF32 = savedF32
+            expCtxApply(f32Saved)
           } else if gck == "f64" {
             if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
               wTarget(exprPrev)
@@ -2199,21 +2205,21 @@ function emitStartFnCode(out: u8[]) {
           } else {
             // A map global's start-fn init seeds the map SHAPE (mirrors the
             // local-`let` seeding) so `Map()` builds THIS global's map struct.
-            if gck == "map" {
-              pendingMapSlot = letMapShapeOf(globalStmts[gi], -1)
-            }
+            const entryCtx = expCtxHere()
+            const sc = expCtxHere()
+            if gck == "map" { sc.mapSlot = letMapShapeOf(globalStmts[gi], -1) }
             // A NULLABLE map global's start-fn init: seed the map SHAPE (`Map()` builds it) and
             // the null heap (a bare `null` init lowers as `ref.null $mapStruct`).
             if gck == "nulmap" {
               const gnmShape = nulMapShapeOf(globalStmts[gi], -1)
-              pendingMapSlot = gnmShape
-              pendingNulRefHeap = mapTypeIdxOf(gnmShape)
+              sc.mapSlot = gnmShape
+              sc.nulRefHeap = mapTypeIdxOf(gnmShape)
             }
             // A struct / nullable-struct cell seeds the struct context so a bare
             // `null` init lowers as `ref.null $S` and a literal builds THIS
             // global's annotated struct (mirrors the const-path seeding).
             if gck == "struct" || gck == "nulstruct" {
-              pendingStructIdx = globalCellStructIdx(globalStmts[gi])
+              sc.structIdx = globalCellStructIdx(globalStmts[gi])
             }
             // The kind-8 variant twin of that seed, for the non-const init path (a variant global whose
             // initializer is a call, another global, or any other non-constexpr): the literal — or the
@@ -2223,32 +2229,32 @@ function emitStartFnCode(out: u8[]) {
               // `const c: Circle | null` that becomes a start-function local still needs the variant
               // context, so an object-literal init builds `uVarHeap[vi]` and a bare `null` init lowers as that variant's own typed null.
               const gnvi = globalCellStructIdx(globalStmts[gi])
-              pendingVariantIdx = gnvi
+              sc.variantIdx = gnvi
               if gnvi >= 0 && gnvi < uVarHeap.length {
-                pendingNulRefHeap = uVarHeap[gnvi]
+                sc.nulRefHeap = uVarHeap[gnvi]
               }
             }
             if gck == "variant" {
-              pendingVariantIdx = globalCellStructIdx(globalStmts[gi])
+              sc.variantIdx = globalCellStructIdx(globalStmts[gi])
             }
             // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
             // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
-            pendingNulBool = letIsNulBoolAnn(globalStmts[gi])
-            pendingNulString = letIsNulString(globalStmts[gi], -1)
+            sc.nulBool = letIsNulBoolAnn(globalStmts[gi])
+            sc.nulString = letIsNulString(globalStmts[gi], -1)
             // D1576 — a `nulnone` cell (a never-filled module-scope `const x = null`) lowers
             // its init as `ref.null none`, the one value it can hold. This block, not the
             // constexpr arm in `emitGlobalSection`, is where every `= null` global's null rep
             // is decided (a bare `null` is not a WasmGC constexpr).
-            pendingNulNone = gck == "nulnone"
-            if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
+            sc.nulNone = gck == "nulnone"
+            if letIsLitUnion(globalStmts[gi]) { sc.litUnion = 1 }
             // A `K | null` NICHE global's start-fn init: a member literal lowers as
             // its atom id, a bare `null` as the `-1` sentinel — the start-fn twin of
             // the const-path seeding (a `null` init routes here; un-seeded it drew
             // the "bare null needs a struct-typed context" loud reject).
             if g.letType >= 0 {
               if nodeTyIsNulLitUnion(g.letType) {
-                pendingLitUnion = 1
-                pendingNulLitUnion = true
+                sc.litUnion = 1
+                sc.nulLitUnion = true
               }
             }
             // A list-annotated global seeds the element kind/slot so its literal init builds the
@@ -2256,31 +2262,26 @@ function emitStartFnCode(out: u8[]) {
             // no-op for a non-list annotation). Needed because a closure-array's function-ident elements
             // aren't an objlit and a scalar `f64[]`/`i64[]`/`f32[]` literal of bare int elements doesn't self-identify; an un-annotated global takes its destination's kind instead (D381).
             const gLb = letListBuild(globalStmts[gi], -1)
-            pendingListKind = gLb.lbKind
-            pendingListSlot = gLb.lbSlot
-            // The three nullable-list cell seeds. A bare `null` is never a WasmGC constexpr, so every
-            // `= null` global routes here — this block, not the global section's constexpr arm, is the one
-            // place a global cell's null rep is decided. Each mirrors `emitLetDeclStmt`'s local kind ladder
-            // exactly, so a `const g: i32[] | null = null` gets the same seeding a local would. Kind 15, the i32-backed `i32[] | null`: `ref.null $lTypeIdx`.
-            const savedSNL = pendingNulList
-            const savedSNC = pendingNulClosure
-            // The kind-driven half of the seeding, shared with the local-`let` and `global.set`
-            // boundaries: the nullable-list and nullable-closure null reps, and the
-            // distinct-backing scalar lists' leaf build code. Applied over the ambient seeds, so
-            // the list seeds above stand for every kind the resolver answers inert for.
-            expCtxApply(expCtxForCell(gck))
+            sc.listKind = gLb.lbKind
+            sc.listSlot = gLb.lbSlot
+            expCtxApply(sc)
+            // The cell's null rep and leaf list build, by kind (the local-`let` and `global.set`
+            // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
+            // `= null` global routes here and this is where its null rep is decided.
+            const cellCtx = expCtxForCell(gck)
             // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
             // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
             // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
             // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
             if gck == "nulreflist" {
-              if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
+              if cellCtx.listSlot >= 0 && cellCtx.listSlot < rlWrapIdx.length {
                 const gnraInit = P.nodes[unwrapParen(g.letInit)]
                 if gnraInit is NullLit {
-                  pendingNulRefHeap = rlWrapIdx[pendingListSlot]
+                  cellCtx.nulRefHeap = rlWrapIdx[cellCtx.listSlot]
                 }
               }
             }
+            expCtxApply(cellCtx)
             // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
             // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
             // position: a union global's cell is always the box (unlike `buildLocals`), so a
@@ -2345,27 +2346,24 @@ function emitStartFnCode(out: u8[]) {
                 return -1
               }
             }
-            pendingNulBool = false
-            pendingNulString = false
-            pendingNulNone = false
-            pendingNulClosure = savedSNC
-            pendingNulList = savedSNL
-            pendingMapSlot = -1
-            pendingStructIdx = -1
-            // The variant twin of that reset — the rung this ladder lacked (D1563). `emitNullLitNode`
-            // reads `pendingVariantIdx` before `pendingStructIdx` and persistently (not consumed on use),
-            // so a `T | null` cell whose `T` is a union arm left the seed armed and the next global's bare
-            // `null` lowered as `ref.null $T` into the wrong cell — check-clean invalid wasm.
-            pendingVariantIdx = -1
-            pendingListKind = LBK_I32_LIST
-            pendingListSlot = 0
-            pendingLitUnion = 0
-            pendingNulLitUnion = false
-            // The ref-heap seed is consumed-and-cleared by `emitNullLitNode`, but a
-            // NON-null init leaves it armed — so clear it here too, else the next
-            // global's bare `null` would take THIS global's wrapper. (The `nulmap` arm
-            // above has always seeded it; the two list arms added here do too.)
-            pendingNulRefHeap = -1
+            // Back to idle, keeping the caller's null reps for a closure and a list. The variant
+            // and ref-heap seeds must clear too: `emitNullLitNode` does not consume them, so a left
+            // armed one retypes the next global's bare `null` into the wrong cell (D1563).
+            const idle = expCtxHere()
+            idle.nulBool = false
+            idle.nulString = false
+            idle.nulNone = false
+            idle.nulClosure = entryCtx.nulClosure
+            idle.nulList = entryCtx.nulList
+            idle.mapSlot = -1
+            idle.structIdx = -1
+            idle.variantIdx = -1
+            idle.listKind = LBK_I32_LIST
+            idle.listSlot = 0
+            idle.litUnion = 0
+            idle.nulLitUnion = false
+            idle.nulRefHeap = -1
+            expCtxApply(idle)
             // Read-only covariance at the module-global binding (D822) — the eighth delivery form,
             // absent from `letRefListDestSlot`'s list of seven because a global is not a `let`. A const
             // global's init is a wasm constexpr and cannot carry a loop, so the widening copy can only go
@@ -4489,6 +4487,7 @@ function svViewTypes() {
   while p < 3 {
     if svPairOn(p) {
       const d = svDstOf(p)
+      tsEntryAt(svViewTy[p], "scalar list view")
       wU8(79) // 0x4f sub final
       wULEB(1)
       wULEB(svDstWrap(d))
@@ -4826,6 +4825,7 @@ function rvViewTypes() {
   if !rvBuilt() { return 0 }
   let p = 0
   while p < rvViewTy.length {
+    tsEntryAt(rvViewTy[p], "record list view")
     wU8(79) // 0x4f sub final
     wULEB(1)
     wULEB(rvWrap())
@@ -7263,6 +7263,26 @@ export function buildStructSupers() {
   0
 }
 
+// The rec-group entries `emitTypeSection` has written so far; entry k is heap type k.
+let tsEmitted = 0
+
+// The entry about to be written must be the one `mAssignTypeIndices` recorded as `idx`; a
+// disagreement means a type family is emitted in a different order or count than `mAssignTypeIndices` allocated.
+function tsEntryAt(idx: i32, what: string) {
+  if idx != tsEmitted {
+    emitFail(
+      "emitProgram: the type section desyncs from the type-index allocation at the "
+        + what
+        + " type — `mAssignTypeIndices` recorded index "
+        + i32ToStr(idx)
+        + ", the section is writing entry "
+        + i32ToStr(tsEmitted),
+    )
+  }
+  tsEmitted = tsEmitted + 1
+  0
+}
+
 function emitTypeSection(
   n: i32,
   typeOffset: i32,
@@ -7271,6 +7291,7 @@ function emitTypeSection(
   nPrintTypes: i32,
   nHelpers: i32,
 ) {
+  tsEmitted = 0
   const typePayload: u8[] = []
   // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
@@ -7302,6 +7323,7 @@ function emitTypeSection(
     while eoi < eOrd.length {
       const si = eOrd[eoi]
       if si >= 0 {
+        tsEntryAt(sHeapIdx[si], "declared struct")
         // The declared-supertype form (D622): a row with a parent, or that is one, is written
         // with WasmGC's `0x50 sub` header instead of a bare `0x5f`, since a type without `sub`
         // is final. `(type $Wide (sub $Narrow …))` is what makes a `(ref $Wide)` acceptable at a `(ref $Narrow)` slot; a module with no proper-prefix pair emits the same bytes as before.
@@ -7343,6 +7365,7 @@ function emitTypeSection(
         vi = vi + 1
         continue
       }
+      tsEntryAt(uVarHeap[vi], "union variant")
       wU8(95) // 0x5f struct
       const cnt = uFieldCount[vi]
       wULEB(cnt)
@@ -7355,6 +7378,7 @@ function emitTypeSection(
       }
       vi = vi + 1
     }
+    tsEntryAt(uBoxIdx, "union box")
     wU8(95)  // 0x5f struct (union box)
     wU8(2)   // 2 fields
     wU8(127) // field 0 tag: 0x7f i32
@@ -7365,30 +7389,35 @@ function emitTypeSection(
     // value-union payload behind the box's `anyref` slot. Emitted in the same fixed order
     // `mAssignTypeIndices` interned them (i32, i64, f32, f64).
     if vbI32Used {
+      tsEntryAt(vbI32Idx, "i32 value box")
       wU8(95)  // 0x5f struct (i32 value box — boolean shares it)
       wU8(1)
       wU8(127) // 0x7f i32
       wU8(0)   // immutable
     }
     if vbI64Used {
+      tsEntryAt(vbI64Idx, "i64 value box")
       wU8(95)  // 0x5f struct (i64 value box)
       wU8(1)
       wU8(126) // 0x7e i64
       wU8(0)   // immutable
     }
     if vbF32Used {
+      tsEntryAt(vbF32Idx, "f32 value box")
       wU8(95)  // 0x5f struct (f32 value box)
       wU8(1)
       wU8(125) // 0x7d f32
       wU8(0)   // immutable
     }
     if vbF64Used {
+      tsEntryAt(vbF64Idx, "f64 value box")
       wU8(95)  // 0x5f struct (f64 value box)
       wU8(1)
       wU8(124) // 0x7c f64
       wU8(0)   // immutable
     }
     if vbV128Used {
+      tsEntryAt(vbV128Idx, "v128 value box")
       wU8(95)  // 0x5f struct (v128 value box)
       wU8(1)
       wU8(123) // 0x7b v128
@@ -7396,6 +7425,7 @@ function emitTypeSection(
     }
   }
   if aUsed {
+    tsEntryAt(aTypeIdx, "i32 array")
     wU8(94)  // 0x5e array ($aTypeIdx — the i32-list / map backing)
     wU8(127) // 0x7f i32 storagetype
     wU8(1)   // mutable
@@ -7403,6 +7433,7 @@ function emitTypeSection(
     // emitted immediately after it. Its storage type is packed i8 and its elements are UTF-8
     // bytes, not i32 code points. It is not `ba8TypeIdx` (the `u8[]` backing) even though the two
     // are now structurally identical: iso-recursive identity is (rec group, position), so keeping the index separate is what makes a missed lowering site invalid wasm instead of a silent share.
+    tsEntryAt(sBackIdx, "string backing")
     wU8(94)  // 0x5e array
     wU8(120) // 0x78 i8 storagetype — PACKED UTF-8 bytes (Stage 2c)
     wU8(1)   // mutable
@@ -7410,6 +7441,7 @@ function emitTypeSection(
     // above: `{ backing: (ref $sBackIdx), start: i32, len: i32, hash: i32 }`. Field indices are
     // fixed: backing=0, start=1, len=2, hash=3. The first three are immutable, letting a view
     // alias its parent's backing with no invalidation risk; `hash` is mutable but is a memo of a pure function of the other three, so a slice memoises its own range and nothing else changes.
+    tsEntryAt(sTypeIdx, "string header")
     wU8(95)         // 0x5f struct
     wU8(4)          // 4 fields
     wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
@@ -7423,6 +7455,7 @@ function emitTypeSection(
     wU8(1)          // MUTABLE — the memo, see above
   }
   if lUsed {
+    tsEntryAt(lTypeIdx, "i32 list wrapper")
     wU8(95)         // 0x5f struct
     wU8(3)          // 3 fields
     wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
@@ -7443,10 +7476,12 @@ function emitTypeSection(
     if rlTwin[rti] < rti {
       rti = rti + 1
     } else {
+      tsEntryAt(rlBackIdx[rti], "ref-list backing")
       wU8(94)               // 0x5e array (ref backing)
       wU8(99)               // 0x63 (ref null ht) — nullable element ref
       wSLEB(rlElemHeap[rti])
       wU8(1)                // mutable
+      tsEntryAt(rlWrapIdx[rti], "ref-list wrapper")
       rvOpenParent(rti)
       wU8(95)               // 0x5f struct (ref-list wrapper)
       wU8(3)                // 3 fields
@@ -7465,10 +7500,12 @@ function emitTypeSection(
     // backing array `(array (mut (ref null $aTypeIdx)))` has a nullable string-ref element so
     // `array.new_default` defaults spare slots to null; the list wrapper is the same
     // `{backing,len,cap}` triple as the i32 list, over the string backing.
+    tsEntryAt(mkArrIdx, "string-list backing")
     wU8(94)  // 0x5e array (keys/string backing)
     wU8(99)  // 0x63 (ref null ht) — nullable string ref
     wSLEB(sTypeIdx)
     wU8(1)   // mutable
+    tsEntryAt(mkListIdx, "string-list wrapper")
     wU8(95)  // 0x5f struct (string-list wrapper)
     wU8(3)   // 3 fields
     wU8(100) // field 0 backing: 0x64 (ref ht) — non-null
@@ -7482,6 +7519,7 @@ function emitTypeSection(
   if mUsed {
     // The map struct — the 7-field open-addressing rep documented at `mUsed`. Field order and
     // count match the host's general-purpose rep exactly (`compiler/builtins/maps.ts`): keys 0, vals 1, live 2, index 3, count 4, size 5, hashes 6.
+    tsEntryAt(mStructIdx, "map")
     wU8(95)              // 0x5f struct (map)
     wU8(mapFieldCount()) // 7 fields (open-addressing hash map, host-aligned), 9 with seqs
     wU8(100)             // field 0 keys: 0x64 (ref $mkListIdx) — non-null
@@ -7505,17 +7543,25 @@ function emitTypeSection(
     wU8(1)               // mutable
     mapSeqFieldTypes()
   }
-  if mI32Used { emitMonoMapStructType(lTypeIdx) }
+  if mI32Used {
+    tsEntryAt(mStructI32Idx, "i32-keyed map")
+    emitMonoMapStructType(lTypeIdx)
+  }
   // The i64-keyed twin, the same struct over the i64 list wrapper, minted right after it.
-  if mI64Used { emitMonoMapStructType(il64TypeIdx) }
+  if mI64Used {
+    tsEntryAt(mStructI64Idx, "i64-keyed map")
+    emitMonoMapStructType(il64TypeIdx)
+  }
   if fa64Used {
     // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
     // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
+    tsEntryAt(fa64TypeIdx, "f64 array")
     wU8(94)  // 0x5e array
     wU8(124) // 0x7c f64 storagetype
     wU8(1)   // mutable
     // The f64-list wrapper `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }` — the
     // same `{backing,len,cap}` triple as the i32 list, over the f64 backing.
+    tsEntryAt(fl64TypeIdx, "f64 list wrapper")
     svOpenParent(1)
     wU8(95)            // 0x5f struct
     wU8(3)             // 3 fields
@@ -7531,10 +7577,12 @@ function emitTypeSection(
     // The i64 array `(array (mut i64))` — `0x5e` array form, `0x7e` i64 storagetype,
     // `0x01` mutable (the i64 sibling of the `5e 7c 01` f64 array). Emitted right after the
     // f64 pair, matching the type-index allocation order.
+    tsEntryAt(ia64TypeIdx, "i64 array")
     wU8(94)  // 0x5e array
     wU8(126) // 0x7e i64 storagetype
     wU8(1)   // mutable
     // The i64-list wrapper `{ backing: (ref $ia64TypeIdx), len: i32, cap: i32 }`.
+    tsEntryAt(il64TypeIdx, "i64 list wrapper")
     svOpenParent(0)
     wU8(95)            // 0x5f struct
     wU8(3)             // 3 fields
@@ -7550,10 +7598,12 @@ function emitTypeSection(
     // The f32 array `(array (mut f32))` — `0x5e` array form, `0x7d` f32 storagetype, `0x01`
     // mutable (the f32 sibling of the `5e 7c 01` f64 / `5e 7e 01` i64 arrays). Emitted right
     // after the i64 pair, matching the type-index allocation order.
+    tsEntryAt(fa32TypeIdx, "f32 array")
     wU8(94)  // 0x5e array
     wU8(125) // 0x7d f32 storagetype
     wU8(1)   // mutable
     // The f32-list wrapper `{ backing: (ref $fa32TypeIdx), len: i32, cap: i32 }`.
+    tsEntryAt(fl32TypeIdx, "f32 list wrapper")
     wU8(95)            // 0x5f struct
     wU8(3)             // 3 fields
     wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
@@ -7568,9 +7618,11 @@ function emitTypeSection(
     // The `u8[]` backing `(array (mut i8))` — the emitter's first packed storage type: `0x78` is
     // not a valtype at all, only legal in an array element or struct field, one byte per element
     // instead of the four an i32 array spends. The consequence every read site must honour: `array.get` is invalid on this type — the engine refuses the module, since a byte read must say how it extends. `fbArrayGet` dispatches to `array.get_u` off this heap index.
+    tsEntryAt(ba8TypeIdx, "u8 array")
     wU8(94)  // 0x5e array
     wU8(120) // 0x78 i8 PACKED storagetype
     wU8(1)   // mutable
+    tsEntryAt(bl8TypeIdx, "u8 list wrapper")
     // The `u8[]` wrapper `{ backing: (ref $ba8TypeIdx), len: i32, cap: i32 }` — the same
     // triple every other list wrapper uses; only the backing it points at is packed.
     wU8(95)           // 0x5f struct
@@ -7590,6 +7642,7 @@ function emitTypeSection(
     // `structref` env (null when non-capturing), field 1 the lifted function's wasm index, both
     // immutable. One closure struct serves every arity since the id is untyped; a call site
     // supplies the concrete env-leading `$fnsig` as `call_indirect`'s type operand, trapping on mismatch. No `funcref` field: reading one back out of the GC heap is a costly host libcall, where an i32 field is a plain load.
+    tsEntryAt(cloStructIdx, "closure")
     wU8(95)  // 0x5f struct
     wU8(2)   // 2 fields
     wU8(99)  // field 0 env: 0x63 (ref null ht)
@@ -7607,6 +7660,7 @@ function emitTypeSection(
     let sai = 0
     while sai < cloSigKeys.length {
       const start = wLen()
+      tsEntryAt(cloSigBase + sai, "closure signature")
       emitCloSigFunctype(sai)
       const nb = wLen() - start
       let twin = sai
@@ -7630,6 +7684,7 @@ function emitTypeSection(
     while fe < fnStmts.length {
       if fnEnvIdxOf(fe) >= 0 {
         const caps = captureNamesOf(fe)
+        tsEntryAt(fnEnvIdxOf(fe), "closure env")
         wU8(95) // 0x5f struct
         wULEB(caps.length)
         let ci = 0
@@ -7661,6 +7716,7 @@ function emitTypeSection(
     let mvKeysWrap = mkListIdx
     if mvSlotKeyKind(mvs) == MAP_KEY_I32 { mvKeysWrap = lTypeIdx }
     if mvSlotKeyKind(mvs) == MAP_KEY_I64 { mvKeysWrap = il64TypeIdx }
+    tsEntryAt(mvMapTypeIdx[mvs], "ref-valued map")
     wU8(95)              // 0x5f struct (ref-valued map)
     wU8(mapFieldCount()) // 7 fields (host-aligned open-addressing hash map), 9 with seqs
     wU8(100)             // field 0 keys: 0x64 (ref <this slot's keys wrapper>) — non-null
@@ -7688,6 +7744,15 @@ function emitTypeSection(
   // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
   // interleaved identically with the surrounding raw framing bytes (the `wTarget` bind
   // covering this whole payload build is established above).
+  // The rec group is complete: its entry count is the functype base `mAssignTypeIndices` returned.
+  if tsEmitted != typeOffset {
+    emitFail(
+      "emitProgram: the type section wrote "
+        + i32ToStr(tsEmitted)
+        + " rec-group entries, `mAssignTypeIndices` allocated "
+        + i32ToStr(typeOffset),
+    )
+  }
   let ti = 0
   while ti < n {
     emitOneFuncType(ti, fnValUsed)
