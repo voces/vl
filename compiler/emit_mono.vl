@@ -230,9 +230,12 @@ import {
 // `compiler/symbols.vl` is the discipline that in-place write follows.
 import {
   IDENT_DROP_MONO_CALLEE,
+  declOrigOf,
   identAuditDrop,
+  identDeclOf,
   identFrom,
   identFromDecl,
+  identOrigNote,
   sidArrGet,
   sidArrPut,
   sidLookup,
@@ -277,7 +280,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { callBindShadowNote } from "./call_bind_shadow"
+import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
 import {
   drwFillDefaults,
@@ -389,6 +392,7 @@ import {
   holeOperandI32PinTyOf,
   identClosureFeAt,
   identFnTypeAnnName,
+  identIsBoundClosure,
   identLetOfAt,
   isSName,
   isUName,
@@ -1267,6 +1271,15 @@ function monoCoalJoinPinName(ix: i32): string {
   monoUnionPinName(ix)
 }
 
+// Whether `ix` is an `Ident` the checker resolved to a declaration other than a function's: a
+// parameter, a binding or a loop variable, which shadows any function of its name.
+function monoIdentReadsValue(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || !(P.nodes[ix] is Ident) { return false }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length { return false }
+  !(P.nodes[d] is FuncDecl)
+}
+
 export function monoArgTyName(ix: i32, fnIx: i32) {
   const cax = unwrapParen(ix)
   // A node the generic body shares, typed at a hole this instance pins to a boolean or a literal
@@ -1355,12 +1368,20 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   // predicate resolves through tables `buildLocals` fills post-mono. `nodeTyIsFunc` is the
   // checker's answer and needs no emit-side table. The gates are OR'd, not swapped, since
   // without `cloPinNode` a forwarder's `gid(x)` falls to the same catch-all.
-  if exprIsClosure(ix, fnIx) || nodeTyIsFunc(cax) || cloPinNode >= 0 {
+  const valRead = monoIdentReadsValue(cax)
+  // A read that resolves to a value binding is not the function its name may also spell.
+  let cloArg = false
+  if valRead {
+    cloArg = identIsBoundClosure(monoIdentNameOf(cax), fnIx)
+  } else {
+    cloArg = exprIsClosure(ix, fnIx)
+  }
+  if cloArg || nodeTyIsFunc(cax) || cloPinNode >= 0 {
     // A function-value argument pins its param as a closure (kind 14). The pinned name
     // carries the callee's `$fnsig` key so the instance's value-call ref-casts to the
     // exact signature.
     const ce = P.nodes[cax]
-    if ce is Ident {
+    if ce is Ident && !valRead {
       // Scope-aware, for the reason the direct-call resolution below already is: a per-pin
       // clone shares its template's NAME, so the flat map answers the template's signature
       // in every instance and one pin key serves them all (D1795).
@@ -3438,6 +3459,7 @@ function monoCloneLambdaPinned(argIx: i32, elemType: string, elemTyIx: i32) {
           const noTP: string[] = []
           const ps: i32[] = [np]
           const clone = mkFunc(nm, noTP, ps, a.fnRet, a.fnBody, a.pos)
+          identOrigNote(clone, unwrapParen(argIx))
           recordClonedCallRetire(unwrapParen(argIx), clone)
           fnStmts.push(clone)
           fnParent.push(-1)
@@ -3776,6 +3798,7 @@ function monoCloneLambdaSubst(
     let cloneRet = nret
     if a.fnRet < 0 && blockHasBareReturn(a.fnBody) { cloneRet = -1 }
     const clone = mkFunc(nm, noTP, ps, cloneRet, nbody, a.pos)
+    identOrigNote(clone, fnIx)
     // The clone is a value too, typed at this pin where the template's type substitutes.
     const cty = monoPinnedTyOf(fnIx, bN, bT)
     if cty >= 0 && !tyHasTyVar(cty) { nodeTyRecord(clone, cty) }
@@ -5474,7 +5497,10 @@ function monoBakeCallback(
     let newCallee = n.callFn
     const callee = P.nodes[n.callFn]
     if callee is Ident {
-      if !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn) {
+      if (
+        !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
+        && monoReadsOwnParam(fnDeclIx, callee.identName, n.callFn)
+      ) {
         let bk = 0
         while bk < cbParamNames.length {
           if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
@@ -5876,7 +5902,7 @@ function monoRenameGenAliasInit(
   if lf[1] < 0 { return 0 }
   const d = P.nodes[lf[1]]
   if !(d is LetDecl) || d.letInit < 0 { return 0 }
-  if (d.letKw != "const" && monoNameIsAssigned(alias)) || d.letType >= 0 {
+  if (d.letKw != "const" && monoLetIsAssigned(alias, lf[1])) || d.letType >= 0 {
     return 0
   }
   const iv = P.nodes[d.letInit]
@@ -5915,7 +5941,7 @@ function monoInstGenAliasNames(body: i32): string[] {
         const d = P.nodes[ix]
         if d is LetDecl {
           if (
-            (d.letKw == "const" || !monoNameIsAssigned(d.letName))
+            (d.letKw == "const" || !monoLetIsAssigned(d.letName, ix))
             && d.letType < 0
             && d.letInit >= 0
             && P.nodes[d.letInit] is Ident
@@ -8130,8 +8156,11 @@ function monoMakeInstanceGo(
           // binding must too, since every later write would be invisible.
           let keepCallRef = false
           if monoInstFe[k] == origFe && cal.identName != monoInstName[k] {
-            if captureCountOf(origFe) > 0 { keepCallRef = true }
-            else if monoNameIsAssigned(cal.identName) { keepCallRef = true }
+            if captureCountOf(origFe) > 0 {
+              keepCallRef = true
+            } else if monoReadIsAssigned(cal.identName, calleeIx) {
+              keepCallRef = true
+            }
           }
           if !keepCallRef {
             if (
@@ -10711,7 +10740,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
     if lf[1] >= 0 {
       const d = P.nodes[lf[1]]
       if d is LetDecl {
-        const fixed = d.letKw == "const" || !monoNameIsAssigned(nm)
+        const fixed = d.letKw == "const" || !monoLetIsAssigned(nm, lf[1])
         if d.letType < 0 && d.letInit >= 0 && fixed {
           return monoCellValueTakeAt(d.letInit, tname, lf[0], depth + 1)
         }
@@ -11046,15 +11075,15 @@ function monoLetWrittenAt(name: string, lf: i32[]): boolean {
 // a `let`, else by name anywhere.
 function monoNameWrittenAt(name: string, at: i32): boolean {
   const lf = monoLetFrameOf(name, at, monoTopFrameOf(at))
-  if lf[1] < 0 { return monoNameIsAssigned(name) }
+  if lf[1] < 0 { return monoReadIsAssigned(name, at) }
   monoLetWrittenAt(name, lf)
 }
 
-// Is `name` ever the target of an assignment anywhere in the arena? An arena scan rather
-// than a scope walk, so it is coarse by name: a homonym in another frame answers true for
-// both. That direction is the safe one — it declines a callee fold and leaves the
-// `call_ref` the annotation already guarantees a signature for.
-function monoNameIsAssigned(name: string) {
+// Whether the binding declared at `d`, a source declaration (`monoDeclCanon`), is the target of
+// an assignment anywhere in the arena. A write whose target resolved to no declaration counts
+// against every binding of its name, and `d` -1 asks after the name alone: both are the safe
+// direction, which declines a callee fold and keeps the `call_ref`.
+function monoDeclIsAssigned(name: string, d: i32): boolean {
   let i = 0
   while i < P.nodes.length {
     const nd = P.nodes[i]
@@ -11062,13 +11091,30 @@ function monoNameIsAssigned(name: string) {
       if nd.binOp == "=" {
         const tg = P.nodes[nd.binLeft]
         if tg is Ident {
-          if tg.identName == name { return true }
+          if tg.identName == name {
+            if d < 0 { return true }
+            const td = identDeclOf(nd.binLeft)
+            if td < 0 || td >= P.nodes.length || monoDeclCanon(td) == d {
+              return true
+            }
+          }
         }
       }
     }
     i = i + 1
   }
   false
+}
+
+// Whether the binding the read of `name` at `at` resolves to is assigned (`monoDeclIsAssigned`).
+function monoReadIsAssigned(name: string, at: i32): boolean {
+  monoDeclIsAssigned(name, monoReadDecl(name, at))
+}
+
+// Whether the `let` at `li`, which binds `name`, is assigned (`monoDeclIsAssigned`).
+function monoLetIsAssigned(name: string, li: i32): boolean {
+  if li < 0 { return monoDeclIsAssigned(name, -1) }
+  monoDeclIsAssigned(name, monoDeclCanon(li))
 }
 
 // `monoCoerceFnValueName` keyed on an expected TYPE-annotation node (`-1` / a non-function type is a
@@ -12007,7 +12053,10 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       // no instance to keep, so declining simply leaves the `call_ref`.
       const spCal = P.nodes[c.callFn]
       if spCal is Ident {
-        if spCal.identName != fn.fnName && monoNameIsAssigned(spCal.identName) {
+        if (
+          spCal.identName != fn.fnName
+          && monoReadIsAssigned(spCal.identName, c.callFn)
+        ) {
           return 0
         }
       }
@@ -12151,7 +12200,10 @@ function monoLamCallByName(calleeIx: i32, origFe: i32, instName: string) {
   if !criFnIsAnonLambda(origFe) || captureCountOf(origFe) > 0 { return 0 }
   const cal = P.nodes[calleeIx]
   if cal is Ident {
-    if cal.identName == instName || monoNameIsAssigned(cal.identName) {
+    if (
+      cal.identName == instName
+      || monoReadIsAssigned(cal.identName, calleeIx)
+    ) {
       return 0
     }
     collectANoteIdentRename(cal.identName)
@@ -12202,6 +12254,50 @@ function monoNameIsCapture(fx: i32, name: string): boolean {
   false
 }
 
+// The source declaration that declaration `d` is a rewrite's copy of, or `d` itself.
+function monoDeclCanon(d: i32): i32 {
+  const o = declOrigOf(d)
+  if o >= 0 { return o }
+  d
+}
+
+// The source declaration the read `at` resolves to, when `at` is an `Ident` spelling `name`
+// that the checker resolved to a node; -1 when it is not, so the caller falls back to the name.
+function monoReadDecl(name: string, at: i32): i32 {
+  if at < 0 || at >= P.nodes.length { return -1 }
+  const n = P.nodes[at]
+  if n is Ident {
+    if n.identName != name { return -1 }
+    const d = identDeclOf(at)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    return monoDeclCanon(d)
+  }
+  -1
+}
+
+// Whether the read of `name` at `at` is a parameter of function `fx`: by the binding the read
+// resolves to, else by name.
+function monoFnBindsParamAt(fx: i32, name: string, at: i32): boolean {
+  const d = monoReadDecl(name, at)
+  if d < 0 { return monoFnBindsParam(fx, name) }
+  const f = P.nodes[fx]
+  if f is FuncDecl {
+    for p in f.fnParams {
+      if monoDeclCanon(p) == d { return true }
+    }
+  }
+  false
+}
+
+// Whether the read of `name` at `at` can be a parameter of function `fx` (-1: of whichever
+// function is being copied): false only where it resolves to some other binding, such as a loop
+// variable of the name (D2114).
+function monoReadsOwnParam(fx: i32, name: string, at: i32): boolean {
+  if fx >= 0 { return monoFnBindsParamAt(fx, name, at) }
+  const d = monoReadDecl(name, at)
+  d < 0 || P.nodes[d] is Param
+}
+
 // Whether function `fx` declares a parameter named `name`.
 function monoFnBindsParam(fx: i32, name: string): boolean {
   const f = P.nodes[fx]
@@ -12233,7 +12329,7 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
   let fx = ctx
   let hops = 0
   while hops < 8 && fx >= 0 {
-    if monoFnBindsParam(fx, name) { return none }
+    if monoFnBindsParamAt(fx, name, at) { return none }
     const li = identLetOfAt(sid, fx, at)
     if li >= 0 {
       // A module-scope binding found from a function is the module's: its initializer reads
@@ -12264,7 +12360,7 @@ function monoAliasChainWritten(name: string, at: i32, ctx: i32): boolean {
   let fr = ctx
   let hops = 0
   while hops < MONO_ALIAS_CHAIN_MAX {
-    if monoNameIsAssigned(nm) { return true }
+    if monoReadIsAssigned(nm, ax) { return true }
     const lf = monoLetFrameOf(nm, ax, fr)
     if lf[1] < 0 { return false }
     const d = P.nodes[lf[1]]
@@ -12753,7 +12849,7 @@ function monoWalk(ix: i32, ctx: i32) {
         }
         // The initializer's lambda, which a reassigned binding need not hold at this call: the
         // call keeps its `call_ref` and only the lambda is pinned (D3849, D3858).
-        if afe >= 0 && monoNameIsAssigned(callee.identName) {
+        if afe >= 0 && monoReadIsAssigned(callee.identName, n.callFn) {
           monoNoRename.push(n.callFn)
         }
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
@@ -12816,7 +12912,7 @@ function monoWalk(ix: i32, ctx: i32) {
             // instance, faithful only while the binding still holds it — hence the
             // restriction to an annotated binding, whose `$fnsig` the `call_ref` needs.
             if identFnTypeAnnName(callee.identName, ctx) == "" { fe = afe }
-            else if !monoNameIsAssigned(callee.identName) { fe = afe }
+            else if !monoReadIsAssigned(callee.identName, n.callFn) { fe = afe }
           } else if identFnTypeAnnName(callee.identName, ctx) == "" {
             // A lambda bound to an un-annotated `const`: its params are inference holes,
             // so monomorphize it per call exactly like a named generic function. An
@@ -14298,6 +14394,7 @@ function monoSigMeet(a: string, b: string): string {
 }
 
 function monoBindSigFail(nm: string): i32 {
+  fnFlowSigFailNote(nm)
   emitFail(
     "emitProgram: the reassigned function binding `"
       + nm

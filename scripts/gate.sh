@@ -193,10 +193,11 @@ run "sentinel-index budget"    "$PY" scripts/sentinel-budget.py --check
 # list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
 # unlike the four above, because the tree reached zero in the PR that added it.
 run "dead-export budget"       "$PY" scripts/export-budget.py --check
-# The prefer-interpolation RATCHET, sixth of the same shape and the first that runs the
-# lint itself rather than a python copy of it (a `+` chain is an expression tree), so it
-# needs the seed. The compiler's standing chains are held; a new one reds here.
-run "interp budget"            "$PY" scripts/interp-budget.py --check
+# The prefer-interpolation RATCHET, sixth of the same shape and the first held by the
+# lint itself: `vl check --budget` walks the baseline's own targets in one process and
+# compares per-file counts (architecture-refactor-plan T2). scripts/interp-budget.py
+# stays the baseline's writer; tests/vl_budget_mode_test.ts holds the two to one answer.
+run "interp budget"            "$VL" check --budget scripts/interp-budget-baseline.json --compiler "$SEED"
 # The render-parse RATCHET, seventh of the same shape: `tyToEmitName(` calls and the ten
 # type-string parsers in the emitter. A rep is decided from the checked type, not from
 # a rendered spelling parsed back (code-quality-2026-10.md L2). A pure file scan, no seed.
