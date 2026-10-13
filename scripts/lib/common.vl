@@ -1,0 +1,251 @@
+// Helpers the scripts/ ports of the Python orchestrators share: Python-compatible text
+// (`str.isspace`, `splitlines`, `json.dumps`), a child-process record, and small path and
+// environment readers. Import with a relative path, e.g. `from "../lib/common.vl"`.
+// Not a general library: it mirrors Python's behaviour so a port can print the same bytes.
+
+import { IoError, pathExists, pathKind } from "std:fs"
+import { exit } from "std:process"
+import { getEnv } from "std:env"
+import { join, replaceAll } from "std:str"
+import { Json } from "std:json"
+
+export type JsonMap = { [string]: Json }
+
+// Stdout, stderr and exit code of one child, both streams decoded as Python's
+// `text=True` does.
+export type Proc = { code: i32, out: string, err: string }
+
+// The code point starting at byte `i` and its byte length, of valid UTF-8.
+export type Cp = { cp: i32, n: i32 }
+
+// Stop with `code` after saying why, on stdout: VL has no stderr sink.
+export function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// The byte length of the whitespace code point at `i` (Python's `str.isspace`), or 0.
+export function wsLen(s: string, i: i32): i32 {
+  if i < 0 || i >= s.length { return 0 }
+  const b = s[i]
+  if b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31) { return 1 }
+  if b == 0xC2 && i + 1 < s.length {
+    if s[i + 1] == 0x85 || s[i + 1] == 0xA0 { return 2 }
+    return 0
+  }
+  if i + 2 >= s.length { return 0 }
+  const c = s[i + 1]
+  const d = s[i + 2]
+  if b == 0xE1 && c == 0x9A && d == 0x80 { return 3 }
+  if b == 0xE2 && c == 0x80 {
+    if (d >= 0x80 && d <= 0x8A) || d == 0xA8 || d == 0xA9 || d == 0xAF {
+      return 3
+    }
+  }
+  if b == 0xE2 && c == 0x81 && d == 0x9F { return 3 }
+  if b == 0xE3 && c == 0x80 && d == 0x80 { return 3 }
+  0
+}
+
+// The byte length of a whitespace code point ending just before `end`, or 0.
+export function wsLenBefore(s: string, end: i32): i32 {
+  let k = 1
+  while k <= 3 {
+    if end - k >= 0 && wsLen(s, end - k) == k { return k }
+    k = k + 1
+  }
+  0
+}
+
+export function lstripWs(s: string): string {
+  let a = 0
+  while a < s.length && wsLen(s, a) > 0 { a = a + wsLen(s, a) }
+  s.slice(a, s.length)
+}
+
+export function rstripWs(s: string): string {
+  let b = s.length
+  while b > 0 && wsLenBefore(s, b) > 0 { b = b - wsLenBefore(s, b) }
+  s.slice(0, b)
+}
+
+export function stripWs(s: string): string { lstripWs(rstripWs(s)) }
+
+// The byte length of the line break at `i` (Python's `str.splitlines` set), or 0.
+export function breakLen(s: string, i: i32): i32 {
+  const b = s[i]
+  if b == 13 {
+    if i + 1 < s.length && s[i + 1] == 10 { return 2 }
+    return 1
+  }
+  if b == 10 || b == 11 || b == 12 || b == 28 || b == 29 || b == 30 { return 1 }
+  if b == 0xC2 && i + 1 < s.length && s[i + 1] == 0x85 { return 2 }
+  if b == 0xE2 && i + 2 < s.length && s[i + 1] == 0x80 {
+    if s[i + 2] == 0xA8 || s[i + 2] == 0xA9 { return 3 }
+  }
+  0
+}
+
+// Python's `str.splitlines()`: no trailing empty piece, every break kind recognised.
+export function splitLines(s: string): string[] {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    const n = breakLen(s, i)
+    if n > 0 {
+      out.push(s.slice(start, i))
+      i = i + n
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  if start < s.length { out.push(s.slice(start, s.length)) }
+  out
+}
+
+// Text as Python's universal-newline reader hands it over: every `\r\n` and `\r` is `\n`.
+export function univNl(s: string): string {
+  replaceAll(replaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
+// The first `n` code points of `s`, which is what a Python slice `[:n]` keeps.
+export function cpPrefix(s: string, n: i32): string {
+  let seen = 0
+  let i = 0
+  while i < s.length {
+    if (s[i] & 0xC0) != 0x80 {
+      if seen == n { return s.slice(0, i) }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  s
+}
+
+// The first line of `s` as `s.splitlines()[0]`, or "" when it has none.
+export function firstLine(s: string): string {
+  const ls = splitLines(s)
+  if ls.length == 0 { return "" }
+  ls[0]
+}
+
+// The byte index of `needle` in `s` at or after `from`, or -1.
+export function findFrom(s: string, needle: string, from: i32): i32 {
+  let i = from
+  while i + needle.length <= s.length {
+    let j = 0
+    while j < needle.length && s[i + j] == needle[j] { j = j + 1 }
+    if j == needle.length { return i }
+    i = i + 1
+  }
+  -1
+}
+
+export function isDigit(b: i32): boolean { b >= 48 && b <= 57 }
+
+export function hexDigits(v: i32, n: i32): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = n - 1
+  while k >= 0 {
+    const d = (v >> (k * 4)) & 15
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+export function uEsc(cp: i32): string { "\\u" + hexDigits(cp, 4) }
+
+export function cpAt(s: string, i: i32): Cp {
+  const b = s[i]
+  if b < 0x80 { return { cp: b, n: 1 } }
+  let cp = 0
+  let n = 1
+  if b >= 0xF0 {
+    n = 4
+    cp = b & 7
+  } else if b >= 0xE0 {
+    n = 3
+    cp = b & 15
+  } else {
+    n = 2
+    cp = b & 31
+  }
+  let k = 1
+  while k < n && i + k < s.length {
+    cp = (cp << 6) | (s[i + k] & 63)
+    k = k + 1
+  }
+  { cp: cp, n: n }
+}
+
+// `json.dumps(s)` with its default `ensure_ascii`: everything outside space..`~` escaped.
+export function jsonStr(s: string): string {
+  const parts = ["\""]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == 34 { parts.push("\\\"") }
+      else if b == 92 { parts.push("\\\\") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 8 { parts.push("\\b") }
+      else if b == 12 { parts.push("\\f") }
+      else if b < 32 || b == 127 { parts.push(uEsc(b)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    const c = cpAt(s, i)
+    if c.cp > 0xFFFF {
+      const v = c.cp - 0x10000
+      parts.push(uEsc(0xD800 | (v >> 10)))
+      parts.push(uEsc(0xDC00 | (v & 0x3FF)))
+    } else {
+      parts.push(uEsc(c.cp))
+    }
+    i = i + c.n
+  }
+  parts.push("\"")
+  join(parts, "")
+}
+
+export function exists(path: string): boolean {
+  const e = pathExists(path)
+  if e is IoError { return false }
+  e
+}
+
+export function isDir(path: string): boolean {
+  const k = pathKind(path)
+  if k is IoError { return false }
+  k == "dir"
+}
+
+// Narrowed before the compare: `pathKind(p) == "file"` refuses at emit (D4340).
+export function isFile(path: string): boolean {
+  const k = pathKind(path)
+  if k is IoError { return false }
+  k == "file"
+}
+
+export function envOr(name: string, dflt: string): string {
+  const v = getEnv(name)
+  if v is string { return v }
+  dflt
+}
+
+// Whether `flag` appears anywhere in `args`.
+export function hasFlag(args: readonly string[], flag: string): boolean {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag { return true }
+    i = i + 1
+  }
+  false
+}
