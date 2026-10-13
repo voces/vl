@@ -476,6 +476,113 @@ apart that a different key would fuse. The first and third are the two refused r
 must leave these sites on the NAME answer, or land one of the re-keyings with its
 `merge-diffset` price paid, before they return the id answer.
 
+### Prerequisite (3) — the 2,248 `name-only` reaches, by mechanism; one arena rule takes 448
+
+**Method.** A scratch seed armed at `unABMode = 3` printed every `name-only` reach as a row:
+the site, the type it offered, that type's arena key text (`canonUnionKeyTextOfTy`), and the
+name-found row's name, member set and key text. Each reach was then classified by **ablation
+over rewrite rules, not by message**: the smallest set of rules from {move `null` last, soften
+a literal, drop a repeated atom, expand a record alias, expand a map alias, expand a union
+alias, substitute a generic application} that makes the two key texts equal, and for the
+alias rules, WHICH side carried the name. A reach where the offered type mints no key at all
+is its own class. Populations: `tests/cases` (5,209 programs) and the distilled corpus
+(10,124 cells), at #3639's head 6ddb06438.
+
+| class | `tests/cases` before → after rule L | programs | distilled before → after | minimal witness | verdict |
+| --- | --- | --- | --- | --- | --- |
+| **L** a string-literal run the row keeps as its litunion alias beside a non-literal member; the key softens it per member | **448 → 0** | 20 | **28 → 0** | key `string\|string\|i32`, row `K\|i32` (`literal-unions/inferred-join-beside-a-scalar.vl`) | **rule L, this PR** |
+| L′ a litunion alias with no non-literal beside it, or a union OF litunion aliases | 103 | 15 | 0 | key `string\|string\|string`, row `OA\|OB` (`literal-unions/declared-union-of-litunions.vl`); site 29 key `K0`, row `string\|string\|string` (`closures/nulclosure-litunion-map-result.vl`) | stays; a rule from the declaration's members is unmeasured |
+| R a record arm by alias on one side, by shape on the other | 561 | 16 | 64 | row-named 531: key `{c:i32}\|{d:i32}`, row `Cat\|Dog` (`closures/closure-union-param-pin-litunion-first.vl`); key-named 24: key `i32\|R`, row `i32\|{f:i32}` (`generics/gradual-type-parameter-union.vl`); both 6 | stays on the name |
+| N1 the key folds a declared null-LAST union's `null` first | 261 | 1 | 0 | key `null\|{[string]:V}\|V[]\|f64`, row `{[string]:V}\|V[]\|f64\|null` (`unions/twice-narrowed-alias-list-arm-beside-fn-arm.vl`) | stays; rule N1 measured, refused |
+| N1′ the same, plus a second `null` from a nested nullable | 9 | 3 | 0 | key `null\|boolean\|…\|null`, row `boolean\|…\|null` (`types/nullable-over-a-union-that-boxes.vl`) | stays; rule N1′ measured, refused |
+| N2 a pin substitutes a nullable into the middle of a declared union | 198 | 5 | 71 | key `i32\|boolean\|null`, row `i32\|null\|boolean` (`generics/map-declared-return-flattens-at-pin.vl`) | stays on the name |
+| M a map alias by name on one side, by shape on the other | 218 | 2 | 0 | key-named 194: key `f64\|JO\|null`, row `f64\|{[string]:J}\|null` (`maps/recursive-alias-declared-first.vl`); row-named 24 (`maps/recursive-alias-map-into-union.vl`) | stays; rule M tried, did not reach |
+| K the key-only site 29 (`riu/mapVal`) offers the bare alias | 108 | 1 | 0 | key `J`, row `null\|f64\|{[string]:J}` (same program) | stays (D1493) |
+| D a numeric literal run softened to repeated scalars | 70 | 22 | 38 | key `i32\|i32\|null`, row `i32\|null` (`closures/inplace-lambda-nullable-union-result.vl`) | stays; rule D measured, refused |
+| G a generic application nested inside a member | 67 | 1 | 0 | key `{v:Box<i32>}\|i32`, row `{v:{v:i32}}\|i32` (`generics/nested-application-union-arm.vl`) | stays (4a miss #4) |
+| A the site offers an ARM, not the union: no key | 173 | 20 | 4 | `closures/closure-array-union-arm-field-call.vl`, `globals/nullable-global-variant-seed-leak.vl` | stays on the name |
+| U no rule set closes it | 32 | 3 | 0 | key six `string`s, row `SU\|EA` (`literal-unions/declared-union-of-litunions.vl`) | unclassified; L′'s neighbourhood |
+| **total** | **2,248 → 1,800** | | **205 → 177** | | |
+
+**Rule L — the key regroups a string-literal run into its alias, as the render already does.**
+`tyToNameGo`'s union arm keeps `K` for a run of string literals whose set is a registered
+litunion alias and which stands beside a non-literal member (the mixed-union preserve), and
+`canonEmitName` mirrors it with `mixedUnionLitAliasRegroup`. `canonUnionKeyTextOfTy` renders
+member by member, so the run reached the key softened. The run scan is now one helper,
+`mixedLitRunAliasOf`, read by both. Measured with the harness armed:
+
+| | `tests/cases` before → after | distilled before → after |
+| --- | --- | --- |
+| `name-only` | 2,248 → **1,800** | 205 → **177** |
+| agree | 329,073 → 329,521 | 262,588 → 262,616 |
+| differ | 68 → **68** | 0 → **0** |
+| alias | 1,974 → 1,974 | 101 → 101 |
+| id-only | 810 → **810** | 552 → **552** |
+| `keySweep/merge-diffset` / `merge-diffvar` | 0 / 0 → 0 / 0 | 0 / 0 → 0 / 0 |
+
+Every reach it moved went to `agree`, nothing else moved, and it re-keys no ROW (rows are minted
+from spellings, and `canonUnionKeyTextOfTy` is read only by the harness). 4a's miss #2 measured
+the same regroup at **0** extra ROWS. The rule works at the call sites, not at the rows.
+
+**Four more rules were built and measured, and refused:**
+
+* **N1: the null fold follows the declaration's `null` position.** It moved all 261 reaches of
+  `twice-narrowed-alias-list-arm-beside-fn-arm.vl` to `agree`. In the same program,
+  `ctr/unionName` gained **532 `id-only`**: the key now finds `V`'s row where the name side
+  answers "no union". Switching such a site would change its answer, so those 532 need
+  classifying before the rule is worth having.
+* **N1′: strip a leading `null` and append one.** It broke 83 reaches that agreed before:
+  `std:json`'s `Json | JsonError | null` rows keep `null` in the MIDDLE, so the stripped key
+  stopped matching them.
+* **D: drop a repeated atom when either copy came from a numeric literal.** It cleared the
+  class and raised `differ` 68 → 70 in `unions/litunion-is-base-type.vl`. There
+  `type T1 = 1 | 2 | "s"`'s row keeps `i32|i32|string`, the deduped key equals `T0 = 1 | "s"`'s,
+  and the key names T0's row. **Two row producers disagree about whether a numeric run
+  dedups** (`T1`'s keeps both, `LN | null`'s keeps one), so no arena rule can match both. The
+  fix is on the row side.
+* **M: render a map alias by its shape at the key position.** Gating `structNameOfTy` and
+  `unionAliasDeclNameOfTy` on a `TyMap` at `RC_UNION_KEY` moved nothing. Also gating a
+  one-member `TyUnion` over a `TyMap` turned the 85 `ctr/unionName` reaches from `name-only`
+  into `<nokey>`: the render declines. The 24 reaches the other way (`WMap` row, shape key,
+  `maps/recursive-alias-map-into-union.vl`) put M in R's position, with both directions present.
+
+**Why the rest stay on the name:**
+
+* **R and G hold both directions.** R has 531 reaches name-on-the-row, 24 name-on-the-key and 6
+  both; G repeats 4a's miss #4. So no renderer rule wins: taking the name breaks the reverse
+  reaches, and taking the shape breaks the forward ones. D3870 makes `{c: i32}` and `Cat` one
+  type, so the answer is a key over record SHAPE on both sides. That re-keys rows, owes the
+  licence measurement (`merge-diffset`, `merge-diffvar`), and must still answer `is Cat` by arm
+  name.
+* **N2 is a position the arena does not hold.** The fold keeps one `null` at the end. The
+  in-place pin substitution is a fact about the spelling, and normalising it in the key is the
+  refused re-keying (`merge-diffset` 0 → 25).
+* **L′ has no non-literal member to anchor the regroup.** The render keeps a declared union of
+  litunion aliases (`SU = SA | SB`) by its member NAMES, and `Kind | "x"` as `Kind | string`.
+  A key built from the declaration's members, the way `declaredStructUnionMembers` reads a
+  struct union, would cover both. It is unmeasured; the next PR can measure it the same way.
+* **K is D1493.** Its re-keying was refused at `merge-diffset` 0 → 2.
+* **A offers a member type.** No type in scope names the declared union, so it needs a
+  narrowed-from link (4b's ~416 class).
+
+**The switch is NOT in this PR, and here is what it needs.** Over both populations after rule L,
+**11 sites read only `agree` and `alias`**:
+
+* `internFuncTypeShapes/valueUnion`, 199 agree and 10 alias;
+* `nliInferIfLet`, 77 agree and 2 alias;
+* `riu/pun`, 75 agree and 1 alias;
+* `riu/refArrayArm`, 26 agree and 1 alias;
+* `inferRetArenaUnionIsDup`, `exprIsUnionStrEq/r`, `collectU/optCallRet`, `riu/nulCloValue`,
+  `nliInferOptChainLet`, `riu/nulCloVariant` and `riu/collapsedName`, 88 reaches together, all
+  `agree`.
+
+The `agree`-only seven can return the id answer and stay module-identical over both corpora by
+construction. The four with an `alias` reach return the FIRST row under the key, a different
+row INDEX, so they need module identity proven, not assumed. Every other site holds at least
+one `name-only`, `differ` or `id-only` reach from the classes above. Of those, `ctr/unionName`
+(771 `id-only`) and `unionNameOfExpr/is` (395) need their `id-only` classified the way this
+section classified `name-only`.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
