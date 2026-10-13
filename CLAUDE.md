@@ -47,9 +47,10 @@ to 3 for anything that does run a full census block.
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
-time, CPU seconds and exit code. Twenty-five gates (26 on master); measured 2026-09-05 on a
-box at load 27, the wall clock was **79.8 s**, set by `distilled corpus` alone at 79.8 s with
-`ci-native` next at 55.5 s — everything else finishes in well under a minute in parallel. The
+time, CPU seconds and exit code. Thirty gates on master; measured 2026-10-12 at 3c2e2227a, back
+to back on one 24-thread box: **173 s** under WSL (every row at once) and **263 s** on Windows
+(at most 6 at once), set by `ci-native` and `filed witnesses`/`scaling shape` behind it. That is
+past the budget below; the September reading (79.8 s, 25 gates) was a smaller gate. The
 table has been per gate since #2564 (before that it read elapsed-to-report, and the old "68
 seconds for all nine" was that broken reading), and it now carries TWO columns: WALL is still
 each row's contended elapsed, CPU is its own user+sys, so a row that is slow and a row that is
