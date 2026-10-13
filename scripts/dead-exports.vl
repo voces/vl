@@ -1,0 +1,291 @@
+// Finds the exports of compiler/ that nothing references, for the dead-export ratchet.
+//
+//     vl run scripts/dead-exports.vl -- --list [--root <dir>]
+//     vl run scripts/dead-exports.vl -- --out <findings.json> [--root <dir>]
+//
+// `unused-function` exempts an exported declaration as public surface, which for
+// compiler/ — whose only consumer is the tree itself — is a blind spot. A reference is
+// any word-boundary occurrence of the name under compiler/, std/, tests/, lsp/,
+// playground/ or scripts/ other than the declaration; docs/ is not a consumer. `--out`
+// writes a `vl check --json`-shaped report that
+// `vl check --budget scripts/export-budget-baseline.json --findings <file>` counts.
+
+import { IoError, listDir, pathKind, readFile, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { toJson } from "std:json"
+import { join } from "std:str"
+import { sort } from "std:array"
+
+const CORPUS = ["compiler", "std", "tests", "lsp", "playground", "scripts"]
+// Build output and vendored trees, derived from the very sources being graded.
+const SKIP_DIRS = [
+  ".git", "node_modules", "dist", "build", "target", "__pycache__", ".cache",
+  ".deno",
+]
+const KINDS = ["function", "let", "const", "type"]
+
+type Export = {
+  rel: string,
+  line: i32,
+  kind: string,
+  name: string,
+  text: string,
+}
+
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// The slot of an identifier byte in a trie node, or -1 for any other byte.
+function slot(c: i32): i32 {
+  if c >= '0' && c <= '9' { return c - '0' }
+  if c >= 'A' && c <= 'Z' { return c - 'A' + 10 }
+  if c >= 'a' && c <= 'z' { return c - 'a' + 36 }
+  if c == '_' { return 62 }
+  -1
+}
+
+// Code-point order, the order Python's `sorted` gives a `str`.
+function strLess(a: string, b: string): boolean {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] < b[i] }
+    i = i + 1
+  }
+  a.length < b.length
+}
+
+function bytesOf(path: string): u8[] {
+  const b = readFile(path)
+  if b is IoError {
+    die("dead-exports: cannot read \{path} (\{b.msg})", 2)
+    return []
+  }
+  b
+}
+
+function sortedNames(dir: string): string[] {
+  const names = listDir(dir)
+  if names is IoError {
+    die("dead-exports: cannot list \{dir} (\{names.msg})", 2)
+    return []
+  }
+  sort(names, strLess)
+  names
+}
+
+// Whether `b[i..]` spells `word`.
+function bytesAt(b: u8[], i: i32, word: string): boolean {
+  if i + word.length > b.length { return false }
+  let k = 0
+  while k < word.length {
+    if b[i + k] != word[k] { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Every `export function|let|const|type NAME` whose `export` opens a line of a
+// compiler/*.vl module. A re-export block names no new declaration and is skipped.
+function exportsIn(root: string): Export[] {
+  const out: Export[] = []
+  for n in sortedNames("\{root}/compiler") {
+    if n.length < 3 || n.slice(n.length - 3, n.length) != ".vl" { continue }
+    const b = bytesOf("\{root}/compiler/\{n}")
+    let ln = 1
+    let a = 0
+    while a <= b.length {
+      let e = a
+      while e < b.length && b[e] != '\n' { e = e + 1 }
+      if bytesAt(b, a, "export ") {
+        for kind in KINDS {
+          const k0 = a + 7
+          if (
+            bytesAt(b, k0, kind)
+            && k0 + kind.length < e
+            && b[k0 + kind.length] == ' '
+          ) {
+            let i = k0 + kind.length + 1
+            while i < e && b[i] == ' ' { i = i + 1 }
+            let j = i
+            while j < e && slot(b[j]) >= 0 { j = j + 1 }
+            if j > i {
+              out.push(
+                {
+                  rel: "compiler/\{n}",
+                  line: ln,
+                  kind: kind,
+                  name: decodeUtf8Lossy(b.slice(i, j)),
+                  text: decodeUtf8Lossy(b.slice(a, e)),
+                },
+              )
+            }
+            break
+          }
+        }
+      }
+      a = e + 1
+      ln = ln + 1
+    }
+  }
+  out
+}
+
+// A trie over the export names: `kids[node * 63 + slot]` is the child or 0, and
+// `ends[node]` the name id spelled by the path to `node`, or -1.
+let kids: i32[] = []
+let ends: i32[] = []
+
+function trieAdd(name: string, id: i32) {
+  let node = 0
+  for c in name {
+    const at = node * 63 + slot(c)
+    if kids[at] == 0 {
+      kids[at] = ends.length
+      ends.push(-1)
+      let k = 0
+      while k < 63 {
+        kids.push(0)
+        k = k + 1
+      }
+    }
+    node = kids[at]
+  }
+  if ends[node] < 0 { ends[node] = id }
+}
+
+// Counts, into `hits[id]`, every identifier run of `b` that spells an export name.
+function countWords(b: u8[], hits: i32[]) {
+  let i = 0
+  while i < b.length {
+    if slot(b[i]) < 0 {
+      i = i + 1
+      continue
+    }
+    let node = 0
+    while i < b.length {
+      const s = slot(b[i])
+      if s < 0 { break }
+      if node >= 0 {
+        node = kids[node * 63 + s]
+        if node == 0 { node = -1 }
+      }
+      i = i + 1
+    }
+    if node > 0 && ends[node] >= 0 { hits[ends[node]] = hits[ends[node]] + 1 }
+  }
+  0
+}
+
+function isSkipped(name: string): boolean {
+  for s in SKIP_DIRS {
+    if s == name { return true }
+  }
+  false
+}
+
+function walk(dir: string, hits: i32[]) {
+  for n in sortedNames(dir) {
+    const path = "\{dir}/\{n}"
+    const kind = pathKind(path)
+    if kind is IoError { continue }
+    if kind == "dir" {
+      if !isSkipped(n) { walk(path, hits) }
+    } else {
+      countWords(bytesOf(path), hits)
+    }
+  }
+  0
+}
+
+// The exports the corpus mentions at most once — that once being the declaration.
+function deadExports(root: string): Export[] {
+  const exps = exportsIn(root)
+  kids = []
+  ends = [-1]
+  let k = 0
+  while k < 63 {
+    kids.push(0)
+    k = k + 1
+  }
+  const ids: i32[] = []
+  for x in exps {
+    trieAdd(x.name, ids.length)
+    ids.push(0)
+  }
+  for d in CORPUS {
+    const top = "\{root}/\{d}"
+    const kind = pathKind(top)
+    if kind is IoError { continue }
+    if kind == "dir" { walk(top, ids) }
+  }
+  // `ids[i]` counts the FIRST export of each name; a repeated name shares it.
+  const out: Export[] = []
+  for x in exps {
+    let node = 0
+    for c in x.name { node = kids[node * 63 + slot(c)] }
+    if ids[ends[node]] <= 1 { out.push(x) }
+  }
+  out
+}
+
+function jsonText(s: string): string {
+  const j = toJson(s)
+  if j is string { return j }
+  "\"\""
+}
+
+function main(args: string[]) {
+  let root = "."
+  let list = false
+  let outPath = ""
+  let i = 0
+  while i < args.length {
+    if args[i] == "--root" && i + 1 < args.length {
+      root = args[i + 1]
+      i = i + 1
+    } else if args[i] == "--out" && i + 1 < args.length {
+      outPath = args[i + 1]
+      i = i + 1
+    } else if args[i] == "--list" {
+      list = true
+    } else {
+      die("dead-exports: unknown argument `\{args[i]}`", 2)
+    }
+    i = i + 1
+  }
+  if !list && outPath == "" {
+    die(
+      "dead-exports: usage: dead-exports.vl (--list | --out <file>) [--root <dir>]",
+      2,
+    )
+  }
+  const dead = deadExports(root)
+  if list {
+    for x in dead { print("\{x.rel}:\{x.line}  \{x.kind} \{x.name}") }
+  }
+  if outPath != "" {
+    const rows: string[] = []
+    for x in dead {
+      const msg = "`\{x.name}` is exported and referenced nowhere in \{join(CORPUS, "/, ")}/"
+      rows.push(
+        "{\"file\": \{jsonText(x.rel)}, \"line\": \{x.line}, \"col\": 1, \"severity\": \"warning\", \"code\": \"dead-export\", \"message\": \{jsonText(msg)}, \"text\": \{jsonText(x.text)}}",
+      )
+    }
+    const r = writeTextFile(outPath, "[\{join(rows, ",\n")}]\n")
+    if r is IoError {
+      die("dead-exports: cannot write \{outPath} (\{r.msg})", 2)
+    }
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("dead-exports: an argument is not UTF-8: \{argv.msg}", 2)
+} else {
+  main(argv)
+}
