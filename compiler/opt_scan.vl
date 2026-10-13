@@ -1,0 +1,463 @@
+// The `-O` rung's reading of its input module, the first optimizer step ported from the
+// host (docs/internals/optimizer-in-vl.md, rung R1): the functions the rung must not
+// inline because only run-once code calls them, from inside a loop, and the extra pass
+// a function with too many local sets asks for. The host stages the module with
+// `optInLoad`, calls `optRungScan`, and reads the answer back through `optOut*`.
+// It answers exactly as the host's `rung_scan` does, and a module this cannot decode
+// gets no marks and no extra pass, as there.
+
+import {
+  WasmCursor,
+  wcByte,
+  wcConstExpr,
+  wcFail,
+  wcNew,
+  wcOp,
+  wcPreamble,
+  wcSkip,
+  wcSkipLeb,
+  wcU32,
+  wcValType,
+} from "./wasm_read"
+
+// A callee at most this many body bytes, loop-free and calling no defined function, is
+// left inlinable into run-once code.
+const RUN_ONCE_INLINE_LEAF_BYTES = 160
+// A function with more `local.set`/`local.tee` than this makes the rung skip `ssa-nomerge`.
+const SSA_SPLIT_MAX_SETS = 8192
+
+let optIn: u8[] = []
+let optOut: u8[] = []
+
+// What one decode of the module found. Bodies are in code-section order; call sites are
+// flattened, one row per direct call of a defined function.
+type ScanState = {
+  nImports: i32,
+  start: i32,
+  escapes: i32[],
+  bodySize: i32[],
+  bodyLoop: boolean[],
+  bodyCalls: boolean[],
+  bodySets: i32[],
+  siteCaller: i32[],
+  siteCallee: i32[],
+  siteInLoop: boolean[],
+  nameIdx: i32[],
+  nameAt: i32[],
+  nameLen: i32[],
+}
+
+// Empties the staged module before a new one is loaded.
+export function optInReset(): i32 {
+  optIn = []
+  0
+}
+
+// Appends the `count` bytes the host staged at linear memory 0.
+export function optInLoad(count: i32): i32 {
+  let i = 0
+  while i < count {
+    optIn.push(__load_u8__(i))
+    i = i + 1
+  }
+  0
+}
+
+export function optOutLen(): i32 { optOut.length }
+
+export function optOutAt(i: i32): i32 {
+  if i < 0 || i >= optOut.length { return 0 }
+  optOut[i]
+}
+
+// Writes `min(count, optOutLen() - off)` answer bytes, four per i32 word little-endian, at
+// linear memory 0 and returns how many; the host's bulk read-back.
+export function optOutStore(off: i32, count: i32): i32 {
+  let n = count
+  if n > optOut.length - off { n = optOut.length - off }
+  if n <= 0 || off < 0 { return 0 }
+  let w = 0
+  let i = 0
+  while i < n {
+    const v = optOut[off + i]
+    w = w | (v << ((i & 3) * 8))
+    i = i + 1
+    if (i & 3) == 0 {
+      __store_i32__(i - 4, w)
+      w = 0
+    }
+  }
+  if (i & 3) != 0 { __store_i32__(i - (i & 3), w) }
+  n
+}
+
+// Scans the staged module. The answer in `optOut` is the extra pass (empty or
+// `--skip-pass=ssa-nomerge`), then one `\n`-prefixed binaryen name per marked callee in
+// function-index order. Returns 1, or 0 with an empty answer when the module did not decode.
+export function optRungScan(): i32 {
+  optOut = []
+  const s: ScanState = {
+    nImports: 0,
+    start: -1,
+    escapes: [],
+    bodySize: [],
+    bodyLoop: [],
+    bodyCalls: [],
+    bodySets: [],
+    siteCaller: [],
+    siteCallee: [],
+    siteInLoop: [],
+    nameIdx: [],
+    nameAt: [],
+    nameLen: [],
+  }
+  if !scanModule(s) { return 0 }
+  let i = 0
+  while i < s.bodySets.length {
+    if s.bodySets[i] > SSA_SPLIT_MAX_SETS {
+      outText("--skip-pass=ssa-nomerge")
+      i = s.bodySets.length
+    }
+    i = i + 1
+  }
+  const hot = runOnceHotCallees(s)
+  const names = nameTable(s)
+  let k = 0
+  while k < hot.length {
+    optOut.push(10)
+    const f = hot[k]
+    const at = names[f]
+    if at >= 0 {
+      outBytes(s.nameAt[at], s.nameLen[at])
+    } else {
+      outDecimal(f - s.nImports)
+    }
+    k = k + 1
+  }
+  1
+}
+
+// Appends an ASCII literal.
+function outText(t: string) {
+  for cp in t { optOut.push(cp) }
+}
+
+function outBytes(at: i32, len: i32) {
+  let i = 0
+  while i < len {
+    optOut.push(optIn[at + i])
+    i = i + 1
+  }
+}
+
+// Appends a non-negative `v` in decimal.
+function outDecimal(v: i32) {
+  if v >= 10 { outDecimal(v / 10) }
+  optOut.push(48 + v % 10)
+}
+
+// Per function index, the row of its last name-section entry, or -1.
+function nameTable(s: ScanState): i32[] {
+  const n = s.nImports + s.bodySize.length
+  const t: i32[] = []
+  while t.length < n { t.push(-1) }
+  let r = 0
+  while r < s.nameIdx.length {
+    const f = s.nameIdx[r]
+    if f >= 0 && f < n { t[f] = r }
+    r = r + 1
+  }
+  t
+}
+
+// Decodes every section the scan reads and steps over the rest. False when any of it
+// does not decode.
+function scanModule(s: ScanState): boolean {
+  const c = wcNew(optIn, 0, optIn.length)
+  wcPreamble(c)
+  while !c.failed && c.pos < c.end {
+    const id = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size > c.end - c.pos { return false }
+    const sec = wcNew(optIn, c.pos, c.pos + size)
+    if id == 0 { scanCustom(s, sec) }
+    else if id == 2 { scanImports(s, sec) }
+    else if id == 7 { scanExports(s, sec) }
+    else if id == 8 { s.start = wcU32(sec) }
+    else if id == 9 { scanElements(s, sec) }
+    else if id == 10 { scanCode(s, sec) }
+    else if id > 13 { wcFail(sec) }
+    if sec.failed { return false }
+    wcSkip(c, size)
+  }
+  !c.failed
+}
+
+// Counts function imports; a table, memory, global or tag import is decoded and skipped.
+function scanImports(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    wcSkip(c, wcU32(c))
+    wcSkip(c, wcU32(c))
+    const kind = wcByte(c)
+    if kind == 0 {
+      wcU32(c)
+      s.nImports = s.nImports + 1
+    } else if kind == 1 {
+      wcValType(c)
+      skipLimits(c)
+    } else if kind == 2 {
+      skipLimits(c)
+    } else if kind == 3 {
+      wcValType(c)
+      wcByte(c)
+    } else if kind == 4 {
+      wcByte(c)
+      wcU32(c)
+    } else {
+      wcFail(c)
+    }
+    i = i + 1
+  }
+}
+
+function skipLimits(c: WasmCursor) {
+  const flags = wcByte(c)
+  wcSkipLeb(c)
+  if (flags & 1) != 0 { wcSkipLeb(c) }
+}
+
+// An exported function escapes.
+function scanExports(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    wcSkip(c, wcU32(c))
+    const kind = wcByte(c)
+    const idx = wcU32(c)
+    if kind == 0 { s.escapes.push(idx) }
+    i = i + 1
+  }
+}
+
+// A function an element segment holds escapes, by index or as a `ref.func` item; the
+// segment's offset expression is decoded but not read.
+function scanElements(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  const offsetFuncs: i32[] = []
+  let i = 0
+  while i < n && !c.failed {
+    const flags = wcU32(c)
+    if flags < 0 || flags > 7 { wcFail(c) }
+    const exprs = (flags & 4) != 0
+    if (flags & 1) == 0 {
+      if (flags & 2) != 0 { wcU32(c) }
+      wcConstExpr(c, offsetFuncs)
+    }
+    if (flags & 3) != 0 {
+      if exprs { wcValType(c) }
+      else if wcByte(c) != 0 { wcFail(c) }
+    }
+    const items = wcU32(c)
+    let k = 0
+    while k < items && !c.failed {
+      if exprs { wcConstExpr(c, s.escapes) } else { s.escapes.push(wcU32(c)) }
+      k = k + 1
+    }
+    i = i + 1
+  }
+}
+
+// One row per body: its size, whether it loops, whether it calls a defined function,
+// its local sets, and its direct call sites with whether each sits inside a loop.
+function scanCode(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { wcFail(c); return }
+    const caller = s.nImports + s.bodySize.length
+    scanBody(s, wcNew(c.b, c.pos, c.pos + size), caller, size)
+    wcSkip(c, size)
+    if s.bodySize.length != i + 1 { wcFail(c) }
+    i = i + 1
+  }
+}
+
+function scanBody(s: ScanState, c: WasmCursor, caller: i32, size: i32) {
+  const groups = wcU32(c)
+  let g = 0
+  while g < groups && !c.failed {
+    wcU32(c)
+    wcValType(c)
+    g = g + 1
+  }
+  // One entry per open block: whether it is a `loop`.
+  const ctrl: boolean[] = []
+  let loops = 0
+  let hasLoop = false
+  let callsDefined = false
+  let sets = 0
+  while c.pos < c.end && !c.failed {
+    const op = wcOp(c)
+    if op == 0x03 {
+      ctrl.push(true)
+      loops = loops + 1
+      hasLoop = true
+    } else if op == 0x02 || op == 0x04 || op == 0x06 || op == 0x1f {
+      ctrl.push(false)
+    } else if op == 0x0b {
+      if ctrl.length > 0 {
+        if ctrl.pop() { loops = loops - 1 }
+      }
+    } else if op == 0x10 || op == 0x12 {
+      if c.imm >= s.nImports {
+        callsDefined = true
+        s.siteCaller.push(caller)
+        s.siteCallee.push(c.imm)
+        s.siteInLoop.push(loops > 0)
+      }
+    } else if op == 0xd2 {
+      s.escapes.push(c.imm)
+    } else if op == 0x21 || op == 0x22 {
+      sets = sets + 1
+    }
+  }
+  if c.failed { return }
+  s.bodySize.push(size)
+  s.bodyLoop.push(hasLoop)
+  s.bodyCalls.push(callsDefined)
+  s.bodySets.push(sets)
+}
+
+// Every `name` custom section's function-name entries (subsection 1), in order; a later
+// entry for an index wins. A subsection that does not decode ends the read, quietly.
+function scanCustom(s: ScanState, c: WasmCursor) {
+  const nlen = wcU32(c)
+  if c.failed || nlen != 4 || nlen > c.end - c.pos { return }
+  const at = c.pos
+  if (
+    c.b[at] != 0x6e
+    || c.b[at + 1] != 0x61
+    || c.b[at + 2] != 0x6d
+    || c.b[at + 3] != 0x65
+  ) {
+    return
+  }
+  wcSkip(c, 4)
+  while c.pos < c.end && !c.failed {
+    const id = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { return }
+    if id == 1 { scanFunctionNames(s, wcNew(c.b, c.pos, c.pos + size)) }
+    wcSkip(c, size)
+  }
+}
+
+function scanFunctionNames(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const idx = wcU32(c)
+    const len = wcU32(c)
+    const at = c.pos
+    wcSkip(c, len)
+    if !c.failed {
+      s.nameIdx.push(idx)
+      s.nameAt.push(at)
+      s.nameLen.push(len)
+    }
+    i = i + 1
+  }
+}
+
+function isDefined(s: ScanState, f: i32): boolean {
+  f >= s.nImports && f - s.nImports < s.bodySize.length
+}
+
+// Run-once code is the defined start function and every function reached only by direct
+// calls from outside any loop of run-once code. A callee is marked when every direct call
+// of it comes from run-once code, one of them inside a loop, and it is not a small
+// loop-free leaf. Ascending function index.
+function runOnceHotCallees(s: ScanState): i32[] {
+  const hot: i32[] = []
+  if !isDefined(s, s.start) { return hot }
+  const n = s.nImports + s.bodySize.length
+  const once: boolean[] = []
+  const escaped: boolean[] = []
+  const sited: boolean[] = []
+  while once.length < n {
+    once.push(false)
+    escaped.push(false)
+    sited.push(false)
+  }
+  once[s.start] = true
+  let e = 0
+  while e < s.escapes.length {
+    const f = s.escapes[e]
+    if f >= 0 && f < n { escaped[f] = true }
+    e = e + 1
+  }
+  let k = 0
+  while k < s.siteCallee.length {
+    const f = s.siteCallee[k]
+    if f >= 0 && f < n { sited[f] = true }
+    k = k + 1
+  }
+  // A fixpoint, since membership only grows.
+  let changed = true
+  while changed {
+    changed = false
+    const blocked = siteBlocked(s, once, n, true)
+    let f = s.nImports
+    while f < n {
+      if sited[f] && !once[f] && !escaped[f] && !blocked[f] {
+        once[f] = true
+        changed = true
+      }
+      f = f + 1
+    }
+  }
+  const outside = siteBlocked(s, once, n, false)
+  const looped: boolean[] = []
+  while looped.length < n { looped.push(false) }
+  k = 0
+  while k < s.siteCallee.length {
+    const f = s.siteCallee[k]
+    if f >= 0 && f < n && s.siteInLoop[k] { looped[f] = true }
+    k = k + 1
+  }
+  let f = s.nImports
+  while f < n {
+    const b = f - s.nImports
+    const big = s.bodyLoop[b]
+      || s.bodyCalls[b]
+      || s.bodySize[b] > RUN_ONCE_INLINE_LEAF_BYTES
+    if sited[f] && looped[f] && !outside[f] && big { hot.push(f) }
+    f = f + 1
+  }
+  hot
+}
+
+// Per function, whether some direct call of it comes from a caller outside `once`, or
+// (when `loopBlocks`) from inside a loop.
+function siteBlocked(
+  s: ScanState,
+  once: boolean[],
+  n: i32,
+  loopBlocks: boolean,
+): boolean[] {
+  const blocked: boolean[] = []
+  while blocked.length < n { blocked.push(false) }
+  let k = 0
+  while k < s.siteCallee.length {
+    const f = s.siteCallee[k]
+    const caller = s.siteCaller[k]
+    if f >= 0 && f < n && caller >= 0 && caller < n {
+      if !once[caller] || loopBlocks && s.siteInLoop[k] { blocked[f] = true }
+    }
+    k = k + 1
+  }
+  blocked
+}
