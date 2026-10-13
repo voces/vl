@@ -19,6 +19,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  NumLit,
   ObjLit,
   OptMember,
   P,
@@ -71,11 +72,17 @@ import {
 let ffMode = 0
 let ffWork = 0
 const FF_NAIVE_CAP = 400000
+// The most instance contexts one generic function's calls mint.
+const FF_CTX_PER_FN = 64
 
 // ── the classes: union-find over slots, each root holding its class's facts ─────────────────
 let ffKeyIx: {[string]: i32} = Map()
 // Reads the walk resolved to a local binding, by node: the sweep checks none now names a function.
 let ffLocalRead: {[i32]: i32} = Map()
+// Per declaration: the binding its initializer reads (-2 for a capture cell, which exists because
+// its binding is written), and whether an `=` writes it.
+let ffDeclFrom: {[i32]: i32} = Map()
+let ffDeclWr: {[i32]: boolean} = Map()
 let ufPar: i32[] = []
 let ufSrc: i32[][] = []
 let ufPin: i32[][] = []
@@ -94,6 +101,8 @@ let pinName: string[][] = []
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
 // binds nothing (module code, a concrete function); 1 is a generic's template walk.
 let ctxKeyIx: {[string]: i32} = Map()
+// Contexts minted per generic function, bounded by `FF_CTX_PER_FN`.
+let ctxPerFn: {[i32]: i32} = Map()
 let ctxBN: string[][] = []
 let ctxBT: i32[][] = []
 let ffCtx = 0
@@ -132,6 +141,8 @@ export function fnFlowShadowBegin() {
   ffWork = 0
   ffKeyIx = Map()
   ffLocalRead = Map()
+  ffDeclFrom = Map()
+  ffDeclWr = Map()
   ufPar = []
   ufSrc = []
   ufPin = []
@@ -144,6 +155,7 @@ export function fnFlowShadowBegin() {
   pinTys = []
   pinName = []
   ctxKeyIx = Map()
+  ctxPerFn = Map()
   ctxBN = []
   ctxBT = []
   declCtx = Map()
@@ -541,7 +553,10 @@ function ffStmt(ix: i32) {
     const s = ffSlot(ffDeclKey(ix, ffCtx))
     ffAddDecl(s, ix)
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
-    if n.letInit >= 0 { ffUnion(s, ffFlow(n.letInit, "binding")) }
+    if n.letInit >= 0 {
+      ffDeclFrom[ix] = ffInitBinding(n.letInit)
+      ffUnion(s, ffFlow(n.letInit, "binding"))
+    }
     return 0
   }
   if n is RetStmt {
@@ -578,6 +593,37 @@ function ffStmt(ix: i32) {
   }
   ffFlow(ix, "statement")
   0
+}
+
+// The binding initializer `ix` reads by name, -2 for a capture cell or a read through one, -1
+// for any other value.
+function ffInitBinding(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if n is Ident {
+    const d = identDeclOf(ix)
+    if d < 0 || d >= P.nodes.length || P.nodes[d] is FuncDecl { return -1 }
+    return d
+  }
+  if ffIsCellValue(ix) { return -2 }
+  -1
+}
+
+// Whether `ix` is the rewrite's capture cell `[v]`, which carries no source position, or a read
+// `c[0]` through one.
+function ffIsCellValue(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is ArrayLit { return n.pos < 0 && n.arrElems.length == 1 }
+  ffIsCellRead(ix)
+}
+
+// Whether `ix` is a read `c[0]` of a name.
+function ffIsCellRead(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Index {
+    const k = P.nodes[n.idxIndex]
+    if P.nodes[n.idxArr] is Ident && k is NumLit { return k.numText == "0" }
+  }
+  false
 }
 
 function ffKids(ix: i32): i32 {
@@ -625,8 +671,9 @@ function ffPlace(ix: i32): i32 {
   const n = P.nodes[u]
   if n is Ident {
     const d = identDeclOf(u)
-    if d >= 0 { return ffDeclSlot(d) }
-    return -1
+    if d < 0 { return -1 }
+    ffDeclWr[d] = true
+    return ffDeclSlot(d)
   }
   if n is Index {
     ffFlow(n.idxIndex, "index")
@@ -928,7 +975,16 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
         if ffMode == 3 {
           key = key + "/" + i32ToStr(ffCtx) + "/" + i32ToStr(ix)
         }
-        ctx = ffCtxOf(key, bN, bT)
+        // A generic that calls itself at a larger type mints a new context per call (D2721):
+        // past the cap, its calls share the template's walk, which answers no pin.
+        const known = (ctxKeyIx[key] ?? -1) >= 0
+        const minted = ctxPerFn[fn] ?? 0
+        if known || minted < FF_CTX_PER_FN {
+          if !known { ctxPerFn[fn] = minted + 1 }
+          ctx = ffCtxOf(key, bN, bT)
+        } else {
+          ctx = 1
+        }
         ffRecord(callee, 2, -1, "direct call", fn, ctx)
       }
       ffEnsureWalked(fn, ctx)
@@ -1049,6 +1105,54 @@ export function fnFlowLamPin(lam: i32): i32[] {
   }
   if pick < 0 || !peered { return none }
   pinTys[pick]
+}
+
+// Whether the binding read `at`, or one its initializer chain copies, may hold a value other than
+// its initializer's: an `=` writes it, or it is a capture cell. True without a built table, the
+// safe answer.
+export function fnFlowReadWritten(at: i32): boolean {
+  if !ffBuilt { return true }
+  let d = ffOrigDecl(identDeclOf(at))
+  let hops = 0
+  while d >= 0 && hops < 64 {
+    if ffDeclWr[d] ?? false { return true }
+    const f = ffDeclFrom[d] ?? -1
+    if f == -2 { return true }
+    d = ffOrigDecl(f)
+    hops = hops + 1
+  }
+  hops >= 64
+}
+
+// The named generic function the read `at` names through a chain of un-annotated aliases none of
+// which an `=` writes (`const k = inner; const j = k`), as its declaration; -1 for any other read.
+export function fnFlowReadGenFn(at: i32): i32 {
+  if !ffBuilt { return -1 }
+  let d = ffOrigDecl(identDeclOf(at))
+  let hops = 0
+  while d >= 0 && d < P.nodes.length && hops < 64 {
+    const n = P.nodes[d]
+    if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return -1 }
+    if n.letKw != "const" && (ffDeclWr[d] ?? false) { return -1 }
+    if !(P.nodes[n.letInit] is Ident) { return -1 }
+    const nd = identDeclOf(n.letInit)
+    if nd < 0 || nd >= P.nodes.length { return -1 }
+    if P.nodes[nd] is FuncDecl {
+      if !monoIsGenericDecl(nd) { return -1 }
+      return nd
+    }
+    d = ffOrigDecl(nd)
+    hops = hops + 1
+  }
+  -1
+}
+
+// The pre-mono declaration minted declaration `d` stands for, else `d`.
+function ffOrigDecl(d: i32): i32 {
+  if d < 0 { return -1 }
+  const o = declOrigOf(d)
+  if o >= 0 { return o }
+  d
 }
 
 function ffBuild(stmts: i32[]) {

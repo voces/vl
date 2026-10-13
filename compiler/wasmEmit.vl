@@ -9090,11 +9090,18 @@ function arrLitHoldsNulStr(elems: i32[], fnIx: i32): boolean {
   false
 }
 
-// Lower an array literal `[e, e, ...]` onto `body` as a growable list value: push each element
-// value in source order, `array.new_fixed $aTypeIdx <count>` for the raw backing, then `count`
-// twice for len and cap and `struct.new $lTypeIdx` to wrap them into `{ backing, len, cap }`. An
-// empty `[]` shares its type's empty backing (`fbBacking`) with len and cap 0.
+// Lower an array literal `[e, e, ...]` onto `body` as a growable list value: the elements in
+// source order, `array.new_fixed` for the backing, then `count` twice for len and cap and
+// `struct.new` for the wrapper; an empty `[]` shares its type's empty backing. The caller's
+// context is restored on every exit.
 function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
+  const saved = expCtxHere()
+  expCtxLeave(saved, emitArrUnder(body, arrIx, fnIx))
+}
+
+// `emitArr`'s body: it applies each arm's element context and leaves it for the wrapper's
+// exit to undo.
+function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     const elems = a.arrElems
@@ -9112,12 +9119,11 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
     if elems.length == 0 && pendingListKind == LBK_I32_LIST {
       const hbk = emptyArrHoleBuildKind(arrIx)
       if hbk != LBK_I32_LIST {
-        pendingListKind = hbk
-        pendingListSlot = emptyArrHoleBuildSlot(arrIx)
-        const hrc = emitArr(body, arrIx, fnIx)
-        pendingListKind = LBK_I32_LIST
-        pendingListSlot = 0
-        return hrc
+        const hc = expCtxHere()
+        hc.listKind = hbk
+        hc.listSlot = emptyArrHoleBuildSlot(arrIx)
+        expCtxApply(hc)
+        return emitArrUnder(body, arrIx, fnIx)
       }
     }
     // Which (backing, wrapper) pair the literal builds — `pendingListKind` 1/2 a ref backing, 3 a
@@ -9422,10 +9428,11 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       }
       // A `(string | null)[]` literal shares the string backing, but a `null` element lowers as
       // `ref.null $sTypeIdx` (a real string element rides its `array.new_fixed` string untouched) —
-      // seed `pendingNulString` for the element emits (the string niche analogue of `pendingNulBool`).
-      const savedArrNS = pendingNulString
+      // seed `nulString` for the element emits (the string niche analogue of `nulBool`).
       if nodeArrayElemIsNulStr(arrIx) || arrLitHoldsNulStr(elems, fnIx) {
-        pendingNulString = true
+        const nsc = expCtxHere()
+        nsc.nulString = true
+        expCtxApply(nsc)
       }
       let i = 0
       while i < elems.length {
@@ -9450,7 +9457,6 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           )
         }
       }
-      pendingNulString = savedArrNS
       if dstStr >= 0 {
         fbLocalGet(dstStr)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built string-ref backing
@@ -9540,6 +9546,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       // its inner ref-list slot, seeded so each element builds as that inner list (recursively).
       let nestInnerSlot = -1
       if elemNest == RLK_REF_LIST { nestInnerSlot = rlElemInnerSlot(rslot) }
+      const rc = expCtxHere()
+      rc.structIdx = elemStructIdx
+      rc.variantIdx = elemVariantIdx
       while i < elems.length {
         // A non-nested-list element list must not hold array elements. Kinds 4/6/7/8 (scalar
         // inner lists) and 9 (ref inner list) legitimately do — and so does a union-box element
@@ -9559,21 +9568,19 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
             return emitFail("emitProgram: nested arrays are not supported")
           }
         }
-        pendingStructIdx = elemStructIdx
-        pendingVariantIdx = elemVariantIdx
+        expCtxApply(rc)
         if elemUnionNm != "" {
           // Box the element into the shared union box — a concrete variant element widens via
           // `emitUnionBoxArg`, like a call argument or return. The outer literal's list threading
           // is cleared around the box: a list-arm element re-enters `emitArr` inside the coerce,
           // and the stale outer kind would force it back onto this slot's ref build.
-          const savedElemK = pendingListKind
-          const savedElemS = pendingListSlot
-          pendingListKind = LBK_I32_LIST
-          pendingListSlot = 0
-          const ubRc = emitUnionBoxArg(body, elemUnionNm, elems[i], fnIx)
-          pendingListKind = savedElemK
-          pendingListSlot = savedElemS
-          if ubRc < 0 { return -1 }
+          const ubc = expCtxHere()
+          ubc.listKind = LBK_I32_LIST
+          ubc.listSlot = 0
+          expCtxApply(ubc)
+          if emitUnionBoxArg(body, elemUnionNm, elems[i], fnIx) < 0 {
+            return -1
+          }
         } else {
           // Reset the `listKind`/`listSlot` context to the INNER list's kind so the element
           // builds the right list, NOT the outer ref-list kind it would inherit. Scalar inner
@@ -9632,7 +9639,6 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           // `(readonly Shape[])[]`.
           emitNestedListWidenSite(body, elems[i], fnIx, rslot)
         }
-        pendingVariantIdx = -1
         i = i + 1
         if dstRef >= 0 {
           coffRef = arrLitChunkFlushAt(
@@ -9645,7 +9651,6 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           )
         }
       }
-      pendingStructIdx = -1
       if dstRef >= 0 {
         fbLocalGet(dstRef)
         wU8(212) // 0xd4 ref.as_non_null — the chunk-built ref backing
@@ -9665,35 +9670,26 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
     // `null` as the sentinel 2, and `(K|null)[]` both. The element type comes from the checker's
     // recorded type; the `pendingListKind == 8` and `== 9` legs catch an all-`null` `[null]`.
     const litArr = nodeArrayElemIsLitUnion(arrIx)
-    const savedArrLU = pendingLitUnion
-    if litArr { pendingLitUnion = 1 }
-    const nbArr = nodeArrayElemIsNulBool(arrIx)
-      || pendingListKind == LBK_NUL_BOOL_LIST
-    const savedArrNB = pendingNulBool
-    if nbArr { pendingNulBool = true }
-    const nlluArr = (nodeArrayElemIsNulLitUnion(arrIx)
-      && pendingListKind != LBK_UNION)
-      || pendingListKind == LBK_NUL_LIT_UNION_LIST
-    const savedArrNLLU = pendingNulLitUnion
-    if nlluArr {
-      pendingNulLitUnion = true
-      pendingLitUnion = 1
+    const ic = expCtxHere()
+    if litArr { ic.litUnion = 1 }
+    if nodeArrayElemIsNulBool(arrIx) || ic.listKind == LBK_NUL_BOOL_LIST {
+      ic.nulBool = true
     }
+    if (
+      (nodeArrayElemIsNulLitUnion(arrIx) && ic.listKind != LBK_UNION)
+      || ic.listKind == LBK_NUL_LIT_UNION_LIST
+    ) {
+      ic.nulLitUnion = true
+      ic.litUnion = 1
+    }
+    expCtxApply(ic)
     const hI32 = forLitHoist(arrIx, elems, fnIx, ALD_I32, aTypeIdx, lTypeIdx)
-    if hI32 != 0 {
-      pendingLitUnion = savedArrLU
-      pendingNulBool = savedArrNB
-      pendingNulLitUnion = savedArrNLLU
-      return if hI32 < 0 { -1 } else { 0 }
-    }
+    if hI32 != 0 { return if hI32 < 0 { -1 } else { 0 } }
     let dstI32 = -1
     let coffI32 = 0
     if elems.length > NEW_FIXED_MAX {
       const dI32 = arrLitDataBuild(body, elems, fnIx, ALD_I32, aTypeIdx)
       if dI32 != 0 {
-        pendingLitUnion = savedArrLU
-        pendingNulBool = savedArrNB
-        pendingNulLitUnion = savedArrNLLU
         if dI32 < 0 { return -1 }
         return arrLitWrap(elems.length, lTypeIdx)
       }
@@ -9740,9 +9736,6 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         coffI32 = arrLitChunkFlush(dstI32, aTypeIdx, coffI32, i, elems.length)
       }
     }
-    pendingLitUnion = savedArrLU
-    pendingNulBool = savedArrNB
-    pendingNulLitUnion = savedArrNLLU
     if dstI32 >= 0 {
       fbLocalGet(dstI32)
       wU8(212) // 0xd4 ref.as_non_null — the chunk-built raw backing
@@ -20878,7 +20871,15 @@ function emitNonNullParamRecover(pk: VKind | null, argIx: i32, fnIx: i32) {
   0
 }
 
+// The call of a function value. The caller's context is restored on every exit.
 function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
+  const saved = expCtxHere()
+  expCtxLeave(saved, emitCallRefUnder(body, callIx, fnIx))
+}
+
+// `emitCallRef`'s body: each argument applies its parameter's context and leaves it for the
+// wrapper's exit to undo.
+function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
     const liftFe = cloLiftCalleeOf(c.callFn, fnIx)
@@ -20930,21 +20931,14 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
     // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
     const args = c.callArgs
     // each argument's valtype is decided by its parameter, so an enclosing wide-scalar
-    // context must not leak into it (cleared here, restored after, mirroring the index-
-    // receiver discipline) — else a bare i32 literal argument under an outer f32/atom
+    // context must not leak into it — else a bare i32 literal argument under an outer f32/atom
     // context lowers at the wrong valtype for the `call_ref` functype: invalid wasm.
-    const savedArgF32 = pendingF32
-    const savedArgF64 = pendingF64
-    const savedArgI64 = pendingI64
-    const savedArgLU = pendingLitUnion
-    const savedArgNulLU = pendingNulLitUnion
-    const savedArgNS = pendingNulString
-    const savedArgRaw = pendingRawNullRead
-    pendingF32 = false
-    pendingF64 = false
-    pendingLitUnion = 0
-    pendingNulLitUnion = false
-    pendingI64 = false
+    const argBase = expCtxHere()
+    argBase.wantF32 = false
+    argBase.wantF64 = false
+    argBase.litUnion = 0
+    argBase.nulLitUnion = false
+    argBase.wantI64 = false
     let i = 0
     while i < args.length {
       // D940 — the struct row the functype declares, seeded exactly as the direct call
@@ -20952,10 +20946,13 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
       // its own row by field set, the pre-merge row wherever the callee's parameter row
       // moved. The seed is the key's, so it agrees with the functype by construction.
       const pkk = sigParamKindAt(ckey, i)
-      seedValueArgShape(pkk, sigParamSlotAt(ckey, i))
+      expCtxApply(argBase)
+      const ac = expCtxHere()
+      expCtxSeedValueArg(ac, pkk, sigParamSlotAt(ckey, i))
       // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
-      pendingNulString = pkk == "nulstr"
-      pendingRawNullRead = false
+      ac.nulString = pkk == "nulstr"
+      ac.rawNullRead = false
+      expCtxApply(ac)
       const pck = sigParamCoerceKind(ckey, i)
       if pck == "i64" {
         if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
@@ -21019,7 +21016,6 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           const cvCtx = expCtxHere()
           cvCtx.variantIdx = cvSlot
           if emitExprExpect(body, args[i], fnIx, cvCtx) < 0 { return -1 }
-          pendingVariantIdx = -1
           if exprUnion(args[i], fnIx) {
             if variantHasCrossTagFits(cvSlot, args[i]) {
               return emitFailCrossTagDelivery(args[i], cvSlot)
@@ -21042,7 +21038,6 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           const cnvArg = P.nodes[unwrapParen(args[i])]
           if cnvArg is NullLit { cnvCtx.nulRefHeap = uVarHeap[cnvSlot] }
           if emitExprExpect(body, args[i], fnIx, cnvCtx) < 0 { return -1 }
-          pendingVariantIdx = -1
           if narrowedArmNeedsUnbox(args[i], fnIx) {
             emitNarrowedArmUnboxTo(
               armDestHeapOf("nulvariant", cnvSlot),
@@ -21101,15 +21096,6 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
       }
       i = i + 1
     }
-    pendingF32 = savedArgF32
-    pendingF64 = savedArgF64
-    pendingI64 = savedArgI64
-    pendingLitUnion = savedArgLU
-    pendingNulLitUnion = savedArgNulLU
-    pendingNulString = savedArgNS
-    pendingRawNullRead = savedArgRaw
-    // Left neutral, as the direct call leaves them.
-    seedValueArgShape(null, -1)
     callRefDepth = crDepth
     // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
     // the concrete `$fnsig` (the engine signature-checks the callee against it).
@@ -28941,26 +28927,34 @@ export function expCtxHere(): ExpCtx {
 // Seeds the container shape a value call's argument builds from its parameter's `$fnsig`
 // kind and slot, replacing the enclosing position's: a list literal argument of a closure
 // called into a `Clip[]` field is the parameter's `i32[]`, not the field's list (D3605).
-function seedValueArgShape(pk: VKind | null, slot: i32) {
-  pendingStructIdx = -1
-  pendingListKind = listBuildKindOfVKind(pk, slot)
-  pendingListSlot = 0
-  pendingMapSlot = -1
-  pendingI64 = false
+function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null, slot: i32) {
+  c.structIdx = -1
+  c.listKind = listBuildKindOfVKind(pk, slot)
+  c.listSlot = 0
+  c.mapSlot = -1
+  c.wantI64 = false
   match pk {
     "struct" | "nulstruct" => {
-      pendingStructIdx = slot
+      c.structIdx = slot
     }
     "reflist" => {
-      if slot >= 0 { pendingListSlot = slot }
+      if slot >= 0 { c.listSlot = slot }
     }
     "map" => {
-      pendingMapSlot = slot
+      c.mapSlot = slot
     }
     "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "nulreflist" | "i32" | "str" | "union" | "variant" | "nulvariant" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
       // No other kind carries a container slot a literal argument builds at.
     }
   }
+  0
+}
+
+// `expCtxSeedValueArg` over the ambient seeds.
+function seedValueArgShape(pk: VKind | null, slot: i32) {
+  const c = expCtxHere()
+  expCtxSeedValueArg(c, pk, slot)
+  expCtxApply(c)
   0
 }
 
