@@ -250,7 +250,7 @@ run "survey measurements"      bash scripts/survey-profile.sh
 run "capability probes"        bash -c "\"$PY\" scripts/capability-probes/run.py --live-sites --compiler \"$SEED\" && \"$PY\" scripts/capability-probes/run.py --floor --compiler \"$SEED\""
 run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
-run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
+run "distilled corpus"         "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
 # is SUPPOSED to disagree with it — that disagreement is the change being measured — so this
@@ -259,9 +259,9 @@ run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py b
 # reads the baseline, under-reported `runs` by six until an agent noticed while diffing its
 # own corpus run.
 if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
-  # Its own --json: the `distilled corpus` row runs regress.py concurrently, and two runs
+  # Its own --json: the `distilled corpus` row runs regress.vl concurrently, and two runs
   # writing the default `.last.json` read each other's truncated files.
-  run "baseline freshness"     "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh --json "$LOGS/fresh.json"
+  run "baseline freshness"     "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm --verify-fresh --json "$LOGS/fresh.json"
 fi
 
 FAIL=0

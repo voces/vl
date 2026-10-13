@@ -131,7 +131,7 @@ order, subject to the one-writer rule.
 | --- | --- | --- |
 | T1 | **Done.** The host process ABI: `std:process` (`runProgram`, `exit`) and `std:env` (`getEnv`) shipped with their host imports; see ROADMAP's "Host ABI for VL scripts". | — |
 | T2 | L11 the VL way: the per-file budgets move into `vl lint` itself (a baseline-reading budget mode), so the ratchets need neither Python nor spawn. The twin Python censuses retire as each rule's budget moves. | none |
-| T3 | **In progress.** `check-filed-witnesses.vl` is ported and runs the gate row (the Python stays for `scripts/inventory/rows.py`, which imports it). Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
+| T3 | **In progress.** `check-filed-witnesses.vl` and `distilled/regress.vl` (with `gradecensus.py`'s grading) are ported and run their gate rows; the Pythons stay, because `scripts/inventory/rows.py` imports the first and other census tools import `cellmap`, `index` and `gradecensus`. Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
 | T4 | L10: the `-O` optimizer | owner decision 3 below |
 | T5 | L12: the remaining LSP features | A7 |
 
