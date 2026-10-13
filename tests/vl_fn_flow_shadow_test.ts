@@ -3,8 +3,9 @@
 //
 // Armed, the table is built from the checked tree before `monomorphize` and graded against
 // every function value the monomorphizer decided; its verdicts are `flow | …` rows in the
-// per-call shadow's bank. Nothing reads them to decide anything, so the emitted module must be
-// the same armed and disarmed.
+// per-call shadow's bank. Nothing reads those rows to decide anything (the table itself pins a
+// hole lambda that shares a class with a peer, armed or not), so the emitted module must be the
+// same armed and disarmed.
 //
 //   classes  — witnesses whose function values land in each verdict, with exact counts: an
 //              agreement, a multi-pin class against mono's own refusal, an undecided

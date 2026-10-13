@@ -57,6 +57,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  aliasNameOfTyIx,
   annUnionAtomsOf,
   anyLitUnionUsed,
   asgKeepsNarrowOf,
@@ -7763,15 +7764,51 @@ function mvValLowersTy(ty: i32): i32 {
   0
 }
 
-// The recorded-type twin of `mapValKindLowerable`. The name rung renders the value and
-// classifies the render, so this asks the arena first and falls through to the render only
-// for a value kind `mvValLowersTy` declines. False for a type that is not a map at all.
+// The recorded-type twin of `mapValKindLowerable`, asked of the arena: `mvValLowersTy`, then
+// the residue it declines. False for a type that is not a map at all.
 function mapTyValKindLowerable(mty: i32) {
   if mty < 0 { return false }
   const mt = T.tys[mty]
   if !(mt is TyMap) { return false }
   if mvValLowersTy(mt.mVal) == 1 { return true }
-  mvValKindOfName(tyToEmitName(mt.mVal)) != MVK_UNSUPPORTED
+  mvValResidualOk(mt.mVal)
+}
+
+// The map values `mvValLowersTy` declines that still lower: a record with a struct or arm row, and a
+// value carrying `null` beside members the vals list can store — a one-member niche, or a box.
+function mvValResidualOk(v: i32): boolean {
+  if v < 0 || v >= T.tys.length { return false }
+  if T.tys[v] is TyObj {
+    return joinRowOfTy(v) >= 0 || variantRowOfOwnRenderTy(v) >= 0
+  }
+  const ms: i32[] = []
+  if !jrFlatMembers(v, ms) { return false }
+  if ms.length == 1 {
+    const m = ms[0]
+    const mt = T.tys[m]
+    // Exhaustive over `Ty` and `_`-less: the one member beside `null` the niche stores.
+    match mt {
+      TyFunc => {
+        return !tyIsLitUnion(mt.fnRet)
+      }
+      TyMap | TyArray => {
+        return true
+      }
+      TyObj => {
+        if joinRowOfTy(m) >= 0 { return true }
+      }
+      TyPrim | TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg => {
+        // No niche of its own; the atom rule below answers.
+      }
+    }
+  }
+  let refMember = false
+  for m in ms {
+    const k = valueAtomKindOfTy(m)
+    if k < 0 || (k >= 7 && k != 14) { refMember = true }
+  }
+  // A ref member boxes only beside a second non-null member; scalar members always box.
+  !refMember || ms.length >= 2
 }
 
 // `mapTyValKindLowerable` asked of a node's recorded type.
@@ -16934,11 +16971,29 @@ function jrFieldFits(
   fj: i32,
   lenient: i32,
 ): boolean {
-  const code = sFieldTypeAt(si, fj)
-  const elem = sFieldElemNameAt(si, fj)
+  jrFieldFitsAt(
+    f,
+    want,
+    sFieldTypeAt(si, fj),
+    sFieldElemNameAt(si, fj),
+    sFieldElemTyIxAt(si, fj),
+    lenient,
+  )
+}
+
+// `jrFieldFits` against a field given by its code, element name and element type, so a union
+// arm's field asks the same question as a struct row's.
+function jrFieldFitsAt(
+  f: i32,
+  want: i32,
+  code: i32,
+  elem: string,
+  et: i32,
+  lenient: i32,
+): boolean {
   if want < 0 || code < 0 {
     if code == FC_STRUCT && elem != "" {
-      return jrCanonFits(nonNullTy(f), si, fj)
+      return jrCanonFits(nonNullTy(f), et, elem)
     }
     // A record field is a struct field, or a box's arm on the lenient pass only.
     if code >= 0 && jrIsRecord(f) {
@@ -16972,11 +17027,11 @@ function jrFieldFits(
   if want == FC_I32_LIST {
     return tyIsLitUnionArray(f) == nameIsLitUnionArray(elem)
   }
-  if want == FC_MAP || want == FC_NUL_MAP { return jrMapValFits(f, si, fj) }
-  if want == FC_UNION { return jrBoxFits(f, si, fj) }
+  if want == FC_MAP || want == FC_NUL_MAP { return jrMapValFits(f, elem) }
+  if want == FC_UNION { return jrBoxFits(f, et) }
   if want == FC_REF_LIST || want == FC_NUL_REF_LIST {
     const at = T.tys[nonNullTy(f)]
-    if at is TyArray { return jrCanonFits(at.aElem, si, fj) }
+    if at is TyArray { return jrCanonFits(at.aElem, et, elem) }
   }
   true
 }
@@ -17003,15 +17058,13 @@ function jrRetIsNullable(f: i32): boolean {
   false
 }
 
-// Whether type `a` and row `si`'s field `fj` target are not proven distinct: their canonical
-// identities, the row's read off its element type and then off its element name.
-function jrCanonFits(a: i32, si: i32, fj: i32): boolean {
+// Whether type `a` and a field's target, element type `et` and element name `elem`, are not
+// proven distinct: their canonical identities, read off `et` first and then off `elem`.
+function jrCanonFits(a: i32, et: i32, elem: string): boolean {
   if a < 0 || tyHasTyVar(a) { return true }
   const ka = repCanonId(a)
   if ka < 0 { return true }
-  const et = sFieldElemTyIxAt(si, fj)
   if et >= 0 && !tyHasTyVar(et) { return repCanonId(et) == ka }
-  const elem = sFieldElemNameAt(si, fj)
   if elem == "" { return true }
   let ke = repNameCanonId(elem)
   if ke < 0 { ke = rowCanonIdOfName(elem) }
@@ -17019,10 +17072,9 @@ function jrCanonFits(a: i32, si: i32, fj: i32): boolean {
   ka == ke
 }
 
-// Whether box field `f` and row `si`'s box field `fj` box the same member sequence, which is
-// the box's tag layout; true where the row's is unknown.
-function jrBoxFits(f: i32, si: i32, fj: i32): boolean {
-  const et = sFieldElemTyIxAt(si, fj)
+// Whether box field `f` and a box field of element type `et` box the same member sequence,
+// which is the box's tag layout; true where `et` is unknown.
+function jrBoxFits(f: i32, et: i32): boolean {
   if et < 0 { return true }
   const qs: i32[] = []
   const rs: i32[] = []
@@ -17037,12 +17089,12 @@ function jrBoxFits(f: i32, si: i32, fj: i32): boolean {
   true
 }
 
-// Whether map field `f` and row `si`'s map field `fj` store their values at one rep.
-function jrMapValFits(f: i32, si: i32, fj: i32): boolean {
+// Whether map field `f` and a map field whose element name is `elem` store values at one rep.
+function jrMapValFits(f: i32, elem: string): boolean {
   const mt = T.tys[nonNullTy(f)]
   if !(mt is TyMap) { return true }
   const sa = mvSlotOfValTyK(mt.mVal, mapKeyKindOfTy(mt.mKey))
-  const sb = mvSlotOfMapValNameOrMono(sFieldElemNameAt(si, fj))
+  const sb = mvSlotOfMapValNameOrMono(elem)
   if sa >= 0 && sb >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(sb) }
   true
 }
@@ -19399,7 +19451,7 @@ function pushDiscrimNarrow(
   // `variantIndexOf` compare cannot miss it.
   let dNm = nominalStructNameOfTy(dTy)
   if dNm == "" || variantIndexOf(dNm) < 0 {
-    const dvr = variantIndexOfOwnRender(tyToEmitName(dTy))
+    const dvr = variantRowOfOwnRenderTy(dTy)
     if dvr >= 0 { dNm = uVariants[dvr] }
   }
   if dNm == "" { return false }
@@ -22823,12 +22875,9 @@ function fieldElemDeclConflict(qElemTy: i32, si: i32, fj: i32): boolean {
 // the field-set scan matches two boxes on their code alone. Two boxes are one layout only if
 // their member SEQUENCES are, the tags being positional. Refutation-only, like its sibling.
 function fieldBoxSetConflict(qTy: i32, si: i32, fj: i32): boolean {
-  if qTy < 0 { return false }
-  const qn = tyToEmitName(qTy)
-  if qn == "" { return false }
-  const rn = sFieldElemNameAt(si, fj)
-  if rn == "" { return false }
-  !unionMemberSetsCompat(qn, rn)
+  if !tyEmitNamesOf(qTy) { return false }
+  if sFieldElemNameAt(si, fj) == "" { return false }
+  !jrBoxFits(qTy, sFieldElemTyIxAt(si, fj))
 }
 
 // Does struct row `si` carry a PROVEN element-declaration conflict against the query
@@ -23384,14 +23433,110 @@ function rowCanonIdOfName(name: string): i32 {
 // rendering the arm itself, would produce exactly this string — the container-element question.
 export function variantIndexOfOwnRender(name: string): i32 {
   if !nameIsShapeOpen(name) { return -1 }
+  variantRowOwnRender(name, -1)
+}
+
+// The arm whose own type renders as the record `ty` does — the arm recorded at that record
+// itself, else the first with its fields in its order, each spelled alike; -1 for none.
+function variantRowOfOwnRenderTy(tyIn: i32): i32 {
+  const ty = jrOneRecordOf(tyIn)
+  if ty < 0 { return -1 }
+  variantRowOwnRender("", ty)
+}
+
+// The one arm scan both keys share: the first arm rendering as `name` when it is not "", else
+// the first matching the record `ty`; -1 for none.
+function variantRowOwnRender(name: string, ty: i32): i32 {
   let vi = 0
   while vi < uVariants.length {
     if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
-      if tyToEmitName(uVarTyIx[vi]) == name { return vi }
+      const a = uVarTyIx[vi]
+      if name != "" {
+        if tyToEmitName(a) == name { return vi }
+      } else if a == ty || jrSameFieldSeq(a, ty, 0) {
+        return vi
+      }
     }
     vi = vi + 1
   }
   -1
+}
+
+// The record `ty` renders as: itself, or the first member of a union whose members are all
+// records spelled alike, which the render dedups to one; -1 for anything else.
+function jrOneRecordOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyObj { return ty }
+  if !(t is TyUnion) { return -1 }
+  const ms = t.uMembers
+  if ms.length == 0 { return -1 }
+  const m0 = ms[0]
+  if m0 < 0 || !(T.tys[m0] is TyObj) { return -1 }
+  for m in ms {
+    if m < 0 || !(T.tys[m] is TyObj) { return -1 }
+    if !jrSpelledAlike(m, m0, 0) { return -1 }
+  }
+  m0
+}
+
+// Whether records `a` and `b` have the same fields in the same order, each spelled alike.
+function jrSameFieldSeq(a: i32, b: i32, depth: i32): boolean {
+  if a < 0 || a >= T.tys.length || b < 0 || b >= T.tys.length { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyObj {
+    if tb is TyObj {
+      const na = ta.objFieldNames
+      const nb = tb.objFieldNames
+      if na.length != nb.length { return false }
+      let k = 0
+      while k < na.length {
+        if na[k] != nb[k] { return false }
+        if (
+          !jrSpelledAlike(ta.objFieldTypes[k], tb.objFieldTypes[k], depth + 1)
+        ) {
+          return false
+        }
+        k = k + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// Whether field types `a` and `b` render alike: one literal-union alias, one primitive (a
+// literal spells its base), or the same shape all the way down.
+function jrSpelledAlike(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if depth > 8 || a < 0 || b < 0 { return false }
+  if litUnionAliasNameOfTy(a) != litUnionAliasNameOfTy(b) { return false }
+  const pa = tyEmitPrimOf(a)
+  const pb = tyEmitPrimOf(b)
+  if pa != null || pb != null { return pa == pb }
+  if tySame(a, b) { return true }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  // Exhaustive over `Ty` and `_`-less: only a shape, a list or a nullable spells its parts.
+  match ta {
+    TyObj => {
+      return jrSameFieldSeq(a, b, depth + 1)
+    }
+    TyArray => {
+      const eb = tyArrayElemIx(b)
+      return eb >= 0 && jrSpelledAlike(ta.aElem, eb, depth + 1)
+    }
+    TyNullable => {
+      if tb is TyNullable {
+        return jrSpelledAlike(ta.nInner, tb.nInner, depth + 1)
+      }
+    }
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyMap => {
+      // Spelled alike only as the same type, which `tySame` above already answered.
+    }
+  }
+  false
 }
 
 // The union-VARIANT table index whose field-set matches a `{meow: i32}` SHAPE name (a collapsed
@@ -29268,57 +29413,80 @@ export function armFieldDeferredRowOk(base: string): boolean {
     g = g + 1
   }
   armDeferStack.push(base)
-  const ok = armPlainLayoutShapeOk(armMintShapeName(tyToEmitName(aty)), 0)
+  const seen: i32[] = []
+  const ok = armPlainLayoutTyOk(aty, 0, seen)
   armDeferStack.pop()
   ok
 }
 
-// The arm render's fields, coded, with `variantStructHeapTwinAt`'s own layout guard applied
-// (D1518): a gate narrowed ahead of its lowering buys check-clean invalid wasm instead, so
-// the two must apply the same rule. Stricter than `variantNestedShapeOkTy` on purpose: that
-// predicate answers "will this intern", this one "will the interned row be the arm's".
-function armPlainLayoutShapeOk(nm: string, depth: i32): boolean {
+// The arm record `ty`'s fields, coded, under `variantStructHeapTwinAt`'s own layout guard
+// (D1518), so the gate and the lowering apply one rule. `seen` holds the records the walk is
+// inside; a revisit is where the arm's render stops at a declared name.
+function armPlainLayoutTyOk(ty: i32, depth: i32, seen: i32[]): boolean {
   if depth > 8 { return false }
-  if !nameIsShapeSpanEnds(nm) { return false }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  if fnames.length == 0 { return false }
-  let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] == "" { return false }
-    const c = nameFieldCode(ftexts[fi])
-    // A -1 is not a refusal here, it is the render's own spelling: `tyToEmitName` writes a
-    // declared target structurally, and an inline shape has no code until it is interned.
-    // The variant row codes the same field from the annotation node, where the declared name
-    // is still there, so it is 15 either way — the leaf below is what both sides must agree on.
-    if c < 0 || c == FC_REF_LIST || c == FC_STRUCT || c == FC_NUL_REF_LIST {
-      if !armRefFieldLeafOk(ftexts[fi], depth + 1) { return false }
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return false }
+  const ftys = t.objFieldTypes
+  if ftys.length == 0 { return false }
+  seen.push(ty)
+  let ok = true
+  for f in ftys {
+    if ok {
+      // The arm's row codes an inline literal union as the string slot.
+      let c = FC_STR
+      if !tyIsLitUnion(f) { c = jrWantOf(f) }
+      if c < 0 || c == FC_REF_LIST || c == FC_STRUCT || c == FC_NUL_REF_LIST {
+        if !armRefLeafTyOk(f, depth + 1, seen) { ok = false }
+      }
     }
-    fi = fi + 1
   }
-  true
+  seen.pop()
+  ok
 }
 
-// The referenced layer, one phase before the struct table exists (D1579) — the mirror of
-// the descent `variantStructHeapTwinAt` makes into a 15/5/28 field. The variant row banks
-// the declared name while the arm's minted anon row banks the structural render; an arm
-// answers through the same deferred predicate, whose `armDeferStack` bounds re-entry.
-function armRefFieldLeafOk(txt: string, depth: i32): boolean {
+// The referenced layer of a 15/5/28 field `f`, one phase before the struct table exists
+// (D1579): through a one-member nullable or an array to a record, or to a revisit, which
+// `armRefLeafNameOk` decides by the declared name.
+function armRefLeafTyOk(f: i32, depth: i32, seen: i32[]): boolean {
   if depth > 8 { return false }
-  if txt == "" { return false }
-  const base = nonNulBaseOf(txt)
-  if base != txt { return armRefFieldLeafOk(base, depth + 1) }
-  if nameIsArray(txt) {
-    return armRefFieldLeafOk(arrElemNameRaw(txt), depth + 1)
+  if f < 0 || f >= T.tys.length { return false }
+  for s in seen {
+    if s == f { return armRefLeafNameOk(aliasNameOfTyIx(f)) }
   }
-  // A declared struct name surviving in a structural render is `tyToEmitName`'s recursion
-  // stop: every other declared target renders structurally, so a name here means the walk
-  // closed a cycle, and the anon row minted from that render does not twin the declared
-  // row — the residue this leaves open (D1579).
-  if nameIsStructDecl(txt) { return false }
-  if nameIsShapeSpanEnds(txt) { return armPlainLayoutShapeOk(txt, depth + 1) }
-  armFieldDeferredRowOk(txt)
+  const ms: i32[] = []
+  if jrFlatMembers(f, ms) {
+    if ms.length != 1 { return false }
+    seen.push(f)
+    const r = armRefLeafTyOk(ms[0], depth + 1, seen)
+    seen.pop()
+    return r
+  }
+  const t = T.tys[f]
+  // Exhaustive over `Ty` and `_`-less: past the nullable peel, only a list or a record leads on.
+  match t {
+    TyArray => {
+      seen.push(f)
+      const r = armRefLeafTyOk(t.aElem, depth + 1, seen)
+      seen.pop()
+      return r
+    }
+    TyObj => {
+      return armPlainLayoutTyOk(f, depth + 1, seen)
+    }
+    TyPrim | TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyMap => {
+      // No struct leaf the arm's row could twin.
+    }
+  }
+  false
+}
+
+// A revisited leaf, by its declared name `nm`: a struct closes a cycle whose anon row does
+// not twin the declared one, and an arm answers through its own deferred predicate.
+function armRefLeafNameOk(nm: string): boolean {
+  if nm == "" { return false }
+  if nameIsStructDecl(nm) { return false }
+  armFieldDeferredRowOk(nm)
 }
 
 // Interns the plainly-lowerable inline shapes buried in the params or result of a
