@@ -154,7 +154,7 @@ Byte-identical until step 5; steps 1-2 are this PR.
 | 3 | mint `canonUnionKey` in canon; push `unKey` at all three registry mint sites; **no reader** | none | `unKey` coverage %, and a sweep asserting no two rows with different member SETS share a key | **SHIPPED — 100% covered, 0 different-set merges** |
 | 4a | the ARENA-side member-sequence renderer, so `canonUnionKeyOfTy` reaches the row's key | none | agreement per row against `unKey`, every miss categorised | **SHIPPED — 1,369 → 2,422 of 2,447 (55.9% → 98.98%)** |
 | 4b | thread the key into `registerInlineUnion`'s recursive sites, and separate the counter's `differ` from a key-EQUAL sibling | `emit_collect.vl` | per-site liveness + disagreement | **SHIPPED — 18 sites, 16 at `differ` 0 / `name-only` 0; `differ` 1,587 → 88** |
-| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, **both halves of the ABI assertion** | blocked on `merge-diffvar` reaching 0 (D1492) |
+| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, **both halves of the ABI assertion** | prerequisite (1) MET 2026-10-13 — `merge-diffvar` 1 → 0 (D1492 closed); blocked on (2) the write-seam `differ` (230 on 5,209 programs) and (3) the `name-only` rule (2,226) — §5 "Re-measured 2026-10-13" |
 | 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — | |
 
 ### What steps 1-3 landed, measured
@@ -377,8 +377,8 @@ over its VARIANT SLICE, so `keySweep/merge-diffvar` is the other half, and neith
 licence:
 
 * `type AS = (Sc | Dg)` beside the inline `Sc | Dg` — same key, same set string, slices
-  `[Sc, Dg]` and `[]`. `merge-diffset` **0**, `merge-diffvar` **1**, on master today (D1492).
-  This is what step 5 is blocked on.
+  `[Sc, Dg]` and `[]`. `merge-diffset` **0**, `merge-diffvar` **1**, on master until
+  2026-10-13 (D1492, closed — see "Re-measured 2026-10-13" below).
 * a VALUE union owns no variants, so only the set compare can see two ATOM sets fused.
 
 Two candidate re-keyings were measured and **refused**, each with its price:
@@ -391,6 +391,42 @@ Two candidate re-keyings were measured and **refused**, each with its price:
 Re-keying rows while the licence is unmet is the wrong order, so neither ships. The expansion
 the key needs is the DECLARATION's member list with no softening, and neither renderer in the
 tree is that.
+
+### Re-measured 2026-10-13 — prerequisite (1) met, (2) and (3) grew with the corpus
+
+The sweep above re-run at `origin/master` 84a8bf275 (`$VL_REP_SHADOW=1`, a seed built with
+`unABMode = 3`, `vl build` per program). **The corpus is not the 2,790 above**: `tests/cases`
+is 5,209 programs today, so the counts are not comparable to the 4b table row for row, and the
+distilled corpus (10,124 cells, `cells/` + `named/`) is graded beside it as a second population.
+
+| bucket | 4b (2,790 programs) | `tests/cases` (5,209) | distilled (10,124 cells) |
+| --- | --- | --- | --- |
+| `keySweep/merge` | — | 469 (all `merge-diffname`) | 125 (all `merge-diffname`) |
+| `keySweep/merge-diffset` | 0 | 0 | 0 |
+| **`keySweep/merge-diffvar`** | **1** | **1 → 0** | 0 → 0 |
+| agree | 30,279 | 328,953 | 262,555 |
+| **differ** | **88** | **283** | **47** |
+| — at the three write seams (`collectU/inferLetTy`, `nliInferIfLet`, `nliInferOptChainLet`) | 87 | **230** (140 / 79 / 11) | 47 (all `inferLetTy`) |
+| alias | 1,499 | 1,901 | 97 |
+| **name-only** | **992** | **2,226** | **195** |
+| id-only | 47 | 810 | 552 |
+
+**(1) is met.** D1492's `AS` row recorded the expansion's member set but built its variant
+slice from the declaration's ONE member, an inline union with no struct atom of its own, so the
+slice came out empty. `collectU` now points that row at the slice of the first earlier row
+minted under the same key (`unVarSliceAdoptKeySibling`): no `uVariants` entry is pushed, so no
+scalar tag (`uVariants.length + k`) moves. Proof: master's and the candidate's compilers emit
+byte-identical modules with identical exit codes over all 15,333 programs (both populations,
+unarmed and armed at mode 3), the candidate compiling master's source reproduces master's
+fixpoint byte for byte, and `rep-fuzz-check.sh` is exact.
+
+**The `differ` that is NOT at a write seam is no longer 1.** 53 reaches over eleven sites on
+`tests/cases`: `riu/mapVal` 15 (D1493), `regValueUnionTy` 9, `unionNameOfExpr/is` 7,
+`letAnnUnionSlot` 5, `letAnnUnionKind` / `emitLetDeclStmt/union` / `arrLitBoxElem` 4 each,
+`emitReturnValue/inferRet` 2, and one each at `letAnnUnionRetSink`,
+`internShapeDeep/valueUnion` and `fnUnionRetSinkOk`. The 4b claim "one read-seam reach in the
+whole corpus" described the 2,790-program corpus; the switch has to account for these before a
+read seam returns the id answer. (2) and (3) are open and unscheduled.
 
 ## 6. The storage-class ladders
 
@@ -487,6 +523,7 @@ recorded type being a union SHAPE (D1490). Still no reader; arming still rides
 
 **Step 5 needs three things, in this order.** (1) **`merge-diffvar` to reach 0** — one pair,
 D1492, and until it does the switch can hand a caller a row with an empty variant slice.
+**Met 2026-10-13** (§5 "Re-measured 2026-10-13"); (2) and (3) below are re-counted there.
 (2) **A decision for the 87 write-seam `differ`** — `registerValueUnionNameAB`'s probe is
 `unABTyProbe`, a `repCanonId` compare of two TYPES at a mint, which is a different question
 from "which row"; either it becomes a row question or those three sites are a documented
