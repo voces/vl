@@ -649,7 +649,7 @@ set / arms / missing / how it ENDS, and has two sections nothing else has: `--sp
 divided across two functions, and `--pred` for the form below. The numbers in this section were
 hand-derived; re-run the script before quoting them. `compiler/lint.vl`'s
 `kind-ladder-incomplete` / `kind-ladder-split` are the same walk per module, ratcheted by
-`scripts/ladder-budget.py`.
+`vl check --budget scripts/ladder-budget-baseline.json`.
 
 **#2400's `nulvariant` hole is FIXED** (`wasmEmit.vl:6347`, landed `ef30652f`) — and it was in a
 ladder of PREDICATES (`exprVariantIndex` → `exprNullableVariant` → `structIndexOfExpr`), invisible

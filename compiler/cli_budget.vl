@@ -29,6 +29,8 @@ let bgSeen: {[string]: boolean} = Map()
 let bgHitCode: string[] = []
 let bgHitRel: string[] = []
 let bgHitName: string[] = []
+let bgUnnamed = 0 // `--findings` hits whose report carried no `text` to name them by
+let bgFindings = "" // the `--findings` report this run counted, or "" for a walk
 
 // The JSON reader's cursor: the baseline as code points, a position, the first error.
 let bjCps: i32[] = []
@@ -346,15 +348,17 @@ export function budgetNote(
   bgHitName.push(rel + ": " + bgTrim(text))
   0
 }
-// `--findings`: note every finding of a budgeted code in `src`, a `vl check --json`
-// report, inside the baseline's targets. A finding carries no source line there, so its
-// name is empty; only the counts a plain `--budget` verdict reads are exact. Returns an
-// error sentence or "".
-export function budgetNoteJson(src: string): string {
+// `--findings`: note each budgeted finding in `src`, the JSON report read from `path`,
+// inside the baseline's targets. A finding's optional `text` (its source line) names its
+// entry; `budgetUnnamed` counts those without one, whose counts alone are exact.
+// Returns an error sentence or "".
+export function budgetNoteJson(src: string, path: string): string {
+  bgFindings = path
   bjCps = []
   pushCps(bjCps, src)
   bjPos = 0
   bjErr = ""
+  bgUnnamed = 0
   const tops: string[] = []
   for t in bgTargets { tops.push(bgTopSeg(t)) }
   if bjExpect('[') && bjPeek() != ']' {
@@ -363,15 +367,26 @@ export function budgetNoteJson(src: string): string {
       let code = ""
       let line = 0
       let col = 0
+      let text = ""
+      let named = false
       if bjExpect('{') && bjPeek() != '}' {
         while bjErr == "" {
           const key = bjString()
           bjExpect(':')
-          if key == "file" { file = bjString() }
-          else if key == "code" { code = bjString() }
-          else if key == "line" { line = bjInt() }
-          else if key == "col" { col = bjInt() }
-          else { bjSkip() }
+          if key == "file" {
+            file = bjString()
+          } else if key == "code" {
+            code = bjString()
+          } else if key == "line" {
+            line = bjInt()
+          } else if key == "col" {
+            col = bjInt()
+          } else if key == "text" {
+            text = bjString()
+            named = true
+          } else {
+            bjSkip()
+          }
           if bjPeek() != ',' { break }
           bjPos = bjPos + 1
         }
@@ -381,7 +396,10 @@ export function budgetNoteJson(src: string): string {
       for t in tops {
         if t == bgTopSeg(file) { inside = true }
       }
-      if inside && budgetWants(code) { budgetNote(code, file, line, col, "") }
+      if inside && budgetWants(code) {
+        if !named { bgUnnamed = bgUnnamed + 1 }
+        budgetNote(code, file, line, col, text)
+      }
       if bjPeek() != ',' { break }
       bjPos = bjPos + 1
     }
@@ -390,6 +408,8 @@ export function budgetNoteJson(src: string): string {
   bjCps = []
   bjErr
 }
+// How many findings the last `budgetNoteJson` counted with no `text` to name them by.
+export function budgetUnnamed(): i32 { bgUnnamed }
 // The first `/`-separated segment of `path`.
 function bgTopSeg(path: string): string {
   let i = 0
@@ -507,6 +527,7 @@ export function budgetCheckLines(baselinePath: string): string[] {
     out.push(
       "  below baseline — `vl check --budget-why "
         + baselinePath
+        + bgFindingsArg()
         + "` names which entries left",
     )
   }
@@ -643,7 +664,12 @@ function bgTimes(k: i32): string {
 // this lint's own `--write-baseline`.
 function bgRemedy(baselinePath: string): string {
   if bgWriter != "" { return "python3 " + bgWriter + " --write-baseline" }
-  "vl check --budget " + baselinePath + " --write-baseline"
+  "vl check --budget " + baselinePath + bgFindingsArg() + " --write-baseline"
+}
+// ` --findings <report>` when this run counted one, else "".
+function bgFindingsArg(): string {
+  if bgFindings == "" { return "" }
+  " --findings " + bgFindings
 }
 
 // `--exempt-codes`: the budgeted codes the baseline still owes, space-separated — what

@@ -73,11 +73,11 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `comment-shouting` | INTERNAL | `comment-style.md` rule 5; `comment-budget-baseline.json` | not `std/` — **fired on consumer files** | `compiler/` only |
 | `comment-history` | INTERNAL | `comment-style.md` rule 3; `comment-budget-baseline.json` | not `std/` — **fired on consumer files** | `compiler/` only |
 | `arena-scan-outside-pass` | INTERNAL | `profiling-the-compiler.md` §Guards; `scripts/scan-budget-baseline.json` (targets: `compiler`, `std`); names the compiler's pass list `asPasses` | **none** | `compiler/` and `std/` |
-| `kind-ladder-incomplete` | INTERNAL | `docs/internals/kind-ladder-lint.md`; `scripts/ladder-budget.py` (`compiler/` via `ladder-census.py`); closed sets are the compiler's `Node`/`VKind`/… | **none** | `compiler/` only |
+| `kind-ladder-incomplete` | INTERNAL | `docs/internals/kind-ladder-lint.md`; `scripts/ladder-budget-baseline.json` (`vl check --budget`, targets `compiler`); closed sets are the compiler's `Node`/`VKind`/… | **none** | `compiler/` only |
 | `kind-ladder-split` | INTERNAL | as above | **none** | `compiler/` only |
 | `sentinel-index-unguarded` | INTERNAL | `docs/internals/sentinel-index-lint.md`; `scripts/sentinel-budget-baseline.json` (`vl check --budget`, targets `compiler`) | **none** | `compiler/` only |
 | `sentinel-index-strict-untested` | INTERNAL | as above (the `*Strict` naming convention is the compiler's) | **none** | `compiler/` only |
-| `dead-export` | INTERNAL | `scripts/export-budget.py`; not emitted by `vl check` at all — the Python walk is the rule | n/a | n/a (script-only) |
+| `dead-export` | INTERNAL | `scripts/dead-exports.vl`; not emitted by `vl check` at all — the script writes a report that `vl check --budget --findings` counts | n/a | n/a (script-only) |
 | `unused-export` | LANGUAGE | editor workspace pass (`lsp/src/moduleGraph.ts`) | n/a | everywhere |
 | `redundant-export` | LANGUAGE | editor workspace pass | n/a | everywhere |
 | `seed-abi-mismatch` | tooling | editor ↔ seed ABI check (`lsp/src/wasmChecker.ts`); a status notice, not a rule | n/a | n/a |
