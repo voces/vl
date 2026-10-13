@@ -1149,10 +1149,9 @@ function ambTopTarget(name: string): string {
   name
 }
 
-// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
-export function compileSrc(): i32 {
-  plusLinksClear()
-  symSetEnabled(0)
+// Parse-side state every entry that re-parses clears first. `callNever` and the sid-keyed
+// tables are per-parse; a stale row would answer for the previous program's nodes.
+function parseStateReset(): i32 {
   P.toks = []
   P.nodes = []
   sidReset()
@@ -1170,6 +1169,14 @@ export function compileSrc(): i32 {
   callRestPacked = []
   callNever = []
   vcDgReset()
+  0
+}
+
+// The reset prelude of a compile or check entry: the parse state, the emit-stage ABI (so a
+// prior compile's `W`/`emitErr` cannot leak into a check's read-back or diagnostics) and
+// the checker. The caller states the `symSetEnabled` mode and whether `vcEpBank` follows.
+function pipelineReset(): i32 {
+  parseStateReset()
   ropeReset(W)
   emitErr = ""
   fnNames = []
@@ -1178,6 +1185,14 @@ export function compileSrc(): i32 {
   globalStmts = []
   globalNames = []
   initChecker()
+  0
+}
+
+// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
+export function compileSrc(): i32 {
+  plusLinksClear()
+  symSetEnabled(0)
+  pipelineReset()
   // Module mode (H3): a non-empty module table runs the multi-file pipeline
   // (order/validate → parse-merge → rename/rewrite → check/emit). With an EMPTY
   // table (every existing consumer) the single-source path below is untouched.
@@ -1185,6 +1200,7 @@ export function compileSrc(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  // No vcEpBank: only a check's tree is replayed by the lint, and a compile never is.
   ambientRenameSingle(root)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
@@ -1271,40 +1287,13 @@ export function rbyteStore(off: i32, count: i32): i32 {
 export function checkSrc(): i32 {
   plusLinksClear()
   symSetEnabled(0)
-  P.toks = []
-  P.nodes = []
-  sidReset()
-  externReset()
-  getDeclReset()
-  sidKeyedTablesReset()
-  P.diags = []
-  vcDiagMemoReset()
-  P.pos = 0
-  nodeToks = []
-  tsReset()
-  declNameTok = []
-  tplHole = []
-  recDupField = []
-  callRestPacked = []
-  callNever = []
-  vcDgReset()
-  fnNames = []
-  fnIndices = []
-  localNames = []
-  globalStmts = []
-  globalNames = []
-  // `check` never emits, so clear the emit-stage ABI a prior `compileSrc` on
-  // this instance populated: a stale `W` would read back through
-  // `rbyteLen`/`rbyteAt`, and a stale `emitErr` would append a phantom emit
-  // diagnostic to THIS check's `diagCount`/`vcDiags` stream.
-  ropeReset(W)
-  emitErr = ""
-  initChecker()
+  pipelineReset()
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
   if modKeys.length > 0 { return modCompile(0) }
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  // Banked for the lint that pairs with this check; a compile has no lint to serve.
   vcEpBank(vcSource(), root)
   ambientRenameSingle(root)
   csPreMintLocs()
@@ -1568,23 +1557,7 @@ function lintSrcRun(): i32 {
     lint(banked)
     return lintCount()
   }
-  P.toks = []
-  P.nodes = []
-  sidReset()
-  externReset()
-  getDeclReset()
-  sidKeyedTablesReset()
-  P.diags = []
-  vcDiagMemoReset()
-  P.pos = 0
-  nodeToks = []
-  tsReset()
-  declNameTok = []
-  tplHole = []
-  recDupField = []
-  callRestPacked = []
-  callNever = []
-  vcDgReset()
+  parseStateReset()
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   // A lossless-recovered AST is the one the user wrote, so lint's findings over it
@@ -1676,26 +1649,8 @@ function lintGraphRun(): i32 {
   let m = 0
   while m < modKeys.length {
     if modFound[m] != 0 {
-      P.toks = []
-      P.nodes = []
-      // The sharpest edge the carrier has: this loop re-parses each module into a
-      // fresh arena, so index 5 is a different identifier every iteration — without
-      // this reset `sidOfNode(5)` would answer with a different module's name.
-      sidReset()
-      externReset()
-      getDeclReset()
-      sidKeyedTablesReset()
-      P.diags = []
-      vcDiagMemoReset()
-      P.pos = 0
-      nodeToks = []
-      tsReset()
-      declNameTok = []
-      tplHole = []
-      recDupField = []
-      callRestPacked = []
-      callNever = []
-      vcDgReset()
+      // Each module re-parses into a fresh arena, so the reset is per iteration.
+      parseStateReset()
       vcLoadToksMod(m)
       const root = parseProgram()
       // Same rule as `lintSrc`: a clean parse OR an all-lossless recovery.
@@ -1737,23 +1692,7 @@ export function lintGraphMsgAt(i: i32): string { lgMsgs[i] }
 export let vcFmtOut = ""
 export function formatSrc(): i32 {
   symSetEnabled(0)
-  P.toks = []
-  P.nodes = []
-  sidReset()
-  externReset()
-  getDeclReset()
-  sidKeyedTablesReset()
-  P.diags = []
-  vcDiagMemoReset()
-  P.pos = 0
-  nodeToks = []
-  tsReset()
-  declNameTok = []
-  tplHole = []
-  recDupField = []
-  callRestPacked = []
-  callNever = []
-  vcDgReset()
+  parseStateReset()
   const src = vcSource()
   // Lex once, feeding tokens into the parser AND the formatter's comment table
   // (the formatter slices spans from `src` and places comments around them).
@@ -1847,32 +1786,7 @@ export function checkSymDiagsComplete(): i32 { 1 }
 export function checkSrcSym(): i32 {
   plusLinksClear()
   symSetEnabled(1)
-  P.toks = []
-  P.nodes = []
-  sidReset()
-  externReset()
-  getDeclReset()
-  sidKeyedTablesReset()
-  P.diags = []
-  vcDiagMemoReset()
-  P.pos = 0
-  nodeToks = []
-  tsReset()
-  declNameTok = []
-  tplHole = []
-  recDupField = []
-  callRestPacked = []
-  callNever = []
-  vcDgReset()
-  fnNames = []
-  fnIndices = []
-  localNames = []
-  globalStmts = []
-  globalNames = []
-  // Clear the emit-stage ABI — see checkSrc (a symbol-aware check never emits).
-  ropeReset(W)
-  emitErr = ""
-  initChecker()
+  pipelineReset()
   if modKeys.length > 0 {
     const mrc = modCompile(0)
     return mrc
@@ -1880,6 +1794,7 @@ export function checkSrcSym(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  // Banked for the lint that pairs with this check; a compile has no lint to serve.
   vcEpBank(vcSource(), root)
   ambientRenameSingle(root)
   csPreMintLocs()
@@ -2603,23 +2518,7 @@ export function lexScan(): i32 {
 // keystroke and a file that does not check must still outline. A parse error is not a
 // failure: `parseProgram` recovers, and the rows that closed are the answer.
 export function extentScan(): i32 {
-  P.toks = []
-  P.nodes = []
-  sidReset()
-  externReset()
-  getDeclReset()
-  sidKeyedTablesReset()
-  P.diags = []
-  vcDiagMemoReset()
-  P.pos = 0
-  nodeToks = []
-  tsReset()
-  declNameTok = []
-  tplHole = []
-  recDupField = []
-  callRestPacked = []
-  callNever = []
-  vcDgReset()
+  parseStateReset()
   vcLoadToksEntry(vcSource())
   extCollect(parseProgram())
 }
