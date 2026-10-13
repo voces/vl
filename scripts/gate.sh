@@ -65,6 +65,9 @@ NAMES=(); PIDS=(); STARTS=()
 # children's user+sys — the whole row's process tree, which the box cannot inflate.
 # `GATE_MAX_PAR` caps how many rows run at once (unset or 0: all at once), for a box shared
 # with a foreground user. A row's WALL starts when it launches, not while it queues.
+# On Windows the default is 6, where running every row at once loses to contention (README,
+# "Developing on Windows").
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) : "${GATE_MAX_PAR:=6}" ;; esac
 GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
 run() { if [ "$GATE_MAX_PAR" -gt 0 ]; then
           while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done

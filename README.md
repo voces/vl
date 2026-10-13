@@ -232,6 +232,12 @@ Everything above runs natively on Windows, with Git for Windows supplying the sh
 - If a virus scanner excludes a folder, set `VL_TMP` to it: `gate.sh` then puts every row's
   temp files there. A scanner that inspects each process launch and new file otherwise costs
   the gate about 10–15% of its wall time.
+- `gate.sh` runs at most 6 rows at a time on Windows unless `GATE_MAX_PAR` says otherwise.
+  Measured on a 24-thread box, 2026-10-12: every row at once 501 s; 12 at a time 342 s;
+  8, 332 s; 6, 306 s; 4, 333 s.
+- Set `VL_BINARYEN` to a directory of binaryen's native release (the version in
+  `package.json`) and the suites use it instead of npm's JS build. The output is
+  byte-identical, `-O` is about 5x faster, and each call skips node's start-up.
 - `gate.sh`'s CPU column reads 0 here. Git Bash's `times` cannot see a native child's CPU,
   and no gate grades on that column.
 
