@@ -24,7 +24,7 @@ restate measurements; follow the links.
 | item | state | where |
 | --- | --- | --- |
 | L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
-| L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. |
+| L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. Next: `valueAtomKind`'s union fallback and `mvValKindOfTy`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
 | L7 `pending*` into `ExpCtx` | **in progress as C3** | `emitReturnValue` builds its `ExpCtx` and restores the caller's on every exit: 25 `pending*` writes to 0 (`wasmEmit.vl` 463 to 436 lines). Next: `emitLetDeclStmt`. The never-cleared count (211 of 1,151) is not ratcheted yet. |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |

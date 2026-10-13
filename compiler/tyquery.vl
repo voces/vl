@@ -1,9 +1,23 @@
 // `tyquery.vl` — structural one-step queries over the checker's `Ty` arena, written once and
 // imported by every phase that walks a type. Each takes an arena index and answers an arena
 // index (or a boolean); a negative index in is a hole and answers the step's decline.
-// Rendering, parsing and rep decisions do not belong here (code-quality-2026-10.md, L8).
+// Rendering, parsing and rep decisions do not belong here (code-quality-2026-10.md, L8); a
+// twin that answers what a render would spell, without building it, does (L2).
 
-import { T, TyArray, TyMap, TyNullable, TyPrim } from "./typecheck"
+import {
+  PrimName,
+  T,
+  TyArray,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNullable,
+  TyPrim,
+  TyUnion,
+  litBaseTy,
+  litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
+} from "./typecheck"
 
 // The element type of array type `ty`, or -1 when `ty` is not a `TyArray`.
 export function tyStepElem(ty: i32): i32 {
@@ -36,4 +50,66 @@ export function tyIsNullPrim(ty: i32): boolean {
   const t = T.tys[ty]
   if t is TyPrim { return t.primName == "null" }
   false
+}
+
+// The primitive `tyToEmitName(ty)` spells, or null when it spells anything else or nothing: a
+// literal spells its base scalar, and a union spells one only when every member spells the
+// same one. A nullable, a shape, a list, a map or a function never spells a primitive.
+export function tyEmitPrimOf(ty: i32): PrimName | null {
+  if ty < 0 { return null }
+  // The renderer answers a revisited ancestor with an alias name or "", never a primitive.
+  for s in tepSeen {
+    if s == ty { return null }
+  }
+  tepSeen.push(ty)
+  const r = tyEmitPrimGo(ty)
+  tepSeen.pop()
+  r
+}
+
+// The ancestor stack of `tyEmitPrimOf`: the renderer's cycle guard, mirrored.
+const tepSeen: i32[] = []
+
+function tyEmitPrimGo(ty: i32): PrimName | null {
+  const t = T.tys[ty]
+  if t is TyPrim {
+    if t.primName == "never" { return null }
+    return t.primName
+  }
+  if t is TyLit {
+    const bt = T.tys[litBaseTy(t)]
+    if bt is TyPrim { return bt.primName }
+    return null
+  }
+  if !(t is TyUnion) { return null }
+  const ms = t.uMembers
+  if ms.length == 0 { return null }
+  // Two string literals beside a non-null, non-literal member spell their registered alias.
+  const texts: string[] = []
+  let nonLit = false
+  for m in ms {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind == "str" { texts.push(mt.litText) }
+    } else if mt is TyPrim {
+      if mt.primName != "null" { nonLit = true }
+    } else {
+      nonLit = true
+    }
+  }
+  if nonLit && texts.length >= 2 {
+    if litUnionAliasOfLitTexts(texts) != "" { return null }
+  }
+  let out: PrimName | null = null
+  for m in ms {
+    // A member spelled by its alias or in grouping parens is not a primitive.
+    if litUnionAliasNameOfTy(m) != "" { return null }
+    const mt = T.tys[m]
+    if mt is TyFunc { return null }
+    const p = tyEmitPrimOf(m)
+    if p == null { return null }
+    if out == null { out = p }
+    else if out != p { return null }
+  }
+  out
 }
