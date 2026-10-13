@@ -17,13 +17,13 @@ This page is the rest of the family, and the instrument that keeps it graded.
 
 ## The population is derived, not remembered
 
-`python3 scripts/memo-generation-probe.py --list` reads `compiler/*.vl`, finds every
+`vl run scripts/memo-generation-probe.vl` (`--list`) reads `compiler/*.vl`, finds every
 module-level binding whose name carries a generation marker (`Epoch`, `Gen`, `Len`, `Ver`,
 `Seen`, `Root`, `Stamp`, `Head`), finds every guard that compares one, and fails if a stamp
-appears that its `ROWS` table does not classify or a row's anchor has been reworded away. On
+appears that `scripts/memo-generation-rows.json` does not classify or a row's anchor has been reworded away. On
 2026-09-05: **121 stamp variables, 34 read by a guard, 27 rows**; on 2026-10-06 (lane CT):
 **229 stamp variables, 47 read by a guard, 51 rows.**
-`tests/vl_memo_generation_test.ts` runs it on every PR in 0.4 s, so a new memo cannot join the
+`tests/vl_memo_generation_test.ts` runs it on every PR, so a new memo cannot join the
 tree ungraded.
 
 | verdict | rows | what it means |
@@ -173,7 +173,7 @@ above are a reading rather than a shrug.
 
 ## What to do with a new memo
 
-1. Add its stamps to `ROWS` — `--list`, and the test, fail until you do.
+1. Add a line to `scripts/memo-generation-rows.json` (id, stamps, verdict, and a disable edit `old`/`new`; one row per line, no code to touch) — `--list`, and the test, fail until you do.
 2. Give it a verdict. `pass-stamped` if its key reads `emitPassGen`; `no-refined-input` only
    if every table its value reads is push-only; otherwise `probe`.
 3. A `probe` row needs a disable edit at the READ, and the per-row run above before it merges.

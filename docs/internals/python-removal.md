@@ -69,7 +69,7 @@ heredoc and moves with its own PR.
 | `scripts/goal-scoreboard.py` | 273 | T | tests/vl_invalid_module_position_test.ts tests/vl_live_sites_test.ts | scripts/goal-scoreboard.vl |
 | `scripts/inventory/ls.py` | 200 | T | tests/vl_inventory_rows_test.ts | scripts/inventory/ls.vl |
 | `scripts/ladder-census.py` | 884 | T | tests/lsp_ratchet_hold_test.ts tests/vl_kind_ladder_test.ts | scripts/ladder-census.vl (shares the budget walk) |
-| `scripts/memo-generation-probe.py` | 403 | T | tests/vl_memo_generation_test.ts | scripts/memo-generation-probe.vl |
+| `scripts/memo-generation-probe.py` | 403 | T | tests/vl_memo_generation_test.ts | done: `scripts/memo-generation-probe.vl`, rows in `scripts/memo-generation-rows.json`; the `.py` is deleted |
 | `scripts/plumb-shape-cost.py` | 397 | T | tests/vl_plumb_shape_port_test.ts | ported: `scripts/plumb-shape-cost.vl` is on master; delete with its port test's oracle |
 | `scripts/sentinel-census.py` | 481 | T | tests/vl_budget_mode_test.ts tests/vl_sentinel_index_test.ts | scripts/sentinel-census.vl (shares the budget walk) |
 | `scripts/silent-sweep/census/gradecensus.py` | 217 | T | tests/vl_regress_port_test.ts | scripts/silent-sweep/census/gradecensus.vl |
