@@ -125,12 +125,18 @@ import {
 import {
   budgetCheckLines,
   budgetExcludes,
+  budgetExemptLine,
   budgetFailed,
+  budgetGitCommit,
+  budgetGitStart,
+  budgetGitStep,
   budgetLoad,
   budgetNote,
   budgetTargets,
   budgetWants,
   budgetWhyLines,
+  budgetWriteText,
+  budgetWroteLine,
 } from "./cli_budget"
 
 // ── `vl` CLI — the brain in VL (docs/cli-design.md) ──────────────────────────
@@ -198,6 +204,8 @@ const ST_SIB_LIST = 19       // got the listing of the checked file's own direct
 const ST_SIB_READ = 20       // got a file outside the module graph, read for its exports
 const ST_VALIDATE_READ = 21  // got a named file's source while checking every path exists
 const ST_BUDGET_READ = 22    // got the `--budget` baseline's source
+const ST_BUDGET_GIT = 23     // got one file of `.git`, resolving HEAD for `--write-baseline`
+const ST_BUDGET_WROTE = 24   // the `--write-baseline` write was serviced
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -233,8 +241,9 @@ let cliExcludes: string[] = [] // --exclude glob patterns (normalized)
 let cliIncludeStd = 0          // --include-std: report std's own warnings too
 let cliIncludeImports = 0      // --include-imports: report imported modules' warnings too
 let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
-let cliBudget = 0              // 1 = --budget <baseline>, 2 = --budget-why <baseline>
+let cliBudget = 0              // 1 = --budget, 2 = --budget-why, 3 = + --write-baseline, 4 = + --exempt-codes
 let cliBudgetPath = ""         // that baseline's path
+let cliBudgetAct = 0           // 3 = --write-baseline, 4 = --exempt-codes, until parsed
 
 // ── work + output ──────────────────────────────────────────────────────────────
 let cliEntrySrc = ""      // the entry file's source
@@ -1160,6 +1169,10 @@ function cliParseArgs() {
       cliFmtCheck = 1
     } else if sub == "check" && a == "--fix" {
       cliFix = 1
+    } else if sub == "check" && a == "--write-baseline" {
+      cliBudgetAct = 3
+    } else if sub == "check" && a == "--exempt-codes" {
+      cliBudgetAct = 4
     } else if sub == "check" && (a == "--budget" || a == "--budget-why") {
       cliBudget = 1
       if a == "--budget-why" { cliBudget = 2 }
@@ -1209,6 +1222,13 @@ function cliParseArgs() {
     && (cliFix != 0 || cliJson != 0 || cliBatch != 0)
   ) {
     cliArgErr = "check: --budget reports a verdict of its own; it takes no --fix, --json or --batch"
+  }
+  if cliArgErr == "" && cliBudgetAct != 0 {
+    if cliBudget == 1 {
+      cliBudget = cliBudgetAct
+    } else {
+      cliArgErr = "check: --write-baseline and --exempt-codes act on a --budget <baseline>"
+    }
   }
   if cliArgErr == "" && cliTestJobs < 0 {
     cliArgErr = "test: --jobs expects a positive count"
@@ -1682,7 +1702,7 @@ function cliTopSeg(path: string): string {
 }
 // `--budget`'s verdict, or `--budget-why`'s names, as the run's stdout.
 function cliBudgetFinish() {
-  let lines = budgetWhyLines()
+  let lines = budgetWhyLines(cliBudgetPath)
   if cliBudget == 1 { lines = budgetCheckLines(cliBudgetPath) }
   let text = ""
   for l in lines { text = text + l + "\n" }
@@ -1691,6 +1711,19 @@ function cliBudgetFinish() {
   if budgetFailed() { cliExit = 1 }
   if cliBudget == 2 && budgetFailed() { cliExit = 2 }
   0
+}
+// `--write-baseline`: read `path` toward HEAD's commit, or — resolved, or "" when it
+// cannot be — write the baseline this run counted.
+function cliBudgetGitRead(path: string) {
+  if path != "" {
+    cliCmdPath = path
+    cliState = ST_BUDGET_GIT
+    return CMD_READ_FILE
+  }
+  cliCmdPath = cliBudgetPath
+  cliCmdData = budgetWriteText(budgetGitCommit())
+  cliState = ST_BUDGET_WROTE
+  CMD_WRITE_FILE
 }
 
 // A `--batch` entry the host could not read. It gets its OWN record — exit 2, the code
@@ -2395,6 +2428,7 @@ function cliStartWork() {
 // build the summary and start printing.
 function cliStartFile() {
   if cliFileIdx >= cliFiles.length {
+    if cliBudget == 3 { return cliBudgetGitRead(budgetGitStart()) }
     if cliBudget != 0 { cliBudgetFinish() } else { cliFinishSummary() }
     return cliBeginPrint()
   }
@@ -3630,11 +3664,22 @@ export function cliNext() {
       cliExit = 2
       return cliBeginPrint()
     }
+    if cliBudget == 4 {
+      cliJsonOut = budgetExemptLine() + "\n"
+      return cliBeginPrint()
+    }
     // The baseline names the population it counts; a named path narrows it.
     if cliTargets.length == 0 { cliTargets = budgetTargets() }
     for g in budgetExcludes() { cliAddExclude(g) }
     cliIncludeImports = 1
     return cliBeginTargets()
+  }
+  if st == ST_BUDGET_GIT {
+    return cliBudgetGitRead(budgetGitStep(cliFileFound != 0, cliFileSrc))
+  }
+  if st == ST_BUDGET_WROTE {
+    cliJsonOut = budgetWroteLine(cliBudgetPath) + "\n"
+    return cliBeginPrint()
   }
   if st == ST_CLASSIFY {
     if cliDirWasDir != 0 {

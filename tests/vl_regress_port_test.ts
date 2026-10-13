@@ -47,11 +47,8 @@ const D = "scripts/silent-sweep/distilled";
 const CELLS: Record<string, [string, string]> = {
   a000001: ["print(6 * 7)", "42"],
   a000002: ['const x: i32 = "s"\nprint(x)', "s"],
-  // Still an emit refusal: a field narrowed to its function arm cannot be called yet.
-  a000003: [
-    'function mk(b: boolean): (() => i32) | string {\n  if b { return () => 7 }\n  return "s"\n}\ntype H = { f: (() => i32) | string }\nconst hh: H = { f: mk(true) }\nif hh.f is () => i32 { print(hh.f()) }',
-    "7",
-  ],
+  // Still an emit refusal: a range step of i32's minimum has no negation.
+  a000003: ["for i in 10 to 1 step -2147483648 { print(i) }", "10"],
   a000004: ['print("it\'s \\"q\\" ü")', "x"],
   a000005: ["const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])", "2"],
 };

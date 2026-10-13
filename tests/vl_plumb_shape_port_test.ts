@@ -327,12 +327,14 @@ Deno.test({
       }, doctor((r) => (r.control_cpu = 0.05)));
       expect("a busy box", busy, 0, "box busy — 1 of 3 runs");
       expect("a busy box", busy, 0, "(1 quiet of 3 runs");
-      expect(
-        "a quiet unit",
-        busy,
-        0,
-        "tail compile              0.00s against",
-      );
+      // The stub's child CPU is real, so the reading is 0.00s or 0.01s depending on load; the
+      // port-vs-Python agreement above already fixes the digits, this fixes only "quiet".
+      expect("a quiet unit", busy, 0, "tail compile ");
+      if (!/tail compile +0\.0\ds against/.test(busy.out)) {
+        throw new Error(
+          `a quiet unit: want a near-zero \`tail compile\` CPU line:\n${busy.out}`,
+        );
+      }
       expect(
         "another host",
         await agree(

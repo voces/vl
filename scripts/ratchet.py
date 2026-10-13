@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """The shared ratchet core — one baseline schema, one `--check`, one `--why`.
 
-Eight scripts hold a count against a committed baseline that may only FALL:
+Eight ratchets hold a count against a committed baseline that may only FALL:
 comment-budget, ladder-budget, sentinel-budget, scan-budget, export-budget,
-interp-budget, render-parse-budget and seed-size. The per-file ones that came
-first were the same 41 lines four times over —
+render-parse-budget, seed-size (scripts/seed-size.vl) and interp, which the lint
+holds itself (`vl check --budget`) and writes in this file's layout. The per-file
+ones that came first were the same 41 lines four times over —
 `load_baseline`, `write_baseline`, `cmd_check`, `cmd_exempt_codes`, the
 `{file: {code: count}}` schema, the `git archive` tree walk, and the
 `python3 scripts/<self>.py --write-baseline` remedy line. This is that shape,
@@ -275,7 +276,7 @@ class Ratchet:
 if __name__ == "__main__":
     print("scripts/ratchet.py is the shared core, not a command. The ratchets are\n"
           "  comment-budget.py  ladder-budget.py  sentinel-budget.py\n"
-          "  scan-budget.py  export-budget.py  interp-budget.py\n"
-          "  render-parse-budget.py\n"
-          "and seed-size, which is VL now: scripts/seed-size.vl")
+          "  scan-budget.py  export-budget.py  render-parse-budget.py\n"
+          "and two held in VL: seed-size (scripts/seed-size.vl) and interp\n"
+          "(`vl check --budget scripts/interp-budget-baseline.json`)")
     sys.exit(2)
