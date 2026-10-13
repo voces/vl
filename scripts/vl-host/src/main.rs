@@ -5982,8 +5982,6 @@ struct ScanBody {
     calls: Vec<(u32, bool)>,
     /// Struct types this body allocates with `struct.new`.
     allocs: std::collections::HashSet<u32>,
-    /// `local.set` and `local.tee` instructions, each a local `ssa-nomerge` may split off.
-    sets: usize,
 }
 
 impl ModuleScan {
@@ -6152,7 +6150,6 @@ impl ModuleScan {
                         calls_defined: false,
                         calls: Vec::new(),
                         allocs: Default::default(),
-                        sets: 0,
                     };
                     // One entry per open block: whether it is a `loop`.
                     let mut ctrl: Vec<bool> = Vec::new();
@@ -6183,7 +6180,6 @@ impl ModuleScan {
                             Operator::RefFunc { function_index } => {
                                 s.escapes.insert(function_index);
                             }
-                            Operator::LocalSet { .. } | Operator::LocalTee { .. } => b.sets += 1,
                             Operator::StructNew { struct_type_index }
                             | Operator::StructNewDefault { struct_type_index } => {
                                 b.allocs.insert(struct_type_index);
@@ -6251,15 +6247,6 @@ impl ModuleScan {
 
     fn body(&self, f: u32) -> &ScanBody {
         &self.bodies[(f - self.n_imports) as usize]
-    }
-
-    /// Binaryen names a function by its name-section entry, else by its index among the
-    /// DEFINED functions — the names `--no-inline=<pattern>` matches against.
-    fn binaryen_name(&self, f: u32) -> String {
-        self.names
-            .get(&f)
-            .cloned()
-            .unwrap_or_else(|| (f - self.n_imports).to_string())
     }
 
     /// Every direct call site, by callee: `(caller, inside a loop)`.
@@ -6378,72 +6365,25 @@ impl ModuleScan {
     }
 }
 
-/// A function with more `local.set`/`local.tee` instructions than this makes the rung skip
-/// binaryen's `ssa-nomerge`, for the whole module. That pass gives each set without a merge
-/// its own local, and two later passes are quadratic in what it makes: `coalesce-locals`
-/// keeps a locals-by-locals matrix that turns into a hash map past 8,192 locals, and
-/// `code-pushing` re-walks the rest of a block for every `if` it can push into. A translated
-/// unit's one huge function then cost 3–5x the whole unit's other work (D2336).
-const SSA_SPLIT_MAX_SETS: usize = 8192;
-
-/// The rung's reading of its input module: the `--no-inline` marks
-/// (`run_once_hot_callees`), and the passes it adds — `--skip-pass=ssa-nomerge` when some
-/// function is over `SSA_SPLIT_MAX_SETS`. A module this cannot parse gets neither.
-fn rung_scan(bytes: &[u8]) -> (Vec<String>, Vec<&'static str>) {
-    let Some(s) = ModuleScan::parse(bytes) else {
-        return (Vec::new(), Vec::new());
-    };
-    let mut extra = Vec::new();
-    if s.bodies.iter().any(|b| b.sets > SSA_SPLIT_MAX_SETS) {
-        extra.push("--skip-pass=ssa-nomerge");
-    }
-    (run_once_hot_callees(&s), extra)
-}
-
-/// `rung_scan`, read by whichever side `$VL_OPT_RUNG_SCAN` names: unset or `rust` the host,
-/// `vl` the compiler's `optRungScan` (`compiler/opt_scan.vl`), and `both` runs the two and
-/// fails the build when they disagree — the parity oracle of rung R1 in
-/// `docs/internals/optimizer-in-vl.md`, which retires the host's side once it holds.
-fn rung_scan_selected(
-    bytes: &[u8],
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let host = || {
-        let (names, extra) = rung_scan(bytes);
-        (
-            names,
-            extra.into_iter().map(String::from).collect::<Vec<_>>(),
-        )
-    };
-    match std::env::var("VL_OPT_RUNG_SCAN")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "" | "rust" => Ok(host()),
-        "vl" => vl_rung_scan(bytes, engine, compiler),
-        "both" => {
-            let h = host();
-            let v = vl_rung_scan(bytes, engine, compiler)?;
-            if h != v {
-                bail!("rung scan parity: the host read {h:?}, the compiler read {v:?}");
-            }
-            Ok(h)
-        }
-        other => bail!("unknown $VL_OPT_RUNG_SCAN `{other}` (rust | vl | both)"),
-    }
-}
-
-/// The compiler's reading of the rung's input, on a fresh instance: the module staged
-/// through `optInLoad`, the answer read back from `optOut` — the extra pass on its first
-/// line, one `--no-inline` name per later line.
-fn vl_rung_scan(
+/// The rung's reading of its input module, by the compiler's `optRungScan`
+/// (`compiler/opt_scan.vl`) on a fresh instance: the `--no-inline` marks for each hot callee
+/// of run-once code, and the passes it adds (`--skip-pass=ssa-nomerge` past a set bound). The
+/// module is staged through `optInLoad`; `optOut` holds the pass on its first line (empty when
+/// none), then one name per line. A seed without these exports cannot build `-O`.
+fn rung_scan(
     bytes: &[u8],
     engine: &Engine,
     compiler: &CompilerSource,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let (mut store, inst) = load_compiler(engine, compiler)?;
-    let reset = inst.get_typed_func::<(), i32>(&mut store, "optInReset")?;
+    let reset = inst
+        .get_typed_func::<(), i32>(&mut store, "optInReset")
+        .map_err(|e| {
+            e.context(
+                "`-O` reads its run-once marks through the compiler's `optRungScan`, \
+                 which this seed predates",
+            )
+        })?;
     let load = inst.get_typed_func::<i32, i32>(&mut store, "optInLoad")?;
     let scan = inst.get_typed_func::<(), i32>(&mut store, "optRungScan")?;
     let mem = io_mem(&mut store, &inst)
@@ -6463,47 +6403,6 @@ fn vl_rung_scan(
         .map(|l| vec![l.to_string()])
         .unwrap_or_default();
     Ok((lines.map(String::from).collect(), extra))
-}
-
-/// The binaryen names of the functions `-O`/`-O3` must NOT inline, because the only code
-/// that calls them runs once and calls them from inside a loop.
-///
-/// V8 (and so every Chromium browser) compiles each wasm function with its baseline
-/// compiler first and swaps in the optimizing one only at the function's NEXT call — there
-/// is no on-stack replacement for wasm. So code that runs once stays baseline code for the
-/// whole run. The start function runs once, and so does a function whose every call site
-/// sits outside any loop of run-once code (`function main() {...}; main()`). Unoptimized,
-/// a hot callee in such a loop is its own function, called many times, and V8 tiers it up;
-/// binaryen inlines a single-caller function wherever it is, which moves the hot work into
-/// the run-once body and leaves it on the baseline tier for good. Cranelift has one tier,
-/// so wasmtime is indifferent (DECISIONS.md, "`-O3` keeps hot callees out of run-once code").
-///
-/// The rule is per call site and binaryen's `--no-inline` is per callee, so a callee is
-/// marked only when EVERY direct call of it comes from run-once code — marking one that
-/// hot code also calls would cost that caller its inlining. A tiny loop-free leaf is left
-/// inlinable (`RUN_ONCE_INLINE_LEAF_BYTES`). Any module this cannot parse gets no marks,
-/// which is exactly the old behaviour.
-fn run_once_hot_callees(s: &ModuleScan) -> Vec<String> {
-    let callers = s.callers();
-    let once = s.run_once(&callers);
-    if once.is_empty() {
-        return Vec::new();
-    }
-    let mut hot: Vec<u32> = callers
-        .iter()
-        .filter(|&(&f, sites)| {
-            s.defined(f)
-                && sites.iter().any(|&(_, in_loop)| in_loop)
-                && sites.iter().all(|&(c, _)| once.contains(&c))
-                && {
-                    let b = s.body(f);
-                    b.has_loop || b.calls_defined || b.size > RUN_ONCE_INLINE_LEAF_BYTES
-                }
-        })
-        .map(|(&f, _)| f)
-        .collect();
-    hot.sort_unstable();
-    hot.into_iter().map(|f| s.binaryen_name(f)).collect()
 }
 
 /// A callee at most this many body bytes may be inlined to let a caller's struct stay off
@@ -6605,7 +6504,7 @@ fn escape_inline_choice(s: &ModuleScan) -> Option<std::collections::HashSet<u32>
         })
         .collect();
     let shares = |a: u32, b: u32| takes[ix(a)].iter().any(|t| takes[ix(b)].contains(t));
-    // A tiny loop-free leaf may go into run-once code too, as `run_once_hot_callees` allows.
+    // A tiny loop-free leaf may go into run-once code too, as the run-once scan allows.
     let leaf = |f: u32| {
         let b = s.body(f);
         !b.has_loop && !b.calls_defined && b.size <= RUN_ONCE_INLINE_LEAF_BYTES
@@ -10698,18 +10597,11 @@ fn build_cmd(args: &[String]) -> Result<()> {
         let map = map_path.as_deref();
         let rows_in = map_rows.take();
         // The chain is a function of these and of `bytes` (stage S2's key); a hit skips it.
-        // A rung the compiler answers (`rung_scan_selected`) makes the seed one of them too.
-        let seed_reads = matches!(
-            std::env::var("VL_OPT_RUNG_SCAN").as_deref(),
-            Ok("vl" | "both")
-        );
-        let mut options = format!("{flag}\0{names}\0{low_memory:?}\0{stable_layout}");
-        if seed_reads {
-            let seed = compiler_hash(&compiler)
-                .map(|h| hex(&h))
-                .unwrap_or_default();
-            options.push_str(&format!("\0{seed}"));
-        }
+        // The seed is one of them: its `optRungScan` reads the rung's input (`rung_scan`).
+        let seed = compiler_hash(&compiler)
+            .map(|h| hex(&h))
+            .unwrap_or_default();
+        let options = format!("{flag}\0{names}\0{low_memory:?}\0{stable_layout}\0{seed}");
         let action = opt_cache_action(
             &bytes,
             options,
@@ -10797,7 +10689,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
             }
             let (no_inline, extra) = phase!(
                 "opt.run_once_scan",
-                rung_scan_selected(rung_input, &compile_engine, &compiler)
+                rung_scan(rung_input, &compile_engine, &compiler)
             )?;
             passes.extend(extra.iter().map(String::as_str));
             phase!(

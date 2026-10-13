@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # The parity oracle for porting an `-O` rung from the host into the compiler
 # (docs/internals/optimizer-in-vl.md): every program is built with `-O` twice, once
-# with `$VAR=$A` and once with `$VAR=$B`, and the two builds must agree on exit
-# status, on the argv of every `wasm-opt` run (captured by a shim), and byte for
-# byte on the module written. A build that times out on either side is UNCOMPARED,
-# never counted as agreeing.
+# per SIDE, and the two builds must agree on exit status, on the argv of every
+# `wasm-opt` run (captured by a shim), and byte for byte on the module written. A
+# build that times out on either side is UNCOMPARED, never counted as agreeing.
 #
 #   scripts/opt-parity.sh [--compiler <seed>] [--jobs N] [--timeout S] [--rung -O3]
-#       VAR A B [path ...]
+#       SIDE_A SIDE_B [path ...]
 #
+# A side is `VAR=value` (that variable set for the checkout's own `vl`) or the path
+# of a `vl` binary: a rung's port is graded `VAR=rust VAR=vl`, its retirement
+# against a binary built before the Rust was deleted. Both sides use one seed.
 # Paths are .vl files or directories (searched for *.vl); the default is
 # tests/cases plus the distilled corpus. Run from the checkout root. Exits 1 when
 # any program disagrees, naming each; 2 on a usage error.
@@ -27,18 +29,23 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
-if [ $# -lt 3 ]; then
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+if [ $# -lt 2 ]; then
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
-VAR=$1 A=$2 B=$3
-shift 3
+A=$1 B=$2
+shift 2
 [ $# -gt 0 ] || set -- tests/cases scripts/silent-sweep/distilled/cells scripts/silent-sweep/distilled/named
 
 ROOT=$(pwd)
 VL=${VL:-$ROOT/scripts/vl-host/target/release/vl}
 WASM_OPT=${VL_WASM_OPT:-$(command -v wasm-opt || echo "$ROOT/node_modules/.bin/wasm-opt")}
-[ -x "$VL" ] || { echo "opt-parity: no vl binary at $VL" >&2; exit 2; }
+# A side's binary, and the one assignment `env` runs it under.
+side_bin() { case "$1" in *=*) echo "$VL" ;; *) realpath "$1" ;; esac; }
+side_env() { case "$1" in *=*) echo "$1" ;; *) echo "OPT_PARITY_SIDE=$1" ;; esac; }
+for side in "$A" "$B"; do
+  [ -x "$(side_bin "$side")" ] || { echo "opt-parity: no vl binary for side \`$side\`" >&2; exit 2; }
+done
 [ -f "$COMPILER" ] || { echo "opt-parity: no compiler seed at $COMPILER" >&2; exit 2; }
 export VL_STD=${VL_STD:-$ROOT/std}
 export BINARYEN_CORES=${BINARYEN_CORES:-1}
@@ -60,15 +67,15 @@ total=$(wc -l < "$WORK/files")
 
 # One program, both sides, in a slot directory of its own; prints one verdict line.
 one() {
-  local f=$1 slot dir side rc
+  local f=$1 slot side spec rc
   slot=$(mktemp -d "$WORK/slot.XXXXXX")
   for side in a b; do
-    local val=$A
-    [ "$side" = b ] && val=$B
+    spec=$A
+    [ "$side" = b ] && spec=$B
     : > "$slot/log"
-    env "$VAR=$val" OPT_PARITY_LOG="$slot/log" VL_WASM_OPT="$WORK/shim.sh" \
-      timeout "$TIMEOUT" "$VL" build "$f" "$RUNG" -o "$slot/out.wasm" --compiler "$COMPILER" \
-      > "$slot/$side.stdout" 2> "$slot/$side.stderr"
+    env "$(side_env "$spec")" OPT_PARITY_LOG="$slot/log" VL_WASM_OPT="$WORK/shim.sh" \
+      timeout "$TIMEOUT" "$(side_bin "$spec")" build "$f" "$RUNG" -o "$slot/out.wasm" \
+      --compiler "$COMPILER" > "$slot/$side.stdout" 2> "$slot/$side.stderr"
     rc=$?
     if [ "$rc" -eq 124 ]; then
       echo "UNCOMPARED $f (timed out, side $side)"
@@ -94,8 +101,8 @@ one() {
   fi
   rm -rf "$slot"
 }
-export -f one
-export WORK VAR A B VL COMPILER TIMEOUT RUNG
+export -f one side_bin side_env
+export WORK A B VL COMPILER TIMEOUT RUNG
 
 xargs -a "$WORK/files" -d '\n' -P "$JOBS" -I{} bash -c 'one "$1"' _ {} > "$WORK/verdicts"
 
@@ -105,6 +112,6 @@ marked=$(grep -c "^AGREE .* [1-9][0-9]*\$" "$WORK/verdicts")
 differ=$(grep -c '^DIFFER ' "$WORK/verdicts")
 uncompared=$(grep -c '^UNCOMPARED ' "$WORK/verdicts")
 grep -E '^(DIFFER|UNCOMPARED) ' "$WORK/verdicts" | sort
-echo "opt-parity $VAR=$A vs $B ($RUNG): $total programs · $agree identical modules ·" \
+echo "opt-parity $A vs $B ($RUNG): $total programs · $agree identical modules ·" \
   "$both_fail both refused · $marked identical carrying a --no-inline or --skip-pass mark · $differ differ · $uncompared uncompared"
 [ "$differ" -eq 0 ]
