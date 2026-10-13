@@ -559,13 +559,23 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      `monoLamCallByName`, and `monoInstLamNames` / `monoCollectLamDecls` /
      `monoInstGenAliasNames`.
 
-   This step closes the shadowing rows.
+   This step closes the shadowing rows. It landed with `monoNameIsParamOnChain`,
+   `monoNamesUsedAsValue`, `monoCellReadName`, `monoLamCallByName`, the
+   `monoInstLamNames` set and `monoLetWrites` still keyed by name, because no witness
+   separates them yet; they carry to step 3. D3957 is not a naming defect and moved to
+   step 3.
 3. **Bindings read the table:** let, const, alias, written let, if/match/`??`/labelled-break
    arms, and return.
    - Retires `monoCoerceWrittenLet`, `monoCoerceLetValues`, the alias-chain set
      (`monoAliasChainLamFe`, `monoGenFnAliasChainFe`, `monoAliasChainWritten`,
      `monoRespellLamAlias`), and the peer pins (`monoPinLamFromPeer`,
      `monoAssignedPeerFe`, `monoInitPeerFe`, `monoTargetPeerFe`).
+   - First PR: a write to a function-valued `let` or capture cell is instanced at the
+     binding's type as each instance spells it, and an `if` expression whose arms all name
+     generics counts as naming generics. It closes D3941, D3953, D3954, D3957, D3958 and
+     D4013, turns seven of D3939's `rv3498` refusals (a cell a shared closure writes with a
+     generic) into runs, and files D4305–D4308. It retires nothing yet: the coercions it
+     adds are the ones the table's let slot will own.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
@@ -772,12 +782,17 @@ at its step is re-ablated, not re-attributed.
 
 | step | rows | outcome on master |
 | --- | --- | --- |
-| 2 identity, not name | D2114, D2479, D3910, D3911, D3924, D3957, D4011, D4016 | silent 5 (invalid wasm 3, trap 1, wrong value 1); emit reject 3 |
-| 3 let / const / alias / written | D3297, D3384, D3858, D3873, D3904, D3906, D3926, D3941, D3942, D3943, D3961, D3962, D3964, D3965, D3976, D4013, D4014, D4015 | silent 12 (invalid wasm 6, trap 3, wrong value 3); emit reject 6 |
+| 2 identity, not name | D2114, D2479, D3910, D3911, D3924, D4011, D4016 | silent 5 (invalid wasm 3, trap 1, wrong value 1); emit reject 3 |
+| 3 let / const / alias / written | D3297, D3384, D3858, D3873, D3904, D3906, D3926, D3941, D3942, D3943, D3957, D3961, D3962, D3964, D3965, D3976, D4013, D4014, D4015 | silent 12 (invalid wasm 6, trap 3, wrong value 3); emit reject 6 |
 | 4 list / map / field / union | D2484, D3165, D3166, D3934, D3935, D3944, D3947, D3978, D4012 | silent 6 (invalid wasm 1, trap 3, wrong value 2); emit reject 3 |
 | 5 capture cells | D3851, D3857, D3868, D3952, D3953, D3954, D3955, D3956, D3958, D3959, D3970, D3971, D3973, D3974 | silent 5 (trap 3, wrong value 1, invalid wasm 1); emit reject 9 |
 | 7 checker refusal (DESIGN) | D3923, D3975, D4010 | silent 2 (invalid wasm 1, trap 1); emit reject 1 |
 | adjacent, not claimed | D1482 (`.map` producing closures), D2735, D3822, D3933 | emit reject 4 |
+
+**Moved at a step:** D3957 was attributed to step 2 and moved to step 3 when step 2 did not
+close it (it traps with the parameter renamed and no capture). Step 3's first PR closed it
+together with D3953, D3954 and D3958, which were attributed to step 5: the write that needed
+instancing is a capture cell's element store.
 
 **New since revision 1:**
 
