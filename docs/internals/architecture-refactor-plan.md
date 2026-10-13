@@ -131,7 +131,7 @@ order, subject to the one-writer rule.
 | --- | --- | --- |
 | T1 | **Done.** The host process ABI: `std:process` (`runProgram`, `exit`) and `std:env` (`getEnv`) shipped with their host imports; see ROADMAP's "Host ABI for VL scripts". | — |
 | T2 | L11 the VL way: the per-file budgets move into `vl lint` itself (a baseline-reading budget mode), so the ratchets need neither Python nor spawn. The twin Python censuses retire as each rule's budget moves. | none |
-| T3 | **Ready.** Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
+| T3 | **In progress.** `check-filed-witnesses.vl` is ported and runs the gate row (the Python stays for `scripts/inventory/rows.py`, which imports it). Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
 | T4 | L10: the `-O` optimizer | owner decision 3 below |
 | T5 | L12: the remaining LSP features | A7 |
 
@@ -178,4 +178,4 @@ These have no unmet prerequisite and touch disjoint files:
   first; it is small.
 - **C3 first PR**: `emitReturnValue` through `ExpCtx` (`wasmEmit.vl`).
 - **B1**: continues in lane SC (#3542).
-- **T3, first port**: `check-filed-witnesses.py`, kept beside the Python version until the reports are byte-identical. It is for VL-first tooling, not gate speed: a VL port still starts `vl` per row, through `runProgram`.
+- **T3, first port — done**: `check-filed-witnesses.vl` prints the Python's report byte for byte on both inventories and now runs the `filed witnesses` gate row; the Python stays beside it (`scripts/inventory/rows.py` imports its row grammar). It found D4290 (a compiler trap) and one new `dogfood:` row (`runProgram` waits). Next: `regress.py` + `gradecensus.py`.
