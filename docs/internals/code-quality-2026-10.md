@@ -256,8 +256,31 @@ disagree: `cstrTablesTruncate` omits bin and print; `monoRecheckEnd` omits arg, 
 mem, ufcs and is; `monoRecheckBegin` stores its marks positionally as `sv[0]`..`sv[20]`.
 
 **Measured cost.** 12 inventory rows cite this machinery by function name: D491, D592, D1400,
-D1520, D1566, D2241, D2294, D2802, D3062, D3078, D3402, D3746. Whether each omission above is
-a live leak or covered by table dedup is UNDECIDED per site; no witness was attempted.
+D1520, D1566, D2241, D2294, D2802, D3062, D3078, D3402, D3746.
+
+**Measured (A1, 2026-10-12).** The first PR's assertion (`probeRollbackArm`, off by default;
+`scripts/probe-rollback-census.ts`) marks 137 tables at each probe's entry and counts every
+table whose length moved by its exit. Over 15,287 programs (5,162 `tests/cases`, 1,477
+distilled cells, 8,647 named cells, `compiler/entry.vl`), on c722ff637. A family's count is its
+busiest column; no table ever shrank. "rolls back" is what the site truncates today.
+
+| probe | ran (runs / programs) | rolls back | left behind (programs) |
+| --- | --- | --- | --- |
+| `argCstrFitsAt` | 26 / 4 | — | nothing |
+| `validateCompArgCstr` | 9 / 2 | — | nothing |
+| `dstTyParamAdapts` | 146 / 33 | — | nothing |
+| `tpIfRecheck` | 21 / 6 | `cstrTablesTruncate` | nothing: its bin/print omission is never exercised |
+| `monoRecheck` | 3,257 / 1,469 | 21 marks | let 150, mem 4, arg 3, ret 1; inside `tpIfRecheck`, let 3 |
+| `solveUnannotParams` | 5,259 / 1,968 | diags, redun/rcoal/isval, bin, arg, print, dJoin, holeFlow | holeShape 586, is 289, mem 274, holeAlt 227, holeArrayDemand 186, holeMap 167, let 124, coalHole 117, bm 30, ufcs 15, ret 11 |
+| `inferReturnsPrePass` | 5,156 / 5,098 | diags, redun/rcoal/isval | print 376, bin 360, let 231, bm 196, holeAlt 72, arg 22, coalHole 22, mem 13, dJoin 9, inferLet 8, nln 4, ufcs 3, holeShape 2, inferLetNulStr 2, holeMap 1, holeArrayDemand 1, tpIf 1 |
+| `globalInitPrePass` | 5,757 / 5,703 | diags, redun/rcoal/isval | bin 262, coalHole 61, let 50, bm 21, arg 1, mem 1, ret 1, dJoin 1, tpIf 1 |
+| `cstrProbeBefore` | 58 / 41 | diags, redun/rcoal/isval | the `*Cstr` rows it exists to record (ret 13, let 9, print 5, bin 4, mem 4, arg 3, bm 2), plus holeAlt 7, dJoin 1, holeMap 1 |
+
+So `monoRecheckEnd`'s omission is live for arg, let, mem and ret and never exercised for bm,
+ufcs and is; `cstrTablesTruncate`'s is never exercised. Every other row is a table the site
+does not roll back at all. Whether a kept row is harmless (the real pass dedups or re-records
+it) or a leak is still per-row and unwitnessed; this table is the list to grade, and A2's
+default rollback is what makes each one an output change to inspect.
 
 **Proposed shape.** One `CheckMark` record with named fields, `checkMark()` and
 `checkRollback(m)`. Rolling back every append-only table is the default; a site that must keep
@@ -266,7 +289,8 @@ one `truncate(n)`, so a new column cannot miss a site.
 
 **First PR.** A debug assertion behind a flag: after each of the seven probes, every table length
 equals its mark, with today's per-site exceptions listed explicitly. That turns the UNDECIDED
-list into measured facts without changing behaviour (byte-identical seed with the flag off).
+list into measured facts without changing behaviour: with the flag off, `vl check` text and
+emitted modules are identical. Landed as A1; the result is the table above.
 
 **Proof for the refactor.** Byte-identical emitted modules and `vl check` output identity over
 `tests/cases` and the corpus; fuel A/B. Where the new default rolls back more than today, an
