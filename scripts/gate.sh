@@ -250,7 +250,7 @@ run "survey measurements"      bash scripts/survey-profile.sh
 # Both run on `scripts/capability-probes.vl`, the VL port of `run.py`.
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
-run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
+run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
 run "distilled corpus"         "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
