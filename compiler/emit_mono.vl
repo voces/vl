@@ -281,6 +281,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
+import { fnFlowLamPin, fnFlowTableBuild } from "./fn_flow_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
 import {
   drwFillDefaults,
@@ -321,6 +322,7 @@ import {
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
+  monoInertValues,
   monoInstFe,
   monoInstName,
   monoInstOrig,
@@ -333,6 +335,7 @@ import {
   monoPinSubRow,
   monoPinSubT,
   monoProgStmts,
+  monoStubSlots,
   monoTwoListRet,
   reExpName,
   reExpTarget,
@@ -10334,17 +10337,6 @@ function monoListElemWrites(fx: i32, name: string, decl: i32): i32[] {
   out
 }
 
-// The un-instanced generics' slots the prune rewrote to the no-op stub, and the generic function
-// names an un-annotated binding's initializer holds where every use of it is its length or a write.
-let monoStubSlots: i32[] = []
-let monoInertValues: i32[] = []
-
-// Whether a closure value of slot `fe` at node `at` is sound: a slot that is not a stub, or a
-// stub nothing can call, since the stub's signature is no instance's (D4123).
-export function monoStubValueOk(fe: i32, at: i32): boolean {
-  !i32ListHas(monoStubSlots, fe) || i32ListHas(monoInertValues, at)
-}
-
 // Records the generic function names in binding `d`'s initializer, directly or as list elements
 // or record fields, when `d` is un-annotated and no use of it can reach one: every use is a write,
 // a list's `.length`, or a record field read whose value holds no generic function.
@@ -13408,113 +13400,17 @@ export function monoGenericAliasFe(letIx: i32) {
   -1
 }
 
-// The `fnStmts` slot of the lambda a lifted lambda's own binding already holds — the
-// binding's initializer — when this lambda reached its slot through an assignment
-// (`f = (a) => …`), or -1. One binding owns one closure cell carrying one functype, so
-// every lambda written into it has to be lowered at the same signature.
-
-// Exactly one assignment, or -1: a lambda literal written into two different bindings has
-// no single signature to adopt. The frame comes from `fnParent`, which is what
-// `identClosureFeSid` wants for a function-scoped `let`.
-function monoAssignedPeerFe(fe: i32) {
-  if fe < 0 || fe >= fnStmts.length { return -1 }
-  const node = fnStmts[fe]
-  const tgts: i32[] = []
-  const tkeys: string[] = []
-  let i = 0
-  let ctx = -1
-  if fe < fnParent.length {
-    const pp = fnParent[fe]
-    if pp >= 0 && pp < fnStmts.length { ctx = fnStmts[pp] }
-  }
-  while i < P.nodes.length {
-    const nd = P.nodes[i]
-    if nd is BinExpr {
-      if nd.binOp == "=" {
-        const lt = P.nodes[nd.binLeft]
-        const lcell = monoCellReadName(nd.binLeft)
-        if lt is Ident || lcell != "" {
-          // The lambda itself, or a name bound to it, read in the write's own frame: the frame
-          // of the lambda or a function lifted out of it, never a namesake elsewhere (D3845),
-          // the name read through its capture cell included (`d1 = d2[0]`, D3855).
-          let hit = nd.binRight == node
-          const named = P.nodes[nd.binRight] is Ident
-            || monoCellReadName(nd.binRight) != ""
-          if !hit && named && monoFrameHolds(ctx, i) {
-            let wf = ctx
-            if ctx >= 0 {
-              wf = monoFrameOfNode(i, ctx)
-            } else {
-              wf = monoTopFrameOf(i)
-            }
-            hit = monoLamValueFe(nd.binRight, wf) == fe
-          }
-          if hit {
-            const tkey = monoIdentNameOf(nd.binLeft) + "|" + lcell
-            if !strListHas(tkeys, tkey) {
-              tkeys.push(tkey)
-              tgts.push(nd.binLeft)
-            }
-          }
-        }
-      }
-    }
-    i = i + 1
-  }
-  // Each binding the lambda is written into holds one signature. Written into several, it takes
-  // theirs where they agree (D3850); where two settled ones disagree there is no single one.
-  let pick = -1
-  const pickPins: string[] = []
-  for tgt in tgts {
-    const peer = monoTargetPeerFe(tgt, ctx)
-    if peer >= 0 && peer != fe {
-      if pick < 0 { pick = peer }
-      if (
-        peer < monoGen.length
-        && (monoInstantiatedAny(peer) || monoGen[peer] == 0)
-      ) {
-        const pins: string[] = []
-        if monoSlotParamPins(peer, pins) {
-          if pickPins.length == 0 {
-            for pn in pins { pickPins.push(pn) }
-            pick = peer
-          } else if !monoStrListsSame(pins, pickPins) {
-            return -1
-          }
-        }
-      }
-    }
-  }
-  pick
-}
-
-// Instantiates the un-annotated lambda in slot `fe` at its peer's signature, where it got its
-// slot from an `f = …` write or seeds a binding one is written into: one binding holds one
-// signature, and the hole's catch-all would put an i32 parameter under an f64-typed cell. A
-// peer with no hole is its own signature. 0 when there is no settled peer, -1 on a failed mint.
-function monoPinLamFromPeer(fe: i32, nDecl: i32): i32 {
+// Instantiates the un-annotated lambda in slot `fe` at the one signature the flow table pins its
+// class at, so a peer's cell type is not met with the hole's i32 default. A lambda the checker
+// typed concretely keeps that signature: a pin names no result, so its instance would return the
+// body's own type. 0 when the table pins none, -1 on a failed mint.
+function monoPinLamFromFlow(fe: i32): i32 {
   if fe < 0 || fe >= fnStmts.length { return 0 }
-  let peer = monoAssignedPeerFe(fe)
-  // A binding it is written into that holds nothing settled yet leaves the one it seeds to
-  // answer (D3855).
-  const settled = peer >= 0
-    && peer < nDecl
-    && (monoInstantiatedAny(peer) || monoGen[peer] == 0)
-  if !settled {
-    const ip = monoInitPeerFe(fe, nDecl)
-    if ip >= 0 || peer < 0 { peer = ip }
+  const lt = nodeTyIxOf(fnStmts[fe])
+  if lt >= 0 && lt < T.tys.length && T.tys[lt] is TyFunc && !tyHasTyVar(lt) {
+    return 0
   }
-  if peer < 0 || peer >= nDecl { return 0 }
-  if !monoInstantiatedAny(peer) && monoGen[peer] != 0 { return 0 }
-  const pins: string[] = []
-  if !monoSlotParamPins(peer, pins) { return 0 }
-  const own = P.nodes[fnStmts[fe]]
-  if own is FuncDecl {
-    if own.fnParams.length == pins.length {
-      if monoInstanceFor(fe, pins, fnStmts[fe], -1) < 0 { return -1 }
-    }
-  }
-  0
+  monoPinLamAtTys(fe, fnFlowLamPin(fnStmts[fe]), false)
 }
 
 // The instance the last `monoMakeInstance` minted or hit; -1 before one.
@@ -14460,31 +14356,6 @@ function monoBindSigFail(nm: string): i32 {
   )
 }
 
-// Whether two string lists hold the same strings in the same order.
-function monoStrListsSame(a: string[], b: string[]): boolean {
-  if a.length != b.length { return false }
-  let i = 0
-  while i < a.length {
-    if a[i] != b[i] { return false }
-    i = i + 1
-  }
-  true
-}
-
-// The lambda the write target `tgt` (a name, or a capture cell's `name[0]`) holds from its
-// initializer chain, read in frame `ctx`; -1 when none.
-function monoTargetPeerFe(tgt: i32, ctx: i32): i32 {
-  if tgt < 0 || tgt >= P.nodes.length { return -1 }
-  const tcell = monoCellReadName(tgt)
-  if tcell != "" { return monoCellLamFe(tcell, tgt, ctx) }
-  let peer = identClosureFeAt(sidOfNode(tgt), ctx, tgt)
-  if peer < 0 {
-    const tn = P.nodes[tgt]
-    if tn is Ident { peer = monoLetAliasLamFe(tn.identName, tgt, ctx) }
-  }
-  peer
-}
-
 // Instantiate the un-annotated lambda in slot `fe` at the concrete parameter types the checker
 // recorded for it (a callback's contextual type), so a generic its body calls is pinned there
 // rather than at the hole's default (D3820). 0 when it declines, -1 on a failed mint.
@@ -14493,12 +14364,23 @@ function monoPinLamFromCheckedTy(fe: i32) {
   if fn is FuncDecl {
     if !monoSubtreeCallsGeneric(fn.fnBody, fnStmts[fe], 0) { return 0 }
     const tys = monoFnValueParamTys(nodeTyIxOf(fnStmts[fe]), fn.fnParams.length)
+    // A callback of a built-in `.map` / `.filter` is called at its element's own spelling; one
+    // handed to a function takes that function's parameter type, keyed by its render (D3834).
+    return monoPinLamAtTys(fe, tys, monoIsBuiltinCallback(fnStmts[fe]))
+  }
+  0
+}
+
+// Instantiates the lambda in slot `fe` at parameter types `tys`, each pinned by its declared
+// record's name, else its render (`builtin`: the spelling a built-in callback's element takes).
+// 0 when the count differs or a type cannot be pinned, -1 on a failed mint.
+function monoPinLamAtTys(fe: i32, tys: i32[], builtin: boolean): i32 {
+  if fe < 0 || fe >= fnStmts.length { return 0 }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
     if tys.length == 0 || tys.length != fn.fnParams.length { return 0 }
     const pins: string[] = []
     let i = 0
-    // A callback of a built-in `.map` / `.filter` is called at its element's own spelling; one
-    // handed to a function takes that function's parameter type, keyed by its render (D3834).
-    const builtin = monoIsBuiltinCallback(fnStmts[fe])
     while i < tys.length {
       if !monoLamPinTyPlain(tys[i], 8) { return 0 }
       let nm = ""
@@ -14680,39 +14562,6 @@ function monoLiftedDescendants(slot: i32): i32[] {
   out
 }
 
-// A lambda written into a `let` (or its capture cell) that the lambda in slot `fe` initializes:
-// one cell, so `fe` takes that lambda's signature (D3850). Only a peer already instantiated, or
-// with no hole, answers; -1 when no write qualifies.
-function monoInitPeerFe(fe: i32, nDecl: i32): i32 {
-  if fe < 0 || fe >= fnParent.length { return -1 }
-  let ctx = -1
-  const pp = fnParent[fe]
-  if pp >= 0 && pp < fnStmts.length { ctx = fnStmts[pp] }
-  monoLetWritesExtend()
-  for k in monoLetWrites.keys() {
-    for i in monoLetWrites.get(k) ?? [] {
-      const nd = P.nodes[i]
-      if nd is BinExpr {
-        if monoFrameHolds(ctx, i) {
-          let wf = ctx
-          if ctx >= 0 {
-            wf = monoFrameOfNode(i, ctx)
-          } else {
-            wf = monoTopFrameOf(i)
-          }
-          if monoLamValueFe(nd.binLeft, wf) == fe {
-            const peer = monoLamValueFe(nd.binRight, wf)
-            if peer >= 0 && peer != fe && peer < nDecl {
-              if monoInstantiatedAny(peer) || monoGen[peer] == 0 { return peer }
-            }
-          }
-        }
-      }
-    }
-  }
-  -1
-}
-
 // A parameter pin spelled as its value's type: a string literal union holds strings, so an
 // instance at it and one at `string` are one signature.
 function monoPinWidened(pin: string): string {
@@ -14841,6 +14690,15 @@ export function monomorphize(stmts: i32[]) {
     if monoHasConcreteHOFParam() { any = true }
   }
   if !any { return 0 }
+  // The flow table reads the tree before the walk rewrites it, and only a hole lambda asks it.
+  let lf = 0
+  while lf < monoGen.length {
+    if monoGen[lf] == 1 && criFnIsAnonLambda(lf) {
+      fnFlowTableBuild(stmts)
+      lf = monoGen.length
+    }
+    lf = lf + 1
+  }
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
@@ -14870,21 +14728,14 @@ export function monomorphize(stmts: i32[]) {
     }
     fe2 = fe2 + 1
   }
-  // Peer pins first, in rounds: a lambda whose peer takes its own signature from a peer later in
-  // slot order is pinned on the next round, not left at the hole's default (D3851).
-  let moved = true
-  let round = 0
-  while moved && round <= nDecl {
-    moved = false
-    let pe = 0
-    while pe < nDecl {
-      if monoGen[pe] == 1 && criFnIsAnonLambda(pe) && !monoInstantiatedAny(pe) {
-        if monoPinLamFromPeer(pe, nDecl) < 0 { return -1 }
-        if monoInstantiatedAny(pe) { moved = true }
-      }
-      pe = pe + 1
+  // Lambdas the flow table pins come first: the table's classes already span every binding a
+  // lambda is written into, so one pass settles a chain of them (D3851).
+  let pe = 0
+  while pe < nDecl {
+    if monoGen[pe] == 1 && criFnIsAnonLambda(pe) && !monoInstantiatedAny(pe) {
+      if monoPinLamFromFlow(pe) < 0 { return -1 }
     }
-    round = round + 1
+    pe = pe + 1
   }
   // The lambda half of that loop. `monoGen == 1` covers two carriers alike only on paper: a
   // named generic is reached only through `monoInstantiate`, while a lifted anonymous lambda
@@ -14894,10 +14745,7 @@ export function monomorphize(stmts: i32[]) {
   while fe3 < nDecl {
     if monoGen[fe3] == 1 && criFnIsAnonLambda(fe3) {
       if !monoInstantiatedAny(fe3) {
-        if monoPinLamFromPeer(fe3, nDecl) < 0 { return -1 }
-        if !monoInstantiatedAny(fe3) {
-          if monoPinLamFromCheckedTy(fe3) < 0 { return -1 }
-        }
+        if monoPinLamFromCheckedTy(fe3) < 0 { return -1 }
         // `monoInstanceFor` declines silently on a boundary it cannot reproduce, so the
         // walk is gated on the outcome rather than on having tried — a declined pin
         // still needs its body walked.
