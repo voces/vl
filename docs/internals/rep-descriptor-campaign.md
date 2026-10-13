@@ -2125,8 +2125,68 @@ correctly and the column agreed with the ladder at every node:
 
 Numeric literal unions keep their base scalar and never set `rdAtom`.
 
-### 13.5 What is next, in order
+### 13.5 The nullable niche family on the column (D3b)
 
-The nullable niche family (`exprNullableString`, `exprNullableList`, `exprNullableStruct`, …),
-then `exprString`, `exprRefArray`, `exprStringArray`, `exprArray`, `exprF64Array` and
-`exprListRep`. Each family goes under the same LEFT-ONLY / RIGHT-ONLY oracle.
+The four nullable niches, `nulstr`, `nulstruct`, `nullist` and `nulclosure`, are answered by one
+predicate, `nodeRepIs(ix, k)`. It is true when the column covers node `ix` and its `rdKind` is
+`k`. No new bank or memo stamp was added; the column is still the derived read of §13.1.
+
+The oracle wrapped 24 sites in `exprNullableString`, `exprNullableStruct`, `exprNullableList`,
+`exprNulClosure` and their let, param and return kin. Each site ran its old predicate and the
+column side by side under `VL_REP_SHADOW=1`. The probe was built from the PR's base (#3672's
+head) and was never committed.
+
+| population | files | AGREE notes | LEFT-ONLY | RIGHT-ONLY |
+| --- | --- | --- | --- | --- |
+| `tests/cases` (a module directory counts once) | 4,981 | 2,318,254 | 190 (four sites, 26 files) | 0 |
+| distilled `cells/` | 1,477 | 228,336 | 0 | 0 |
+| distilled `named/` | 8,647 | 1,450,396 | 0 | 0 |
+
+The derived cells reach 14 of the 24 sites. `nicheStr` is reached only by `tests/cases`.
+
+Twenty sites read 0 LEFT-ONLY and 0 RIGHT-ONLY in all three populations, and they are converted:
+
+* `nulstr`: `nsTyped`, `nsAs` and `nsCallFb` in `exprNullableString`, plus `nsLetAnn`
+  (`letIsNulString`), `nsNarrowLet`, `qnsParam` (`paramNulString`), `ifStr`, `nluIfStr`,
+  `atomNulStr`, `nicheStr`, `strOp` and `frbStr`;
+* `nulstruct`: `nrAs` in `exprNullableStruct`, plus `ifStruct` and `frbStruct`;
+* `nullist`: `nlCallRet` in `exprNullableList`, plus `qnlParam` (`paramNulList`) and `frbList`;
+* `nulclosure`: `ncTyped` in `exprNulClosure`, plus `ncLetInit`, `qncParam` (`paramNulClosure`) and
+  `qncLetAnn` (`letIsNulClosure`).
+
+`nodeTyIsNullableString` lost its last caller and is deleted.
+
+### 13.6 Four sites stay on their ladder
+
+Each of these reads LEFT-ONLY: the ladder answers the niche where the column is uncovered.
+The column is narrower than the ladder here, not wrong, and switching would change behaviour.
+
+| site | LEFT-ONLY | what the column does not cover |
+| --- | --- | --- |
+| `nrCallFb` (`exprNullableStruct`, call fallback) | 171, 22 files | `S \| null` where `S` is a union arm |
+| `nrParam` (`paramNulRef`) | 8, 2 files | the same |
+| `nrLetAnn` (`letIsNulRef`) | 5, 1 file | the same |
+| `qnlLetAnn` (`letIsNulList`) | 6, 1 file | `(K \| null)[] \| null`, an array of nullable literal-union elements |
+
+The first three are one cause. `repOfNullable`'s `TyObj` arm declines a variant member, because
+that slot is named by the variant index and the ladder resolves it by name. Six of the 22
+`nrCallFb` files are `std:fs` programs: `IoResult` is `IoError | null`, and `IoError` is an arm of
+`string | IoError`. The witness is
+`tests/cases/closures/nullable-arm-param-function-value.vl`, where `Circle` is an arm of `Shape`.
+These three move once the column covers a nullable variant member.
+
+`qnlLetAnn` is `nodeTyIsNulI32List` admitting a nullable literal-union element, which shares the
+`i32` sentinel. `repOfNullable`'s `TyArray` arm does not admit it. The witness is
+`tests/cases/lists/nullable-elem-list-nullable-binding.vl`.
+
+### 13.7 What is next, in order
+
+`exprString`, then `exprRefArray`, `exprStringArray`, `exprArray`, `exprF64Array` and
+`exprListRep`, each under the same oracle. `exprString` was not converted here. Most of its
+rungs are about the call and the callee (`slice`, `pop`, closure-array calls, field closures,
+function-value signatures) rather than the node's own type. Only its `AsExpr` and `if`-join
+`TK_STR` rungs are candidates for the column.
+
+Before those, cover a nullable variant member and a nullable-literal-union element in
+`repOfNullable`, then move the four sites in §13.6. The alias sites of §13.3 still wait for
+registry step 5.
