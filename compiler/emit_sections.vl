@@ -435,16 +435,6 @@ import {
   narrowTys,
   narrowVariants,
   nestedNameBySid,
-  pendingF32,
-  pendingF64,
-  pendingI64,
-  pendingListKind,
-  pendingListSlot,
-  pendingMapSlot,
-  pendingNulLitUnion,
-  pendingNulRefHeap,
-  pendingStructIdx,
-  pendingVariantIdx,
   postMonoShapes,
   raUsed,
   reExpName,
@@ -679,7 +669,6 @@ import {
   nulScalarListKindOfNode,
   nulVariantIndexOf,
   paramStructIdxOf,
-  pendingLitUnion,
   preStmtNarrow,
   pushPostGuardNarrow,
   recordRefPushSlot,
@@ -8416,55 +8405,58 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
     // annotated struct, `pendingListKind`/`pendingListSlot` an empty `[]` to its list.
     const gck = globalCellKind(globalStmts[gi])
     const gcs = globalCellStructIdx(globalStmts[gi])
-    if gck == "struct" { pendingStructIdx = gcs }
+    const sc = expCtxHere()
+    if gck == "struct" { sc.structIdx = gcs }
     // A variant cell seeds the variant context, so the literal builds the bare variant struct.
     // Bounded, because `gcs` is a variant index only where `globalCellStructIdx` found one; its
     // last rung falls through to `structIndexOfExpr`, another table's index entirely.
     if gck == "variant" {
-      if gcs >= 0 && gcs < uVarHeap.length { pendingVariantIdx = gcs }
+      if gcs >= 0 && gcs < uVarHeap.length { sc.variantIdx = gcs }
     }
     // A nullable-struct cell seeds the same struct context: a bare `null` init lowers as
     // `ref.null $S` (a valid constexpr), a struct literal as that struct.
-    if gck == "nulstruct" { pendingStructIdx = gcs }
+    if gck == "nulstruct" { sc.structIdx = gcs }
     // A nullable-variant cell seeds the variant context and its own typed null, bounded for the
     // same reason as its non-null sibling.
     if gck == "nulvariant" {
       if gcs >= 0 && gcs < uVarHeap.length {
-        pendingVariantIdx = gcs
-        pendingNulRefHeap = uVarHeap[gcs]
+        sc.variantIdx = gcs
+        sc.nulRefHeap = uVarHeap[gcs]
       }
     }
     const gcLb = letListBuild(globalStmts[gi], -1)
-    pendingListKind = gcLb.lbKind
-    pendingListSlot = gcLb.lbSlot
+    sc.listKind = gcLb.lbKind
+    sc.listSlot = gcLb.lbSlot
+    expCtxApply(sc)
     // The rungs a cell derives from its kind alone, shared with the local `let`, the
     // start-function init and the `global.set` arm: a distinct-backing nullable scalar
     // list's leaf build code (a small `i64` literal would otherwise build the i32 list),
     // and the nullable-list and nullable-closure null reps.
-    expCtxApply(expCtxForCell(gck))
+    const cc = expCtxForCell(gck)
     // A map cell's `Map()` init builds the struct of its map SHAPE; a nullable one's bare
     // `null` lowers as `ref.null $mapStruct`. Both are valid WasmGC constexprs.
-    if gck == "map" { pendingMapSlot = letMapShapeOf(globalStmts[gi], -1) }
+    if gck == "map" { cc.mapSlot = letMapShapeOf(globalStmts[gi], -1) }
     if gck == "nulmap" {
       const nms = nulMapShapeOf(globalStmts[gi], -1)
-      pendingMapSlot = nms
-      pendingNulRefHeap = mapTypeIdxOf(nms)
+      cc.mapSlot = nms
+      cc.nulRefHeap = mapTypeIdxOf(nms)
     }
     // A wider numeric cell re-encodes an integer literal directly as `i64.const`/`f32.const`/
     // `f64.const`, so the init stays a constexpr (no convert op).
-    pendingI64 = (gck == "i64")
-    pendingF32 = (gck == "f32")
-    pendingF64 = (gck == "f64")
+    cc.wantI64 = (gck == "i64")
+    cc.wantF32 = (gck == "f32")
+    cc.wantF64 = (gck == "f64")
     // A literal-union const lowers its member init as `i32.const <id>`; a nullable one lowers a
     // bare `null` as the -1 sentinel. Un-seeded, a member init emitted the string ref into the
     // i32 niche cell (invalid wasm) and a `null` init drew a loud reject.
-    if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
+    if letIsLitUnion(globalStmts[gi]) { cc.litUnion = 1 }
     if g.letType >= 0 {
       if nodeTyIsNulLitUnion(g.letType) {
-        pendingLitUnion = 1
-        pendingNulLitUnion = true
+        cc.litUnion = 1
+        cc.nulLitUnion = true
       }
     }
+    expCtxApply(cc)
     // A union cell boxes its init in the constexpr (`struct.new` / `array.new_fixed` /
     // `i32.const` are all constant in WasmGC), and a `const f = add` aliasing a generic named
     // function emits its closure through the floor-less core, as `emitLetDeclStmt` does.
