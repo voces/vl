@@ -1,0 +1,611 @@
+// The D1655 family: a memo whose staleness key reads only epochs and table LENGTHS is blind
+// to every IN-PLACE fill of a table its value depends on. `emitPassGen` is the shared fix: a
+// memo answer may not outlive the pass that computed it.
+//
+//     vl run scripts/memo-generation-probe.vl [--list]
+//     vl run scripts/memo-generation-probe.vl --run [--only=<id>,<id>] [--before P] [--out P] [--vl P]
+//     vl run scripts/memo-generation-probe.vl --revert
+//
+// --list    Derives every generation-stamped guard in `compiler/*.vl` by shape and checks the
+//           stamps it finds against the rows in `scripts/memo-generation-rows.json`. A stamp
+//           nobody classified, a row naming a stamp that is gone, or a disable edit whose
+//           anchor drifted is a failure (exit 1): a new memo cannot join the tree ungraded.
+// --run     Applies a row's DISABLE edit (the memo MISSES, which is stronger than stamping it
+//           on `emitPassGen`), builds a probe compiler with `--before` as the seed, reverts
+//           the tree and leaves the artifact at `--out`. Grade ONE row at a time (`--only`):
+//           with every memo off the compiler exhausts the GC heap and masks every answer.
+//           A disable edit must target the memo's READ, never a first-wins write rule.
+// --revert  Restores an interrupted `--run`.
+//
+// THE ROWS ARE DATA. `memo-generation-rows.json` is a JSON array, one row per line:
+//   {"id", "stamps": [...], "verdict", "old", "new", "all"?, "note"?}
+// `verdict` is pass-stamped | no-refined-input | resume-reseeds | not-a-memo | probe. `old`
+// and `new` are the disable edit (absent for a row that is no memo); `old` must occur exactly
+// once in `compiler/*.vl`, unless `"all": true` applies it to every file that has it.
+// Adding a memo is adding a line there; no code changes. Run from the checkout root. The
+// graded table is `docs/internals/memo-generation-census-2026-09.md`.
+
+import { IoError, listDir, readTextFile, writeTextFile } from "std:fs"
+import { Json, JsonError, parseJson } from "std:json"
+import { programArgs } from "std:args"
+import { ProcessOutput, exit, runProgram } from "std:process"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import {
+  endsWith,
+  join,
+  padEnd,
+  padStart,
+  replaceAll,
+  split,
+  startsWith,
+} from "std:str"
+import { includes, sorted } from "std:array"
+import { JsonMap, die, exists, findFrom, univNl } from "./lib/common"
+
+const COMPILER_DIR = "compiler"
+const ROWS_PATH = "scripts/memo-generation-rows.json"
+const BACKUP = "_scratch/memo-probe-backup"
+const VERDICTS = [
+  "pass-stamped", "no-refined-input", "resume-reseeds", "not-a-memo", "probe",
+]
+
+// One classified memo. `hasEdit` is false for a row that is no memo.
+type Row = {
+  id: string,
+  stamps: string[],
+  verdict: string,
+  hasEdit: boolean,
+  all: boolean,
+  old: string,
+  repl: string,
+}
+
+// A source file's name and its text, newlines normalised as Python's reader gave them.
+type Src = { name: string, text: string }
+
+// ── byte classes ──────────────────────────────────────────────────────────────
+
+function isIdStart(b: i32): boolean {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+function isIdChar(b: i32): boolean { isIdStart(b) || (b >= 48 && b <= 57) }
+
+// Python's ASCII `\s`.
+function isWs(b: i32): boolean { b == 32 || (b >= 9 && b <= 13) }
+
+function skipWs(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isWs(s[j]) { j = j + 1 }
+  j
+}
+
+// The end of the identifier starting at `i`, or `i` when none starts there.
+function idEnd(s: string, i: i32): i32 {
+  if i >= s.length || !isIdStart(s[i]) { return i }
+  let j = i + 1
+  while j < s.length && isIdChar(s[j]) { j = j + 1 }
+  j
+}
+
+function hasAt(s: string, i: i32, lit: string): boolean {
+  if i < 0 || i + lit.length > s.length { return false }
+  let k = 0
+  while k < lit.length {
+    if s[i + k] != lit[k] { return false }
+    k = k + 1
+  }
+  true
+}
+
+// `!=` or `==` at `i`: the operator's width, else 0.
+function cmpOpLen(s: string, i: i32): i32 {
+  if hasAt(s, i, "!=") || hasAt(s, i, "==") { return 2 }
+  0
+}
+
+// ── the stamp census ──────────────────────────────────────────────────────────
+
+const STAMP_MARKS = [
+  "Epoch", "Gen", "Len", "Ver", "Seen", "Root", "Stamp", "Head",
+]
+
+function hasStampMark(name: string): boolean {
+  for m in STAMP_MARKS {
+    if name.indexOf(m) >= 0 { return true }
+  }
+  false
+}
+
+// `^(?:export )?(?:let|const) NAME\s*(?::|=)`: the declared name, or "".
+function declaredName(ln: string): string {
+  let i = 0
+  if hasAt(ln, 0, "export ") { i = 7 }
+  if hasAt(ln, i, "let ") { i = i + 4 }
+  else if hasAt(ln, i, "const ") { i = i + 6 }
+  else { return "" }
+  const e = idEnd(ln, i)
+  if e == i { return "" }
+  const j = skipWs(ln, e)
+  if j < ln.length && (ln[j] == 58 || ln[j] == 61) { return ln.slice(i, e) }
+  ""
+}
+
+// Module-level bindings whose name reads as a generation stamp, name -> "file:line" of the
+// last declaration.
+function moduleStamps(srcs: Src[]): Map<string, string> {
+  const out = Map<string, string>()
+  for f in srcs {
+    const lines = split(f.text, "\n")
+    let i = 0
+    while i < lines.length {
+      const name = declaredName(lines[i])
+      if name.length > 0 && hasStampMark(name) {
+        out[name] = f.name + ":" + toString(i + 1)
+      }
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Guard 1: `^\s*\(?NAME\s*(?:!=|==)\s*[A-Za-z_]`.
+function guard1(ln: string): string {
+  let i = skipWs(ln, 0)
+  if i < ln.length && ln[i] == 40 { i = i + 1 }
+  const e = idEnd(ln, i)
+  if e == i { return "" }
+  const j = skipWs(ln, e)
+  const n = cmpOpLen(ln, j)
+  if n == 0 { return "" }
+  const k = skipWs(ln, j + n)
+  if k < ln.length && isIdStart(ln[k]) { return ln.slice(i, e) }
+  ""
+}
+
+// The text after a leading `if ` (`^\s*if `), or -1.
+function afterIf(ln: string): i32 {
+  const i = skipWs(ln, 0)
+  if hasAt(ln, i, "if ") { return i + 3 }
+  -1
+}
+
+// Guard 2: `^\s*if .*?\bNAME\[[^\]]+\]\s*(?:!=|==)\s*[A-Za-z_]`, the leftmost NAME.
+function guard2(ln: string): string {
+  const from = afterIf(ln)
+  if from < 0 { return "" }
+  let p = from
+  while p < ln.length {
+    if isIdStart(ln[p]) && (p == 0 || !isIdChar(ln[p - 1])) {
+      const e = idEnd(ln, p)
+      if e < ln.length && ln[e] == 91 {
+        const close = findFrom(ln, "]", e + 1)
+        if close > e + 1 {
+          const j = skipWs(ln, close + 1)
+          const n = cmpOpLen(ln, j)
+          if n > 0 {
+            const k = skipWs(ln, j + n)
+            if k < ln.length && isIdStart(ln[k]) { return ln.slice(p, e) }
+          }
+        }
+      }
+    }
+    p = p + 1
+  }
+  ""
+}
+
+// Guard 3: `^\s*if .*?sidArrGet\(NAME\s*,`, the leftmost call.
+function guard3(ln: string): string {
+  const from = afterIf(ln)
+  if from < 0 { return "" }
+  let p = findFrom(ln, "sidArrGet(", from)
+  while p >= 0 {
+    const s = p + 10
+    const e = idEnd(ln, s)
+    if e > s && skipWs(ln, e) < ln.length && ln[skipWs(ln, e)] == 44 {
+      return ln.slice(s, e)
+    }
+    p = findFrom(ln, "sidArrGet(", p + 1)
+  }
+  ""
+}
+
+// Guard 4: `^\s*if\s+NAME\.length\s*!=\s*NAME\.length\s*\{`, answering the left table.
+function guard4(ln: string): string {
+  let i = skipWs(ln, 0)
+  if !hasAt(ln, i, "if") { return "" }
+  const w = skipWs(ln, i + 2)
+  if w == i + 2 { return "" }
+  const e = idEnd(ln, w)
+  if e == w || !hasAt(ln, e, ".length") { return "" }
+  const j = skipWs(ln, e + 7)
+  if !hasAt(ln, j, "!=") { return "" }
+  const k = skipWs(ln, j + 2)
+  const e2 = idEnd(ln, k)
+  if e2 == k || !hasAt(ln, e2, ".length") { return "" }
+  const m = skipWs(ln, e2 + 7)
+  if m < ln.length && ln[m] == 123 { return ln.slice(w, e) }
+  ""
+}
+
+// Guard 5: `^\s*if\s+P\.nodes\.length\s*(?:!=|==)\s*NAME`.
+function guard5(ln: string): string {
+  const i = skipWs(ln, 0)
+  if !hasAt(ln, i, "if") { return "" }
+  const w = skipWs(ln, i + 2)
+  if w == i + 2 || !hasAt(ln, w, "P.nodes.length") { return "" }
+  const j = skipWs(ln, w + 14)
+  const n = cmpOpLen(ln, j)
+  if n == 0 { return "" }
+  const k = skipWs(ln, j + n)
+  const e = idEnd(ln, k)
+  if e == k { return "" }
+  ln.slice(k, e)
+}
+
+// The first guard shape that names a known stamp on this line, else "".
+function guardStamp(ln: string, stamps: Map<string, string>): string {
+  let g = guard1(ln)
+  if g.length > 0 && stamps[g] != null { return g }
+  g = guard2(ln)
+  if g.length > 0 && stamps[g] != null { return g }
+  g = guard3(ln)
+  if g.length > 0 && stamps[g] != null { return g }
+  g = guard4(ln)
+  if g.length > 0 && stamps[g] != null { return g }
+  g = guard5(ln)
+  if g.length > 0 && stamps[g] != null { return g }
+  ""
+}
+
+function trimmedStartsWithComment(ln: string): boolean {
+  const i = skipWs(ln, 0)
+  hasAt(ln, i, "//")
+}
+
+// Stamp -> where a guard reads it, in file then line order.
+function derive(
+  srcs: Src[],
+  stamps: Map<string, string>,
+): Map<string, string[]> {
+  const hits = Map<string, string[]>()
+  for f in srcs {
+    const lines = split(f.text, "\n")
+    let i = 0
+    while i < lines.length {
+      const ln = lines[i]
+      if !trimmedStartsWithComment(ln) {
+        const s = guardStamp(ln, stamps)
+        if s.length > 0 {
+          const at = f.name + ":" + toString(i + 1)
+          const prev = hits[s]
+          if prev == null { hits[s] = [at] } else { prev.push(at) }
+        }
+      }
+      i = i + 1
+    }
+  }
+  hits
+}
+
+// ── the rows ──────────────────────────────────────────────────────────────────
+
+function strOf(m: JsonMap, k: string): string {
+  const v = m[k]
+  if v is string { return v }
+  ""
+}
+
+function badRows(msg: string): never {
+  die("memo-generation-probe: " + ROWS_PATH + " " + msg, 1)
+  exit(1)
+}
+
+function rowFrom(m: JsonMap): Row {
+  const stamps: string[] = []
+  const ss = m["stamps"]
+  if ss is Json[] {
+    for s in ss {
+      if s is string {
+        stamps.push(s)
+      } else {
+        badRows("has a non-string stamp")
+      }
+    }
+  }
+  const old = strOf(m, "old")
+  const all = m["all"]
+  {
+    id: strOf(m, "id"),
+    stamps: stamps,
+    verdict: strOf(m, "verdict"),
+    hasEdit: old.length > 0,
+    all: all is boolean && all,
+    old: old,
+    repl: strOf(m, "new"),
+  }
+}
+
+function loadRows(): Row[] {
+  const out: Row[] = []
+  const text = readTextFile(ROWS_PATH)
+  if text is IoError { badRows("cannot be read (" + text.msg + ")") }
+  const j = parseJson(text)
+  if j is JsonError { badRows("is not JSON: " + j.msg) }
+  if j is Json[] {
+    for r in j {
+      if r is JsonMap {
+        out.push(rowFrom(r))
+      } else {
+        badRows("has a row that is not an object")
+      }
+    }
+    return out
+  }
+  badRows("is not a JSON array")
+}
+
+// ── the tree ──────────────────────────────────────────────────────────────────
+
+// `compiler/*.vl`, in name order, newlines normalised.
+function loadSrcs(): Src[] {
+  const out: Src[] = []
+  const names = listDir(COMPILER_DIR)
+  if names is IoError {
+    die("memo-generation-probe: cannot list \{COMPILER_DIR} (\{names.msg})", 1)
+    return out
+  }
+  const vls = names.filter(
+    (n: string): boolean => endsWith(n, ".vl") && !startsWith(n, "."),
+  )
+  for n in sorted(vls, (a: string, b: string): boolean => a < b) {
+    const t = readTextFile(COMPILER_DIR + "/" + n)
+    if t is IoError {
+      die("memo-generation-probe: cannot read \{n} (\{t.msg})", 1)
+      return out
+    }
+    out.push({ name: n, text: univNl(t) })
+  }
+  out
+}
+
+// Non-overlapping occurrences, as Python's `str.count`.
+function countOf(s: string, needle: string): i32 {
+  let n = 0
+  let at = findFrom(s, needle, 0)
+  while at >= 0 {
+    n = n + 1
+    at = findFrom(s, needle, at + needle.length)
+  }
+  n
+}
+
+// ── --list ────────────────────────────────────────────────────────────────────
+
+function cmdList(): i32 {
+  const srcs = loadSrcs()
+  const rows = loadRows()
+  const stamps = moduleStamps(srcs)
+  const hits = derive(srcs, stamps)
+  const owned = Map<string, string>()
+  for r in rows {
+    for s in r.stamps { owned[s] = r.id }
+  }
+  print(
+    "module-level stamp variables: \{stamps.length} · read by a guard: \{hits.length} · rows: \{rows.length}",
+  )
+  for v in VERDICTS {
+    const ids: string[] = []
+    for r in rows {
+      if r.verdict == v { ids.push(r.id) }
+    }
+    print(
+      "  \{padEnd(v, 17, " ")} \{padStart(toString(ids.length), 2, " ")}  \{join(ids, ", ")}",
+    )
+  }
+  const bad: string[] = []
+  for s in sorted(hits.keys(), (a: string, b: string): boolean => a < b) {
+    if owned[s] == null {
+      const at = hits[s] ?? []
+      bad.push(
+        "UNCLASSIFIED stamp `\{s}` (declared \{stamps[s] ?? ""}) read at \{join(at.slice(0, 3), ", ")} — add a row to \{ROWS_PATH}, and a disable edit unless its key already reads `emitPassGen`",
+      )
+    }
+  }
+  const texts: string[] = []
+  for f in srcs { texts.push(f.text) }
+  const src = join(texts, "\n")
+  for r in rows {
+    for s in r.stamps {
+      if stamps[s] == null {
+        bad.push("STALE ROW `\{r.id}`: no module-level stamp `\{s}` any more")
+      }
+    }
+    if r.hasEdit {
+      const c = countOf(src, r.old)
+      if r.all {
+        if c < 1 { bad.push("STALE EDIT `\{r.id}`: anchor gone") }
+      } else if c != 1 {
+        bad.push("STALE EDIT `\{r.id}`: anchor appears \{c} times, want 1")
+      }
+    }
+  }
+  for b in bad { print("  " + b) }
+  if bad.length > 0 { return 1 }
+  0
+}
+
+// ── --run / --revert ──────────────────────────────────────────────────────────
+
+// Run a helper that must succeed (`mkdir`, `rm`); a failure to start it is fatal.
+function sh(cmd: string, args: string[]) {
+  const r = runProgram(cmd, args)
+  if r is IoError { die("memo-generation-probe: " + r.msg, 1) }
+}
+
+function backupFiles(): string[] {
+  const out: string[] = []
+  const names = listDir(BACKUP)
+  if names is IoError { return out }
+  for n in sorted(names, (a: string, b: string): boolean => a < b) {
+    if endsWith(n, ".vl") { out.push(n) }
+  }
+  out
+}
+
+function readOrDie(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("memo-generation-probe: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  t
+}
+
+function writeOrDie(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null {
+    die("memo-generation-probe: cannot write \{path} (\{w.msg})", 1)
+  }
+}
+
+// The snapshot is consumed: left behind, the NEXT run's interrupted-run restore would put it
+// back over whatever the tree became since.
+function cmdRevert(): i32 {
+  let n = 0
+  for name in backupFiles() {
+    writeOrDie(COMPILER_DIR + "/" + name, readOrDie(BACKUP + "/" + name))
+    sh("rm", ["-f", BACKUP + "/" + name])
+    n = n + 1
+  }
+  print("reverted \{n} file(s)")
+  0
+}
+
+// One planned edit: the file, the row, and whether it applies to every occurrence.
+type Edit = { file: string, row: Row }
+
+function planEdits(rows: Row[], srcs: Src[], only: string[] | null): Edit[] {
+  const out: Edit[] = []
+  for r in rows {
+    if !r.hasEdit { continue }
+    if only != null && !only.includes(r.id) { continue }
+    if r.all {
+      for f in srcs {
+        if f.text.includes(r.old) { out.push({ file: f.name, row: r }) }
+      }
+      continue
+    }
+    let home = ""
+    for f in srcs {
+      if home.length == 0 && countOf(f.text, r.old) == 1 { home = f.name }
+    }
+    if home.length > 0 {
+      out.push({ file: home, row: r })
+    } else {
+      print("no unique home for \{r.id}'s disable edit")
+    }
+  }
+  out
+}
+
+// A child's captured stream, printed as it would have reached the terminal.
+function echo(s: string) {
+  if s.length == 0 { return }
+  if endsWith(s, "\n") { print(s.slice(0, s.length - 1)) } else { print(s) }
+}
+
+function cmdRun(
+  before: string,
+  outPath: string,
+  vl: string,
+  only: string[] | null,
+): i32 {
+  // An interrupted run left its snapshot behind: restore it BEFORE taking a new one.
+  if backupFiles().length > 0 { cmdRevert() }
+  sh("mkdir", ["-p", BACKUP])
+  const todo = planEdits(loadRows(), loadSrcs(), only)
+  for e in todo {
+    if !exists(BACKUP + "/" + e.file) {
+      writeOrDie(BACKUP + "/" + e.file, readOrDie(COMPILER_DIR + "/" + e.file))
+    }
+  }
+  for e in todo {
+    const path = COMPILER_DIR + "/" + e.file
+    const s = univNl(readOrDie(path))
+    const c = countOf(s, e.row.old)
+    if !e.row.all && c != 1 {
+      print("SKIP \{e.row.id} (anchor count \{c})")
+      continue
+    }
+    writeOrDie(path, replaceAll(s, e.row.old, e.row.repl))
+    print("disabled " + padEnd(e.row.id, 22, " ") + " " + e.file)
+  }
+  let rc = 1
+  const r = runProgram(
+    vl,
+    ["build", "compiler/entry.vl", "-o", outPath, "--compiler", before],
+  )
+  if r is ProcessOutput {
+    rc = r.code
+    echo(decodeUtf8Lossy(r.stdout))
+    echo(decodeUtf8Lossy(r.stderr))
+  } else {
+    print("memo-generation-probe: " + r.msg)
+  }
+  cmdRevert()
+  print("probe compiler: \{outPath} (build rc=\{rc})")
+  rc
+}
+
+// ── arguments ─────────────────────────────────────────────────────────────────
+
+function hasFlag(args: readonly string[], flag: string): boolean {
+  for a in args {
+    if a == flag { return true }
+  }
+  false
+}
+
+// `--flag value` or `--flag=value`, else `fallback`.
+function flagValue(
+  args: readonly string[],
+  flag: string,
+  fallback: string,
+): string {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag && i + 1 < args.length { return args[i + 1] }
+    if startsWith(args[i], flag + "=") {
+      return args[i].slice(flag.length + 1, args[i].length)
+    }
+    i = i + 1
+  }
+  fallback
+}
+
+function main(args: readonly string[]): i32 {
+  if hasFlag(args, "--revert") { return cmdRevert() }
+  if hasFlag(args, "--run") {
+    const only = flagValue(args, "--only", "")
+    let onlyList: string[] | null = null
+    if only.length > 0 { onlyList = split(only, ",") }
+    return cmdRun(
+      flagValue(args, "--before", "build/vl-compiler.wasm"),
+      flagValue(args, "--out", "_scratch/memo-probe.wasm"),
+      flagValue(args, "--vl", "scripts/vl-host/target/release/vl"),
+      onlyList,
+    )
+  }
+  cmdList()
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("memo-generation-probe: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  const code = main(argv)
+  if code != 0 { exit(code) }
+}

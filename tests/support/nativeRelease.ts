@@ -870,3 +870,12 @@ export const rustList = (src: string, name: string): string[] => {
   if (!m) throw new Error(`could not find ${name} in scripts/vl-host/src/main.rs`);
   return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
 };
+
+// A rung's own passes, `OPT_PASSES` or `RELEASE_PASSES`, parsed out of
+// `compiler/opt_scan.vl`, which builds every `-O`/`-O3` argv since rung R2.
+export const vlList = (name: string): string[] => {
+  const src = Deno.readTextFileSync(`${ROOT}/compiler/opt_scan.vl`);
+  const m = new RegExp(`const ${name}\\s*=\\s*\\[([^\\]]*)\\]`).exec(src);
+  if (!m) throw new Error(`could not find ${name} in compiler/opt_scan.vl`);
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+};

@@ -7725,7 +7725,7 @@ inliner does not rescue them in a function that large. `-O3` inlined them all, a
 +10% build time over `-O` in plumb's measurement.
 
 **The rule.** The `-O` rung passes `--always-inline-max-function-size 8` ahead of `-O`
-(`OPT_PASSES` in `scripts/vl-host/src/main.rs`). `-O3` is unchanged. The run-once marks of lane
+(`OPT_PASSES` in `compiler/opt_scan.vl`). `-O3` is unchanged. The run-once marks of lane
 L8 still apply, because `--no-inline` wins over the size. A function of size 8 or less has no loop
 and is well under L8's 160-byte leaf bound, so L8 marks one only when it calls a defined function,
 and then the mark keeps it out of run-once code as before. The L4 escape step is separate and runs
@@ -7807,7 +7807,7 @@ binaryen's `--always-inline-max-function-size=16 --inlining-optimizing` run afte
 on every unit: +2% size (164.4 → 167.6 MB) and Mac Chrome 272 → 309 fps.
 
 **The rule.** The `-O` rung's size goes from 8 to 16 (`OPT_PASSES` in
-`scripts/vl-host/src/main.rs`). `nan32`, at about 20, stays a call: the fast path is inlined and
+`compiler/opt_scan.vl`). `nan32`, at about 20, stays a call: the fast path is inlined and
 the slow path is not. L8's run-once marks still win, and `-O3` is unchanged.
 
 **What was rejected.**

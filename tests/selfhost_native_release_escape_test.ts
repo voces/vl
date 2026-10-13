@@ -22,6 +22,7 @@ import {
   logsOf,
   ROOT,
   rustList,
+  vlList,
   vl,
   WASM_DIS,
   WASM_OPT,
@@ -130,7 +131,7 @@ for (const [fx, melts] of FIXTURES) {
           const c = `${tmp}/c${rung}.wasm`;
           const opt = await run(WASM_OPT, [
             plain,
-            ...rustList(mainRs, passes),
+            ...vlList(passes),
             ...features,
             "-o",
             c,

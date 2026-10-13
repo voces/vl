@@ -1,9 +1,10 @@
-// The `-O` rung's reading of its input module, the first optimizer step ported from the
-// host (docs/internals/optimizer-in-vl.md, rung R1): the functions the rung must not
-// inline because only run-once code calls them, from inside a loop, and the extra pass
-// a function with too many local sets asks for. The host stages the module with
-// `optInLoad`, calls `optRungScan`, and reads the answer back through `optOut*`.
-// A module this cannot decode gets no marks and no extra pass.
+// The `-O` rung's reading of its input module and the `wasm-opt` passes built from it,
+// ported from the host (docs/internals/optimizer-in-vl.md, rungs R1 and R2): a mark for
+// each function the rung must not inline because only run-once code calls it, from inside
+// a loop, the extra pass a function with too many local sets asks for, and the rung's own
+// passes; also the `vl-src` strip an `-O` build's input gets. The host stages the module
+// with `optInLoad`, calls `optRungArgv` or `optStripSrc`, and reads the answer through
+// `optOut*`. A module this cannot decode gets no marks and no extra pass.
 
 import {
   WasmCursor,
@@ -24,6 +25,15 @@ import {
 const RUN_ONCE_INLINE_LEAF_BYTES = 160
 // A function with more `local.set`/`local.tee` than this makes the rung skip `ssa-nomerge`.
 const SSA_SPLIT_MAX_SETS = 8192
+// The low region binaryen's own `--low-memory-unused` assumes; a smaller promise does not
+// pass the flag.
+const LOW_MEMORY_BINARYEN = 1024
+// `-O`: binaryen's `-O`, inlining every function of at most 16 size units (DECISIONS.md,
+// "`-O` inlines leaf helpers").
+const OPT_PASSES = ["--always-inline-max-function-size", "16", "-O"]
+// `-O3`, the release profile (docs/internals/opt-profile-design.md): `--closed-world` melts
+// union boxes, and only the repeated `-O3` melts the grown list wrapper.
+const RELEASE_PASSES = ["--closed-world", "-O3", "--gufa", "-O3"]
 
 let optIn: u8[] = []
 let optOut: u8[] = []
@@ -95,7 +105,104 @@ export function optOutStore(off: i32, count: i32): i32 {
 // function-index order. Returns 1, or 0 with an empty answer when the module did not decode.
 export function optRungScan(): i32 {
   optOut = []
-  const s: ScanState = {
+  const s = newScanState()
+  if !scanModule(s) { return 0 }
+  if ssaSplit(s) { outText("--skip-pass=ssa-nomerge") }
+  const hot = runOnceHotCallees(s)
+  const names = nameTable(s)
+  let k = 0
+  while k < hot.length {
+    optOut.push(10)
+    outName(s, names, hot[k])
+    k = k + 1
+  }
+  1
+}
+
+// The rung's `wasm-opt` passes over the staged module, one `\n`-terminated argument each: a
+// `--no-inline=` mark per hot callee, `--low-memory-unused` when `lowMemory` (the promised
+// bytes, 0 for none) covers binaryen's region, `-g` when `names` is nonzero, the passes of
+// `rung` (1 for `-O`, 3 for `-O3`), then the scan's extra pass. Returns 0 for any other rung.
+export function optRungArgv(rung: i32, names: i32, lowMemory: i32): i32 {
+  optOut = []
+  if rung != 1 && rung != 3 { return 0 }
+  const s = newScanState()
+  const scanned = scanModule(s)
+  if scanned {
+    const hot = runOnceHotCallees(s)
+    const table = nameTable(s)
+    let k = 0
+    while k < hot.length {
+      outText("--no-inline=")
+      outName(s, table, hot[k])
+      optOut.push(10)
+      k = k + 1
+    }
+  }
+  if lowMemory >= LOW_MEMORY_BINARYEN { outArg("--low-memory-unused") }
+  if names != 0 { outArg("-g") }
+  const passes = if rung == 3 { RELEASE_PASSES } else { OPT_PASSES }
+  for p in passes { outArg(p) }
+  if scanned && ssaSplit(s) { outArg("--skip-pass=ssa-nomerge") }
+  1
+}
+
+// Writes the staged module without its `vl-src` custom section, whose rows describe the
+// emitter's bytes, which `-O` rewrites. Returns 1, or 0 with an empty answer when the module
+// has no such section or its section framing does not parse.
+export function optStripSrc(): i32 {
+  optOut = []
+  if (
+    optIn.length < 8
+    || optIn[0] != 0
+    || optIn[1] != 0x61
+    || optIn[2] != 0x73
+    || optIn[3] != 0x6d
+  ) {
+    return 0
+  }
+  outBytes(0, 8)
+  let removed = false
+  const c = wcNew(optIn, 8, optIn.length)
+  while c.pos < c.end {
+    const start = c.pos
+    const id = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos {
+      optOut = []
+      return 0
+    }
+    const end = c.pos + size
+    if id == 0 && isSrcName(c) {
+      removed = true
+    } else {
+      outBytes(start, end - start)
+    }
+    c.pos = end
+  }
+  if !removed {
+    optOut = []
+    return 0
+  }
+  1
+}
+
+// Whether the custom section at the cursor is named `vl-src`; the cursor does not move.
+function isSrcName(c: WasmCursor): boolean {
+  const n = wcNew(c.b, c.pos, c.end)
+  const len = wcU32(n)
+  if n.failed || len != 6 || len > n.end - n.pos { return false }
+  const at = n.pos
+  c.b[at] == 0x76
+    && c.b[at + 1] == 0x6c
+    && c.b[at + 2] == 0x2d
+    && c.b[at + 3] == 0x73
+    && c.b[at + 4] == 0x72
+    && c.b[at + 5] == 0x63
+}
+
+function newScanState(): ScanState {
+  {
     nImports: 0,
     start: -1,
     escapes: [],
@@ -110,30 +217,31 @@ export function optRungScan(): i32 {
     nameAt: [],
     nameLen: [],
   }
-  if !scanModule(s) { return 0 }
+}
+
+// Whether some body has more local sets than the rung runs `ssa-nomerge` on.
+function ssaSplit(s: ScanState): boolean {
   let i = 0
   while i < s.bodySets.length {
-    if s.bodySets[i] > SSA_SPLIT_MAX_SETS {
-      outText("--skip-pass=ssa-nomerge")
-      i = s.bodySets.length
-    }
+    if s.bodySets[i] > SSA_SPLIT_MAX_SETS { return true }
     i = i + 1
   }
-  const hot = runOnceHotCallees(s)
-  const names = nameTable(s)
-  let k = 0
-  while k < hot.length {
-    optOut.push(10)
-    const f = hot[k]
-    const at = names[f]
-    if at >= 0 {
-      outBytes(s.nameAt[at], s.nameLen[at])
-    } else {
-      outDecimal(f - s.nImports)
-    }
-    k = k + 1
+  false
+}
+
+// A function's binaryen name: its name-section entry, else its defined index.
+function outName(s: ScanState, names: i32[], f: i32) {
+  const at = names[f]
+  if at >= 0 {
+    outBytes(s.nameAt[at], s.nameLen[at])
+  } else {
+    outDecimal(f - s.nImports)
   }
-  1
+}
+
+function outArg(t: string) {
+  outText(t)
+  optOut.push(10)
 }
 
 // Appends an ASCII literal.
