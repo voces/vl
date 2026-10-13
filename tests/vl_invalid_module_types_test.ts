@@ -7,9 +7,13 @@
 // module, reads the two types off the failing operator, and writes each module type index with
 // its VL name (asked of the compiler that emitted the module) and its struct or array shape.
 //
-// THE WITNESSES MUST STILL BE INVALID: D2416 and D1974 (one module and two) are check-clean
-// invalid wasm on the seed this lands on. When one is fixed its case goes red at the "still
-// check-clean" or exit-code assertion; replace it with any other such program.
+// NO WITNESS IS A LIVE COMPILER DEFECT. The invalid module is made by
+// `$VL_FAULT_INJECT=wrong-ref:<type>[:<body>]`, which rewrites one emitted body to hand
+// `ref.null $type` to a `struct.get` of another struct type, so the validator's sentence is the
+// production one (`expected (ref null $type), found (ref null $type)`) over a VALID program.
+// Which type index is the record, the string or the map, and which body is `f`, is the
+// emitter's layout and changes with it, so each case sweeps the index until the namer's output
+// names what the case is about, then checks all three channels at that index.
 //
 // GATING: `SELFHOST_NATIVE_ALIGN=1` plus the built binary and seed.
 //
@@ -69,6 +73,9 @@ type Case = {
   name: string;
   files: Record<string, string>;
   entry: string;
+  // Sweep the faulted TYPE or the faulted function BODY until `hit` accepts the output.
+  sweep: "type" | "body";
+  hit: (out: string) => boolean;
   // Each text must appear on every channel.
   want: string[];
   // Text no channel may print.
@@ -77,54 +84,37 @@ type Case = {
 
 const CASES: Case[] = [
   {
-    name: "D2416: a record arriving where an i32 is expected names the record",
+    name: "a record arriving where another type is expected names the record",
     files: {
       "r.vl": "type A = { r: i32 }\n" +
-        "function st(): A { return { r: 8 } }\n" +
-        "function mkB(): boolean | null { return null }\n" +
-        "function take(a) {\n" +
-        "  const f = a ?? st()\n" +
-        "  if f is A { print(f.r) } else { print(0) }\n" +
-        "}\n" +
-        "take(mkB())\n",
+        "function mk(): A[] { [{ r: 1 }] }\n" +
+        "print(mk().length)\n",
     },
     entry: "r.vl",
-    want: [
-      "failed to validate inside `take`",
-      "type mismatch: expected i32, found (ref $0); $0 is `A`, struct {mut i32}",
-    ],
+    sweep: "type",
+    hit: (o) => o.includes("is `A`, struct {mut i32}"),
+    want: ["failed to validate inside `mk`", "is `A`, struct {mut i32}"],
     never: ["$type"],
   },
   {
     name:
-      "D1974: a string expected where an i32 arrives names `string` and its shape",
+      "a string where another type is expected names `string` and its shape",
     files: {
-      "s.vl": "function f(k: i32): string {\n" +
-        "  {\n" +
-        '    return "a"\n' +
-        "  }\n" +
-        "  5\n" +
-        "}\n" +
-        "print(f(1))\n",
+      "s.vl": 'function f(k: i32): string { "a" }\n' + "print(f(1))\n",
     },
     entry: "s.vl",
-    want: [
-      "failed to validate inside `f`",
-      "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
-    ],
+    sweep: "type",
+    hit: (o) => o.includes("is `string`, struct {"),
+    want: ["failed to validate inside", "is `string`, struct {"],
     never: ["$type"],
   },
   {
-    // D1974's function moved into an imported module.
     name:
-      "D1974: a canonical type id is a module index, and a merged function its source name",
+      "a canonical type id is a module index, and a merged function its source name",
     files: {
-      "s.vl": "export function f(k: i32): string {\n" +
-        "  {\n" +
-        '    return "a"\n' +
-        "  }\n" +
-        "  5\n" +
-        "}\n",
+      // A loop, so `f` is neither inlined away nor too short for the fault to rewrite.
+      "s.vl": 'export function f(k: i32): string {\n  let s = "a"\n' +
+        '  for i in 0 to k {\n    s = s + "b"\n  }\n  return s\n}\n',
       "main.vl": 'import { f } from "./s"\n' +
         "function d(x: i32) {\n" +
         "  print(f(x))\n" +
@@ -132,11 +122,13 @@ const CASES: Case[] = [
         "d(1)\n",
     },
     entry: "main.vl",
+    sweep: "body",
+    hit: (o) => o.includes("inside `f`"),
     want: [
       "failed to validate inside `f`",
-      "type mismatch: expected (ref $2), found i32; $2 is `string`, struct {(ref $1), i32, i32, mut i32}",
+      "type mismatch: expected (ref null $",
     ],
-    never: ["(id ", "f$m", "d$m0"],
+    never: ["(id ", "f$m", "d$m0", "$type"],
   },
   // The string-keyed map struct is one heap type for every string-keyed map and set, so it is
   // named by its rep: a `Set<string>` must not be called `{[string]: i32}`.
@@ -144,20 +136,27 @@ const CASES: Case[] = [
     name:
       "a heap type several VL types share is named by its rep, not by one of them",
     files: {
-      "s.vl": "type T = Set<string>\n" +
-        'function d(self: T): string { "RS" }\n' +
-        "function h<T>(x: T): string { x.d() }\n" +
-        "const a: T = Set()\n" +
-        "print([a].map((x) => h(x))[0])\n",
+      "s.vl": 'const a: Set<string> = Set()\na.add("x")\nprint(a.length)\n',
     },
     entry: "s.vl",
-    want: [
-      "type mismatch: expected (ref $",
-      "is `string-keyed map or set`, struct {",
-    ],
+    sweep: "type",
+    hit: (o) => o.includes("is `string-keyed map or set`, struct {"),
+    want: ["is `string-keyed map or set`, struct {"],
     never: ["$type", "{[string]: i32}"],
   },
 ];
+
+const faultOf = (c: Case, i: number) =>
+  c.sweep === "type" ? `wrong-ref:${i}` : `wrong-ref:0:${i}`;
+
+// How many types (or bodies) the emitted module has: the fault's own refusal says.
+const countOf = async (c: Case, dir: string): Promise<number> => {
+  const r = await run(["check", "--codegen", c.entry], dir, faultOf(c, 100000));
+  const word = c.sweep === "type" ? "types" : "bodies";
+  const m = r.out.match(new RegExp(`has (\\d+) ${word}`));
+  if (!m) throw new Error(`the fault did not report a count:\n${r.out}`);
+  return Number(m[1]);
+};
 
 for (const c of CASES) {
   Deno.test({
@@ -165,10 +164,32 @@ for (const c of CASES) {
     ignore: !ENABLED,
     fn: async () => {
       await withDir(c.files, async (dir) => {
+        // The control: with no fault the program is valid and runs.
         const chk = await run(["check", c.entry], dir);
-        if (chk.code !== 0) {
+        const clean = await run(["run", c.entry], dir);
+        if (chk.code !== 0 || clean.code !== 0) {
           throw new Error(
-            `the witness no longer check-cleans (fixed?) — replace it:\n${chk.out}`,
+            `the program must check and run clean:\n${chk.out}${clean.out}`,
+          );
+        }
+        const n = await countOf(c, dir);
+        let at = -1;
+        for (let lo = 0; lo < n && at < 0; lo += 8) {
+          const idx = Array.from(
+            { length: Math.min(8, n - lo) },
+            (_, k) => lo + k,
+          );
+          const outs = await Promise.all(
+            idx.map((i) =>
+              run(["check", "--codegen", c.entry], dir, faultOf(c, i))
+            ),
+          );
+          const k = outs.findIndex((o) => c.hit(o.out));
+          if (k >= 0) at = idx[k];
+        }
+        if (at < 0) {
+          throw new Error(
+            `none of the ${n} faulted ${c.sweep}s satisfied the case`,
           );
         }
         const channels: [string, string[]][] = [
@@ -177,7 +198,7 @@ for (const c of CASES) {
           ["check --codegen", ["check", "--codegen", c.entry]],
         ];
         for (const [what, args] of channels) {
-          const r = await run(args, dir);
+          const r = await run(args, dir, faultOf(c, at));
           if (r.code !== EXIT_COMPILER_BUG) {
             throw new Error(
               `${what}: want exit ${EXIT_COMPILER_BUG}, got ${r.code}\n${r.out}`,
@@ -188,9 +209,9 @@ for (const c of CASES) {
               throw new Error(`${what}: want \`${w}\`, got:\n${r.out}`);
             }
           }
-          for (const n of c.never) {
-            if (r.out.includes(n)) {
-              throw new Error(`${what}: must not print \`${n}\`:\n${r.out}`);
+          for (const x of c.never) {
+            if (r.out.includes(x)) {
+              throw new Error(`${what}: must not print \`${x}\`:\n${r.out}`);
             }
           }
         }
