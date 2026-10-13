@@ -2391,9 +2391,9 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
   false
 }
 
-function seedFieldListBuild(code: i32, refSlot: i32) {
-  pendingListKind = LBK_I32_LIST
-  pendingListSlot = 0
+function seedFieldListBuild(ctx: ExpCtx, code: i32, refSlot: i32) {
+  ctx.listKind = LBK_I32_LIST
+  ctx.listSlot = 0
   if code == FC_REF_LIST || code == FC_NUL_REF_LIST {
     let slot = refSlot
     if slot < 0 { slot = 0 }
@@ -2402,22 +2402,22 @@ function seedFieldListBuild(code: i32, refSlot: i32) {
         "emitProgram: ref-list field element type is not interned",
       )
     }
-    pendingListSlot = slot
+    ctx.listSlot = slot
     if rlElemKindTbl[slot] == RLK_UNION {
-      pendingListKind = LBK_UNION
+      ctx.listKind = LBK_UNION
     } else if code == FC_NUL_REF_LIST && rlElemKindTbl[slot] != RLK_STRUCT {
-      pendingListKind = LBK_REF_AT_SLOT
+      ctx.listKind = LBK_REF_AT_SLOT
     } else {
-      pendingListKind = LBK_REF
+      ctx.listKind = LBK_REF
     }
     return 0
   }
   if fieldCodeScalarListBuildKind(code) >= 0 {
-    pendingListKind = fieldCodeScalarListBuildKind(code)
+    ctx.listKind = fieldCodeScalarListBuildKind(code)
   }
 
   if isNulScalarListFieldCode(code) {
-    pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(code))
+    ctx.listKind = nulScalarListBuildKind(nulScalarListCodeKind(code))
   }
   0
 }
@@ -7995,12 +7995,18 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
       fbLocalSet(rslot)
     }
-    if seedFieldListBuild(code, variantFieldRefSlot(vis[0], fis[0])) < 0 {
+    const sfSaved = expCtxHere()
+    const sfCtx = expCtxHere()
+    if (
+      seedFieldListBuild(sfCtx, code, variantFieldRefSlot(vis[0], fis[0]))
+      < 0
+    ) {
       return -1
     }
-    if emitScalarFieldStoreVal(body, valIx, fnIx, code) < 0 { return -1 }
-    pendingListKind = LBK_I32_LIST
-    pendingListSlot = 0
+    expCtxApply(sfCtx)
+    const sfVal = emitScalarFieldStoreVal(body, valIx, fnIx, code)
+    expCtxApply(sfSaved)
+    if sfVal < 0 { return -1 }
     const vslot = objOrderStashSlot(code, uFieldStorageSlot(vis[0], fis[0]))
     fbLocalSet(vslot)
     let i = 0
@@ -21127,10 +21133,15 @@ let stubWriteRhs = 0 - 1
 // Cleared per program by `emitProgram`: a node id is only meaningful in the arena that minted it.
 export function stubWriteRhsReset() { stubWriteRhs = 0 - 1 }
 
-// Lower an assignment `target = value` onto `body`: emit the value expression, then
-// `local.set <index>` for the target local. The target must be a bare `Ident` naming a
-// param or declared local (no member/indexed assignment in this slice).
+// Lower an assignment `target = value` onto `body`: the value emits under the target's
+// `ExpCtx`, then the store. The caller's context is restored on every exit, failure included.
 function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
+  const saved = expCtxHere()
+  expCtxLeave(saved, emitAssignUnder(body, binIx, fnIx))
+}
+
+// `emitAssign`'s body: an arm applies its target's context and leaves it for the exit to undo.
+function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
   const a = P.nodes[binIx]
   if a is BinExpr {
     // A map cell's `null` is a miss, which no write narrows, so only other places refuse.
@@ -21164,28 +21175,30 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           // wrapper, not the default i32-list) — mirroring the global-init seeding.
           const gLet = globalStmts[gIdx]
           const gaKind = globalCellKind(gLet)
-          if gaKind == "struct" { pendingStructIdx = globalCellStructIdx(gLet) }
+          const gaCtx = expCtxHere()
+          if gaKind == "struct" { gaCtx.structIdx = globalCellStructIdx(gLet) }
           // a nullable-struct global (`g = null` / `g = { … }` over `let g: S | null`): the
           // cell is `(ref null $S)`, so a bare `null` needs the same struct seed the
           // non-null-cell line above gives — from `nulRefStructIdxOfLet`'s `| null` peel.
           if gaKind == "nulstruct" {
-            pendingStructIdx = nulRefStructIdxOfLet(gLet, -1)
+            gaCtx.structIdx = nulRefStructIdxOfLet(gLet, -1)
           }
           // an arm cell (kind-8 `variant` or `nulvariant`) seeds the variant index, exactly
           // as the binding boundary does, so an object-literal RHS builds the bare
           // `(ref $uVarHeap[vi])` instead of the `{tag, value}` box (D1031's unbox reads the same resolver).
           const gaArmIdx = globalCellArmIdx(gLet, gaKind)
           const gaCellIsArm = gaKind == "variant" || gaKind == "nulvariant"
-          if gaCellIsArm { pendingVariantIdx = gaArmIdx }
-          pendingListKind = letAnnRefListKind(gLet)
-          pendingListSlot = letAnnRefListSlot(gLet)
+          if gaCellIsArm { gaCtx.variantIdx = gaArmIdx }
+          gaCtx.listKind = letAnnRefListKind(gLet)
+          gaCtx.listSlot = letAnnRefListSlot(gLet)
           // an empty-`[]`-initialized `S[] | null` global's mono-i32-list misread is
           // `exprArray`/`exprRefArray`'s bug in `emit_classify.vl`, not these seeds'. A
           // map-typed global seeds the map shape, so a bare `Map()` RHS constructs this
           // binding's map struct instead of the shared mono one.
           if exprMap(lhsIx, fnIx) {
-            pendingMapSlot = mapShapeOfExpr(lhsIx, fnIx)
+            gaCtx.mapSlot = mapShapeOfExpr(lhsIx, fnIx)
           }
+          expCtxApply(gaCtx)
           // a union-typed global (kind 4) coerces a raw assigned value into the box; three
           // shapes are not that: a literal-union global's cell is a plain `(mut i32)` atom,
           // a concrete-variant RHS must be boxed unconditionally since a union global's
@@ -21251,13 +21264,13 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
               }
             }
             // a kind-18 nullable ref-array global's null is this global's element wrapper
-            // (`pendingListSlot` above already holds the slot), armed only for a bare `null`
+            // (`gaCtx.listSlot` above already holds the slot), armed only for a bare `null`
             // RHS (the #964 seed-leak gate) so a `[null]` element takes its own heap type instead.
             if gaKind == "nulreflist" {
-              if pendingListSlot >= 0 && pendingListSlot < rlWrapIdx.length {
+              if gaCtx.listSlot >= 0 && gaCtx.listSlot < rlWrapIdx.length {
                 const gnraRhs = P.nodes[unwrapParen(a.binRight)]
                 if gnraRhs is NullLit {
-                  gsCtx.nulRefHeap = rlWrapIdx[pendingListSlot]
+                  gsCtx.nulRefHeap = rlWrapIdx[gaCtx.listSlot]
                 }
               }
             }
@@ -21267,9 +21280,6 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
             if exprIsLitAtom(lhsIx, fnIx) { gsCtx.litUnion = 1 }
             if emitExprExpect(body, a.binRight, fnIx, gsCtx) < 0 { return -1 }
           }
-          pendingListKind = LBK_I32_LIST
-          pendingListSlot = 0
-          pendingMapSlot = -1
           // the scalar dual (D965) at the global-assignment boundary (`b = e` between two
           // module globals) — distinct from the global-init copy in `emit_sections`, since
           // a re-assignment is ordinary code and a const initializer a wasm constexpr.
@@ -21289,11 +21299,6 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           // the nullable-niche recover at the same boundary (D1115) — `g = y` under
           // `if y != null`, into a global whose cell is a non-null ref.
           if nulNicheRecoverOwed(gaKind, a.binRight, fnIx) { fbRefAsNonNull() }
-          // the two seeds this arm sets must be cleared here too (D1563), or an arm-cell
-          // store leaves `pendingVariantIdx` armed for a later `c = null` into an unrelated
-          // nullable struct, which then reads the stale variant seed first.
-          pendingStructIdx = -1
-          pendingVariantIdx = -1
           return emitUserGlobalSet(gIdx) // 0x24 global.set, or a promoted `local.set`
         }
         return emitFail(
@@ -21302,15 +21307,15 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       }
       // a map-typed local seeds the map shape for a bare `Map()` RHS, exactly as the
       // global arm above.
-      if exprMap(lhsIx, fnIx) { pendingMapSlot = mapShapeOfExpr(lhsIx, fnIx) }
+      const laCtx = expCtxHere()
+      if exprMap(lhsIx, fnIx) { laCtx.mapSlot = mapShapeOfExpr(lhsIx, fnIx) }
       // the list seeds a local target needs, keyed off the target expression
       // (`exprListCellBuildKind`) since a declared local has no `LetDecl` left to read and
       // a param never had one — else a list-literal RHS builds the default i32 list into a
-      // non-i32 slot. Saved and restored around the whole arm; `fbLocalSet` is no reset.
-      const savedAsLK = pendingListKind
-      const savedAsLS = pendingListSlot
-      pendingListKind = exprListCellBuildKind(lhsIx, fnIx)
-      pendingListSlot = exprListCellBuildSlot(lhsIx, fnIx)
+      // non-i32 slot.
+      laCtx.listKind = exprListCellBuildKind(lhsIx, fnIx)
+      laCtx.listSlot = exprListCellBuildSlot(lhsIx, fnIx)
+      expCtxApply(laCtx)
       // a union-typed local (kind 4) coerces a raw assigned value into the box (`u = 3.5`
       // over `let u: i32 | f64` boxes the f64); a union-valued RHS passes through unchanged.
       const aUNm = unionNameOfIdentAt(sidOfNode(lhsIx), fnIx, lhsIx)
@@ -21421,9 +21426,6 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         if exprIsLitAtom(lhsIx, fnIx) { asCtx.litUnion = 1 }
         if emitExprExpect(body, a.binRight, fnIx, asCtx) < 0 { return -1 }
       }
-      pendingMapSlot = -1
-      pendingListKind = savedAsLK
-      pendingListSlot = savedAsLS
       // read-only covariance at the ASSIGNMENT boundary (D791) — `aU = lv1` over a
       // `let aU: Shape[]` and a `Circle[]`-repped `lv1`.
       emitRefListWidenSite(
@@ -21607,9 +21609,10 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
       }
       if emitExpr(body, target.idxIndex, fnIx) < 0 { return -1 }
-      pendingStructIdx = storeStructIdx
-      const savedSVI = pendingVariantIdx
-      if storeVariantIdx >= 0 { pendingVariantIdx = storeVariantIdx }
+      const stCtx = expCtxHere()
+      stCtx.structIdx = storeStructIdx
+      if storeVariantIdx >= 0 { stCtx.variantIdx = storeVariantIdx }
+      expCtxApply(stCtx)
       if storeUnionNm != "" {
         if emitUnionBoxArg(body, storeUnionNm, a.binRight, fnIx) < 0 {
           return -1
@@ -21626,10 +21629,9 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       } else if isI64 {
         if emitExprAsI64(body, a.binRight, fnIx) < 0 { return -1 }
       } else if isF32 {
-        const savedPF32 = pendingF32
-        pendingF32 = true
+        stCtx.wantF32 = true
+        expCtxApply(stCtx)
         if emitExprAsF32(body, a.binRight, fnIx) < 0 { return -1 }
-        pendingF32 = savedPF32
       } else if arrElemLitUnionTy(target.idxArr, fnIx) >= 0 {
         // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id —
         // the store half of the boundary `exprIsLitAtom`'s Index arm reads. Without it a
@@ -21687,8 +21689,6 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           )
         }
       }
-      pendingStructIdx = -1
-      pendingVariantIdx = savedSVI
       const storeValSlot = listIdxValSlot(idxKind, idxSlot)
       fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
@@ -21725,20 +21725,23 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           fbStructGet(uBoxIdx, 1)  // box field 1: value (anyref)
           fbRefCast(uVarHeap[nvi]) // ref.cast to the variant struct
           // An ARRAY-typed variant field threads its element kind, exactly as the plain
-          // receiver above does — seeded AFTER the receiver's own emit, which is free to
-          // clobber the pending globals, and cleared again before the `struct.set`.
+          // receiver above does — its context is taken AFTER the receiver's own emit, which
+          // may leave seeds of its own behind.
           const nvCode = variantFieldTypeAt(nvi, nfi)
-          if seedFieldListBuild(nvCode, variantFieldRefSlot(nvi, nfi)) < 0 {
+          const nvCtx = expCtxHere()
+          if (
+            seedFieldListBuild(nvCtx, nvCode, variantFieldRefSlot(nvi, nfi))
+            < 0
+          ) {
             return -1
           }
+          expCtxApply(nvCtx)
           // A SCALAR f64/i64/f32 variant field widens its RHS at the store boundary,
           // exactly as the construct does (`v.f = 9` into an i64 field emitted a raw
           // `i32.const` — invalid wasm at `struct.set`).
           if emitVariantFieldStoreVal(body, nvi, nfi, a.binRight, fnIx) < 0 {
             return -1
           }
-          pendingListKind = LBK_I32_LIST
-          pendingListSlot = 0
           fbStructSet(uVarHeap[nvi], nfi)
           return 0
         }
@@ -21759,14 +21762,17 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           // Array-field element-kind seed + scalar-field RHS widening, as the narrowed
           // branch above.
           const pwCode = variantFieldTypeAt(pwvi, pwfi)
-          if seedFieldListBuild(pwCode, variantFieldRefSlot(pwvi, pwfi)) < 0 {
+          const pwCtx = expCtxHere()
+          if (
+            seedFieldListBuild(pwCtx, pwCode, variantFieldRefSlot(pwvi, pwfi))
+            < 0
+          ) {
             return -1
           }
+          expCtxApply(pwCtx)
           if emitVariantFieldStoreVal(body, pwvi, pwfi, a.binRight, fnIx) < 0 {
             return -1
           }
-          pendingListKind = LBK_I32_LIST
-          pendingListSlot = 0
           fbStructSet(uVarHeap[pwvi], pwfi)
           return 0
         }
@@ -21785,14 +21791,17 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         if emitExpr(body, target.memObj, fnIx) < 0 { return -1 }
         fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
         const nwCode = variantFieldTypeAt(nwvi, nwfi)
-        if seedFieldListBuild(nwCode, variantFieldRefSlot(nwvi, nwfi)) < 0 {
+        const nwCtx = expCtxHere()
+        if (
+          seedFieldListBuild(nwCtx, nwCode, variantFieldRefSlot(nwvi, nwfi))
+          < 0
+        ) {
           return -1
         }
+        expCtxApply(nwCtx)
         if emitVariantFieldStoreVal(body, nwvi, nwfi, a.binRight, fnIx) < 0 {
           return -1
         }
-        pendingListKind = LBK_I32_LIST
-        pendingListSlot = 0
         fbStructSet(uVarHeap[nwvi], nwfi)
         return 0
       }
@@ -21825,20 +21834,21 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       // annotated `let xs: T[] = []` or an object-literal array field uses (else the
       // empty literal defaults to the i32-list wrapper and the `struct.set` rejects it).
       const fscode = sFieldTypeAt(si, fieldIdx)
-      if seedFieldListBuild(fscode, sFieldRefSlot(si, fieldIdx)) < 0 {
+      const fsCtx = expCtxHere()
+      if seedFieldListBuild(fsCtx, fscode, sFieldRefSlot(si, fieldIdx)) < 0 {
         return -1
       }
       // A MAP-typed field (code 19) seeds the map SHAPE — the write twin of `emitObj`'s
       // construct-side seed, carrying the same defect the ident arms above describe.
-      pendingMapSlot = -1
-      if fscode == FC_MAP { pendingMapSlot = sFieldMapShape(si, fieldIdx) }
+      fsCtx.mapSlot = -1
+      if fscode == FC_MAP { fsCtx.mapSlot = sFieldMapShape(si, fieldIdx) }
       // D1568 — a code-15 field seeds its target struct row, the write twin of the
       // construct-side seed: without it `w.f = null` over `f: C | null` reached
-      // `emitNullLitNode` with every seed unset. Restored below (D1563's rule: every seed has a home).
-      const savedWPSI = pendingStructIdx
+      // `emitNullLitNode` with every seed unset.
       if fscode == FC_STRUCT {
-        pendingStructIdx = sFieldTgtStructIdx(si, fieldIdx)
+        fsCtx.structIdx = sFieldTgtStructIdx(si, fieldIdx)
       }
+      expCtxApply(fsCtx)
       // a box-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
       // niche fields seed their null rep for a bare `null` (the `emitNullLitNode` table).
       // The write twin of the construct-side seed, through `emitUnionBoxArg` since the
@@ -21918,9 +21928,6 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         fscode,
         sFieldRefSlot(si, fieldIdx),
       )
-      pendingListKind = LBK_I32_LIST
-      pendingMapSlot = -1
-      pendingStructIdx = savedWPSI
       fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
       return 0
     }
