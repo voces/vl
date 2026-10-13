@@ -205,12 +205,13 @@ Deno.test({
         ? Deno.remove(`${dir}/build/vl-compiler.wasm.src`).catch(() => {})
         : Deno.writeTextFile(`${dir}/build/vl-compiler.wasm.src`, text);
     try {
-      await Deno.mkdir(`${dir}/scripts`);
+      await Deno.mkdir(`${dir}/scripts/lib`, { recursive: true });
       await Deno.mkdir(`${dir}/compiler`);
       await Deno.mkdir(`${dir}/build`);
       for (const f of ["survey-regrade.py", "seed_provenance.py", "survey-regrade.vl"]) {
         await Deno.copyFile(`${ROOT}/scripts/${f}`, `${dir}/scripts/${f}`);
       }
+      await Deno.copyFile(`${ROOT}/scripts/lib/common.vl`, `${dir}/scripts/lib/common.vl`);
       // Sorted order matters to the fold: a name that sorts before `a.vl` by byte but after it
       // by locale would be hashed differently.
       await Deno.writeTextFile(`${dir}/compiler/b.vl`, SRC);
