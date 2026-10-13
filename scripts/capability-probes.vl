@@ -1,0 +1,989 @@
+// Run every capability probe in `scripts/capability-probes/` and report which still refuse.
+// The VL port of `scripts/capability-probes/run.py`, whose docstrings are the full contract;
+// the two print the same report byte for byte and exit with the same code.
+//
+//     vl run scripts/capability-probes.vl -- [--compiler SEED] [--live-sites | --floor]
+//
+// Run it from the checkout root: paths resolve against the working directory. Probes are
+// graded `$JOBS` at a time (default 6) by `xargs -P` over a build of this file, because
+// `runProgram` waits for its child. `$VL_PROBE_TIMEOUT` (default 120) bounds each `vl` call.
+
+import { IoError, listDir, pathExists, readFile, writeTextFile } from "std:fs"
+import { exit, runProgram } from "std:process"
+import { getEnv } from "std:env"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { join, replaceAll, split, startsWith } from "std:str"
+import { Json, JsonError, parseJson } from "std:json"
+import { includes } from "std:array"
+
+const HERE = "scripts/capability-probes"
+const SELF = "scripts/capability-probes.vl"
+const COMPILER = "build/vl-compiler.wasm"
+
+type JsonMap = { [string]: Json }
+
+// Stop with `code` after saying why, on stdout: VL has no stderr sink.
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// ── text helpers: the parts of Python's `str` and `re` this file reads with ─────────
+
+// The byte length of the whitespace code point at `i` (Python's `str.isspace`), or 0.
+function wsLen(s: string, i: i32): i32 {
+  if i < 0 || i >= s.length { return 0 }
+  const b = s[i]
+  if b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31) { return 1 }
+  if b == 0xC2 && i + 1 < s.length {
+    if s[i + 1] == 0x85 || s[i + 1] == 0xA0 { return 2 }
+    return 0
+  }
+  if i + 2 >= s.length { return 0 }
+  const c = s[i + 1]
+  const d = s[i + 2]
+  if b == 0xE1 && c == 0x9A && d == 0x80 { return 3 }
+  if b == 0xE2 && c == 0x80 {
+    if (d >= 0x80 && d <= 0x8A) || d == 0xA8 || d == 0xA9 || d == 0xAF {
+      return 3
+    }
+  }
+  if b == 0xE2 && c == 0x81 && d == 0x9F { return 3 }
+  if b == 0xE3 && c == 0x80 && d == 0x80 { return 3 }
+  0
+}
+
+// The byte length of a whitespace code point ending just before `end`, or 0.
+function wsLenBefore(s: string, end: i32): i32 {
+  let k = 1
+  while k <= 3 {
+    if end - k >= 0 && wsLen(s, end - k) == k { return k }
+    k = k + 1
+  }
+  0
+}
+
+// The byte index just past the whitespace run starting at `i`.
+function skipWs(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && wsLen(s, j) > 0 { j = j + wsLen(s, j) }
+  j
+}
+
+// The byte index where the trailing whitespace run of `s` starts.
+function trailWsStart(s: string): i32 {
+  let b = s.length
+  while b > 0 && wsLenBefore(s, b) > 0 { b = b - wsLenBefore(s, b) }
+  b
+}
+
+// Python's `str.strip()`.
+function stripWs(s: string): string {
+  const a = skipWs(s, 0)
+  const b = trailWsStart(s)
+  if b <= a { return "" }
+  s.slice(a, b)
+}
+
+// The byte length of the line break at `i` (Python's `str.splitlines` set), or 0.
+function breakLen(s: string, i: i32): i32 {
+  const b = s[i]
+  if b == 13 {
+    if i + 1 < s.length && s[i + 1] == 10 { return 2 }
+    return 1
+  }
+  if b == 10 || b == 11 || b == 12 || b == 28 || b == 29 || b == 30 { return 1 }
+  if b == 0xC2 && i + 1 < s.length && s[i + 1] == 0x85 { return 2 }
+  if b == 0xE2 && i + 2 < s.length && s[i + 1] == 0x80 {
+    if s[i + 2] == 0xA8 || s[i + 2] == 0xA9 { return 3 }
+  }
+  0
+}
+
+// Python's `str.splitlines()`: no trailing empty piece, every break kind recognised.
+function splitLines(s: string): string[] {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    const n = breakLen(s, i)
+    if n > 0 {
+      out.push(s.slice(start, i))
+      i = i + n
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  if start < s.length { out.push(s.slice(start, s.length)) }
+  out
+}
+
+// Text as Python's universal-newline reader hands it over: every `\r\n` and `\r` is `\n`.
+function univNl(s: string): string {
+  replaceAll(replaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
+// The first `n` code points of `s`, which is what a Python slice `[:n]` keeps.
+function cpPrefix(s: string, n: i32): string {
+  let seen = 0
+  let i = 0
+  while i < s.length {
+    if (s[i] & 0xC0) != 0x80 {
+      if seen == n { return s.slice(0, i) }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  s
+}
+
+// From byte `i`, up to `n` code points that are not `\n` (nor `"` when `noQuote`): the
+// byte index just past them, as a `[^\n]{0,n}` or `[^\n"]{0,n}` match ends.
+function cpRunEnd(s: string, i: i32, n: i32, noQuote: boolean): i32 {
+  let j = i
+  let seen = 0
+  while j < s.length && seen < n {
+    const b = s[j]
+    if b == 10 || (noQuote && b == 34) { return j }
+    j = j + 1
+    while j < s.length && (s[j] & 0xC0) == 0x80 { j = j + 1 }
+    seen = seen + 1
+  }
+  j
+}
+
+// The byte index of `needle` in `s` at or after `from`, or -1.
+function findFrom(s: string, needle: string, from: i32): i32 {
+  let i = from
+  while i + needle.length <= s.length {
+    let j = 0
+    while j < needle.length && s[i + j] == needle[j] { j = j + 1 }
+    if j == needle.length { return i }
+    i = i + 1
+  }
+  -1
+}
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+function anyIn(s: string, needles: string[]): boolean {
+  for n in needles {
+    if contains(s, n) { return true }
+  }
+  false
+}
+
+// `re.search("(A|B|…)<tail>", s)`: the leftmost byte at which one of `alts` starts, and
+// the alternative found there, or `at: -1`.
+type Hit = { at: i32, alt: string }
+
+function leftmost(s: string, alts: string[]): Hit {
+  let best: Hit = { at: -1, alt: "" }
+  for a in alts {
+    const at = findFrom(s, a, 0)
+    if at >= 0 && (best.at < 0 || at < best.at) { best = { at: at, alt: a } }
+  }
+  best
+}
+
+// `s` padded with spaces to `w` code points on the right, as `{s:<w}` formats it.
+function padRight(s: string, w: i32): string {
+  let out = s
+  let n = s.cpLen()
+  while n < w {
+    out = out + " "
+    n = n + 1
+  }
+  out
+}
+
+function isDigit(b: i32): boolean { b >= 48 && b <= 57 }
+
+// The byte index past a run of ASCII digits from `i`, or -1 when there is none.
+function digitsEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isDigit(s[j]) { j = j + 1 }
+  if j == i { return -1 }
+  j
+}
+
+// `\w` over UTF-8 bytes: an ASCII letter, digit or `_`, or any non-ASCII byte.
+function isWordByte(b: i32): boolean {
+  isDigit(b)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+    || b >= 0x80
+}
+
+// `xs` in byte order, which for UTF-8 is Python's code-point order. A hand merge sort
+// rather than `std:array`'s `sort`, whose comparator lambda makes the compiler trap (D4290).
+function sortStrings(xs: string[]): string[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = sortStrings(xs.slice(0, mid))
+  const b = sortStrings(xs.slice(mid, xs.length))
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !(b[j] < a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// ── `repr`, as `%r` prints a string ───────────────────────────────────────────────
+
+function hexDigits(v: i32, n: i32): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = n - 1
+  while k >= 0 {
+    const d = (v >> (k * 4)) & 15
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+// The code point starting at byte `i` and its byte length, of valid UTF-8.
+type Cp = { cp: i32, n: i32 }
+
+function cpAt(s: string, i: i32): Cp {
+  const b = s[i]
+  if b < 0x80 { return { cp: b, n: 1 } }
+  let cp = 0
+  let n = 1
+  if b >= 0xF0 {
+    n = 4
+    cp = b & 7
+  } else if b >= 0xE0 {
+    n = 3
+    cp = b & 15
+  } else {
+    n = 2
+    cp = b & 31
+  }
+  let k = 1
+  while k < n && i + k < s.length {
+    cp = (cp << 6) | (s[i + k] & 63)
+    k = k + 1
+  }
+  { cp: cp, n: n }
+}
+
+// Whether Python's `str.isprintable` refuses the non-ASCII code point `cp`: the
+// separators, format and control characters, surrogates and private use. Unassigned
+// code points, which Python also refuses, are not tabled.
+function unprintable(cp: i32): boolean {
+  if cp <= 0xA0 || cp == 0xAD || cp == 0x1680 || cp == 0x3000 { return true }
+  if (cp >= 0x600 && cp <= 0x605) || cp == 0x61C || cp == 0x6DD || cp == 0x70F {
+    return true
+  }
+  if cp == 0x180E || (cp >= 0x2000 && cp <= 0x200F) { return true }
+  if (cp >= 0x2028 && cp <= 0x202F) || (cp >= 0x205F && cp <= 0x206F) {
+    return true
+  }
+  if (cp >= 0xD800 && cp <= 0xF8FF) || cp == 0xFEFF { return true }
+  if cp >= 0xFFF9 && cp <= 0xFFFB { return true }
+  cp == 0xE0001 || (cp >= 0xE0020 && cp <= 0xE007F) || cp >= 0xF0000
+}
+
+function pyRepr(s: string): string {
+  let q = 39
+  if contains(s, "'") && !contains(s, "\"") { q = 34 }
+  const qs = s.slice(0, 0) + (if q == 39 { "'" } else { "\"" })
+  const parts = [qs]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == q || b == 92 { parts.push("\\" + s.slice(i, i + 1)) }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b < 32 || b == 127 { parts.push("\\x" + hexDigits(b, 2)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    const c = cpAt(s, i)
+    if !unprintable(c.cp) { parts.push(s.slice(i, i + c.n)) }
+    else if c.cp <= 0xFF { parts.push("\\x" + hexDigits(c.cp, 2)) }
+    else if c.cp <= 0xFFFF { parts.push("\\u" + hexDigits(c.cp, 4)) }
+    else { parts.push("\\U" + hexDigits(c.cp, 8)) }
+    i = i + c.n
+  }
+  parts.push(qs)
+  join(parts, "")
+}
+
+// ── processes and files ──────────────────────────────────────────────────────────
+
+// Exit code and both streams of one child, decoded as Python's `text=True` does.
+type Proc = { code: i32, out: string, err: string }
+
+function spawn(cmd: string, args: string[]): Proc {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("capability-probes: cannot run \{cmd} (\{r.msg})", 1)
+    return { code: -1, out: "", err: "" }
+  }
+  {
+    code: r.code,
+    out: univNl(decodeUtf8Lossy(r.stdout)),
+    err: univNl(decodeUtf8Lossy(r.stderr)),
+  }
+}
+
+function readText(path: string): string {
+  const t = readFile(path)
+  if t is IoError {
+    die("capability-probes: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(decodeUtf8Lossy(t))
+}
+
+function writeText(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null { die("capability-probes: cannot write \{path} (\{w.msg})", 1) }
+}
+
+function exists(path: string): boolean {
+  const e = pathExists(path)
+  if e is IoError { return false }
+  e
+}
+
+function envOr(name: string, dflt: string): string {
+  const v = getEnv(name)
+  if v is string { return v }
+  dflt
+}
+
+function cwd(): string {
+  const p = spawn("pwd", ["-P"])
+  if p.code != 0 { die("capability-probes: pwd failed: " + p.err, 1) }
+  stripWs(p.out)
+}
+
+// The `.vl` names directly under `dir`, sorted, as `sorted(os.listdir(dir))` filters them.
+function vlFiles(dir: string, ext: string): string[] {
+  const out: string[] = []
+  const names = listDir(dir)
+  if names is IoError {
+    die("capability-probes: cannot list \{dir} (\{names.msg})", 1)
+    return out
+  }
+  for n in names {
+    if (
+      n.length >= ext.length
+      && n.slice(n.length - ext.length, n.length) == ext
+    ) {
+      out.push(n)
+    }
+  }
+  sortStrings(out)
+}
+
+// ── the grading vocabulary: `matches`, `expected`, `classify` ─────────────────────
+
+// Does `out` satisfy the header's `Should print ...` contract (run.py's `matches`)?
+function matches(want: string, out: string): boolean {
+  const w = stripWs(want)
+  if contains(w, " then ") {
+    const parts: string[] = []
+    for p in split(w, " then ") { parts.push(stripWs(p)) }
+    const lines: string[] = []
+    for l in splitLines(stripWs(out)) { lines.push(stripWs(l)) }
+    if parts.length != lines.length { return false }
+    let k = 0
+    while k < parts.length {
+      if parts[k] != lines[k] { return false }
+      k = k + 1
+    }
+    return true
+  }
+  contains(out, replaceAll(w, " twice", ""))
+}
+
+// `re.search(r"Should print (.+?)\.?\s*$", line)` on one header line: the group, or null.
+function shouldPrint(line: string): string | null {
+  const key = "Should print "
+  const at = findFrom(line, key, 0)
+  if at < 0 { return null }
+  const rest = line.slice(at + key.length, line.length)
+  if rest.length == 0 { return null }
+  let end = trailWsStart(rest)
+  if end > 0 && rest[end - 1] == 46 { end = end - 1 }
+  if end < 1 { end = cpPrefix(rest, 1).length }
+  rest.slice(0, end)
+}
+
+// The `Should print ...` line in the probe's header (run.py's `expected`), or null.
+function expected(path: string): string | null {
+  for line in readText(path).split("\n") {
+    if !startsWith(line, "//") { break }
+    const g = shouldPrint(line)
+    if g is string { return stripWs(g) }
+  }
+  null
+}
+
+// `re.match(r"^Checked \d+ file|^Found \d+ error|^Error: \w+ error\s*$", l)`.
+function isScenery(l: string): boolean {
+  for pair in [["Checked ", " file"], ["Found ", " error"]] {
+    if startsWith(l, pair[0]) {
+      const e = digitsEnd(l, pair[0].length)
+      if e > 0 && startsWith(l.slice(e, l.length), pair[1]) { return true }
+    }
+  }
+  if !startsWith(l, "Error: ") { return false }
+  let i = 7
+  while i < l.length && isWordByte(l[i]) { i = i + 1 }
+  if i == 7 || !startsWith(l.slice(i, l.length), " error") { return false }
+  skipWs(l, i + 6) == l.length
+}
+
+// `re.sub(r"^\S+?:\d+:\d+:\s*", "", l)`: a leading `<path>:<line>:<col>:` and the space
+// after it dropped.
+function dropPosPrefix(l: string): string {
+  let p = 1
+  while p < l.length && wsLen(l, p - 1) == 0 {
+    if l[p] == 58 {
+      const a = digitsEnd(l, p + 1)
+      if a > 0 && a < l.length && l[a] == 58 {
+        const b = digitsEnd(l, a + 1)
+        if b > 0 && b < l.length && l[b] == 58 {
+          return l.slice(skipWs(l, b + 1), l.length)
+        }
+      }
+    }
+    p = p + 1
+  }
+  l
+}
+
+// Name the refusal channel from `vl check`'s rc and the combined output (run.py's
+// `classify`): the verdict and the detail beside it.
+type Verdict = { where: string, detail: string }
+
+function classify(chkRc: i32, err: string): Verdict {
+  const lines: string[] = []
+  for raw in splitLines(err) {
+    if (
+      contains(raw, "[HINT]")
+      || contains(raw, "[WARNING]")
+      || contains(raw, "[INFO]")
+    ) {
+      continue
+    }
+    if startsWith(raw, " ") || isScenery(raw) { continue }
+    const l = stripWs(dropPosPrefix(raw))
+    if l != "" && l != "[ERROR]:" { lines.push(l) }
+  }
+  const m = leftmost(
+    err,
+    ["not yet supported", "has no lowering", "not supported by codegen"],
+  )
+  let where = "emit refuses"
+  if chkRc != 0 {
+    where = "check refuses"
+  } else if anyIn(err, ["wasm backtrace", "call stack exhausted"]) {
+    where = "COMPILER TRAP (check rc 0)"
+  } else if (
+    anyIn(
+      err,
+      [
+        "Invalid input WebAssembly", "WebAssembly translation error",
+        "failed to parse WebAssembly",
+      ],
+    )
+  ) {
+    where = "SILENT (check rc 0)"
+  }
+  const inv = leftmost(
+    err,
+    ["Invalid input WebAssembly code", "type mismatch: expected "],
+  )
+  let detail = ""
+  if startsWith(where, "SILENT") || startsWith(where, "COMPILER TRAP") {
+    if inv.at >= 0 {
+      let n = 48
+      if inv.alt == "Invalid input WebAssembly code" { n = 60 }
+      detail = err.slice(
+        inv.at,
+        cpRunEnd(err, inv.at + inv.alt.length, n, false),
+      )
+    } else if lines.length > 0 {
+      detail = cpPrefix(lines[lines.length - 1], 70)
+    } else {
+      detail = cpPrefix(err, 70)
+    }
+  } else if m.at >= 0 {
+    detail = err.slice(m.at, cpRunEnd(err, m.at + m.alt.length, 54, true))
+  } else if lines.length > 0 {
+    detail = cpPrefix(lines[0], 70)
+  } else {
+    detail = cpPrefix(err, 70)
+  }
+  { where: where, detail: detail }
+}
+
+// ── grading one probe (run.py's `grade_full`), inside a worker ──────────────────────
+
+// One graded probe: its verdict, the detail, its stripped stdout and the whole refusal.
+type Graded = { verdict: string, detail: string, out: string, err: string }
+
+// What a worker needs: the binary, the seed, `std/`, the probe and the timeout.
+type Job = {
+  vl: string,
+  seed: string,
+  std: string,
+  probe: string,
+  secs: string,
+}
+
+function vlStd(j: Job, cmd: string): Proc {
+  spawn(
+    "env",
+    [
+      "VL_STD=" + j.std,
+      "timeout",
+      j.secs,
+      j.vl,
+      cmd,
+      j.probe,
+      "--compiler",
+      j.seed,
+    ],
+  )
+}
+
+function gradeFull(j: Job): Graded {
+  const want = expected(j.probe)
+  const run = vlStd(j, "run")
+  if run.code == 124 {
+    return {
+      verdict: "TIMEOUT",
+      detail: "no answer in \{j.secs}s",
+      out: "",
+      err: "",
+    }
+  }
+  const out = stripWs(run.out)
+  if run.code == 0 {
+    if want is string {
+      if !matches(want, out) {
+        return { verdict: "WRONG", detail: out, out: out, err: "" }
+      }
+    }
+    return { verdict: "RUNS", detail: "", out: out, err: "" }
+  }
+  const chk = vlStd(j, "check")
+  if chk.code == 124 {
+    return {
+      verdict: "TIMEOUT",
+      detail: "check gave no answer in \{j.secs}s",
+      out: out,
+      err: "",
+    }
+  }
+  const err = chk.out + chk.err + run.out + run.err
+  const v = classify(chk.code, err)
+  { verdict: v.where, detail: v.detail, out: out, err: err }
+}
+
+// A worker's answer file: each field as its byte length on a line, then its bytes.
+function field(s: string): string { toString(s.length) + "\n" + s }
+
+function gradeOne(file: string) {
+  const l = readText(file).split("\n")
+  const g = gradeFull(
+    { vl: l[0], seed: l[1], std: l[2], probe: l[3], secs: l[4] },
+  )
+  writeText(
+    file + ".out",
+    field(g.verdict) + field(g.detail) + field(g.out) + field(g.err),
+  )
+}
+
+function readGraded(file: string): Graded {
+  const t = readText(file)
+  const f: string[] = []
+  let at = 0
+  while f.length < 4 {
+    const nl = findFrom(t, "\n", at)
+    if nl < 0 {
+      die("capability-probes: a worker answer is truncated: " + file, 1)
+    }
+    const n = parseI32(t.slice(at, nl)) ?? 0
+    f.push(t.slice(nl + 1, nl + 1 + n))
+    at = nl + 1 + n
+  }
+  { verdict: f[0], detail: f[1], out: f[2], err: f[3] }
+}
+
+// ── the parent: stage one job per probe, fan them out, read the answers back ─────────
+
+function jobsFromEnv(): i32 {
+  const j = envOr("JOBS", "6")
+  const n = parseI32(stripWs(j))
+  if n == null { die("capability-probes: JOBS is not an integer: " + j, 1) }
+  n ?? 6
+}
+
+// Up to this many probes are graded in this process: below it the fan-out's own build
+// costs more than it saves (`--live-sites` grades about a dozen).
+const SERIAL_MAX = 16
+
+// Grade every probe named in `probes` (file names under `HERE`) against `seed`.
+function gradeAll(
+  abs: string,
+  seed: string,
+  probes: string[],
+): Map<string, Graded> {
+  const res: Map<string, Graded> = Map()
+  const secs = envOr("VL_PROBE_TIMEOUT", "120")
+  if probes.length <= SERIAL_MAX {
+    for p in probes {
+      res[p] = gradeFull(
+        {
+          vl: abs + "/scripts/vl-host/target/release/vl",
+          seed: seed,
+          std: abs + "/std",
+          probe: "\{abs}/\{HERE}/\{p}",
+          secs: secs,
+        },
+      )
+    }
+    return res
+  }
+  const mk = spawn("mktemp", ["-d"])
+  if mk.code != 0 { die("capability-probes: mktemp -d failed: " + mk.err, 1) }
+  const root = stripWs(mk.out)
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const head = [abs + "/scripts/vl-host/target/release/vl", seed, abs + "/std"]
+  const files: string[] = []
+  let k = 0
+  for p in probes {
+    const f = root + "/" + toString(k) + ".job"
+    writeText(f, "\{join(head, "\n")}\n\{abs}/\{HERE}/\{p}\n\{secs}")
+    files.push(f)
+    k = k + 1
+  }
+  const grader = root + "/grader.wasm"
+  const b = spawn(vl, ["build", SELF, "--compiler", COMPILER, "-o", grader])
+  if b.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("capability-probes: cannot build \{SELF}:\n" + b.out + b.err, 1)
+  }
+  writeText(root + "/jobs", join(files, "\n") + "\n")
+  const x = spawn(
+    "xargs",
+    [
+      "-a",
+      root + "/jobs",
+      "-d",
+      "\\n",
+      "-P",
+      toString(jobsFromEnv()),
+      "-n",
+      "1",
+      vl,
+      "run",
+      grader,
+      "--",
+      "--grade-one",
+    ],
+  )
+  if x.code != 0 {
+    spawn("rm", ["-rf", root])
+    die(
+      "capability-probes: a grading worker failed (rc=\{toString(x.code)}):\n"
+        + x.out
+        + x.err,
+      1,
+    )
+  }
+  k = 0
+  for p in probes {
+    res[p] = readGraded(files[k] + ".out")
+    k = k + 1
+  }
+  spawn("rm", ["-rf", root])
+  res
+}
+
+function graded(res: Map<string, Graded>, p: string): Graded {
+  res[p] ?? { verdict: "", detail: "", out: "", err: "" }
+}
+
+// ── `--live-sites` (run.py's `check_live_sites`) ──────────────────────────────────
+
+type Site = { literal: string, probe: string }
+
+function loadLiveSites(path: string): Site[] {
+  const out: Site[] = []
+  const j = parseJson(readText(path))
+  if j is JsonError {
+    die("capability-probes: \{path} is not JSON: \{j.msg}", 1)
+    return out
+  }
+  if j is JsonMap {
+    const sites = j["sites"]
+    if sites is Json[] {
+      for s in sites {
+        if s is JsonMap {
+          const lit = s["literal"]
+          const probe = s["probe"]
+          if lit is string && probe is string {
+            out.push({ literal: lit, probe: probe })
+            continue
+          }
+        }
+        die("capability-probes: a site in \{path} has no literal or probe", 1)
+      }
+      return out
+    }
+  }
+  die("capability-probes: \{path} has no `sites` list", 1)
+  out
+}
+
+// `compiler/*.vl` as one text, so a listed literal that has left the tree is caught.
+function compilerSource(): string {
+  const parts: string[] = []
+  for fn in vlFiles("compiler", ".vl") {
+    parts.push(readText("compiler/" + fn))
+  }
+  join(parts, "\n")
+}
+
+type Row = { verdict: string, lit: string, probe: string, detail: string }
+
+function liveSites(abs: string, seed: string): i32 {
+  const sites = loadLiveSites(HERE + "/live-sites.json")
+  const src = compilerSource()
+  const rows: Row[] = []
+  const toGrade: string[] = []
+  for s in sites {
+    if !exists(HERE + "/" + s.probe) {
+      rows.push(
+        {
+          verdict: "NOPROBE",
+          lit: s.literal,
+          probe: s.probe,
+          detail: "no such file in scripts/capability-probes/",
+        },
+      )
+    } else if !contains(src, "\"" + s.literal) {
+      rows.push(
+        {
+          verdict: "GONE",
+          lit: s.literal,
+          probe: s.probe,
+          detail: "literal is no longer in compiler/*.vl",
+        },
+      )
+    } else {
+      rows.push({ verdict: "", lit: s.literal, probe: s.probe, detail: "" })
+      if !toGrade.includes(s.probe) { toGrade.push(s.probe) }
+    }
+  }
+  const res = gradeAll(abs, seed, toGrade)
+  let bad = 0
+  let live = 0
+  for r in rows {
+    let verdict = r.verdict
+    let detail = r.detail
+    if verdict == "" {
+      const g = graded(res, r.probe)
+      if g.verdict == "RUNS" {
+        verdict = "FELL"
+        detail = "the witness RUNS — delete this entry"
+      } else if !contains(g.err, r.lit) {
+        verdict = "DRIFT"
+        detail = "\{g.verdict}: \{g.detail}"
+      } else {
+        verdict = "LIVE"
+        detail = g.verdict
+      }
+    }
+    if verdict == "LIVE" { live = live + 1 } else { bad = bad + 1 }
+    print(
+      "  \{padRight(verdict, 7)} \{padRight(cpPrefix(r.lit, 64), 66)} \{r.probe}",
+    )
+    if verdict != "LIVE" { print("          " + detail) }
+  }
+  print(
+    "\n\{toString(live)} of \{toString(rows.length)} listed refusal sites still refuse a check-clean program",
+  )
+  if bad > 0 {
+    print(
+      "A row above is not what the list claims. The list is a RATCHET: a witness",
+    )
+    print(
+      "that starts running comes OFF it in the PR that closed the gap, and a row",
+    )
+    print("may only be ADDED with a probe that reaches its literal.")
+    return 1
+  }
+  0
+}
+
+// ── `--floor` and the default report ─────────────────────────────────────────────
+
+function floor(probes: string[], res: Map<string, Graded>): i32 {
+  let bad = 0
+  for fn in probes {
+    const g = graded(res, fn)
+    if (
+      g.verdict == "WRONG"
+      || g.verdict == "TIMEOUT"
+      || startsWith(g.verdict, "SILENT")
+      || startsWith(g.verdict, "COMPILER TRAP")
+    ) {
+      print("  \{padRight(g.verdict, 26)} \{fn}\n          \{g.detail}")
+      bad = bad + 1
+    }
+  }
+  print(
+    "\n\{toString(bad)} of \{toString(probes.length)} capability probes break clause 1 (trap, invalid wasm, timeout or wrong output)",
+  )
+  if bad > 0 { return 1 }
+  0
+}
+
+function report(probes: string[], res: Map<string, Graded>): i32 {
+  const now: string[] = []
+  const still: string[] = []
+  const why: string[] = []
+  for fn in probes {
+    const g = graded(res, fn)
+    if g.verdict == "RUNS" {
+      now.push(fn)
+    } else if g.verdict == "WRONG" {
+      const want = expected(HERE + "/" + fn) ?? ""
+      still.push(fn)
+      why.push(
+        "RUNS but output " + pyRepr(g.out) + ", header says " + pyRepr(want),
+      )
+    } else {
+      still.push(fn)
+      why.push("\{g.verdict}: \{g.detail}")
+    }
+  }
+  for fn in now { print("  RUNS  " + fn) }
+  let k = 0
+  while k < still.length {
+    print("  GAP   " + still[k] + "\n          " + why[k])
+    k = k + 1
+  }
+  print(
+    "\n\{toString(now.length)} of \{toString(probes.length)} capability probes run · \{toString(still.length)} still refuse",
+  )
+  if still.length > 0 {
+    print(
+      "Each line above is a program the type system accepts and codegen will not build.",
+    )
+    return 1
+  }
+  0
+}
+
+// ── arguments, as run.py's argparse reads them ────────────────────────────────────
+
+const USAGE = "usage: run.py [-h] [--compiler COMPILER] [--live-sites] [--floor]"
+
+function usageError(msg: string): i32 {
+  print(USAGE)
+  print("run.py: error: " + msg)
+  2
+}
+
+// The long option `arg` names, by exact spelling or unique prefix, or "" for none.
+function longOpt(arg: string): string {
+  if !startsWith(arg, "--") || arg.length < 3 { return "" }
+  let hit = ""
+  let n = 0
+  for o in ["--compiler", "--live-sites", "--floor", "--help"] {
+    if o == arg { return o }
+    if startsWith(o, arg) {
+      hit = o
+      n = n + 1
+    }
+  }
+  if n == 1 { return hit }
+  ""
+}
+
+function main(args: string[]): i32 {
+  if args.length == 2 && args[0] == "--grade-one" {
+    gradeOne(args[1])
+    return 0
+  }
+  const abs = cwd()
+  let seed = abs + "/" + COMPILER
+  let live = false
+  let fl = false
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    let val: string | null = null
+    const eq = findFrom(a, "=", 0)
+    if startsWith(a, "--") && eq > 0 {
+      val = a.slice(eq + 1, a.length)
+      a = a.slice(0, eq)
+    }
+    const o = if a == "-h" { "--help" } else { longOpt(a) }
+    if o == "--help" {
+      print(USAGE)
+      return 0
+    } else if o == "--compiler" {
+      if val is string {
+        seed = val
+      } else if i + 1 < args.length && !startsWith(args[i + 1], "-") {
+        seed = args[i + 1]
+        i = i + 1
+      } else {
+        return usageError("argument --compiler: expected one argument")
+      }
+    } else if o == "--live-sites" && val == null {
+      live = true
+    } else if o == "--floor" && val == null {
+      fl = true
+    } else {
+      return usageError("unrecognized arguments: " + args[i])
+    }
+    i = i + 1
+  }
+  if live { return liveSites(abs, seed) }
+  const probes = vlFiles(HERE, ".vl")
+  if probes.length == 0 {
+    print("no probes found -- that is a failure, not a pass")
+    return 1
+  }
+  const res = gradeAll(abs, seed, probes)
+  if fl { return floor(probes, res) }
+  report(probes, res)
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("capability-probes: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

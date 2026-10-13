@@ -1,0 +1,788 @@
+// The checker's driver: one walk of the program, then the pin solvers in a fixed order, each
+// writing the annotations it solved and re-checking the program, under a budget per solver. A
+// solver finds and applies; this file decides when a re-check runs, when a pending rewrite is
+// declined, and the order refusals are reported in. It also holds D3817's policy, which reads
+// what the parameter solve saw of an uncalled entry export.
+import {
+  BinExpr,
+  Block,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  MatchExpr,
+  Member,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  declNameTokOf,
+  i32ToStr,
+  mkTypeRef,
+  nodeChildren,
+  ufcsModOfNode,
+} from "./ast"
+import {
+  expInfCol,
+  expInfEnd,
+  expInfLine,
+  expInfName,
+  expInfPinLets,
+  expInfTok,
+  expInfType,
+  expInfUse,
+} from "./check_state"
+import { nodeStartTok } from "./fmt_util"
+import { i32ListHas } from "./listutil"
+import { strContains } from "./strutil"
+import {
+  T,
+  checkProgramPass,
+  checkRestart,
+  declIsExportedFn,
+  demangleName,
+  expObsPinAt,
+  expObsPinParam,
+  expObsPinTy,
+  expObsReadAt,
+  expObsReadParam,
+  expObsReset,
+  fnDeclIx,
+  gRootStmts,
+  identFlushPending,
+  lbiApplyPins,
+  lbiDropUnobservable,
+  lbiPending,
+  lbiReport,
+  lbiReset,
+  lbiSolve,
+  lbiSymTypes,
+  luSpell,
+  ovHoleSites,
+  ovUnpinnedReport,
+  recAdApplyPins,
+  recAdForcedReport,
+  recAdLoosened,
+  recAdMark,
+  recAdPassReset,
+  recAdPending,
+  recAdReport,
+  recAdReset,
+  recAdSolve,
+  recAdUndo,
+  redunTruncate,
+  symFlushPending,
+  tErr,
+  tyEq,
+  tyToStrUser,
+  wsDecline,
+  wsReset,
+  wsStep,
+} from "./typecheck"
+
+// The re-checking solvers, in the order the driver runs them after the first walk: an uncalled
+// export's parameters (D3817), a wider record passed on (D3992), then a literal binding's type
+// and a record's adopted width, which settle together.
+type PinPhase = "expParam" | "width" | "literal"
+
+// The checker's entry point; `initChecker()` must have run first. A literal binding whose uses
+// give it another type than its default is re-checked with that type written as its annotation;
+// the refusals of bindings no type satisfies are reported by the last pass.
+export function checkProgram(rootIx: i32) {
+  expInfReset()
+  expObsReset()
+  lbiReset()
+  recAdReset()
+  wsReset()
+  checkProgramPass(rootIx)
+  pinSolve()
+  pinRun("expParam", rootIx)
+  pinRun("width", rootIx)
+  pinRun("literal", rootIx)
+  // A rewrite still pending after the last pass quieted a refusal nothing will apply.
+  if wsDecline() { checkProgramAgain(rootIx) }
+  pinReport()
+}
+
+// The most re-checks a phase pays. A forwarding chain gains one link a width round, and a chain
+// of literal bindings whose types settle once a neighbour's has one a literal round.
+function pinBudget(p: PinPhase): i32 {
+  match p {
+    "expParam" => 1
+    "width" => 8
+    "literal" => 2
+  }
+}
+
+// Applies phase `p`'s pending annotations; true when it wrote any, so a re-check is owed.
+function pinApply(p: PinPhase): boolean {
+  match p {
+    "expParam" => expParamInfer() > 0
+    "width" => wsStep() > 0
+    "literal" => {
+      if !lbiPending() && !recAdPending() { return false }
+      lbiApplyPins()
+      recAdApplyPins()
+      true
+    }
+  }
+}
+
+// Runs phase `p` until it writes nothing or its budget is spent, re-checking after each round.
+function pinRun(p: PinPhase, rootIx: i32) {
+  let round = 0
+  while round < pinBudget(p) {
+    const mark = recAdMark()
+    if !pinApply(p) { return 0 }
+    checkProgramAgain(rootIx)
+    round = round + 1
+    pinSettle(p, mark, rootIx)
+  }
+  0
+}
+
+// What phase `p` owes after a round's re-check. A literal round whose re-check refuses anything
+// other than an adopted value handed on whole undoes its adoptions, which the literal's own type
+// served; one across a numeric width stays, since its reads mean the adopted type (D3339).
+function pinSettle(p: PinPhase, mark: i32, rootIx: i32) {
+  match p {
+    "expParam" => 0
+    "width" => 0
+    "literal" => {
+      if recAdLoosened(mark) && recAdUndo(mark) { checkProgramAgain(rootIx) }
+      0
+    }
+  }
+}
+
+// The solvers that read a finished walk.
+function pinSolve() {
+  lbiSolve()
+  lbiDropUnobservable()
+  recAdSolve()
+  0
+}
+
+// A fresh check of the program after a phase rewrote some declarations' annotations.
+function checkProgramAgain(rootIx: i32) {
+  checkRestart()
+  lbiReset()
+  recAdPassReset()
+  checkProgramPass(rootIx)
+  pinSolve()
+  0
+}
+
+// What only the last walk may report, in phase order.
+function pinReport() {
+  symFlushPending()
+  identFlushPending()
+  lbiSymTypes()
+  lbiReport()
+  recAdForcedReport()
+  recAdReport()
+  ovUnpinnedReport()
+  expInfReport()
+  // A program with errors is typed in part against what its annotations say, so none of them
+  // is reported redundant (D3800).
+  if T.diags.length > 0 { redunTruncate(0) }
+  0
+}
+
+// ── Exported entry functions nothing in the program calls (D3817) ───────────────────────────
+// The host calls one, so an un-annotated parameter takes the one type its pinning uses agree on,
+// and anything else, a generic one included, is refused. Refusals wait for the last check pass,
+// which a re-check would otherwise clear.
+let expInfErrMsg: string[] = []
+let expInfErrAt: i32[] = []
+// The parameters annotated so far, so a re-check does not infer them twice.
+let expInfDone: i32[] = []
+// Whether the entry is a std module, which only ever runs imported: its exports have callers.
+let expInfEntryStd = false
+
+// Stages whether the program's entry module is a std module, before `checkProgram`.
+export function expInfSetEntryStd(b: boolean) {
+  expInfEntryStd = b
+  0
+}
+
+// The entry module's exported functions no statement outside their own body names.
+function expUncalledExports(): i32[] {
+  const out: i32[] = []
+  if expInfEntryStd { return out }
+  const cands: i32[] = []
+  expShWanted = Map()
+  for st in gRootStmts {
+    const f = P.nodes[st]
+    if f is FuncDecl {
+      if f.fnName != "" && ufcsModOfNode(st) <= 0 && declIsExportedFn(st) {
+        cands.push(st)
+        expShWanted[f.fnName] = 1
+      }
+    }
+  }
+  if cands.length == 0 { return out }
+  const readers = expNameReaders()
+  for st in cands {
+    const f = P.nodes[st]
+    if f is FuncDecl {
+      const r = readers[f.fnName] ?? -1
+      if r == -1 || r == st { out.push(st) }
+    }
+  }
+  out
+}
+
+// The exported function names `expNameReaders` tracks; a shadow list carries only these, so
+// it stays as short as the names a nearer scope can hide.
+let expShWanted: {[string]: i32} = Map()
+
+// For each tracked export name some identifier reads, the root statement holding the reads, or -2
+// when more than one does; one walk of the program. A read a nearer binding shadows is skipped.
+function expNameReaders(): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  for st in gRootStmts {
+    // Each node carries the names a nearer scope rebinds there, as `|a|b|`.
+    const stack: i32[] = [st]
+    const stackSh: string[] = ["|"]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      const sh = stackSh.pop() ?? "|"
+      if ix >= 0 && ix < P.nodes.length {
+        const nm = expIdentName(ix)
+        if (expShWanted[nm] ?? 0) == 1 && !strContains(sh, "|" + nm + "|") {
+          const prev = out[nm] ?? -1
+          if prev == -1 { out[nm] = st }
+          else if prev != st { out[nm] = -2 }
+        }
+        expShadowKids(ix, sh, stack, stackSh)
+      }
+    }
+  }
+  out
+}
+
+// Pushes node `ix`'s children walked under shadow list `sh`, each with the list it is walked
+// under: a function adds its name and parameters, a loop its variables, a match arm its
+// bindings, and a block each name its statements declare, from that statement on.
+function expShadowKids(ix: i32, sh: string, stack: i32[], stackSh: string[]) {
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    let inner = expShAdd(sh, n.fnName)
+    for q in n.fnParams {
+      const qp = P.nodes[q]
+      if qp is Param { inner = expShAdd(inner, qp.parName) }
+    }
+    for k in nodeChildren(ix) {
+      stack.push(k)
+      stackSh.push(inner)
+    }
+    return 0
+  } else if n is Block {
+    let run = sh
+    for st in n.blkStmts {
+      stack.push(st)
+      stackSh.push(run)
+      run = expShAdd(run, expStmtDeclName(st))
+    }
+    return 0
+  }
+  let inner = sh
+  if n is ForIn {
+    inner = expShAdd(expShAdd(sh, n.fiVar), n.fiVar2)
+    stack.push(n.fiIter)
+    stackSh.push(sh)
+    stack.push(n.fiBody)
+    stackSh.push(inner)
+    return 0
+  } else if n is ForRange {
+    inner = expShAdd(sh, n.frVar)
+  } else if n is MatchExpr {
+    stack.push(n.matchScrut)
+    stackSh.push(sh)
+    let i = 0
+    while i < n.matchBodies.length {
+      stack.push(n.matchBodies[i])
+      stackSh.push(expArmShadow(n, i, sh))
+      i = i + 1
+    }
+    return 0
+  }
+  for k in nodeChildren(ix) {
+    stack.push(k)
+    stackSh.push(inner)
+  }
+  0
+}
+
+// Shadow list `sh` with the names a pattern of arm `i` of match `n` binds for its body.
+function expArmShadow(n: MatchExpr, i: i32, sh: string): string {
+  let out = sh
+  if i >= n.matchArmStart.length || i >= n.matchArmCount.length { return out }
+  let p = n.matchArmStart[i]
+  while p < n.matchArmStart[i] + n.matchArmCount[i] && p < n.matchBinds.length {
+    const bx = n.matchBinds[p]
+    if bx >= 0 && bx < P.nodes.length {
+      const b = P.nodes[bx]
+      if b is Block {
+        for st in b.blkStmts { out = expShAdd(out, expStmtDeclName(st)) }
+      }
+    }
+    p = p + 1
+  }
+  out
+}
+
+// Shadow list `sh` with `nm` added when it is a tracked export name.
+function expShAdd(sh: string, nm: string): string {
+  if (expShWanted[nm] ?? 0) != 1 { return sh }
+  sh + nm + "|"
+}
+
+// The name statement `st` declares in its block, or "".
+function expStmtDeclName(st: i32): string {
+  if st < 0 || st >= P.nodes.length { return "" }
+  const d = P.nodes[st]
+  if d is LetDecl { return d.letName }
+  expFnDeclName(st)
+}
+
+// The name of function declaration `st`, or "" for any other statement.
+function expFnDeclName(st: i32): string {
+  const d = P.nodes[st]
+  if d is FuncDecl { return d.fnName }
+  ""
+}
+
+// Infers the un-annotated parameters of every uncalled entry export, annotating each that one
+// type fits; records the refusals for the rest. The count of annotations made.
+function expParamInfer(): i32 {
+  let made = 0
+  for fx in expUncalledExports() {
+    const f = P.nodes[fx]
+    if f is FuncDecl {
+      if f.fnTyParams.length > 0 {
+        expInfRefuse(
+          "exported function `"
+            + demangleName(f.fnName)
+            + "` is generic over `"
+            + f.fnTyParams[0]
+            + "` and nothing in the program calls it; the host calls it, so its signature must be explicit. Give its parameters concrete types, or export a concrete wrapper",
+          fx,
+        )
+      } else {
+        const up = expParents(f.fnBody)
+        for px in f.fnParams {
+          const p = P.nodes[px]
+          if p is Param {
+            if p.parType < 0 && !i32ListHas(expInfDone, px) {
+              if expInferParam(f, px, p.parName, up) { made = made + 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+  made
+}
+
+// Queues refusal `msg` at node `at` for the end of the check.
+function expInfRefuse(msg: string, at: i32) {
+  if i32ListHas(expInfErrAt, at) { return 0 }
+  expInfErrMsg.push(msg)
+  expInfErrAt.push(at)
+  0
+}
+
+// Raises the queued refusals; run once, after the last check pass.
+function expInfReport() {
+  let i = 0
+  while i < expInfErrMsg.length {
+    tErr(expInfErrMsg[i], expInfErrAt[i])
+    i = i + 1
+  }
+  0
+}
+
+// Each node's parent within body `b`.
+function expParents(b: i32): {[i32]: i32} {
+  const up: {[i32]: i32} = Map()
+  const stack: i32[] = [b]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      for k in nodeChildren(ix) {
+        if k >= 0 {
+          up[k] = ix
+          stack.push(k)
+        }
+      }
+    }
+  }
+  up
+}
+
+// The outermost parenthesis around `ix`, so its parent is the read's consumer.
+function expUnparen(ix: i32, up: {[i32]: i32}): i32 {
+  let u = ix
+  while true {
+    const p = up[u] ?? -1
+    if p < 0 { return u }
+    const pn = P.nodes[p]
+    if !(pn is Paren) { return u }
+    u = p
+  }
+  u
+}
+
+// Infers parameter `px` (named `nm`) of exported function `f` from what the parameter solve saw
+// of it: annotates it and records the hint when its pinning uses agree on one type, else queues
+// the refusal. True when annotated.
+function expInferParam(
+  f: FuncDecl,
+  px: i32,
+  nm: string,
+  up: {[i32]: i32},
+): boolean {
+  // What the never-pinning uses allow, for the refusal's candidate list.
+  let numeric = false
+  let lengthy = false
+  let overloaded = ""
+  let i = 0
+  while i < expObsReadParam.length {
+    if expObsReadParam[i] == px {
+      const u = expUnparen(expObsReadAt[i], up)
+      const n = P.nodes[up[u] ?? -1]
+      if n is BinExpr {
+        if (
+          n.binOp == "*"
+          || n.binOp == "/"
+          || n.binOp == "-"
+          || n.binOp == "%"
+        ) {
+          numeric = true
+        }
+      } else if n is Member {
+        if n.memObj == u {
+          if n.memProp == "length" { lengthy = true }
+          const m = up[u] ?? -1
+          const c = up[m] ?? -1
+          const cn = P.nodes[c]
+          if cn is Call {
+            if cn.callFn == m && i32ListHas(ovHoleSites, c) {
+              overloaded = n.memProp
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  const pinTy: i32[] = []
+  const pinAt: i32[] = []
+  const pinUse: string[] = []
+  i = 0
+  while i < expObsPinParam.length {
+    if expObsPinParam[i] == px {
+      expPinOf(f, nm, expObsPinAt[i], expObsPinTy[i], up, pinTy, pinAt, pinUse)
+    }
+    i = i + 1
+  }
+  const fname = demangleName(f.fnName)
+  const head = "exported function `"
+    + fname
+    + "`: parameter `"
+    + nm
+    + "` has no type and nothing in the program calls `"
+    + fname
+    + "`; the host calls it, so its signature must be explicit. "
+  // An overloaded member call on it already refuses, naming the candidates (`ovUnpinnedReport`).
+  if pinTy.length == 0 && overloaded != "" { return false }
+  if pinTy.length == 0 {
+    let cands = "any type"
+    if numeric { cands = "i32, i64, f32, f64, …" }
+    else if lengthy { cands = "string, any list, …" }
+    let eg = "T"
+    if numeric { eg = "f64" }
+    else if lengthy { eg = "string" }
+    expInfRefuse(
+      head
+        + "The body fits more than one type ("
+        + cands
+        + "). Annotate it: `export function "
+        + fname
+        + "("
+        + nm
+        + ": "
+        + eg
+        + ")`",
+      px,
+    )
+    return false
+  }
+  expPinsBySource(pinTy, pinAt, pinUse)
+  i = 1
+  while i < pinTy.length {
+    if !tyEq(pinTy[i], pinTy[0]) {
+      expInfRefuse(
+        head
+          + "Its uses disagree: "
+          + pinUse[0]
+          + " (line "
+          + i32ToStr(expLineOf(pinAt[0]))
+          + ") wants `"
+          + tyToStrUser(pinTy[0])
+          + "`, and "
+          + pinUse[i]
+          + " (line "
+          + i32ToStr(expLineOf(pinAt[i]))
+          + ") wants `"
+          + tyToStrUser(pinTy[i])
+          + "`. Annotate it with the one it takes",
+        px,
+      )
+      return false
+    }
+    i = i + 1
+  }
+  const sp = luSpell(pinTy[0])
+  if sp == "" {
+    expInfRefuse(
+      head
+        + "Its uses want `"
+        + tyToStrUser(pinTy[0])
+        + "`, which an annotation here cannot spell. Annotate it, or export a wrapper",
+      px,
+    )
+    return false
+  }
+  const p = P.nodes[px]
+  if p is Param { p.parType = mkTypeRef(sp, -1) }
+  expInfDone.push(px)
+  expInfHintAdd(px, nm, tyToStrUser(pinTy[0]), pinUse[0])
+  true
+}
+
+// Adds the pin read `at` of `nm` delivered whole to `ty` makes, when the delivery is one a
+// message can quote: an argument to a named function, a member call's receiver, a `return`, an
+// annotated binding's initialiser, a store to the body's one annotated binding of that name, or
+// the body's value. Any other delivery pins nothing.
+function expPinOf(
+  f: FuncDecl,
+  nm: string,
+  at: i32,
+  ty: i32,
+  up: {[i32]: i32},
+  pinTy: i32[],
+  pinAt: i32[],
+  pinUse: string[],
+) {
+  const u = expUnparen(at, up)
+  const pix = up[u] ?? -1
+  const p = P.nodes[pix]
+  if p is Call {
+    const callee = expIdentName(p.callFn)
+    if expDeclaredConcrete(callee, p.callArgs, u) {
+      return expPinPush(
+        ty,
+        pix,
+        "`" + demangleName(callee) + "(…" + nm + "…)`",
+        pinTy,
+        pinAt,
+        pinUse,
+      )
+    }
+  } else if p is Member {
+    const c = up[pix] ?? -1
+    const cn = P.nodes[c]
+    if cn is Call {
+      if p.memObj == u && cn.callFn == pix && !i32ListHas(ovHoleSites, c) {
+        return expPinPush(
+          ty,
+          c,
+          "`" + nm + "." + p.memProp + "()`",
+          pinTy,
+          pinAt,
+          pinUse,
+        )
+      }
+    }
+  } else if p is RetStmt {
+    if f.fnRet >= 0 {
+      return expPinPush(ty, pix, "`return " + nm + "`", pinTy, pinAt, pinUse)
+    }
+  } else if p is LetDecl {
+    if p.letType >= 0 && p.letInit == u {
+      expInfPinLets.push(pix)
+      return expPinPush(
+        ty,
+        pix,
+        "`" + p.letKw + " " + p.letName + ": … = " + nm + "`",
+        pinTy,
+        pinAt,
+        pinUse,
+      )
+    }
+  } else if p is BinExpr {
+    const lhs = expIdentName(p.binLeft)
+    if p.binOp == "=" && lhs != "" && lhs != nm && p.binRight == u {
+      const ld = expSoleLet(f.fnBody, lhs)
+      if ld >= 0 {
+        expInfPinLets.push(ld)
+        return expPinPush(
+          ty,
+          pix,
+          "`" + lhs + " = " + nm + "`",
+          pinTy,
+          pinAt,
+          pinUse,
+        )
+      }
+    }
+  }
+  if f.fnRet >= 0 && u == expTailValue(f.fnBody) {
+    return expPinPush(ty, u, "the function's result", pinTy, pinAt, pinUse)
+  }
+  0
+}
+
+// The one annotated `let` named `nm` in body `b`, outside nested functions, or -1 when there is
+// none or more than one.
+function expSoleLet(b: i32, nm: string): i32 {
+  let found = -1
+  let count = 0
+  const stack: i32[] = [b]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is LetDecl {
+        if n.letName == nm {
+          count = count + 1
+          if n.letType >= 0 { found = ix }
+        }
+      }
+      if !(n is FuncDecl) || ix == b {
+        for k in nodeChildren(ix) { stack.push(k) }
+      }
+    }
+  }
+  if count != 1 { return -1 }
+  found
+}
+
+// Sorts the three pin columns by their use's position in the source, so a refusal quotes the
+// first use first.
+function expPinsBySource(pinTy: i32[], pinAt: i32[], pinUse: string[]) {
+  let i = 1
+  while i < pinAt.length {
+    let j = i
+    while j > 0 && nodeStartTok(pinAt[j]) < nodeStartTok(pinAt[j - 1]) {
+      const t = pinTy[j]
+      pinTy[j] = pinTy[j - 1]
+      pinTy[j - 1] = t
+      const a = pinAt[j]
+      pinAt[j] = pinAt[j - 1]
+      pinAt[j - 1] = a
+      const u = pinUse[j]
+      pinUse[j] = pinUse[j - 1]
+      pinUse[j - 1] = u
+      j = j - 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The name identifier `ix` reads, else "".
+function expIdentName(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName }
+  ""
+}
+
+function expPinPush(
+  t: i32,
+  at: i32,
+  use: string,
+  pinTy: i32[],
+  pinAt: i32[],
+  pinUse: string[],
+) {
+  pinTy.push(t)
+  pinAt.push(at)
+  pinUse.push(use)
+  0
+}
+
+// The last statement of block `b`, the body's value when it is an expression; -1 otherwise.
+function expTailValue(b: i32): i32 {
+  if b < 0 || b >= P.nodes.length { return -1 }
+  const n = P.nodes[b]
+  if n is Block {
+    if n.blkStmts.length == 0 { return -1 }
+    return n.blkStmts[n.blkStmts.length - 1]
+  }
+  -1
+}
+
+// Whether `name` is a declared, non-generic function whose parameter at `u`'s position among
+// `args` is annotated: a computed callee, or one whose parameter is solved, quotes nothing.
+function expDeclaredConcrete(name: string, args: i32[], u: i32): boolean {
+  const fd = fnDeclIx[name] ?? -1
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = P.nodes[fd]
+  if f is FuncDecl {
+    let k = 0
+    while k < args.length && args[k] != u { k = k + 1 }
+    if f.fnTyParams.length > 0 || k >= f.fnParams.length || k >= args.length {
+      return false
+    }
+    const p = P.nodes[f.fnParams[k]]
+    if p is Param { return p.parType >= 0 }
+  }
+  false
+}
+
+// The 1-based line node `ix` starts on, or 0.
+function expLineOf(ix: i32): i32 {
+  const tk = nodeStartTok(ix)
+  if tk < 0 || tk >= P.toks.length { return 0 }
+  P.toks[tk].line
+}
+
+// Records the hint for parameter `px`: inferred as `ty` from `use`, with the fix's insertion
+// point after the parameter's name.
+function expInfHintAdd(px: i32, nm: string, ty: string, use: string) {
+  const tk = declNameTokOf(px)
+  if tk < 0 || tk >= P.toks.length { return 0 }
+  const t = P.toks[tk]
+  expInfLine.push(t.line)
+  expInfCol.push(t.col)
+  expInfEnd.push(t.col + t.text.length)
+  expInfTok.push(tk)
+  expInfName.push(nm)
+  expInfType.push(ty)
+  expInfUse.push(use)
+  0
+}
+
+// Empties D3817's tables; once per program, since the re-check its annotations need would
+// otherwise drop what the first pass found.
+function expInfReset() {
+  expInfErrMsg = []
+  expInfErrAt = []
+  expInfDone = []
+  expInfPinLets = []
+  expInfLine = []
+  expInfCol = []
+  expInfEnd = []
+  expInfTok = []
+  expInfName = []
+  expInfType = []
+  expInfUse = []
+  0
+}
