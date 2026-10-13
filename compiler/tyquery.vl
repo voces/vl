@@ -8,15 +8,24 @@ import {
   PrimName,
   T,
   TyArray,
+  TyErr,
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
+  TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
+  cUserTypes,
   litBaseTy,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
+  litUnionInlineNameOfTy,
+  lvTyNever,
+  nulFoldWrapperTyIxOf,
+  tyIsGenAppInstance,
 } from "./typecheck"
 
 // The element type of array type `ty`, or -1 when `ty` is not a `TyArray`.
@@ -112,4 +121,161 @@ function tyEmitPrimGo(ty: i32): PrimName | null {
     else if out != p { return null }
   }
   out
+}
+
+// The primitive the element of list `arr` spells inside `arr`'s own render, or null. An inline
+// string-literal union element keeps its quoted members there, except inside a generic
+// application, whose interior is spelled as at the root; an aliased one spells its alias.
+export function tyEmitElemPrimOf(arr: i32): PrimName | null {
+  const el = tyStepElem(arr)
+  if el < 0 { return null }
+  if litUnionAliasNameOfTy(el) != "" { return null }
+  if litUnionInlineNameOfTy(el) != "" && !tyIsGenAppInstance(arr) {
+    return null
+  }
+  tyEmitPrimOf(el)
+}
+
+// Whether the element of list `arr` spells `p|null` (1), `null|p` (2) or neither (0) inside
+// `arr`'s render: a nullable of `p`, or a union whose members spell only `p` and `null`, in the
+// order the union first names them.
+export function tyEmitElemNulPrimOf(arr: i32, p: PrimName): i32 {
+  const el = tyStepElem(arr)
+  if el < 0 { return 0 }
+  if litUnionAliasNameOfTy(el) != "" { return 0 }
+  if litUnionInlineNameOfTy(el) != "" { return 0 }
+  const t = T.tys[el]
+  if t is TyNullable {
+    const inr = t.nInner
+    if inr < 0 { return 0 }
+    if litUnionAliasNameOfTy(inr) != "" || litUnionInlineNameOfTy(inr) != "" {
+      return 0
+    }
+    if T.tys[inr] is TyFunc { return 0 }
+    if tyEmitPrimOf(inr) == p { return 1 }
+    return 0
+  }
+  if !(t is TyUnion) { return 0 }
+  // Two string literals beside a non-null member spell their registered alias.
+  const texts: string[] = []
+  let nonLit = false
+  for m in t.uMembers {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind == "str" { texts.push(mt.litText) }
+    } else if !tyIsNullPrim(m) {
+      nonLit = true
+    }
+  }
+  if nonLit && texts.length >= 2 && litUnionAliasOfLitTexts(texts) != "" {
+    return 0
+  }
+  let order = 0
+  let sawP = false
+  let sawN = false
+  for m in t.uMembers {
+    if litUnionAliasNameOfTy(m) != "" { return 0 }
+    if T.tys[m] is TyFunc { return 0 }
+    const mp = tyEmitPrimOf(m)
+    if mp == "null" {
+      if order == 0 { order = 2 }
+      sawN = true
+    } else if mp != null && mp == p {
+      if order == 0 { order = 1 }
+      sawP = true
+    } else {
+      return 0
+    }
+  }
+  if sawP && sawN { return order }
+  0
+}
+
+// Whether `tyToEmitName(ty)` spells anything at all: false for a hole, `never`, a type
+// variable, a negation or an error, and for a shape holding one of those that no alias name
+// stands in for.
+export function tyEmitNamesOf(ty: i32): boolean {
+  if ty < 0 { return false }
+  // The renderer answers a revisited ancestor with its declared name, if it has one.
+  for s in tenSeen {
+    if s == ty {
+      for k in cUserTypes.keys() {
+        if (cUserTypes[k] ?? -1) == ty { return true }
+      }
+      return false
+    }
+  }
+  tenSeen.push(ty)
+  const r = tyEmitNamesGo(ty)
+  tenSeen.pop()
+  // An empty render falls back to the name of the alias that folds `ty | null`.
+  r || nulFoldWrapperTyIxOf(ty) >= 0
+}
+
+// The ancestor stack of `tyEmitNamesOf`: the renderer's cycle guard, mirrored.
+const tenSeen: i32[] = []
+
+// `tyEmitNamesOf` of a part the renderer spells by its literal-union alias when it has one.
+function tyEmitNamesOrAlias(ty: i32): boolean {
+  if litUnionAliasNameOfTy(ty) != "" { return true }
+  tyEmitNamesOf(ty)
+}
+
+// True when `ty` is a nullable whose inner has a literal-union alias, which a field or a
+// function result spells as `K|null` without rendering the inner.
+function tyIsNulAliased(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return litUnionAliasNameOfTy(t.nInner) != "" }
+  false
+}
+
+function tyEmitNamesGo(ty: i32): boolean {
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less, arm for arm with the renderer's own match.
+  match t {
+    TyPrim => {
+      return t.primName != "never"
+    }
+    TyLit => {
+      return true
+    }
+    TyUnion => {
+      if litUnionInlineNameOfTy(ty) != "" { return true }
+      if t.uMembers.length == 0 { return false }
+      for m in t.uMembers {
+        if !(T.tys[m] is TyLit) && !tyEmitNamesOrAlias(m) { return false }
+      }
+      return true
+    }
+    TyNullable => {
+      if litUnionInlineNameOfTy(t.nInner) != "" { return true }
+      return tyEmitNamesOrAlias(t.nInner)
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if !tyIsNulAliased(f) && !tyEmitNamesOrAlias(f) { return false }
+      }
+      return true
+    }
+    TyArray => {
+      return tyEmitNamesOrAlias(t.aElem)
+    }
+    TyMap => {
+      return tyEmitNamesOf(t.mKey) && tyEmitNamesOrAlias(t.mVal)
+    }
+    TyFunc => {
+      for pt in t.fnParamTypes {
+        if !tyEmitNamesOf(pt) { return false }
+      }
+      // A `never` result spells `void`.
+      if t.fnRet >= 0 && t.fnRet == lvTyNever() { return true }
+      if tyIsNulAliased(t.fnRet) { return true }
+      return tyEmitNamesOrAlias(t.fnRet)
+    }
+    TyVar | TyNeg | TyErr => {
+      // No name at either face.
+    }
+  }
+  false
 }

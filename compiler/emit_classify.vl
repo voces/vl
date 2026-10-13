@@ -123,6 +123,7 @@ import {
   litSetBaseTy,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
+  litUnionInlineNameOfTy,
   luDeclPosOf,
   mapDeliveryRecorded,
   mapRetagAllRows,
@@ -865,6 +866,9 @@ import {
 import { i32ListHas, strListHas } from "./listutil"
 import { strContains } from "./strutil"
 import {
+  tyEmitElemNulPrimOf,
+  tyEmitElemPrimOf,
+  tyEmitNamesOf,
   tyEmitPrimOf,
   tyIsNullPrim,
   tyMapValOf,
@@ -7664,6 +7668,8 @@ function mvValLowersTy(ty: i32): i32 {
             if !tyIsLitUnion(it2.fnRet) { return 1 }
           }
           TyUnion => {
+            // A nullable literal-union alias is an i32 niche (atom ids, `-1` for null): the mono map.
+            if litUnionAliasNameOfTy(inr) != "" { return 1 }
             // A nullable union value lands in the atom counting, whose second `-3` needs
             // `!isValueUnionName`. That predicate is copied rather than re-derived: every atom must
             // have a `valueAtomKind` — the prims, `null`, and the list atoms — with at least two
@@ -14098,18 +14104,216 @@ export function listGetStagesOperand(ix: i32): boolean {
   if c.callArgs.length != 1 { return false }
   !listGetIdxReReadable(c.callArgs[0])
 }
-// `valueAtomKind` of a type's render. The arena answers for a primitive, list, record or
-// map; any other kind asks the spelling, which reads a literal, a literal union or a
-// one-member alias union as its base atom where `valueRowKind` answers -1.
+// `valueAtomKind` of a type's render, read off the type. One shape still asks the spelling: a
+// union of two or more members that share a list or closure kind whose spelling that kind
+// does not fix (`i32[] | K[]`, two function types), since the render keeps one part only when
+// the members spell alike (D4320); and a list element union this does not walk.
 export function valueAtomKindOfTy(ty: i32): i32 {
-  if ty >= 0 {
-    const t = T.tys[ty]
-    if t is TyPrim || t is TyArray || t is TyObj || t is TyMap {
-      const k = valueRowKind(ty)
-      if k != -2 { return k }
+  const k = vakOfTy(ty)
+  if k != -2 { return k }
+  valueAtomKind(tyToEmitName(ty))
+}
+
+// `valueAtomKindOfTy`'s decision, or -2 for "ask the spelling".
+function vakOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  for s in vakSeen {
+    // A revisited ancestor spells an alias name or nothing, neither of them an atom.
+    if s == ty { return -1 }
+  }
+  vakSeen.push(ty)
+  const r = vakGo(ty)
+  vakSeen.pop()
+  r
+}
+
+// The ancestor stack of `vakOfTy`: the renderer's cycle guard, mirrored.
+const vakSeen: i32[] = []
+
+// The atom kind of a primitive's own spelling, -1 for one that is not a value atom.
+function vakOfPrim(p: PrimName | null): i32 {
+  if p == null { return -1 }
+  match p {
+    "i32" => {
+      return 0
+    }
+    "boolean" => {
+      return 1
+    }
+    "string" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f64" => {
+      return 4
+    }
+    "f32" => {
+      return 5
+    }
+    "null" => {
+      return 6
+    }
+    "v128" => {
+      return 14
+    }
+    "void" | "never" | "u8" => {
+      return -1
     }
   }
-  valueAtomKind(tyToEmitName(ty))
+}
+
+// The atom kind of the list spelling `p[]`, -1 for one that is not a value atom.
+function vakOfPrimList(p: PrimName | null): i32 {
+  if p == null { return -1 }
+  match p {
+    "i32" => {
+      return 7
+    }
+    "boolean" => {
+      return 17
+    }
+    "f64" => {
+      return 8
+    }
+    "string" => {
+      return 9
+    }
+    "i64" => {
+      return 10
+    }
+    "f32" => {
+      return 12
+    }
+    "u8" => {
+      return 13
+    }
+    "void" | "null" | "never" | "v128" => {
+      return -1
+    }
+  }
+}
+
+function vakGo(ty: i32): i32 {
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: every arena shape says what its render reads as.
+  match t {
+    TyPrim => {
+      return valueRowKind(ty)
+    }
+    TyObj | TyMap | TyNullable => {
+      // A shape, a map and a `T | null` are never one value atom.
+      return -1
+    }
+    TyLit => {
+      return vakOfPrim(tyEmitPrimOf(ty))
+    }
+    TyVar | TyNeg | TyErr => {
+      // No spelling at all.
+      return -1
+    }
+    TyFunc => {
+      // A result that is a list or a union can end the spelling in `[]`, which the list cuts read.
+      if t.fnRet >= 0 {
+        const rt = T.tys[t.fnRet]
+        if rt is TyArray || rt is TyUnion { return -2 }
+      }
+      if tyEmitNamesOf(ty) { return 11 }
+      return -1
+    }
+    TyArray => {
+      const k = valueRowKind(ty)
+      if k != -2 { return k }
+      return vakOfListElem(ty)
+    }
+    TyUnion => {
+      const p = tyEmitPrimOf(ty)
+      if p != null { return vakOfPrim(p) }
+      return vakOfUnion(t.uMembers)
+    }
+  }
+}
+
+// The atom kind of list `arr` whose element the arena row does not classify, by the element's
+// spelling inside the list's render, or -2 for an element union this does not walk.
+function vakOfListElem(arr: i32): i32 {
+  const p = tyEmitElemPrimOf(arr)
+  if p != null { return vakOfPrimList(p) }
+  if tyEmitElemNulPrimOf(arr, "boolean") != 0 { return 18 }
+  if tyEmitElemNulPrimOf(arr, "string") != 0 { return 9 }
+  const el = tyStepElem(arr)
+  if el < 0 { return -1 }
+  // A quoted literal run with a null, or its alias with one, is the atom list.
+  if litUnionInlineNameOfTy(el) != "" { return 7 }
+  const e = T.tys[el]
+  // Exhaustive over `Ty` and `_`-less: every element shape says whether it is an atom list.
+  match e {
+    TyNullable => {
+      const inr = e.nInner
+      if inr < 0 { return -1 }
+      if litUnionAliasNameOfTy(inr) != "" || litUnionInlineNameOfTy(inr) != "" {
+        return 7
+      }
+      const it = T.tys[inr]
+      if it is TyUnion || it is TyNullable { return -2 }
+      // A function, any other primitive, a shape, a list or a map beside the null is not one
+      // of the three nullable-element lists.
+      return -1
+    }
+    TyUnion => {
+      return -2
+    }
+    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
+      // A shape, list, map or function element, or an element with no spelling.
+      return -1
+    }
+  }
+}
+
+// The atom kind of a union no primitive spells, from its members' kinds: one part when every
+// member spells alike, else several parts, which are never one atom.
+function vakOfUnion(ms: i32[]): i32 {
+  if ms.length == 0 { return -1 }
+  // Two string literals beside a non-null member spell their registered alias, an extra part.
+  const texts: string[] = []
+  let nonLit = false
+  for m in ms {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind == "str" { texts.push(mt.litText) }
+    } else if !tyIsNullPrim(m) {
+      nonLit = true
+    }
+  }
+  if nonLit && texts.length >= 2 && litUnionAliasOfLitTexts(texts) != "" {
+    return -1
+  }
+  let kind = -3
+  for m in ms {
+    let mk = -1
+    const mt = T.tys[m]
+    if litUnionAliasNameOfTy(m) != "" {
+      mk = -1
+    } else if mt is TyFunc {
+      // A function member is grouped, so its spelling never ends in `[]`.
+      if tyEmitNamesOf(m) { mk = 11 }
+    } else if mt is TyUnion {
+      return -2
+    } else {
+      mk = vakOfTy(m)
+      if mk == -2 { return -2 }
+    }
+    if mk == -1 { return -1 }
+    if kind == -3 { kind = mk }
+    else if kind != mk { return -1 }
+  }
+  // One spelling per kind, except the atom list, the string list, the nullable boolean list
+  // and the closure, each of which several spellings share (D4320).
+  if ms.length > 1 && (kind == 7 || kind == 9 || kind == 11 || kind == 18) {
+    return -2
+  }
+  kind
 }
 
 // The value-atom kind the concrete (non-box) side of a union `==` compares under — the
@@ -23685,36 +23889,87 @@ export function nulScalarListKind(name: string): VKind | null {
   if nameIsU8Array(b) { return "nulu8list" }
   null
 }
-// `nulScalarListKind` of `ty | null`, asked of the type: a list whose element is one of the
-// five distinct-backing scalars, or a nullable string. Any other shape asks the spelling.
+// `nulScalarListKind` of `ty | null`, asked of the type: a list whose element spells one of
+// the five distinct-backing scalars or a nullable string, or a union whose members all spell
+// the same such list.
 export function nulScalarListKindOfTy(ty: i32): VKind | null {
-  if ty >= 0 {
-    const t = T.tys[ty]
-    if t is TyArray {
-      if t.aElem >= 0 {
-        const el = T.tys[t.aElem]
-        if el is TyPrim {
-          const p = el.primName
-          if p == "string" { return "nulstrlist" }
-          if p == "f64" { return "nulf64list" }
-          if p == "i64" { return "nuli64list" }
-          if p == "f32" { return "nulf32list" }
-          if p == "u8" { return "nulu8list" }
-          if p == "i32" || p == "boolean" { return null }
-        }
-        if el is TyNullable {
-          if el.nInner >= 0 {
-            const inr = T.tys[el.nInner]
-            if inr is TyPrim {
-              if inr.primName == "string" { return "nulstrlist" }
-            }
-          }
-        }
+  const c = nslSpellOf(ty)
+  if c == 1 || c >= 6 { return "nulstrlist" }
+  if c == 2 { return "nulf64list" }
+  if c == 3 { return "nuli64list" }
+  if c == 4 { return "nulf32list" }
+  if c == 5 { return "nulu8list" }
+  null
+}
+
+// The spelling `nulScalarListKindOfTy` reads, as a code: 1-5 `string[]`, `f64[]`, `i64[]`,
+// `f32[]`, `u8[]`; 6 `(string|null)[]`, 7 `(null|string)[]`; 0 anything else. Union members
+// are compared by code, since the render keeps one part only when two spell alike.
+function nslSpellOf(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  for s in nslSeen {
+    if s == ty { return 0 }
+  }
+  nslSeen.push(ty)
+  const r = nslSpellGo(ty)
+  nslSeen.pop()
+  r
+}
+
+// The ancestor stack of `nslSpellOf`: a revisited union spells an alias name, never a list.
+const nslSeen: i32[] = []
+
+function nslSpellGo(ty: i32): i32 {
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: only a list or a union of lists spells one.
+  match t {
+    TyArray => {
+      const p = tyEmitElemPrimOf(ty)
+      if p != null { return nslOfPrim(p) }
+      const o = tyEmitElemNulPrimOf(ty, "string")
+      if o == 0 { return 0 }
+      return 5 + o
+    }
+    TyUnion => {
+      let code = 0
+      for m in t.uMembers {
+        const c = nslSpellOf(m)
+        if c == 0 { return 0 }
+        if code == 0 { code = c }
+        else if code != c { return 0 }
       }
+      return code
+    }
+    TyPrim | TyLit | TyNullable | TyObj | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
+      return 0
     }
   }
-  nulScalarListKind(tyToEmitName(ty) + "|null")
 }
+
+// The `nslSpellOf` code of the list spelling `p[]`.
+function nslOfPrim(p: PrimName): i32 {
+  match p {
+    "string" => {
+      return 1
+    }
+    "f64" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f32" => {
+      return 4
+    }
+    "u8" => {
+      return 5
+    }
+    "i32" | "boolean" | "void" | "null" | "never" | "v128" => {
+      return 0
+    }
+  }
+}
+
 // The nullable-scalar-list VKind of annotation node `tyIx`, or `null`. Arena-first and
 // total where it covers: the spelling can't tell the four cases apart any more, since
 // `canonEmitName` softens a bare inline literal union to its base scalar. A covered
