@@ -2,8 +2,8 @@
 """The shared ratchet core — one baseline schema, one `--check`, one `--why`.
 
 Eight ratchets hold a count against a committed baseline that may only FALL:
-comment-budget, ladder-budget, scan-budget, export-budget, render-parse-budget,
-seed-size (scripts/seed-size.vl), and interp and sentinel, which the lint holds
+ladder-budget, export-budget, render-parse-budget,
+seed-size (scripts/seed-size.vl), and comment, scan, interp and sentinel, which the lint holds
 itself (`vl check --budget`) and writes in this file's layout. The per-file
 ones that came first were the same 41 lines four times over —
 `load_baseline`, `write_baseline`, `cmd_check`, `cmd_exempt_codes`, the
@@ -275,8 +275,7 @@ class Ratchet:
 
 if __name__ == "__main__":
     print("scripts/ratchet.py is the shared core, not a command. The ratchets are\n"
-          "  comment-budget.py  ladder-budget.py\n"
-          "  scan-budget.py  export-budget.py  render-parse-budget.py\n"
-          "and three held in VL: seed-size (scripts/seed-size.vl), interp and sentinel\n"
-          "(`vl check --budget scripts/{interp,sentinel}-budget-baseline.json`)")
+          "  ladder-budget.py  export-budget.py  render-parse-budget.py\n"
+          "and five held in VL: seed-size (scripts/seed-size.vl), and comment, scan, interp\n"
+          "and sentinel (`vl check --budget scripts/{comment,scan,interp,sentinel}-budget-baseline.json`)")
     sys.exit(2)

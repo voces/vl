@@ -444,7 +444,7 @@ Deno.test({
 // THE SETS ARE READ FROM THE TREE, NOT COPIED INTO IT. `ladder-budget.py` re-derives
 // every closed set from the `export type` that declares it and compares against
 // `compiler/lint.vl`'s `const kl<Name>` arrays, exiting non-zero on any drift — the
-// same contract `scan-budget.py` enforces on `asPasses`. This runs that check on its
+// same contract tests/vl_scan_passes_test.ts enforces on `asPasses`. This runs that check on its
 // own, so a drifting set fails HERE and names the set, rather than showing up as a
 // mysterious count change in the ratchet.
 Deno.test({

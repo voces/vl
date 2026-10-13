@@ -1,21 +1,16 @@
-// THE TWO COMMENT-RULE IMPLEMENTATIONS MUST AGREE.
+// THE FOUR COMMENT RULES GRADE THEIR FIXTURES TO THE LINE.
 //
-// `compiler/lint.vl` grades one module at a time from the source the driver hands
-// it; `scripts/comment-budget.py` grades the whole tree for the per-file ratchet.
-// They carry the same block definition, the same four clauses and the same two
-// budgets (4 lines a block, 12 a module header), and nothing else ties them
-// together — so a change to either that moves a count silently un-ratchets the
-// tree. This runs BOTH over five fixtures and compares the hit LINES, not totals.
-// The rules themselves are docs/internals/comment-style.md.
+// `compiler/lint.vl` is the only implementation (the Python twin retired when
+// `vl check --budget` took the ratchet), so each fixture pins the exact lines the four
+// codes fire on, and an empty answer cannot pass for a clean one. The rules themselves
+// are docs/internals/comment-style.md.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
 // seed wasm, like the other native `vl_*` suites.
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
-
-const SCRIPT = `${ROOT}/scripts/comment-budget.py`;
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 const TOO_LONG = "comment-block-too-long";
 const UNCITED = "comment-measurement-uncited";
 const SHOUTING = "comment-shouting";
@@ -146,23 +141,6 @@ const DEP = `export function dep(): i32 { 7 }\n`;
 
 type Hits = { lines: Record<string, number[]>; msgs: string[] };
 
-const script = async (path: string): Promise<Hits> => {
-  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-    args: [SCRIPT, "--grade", path],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (code !== 0) {
-    throw new Error(
-      `comment-budget.py --grade ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
-    );
-  }
-  const raw = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, [number, number][]>;
-  const lines: Record<string, number[]> = {};
-  for (const c of CODES) lines[c] = raw[c].map(([line]) => line).sort((x, y) => x - y);
-  return { lines, msgs: [] };
-};
-
 // The four codes grade `compiler/` alone (docs/internals/lint-rule-scope.md), so the
 // fixture is checked as `compiler/<file>` relative to its temp root, the shape
 // `lint-self.sh` hands the CLI.
@@ -199,7 +177,7 @@ const lint = async (dir: string, file: string): Promise<Hits> => {
 const eq = (a: number[], b: number[]) => JSON.stringify(a) === JSON.stringify(b);
 
 Deno.test({
-  name: "comment rules: the lint and the ratchet script agree, all four codes",
+  name: "comment rules: the lint grades every fixture to the line, all four codes",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_comment_budget_" });
@@ -209,24 +187,14 @@ Deno.test({
     for (const f of FIXTURES) {
       const path = `${dir}/compiler/${f.name}`;
       await Deno.writeTextFile(path, f.src);
-      const s = await script(path);
       const l = await lint(dir, f.name);
 
       for (const c of CODES) {
-        if (!eq(s.lines[c], l.lines[c])) {
-          throw new Error(
-            `${f.name}: ${c} disagrees — comment-budget.py wants lines ` +
-              `${JSON.stringify(s.lines[c])}, compiler/lint.vl got ` +
-              `${JSON.stringify(l.lines[c])}. The two carry the same block definition ` +
-              `and the same budgets; whichever moved has to move back, or both together.`,
-          );
-        }
-        // Pin the fixture's own arithmetic, so an agreeing pair of ZEROS cannot pass.
         const want = f.want[c] ?? [];
-        if (!eq(s.lines[c], want)) {
+        if (!eq(l.lines[c], want)) {
           throw new Error(
-            `${f.name}: want ${c} at lines ${JSON.stringify(want)}, got ` +
-              `${JSON.stringify(s.lines[c])}`,
+            `${f.name}: want ${c} at lines ${JSON.stringify(want)}, compiler/lint.vl got ` +
+              `${JSON.stringify(l.lines[c])}`,
           );
         }
       }
@@ -252,12 +220,9 @@ Deno.test({
 // std-api-review.md §4 — so the four codes skip a std module, and a consumer's
 // `vl check` stops burying its own diagnostics under std's house style (D1601).
 //
-// Both implementations carry that scoping, in the only place each can: the lint
-// tests the MODULE PATH the driver hands it, and comment-budget.py's `sources()`
-// walks `compiler/` alone. `--grade` stays path-blind (it grades the text it is
-// handed), which is why the pair is pinned here and not through the comparison
-// above. The compiler-path twin is the same source, so the std side cannot pass
-// by grading nothing at all.
+// The lint tests the MODULE PATH the driver hands it, and the baseline's `targets` name
+// `compiler/` alone; both are pinned below. The compiler-path twin is the same source, so
+// the std side cannot pass by grading nothing at all.
 const SCOPED = `// A header of three lines, so the run below is a plain block.
 // It is not the block under test; the block under test is the next one.
 // Two of these lines exist only to take the header slot.
@@ -332,26 +297,24 @@ Deno.test({
 });
 
 Deno.test({
-  name: "comment rules: the ratchet walks compiler/ only",
-  ignore: !ENABLED,
-  fn: async () => {
-    const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-      args: [SCRIPT],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
-    if (code !== 0) {
+  name: "comment rules: the ratchet baseline walks compiler/ only",
+  fn: () => {
+    const b = JSON.parse(Deno.readTextFileSync(`${ROOT}/scripts/comment-budget-baseline.json`)) as {
+      targets?: string[];
+      total?: Record<string, number>;
+      files?: Record<string, unknown>;
+    };
+    const targets = b.targets ?? [];
+    if (targets.length !== 1 || targets[0] !== "compiler") {
       throw new Error(
-        `comment-budget.py exited ${code}: ${new TextDecoder().decode(stderr)}`,
+        `the comment ratchet must walk compiler/ alone — the lint no longer produces std ` +
+          `counts, so a baseline for them can never fall. targets: ${JSON.stringify(targets)}`,
       );
     }
-    const rows = new TextDecoder().decode(stdout).split("\n");
-    const std = rows.filter((r) => r.startsWith("std/"));
-    if (std.length > 0) {
-      throw new Error(
-        `the ratchet must not walk std/ — the lint no longer produces those ` +
-          `counts, so a baseline for them can never fall. Rows: ${JSON.stringify(std)}`,
-      );
+    for (const c of CODES) {
+      if (typeof b.total?.[c] !== "number") throw new Error(`the baseline budgets no ${c}`);
     }
+    const std = Object.keys(b.files ?? {}).filter((f) => f.startsWith("std/"));
+    if (std.length > 0) throw new Error(`the baseline holds std rows: ${JSON.stringify(std)}`);
   },
 });
