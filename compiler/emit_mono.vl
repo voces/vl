@@ -47,6 +47,7 @@ import {
   blockHasBareReturn,
   blockLastStmt,
   cUserTypes,
+  callBindTyOf,
   canonEmitName,
   collectValuedReturns,
   declAnnRawTyName,
@@ -11596,6 +11597,32 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
   sp
 }
 
+// The pin of hole parameter `pIx` when call `callIx` hands it generic function `argIx`: the
+// checker bound the hole to the instance the body calls it at, which is materialized here
+// (D4420). "" when the argument is not a generic or the checker bound no concrete signature.
+function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
+  const bt = monoHoleGenFnTy(callIx, pIx, argIx)
+  if bt < 0 { return "" }
+  const nm = monoConcreteFnTyName(bt)
+  if nm == "" { return "" }
+  if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+  monoArgFnTypeName(argIx, ctx)
+}
+
+// The concrete function type the checker bound hole parameter `pIx` to at call `callIx`, when
+// `argIx` is a generic function; -1 otherwise.
+function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
+  if !monoCalleeIsGeneric(unwrapParen(argIx)) { return -1 }
+  const pt = nodeTyIxOf(pIx)
+  if pt < 0 || pt >= T.tys.length { return -1 }
+  const pv = T.tys[pt]
+  if !(pv is TyVar) { return -1 }
+  const bt = callBindTyOf(callIx, pv.tvName)
+  if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) { return -1 }
+  if !(T.tys[bt] is TyFunc) { return -1 }
+  bt
+}
+
 // Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
 let monoDestPinOff = false
 
@@ -11695,6 +11722,11 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             // pins the parameter's own type. `recordedParamPinName` is that one answer,
             // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
             let an = recordedParamPinName(params[i])
+            let anTy = -1
+            if an == "" {
+              an = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
+              if an != "" { anTy = monoHoleGenFnTy(callIx, params[i], args[i]) }
+            }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
               return emitFail(
@@ -11706,7 +11738,8 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               )
             }
             pinned.push(an)
-            pinTys.push(monoArgPinTyIx(args[i], ctx))
+            if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
+            pinTys.push(anTy)
           } else {
             // The declared spelling where the annotation is a type parameter, the
             // arena's canon'd one everywhere else. Without it a parameter whose name
@@ -11808,7 +11841,16 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 pinTys.push(monoArgPinTyIx(args[i], ctx))
               }
             } else {
-              const an2 = monoArgPinName(args[i], ctx)
+              let an2 = ""
+              let an2Ty = -1
+              if ann == tp {
+                an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
+                if an2 != "" {
+                  an2Ty = monoHoleGenFnTy(callIx, params[i], args[i])
+                }
+              }
+              if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
+              if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
               if an2 == "" {
                 return emitFail(
                   "emitProgram: monomorphize: unsupported argument type for `"
@@ -11847,7 +11889,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 pinTys.push(monoArgPinTyIx(args[i], ctx))
               } else {
                 pinned.push(bind)
-                pinTys.push(monoArgPinTyIx(args[i], ctx))
+                pinTys.push(an2Ty)
               }
             }
           }
