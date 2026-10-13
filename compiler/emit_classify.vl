@@ -175,11 +175,9 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNulNumLitUnion,
   nodeTyIsNulScalarBox,
-  nodeTyIsNulString,
   nodeTyIsNulStruct,
   nodeTyIsNullable,
   nodeTyIsNullableOneRep,
-  nodeTyIsNullableString,
   nodeTyIsNullableStruct,
   nodeTyIsObj,
   nodeTyIsPureLitUnion,
@@ -819,6 +817,7 @@ import {
   mvSlotOfValNameTyKArm,
   mvValTyIxOfNameRow,
   nodeMapValTyIx,
+  nodeRepIs,
   nodeRepIsAtom,
   nodeRepIsNulAtom,
   nodeTyMapKeyIsLitUnion,
@@ -2895,7 +2894,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
         if fn is FuncDecl {
-          if fn.fnRet >= 0 { return retNulListFlag(fn.fnRet) == 1 }
+          if fn.fnRet >= 0 { return nodeRepIs(fn.fnRet, "nullist") }
         }
       }
       // A closure-value call whose resolved sig result is the nullable i32-backed list
@@ -3342,7 +3341,7 @@ export function letIsNulString(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      if retNulStringFlag(d.letType) == 1 { return true }
+      if nodeRepIs(d.letType, "nulstr") { return true }
       // A generic instance's binding carries the re-check's type, which can drop a null its
       // `if` still yields at the pin; the cell holds what the join builds (D3290).
       if d.letInit >= 0 && fnInPinnedInstance(fnIx) {
@@ -3371,7 +3370,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   // the checker recorded this node as `string | null`. It recovers the niche for a form the
   // syntactic arms below cannot trace — an else-less `if` printed directly, whose join is the
   // niche and which otherwise falls past every arm to the non-null string print (D1766).
-  if nodeTyIsNullableString(exprIx) { return true }
+  if nodeRepIs(exprIx, "nulstr") { return true }
   // A value the hole instance `fnIx` is pins at `string | null`, where the recorded type is
   // the hole's variable: a join of the parameter reads no arm as nullable (D3016).
   if tyIsNulPrim(holeOperandTyOf(exprIx, fnIx), "string") { return true }
@@ -3381,7 +3380,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
     if exprNullableString(nlIfStr, fnIx) { return true }
   }
   const e = P.nodes[unwrapParen(exprIx)]
-  if e is AsExpr { return nodeTyIsNulString(unwrapParen(exprIx)) }
+  if e is AsExpr { return nodeRepIs(unwrapParen(exprIx), "nulstr") }
   // A string join any link of which can yield `null` is the `(ref null)` block `emitIfExprRef`
   // builds, as a generic's `a ?? d` joined with a `K | null` pin is (D3281).
   if e is IfStmt {
@@ -3407,9 +3406,8 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
       if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulstr" }
     }
     // Fallback, scoped to a call: a `string | null`-returning closure value call whose callee
-    // the cases above miss, such as an indexed closure-array element. `nodeTyIsNullableString`
-    // reads the checker's per-node type without rendering it.
-    return nodeTyIsNullableString(exprIx)
+    // the cases above miss, such as an indexed closure-array element, read off its checked rep.
+    return nodeRepIs(exprIx, "nulstr")
   }
   if e is Ident {
     if (
@@ -3552,7 +3550,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // the `exprNullableString` arm; both read the cast's own recorded type, which for the
   // coalescing member is the nullable result.
   if e is AsExpr {
-    if retNulRefFlag(exprIx) == 1 { return true }
+    if nodeRepIs(exprIx, "nulstruct") { return true }
     return asNulStructRow(exprIx) >= 0
   }
   if e is Call {
@@ -4265,7 +4263,7 @@ function letInitTyIsNarrowedNulStr(letIx: i32, fnIx: i32): boolean {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 || d.letInit < 0 { return false }
-    if !nodeTyIsNullableString(d.letInit) { return false }
+    if !nodeRepIs(d.letInit, "nulstr") { return false }
     return letInitIsBox(d.letInit, fnIx)
   }
   false
@@ -4277,7 +4275,7 @@ function letInitTyIsNulFunc(letIx: i32): boolean {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letInit < 0 { return false }
-    return nodeTyIsNulFunc(d.letInit)
+    return nodeRepIs(d.letInit, "nulclosure")
   }
   false
 }
@@ -10785,7 +10783,7 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     if exprHasStrOp(e.ifCond, fnIx) { return true }
     // An atom arm under a `string`-typed join widens, staging the atom id in the string-op
     // frame. Mirrors the emit decision: the join type recorded by the checker, any arm.
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeTyIsNulString(exprIx) {
+    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeRepIs(exprIx, "nulstr") {
       if ifChainHasAtomArm(exprIx, fnIx) { return true }
     }
     // A join the generic body shares, typed at a hole: the instance may lower it as a string,
@@ -16589,7 +16587,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   // join (an atom + a string/member-literal arm, either order) is the string ref kind even
   // when the then arm alone doesn't classify stringy; the atom arm widens later.
   if tyKindOf(nodeTyIxOf(ifIx)) == TK_STR { return "str" }
-  if nodeTyIsNulString(ifIx) { return "str" }
+  if nodeRepIs(ifIx, "nulstr") { return "str" }
   // The same signal read off the ARMS, for the body where the rung above is blind: a hole
   // arm absorbs the join, so the `if` records that arm's type. Both arms are asked, so a join
   // of two atoms keeps the i32 rep its own rungs give it (D1728).
@@ -16649,7 +16647,7 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   if exprNullableVariant(tv, fnIx) { return "variant" }
   // A nullable-struct join whose then arm is `null` (no rep of its own): the struct index
   // resolves from the checker's inner struct in `ifExprRefSlot` instead.
-  if nodeTyIsNullableStruct(ifIx) { return "struct" }
+  if nodeRepIs(ifIx, "nulstruct") { return "struct" }
   null
 }
 
@@ -21904,9 +21902,9 @@ export function fnRetNullBearing(fnIx: i32) {
   if !(fn is FuncDecl) { return false }
   const r = fn.fnRet
   if tyIsNulBool(r) { return true }
-  if retNulStringFlag(r) == 1 { return true }
-  if retNulRefFlag(r) == 1 { return true }
-  if retNulListFlag(r) == 1 { return true }
+  if nodeRepIs(r, "nulstr") { return true }
+  if nodeRepIs(r, "nulstruct") { return true }
+  if nodeRepIs(r, "nullist") { return true }
   // Every list rep `emitNullForRet` has a `ref.null` for, not only the i32-backed one (D2495).
   if nulScalarListKindOfNode(r) != null { return true }
   if retNulRefArrFlag(r) == 1 { return true }
@@ -23827,7 +23825,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   // `emitIfExprAs` writes for this shape.
   const elIfA = nulArmIfThenValueIx(exprIx)
   // A join typed `string | null` has a string arm beside the atom, so it is the string niche.
-  if elIfA >= 0 && !nodeTyIsNulString(unwrapParen(exprIx)) {
+  if elIfA >= 0 && !nodeRepIs(unwrapParen(exprIx), "nulstr") {
     return exprIsLitAtom(elIfA, fnIx)
   }
   // A `(K | null)[]` element read `p[i]` — the niche i32 (a member id or `-1`). Recovered
@@ -31333,7 +31331,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if e.ifElse < 0 { return false }
     if ifJoinTypedAtom(unwrapParen(exprIx)) { return true }
     // A join typed `string | null` is the nullable string ref, whatever atoms its arms hold.
-    if nodeTyIsNulString(unwrapParen(exprIx)) { return false }
+    if nodeRepIs(unwrapParen(exprIx), "nulstr") { return false }
     // A join `emitIfExpr` lowers as a union box is the box, whatever its arms are alone: a
     // generic's `a ?? 5` pinned at a literal union joins to `K | i32` (D3281).
     if (
@@ -36714,7 +36712,7 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
   // `TyFunc` for every spelling that yields one, including a call whose callee INFERRED the
   // niche and so carries no annotation for the ladder below to read. Structural, so nothing
   // but the nullable-closure rep claims it (D1622).
-  if nodeTyIsNulFunc(exprIx) { return true }
+  if nodeRepIs(exprIx, "nulclosure") { return true }
   // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfC = nulIfArmNullableValueIx(exprIx)
   if nlIfC >= 0 {
@@ -39226,7 +39224,7 @@ function identHoldsUnionBox(ix: i32, name: string, fnIx: i32): boolean {
 export function nicheReadKindAt(ix: i32, key: string): i32 {
   const nk = narrowedNicheAtomOf(key)
   if nk == 1 && nodeTyIsNulBool(ix) { return 1 }
-  if nk == 2 && nodeTyIsNulString(ix) { return 2 }
+  if nk == 2 && nodeRepIs(ix, "nulstr") { return 2 }
   -1
 }
 
