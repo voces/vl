@@ -26,9 +26,9 @@ restate measurements; follow the links.
 | L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
 | L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. Next: `valueAtomKind`'s union fallback and `mvValKindOfTy`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
-| L4–L7 | not started | |
+| L7 `pending*` into `ExpCtx` | **in progress as C3** | `emitReturnValue` builds its `ExpCtx` and restores the caller's on every exit: 25 `pending*` writes to 0 (`wasmEmit.vl` 463 to 436 lines). Next: `emitLetDeclStmt`. The never-cleared count (211 of 1,151) is not ratcheted yet. |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
-| L9–L14 | not started | |
+| L4–L6, L9–L14 | not started | |
 | SMALL S-c front-end tidy | **partial** | `typecheck.vl` imports `./ast` once (byte-identical seed). Not byte-identical, so not done: the second `Tok` (the lexer's has no `pos`), the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check). `await` skipped: a surface decision. |
 | SMALL S-a, S-b, S-d … S-n | not started | |
 | RepDesc rulings | **open** since 2026-09-06 | `open-rulings.md`: `one-literal-union-rep`, `nullable-rep-rule-stated-once` |
@@ -131,7 +131,7 @@ order, subject to the one-writer rule.
 | --- | --- | --- |
 | T1 | **Done.** The host process ABI: `std:process` (`runProgram`, `exit`) and `std:env` (`getEnv`) shipped with their host imports; see ROADMAP's "Host ABI for VL scripts". | — |
 | T2 | L11 the VL way: the per-file budgets move into `vl lint` itself (a baseline-reading budget mode), so the ratchets need neither Python nor spawn. The twin Python censuses retire as each rule's budget moves. | none |
-| T3 | **Ready.** Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
+| T3 | **In progress.** `check-filed-witnesses.vl` is ported and runs the gate row (the Python stays for `scripts/inventory/rows.py`, which imports it). Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
 | T4 | L10: the `-O` optimizer | owner decision 3 below |
 | T5 | L12: the remaining LSP features | A7 |
 
@@ -178,4 +178,4 @@ These have no unmet prerequisite and touch disjoint files:
   first; it is small.
 - **C3 first PR**: `emitReturnValue` through `ExpCtx` (`wasmEmit.vl`).
 - **B1**: continues in lane SC (#3542).
-- **T3, first port**: `check-filed-witnesses.py`, kept beside the Python version until the reports are byte-identical. It is for VL-first tooling, not gate speed: a VL port still starts `vl` per row, through `runProgram`.
+- **T3, first port — done**: `check-filed-witnesses.vl` prints the Python's report byte for byte on both inventories and now runs the `filed witnesses` gate row; the Python stays beside it (`scripts/inventory/rows.py` imports its row grammar). It found D4290 (a compiler trap) and one new `dogfood:` row (`runProgram` waits). Next: `regress.py` + `gradecensus.py`.

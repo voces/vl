@@ -306,9 +306,14 @@ print(f("ab"))  // prints 2
 > Ruling: owner 2026-10-12 (Q4 (c)), DECISIONS.md §"Record arms that share a field name form
 > a legal union". `u is A` tests whether the value fits `A`, field by field.
 
-> Status: not built. A union of two records with the same field names, where no field is
-> literal-typed in both, is still refused when it is formed (`{ v: i32 } | { v: boolean }`)
-> (D4056).
+> Status: built (D4056). Open gaps, each refused loudly: a true `is` over overlapping arms
+> (`{ v: i32 | string } | { v: string }`) does not narrow `x` (D4262); arms whose shared field
+> is a `Set` in one and a map in the other (D4263); a field that is a box with a member only some
+> of whose values fit (D4265); a field read under an `is` that a sibling arm also passes, when
+> the arms store it differently (D4266); and a nested-record field only some of whose values
+> fit (D4267). One gap is not loud: a read of a field that every arm stores as a nullable integer
+> (`{ v: i32 | null } | { v: 1 | null }`) builds an invalid module (D4268). Which arm an inline
+> literal fitting several arms builds is an open question (D4056).
 
 Open question: does `v is A` hold of a record value that has every field of `A` and more?
 Today it does not. See OPEN-QUESTIONS.md §Q2.

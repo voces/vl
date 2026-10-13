@@ -1,0 +1,1539 @@
+// Run the repro filed under every defect heading of a docs inventory and report which rows
+// no longer behave as filed. The VL port of `scripts/check-filed-witnesses.py`, whose
+// docstring is the full contract; the two print the same report byte for byte.
+//
+//     vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] <doc-or-dir>...
+//     vl run scripts/check-filed-witnesses.vl -- --self-test
+//
+// Paths resolve against the working directory, so run it from the checkout root. Rows are
+// graded `$JOBS` at a time (default 4) by `xargs -P` over a build of this file, because
+// `runProgram` waits for its child; `mktemp`, `mkdir` and `rm` stand in for the directory
+// operations `std:fs` lacks. Both are `dogfood:` rows in ROADMAP.md.
+
+import {
+  IoError,
+  listDir,
+  pathExists,
+  pathKind,
+  readFile,
+  readTextFile,
+  writeTextFile,
+} from "std:fs"
+import { exit, runProgram } from "std:process"
+import { getEnv } from "std:env"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import {
+  endsWith,
+  join,
+  lastIndexOf,
+  replaceAll,
+  split,
+  startsWith,
+  toLowerAscii,
+} from "std:str"
+
+const VL = "./scripts/vl-host/target/release/vl"
+const COMPILER = "build/vl-compiler.wasm"
+const SELF = "scripts/check-filed-witnesses.vl"
+const SIDECAR = "build/vl-compiler.wasm.src"
+const REPEAT_MAX: i64 = 50000000
+
+// A section of an inventory doc: one `### <ID> — <title>` row and what it filed.
+type Row = {
+  id: string,
+  title: string,
+  hasStatus: boolean,
+  status: string,
+  repro: string,
+  wantLabels: i32,
+  want: string,
+  doc: string,
+  line: i32,
+}
+
+// What the compiler did with one witness: the outcome, a 200-code-point detail, and the
+// run's whole stdout when it ran.
+type Ran = { outcome: string, detail: string, stdout: string }
+
+// A graded row, or an ungradeable one when `why` is not empty.
+type Graded = {
+  row: Row,
+  declared: string,
+  actual: string,
+  detail: string,
+  why: string,
+}
+
+// Stop with `code` after saying why, on stdout: VL has no stderr sink.
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// ── text helpers: the parts of Python's `str` and `re` this file reads with ─────────────
+
+// The byte length of the whitespace code point at `i` (Python's `str.isspace`), or 0.
+function wsLen(s: string, i: i32): i32 {
+  if i < 0 || i >= s.length { return 0 }
+  const b = s[i]
+  if b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31) { return 1 }
+  if b == 0xC2 && i + 1 < s.length {
+    if s[i + 1] == 0x85 || s[i + 1] == 0xA0 { return 2 }
+    return 0
+  }
+  if i + 2 >= s.length { return 0 }
+  const c = s[i + 1]
+  const d = s[i + 2]
+  if b == 0xE1 && c == 0x9A && d == 0x80 { return 3 }
+  if b == 0xE2 && c == 0x80 {
+    if (d >= 0x80 && d <= 0x8A) || d == 0xA8 || d == 0xA9 || d == 0xAF {
+      return 3
+    }
+  }
+  if b == 0xE2 && c == 0x81 && d == 0x9F { return 3 }
+  if b == 0xE3 && c == 0x80 && d == 0x80 { return 3 }
+  0
+}
+
+// The byte length of a whitespace code point ending just before `end`, or 0.
+function wsLenBefore(s: string, end: i32): i32 {
+  let k = 1
+  while k <= 3 {
+    if end - k >= 0 && wsLen(s, end - k) == k { return k }
+    k = k + 1
+  }
+  0
+}
+
+function lstripWs(s: string): string {
+  let a = 0
+  while a < s.length && wsLen(s, a) > 0 { a = a + wsLen(s, a) }
+  s.slice(a, s.length)
+}
+
+function rstripWs(s: string): string {
+  let b = s.length
+  while b > 0 && wsLenBefore(s, b) > 0 { b = b - wsLenBefore(s, b) }
+  s.slice(0, b)
+}
+
+function stripWs(s: string): string { lstripWs(rstripWs(s)) }
+
+// `s` without leading and trailing copies of the one-byte character `c`.
+function stripByte(s: string, c: i32): string {
+  let a = 0
+  let b = s.length
+  while a < b && s[a] == c { a = a + 1 }
+  while b > a && s[b - 1] == c { b = b - 1 }
+  s.slice(a, b)
+}
+
+function rstripByte(s: string, c: i32): string {
+  let b = s.length
+  while b > 0 && s[b - 1] == c { b = b - 1 }
+  s.slice(0, b)
+}
+
+// The byte length of the line break at `i` (Python's `str.splitlines` set), or 0.
+function breakLen(s: string, i: i32): i32 {
+  const b = s[i]
+  if b == 13 {
+    if i + 1 < s.length && s[i + 1] == 10 { return 2 }
+    return 1
+  }
+  if b == 10 || b == 11 || b == 12 || b == 28 || b == 29 || b == 30 { return 1 }
+  if b == 0xC2 && i + 1 < s.length && s[i + 1] == 0x85 { return 2 }
+  if b == 0xE2 && i + 2 < s.length && s[i + 1] == 0x80 {
+    if s[i + 2] == 0xA8 || s[i + 2] == 0xA9 { return 3 }
+  }
+  0
+}
+
+// Python's `str.splitlines()`: no trailing empty piece, every break kind recognised.
+function splitLines(s: string): string[] {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    const n = breakLen(s, i)
+    if n > 0 {
+      out.push(s.slice(start, i))
+      i = i + n
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  if start < s.length { out.push(s.slice(start, s.length)) }
+  out
+}
+
+// Text as Python's universal-newline reader hands it over: every `\r\n` and `\r` is `\n`.
+function univNl(s: string): string {
+  replaceAll(replaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
+// The first `n` code points of `s`, which is what a Python slice `[:n]` keeps.
+function cpPrefix(s: string, n: i32): string {
+  let seen = 0
+  let i = 0
+  while i < s.length {
+    if (s[i] & 0xC0) != 0x80 {
+      if seen == n { return s.slice(0, i) }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  s
+}
+
+// The first line of `s` as `s.splitlines()[0]`, or "" when it has none.
+function firstLine(s: string): string {
+  const ls = splitLines(s)
+  if ls.length == 0 { return "" }
+  ls[0]
+}
+
+// The byte index of `needle` in `s` at or after `from`, or -1.
+function findFrom(s: string, needle: string, from: i32): i32 {
+  let i = from
+  while i + needle.length <= s.length {
+    let j = 0
+    while j < needle.length && s[i + j] == needle[j] { j = j + 1 }
+    if j == needle.length { return i }
+    i = i + 1
+  }
+  -1
+}
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+// `s` left-justified to `w` code points, as `f"{s:<w}"` pads it.
+function padTo(s: string, w: i32): string {
+  let out = s
+  let n = s.cpLen()
+  while n < w {
+    out = out + " "
+    n = n + 1
+  }
+  out
+}
+
+function isDigit(b: i32): boolean { b >= 48 && b <= 57 }
+
+function isAlpha(b: i32): boolean {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+}
+
+function isUpper(b: i32): boolean { b >= 65 && b <= 90 }
+
+// A regex word character, with every non-ASCII byte read as punctuation.
+function isWordByte(b: i32): boolean { isDigit(b) || isAlpha(b) || b == 95 }
+
+// Whether `s` starts with `word` followed by a regex word boundary (`^word\b`).
+function leadWord(s: string, word: string): boolean {
+  if !startsWith(s, word) { return false }
+  s.length == word.length || !isWordByte(s[word.length])
+}
+
+// The count of leading `#`.
+function hashes(s: string): i32 {
+  let n = 0
+  while n < s.length && s[n] == 35 { n = n + 1 }
+  n
+}
+
+// Whether `s` is `^#{lo,hi}\s`: lo to hi hashes, then whitespace.
+function headOf(s: string, lo: i32, hi: i32): boolean {
+  const n = hashes(s)
+  n >= lo && n <= hi && wsLen(s, n) > 0
+}
+
+// The index past a run of whitespace starting at `i`.
+function skipWs(s: string, i: i32): i32 {
+  let j = i
+  while wsLen(s, j) > 0 { j = j + wsLen(s, j) }
+  j
+}
+
+// A row heading's id and title, or an empty id when `ln` is not one. The grammar is
+// `^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$`.
+type Sec = { id: string, title: string }
+
+function matchSec(ln: string): Sec {
+  const none: Sec = { id: "", title: "" }
+  if !headOf(ln, 2, 4) { return none }
+  const a = skipWs(ln, hashes(ln))
+  if a >= ln.length || !isUpper(ln[a]) { return none }
+  let i = a + 1
+  while i < ln.length && isDigit(ln[i]) { i = i + 1 }
+  if i == a + 1 { return none }
+  if ln[a] == 68 && i < ln.length {
+    let j = i
+    if ln[j] == 45 { j = j + 1 }
+    if j < ln.length && isAlpha(ln[j]) {
+      j = j + 1
+      while j < ln.length && (isAlpha(ln[j]) || isDigit(ln[j])) { j = j + 1 }
+      if wsLen(ln, j) > 0 { i = j }
+    }
+  }
+  if wsLen(ln, i) == 0 { return none }
+  let k = skipWs(ln, i)
+  if startsWith(ln.slice(k, ln.length), "—") { k = k + 3 }
+  else if k < ln.length && ln[k] == 45 { k = k + 1 }
+  else { return none }
+  if wsLen(ln, k) == 0 { return none }
+  { id: ln.slice(a, i), title: stripWs(ln.slice(skipWs(ln, k), ln.length)) }
+}
+
+// `^#{2,4}\s+D\d`: a heading that plainly names a D-row, parsed or not.
+function isRowHead(ln: string): boolean {
+  if !headOf(ln, 2, 4) { return false }
+  const a = skipWs(ln, hashes(ln))
+  a + 1 < ln.length && ln[a] == 68 && isDigit(ln[a + 1])
+}
+
+function isAnyHead(ln: string): boolean { headOf(ln, 1, 6) }
+
+// The `<name>.vl` of a `// file: <name>.vl` marker line, or "".
+function fileMark(ln: string): string {
+  if !startsWith(ln, "// file: ") { return "" }
+  let i = 9
+  while i < ln.length && wsLen(ln, i) == 0 { i = i + 1 }
+  const name = ln.slice(9, i)
+  if skipWs(ln, i) != ln.length { return "" }
+  if name.length < 4 || !endsWith(name, ".vl") { return "" }
+  name
+}
+
+// `src` with every `@@repeat(N, "text")@@` replaced by N copies of `text`.
+function expandRepeats(src: string): string {
+  const open = "@@repeat("
+  let out = ""
+  let from = 0
+  let at = findFrom(src, open, 0)
+  while at >= 0 {
+    let i = at + open.length
+    const d0 = i
+    while i < src.length && isDigit(src[i]) { i = i + 1 }
+    let ok = i > d0 && startsWith(src.slice(i, src.length), ", \"")
+    let t0 = 0
+    let t1 = 0
+    if ok {
+      t0 = i + 3
+      t1 = findFrom(src, "\"", t0)
+      ok = t1 >= 0 && startsWith(src.slice(t1, src.length), "\")@@")
+    }
+    if !ok {
+      at = findFrom(src, open, at + 1)
+      continue
+    }
+    let n: i64 = 0
+    let k = d0
+    while k < i {
+      n = n * 10 + ((src[k] - 48) as i64)
+      k = k + 1
+    }
+    if n > REPEAT_MAX {
+      die(
+        "check-filed-witnesses: @@repeat count \{toString(n)} is over the \{toString(REPEAT_MAX)} cap",
+        1,
+      )
+    }
+    const text = src.slice(t0, t1)
+    out = out + src.slice(from, at)
+    let c: i64 = 0
+    const parts: string[] = []
+    while c < n {
+      parts.push(text)
+      c = c + 1
+    }
+    out = out + join(parts, "")
+    from = t1 + 4
+    at = findFrom(src, open, from)
+  }
+  out + src.slice(from, src.length)
+}
+
+// ── JSON, as Python's `json.dumps` spells a string ────────────────────────────────
+
+function hexDigits(v: i32, n: i32): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = n - 1
+  while k >= 0 {
+    const d = (v >> (k * 4)) & 15
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+function uEsc(cp: i32): string { "\\u" + hexDigits(cp, 4) }
+
+// `json.dumps(s)` with its default `ensure_ascii`: everything outside space..`~` escaped.
+function jsonStr(s: string): string {
+  const parts = ["\""]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == 34 { parts.push("\\\"") }
+      else if b == 92 { parts.push("\\\\") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 8 { parts.push("\\b") }
+      else if b == 12 { parts.push("\\f") }
+      else if b < 32 || b == 127 { parts.push(uEsc(b)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    let cp = 0
+    let n = 1
+    if b >= 0xF0 {
+      n = 4
+      cp = b & 7
+    } else if b >= 0xE0 {
+      n = 3
+      cp = b & 15
+    } else {
+      n = 2
+      cp = b & 31
+    }
+    let k = 1
+    while k < n && i + k < s.length {
+      cp = (cp << 6) | (s[i + k] & 63)
+      k = k + 1
+    }
+    if cp > 0xFFFF {
+      const v = cp - 0x10000
+      parts.push(uEsc(0xD800 | (v >> 10)))
+      parts.push(uEsc(0xDC00 | (v & 0x3FF)))
+    } else {
+      parts.push(uEsc(cp))
+    }
+    i = i + n
+  }
+  parts.push("\"")
+  join(parts, "")
+}
+
+// ── the declared-status vocabulary ─────────────────────────────────────────────
+
+// Needle and outcome, in order: the first needle found wins, so the specific phrases
+// precede the substrings they contain.
+const DECLARED_NEEDLE = [
+  "now a loud check reject", "now a loud emit reject",
+  "runs today and must keep running", "closed", "loads then traps",
+  "trap after load", "check-clean invalid wasm", "check-clean silently wrong",
+  "check-clean wrong evaluation", "compiler trap", "loud emit reject",
+  "loud check reject",
+]
+const DECLARED_OUTCOME = [
+  "check_reject", "emit_reject", "runs", "runs", "trap_loads", "trap_loads",
+  "silent_invalid_wasm", "silent_wrong_value", "silent_wrong_evalcount",
+  "compiler_trap", "emit_reject", "check_reject",
+]
+const OUTCOMES_SORTED = "check_reject, compiler_trap, emit_reject, runs, silent_invalid_wasm, silent_wrong_evalcount, silent_wrong_value, trap_loads"
+
+const NEGATIONS = [
+  " not ", " never ", " no longer ", " isn't ", " is not ", " nor ",
+  " rather than ",
+]
+const CLAUSE_SEPS = [".", ";", "·", "—", ","]
+
+// Whether a negation in the same clause governs the match at byte `pos` of `low`.
+function negatedBefore(low: string, pos: i32): boolean {
+  let window = low.slice(0, pos)
+  for sep in CLAUSE_SEPS {
+    const cut = lastIndexOf(window, sep)
+    if cut != -1 { window = window.slice(cut + sep.length, window.length) }
+  }
+  window = " " + window + " "
+  for n in NEGATIONS {
+    if contains(window, n) { return true }
+  }
+  false
+}
+
+// The canonical outcome a status line files, or "" when it names none (or negates it).
+function declaredOutcome(status: string): string {
+  const low = toLowerAscii(status)
+  let k = 0
+  while k < DECLARED_NEEDLE.length {
+    const pos = findFrom(low, DECLARED_NEEDLE[k], 0)
+    if pos != -1 {
+      if negatedBefore(low, pos) { return "" }
+      return DECLARED_OUTCOME[k]
+    }
+    k = k + 1
+  }
+  ""
+}
+
+// Whether the status files a parse-stage refusal: `parse[ -](error|stage)|at the parse\b`.
+function namesParseError(status: string): boolean {
+  const low = toLowerAscii(status)
+  let best = -1
+  for needle in ["parse error", "parse-error", "parse stage", "parse-stage"] {
+    const p = findFrom(low, needle, 0)
+    if p != -1 && (best == -1 || p < best) { best = p }
+  }
+  let from = 0
+  while from >= 0 {
+    const p = findFrom(low, "at the parse", from)
+    if p == -1 { break }
+    const end = p + 12
+    if end == low.length || !isWordByte(low[end]) {
+      if best == -1 || p < best { best = p }
+      break
+    }
+    from = p + 1
+  }
+  best != -1 && !negatedBefore(low, best)
+}
+
+const INVALID_MARKERS = [
+  "Invalid input WebAssembly code", "wasm validation", "failed to parse",
+  "type mismatch: expected", "WebAssembly translation error",
+  "validation error",
+]
+const TRAP_MARKERS = [
+  "wasm trap", "unreachable", "out of bounds", "divide by zero",
+  "null reference", "cast failure", "integer overflow",
+]
+
+function anyIn(s: string, needles: string[]): boolean {
+  for n in needles {
+    if contains(s, n) { return true }
+  }
+  false
+}
+
+// ── processes and directories ────────────────────────────────────────────────
+
+// Stdout, stderr and exit code of one child, both streams decoded as Python's
+// `text=True` does.
+type Proc = { code: i32, out: string, err: string }
+
+function spawn(cmd: string, args: string[]): Proc {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("check-filed-witnesses: cannot run \{cmd} (\{r.msg})", 1)
+    return { code: -1, out: "", err: "" }
+  }
+  {
+    code: r.code,
+    out: univNl(decodeUtf8Lossy(r.stdout)),
+    err: univNl(decodeUtf8Lossy(r.stderr)),
+  }
+}
+
+// One `vl` subcommand on a witness, bounded at 120 s as the Python's `timeout=120` is.
+function vl(args: string[]): Proc {
+  const full = ["120", VL]
+  for a in args { full.push(a) }
+  spawn("timeout", full)
+}
+
+function readText(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("check-filed-witnesses: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  t
+}
+
+function writeText(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null {
+    die("check-filed-witnesses: cannot write \{path} (\{w.msg})", 1)
+  }
+}
+
+function exists(path: string): boolean {
+  const e = pathExists(path)
+  if e is IoError { return false }
+  e
+}
+
+function isDir(path: string): boolean {
+  const k = pathKind(path)
+  if k is IoError { return false }
+  k == "dir"
+}
+
+// A fresh private directory from `mktemp -d`, under `$TMPDIR` when it is set.
+function makeTempDir(): string {
+  const p = spawn("mktemp", ["-d"])
+  if p.code != 0 { die("check-filed-witnesses: mktemp -d failed: " + p.err, 1) }
+  stripWs(p.out)
+}
+
+// ── witnesses: write each to its own directory, then classify what `vl` does ───────
+
+// The `// file:` sections of a witness as alternating name and source; one unnamed
+// section is `w.vl`. The last name is the entry the three channels run.
+function splitFiles(src0: string): string[] {
+  const src = expandRepeats(src0)
+  const out: string[] = []
+  let name = ""
+  let body: string[] = []
+  for ln in splitLines(src) {
+    const m = fileMark(ln)
+    if m != "" {
+      if name != "" {
+        out.push(name)
+        out.push(rstripWs(join(body, "\n")) + "\n")
+      }
+      name = m
+      body = []
+    } else {
+      body.push(ln)
+    }
+  }
+  if name == "" { return ["w.vl", src] }
+  out.push(name)
+  out.push(rstripWs(join(body, "\n")) + "\n")
+  out
+}
+
+// Write the files of the repro staged at `dir/repro` beside it, and answer the entry's path.
+function stageWitness(dir: string): string {
+  const files = splitFiles(readText(dir + "/repro"))
+  let k = 0
+  while k < files.length {
+    writeText(dir + "/" + files[k], files[k + 1])
+    k = k + 2
+  }
+  dir + "/" + files[files.length - 2]
+}
+
+// Classify the witness staged in `dir` on the check, run and build channels.
+function classify(dir: string): Ran {
+  const f = stageWitness(dir)
+  const chk = vl(["check", f, "--compiler", COMPILER])
+  if chk.code != 0 {
+    const diag = stripWs(chk.out + chk.err)
+    if contains(diag, "(parse error)") {
+      return {
+        outcome: "witness_unparsed",
+        detail: cpPrefix(diag, 200),
+        stdout: "",
+      }
+    }
+    return { outcome: "check_reject", detail: cpPrefix(diag, 200), stdout: "" }
+  }
+  const run = vl(["run", f, "--compiler", COMPILER])
+  if run.code == 0 {
+    return {
+      outcome: "runs",
+      detail: cpPrefix(stripWs(run.out), 200),
+      stdout: run.out,
+    }
+  }
+  const err = stripWs(run.out + run.err)
+  const detail = cpPrefix(err, 200)
+  if contains(err, "emit error") {
+    return { outcome: "emit_reject", detail: detail, stdout: "" }
+  }
+  const out = dir + "/w.wasm"
+  const bld = vl(["build", f, "--compiler", COMPILER, "-o", out])
+  if bld.code != 0 && !exists(out) {
+    return { outcome: "compiler_trap", detail: detail, stdout: "" }
+  }
+  if anyIn(err, INVALID_MARKERS) {
+    return { outcome: "silent_invalid_wasm", detail: detail, stdout: "" }
+  }
+  if anyIn(err, TRAP_MARKERS) {
+    return { outcome: "trap_loads", detail: detail, stdout: "" }
+  }
+  { outcome: "silent_invalid_wasm", detail: detail, stdout: "" }
+}
+
+// Classify `dir`'s witness and leave the answer in three files beside it.
+function gradeDir(dir: string) {
+  const r = classify(dir)
+  writeText(dir + "/outcome", r.outcome)
+  writeText(dir + "/detail", r.detail)
+  writeText(dir + "/stdout", r.stdout)
+}
+
+function readRan(dir: string): Ran {
+  {
+    outcome: readText(dir + "/outcome"),
+    detail: readText(dir + "/detail"),
+    stdout: readText(dir + "/stdout"),
+  }
+}
+
+// Make one directory per witness under `root`, leave its source there as `repro`, and
+// answer the directories.
+function stageAll(root: string, srcs: string[]): string[] {
+  const dirs: string[] = []
+  let k = 0
+  while k < srcs.length {
+    dirs.push(root + "/" + toString(k))
+    k = k + 1
+  }
+  let at = 0
+  while at < dirs.length {
+    const batch = ["-p"]
+    while at < dirs.length && batch.length < 500 {
+      batch.push(dirs[at])
+      at = at + 1
+    }
+    const p = spawn("mkdir", batch)
+    if p.code != 0 {
+      die("check-filed-witnesses: mkdir failed: " + p.out + p.err, 1)
+    }
+  }
+  k = 0
+  while k < srcs.length {
+    writeText(dirs[k] + "/repro", srcs[k])
+    k = k + 1
+  }
+  dirs
+}
+
+// Grade every staged directory, `jobs` at a time. Serial grading runs in this process;
+// parallel grading builds this file once and lets `xargs -P` fan the directories out one
+// per worker, so a slow witness holds up no neighbour.
+function gradeAll(root: string, dirs: string[], jobs: i32) {
+  if jobs <= 1 || dirs.length <= 1 {
+    for d in dirs { gradeDir(d) }
+    return 0
+  }
+  const grader = root + "/grader.wasm"
+  const b = spawn(VL, ["build", SELF, "--compiler", COMPILER, "-o", grader])
+  if b.code != 0 {
+    die(
+      "check-filed-witnesses: cannot build " + SELF + ":\n" + b.out + b.err,
+      1,
+    )
+  }
+  writeText(root + "/dirs", join(dirs, "\n") + "\n")
+  const x = spawn(
+    "xargs",
+    [
+      "-a",
+      root + "/dirs",
+      "-d",
+      "\\n",
+      "-P",
+      toString(jobs),
+      "-n",
+      "1",
+      VL,
+      "run",
+      grader,
+      "--",
+      "--grade-dirs",
+    ],
+  )
+  if x.code != 0 {
+    die("check-filed-witnesses: a grading worker failed:\n" + x.out + x.err, 1)
+  }
+  0
+}
+
+// Stage, grade and read back every source in `srcs`, in order.
+function runAll(srcs: string[], jobs: i32): Ran[] {
+  const out: Ran[] = []
+  if srcs.length == 0 { return out }
+  const root = makeTempDir()
+  const dirs = stageAll(root, srcs)
+  gradeAll(root, dirs, jobs)
+  for d in dirs { out.push(readRan(d)) }
+  spawn("rm", ["-rf", root])
+  out
+}
+
+// ── reading a doc ───────────────────────────────────────────────────────────────
+
+function blankRow(doc: string): Row {
+  {
+    id: "",
+    title: "",
+    hasStatus: false,
+    status: "",
+    repro: "",
+    wantLabels: 0,
+    want: "",
+    doc: doc,
+    line: 0,
+  }
+}
+
+function statusJoinContinues(line: string): boolean {
+  if stripWs(line) == "" { return false }
+  matchSec(line).id == "" && !isAnyHead(line)
+}
+
+// The indented program the `Repro` lead-in at `lines[i]` introduces, or "".
+function blockAt(lines: string[], i: i32): string {
+  const body: string[] = []
+  let j = i + 1
+  let scanned = 0
+  while j < lines.length && scanned < 6 && !startsWith(lines[j], "    ") {
+    if stripWs(lines[j]) != "" && headOf(lines[j], 2, 4) { break }
+    j = j + 1
+    scanned = scanned + 1
+  }
+  while (
+    j < lines.length
+    && (startsWith(lines[j], "    ") || stripWs(lines[j]) == "")
+  ) {
+    if startsWith(lines[j], "    ") {
+      body.push(lines[j].slice(4, lines[j].length))
+    } else {
+      body.push("")
+    }
+    j = j + 1
+  }
+  const src = rstripWs(join(body, "\n"))
+  if stripWs(src) == "" { return "" }
+  src + "\n"
+}
+
+// The indented block directly under the `Want` lead-in at `lines[i]`, or "".
+function wantBlock(lines: string[], i: i32): string {
+  let j = i + 1
+  while j < lines.length && stripWs(lines[j]) == "" { j = j + 1 }
+  if j >= lines.length || !startsWith(lines[j], "    ") { return "" }
+  const body: string[] = []
+  while (
+    j < lines.length
+    && (startsWith(lines[j], "    ") || stripWs(lines[j]) == "")
+  ) {
+    if startsWith(lines[j], "    ") {
+      body.push(lines[j].slice(4, lines[j].length))
+    } else {
+      body.push("")
+    }
+    j = j + 1
+  }
+  rstripWs(join(body, "\n")) + "\n"
+}
+
+function docLines(doc: string): string[] { splitLines(univNl(readText(doc))) }
+
+// Every row section of `doc`, in order.
+function parseDoc(doc: string): Row[] {
+  const lines = docLines(doc)
+  const rows: Row[] = []
+  let cur = blankRow(doc)
+  let open = false
+  let i = 0
+  while i < lines.length {
+    const ln = lines[i]
+    const m = matchSec(ln)
+    if m.id != "" {
+      if open { rows.push(cur) }
+      cur = blankRow(doc)
+      cur.id = m.id
+      cur.title = m.title
+      cur.line = i + 1
+      open = true
+      i = i + 1
+      continue
+    }
+    if isAnyHead(ln) {
+      if open { rows.push(cur) }
+      open = false
+      i = i + 1
+      continue
+    }
+    if !open {
+      i = i + 1
+      continue
+    }
+    if !cur.hasStatus && startsWith(ln, "**") {
+      const r = rstripWs(ln)
+      if endsWith(r, "**") && r.length > 2 {
+        cur.status = stripWs(stripByte(ln, 42))
+        cur.hasStatus = true
+      } else {
+        const parts = [ln]
+        let k = i + 1
+        while k < lines.length {
+          if !statusJoinContinues(lines[k]) { break }
+          parts.push(lines[k])
+          if endsWith(rstripWs(lines[k]), "**") {
+            cur.status = stripWs(stripByte(join(parts, " "), 42))
+            cur.hasStatus = true
+            break
+          }
+          k = k + 1
+        }
+      }
+    }
+    if leadWord(ln, "Want") {
+      cur.wantLabels = cur.wantLabels + 1
+      if cur.wantLabels == 1 { cur.want = wantBlock(lines, i) }
+      i = i + 1
+      continue
+    }
+    if cur.repro == "" && leadWord(ln, "Repro") {
+      cur.repro = blockAt(lines, i)
+    }
+    i = i + 1
+  }
+  if open { rows.push(cur) }
+  rows
+}
+
+// Row-shaped headings `matchSec` did not parse, as alternating line number and heading.
+function unparsedRowHeads(doc: string): string[] {
+  const out: string[] = []
+  const lines = docLines(doc)
+  let i = 0
+  while i < lines.length {
+    if isRowHead(lines[i]) && matchSec(lines[i]).id == "" {
+      out.push(toString(i + 1))
+      out.push(stripWs(lines[i]))
+    }
+    i = i + 1
+  }
+  out
+}
+
+// ── resolving the arguments ─────────────────────────────────────────────────────
+
+// A path spelled as Python's `pathlib` prints it: no empty or `.` segments.
+function normPath(p: string): string {
+  const segs: string[] = []
+  for s in p.split("/") {
+    if s != "" && s != "." { segs.push(s) }
+  }
+  const body = join(segs, "/")
+  if startsWith(p, "/") { return "/" + body }
+  if body == "" { return "." }
+  body
+}
+
+function under(dir: string, name: string): string {
+  if dir == "." { return name }
+  dir + "/" + name
+}
+
+// A row file's sort key: `D9` before `D10`, and `D661` before `D661A`.
+type IdKey = { pre: string, num: i64, rest: string, path: string }
+
+function idKey(stem: string, path: string): IdKey {
+  let i = 0
+  while i < stem.length && isAlpha(stem[i]) { i = i + 1 }
+  let j = i
+  while j < stem.length && isDigit(stem[j]) { j = j + 1 }
+  if i == 0 || j == i { return { pre: stem, num: 0, rest: "", path: path } }
+  let n: i64 = 0
+  let k = i
+  while k < j {
+    n = n * 10 + ((stem[k] - 48) as i64)
+    k = k + 1
+  }
+  {
+    pre: stem.slice(0, i),
+    num: n,
+    rest: stem.slice(j, stem.length),
+    path: path,
+  }
+}
+
+function idLess(a: IdKey, b: IdKey): boolean {
+  if a.pre != b.pre { return a.pre < b.pre }
+  if a.num != b.num { return a.num < b.num }
+  a.rest < b.rest
+}
+
+// `keys` in `idLess` order, stably. A hand merge sort rather than `std:array`'s `sort`:
+// a function value anywhere in this file makes the compiler trap on it (D4290).
+function sortKeys(keys: IdKey[]): IdKey[] {
+  if keys.length <= 1 { return keys }
+  const mid = keys.length / 2
+  const a = sortKeys(keys.slice(0, mid))
+  const b = sortKeys(keys.slice(mid, keys.length))
+  const out: IdKey[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !idLess(b[j], a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// The source a split directory's README names, from its `inventory-split` marker, or "".
+function sourceMark(text: string): string {
+  for ln in text.split("\n") {
+    let s = ln
+    if !startsWith(s, "<!--") { continue }
+    s = lstripWs(s.slice(4, s.length))
+    if !startsWith(s, "inventory-split:") { continue }
+    s = lstripWs(s.slice(16, s.length))
+    if !startsWith(s, "source") || wsLen(s, 6) == 0 { continue }
+    s = lstripWs(s.slice(6, s.length))
+    let e = 0
+    while e < s.length && wsLen(s, e) == 0 { e = e + 1 }
+    const src = s.slice(0, e)
+    const rest = rstripWs(lstripWs(s.slice(e, s.length)))
+    if src == "" || rest != "-->" { continue }
+    return src
+  }
+  ""
+}
+
+// A doc path as given, or the row files under a directory, in id order.
+function resolve(arg: string): string[] {
+  if !isDir(arg) { return [arg] }
+  const dir = normPath(arg)
+  const names = listDir(arg)
+  if names is IoError {
+    die("check-filed-witnesses: cannot list \{arg} (\{names.msg})", 1)
+    return []
+  }
+  const keys: IdKey[] = []
+  for n in names {
+    if startsWith(n, "D") && endsWith(n, ".md") {
+      keys.push(idKey(n.slice(0, n.length - 3), under(dir, n)))
+    }
+  }
+  if keys.length > 0 {
+    const out: string[] = []
+    for k in sortKeys(keys) { out.push(k.path) }
+    return out
+  }
+  const readme = under(dir, "README.md")
+  let mark = ""
+  if exists(readme) { mark = sourceMark(readText(readme)) }
+  if mark == "" {
+    die(
+      arg
+        + ": holds no `D*.md` rows, and "
+        + readme
+        + " carries no `<!-- inventory-split: source ... -->` line to fall back to",
+      1,
+    )
+  }
+  [mark]
+}
+
+// ── grading a row against what its witness did ──────────────────────────────────
+
+// Stdout as a `Want:` block can spell it: no trailing whitespace or trailing blank lines.
+function normOutput(text: string): string {
+  const ls: string[] = []
+  for l in splitLines(text) { ls.push(rstripWs(l)) }
+  rstripByte(join(ls, "\n"), 10)
+}
+
+// The outcome to compare with `want`, or an empty outcome and the reason it is ungradeable.
+type Verdict = { got: string, why: string }
+
+function grade(
+  status: string,
+  repro: string,
+  hasWant: boolean,
+  wanted: string,
+  want: string,
+  ran: Ran,
+): Verdict {
+  if ran.outcome == "witness_unparsed" {
+    if !namesParseError(status) {
+      return {
+        got: "",
+        why: "the witness does not PARSE, and the status does not file a parse error as the outcome",
+      }
+    }
+    return { got: "check_reject", why: "" }
+  }
+  if ran.outcome != "runs" { return { got: ran.outcome, why: "" } }
+  const mismatch = hasWant && normOutput(ran.stdout) != normOutput(wanted)
+  if want == "silent_wrong_value" {
+    const pr: string[] = []
+    for l in splitLines(repro) {
+      if contains(l, "// PRINTS") {
+        const at = findFrom(l, "PRINTS", 0)
+        pr.push(stripWs(l.slice(at + 6, l.length)))
+      }
+    }
+    if pr.length == 0 && !hasWant {
+      return {
+        got: "",
+        why: "declares a wrong VALUE but carries neither a `// PRINTS` line nor a `Want:` block",
+      }
+    }
+    if pr.length > 0 && stripWs(ran.detail) == pr[pr.length - 1] {
+      return { got: "silent_wrong_value", why: "" }
+    }
+    if mismatch {
+      if pr.length > 0 { return { got: "wrong_output", why: "" } }
+      return { got: "silent_wrong_value", why: "" }
+    }
+    return { got: "runs", why: "" }
+  }
+  if mismatch { return { got: "wrong_output", why: "" } }
+  { got: "runs", why: "" }
+}
+
+// ── seed provenance, as `scripts/seed_provenance.py` computes it ──────────────────
+
+function fnvFeed(h0: i64, data: u8[]): i64 {
+  let h = h0
+  let i = 0
+  while i < data.length {
+    h = (h ^ (data[i] as i64)) * 1099511628211
+    i = i + 1
+  }
+  h
+}
+
+function hex64(h: i64): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = 15
+  while k >= 0 {
+    const d = ((h >> ((k * 4) as i64)) & 15) as! i32
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+// FNV-1a over every `compiler/*.vl` in sorted name order, and how many there were.
+type Identity = { hash: string, files: i32 }
+
+function sourceIdentity(): Identity {
+  const listed = listDir("compiler")
+  if listed is IoError {
+    die("check-filed-witnesses: cannot list compiler/ (" + listed.msg + ")", 1)
+    return { hash: "", files: 0 }
+  }
+  const keys: IdKey[] = []
+  for n in listed {
+    if endsWith(n, ".vl") { keys.push({ pre: n, num: 0, rest: "", path: n }) }
+  }
+  const names: string[] = []
+  for k in sortKeys(keys) { names.push(k.path) }
+  const zero: u8[] = [0]
+  let h: i64 = -3750763034362895579
+  for n in names {
+    const src = readFile("compiler/" + n)
+    if src is IoError {
+      die("check-filed-witnesses: cannot read compiler/\{n} (\{src.msg})", 1)
+      return { hash: "", files: 0 }
+    }
+    h = fnvFeed(h, n.bytes())
+    h = fnvFeed(h, zero)
+    h = fnvFeed(h, toString(src.length).bytes())
+    h = fnvFeed(h, zero)
+    h = fnvFeed(h, src)
+    h = fnvFeed(h, zero)
+  }
+  { hash: hex64(h), files: names.length }
+}
+
+// The identity `refresh-compiler.sh` recorded beside the seed, or "" when there is none.
+function recordedIdentity(): string {
+  const t = readTextFile(SIDECAR)
+  if t is IoError { return "" }
+  for raw in splitLines(univNl(t)) {
+    const line = stripWs(raw)
+    if line != "" && !startsWith(line, "#") {
+      let e = 0
+      while e < line.length && wsLen(line, e) == 0 { e = e + 1 }
+      return line.slice(0, e)
+    }
+  }
+  ""
+}
+
+// Print the seed's provenance and answer an exit code, or 0 to carry on.
+function provenance(moved: i32): i32 {
+  const what = "check-filed-witnesses"
+  const have = sourceIdentity()
+  const want = recordedIdentity()
+  const n = toString(have.files)
+  if want == "" {
+    print(
+      "seed provenance: UNKNOWN (no \{SIDECAR}) · compiler/*.vl is \{have.hash} over \{n} files",
+    )
+    if moved > 0 {
+      print(
+        "\{what}: REFUSING to report \{toString(moved)} MOVED row(s) against a seed of unknown provenance —\n  a MOVED reading is quoted with the seed's identity beside the tree's or it is\n  not a reading. Run `scripts/refresh-compiler.sh` and re-run.",
+      )
+      return 2
+    }
+    return 0
+  }
+  if want == have.hash {
+    print(
+      "seed provenance: \{want} · compiler/*.vl \{have.hash} over \{n} files — match",
+    )
+    return 0
+  }
+  print(
+    "seed provenance: \{want} · compiler/*.vl \{have.hash} over \{n} files — DIFFER",
+  )
+  print(
+    "\{what}: REFUSING — the seed was built from different `compiler/*.vl` than the ones\n  checked out, so every row would be graded against a compiler this tree does\n  not describe. Run `scripts/refresh-compiler.sh` and re-run.",
+  )
+  2
+}
+
+// ── the report ───────────────────────────────────────────────────────────────
+
+function jsonRecord(g: Graded): string {
+  const r = g.row
+  let status = "null"
+  if r.hasStatus { status = jsonStr(r.status) }
+  let want = "null"
+  if r.wantLabels > 0 { want = jsonStr(r.want) }
+  let agrees = "false"
+  if g.actual == g.declared { agrees = "true" }
+  "  {\n    \"id\": \{jsonStr(r.id)},\n    \"title\": \{jsonStr(r.title)},\n    \"status\": \{status},\n    \"repro\": \{jsonStr(r.repro)},\n    \"want\": \{want},\n    \"want_labels\": \{toString(r.wantLabels)},\n    \"doc\": \{jsonStr(r.doc)},\n    \"line\": \{toString(r.line)},\n    \"declared\": \{jsonStr(g.declared)},\n    \"actual\": \{jsonStr(g.actual)},\n    \"detail\": \{jsonStr(g.detail)},\n    \"agrees\": \{agrees}\n  }"
+}
+
+function jobsFromEnv(): i32 {
+  const j = getEnv("JOBS")
+  if j is string {
+    const n = parseI32(stripWs(j))
+    if n == null {
+      die("check-filed-witnesses: JOBS is not an integer: " + j, 1)
+    }
+    return n ?? 4
+  }
+  4
+}
+
+const USAGE = "usage: vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] <doc-or-dir>...\n       vl run scripts/check-filed-witnesses.vl -- --self-test\nRun from the checkout root; `$JOBS` rows at a time (default 4).\nExit 0 when every row behaves as filed, 1 when one MOVED, or, under --strict, cannot be\ngraded, 2 when the seed's provenance refuses the reading."
+
+function mainReport(docs: string[], strict: boolean, outJson: string): i32 {
+  const rows: Row[] = []
+  const declared: string[] = []
+  const reasons: string[] = []
+  const unparsed: string[] = []
+  for arg in docs {
+    for doc in resolve(arg) {
+      const heads = unparsedRowHeads(doc)
+      let h = 0
+      while h < heads.length {
+        unparsed.push(doc + ":" + heads[h] + "  " + cpPrefix(heads[h + 1], 110))
+        h = h + 2
+      }
+      for r in parseDoc(doc) {
+        rows.push(r)
+        if r.repro == "" {
+          declared.push("")
+          reasons.push("no Repro block")
+          continue
+        }
+        const want = declaredOutcome(r.status)
+        if want == "" {
+          declared.push("")
+          reasons.push("status line names no known outcome")
+          continue
+        }
+        if r.wantLabels > 1 {
+          declared.push("")
+          reasons.push("carries more than one `Want:` block")
+          continue
+        }
+        if r.wantLabels > 0 && r.want == "" {
+          declared.push("")
+          reasons.push("a `Want:` label with no indented block under it")
+          continue
+        }
+        declared.push(want)
+        reasons.push("")
+      }
+    }
+  }
+  const srcs: string[] = []
+  let k = 0
+  while k < rows.length {
+    if declared[k] != "" { srcs.push(rows[k].repro) }
+    k = k + 1
+  }
+  const ran = runAll(srcs, jobsFromEnv())
+  const results: Graded[] = []
+  const ungradable: Graded[] = []
+  let wantChecked = 0
+  let next = 0
+  k = 0
+  while k < rows.length {
+    const r = rows[k]
+    const want = declared[k]
+    if want == "" {
+      ungradable.push(
+        { row: r, declared: "", actual: "", detail: "", why: reasons[k] },
+      )
+      k = k + 1
+      continue
+    }
+    const out = ran[next]
+    next = next + 1
+    const v = grade(r.status, r.repro, r.wantLabels > 0, r.want, want, out)
+    if v.got == "" {
+      ungradable.push(
+        { row: r, declared: "", actual: "", detail: "", why: v.why },
+      )
+      k = k + 1
+      continue
+    }
+    if (
+      r.wantLabels > 0
+      && (v.got == "runs"
+        || v.got == "silent_wrong_value"
+        || v.got == "wrong_output")
+    ) {
+      wantChecked = wantChecked + 1
+    }
+    let detail = out.detail
+    if v.got == "wrong_output" {
+      detail = "prints "
+        + cpPrefix(jsonStr(normOutput(out.stdout)), 120)
+        + ", Want "
+        + cpPrefix(jsonStr(normOutput(r.want)), 120)
+    }
+    results.push(
+      { row: r, declared: want, actual: v.got, detail: detail, why: "" },
+    )
+    k = k + 1
+  }
+  const moved: Graded[] = []
+  let mismatch = 0
+  let w = 4
+  for g in results {
+    if g.actual != g.declared { moved.push(g) }
+    if g.actual == "wrong_output" { mismatch = mismatch + 1 }
+    if g.row.id.cpLen() > w { w = g.row.id.cpLen() }
+  }
+  print(
+    "\{padTo("ID", w)}  \{padTo("FILED", 22)} \{padTo("TODAY", 22)} VERDICT",
+  )
+  for g in results {
+    let verdict = "** MOVED **"
+    if g.actual == g.declared { verdict = "as filed" }
+    print(
+      "\{padTo(g.row.id, w)}  \{padTo(g.declared, 22)} \{padTo(g.actual, 22)} \{verdict}",
+    )
+  }
+  for g in ungradable {
+    print(
+      "\{padTo(g.row.id, w)}  \{padTo("-", 22)} \{padTo("-", 22)} not graded (\{g.why})",
+    )
+  }
+  print(
+    "\n\{toString(results.length)} graded · \{toString(results.length - moved.length)} as filed · \{toString(moved.length)} MOVED · \{toString(ungradable.length)} not graded · \{toString(unparsed.length)} UNPARSED",
+  )
+  print(
+    "\{toString(wantChecked)} output-checked against Want · \{toString(mismatch)} output mismatch",
+  )
+  const prov = provenance(moved.length)
+  if moved.length > 0 {
+    print(
+      "\nRows whose filed behaviour no longer reproduces — re-grade the doc:",
+    )
+    for g in moved {
+      print(
+        "  \{g.row.doc}:\{toString(g.row.line)}  \{g.row.id} — \{g.row.title}",
+      )
+      print(
+        "      filed \{g.declared}, now \{g.actual}: \{firstLine(g.detail)}",
+      )
+    }
+  }
+  if ungradable.length > 0 && strict {
+    print(
+      "\nRows this cannot grade - a filed row must carry a witness the checker RUNS:",
+    )
+    for g in ungradable {
+      print(
+        "  \{g.row.doc}:\{toString(g.row.line)}  \{g.row.id} - \{g.row.title}",
+      )
+      print("      " + g.why)
+    }
+    print(
+      "      fix: give it a `Repro:` block and a status line naming one of \{OUTCOMES_SORTED}.",
+    )
+    print(
+      "      a witness that does not PARSE is prose, not a program: write the program, or — where the parse-stage refusal IS the filed outcome — say `parse error` in the status line.",
+    )
+    print(
+      "      a defect reachable only under a change that was REFUSED is a refutation pin: file the program that must keep RUNNING, with the status `runs today and must keep running`.",
+    )
+  }
+  if unparsed.length > 0 {
+    print(
+      "\nRow headings this parser did NOT recognise - they are in no column above:",
+    )
+    for u in unparsed { print("  " + u) }
+    print(
+      "      fix: widen `SEC`'s id pattern to admit the suffix, or rename the row.",
+    )
+  }
+  if outJson != "" {
+    const recs: string[] = []
+    for g in results { recs.push(jsonRecord(g)) }
+    let body = "[]"
+    if recs.length > 0 { body = "[\n" + join(recs, ",\n") + "\n]" }
+    writeText(outJson, body)
+    print("\nwrote " + outJson)
+  }
+  if prov != 0 { return prov }
+  if (
+    moved.length > 0
+    || unparsed.length > 0
+    || (ungradable.length > 0 && strict)
+  ) {
+    return 1
+  }
+  0
+}
+
+// ── --self-test: the outcome vocabulary fires on specimens predicted in source ──────
+
+const WANT_PROG = "print(4)\nprint(\"x\")\n"
+
+function selfTest(): i32 {
+  print(
+    "outcome-vocabulary self-test (prediction stated in source, before the run)",
+  )
+  const wants = [
+    "runs", "check_reject", "trap_loads", "runs", "runs", "witness_unparsed",
+  ]
+  const srcs = [
+    "print(6 * 7)\n", "const x: i32 = \"nope\"\nprint(x)\n",
+    "const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])\n",
+    "// file: a.vl\nexport function six(): i32 { return 6 }\n// file: main.vl\nimport { six } from \"./a\"\nprint(six() * 7)\n",
+    "const xs: i32[] = [1]\nconst s = \"@@repeat(40, \"ab\")@@\"\nprint(xs[s.length - 80])\n",
+    "The classifier answers only for the distinct-backing kinds, and the caller's\nbinding stays non-null: strictly worse than the refusal it replaced.\n",
+  ]
+  // Want specimens: declared outcome, repro, Want block ("-" for none), predicted grade.
+  const wd = [
+    "runs", "runs", "runs", "silent_wrong_value", "silent_wrong_value",
+    "silent_wrong_value", "silent_wrong_value", "runs",
+  ]
+  const ws = [
+    WANT_PROG,
+    WANT_PROG,
+    WANT_PROG,
+    WANT_PROG,
+    WANT_PROG,
+    "print(4)\n// PRINTS 4\n",
+    "print(4)\n// PRINTS 3\n",
+    WANT_PROG,
+  ]
+  const ww = [
+    "4\nx\n", "4\ny\n", "-", "5\nx\n", "4\nx\n", "5\n", "5\n", "4  \nx\n\n",
+  ]
+  const wp = [
+    "runs", "wrong_output", "runs", "silent_wrong_value", "runs",
+    "silent_wrong_value", "wrong_output", "runs",
+  ]
+  const all: string[] = []
+  for s in srcs { all.push(s) }
+  for s in ws {
+    let seen = false
+    for a in all {
+      if a == s { seen = true }
+    }
+    if !seen { all.push(s) }
+  }
+  const ran = runAll(all, 1)
+  let bad = 0
+  let k = 0
+  while k < wants.length {
+    const got = ran[k].outcome
+    const ok = got == wants[k]
+    if !ok { bad = bad + 1 }
+    let mark = "** WRONG **"
+    if ok { mark = "ok" }
+    print("  want \{padTo(wants[k], 20)} got \{padTo(got, 20)} \{mark}")
+    if !ok { print("      " + firstLine(ran[k].detail)) }
+    k = k + 1
+  }
+  const n = wants.length + wd.length
+  print("`Want:` grading (declared, Want -> predicted)")
+  k = 0
+  while k < wd.length {
+    let at = 0
+    while all[at] != ws[k] { at = at + 1 }
+    const hasWant = ww[k] != "-"
+    const v = grade("", ws[k], hasWant, ww[k], wd[k], ran[at])
+    let graded = v.got
+    if graded == "" { graded = v.why }
+    const ok = v.got == wp[k]
+    if !ok { bad = bad + 1 }
+    let shown = "null"
+    if hasWant { shown = jsonStr(ww[k]) }
+    let mark = "** WRONG **"
+    if ok { mark = "ok" }
+    print(
+      "  \{padTo(wd[k], 20)} \{padTo(shown, 16)} want \{padTo(wp[k], 20)} got \{padTo(graded, 20)} \{mark}",
+    )
+    k = k + 1
+  }
+  print(
+    "\{toString(n)} specimens · \{toString(n - bad)} routed correctly · \{toString(bad)} wrong",
+  )
+  if bad > 0 { return 1 }
+  0
+}
+
+// ── the command ─────────────────────────────────────────────────────────────────
+
+function main(args: string[]): i32 {
+  if args.length > 0 && args[0] == "--grade-dirs" {
+    let k = 1
+    while k < args.length {
+      gradeDir(args[k])
+      k = k + 1
+    }
+    return 0
+  }
+  let outJson = ""
+  let strict = false
+  const docs: string[] = []
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if a == "--json" {
+      if i + 1 >= args.length {
+        die("check-filed-witnesses: --json needs a path", 2)
+      }
+      outJson = args[i + 1]
+      i = i + 2
+      continue
+    }
+    if a == "--strict" { strict = true }
+    else if a == "--self-test" { return selfTest() }
+    else { docs.push(a) }
+    i = i + 1
+  }
+  if docs.length == 0 {
+    print(USAGE)
+    return 2
+  }
+  mainReport(docs, strict, outJson)
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("check-filed-witnesses: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
