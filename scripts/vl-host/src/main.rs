@@ -6848,6 +6848,14 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
     if !status.success() {
         bail!("wasm-dis `{dis}` failed (exit {:?})", status.code());
     }
+    // A native Windows `wasm-dis` writes `\r\n`; the dump is `\n` on every platform.
+    if cfg!(windows) {
+        if let Ok(text) = std::fs::read_to_string(wat_path) {
+            if text.contains('\r') {
+                std::fs::write(wat_path, text.replace("\r\n", "\n"))?;
+            }
+        }
+    }
     println!("wrote {wat_path}");
     Ok(())
 }

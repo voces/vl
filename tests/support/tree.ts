@@ -34,6 +34,15 @@ export const binaryen = (tool: string): string => {
   if (native && tool !== "wasm-dis") return `${native}/${tool}${win ? ".exe" : ""}`;
   return `${ROOT}/node_modules/.bin/${tool}${win ? ".cmd" : ""}`;
 };
+
+/** The `wasm-dis` to hand the host as `VL_WASM_DIS`: the native one when
+ * `$VL_BINARYEN` names it, since the host writes every `--wat` dump with `
+`. */
+export const hostWasmDis = (): string => {
+  const native = Deno.env.get("VL_BINARYEN");
+  if (!native) return binaryen("wasm-dis");
+  return `${native}/wasm-dis${Deno.build.os === "windows" ? ".exe" : ""}`;
+};
 export const STD = `${ROOT}/std`;
 
 /** Whether `p` exists. `Deno.statSync` throws on a miss; this is the test suite's
