@@ -10,7 +10,7 @@
 # `--require-profile` is what makes a missing profile a failure rather than a quiet skip.
 set -u
 cd "$(dirname "$0")/.."
-PY="${PYTHON:-python3}"
+export PYTHON="${PYTHON:-python3}"
 VL="${VL:-scripts/vl-host/target/release/vl}"
 # The profiled self-compile runs under the null collector by choice, as every self-compile
 # script pins it (DECISIONS.md, "The compiler's collector is copying by default").
@@ -30,6 +30,8 @@ VL_PROFILE_GUEST="$WORK/p.json" "$VL" build compiler/entry.vl --compiler "$WORK/
   -o "$WORK/out.wasm" >/dev/null 2>&1 || {
   echo "survey-profile: the profiled compile failed"; exit 1; }
 
-"$PY" scripts/survey-regrade.py --self-test >/dev/null || {
-  echo "survey-profile: survey-regrade.py --self-test failed"; exit 1; }
-exec "$PY" scripts/survey-regrade.py --require-profile --profile "$WORK/p.json" "$DOC"
+RG=(scripts/survey-regrade.vl --compiler "$SEED" --)
+"$VL" run "${RG[@]}" --self-test >/dev/null || {
+  echo "survey-profile: survey-regrade.vl --self-test failed"; exit 1; }
+"$VL" run "${RG[@]}" --require-profile --profile "$WORK/p.json" "$DOC"
+exit $?

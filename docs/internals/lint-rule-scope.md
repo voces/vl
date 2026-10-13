@@ -22,7 +22,7 @@ relative to the VL checkout or `""`:
 * **CLI** — `lintScopeKeyOf` (driver.vl): an absolute target inside the checkout the
   binary resolves `std:` from is made relative; an absolute target outside it, or any
   absolute target on a distribution binary, is `""`. A **relative** target is trusted as
-  spelled (it is how `lint-self.sh` and `interp-budget.py` name files).
+  spelled (it is how `lint-self.sh` and `vl check --budget` name files).
 * **Editor** — `lintPathFor` (`lsp/src/vlRoot.ts`) walks up from the document itself for
   `compiler/entry.vl` + `std/fmt.vl`; outside a checkout it answers `undefined`, and
   `wasmChecker.lint` then commits an empty path, so the seed sees `""`. Pinned by the
@@ -65,7 +65,7 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `byte-as-code-point` | LANGUAGE | a string's byte `s[i]` passed straight to a code-point position (D3641) | n/a (new) | everywhere |
 | `float-list-as-vector` | LANGUAGE | a 2–4-element `f64[]`/`f32[]` literal returned, passed to a parameter read only at fixed indexes, or bound to a local read that way (`hint`; sunpa item b) | n/a (new) | everywhere |
 | `shift-mask-is-logical-shift` | LANGUAGE | `(x >> k) & mask` where the mask makes it exactly `x >>> k` (`hint`; sunpa item b) | n/a (new) | everywhere |
-| `prefer-interpolation` | LANGUAGE (decided) | see below; `scripts/interp-budget.py` holds the repo's own debt | not under `compiler/` | everywhere except `compiler/` (unchanged) |
+| `prefer-interpolation` | LANGUAGE (decided) | see below; `vl check --budget scripts/interp-budget-baseline.json` holds the repo's own debt | not under `compiler/` | everywhere except `compiler/` (unchanged) |
 | `compiler-no-interpolation` | INTERNAL | the seed must load with no host imports (CLAUDE.md "After editing compiler/*.vl") | `compiler/` only | `compiler/` only (unchanged) |
 | `std-comment-audience` | INTERNAL | `docs/internals/std-api-review.md` §4; no baseline, gated at zero by `lint-self.sh` | `std/` / `std:` only | `std/` / `std:` only (unchanged) |
 | `comment-block-too-long` | INTERNAL | `docs/internals/comment-style.md` rule 2; `scripts/comment-budget.py` (trees: `compiler`) | not `std/` — **fired on consumer files** | `compiler/` only |
@@ -90,7 +90,7 @@ semantics, not lint policy, and are out of scope here.
 * `prefer-interpolation` — LANGUAGE. Interpolation is the language's own spelling for a
   string built from pieces, and the advice holds in any program. What is repo-specific is
   only its *exclusion* from `compiler/` (the seed cannot import `std:fmt`) and the
-  `interp-budget.py` ratchet that holds this tree's standing `+` chains; neither changes
+  interp ratchet (`vl check --budget`) that holds this tree's standing `+` chains; neither changes
   what a consumer should see.
 * `union-let-no-melt` — LANGUAGE. It is about VL's representation, not this repo's
   style: a union-typed `let` written on two paths in a loop allocates a box every trip in
@@ -236,7 +236,7 @@ Why this over (a) and (b):
   in `lint.vl` and as its Python twin (`comment-budget.py`, `ladder-census.py`,
   `sentinel-census.py`, `scan-budget.py`) — with a test per pair whose only job is to keep
   them agreeing. With the rule as a program, the ratchet script grades the rule's own
-  output (`vl check --json`, as `interp-budget.py` already does) and the twins retire.
+  output (as `vl check --budget` already does for interp) and the twins retire.
   That is also the dogfooding direction: a non-VL instrument ported to VL.
 * **Any repository can use it**, for its own vocabulary — webcraft or plumb can ladder-lint
   their own closed sets without the compiler knowing their names.

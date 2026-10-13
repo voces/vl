@@ -2,8 +2,8 @@
 // lint itself. The baseline is a JSON file naming a `label`, the `writer` that rewrites
 // it, the `targets`/`exclude` to walk, the per-code `total`, the per-file counts and the
 // named `entries`; the CLI feeds every finding of a budgeted code through `budgetNote`
-// and prints `budgetCheckLines` or `budgetWhyLines`. It reads a baseline, never writes
-// one. docs/internals/architecture-refactor-plan.md T2.
+// and prints `budgetCheckLines` or `budgetWhyLines`, or `budgetWriteText` rewrites the
+// baseline from the run. docs/internals/architecture-refactor-plan.md T2.
 
 import { pushCps } from "./strutil"
 import { i32ToStr } from "./ast"
@@ -420,7 +420,7 @@ export function budgetCheckLines(baselinePath: string): string[] {
     for b in bad { out.push(b) }
     out.push("")
     out.push("After a rewrite, lower the baseline with")
-    out.push("  python3 " + bgWriter + " --write-baseline")
+    out.push("  " + bgRemedy(baselinePath))
     return out
   }
   let ok = bgLabel + " budget ok — "
@@ -456,15 +456,15 @@ export function budgetCheckLines(baselinePath: string): string[] {
 // The `--budget-why` report: per code, the entries that `LEFT`, `ENTERED` or changed count
 // between the baseline's stored `entries` and this run. Without stored entries it is one
 // line saying so, and `budgetFailed()` is true.
-export function budgetWhyLines(): string[] {
+export function budgetWhyLines(baselinePath: string): string[] {
   const out: string[] = []
   bgFailed = !bgHasEntries
   if bgFailed {
     out.push(
       bgLabel
-        + ": the baseline stores no `entries`; re-run `python3 "
-        + bgWriter
-        + " --write-baseline`",
+        + ": the baseline stores no `entries`; re-run `"
+        + bgRemedy(baselinePath)
+        + "`",
     )
     return out
   }
@@ -546,5 +546,261 @@ export function budgetWhyLines(): string[] {
 }
 function bgTimes(k: i32): string {
   if k > 1 { return "  (x" + i32ToStr(k) + ")" }
+  ""
+}
+
+// The command that rewrites the baseline: its `writer` script while one is named, else
+// this lint's own `--write-baseline`.
+function bgRemedy(baselinePath: string): string {
+  if bgWriter != "" { return "python3 " + bgWriter + " --write-baseline" }
+  "vl check --budget " + baselinePath + " --write-baseline"
+}
+
+// `--exempt-codes`: the budgeted codes the baseline still owes, space-separated — what
+// scripts/lint-self.sh holds out of its own gate until each reaches zero.
+export function budgetExemptLine(): string {
+  let out = ""
+  let i = 0
+  while i < bgCodes.length {
+    if bgTotal[i] > 0 {
+      if out != "" { out = out + " " }
+      out = out + bgCodes[i]
+    }
+    i = i + 1
+  }
+  out
+}
+
+// `s` as a JSON string literal, escaped as Python's `json.dumps` does; `ascii` also
+// spells every non-ASCII code point as `\u` escapes (`ensure_ascii`).
+function bgQuote(s: string, ascii: boolean): string {
+  const out: i32[] = ['"']
+  for c in s {
+    if c == '"' || c == '\\' {
+      out.push('\\')
+      out.push(c)
+    } else if c == '\n' {
+      out.push('\\')
+      out.push('n')
+    } else if c == '\r' {
+      out.push('\\')
+      out.push('r')
+    } else if c == '\t' {
+      out.push('\\')
+      out.push('t')
+    } else if c == 8 {
+      out.push('\\')
+      out.push('b')
+    } else if c == 12 {
+      out.push('\\')
+      out.push('f')
+    } else if c < 32 || (ascii && c > 126) {
+      if c > 65535 {
+        bgU4(out, 55296 + ((c - 65536) >> 10))
+        bgU4(out, 56320 + ((c - 65536) & 1023))
+      } else {
+        bgU4(out, c)
+      }
+    } else {
+      out.push(c)
+    }
+  }
+  out.push('"')
+  fromCodePoints(out)
+}
+function bgU4(out: i32[], v: i32) {
+  const hex = "0123456789abcdef"
+  out.push('\\')
+  out.push('u')
+  let sh = 12
+  while sh >= 0 {
+    out.push(hex[(v >> sh) & 15])
+    sh = sh - 4
+  }
+  0
+}
+// `["a", "b"]`, as `json.dumps` spells a string list.
+function bgQuoteList(xs: string[]): string {
+  let out = "["
+  let i = 0
+  while i < xs.length {
+    if i > 0 { out = out + ", " }
+    out = out + bgQuote(xs[i], true)
+    i = i + 1
+  }
+  out + "]"
+}
+// This run's count of `code` in file `rel`, or over every file when `rel` is "".
+function bgRunCount(rel: string, code: string): i32 {
+  if rel != "" { return bgNowCount(rel, code) }
+  let n = 0
+  for c in bgHitCode {
+    if c == code { n = n + 1 }
+  }
+  n
+}
+// `{"<code>": <n>, …}` over every budgeted code, counted in `rel` ("" = every file).
+function bgCountsJson(rel: string): string {
+  let out = "{"
+  let i = 0
+  while i < bgCodes.length {
+    if i > 0 { out = out + ", " }
+    out = out
+      + bgQuote(bgCodes[i], true)
+      + ": "
+      + i32ToStr(bgRunCount(rel, bgCodes[i]))
+    i = i + 1
+  }
+  out + "}"
+}
+
+// The baseline this run counted, laid out line for line as scripts/ratchet.py writes
+// one: `label`, `writer`, `targets` and `exclude` kept from the loaded baseline, `commit`
+// replaced, counts recounted, and `entries` rewritten when the loaded baseline had them.
+export function budgetWriteText(commit: string): string {
+  const body: string[] = ["{"]
+  if bgLabel != "" { body.push("\"label\": " + bgQuote(bgLabel, true) + ",") }
+  if bgWriter != "" {
+    body.push("\"writer\": " + bgQuote(bgWriter, true) + ",")
+  }
+  body.push("\"commit\": " + bgQuote(commit, true) + ",")
+  if bgTargets.length > 0 {
+    body.push("\"targets\": " + bgQuoteList(bgTargets) + ",")
+  }
+  if bgExclude.length > 0 {
+    body.push("\"exclude\": " + bgQuoteList(bgExclude) + ",")
+  }
+  body.push("\"total\": " + bgCountsJson("") + ",")
+  body.push("\"files\": {")
+  let rows = ""
+  for rel in bgSortedUniq(bgHitRel) {
+    if rows != "" { rows = rows + ",\n" }
+    rows = rows + bgQuote(rel, true) + ": " + bgCountsJson(rel)
+  }
+  body.push(rows)
+  if bgHasEntries {
+    body.push("},")
+    body.push("\"entries\": [")
+    let ents = ""
+    for code in bgSortedUniq(bgCodes) {
+      const names: string[] = []
+      const hits: {[string]: i32} = Map()
+      let h = 0
+      while h < bgHitCode.length {
+        if bgHitCode[h] == code {
+          names.push(bgHitName[h])
+          hits[bgHitName[h]] = (hits[bgHitName[h]] ?? 0) + 1
+        }
+        h = h + 1
+      }
+      for x in bgSortedUniq(names) {
+        if ents != "" { ents = ents + ",\n" }
+        ents = ents
+          + "["
+          + bgQuote(code, false)
+          + ", "
+          + bgQuote(x, false)
+          + ", "
+          + i32ToStr(hits[x] ?? 0)
+          + "]"
+      }
+    }
+    body.push(ents)
+    body.push("]")
+  } else {
+    body.push("}")
+  }
+  body.push("}")
+  let out = ""
+  for l in body { out = out + l + "\n" }
+  out
+}
+// `--write-baseline`'s report: `wrote <path>: <n> <code>, …`.
+export function budgetWroteLine(baselinePath: string): string {
+  let out = "wrote " + baselinePath + ": "
+  let i = 0
+  while i < bgCodes.length {
+    if i > 0 { out = out + ", " }
+    out = out + i32ToStr(bgRunCount("", bgCodes[i])) + " " + bgCodes[i]
+    i = i + 1
+  }
+  out
+}
+
+// The checkout's HEAD commit, resolved through the host's file reads alone: a linked
+// worktree's `.git` file names its git dir, `commondir` the shared one, and a branch
+// resolves through its loose ref or `packed-refs`. `budgetGitStart` returns the first
+// path to read and `budgetGitStep` each next one, or "" once `budgetGitCommit` is known.
+let bgGitStage = 0
+let bgGitDir = ""
+let bgGitCommon = ""
+let bgGitRef = ""
+let bgGitSha = ""
+// HEAD's 9-character prefix, as `git rev-parse --short` prints it for this tree; "" when
+// HEAD could not be resolved.
+export function budgetGitCommit(): string {
+  if bgGitSha.length > 9 { return bgGitSha.slice(0, 9) }
+  bgGitSha
+}
+export function budgetGitStart(): string {
+  bgGitStage = 0
+  bgGitDir = ".git"
+  bgGitCommon = ""
+  bgGitRef = ""
+  bgGitSha = ""
+  ".git"
+}
+export function budgetGitStep(found: boolean, src: string): string {
+  const text = bgTrim(src)
+  if bgGitStage == 0 {
+    if found && text.length > 7 && text.slice(0, 7) == "gitdir:" {
+      bgGitDir = bgTrim(text.slice(7, text.length))
+    }
+    bgGitStage = 1
+    return bgGitDir + "/HEAD"
+  }
+  if bgGitStage == 1 {
+    if !found { return "" }
+    if text.length > 4 && text.slice(0, 4) == "ref:" {
+      bgGitRef = bgTrim(text.slice(4, text.length))
+      bgGitStage = 2
+      return bgGitDir + "/commondir"
+    }
+    bgGitSha = text
+    return ""
+  }
+  if bgGitStage == 2 {
+    bgGitCommon = bgGitDir
+    if found && text != "" {
+      bgGitCommon = text
+      if text[0] != '/' { bgGitCommon = bgGitDir + "/" + text }
+    }
+    bgGitStage = 3
+    return bgGitCommon + "/" + bgGitRef
+  }
+  if bgGitStage == 3 {
+    if found && text != "" {
+      bgGitSha = text
+      return ""
+    }
+    bgGitStage = 4
+    return bgGitCommon + "/packed-refs"
+  }
+  if found { bgGitSha = bgPackedRef(src, " " + bgGitRef) }
+  ""
+}
+// The sha on the `packed-refs` line ending in `suffix`, or "".
+function bgPackedRef(src: string, suffix: string): string {
+  let a = 0
+  let i = 0
+  while i <= src.length {
+    if i == src.length || src[i] == '\n' {
+      const l = bgTrim(src.slice(a, i))
+      const k = l.length - suffix.length
+      if k > 0 && l.slice(k, l.length) == suffix { return l.slice(0, k) }
+      a = i + 1
+    }
+    i = i + 1
+  }
   ""
 }
