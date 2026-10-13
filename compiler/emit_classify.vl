@@ -847,7 +847,6 @@ import {
   tyIsI32LeafElem,
   tyIsStrLeafElem,
   tyMapKeyKind,
-  tyMapValOf,
   unMemRowStart,
   vbHeapIdxOfKind,
 } from "./emit_rep"
@@ -861,6 +860,7 @@ import {
 } from "./symbols"
 import { i32ListHas, strListHas } from "./listutil"
 import { strContains } from "./strutil"
+import { tyIsNullPrim, tyMapValOf, tyPeelNul, tyStepElem } from "./tyquery"
 
 // The `$fnsig` param-spine token for parameter `paramIx` — one token per distinct param
 // valtype, so two functions share a `$fnsig` exactly when their param valtypes byte-match.
@@ -14805,8 +14805,8 @@ function tyNulSoleInner(ty: i32): i32 {
     }
     TyUnion => {
       if t.uMembers.length == 2 {
-        if tyIsNullTy(t.uMembers[0]) { return t.uMembers[1] }
-        if tyIsNullTy(t.uMembers[1]) { return t.uMembers[0] }
+        if tyIsNullPrim(t.uMembers[0]) { return t.uMembers[1] }
+        if tyIsNullPrim(t.uMembers[1]) { return t.uMembers[0] }
       }
     }
     TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
@@ -14814,13 +14814,6 @@ function tyNulSoleInner(ty: i32): i32 {
     }
   }
   -1
-}
-
-function tyIsNullTy(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyPrim { return t.primName == "null" }
-  false
 }
 
 // Whether the `as?` at `ix` casts a type-parameter operand to a number: the checker types it
@@ -28215,20 +28208,6 @@ function tyStepNullable(ty: i32): i32 {
   -1
 }
 
-function tyStepElem(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyArray { return t.aElem }
-  -1
-}
-
-function tyStepMapVal(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyMap { return t.mVal }
-  -1
-}
-
 // The `TyFunc` arms of the same family: `annFnDecompose` hands back the param texts and the
 // result text, and these hand back the matching arena entries, declining unless the arena
 // really is a function of exactly that arity — an arity mismatch is a different function.
@@ -28367,7 +28346,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
   // into the value so its shapes intern, via position-independent map-value resolution. A
   // named-alias value already interned via its own TypeRef, so this is the inline dual.
   if nameIsMap(nm) {
-    return internShapeDeepTy(mapValNameOf(nm), tyStepMapVal(ty))
+    return internShapeDeepTy(mapValNameOf(nm), tyMapValOf(ty))
   }
   gaeEnsure(nm)
   internInlineShapeTy(nm, ty) // no-op for any non-shape leaf
@@ -30636,24 +30615,12 @@ export function shapeFieldElemRow(fty: i32, code: i32) {
   if code == FC_UNION { return fty }
   if code == FC_I32 { return fty }
   if code == FC_I32_LIST { return fty }
-  if code == FC_STRUCT { return tyShapeNulPeel(fty) }
+  if code == FC_STRUCT { return tyPeelNul(fty) }
   if code == FC_NUL_LIT_UNION { return -1 }
-  if code == FC_REF_LIST { return tyShapeArrElem(fty) }
-  if code == FC_NUL_REF_LIST { return tyShapeArrElem(tyShapeNulPeel(fty)) }
+  if code == FC_REF_LIST { return tyStepElem(fty) }
+  if code == FC_NUL_REF_LIST { return tyStepElem(tyPeelNul(fty)) }
   if code == FC_MAP { return tyMapValOf(fty) }
-  if code == FC_NUL_MAP { return tyMapValOf(tyShapeNulPeel(fty)) }
-  -1
-}
-function tyShapeNulPeel(ty: i32) {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyNullable { return t.nInner }
-  ty
-}
-function tyShapeArrElem(ty: i32) {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyArray { return t.aElem }
+  if code == FC_NUL_MAP { return tyMapValOf(tyPeelNul(fty)) }
   -1
 }
 
@@ -38014,18 +37981,6 @@ export function narrowDropsNull(name: string): boolean {
   s >= 0 && !msHasNull(s)
 }
 
-// True when arena type `ty` IS the `null` type itself (as against a nullable of something).
-// `narrowExcludesNull`'s second half: a `== null` / `is null` push banks the null type, and a
-// narrowing TO null excludes nothing.
-function tyIsNullPrim(ty: i32): boolean {
-  // `unMemTys` records -1 for a member spelling that did not resolve to an arena type, and
-  // `isUnionOfTy` reads that column directly — so the guard is load-bearing, not defensive.
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyPrim { return t.primName == "null" }
-  false
-}
-
 export function narrowedValueAtomOf(name: string) {
   const i = narrowSlotOf(name)
   if i < 0 { return "" }
@@ -39845,16 +39800,6 @@ export function unMemAtomKind(m: i32): i32 {
 // map / a list-of-maps / a closure / a closure-array / a closure-carrying value" by walking
 // the arena structurally instead of the emitter's per-field lowering codes — narrowing-blind
 // and conservative, so an unresolvable arm answers "no".
-
-// The inner of a `T | null`, else `ty` itself. The lowering codes fold a nullable
-// struct (`next: S | null`) into the same code-15 nested-struct hop as a bare `S`, and
-// a nullable closure into code 22 beside code 14's bare one.
-export function tyPeelNul(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyNullable { return t.nInner }
-  ty
-}
 
 // The arena type of field `name` of the object type `ty` (nullable-peeled — a code-15
 // hop follows `S` and `S | null` alike), or -1 when `ty` is not an object or has no
