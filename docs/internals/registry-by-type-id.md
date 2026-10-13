@@ -622,8 +622,67 @@ lookup reaches them. With rule L′ the seed is still module-identical: `difftre
 
 **What the next switch needs.** Every other site holds at least one `name-only`, `differ` or
 `id-only` reach from the classes above. Of those, `ctr/unionName` (771 `id-only`) and
-`unionNameOfExpr/is` (395) need their `id-only` classified the way this section classified
-`name-only`.
+`unionNameOfExpr/is` (395) needed their `id-only` classified the way this section classified
+`name-only`. The next section does that.
+
+### Step 5 — the second switch: the `id-only` reaches classified, and `unionNameOfExpr/is` joins
+
+An `id-only` reach is one where the key finds a row and the spelling names none. The two
+sites with the most of them were classified the way the `name-only` reaches were: by what the
+row the key finds is, against what the name path does with that reach.
+
+**`unionNameOfExpr/is` (site 4, 395 `id-only`).** Its one caller is `ifJoinUnionName`. On a
+miss the spelling falls to D1561's `nodeRegisteredUnionName`, which picks a row by the type's
+canon id.
+
+| class | reaches | what the key row is |
+| --- | --- | --- |
+| K | 360, 17 lines | the row the D1561 fallback already returns (`Shape`, `Animal`, `#lu2`, `K0`, `Err`) |
+| O | 35, 2 programs | the join's own member-order row, where the fallback returns a same-set row in another order: `coalesce-result-rep.vl` (`A\|i32` beside declared `M = i32\|A`) and `coalesce-record-join-nested-null.vl` (`A$m0\|B$m0\|null` beside `B$m0\|A$m0\|null`) |
+
+The site also has 7 `differ` reaches, all in `unions/is-literal-union-over-string-arm.vl`, and
+no `name-only`. A union arm's tag is global (`unionArmTagOf`: a variant's tag is `uTags[vi]`, a
+scalar's is `uVariants.length + k`), so a row of another member order moves no tag. The seam
+`unionRowNameAB` returns the key row's NAME, so a spelling no row is named by still reaches a
+row. Built over the 17 `id-only` files, the `differ` file and 120 `agree`/`neither` controls,
+all 128 modules are identical to the base.
+
+**`ctr/unionName` (site 42, 771 `id-only`).** This is `collectTyReachRegister`'s `TyUnion` arm
+calling `registerInlineUnionAt`.
+
+| class | reaches | what the key row is |
+| --- | --- | --- |
+| S | 742 (270 in 85 `tests/cases` lines, 472 in 138 distilled) | a softened literal union: the spelling renders a bare `i32`/`i64`/`string`, and the key finds the litunion row; the call mints nothing |
+| Av | 19 | a value-union alias: `i32\|string` beside a declared `U`; the name path mints a key-equal sibling row, and skipping it leaves the module unchanged |
+| As | 10, 10 programs | a struct-union alias: `Cat\|Dog` beside `Animal`, `Circle\|Rect` beside `Shape`; the name path mints a sibling row with its own variant slice |
+
+Switching site 42 over its 230 files leaves 223 modules identical and changes 7, all class As.
+Two of them stop building: `capture-ref-types.vl` (`ref valtype with no interned shape`) and
+`is-inline-shape-names-a-nominal-variant.vl` (`` `is` receiver is not a union value ``). Later
+readers resolve `Cat|Dog` by its spelling and need the sibling's variant slice. **Site 42 stays
+on the name.** It can switch once the struct-sibling mint adopts the key row's slice (as
+`unVarSliceAdoptKeySibling` does for D1492), or once every reader of the sibling's spelling
+resolves by the key.
+
+**The proof.** Only site 4 switches. `difftree.sh --identity` over the same 15,100 files:
+**10,013 modules built, 0 differ, 0 uncompared**. The candidate compiling master's source reproduces master's fixpoint.
+
+**Reach counts, armed, before → after.**
+
+| | `tests/cases` | distilled |
+| --- | --- | --- |
+| agree / alias / differ | 329,332 / 1,974 / 68 | 262,616 / 101 / 0 |
+| `id-only` / `name-only` | 810 / 1,768 | 552 / 177 |
+| `ctr/unionName` `id-only` / `name-only` | 299 / 392 | 472 / 0 |
+| `unionNameOfExpr/is` agree / differ / `id-only` / neither | 191 / 7 / 395 / 4,895 | 28 / 0 / 0 / 1,181 |
+
+Every count above is the same before and after the switch. A switch moves the seam's answer and
+does not move the classification. (The `tests/cases` agree total reads 298 below the first
+switch's 329,630, before and after alike, so the gap is the sweep's population or load, not
+this change.)
+
+**What the next switch needs.** Site 42 needs the class-As sibling resolved, as above. Every
+other site still holds a `name-only` or `differ` reach.
 
 ## 6. The storage-class ladders
 
