@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
+| L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) landed as #3542. Step 1, the function-value flow table, runs in shadow (`fn_flow_shadow.vl`, off by default): graded against mono, it flags 60 of 69 silent review witnesses (the 9 others are D3923/D3972/D3973, outside its domain) and filed D4300–D4304. Step 2 is next. |
 | L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. The second read `valueAtomKindOfTy` and `nulScalarListKindOfTy` off the type (`tyEmitElemPrimOf`, `tyEmitElemNulPrimOf`, `tyEmitNamesOf`): 112 → 111. `valueAtomKindOfTy` still renders a union of members that share a list or closure rep (D4320), and `mapTyValKindLowerable` still renders an anonymous shape or a nullable union of shapes. Next: `armFieldUnionName`, `joinRowOfTy`, `listUnionEmitName`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
 | L4 one rollback for the quiet probes | first PR (A1) **in review** | The assertion and its measured list are in code-quality-2026-10.md L4. A2 (`CheckMark`) is next. |
@@ -179,5 +179,5 @@ These have no unmet prerequisite and touch disjoint files:
 - **A6 / S-c**: one `./ast` import block in `typecheck.vl`. This conflicts with A1, so run it
   first; it is small.
 - **C3 first PR**: `emitReturnValue` through `ExpCtx` (`wasmEmit.vl`).
-- **B1**: continues in lane SC (#3542).
+- **B1**: continues in lane SC; step 1 (the flow table in shadow) is landing, step 2 next.
 - **T3, first port — done**: `check-filed-witnesses.vl` prints the Python's report byte for byte on both inventories and now runs the `filed witnesses` gate row; the Python stays beside it (`scripts/inventory/rows.py` imports its row grammar). It found D4290 (a compiler trap) and one new `dogfood:` row (`runProgram` waits). Next: `regress.py` + `gradecensus.py`.
