@@ -18,6 +18,8 @@
 #   scripts/gate.sh              # everything
 #   scripts/gate.sh --no-build   # reuse build/vl-compiler.wasm as it stands
 set -u
+# Everything this gate starts is a preferred OOM victim, ahead of the session that ran it.
+[ "$(cat /proc/self/oom_score_adj 2>/dev/null || echo 1000)" -lt 300 ] && echo 300 >/proc/self/oom_score_adj 2>/dev/null
 cd "$(dirname "$0")/.."
 # Pin std: to THE TREE BEING GRADED. The host resolves std: from the BINARY's
 # checkout, and a worktree's binary is a symlink to the main repo's — so without
