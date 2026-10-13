@@ -1,0 +1,1325 @@
+// Re-run the MEASUREMENT filed under every row of the code-quality survey and report which
+// rows no longer read what they claim. The VL port of `scripts/survey-regrade.py`, whose
+// docstring is the full contract; the two print the same report byte for byte.
+//
+//     vl run scripts/survey-regrade.vl -- [--strict] [--require-profile] [--profile P.json]
+//                                         [--json OUT] <doc>...
+//     vl run scripts/survey-regrade.vl -- --self-test
+//
+// Paths resolve against the working directory, so run it from the checkout root. A `shell`
+// row's command runs under `env PYTHON=... timeout 600 sh -c`; `mktemp` and `rm` stand in
+// for the directory operations `std:fs` lacks (a `dogfood:` row in ROADMAP.md).
+
+import { IoError, listDir, readFile, readTextFile, writeTextFile } from "std:fs"
+import { exit, runProgram } from "std:process"
+import { getEnv } from "std:env"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseF64, toFixed, toString } from "std:fmt"
+import { Json, JsonError, parseJson } from "std:json"
+import {
+  endsWith,
+  join,
+  replaceAll,
+  split,
+  startsWith,
+  toLowerAscii,
+} from "std:str"
+
+const SIDECAR = "build/vl-compiler.wasm.src"
+const KINDS = ["shell", "profile-incl", "profile-self", "none"]
+
+// One `### row N` heading and the `Measure:` block under it: `keys`/`vals` in file order.
+type Rec = {
+  doc: string,
+  line: i32,
+  id: string,
+  title: string,
+  hasBlock: boolean,
+  keys: string[],
+  vals: string[],
+}
+
+// A row's verdict once graded.
+type Hit = { rec: Rec, filed: f64, today: f64, tol: f64, verdict: string }
+
+// The guest profile, flattened to the arrays the share arithmetic walks.
+type Prof = {
+  fname: string[],
+  frameFunc: i32[],
+  stFrame: i32[],
+  stPrefix: i32[],
+  stacks: i32[],
+}
+
+// Where the report goes: stdout, or `captured` while the self-test reads it back.
+let capturing = false
+let captured = ""
+
+function say(s: string) {
+  if capturing { captured = captured + s + "\n" } else { print(s) }
+}
+
+// Stop with `code` after saying why, on stdout: VL has no stderr sink.
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// ── text helpers: the parts of Python's `str` this file reads with ──────────────────────
+
+// The byte length of the whitespace code point at `i` (Python's `str.isspace`), or 0.
+function wsLen(s: string, i: i32): i32 {
+  if i < 0 || i >= s.length { return 0 }
+  const b = s[i]
+  if b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31) { return 1 }
+  if b == 0xC2 && i + 1 < s.length {
+    if s[i + 1] == 0x85 || s[i + 1] == 0xA0 { return 2 }
+    return 0
+  }
+  if i + 2 >= s.length { return 0 }
+  const c = s[i + 1]
+  const d = s[i + 2]
+  if b == 0xE1 && c == 0x9A && d == 0x80 { return 3 }
+  if b == 0xE2 && c == 0x80 {
+    if (d >= 0x80 && d <= 0x8A) || d == 0xA8 || d == 0xA9 || d == 0xAF {
+      return 3
+    }
+  }
+  if b == 0xE2 && c == 0x81 && d == 0x9F { return 3 }
+  if b == 0xE3 && c == 0x80 && d == 0x80 { return 3 }
+  0
+}
+
+function wsLenBefore(s: string, end: i32): i32 {
+  let k = 1
+  while k <= 3 {
+    if end - k >= 0 && wsLen(s, end - k) == k { return k }
+    k = k + 1
+  }
+  0
+}
+
+function lstripWs(s: string): string {
+  let a = 0
+  while a < s.length && wsLen(s, a) > 0 { a = a + wsLen(s, a) }
+  s.slice(a, s.length)
+}
+
+function rstripWs(s: string): string {
+  let b = s.length
+  while b > 0 && wsLenBefore(s, b) > 0 { b = b - wsLenBefore(s, b) }
+  s.slice(0, b)
+}
+
+function stripWs(s: string): string { lstripWs(rstripWs(s)) }
+
+// Text as Python's universal-newline reader hands it over: every `\r\n` and `\r` is `\n`.
+function univNl(s: string): string {
+  replaceAll(replaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
+// Python's `str.splitlines()` on text that has been through `univNl`.
+function splitLines(s: string): string[] {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    let n = 0
+    if b == 10 || b == 11 || b == 12 || b == 28 || b == 29 || b == 30 {
+      n = 1
+    } else if b == 0xC2 && i + 1 < s.length && s[i + 1] == 0x85 {
+      n = 2
+    } else if (
+      b == 0xE2
+      && i + 2 < s.length
+      && s[i + 1] == 0x80
+      && (s[i + 2] == 0xA8 || s[i + 2] == 0xA9)
+    ) {
+      n = 3
+    }
+    if n > 0 {
+      out.push(s.slice(start, i))
+      i = i + n
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  if start < s.length { out.push(s.slice(start, s.length)) }
+  out
+}
+
+// The first `n` code points of `s`, which is what a Python slice `[:n]` keeps.
+function cpPrefix(s: string, n: i32): string {
+  let seen = 0
+  let i = 0
+  while i < s.length {
+    if (s[i] & 0xC0) != 0x80 {
+      if seen == n { return s.slice(0, i) }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  s
+}
+
+// `s` left-justified to `w` code points, as `"%-*s"` pads it.
+function padTo(s: string, w: i32): string {
+  let out = s
+  let n = s.cpLen()
+  while n < w {
+    out = out + " "
+    n = n + 1
+  }
+  out
+}
+
+function isDigit(b: i32): boolean { b >= 48 && b <= 57 }
+
+function isWordByte(b: i32): boolean {
+  isDigit(b) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+function startsAt(s: string, at: i32, lit: string): boolean {
+  if at < 0 || at + lit.length > s.length { return false }
+  let j = 0
+  while j < lit.length && s[at + j] == lit[j] { j = j + 1 }
+  j == lit.length
+}
+
+function skipWs(s: string, i0: i32): i32 {
+  let i = i0
+  while i < s.length && wsLen(s, i) > 0 { i = i + wsLen(s, i) }
+  i
+}
+
+// Python's `repr` of a string, for the messages that print `%r`.
+function pyRepr(s: string): string {
+  let quote = "'"
+  if contains(s, "'") && !contains(s, "\"") { quote = "\"" }
+  const parts = [quote]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    const ch = s.slice(i, i + 1)
+    if b == 92 {
+      parts.push("\\\\")
+    } else if ch == quote {
+      parts.push("\\" + quote)
+    } else if b == 10 {
+      parts.push("\\n")
+    } else if b == 13 {
+      parts.push("\\r")
+    } else if b == 9 {
+      parts.push("\\t")
+    } else if b < 32 || b == 127 {
+      parts.push("\\x" + hex2(b))
+    } else if b < 0x80 {
+      parts.push(ch)
+    } else {
+      let n = 2
+      if b >= 0xF0 { n = 4 }
+      else if b >= 0xE0 { n = 3 }
+      parts.push(s.slice(i, i + n))
+      i = i + n
+      continue
+    }
+    i = i + 1
+  }
+  parts.push(quote)
+  join(parts, "")
+}
+
+function hex2(v: i32): string {
+  const digits = "0123456789abcdef"
+  digits.slice((v >> 4) & 15, ((v >> 4) & 15) + 1)
+    + digits.slice(v & 15, (v & 15) + 1)
+}
+
+function contains(s: string, needle: string): boolean {
+  let i = 0
+  while i + needle.length <= s.length {
+    if startsAt(s, i, needle) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// ── numbers: Python's `float()`, `%g` and the regex `-?\d+(?:\.\d+)?` ───────────────────
+
+// Python's `float(text)` for the spellings a `filed:`/`tol:` value takes, or null.
+function pyFloat(text: string): f64 | null {
+  let s = stripWs(text)
+  const low = toLowerAscii(s)
+  if low == "inf" || low == "+inf" || low == "infinity" || low == "+infinity" {
+    return parseF64("Infinity")
+  }
+  if low == "-inf" || low == "-infinity" { return parseF64("-Infinity") }
+  if low == "nan" || low == "+nan" || low == "-nan" { return parseF64("NaN") }
+  if startsWith(s, "+") { s = s.slice(1, s.length) }
+  let neg = ""
+  if startsWith(s, "-") {
+    neg = "-"
+    s = s.slice(1, s.length)
+  }
+  if startsWith(s, ".") { s = "0" + s }
+  if endsWith(s, ".") { s = s + "0" }
+  s = replaceAll(s, ".e", ".0e")
+  s = replaceAll(s, ".E", ".0E")
+  if s.length > 0 && (s[0] == 43 || s[0] == 45) { return null }
+  parseF64(neg + s)
+}
+
+function trimZeros(s: string): string {
+  if !contains(s, ".") { return s }
+  let b = s.length
+  while b > 0 && s[b - 1] == 48 { b = b - 1 }
+  if b > 0 && s[b - 1] == 46 { b = b - 1 }
+  s.slice(0, b)
+}
+
+function pow10(e: i32): f64 {
+  let p = 1.0
+  let i = 0
+  while i < e {
+    p = p * 10.0
+    i = i + 1
+  }
+  p
+}
+
+// `"%.{prec}g" % v`: `prec` significant digits, fixed or exponential by the exponent,
+// trailing zeros dropped. Ties round away from zero here and to even in Python, which an
+// exact binary tie at `prec` digits could tell apart and no survey number is.
+function fmtG(v: f64, prec: i32): string {
+  if v != v { return "nan" }
+  if v == parseF64("Infinity") { return "inf" }
+  if v == parseF64("-Infinity") { return "-inf" }
+  if v == 0.0 { return "0" }
+  let neg = ""
+  let a = v
+  if v < 0.0 {
+    neg = "-"
+    a = 0.0 - v
+  }
+  let x = 0
+  let m = a
+  while m >= 10.0 {
+    m = m / 10.0
+    x = x + 1
+  }
+  while m < 1.0 {
+    m = m * 10.0
+    x = x - 1
+  }
+  if x >= -4 && x < prec {
+    let s = toFixed(a, prec - 1 - x)
+    // Rounding up to the next power of ten adds an integer digit.
+    if startsWith(s, "10") && x + 1 < prec && countIntDigits(s) > x + 1 {
+      s = toFixed(a, prec - 2 - x)
+    }
+    if countIntDigits(s) > x + 1 && x + 1 >= prec {
+      return neg + expForm(a, prec, x + 1)
+    }
+    return neg + trimZeros(s)
+  }
+  neg + expForm(a, prec, x)
+}
+
+function countIntDigits(s: string): i32 {
+  let i = 0
+  while i < s.length && s[i] != 46 { i = i + 1 }
+  i
+}
+
+function expForm(a: f64, prec: i32, x0: i32): string {
+  let x = x0
+  let mant = ""
+  if x >= 0 {
+    mant = toFixed(a / pow10(x), prec - 1)
+  } else {
+    mant = toFixed(a * pow10(0 - x), prec - 1)
+  }
+  if startsWith(mant, "10") {
+    x = x + 1
+    if x >= 0 {
+      mant = toFixed(a / pow10(x), prec - 1)
+    } else {
+      mant = toFixed(a * pow10(0 - x), prec - 1)
+    }
+  }
+  mant = trimZeros(mant)
+  let sign = "+"
+  let ax = x
+  if x < 0 {
+    sign = "-"
+    ax = 0 - x
+  }
+  let digits = toString(ax)
+  if digits.length < 2 { digits = "0" + digits }
+  mant + "e" + sign + digits
+}
+
+// The last `-?\d+(?:\.\d+)?` match in `s`, as text, or "" when there is none.
+function lastNumber(s: string): string {
+  let last = ""
+  let i = 0
+  while i < s.length {
+    let j = i
+    if s[j] == 45 { j = j + 1 }
+    if j < s.length && isDigit(s[j]) {
+      while j < s.length && isDigit(s[j]) { j = j + 1 }
+      if j + 1 < s.length && s[j] == 46 && isDigit(s[j + 1]) {
+        j = j + 1
+        while j < s.length && isDigit(s[j]) { j = j + 1 }
+      }
+      last = s.slice(i, j)
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+  last
+}
+
+// ── the survey document ──────────────────────────────────────────────────────────────
+
+// `### row N — title`: the row number text and the stripped title, or "" when `ln` is not one.
+function matchRow(ln: string): string[] {
+  const no: string[] = []
+  if !startsWith(ln, "###") { return no }
+  const i = skipWs(ln, 3)
+  if i == 3 { return no }
+  if !startsAt(ln, i, "row") { return no }
+  const j = skipWs(ln, i + 3)
+  if j == i + 3 { return no }
+  let k = j
+  while k < ln.length && isDigit(ln[k]) { k = k + 1 }
+  if k == j { return no }
+  if k < ln.length && isWordByte(ln[k]) { return no }
+  const num = ln.slice(j, k)
+  let t = skipWs(ln, k)
+  if t >= ln.length { return [num, ""] }
+  if startsAt(ln, t, "-") { t = t + 1 }
+  else if startsAt(ln, t, "—") { t = t + 3 }
+  else { return no }
+  [num, stripWs(ln.slice(t, ln.length))]
+}
+
+function isRowHead(ln: string): boolean { matchRow(ln).length > 0 }
+
+function blockGet(r: Rec, key: string): string | null {
+  let at = r.keys.length - 1
+  while at >= 0 {
+    if r.keys[at] == key { return r.vals[at] }
+    at = at - 1
+  }
+  null
+}
+
+// The value under `key` or "" (Python's `b.get(key)` read for truth).
+function bget(r: Rec, key: string): string {
+  const v = blockGet(r, key)
+  if v is string { return v }
+  ""
+}
+
+function bhas(r: Rec, key: string): boolean {
+  const v = blockGet(r, key)
+  v is string
+}
+
+function setKey(keys: string[], vals: string[], key: string, val: string) {
+  let at = 0
+  while at < keys.length {
+    if keys[at] == key {
+      vals[at] = val
+      return
+    }
+    at = at + 1
+  }
+  keys.push(key)
+  vals.push(val)
+}
+
+function readText(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("survey-regrade: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(t)
+}
+
+// Every `### row N` heading in `doc`, with the `Measure:` block under it.
+function parseDoc(doc: string): Rec[] {
+  const lines = split(readText(doc), "\n")
+  const rows: Rec[] = []
+  let i = 0
+  while i < lines.length {
+    const m = matchRow(lines[i])
+    if m.length == 0 {
+      i = i + 1
+      continue
+    }
+    const keys: string[] = []
+    const vals: string[] = []
+    let has = false
+    let j = i + 1
+    while j < lines.length && !isRowHead(lines[j]) {
+      if rstripWs(lines[j]) == "Measure:" {
+        has = true
+        let k = j + 1
+        while (
+          k < lines.length
+          && (startsWith(lines[k], "    ") || stripWs(lines[k]) == "")
+        ) {
+          const body = stripWs(lines[k])
+          if body != "" {
+            const c = body.indexOf(":")
+            if c < 0 {
+              setKey(keys, vals, body, "")
+            } else {
+              setKey(
+                keys,
+                vals,
+                stripWs(body.slice(0, c)),
+                stripWs(body.slice(c + 1, body.length)),
+              )
+            }
+          }
+          k = k + 1
+        }
+        break
+      }
+      j = j + 1
+    }
+    rows.push(
+      {
+        doc: doc,
+        line: i + 1,
+        id: "row " + m[0],
+        title: m[1],
+        hasBlock: has,
+        keys: keys,
+        vals: vals,
+      },
+    )
+    i = i + 1
+  }
+  rows
+}
+
+// A path spelled as Python's `pathlib` prints it: no empty or `.` segments.
+function normPath(p: string): string {
+  const segs: string[] = []
+  for s in p.split("/") {
+    if s != "" && s != "." { segs.push(s) }
+  }
+  const body = join(segs, "/")
+  if startsWith(p, "/") { return "/" + body }
+  if body == "" { return "." }
+  body
+}
+
+// ── the guest profile ────────────────────────────────────────────────────────────────
+
+function jobj(j: Json, what: string): { [string]: Json } {
+  if j is { [string]: Json } { return j }
+  die("survey-regrade: profile: \{what} is not an object", 1)
+  const empty: { [string]: Json } = Map()
+  empty
+}
+
+function jarr(j: Json | null, what: string): Json[] {
+  if j is Json[] { return j }
+  die("survey-regrade: profile: \{what} is not an array", 1)
+  []
+}
+
+function jints(j: Json | null, what: string, nullAs: i32): i32[] {
+  const out: i32[] = []
+  for v in jarr(j, what) {
+    if v is f64 { out.push(v as! i32) }
+    else if v == null { out.push(nullAs) }
+    else { die("survey-regrade: profile: \{what} holds a non-number", 1) }
+  }
+  out
+}
+
+function loadProfile(path: string): Prof {
+  const text = readTextFile(path)
+  if text is IoError {
+    die("survey-regrade: cannot read \{path} (\{text.msg})", 1)
+  }
+  const parsed = parseJson(text as! string)
+  if parsed is JsonError {
+    die("survey-regrade: \{path} is not JSON (\{parsed.msg})", 1)
+  }
+  const root = jobj(parsed as! Json, "the document")
+  const th = jobj(jarr(root["threads"] ?? null, "threads")[0], "threads[0]")
+  // `stringArray`, else `stringTable`, else `shared.stringArray`; an empty one falls through.
+  let strs: Json[] = []
+  const sa = th["stringArray"] ?? null
+  const st = th["stringTable"] ?? null
+  if sa is Json[] && sa.length > 0 {
+    strs = sa
+  } else if st is Json[] && st.length > 0 {
+    strs = st
+  } else {
+    const sh = root["shared"] ?? null
+    if sh is { [string]: Json } {
+      const x = sh["stringArray"] ?? null
+      if x is Json[] { strs = x }
+    }
+  }
+  const names: string[] = []
+  for s in strs {
+    if s is string { names.push(s) } else { names.push("") }
+  }
+  const funcNames = jints(
+    jobj(th["funcTable"] ?? null, "funcTable")["name"] ?? null,
+    "funcTable.name",
+    0,
+  )
+  const fname: string[] = []
+  for n in funcNames { fname.push(names[n]) }
+  const frames = jobj(th["frameTable"] ?? null, "frameTable")
+  const stackTable = jobj(th["stackTable"] ?? null, "stackTable")
+  const samples = jobj(th["samples"] ?? null, "samples")
+  {
+    fname: fname,
+    frameFunc: jints(frames["func"] ?? null, "frameTable.func", 0),
+    stFrame: jints(stackTable["frame"] ?? null, "stackTable.frame", 0),
+    stPrefix: jints(stackTable["prefix"] ?? null, "stackTable.prefix", -1),
+    stacks: jints(samples["stack"] ?? null, "samples.stack", -1),
+  }
+}
+
+function nameMatches(n: string, want: string): boolean {
+  n == want || startsWith(n, want + "$")
+}
+
+// Share of samples, in percent, whose LEAF frame matches `want` (SELF), or the sum over each
+// matching NAME of the samples carrying it anywhere on the stack (INCL), as the Python's
+// `pct` adds its per-name counts: a stack holding both `f` and `f$m2` counts twice for `f`.
+// A name matches when it is `want` or `want$...`.
+function shareOf(p: Prof, want: string, inclusive: boolean): f64 {
+  const total = p.stacks.length
+  if total == 0 { return 0.0 }
+  let hits = 0
+  if inclusive {
+    // bit[k]: the bit of the distinct matching name function `k` carries, or -1.
+    const distinct: string[] = []
+    const bit: i32[] = []
+    for n in p.fname {
+      let at = -1
+      if nameMatches(n, want) {
+        let d = 0
+        while d < distinct.length {
+          if distinct[d] == n { at = d }
+          d = d + 1
+        }
+        if at < 0 {
+          at = distinct.length
+          distinct.push(n)
+        }
+      }
+      bit.push(at)
+    }
+    if distinct.length > 30 {
+      die(
+        "survey-regrade: \{want} matches more than 30 distinct frame names",
+        1,
+      )
+    }
+    // mask[node]: the matching names on the stack from `node` to the root, -1 when unknown.
+    const mask: i32[] = []
+    let n = 0
+    while n < p.stFrame.length {
+      mask.push(-1)
+      n = n + 1
+    }
+    for si in p.stacks {
+      if si < 0 { continue }
+      const chain: i32[] = []
+      let cur = si
+      while cur >= 0 && mask[cur] < 0 {
+        chain.push(cur)
+        cur = p.stPrefix[cur]
+      }
+      let acc = 0
+      if cur >= 0 { acc = mask[cur] }
+      let c = chain.length - 1
+      while c >= 0 {
+        const k = bit[p.frameFunc[p.stFrame[chain[c]]]]
+        if k >= 0 { acc = acc | (1 << k) }
+        mask[chain[c]] = acc
+        c = c - 1
+      }
+      let m = mask[si]
+      while m != 0 {
+        hits = hits + (m & 1)
+        m = m >>> 1
+      }
+    }
+  } else {
+    for si in p.stacks {
+      if si < 0 { continue }
+      if nameMatches(p.fname[p.frameFunc[p.stFrame[si]]], want) {
+        hits = hits + 1
+      }
+    }
+  }
+  100.0 * (hits as f64) / (total as f64)
+}
+
+function present(p: Prof, want: string): boolean {
+  for n in p.fname {
+    if nameMatches(n, want) { return true }
+  }
+  false
+}
+
+// ── a shell row ──────────────────────────────────────────────────────────────────────
+
+// Run `cmd` from the working directory; the LAST number in stdout is the reading. The
+// first answer is that number as text, the second the reason it could not be read.
+function runShell(cmd: string): string[] {
+  let py = "python3"
+  const e = getEnv("PYTHON")
+  if e is string && e != "" { py = e }
+  const r = runProgram(
+    "env",
+    ["PYTHON=" + py, "timeout", "600", "sh", "-c", cmd],
+  )
+  if r is IoError {
+    die("survey-regrade: cannot run sh (\{r.msg})", 1)
+    return ["", ""]
+  }
+  const out = univNl(decodeUtf8Lossy(r.stdout))
+  const err = univNl(decodeUtf8Lossy(r.stderr))
+  if r.code != 0 {
+    let msg = stripWs(err)
+    if msg == "" { msg = stripWs(out) }
+    return ["", "command exited \{toString(r.code)}: " + cpPrefix(msg, 140)]
+  }
+  const num = lastNumber(out)
+  if num == "" {
+    return [
+      "",
+      "command printed no number: " + pyRepr(cpPrefix(stripWs(out), 140)),
+    ]
+  }
+  [num, ""]
+}
+
+// ── seed provenance, as `scripts/seed_provenance.py` computes it ──────────────────────
+
+function fnvFeed(h0: i64, data: u8[]): i64 {
+  let h = h0
+  let i = 0
+  while i < data.length {
+    h = (h ^ (data[i] as i64)) * 1099511628211
+    i = i + 1
+  }
+  h
+}
+
+function hex64(h: i64): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = 15
+  while k >= 0 {
+    const d = ((h >> ((k * 4) as i64)) & 15) as! i32
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+type Identity = { hash: string, files: i32 }
+
+// FNV-1a over every `compiler/*.vl` in sorted name order, and how many there were.
+function sourceIdentity(): Identity {
+  const listed = listDir("compiler")
+  if listed is IoError {
+    die("survey-regrade: cannot list compiler/ (" + listed.msg + ")", 1)
+    return { hash: "", files: 0 }
+  }
+  const names: string[] = []
+  for n in listed {
+    if endsWith(n, ".vl") {
+      let at = names.length
+      names.push(n)
+      while at > 0 && names[at - 1] > n {
+        names[at] = names[at - 1]
+        at = at - 1
+      }
+      names[at] = n
+    }
+  }
+  const zero: u8[] = [0]
+  let h: i64 = -3750763034362895579
+  for n in names {
+    const src = readFile("compiler/" + n)
+    if src is IoError {
+      die("survey-regrade: cannot read compiler/\{n} (\{src.msg})", 1)
+      return { hash: "", files: 0 }
+    }
+    h = fnvFeed(h, n.bytes())
+    h = fnvFeed(h, zero)
+    h = fnvFeed(h, toString(src.length).bytes())
+    h = fnvFeed(h, zero)
+    h = fnvFeed(h, src)
+    h = fnvFeed(h, zero)
+  }
+  { hash: hex64(h), files: names.length }
+}
+
+// The identity `refresh-compiler.sh` recorded beside the seed, or "" when there is none.
+function recordedIdentity(): string {
+  const t = readTextFile(SIDECAR)
+  if t is IoError { return "" }
+  for raw in splitLines(univNl(t)) {
+    const line = stripWs(raw)
+    if line != "" && !startsWith(line, "#") {
+      let e = 0
+      while e < line.length && wsLen(line, e) == 0 { e = e + 1 }
+      return line.slice(0, e)
+    }
+  }
+  ""
+}
+
+// Print the seed's provenance and answer an exit code, or 0 to carry on.
+function provenance(moved: i32): i32 {
+  const what = "survey-regrade"
+  const have = sourceIdentity()
+  const want = recordedIdentity()
+  const n = toString(have.files)
+  if want == "" {
+    say(
+      "seed provenance: UNKNOWN (no \{SIDECAR}) · compiler/*.vl is \{have.hash} over \{n} files",
+    )
+    if moved > 0 {
+      say(
+        "\{what}: REFUSING to report \{toString(moved)} MOVED row(s) against a seed of unknown provenance —\n  a MOVED reading is quoted with the seed's identity beside the tree's or it is\n  not a reading. Run `scripts/refresh-compiler.sh` and re-run.",
+      )
+      return 2
+    }
+    return 0
+  }
+  if want == have.hash {
+    say(
+      "seed provenance: \{want} · compiler/*.vl \{have.hash} over \{n} files — match",
+    )
+    return 0
+  }
+  say(
+    "seed provenance: \{want} · compiler/*.vl \{have.hash} over \{n} files — DIFFER",
+  )
+  say(
+    "\{what}: REFUSING — the seed was built from different `compiler/*.vl` than the ones\n  checked out, so every row would be graded against a compiler this tree does\n  not describe. Run `scripts/refresh-compiler.sh` and re-run.",
+  )
+  2
+}
+
+// ── grading ──────────────────────────────────────────────────────────────────────────
+
+// Why a row could not be re-read; the row is `bad[k]` and the reason `why[k]`.
+function grade(
+  rows: Rec[],
+  profPath: string,
+  strict: boolean,
+  requireProfile: boolean,
+  withProvenance: boolean,
+): i32 {
+  let prof: Prof = {
+    fname: [],
+    frameFunc: [],
+    stFrame: [],
+    stPrefix: [],
+    stacks: [],
+  }
+  let haveProf = false
+  if profPath != "" {
+    prof = loadProfile(profPath)
+    haveProf = true
+    say("profile: \{profPath} (\{toString(prof.stacks.length)} samples)\n")
+  }
+  const graded: Hit[] = []
+  const moved: Hit[] = []
+  const skipped: Rec[] = []
+  const exempt: Rec[] = []
+  const badRow: Rec[] = []
+  const badWhy: string[] = []
+  for r in rows {
+    if !r.hasBlock {
+      badRow.push(r)
+      badWhy.push("no Measure: block")
+      continue
+    }
+    const kind = bget(r, "kind")
+    if !kindOk(kind) {
+      badRow.push(r)
+      badWhy.push(
+        "kind is \{pyRepr(kind)}, not one of shell/profile-incl/profile-self/none",
+      )
+      continue
+    }
+    if kind == "none" {
+      if bget(r, "why") == "" {
+        badRow.push(r)
+        badWhy.push("kind: none with no `why:`")
+      } else {
+        exempt.push(r)
+      }
+      continue
+    }
+    const filedT = blockGet(r, "filed")
+    let filed = 0.0
+    let tol = 0.0
+    let numbersOk = filedT is string
+    if filedT is string {
+      const f = pyFloat(filedT)
+      if f == null { numbersOk = false } else { filed = f }
+    }
+    if numbersOk && bhas(r, "tol") {
+      const t = pyFloat(bget(r, "tol"))
+      if t == null { numbersOk = false } else { tol = t }
+    }
+    if !numbersOk {
+      badRow.push(r)
+      badWhy.push("filed:/tol: missing or not a number")
+      continue
+    }
+    let today = 0.0
+    if kind == "shell" {
+      if bget(r, "cmd") == "" {
+        badRow.push(r)
+        badWhy.push("kind: shell with no `cmd:`")
+        continue
+      }
+      const got = runShell(bget(r, "cmd"))
+      if got[0] == "" {
+        badRow.push(r)
+        badWhy.push(got[1])
+        continue
+      }
+      today = pyFloat(got[0]) ?? 0.0
+    } else {
+      const what = bget(r, "what")
+      if what == "" {
+        badRow.push(r)
+        badWhy.push("kind: \{kind} with no `what:`")
+        continue
+      }
+      if !haveProf {
+        skipped.push(r)
+        continue
+      }
+      if !present(prof, what) {
+        badRow.push(r)
+        badWhy.push(
+          "no frame named \{pyRepr(what)} in the profile — the row names a function the tree no longer has",
+        )
+        continue
+      }
+      today = shareOf(prof, what, kind == "profile-incl")
+    }
+    let d = "both"
+    if bhas(r, "dir") { d = bget(r, "dir") }
+    if d != "both" && d != "at-most" && d != "at-least" {
+      badRow.push(r)
+      badWhy.push("dir is \{pyRepr(d)}, not both/at-most/at-least")
+      continue
+    }
+    let verdict = "holds"
+    if today > filed + tol && (d == "both" || d == "at-most") {
+      verdict = "stale-live"
+    } else if today < filed - tol && (d == "both" || d == "at-least") {
+      verdict = "stale-closed"
+    }
+    const hit: Hit = {
+      rec: r,
+      filed: filed,
+      today: today,
+      tol: tol,
+      verdict: verdict,
+    }
+    graded.push(hit)
+    if verdict != "holds" { moved.push(hit) }
+  }
+
+  let w = 6
+  for r in rows {
+    if r.id.cpLen() > w { w = r.id.cpLen() }
+  }
+  say(
+    padTo("ROW", w)
+      + "  "
+      + padTo("FILED", 10)
+      + " "
+      + padTo("TODAY", 10)
+      + " VERDICT",
+  )
+  for h in graded {
+    say(
+      padTo(h.rec.id, w)
+        + "  "
+        + padTo(fmtG(h.filed, 4), 10)
+        + " "
+        + padTo(fmtG(h.today, 4), 10)
+        + " "
+        + h.verdict,
+    )
+  }
+  for r in skipped {
+    say(
+      padTo(r.id, w)
+        + "  "
+        + padTo("-", 10)
+        + " "
+        + padTo("-", 10)
+        + " skipped (needs --profile)",
+    )
+  }
+  for r in exempt {
+    say(
+      padTo(r.id, w)
+        + "  "
+        + padTo("-", 10)
+        + " "
+        + padTo("-", 10)
+        + " not measurable ("
+        + cpPrefix(bget(r, "why"), 56)
+        + ")",
+    )
+  }
+  let b = 0
+  while b < badRow.length {
+    say(
+      padTo(badRow[b].id, w)
+        + "  "
+        + padTo("-", 10)
+        + " "
+        + padTo("-", 10)
+        + " NOT RE-RUNNABLE ("
+        + cpPrefix(badWhy[b], 56)
+        + ")",
+    )
+    b = b + 1
+  }
+
+  say(
+    "\n\{toString(graded.length)} graded · \{toString(graded.length - moved.length)} hold · \{toString(moved.length)} moved · \{toString(skipped.length)} skipped · \{toString(exempt.length)} not measurable · \{toString(badRow.length)} NOT RE-RUNNABLE",
+  )
+  let prov = 0
+  if withProvenance { prov = provenance(moved.length) }
+  if requireProfile && skipped.length > 0 {
+    say(
+      "\n--require-profile: \{toString(skipped.length)} share row(s) reported `skipped` because no profile was\n  given. Take one with `scripts/perf/guest-profile.sh <dir> build compiler/entry.vl`\n  and pass `--profile <dir>/entry.json`.",
+    )
+    for r in skipped { say("  \{r.doc}:\{toString(r.line)}  \{r.id}") }
+  }
+  if moved.length > 0 {
+    say("\nRows whose filed number no longer reads — re-grade the survey:")
+    for h in moved {
+      say(
+        "  \{h.rec.doc}:\{toString(h.rec.line)}  \{h.rec.id} — \{h.rec.title}",
+      )
+      say(
+        "      filed \{fmtG(h.filed, 6)} (±\{fmtG(h.tol, 6)}), today \{fmtG(h.today, 6)}: \{h.verdict}",
+      )
+    }
+  }
+  if badRow.length > 0 {
+    say("\nRows whose number cannot be re-read — this is the failure:")
+    b = 0
+    while b < badRow.length {
+      say(
+        "  \{badRow[b].doc}:\{toString(badRow[b].line)}  \{badRow[b].id} — \{badRow[b].title}",
+      )
+      say("      " + badWhy[b])
+      b = b + 1
+    }
+    say(
+      "      fix: give the row a `Measure:` block naming a kind, a filed number and a tolerance — or `kind: none` with a `why:` if no number is re-runnable.",
+    )
+  }
+  if prov != 0 { return prov }
+  if (
+    badRow.length > 0
+    || (moved.length > 0 && strict)
+    || (requireProfile && skipped.length > 0)
+  ) {
+    return 1
+  }
+  0
+}
+
+function kindOk(k: string): boolean {
+  for x in KINDS {
+    if x == k { return true }
+  }
+  false
+}
+
+// ── --json ───────────────────────────────────────────────────────────────────────────
+
+function hexDigits(v: i32, n: i32): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = n - 1
+  while k >= 0 {
+    const d = (v >> (k * 4)) & 15
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+function uEsc(cp: i32): string { "\\u" + hexDigits(cp, 4) }
+
+// `json.dumps(s)` with its default `ensure_ascii`: everything outside space..`~` escaped.
+function jsonStr(s: string): string {
+  const parts = ["\""]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == 34 { parts.push("\\\"") }
+      else if b == 92 { parts.push("\\\\") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 8 { parts.push("\\b") }
+      else if b == 12 { parts.push("\\f") }
+      else if b < 32 || b == 127 { parts.push(uEsc(b)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    let cp = 0
+    let n = 1
+    if b >= 0xF0 {
+      n = 4
+      cp = b & 7
+    } else if b >= 0xE0 {
+      n = 3
+      cp = b & 15
+    } else {
+      n = 2
+      cp = b & 31
+    }
+    let k = 1
+    while k < n && i + k < s.length {
+      cp = (cp << 6) | (s[i + k] & 63)
+      k = k + 1
+    }
+    if cp > 0xFFFF {
+      const v = cp - 0x10000
+      parts.push(uEsc(0xD800 | (v >> 10)))
+      parts.push(uEsc(0xDC00 | (v & 0x3FF)))
+    } else {
+      parts.push(uEsc(cp))
+    }
+    i = i + n
+  }
+  parts.push("\"")
+  join(parts, "")
+}
+
+// `json.dumps(rows, indent=2)`.
+function rowsJson(rows: Rec[]): string {
+  const items: string[] = []
+  for r in rows {
+    let block = "null"
+    if r.hasBlock {
+      if r.keys.length == 0 {
+        block = "{}"
+      } else {
+        const fields: string[] = []
+        let k = 0
+        while k < r.keys.length {
+          fields.push("      " + jsonStr(r.keys[k]) + ": " + jsonStr(r.vals[k]))
+          k = k + 1
+        }
+        block = "{\n" + join(fields, ",\n") + "\n    }"
+      }
+    }
+    items.push(
+      "  {\n    \"doc\": \{jsonStr(r.doc)},\n    \"line\": \{toString(r.line)},\n    \"id\": \{jsonStr(r.id)},\n    \"title\": \{jsonStr(r.title)},\n    \"block\": \{block},\n    \"why\": null\n  }",
+    )
+  }
+  "[\n" + join(items, ",\n") + "\n]"
+}
+
+// ── --self-test ──────────────────────────────────────────────────────────────────────
+
+const SELF_TEST_DOC = [
+  "", "### row 1 — a reading that holds", "", "Measure:", "", "    kind: shell",
+  "    cmd: echo 42", "    filed: 42", "    tol: 0", "",
+  "### row 2 — a reading that has GROWN", "", "Measure:", "", "    kind: shell",
+  "    cmd: echo 99", "    filed: 10", "    tol: 1", "",
+  "### row 3 — a reading that has FALLEN", "", "Measure:", "",
+  "    kind: shell", "    cmd: echo 1", "    filed: 30.29", "    tol: 2", "",
+  "### row 4 — a row with no block at all", "", "Some prose, indented nowhere.",
+  "", "### row 5 — a declared exemption", "", "Measure:", "", "    kind: none",
+  "    why: the value is a readability claim, not a number", "",
+  "### row 6 — a share the synthetic profile must read exactly", "", "Measure:",
+  "", "    kind: profile-self", "    what: b", "    filed: 75", "    tol: 0",
+  "", "### row 7 — an inclusive share, counted once per sample", "", "Measure:",
+  "", "    kind: profile-incl", "    what: a", "    filed: 100", "    tol: 0",
+  "", "### row 8 — a function the profile does not carry", "", "Measure:", "",
+  "    kind: profile-incl", "    what: renamedAway", "    filed: 16",
+  "    tol: 4", "",
+]
+
+// Two frames and four samples, so every share is exact by construction: `a` is the root of
+// every stack (incl 100%, self 25%), `b` the leaf of the other three (self 75%, incl 75%).
+const SELF_TEST_PROFILE = "{\"threads\": [{\"stringArray\": [\"a\", \"b\"], \"funcTable\": {\"name\": [0, 1]}, \"frameTable\": {\"func\": [0, 1]}, \"stackTable\": {\"frame\": [0, 1], \"prefix\": [null, 0]}, \"samples\": {\"stack\": [0, 1, 1, 1]}}]}"
+
+function mktemp(): string {
+  const r = runProgram("mktemp", ["-d"])
+  if r is IoError {
+    die("survey-regrade: cannot run mktemp (\{r.msg})", 1)
+    return ""
+  }
+  if r.code != 0 { die("survey-regrade: mktemp -d failed", 1) }
+  stripWs(decodeUtf8Lossy(r.stdout))
+}
+
+function selfTest(): i32 {
+  const dir = mktemp()
+  const doc = dir + "/survey.md"
+  const prof = dir + "/profile.json"
+  const w1 = writeTextFile(doc, join(SELF_TEST_DOC, "\n"))
+  const w2 = writeTextFile(prof, SELF_TEST_PROFILE)
+  if w1 != null || w2 != null {
+    die("survey-regrade: cannot write the self-test files", 1)
+  }
+  const rows = parseDoc(doc)
+  if rows.length != 8 {
+    runProgram("rm", ["-rf", dir])
+    print("self-test FAILED: parsed \{toString(rows.length)} rows, want 8")
+    return 1
+  }
+  capturing = true
+  captured = ""
+  const rc = grade(rows, prof, false, false, false)
+  capturing = false
+  const out = captured
+  runProgram("rm", ["-rf", dir])
+  const ids = [
+    "row 1", "row 2", "row 3", "row 4", "row 5", "row 6", "row 7", "row 8",
+  ]
+  const verdicts = [
+    "holds", "stale-live", "stale-closed", "NOT RE-RUNNABLE", "not measurable",
+    "holds", "holds", "NOT RE-RUNNABLE",
+  ]
+  const bad: string[] = []
+  const lines = split(out, "\n")
+  let k = 0
+  while k < ids.length {
+    let line = ""
+    let found = false
+    for l in lines {
+      if !found && startsWith(l, ids[k] + " ") {
+        line = l
+        found = true
+      }
+    }
+    if !found {
+      bad.push("\{ids[k]}: want \{verdicts[k]}, got '<no row>'")
+    } else if !contains(line, verdicts[k]) {
+      bad.push("\{ids[k]}: want \{verdicts[k]}, got \{pyRepr(line)}")
+    }
+    k = k + 1
+  }
+  if rc != 1 {
+    bad.push(
+      "exit code \{toString(rc)}, want 1 (rows 4 and 8 are not re-runnable)",
+    )
+  }
+  print(out)
+  if bad.length > 0 {
+    print("self-test FAILED:")
+    for b in bad { print("  " + b) }
+    return 1
+  }
+  print(
+    "self-test ok — every verdict fires on a specimen that must produce it, and a row with no block exits non-zero",
+  )
+  0
+}
+
+// ── the command ──────────────────────────────────────────────────────────────────────
+
+const USAGE = "usage: vl run scripts/survey-regrade.vl -- [--strict] [--require-profile] [--profile P.json] [--json OUT] <doc>...\n       vl run scripts/survey-regrade.vl -- --self-test\nRun from the checkout root. Exit 0 when every row's number re-reads, 1 when one cannot\n(or, under --strict, moved), 2 when the seed's provenance refuses the reading."
+
+function main(args: string[]): i32 {
+  const docs: string[] = []
+  let prof = ""
+  let strict = false
+  let requireProfile = false
+  let outJson = ""
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if a == "--strict" {
+      strict = true
+    } else if a == "--require-profile" {
+      requireProfile = true
+    } else if a == "--self-test" {
+      return selfTest()
+    } else if a == "--profile" {
+      if i + 1 >= args.length {
+        print(
+          "--profile takes a guest-profile JSON (scripts/perf/guest-profile.sh writes one)",
+        )
+        return 2
+      }
+      prof = args[i + 1]
+      i = i + 1
+    } else if a == "--json" {
+      if i + 1 >= args.length { die("survey-regrade: --json needs a path", 2) }
+      outJson = args[i + 1]
+      i = i + 1
+    } else {
+      docs.push(a)
+    }
+    i = i + 1
+  }
+  if docs.length == 0 {
+    print(USAGE)
+    return 2
+  }
+  const rows: Rec[] = []
+  for d in docs {
+    for r in parseDoc(normPath(d)) { rows.push(r) }
+  }
+  if rows.length == 0 {
+    print("no `### row N` headings in " + join(docs, ", "))
+    return 2
+  }
+  const rc = grade(rows, prof, strict, requireProfile, true)
+  if outJson != "" {
+    const w = writeTextFile(outJson, rowsJson(rows))
+    if w != null {
+      die("survey-regrade: cannot write \{outJson} (\{w.msg})", 1)
+    }
+    print("\nwrote " + outJson)
+  }
+  rc
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("survey-regrade: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
