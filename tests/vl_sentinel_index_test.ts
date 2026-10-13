@@ -1,7 +1,7 @@
 // THE TWO SENTINEL-INDEX IMPLEMENTATIONS MUST AGREE.
 //
 // `compiler/lint.vl` grades one module at a time from the source the driver hands it;
-// `scripts/sentinel-budget.py` (through `scripts/sentinel-census.py`) grades the whole
+// `scripts/sentinel-census.py` grades the whole
 // tree for the per-file ratchet. They carry the same table definition, the same
 // per-module hole-field and map derivations, the same reader fixpoint and the same
 // linear guard model, and nothing else ties them together — so a change to either that
@@ -28,7 +28,7 @@
 
 import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
 
-const SCRIPT = `${ROOT}/scripts/sentinel-budget.py`;
+const SCRIPT = `${ROOT}/scripts/sentinel-census.py`;
 const UNGUARDED = "sentinel-index-unguarded";
 const STRICT = "sentinel-index-strict-untested";
 const CODES = [UNGUARDED, STRICT] as const;
@@ -272,7 +272,7 @@ const script = async (path: string): Promise<Hits> => {
   }).output();
   if (code !== 0) {
     throw new Error(
-      `sentinel-budget.py --grade ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
+      `sentinel-census.py --grade ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
     );
   }
   const raw = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, unknown[][]>;
@@ -331,7 +331,7 @@ Deno.test({
       for (const c of CODES) {
         if (!eq(s.at[c], l.at[c])) {
           throw new Error(
-            `${f.name}: ${c} disagrees — sentinel-budget.py wants ` +
+            `${f.name}: ${c} disagrees — sentinel-census.py wants ` +
               `${JSON.stringify(s.at[c])}, compiler/lint.vl got ${JSON.stringify(l.at[c])}. ` +
               `The two carry the same table definition, the same hole-field and map ` +
               `derivations and the same guard model; whichever moved has to move back, ` +
@@ -365,24 +365,41 @@ Deno.test({
   },
 });
 
-// THE RATCHET IS A COMMITTED FILE, AND IT HAS TO DESCRIBE THIS TREE. A baseline whose
-// per-file rows no longer match the census is a gate that passes for the wrong reason —
-// either it was written on a different tree, or the walk stopped seeing something.
+// THE RATCHET IS A COMMITTED FILE, AND IT HAS TO DESCRIBE THIS TREE. `vl check --budget
+// scripts/sentinel-budget-baseline.json` is the gate row (the lint's own count); this holds
+// the census, an independent implementation, to the same baseline: no file may exceed its
+// row, and the baseline's totals must be the sum of its rows.
 Deno.test({
-  name: "sentinel-index: the committed baseline is at or above the tree, and --check passes",
+  name: "sentinel-index: the committed baseline is at or above the census, per file",
   ignore: !ENABLED,
   fn: async () => {
     const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-      args: [SCRIPT, "--check"],
+      args: [SCRIPT, "--counts"],
       stdout: "piped",
       stderr: "piped",
     }).output();
-    const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
     if (code !== 0) {
-      throw new Error(`sentinel-budget.py --check exited ${code}:\n${out}`);
+      throw new Error(`sentinel-census.py --counts exited ${code}: ${new TextDecoder().decode(stderr)}`);
     }
-    if (!out.includes("sentinel-index budget ok")) {
-      throw new Error(`want the "sentinel-index budget ok" summary line, got:\n${out}`);
+    const now = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, Record<string, number>>;
+    const base = JSON.parse(
+      await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
+    ) as { total: Record<string, number>; files: Record<string, Record<string, number>> };
+    const over: string[] = [];
+    for (const [rel, v] of Object.entries(now)) {
+      for (const c of CODES) {
+        const was = base.files[rel]?.[c] ?? 0;
+        if ((v[c] ?? 0) > was) over.push(`${rel} ${c}: ${v[c]} (baseline ${was})`);
+      }
+    }
+    for (const c of CODES) {
+      const sum = Object.values(base.files).reduce((n, v) => n + (v[c] ?? 0), 0);
+      if (sum !== base.total[c]) {
+        over.push(`baseline total ${c} is ${base.total[c]} but its rows sum to ${sum}`);
+      }
+    }
+    if (over.length > 0) {
+      throw new Error(`the baseline does not describe the census:\n  ${over.join("\n  ")}`);
     }
   },
 });

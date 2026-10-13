@@ -19,11 +19,14 @@ Four sections:
   --tables    the tables read in each module that the reading function did not build
   (default)   the hit table: file:function, the table, the index, its producer
 
-compiler/lint.vl carries the SAME walk per module, and scripts/sentinel-budget.py is
-its per-file ratchet. Both are the same rule over the same derivation, which is what
-tests/vl_sentinel_index_test.ts pins.
+compiler/lint.vl carries the SAME walk per module, and `vl check --budget
+scripts/sentinel-budget-baseline.json` is its per-file ratchet. Both are the same rule
+over the same derivation, which is what tests/vl_sentinel_index_test.ts pins.
+  --counts    {file: {code: hits}} as JSON, over the tree
+  --grade F   ONE file's hits as JSON (the shape that test compares), graded where it is
 """
 
+import json
 import os
 import re
 import sys
@@ -429,11 +432,36 @@ def cmd_table(limit, code):
     return 0
 
 
+def cmd_grade(path):
+    """ONE file's hits as JSON {code: [[line, col, table, idx], ...]} — graded WHERE IT
+    IS, so a fixture in a temp directory reads exactly as a compiler module does."""
+    rel = os.path.basename(path)
+    out = {c: [] for c in CODES}
+    for h in hits_in(rel, read_source(path)):
+        out[h.code].append([h.line, h.col, h.table, h.idx])
+    for c in CODES:
+        out[c].sort()
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_counts():
+    out = {}
+    for h in all_hits():
+        out.setdefault(h.rel, {c: 0 for c in CODES})[h.code] += 1
+    print(json.dumps(out))
+    return 0
+
+
 def main():
     global ROOT
     args = sys.argv[1:]
     if "--root" in args:
         ROOT = args[args.index("--root") + 1]
+    if "--counts" in args:
+        return cmd_counts()
+    if "--grade" in args:
+        return cmd_grade(args[args.index("--grade") + 1])
     if "--readers" in args:
         return cmd_readers("--hits" in args)
     if "--holes" in args:

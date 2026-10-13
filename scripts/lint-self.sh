@@ -87,7 +87,7 @@ lint_graded() { # <target> <json path>
     $("$VL" check --budget scripts/interp-budget-baseline.json --exempt-codes) \
     $("$PY" scripts/scan-budget.py --exempt-codes) \
     $("$PY" scripts/ladder-budget.py --exempt-codes) \
-    $("$PY" scripts/sentinel-budget.py --exempt-codes)
+    $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes)
 }
 
 # std/ goes first: it is near-instant AND its module load warms the seed's
@@ -189,6 +189,9 @@ if [ "$GRAPH_FILES" -lt 2 ]; then
   echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
   exit 1
 fi
+# The sentinel-index ratchet counts the findings this graph run already produced, rather
+# than walking compiler/ a second time (`--findings`, the same `--include-imports` report).
+"$VL" check --budget scripts/sentinel-budget-baseline.json --findings "$WORK/graph.json" || exit $?
 [ "$FMT_RC" = 0 ] || exit "$FMT_RC"
 
 echo "self-lint + fmt-check clean ✅"

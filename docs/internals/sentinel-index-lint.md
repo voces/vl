@@ -1,7 +1,7 @@
 # `sentinel-index-unguarded` — a table read whose index nobody bounded
 
 **Landed 2026-09-03.** Rule in `compiler/lint.vl`, tree-wide census in
-`scripts/sentinel-census.py`, ratchet in `scripts/sentinel-budget.py`, agreement pinned by
+`scripts/sentinel-census.py`, ratchet `vl check --budget scripts/sentinel-budget-baseline.json`, agreement pinned by
 `tests/vl_sentinel_index_test.ts`.
 
 ## Why
@@ -120,7 +120,7 @@ tree reported only the `checkIsExprNode` read that is #2494's. Each fix silences
 sites.
 
 **#2494 then MERGED while this branch was open, which is the control re-run for free.**
-`sentinel-budget.py --why` on the new master prints
+`sentinel-budget.py --why` (now `vl check --budget-why`) on the new master prints
 
 ```
 sentinel-index-unguarded  390 hits over 274 names -> 386 over 273
@@ -262,10 +262,9 @@ python3 scripts/sentinel-census.py                    # every hit: file:line, fu
 python3 scripts/sentinel-census.py --readers --hits   # the reader census, joined against the hits
 python3 scripts/sentinel-census.py --holes            # each module's hole fields
 python3 scripts/sentinel-census.py --root <dir>       # grade another tree (a `git archive` unpack)
-python3 scripts/sentinel-budget.py                    # the per-file table
-python3 scripts/sentinel-budget.py --check            # the gate: a file may only go down
-python3 scripts/sentinel-budget.py --why              # what LEFT and what ENTERED since the baseline's commit
-python3 scripts/sentinel-budget.py --write-baseline   # after a real fix, in the same PR
+vl check --budget scripts/sentinel-budget-baseline.json                  # the gate: a file may only go down
+vl check --budget-why scripts/sentinel-budget-baseline.json              # what LEFT and what ENTERED (stored entries)
+vl check --budget scripts/sentinel-budget-baseline.json --write-baseline # after a real fix, in the same PR
 ```
 
 `--check` is a `gate.sh` row and a ci-native step. `scripts/lint-self.sh` holds
