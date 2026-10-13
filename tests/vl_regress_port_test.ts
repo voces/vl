@@ -4,9 +4,11 @@
 // `census/gradecensus.py` (architecture-refactor-plan.md, T3). Both read their corpus at a
 // fixed path under the checkout, so this builds a small checkout of their own — the scripts
 // copied, `std/`, `build/` and `scripts/vl-host` linked — with a fixture corpus whose cells
-// land in every class the grader can tell apart without a doctored seed: runs, wrong value
-// (quotes and a non-ASCII letter in the `%r` message), loud check reject, loud emit reject
-// and trap_loads, in both `cells/` and `named/`. It then requires the same stdout, exit code
+// land in every class the grader can tell apart: runs, wrong value (quotes and a non-ASCII
+// letter in the `%r` message), loud check reject, loud emit reject, check-clean invalid wasm,
+// trap_loads and compiler trap, in both `cells/` and `named/`. The graders' `$VL` is a STUB
+// that answers each cell from `//! key: value` lines, so no outcome is a live compiler
+// defect and a compiler fix cannot turn this red. It then requires the same stdout, exit code
 // and files from both for: `--write-baseline`, a clean diff, a doctored baseline with a lost
 // `runs` cell, a move into silent and a message change (exit 1), `--verify-fresh` stale and
 // fresh, a per-cell grade (`GRADE_BATCH=0`), an incomplete index, its `--set` repair, the
@@ -43,21 +45,76 @@ type Out = { code: number; out: string };
 
 const D = "scripts/silent-sweep/distilled";
 
-// One cell per class, as (program, expected stdout). Names sort in the order listed.
+// The stub `vl` both graders spawn (`$VL`): it answers `check`, `check --batch --json`,
+// `run`, `run --batch --out-dir` and `build` from `//! key: value` lines in each cell
+// (`\n` in a value is a newline). The port builds `regress.vl` with `$VL` and runs the result for
+// its grading chunks, so the stub's wrapper hands those two calls to the real binary, so no outcome depends on a live compiler defect.
+// Keys: `check-err` (a check error message), `run-out`, `run-err`, `run-rc`, `built`.
+const STUB_PY = `import json, os, sys
+a = sys.argv[1:]
+def d(f):
+    o = {}
+    for l in open(f, encoding="utf-8"):
+        if l.startswith("//! ") and ": " in l:
+            k, v = l[4:].rstrip("\\n").split(": ", 1)
+            o[k] = v.replace("\\\\n", "\\n")
+    return o
+def files(): return [x for x in a[1:] if x.endswith(".vl")]
+def out(s, e=sys.stdout): e.write(s); e.flush()
+if a[0] == "check" and "--batch" in a:
+    for f in files():
+        m = d(f).get("check-err")
+        out(json.dumps({"exit": 1 if m else 0, "diagnostics":
+            [{"severity": "error", "message": m}] if m else []}) + "\\n")
+elif a[0] == "check":
+    m = d(a[1]).get("check-err")
+    out("[ERROR]: " + m + "\\n" if m else "Checked 1 file, no errors.\\n")
+    sys.exit(1 if m else 0)
+elif a[0] == "run" and "--batch" in a:
+    od = a[a.index("--out-dir") + 1]
+    for f in files():
+        c = d(f)
+        n = os.path.join(od, os.path.basename(f))
+        open(n + ".out", "w", encoding="utf-8").write(c.get("run-out", ""))
+        if int(c.get("run-rc", "0")) != 0:
+            open(n + ".err", "w", encoding="utf-8").write(c.get("run-err", ""))
+elif a[0] == "run":
+    c = d(a[1])
+    out(c.get("run-out", ""))
+    out(c.get("run-err", ""), sys.stderr)
+    sys.exit(int(c.get("run-rc", "0")))
+elif a[0] == "build":
+    if d(a[1]).get("built") == "1":
+        open(a[a.index("-o") + 1], "wb").write(b"\\0asm")
+else:
+    sys.exit(64)
+`;
+
+// One cell per class, as (directives, expected stdout). Names sort in the order listed.
 const CELLS: Record<string, [string, string]> = {
-  a000001: ["print(6 * 7)", "42"],
-  a000002: ['const x: i32 = "s"\nprint(x)', "s"],
-  // Still an emit refusal: a range step of i32's minimum has no negation.
-  a000003: ["for i in 10 to 1 step -2147483648 { print(i) }", "10"],
-  a000004: ['print("it\'s \\"q\\" ü")', "x"],
-  a000005: ["const xs: i32[] = [1, 2]\nprint(xs.length)\nprint(xs[9])", "2"],
+  a000001: ["run-out: 42\n", "42"],
+  a000002: ["check-err: type mismatch: expected i32, found string", "s"],
+  a000003: [
+    "run-rc: 1\nrun-err: Error: emit error\\nf.vl:1:1: emitProgram: a range step of i32's minimum has no negation\\n",
+    "10",
+  ],
+  a000004: ['run-out: it\'s "q" \u00fc\\n', "x"],
+  a000005: [
+    "run-rc: 70\nrun-err: error: wasm trap: out of bounds array access\\n\nbuilt: 1",
+    "2",
+  ],
+  a000006: [
+    "run-rc: 1\nrun-err: [wasm] Invalid input WebAssembly code at offset 77: type mismatch\\n",
+    "7",
+  ],
+  a000007: ["run-rc: 70\nrun-err: error: wasm trap: unreachable\\n", "8"],
 };
 const NAMED: Record<string, [string, string]> = {
-  fx_runs: ['print("é")', "é"],
-  fx_reject: ["print(undefinedName)", ""],
-  fx_wrong: ["print(1)\nprint(2)", "1"],
+  fx_runs: ["run-out: \u00e9\\n", "\u00e9"],
+  fx_reject: ["check-err: undefined name `undefinedName`", ""],
+  fx_wrong: ["run-out: 1\\n2\\n", "1"],
 };
-const REPRESENTS = [60, 7, 1200, 3, 45];
+const REPRESENTS = [60, 7, 1200, 3, 45, 5, 2];
 
 const tree = async (dir: string) => {
   await Deno.mkdir(`${dir}/${D}/cells`, { recursive: true });
@@ -78,6 +135,13 @@ const tree = async (dir: string) => {
   await Deno.symlink(STD, `${dir}/std`);
   await Deno.symlink(`${ROOT}/build`, `${dir}/build`);
   await Deno.symlink(`${ROOT}/scripts/vl-host`, `${dir}/scripts/vl-host`);
+  await Deno.writeTextFile(`${dir}/stubvl.py`, STUB_PY);
+  await Deno.writeTextFile(
+    `${dir}/stubvl`,
+    `#!/bin/sh\ncase "$2" in *regress.vl|*grader.wasm) exec "${VL}" "$@";; esac\n` +
+      `exec "${pythonBin()}" "${dir}/stubvl.py" "$@"\n`,
+  );
+  await Deno.chmod(`${dir}/stubvl`, 0o755);
   const rows: string[] = [];
   const part = async (
     name: string,
@@ -85,7 +149,10 @@ const tree = async (dir: string) => {
   ) => {
     const expect: Record<string, string> = {};
     for (const [c, [src, want]] of Object.entries(cells)) {
-      await Deno.writeTextFile(`${dir}/${D}/${name}/${c}.vl`, src + "\n");
+      await Deno.writeTextFile(
+        `${dir}/${D}/${name}/${c}.vl`,
+        src.split("\n").map((l) => `//! ${l}`).join("\n") + "\n",
+      );
       expect[c] = want;
     }
     await Deno.writeTextFile(
@@ -127,7 +194,12 @@ Deno.test({
         cwd: dir,
         stdout: "piped",
         stderr: "piped",
-        env: nativeEnv({ NO_COLOR: "1", JOBS: "2", VL, ...extra }),
+        env: nativeEnv({
+          NO_COLOR: "1",
+          JOBS: "2",
+          VL: `${dir}/stubvl`,
+          ...extra,
+        }),
       }).output();
       return { code, out: dec.decode(stdout) + dec.decode(stderr) };
     };
@@ -213,6 +285,8 @@ Deno.test({
           "loud check reject",
           "loud emit reject",
           "trap_loads",
+          "check-clean invalid wasm",
+          "compiler trap",
         ]
       ) {
         if (!base.includes(`"class": "${cls}"`)) {

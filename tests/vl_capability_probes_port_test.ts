@@ -12,6 +12,9 @@
 // path (more probes than the port grades in-process) and the in-process one; a named
 // `--compiler`; and an empty probe directory. A one-word mutation of the port must red.
 //
+// The two TIMEOUT probes are graded alone under a 10 s bound; the rest run under 60 s, which
+// only a starved machine could reach, so load cannot turn an answering probe into a TIMEOUT.
+//
 // Where they cannot agree, pinned below rather than left as prose:
 //   1. An argument error: both exit 2; the Python's argparse writes to stderr, the port's
 //      usage text goes to stdout, because VL has no stderr sink.
@@ -104,8 +107,6 @@ const PROBES: Record<string, string> = {
     "//! run-err: call stack exhausted\\nInvalid input WebAssembly code\\n",
     "",
   ].join("\n"),
-  "o-timeout-run.vl": "// Should print 1.\n//! run-sleep: 30\n",
-  "p-timeout-check.vl": "//! run-rc: 1\n//! run-out: partial\\n\n//! check-sleep: 30\n",
   "q-scenery.vl": [
     "//! run-rc: 1",
     "//! run-err: Error: emit error  \\nChecked 3 files, no errors.\\nFound 2 errors.\\n[ERROR]:\\nfoo.vl:1:2:   the real cause\\n",
@@ -125,6 +126,16 @@ const PROBES: Record<string, string> = {
   ].join("\n"),
 };
 
+// The two probes that answer by never answering. They are graded alone, in a tree of their
+// own and under a bound long enough that no probe that DOES answer can be starved into one,
+// so the other seventeen are graded with a bound they cannot reach at all.
+const TIMEOUTS: Record<string, string> = {
+  "o-timeout-run.vl": "// Should print 1.\n//! run-sleep: 600\n",
+  "p-timeout-check.vl": "//! run-rc: 1\n//! run-out: partial\\n\n//! check-sleep: 600\n",
+};
+const SLOW = "10";
+const FAST = "60";
+
 // Probes no green run can hold: dropped for the green cases.
 const RED = [
   "e-wrong.vl",
@@ -137,8 +148,6 @@ const RED = [
   "l-silent-none.vl",
   "m-trap.vl",
   "n-trap-inv.vl",
-  "o-timeout-run.vl",
-  "p-timeout-check.vl",
   "q-scenery.vl",
   "r-live.vl",
   "s-drift.vl",
@@ -159,7 +168,7 @@ const SITES = [
   ),
 ];
 
-const tree = async (dir: string) => {
+const tree = async (dir: string, probes: Record<string, string> = PROBES) => {
   await Deno.mkdir(`${dir}/${P}`, { recursive: true });
   await Deno.mkdir(`${dir}/compiler`, { recursive: true });
   await Deno.mkdir(`${dir}/scripts/vl-host/target/release`, { recursive: true });
@@ -170,7 +179,7 @@ const tree = async (dir: string) => {
   const stub = `${dir}/scripts/vl-host/target/release/vl`;
   await Deno.writeTextFile(stub, STUB);
   await Deno.chmod(stub, 0o755);
-  for (const [n, src] of Object.entries(PROBES)) {
+  for (const [n, src] of Object.entries(probes)) {
     await Deno.writeTextFile(`${dir}/${P}/${n}`, src);
   }
   await Deno.writeTextFile(`${dir}/${P}/live-sites.json`, JSON.stringify({ sites: SITES }));
@@ -191,13 +200,16 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_capability_probes_port_" });
+    const dirT = await Deno.makeTempDir({ prefix: "vl_capability_probes_port_t_" });
+    let cwd = dir;
+    let bound = FAST;
     const spawn = async (cmd: string, args: string[]): Promise<Out> => {
       const { code, stdout, stderr } = await new Deno.Command(cmd, {
         args,
-        cwd: dir,
+        cwd,
         stdout: "piped",
         stderr: "piped",
-        env: nativeEnv({ NO_COLOR: "1", JOBS: "2", VL, VL_PROBE_TIMEOUT: "2" }),
+        env: nativeEnv({ NO_COLOR: "1", JOBS: "2", VL, VL_PROBE_TIMEOUT: bound }),
       }).output();
       return { code, out: dec.decode(stdout) + dec.decode(stderr) };
     };
@@ -219,6 +231,23 @@ Deno.test({
       return p.out;
     };
     try {
+      // The probes that never answer, alone, under the bound that lets them time out.
+      await tree(dirT, TIMEOUTS);
+      cwd = dirT;
+      bound = SLOW;
+      const slow = await agree("the timeouts", [], 1);
+      for (
+        const v of [
+          `TIMEOUT: no answer in ${SLOW}s`,
+          `TIMEOUT: check gave no answer in ${SLOW}s`,
+        ]
+      ) {
+        if (!slow.includes(v)) {
+          throw new Error(`the fixture must reach \`${v}\`; the report is:\n${slow}`);
+        }
+      }
+      cwd = dir;
+      bound = FAST;
       await tree(dir);
       const all = await agree("the report", [], 1);
       for (
@@ -232,8 +261,6 @@ Deno.test({
           "SILENT (check rc 0): type mismatch: expected i32",
           "SILENT (check rc 0): the last line",
           "COMPILER TRAP (check rc 0): wasm backtrace:",
-          "TIMEOUT: no answer in 2s",
-          "TIMEOUT: check gave no answer in 2s",
           "emit refuses: the real cause",
         ]
       ) {
@@ -292,6 +319,7 @@ Deno.test({
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
+      await Deno.remove(dirT, { recursive: true });
     }
   },
 });
