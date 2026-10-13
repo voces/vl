@@ -182,13 +182,8 @@ run "arena-scan budget"        "$PY" scripts/scan-budget.py --check
 # exhaustive over it or its default NAMES what it excludes. Also re-derives the lint's
 # copy of every closed set from the `export type` that declares it and FAILS on drift.
 run "kind-ladder budget"       "$PY" scripts/ladder-budget.py --check
-# The sentinel-index RATCHET, fourth of the same shape: a table read whose index came
-# from a reader that can answer in band is bound-tested, or takes a reader whose miss
-# cannot be a real row. Four compiler TRAPS of that shape landed on 2026-09-03 — `vl
-# check` rc 0, then an anonymous out-of-bounds read inside the seed (D1440, D1462, D1500
-# and #2498 — and docs/internals/sentinel-index-lint.md for the controls). Held by the
-# lint itself, like the interp row below.
-run "sentinel-index budget"    "$VL" check --budget scripts/sentinel-budget-baseline.json --compiler "$SEED"
+# The sentinel-index RATCHET, fourth of the same shape, is held inside "lint-self + fmt":
+# it counts the findings that row's compiler-graph run already produced (`--findings`).
 # The dead-export RATCHET, fifth of the same shape: `unused-function` exempts an exported
 # declaration ("public surface"), so for a tree whose only consumer is itself the export
 # list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,

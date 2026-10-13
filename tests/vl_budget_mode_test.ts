@@ -228,3 +228,52 @@ Deno.test({
     }
   },
 });
+
+// `--findings` COUNTS A `--json` REPORT INSTEAD OF WALKING. A report with one finding more
+// than a file's baseline reds on exactly that file; an out-of-target file is ignored.
+Deno.test({
+  name: "vl check --budget --findings counts a report, not a walk",
+  ignore: !ENABLED,
+  async fn() {
+    const base = JSON.parse(
+      await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
+    );
+    const code = "sentinel-index-unguarded";
+    const at = (file: string, n: number) =>
+      Array.from(
+        { length: n },
+        (_, i) => ({ file, code, line: i + 1, col: 1 }),
+      );
+    const dir = await Deno.makeTempDir({ prefix: "vl_budget_findings_" });
+    try {
+      const baselinePath = `${ROOT}/scripts/sentinel-budget-baseline.json`;
+      const file = "compiler/emit_classify.vl";
+      const was = base.files[file][code];
+      const ok = `${dir}/ok.json`;
+      await Deno.writeTextFile(
+        ok,
+        JSON.stringify([...at(file, was), ...at("std/fs.vl", 5)]),
+      );
+      const good = await vl(["--budget", baselinePath, "--findings", ok]);
+      expectEq("at baseline: exit", 0, good.code);
+      const bad = `${dir}/bad.json`;
+      await Deno.writeTextFile(bad, JSON.stringify(at(file, was + 1)));
+      const red = await vl(["--budget", baselinePath, "--findings", bad]);
+      expectEq("one over: exit", 1, red.code);
+      expectEq(
+        "one over: names the file",
+        true,
+        red.out.includes(`${file}  ${code}: ${was + 1} (baseline ${was})`),
+      );
+      const refused = await vl([
+        "--budget-why",
+        baselinePath,
+        "--findings",
+        ok,
+      ]);
+      expectEq("--budget-why refuses --findings", 2, refused.code);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

@@ -189,6 +189,9 @@ if [ "$GRAPH_FILES" -lt 2 ]; then
   echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
   exit 1
 fi
+# The sentinel-index ratchet counts the findings this graph run already produced, rather
+# than walking compiler/ a second time (`--findings`, the same `--include-imports` report).
+"$VL" check --budget scripts/sentinel-budget-baseline.json --findings "$WORK/graph.json" || exit $?
 [ "$FMT_RC" = 0 ] || exit "$FMT_RC"
 
 echo "self-lint + fmt-check clean ✅"
