@@ -27,7 +27,8 @@ restate measurements; follow the links.
 | L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
 | L4–L14 | not started | |
-| SMALL S-a … S-n | not started | |
+| SMALL S-c front-end tidy | **partial** | `typecheck.vl` imports `./ast` once (byte-identical seed). Not byte-identical, so not done: the second `Tok` (the lexer's has no `pos`), the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check). `await` skipped: a surface decision. |
+| SMALL S-a, S-b, S-d … S-n | not started | |
 | RepDesc rulings | **open** since 2026-09-06 | `open-rulings.md`: `one-literal-union-rep`, `nullable-rep-rule-stated-once` |
 
 Update this table in the PR that moves an item.
