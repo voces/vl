@@ -47068,6 +47068,86 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
   true
 }
 
+// Instantiates a generic function passed to an un-annotated parameter at the arguments the
+// body calls that parameter with (`take(same)` where `take` calls `a("x")`): binding `vNames[k]`
+// to `same<T>`'s open signature would leave every call of the hole typed `T` (D4420). Kept
+// generic when a call is unpinned or two calls disagree, which the emitter still refuses.
+function instGenFnHolePins(
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  hNames: string[],
+  hArgNode: i32[],
+) {
+  if calleeFn < 0 { return 0 }
+  let k = 0
+  while k < vNames.length {
+    const vt = vTys[k]
+    if vt >= 0 && vt < T.tys.length && tyHasTyVar(vt) {
+      const vf = T.tys[vt]
+      if (
+        vf is TyFunc
+        && argIsOwnGenericFnValue(holeArgNodeOf(vNames[k], hNames, hArgNode))
+      ) {
+        const inst = genFnHoleInstance(vNames, vTys, k, vt, calleeFn)
+        if inst >= 0 { vTys[k] = inst }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The argument node bound to hole `name` at this call, or -1.
+function holeArgNodeOf(name: string, hNames: string[], hArgNode: i32[]): i32 {
+  let q = 0
+  while q < hNames.length {
+    if hNames[q] == name { return hArgNode[q] }
+    q = q + 1
+  }
+  -1
+}
+
+// `vt` instantiated at every argument the callee's body passes when calling hole `vNames[k]`,
+// or -1 when there is no such call, an argument is still open, or two calls disagree.
+function genFnHoleInstance(
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  vt: i32,
+  calleeFn: i32,
+): i32 {
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) { return -1 }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  let seen = false
+  let ci = 0
+  while ci < argCstr.at.length {
+    if cstrOwnedBy(argCstr.fn[ci], calleeFn) && argCstr.form[ci] > 0 {
+      const row = hdRowOf(argCstr.exp[ci])
+      if row >= 0 && hdKind[row] == HD_PARAM && hdBase[row] >= 0 {
+        const bt = T.tys[hdBase[row]]
+        if bt is TyVar && bt.tvName == vNames[k] {
+          const pj = hdInner[row]
+          if pj < 0 || pj >= vf.fnParamTypes.length { return -1 }
+          const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
+          if rat < 0 || tyHasTyVar(rat) || tyIsDeferredJoin(rat) { return -1 }
+          bindGenWalk(vf.fnParamTypes[pj], rat, gNames, gTys)
+          const want = substTyDeep(vf.fnParamTypes[pj], gNames, gTys)
+          if tyHasTyVar(want) || !assignable(rat, want) { return -1 }
+          seen = true
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  if !seen { return -1 }
+  const inst = substTyDeep(vt, gNames, gTys)
+  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst
+}
+
 // The argument each bare-hole parameter came from, as three parallel arrays keyed by the
 // parameter's type-variable name — a deferred constraint is reported at the call but is about
 // one argument, which only the call site knows. `selfOff` is 1 for the UFCS spelling, whose
@@ -53259,6 +53339,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       substNestMode = SUBST_ALL
     }
     const wsVd = T.diags.length
+    instGenFnHolePins(vNames, vTys, cstrCallee, dhNames, dhArgNode)
     callBindNote(ix, vNames, vTys)
     pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
     if fsbName.length > 0 {
