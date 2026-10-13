@@ -576,6 +576,37 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      D4013, turns seven of D3939's `rv3498` refusals (a cell a shared closure writes with a
      generic) into runs, and files D4305–D4308. It retires nothing yet: the coercions it
      adds are the ones the table's let slot will own.
+   - Second PR: the retirements, tried by deletion. Each site was replaced with its
+     no-answer stub (`-1`, `false`, an empty list) and graded on the outputs of 15,331 files
+     (tests/cases, the distilled cells and named). Nothing could be deleted. The table is
+     still shadow-only (`ffMode` 0), so no site has a reader to hand its answer to, and
+     each one still decides at least one fixture. The stubs moved the files shown below:
+
+     | site | files moved | runs lost | a witness that needs it |
+     | --- | --- | --- | --- |
+     | `monoPinLamFromPeer` | 5 | 3 | closures/hole-lambda-peer-through-cell-read |
+     | `monoAssignedPeerFe` | 3 | 2 | closures/hole-lambda-cell-seeded-from-cell-mutate-then-read |
+     | `monoInitPeerFe` | 2 | 2 | closures/hole-lambda-cell-takes-instance-type |
+     | `monoTargetPeerFe` | 3 | 2 | closures/hole-lambda-cell-takes-instance-type |
+     | `monoCoerceWrittenLet` | 22 | 2 | closures/written-let-of-generics-called-after-another-instance |
+     | `monoCoerceWrittenCell` | 36 | 20 | closures/captured-cell-shared-writer-alias |
+     | `monoAliasChainLamFe` | 19 | 13 | closures/hole-lambda-alias-mutate-then-read |
+     | `monoGenFnAliasChainFe` | 8 | 3 | generics/alias-chain-of-generic-function |
+     | `monoAliasChainWritten` | 4 | 0, wrong values | closures/hole-lambda-let-alias-after-write (`aC` for `aE`) |
+     | `monoRespellLamAlias` | 4 | 2 | closures/hole-lambda-binding-one-signature |
+     | `monoCallWrittenLet` | 5 | 1 | closures/written-let-called-at-string-literal-union-and-string |
+     | `monoCapturedLamFe` | 5 | 2 | generics/hole-lambda-calls-per-instance |
+     | `monoNameIsParamOnChain` | 3 | 3 | closures/captured-cell-written-parameter-of-t |
+     | `monoNamesUsedAsValue` | 704 | 151 | functions/value-flow-mono-module-scope |
+     | `monoInstLamNames` + `monoInstGenAliasNames` | 15 | 7 | closures/captured-lambda-alias-call |
+     | `monoLamCallByName` | 6 | 0, same values | larger modules: it is a direct-call rename, not a decision |
+     | `monoCellTyIsOpen` gate | 2 | 2 | closures/capture-by-reference |
+
+     These sites retire when the let and cell slots become the deciding reader. Until then,
+     deleting one costs the fixture in the last column. One name-keyed lookup did move:
+     `monoCellFnTyNameAt` finds its cell by `identDeclOf` on the read, not `monoLetFrameOf`
+     on the name, and the outputs are byte-identical on all 15,331 files. Its open-type gate
+     stays, because capture-by-reference needs it.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
