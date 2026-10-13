@@ -76,7 +76,7 @@
 // AND requires the vl binary + seed wasm + `wasm-opt` + `wasm-dis`; absent any,
 // every case registers ignored with a one-line how-to-build note.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./tree.ts";
+import { COMPILER, exists, hostWasmDis, nativeEnv, ROOT, VL, binaryen } from "./tree.ts";
 // Re-exported so the four `selfhost_native_release*` suites keep importing them
 // from here; the derivation itself is tree.ts's.
 export { binaryen, COMPILER, exists, nativeEnv, ROOT, VL };
@@ -766,7 +766,7 @@ export const vl = async (args: string[], env: Record<string, string> = {}) => {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ VL_WASM_OPT: WASM_OPT, VL_WASM_DIS: WASM_DIS, ...env }),
+    env: nativeEnv({ VL_WASM_OPT: WASM_OPT, VL_WASM_DIS: hostWasmDis(), ...env }),
   }).output();
   return {
     code,

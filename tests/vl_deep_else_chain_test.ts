@@ -19,7 +19,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, binaryen } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen, hostWasmDis } from "./support/tree.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -75,7 +75,7 @@ const vl = async (args: string[]) => {
       NO_COLOR: "1",
       VL_STD: `${ROOT}/std`,
       // binaryen's `wasm-dis` for `--wat`, which is a node script, hence PATH.
-      VL_WASM_DIS: binaryen("wasm-dis"),
+      VL_WASM_DIS: hostWasmDis(),
       PATH: Deno.env.get("PATH") ?? "",
       // node cannot start on Windows without it.
       ...(Deno.build.os === "windows" ? { SYSTEMROOT: Deno.env.get("SYSTEMROOT") ?? "" } : {}),
