@@ -1005,7 +1005,7 @@ Grading: `tests/cases/literal-unions/*` (121 modules), plus the oracle's LEFT-ON
 `tyKindOf` and at `vtKindOfType`, which must fall to 0 under (a) or (c) and is permanent
 under (b).
 
-### nullable-rep-rule-stated-once — can niche-vs-box be one rule instead of eleven arms?
+### nullable-rep-rule-stated-once — can niche-vs-box be one rule instead of eleven arms? — RULED 2026-10-13: (b)
 
 Raised 2026-09-06 by the same campaign. **Nothing is broken while this waits**; the eleven
 arms are individually correct, and the per-rep audit's own finding is that a ladder naming
@@ -1032,6 +1032,8 @@ exhaustiveness check), so a twelfth shape breaks the self-compile rather than fa
 through. Cheaper, and it buys the same *safety* without the same *simplicity*.
 (c) Leave it. The eleven arms are correct and the audit that found them is the standing
 instrument.
+
+**Ruling (owner, 2026-10-13): (b).** `repOfNullable` becomes a `_`-less `match` over the inner variant, so a twelfth nullable shape breaks the self-compile rather than falling through. (a) stays the better end state and is not ruled out for later.
 
 **Recommendation: (b) now, (a) as the campaign reaches step 5 of its order.** The measured
 hazard is a MISSING arm, not a wrong one — `nulvariant` had no rung (#2400) and
@@ -1503,6 +1505,12 @@ Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewh
 ---
 
 ## Ruled — decisions taken, kept here so they are not re-swept
+
+### `optimizer-location` (refactor plan L10) — RULED 2026-10-13: (A), the optimizer is a VL pass
+
+**Ruling (owner, 2026-10-13, (A)).** `-O` becomes a VL compiler pass for every host, so the
+Deno and playground hosts gain it. The Rust optimizer retires after a byte-identical,
+rung-by-rung port. The plan is `docs/internals/optimizer-in-vl.md`.
 
 ### `-O`/`-O3` without `wasm-opt` — RULED 2026-08-03, shipped as #1339
 

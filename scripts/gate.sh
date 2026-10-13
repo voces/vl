@@ -182,16 +182,24 @@ run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler 
 # what stops a whole-program scan being added outside a pass. #2419's class.
 run "arena-scan budget"        "$VL" check --budget scripts/scan-budget-baseline.json --compiler "$SEED"
 # The kind-ladder RATCHET, third of the same shape: a ladder over a closed kind set is
-# exhaustive over it or its default NAMES what it excludes. Also re-derives the lint's
-# copy of every closed set from the `export type` that declares it and FAILS on drift.
-run "kind-ladder budget"       "$PY" scripts/ladder-budget.py --check
+# exhaustive over it or its default NAMES what it excludes. Its twin row re-derives the
+# lint's copy of every closed set from the `export type` that declares it and FAILS on drift.
+run "kind-ladder budget"       "$VL" check --budget scripts/ladder-budget-baseline.json --compiler "$SEED"
+run "kind-ladder sets"         "$VL" run scripts/ladder-sets.vl --compiler "$SEED"
 # The sentinel-index RATCHET, fourth of the same shape, is held inside "lint-self + fmt":
 # it counts the findings that row's compiler-graph run already produced (`--findings`).
 # The dead-export RATCHET, fifth of the same shape: `unused-function` exempts an exported
 # declaration ("public surface"), so for a tree whose only consumer is itself the export
 # list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
-# unlike the four above, because the tree reached zero in the PR that added it.
-run "dead-export budget"       "$PY" scripts/export-budget.py --check
+# unlike the four above, because the tree reached zero in the PR that added it. No lint
+# sees a reference from another tree, so scripts/dead-exports.vl writes the report and
+# `vl check --budget --findings` counts it.
+dead_export_budget() {
+  "$VL" run scripts/dead-exports.vl --compiler "$SEED" -- --out "$LOGS/dead-exports.json" &&
+    "$VL" check --budget scripts/export-budget-baseline.json \
+      --findings "$LOGS/dead-exports.json" --compiler "$SEED"
+}
+run "dead-export budget"       dead_export_budget
 # The prefer-interpolation RATCHET, sixth of the same shape and the first held by the
 # lint itself: `vl check --budget` walks the baseline's own targets in one process and
 # compares per-file counts (architecture-refactor-plan T2); `--write-baseline` rewrites
