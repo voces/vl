@@ -545,8 +545,8 @@ call or a hole field, with no bound test before it. Each rewrite gets simpler on
    question from `lint-rule-scope.md`.)
 2. **The four comment rules** exercise the token and comment layer.
    `comment-budget.py --check` must read the same `0 / 0 / 0 / 0` before and after. The
-   ratchet then grades `vl check --json` output, as `interp-budget.py` already does, and
-   its own walk is deleted.
+   ratchet then grades the rule's own output, as `vl check --budget` already does for
+   interp, and its own walk is deleted.
 3. **`std-comment-audience`** is the same shape, gated at zero.
 4. **`arena-scan-outside-pass`** is structural and single-file, and must read 87 before
    and after.

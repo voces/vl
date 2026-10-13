@@ -14,7 +14,7 @@
 // scoping bug would otherwise show up as silence under `compiler/` and noise
 // everywhere else rather than as a red here. Both paths are checked RELATIVE to a
 // temp root, since the scope is a target rooted at `compiler/` — the shape
-// `lint-self.sh`'s `vl check compiler/entry.vl` and `scripts/interp-budget.py`
+// `lint-self.sh`'s `vl check compiler/entry.vl` and `vl check --budget`
 // produce — not a `/compiler/` anywhere.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary +
