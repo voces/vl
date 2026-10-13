@@ -9,9 +9,9 @@ Owner directive 2026-10-13: no Python in the repo; tooling is written in VL. Cen
 
 | Class | Meaning | Files | Lines |
 | --- | --- | --- | --- |
-| G | a gate row in `scripts/gate.sh` / `ci.yml`, or a shell script those run | 11 | 3,159 |
+| G | a gate row in `scripts/gate.sh` / `ci.yml`, or a shell script those run | 9 | 2,794 |
 | T | run or read by a test under `tests/` | 17 | 6,328 |
-| I | imported by a G/T file (a D file importing it keeps it D) | 11 | 2,896 |
+| I | imported by a G/T file (a D file importing it keeps it D) | 12 | 3,119 |
 | D | named as a procedure in `CLAUDE.md`, a README, `REPRODUCE.md`, a docs tool table or a fixture header | 122 (48 are `bench/*/main.py`) | 14,745 |
 | X | nothing reaches it; deleted in this PR | 72 | 17,419 |
 
@@ -34,9 +34,9 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 3 | `kind-ladder budget` | `ladder-budget.py`, `ladder-census.py` | `ladder-budget.vl` |
 | 4 | `dead-export budget` | `export-budget.py` | `export-budget.vl` |
 | 5 | `render-parse budget` | `render-parse-budget.py` | `render-parse-budget.vl` |
-| 6 | `splice scan` | `inventory/splice-scan.py`, `inventory/rows.py` | `inventory/splice-scan.vl` |
+| 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/rows.py` stays (reached by `ls.py`, `split.py`, `selftest.py`) | `inventory/rows.vl` with them |
 | 7 | `lint-self.sh` (`--filter-lint`, `--exempt-codes`, `matrix.py`) | the budgets above, `capability-probes/matrix.py` | falls out of rows 1-3, plus `matrix.vl` |
-| 8 | `refresh-compiler.sh` | `seed_provenance.py` | `seed-provenance.vl` |
+| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` stays, imported by `check-filed-witnesses.py` and `survey-regrade.py` | deleted with those two |
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
 | - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `.py` kept as port-test oracle | delete `plumb-shape-cost.py`, `check-filed-witnesses.py` (+ `inventory/{ls,split,selftest}.py`, `sabotage.py`), `capability-probes/run.py`, `distilled/{regress,index,cellmap,redistil}.py` (+ `gradecensus.py`, `corpuscmp.py`), `survey-regrade.py`, `grade.py`, `profile-rank.py` with their port tests |
 
@@ -54,12 +54,11 @@ heredoc and moves with its own PR.
 | `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | ported: `scripts/capability-probes.vl` is on master; delete with its port test's oracle |
 | `scripts/comment-budget.py` | 483 | G | .github/workflows/ci.yml scripts/gate.sh (+1) | scripts/comment-budget.vl |
 | `scripts/export-budget.py` | 199 | G | .github/workflows/ci.yml scripts/gate.sh | scripts/export-budget.vl |
-| `scripts/inventory/splice-scan.py` | 142 | G | scripts/gate.sh | scripts/inventory/splice-scan.vl |
 | `scripts/ladder-budget.py` | 276 | G | scripts/gate.sh scripts/lint-self.sh | scripts/ladder-budget.vl |
 | `scripts/ratchet.py` | 282 | G | scripts/gate.sh | scripts/ratchet.vl (shared by the 7 budgets) |
 | `scripts/render-parse-budget.py` | 167 | G | .github/workflows/ci.yml scripts/gate.sh | scripts/render-parse-budget.vl |
 | `scripts/scan-budget.py` | 249 | G | scripts/gate.sh scripts/lint-self.sh | scripts/scan-budget.vl |
-| `scripts/seed_provenance.py` | 223 | G | scripts/refresh-compiler.sh | scripts/seed-provenance.vl |
+| `scripts/seed_provenance.py` | 223 | I | scripts/check-filed-witnesses.py scripts/survey-regrade.py | ported: `scripts/seed-provenance.vl` is on master; delete with those two |
 | `scripts/silent-sweep/distilled/regress.py` | 177 | G | scripts/lint-self.sh | ported: `scripts/silent-sweep/distilled/regress.vl` is on master; delete with its port test's oracle |
 
 ### T: tests
@@ -91,7 +90,7 @@ heredoc and moves with its own PR.
 | `scripts/day-one/grammar.py` | 802 | I | scripts/day-one/sample.py | scripts/day-one/grammar.vl |
 | `scripts/day-one/imports.py` | 168 | I | scripts/day-one/sample.py | scripts/day-one/imports.vl |
 | `scripts/day-one/render.py` | 541 | I | scripts/day-one/modules.py | scripts/day-one/render.vl |
-| `scripts/inventory/rows.py` | 120 | I | scripts/inventory/ls.py | scripts/inventory/rows.vl |
+| `scripts/inventory/rows.py` | 120 | I | scripts/inventory/ls.py (+2) | scripts/inventory/rows.vl |
 | `scripts/inventory/selftest.py` | 127 | I | scripts/inventory/split.py | scripts/inventory/selftest.vl |
 | `scripts/inventory/split.py` | 388 | I | scripts/check-filed-witnesses.py | scripts/inventory/split.vl |
 | `scripts/profile-rank.py` | 98 | I | scripts/survey-regrade.py | scripts/profile-rank.vl |
