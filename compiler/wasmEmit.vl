@@ -4961,13 +4961,16 @@ function emitNarrowedNicheRead(
     fbIf(127) // 0x04 if, 0x7f i32 result blocktype
     fbI32Const(0 - 1) // the null sentinel
     fbElse()
-    const savedLU = pendingLitUnion
-    const savedNLU = pendingNulLitUnion
-    pendingLitUnion = 0
-    pendingNulLitUnion = false
+    const nicheSaved = expCtxHere()
+    const nicheIn = expCtxHere()
+    nicheIn.litUnion = 0
+    nicheIn.nulLitUnion = false
+    expCtxApply(nicheIn)
     const rc3 = emitStashedStrToAtomChain(body, st, texts, 0, fnIx)
-    pendingLitUnion = savedLU
-    pendingNulLitUnion = savedNLU
+    const nicheOut = expCtxHere()
+    nicheOut.litUnion = nicheSaved.litUnion
+    nicheOut.nulLitUnion = nicheSaved.nulLitUnion
+    expCtxApply(nicheOut)
     if rc3 < 0 { return -1 }
     fbEnd()
     return 0
@@ -5150,14 +5153,12 @@ function emitEmptyArrUnionArm(
   }
   if tag < 0 { return 0 }
   fbI32Const(tag)
-  const savedK = pendingListKind
-  const savedS = pendingListSlot
-  pendingListKind = emptyArrUnionArmBuildKind(exprIx)
-  pendingListSlot = emptyArrUnionArmSlot(exprIx)
-  if pendingListSlot < 0 { pendingListSlot = 0 }
+  let emptySlot = emptyArrUnionArmSlot(exprIx)
+  if emptySlot < 0 { emptySlot = 0 }
+  const emptyKind = emptyArrUnionArmBuildKind(exprIx)
+  const savedBuild = expCtxSwapListBuild(emptyKind, emptySlot)
   const rc = emitExpr(body, exprIx, fnIx)
-  pendingListKind = savedK
-  pendingListSlot = savedS
+  expCtxRestoreListBuild(savedBuild)
   if rc < 0 { return -1 }
   fbStructNew(uBoxIdx) // { tag, list-wrapper ref }
   1
@@ -5248,13 +5249,9 @@ function emitUnionListLitViaRefArm(
       return emitFail("emitProgram: boolean list arm has no tag")
     }
     fbI32Const(armTag)
-    const savedK = pendingListKind
-    const savedS = pendingListSlot
-    pendingListKind = LBK_UNION
-    pendingListSlot = armSlot
+    const savedBuild = expCtxSwapListBuild(LBK_UNION, armSlot)
     const rc = emitExpr(body, exprIx, fnIx)
-    pendingListKind = savedK
-    pendingListSlot = savedS
+    expCtxRestoreListBuild(savedBuild)
     if rc < 0 { return -1 }
     fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
     return 1
@@ -5286,13 +5283,9 @@ function emitUnionNestedListLit(
       return emitFail("emitProgram: boolean list arm has no tag")
     }
     fbI32Const(nestTag)
-    const savedK = pendingListKind
-    const savedS = pendingListSlot
-    pendingListKind = LBK_REF
-    pendingListSlot = armSlot
+    const savedBuild = expCtxSwapListBuild(LBK_REF, armSlot)
     const rc = emitExpr(body, exprIx, fnIx)
-    pendingListKind = savedK
-    pendingListSlot = savedS
+    expCtxRestoreListBuild(savedBuild)
     if rc < 0 { return -1 }
     fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
     return 1
@@ -13139,13 +13132,9 @@ function emitIndex(body: u8[], idxIx: i32, fnIx: i32) {
       P.nodes[unwrapParen(nd.idxArr)] is ArrayLit
       && pendingListKind != LBK_I32_LIST
     ) {
-      const svKind = pendingListKind
-      const svSlot = pendingListSlot
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
+      const savedBuild = expCtxSwapListBuild(LBK_I32_LIST, 0)
       const r = emitIndexGo(body, idxIx, fnIx)
-      pendingListKind = svKind
-      pendingListSlot = svSlot
+      expCtxRestoreListBuild(savedBuild)
       return r
     }
   }
@@ -13164,10 +13153,10 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
     if nsk != null {
       if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
       wU8(212) // 0xd4 ref.as_non_null (the `!= null` guard makes this safe)
-      const savedNslF32 = pendingF32
-      pendingF32 = false
-      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-      pendingF32 = savedNslF32
+      const nslF32 = expCtxSwapF32(false)
+      const nslRc = emitExpr(body, nd.idxIndex, fnIx)
+      expCtxSwapF32(nslF32)
+      if nslRc < 0 { return -1 }
       if nsk == "nulstrlist" {
         emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
         fbArrayGet(mkArrIdx) // 0xfb 0x0b string backing
@@ -13224,10 +13213,10 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
       // a bare index literal emits as `f32.const`. This matters for an inner read `g[i][j]`
       // over an `f32[][]`: the outer f32 read leaves `pendingF32` set while emitting this
       // receiver, so the inner `[j]` would otherwise inherit a context that is not its own.
-      const savedRlIxF32 = pendingF32
-      pendingF32 = false
-      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-      pendingF32 = savedRlIxF32
+      const rlIxF32 = expCtxSwapF32(false)
+      const rlIxRc = emitExpr(body, nd.idxIndex, fnIx)
+      expCtxSwapF32(rlIxF32)
+      if rlIxRc < 0 { return -1 }
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read. A list that may be
       // a view reads its element through the view's source (D3041).
       if rlHz >= 0 {
@@ -13336,10 +13325,10 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
         if emitExpr(body, nd.idxArr, fnIx) < 0 { return -1 }
       }
       // The index is always i32 (see the ref-array arm above).
-      const savedIxF32 = pendingF32
-      pendingF32 = false
-      if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
-      pendingF32 = savedIxF32
+      const ixF32 = expCtxSwapF32(false)
+      const ixRc = emitExpr(body, nd.idxIndex, fnIx)
+      expCtxSwapF32(ixF32)
+      if ixRc < 0 { return -1 }
       // A list that may be a view reads its element through the view's source (D3028).
       const ixSv = svDstOfKind(ek)
       if ixSv >= 0 && skHz < 0 { return emitSvIndexRead(ek, ixSv) }
@@ -17676,16 +17665,9 @@ function widenClassifyExpr(exprIx: i32, fnIx: i32) {
 // `pendingI64`/`pendingF32`/`pendingF64` are a property of one literal position, not the
 // subtree around it — left on, every integer literal inside (an array index, a map key, a `.slice` bound) takes the wide form while its own slot is still i32: `vl check` rc 0, invalid module.
 function emitExprWideCleared(body: u8[], ix: i32, fnIx: i32) {
-  const savedI64 = pendingI64
-  const savedF32 = pendingF32
-  const savedF64 = pendingF64
-  pendingI64 = false
-  pendingF32 = false
-  pendingF64 = false
+  const saved = expCtxClearWidths()
   const r = emitExpr(body, ix, fnIx)
-  pendingI64 = savedI64
-  pendingF32 = savedF32
-  pendingF64 = savedF64
+  expCtxRestoreWidths(saved)
   r
 }
 
@@ -20382,10 +20364,9 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
         } else if callee.identName == "__store_i64__" {
           if emitExprAsI64(body, msVal, fnIx) < 0 { return -1 }
         } else if callee.identName == "__store_f32__" {
-          const savedStF32 = pendingF32
-          pendingF32 = true
+          const savedStF32 = expCtxSwapF32(true)
           const stRc = emitExprAsF32(body, msVal, fnIx)
-          pendingF32 = savedStF32
+          expCtxSwapF32(savedStF32)
           if stRc < 0 { return -1 }
         } else {
           if emitExprAsF64(body, msVal, fnIx) < 0 { return -1 }
@@ -20548,10 +20529,14 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
                   + " takes a u8[] but the u8 list type was not collected",
               )
             }
-            const savedFsLK = pendingListKind
-            pendingListKind = LBK_U8_LIST
+            const fsSaved = expCtxHere()
+            const fsIn = expCtxHere()
+            fsIn.listKind = LBK_U8_LIST
+            expCtxApply(fsIn)
             const fsRc = emitExprWideCleared(body, c.callArgs[fsA], fnIx)
-            pendingListKind = savedFsLK
+            const fsOut = expCtxHere()
+            fsOut.listKind = fsSaved.listKind
+            expCtxApply(fsOut)
             if fsRc < 0 { return -1 }
           } else {
             if fsArgIsI64(fsK, fsA) {
@@ -20955,7 +20940,7 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
         // interned i32 atom id, and a `null` argument into a `K | null` param as the
         // sentinel `-1` — without them a string ref reached an i32 param slot, invalid
         // wasm with `vl check` clean, in every function-value shape.
-        let clu = cloCallParamLitUnion(callIx, i)
+        let clu = cloCallParamLitUnion(callIx, i, fnIx)
         // An un-annotated parameter pinned at a literal union has a hole in the callee's type,
         // so the `i` token is the only word, and an atom argument makes it the atom (D3076).
         if clu == 0 && (pkk == "i32" || pkk == null) {
@@ -22192,11 +22177,9 @@ function emitPushMany(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
       }
       fbLocalSet(recvS)
       const lst = spreadRunLit(c.callArgs, callIx, c.pos)
-      pendingListKind = pendingKindOfMf(kk, row)
-      pendingListSlot = row
+      expCtxSetListBuild(pendingKindOfMf(kk, row), row)
       if emitExpr(body, lst, fnIx) < 0 { return -1 }
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
+      expCtxSetListBuild(LBK_I32_LIST, 0)
       fbLocalSet(srcS)
       // tot = recv.len + new.len
       fbLocalGet(recvS)
@@ -22423,19 +22406,21 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
         const backIdx = base + 2
         const pushArmOwed = narrowedArmNeedsUnbox(c.callArgs[0], fnIx)
         // V = x  (an f64-list push coerces/encodes the value as f64)
-        pendingStructIdx = pushStructIdx
-        const savedPVI = pendingVariantIdx
-        if pushVariantIdx >= 0 { pendingVariantIdx = pushVariantIdx }
+        const pushSaved = expCtxHere()
+        const pushIn = expCtxHere()
+        pushIn.structIdx = pushStructIdx
+        if pushVariantIdx >= 0 { pushIn.variantIdx = pushVariantIdx }
+        expCtxApply(pushIn)
         if isF64 {
           if emitExprAsF64(body, c.callArgs[0], fnIx) < 0 { return -1 }
         } else if isI64 {
           if emitExprAsI64(body, c.callArgs[0], fnIx) < 0 { return -1 }
         } else if isF32 {
           // an f32-list push coerces/encodes the value as f32 (a float literal re-encodes).
-          const savedPF32 = pendingF32
-          pendingF32 = true
-          if emitExprAsF32(body, c.callArgs[0], fnIx) < 0 { return -1 }
-          pendingF32 = savedPF32
+          const pushF32 = expCtxSwapF32(true)
+          const pushF32Rc = emitExprAsF32(body, c.callArgs[0], fnIx)
+          expCtxSwapF32(pushF32)
+          if pushF32Rc < 0 { return -1 }
         } else if pushUnionNm != "" {
           if emitUnionBoxArg(body, pushUnionNm, c.callArgs[0], fnIx) < 0 {
             return -1
@@ -22487,8 +22472,10 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
         } else {
           if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
         }
-        pendingStructIdx = -1
-        pendingVariantIdx = savedPVI
+        const pushOut = expCtxHere()
+        pushOut.structIdx = -1
+        pushOut.variantIdx = pushSaved.variantIdx
+        expCtxApply(pushOut)
         // the narrowed-arm unbox at the `.push` boundary (D1031) — `xs.push(s)` into a
         // `Circle[]` under `if s is Circle`. The element-literal twin is in `emitArr`; both
         // read the same slot heap, so the two spellings of one store cannot disagree.
@@ -23319,13 +23306,9 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       // receiver chain completes — including its result wrapper — before this store,
       // so the shared frame slots are free to reuse.) The receiver builds at its own type: a
       // list seed the destination threaded is for the result, not the source (D3149).
-      const mfSvKind = pendingListKind
-      const mfSvSlot = pendingListSlot
-      pendingListKind = LBK_I32_LIST
-      pendingListSlot = 0
+      const mfSaved = expCtxSwapListBuild(LBK_I32_LIST, 0)
       const mfRc = emitExpr(body, callee.memObj, fnIx)
-      pendingListKind = mfSvKind
-      pendingListSlot = mfSvSlot
+      expCtxRestoreListBuild(mfSaved)
       if mfRc < 0 { return -1 }
       // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
       // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
@@ -29013,6 +28996,40 @@ function expCtxRestoreWidths(saved: ExpCtx) {
   0
 }
 
+// Sets the f32 literal seed to `want` and returns the seed it replaced, for a second call to
+// put back; no other ambient seed is touched.
+function expCtxSwapF32(want: boolean): boolean {
+  const c = expCtxHere()
+  const was = c.wantF32
+  c.wantF32 = want
+  expCtxApply(c)
+  was
+}
+
+// Sets the literal-union seed to `atom` and returns the seed it replaced, for a second call to
+// put back; no other ambient seed is touched.
+function expCtxSwapLitUnion(atom: i32): i32 {
+  const c = expCtxHere()
+  const was = c.litUnion
+  c.litUnion = atom
+  expCtxApply(c)
+  was
+}
+
+// Sets the list build like `expCtxSetListBuild` and returns the context before it, for
+// `expCtxRestoreListBuild`.
+function expCtxSwapListBuild(kind: i32, slot: i32): ExpCtx {
+  const saved = expCtxHere()
+  expCtxSetListBuild(kind, slot)
+  saved
+}
+
+// Puts back the list build `expCtxSwapListBuild` took from `saved`, leaving every other
+// ambient seed as the emit under it left it.
+function expCtxRestoreListBuild(saved: ExpCtx) {
+  expCtxSetListBuild(saved.listKind, saved.listSlot)
+}
+
 // Sets the list build a list literal builds at: a build code and, for the ref and union
 // codes, the row it builds at. Every other seed stays as it is.
 function expCtxSetListBuild(kind: i32, slot: i32) {
@@ -29527,23 +29544,21 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
     // slot as the `(ref $array)` it is, and each member constant must lower as a string —
     // under `pendingLitUnion` a member literal folds to its interned id instead, so the
     // tower called `strEq` with an i32 operand. Restored on both exits.
-    const savedST = pendingLitUnion
-    pendingLitUnion = 0
+    const savedST = expCtxSwapLitUnion(0)
     let rv = emitExpr(body, ix, fnIx)
     if rv >= 0 {
       fbLocalSet(atomStageSlot)
       rv = emitStagedStrToAtomChain(body, texts, 0, fnIx)
     }
-    pendingLitUnion = savedST
+    expCtxSwapLitUnion(savedST)
     return rv
   }
   // The inner emits run OUTSIDE the atom context: the value re-reads must lower as the
   // string they are (re-entering this arm would not terminate), and the per-member literal
   // must lower as a string CONSTANT, not as its own interned id.
-  const savedLU = pendingLitUnion
-  pendingLitUnion = 0
+  const savedLU = expCtxSwapLitUnion(0)
   const r = emitStrToAtomChain(body, ix, texts, 0, fnIx)
-  pendingLitUnion = savedLU
+  expCtxSwapLitUnion(savedLU)
   r
 }
 
@@ -29611,10 +29626,9 @@ function emitDestStrToAtom(body: u8[], valIx: i32, fnIx: i32, luTy: i32) {
   const ix = unwrapParen(valIx)
   if unionEqOperandOk(ix) {
     // A PLACE: re-read it per member, no slot.
-    const savedRR = pendingLitUnion
-    pendingLitUnion = 0
+    const savedRR = expCtxSwapLitUnion(0)
     const rr = emitStrToAtomChain(body, ix, texts, 0, fnIx)
-    pendingLitUnion = savedRR
+    expCtxSwapLitUnion(savedRR)
     return rr
   }
   if !fnUsesAtomStage {
@@ -29625,10 +29639,9 @@ function emitDestStrToAtom(body: u8[], valIx: i32, fnIx: i32, luTy: i32) {
       "emitProgram: literal-union atom narrowing needs a staging slot that was not reserved",
     )
   }
-  const savedLU = pendingLitUnion
-  pendingLitUnion = 0
+  const savedLU = expCtxSwapLitUnion(0)
   const rv = emitExpr(body, ix, fnIx)
-  pendingLitUnion = savedLU
+  expCtxSwapLitUnion(savedLU)
   if rv < 0 { return -1 }
   fbLocalSet(atomStageSlot)
   emitStagedStrToAtomChain(body, texts, 0, fnIx)

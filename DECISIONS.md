@@ -1207,7 +1207,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
   * **A FLAG ON `TyArray`, NOT A `Ty` VARIANT.** `TyArray = { aElem, aRead }`. A variant
     would owe an arm in eighteen `TyArray` ladders and in every `_`-less `match` over `Ty`,
-    and `ladder-budget.py` re-derives the closed set from the `export type` and would demand
+    and `scripts/ladder-sets.vl` re-derives the closed set from the `export type` and would demand
     each one. A flag is invisible to every ladder that does not ask.
 
   * **`repCanonId` IGNORES IT, SO A VIEW IS THE SAME VALUE.** No copy, no new heap type, and

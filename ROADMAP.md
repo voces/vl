@@ -155,7 +155,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   kind ladders (ONE storage-class dispatch table) are still ahead of both.
 - ✅ **8. A ladder over a closed kind set is exhaustive or names its default — DONE.**
   `kind-ladder-incomplete` / `kind-ladder-split` in `compiler/lint.vl`, the ratchet
-  `scripts/ladder-budget.py --check` (440 + 9 today), the census `scripts/ladder-census.py`.
+  `vl check --budget scripts/ladder-budget-baseline.json` (440 + 9 then), the census `scripts/ladder-census.py`.
   See the fuller row below. **STATUS 2026-09-06: ratchet now 430 + 8** — it was 435 + 8 when this line was written
   the same day, which is how fast a quoted ratchet goes stale.
 - ✅ **8b. A table read bound-tests its index, or takes a reader whose miss cannot be a
@@ -499,8 +499,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   drops a kind the first tests — D981's exact shape, and the control (`urcExprClean` /
   `urcStmtFlags`, which hand back both ways) stays silent. **440 + 9 stand** [STATUS
   2026-09-06: now 435 + 8, moved by #2685 and neighbours], ratcheted per
-  file by `scripts/ladder-budget.py --check`, which re-derives every closed set from the
-  `export type` that declares it and FAILS when the lint's copy has drifted.
+  file by `vl check --budget scripts/ladder-budget-baseline.json`, and
+  `scripts/ladder-sets.vl` re-derives every closed set from the `export type` that declares
+  it and FAILS when the lint's copy has drifted.
   `scripts/ladder-census.py` is the discovery instrument — `--sets`, the ladder table,
   `--split`, and `--pred` for the form with no kind literal in it at all (#2400's).
   Byte-identical seed. See CLAUDE.md, "A LADDER OVER A CLOSED KIND SET".

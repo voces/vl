@@ -146,7 +146,7 @@ Measure:
 Measure:
 
     kind: shell
-    cmd: "$PYTHON" scripts/export-budget.py --check
+    cmd: F=$(mktemp) && scripts/vl-host/target/release/vl run scripts/dead-exports.vl --compiler build/vl-compiler.wasm -- --out "$F" && scripts/vl-host/target/release/vl check --budget scripts/export-budget-baseline.json --findings "$F" --compiler build/vl-compiler.wasm; r=$?; rm -f "$F"; exit $r
     filed: 0
     tol: 0
     dir: at-most

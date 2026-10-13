@@ -1,12 +1,9 @@
-// THE TWO KIND-LADDER IMPLEMENTATIONS MUST AGREE.
+// THE KIND-LADDER LINT, GRADED TO THE LINE.
 //
-// `compiler/lint.vl` grades one module at a time from the source the driver hands
-// it; `scripts/ladder-budget.py` (through `scripts/ladder-census.py`) grades the
-// whole tree for the per-file ratchet. They carry the same arm definition, the same
-// closed sets, the same two-arm floor and the same brace-walked default region, and
-// nothing else ties them together — so a change to either that moves a count
-// silently un-ratchets the tree. This runs BOTH over four fixtures and compares the
-// hit LINES, not totals.
+// `compiler/lint.vl` grades one module at a time, and `vl check --budget
+// scripts/ladder-budget-baseline.json` counts the same findings per file for the
+// ratchet, so the lint is the only implementation. This runs it over the fixtures and
+// compares the hit LINES with each fixture's pinned ones, not totals.
 //
 // The fixtures also PIN THE FALSE POSITIVES the rule has to design out: a ladder
 // that delegates its default to a sibling, a membership test written as one `||`
@@ -23,9 +20,9 @@
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const SCRIPT = `${ROOT}/scripts/ladder-budget.py`;
+const SETS = `${ROOT}/scripts/ladder-sets.vl`;
 const INCOMPLETE = "kind-ladder-incomplete";
 const SPLIT = "kind-ladder-split";
 const CODES = [INCOMPLETE, SPLIT] as const;
@@ -313,7 +310,7 @@ print(oneLiner("x") + holed("u8list"))
   },
   {
     // A FIELD read is graded against the field's DECLARING type, not the set its literals
-    // happen to spell. `c.primName` names three, but the field table (census + the lint's
+    // happen to spell. `c.primName` names three, but the field table (the lint's
     // `klFieldSetOf`, drift-gated against `type X = { f: T }`) resolves it to `PrimName`'s
     // ten, so the ladder is incomplete. Without the table its three would be an exhaustive
     // three-member set and nothing would fire — this is the pin that the field path is live.
@@ -337,25 +334,6 @@ print(fieldPrimLadder(c))
 ];
 
 type Hits = { lines: Record<string, number[]>; msgs: Record<string, string[]> };
-
-const script = async (path: string): Promise<Hits> => {
-  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-    args: [SCRIPT, "--grade", path],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (code !== 0) {
-    throw new Error(
-      `ladder-budget.py --grade ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
-    );
-  }
-  const raw = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, unknown[][]>;
-  const lines: Record<string, number[]> = {};
-  for (const c of CODES) {
-    lines[c] = raw[c].map((r) => r[0] as number).sort((x, y) => x - y);
-  }
-  return { lines, msgs: {} };
-};
 
 // The rule grades `compiler/` alone (docs/internals/lint-rule-scope.md), so the fixture
 // is checked as `compiler/<file>` relative to its temp root.
@@ -391,7 +369,7 @@ const lint = async (dir: string, file: string): Promise<Hits> => {
 const eq = (a: number[], b: number[]) => JSON.stringify(a) === JSON.stringify(b);
 
 Deno.test({
-  name: "kind-ladder: the lint and the ratchet script agree, both codes",
+  name: "kind-ladder: the lint fires on each fixture's pinned lines, both codes",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_kind_ladder_" });
@@ -400,28 +378,14 @@ Deno.test({
     for (const f of FIXTURES) {
       const path = `${dir}/compiler/${f.name}`;
       await Deno.writeTextFile(path, f.src);
-      const s = await script(path);
       const l = await lint(dir, f.name);
 
-      for (const c of CODES) {
-        if (!eq(s.lines[c], l.lines[c])) {
-          throw new Error(
-            `${f.name}: ${c} disagrees — ladder-budget.py wants lines ` +
-              `${JSON.stringify(s.lines[c])}, compiler/lint.vl got ` +
-              `${JSON.stringify(l.lines[c])}. The two carry the same arm definition, ` +
-              `the same closed sets and the same default region; whichever moved has ` +
-              `to move back, or both together.`,
-          );
-        }
-      }
-
-      // Pin the fixture's own arithmetic, so an agreeing pair of ZEROS cannot pass.
       const want: Record<string, number[]> = { [INCOMPLETE]: f.incomplete, [SPLIT]: f.split };
       for (const c of CODES) {
-        if (!eq(s.lines[c], want[c])) {
+        if (!eq(l.lines[c], want[c])) {
           throw new Error(
-            `${f.name}: want ${c} at lines ${JSON.stringify(want[c])}, got ` +
-              `${JSON.stringify(s.lines[c])}`,
+            `${f.name}: want ${c} at lines ${JSON.stringify(want[c])}, ` +
+              `compiler/lint.vl got ${JSON.stringify(l.lines[c])}`,
           );
         }
       }
@@ -441,26 +405,53 @@ Deno.test({
   },
 });
 
-// THE SETS ARE READ FROM THE TREE, NOT COPIED INTO IT. `ladder-budget.py` re-derives
-// every closed set from the `export type` that declares it and compares against
-// `compiler/lint.vl`'s `const kl<Name>` arrays, exiting non-zero on any drift — the
-// same contract tests/vl_scan_passes_test.ts enforces on `asPasses`. This runs that check on its
-// own, so a drifting set fails HERE and names the set, rather than showing up as a
-// mysterious count change in the ratchet.
+// THE SETS ARE READ FROM THE TREE, NOT COPIED INTO IT. `scripts/ladder-sets.vl`
+// re-derives every closed set from the `export type` that declares it and compares
+// against `compiler/lint.vl`'s `const kl<Name>` arrays, exiting non-zero on any drift —
+// the same contract tests/vl_scan_passes_test.ts enforces on `asPasses`. A drifting set
+// fails HERE and names the set, rather than showing up as a count change in the ratchet.
+// The control is a copy of compiler/ with one new closed set, which the check must name.
+const sets = async (args: string[]) => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
+    args: ["run", SETS, "--compiler", COMPILER, "--", ...args],
+    cwd: ROOT,
+    stdout: "piped",
+    stderr: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
+  }).output();
+  const dec = new TextDecoder();
+  return { code, out: dec.decode(stdout) + dec.decode(stderr) };
+};
+
 Deno.test({
   name: "kind-ladder: the lint's closed-set copy still matches the tree",
-  ignore: !GATED,
+  ignore: !ENABLED,
   fn: async () => {
-    const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-      args: [SCRIPT, "--check"],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
-    if (code !== 0) {
-      throw new Error(
-        `ladder-budget.py --check exited ${code}:\n` +
-          new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
+    const tree = await sets([]);
+    if (tree.code !== 0) {
+      throw new Error(`ladder-sets.vl exited ${tree.code}:\n${tree.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_kind_sets_" });
+    try {
+      await Deno.mkdir(`${dir}/compiler`);
+      for await (const e of Deno.readDir(`${ROOT}/compiler`)) {
+        if (e.isFile && e.name.endsWith(".vl")) {
+          await Deno.copyFile(`${ROOT}/compiler/${e.name}`, `${dir}/compiler/${e.name}`);
+        }
+      }
+      await Deno.writeTextFile(
+        `${dir}/compiler/zz_drift.vl`,
+        `export type ZzDrift = "a" | "b" | "c"\n`,
       );
+      const drifted = await sets(["--root", dir]);
+      const want = "`ZzDrift` (compiler/zz_drift.vl:1) is declared in the tree and missing";
+      if (drifted.code !== 1 || !drifted.out.includes(want)) {
+        throw new Error(
+          `the drifted control must exit 1 naming ZzDrift; got ${drifted.code}:\n${drifted.out}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
   },
 });
