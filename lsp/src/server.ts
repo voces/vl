@@ -13,7 +13,6 @@ import {
   DocumentHighlightKind,
   DocumentSymbol,
   FoldingRange,
-  FoldingRangeKind,
   Hover,
   InlayHint,
   InlayHintKind,
@@ -118,7 +117,7 @@ import {
   stdExportSurfaces,
   wordEndingBefore,
 } from "./editorText.ts";
-import { foldingRanges, type VlFoldingKind } from "./folding.ts";
+import { foldingRangesAt } from "./features.ts";
 import {
   callSiteAt,
   repairedSource,
@@ -730,23 +729,10 @@ connection.onDocumentSymbol(
 // with a missing or broken seed keeps folding while every other handler above
 // returns null. That is also what `editor.stickyScroll.defaultModel` =
 // `foldingProviderModel` reads, which is how an `if` or a `for` gets to stick.
-const foldingKindMap: Record<VlFoldingKind, FoldingRangeKind> = {
-  comment: FoldingRangeKind.Comment,
-  imports: FoldingRangeKind.Imports,
-};
 connection.onFoldingRanges((params): FoldingRange[] | null => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
-  const text = doc.getText();
-  const extents = (wasmChecker?.declExtentsAt(text) ?? []).map((e) => ({
-    headerLine: e.header.line,
-    endLine: e.range.end.line,
-  }));
-  return foldingRanges(text, extents).map((r) => {
-    const range: FoldingRange = { startLine: r.startLine, endLine: r.endLine };
-    if (r.kind !== undefined) range.kind = foldingKindMap[r.kind];
-    return range;
-  });
+  return foldingRangesAt(doc.getText(), wasmChecker);
 });
 
 // Signature help (D9.10): the callee's parameters while typing a call, with the
