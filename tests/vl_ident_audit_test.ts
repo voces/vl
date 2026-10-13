@@ -9,18 +9,16 @@
 // reachable declaration binds their name; identifiers resolved to a node that does not declare
 // their name (a shadow resolved to the wrong binding).
 //
-// THREE HALVES, each needed for the others to mean anything:
+// TWO HALVES, each needed for the other to mean anything:
 //
 //   zero   — witnesses whose identifiers are all minted or renamed by a rewrite (a capture
 //            cell, a boxed parameter, a write inside a closure, monomorphized callees), and
-//            plain declarations and shadows, audit 0 in all three counts.
+//            plain declarations and shadows, audit 0 in all three counts. D3899's fixture (a
+//            lambda argument of a call through an alias above its declaration, which the
+//            checker once never visited) is one of them since that row closed.
 //   fires  — switching off ONE propagation site (`identAuditDropSet`) makes the count rise on
 //            the witness that site serves, attributed to the pass that owns it. Without this
 //            an audit that stopped walking would pass the zero half quietly.
-//   pin    — D3899: a call through a module alias of a generic function, written above the
-//            alias, checks none of its arguments, so the lambda argument's identifiers are
-//            never resolved. The fixture audits exactly 1 until D3899 closes; when it moves,
-//            re-grade the row and turn this into a zero.
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
 //
@@ -355,20 +353,18 @@ Deno.test({
 
 Deno.test({
   name:
-    "ident audit pin: D3899's unchecked lambda argument leaves exactly its parameter use",
+    "ident audit: D3899's lambda argument, called through an alias above its declaration, is resolved",
   ignore,
   fn() {
     const path =
       `${ROOT}/tests/cases/functions/let-of-generic-called-above-declaration-lambda-arg-runs.vl`;
     const a = audit(Deno.readTextFileSync(path), DROP_NONE);
     compiles("D3899 fixture", a);
-    const want = "BinExpr.left @ check 'x'=1";
-    if (a.unresolved !== 1 || a.rows.join("; ") !== want) {
+    if (a.unresolved + a.builtinDeclared + a.misresolved !== 0) {
       throw new Error(
-        `D3899 fixture: want 1 unresolved (${want}), got ${a.unresolved} (${
+        `D3899 fixture: want 0 in all three counts, got ${a.unresolved}/${a.builtinDeclared}/${a.misresolved} (${
           a.rows.join("; ")
-        }). ` +
-          "If D3899 closed, re-grade its row and make this fixture a zero.",
+        })`,
       );
     }
   },
