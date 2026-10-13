@@ -132,6 +132,7 @@ import {
   budgetGitStep,
   budgetLoad,
   budgetNote,
+  budgetNoteJson,
   budgetTargets,
   budgetWants,
   budgetWhyLines,
@@ -181,31 +182,32 @@ const CMD_TEST_COMPILE = 12 // compile every queued file; commit each outcome in
 
 // The state-machine states (cliState). `*_RECV` states resume after the host has
 // committed the result of the command the previous `cliNext` returned.
-const ST_INIT = 0            // parse argv, classify the target
-const ST_CLASSIFY = 1        // got the LIST_DIR result for the target (dir vs file)
-const ST_WALK = 2            // got a LIST_DIR result for a pending directory
-const ST_PRINT = 3           // draining cliOut to stderr
-const ST_CHECK_READ = 4      // got a check file's source
-const ST_CHECK_FETCH = 5     // got a pending module's source
-const ST_DONE = 6            // finished
-const ST_FMT_STDIN = 7       // got stdin for `fmt`
-const ST_FMT_READ = 8        // got a fmt file's source
-const ST_FMT_AFTER = 9       // a fmt write/print was serviced; advance
-const ST_FIX_WROTE = 10      // a `check --fix` write was serviced; run the check
-const ST_TEST_READ = 11      // got a test file's source
-const ST_TEST_FETCH = 12     // got a test file dependency's source
-const ST_TEST_STASH = 13     // the host stashed the compiled test module
-const ST_TEST_COLLECT = 14   // the host reported every stashed file's registry
-const ST_TEST_RUN = 15       // the host reported every planned test's result
-const ST_CHECK_VALIDATE = 16 // the host validated this file's emitted module
-const ST_TEST_ENQUEUED = 17  // the host queued one file for the compile pool
-const ST_TEST_POOLED = 18    // the host committed every queued file's compile outcome
-const ST_SIB_LIST = 19       // got the listing of the checked file's own directory
-const ST_SIB_READ = 20       // got a file outside the module graph, read for its exports
-const ST_VALIDATE_READ = 21  // got a named file's source while checking every path exists
-const ST_BUDGET_READ = 22    // got the `--budget` baseline's source
-const ST_BUDGET_GIT = 23     // got one file of `.git`, resolving HEAD for `--write-baseline`
-const ST_BUDGET_WROTE = 24   // the `--write-baseline` write was serviced
+const ST_INIT = 0             // parse argv, classify the target
+const ST_CLASSIFY = 1         // got the LIST_DIR result for the target (dir vs file)
+const ST_WALK = 2             // got a LIST_DIR result for a pending directory
+const ST_PRINT = 3            // draining cliOut to stderr
+const ST_CHECK_READ = 4       // got a check file's source
+const ST_CHECK_FETCH = 5      // got a pending module's source
+const ST_DONE = 6             // finished
+const ST_FMT_STDIN = 7        // got stdin for `fmt`
+const ST_FMT_READ = 8         // got a fmt file's source
+const ST_FMT_AFTER = 9        // a fmt write/print was serviced; advance
+const ST_FIX_WROTE = 10       // a `check --fix` write was serviced; run the check
+const ST_TEST_READ = 11       // got a test file's source
+const ST_TEST_FETCH = 12      // got a test file dependency's source
+const ST_TEST_STASH = 13      // the host stashed the compiled test module
+const ST_TEST_COLLECT = 14    // the host reported every stashed file's registry
+const ST_TEST_RUN = 15        // the host reported every planned test's result
+const ST_CHECK_VALIDATE = 16  // the host validated this file's emitted module
+const ST_TEST_ENQUEUED = 17   // the host queued one file for the compile pool
+const ST_TEST_POOLED = 18     // the host committed every queued file's compile outcome
+const ST_SIB_LIST = 19        // got the listing of the checked file's own directory
+const ST_SIB_READ = 20        // got a file outside the module graph, read for its exports
+const ST_VALIDATE_READ = 21   // got a named file's source while checking every path exists
+const ST_BUDGET_READ = 22     // got the `--budget` baseline's source
+const ST_BUDGET_GIT = 23      // got one file of `.git`, resolving HEAD for `--write-baseline`
+const ST_BUDGET_WROTE = 24    // the `--write-baseline` write was serviced
+const ST_BUDGET_FINDINGS = 25 // got the `--findings` report's source
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -243,6 +245,7 @@ let cliIncludeImports = 0      // --include-imports: report imported modules' wa
 let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
 let cliBudget = 0              // 1 = --budget, 2 = --budget-why, 3 = + --write-baseline, 4 = + --exempt-codes
 let cliBudgetPath = ""         // that baseline's path
+let cliBudgetFindings = ""     // `--findings`: a `check --json` report counted instead of a walk
 let cliBudgetAct = 0           // 3 = --write-baseline, 4 = --exempt-codes, until parsed
 
 // ── work + output ──────────────────────────────────────────────────────────────
@@ -1182,6 +1185,13 @@ function cliParseArgs() {
       } else {
         cliUsageErr("check: " + a + " requires a baseline file")
       }
+    } else if sub == "check" && a == "--findings" {
+      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
+        cliBudgetFindings = cliArgs[i + 1]
+        i = i + 1
+      } else {
+        cliUsageErr("check: --findings requires a `--json` report file")
+      }
     } else if sub == "test" && a == "-t" {
       if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
         cliTestFilter = cliArgs[i + 1]
@@ -1229,6 +1239,13 @@ function cliParseArgs() {
     } else {
       cliArgErr = "check: --write-baseline and --exempt-codes act on a --budget <baseline>"
     }
+  }
+  if (
+    cliArgErr == ""
+    && cliBudgetFindings != ""
+    && (cliBudget != 1 || cliBudgetAct != 0)
+  ) {
+    cliArgErr = "check: --findings counts a --budget <baseline> verdict; it takes no --budget-why, --write-baseline or --exempt-codes"
   }
   if cliArgErr == "" && cliTestJobs < 0 {
     cliArgErr = "test: --jobs expects a positive count"
@@ -3668,11 +3685,27 @@ export function cliNext() {
       cliJsonOut = budgetExemptLine() + "\n"
       return cliBeginPrint()
     }
+    if cliBudgetFindings != "" {
+      cliCmdPath = cliBudgetFindings
+      cliState = ST_BUDGET_FINDINGS
+      return CMD_READ_FILE
+    }
     // The baseline names the population it counts; a named path narrows it.
     if cliTargets.length == 0 { cliTargets = budgetTargets() }
     for g in budgetExcludes() { cliAddExclude(g) }
     cliIncludeImports = 1
     return cliBeginTargets()
+  }
+  if st == ST_BUDGET_FINDINGS {
+    let err = "cannot read it"
+    if cliFileFound != 0 { err = budgetNoteJson(cliFileSrc) }
+    if err != "" {
+      cliOut = ["check: --findings " + cliBudgetFindings + ": " + err]
+      cliExit = 2
+      return cliBeginPrint()
+    }
+    cliBudgetFinish()
+    return cliBeginPrint()
   }
   if st == ST_BUDGET_GIT {
     return cliBudgetGitRead(budgetGitStep(cliFileFound != 0, cliFileSrc))

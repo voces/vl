@@ -373,10 +373,7 @@ const OWNERS: Record<string, string[]> = {
     "scripts/ladder-budget.py",
     "scripts/ladder-census.py",
   ],
-  "scripts/sentinel-budget-baseline.json": [
-    "scripts/sentinel-budget.py",
-    "scripts/sentinel-census.py",
-  ],
+  "scripts/sentinel-budget-baseline.json": [],
   "scripts/scan-budget-baseline.json": ["scripts/scan-budget.py"],
   "scripts/comment-budget-baseline.json": ["scripts/comment-budget.py"],
   "scripts/export-budget-baseline.json": ["scripts/export-budget.py"],
