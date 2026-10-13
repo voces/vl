@@ -29,7 +29,8 @@ import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-VL = os.environ.get("VL", "scripts/vl-host/target/release/vl")
+# normpath: Windows cannot spawn a relative path spelled with `/`.
+VL = os.path.normpath(os.environ.get("VL", "scripts/vl-host/target/release/vl"))
 # THE `std:` A GRADE READS IS THIS CHECKOUT'S, NOT THE BINARY'S. The host resolves `std:`
 # off the executable's ancestors, and an agent worktree symlinks
 # `scripts/vl-host/target` at the MAIN repo — so without this every cell was graded against
@@ -107,12 +108,102 @@ def one(name):
     return name, "check-clean invalid wasm", norm(rerr)
 
 
+# BATCHED GRADING: `vl check --batch --json` and `vl run --batch` over a chunk of cells,
+# one process each instead of two per cell; process start-up was ~95% of a small cell's
+# cost. A cell the batch records cannot classify exactly as `one` would (an unexpected
+# exit, a trap, a chunk that timed out) is graded by `one` itself, so the answer is the
+# per-cell grader's by construction. GRADE_BATCH=0 grades every cell with `one`.
+CHUNK = 100
+CHUNK_TIMEOUT = 600
+
+
+def batch_check(names):
+    """{name: None (check-clean) | (cls, msg) | "fallback"} for one chunk."""
+    files = [os.path.join(CELLS, n + ".vl") for n in names]
+    try:
+        p = subprocess.run([VL, "check", "--batch", "--json", *files, "--compiler", SEED],
+                           capture_output=True, text=True, timeout=CHUNK_TIMEOUT, env=VL_ENV)
+    except subprocess.TimeoutExpired:
+        return {n: "fallback" for n in names}
+    recs = [json.loads(l) for l in p.stdout.splitlines() if l.strip()]
+    if len(recs) != len(names):
+        return {n: "fallback" for n in names}
+    out = {}
+    for n, r in zip(names, recs):
+        errs = [d for d in r["diagnostics"] if d["severity"] == "error"]
+        if r["exit"] == 0 and not errs:
+            out[n] = None
+        elif r["exit"] == 1 and errs:
+            first = errs[0]["message"].splitlines()[0] if errs[0]["message"] else ""
+            out[n] = ("loud check reject", norm("[ERROR]: " + first))
+        else:
+            out[n] = "fallback"
+    return out
+
+
+def batch_run(names):
+    """{name: (cls, msg) | "fallback"} for check-clean cells of one chunk."""
+    files = [os.path.join(CELLS, n + ".vl") for n in names]
+    with tempfile.TemporaryDirectory() as od:
+        try:
+            subprocess.run([VL, "run", "--batch", "--out-dir", od, *files, "--compiler", SEED],
+                           capture_output=True, text=True, timeout=CHUNK_TIMEOUT, env=VL_ENV)
+        except subprocess.TimeoutExpired:
+            return {n: "fallback" for n in names}
+        out = {}
+        for n in names:
+            o = os.path.join(od, n + ".vl.out")
+            e = os.path.join(od, n + ".vl.err")
+            if not os.path.exists(o):
+                out[n] = "fallback"
+                continue
+            got = open(o, encoding="utf-8", errors="replace").read()
+            if not os.path.exists(e):
+                got = got.strip()
+                out[n] = ("runs", "") if got == EXPECT[n] else (
+                    "runs but wrong value", "want %r got %r" % (EXPECT[n], got[:80]))
+                continue
+            # A failing `vl run` prints `Error: <the same chain>` on stderr for an emit
+            # reject. Invalid wasm and traps it renders further (the validation
+            # explanation, source frames), and a trap needs `one`'s `vl build` stage.
+            rerr = "Error: " + open(e, encoding="utf-8", errors="replace").read() + got
+            if any(m in rerr for m in EMIT):
+                out[n] = ("loud emit reject", norm(rerr))
+            else:
+                out[n] = "fallback"
+        return out
+
+
+def grade_chunk(names):
+    res = {}
+    clean = []
+    for n, v in batch_check(names).items():
+        if v is None:
+            clean.append(n)
+        elif v != "fallback":
+            res[n] = v
+    if clean:
+        for n, v in batch_run(clean).items():
+            if v != "fallback":
+                res[n] = v
+    for n in names:
+        if n not in res:
+            res[n] = one(n)[1:]
+    return res
+
+
 def main():
     names = sorted(EXPECT)
     res = {}
     with ThreadPoolExecutor(max_workers=JOBS) as ex:
-        for name, cls, msg in ex.map(one, names):
-            res[name] = {"class": cls, "msg": msg}
+        if os.environ.get("GRADE_BATCH", "1") == "0":
+            for name, cls, msg in ex.map(one, names):
+                res[name] = {"class": cls, "msg": msg}
+        else:
+            chunks = [names[i:i + CHUNK] for i in range(0, len(names), CHUNK)]
+            for part in ex.map(grade_chunk, chunks):
+                for name, (cls, msg) in part.items():
+                    res[name] = {"class": cls, "msg": msg}
     json.dump(res, open(OUTJSON, "w"), indent=0, sort_keys=True)
     c = Counter(v["class"] for v in res.values())
     print("%s  cells=%d  seed=%s" % (OUTJSON, len(res), SEED))

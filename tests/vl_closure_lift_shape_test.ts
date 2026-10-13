@@ -14,9 +14,9 @@
 // `ci-native` installs no npm deps, so it self-ignores there; the `ci-release-shape` job names
 // this file and runs it with npm deps.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen, wasmDis } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
 if (!ENABLED) {
   console.warn(
@@ -70,10 +70,7 @@ const disassemble = async (
         new TextDecoder().decode(p.stderr);
       throw new Error(`vl build failed: ${err}`);
     }
-    const d = await new Deno.Command(WASM_DIS, {
-      args: [out],
-      stdout: "piped",
-    }).output();
+    const d = await wasmDis([out]);
     return functionsOf(new TextDecoder().decode(d.stdout));
   } finally {
     Deno.removeSync(dir, { recursive: true });

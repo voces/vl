@@ -13,10 +13,11 @@
 // through it is a write). Seed-gated like the other wasm suites.
 //   deno test -A --no-check tests/vl_effects_summary_test.ts
 
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { withEffects } from "../lsp/src/typeFeatures.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

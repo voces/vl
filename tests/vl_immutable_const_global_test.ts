@@ -10,9 +10,9 @@
 // GATING: needs the built binary, the seed and `wasm-dis` (`node_modules`). A missing
 // prerequisite self-ignores rather than fails, so read the suite's IGNORED COUNT.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen, wasmDis } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
 if (!ENABLED) console.warn("[immutable-const-global] skipped — missing vl, the seed or wasm-dis");
 
@@ -97,7 +97,7 @@ Deno.test({
       if (!b.success) {
         throw new Error(`vl build failed: ${new TextDecoder().decode(b.stderr)}`);
       }
-      const d = await new Deno.Command(WASM_DIS, { args: [out], stdout: "piped" }).output();
+      const d = await wasmDis([out]);
       const wat = new TextDecoder().decode(d.stdout);
       const got = wat.split("\n")
         .filter((l) => l.startsWith(" (global $"))

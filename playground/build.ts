@@ -32,6 +32,7 @@
 // therefore reaches a returning visitor without a hard reload, while a rebuild
 // that changes nothing emits byte-identical names and keeps their cache warm.
 
+import { filePath } from "../tests/support/filePath.ts";
 import * as esbuild from "esbuild";
 import { denoPlugins } from "esbuild-deno-loader";
 import {
@@ -53,7 +54,7 @@ const DIST = new URL("dist/", HERE);
 // path. We then swap the `index.d.ts` the loader would pick for `index.js`.
 const binaryenEntry = (): string => {
   const resolved = import.meta.resolve("binaryen");
-  const path = new URL(resolved).pathname;
+  const path = filePath(new URL(resolved));
   return path.replace(/index\.d\.ts$/, "index.js");
 };
 
@@ -92,20 +93,20 @@ const build = async (): Promise<{ js: string; css: string }> => {
       ...denoPlugins({
         // Point the loader at the shared root deno.json so the .ts sloppy-import
         // graph resolves exactly as Deno does.
-        configPath: new URL("deno.json", ROOT).pathname,
+        configPath: filePath(new URL("deno.json", ROOT)),
         nodeModulesDir: "manual",
       }),
     ],
     // esbuild's cwd anchors the native loader's `deno info` at the repo root, so
     // node_modules and the import map are found.
-    absWorkingDir: ROOT.pathname,
+    absWorkingDir: filePath(ROOT),
     // The object form names the entry output `playground-<hash>.js` (+ the
     // sibling `playground-<hash>.css`) under `outdir`, which `splitting`
     // requires (it can't target a single `outfile`). The resolved `index.html`
     // written below loads those exact names; the split chunk(s) sit beside them
     // and are fetched lazily by their relative URLs.
-    entryPoints: { playground: new URL("src/main.ts", HERE).pathname },
-    outdir: DIST.pathname,
+    entryPoints: { playground: filePath(new URL("src/main.ts", HERE)) },
+    outdir: filePath(DIST),
     // Content-hash the ENTRY points, as the chunks already were. These are the
     // two URLs index.html hard-referenced under stable names, so they were the
     // two a browser could serve from cache indefinitely after a ship. esbuild's

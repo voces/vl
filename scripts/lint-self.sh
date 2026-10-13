@@ -118,6 +118,9 @@ echo "== fmt-check: compiler/ std/ scripts/ tests/ bench/ (parallel per file) ==
 FMT_RC=0
 FMT_LOG="$WORK/fmt.log"
 : > "$FMT_LOG"
+# Each worker writes its own part (a chunk's lines can exceed what one append keeps whole).
+export FMT_PARTS="$WORK/fmt.parts"
+mkdir -p "$FMT_PARTS"
 # One `vl fmt --check` per file, classified by EXIT CODE: 0 clean, 1 drift, 2 the file does
 # not parse. rc 2 is out of scope, not a failure — `tests/cases/` holds deliberately-invalid
 # fixtures (a missing brace, an unterminated string) that exist to be refused, and the count
@@ -128,22 +131,48 @@ find compiler std scripts tests bench \
     -path scripts/silent-sweep/distilled -prune -o \
     -path scripts/capability-probes/matrix -prune -o \
     -name '*.vl' -print0 \
-  | xargs -0 -n 1 -P "$(nproc)" bash -c '
+  | xargs -0 -n 200 -P "$(nproc)" bash -c '
+      # One `vl fmt --check` per 200 files: it names each drifting file
+      # (`<f>: not formatted`) and each unparseable one (`fmt: <f>: parse error …`).
+      # A chunk with any other line, or another exit code, is redone one file at a
+      # time, so the classification is always the per-file one.
+      one() {
+        rc=0
+        "$VL" fmt --check "$1" >/dev/null 2>&1 || rc=$?
+        case "$rc" in
+          0) ;;
+          1) printf "drift\t%s\n" "$1" ;;
+          2) printf "unparsed\t%s\n" "$1" ;;
+          *) printf "crash%s\t%s\n" "$rc" "$1" ;;
+        esac
+      }
+      VL=$0
       rc=0
-      "$0" fmt --check "$1" >/dev/null 2>&1 || rc=$?
-      case "$rc" in
-        0) ;;
-        1) printf "drift\t%s\n" "$1" ;;
-        2) printf "unparsed\t%s\n" "$1" ;;
-        *) printf "crash%s\t%s\n" "$rc" "$1" ;;
-      esac' "$VL" >> "$FMT_LOG"
+      out=$("$VL" fmt --check "$@" 2>&1) || rc=$?
+      res=""
+      ok=1
+      case "$rc" in 0|1|2) ;; *) ok=0 ;; esac
+      if [ "$ok" = 1 ] && [ -n "$out" ]; then
+        while IFS= read -r l; do
+          case "$l" in
+            "fmt: "*": parse error"*) f=${l#fmt: }; res="$res$(printf "unparsed\t%s" "${f%%: parse error*}")
+" ;;
+            *": not formatted") res="$res$(printf "drift\t%s" "${l%: not formatted}")
+" ;;
+            *) ok=0 ;;
+          esac
+        done <<< "$out"
+      fi
+      part=$(mktemp "$FMT_PARTS/part.XXXXXX")
+      if [ "$ok" = 1 ]; then printf "%s" "$res" > "$part"; else for f in "$@"; do one "$f"; done > "$part"; fi' "$VL"
+cat "$FMT_PARTS"/part.* >> "$FMT_LOG" 2>/dev/null || true
 FMT_DRIFT=$(grep -c '^drift' "$FMT_LOG" || true)
 FMT_UNPARSED=$(grep -c '^unparsed' "$FMT_LOG" || true)
 FMT_CRASH=$(grep -c '^crash' "$FMT_LOG" || true)
 echo "fmt: $FMT_DRIFT drifting, $FMT_UNPARSED unparseable (out of scope), $FMT_CRASH crashed"
 if [ "$FMT_DRIFT" != 0 ] || [ "$FMT_CRASH" != 0 ]; then
   grep -E '^(drift|crash)' "$FMT_LOG" | sort | sed 's/^/  /'
-  echo "  run: vl fmt -w <path>   (one path per run)"
+  echo "  run: vl fmt -w <path>   (or several paths)"
   FMT_RC=1
 fi
 

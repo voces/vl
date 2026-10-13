@@ -15,9 +15,9 @@
 //
 // @test-timing opt
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen, wasmDis } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
 if (!ENABLED) console.warn("[memarg-const-fold] skipped — missing vl, the seed or binaryen");
 
@@ -105,14 +105,14 @@ const dis = async (dir: string, name: string, rung: string[]): Promise<string> =
   const out = `${dir}/${name}${rung.join("")}.wasm`;
   const b = await new Deno.Command(VL, {
     args: ["build", `${dir}/${name}.vl`, "-o", out, "--compiler", COMPILER, ...rung],
-    env: nativeEnv({}),
+    env: nativeEnv({ VL_WASM_OPT: binaryen("wasm-opt") }),
     stdout: "piped",
     stderr: "piped",
   }).output();
   if (!b.success) {
     throw new Error(`vl build ${name} ${rung} failed: ${new TextDecoder().decode(b.stderr)}`);
   }
-  const d = await new Deno.Command(WASM_DIS, { args: [out], stdout: "piped" }).output();
+  const d = await wasmDis([out]);
   return new TextDecoder().decode(d.stdout);
 };
 

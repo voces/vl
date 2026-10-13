@@ -131,7 +131,7 @@ function lerp(a: f32): f32 { a * h + 7.0 }   // h is the f32 0.5 here
 const K = 7
 function take64(x: i64): i64 { x }
 print(take64(K) * 1000000000)                 // 7000000000 — K is an i64 7 here
-print(K * 1000000000)                         // -1589934592 — no context: an i32 7, which wraps
+print(K * 1000000000)                         // 7000000000 — a tree of constants is computed exactly
 ```
 
 A read the literal does not fit is the literal's own error there (`const B = 3000000000` read as
@@ -268,10 +268,15 @@ fourth, `as%`, cannot fail at all and has its own section below:
 | `x as T` | `T` | returns `null` from the enclosing function, which must return `\| null` |
 
 ```vl
-print(3.9 as? i32)                 // null — 3.9 is not an integer
-print(3.0 as? i32)                 // 3
-print(5000000000 as? i32)          // null — out of i32's range
+function toI32(d: f64): i32 | null { d as? i32 }
+print(toI32(3.9))                  // null — 3.9 is not an integer
+print(toI32(3.0))                  // 3
+print(toI32(5000000000.0))         // null — out of i32's range
 ```
+
+A cast of a constant that can never succeed is refused when the program is checked:
+`3.9 as? i32` is refused with "constant 3.9 is not a whole number, so `i32` cannot hold
+it — `as?` on it would be null on every run".
 
 A **fraction fails the same way an out-of-range value does** — a float-to-integer cast
 never rounds, so it needs an *exact* integer value. `2.5 as! i32` traps

@@ -30,6 +30,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -103,7 +104,7 @@ const vl = async (args: string[]): Promise<Res> => {
 };
 
 const withDir = async (fn: (dir: string) => Promise<void>): Promise<void> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_large_source_" });
+  const dir = await makeTempDir({ prefix: "vl_large_source_" });
   try {
     await fn(dir);
   } finally {

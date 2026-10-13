@@ -366,6 +366,10 @@ let dgLossless: i32[] = []
 // it ends at, pushed in pairs. Sparse for the same reason as `dgLossless`.
 let dgSpanIdx: i32[] = []
 let dgSpanTok: i32[] = []
+// A parse diagnostic's stable code, for one `check --fix` can act on: the `P.diags` index and
+// its code, pushed in pairs. Sparse for the same reason as `dgLossless`.
+let dgCodeIdx: i32[] = []
+let dgCodeVal: string[] = []
 
 // The `ObjLit` nodes of a bare `{}` standing as a statement, which the parser has already
 // refused as an empty block (D2223); the checker skips its own value refusal for these.
@@ -373,14 +377,21 @@ export const stmtBraceNodes: i32[] = []
 // The subset of `stmtBraceNodes` that end their block, whose value may be used: the parser
 // leaves their message to the checker, which knows whether a value is expected there.
 export const stmtBraceTails: i32[] = []
+// The bare names that are a whole braced statement, `{ steps }`: a block yielding the name,
+// which reads as a record shorthand to a JavaScript hand. The checker says so where a record is
+// wanted (DV-1216).
+export const braceNameStmts: i32[] = []
 
 // Clear the column (and `stmtBraceNodes`). Paired with `P.diags = []`; see `vcDgReset` in driver.vl.
 export function dgLosslessReset() {
   dgLossless = []
   dgSpanIdx = []
   dgSpanTok = []
+  dgCodeIdx = []
+  dgCodeVal = []
   while stmtBraceNodes.length > 0 { stmtBraceNodes.pop() }
   while stmtBraceTails.length > 0 { stmtBraceTails.pop() }
+  while braceNameStmts.length > 0 { braceNameStmts.pop() }
   0
 }
 
@@ -397,6 +408,27 @@ export function dgMarkSpanEnd(i: i32, tok: i32) {
   dgSpanIdx.push(i)
   dgSpanTok.push(tok)
   0
+}
+
+// The code of a JavaScript `===` or `!==`, which `check --fix` rewrites to VL's operator.
+export const STRICT_EQ_CODE = "strict-equality"
+
+// Give the `P.diags` index `i` the stable code `code`. Callers pass the index the push is about
+// to occupy (`P.diags.length`), matching `dgMarkLossless`.
+export function dgMarkCode(i: i32, code: string) {
+  dgCodeIdx.push(i)
+  dgCodeVal.push(code)
+  0
+}
+
+// The code of parse diagnostic `i`, or "" when it has none.
+export function dgCodeOf(i: i32): string {
+  let k = 0
+  while k < dgCodeIdx.length {
+    if dgCodeIdx[k] == i { return dgCodeVal[k] }
+    k = k + 1
+  }
+  ""
 }
 
 // The token parse diagnostic `i` ends at, or -1 when it ends at its own anchor.
@@ -2032,15 +2064,21 @@ export function memberCallRungAdd(callIx: i32, rung: i32) {
   memberCallRung[callIx] = rung
   0
 }
+// A copied call that banked no rung of its own answers its original's (D4030).
 export function memberCallRungOf(callIx: i32) {
   if callIx >= 0 && callIx < memberCallRung.length {
-    return memberCallRung[callIx]
+    if memberCallRung[callIx] != 0 { return memberCallRung[callIx] }
+  }
+  const at = ufcsSiteRoot(callIx)
+  if at != callIx && at >= 0 && at < memberCallRung.length {
+    return memberCallRung[at]
   }
   0
 }
 export function ufcsAliasReset() {
   memberCallRung = []
   ufcsSiteTo = []
+  ufcsSiteFrom = []
   ufcsScopeMod = []
   ufcsScopeFrom = []
   ufcsScopeTo = []
@@ -2061,6 +2099,24 @@ export function ufcsSiteAdd(callIx: i32, mangled: string) {
 function ufcsSiteOf(callIx: i32) {
   if callIx >= 0 && callIx < ufcsSiteTo.length { return ufcsSiteTo[callIx] }
   ""
+}
+// A call node minted as a copy of another, mapped to the node it copies, or -1. A copy is the
+// same call site, so it resolves as the merge-walked original does (D4030).
+let ufcsSiteFrom: i32[] = []
+// Record that call `to` copies call `from`; returns `to`.
+export function ufcsSiteCarry(to: i32, from: i32) {
+  if to < 0 || from < 0 || to == from { return to }
+  while ufcsSiteFrom.length <= to { ufcsSiteFrom.push(-1) }
+  ufcsSiteFrom[to] = from
+  to
+}
+// The merge-walked node call `callIx` copies, or `callIx` itself.
+function ufcsSiteRoot(callIx: i32) {
+  let at = callIx
+  while at >= 0 && at < ufcsSiteFrom.length && ufcsSiteFrom[at] >= 0 {
+    at = ufcsSiteFrom[at]
+  }
+  at
 }
 // Module `m` binds plain `plain` to the merged `self`-function `mangled` — one
 // row per name in that module's scope, declaration or import (alias included).
@@ -2136,9 +2192,10 @@ export function ufcsAliasInScope(nodeIx: i32, name: string) {
 // entry point for the three consumers that hold a call node, so the checker and the emitter
 // cannot pick different modules' functions for one call.
 export function ufcsAliasAtSite(callIx: i32, name: string) {
-  const site = ufcsSiteOf(callIx)
+  const at = ufcsSiteRoot(callIx)
+  const site = ufcsSiteOf(at)
   if site != "" { return site }
-  ufcsAliasInScope(callIx, name)
+  ufcsAliasInScope(at, name)
 }
 
 // Receiver overloading (owner ruling O1, `docs/internals/receiver-overloading.md`): a module
@@ -2209,7 +2266,8 @@ export function ovSiteAdd(callIx: i32, row: i32) {
 // The set member call `callIx` must choose from, or -1.
 export function ovSiteSetOf(callIx: i32) {
   if ovSetMod.length == 0 { return -1 }
-  const row = ovSiteRow[callIx] ?? -1
+  // A copied call that banked no set of its own answers its original's (D4030).
+  const row = ovSiteRow[callIx] ?? ovSiteRow[ufcsSiteRoot(callIx)] ?? -1
   if row < 0 || ovSetBad[row] { return -1 }
   row
 }
@@ -2534,6 +2592,17 @@ export function getDeclReset() {
   0
 }
 
+// The name a caller writes for parameter `nm`: a parameter named like an ambient function is
+// renamed apart by the merge (`name$m<k>`), and its label stays the declared name.
+export function paramLabel(nm: string): string {
+  let i = nm.length - 1
+  while i >= 0 && nm[i] >= '0' && nm[i] <= '9' { i = i - 1 }
+  if i >= 1 && i < nm.length - 1 && nm[i] == 'm' && nm[i - 1] == '$' {
+    return nm.slice(0, i - 1)
+  }
+  nm
+}
+
 // Bind call arguments to parameter slots by name, then positionally — the single source of
 // truth shared by the checker and the emitter. Returns one value-node index per parameter
 // in parameter order (-1 where no argument filled the slot), followed by any leftover
@@ -2562,7 +2631,7 @@ export function orderArgsByParamNames(
       let pIx = -1
       let k = 0
       while k < paramNames.length {
-        if pIx < 0 && paramNames[k] == nm { pIx = k }
+        if pIx < 0 && paramLabel(paramNames[k]) == nm { pIx = k }
         k = k + 1
       }
       if pIx < 0 || slots[pIx] >= 0 {

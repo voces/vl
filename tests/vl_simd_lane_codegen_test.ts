@@ -11,10 +11,10 @@
 //
 // @test-timing opt
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen, wasmDis } from "./support/tree.ts";
 
-const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_OPT = binaryen("wasm-opt");
+const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_OPT) && exists(WASM_DIS);
 if (!ENABLED) console.warn("[simd-lane-codegen] skipped — missing vl, the seed or binaryen");
 
@@ -57,7 +57,7 @@ const dis = async (dir: string, name: string, rung: string): Promise<string> => 
   if (!b.success) {
     throw new Error(`vl build ${name} ${rung} failed: ${new TextDecoder().decode(b.stderr)}`);
   }
-  const d = await new Deno.Command(WASM_DIS, { args: [out], stdout: "piped" }).output();
+  const d = await wasmDis([out]);
   return new TextDecoder().decode(d.stdout);
 };
 

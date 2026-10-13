@@ -11,6 +11,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -31,7 +32,7 @@ Deno.test({
   name: "vl-check-fix: applies prefer-const only; leaves unused var/param (still reported); idempotent",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_" });
     try {
       const f = `${dir}/a.vl`;
       // The `: i64` return is NOT redundant (the i32 body widens to it), so the
@@ -69,7 +70,7 @@ Deno.test({
     "vl-check-fix: iterates to a fixpoint, removes the import it orphaned, keeps exported signatures (D3597)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_rounds_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_rounds_" });
     try {
       const f = `${dir}/a.vl`;
       // Removing `: Buf` orphans the `Buf` import, which only the next round can see. The
@@ -105,7 +106,7 @@ Deno.test({
   name: "vl-check-fix: an unused import of the program's own module stays whole (it may run code)",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_own_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_own_" });
     try {
       await Deno.writeTextFile(
         `${dir}/dep.vl`,
@@ -149,7 +150,7 @@ const fixCase = (name: string, files: Record<string, string>, want: string) =>
     name: `vl-check-fix: ${name}`,
     ignore: !ENABLED,
     fn: async () => {
-      const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_imp_" });
+      const dir = await makeTempDir({ prefix: "vl_check_fix_imp_" });
       try {
         for (const [rel, src] of Object.entries(files)) {
           await Deno.mkdir(`${dir}/${rel}`.replace(/\/[^/]*$/, ""), { recursive: true });
@@ -293,9 +294,10 @@ fixCase(
       "const a: u8[] = filled(16, 0 as! u8)\n" +
       "print(f(filled(f(g()), (0))) + a.length + u16le(g(), 0))\n",
   },
-  // The orphaned `filled` import and the now-redundant annotations go in the next round.
+  // The orphaned `filled` import and the now-redundant binding annotation go in the next
+  // round; `f`'s return annotation stays (DV-103).
   'import { u16le, zeroBytes } from "std:bytes"\n' +
-    "function f(b: u8[]) { return b.length }\n" +
+    "function f(b: u8[]): i32 { return b.length }\n" +
     "function g(): u8[] { return zeroBytes(4 * 2) }\n" +
     "const a = zeroBytes(16)\nprint(f(zeroBytes(f(g()))) + a.length + u16le(g(), 0))\n",
 );
@@ -383,6 +385,30 @@ fixCase(
     "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
 );
 
+// ---- a positional argument after a misplaced named one (D4061, ruling Q8) ----
+
+fixCase(
+  "positional arguments after a misplaced name are named for the parameter they bind today",
+  {
+    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
+      "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
+      "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+      "print(box(h: 3, 2))\nprint(f(c: 5, 1, 7))\nprint((5).m(d: 1, 2))\n",
+  },
+  "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
+    "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
+    "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+    "print(box(h: 3, w: 2))\nprint(f(c: 5, a: 1, b: 7))\nprint((5).m(d: 1, c: 2))\n",
+);
+
+fixCase(
+  "a name given twice has no mechanical fix and is left alone",
+  {
+    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+  },
+  "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+);
+
 fixCase(
   "a method call on a receiver built from an earlier error imports nothing for it (DV-101)",
   {
@@ -419,7 +445,7 @@ Deno.test({
   name: "vl-check-fix: a directory run offers every file the walk found, at its relative path",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_dir_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_dir_" });
     try {
       await Deno.mkdir(`${dir}/src/gen`, { recursive: true });
       await Deno.mkdir(`${dir}/src/skills`, { recursive: true });
@@ -455,7 +481,7 @@ Deno.test({
   name: "vl-check-fix: a file beside it that does not lex is named as skipped, and the rest still answer",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_skip_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_skip_" });
     try {
       await Deno.writeTextFile(`${dir}/bad.vl`, 'export const Q = "unterminated\n');
       await Deno.writeTextFile(`${dir}/ids.vl`, "export const SPR_A: i32 = 1\n");
@@ -469,3 +495,51 @@ Deno.test({
     }
   },
 });
+
+fixCase(
+  "a private helper keeps its return annotation while a redundant local annotation goes (DV-103)",
+  {
+    "main.vl": "function usable(a: i32): boolean {\n  const ok: boolean = a > 0\n  return ok\n}\n" +
+      "print(usable(1))\n",
+  },
+  "function usable(a: i32): boolean {\n  const ok = a > 0\n  return ok\n}\nprint(usable(1))\n",
+);
+
+fixCase(
+  "a concrete function the generic initializer cannot be held at is not annotated",
+  {
+    "main.vl": "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+      "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+  },
+  "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+    "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+);
+
+fixCase(
+  "a non-numeric cast to the type its operand already has is dropped, keeping the operand",
+  {
+    "main.vl": "function g(t: string | i32) {\n  if t is string {\n    print((t as! string).length)\n" +
+      "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s as string)\n",
+  },
+  "function g(t: string | i32) {\n  if t is string {\n    print((t).length)\n" +
+    "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s)\n",
+);
+
+fixCase(
+  "JavaScript's `!==` and `===` become VL's `!=` and `==`, which are already strict (DV-1214)",
+  {
+    "main.vl": "function f(n: i32): boolean {\n  return n !== 2 && n === 3\n}\nprint(f(1))\n",
+  },
+  "function f(n: i32): boolean {\n  return n != 2 && n == 3\n}\nprint(f(1))\n",
+);
+
+fixCase(
+  "an unknown type some module exports is imported, beside its existing import or as a new one (DV-007)",
+  {
+    "world.vl": "export type Level = { n: i32 }\nexport function mk(): Level { return { n: 1 } }\n",
+    "main.vl": 'import { mk } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
+      "print(depth(mk()))\n",
+  },
+  'import { mk, Level } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
+    "print(depth(mk()))\n",
+);

@@ -23,7 +23,7 @@
 //
 // @test-timing native
 
-import { COMPILER, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
+import { binaryen, COMPILER, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -147,7 +147,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const wasmOpt = Deno.env.get("VL_WASM_OPT") ??
-      new URL("../node_modules/.bin/wasm-opt", import.meta.url).pathname;
+      binaryen("wasm-opt");
     if (!exists(wasmOpt)) return; // binaryen absent — the opt rungs have their own gate
     await withDir(async (dir, src) => {
       const env = { VL_WASM_OPT: wasmOpt };

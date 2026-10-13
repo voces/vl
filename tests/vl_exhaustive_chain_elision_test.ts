@@ -27,9 +27,9 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen, wasmDisSync } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(WASM_DIS);
@@ -135,11 +135,7 @@ function measure(
       }`,
     );
   }
-  const dis = new Deno.Command(WASM_DIS, {
-    args: [wasm],
-    stdout: "piped",
-    stderr: "piped",
-  }).outputSync();
+  const dis = wasmDisSync([wasm]);
   if (dis.code !== 0) {
     throw new Error(
       `wasm-dis ${name} failed (rc ${dis.code}): ${

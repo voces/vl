@@ -4,9 +4,10 @@
 // per-byte `rbyteAt` read-back, and V8's own compile+run of each emitted module.
 // Also answers whether per-case cost DRIFTS on the one instance the oracle keeps.
 //   deno run -A scripts/perf/oracle-abi-probe.ts [n-cases]
+import { filePath } from "../../tests/support/filePath.ts";
 import { runWasm } from "../../tests/support/runWasm.ts";
-const SEED = new URL("../../build/vl-compiler.wasm", import.meta.url).pathname;
-const DIR = new URL("../../tests/cases/", import.meta.url).pathname;
+const SEED = filePath(new URL("../../build/vl-compiler.wasm", import.meta.url));
+const DIR = filePath(new URL("../../tests/cases/", import.meta.url));
 type Ex = Record<string, (...a: number[]) => number> & {
   memory?: WebAssembly.Memory;
   ioMem?: WebAssembly.Memory;
