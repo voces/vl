@@ -483,10 +483,10 @@ the fall was a genuine merge (#2465): a check that is a strict subset of the rig
 result indistinguishable from the right one's, so say what was compared. And a ratchet's FALL
 is not self-explaining: "it went down" and "it went down because #2465 added the arm" are
 different confidence levels, and only the second rules out a detector that stopped seeing
-something — `--why` names the entries that left since the baseline's commit, and all five
-per-file ratchets now carry it (`comment-budget`, `ladder-budget`, `sentinel-budget`,
-`scan-budget`, `export-budget`, sharing one `scripts/ratchet.py`; `seed-size` is a scalar and
-has no entries to name). A baseline recording no `commit` falls back to the commit that last
+something — the ratchets with stored entries name what left since the baseline's commit:
+`vl check --budget <baseline> --budget-why` for comment, scan, sentinel and interp, and
+`--why` on `ladder-budget.py`/`export-budget.py` (sharing `scripts/ratchet.py`; `seed-size` is
+a scalar and has no entries to name). A baseline recording no `commit` falls back to the commit that last
 CHANGED it.
 
 `vl fmt -w`, `vl check` and `vl test` take several paths (files or directories) in one run.
@@ -645,7 +645,7 @@ identically, so the candidate can never reach a red. A change that loops on the 
 an unbounded recursion or a fixpoint that does not converge, and that is the defect.
 
 **Three gates now catch this class, at three different moments.** `arena-scan-outside-pass`
-(`compiler/lint.vl` + `scripts/scan-budget.py`'s ratchet) fires at REVIEW time on a loop
+(`compiler/lint.vl` + `vl check --budget scripts/scan-budget-baseline.json`) fires at REVIEW time on a loop
 bounded by a whole-program table outside a pass — 132 stand, the count may only fall.
 `tests/vl_scaling_shape_test.ts` compiles ~38 pairs of same-work-different-shape programs
 and grades the ratio of the two arms' guest FUEL (`$VL_FUEL=1`), so the failure NAMES the
@@ -676,9 +676,10 @@ from comments that were confidently STALE, not long — a length budget alone wo
 corrected none of them.
 
 The tree cannot reach zero in one PR, so all four codes ride ONE RATCHET.
-`python3 scripts/comment-budget.py --check` (a gate in `gate.sh` and in CI) fails when any
-FILE's count for any code goes up; `--write-baseline` lowers it, in the same PR as the trim
-that earned it, `--list <code>` names the blocks and `--why` names the ones that LEFT.
+`vl check --budget scripts/comment-budget-baseline.json` (a gate in `gate.sh` and in CI) fails
+when any FILE's count for any code goes up; `--write-baseline` lowers it, in the same PR as the
+trim that earned it, `vl check compiler --severity info` names the blocks and `--budget-why`
+names the ones that LEFT.
 `scripts/lint-self.sh` holds a code out
 of its own `info` gate only while the baseline still owes it — read FROM the baseline, so the
 exemption deletes itself at zero, one code at a time (`comment-measurement-uncited` is

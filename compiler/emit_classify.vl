@@ -256,7 +256,6 @@ import {
   tyIxIsVariantMember,
   tyLitMemberTexts,
   tyLitSetMemberLexes,
-  tyLitUnionAliasIx,
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
@@ -19086,16 +19085,8 @@ export function cloCallParamLitUnion(callIx: i32, idx: i32) {
     if t is TyFunc {
       if idx < 0 || idx >= t.fnParamTypes.length { return 0 }
       const pty = t.fnParamTypes[idx]
-      // Alias-only for the non-null form, by arena-index identity: an inline `"a" | "b"`
-      // param really is a string (outside `litUnionPreserve`'s set), and call sites already
-      // work by pushing it. `unionAliasDeclNameOfTy`, not `litUnionAliasNameOfTy` (which
-      // would name the inline spelling "K" wherever `type K = "a" | "b"` is also declared).
-      if tyIsLitUnion(pty) {
-        // `tyLitUnionAliasIx`, not `unionAliasDeclNameOfTy`: both exclude the inline
-        // spelling, but the name form also misses a narrowed copy, whose rep is the atom.
-        if tyLitUnionAliasIx(pty) >= 0 { return 1 }
-        return 0
-      }
+      // A string literal union, aliased or inline, is the interned i32 atom.
+      if tyIsLitUnion(pty) { return 1 }
       // The niche claims both spellings, exactly as `nodeTyIsNulLitUnion` does: inline and
       // aliased alike rep as the i32 atom with the `-1` null sentinel.
       if tyIsNullableLitUnion(pty) { return 2 }
@@ -19149,7 +19140,7 @@ export function cloCallResultLitUnion(callIx: i32, fnIx: i32): boolean {
   const ft = cloCallCalleeFnTy(callIx, fnIx)
   if ft < 0 { return false }
   const t = T.tys[ft]
-  if t is TyFunc { return tyLitUnionAliasIx(t.fnRet) >= 0 }
+  if t is TyFunc { return tyIsLitUnion(t.fnRet) }
   false
 }
 
@@ -30640,7 +30631,7 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
     // The alias-index question, matching the rep, exactly as `exprIsLitAtom`'s param arm
     // asks it: a narrowed alias is a copy at a fresh index, so the registry misses while
     // the rep layer, which assigns the valtype through this same test, says `i32`.
-    return tyLitUnionAliasIx(nodeTyIxOf(bn.parType)) >= 0
+    return tyIsLitUnion(nodeTyIxOf(bn.parType))
   }
   if bn is LetDecl {
     return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
@@ -30708,7 +30699,7 @@ export function forInVarIsLitAtom(
   if nodeTyMapKeyIsLitUnion(iterIx) { return true }
   if ek != "i32" { return false }
   const hp = iterElemPinTy(iterIx, fnIx)
-  if hp >= 0 { return tyLitUnionAliasIx(hp) >= 0 || tyIsNulLitUnionNiche(hp) }
+  if hp >= 0 { return tyIsLitUnion(hp) || tyIsNulLitUnionNiche(hp) }
   false
 }
 
@@ -31239,7 +31230,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   // A node the generic body shares, typed at a hole this instance pins to a literal union,
   // which every rung below reads at the hole (D2942).
   if (
-    tyLitUnionAliasIx(holeOperandTyOf(exprIx, fnIx)) >= 0
+    tyIsLitUnion(holeOperandTyOf(exprIx, fnIx))
     && holeLitReadIsAtom(exprIx, fnIx, 0)
   ) {
     return true
@@ -31265,11 +31256,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
     const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(exprIx))
     if pt >= 0 {
-      // The alias-index question, not the registry one: `tyLitUnionAliasIx` also consults
-      // the checker's copy-provenance table, which records the copies narrowing, join, or
-      // subtraction mint at fresh indices. This is the same predicate the rep layer uses to
-      // assign the valtype, so the consumer agrees with the rep by construction.
-      const r = tyLitUnionAliasIx(nodeTyIxOf(pt)) >= 0
+      // The same structural predicate the rep layer assigns the valtype by, so the consumer
+      // agrees with the rep by construction.
+      const r = tyIsLitUnion(nodeTyIxOf(pt))
       return r
     }
     const gli = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
@@ -31413,10 +31402,10 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
   }
   if e is Call {
-    // Any call whose checked result type is an aliased litunion holds an i32 atom, widened
+    // Any call whose checked result type is a registered litunion holds an i32 atom, widened
     // at print. Covers a closure value call, a struct-field closure call, and an
     // indexed-closure call, none of which the callee-Ident named arm below can reach. A
-    // named call to an inline-litunion-returning function reps as a string ref, correctly excluded.
+    // generic call whose result a pin minted is excluded: its instance may return a string.
     if nodeTyIsLitUnionAlias(unwrapParen(exprIx)) { return true }
     // A function-value call whose callee's annotated result is an aliased litunion — the arm
     // above cannot reach inside a monomorphized instance, where the call node is shared with
@@ -33644,9 +33633,7 @@ export function holeNulStringPinTyOf(exprIx: i32, fnIx: i32): i32 {
 export function holeOperandI32PinTyOf(exprIx: i32, fnIx: i32): i32 {
   const t = holeOperandTyOf(exprIx, fnIx)
   if tyPrimNameOf(t) == "boolean" || tyIsNulPrim(t, "boolean") { return t }
-  if tyLitUnionAliasIx(t) >= 0 && holeLitReadIsAtom(exprIx, fnIx, 0) {
-    return t
-  }
+  if tyIsLitUnion(t) && holeLitReadIsAtom(exprIx, fnIx, 0) { return t }
   -1
 }
 
@@ -48307,12 +48294,13 @@ function annParamKind(t: string) {
   if t == "i64" { return repSigTokOfKind("i64") }
   if t == "f32" { return repSigTokOfKind("f32") }
   if t == "v128" { return repSigTokOfKind("v128") }
-  // A registered union name is the `{tag, value}` box, except a litunion alias, whose rep is
-  // the interned i32 atom — gated on `isUName` since only a declared alias registers a name.
-  if isUName(t) {
-    if nameIsLitUnionType(t) { return repSigTokOfKind("i32") }
-    return repSigTokOfKind("union")
+  // A string literal union, bare or nullable, aliased or inline, is the interned i32 atom —
+  // before the string test, which would read an inline spelling as `str`.
+  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
+    return repSigTokOfKind("i32")
   }
+  // Any other registered union name is the `{tag, value}` box.
+  if isUName(t) { return repSigTokOfKind("union") }
   if nameIsString(t) { return repSigTokOfKind("str") }
   // The scalar-element list backings, via the one home `scalarListRepOfName` — the same
   // enumeration `annRetKind` reads, so the two `$fnsig` producers cannot drift.
@@ -48342,10 +48330,6 @@ function annParamKind(t: string) {
   // the AST producer's `cloParamTok` keys, matching a nominal name too.
   const sti = structIndexOfTypeName(t)
   if sti >= 0 { return repSigSlotTokOfKind("struct", sti) }
-  // A literal union, bare or nullable, is the interned i32 atom at a parameter as at a result.
-  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
-    return repSigTokOfKind("i32")
-  }
   // The nullable and union params, the name twin of `cloParamTok`'s niche kinds: without them
   // an annotation or arena type naming `string | null` keyed nothing, and the call fell to an
   // unrelated arity functype (D2552). A nullable closure param stays outside the ABI there.
@@ -48704,19 +48688,14 @@ function sigKeyOfTyGo(funcTyIx: i32): string {
   key + rc
 }
 
-// One parameter's `$fnsig` token for `sigKeyOfTy`, arena first, else its render. A
-// litunion-alias parameter keeps its alias name, since a raw render softens it to `string`
-// while the other producers key the i32 atom. "" when the type has no token.
+// One parameter's `$fnsig` token for `sigKeyOfTy`, arena first, else its render. A string
+// literal union keys the i32 atom, since a raw render may soften it to `string`. "" when the
+// type has no token.
 function sigParamTokOfTy(pty: i32): string {
   const pc = paramTokOfTy(pty)
   if pc != "" { return pc }
-  let pnm = ""
-  if tyIsLitUnion(pty) {
-    // `tyLitUnionAliasIx` follows the checker's alias provenance, so a narrowed-copy alias
-    // param resolves its source name, not `string`.
-    pnm = unionAliasDeclNameOfTy(tyLitUnionAliasIx(pty))
-  }
-  if pnm == "" { pnm = tyToEmitName(pty) }
+  if tyIsLitUnion(pty) { return repSigTokOfKind("i32") }
+  const pnm = tyToEmitName(pty)
   if pnm == "" { return "" }
   annParamKind(pnm)
 }

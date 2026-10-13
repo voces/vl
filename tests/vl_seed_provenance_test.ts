@@ -11,58 +11,120 @@
 // NOT A TIMESTAMP. `git archive`, `cp`, a rebase and a checkout all hand a stale artifact a
 // fresh mtime and a fresh one an old mtime, which is why CLAUDE.md's cargo rule reads "verify
 // BEHAVIORALLY, never by timestamp". `refresh-compiler.sh` records the FOLD of the sources it
-// compiled and `scripts/seed_provenance.py` recomputes it — identities, not clocks.
+// compiled and `scripts/seed-provenance.vl` recomputes it — identities, not clocks.
 //
-// This is the cheap half: it drives the python's own `--self-test`, which builds a specimen per
-// verdict (match / differ / unknown) and sabotages the comparison to prove the specimens would
-// notice. No compiler, no seed, milliseconds.
+// The recorder is a VL program now (it was `seed_provenance.py`, which stays only because the
+// two Python graders still import it). The first case drives its `--self-test`, which builds a
+// specimen per verdict (match / differ / unknown) and sabotages the comparison to prove the
+// specimens would notice. The second pins the VL fold to the Python's, byte for byte, so the two
+// cannot drift while both exist.
 //
 // No assertion library, per CLAUDE.md.
+// @test-timing native
 
-import { ROOT } from "./support/tree.ts";
+import {
+  COMPILER,
+  exists,
+  nativeEnv,
+  pythonBin,
+  ROOT,
+  VL,
+} from "./support/tree.ts";
 
-const SCRIPT = `${ROOT}/scripts/seed_provenance.py`;
-
-/** A python that actually runs: `$PYTHON`, then /usr/bin/python3, then whatever is on PATH. */
-async function python(): Promise<string> {
-  const tried: string[] = [];
-  for (const p of [Deno.env.get("PYTHON"), "/usr/bin/python3", "python3"]) {
-    if (p === undefined) continue;
-    tried.push(p);
-    try {
-      const { code } = await new Deno.Command(p, {
-        args: ["-c", "print(1)"],
-        stdout: "null",
-        stderr: "null",
-      }).output();
-      if (code === 0) return p;
-    } catch { /* not on PATH — try the next */ }
-  }
-  throw new Error(`no working python3 found (tried ${tried.join(", ")})`);
+const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
+const ENABLED = GATED && exists(VL) && exists(COMPILER);
+if (GATED && !ENABLED) {
+  console.warn(
+    "[vl-seed-provenance] skipped — missing vl binary or seed wasm.",
+  );
 }
 
-async function run(args: string[]) {
-  const { code, stdout, stderr } = await new Deno.Command(await python(), {
-    args: [SCRIPT, ...args],
+const dec = new TextDecoder();
+
+/** `scripts/seed-provenance.vl <argv>` from the checkout root (it resolves paths against the cwd). */
+async function provenance(argv: string[]) {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
+    args: [
+      "run",
+      "scripts/seed-provenance.vl",
+      "--compiler",
+      COMPILER,
+      "--",
+      ...argv,
+    ],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
-  const d = new TextDecoder();
-  return { code, out: d.decode(stdout) + d.decode(stderr) };
+  return { code, out: dec.decode(stdout) + dec.decode(stderr) };
 }
 
-Deno.test("seed provenance: every verdict fires on a specimen that must produce it", async () => {
-  const { code, out } = await run(["--self-test"]);
-  if (code !== 0) {
-    throw new Error(`seed_provenance.py --self-test failed (rc ${code}):\n${out}`);
-  }
-  // The summary has to name what was proved, or a self-test that stopped testing reads the same.
-  for (const want of ["match passes", "refresh-compiler.sh", "MOVED"]) {
-    if (!out.includes(want)) {
-      throw new Error(`the self-test summary must mention ${JSON.stringify(want)}; got:\n${out}`);
+Deno.test({
+  name:
+    "seed provenance: every verdict fires on a specimen that must produce it",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { code, out } = await provenance(["--self-test"]);
+    if (code !== 0) {
+      throw new Error(
+        `seed-provenance.vl --self-test failed (rc ${code}):\n${out}`,
+      );
     }
-  }
+    // The summary has to name what was proved, or a self-test that stopped testing reads the same.
+    for (const want of ["match passes", "refresh-compiler.sh", "MOVED"]) {
+      if (!out.includes(want)) {
+        throw new Error(
+          `the self-test summary must mention ${
+            JSON.stringify(want)
+          }; got:\n${out}`,
+        );
+      }
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "seed provenance: the VL fold writes the Python fold's sidecar byte for byte",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_seed_prov_" });
+    try {
+      const viaVl = await provenance(["--write", "--seed", `${dir}/vl.wasm`]);
+      if (viaVl.code !== 0) {
+        throw new Error(`--write failed (rc ${viaVl.code}):\n${viaVl.out}`);
+      }
+      const py = await new Deno.Command(pythonBin(), {
+        args: [
+          "scripts/seed_provenance.py",
+          "--write",
+          "--seed",
+          `${dir}/py.wasm`,
+        ],
+        cwd: ROOT,
+        stdout: "null",
+        stderr: "piped",
+      }).output();
+      if (py.code !== 0) {
+        throw new Error(`python --write failed:\n${dec.decode(py.stderr)}`);
+      }
+      const a = await Deno.readTextFile(`${dir}/vl.wasm.src`);
+      const b = await Deno.readTextFile(`${dir}/py.wasm.src`);
+      if (a !== b) {
+        throw new Error(
+          `sidecars differ.\nvl: ${JSON.stringify(a)}\npy: ${
+            JSON.stringify(b)
+          }`,
+        );
+      }
+      if (!/^[0-9a-f]{16}\n/.test(a)) {
+        throw new Error(`want a 16-hex identity first, got ${a}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
 });
 
 const RECORD = `${ROOT}/scripts/record-seed-provenance.sh`;
@@ -73,51 +135,55 @@ async function record(env: Record<string, string>) {
   const { code, stdout, stderr } = await new Deno.Command("bash", {
     args: [RECORD, seed],
     cwd: ROOT,
-    env,
+    env: { ...nativeEnv(), VL, ...env },
     stdout: "piped",
     stderr: "piped",
   }).output();
-  const d = new TextDecoder();
   let sidecar: string | null = null;
   try {
     sidecar = await Deno.readTextFile(`${seed}.src`);
   } catch { /* the refusal path leaves none, which is the point */ }
   await Deno.remove(seed).catch(() => {});
   await Deno.remove(`${seed}.src`).catch(() => {});
-  return { code, out: d.decode(stdout) + d.decode(stderr), sidecar };
+  return { code, out: dec.decode(stdout) + dec.decode(stderr), sidecar };
 }
 
-Deno.test("seed provenance: a `python3` that cannot start falls back rather than skipping", async () => {
-  // The box this was found on has a Homebrew python3 first on PATH that exits before running a
-  // line. `/bin/false` stands in for it: same observable — rc != 0, nothing recorded.
-  // The default fallback is the distro's `/usr/bin/python3`, which Windows does not have, so
-  // there the seam names the PATH interpreter instead: the fallback branch is what is under test.
-  const { code, out, sidecar } = await record({
-    PYTHON: "/bin/false",
-    ...(Deno.build.os === "windows" ? { PYTHON_FALLBACK: "python3" } : {}),
-  });
-  if (code !== 0) throw new Error(`want rc 0 via the fallback, got ${code}:\n${out}`);
-  if (sidecar === null) throw new Error(`the fallback recorded no sidecar; output:\n${out}`);
-  if (!/^[0-9a-f]{16}\n/.test(sidecar)) {
-    throw new Error(`want a 16-hex identity as the sidecar's first line, got:\n${sidecar}`);
-  }
-  if (!out.includes("could not run")) {
-    throw new Error(`the fallback must say which interpreter failed; got:\n${out}`);
-  }
+Deno.test({
+  name:
+    "seed provenance: the recorder writes a 16-hex identity through a working compiler",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { code, out, sidecar } = await record({ COMPILER });
+    if (code !== 0) throw new Error(`want rc 0, got ${code}:\n${out}`);
+    if (sidecar === null || !/^[0-9a-f]{16}\n/.test(sidecar)) {
+      throw new Error(
+        `want a 16-hex identity as the sidecar's first line, got:\n${sidecar}`,
+      );
+    }
+  },
 });
 
-Deno.test("seed provenance: with no working interpreter it REFUSES and leaves no sidecar", async () => {
-  // The control this guard would otherwise never be watched refuse. A stale sidecar would be
-  // worse than none — a grader reads it as THIS seed's identity — so the refusal must clear it.
-  const { code, out, sidecar } = await record({
-    PYTHON: "/bin/false",
-    PYTHON_FALLBACK: "/bin/false",
-  });
-  if (code === 0) throw new Error(`want a non-zero refusal, got rc 0:\n${out}`);
-  if (sidecar !== null) throw new Error(`the refusal left a sidecar behind:\n${sidecar}`);
-  if (!out.includes("PYTHON")) {
-    throw new Error(`the refusal must name PYTHON so the fix is in the message; got:\n${out}`);
-  }
+Deno.test({
+  name:
+    "seed provenance: with a compiler that cannot run it REFUSES and leaves no sidecar",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The control this guard would otherwise never be watched refuse. A stale sidecar would be
+    // worse than none — a grader reads it as THIS seed's identity — so the refusal must clear it.
+    // `/bin/false` stands in for a compiler that cannot start: same observable, rc != 0.
+    const { code, out, sidecar } = await record({ COMPILER: "/bin/false" });
+    if (code === 0) {
+      throw new Error(`want a non-zero refusal, got rc 0:\n${out}`);
+    }
+    if (sidecar !== null) {
+      throw new Error(`the refusal left a sidecar behind:\n${sidecar}`);
+    }
+    if (!out.includes("COMPILER")) {
+      throw new Error(
+        `the refusal must name COMPILER so the fix is in the message; got:\n${out}`,
+      );
+    }
+  },
 });
 
 Deno.test("seed provenance: refresh-compiler.sh does not degrade the miss to a note", async () => {
@@ -127,10 +193,10 @@ Deno.test("seed provenance: refresh-compiler.sh does not degrade the miss to a n
   if (!src.includes("record-seed-provenance.sh")) {
     throw new Error(
       "refresh-compiler.sh must record the seed's provenance through " +
-        "scripts/record-seed-provenance.sh, which fails loud when no interpreter runs",
+        "scripts/record-seed-provenance.sh, which fails loud when the recorder cannot run",
     );
   }
-  if (/seed_provenance\.py[^\n]*\|\|/.test(src)) {
+  if (/record-seed-provenance\.sh[^\n]*\|\|/.test(src)) {
     throw new Error(
       "refresh-compiler.sh swallows the provenance step's failure with `||` — a seed with " +
         "no sidecar would ship while the refresh reports success",
