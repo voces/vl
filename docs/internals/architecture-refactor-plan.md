@@ -91,7 +91,7 @@ order, subject to the one-writer rule.
 
 ### Wave A: enablers (no behaviour change)
 
-| step | item | prerequisite |
+| step | item | file owner | proof |
 | --- | --- | --- | --- |
 | A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | the fixpoint reproduces master's seed from master's source, and `vl check` text and emitted modules are identical over `tests/cases` and the corpus with the flag off |
 | A2 | L4: one `CheckMark` / `checkRollback`; each constraint family becomes a record of columns with one `truncate` | `typecheck.vl` | `vl check` and module identity; fuel A/B |
@@ -103,7 +103,7 @@ order, subject to the one-writer rule.
 
 ### Wave B: one producer per fact
 
-| step | item | prerequisite |
+| step | item | owner | prerequisite |
 | --- | --- | --- | --- |
 | B1 | L1, executed as SC's migration (`fn-value-flow-design.md` §(f), steps 0–4). SC's checker-side store (§(h)) **is** L1's banked binding; there is no second bank. Mono's instance key becomes the type-id tuple, and a per-instance node-type column retires `monoArgTyName`. | lane SC (`emit_mono.vl`, the SC parts of `typecheck.vl`) | #3542 (step 0) |
 | B2 | L2 stage 2: the type-taking twins land in `tyquery.vl` | `emit_classify.vl` | A3 |
@@ -111,7 +111,7 @@ order, subject to the one-writer rule.
 
 ### Wave C: each decision at the phase that owns it
 
-| step | item | prerequisite |
+| step | item | owner | prerequisite |
 | --- | --- | --- | --- |
 | C1 | L3, in order: (a) object-literal shape against a union variant; (b) probe `checkParams`' valtype ladder with a check-clean witness; (c) reword the built-in arity floors as internal invariants; (d) the mono function-value rules | checker; `emit_sections.vl` | (d) needs B1 step 4 |
 | C2 | L5: one `pinDriver` in `check_pins.vl`; D3817 becomes a policy over `solveUnannotParams` | `typecheck.vl` | A2. Fold #3516's width-subtype rewrite in as a solver if it is still open. |
@@ -119,7 +119,7 @@ order, subject to the one-writer rule.
 
 ### Wave D: structure
 
-| step | item | prerequisite |
+| step | item | owner | prerequisite |
 | --- | --- | --- | --- |
 | D1 | L9: callee-closed carves of `typecheck.vl`. `check_pins.vl` (from C2) is the first; leaves follow. | `typecheck.vl` | A2, A6 (S-c), C2 |
 | D2 | L8: split `emit_classify.vl` by banner region; split the 400-line functions at low-liveness seams | `emit_classify.vl` | a priced self-compile A/B before the first split |
