@@ -26,7 +26,7 @@ restate measurements; follow the links.
 | L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
 | L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. The second read `valueAtomKindOfTy` and `nulScalarListKindOfTy` off the type (`tyEmitElemPrimOf`, `tyEmitElemNulPrimOf`, `tyEmitNamesOf`): 112 → 111. `valueAtomKindOfTy` still renders a union of members that share a list or closure rep (D4320), and `mapTyValKindLowerable` still renders an anonymous shape or a nullable union of shapes. Next: `armFieldUnionName`, `joinRowOfTy`, `listUnionEmitName`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
-| L4 one rollback for the quiet probes | first PR (A1) **in review** | The assertion and its measured list are in code-quality-2026-10.md L4. A2 (`CheckMark`) is next. |
+| L4 one rollback for the quiet probes | A1 and A2 **in review** | A1 is the assertion and its measured list. A2 adds `CheckMark` / `checkRollback` and records of columns, with each site's set unchanged and the census identical. The leaks go next, one site per change, from the per-leak notes in code-quality-2026-10.md L4. |
 | L7 `pending*` into `ExpCtx` | **in progress as C3** | `emitReturnValue` and `emitLetDeclStmt` each build their `ExpCtx` and restore the caller's on every exit: 25 and 34 `pending*` writes to 0 (`wasmEmit.vl` 463 to 401 lines). Next: `emitAssign`, then `emitDirectCall`. The never-cleared count (211 of 1,151) is not ratcheted yet. |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
 | L5–L6, L9–L14 | not started | |
@@ -91,7 +91,7 @@ order, subject to the one-writer rule.
 
 ### Wave A: enablers (no behaviour change)
 
-| step | item | file owner | proof |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | the fixpoint reproduces master's seed from master's source, and `vl check` text and emitted modules are identical over `tests/cases` and the corpus with the flag off |
 | A2 | L4: one `CheckMark` / `checkRollback`; each constraint family becomes a record of columns with one `truncate` | `typecheck.vl` | `vl check` and module identity; fuel A/B |
@@ -103,7 +103,7 @@ order, subject to the one-writer rule.
 
 ### Wave B: one producer per fact
 
-| step | item | owner | prerequisite |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | B1 | L1, executed as SC's migration (`fn-value-flow-design.md` §(f), steps 0–4). SC's checker-side store (§(h)) **is** L1's banked binding; there is no second bank. Mono's instance key becomes the type-id tuple, and a per-instance node-type column retires `monoArgTyName`. | lane SC (`emit_mono.vl`, the SC parts of `typecheck.vl`) | #3542 (step 0) |
 | B2 | L2 stage 2: the type-taking twins land in `tyquery.vl` | `emit_classify.vl` | A3 |
@@ -111,7 +111,7 @@ order, subject to the one-writer rule.
 
 ### Wave C: each decision at the phase that owns it
 
-| step | item | owner | prerequisite |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | C1 | L3, in order: (a) object-literal shape against a union variant; (b) probe `checkParams`' valtype ladder with a check-clean witness; (c) reword the built-in arity floors as internal invariants; (d) the mono function-value rules | checker; `emit_sections.vl` | (d) needs B1 step 4 |
 | C2 | L5: one `pinDriver` in `check_pins.vl`; D3817 becomes a policy over `solveUnannotParams` | `typecheck.vl` | A2. Fold #3516's width-subtype rewrite in as a solver if it is still open. |
@@ -119,7 +119,7 @@ order, subject to the one-writer rule.
 
 ### Wave D: structure
 
-| step | item | owner | prerequisite |
+| step | item | prerequisite |
 | --- | --- | --- | --- |
 | D1 | L9: callee-closed carves of `typecheck.vl`. `check_pins.vl` (from C2) is the first; leaves follow. | `typecheck.vl` | A2, A6 (S-c), C2 |
 | D2 | L8: split `emit_classify.vl` by banner region; split the 400-line functions at low-liveness seams | `emit_classify.vl` | a priced self-compile A/B before the first split |
@@ -175,6 +175,7 @@ Each is posted for question time; work that does not depend on it continues.
 These have no unmet prerequisite and touch disjoint files:
 
 - **A1**: L4 assertion harness (`typecheck.vl`). In review.
+- **A2**: L4 `CheckMark` / `checkRollback` (`typecheck.vl`), on A1. In review.
 - **A5**: errno agreement test (host + `std/fs.vl`).
 - **A6 / S-c**: one `./ast` import block in `typecheck.vl`. This conflicts with A1, so run it
   first; it is small.

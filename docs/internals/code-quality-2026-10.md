@@ -292,6 +292,39 @@ equals its mark, with today's per-site exceptions listed explicitly. That turns 
 list into measured facts without changing behaviour: with the flag off, `vl check` text and
 emitted modules are identical. Landed as A1; the result is the table above.
 
+**Second PR (A2).** `checkMark()` / `checkRollback(m, set)` in `typecheck.vl`, with one `RB_*`
+bit per family. The ten `*Cstr` families are records of columns (`argCstr.at`, …), each with
+one `truncate`. The seven sites keep exactly today's sets, named `RB_PINNED` (`tpIfRecheck`),
+`RB_MONO`, `RB_SOLVE`, `RB_PREPASS` (`inferReturnsPrePass`, `cstrProbeBefore`), and `RB_LINT`
+alone (`globalInitPrePass`). `cstrTablesMark`'s array and `monoRecheckBegin`'s `sv[0..20]` are
+gone. The census above is byte-identical before and after, so every leak in it still stands.
+
+**Per-leak notes for the behaviour-changing PR.** Each is a change to one site's set, graded
+on its own output diff:
+
+- `tpIfRecheck`: add `RB_BIN | RB_PRINT`. The omission is never exercised, so expect no
+  output change.
+- `monoRecheck`: add `RB_ARG | RB_LET | RB_MEM | RB_RET`. These are live in 150 / 4 / 3 / 1
+  programs. Grade against D592, D1520 and D2294. bm, ufcs and is are never exercised, so add
+  them too.
+- `solveUnannotParams`: the hole tables (holeShape, holeAlt, holeArrayDemand, holeMap) may be
+  what the probe is *for*. Ask whether the real pass re-derives them before dropping any. The
+  constraint rows (is, mem, let, coalHole, bm, ufcs, ret) are re-recorded by the real
+  pass. The question there is whether a kept probe row duplicates or pre-empts a diagnostic
+  (D3817, D3746).
+- `inferReturnsPrePass`: has the widest leak set (print 376, bin 360, let 231, bm 196, …). Its
+  diags rollback is skippable (`prbSkip`), which is the census's own control. Grade against
+  D1400, D1566 and D2241.
+- `globalInitPrePass`: rolls back only the lint notes. It drops diagnostics per initializer by
+  hand (`numLitNotesDropFrom`). Its leaks are bin 262, coalHole 61, let 50 and bm 21; grade
+  against D3078.
+- `cstrProbeBefore`: keeps its `*Cstr` rows by design (D3062). holeAlt 7, dJoin 1 and holeMap 1
+  are not part of that design, so they are the candidates to drop.
+- Not in any mark: the keyed maps beside the columns (`nestCstrSeen`, `dJoinRelayed`,
+  `tpIfJoinAt`, `tpIfOkAt`). Nor are `tpIfReNames`/`tpIfReTys`, which are spans that
+  `tpIfReStart` indexes, not rows. A rollback that drops rows leaves the maps pointing past
+  the end, so the follow-up decides what each map means after a truncate.
+
 **Proof for the refactor.** Byte-identical emitted modules and `vl check` output identity over
 `tests/cases` and the corpus; fuel A/B. Where the new default rolls back more than today, an
 output change is a finding to grade against the D3062 / D1520 witnesses.
