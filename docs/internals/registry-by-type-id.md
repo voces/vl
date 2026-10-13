@@ -154,7 +154,7 @@ Byte-identical until step 5; steps 1-2 are this PR.
 | 3 | mint `canonUnionKey` in canon; push `unKey` at all three registry mint sites; **no reader** | none | `unKey` coverage %, and a sweep asserting no two rows with different member SETS share a key | **SHIPPED — 100% covered, 0 different-set merges** |
 | 4a | the ARENA-side member-sequence renderer, so `canonUnionKeyOfTy` reaches the row's key | none | agreement per row against `unKey`, every miss categorised | **SHIPPED — 1,369 → 2,422 of 2,447 (55.9% → 98.98%)** |
 | 4b | thread the key into `registerInlineUnion`'s recursive sites, and separate the counter's `differ` from a key-EQUAL sibling | `emit_collect.vl` | per-site liveness + disagreement | **SHIPPED — 18 sites, 16 at `differ` 0 / `name-only` 0; `differ` 1,587 → 88** |
-| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, **both halves of the ABI assertion** | prerequisite (1) MET 2026-10-13 — `merge-diffvar` 1 → 0 (D1492 closed); blocked on (2) the write-seam `differ` (230 on 5,209 programs) and (3) the `name-only` rule (2,226) — §5 "Re-measured 2026-10-13" |
+| 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, **both halves of the ABI assertion** | prerequisite (1) MET 2026-10-13 — `merge-diffvar` 1 → 0 (D1492 closed); (2) MET at the write seams — `differ` 230 → 0 (the probe asked about the `LetDecl` statement), the licence gated by `tests/vl_union_key_licence_test.ts`, 68 off-site reaches a documented exception; blocked on (3) the `name-only` rule (2,248) — §5 "Prerequisite (2)" |
 | 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — | |
 
 ### What steps 1-3 landed, measured
@@ -428,6 +428,54 @@ fixpoint byte for byte, and `rep-fuzz-check.sh` is exact.
 whole corpus" described the 2,790-program corpus; the switch has to account for these before a
 read seam returns the id answer. (2) and (3) are open and unscheduled.
 
+### Prerequisite (2) — the write seams were asking about the STATEMENT, and the licence is a test
+
+**The licence is gated.** `tests/vl_union_key_licence_test.ts` sweeps the 130 `tests/cases`
+programs whose rows share a key (`keySweep/merge` ≥ 1, the only programs where either half can
+fire; listed in `tests/fixtures/union-key-licence/witnesses.txt`) and fails on any
+`keySweep/merge-diffset` or `keySweep/merge-diffvar`. Its control is D1492's own program,
+which must reach the pair compare; run against the pre-D1492 master seed the test reds on
+exactly that program (`merge-diffvar` 1). `VL_UNION_LICENCE_FULL=1` sweeps all 5,209
+programs (0 and 0).
+
+**228 of the 230 write-seam `differ` were an instrument defect.** A seeded sample (4 programs
+per site, minimised by line removal) fell to one un-annotated `const` each — `const b = if c
+{ "green" } else { 7 }`, `const t = o.inner?.w`, `const z = get(true) ?? [4]` — and every one
+offered `nodeTyIxOf` of the `LetDecl` STATEMENT, whose type is `void`, so `unABTyProbe`
+compared the row with `void`. Under the switch that would have recorded `void` as the row's
+type. The three sites now offer the INITIALISER's type (`letInitTyIxOf`), the optional-call
+mint that shared site 29 with `riu/mapVal` has its own site 47 (`collectU/optCallRet`), and
+`registerValueUnionNameAB` mints first and then asks the ROW question every read seam asks
+(`unABProbe` on `unRowOfName` against `unRowOfTyAB`); `unABTyProbe` is retired.
+
+| write seam | agree | alias | name-only | differ (was) |
+| --- | --- | --- | --- | --- |
+| `collectU/inferLetTy` | 134 | 4 | 12 | **0** (140) |
+| `nliInferIfLet` | 73 | 2 | 4 | **0** (79) |
+| `nliInferOptChainLet` | 11 | 0 | 0 | **0** (11) |
+| `collectU/optCallRet` | 15 | 0 | 0 | **0** (in site 29) |
+
+The 16 `name-only` (three programs) carry the other 2 of the 230: an inferred literal union beside a scalar
+(`9000000000 | 1 | i32`) whose row holds the softened rep `i64|i32` — §2's type-vs-rep
+softening, so they join (3) rather than (2). Distilled: write-seam `differ` 47 → 0.
+
+**The 68 off-site `differ` are three mechanisms, each a KEY decision already priced above.**
+Every reach printed its two rows; each family minimised to the line shown.
+
+| family | sites (reaches) | minimal witness | the two rows |
+| --- | --- | --- | --- |
+| `null`'s declared position (4a miss #3) | `internShapeDeep/valueUnion` 16, `regValueUnionTy` 9 | `function inl(): null \| f64 \| null { return null }` | `null\|f64` vs `f64\|null` |
+| a record arm spelled by alias vs by shape | `unionNameOfExpr/is` 7, `letAnnUnionSlot` 5, `letAnnUnionKind` 4, `emitLetDeclStmt/union` 4, `arrLitBoxElem` 4, `emitReturnValue/inferRet` 2, `letAnnUnionRetSink` 1, `fnUnionRetSinkOk` 1 | `type P = {x: i32}` and a join of a `P` with a `string`, beside the same join of an inferred `{ x: 7 }` | `P\|string` vs `{x:i32}\|string` |
+| D1493, the alias-expansion key | `riu/mapVal` 15 | `std:json`'s `Json` narrowed by `is` | `Json` vs its expansion |
+
+None is a disagreement about which ATOMS the union holds; each is two rows the key keeps
+apart that a different key would fuse. The first and third are the two refused re-keyings in
+"The licence is TWO assertions"; the second is the same shape over a structural record
+(the D3870 ruling makes `P` and `{x: i32}` one type, the key renders them differently). So
+(2) is met at the write seams, and the off-site 68 are a documented exception: the switch
+must leave these sites on the NAME answer, or land one of the re-keyings with its
+`merge-diffset` price paid, before they return the id answer.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
@@ -524,10 +572,9 @@ recorded type being a union SHAPE (D1490). Still no reader; arming still rides
 **Step 5 needs three things, in this order.** (1) **`merge-diffvar` to reach 0** — one pair,
 D1492, and until it does the switch can hand a caller a row with an empty variant slice.
 **Met 2026-10-13** (§5 "Re-measured 2026-10-13"); (2) and (3) below are re-counted there.
-(2) **A decision for the 87 write-seam `differ`** — `registerValueUnionNameAB`'s probe is
-`unABTyProbe`, a `repCanonId` compare of two TYPES at a mint, which is a different question
-from "which row"; either it becomes a row question or those three sites are a documented
-exception. (3) **A rule for the 992 `name-only`**, which is not one gap: ~416 want a
+(2) **A decision for the write-seam `differ`** — **met** (§5 "Prerequisite (2)"): the
+probe is a row question, the three seams offer the initialiser's type, and the 68 off-site
+reaches are three named key decisions the switch leaves on the name answer. (3) **A rule for the 992 `name-only`**, which is not one gap: ~416 want a
 narrowed-from link the tree does not have, 350 are unions the arena records structurally
 where the row holds a reverse-mapped nominal spelling, ~148 are the row's own key (4a misses
 #2/#4), ~78 are D1490's collapse. **The seams that return a ROW rather than a boolean
