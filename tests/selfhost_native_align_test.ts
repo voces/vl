@@ -50,6 +50,7 @@
 // @test-timing native
 // @test-timing sweep n=2328 name~"native-align setup"
 
+import { filePath } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 const CASES = new URL("./cases/", import.meta.url);
@@ -67,7 +68,7 @@ if (GATED && !ENABLED) {
 }
 
 const src = (rel: string) => Deno.readTextFileSync(new URL(rel, CASES));
-const path = (rel: string) => new URL(rel, CASES).pathname;
+const path = (rel: string) => filePath(new URL(rel, CASES));
 const base = (rel: string) => rel.split("/").pop()!;
 const head = (s: string, n = 1) => s.trim().split("\n").slice(0, n).join(" / ");
 
@@ -194,7 +195,7 @@ const walkVl = function* (dir: URL): Generator<string> {
     const child = new URL(entry.name + (entry.isDirectory ? "/" : ""), dir);
     if (entry.isDirectory) yield* walkVl(child);
     else if (entry.name.endsWith(".vl")) {
-      yield child.pathname.slice(CASES.pathname.length);
+      yield child.href.slice(CASES.href.length);
     }
   }
 };
@@ -321,8 +322,11 @@ let batchP: Promise<Map<string, BatchResult>> | null = null;
 const batchResults = (): Promise<Map<string, BatchResult>> =>
   batchP ??= (async () => {
     const results = new Map<string, BatchResult>();
+    // Through `spawnGate`, like every other spawn here: there are as many waves as the
+    // most repeated basename has copies (about a hundred), and launching them all at
+    // once starves every other process on the box.
     await Promise.all(
-      partitionWaves([...TIERS.run, ...TIERS.trap]).map(async (wave) => {
+      partitionWaves([...TIERS.run, ...TIERS.trap]).map((wave) => spawnGate(async () => {
         const dir = await Deno.makeTempDir({ prefix: "vl-native-align-batch-" });
         try {
           const { code, stderr } = await new Deno.Command(VL, {
@@ -359,7 +363,7 @@ const batchResults = (): Promise<Map<string, BatchResult>> =>
         } finally {
           await Deno.remove(dir, { recursive: true }).catch(() => {});
         }
-      }),
+      })),
     );
     return results;
   })();
@@ -414,6 +418,24 @@ const checkWaves = (rels: string[]): string[][] => {
   const n = Math.min(SPAWN_JOBS, rels.length);
   const out: string[][] = Array.from({ length: n }, () => []);
   rels.forEach((rel, i) => out[i % n].push(rel));
+  return out.flatMap(fitArgv);
+};
+
+// Windows caps a whole command line at 32,767 characters, which one wave of absolute
+// paths exceeds; there a wave runs as several processes. Elsewhere it stays one.
+const ARGV_BUDGET = Deno.build.os === "windows" ? 24_000 : Infinity;
+const fitArgv = (rels: string[]): string[][] => {
+  const out: string[][] = [[]];
+  let len = 0;
+  for (const rel of rels) {
+    const n = path(rel).length + 3;
+    if (len + n > ARGV_BUDGET && out[out.length - 1].length > 0) {
+      out.push([]);
+      len = 0;
+    }
+    out[out.length - 1].push(rel);
+    len += n;
+  }
   return out;
 };
 

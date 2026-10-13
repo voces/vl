@@ -421,8 +421,8 @@ operand's _kind_ determines how:
   must carry `| null`, else the checker refuses and names `as!` / `as?`), `as?`
   yields `null` typed `T | null`, `as!` traps. A FLOAT target (`f64 → f32`,
   `i64 → f64`) rounds and never fails. Loss is spelled where it happens:
-  `trunc(d) as! i32` / `floor(d) as! i32`, which the emitter peepholes to the
-  one `i32.trunc_f64_s` today's `d as i32` emits. The struck paragraph's
+  `trunc(d) as! i32` / `floor(d) as! i32`, where the emitter drops the
+  integrality compare and tests only the range. The struck paragraph's
   objection was to propagating the OPERAND (a raw `f64`); what propagates here
   is `null`, the trio's remainder for a failure with one cause, which infects
   nothing the signature does not already owe. Extension 3b's user cast remains

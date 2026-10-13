@@ -28,7 +28,8 @@
 //
 // PURE — reads two `.vl` files as text. No seed, no binary, so it runs in the `ci` job.
 
-const ROOT = new URL("../", import.meta.url).pathname.replace(/\/$/, "");
+import { filePath } from "./support/filePath.ts";
+const ROOT = filePath(new URL("../", import.meta.url)).replace(/[\\/]$/, "");
 
 const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);

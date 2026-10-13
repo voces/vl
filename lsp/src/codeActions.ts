@@ -303,6 +303,17 @@ export type FixableDiagnostic = {
 export const UFCS_NOT_IMPORTED_CODE = "ufcs-not-imported";
 
 /**
+ * The code of an undeclared name some module exports (`undeclared identifier 'X' — `X`
+ * is exported by …`). Same payload as {@link UFCS_NOT_IMPORTED_CODE} — `member` and one
+ * `modules` field per exporter — and the same fix, so the readers below take either.
+ */
+export const MISSING_IMPORT_CODE = "missing-import";
+
+/** Whether `code` is one of the two codes whose fix is an import. */
+const isImportCode = (code: string | number | undefined): boolean =>
+  code === UFCS_NOT_IMPORTED_CODE || code === MISSING_IMPORT_CODE;
+
+/**
  * The CATEGORY of a diagnostic code — everything before the first `;`.
  *
  * KEPT AS A TOLERANT READER, DEPENDED ON BY NOTHING. A code is a bare category
@@ -333,7 +344,7 @@ export const ufcsMissingImportAt = (
   source: string,
   diag: FixableDiagnostic,
 ): string | undefined => {
-  if (diag.code !== UFCS_NOT_IMPORTED_CODE) return undefined;
+  if (!isImportCode(diag.code)) return undefined;
   const line = splitLines(source)[diag.range.start.line];
   if (line === undefined) return undefined;
   const end = diag.range.end.line === diag.range.start.line
@@ -359,11 +370,11 @@ export const ufcsImportModules = (
   diag: FixableDiagnostic,
   cached: readonly FixableDiagnostic[] = [],
 ): string[] => {
-  if (diag.code !== UFCS_NOT_IMPORTED_CODE) return [];
+  if (!isImportCode(diag.code)) return [];
   const own = dataModules(diag.data);
   if (own !== undefined) return own;
   for (const d of cached) {
-    if (d.code !== UFCS_NOT_IMPORTED_CODE) continue;
+    if (d.code !== diag.code) continue;
     if (d.range.start.line !== diag.range.start.line) continue;
     if (d.range.start.character !== diag.range.start.character) continue;
     const twin = dataModules(d.data);

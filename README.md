@@ -127,8 +127,8 @@ the host build.)
 
 | Command | What it does |
 |---|---|
-| `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
-| `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `-O3` the release profile, `--wat` also dump text, `--no-validate` skip the instantiability check; `--import-memory` / `--heap-base=` / `--heap-limit=` lay a unit out to share a host-owned memory; `--shared-memory=<pages>` makes that memory shared across Web Workers). |
+| `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. `--extern NAME=VALUE` gives an `extern let`/`extern const` global its value. |
+| `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `-O3` the release profile, `--wat` also dump text, `--no-validate` skip the instantiability check; `--import-memory` / `--heap-base=` / `--heap-limit=` lay a unit out to share a host-owned memory; `--shared-memory=<pages>` makes that memory shared across Web Workers; `--initial-memory=<size>` / `--max-memory=<size>` size it). |
 | `vl check <path>` | Type-check + lint (errors + warnings/hints) a file, or every `*.vl` under a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>` prunes paths). Pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter; `--fix` writes the safe lint fixes in place — `prefer-const` (`let`→`const`) and `redundant-type` (removes an explicit annotation the initializer already infers, e.g. `let x: i32 = 5` → `let x = 5`). |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |
 
@@ -214,6 +214,34 @@ deno task install               # = npm ci
 | `deno task test` | Run the suite (`tests/` — the `.vl` corpus + unit tests). |
 | `deno task playground` | Build the in-browser playground (Monaco + client-side LSP) and serve it. |
 | `deno task playground:build` / `:verify` | Build / verify just the playground bundle. |
+
+### Developing on Windows
+
+Everything above runs natively on Windows, with Git for Windows supplying the shell.
+
+- Install Git for Windows, Rust, Deno, Node (for `npm ci`) and Python 3.9+.
+- Put `C:\Program Files\Git\bin` on `PATH` ahead of `System32`. A bare `bash` otherwise
+  starts WSL.
+- Run the `.sh` scripts under Git Bash: `bash scripts/gate.sh`, `bash scripts/refresh-compiler.sh`.
+- Set `PYTHONUTF8=1`. The Python tooling reads UTF-8 files, and a Windows Python defaults to
+  cp1252. `gate.sh` exports it for its own rows.
+- Create `<drive>:\tmp` on the checkout's drive. Several fixtures write `/tmp/...`, which a
+  native process resolves on the current drive.
+- `vl` prints paths with `/` separators on every OS, so compare test output against
+  `slashed()` from `tests/support/filePath.ts`.
+- If a virus scanner excludes a folder, set `VL_TMP` to it: `gate.sh` then puts every row's
+  temp files there. A scanner that inspects each process launch and new file otherwise costs
+  the gate about 10–15% of its wall time.
+- `bash scripts/gate.sh --fast` is a local check to run before pushing: every row except the slow
+  ten. It takes about a minute on Windows and is not the merge gate.
+- `gate.sh` runs at most 6 rows at a time on Windows unless `GATE_MAX_PAR` says otherwise.
+  Measured on a 24-thread box, 2026-10-12: every row at once 501 s; 12 at a time 342 s;
+  8, 332 s; 6, 306 s; 4, 333 s.
+- Set `VL_BINARYEN` to a directory of binaryen's native release (the version in
+  `package.json`) and the suites use it instead of npm's JS build. The output is
+  byte-identical, `-O` is about 5x faster, and each call skips node's start-up.
+- `gate.sh`'s CPU column reads 0 here. Git Bash's `times` cannot see a native child's CPU,
+  and no gate grades on that column.
 
 ### Editor (LSP)
 

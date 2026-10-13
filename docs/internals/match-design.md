@@ -70,6 +70,12 @@ Phase 3 (now):
   `_`. See "An integer scrutinee" below; the ruling is DECISIONS.md §"`match` over an integer
   scrutinee".
 
+Phase 3b (now):
+- **Constant** — `MAGIC => …` where `MAGIC` is a `const` with a literal value, over any scrutinee
+  a literal arm takes: compared by value, with the literal arm's duplicate, exhaustiveness and
+  `br_table` treatment. A bare name that is neither a type nor such a constant is an error. The
+  ruling and its edges are DECISIONS.md §"A `const` with a literal value is a `match` arm".
+
 Deferred (follow-ups, captured here so we don't reinvent them):
 - **Guards** — `pat if cond => …` (`when`-style). Keep `if`-conditions OUT of the pattern grammar
   otherwise; arbitrary-condition `when` (Kotlin) would make exhaustiveness meaningless.
@@ -273,19 +279,19 @@ variant, return sink) and the two binding-init sinks (nullable local, union-box 
 the VALUE in its own rep. Stack-wise the prelude is neutral: it runs inside the arm's `if`/`else`
 frame and leaves only the value the blocktype promises.
 
-**The constraint is the local-slot PRE-ORDER, and it is why two positions are refused.** Wasm
-locals are function-scoped, and `emitLetDeclStmt` claims them off a linear cursor whose order the
-collect pass must have replayed exactly — a slot claimed out of order is another binding's cell,
-which is a silent wrong answer, not a crash. So the collect pass walks the two statement positions
-whose order the emitter reproduces (`collectIfExprLocals`): a binding INITIALIZER and a `return`
-operand. It does NOT walk an if-expression nested deeper inside an expression (an argument, an
-arm's own tail value), nor a TOP-LEVEL binding, whose `const` is a module global that the start
-function's local collection never descends into. `armPreludeBlocks` records the arms collect walked
-and `emitIfArmOpen` requires membership, so those two shapes are diagnostics naming the supported
-spelling. Without that test both were compiler TRAPS (`out of bounds array access`) the moment the
-arm emitters accepted a multi-statement arm — the mark is what converts a silent-or-crashing
-misalignment into a loud one. Widening either position means teaching collect to walk expressions
-in the emitter's evaluation order; the pre-order is the whole cost.
+**The constraint was the local-slot PRE-ORDER; an expression arm now takes its slots by node.**
+Wasm locals are function-scoped, and `emitLetDeclStmt` claims them off a linear cursor whose order
+the collect pass must replay exactly — a slot claimed out of order is another binding's cell. The
+collect pass replays that order for the two statement positions the emitter reproduces
+(`collectIfExprLocals`): a binding INITIALIZER and a `return` operand. Every other if-expression —
+an argument, an operand, an element or field, an arm's own tail, a global's initializer, a
+top-level expression — is found by `collectExprArms` wherever the walk meets it, and its arm's
+locals are pinned to their declaration NODE (`declSlotByNode`), which `emitLetDeclStmt` reads
+before the cursor; the cursor steps over every such position (`localByNode`), so no slot it hands
+out moves (D2785). The parser records each if or match it meets in expression position
+(`valueIfNodes`), and a program with none of them declaring a local skips the walk entirely.
+`armPreludeBlocks` still records the arms collect walked and `emitIfArmOpen` still requires
+membership, so an arm no walk reached is a loud internal failure rather than a misaligned slot.
 
 `armPreludeBlocks` holds arena NODE indices, so it resets in `emitProgram`'s sidecar block with the
 other index columns. A stale index that happens to name a node in the next program grants

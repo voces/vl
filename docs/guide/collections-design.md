@@ -23,33 +23,86 @@
 
 Everything below this section is design vocabulary and a decision record; this block is
 the shipped surface, and it is here because the rest of the document did not state it in
-one place. A consumer building a real program (glean, VL-033) read `Map()` working as a
-value, wrote `type S = { index: Map }`, was told `unknown type 'Map'`, and concluded the
-map type was unspellable. It is spellable — with the index signature, never with the
-constructor's name:
+one place.
 
 | you want | the TYPE | the VALUE |
 | --- | --- | --- |
 | a sequence | `T[]` — `string[]`, `i32[][]` | `[...]` — `["a", "b"]`, `[]` |
-| a byte sequence | `u8[]` | `[...]` of `i32`s, or `std:fs`'s `readFile` |
-| a map | `{[K]: V}` — `{[string]: i32}` | `Map()` |
-| a set | `{[K]: boolean}` — `{[string]: boolean}` | `Set()` |
+| a byte sequence | `u8[]` | `[...]` of `i32`s, `std:bytes`'s `zeroBytes(n)`, or `std:fs`'s `readFile` |
+| a map | `Map<K, V>` or `{[K]: V}` — `Map<string, i32>` | `Map()`, `Map<string, i32>()` |
+| a set | `Set<T>` — `Set<string>` | `Set()`, `Set<string>()` |
 
-`Map` and `Set` are CONSTRUCTOR names, not type names, and `Map<string, i32>` is not a
-spelling either (call-site type arguments do not exist; that is A15, unbuilt). The
-checker says so at every annotation position since D1582. A map is an ordinary field
-type, so the struct VL-033 wanted is:
+**`Map<K, V>` and `{[K]: V}` are two spellings of ONE type** (A15): either flows where the
+other is written, both carry the whole map surface, and a hover or an error prints the
+index-signature spelling. Both shorthands, `{[K]: V}` and `T[]`, name CONCRETE types with
+their full methods, and `T[]` is not a subtype of `{[i32]: T}` (owner ruling Q1, 2026-09-25,
+which retires §C2's interface reading — see the banner there). **`Set<T>` is its own type**
+(ruling Q2): `add`, `has`, `delete`, `clear()`, `keys()`/`values()` (the elements, `T[]`), `length` and
+`for x in s`; no index and no `get`/`set`; and it is neither a list nor a map, so it flows
+to no `T[]` or `{[K]: V}` destination and neither flows to it. It prints as `Set<T>`.
+`{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`; it inserts
+with `m[k] = true`, since `.add` is a Set method. A set and a map whose value is one `i32` cell
+(`boolean`, `i32`, a literal union) cannot share a union yet (D2673); two such maps can
+(`{[K]: i32} | {[K]: boolean}`), and `is` tells them apart. A bare
+`Map` or `Set` with no type arguments is not a type — the checker says
+`` `Map` needs its key and value types — write `Map<K, V>` ``.
+
+**What each operation costs** — its complexity, which is contract, and a measured time — is
+on [the cost page](costs.md), with when `u8[]`, a `Buf`, or `std:idtable`'s `IdTable<V>` (a
+table keyed by small ids you hand out yourself) is the right tool.
+
+A map is an ordinary field type, so the struct glean's VL-033 wanted is:
 
 ```vl
-type Interner = { names: string[], index: {[string]: i32} }
+type Interner = { names: string[], index: Map<string, i32> }
 const it: Interner = { names: [], index: Map() }
 it.index.set("main", 0)
 print(it.index["main"] ?? -1)
 ```
 
-Keys must be `string` or `i32` (anything else is a named refusal). An EMPTY collection
-still needs its element/value type pinned by an annotation or by a use — `const m = Map()`
-alone is `cannot infer a type for 'm'`, exactly as `const xs = []` is.
+Keys must be `string`, `i32` or `i64` (anything else is a named refusal, at `Map<f64, i32>` as
+at `{[f64]: i32}`). An EMPTY collection needs its key and value types from somewhere: a
+constructor that names them (`const m = Map<string, i32>()`), an annotation on its
+destination, or a later use. `const m = Map()` with none of those is
+`cannot infer a type for 'm'`, exactly as `const xs = []` is.
+
+**Every collection counts with `.length`, and other languages' spellings are refused with
+the VL one named** (owner ruling Q9, 2026-09-25; DECISIONS.md §"Every collection counts with
+`.length`"). A list, a map, a `Set` and a string all answer `.length`; there is no second name.
+What you might reach for from elsewhere, and what the checker says:
+
+| you wrote | the checker says |
+| --- | --- |
+| `m.size`, `s.size`, `xs.size`, `"ab".size` | ``no field 'size' on map {[string]: i32}; did you mean '.length'?`` |
+| `xs.count`, `m.count` | ``no field 'count' on array i32[]; did you mean '.length'?`` |
+| `len(xs)` (a list, map, set or string) | ``undeclared identifier 'len' — a length is a member in VL; did you mean 'xs.length'?`` |
+| `Array<i32>` | ``unknown type 'Array<i32>'; did you mean 'i32[]'?`` |
+| `Record<string, i32>` | ``unknown type 'Record<string,i32>'; did you mean '{[string]: i32}' or 'Map<string, i32>'?`` |
+| `xs.contains(x)` | ``no method '.contains' on array i32[]; did you mean '.includes'?`` |
+| `"a" in m` | `` `in` is not an operator in VL outside a `for` loop's head; to test for a key, use `m.has(k)` `` |
+| `x in s` (a `Set`) | ``… ; to test set membership, use `s.has(x)` `` |
+| `x in xs` (a list) | ``… ; use `xs.includes(x)` for a value, or `i < xs.length` for an index`` |
+| `"a" in s` (a string) | ``… ; to test for a substring, use `s.includes("a")` `` |
+
+The names stay free for your own use: a record field called `size`, a `self`-function
+`size(self: {[string]: i32})` called as `m.size()`, a function of your own called `len`, and a
+type of your own called `Array` or `Record` all work, and the redirects above fire only when
+nothing in scope has the name. `in` is a keyword only in a `for` head (`for x in xs`); in an
+expression it parses at a comparison's precedence purely so that `if x in xs && y` is one
+diagnostic rather than a parse cascade (ruling Q10; DECISIONS.md §"`in` is a for-loop keyword,
+not an operator").
+
+**Explicit type arguments on any generic call.** The same `<…>` works on a call of your own
+generic function, TypeScript's way: `id<f64>(3)`, `make<string>()`. The written types bind
+the function's type parameters in declaration order before any argument is checked, so an
+argument that disagrees is the argument's error (`id<string>(3)` reports argument 1), a bound
+is checked at the written type, and a type parameter no parameter mentions becomes callable.
+The parse rule is TypeScript's: after a name, `<` opens type arguments only when what follows
+parses as a type list, closes with `>`, and is directly followed by `(`; every other `<` is a
+comparison. So `a < b > (c)` now reads as a generic call — a relational chain VL's checker
+never accepted, since `a < b` is a `boolean` — and so does `f(a < b, c > (d))`, which DID run
+before as two comparisons and is now refused with a hint; parenthesise a comparison there:
+`f((a < b), c > (d))`.
 
 **Iterating a collection — reach for the element, not the index.** The first spelling to
 try binds the elements directly; it needs no bound and cannot run off the end:
@@ -834,11 +887,11 @@ is no fixed-array literal to fight.
   pitfall) is deferred.
 
 **Explicitly out of scope for v1 (xfail / future):**
-- `insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift) — `push`/`pop`
-  (ends) only in v1.
+- ~~`insert(i, x)` / `remove(i)` at arbitrary positions (O(n) shift)~~ — shipped in
+  `std:array` as `insert`, `removeAt`, `swapRemove` and the in-place filter `retain`.
 - `shrinkToFit()` / any auto-shrink — grow-only.
 - **Per-frame pooling / reuse beyond `clear()`** — a heavier "retain this buffer
-  across frames" story (`retain`, `mapInto(dst)`, free-list pooling) is **deferred
+  across frames" story (`mapInto(dst)`, free-list pooling) is **deferred
   past v1**: it is not clearly first-release-critical, and the inferred fixed-array
   representation (§VL.7) already removes the per-frame allocation for the
   fixed-size cases *for free*. The one cheap piece kept in v1 is capacity-retaining
@@ -1005,7 +1058,19 @@ inference (or even single-representation-first) and tighten later.
 
 ## §C2 — Collections as structural interfaces: `{[K]:V}` as interface, `Map`/`List`/`Set` as subtypes
 
-> Status: **design / research only.** This records a decision the owner made this
+> **REVERSED 2026-09-25 (owner ruling Q1).** `{[K]: V}` and `T[]` are CONCRETE types with their
+> full methods; `Map<K, V>` is only a longer spelling of `{[K]: V}`; and `T[]` is not a subtype
+> of `{[i32]: T}` in either direction. The index contracts differ (a list read traps and has
+> type `T`, a map read on a miss yields `V | null`; a list write out of bounds traps, a map
+> write inserts), the checker never implemented the interface reading, and the bug C2 was
+> chosen to fix came from `Set` being spelled `{[T]: boolean}`, which C2.2's own `Set<T>` now
+> fixes (ruling Q2, built). "Any mapping" is a bound. The rationale is
+> `docs/internals/collections-representation-design.md` §5 and §11 (branch
+> `design-collections-representation`), and the record is DECISIONS.md, "`{[K]: V}` and `T[]`
+> are concrete types". The section below is kept as the decision history; C2.2 (`Set<T>`) and
+> C2.3/C2.4 still describe the shipped surface.
+
+> Status (original): **design / research only.** This records a decision the owner made this
 > round ("C2") about *what an index-signature type means* and *how the concrete
 > collections relate to it*. As with the rest of this doc, the `DECISIONS.md` entry
 > lands **with implementation, not before** — this section is the mental model and the
@@ -1081,6 +1146,13 @@ the `self` param wears."
 
 ### C2.2 — `Set<T>` is its OWN type — *not* `{[T]:boolean}`
 
+> **BUILT 2026-09-25 (owner ruling Q2).** The shipped surface is `add`, `has`, `delete`,
+> `keys()` and `values()` (both the elements, `T[]`), `length`, and `for x in s`. There is no
+> positional or membership subscript: `s[x]` is refused with a sentence naming `has`/`add`.
+> Q2 also settles the paragraph below that relates a set to the `{[i32]: T}` sequence core:
+> a set has no relation to lists or maps, so it is a subtype of neither. It is invariant in
+> `T`. `{[T]: boolean}` stays legal as a plain map of booleans, without `.add`.
+
 **Decision.** `Set<T>` is a **distinct concrete type** with its own surface — it is
 **not** spelled, and not structurally equal to, `{[T]:boolean}`. Its surface is:
 
@@ -1128,6 +1200,9 @@ never a real value a user stored; it was a representation artifact of spelling
 membership as a map-to-bool, and it should never have been observable.
 
 ### C2.3 — Size unifies on `.length`
+
+**Shipped** (ruling Q9, 2026-09-25): `m.size` is gone, and `.size`/`.count` on any collection
+or string is refused with a redirect to `.length` (see "What you write TODAY").
 
 **Decision.** Drop `.size` for `Map`/`Set`; use **`.length`** uniformly across
 `List`, `Map`, and `Set`. This is the **DECISIONS B6** member: O(1), read-only,

@@ -4,6 +4,7 @@
 // `refresh-compiler.sh` yet) they self-ignore with build instructions, the same
 // convention as the native align suite. The diff helper tests run always.
 
+import { filePath } from "./support/filePath.ts";
 import {
   diffDefinition,
   diffDiagnostics,
@@ -13,7 +14,7 @@ import {
 } from "../lsp/src/wasmCheckerNode.ts";
 import type { VLDiagnostic } from "../compiler/diagnostics.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -122,6 +123,257 @@ Deno.test({ name: "wasm-checker: `unknown type` carries the `did you mean` suffi
   const miss = await msgs("type Circle = { r: f64 }\n\nconst z: Zork = 1\nprint(z)\n");
   if (JSON.stringify(miss) !== JSON.stringify(["unknown type 'Zork'"])) {
     throw new Error(`want ["unknown type 'Zork'"], got ${JSON.stringify(miss)}`);
+  }
+});
+
+// D2860 (plumb PL-052) — a mismatch whose value reads an un-annotated numeric literal names that
+// declaration and the annotation, on the same message the CLI prints. The control annotates the
+// declaration wrongly, so the mismatch stands and the note must not.
+Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const body = "function mul32(a: f32, b: f32): f32 { a * b }\n" +
+    "const TABLE = [1.0, 0.0, 0.0, 1.0]\n" +
+    "function f(): f32 { mul32(TABLE[0], 1.0) }\nprint(f())\n";
+  const hit = await msgs(body);
+  const wantHit = [
+    "argument 1: expected f32, got f64 — `TABLE` on line 2 has no annotation, so its literal " +
+    "defaulted to `f64[]`; annotate it: `const TABLE: f32[] = …`",
+  ];
+  if (JSON.stringify(hit) !== JSON.stringify(wantHit)) {
+    throw new Error(`want ${JSON.stringify(wantHit)}, got ${JSON.stringify(hit)}`);
+  }
+  // No note: an annotated declaration, a non-literal initializer, and a list a non-literal write
+  // reaches. A scalar `let` a non-literal write reaches takes its type from its uses (D3246), and
+  // one whose read and write disagree is refused naming both, below.
+  const g = "function g(a: f32): f32 { a }\nfunction src(): f64 { 3.0 }\n";
+  const misses = [
+    body.replace("const TABLE =", "const TABLE: f64[] ="),
+    g + "const T: f64[] = [1.0]\nconst V = T[0]\nprint(g(V))\n",
+    // A non-literal element write or push: the suggested `f32[]` would refuse it.
+    g + "const A = [1.0, 0.0]\nA[1] = src()\nprint(g(A[0]))\n",
+    g + "const B = [1.0, 0.0]\nB.push(src())\nprint(g(B[0]))\n",
+    g + "let C = [1.0, 0.0]\nC[0] = src()\nprint(g(C[0]))\n",
+    g + "const D = [1.0, 0.0]\nconst E = D\nE[0] = src()\nprint(g(D[0]))\n",
+  ];
+  for (const src of misses) {
+    const miss = await msgs(src);
+    if (JSON.stringify(miss) !== JSON.stringify(["argument 1: expected f32, got f64"])) {
+      throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(miss)}`);
+    }
+  }
+  const conflict = (nm: string, a: number, ta: string, b: number, tb: string) =>
+    `\`${nm}\` takes its type from its uses, and they conflict: the use on line ${a} needs ` +
+    `\`${ta}\` and the use on line ${b} needs \`${tb}\` — annotate \`${nm}\``;
+  const scalars: [string, string[]][] = [
+    [
+      g + "let w = 1.5\nprint(g(w))\nw = src()\n",
+      ["argument 1: expected f32, got f64", conflict("w", 4, "f32", 5, "f64")],
+    ],
+    [
+      g + "let u = 1.5\nu += src()\nprint(g(u))\n",
+      ["argument 1: expected f32, got f64", conflict("u", 4, "f64", 5, "f32")],
+    ],
+    // A literal `const` is its literal at the read, so the mismatch is the literal's own.
+    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it"]],
+  ];
+  for (const [src, want] of scalars) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)} for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
+  }
+  // An exported declaration in another module, read through an import alias: the note names the
+  // declaring file and keeps `export`.
+  const lib = "export const TABLE = [1.0, 2.0]\n";
+  const read = (key: string) => key.endsWith("lib.vl") ? lib : undefined;
+  const cross = (await checker.check(
+    'import { TABLE as T } from "./lib"\nfunction g(a: f32): f32 { a }\nprint(g(T[0]))\n',
+    "/proj/main.vl",
+    read,
+  )).filter((d) => d.severity === "error").map((d) => d.message);
+  const wantCross = [
+    "argument 1: expected f32, got f64 — `TABLE` on line 1 of lib.vl has no annotation, so its " +
+    "literal defaulted to `f64[]`; annotate it: `export const TABLE: f32[] = …`",
+  ];
+  if (JSON.stringify(cross) !== JSON.stringify(wantCross)) {
+    throw new Error(`want ${JSON.stringify(wantCross)}, got ${JSON.stringify(cross)}`);
+  }
+});
+
+// D2966 (plumb PL-054) — a store the defaulted literal refuses names the declaration too. The
+// misses pin the note's ABSENCE, which a fixture's substring directive cannot.
+Deno.test({ name: "wasm-checker: a store into a defaulted literal names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const witness = "function ld32(a: i64) { (__load_i32__(a as% i32) as% i64) & 4294967295 }\n" +
+    "function sum(p: i64, n: i64) { let s = 0; let i = 0; while i < n { s += ld32(p + i * 4); i += 1 }; s }\n" +
+    "print(sum(0, 0))\n";
+  // PL-054's witness now checks: `s` takes `i64` from its store (D3246).
+  const clean = await msgs(witness);
+  if (clean.length !== 0) throw new Error(`want the witness clean, got ${JSON.stringify(clean)}`);
+  const hits: [string, string][] = [
+    [
+      "function fl(): f32 { 1.5 }\nconst r = { x: 0 }\nr.x += fl()\nprint(r.x)\n",
+      "operator '+' mixes i32 and f32 — field `x` of `r` on line 2 has no annotation, so its " +
+      "literal defaulted to `i32`; write it `x: 0 as f32`",
+    ],
+  ];
+  for (const [src, want] of hits) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify([want])) {
+      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
+    }
+  }
+  // No note: an annotated declaration, an integer `let` a float is stored into, a float `let` an
+  // integer is stored into (each keeps its kind, D3246), and a store to a `const`.
+  const g = "function big(): i64 { 5 }\nfunction fl(): f32 { 1.5 }\n";
+  const misses: [string, string[]][] = [
+    [g + "let a: i32 = 0\na = big()\nprint(a)\n", ["cannot assign i64 to i32"]],
+    [g + "let b = 0\nb = big()\nb = fl()\nprint(b)\n", ["cannot assign f32 to i64"]],
+    [g + "let c = 0.5\nc = big()\nprint(c)\n", ["cannot assign i64 to f64"]],
+    // A whole store to a `const` is refused; a `const` is never re-typed by a store.
+    [
+      "function big(): i64 { 5000000000 }\nconst t = 0\n" +
+      "function run() { const s = 0; s += big(); t = big() }\nrun()\n",
+      [
+        "cannot reassign `const` s",
+        "cannot assign i64 to i32",
+        "cannot reassign `const` t",
+        "cannot assign i64 to i32",
+      ],
+    ],
+  ];
+  for (const [src, want] of misses) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)} for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
+  }
+});
+
+// D2977 (plumb PL-056) — the refused value reads the literal binding as a first argument, an
+// operand, or inside a record or list literal. The misses pin the note's ABSENCE when another read
+// wants the literal's own type: the suggestion would refuse that read.
+Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const g = "function mul(a: f32, b: f32): f32 { a * b }\nfunction gi(a: i32): i32 { a }\n";
+  // A literal `const` is its literal at every read (D3246, owner ruling C): a first argument, an
+  // operand, a record field, a list element, and reads that want different types all check.
+  const clean = [
+    g + "const x = 0.0\nfunction f(y: f32): f32 { mul(x, y) }\nprint(f(2.0))\n",
+    g + "function f(y: f32): f32 {\n  const n = 3\n  n * y\n}\nprint(f(2.0))\n",
+    g + "type V = { v: f32 }\nlet fv = 1.5\nconst r: V = { v: fv }\nprint(r.v)\n",
+    g + "const e = 4\nconst xs: f32[] = [e]\nprint(xs[0])\n",
+    g + "const d = 7\nprint(mul(d, 1.0))\nprint(d / 2)\n",
+    g + "const b = 3\nprint(mul(b, 1.0))\nprint(gi(b))\n",
+    g + "const i = 1\nconst ys = [7, 8]\nprint(ys[i])\nprint(mul(i, 1.0))\n",
+    g + "const m = 3\nfunction a(): f32 { mul(m, 1.0) }\nfunction c(n: i32): boolean { m < n }\nprint(a())\n",
+    g + "const q = 3\nprint(mul(q, 1.0))\nprint(q == 3)\n",
+    g + "function id<T>(a: T): T { a }\nconst p = 3\nprint(mul(p, 1.0))\nprint(id(p) + gi(1))\n",
+  ];
+  for (const src of clean) {
+    const got = await msgs(src);
+    if (got.length !== 0) throw new Error(`want ${JSON.stringify(src)} clean, got ${JSON.stringify(got)}`);
+  }
+  // An `f32` holds integers only up to 2^24 exactly: the constant's refusal at the read.
+  const v = await msgs(g + "const v = 16777217\nprint(mul(v, 1.0))\n");
+  const wantV = ["constant 16777217 is not exact at f32 — write it as a float literal to round it"];
+  if (JSON.stringify(v) !== JSON.stringify(wantV)) {
+    throw new Error(`want the bare mismatch, got ${JSON.stringify(v)}`);
+  }
+  // D2981: a float literal stored into an integer `let` is refused; the `let` keeps its kind.
+  const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
+  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it"];
+  if (JSON.stringify(store) !== JSON.stringify(wantStore)) {
+    throw new Error(`want ${JSON.stringify(wantStore)}, got ${JSON.stringify(store)}`);
+  }
+});
+
+// D3070 (plumb PL-070) — a function value whose un-annotated return defaulted from the numeric
+// literals it returns names the function and the return annotation. The misses pin the note's
+// ABSENCE when no single annotation fixes every use.
+Deno.test({ name: "wasm-checker: a function value's defaulted literal return names the function", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const g = "function ap(f: (i64) => i64): i64 { f(1) }\nfunction af(f: (i64) => f32): f32 { f(1) }\n" +
+    "function a32(f: (i64) => i32): i32 { f(1) }\n";
+  const mis = "argument 1: expected (i64) => i64, got (i64) => i32";
+  const hits: [string, string][] = [
+    [
+      g + "function never(x: i64) { -1 }\nprint(ap(never))\n",
+      mis + " — `never` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function never(x: i64): i64 { … }`",
+    ],
+    [
+      g + "const k = (x: i64) => -1\nprint(ap(k))\n",
+      mis + " — `k` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `const k = (x: i64): i64 => -1`",
+    ],
+    // A tree of literals is its constant, so it is named by its value.
+    [
+      g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n",
+      mis + " — `m` returns the literal `6` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function m(x: i64): i64 { … }`",
+    ],
+    // A call whose result still fits the annotated return keeps the note.
+    [
+      g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: i64 = c(4)\nprint(y)\n",
+      mis + " — `c` returns the literal `5` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function c(x: i64): i64 { … }`",
+    ],
+  ];
+  for (const [src, want] of hits) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify([want])) {
+      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const misses: [string, string[]][] = [
+    // Another use needs the `i32` return: as a value, or as a call result.
+    [g + "function a(x: i64) { -1 }\nprint(ap(a))\nprint(a32(a))\n", [mis]],
+    [g + "function b(x: i64) { -1 }\nprint(ap(b))\nconst y: i32 = b(1)\nprint(y)\n", [mis]],
+    // Two destinations want two annotations.
+    [
+      g + "function d(x: i64) { 2 }\nprint(ap(d))\nprint(af(d))\n",
+      [mis, "argument 1: expected (i64) => f32, got (i64) => i32"],
+    ],
+    // An `f32` holds integers only up to 2^24 exactly.
+    [g + "function e(x: i64) { 16777217 }\nprint(af(e))\n", ["argument 1: expected (i64) => f32, got (i64) => i32"]],
+    // A lambda binding that is reassigned, or aliased.
+    [g + "function z(x: i64): i32 { 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
+    [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
+    // A return that is not a literal (a tree of literals is one: its constant, exact).
+    [g + "function m(x: i64) { (x as% i32) * 3 }\nprint(ap(m))\n", [mis]],
+    // A call result the annotation would change: cast, operator, inferred tail, member call.
+    [g + "function c1(x: i64) { 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
+    [g + "function c2(x: i64) { 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],
+    [
+      g + "function c3(x: i64) { 5 }\nprint(ap(c3))\nfunction w() { c3(1) }\nfunction t(v: i32): i32 { v }\nprint(t(w()))\n",
+      [mis],
+    ],
+    [g + "function c4(self: i64) { 5 }\nprint(ap(c4))\nconst q: i32 = (1 as i64).c4()\nprint(q)\n", [mis]],
+    // An exported function: another module may read its result at the old type.
+    [g + "export function c5(x: i64) { 5 }\nprint(ap(c5))\n", [mis]],
+  ];
+  for (const [src, want] of misses) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)} for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
   }
 });
 
@@ -357,6 +609,60 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   }
 });
 
+// A literal `const` is its literal at each read (D3246), so a read hovers as the type it takes
+// there, and every read stays a reference — including when a `let` pin re-checks the program.
+Deno.test({
+  name: "wasm-symbols: a literal const read hovers per use and stays a reference",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "const K = 7\n" +
+    "function takeF32(x: f32): f32 { x }\n" +
+    "function takeI64(x: i64): i64 { x }\n" +
+    "print(takeF32(K))\n" +
+    "print(takeI64(K))\n" +
+    "let bb = 1\n" +
+    "bb = takeI64(K)\n";
+  const want: [number, number, string][] = [[3, 14, "f32"], [4, 14, "i64"]];
+  for (const [line, col, ty] of want) {
+    const got = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col);
+    if (got !== ty) {
+      throw new Error(`hover at ${line}:${col}: want ${ty}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const refs = await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 3, 14, true);
+  const lines = refs.map((r) => r.start.line).sort((a, b) => a - b);
+  if (JSON.stringify(lines) !== "[0,3,4,6]") {
+    throw new Error(`references: want [0,3,4,6], got ${JSON.stringify(lines)}`);
+  }
+});
+
+// A read above its binding's declaration — a literal `const` at the top level, or any module
+// binding read in a function written above it — is still a reference, so a rename reaches it.
+Deno.test({
+  name: "wasm-symbols: a read above the declaration is a reference",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "print(K + 1)\n" +
+    "function above(): i32 { K + N }\n" +
+    "const K = 3\n" +
+    "function one(): i32 { 1 }\n" +
+    "const N = one()\n";
+  const at = (r: { start: { line: number; character: number } }) =>
+    `${r.start.line}:${r.start.character}`;
+  const k = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 2, 6, true)).map(at).sort();
+  if (JSON.stringify(k) !== '["0:6","1:24","2:6"]') {
+    throw new Error(`K references: want ["0:6","1:24","2:6"], got ${JSON.stringify(k)}`);
+  }
+  const n = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 4, 6, true)).map(at).sort();
+  if (JSON.stringify(n) !== '["1:28","4:6"]') {
+    throw new Error(`N references: want ["1:28","4:6"], got ${JSON.stringify(n)}`);
+  }
+  const hover = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 6);
+  if (hover !== "i32") throw new Error(`hover above the declaration: want i32, got ${hover}`);
+});
+
 Deno.test({
   name: "wasm-symbols: an un-annotated param hovers as everything its body demands",
   ignore,
@@ -476,6 +782,42 @@ Deno.test({
   const use = await checker.hoverTypeAt(fn, "/tmp/x.vl", noSiblings, 3, 6);
   if (use !== "(a: i32, b: i32) => i32") {
     throw new Error(`expected the named signature at a fn use, got ${JSON.stringify(use)}`);
+  }
+});
+
+// Flow facts reach hover too: a binding filled on the `null` arm of an `if` is its non-null type
+// below it (D3556), and the first `pop()` under a `.length` test is the element (D3558).
+Deno.test({
+  name: "wasm-symbols: hover after a fill-on-null join and under a `.length` test",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "type S = { n: i32 }\n" +
+    "function get(m: Map<i32, S>, k: i32): S {\n" +
+    "  let s = m.get(k)\n" +
+    "  if s == null { s = { n: k } }\n" +
+    "  const t = s\n" +
+    "  t\n" +
+    "}\n" +
+    "const stack = [1, 2]\n" +
+    "while stack.length > 0 {\n" +
+    "  const k = stack.pop()\n" +
+    "  print(k + 1)\n" +
+    "}\n" +
+    "const after = stack.pop()\n" +
+    "print(after ?? 0)\n";
+  const cases: [number, number, string][] = [
+    [2, 6, "S | null"], // `let s` — the declaration keeps its declared type
+    [4, 12, "S"], // `s` below the join
+    [4, 8, "S"], // `t`
+    [9, 8, "i32"], // `k` from the first pop under the test
+    [12, 6, "i32 | null"], // `after`, outside the test
+  ];
+  for (const [line, col, want] of cases) {
+    const got = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col);
+    if (got !== want) {
+      throw new Error(`${line}:${col}: want ${want}, got ${JSON.stringify(got)}`);
+    }
   }
 });
 
@@ -737,6 +1079,60 @@ Deno.test({ name: "wasm-checker: a lint range covers what the message names", ig
   }
 });
 
+Deno.test({ name: "wasm-checker: shadowed-local warns on the inner binding's name (D3579)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-021: the loop's scalar `sheet` hides the function's array `sheet`.
+  const src = "function f() {\n" +
+    "  const sheet = [1.0, 2.0]\n" +
+    "  let s = 0.0\n" +
+    "  for k in 0 until 2 { const sheet = 10.0 * k as f64; s += sheet }\n" +
+    "  s + sheet[0]\n" +
+    "}\n" +
+    "print(f())\n";
+  const diags = checker.lint(src).filter((x) => x.code === "shadowed-local");
+  if (diags.length !== 1) throw new Error(`want one shadowed-local, got ${JSON.stringify(diags)}`);
+  const d = diags[0];
+  const want = "`sheet` shadows the `sheet` declared at 2:9 in this function; " +
+    "rename one if they are different values";
+  if (d.severity !== "warning" || d.message !== want) {
+    throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+  }
+  const innerCol = src.split("\n")[3].indexOf("sheet");
+  if (d.range.start.line !== 3 || d.range.start.character !== innerCol || rangeText(src, d.range) !== "sheet") {
+    throw new Error(`want the range over the inner \`sheet\` at 3:${innerCol}, got ${JSON.stringify(d.range)}`);
+  }
+  // The control: a lambda's own binding is not the enclosing function's.
+  const lam = "function g() {\n  const n = 1\n  const h = (k: i32) => { const n = k; n }\n  h(n)\n}\nprint(g())\n";
+  const quiet = checker.lint(lam).filter((x) => x.code === "shadowed-local");
+  if (quiet.length !== 0) throw new Error(`a lambda binding fired: ${JSON.stringify(quiet)}`);
+});
+
+Deno.test({ name: "wasm-checker: shadowed-function warns on a local hiding a function it calls above (D3599)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-029: `over` is called, then a `const over` hides the module's function.
+  const src = "function over(x: i32) { x + 1 }\n" +
+    "export function f(k: i32) {\n" +
+    "  let a = over(k)\n" +
+    "  const over = 3\n" +
+    "  a + over\n" +
+    "}\n";
+  const diags = checker.lint(src).filter((x) => x.code === "shadowed-function");
+  if (diags.length !== 1) throw new Error(`want one shadowed-function, got ${JSON.stringify(diags)}`);
+  const d = diags[0];
+  const want = "`over` shadows the function `over` declared at 1:10, which this function calls " +
+    "above it; below it the name means the binding, so rename one";
+  if (d.severity !== "warning" || d.message !== want) {
+    throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+  }
+  if (d.range.start.line !== 3 || rangeText(src, d.range) !== "over") {
+    throw new Error(`want the range over the \`const\`'s name on line 3, got ${JSON.stringify(d.range)}`);
+  }
+  // The control: a binding named like a builtin the function never calls is quiet.
+  const quiet = checker.lint("function h(max: i32) { max + 1 }\nprint(h(1))\n")
+    .filter((x) => x.code === "shadowed-function");
+  if (quiet.length !== 0) throw new Error(`an uncalled builtin name fired: ${JSON.stringify(quiet)}`);
+});
+
 Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   // The owner's case: `const n = P.nodes[ix]` highlighted `P`, one column, because the
@@ -752,7 +1148,8 @@ Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", 
     "  kid.nKid\n" +
     "}\n" +
     "print(holeOf({ nKid: 1 }) + readIt({ nKid: 0 }))\n";
-  const diags = checker.lint(src);
+  // A repo-policy rule, so it grades `compiler/` alone (docs/internals/lint-rule-scope.md).
+  const diags = checker.lint(src, "compiler/probe.vl");
   const d = diags.find((x) => x.code === "sentinel-index-unguarded");
   if (d === undefined) throw new Error("no sentinel-index-unguarded fired");
   const named = /`([^`]*)`/.exec(d.message)?.[1] ?? "";
@@ -765,6 +1162,63 @@ Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", 
   // have widened to is `nodes`, five characters, and the range is longer than that.
   if (d.range.end.character - d.range.start.character <= "nodes".length) {
     throw new Error("the range is no wider than the host's old identifier guess");
+  }
+});
+
+Deno.test({ name: "wasm-checker: byte-as-code-point shows in the editor, over the read (D3641)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-029: a glyph looked up per BYTE of a copied `string` parameter. The editor
+  // lints before it checks, so this is the untyped face: the receiver is visibly a string.
+  const src = "function glyphOf(cp: i32) { cp }\n" +
+    "function letter(text0: string, xs: i32[]) {\n" +
+    "  let text = text0\n" +
+    "  text = text + \"\"\n" +
+    "  let n = glyphOf(text[0]) + glyphOf(xs[0])\n" +
+    "  if text.slice(0, 2)[1] == 'í' { n = n + 1 }\n" +
+    "  n + fromCodePoint(xs[1]).length\n" +
+    "}\n" +
+    "print(letter(\"Hrímey\", [1, 2]))\n";
+  const diags = checker.lint(src).filter((x) => x.code === "byte-as-code-point");
+  const got = diags.map((d) => rangeText(src, d.range));
+  if (JSON.stringify(got) !== JSON.stringify(["text[0]", "text.slice(0, 2)[1]"])) {
+    throw new Error(`want the two string reads, not the i32[] ones; got ${JSON.stringify(got)}`);
+  }
+  const want = "`s[i]` is a byte, not a character; use `for cp in s` or `codePoints(s)[i]`";
+  for (const d of diags) {
+    if (d.severity !== "warning" || d.message !== want) {
+      throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+    }
+  }
+});
+
+Deno.test({ name: "wasm-checker: a discarded line led by `-x` shows in the editor, over the statement, and `- x` continues (D3673, D3698)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-040: `-b` with no space after the minus is its own statement, while `- b`
+  // continues `v`. The editor lints before it checks, so this is the untyped face: parameters
+  // annotated as scalars fire, while a field read and a local initialised by a call need the
+  // check's types and stay quiet here.
+  const src = "type Cam = { x: f64, y: f64 }\n" +
+    "function mk() { 2.0 }\n" +
+    "function f(a: f64, b: f64, c: Cam): f64 {\n" +
+    "  const w = a * 3.0\n" +
+    "    -b * 3.5\n" +
+    "  const v = a * 3.0\n" +
+    "    - b * 3.5\n" +
+    "  a + b\n" +
+    "  c.x - c.y\n" +
+    "  const t = mk()\n" +
+    "  t * 2.0\n" +
+    "  w\n" +
+    "}\n" +
+    "print(f(1.0, 1.0, { x: 1.0, y: 2.0 }))\n";
+  const diags = checker.lint(src).filter((x) => x.code === "unused-pure-expression");
+  const got = diags.map((d) => [rangeText(src, d.range), d.severity, d.message.slice(0, 34)]);
+  const want = [
+    ["-b * 3.5", "warning", "this line is a separate statement;"],
+    ["a + b", "warning", "This expression has no effect: it "],
+  ];
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
   }
 });
 
@@ -1116,6 +1570,37 @@ Deno.test({
   }
 });
 
+// D3559: an export list with no `from` arms the loop (it is an `export {` line) and must
+// be refused for what it is, underlining the listed name, never as a re-export from "".
+Deno.test({
+  name: "wasm-checker: `export { x }` of an import names the re-export to write (D3559)",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const lib = "export function sq(n: i32): i32 { n * n }\n";
+  const siblings = (p: string) => p === "/proj/lib.vl" ? lib : undefined;
+  const src = 'import { sq } from "./lib"\nexport { sq }\nprint(sq(3))\n';
+  const diags = await checker.check(src, "/proj/main.vl", siblings);
+  const want = '`export { sq }` names an imported binding; re-export it with `export { sq } from "./lib"`';
+  const got = diags.map((d) => d.message);
+  if (diags.length !== 1 || diags[0].message !== want) {
+    throw new Error(`want exactly ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  }
+  const r = diags[0].range;
+  if (r.start.line !== 1 || r.start.character !== 9 || r.end.character !== 11) {
+    throw new Error(`want the span of \`sq\` on line 1 (9..11), got ${JSON.stringify(r)}`);
+  }
+  // The control: the suggested spelling, kept beside the import, checks clean.
+  const fixed = await checker.check(
+    'import { sq } from "./lib"\nexport { sq } from "./lib"\nprint(sq(3))\n',
+    "/proj/main.vl",
+    siblings,
+  );
+  if (fixed.length !== 0) {
+    throw new Error(`the suggested re-export must check clean; got ${fixed.map((d) => d.message).join("; ")}`);
+  }
+});
+
 // The interpolation arm's own failure shape: without it the loop never runs, `std:fmt`
 // is never committed, and the injected reference resolves to nothing — an
 // "undeclared identifier" on a program the CLI compiles cleanly, the worst shape
@@ -1270,7 +1755,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const path = new URL("../std/buffer.vl", import.meta.url).pathname;
+  const path = filePath(new URL("../std/buffer.vl", import.meta.url));
   const source = await Deno.readTextFile(path);
   const diags = await checker.check(source, path, noSiblings);
   const hit = diags.find((d) => d.message.includes("is internal to std"));
@@ -1297,5 +1782,44 @@ Deno.test({
       "expected the origin refusal for a user std/ folder outside any checkout, got: " +
         (diags.map((d) => d.message).join("; ") || "(none)"),
     );
+  }
+});
+
+// D3069 — a keyword naming a binding is ONE editor diagnostic, spanning the keyword at the
+// declaration; the uses of the name after it add nothing (they were a cascade of three).
+Deno.test({ name: "wasm-checker: a keyword parameter name is one diagnostic at the declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const diags = await checker.check(
+    "function f(type: i64) { if type == 0 { return -1 }; type + 1 }\n",
+    "/tmp/x.vl",
+    noSiblings,
+  );
+  const want = "`type` is a keyword and can't name a parameter — rename it";
+  const got = diags.map((d) =>
+    `${d.severity} ${d.range.start.line}:${d.range.start.character}-${d.range.end.character} ${d.message}`
+  );
+  if (got.length !== 1 || got[0] !== `error 0:11-15 ${want}`) {
+    throw new Error(`want exactly [error 0:11-15 ${want}], got: ${JSON.stringify(got)}`);
+  }
+});
+
+// D3484 (owner ruling 2026-10-03) — a key given twice in an object literal is one editor
+// error per repeat, spanning the repeated key and naming the first one's position.
+Deno.test({ name: "wasm-checker: a repeated object key is an error at the repeat", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const diags = await checker.check(
+    "const seq = 1\nconst o = { seq, seq: 5, b: { a: 1, a: 2 } }\nprint(o.seq)\n",
+    "/tmp/x.vl",
+    noSiblings,
+  );
+  const got = diags.map((d) =>
+    `${d.severity} ${d.range.start.line}:${d.range.start.character}-${d.range.end.character} ${d.message}`
+  ).sort();
+  const want = [
+    "error 1:17-20 key `seq` is given twice in this object literal (first at 2:13)",
+    "error 1:36-37 key `a` is given twice in this object literal (first at 2:31)",
+  ];
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`want ${JSON.stringify(want)}, got: ${JSON.stringify(got)}`);
   }
 });

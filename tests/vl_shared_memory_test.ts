@@ -11,10 +11,11 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen, wasmDis } from "./support/tree.ts";
+import { memoryLimits, sections } from "./support/wasmMemory.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER);
-const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
+const WASM_OPT = binaryen("wasm-opt");
 const HAVE_OPT = exists(WASM_OPT);
 if (!ENABLED) {
   console.warn(
@@ -64,72 +65,6 @@ const build = async (
 const eq = (got: unknown, want: unknown, what: string) => {
   const g = JSON.stringify(got), w = JSON.stringify(want);
   if (g !== w) throw new Error(`${what}\n  want ${w}\n  got  ${g}`);
-};
-
-/** A walk over the module's sections: each id with its payload's [start, end). */
-const sections = (bytes: Uint8Array) => {
-  const out: { id: number; start: number; end: number }[] = [];
-  let at = 8;
-  const uleb = () => {
-    let v = 0, shift = 0, b = 0;
-    do {
-      b = bytes[at++];
-      v |= (b & 0x7f) << shift;
-      shift += 7;
-    } while (b & 0x80);
-    return v;
-  };
-  while (at < bytes.length) {
-    const id = bytes[at++];
-    const len = uleb();
-    out.push({ id, start: at, end: at + len });
-    at += len;
-  }
-  return out;
-};
-
-/** The memory's limits as the module declares them — defined (section 5) or imported (section 2,
- * found as the tail of an import entry of kind 2). `null` when the module has no memory. */
-const memoryLimits = (bytes: Uint8Array) => {
-  let at = 0;
-  const uleb = () => {
-    let v = 0, shift = 0, b = 0;
-    do {
-      b = bytes[at++];
-      v += (b & 0x7f) * 2 ** shift;
-      shift += 7;
-    } while (b & 0x80);
-    return v;
-  };
-  const limits = () => {
-    const flag = bytes[at++];
-    const min = uleb();
-    const max = flag & 1 ? uleb() : null;
-    return { flag, min, max };
-  };
-  for (const s of sections(bytes)) {
-    at = s.start;
-    if (s.id === 5) {
-      uleb(); // count
-      return { where: "defined", ...limits() };
-    }
-    if (s.id === 2) {
-      const n = uleb();
-      for (let i = 0; i < n; i++) {
-        for (let name = 0; name < 2; name++) { // module name, field name
-          const len = uleb(); // read BEFORE adding: `at += uleb()` reads `at` first
-          at += len;
-        }
-        const kind = bytes[at++];
-        if (kind === 2) return { where: "imported", ...limits() };
-        if (kind === 0) uleb();
-        else if (kind === 1) { at++; limits(); } // table: reftype + limits
-        else if (kind === 3) { at++; at++; } // global: valtype + mut (i32/f64 only here)
-        else throw new Error(`unexpected import kind ${kind}`);
-      }
-    }
-  }
-  return null;
 };
 
 // A unit that writes and reads raw guest addresses — the shape a transliterated guest thread is.
@@ -234,7 +169,7 @@ Deno.test({
 
 // The shared allocator is decided by the build: a default build of a unit that allocates
 // carries no atomic at all, a shared build allocates through them.
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 Deno.test({
   name: "shared-memory: only a shared build allocates with atomics",
   ignore: !ENABLED || !exists(WASM_DIS),
@@ -246,10 +181,7 @@ print(Buffer(16).base)
       const tmp = await Deno.makeTempDir();
       try {
         await Deno.writeFile(`${tmp}/m.wasm`, bytes);
-        const { stdout } = await new Deno.Command(WASM_DIS, {
-          args: [`${tmp}/m.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"],
-          stdout: "piped",
-        }).output();
+        const { stdout } = await wasmDis([`${tmp}/m.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"]);
         return (dec.decode(stdout).match(/\bi64\.atomic\.[a-z.0-9_]+/g) ?? []).sort();
       } finally {
         await Deno.remove(tmp, { recursive: true });
@@ -305,7 +237,7 @@ print(b.base > a.base)
 //
 // `fill` stamps every word of a new `Buf`; `stress` makes `count` of them back to back and
 // answers where its record of them starts (the bases, then the lengths, in a `Buf` of its own).
-const TWO = `import { Buffer, Buf, bufferMark, bufferRelease, storeI32 } from "std:buffer"
+const TWO = `import { Buffer, Buf, bufferMark, bufferPeak, bufferRelease, storeI32 } from "std:buffer"
 let bumps = 0
 export function put(addr: i32, v: i32) { __store_i32__(addr, v) }
 export function peek(addr: i32): i32 { __load_i32__(addr) }
@@ -320,6 +252,7 @@ function fill(n: i32, stamp: i32): Buf {
 }
 export function alloc(n: i32, stamp: i32): i32 { fill(n, stamp).base }
 export function mark(): i32 { bufferMark() }
+export function peak(): i32 { bufferPeak() }
 export function release(m: i32) { bufferRelease(m) }
 export function stress(count: i32, stamp: i32): i32 {
   const rec = Buffer(count * 8)
@@ -359,6 +292,7 @@ self.onmessage = async (e) => {
   if (op === "peek") self.postMessage({ v: x.peek(a) });
   if (op === "alloc") self.postMessage({ v: x.alloc(a, b) });
   if (op === "mark") self.postMessage({ v: x.mark() });
+  if (op === "peak") self.postMessage({ v: x.peak() });
   if (op === "release") { x.release(a); self.postMessage({ ok: true }); }
   if (op === "bump") self.postMessage({ v: x.bump() });
   if (op === "stress") { go(); self.postMessage({ v: x.stress(a, b) }); }
@@ -466,6 +400,10 @@ Deno.test({
         eq(bAddr, aAddr + 64, "B's first Buffer follows A's");
         eq(Array.from(new Int32Array(memory.buffer, aAddr, 16)), Array(16).fill(0xaaaa), "A's stamps are intact");
         eq(view[bAddr >> 2], 0xbbbb, "B's stamp");
+        eq(await v(B, { op: "peak" }), bAddr + 64, "B's peak is its own Buffer's end");
+        await call(B, { op: "release", a: bAddr });
+        eq(await v(B, { op: "peak" }), bAddr + 64, "a release does not lower the peak");
+        eq(await v(A, { op: "peak" }), aAddr + 64, "A's peak counts A's Buffer and the shared pointer now");
 
         // A cross-worker handoff through plain stores: B blocks, A writes and signals.
         const got = v(B, { op: "wait", a: GO, b: 4096 });

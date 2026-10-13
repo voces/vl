@@ -154,6 +154,8 @@ monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
       [/`(?:[^`\\]|\\.)*`/, "string"],
       [/\.\.\./, "operator"],
       [/\b\d[\d_]*(?:\.\d[\d_]*)?\b/, "number"],
+      // A label, `@outer`: one token where it is declared and where a jump names it.
+      [/@[a-zA-Z_]\w*/, "tag"],
       [
         /[a-zA-Z_]\w*/,
         { cases: { "@keywords": "keyword", "@default": "identifier" } },

@@ -9,16 +9,19 @@ root. Agent operating instructions are `AGENTS.md` / `CLAUDE.md` at the root.
 The language and CLI as a user mental model.
 
 - [`guide/soundness.md`](guide/soundness.md) — the type-safety guarantees.
-- [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; the `as` / `as?` / `as!` / `as%` family).
+- [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; `>>>` is the unsigned / logical shift right; the `as` / `as?` / `as!` / `as%` family).
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
+- [`guide/loops.md`](guide/loops.md) — loops and labelled blocks, `@B`, `break @B` / `continue @B`, and the value a loop or block carries.
 - [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
 - [`guide/objects.md`](guide/objects.md) — object literals and braces: when `{` is an object and when a block, what `{}` completes, and why a `{}` statement is refused.
+- [`guide/methods.md`](guide/methods.md) — `v.f(…)`: which functions a method call finds, and when it needs an import (a built-in receiver always does; a named type's own module does not).
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
 - [`guide/getters.md`](guide/getters.md) — `get x(self: T): R`: read-only properties of a nominal type, where they are found, and the body contract that keeps a read as cheap as a field.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
 - [`guide/strings-design.md`](guide/strings-design.md) — string representation and API.
 - [`guide/extern.md`](guide/extern.md) — `extern function`: calling a host-provided function, the types that cross, and why the return type (`: void` included) is required.
 - [`guide/bytes.md`](guide/bytes.md) — reading integers out of a `u8[]` (`std:bytes`): the eight widths and byte orders, why there is no `u32le`, floats by bitcast, and what an out-of-range offset does.
+- [`guide/writing-bytes.md`](guide/writing-bytes.md) — writing binary files (PNG, glTF) from a VL tool: building a `u8[]`, `std:fs`'s `writeFile`, and handing a `Buf` to a JS host.
 - [`guide/lambda-param-skip-design.md`](guide/lambda-param-skip-design.md) — lambda param-skip ergonomics.
 - [`guide/language-todo.md`](guide/language-todo.md) — language feature backlog.
 
@@ -32,6 +35,7 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/memory-gc-design.md`](internals/memory-gc-design.md) — WasmGC vs linear memory; collector choice.
 - [`internals/buffer-design.md`](internals/buffer-design.md) — the `Buffer` tier and exported memory (P0.1/P0.2).
 - [`internals/numeric-intrinsics.md`](internals/numeric-intrinsics.md) — single-opcode numeric builtins (P0.3/P0.4).
+- [`internals/unsigned-types-design.md`](internals/unsigned-types-design.md) — proposed `u32`/`u64` value types (not ruled; open questions U1–U14).
 - [`internals/codegen-builder-migration-plan.md`](internals/codegen-builder-migration-plan.md) — emitter builder refactor plan.
 - [`internals/monomorphization-design.md`](internals/monomorphization-design.md) — generic instantiation.
 - [`internals/match-design.md`](internals/match-design.md) — `match` exhaustive value/variant dispatch.

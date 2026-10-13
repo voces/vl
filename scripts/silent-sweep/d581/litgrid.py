@@ -235,9 +235,9 @@ BSEAMS = {
                  "const q = m.has(self)", "boolean", "q", {"str": "true"}),
     "mdel":     ([], ["const m: {[string]: string} = Map()", 'm.set("s", "v")'],
                  "const q = m.delete(self)", "boolean", "q", {"str": "true"}),
-    "sadd":     ([], ["const st: {[string]: boolean} = Set()"], "st.add(self)",
+    "sadd":     ([], ["const st: Set<string> = Set()"], "st.add(self)",
                  "boolean", 'st.has("s")', {"str": "true"}),
-    "shas":     ([], ["const st: {[string]: boolean} = Set()", 'st.add("s")'],
+    "shas":     ([], ["const st: Set<string> = Set()", 'st.add("s")'],
                  "const q = st.has(self)", "boolean", "q", {"str": "true"}),
     # An ARRAY `.get(i)` does not EMIT on any seed (the same "callee is not a function
     # name" gap, in the array's arm), so its legitimate column is `emit` on BOTH spellings.

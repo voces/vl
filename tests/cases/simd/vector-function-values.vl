@@ -1,0 +1,164 @@
+// @run
+// @log 9
+// @log 10 52
+// @log 4017
+// @log true
+// @log true
+// @log 11
+// @log true
+// @log 42
+// @log 7
+// @log 10
+// @log 103
+// @log 1717
+// @hint Intentionally-unused parameter
+// Regression (D2811, D2643, D2812; plumb PL-051). A vector crosses the function-value ABI as
+// a parameter, a result and a capture, for a named function, a lambda, a closure, a list
+// element and a record field, at any arity beside i64. Each proof reads a lane that only the
+// right vector carries.
+import { toString } from "std:fmt"
+
+function mk(a: i32): v128 {
+  const s = __splat_i32x4__(a)
+  __replace_lane_i32x4__(
+    __replace_lane_i32x4__(__replace_lane_i32x4__(s, 1, a + 1), 2, a + 2),
+    3,
+    a + 3,
+  )
+}
+
+// The ask: a named function passed as a `(v128) => i64` value.
+function lane0(v: v128) { __extract_lane_i32x4__(v, 0) as% i64 }
+function runWith(fn: (v128) => i64) { fn(__splat_i32x4__(9)) }
+print(toString(runWith(lane0)))
+
+// A vector result through a lambda value; lane 3 carries the weighted sum of lanes 0 and 1.
+function run2(fn: (v128, v128) => v128): v128 { fn(mk(10), mk(20)) }
+const r2 = run2((p0: v128, p1: v128): v128 => {
+  __replace_lane_i32x4__(
+    p0,
+    3,
+    __extract_lane_i32x4__(p0, 0) + __extract_lane_i32x4__(p1, 1) * 2,
+  )
+})
+print(
+  toString(__extract_lane_i32x4__(r2, 0))
+    + " "
+    + toString(__extract_lane_i32x4__(r2, 3)),
+)
+
+// A closure capturing a vector, interleaved with i64 parameters.
+function run2i(fn: (v128, i64) => i64) { fn(mk(10), 2000) }
+function outer() {
+  const cap = mk(6)
+  run2i(
+    (p0, p1) => (__extract_lane_i32x4__(p0, 0) as% i64)
+      + p1 * 2
+      + (__extract_lane_i32x4__(cap, 1) as% i64),
+  )
+}
+print(toString(outer()))
+
+// Plumb's shape: one 8-argument predicate type shared by several wrappers, a list and a field.
+type Pred = (i64, i64, i64, i64, v128, v128, v128, v128) => boolean
+function inA(
+  x0: i64,
+  _y0: i64,
+  _x1: i64,
+  y1: i64,
+  a: v128,
+  _b: v128,
+  _c: v128,
+  d: v128,
+) {
+  (__extract_lane_i32x4__(a, 0) as% i64) + x0
+    == (__extract_lane_i32x4__(d, 3) as% i64) + y1
+}
+function inB(
+  _x0: i64,
+  y0: i64,
+  x1: i64,
+  _y1: i64,
+  _a: v128,
+  b: v128,
+  c: v128,
+  _d: v128,
+) {
+  __extract_lane_i32x4__(b, 1) + __extract_lane_i32x4__(c, 2) == 9
+    && x1 == 3
+    && y0 == 2
+}
+function wrap1(p: Pred) {
+  p(
+    1,
+    2,
+    3,
+    4,
+    __splat_i32x4__(7),
+    __splat_i32x4__(4),
+    __splat_i32x4__(5),
+    __splat_i32x4__(4),
+  )
+}
+function wrap2(p: Pred, q: Pred) {
+  let n = 0
+  if p(0, 2, 3, 0, mk(1), mk(4), mk(5), mk(-2)) { n = n + 1 }
+  if q(0, 2, 3, 0, mk(1), mk(3), mk(3), mk(1)) { n = n + 10 }
+  n
+}
+const ps = [inA, inB]
+const h = { p: inB, n: 1 }
+print(wrap1(inA))
+print(wrap1(ps[1]))
+print(toString(wrap2(ps[0], h.p)))
+const sums: Pred = (x0, _y0, _x1, y1, _a, _b, _c, _d) => x0 + y1 == 5
+print(wrap1(sums))
+
+// A closure returned from a function, capturing its vector argument.
+function maker(k: v128): (v128) => i32 {
+  (v: v128): i32 => __extract_lane_i32x4__(__add_i32x4__(v, k), 0)
+}
+const f = maker(__splat_i32x4__(40))
+print(toString(f(__splat_i32x4__(2))))
+
+// A function value returning a vector, from a factory.
+function adder(): (v128, v128) => v128 {
+  (a: v128, b: v128): v128 => __add_i32x4__(a, b)
+}
+print(
+  toString(
+    __extract_lane_i32x4__(adder()(__splat_i32x4__(3), __splat_i32x4__(4)), 2),
+  ),
+)
+
+// D2643: a lambda whose inferred result is a vector.
+const dbl = (v: v128) => __add_i32x4__(v, v)
+print(toString(__extract_lane_i32x4__(dbl(__splat_i32x4__(5)), 1)))
+
+// D2812: a nullable vector result through a function type.
+function mkv(n: i64): v128 | null {
+  if n < 0 { return null }
+  __splat_i32x4__(n as% i32)
+}
+function runN(fn: (i64) => v128 | null) {
+  const a = fn(3)
+  const b = fn(-1)
+  let s = 0
+  if a != null { s = s + __extract_lane_i32x4__(a, 1) }
+  if b == null { s = s + 100 }
+  s
+}
+print(toString(runN(mkv)))
+
+// A void result: a vector sink called through a value.
+let acc = 0
+function sink(v: v128): void { acc = acc + __extract_lane_i32x4__(v, 3) }
+function runS(fn: (v128) => void) {
+  fn(__splat_i32x4__(8))
+  fn(__splat_i32x4__(9))
+}
+runS(sink)
+runS((v: v128): void => {
+  acc = acc + 100 * __extract_lane_i32x4__(v, 0)
+})
+print(toString(acc))

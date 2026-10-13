@@ -41,6 +41,7 @@
 
 // This repo's test files carry their own assert (no `@std/assert` in the import
 // map) — same three lines as `lsp_docxref_test.ts`.
+import { filePath } from "./support/filePath.ts";
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
   const e = JSON.stringify(expected);
@@ -49,7 +50,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   }
 };
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -122,7 +123,7 @@ const matrix = (len: number, cap: number): Array<[number, number]> => {
 
 /** Compile a source big enough that its emitted module spans more than two
  * chunks, and hand back the instance holding it. A long string literal is the
- * cheapest way there: ~3 emitted bytes per character, no per-function work. */
+ * cheapest way there: one data-segment byte per character, no per-function work. */
 const bigEmit = (): Exports => {
   const exp = instantiate();
   exp.modReset();
@@ -130,7 +131,7 @@ const bigEmit = (): Exports => {
   loadString(
     exp,
     (n) => exp.srcLoad(n),
-    `export function s(): string { "${"abcdefghij".repeat(6000)}" }\n`,
+    `export function s(): string { "${"abcdefghij".repeat(20000)}" }\n`,
   );
   assertEquals(exp.compileSrc(), 0, "the payload program must compile");
   return exp;

@@ -37,7 +37,14 @@ spelling, the second delivery position, the sibling row this was predicted to fi
     `loud emit reject`, `check-clean invalid wasm`, `check-clean silently wrong`,
     `check-clean wrong evaluation`, `compiler trap`, `loads then traps`,
     `trap after load`. Do not negate one: `not closed` grades as `closed`.
-  * A `check-clean silently wrong` row must carry a `// PRINTS <text>` line in its repro.
+  * A `check-clean silently wrong` row must carry a `// PRINTS <text>` line in its repro
+    (the WHOLE of today's wrong stdout), a `Want:` block, or both.
+  * `Want:` then a 4-space-indented block, after blank lines only, holding the CORRECT stdout,
+    one line per output line. Optional, at most one, below `Repro:`. The grader compares it
+    whenever the program runs: a closed row must print exactly it (else `wrong_output`,
+    MOVED), and an open wrong-value row is as filed while it prints something else. Give
+    every wrong-value row one whose right answer is settled; leave it off a row whose right
+    answer waits on a ruling (a value or a refusal).
   * `Repro:` then a 4-space-indented program. A multi-module witness splits with
     `// file: <name>.vl` markers; the LAST section is the entry.
   * At most three `####` sections, in this order: mechanism, ablation, grading list.

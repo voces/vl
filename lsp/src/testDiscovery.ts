@@ -155,7 +155,7 @@ export const flattenTests = (
 
 // ---- the `-t` plan -----------------------------------------------------------
 //
-// `-t` is a SUBSTRING filter over the scope-qualified name (`cliContains` in
+// `-t` is a SUBSTRING filter over the scope-qualified name (`strContains` in
 // compiler/cli_util.vl), not an exact match and not anchored. So a filter can
 // only ever be too generous, never too narrow, and the plan's job is to pick the
 // least generous string that still covers what was clicked and to SAY what else
@@ -195,7 +195,7 @@ export const selectedPaths = (
     ? all.filter((p) => p.startsWith(target.path + " > "))
     : all.filter((p) => p === target.path);
 
-/** The registered paths `-t filter` actually selects (`cliContains`). */
+/** The registered paths `-t filter` actually selects (`strContains`). */
 export const substringPaths = (
   all: readonly string[],
   filter: string,

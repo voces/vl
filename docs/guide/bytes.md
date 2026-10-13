@@ -2,7 +2,8 @@
 
 `std:fs`'s `readFile` and `readFileRange` hand you a `u8[]`, and a binary format is
 integers packed into it at known offsets. `std:bytes` is the eight reads that take one
-out. Every value printed below was run against the shipped compiler.
+out, plus `zeroBytes(n)` to make a zeroed one to fill. Every value printed below was run
+against the shipped compiler.
 
 ```vl
 import { i32le, i64le, u16be } from "std:bytes"
@@ -14,7 +15,7 @@ if !(b is IoError) {
 }
 ```
 
-Each export takes the list first, so it reads as a method — but VL has no namespace
+Each read takes the list first, so it reads as a method — but VL has no namespace
 import and a UFCS call resolves only names that are in scope, so **every name you use
 has to be in the `import` list**.
 
@@ -118,7 +119,8 @@ Byte order means nothing for one byte, which is the other reason these would not
 
 **Writing.** There is no `put*` family yet, because the two shapes a caller wants —
 storing into an existing array at an offset, and appending to one being built — are
-different functions and no consumer has needed both.
+different functions and no consumer has needed both. Building a `u8[]` and writing it to a file
+or a host is [`writing-bytes.md`](writing-bytes.md).
 
 **A cursor.** These take an explicit offset. A type that carries a position and advances
 it is a fine thing to write over them, and `std:buffer`'s `Buf` is the linear-memory tier
@@ -126,4 +128,7 @@ when the bytes are going to a host rather than through VL.
 
 **`u8[]` helpers in general.** `std:array`'s generic helpers do not apply to a `u8[]`;
 `std:utf8` decodes one to text, `std:base64` encodes one, and this module reads integers
-out of one.
+out of one. To make one of a length chosen at run time, `zeroBytes(n)` from this module
+answers `n` zero bytes in one allocation, where a `push(0)` loop grows the list `n` times;
+fill it by index (`b[i] = v`). `filled(n, 0)` cannot do it, since `u8` is an element type
+and a type parameter never binds it.

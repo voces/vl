@@ -215,7 +215,7 @@ body(null)
 
 P["u_map_i32_capture"] = """
 function body(m: {[i32]: string}) {
-  function inner() { print(m.size) }
+  function inner() { print(m.length) }
   inner()
 }
 function mk(): {[i32]: string} {
@@ -228,7 +228,7 @@ body(mk())
 
 P["u_map_str_capture"] = """
 function body(m: {[string]: i32}) {
-  function inner2() { print(m.size) }
+  function inner2() { print(m.length) }
   inner2()
 }
 function mk2(): {[string]: i32} {

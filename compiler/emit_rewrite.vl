@@ -6,14 +6,25 @@
 // declarations for later phases. Consults the classifiers (`emit_classify.vl`);
 // writes no bytes.
 
-import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
+import {
+  arrElemNameRaw,
+  nameIsArray,
+  nameIsSpaceFree,
+  tyTopIndexOf,
+} from "./tyname"
 import {
   TY_I32,
   annUnionAtomsOf,
+  asgAnyWiderStore,
+  asgStoreTyOf,
+  exitArmBlockAt,
+  exitArmCount,
+  exitFirstLetAt,
+  exitFirstLetCount,
+  externValueSeen,
   forInBindTy,
   ifYieldsNoValue,
   inferRetFnKey,
-  inferRetIsNulList,
   inferRetNameByNode,
   inferRetNameOf,
   inferRetRowByNode,
@@ -22,16 +33,32 @@ import {
   inferRetRungIsMapElemList,
   inferRetRungIsNestedElemUnionList,
   inferRetRungIsNestedLeafList,
+  inferRetRungIsNulListRet,
   inferRetRungIsNullable,
   inferRetRungIsParenUnionElemList,
   inferRetRungIsScalarListRet,
   inferRetRungIsStructElemList,
   inferRetTyIxByNode,
   inferRetTyIxOf,
+  joinHeadOf,
+  joinRowName,
+  joinRowNext,
+  joinRowRename,
   lambdaVoidAdoptedAt,
+  letJoinCandidates,
+  letNullHoleFilledTy,
+  letNullHoleUnfilled,
   litUnionAliasNameOfTy,
+  loopValAny,
+  loopValTailOf,
+  loopValTyOf,
+  lvTyBool,
+  lvTyNever,
+  lvTyNull,
+  lvTyVoid,
   memSharedCalls,
   mkArrayTy,
+  mkNullableTyOf,
   nameIsLitUnionType,
   nodeTyCarry,
   nodeTyExcludesNull,
@@ -43,6 +70,8 @@ import {
   nodeTyMapValExcludesNull,
   nodeTyName,
   nodeTyRecord,
+  nonNullTy,
+  nulRecListNominalName,
   numLitUnionAliasName,
   numLitUnionBaseName,
   numLitUnionHasBase,
@@ -50,15 +79,21 @@ import {
   opIdxFnAtNode,
   optCallRestamp,
   recordNodeTyFrom,
+  refViewCarry,
   strLitRecvTy,
   tyArrayElemIx,
+  tyBearsNull,
+  tyEq,
   tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
+  tyIsMap,
   tyIsNulValueUnionBox,
+  tyPrimNameOf,
   tySame,
   tyToEmitName,
+  tyToStr,
   voidCoerceValAt,
   voidCoerceValCount,
   voidCoerceValNameAt,
@@ -69,6 +104,7 @@ import {
   BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
   CharLit,
   ContinueStmt,
@@ -81,7 +117,9 @@ import {
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -97,13 +135,22 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  addNode,
+  arenaNoteRefWrite,
+  arenaSetNode,
   callSiteLocOf,
   elseIfLink,
+  externArityAt,
+  externLinkOf,
+  externParamAt,
+  externRetAt,
   fillArgDefaults,
   fnRequiredArity,
   hasNamedArgs,
   i32ToStr,
+  markCallNever,
   mkArrayLit,
+  mkAsExpr,
   mkBareBlockIf,
   mkBinary,
   mkBlock,
@@ -121,27 +168,44 @@ import {
   mkOptMember,
   mkParam,
   mkStr,
+  mkUnary,
+  nodeChildren,
+  nodeSpineChildren,
+  nodeToks,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
   paramDefaultOf,
   ufcsAliasAtSite,
+  valueIfAdd,
+} from "./ast"
+import {
+  MC_RUNG_BUILTIN,
+  MC_RUNG_PER_INSTANCE,
+  MC_RUNG_SELF_FN,
+  memberCallRungAdd,
+  memberCallRungOf,
 } from "./ast"
 import {
   annArrowAt,
-  capHas,
   drwDispatchOp,
   nameIsStructWithLitUnionField,
   nameIsStructWithUnionField,
   nodeIsTypeDecl,
+  noteCallOrigin,
   nullablePartOf,
   plCacheBust,
   unwrapParen,
 } from "./emit_base"
 import { emitFailAt } from "./emit_bytes"
-import { fnIndexOfInScopeChain } from "./emit_collect"
+import { cloUnboxPick } from "./emit_lift"
+import { assignTags, registerInlineUnion } from "./emit_collect"
 import {
+  bodyRebuiltFrom,
   cboxCellNames,
+  cboxReadTy,
+  cboxStoreCells,
+  emitRootIx,
   fRetVoid,
   fnDispNames,
   fnParent,
@@ -149,6 +213,7 @@ import {
   fnValUsed,
   gSharedMemPages,
   startStmts,
+  uVariants,
   unNames,
   unTyIx,
 } from "./emit_state"
@@ -159,19 +224,706 @@ import {
   exprIsClosure,
   exprReReadable,
   fnIndexOf,
+  fnIndexOfInScopeChainAt,
+  fnRetJoinsWiderRecord,
+  fnTyRetOf,
+  inferRetNulPinned,
   letDeclIsClosureNoLocal,
+  listUnionEmitName,
+  nameFreeToModule,
   nameIsWholeSpanShape,
+  nliForgetLet,
   resolveShapeToNominal,
   sFieldIndex,
   shapeNominalOfTy,
   structIndexOfExpr,
-  structIndexOfTypeName,
   synthTypeRefTy,
+  tyIsJoinedRecord,
+  tyIsListUnion,
   tyStructHasMapField,
+  unRowOfCanon,
 } from "./emit_classify"
 import { paramIsClosure, paramNulClosure } from "./emit_query"
-import { sidNoteNodeName } from "./symbols"
+import { sidNoteNodeName, sidOfNode } from "./symbols"
+import { strListHas } from "./listutil"
 
+// ── loop and labelled-block values ────────────────────────────────────────────────────────────
+
+// A loop or labelled block whose value is used becomes `if true { let $lv: T [= null]; <loop>;
+// $lv } else { __trap__() }`, each `break v` storing `$lv = v` first. A nullable `T` starts
+// `null`; a non-null one has only value exits, whose frame carries the value out (`whileLv`).
+// DECISIONS.md, "Labels are marked at the exit, and any loop carries a value".
+
+// The loops are gathered in pre-order and rewritten in reverse, so a nested loop is rewritten
+// before any loop its `break`s may leave; `atStmt` records whether each stands in a statement
+// list, where the statement walks collect its locals. An explicit stack, for deep chains.
+export function loopValueRewrite(rootIx: i32) {
+  exitArmsEndNever()
+  if !loopValAny() { return 0 }
+  const todo: i32[] = [rootIx]
+  const todoStmt: boolean[] = [true]
+  const loops: i32[] = []
+  const loopStmt: boolean[] = []
+  const coalesces: i32[] = []
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    const atStmt = todoStmt.pop() ?? false
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if (
+        (n is WhileStmt || n is ForRange || n is ForIn)
+        && loopValTyOf(ix) >= 0
+      ) {
+        loops.push(ix)
+        loopStmt.push(atStmt)
+      }
+      if n is BinExpr {
+        if n.binOp == "??" && lvIsNullableLoop(unwrapParen(n.binLeft)) {
+          coalesces.push(ix)
+        }
+      }
+      const inList = n is Block || n is Program
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        todoStmt.push(inList)
+        i = i + 1
+      }
+    }
+  }
+  let k = loops.length - 1
+  while k >= 0 {
+    lvRewriteAt(loops[k], loopValTyOf(loops[k]), loopStmt[k])
+    k = k - 1
+  }
+  for q in coalesces { lvCoalesceIntoArm(q) }
+  capMemoNoteEdit()
+  plCacheBust()
+  0
+}
+
+// Is `ix` a loop whose used value is nullable?
+function lvIsNullableLoop(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if !(n is WhileStmt || n is ForRange || n is ForIn) { return false }
+  const ty = loopValTyOf(ix)
+  ty >= 0 && tyBearsNull(ty)
+}
+
+// `(loop) ?? d` at `q`, its loop already rewritten, becomes the if-expression with `$lv ?? d` as
+// its value: an arm's own binding has no rep until the arm lowers, so a `??` over the whole `if`
+// found none, where one over the binding reads it as any local (D3370).
+function lvCoalesceIntoArm(q: i32) {
+  const c = P.nodes[q]
+  if c is BinExpr {
+    const s = P.nodes[unwrapParen(c.binLeft)]
+    if s is IfStmt {
+      const tb = P.nodes[s.ifThen]
+      if tb is Block {
+        const st = tb.blkStmts
+        if st.length == 0 { return 0 }
+        const ty = nodeTyIxOf(q)
+        const co = mkBinary("??", st[st.length - 1], c.binRight, c.pos)
+        nodeTyRecord(co, ty)
+        st[st.length - 1] = co
+        nodeTyRecord(s.ifThen, ty)
+        const w: Node = {
+          ifCond: s.ifCond,
+          ifThen: s.ifThen,
+          ifElse: s.ifElse,
+          pos: s.pos,
+        }
+        arenaSetNode(q, w)
+        nodeTyRecord(q, ty)
+        valueIfAdd(q)
+      }
+    }
+  }
+  0
+}
+
+// Rewrites the loop at `x`, whose used value has type `ty`, in place into the if-expression.
+function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
+  const loop = P.nodes[x]
+  const pos = loop.pos
+  const name = "$lv" + i32ToStr(x)
+  const nullable = tyBearsNull(ty)
+  // A generic body's value names its type parameters, which each instance re-resolves.
+  const spell = lvSpellOf(ty)
+  if spell == "" {
+    return emitFailAt("emitProgram: a loop value's type has no spelling", x)
+  }
+  // The loop moves to a fresh node, and the if-expression takes its place.
+  const y = addNode(loop)
+  if x < nodeToks.length && y < nodeToks.length { nodeToks[y] = nodeToks[x] }
+  let init = -1
+  if nullable {
+    init = mkNull("null", pos)
+    nodeTyRecord(init, lvTyNull())
+  } else {
+    // A wide scalar binding declares with a zero; the frame's value overwrites it before any read.
+    const prim = tyPrimNameOf(ty)
+    if prim != null {
+      if prim == "f64" || prim == "f32" { init = mkNum("0.0", pos) }
+      if prim == "i64" { init = mkNum("0", pos) }
+    }
+    nodeTyRecord(init, ty)
+  }
+  // A spelling naming a type parameter is resolved from its name, as each instance's own is.
+  let annTy = ty
+  if tyHasTyVar(ty) { annTy = -1 }
+  const decl = mkLet("let", name, synthTypeRefTy(spell, pos, annTy), init, pos)
+  nodeTyRecord(decl, lvTyVoid())
+  const rd = mkIdent(name, pos)
+  nodeTyRecord(rd, ty)
+  let label = ""
+  let body = -1
+  if loop is WhileStmt {
+    label = loop.whileLabel
+    body = loop.whileBody
+    if !nullable { loop.whileLv = name }
+    if loop.whileBlk == 1 { lvRewriteTail(body, loopValTailOf(x), name, ty) }
+  } else if loop is ForRange {
+    label = loop.frLabel
+    body = loop.frBody
+  } else if loop is ForIn {
+    label = loop.fiLabel
+    body = loop.fiBody
+  }
+  lvRewriteBreaks(body, label, name, ty, 0, false)
+  const thenSt: i32[] = []
+  thenSt.push(decl)
+  thenSt.push(y)
+  thenSt.push(rd)
+  const thenB = mkBlock(thenSt, pos)
+  nodeTyRecord(thenB, ty)
+  const trapFn = mkIdent("__trap__", pos)
+  const trap = mkCall(trapFn, [], pos)
+  nodeTyRecord(trap, lvTyNever())
+  markCallNever(trap)
+  const elseSt: i32[] = []
+  elseSt.push(trap)
+  const elseB = mkBlock(elseSt, pos)
+  const cond = mkBool(1, -1)
+  nodeTyRecord(cond, lvTyBool())
+  const w: Node = { ifCond: cond, ifThen: thenB, ifElse: elseB, pos: pos }
+  arenaSetNode(x, w)
+  nodeTyRecord(x, ty)
+  if !atStmt { valueIfAdd(x) }
+  0
+}
+
+// The annotation spelling of type `ty` for a synthesized binding, or "" when it has none: a
+// type parameter's by name, and a literal union's by its members, since its emit name is the
+// softened `string`.
+function lvSpellOf(ty: i32): string {
+  let spell = tyToEmitName(ty)
+  if spell == "" && tyHasTyVar(ty) { spell = lvSpaceless(tyToStr(ty)) }
+  if tyIsLitUnion(ty) || tyIsLitUnion(nonNullTy(ty)) { spell = tyToStr(ty) }
+  spell
+}
+
+// `s` without its spaces: the emitter's annotation spellings are spaceless (`T|null`).
+function lvSpaceless(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if s[i] != 32 { out = out + s.slice(i, i + 1) }
+    i = i + 1
+  }
+  out
+}
+
+// Ends each value-`if` arm block that always exits with `__trap__()`, after the exit: the
+// statements run as the arm's prelude and the dead `never` value meets any blocktype (D3222).
+function exitArmsEndNever() {
+  exitFirstLetsAnnotate()
+  let i = 0
+  while i < exitArmCount() {
+    const blk = exitArmBlockAt(i)
+    if blk < 0 || blk >= P.nodes.length { return 0 }
+    const b = P.nodes[blk]
+    if b is Block {
+      const trap = mkCall(mkIdent("__trap__", b.pos), [], b.pos)
+      nodeTyRecord(trap, lvTyNever())
+      markCallNever(trap)
+      b.blkStmts.push(trap)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Annotates each un-annotated binding whose initializer's first arm always exits with the type
+// the checker gave it, so the emitter classifies the binding by the arm that has a value. A
+// `null` value arm makes the binding a null hole, typed by what later writes filled it with; a
+// hole nothing filled is left to the rep a bare `null` binding takes (D3355).
+function exitFirstLetsAnnotate() {
+  let i = 0
+  while i < exitFirstLetCount() {
+    const li = exitFirstLetAt(i)
+    if li >= 0 && li < P.nodes.length {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        let ty = nodeTyIxOf(d.letInit)
+        if letNullHoleUnfilled(li) { ty = -1 }
+        const filled = letNullHoleFilledTy(li)
+        if filled >= 0 { ty = filled }
+        let spell = ""
+        if ty >= 0 { spell = lvSpellOf(ty) }
+        if d.letType < 0 && spell != "" {
+          let annTy = ty
+          if tyHasTyVar(ty) { annTy = -1 }
+          d.letType = synthTypeRefTy(spell, -1, annTy)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// `name = v` for the value `v` a loop exit hands over, typed as the checker typed `v`.
+function lvAssign(name: string, v: i32, ty: i32): i32 {
+  // An inner loop value rewritten as a statement is a value from here on, so the collect pass
+  // must walk its arms for their locals.
+  if v >= 0 && P.nodes[v] is IfStmt { valueIfAdd(v) }
+  const t = mkIdent(name, -1)
+  nodeTyRecord(t, ty)
+  const a = mkBinary("=", t, v, -1)
+  nodeTyCarry(a, v)
+  a
+}
+
+// A labelled block's value tail `tail`, the last statement of its body `body`, becomes `name = tail`.
+function lvRewriteTail(body: i32, tail: i32, name: string, ty: i32) {
+  if tail < 0 { return 0 }
+  const b = P.nodes[body]
+  if b is Block {
+    const st = b.blkStmts
+    if st.length > 0 && st[st.length - 1] == tail {
+      st[st.length - 1] = lvAssign(name, tail, ty)
+    }
+  }
+  0
+}
+
+// Rewrites each `break v` under `ix` that leaves the loop labelled `label` (`depth` 0 while no
+// loop or block lies between them) so its value statement stores into `name`. A labelled
+// `break` leaves it only while no nearer loop or block takes the same label (`shadow`).
+function lvRewriteBreaks(
+  root: i32,
+  label: string,
+  name: string,
+  ty: i32,
+  depth0: i32,
+  shadow0: boolean,
+) {
+  const todo: i32[] = [root]
+  const todoDepth: i32[] = [depth0]
+  const todoShadow: boolean[] = [shadow0]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    const depth = todoDepth.pop() ?? 0
+    const shadow = todoShadow.pop() ?? false
+    if ix >= 0 && ix < P.nodes.length && !(P.nodes[ix] is FuncDecl) {
+      lvRewriteBlockBreaks(ix, label, name, ty, depth, shadow)
+      let d = depth
+      let sh = shadow
+      const inner = lvLabelOf(ix)
+      if inner != LV_NOT_A_LOOP {
+        d = depth + 1
+        if label != "" && inner == label { sh = true }
+      }
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        todoDepth.push(d)
+        todoShadow.push(sh)
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// What `lvLabelOf` answers for a node no `break` can leave: `%` spells no label.
+const LV_NOT_A_LOOP = "%"
+
+// The label of the loop or labelled block at `ix` ("" for none), else `lvNotALoop`'s answer.
+function lvLabelOf(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is WhileStmt { return n.whileLabel }
+  if n is ForRange { return n.frLabel }
+  if n is ForIn { return n.fiLabel }
+  lvNotALoop(ix)
+}
+
+// Every other kind: an expression, a declaration or a statement no `break` leaves.
+function lvNotALoop(_ix: i32): string { LV_NOT_A_LOOP }
+
+// `lvRewriteBreaks` for the statement list of one block `ix`, `depth` loops inside the target.
+function lvRewriteBlockBreaks(
+  ix: i32,
+  label: string,
+  name: string,
+  ty: i32,
+  depth: i32,
+  shadow: boolean,
+) {
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    let j = 1
+    while j < st.length {
+      if st[j] >= 0 && st[j] < P.nodes.length {
+        const b = P.nodes[st[j]]
+        if b is BreakStmt {
+          if b.brkHasVal == 1 && lvLeaves(b.brkLabel, label, depth, shadow) {
+            st[j - 1] = lvAssign(name, st[j - 1], ty)
+          }
+        }
+      }
+      j = j + 1
+    }
+  }
+  0
+}
+
+// Whether a `break` labelled `brk` leaves the loop labelled `label` from `depth` loops inside it.
+function lvLeaves(
+  brk: string,
+  label: string,
+  depth: i32,
+  shadow: boolean,
+): boolean {
+  if brk == "" { return depth == 0 }
+  brk == label && !shadow
+}
+
+// ── nullable scalar locals (SP-046) ────────────────────────────────────────────────────────
+
+// A function-local `const g = e` of type `S | null`, `S` a wide numeric scalar, whose every use
+// is a null test, a narrowed read or `g ?? d`, becomes `let $np: boolean = true` and
+// `const $nv: S = e ?? (if true { $np = false  0 } else { 0 })`: the fused `??` reads the
+// value without a box. Any other use, a capture or a shadowing name keeps the boxed binding.
+export function nulScalarSplit(rootIx: i32) {
+  const todo: i32[] = [rootIx]
+  const todoMode: i32[] = [0]
+  const blocks: i32[] = []
+  const lets: i32[] = []
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    let mode = todoMode.pop() ?? 0
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is FuncDecl {
+        if n.fnTyParams.length > 0 || mode == 2 { mode = 2 } else { mode = 1 }
+      }
+      if n is Block {
+        if mode == 1 {
+          for s in n.blkStmts {
+            if nssCandidate(s) {
+              blocks.push(ix)
+              lets.push(s)
+            }
+          }
+        }
+      }
+      for k in nodeChildren(ix) {
+        todo.push(k)
+        todoMode.push(mode)
+      }
+    }
+  }
+  let i = 0
+  while i < lets.length {
+    nssTry(blocks[i], lets[i])
+    i = i + 1
+  }
+  if lets.length > 0 {
+    capMemoNoteEdit()
+    plCacheBust()
+  }
+  0
+}
+
+// The scalar `S` of a `const` whose initializer is typed `S | null`, or -1.
+function nssScalarOf(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letKw != "const" || d.letInit < 0 { return -1 }
+    const t = nodeTyIxOf(d.letInit)
+    if t < 0 { return -1 }
+    const s = nonNullTy(t)
+    if s == t { return -1 }
+    const prim = tyPrimNameOf(s)
+    if prim == "i32" || prim == "i64" || prim == "f64" || prim == "f32" {
+      if nssFusedInit(d.letInit) { return s }
+    }
+  }
+  -1
+}
+
+// True when `e ?? d` over the initializer `ix` is a fused read that makes no box: a map read
+// (`m[k]`, `m.get(k)`), a scalar list's `.get(i)` or `.pop()`. Any other
+// producer already hands over a box, and splitting it only hides the box from the optimizer.
+function nssFusedInit(ix: i32): boolean {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Index { return tyIsMap(nodeTyIxOf(e.idxArr)) }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      const rt = nodeTyIxOf(callee.memObj)
+      if callee.memProp == "get" && e.callArgs.length == 1 {
+        return tyIsMap(rt) || tyArrayElemIx(rt) >= 0
+      }
+      if callee.memProp == "pop" && e.callArgs.length == 0 {
+        return tyArrayElemIx(rt) >= 0
+      }
+    }
+  }
+  nssBoxedProducer(ix)
+}
+
+// Every other initializer, a call returning `S | null` among them, is a producer whose value
+// is already a box when it arrives, so it is never split.
+function nssBoxedProducer(_ix: i32): boolean { false }
+
+function nssCandidate(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  nssScalarOf(ix) >= 0
+}
+
+// True when `ix` is the bare name `name`.
+function nssIsName(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  false
+}
+
+// True when node `ix` declares `name` (a shadow the walk does not follow), or is a `match`,
+// which the checker desugars before this pass and so is not expected here.
+function nssDeclares(ix: i32, name: string): boolean {
+  const n = P.nodes[ix]
+  if n is LetDecl { return n.letName == name }
+  if n is Param { return n.parName == name }
+  if n is ForRange { return n.frVar == name }
+  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
+  if n is FuncDecl { return n.fnName == name }
+  if n is MatchExpr { return true }
+  nssBindsNoName(ix)
+}
+
+// Every other node kind binds no name of its own.
+function nssBindsNoName(_ix: i32): boolean { false }
+
+// Classifies every use of the `const` at `letIx`, the statement of block `blk`, and rewrites
+// them and the binding when all qualify.
+function nssTry(blk: i32, letIx: i32) {
+  const b = P.nodes[blk]
+  const d = P.nodes[letIx]
+  if b is Block {
+    if d is LetDecl {
+      const s = nssScalarOf(letIx)
+      const t = nodeTyIxOf(d.letInit)
+      const name = d.letName
+      const st = b.blkStmts
+      let at = -1
+      let i = 0
+      while i < st.length {
+        if st[i] == letIx { at = i }
+        i = i + 1
+      }
+      if at < 0 { return 0 }
+      // The uses, by kind: a test yielding presence, one yielding absence, a read, a `??`.
+      const pres: i32[] = []
+      const abs: i32[] = []
+      const reads: i32[] = []
+      const coals: i32[] = []
+      const todo: i32[] = []
+      const inFn: boolean[] = []
+      let j = st.length - 1
+      while j > at {
+        todo.push(st[j])
+        inFn.push(false)
+        j = j - 1
+      }
+      while todo.length > 0 {
+        const ix = todo.pop() ?? -1
+        const fn = inFn.pop() ?? false
+        if ix >= 0 && ix < P.nodes.length {
+          if nssDeclares(ix, name) { return 0 }
+          const n = P.nodes[ix]
+          let kids = true
+          if n is Ident {
+            if n.identName == name {
+              if fn || !tyEq(nodeTyIxOf(ix), s) { return 0 }
+              reads.push(ix)
+            }
+          } else if n is BinExpr {
+            const op = n.binOp
+            if op == "==" || op == "!=" {
+              let operand = -1
+              if nssIsName(n.binLeft, name) && P.nodes[n.binRight] is NullLit {
+                operand = n.binLeft
+              }
+              if nssIsName(n.binRight, name) && P.nodes[n.binLeft] is NullLit {
+                operand = n.binRight
+              }
+              if operand >= 0 {
+                if fn || !tyEq(nodeTyIxOf(operand), t) { return 0 }
+                if op == "==" { abs.push(ix) } else { pres.push(ix) }
+                kids = false
+              }
+            } else if op == "??" && nssIsName(n.binLeft, name) {
+              if fn || !tyEq(nodeTyIxOf(n.binLeft), t) { return 0 }
+              coals.push(ix)
+              todo.push(n.binRight)
+              inFn.push(fn)
+              kids = false
+            }
+          } else if n is IsExpr {
+            if nssIsName(n.isObj, name) {
+              if fn || !tyEq(nodeTyIxOf(n.isObj), t) { return 0 }
+              if n.isVariant == "null" { abs.push(ix) }
+              else if n.isVariant == tyToStr(s) { pres.push(ix) }
+              else { return 0 }
+              kids = false
+            }
+          }
+          if kids {
+            const inner = fn || n is FuncDecl
+            for k in nodeChildren(ix) {
+              todo.push(k)
+              inFn.push(inner)
+            }
+          }
+        }
+      }
+      nssRewrite(b, at, d, s, pres, abs, reads, coals)
+    }
+  }
+  0
+}
+
+// Applies `nssTry`'s verdict: the two bindings replace the `const` at `st[at]`, and each use
+// is overwritten in place with its read of them.
+function nssRewrite(
+  b: Block,
+  at: i32,
+  d: LetDecl,
+  s: i32,
+  pres: i32[],
+  abs: i32[],
+  reads: i32[],
+  coals: i32[],
+) {
+  const pos = d.pos
+  const np = "$np" + i32ToStr(b.blkStmts[at])
+  const nv = "$nv" + i32ToStr(b.blkStmts[at])
+  const tb = lvTyBool()
+  const init = mkBool(1, pos)
+  nodeTyRecord(init, tb)
+  const npDecl = mkLet("let", np, synthTypeRefTy("boolean", pos, tb), init, pos)
+  nodeTyRecord(npDecl, lvTyVoid())
+  const npT = mkIdent(np, pos)
+  nodeTyRecord(npT, tb)
+  const clr = mkBool(0, pos)
+  nodeTyRecord(clr, tb)
+  const asg = mkBinary("=", npT, clr, pos)
+  nodeTyCarry(asg, clr)
+  const missSt: i32[] = [asg, nssZero(s, pos)]
+  const miss = mkBlock(missSt, pos)
+  nodeTyRecord(miss, s)
+  const otherSt: i32[] = [nssZero(s, pos)]
+  const other = mkBlock(otherSt, pos)
+  nodeTyRecord(other, s)
+  const cond = mkBool(1, -1)
+  nodeTyRecord(cond, tb)
+  const def = mkIf(cond, miss, other, pos)
+  nodeTyRecord(def, s)
+  valueIfAdd(def)
+  const co = mkBinary("??", d.letInit, def, pos)
+  nodeTyRecord(co, s)
+  const nvDecl = mkLet(
+    "const",
+    nv,
+    synthTypeRefTy(tyToEmitName(s), pos, s),
+    co,
+    pos,
+  )
+  nodeTyRecord(nvDecl, lvTyVoid())
+  const old = b.blkStmts
+  const st: i32[] = []
+  let i = 0
+  while i < old.length {
+    if i == at {
+      st.push(npDecl)
+      st.push(nvDecl)
+    } else {
+      st.push(old[i])
+    }
+    i = i + 1
+  }
+  b.blkStmts = st
+  for ix in pres { nssSetName(ix, np, tb) }
+  for ix in abs {
+    const id = mkIdent(np, -1)
+    nodeTyRecord(id, tb)
+    const un: Node = { unOp: "!", unArg: id, pos: P.nodes[ix].pos }
+    arenaSetNode(ix, un)
+    nodeTyRecord(ix, tb)
+  }
+  for ix in reads { nssSetName(ix, nv, s) }
+  for ix in coals {
+    const c = P.nodes[ix]
+    if c is BinExpr {
+      const ty = nodeTyIxOf(ix)
+      const cp = mkIdent(np, -1)
+      nodeTyRecord(cp, tb)
+      const cv = mkIdent(nv, -1)
+      nodeTyRecord(cv, s)
+      const thenSt: i32[] = [cv]
+      const thenB = mkBlock(thenSt, -1)
+      nodeTyRecord(thenB, ty)
+      const elseSt: i32[] = [c.binRight]
+      const elseB = mkBlock(elseSt, -1)
+      nodeTyRecord(elseB, ty)
+      const w: Node = { ifCond: cp, ifThen: thenB, ifElse: elseB, pos: c.pos }
+      arenaSetNode(ix, w)
+      nodeTyRecord(ix, ty)
+      valueIfAdd(ix)
+    }
+  }
+  0
+}
+
+// Overwrites node `ix` with a read of the name `name`, typed `ty`.
+function nssSetName(ix: i32, name: string, ty: i32) {
+  const w: Node = { identName: name, pos: P.nodes[ix].pos }
+  arenaSetNode(ix, w)
+  sidNoteNodeName(ix)
+  nodeTyRecord(ix, ty)
+  0
+}
+
+// A zero of scalar `s`, the value the miss arm yields and nothing reads.
+function nssZero(s: i32, pos: i32): i32 {
+  const prim = tyPrimNameOf(s)
+  let z = -1
+  if prim == "f64" || prim == "f32" {
+    z = mkNum("0.0", pos)
+  } else {
+    z = mkNum("0", pos)
+  }
+  nodeTyRecord(z, s)
+  z
+}
 // ── the build-decided `if` ───────────────────────────────────────────────────
 
 // Whether the statement at `ix` is an else-less `if __memory_shared__() { … }` whose call the
@@ -218,6 +970,8 @@ function foldMemSharedList(stmts: i32[]) {
 
 // The pass: every statement list in the arena, so a nested or top-level fold is met too.
 export function foldMemShared() {
+  // With no resolved `__memory_shared__()` call no statement folds.
+  if memSharedCalls.length == 0 { return 0 }
   const n = P.nodes.length
   let i = 0
   while i < n {
@@ -275,12 +1029,17 @@ function drwCloShadowed(name: string) {
 // default expressions for the trailing arguments the call omitted — runs before
 // monomorphization, so every later pass sees an ordinary full-arity call and no
 // new `$fnsig` key is minted. A call through a function value resolves nothing.
-function drwFillDefaults(ix: i32, ctx: i32) {
+export function drwFillDefaults(ix: i32, ctx: i32) {
   const n = P.nodes[ix]
   if n is Call {
     const cf = P.nodes[n.callFn]
     if cf is Ident {
-      const fe = fnIndexOfInScopeChain(cf.identName, ctx)
+      const fe = fnIndexOfInScopeChainAt(
+        sidOfNode(n.callFn),
+        cf.identName,
+        ctx,
+        n.callFn,
+      )
       if fe < 0 { return 0 }
       // A closure binding of the name is what the call denotes, so the module function's
       // defaults are not this call's: filling them hands the closure an argument its
@@ -351,21 +1110,12 @@ function drwIsMapRead(ix: i32) {
   false
 }
 
-// Whether any instantiation of the enclosing generic resolves `prop` as a field of
-// the receiver, so the answer differs per instance and this rewrite must decline
-// (D1002): the body cannot answer, but the call sites can, from the checker's
-// per-argument types. Declining hands the call to the field-closure lowering instead.
-
-// D1430 — an un-annotated parameter is a generic too. `fnTyParams.length == 0` is not
-// "not generic": `function g(x) { x.tag() }` declares no type parameters but still
-// takes any type, so this must still decline and not rewrite the call onto a
-// `self`-function whose receiver type no instantiation can ever have.
-function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
+// Whether `recvIx` is a parameter of the generic `ctx` still typed by a type parameter, so the
+// member `recv.prop(…)` names (built-in, field or `self`-function) differs per instance and the
+// rewrite leaves the call to `monoPinBinOps` (D2517). An un-annotated parameter counts: it takes
+// any type too.
+function drwRecvIsTyParam(recvIx: i32, ctx: i32) {
   if ctx < 0 { return false }
-  // Ordered by cost: `tyHasTyVar` fans out over a union's members and an object's fields
-  // to depth 12 with no memo, exponential on a recursive union. The parameter scan runs
-  // first so a receiver naming an annotated parameter of a non-generic function returns
-  // before paying that cost.
   const fn = P.nodes[ctx]
   if fn is FuncDecl {
     const r = P.nodes[unwrapParen(recvIx)]
@@ -386,37 +1136,16 @@ function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
       }
       if pi < 0 { return false }
       if fn.fnTyParams.length == 0 && !piHole { return false }
-      // The receiver's own recorded type must still be a hole — a concrete receiver is
-      // answered by `structIndexOfExpr` already; only an un-annotated parameter reaches here.
-      if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
-      const gname = fn.fnName
-      if gname == "" { return false }
-      let seen = 0
-      let k = 0
-      while k < P.nodes.length {
-        const nd = P.nodes[k]
-        if nd is Call {
-          const ce = P.nodes[nd.callFn]
-          // A UFCS call naming this generic reaches it through a receiver this scan
-          // cannot line up with a parameter position — decline rather than guess.
-          if ce is Member {
-            if ce.memProp == gname { return false }
-          }
-          if ce is Ident {
-            if ce.identName == gname {
-              if pi >= nd.callArgs.length { return false }
-              if tyFieldTyOf(nodeTyIxOf(nd.callArgs[pi]), prop) >= 0 {
-                seen = seen + 1
-              }
-            }
-          }
-        }
-        k = k + 1
-      }
-      return seen > 0
+      if fn.fnName == "" { return false }
+      return tyHasTyVar(nodeTyIxOf(recvIx))
     }
   }
   false
+}
+
+// Whether the rewrite left member call `callIx` to each instance (`drwRecvIsTyParam`).
+export function drwMemberDeferred(callIx: i32) {
+  memberCallRungOf(callIx) == MC_RUNG_PER_INSTANCE
 }
 
 // A fresh node denoting the same place as `ix`, so the guard's null test and the call never
@@ -488,6 +1217,13 @@ function drwOptGuard(
 // the block's value.
 let drwAtStmt = false
 
+// A user operator's call `call`, standing for the operator expression `opIx`: it carries the
+// checked type, so a reader of the rewritten node (a walk's element, a print) sees the result.
+function drwOpCall(call: i32, opIx: i32): i32 {
+  nodeTyCarry(call, opIx)
+  call
+}
+
 // Every node this returns in place of `ix` is freshly minted, except the `??` fold's left
 // operand, which reports itself to the capture memo (D2017).
 function drwWalk(ix: i32, ctx: i32) {
@@ -510,6 +1246,7 @@ function drwWalk(ix: i32, ctx: i32) {
     if c0 is OptMember {
       optWasOpt = true
       n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
+      arenaNoteRefWrite()
     }
     let optRecv = -1
     const callee = P.nodes[n.callFn]
@@ -529,15 +1266,15 @@ function drwWalk(ix: i32, ctx: i32) {
               false,
               callee.pos,
             )
+            arenaNoteRefWrite()
             return ix
           }
         }
       }
-      // D1522 — a map `m.get(k)` is the read `m[k]`, so it becomes one, here rather than
-      // as a separate emit arm: an emit arm alone leaves every consumer classifier reading
-      // the call's checker type and claiming a box the read never left. The checked type
-      // rides onto the new Index node, which the checker's own type gates.
-      if callee.memProp == "get" {
+      // D1522 — a map `m.get(k)` is the read `m[k]`, rewritten here so every consumer
+      // classifier reads the Index node (it carries the checked type) rather than claiming a
+      // box the read never left. Only where the checker took the built-in: a set's is a function.
+      if callee.memProp == "get" && memberCallRungOf(ix) != MC_RUNG_SELF_FN {
         if args.length == 1 && nodeTyIsMap(callee.memObj) {
           const mgIx = mkIndex(callee.memObj, args[0], n.pos)
           nodeTyCarry(mgIx, ix)
@@ -557,19 +1294,25 @@ function drwWalk(ix: i32, ctx: i32) {
       const recvHasField = recvFieldTy >= 0
       const si = structIndexOfExpr(callee.memObj, ctx)
       let ufcs = false
-      if si >= 0 && !recvHasField {
-        if sFieldIndex(si, callee.memProp) < 0 {
+      // A call the checker resolved to a built-in method stays one: that is the rung a
+      // `self`-function of the same name loses to on this receiver (D2476).
+      const builtinRung = memberCallRungOf(ix) == MC_RUNG_BUILTIN
+      // And one it resolved to a `self`-function stays one where the struct row has the field
+      // but the checked type does not: a `P | null` receiver's row is `P`'s.
+      const selfFnRung = memberCallRungOf(ix) == MC_RUNG_SELF_FN
+      if si >= 0 && !recvHasField && !builtinRung {
+        if sFieldIndex(si, callee.memProp) < 0 || selfFnRung {
           if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
         }
       }
-      if si < 0 && !recvHasField {
+      if si < 0 && !recvHasField && !builtinRung {
         if !exprIsClosure(n.callFn, ctx) {
           if drwSelfFnOf(uName, args.length + 1) >= 0 {
             // A type-parameter receiver has no struct row yet, so `si < 0` alone cannot
-            // mean "no field, so UFCS" — see `drwAnyInstanceTakesField`. Asked last, after
-            // the `self`-function has matched, since it walks the whole arena and node
-            // table and every `.push`/`.slice` receiver in a real program reaches this arm.
-            if !drwAnyInstanceTakesField(callee.memObj, callee.memProp, ctx) {
+            // mean "no field, so UFCS": each instance answers for itself.
+            if drwRecvIsTyParam(callee.memObj, ctx) {
+              memberCallRungAdd(ix, MC_RUNG_PER_INSTANCE)
+            } else {
               ufcs = true
             }
           }
@@ -598,12 +1341,17 @@ function drwWalk(ix: i32, ctx: i32) {
           }
           nm[0] = ""
         }
-        n.callFn = mkIdent(uName, -1)
+        const ufcsFn = mkIdent(uName, -1)
+        noteCallOrigin(ufcsFn, ix)
+        n.callFn = ufcsFn
+        arenaNoteRefWrite()
       }
       drwFillDefaults(ix, ctx)
       return drwOptGuard(ix, ix, optRecv, n.pos, atStmt)
     }
-    n.callFn = drwWalk(n.callFn, ctx)
+    const nfn = drwWalk(n.callFn, ctx)
+    if nfn != n.callFn { arenaNoteRefWrite() }
+    n.callFn = nfn
     drwFillDefaults(ix, ctx)
     return ix
   }
@@ -731,7 +1479,7 @@ function drwWalk(ix: i32, ctx: i32) {
       // lands on the inner node only. D1371 — without peeling, `(a as? i32) ?? 0` read the
       // stale parenthesized type while the un-parenthesised spelling ran correctly.
       const coalLhs = unwrapParen(n.binLeft)
-      if nodeTyExcludesNull(coalLhs) {
+      if (nodeTyExcludesNull(coalLhs)) {
         capMemoNoteEdit()
         return n.binLeft
       }
@@ -741,6 +1489,11 @@ function drwWalk(ix: i32, ctx: i32) {
       if P.nodes[unwrapParen(n.binRight)] is NullLit {
         capMemoNoteEdit()
         return n.binLeft
+      }
+      // `null ?? d` is `d`, the type the checker gave it (D2261).
+      if coalLhs >= 0 && P.nodes[coalLhs] is NullLit {
+        capMemoNoteEdit()
+        return n.binRight
       }
       // A read of a `{[K]: V}` map with a nullable default is `V | null`, a rep the fused
       // get-with-default builds only for some values, so a re-readable one desugars to the
@@ -802,13 +1555,16 @@ function drwWalk(ix: i32, ctx: i32) {
         const oargs: i32[] = []
         oargs.push(n.binLeft)
         oargs.push(n.binRight)
-        return mkCall(mkIdent(opFn, -1), oargs, -1)
+        return drwOpCall(mkCall(mkIdent(opFn, -1), oargs, -1), ix)
       }
       if osi >= 0 {
         if drwFieldClosure(osi, n.binOp) {
           const fargs: i32[] = []
           fargs.push(n.binRight)
-          return mkCall(mkMember(n.binLeft, n.binOp, -1), fargs, -1)
+          return drwOpCall(
+            mkCall(mkMember(n.binLeft, n.binOp, -1), fargs, -1),
+            ix,
+          )
         }
       }
     }
@@ -850,14 +1606,14 @@ function drwWalk(ix: i32, ctx: i32) {
       const roargs: i32[] = []
       roargs.push(n.idxArr)
       roargs.push(n.idxIndex)
-      return mkCall(mkIdent(rOp, -1), roargs, -1)
+      return drwOpCall(mkCall(mkIdent(rOp, -1), roargs, -1), ix)
     }
     // The index read trap: a struct receiver carrying a "[]" closure field.
     const tsi = structIndexOfExpr(n.idxArr, ctx)
     if drwFieldClosure(tsi, "[]") {
       const targs: i32[] = []
       targs.push(n.idxIndex)
-      return mkCall(mkMember(n.idxArr, "[]", -1), targs, -1)
+      return drwOpCall(mkCall(mkMember(n.idxArr, "[]", -1), targs, -1), ix)
     }
     return ix
   }
@@ -950,7 +1706,9 @@ export function dispatchRewrite(stmts: i32[]) {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
       drwCloNames.clear()
-      fn.fnBody = drwWalk(fn.fnBody, fnStmts[fe])
+      const drwBody = drwWalk(fn.fnBody, fnStmts[fe])
+      if drwBody != fn.fnBody { bodyRebuiltFrom.set(drwBody, fn.fnBody) }
+      fn.fnBody = drwBody
       if fe < fRetVoid.length && fRetVoid[fe] == 0 {
         spillTail(fn.fnBody, fnStmts[fe])
       }
@@ -1140,6 +1898,7 @@ function spillLocal(
   out.push(decl)
   const rd = mkIdent(name, pos)
   nodeTyCarry(rd, ix)
+  refViewCarry(ix, rd)
   rd
 }
 
@@ -1167,6 +1926,448 @@ function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
   0
 }
 
+// ── value-position writes to a wider name (D2398) ─────────────────────────────────────────────
+// An assignment yields its right side, a name's re-read its storage. Where the two types
+// differ (`5` into an `f64`), a write on its statement's leading evaluation path moves ahead
+// of the statement as `const v = e; a = v`, and the statement reads `v`.
+
+// The names read, in evaluation order, by operands the walk has already passed; a write the
+// walk moves ahead of them must not change what they read.
+let asvReads: string[] = []
+// Set once the walk passes an operand that it cannot prove the moved write leaves alone.
+let asvStop = false
+// Whether the statement walked is a top-level binding, which has room for one moved write.
+let asvTopLet = false
+
+// Records the operand at `ix` as passed: a name joins `asvReads`, and any operand other than
+// a name or a literal (`exprReReadable` of a leaf) ends the walk.
+function asvPassOperand(ix: i32) {
+  const u = unwrapParen(ix)
+  if u < 0 { return 0 }
+  const n = P.nodes[u]
+  if n is Ident {
+    asvReads.push(n.identName)
+    return 0
+  }
+  if !asvIsLeaf(u) { asvStop = true }
+  0
+}
+
+// A literal or a name: an operand whose evaluation neither writes nor depends on order.
+function asvIsLeaf(ix: i32): boolean {
+  if ix < 0 { return false }
+  if P.nodes[ix] is Member || P.nodes[ix] is Index { return false }
+  exprReReadable(ix)
+}
+
+// Whether evaluating `ix` can write anything: an assignment under an operator, or any node
+// `exprReReadable` does not answer for, a call among them.
+function asvMayWrite(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" { return true }
+    return asvMayWrite(n.binLeft) || asvMayWrite(n.binRight)
+  }
+  if n is Unary { return asvMayWrite(n.unArg) }
+  asvLeafMayWrite(ix)
+}
+
+// Whether a node that is not an operator can write: any node `exprReReadable` does not
+// answer for, a call among them.
+function asvLeafMayWrite(ix: i32): boolean { !exprReReadable(ix) }
+
+// Whether the value-position write `a = e` at `asgIx` moves ahead: its name's type is not the
+// value's, neither is a literal-union atom (a store that encodes one keeps its re-read, as
+// D2285's does), the value is not a bare `null`, and no operand already passed reads the name
+// or anything `e` may write.
+function asvMoves(asgIx: i32): boolean {
+  if !asvTypeMoves(asgIx) { return false }
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  const t = P.nodes[a.binLeft]
+  if !(t is Ident) { return false }
+  let i = 0
+  let spilled = true
+  while i < asvReads.length {
+    if asvReads[i] == t.identName { return false }
+    if asvReads[i].slice(0, 4) != "asg#" { spilled = false }
+    i = i + 1
+  }
+  spilled || !asvMayWrite(a.binRight)
+}
+
+// `asvMoves`'s half that reads only the write at `asgIx`: a plain write to a name whose
+// storage type is not the value's, where neither is a literal-union atom or holds a type
+// variable, and the value is not a bare `null`.
+function asvTypeMoves(asgIx: i32): boolean {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" || a.binCompound != "" { return false }
+  if !(P.nodes[a.binLeft] is Ident) { return false }
+  if P.nodes[unwrapParen(a.binRight)] is NullLit { return false }
+  const lt = asgStoreTyOf(asgIx)
+  const vt = nodeTyIxOf(asgIx)
+  if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
+  if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
+  !(tyHasTyVar(lt) || tyHasTyVar(vt))
+}
+
+// Walks the operands of `ix` that run first, moving each value-position write `asvMoves`
+// accepts onto `out`; answers the node that replaces `ix`. `isValue` is false only for a
+// statement's own top-level write, whose value nothing reads.
+function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
+  if ix < 0 || asvStop { return ix }
+  const n = P.nodes[ix]
+  if (
+    n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+  ) {
+    return ix
+  }
+  if n is Paren {
+    n.parInner = asvWalk(n.parInner, out, isValue)
+    return ix
+  }
+  if n is BinExpr {
+    if n.binOp == "=" { return asvWalkWrite(ix, n, out, isValue) }
+    n.binLeft = asvWalk(n.binLeft, out, true)
+    asvPassOperand(n.binLeft)
+    if n.binOp == "&&" || n.binOp == "||" || n.binOp == "??" { asvStop = true }
+    n.binRight = asvWalk(n.binRight, out, true)
+    return ix
+  }
+  if n is Unary {
+    n.unArg = asvWalk(n.unArg, out, true)
+    return ix
+  }
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    if callee is Member {
+      callee.memObj = asvWalk(callee.memObj, out, true)
+      asvPassOperand(callee.memObj)
+    } else if callee is Ident {
+      // A callee a binding holds is read before the arguments run.
+      if asvIsBound(callee.identName) { asvPassOperand(n.callFn) }
+    } else {
+      asvStop = true
+    }
+    // Named arguments run in parameter order, not source order (D2343), so none moves.
+    if hasNamedArgs(n.callArgNames) { return asvHalt(ix) }
+    asvWalkList(n.callArgs, out)
+    return ix
+  }
+  if n is ArrayLit {
+    asvWalkList(n.arrElems, out)
+    return ix
+  }
+  if n is ObjLit { return asvWalkObj(ix, n, out) }
+  if n is Spread {
+    n.spdArg = asvWalk(n.spdArg, out, true)
+    return ix
+  }
+  if n is Member {
+    n.memObj = asvWalk(n.memObj, out, true)
+    return ix
+  }
+  if n is Index {
+    n.idxArr = asvWalk(n.idxArr, out, true)
+    asvPassOperand(n.idxArr)
+    n.idxIndex = asvWalk(n.idxIndex, out, true)
+    return ix
+  }
+  if n is IsExpr {
+    n.isObj = asvWalk(n.isObj, out, true)
+    return ix
+  }
+  if n is AsExpr {
+    n.asObj = asvWalk(n.asObj, out, true)
+    return ix
+  }
+  asvHalt(ix)
+}
+
+// The end of the walk at `ix`, a node whose operands it does not model (a lambda, a `match`,
+// an `if` used as a value): no later write moves past it. Answers `ix` unchanged.
+function asvHalt(ix: i32): i32 {
+  asvStop = true
+  ix
+}
+
+// `asvWalk` over operands that run in order, each passed before the next is walked.
+function asvWalkList(xs: i32[], out: i32[]) {
+  let i = 0
+  while i < xs.length {
+    xs[i] = asvWalk(xs[i], out, true)
+    asvPassOperand(xs[i])
+    i = i + 1
+  }
+  0
+}
+
+// A record literal's fields run in layout order, not source order, so only a literal whose
+// other fields are all literals has an operand that provably runs first.
+function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
+  let lead = -1
+  let i = 0
+  while i < n.objFields.length {
+    const f = P.nodes[n.objFields[i]]
+    if f is FieldInit {
+      const v = P.nodes[unwrapParen(f.fiValue)]
+      if !(v is NumLit || v is StrLit || v is CharLit || v is BoolLit) {
+        if lead >= 0 {
+          asvStop = true
+          return ix
+        }
+        lead = n.objFields[i]
+      }
+    }
+    i = i + 1
+  }
+  if lead >= 0 {
+    const lf = P.nodes[lead]
+    if lf is FieldInit { lf.fiValue = asvWalk(lf.fiValue, out, true) }
+  }
+  asvStop = true
+  ix
+}
+
+// Passes the operands a write's target `ti` evaluates before its right side: a field's
+// receiver, or an element's receiver and index. A name evaluates none; any other target ends
+// the walk.
+function asvPassTarget(ti: i32) {
+  if ti < 0 { return asvHalt(ti) }
+  const t = P.nodes[ti]
+  if t is Member { return asvPassOperand(t.memObj) }
+  if t is Index {
+    asvPassOperand(t.idxArr)
+    return asvPassOperand(t.idxIndex)
+  }
+  if t is Ident { return 0 }
+  asvHalt(ti)
+}
+
+// An assignment on the leading path: its right side runs first; a name target of a value
+// write `asvMoves` accepts becomes `const v = e; a = v` on `out` and the read of `v`. A field
+// or element target is walked only when its receiver and index are names or literals.
+function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
+  asvPassTarget(unwrapParen(n.binLeft))
+  n.binRight = asvWalk(n.binRight, out, true)
+  if asvStop || !isValue || !asvMoves(ix) { return ix }
+  if asvTopLet { asvStop = true }
+  // A literal keeps its store, which may encode it at the place's width (`2.5` into `f32`),
+  // and is yielded as a copy at the value's type, as D2285's tail does.
+  const lit = asvLitCopy(n.binRight)
+  if lit >= 0 {
+    nodeTyRecord(lit, nodeTyIxOf(ix))
+    out.push(ix)
+    return lit
+  }
+  const v = spillLocal(n.binRight, ix, "nv", out, n.pos)
+  n.binRight = v
+  out.push(ix)
+  spillRead(v)
+}
+
+// `cboxLitCopy`, and a negated number literal too; -1 for any other node.
+function asvLitCopy(ix: i32): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 { return -1 }
+  const n = P.nodes[u]
+  if n is Unary {
+    if n.unOp != "-" { return -1 }
+    const inner = cboxLitCopy(n.unArg)
+    if inner < 0 { return -1 }
+    nodeTyCarry(inner, n.unArg)
+    return mkUnary("-", inner, n.pos)
+  }
+  cboxLitCopy(u)
+}
+
+// The statement at `ix` with its leading value-position writes moved onto `out`: a binding's
+// initialiser, a return's value, an `if`'s condition, a `match`'s subject, or the expression.
+function asvStmt(ix: i32, out: i32[]) {
+  asvReads = []
+  asvStop = false
+  const s = P.nodes[ix]
+  if s is LetDecl {
+    s.letInit = asvWalk(s.letInit, out, true)
+  } else if s is RetStmt {
+    s.retArg = asvWalk(s.retArg, out, true)
+  } else if s is IfStmt {
+    s.ifCond = asvWalk(s.ifCond, out, true)
+  } else if s is MatchExpr {
+    s.matchScrut = asvWalk(s.matchScrut, out, true)
+  } else if (
+    !(s is FuncDecl
+      || s is WhileStmt
+      || s is ForRange
+      || s is ForIn
+      || s is Block)
+  ) {
+    asvWalk(ix, out, false)
+  }
+  0
+}
+
+// Every name a `let` or a parameter binds, so a call through a binding reads it; built on
+// the first question, since most programs never ask one.
+let asvBound: {[string]: i32} = Map()
+let asvBoundBuilt = false
+
+// Records the name the `let` at `ix` binds, if it is one.
+function asvNoteLet(ix: i32) {
+  const bn = P.nodes[ix]
+  if bn is LetDecl { asvBound[bn.letName] = 1 }
+  0
+}
+
+// Records the name the parameter at `ix` binds, if it is one.
+function asvNoteParam(ix: i32) {
+  const bn = P.nodes[ix]
+  if bn is Param { asvBound[bn.parName] = 1 }
+  0
+}
+
+// Whether some `let` or parameter binds `name`.
+function asvIsBound(name: string): boolean {
+  if !asvBoundBuilt {
+    asvBoundBuilt = true
+    const n = P.nodes.length
+    let i = 0
+    while i < n {
+      asvNoteLet(i)
+      asvNoteParam(i)
+      i = i + 1
+    }
+  }
+  (asvBound[name] ?? 0) == 1
+}
+
+// Rewrites one statement list, once after every statement is walked (D2872): the moved writes
+// land ahead of their statement. A top-level statement other than a binding takes them inside a
+// bare block of its own, so they stay locals of the start function. A top-level binding moves
+// one write, as a module binding and a statement ahead of it, at the start function's order.
+function asvList(stmts: i32[], top: boolean) {
+  const res: i32[] = []
+  let moved = false
+  let i = 0
+  while i < stmts.length {
+    const out: i32[] = []
+    asvTopLet = top && P.nodes[stmts[i]] is LetDecl
+    asvStmt(stmts[i], out)
+    if out.length > 0 { moved = true }
+    if out.length > 0 && top && !asvTopLet {
+      const blk = mkBareBlockIf(mkBlock(out, -1), P.nodes[stmts[i]].pos)
+      out.push(stmts[i])
+      res.push(blk)
+    } else {
+      let k = 0
+      while k < out.length {
+        res.push(out[k])
+        k = k + 1
+      }
+      res.push(stmts[i])
+    }
+    i = i + 1
+  }
+  if !moved { return 0 }
+  i = 0
+  while i < res.length {
+    if i < stmts.length { stmts[i] = res[i] } else { stmts.push(res[i]) }
+    i = i + 1
+  }
+  plCacheBust()
+  0
+}
+
+// Whether function `fnIx` yields its body's value: un-annotated and not adopted as a void
+// callback, or annotated with a type other than `void`.
+function asvFnYields(fnIx: i32): boolean {
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet < 0 { return !lambdaVoidAdoptedAt(fnIx) }
+  const rt = P.nodes[fn.fnRet]
+  if rt is TypeRef { return rt.tyName != "void" }
+  false
+}
+
+// The value tail of the block at `blockIx`, arm by arm along a tail `if`'s `else if` spine: a
+// write `asvMoves` accepts becomes `const v = e; a = v; v`, as `spillTail` does for a field.
+function asvTail(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if !(b is Block) { return 0 }
+  const st = b.blkStmts
+  if st.length == 0 { return 0 }
+  const tx = st[st.length - 1]
+  if P.nodes[tx] is IfStmt {
+    if ifYieldsNoValue(tx) || !asvChainHasElse(tx) { return 0 }
+    let cur = tx
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = elseIfLink(cur)
+      if c is IfStmt {
+        asvTail(c.ifThen)
+        if cur < 0 { asvTail(c.ifElse) }
+      }
+    }
+    return 0
+  }
+  if !(P.nodes[tx] is BinExpr) { return 0 }
+  asvReads = []
+  asvStop = false
+  asvTopLet = false
+  const out: i32[] = []
+  const v = asvWalk(tx, out, true)
+  if out.length == 0 { return 0 }
+  st.pop()
+  let k = 0
+  while k < out.length {
+    st.push(out[k])
+    k = k + 1
+  }
+  st.push(v)
+  plCacheBust()
+  0
+}
+
+// Whether the `else if` chain from the `if` at `ix` ends in an `else`, which a value needs.
+function asvChainHasElse(ix: i32): boolean {
+  let cur = ix
+  let last = ix
+  while cur >= 0 {
+    last = cur
+    cur = elseIfLink(cur)
+  }
+  const l = P.nodes[last]
+  if l is IfStmt { return l.ifElse >= 0 }
+  false
+}
+
+// The pass: every statement list in the arena, before collection reads the module's bindings.
+export function assignValueSpill(stmts: i32[]) {
+  asvBound = Map()
+  asvBoundBuilt = false
+  const n = P.nodes.length
+  // A program whose every write stores its right side's own type has nothing to move.
+  if !asgAnyWiderStore() { return 0 }
+  let i = 0
+  while i < n {
+    const nd = P.nodes[i]
+    if nd is Block { asvList(nd.blkStmts, false) }
+    if nd is FuncDecl {
+      if asvFnYields(i) { asvTail(nd.fnBody) }
+    }
+    i = i + 1
+  }
+  asvList(stmts, true)
+  0
+}
+
 // Pins every un-annotated lambda that returns a union to that union, consuming the
 // contextual return type the checker already computed. A body-inferred return for a
 // union join (`if … { aCat } else { aDog }`) collapses to one arm, so without the pin
@@ -1188,6 +2389,17 @@ export function synthRetAnnots() {
           if fe < fRetVoid.length { fRetVoid[fe] = 1 }
           fe = fe + 1
           continue
+        }
+        // A lambda returning a join of records wider than its tails takes the join (D2731), as
+        // a named function does, so its signature and its built value name one row.
+        const ljt = fnTyRetOf(nodeTyIxOf(lamIx))
+        if fnRetJoinsWiderRecord(lamIx, ljt) {
+          const ljn = tyToEmitName(ljt)
+          if ljn != "" {
+            fn.fnRet = synthTypeRefTy(ljn, -1, ljt)
+            fe = fe + 1
+            continue
+          }
         }
         const ctx = inferRetNameByNode(lamIx)
         if ctx != "" {
@@ -1213,6 +2425,10 @@ export function synthRetAnnots() {
             // No separate map-member-union arm: it would pin the identical body the boxed-
             // union arm above already reaches, and keeping it would silently mask a gap in
             // that arm's rung set instead of surfacing an un-pinned row.
+          } else if inferRetRungIsNulListRet(ctxRow) {
+            // A nullable list at a distinct-backing element (`string[] | null`): pins as the
+            // named function's pin does, so the result declares the nullable wrapper (D2399).
+            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if inferRetRungIsParenUnionElemList(ctxRow) {
             // An element-value-union list return (`(f64|null)[]`, `(i64|boolean)[]`): each
             // element seeds through the value-union-box list rep (`refArrElemKind == 2`),
@@ -1307,15 +2523,6 @@ export function synthRetAnnots() {
 // `i32[] | null`, but the inferred spelling has no nullable-list arm in the `fRetKind`
 // cascade. A pin rather than cascade arms, since the annotated spelling is served at four sites.
 
-// Whether the inferred return of `name` is `S | null` over a declared struct row — the
-// D1220 leg of the pin above. Asks the same pair `inferNulStructRow` does, so the pin
-// and the emitter's `retNulRefIndex` cannot resolve different rows.
-function snrNulStructRet(name: string): boolean {
-  const part = nullablePartOf(inferRetNameOf(name))
-  if part == "" { return false }
-  structIndexOfTypeName(part) >= 0
-}
-
 export function synthNulListRetAnns() {
   let i = 0
   while i < fnStmts.length {
@@ -1327,14 +2534,82 @@ export function synthNulListRetAnns() {
         // it declared a `(ref null $C)` result over a body with no `ref.null` fallback —
         // a trap at `vl check` rc 0. `fnRetNullBearing`/`emitNullForRet` both read `fn.fnRet`.
         const irk = inferRetFnKey(fnStmts[i], fn.fnName)
-        if inferRetIsNulList(irk) || snrNulStructRet(irk) {
+        if inferRetNulPinned(irk) {
           const nm = inferRetNameOf(irk)
           if nm != "" { fn.fnRet = synthTypeRefTy(nm, -1, inferRetTyIxOf(irk)) }
+        } else {
+          // A return joining records into one (D2731) takes the joined type, so each
+          // returned literal is built at its row as under the annotated spelling.
+          const jty = fnTyRetOf(nodeTyIxOf(fnStmts[i]))
+          // So does a return set joining lists of different storage, built as the union box.
+          if (
+            tyIsJoinedRecord(jty)
+            || fnRetJoinsWiderRecord(fnStmts[i], jty)
+            || tyIsListUnion(jty)
+          ) {
+            if tyIsListUnion(jty) {
+              if synthListUnionRet(fn, jty) < 0 { return -1 }
+            } else {
+              const jnm = tyToEmitName(jty)
+              if jnm != "" { fn.fnRet = synthTypeRefTy(jnm, -1, jty) }
+            }
+          }
         }
       }
     }
     i = i + 1
   }
+  let n = 0
+  while n < letJoinCandidates.length {
+    if synthListUnionLet(letJoinCandidates[n]) < 0 { return -1 }
+    n = n + 1
+  }
+  0
+}
+
+// Pins an un-annotated binding whose `??` or `if` initializer joins lists of different
+// storage (`xs ?? [[1]]` over `string[] | null`) to that list union, registering the union
+// as the annotated spelling does; a bare join names no union row to box into (D2844).
+function synthListUnionLet(letIx: i32): i32 {
+  const s = P.nodes[letIx]
+  if !(s is LetDecl) { return 0 }
+  if s.letType >= 0 || s.letInit < 0 { return 0 }
+  const init = unwrapParen(s.letInit)
+  if init < 0 { return 0 }
+  const n = P.nodes[init]
+  let joins = n is IfStmt
+  if n is BinExpr { joins = n.binOp == "??" }
+  if !joins { return 0 }
+  const jty = nodeTyIxOf(init)
+  if !tyIsListUnion(jty) { return 0 }
+  const jnm = listUnionEmitName(jty)
+  if jnm == "" || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    const before = uVariants.length
+    if registerInlineUnion(root.progStmts, jnm) < 0 { return -1 }
+    if uVariants.length != before {
+      if assignTags() < 0 { return -1 }
+    }
+    s.letType = synthTypeRefTy(jnm, -1, jty)
+  }
+  0
+}
+
+// Pins `fn`'s return to the list union `jty`, registering the union a record list arm needs
+// after `collectU` has run, as an annotated spelling registers it there (D2768).
+function synthListUnionRet(fn: FuncDecl, jty: i32): i32 {
+  const jnm = listUnionEmitName(jty)
+  if jnm == "" || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    const before = uVariants.length
+    if registerInlineUnion(root.progStmts, jnm) < 0 { return -1 }
+    if uVariants.length != before {
+      if assignTags() < 0 { return -1 }
+    }
+  }
+  fn.fnRet = synthTypeRefTy(jnm, -1, jty)
   0
 }
 
@@ -1362,6 +2637,10 @@ function unionParamPinName(ix: i32) {
   // string half: an alias and an inline spelling soften to the same base scalar.
   const nb = numLitUnionBaseName(ty)
   if nb != "" { return nb }
+  // The param's own row first: the pin's spelling is what an `is` in the body is decided
+  // against, so another union's alias folds a test on a member it lacks (D3039).
+  const own = unRowOfCanon(ty)
+  if own >= 0 { return unNames[own] }
   let u = 0
   while u < unNames.length {
     const nm = unNames[u]
@@ -1400,6 +2679,9 @@ export function recordedParamPinName(pIx: i32) {
   }
   const tn = nodeTyName(pIx)
   if tn == "" { return "" }
+  // A list of nullable records pins the declared struct's row, as its own binding does.
+  const nrl = nulRecListNominalName(nodeTyIxOf(pIx))
+  if nrl != "" { return nrl }
   // The shape-to-nominal decision moves onto the arena (`shapeNominalOfTy`), but the render
   // (`tn`) stays: it is the artefact `synthParamAnnots` mints from, and its emptiness is the
   // inference-hole gate (a `TyVar` renders ""). The gate order is deliberately unchanged —
@@ -1549,6 +2831,7 @@ function cboxShadowParams(fn: i32) {
 function cboxFrameReset() {
   cboxDletSeen = Map()
   cboxCellTy = Map()
+  cboxVecCells = Map()
   cboxKind = Map()
   cboxLetIx = Map()
   cboxLoopUp = []
@@ -1669,7 +2952,7 @@ function cboxLoopMeet(a: i32, b: i32) {
 // in the other arm of an `if`, or the two share a loop that re-runs the capture against the
 // same binding (a loop other than the one the binding is declared in).
 function cboxByRef(name: string, alam: string[]) {
-  if capHas(alam, name) { return true }
+  if strListHas(alam, name) { return true }
   const declLoop = cboxDeclLoop[name] ?? -1
   let ci = cboxCapHead[name] ?? -1
   while ci >= 0 {
@@ -1741,7 +3024,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
         const t = P.nodes[n.binLeft]
         if t is Ident {
           if (cboxShadow[t.identName] ?? 0) == 0 {
-            if !capHas(alam, t.identName) { alam.push(t.identName) }
+            if !strListHas(alam, t.identName) { alam.push(t.identName) }
           }
         }
       }
@@ -1875,7 +3158,7 @@ function cboxTypedLeftName(n: BinExpr, boxed: string[]) {
   if n.binOp != "??" && n.binOp != "=" { return "" }
   const l = P.nodes[unwrapParen(n.binLeft)]
   if l is Ident {
-    if capHas(boxed, l.identName) && (cboxShadow[l.identName] ?? 0) == 0 {
+    if strListHas(boxed, l.identName) && (cboxShadow[l.identName] ?? 0) == 0 {
       return l.identName
     }
   }
@@ -1887,6 +3170,13 @@ function cboxTypedLeftName(n: BinExpr, boxed: string[]) {
 // `Q | null`) the tail becomes `const t = e; v = t; t`, arm by arm under a tail `if`; a
 // literal `e` keeps its store and is yielded as a copy, since the store encodes an atom (D2285).
 let cboxYieldCtr = 0
+
+// The `__cbv` locals `cboxYieldTail` moved a binding write's value into. That value is still
+// one a binding is written with, which the emitter tells apart from any other value (D4123).
+let cboxWriteLets: {[string]: i32} = Map()
+export function cboxIsWriteLet(name: string): boolean {
+  (cboxWriteLets[name] ?? 0) == 1
+}
 function cboxYieldTail(blockIx: i32, boxed: string[]) {
   const b = P.nodes[blockIx]
   if !(b is Block) { return 0 }
@@ -1921,6 +3211,7 @@ function cboxYieldTail(blockIx: i32, boxed: string[]) {
   }
   const tname = "__cbv" + i32ToStr(cboxYieldCtr)
   cboxYieldCtr = cboxYieldCtr + 1
+  cboxWriteLets[tname] = 1
   const tlet = mkLet("const", tname, -1, tn.binRight, -1)
   const store = mkIdent(tname, -1)
   nodeTyRecord(store, valTy)
@@ -1951,6 +3242,7 @@ function cboxLitCopy(ix: i32) {
 function cboxBoxLet(ix: i32, key: string) {
   const n = P.nodes[ix]
   if !(n is LetDecl) { return 0 }
+  if cboxVecBoxLet(ix, n, key) { return 0 }
   if n.letType >= 0 {
     const lt = P.nodes[n.letType]
     if lt is TypeRef {
@@ -1960,9 +3252,10 @@ function cboxBoxLet(ix: i32, key: string) {
       let boxedTy = -1
       if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
       if boxedTy >= 0 { cboxCellTy[key] = boxedTy }
-      let cellName = lt.tyName + "[]"
-      if annUnionAtomsOf(n.letType) != 1 || annArrowAt(lt.tyName) >= 0 {
-        cellName = "(" + lt.tyName + ")[]"
+      const elemName = cboxElemName(n.letType, lt.tyName, elemTy)
+      let cellName = elemName + "[]"
+      if cboxElemNeedsParens(n.letType, elemName) {
+        cellName = "(" + elemName + ")[]"
       }
       n.letType = synthTypeRefTy(cellName, -1, boxedTy)
     }
@@ -1970,12 +3263,62 @@ function cboxBoxLet(ix: i32, key: string) {
   if n.letType < 0 {
     const initTy = nodeTyIxOf(n.letInit)
     if initTy >= 0 { cboxCellTy[key] = mkArrayTy(initTy) }
+    // The binding's inferred value union described the value, which is now the cell's
+    // element: left standing, it would box the cell literal itself (D2392).
+    nliForgetLet(ix)
   }
   const els: i32[] = []
   els.push(n.letInit)
   n.letInit = mkArrayLit(els, -1)
   nodeTyRecord(n.letInit, cboxCellTy[key] ?? -1)
   0
+}
+
+// The cell element's spelling: a written annotation's own, and for one the emitter minted
+// before the struct table existed, a record (or nullable record) respelled by its declared name,
+// since a list of the anonymous shape has no rep.
+function cboxElemName(ann: i32, name: string, elemTy: i32): string {
+  if annUnionAtomsOf(ann) >= 0 || elemTy < 0 { return name }
+  const nn = nonNullTy(elemTy)
+  const nom = shapeNominalOfTy(nn)
+  if nom == "" || nameIsArray(nom) { return name }
+  if nn != elemTy { return nom + "|null" }
+  nom
+}
+
+// Whether the cell element spelled `name` at annotation `ann` is composite. An annotation the
+// emitter minted has no atom count, so its spelling answers: a top-level `|` or arrow.
+function cboxElemNeedsParens(ann: i32, name: string): boolean {
+  if annArrowAt(name) >= 0 { return true }
+  const atoms = annUnionAtomsOf(ann)
+  if atoms < 0 { return tyTopIndexOf(name, '|', 0, 0) >= 0 }
+  atoms != 1
+}
+
+// A vector has no list backing, so its cell is a list of `v128 | null` boxes: every read
+// unboxes with `as!`, and a store boxes (D2826). Names such a cell in `cboxVecCells`.
+let cboxVecCells: {[string]: i32} = Map()
+// Set while `cboxWalk` rewrites the bare target of an `=`, which a vector cell stores into
+// rather than unboxes.
+let cboxStoreTarget = false
+function cboxVecBoxLet(ix: i32, n: LetDecl, key: string): boolean {
+  let vty = -1
+  if n.letType >= 0 {
+    vty = nodeTyIxOf(n.letType)
+  } else {
+    vty = nodeTyIxOf(n.letInit)
+  }
+  if tyPrimNameOf(vty) != "v128" { return false }
+  const cellTy = mkArrayTy(mkNullableTyOf(vty))
+  cboxCellTy[key] = cellTy
+  cboxVecCells[key] = 1
+  if n.letType < 0 { nliForgetLet(ix) }
+  n.letType = synthTypeRefTy("(v128|null)[]", -1, cellTy)
+  const els: i32[] = []
+  els.push(n.letInit)
+  n.letInit = mkArrayLit(els, -1)
+  nodeTyRecord(n.letInit, cellTy)
+  true
 }
 
 // A `let <name>$cb = [<name>]` that seeds the cell of boxed parameter or loop variable `name`,
@@ -2063,6 +3406,39 @@ function cboxContStoreBack(ix: i32, name: string, label: string, nest: i32) {
 // maker's own and is boxed, one opened deeper shadows the maker's name.
 let cboxDepth = 0
 
+// Point the arm-join rows banked at `ix` (an `if`, or the statement a value-position `if` is the
+// whole value of) that name a boxed binding, or a path off one, at the cell the rewritten reads
+// go through (`c[0]`, `c[0].v`), so the push after the statement lands on them.
+// The rows already renamed: a body is walked once per frame that holds it.
+let cboxRenamedRows: {[i32]: boolean} = Map()
+
+function cboxRenameJoins(ix: i32, boxed: string[]) {
+  let r = joinHeadOf(ix)
+  while r >= 0 {
+    const key = joinRowName(r)
+    if cboxRenamedRows[r] ?? false {
+      r = joinRowNext(r)
+      continue
+    }
+    let cut = 0
+    while cut < key.length && key[cut] != '.' && key[cut] != '[' {
+      cut = cut + 1
+    }
+    const root = key.slice(0, cut)
+    if (
+      strListHas(boxed, root)
+      && (cboxShadow[root] ?? 0) == 0
+      && (cboxVecCells[root] ?? 0) == 0
+    ) {
+      const cell = cboxCellOf[root] ?? root
+      joinRowRename(r, cell + "[0]" + key.slice(cut, key.length))
+      cboxRenamedRows[r] = true
+    }
+    r = joinRowNext(r)
+  }
+  0
+}
+
 // Rewrites the maker body (and its nested lambda bodies): a use of a boxed name → `c[0]`,
 // and a boxed `let c = init` → `let c = [init]`, except where a nested function's own
 // binding shadows the name. Returns the (possibly replaced) node index so parents
@@ -2071,14 +3447,25 @@ function cboxWalk(ix: i32, boxed: string[]) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
   if n is Ident {
-    if capHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
+    if strListHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
       // The cell `c` carries the type of its list, so an element question about `c[0]` has
       // the binding's declared type to answer from. The read `c[0]` itself is untyped here;
       // only the left of a `??` or `=` is typed, by the `BinExpr` arm.
       const cell = mkIdent(cboxCellOf[n.identName] ?? n.identName, -1)
       const cellTy = cboxCellTy[n.identName] ?? -1
       if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
-      return mkIndex(cell, mkNum("0", -1), -1)
+      const rd = mkIndex(cell, mkNum("0", -1), -1)
+      const rty = nodeTyIxOf(ix)
+      if (cboxVecCells[n.identName] ?? 0) == 1 {
+        if cboxStoreTarget { return rd }
+        nodeTyRecord(rd, tyArrayElemIx(cellTy))
+        const un = mkAsExpr(rd, "v128", "trap", -1)
+        if rty >= 0 { nodeTyRecord(un, rty) }
+        return un
+      }
+      if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
+      if rd >= 0 && cboxStoreTarget { cboxStoreCells[rd] = 1 }
+      return rd
     }
     return ix
   }
@@ -2106,17 +3493,21 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is LetDecl {
+    cboxRenameJoins(ix, boxed)
     n.letInit = cboxWalk(n.letInit, boxed)
     if cboxDepth > 0 {
       cboxShadowPush(n.letName)
       return ix
     }
-    if capHas(boxed, n.letName) { cboxBoxLet(ix, n.letName) }
+    if strListHas(boxed, n.letName) { cboxBoxLet(ix, n.letName) }
     return ix
   }
   if n is BinExpr {
+    cboxRenameJoins(ix, boxed)
     const leftName = cboxTypedLeftName(n, boxed)
+    cboxStoreTarget = n.binOp == "=" && P.nodes[unwrapParen(n.binLeft)] is Ident
     n.binLeft = cboxWalk(n.binLeft, boxed)
+    cboxStoreTarget = false
     n.binRight = cboxWalk(n.binRight, boxed)
     // The left of a `??` or `=` is typed at the binding's declared type: the coalesce lowers
     // from its operand's type (a closure may have written the cell since any narrowing), and
@@ -2131,6 +3522,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is IfStmt {
+    cboxRenameJoins(ix, boxed)
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let cur = ix
     while cur >= 0 {
@@ -2164,7 +3556,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
     // A boxed range variable gets a cell per iteration, seeded from the counter, and hands the
     // cell's value back to the counter wherever the iteration ends and the loop steps on.
     let rseed = -1
-    if cboxDepth == 0 && capHas(boxed, n.frVar) {
+    if cboxDepth == 0 && strListHas(boxed, n.frVar) {
       rseed = cboxSeedLet(n.frVar, -1, TY_I32)
     }
     n.frBody = cboxWalk(n.frBody, boxed)
@@ -2192,10 +3584,10 @@ function cboxWalk(ix: i32, boxed: string[]) {
     let iseed2 = -1
     if cboxDepth == 0 {
       const iterTy = strLitRecvTy(nodeTyIxOf(n.fiIter))
-      if capHas(boxed, n.fiVar) {
+      if strListHas(boxed, n.fiVar) {
         iseed = cboxSeedLet(n.fiVar, -1, forInBindTy(iterTy, false))
       }
-      if n.fiVar2 != "" && capHas(boxed, n.fiVar2) {
+      if n.fiVar2 != "" && strListHas(boxed, n.fiVar2) {
         iseed2 = cboxSeedLet(n.fiVar2, -1, forInBindTy(iterTy, true))
       }
     }
@@ -2239,7 +3631,9 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is Call {
-    n.callFn = cboxWalk(n.callFn, boxed)
+    const nfn = cboxWalk(n.callFn, boxed)
+    if nfn != n.callFn { arenaNoteRefWrite() }
+    n.callFn = nfn
     const args = n.callArgs
     let ci = 0
     while ci < args.length {
@@ -2304,13 +3698,13 @@ function cboxNoInitMsg(nm: string) {
 
 // The frame's bindings `cboxByRef` says a closure must share, from `dlets`. A `let` with no
 // init takes a zero value to box; one whose type has none cannot be boxed and is refused,
-// since capturing it by value would be silently wrong.
-function cboxPick(dlets: string[], alam: string[]) {
+// since capturing it by value would be silently wrong. A name in `unboxed` stays a local.
+function cboxPick(dlets: string[], alam: string[], unboxed: string[]) {
   const boxed: string[] = []
   let di = 0
   while di < dlets.length {
     const nm = dlets[di]
-    if cboxByRef(nm, alam) {
+    if cboxByRef(nm, alam) && !strListHas(unboxed, nm) {
       let ok = true
       const lx = cboxLetIx[nm] ?? -1
       if (cboxKind[nm] ?? CBOX_LET) == CBOX_LET && lx >= 0 {
@@ -2337,11 +3731,54 @@ function cboxPick(dlets: string[], alam: string[]) {
   boxed
 }
 
+// The frame's `let`s of a scalar type that `cboxByRef` says a closure must share: those a
+// lifted closure can take by value and hand back (D3664).
+function cboxScalarLets(dlets: string[], alam: string[], tys: i32[]): string[] {
+  const out: string[] = []
+  let di = 0
+  while di < dlets.length {
+    const nm = dlets[di]
+    const lx = cboxLetIx[nm] ?? -1
+    if (
+      (cboxKind[nm] ?? CBOX_LET) == CBOX_LET
+      && lx >= 0
+      && cboxByRef(nm, alam)
+    ) {
+      const ld = P.nodes[lx]
+      if ld is LetDecl {
+        let ty = -1
+        if ld.letType >= 0 {
+          ty = nodeTyIxOf(ld.letType)
+        } else {
+          ty = nodeTyIxOf(ld.letInit)
+        }
+        const pn = tyPrimNameOf(ty)
+        if (
+          pn == "i32"
+          || pn == "i64"
+          || pn == "f64"
+          || pn == "f32"
+          || pn == "boolean"
+        ) {
+          out.push(nm)
+          tys.push(ty)
+        }
+      }
+    }
+    di = di + 1
+  }
+  out
+}
+
 // Per function frame (top-level or nested): boxes each binding a closure must share with it
 // (`cboxByRef`) — a `let`, a parameter, or a loop variable — and rewrites every use to go
 // through the cell. Usage-gated: a frame with no such binding rewrites nothing.
 export function captureBoxRewrite(_stmts: i32[]) {
+  cboxWriteLets = Map()
   cboxCellNames = Map()
+  cboxReadTy = Map()
+  cboxStoreCells = Map()
+  cboxRenamedRows = Map()
   let fe = 0
   while fe < fnStmts.length {
     const fn = P.nodes[fnStmts[fe]]
@@ -2357,7 +3794,9 @@ export function captureBoxRewrite(_stmts: i32[]) {
         pi = pi + 1
       }
       cboxScan(fn.fnBody, 0, dlets, alam)
-      const boxed = cboxPick(dlets, alam)
+      const tys: i32[] = []
+      const cands = cboxScalarLets(dlets, alam, tys)
+      const boxed = cboxPick(dlets, alam, cloUnboxPick(fe, cands, tys))
       if boxed.length > 0 {
         // A parameter's cell is seeded at the top of the body, from the argument. An optional
         // parameter's annotation names only the non-null part, so it takes its recorded type.
@@ -2366,7 +3805,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
         while pi < ps.length {
           const p = P.nodes[ps[pi]]
           if p is Param {
-            if capHas(boxed, p.parName) {
+            if strListHas(boxed, p.parName) {
               let annot = p.parType
               if p.parOpt != 0 { annot = -1 }
               seeds.push(cboxSeedLet(p.parName, annot, nodeTyIxOf(ps[pi])))
@@ -2400,7 +3839,7 @@ function cboxModuleFrame() {
     cboxScan(startStmts[si], 0, dlets, alam)
     si = si + 1
   }
-  const boxed = cboxPick(dlets, alam)
+  const boxed = cboxPick(dlets, alam, [])
   if boxed.length == 0 { return 0 }
   let wi = 0
   while wi < startStmts.length {
@@ -2418,6 +3857,10 @@ function cboxModuleFrame() {
 // The names read inside a function nested in the frame being walked.
 let shrLamNames: {[string]: i32} = Map()
 let shrLamAny = false
+// Names a function nested in the frame being walked takes as a parameter, and names such a
+// function reads where no nested function around the read takes one of that name (D3025).
+let shrLamParams: {[string]: i32} = Map()
+let shrLamFree: {[string]: i32} = Map()
 // The module's top-level bindings and function names, visible from every frame.
 let shrGlobals: {[string]: i32} = Map()
 // Names a call in the unit being respelled spells as a method (`x.name()`): the checker may
@@ -2465,6 +3908,53 @@ function shrCollect(ix: i32, inFn: boolean) {
   0
 }
 
+// Records `shrLamParams` and `shrLamFree` under `ix`, where `ps` holds the parameters of the
+// nested functions around it and `inFn` says whether there is one. An `else if` chain is walked
+// along its spine.
+function shrCollectParams(ix: i32, ps: string[], inFn: boolean) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Ident {
+      if inFn && !strListHas(ps, n.identName) { shrLamFree[n.identName] = 1 }
+      return 0
+    }
+    if n is FuncDecl {
+      const inner: string[] = []
+      let i = 0
+      while i < ps.length {
+        inner.push(ps[i])
+        i = i + 1
+      }
+      let pi = 0
+      while pi < n.fnParams.length {
+        const pn = P.nodes[n.fnParams[pi]]
+        if pn is Param {
+          shrLamParams[pn.parName] = 1
+          inner.push(pn.parName)
+        }
+        pi = pi + 1
+      }
+      return shrCollectParams(n.fnBody, inner, true)
+    }
+    const kids = nodeValueSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      shrCollectParams(kids[i], ps, inFn)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether a binding of `name` in the frame being walked is read by a nested function that
+// reaches it through another nested function taking a parameter of that name: a capture
+// forwarded by name would resolve to the parameter, so the binding needs its own spelling.
+function shrParamShadows(name: string): boolean {
+  (shrLamFree[name] ?? 0) == 1 && (shrLamParams[name] ?? 0) == 1
+}
+
 // Records in `shrMethodNames` every name a call under `ix` spells as a method. An `else if`
 // chain is walked along its spine.
 function shrCollectMethods(ix: i32) {
@@ -2503,7 +3993,10 @@ function shrDeclare(name: string, respell: boolean): string {
     const open = (shrCur[name] ?? "") != ""
     if (
       (shrLamNames[name] ?? 0) == 1
-      && (open || (shrFrameSeen[name] ?? 0) == 1 || (shrGlobals[name] ?? 0) == 1)
+      && (open
+        || (shrFrameSeen[name] ?? 0) == 1
+        || (shrGlobals[name] ?? 0) == 1
+        || shrParamShadows(name))
     ) {
       sp = shrMint(name)
     } else if (
@@ -2520,6 +4013,11 @@ function shrDeclare(name: string, respell: boolean): string {
       }
     }
   }
+  shrOpen(name, sp)
+}
+
+// Opens a binding of `name` spelled `sp`, and returns `sp`.
+function shrOpen(name: string, sp: string): string {
   shrTrailName.push(name)
   shrTrailPrev.push(shrCur[name] ?? "")
   shrTrailPrevDepth.push(shrCurDepth[name] ?? 0)
@@ -2552,38 +4050,102 @@ function shrWalkFrame(fnIx: i32) {
     const savedShared = shrFrameShared
     const savedLam = shrLamNames
     const savedAny = shrLamAny
+    const savedParams = shrLamParams
+    const savedFree = shrLamFree
     shrFrameSeen = Map()
     shrFrameShared = Map()
     shrLamNames = Map()
     shrLamAny = false
+    shrLamParams = Map()
+    shrLamFree = Map()
     shrCollect(fn.fnBody, false)
+    shrCollectParams(fn.fnBody, [], false)
     shrDepth = shrDepth + 1
     const mark = shrTrailName.length
     const ps = fn.fnParams
+    // A parameter keeps its spelling, which a named argument matches, so one that needs its own
+    // is copied into a respelled local at the top of the body.
+    const seeds: i32[] = []
     let pi = 0
     while pi < ps.length {
       const p = P.nodes[ps[pi]]
-      if p is Param { shrDeclare(p.parName, false) }
+      if p is Param {
+        if shrParamNeedsSeed(p.parName, fn.fnBody) {
+          const sp = shrMint(p.parName)
+          let annot = p.parType
+          if p.parOpt != 0 { annot = -1 }
+          const src = mkIdent(p.parName, -1)
+          const pty = nodeTyIxOf(ps[pi])
+          if pty >= 0 { nodeTyRecord(src, pty) }
+          seeds.push(mkLet("let", sp, annot, src, -1))
+          shrOpen(p.parName, sp)
+        } else {
+          shrDeclare(p.parName, false)
+        }
+      }
       pi = pi + 1
     }
     shrWalk(fn.fnBody)
+    let si = seeds.length - 1
+    while si >= 0 {
+      cboxPrepend(fn.fnBody, seeds[si])
+      si = si - 1
+    }
     shrTrim(mark)
     shrDepth = shrDepth - 1
     shrFrameSeen = savedSeen
     shrFrameShared = savedShared
     shrLamNames = savedLam
     shrLamAny = savedAny
+    shrLamParams = savedParams
+    shrLamFree = savedFree
   }
   0
+}
+
+// Whether parameter `name` of the frame whose body is `body` is seeded into a respelled local:
+// `shrParamShadows` holds, the body is a block to seed, and nothing spells the name as a method.
+function shrParamNeedsSeed(name: string, body: i32): boolean {
+  if name == "" || name == "self" { return false }
+  if (shrMethodNames[name] ?? 0) == 1 { return false }
+  if !shrParamShadows(name) { return false }
+  if body < 0 || body >= P.nodes.length { return false }
+  P.nodes[body] is Block
 }
 
 // Respells the bindings under `ix` that `shrDeclare` decides to, and every read of one. A
 // block closes its bindings and a loop its variables; an `else if` chain is walked along its
 // spine, so its depth costs no stack.
+// The arm-join rows already respelled: a row names its binding as the checker spelled it.
+let shrJoinDone: {[i32]: boolean} = Map()
+
+// Respell the arm-join rows banked at `ix` whose root this pass gave a new spelling, as it
+// respells the reads they describe.
+function shrRespellJoins(ix: i32) {
+  let r = joinHeadOf(ix)
+  while r >= 0 {
+    if !(shrJoinDone[r] ?? false) {
+      shrJoinDone[r] = true
+      const key = joinRowName(r)
+      let cut = 0
+      while cut < key.length && key[cut] != '.' && key[cut] != '[' {
+        cut = cut + 1
+      }
+      const sp = shrCur[key.slice(0, cut)] ?? ""
+      if sp != "" && sp != key.slice(0, cut) {
+        joinRowRename(r, sp + key.slice(cut, key.length))
+      }
+    }
+    r = joinRowNext(r)
+  }
+  0
+}
+
 function shrWalk(ix: i32) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
     const n = P.nodes[cur]
+    if n is IfStmt || n is LetDecl || n is BinExpr { shrRespellJoins(cur) }
     if n is Ident {
       const sp = shrCur[n.identName] ?? ""
       if sp != "" && sp != n.identName {
@@ -2658,6 +4220,7 @@ function shrWalk(ix: i32) {
 // when a closure inside it reads some name. Runs before any pass that asks about captures.
 export function shadowRespell(stmts: i32[]) {
   shrGlobals = Map()
+  shrJoinDone = Map()
   let gi = 0
   while gi < stmts.length {
     const g = P.nodes[stmts[gi]]
@@ -2671,10 +4234,13 @@ export function shadowRespell(stmts: i32[]) {
   shrMethodNames = Map()
   shrLamNames = Map()
   shrLamAny = false
+  shrLamParams = Map()
+  shrLamFree = Map()
   let mi = 0
   while mi < stmts.length {
     if P.nodes[stmts[mi]] !is FuncDecl {
       shrCollect(stmts[mi], false)
+      shrCollectParams(stmts[mi], [], false)
       shrCollectMethods(stmts[mi])
     }
     mi = mi + 1
@@ -2802,7 +4368,7 @@ export function synthVoidTwins(_stmts: i32[]) {
             const callIx = mkCall(mkIdent(name, tfn.pos), argIds, tfn.pos)
             const bodyIx = mkBlock([callIx], tfn.pos)
             const twin = mkFunc(
-              "__voidtw_" + name,
+              name + "$voidtw",
               noTyParams,
               nps,
               synthTypeRefTy("void", -1, -1),
@@ -2821,5 +4387,138 @@ export function synthVoidTwins(_stmts: i32[]) {
     }
     i = i + 1
   }
+  0
+}
+
+// ── synthExternValues — a callee for an `extern` taken as a value ────────────────
+// A function value is called with its closure env as the leading argument, which a host
+// import does not take. So each extern read other than as a callee gets one capture-free
+// forwarding function `<name>$extv`, a spelling no program can write, and the read is respelled to name it (D2618).
+let extValName: string[] = []
+let extValFe: i32[] = []
+
+// The forwarding function minted for the extern named `name`, or -1.
+function externValueFe(name: string): i32 {
+  let i = 0
+  while i < extValName.length {
+    if extValName[i] == name { return extValFe[i] }
+    i = i + 1
+  }
+  -1
+}
+
+export function synthExternValues() {
+  extValName = []
+  extValFe = []
+  extvLoopVars = []
+  if !externValueSeen() || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    let s = 0
+    while s < root.progStmts.length {
+      extvRespellIn(root.progStmts[s], -1)
+      s = s + 1
+    }
+  }
+  const nFns = fnStmts.length
+  let fe = 0
+  while fe < nFns {
+    const fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl { extvRespellIn(fn.fnBody, fnStmts[fe]) }
+    fe = fe + 1
+  }
+  0
+}
+
+// The loop variables of the `for`s of the walked frame the respell walk is inside: each is in
+// scope only in its own loop, which a whole-frame lookup cannot see.
+let extvLoopVars: string[] = []
+
+// Respell every extern read as a value in the subtree at `ix`, which lies in the frame of
+// function node `fnIx` (-1 for the module's statements). A nested function is its own
+// `fnStmts` frame and is not entered; a callee is a call to the import and is left alone.
+function extvRespellIn(ix: i32, fnIx: i32) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is FuncDecl { return 0 }
+    if n is Ident {
+      const nm = n.identName
+      if externLinkOf(nm) >= 0 && extvNameFree(fnIx, nm) {
+        if externValueFe(nm) < 0 { synthExternValueFn(nm, n.pos) }
+        if externValueFe(nm) >= 0 {
+          n.identName = nm + "$extv"
+          sidNoteNodeName(cur)
+        }
+      }
+      return 0
+    }
+    const mark = extvLoopVars.length
+    if n is ForRange { extvLoopVars.push(n.frVar) }
+    if n is ForIn {
+      extvLoopVars.push(n.fiVar)
+      extvLoopVars.push(n.fiVar2)
+    }
+    let skip = -1
+    if n is Call {
+      if P.nodes[unwrapParen(n.callFn)] is Ident { skip = n.callFn }
+    }
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if kids[k] != skip { extvRespellIn(kids[k], fnIx) }
+      k = k + 1
+    }
+    while extvLoopVars.length > mark { extvLoopVars.pop() }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether the extern `name` read in the frame of `fnIx` means the extern and not a binding.
+function extvNameFree(fnIx: i32, name: string): boolean {
+  if strListHas(extvLoopVars, name) { return false }
+  nameFreeToModule(fnIx, name)
+}
+
+// Mint `function <name>$extv(a0: P0, …): R { name(a0, …) }` for the extern `name`, from
+// its link row's own parameter and result spellings.
+function synthExternValueFn(name: string, pos: i32) {
+  const k = externLinkOf(name)
+  const n = externArityAt(k)
+  if n < 0 { return 0 }
+  const ps: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < n {
+    const pn = "__a" + i32ToStr(i)
+    const pty = synthTypeRefTy(externParamAt(k, i), pos, -1)
+    ps.push(mkParam(pn, pty, -1, 0, 0, pos))
+    const arg = mkIdent(pn, pos)
+    recordNodeTyFrom(arg, pty)
+    args.push(arg)
+    i = i + 1
+  }
+  let ret = externRetAt(k)
+  if ret == "" { ret = "void" }
+  const rty = synthTypeRefTy(ret, pos, -1)
+  const noTyParams: string[] = []
+  // The minted nodes postdate the checker, so each carries the type its annotation names.
+  const call = mkCall(mkIdent(name, pos), args, pos)
+  recordNodeTyFrom(call, rty)
+  const fe = mkFunc(
+    name + "$extv",
+    noTyParams,
+    ps,
+    rty,
+    mkBlock([call], pos),
+    pos,
+  )
+  fnStmts.push(fe)
+  fnParent.push(-1)
+  fnDispNames.push("")
+  fnValUsed = true
+  extValName.push(name)
+  extValFe.push(fnStmts.length - 1)
   0
 }

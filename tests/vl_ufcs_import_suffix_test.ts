@@ -194,8 +194,9 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_ufcs_suffix_" });
     try {
-      // `area` is an ORPHAN in "./lib", and the entry declares its own `area(self: string)`,
-      // so importing the plain name would collide with it. The line to paste aliases the
+      // `area` is an ORPHAN in "./lib", and the entry declares its own `area(self: string | i32)`,
+      // whose union `self` overlaps every receiver kind, so importing the plain name would
+      // collide with it (a local `area(self: string)` would not: receiver overloading). The line to paste aliases the
       // import after the receiver's type and names the call it enables.
       eq(
         await errorsOfFiles(dir, {
@@ -205,7 +206,7 @@ Deno.test({
             "export function area(self: Box): i32 { return self.v * self.v }\n\n" +
             "export function helper(): i32 { return 0 }\n",
           "entry.vl": 'import { box } from "./base"\nimport { helper } from "./lib"\n\n' +
-            "function area(self: string): i32 { return self.length }\n\n" +
+            "function area(self: string | i32): i32 { return 1 }\n\n" +
             'print(box(2).area())\n\nprint(helper())\n\nprint("ab".area())\n',
         }),
         [
@@ -239,7 +240,7 @@ Deno.test({
             "export function area(self: Box): i32 { return self.v * self.v }\n\n" +
             "export function helper(): i32 { return 0 }\n",
           "entry.vl": 'import { box } from "./base"\nimport { helper } from "./lib"\n\n' +
-            "function area(self: string): i32 { return self.length }\n\n" +
+            "function area(self: string | i32): i32 { return 1 }\n\n" +
             "function areaBox(n: i32): i32 { return n }\n\n" +
             'print(box(2).area())\n\nprint(helper())\n\nprint("ab".area())\n\n' +
             "print(areaBox(1))\n",

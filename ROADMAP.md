@@ -86,7 +86,6 @@ units: **hours** · **half-day** · **days**.
 | B7 R4 `utf8Length` | A breaking std removal; also triggers the `std-api-reviewer` gate. |
 | C5 distribution · F5 the name · H5 versioning · H-M2 · J2 runner · J3 port target · D field-level hints · F9 baseline scope | Each already carries its question in its own row. |
 | registry-by-key step 5 | Blocked on D1492's write-seam question. |
-| `dogfood:` fixed-precision float rendering in `std:fmt` | Whether `toFixed(self: f64, digits: i32): string` is the export, a runtime format spec is, or precision belongs in the interpolation hole. `std:fmt` renders a float only at full precision (`toString(100.0 / 3.0)` → `33.333333333333336`), so `scripts/seed-size.vl` carries eleven hand-written lines (`pctStr`) where the Python it replaced wrote `+.1f` twice, and the two round differently on an exact tie — and every later port that prints a percentage, a duration or a ratio meets the same wall. Options, peers and a recommendation for `toFixed`: `open-rulings.md` §D `fmt-fixed-precision`. |
 | scope-exit cleanup (`defer` / `using` / `Drop`-like) | Which construct, if any, lets a block run code on every exit. It gates a `std:fs` file handle (fs-streaming Q1, RULED 2026-09-23: no handle until this exists) and any future std resource. VL has no destructor, `defer` or `using`, and WasmGC has no finalizer. Options and the questions a design owes: `open-rulings.md` §D `scope-exit-cleanup`. |
 | `dogfood:` `std:fs` cannot make, empty or remove a directory | Whether `makeTempDir(prefix)` lands first, whether `makeDir`/`removeDir`/`removeFile` do, or both. `listDir` reads a directory and nothing creates one — measured, a write into a missing directory is `ENOENT` — and this BLOCKS the second scheduled port: `scripts/check-filed-witnesses.py` writes each witness to a fresh temp directory, and **eight rows** (D1120, D1191, D1519, D1571, D1585, D1598, D1651, D1654) carry a multi-file witness whose relative imports force the sibling to be named by the WITNESS, so a shared flat directory collides between the six concurrent agents CLAUDE.md allows. Options, peers and a recommendation for `makeTempDir` first: `open-rulings.md` §D `fs-directory-mutation`. |
 | `dogfood:` VL has no pattern matching over text | Whether character scanning stays the answer (with `std:str` growing the helpers ports reach for), whether a restricted `std:regex` is built, or whether a checked pattern literal enters the language. NOT a blocker, and that is measured: a VL row parser with no regex reads an inventory row and agrees with `check-filed-witnesses.py` on the id, the status line and the repro's line count — the heading scanner is fifteen lines where `re` is one. This is about the cost the next twenty ports pay. Options, peers and a recommendation for character scanning: `open-rulings.md` §D `text-pattern-matching`. |
@@ -97,6 +96,14 @@ units: **hours** · **half-day** · **days**.
 ---
 
 ## Next (highest leverage)
+
+### Architecture refactor (2026-10-12)
+
+🟡 **Bring the compiler and its tools in line with `docs/ARCHITECTURE.md`.**
+- Plan: [`docs/internals/architecture-refactor-plan.md`](docs/internals/architecture-refactor-plan.md),
+  which gives the order, dependencies, acceptance rules and status of L1–L14 and Track T.
+- Measurements and the shape of each item: `docs/internals/code-quality-2026-10.md`.
+- In progress: L1 (lane SC) and L2. Ready to brief: A1, A3, A5, S-c and C3's first PR.
 
 ### Modernization program (owner, 2026-09-02)
 
@@ -184,6 +191,25 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
+
+- **Initialization order — RULED (owner, 2026-09-26).** *Now:* reading a module global before
+  its initializer ran is a clear runtime error — BUILT (D2652, D2653): a read that top-level code
+  can reach before the declaration traps with "`g` read before its initializer ran (file:line),
+  via f". *Goal:* a compile error whenever init-before-read is not statically guaranteed, plus
+  compile-time reordering of initializers wherever that preserves behaviour, for globals and
+  locals. The ruling covers writes too (D2654): a write that can run before the initializer
+  traps with "`g` written before its initializer ran", and the direct top-level spelling is a
+  check error. The runtime guard's reachability pass (`initGuardScan`) is the analysis the compile
+  error would start from; an uninitialized module `let` (D2655) is open beside it.
+
+- **A list of only `null` — RULED (a) for now, (c) later (owner, 2026-10-12, spec Q3,
+  D1832).** *Now:* a null-only list literal no typed destination receives (`const e = [null]`)
+  is a `vl check` error naming the annotation — BUILT ([D1832](docs/internals/inventory/D1832.md)).
+  *Later target, (c):* infer the element from the first non-null USE, so
+  `const e = [null]; e.push(42)` pins `(i32 | null)[]` the way A-infer-null pins a scalar
+  `let x = null`. New checker machinery: an element hole on the literal that a later use fills,
+  with today's `push: cannot add i32 to null[]` site becoming the pin. Rationale and peers:
+  `docs/internals/open-rulings.md` §D1832.
 
 - **Queued (owner, 2026-09-24, plumb):** std wrappers / compiler-level functionality over the raw
   shared-memory and atomics intrinsics (and the raw integer SIMD intrinsics), each through
@@ -754,8 +780,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   entry, recorded in the header); `IdentityMap`/`IdentitySet` as concrete types that SATISFY
   `{[K]: V}` (the critics' "off the interface" was refused: the index-signature is the
   capability, and a signature names the concrete type when it wants one); the serial deferred
-  until a program measures the scan as a problem. Two things the ruling asked for that do not
-  exist today ride along: concrete `Map<K, V>`/`Set<T>` names as annotation types, and
+  until a program measures the scan as a problem. Two things the ruling asked for rode along
+  and shipped 2026-09-25 (A15 item 3): `Map<K, V>`/`Set<T>` as annotation types, and
   `Map<string, i32>()` explicit type arguments. Build items in ship order under **A15**; the
   operator is routed to vl-de.
 
@@ -1970,20 +1996,26 @@ in-language GC knobs.
   binding ends the narrowing (reachability of the writer, not flow). REMAINING: **flow analysis**,
   the owner's ideal — keep the narrowing when the writer can only write a member the narrowing
   already admits (`k` sets `v` to a boolean only when `v` is already a boolean), which needs the
-  per-path `W` of A6b's chain; and the forms the survey found open — a declared operator writing
-  its operand's field ([D2400](docs/internals/inventory/D2400.md)), a module global written by
-  another top-level function ([D2401](docs/internals/inventory/D2401.md)), a closure made under a
-  narrowing and called after a writer ([D2402](docs/internals/inventory/D2402.md)), a path read
-  before a writing call in a loop ([D2403](docs/internals/inventory/D2403.md)), a path fact in a
-  condition with a later writing call ([D2404](docs/internals/inventory/D2404.md)), and the path
-  re-test the path rule refuses ([D2405](docs/internals/inventory/D2405.md), clause 2). Field,
-  element and map-value narrowings through a plain call, a method or a closure already end
-  soundly (the path write-effect rule). **Open question (floated by the owner, not decided):**
+  per-path `W` of A6b's chain. The six forms the D2390 survey filed are closed (D2400–D2405; the
+  operator, module-global, closure-capture, loop, condition and path-re-test forms, all through
+  `callMayWrite`). **Escaping closures, RULED (a) 2026-09-25:** a closure that escapes (returned,
+  stored in a field/list/map/global, assigned to another binding, or handed to a callee not known
+  to only call it) loses every captured path narrowing, and every captured bare-name narrowing of
+  a name assigned anywhere; one used locally by name keeps it under D2402's per-call check
+  ([D2407](docs/internals/inventory/D2407.md), D2462, closed). The owner's ideal, deferred with the
+  flow analysis above: keep the narrowing when no write of the path can run before the closure
+  does ("if we know `o.v = null` doesn't happen then it's fine"). Path writers are found by write
+  SHAPE (`fnWriteShapes`: field stored, cell stored, map cell removed, free name rebound), so
+  aliases, arguments, receivers, built-in mutators and the function values a callee runs all
+  count, each callback charged at its own call site (D2461, D2471, D2472, D2473, closed). Still open: a bare-name re-test
+  inside the arm of a condition whose call ended the narrowing
+  ([D2408](docs/internals/inventory/D2408.md), clause 2). **Open question (floated by the owner, not decided):**
   ban side effects in operator overloads, or let one modify only its left/right operands — an
   "overload-eligible" derived predicate beside getter-eligible (effects doc §C1b). Under the second
   reading an operator site needs only D2400's operand-path invalidation and can never run a
   writer — today a dispatched operator ends a narrowing when a declaration of that operator
-  reaches the writer, or when the writer escaped, as an unknown call does.
+  reaches the writer, or when the writer escaped, as an unknown call does, and ends a path
+  narrowing of an operand a declaration may write (D2400).
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
   **Defaults + surface RULED 2026-08-18** — see A9.
@@ -2119,12 +2151,16 @@ in-language GC knobs.
      a === b` true · a newtype fixture proving `Id` never prints as `string`. → **vl-de**.
   2. **Struct keys for `Map`/`Set`** — key-eligible = `==`-comparable; hash and `==` share one
      lowering (D1017 first); `-0.0` folds into `0.0` in the hash; the NaN-key and mutable-key
-     rules go in the `Map` header.
-  3. **`Set<T>`** (C2.2, unbuilt), the concrete names `Map<K, V>` / `Set<T>` as annotation-legal
-     types (`Map<string, i32>` is `unknown type` today — only `{[string]: i32}` works), and
-     TS-style explicit type arguments on a call (`Map<string, i32>()` is a parse error today;
-     `f<a>(b)` becomes a generic call and the relational chain `f < a > (b)` is given up, as TS
-     does).
+     rules go in the `Map` header. `i64` keys SHIPPED ahead of it (2026-09-25, collections Q8
+     (a), D2505), as a key probe of their own.
+  3. **SHIPPED (2026-09-25) as the alias version:** `Map<K, V>` / `Set<T>` are annotation-legal
+     long spellings of `{[K]: V}` / `{[T]: boolean}`, and TS-style explicit type arguments work
+     on `Map<K, V>()`, `Set<T>()` and every declared generic (`f<a>(b)` is a generic call; the
+     relational chain `f < a > (b)` is given up, and occurred nowhere — DECISIONS.md §Parser).
+     RULED 2026-09-25 (Q1): `{[K]: V}` stays the concrete map, `Map<K, V>` only its long
+     spelling, C2's interface reading reversed. BUILT 2026-09-25 (Q2): `Set<T>` is its own
+     type, not a map-to-bool (C2.2; DECISIONS.md, "`{[K]: V}` and `T[]` are concrete types").
+     Open: `o.f<T>()` on a method call, and an instantiation expression without a call.
   4. **`IdentityMap<K, V>` / `IdentitySet<K>`** on the flat-scan rep — the 7-field map struct
      with `ref.eq` as the probe compare and `index`/`hashes` unused; `IdentityMap <: {[K]: V}`,
      `IdentitySet` on the sequence read core like `Set`; `K` = anything `===` accepts; header:
@@ -2138,8 +2174,9 @@ in-language GC knobs.
      count today and would compare the slot; `emitStructExprAsVariantBox` copies field-for-field;
      `repStructSlotsTwin` is computed twice and must agree). `flat` classes get no slot and stay
      on the scan. Acceptance: synthesis §2c's four cells + the N/4N timing probe (fail above 6×).
-  Still REMAINING from before, unchanged: `boolean`→i32 coercion when storing a comparison
-  result; SELF-HOST struct/function-value equality (guarded loudly today).
+  Still REMAINING from before, unchanged: SELF-HOST struct/function-value equality (guarded
+  loudly today). (Storing a comparison result as a number is `b as i32` — the implicit
+  `boolean`→i32 coercion was retired by the owner's ruling (C), 2026-09-29, D3218.)
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/guide/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).
@@ -2374,6 +2411,15 @@ in-language GC knobs.
   literal `5.5 % 2.0`, so it is not an inference gap. A `-1` opcode must fail loudly rather
   than fall through; the language-consistent fix lowers `a % b` as `a - trunc(a/b)*b`.
   Workboard D7.
+- ⬜ **B-range. Loop-range facts that fold bounds guards (D4000, diderven DV-1000).** A helper
+  guard such as `if x < 0 || x >= 136 { return 1 }`, called from `for x in 0 until 136`, is
+  tested on every iteration. Most of its compares are decided by the loop's range. V8's
+  JavaScript tier folds them; VL, binaryen and V8's wasm tier keep no range facts. That
+  difference is the whole 2.5–4x gap between DV-1000's scan and hand-written JS. The
+  access-path ingredients the filing named measure 10–20% together. The feature: induction
+  ranges for `for … until`, propagated through the helper once it is inlined (or into a
+  specialised twin), folding compares and list bounds tests the range decides, and keeping
+  every trap message a fold cannot discharge. Grade on node against the JS control.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
 - ⬜ **B6-ro. The `readonly` sweep of `std:array`'s pure readers.** `extend`'s `other` and
@@ -2422,8 +2468,10 @@ in-language GC knobs.
   `type S` spelling covers it. The map-ARRAY annotation arm's hand-written copy of the same
   forcing went with it.
   REMAINING, all
-  loud rejects with pinned fixtures: **a UNION MEMBER** (`{[i32]: V} | i32` — the box carries no
-  map shape, `maps/error-i32-keyed-position-union-member.vl`); **a list of LISTS of maps**
+  loud rejects with pinned fixtures: ~~**a UNION MEMBER**~~ (`{[i32]: V} | i32` — lowered
+  2026-09-26 by a box tag per integer-keyed mono map struct, D2519, `maps/i32-keyed-position-union-member.vl`;
+  and two maps of ONE struct, `{[K]: i32} | {[K]: boolean}`, by a box tag per member type, D2493 —
+  the `Set<K>` half of that pair is D2673); **a list of LISTS of maps**
   (`{[i32]: V}[][]`, one `[]` deeper than the peel, on both the bare and the field spelling —
   `maps/error-i32-keyed-position-array.vl`); and an ARRAY OF CLOSURES returning one
   (`(() => {[i32]: V})[]`). **And the MAP-VALUE position, which the list above and the gate's own
@@ -3052,7 +3100,9 @@ in-language GC knobs.
      hand-written `if u is A || u is B { … } else { u.c }`.
 - 🟡 **B-debug. Source maps + trap diagnostics follow-ups.** REMAINING: (1) **full source-mapped
   stack traces** — map every wasm frame in the trap's stack → VL `function (file:L:C)`, not just
-  the top frame; (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
+  the top frame (for a JS host and an optimized build, `vl build --source-map` + `vl addr2line
+  <module> -` now map every frame of a pasted trace, D3561; `vl run` of an optimized module
+  still reads only `vl-src`); (2) **value-rich panic messages** — a host `panic(msg)` abort path that formats
   the offending values (e.g. `index 7 out of bounds (length 3)`, `integer division by zero` —
   today both surface as a bare wasm backtrace); (3) an index-assignment LHS has
   no parser span yet — broaden parser span coverage for OOB *write* errors. Also feasible: a
@@ -3105,6 +3155,59 @@ seed from current `compiler/*.vl` in ~40s.*
   and it is the convention `vl seed` already set. `docs/internals/cli-design.md`
   §"The output channel is RULED" carries the decision and the alternative.
   REMAINING: surfacing diagnostics with spans once the spans rungs land.
+- ✅ **C-test-shared-compile. CLOSED by owner ruling 2026-10-06 (sunpa SP-041, ask 2): C, with B a
+  strong no.** Test files are fully independent: no shared module state, no cross-file inference
+  coupling, no shared failure, so (b) one module per run is refused, and
+  `tests/fixtures/vl-test-shared/` stays the pinned guarantee. (a) separate compilation stays on
+  plumb's track. The answer for sunpa is a faster compiler (`C-compile-hotspots`) plus the
+  content-hashed compile cache (`C-test-cache`), whose design is
+  `docs/internals/incremental-compilation-design.md`.
+- ⬜ **C-test-cache. A content-hashed compile cache across `vl test` runs (sunpa SP-041, ask 3).**
+  Key a test file's emitted module on the bytes of every source in its import graph, the seed's
+  content key and the flags that reach the compile, and reuse it when nothing changed, so an
+  edit to one test file does not rebuild `game.vl` for the others. The host already keys the
+  seed's `.cwasm` sidecar by content (`load_compiler_module`); the new part is that the graph is
+  only known after the fetch loop, so the brain has to report it (or the host records every
+  `CMD_READ_FILE` a worker serviced). Measured 2026-10-06: sunpa's `vl test src/` is 25.7 s, of
+  which `rules.test.vl`'s compile is 24.5 s and the tests themselves ~40 ms.
+  **Designed** (lane IC, 2026-10-06): `docs/internals/incremental-compilation-design.md` §4 —
+  this row is its Stage S1. The key is the whole host-to-guest transcript (staging calls, argv,
+  every command reply and read), recorded by the host, plus the resolved seed, host build id,
+  binaryen and environment; no compiler change.
+- ⬜ **C-incremental. Incremental and cached compilation, staged (lane IC; owner direction
+  2026-10-06: compile many at once, watch, file cache).** Plan and gates:
+  `docs/internals/incremental-compilation-design.md` §5 — S0 phase marks, S1 whole-action file
+  cache (`C-test-cache`), S2 `-O` chain cache, S3 `--watch`, S4 compile cost
+  (`C-compile-hotspots`), S5 per-module checker reuse with an interface hash, S6 per-function emit
+  reuse with symbolic indices. Four owner questions in §6: Q1 record adoption across a module
+  boundary (it crosses today, unlike an exported `let`), Q2 cache default and location, Q3 the
+  watch surface, Q4 frozen export signatures.
+- ⬜ **C-compile-hotspots. Two whole-table scans dominate large compiles (sunpa SP-041, ask 4).**
+  Guest profile of `vl build src/game.vl` (sunpa, no `-O`, 17.4 s, 2026-10-06, named seed):
+  `nameIsStructDecl` (`emit_classify.vl`) is **41.9% of self time** — it walks all of `P.nodes`
+  per call, reached from `sigKeyOfTy` → `structIndexOfTypeName` → `shapeRowScanK` →
+  `shapeFieldTypeCompatK`; `crwAddName` (`typecheck.vl`) is 14.0% — a comma-joined string set
+  grown by `indexOf`, quadratic in names; `fieldClosureFeOfRecvRaw` is 8.7%. Separately, an
+  ENTRY module with N exports builds in O(N²): SP-041's `big.vl` (20,000 exported functions)
+  builds in 10.4 s as the entry but 2.1 s when a one-line importer is the entry; 5k/10k/20k
+  exports read 0.89 / 3.26 / 10.4 s, and 69% of the 10k build is `emitExportSection`
+  (`exportSlotOfTarget`, `exportPublicNames` → `strListHas`, linear list scans). Each is a
+  memo or a name→index map; the scaling guards (`tests/vl_scaling_shape_test.ts`) want an
+  `exports` axis beside them.
+- ⬜ **C-test-std-friction. Two `std:test` asks from sunpa SP-041 — std API, so std-api-reviewer
+  and owner first.** (1) `toBeTrue`/`toBeFalse` take no message, so a check that wants to print
+  the numbers behind a failure is spelled `if !ok { fail("x \{x}") }` (sunpa `src/testflat.vl`
+  `check`). Options: an optional message parameter on the boolean matchers, or a
+  `expect(ok, "context")` form that every matcher's failure carries. (2) the report has no
+  per-test time, only `VL_TEST_TRACE`'s per-file stamps. vl-test-design.md known gap 3 left
+  timings out so the report stays byte-deterministic; an opt-in flag (`--durations`, as pytest)
+  keeps the default report assertable.
+- ⬜ **C-extern-read. `vl run` refuses an unsupplied extern global only when the program READS
+  it.** `vl run --extern NAME=VALUE` (plumb PL-046, [D2636](docs/internals/inventory/D2636.md))
+  supplies a value, and without one `vl run` refuses every DECLARED extern global, including one
+  that only an imported module declares and nothing reads. The goal (owner ruling 2026-09-26) is
+  to refuse only a global some reachable code reads or writes; that needs the emitter to report
+  which extern globals it referenced, or to drop an unreferenced import.
 
 ---
 

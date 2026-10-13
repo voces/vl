@@ -113,6 +113,14 @@ export let gImportMemory = 0
 // count declares the memory SHARED (flag 0x03) with that max, imported or defined alike
 // (`vl build --shared-memory=<pages>`, DECISIONS.md §"A shared memory is a build flag").
 export let gSharedMemPages = 0
+// The memory's initial page count (default 1) and, unshared, its declared max (0: none), both
+// imported or defined alike (`vl build --initial-memory=` / `--max-memory=`, D3560).
+export let gInitialMemPages = 1
+export let gMaxMemPages = 0
+// The `--low-memory-unused` promise: no access's effective address is below this many bytes, so
+// an address `a + K` (K + offset below it) may take K as its memarg offset. 0, the default,
+// promises nothing. Only the host sets it (`setLowMemoryUnused`); DECISIONS.md, "PL-061".
+export let gLowMemUnused: i32 = 0
 // The heap window `[gHeapBase, gHeapLimit)`: the only linear memory `std:buffer` hands out,
 // carried by two immutable globals that exist only when `gHeapUsed` (a read of either).
 // Defaults: the historical base, and the largest 8-aligned i32 as the limit (the old 2 GiB cap).
@@ -122,13 +130,41 @@ export let gHeapLimit = 2147483640
 export let gHeapUsed = false
 // The heap-base global's index (the limit is the next one), or -1 when `gHeapUsed` is false.
 export let gHeapGlobalIdx = -1
+// The read-before-init guard (D2652). `gInitGuard[gi]` is 1 when some code reachable before
+// global `gi`'s initializer runs names it (reads and writes guarded), 2 when that code assigns a
+// folded `let` (writes only, D2654); `gInitFnReach[p]` is the top-level position at which
+// `fnStmts[p]` first becomes callable, `INIT_REACH_NEVER` when no top-level code names it.
+export let gInitGuard: i32[] = []
+export let gInitFnReach: i32[] = []
+export const INIT_REACH_NEVER = 2147483647
+// Whether any global is guarded, and the index of the i32 progress global (the last
+// guarded initializer's `globalStmts` position + 1), or -1 when none is.
+export let gInitAny = false
+export let gInitProgIdx = -1
+// The top-level position the start function is lowering, or -1 outside it.
+export let gInitStartOrd = -1
 // Top-level statements (a bare `print(...)`, an assignment, a `while` over globals)
 // run inside the synthetic start function, in source order, after the non-const
 // global inits — the host's `__program__` model.
 export let startStmts: i32[] = []
+// The order the start function runs top-level nodes in: `startStmtOrd[si]` and
+// `globalStmtOrd[gi]` are the node's position in the module's statement list when `collectFns`
+// read it. Keyed by list position, so a pass that replaces the node keeps its place.
+export let startStmtOrd: i32[] = []
+// The top-level function declarations, in the same list-position order: `topFnNodes[k]` sits at
+// position `topFnOrd[k]`, so a module-level narrowing can be matched to the functions after it.
+export let topFnNodes: i32[] = []
+export let topFnOrd: i32[] = []
+export let globalStmtOrd: i32[] = []
 // The names `captureBoxRewrite` turned into shared cells. A narrowing of a cell's read, live
 // where a closure is written, is the closure's too, as a bare capture's is (D2341).
 export let cboxCellNames: {[string]: i32} = Map()
+// The type the checker recorded for a read `captureBoxRewrite` replaced with `cell[0]`, keyed
+// by the replacing node: the read's narrowing survives only here (D2606).
+export let cboxReadTy: {[i32]: i32} = Map()
+// The `cell[0]` nodes `captureBoxRewrite` put in place of an assignment's bare target: the write
+// is to a captured name, and its narrowing lives on the cell's read key (D3288).
+export let cboxStoreCells: {[i32]: i32} = Map()
 // The unsupported-shape state: `emitFailed` is the set flag, declared `boolean` (not
 // a bare `0`/`1` i32, which would pin to the literal type and refuse reassignment) and
 // `emitErr` carries the first message. Both are top-level mutable `let`s, so they
@@ -264,6 +300,62 @@ export let cloSigWalkRoots: i32[] = []
 // `mAssignTypeIndices`. The captured NAMES per function are recomputed on demand by
 // `captureNamesOf` (a flat `string[]` per call — `string[][]` is not self-host-emittable).
 export let fnEnvIdx: i32[] = []
+// Per lifted slot, parallel to `fnStmts`: the capture count of a function `cloLiftScan`
+// lambda-lifted (every use a direct call, so its captures travel as leading parameters after
+// the env and no closure value is built), or -1. `cloLiftFrame`/`cloLiftLet` pair each lifted
+// `const` binding with the frame that declares it, so that frame skips the binding (SP-037).
+export let cloLiftCapN: i32[] = []
+export let cloLiftFrame: i32[] = []
+export let cloLiftLet: i32[] = []
+export let cloLiftFe: i32[] = []
+// A captured `let` every capturer of which is lifted stays a plain local (D3664): the
+// FuncDecl nodes `captureBoxRewrite` left such a binding unboxed for, each of which
+// `cloLiftScan` must lift, and pairs of a capturer node with a binding it assigns.
+export let cloUnboxNeed: i32[] = []
+export let cloUnboxWrFn: i32[] = []
+export let cloUnboxWrName: string[] = []
+// Per lifted slot, the captures it assigns, returned after its result and written back by
+// every call site: `cloLiftWrStart[fe]`/`cloLiftWrN[fe]` slice the capture indices
+// `cloLiftWrIdx` and their names `cloLiftWrName`.
+export let cloLiftWrStart: i32[] = []
+export let cloLiftWrN: i32[] = []
+export let cloLiftWrIdx: i32[] = []
+export let cloLiftWrName: string[] = []
+
+// The parameter slot of capture `name` that lifted slot `fe` assigns, or -1.
+export function cloLiftWriteSlot(fe: i32, name: string): i32 {
+  if fe < 0 || fe >= cloLiftWrN.length { return -1 }
+  const start = cloLiftWrStart[fe]
+  let j = 0
+  while j < cloLiftWrN[fe] {
+    if cloLiftWrName[start + j] == name { return 1 + cloLiftWrIdx[start + j] }
+    j = j + 1
+  }
+  -1
+}
+
+// Clears the per-program unboxing and write-back tables.
+export function cloLiftWrReset() {
+  cloUnboxNeed = []
+  cloUnboxWrFn = []
+  cloUnboxWrName = []
+  cloLiftWrStart = []
+  cloLiftWrN = []
+  cloLiftWrIdx = []
+  cloLiftWrName = []
+  0
+}
+
+// The capture index of the `j`th capture lifted slot `fe` assigns.
+export function cloLiftWriteCapAt(fe: i32, j: i32): i32 {
+  cloLiftWrIdx[cloLiftWrStart[fe] + j]
+}
+
+// How many captures lifted slot `fe` assigns and returns.
+export function cloLiftWriteCount(fe: i32): i32 {
+  if fe < 0 || fe >= cloLiftWrN.length { return 0 }
+  cloLiftWrN[fe]
+}
 // Capture-list cache: every lifted function's captured names back-to-back in
 // `capNamesFlat`, with `capStartTbl[fe]`/`capCountTbl[fe]` its slice — the
 // self-hostable stand-in for a `string[][]`. Valid only while `capCacheOn`, set once
@@ -339,6 +431,13 @@ export let gPromoOk: i32[] = []
 export let gPromoSlot: i32[] = []
 export let gCellIdx: i32[] = []
 export let gPromoInStart = false
+// A module `const` whose initializer lowers to one scalar immediate is read as that immediate:
+// `gFoldOk[gi]` is 1 when every read folds, and its bytes are `gFoldPool[gFoldAt[gi]..]` for
+// `gFoldLen[gi]` bytes, captured by `captureFoldedConsts`; `gFoldAt` is -1 until then.
+export let gFoldOk: i32[] = []
+export let gFoldAt: i32[] = []
+export let gFoldLen: i32[] = []
+export let gFoldPool: u8[] = []
 // The active `is`-narrowing stack; the discriminated-union table section (G1)
 // carries the full architecture note.
 export let narrowNames: string[] = []
@@ -362,7 +461,7 @@ export let narrowTop = 0
 export let narrowBareIdentOnly = false
 // The declaration-site narrowing of a capture: a nested function/lambda sits
 // lexically inside the guard that narrowed the binding it captures, so a captured
-// read must use that same narrowing. One record per (lifted-frame, capture name) is
+// read must use that same narrowing. One record per (lifted-frame, narrowing key) is
 // replayed by `capNarrowSeed` onto both walks that enter a body, so they cannot disagree.
 export let cnFe: i32[] = []
 export let cnName: string[] = []
@@ -373,6 +472,11 @@ export let cnSet: i32[] = []
 // records at each nested function ONLY then, so the capture scans every other phase runs
 // cost nothing and mutate nothing.
 export let cnRecording = false
+// The module globals the nested body `capScan` is inside reads, collected only while
+// `cnGlobOn` (inside a nested body, while `cnRecording`). A global is never a capture, yet a
+// narrowing of it at the declaration site binds the body's read.
+export let cnGlobReads: {[string]: i32} = Map()
+export let cnGlobOn = false
 // The arena index of the `FuncDecl` whose body `capScan` is currently inside — the `fnIx`
 // `setNarrowFromCond` resolves a condition against. Meaningful only while `cnRecording`;
 // -1 at module scope (the start function), exactly as the emitter's module-scope walks
@@ -465,6 +569,9 @@ export let localBlockLet: i32[] = []
 // a question answerable only from the iterable must reach it via the slot — keying on
 // the loop-var name instead is a miscompile, since two loops may share a name.
 export let localLoopIter: i32[] = []
+// Parallel to `localNames`: for the SECOND name of a `for k, v in m` map walk, the map
+// expression walked; `-1` otherwise. The value's questions go to the map's vals slot.
+export let localPairIter: i32[] = []
 // Parallel to `localNames`: the `LetDecl` node that declared the slot; `-1` for a
 // param-shadow slot, a loop var, or an emitter-synthesized temp. A monomorphized
 // instance keeps its only concrete type at the declaration, since every leaf
@@ -473,6 +580,17 @@ export let localDeclIx: i32[] = []
 // Per declared-local flag: 1 if the slot is a literal-union ATOM (`: K` where `type K = "a"|"b"`), an
 // i32-backed interned id. Parallel to `localNames`; pushed in `addLocalName`, reset in `buildLocals`.
 export let localLitUnion: i32[] = []
+// Per declared-local flag: 1 when the slot belongs to a declaration inside an if-expression arm
+// the collect walk reached in expression position, which the emitter finds by node
+// (`declSlotByNode`) rather than by `emitLetCursor`, so the cursor steps over it (D2785).
+export let localByNode: i32[] = []
+// The first slot of each such declaration (a `let`, or a loop's run of slots), by arena node.
+export let declSlotByNode: {[i32]: i32} = Map()
+// Nonzero while the collect walk is inside an expression-position if-expression.
+export let collectByNode = 0
+// Whether this program has an if-expression outside a statement list that declares a local,
+// set once by `scanExprArmLocals`; with none, the collect walk skips every expression.
+export let exprArmLocalsAny = false
 // Same-named slot disambiguation for the scratch detection passes (D1595): they run
 // with the scope stack empty, so `declaredSlotOf`'s flat scan over `localNames` guesses
 // whenever one frame binds a name twice. `dupSlotBias` selects the name's k-th rep class and
@@ -554,6 +672,10 @@ export let loopContDepth: i32[] = []
 export let loopBrkDepth: i32[] = []
 export let loopContLabel: string[] = []
 export let loopBrkLabel: string[] = []
+// The break frames typed by a loop's non-null value (`WhileStmt.whileLv`): each frame's
+// absolute depth and its result binding, so a `break v` into it hands the value over.
+export let lvFrameDepth: i32[] = []
+export let lvFrameName: string[] = []
 // Per-function scratch frames: `fbBeginFunc` (emit_bytes) owns the layout, walking
 // frames in a fixed order after params+locals and reserving each only when its
 // `fnUses*` flag is set — a new frame is appended last so an unused function keeps
@@ -626,14 +748,14 @@ export let fnUsesCloEq = false
 export let cloEqScratchBase = 0
 // Per-function array-intrinsic scratch (std-design D1): `__array_new__(n, fill)` and
 // `__array_new_default__(n)` stage the runtime length `n` in one i32 slot, feeding the
-// allocation size and the list wrapper's len/cap fields. Flagged by `fnHasArrNew`;
+// allocation size and the list wrapper's len/cap fields. Flagged by `fnHasScratch`;
 // `__array_copy__`/`__trap__` need no scratch.
 export let fnUsesArrNew = false
 export let arrNewScratchBase = 0
 // `f(x) ?? d` (call-LHS null-coalesce) frame: stashes the call's result once so the
 // null test and recovery read the same evaluation. Three slots, one per rep the call
 // may return (a value-union box, a `string | null` niche, a `boolean | null` niche).
-// Flagged by `fnHasCoalesceCall`, which over-approximates any call-LHS `??`.
+// Flagged by `fnHasScratch`, which over-approximates any call-LHS `??`.
 export let fnUsesCoalesceCall = false
 export let coalesceCallSlot = 0
 export let coalesceCallStrSlot = 0
@@ -665,6 +787,9 @@ export let uBoxNewEnd = -1
 // written — two conditions, for the reason `uBoxNewEnd` states, reset per function.
 export let tailCallEnd = -1
 export let tailCallIdx = -1
+// The buffer offset just past the write-back that follows a call to a lifted function
+// assigning captures (D3664), so a self call in tail position can still become `return_call`.
+export let liftWbEnd = -1
 // Struct-type table: a flat store keyed by struct index (`sNames`, `sFieldNames`,
 // `sFieldTypes`, `sHeapIdx`), rebuilt by `collectS`, empty when the program declares
 // unions instead. `postMonoShapes` turns true once `monomorphize` runs, so
@@ -740,6 +865,15 @@ export let emitArenaFinal = false
 // computed it, so this is the generation such a memo stamps (D1655).
 export let emitPassGen = 0
 
+// Every in-place rewrite of a struct or union table row, which no table length shows; part of
+// the type-registry generation (`tyRegGenNow`, compiler/emit_classify.vl).
+export let tyRegWrites = 0
+
+export function tyRegNoteWrite() {
+  tyRegWrites = tyRegWrites + 1
+  0
+}
+
 export let sDeclared = false
 export let sNames: string[] = []
 
@@ -748,6 +882,37 @@ export let sRowDecl: i32[] = []
 export let sFieldNames: string[] = []
 export let sFieldStart: i32[] = []
 export let sFieldCount: i32[] = []
+// The field codes: the storage kind `sFieldTypes` and `uFieldTypes` record per field, which
+// `pushFieldStorage` turns into a valtype. Integers because they live in i32 tables and in
+// the object-literal order stash (`100 + code`).
+export const FC_I32 = 0            // `i32`, `boolean` and a literal-union atom
+export const FC_STR = 3            // `string`, and an inline literal-union set
+export const FC_I32_LIST = 4       // `i32[]`, `boolean[]` and a literal-union atom list
+export const FC_REF_LIST = 5       // a list of structs, unions, closures, lists or maps
+export const FC_STR_LIST = 6       // `string[]`
+export const FC_CLOSURE = 14       // a function type
+export const FC_STRUCT = 15        // a struct, nullable or not
+export const FC_UNION = 16         // the union box
+export const FC_F64 = 17
+export const FC_NUL_I32_LIST = 18
+export const FC_MAP = 19
+export const FC_NUL_STR = 20
+export const FC_NUL_BOOL = 21
+export const FC_NUL_CLOSURE = 22
+export const FC_I64 = 23
+export const FC_F32 = 24
+export const FC_F64_LIST = 25
+export const FC_I64_LIST = 26
+export const FC_F32_LIST = 27
+export const FC_NUL_REF_LIST = 28
+export const FC_NUL_MAP = 29
+export const FC_NUL_LIT_UNION = 30 // the atom slot with `-1` as `null`
+export const FC_NUL_STR_LIST = 31
+export const FC_NUL_F64_LIST = 32
+export const FC_NUL_I64_LIST = 33
+export const FC_NUL_F32_LIST = 34
+export const FC_U8_LIST = 35
+export const FC_NUL_U8_LIST = 36
 export let sFieldTypes: i32[] = []
 // Parallel to `sFieldTypes`: for a ref-list field (code 5) the element type-NAME (the
 // table key into `rlElemName`); "" for any non-ref-list field. Lets a field store/load /
@@ -767,7 +932,7 @@ export let sFieldElemTyIx: i32[] = []
 // type is an i32-keyed map (`{[i32]: V}`, or its `| null` twin), 0 otherwise. A map
 // field records only its value, and an mv slot's identity is the (key, value) pair, so
 // without this column an i32-keyed map field resolves its string-keyed twin's struct.
-export let sFieldElemKeyI32: i32[] = []
+export let sFieldElemKeyKind: i32[] = []
 export let sHeapIdx: i32[] = []
 // Structural slot dedup, the twin pattern `rlTwin`/`mvTwin`/`uVarTwin` repeat: VL is
 // structurally typed, so `type A = {v:i32}` and `type B = {v:i32}` must share one
@@ -802,6 +967,9 @@ export function sSubbedAt(si: i32): boolean {
 // type before computing the structural key; recording the index at the mint removes
 // that round-trip and covers rows a name cannot resolve at all (synthetic `#anon` shapes).
 export let sTyIx: i32[] = []
+// An anonymous row whose recorded type is a hole's context to the minting literal's own record
+// type, so a code-0 field still says whether it holds `i32`, `boolean` or a literal set (D2762).
+export let sAnonOwnTy: {[i32]: i32} = Map()
 // Array-type table: a single element type (`i32`), so all raw i32 arrays share one
 // WasmGC array heap type — the backing store of a growable `i32[]` list and the map's
 // raw `live`/`index`/`hashes`/mono-`vals` arrays. Emitted whenever the program uses a
@@ -868,6 +1036,20 @@ export let rlWrapIdx: i32[] = []
 // and `A[]` sharing a struct heap still mismatch `(ref $S)` at the call boundary.
 export let rlTwin: i32[] = []
 export let rlElemKindTbl: i32[] = []
+// The ref-list element kinds `rlElemKindTbl` records per slot: what one element of the list
+// is. Integers because they live in that i32 table. The build kinds (`LBK_*`) share 1, 2 and
+// 5 with this set by value and nothing else.
+export const RLK_STRUCT = 1   // a struct or variant row, nullable or not
+export const RLK_UNION = 2    // the union box
+export const RLK_MAP = 3
+export const RLK_I32_LIST = 4 // an inner `i32[]`, `boolean[]` or literal-union atom list
+export const RLK_CLOSURE = 5
+export const RLK_STR_LIST = 6
+export const RLK_F64_LIST = 7
+export const RLK_I64_LIST = 8
+export const RLK_REF_LIST = 9 // an inner ref list, whose own row is `rlElemInnerSlot`
+export const RLK_F32_LIST = 10
+export const RLK_U8_LIST = 11
 // Per ref-list slot: `1` if the element is a nullable niche (`(ref null $elem)`, e.g. a
 // `(P | null)[]`), so the caller narrows with `e != null`; `0` otherwise, including a
 // value-union box element whose null is a tag inside a non-null box. The kind decides
@@ -893,6 +1075,10 @@ export let mStructIdx = 0
 // keys-list type immediates differ. `mI32Used` gates the extra heap type; `mStructI32Idx` is that struct.
 export let mI32Used = false
 export let mStructI32Idx = 0
+// The i64-keyed twin (`{[i64]: V}`): `keys` is the i64 list over `ia64TypeIdx`, and the index
+// is the i32-keyed pair layout with a hash of the key as the pair's tag.
+export let mI64Used = false
+export let mStructI64Idx = 0
 // `slUsed` is set by `collectA` when a `string[]` field appears. It reuses the same
 // string-ref list types as the map's keys list, so the keys backing+wrapper types are
 // emitted whenever `slUsed || mUsed`, while the map struct stays gated on `mUsed` alone
@@ -901,16 +1087,29 @@ export let slUsed = false
 // Ref-valued map table (per-(key,value) parameterization): a `{[string]: V}` whose V is
 // a reference cannot ride the monomorphic i32 `vals` list, so each distinct ref value
 // type interns its own 7-field map struct. Slot `-1` is mono i32-valued, `-2` a Set, `-3`
-// unsupported, `-4`/`-5` i32-keyed; `mvKeyI32` is the second half of a slot's (key,value) identity.
+// unsupported, `-4`/`-5` i32-keyed, `-6`/`-7` i64-keyed; `mvKeyKind` is the second half of a slot's (key,value) identity.
 export let mvValName: string[] = [] // canonical value type-name per slot
-// The KEY half of the slot's identity: 1 when this slot's map struct has the i32 keys
-// list (`lTypeIdx` over `aTypeIdx`), 0 for the string-ref keys list. Parallel to
-// `mvValName`; read through `mvSlotKeyI32`.
-export let mvKeyI32: i32[] = []
+// The KEY half of the slot's identity, a `typecheck.mapKeyKindOfTy` kind: which keys list the
+// slot's map struct has (string-ref, i32 or i64). Parallel to `mvValName`; read through
+// `mvSlotKeyKind`.
+export let mvKeyKind: i32[] = []
 // Arena-index sidecar parallel to `mvValName`, recorded by `recordMvValTyIx` — the
 // structural input the slot resolvers key on instead of re-comparing the recorded name string.
 export let mvValTyIx: i32[] = []
-export let mvValKind: i32[] = []      // 3 = string value, 1 = struct value
+export let mvValKind: i32[] = [] // 3 = string value, 1 = struct value
+// The map value kinds `mvValKind` records per slot and `mvValKindOfName` answers. Integers
+// because they live in that i32 table. `MVK_MONO` and `MVK_UNSUPPORTED` are answers, never
+// slot kinds: a mono i32 value rides the shared `$mapStruct`, and an unsupported one no map.
+export const MVK_MONO = -1
+export const MVK_UNSUPPORTED = -3
+export const MVK_STRUCT = 1           // a struct or variant row
+export const MVK_UNION = 2            // the union box
+export const MVK_STR = 3
+export const MVK_REF = 6              // a nested map or a list, on the ref-value spine
+export const MVK_I64 = 10
+export const MVK_F64 = 11
+export const MVK_F32 = 13
+export const MVK_CLOSURE = 14         // a closure fat-pointer, nullable or not
 export let mvValStructIdx: i32[] = [] // struct TABLE index of a kind-1 value, else -1
 // The variant-table row of a kind-1 value that is a declared union arm, else -1,
 // pushed in lockstep with `mvValStructIdx` so the pair is one row. The two are
@@ -976,6 +1175,9 @@ export let gHelpMapProbe = -1  // (keyHash, index, hashes, live, keysBack, key) 
 export let gHelpMapProbeI32 = -1 // (index, key) -> probe slot
 export let gHelpMapResize = -1 // (index, hashes, live, count, size) -> index'
 export let gHelpMapResizeI32 = -1 // (index, count) -> index'
+// The i64-keyed probe: the pair index again, whose tag is the key's hash, so a tag match is
+// confirmed against the keys backing. Emitted only when `mI64Used`; it resizes as i32-keyed.
+export let gHelpMapProbeI64 = -1 // (index, key i64, keysBack) -> probe slot
 // D1586 — the float remainder intrinsic: wasm has no `f64.rem` instruction, so `a % b`
 // over floats calls this once-per-module `fmod`, gated on `gNeedsF64Rem` (`scanPrintUse`
 // sets it; the f32 slice promotes in and demotes out, so one helper serves both widths).
@@ -986,14 +1188,133 @@ export let gNeedsF64Rem = false
 export let gMapDeletes = false
 export let gHelpMapResync = -1 // (live, count, seq) -> cursor: a walk's step after compaction
 // One compaction helper per map shape, `(ref <mapTy>) -> ()`: row 0 the string-keyed mono map,
-// row 1 the i32-keyed one, row `2 + s` mv slot `s`; -1 where the shape has none.
+// row 1 the i32-keyed one, row `2 + s` mv slot `s`, the last row the i64-keyed one; -1 where
+// the shape has none.
 export let gHelpMapCompact: i32[] = []
+// D2652 — `__init_fail__(g, verb, r)`: prints global `g`'s name and place, the verb and
+// reader `r`, then traps; the one body every guard site calls. Reserved when `gInitAny`; its
+// rows are interned while user bodies emit, before its own body (the last helper) is written.
+export let gHelpInitFail = -1
+// `__as_fail__(line, colRow)`: prints a failed `as!` cast's reason, its domain the row
+// `colRow & 7` of `gAsFailDoms` and its place `line:(colRow >> 3)`, none at line 0 (SP-056).
+// Reserved when `gNeedsAsFail`; rows are interned while user bodies emit.
+export let gHelpAsFail = -1
+export let gNeedsAsFail = false
+export let gAsFailDoms: string[] = []
+// A scalar list delivered as a wider `readonly` list from a source other handles may write is a
+// view that keeps its source (D3028). `svPairs` is the checker's `scalarViewPairs` less a pair this
+// module lacks the lists of; per pair (0 `i32`->`i64`, 1 `i32`->`f64`, 2 `f32`->`f64`) a view type
+// and maker, per destination (0 `i64`, 1 `f64`) a sync, an element and a length helper.
+export let svPairs = 0
+export let svViewTy: i32[] = []
+export let gHelpSvMk: i32[] = []
+export let gHelpSvSync: i32[] = []
+export let gHelpSvGet: i32[] = []
+export let gHelpSvLen: i32[] = []
+
+// Whether view pair `p` (0 `i32`->`i64`, 1 `i32`->`f64`, 2 `f32`->`f64`) is built in this module.
+export function svPairOn(p: i32): boolean { (svPairs & (1 << p)) != 0 }
+
+// Whether some view reads as destination `d` (0 `i64`, 1 `f64`).
+export function svDstOn(d: i32): boolean {
+  if d == 0 { return svPairOn(0) }
+  svPairOn(1) || svPairOn(2)
+}
+
+// A record list delivered as a list of union boxes from a source other handles may write is a view
+// that keeps its source (D3041). Union-box lists share one wrapper (row `rvUnionSlot`), so one sync,
+// element and length helper serves them (-1 unreserved); per source row `rvSrcSlot[p]` a view type,
+// the variant it boxes as, and whether a twin row it stands for holds `null` (`rvNul`).
+export let gHelpRvSync = -1
+export let gHelpRvGet = -1
+export let gHelpRvLen = -1
+export let rvUnionSlot = -1
+export let rvSrcSlot: i32[] = []
+export let rvVariant: i32[] = []
+export let rvNul: i32[] = []
+export let rvViewTy: i32[] = []
+
+// Whether a list at ref-list row `slot` may be a view: a union-box list in a module that builds one.
+export function rvMayView(slot: i32): boolean {
+  if rvSrcSlot.length == 0 || slot < 0 || slot >= rlElemKindTbl.length {
+    return false
+  }
+  rlElemKindTbl[slot] == RLK_UNION
+}
+export let gInitGIdx: i32[] = []
+export let gInitGNames: string[] = []
+export let gInitGLocs: string[] = []
+export let gInitReaders: string[] = []
 // String-literal pool: distinct string literals interned once as immutable module
 // globals, so an occurrence lowers as a `global.get` rather than a fresh allocation
 // per evaluation. The pool occupies global indices before the user globals, so a
 // const user global's init constexpr may reference a pool entry. Collected by `collectStrPool`.
 export let gStrPoolTexts: string[] = []
 export let gStrPoolIx: {[string]: i32} = Map()
+// String literals past the pool's cap, each stored once as a passive data segment that
+// `array.new_data` reads, so a literal costs its function body a few bytes whatever its length
+// (D2092). Segment `k` is `gStrDataLen[k]` UTF-8 bytes, held in order by the parts from
+// `gStrDataStart[k]` up to the next segment's start.
+export let gStrDataIx: {[string]: i32} = Map()
+export let gStrDataStart: i32[] = []
+export let gStrDataLen: i32[] = []
+export let gStrDataParts: ByteChunk[] = []
+// Whether the expression being emitted is a global's constant initializer, where a literal
+// cannot chunk through locals and so builds as one `array.new_fixed` within the operand cap.
+export let gConstExprEmit = false
+// Module constants a body may read instead of allocating: an empty list's backing per array
+// type, each capture-free function's closure, a constant list only a `for` reads (`gSynthInit`).
+// They trail every other global, from `gSynthBase` (-1 until `emitGlobalSection` places them),
+// and their section is framed after the bodies, so a body may add one.
+export const SYNTH_EMPTY_BACKING = 0
+export const SYNTH_CLOSURE = 1
+export const SYNTH_CONST_LIST = 2
+export let gSynthBase = -1
+export let gSynthKind: i32[] = []
+export let gSynthArg: i32[] = []
+export let gSynthInit: u8[][] = []
+export let gSynthAt: {[i32]: i32} = Map()
+
+// The global holding synthetic constant (`kind`, `arg`), minted on first use, or -1 where none
+// can be read: before the global section is placed, or inside a constant initializer.
+export function synthGlobalIdx(kind: i32, arg: i32): i32 {
+  if gSynthBase < 0 || gConstExprEmit || arg < 0 { return -1 }
+  const key = arg * 2 + kind
+  const have = gSynthAt[key] ?? -1
+  if have >= 0 { return gSynthBase + have }
+  gSynthAt[key] = gSynthKind.length
+  gSynthKind.push(kind)
+  gSynthArg.push(arg)
+  gSynthInit.push([])
+  gSynthBase + gSynthKind.length - 1
+}
+
+// The global holding the list of wrapper type `wrapTy` that constant initializer `init` builds,
+// shared with an earlier list of the same bytes, or -1 where `synthGlobalIdx` would give none.
+export function synthConstListIdx(wrapTy: i32, init: u8[]): i32 {
+  if gSynthBase < 0 || gConstExprEmit || wrapTy < 0 { return -1 }
+  let i = 0
+  while i < gSynthKind.length {
+    if gSynthKind[i] == SYNTH_CONST_LIST && gSynthArg[i] == wrapTy {
+      if bytesEq(gSynthInit[i], init) { return gSynthBase + i }
+    }
+    i = i + 1
+  }
+  gSynthKind.push(SYNTH_CONST_LIST)
+  gSynthArg.push(wrapTy)
+  gSynthInit.push(init)
+  gSynthBase + gSynthKind.length - 1
+}
+
+function bytesEq(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
 // The arm blocks whose prelude locals `collectLocalsIf` allocated, as a mark column indexed by
 // arena node. Locals are claimed off a linear cursor, so the emitter may lower only a prelude
 // the collect pass walked; an unwalked one fails loudly at `emitIfArmOpen` rather than claiming
@@ -1004,6 +1325,21 @@ export let armPreludeBlocks: {[i32]: boolean} = Map()
 // struct-ref list, `2` = union-ref list. `emitArr` consults it ONLY for an empty
 // literal — a non-empty one takes its kind from its elements.
 export let pendingListKind = 0
+// The list build kinds: which (backing, wrapper) pair `emitArr` builds a literal at, as
+// `pendingListKind`, `ExpCtx.listKind`, `ListBuild.lbKind` and the concat and compare reps
+// carry it. Not the ref-list element kinds (`RLK_*`), which agree with these only at 1 and 2.
+export const LBK_I32_LIST = 0           // the default: `i32[]`, `boolean[]` and atom lists
+export const LBK_REF = 1                // a ref list: struct rows, maps, and the ref default
+export const LBK_UNION = 2              // a ref list of union boxes
+export const LBK_STR_LIST = 3
+export const LBK_F64_LIST = 4
+export const LBK_REF_AT_SLOT = 5        // a ref list built at exactly `pendingListSlot`'s row
+export const LBK_I64_LIST = 6
+export const LBK_F32_LIST = 7
+export const LBK_NUL_BOOL_LIST = 8      // `(boolean | null)[]`, on the i32 backing
+export const LBK_NUL_LIT_UNION_LIST = 9 // `(K | null)[]`, atoms with `-1` as `null`
+export const LBK_U8_LIST = 10
+export const LBK_NUL_U8_LIST = 13       // `u8[] | null`, the packed backing in a nullable cell
 // The ref-list table slot that empty `[]` builds as: which distinct element type
 // (`Tok[]` vs `Diag[]` vs `Node[]`), where `pendingListKind` says only struct-vs-union.
 // Set alongside it for kinds 1/2; defaults to slot 0.
@@ -1165,10 +1501,32 @@ export let vbI32Used = false
 export let vbI64Used = false
 export let vbF32Used = false
 export let vbF64Used = false
+export let vbV128Used = false
+// An integer-keyed map whose value rides the shared i32 `vals` list is a union member: its
+// arm takes a tag of its own above the value-atom band (`mapSlotTag`), one per key rep.
+export let mIntMonoArmUsed = false
+// A boolean-leaf list arm shares its storage with the `i32` twin but tags apart: `boolean[]`
+// at code 17, `(boolean | null)[]` at 18, a deeper `boolean[]..[]` at `18 + depth`. The deepest
+// such arm any union holds (a flat one is 0), or -1; the codes exist only up to it.
+export let vbBoolListTop = -1
+// The map TYPES among the module's union arms that may share one struct with another (a mono
+// map of one key rep, or a map with a value slot), one row each: the arm's arena type, its
+// folded shape, and its tag code (-1 the shape's own tag, k >= 0 the code `17 + k` above the
+// value-atom band, `mTwinExtra` of them). Registered at collect, read by every box and test.
+export let mTwinTys: i32[] = []
+export let mTwinShapes: i32[] = []
+export let mTwinCodes: i32[] = []
+export let mTwinExtra = 0
+// Whether the value-slot rows have been grouped by the struct they emit (`mapTwinSettle`); a
+// slot's struct is known only once collection ends.
+export let mTwinSettled = false
+// Whether a delivery retags a box (`mapRetagAnyEmitted`): -1 not yet asked, else 0 or 1.
+export let mTwinRetagMemo = -1
 export let vbI32Idx = 0
 export let vbI64Idx = 0
 export let vbF32Idx = 0
 export let vbF64Idx = 0
+export let vbV128Idx = 0
 // Flat multi-struct field table (union variant structs), parallel to `uVariants`:
 // variant struct `i` owns the field names `uFieldNames[uFieldStart[i] ..
 // + uFieldCount[i]]`, in declaration order. A flat backing store sidesteps a
@@ -1194,9 +1552,9 @@ export let uFieldLitTyIx: i32[] = []
 // The `sFieldElemTyIx` sidecar for VARIANT fields (destringify D5), recorded by
 // `recordUFieldElemRow`.
 export let uFieldElemTyIx: i32[] = []
-// The `sFieldElemKeyI32` key column for variant fields (B6b) — see that column's
+// The `sFieldElemKeyKind` key column for variant fields (B6b) — see that column's
 // header for why a map field row that carries only `V` cannot resolve its map struct.
-export let uFieldElemKeyI32: i32[] = []
+export let uFieldElemKeyKind: i32[] = []
 export let fnUsesMap = false
 export let mapScratchBase = 0
 // The i32-keyed map's own scratch slots, appended after the string-keyed frame so no
@@ -1204,6 +1562,9 @@ export let mapScratchBase = 0
 //   +0 keyI32 i32 (target key) . +1 keysBk (ref $aTypeIdx) (keys backing) . +2/+3 kOut/kSrc
 //   (ref $aTypeIdx) (`.keys()` output/source) . +4 mapRef (ref $mStructI32Idx), typed apart from the string frame's mono slot.
 export let mapI32Base = 0
+// The i64-keyed twin of that frame, reserved when `fnUsesMap && mI64Used`: +0 the i64 key,
+// +1 keysBk, +2/+3 kOut/kSrc (all `(ref $ia64TypeIdx)`), +4 mapRef (ref $mStructI64Idx).
+export let mapI64Base = 0
 // `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
 // outBack (ref $mkArrIdx), keysBack (ref $mkArrIdx), live (ref $aTypeIdx), then i/j/count
 // (3 i32). Reserved when the function builds a map's key list (`fnUsesMapKeys`).
@@ -1433,6 +1794,49 @@ export let monoKeys: string[] = []
 export let monoInstOrig: i32[] = []
 export let monoInstName: string[] = []
 export let monoInstFe: i32[] = []
+// An instance parameter's synthesized annotation node to the arena type its pin is taken from:
+// the annotation spells a pin by name, which renders a Set as its boolean map and a
+// literal-union value by its base, so a test that needs the member type reads this instead.
+export let monoParamPinTy: {[i32]: i32} = Map()
+// An instance parameter pinned at an anonymous record row to the argument's own record type.
+// The row is shared by every literal of its layout, so `boolean` and `i32` fields read the same
+// row; the instance's own type is what a field read formats by (D2762).
+export let monoAnonParamPinTy: {[i32]: i32} = Map()
+// An instance keyed by its exact pinned types, because its body tests a value whose type names
+// a type parameter: its `fnStmts` slot to a row of `monoExactSubN`/`monoExactSubT`, each type
+// parameter bound to its exact pinned type (a Set, a literal-union value). D2684.
+export let monoExactSubRow: {[i32]: i32} = Map()
+// An instance whose returns join to two list types at its pin, by instance name, to that
+// union: the call is typed as one list, so a use needing one list is refused (D2766).
+export let monoTwoListRet: {[string]: i32} = Map()
+export let monoExactSubN: string[][] = []
+export let monoExactSubT: i32[][] = []
+// An instance with un-annotated parameters: its `fnStmts` slot to a row of
+// `monoHoleSubN`/`monoHoleSubT`, each hole's type variable bound to this instance's pin. The
+// instance shares the generic body's nodes, whose recorded types name those variables (D2921).
+export let monoHoleSubRow: {[i32]: i32} = Map()
+// A function body a pass rebuilt (a monomorphized instance's, or a rewrite's copy-on-write
+// spine), to the body it comes from. The rebuilt spine shares the original's leaves, so a read
+// is placed against the original's scopes (D3296).
+export let bodyRebuiltFrom: {[i32]: i32} = Map()
+export let monoHoleSubN: string[][] = []
+export let monoHoleSubT: i32[][] = []
+// Each instance's type parameters bound to its parameters' pinned types, by `fnStmts` slot. A
+// generic call in an instance that is not exact reads its argument's type here, or it pins the
+// callee at the caller's own type parameter (D3044).
+export let monoPinSubRow: {[i32]: i32} = Map()
+export let monoPinSubN: string[][] = []
+export let monoPinSubT: i32[][] = []
+// The object literals an instance rebuilt at a pinned type for a field at a union holding a
+// type parameter: the post-monomorphization shape pass mints each one's row (D2906).
+export let monoGradualObjLits: {[i32]: boolean} = Map()
+export let monoGradualObjList: i32[] = []
+// The `as?` casts an instance re-made over a gradual union's operand that its pin makes a
+// scalar: each is lowered as over a bare parameter, nullable at every pin (D2754).
+export let monoGradualAsScalar: {[i32]: boolean} = Map()
+// Whether some instance's template returns a union holding a type parameter, the one source of
+// a union a concrete record literal's field can hold whose row waits on monomorphization (D3264).
+export let monoGradualRetPinned = false
 // The root statement list, for the per-instance map/inference rebuilds.
 export let monoProgStmts: i32[] = []
 
@@ -1508,6 +1912,121 @@ export function fnStmtsIndexOf(fnIx: i32) {
 // scope-chain twins walk one index; the walk is quadratic in the frame count without it.
 export let fnChildHead: i32[] = []
 export let fnChildNext: i32[] = []
+
+// A named `function` declared as a statement of a block, by `fnStmts` position as lifted: the
+// arena range of its own subtree and its block's arena index. Its name is in scope inside that
+// subtree and from its end to the block's, as a `let`'s is (D3608). The columns are shorter
+// than `fnStmts`, with -1 rows.
+export let lfDeclLo: i32[] = []
+export let lfDeclAt: i32[] = []
+export let lfDeclBlock: i32[] = []
+// The first row of each name, by sid, and each row's next of the same name: one lookup walks
+// only the functions of its own name.
+export let lfSidHead: i32[] = []
+export let lfSidNext: i32[] = []
+// For a per-pin clone the monomorphizer minted of a block-local function, the template's
+// position; -1 for a declaration as written. A clone's row is never chained.
+let lfDeclOrigin: i32[] = []
+// The clones of each template position, chained: `lfCloneHead[t]` the latest, `lfCloneNext[c]`
+// the one before; -1 ends a chain. Most templates have none, so the lookup costs nothing.
+export let lfCloneHead: i32[] = []
+export let lfCloneNext: i32[] = []
+
+// A callee identifier the monomorphizer minted for a cloned call, by arena index: the
+// identifier it copies, which stands for its source position (`lfMintedOf`).
+let lfMinted: {[i32]: i32} = Map()
+
+// Records the minted callee `minted` as a copy of the identifier at `orig`.
+export function lfNoteMinted(minted: i32, orig: i32) {
+  lfMinted[minted] = orig
+  0
+}
+
+// The identifier the minted callee `ix` copies, followed to a source node, or `ix` itself.
+export function lfMintedOf(ix: i32): i32 {
+  let at = ix
+  let hops = 0
+  while hops < 64 {
+    const o = lfMinted[at] ?? -1
+    if o < 0 { return at }
+    at = o
+    hops = hops + 1
+  }
+  at
+}
+
+// The block holding the block-local function at `fnStmts` position `i`, or -1 for none.
+export function lfBlockOf(i: i32): i32 {
+  if i < 0 || i >= lfDeclBlock.length { return -1 }
+  lfDeclBlock[i]
+}
+
+// Records `fnStmts` position `i`, the declaration at `declIx` whose subtree starts at `lo`, as a
+// statement of block `blockIx`.
+export function lfNoteBlockLocal(
+  i: i32,
+  sid: i32,
+  lo: i32,
+  declIx: i32,
+  blockIx: i32,
+) {
+  lfGrow(i)
+  lfDeclLo[i] = lo
+  lfDeclAt[i] = declIx
+  lfDeclBlock[i] = blockIx
+  if sid < 0 { return 0 }
+  while lfSidHead.length <= sid { lfSidHead.push(-1) }
+  lfSidNext[i] = lfSidHead[sid]
+  lfSidHead[sid] = i
+  0
+}
+
+// Records `fnStmts` position `i` as a per-pin clone of the block-local function at `tmpl`, or
+// nothing when `tmpl` is not one.
+export function lfNoteClone(i: i32, tmpl: i32) {
+  if i < 0 || lfBlockOf(tmpl) < 0 { return 0 }
+  lfGrow(i)
+  lfDeclLo[i] = lfDeclLo[tmpl]
+  lfDeclAt[i] = lfDeclAt[tmpl]
+  lfDeclBlock[i] = lfDeclBlock[tmpl]
+  lfDeclOrigin[i] = tmpl
+  while lfCloneHead.length <= tmpl { lfCloneHead.push(-1) }
+  lfCloneNext[i] = lfCloneHead[tmpl]
+  lfCloneHead[tmpl] = i
+  0
+}
+
+// The template position of the clone at `i`, or -1.
+export function lfOriginOf(i: i32): i32 {
+  if i < 0 || i >= lfDeclOrigin.length { return -1 }
+  lfDeclOrigin[i]
+}
+
+function lfGrow(i: i32) {
+  while lfDeclBlock.length <= i {
+    lfDeclLo.push(-1)
+    lfDeclAt.push(-1)
+    lfDeclBlock.push(-1)
+    lfDeclOrigin.push(-1)
+    lfSidNext.push(-1)
+    lfCloneNext.push(-1)
+  }
+  0
+}
+
+// Empties the columns, at the start of a program's collection.
+export function lfReset() {
+  lfDeclLo = []
+  lfDeclAt = []
+  lfDeclBlock = []
+  lfSidHead = []
+  lfSidNext = []
+  lfMinted = Map()
+  lfCloneHead = []
+  lfCloneNext = []
+  lfDeclOrigin = []
+  0
+}
 
 // Drop the index so the next reader rebuilds it. Every `fnParent` write outside `collectFns`
 // calls this: the length compare below triggers a lazy build, it does not test validity, so a

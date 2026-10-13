@@ -15,6 +15,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 const STD = `${ROOT}/std`;
@@ -29,7 +30,7 @@ const run = async (
   src: (dir: string) => string,
   extra: Record<string, string> = {},
 ): Promise<string[]> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_base64_" });
+  const dir = await makeTempDir({ prefix: "vl_base64_" });
   try {
     const entry = `${dir}/probe.vl`;
     await Deno.writeTextFile(entry, src(dir));

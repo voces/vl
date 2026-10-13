@@ -13,10 +13,11 @@
 // through it is a write). Seed-gated like the other wasm suites.
 //   deno test -A --no-check tests/vl_effects_summary_test.ts
 
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { withEffects } from "../lsp/src/typeFeatures.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -117,8 +118,8 @@ const WANT = [
   "setA: writes: `p.a` · reads: none · allocates: no · cost: 0 steps · I/O: none",
   "fresh: writes: none · reads: none · allocates: yes (a struct literal at line 31) · cost: 0 steps · I/O: none",
   "closes: writes: unknown (a call of a function value at line 37) · reads: unknown (a call of a function value at line 37) · allocates: yes (a closure at line 36) · cost: unbounded (it calls a function value at line 37) · I/O: unknown (a call of a function value at line 37)",
-  `hyp: ${NONE} · cost: 1 step · I/O: none`,
-  `viaUfcs: ${NONE} · cost: 2 steps · I/O: none`,
+  `hyp: ${NONE} · cost: 5 steps · I/O: none`,
+  `viaUfcs: ${NONE} · cost: 6 steps · I/O: none`,
   `isAb: ${NONE} · cost: 2 steps · I/O: none`,
   "greet: writes: none · reads: none · allocates: yes (a string concatenation at line 42) · cost: unbounded (it concatenates strings at line 42) · I/O: none",
   `get lenish: ${NONE} · cost: 0 steps · I/O: none`,

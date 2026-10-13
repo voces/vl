@@ -30,8 +30,8 @@ const HELD_CODES = [
 ];
 
 /** The file's lint findings for the ratcheted codes, before any hold. Staged with
- * its real path, the way the editor now does (`server.ts`'s `lintPathFor`) — none
- * of `HELD_CODES` is path-scoped, so this does not move their counts. */
+ * its real path, the way the editor does (`server.ts`'s `lintPathFor`) — every one of
+ * `HELD_CODES` grades `compiler/` alone (docs/internals/lint-rule-scope.md). */
 const rawFindings = () => {
   const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
   const src = Deno.readTextFileSync(TARGET);

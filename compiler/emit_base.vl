@@ -4,15 +4,21 @@
 // `emit_query`) import.
 
 import {
+  MAP_KEY_I32,
+  MAP_KEY_I64,
+  MAP_KEY_STR,
   T,
   TyArray,
   TyFunc,
   TyMap,
   TyNullable,
+  TyPrim,
   declAnnRawTyName,
   inferRetNameOf,
   isValueUnionName,
+  mapKeyKindOfTy,
   nameIsI32HashedLitUnion,
+  nameIsI64HashedKey,
   nameIsLitUnionType,
   nodeTyArrayElemRepName,
   nodeTyIsClosureArray,
@@ -99,7 +105,10 @@ import {
   Unary,
   WhileStmt,
   i32ToStr,
+  nodeChildren,
+  nodeValueChildren,
 } from "./ast"
+import { strContains } from "./strutil"
 
 // Append all of `src` onto `dst` (in place) and return `dst`.
 export function appendAll(dst: u8[], src: u8[]) {
@@ -118,15 +127,6 @@ export function appendAll(dst: u8[], src: u8[]) {
 export function capIsBound(bound: {[string]: i32}, name: string) {
   (bound[name] ?? 0) == 1
 }
-// True if `name` is in `caps` already (dedup the capture list).
-export function capHas(caps: string[], name: string) {
-  let i = 0
-  while i < caps.length {
-    if caps[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
 // True if `name` is a call target the emitter lowers inline — one of the five builtins
 // (`print`, `Map`, `Set`, `fromCodePoint`, `fromCodePoints`). Consulted only at `capScan`'s
 // `Call` arm, callee position: elsewhere it suppressed genuine captures of a local sharing
@@ -139,17 +139,65 @@ export function isBuiltinFnName(name: string) {
   if name == "Set" { return true }
   false
 }
-// A single-entry cache for `parentLetOf`, keyed by block: the block whose name → `LetDecl`
-// map is built, and the map itself (`name -> LetDecl` arena index, first-wins). Every
-// `parentLetOf` caller passes its function's body block, so the cache rebuilds once per
-// function. `resetParentLetCache` clears it at `emitProgram` start — a stale block index from a prior compile must not be trusted.
+// The block whose let plan the `pl*` tables below hold, or -1. The plan is the current entry
+// of a small most-recently-used cache (`plSaved*`), so a question about a callee's body does
+// not cost the caller a rebuild of its own (D2687). `resetParentLetCache` clears every entry
+// at `emitProgram` start — a stale block index from a prior compile must not be trusted.
 let plCacheBlock: i32 = -1
 
-// Evicts the single-entry cache without resetting `plGen`'s own counter — the next ask for
-// ANY block, even the one just built, rebuilds. Nothing here can distinguish "this block's
-// own plan changed" from "a different block is being asked about", so a caller that knows
-// the arena moved under a cached block must call this explicitly (D2389).
-export function plCacheBust() { plCacheBlock = -1 }
+// Evicts every cached plan — the next ask for ANY block, even the one just built, rebuilds.
+// Nothing here can distinguish "this block's own plan changed" from "a different block is
+// being asked about", so a caller that knows the arena moved under a cached block must call
+// this explicitly (D2389).
+export function plCacheBust() {
+  plCacheBlock = -1
+  let i = 0
+  while i < plSavedBlock.length {
+    plSavedBlock[i] = -1
+    i = i + 1
+  }
+  0
+}
+
+// One cached plan's tables, parked while another block's plan is current. Field for field the
+// `pl*` globals below; `plSave`/`plLoad` are the only code that moves between the two.
+type PlPlan = {
+  sidVal: i32[],
+  sidGen: i32[],
+  ownerVal: i32[],
+  dupGen: i32[],
+  moreSid: i32[],
+  moreIx: i32[],
+  moreOwner: i32[],
+  moreNext: i32[],
+  moreHead: i32[],
+  lxLo: i32[],
+  lxHi: i32[],
+  lxLoop: i32[],
+  lxNext: i32[],
+  lxHead: i32[],
+  lxSid: i32[],
+  sortStart: i32[],
+  sortCount: i32[],
+  sortGen: i32[],
+  sortedCand: i32[],
+  sortedOwner: i32[],
+  sortedSkip: i32[],
+  loopSidVal: i32[],
+  loopSidGen: i32[],
+}
+
+// The parked plans, most recent first, with the block and generation each belongs to. A
+// parked plan's stamps all name its own generation, so loading it back needs no rebuild.
+let plSaved: PlPlan[] = []
+let plSavedBlock: i32[] = []
+let plSavedGen: i32[] = []
+// How many plans stay parked besides the current one: a caller, its callee, and the chain a
+// callee's own inferred return reaches.
+const PL_PARKED = 3
+// The last generation any build took. Each build takes the next one, so a recycled plan's
+// older stamps can never read as present.
+let plGenTop: i32 = 0
 // `plSidVal`/`plSidGen` are the R6 form of `plCacheMap`: a dense sid-indexed array replaces a
 // per-block `{[string]: i32}` that could not be cleared cheaply. A slot counts as present only
 // when its `plSidGen` stamp equals the current `plGen`, so clearing is O(1). `plGen` starts at
@@ -169,12 +217,17 @@ let plMoreOwner: i32[] = []
 let plMoreNext: i32[] = []
 let plMoreHead: i32[] = []
 // Every loop variable's scope in the current build, chained per sid like `plMore*`: the
-// variable is visible at `atIx` when `plLxLo < atIx <= plLxHi` (the loop header's last node,
-// then the body block's own index — the arena is post-order). Rebuilt with the rest (D2289).
+// variable is visible at `atIx` when `plLxLo < atIx <= plLxHi` (one below the body's first-built
+// node, then the body block's own index — the arena is post-order). Rebuilt with the rest (D2289).
 let plLxLo: i32[] = []
 let plLxHi: i32[] = []
+// The `ForRange`/`ForIn` each `plLx*` row belongs to, so a query can name the loop.
+let plLxLoop: i32[] = []
 let plLxNext: i32[] = []
 let plLxHead: i32[] = []
+// The sid each `plLx*` row chains under, so the next build can clear exactly the
+// `plLxHead` slots this one wrote (see `plBuildLetMap`).
+let plLxSid: i32[] = []
 // A lazily-built, ASCENDING-by-`cand` materialization of one sid's `plMore*` chain, binary
 // searched instead of walked per query (D2326). `plSortStart`/`plSortCount` locate sid's
 // slice of the flat, per-function `plSortedCand`/`plSortedOwner`; `plSortGen` names the
@@ -284,6 +337,51 @@ export function frameBindsCachePut(sid: i32, v: i32) {
   0
 }
 
+// One frame's answers to "is `sid` a parameter of frame `pshFrame` that a `let` or loop
+// variable of its body also binds", by sid: `pshSidVal` is 1 or 0 where `pshSidGen` matches
+// `pshGen`. Asking about another frame bumps the generation; a rebuilt body keeps its names.
+let pshFrame: i32 = -1
+let pshBody: i32 = -1
+let pshGen: i32 = 0
+let pshSidGen: i32[] = []
+let pshSidVal: i32[] = []
+
+// Whether `sid` names a parameter of the function node `fnIx` that some `let` or loop variable
+// of its body shadows somewhere: the only case a read of the parameter's name needs its
+// position to tell the two apart (D3293).
+export function paramShadowedInBody(fnIx: i32, sid: i32): boolean {
+  if fnIx < 0 || sid < 0 { return false }
+  if fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {
+    return pshSidVal[sid] == 1
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fnIx != pshFrame || fn.fnBody != pshBody {
+      pshFrame = fnIx
+      pshBody = fn.fnBody
+      pshGen = pshGen + 1
+    }
+    let v = 0
+    let i = 0
+    while i < fn.fnParams.length && v == 0 {
+      if sidOfNode(fn.fnParams[i]) == sid { v = 1 }
+      i = i + 1
+    }
+    if v == 1 {
+      if (
+        parentLetOfSid(fn.fnBody, sid) < 0
+        && parentLoopVarOfSid(fn.fnBody, sid) < 0
+      ) {
+        v = 0
+      }
+    }
+    sidArrPut(pshSidGen, sid, pshGen)
+    sidArrPut(pshSidVal, sid, v)
+    return v == 1
+  }
+  false
+}
+
 // Drops this file's sid-keyed rows. Paired with `symbols.sidReset` by the driver
 // (`emit_sections.sidKeyedTablesReset`) because the id space is re-keyed there: a generation
 // stamp defends against a stale key, never against a re-keyed universe — program N+1 would
@@ -301,8 +399,10 @@ export function sidResetParentLet() {
   plMoreHead = []
   plLxLo = []
   plLxHi = []
+  plLxLoop = []
   plLxNext = []
   plLxHead = []
+  plLxSid = []
   plSortStart = []
   plSortCount = []
   plSortGen = []
@@ -312,14 +412,43 @@ export function sidResetParentLet() {
   plLoopSidVal = []
   plLoopSidGen = []
   plGen = 0
+  plGenTop = 0
+  plLxIdxKey = Map()
+  plLxIdxGen = []
+  plLxIdxLo = []
+  plLxIdxHi = []
+  plLxIdxLoop = []
+  plLxIdxUp = []
+  plSaved = []
+  plSavedBlock = []
+  plSavedGen = []
   fcbFrame = -1
   fcbGen = 0
   fcbSidGen = []
   fcbSidVal = []
+  pshFrame = -1
+  pshBody = -1
+  pshGen = 0
+  pshSidGen = []
+  pshSidVal = []
   0
 }
 
+// A callee node a rewrite minted past its frame's body, keyed to the call it replaced the
+// callee of, so a positional scope question can be asked at the call's own source position.
+let callOrigin: {[i32]: i32} = Map()
+
+export function noteCallOrigin(minted: i32, callIx: i32) {
+  callOrigin[minted] = callIx
+  0
+}
+
+// The source position that stands for node `ix`: the originating call for a minted callee,
+// else `ix` itself.
+export function callOriginOf(ix: i32): i32 { callOrigin[ix] ?? ix }
+
 export function resetParentLetCache() {
+  callOrigin = Map()
   sidResetParentLet()
   nnfSet = Map()
   nnfScanned = 0
@@ -342,10 +471,10 @@ export function resetParentLetCache() {
   0
 }
 
-// Fills `plCacheMap` (via the parallel sid arrays) with every function-scoped `LetDecl`
-// reachable from `blockIx`, first-wins, in `parentLetOf`'s own pre-order. Descends both
-// `if`/`else` branches, `while`/`for` bodies and nested blocks, since a wasm local is scoped
-// to the whole function. `owner` is the innermost enclosing block's own index (D2316).
+// Fills `plCacheMap` (the sid arrays) with every `LetDecl` of the frame at `blockIx`,
+// first-wins in pre-order: every block, a value `if`'s or `match` arm's included, since a wasm
+// local is function-scoped; not a nested `FuncDecl`. `owner` is the innermost enclosing
+// block's own index (D2316).
 function plScanStmt(ix: i32, owner: i32) {
   if ix < 0 { return 0 }
   const st = P.nodes[ix]
@@ -370,6 +499,7 @@ function plScanStmt(ix: i32, owner: i32) {
       plMoreIx.push(ix)
       plMoreOwner.push(owner)
     }
+    plScanStmt(st.letInit, owner)
   } else if st is IfStmt {
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let cur = ix
@@ -377,6 +507,7 @@ function plScanStmt(ix: i32, owner: i32) {
       const c = P.nodes[cur]
       cur = -1
       if c is IfStmt {
+        plScanStmt(c.ifCond, owner)
         plScanStmt(c.ifThen, c.ifThen)
         if c.ifElse >= 0 {
           if P.nodes[c.ifElse] is IfStmt {
@@ -388,21 +519,27 @@ function plScanStmt(ix: i32, owner: i32) {
       }
     }
   } else if st is WhileStmt {
+    plScanStmt(st.whileCond, owner)
     plScanStmt(st.whileBody, st.whileBody)
   } else if st is ForRange {
     plRecordLoopVar(st.frVar, ix)
     let head = st.frTo
     if st.frFrom > head { head = st.frFrom }
     if st.frStep > head { head = st.frStep }
-    plRecordLoopExtent(st.frVar, head, st.frBody)
+    plRecordLoopExtent(st.frVar, plLoopLo(head, st.frBody), st.frBody, ix)
+    plScanStmt(st.frFrom, owner)
+    plScanStmt(st.frTo, owner)
+    plScanStmt(st.frStep, owner)
     plScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     plRecordLoopVar(st.fiVar, ix)
-    plRecordLoopExtent(st.fiVar, st.fiIter, st.fiBody)
+    const fiLo = plLoopLo(st.fiIter, st.fiBody)
+    plRecordLoopExtent(st.fiVar, fiLo, st.fiBody, ix)
     if st.fiVar2 != "" {
       plRecordLoopVar(st.fiVar2, ix)
-      plRecordLoopExtent(st.fiVar2, st.fiIter, st.fiBody)
+      plRecordLoopExtent(st.fiVar2, fiLo, st.fiBody, ix)
     }
+    plScanStmt(st.fiIter, owner)
     plScanStmt(st.fiBody, st.fiBody)
   } else if st is Block {
     const stmts = st.blkStmts
@@ -422,18 +559,75 @@ function plScanStmt(ix: i32, owner: i32) {
       plScanStmt(pstmts[pi], ix)
       pi = pi + 1
     }
+  } else if st is FuncDecl {
+    // A nested function or lambda is its own frame, scanned when its own body is asked about.
+  } else if st is Ident || st is NumLit || st is StrLit || st is BoolLit {
+    // A leaf, the commonest node: nothing below it to scan.
+  } else if st is BinExpr {
+    // Any other node is an expression, and one may hold a block (a value `if` arm, a `match`
+    // arm) whose bindings are this frame's locals (D2385). The frequent kinds walk in place.
+    plScanStmt(st.binLeft, owner)
+    plScanStmt(st.binRight, owner)
+  } else if st is Call {
+    plScanStmt(st.callFn, owner)
+    const args = st.callArgs
+    let ai = 0
+    while ai < args.length {
+      plScanStmt(args[ai], owner)
+      ai = ai + 1
+    }
+  } else if st is Member {
+    plScanStmt(st.memObj, owner)
+  } else {
+    const kids = nodeValueChildren(ix)
+    let ki = 0
+    while ki < kids.length {
+      plScanStmt(kids[ki], owner)
+      ki = ki + 1
+    }
   }
   0
 }
 
+// The lower bound of a loop's post-order scope: its header's last-built node, which precedes the
+// body, unless a rewrite replaced the header by a node appended past the body.
+function plLoopLo(head: i32, body: i32): i32 {
+  if head < body { return head }
+  plBodyLo(body)
+}
+
+// One below a loop body's first-built node: the post-order range's lower bound when a rewrite
+// has replaced the header by an appended node (D3139). The walk descends appended subtrees and
+// closures too, since an appended node never lowers the bound but may hold original ones.
+function plBodyLo(body: i32): i32 {
+  if body < 0 || body >= P.nodes.length { return body }
+  let lo = body
+  const stack: i32[] = [body]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      if ix < lo { lo = ix }
+      const kids = nodeChildren(ix)
+      let k = 0
+      while k < kids.length {
+        stack.push(kids[k])
+        k = k + 1
+      }
+    }
+  }
+  lo - 1
+}
+
 // Chains one loop variable's scope row onto its sid (`plLx*`).
-function plRecordLoopExtent(name: string, lo: i32, hi: i32) {
+function plRecordLoopExtent(name: string, lo: i32, hi: i32, loop: i32) {
   if name == "" { return 0 }
   const lsid = sidOf(name)
   plLxNext.push(sidArrGet(plLxHead, lsid))
   sidArrPut(plLxHead, lsid, plLxLo.length)
+  plLxSid.push(lsid)
   plLxLo.push(lo)
   plLxHi.push(hi)
+  plLxLoop.push(loop)
   0
 }
 
@@ -625,6 +819,22 @@ export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
   best
 }
 
+// Whether a module-scope block binding of `name` is in scope at `atIx` — bounds-checks even a
+// sole binding, unlike `moduleLocalLetOfAt`'s fast path; the module twin of `parentLetCoversAt`.
+export function moduleLocalLetCoversAt(
+  rootIx: i32,
+  name: string,
+  atIx: i32,
+): boolean {
+  if atIx < 0 { return false }
+  const first = moduleLocalLetOf(rootIx, name)
+  if first < 0 { return false }
+  if mllDup[name] != true {
+    return first < atIx && atIx <= (mllOwner[name] ?? -1)
+  }
+  moduleLocalLetOfAt(rootIx, name, atIx) >= 0
+}
+
 // Appends `name`'s bindings to `mllSort*` in index order and returns the slice start, or -2
 // when two of its blocks overlap without one nesting in the other. The arena is post-order,
 // so a binding's scope `(at, owner]` either nests in or is disjoint from each other's.
@@ -692,15 +902,19 @@ function mllSortFind(off: i32, cnt: i32, atIx: i32): i32 {
 // (D2316) — cleared here rather than generation-stamped per row, since it is a flat list a
 // stale entry could not be told apart from a fresh one within.
 function plBuildLetMap(blockIx: i32) {
+  // The two sid-indexed heads are cleared where the last build wrote them, not replaced: a
+  // fresh `[]` regrows to the program's sid count on every build.
+  plClearHeads(plLxHead, plLxSid)
+  plClearHeads(plMoreHead, plMoreSid)
   plLxLo = []
   plLxHi = []
+  plLxLoop = []
   plLxNext = []
-  plLxHead = []
+  plLxSid = []
   plMoreSid = []
   plMoreIx = []
   plMoreOwner = []
   plMoreNext = []
-  plMoreHead = []
   // `plSortedCand`/`plSortedOwner`/`plSortedSkip` are flat too (a stale slice cannot be told
   // apart from a fresh one within), while `plSortStart`/`plSortCount`/`plSortGen` are
   // sid-indexed and self-invalidate against `plGen` like `plSidGen`/`plDupGen` do.
@@ -710,9 +924,147 @@ function plBuildLetMap(blockIx: i32) {
   plScanStmt(blockIx, blockIx)
 }
 
+// Resets `heads[sids[k]]` to -1 for every row `k`.
+function plClearHeads(heads: i32[], sids: i32[]) {
+  let k = 0
+  while k < sids.length {
+    const sid = sids[k]
+    if sid >= 0 && sid < heads.length { heads[sid] = -1 }
+    k = k + 1
+  }
+  0
+}
+
+// The current plan's tables, to park.
+function plSave(): PlPlan {
+  const p: PlPlan = {
+    sidVal: plSidVal,
+    sidGen: plSidGen,
+    ownerVal: plOwnerVal,
+    dupGen: plDupGen,
+    moreSid: plMoreSid,
+    moreIx: plMoreIx,
+    moreOwner: plMoreOwner,
+    moreNext: plMoreNext,
+    moreHead: plMoreHead,
+    lxLo: plLxLo,
+    lxHi: plLxHi,
+    lxLoop: plLxLoop,
+    lxNext: plLxNext,
+    lxHead: plLxHead,
+    lxSid: plLxSid,
+    sortStart: plSortStart,
+    sortCount: plSortCount,
+    sortGen: plSortGen,
+    sortedCand: plSortedCand,
+    sortedOwner: plSortedOwner,
+    sortedSkip: plSortedSkip,
+    loopSidVal: plLoopSidVal,
+    loopSidGen: plLoopSidGen,
+  }
+  p
+}
+
+// Makes the parked plan `p` current.
+function plLoad(p: PlPlan) {
+  plSidVal = p.sidVal
+  plSidGen = p.sidGen
+  plOwnerVal = p.ownerVal
+  plDupGen = p.dupGen
+  plMoreSid = p.moreSid
+  plMoreIx = p.moreIx
+  plMoreOwner = p.moreOwner
+  plMoreNext = p.moreNext
+  plMoreHead = p.moreHead
+  plLxLo = p.lxLo
+  plLxHi = p.lxHi
+  plLxLoop = p.lxLoop
+  plLxNext = p.lxNext
+  plLxHead = p.lxHead
+  plLxSid = p.lxSid
+  plSortStart = p.sortStart
+  plSortCount = p.sortCount
+  plSortGen = p.sortGen
+  plSortedCand = p.sortedCand
+  plSortedOwner = p.sortedOwner
+  plSortedSkip = p.sortedSkip
+  plLoopSidVal = p.loopSidVal
+  plLoopSidGen = p.loopSidGen
+  0
+}
+
+// Makes `blockIx`'s plan current: already current, parked (loaded back), or built — into the
+// least recently used parked plan's tables once `PL_PARKED` are held, else into fresh ones.
+// The plan it replaces is parked first, most recent.
+function plEnsure(blockIx: i32) {
+  if blockIx == plCacheBlock { return 0 }
+  // No current plan (the first ask, or after a bust) — nothing to park, build in place.
+  if plCacheBlock < 0 {
+    plGenTop = plGenTop + 1
+    plGen = plGenTop
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+    return 0
+  }
+  const cur = plSave()
+  const curBlock = plCacheBlock
+  const curGen = plGen
+  let hit = -1
+  let i = 0
+  while i < plSavedBlock.length && hit < 0 {
+    if plSavedBlock[i] == blockIx { hit = i }
+    i = i + 1
+  }
+  // The slot the current plan is parked over: the hit, the oldest when full, else a new one.
+  let slot = hit
+  if slot < 0 {
+    if plSaved.length >= PL_PARKED {
+      slot = plSaved.length - 1
+      plLoad(plSaved[slot])
+    } else {
+      slot = plSaved.length
+      plSaved.push(cur)
+      plSavedBlock.push(-1)
+      plSavedGen.push(0)
+      plLxHead = []
+      plLxSid = []
+      plMoreHead = []
+      plMoreSid = []
+      plSidVal = []
+      plSidGen = []
+      plOwnerVal = []
+      plDupGen = []
+      plSortStart = []
+      plSortCount = []
+      plSortGen = []
+      plLoopSidVal = []
+      plLoopSidGen = []
+    }
+    plGenTop = plGenTop + 1
+    plGen = plGenTop
+    plBuildLetMap(blockIx)
+  } else {
+    plLoad(plSaved[hit])
+    plGen = plSavedGen[hit]
+  }
+  // Shift the entries before `slot` down one and park the old current plan at the front.
+  let j = slot
+  while j > 0 {
+    plSaved[j] = plSaved[j - 1]
+    plSavedBlock[j] = plSavedBlock[j - 1]
+    plSavedGen[j] = plSavedGen[j - 1]
+    j = j - 1
+  }
+  plSaved[0] = cur
+  plSavedBlock[0] = curBlock
+  plSavedGen[0] = curGen
+  plCacheBlock = blockIx
+  0
+}
+
 // Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
 // bodies — wasm locals are function-scoped). Returns its arena index or -1. Backed by the
-// single-entry per-block cache above (built on a miss, then O(1)).
+// per-block plan cache above (built on a miss, then O(1)).
 export function parentLetOf(blockIx: i32, name: string) {
   // `sidOf`, not `sidLookup`: this table is built lazily on the miss inside `parentLetOfSid`,
   // so a name interned only by that build would resolve to -1 for an id taken earlier —
@@ -726,11 +1078,7 @@ export function parentLetOf(blockIx: i32, name: string) {
 // unpositioned ones. A caller holding the identifier's arena index gets the sid from the carrier for free.
 export function parentLetOfSid(blockIx: i32, sid: i32) {
   if blockIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return -1 }
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   sidArrGet(plSidVal, sid)
@@ -748,6 +1096,22 @@ function plBuildSortedDup(sid: i32) {
     tmpCand.push(plMoreIx[i])
     tmpOwner.push(plMoreOwner[i])
     i = plMoreNext[i]
+  }
+  // Sorted DESCENDING by `cand`, which the stack below assumes: the walk records a binding
+  // before scanning its initializer, whose bindings are earlier in the post-order arena (D2385).
+  let si = 1
+  while si < tmpCand.length {
+    const c = tmpCand[si]
+    const o = tmpOwner[si]
+    let sj = si
+    while sj > 0 && tmpCand[sj - 1] < c {
+      tmpCand[sj] = tmpCand[sj - 1]
+      tmpOwner[sj] = tmpOwner[sj - 1]
+      sj = sj - 1
+    }
+    tmpCand[sj] = c
+    tmpOwner[sj] = o
+    si = si + 1
   }
   const start = plSortedCand.length
   const stack: i32[] = []
@@ -814,11 +1178,7 @@ function plBestDupAt(sid: i32, atIx: i32, first: i32, fOwner: i32): i32 {
 // name answers as `parentLetOfSid` does.
 export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
   if blockIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return -1 }
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   const first = sidArrGet(plSidVal, sid)
@@ -827,17 +1187,75 @@ export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
   plBestDupAt(sid, atIx, first, sidArrGet(plOwnerVal, sid))
 }
 
+// `parentLetReadAt`'s answer when the plan cannot place the read: a binding of `sid` lies past
+// the block's own arena index, spliced in by a pass after parsing, so no range speaks for it.
+export const PL_READ_UNPLACED = -2
+
+// The `LetDecl` a read of `sid` at node `atIx` denotes in the body block at `blockIx`, -1 when
+// the read denotes no body `let` (a parameter, a module global, a loop variable, a name bound
+// only in a block the read is outside), or `PL_READ_UNPLACED`. Unlike `parentLetOfAt`, a sole
+// binding must cover the read too, so a dead-scoped `let` never answers for an outer binding.
+export function parentLetReadAt(blockIx: i32, sid: i32, atIx: i32): i32 {
+  if blockIx < 0 || sid < 0 || atIx < 0 { return -1 }
+  if blockIx != plCacheBlock { plEnsure(blockIx) }
+  // `plSidVal` and `plOwnerVal` are written with `plSidGen`, so one bound serves all three.
+  if sid >= plSidGen.length || plSidGen[sid] != plGen { return -1 }
+  const first = plSidVal[sid]
+  if first > blockIx { return PL_READ_UNPLACED }
+  let li = -1
+  if sid >= plDupGen.length || plDupGen[sid] != plGen {
+    if first < atIx && atIx <= plOwnerVal[sid] { li = first }
+  } else {
+    if sidArrGet(plSortGen, sid) != plGen { plBuildSortedDup(sid) }
+    // The duplicates' largest index, off the slice sorted ascending once per plan.
+    const count = sidArrGet(plSortCount, sid)
+    if (
+      count > 0
+      && plSortedCand[sidArrGet(plSortStart, sid) + count - 1] > blockIx
+    ) {
+      return PL_READ_UNPLACED
+    }
+    li = plBestDupAt(sid, atIx, first, plOwnerVal[sid])
+  }
+  if li < 0 { return -1 }
+  // A loop variable between the `let` and the read shadows it.
+  if sid >= plLxHead.length || plLxHead[sid] < 0 { return li }
+  const lp = parentLoopAt(blockIx, sid, atIx)
+  if lp >= 0 && parentLoopAt(blockIx, sid, li) != lp { return -1 }
+  li
+}
+
+// The `LetDecl` of `sid` in the body block at `blockIx` written at source position `pos`, or -1:
+// the binding a rebuilt spine re-declared for its template's, which keeps the position.
+export function parentLetAtPos(blockIx: i32, sid: i32, pos: i32): i32 {
+  if blockIx < 0 || sid < 0 || pos < 0 { return -1 }
+  plEnsure(blockIx)
+  if sidArrGet(plSidGen, sid) != plGen { return -1 }
+  if plLetPosIs(sidArrGet(plSidVal, sid), pos) {
+    return sidArrGet(plSidVal, sid)
+  }
+  let i = sidArrGet(plMoreHead, sid)
+  while i >= 0 {
+    if plLetPosIs(plMoreIx[i], pos) { return plMoreIx[i] }
+    i = plMoreNext[i]
+  }
+  -1
+}
+
+function plLetPosIs(letIx: i32, pos: i32): boolean {
+  if letIx < 0 { return false }
+  const d = P.nodes[letIx]
+  if d is LetDecl { return d.pos == pos }
+  false
+}
+
 // Whether a function-scoped `LetDecl` of `sid` covers `atIx` — bounds-checks even a SOLE
 // binding, unlike `parentLetOfAt`'s fast path. A dedicated reader rather than a changed
 // `parentLetOfAt`: the CAPTURE channel re-asks the latter with an `atIx` its other callers
 // still need to trust unconditionally (D2325).
 export function parentLetCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
   if blockIx < 0 { return false }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return false }
   if atIx < 0 { return false }
   if sidArrGet(plSidGen, sid) != plGen { return false }
@@ -849,42 +1267,161 @@ export function parentLetCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
 }
 
 // Whether the `LetDecl` at `letIx`, a binding of `sid` in the body block at `blockIx`, is a
-// direct statement of that block rather than of a block nested in it — read off the scan's
-// owner column, so the answer costs the bindings of `sid`, not the block's statements.
+// direct statement of that block rather than of a block nested in it.
 export function parentLetOwnedBy(blockIx: i32, sid: i32, letIx: i32): boolean {
-  if blockIx < 0 || sid < 0 || letIx < 0 { return false }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
-  if sidArrGet(plSidGen, sid) != plGen { return false }
-  if sidArrGet(plSidVal, sid) == letIx {
-    return sidArrGet(plOwnerVal, sid) == blockIx
-  }
+  if blockIx < 0 { return false }
+  parentLetOwnerOf(blockIx, sid, letIx) == blockIx
+}
+
+// The block that directly holds the `LetDecl` at `letIx`, a binding of `sid` somewhere in the
+// body block at `blockIx`, or -1 when it is not one — read off the scan's owner column, so
+// the answer costs the bindings of `sid`, not the block's statements.
+export function parentLetOwnerOf(blockIx: i32, sid: i32, letIx: i32): i32 {
+  if blockIx < 0 || sid < 0 || letIx < 0 { return -1 }
+  plEnsure(blockIx)
+  if sidArrGet(plSidGen, sid) != plGen { return -1 }
+  if sidArrGet(plSidVal, sid) == letIx { return sidArrGet(plOwnerVal, sid) }
   let i = sidArrGet(plMoreHead, sid)
   while i >= 0 {
-    if plMoreIx[i] == letIx { return plMoreOwner[i] == blockIx }
+    if plMoreIx[i] == letIx { return plMoreOwner[i] }
     i = plMoreNext[i]
   }
-  false
+  -1
 }
 
 // Whether a `for` variable of `sid` in the body block at `blockIx` is in scope at `atIx` —
 // the loop-variable twin of `parentLetCoversAt`, walking only `sid`'s own rows.
 export function parentLoopCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
   if blockIx < 0 || sid < 0 || atIx < 0 { return false }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   let i = sidArrGet(plLxHead, sid)
   while i >= 0 {
     if plLxLo[i] < atIx && atIx <= plLxHi[i] { return true }
     i = plLxNext[i]
   }
   false
+}
+
+// The innermost `for` loop of `sid` in the body block at `blockIx` whose variable is in scope
+// at `atIx`, or -1: `parentLoopCoversAt` naming the loop, off the same rows. Innermost is the
+// highest header, the arena being post-order. A long chain is binary searched (`plLxIndexOf`).
+export function parentLoopAt(blockIx: i32, sid: i32, atIx: i32): i32 {
+  if blockIx < 0 || sid < 0 || atIx < 0 { return -1 }
+  plEnsure(blockIx)
+  let n = 0
+  let c = sidArrGet(plLxHead, sid)
+  while c >= 0 && n <= PL_LX_SCAN {
+    n = n + 1
+    c = plLxNext[c]
+  }
+  if n > PL_LX_SCAN { return plLxIndexedAt(plLxIndexOf(sid), atIx) }
+  let best = -1
+  let bestLo = -1
+  let i = sidArrGet(plLxHead, sid)
+  while i >= 0 {
+    if plLxLo[i] < atIx && atIx <= plLxHi[i] && plLxLo[i] > bestLo {
+      best = plLxLoop[i]
+      bestLo = plLxLo[i]
+    }
+    i = plLxNext[i]
+  }
+  best
+}
+
+// The chain length up to which `parentLoopAt` scans a sid's loop rows rather than indexing them.
+const PL_LX_SCAN = 8
+
+// One sid's loop rows sorted by header (`plLxIdxLo`) with each row's innermost enclosing row of
+// the same sid (`plLxIdxUp`), keyed by sid and valid while its build's `plGen` is current,
+// which names one block's plan: generations are never reissued within a program.
+let plLxIdxKey: {[i32]: i32} = Map()
+let plLxIdxGen: i32[] = []
+let plLxIdxLo: i32[][] = []
+let plLxIdxHi: i32[][] = []
+let plLxIdxLoop: i32[][] = []
+let plLxIdxUp: i32[][] = []
+
+// The index entry of `sid`'s rows in the current plan, built on first need.
+function plLxIndexOf(sid: i32): i32 {
+  let e = plLxIdxKey.get(sid) ?? -1
+  if e >= 0 && plLxIdxGen[e] == plGen { return e }
+  const rows: i32[] = []
+  let i = sidArrGet(plLxHead, sid)
+  while i >= 0 {
+    rows.push(i)
+    i = plLxNext[i]
+  }
+  // Insertion by header: the chain is pushed in scan order, which is nearly always ascending.
+  const lo: i32[] = []
+  const hi: i32[] = []
+  const lp: i32[] = []
+  let r = rows.length - 1
+  while r >= 0 {
+    const row = rows[r]
+    let at = lo.length
+    lo.push(0)
+    hi.push(0)
+    lp.push(0)
+    while at > 0 && lo[at - 1] > plLxLo[row] {
+      lo[at] = lo[at - 1]
+      hi[at] = hi[at - 1]
+      lp[at] = lp[at - 1]
+      at = at - 1
+    }
+    lo[at] = plLxLo[row]
+    hi[at] = plLxHi[row]
+    lp[at] = plLxLoop[row]
+    r = r - 1
+  }
+  // Ranges of one tree nest or are disjoint, so a stack of open ranges names each one's parent.
+  const up: i32[] = []
+  const open: i32[] = []
+  let k = 0
+  while k < lo.length {
+    while open.length > 0 && hi[open[open.length - 1]] < lo[k] { open.pop() }
+    if open.length > 0 {
+      up.push(open[open.length - 1])
+    } else {
+      up.push(0 - 1)
+    }
+    open.push(k)
+    k = k + 1
+  }
+  if e < 0 {
+    e = plLxIdxGen.length
+    plLxIdxGen.push(plGen)
+    plLxIdxLo.push(lo)
+    plLxIdxHi.push(hi)
+    plLxIdxLoop.push(lp)
+    plLxIdxUp.push(up)
+    plLxIdxKey.set(sid, e)
+    return e
+  }
+  plLxIdxGen[e] = plGen
+  plLxIdxLo[e] = lo
+  plLxIdxHi[e] = hi
+  plLxIdxLoop[e] = lp
+  plLxIdxUp[e] = up
+  e
+}
+
+// `parentLoopAt` over index entry `e`: the last header before `atIx`, then outward to the first
+// row whose body still holds it.
+function plLxIndexedAt(e: i32, atIx: i32): i32 {
+  if e < 0 || e >= plLxIdxLo.length { return -1 }
+  const lo = plLxIdxLo[e]
+  let a = 0
+  let b = lo.length
+  while a < b {
+    const m = (a + b) / 2
+    if lo[m] < atIx { a = m + 1 } else { b = m }
+  }
+  let p = a - 1
+  while p >= 0 {
+    if atIx <= plLxIdxHi[e][p] { return plLxIdxLoop[e][p] }
+    p = plLxIdxUp[e][p]
+  }
+  -1
 }
 
 // Finds the `for` loop variable named `name` anywhere in the body block at `blockIx` — the
@@ -899,11 +1436,7 @@ export function parentLoopVarOf(blockIx: i32, name: string) {
 // table under one generation, so either lookup builds both).
 function parentLoopVarOfSid(blockIx: i32, sid: i32) {
   if blockIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return -1 }
   if sidArrGet(plLoopSidGen, sid) != plGen { return -1 }
   sidArrGet(plLoopSidVal, sid)
@@ -1230,6 +1763,59 @@ export function objFieldSrcOrder(
   }
   ord
 }
+// `objIx`'s initialisers in source order as (layout slot, initialiser) pairs over the same span
+// `objFieldSrcOrder` reads. An initialiser whose name the layout lacks (a field the shape it
+// flows into drops, D1696) pairs with -1 and still runs, for its effect alone.
+export function objFieldSrcPairs(
+  objIx: i32,
+  names: string[],
+  start: i32,
+  cnt: i32,
+): i32[] {
+  const out: i32[] = []
+  const o = P.nodes[objIx]
+  if o is ObjLit {
+    for fx in o.objFields {
+      const f = P.nodes[fx]
+      if f is FieldInit {
+        let slot = -1
+        let k = 0
+        while k < cnt && slot < 0 {
+          if names[start + k] == f.fiName { slot = k }
+          k = k + 1
+        }
+        out.push(slot)
+        out.push(f.fiValue)
+      }
+    }
+  }
+  out
+}
+// Whether the literal at `objIx` sets a name the layout span lacks, a field the shape it is
+// built at drops; its initialiser still has to run.
+export function objLitDropsField(
+  objIx: i32,
+  names: string[],
+  start: i32,
+  cnt: i32,
+): boolean {
+  const o = P.nodes[objIx]
+  if o is ObjLit {
+    for fx in o.objFields {
+      const f = P.nodes[fx]
+      if f is FieldInit {
+        let lay = false
+        let k = 0
+        while k < cnt && !lay {
+          if names[start + k] == f.fiName { lay = true }
+          k = k + 1
+        }
+        if !lay { return true }
+      }
+    }
+  }
+  false
+}
 // True when the object literal at `objIx` must evaluate its initialisers into scratch
 // locals before it constructs. `struct.new` takes operands in layout order — sorted by
 // field name (D622) — so a literal written in any other order runs them permuted unless
@@ -1520,6 +2106,86 @@ export function strToCps(s: string) {
   const out: i32[] = []
   for cp in s { out.push(cp) }
   out
+}
+
+// A lexeme at least this long decodes piece by piece in `litUtf8`.
+export const LIT_PIECE = 1048576
+
+// Appends the UTF-8 bytes lexeme `lex` denotes, `cpsToUtf8(decodeStr(strToCps(lex)))`, to `out`
+// as parts of its own and returns their count, decoding pieces of about `LIT_PIECE` code points so
+// no `i32[]` outgrows its size cap (D1977). A piece ends only where no escape is open: before an
+// escape's backslash, or 16 code points past the last one where the previous is not whitespace.
+export function litUtf8(lex: string, out: { b: u8[] }[]): i32 {
+  const first = out.length
+  out.push({ b: [] }) // this literal's first part, so no byte lands in an earlier one
+  let piece: i32[] = []
+  let lastBs = -1
+  let prevBs = false
+  let run = 0
+  for cp in lex {
+    if run == 1 && cp == 10 {
+      run = 2
+      piece.push(cp)
+    } else if run > 0 && (cp == 32 || cp == 9) {
+      // A line continuation's indentation, which `decodeStr` drops: left out of the piece, so
+      // a run of any length cannot keep a piece from ending.
+      run = 2
+    } else {
+      run = 0
+      const n = piece.length
+      const opens = cp == 92 && !prevBs
+      if n >= LIT_PIECE && litPieceEnds(piece, lastBs, opens) {
+        piece.push(34) // the closing delimiter `decodeStr` strips
+        litPieceFlush(piece, out)
+        piece = [34]
+        lastBs = -1
+      }
+      if prevBs && (cp == 10 || cp == 13) { run = litRunAfter(cp) }
+      if opens { lastBs = piece.length }
+      prevBs = opens
+      piece.push(cp)
+    }
+  }
+  litPieceFlush(piece, out)
+  let n = 0
+  let k = first
+  while k < out.length {
+    n = n + out[k].b.length
+    k = k + 1
+  }
+  n
+}
+
+// The continuation state after an escape's newline `cp`: 1 when a `\r` may still take one
+// `\n`, else 2, inside the indentation run.
+function litRunAfter(cp: i32): i32 {
+  if cp == 13 { return 1 }
+  2
+}
+
+// Whether a piece may end before a code point that `opens` an escape or not, given the index
+// of the piece's last escape-opening backslash (-1 for none).
+function litPieceEnds(piece: i32[], lastBs: i32, opens: boolean): boolean {
+  if opens || lastBs < 0 { return true }
+  const n = piece.length
+  if n - lastBs <= 16 { return false }
+  const p = piece[n - 1]
+  p != 32 && p != 9 && p != 10 && p != 13
+}
+
+// A literal's bytes are kept in parts of at most this many, so no one `u8[]` holds them all.
+export const LIT_PART = 16777216
+
+// Decode one delimited piece and append the bytes it encodes to the parts `out`.
+function litPieceFlush(piece: i32[], out: { b: u8[] }[]) {
+  const bytes = cpsToUtf8(decodeStr(piece))
+  let i = 0
+  while i < bytes.length {
+    if out[out.length - 1].b.length >= LIT_PART { out.push({ b: [] }) }
+    out[out.length - 1].b.push(bytes[i])
+    i = i + 1
+  }
+  0
 }
 // UTF-8-encodes a code-point vector into the byte vector a Stage 2c string literal is built
 // from — the inverse of `strToCps` plus the decode `for cp in s` lowers to. A code point
@@ -1953,6 +2619,47 @@ export function retStrArrFlag(tyIx: i32) {
 // function body it builds chunked (`array.new_default` plus per-chunk `array.new_fixed`/
 // `array.copy`), and a global initializer holding one routes through the start function instead (a wasm constant expression has no locals to chunk through).
 export const NEW_FIXED_MAX = 10000
+
+// A string or ref literal longer than this builds in chunks of this many: an engine compiles one
+// `array.new_fixed` over n operands that allocate in time and memory super-linear in n, and a
+// global's constant initializer is such a function too, so it moves to the start function (D3462).
+export const ALLOC_LIT_CHUNK = 256
+
+// Whether the array literal at `ix` builds a plain scalar backing: every element a number or
+// boolean literal, and the checker's element type a bare primitive.
+function arrLitBuildsScalar(ix: i32): boolean {
+  if !arrTyElemIsPrim(nodeTyIxOf(ix)) { return false }
+  const a = P.nodes[ix]
+  if a is ArrayLit {
+    let i = 0
+    while i < a.arrElems.length {
+      if !arrLitElemIsScalarLit(a.arrElems[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether arena type `ty` is an array of a bare primitive: a literal-union or nullable element
+// boxes or niches, and the checker records the destination's element on the literal.
+function arrTyElemIsPrim(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return false }
+    return T.tys[t.aElem] is TyPrim
+  }
+  false
+}
+
+function arrLitElemIsScalarLit(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is NumLit { return true }
+  e is BoolLit
+}
+
 // Whether the initializer expression at `exprIx` is a valid WasmGC constant expression — the
 // forms `emitProgram` lowers inline in the global section. Const: literals, an `ArrayLit`/
 // `ObjLit` whose parts are all const, and a `Paren` wrapping one; a literal past the operand
@@ -1967,6 +2674,9 @@ export function isConstInit(exprIx: i32) {
   if e is Paren { return isConstInit(e.parInner) }
   if e is ArrayLit {
     if e.arrElems.length > NEW_FIXED_MAX { return false }
+    if e.arrElems.length > ALLOC_LIT_CHUNK && !arrLitBuildsScalar(exprIx) {
+      return false
+    }
     let i = 0
     while i < e.arrElems.length {
       if !isConstInit(e.arrElems[i]) { return false }
@@ -2104,14 +2814,23 @@ export function nameIsI32KeyedMap(name: string) {
   // `mapKeyRepTy` — the checker's own answer, which the arena legs project — says i32 (D1748).
   nameIsI32HashedLitUnion(k)
 }
+// The key kind (`typecheck.mapKeyKindOfTy`) the map spelling `name` carries, cut as
+// `nameIsI32KeyedMap` cuts it.
+export function mapNameKeyKind(name: string): i32 {
+  if nameIsI32KeyedMap(name) { return MAP_KEY_I32 }
+  const k = mapSpellKeyName(name)
+  if k == "i64" || nameIsI64HashedKey(k) { return MAP_KEY_I64 }
+  MAP_KEY_STR
+}
 // Folds a map shape to the flavor-blind twin every op that does not care about set-ness wants:
-// the set sentinel to its map sibling (-2 → -1 string-keyed, -5 → -4 i32-keyed) and the
+// the set sentinel to its map sibling (-2 → -1 string, -5 → -4 i32, -7 → -6 i64 keys) and the
 // unsupported sentinel to the mono map. The key half of the vocabulary survives the fold —
-// that is the whole point of the two disjoint pairs.
+// that is the whole point of the disjoint pairs.
 export function mapShapeFoldSet(sh: i32) {
   if sh == -2 { return -1 }
   if sh == -3 { return -1 }
   if sh == -5 { return -4 }
+  if sh == -7 { return -6 }
   sh
 }
 // True if the type-annotation node at `tyIx` is a nullable bare map (`{[string]: V} | null`) —
@@ -2891,27 +3610,6 @@ export function tyIsFuncType(tyIx: i32) {
   if nodeTyIxOf(tyIx) >= 0 { return nodeTyIsFunc(tyIx) }
   false
 }
-// True if `s` contains the substring `sub`.
-export function strContains(s: string, sub: string) {
-  if sub.length == 0 { return true }
-  if sub.length > s.length { return false }
-  let i = 0
-  while i + sub.length <= s.length {
-    let j = 0
-    let ok = true
-    while j < sub.length {
-      if s[i + j] != sub[j] {
-        ok = false
-        j = sub.length
-      } else {
-        j = j + 1
-      }
-    }
-    if ok { return true }
-    i = i + 1
-  }
-  false
-}
 // Is the FuncDecl at arena index `fnIx` generic — explicit `<T>` params, or any
 // un-annotated parameter (a per-callsite inference hole)?
 export function monoIsGenericDecl(fnIx: i32) {
@@ -3215,6 +3913,132 @@ export function monoSubstAnn(
   }
   ann
 }
+// The index of the one atom of union pattern `pats` that names a type parameter, or -1 when
+// none or several do.
+function monoUnionOpenAtom(pats: string[], typarams: string[]): i32 {
+  let open = -1
+  let i = 0
+  while i < pats.length {
+    if monoAnnHasTyParam(pats[i], typarams) {
+      if open >= 0 { return -1 }
+      open = i
+    }
+    i = i + 1
+  }
+  open
+}
+
+// Whether pairing `pats` with `acts` by position meets every concrete pattern atom with itself.
+function monoUnionPairsAlign(
+  pats: string[],
+  acts: string[],
+  open: i32,
+): boolean {
+  if pats.length != acts.length { return false }
+  let i = 0
+  while i < pats.length {
+    if i != open && normTypeAtom(pats[i]) != normTypeAtom(acts[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether annotation `pat` is a union with one type-parameter atom and a concrete atom besides
+// `null`. Its binding yields to every other parameter's, since the checker binds a type
+// parameter from a nullable (`T | null`) in order but from such a union not at all.
+export function monoAnnIsOpenUnion(pat: string, typarams: string[]): boolean {
+  if unionMemberCount(pat) < 2 { return false }
+  const pats: string[] = []
+  splitUnionAtoms(pat, pats)
+  const open = monoUnionOpenAtom(pats, typarams)
+  if open < 0 { return false }
+  let i = 0
+  while i < pats.length {
+    if i != open && normTypeAtom(pats[i]) != "null" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether every atom of argument `actual` is a concrete atom of union annotation `pat`, so its
+// one type-parameter atom is left free (`T | null` at `null`) and should bind elsewhere first.
+export function monoUnionLeavesOpenFree(
+  pat: string,
+  actual: string,
+  typarams: string[],
+): boolean {
+  if unionMemberCount(pat) < 2 { return false }
+  const pats: string[] = []
+  splitUnionAtoms(pat, pats)
+  const open = monoUnionOpenAtom(pats, typarams)
+  if open < 0 { return false }
+  const acts: string[] = []
+  splitUnionAtoms(actual, acts)
+  let i = 0
+  while i < acts.length {
+    let covered = false
+    let j = 0
+    while j < pats.length && !covered {
+      if j != open && normTypeAtom(pats[j]) == normTypeAtom(acts[i]) {
+        covered = true
+      }
+      j = j + 1
+    }
+    if !covered { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The union spelling of `atoms`, in their order.
+function joinUnionAtoms(atoms: string[]): string {
+  let out = ""
+  let i = 0
+  while i < atoms.length {
+    if i > 0 { out = out + "|" }
+    out = out + atoms[i]
+    i = i + 1
+  }
+  out
+}
+
+// Binds the open atom of union pattern `pats` to the atoms of `acts` that no concrete atom of
+// the pattern names, in their own order (`string | T` at `M | null` binds `T` to `M|null`).
+function monoBindUnionRest(
+  pats: string[],
+  acts: string[],
+  open: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  let rest = ""
+  let n = 0
+  let i = 0
+  while i < acts.length {
+    let covered = false
+    let j = 0
+    while j < pats.length && !covered {
+      if j != open && normTypeAtom(pats[j]) == normTypeAtom(acts[i]) {
+        covered = true
+      }
+      j = j + 1
+    }
+    if !covered {
+      if n > 0 { rest = rest + "|" }
+      rest = rest + acts[i]
+      n = n + 1
+    }
+    i = i + 1
+  }
+  // The argument is all concrete members (`f("s")` at `T | string`): `T` is otherwise free, and
+  // the argument's own spelling is a binding the substitution reproduces.
+  if n == 0 { rest = joinUnionAtoms(acts) }
+  monoBindFromAnn(pats[open], rest, typarams, tvN, tvV)
+}
+
 // Bind type params by matching a parameter's annotation PATTERN against the
 // argument's concrete type name: `T` against anything, `T[]` against `X[]`,
 // `Box<T>` against `Box<i32>` (same head, pairwise arguments). First use wins.
@@ -3254,6 +4078,10 @@ export function monoBindFromAnn(
     splitUnionAtoms(pat, puatoms)
     const auatoms: string[] = []
     splitUnionAtoms(actual, auatoms)
+    const open = monoUnionOpenAtom(puatoms, typarams)
+    if open >= 0 && !monoUnionPairsAlign(puatoms, auatoms, open) {
+      return monoBindUnionRest(puatoms, auatoms, open, typarams, tvN, tvV)
+    }
     if puatoms.length == auatoms.length {
       let ui = 0
       while ui < puatoms.length {
@@ -3370,4 +4198,20 @@ export function drwDispatchOp(op: string) {
   if op == "==" || op == "!=" { return false }
   if op == "&&" || op == "||" || op == "??" { return false }
   true
+}
+
+// The map shape of a set type: `-5` for an i32-keyed set, `-7` for an i64-keyed one, `-2` for a
+// string-keyed one, `0` when
+// `ty` is not a set (a map, a hole, or no type). The set flavor is the arena's `mSet` bit.
+export function setShapeOfTy(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyMap {
+    if t.mSet != 1 { return 0 }
+    const kk = mapKeyKindOfTy(t.mKey)
+    if kk == MAP_KEY_I32 { return -5 }
+    if kk == MAP_KEY_I64 { return -7 }
+    return -2
+  }
+  0
 }

@@ -18,6 +18,25 @@ command loop the same way it covers `build`'s single `compileSrc`. Profile the c
 actually mean — `vl build` is a poor proxy for `vl check`, which runs the LINT that `build`
 never reaches (0.12 vs 0.84 CPU-s on one 17,600-line file).
 
+**ALLOCATION, NOT TIME: `VL_PROFILE_GUEST_ALLOC=1`.** The host then weights each sample by the
+bytes its resident set grew since the previous one. Under the null collector, which never frees,
+that growth is what the compiler allocated, so `profile-rank.py <p.json> 30 --alloc` ranks
+functions by bytes. Read the INCL column: a sample's leaf is whatever ran when the epoch ticked,
+which is not always the allocator. Under `VL_FUEL=1`, `vl build` also prints `[alloc] guest:
+<bytes>`, the resident growth across the compile call, and `tests/vl_scaling_shape_test.ts`
+grades it under `VL_COMPILE_GC=null`. The default compile collector is COPYING (since
+2026-10-07), so an allocation profile or `[alloc]` reading needs `VL_COMPILE_GC=null` set
+by hand; under copying the resident set stops growing once the heap is sized. Under null
+everything a compile allocates counts against one 4 GiB heap, and sunpa's `game.vl` filled it
+(D3737). A table reset per function and regrown to the program's size costs the heap its full
+size each time, even where it costs little fuel.
+
+**WHICH COLLECTOR, AND WHAT IT COSTS.** `vl build` and `vl run` compile under the copying
+collector from a 256 MiB first heap; `VL_COMPILE_GC=null` and `=copying` are the overrides,
+`VL_COMPILE_GC_HEAP` sets the first heap, and `VL_GC_STATS=1` prints the collection count and
+the peak live set. The self-compile scripts pin null, which is ~10% faster there. Measurements
+and the options declined: DECISIONS.md, "The compiler's collector is copying by default".
+
 Notes, each of which cost something to learn:
 
 * **`vl run` profiles the COMPILE, not the program it emitted.** The user program runs on a
@@ -325,20 +344,122 @@ interleaved, master host + seed against this branch): `chunk_335` 12.8 → 3.7 s
 leaves are inlined. The pass-list rule and its runtime price: DECISIONS.md, "`-O` skips
 `ssa-nomerge` for a function over 8,192 sets".
 
+## Measured 2026-09-25 — the plumb-shape fuel drift, merge by merge
+
+The baseline was written at `b79b09c95`, #3119's branch head on top of #3116, so #3117 and #3118
+landed underneath it and #3119's own saving was already in it. By `039fd6832`
+the fuel read +3.69% on the main unit and +4.60% on the tail unit, against a +5% bar. A fixpoint
+seed was built for every first-parent merge that touched `compiler/` (docs-only merges cost
+nothing) and fuelled with no `wasm-opt`. The steps of at least 0.1% on either unit:
+
+| merge | main | tail | what it added |
+| --- | ---: | ---: | --- |
+| #3117 | +0.24% | +0.25% | a `Spread` arm in ~20 tree walkers, each asked at every node |
+| #3118 | +0.18% | +0.12% | closures capture by reference |
+| #3119 | −0.15% | −0.19% | D2335/D2336, the saving the baseline already held |
+| #3121 | +0.14% | +0.16% | the atomics intrinsic table |
+| #3123 | +0.23% | +0.23% | `foldMemShared`, an arena pass with nothing to fold (recovered) |
+| #3126 | +0.10% | +0.10% | memarg offsets |
+| #3134 | −0.84% | −0.83% | i32-keyed maps probe a pair index: the compiler's own maps got cheaper |
+| #3135 | +0.33% | +0.23% | a call is not classified by a same-named function off its scope chain |
+| #3136 | +1.35% | +1.10% | the union member-set ladder resolves sibling blocks by position |
+| #3141 | +0.50% | +0.50% | `minMaxKind` asked first by `exprIsI64`/`F32`/`F64`, two string compares per call (recovered) |
+| #3146 | −0.73% | +0.19% | indexed `fnStmtsPosOf` |
+| #3145 | +1.18% | +1.16% | a call ends a narrowing: a bank lookup per statement per walk (recovered) |
+| #3148 | +0.02% | +0.37% | name shadowing at closed and expression blocks |
+| #3147 | +0.11% | +0.11% | named arguments |
+| #3155 | +0.27% | +0.27% | written type arguments: an arena pass and a list per call (recovered) |
+| #3167 | +0.10% | +0.10% | map-valued maps and friends |
+
+The seed cached in `~/.claude/vl-tools/bisect-seeds/` under `30461f099` fuelled 0.8% above a
+fresh fixpoint of that commit; the other six cached seeds matched theirs. Rebuild a seed before
+attributing a step to it.
+
+**Recovered, byte-identical** (self-compile and all 3,721 `tests/cases` programs, wasm and
+diagnostics, against the master seed): an empty retirement bank answers without a map probe;
+`callIsIntrMinMax` tests the name's length before comparing; `annotateTyArgLambdas` and the
+checker's per-call questions skip when no call wrote a type argument; `foldMemShared` returns
+with no `__memory_shared__()` call. Those four took back 1.0 point. The fifth was older than
+the drift: `capNarrowBuild` walked every top-level frame with the narrowing stack live, running
+the condition, post-guard and retirement classifiers at every statement, to bank the narrowing
+at nested functions — and a frame with no nested function banks nothing. `cnWalkFrame` now asks
+`subtreeHasFuncDecl` first, in the two walks that bank nothing for the frame itself: a
+parentless frame that is not a top-level function, and a top-level function recorded under no
+live module narrowing. A top-level function under a live module narrowing is still walked,
+since that walk is its own record (D2555). That took 3.8 points, and 3–5% of the guest fuel on
+plumb's own `chunk_334`, `chunk_525` and `chunk_179` with identical output. Net against the old
+baseline, on #3169's master: main −1.22%, tail −0.45%.
+
+What remains of the drift is capability: #3136 (+1.1–1.35%) is the positional resolution D2326
+needed for correctness, and its ladder (`unionNameOfIdentAt` into `letUnionNameOf`) is ~8% of
+the tail unit's profile, the largest piece left.
+
+## Measured 2026-09-26 — what a "redundant" annotation was paying for (D2685–D2688)
+
+The third code-quality survey deleted the checker's `redundant-type` spans outside the hot
+files (432 on this tree) and got a byte-identical seed whose self-compile cost **88.18G** fuel
+against **51.68G** for master's source. Byte identity cannot see work. `VL_FUEL=1` on one
+file at a time put almost all of it in `ast.vl`'s 23 `const out: i32[] = [...]`, and the
+`--names` profile put 23% of the build in `fnParamKindListSlot`: an un-annotated list
+literal's destination scan knew a function body as its scope only for the FIRST binding of
+its name, so every later sibling-block `const out` walked the whole arena (D2685). Rooting
+that walk at the block holding the binding, plus stopping the hint recorder's `=` scan at
+the `=` (D2686, which had made the ANNOTATED spelling quadratic too), gives:
+
+| source, seed | fuel |
+| --- | ---: |
+| master's, master | 51.68G |
+| annotations stripped, master | 88.18G |
+| master's, after | 50.25G |
+| annotations stripped, after | 51.15G |
+
+Both after-builds reproduce master's seed byte for byte. The remaining +0.9G is inferred
+returns and shared names, filed with their own ladders as D2687 (a single-entry let-plan
+cache evicted by each call to an inferred-return callee) and D2688 (an occurrence chain
+per name, not per name and frame). Ladders are fuel, one build each, from generated
+programs whose one knob is the entity count; a quadratic reads ~4x per doubling.
+
+**That attribution was a prediction, and closing both rows refuted it.** D2687 now parks up to
+three built let plans beside the current one, and D2688 chains the occurrence index per (name,
+frame); both ladders are linear (the rows carry them). On the self-compile, re-measured on
+`fdd0050af` with the #3196 recipe (441 spans stripped on that tree):
+
+| source, seed | fuel |
+| --- | ---: |
+| master's, master | 50.67G |
+| annotations stripped, master | 51.65G |
+| master's, after D2687 + D2688 | 50.54G |
+| annotations stripped, after D2687 + D2688 | 51.51G |
+
+All four reproduce master's seed byte for byte. The stripped source still costs +0.97G, so the
+residual is neither row. Stripping one file at a time (master's source otherwise, the after
+seed) spreads it: `emit_rep` +397M, `ast` +347M, `emit_rewrite` +239M, `tyname` +197M,
+`lexer` +155M, the other 17 files under 120M each. And inside `emit_rep` it is not per
+annotation: any ONE of twelve stripped returns costs 86–99M alone, all twelve together 115M,
+so the first inferred return in a file pays a fixed cost of about one pass over something
+large. A sampled profile of that difference is diffuse (`__str_eq__`, `__map_probe__`, no
+function above noise), and a chain of inferred returns declared callee-last is linear
+(40.6M / 80.8M / 167.6M at 100 / 200 / 400), so it is not `computeRetInference`'s fixpoint
+rounds either. The mechanism is open.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
 
 * **`tests/vl_scaling_shape_test.ts`** — nine pairs, the same work reshaped along one axis
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
-  covariant bindings),
-  graded on the ratio of the two arms' CPU (user+sys) so machine speed and box load cancel.
-  **The ratio has to be of CPU, because `gate.sh`'s fan-out is not a uniform slowdown**: the
-  two arms run at different moments and a burst inflates whichever one it lands on. Measured
-  2026-09-05 over three fanned-out gate runs, the `functions` pair's WALL ratio read
-  2.95 / 3.34 / 4.51 against a bar of 2.5 while its CPU ratio read 1.14 / 1.18 / 1.19 — the
-  row had gone red on three unrelated PRs that way. A tenth case is the family's own CONTROL,
-  a pair that MUST red: one source with one literal changed, the many arm running its inner
+  covariant bindings; later pairs include calls to inferred-return callees and a list name
+  shared across functions),
+  graded on the ratio of the two arms' guest FUEL (`$VL_FUEL=1`), a count of guest
+  instructions that box load cannot move. **It was CPU, and CPU was not enough**: a ratio of
+  CPU cancels a uniform slowdown, and `gate.sh`'s fan-out delivers bursts that land on one
+  arm. `functions` once read 2.95–4.51 on WALL against a bar of 2.5, and on 2026-09-27 `reads
+  after many closed sibling shadows` read 1.13–2.75 on CPU against the same bar while its
+  fuel ratio was 2.708 on every run, loaded or idle. A compile bar is now the default 2.5, or
+  1.25× the axis's fuel ratio where that is higher. The three RUNTIME pairs (string appends)
+  stay on CPU, since fuel meters only the compiler. Two CONTROLS must red, one per grader: the
+  fuel one compiles 20× the statements against 1× (reads 19.9), and the CPU one is a pair
+  whose many arm runs its inner
   loop n times per outer step against the one arm's once, so the quadratic is the PROGRAM's
   own algorithm and no compiler improvement can retire it. **That is deliberate** — the
   control was first built on a compiler gap (a struct-field string accumulator, which the
@@ -359,11 +480,16 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   It is a REVIEW aid and not a proof: every one of D1514's twenty-five scans was reported here
   and carried in the baseline, so the count falling is what a fix looks like, not what a
   regression is caught by.
-* **`scripts/self-compile-time.sh`** — the candidate compiling the compiler, in CPU seconds
-  against `scripts/self-compile-baseline.json` (6.3 s idle), tripping past 4×. Fires when the
-  other two missed it. HALF the factor pays for contention — the same build reads 12.2–12.7 s
-  inside a fanned-out `gate.sh` at load 164 — which is why the band is not 2×. It says only
-  that the bootstrap got dearer; the shape family says where.
+* **`scripts/self-compile-time.sh`** — the candidate compiling the compiler, in guest FUEL
+  against `scripts/self-compile-baseline.json`, tripping past 1.5×. Fires when the other two
+  missed it. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
+  for contention, and it still flaked: docs-only PRs whose seed WAS master's fixpoint read
+  26.8 s and 27.6 s at load 40–50 against a 25.2 s line. Fuel is identical run to run, so the
+  factor now pays only for the compiler growing between re-baselines. The line is coarse: one
+  injected whole-arena scan per emitted function (a quarter of them) read +57% and red, while
+  a weaker injection read +34% and passed — as it also would have on the CPU row. It catches
+  the D1090 class, a many-fold blowup; the shape family is what sees a smaller multiplier, and
+  says where.
 * **`scripts/plumb-shape-cost.py`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that

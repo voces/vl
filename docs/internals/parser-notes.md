@@ -39,7 +39,10 @@ AST defined in `compiler/ast.vl`. Grammar covered:
   type       := IDENT                       (a single type-name annotation)
   expr       := assignment (precedence climbing, right-assoc "=")
   unary      := ("!" | "-" | "~") unary | postfix
-  postfix    := primary ( "(" args? ")" | "." IDENT )*
+  postfix    := primary ( tyArgs? "(" args? ")" | "." IDENT )*
+  tyArgs     := "<" type ("," type)* ">"   (after a bare IDENT callee only, and only when
+                the whole run parses and a "(" follows the ">" — else "<" is a comparison;
+                DECISIONS.md §Parser, "Explicit type arguments on a call")
   primary    := NUMBER | STRING | CHAR | "true" | "false" | IDENT | "(" expr ")"
 
 ── Structure: mutual recursion ──────────────────────────────────────────────
@@ -395,6 +398,12 @@ is `-(b as i64)`) — the reverse of Rust, but unobservable for numeric casts
 (negation / bitwise-not commute with wrap / trunc / demote). CHAINABLE
 (`x as i64 as f64`).
 ```
+
+**Amended 2026-10-04 — a prefix operator now binds TIGHTER than `as` (owner ruling A, D3629).**
+The "unobservable" claim above was false: it fails at a widening of INT_MIN (`-m as i64` was
+2147483648), at a `u8` target (`-1 as u8` was the `i32` -1), and for `!` and `~`, where `!x as
+i32` was a type error and `~x as f64` invalid wasm. `parseUnary` is now `parsePrefixed` (prefix
+operators over a postfix operand and its guard), then `parseCastChain`, then `parseGuardSuffix`.
 
 **Amended 2026-09-04 — a line may now LEAD with `as`.** The archived block's last sentence read
 "a newline before `as` ends the statement (no `skipNewlines` here), so a following `as = 1`

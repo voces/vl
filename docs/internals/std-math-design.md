@@ -89,6 +89,9 @@ concrete need today, not a hypothetical future one.
    down" (§D) — that would be a different, more-accurate function than the one the error bound
    describes, and worse, an f64 host op that happens to be exact for common cases can mask a
    real f32 divergence until a consumer hits the input that doesn't cast the same way twice.
+   **`sinF32`/`cosF32` depart from this deliberately** (D3476): they evaluate in f64 and
+   round once, because sin/cos have no f32 pipeline to match and f32 arithmetic cannot
+   reduce large arguments. The reason and the measured bound are in `std-notes.md` §`std:math`.
 5. **Never delegates to a "close enough" approximation the standard library already has.**
    There isn't one — this is the first `std:math`-shaped module VL has ever had, so there is no
    precedent to be consistent with beyond the intrinsics' own naming/width conventions
@@ -182,6 +185,22 @@ and flags the open sub-problem rather than final numbers:
 | `powF64(x, y)` | integer `y`: all finite `x`; non-integer `y`: `x > 0` | integer exponent: exact within rounding (repeated squaring); general case: ≤ **1e-8 relative**, inherited from `exp(y * ln(x))` | `pow`'s general case depends on a `ln`, which is not separately named in the ask — §H O2 |
 | `powF32` | same shape | integer exponent: exact within rounding; general case ≤ **1e-6 relative** | |
 
+**Shipped (D3476, 2026-10-02): `sin`/`cos` landed first, full range, not bounded.** All
+four take every finite input, however large (integer Payne–Hanek above `2^20·π/2`), within
+1 ulp — 1.2e-16 absolute at f64 and 6e-8 at f32, tighter than the targets above.
+`std-notes.md` §`std:math` has the measurements.
+
+**Upgraded (sunpa SP-013, 2026-10-03): `atan2` and `hypot` now meet the 1-ulp contract**
+(slice 1 shipped a 1e-7 polynomial `atan2` and a naive `hypot`), and `atan`, `asin` and `acos`
+joined at both widths under it. These changed existing exports' values; `std-notes.md`
+§`std:math` lists the changes.
+
+**Shipped (sunpa SP-005, 2026-10-03): `exp`, `log` and `pow` at both widths**, every finite
+input, within 1 ulp (measured 0.53 ulp at f64, 0.5000x at f32), tighter than the relative
+targets above. `log` is exported rather than private (O2), because sunpa asked for it by name;
+`pow`'s edge cases are IEEE 754's. `std-notes.md` §`std:math` has the algorithms, the
+measurements and the cost.
+
 **Sequencing within slice 2 is not "all four together."** The integer-exponent fast path for
 `pow` has no dependency on `exp`/`ln` and can ship first; the general real-exponent case depends
 on a deterministic `ln`, which is new work slice 2's own table does not currently name as an
@@ -200,7 +219,7 @@ slice's least-scoped piece.
    reduction problems are attempted.
 3. **Slice 2 — `sin`, `cos`, `exp`, `pow`:** same contract, applied to harder domains; ship
    `exp`/`pow`'s integer path before `sin`/`cos`, per §E's sequencing note.
-4. **Deferred, not scoped here:** `hypot`'s overflow-safe variant; a full-range `sin`/`cos`;
+4. **Deferred, not scoped here:** `hypot`'s overflow-safe variant;
    inverse-hyperbolic or any op no consumer has asked for (`std-api-review.md`'s
    no-speculative-surface rule applies to this module exactly as it does to every other).
 
@@ -250,14 +269,15 @@ review prefers the single name.
 `exp(y * ln(x))` for non-integer exponents, and `ln` is not in the original ask. → **Recommend
 building `ln` as an internal (non-exported) helper for `pow`'s sake in slice 2**, and exporting
 it only if a consumer files a need — `std-api-review.md`'s no-speculative-surface rule argues
-against shipping a fourth name nobody asked for yet.
+against shipping a fourth name nobody asked for yet. **Resolved by the build (SP-005):** a
+consumer filed the need (sunpa asked for `log` by name), so `logF64`/`logF32` are exported.
 
 **O3 — `sin`/`cos`'s documented input range.** §E proposes shipping a bounded-domain v1
 (`|x| ≤ 2^20` or similar) rather than full Payne–Hanek reduction. → **Recommend shipping the
 bounded version first, stated explicitly in the doc comment** (matching `std:fmt`'s "no radix
 but ten" precedent for an honestly-scoped v1), since none of the three filed consumer needs
 require unbounded-magnitude trig arguments — a full reduction is a clean additive follow-up,
-never a breaking one, if a fourth consumer needs it.
+never a breaking one, if a fourth consumer needs it. **Superseded by the build (D3476):** full range shipped, so there is no bounded v1.
 
 **O4 — Should `TAU` (`2π`) ship alongside `PI`?** sunsuz's own bearing code divides by `TAU`
 (`~/sunsuz/src/world/coast.ts`: `Math.atan2(-y, x) / TAU + 0.5`). → **Recommend deferring** —

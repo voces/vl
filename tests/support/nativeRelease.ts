@@ -76,13 +76,13 @@
 // AND requires the vl binary + seed wasm + `wasm-opt` + `wasm-dis`; absent any,
 // every case registers ignored with a one-line how-to-build note.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./tree.ts";
+import { COMPILER, exists, hostWasmDis, nativeEnv, ROOT, VL, binaryen } from "./tree.ts";
 // Re-exported so the four `selfhost_native_release*` suites keep importing them
 // from here; the derivation itself is tree.ts's.
-export { COMPILER, exists, nativeEnv, ROOT, VL };
+export { binaryen, COMPILER, exists, nativeEnv, ROOT, VL };
 
-export const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
-export const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+export const WASM_OPT = binaryen("wasm-opt");
+export const WASM_DIS = binaryen("wasm-dis");
 export const MELT = `${ROOT}/tests/fixtures/opt-melt`;
 export const LOOPS = `${ROOT}/tests/fixtures/opt-loop`;
 export const BENCH = `${ROOT}/bench`;
@@ -162,7 +162,11 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // around it is local scalarization across a liveness window: a rep change
   // (`unboxed-union-rep-design.md` §12.4), not a sink.
   { fixture: "union-box-branch-local-read", none: 4, O: 4, O3: 4 },
+  // D3623 split this row. Its unconditional pushes are now counted and the list is reserved,
+  // which melts it outright (10/0/0, `list-wrapper-push-reserved`); the grown worst case keeps
+  // its row, unchanged, by putting the pushes under an `if`.
   { fixture: "list-wrapper-push", none: 9, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push-reserved", none: 10, O: 0, O3: 0 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD
@@ -380,7 +384,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "closure call in a hot loop, four spellings",
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 351 -> 329 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 329, fns: 3, allocs: 1, indirect: 0 },
+    // D3663: `f3` and `f4` are called only directly, so they are lambda-lifted and build no
+    // closure; `-O` now melts phases 3 and 4 as `-O3` does — 329 -> 258 bytes, 3 -> 1 fns,
+    // 1 -> 0 allocs.
+    O: { bytes: 258, fns: 1, allocs: 0, indirect: 0 },
     O3: { bytes: 269, fns: 1, allocs: 0, indirect: 0 },
   },
   // HIGHER-ORDER BUILTINS. `xs.map(f).filter(g)` plus a `reduce`: the one shape where
@@ -400,8 +407,13 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "map/filter/reduce callback pipeline",
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 869 -> 809 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 809, fns: 4, allocs: 8, indirect: 0 },
-    O3: { bytes: 688, fns: 1, allocs: 8, indirect: 0 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 8 -> 6 at both rungs, bytes 809 -> 790 and 688 -> 697.
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 790 -> 834, `-O3` 697 -> 741 bytes.
+    O: { bytes: 834, fns: 4, allocs: 6, indirect: 0 },
+    O3: { bytes: 741, fns: 1, allocs: 6, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
   // `meta.json` records that `-O3` does NOT help here (1.469s vs 1.331s) — binaryen cannot
@@ -423,8 +435,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // row discriminating a dynamic target from a devirtualisable one, exactly as intended.
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 672 -> 644 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 644, fns: 5, allocs: 22, indirect: 2 },
-    O3: { bytes: 453, fns: 5, allocs: 14, indirect: 2 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 22 -> 18 and 14 -> 10, bytes 644 -> 654 and 453 -> 468; `indirect`
+    // held at 2.
+    O: { bytes: 654, fns: 5, allocs: 18, indirect: 2 },
+    O3: { bytes: 468, fns: 5, allocs: 10, indirect: 2 },
   },
   // TAIL CALLS. `meta.json` still carries the `vlDefect` entry from when VL emitted a plain
   // `call` in tail position; the emitter now emits `return_call`, and the same entry measures
@@ -480,8 +496,14 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // reads its header's fields as constants and drops the header allocation, keeping only
     // the backing array: allocs 16 -> 15, bytes 1546 -> 1532. `-O` keeps the header
     // (bytes 1650 -> 1657).
-    O: { bytes: 1657, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
-    O3: { bytes: 1532, fns: 3, allocs: 15, indirect: 0, refEq: 1 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 16 -> 12 and 15 -> 11, bytes 1657 -> 1645 and 1532 -> 1530; `refEq`
+    // held at 1.
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 1645 -> 1717, `-O3` 1530 -> 1602 bytes.
+    O: { bytes: 1717, fns: 3, allocs: 12, indirect: 0, refEq: 1 },
+    O3: { bytes: 1602, fns: 3, allocs: 11, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
@@ -529,8 +551,22 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // D2370: a module that never deletes grows no `live` array per map, so both rungs lose that
     // grow site: `allocs` 95 -> 93 and 46 -> 44, `-O` 7960 -> 7889 and `-O3` 2472 -> 2397 bytes.
     // `fns` and `refEq` unchanged.
-    O: { bytes: 7889, fns: 16, allocs: 93, indirect: 0, refEq: 1 },
-    O3: { bytes: 2397, fns: 6, allocs: 44, indirect: 0, refEq: 1 },
+    // D2625: `std:fmt`'s digit loop prepends, so it takes the site-cached append — one grow
+    // site (`array.new_default` + header) and one `ref.eq` frontier test: `allocs` 93 -> 95 and
+    // 44 -> 46, `refEq` 1 -> 2, bytes +160 / +240. Key building is 0.15 -> 0.10 s. The probe
+    // loop's code is unchanged, yet reads ~1.6x under the default collector: master's garbage
+    // forced one copying collection that compacted the keys, the new build's did not. Under
+    // `VL_GC=none` (no compaction in either) the whole run is 3.30 -> 3.10 s at 300 passes.
+    // D3565: `std:fmt` gained `toFixed`, which `-O` carries unused, and binaryen's `-O` now
+    // inlines `std:fmt`'s `bnLen` leaf instead of keeping it: fns 16 -> 15, the rest held.
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 95 -> 89 and 46 -> 43, bytes 8049 -> 8259 (8253 before
+    // this change) and 2637 -> 2639.
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 8259 -> 8896 bytes.
+    O: { bytes: 8896, fns: 15, allocs: 89, indirect: 0, refEq: 2 },
+    O3: { bytes: 2639, fns: 6, allocs: 43, indirect: 0, refEq: 2 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -546,8 +582,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // — `-O` 1215 -> 1509, `-O3` 1131 -> 1429 bytes, structure unchanged.
     // D2370: the pair index — the probe reads the index alone and no `live`/`hashes` grow is
     // emitted, `allocs` 13 -> 9 at both rungs, `-O` 1509 -> 1367, `-O3` 1429 -> 1283 bytes.
-    O: { bytes: 1367, fns: 3, allocs: 9, indirect: 0 },
-    O3: { bytes: 1283, fns: 3, allocs: 9, indirect: 0 },
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 9 -> 7 at both rungs, bytes 1367 -> 1372 and 1283 -> 1288.
+    O: { bytes: 1372, fns: 3, allocs: 7, indirect: 0 },
+    O3: { bytes: 1288, fns: 3, allocs: 7, indirect: 0 },
   },
   // MIXED MAP + STRING, the realistic one: tokenize by code-point scan and slice, then a
   // read-modify-write upsert. `meta.json` decomposes VL's cost as ~64% map upsert and ~21%
@@ -587,8 +626,21 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // above) — `-O3` 3140 -> 3383 bytes, structure unchanged; `-O` stayed within band.
     // D2370: no `live` grow in a module that never deletes (the i32-keyed map also drops its
     // `hashes`): `allocs` 101 -> 98 and 52 -> 49, `-O` 8568 -> 8702, `-O3` 3383 -> 3278 bytes.
-    O: { bytes: 8702, fns: 16, allocs: 98, indirect: 0, refEq: 1 },
-    O3: { bytes: 3278, fns: 6, allocs: 49, indirect: 0, refEq: 1 },
+    // D2625: the document builder's `doc = doc + …` is declared twice under one name, so the
+    // binding proof declined it; both appends now take the site-cached lowering, and
+    // `std:fmt`'s digit loop a third: `allocs` 98 -> 104 and 49 -> 54, `refEq` 1 -> 4, bytes
+    // +477 / +467. Timed interleaved, 0.77 -> 0.80 s (unchanged within the box's noise).
+    // D3565: `-O` fns 16 -> 15, the same `bnLen` inlining as on `collections/map-string`.
+    // 2026-10-06, shared constants (sunpa SP-043): an empty `[]` or `Map()` reads its type's one
+    // zero-length backing from a global, and a capture-free lambda its one constant closure,
+    // so those sites leave the function bodies: allocs 104 -> 98 and 54 -> 51, bytes 9179 -> 9388 (9382 before
+    // this change) and 3745 -> 3746.
+    // SP-056: an `as!` reason is one call of the shared `__as_fail__` helper, which `-O` keeps as
+    // a function: fns 15 -> 16, bytes within band. Cold path only.
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 9388 -> 9954, `-O3` 3746 -> 3861 bytes.
+    O: { bytes: 9954, fns: 16, allocs: 98, indirect: 0, refEq: 4 },
+    O3: { bytes: 3861, fns: 6, allocs: 51, indirect: 0, refEq: 4 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
@@ -598,8 +650,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "arrays/fill-sum",
     axis: "hot-loop i32 array element write + read; per-access bounds check",
-    O: { bytes: 318, fns: 1, allocs: 2, indirect: 0 },
-    O3: { bytes: 298, fns: 1, allocs: 2, indirect: 0 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 318 -> 346, `-O3` 298 -> 323 bytes.
+    O: { bytes: 346, fns: 1, allocs: 2, indirect: 0 },
+    O3: { bytes: 323, fns: 1, allocs: 2, indirect: 0 },
   },
   // ARRAY READ IN A BRANCHY LOOP. The bench twin of `opt-loop/binsearch-probe`, which pins the
   // loop SHAPE; this pins the code SIZE of the same kernel, and the two are complementary —
@@ -619,18 +673,43 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // Both rungs fns 1 -> 2, allocs 2 -> 3: the search function, called from `main`'s loop, is
     // no longer inlined into `main`, which runs once (DECISIONS.md, "`-O3` keeps hot callees
     // out of run-once code"). Timed at `-O3`: V8 1.70 -> 1.42 s, wasmtime 2.27 -> 2.05 s.
-    O: { bytes: 694, fns: 2, allocs: 3, indirect: 0 },
-    O3: { bytes: 648, fns: 2, allocs: 3, indirect: 0 },
+    //
+    // SP-056: the two setup casts' reasons are calls of the shared `__as_fail__` helper, a
+    // function of its own at both rungs (fns 2 -> 3). In a module this small the helper's body
+    // outweighs the two per-character reasons it replaces: `-O` 694 -> 778, `-O3` 648 -> 757.
+    O: { bytes: 778, fns: 3, allocs: 3, indirect: 0 },
+    O3: { bytes: 757, fns: 3, allocs: 3, indirect: 0 },
   },
-  // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). Adds a `struct.get` per element to the
-  // fill-sum shape, and `allocs: 3` says the per-element structs are allocated once during
-  // setup and never re-materialised inside the scan.
-  // SHOULD MOVE IF: field access lowering changes, or a struct starts being copied per access.
+  // A KNOWN-SIZE LIST BUILT BY `push` (sunpa SP-036, D3623). The 16 pushes sit in a constant
+  // 4x4 nest, so the list is reserved at 16 and each push appends through two locals while
+  // under it; with the push inline the 4-trip loop unrolls, which is the +900 bytes. `allocs`
+  // 7 -> 10 is the growing append's cold `array.new_default`, kept in each unrolled copy.
+  // Master was 876 / 840 bytes and 7 allocs: no reserve, three growths per product.
+  // SHOULD MOVE IF: the reserve or the region's append stops firing, or a push stops unrolling.
+  // SP-056: the closing `trunc(…) as! i64` tests its range and names its failure through the
+  // `__as_fail__` helper, inlined into its one caller (it was a bare `i64.trunc_f64_s`, with no
+  // reason): `-O` 1787 -> 2090, `-O3` 1721 -> 2024 bytes, a cold branch after the loops.
+  {
+    bench: "arrays/push-known-size",
+    axis: "building a list of compile-time-known size with push",
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 2090 -> 2401, `-O3` 2024 -> 2335 bytes.
+    O: { bytes: 2401, fns: 2, allocs: 10, indirect: 0 },
+    O3: { bytes: 2335, fns: 2, allocs: 10, indirect: 0 },
+  },
+  // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). The `P[]` is flattened (D3681): four
+  // i32s per element in one array, so setup allocates no `P` (`allocs` 3 -> 2: the list and
+  // its backing) and the scan reads two fields with two `array.get`s, no pointer chase. The
+  // +107 / +120 bytes are the index clamp and the scaled lengths. Timed at `-O3`, 10^6
+  // elements x 500 rounds: V8 0.93 -> 0.62 s, wasmtime 1.51 -> 1.26 s.
+  // SHOULD MOVE IF: the flattening stops firing, or a struct starts being copied per access.
   {
     bench: "arrays/struct-aos",
     axis: "array-of-structs field scan",
-    O: { bytes: 345, fns: 1, allocs: 3, indirect: 0 },
-    O3: { bytes: 287, fns: 1, allocs: 3, indirect: 0 },
+    // SP-056: a list index's guard branches to an out-of-line trap rather than a
+    // `select` to -1, structure unchanged: `-O` 452 -> 473, `-O3` 407 -> 428 bytes.
+    O: { bytes: 473, fns: 1, allocs: 2, indirect: 0 },
+    O3: { bytes: 428, fns: 1, allocs: 2, indirect: 0 },
   },
   // THE TIGHT SCALAR LOOP — `LOOP_TABLE`'s `scalar-accum-3` is this kernel, and it is the 2.43x
   // loop-rotation row. At 203 bytes with a single loop and no allocation, this is the ONE row
@@ -687,7 +766,7 @@ export const vl = async (args: string[], env: Record<string, string> = {}) => {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ VL_WASM_OPT: WASM_OPT, VL_WASM_DIS: WASM_DIS, ...env }),
+    env: nativeEnv({ VL_WASM_OPT: WASM_OPT, VL_WASM_DIS: hostWasmDis(), ...env }),
   }).output();
   return {
     code,

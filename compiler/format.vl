@@ -52,11 +52,19 @@ import {
   WhileStmt,
 } from "./ast"
 import { TokKind } from "./lexer"
-import { P, externGlobalLinkOfNode, isBodyTyDecl, nodeEndOf } from "./ast"
+import {
+  P,
+  callTyArgEndsOf,
+  callTyArgsOf,
+  externGlobalLinkOfNode,
+  isBodyTyDecl,
+  nodeEndOf,
+} from "./ast"
 // The free index-operator declaration-name encoding — the formatter prints the operator
 // back in its source spelling, not the name it declares under.
 import { getDeclPropOf, opDeclOpOf } from "./ast"
 import { declNameTokOf } from "./ast"
+import { brkValSeen, nodeChildren } from "./ast"
 import { fnTpBoundOf } from "./ast"
 import {
   binPrecOf,
@@ -530,6 +538,8 @@ export function formatProgram(progRoot: i32) {
     // D1045 — a body-scoped `type` is filtered one scope in for the same reason: the parser
     // hoists it into `progStmts` and it stays at its lexical position as well.
     topPrevLine = emitImports()
+    fmtBrkVal = Map()
+    fmtFoldBreaks(progRoot)
     const stmts: i32[] = []
     let fi = 0
     while fi < root.progStmts.length {
@@ -547,6 +557,81 @@ export function formatProgram(progRoot: i32) {
   }
   const text = joinOut()
   alignComments(normalizeProgram(text))
+}
+
+// `break v` parses as the value's statement followed by the break (`brkHasVal`). The printer
+// reads the two as one statement, so `fmtFoldBreaks` moves each value out of its list into
+// this map, keyed by the break node.
+let fmtBrkVal: {[i32]: i32} = Map()
+
+// Folds every `break v` under node `ix`, values included, as `fmtBrkVal` describes.
+// Walked with an explicit stack, since an `else if` chain nests thousands deep (D1990).
+function fmtFoldBreaks(root: i32) {
+  if !brkValSeen { return 0 }
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        i = i + 1
+      }
+      fmtFoldBlock(ix)
+    }
+  }
+  0
+}
+
+// Folds the `break v`s of one statement list, when `ix` is a block.
+function fmtFoldBlock(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    const out: i32[] = []
+    let j = 0
+    while j < st.length {
+      let folded = false
+      const b = P.nodes[fmtNodeOr(st[j])]
+      if b is BreakStmt {
+        if b.brkHasVal == 1 && out.length > 0 {
+          fmtBrkVal[st[j]] = out[out.length - 1]
+          out.pop()
+          out.push(st[j])
+          folded = true
+        }
+      }
+      if !folded { out.push(st[j]) }
+      j = j + 1
+    }
+    while st.length > 0 { st.pop() }
+    let m = 0
+    while m < out.length {
+      st.push(out[m])
+      m = m + 1
+    }
+  }
+  0
+}
+
+// `ix` where it names an arena node, else the root (never a break).
+function fmtNodeOr(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  ix
+}
+
+// The `break` statement's text: the keyword, its `@label` and its value.
+function breakText(ix: i32, indent: i32): string {
+  const n = P.nodes[ix]
+  if n is BreakStmt {
+    let t = n.brkKw
+    if n.brkLabel.length > 0 { t = t + " @" + n.brkLabel }
+    const v = fmtBrkVal[ix] ?? -1
+    if v >= 0 { t = t + " " + expr(v, indent, 0) }
+    return t
+  }
+  ""
 }
 
 // Format one recovered `import` or re-export spanning tokens `[kw .. pathTok]`. A braced
@@ -583,7 +668,7 @@ function fmtImport(kw: i32, pathTok: i32) {
       if it.length > 0 { items.push(it) }
       cur = ""
     } else {
-      cur = cur + fromCodePoint(inner[p])
+      cur = cur + inner.slice(p, p + 1)
     }
     p = p + 1
   }
@@ -1048,7 +1133,7 @@ function emitStatement(ix: i32, indent: i32) {
   } else if n is ForIn {
     emitForIn(ix, n, indent)
   } else if n is BreakStmt {
-    emitBreakContinue(n.brkKw, n.brkLabel, indent, ix)
+    emitMultiline(breakText(ix, indent), indent, stopLineOf(ix))
   } else if n is ContinueStmt {
     emitBreakContinue(n.contKw, n.contLabel, indent, ix)
   } else if n is Block {
@@ -1134,7 +1219,7 @@ function emitReturn(node: RetStmt, indent: i32) {
 function emitBreakContinue(kw: string, label: string, indent: i32, ix: i32) {
   const line = stopLineOf(ix)
   if label.length > 0 {
-    emitMultiline(kw + " " + label, indent, line)
+    emitMultiline(kw + " @" + label, indent, line)
   } else {
     emitMultiline(kw, indent, line)
   }
@@ -1292,7 +1377,22 @@ function emitBlockStatement(ix: i32, node: Block, indent: i32) {
 
 function emitWhile(ix: i32, node: WhileStmt, indent: i32) {
   let label = ""
-  if node.whileLabel.length > 0 { label = node.whileLabel + ": " }
+  if node.whileLabel.length > 0 { label = "@" + node.whileLabel + " " }
+  // A labelled block has no `while` or condition to print.
+  if node.whileBlk == 1 {
+    const bInline = inlineBlockBody(node.whileBody, indent)
+    if (
+      bInline.length > 0
+      && indent * 2 + dispWidth(label) + dispWidth(bInline) <= fmtWidth
+    ) {
+      emitLine(indent, label + bInline)
+    } else {
+      emitLine(indent, label + "{")
+      emitBlockBody(node.whileBody, indent)
+      closingBrace(indent, stopLineOf(node.whileBody))
+    }
+    return 0
+  }
   if isBracedBlock(node.whileBody) {
     const cond = expr(node.whileCond, indent, 0)
     const inline = inlineBlockBody(node.whileBody, indent)
@@ -1349,7 +1449,7 @@ function emitBareBody(blockIx: i32, indent: i32) {
 
 function emitForRange(ix: i32, node: ForRange, indent: i32) {
   let label = ""
-  if node.frLabel.length > 0 { label = node.frLabel + ": " }
+  if node.frLabel.length > 0 { label = "@" + node.frLabel + " " }
   const from = expr(node.frFrom, indent, 0)
   const to = expr(node.frTo, indent, 0)
   let kw = " to " // the inclusive form; `until` is the half-open twin
@@ -1362,7 +1462,7 @@ function emitForRange(ix: i32, node: ForRange, indent: i32) {
 
 function emitForIn(ix: i32, node: ForIn, indent: i32) {
   let label = ""
-  if node.fiLabel.length > 0 { label = node.fiLabel + ": " }
+  if node.fiLabel.length > 0 { label = "@" + node.fiLabel + " " }
   const iter = expr(node.fiIter, indent, 0)
   let vars = node.fiVar
   if node.fiVar2 != "" { vars = vars + ", " + node.fiVar2 }
@@ -1442,9 +1542,32 @@ function collapseSingleIf(_ix: i32, node: IfStmt, indent: i32) {
   line
 }
 
+// The object literal a branch or arm is when the parser read its braces as one (`{ a: 1 }`, a
+// synthesized one-statement block): that object's text, whose braces are the arm's. "" for any
+// other body, and for `{}`, which as a body is an empty block.
+function armObjectText(blockIx: i32, indent: i32): string {
+  if blockIx < 0 || blockIx >= P.nodes.length || isBracedBlock(blockIx) {
+    return ""
+  }
+  const n = P.nodes[blockIx]
+  if n is Block {
+    if n.blkStmts.length != 1 { return "" }
+    const o = P.nodes[n.blkStmts[0]]
+    if o is ObjLit {
+      if o.objFields.length > 0 { return expr(n.blkStmts[0], indent, 0) }
+    }
+  }
+  ""
+}
+
 // Render a brace block with a single simple statement inline as `{ stmt }`, or
 // `{}` when empty. Returns "" when the body can't inline.
 function inlineBlockBody(blockIx: i32, indent: i32) {
+  const ao = armObjectText(blockIx, indent)
+  if ao != "" {
+    if hasNewline(ao) { return "" }
+    return ao
+  }
   const n = P.nodes[blockIx]
   if n is Block {
     const sl = startLineOf(blockIx)
@@ -1725,12 +1848,9 @@ function statementInline(ix: i32, indent: i32) {
     if n.retArg < 0 { return "return" }
     return "return " + expr(n.retArg, indent, 0)
   }
-  if n is BreakStmt {
-    if n.brkLabel.length > 0 { return "break " + n.brkLabel }
-    return "break"
-  }
+  if n is BreakStmt { return breakText(ix, indent) }
   if n is ContinueStmt {
-    if n.contLabel.length > 0 { return "continue " + n.contLabel }
+    if n.contLabel.length > 0 { return "continue @" + n.contLabel }
     return "continue"
   }
   if n is LetDecl { return letInline(ix, n, indent) }
@@ -1790,7 +1910,25 @@ function expr(ix: i32, indent: i32, column: i32) {
   if n is IfStmt { return ifExpr(ix, n, indent) }
   if n is Block { return blockExpr(ix, n, indent) }
   if n is MatchExpr { return matchExprFmt(ix, n, indent) }
+  if n is WhileStmt || n is ForRange || n is ForIn {
+    return loopExpr(ix, indent)
+  }
   sliceFallback(ix)
+}
+
+// A loop or labelled block in value position: printed as its statement form, whose first
+// line continues the expression it stands in.
+function loopExpr(ix: i32, indent: i32) {
+  const saved = outBuf
+  outBuf = []
+  emitStatement(ix, indent)
+  const inner = rstripNl(joinOut())
+  outBuf = saved
+  const lead = indentStr(indent)
+  if inner.length >= lead.length && inner.slice(0, lead.length) == lead {
+    return inner.slice(lead.length, inner.length)
+  }
+  inner
 }
 
 // One match arm pattern. A string literal or the `_` wildcard render as the expression they
@@ -2020,16 +2158,6 @@ function flattenChain(
   0
 }
 
-// Whether any link of a flattened chain is a subtraction.
-function chainHasMinus(ops: string[]) {
-  let i = 0
-  while i < ops.length {
-    if ops[i] == "-" { return true }
-    i = i + 1
-  }
-  false
-}
-
 function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32) {
   const prec = binPrecOf(node.binOp)
   const ops: string[] = []
@@ -2047,19 +2175,12 @@ function binaryChain(ix: i32, node: BinExpr, indent: i32, column: i32) {
     return oneLine
   }
   // Reflow: each operand after the first on its own continuation line, one indent deeper,
-  // led by its operator. A chain holding a `-` link keeps every operator trailing instead,
-  // because outside brackets a line that begins with `-` is a new statement, not a
-  // continuation (guide/operators.md, "Breaking a long expression across lines").
-  const lead = !chainHasMinus(ops)
+  // led by its operator and a space. A leading `- b` continues the line above at every
+  // depth because of that space; `-b` would be a statement of its own.
   let result = txt[0]
-  if !lead { result = result + " " + ops[1] }
   let j = 1
   while j < txt.length {
-    let head = ""
-    if lead { head = ops[j] + " " }
-    let tail = ""
-    if !lead && j + 1 < txt.length { tail = " " + ops[j + 1] }
-    result = result + "\n" + indentStr(indent + 1) + head + txt[j] + tail
+    result = result + "\n" + indentStr(indent + 1) + ops[j] + " " + txt[j]
     j = j + 1
   }
   result
@@ -2075,7 +2196,24 @@ function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32) {
     if raw.length > 0 { return raw }
   }
   if node.binOp == "=" { return renderAssign(ix, node, indent, column) }
+  // A comment after an operator has no printer in the chain, so the expression keeps its
+  // source text, as an object literal's gaps do (D3514).
+  if commentInOperatorGaps(ix) { return sliceFallback(ix) }
   binaryChain(ix, node, indent, column)
+}
+
+// Whether a pending comment starts between an operand and the next one, anywhere along the
+// operator chain rooted at `ix` (template and assignment nodes print themselves).
+function commentInOperatorGaps(ix: i32) {
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binTpl == 1 || n.binOp == "=" { return false }
+    if commentInCharSpan(nodeEndOf(n.binLeft), nodePos(n.binRight)) {
+      return true
+    }
+    return commentInOperatorGaps(n.binLeft) || commentInOperatorGaps(n.binRight)
+  }
+  false
 }
 
 // Emit possibly-multiline `text` with only its first line indented (continuation
@@ -2198,6 +2336,11 @@ function unary(_ix: i32, node: Unary, indent: i32, column: i32) {
     }
     if needs { operand = "(" + operand + ")" }
   }
+  // `- -x` printed tight would lex as the decrement `--x`, and `- -x` with a space would
+  // continue the line above when it leads a statement, so the inner operand is parenthesised.
+  if node.unOp == "-" && operand.slice(0, 1) == "-" {
+    return "-(" + operand + ")"
+  }
   node.unOp + operand
 }
 
@@ -2208,14 +2351,27 @@ function isExpr(ix: i32, node: IsExpr, indent: i32, column: i32) {
 }
 
 // `x as T` — the target and the mode ride the node (`asTy`, `asMode`), so neither needs
-// source recovery, unlike `is`. The operand renders through `primary`, which parenthesizes
-// a composite so the cast keeps binding the whole value. The suffix is part of the
-// operator: a bare `" as "` turns `x as! T` into a propagation, pinned by a `fmt` case.
+// source recovery, unlike `is`. A prefix operand prints bare, since every prefix operator binds
+// tighter than `as`; any other composite goes through `primary`, which parenthesizes it. The
+// suffix is part of the operator: a bare `" as "` turns `x as! T` into a propagation.
 function asExpr(_ix: i32, node: AsExpr, indent: i32, column: i32) {
   let kw = " as "
   if node.asMode == "trap" { kw = " as! " }
   if node.asMode == "null" { kw = " as? " }
   if node.asMode == "wrap" { kw = " as% " }
+  const o = P.nodes[node.asObj]
+  let bare = false
+  if o is Unary {
+    // `x !is T` is a `!` over a negated guard; its surface form takes the parentheses.
+    const g = P.nodes[o.unArg]
+    bare = true
+    if g is IsExpr { bare = g.isNeg == 0 }
+  } else if o is BinExpr {
+    bare = o.binCompound == "++" || o.binCompound == "--"
+  }
+  if bare {
+    return expr(node.asObj, indent, column) + kw + demangleSpelling(node.asTy)
+  }
   primary(node.asObj, indent, column) + kw + demangleSpelling(node.asTy)
 }
 
@@ -2459,7 +2615,14 @@ function callExpr(ix: i32, node: Call, indent: i32, column: i32) {
 // column `head` itself begins at. Split out of `callExpr` because the chain layout needs the
 // same tail under a different head, and a second spelling of the trailing-lambda hug plus
 // the width test is exactly the one width test this file already has.
-function callTail(node: Call, ix: i32, head: string, indent: i32, column: i32) {
+function callTail(
+  node: Call,
+  ix: i32,
+  callee: string,
+  indent: i32,
+  column: i32,
+) {
+  const head = callee + callTyArgText(ix)
   // A comment between the arguments has the same nowhere to go, and the anchor is the
   // argument list rather than the whole call: the callee is already rendered into `head`,
   // and a receiver chain is a construct of its own that this must not reprint (D1777).
@@ -2488,11 +2651,38 @@ function callTail(node: Call, ix: i32, head: string, indent: i32, column: i32) {
   head + wrapList("(", args, ")", indent, column + dispWidth(head))
 }
 
+// A call's explicit type arguments as written (`<string, i32>`), or "" when it has none.
+function callTyArgText(ix: i32): string {
+  const tas = callTyArgsOf(ix)
+  if tas.length == 0 { return "" }
+  const ends = callTyArgEndsOf(ix)
+  let out = "<"
+  let i = 0
+  while i < tas.length {
+    if i > 0 { out = out + ", " }
+    out = out + tyArgText(tas[i], ends[i])
+    i = i + 1
+  }
+  out + ">"
+}
+
+// One type argument as written: its source from its first token to its recorded end `stop`,
+// which stops short of a closing `>` the argument's last token shares (`Box<i32>>`).
+function tyArgText(ix: i32, stop: i32): string {
+  const start = nodePos(ix)
+  if start < 0 || stop < start || stop > fmtSrc.length {
+    return recoverType(ix)
+  }
+  collapseWs(fmtSrc.slice(start, stop))
+}
+
 // The offset of the `(` opening `node`'s argument list: the first one at or after the
 // callee's end, which is where the call's own punctuation starts. -1 when either side has
 // no span, and the caller then keeps the rendered form.
 function callArgOpenAt(node: Call, ix: i32) {
   let p = nodeEndOf(node.callFn)
+  const tEnds = callTyArgEndsOf(ix)
+  if tEnds.length > 0 { p = tEnds[tEnds.length - 1] }
   const stop = nodeEndOf(ix)
   if p < 0 || stop < p || stop > fmtSrc.length { return -1 }
   while p < stop {
@@ -2575,8 +2765,15 @@ function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32) {
   if node.objFields.length == 0 { return "{}" }
   // A comment between the fields is the list literal's case at the other bracket: it falls
   // through to the statement printer, one construct later than the row it annotates (D1777).
-  if commentInListGaps(nodePos(ix), nodeEndOf(ix), node.objFields) {
+  // A comment between a key and its value has no printer either, so it anchors the same way (D3492).
+  if (
+    commentInListGaps(nodePos(ix), nodeEndOf(ix), node.objFields)
+    || commentInFieldKeyGaps(node.objFields)
+  ) {
     return sliceFallback(ix)
+  }
+  if loneShorthandComma(node.objFields) {
+    return "{ " + fieldInitText(node.objFields[0], indent, column) + ", }"
   }
   const items: string[] = []
   let i = 0
@@ -2587,14 +2784,60 @@ function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32) {
   wrapList("{ ", items, " }", indent, column)
 }
 
+// Whether a pending comment starts between some field's key and its value. A shorthand's
+// value shares the key's position, so its span is empty.
+function commentInFieldKeyGaps(fields: i32[]) {
+  let i = 0
+  while i < fields.length {
+    const f = P.nodes[fields[i]]
+    if f is FieldInit {
+      if commentInCharSpan(nodePos(fields[i]), nodePos(f.fiValue)) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the literal is one shorthand field written with a comma after it. In a body
+// position `{ id, }` is an object and `{ id }` a block (D3475), so that comma is kept.
+function loneShorthandComma(fields: i32[]) {
+  if fields.length != 1 { return false }
+  const f = P.nodes[fields[0]]
+  if f is FieldInit {
+    if !fieldIsShorthand(fields[0], f) { return false }
+    let t = tokIndexAt(nodePos(fields[0]))
+    if t < 0 { return false }
+    t = t + 1
+    while t < P.toks.length && P.toks[t].kind == "NEWLINE" { t = t + 1 }
+    return t < P.toks.length && P.toks[t].kind == "COMMA"
+  }
+  false
+}
+
+// A field as written: a shorthand `{ seq }` stays `seq` and `seq: seq` stays spelled out
+// (D3478). The parser gives a shorthand's value the key's own position, which nothing else
+// can, since a written value starts after the `:`.
 function fieldInitText(ix: i32, indent: i32, column: i32) {
   const n = P.nodes[ix]
   if n is FieldInit {
+    if fieldIsShorthand(ix, n) { return n.fiName }
     return fieldKeyText(ix, n.fiName)
       + ": "
       + expr(n.fiValue, indent + 1, column)
   }
   ""
+}
+
+function fieldIsShorthand(ix: i32, f: FieldInit) {
+  const v = f.fiValue
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = P.nodes[v]
+  if vn is Ident {
+    return vn.identName == f.fiName && nodePos(v) == nodePos(ix)
+  }
+  false
 }
 
 // A field key as written. The parser strips the quotes from a string-literal key
@@ -2700,8 +2943,16 @@ function arrayLiteral(ix: i32, node: ArrayLit, indent: i32, column: i32) {
 }
 
 // A parenthesised expression `( inner )`. The self-host keeps explicit parens.
-function parenExpr(_ix: i32, node: Paren, indent: i32, column: i32) {
-  "(" + expr(node.parInner, indent, column + 1) + ")"
+// A comment between a bracket and the inner expression keeps the source text (D3514).
+function parenExpr(ix: i32, node: Paren, indent: i32, column: i32) {
+  const inner = node.parInner
+  if (
+    commentInCharSpan(nodePos(ix), nodePos(inner))
+    || commentInCharSpan(nodeEndOf(inner), nodeEndOf(ix))
+  ) {
+    return sliceFallback(ix)
+  }
+  "(" + expr(inner, indent, column + 1) + ")"
 }
 
 // An anonymous function value in expression position is always an arrow lambda
@@ -2767,8 +3018,9 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
   if !hasCmt && ifChainIsSimple(ix) {
     // An `else if` chain is rendered along its spine (D1990).
     const cond = expr(node.ifCond, indent, 0)
-    const thenE = bareBodyInline(node.ifThen, indent)
-    const parts: string[] = ["if " + cond + " { " + thenE + " }"]
+    const parts: string[] = [
+      "if " + cond + " " + armInline(node.ifThen, indent),
+    ]
     let nxt = node.ifElse
     while nxt >= 0 {
       const at = nxt
@@ -2776,11 +3028,10 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
       const e = P.nodes[at]
       if e is IfStmt {
         const ec = expr(e.ifCond, indent, 0)
-        const et = bareBodyInline(e.ifThen, indent)
-        parts.push(" else if " + ec + " { " + et + " }")
+        parts.push(" else if " + ec + " " + armInline(e.ifThen, indent))
         nxt = e.ifElse
       } else {
-        parts.push(" else { " + bareBodyInline(at, indent) + " }")
+        parts.push(" else " + armInline(at, indent))
       }
     }
     return concatParts(parts)
@@ -2791,6 +3042,13 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
     return ifExprBlocks(node, indent)
   }
   sliceFallback(ix)
+}
+
+// One simple `if`-expression arm on one line: `{ expr }`, or an object arm as the object.
+function armInline(blockIx: i32, indent: i32): string {
+  const ao = armObjectText(blockIx, indent)
+  if ao != "" { return ao }
+  "{ " + bareBodyInline(blockIx, indent) + " }"
 }
 
 // Whether every arm of the `if` chain at `ix` is one simple expression, so the chain can
@@ -2857,6 +3115,8 @@ function armBlock(ix: i32, indent: i32) {
 }
 
 function blockExpr(ix: i32, node: Block, indent: i32) {
+  const ao = armObjectText(ix, indent)
+  if ao != "" { return ao }
   const saved = outBuf
   outBuf = []
   emitStatements(node.blkStmts, indent + 1)

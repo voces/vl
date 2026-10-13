@@ -60,7 +60,7 @@ PASS = {
     "passCheckTopLevel", "buildFnMap", "computeVoidFns", "computeRetInference",
     "dispatchRewrite", "captureBoxRewrite", "synthRetAnnots", "synthDstPinAnns",
     "scanArrLitCommit", "monomorphize", "collectGenAliasShapes", "collectAnnShapes",
-    "synthGlobalEmptyListAnns", "synthVoidTwins", "synthParamAnnots",
+    "synthGlobalEmptyListAnns", "synthVoidTwins", "synthExternValues", "synthParamAnnots",
     "collectMapFilterUse", "collectFnValUse", "collectCloSigs", "scanPrintUse",
     "checkFnParams", "capCacheBuild", "capNarrowBuild", "synthCaptureEmptyListAnns",
     "collectInlineUnions", "computeGlobalPromotion", "mAssignTypeIndices",

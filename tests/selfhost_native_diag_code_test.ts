@@ -17,7 +17,7 @@
 //
 // Run with:  deno test -A tests/selfhost_native_diag_code_test.ts
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -33,6 +33,7 @@ if (ignore) {
   );
 }
 
+import { filePath } from "./support/filePath.ts";
 import { decodeDiagData } from "../compiler/diagnostics.ts";
 import type { VLDiagnosticData } from "../compiler/diagnostics.ts";
 
@@ -954,5 +955,38 @@ Deno.test({
     if (diags[0].raw !== "") {
       throw new Error(`expected no payload, got: ${JSON.stringify(diags[0].raw)}`);
     }
+  }
+});
+
+Deno.test({
+  name: "diag-code: a `self`-function a member shadows carries `self-fn-shadowed` (D2475)",
+  ignore,
+}, () => {
+  // One code for both earlier rungs; `rung` says which one owns the name, so a quick-fix
+  // offering a rename reads the member and the receiver from the payload, not the sentence.
+  const exp = instantiate();
+  const cases: { src: string; want: VLDiagnosticData }[] = [
+    {
+      src: "function get(self: {[i32]: i32}, k: i32): i32 { k }\n",
+      want: { member: ["get"], recv: ["{[i32]: i32}"], rung: ["method"] },
+    },
+    {
+      src: "type P = {x: i32}\nfunction x(self: P): i32 { self.x }\n",
+      want: { member: ["x"], recv: ["P"], rung: ["field"] },
+    },
+  ];
+  for (const c of cases) {
+    const { rc, diags } = check(exp, c.src);
+    if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+    if (diags.length !== 1) {
+      throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+    }
+    if (diags[0].code !== "self-fn-shadowed") {
+      throw new Error(`expected code "self-fn-shadowed", got: ${JSON.stringify(diags[0])}`);
+    }
+    if (!diags[0].message.includes("would never call this function — rename it")) {
+      throw new Error(`unexpected message: ${diags[0].message}`);
+    }
+    sameData(diags[0].data, c.want, c.src);
   }
 });

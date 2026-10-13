@@ -11,7 +11,23 @@ than left to be re-derived. The precedence ladder is the parser's own
 
 Assignment (`=`, and the compound forms `+= -= *= /= %= &= |= ^= <<= >>= >>>=`) binds
 loosest of all and is right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary operator, so
-`a + b as! i32` is `a + (b as! i32)`. Unary `-` `!` `~` bind tighter still.
+`a + b as! i32` is `a + (b as! i32)`. Every prefix operator — `-` `!` `~` `++` `--` — binds
+tighter still, as in Rust, so `-x as T` is `(-x) as T` and `-x as T + y` is `((-x) as T) + y`;
+postfix operators (`.f`, `[i]`, calls, `x++`) bind tightest. Continuing the ladder above:
+
+```
+…   <   *  /  %   <   as  as?  as!  as%   <   -x  !x  ~x  ++x  --x   <   x.f  x[i]  x(…)  x++
+```
+
+A type guard `x is T` / `x !is T` binds tighter than a prefix operator but takes a whole cast
+chain: `!x is T` is `!(x is T)`, while `x as T is U` is `(x as T) is U`.
+
+The prefix rule decides values at the edges, so they are worth stating. The negation happens at
+the operand's own width, BEFORE the cast sees it: with `m: i32` holding `-2147483648`, `-m as
+i64` is `-2147483648` (the `i32` negation wraps), and `-(m as i64)` is `2147483648`. A negative
+literal is one constant: `-2147483648 as i32` is `i32`'s minimum, and `-1 as u8` and `-0.5 as
+i32` are check errors naming `-1` and `-0.5`, while `-1 as% u8` is 255. (DECISIONS.md §"Prefix
+operators bind tighter than `as`".)
 
 ## Arithmetic
 
@@ -66,6 +82,20 @@ This is `i32.div_s`/`i64.div_s`'s own trap; wasm has no wrapping division instru
 divide that would overflow fails loudly the same way a divide by zero does, rather than
 silently producing the wrong (wrapped) quotient.
 
+**The numeric intrinsics `abs`, `min` and `max` keep an integer operand's width**: over `i32`
+operands they compute and return `i32`, over an `i64` one `i64`, and only a float operand makes
+them `f64` (or `f32`). A bare literal argument has no width of its own and adapts like any other
+literal, so `const x: f64 = abs(-3)` is `3.0`. `abs` follows the wrap rule above, being `0 - x`
+for a negative `x`: the one input with no positive counterpart comes back unchanged.
+
+```vl
+const n: i32 = -5
+print(abs(n) / 2)           // 2 — an i32, so `/` is integer division
+const m: i32 = -2147483648
+print(abs(m))               // -2147483648 — INT32_MIN wraps, as `0 - m` does
+print(abs(-2.5))            // 2.5
+```
+
 ### `%` is the truncated remainder — the same one Rust, JavaScript and C compute
 
 `a % b` has the value of `a - b * trunc(a / b)` and **takes the sign of the DIVIDEND**:
@@ -86,6 +116,64 @@ C's `fmod` exactly: `x % 0.0` is `NaN`, `Infinity % b` is `NaN`, `a % Infinity` 
 rather than by evaluating the `a - b * trunc(a / b)` identity, which drifts by an ulp once
 the quotient passes 2^53 — so `1e308 % 3.0` is `2`, not an approximation of it.
 
+## Numeric literals in `let` and `const`
+
+A bare numeric literal is an `i32` (an integer) or an `f64` (a `.` or exponent literal) unless
+its context says otherwise, and a binding it initialises follows two rules — provisional, per
+the owner's 2026-09-29 ruling (DECISIONS.md §"A literal binding takes its type from its uses").
+
+**A `const` is its literal at every read.** Each read takes the type the literal written there
+would take, so one `const` can be an `f32` in one place and an `i64` in another:
+
+```vl
+const h = 0.5
+function lerp(a: f32): f32 { a * h + 7.0 }   // h is the f32 0.5 here
+const K = 7
+function take64(x: i64): i64 { x }
+print(take64(K) * 1000000000)                 // 7000000000 — K is an i64 7 here
+print(K * 1000000000)                         // 7000000000 — a tree of constants is computed exactly
+```
+
+A read the literal does not fit is the literal's own error there (`const B = 3000000000` read as
+an `i32`). This holds wherever the read stands, above the declaration included, and a binding
+that copies a literal `const` (`let n = K`, `const K2 = K`) holds the literal as if it were
+written there. Annotate a `const` (`const K: i64 = 7`) to give it one type everywhere.
+
+**A `let` takes its type from what it is stored into and what is stored into it**, within its
+literal's kind — an integer becomes at most an `i64`, a float `f32` or `f64` — and keeps its
+literal's type when nothing typed reaches it:
+
+```vl
+let s = 0
+for x in xs { s += x }     // xs: i64[] → s is an i64
+let n = 0
+n = 5                      // only literals: n stays an i32
+let b = 7
+takeF64(b)                 // an f64 destination widens b there; b stays an i32
+print(b / 2)               // 3 — integer division
+```
+
+What it is stored into is any typed place: a parameter, a binding, a return, a field or element
+of a literal delivered to a typed record or list (`const r: R = { v: s }`), a map value. Operands
+never choose: `if s < n64`, `s + 0.5` or `take64(s + 1)` give `s` no type, and neither does an
+argument to a type parameter (`id(s)`). Two deliveries or stores that no single type satisfies
+are an error naming both.
+
+## Porting numeric code from JS/TS
+
+A float literal adapts to the other operand, so beside an `f32` it is an `f32` and the whole
+operation runs in `f32` (this is deliberate: `x * 0.5` in `f32` code stays `f32`). JS reads a
+`Float32Array` element as an `f64`, so a literal port changes results without a warning:
+
+```vl
+const a: f32[] = [0.1]
+print(a[0] + 1e-3)          // 0.10100000351667404 — the sum is f32
+print(a[0] as f64 + 1e-3)   // 0.10100000149011612 — what JS/TS computes
+```
+
+To store as `f32` and compute as `f64`, write `grid[k] as f64` at each read, or keep the grid an
+`f64[]`. Every operand that meets other arithmetic needs the cast, not just the first.
+
 ## Comparison and logic
 
 | operator | operands | result | notes |
@@ -96,18 +184,46 @@ the quotient passes 2^53 — so `1e308 % 3.0` is `2`, not an approximation of it
 | `!` | a boolean | `boolean` | |
 | `??` | a nullable and a fallback | the non-null type | `a ?? b` yields `b` only when `a` is `null` |
 
+There is no `in` operator: `in` is a keyword of the `for` head (`for x in xs`) and nothing else.
+`a in b` in an expression is refused with the membership test the receiver does have —
+`m.has(k)` for a map, `s.has(x)` for a `Set`, `xs.includes(x)` (a value) or `i < xs.length` (an
+index) for a list, `s.includes(x)` for a string. It parses at the comparisons' precedence, so `if x in xs && y` is one error.
+
 ## Bitwise and shifts — integers only
 
 | operator | meaning |
 | --- | --- |
 | `&` `\|` `^` | and / or / xor |
 | `<<` | shift left |
-| `>>` | ARITHMETIC (sign-propagating) shift right — `-16 >> 2` is `-4` |
-| `>>>` | LOGICAL (zero-filling) shift right — `-16 >>> 28` is `15` |
+| `>>` | ARITHMETIC (signed, sign-propagating) shift right — `-16 >> 2` is `-4` |
+| `>>>` | LOGICAL (unsigned, zero-filling) shift right — `-16 >>> 28` is `15` |
 | `~` | bitwise not |
 
+### Unsigned shift / logical shift right: `>>>`
+
+VL has JavaScript's and Java's `>>>`: the unsigned shift right, also called the logical shift
+(Rust and C spell it `>>` on an unsigned type; Go on a `uint`). It shifts in
+zeros, where `>>` shifts in copies of the sign bit. It works on `i32` and `i64` alike, at the
+operand's own width, and has a compound form `>>>=`.
+
+```vl
+const h = -123456789
+print(h >> 13)              // -15071      the sign is copied in
+print(h >>> 13)             // 509217      zeros are shifted in
+print((h >> 13) & 0x7ffff)  // 509217      the same bits, written by hand
+const big: i64 = -1
+print(big >>> 60)           // 15
+```
+
+Masking an arithmetic shift down to its low `32 - k` bits (`64 - k` for an `i64`) is
+`>>>` spelled the long way. `vl check` points it out with the hint
+`shift-mask-is-logical-shift` wherever it can see that the shifted value is an `i32` or an
+`i64`.
+
 These are about BIT PATTERNS, so a float operand is refused: `1.0 & 2` is
-`operator '&' is integer-only, got f64 and i32`. `%` is deliberately **not** in this family —
+`operator '&' is integer-only, got f64 and i32`, and `~2.5` is
+`operator '~' is integer-only, got f64` (also through a type parameter pinned to a float).
+`%` is deliberately **not** in this family —
 a float remainder is a meaningful number, and VL computes it.
 
 ## Compound assignment
@@ -152,10 +268,15 @@ fourth, `as%`, cannot fail at all and has its own section below:
 | `x as T` | `T` | returns `null` from the enclosing function, which must return `\| null` |
 
 ```vl
-print(3.9 as? i32)                 // null — 3.9 is not an integer
-print(3.0 as? i32)                 // 3
-print(5000000000 as? i32)          // null — out of i32's range
+function toI32(d: f64): i32 | null { d as? i32 }
+print(toI32(3.9))                  // null — 3.9 is not an integer
+print(toI32(3.0))                  // 3
+print(toI32(5000000000.0))         // null — out of i32's range
 ```
+
+A cast of a constant that can never succeed is refused when the program is checked:
+`3.9 as? i32` is refused with "constant 3.9 is not a whole number, so `i32` cannot hold
+it — `as?` on it would be null on every run".
 
 A **fraction fails the same way an out-of-range value does** — a float-to-integer cast
 never rounds, so it needs an *exact* integer value. `2.5 as! i32` traps
@@ -179,6 +300,21 @@ Storing into a `u8[]` **without** the cast still keeps the low byte and never co
 (`bytes.push(300)` stores 44) — the cast is the check the store is not. See
 [`collections-design.md`](collections-design.md) §"What you write TODAY" for the store.
 
+A **`boolean` converts to a number only through `as`**: `b as i32` is 1 for `true` and 0 for
+`false`, and so is `b as u8`, `b as i64`, `b as f32` or `b as f64`. The conversion is exact, so
+it never fails — `as!` never traps and `as?` is the plain number. A `boolean` is never accepted
+where a number is expected without it, at any position (a binding, an argument, a return, a
+field, a list element, a push, a map value); the error names the cast to write. Counting is the
+usual use:
+
+```vl
+let n = 0
+for ok in results { n = n + ok as i32 }
+```
+
+The reverse has no cast — write the comparison you mean (`n != 0`). `as%` refuses a `boolean`,
+which has no width to wrap.
+
 A cast whose operand is a UNION picks an ARM instead, with the same three suffixes and the
 same meanings; `x as u8` is not that cast, and refuses a union operand rather than silently
 skipping the range test.
@@ -198,7 +334,7 @@ no trap, nothing to propagate. It is how a bit pattern is written down.
 ```vl
 print(0xb81a1aaa as% i32)          // -1206248790 — a hex literal is typed i64, this is its i32 bits
 print(300 as% u8)                  // 44
-print((0 - 1) as% u8)              // 255
+print(-1 as% u8)                   // 255 — the constant -1 (prefix `-` binds tighter than `as`)
 bytes.push((v >>> 24) as% u8)      // the top byte of any word, sign bit included
 ```
 
@@ -209,8 +345,8 @@ casts say what one cannot (`(u as! i32) as% u8`).
 
 A LITERAL operand is folded, so `0xb81a1aaa as% i32` is a constant and can be used as one. And
 `%` here can never be read as the remainder: the suffix is read only directly after `as`, and
-`as` only directly after a postfix operand, so `a % b`, `a as% u8 % b` and a binding named `as`
-all keep their meanings.
+`as` only directly after an operand (a postfix one, or one under prefix operators), so `a % b`,
+`a as% u8 % b` and a binding named `as` all keep their meanings.
 
 ## Breaking a long expression across lines
 
@@ -227,36 +363,39 @@ const ok2 = a == 1
 ```
 
 Everything in the precedence ladder above continues a line — `|| && ?? == != < <= > >= + * / %`,
-the bitwise and shift operators, and assignment — along with `.`, `?.`, `is`, and the four `as`
-casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
+the bitwise and shift operators, assignment, and `-` with a space after it (below) — along with
+`.`, `?.`, `is`, and the four `as` casts. Precedence is unaffected: the operator binds exactly as if the newline were a space, so
 `a` ⏎ `|| b` ⏎ `&& c` is `a || (b && c)`. Blank lines and comment lines between the two halves
 are free.
 
-**A leading `-` does not continue a line**, because `-x` is a legal statement and a block's last
-statement is its value:
+**A leading `-` continues a line only when a space or tab follows it.** `- x` is a subtraction
+from the line above; `-x`, with the minus touching its operand, is a statement of its own,
+because `-x` is a legal statement and a block's last statement is its value:
 
 ```vl
+const w = a * 3.0
+  - b * 3.5                // one expression: a * 3.0 - b * 3.5
+
 function f(): i32 {
   work()
   -x                       // the block's value is `-x`; NOT `work() - x`
 }
 ```
 
-Write the `-` at the end of the previous line, or parenthesize, to subtract across a break. The
-same holds for a line beginning with `!`, `(`, `[`, `{`, an identifier or a literal: each can
-start a statement, so each does. Inside an open `(`, `[` or object-literal `{` there is no
-statement a newline could end, so `-` continues there like everything else.
+A `-` at the very end of its line does not count as spaced: write the operand on the same
+line. A line beginning with `!`, `(`, `[`, `{`, an identifier or a literal can start a
+statement, so it does. Inside an open `(`, `[` or object-literal `{` there is no statement a
+newline could end, so `-` continues there with or without the space.
 
 `vl fmt` prints a chain it has to break with the operator at the START of each continuation
-line, one operand per line — except a chain with a `-` in it, which keeps every operator at the
-end of the line for the reason above:
+line, one operand per line, and always with a space after the operator:
 
 ```vl
 const label = prefix
   + ": "
   + describe(value)
 
-const span = end -
-  start +
-  padding
+const span = end
+  - start
+  + padding
 ```

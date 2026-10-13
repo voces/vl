@@ -68,6 +68,7 @@ import {
   type SeedOrigin,
   type SeedSource,
   type WasmChecker,
+  type WasmExactConstAt,
   type WasmImportedSource,
   type WasmMemberToken,
   type WasmRange,
@@ -78,6 +79,7 @@ import {
   type Completion,
   type CompletionKind,
   displayableType,
+  exactConstHover,
   docMarkdown,
   documentHighlightsFromRefs,
   type DocRefResolver,
@@ -1008,6 +1010,23 @@ connection.onHover(async (params): Promise<Hover | null> => {
         return undefined;
       });
   };
+  // The exact constant under the cursor (an un-annotated literal `const`): its value and,
+  // at a use, the type it took there — it has no single type for `hoverTypeAt` to give.
+  const wasmConst = async (): Promise<WasmExactConstAt | undefined> => {
+    if (wasmChecker?.constAt === undefined) return undefined;
+    return await wasmChecker
+      .constAt(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] constAt failed: ${err}`);
+        return undefined;
+      });
+  };
   // The `///` block above the DECLARATION the cursor's name resolves to (D9.11).
   // Asked once for the whole ladder: the rungs disagree about which query answers the
   // type, but they all name the same declaration, and `ensurePrepared` is memoised so
@@ -1067,6 +1086,11 @@ connection.onHover(async (params): Promise<Hover | null> => {
   if (wasmChecker === undefined) return null;
   if (!wordForHover) return null;
   const doc = await wasmDoc();
+  const exact = await wasmConst();
+  if (exact) {
+    const { code, note } = exactConstHover(wordForHover, exact);
+    return { contents: hoverMarkdown(code, doc, note) };
+  }
   const t = displayableType(await wasmHoverType());
   if (t) {
     return {
@@ -1199,7 +1223,7 @@ const toCompletionItem = (
 ): CompletionItem => {
   const item: CompletionItem = { label: c.name, kind: completionKind[c.kind] };
   if (c.detail !== undefined) {
-    item.labelDetails = { detail: typeLabelDetail(c.detail) };
+    item.labelDetails = { detail: c.labelDetail ?? typeLabelDetail(c.detail) };
   }
   if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
     item.documentation = {

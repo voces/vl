@@ -16,10 +16,10 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen } from "./support/tree.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER);
-const WASM_MERGE = `${ROOT}/node_modules/.bin/wasm-merge`;
+const WASM_MERGE = binaryen("wasm-merge");
 const HAVE_MERGE = exists(WASM_MERGE);
 if (!ENABLED) {
   console.warn(

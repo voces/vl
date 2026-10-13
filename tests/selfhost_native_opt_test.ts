@@ -21,9 +21,10 @@
 //
 // @test-timing opt
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { filePath } from "./support/filePath.ts";
+import { COMPILER, VL, exists, nativeEnv, binaryen } from "./support/tree.ts";
 
-const WASM_OPT = `${ROOT}/node_modules/.bin/wasm-opt`;
+const WASM_OPT = binaryen("wasm-opt");
 const CASES = new URL("./cases/", import.meta.url);
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -73,7 +74,7 @@ for (const rel of CASES_LIST) {
     name: `native-opt: ${rel} — vl build -O shrinks + vl run reproduces @log`,
     ignore: !ENABLED,
     fn: async () => {
-      const srcPath = new URL(rel, CASES).pathname;
+      const srcPath = filePath(new URL(rel, CASES));
       const want = logsOf(Deno.readTextFileSync(new URL(rel, CASES)));
       const tmp = await Deno.makeTempDir();
       try {
@@ -119,20 +120,23 @@ Deno.test({
     const tmp = await Deno.makeTempDir();
     try {
       const log = `${tmp}/cores.log`;
-      const wrap = `${tmp}/wasm-opt`;
+      const win = Deno.build.os === "windows";
+      const wrap = `${tmp}/wasm-opt${win ? ".cmd" : ""}`;
       Deno.writeTextFileSync(
         wrap,
-        `#!/bin/sh\necho "\${BINARYEN_CORES-unset}" >> "${log}"\nexec "${WASM_OPT}" "$@"\n`,
+        win
+          ? `@echo off\r\nif defined BINARYEN_CORES (>>"${log}" echo %BINARYEN_CORES%) else (>>"${log}" echo unset)\r\n"${WASM_OPT}" %*\r\n`
+          : `#!/bin/sh\necho "\${BINARYEN_CORES-unset}" >> "${log}"\nexec "${WASM_OPT}" "$@"\n`,
       );
-      Deno.chmodSync(wrap, 0o755);
-      const src = new URL("arith/ops.vl", CASES).pathname;
+      if (!win) Deno.chmodSync(wrap, 0o755);
+      const src = filePath(new URL("arith/ops.vl", CASES));
       const runs = async (env: Record<string, string>) => {
         try {
           Deno.removeSync(log);
         } catch { /* no earlier run */ }
         const b = await vl(["build", src, "-O", "-o", `${tmp}/o.wasm`], { VL_WASM_OPT: wrap, ...env });
         if (b.code !== 0) throw new Error(`vl build -O failed: ${b.err.trim().split("\n")[0]}`);
-        return Deno.readTextFileSync(log).trim().split("\n");
+        return Deno.readTextFileSync(log).trim().split(/\r?\n/);
       };
       if (Deno.env.get("BINARYEN_CORES") === undefined) {
         const cap = String(Math.min(4, navigator.hardwareConcurrency));

@@ -8,25 +8,37 @@ import {
   CharLit,
   FuncDecl,
   Ident,
+  LetDecl,
   Member,
   NullLit,
   NumLit,
   OptMember,
   P,
   Param,
+  Paren,
   StrLit,
   Unary,
+  aliasFnParamNames,
+  annTsWrittenOf,
   declHasExportKw,
   declNameTokOf,
   getDeclPropOf,
   nodeToks,
   paramDefaultOf,
+  tsFnParamNames,
 } from "./ast"
 import {
   SYM_MEM_METHOD,
   docCmtLine,
   docCmtMod,
   docCmtText,
+  expInfCol,
+  expInfEnd,
+  expInfLine,
+  expInfName,
+  expInfTok,
+  expInfType,
+  expInfUse,
   inlayCol,
   inlayKind,
   inlayLine,
@@ -36,6 +48,7 @@ import {
   isvalEnd,
   isvalLine,
   isvalLit,
+  isvalMsg,
   isvalName,
   isvalTok,
   isvalType,
@@ -44,18 +57,23 @@ import {
   memcName,
   memcTok,
   memcType,
+  rcoalCode,
   rcoalCol,
   rcoalEnd,
   rcoalLine,
+  rcoalMsg,
   rcoalTok,
   rcoalType,
+  rcoalWhy,
   redunECol,
   redunELine,
   redunName,
+  redunRet,
   redunSCol,
   redunSLine,
   redunTok,
   redunType,
+  scopeResConst,
   scopeResKind,
   scopeResName,
   scopeResRaw,
@@ -102,6 +120,7 @@ import {
 // completion detail), so it renders through the user pathway — `tyToStrUser` /
 // `tyToStructStrUser`, demangle then render — never the raw `tyToStr`, whose spelling
 // doubles as a canon and interner key and keeps its `$mN` mangles.
+import { cexDecText, cexLexeme, cexOfLexeme, cexOk } from "./const_exact"
 import { srcmapModOfTok } from "./srcmap"
 import {
   T,
@@ -109,10 +128,13 @@ import {
   TyNullable,
   TyObj,
   TyPrim,
+  TyUnion,
   assignable,
   cUserTypes,
   demangleName,
   inlayHole,
+  lbiConstUseTy,
+  lbiExactConstLit,
   nodeTyIxOf,
   strLitRecvTy,
   tyToStrUser,
@@ -212,15 +234,16 @@ export function symOccCovers(i: i32, line: i32, col: i32) {
   const ec = symOccEndCol(i)
   col >= sc && col <= ec
 }
-// The occurrence index covering (line, col), tightest span winning (a name
-// nested in a larger construct beats an outer one); -1 if the cursor is off any
-// identifier occurrence.
+// The entry module's occurrence index covering (line, col), tightest span winning (a
+// name nested in a larger construct beats an outer one); -1 if the cursor is off any
+// identifier occurrence. An imported module's occurrence at the same coordinates is
+// another file's, never the cursor's (D3476).
 export function symOccAt(line: i32, col: i32) {
   let best = -1
   let bestWidth = 0
   let i = 0
   while i < symOccTok.length {
-    if symOccCovers(i, line, col) {
+    if symOccCovers(i, line, col) && srcmapModOfTok(symOccTokOf(i)) == 0 {
       const w = symOccEndCol(i) - symOccStartCol(i)
       if best < 0 || w < bestWidth {
         best = i
@@ -253,7 +276,11 @@ function symGetterDefAt(line: i32, col: i32) {
   while k < symMemGetter.length {
     let m = 0
     while m < symMemNode.length {
-      if symMemNode[m] == symMemGetter[k] && symMemLine[m] == line {
+      if (
+        symMemNode[m] == symMemGetter[k]
+        && symMemLine[m] == line
+        && symMemInEntry(m)
+      ) {
         if col >= symMemCol[m] && col < symMemEndCol[m] {
           const decl = symMemGetterDecl[k]
           let i = 0
@@ -284,10 +311,16 @@ function symRefFillAt(line: i32, col: i32) {
   const binding = symOccDecl[occ]
   let i = 0
   while i < symOccTok.length {
-    if symOccDecl[i] == binding { symRefOcc.push(i) }
+    if symOccDecl[i] == binding && symOccInEntry(i) { symRefOcc.push(i) }
     i = i + 1
   }
   0
+}
+// Whether occurrence `i` is in the entry document: a position query's line and column are the
+// entry's, and another module's occurrence at the same coordinates is a different name (D3324).
+function symOccInEntry(i: i32) {
+  const tk = symOccTokOf(i)
+  tk >= 0 && srcmapModOfTok(tk) == 0
 }
 // The count of occurrences (declaration plus uses) of the binding under (line, col)
 // — find-references. `symRefAt(line, col, k)` returns the k-th such occurrence index,
@@ -313,30 +346,73 @@ function bindTypeOf(binding: i32) {
 // ── named function signature (hover) ─────────────────────────────────────────
 
 // A function binding hovers with its parameter names, which `TyFunc` does not carry,
-// so this zips the binding's `FuncDecl` parameter names with the type's parameter
-// types. "" when that does not apply and the caller falls back to the bare type: not
-// `FuncDecl`-declared, not a `TyFunc`, or a parameter count the two disagree on.
+// so this zips `declParamNames` (a `FuncDecl`'s, or those its annotation wrote) with the
+// type's parameter types. "" when that does not apply and the caller falls back to the bare
+// type: no names, not a `TyFunc`, or a parameter count the two disagree on.
 function fnSigStr(declNode: i32, ty: i32) {
-  if declNode < 0 || declNode >= P.nodes.length { return "" }
-  const nd = P.nodes[declNode]
-  if !(nd is FuncDecl) { return "" }
   if ty < 0 { return "" }
   const t = T.tys[ty]
   if !(t is TyFunc) { return "" }
-  if nd.fnParams.length != t.fnParamTypes.length { return "" }
+  const names = declParamNames(declNode, t.fnParamTypes.length)
+  if names.length == 0 && !declIsFunc(declNode) { return "" }
+  namedFnStr(names, ty)
+}
+// Function type `ty` rendered with `names` beside its parameters, or "" when `ty` is not a
+// function or the two disagree on arity.
+function namedFnStr(names: string[], ty: i32) {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if !(t is TyFunc) { return "" }
+  if names.length != t.fnParamTypes.length { return "" }
   let s = "("
   let i = 0
-  while i < nd.fnParams.length {
-    const pn = P.nodes[nd.fnParams[i]]
-    if !(pn is Param) { return "" }
+  while i < names.length {
     if i > 0 { s = s + ", " }
-    s = s + pn.parName + ": " + tyToStrUser(t.fnParamTypes[i])
+    s = s + names[i] + ": " + tyToStrUser(t.fnParamTypes[i])
     i = i + 1
   }
   s + ") => " + tyToStrUser(t.fnRet)
 }
+function declIsFunc(declNode: i32) {
+  if declNode < 0 || declNode >= P.nodes.length { return false }
+  P.nodes[declNode] is FuncDecl
+}
+// The parameter names of the callable `declNode` declares, when it takes exactly `arity`:
+// a `FuncDecl`'s own, or those a binding's function-type annotation wrote (`const g: (fn:
+// i32) => i32`, through an alias too). `[]` when neither applies.
+function declParamNames(declNode: i32, arity: i32): string[] {
+  const names: string[] = []
+  if declNode < 0 || declNode >= P.nodes.length { return names }
+  const nd = P.nodes[declNode]
+  if nd is FuncDecl {
+    if nd.fnParams.length != arity { return names }
+    let i = 0
+    while i < nd.fnParams.length {
+      const pn = P.nodes[nd.fnParams[i]]
+      if pn is Param {
+        names.push(demangleName(pn.parName))
+      } else {
+        names.push("")
+      }
+      i = i + 1
+    }
+    return names
+  }
+  tsFnParamNames(annTsWrittenOf(bindAnnOf(declNode)), arity, 0)
+}
+// The type annotation a `Param` or `LetDecl` binding carries, or -1.
+function bindAnnOf(ix: i32) {
+  const nd = P.nodes[ix]
+  if nd is Param { return nd.parType }
+  letAnnOf(ix)
+}
+function letAnnOf(ix: i32) {
+  const nd = P.nodes[ix]
+  if nd is LetDecl { return nd.letType }
+  -1
+}
 // The rendered type string of the binding under (line, col), or "" when the cursor is
-// off any tracked binding or its type is not retained. A `FuncDecl`-declared binding
+// off any tracked binding or its type is not retained. A binding with parameter names
 // renders as its named signature (`fnSigStr`); a use under a flow narrowing renders
 // the narrowed type bare, since `fnSigStr` would zip names against a type not in force.
 export function symTypeStrAt(line: i32, col: i32) {
@@ -349,6 +425,57 @@ export function symTypeStrAt(line: i32, col: i32) {
     if sig != "" { return sig }
   }
   tyToStrUser(ty)
+}
+
+// Exact-constant hover: "" off an un-annotated literal `const`; else `decl` or `use`, the type
+// this read took ("" at the declaration), then `cqConstFields`, one per line.
+export function symConstAt(line: i32, col: i32) {
+  const occ = symOccAt(line, col)
+  if occ < 0 || occ >= symOccDecl.length { return "" }
+  const f = cqConstFields(symOccDecl[occ])
+  if f == "" { return "" }
+  if symOccIsDecl[occ] == 1 { return "decl\n\n" + f }
+  // The literal's own type at this read, which is what compiles; none rather than a guess.
+  const ty = lbiConstUseTy(occ)
+  let ts = ""
+  if ty >= 0 { ts = tyToStrUser(ty) }
+  "use\n" + ts + "\n" + f
+}
+
+// The exact constant declared at `decl`, one field per line: its kind (`int`, `float` or
+// `pattern`), its value as shown (a pattern as written), and a pattern's signed magnitude in
+// decimal ("" otherwise). "" when `decl` is no exact constant.
+export function cqConstFields(decl: i32) {
+  cqConstPeel(lbiExactConstLit(decl), false)
+}
+
+// `cqConstFields` for the literal under parentheses and negations at `ix`, negated when `neg`.
+function cqConstPeel(ix: i32, neg: boolean): string {
+  if ix < 0 { return "" }
+  const n = P.nodes[ix]
+  if n is NumLit { return cqConstOfLit(n.numText, neg) }
+  if n is Paren { return cqConstPeel(n.parInner, neg) }
+  if n is Unary {
+    if n.unOp == "-" { return cqConstPeel(n.unArg, !neg) }
+    return ""
+  }
+  cqConstNone()
+}
+
+// Every other node holds no literal a constant could show.
+function cqConstNone(): string { "" }
+
+// `cqConstFields` for the literal `text`, negated when `neg`.
+function cqConstOfLit(text: string, neg: boolean) {
+  const v = cexOfLexeme(text)
+  if !cexOk(v) { return "" }
+  let sign = ""
+  if neg { sign = "-" }
+  if v.cxFloat { return "float\n" + sign + cexLexeme(v) + "\n" }
+  const dec = cexDecText(v)
+  if v.cxPat { return "pattern\n" + sign + text + "\n" + sign + dec }
+  if dec == "0" { sign = "" }
+  "int\n" + sign + dec + "\n"
 }
 function inlayPush(k: i32, occ: i32, ty: i32) {
   inlayKind.push(k)
@@ -374,8 +501,9 @@ export function symInlayScan() {
           if t is TyFunc {
             if !inlayHole(t.fnRet) { inlayPush(1, i, t.fnRet) }
           }
-        } else {
-          if !inlayHole(ty) { inlayPush(0, i, ty) }
+        } else if !inlayHole(ty) && cqConstFields(symOccDecl[i]) == "" {
+          // An exact constant has no single type to annotate; its hover shows its value.
+          inlayPush(0, i, ty)
         }
       }
     }
@@ -398,15 +526,22 @@ export function redunEColAt(i: i32) { redunECol[i] }
 export function redunNameAt(i: i32) { redunName[i] }
 export function redunTypeAt(i: i32) { redunType[i] }
 export function redunTokAt(i: i32) { redunTok[i] }
+export function redunRetAt(i: i32) { redunRet[i] }
 // The finding's human message, and the single spelling of it: the CLI report,
 // `--fix`'s companion output and the wasm driver's `redunMsg*` byte ABI all read it
 // here, so no consumer can drift from another's wording.
 export function redunMsgAt(i: i32) {
+  let advice = " — remove it to lean on inference"
+  // `--fix` keeps a return annotation, so the hint does not ask for what the fixer declines.
+  if redunRet[i] {
+    advice = " — `--fix` keeps a return annotation as the signature's documentation; remove it by hand if it is not"
+  }
   "redundant type annotation: `"
     + redunName[i]
     + "` is inferred as `"
     + redunType[i]
-    + "` — remove it to lean on inference"
+    + "`"
+    + advice
 }
 // ── dead `??` defaults ───────────────────────────────────────────────────────
 // The checker's `rcoal*` findings, read exactly as `redun*` is: count plus per-index
@@ -417,10 +552,18 @@ export function rcoalLineAt(i: i32) { rcoalLine[i] }
 export function rcoalColAt(i: i32) { rcoalCol[i] }
 export function rcoalEndAt(i: i32) { rcoalEnd[i] }
 export function rcoalTokAt(i: i32) { rcoalTok[i] }
+// The finding's lint code: a dead `??` default, a dead null test or a deep record `==`.
+export function rcoalCodeAt(i: i32) { rcoalCode[i] }
 // The single spelling of this diagnostic. It says what is dead (the default), why (the
 // left operand's type), and what to do — the convention the emitter-capability errors
 // follow: name the construct, then the action after an em dash.
 export function rcoalMsgAt(i: i32) {
+  if rcoalMsg[i] != "" { return rcoalMsg[i] }
+  if rcoalWhy[i] != "" {
+    return "this `??` default is never used: "
+      + rcoalWhy[i]
+      + " — drop the `??` and its default"
+  }
   "this `??` default is never used: `"
     + rcoalType[i]
     + "` is never null — drop the `??` and its default"
@@ -437,6 +580,7 @@ export function isvalTokAt(i: i32) { isvalTok[i] }
 // and the fix — a distinguishable arm, since `string | "err"` cannot tell a failure
 // from a string that reads "err".
 export function isvalMsgAt(i: i32) {
+  if i < isvalMsg.length && isvalMsg[i] != "" { return isvalMsg[i] }
   "`"
     + isvalName[i]
     + "` is `"
@@ -444,6 +588,31 @@ export function isvalMsgAt(i: i32) {
     + "` — `is "
     + isvalLit[i]
     + "` is a value test (`==`) and cannot tell a failure from data; give the failure a distinguishable arm (`| null` or a struct)"
+}
+
+// The finding's lint code: a contained `is` arm, or a value test over a collapsed arm.
+export function isvalCodeAt(i: i32) {
+  if i < isvalMsg.length && isvalMsg[i] != "" { return "contained-arm-is-test" }
+  "collapsed-arm-value-test"
+}
+
+// ── An uncalled entry export's parameter inferred from its body (D3817) ─────
+// Read exactly as `isval*` is; the fix inserts `: <type>` at the name's end.
+export function expInfCount() { expInfTok.length }
+export function expInfLineAt(i: i32) { expInfLine[i] }
+export function expInfColAt(i: i32) { expInfCol[i] }
+export function expInfEndAt(i: i32) { expInfEnd[i] }
+export function expInfTokAt(i: i32) { expInfTok[i] }
+export function expInfTypeAt(i: i32) { expInfType[i] }
+// The single spelling of this hint.
+export function expInfMsgAt(i: i32) {
+  "`"
+    + expInfName[i]
+    + "` inferred as "
+    + expInfType[i]
+    + " from "
+    + expInfUse[i]
+    + "; annotate to freeze the export"
 }
 
 // The text a `///` line contributes: the lexeme past the three slashes, with ONE
@@ -657,6 +826,24 @@ function tscDocOf(i: i32) {
   tscDocBuf
 }
 
+// The hover text of user type `key`, whose type is `ty`. A function alias (a one-member union
+// over a `TyFunc`) shows the parameter names its declaration wrote; anything else takes the
+// structural render, since the query asks what the name stands for (not `Pt` for `Pt`).
+function aliasHoverStr(key: string, ty: i32) {
+  let fty = ty
+  const tu = T.tys[ty]
+  if tu is TyUnion {
+    if tu.uMembers.length == 1 { fty = tu.uMembers[0] }
+  }
+  const tf = T.tys[fty]
+  if tf is TyFunc {
+    const n = tf.fnParamTypes.length
+    const named = namedFnStr(aliasFnParamNames(key, n), fty)
+    if named != "" && n > 0 { return named }
+  }
+  tyToStructStrUser(ty)
+}
+
 // Type-alias hover: the rendered type of the user type name (a `type`-declared struct
 // or union alias) whose token covers (line, col), or "" when the cursor is off one. A
 // type name is not a value-binding occurrence, so this scans the token stream and
@@ -674,10 +861,12 @@ export function symTypeAliasAt(line: i32, col: i32) {
       // A multi-module merge renames the entry's own type decls (`W` → `W$m0`), so the
       // map's key is mangled while the token still reads `W`. -1 is a clean miss.
       let ty = cUserTypes[t.text] ?? (-1)
-      if ty < 0 { ty = cUserTypes[t.text + "$m0"] ?? (-1) }
-      // The one display query that wants the structural render: it is handed the name
-      // and asks what it stands for, so a nominal render would answer `Pt` for `Pt`.
-      if ty >= 0 { return tyToStructStrUser(ty) }
+      let key = t.text
+      if ty < 0 {
+        key = t.text + "$m0"
+        ty = cUserTypes[key] ?? (-1)
+      }
+      if ty >= 0 { return aliasHoverStr(key, ty) }
     }
     i = i + 1
   }
@@ -702,7 +891,12 @@ function symMemIxAt(line: i32, col: i32) {
   let bestW = 0
   let i = 0
   while i < symMemNode.length {
-    if symMemLine[i] == line && col >= symMemCol[i] && col <= symMemEndCol[i] {
+    if (
+      symMemLine[i] == line
+      && col >= symMemCol[i]
+      && col <= symMemEndCol[i]
+      && symMemInEntry(i)
+    ) {
       const w = symMemEndCol[i] - symMemCol[i]
       if best < 0 || w < bestW {
         best = i
@@ -712,6 +906,14 @@ function symMemIxAt(line: i32, col: i32) {
     i = i + 1
   }
   best
+}
+// Whether member access `i` is in the entry document, whose coordinates a position query
+// names; an imported module's access at the same line and column is another file's (D3324).
+function symMemInEntry(i: i32) {
+  const n = symMemNode[i]
+  if n < 0 || n >= nodeToks.length { return false }
+  const tk = nodeToks[n]
+  tk >= 0 && srcmapModOfTok(tk) == 0
 }
 // Whether type `ty` is a function — the `method` vs `property` distinction for
 // semantic tokens. Unwraps a nullable wrapper so an optional method (`o?.fn`)
@@ -801,6 +1003,7 @@ export function symScopeAt(line: i32, col: i32) {
   scopeResType = []
   scopeResRaw = []
   scopeResTok = []
+  scopeResConst = []
   const resVis: i32[] = []
   const idxByName: {[string]: i32} = Map()
   let i = 0
@@ -817,12 +1020,14 @@ export function symScopeAt(line: i32, col: i32) {
         scopeResType.push(symBindTypeStr(symVisNode[i]))
         scopeResRaw.push(symVisName[i])
         scopeResTok.push(visDeclTok(symVisNode[i]))
+        scopeResConst.push(cqConstFields(symVisNode[i]))
         resVis.push(i)
       } else if visTighter(i, resVis[existing]) {
         scopeResKind[existing] = symVisKind[i]
         scopeResType[existing] = symBindTypeStr(symVisNode[i])
         scopeResRaw[existing] = symVisName[i]
         scopeResTok[existing] = visDeclTok(symVisNode[i])
+        scopeResConst[existing] = cqConstFields(symVisNode[i])
         resVis[existing] = i
       }
     }
@@ -1279,8 +1484,8 @@ function sigDefaultText(pIx: i32): string {
   }
   ""
 }
-// Fill the table from function type `ty`, naming the parameters off `declNode`'s
-// `FuncDecl` when there is one and it agrees on arity — a disagreeing pair would label
+// Fill the table from function type `ty`, naming the parameters by `declParamNames`
+// when they agree on arity — a disagreeing pair would label
 // argument k with parameter k+1's name. `skip` drops leading parameters, 1 for a UFCS
 // call. Returns the row count, or -1 when `ty` is not a function.
 function sigFill(declNode: i32, ty: i32, skip: i32) {
@@ -1289,18 +1494,16 @@ function sigFill(declNode: i32, ty: i32, skip: i32) {
   if !(t is TyFunc) { return -1 }
   const pts = t.fnParamTypes
   if skip > pts.length { return -1 }
-  const names: string[] = []
+  const names = declParamNames(declNode, pts.length)
   const dflts: string[] = []
   if declNode >= 0 && declNode < P.nodes.length {
     const nd = P.nodes[declNode]
     if nd is FuncDecl {
+      // Same arity gate as the names, and for the same reason: a
+      // disagreeing pair would attach parameter k+1's default to argument k.
       if nd.fnParams.length == pts.length {
         let i = 0
         while i < nd.fnParams.length {
-          const pn = P.nodes[nd.fnParams[i]]
-          if pn is Param { names.push(pn.parName) } else { names.push("") }
-          // Same arity gate as the names, and for the same reason: a
-          // disagreeing pair would attach parameter k+1's default to argument k.
           dflts.push(sigDefaultText(nd.fnParams[i]))
           i = i + 1
         }

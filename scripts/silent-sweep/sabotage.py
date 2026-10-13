@@ -50,7 +50,7 @@ WRONG = [
     ("namedlit", 'type K = "p" | "q"\nconst k: K = "p"\nprint(k)', ["q"]),
     ("struct", "type S = { w: i32 }\nconst s: S = { w: 5 }\nprint(s.w)", ["6"]),
     ("list", "const xs: i32[] = [1, 2]\nprint(xs.length)", ["3"]),
-    ("map", 'const m: {[string]: i32} = Map()\nm["k"] = 1\nprint(m.size)', ["2"]),
+    ("map", 'const m: {[string]: i32} = Map()\nm["k"] = 1\nprint(m.length)', ["2"]),
     ("closure", "const f: (i32) => i32 = (x) => x + 1\nprint(f(3))", ["5"]),
     ("nulstr", 'function b(p: string | null) { if p != null { print(p) } else { print("NUL") } }\nb("aa")',
      ["NUL"]),

@@ -728,6 +728,9 @@ width in bytes); it is a hint, not a constraint, and §H4 pins that.
 | `__load_i64__(a)` | `i64.load` | `0x29` | `29 03 00` | i64 |
 | `__load_f32__(a)` | `f32.load` | `0x2a` | `2a 02 00` | f32 |
 | `__load_f64__(a)` | `f64.load` | `0x2b` | `2b 03 00` | f64 |
+| `__load_u8_i64__(a)` | `i64.load8_u` | `0x31` | `31 00 00` | i64, zero-extended |
+| `__load_u16_i64__(a)` | `i64.load16_u` | `0x33` | `33 01 00` | i64, zero-extended |
+| `__load_u32_i64__(a)` | `i64.load32_u` | `0x35` | `35 02 00` | i64, zero-extended |
 | `__memory_size__()` | `memory.size` | `0x3f` | `3f 00` | i32, pages |
 | `__memory_grow__(n)` | `memory.grow` | `0x40` | `40 00` | i32, PREVIOUS pages, or -1 |
 | *(control)* `__load_i32__` | `i32.load` | `0x28` | `28 02 00` | unchanged |
@@ -740,6 +743,25 @@ Every module built for this table passes `wasm-tools validate`, and the wide tri
 signatures come out as `(param i32) (result i64|f32|f64)` — i.e. the checker's declared return types
 reach the wasm type section, which is what makes `print(__load_f64__(0))` route to `__print_f64__` in
 a program that spells `f64` nowhere.
+
+The three `__load_u*_i64__` rows (plumb PL-048) are the non-atomic twins of
+`__atomic_load{8,16,32}_u_i64__`: a zero-extended i64 in one instruction. There is no signed trio —
+`__load_i32__(a) as i64` is already `i64.load32_s` once binaryen runs. The emitter also FOLDS the
+spellings that mean the same load (`zextLoadOf`, `compiler/wasmEmit.vl`), so source written before
+the intrinsics existed gets the instruction too:
+
+| spelling | lowers to |
+| --- | --- |
+| `(__load_i32__(a, k) as% i64) & 0xffffffff` (or `as i64`, mask on either side) | `i64.load32_u offset=k` |
+| `__load_u16__(a) as i64` / `as% i64`, bare or `& 0xffff` / `& 0xffffffff` | `i64.load16_u` |
+| `__load_u8__(a) as i64` / `as% i64`, bare or `& 0xff` / `& 0xffff` / `& 0xffffffff` | `i64.load8_u` |
+| any of the above `& M` again, `M` covering the width | the same load |
+
+A mask is an integer literal or a top-level `i64` const bound to one. Any other mask is not a
+zero-extend and keeps its `i64.and` — `& 0xfffffffe`, or `& 0xff` over a 16-bit load; an `i32`
+const is refused because widening it sign-extends. Binaryen already folds the widening of a narrow
+unsigned load but never drops the mask, so without the fold every such load cost one `i64.and`.
+`tests/vl_zext_load_fold_test.ts` reads the instructions at both rungs.
 
 ### H3. Exported memory, and its gate
 
@@ -2412,6 +2434,31 @@ wasmtime gives back the melt on the four one-view kernels that collapsed (`scale
 (`--always-inline-max-function-size=60`) and M8's hoisted accessors are unaffected; what M4 attributes to a second call site is now what every kernel
 behind a run-once driver pays under wasmtime, which is where L4 (emit-time scalar replacement of
 a descriptor) would pay off.
+
+### M10. The descriptor travels as fields: no reload left (2026-10-04, D3625)
+
+The `-O`/`-O3` multi-value step (DECISIONS.md, "`-O` returns a small record's fields as
+multi-value") is that scalar replacement, done at the call boundary instead of at emit time.
+A view descriptor is a small record no `struct.set` names, so `f32view` gets a twin returning
+its fields, and `getF32`/`setF32`/`Buf.loadF32` get twins taking the descriptor as fields: the
+kernel holds `base` and `length` in locals and reads no field per element. The `sget` column of
+every `view` and `buf` row in M7's tests is now 0 at both rungs, and M9's run-once driver no
+longer matters for it. Every `trap` cell is unchanged: M2's answer stands, the check is still
+emitted per access, and it is the cheap part.
+
+`vl run` wall seconds, `-O3`, min of 3 (startup included; load 4–12), step off → on, every
+output identical to the unoptimized run:
+
+| kernel | off | on | | kernel | off | on |
+| --- | --- | --- | --- | --- | --- | --- |
+| `scale-view` | 0.38 | 0.23 | | `scale-buf` | 0.28 | 0.23 |
+| `scale-accessor` | 0.36 | 0.24 | | `reduce-buf` | 0.23 | 0.16 |
+| `scale-seedtwice` | 0.36 | 0.22 | | `rows-buf` | 0.35 | 0.24 |
+| `reduce-view` | 0.25 | 0.18 | | `axpy-buf` | 0.34 | 0.27 |
+| `rows-view` | 0.48 | 0.27 | | `scale-hoist` (control) | 0.20 | 0.18 |
+| `axpy-view` | 0.51 | 0.28 | | `axpy-hoist` (control) | 0.23 | 0.24 |
+
+The fenced `view` spelling now runs within 0.05 s of the hand-hoisted one.
 
 ## N. The allocator over a shared memory (2026-09-24)
 

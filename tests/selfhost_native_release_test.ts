@@ -5,12 +5,12 @@
 //
 // @test-timing opt
 import {
+  binaryen,
   COMPILER,
   ENABLED,
   MELT,
   ROOT,
   VL,
-  WASM_DIS,
   WASM_OPT,
   buildAndCount,
   exists,
@@ -18,6 +18,7 @@ import {
   rustList,
   vl,
 } from "./support/nativeRelease.ts";
+import { wasmDis } from "./support/tree.ts";
 
 Deno.test({
   name: "native-release: the feature enables accept a return_call module at BOTH rungs",
@@ -42,7 +43,7 @@ Deno.test({
     };
     try {
       const base = `${tmp}/tc.wasm`;
-      const asm = await sh(`${ROOT}/node_modules/.bin/wasm-as`, [wat, ...features, "-o", base]);
+      const asm = await sh(binaryen("wasm-as"), [wat, ...features, "-o", base]);
       if (asm.code !== 0) throw new Error(`wasm-as rejected the fixture: ${asm.err.trim()}`);
 
       for (const [label, passes] of [
@@ -60,11 +61,7 @@ Deno.test({
         }
         // The opcode must SURVIVE: an optimizer that silently rewrote it back to a
         // plain `call` would pass the exit-status check while undoing the 2.0x.
-        const dis = await new Deno.Command(WASM_DIS, {
-          args: [out, ...features],
-          stdout: "piped",
-          stderr: "piped",
-        }).output();
+        const dis = await wasmDis([out, ...features]);
         if (!new TextDecoder().decode(dis.stdout).includes("return_call")) {
           throw new Error(`${label} removed the return_call (the tail call did not survive)`);
         }

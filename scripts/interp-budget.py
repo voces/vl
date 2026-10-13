@@ -40,7 +40,7 @@ TREES = ("compiler", "std", "scripts")
 # whose spelling is what they test, and matrix templates, which are not programs.
 SKIP = ("scripts/silent-sweep/distilled/", "scripts/capability-probes/matrix/")
 VL = os.environ.get("VL", os.path.join(ratchet.ROOT, "scripts", "vl-host", "target",
-                                       "release", "vl"))
+                                       "release", "vl.exe" if os.name == "nt" else "vl"))
 SEED = os.path.join(ratchet.ROOT, "build", "vl-compiler.wasm")
 
 
@@ -78,7 +78,7 @@ def findings(root):
 
     def one(target):
         p = subprocess.run([VL, "check", target, "--severity", "info", "--json",
-                            "--compiler", SEED], cwd=root, env=env,
+                            "--include-imports", "--compiler", SEED], cwd=root, env=env,
                            capture_output=True, text=True, timeout=600)
         text = p.stdout.strip()
         if p.returncode > 2 or not text.startswith("["):

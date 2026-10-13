@@ -21,6 +21,8 @@ import {
   Call,
   CharLit,
   ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
@@ -41,7 +43,9 @@ import {
   Paren,
   Program,
   RetStmt,
+  Spread,
   StrLit,
+  TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
@@ -53,19 +57,23 @@ import {
   declNameTokOf,
   elseIfLink,
   externGlobalLinkOfNode,
+  i32ToStr,
+  nodeChildren,
   nodeSpineChildren,
   nodeToks,
   stmtAlwaysExits,
 } from "./ast"
 // The free index-operator declaration-name encoding.
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
-import { getDeclLabel, getDeclPropOf } from "./ast"
+import { brkValSeen, getDeclLabel, getDeclPropOf, letWasRetyped } from "./ast"
 import {
   nodeLastTok,
   nodeSpanEndTok,
   nodeStartTok,
   tokFirstLineEndCol,
 } from "./fmt_util"
+import { strListHas } from "./listutil"
+import { demangleSpelling } from "./tyname"
 
 // ── diagnostic sink ──────────────────────────────────────────────────────────
 
@@ -149,7 +157,8 @@ function lintEmitAtSpan(
   endCo: i32,
 ) {
   lintCodes.push(code)
-  lintMsgs.push(msg)
+  // A binding the merge renamed apart (`print$m0`) is named by its source spelling.
+  lintMsgs.push(demangleSpelling(msg))
   lintSevs.push(sev)
   lintLines.push(ln)
   lintCols.push(co)
@@ -198,6 +207,7 @@ export function lint(progRoot: i32) {
     duplicateImports(stmts)
     unusedFunctions(stmts)
     preferConst()
+    vecReportScanned()
     // One walk offers every node to every structural rule; the regroup restores
     // the rule-major emit sequence a same-position tie reads.
     const walkMark = lintCodes.length
@@ -207,6 +217,8 @@ export function lint(progRoot: i32) {
     // The typed links describe one module's text; a caller that does not hand them in
     // again is judged as having none, never as having the previous module's.
     lintSetPlusLinks(Map(), false)
+    lintSetStrIndexes(Map(), false)
+    lintSetScalarReads(Map(), false)
     // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
     // the arena. All four read the source the driver set, and `commentBudget` consumes
     // it, so it runs last — after the std audience pass, which reads the same text.
@@ -233,9 +245,13 @@ export function lint(progRoot: i32) {
 function unionLetNoMeltVisit(ix: i32) {
   const n = P.nodes[ix]
   let body = -1
-  if n is WhileStmt { body = n.whileBody }
-  else if n is ForRange { body = n.frBody }
-  else if n is ForIn { body = n.fiBody }
+  if n is WhileStmt {
+    if n.whileBlk == 0 { body = n.whileBody }
+  } else if n is ForRange {
+    body = n.frBody
+  } else if n is ForIn {
+    body = n.fiBody
+  }
   if body < 0 { return 0 }
   reportUnionLetsIn(body, body)
   0
@@ -667,9 +683,9 @@ function blockRereads(ix: i32, recvName: string, key: i32) {
 // another after it in the same list can have its value discarded for sure.
 
 // Trivially pure is a closed syntactic whitelist — literals, a bare identifier read,
-// `(e)` over pure, an array or struct literal of pure parts, and an operator
-// expression whose every leaf is a literal. The literal-leaf bound is soundness: VL
-// has operator overloading, and dispatch needs an object-typed left operand.
+// `(e)` over pure, an array or struct literal of pure parts, and an operator tree whose
+// leaves are literals or reads of plain scalars (`upeScalarOperand`). The scalar bound is
+// soundness: VL has operator overloading, and dispatch needs a non-scalar operand.
 function unusedPureExprVisit(ix: i32) {
   const n = P.nodes[ix]
   if n is Block { reportUnusedPureIn(n.blkStmts) }
@@ -682,17 +698,195 @@ function unusedPureExprVisit(ix: i32) {
 function reportUnusedPureIn(stmts: i32[]) {
   let i = 0
   while i + 1 < stmts.length {
-    if upeIsPure(stmts[i]) {
-      lintEmit(
-        "unused-pure-expression",
-        "This expression has no effect: it is not the final statement of its block, so its value is discarded",
-        "warning",
-        stmts[i],
-      )
+    // The statement before a `break v` is that break's value, not a discarded one.
+    let isBrkVal = false
+    const nxi = stmts[i + 1]
+    if brkValSeen && nxi >= 0 && nxi < P.nodes.length {
+      const nx = P.nodes[nxi]
+      if nx is BreakStmt { isBrkVal = nx.brkHasVal == 1 }
+    }
+    const st = stmts[i]
+    // A line led by `-` is reported whatever its operands: the claim is only that its value
+    // is discarded, which holds of every operator statement before the last.
+    const minus = i > 0 && upeLeadsWithMinus(st)
+    if !isBrkVal && (minus || upeIsPure(st) || upeScalarOperand(st, 0)) {
+      let msg = "This expression has no effect: it is not the final statement of its block, so its value is discarded"
+      if minus {
+        msg = upeMinusStmtMsg
+        if upeEndsInExpr(stmts[i - 1]) { msg = upeMinusMsg }
+      }
+      const first = nodeStartTok(st)
+      if first < 0 {
+        lintEmit("unused-pure-expression", msg, "warning", st)
+      } else {
+        lintEmitAtSpan(
+          "unused-pure-expression",
+          msg,
+          "warning",
+          P.toks[first].line,
+          P.toks[first].col,
+          tokFirstLineEndCol(nodeSpanEndTok(st)),
+        )
+      }
     }
     i = i + 1
   }
   0
+}
+
+// A leading `-` continues the line above only with a space after it, so `a * 3.0` over
+// `-b * 3.5` is two statements and the second is thrown away.
+const upeMinusMsg = "this line is a separate statement; its value is discarded. If it continues the expression above, put a space after the `-`"
+
+// After a statement that ends in no expression a space would not help: the line is still its
+// own statement.
+const upeMinusStmtMsg = "this line is a separate statement; its value is discarded. If it continues an expression above, wrap it in parentheses or put the operator at the end of the previous line"
+
+// Whether statement `ix` ends in an expression, so a line-leading `- b` after it would
+// continue it: not a loop, an `if` statement, a block, a declaration or a valueless jump.
+function upeEndsInExpr(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const s = P.nodes[ix]
+  match s {
+    IfStmt | WhileStmt | ForRange | ForIn | Block | Program => false
+    FuncDecl | TypeDecl | UnionDecl | ImportDecl | Param | FieldDef | TypeRef => false
+    BreakStmt | ContinueStmt => false
+    RetStmt => s.retArg >= 0
+    LetDecl => s.letInit >= 0
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call => true
+    Member | OptMember | Paren | ErrExpr | FieldInit | ObjLit | ArrayLit | Index => true
+    IsExpr | AsExpr | MatchExpr | Spread => true
+  }
+}
+
+// Whether statement `ix` is an operator expression opening with a `-` on a line of its own,
+// below an earlier token.
+function upeLeadsWithMinus(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  let op = e is Unary
+  if e is BinExpr { op = e.binOp != "=" && e.binTpl == 0 }
+  if !op { return false }
+  const first = nodeStartTok(ix)
+  if first <= 0 || first >= P.toks.length { return false }
+  if P.toks[first].text != "-" { return false }
+  P.toks[first - 1].line < P.toks[first].line
+}
+
+// The reads under a discarded operator statement the check typed, by anchor byte offset: 1
+// when the read checked as an unbranded scalar on every check of it. Unknown unless the
+// caller paired this lint with its check; `upeAstIdx` then marks the names visibly scalar.
+let upeScalarBank: {[i32]: i32} = Map()
+let upeScalarKnown = false
+let upeAstIdx: i32[] = []
+
+export function lintSetScalarReads(sites: {[i32]: i32}, known: boolean) {
+  upeScalarBank = sites
+  upeScalarKnown = known
+  0
+}
+
+// Mark each name read under operator statement `ix` whose binding is visibly a plain scalar.
+// Run from the scope scan just before the statement, so a name resolves as it reads there.
+function upeAstMark(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return 0 }
+  const e = P.nodes[ix]
+  if e is Paren { return upeAstMark(e.parInner, depth + 1) }
+  if e is Unary { return upeAstMark(e.unArg, depth + 1) }
+  if e is BinExpr {
+    if e.binOp == "=" || e.binTpl == 1 { return 0 }
+    upeAstMark(e.binLeft, depth + 1)
+    return upeAstMark(e.binRight, depth + 1)
+  }
+  upeAstMarkName(ix)
+}
+
+// The leaf arm of `upeAstMark`: a name read is marked when its binding is a plain scalar;
+// every other leaf is left for the check's types.
+function upeAstMarkName(ix: i32) {
+  const e = P.nodes[ix]
+  if e is Ident {
+    if upeDeclScalar(lintBindDecl(e.identName)) {
+      while upeAstIdx.length <= ix { upeAstIdx.push(0) }
+      upeAstIdx[ix] = 1
+    }
+  }
+  0
+}
+
+// Whether declaration `d` binds a plain scalar: a parameter by its annotation, else
+// `upeLetScalar`.
+function upeDeclScalar(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is Param { return dn.parRest == 0 && upeAnnScalar(dn.parType) }
+  upeLetScalar(d)
+}
+
+// Whether `let`/`const` `d` binds a plain scalar: by its annotation, else by an initialiser
+// that is a tree of literals other than a bare `null`.
+function upeLetScalar(d: i32): boolean {
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 { return upeAnnScalar(dn.letType) }
+    const init = lintUnwrapParen(dn.letInit)
+    if init < 0 || init >= P.nodes.length || P.nodes[init] is NullLit {
+      return false
+    }
+    return upeLitOperand(init)
+  }
+  false
+}
+
+// Whether annotation node `t` spells a numeric primitive, `boolean` or `string`.
+function upeAnnScalar(t: i32): boolean {
+  if t < 0 || t >= P.nodes.length { return false }
+  const tn = P.nodes[t]
+  if tn is TypeRef {
+    const nm = tn.tyName
+    return nm == "i32"
+      || nm == "i64"
+      || nm == "f32"
+      || nm == "f64"
+      || nm == "boolean"
+      || nm == "string"
+  }
+  false
+}
+
+// Whether read `ix` is a plain scalar: a name `upeAstMark` marked, or a name or field read
+// the paired check typed as one.
+function upeScalarLeaf(ix: i32): boolean {
+  if ix < upeAstIdx.length && upeAstIdx[ix] == 1 { return true }
+  if !upeScalarKnown { return false }
+  const tk = nodeLastTok(ix)
+  if tk < 0 { return false }
+  (upeScalarBank[P.toks[tk].start] ?? 0) == 1
+}
+
+// The operator sub-language over plain scalars: a literal, a scalar read, `(e)`, unary `-` /
+// `!` / `~`, or a whitelisted binary other than `/` and `%` over a read. No overload can take
+// an operator whose operands are scalars, so the whole tree is pure.
+function upeScalarOperand(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return false }
+  const e = P.nodes[ix]
+  if e is Ident || e is Member { return upeScalarLeaf(ix) }
+  if e is Paren { return upeScalarOperand(e.parInner, depth + 1) }
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "!" || e.unOp == "~" {
+      return upeScalarOperand(e.unArg, depth + 1)
+    }
+    return false
+  }
+  if e is BinExpr {
+    if e.binTpl == 1 || !upePureBinOp(e.binOp) { return false }
+    // An integer `/` or `%` by a read can trap on zero; over literals it is decided here.
+    if e.binOp == "/" || e.binOp == "%" { return upeLitOperand(ix) }
+    return upeScalarOperand(e.binLeft, depth + 1)
+      && upeScalarOperand(e.binRight, depth + 1)
+  }
+  // A literal leaf, or nothing this sub-language admits.
+  upeLitOperand(ix)
 }
 
 // The closed binary-operator whitelist: every value-producing operator the parser
@@ -793,9 +987,10 @@ const lintRankDivZero = 7
 const lintRankRangeLen = 8
 const lintRankPreferInterp = 9
 const lintRankCompilerNoInterp = 10
-const lintRankCount = 11
+const lintRankByteAsCp = 11
+const lintRankCount = 12
 
-// Offer `ix` to all eleven structural rules, in rank order. Each visitor opens with its
+// Offer `ix` to all twelve structural rules, in rank order. Each visitor opens with its
 // own `is` test, so this is a flat unconditional sequence: there is no rule id to
 // dispatch on and no chain a new rule could be inserted into in the wrong place.
 function lintVisitAll(ix: i32) {
@@ -810,6 +1005,7 @@ function lintVisitAll(ix: i32) {
   rangeLenBoundVisit(ix)
   preferInterpVisit(ix)
   compilerNoInterpVisit(ix)
+  byteAsCpVisit(ix)
   0
 }
 
@@ -850,6 +1046,7 @@ function lintRankOfCode(code: string) {
   if code == "range-inclusive-length" { return lintRankRangeLen }
   if code == "prefer-interpolation" { return lintRankPreferInterp }
   if code == "compiler-no-interpolation" { return lintRankCompilerNoInterp }
+  if code == "byte-as-code-point" { return lintRankByteAsCp }
   lintRankCount
 }
 
@@ -924,7 +1121,11 @@ function constantBranchVisit(ix: i32) {
 function literalBool(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const e = P.nodes[ix]
-  if e is BoolLit { return e.boolVal }
+  // A literal minted with no position is a rewrite's scaffolding, not the author's condition.
+  if e is BoolLit {
+    if e.pos < 0 { return -1 }
+    return e.boolVal
+  }
   -1
 }
 
@@ -1276,6 +1477,932 @@ function piOperandSource(ix: i32) {
   const out = txSource.slice(lo, hi)
   if out.slice(0, ta.text.length) != ta.text { return "" }
   out
+}
+
+// ── 4f. a string's byte where a code point is meant (byte-as-code-point) ──────
+
+// `s[i]` over a `string` is a UTF-8 byte, a character only while the text is ASCII, so
+// `glyphOf(face, text[i])` letters `"Hrímey"` as mojibake. Fires where such a read flows
+// straight into a code-point position: `fromCodePoint`'s argument, a parameter of this
+// module named `cp` or `codePoint`, or a comparison with a non-ASCII character literal.
+const bacMsg = "`s[i]` is a byte, not a character; use `for cp in s` or `codePoints(s)[i]`"
+
+// The index reads the check typed, by anchor byte offset: 1 when the receiver checked as a
+// `string` on every check of it. Unknown unless the caller paired this lint with its check;
+// then `bacAstIdx` stands in, marking the reads whose receiver is visibly a string.
+let bacStrIdx: {[i32]: i32} = Map()
+let bacStrIdxKnown = false
+let bacAstIdx: i32[] = []
+
+export function lintSetStrIndexes(sites: {[i32]: i32}, known: boolean) {
+  bacStrIdx = sites
+  bacStrIdxKnown = known
+  0
+}
+
+function bacMark(ix: i32) {
+  if ix < 0 { return 0 }
+  while bacAstIdx.length <= ix { bacAstIdx.push(0) }
+  bacAstIdx[ix] = 1
+  0
+}
+
+// Whether expression `ix` is visibly a `string` without a checker: a literal, a template, a
+// name declared `string` or initialised from one, or a `.slice` of one. Run from the scope
+// scan, so a name resolves to the binding visible at the read.
+function bacAstStr(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 8 { return false }
+  const e = P.nodes[ix]
+  if e is StrLit { return true }
+  if e is Paren { return bacAstStr(e.parInner, depth + 1) }
+  if e is BinExpr { return e.binTpl == 1 }
+  bacSliceStr(ix, depth)
+}
+
+// The `.slice(…)` arm of `bacAstStr`; every other kind is a name or not a string.
+function bacSliceStr(ix: i32, depth: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Call {
+    if e.callFn < 0 || e.callFn >= P.nodes.length { return false }
+    const f = P.nodes[e.callFn]
+    if f is Member {
+      return f.memProp == "slice" && bacAstStr(f.memObj, depth + 1)
+    }
+    return false
+  }
+  bacNameStr(ix, depth)
+}
+
+// The name arm of `bacAstStr`: the binding the name resolves to, read by `bacDeclStr`.
+function bacNameStr(ix: i32, depth: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Ident {
+    const d = lintBindDecl(e.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    return bacDeclStr(d, depth)
+  }
+  false
+}
+
+// Whether declaration `d` binds a string: a parameter by its annotation, else `bacLetStr`.
+function bacDeclStr(d: i32, depth: i32): boolean {
+  const dn = P.nodes[d]
+  if dn is Param { return bacAnnIsStr(dn.parType) }
+  bacLetStr(d, depth)
+}
+
+// Whether `let`/`const` `d` binds a string, by its annotation or else its initialiser.
+function bacLetStr(d: i32, depth: i32): boolean {
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 { return bacAnnIsStr(dn.letType) }
+    return bacAstStr(dn.letInit, depth + 1)
+  }
+  false
+}
+
+// Whether annotation node `t` spells `string`.
+function bacAnnIsStr(t: i32): boolean {
+  if t < 0 || t >= P.nodes.length { return false }
+  const tn = P.nodes[t]
+  if tn is TypeRef { return tn.tyName == "string" }
+  false
+}
+
+// Whether index read `ix` is a string's byte, by the check's types when the caller paired them.
+function bacIsStrIndex(ix: i32): boolean {
+  if bacStrIdxKnown {
+    const tk = nodeLastTok(ix)
+    if tk < 0 { return false }
+    return (bacStrIdx[P.toks[tk].start] ?? 0) == 1
+  }
+  ix >= 0 && ix < bacAstIdx.length && bacAstIdx[ix] == 1
+}
+
+// Whether `ix` is a character literal naming a code point above U+007F, written as the
+// character itself or as a `\u{…}` escape.
+function bacNonAsciiChar(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is CharLit {
+    const t = e.charText
+    if t.length < 3 { return false }
+    if t[1] >= 128 { return true }
+    if t[1] != '\\' || t[2] != 'u' { return false }
+    let v = 0
+    let i = 4
+    while i < t.length && t[i] != '}' {
+      const c = t[i]
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      if v >= 128 { return true }
+      v = v * 16 + d
+      i = i + 1
+    }
+    return v >= 128
+  }
+  false
+}
+
+// Whether parameter name `nm` says the parameter is a code point.
+function bacCpParam(nm: string): boolean {
+  nm == "cp" || nm == "codePoint" || nm == "codepoint"
+}
+
+function byteAsCpVisit(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Call {
+    if n.callFn < 0 || n.callFn >= P.nodes.length { return 0 }
+    const f = P.nodes[n.callFn]
+    let name = ""
+    let shift = 0
+    if f is Ident { name = f.identName }
+    if f is Member {
+      name = f.memProp
+      shift = 1
+    }
+    if name == "fromCodePoint" && shift == 0 {
+      if n.callArgs.length == 1 { bacReport(n.callArgs[0]) }
+      return 0
+    }
+    bacCpArgs(n, name, shift)
+  } else if n is BinExpr {
+    const op = n.binOp
+    const cmp = op == "=="
+      || op == "!="
+      || op == "<"
+      || op == "<="
+      || op == ">"
+      || op == ">="
+    if !cmp { return 0 }
+    if bacNonAsciiChar(lintUnwrapParen(n.binRight)) { bacReport(n.binLeft) }
+    if bacNonAsciiChar(lintUnwrapParen(n.binLeft)) { bacReport(n.binRight) }
+  }
+  0
+}
+
+// Report each argument of call `n` to this module's function `name` that lands on a
+// code-point parameter; `shift` is 1 for a method call, whose receiver is parameter 0.
+function bacCpArgs(n: Call, name: string, shift: i32) {
+  const d = lintModFnDecl[name] ?? -1
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    let a = 0
+    while a < n.callArgs.length {
+      let named = ""
+      if a < n.callArgNames.length { named = n.callArgNames[a] }
+      if named != "" {
+        if bacCpParam(named) { bacReport(n.callArgs[a]) }
+      } else if a + shift < fd.fnParams.length {
+        const pix = fd.fnParams[a + shift]
+        if pix >= 0 && pix < P.nodes.length {
+          const pn = P.nodes[pix]
+          if pn is Param {
+            if pn.parRest == 0 && bacCpParam(pn.parName) {
+              bacReport(n.callArgs[a])
+            }
+          }
+        }
+      }
+      a = a + 1
+    }
+  }
+  0
+}
+
+// Report `ix0` when, under parentheses and `as` conversions, it is a string's byte. The
+// span is the whole `s[i]`.
+function bacReport(ix0: i32) {
+  let ix = lintUnwrapParen(ix0)
+  let more = true
+  while more && ix >= 0 && ix < P.nodes.length {
+    const e = P.nodes[ix]
+    more = false
+    if e is AsExpr {
+      ix = lintUnwrapParen(e.asObj)
+      more = true
+    }
+  }
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if !(P.nodes[ix] is Index) || !bacIsStrIndex(ix) { return 0 }
+  const first = nodeStartTok(ix)
+  if first < 0 { return 0 }
+  lintEmitAtSpan(
+    "byte-as-code-point",
+    bacMsg,
+    "warning",
+    P.toks[first].line,
+    P.toks[first].col,
+    tokFirstLineEndCol(nodeSpanEndTok(ix)),
+  )
+  0
+}
+
+// ── 4g. a small float list used as a vector (float-list-as-vector) ───────────
+
+// `[x, y, z]` as an `f64[]` allocates a list each time it is built, where a non-escaping
+// record `{ x, y, z }` is scalarised. Three positions qualify: returned, passed to an
+// `f64[]`/`f32[]` parameter the callee reads only as `p[0]`…, or bound to a local read only
+// that way. Syntactic and scope-resolved, so it runs inside `bindScan`.
+let vecFnRet = -1
+let vecInFn = false
+// Array literals in a returned position: the tail of a function body or a `return`.
+let vecRetLit: {[i32]: i32} = Map()
+// Per `Ident` node: 1 the array of a constant-index read, 2 the array of an index write.
+let vecIdxUse: {[i32]: i32} = Map()
+// Tracked bindings, by `declNodes` id: the element type, constant reads, any other use.
+let vecIds: i32[] = []
+let vecTy: {[i32]: string} = Map()
+let vecReads: {[i32]: i32} = Map()
+let vecOther: {[i32]: i32} = Map()
+// A parameter node's `declNodes` id, and the literal arguments waiting on one.
+let vecParamId: {[i32]: i32} = Map()
+let vecArgLits: i32[] = []
+let vecArgParams: i32[] = []
+let vecArgTys: string[] = []
+// The module function being scanned (-1 in a lambda or outside any), the returned literals
+// queued against one, each call of one with its node, and the call contexts seen.
+let vecFnDecl = -1
+let vecRetLits: i32[] = []
+let vecRetFns: i32[] = []
+let vecRetTys: string[] = []
+let vecCallIxs: i32[] = []
+let vecCallFns: i32[] = []
+// Per `Call` node: 1 read at a constant index, else the `declNodes` id of the local it binds
+// plus 2. A function named anywhere but as a callee is in `vecFnEscapes`.
+let vecCallCtx: {[i32]: i32} = Map()
+let vecCalleeIx: {[i32]: i32} = Map()
+let vecFnEscapes: {[i32]: i32} = Map()
+
+function vecReset() {
+  vecFnRet = -1
+  vecInFn = false
+  vecRetLit = Map()
+  vecIdxUse = Map()
+  vecIds = []
+  vecTy = Map()
+  vecReads = Map()
+  vecOther = Map()
+  vecParamId = Map()
+  vecArgLits = []
+  vecArgParams = []
+  vecArgTys = []
+  vecFnDecl = -1
+  vecRetLits = []
+  vecRetFns = []
+  vecRetTys = []
+  vecCallIxs = []
+  vecCallFns = []
+  vecCallCtx = Map()
+  vecCalleeIx = Map()
+  vecFnEscapes = Map()
+  0
+}
+
+// The type spelling of annotation node `t`, or "" when it is no plain `TypeRef`.
+function lintAnnName(t: i32): string {
+  if t < 0 || t >= P.nodes.length { return "" }
+  const tn = P.nodes[t]
+  if tn is TypeRef { return tn.tyName }
+  ""
+}
+
+// The element type of a `f64[]` / `f32[]` spelling, or "".
+function vecListElem(name: string): string {
+  if name == "f64[]" { return "f64" }
+  if name == "f32[]" { return "f32" }
+  ""
+}
+
+// The elements of `ix` when it is a list literal of 2 to 4 elements with no spread, else
+// an empty list.
+function vecLitElems(ix: i32): i32[] {
+  const none: i32[] = []
+  if ix < 0 || ix >= P.nodes.length { return none }
+  const e = P.nodes[ix]
+  if e is ArrayLit {
+    const els = e.arrElems
+    if els.length < 2 || els.length > 4 { return none }
+    let i = 0
+    while i < els.length {
+      const el = els[i]
+      if el < 0 || el >= P.nodes.length || P.nodes[el] is Spread { return none }
+      i = i + 1
+    }
+    return els
+  }
+  none
+}
+
+// Whether the numeric lexeme `t` is a float: a `.`, an exponent or an `f`/`d` suffix,
+// with no radix prefix.
+function lintNumLexIsFloat(t: string): boolean {
+  if t.length > 1 && t[0] == '0' {
+    const c = t[1]
+    if c == 'x' || c == 'X' || c == 'b' || c == 'B' || c == 'o' || c == 'O' {
+      return false
+    }
+  }
+  let i = 0
+  while i < t.length {
+    const ch = t[i]
+    if ch == '.' || ch == 'e' || ch == 'E' || ch == 'f' || ch == 'd' {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The float type expression `ix` visibly has: "f64" or "f32" by an annotation, `as` or a
+// module function's return type, "lit" for a float literal (it adapts), or "" when this
+// pass cannot tell. Names resolve through the scope stack as it stands.
+function vecFloatOf(ix: i32, depth: i32): string {
+  if ix < 0 || ix >= P.nodes.length || depth > 8 { return "" }
+  const e = P.nodes[ix]
+  match e {
+    NumLit => if lintNumLexIsFloat(e.numText) { "lit" } else { "" }
+    Paren => vecFloatOf(e.parInner, depth + 1)
+    Unary => if e.unOp == "-" { vecFloatOf(e.unArg, depth + 1) } else { "" }
+    Ident => vecFloatOfName(e.identName, depth)
+    AsExpr => vecFloatName(e.asTy)
+    Call => vecFloatName(lintAnnName(vecModFnRet(e.callFn)))
+    BinExpr => vecFloatOfArith(e, depth)
+    StrLit | CharLit | BoolLit | NullLit | Member | OptMember | Index => ""
+    ArrayLit | ObjLit | FieldInit | Spread | IsExpr | MatchExpr | ErrExpr => ""
+    FuncDecl | IfStmt | WhileStmt | ForRange | ForIn | Block | Program => ""
+    LetDecl | RetStmt | BreakStmt | ContinueStmt | TypeDecl | UnionDecl => ""
+    ImportDecl | Param | FieldDef | TypeRef => ""
+  }
+}
+
+// "f64" / "f32" for that type's spelling, else "".
+function vecFloatName(name: string): string {
+  if name == "f64" || name == "f32" { return name }
+  ""
+}
+
+// The float type of a name read: its parameter's or binding's annotation, else the
+// initialiser of an un-annotated binding.
+function vecFloatOfName(name: string, depth: i32): string {
+  const d = lintBindDecl(name)
+  if d < 0 || d >= P.nodes.length { return "" }
+  const ann = lintDeclAnn(d)
+  if ann >= 0 { return vecFloatName(lintAnnName(ann)) }
+  vecFloatOf(lintLetInit(d), depth + 1)
+}
+
+// The initialiser node of binding `d`, or -1 for a declaration that is no `let`/`const`.
+function lintLetInit(d: i32) {
+  const dn = P.nodes[d]
+  if dn is LetDecl { return dn.letInit }
+  -1
+}
+
+// The float type of `a op b` for `+ - * /`: both operands floats, or one a float and the
+// other an integer literal, which adapts to it.
+function vecFloatOfArith(e: BinExpr, depth: i32): string {
+  const op = e.binOp
+  if op != "+" && op != "-" && op != "*" && op != "/" { return "" }
+  if e.binTpl != 0 { return "" }
+  const l = vecFloatOf(e.binLeft, depth + 1)
+  const r = vecFloatOf(e.binRight, depth + 1)
+  if l != "" && r != "" { return vecFloatJoin(l, r) }
+  if l != "" && vecIsIntLit(e.binRight) { return l }
+  if r != "" && vecIsIntLit(e.binLeft) { return r }
+  ""
+}
+
+// The joint float type of two operands: a typed side wins over a literal.
+function vecFloatJoin(a: string, b: string): string {
+  if a == "lit" { return b }
+  a
+}
+
+// Whether `ix` is an integer literal, under parentheses.
+function vecIsIntLit(ix: i32): boolean {
+  const u = lintUnwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const e = P.nodes[u]
+  if e is NumLit { return !lintNumLexIsFloat(e.numText) }
+  false
+}
+
+// The return-type annotation of the module function a bare-name callee `fnIx` names, or -1.
+function vecModFnRet(fnIx: i32): i32 {
+  const d = vecModFnOf(fnIx, 0)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const fd = P.nodes[d]
+  if fd is FuncDecl { return fd.fnRet }
+  -1
+}
+
+// The declaration of the module function callee `fnIx` names, or -1, also when a binding
+// in scope hides the name. `shift` 1 also takes a method-call callee `x.f`.
+function vecModFnOf(fnIx: i32, shift: i32): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length { return -1 }
+  const f = P.nodes[fnIx]
+  let name = ""
+  if f is Ident { name = f.identName }
+  if shift == 1 {
+    if f is Member { name = f.memProp }
+  }
+  if name == "" || lintBindDecl(name) >= 0 { return -1 }
+  lintModFnDecl[name] ?? -1
+}
+
+// The element type list literal `ix` visibly has when every element is a float, else "".
+function vecLitFloatTy(ix: i32): string {
+  const els = vecLitElems(ix)
+  if els.length == 0 { return "" }
+  let ty = "lit"
+  let i = 0
+  while i < els.length {
+    const t = vecFloatOf(els[i], 0)
+    if t == "" { return "" }
+    ty = vecFloatJoin(ty, t)
+    i = i + 1
+  }
+  if ty == "lit" { return "f64" }
+  ty
+}
+
+// Enter function `n` at node `ix` for this rule: its return annotation, whether it is a
+// module function, and its body's tail marked as returned. Answers the annotation
+// `vecLeaveFn` restores.
+function vecEnterFn(n: FuncDecl, ix: i32): i32 {
+  const saved = vecFnRet
+  vecFnRet = n.fnRet
+  vecFnDecl = -1
+  if n.fnName != "" && (lintModFnDecl[n.fnName] ?? -1) == ix { vecFnDecl = ix }
+  vecInFn = true
+  let tail = n.fnBody
+  if tail >= 0 && tail < P.nodes.length {
+    const b = P.nodes[tail]
+    if b is Block {
+      tail = -1
+      if b.blkStmts.length > 0 { tail = b.blkStmts[b.blkStmts.length - 1] }
+    }
+  }
+  vecRetLit[lintUnwrapParen(tail)] = 1
+  saved
+}
+
+function vecLeaveFn(saved: i32, wasInFn: boolean, declSaved: i32) {
+  vecFnRet = saved
+  vecFnDecl = declSaved
+  vecInFn = wasInFn
+  0
+}
+
+// Track parameter `pix` (`declNodes` id `id`) when it is an `f64[]` / `f32[]`.
+function vecTrackParam(pix: i32, id: i32) {
+  const pn = P.nodes[pix]
+  if pn is Param {
+    if pn.parRest != 0 { return 0 }
+    const ty = vecListElem(lintAnnName(pn.parType))
+    if ty == "" { return 0 }
+    vecParamId[pix] = id
+    vecTrack(id, ty)
+  }
+  0
+}
+
+// Track binding `id` with element type `ty`, a local and a parameter alike.
+function vecTrack(id: i32, ty: string) {
+  vecIds.push(id)
+  vecTy[id] = ty
+  vecReads[id] = 0
+  vecOther[id] = 0
+  0
+}
+
+// The element type a function-local `let`/`const` at `ix` binds a vector-shaped literal
+// at, or "". Called before the binding is pushed, so its initialiser resolves as written.
+function vecLetCandidate(ix: i32): string {
+  if !vecInFn { return "" }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    const init = lintUnwrapParen(n.letInit)
+    if vecLitElems(init).length == 0 { return "" }
+    if n.letType >= 0 { return vecListElem(lintAnnName(n.letType)) }
+    return vecLitFloatTy(init)
+  }
+  ""
+}
+
+// Classify one `Ident` occurrence against the binding it resolves to: a constant-index
+// read, or any other use.
+function vecNoteUse(ix: i32, name: string) {
+  const i = visHead[name] ?? -1
+  if i < 0 { return 0 }
+  const id = visIds[i]
+  if id < 0 || !vecTy.has(id) { return 0 }
+  if (vecIdxUse[ix] ?? 0) == 1 {
+    vecReads[id] = (vecReads[id] ?? 0) + 1
+  } else {
+    vecOther[id] = 1
+  }
+  0
+}
+
+// Mark the array of index read `n` when the index is an integer literal. An index write
+// marks it first, since its `BinExpr` is visited before the target, so the write wins.
+function vecNoteIndex(n: Index) {
+  const arr = lintUnwrapParen(n.idxArr)
+  if arr < 0 || arr >= P.nodes.length { return 0 }
+  if P.nodes[arr] is Call {
+    if vecIsIntLit(n.idxIndex) { vecCallCtx[arr] = 1 }
+    return 0
+  }
+  if !(P.nodes[arr] is Ident) { return 0 }
+  if vecIdxUse.has(arr) { return 0 }
+  if vecIsIntLit(n.idxIndex) { vecIdxUse[arr] = 1 }
+  0
+}
+
+function vecNoteIndexWrite(lhsIx: i32) {
+  const lhs = P.nodes[lhsIx]
+  if lhs is Index {
+    const arr = lintUnwrapParen(lhs.idxArr)
+    if arr >= 0 { vecIdxUse[arr] = 2 }
+  }
+  0
+}
+
+// A list literal in a returned position of a module function: queued when the function's
+// return annotation is `f64[]`/`f32[]`, or it has none and every element is visibly a
+// float. Whether every caller reads the result as a vector is known once the scan is done.
+function vecCheckReturned(ix: i32) {
+  if vecFnDecl < 0 || !vecRetLit.has(ix) || vecLitElems(ix).length == 0 {
+    return 0
+  }
+  let ty = ""
+  if vecFnRet >= 0 {
+    ty = vecListElem(lintAnnName(vecFnRet))
+  } else {
+    ty = vecLitFloatTy(ix)
+  }
+  if ty != "" {
+    vecRetLits.push(ix)
+    vecRetFns.push(vecFnDecl)
+    vecRetTys.push(ty)
+  }
+  0
+}
+
+// A `let`/`const` at `ix` (`declNodes` id `id`) bound to a call of a module function: the
+// call's context is that local, tracked so its reads are classified.
+function vecNoteCallLet(ix: i32, id: i32) {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    const init = lintUnwrapParen(n.letInit)
+    if init < 0 || init >= P.nodes.length || !(P.nodes[init] is Call) {
+      return 0
+    }
+    if vecCallCtx.has(init) { return 0 }
+    vecCallCtx[init] = id + 2
+    if !vecTy.has(id) { vecTrack(id, "") }
+  }
+  0
+}
+
+// A module function's name read anywhere but as a callee lets its result go unseen.
+function vecNoteFnRef(ix: i32, name: string) {
+  if vecCalleeIx.has(ix) || lintBindDecl(name) >= 0 { return 0 }
+  const d = lintModFnDecl[name] ?? -1
+  if d >= 0 { vecFnEscapes[d] = 1 }
+  0
+}
+
+// Whether every caller of module function `d` reads its result only at constant indexes,
+// directly or through a local read that way. Needs one caller, and a function not exported.
+function vecCallersReadAsVector(d: i32): boolean {
+  if vecFnEscapes.has(d) || declIsExported(d) { return false }
+  let seen = 0
+  let i = 0
+  while i < vecCallIxs.length {
+    if vecCallFns[i] == d {
+      const ctx = vecCallCtx[vecCallIxs[i]] ?? 0
+      if ctx == 0 { return false }
+      if ctx >= 2 && !vecOnlyConstReads(ctx - 2) { return false }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  seen > 0
+}
+
+// Whether every literal queued as returned by `d` has `n` elements.
+function vecRetLengthsAgree(d: i32, n: i32): boolean {
+  let i = 0
+  while i < vecRetLits.length {
+    if vecRetFns[i] == d && vecLitElems(vecRetLits[i]).length != n {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Queue each list-literal argument of call `n` whose parameter is a tracked `f64[]` or
+// `f32[]`; whether the callee reads it as a vector is known once the scan is done.
+function vecNoteCall(n: Call, ix: i32) {
+  if n.callFn < 0 || n.callFn >= P.nodes.length { return 0 }
+  vecCalleeIx[n.callFn] = 1
+  const d = vecModFnOf(n.callFn, 1)
+  if d < 0 || d >= P.nodes.length { return 0 }
+  vecCallIxs.push(ix)
+  vecCallFns.push(d)
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    let shift = 0
+    if P.nodes[n.callFn] is Member { shift = 1 }
+    let a = 0
+    while a < n.callArgs.length {
+      const lit = lintUnwrapParen(n.callArgs[a])
+      let named = ""
+      if a < n.callArgNames.length { named = n.callArgNames[a] }
+      const pix = vecParamAt(fd, a + shift, named)
+      if pix >= 0 && vecLitElems(lit).length > 0 {
+        vecArgLits.push(lit)
+        vecArgParams.push(pix)
+        vecArgTys.push(vecListElem(lintAnnName(vecParamType(pix))))
+      }
+      a = a + 1
+    }
+  }
+  0
+}
+
+// The parameter node of `fd` an argument lands on: by `named` when it carries a name,
+// else at position `at`; -1 when there is none.
+function vecParamAt(fd: FuncDecl, at: i32, named: string): i32 {
+  let p = 0
+  while p < fd.fnParams.length {
+    const pix = fd.fnParams[p]
+    if pix >= 0 && pix < P.nodes.length {
+      const pn = P.nodes[pix]
+      if pn is Param {
+        if named != "" && pn.parName == named { return pix }
+        if named == "" && p == at { return pix }
+      }
+    }
+    p = p + 1
+  }
+  -1
+}
+
+function vecParamType(pix: i32): i32 {
+  const pn = P.nodes[pix]
+  if pn is Param { return pn.parType }
+  -1
+}
+
+// Whether tracked binding `id` is read, and read only at constant indexes.
+function vecOnlyConstReads(id: i32): boolean {
+  (vecReads[id] ?? 0) > 0 && (vecOther[id] ?? 1) == 0
+}
+
+// After the scan: report each tracked local, each queued argument whose parameter the
+// callee reads only as a vector, and each returned literal whose callers all do.
+function vecReportScanned() {
+  let r = 0
+  while r < vecRetLits.length {
+    const d = vecRetFns[r]
+    const n = vecLitElems(vecRetLits[r]).length
+    if vecRetLengthsAgree(d, n) && vecCallersReadAsVector(d) {
+      vecReport(
+        vecRetLits[r],
+        vecRetTys[r],
+        "is returned to callers that read it only at fixed indexes",
+      )
+    }
+    r = r + 1
+  }
+  let k = 0
+  while k < vecIds.length {
+    const id = vecIds[k]
+    if (
+      id >= 0
+      && id < declNodes.length
+      && declKinds[id] == 0
+      && (vecTy[id] ?? "") != ""
+      && vecOnlyConstReads(id)
+    ) {
+      const dn = P.nodes[declNodes[id]]
+      if dn is LetDecl {
+        vecReport(
+          lintUnwrapParen(dn.letInit),
+          vecTy[id] ?? "f64",
+          "is only read at fixed indexes",
+        )
+      }
+    }
+    k = k + 1
+  }
+  let i = 0
+  while i < vecArgLits.length {
+    const id = vecParamId[vecArgParams[i]] ?? -1
+    if id >= 0 && vecArgTys[i] != "" && vecOnlyConstReads(id) {
+      vecReport(
+        vecArgLits[i],
+        vecArgTys[i],
+        "goes to a parameter read only at fixed indexes",
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Report list literal `ix` (2 to 4 elements of `ty`), spanning its first line.
+function vecReport(ix: i32, ty: string, how: string) {
+  const n = vecLitElems(ix).length
+  const first = nodeStartTok(ix)
+  if first < 0 || n == 0 { return 0 }
+  let fields = "{ x, y }"
+  if n == 3 { fields = "{ x, y, z }" }
+  if n == 4 { fields = "{ x, y, z, w }" }
+  lintEmitAtSpan(
+    "float-list-as-vector",
+    "this "
+      + i32ToStr(n)
+      + "-element `"
+      + ty
+      + "[]` "
+      + how
+      + ", so it is used as a vector: a list allocates every time it is built, and a record `"
+      + fields
+      + "` does not",
+    "hint",
+    P.toks[first].line,
+    P.toks[first].col,
+    tokFirstLineEndCol(nodeSpanEndTok(ix)),
+  )
+  0
+}
+
+// ── 4h. a logical shift written by hand (shift-mask-is-logical-shift) ─────────
+
+// `(x >> k) & mask`, where `mask` keeps exactly the `w - k` low bits of a `w`-bit `x`, is
+// `x >>> k`: the mask clears precisely the copies of the sign bit `>>` shifted in. Fires
+// only when that is exact: `x` visibly `i32` or `i64`, `k` and `mask` literals.
+function shiftMaskVisit(n: BinExpr) {
+  if n.binOp != "&" || n.binTpl != 0 { return 0 }
+  if shiftMaskTry(n.binLeft, n.binRight) { return 0 }
+  shiftMaskTry(n.binRight, n.binLeft)
+  0
+}
+
+// Report when `shIx` is `x >> k` and `maskIx` the literal that makes the pair `x >>> k`.
+function shiftMaskTry(shIx: i32, maskIx: i32): boolean {
+  const s = lintUnwrapParen(shIx)
+  if s < 0 || s >= P.nodes.length { return false }
+  const sh = P.nodes[s]
+  if sh is BinExpr {
+    if sh.binOp != ">>" { return false }
+    const kv = lintIntLitValue(sh.binRight)
+    if kv < 1 || kv > 63 { return false }
+    const k = kv as% i32
+    const w = intWidthOf(sh.binLeft, 0)
+    if (w != 32 && w != 64) || k >= w { return false }
+    const want = ((1 as i64) << (w - k)) - 1
+    if lintIntLitValue(maskIx) != want { return false }
+    const first = nodeStartTok(shIx)
+    const end = nodeSpanEndTok(maskIx)
+    if first < 0 || end < 0 { return false }
+    let x = piOperandSource(sh.binLeft)
+    if x == "" { x = "x" }
+    const kTxt = i32ToStr(k)
+    lintEmitAtSpan(
+      "shift-mask-is-logical-shift",
+      "masking `"
+        + x
+        + " >> "
+        + kTxt
+        + "` to its low "
+        + shiftMaskBits(w - k)
+        + " is the logical shift `"
+        + x
+        + " >>> "
+        + kTxt
+        + "`: `>>>` shifts in zeros where `>>` copies the sign bit",
+      "hint",
+      P.toks[first].line,
+      P.toks[first].col,
+      tokFirstLineEndCol(end),
+    )
+    return true
+  }
+  false
+}
+
+function shiftMaskBits(n: i32): string {
+  if n == 1 { return "bit" }
+  i32ToStr(n) + " bits"
+}
+
+// The value of the integer literal at `ix` (under parentheses), or -1 when it is none or
+// does not fit a non-negative `i64`.
+function lintIntLitValue(ix: i32): i64 {
+  const u = lintUnwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const e = P.nodes[u]
+  if e is NumLit {
+    const t = e.numText
+    if lintNumLexIsFloat(t) { return -1 }
+    let base = 10
+    let i = 0
+    if t.length > 2 && t[0] == '0' {
+      const c = t[1]
+      if c == 'x' || c == 'X' { base = 16 }
+      if c == 'b' || c == 'B' { base = 2 }
+      if c == 'o' || c == 'O' { base = 8 }
+      if base != 10 { i = 2 }
+    }
+    let v: i64 = 0
+    while i < t.length {
+      if t[i] != '_' {
+        const d = lintDigitValue(t[i])
+        if d < 0 || d >= base || v > 576460752303423487 { return -1 }
+        v = v * (base as i64) + (d as i64)
+      }
+      i = i + 1
+    }
+    return v
+  }
+  -1
+}
+
+// The value of one hexadecimal digit character, or -1.
+function lintDigitValue(c: i32): i32 {
+  if c >= '0' && c <= '9' { return c - '0' }
+  if c >= 'a' && c <= 'f' { return c - 'a' + 10 }
+  if c >= 'A' && c <= 'F' { return c - 'A' + 10 }
+  -1
+}
+
+// The integer width expression `ix` visibly has: 32 or 64 by an annotation, `as` or a
+// module function's return type, -1 for an integer literal (it adapts), 0 when unknown.
+function intWidthOf(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > 8 { return 0 }
+  const e = P.nodes[ix]
+  match e {
+    NumLit => if lintNumLexIsFloat(e.numText) { 0 } else { -1 }
+    Paren => intWidthOf(e.parInner, depth + 1)
+    Unary => if e.unOp == "-" || e.unOp == "~" { intWidthOf(e.unArg, depth + 1) } else { 0 }
+    Ident => intWidthOfName(e.identName, depth)
+    AsExpr => intWidthName(e.asTy)
+    Call => intWidthName(lintAnnName(vecModFnRet(e.callFn)))
+    BinExpr => intWidthOfArith(e, depth)
+    StrLit | CharLit | BoolLit | NullLit | Member | OptMember | Index => 0
+    ArrayLit | ObjLit | FieldInit | Spread | IsExpr | MatchExpr | ErrExpr => 0
+    FuncDecl | IfStmt | WhileStmt | ForRange | ForIn | Block | Program => 0
+    LetDecl | RetStmt | BreakStmt | ContinueStmt | TypeDecl | UnionDecl => 0
+    ImportDecl | Param | FieldDef | TypeRef => 0
+  }
+}
+
+// 32 or 64 for `i32` / `i64`, read off the spelling's digits; 0 for any other type.
+function intWidthName(name: string): i32 {
+  if name == "i32" || name == "i64" {
+    return (name[1] - '0') * 10 + (name[2] - '0')
+  }
+  0
+}
+
+// A name read's width: its annotation, else the initialiser of an un-annotated binding.
+// A binding of a bare literal is unknown, since the literal takes its type from later uses.
+function intWidthOfName(name: string, depth: i32): i32 {
+  const d = lintBindDecl(name)
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const ann = lintDeclAnn(d)
+  if ann >= 0 { return intWidthName(lintAnnName(ann)) }
+  const w = intWidthOf(lintLetInit(d), depth + 1)
+  if w < 0 { return 0 }
+  w
+}
+
+// The width of an integer operator expression: a shift takes its left operand's, the
+// others need both operands to agree, a literal adapting to the other side.
+function intWidthOfArith(e: BinExpr, depth: i32): i32 {
+  const op = e.binOp
+  if e.binTpl != 0 { return 0 }
+  if op == "<<" || op == ">>" || op == ">>>" {
+    return intWidthOf(e.binLeft, depth + 1)
+  }
+  const arith = op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+  if !arith && op != "&" && op != "|" && op != "^" { return 0 }
+  const l = intWidthOf(e.binLeft, depth + 1)
+  const r = intWidthOf(e.binRight, depth + 1)
+  if l == 0 || r == 0 { return 0 }
+  if l < 0 { return r }
+  if r < 0 || r == l { return l }
+  0
 }
 
 // ── 4e. compiler/ cannot use interpolation (compiler-no-interpolation) ────────
@@ -1666,14 +2793,34 @@ let visIds: i32[] = []
 // as deep as the module has bindings (B6a, `docs/internals/perf-opportunities-2026-09.md`).
 let visHead: {[string]: i32} = Map()
 let visPrev: i32[] = []
+// The name token that declares each entry (-1 when the source holds none), and the
+// `visReadSeq` stamp of the last read that resolved to it.
+let visToks: i32[] = []
+let visLastRead: i32[] = []
+// 1 when the entry belongs to a chain `shadowedLocal` reported, so a deeper binding of
+// the same name joins that chain instead of reporting again.
+let visShadowed: i32[] = []
+let visReadSeq = 0
+// The stack depth at which the innermost enclosing function's entries begin, or -1
+// outside any function. An entry at or above it belongs to that function.
+let visFnMark = -1
+// The module's top-level functions, by name, each with its name token.
+let lintModFns: {[string]: i32} = Map()
+// The same functions' declaration nodes, by name.
+let lintModFnDecl: {[string]: i32} = Map()
+// The body of the innermost enclosing function, or -1 outside any.
+let visFnBody = -1
 
 // Push one scope entry: `id` is its `declNodes` index, or -1 for a shadowing-only
 // entry. The single writer of the stack and its chain, so the two cannot disagree.
-function visPush(name: string, id: i32) {
+function visPush(name: string, id: i32, tok: i32) {
   visPrev.push(visHead[name] ?? -1)
   visHead[name] = visNames.length
   visNames.push(name)
   visIds.push(id)
+  visToks.push(tok)
+  visLastRead.push(0)
+  visShadowed.push(0)
   0
 }
 
@@ -1688,7 +2835,9 @@ function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
   declToks.push(tok)
   declUsed.push(0)
   declWritten.push(0)
-  visPush(name, declNodes.length - 1)
+  let at = tok
+  if at < 0 { at = declNameTokOf(ix) }
+  visPush(name, declNodes.length - 1, at)
   0
 }
 
@@ -1701,6 +2850,9 @@ function bindTrim(mark: i32) {
     visNames.pop()
     visIds.pop()
     visPrev.pop()
+    visToks.pop()
+    visLastRead.pop()
+    visShadowed.pop()
   }
   0
 }
@@ -1711,6 +2863,10 @@ function bindTrim(mark: i32) {
 function bindMark(name: string, flag: i32) {
   const i = visHead[name] ?? -1
   if i < 0 { return 0 }
+  if flag == 0 {
+    visReadSeq = visReadSeq + 1
+    visLastRead[i] = visReadSeq
+  }
   const id = visIds[i]
   if id >= 0 {
     if flag == 0 { declUsed[id] = 1 } else { declWritten[id] = 1 }
@@ -1744,10 +2900,13 @@ function nameVisit(ix: i32) {
         propNamesAdd(fn.omProp)
       }
     }
+    vecNoteCall(n, ix)
   } else if n is Ident {
     // Every occurrence counts as a use, an assignment LHS included, which keeps a
     // write-only binding off the unused-variable list.
     refNamesAdd(n.identName)
+    vecNoteUse(ix, n.identName)
+    vecNoteFnRef(ix, n.identName)
     bindMark(n.identName, 0)
   } else if n is Unary {
     // The name is recorded although there is no unary operator dispatch: `n.unOp` is
@@ -1755,8 +2914,12 @@ function nameVisit(ix: i32) {
     // tracks, and an arity-2 `function -(self, other)` is named by the `BinExpr` arm
     // below, which is the arm that dispatches (D444).
     refNamesAdd(n.unOp)
+  } else if n is MatchExpr {
+    matchPatNamesVisit(n)
   } else if n is Index {
     lintSawIndexRead = true
+    if bacAstStr(n.idxArr, 0) { bacMark(ix) }
+    vecNoteIndex(n)
   } else if n is Member {
     // A property read may be a getter's use. `.` opens no identifier, so the key cannot
     // collide with a name.
@@ -1772,15 +2935,333 @@ function nameVisit(ix: i32) {
       if lhsIx >= 0 && lhsIx < P.nodes.length {
         const lhs = P.nodes[lhsIx]
         if lhs is Ident { bindMark(lhs.identName, 1) }
-        if lhs is Index { lintSawIndexWrite = true }
+        if lhs is Index {
+          lintSawIndexWrite = true
+          vecNoteIndexWrite(lhsIx)
+        }
       }
     } else {
+      shiftMaskVisit(n)
       // An operator (`a + b` → `function +(self, b)`) dispatches by operator
       // name; the TS reference walk records it as a `FunctionCall` callee.
       // Assignment `=` is not a method call, so it is excluded above.
       refNamesAdd(n.binOp)
     }
+  } else if n is RetStmt {
+    vecRetLit[lintUnwrapParen(n.retArg)] = 1
+  } else if n is ArrayLit {
+    vecCheckReturned(ix)
   }
+  0
+}
+
+// A bare-name arm pattern marks the binding it names used only where the checker reads it as a
+// `const` arm (D3271): the binding is a literal-valued `const`, and the name is no type this file
+// could mean, or the `match` is visibly over values (a literal arm, or an integer scrutinee).
+function matchPatNamesVisit(n: MatchExpr) {
+  let i = 0
+  while i < n.matchPats.length {
+    const pix = n.matchPats[i]
+    if pix >= 0 && pix < P.nodes.length {
+      const p = P.nodes[pix]
+      if p is IsExpr {
+        const nm = p.isVariant
+        if lintIsBareName(nm) && lintBindIsLitConst(nm) {
+          if !lintTyCapable.has(nm) || matchLooksValued(n) { bindMark(nm, 0) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The names a type pattern in this file may mean: its top-level types and its import locals.
+let lintTyCapable: {[string]: boolean} = Map()
+// Its top-level literal unions: a scrutinee annotated with one is matched on values.
+let lintLitUnions: {[string]: boolean} = Map()
+
+function lintTyCapableCollect(root: i32) {
+  lintTyCapable = Map()
+  lintLitUnions = Map()
+  if root < 0 || root >= P.nodes.length { return 0 }
+  const r = P.nodes[root]
+  if r is Program {
+    let i = 0
+    while i < r.progStmts.length {
+      lintTyCapableNote(r.progStmts[i])
+      i = i + 1
+    }
+  }
+  0
+}
+
+// `lintTyCapableCollect` for one top-level statement; a slot the checker emptied is skipped.
+function lintTyCapableNote(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const st = P.nodes[ix]
+  if st is TypeDecl { lintTyCapable[st.tdName] = true }
+  lintUnionNote(ix)
+  lintImportNote(ix)
+}
+
+// A top-level union's name, and whether it is a literal union.
+function lintUnionNote(ix: i32) {
+  const st = P.nodes[ix]
+  if st is UnionDecl {
+    lintTyCapable[st.udName] = true
+    if lintHasLitVariant(st.udVariants) { lintLitUnions[st.udName] = true }
+  }
+  0
+}
+
+// An import's locals, any of which may name a type.
+function lintImportNote(ix: i32) {
+  const st = P.nodes[ix]
+  if st is ImportDecl {
+    let q = 0
+    while q < st.impLocals.length {
+      lintTyCapable[st.impLocals[q]] = true
+      q = q + 1
+    }
+  }
+  0
+}
+
+// Whether a union's member spellings include a quoted literal.
+function lintHasLitVariant(vs: string[]) {
+  let i = 0
+  while i < vs.length {
+    if vs[i].length > 0 && vs[i][0] == '"' { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The declaration the innermost visible binding of `name` came from, or -1.
+function lintBindDecl(name: string) {
+  const i = visHead[name] ?? -1
+  if i < 0 { return -1 }
+  const id = visIds[i]
+  if id < 0 { return -1 }
+  declNodes[id]
+}
+
+// Whether `name`'s innermost binding is a `const` whose initializer is a number, `-` over one,
+// a string, or a copy of a numeric one — the constants a `match` arm takes.
+function lintBindIsLitConst(name: string) {
+  const d = lintBindDecl(name)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letKw != "const" { return false }
+    const init = lintUnwrapParen(dn.letInit)
+    if lintIsLitInit(init) { return true }
+    return dn.letType < 0 && lintIsNumCopy(init, 0)
+  }
+  false
+}
+
+// Whether `ix` is the bare name of an un-annotated `const` holding a number, written there or
+// copied by name in turn: such a copy holds that number (D3246).
+function lintIsNumCopy(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 8 { return false }
+  const e = P.nodes[ix]
+  if e is Ident {
+    const d = lintBindDecl(e.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letKw != "const" || dn.letType >= 0 { return false }
+      const init = lintUnwrapParen(dn.letInit)
+      if init >= 0 && init < P.nodes.length && P.nodes[init] is NumLit {
+        return true
+      }
+      if init >= 0 && init < P.nodes.length && lintIsNegNum(init) {
+        return true
+      }
+      return lintIsNumCopy(init, depth + 1)
+    }
+  }
+  false
+}
+
+// Whether `ix` is a number, a string, or `-` directly over a number.
+function lintIsLitInit(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is NumLit || e is StrLit { return true }
+  lintIsNegNum(ix)
+}
+
+// Whether `ix` is `-` directly over a number.
+function lintIsNegNum(ix: i32) {
+  const e = P.nodes[ix]
+  if e is Unary {
+    if e.unOp == "-" && e.unArg >= 0 && e.unArg < P.nodes.length {
+      return P.nodes[e.unArg] is NumLit
+    }
+  }
+  false
+}
+
+// Whether match `n` is visibly over values: a literal arm, or a scrutinee bound with `i32`,
+// `i64` or a literal union of this file.
+function matchLooksValued(n: MatchExpr) {
+  let i = 0
+  while i < n.matchPats.length {
+    const pix = n.matchPats[i]
+    if pix >= 0 && pix < P.nodes.length {
+      if lintIsLitInit(pix) { return true }
+    }
+    i = i + 1
+  }
+  lintScrutIsInt(n.matchScrut)
+}
+
+// Whether scrutinee `ix` is a name bound with an `i32`, `i64` or literal-union annotation.
+function lintScrutIsInt(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is Ident {
+    const d = lintBindDecl(e.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    return lintAnnIsInt(lintDeclAnn(d))
+  }
+  false
+}
+
+// The annotation node of parameter or binding `d`, or -1.
+function lintDeclAnn(d: i32) {
+  const dn = P.nodes[d]
+  if dn is Param { return dn.parType }
+  lintLetAnn(d)
+}
+
+// The annotation node of binding `d`, or -1 for a declaration that is no `let`/`const`.
+function lintLetAnn(d: i32) {
+  const dn = P.nodes[d]
+  if dn is LetDecl { return dn.letType }
+  -1
+}
+
+// Whether annotation node `t` spells `i32`, `i64` or one of this file's literal unions.
+function lintAnnIsInt(t: i32) {
+  if t < 0 || t >= P.nodes.length { return false }
+  const tn = P.nodes[t]
+  if tn is TypeRef {
+    const nm = tn.tyName
+    return nm == "i32" || nm == "i64" || lintLitUnions.has(nm)
+  }
+  false
+}
+
+// Whether `s` is one identifier: letters, digits and `_`, not starting with a digit.
+function lintIsBareName(s: string) {
+  if s.length == 0 { return false }
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    let ok = c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    if i > 0 && c >= '0' && c <= '9' { ok = true }
+    if !ok { return false }
+    i = i + 1
+  }
+  true
+}
+
+// shadowed-local: warns when binding `name` (token `tok`) hides one of the same function,
+// and returns 1 when it joins a reported chain. Skips module names, an outer function's or
+// lambda's bindings, and a rebinding whose initialiser read the outer one after `readMark`
+// (`const x = x as f64`; -1 for a loop variable).
+function shadowedLocal(name: string, tok: i32, readMark: i32): i32 {
+  if visFnMark < 0 || tok < 0 { return 0 }
+  const i = visHead[name] ?? -1
+  if i < visFnMark { return 0 }
+  const outer = visToks[i]
+  if outer < 0 { return 0 }
+  if visShadowed[i] == 1 { return 1 }
+  if readMark >= 0 && visLastRead[i] > readMark { return 0 }
+  lintEmitAtTok(
+    "shadowed-local",
+    "`"
+      + name
+      + "` shadows the `"
+      + name
+      + "` declared at "
+      + i32ToStr(lintTokLine(outer))
+      + ":"
+      + i32ToStr(lintTokCol(outer) + 1)
+      + " in this function; rename one if they are different values",
+    "warning",
+    tok,
+  )
+  1
+}
+
+// Whether `name` is a builtin a call can name: the lowered five and the numeric intrinsics.
+const LINT_BUILTIN_FNS = [
+  "print", "Map", "Set", "fromCodePoint", "fromCodePoints", "sqrt", "abs",
+  "floor", "ceil", "trunc", "nearest", "min", "max", "copysign", "clz", "ctz",
+  "popcnt", "rotl", "rotr",
+]
+function lintBuiltinFnName(name: string) { strListHas(LINT_BUILTIN_FNS, name) }
+
+// Whether the subtree at `root` holds a call of the bare name `name` whose callee token
+// comes before token `before`.
+function lintCallsNameBefore(root: i32, name: string, before: i32) {
+  const work = [root]
+  while work.length > 0 {
+    const ix = work.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const cf = n.callFn
+        if cf >= 0 && cf < P.nodes.length && cf < nodeToks.length {
+          const cn = P.nodes[cf]
+          const ct = nodeToks[cf]
+          if cn is Ident {
+            if cn.identName == name && ct >= 0 && ct < before { return true }
+          }
+        }
+      }
+      for k in nodeChildren(ix) { work.push(k) }
+    }
+  }
+  false
+}
+
+// shadowed-function: warns when a function's binding `name` (token `tok`) hides a function
+// of the module or a builtin that the same function calls above it, since the calls on either
+// side of the binding then mean different things (D3599). A name that already shadows one of
+// the same function is `shadowed-local`'s.
+function shadowedFunction(name: string, tok: i32) {
+  if visFnMark < 0 || tok < 0 { return 0 }
+  if (visHead[name] ?? -1) >= visFnMark { return 0 }
+  if !lintCallsNameBefore(visFnBody, name, tok) { return 0 }
+  const ft = lintModFns[name] ?? -1
+  let what = ""
+  if ft >= 0 {
+    what = "the function `"
+      + name
+      + "` declared at "
+      + i32ToStr(lintTokLine(ft))
+      + ":"
+      + i32ToStr(lintTokCol(ft) + 1)
+  } else if lintBuiltinFnName(name) {
+    what = "the builtin `" + name + "`"
+  }
+  if what == "" { return 0 }
+  lintEmitAtTok(
+    "shadowed-function",
+    "`"
+      + name
+      + "` shadows "
+      + what
+      + ", which this function calls above it; below it the name means the binding, so rename one",
+    "warning",
+    tok,
+  )
   0
 }
 
@@ -1811,6 +3292,10 @@ function bindScan(ix: i32) {
         const s = P.nodes[six]
         if s is LetDecl {
           bindPush(s.letName, six, 0, -1)
+        } else if s is FuncDecl {
+          const ft = declNameTokOf(six)
+          if ft >= 0 { lintModFns[s.fnName] = ft }
+          lintModFnDecl[s.fnName] = six
         } else if s is ImportDecl {
           let q = 0
           while q < s.impLocals.length {
@@ -1827,6 +3312,7 @@ function bindScan(ix: i32) {
     while i < n.progStmts.length {
       const six = n.progStmts[i]
       if six >= 0 && six < P.nodes.length {
+        if i + 1 < n.progStmts.length { upeAstMark(six, 0) }
         const s = P.nodes[six]
         if s is LetDecl { bindScanLetInit(six) } else { bindScan(six) }
       }
@@ -1839,6 +3325,7 @@ function bindScan(ix: i32) {
     const mark = visNames.length
     let i = 0
     while i < n.blkStmts.length {
+      if i + 1 < n.blkStmts.length { upeAstMark(n.blkStmts[i], 0) }
       bindScan(n.blkStmts[i])
       i = i + 1
     }
@@ -1846,14 +3333,28 @@ function bindScan(ix: i32) {
   } else if n is LetDecl {
     // Initializer first (reads the OUTER binding on a same-name init), then the
     // binding — visible until the enclosing scope's trim.
+    const readMark = visReadSeq
     bindScanLetInit(ix)
+    const vecTyOf = vecLetCandidate(ix)
+    shadowedFunction(n.letName, declNameTokOf(ix))
+    const shadowed = shadowedLocal(n.letName, declNameTokOf(ix), readMark)
     bindPush(n.letName, ix, 0, -1)
+    visShadowed[visNames.length - 1] = shadowed
+    if vecTyOf != "" { vecTrack(declNodes.length - 1, vecTyOf) }
+    if vecInFn { vecNoteCallLet(ix, declNodes.length - 1) }
   } else if n is FuncDecl {
     // A function scope: parameter defaults, then parameters, then the body. The defaults
     // are scanned before the parameters bind, because a default's names resolve at the
     // declaration in the enclosing scope — scanning them after would attribute
     // `function f(K: i32, b: i32 = K)`'s use to the parameter, which the checker refuses.
     const mark = visNames.length
+    const fnMarkSaved = visFnMark
+    const fnBodySaved = visFnBody
+    visFnMark = mark
+    visFnBody = n.fnBody
+    const vecWasInFn = vecInFn
+    const vecDeclSaved = vecFnDecl
+    const vecRetSaved = vecEnterFn(n, ix)
     let pd = 0
     while pd < n.fnParams.length {
       const dix = n.fnParams[pd]
@@ -1870,25 +3371,47 @@ function bindScan(ix: i32) {
       const pix = n.fnParams[p]
       if pix >= 0 && pix < P.nodes.length {
         const pn = P.nodes[pix]
-        if pn is Param { bindPush(pn.parName, pix, 1, -1) }
+        if pn is Param {
+          shadowedFunction(pn.parName, declNameTokOf(pix))
+          bindPush(pn.parName, pix, 1, -1)
+          vecTrackParam(pix, declNodes.length - 1)
+        }
       }
       p = p + 1
     }
     bindScan(n.fnBody)
     bindTrim(mark)
+    visFnMark = fnMarkSaved
+    visFnBody = fnBodySaved
+    vecLeaveFn(vecRetSaved, vecWasInFn, vecDeclSaved)
   } else if n is ForRange {
     bindScan(n.frFrom)
     bindScan(n.frTo)
     bindScan(n.frStep)
     const mark = visNames.length
-    visPush(n.frVar, -1)
+    const vTok = declNameTokOf(ix)
+    shadowedFunction(n.frVar, vTok)
+    const shadowed = shadowedLocal(n.frVar, vTok, -1)
+    visPush(n.frVar, -1, vTok)
+    visShadowed[visNames.length - 1] = shadowed
     bindScan(n.frBody)
     bindTrim(mark)
   } else if n is ForIn {
     bindScan(n.fiIter)
     const mark = visNames.length
-    visPush(n.fiVar, -1)
-    if n.fiVar2 != "" { visPush(n.fiVar2, -1) }
+    const vTok = declNameTokOf(ix)
+    shadowedFunction(n.fiVar, vTok)
+    const shadowed = shadowedLocal(n.fiVar, vTok, -1)
+    visPush(n.fiVar, -1, vTok)
+    visShadowed[visNames.length - 1] = shadowed
+    if n.fiVar2 != "" {
+      let v2Tok = -1
+      if vTok >= 0 { v2Tok = vTok + 2 }
+      shadowedFunction(n.fiVar2, v2Tok)
+      const shadowed2 = shadowedLocal(n.fiVar2, v2Tok, -1)
+      visPush(n.fiVar2, -1, v2Tok)
+      visShadowed[visNames.length - 1] = shadowed2
+    }
     bindScan(n.fiBody)
     bindTrim(mark)
   } else {
@@ -1925,6 +3448,18 @@ function collectBindingsAndRefs(progRoot: i32) {
   visIds = []
   visHead = Map()
   visPrev = []
+  visToks = []
+  visLastRead = []
+  visShadowed = []
+  visReadSeq = 0
+  visFnMark = -1
+  visFnBody = -1
+  lintModFns = Map()
+  lintModFnDecl = Map()
+  bacAstIdx = []
+  upeAstIdx = []
+  vecReset()
+  lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()
   0
@@ -1971,6 +3506,12 @@ function declIsConst(ix: i32) {
   false
 }
 
+// A `let`/`const` the checker's rewrite minted rather than the author wrote: it has no
+// name token, and no finding about it could point at anything in the source.
+function declMinted(ix: i32, kind: i32): boolean {
+  kind == 0 && declNameTokOf(ix) < 0
+}
+
 function unusedBindings() {
   let i = 0
   while i < declNodes.length {
@@ -1984,7 +3525,7 @@ function unusedBindings() {
     }
     const name = declNameOf(ix, kind)
     // A binding some occurrence resolved to (read OR written) is used — not dead.
-    if declUsed[i] == 0 {
+    if declUsed[i] == 0 && !declMinted(ix, kind) {
       // An exported top-level binding is public surface (the native parser drops
       // the `export` keyword; recovered from the token stream). An `extern let` is an
       // import declaration, which is no more dead unused than an `extern function` is.
@@ -2143,9 +3684,11 @@ function preferConst() {
       // An `extern let` too: `let` is its import's mutability, a contract with the host.
       if (
         !declIsConst(ix)
+        && !declMinted(ix, kind)
         && !startsUnderscore(name)
         && !declIsExported(ix)
         && externGlobalLinkOfNode(ix) < 0
+        && !letWasRetyped(ix)
       ) {
         // Used (else unused-variable owns it) and never written.
         if declUsed[i] != 0 && declWritten[i] == 0 {
@@ -2260,20 +3803,6 @@ export function lintSetSource(src: string) {
 // What more than one rule reads, over the one `txSource` the driver hands in. A `cb` /
 // `kl` / `si` / `sca` / `as` prefix below is rule-local: exactly one rule calls it. The
 // exception is `kl`'s line index, which every rule takes through `klEnsureIndex`.
-
-// The index of `name` in `xs`, or -1. Every caller tests it: a 0 here is the first row
-// and not "absent", which is the clamp D1500 names.
-function txListIndexOf(xs: string[], name: string) {
-  let i = 0
-  while i < xs.length {
-    if xs[i] == name { return i }
-    i = i + 1
-  }
-  -1
-}
-
-// `name` occurs in `xs`.
-function txListHas(xs: string[], name: string) { txListIndexOf(xs, name) >= 0 }
 
 function txIsDigit(c: i32) { c >= '0' && c <= '9' }
 
@@ -2747,10 +4276,10 @@ function cbReport(
 function commentBudget() {
   const s = txSource
   txSource = ""
-  // `comment-style.md` is the COMPILER's rubric; a std comment is consumer API
-  // surface, graded by `std-comment-audience` against `std-api-review.md` §4
-  // instead. Grading std under both buried a consumer's own diagnostics (D1601).
-  if scaIsStd(scaRunPath) { return 0 }
+  // `comment-style.md` is the rubric of `compiler/` alone: a std comment is graded by
+  // `std-comment-audience` instead (D1601), and a file outside the checkout arrives
+  // here with "" and is graded by nothing. docs/internals/lint-rule-scope.md.
+  if !scaIsCompiler(scaRunPath) { return 0 }
   klEnsureIndex(s)
   let n = 0
   let blockLine = 0
@@ -2842,8 +4371,8 @@ function commentBudget() {
 // does and what its edges are, and nothing cites a defect row, a pull request, a date
 // or the vocabulary of how VL is built. Rubric: `docs/internals/std-api-review.md` §4.
 
-// Scoped to `std/` by the module path the driver sets beside the source, so every
-// other tree keeps only the ordinary comment budget above.
+// Scoped to `std/` by the module path the driver sets beside the source; the
+// ordinary comment budget above grades `compiler/` alone.
 const scaHeaderBudget = 10
 const scaDocBudget = 4
 
@@ -2853,9 +4382,9 @@ const scaDocBudget = 4
 // against the previous one's path.
 let scaPath = ""
 // This run's path, frozen for the duration of one `lint()` call — every path-scoped
-// rule (`preferInterpVisit`, `compilerNoInterpVisit`, `stdCommentAudience`,
-// `commentBudget`) reads this, never `scaPath` directly, so a rule that runs before
-// `commentBudget` (the walk) still sees the SAME answer as one that runs after it.
+// rule (the table in docs/internals/lint-rule-scope.md) reads this, never `scaPath`,
+// so a rule that runs before `commentBudget` (the walk) sees the same answer as one
+// that runs after it.
 let scaRunPath = ""
 export function lintSetPath(p: string) {
   scaPath = p
@@ -2871,10 +4400,9 @@ function scaIsStd(p: string): boolean {
   txAt(p, 0, b, "std/") || txAt(p, 0, b, "std:")
 }
 
-// Whether `p` names a file under `compiler/` — the tree that becomes the seed
-// (`build/vl-compiler.wasm`) and so must stay import-free. `preferInterpVisit` and
-// `compilerNoInterpVisit` (§4d/4e) read it; prefix-only, for the same reason as
-// `scaIsStd` above.
+// Whether `p` names a file under `compiler/` — the tree that becomes the seed and
+// the only one the repo-policy rules grade (docs/internals/lint-rule-scope.md).
+// Prefix-only, for the same reason as `scaIsStd` above.
 function scaIsCompiler(p: string): boolean { txAt(p, 0, p.length, "compiler/") }
 
 // `txWordIsI` with the leading boundary taken here rather than by the caller, so
@@ -3091,18 +4619,21 @@ const asTables = [
 ]
 
 // The emitter's ordered pass table (`emit_sections.vl`, `runEmitPass`) plus
-// `checkProgram`, the checker's entry. `scripts/scan-budget.py` re-derives this list
+// `checkProgramPass`, the checker's walk. `scripts/scan-budget.py` re-derives this list
 // from `runEmitPass` and fails when the two disagree, so this copy cannot go stale.
 const asPasses = [
   "collectTyParamNames", "collectU", "collectS", "collectA", "collectFns",
   "passCheckTopLevel", "buildFnMap", "computeVoidFns", "computeRetInference",
-  "shadowRespell", "dispatchRewrite", "captureBoxRewrite", "synthRetAnnots",
-  "synthNulListRetAnns", "synthDstPinAnns", "scanArrLitCommit", "monomorphize",
-  "collectGenAliasShapes", "collectAnnShapes", "collectArrNewFrames",
-  "synthGlobalEmptyListAnns", "synthVoidTwins", "synthParamAnnots",
+  "shadowRespell", "assignValueSpill", "dispatchRewrite", "captureBoxRewrite",
+  "synthRetAnnots", "synthNulListRetAnns", "synthDstPinAnns",
+  "scanArrLitCommit", "monomorphize", "collectGenAliasShapes",
+  "collectAnnShapes", "collectArrNewFrames", "synthGlobalEmptyListAnns",
+  "synthVoidTwins", "synthExternValues", "synthParamAnnots",
   "collectMapFilterUse", "collectFnValUse", "collectCloSigs", "scanPrintUse",
-  "checkFnParams", "capCacheBuild", "capNarrowBuild",
-  "synthCaptureEmptyListAnns", "foldMemShared", "checkProgram",
+  "initGuardScan", "checkFnParams", "capCacheBuild", "capNarrowBuild",
+  "synthCaptureEmptyListAnns", "synthCaptureReadAnns", "foldMemShared",
+  "loopValueRewrite", "nulScalarSplit", "auditRecordJoinLeaves",
+  "scanExprArmLocals", "cloLiftScan", "checkProgramPass",
 ]
 
 // Scanners that are not pass-table rows and still run once per program. Each entry is
@@ -3111,12 +4642,13 @@ const asAllow = [
   "canonEmitTypeNames", "collectAnonShapes", "collectStrPool",
   "computeGlobalPromotion", "structEmitOrder", "assignTags",
   "startFnDetectScratch", "anonLeafIxBuild", "strAccScanStart",
-  "markNeverCallsByDecl", "esDumpText",
+  "markNeverCallsByDecl", "esDumpText", "captureFoldedConsts",
+  "anonGenArgBuild", "progBindsAmbientName",
 ]
-// Each entry above has one caller, or two that each run once per module — the arena rename,
-// the anon-shape intern and its index, the data section, global promotion, the type section's
-// order, the variant tags, `dupScanRun`'s per-candidate scan, the start function's proof, the
-// lint's never-call marks, and the effects dump.
+// Each entry above runs once per module from its caller(s) — the arena rename, the anon-shape
+// intern and its index, the data section, global promotion, the type section's order, the
+// variant tags, `dupScanRun`'s per-candidate scan, the start function's proof, the lint's
+// never-call marks, the effects dump, the const fold, generic marks, the ambient-rename test.
 
 // The whole-program table whose `.length` is read at `i`, or "" when none is.
 function asTableAt(s: string, i: i32, b: i32) {
@@ -3176,6 +4708,9 @@ function asZeroedNameOf(s: string, k: i32, b: i32) {
 // reading `klFnName`, which holds column-0 headers only — an indented `function` opens a
 // body here. O(bytes), one array of names per body.
 function arenaScanLint() {
+  // The tables it knows are the compiler's own, so it grades only the two trees
+  // `scripts/scan-budget.py` covers.
+  if !scaIsCompiler(scaRunPath) && !scaIsStd(scaRunPath) { return 0 }
   const s = txSource
   klEnsureIndex(s)
   let fnName = ""
@@ -3198,9 +4733,9 @@ function arenaScanLint() {
         const v = asWhileVarOf(s, k, le)
         if (
           v.length > 0
-          && txListHas(zeroed, v)
-          && !txListHas(asPasses, fnName)
-          && !txListHas(asAllow, fnName)
+          && strListHas(zeroed, v)
+          && !strListHas(asPasses, fnName)
+          && !strListHas(asAllow, fnName)
         ) {
           lintEmitAtSpan(
             "arena-scan-outside-pass",
@@ -3292,7 +4827,7 @@ const klNode = [
 ]
 // `TokKind` — compiler/lexer.vl
 const klTokKind = [
-  "", "IDENT", "NUMBER", "STRING", "CHAR", "TEMPLATE", "TEMPLATE_HEAD",
+  "", "IDENT", "LABEL", "NUMBER", "STRING", "CHAR", "TEMPLATE", "TEMPLATE_HEAD",
   "TEMPLATE_MID", "TEMPLATE_TAIL", "NEWLINE", "EOF", "ERROR", "IF", "IS",
   "IMPORT", "FUNCTION", "FOR", "FALSE", "CONST", "CONTINUE", "ELSE", "EXPORT",
   "EXTERN", "TYPE", "TRUE", "RETURN", "LET", "WHILE", "AWAIT", "BREAK", "MATCH",
@@ -3311,15 +4846,22 @@ const klListRepGate = [
   "member-field", "closure-array-call", "map-filter", "callee-return",
   "callee-value", "coalesce",
 ]
+// `RepKeyMode` — compiler/emit_rep.vl
+const klRepKeyMode = ["canon", "elem", "mv"]
+// `CliWithheld` — compiler/cli.vl
+const klCliWithheld = ["shown", "std", "import", "exclude"]
+// `PlTable` — compiler/driver.vl
+const klPlTable = ["plus", "strIdx", "scalar"]
 
 // Smallest first, so `klSetOf` can take the first set that holds every arm and land
 // on the same answer the census's "smallest set containing them all" does.
 const klSetNames = [
   "AsMode", "BtKind", "MfKind", "PushKind", "PrimName", "Ty", "RtKind",
   "EqCmpKind", "VKind", "Node", "TokKind", "StashWant", "ListRepGate",
+  "RepKeyMode", "CliWithheld", "PlTable",
 ]
 // 1 when the set's members are type names (`x is TyObj`), 0 when string literals.
-const klSetIsType = [0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+const klSetIsType = [0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
 
 // The i-th set's members. A dispatch on an index, not on a kind — the lint's own
 // ladders are over `i32`, so this rule cannot report itself.
@@ -3337,6 +4879,9 @@ function klSetMembers(i: i32): string[] {
   if i == 10 { return klTokKind }
   if i == 11 { return klStashWant }
   if i == 12 { return klListRepGate }
+  if i == 13 { return klRepKeyMode }
+  if i == 14 { return klCliWithheld }
+  if i == 15 { return klPlTable }
   []
 }
 
@@ -3720,8 +5265,8 @@ function klLineCallsAny(s: string, a: i32, e: i32) {
         const p = txSpacesEnd(s, j, e)
         if p < e && s[p] == '(' {
           const nm = s.slice(i, j)
-          if txListHas(klNamingCalls, nm) { return true }
-          if txListHas(klFnName, nm) { return true }
+          if strListHas(klNamingCalls, nm) { return true }
+          if strListHas(klFnName, nm) { return true }
         }
         i = j
       }
@@ -3789,7 +5334,7 @@ function klSetOf(mems: string[], a: i32, n: i32, isType: i32) {
       let ok = true
       let k = 0
       while k < n {
-        if !txListHas(ms, mems[a + k]) { ok = false }
+        if !strListHas(ms, mems[a + k]) { ok = false }
         k = k + 1
       }
       if ok { return si }
@@ -3839,7 +5384,7 @@ function klFieldSetOf(
       const ms = klSetMembers(si)
       let k = 0
       while k < n {
-        if !txListHas(ms, mems[a + k]) { return -1 }
+        if !strListHas(ms, mems[a + k]) { return -1 }
         k = k + 1
       }
       return si
@@ -3905,7 +5450,7 @@ function klParamSetOf(
   const ms = klSetMembers(si)
   let k = 0
   while k < n {
-    if !txListHas(ms, mems[a + k]) { return -1 }
+    if !strListHas(ms, mems[a + k]) { return -1 }
     k = k + 1
   }
   si
@@ -4239,7 +5784,7 @@ function klMatchGrade(s: string, f: i32, ln: i32, col: i32, hi: i32) {
         if klAIsType == isType {
           let m = 0
           while m < klAMem.length {
-            if !txListHas(mems, klAMem[m]) { mems.push(klAMem[m]) }
+            if !strListHas(mems, klAMem[m]) { mems.push(klAMem[m]) }
             m = m + 1
           }
         }
@@ -4384,7 +5929,7 @@ function klSplitWalks(s: string) {
     while y < klLadFn.length {
       if x != y && klLadSet[x] == klLadSet[y] && klLadFn[x] != klLadFn[y] {
         const key = txNumStr(klLadFn[x]) + ":" + txNumStr(klLadFn[y])
-        if !txListHas(klSplitDone, key) {
+        if !strListHas(klSplitDone, key) {
           if klGradePair(s, x, y) == 1 { klSplitDone.push(key) }
         }
       }
@@ -4399,6 +5944,8 @@ function klSplitWalks(s: string) {
 // recorded ladders for the split rule. Linear in bytes for the first two; the third is
 // quadratic in LADDERS, of which the largest module has under two hundred.
 function kindLadderLint() {
+  // The closed sets are the compiler's own kinds, so only `compiler/` is graded.
+  if !scaIsCompiler(scaRunPath) { return 0 }
   const s = txSource
   klLadFn = []
   klLadSet = []
@@ -5102,6 +6649,8 @@ function siGradeFn(s: string, f: i32) {
 // module index rather than inheriting one, so it does not depend on running after the
 // kind-ladder pass; `klEnsureIndex` is what keeps that free.
 function sentinelIndexLint() {
+  // Tuned to the compiler's `-1` conventions and ratcheted over `compiler/` alone.
+  if !scaIsCompiler(scaRunPath) { return 0 }
   const s = txSource
   klEnsureIndex(s)
   siScanHoles(s)

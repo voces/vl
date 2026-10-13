@@ -18,9 +18,10 @@
 // `lsp_*_wasm_test.ts`; wired into ci.yml's "Editor features on the wasm
 // compiler" step, which is what makes it run in CI at all.
 
+import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

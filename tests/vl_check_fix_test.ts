@@ -1,7 +1,7 @@
 // NATIVE `vl check --fix` — the lint auto-fix, computed and applied in VL
 // (compiler/cli.vl) and written back via the command-queue pump (CMD_WRITE_FILE).
-// Exactly ONE fix, the only one that is always correct with no human judgment:
-//   prefer-const → `let` becomes `const`.
+// The fixes: prefer-const, a redundant type annotation, an unused import. They run in
+// rounds to a fixpoint, since one can expose another.
 // `--fix` deliberately does NOT touch unused variables OR parameters: the
 // `_`-prefix silences a warning, and whether that's right depends on intent
 // (genuinely-unused vs forgotten-after-refactor), so it stays a human choice.
@@ -11,6 +11,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -31,7 +32,7 @@ Deno.test({
   name: "vl-check-fix: applies prefer-const only; leaves unused var/param (still reported); idempotent",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_check_fix_" });
+    const dir = await makeTempDir({ prefix: "vl_check_fix_" });
     try {
       const f = `${dir}/a.vl`;
       // The `: i64` return is NOT redundant (the i32 body widens to it), so the
@@ -63,3 +64,482 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "vl-check-fix: iterates to a fixpoint, removes the import it orphaned, keeps exported signatures (D3597)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_fix_rounds_" });
+    try {
+      const f = `${dir}/a.vl`;
+      // Removing `: Buf` orphans the `Buf` import, which only the next round can see. The
+      // exported function's return and the exported const's type are API and stay.
+      const before = 'import { Buffer, Buf } from "std:buffer"\n' +
+        "export function f(x: i32): i32 { x + 1 }\n" +
+        "export const m: i32 = 4\n" +
+        "const b: Buf = Buffer(8)\n" +
+        "print(f(m) + b.length)\n";
+      await Deno.writeTextFile(f, before);
+      const r = await fix(f);
+      if (r.code !== 0) throw new Error(`--fix exited ${r.code}:\n${r.err}`);
+      const want = 'import { Buffer } from "std:buffer"\n' +
+        "export function f(x: i32): i32 { x + 1 }\n" +
+        "export const m: i32 = 4\n" +
+        "const b = Buffer(8)\n" +
+        "print(f(m) + b.length)\n";
+      const after = await Deno.readTextFile(f);
+      if (after !== want) throw new Error(`unexpected fixed source:\n${after}`);
+      const note = "Applied 2 fix(es) in 2 round(s): 1 redundant type annotation, 1 unused import.";
+      if (!r.err.includes(note)) throw new Error(`expected the summary "${note}", got:\n${r.err}`);
+      const r2 = await fix(f);
+      if (r2.code !== 0 || r2.err.includes("Applied") || r2.err.includes("Unused import")) {
+        throw new Error(`expected a clean idempotent re-run, got ${r2.code}:\n${r2.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-check-fix: an unused import of the program's own module stays whole (it may run code)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_fix_own_" });
+    try {
+      await Deno.writeTextFile(
+        `${dir}/dep.vl`,
+        'print("dep runs")\nexport const x = 1\nexport const y = 2\n',
+      );
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(
+        f,
+        'import { x } from "./dep"\nimport { x as x2, y } from "./dep"\nprint(y)\n',
+      );
+      const r = await fix(f);
+      if (r.code !== 0) throw new Error(`--fix exited ${r.code}:\n${r.err}`);
+      // Dropping the first import would skip dep's top-level `print`; one specifier of the
+      // second can go, since that statement stays.
+      const want = 'import { x } from "./dep"\nimport { y } from "./dep"\nprint(y)\n';
+      const after = await Deno.readTextFile(f);
+      if (after !== want) throw new Error(`unexpected fixed source:\n${after}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// ---- missing imports (lane IM): an error whose one exporter names the edit ------------
+
+const check = async (path: string): Promise<{ code: number; err: string }> => {
+  const { code, stderr } = await new Deno.Command(VL, {
+    args: ["check", path, "--compiler", COMPILER],
+    stdout: "piped",
+    stderr: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
+  }).output();
+  return { code, err: new TextDecoder().decode(stderr) };
+};
+
+// Writes `files` to a temp dir, runs `--fix` on `main.vl`, and compares the result with
+// `want`. A `want` equal to the input is the no-edit case: nothing may be applied. Else the
+// fixed file must re-check clean, which is the proof the edit was the right one.
+const fixCase = (name: string, files: Record<string, string>, want: string) =>
+  Deno.test({
+    name: `vl-check-fix: ${name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const dir = await makeTempDir({ prefix: "vl_check_fix_imp_" });
+      try {
+        for (const [rel, src] of Object.entries(files)) {
+          await Deno.mkdir(`${dir}/${rel}`.replace(/\/[^/]*$/, ""), { recursive: true });
+          await Deno.writeTextFile(`${dir}/${rel}`, src);
+        }
+        const f = `${dir}/main.vl`;
+        const r = await fix(f);
+        const after = await Deno.readTextFile(f);
+        if (after !== want) {
+          throw new Error(`fixed source: want\n${want}\ngot\n${after}\n(stderr:\n${r.err})`);
+        }
+        if (want === files["main.vl"]) {
+          if (r.err.includes("Applied")) throw new Error(`nothing may be applied:\n${r.err}`);
+          if (r.code === 0) throw new Error("the errors must stand");
+          return;
+        }
+        const r2 = await check(f);
+        if (r2.code !== 0) throw new Error(`the fixed file must check clean:\n${r2.err}`);
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
+    },
+  });
+
+const TERRAIN = "export function height(x: i32): i32 { x * 2 }\n" +
+  "export const SEA = 3\nexport function other(): i32 { 1 }\n";
+
+fixCase(
+  "an undeclared name joins its module's existing import, or a new one, local or std",
+  {
+    "terrain.vl": TERRAIN,
+    "sub/side.vl": "export function side(): i32 { 5 }\n",
+    "mid.vl": 'import { side } from "./sub/side"\nexport function mid(): i32 { side() }\n',
+    "main.vl": 'import { mid } from "./mid"\nimport { other } from "./terrain"\n' +
+      "print(mid() + height(2) + SEA + other() + side())\nprint(hypotF64(3.0, 4.0))\n" +
+      "const xs = [1, 2, 3]\nprint(xs.includes(2))\n",
+  },
+  'import { mid } from "./mid"\nimport { other, height, SEA } from "./terrain"\n' +
+    'import { side } from "./sub/side"\nimport { hypotF64 } from "std:math"\n' +
+    'import { includes } from "std:array"\n' +
+    "print(mid() + height(2) + SEA + other() + side())\nprint(hypotF64(3.0, 4.0))\n" +
+    "const xs = [1, 2, 3]\nprint(xs.includes(2))\n",
+);
+
+fixCase(
+  "a name imported from a module that does not export it moves to the one that does",
+  {
+    "terrain.vl": TERRAIN,
+    "mid.vl": 'import { height } from "./terrain"\nexport function mid(): i32 { height(1) }\n',
+    "main.vl": 'import { height } from "./mid"\nimport { mid, SEA } from "./mid"\n' +
+      "print(height(1) + mid() + SEA)\n",
+  },
+  // `height` is its import's only name, so the specifier changes; `SEA` leaves a list and
+  // joins that import in the next round.
+  'import { height, SEA } from "./terrain"\nimport { mid } from "./mid"\n' +
+    "print(height(1) + mid() + SEA)\n",
+);
+
+fixCase(
+  "a std name imported from the wrong std module moves to the one that declares it",
+  {
+    "main.vl": 'import { includes, join } from "std:array"\nconst xs = [1, 2]\n' +
+      'print(xs.includes(1))\nprint(["a", "b"].join("-"))\n',
+  },
+  'import { includes } from "std:array"\nimport { join } from "std:str"\nconst xs = [1, 2]\n' +
+    'print(xs.includes(1))\nprint(["a", "b"].join("-"))\n',
+);
+
+fixCase(
+  "a method's receiver picks the module, and a re-export counts as its declaring module",
+  {
+    "main.vl": 'const s = "a,b"\nconst parts = ["a", "b"]\n' +
+      'print(s.lastIndexOf(","))\nprint(parts.join("/"))\n',
+  },
+  'import { lastIndexOf, join } from "std:str"\nconst s = "a,b"\nconst parts = ["a", "b"]\n' +
+    'print(s.lastIndexOf(","))\nprint(parts.join("/"))\n',
+);
+
+fixCase(
+  "in a file with no imports, the new import goes after the header comment",
+  {
+    "main.vl": "// hdr: what this file is for\n// second header line\n\nprint(hypotF64(3.0, 4.0))\n",
+  },
+  "// hdr: what this file is for\n// second header line\n\n" +
+    'import { hypotF64 } from "std:math"\nprint(hypotF64(3.0, 4.0))\n',
+);
+
+fixCase(
+  "two exporters: the message lists both and nothing is edited",
+  {
+    "a.vl": "export function dup(): i32 { 1 }\n",
+    "b.vl": "export function dup(): i32 { 2 }\n",
+    "main.vl": 'import { dup as one } from "./a"\nimport { dup as two } from "./b"\n' +
+      "print(one() + two() + dup())\n",
+  },
+  'import { dup as one } from "./a"\nimport { dup as two } from "./b"\n' +
+    "print(one() + two() + dup())\n",
+);
+
+fixCase(
+  "a method the file already binds for another receiver kind is imported under its own name",
+  {
+    "s.vl": 'export function d(self: string): string { "S" }\n',
+    "a.vl": 'export function d<T>(self: T[]): string { "A" }\nexport function other(): i32 { 1 }\n',
+    "main.vl": 'import { d } from "./s"\nimport { other } from "./a"\n' +
+      'print("x".d())\nprint([other()].d())\n',
+  },
+  'import { d } from "./s"\nimport { other, d } from "./a"\n' +
+    'print("x".d())\nprint([other()].d())\n',
+);
+
+fixCase(
+  "an import that needs an alias is not applied (the call would need respelling too)",
+  {
+    "ni.vl": 'export function d(self: i32): string { "I" }\n',
+    "nf.vl": 'export function d(self: f64): string { "F" }\nexport function of(): i32 { 1 }\n',
+    "main.vl": 'import { d } from "./ni"\nimport { of } from "./nf"\nconst b = 1.5\nprint(b.d())\nprint(of())\n',
+  },
+  'import { d } from "./ni"\nimport { of } from "./nf"\nconst b = 1.5\nprint(b.d())\nprint(of())\n',
+);
+
+fixCase(
+  "one name asked of two modules by two receivers: both imports are added (receiver overloading)",
+  {
+    "main.vl": 'const s = "a,b"\nconst xs = [1, 2]\n' +
+      'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
+  },
+  'import { lastIndexOf } from "std:str"\nimport { lastIndexOf } from "std:array"\n' +
+    'const s = "a,b"\nconst xs = [1, 2]\n' +
+    'print(s.lastIndexOf(","))\nprint(xs.lastIndexOf(2))\n',
+);
+
+// ---- `filled(n, 0)` into a `u8[]` (lane DG): `u8` is storage, so the fix is `zeroBytes(n)` ----
+
+fixCase(
+  "a literal-zero `filled` delivered as a `u8[]` becomes `zeroBytes`, with its import",
+  {
+    "main.vl": 'import { filled } from "std:array"\nimport { u16le } from "std:bytes"\n' +
+      "function f(b: u8[]): i32 { return b.length }\n" +
+      "function g(): u8[] { return filled(4 * 2, 0) }\n" +
+      "const a: u8[] = filled(16, 0 as! u8)\n" +
+      "print(f(filled(f(g()), (0))) + a.length + u16le(g(), 0))\n",
+  },
+  // The orphaned `filled` import and the now-redundant binding annotation go in the next
+  // round; `f`'s return annotation stays (DV-103).
+  'import { u16le, zeroBytes } from "std:bytes"\n' +
+    "function f(b: u8[]): i32 { return b.length }\n" +
+    "function g(): u8[] { return zeroBytes(4 * 2) }\n" +
+    "const a = zeroBytes(16)\nprint(f(zeroBytes(f(g()))) + a.length + u16le(g(), 0))\n",
+);
+
+fixCase(
+  "a non-zero `filled` into a `u8[]` is not rewritten",
+  {
+    "main.vl": 'import { filled } from "std:array"\nconst a: u8[] = filled(16, 7)\nprint(a.length)\n',
+  },
+  'import { filled } from "std:array"\nconst a: u8[] = filled(16, 7)\nprint(a.length)\n',
+);
+
+// The rewrite declines whenever the file binds `zeroBytes` to anything but `std:bytes`'s: the
+// new call would reach that binding (or the added import would clash with it).
+const ZB_FILL = 'import { filled } from "std:array"\n';
+const zbDeclines: [string, Record<string, string>][] = [
+  [
+    "a module function named `zeroBytes`",
+    {
+      "main.vl": ZB_FILL + "function zeroBytes(n: i32) { return n * 100 }\n" +
+        "const a: u8[] = filled(4, 0)\nprint(a.length + zeroBytes(1))\n",
+    },
+  ],
+  [
+    "a `zeroBytes` imported from another module",
+    {
+      "main.vl": ZB_FILL + 'import { zeroBytes } from "./zb"\n' +
+        "const a: u8[] = filled(4, 0)\nprint(a.length + zeroBytes(1))\n",
+      "zb.vl": "export function zeroBytes(n: i32) { return n * 100 }\n",
+    },
+  ],
+  [
+    "a parameter named `zeroBytes` in scope",
+    {
+      "main.vl": ZB_FILL +
+        "function k(zeroBytes: i32) {\n  const a: u8[] = filled(4, 0)\n" +
+        "  return a.length + zeroBytes\n}\nprint(k(5))\n",
+    },
+  ],
+  [
+    "a module `const zeroBytes` declared after the call",
+    {
+      "main.vl": ZB_FILL + "function k() {\n  const a: u8[] = filled(4, 0)\n" +
+        "  return a.length + zeroBytes\n}\nconst zeroBytes = 7\nprint(k())\n",
+    },
+  ],
+  [
+    "a comment inside the call",
+    {
+      "main.vl": ZB_FILL +
+        "const a: u8[] = filled(\n  4, // n\n  0,\n)\nprint(a.length)\n",
+    },
+  ],
+];
+for (const [what, files] of zbDeclines) {
+  fixCase(
+    `a literal-zero \`filled\` into a \`u8[]\` is left alone beside ${what}`,
+    files,
+    files["main.vl"],
+  );
+}
+
+fixCase(
+  "the `vl fmt` trailing-comma `filled` call and every spelling of zero rewrite to `zeroBytes`",
+  {
+    "main.vl": ZB_FILL + "const a: u8[] = filled(\n  4 * 2,\n  0,\n)\n" +
+      "const b: u8[] = filled(2, -0)\nconst c: u8[] = filled(2, 0x0)\n" +
+      "const d: u8[] = filled(2, 00)\nconst e: u8[] = filled(2, 0 as u8)\n" +
+      "print(a.length + b.length + c.length + d.length + e.length)\n",
+  },
+  'import { zeroBytes } from "std:bytes"\nconst a = zeroBytes(4 * 2)\n' +
+    "const b = zeroBytes(2)\nconst c = zeroBytes(2)\nconst d = zeroBytes(2)\n" +
+    "const e = zeroBytes(2)\nprint(a.length + b.length + c.length + d.length + e.length)\n",
+);
+
+// ---- a concrete function written to a `let` that keeps its generic type (D3960, ruling C) ----
+
+fixCase(
+  "a concrete function written to a generic `let` gets the annotation that lets it hold one",
+  {
+    "main.vl": "function inner<U>(u: U) { print(u) }\nfunction q(n: i32) { print(n + 1) }\n" +
+      "function main() {\n  let k = inner\n  k = q\n  k(1)\n}\nmain()\n",
+  },
+  "function inner<U>(u: U) { print(u) }\nfunction q(n: i32) { print(n + 1) }\n" +
+    "function main() {\n  let k: (i32) => void = inner\n  k = q\n  k(1)\n}\nmain()\n",
+);
+
+// ---- a positional argument after a misplaced named one (D4061, ruling Q8) ----
+
+fixCase(
+  "positional arguments after a misplaced name are named for the parameter they bind today",
+  {
+    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
+      "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
+      "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+      "print(box(h: 3, 2))\nprint(f(c: 5, 1, 7))\nprint((5).m(d: 1, 2))\n",
+  },
+  "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
+    "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
+    "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+    "print(box(h: 3, w: 2))\nprint(f(c: 5, a: 1, b: 7))\nprint((5).m(d: 1, c: 2))\n",
+);
+
+fixCase(
+  "a name given twice has no mechanical fix and is left alone",
+  {
+    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+  },
+  "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+);
+
+fixCase(
+  "a method call on a receiver built from an earlier error imports nothing for it (DV-101)",
+  {
+    "main.vl": 'import { expect } from "std:test"\nconst g: i32[] = []\n' +
+      "expect(g.includes(1)).toEqual(false)\n",
+  },
+  'import { expect } from "std:test"\nimport { includes } from "std:array"\nconst g: i32[] = []\n' +
+    "expect(g.includes(1)).toEqual(false)\n",
+);
+
+// ---- files outside the module graph (diderven DV-004) ----------------------------------
+
+fixCase(
+  "a name only a not-yet-imported file beside it exports gets a new import of that file",
+  {
+    "ids.vl": "export const SPR_A: i32 = 1\nexport function idOf(n: i32): i32 { n }\n",
+    "nested/deeper.vl": "export const SPR_B: i32 = 2\n",
+    "main.vl": "print(idOf(SPR_A))\n",
+  },
+  'import { idOf, SPR_A } from "./ids"\nprint(idOf(SPR_A))\n',
+);
+
+fixCase(
+  "a file beside it that does not export the name adds nothing, and a single-file run reads no subdirectory",
+  {
+    "ids.vl": "export const SPR_A: i32 = 1\n",
+    "nested/deeper.vl": "export const SPR_B: i32 = 2\n",
+    "main.vl": "print(SPR_B)\n",
+  },
+  "print(SPR_B)\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a directory run offers every file the walk found, at its relative path",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_fix_dir_" });
+    try {
+      await Deno.mkdir(`${dir}/src/gen`, { recursive: true });
+      await Deno.mkdir(`${dir}/src/skills`, { recursive: true });
+      await Deno.writeTextFile(`${dir}/src/gen/sprites.vl`, "export const SPR_X: i32 = 7\n");
+      await Deno.writeTextFile(`${dir}/src/skills/use.vl`, "print(SPR_X)\n");
+      const plain = await check(`${dir}/src`);
+      const note = '`SPR_X` is exported by "../gen/sprites"';
+      if (!plain.err.includes(note)) {
+        throw new Error(`the error must name the file: want ${note}\ngot\n${plain.err}`);
+      }
+      await fix(`${dir}/src`);
+      const after = await Deno.readTextFile(`${dir}/src/skills/use.vl`);
+      const want = 'import { SPR_X } from "../gen/sprites"\nprint(SPR_X)\n';
+      if (after !== want) throw new Error(`fixed source: want\n${want}\ngot\n${after}`);
+      const r = await check(`${dir}/src`);
+      if (r.code !== 0) throw new Error(`the fixed tree must check clean:\n${r.err}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+fixCase(
+  "a file beside it exporting a std name is listed with std, and two exporters edit nothing",
+  {
+    "geo.vl": "export function hypotF64(a: f64, b: f64): f64 { a + b }\n",
+    "main.vl": "print(hypotF64(3.0, 4.0))\n",
+  },
+  "print(hypotF64(3.0, 4.0))\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a file beside it that does not lex is named as skipped, and the rest still answer",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_fix_skip_" });
+    try {
+      await Deno.writeTextFile(`${dir}/bad.vl`, 'export const Q = "unterminated\n');
+      await Deno.writeTextFile(`${dir}/ids.vl`, "export const SPR_A: i32 = 1\n");
+      await Deno.writeTextFile(`${dir}/main.vl`, "print(SPR_A)\n");
+      const plain = await check(`${dir}/main.vl`);
+      for (const want of ['`SPR_A` is exported by "./ids"', `skipped ${dir}/bad.vl: it does not lex`]) {
+        if (!plain.err.includes(want)) throw new Error(`want ${want}\ngot\n${plain.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+fixCase(
+  "a private helper keeps its return annotation while a redundant local annotation goes (DV-103)",
+  {
+    "main.vl": "function usable(a: i32): boolean {\n  const ok: boolean = a > 0\n  return ok\n}\n" +
+      "print(usable(1))\n",
+  },
+  "function usable(a: i32): boolean {\n  const ok = a > 0\n  return ok\n}\nprint(usable(1))\n",
+);
+
+fixCase(
+  "a concrete function the generic initializer cannot be held at is not annotated",
+  {
+    "main.vl": "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+      "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+  },
+  "function inner<U>(u: U) { print(u) }\nfunction r(n: i32): string { return \"x\" }\n" +
+    "function main() {\n  let k = inner\n  k = r\n  print(k(1))\n}\nmain()\n",
+);
+
+fixCase(
+  "a non-numeric cast to the type its operand already has is dropped, keeping the operand",
+  {
+    "main.vl": "function g(t: string | i32) {\n  if t is string {\n    print((t as! string).length)\n" +
+      "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s as string)\n",
+  },
+  "function g(t: string | i32) {\n  if t is string {\n    print((t).length)\n" +
+    "  }\n}\ng(\"ab\")\nconst s = \"x\"\nprint(s)\n",
+);
+
+fixCase(
+  "JavaScript's `!==` and `===` become VL's `!=` and `==`, which are already strict (DV-1214)",
+  {
+    "main.vl": "function f(n: i32): boolean {\n  return n !== 2 && n === 3\n}\nprint(f(1))\n",
+  },
+  "function f(n: i32): boolean {\n  return n != 2 && n == 3\n}\nprint(f(1))\n",
+);
+
+fixCase(
+  "an unknown type some module exports is imported, beside its existing import or as a new one (DV-007)",
+  {
+    "world.vl": "export type Level = { n: i32 }\nexport function mk(): Level { return { n: 1 } }\n",
+    "main.vl": 'import { mk } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
+      "print(depth(mk()))\n",
+  },
+  'import { mk, Level } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
+    "print(depth(mk()))\n",
+);

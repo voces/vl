@@ -50,8 +50,20 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   A pattern past 64 bits is refused at the literal itself, since no VL destination is wider.
   **Upward adoption only at an operand peer**: an i64 peer widens the literal, a 32-bit peer
   leaves a wider one alone, so `x + 0x1_0000_0000` over an `i32` still widens to i64 rather
-  than becoming a new refusal. And unary minus is NOT peeled — the literal is then an operand
-  rather than the delivered value — which is also Java's answer (`long x = -0xFFFFFFFF` is 1).
+  than becoming a new refusal. A negated literal is read at the destination's width too, so
+  `const x: i64 = -0xFFFFFFFF` is −4294967295 (unlike Java's `long x = -0xFFFFFFFF`, which is 1);
+  the next entry makes that one rule for every negation chain.
+
+- **A NEGATION CHAIN OVER ONE INTEGER LITERAL IS A LITERAL TREE, ADOPTED AT A 64-BIT DESTINATION**
+  (2026-09-28, D3043/D3049/D3050, #3265). An i64 binding, return, argument, operator peer or
+  `as i64` computes `-(-lit)` at 64 bits exactly as it computes `1 + 2`, so the checker and the
+  emitter agree on a chain's type and value at every nesting. This CHANGES the value of programs
+  that ran: `const x: i64 = -(-0x80000000)` was −2147483648 and is 2147483648, and
+  `const C0: i64 = -(-2147483648)` likewise; `-(-0xffffffff)` at i64 was −1 and is 4294967295.
+  The old values were the checker typing the chain i32 while the emitter read one negation at
+  64 bits — no reading of the language produced them. With no 64-bit destination a chain keeps
+  its own width, so `print(-(-2147483648))` still wraps at i32. A chain over a decimal that fits
+  i32 never wraps, so it is left at i32 and widened after (same value, no adoption cost).
 
 - **`T | null` IS VALUE-COMPARABLE EXACTLY WHEN `T` IS** (2026-09-03, D1180). `isEquatable`
   refused every nullable field on the stated ground that "discriminating the variant would be
@@ -168,7 +180,10 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   initializer was the EMPTY literal and the fall-through has nothing to read there. **The
   set is CLOSED at two, and that is a property of `assignableExpr`, not of this file**:
   every other element name either is `boolean` or is not a destination a boolean can reach,
-  so the initializer can never hand it a boolean to outvote.
+  so the initializer can never hand it a boolean to outvote. **Since 2026-09-29 the set is
+  EMPTY** (D3218, ruling C retired A7 and the `u8` arm's `boolean` source): no boolean
+  reaches a numeric element, and the rung stays only because a declared numeric element is
+  still the right answer for a list whose initializer reads otherwise.
 
 - **A CHECK THAT ACCEPTS A LITERAL ELEMENT-WISE MUST SAY SO ON THE LITERAL, BECAUSE THE
   EMITTER CLASSIFIES A LIST FROM THE CHECKER'S COLUMN AND NOT FROM THE REP SIDECAR**
@@ -244,7 +259,9 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   the A7 coercion, becomes a false reject. Asking per SLOT keeps the coercion and pays a
   vaguer message. **When a reconstruction is coarser than what it reconstructs, prefer the
   finer ask and accept the weaker sentence**; the refused candidate is kept buildable and its
-  two-cell price is in `named/`.
+  two-cell price is in `named/`. (The A7 instance of this is gone since 2026-09-29 — D3218,
+  ruling C — and `[0, self]` at `g(true)` now refuses at the pin as its direct twin does; the
+  per-slot ask still decides the brand and `u8` literal adoptions the same way.)
 
 - **A DEFERRED-CONSTRAINT TABLE IS DEFINED BY WHAT ITS PIN CAN ASK, NOT BY WHAT IT RECORDS —
   WHICH IS WHY THE BUILTIN ARGUMENTS COULD NOT JOIN `argCstr`** (2026-08-29,
@@ -270,10 +287,11 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **A PIN THAT RE-ASKS A BODY'S QUESTION MUST CALL THE FUNCTION THE BODY CALLED, NOT AN
   EQUIVALENT ONE** (2026-08-29, silent-class-inventory D551 / #2017). `validateRetCstrs` asks
-  `assignableExpr` on the substituted pair, not `assignable`. The two differ: the A7
-  boolean-to-`i32` coercion, the f32-literal adoption, the literal-type member rule and the
-  nominal-literal brand waiver all live at the EXPRESSION seam and are deliberately absent
-  from the plain predicate. Asking `assignable` made the generic spelling REFUSE
+  `assignableExpr` on the substituted pair, not `assignable`. The two differ: the f32-literal
+  adoption, the literal-type member rule and the nominal-literal brand waiver all live at the
+  EXPRESSION seam and are deliberately absent from the plain predicate (so did the A7
+  boolean-to-`i32` coercion, the example this entry was written against, until its
+  retirement on 2026-09-29 — D3218, ruling C). Asking `assignable` made the generic spelling REFUSE
   `function g<T>(self: T): i32 { return self }` at `g(true)` while the direct spelling runs —
   a false reject invented by the fix. **The identity is the soundness argument**: parity with
   the direct spelling is structural, not a second rule that can drift the way `checkBinary`
@@ -928,18 +946,21 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   one relation); the hash folds `-0.0` into `0.0` so `0.0 == -0.0` finds its entry; a
   key mutated after insertion is lost (Java's rule). **`IdentityMap<K, V>` /
   `IdentitySet<K>` are the identity-keyed containers** — separate concrete types with
-  `Map`/`Set`'s whole surface, `K` = anything `===` accepts, and BOTH satisfy the
-  index-signature interface: `{[K]: V}` is the CAPABILITY, not the implementation, and
-  a signature names `Map<K, V>` or `IdentityMap<K, V>` when it wants the specific one
-  (the concrete names become annotation-legal and `Map<string, i32>()` parses
-  TS-style as part of this — neither exists today). Rep: the existing 7-field map
+  `Map`/`Set`'s whole surface, `K` = anything `===` accepts. `{[K]: V}` names the
+  concrete map, not a capability (Q1, 2026-09-25, reversing C2), so a signature that
+  accepts any mapping writes a bound (the concrete names are annotation-legal and
+  `Map<string, i32>()` parses TS-style since A15 item 3 — `Map<K, V>` a long spelling of
+  `{[K]: V}`, `Set<T>` its own type per Q2; see "`{[K]: V}` and `T[]` are concrete
+  types" below, and the entry after this one for the parse rule). Rep: the existing 7-field map
   struct with `ref.eq` as the probe compare; v1 is a flat scan, and the lazy `i64`
   per-class serial is the optimisation that follows ONLY WHEN MEASURED NECESSARY — the
   API is identical, so nothing waits on it. Identity keys keep their objects alive;
   there are no weak references. (A15)
 - **Bare literals default to their base type.** `let x = 0` is `i32`, not the
   singleton `0`; the literal type survives only via an explicit annotation
-  (`let x: 0 | 1`). (A16)
+  (`let x: 0 | 1`). (A16) Refined 2026-09-29, for now: a `let` a bare literal initialises
+  takes its type from its deliveries and stores, and such a `const` is its literal at every
+  read (see "A literal binding takes its type from its uses").
 - **A literal in an f32 context is admitted when f32 holds the best
   representation of what was WRITTEN** — which means the two literal kinds take
   different rules, by force rather than for symmetry. A `.` literal is
@@ -1813,12 +1834,17 @@ it worked.
   (`/` is `div_s`) and already exposed one unsigned instruction as an operator
   (`>>>`). A `u32` would touch the type arena, every rep table, every widening
   rule and every emitter kind code to express something the operand need not
-  carry.
-- **No transcendentals, ever, as a language or std primitive.** No wasm opcode
-  computes `sin`/`pow`/`exp`, so any implementation is a library whose last bit
-  is a policy choice. A program that must match another implementation exactly
-  has to own that choice; shipping one would give it a trap to avoid rather than
-  work to save. (`docs/internals/numeric-intrinsics.md`)
+  carry. *Amended 2026-10-03:* VL adds `u32` and `u64` as value types, and the
+  unsigned operations stay for `i32` and `i64` operands (§"`u32` and `u64` are value
+  types").
+- **No transcendental as a compiler intrinsic; they live in `std:math`.** No wasm
+  opcode computes `sin`/`pow`/`exp`, so any implementation is a library whose last
+  bit is a policy choice, and that library is not the compiler's. This entry first
+  said "no transcendentals, ever, as a language or std primitive"; the std half was
+  superseded by `docs/internals/std-math-design.md`, which owns the choice in
+  `std:math` (pure VL, the same bits on every host, a published ulp bound). A
+  program that must match some other implementation exactly still owns that choice
+  itself. (`docs/internals/numeric-intrinsics.md`)
 
 - **A classifier's "no answer" sentinel is NOT neutral when the caller has a
   default — so a DECLINE LIST is a set of testable claims, and each entry must be
@@ -1949,6 +1975,25 @@ three callers instead would have been three more places to forget.
   parsing are one phase to `vl check` and a character with no meaning needs no token kind.
   The one non-additive edge is the indentation strip: `"ab\<newline>  cd"` was `ab  cd` and is
   now `abcd`, so a space that is wanted goes BEFORE the backslash, where it is content.
+- **Explicit type arguments on a call use TypeScript's disambiguation (A15 item 3).**
+  After a name, `<` opens type arguments only when the run parses as a comma-separated
+  type list with no diagnostic, closes with `>` (a fused `>>`/`>>>` included), and is
+  followed DIRECTLY by `(`; otherwise the parser restores its cursor, token stream,
+  diagnostics and spelling stack and the `<` is a comparison. Chosen over a lexical rule
+  (no space before `<`) because it is the one a TS reader already carries, and over a
+  turbofish (`f::<T>()`) because the price is small and measured. Two forms change meaning.
+  The chain `a < b > (c)` was already a check error, since `a < b` is a `boolean`. The
+  COMMA form `f(a < b, c > (d))` is not: it ran before, as two comparison arguments, and
+  now reads as one call `a<b, c>(d)` and is refused — with a hint naming this rule and the
+  fix, `f((a < b), c > (d))`. Neither form occurred once in `tests/cases` (3,596 files), the
+  distilled corpus (7,589 cells), `std/`, `scripts/`, the compiler, glean (319 files) or
+  plumb's sources (104); the owner accepted the ambiguity as TypeScript does, and the comma
+  form is flagged to the owner separately. A line break inside the `<…>` is not tolerated
+  (the list must sit on one line); left as is. Scope today: a direct call of a
+  declared generic function, and `Map<K, V>()` / `Set<T>()`; the written types bind the
+  type parameters in declaration order before any argument is checked. A method call
+  (`o.f<T>()`) and an instantiation expression without a call (`const g = id<i32>`) are
+  not parsed.
 - **Hand-written parser over a generator.** Dropped antlr4 (Java/Gradle build
   step; can't be part of a self-hosted compiler). Chose hand-written (Pratt)
   over peggy/parser-combinators for error quality and bootstrappability. (Track
@@ -3991,6 +4036,10 @@ trapped `cast failure` at the caller's next `q.x + 1`. **No new semantics were c
 The rule is the owner's A9 reads-only rule, already governing lists: a covariant delivery is
 legal exactly where nothing it reaches WRITES a widened slot.
 
+**Since 2026-09-29 it governs only deliveries that share a storage.** An existing record whose
+field is STORED differently at the destination is refused outright, written or not, and a fresh
+one is built there ("Record covariance: only a fresh value widens", below).
+
 * **What counts as a widened slot.** Every field path whose type differs between the delivered
   value and the destination (`.x`, `.inner.x`, `.xs[]`, a map's `[]`), including the slots of a
   union member the value can be narrowed to. A slot owned by a fresh literal is exempt — no
@@ -4570,8 +4619,8 @@ target (`f64 → f32`, `i64 → f64`, `i32 → f32`) ROUNDS and never fails — 
 nearest representable float is the conversion, not a loss of the value's meaning. Loss is
 SPELLED where it happens: `trunc(d) as! i32`, `floor(d) as! i32`, `nearest(d) as! i32`,
 where `trunc`/`floor`/`ceil`/`nearest` are the existing `f64 → f64` intrinsics and the
-`as!` is provably infallible after them (the emitter peepholes the pair to the one
-`i32.trunc_f64_s`). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
+`as!` can then fail only on range (the emitter drops the integrality compare; see
+"An integral operand's cast tests only the range"). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
 would have been `as?` spelled as a function, a std API bent around the ignored-suffix gap
 (D1041), which is exactly what the 2026-09-01 "design is not bounded by the seed" rule
 forbids.
@@ -4722,8 +4771,9 @@ domain. The REP target decides the conversion opcode and the `i32 | null` box ro
 registers, the DOMAIN decides the range test and the `as!` message. Collapsing them either
 loses the range or registers a `u8|null` box that nothing builds — which is why the canon pass
 that rewrites `n.asTy` to the primitive spelling leaves `u8` alone, and why the emitter's
-`trunc(d) as! i32` peephole declines the `u8` domain (its premise is that the conversion
-instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255).
+`trunc(d) as! i32` peephole declined the `u8` domain (its premise was that the conversion
+instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255; the
+range test that replaced it in SP-056 tests the domain's).
 
 **Grading list.** D1587, and D1583 which it supersedes; the 60-cell trio grid on that row;
 `tests/cases/numerics/as-cast-u8-trio.vl`, `as-cast-u8-trap-range.vl`,
@@ -4819,6 +4869,15 @@ LITERAL check type (`is null` / `is string` / `is Circle` still discriminate), a
 codegen — 18 programs graded against a pristine `origin/master` seed emit byte-identical wasm.
 
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
+
+> **Amended by D3870 (owner ruling C, 2026-10-08) and D3885 (owner ruling A, 2026-10-10).**
+> The principle stands: `is` asks whether the VALUE is a member of the type, and a
+> literal-typed field is decided by its value. What falls is the fallback to the tag, that
+> is, to the declaration a value was built under. Records are structural, so two same-shape
+> record types are one type and no tag records a value's declared name. The refusal of a
+> same-shape pair with no distinguishing literal field (`{v: i32} | {v: boolean}`), called a
+> design rule below, has no live ruling now. It is pending owner question Q4
+> (`docs/spec/OPEN-QUESTIONS.md`).
 
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
 field — `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`
@@ -5315,7 +5374,8 @@ can begin an expression either — `=` and every compound form (`+= -= *= /= %= 
 `?.`) already joined at every depth; `is` and the four `as` casts join here for the first time.
 A `|>` pipe, if one is ever added, would join for the same reason.
 
-**Why unary minus is EXCLUDED.** `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
+**Why unary minus is EXCLUDED** *(amended 2026-10-05: a `-` followed by a space or tab now
+continues — see "A line-leading `-` continues only when whitespace follows it" below)*. `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
 the block's value is `-x`". Joining would silently turn it into `f() - x` — a value change with
 no diagnostic — so a leading-minus line stays a statement, and a program that wants subtraction
 puts the operator at the end of the previous line or in parentheses, as today. Swift, Kotlin, Go
@@ -5346,6 +5406,74 @@ normalises the layout away and that stays fine — the third ruling on this axis
 the leading dot and D1581.
 
 
+## A line-leading `-` continues only when whitespace follows it (D3698, 2026-10-05)
+
+**Ruling** (owner, on sunpa SP-040; amends the 2026-09-04 ruling above, which excluded `-`
+outright). A line whose first token is `-` FOLLOWED BY A SPACE OR TAB is a binary minus and
+continues the previous expression, like every other continuing operator. A `-` touching its
+operand stays a new statement:
+
+```vl
+const w = a * 3.0
+  - b * 3.5        // one expression: a * 3.0 - b * 3.5
+
+function f(): i32 {
+  g()
+  -x               // two statements: the block's value is -x
+}
+```
+
+sunpa's camera wrote the first form, computed `a * 3.0`, and discarded the second line in
+silence; #3383's lint named it after the fact. The spaced form is how every style guide and
+`vl fmt` itself write a broken subtraction, so it now means what it looks like.
+
+**Why `{ f()` ⏎ `-x }` still holds.** The 2026-09-04 reason for the exclusion is unchanged: a
+`-x` line is a legal statement, and a block's last one is its value. The spacing keeps both
+readings: nobody writes a negation as `- x`, and nobody writes a broken subtraction as `-x`.
+
+**The survey.** JavaScript and Lua continue on a leading `-` unconditionally (JS's ASI has no
+rule for it, Lua has no statement terminator), which is the `{ f() ⏎ -x }` hazard. Swift and
+Scala 3 decide by spacing, as here: Swift treats an operator with whitespace on both sides as
+binary and one touching its operand as prefix, and Scala 3 continues a line on a leading
+infix operator only when whitespace follows it. F# decides by indentation (an offside
+operator continues). Go, Kotlin, Ruby and Python start a new statement and make the author
+put the operator at the end of the line or open a bracket.
+
+**The exact rule.** The test is the next TOKEN, not a character: the `-` continues when the
+following token is on the same line and does not start right after it. The lexer skips only
+spaces and tabs between tokens on a line, so that gap is horizontal whitespace. A `-` at the
+end of its line (followed by a newline, or by a comment and then a newline) does NOT count as
+spaced and keeps its old reading — "space or tab" was chosen over "any whitespace" so that a
+lone `-` cannot join three lines. Compound tokens are unaffected by construction: `-=` already
+continued (it cannot begin an expression), `--` is the decrement and no binary operator, VL
+has no `->`, and `-1` lexes as `-` then `1`, so `- 1` continues and `-1` does not. One more
+exception, at every depth: a line that reads as a negative integer match pattern followed by
+`=>` (`-1 =>`, `- 1 | 2 =>`) is the next arm, never a subtraction from the previous arm's
+body, since no continued expression can be followed by `=>` there (D3699, which was already a
+parse error inside brackets). The pattern run may break after an or-pattern's `|`, as
+`parseMatch` allows.
+
+`- b` continues across blank lines and comment-only lines, like the other leading operators:
+the scan is the same `afterNewlines` run.
+
+**Inside brackets nothing changes.** The 2026-09-04 text said a leading `-` inside a bracket
+was a parse error; that was out of date — D1581's bracket gate already let `-` continue there,
+spaced or not, because no statement can end inside a bracket. Both spellings keep continuing.
+
+**The cost is whitespace significance**, which VL otherwise does not have between tokens
+on a line. It is confined to one token at one position (the first token of a line, outside
+brackets), and the two readings differ only where the space makes the author's intent
+visible. `vl fmt` now leads EVERY broken chain with its operator, `-` included, always as
+`- b` (the 2026-09-24 trailing exception is retired), and prints a negated negation as
+`-(-x)` rather than `- -x`, which at the start of a statement would now continue the line
+above.
+
+**Measured.** Every `.vl` file and `vl` code block in this repo and the consumers' sources
+(sunpa/src, plumb/src, glean) was scanned for a line-leading `-`. 0 spaced lines outside
+brackets existed before this change (the one in sunpa, `terrain.vl`, sits inside a `(`), so
+no existing program changes meaning; the tight `-x` lines (919 in the repo, 104 sunpa, 53
+plumb, 8 glean) parse as before by construction.
+
 ## `vl fmt` puts a broken chain's operator at the start of the line (2026-09-24)
 
 **Ruling** (owner). When `vl fmt` breaks a binary-operator chain that does not fit the width,
@@ -5362,7 +5490,8 @@ Only the operator moves. Which chains break, the flattening by precedence, and t
 indentation are unchanged, and so is the forced-paren form of an over-wide `if`/`while`
 condition, whose operands now lead with `&&` / `||` inside the parens.
 
-**A chain holding a `-` link keeps every operator trailing.** The ruling above excludes `-`
+**A chain holding a `-` link keeps every operator trailing.** *(Retired 2026-10-05 by D3698:
+a spaced `- b` now continues at every depth, so a `-` chain leads like any other.)* The ruling above excludes `-`
 from the line-continuing set: outside brackets `a` ⏎ `- b` is two statements, and at a
 binding it is a silent value change (`const v = a` then a discarded `-b`), not an error.
 The formatter does not track bracket depth, so it cannot know when a leading `-` would be
@@ -5392,7 +5521,7 @@ the same name imported twice from the same module, or through a re-export chain 
 the same declaration, is redundant and still RUNS; only two DIFFERENT declarations under one
 name are refused. Pinned both ways:
 `tests/cases/modules/duplicate-import-same-declaration/` and
-`tests/cases/modules/err-duplicate-import-two-modules/`.
+`tests/cases/modules/err-duplicate-binding/` (since receiver overloading, O1, two functions whose first parameters differ in kind coexist: `tests/cases/modules/overload-record-receivers/`).
 
 **Why it is a rule and not a lint: the meaning was reader-dependent.** The merge's rename map
 held two rows under one key and its readers disagreed about which won — `modRenamed` (VALUE
@@ -5758,9 +5887,40 @@ an append mentions it (which is what makes evaluating the parts before reading `
 unobservable); and no nested function mentions it. At least one self-append must be inside a
 loop, so a straight-line `s = s + x` keeps the bytes it had.
 
-NOT DONE, deliberately: a module GLOBAL accumulator. The declaration and the assignment sit
-in different scope units, so proving the invariant needs a module-wide walk rather than a
-per-function one; the pattern stays quadratic and is filed in ROADMAP item 7.
+A module GLOBAL accumulator appended at top level is the same proof over the whole module
+(#2920, `strAccScanStart`).
+
+**The site-cached append: every other place, proven at run time (D2625, 2026-09-26).** The
+binding proof cannot reach a field (`o.s = o.s + x`), a list cell, a map value
+(`m[k] = (m[k] ?? "") + x`), a global appended inside a function, a parameter, or a PREPEND
+(`s = x + s`) — each of those copied its whole prefix per append, 10–20 s for 160,000 appends.
+A static proof for them would have to see every write to the place anywhere in the program:
+struct copies, list `.slice`s, map values, generic std code. So these take a RUNTIME rule
+instead. Each `p = p + parts` or `p = parts + p` inside a loop owns two function locals: `SB`,
+the buffer that site allocated last, and `SE`, its frontier (for a prepend, the lowest start).
+The invariant is that no view into `SB` extends past `SE` (starts before it): `SB` was fresh
+when the site made it, only this site in this frame ever writes it, and it writes only
+beyond the frontier and moves the frontier with it. So a value `v` may be extended in place
+exactly when `v.backing == SB` (`ref.eq`) and `v`'s edge is `SE`; every other value — an
+alias of an older snapshot, a string shared with another place, one a part's call appended to
+meanwhile — copies into a fresh buffer that becomes `SB`. No aliasing argument is needed, so
+the rule applies to any place, and a stale answer can only cost a copy.
+
+EXACTNESS: the parts, the place's own read included, are evaluated exactly as the copying
+lowering evaluates them, left to right and once; only the allocation differs, so the
+evaluation order and every printed value are the copying lowering's (an aliasing grid over
+every shape and a 40-seed randomized mix of appends, prepends, snapshots, restores and shared
+strings agree with the copying compiler line for line). A miss allocates
+EXACT-FIT, `len + added`, and a full hit doubles: a loop pays one extra copy on its first hit
+and stays linear, and a one-off append keeps no slack. Slack on a miss is RETAINED memory,
+not garbage — a first cut that gave a miss `len + 2*added + 16` made one append to each of
+1M objects 148 -> 295 MB and 0.06 -> 0.17 s (review of #3192). The binding proof still wins where it applies —
+its lowering has no test — so a proven local keeps its bytes.
+
+Two shapes stay quadratic, filed rather than guessed at: a site outside any loop reached from
+a caller's loop (D2669 — the locals live one call, and module-lifetime storage needs the site
+count before the global section is written), and one site cycling over several strings (D2670
+— one cached buffer per site). Ropes stay the owner's held option.
 
 **Why not a separate buffer with a materialisation point** (Part D's option B as written).
 It needs two extra locals, a loop-entry hook, a materialisation at every loop EXIT including
@@ -5819,10 +5979,11 @@ consequences worth writing down rather than discovering. The row now needs the b
 a working seed where a `stat` and a `json.load` needed neither, which is why it sits after the
 build in both callers and cannot report when the seed itself is broken. And the port is graded
 by having RUN BESIDE the Python, output for output, with the three places they could not agree
-named and asserted in `tests/vl_seed_size_port_test.ts` — the one-decimal percentage's rounding
-(there is no fixed-precision renderer in `std:fmt`), the tool its own regressed message names,
-and the stream a loud failure uses (VL has no stderr sink). The two gaps have rulings in
-`open-rulings.md` §D; the port routes around them with comments naming each.
+named and asserted in `tests/vl_seed_size_test.ts` — the one-decimal percentage's rounding
+of an exact tie (`std:fmt`'s `toFixed` breaks it away from zero, the Python's `+.1f` to even),
+the tool its own regressed message names, and the stream a loud failure uses (VL has no stderr
+sink). The stderr gap has a ruling pending in `open-rulings.md` §D; the precision gap was
+ruled 2026-10-03 and `pctStr` now calls `toFixed`.
 
 ### Why +3%, and why it does not block on shrinkage
 
@@ -6380,6 +6541,45 @@ binary operator always has a left operand and a `%` that spells the cast never d
 a contextual keyword, so a binding may still be named `as` and take an ordinary remainder.
 `tests/cases/numerics/as-pct-precedence.vl` is the fixture that pins both readings.
 
+## A `boolean` is never a number; `as` converts it (owner ruling (C), 2026-09-29) — D3218
+
+**The A7 coercion is retired.** Since #152 a `boolean`-typed VALUE was accepted wherever the
+destination was exactly `i32` (binding, argument, return, field, element, store, push, map
+value) and, through the `u8` arm's source set, a `u8` element, as `1`/`0`; a bare `true`/`false`
+literal was refused. It was the one implicit crossing between the two scalar families, and a
+boolean that silently becomes a count is the confusion a type exists to catch — the value/literal
+asymmetry it needed is how D2628 and D3218 were filed as silently-wrong defects against a
+designed rule. Now every position refuses a `boolean` into a number, and the refusal names
+the fix: ``… got boolean — a `boolean` is not a number; convert it with `b as i32` `` (a brand
+destination names the brand, `b as A1`, and a `u8` cell names `u8`). Two positions that never
+checked the value against its destination at all still let a boolean through, as they let any
+mismatched scalar through: a `??` operand at a generic pin (D3252) and a spread element (D3253).
+
+**`as` from `boolean`, and the targets it takes.** `b as N` gives 1 or 0 for EVERY numeric
+target — `i32` and `u8` read the boolean's own i32 (no instruction), `i64` sign-extends,
+`f32`/`f64` convert. That is the rule the rest of `as` already follows: the family is closed
+over the numeric scalars, and restricting a boolean source to `i32`/`u8` would make
+`b as f64` the one numeric pair a user must spell through a second cast. The conversion is
+EXACT, so under the exact-or-fail ruling it cannot fail: `as!` never traps, `as?` is the bare
+number (not `N | null`), and bare `as` propagates nothing — the same answer `i32 as? f64`
+gives. A literal converts as a value does (`true as i32` is `1`). A type parameter pinned at
+`boolean` converts at the pin exactly as the direct spelling does; before the ruling it was a
+pin "at no number" and missed (D2791), which would now disagree with its direct twin.
+
+**What stays refused.** `as%` over a `boolean` — the wrap cast names a width to keep the low
+bits of, and a boolean has none, so it refuses and names `as` (at the direct spelling and at a
+pin, in one sentence). The reverse, a number into a `boolean`, has no implicit form and no
+`as` either: which numbers are `true` is a question with more than one answer (`!= 0`, `== 1`),
+so the comparison is written out.
+
+**Price, measured.** 194 distilled-corpus cells moved `runs` → `loud check reject`, every one in
+a grid built to exercise A7 (`d591` 86, `d581` 28, `d551` 24, `d591t` 22, `d572` 16, `d532x` 8,
+`d581o` 4, `d582s` 4, `d572o` 2), each refusing in words that name `boolean` against a number;
+62 more already-refused cells gained the note. Nothing in `compiler/`, `std/` or `scripts/`
+relied on it (the fixpoint holds), nor did plumb. The fixtures that pinned A7 were migrated to
+the `as` spelling, and `tests/cases/types/boolean-to-i32-container-reject.vl` and
+`tests/cases/generics/boolean-into-number-at-pin-reject.vl` pin the refusal at every position.
+
 ## The union box's TAG is the only sound discriminator; `ref.test` is not a substitute (2026-09-07) — ROADMAP row 16, closed as DESIGN
 
 `emitIs` over a boxed union compares the box's tag, and ROADMAP row 16 asked whether WasmGC's
@@ -6557,6 +6757,33 @@ Atomics are a separate lane; wrappers over the raw intrinsics are queued in `ROA
 through the std review. Pinned by `tests/vl_shared_memory_test.ts`, which runs one module in two
 Workers over one `WebAssembly.Memory({ shared: true })`.
 
+## A memory's size is a build flag: `--initial-memory=<size>`, `--max-memory=<size>` (owner, 2026-10-03) — sunpa SP-011
+
+**The ask:** a `Buffer()` that grows the memory mid-frame detaches every typed-array view a JS
+host holds of it, so sunpa's draw list read `undefined` after a culling pass allocated. The
+owner chose the answer every other wasm toolchain gives (Emscripten `-sINITIAL_MEMORY`,
+Rust/Zig `--initial-memory`, AssemblyScript `--initialMemory`) over a `std:buffer` API
+(`reserve`, `memoryEpoch`): a build flag, plus a cost-guide note (D3560).
+
+- **Sizes are bytes or `KiB`/`MiB`/`GiB`, a whole number of 64 KiB pages, refused rather than
+  rounded.** Every other layout flag is parsed strictly and exits 2 on a value it cannot take,
+  and a silently rounded size would be a different contract from the one the build line names.
+  The refusal names the next page multiple. Zero and anything past 4 GiB (65536 pages; VL
+  emits no memory64) are refused.
+- **`--max-memory` and `--shared-memory` conflict, they do not alias.** Both declare the max,
+  and `--shared-memory` takes pages where `--max-memory` takes bytes, so accepting both would
+  mean ruling which wins. A shared build keeps `--shared-memory=<pages>` as its one max;
+  `--initial-memory` combines with it, and with `--max-memory`, as long as it is at most the
+  max.
+- **The flags shape the declaration only.** Imported (`--import-memory`) or defined, the
+  limits carry the same min and max; a module that touches no linear memory has none and the
+  flags change nothing. `std:buffer` needs no change: it grows only when an allocation passes
+  `memory.size`, so a memory that starts large enough never grows. `--max-memory` caps growth
+  the way `--shared-memory` does, and a `Buffer()` past it traps.
+- **`vl run` takes both**, like `--shared-memory`, because they change the memory's type and not
+  who supplies it. Pinned by `tests/vl_initial_memory_test.ts`, whose control shows the default
+  one-page memory detaching a view under V8.
+
 ## std:buffer's allocator over a shared memory (owner direction, 2026-09-24) — every instance allocates, none overlap
 
 **The ask:** the first std-level lane over the raw shared-memory and atomics layer. Several
@@ -6690,10 +6917,18 @@ import a mutable global another unit (or the embedder) owns, and a unit to expor
   `--rename-export-conflicts` (`cli-design.md`, "the facade recipe"). Measured for globals too: an
   imported MUTABLE global re-exported through the facade resolves to the defining unit's own
   global, with no `extern` import left and every access a direct `global.get`/`global.set`.
-- **`vl run` provides no globals and refuses at load**, naming the global and the fix (build and
-  link it). Supplying zero-initialized globals was the alternative and was declined: the program
-  would read a value nobody set, which is exactly what the contract exists to prevent. The same
-  choice `vl run --import-memory` made.
+- **`vl run` supplies a global only from `--extern NAME=VALUE`, and otherwise refuses at load**,
+  naming the global and the flag. Supplying zero-initialized globals was the alternative and was
+  declined: the program would read a value nobody set, which is exactly what the contract exists
+  to prevent. The flag keeps that contract, since the value is one the caller wrote (owner ruling
+  2026-09-26, plumb PL-046, [D2636](docs/internals/inventory/D2636.md)); the refusal is per
+  DECLARATION, and narrowing it to globals the program actually reads is a ROADMAP item. The
+  spelling `--extern` (owner ruling 2026-09-26, over `--define`/`-D` and `--define-global`) matches
+  the keyword the program declares the global with. A `boolean` crosses as an i32, so the host
+  cannot tell one from its import; the compiler writes a `vl-extern-bool` custom section naming
+  them, only when one exists, and the host refuses any value but `true`/`false`/`1`/`0` for
+  those. The alternative, a boolean-specific import name, would have changed the ABI every other
+  host links against.
 
 Pinned by `tests/vl_extern_global_test.ts` (sections, a host `WebAssembly.Global` written from both
 sides, V8 and `wasm-merge` + `-O3` links, the mutability `LinkError`, the `vl run` refusal) and the
@@ -6788,6 +7023,8 @@ every local must have a non-boxing representation, decided from types before emi
   otherwise hand lint a tree whose callee rows were popped.
 
 ## The compiler's collector is picked by the size of the entry file (2026-09-22) — plumb PL-002 follow-up
+
+*Superseded 2026-10-07: the default is now copying at every size, see "The compiler's collector is copying by default" below.*
 
 `vl build` and `vl run` used to compile under wasmtime's NULL collector always. It never frees,
 so a compile's peak memory is every byte the compiler ever allocated, and the GC heap's 32-bit
@@ -6907,6 +7144,60 @@ Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits. (2026-09-2
 this paragraph asked for now exists, `profiling-the-compiler.md` §"Measured 2026-09-24, second
 pass"; after D2317–D2319 the units sit at ~291 MB, and `P.nodes` plus `P.toks` are two thirds
 of what is left.)
+
+## The compiler's collector is copying by default (2026-10-07) — lane GC, sunpa build memory
+
+**Supersedes the entry-file threshold above.** `vl build` and `vl run` compile under the
+copying collector from a 256 MiB first heap at EVERY entry-file size (`compile_engine`,
+`scripts/vl-host/src/main.rs`). `$VL_COMPILE_GC=null|copying` stay as overrides (`auto` is
+copying), `$VL_COMPILE_GC_HEAP` still sets the first heap, and the self-compile scripts still
+pin null.
+
+**Why.** The threshold read the ENTRY file, so sunpa's `game.vl` — a 260 KB entry over a 2 MB
+module graph — compiled under null and held every byte the compiler allocated: 2.4 GB peak per
+build, and sunpa runs up to five builds at once, so memory set its slot cap. The +11–19% CPU
+that justified null below 1.5 MiB did not reproduce on this workload once the seed's sidecar is
+warm: null's cost is faulting in 2.4 GB of fresh pages, which copying, re-using one semispace
+pair, does not pay. One quiet run per cell unless noted, load 2–6, warm sidecars, wall / peak
+RSS (the vl process's `VmHWM`) / collections (`VL_GC_STATS=1`), all on master's seed:
+
+| input | null (master default) | copying 256 MiB (new default) | 512 MiB | 768 MiB | 1 GiB |
+| --- | --- | --- | --- | --- | --- |
+| sunpa `game.vl`, plain (3 interleaved) | 20.6–23.2 s / 2,440 MiB / 0 | 19.9–20.1 s / 563 MiB / 61 | 19.3 s / 564 / 28 | 19.8 s / 820 / 11 | 20.8 s / 1,075 / 7 |
+| sunpa `game.vl`, `-O3` (its `build:vl`) | 50.4 s / 2,435 MiB / 0 | 50.0 s / 559 MiB / 61 | 50.1 s / 559 / 28 | — | 50.1 s / 1,071 / 7 |
+| self-compile `compiler/entry.vl` (2 interleaved) | 8.4–9.1 s / 2,341 MiB / 0 | 9.7 s / 1,071 MiB / 26 | 10.0 s / 1,072 / 22 | 13.6 s / 815 / 42 | 9.3 s / 1,071 / 12 |
+| `print("hello")` | 0.02 s / 37 MiB | 0.02 s / 38 MiB | 0.02 s / 37 MiB | — | — |
+
+All of them emit the same bytes: sunpa's module and source map (plain and `-O3`) and the
+self-compile, which is the seed itself (`--prove-fixpoint` holds).
+
+**Why 256 MiB and not a bigger first heap.** wasmtime 47's copying heap collects whenever the
+last live size is under half its capacity (`should_collect_first`) and only otherwise doubles,
+and it never returns a semispace's pages, so the peak RSS is the heap's size, not the live set's.
+A first heap just above twice the live set collects over and over while reclaiming little: 384
+MiB on sunpa (192 MiB live, 192 MiB semispace) ran 138 collections at 25.0 s, 768 MiB on the
+self-compile (367 MiB live) 42 at 13.6 s. 256 MiB doubles past that band on both inputs, costs
+the most collections but the least memory, and keeps the engine configuration — and so the seed's
+`.cwasm` sidecar — that `refresh-compiler.sh` already warms. Each distinct value is a fresh
+Cranelift compile of the seed (~9 s, ~1.9 GB peak, once per host binary).
+
+**Why the self-compile stays null.** It is the one input here where null is faster (~10% wall,
+~16% CPU, against 54% less memory), and the gate runs it many times; the scripts pin it, so the
+default does not move it.
+
+**Declined.**
+* *A null start that switches to copying when the heap nears a size.* Impossible mid-instance:
+  the collector is an `Engine` setting, compiled into the seed's code (object headers, barriers,
+  the allocation path). Switching means restarting the compile, which pays the failed attempt's
+  peak first — the retry the section above declined.
+* *DRC (deferred reference counting).* sunpa `game.vl` plain had not finished at 600 s (null:
+  24 s); killed.
+* *A size threshold on the module graph instead of the entry file.* Not needed once copying is
+  no slower; the host also cannot sum imports before it compiles.
+
+**Rows that moved.** D2771, D2780 and D3407 filed a compiler trap that was the null heap filling
+with garbage; under copying their witnesses build in 8–10 s at about 300 MB, and the trap is
+closed while the exponential cost in their titles stays open.
 
 ## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
 
@@ -7109,8 +7400,8 @@ bytes, and binaryen keeps an unknown custom section with or without `-g` while r
 body under it — so master's `--names -O` already carried them, stale, and a trap printed a wrong
 source line (a 700-line program trapping at line 692 read `at 488:5` at `-O`, `at 419:5` at
 `-O3`). The host strips the section before the first `wasm-opt` run. Remapping the rows through
-binaryen (a source map) is the way to get lines back; until then an optimized build's frames
-carry names and no lines.
+binaryen (a source map) is the way to get lines back. `vl build --source-map` now does that
+(§"`--source-map` is its own flag, and the map is a side channel", D3561).
 
 **Price, `--names` over the same rung without it** (bytes, all of it the name section): the 86
 `bench/` programs +8,837 at `-O` (+9.6%, median +58 per program, range 43–453) and +6,790 at
@@ -7131,6 +7422,295 @@ flag.
   in two runs are valid. The step avoids it by running the rung's own pipeline, and the host
   still validates every module it writes.
 * *An inline hint* (`@metadata.code.inline`): binaryen 133 still ignores it, as L8 found for 130.
+
+## `-O` inlines a small record's producer (2026-09-29) — plumb PL-057/058, owner ruling (B)
+
+**The ruling.** No tuple syntax: a SMALL record returned from a call that does not escape at the
+caller is the compiler's to lower without a `struct.new`. The ruling names wasm multi-value
+results as the lowering and asked for the cheaper route to be tried first.
+
+**The defect (D3261).** plumb's squad returns a five-field `Quat` from `slerp`, which has three
+callers and is binaryen size ~20, over the `-O` rung's always-inline 16. It stayed a call, and a
+`return` is a way out of `--heap2local`'s escape analysis, so every call allocated: 100M squads
+took 1.77–2.05 s and 270 MB under `vl run` at `-O` (1.76–1.91 s at `-O3`), against 0.57–0.70 s
+and 8 MB for plumb's module-globals workaround.
+
+**The rule.** The L4 escape step (`escape_inline_choice`) already inlined the callees a
+per-call struct is PASSED to. It now also chooses a callee that RETURNS one, on the same bounds
+(320 body bytes, no call cycle, the expanded and growth bounds), when:
+
+1. the result is a struct type no field, element, global or table can hold, that takes no part
+   in subtyping, and that has at most 8 fields (`ESCAPE_RECORD_MAX_FIELDS`), each a number or a
+   reference to a struct — a record, not a list or string wrapper;
+2. the callee allocates it, or gets it from a chosen producer (`wrap(k) = mk(k + 1)`);
+3. at some caller it stays: that caller hands it to no function that is not chosen and returns
+   it only if that caller is itself a chosen taker or a producer found useful. That is a least
+   fixpoint, computed by a worklist from callers down to callees, so a chain of producers whose
+   top leaks has no useful member and is not copied into every caller.
+
+"Held" now also covers a type some `ref.test`/`ref.cast`/`br_on_cast` targets. A union box
+stores its payload in an `anyref` field that names no struct type, so the field scan missed it,
+and a producer whose only callers box the result was inlined for no melt (+13–18% bytes, one
+module 382 → 886, in review). Getting a record back out of a box needs a cast, so the cast is
+the tell.
+
+Producers are found by a worklist up from the ones that allocate, and the choice runs in two
+rounds — the second without the producers the first found futile, which drops the takers only
+they had made worth choosing. The first version restarted the whole choice after each futile
+producer, one per restart on a chain: 20,000 chained producers built in 25 s against master's
+3.2 s. It is now 3.1 s, and 3,000 / 10,000 / 20,000-producer chains build byte-identically to
+master in the same time.
+
+A caller holding a chosen producer's record counts as allocating it, so a helper it is passed
+to (`score(r)`) is chosen by the existing rule. And any tiny loop-free callee (at most
+`RUN_ONCE_INLINE_LEAF_BYTES`, no call to a defined function) may be chosen although run-once code
+calls it — a producer or a struct-TAKING helper alike — as `run_once_hot_callees` already
+leaves such a leaf inlinable: its per-call work is too small for V8's baseline tier to matter,
+and the top-level loop is where a benchmark calls it.
+
+**Why not the multi-value ABI first.** Inlining gets plumb's shape all the way: the record
+version now beats the globals one, because the fields become locals where the workaround pays a
+`global.set`/`global.get` per field. The ABI remains the route for what inlining cannot reach —
+a producer over the bound (D3262) and a record type some other call site lets escape (D3263,
+since `--no-inline` is per callee and the escape test is per wasm type).
+
+**Measured** (100M squads, `-O`, one core, 5 interleaved rounds, load 3–5; wasmtime is `vl run`,
+V8 is node 24.11.1 instantiating the module):
+
+| build | wasmtime user s | RSS | V8 CPU s |
+| --- | --- | --- | --- |
+| record, master `-O` | 1.77–2.05 | 270–278 MB | 0.99–1.29 |
+| record, this `-O` | **0.36–0.50** | 8–17 MB | **0.46–0.48** |
+| globals `-O` (unchanged, byte-identical) | 0.57–0.70 | 8–16 MB | 0.65–0.79 |
+| record, master `-O3` | 1.76–1.91 | 270–278 MB | 0.75–0.82 |
+| record, this `-O3` | **0.36–0.37** | 8–16 MB | **0.47–0.49** |
+
+`slerp`'s `struct.new` is gone from both rungs' output (wasm-dis), and the module is 5,942 →
+5,893 bytes. A 126-program grid (1–8 fields of mixed f32/i32/f64/boolean and a nested record ×
+reads, read-then-escape, stored in a global, passed, returned on, rewritten, called from the
+top-level loop × a producer under and over the inline bound) prints the unoptimized build's
+output at both rungs, and its record allocations left fall from 206 to 161 of 252 modules: 122
+over the bound (D3262), 36 whose record type is stored somewhere (D3263), and 3 nested records'
+inner struct at `-O` only, which `-O3`'s second `--heap2local` melts. Byte-identical: all 90 `bench/` programs at both
+rungs, `plumb-shape-cost.py`'s two units, and the glob version. A second, 260-program grid from
+review (1/3/8/9 fields with and without a nested record × six producer shapes × seven uses ×
+seven ways to store the record, one or three callers, exported or not) prints the plain output
+at both rungs, with fewer allocation sites in 8 modules and more in none. The compiler at `-O` grows
++0.16% in the same time, and still self-compiles to the seed byte for byte. Without the
+field-shape bound, `std:fmt`'s `bnCopy` (an `i64[]` wrapper) was chosen and `map-string` grew
+8,395 → 12,165 bytes for no melt; the bound is what keeps a list wrapper out.
+`tests/fixtures/opt-escape/record-result.vl` in `tests/selfhost_native_release_escape_test.ts`
+pins the melt against the rung's own passes as control.
+
+## `-O` returns a small record's fields as multi-value (2026-10-04) — sunpa, owner ruling (B), D3625
+
+**The defect.** sunpa's fight view made about 2,000 records a frame (12.9 minor GCs a second
+against a target under one), from one-line vector and quaternion helpers (`origin`, `qnorm`,
+`unit`, `qaxis`, `quatOf`, `cross`, `qrot`, `qmul`, `nlerp`) whose callers read the result
+field by field and drop it. The escape step above could not reach them: a module global
+(`UP`) and record fields (`Skeleton.rootRotation`, `TwoBone.hinge`) hold both types, so the
+per-type test refused every producer (D3263), and where it did inline, a producer with two
+results (`unit`) merged them, which `--heap2local` cannot melt (D3625's witness, and D3598).
+
+**The rule.** The step the ruling names, at the call boundary, as a host step before the
+escape step (`scripts/vl-host/src/multivalue.rs`). A record is a struct type of 1 to 8 fields,
+each `i32`/`i64`/`f32`/`f64`, that no `struct.set` (or atomic write) anywhere in the module
+can reach (by type and subtyping component since D3630, below). A producer returns a non-null reference to one; a function gets
+a twin per `(field parameters, fields result)` pair a call site asks for. A call calls a twin
+when its result reaches only `struct.get`s, a field-only local (every set from a producer, a
+`struct.new` or another such local, every get a field use), a field-only parameter of another
+call, or, inside a result twin, the exit. A returned `struct.new` is deleted, since its fields
+are already on the stack in order; any other returned value is read field by field at the
+exit. Everything else keeps the struct: a store, a capture, `==`, a cast, an ordinary
+argument, a function value. Chains pass fields through: `qnorm(qmul(qnorm(a), b))` makes no
+record at all.
+
+**Why it is sound.** With no write to the shape anywhere, a record cannot change after it is
+made, so reading its fields at the call reads what each later `struct.get` would; a value
+that reaches only `struct.get`s has no observable identity; and a producer's result is
+non-null, so no trap moves. A local whose type is nullable is scalarized only when its first
+use is a set in the function's own frame. A function that can leave with its result other
+than by `return`/`br`/its end (`br_if`, `br_table`, `br_on_*`, `try`, an indirect tail call,
+or a tail call to such a function) gets no result twin. Producers, field-only parameters and
+locals are greatest fixpoints, so recursion and mutual recursion are covered.
+
+**Why a host step, not the emitter.** The decision is per call site and needs the call's
+operand-stack flow, which wasmparser's validator gives exactly (each op's arity names what it
+consumes); in the emitter it would be a new pass over every construct that can deliver a
+record. The escape step is already a host step on the same module, and an `-O` build is where
+binaryen runs anyway. A `--source-map` build (sunpa's) keeps its map: every row is moved with
+the op it names, and a twin gets a copy of its function's rows.
+
+**The bound is eight fields, measured.** The brief asked for four. Past the return registers
+each field is a store and a load through a return area, which still beats the allocation:
+one producer called from three sites in a hot loop, `-O3`, step off → on, V8 2,000 frames and
+wasmtime 4M calls:
+
+| fields | V8 ms | wasmtime user s |
+| --- | --- | --- |
+| 4 | 45.3 → 11.8 | 0.10 → 0.03 |
+| 5 | 48.3 → 15.4 | 0.17 → 0.03 |
+| 6 | 47.5 → 20.4 | 0.15 → 0.04 |
+| 8 | 69.7 → 25.8 | 0.16 → 0.05 |
+
+Eight is also the size `ESCAPE_RECORD_MAX_FIELDS` already gives this ruling, and plumb's
+`Quat` (five fields) is inside it, so D3262 and D3263 close with this. A 4x4 matrix (16) is
+out of scope.
+
+**Measured.** sunpa's frame rebuilt over its own `src/pose.vl` and `src/ik.vl` (30 bones: a clip
+layer per bone, four `twoBone` limbs, a `fabrik` tail, an aim chain, the per-bone reads of a
+draw list), `-O3`, step off → on: **866 → 44 allocations a frame** (the 44 are `fabrik`'s `V3[]`,
+which does hold its records); V8 19.4 → 15.1 ms per 2,000 frames and 1,342 → 87 scavenges per
+40,000; wasmtime 0.55 → 0.43 s wall per 30,000 frames; the module 17,026 → 18,210 bytes. D3598's
+loop: 34 → 5.2 ms per 10M iterations on V8, the hand-scalarized speed.
+
+Correctness: a 1,050-program grid (2-9 fields of every scalar type × seven producer shapes ×
+five positions × every use, with and without a field write) prints the unoptimized output at
+both rungs, and its non-escaping family's dynamic allocations fall 14,378 → 4,633 at `-O3` with
+none rising (what is left: top-level bindings, which are module globals; closures; the
+nine-field control). All 3,443 `@run` corpus cases and `bench/` mains at both rungs: the step
+rewrote 181, every one prints the plain output; the 48 `bench/` mains and both
+`plumb-shape-cost.py` units are untouched and byte-identical (the step costs them 0 ms). The
+compiler at `-O`: the step takes 102 ms on its 4 MB, rewrites it, and the result self-compiles
+to the seed byte for byte. `--enable-multivalue` is byte-neutral on the compiler at both
+rungs. `tests/selfhost_native_release_multivalue_test.ts` pins sunpa's shapes (against a step-off
+control), escapes, recursion and the bound; `tests/vl_addr2line_test.ts` a trap inside a twin.
+
+**A write is charged by type index, not shape, when the indices cannot alias (D3630).** Shape
+and "outside subtyping" were both proxies for "no write can reach this value". After
+re-pinning, sunpa's `V3` still got no twin, for two reasons. First, its in-place 3×f64 records
+share V3's shape. Second, the emitter's width subtyping (D622) makes `V3` a subtype of any
+`{ x, y }` record in the program. VL emits every struct type into one rec group, and there
+distinct indices are distinct wasm types, so the step now asserts that and charges a write to
+the written type's subtyping component. A subtype's value stands where its supertype is
+expected, so a write through either reaches both. A module whose struct types span several
+groups keeps the shape rule. `$VL_MV_EXPLAIN=1` prints each type's and producer's verdict,
+for consumers to find their own disqualifier.
+
+## `-O` takes a record argument apart up to 64 fields, and an `if` that chooses a record (2026-10-06) — sunpa, D3754, D3766, D3767
+
+**Arguments get their own bound.** The eight-field bound above was set for results, where each
+field past the return registers goes through a return area. A parameter has no such area: its
+fields are ordinary arguments. A record ARGUMENT is now 1 to 64 fields (`MV_ARG_MAX_FIELDS`),
+each a number or a reference, and a result keeps eight numeric fields. A reference field is
+passed on as the reference, so identity holds; the never-written rule is unchanged, so its
+value cannot change while it is read early. A twin takes at most 128 parameters
+(`MV_TWIN_MAX_PARAMS`; V8 accepts 1,000), bounded per function when its field-only
+parameters are chosen, so no call site can widen a twin past it. The step validates its own
+output and keeps the input when that fails: a bad rewrite costs an optimization, not a build.
+
+**The bound is where the gain falls off, measured.** An N-field `f64` record built per call at
+two sites and passed to a callee too large to inline that reads every field, 6M calls, `-O3`,
+step off → on: V8 1.48x at 8 fields, 1.61x at 16, 1.70x at 24, 1.67x at 32, 1.50x at 48, 1.55x
+at 64, then 1.41x at 96 and 1.29x at 128; wasmtime 1.97x at 8 and 16, 2.03x at 32, 1.80x at
+64, 1.77x at 96, 1.61x at 128. It never reverses, but past 64 each step costs more than it
+saves relative to the allocation, and sunpa's widest record (36 fields) is well inside. A
+callee reading 5 of the fields gains at every width, since binaryen drops unread parameters.
+
+**A reference field to a struct nothing writes keeps its record whole for a small callee.**
+A value union's box is `{ tag, payload }`, the payload a box of its own. Passed to a callee of
+at most `ESCAPE_INLINE_MAX_BYTES`, the escape step inlines it and `--heap2local` removes both
+boxes; taken apart here, the payload box would still be made. The first cut missed this and
+sunpa's sound table made 12,800 more boxes through a `toString` twin that was no longer
+inlined. For a larger callee both are allocated without the step, so taking it apart still
+saves one.
+
+**An `if` that chooses a record leaves its fields (D3766).** sunpa's IK passes
+`if pb < 0 { sk.rootRotation } else { quatOf(g[pb]) }` to a field-only parameter, and its legs
+choose `if d0.z < d1.z { d1 } else { d0 }`. The step followed a record from its maker to its
+use and an `if`'s `end` was neither, so the producer arm allocated. A non-null single-record
+`if` that no branch targets is now a merge: when its value reaches a field use, its block type
+becomes multi-value and each arm leaves fields (a twin call, a deleted `struct.new`, a
+scalarized local's slots, or a stored record read at the arm's end). Reading early is sound
+for the reason every twin is: nothing writes the type.
+
+**A local handed to a result twin's fallback is a field use (D3767).** `unit(v, fallback)`
+returns `fallback` unchanged, a field use only in its result twin. A local passed there at a
+call whose own result is held as fields always reaches that twin, so it is held as fields too.
+
+**Measured on sunpa** `f81a945` under `feet-test` (10,938 frames), `-O3`, master → this:
+**413.4 → 396.5 `struct.new` a frame**: `qnorm.mv` 3.85 → 0, `cylAlong` 26.4 → 17.6, `unit.mv`
+10.9 → 9.1, the anim `Item` 1 → 0. Feet and gait outputs are byte-identical. What it did not
+reach is filed: the game-side `Item` is written elsewhere (D3765, a decision on fresh
+arguments), a stored record read whole (D3753) and a cache list (D3752).
+
+## `-O` stores a never-written small record inline in its parent (2026-10-05) — sunpa SP-039, D3678
+
+**The defect.** A store into a record field (`j.rot = qnorm(…)`) kept a fresh `Q` box per
+store, and the multi-value step above cannot remove it: a store is not a field use. Slice S1
+of `docs/internals/inline-records-design.md`.
+
+**The rule.** A host step before the multi-value step (`scripts/vl-host/src/inline.rs`)
+replaces a struct field of record type `V` with `V`'s fields when nothing can tell a shared
+box from a copy: `V` is never written (the multi-value step's charge, D3630), no `ref.eq` or
+`extern.convert_any` can see it, it is a leaf of the subtyping order, and no value crossing
+the module boundary can reach it (every type reachable from an import, export, exposed table
+or tag, through fields, elements and signatures; a reachable abstract `any`/`eq`/`struct`
+refuses every record some op hands to such a place, as a union box's payload). Following
+fields is the conservative default the design review asked for: a JS host cannot read a
+struct's fields, and sunpa pays for it (below). The owner ruled it out as the default the
+same day (next paragraph). A parent must be made by `struct.new` in a function body (not `new_default`, not
+a constant expression, D3679), never atomically, must not cross the boundary itself, and must
+lay the field out as its sub- and supertypes do. Every store must be non-null by type; a
+nullable record local that validates as non-null is declared so first.
+
+**Why a cost rule, not just a soundness rule.** A read that needs the whole record re-boxes,
+which allocates where sharing the box did not: sunpa's `Skeleton.rootRotation` is stored once
+and read whole every frame. So a field is inlined only when every read is free — field-read,
+held in a once-set local that is only field-read, or passed to a parameter the multi-value
+step takes as fields. That makes the step never add an allocation, at the price of D3680 (a
+whole read returned to a field-reading caller is free too, and not yet counted so).
+`$VL_INLINE_REBOX=1` lifts the rule so a grid can grade the re-box path.
+
+**Why the host and not the emitter.** The design's table: one module rewrite against ~500
+emitter field sites, and a failure mode of "the input is kept" against check-clean invalid
+wasm. Validation does not catch a shifted index that still type-checks, so every fixture
+grades by output, and the step was swept over the 4,514 `tests/cases` programs (104 changed
+by default, 119 with the cost rule lifted, at the store and at the spill path: all agree).
+
+**Measured.** sunpa's feet check (8,394 posed characters), output identical: `Q` boxes
+78,441 → 53,275 (9.3 → 6.3 per character). `V3` stays at 106,805 under the default rule,
+because the export `animationReady` returns a record with a `V3` field to JS; with
+`$VL_INLINE_BOUNDARY=direct` it falls to 89,937 (12.7 → 10.7).
+
+**The boundary is the signature (owner ruling 2026-10-05, §6 Q2; D3718).** A record's layout
+is not part of a module's boundary. Only a type a boundary signature names keeps its layout
+and identity, because a JS host can hold that object but cannot read a struct's fields; a
+record nested in one (a field, a list element, a union box's payload) may be inlined. A
+value handed to an `any`/`eq`/`struct` place is still refused while such a reference crosses
+a signature, since JS may then hold that very object. The conservative rule stays available
+as `vl build --stable-layout`, for a unit linked wasm to wasm or read field by field (the
+owner's (C), "unless C is easy": it was, the step already had the mode). The env knob is
+retired, since a flag is the supported spelling and two would drift. sunpa's feet check on
+`ce4e1c3`: `V3` 106,981 → 90,113, feet and gait output identical, and the
+`--stable-layout` module equals master's byte for byte apart from its map's file name.
+
+**Lists too: slice S2 (2026-10-05; D3681).** A `V[]` of such a record, its fields one number
+type, is flattened to one array of those numbers at `n` times the length
+(`scripts/vl-host/src/flat.rs`, run on S1's output; inline-records-design.md §7). Map value
+lists share the backing type and go with it. A list made by `filled(n, v)` (`array.new`) stays
+boxed: its slots share one box, so flat it would be `n` copies of the fields, `n` times the
+memory, past V8's array-length cap at `filled(40000000, q)` (review of the S2 PR). Three
+choices worth keeping:
+* **Every index is clamped, not trusted.** `i * n` wraps for an `i` the original would have
+  trapped on, and a wrapped index can land in bounds, reading a wrong element where the boxed
+  list trapped. So `x` becomes `select(x * n, -n, x <u ⌊(2^32 - n)/n⌋ + 1)`. VL's own indices
+  are already bounded by the list's length, but the step cannot see that from wasm, and the
+  select costs 13–16% of a flat read (D3720).
+* **The cost rule is S1's plus a read budget.** No read may add an allocation, and reads may
+  come to at most six whole elements per store site: on V8 a store saves what 6.5 flat element
+  reads cost over boxed ones (wasmtime 70). Iterate-only over a flat list is 1.6x slower on V8,
+  so a list filled once and read every frame regresses, and the static count cannot tell
+  (D3720). One whole read anywhere keeps every list of that record boxed (D3719).
+* **A nullable local is proved non-null by dataflow, for S1 too.** VL declares many record
+  locals `(ref null V)` because they are set in a nested block, and validating a tightened
+  local fails there. A forward pass over each body (a loop starts without the locals any set
+  inside it may null) shows which reads hold no null; a store casts such a read with
+  `ref.as_non_null`, which never traps. A `(V | null)[]` still stores real nulls and stays boxed.
+
+sunpa `ce4e1c3`'s feet check: `Q` boxes 601,198 → 37,120, feet and gait output byte-identical.
+Graded by output at `-O`/`-O3`, default, re-box-forced and spill-forced, over the `flat-*`
+fixtures and every `tests/cases` program the step touches.
 
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
@@ -7210,6 +7790,84 @@ elsewhere it is small (the compiler +0.94%, `decode-bench` +21 bytes, the 86 `be
 * *`--flexible-inline-max-function-size` at `-O`.* Binaryen consults it only at `-O3` or above.
 * *A much larger size.* L4 measured `-aimfs 400` doubling `decode-bench` and costing V8 3–6%;
   12 already buys almost nothing over 8 here.
+
+PL-053 later raised the size to 16, for a helper whose fast path branches to a slow call (the
+next section).
+
+## `-O` inlines a fast path that calls out to a slow one (2026-09-28) — plumb PL-053
+
+**The defect.** plumb does every float operation through a helper that reproduces x86's NaN:
+`function fmul32(a: f32, b: f32): f32 { const r = a * b; if r != r { nan32(a, b) } else { r } }`,
+where `nan32` picks the first NaN operand, quieted, else `0xffc00000`. Binaryen sizes that helper
+at 11, or 12 in the `if r != r { return nan32(a, b) }; r` form plumb's `rt.vl` uses, just over
+PL-027's size of 8, so at `-O` every float operation in a translated unit was a call: 5,692 of
+them in `chunk_464`. V8 does not inline them in a function that large either; in plumb's Chrome
+profile `fmul32` alone was 1.18% of the game worker's ticks and `fsub32` 0.51%. plumb measured
+binaryen's `--always-inline-max-function-size=16 --inlining-optimizing` run after `vl build -O`
+on every unit: +2% size (164.4 → 167.6 MB) and Mac Chrome 272 → 309 fps.
+
+**The rule.** The `-O` rung's size goes from 8 to 16 (`OPT_PASSES` in
+`scripts/vl-host/src/main.rs`). `nan32`, at about 20, stays a call: the fast path is inlined and
+the slow path is not. L8's run-once marks still win, and `-O3` is unchanged.
+
+**What was rejected.**
+* *Partial inlining* (`--partial-inlining-ifs`, `-pii 1` and `3`). Binaryen splits only a
+  function whose body STARTS with the `if`; this one starts by computing `r`, so it inlines
+  nothing here (0 of 601 calls in the stand-in), at every setting measured.
+* *12.* The smallest size that inlines both forms of the helper. It builds the float-heavy units
+  as 16 does, and the compiler 1.0% smaller. 16 is what plumb measured end to end, and leaves
+  room for a helper one or two nodes larger (an extra operand, a mask on the result).
+* *A host step that inlines only "fast path plus a call" functions.* The host can already force
+  exactly chosen callees inline (lane L4's renaming step), but that costs a second `wasm-opt`
+  run over each 2 MB unit, while the plain size costs the compiler 2.3% and plumb's units
+  without float helpers under 1.3%.
+* *An `inline` hint on a function.* A language change; left to the owner (PL-053's report).
+* *The same size at `-O3`.* `-O3` inlines a "lightweight" function up to 20, but a function
+  that makes a call is not lightweight, so `-O3` also keeps `fmul32` a call (5,692 in
+  `chunk_464`). plumb builds at `-O`; changing the release rung is a separate measurement.
+
+**Measured.** binaryen 133 (130 inlines the same sizes). Sizes in bytes of a `--names -O
+--import-memory` build, as plumb builds its units; optimiser CPU is `wasm-opt` alone at load
+3–24, so read it as noise within ±10%.
+
+| `-O` with size | 8 (was) | 12 | **16** |
+| --- | --- | --- | --- |
+| plumb `chunk_464` (most `fmul32` uses) | 275,874 | 412,722 | **412,722** |
+| its calls to `f{add,sub,mul,div}{32,64}` | 5,692 | 0 | **0** |
+| plumb `chunk_448` | 264,303 | 348,715 | **348,672** |
+| plumb, every 64th unit (10), bytes | 2,594,630 | 2,680,920 (+3.33%) | **2,688,466 (+3.62%)** |
+| the same 10, optimiser CPU / largest RSS | 20.1 s / 68 MB | 20.8 s / 69 MB | **20.6 s / 73 MB** |
+| the compiler, `-O` bytes | 2,690,477 | 2,723,319 (+1.22%) | **2,751,172 (+2.26%)** |
+| 90 `bench/` programs, bytes (changed) | 103,443 | — | **105,537 (3)** |
+| `plumb-shape-cost.py`'s two units | — | — | **byte-identical to 8** |
+
+Eight of the ten sampled units change by under 1.3%; the growth is in the float-heavy units
+(`chunk_448` +32%, `chunk_464` +50%), and it is the inlining itself. plumb's whole game grew 2%.
+
+Runtime, CPU seconds, median of 7 alternating rounds at load 2–4. V8 is node 24 instantiating
+the module; wasmtime is `vl run` on the prebuilt module. The stand-ins are verbatim copies of
+plumb's helpers called from a kernel: `big` is one function of 600 helper calls run 10^6 times,
+`small` one of 9 calls run 10^8 times.
+
+| program | engine | size 8 (was) | **16** | `-O3` |
+| --- | --- | --- | --- | --- |
+| `big` | V8 | 0.769 | **0.686** (−11%) | 0.807 |
+| `big` | wasmtime | 0.670 | **0.690** (+3%) | 0.720 |
+| `small` | V8 | 0.555 | **0.550** | 0.559 |
+| `small` | wasmtime | 0.910 | **0.560** (−38%) | 0.920 |
+| `bench/` `binarytrees`, `struct-alloc`, `fib` (the 3 that change) | both | — | flat within noise | — |
+| the compiler building `chunk_543` | wasmtime | 1.54 | **1.51**, identical output | — |
+
+V8's own inliner covers the small kernel and runs out in the large one, as PL-027 found; plumb's
+frame rate is the large case. Neither the seed nor its size gate moves: the seed is built without
+`-O`.
+
+**Correctness.** Inlining must not move a NaN's bits. `tests/fixtures/opt-leaf/nan-exact.vl`
+runs every helper over signalling and quiet NaNs with payloads on either side, `Inf - Inf`,
+`0 * Inf` and ordinary operands, in both operand orders; its 72 expected lines were checked
+against an independent numpy model of the x86 rule, and `-O` must print them exactly, with every
+helper inlined and `nan32`/`nan64` still called. The -O output under binaryen 133 and under V8
+prints the same.
 
 ## `-O` skips `ssa-nomerge` for a function over 8,192 sets (2026-09-24) — plumb's tail units, D2336
 
@@ -7829,9 +8487,9 @@ another reacher (`const r = () => k` escapes `k`). An interpolation hole over a 
 (`"\{v}"`) renders through std:fmt without reaching user code, so it ends nothing. The rule is
 name-based and flow-insensitive: a same-named
 binding elsewhere in the root, or an escape later in the function, ends narrowings it strictly
-need not. That costs a re-test, never a wrong value. What the rule cannot see — a writer that is
-a separate top-level function, or a global written from another top-level function — is D2401,
-still open; the rule is sound within the function that declares the variable.
+need not. That costs a re-test, never a wrong value. A module binding narrowed inside a function
+is asked the same question a second time with the whole module as the root, so a top-level
+function or a module-level closure that writes it is a writer like any other (D2401).
 
 **WHERE IT ENDS, precisely.** The retirement is in place, as a falsifying write's is, so it
 outlives the block the call sits in, and the arm join at the enclosing `if` sees it.
@@ -7863,11 +8521,1855 @@ That needs the value `k` writes related to the value `v` holds when `k` runs —
 effect with a guard, the same machinery A6b Stage B's stored witnesses need. Not built; the
 conservative rule is the sound floor it would refine.
 
-**THE OTHER FORMS, surveyed and filed rather than fixed.** A field, element or map-value
-narrowing already ends at a call that may write it (the path rule), including through a method
-or a closure; the gaps are a declared operator that writes its operand's field (D2400), a module
-global written by another top-level function (D2401), a closure made under the narrowing and
-called after a writer (D2402), a path read before a writing call inside a loop (D2403), a path
-fact in a condition with a later writing call (D2404), and a path re-test that the path rule
-refuses (D2405, clause 2). Whether a declared operator may have side effects beyond its operands
-at all was floated by the owner, not decided (ROADMAP, "Narrowing invalidation across calls").
+**THE OTHER FORMS (D2400–D2405, closed).** Every one answers through `callMayWrite`.
+
+* *A path a call ends reads its declared type after the call's statement* (D2405). The call banks
+  the path for the emitter to retire after that statement, as it banks a bare name, so the
+  re-test the diagnostic asks for narrows again; a read later in the same statement is still
+  refused. A narrowing of an enclosing function stays a refusal, since the emitter retires only
+  the function it is lowering; so does one ended inside a body with an un-annotated parameter,
+  or by a method on a receiver not yet typed, since the re-check at each call's argument types
+  decides, and a declared-type read settled earlier would reach it against types it never saw.
+  A map's `set` ends a narrowing of the key it writes, like `m[k] = v`; `push` ends none.
+* *A call to a `const`-bound lambda is a call to its body* for the path rule, since the write
+  shapes below see a write through an alias of a captured object (D2461; #3150 kept such a
+  lambda opaque unless it wrote no place). Handing the narrowed value itself to a callee ends
+  nothing, since the callee holds the value, not the place.
+* *A declared operator is a call* for the path rule too (D2400): its operands are its arguments,
+  the declaration is the one the checker resolved (every declaration of the operator where
+  none is resolved yet), and an operator closure field is opaque, as a call through a closure
+  field already is. Operator sites compose into a callee's write summaries.
+* *A path fact in a condition* is dropped when a later call in the condition may write it
+  (D2404), exactly as a bare name's is.
+* *In a loop*, a call that may write a path narrowed outside the loop is refused when the loop
+  read the path before it, an inner loop's reads included (D2403). This differs from the bare-name rule, which retires before
+  the loop: which call may write a path depends on checked types the loop body does not yet
+  have. A re-test inside the loop runs.
+* *A write through another name for the object* ends a path narrowing like a call (D2584,
+  D2585; the owner's extension of (a) to places, 2026-09-26). `q.f = null` after `const q = p`
+  ends `p.f`, as do `ys[0] = …` over an alias of `xs` and `n["k"] = …` over an alias of `m`. The
+  write's shape (`.f`, `[0]`, `["k"]`, `[]`) is matched against every step of every live key,
+  the rule a call's write summary uses, so a nested alias (`const s = p.g`, `s.f = …`) and a
+  second parameter holding the same object count. It stays sound and cheap by three facts,
+  never by flow: a field step matches only when the two receivers' types may be one object; a
+  store the narrowed type admits into the key's last step keeps the narrowing; and a `const`
+  bound to a new object whose name its root uses only as a field or cell receiver is the only
+  holder of that object. That last fact is about the BINDING in scope at the write, not the
+  name — a module `let` of the same name, or a same-named `const` in another block, is another
+  binding — and it makes the sole holder apart from everything: a write through it reaches no
+  other key, and a write through anything else never reaches its first step. Two distinct
+  objects of one type held any other way (two parameters, two call results) are the price:
+  the read after the write re-tests. It settles like a call's retirement — after the
+  statement, refused in a loop that read the path first or a closure made before — and a write
+  inside a nested function ends an enclosing narrowing only for the rest of that body, since the
+  calls that run it are what the call rule already charges.
+* *A write inside a condition* ends what the condition established before it (D2589). `&&`
+  checks its right operand under the left operand's facts, and a write there (an assignment
+  in an if-expression arm, a `match` arm, a loop in that arm) retires them as any write does;
+  the arm the whole condition guards, and the code after an `||` guard's early return, then
+  read the place at its declared type, and a re-test after the write narrows again, in both
+  halves. Evaluation order decides, unlike the call rule above: a write before the test
+  (`(… p.f = mk() …) && p.f != null`) keeps the test's fact. A write the fact admits keeps a
+  field's or cell's fact (`p.f = { r: 9 }`), but not a bare name's: a name written inside an
+  if-expression arm reads at its declaration after the arm, as it does after any block that
+  wrote it (D1736), so `x != null && (if c { x = { r: 9 }; true } else { false })` must
+  re-test `x`.
+* *Testing an assignment narrows its target* (D2602). `(x = e) != null`, `(x = e) == null` in
+  its else and after an early return, and `(x = e) is T` narrow the bare name `x`, which holds
+  the tested value, exactly as the same test of `x` written after the assignment would. A
+  field or cell target (`(p.f = e) != null`) does not narrow yet; the test is on the value.
+* *A nested function made under a narrowing* (D2402) of a binding some function may write keeps
+  the narrowing only when it is called by its handle in the body that makes it and neither
+  writes nor tests the binding itself; each such call is refused unless the binding still holds
+  the captured type there. A lambda handed straight to an array's `map`/`filter` keeps it too,
+  and so does one handed to a declared function whose body only ever calls that parameter, when
+  the call reaches no writer (`callMayWrite` on the call itself). Otherwise the body reads the
+  declared type. A clone a generic's instance makes of the lambda answers what it did. A path a nested function read under the
+  narrowing makes a later writing call in the same function refused; a closure that escapes
+  reads the path at its declared type (D2407, below). A declared function that hands the
+  callback on to another that only calls it counts as only calling it.
+
+**AN ESCAPING CLOSURE LOSES WHAT IT CAPTURED (owner ruling (a), 2026-09-25 — D2407, D2462).** A
+closure that escapes the function making it — returned, stored in a field, list, map or global,
+assigned to another binding, or handed to a callee not known to only call it — reads every
+captured field, element and map-value path at its declared type, and every captured bare name
+that is assigned anywhere (a `const`, or a `let` never assigned, cannot change and keeps its
+narrowing). A closure used only by its handle in the body that makes it, or run as a callback
+inside the call it is handed to, keeps the narrowing under D2402's per-call check. The reason is
+the one D2402 gives for a bare name, made unconditional: a path can be written by any holder of
+the object, after the function that made the closure has returned, so no analysis of that
+function bounds it. A re-test inside the closure narrows again. **The owner's ideal is smarter**
+("if we know `o.v = null` doesn't happen then it's fine"): keep the narrowing when no write of
+the path can run before the closure does. That is flow analysis over every holder of the object,
+the same machinery as A6c's, and is deferred with it; the loss is the sound floor it would
+refine.
+
+**A WRITE UNDER A NARROWING IS CHECKED AGAINST THE DECLARATION AND RE-NARROWS (owner ruling,
+2026-09-26 — D2604, D2609, D2610, D2612).** Inside a narrowed block, any write the binding's
+DECLARED type admits is allowed, and the write re-narrows the place to the written value's type
+for the rest of the flow. This follows TypeScript and Kotlin. `if x is string { x = 5; x + 1 }`
+over `x: i32 | string` runs and `x.length` after the write is refused; `if y == null { return }`
+then `y = null` over `y: A | null` is accepted and `y == null` reads `true`. It holds for every
+narrowing form (`is`, `!= null`, `== null` with an early return, an `||` guard, a `while` guard's
+`break`), for a module binding, and for a field, list cell or map cell, and in both faces.
+
+* *Where the value lands.* A value lands on the member of the declaration it IS before one it
+  merely widens to: `5` into `i32 | f64` narrowed to `f64` re-narrows to `i32` and is stored as
+  the `i32` member, because that is the representation the emitter writes. A union-typed value
+  lands on one member only when each of its members does; otherwise the place reads its
+  declaration, unless the narrowing it had already admits every member, which it then keeps.
+  A `null` write reads the declaration after it.
+* *After an `if`.* The place holds what either path left, and a numeric member is never absorbed
+  by one it widens to: a one-branch `x = 1.5` under `x is i32` leaves `i32 | f64`, not `f64`
+  (D2627). A value of such a union is refused where only its widest member is expected (`f64`),
+  because no delivery converts the box yet (D2611, open); `is` re-tests it.
+* *A null test after a write.* After a write under a guard the storage may hold `null` again,
+  so the test is a real question for the rest of that scope, as after an assignment's
+  narrowing. Where the value is proved non-null the test is dead, which the next section rules
+  a warning.
+* *In a loop.* A write in a loop that may leave a narrowing made outside the loop ends that
+  narrowing before the loop starts, in both halves, as a call that may write it does (the
+  "before a loop" rule above), since the reads above the write run again after it. The loop
+  decides this from the value's type as the loop begins: a literal, a name, an object literal
+  naming one member's fields, or a call of a function with a declared return type. A value whose
+  type needs the loop (a local declared inside it, an expression) must still land within the
+  narrowing the loop began with, or the write is refused with the barrier's sentence.
+* *Under a closure.* A closure made under the narrowing and called by its handle keeps it, and a
+  call of it after a write that left the narrowing is refused (the D2402 per-call check, which
+  now also answers a direct write, where before the write itself was refused whenever any
+  function body had been checked since the narrowing began). A closure that escapes reads a
+  binding assigned anywhere at its declared type (D2407).
+
+**THE PRICE.** A re-narrowed place meets the existing refusal of an `is` test that can never
+match: `if x is i32 { x = "s"; print(x is i32) }` over `i32 | string | null` printed `false` on
+master and is refused now, since `x` is a `string` there. 58 of the 4,600 cells of the
+narrowed-write grid (`scripts/capability-probes/narrowed-write-grid.py`) are that shape, all at
+the test of the member the write left. #3184's review grid (2,373 cells) moves 22 cells from
+running to refused, all one shape: a one-branch write of a widening member whose condition was
+false on the run, read where the other member is expected, e.g. `if x is f64 { if c0() { x = 5 };
+useF64(x) }`. The same program with the condition true trapped on master; it is refused now as
+D2611's union-to-`f64` delivery. No other cell that ran on master changed.
+
+**A NULL TEST OF A VALUE PROVED NON-NULL IS A WARNING (owner ruling, 2026-09-26, option (a) of
+open-rulings §dead-null-test).** `x == null` or `x != null` over a value whose type admits no
+`null` (by its declaration, a narrowing or a write) compiles, with the warning "`x == null` is
+always false here (x is A | B)" (lint code `dead-null-test`, the channel `recordDeadCoalesce`
+already uses for a dead `??` default), and the emitter lowers it to its constant: the operand
+runs for its effects unless it is a bare name, and is never read as nullable. This follows
+TypeScript's split. An impossible `match` arm, `is` member or literal comparison stays an
+ERROR (D2198 stands): those name a member the type does not have, where a null test only
+asks a question whose answer is already known. "No member admits `null`" is decided by
+`assignable(null, T)` as well as the member walk, so a recursive alias that hides a `null`
+arm (`Json`) keeps its real test. The ruling lets the assignment narrowing take its path twin
+(D1848): `o.v = 5` over `o.v: i32 | null` strips `null` for the code after it, and the three
+fixtures that null-test a binding read out of such a field run with the warning.
+
+**AN ASSIGNMENT'S NARROWING REACHES A BODY ONLY WHERE NO `null` CAN FOLLOW (D2529).** A guard's
+narrowing reaches a closure called by its handle through D2402's per-call check. An assignment's
+narrowing (`x = 1` over `i32 | null`, which removes only `null`) and a post-guard one reach a
+function body only where no write can falsify them first, so a function body reads the binding
+at its declared type when a write that may store `null` can run before the body does:
+
+* a module `let` read by a top-level function or a module-level closure, when any assignment in
+  the program may store `null`; and, for a top-level function, which may be called before its
+  own declaration, also unless the program's first top-level write of the binding stores a
+  non-null value with no call, operator or index dispatch that may reach user code ahead of it;
+* a local captured by reference, when a write that may store `null` follows the capture, shares
+  a loop with it that the declaration is not inside, or sits in another closure. For a local of
+  a scalar nullable (`i32 | null`, `f64 | null`) any such write counts, `null` or not, because
+  the shared cell holds the value box and a closure's read of it is not yet narrowed (D2555).
+
+"May store `null`" is syntactic: a literal other than `null` (a number, string, character,
+boolean, object, array or function) cannot, nor can a `??` whose default is one, and anything
+else may. So a later `g = "abc"` into a
+`string` narrowing keeps it, while `g = mk()` ends it whatever `mk` returns. A callback run inside
+the call it is handed to (D2402) keeps the narrowing, and a re-test inside the body narrows again.
+
+**THE PRICE.** `let g: string | null = null; g = "ab"; function f() { g.length }; g = mk()` ran
+on master (the ref ops tolerate a null ref, and trap on one) and is now refused at `g.length`, and
+so is the same shape with a call before `g = "ab"`. On master the scalar-box spellings of every
+such program were check-clean invalid wasm, and the ref ones trapped as soon as the write stored
+`null` (`r2`, `r5` in #3169's review). The refinement that would recover them relates a write's
+checked type to the narrowing, which needs the write checked before the body; the conservative
+floor is what the checker's single pass can answer.
+
+**THE WRITE SHAPES (D2461, D2471, D2472, D2473).** A path's writers are found by what a write
+REPLACES, not the name it is spelled through. `fnWriteShapes` summarises a function as the fields
+it may store (`.f`), the cells it may store (`[k]` under a literal key, `[]` any) and the map cells
+it may remove (`-[k]`, `-[]`), each cell shape tagged with its container's kind and element type,
+plus the free names it may rebind (`=g`). It folds in every callee and operator declaration. A
+call of the function's own parameter `i` is `@i`, and each call site charges what its argument
+there writes, so a read-only callback keeps a narrowing and a writing one ends it wherever the
+call to it sits; inside a recursion cycle, every function value an edge hands on is charged, since
+the cycle may call it in any slot; any other unknown callee is opaque. A call ends a narrowing of a path when a
+shape hits a step of it. So a write through a second parameter, a `const` copy, a list holding the
+object, a module binding, an argument or a receiver is seen without being named: any object of
+that shape reachable to the callee is assumed to be the narrowed one. The refinements that keep
+it from refusing what cannot change: a cell shape hits only a container of the same kind whose
+element type one of them is assignable to; a write one step below a `const` the function built
+itself is left out; a store into the path's own last step is harmless when that place stores
+exactly the narrowed type. A field shape is scoped only by name, and that is not a shortcut:
+width subtyping lets a `{ x, y }` record be passed where a `{ x }` is expected, so a callee's
+`q.x = null` may be the caller's `p.x`. Built-in methods read one effect column
+(`builtinMethodEffect`), applied only when the receiver's type has that built-in: an append
+(`push`, `add`) replaces no held cell; a list's `pop` and `clear` and a map's `set` and `delete`
+may. A method a record declares, and a std function reached by the method spelling, is
+summarised from its body.
+
+Whether a declared operator may have side effects beyond its operands at all was floated by the
+owner, not decided (ROADMAP, "Narrowing invalidation across calls").
+
+## `{[K]: V}` and `T[]` are concrete types; `Set<T>` is a distinct type (owner rulings Q1 and Q2, 2026-09-25)
+
+Recorded from `docs/internals/collections-representation-design.md` (branch
+`design-collections-representation`, revision 2), §5 and §11 Q1/Q2.
+
+**Q1 — ruled (a): the shorthands name CONCRETE types, which reverses C2.** `{[K]: V}` is the
+built-in map with its full method surface (`get`, `set`, `has`, `delete`, `keys`, `values`,
+`length`), exactly as `T[]` is the built-in list with `push`, `pop` and `slice`. `Map<K, V>` is
+only a longer spelling of `{[K]: V}`. `T[]` is NOT a subtype of `{[i32]: T}`, in either
+direction. This reverses `collections-design.md` §C2, which read the index signature as a
+structural interface with `Map`/`List`/`Set` as its subtypes. Why:
+
+* **The index contracts differ.** `xs[i]` out of bounds traps and has type `T`; `m[k]` on a
+  miss yields `V | null`. `xs[i] = v` out of bounds traps; `m[k] = v` inserts. A subtype that
+  changes what indexing returns and what a write does is not a subtype. The iteration rule
+  (element first for a list, key first for a map, C2.4) is a second, independent reason.
+* **The checker already treats them as disjoint** (design doc §2.4, run): a list is refused
+  where `{[i32]: i32}` is written, and hole inference refuses to guess between them. C2's
+  interface reading was never implemented.
+* **The bug C2 was chosen to fix came from `Set` being spelled `{[T]: boolean}`,** not from
+  maps carrying map methods (design doc §5(i)). `Set<T>` as its own type removes it.
+* **The alternative re-decides every hand-written site.** Keeping C2 means interface
+  subtyping and a choice at each of ~2,800 `{[K]: V}` / `Map()` sites (design doc §6).
+
+"Any mapping" is written as a bound (`<M: { get(K): V | null }>`), not as `{[K]: V}`; making
+built-in methods satisfy such a bound is the design doc's step 4 (§11 Q5, not yet ruled).
+
+**Q2 — ruled (a): `Set<T>` is a distinct type.** Its surface is `add`, `has`, `delete`,
+`keys()` and `values()` (both `T[]`, the elements), `length`, and `for x in s` over the
+elements (`for x, i in s` pairs each element with its position, as a list does). It has no
+index (`s[x]` is refused with a sentence naming `has`/`add`), no `get`/`set`, and no relation
+to `T[]` or `{[K]: V}`: neither is assignable to it and it is assignable to neither. It is
+invariant in its element. `Set()` and `Set<T>()` construct it, and it prints as `Set<T>` in
+hover and diagnostics. One union is refused for now: a `Set<K>` beside a map whose value is one
+i32 cell (`{[K]: boolean}`, `{[K]: i32}`, a literal union), because the two lower to the same map
+struct and a union box could not tell them apart (D2673, which lifts the refusal; the map-with-map
+pair D2493 closed with a box tag per member type). On master that
+union collapsed to one type, so `f(x: Set<string> | {[string]: boolean} | null)` called as
+`f(null)` ran and is now a check refusal: a loud runs→not-runs. `{[K]: boolean}` stays legal and means a plain map of booleans, built
+by `Map()`, with one change: **`.add` is a Set method only** (owner ruling, 2026-09-25, after
+#3158's review counted zero call sites in the repo and every consumer). On a boolean-valued map
+it is refused with "`.add` is a `Set` method — use `m[k] = true`, or make it a `Set<K>`"; B6a had
+admitted it there because the set flavor used to live in the binding, which Q2 retires. There is
+no forced migration: `Set()` had zero uses in plumb, glean, veldt, sunsuz
+and webcraft on 2026-09-25, and the in-repo uses (29 fixtures, one bench, 108 curated corpus
+cells and four grid generators) were rewritten from `{[K]: boolean} = Set()` to `Set<K>`.
+
+**The representation did not change.** A set is still the map struct with membership in
+`vals`. What changed is where the set flavor lives: in the TYPE (the arena's `mSet` bit), which
+every spelling of `Set<T>` now sets, instead of in the binding that called `Set()`. The emitter
+reads it from the expression's type (`setShapeOfTy`), so a set passed through a parameter,
+field or return walks its elements (D2469, which printed `true`s), and the bound `.values()` of
+a bare `Set()` builds (D2470).
+
+## A self-function the resolution order can never reach is an error (owner ruling, 2026-09-25) — D2475
+
+**Ruled (collections Q6, generalised by the owner): a `self`-function whose name `recv.name(…)`
+would never reach is refused at its declaration.** `recv.name(args)` resolves in one order — a
+built-in method of the receiver's kind (list, map/set, string), then a field of the receiver
+type (a closure-typed field is called), then a `self`-function in scope — so a function named
+after a member every admitted receiver already has is dead code. Before the ruling
+`function get(self: {[i32]: i32}, k: i32)` was accepted and `m.get(1)` silently called the
+built-in; on a list, a set or a string the emitter even called the function the checker had not
+typed (D2476). The refusal names the member and the rung, and never says "built-in":
+
+> `get` is already a method of `{[i32]: i32}`, so `m.get(…)` would never call this function — rename it
+>
+> `x` is already a field of `P`, so `p.x(…)` would never call this function — rename it
+
+(code `self-fn-shadowed`, data `member` / `recv` / `rung`).
+
+**IT IS DECIDED BY THE DECLARED `self` TYPE, AND ONLY WHEN EVERY RECEIVER IT ADMITS IS SHADOWED.**
+A free function named `get` over an unrelated type stays fine; so does one whose `self` a
+receiver without the member can reach:
+
+* **a type-parameter `self` is never refused.** `function slice<T>(self: T, …)` is reached by
+  `(3).slice(…)` and shadowed by `"s".slice(…)`; the call site decides, per receiver, and the
+  emitter follows the checker's answer there (D2476). Refusing only when EVERY instantiation
+  would shadow is the conservative reading the lane was given, and for a bare `T` no such
+  bound is checked — a bound that itself names a field (`T: {x: i32}` with `x(self: T)`) is
+  therefore accepted although no instantiation reaches it. A `T[]` or `{[K]: V}` `self` is not
+  a type parameter: every instantiation is a list or a map, so `push<T>(self: T[], …)` is refused.
+* **a nullable or union `self` is not refused** (`x(self: P | null)`): the null receiver, or a
+  union receiver with no common field, reaches the function.
+* **a map and a `Set<T>` answer from their own tables**, since #3158 made them distinct types
+  (neither is assignable to the other): `has`/`delete`/`keys`/`values` are members of both,
+  `get`/`set` of a map only and `add` of a set only. So `get(self: Set<T>, …)` and
+  `add(self: {[K]: boolean}, …)` are legal and reached; on the map the function answers before
+  the "`.add` is a `Set` method" hint, which is for a map with no such function in scope.
+* **`length` is a member read**, not a method, so `xs.length()` reaches a function named
+  `length`; `size` is no member of any collection since Q9 (below), so `m.size()` reaches one
+  named `size`.
+
+Why an error rather than a lint: the function is not merely unused, it is unreachable by the
+spelling its `self` parameter exists for, and the author's intent — to override or extend the
+member — is exactly what the language will not do. A warning would leave the silent half in
+place for anyone who does not read warnings; the rename costs one word.
+
+## Every collection counts with `.length` (owner ruling Q9, 2026-09-25)
+
+**Ruled (a): `m.size` is removed, and the other languages' spellings of a count or a collection
+type are refused with the VL spelling named.** Recorded from
+`docs/internals/collections-representation-design.md` (branch `design-collections-representation`)
+§11 Q9; `collections-design.md` §C2.3 had already ruled `.size` dropped, and the checker still
+answered it on a map or a `Set`.
+
+| written | refused with |
+| --- | --- |
+| `.size` or `.count` on a list, map, `Set` or string | `no field 'size' on map {[string]: i32}; did you mean '.length'?` |
+| `len(x)`, when nothing in scope is named `len` and `x` has a length | `undeclared identifier 'len' — a length is a member in VL; did you mean 'x.length'?` (a `len` of anything else is a plain `undeclared identifier 'len'`) |
+| `Array<T>` | `unknown type 'Array<i32>'; did you mean 'i32[]'?` |
+| `Record<K, V>` | `unknown type 'Record<string,i32>'; did you mean '{[string]: i32}' or 'Map<string, i32>'?` |
+
+Why: two names for one property is a permanent second spelling that every reader has to learn
+is the same thing, and a refusal that names the answer teaches it in one step — the house style
+`.contains` → `.includes` already set. Each redirect is a SUFFIX on the sentence the checker
+already raised, so a consumer matching `no field '…' on` or `unknown type '…'` keeps matching.
+
+**The names stay free for a program's own use.** Only the collection built-in is removed: a
+record field named `size` reads as before, a `self`-function `size(self: {[K]: V})` is reached by
+`m.size()`, and `len`, `Array` and `Record` resolve to a program's own declarations — each
+redirect fires only after resolution has already failed. `N.size`, a `flat` record's byte size,
+is a layout constant on a TYPE name and is untouched.
+
+**Priced — BREAKING for `m.size`.** In-repo: 148 sites in 55 fixtures under `tests/cases/`, 147
+derived and 2 curated corpus cells, 6 capability probes and 4 matrix templates, one compiler
+diagnostic that recommended `m.size`, 17 inventory-row witnesses, two design-doc snippets, and eleven generator scripts (`gen.py`,
+`gencensus.py`, `mkmatrix.py`, `genorder.py`, `d341/mkgrid.py`, `day-one/grammar.py`,
+`sabotage.py` and four one-shot repro scripts) now spell `.length`; the corpus moved no cell. None in `std/` or
+`compiler/`. Consumers: plumb has three (`tools/fuzz-gen.vl:233`, `tools/translate-all.vl:251`
+and `:267`) plus the filed repros PL-025 and PL-035; glean, sunsuz and webcraft have none.
+
+## `in` is a for-loop keyword, not an operator (owner ruling Q10, 2026-09-25)
+
+**Ruled (a): `a in b` in an expression is parsed only to be refused, with the membership test
+the receiver does have.**
+
+| receiver `b` | the sentence ends |
+| --- | --- |
+| a map (or a nullable one) | ``; to test for a key, use `m.has(k)` `` |
+| a `Set` | ``; to test set membership, use `s.has(x)` `` |
+| a list | ``; use `xs.includes(x)` for a value, or `i < xs.length` for an index`` |
+| a string | ``; to test for a substring, use `s.includes("a")` `` (with the program's own operands) |
+| anything else | the head alone: `` `in` is not an operator in VL outside a `for` loop's head `` |
+
+Before the ruling `"a" in m` was a parse error cascade — `expected ',' but found 'in'`,
+`undeclared identifier 'in'`, a second comma error and a `print` refusal for one mistake. Why
+not make it work (option b): `has` already answers for a map and a set, and a list has two
+readings (a value or an index) that `in` would have to pick between; refusing costs one parser
+rule, teaches the right method, and keeps the keyword free if a working `in` is ever wanted.
+
+**Mechanism.** `in` stays a soft keyword, an `IDENT` token. `parseBinary` gives it the
+relational tier (`IN_PREC`, the binding power of `<`) when it follows an operand on the same
+line, and builds an ordinary `BinExpr` with op `in`; the checker refuses that op first and
+answers `boolean`, so `if x in xs && y` is one diagnostic. A `for` head consumes its own `in`
+before any expression is parsed; `in` at the start of an operand is still an identifier
+(`let in = 4; print(in + 1)`); a line break before `in` still ends the statement, since only
+token kinds with a binary precedence continue a line.
+
+**One spelling that ran now refuses.** VL accepts two statements on one line with no separator,
+so on master `print(1) in = 5` — a second statement assigning a variable named `in` — ran. `in`
+after an operand on the same line is now the operator, so that line is a parse error
+(`expected an expression but found EQUAL`). It is loud, the fix is a line break or `;`, and no
+`.vl` file in `tests/`, `std/`, `compiler/` or `scripts/` (the distilled corpus included) has it:
+the tree was searched for `in` outside a `for` head, and every use is `in` as a variable at the
+start of a statement or operand, which parses as before.
+
+## An `i64` map key is a third key probe, hashed by a 64-bit multiply into the i32 key's pair index (collections Q8 (a), owner ruling 2026-09-25) — D2505
+
+**Ruled (a): `{[i64]: V}` is a built-in key type now**, ahead of any dense-map or struct-key
+work, as one more key probe inside the existing map helpers and with no new element-kind family.
+Key equality and hashing are a function of `K` alone; there is no user `==`. It closes plumb
+PL-018 and PL-029.
+
+**THE REP.** The key is a KIND (`MAP_KEY_STR`, `MAP_KEY_I32`, `MAP_KEY_I64`, from
+`typecheck.mapKeyKindOfTy`) where the emitter used to carry an i32-keyed boolean: the mono
+sentinels are `-4`/`-5` (i32 map/Set) and `-6`/`-7` (i64), an mv slot's key column holds the
+kind, and the struct differs from the i32-keyed one only in field 0, the i64 list. The index is
+the i32 key's (tag, entry) pair layout, with a TAG in the key's place.
+
+**THE HASH.** The tag is the top 32 bits of `key * 0x9E3779B97F4A7C15 mod 2^64`, the 64-bit
+Fibonacci constant, and the slot is then placed from the tag by the same 32-bit Fibonacci step
+an i32 key takes. Three properties decided it. (1) Every bit of the key reaches the tag, and two
+keys that differ only in their high 32 bits always get different tags, because the difference of
+their products' high halves is `d * lo32(C) mod 2^32` with `lo32(C)` odd. Folding the halves
+with `xor` was the alternative the brief suggested, and it sends every key whose halves are equal
+(`(n << 32) | n`) to tag 0. (2) Because the tag is 32 bits, the pair resize
+(`__map_resize_i32__`) and the compaction re-place an i64 map exactly as an i32 one, so only the
+probe is new: `__map_probe_i64__` compares the tag first and confirms against the keys backing
+only on a tag match. (3) A tag match is not a key match — multiplication by an odd constant is a
+bijection mod 2^64, so keys can be constructed to share a tag — which is why the probe keeps the
+key compare, and why `i64-keyed-basics.vl` carries six keys with one tag: a seed whose probe
+trusted the tag failed it.
+
+**THE PRICE, MEASURED** (`bench/collections/map-i32`'s loop with only the key type changed, 200K
+keys, 40M lookups, `-O`, min of 5 interleaved at load ~12): the same keys as i64 run 1.05x the
+i32 map's time; the keys spread across the full 64 bits (`k * 4294967311`) run 0.67x, since the
+i32 map places `7i + 3` by one Fibonacci step and the i64 map by two. A module with no i64-keyed
+map builds byte-identically.
+
+## A generic's member call is resolved per instance, in the same order — D2517
+
+`recv.name(…)` inside a generic body has a type-parameter receiver, so which member it names
+depends on the instance: `x.push(1)` in `f<T>(x: T)` is the list's own `push` at `f(xs)` and a
+`push(self: i32[] | string, …)` function at `f("s")`. **Each instance resolves the call in the
+language's one order — built-in method, then field, then `self`-function — on its own receiver
+type** (`memberRungOnTy`, the same answer D2475's declaration refusal reads). The body was
+typed once, against the function, so at an instance where a built-in or a field takes the call
+the checker's pin requires that it fit how the body used it: the arity, each argument's type,
+no named arguments, and for a built-in the value's type — `x.slice(0, 2) + 1` against a
+`slice(self: string | boolean, …): i32` is refused at `f("hello")`, since the string's `slice`
+returns `string`. A field's value is not held to the body's use: a field already took the call
+per instance before this ruling (D1063), and `print(x.tag())` reads either value.
+
+**A map or set method name leaves an un-annotated parameter open when a `self`-function of
+that name is in scope (D2518)**, instead of demanding a map the function's own receiver may not
+be. `map`/`filter` still demand a list: the pin cannot state a callback's parameter, and a site
+the emitter cannot re-dispatch per instance (below) keeps the demand, so its built-in runs.
+
+**Only a call on the generic's own parameter is re-dispatched.** A call through a local bound
+from it, or from inside a closure, is refused at an instance whose built-in or field would take
+it, naming both and the spelling that works (D2520, open); on master it ran the function.
+
+## A collection's stated cost is contract, and an automatic representation is never slower than the baseline (owner ruling Q3+Q4, 2026-09-25)
+
+Recorded from `docs/internals/collections-representation-design.md` (branch
+`design-collections-representation`) §11 Q3 and Q4. The ruling, verbatim:
+
+> A collection's stated complexity is contract, and so is this: no automatic representation is
+> ever slower than the collection's baseline representation. Representations are chosen (1) by
+> the type: always allowed; (2) by size only: allowed silently if it depends only on `.length`,
+> has hysteresis, and falls back exactly to the baseline; (3) by data pattern: only when a named
+> type already offers the same representation, the exit is one-way to the baseline,
+> `vl run --stats` reports each exit, and the cost page names the trigger. No representation may
+> change what a program prints. No build flag selects representations. The dense int-keyed table
+> is a named, consumer-chosen type.
+
+**The three tiers**, as a checklist for any change that gives one surface type a second
+representation:
+
+| tier | chosen by | allowed when |
+| --- | --- | --- |
+| 1 | the TYPE (`u8[]` packed bytes; a future `boolean[]` as `i8`, or a niche for `(i32 \| null)[]`) | always |
+| 2 | SIZE alone | silently, if the choice reads only `.length`, has hysteresis (no flip-flop at one boundary), and falls back to exactly the baseline representation |
+| 3 | the PATTERN of the data (density, ascending inserts) | only if a named type already offers the same representation, the exit to the baseline is one-way, `vl run --stats` reports each exit, and `docs/guide/costs.md` names the trigger |
+
+Every tier obeys the two rules above them: no representation may change what a program prints,
+and none is ever slower than the baseline representation. No build flag selects one, so a
+representation is a property of the program and not of how it was built.
+
+**What it settles.** Q3 was whether cost is contract (option (a), taken: a data-dependent mode
+ships only with an observable and a cost page). Q4 was whether the dense int-keyed map is a
+named type or a hidden holey-ascending mode inside `{[i32]: V}`. It is a named type the consumer
+chooses: `IdTable<V>` in `std:idtable`, over a `(V | null)[]`, iterating in key order and costing
+one slot per id up to the highest set. A hidden mode inside `{[i32]: V}` is not ruled out, but it
+is tier 3 and needs `IdTable` to exist first (it does) plus the `--stats` observable (it does
+not). The user-facing statement of the complexities is `docs/guide/costs.md`, and a change that
+alters a row there is a contract change.
+
+**Why a named type first** (the design doc's §7 step 2d). plumb's hand tables are already
+arrays, so a mode inside the map would speed up none of them; a slot table iterates in key
+order and keeps holes, which is a different contract and so a different type; and it adds no
+branch to every map operation. Measured on plumb's access pattern (ascending ids 7 apart in one
+shared id space, deletes 2,000 behind, 32 lookups per insert, `-O`): with a record value
+`IdTable` runs 6.6 ns per operation against the map's 10.6. With an `i32` value it is on par
+(11.3–13.7 against 13.4–19.2), because `(i32 | null)[]` boxes every element; the tier-1 niche
+above is what would close that.
+
+## A tree of integer literals takes a 64-bit destination's width, and a literal shift count must be below the operand's (2026-09-26) — D2709, D2710
+
+**The rule.** A bare literal already takes its destination's type: `const x: i64 = 5` stores 5
+at 64 bits. An operator tree over integer literals alone — `3 << 32`, `2147483647 + 1` — now
+takes an `i64` destination too, so it is computed at 64 bits rather than wrapped at 32 bits and
+then widened, and an operand beside an `i64` one takes that one's type, so `x + (1 << 40)` adds
+2^40. An `i32` variable is never widened, so a tree that mixes one keeps the 32-bit rule, and an
+`i32` destination is unchanged, wraparound included. A float destination is unchanged too: the
+reading there changes the value of programs that run today and awaits a ruling (D2711).
+
+**The shift count.** Wasm takes a shift count modulo the width, so `x << 32` over an `i32` is
+`x`. A literal count below 0 or at or above the operand's width is refused, as in Rust and Go;
+the refusal is graded after every literal tree has its width, so `const a: i64 = 1 << 40` is
+accepted and `const b = 1 << 40` is not. A computed count keeps the wasm modulo. The one
+program in the repo that relied on the wrap was a fixture that had recorded it by mistake.
+
+## `--low-memory-unused` folds an i64 address's constant, and takes a size (2026-09-28) — plumb PL-061
+
+**The ask.** plumb's translator addresses guest memory through i64 registers, so its natural
+spelling of `[rsp + 32]` is `__load_i64__((rsp + 32) as% i32)`. That lowered to
+`i32.wrap_i64(i64.add(rsp, 32))` and a load at offset 0: one add per access, which V8 cannot fold
+into the machine addressing mode. Binaryen's `optimize-added-constants`, which `vl build -O
+--low-memory-unused` already runs, folds only an `i32.add(x, C)` pointer, and has no rule for a
+wrap of an i64 add. So plumb spelled every access in the explicit offset form
+(`{ const mb = rsp; __load_i64__(mb as% i32, 32) }`), 28% of its 43.5M generated lines.
+
+**The two programs, precisely.** Write `a = wrap(p)` (the low 32 bits of `p`) and `o` for the
+access's own memarg offset. `wrap` is a ring homomorphism from i64 to i32, so the original
+address `wrap(p + C)` is exactly `(a + C) mod 2^32`, for any `C`: the i64 spelling and the i32
+spelling `a + C` are the same program, and the only question is the one the i32 fold already
+answers. Wasm adds the memarg offset to the address WITHOUT wrapping, so
+
+* original: effective address `((a + C) mod 2^32) + o`;
+* folded, `wrap(p)` with offset `C + o`: effective address `a + C + o`.
+
+They are equal whenever `a + C < 2^32`. Otherwise, for `0 <= C < 2^32`, the original's address
+is `a + C - 2^32 + o`, which is below `C + o` because `a < 2^32`; the folded form's is at least
+2^32, beyond any wasm32 memory (at most 65,536 pages, 4 GiB), so it traps. Peeling several
+constants (`p + 8 + 24`) is the same argument over their sum: every wrap it can take lands below
+the sum. **So the two differ exactly on an access whose effective address is below `C + o`,
+and a promise that no access reaches below `N` makes them the same program whenever `C + o < N`.**
+Not below `C` alone: with `o = 2000` and `C = 8`, the original's wrapped access lands in
+`[2000, 2008)`, outside a 1 KiB promise. Binaryen checks the same total (`offset=1000` over
+`+ 8` folds to 1008; `offset=2000` over `+ 8` stays an add).
+
+**What VL's flag promises.** Before this change, `--low-memory-unused` passed binaryen's flag of
+that name and promised exactly what binaryen assumes: the first 1 KiB is never accessed
+(binaryen 130 fixes the bound at 1024 and ignores `--pass-arg=low-memory-bound@N`, checked).
+Nothing VL itself emits touches linear memory below the heap window (no data section, no shadow
+stack), so the promise is about the program's own intrinsic accesses and `std:buffer`'s window.
+
+**The rule.**
+* Under `--low-memory-unused` the EMITTER folds an address's added constants into the memarg
+  when their sum plus the access's offset is below the promised size: an i32 `q + C`, and an
+  i64 `(p + C) as% i32` as `wrap(p)` with offset `C` (`memLowFoldK` in `compiler/wasmEmit.vl`,
+  set by the host through the seed's `setLowMemoryUnused`). Without the flag nothing changes,
+  and the add wraps as before (`tests/cases/intrinsics/memarg-i64-address-wraps.vl`).
+* `--low-memory-unused=<bytes>` promises a larger region; the bare flag is `=1024`, today's
+  promise. plumb never maps its low 64 KiB and measured its accesses' constants: 95.13% below
+  1024, 2.73% in 1024–4095, 1.79% in 4096–65535, 0.35% at 65536 or more, so `=65536` covers
+  99.65% of them. Only VL can use a larger size, since binaryen cannot be told one; binaryen's
+  own pass still runs for any promise of at least 1 KiB, and folds what inlining exposes.
+* A heap window that starts inside the promise contradicts it: `--heap-base` below the size exits
+  2, and so does a module that allocates from the default window (base 1024) under a larger
+  promise. A module that never allocates is unaffected by where the window starts.
+* The flag still needs `-O`/`-O3`, as before: it is a licence to optimise, and a debug build
+  keeps every add.
+
+**Why the emitter and not a pre-pass before binaryen.** The minimal target was that
+`__load_i64__((p + 32) as% i32)` and `__load_i64__(p as% i32, 32)` build to the same wasm; the
+emitter meets it before binaryen runs (`-O --low-memory-unused` builds the two to identical
+function bodies, and a module holding both deduplicates them), for the sized promise too, where
+no binaryen pass can. A pre-pass would have to be a wasm rewriter in the host, which has none.
+
+**A trivial accessor's call folds too (PL-061, part 2).** `function ld64(a: i64): i64 {
+__load_i64__(a as% i32) }` called as `ld64(rsp + 32)` has nothing to fold inside `ld64`, and once
+`-O` inlines it the address is `i32.wrap_i64(i64.add(rsp, 32))`, which no binaryen pass folds.
+Under the promise the emitter emits such a call in place (`emitLowMemAccessorCall` in
+`compiler/wasmEmit.vl`): the accessor's own body, with its address operand replaced by `wrap(rsp)`
+and 32 added to the memarg, and its value parameter's read replaced by the caller's argument. That
+is the direct spelling `__load_i64__((rsp + 32) as% i32)`, so the argument above covers it. It
+stays exact because only a trivial accessor qualifies: not generic, i64 parameters with no
+default, one expression that is a scalar load of `a as% i32` under `as` casts and a `&` with a
+literal or module `const`, or a store of `v` or `v as T` there, each parameter read once and in
+parameter order. The arguments are then evaluated once each, in their order, before the access,
+as the call evaluated them; a non-constant address, a named argument, an i32 argument or a
+missing flag keeps the call. A rewrite after binaryen's inlining would have needed a wasm pass in
+the host and could only reach binaryen's 1 KiB, and it would not have met the target: the two
+spellings build to identical wasm only if they reach binaryen identical.
+
+## Labels are marked at the exit, and any loop carries a value (owner ruling 2026-09-29) — plumb PL-073
+
+**The spelling below is superseded**: a label is `@B` at the declaration and at the jump since
+the 2026-09-30 ruling (next section). The semantics here stand unchanged.
+
+**The rulings.** A block takes a label as a loop does, `B: { … }`. The label is named again at the
+exit, Zig-style: `break :B`, `break :B v`, `continue :B`; the declaration stays `B:`. A bare
+`break v` leaves the innermost loop with `v`, and a bare `break` keeps working, so `break x` with
+`x` a name now means the value `x`. Any loop may carry a value: its type is the
+join of every `break` value, a block's tail joins in, a `while`/`for` that can finish without a
+`break v` adds `null` (`T | null`), and `while true` — a literal `true`, which cannot run out — is
+plain `T`. `continue :B` on a block is an error. The guide is `docs/guide/loops.md`.
+
+**Why the colon at the exit.** A label and a value share the operand slot after `break`, and a
+value is the common case plumb's forward-exit blocks need. Marking the label rather than the
+value keeps `break v` the short form and makes `break :B v` unambiguous at the parser, with no
+lookup of which names are labels. Zig reads the same way.
+
+**Why `null` for a loop that can run out and plain `T` for `while true`.** A loop whose condition
+fails has produced no value, and `null` is VL's absence, the same rule as an else-less `if` used
+as a value. `while true` has no such path, so adding `null` would make every search loop's result
+need an unwrap that can never fire. The literal is the test, not flow analysis: `while 1 == 1`
+runs out as far as the type is concerned.
+
+**How it lowers.** The checker types the loop (`checkBreakNode`, `lpPopResult`); the emitter's
+first pass (`loopValueRewrite`) turns a loop whose value is used into
+`if true { let $lv: T [= null]; <loop>; $lv } else { __trap__() }` with each `break v` storing
+`$lv = v` first, so every delivery position lowers the value through a binding it already
+handles. A nullable `T` starts at `null`; a non-null one is carried out of the loop's `block
+(result T)` frame by `br` and stored where the binding's read validates. A block is a `block`
+frame with no `loop`. A loop whose value is discarded is a statement and `break v` evaluates `v`.
+
+**What it costs a program without one.** Nothing: the rewrite and the formatter's fold are both
+gated on a program holding a value loop, and `break`/`continue` lower as before.
+
+**A labelled block is left only by its name (owner ruling, same day: option C, Rust's E0695).**
+The first reading let a bare `break` leave the innermost loop *or block*, which made a block
+silently capture a `break` meant for the loop around it. Now a bare `break`, `break v` or
+`continue` never targets a block: one whose way to its loop crosses a labelled block, or a bare
+`break` in a block with no loop around it, is refused at `vl check` naming both fixes
+(`break :B`, or label the loop and `break :L`). A bare `break v` with no block in between still
+leaves the innermost loop with `v`. The refusal is the parser's, which already tracks the labels
+in scope; the checker and emitter never see a bare jump that could reach a block.
+
+**One spelling needs parentheses.** A labelled block as a call argument, `f((B: { … }))`, since
+`f(B: …)` is a named argument. Choosing the named argument keeps every existing call meaning
+what it meant.
+
+## A label is `@name`, and `{ name: … }` is always an object (owner ruling 2026-09-30) — D3374
+
+**The ruling.** A label is one token, `@name`, spelled the same where it is declared and where a
+jump names it: `@outer while …`, `@L for …`, `@B { … }`, `break @B`, `break @B v`,
+`continue @L`. A label goes only on `while`, `for` and `{`; `@name` anywhere else is a parse error
+saying so. The semantics of the 2026-09-29 rulings are unchanged: a labelled block is exited only
+by name (E0695), `break v` carries a value, a loop's value is `T | null` and `while true`'s is
+`T`, and loop labels stay optional.
+
+**Why a sigil.** `name:` shared its spelling with an object field, so `{ a: { b } }` needed a
+rule to say which it was, and every rule was wrong somewhere: #3293 read the inner braces, #3302
+also read the token after them, and D3374 was the same braces reading as a block in a `then` arm
+and an object in an `else` arm. `@` was unused, and `'` (Rust's `'a`) is VL's char quote. With
+the label lexically distinct, `{ name: … }` is ALWAYS an object literal — a function or lambda
+body, an `if`/`else` branch, a `match` arm — and the heuristics that existed only for labels
+(`labelBraceOpensStmt`, `labelledBraceIsBlock`, the recorded object-looking arms and their note)
+are gone. A labelled block is now a call argument as written, `f(@B { … })`, since nothing reads
+`@B` as a named argument. What stays is the shorthand rule, which has nothing to do with labels:
+a body `{ b }` is a block whose tail is `b`, and `{}` is an empty block.
+
+**One spelling costs parentheses.** `break @C { … }` names the label `C`, so a labelled block
+that is itself the value of a `break` is written `break (@C { … })`.
+
+**Migration, and how long it lasts.** The retired spellings are parse errors with the fix:
+`` `B: { … }` is no longer a label; write `@B { … }` `` (and the `while`/`for` twins, in statement
+and value position), `` `break :B` is now `break @B` ``, and, when an object literal fails to parse
+with a field `name: {` or `name: while` in it, `` `name: …` is an object field here; a label is
+written `@name { … }` `` (`@name while …` for a loop). That note is how an old labelled block
+first in a body reads now: as an object, so the note rides the object's own error. A
+`break @C` that names no label and has a `{` after it adds that a labelled block as the value is
+written `break (@C { … })`, and `@while` is refused as a label name. The detection (`oldLabelAt`,
+`oldLabelFieldNote` and the `:` arm of `parseJumpLabel` in `compiler/parser.vl`) is kept only
+while sources written before the ruling are migrated — plumb's generated units are the known
+population — and is deleted once plumb regenerates; nothing else depends on it. One old shape
+migrates silently and cannot be detected: an unused label on a loop first in a body,
+`function f() { L: while c { … } }`, is now an object holding the loop's value, which the
+checker refuses only when that value is `void`. `scripts/codemods/label-at.py` rewrites a tree,
+and rewrites that shape too.
+
+## `{ name, … }` is an object too; only a lone `{ name }` is a block (2026-10-02) — D3475
+
+**The rule.** Where a body, branch or arm may be either a block or an object literal, braces whose
+first token (past newlines) is a name followed by `,` are an object literal, as `{ name: … }`
+already was: `{ id, x: x }`, `{ id, x }`, a trailing comma `{ id, }`, and each of those across
+lines. Braces holding a lone `{ name }` stay a block whose value is `name`, and `{}` stays an empty
+block. The deciding function is `looksLikeObject` in `compiler/parser.vl`, which every such
+position consults: a function or lambda body, an `if`/`else` branch, a `match` arm and a
+statement.
+
+**Why a comma, and why not a lone name.** No statement is followed by a comma, so `{ id,` could
+only ever begin an object, and before this rule it was a parse error (sunpa SP-001); taking it is
+a pure capability add that changes the meaning of no program master accepted. The trailing-comma
+form `{ id, }` follows from the same argument: a block cannot contain `id,` either, so it is a
+one-field object rather than a second rule. `{ name }` is different: it is a legal block today, an
+`if b { x } else { y }` arm reads naturally as one, and reading it as an object would silently
+retype every such program. The one-field shorthand object in a body position is written
+`({ name })` or `{ name, }`.
+
+## Parameter names in a function type are documentation (owner ruling A1, 2026-09-29) — plumb PL-060
+
+**The ruling.** A function type may name its parameters, `type GuestCall = (fn: i32, rcx: i64,
+rdx: i64) => i32`, and the names are never part of the type: `(a: i32) => i32`, `(b: i32) => i32`
+and `(i32) => i32` are one type for assignability, joins, canon and type keys, monomorphization
+keys and a union's member set. The editor shows them — hover and signature help on a call through
+a binding whose annotation wrote them, through an alias too — and a mismatch diagnostic on such a
+binding quotes the annotation as written. A named-argument call through a function VALUE
+(`g(rcx: 1)`) stays refused, now with its reason: `named arguments work only on declared
+functions, not on a function value`. Named calls on declared functions are unchanged.
+
+**Why names are not identity.** Identity by name would put a name on every lambda and every
+inferred function type, and make two otherwise equal closures unassignable over a spelling. As
+documentation the step is reversible: resolving `g(rcx: 1)` against the static type's names (C#
+delegates do) is purely additive later (A2), and refusing it now reads nothing into the names.
+
+**All or none.** `(fn: i32, i64) => i32` is refused, `name every parameter of a function type, or
+none of them`, at the list's `)`. A half-named list reads as though the unnamed slots were a
+different kind of parameter, and "all or none" keeps the one question a reader asks — which
+argument is which — answered by the type or not at all. A name inside a parenthesized type that
+is not a function type names nothing and is refused too. Function types have no optional or rest
+parameters today, so there is nothing for a name to attach to there. A keyword cannot be a name,
+and one list cannot name two parameters alike — the same two rules a declared parameter list
+follows, the second of which it now enforces too (D3279).
+
+**Where the names live.** The parser keeps them on the `TS_FUNC` spelling node's text and never in
+the synthetic type name, so nothing downstream of the parser can see them; the four spellings in
+`tests/vl_fn_type_param_names_test.ts` build byte-identical modules. The editor reads them from a
+second, never-cleared column of the annotation and alias spelling roots (`annTsWrittenOf`), since
+canon drops the live root of an alias-spelled annotation. An annotation that writes names is not
+reported as a redundant annotation: inference cannot recover what it documents. That check
+resolves each annotation's alias names, so it reads a name → root map built once per program
+(`aliasTsRootOf`), and `tests/vl_scaling_shape_test.ts` holds one name's price over 3,000 aliases.
+
+**Not covered.** A method member of a type literal (`{ area(scale: f64): f64 }`) is a sibling
+construct, not a function type, and still takes types only — D3270 asks for the same reading.
+A call through a record FIELD (`o.cb(…)`) shows the field's type bare, since the field's
+declaration is not reachable from the member's resolved structural type.
+
+## A `const` with a literal value is a `match` arm (owner ruling A, 2026-09-29) — plumb PL-062, D3271
+
+**The ruling.** `match sig { MAGIC => …, ROOT => …, _ => … }` where `MAGIC` is a `const` whose
+initializer is a literal: the arm is compared by value and treated like the literal it holds —
+duplicate arms, exhaustiveness over a literal union, and the dense-`br_table` lowering all read
+its value. A bare name in pattern position that resolves to no type and to no such constant is a
+hard error. VL has no binding patterns, so a bare name has no other meaning, and refusing it now
+closes Rust's hazard where renaming a constant silently turns its arm into a catch-all binding.
+
+**Decided in the lane, within the ruling.**
+
+* **Which wins, a type or a constant of the same name, depends on the scrutinee (coordinator
+  ruling, review round 2).** Over a VALUE vocabulary (an integer or a literal-union scrutinee)
+  no type but `null` is ever a valid pattern, so a lexically visible literal-valued constant
+  wins over a same-named type or type parameter. Over a union of types the arms are types, so
+  the type wins and a constant there is refused as a value. This refuses nothing that could
+  otherwise run. A hole scrutinee is decided by its arms, so there a type stays a type.
+* **The module merge keeps both spellings.** It renames a pattern as a type, as before, and
+  when a local value shadows the name it banks the value spelling beside the node
+  (`matchPatValueName`), so each vocabulary reads the name it takes. Round 1 skipped the
+  rename instead, which refused an imported type pattern that a local shadowed.
+* **Imported constants work, renamed imports too.** They resolve through the import like any
+  value reference. VL has no qualified module access (`mod.MAGIC` does not parse anywhere), so
+  there is nothing qualified to admit.
+* **A local constant shadows a module one**, where the `match` stands, as any read does.
+* **The unused-variable lint counts an arm as a use only where the checker reads a constant:**
+  a literal-valued `const` binding, with the name either no type the file could mean or the
+  `match` visibly over values (a literal arm, or an `i32`/`i64`-annotated scrutinee). The lint
+  runs without the checker, so this is the syntactic reading of the rule above.
+* **Typed constants work** (`const K2: K = "a"` over `K`, `const W: i64 = 3` over `i64`); the arm
+  reads the constant, so its type is the constant's and the assignability rule is the literal
+  arm's. A `const TS: string = "a"` over `K` is admitted by value, as `k == TS` is.
+* **Negative constants work** (`const N = -1`): the value is `-` over a number, exactly the
+  negative literal arm.
+* **Computed constants are refused for now** (`const B = A + 1`, `const A2 = A`). The ruling
+  admits them when the compiler already folds them, and #3262 does — but in the emitter, after
+  the checker, which needs the value for duplicates and exhaustiveness and keeps no constant
+  scope (D1588). The refusal names the fix; D3272 carries the recommendation (one checker-visible
+  constant evaluator the emitter's fold then reads).
+* **Every other name is refused as what it is.** A `let`, a parameter or a loop variable reads
+  "is a variable, not a `const`", a function "is a function", and a name bound to nothing is an
+  unknown name. The checker banks a declaration only for its constants (the per-scope `const`
+  chain it already kept), so the sentence does not tell a `let` from a parameter; a chain of
+  every binding's declaration cost measurable compiler fuel for that one word.
+* **A character or boolean constant is refused** with its own sentence: no integer or literal
+  union arm takes that literal kind today, so the constant has nothing to be compared as.
+* **An `f64` scrutinee stays unsupported**, as it is for literal arms (D1572).
+
+**How it lowers.** The pattern node is rewritten in place into a read of the constant, so the
+desugared test is the hand-written `scrut == MAGIC` and types, narrows and emits as that does;
+the constant's literal is kept beside the node, and `switchLitPair` reads it, so a dense set of
+constant arms is one `br_table` exactly as its literal spelling is.
+
+## A literal binding takes its type from its uses (owner rulings (B), then B′ + C "for now", 2026-09-29) — D3246, plumb PL-054/PL-056
+
+**Provisional.** The owner ruled (B) — a literal binding takes the join of its uses — and then,
+after review showed operands re-typing values in ways nobody expected (`i * 0.5` beside an index
+refused, `b / 3` turning into float division), refined it to **B′ for `let` and C for `const`,
+"at least for now"**. Both are below; the grid and the review generator grade exactly these.
+
+**`let` (B′).** An un-annotated `let` initialised by a bare numeric literal — possibly negated or
+parenthesised — is re-typed only by:
+
+* DELIVERIES of the binding WHOLE (through parentheses and a negation): a typed parameter, a
+  typed binding, a field or element of a record or list literal delivered to a typed slot, a
+  map value or other stored place, a nullable number slot (its number), an annotated return, a
+  list index (`i32`), a map key;
+* STORES into it (`s = e`, `s += e`), where `e`'s type counts, joined with the literal's own type
+  (so storing an `f32` into `let x = 0.5` keeps `f64`); a stored literal, whole or in the stored
+  expression (`y += 3000000000`), bounds it to the types that hold that literal (`y = 3000000000`
+  needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32` and 4294967295 at `i64`, the width the
+  other uses choose);
+* a store of another literal `let` (whole or in an operand), solved jointly by a worklist; one
+  read in an integer intrinsic's operand (`b = divU(a, 2)`) bounds `b` from below and is never
+  widened by it, since an operand chooses nothing, while one in a float intrinsic's operand
+  (`y = abs(x)`) is solved as a copy is: a float binding falls below `f64` only through an
+  `f32` destination, which the target's answer can pass on but never widen, and the intrinsic's
+  own first-pass `f64` bounds nothing (D3387). The answer does not depend on the order the bindings are
+  declared in (D3343, plumb PL-079): the stores settle first, each binding offering only the
+  narrowest type its own rows need, and only then does a store's target bound the binding
+  stored into it — so `r9 = r10 * 2` widens `r9` to `r10`'s `i64`, never caps `r10` at a
+  default `r9` guessed first.
+
+Rules:
+
+* **Operands never choose.** `s < n64`, `b + mk()` or `take64(b + 1)` give `b` no type; a read
+  inside an expression is an operand of it. It still vetoes a type that would make that
+  expression wider than where it goes: `take64(b); xs[b - 6]` keeps `b` an `i32`.
+* **Within kind.** An integer literal becomes only a wider integer (`i32` → `i64`), a float one
+  only `f32`/`f64`. A destination of the other kind widens at that use as it always did, and the
+  binding keeps its type — `takeF64(b); print(b / 3)` stays integer division. Such a destination
+  still vetoes a choice the binding could not widen from: `take64(b); takeF64(b)` keeps `i32`.
+* **Vetoes keep the default.** A float-literal operand (rules out `i64`), a bitwise operand (an
+  integer) and `==` with an integer literal (rules out `f32`) choose nothing; when the chosen type
+  would break one, the binding keeps its literal's own type rather than being refused.
+* The choice is the join of the in-kind deliveries and stores, else the meet of the destinations
+  (`takeI32(b); take64(b)` keeps `i32`), else the narrowest type satisfying them all. Two in-kind
+  uses nothing satisfies are refused with both named ("`s` takes its type from its uses, and they
+  conflict: the use on line 18 needs `i64` and the use on line 19 needs `i32`").
+* **A type parameter needs nothing.** An argument to a parameter whose type names one (`id(b)`)
+  neither chooses nor vetoes, and a refusal never names it.
+* An exported `let` is typed only by its own module's uses; an importer's use is an ordinary use
+  of whatever type the module gave it.
+
+Mechanism: a pass records the uses; a `let` whose type moved has its type written as a
+synthesized annotation and the program is checked again (at most three passes), so the re-check
+is the annotated program. A move no read can observe — a decimal or small-radix integer, written
+only by literals that mean the same at `i32`, every read of which widens where it stands — skips
+the re-check; only its recorded type (hover) then shows the literal's default. `prefer-const`
+does not suggest `const` for a `let` whose type moved, since a `const` would not keep it.
+
+**`const` (C, Go/Zig-style).** An un-annotated `const` initialised by a bare numeric literal has
+no single type: every READ is its literal, typed by where it stands exactly as the literal written
+there would be — a typed parameter, binding or field sets it; a binary operand beside a typed one
+takes that one's type where the literal would; with no context it is the literal's default. So
+there is no solve and no re-check for a `const`, and no cross-module effect: an exported `N` or
+`std:fs`'s `ENOENT` is typed per read in each module (`half()` printing `N / 2` prints `3`). A
+literal that does not fit the read's type (`const B = 3000000000` read as `i32`) is the literal's
+own error at that read. `const x = -1` is its negated literal, as a `let`'s is. An annotated
+`const` is unchanged.
+
+Declaration order never changes a value: a read above the declaration, at the top level or in
+a function written above it, is the literal too, so a literal `const` has no dead zone (a
+`const` computed from anything else still has one). A binding initialised by a bare read of a
+literal `const` holds that literal as if it were written there — `let bb = M` is a literal
+`let`, typed by its deliveries; `const A2 = A` is a literal `const`, and a `match` arm — at any
+depth and, at the top level, in either order.
+
+Mechanism: the checker rewrites each read into a copy of the literal the moment it resolves it,
+so the checker and the emitter see the literal, and the editor still records the read as an
+occurrence of the name (a read above the declaration included), with the type it takes there
+for hover. A parameter default and a `match` arm are rewritten like any read, so they take the
+literal at the parameter's or the scrutinee's type (`x: i64 = B` and an arm `B =>` over `i64`
+are 4294967295 for `const B = 0xFFFFFFFF`); an arm's diagnostics still quote it by name. A
+default is delivered like an argument, so `x: f32 = 0.1` is the `f32` 0.1, written or read
+through a `const`, as `let g: f32 = 0.1` already was. Two
+kinds of read keep the NAME:
+
+* a write target (`K = 1`, `K += 1`, `K++`): the write needs the binding, and its refusal names it;
+* a `for` range bound or step: a range is `i32`, where a literal and its name read the same, and
+  the constant-range refusals and the step floor judge a literal the author wrote.
+
+One more is rewritten but flagged, because its check is about a literal the author wrote: a
+newtype's brand (a named value is not brand-polymorphic). A shift count was flagged too, and
+taken modulo past the width; since the exact-constant ruling it is a constant and refused past
+the width as a written count is (D2724).
+
+**Hints.** "redundant type annotation" on a literal `let` also requires the solve to agree. On an
+annotated literal `const` it is withheld where the bare literal would read differently: an `f64`
+meeting an `f32` operand, or a literal tree taking a destination's width (`take64(C * 1000000000)`).
+
+**Programs whose behaviour changed.** Two kinds, and in every graded cell the new value is the
+one the rule gives. An integer `let` widened by an `i64` delivery: `let b = 7; take64(b);
+print(b * 1000000000)` printed `-1589934592` and prints `7000000000` (the review's B′ grid, 1,155
+cells: 229 such values, each equal to its `i64`-annotated twin). And a `const` read in a context
+where its literal means something else: `const M = 0xFFFFFFFF; let a: i64 = M` printed `-1` and
+prints `4294967295` (the review's const grid, 590 cells: 135 values moved from master, each equal
+to the literal written at the read). Neither grid loses a running cell. In the repository: two
+inventory rows moved (D1730's `xs[i]` with `const i = 0` now keys and runs; D2443's
+literal-`const` spelling runs, since a copy of a literal `const` holds the literal and no alias
+of the shadowing local is formed, and the row is graded on its parameter spelling); fixture
+changes are listed in the PR. The compiler's `gLowMemUnused` is annotated `i32` so the
+self-compile does not re-check.
+
+**Cost, against master `e70102886`.** One self-compile +0.8% guest fuel; the plumb-shape units
+−8.0% / −8.6% (a `const` read is now a constant, not a global); plumb's runtime modules +0.6% to
++2.6% with no re-check; a generated chunk that builds on current master (`chunk_1`, its labels
+respelled for the labelled-block ruling) −7.9%, its only difference each
+`i64.extend_i32_s(local.get y)` becoming `i64.const 32`. The seed grows 40 KB (+1.1%) and the
+seed-size baseline is rewritten with it.
+
+## Exact constant arithmetic (owner ruling A, 2026-09-30) — D2712, D2724, D2725, D3053, D3054
+
+**The ruling.** A `const` whose initialiser is literal arithmetic — numeric literals, other such
+`const`s, parentheses, unary minus, `~`, `+ - * / %`, `& | ^`, `<< >> >>>`, with integer and
+float literals — is computed EXACTLY, like Go's untyped constants or Zig's `comptime_int`, and
+typed at each use. A use whose destination cannot hold the exact value is a check error
+(`constant 2147483648 overflows i32`), never a silent wrap. It extends ruling C (a bare literal
+`const` is its literal at every read). A tree that reads a variable, calls a function, or names a
+`let` is untouched, and so is an annotated `const` except as below.
+
+**Where it applies (owner, 2026-09-30).** A read of a literal `const` is already the literal
+written there, so a tree of literals written in place is the same program as a `const` holding
+it; the owner confirmed that scope. The fold runs on every such tree wherever it stands — a `const` initialiser, an argument, a shift count, a
+generic body, a join — and on nothing else. So `x << (16 + 16)` is `x << 32` (refused, D2725),
+`1 << K` is `1 << 40` (D2724), `[x, -(-0x80000000)]` holds 2^31 beside an `i64` (D3054),
+`(-(-(-0xFFFFFFFF))) as% i64` is `-4294967295` like the single negation (D3053), and
+`g<i64>(0)` over `x + (3 << 31)` adds 3 * 2^31 (D2712).
+
+**Mechanism.** The checker folds a tree the first time it checks its root (`cexTryFold`, and
+before any scope exists for a module initialiser, `cexFoldModInit`), computing it in
+`compiler/const_exact.vl`, and rewrites the root in place into the literal of the value: a
+decimal, a hex literal for a bit pattern (below), a decimal float, with a negation over it when
+negative. Every use then types that literal exactly as it types one the author wrote, so there is
+one set of rules for a literal and a constant, and the emitter never sees the tree. A name the
+tree read stays an editor reference.
+
+**The details, following Go.**
+
+* Integer division truncates toward zero and `%` takes the dividend's sign, as at run time.
+  Division or remainder by an integer zero has no value and is a check error (`division by zero
+  in a constant expression`); the run-time trap is still there for a divisor that is not a
+  constant.
+* A shift count must be a non-negative integer (`shift count -1 is negative`). `<<` is exact and
+  `>>` floors. A count too large for the destination shows as the value not fitting there, as in
+  Go: `1 << 40` at `i32` is `constant 1099511627776 overflows i32`, and at `i64` it is 2^40. A
+  constant count beside an operand that is not a constant is graded as a written count is
+  (D2710): refused at or past the operand's width, a `const` name (D2724), a tree (D2725) and a
+  radix count read at its full value (D3427).
+* Mixing an integer and a float makes a float constant (`1 + 0.5` is 1.5); an integer `/` of two
+  integers is still integer division (`7 / 2` is 3 at every destination; D2711).
+* A float constant at an integer destination — a binding, argument, return, field or list
+  element — is that integer when it is a whole number (`2.5 * 4` is `10` at `i64`); otherwise it
+  is refused as any float there is.
+* An integer constant at `f32` or `f64` is taken as an integer literal is: when that float holds
+  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round). A float
+  constant is exact until its use: `0.1 + 0.2` is the `f64` nearest 0.3 and the `f32` nearest
+  0.3, not the sum of two rounded values.
+* **Precision.** Integers are exact to 512 bits, past which the expression is a check error
+  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
+  float constant is an exact fraction whose numerator and denominator are each held to 4096
+  bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
+  literal: exact when its expansion terminates within 400 characters, otherwise to 800
+  significant digits and a sticky last digit when anything is cut. Every rounding boundary of
+  an `f32` or `f64` has fewer significant digits than that, so the use rounds the literal as it
+  would the exact value (`1.0 + 1.0/9007199254740992.0 + 1.0/3.0/1e70` is the double above 1,
+  where 60 digits read a tie and rounded to 1). A float zero keeps its sign, as IEEE does:
+  `0.0 * -1.0` is `-0`, and `-0.0 + 0.0` is `+0`.
+* **A refusal names the constant and the destination** at an integer, float or union
+  destination: `constant 2147483648 overflows i32`, `constant 123456789000 is not exact at f32`,
+  `constant 1.5 is not a whole number, so i64 cannot hold it`, `constant 2147483648 fits no
+  member of i32 | string`. A `u8` element keeps the literal's own refusal.
+
+**Where VL keeps its own rules.**
+
+* **A radix literal is the bit pattern at its use's width under every operator (owner,
+  2026-09-30, ruling A on radix arithmetic).** `0x80000000 / 2` at `i32` is -1073741824 and
+  `0xFFFFFFFF % 7` at `i32` is -1, as on master and in Java and wasm; an unsigned reading is
+  spelled `divU`, `remU`, `ltU` or `>>>` (for `i32` and `i64` operands; since U1, a
+  `u32` or `u64` operand reads unsigned under `/`, `%` and `<`, §"`u32` and `u64` are value
+  types"). The width is the use's, which the fold cannot see, so a
+  tree whose value depends on it is not folded and computes where it is used, as before:
+  arithmetic (`+ - * / %`) over a pattern, `>>` and `~` over a pattern whose top bit is set at
+  its own width (32 or 64 bits), any operation over a pattern wider than 32 bits (which an `i32`
+  does not hold), and a pattern shifted past 32 bits. Such a tree is left whole: no decimal part
+  of it folds on its own, so `(1 << 31) - 0x1` is 2147483647 at `i32`, as on master, rather
+  than an `i64` literal minus a pattern. What reads the same at
+  every width folds, and stays a pattern that fits a width by its digits: a negation, `&`, `|`,
+  `^`, `>>>`, and `<<` within 32 bits (`0xFFFF0000 | 0xFF` is -65281 at `i32` and 4294902015 at
+  `i64`; `0xFF << 24` is `0xFF000000`). A decimal literal is a number: `1 << 31` at `i32` is
+  refused as Go refuses `int32(1 << 31)`; `0x1 << 31` is the pattern.
+* **A float division by zero, and a float constant past the largest double, are not folded.**
+  VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
+  computation they were; Go refuses both.
+* `>>>` of a negative constant depends on the width it runs at, so it is not folded either, and
+  a tree containing one keeps the literal-tree reading at its destination's width (D2709).
+* A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one
+  stored truncated), since ruling C makes a constant its literal; whether a negative literal
+  should refuse there is D3428's open question.
+* An annotated `const` is a typed constant (owner, 2026-09-30): its annotation is the tree's
+  destination, so `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
+* An integer literal past the `i64` range is refused wherever no float holds it exactly
+  (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
+  the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
+* In a generic body, an `i64` operand beside a type-parameter operand records a constraint
+  (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
+  since the body alone cannot see the width (D2712, D3426); an `f32` pin is still open (D3429).
+
+**Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
+constant rounded step by step, and now has the exact value or a loud refusal. One more kind is not a wrap: an operation over
+float literals under an `f32` operation (`y * (0.5 * 3.0 + y)`), which #3324 read as an `f64`
+widening the operation above it, is now its constant, an `f32` literal beside `y`, so the
+operation stays at `f32` (`tests/cases/arith/float-literal-operation-nested-f32.vl`). The
+exact-constant grid
+(`scripts/capability-probes/const-exact-grid.py`, 36 initialisers x 15 uses x 2 spellings =
+1,080 cells, expected values from Python's exact integers and fractions, and for the 180 cells
+of radix-pattern arithmetic master's own output) grades 1,080 of 1,080 as the rule says; against
+master `028dedb33`, 207 cells moved from a wrapped or step-rounded value (98 now refused, as `K`
+at `i32` for `K = 2147483647 + 1`, and 109 now exact), and no cell that printed the exact value
+on master changed.
+The literal-binding grid (594 cells) still grades every cell as its rule program does; against
+master `5e277ab52`, 172 of its cells moved from master's wrapped value to the exact one (a literal `const` read into `b * 1000000000`).
+Fixtures that pinned a wrap were rewritten, each listed in the PR. Every module initialiser that
+is a constant tree is folded before the module is checked — a `let` and an annotated `const` as
+well as a literal `const` — so each is checked as the bare spelling of its value would be (a
+`let` holding one is a literal `let`; an annotation on one is as redundant as on its literal).
+
+**Cost, against master `028dedb33`.** The fold is one walk per arithmetic operator, stopping at
+its first leaf that is no constant, with the operators a nested walk found to be none
+remembered: the plumb-shape units +0.22% / +0.23% guest fuel, a generated plumb chunk
+(`chunk_0`) +0.20% (most of its constants are arithmetic over a hex base, which the radix
+ruling leaves at its width, so the walk is paid without the saving), the L2 self-compile
++0.8%, the seed +33 KB (+0.8%). plumb's 428 units check with byte-identical diagnostics; their
+builds differ only as constants folded earlier (identical after binaryen's constant folding, or
+after `-O2`, but for three `x86.vl` records whose initialisers became constant expressions). A
+chain of `const`s whose exact value grows each step pays for the
+growth: 200 floats each four times the last cost +65% over computing them at run time.
+
+## Flow narrowing: per-path facts meet at joins (owner ruling 2026-09-29) — plumb PL-064, D3285
+
+**The ruling.** General branch-join narrowing, built as one core plus slices, rather than a
+special case for `if x == null { x = 0 }`. D2390's "flow analysis later" is this; its call rule
+becomes the core's transfer function for calls. Slice 1 (this) is `if`/`else` joins. Slice 2 is
+early exits (a `return`/`break`/`continue` dropping a path), slice 3 `match`, `&&` and `||`,
+slice 4 loops (a fixpoint). Each slice ships at the same bar: no program that ran stops running,
+and every newly accepted program runs correctly at the direct, `<T>` and hole spellings.
+
+**The core.** Each path through an `if` carries narrowing facts, place key → type, over the place
+keys the checker already has (a name, `o.v`, `xs[0]`, their compositions). The facts that hold
+below the `if` are the meet of the surviving paths: a key reads at the join of what each path
+left it at, a diverging path contributes nothing, an absent `else` is the fall-through path. The
+state a path carries is the scope chain plus the path overlay, as before; what the core adds is
+the per-arm ledger it folds (`narClob*`, one row per transfer) and the meet at the join
+(`applyArmJoins`, `compiler/typecheck.vl`). One pass folds a subtree's rows in order, and the
+join then replaces them with one summary row per key at the `if`'s own statement depth
+(`narCompactIf`), so an enclosing join folds each inner `if` as a single transfer and the whole
+thing stays linear in the function however deep the nesting.
+
+**The transfer functions,** each the existing rule, now feeding the ledger rather than beside it:
+
+- a null test, an `is` test, a discriminant or a type-guard call sets each arm's START for the
+  keys it tests (`collectThenNarrows` / `collectElseNarrows`); a key the condition does not test
+  starts both arms at its entry type;
+- a write narrows the place to the member it stores: the straight-line null strip (`x = 5` over
+  `i32 | null`), the re-narrow under a guard (#3289), a path's twin (D1848). A non-null write to
+  an un-narrowed nullable path is now a row too;
+- a call that may write the place ends its narrowing (D2390), as a row the join cannot merge a
+  fact back over; so does a variable-index write to any cell of the receiver, and an aliased write;
+- a write inside the condition may or may not have run, so it joins into both paths.
+
+**Where the join lands.** In the block that holds the `if`, banked like the post-guard
+fall-through, which is exactly the lifetime of the emitter's push after the statement
+(`pushPostGuardNarrow`); the earlier in-place write at the binding's own depth outlived a loop
+body or an enclosing arm. An `else if` link installs nothing of its own, its parent joins it. An
+`if` in value position installs when its statement ends, and only when it is that statement's
+whole value (a `let` initializer or an assignment's right side), since nothing else guarantees it
+ran. A join row naming a name a closure writes is renamed to that name's cell (D3288).
+
+**A fact is about a binding, not a name.** A ledger row records the binding its key's root
+resolved to (`narClobDecl`, `narBindDepthOf`), so an inner block's `let x` neither feeds nor
+retires the outer `x`'s join. An inner declaration or a parameter of the root invalidates the
+outer binding's path overlays for its scope (`narShadowPaths`), and the emitter pushes a shadow
+entry that hides the outer narrowings until the block ends (`shadowNarrowFor`). The respelling
+pass that renames a captured binding renames its join rows with it. A call that may write a
+place leaves its row on its path even when a sibling arm already retired the name in place, so
+the meet sees both paths' ends.
+
+**A kill on any path survives the meet.** A call that may write a place, an alias write, a
+write to an outer binding an inner declaration hides, and a write with no key (a computed index)
+leave the place UNKNOWN on their path (`NAR_UNKNOWN` in the fold), and so does a write to any
+prefix of the key, the root included, whatever it stored (D3319: sound and deliberately
+imprecise, since `a.in = { v: 5 }` could re-narrow `a.in.v` but slice 1 does not read the
+literal's fields); only a later write at that
+arm's own depth replaces it, and the meet declines a key any surviving path leaves unknown. A
+kill row is pushed even when a sibling arm already retired the place in place, so no other
+path's re-narrow can erase it. Inside a loop, a write the body may make to the key, to a prefix
+of it, to a cell of its receiver at a computed index, or to the same field through another
+receiver ends the fact before the loop (`loopWriteMayReach`), since the reads before it run again.
+Through another receiver the write's value is judged against that place's declared storage, so a
+non-null write keeps the fact, as master did and the straight-line alias rule does.
+
+**Every path write leaves a row, and a retired entry is not a read.** A write over a
+narrowing that a sibling arm or a kill already retired in place still records what it stored
+(D3315), so no path is mistaken for untouched. After such an `if` the path narrows again on the
+next non-null write, a join installs even over a retired entry, and an assignment's target is
+never refused as a read of the retirement (D3316). A loop's literal-subscript write names its
+cell (D3317), and the else arm of a null test restates a path a live overlay already held
+(D3318), so a then arm's in-place retirement cannot leave the two halves disagreeing.
+
+**What slice 1 declines.** A key whose path types hold a type variable or a hole: inside a
+generic body `T | null` is gradually assignable to `T`, the join would read as `T`, and join rows
+are banked per node while the emitter lowers per instance (D3286, open). A condition-tested key
+where one arm diverges stays with the post-guard rule, which slice 2 routes through the core.
+
+**Cost.** Two GROWTH axes in `tests/vl_scaling_shape_test.ts`: sequential joins of one name read
+3.98 (linear), and joins nested deep 5.26, which is the depth-proportional walk a write makes
+over the name's narrowing layers (`narWriteStorage`), not the join. Master's nested straight-line
+writes already read 8.2 on that walk; the emitter's narrowing stack now keeps a per-key slot
+index so a lookup or retirement costs the key's own entries rather than the whole stack, which
+took a flat run of straight-line writes from 10.5 to 3.95.
+
+**A `.length` test proves the next pop (owner ruling A on sunpa SP-008, D3558).** Inside `if` /
+`while k.length > 0` (also `!= 0`, `>= 1`, `0 < k.length`), the first `k.pop()` is the element,
+not `T | null`. This is a fact about a list place rather than a type, so it is kept beside the
+narrowing core (`neEnter`/`nePopTakes`, `compiler/typecheck.vl`) and not in the ledger: it is
+consumed by the pop rather than joined. It is ended, in checking order, by anything that may
+shrink or rebind the list or re-run the pop: any call or operator that may dispatch (which is how
+an alias's pop, a closure's and a callee's are caught), a write to the key's root name, any
+write to a field or element (another name may reach the same list), a declaration of its name, a loop, and a call with named arguments, whose arguments run in
+parameter order. A `push` ends it too, as the ruling says, though it cannot make the list empty.
+The emitter reads such a pop unchecked; there is no postfix `!` (declined; D3555 names it).
+
+## Record covariance: only a fresh value widens (owner ruling "A, with C eventually", 2026-09-29) — D2996
+
+**The ruling.** A record delivered where a record of the same field names stores a field
+differently is allowed only for a FRESH value: an object literal at the delivery, which is built
+there, or a binding that holds only a literal, which adopts the destination type. Any existing
+record — a binding, a call result, a field — is refused, and the message names both fixes:
+build the source at the wider type, or copy it with a literal `{ f: i.f }`. Records are shared
+references, so widening one in place lets a write through the wider handle break the narrower
+one's invariant; this is the array-covariance rule ("No implicit container widening") for
+records. Copy-on-delivery (B) was rejected because it silently changes aliasing. Read-only
+covariance (C: a `readonly` record type or view) is a later, additive extension: it only admits
+deliveries this rule refuses, so nothing here precludes it.
+
+**Rep, not type, decides.** The rule asks whether the two records STORE a field differently
+(`fieldStorageEq`), not whether their types differ. A list field and its `readonly` view, an
+integer literal type and `i32`, a map whose entries store alike, and two records whose fields all
+do are one storage, and the delivery is shared soundly as it always was; D2060's reads-only rule
+still governs writes through such a handle. `i32` into `i32 | null`, `i64`, `f64` or
+`i32 | string`, `O` into `O | null`, a record into a union of records, a string literal union
+into `string` and a nested record of any of these differ.
+
+**Where it is asked.** Every delivery the checker's assignment seam sees (argument, return,
+binding, assignment, field and element store, `push`, list literal element, closure argument,
+generic receiver) and every join operand (`if`/`match` arm, `??` operand, inferred return, list
+literal element) is queued and walked once the pass is over (`recRunPending`, beside D2060's
+`rcwRunPending`), when the occurrence index is complete; a pair of types no existing record could
+be refused at is dropped before anything is resolved, so a program with no such pair pays
+nothing measurable (plumb's shape units read +0.04% guest fuel).
+
+**What counts as fresh.** The walk follows a value to where it was built: through parentheses,
+un-annotated bindings (a `const`, or a `let` assigned only object literals), `if`/`match`/block
+tails, both `??` operands (an existing record on either side is refused), an element read of a
+list literal, a container built by inference (`Map()`, `Set()`, a generic call whose result names
+a type parameter and into which no existing list goes), and a generic identity call (`id(x)`, a
+bare `T` result from one `T` parameter). An object or list literal reached that way is fresh and
+judged field by field and element by element. One reading goes past the ruling's words and is
+recorded as such: **a call of a function with no declared result (a lambda bound to a name
+included) that returns only fresh records is fresh too**. The distilled corpus depends on it —
+refusing those call results cost 598 behavioural classes (17,155 census cells) of running
+programs — and it is the same fact as a binding: nothing else holds the value. A returned local
+that the function also hands to another place (an argument, a store, a literal) is shared, and is
+judged by its type (D3341).
+
+**Adoption, and where it stops.** A fresh BINDING delivered where a record of its field names
+stores a field differently takes that record as its type: the destination is written as its
+annotation and the program is checked again, the literal-binding re-check of D3246. Every later
+use then sees the destination type, which is what makes D2933's element delivery run, and two
+demands that store differently are refused naming both lines. The binding is found the way
+freshness is (D3441-D3443): through an `if`, `match` or block tail, either `??` operand and a
+generic identity call, and at a union destination on the member the value lands on, its one
+record (or list of records) member of those field names, as the annotated twin
+`const q: D = …` lands. Adoption is all or nothing per binding, and it has these limits:
+
+* **Across a numeric width or kind the binding adopts fully** (owner ruling D3339 (A),
+  2026-09-30): `const q = { v: 1 }` delivered as `{ v: f64 }` is that type at every read, before
+  the delivery and after it, so `q.v / 3` prints `0.3333333333333333` exactly as
+  `const q: D = { v: 1 }` does. It is the literal-binding rule (B′) one level down: a literal
+  takes its type from its deliveries. A delivery the literal's own type refuses outright
+  (`i32` into `f32`) adopts too (`recAdForce`). The re-check is never undone for such a binding:
+  a read that needs the old width (`const n: i32 = q.v`) is refused, as the annotated twin's is,
+  and the refusal names the adoption. The first attempt served such reads at the literal's own
+  type one read at a time, and that leaked through lambdas, loops and identity calls and changed
+  the values running programs printed. A destination that drops a nested field is a shape the
+  literal cannot be written at, so that delivery keeps its own-type build.
+* **No adoption of a function's result.** The first candidate wrote the destination as a
+  function's declared result, and an annotated function whose literal is built at a declared
+  record of its own fields is invalid wasm where the un-annotated call ran (D3342). A function's
+  call stays master's delivery, with one exception (D3444): a function called at exactly one
+  site whose every returned value is an object literal builds those literals at that call's
+  destination (their rep type, `recFnBuiltAtDst`), which lets an integer field land in a float
+  one and takes precedence over a declared row of the literal's own fields (D2437, D3349,
+  D3351, D3430). Called at two sites, such a delivery is refused as below; building both at the
+  destination would be adopting the function's result.
+* **The re-check is undone** when it refuses anything but the adopted binding handed on whole,
+  for an adoption that changes no number's width or kind.
+
+Where master built invalid wasm for a delivery the checker neither adopts nor refuses as
+existing, it refuses instead, with the existing-record wording: a record a function called at
+more than one site built into a record (not a union) with a
+bare `f32`/`f64` field it holds as an integer, which has no conversion (`recFloatBuiltElsewhere`);
+a literal built inside a function or through a generic identity call where a record of its own
+fields is declared, by a `type` or inline in an annotation (D3430), which builds it at that row
+(`recBuiltAtDeclared`, D3338 — a method or generic argument declines, since `Map.set` of the same
+call runs on master; a fresh call handed through a generic identity is judged at the identity);
+and one binding or function a kept delivery builds at another
+storage and that is handed on whole at its own type, or delivered at two storages
+(`recKeptConflicts`).
+
+**Measured for lane RC3, against master `028dedb33`.** The annotated twin is the oracle. A 312-cell
+grid (six field pairs, seventeen delivery positions, reads before, after and none): 0
+disagreements, 62 running cells print their twin's new value, 0 runs lost. A 216-cell
+function-result grid and a 162-cell declared-own-row grid: 0 runs lost, 168 cells from a
+refusal or invalid wasm to runs, 14 from invalid wasm to a refusal; the 48 cells still disagreeing are a function called at two
+sites or handed through a generic identity, both refused, none invalid. The distilled corpus
+moves exactly as master's does, and plumb's 214 entry files check identically. A union
+destination (`R | string`, `R | null`, `R | G`) keeps master's boxed build of a fresh call at
+every site count (a 72-cell grid and the #3325 review's 720-cell grid: 0 runs lost).
+
+**Measured before landing, against master `2b30e3674`, after the #3312 review.** The distilled
+corpus lost no runs. The review's 1,344-cell grid: 0 value changes, 0 fresh runs lost, 9 invalid
+modules to runs, 1,012 invalid or emit-refused cells to check refusals; 12 existing-record runs
+(`O` into `O | null` at a map value or closure capture) are refused as the ruling requires, and 74
+cells stay invalid or emit-refused as on master (D3339, D3349-D3351). A 540-cell width grid
+(six width pairs × six fresh spellings × five positions × three uses): all 320 running cells
+print master's values, and all 220 invalid or refused ones are now check refusals. The 936-cell
+position grid and the 88-cell adoption grid show 0 value changes and no new silent cell.
+plumb's 508 files check identically.
+
+**Measured for the D3339 ruling, against master `d0789e90a`.** The oracle is the annotated twin.
+A 1,920-cell grid (five field pairs, three literal shapes, eight readers, eight delivery
+positions, reads before and after the delivery) and a 324-cell grid of second demands both
+agree with their twins everywhere except nine cells of D3340's container refusal, identical on
+master. 572 running cells print a new value, each equal to its twin's. 73 running cells are now
+refused, each as its twin is: a read that needs the literal's own width after the adoption
+(`const n: i32 = q.v`, an interpolated `f64 | null` field). The distilled corpus loses no runs
+and 26 classes (3,795 census cells) move from a check refusal to runs.
+
+## A function value at another function type is adapted where it is delivered (2026-09-30) — D3073, D3112
+
+The checker admits a function value where a function type of another rep is expected (a record
+result read as a union, a record list read as a `readonly` union list, a union parameter read as
+a record one), and a function value keeps the `$fnsig` it was built at, so the call through the
+destination's type trapped. The coordinator's note on D3073 was: (A) an adapter at the delivery for
+a result a read-only view serves, (B) a check refusal for anything that needs a copy.
+
+**The adapter is a rewrite, not an emitter thunk.** `fvaAdapt` (typecheck.vl) replaces the
+delivered expression, in place, with `(p…): R => f(p…)` at the destination's type and checks it
+as written code. Each argument and the result then convert through the delivery that already
+exists for them (the D3041 view, a union box, a generic's instance), and a conversion the language
+refuses is refused by the same rule a hand-written wrapper meets: D2715's `A | B` result read as
+`B` is the record-covariance refusal, since a call's result is not provably fresh. An emitter
+thunk would have needed its own copy of every delivery conversion. A function declaration or a
+`const` is called directly; any other value is read once, as the argument of a lambda called in
+place, so a later store to a `let` does not reach the adapter.
+
+**"May differ" is decided on the rep, not the type.** The checker has no `$fnsig` key (the
+emitter interns those after checking), so `fvaSlotMayDiffer` mirrors what the key ignores: a single
+literal is its base scalar (`() => "ab"` is `() => string`), a union's members compare as a set
+(`Circle | Sq` is `Sq | Circle` and `Shape`), a list differs only by its element, and anything else
+unequal counts as a difference. The #3314 review's first round lost 79 running cells to a
+type-level comparison that forced adapters, and container refusals, on same-signature functions.
+
+**A function inside a container is refused, not adapted.** A list, record, map or `| null`
+holding functions taken at a wider function type would need each function rewritten on the way,
+which is a copy; the check refuses it and names the fix. A literal adapts each element or field,
+since that is a delivery per element. The `| null` case could be adapted behind a null test, but a
+lambda parameter of nullable function type has no representation in the function-value ABI yet.
+
+**A generic function named as a value is always adapted**, whatever type the checker gave the
+name, so its instance is built by the adapter's direct call (D3112, D3113). One held with no
+concrete function type at all is D3381, which asks for a ruling.
+
+Measured against master `3291e99e1`: the distilled corpus lost no runs, the filed-witness grader moved only
+the five rows this re-grades, and plumb-shape guest fuel moved +0.02% (main and tail). The
+compiler's own source has no delivery the adapter rewrites (its first self-compile was
+byte-identical to the second).
+
+## A map read off a hole is read at the map its instance pins, by the emitter only (2026-09-30) — D3130, D3155
+
+A read `m[k]` off an un-annotated parameter (or a `<T>` one) is an element derivation of the
+hole, and at a map pin it is the value or `null`. The emitter never resolved it there, so a hole
+instance read every map as a plain `i32` map: a `boolean` printed `1`, an atom printed its id, and
+a scalar miss bound the raw `0`.
+
+**The emitter resolves it; the checker does not.** `holePinReadOf` and `nodeTyPinIxOf` answer the
+derivation at a map pin (`mapPinReadTy`), and the emitter's map readers ask the receiver through
+`mapRecvTyIn`: its recorded type, else the instance's own binding (`holeOperandTyOf`, or the exact
+binding of a `<T>` instance), else the program's one banked pin. The #3282 candidate resolved it in
+`substHoleTyReal` as well and lost running cells in each of four review rounds, because every
+deferred `??` and demand re-asked at the pin changed at once. The price of leaving the checker is
+D3400: a demand on the read (a member access on the nullable result, `print` of a map) is not
+re-asked at the pin.
+
+**A `??` default that no member can hold keeps the template reading.** `atomMap[k] ?? 5` is an
+`AB | i32` join, which no spelling lowers (the direct one refuses it at check, and `x ?? 3` over a
+`K | null` binding is an emit refusal). Reading that map at its pin makes the emitter refuse it,
+which loses the twelve `d3127-coal-price` cells whose key misses and so print the default. Those
+keep master's lowering (`coalMapReadForeignDefault`); the hit that prints the id is D3127.
+
+**The binding's box comes from the one banked pin**, since a shared `LetDecl` carries one
+synthesized annotation. Two calls at two map types therefore still bind the raw scalar (D3398).
+
+Measured against master `8df60e472`: the distilled corpus lost no runs, rep-fuzz is exact, the
+filed-witness grader moved only the five rows this re-grades, and plumb-shape guest fuel moved
+-0.03%. Lane MH's map-read grid (11 value types, 9 readers, a hit and a miss, a field or a bound
+receiver, in the hole, `<T>` and direct spellings) went from 67 wrong values to none against the
+direct twin, and from 68 invalid modules or traps to 44, all of them D3399 or D3400. It lost no
+running cell with `i32` or string keys or with a second instance.
+
+**Review round (#3318).** Two instance readers must not outrun the fused map `??`. A store
+narrows the read after it to non-null, and `coalesceOperandPinNonNull` then emitted the bare
+read, which is still the map's nullable rep (6 cells ran on master and built invalid wasm); a
+fused map read now keeps the fused lowering. And a `??` over an atom map read whose default is
+a hole's read of the same kind keeps the `-1` niche (`coalMapReadNulAtomTexts`), where `print`
+had spelled the sentinel as a member. The pin-nullable default is asked only there: widening
+`coalesceDefaultNullable` itself broke three `d3127-coal-price` chains. Two `<T>` cells moved
+from a refusal to D3398's wrong value, recorded as the named set `mh-two-instance-price`.
+
+## `vl fmt` keeps a field written as shorthand, and an object literal is one line when it fits (2026-10-03) — D3478, sunpa SP-004
+
+**A field prints the way it was written.** `{ seq }` stays `seq` and `{ seq: seq }` stays
+`seq: seq`; the formatter converts neither way. Shorthand is a supported spelling, and a
+formatter that rewrites it means a file only ever holds the long form, and that every format
+moves text under the author's next scripted edit (sunpa lost two fields that way). It is the
+formatter's own standing rule, "never re-spell what the author wrote". Method shorthand
+`{ f() { … } }` is a separate, older decision and still canonicalises to the arrow field
+(`docs/internals/format-notes.md`).
+
+**Meaning cannot move: the printer adds no braces, keeps an object's parens, and keeps the
+comma on a lone shorthand field.** A one-field `{ id }` in a body position is a block, so an
+object there is written `({ id })` or `{ id, }` (D3475). The `Paren` node keeps the parens, and
+a single shorthand field written with a comma after it prints as `{ id, }`, the one place the
+one-line form keeps a trailing comma: dropping it, as every other one-line list does, turned
+`{ id, }` into the block `{ id }` (found by D3475's own round trip). Several fields (`{ id, n }`)
+print the same tokens and re-parse the same way. The printer recognises a shorthand by its
+value sharing the key's source position, which a written `seq: seq` cannot. The fmt tests prove
+the round trip by running both spellings, and the D3478 one by building them to byte-identical
+wasm.
+
+**Layout: one line whenever it fits.** An object literal takes the same `wrapList` rule as a
+call's arguments and a non-scalar array: one line if it fits in 80 columns from where it starts,
+else one field per line with a trailing comma. How the author wrapped it is not consulted, so a
+literal written over several lines that fits is joined, and one that does not is split. That is
+the rule calls and arrays already follow (an array of scalar literals keeps the author's uniform
+rows, which an object has no analogue of). The SP-004 split was not a layout rule: expanding the
+shorthand pushed the literal past the width. Keeping the author's line breaks was considered and
+not taken: it would make objects the one bracketed list whose layout is the author's, and a
+written break would then survive every later edit that shortened the literal.
+
+## Runtime numbers of different types join as a union, and operators dispatch per member (owner ruling, 2026-09-30) — D3345, D3363, D3449, D3450
+
+The goal is that no annotation is ever required, and a join that silently widened `i32` into
+`f64` lost the one fact an annotation would have kept: which type the value is. The ruling has four
+parts. A literal adapts, as before (`if c { 2.5 } else { 5 }` is `f64`). Two runtime values of
+different numeric types join as their union (`i32 | f64`), in any arm order, beside a `null` arm,
+and in the direct spelling, a generic pin and a hole alike. An operator over a numeric union
+computes at each member's own type and yields the union of the results (Julia's dispatch), so
+`i64 | f64` stays exact and `is` still answers after arithmetic. A numeric union delivers into a
+single numeric type only when every member converts to it exactly.
+
+**What a "join" is here.** The arms of a value `if` or `match`, an inferred return set
+(`return` statements, a tail `if`'s arms, the implicit tail), and — since the owner's ruling of
+2026-10-03 below — a `??` and its default, and a list literal's elements. An arm counts as a literal when
+every value it yields is a number literal, an operator tree of them, `null` or an assignment, and
+one is not `null` (`valueIsLitOnly`): an arm of only `null` adapts to nothing, so `if a { x } else
+if b { y } else { null }` keeps `x` and `y` apart. A literal inside a union chain boxes at its own
+type when that type is a member (`if a { y } else if b { x } else { 4 }` boxes `4` as `i32`).
+
+**Where the rule lives.** `joinTys` takes `njApart` for one call; `joinArmLit` and `inferRetJoin`
+set it when neither side is a literal, and `numApartJoin` then keeps the numeric members apart
+instead of taking `assignable`'s widening. A join kept apart over type parameters is marked
+(`markTpJoinApart`) so its pin re-joins apart too (`rejoinMembers`), which is what closes D3345; the
+emitter's pin join (`joinPinnedArmLit`) reads the same literal flags off the arm nodes.
+
+**Dispatch is a lowering, not a desugaring.** `emitNumUnionBin` stashes each operand once in a
+lazy-frame slot keyed by nesting depth (codes 26 and 27), tests the box tag, and runs each member
+pair through the scalar opcode tables at the pair's type (`numPairOpTy`, the checker's own pair
+rule, so the two cannot disagree). A rewrite into an `if` chain would have needed a fresh binding
+for every operand that is not a place, which VL has no expression form for. A pair the scalar rule
+refuses (`i32 + f32`, `i64 + f64`) refuses the whole operator, naming the pair.
+
+**A program with no numeric union pays one global read per hook.** `numUnionMinted` is set the
+first time `mkUnionTy` mints a union of numbers outside a `std:` function body (a join, an
+annotation, a substitution, a narrowing's remainder), and every checker and emitter hook tests it
+first. std's own narrowings do not count: `toString`'s `i32 | i64 | boolean | f64` narrows to a
+numeric remainder in every program that interpolates, and std does no arithmetic over one. The
+classifier gates sit inside the `if`/operator arms that could misread a box, not ahead of the
+typed fast path, since even one global read there priced plumb's units at +0.1%.
+
+**The join is kept only where every caller reads it directly; elsewhere it stays master's widening
+(D3494, D3495).** The #3327 review found three loss families, and each needed a different
+mechanism to carry the union somewhere new:
+- a wrapper's template, through `validateEscJoins`;
+- a literal adapting beside kept-apart arms at a pin;
+- master's own mistyped `f32 | i32` for an `i64` arm, which the new operators trapped over where
+  master had refused them.
+
+Each lost programs that ran on master. So the lane holds those positions back instead of fixing
+them in a fourth round:
+- A function is `njFnReached` when it is named inside a lambda body, read as a value, names
+  itself, or is named inside a generic or hole body. Every join in it is master's, and so is its
+  instance (`njPinGated`). One exception (D3589, below): a helper that yields only its own
+  parameters, through `return` or an `if`/`else` chain with no `match`, named in a generic or
+  hole body whose own function is not `njFnReached`.
+- A return set holding a literal leaf, or a call of a held-back function, is `njFnGated`. Only
+  its return joins are master's.
+- The result of a call to a held-back function whose own inferred return is a join, and a
+  `const` bound only from such a result, is `njExprHeld`. The operators, conversions and
+  deliveries the ruling adds are refused over that expression, as master refused them. The hold
+  is on the expression, never the type: a direct join's `i32 | f64` is the same arena row, and
+  holding the row refused arithmetic on a direct union once any held call shared it (the second
+  re-review's v5).
+
+The test is per function, not per call, so a direct call of a function some generic also calls
+widens too. That is the conservative direction. On the review's 1,248-cell return-set grid every
+held cell prints or refuses as on master: eight that build invalid wasm on master still do,
+first failing at a later line. Every direct, generic and hole cell prints
+the member's own value.
+
+**A generic or hole caller reads its callee's join as a union of its own parameters (D3589).**
+`G(k, a, b)` inside `F<A, B>` returns `G`'s deferred join of `F`'s `A` and `B`, which no call site
+of `F` has pinned yet. It used to collapse to one arm, noted as an escaped join, and every pin
+where the join stayed apart refused it; before that, the gate above held `G` to master's widening,
+so `F(1, 2.5, 3)` read the `i32` as an `f64`. When the callee's arms joined apart, or its return is
+annotated, and every member is the caller's own parameter, the call is typed as a kept-apart
+union of them (`keptParamUnion`), the one an annotated `A | B` return would give, and each pin of
+`F` re-joins it without widening. That is what lets the gate stop holding such a callee: the
+caller's pins read the union the callee builds. The exception is syntactic and narrow on
+purpose: the #3367 review's 18,900-cell wrapper grid lost 274 right cells when every callee a
+generic or hole body names was released, through a `match`-bodied helper and through a wrapper
+that binds the call before returning it, neither of which this union carries. Those, recursive
+and value-read wrappers (D3494), and a join with a `null` arm (D3591) keep master's widening.
+
+**`??` and list literals join the same way (owner ruling, 2026-10-03, A; D3451).** `q ?? b` is
+the `if q != null { q } else { b }` it spells, and `[a, b]` holds what `[if c { a } else { b }]`
+holds, so rewriting one spelling as the other must not change what a program prints.
+- A runtime default of another number type joins apart (`coalJoinApart`): `q ?? b` over
+  `i32 | null` and `f64` is `i32 | f64`. A literal default still adapts (`q ?? 2.5` is `f64`).
+- A list literal joins its runtime elements apart and then lets each literal element adapt to
+  that join (`listJoinApart`), so element order does not decide the type: `[a, b, 4]` over `i32`
+  and `f64` is `(i32 | f64)[]` with `4` an `i32`, `[a, 2.5]` over `i32` is `f64[]`, and `[1, 2.5]`
+  is `f64[]`. This is the `match` with its runtime arms first; an `if`/`match` chain that puts
+  the literal first types its inner pair before the runtime arm arrives.
+- An annotated destination converts as for any numeric union: `const xs: f64[] = [a, b]` builds
+  an `f64[]`, and a member that does not convert exactly is refused.
+- Four positions keep master's widening, each because joining apart there reaches a defect the
+  lane did not fix: a `??` whose left operand is a field, an index or a method call's result
+  (`coalLhsParts`: the emitter's `??` lowerings read those at the operand's own rep), a `??` in a
+  generic or hole body (its instance lowers the result at the left operand's rep, D2562, D3580),
+  a list literal with a literal element in a generic or hole body (the pin's re-join cannot tell
+  the literal's member from a runtime one, D3534), and a list with a nullable runtime element
+  outside such a body (a generic `==` over the resulting `T | U | null` traps or does not lower,
+  D3535).
+- Where a literal sits beside a runtime number, `??` adapts it by its value and the `if` by its
+  type (`q ?? 5` over `f32 | null` is `f32`, the `if` is `f32 | i32`). That divergence is older
+  than this ruling and is the owner's question in D3536.
+
+Measured on the NJ2 twin grid (7,484 programs: every `??`, list literal and `??` chain beside its
+`if`/`match` twin, over `i32`/`i64`/`f32`/`f64`, their nullables, two-member unions and three
+literals, at 17 positions): master's 1,535 twin disagreements fall to 390, every one of them
+either master's own (341 cells unchanged on both spellings) or a literal tail in a chain (49,
+D3536); 0 new invalid wasm or traps, and 344 master invalid-wasm cells run. The #3353 review's
+left-operand shape grid (192: local, field, index, `.get()`, call, `?.`) loses no run, and its
+1,280-cell grid loses 16, each a `[a(), b()] == [a(), b()]` whose `==` over a list of a number
+union has no lowering (its `if`-spelled twin refuses the same way on master). Runs lost on the
+twin grid are 5, each the ruling's own type: a `+` over `i32 | f64 | f32`, two `indexOf` over
+`(i32 | f32 | f64)[]`, two `is i32` over a list `5` adapts into as `i64` or `f64`. The `if`
+spelling's outputs did not move in any cell.
+
+**`as T` over an all-numeric union converts when no member can fail** (a float target, or `i64`
+over integer members), because that is what the ruling's fix message (`write x as f64`) needs
+`as f64` over `i64 | f64` to do. Where some member's conversion can fail (`(i32 | f64) as? i32`) it
+stays the member cast it is over any union, so no running program changes meaning.
+
+Measured on the numeric-join grid (four member types in every ordered pair, with and without a
+`null` arm in three positions, at nine positions, each cell printing every operator's result
+against a Python oracle): 432 of 432 cells correct, 40 of 40 lossy deliveries refused. Before the
+lane, a probe build counted the joins whose type would change: none in plumb, none in the
+distilled corpus's if/match/return joins, one in `tests/cases` (`numerics/f32-f64-join-widens.vl`,
+whose values did not change; its `redundant annotation` hints went, since the functions now infer
+a union).
+
+## `--source-map` is its own flag, and the map is a side channel (2026-10-03) — D3561, sunpa SP-010
+
+A `--names` trap frame reads `pick@2`. The name section is per function, so `@2` is the
+DECLARATION's line, and in a 300-line function that leaves the author bisecting by hand. The
+`vl-src` rows have the per-statement answer, but only for the emitter's bytes, so `-O`/`-O3`
+strip them. A JS host never reads them in any build.
+
+**`vl build --source-map` writes `<out>.map`, a source map v3 in the wasm convention.** It has
+one generated line, and each segment's column is a MODULE byte offset: the offset V8, Node and
+Deno print after `wasm-function[i]:`, and the one the `vl-src` rows already use. The rows nest,
+so they are flattened, and the narrowest row wins. Each `wasm-opt` run (the escape step and the
+rung) takes the map as `--input-source-map` and writes it back as `--output-source-map`.
+binaryen keeps an expression's location through its rewrites, and an inlined callee keeps the
+CALLEE's line. A `sourceMappingURL` section names the map, for DevTools. `vl addr2line
+<module> <location>` reads the map back offline. It falls back to the `vl-src` section of an
+unoptimized `--names` build. Given `-`, it annotates a pasted stack trace frame by frame.
+
+**Why a flag of its own, rather than riding `--names`.** The map is a second FILE beside the
+module, and `--names` has only ever changed the module itself. A build that asked for names
+has not asked for an extra artifact, and `-o -` has nowhere to put one (`--source-map -o -`
+is refused, as `--wat` is). The flag still asks the seed for the `--names` sections, since the
+map is made from `vl-src`, and then drops whichever ones the build did not ask for. Both are
+appended after the code, so dropping them moves no byte the map names.
+
+**Price, measured on a 2 MB plumb-shaped unit (`gen-plumb-shape.vl`, under load).** binaryen's
+code is BYTE-IDENTICAL with and without the map at every rung: the module grows by the
+30-byte section and nothing else (`tests/vl_addr2line_test.ts` pins this). The map is 396 KB
+at the plain build, 541 KB at `-O` and 536 KB at `-O3`. CPU: the plain build is unchanged
+(2.87 vs 2.89 s); `-O` reads 10.5 → 11.5 s and 12.6 → 12.3 s (noise to +9%); `-O3` reads
+15.4 → 18.4 s and 15.2 → 18.0 s (+18%), because binaryen tracks a location per expression.
+Peak RSS rises by about 6 MB. A build without the flag is byte-identical to master's: 51
+sources (`bench/` and three probes) × five flag sets, `cmp`-equal, and the seed's fixpoint is
+unchanged.
+
+**What a line means after `-O`.** It is the line of the expression binaryen kept for the
+trapping instruction. When binaryen folds a check into a later use, the trap is reported
+there. The #3351 review saw this at `-O`: an `as!` null trap was attributed to the line that
+dereferences the value, not the line of the `as!`. An offset in no function body (a custom section, past the end, a
+stale module) has no answer: the map's last segment would otherwise claim it. An unnamed
+function gets no `wasm-function[i]` label, because V8 13.6 (Node 24) counts imported
+functions in that index and V8 15 (Deno 2.9) does not.
+
+**Not done.** `vl run <module.wasm>` still reads only `vl-src`, so an optimized module run
+there prints names and no lines. `vl addr2line` gives that line. No DWARF is emitted: DevTools
+reads a source map natively and DWARF needs an extension, so a map is the smaller step.
+
+## A list built by pushes of a known count is reserved, and the pushes keep their count test (2026-10-04) — D3623, sunpa SP-036
+
+**When `const o: T[] = []` (or `let`) is followed, before any other use of `o`, by pushes that
+are unconditional statements in constant-trip range loops, with no `break`, `continue` or
+`return` in that region, `o`'s backing is allocated at the product of the trip counts.** The
+region's pushes store through a local copy of the backing at a local count, and `len` is written
+back once, after the region's last statement. A count of zero, a non-constant bound, a push
+under an `if`, or any other mention of `o` ends the region where it stands; whatever is counted
+before it is still reserved.
+
+**Every region push still tests its count against the reserve.** Past it, the push writes the
+count to `len` and takes the ordinary growing append. The analysis is exact by construction,
+so this branch never runs, and it costs about 15% on SP-036's product (a hand-edited build
+without it reads 119–123 ms against 132–137 ms). It stays because the reserve is an
+optimisation whose input is an AST walk, and a walk that is wrong one day should cost a
+growth, not a wrong list: a seed that reserves HALF the count passes the 660-cell grid in D3623
+unchanged. Moving the growing append to an out-of-line helper measured about 7% and is not
+built.
+
+**Two neighbours had to learn about a region push, and they were worth more than the reserve
+itself.** A push is a `Call`, and both the list-header hoist (`hoistSafeExpr`) and the unroller
+(`unrollCost`) refuse a call. A region push moves only its own fresh list, which nothing else
+holds and which the region never indexes, so the hoist may keep other lists' headers in locals
+across it; and it is inline code, so it may unroll, weighing `UNROLL_PUSH_NODES` (16) extra
+nodes for its growing append. Measured on SP-036 (ms, medians): master 168, reserve only 158,
++ locals 150, + hoist 141, + unroll 137; `filled` + index 115.
+
+## Prefix operators bind tighter than `as` (owner ruling A, 2026-10-04) — D3629
+
+**Every prefix operator — `-`, `!`, `~`, `++`, `--` — binds tighter than `as` / `as?` / `as!` /
+`as%`, as in Rust, and `as` stays tighter than every binary operator.** `-x as T` is `(-x) as
+T`, and `-x as T + y` is `((-x) as T) + y`. Before this, the parser read `-x as T` as `-(x as
+T)`, while the guide already said unary operators bound tighter; the guide was the intended
+rule and the parser was brought to it.
+
+**Why Rust's order.** The cast then sees the value the source spells. `-1 as u8` is the constant
+-1, which no byte holds, so it is a check error under the constant rule (§"Exact constant
+arithmetic"); `-2147483648 as i32` is `i32`'s minimum rather than a refusal of 2147483648; and
+`-0.5 as i32` names -0.5. The other order made `-1 as u8` a negated byte, -1 as an `i32`, which
+is not a `u8` at all. The cost is at one edge: with `m: i32` holding INT_MIN, `-m as i64` is now
+-2147483648 (the `i32` negation wraps first) where it was 2147483648. That is the reading a
+Rust or C programmer expects, and `-(m as i64)` spells the other one.
+
+**`!` and `~` follow `-`.** Under the old grouping `!x as i32` was `!(x as i32)`, a type error
+for every operand, and `~x as f64` was `~(x as f64)`, which compiled to invalid wasm; both now
+mean what they say.
+
+**A type guard is not part of the rule.** `!x is T` stays `!(x is T)`, the narrowing idiom, and
+`x as T is U` stays `(x as T) is U`. The guard binds to a prefixed operand's own postfix
+expression, and to a whole cast chain.
+
+**Census before landing.** Twelve `-<literal> as T` uses in `tests/`, none in `compiler/`,
+`std/` or `scripts/`, and two in consumers (plumb `~255 as% i64`, sunpa `-2.45 as f32`); each
+means the same value under both groupings. `vl fmt` output is byte-identical under both parsers
+over all 15,413 `.vl` files in the tree; the printer had always emitted `-x as T` bare.
+
+## An integral operand's cast tests only the range (2026-10-09) — sunpa SP-056
+
+**The rule.** When the operand of a numeric cast to an integer is `floor`, `ceil`, `trunc` or
+`nearest` of an f64 or f32 — written directly, or as a `const` that one of them initialises —
+the emitter drops the integrality compare (`trunc(d) == d`) and keeps the range test, in all three
+modes. The value is integral by construction, and NaN and ±Inf still fail the range test. An `as!`
+on such an operand still prints `as! i32 at <line>:<col>: not exact`; at an i32 or i64 domain it
+then traps at the conversion itself, whose range is exactly the test's, so the host's note names
+the range or NaN, as it did for master's direct spelling. At `u8` it traps at `unreachable`.
+Neither a `let` nor a chain of `const`s is followed (a name in the initialiser would resolve at
+the cast's scope), and a binding, global or function named `floor` declines.
+
+**What it replaced.** For the direct spelling only, a peephole skipped the whole test and relied
+on `i32.trunc_f64_s` trapping out of range. It had two faults. Its shadowing test was weaker than
+the call's: with `const floor = (x: f64): f64 => x + 0.5`, `floor(1.0) as! i32` printed `1`
+instead of trapping (`as-cast-integral-operand-trap-shadowed.vl` fails on master). And it was the
+slower code: on V8, a bare `i32.trunc_f64_s` after `f64.floor` costs more than the same conversion
+behind an explicit range test.
+
+**Measured** (Deno 2.9.6 / V8 15.0, `-O3`; sunpa's `vnoise` kernel, 5M points × 4; median of
+medians of 5–9 interleaved rounds of `run.ts`'s 7, load 15–30):
+
+| `vnoise` lowering | ms | vs Rust |
+| --- | --- | --- |
+| master: integral + range test, message, then trunc | 272–308 | 1.07–1.15x |
+| bare `i32.trunc_f64_s` (the peephole, applied to the `const`) | 298–318 | 1.15–1.2x |
+| bare `i32.trunc_sat_f64_s` | 320 | 1.2x |
+| **range test, then `i32.trunc_f64_s`** | **242–250** | **0.96–0.98x** |
+
+**Every `as!` reason is one call.** The reason used to be streamed a character at a time at
+each site, about 150 bytes a site, so keeping it on every new integral site cost sunpa's game
++2.4%. It is now printed by one `__as_fail__(line, col << 3 | domain row)` helper, reserved when
+the module has an `as!` with a sad path, so a site pays two constants and a call; binaryen
+specialises the helper on a constant argument. The helper prints the place in decimal at run
+time, so its body is the same for every site.
+
+| sunpa's game, `-O3`, no names | bytes |
+| --- | --- |
+| master | 2,718,883 |
+| the range-only rule, reason kept per character | 2,784,528 (+2.4%) |
+| the range-only rule, no reason on an integral site | 2,728,643 (+0.36%) |
+| **the range-only rule, every reason through `__as_fail__`** | **2,723,550 (+0.17%)** |
+
+On 100 sites in one function, `-O3`: fractional `(x + k) as! i32` 11,114 → 6,435 bytes, and
+`floor(…) as! u8` 10,814 → 5,831. `floor(…) as! i32` is 1,094 → 5,735, because master's sites
+carried neither the range test nor a reason. A module with one or two sites pays the helper's
+body: `bench/arrays/binsearch` `-O3` 648 → 757.
+
+**Rejected: inlining `signed` at `-O3`.** SP-056 also asked why the 10-op leaf `signed` stays a
+call. `-O3` inlines through binaryen's "lightweight" rule (no call, no loop, size ≤ 20), and
+`signed` with `hash` inlined into it measures 29–30, so it stays a call; `-O3` also does not carry
+`-O`'s `--always-inline-max-function-size 16`. Raising the flexible size to 40 inlines it, and on
+V8 the kernel is 4–6% SLOWER (259.8 against 243.7 ms), with or without V8's own wasm inliner;
+the game grows 3.2%. The call is not where the gap was.
+
+## A list index's guard is a branch to the trap, not a `select` (2026-10-09) — sunpa SP-056
+
+**The rule.** A list read or write tests `i u< len` and, when it fails, branches to an out-of-line
+read at index -1 of the backing, so the trap is still the engine's own `out of bounds array
+access`. A record list's backing traps by a one-element `array.copy` to index `array.len` instead,
+which `-O`'s flattening rewrites as it does a list's growth, where a read it would box. A copy to
+-1 also trapped, but flattened to dest -4 with length 4, whose end is exactly 2^32: out of range
+only for an engine that checks the sum without wrapping. At `len` it is out of range by construction. The guard used to be
+`array.get backing (select -1 i (i u< len))`: the same compare, but on the index's data path.
+A list whose backing this module never typed keeps the `select`.
+
+**Measured** (Deno 2.9.6 / V8 15.0, `-O3`; sunpa's `run.ts track 100000`, medians of 7, load 3–9;
+sums identical):
+
+| | track VL | track Rust | VL / Rust |
+| --- | --- | --- | --- |
+| master | 162.9–165.9 ms | 121.5–126.3 ms | 1.29–1.37x |
+| **the branch guard** | **127.9–133.1 ms** | 122.1–124.4 ms | **1.03–1.09x** |
+
+`bench/arrays/fill-sum` −22% and `binsearch` −7% on V8 (start function, medians of 5); wasmtime
+is flat to slightly faster. `noise` (no list reads) is unchanged.
+
+**The price is bytes.** Each guarded access carries the `if` and its trap: sunpa's game
+(`-O3`, no names) 2,736,128 → 2,898,196 (+5.9%); the seed 4,453,444 → 4,773,370 (+7.2%), its
+baseline rewritten here. Part of it is binaryen no longer merging repeated checks of one index,
+since a branch to a trap is not a pure `select` it can fold, so `-O` keeps more guards. The L2
+self-compile's guest fuel against master is −1.7% (59.64 G → 58.61 G). The release-shape rows
+moved in bytes only.
+
+**Rejected: versioning the loop.** SP-056's design was a range loop cloned behind one pre-entry
+check, the clone's candidate indices unguarded. Built and measured, interleaved at low load:
+versioning alone 1.027x master (slower), versioning with the branch guard 0.855x, the branch
+guard alone 0.776x. The hot reads that matter in `sample` are not in counted runs — the
+`while` scans of `k.times[i]`, the span reads, the norm — and the clones cost code the engine
+then has to compile and predict.
+
+**Rejected: `unreachable` in the untaken branch.** Measured equal on speed (0.773x) at +1.5% on
+the game instead of +6.0%, but the trap becomes `unreachable` with the note "a compiler-emitted
+trap" rather than the bounds trap the guide and `std:bytes` promise. Keeping the message was
+chosen; the smaller form is one line if that trade is wanted.
+
+## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
+
+**VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and
+`i64`, and the type picks the unsigned operation: `/`, `%`, comparison, `>>` and widening
+read the bits as unsigned. This amends §"Types & semantics", *"Unsigned integer ops are
+operations, not a `u32` type"*: `divU`, `ltU` and `>>>` stay, for `i32` and `i64` operands.
+Three consumers had built unsigned arithmetic by hand, and the type removes that class of
+bug. Design and options: `docs/internals/unsigned-types-design.md`.
+
+**Implicit conversions are only the lossless ones (U2 = A, 2026-10-03).** The lattice gains
+`u32 → i64`, `u32 → u64` and `u32 → f64`. Every other conversion is written `as` (exact or
+fail) or `as%` (wrap).
+
+**A radix literal with no context stays signed (U3 = A, 2026-10-03).** `print(0xDEADBEEF)`
+prints -559038737, as it does today. A literal is `u32` or `u64` only where its use names
+that type, so no existing program's output changes.
+
+**Mixed signed and unsigned operands are a check error (U4 = A, 2026-10-04).** `u + i` is
+refused, and the message says to write `i as u32` or `u as i32`. A literal operand adapts,
+and a shift count may be any integer. This is the rule of Rust, Go and Zig, and it follows
+from U2: `i32 ↔ u32` has no lossless edge.
+
+Questions U5–U14 of the design doc are not yet ruled. Nothing here is built.
+
+
+## A positional argument lands at its written index (Q8, committee on owner delegation, 2026-10-11)
+
+**The rule.** A positional argument may follow named ones only when every named argument
+before it sits in its own parameter position. Naming a parameter that a positional argument
+already filled is refused ("given twice"). In a method call `x.f(…)` the receiver is
+position 0. The principle: a positional argument always lands at its written index. This is
+Kotlin's rule since 1.4.
+
+```vl
+function box(w: i32, h: i32): i32 { w * 10 + h }
+box(w: 3, 2)   // ok: `w` is in position 0, so 2 lands at position 1 — 32
+box(h: 3, 2)   // refused: `h` is not in its own position
+box(3, w: 2)   // refused: `w` is given twice
+box(3, h: 2)   // ok — 32
+```
+
+**Before.** Named arguments bound first, and positional ones then filled the parameters
+still unbound in declaration order, wherever they stood. `box(h: 3, 2)` and `box(3, w: 2)`
+both printed 23: the positional argument moved to a later parameter without a word.
+
+**Why not Python's rule (positional first, always).** It would break 11 calls in diderven,
+`src/craft/recipes.vl`, of the shape `gear("Copper Sword", SN_ANVIL, base: 100, [...])`,
+where the label documents an argument that is already in its own position. This rule keeps
+those and checks the label. No consumer or corpus call relies on the old skip rule.
+
+The committee voted 2–1 for this option, amended from the open question's (b)
+(`docs/spec/OPEN-QUESTIONS.md` Q8). The checker does not enforce it yet (D4061).
+
+## `is` tests whether the value fits the type (owner ruling (A), 2026-10-10) — D3885
+
+**The rule.** `v is B` asks whether the value `v` holds fits `B` structurally, not which type
+`v` was declared at or built as. With `A = { x: i32 }` and `B = { x: 1 | 2 }`, a value
+`const a: A = { x: 1 }` gives `a is B` true, and `{ x: 7 }` gives false. Values carry no
+runtime declared-type tag.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+function f(v: A | B): string { if v is B { return "B" } "A" }
+const a: A = { x: 1 }
+print(f(a))   // B
+```
+
+**Why.** VL's records are structural (D3870, option C: same-shape records are one type). An
+`is` that answered by declared type would need a hidden tag on every record and would
+contradict that ruling.
+
+**What it adds.** A HINT, not an error, where one arm contains another: `` `B` is contained
+in `A`, so `is B` tests the value `` (code `contained-arm-is-test`). Disjoint literal sets are
+a real discriminant and get no hint. The string-against-integer-literal check reject keeps
+its behaviour. Where the operand's declared type is a single record containing `B`, the
+compiler still answers by the declared type (D4058).
+
+## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
+
+**The rule.** A union of records whose arms share a field name is legal, whether or not a
+field is literal-typed in both. `u is A` answers whether the value structurally fits `A`,
+field by field. A tag may serve as a fast path only where it gives the same answer as the
+structural test.
+
+```vl
+type A = { v: i32 }
+type B = { v: boolean }
+function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+print(f({ v: true }))   // prints 2
+```
+
+**Why.** The owner: "'is' is not a nominal check; the language is structural", and "We can
+do a nominal check for perf reasons, but fundamentally the language is meant to be
+structural." This is the same principle as D3885 and D3870, applied to the union's formation
+rule. The 2026-09-02 refusal it replaces is retired.
+
+**Before.** The union was refused when formed, whichever way the `is` went. The checker does
+not admit it yet (D4056).
+
+## `x == L` narrows a literal union as `x is L` does (Q10 (a), owner ruling, 2026-10-12) — D4059
+
+**The rule.** For a literal union `K`, `x == L` narrows exactly as `x is L` does: in the
+then-branch, in the else-branch, after an exiting guard, and with `!=` reversed.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } 3 }
+```
+
+**Why.** The guide already said it, and `x is L` reads as `x == L` with narrowing. One
+spelling that narrows and one that does not was a trap. The checker does not do it yet
+(D4059).
+
+## A declaration shadows an ambient name of the same name (Q11 (b), owner ruling, 2026-10-12) — D4066
+
+**The rule.** A declaration named like an ambient name (a built-in type, `print`, `Map`,
+`Set`, a float or integer intrinsic) shadows it in its scope, for both the call and its
+type. Compiler intrinsics (`__name__`) stay refused.
+
+```vl
+function print(s: string): i32 { 7 }
+print("x")   // calls the program's own `print`, typed by its own signature
+```
+
+**Why.** A call and its type must agree about which name they mean; today a declared
+`print` is called but typed by the ambient one. Shadowing is how every other scope works.
+Built by D4066: the merge renames such a binding, so no spelling-matched site sees it.
+
+## A re-export binds its name locally (owner rulings R1–R3, 2026-10-04) — sunpa SP-014, SP-020
+
+**R1 (A).** `export { X } from "m"` publishes `X` and also binds `X` in the re-exporting
+module, as an import would. This is what shipped (#1196) and what `std:fs` relies on: it
+uses `Buf` in its signatures through `export { Buf } from "std:buffer"` alone. JS and TS
+bind nothing locally here; VL does, so one line both uses and publishes a name.
+
+**R2 (A).** An `import` of a name the same module also re-exports from the same specifier
+is redundant, and gets the duplicate-import WARNING with a `--fix` that removes the
+import. std's eight instances (`std:args` 1, `std:env` 4, `std:process` 3) are cleaned up
+in the change that lands the warning (D4064).
+
+**R3 (A).** `export { x }` without `from` stays refused when `x` is an import. There is one
+spelling for passing an import on, `export { x } from "m"`, and the refusal names it.
+
+The questions and options are `docs/internals/modules-design.md` §2.1.1.
+
+## No prelude: every library name is imported (owner ruling O7, 2026-10-07)
+
+**The rule.** No default prelude and no configurable one. Every library name, `std:str`'s
+and `std:array`'s included, is imported explicitly. The ambient names a module sees with
+no import are the intrinsic floor, not a prelude. This supersedes the configurable-prelude
+amendment in `docs/internals/modules-design.md` §2 (`builtin-methods-to-std.md` §O7).
+
+The owner's words were "stay explicit". The reasoning and the reopen condition below are
+not the owner's. They come from the five-reviewer debate memo the ruling was decided after
+(5–0 for explicit imports), and are recorded as that memo's argument.
+
+**The memo's argument.** `std:str` and `std:array` collide on several names (`lastIndexOf`,
+and under A′ `includes`, `indexOf`, `slice`, `get`), so a prelude would need type-directed
+dispatch or a new shadowable scope tier. Tooling carries the typing cost instead: `vl check
+--fix` adds the import, choosing the module by the receiver's type. The memo would reopen
+the question only if receiver overloading (O1) and a shadowable prelude tier both exist and
+the default set is versioned, or if agents keep retrying imports after the receiver-typed
+`--fix`.
+
+## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
+
+**The rule.** An exported record binding without an annotation takes the field types its
+importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
+an importer to `take(w: { x: i64, y: i64 })` widens `pt`'s layout in that program. Nothing
+refuses it, and no `--fix` adds an annotation.
+
+**Why.** In the owner's words: "don't want an auto fix. vl design principles is minimal
+annotations. I rather we have more complex incremental build machinery." An incremental
+build therefore keys a module on the layout demands its importers make
+(`docs/internals/incremental-compilation-design.md` §"Owner questions", Q1).
+
+## The module system's eight decided directions (owner review, 2026-06-06) — modules-design §5
+
+`docs/internals/modules-design.md` §5 lists eight directions the owner reviewed, folded in by
+commit `e295c6986` ("docs(modules): fold in owner review — std: scheme, no prelude,
+fine-grained modules, live-ref/readonly(A9) exports, `as` aliasing, no extension,
+visibility", 2026-06-06). The section says the formal record would land here at
+implementation; this is that record. Each direction in its own words:
+
+1. "Std specifier = the `std:` scheme (colon), not `std/`."
+2. "No implicit library prelude." (Restated and extended by O7, the section above.)
+3. "Fine-grained std modules." One module per concern, flat.
+4. "Export semantics = live references; readonly is A9." "Exported bindings are live
+   references"; "the imported name is read-only (no reassigning another module's `let`)".
+5. "Rename in v1; re-export deferred." `import { x as y }` is in; re-export has since landed
+   (the R1–R3 section above).
+6. "Omit the `.vl` extension in specifiers." "No index/directory guessing."
+7. "LSP cross-file / std navigation = Phase 3, perf-bounded." Tooling, not a module rule.
+8. "Visibility: v1 binary." "v1 = top-level `export` or private."
+
+Items 2 and 8 also carry open sub-questions in §5 (a shadowable convenience name;
+graduated visibility levels). They stay open. `docs/spec/modules.md` cites directions 4
+and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.

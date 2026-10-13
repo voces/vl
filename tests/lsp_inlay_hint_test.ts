@@ -7,6 +7,7 @@
 //   deno test -A --no-check tests/lsp_inlay_hint_test.ts
 // (also included in `deno task test`).
 
+import { filePath } from "./support/filePath.ts";
 import { inlayHintsFromWasm } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
@@ -23,7 +24,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 // `inlayHintsFromWasm` applies the same source-scan annotation/range filters as
 // the TS path. Seed-gated; self-ignores when the seed is absent.
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -108,4 +109,20 @@ export const TAU: f64 = 6.28318
     [{ line: 3, char: 5, label: ": i32" }],
     "only the entry module's hint survives",
   );
+});
+
+// A function whose every call is a statement lowers as `void` (D2631), which is an optimisation
+// the editor must not show: hover and the return inlay keep the type the body infers, so a read
+// added later is not a type error the hint itself put there.
+Deno.test({
+  name: "wasm-inlay: a function called only as a statement shows its inferred return, not void",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const candidates = await checker.inlayHintsAt(src, "/tmp/x.vl", noSiblings);
+  const hints = inlayHintsFromWasm(candidates, undefined, src);
+  assertEquals(hints.map((h) => h.label), [": string"], "statement-only function's return inlay");
+  const hover = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
+  assertEquals(hover, "(n: string) => string", "statement-only function's hover");
 });

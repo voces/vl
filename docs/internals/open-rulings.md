@@ -537,13 +537,34 @@ declaration line the name section carries cannot spell one file two ways — the
 program: the entry is its own bare file name and the import is `lib.vl`, with no directory
 prefix from either the cwd or the entry's own path.
 
-### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
+### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — RULED 2026-09-26
+
+**Ruling (owner, 2026-09-26, Q5 (a)):** lift the refusal. An `i32`- or `i64`-keyed `Map`/`Set`
+(and `{[i32]: V}`, `{[i64]: V}`) is a union member at every position, the same as the
+string-keyed twin. D2519 closes.
+
+**Built as a tag per map STRUCT, not a struct column.** Measuring the box showed the question
+below was narrower than it reads: a map arm's tag was already keyed on its interned value slot,
+and a slot carries its key rep, so every typed-value map (`{[i32]: string}`, `{[i64]: Rec}`)
+already had its own tag and struct. Only the three MONO structs (an i32-cell value: `i32`,
+`boolean`, a literal union, a `Set`) shared one tag, `mapSlotTag(-1)`, and the narrowed unbox
+fell to the string-keyed mono struct for all three. The i32- and i64-keyed mono maps now tag at
+value-atom codes 15 and 16, above the band `uAtomBandTop` lifts only in a module whose collect
+pass saw such an arm (`mIntMonoArmUsed`), the pattern #3187 used for the vector's code 14; the
+unbox and `is` resolve a mono arm to its key's struct. Cost: a program with no integer-keyed
+mono map arm is byte-identical (270 of 270 fixture programs, including every one spelling a map
+in a union), and the seed grew 0.06%. Option (b) below changes the box's own type, so every
+module that builds a union would move. Two maps that share one struct, `{[K]: i32} |
+{[K]: boolean}`, shared a tag at first (D2493); they now take a tag per member TYPE from a
+band sized at collect the same way, so `is`, a `match` arm and `as` tell them apart at every key
+rep and inside a generic instance. A `Set<K>` beside such a map is still refused (D2673): the
+union spells the set as the boolean map, so the two are one atom before any tag is chosen.
 
 `const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not
 inside '{[i32]:i32}|i32'`, and it is the ONE container position left after B6a opened the other
 three (a nested array element, an array of map-returning closures, a map value). The refusal was
 argued from the rep and is now MEASURED: opening the arm made
-`tests/cases/maps/error-i32-keyed-position-union-member.vl` — an `is {[i32]: i32}` narrowed read
+`tests/cases/maps/i32-keyed-position-union-member.vl` (then an error fixture) — an `is {[i32]: i32}` narrowed read
 through the box — `vl check` rc 0 and then invalid wasm, `type mismatch: expected (ref null
 $type), found (ref $type)`. So the position is a clause-1 miscompile away from legal, not a peel
 away.
@@ -675,7 +696,15 @@ on top of the dynamic-step work — but it must REQUIRE the step, because the in
 default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
 the trap: it looks like the i32 loop and its count is not a property of the source.
 
-### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — raised 2026-09-06
+### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — RULED 2026-10-12
+
+**Ruling (owner, 2026-10-12, spec Q3): (a) for now, (c) as the later target.** A null-only
+list literal with no destination that names its element type is a check error: "a list of only
+`null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`". Every typed
+destination (annotated binding, typed parameter, annotated return, record field, nested
+`[[null]]` under one) is unaffected, as is `[null, 42]`. Built; D1832 closed as a check reject.
+(c), inferring the element from the first non-null use, is on ROADMAP.md and not built.
+
 
 `const e = [null]` infers **`null[]`** — pinned by forcing it into a diagnostic, which reads
 `cannot assign null[] to 'bad' of type i32` — and every use of one refuses at the LITERAL with
@@ -805,7 +834,13 @@ Today no `...` token exists, no function is variadic, and `push` takes exactly o
 
 Today `Stop{}` is legal and means exactly `Stop` (a variant arm binding nothing), while the same shape NESTED (`Wrap{p: {}}`) is refused as binding nothing. **Options.** (a) refuse `Stop{}` with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"), one spelling per meaning and nothing for `vl fmt` to choose between; (b) allow both levels (Rust allows `Stop {}`), and lift the nested refusal for consistency. **Recommendation: (a).**
 
-### dead-null-test — is a null test on a provably non-null value an ERROR or a LINT? — ASKED 2026-09-07
+### dead-null-test — is a null test on a provably non-null value an ERROR or a LINT? — RULED (a) 2026-09-26
+
+**Ruling (owner, 2026-09-26):** (a), following TypeScript's split. A null test (`==`/`!=`
+`null`) on a value proved non-null is a WARNING and folds to its constant; an impossible
+`match` arm, `is` member or literal comparison stays an ERROR (D2198 stands). BUILT in #3184,
+which also closes [D1848](inventory/D1848.md); DECISIONS.md, the D2390 section.
+
 
 Raised by [D1848](inventory/D1848.md), whose build is measured and reverted rather than shipped. The assignment narrowing has no PATH arm: `o.v = 5` over a nullable field does not strip `null`, while `x = 5` over a nullable binding does. The path arm is a dozen lines and every probe row lands — but it costs **three shipped fixtures**, all one shape: write a non-null value into a nullable place, bind the read, then null-test the binding (`s.f = "bb"; const t4 = s.f; if t4 != null { … }` becomes `cannot compare string with null`). **The refusal is consistent, which is what makes it a ruling rather than a bug**: master already refuses the bare-name spelling of that exact shape, because `isAsgNarrowedName` exempts the narrowed NAME itself and not a binding read out of it. **Options.** (a) a null test on a value the checker proved non-null is a LINT, as a dead `??` default already is through `recordDeadCoalesce` — D1848 then closes free, the bare-name asymmetry closes with it, and the three fixtures keep running; (b) it stays an ERROR — D1848's close is those three fixtures' price, and the question becomes whether the design owes those programs; (c) D1848 closes as DESIGN and the path keeps no assignment narrowing at all, which leaves `o.v = 5; o.v + 1` refusing for a reason no sentence states. **Recommendation: (a)** — the value is proved, not asserted, so the test is dead code rather than a type error, and every other dead-code finding in the checker is a lint.
 
@@ -1006,7 +1041,20 @@ parameter values") is contradicted by `function ld(self: {v: i32}, k: i32 = 5)` 
 `tests/cases/objects/ufcs-shadowed-callee-no-default-fill.vl`. Both should be re-measured
 against the tree and closed or re-worded before they are put to the owner.
 
-### fmt-fixed-precision — how does a VL program render a float to N decimal places? — raised 2026-09-07
+### fmt-fixed-precision — RULED 2026-10-03: (a), `toFixed(self: f64, digits: i32): string` in `std:fmt`
+
+**Ruling (owner, 2026-10-03, (a); sunpa SP-015, D3565).** `toFixed` is the export, with JS
+`Number.prototype.toFixed`'s contract string for string: it rounds the EXACT binary value half
+away from zero (`1.005.toFixed(2)` is `"1.00"`), renders non-finite values and |x| >= 1e21 as
+`toString` does, signs a negative value that rounds to zero (`"-0.00"`) but not `-0`, and is
+locale-free machine text — always `.`, never grouped. Locale-aware display formatting is a
+separate, later `std:intl`. `digits` outside 0..=100 TRAPS (JS throws `RangeError`): a count
+outside the range is a caller bug, the error model's channel for a bug is a trap, and a clamp
+would hand back a string the caller did not ask for. The rationale and the 21M-call agreement
+sweep against V8 are `std-notes.md` §`std:fmt`; `scripts/seed-size.vl`'s `pctStr` now calls it.
+The filing below is kept as it was raised.
+
+#### As raised, 2026-09-07 — how does a VL program render a float to N decimal places?
 
 **It cannot.** `std:fmt` exports `toString(self: i32 | i64 | boolean | f64)` and nothing else
 that renders a number, and `toString` is full precision: `toString(100.0 / 3.0)` prints
@@ -1367,6 +1415,46 @@ the interaction with early `return`, `break` out of a loop, a trap (which ends t
 so no cleanup can run), and closures that capture the resource. (a) and (b) are both
 additive syntax.
 
+### boolean-into-i32 — should a `boolean` value keep flowing into an `i32` slot as `1`/`0`? — raised 2026-09-29 — **RULED (c), 2026-09-29**
+
+**Ruled (c) by the owner on 2026-09-29, and landed:** the A7 coercion is retired at every
+position, and `as` converts a `boolean` to every numeric target (`i32`, `u8`, `i64`, `f32`,
+`f64`) as 1 or 0, exactly, so no `as` mode can fail. The refusal names the conversion. The
+rationale, the choice of targets and the measured price (194 corpus cells on the landing's
+master) are DECISIONS.md §"A `boolean` is never a number; `as` converts it"; D3218 and D2628
+are closed by it. The question as it was put:
+
+**A language ruling, not a defect.** D3218 was filed as a soundness hole: `const aa: boolean =
+true` then `f(aa)` into `f(x: i32)` checks clean and prints `2`. That is the A7 coercion
+(`2ac5805a2`, #152): a `boolean`-typed VALUE is accepted wherever the destination is exactly
+`i32` (binding, argument, return, field, element, push, store), as `1`/`0`, and a bare
+`true`/`false` literal is refused. The `u8` element slot takes a `boolean` value the same way.
+It is pinned by six fixtures (`tests/cases/types/boolean-to-i32*.vl`,
+`tests/cases/arrays/joined-element-adopts-the-annotated-list.vl`, and three
+`tests/cases/generics/*-at-pin-keeps.vl`), and DECISIONS.md cites it three times as a rule the
+generic pins must keep. The checker is doing what the design says.
+
+**The price of retiring it**, measured by deleting the arm on master `94670f728` (lane BI):
+156 distilled-corpus cells go `runs` → `loud check reject`, every one in a grid built to
+exercise A7 (`d591` 54, `d581` 28, `d551` 24, `d572` 16, `d591t` 16, `d532x` 8, `d581o` 4,
+`d582s` 4, `d572o` 2), and every refusal names `boolean` against `i32`. The six fixtures above
+flip. No line of `compiler/`, `std/`, `scripts/`, or plumb's 507 units (`out/vl-hd`, `src`,
+`tools`) relies on it, and the compiler self-compiles unchanged without it.
+
+**Options.**
+(a) **Keep it** (today). The one crossing between the two scalar families; it costs nothing
+at runtime and saves `if b { 1 } else { 0 }` when counting.
+(b) **Retire it**, refusing in the literal's words (`argument 1: expected i32, got boolean`),
+and retire the `u8` element's `boolean` arm with it. `b as i32` is refused today (`as`
+supports numeric conversions only), so the only spelling left would be the `if`.
+(c) **Retire it and let `as` convert** `boolean` to `i32`/`u8`, so the conversion is written
+where it happens.
+
+**Recommendation: (c).** Implicit crossings are what VL avoids everywhere else (a lossless
+`i32` into `f32` is refused because it can round), a `boolean` that silently becomes a count
+is the confusion a type exists to catch, and nothing outside A7's own grids and fixtures uses
+it. (b) without (c) leaves no short explicit spelling.
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.
@@ -1516,6 +1604,15 @@ all three rungs — so the flag is a convenience over an existing route, not the
 **Filing note.** This had been ruled in conversation before and never written down, which is the
 exact failure mode this index exists to catch; it resurfaced as an open blocker on the workboard.
 Recorded here and in `DECISIONS.md`.
+
+**RE-OPENED FOR THE OWNER 2026-10-11 (lane PF, diderven DV-1000/DV-1001).** New evidence:
+V8 scales its own wasm inlining budget by the module's share of small functions, so after
+`-O3` strips VL's small stubs, a helper binaryen leaves alone is often inlined by nobody.
+This is why `-O3` measures slower than the default on both DV kernels. Measurements and four
+options are in `docs/internals/perf/v8-inline-budget-2026-10.md`. The recommendation is
+`--flexible-inline-max-function-size 40` in `RELEASE_PASSES` (+5.7% on the compiler at
+`-O3`, +2.9% on diderven's game, DV-1000 at `-O3` 1.5x faster). The flag ruled here has
+never been built.
 
 ### `N5-variance-defaults-and-surface` (workboard C8) — RULED 2026-08-18: inferred, no surface
 

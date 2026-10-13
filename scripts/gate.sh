@@ -18,6 +18,8 @@
 #   scripts/gate.sh              # everything
 #   scripts/gate.sh --no-build   # reuse build/vl-compiler.wasm as it stands
 set -u
+# Everything this gate starts is a preferred OOM victim, ahead of the session that ran it.
+[ "$(cat /proc/self/oom_score_adj 2>/dev/null || echo 1000)" -lt 300 ] && echo 300 >/proc/self/oom_score_adj 2>/dev/null
 cd "$(dirname "$0")/.."
 # Pin std: to THE TREE BEING GRADED. The host resolves std: from the BINARY's
 # checkout, and a worktree's binary is a symlink to the main repo's — so without
@@ -26,6 +28,15 @@ cd "$(dirname "$0")/.."
 # "toString is not exported" read from the main repo's pre-rename std, while the
 # same command with VL_STD pinned passed). Callers may still override.
 export VL_STD="${VL_STD:-$PWD/std}"
+# $VL_TMP: put every row's temp files in one directory, e.g. one the virus scanner skips.
+if [ -n "${VL_TMP:-}" ]; then
+  mkdir -p "$VL_TMP"
+  if command -v cygpath >/dev/null; then
+    export TMPDIR="$(cygpath -u "$VL_TMP")" TMP="$(cygpath -w "$VL_TMP")" TEMP="$(cygpath -w "$VL_TMP")"
+  else
+    export TMPDIR="$VL_TMP" TMP="$VL_TMP" TEMP="$VL_TMP"
+  fi
+fi
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
 # Ten rows below shell a python3, and a broken one exits rc=1 in milliseconds — the same
@@ -33,6 +44,8 @@ LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 # them. $PYTHON pins an interpreter for every row without editing a script, and the
 # preflight row names the one that answered. Exported for the scripts a row shells.
 PY="${PYTHON:-python3}"; export PYTHON="$PY"
+# Files are UTF-8; without this a Windows Python reads them as cp1252.
+export PYTHONUTF8=1
 # The native binary and the seed, for the rows written in VL. One row is today
 # (`seed size`, ported from Python); the paths are the ones every suite derives.
 VL="${VL:-$PWD/scripts/vl-host/target/release/vl}"
@@ -52,11 +65,28 @@ NAMES=(); PIDS=(); STARTS=()
 # returns instantly, so an elapsed computed there is the loop's clock. No stamp falls back
 # to that reading. CPU is the same subshell's `times`, whose second line is its reaped
 # children's user+sys — the whole row's process tree, which the box cannot inflate.
-run() { local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
+# `GATE_MAX_PAR` caps how many rows run at once (unset or 0: all at once), for a box shared
+# with a foreground user. A row's WALL starts when it launches, not while it queues.
+# On Windows the default is 6, where running every row at once loses to contention (README,
+# "Developing on Windows").
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) : "${GATE_MAX_PAR:=6}" ;; esac
+GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE_MAX_PAR="${GATE_MAX_PAR:-0}"
+# `--fast`: a local pre-push check, NOT the merge gate. It skips the rows whose cost is the
+# slow tail of the gate (whole-corpus grades, timing measurements, the fixpoints, the full
+# native suite) and ends with a line no merge tooling reads as a pass.
+FAST=0
+for a in "$@"; do [ "$a" = --fast ] && FAST=1; done
+SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|survey measurements|native-fixpoint|self-compile time|rep-fuzz|plumb-shape cost|"
+SKIPPED=()
+run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1"); return 0; fi
+        if [ "$GATE_MAX_PAR" -gt 0 ]; then
+          while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done
+        fi
+        local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
         ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
-           for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(echo "$tot + $m * 60 + $x" | bc); done
+           for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(awk -v t="$tot" -v m="$m" -v x="$x" 'BEGIN { print t + m * 60 + x }'); done
            printf '%s' "$tot"; }
 
 # FIRST ROW, so the table's first line names the cause once instead of ten times.
@@ -68,8 +98,9 @@ run "python preflight"         bash scripts/python-preflight.sh "$LOGS/python.di
 # and ci.yml keep the full set, CI running them as separate jobs (pass-2 survey §7).
 #
 # A file the three single-file rows below own leaves both lists, so the dedicated row is
-# the only place it runs. vl_scaling_shape_test.ts is the one that must: it grades a TIME
-# RATIO, and measured concurrently with itself it grades the box. The other two are pure
+# the only place it runs. vl_scaling_shape_test.ts is the one that must: its runtime pairs
+# grade a CPU RATIO, and measured concurrently with itself that grades the box (its compile
+# pairs grade guest fuel, which load cannot move). The other two are pure
 # file scans — no seed, no SELFHOST_NATIVE_ALIGN — so they run identically wherever they land.
 OWN_ROW=$'tests/vl_scaling_shape_test.ts\ntests/vl_inventory_refs_test.ts\ntests/vl_no_conflict_markers_test.ts'
 # Filtered in bash, not with `--ignore`: `--ignore` next to an explicit multi-glob file
@@ -166,9 +197,13 @@ run "dead-export budget"       "$PY" scripts/export-budget.py --check
 # lint itself rather than a python copy of it (a `+` chain is an expression tree), so it
 # needs the seed. The compiler's standing chains are held; a new one reds here.
 run "interp budget"            "$PY" scripts/interp-budget.py --check
-# THE SHAPE FAMILY: ten pairs, same work, one axis reshaped, graded on the TIME
-# RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
-# whose verdict is a measurement, and it reds on the pre-#2419 compiler.
+# The render-parse RATCHET, seventh of the same shape: `tyToEmitName(` calls and the ten
+# type-string parsers in the emitter. A rep is decided from the checked type, not from
+# a rendered spelling parsed back (code-quality-2026-10.md L2). A pure file scan, no seed.
+run "render-parse budget"     "$PY" scripts/render-parse-budget.py --check
+# THE SHAPE FAMILY: pairs of the same work, one axis reshaped, graded on the ratio of
+# the compiler's guest FUEL (a count, so load cannot move it; the runtime pairs on CPU).
+# ~40 s, and it reds on the pre-#2419 compiler.
 run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
@@ -184,7 +219,10 @@ run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 # discipline already list both paths, and this line named one. They graded `17 as filed`
 # the day they were added here, so the gap was latent rather than a live wrong claim —
 # which is exactly the state a filed row is supposed to decay into unnoticed.
-run "filed witnesses"          "$PY" scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2
+#
+# `--self-test` first (~0.3 s): the grader's outcome vocabulary and its `Want:` output rule
+# are each seen to fire on specimens before the rows are graded by them.
+run "filed witnesses"          bash -c "\"$PY\" scripts/check-filed-witnesses.py --self-test >/dev/null && \"$PY\" scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2"
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside
@@ -220,7 +258,9 @@ run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py b
 # reads the baseline, under-reported `runs` by six until an agent noticed while diffing its
 # own corpus run.
 if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
-  run "baseline freshness"     "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh
+  # Its own --json: the `distilled corpus` row runs regress.py concurrently, and two runs
+  # writing the default `.last.json` read each other's truncated files.
+  run "baseline freshness"     "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --verify-fresh --json "$LOGS/fresh.json"
 fi
 
 FAIL=0
@@ -229,13 +269,13 @@ FAIL=0
 # CPU is the row's own user+sys, which contention cannot inflate: WALL/CPU is the waiting,
 # so a row that is SLOW (high CPU) and one that is STARVED (high WALL, low CPU) separate.
 echo
-echo "WALL = elapsed with all rows running   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
+echo "WALL = elapsed once launched   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
 printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
   [ -n "$fin" ] || fin=$(date +%s.%N)
-  el=$(echo "$fin - ${STARTS[$i]}" | bc)
+  el=$(awk -v f="$fin" -v s="${STARTS[$i]}" 'BEGIN { print f - s }')
   cpu=$(cpusec $(tail -1 "$LOGS/$i.cpu" 2>/dev/null))
   [ -n "$cpu" ] || cpu=0
   if [ $rc -eq 0 ]; then printf '%-22s %7.1fs %7.1fs  ok\n' "${NAMES[$i]}" "$el" "$cpu"
@@ -247,5 +287,9 @@ if [ $FAIL -ne 0 ]; then
   # once, here, rather than leaving ten identical `rc=1` rows to be read as a regression.
   [ -s "$LOGS/python.diag" ] && { echo; cat "$LOGS/python.diag"; }
   echo; echo "GATE FAILED — logs in $LOGS"; exit 1
+fi
+if [ "$FAST" = 1 ]; then
+  echo; echo "FAST TIER PASSED — not the merge gate; skipped: ${SKIPPED[*]}  (logs in $LOGS)"
+  exit 0
 fi
 echo; echo "ALL GATES PASS ✅  (logs in $LOGS)"

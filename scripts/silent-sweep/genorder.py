@@ -26,7 +26,7 @@ PAY = [
     ("list_str", "", "string[]", '["a"]', "print({E}.length)", "1"),
     ("list_f64", "", "f64[]", "[1.25]", "print({E}.length)", "1"),
     ("list_ref", "type Rg = { w: i32 }", "Rg[]", "[{ w: 1 }]", "print({E}.length)", "1"),
-    ("map_str", "", "{[string]: i32}", "mkG()", "print({E}.size)", "1"),
+    ("map_str", "", "{[string]: i32}", "mkG()", "print({E}.length)", "1"),
     ("closure", "", "(i32) => i32", "(x) => x + 1", "print({E}(3))", "4"),
 ]
 MKG = """function mkG(): {[string]: i32} {

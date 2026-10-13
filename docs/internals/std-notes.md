@@ -99,7 +99,8 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   refused. `tests/cases/std/array-sort-agrees.vl` is the differential fixture that keeps
   the two copies honest; the only intended differences are the leading copy and the
   tail, where `sorted` returns whichever buffer holds the answer.
-  `tests/cases/std/error-generic-closure-forward.vl` pins the refusal itself.
+  The refusal is lifted (D2552, `tests/cases/std/generic-closure-forward.vl`); collapsing
+  `sorted` onto `sort` is the pending follow-up.
 - **`SORT_RUN` lives inside the function** rather than beside the module header: a
   module-level `const` is emitted as a wasm global whether or not anything imports the
   export that reads it, so it would be charged to callers who never sort.
@@ -568,6 +569,38 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `isDigitByte` (which the f64 parser uses further down), because it is the hot loop's
   first test and the negated form lets the refusal return directly. One predicate, two
   spellings — if a third appears, collapse them.
+- **`toFixed` is JS's `Number.prototype.toFixed`, ECMA-262 step for step** (owner ruling
+  2026-10-03 (A) on `open-rulings.md` §`fmt-fixed-precision`; sunpa SP-015; D3565). The
+  choices a reviewer should know were made, not drifted into:
+  - **Exact, not float.** |x| is `m × 2^e`; the answer is `m × 10^digits × 2^e` rounded to
+    an integer with ties upward, which for `e < 0` is "add `2^(-e-1)`, shift right `-e`" on a
+    big natural. No float multiply anywhere, so `1.005` at two places is `"1.00"` because
+    its double is below the tie. A scaled value under one half short-circuits to zero
+    before any shift is materialised, so `5e-324` costs no 1074-bit numbers.
+  - **`digits` outside 0..=100 traps.** JS throws `RangeError`. Clamping was the other
+    candidate the ruling named; it was declined because a clamp hands back a string the
+    caller did not ask for, silently, and the error model's channel for a caller bug is a
+    trap (`std:array`'s `filled` and `std:idtable`'s `set` trap the same way on a negative
+    count). A `T | E` return was not considered: a formatter that can fail gives every call
+    site a second error channel for an argument that is almost always a literal.
+  - **|x| >= 1e21 renders as `toString`**, i.e. exponential (`"1e+21"`), matching JS rather
+    than always printing fixed. The consumers that asked for it port JS, and agreement
+    with JS is the one property a caller can test without reading this module. Non-finite
+    values render `"NaN"` / `"Infinity"` / `"-Infinity"` for the same reason.
+  - **The sign is read with `<`, not off the bit pattern** — the opposite of `renderF64` —
+    because the spec does: `-0` renders `"0"`, but `-0.0001` at two places renders `"-0.00"`.
+  - **`self: f64` only**, where `toString` takes `i32 | i64 | boolean | f64`: an `i64`
+    above 2^53 is not exactly an f64, and an integer at N places is `toString` plus zeros.
+    An `i32` widens in without a cast.
+  - **Locale-free by contract.** Always `.`, never grouped. Display formatting with a
+    locale is a separate, later `std:intl`; `toFixed` must not grow a locale parameter.
+  - **Agreement, measured.** 1,000,000 random doubles × `digits` 0..20 (21M calls) in five
+    families — raw bit patterns, exponents 2^-40..2^72, `n / 10^j`, exact binary ties
+    `n / 2^k`, quarters — plus 20,000 × 0..100 and 50 edge values × 0..100, graded string for
+    string against V8 (node and Deno): 0 mismatches.
+  - **Cost.** Per call, measured as wasmtime fuel by bisection on an unoptimised build:
+    ~1,500 at 0 digits, ~2,200 at 2, ~3,100 at 6, ~6,900 at 20, against ~14,000 for
+    `toString` of the same values. One `-O` program that imports only `toFixed` is 4.5 KB.
 
 ## `std:json`
 
@@ -753,6 +786,43 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   of `std:str` and `std:fmt` for one i32 rendering; binaryen's DCE at `-O3` removes almost all
   of it.
 
+## `std:idtable`
+
+- **Admitted by the owner's collections Q4 ruling (2026-09-25)**: "The dense int-keyed table is
+  a named, consumer-chosen type" (DECISIONS.md, "A collection's stated cost is contract"). The
+  consumer is plumb, which hand-rolls ten of these: seven from `~/plumb/src/render.vl:313`
+  (`texsT`, `bufsT`, `viewsT`, …), `ctxs` and `shaderBinds` later in that file, and `socks` in
+  `src/win32.vl`, each a
+  `(T | null)[]` grown by `push(null)`, deleted by storing `null`, never iterated.
+- **Its own module**, not a section of `std:array`: `std:array` is helpers over `T[]`, and this is
+  a type with its own methods whose names (`get`, `set`, `has`, `delete`) would read as list
+  methods there. The names are the built-in map's, so switching a `{[i32]: V}` to an
+  `IdTable<V>` changes the type and the constructor and nothing else, unless the program
+  enumerates keys: `for k in m` and `m.keys()` become `t.ids()`, named differently on purpose
+  because the order differs (ascending, not insertion). The methods resolve through the type
+  with only `IdTable` imported, so the header's import line names nothing else and a caller's
+  own `get` is untouched; importing `get` explicitly does not shadow `m.get(k)` or `xs.get(i)`
+  either (`idtable-scalar-values.vl`). `length` is the COUNT of ids
+  present, as a map's is, not the highest id + 1. The brackets duplicate `get`/`set` for the
+  same map parity; `std:buffer`'s views set the precedent.
+- **Over `(V | null)[]`, as asked**, which is plumb's own spelling. Building it found four
+  compiler rows, all closed in the same PR: D2525 (a generic `(V | null)[]` refused outright),
+  D2526 (the method spelling `t.set(…)` refused as a widened write), D2527 (`IdTable<Tex>()`
+  from another module: "unknown type"), D2528 (an applied generic record with a nullable-record
+  list field). D2525's boundary still refuses, loudly, a `V` that is a `string`, `boolean`,
+  string literal union, function type, union of records or generic record application; the
+  header names each, and D2525 says why.
+- **`set` pushes one shared `null`**, made once per call. A `null` literal pushed into a boxed
+  `(i32 | null)[]` allocates a box per push: plumb's hand-rolled `push(null)` loop measured 3×
+  slower than a map at a million ids with `i32` values, and the shared value brings `IdTable<i32>`
+  to parity with the map. `delete` still stores a fresh `null`, one allocation per call.
+- **Measured 2026-09-25** (`docs/guide/costs.md`, `-O`, `vl run`): on plumb's pattern (ascending
+  ids 7 apart, deletes 2,000 behind, 32 lookups per insert), a record value runs 6.6 ns per
+  operation against the map's 10.6 and the hand-rolled table's 6.2–6.8; an `i32` value
+  11.3–13.7 against the map's 13.4–19.2. The three programs are `bench/collections/id-table/`.
+- **A negative id traps in `set`** (plumb silently ignored it): a dropped write is a silent loss,
+  and `std:array.filled` traps on a negative length for the same reason. Reads answer `null`.
+
 ## `std:utf16`
 
 - **Admitted by clause (a) of `std-design.md` D2**: UTF-16 is the text ABI of the Win32, JS
@@ -839,10 +909,10 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
 - **Why the names do not reuse `load*`.** Not taste: VL has no namespace import and a UFCS
   call resolves only names in scope, so a file reading both a `Buf` and a `u8[]` must import
   both sets into one scope, and a module that both imports and declares a name is a hard
-  parse error. Two `loadI32`s would not compile UNALIASED —
-  `tests/cases/modules/err-duplicate-import-two-modules/` is that shape. `as` renaming does
-  exist, so the choice is between distinct names, which cost nobody anything, and an alias
-  every caller has to write.
+  parse error. Two `loadI32`s did not compile UNALIASED when this was decided. (Since
+  receiver overloading, O1, a `u8[]` and a `Buf` receiver differ in kind and the two would
+  coexist; the distinct names stand, since renaming a shipped std export has no deprecation
+  path.)
 - **`u8[]` is outside the generic surface** — not a `T[]`, so `std:array`'s helpers do not
   reach it; the loops are written out here, as `std:base64` and `std:utf8` write theirs.
 - **Why nothing bounds-checks.** A read is one array index and the engine already checks it,
@@ -857,6 +927,19 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   integer read, and `tests/vl_std_bytes_test.ts` pins that composition so it cannot rot.
 - **What the suite grades against.** `DataView`, the platform's own byte reader, not a second
   shift ladder written in TypeScript to agree with the VL one.
+- **`zeroBytes`, the one constructor (D3620, owner ruling 2026-10-04).** sunpa SP-030 and
+  the `u8[]` half of SP-007/D3539: `filled(n, 0)` cannot make a `u8[]` because `u8` is a
+  storage type and a type parameter never binds it, so the spelling was `n` pushes. The
+  ruling chose a std export over a generic rule (D3539's option B) or nothing (C). It lives
+  here, not in `std:array`, because `std:array` is generic and its header says no export
+  applies to a `u8[]`; here is where `u8[]`-specific code already is. The lowering is one
+  `__array_new_default__`, as `std:buffer.loadBytes` allocates; at `n = 4,000,000` it burns
+  4.0M wasmtime fuel (the engine charges the zeroing per element) against 140.6M for the
+  push loop. A negative `n` traps by name, matching `filled`, rather than answering an empty
+  list: a negative length is a caller bug, and silently clamping it is the lossy shape
+  `std-api-review.md` §2 is critical of. Zero only, no fill byte: no consumer asked for one,
+  and a fill byte would be an `i32` the store truncates silently. A non-zero fill is
+  `zeroBytes` plus a loop until a consumer needs more.
 
 ## `std:seed`
 
@@ -871,46 +954,225 @@ the module's first landing. The design's §C determinism contract is the spine: 
 pure VL over the opcode intrinsics (`sqrt`, `abs`) and `+ - * /`, no host `Math` call, so the
 only cross-host variance is IEEE-754 itself.
 
-- **`atan2`'s algorithm.** Fold to the first octant — `a = atanUnit(min(ax,ay)/max(ax,ay))`
-  when `ax >= ay`, else `PI/2 - atanUnit(ax/ay)` — giving the angle magnitude in `[0, PI/2]`,
-  then reconstruct the quadrant with `if x < 0 { a = PI - a }` and `if y < 0 { a = -a }`. The
-  `(0,0)` guard runs first so the division never sees `0/0`. `atanUnit(r)` approximates
-  `atan(r)` on `[0,1]` as `r * P(r*r)`.
+- **Superseded (sunpa SP-013, 2026-10-03).** Slice 1's `atan2` was a degree-8 minimax
+  polynomial in `r*r` on the first octant, good to 1.36e-8 (f64) / 2.58e-7 (f32) absolute,
+  that dropped the sign of a zero `y`; its `hypot` was the naive `sqrt(x*x + y*y)`, which
+  overflows past ~1.3e154 (f64) / ~1.8e19 (f32). Both were replaced by the 1-ulp versions
+  described under SP-013 below, which CHANGED THESE EXPORTS' VALUES: `atan2F64(0.3, 0.7)` was
+  `0.4048917884765582` and is `0.40489178628508343`, `atan2F64(0.0, -0.0)` was `0` and is
+  `PI`, `atan2F64(-0.0, -1.0)` was `PI` and is `-PI` (so the documented range went from
+  `(-PI, PI]` to `[-PI, PI]`), and `hypotF64(1e200, 1e200)` was infinity and is
+  `1.414213562373095e200`.
+  `tests/cases/math/atan2-quadrants.vl` and `hypot.vl` still hold; their bound-style
+  assertions are within the new contract.
 
-- **The coefficients.** `P` is a degree-8 minimax polynomial in `u = r*r` (highest term
-  `r^17`), derived by a Remez exchange on `g(u) = atan(sqrt u)/sqrt u` over `[0,1]`
-  (`scripts` were run out of tree; the derivation is a pure-Python Remez with a 200k-node
-  error scan). Ratio-error minimax rather than atan-weighted, which is conservative near
-  `r=0` and tight near `r=1` where the worst case sits — good enough with margin to spare,
-  so no weighting was added. The same nine decimal literals serve both widths: in the f32
-  body they adapt to f32 contextually (`p` is declared `f32`), which is what makes the f32
-  function native f32 throughout rather than an f64 computation cast down (design §D).
+### `sinF64`/`cosF64`/`sinF32`/`cosF32` (D3476, sunpa SP-002)
 
-- **Measured worst-case absolute error** (grade it by regenerating the sweep: 44,647 pairs —
-  a `[-60,60]^2` integer grid, a dense `r`-in-`[0,1]` fold sweep across all sign combos, and
-  several magnitude scales — each compared via `f64bits`/`f32bits` against Python's
-  `math.atan2` of the same inputs):
-  - `atan2F64`: **1.36e-8**, bound 1e-7 — ~7× margin. Worst case at the `ax==ay` fold
-    boundary (`r=1`), i.e. the polynomial's own minimax peak.
-  - `atan2F32`: **2.58e-7**, bound 1e-6 — ~4× margin. Worst case in Q2 at a small ratio,
-    dominated by the `PI - a` reconstruction rounding at f32 and f32 Horner accumulation, not
-    by the approximation error (which is 1.36e-8, negligible at f32).
+- **Reduction.** `reducePio2` returns `q mod 4` and leaves `x - q·π/2` in `[-π/4, π/4]` as the
+  unevaluated sum `redHi + redLo` (two private module globals, written then read straight
+  back by the caller; no result depends on an earlier call). Below `2^20·π/2` (≈1.647e6) it
+  is Cody–Waite with π/2 in three 33-bit parts plus tails, the second and third rounds run
+  only when the first cancelled more than 16 / 49 bits (fdlibm's shape; relative error of the
+  reduced argument ≤ 2^-70 over 200k probes). Above it is an integer Payne–Hanek: the
+  53-bit significand times a 192-bit window of 2/π taken from a 21-word table (one word of
+  leading zeros, so the window may start before the binary point), product kept mod 2^192
+  in 32-bit columns of i64, top two bits the quadrant, the 190 below the fraction, rounded
+  to nearest, normalised with `clz`, turned into a double-double, and multiplied by π/2 in
+  double-double (Dekker). Accurate to ~2^-100 relative for every finite double, including
+  `6381956970095103·2^797`, the double closest to a multiple of π/2.
+- **Kernels.** Degree-6-in-`x²` minimax polynomials for `sin` (relative error 2^-57.1) and
+  `cos` (2^-62.1) on `[0, (π/4)²]`, from a Remez exchange in mpmath
+  (`scripts/std-math/trig-remez.py sin64|cos64`), fed through fdlibm's tail-carrying kernel
+  shapes so `redLo` is honoured. The f32 pair uses degree-4 kernels (2^-36.8 / 2^-33.1,
+  `sin32|cos32`) evaluated in f64 on `redHi` alone, then one f64→f32 rounding.
+- **The f32 pair evaluates in f64, a deliberate departure from std-math-design §C.4.** That
+  clause rules out "compute in f64, cast down" because a cast-down function differs from one
+  that rounds like the caller's f32 pipeline. For sin/cos there is no f32 pipeline to match
+  (WGSL's `sin` is driver-defined, and sunsuz's peer confirmed no shader twin), while f32
+  Cody–Waite cannot reach large arguments at all and f32 Horner would cost accuracy. The
+  result is one rounding from a value good to ~2^-33, which is within 0.5014 f32 ulp, and
+  wasm runs f64 arithmetic at f32 speed. The signature is f32 in and out, so no caller
+  widens; what §C.4 protects (determinism, a published bound) holds.
+- **Special values.** `|x| < 2^-26` (f64) / `2^-12` (f32) returns `x` from sin (this keeps
+  `-0.0` and subnormals exact) and `1` from cos. NaN and ±∞ return the constant quiet NaN
+  `0x7FF8000000000000` / `0x7FC00000` rather than `x - x`, because a NaN produced by
+  arithmetic has an engine-chosen sign bit in wasm, and the contract is bits.
+- **Exact-constant trap.** Under the exact-constant ruling a `const` initialised from other
+  literal-valued consts is computed exactly, so Veltkamp's split written as
+  `const c = 134217729.0 * P1; const hi = c - (c - P1)` folds to `hi = P1, lo = 0` and the
+  double-double product silently loses its low half (it cost 0.7 ulp in the Payne–Hanek
+  range before it was caught). The split halves of π/2 are therefore literals. Any rounding
+  trick on constants in this module must be precomputed the same way.
+- **Measured** (`scripts/std-math/trig-check.sh`, 2.88M points: 1M uniform in `[-1e6, 1e6]`
+  at each width, 200k random bit patterns, near-multiples of π/2 for `k ≤ 20000` and random
+  `k < 2^50` with their ±1-ulp neighbours, and specials; graded by mpmath). Max error:
+  `sinF64` 0.772 ulp, `cosF64` 0.761 ulp, `sinF32`/`cosF32` 0.5014 ulp, against a published
+  bound of 1 ulp. `scripts/std-math/trig-f32-exhaustive.vl` runs all 2,139,095,040
+  non-negative finite f32 against the f64 pair (~150 s at `-O3`): worst 0.50148 ulp for both,
+  and 396,590 (`sinF32`) / 408,475 (`cosF32`) results, ~0.02%, are not the correctly rounded
+  f32, so the f32 bound is exhaustive rather than sampled.
+- **Determinism.** The grid's transcript is byte-identical between wasmtime (`vl run`) and
+  V8 (Deno), at `-O0` and at `-O3`, on every result bit; `trig-check.sh` fails otherwise.
+  The fixtures pin exact values, so the corpus oracle (V8) and the native suites (wasmtime)
+  each re-check them.
+- **Cost.** One call, measured inside wasm at load ~20: 2.8 ns for `|x| ≤ 0.3`, 5.5–6 ns for
+  `|x| ≤ 5000` under wasmtime and 7.9–9 ns under V8, against 17.6–18.4 ns for a JS loop over
+  V8's `Math.sin`/`Math.cos`. The Payne–Hanek path is only taken above ≈1.6e6.
+- **No `sinCosF64` (std-api-review, 2026-10-02: do not add).** Both values share one
+  reduction, so a fused export would save ~2 ns of ~6, and nothing below π/4 where there is
+  no reduction. It needs a two-value return: VL has no tuples, and a `{ sin, cos }` record
+  return would make that record type permanent surface and lean on a multi-value lowering
+  not yet verified as shipped. No consumer asked. Deferred until one measures the cost of
+  the second reduction.
+- **`redHi`/`redLo` assume per-instance module globals.** Each write is read back at once by
+  the same call, so no result depends on an earlier call; a future threading model that
+  SHARED module globals across instances would make this a race, and `reducePio2` would
+  then need a real two-value return.
 
-- **Signed zero is not special-cased.** The quadrant tests use `x < 0.0` / `y < 0.0`, which
-  are false for `-0.0`, so the sign is lost when `y = ±0`: `atan2F*(0.0, -0.0)` returns
-  `0` where a fully IEEE `atan2` returns `PI`, and `atan2F*(-0.0, -1.0)` returns `+PI` where
-  IEEE returns `-PI`. None of the three filed consumers feed signed zeros; a `copysign`-based sign
-  extraction would close it additively without touching the bound. Filed here rather than in
-  the export comment because it is an implementation limit, not part of the promised contract.
+### `expF64`/`expF32`/`logF64`/`logF32`/`powF64`/`powF32` (sunpa SP-005)
 
-- **`hypot` is the naive `sqrt(x*x + y*y)`**, design §E's documented v1 form. The overflow
-  thresholds the export comments name (~1.3e154 for f64, ~1.8e19 for f32) are where `x*x`
-  first reaches the width's max finite value; the scaled overflow-safe form is deferred (§F).
+- **What admits them.** sunpa's world generator calls `exp` in about twenty places and `pow`
+  once, and carried its own `exp`/`ln`/`pow` in `src/worldgen/noise.vl`; the design's §E
+  table already named `exp` and `pow`. `log` is exported rather than kept private (design §H
+  O2 recommended private) because sunpa asked for it by name and `pow` needs it anyway, so
+  the extra surface is one name over code that has to exist. `log2`, `log10`, `exp2`,
+  `expm1` and `log1p` are not exported: nobody asked, and the header says so.
+- **`exp`.** `x = k·ln2/32 + r`, `|r| ≤ ln2/64`, with `k·ln2/32` split so the high product
+  is exact for every `|k| < 2^16`. `e^r - 1 = r + r²·Q(r)`, Q a degree-4 minimax fit (2^-63
+  absolute). `2^(j/32)` comes from a 32-entry double-double table, so the result is
+  `T_hi + (T_lo + T_hi·(e^r - 1))` with one rounding of note, then scaled by `2^(k>>5)`. A
+  subnormal result adds 1 before the final rounding, so that rounding lands on the subnormal
+  grid instead of rounding twice; `2^1024` is reached as `2^1023·2`.
+- **`log`.** `x = 2^k·z`, `z ∈ [0.7109375, 1.421875)`, split into 32 buckets by z's top
+  significand bits, bucket 18 centred on 1.0. Each bucket stores `1/c` rounded to 21
+  significant bits, so `z·(1/c) - 1` is EXACT as `(zh·ic - 1) + zl·ic` with z split at 32
+  bits: no FMA, no Dekker. `|r| ≤ 2^-6`; `log1p(r) = r - r²/2 + r³·P(r)`, P a degree-7
+  minimax fit (2^-71 relative to r), with `r²/2` kept exact through a 21-bit split and every
+  two-sum error carried. The result is a double-double good to ~2^-68 relative, written to
+  the module globals `lgHi`/`lgLo` (the `redHi`/`redLo` pattern: written, then read straight
+  back by the same call). Bucket 18 has `1/c = 1` and `-ln c = 0`, so `log` stays relative
+  near `x = 1` where the result is tiny.
+- **`pow`.** `y·(lgHi + lgLo)` as a double-double (Dekker's product), then `exp` of it with
+  the low part folded into `r`. With `|y·log x| ≤ 746` that keeps the argument's absolute
+  error near 2^-62, about 0.002 ulp of the result. Integer exponents take the same path: the
+  pre-rounding error is a few hundredths of an ulp, so any exact result that is a double
+  comes back exact (the grid checks every `a^b` for `|a| ≤ 40`, `|b| ≤ 80`). The edge cases
+  are IEEE 754 / C99 Annex F `pow`, checked before any arithmetic. **Deviation from JS**:
+  `Math.pow(1, NaN)`, `Math.pow(±1, ±Infinity)` are NaN in JS and 1.0 here. Likewise
+  `atan2F64(-tiny, +large)` (a quotient that underflows) is `-0.0` here, as C99 has it
+  (`atan2(-y, x) = -atan2(y, x)`), where V8's `Math.atan2` gives `+0.0`.
+- **The f32 trio evaluates in f64 and rounds once**, as `sinF32`/`cosF32` do (§C.4's
+  deliberate departure, same reason: no f32 pipeline to match, and one rounding from a value
+  good to ~2^-41 gives 0.5000x f32 ulp). `expF32` and `logF32` use lighter kernels on the
+  same tables (degree-2 Q, degree-3 P, no double-double); `powF32` is `logKernelF32` then
+  `expKernelF32` in f64, whose ~2^-36 argument error is invisible at f32. The NaN `powWith`
+  returns is mapped to the f32 quiet NaN explicitly, because a demoted NaN's bits are the
+  engine's choice.
+- **Constants and coefficients** come from `scripts/std-math/explog-tables.py` (mpmath; the
+  Remez exchange is the trig script's). Every literal is the script's `repr`, so no constant
+  is built from another (the exact-constant trap in the trig notes above does not arise).
+- **Measured** (`scripts/std-math/math-check.sh`, 12,535,598 points over every function in
+  this landing, graded by mpmath at 256 bits; for these three: uniform sweeps over each function's whole finite range, the unit interval, tiny
+  arguments, subnormal results, random bit patterns, `log` within 1e-6 of 1, `pow` with `x`
+  within 1e-9 of 1 and `|y|` up to 1e12, every small integer power, and every pair of 39
+  edge values). Max error: `expF64` 0.5265 ulp, `logF64` 0.5000, `powF64` 0.5284 (0.5043 in
+  the subnormals); `expF32`/`logF32`/`powF32` 0.5000. Every edge case matched, every exact
+  power exact. `scripts/std-math/math-f32-exhaustive.vl` runs every f32 `expF32` and
+  `logF32` compute (~4.3e9; ~12 min with the arc functions, at `-O3`): worst 0.5000024 ulp for `expF32`, 0.5 for
+  `logF32`; 218 and 2 results differ from the f64 function rounded to f32.
+- **Determinism.** The grid's transcript is byte-identical between wasmtime and V8 at `-O0`
+  and `-O3` on every result; `math-check.sh` fails otherwise. The three fixtures
+  (`tests/cases/math/exp-log-pow*.vl`) pin values the grader confirmed correctly rounded.
+- **Cost** (wasmtime fuel per call, ~1 unit per instruction, load-independent; argument
+  ranges `exp` [-10, 10], `log` [0.01, 100], `pow` x ∈ [0.1, 10], y ∈ [-5, 5]):
 
-- **What grades it.** `tests/cases/math/hypot.vl`, `atan2-quadrants.vl` and `pi.vl` — run
-  through the standing corpus oracle. The atan2 fixture asserts each result within the
-  promised bound (printing `true`) rather than pinning exact bits, so a later coefficient
-  change that still meets the bound does not churn the fixture.
+  | call | `-O0` | `-O3` |
+  | --- | --- | --- |
+  | `expF64` | 161 | 109 |
+  | `expF32` | 122 | 79 |
+  | `logF64` | 318 | 210 |
+  | `logF32` | 128 | 74 |
+  | `powF64` | 592 | 428 |
+  | `powF32` | 314 | 214 |
+  | sunpa `exp` (Taylor-13, no table) | 138 | 105 |
+  | sunpa `ln` (atanh series) | 124 | 93 |
+  | sunpa `pow` (`exp(y·ln x)`) | 266 | 201 |
+  | naive 25-term Taylor `exp`, no reduction | 518 | 469 |
+
+  sunpa's versions graded on the same grader: `exp` 1.05 ulp, `ln` 2.21, `pow` 1,498 ulp
+  (the plain `exp(y·ln x)` amplifies `ln`'s rounding by `|y·ln x|`). `logF64` pays ~2× for
+  its double-double, which `powF64` needs; a single-double `logF64` would save ~100 fuel at
+  ~0.52 ulp and was not worth a second code path.
+- **Size** (this landing together with SP-013 below). The module's source goes from 13,004
+  to 33,818 bytes. An unoptimised (`-O0`) program that imports anything from `std:math`
+  emits the whole module, so it grows from 4,175 to 12,913 bytes (the exp/log tables are 160
+  f64 constants); under `-O3` only what is called survives (`powF64` alone: 2,710 bytes). The
+  seed does not change: the compiler does not import std.
+
+### `atan2`, `atan`, `asin`, `acos` and a scaled `hypot` at 1 ulp (sunpa SP-013)
+
+- **Why.** sunpa's retargeting tool computes `atan2(|a×b|, a·b)` and writes f32 output; the
+  slice-1 polynomial's ~1e-8 error flipped those bits, so it carried fdlibm's `atan`,
+  `atan2`, `acos` and V8's scaled `hypot` in `src/tools/libm.vl`. The SP-013 ask is the
+  sin/cos contract for all of them, plus `atan`/`asin`/`acos`.
+- **One core.** `atanParts(t, tl)` is atan of a double-double `t ∈ [0, 1]`: reduced to
+  `|u| ≤ 7/16` by `atan(t) = atan(c) + atan((t - c)/(1 + c·t))`, `c ∈ {1/2, 1}` (fdlibm's
+  breakpoints), the reduced quotient kept as a double-double by `divParts` (the quotient's
+  rounding error recovered with a Dekker product), then `u + u³·P(u²)`, P a degree-10
+  minimax fit (`scripts/std-math/arc-tables.py`, 2^-56.8 relative; the floor is the
+  rounding of P's own coefficients). `arcParts(n, d)` is the angle of `(d, n)` in `[0, π]`:
+  the smaller of `n`/`|d|` over the larger, then `π - a` or `π/2 ± a` added in
+  double-double. Every public f64 function is a thin edge-case layer over it: `atan2`
+  scales both arguments by one power of 2 into `[2^-62, 4)` (an exponent gap over 60 is
+  answered directly: `y/x`, `π` or `π/2`), `atan(x)` is `atanParts(x)` or `π/2 -
+  atan(1/x)`, and `asin`/`acos` are `arcParts` over `(x, sqrt(1 - x²))` with `1 - x²`
+  exact (Dekker square) and the root corrected by one Newton step, so neither loses
+  accuracy near ±1. Results land in the module globals `atHi`/`atLo` (the `redHi` pattern).
+- **`hypot`** squares both arguments exactly (Dekker), sums them as a double-double, and
+  corrects the rounded root with one Newton step whose `r·r` is exact. Outside `[1e-135,
+  1e135]` both arguments are first scaled by one power of 2, so nothing overflows or
+  underflows before the result does; `hypotF64(x, y)` is infinity only when the length is.
+  Correctly rounded on every normal result graded; a subnormal result is scaled back from
+  the tiny path and so rounds twice, which an independent 2.8M-point review measured at up
+  to 0.7496 ulp (this grid's worst was 0.5019 over 250,012 subnormal results). It differs
+  from V8's Kahan-summed `hypot` in the last bit sometimes; V8's is not correctly rounded
+  either.
+- **Edge cases are IEEE 754 / C99 Annex F**, in both `atan2`s: a zero `y` keeps its sign,
+  `x = -0` gives `±π`, two infinities give `±π/4` or `±3π/4`; `hypot(±inf, NaN)` is
+  infinity. Slice 1 returned `0` for `atan2(0, -0)`; that was the documented deviation and
+  it is gone.
+- **The f32 functions evaluate in f64 and round once** (the sin/cos departure from §C.4,
+  same reason), on a degree-6 kernel (`atanKernelF32`, 2^-38 relative) without
+  double-doubles; `asinF32`/`acosF32` form `1 - x·x` in f64, exact enough at f32;
+  `hypotF32` is `sqrt(x·x + y·y)` in f64, where neither square can overflow.
+- **Measured** (`scripts/std-math/math-check.sh`, mpmath at 256 bits; the same run as
+  exp/log/pow above): `atanF64` 0.6149 ulp, `asinF64` 0.6477, `acosF64` 0.6531,
+  `atan2F64` 0.6468, `hypotF64` 0.5000 (0.7496 for subnormal results); every f32 one 0.5000. The
+  exhaustive f32 run (`math-f32-exhaustive.vl`) covers every `atanF32`, `asinF32`,
+  `acosF32` input: worst 0.50004 ulp, and 615 / 509 / 179 results differ from the f64 twin
+  rounded. The f64 arc functions are within 1 ulp, not correctly rounded: 0.1–0.4% of
+  results are the other neighbour, so they will differ from V8's (now correctly rounded)
+  `Math.atan2`/`Math.acos` on that fraction, as they do from fdlibm.
+- **Cost** (fuel per call; the slice-1 numbers are what these replace):
+
+  | call | `-O0` | `-O3` |
+  | --- | --- | --- |
+  | `atan2F64` | 459 | 346 |
+  | slice-1 `atan2F64` (polynomial) | 100 | 80 |
+  | sunpa's fdlibm `atan2` | 272 | 227 |
+  | `atan2F32` | 156 | 117 |
+  | `atanF64` / fdlibm `atan` | 273 / 135 | 225 / 115 |
+  | `atanF32` | 99 | 73 |
+  | `asinF64` / `asinF32` | 399 / 112 | 333 / 89 |
+  | `acosF64` / fdlibm `acos` | 424 / 99 | 346 / 82 |
+  | `acosF32` | 110 | 85 |
+  | `hypotF64` | 196 | 166 |
+  | slice-1 naive `hypotF64` | 13 | 11 |
+  | sunpa's V8 `hypot2` (array-based) | 180 | 145 |
+  | `hypotF32` | 44 | 39 |
+
+  The f64 arc functions pay 1.5–4× fdlibm for their double-double, which is what holds them
+  to ~0.65 ulp at every graded argument. fdlibm's own bound was not measured here.
 
 ## `std:simd`
 

@@ -78,6 +78,11 @@ cost no new type, no new widening edge, no second integer rep, and no change to 
 program. A `u32` would touch the type arena, every rep table, every widening rule and every emitter
 kind code, to express something the operand does not need to carry.
 
+*Amended 2026-10-03 and 2026-10-04 (owner rulings U1–U4):* VL adds `u32` and `u64` as value
+types, and the type picks the unsigned operation. `divU`, `remU`, `ltU` and `>>>` stay, for `i32`
+and `i64` operands. See DECISIONS.md §"`u32` and `u64` are value types" and
+[unsigned-types-design.md](unsigned-types-design.md).
+
 ## Shadowing
 
 An intrinsic is a **fallback for a name the program did not define**. The checker skips its arm when
@@ -93,11 +98,11 @@ function is silently dead. The dunder spelling makes that unlikely rather than i
 
 ## What is deliberately absent
 
-`sin`, `cos`, `atan2`, `pow`, `exp` and every other transcendental. **No wasm opcode computes one**,
-so any implementation is a library whose last bit is a policy choice — and a program that must match
-another implementation exactly has to own that choice itself. Providing one would not save such a
-program work; it would give it a trap to avoid. A future `std:math` for other users is a separate
-question and nothing here forecloses it.
+`sin`, `cos`, `atan2`, `pow`, `exp` and every other transcendental, **as an intrinsic**. No wasm
+opcode computes one, so any implementation is a library whose last bit is a policy choice, and the
+compiler does not make it. The library is `std:math` (`docs/internals/std-math-design.md`): pure VL
+over these opcodes, the same bits on every host, with a published ulp bound per function. A program
+that must match some other implementation exactly still owns that choice itself.
 
 ## Where the code is
 

@@ -74,6 +74,7 @@
 //
 // Run with:  deno test -A --parallel tests/cases_wasm_*_test.ts
 
+import { filePath } from "./filePath.ts";
 import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // The module-arming gate — the SHARED TS copy. `compiler/moduleGate.ts` is a LEAF
 // (it imports nothing and carries no runtime), so this oracle keeps its "no
@@ -85,7 +86,7 @@ import { needsModules } from "../../compiler/moduleGate.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
-const SEED = new URL("../../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../../build/vl-compiler.wasm", import.meta.url));
 
 const seedExists = (() => {
   try {
@@ -356,7 +357,12 @@ const driveCase = (
   // table is still standing: `redunModuleAt` / `rcoalModuleAt` / `isvalModuleAt`
   // resolve each finding's owner through `modOfTok`, and the later `lintSrc`
   // re-parse resets that table.
-  const redun = [...readRedun(exp), ...readRcoal(exp), ...readIsval(exp)];
+  const redun = [
+    ...readRedun(exp),
+    ...readRcoal(exp),
+    ...readIsval(exp),
+    ...readExpInf(exp),
+  ];
   let bytes: Uint8Array | undefined;
   if (emit && rc === 0) {
     const n = exp.rbyteLen();
@@ -469,7 +475,9 @@ const assertCase = async (
     if (!onLine.some((di) => di.col === want.col)) {
       throw new Error(
         `@error-at ${want.line}:${want.col} — the message is on that line but at ` +
-          `column ${onLine.map((di) => di.col).join("/")}. Both numbers are 0-based; ` +
+          `column ${
+            onLine.map((di) => di.col).join("/")
+          }. Both numbers are 0-based; ` +
           `fix the directive or the span, not the base: ${fmtDiags(onLine)}`,
       );
     }
@@ -651,27 +659,31 @@ const readIsval = (exp: Exports): LintDiag[] => {
   return out;
 };
 
-// Rules the CORPUS is exempt from. They police the hygiene of source WE maintain
-// (`scripts/comment-budget.py` and `scripts/ladder-budget.py` ratchet it); these
-// cases pin what the compiler says about a PROGRAM, not about our prose or our
-// dispatch tables. `tests/` is excluded from `lint-self.sh` for the same reason.
-//
-// The four comment rules (docs/internals/comment-style.md): a case file's header is
-// documentation OF the case, and hundreds carry a long one, a shouted emphasis or a
-// sentence about what the compiler used to do — which is the point of the case. The
-// kind-ladder rules: their closed sets are the COMPILER's (`VKind`, `Node`, `MfKind`,
-// …), read out of `compiler/*.vl`, so a case declaring
-// `type Kind = "i32" | "str" | "bool"` is graded against a vocabulary that is not its
-// own — `literal-unions/atom-basics.vl` is exactly that collision, and its `classify`
-// covers its OWN union completely.
-const CORPUS_EXEMPT_CODES = new Set([
-  "comment-block-too-long",
-  "comment-measurement-uncited",
-  "comment-shouting",
-  "comment-history",
-  "kind-ladder-incomplete",
-  "kind-ladder-split",
-]);
+/**
+ * The inferred-export-parameter hints (`expInf*`, D3817): an uncalled entry export's
+ * untyped parameter the checker annotated from its body. Type-informed like the three
+ * above; entry module only, message over `expInfMsg*`. An older seed lacks the exports.
+ */
+const readExpInf = (exp: Exports): LintDiag[] => {
+  const out: LintDiag[] = [];
+  if (typeof exp.expInfCount !== "function") return out;
+  const n = exp.expInfCount();
+  for (let i = 0; i < n; i++) {
+    if (exp.expInfModuleAt(i) !== 0) continue;
+    out.push({
+      sev: "hint",
+      line: exp.expInfLineAt(i),
+      col: exp.expInfColAt(i),
+      msg: readString(exp.expInfMsgLen(i), (j) => exp.expInfMsgByte(i, j)),
+    });
+  }
+  return out;
+};
+
+// No code is filtered here. The repo-policy rules (the comment rubric, the kind-ladder
+// and sentinel-index rules, …) grade only the VL tree's own `compiler/`/`std/`, and a
+// case is linted with no path staged, so they decline by themselves
+// (docs/internals/lint-rule-scope.md); a case that saw one would be that scoping broken.
 
 /**
  * Run the self-hosted lint pass over `src` and read its diagnostics. Called only right
@@ -689,8 +701,6 @@ const driveLint = (exp: Exports, src: string): LintDiag[] => {
   const out: LintDiag[] = [];
   if (n < 0) return out; // a lex/parse error — lint needs a valid AST
   for (let i = 0; i < n; i++) {
-    const code = readString(exp.lintCodeLen(i), (j) => exp.lintCodeByte(i, j));
-    if (CORPUS_EXEMPT_CODES.has(code)) continue;
     out.push({
       sev: readString(exp.lintSevLen(i), (j) => exp.lintSevByte(i, j)),
       line: exp.lintLineAt(i),
@@ -788,7 +798,9 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
       name,
       ignore: skip !== undefined && skip !== null,
       fn: async () => {
-        const entryKey = (c.kind === "single" ? c.url : c.entry).pathname;
+        const entryKey = filePath(
+          c.kind === "single" ? c.url : c.entry,
+        ).replaceAll("\\", "/");
         const r = driveCase(
           exports!,
           entryKey,
@@ -822,7 +834,9 @@ export const registerCorpusOracle = (shard: number, shards: number): void => {
   Deno.test("EXPECTED_DIVERGENCES entries name existing cases", () => {
     const stale = Object.keys(EXPECTED_DIVERGENCES).filter((k) => !seen.has(k));
     if (stale.length) {
-      throw new Error(`stale EXPECTED_DIVERGENCES entries: ${stale.join(", ")}`);
+      throw new Error(
+        `stale EXPECTED_DIVERGENCES entries: ${stale.join(", ")}`,
+      );
     }
   });
 };

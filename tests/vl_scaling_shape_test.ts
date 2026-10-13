@@ -7,10 +7,10 @@
 // predicates re-derived once per emitted FUNCTION were 59% of a self-compile, and the
 // functions pair below reads 5.81x on that compiler against 1.02x after.
 //
-// The ratio is of the child's CPU (user+sys), because a ratio cancels only a UNIFORM
-// slowdown and a fanned-out gate delivers bursts: the two arms run at different moments,
-// and the one a burst lands on is inflated alone. The last case below is the CONTROL, a
-// pair that must red, so a grader that stopped measuring cannot pass in silence.
+// A compile pair's ratio is of the compiler's guest FUEL (`$VL_FUEL=1`), a count of guest
+// instructions that box load cannot move; the runtime pairs are of the child's CPU. The two
+// CONTROLS at the end are pairs that must red, one per grader, so a grader that stopped
+// measuring cannot pass in silence.
 //
 // One pair per axis a pass could accidentally multiply over. The "many" arm spreads the
 // same work over N entities, the "one" arm over N/K. Method and profiles:
@@ -18,14 +18,18 @@
 //
 // @test-timing instrument
 
-// TWO AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather than
-// the default. That is recorded DEBT, not tolerance: each names the function that makes it
-// so, and both answer a name by linear scan over a registry table, which is why `__str_eq__`
-// tops their profiles. Two have left the list: `generic pins` when its per-instance pass
-// learned to resume, and `unions` when the five scans under it came off — and reading either
-// as still super-linear costs a campaign. Lower a bar when the thing it names stops
-// multiplying, and RESIZE the pair when its cheap arm falls under the floor, because from
-// there the reading is a budget on the dear arm and not a ratio at all.
+// A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
+// HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
+// every run, so the margin pays only for the compiler changing, not for the box. Four axes
+// sit above the default because they are super-linear today — `types`, `reads after many
+// closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
+// and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
+// multiplying. Eight are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
+// `in-function value writes`, the two `if joins` pairs, `nested inline record types across
+// functions (fuel)`, `record-parameter field calls` and `closure arguments in one function`.
+// The CPU readings quoted
+// beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
 
@@ -54,6 +58,63 @@ const genFunctions = (nf: number, ns: number): string => {
   o.push("let acc = 0");
   for (let i = 0; i < 40; i++) o.push(`acc = acc + f${i}(${i % 5})`);
   o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// `genFunctions` with a `??` over an object-literal default in the module, which is what
+// switches on the anon-leaf narrow-use pass (compiler/emit_collect.vl). That pass asks each
+// function with parameters about its own name; asked by scanning the arena, it is
+// functions x identifiers.
+const genFamilyFunctions = (nf: number, ns: number): string =>
+  [
+    "type Pt = { x: i32 }",
+    "function src(k: i32): Pt | null { if k > 0 { return null } { x: k } }",
+    "const fam = src(1) ?? { x: 2 }",
+    genFunctions(nf, ns).replace("let acc = 0", "let acc = fam.x"),
+  ].join("\n");
+
+// `n` functions that each call a closure field of their record parameter, each called once.
+// Resolving `b.get()` follows the parameter to its call sites' arguments, so a lookup that
+// scans every call in the arena for them is functions x calls.
+const genParamFieldCalls = (n: number): string => {
+  const o: string[] = ["type Box = { get: () => i32 }"];
+  for (let i = 0; i < n; i++) o.push(`function f${i}(b: Box): i32 { b.get() + ${i % 13} }`);
+  o.push("const bx: Box = { get: () => 3 }", "let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(bx)`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// One function passing the same local closure to a higher-order function `n` times.
+// `monomorphize` asks, at each call, whether the argument is a capture of the frame, and the
+// answer walks the whole frame, so an unmemoised capture set is calls x body.
+const genClosureArgCalls = (n: number): string => {
+  const o: string[] = [
+    "function apply(x: i32, f: (v: i32) => i32): i32 { f(x) }",
+    "function run(k: i32): i32 {",
+    "  let acc = 0",
+    "  const g = (v: i32): i32 => v + k",
+  ];
+  for (let i = 0; i < n; i++) o.push(`  acc = acc + apply(${i % 7}, g)`);
+  o.push("  acc", "}", "print(run(3))");
+  return o.join("\n") + "\n";
+};
+
+// `n` calls whose string result is classified, through a callee taking a `w`-field record
+// (`wide`) or a one-field one. Both arms declare both records, so only the callee's signature
+// width differs; a signature key re-derived per call is calls x width x width.
+const genSigWidthCalls = (n: number, w: number, wide: boolean): string => {
+  const o: string[] = [
+    "type Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: f64`).join(", ") + " }",
+    "type Narrow = { f0: f64 }",
+    'function f(p: Wide): string { "a" }',
+    'function g(p: Narrow): string { "a" }',
+    "const qw: Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: ${i}.5`).join(", ") + " }",
+    "const qn: Narrow = { f0: 1.5 }",
+    'let acc = ""',
+  ];
+  for (let i = 0; i < n; i++) o.push(`acc = acc + ${wide ? "f(qw)" : "g(qn)"}`);
+  o.push("print(acc.length)");
   return o.join("\n") + "\n";
 };
 
@@ -111,6 +172,30 @@ const genLitSets = (n: number, k: number): string => {
 
 // N call sites either way; the many arm spreads them over N callees, the one arm over
 // N/K. Both DECLARE N functions, so only the callee distribution differs.
+// `n` value-position writes to a wider name, each a binding of its own, at module scope or in
+// one function. D2398 moves each ahead of its binding and keys the start function's order.
+const genValueWrites = (n: number, inFn: boolean): string => {
+  const o: string[] = ["function h(i: i32): i32 { i }", "let a: f64 = 0"];
+  if (inFn) o.push("function main() {");
+  const pad = inFn ? "  " : "";
+  for (let i = 0; i < n; i++) o.push(`${pad}const y${i} = (a = h(${i}))`);
+  if (inFn) o.push("}", "main()");
+  return o.join("\n") + "\n";
+};
+
+// `if` branches and `match` arms: empty ones and a labelled block, which are blocks, and ones
+// whose braces are an object literal, which are the arm's value (D3276).
+const genArmBodies = (n: number): string => {
+  const o: string[] = ["let t = 0"];
+  for (let i = 0; i < n; i++) {
+    o.push(`function f${i}(c: boolean) {`, "  if c {} else { t = t + 1 }", "  match t { 1 => {} _ => {} }");
+    o.push("  if c { @L { t } } else { t = t + 2 }");
+    o.push("  const o = if c { a: t } else { a: t + 2 }", "  t = t + o.a", "}");
+  }
+  o.push("f0(false)", "print(t)");
+  return o.join("\n") + "\n";
+};
+
 const genCallSites = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
@@ -121,6 +206,17 @@ const genCallSites = (n: number, k: number): string => {
     fill(o, i, 6);
   }
   o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// EXPORTS: N functions in the entry file, every one `export`-marked, against N/K of them. Both
+// arms declare and call the same N functions; only the size of the export table differs.
+const genExports = (n: number, k: number): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const ex = i % k === 0 ? "export " : "";
+    o.push(`${ex}function f${i}(x: i32): i32 { if x > ${i} { x * ${i} + f${i > 0 ? i - 1 : 0}(x - 1) } else { x + ${i} } }`);
+  }
   return o.join("\n") + "\n";
 };
 
@@ -195,6 +291,20 @@ const genPins = (n: number, many: boolean): string => {
   return o.join("\n") + "\n";
 };
 
+// GENERIC FIRST INSTANCES against plain twins: N generics instantiated once each, so every
+// instance is a FIRST one and replaces its template's `fnStmts` slot, against the same N
+// functions written at `i32`. Both arms emit N one-expression functions.
+const genFirstInsts = (n: number, many: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(many ? `function g${i}<T>(x: T): T { x }` : `function g${i}(x: i32): i32 { x }`);
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + g${i}(${i % 97})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
 // COVARIANT BINDINGS: N delivery functions either way, `cov` of them binding a covariant
 // list handle (`const b: Shape[] = a`) and the rest binding the same list at its own type.
 // The alias-closure answer is memoised per (root name, frame), so only the covariant ones
@@ -258,16 +368,73 @@ const writeModules = (dir: string, mods: number, per: number, body: number): str
   return `${dir}/main.vl`;
 };
 
+// D2914's pair: `nl` un-annotated lists of object literals, each adopted `per` times by a
+// declared record list, beside an annotated record of the same field names, so every list takes
+// the destination's record as its type (D3339) and its reads are checked at it.
+const genAdoptedLists = (nl: number, per: number): string => {
+  const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
+  for (let k = 0; k < nl; k++) {
+    o.push(`const il${k} = [{ f: ${k % 13} }]`);
+    for (let j = 0; j < per; j++) {
+      o.push(`const ic${k}_${j}: I[] = il${k}`, `print((il${k}[0].f ?? 0) + ${j % 7})`);
+    }
+  }
+  o.push("print(i.f)");
+  return o.join("\n") + "\n";
+};
+
+// The same-name twin: `nf` functions, each binding its own `il` and adopting it, so a use check
+// that walked every identifier of the name program-wide would read each function's lists.
+const genAdoptedListsFn = (nf: number): string => {
+  const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
+  for (let k = 0; k < nf; k++) {
+    o.push(`function h${k}(): i32 {`, `  const il = [{ f: ${k % 13} }]`, "  const ic: I[] = il");
+    o.push("  if (il[0].f ?? 0) > 5 { ic.length + 1 } else { ic.length }", "}");
+  }
+  o.push("let acc = 0");
+  for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
+  o.push("print(acc)", "print(i.f)");
+  return o.join("\n") + "\n";
+};
+
+// D2933's same-name twin: `nf` functions, each binding its own record literal `r` and handing an
+// alias of it to a declared record of the same field names, so each literal is re-seated.
+const genReseatedRecordsFn = (nf: number): string => {
+  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "function use(j: J): i32 { j.f ?? 0 }"];
+  for (let k = 0; k < nf; k++) {
+    o.push(`function h${k}(): i32 {`, `  const r = { f: ${k % 13} }`, "  const q = r", "  use(q) + r.f", "}");
+  }
+  o.push("let acc = 0");
+  for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// D2922's DEPTH twin: a chain of `k` un-annotated functions, each returning the previous one's
+// call from three `return`s, over a record literal a declared record of its field names could
+// re-seat, so a use walk that followed each call once per path would read 3^k calls.
+const genReturnChain = (k: number): string => {
+  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "const r = { f: 7 }", "function g0(n: i32) { return r }"];
+  for (let i = 1; i <= k; i++) {
+    o.push(`function g${i}(n: i32) {`, `  if n > 2 { return g${i - 1}(n - 1) }`);
+    o.push(`  if n > 1 { return g${i - 1}(n - 2) }`, `  return g${i - 1}(n)`, "}");
+  }
+  o.push(`print(g${k}(3).f)`);
+  return o.join("\n") + "\n";
+};
+
 // ── the runner ───────────────────────────────────────────────────────────────
 
-// WHAT IS GRADED IS THE CHILD'S CPU, NOT THE CLOCK. A ratio cancels a UNIFORM slowdown,
-// and `gate.sh` does not deliver one: 24 rows fan out, so the two arms of a pair run at
-// different moments against a load that moves by the second, and the arm a burst lands on
-// is inflated alone. Measured beside a fanned-out gate, one arm's WALL reading moved 2.6x
-// while its own user+sys did not — the axes then read 3.69 and 6.54 against bars of 2.5
-// and 4.0 with nothing wrong. Contention costs a process waiting; it does not make it
-// execute more instructions, so user+sys is what a reshaped pair can be compared on.
-type Cost = { wall: number; cpu: number };
+// A COMPILE PAIR IS GRADED ON GUEST FUEL. `$VL_FUEL=1` makes the host meter the compiler in
+// wasmtime fuel, about one unit per guest instruction: a count, identical on every run of the
+// same seed over the same source however busy the box is. A CPU ratio is not that — the two
+// arms run at different moments and a burst inflates one alone, so one axis read 2.1 - 2.75
+// against a 2.5 bar across gate runs while its fuel ratio was 2.705 every time. A fuel ratio
+// needs no retry round and no floor, and its two arms can run at once.
+//
+// A RUNTIME pair (the string-append axes, the control) is graded on the child's CPU, because
+// fuel meters only the compiler: that cost lands in the emitted program, which runs unmetered.
+type Cost = { wall: number; cpu: number; fuel: number; alloc: number };
 
 // `times`' SECOND line is the shell's reaped children — this spawn's `vl` and nothing
 // else, the shell's own cost being the first line. A POSIX builtin, so this needs no
@@ -281,36 +448,107 @@ const childCpu = (out: string): number => {
   return s;
 };
 
-const spawn = async (what: string, argv: string[]): Promise<Cost> => {
+const spawn = async (
+  what: string,
+  argv: string[],
+  fuel: boolean,
+  extra: Record<string, string> = {},
+): Promise<Cost> => {
   const t0 = Date.now();
-  const { code, stdout, stderr } = await new Deno.Command("/bin/sh", {
-    args: ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
+  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...extra };
+  if (fuel) env.VL_FUEL = "1";
+  // Windows has no `times` that sees a native child's CPU: cpu-times.ps1 prints the same line.
+  const win = Deno.build.os === "windows";
+  const { code, stdout, stderr } = await new Deno.Command(win ? "powershell" : "/bin/sh", {
+    args: win
+      ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${ROOT}/tests/support/cpu-times.ps1`, VL, ...argv]
+      : ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
+    env,
   }).output();
   const wall = (Date.now() - t0) / 1000;
-  if (code !== 0) {
-    throw new Error(`vl ${what} failed: ${new TextDecoder().decode(stderr).slice(0, 400)}`);
+  const err = new TextDecoder().decode(stderr);
+  if (code !== 0) throw new Error(`vl ${what} failed: ${err.slice(0, 400)}`);
+  const m = err.match(/^\[fuel\] guest: (\d+)$/m);
+  if (fuel && !m) {
+    throw new Error(`vl ${what} printed no \`[fuel]\` line: this host predates $VL_FUEL; rebuild scripts/vl-host`);
   }
-  return { wall, cpu: childCpu(new TextDecoder().decode(stdout)) };
+  const a = err.match(/^\[alloc\] guest: (\d+)$/m);
+  return {
+    wall,
+    cpu: childCpu(new TextDecoder().decode(stdout)),
+    fuel: m ? Number(m[1]) : 0,
+    alloc: a ? Number(a[1]) : 0,
+  };
 };
 
 const build = (src: string, out: string): Promise<Cost> =>
-  spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER]);
+  spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true);
 
-// The floor on the denominator keeps one spike on a sub-second arm from dominating the
-// quotient; every pair below is sized so the cheaper arm clears it on an idle box, so the
-// floor is a safety net and not the thing being measured. Its two values carry over from
-// the wall-clock reading unchanged, because an idle `vl build` spends what it takes: CPU
-// ran 4-8% over wall across every axis.
-const FLOOR = 0.4;
+// A build under the NULL collector, which never frees, so its `[alloc]` line is every byte the
+// compile allocated — the quantity the null collector's 4 GiB heap caps. The reading is the
+// process's resident growth, and a process that first compiled the seed for this engine reuses
+// the memory that compile freed, reading up to ~30 MB low; one warm build per file run first.
+let nullWarm: Promise<Cost> | null = null;
+const buildNull = async (src: string, out: string): Promise<Cost> => {
+  nullWarm ??= (async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_warm_" });
+    try {
+      Deno.writeTextFileSync(`${dir}/w.vl`, "print(1)\n");
+      return await spawn("the warm-up build", ["build", `${dir}/w.vl`, "-o", `${dir}/w.wasm`, "--compiler", COMPILER], true, {
+        VL_COMPILE_GC: "null",
+      });
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  })();
+  await nullWarm;
+  const c = await spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true, {
+    VL_COMPILE_GC: "null",
+  });
+  if (!(c.alloc > 0)) {
+    throw new Error(`vl build on ${src} printed no \`[alloc]\` line: this host predates it; rebuild scripts/vl-host`);
+  }
+  return c;
+};
+
+// The floor on a RUNTIME pair's denominator keeps one spike on a sub-second arm from
+// dominating the quotient. A fuel pair has none: no spike can land on a count.
 const RUN_FLOOR = 0.05;
 const VERBOSE = Deno.env.get("VL_SCALING_VERBOSE") === "1";
 
-// A suspicious ratio buys one more INTERLEAVED round — many, one, many, one — and takes
-// the per-side minimum, so a burst that hits one arm is dropped rather than being divided
-// by an arm it missed. A spike does not repeat, a quadratic does.
+const fail = (axis: string, bar: number, note: string, reading: string, why: string): never => {
+  throw new Error(
+    `${axis}: the many-entity arm cost ${reading} for the same work reshaped (bar ${bar}) — ` +
+      `something is being re-derived per ${axis} entity. ${note} Profile it with ` +
+      `docs/internals/profiling-the-compiler.md and bank the answer. ${why}`,
+  );
+};
+
+// A compile pair: both arms at once, graded on the ratio of their guest fuel.
+const gradeFuel = async (
+  axis: string,
+  bar: number,
+  note: string,
+  many: () => Promise<Cost>,
+  one: () => Promise<Cost>,
+): Promise<number> => {
+  const [m, o] = await Promise.all([many(), one()]);
+  if (!(m.fuel > 0 && o.fuel > 0)) throw new Error(`${axis}: an arm read no fuel (${m.fuel}, ${o.fuel})`);
+  const ratio = m.fuel / o.fuel;
+  const reading = `${m.fuel.toExponential(3)} fuel against ${o.fuel.toExponential(3)} ` +
+    `(ratio ${ratio.toFixed(3)}; ${m.cpu.toFixed(2)}s / ${o.cpu.toFixed(2)}s cpu)`;
+  if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
+  if (ratio > bar) {
+    fail(axis, bar, note, reading, "(The ratio is of guest fuel, a count, so box load cannot move it.)");
+  }
+  return ratio;
+};
+
+// A runtime pair, on CPU. A suspicious ratio buys one more INTERLEAVED round — many, one,
+// many, one — and takes the per-side minimum, so a burst that hits one arm is dropped
+// rather than being divided by an arm it missed. A spike does not repeat, a quadratic does.
 const grade = async (
   axis: string,
   bar: number,
@@ -328,20 +566,17 @@ const grade = async (
   }
   const say = (xs: Cost[]) =>
     `${least(xs, (c) => c.cpu).toFixed(2)}s cpu (${least(xs, (c) => c.wall).toFixed(2)}s wall)`;
-  if (VERBOSE) {
-    console.log(
-      `[scaling] ${axis}: many ${say(ms)} one ${say(os)} ` +
-        `ratio ${ratio().toFixed(2)} bar ${bar}`,
-    );
-  }
+  const reading = `${say(ms)} against ${say(os)} (ratio ${ratio().toFixed(2)})`;
+  if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
   if (ratio() > bar) {
-    throw new Error(
-      `${axis}: the many-entity arm cost ${say(ms)} against ${say(os)} for the same work ` +
-        `reshaped (ratio ${ratio().toFixed(2)}, bar ${bar}) — something is being ` +
-        `re-derived per ${axis} entity. ${note} Profile it with ` +
-        `docs/internals/profiling-the-compiler.md and bank the answer. (The ratio is of ` +
-        `CPU, so box load is not the explanation; wall far above cpu means only that the ` +
-        `run was starved.)`,
+    fail(
+      axis,
+      bar,
+      note,
+      reading,
+      "(The ratio is of CPU, which cancels a uniform slowdown but NOT a burst that lands on " +
+        "one arm; it read over the bar in two interleaved rounds, which a burst rarely does twice. " +
+        "Wall far above cpu means only that the run was starved.)",
     );
   }
 };
@@ -351,18 +586,16 @@ const gradePair = async (
   bar: number,
   note: string,
   mk: (dir: string) => Promise<[string, string]> | [string, string],
-  floor: number = FLOOR,
-): Promise<void> => {
+): Promise<number> => {
   const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis}_` });
   try {
     const [manySrc, oneSrc] = await mk(dir);
-    await grade(
+    return await gradeFuel(
       axis,
       bar,
       note,
       () => build(manySrc, `${dir}/many.wasm`),
       () => build(oneSrc, `${dir}/one.wasm`),
-      floor,
     );
   } finally {
     await Deno.remove(dir, { recursive: true });
@@ -375,17 +608,13 @@ const twoFiles = (dir: string, many: string, one: string): [string, string] => {
   return [`${dir}/many.vl`, `${dir}/one.vl`];
 };
 
-const axis = (
-  name: string,
-  bar: number,
-  note: string,
-  mk: (d: string) => [string, string],
-  floor?: number,
-) =>
+const axis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
   Deno.test({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
-    fn: () => gradePair(name, bar, note, mk, floor),
+    fn: async () => {
+      await gradePair(name, bar, note, mk);
+    },
   });
 
 // Measured 2026-09-03, box load 3 to 101 — absolute times moved 3x over that range while
@@ -406,59 +635,188 @@ axis(
   (d) => twoFiles(d, genFunctions(1600, 20), genFunctions(80, 400)),
 );
 
+// Lane AL's pair: 1,200 functions with a parameter against 60, under a `??` family. Fuel reads
+// 1.06; master read 3.11, from `anonLeafNarrowUseMark` scanning every node for each function's
+// name. The calls pass literals, so the per-argument scans are not exercised here.
+axis(
+  "functions with parameters x identifiers",
+  2.0,
+  "A per-function question in `anonLeafNarrowUseMark` (compiler/emit_collect.vl) is scanning the arena instead of the resolver index.",
+  (d) => twoFiles(d, genFamilyFunctions(1200, 20), genFamilyFunctions(60, 400)),
+);
+
+// Lane HS's GROWTH pair, 2,400 functions against 600, so linear reads 4. Fuel reads 4.07;
+// master read 12.97, from `fieldClosureFeOfRecvRaw` scanning every `Call` for a parameter's
+// call sites where the callee-name index answers them directly.
+axis(
+  "record-parameter field calls",
+  5.1,
+  "`fieldClosureFeOfRecvRaw` (compiler/emit_classify.vl) is scanning the arena for a parameter's call sites instead of `callsOfCallee`.",
+  (d) => twoFiles(d, genParamFieldCalls(2400), genParamFieldCalls(600)),
+);
+
+// Lane HS's third pair, 1,600 calls against 400, so linear reads 4. Fuel reads 3.92; with the
+// capture memo unarmed in `monomorphize` it read 14.16, every call re-walking the frame.
+axis(
+  "closure arguments in one function",
+  5.0,
+  "`captureNamesOf` is re-walking a frame per query in `monomorphize`; is the pass still in `passKeepsCaptures` (compiler/emit_sections.vl)?",
+  (d) => twoFiles(d, genClosureArgCalls(1600), genClosureArgCalls(400)),
+);
+
+// Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
+// one. Fuel reads 3.38; the #3422 compiler read 6.17, from `sigKeyOfTy` and
+// `structIndexOfTypeName` re-deriving the callee's key per call where the type-registry
+// generation memo answers it once.
+axis(
+  "signature width x calls",
+  4.3,
+  "`sigKeyOfTy` or `structIndexOfTypeName` (compiler/emit_classify.vl) is re-deriving per call instead of reading its `tyRegGenNow` memo.",
+  (d) => twoFiles(d, genSigWidthCalls(2000, 64, true), genSigWidthCalls(2000, 64, false)),
+);
+
 // D2150's pair: a registry lookup that scans every registered set made the many arm
 // quadratic in the sets; the member-set index keeps it linear.
 axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
   twoFiles(d, genLitSets(3000, 1), genLitSets(3000, 20)));
 
 // 1.37 / 1.15 / 1.19.
-axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
+axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
 // The pair moved 800 -> 2,400 because at 800 the cheap arm ran 0.16 s under a 0.25 s floor:
 // the floor was the denominator, so the reading was an absolute budget and a constant-factor
 // regression was invisible. At 2,400 the cheap arm is 0.6 to 1.2 s, 2.4 to 3.2x the floor, so
 // the reading is a ratio again — median 1.28 to 1.40 over 44 interleaved rounds spanning load
-// 22 to 235, against master's 1.42 to 1.48 beside it. The arms have converged, so the bar
-// would be the family default; it sits at 3.0 because one round of the 44 drew 2.30 and 2.5
-// would have 1.09x on that. 3.0 is 1.3x the worst round and 1.8x the second worst, and the
-// pre-#2630 compiler — still carrying the scans since taken off this axis — reads 4.42 here.
+// 22 to 235, against master's 1.42 to 1.48 beside it. The arms have converged, so the bar is
+// the family default (fuel reads 1.88); the pre-#2630 compiler — still carrying the scans
+// since taken off this axis — read 4.42 here on CPU.
 axis(
   "unions",
-  3.0,
+  2.5,
   "No frame is above 5% on this axis any more — profile the many arm before naming a cause.",
   (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
-  0.25,
+);
+
+// D2398's pair: the start function orders each top-level node, and a moved write keyed by a
+// list scan made the module-scope arm quadratic (0.96 s at 8,000, 3.82 s at 16,000).
+axis(
+  "module-scope value writes",
+  2.5,
+  "The start function's merge (`startStmtOrd`, compiler/emit_sections.vl) is scanning per step.",
+  (d) => twoFiles(d, genValueWrites(12000, false), genValueWrites(12000, true)),
+);
+
+// D2872's GROWTH pair: the in-function arm at `n` against `n/4`, so linear reads 4 and
+// quadratic 16. Fuel reads 4.02; master read 14.97, from a per-name scan of every local in
+// scope (`igWalk`) and a list shift per moved write (`asvList`).
+axis(
+  "in-function value writes",
+  5.0,
+  "`igWalk`'s shadow lookup (compiler/emit_sections.vl) or `asvList`'s rewrite (compiler/emit_rewrite.vl) is scanning per write.",
+  (d) => twoFiles(d, genValueWrites(12000, true), genValueWrites(3000, true)),
+);
+
+// D3276's GROWTH pair, 8,000 functions of arm and branch bodies against 2,000, so linear reads 4.
+// A per-block scan of the object-looking arms once read 9.5x master at 8,000.
+axis(
+  "object-looking arm bodies",
+  5.0,
+  "A per-block or per-function pass is scanning the arm bodies (compiler/parser.vl `parseArmBody`).",
+  (d) => twoFiles(d, genArmBodies(8000), genArmBodies(2000)),
+);
+
+// D2914's GROWTH pair, 400 re-seated lists against 100, so linear reads 4 and quadratic 16. A
+// known super-linear axis: fuel reads 8.42 on master `a41bd80e8`, before the use check existed,
+// and 8.33 with it, so the bar is 1.25x that. A check that walked the program once per list
+// read 15.4 here.
+axis(
+  "adopted record lists",
+  10.5,
+  "A re-seated list's use check (`rsNarrowUseRefuse`, compiler/emit_classify.vl) is walking the program per list.",
+  (d) => twoFiles(d, genAdoptedLists(400, 1), genAdoptedLists(100, 1)),
+);
+
+// D2914's same-name GROWTH pair: 800 functions each adopting its own `il` against 200, so
+// linear reads 4 and quadratic 16. Fuel reads 4.03 on master `e91e04a8f` and with the use check
+// alike, so the bar is 1.25x that; the check that walked every `il` in the program read 5.78.
+axis(
+  "adopted record lists sharing a name",
+  5.0,
+  "A re-seated list's use check (`rsUsesOf`, compiler/emit_classify.vl) is reading other functions' identifiers.",
+  (d) => twoFiles(d, genAdoptedListsFn(800), genAdoptedListsFn(200)),
+);
+
+// D2933's same-name GROWTH pair: 800 functions each re-seating its own `r` against 200, so
+// linear reads 4 and quadratic 16. Fuel reads 3.94 on master `8615a730d` and with the re-seat
+// alike, so the bar is 1.25x that.
+axis(
+  "re-seated record literals sharing a name",
+  5.0,
+  "A record literal's re-seat (`objLitBindDestRow`, compiler/emit_classify.vl) is reading other functions' identifiers.",
+  (d) => twoFiles(d, genReseatedRecordsFn(800), genReseatedRecordsFn(200)),
+);
+
+// D2922's DEPTH pair: a return chain 200 functions deep against 50, so linear reads 4. Fuel reads
+// 3.96 on master `8615a730d` and 3.95 with the call walk, so the bar is 1.25x that; a walk with
+// no per-query visited set traps the compiler on both arms.
+axis(
+  "records returned through a deep call chain",
+  5.0,
+  "A re-seated value's return walk (`rsRetCallUse`, compiler/emit_classify.vl) is re-walking a function's calls per path.",
+  (d) => twoFiles(d, genReturnChain(200), genReturnChain(50)),
+);
+
+// D3051's DEPTH pair: module const chains 200 deep against 50, each const naming the one
+// before it twice, so linear reads 4 and a classifier re-walking a named const's initializer
+// reads 2^150. Fuel reads 3.43; master `0b618d160` traps on both arms, and with the f64 and i64
+// answers memoised but not the string one it read 6.31.
+const genConstChain = (depth: number): string => {
+  const o: string[] = [];
+  for (const [p, a0] of [["A", "3"], ["F", "3.0"], ["L", "3 as i64"]]) {
+    o.push(`const ${p}0 = ${a0}`);
+    // The chain holds its value: an exact constant past 64 bits is refused where it is read, and
+    // one that grows is computed at its full width, which is not what this axis measures.
+    for (let i = 1; i <= depth; i++) o.push(`const ${p}${i} = ${p}${i - 1} * 3 - ${p}${i - 1} * 2`);
+  }
+  o.push(`function g() { print(A${depth}) print(F${depth}) print(L${depth}) }`, "g()");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "module const chain depth",
+  5.0,
+  "A float, i64 or string classifier (`globalReadAsk`, compiler/emit_classify.vl) is re-walking a named global's initializer per mention.",
+  (d) => twoFiles(d, genConstChain(200), genConstChain(50)),
 );
 
 // 1.09 / 0.97 / 1.13.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
 
-// 1.99 / 2.47 / 2.58 / 2.75 over four runs — the widest spread in the family and a known
-// super-linear axis, so the bar clears the top of it. `modIndexOfKey` (compiler/driver.vl)
-// and `capHas` (compiler/emit_base.vl) are 47% and 35% INCLUSIVE on a 400-module build,
-// both linear scans of a string-keyed table asked once per module, with `__str_eq__` under
-// them at 73% self. 800 modules against 400 is 4.45x, so a per-module arena scan would
-// roughly double this ratio and still be caught. Each function carries 30 statements so
-// the linear half is not startup-dominated; shrink that once those two stop scanning.
-// The super-linear axes' bars carry ~2x headroom over the IDLE ratio (modules 2.58,
-// closures 2.22): a ratio is load-tolerant but not load-proof, and the pairs that move
-// most with load are the ones whose cheap arm clamps on `FLOOR` while the dear arm does
-// not — the quotient is then an absolute budget on the dear arm. That is why a
-// super-linear bar sits above its measurement rather than at it, and why an axis whose
-// two arms cost the same can take the family default.
-// A doubling of the class (a new scan per entity) still clears every bar.
-axis("modules", 5.0, "The module merge is scaling with the file count.", (d) => [
+// The entry file's export table: deduping the staged names and resolving each one's target
+// scanned per export. Fuel reads 1.01; master `4179e4b36` read 4.23 here, and 8x the fuel at
+// 20,000 exports.
+axis(
+  "exports",
+  2.5,
+  "The export staging (`compileSrc`, compiler/driver.vl) or `emitExportSection`'s tables (compiler/emit_sections.vl) are scanning per export.",
+  (d) => twoFiles(d, genExports(8000, 1), genExports(8000, 20)),
+);
+
+// Fuel reads 1.07, so the bar is the family default. It read 3.2 while `modIndexOfKey` and
+// `modRecomputePending` (compiler/driver.vl) scanned the module table by string compare once
+// per commit: a key is an absolute path, so that ratio also grew with the length of $TMPDIR
+// (4.15 under an 80-character one). Each function carries 30 statements so the linear half
+// is not startup-dominated.
+axis("modules", 2.5, "The module merge is scaling with the file count.", (d) => [
   writeModules(`${d}/many`, 400, 2, 30),
   writeModules(`${d}/one`, 200, 4, 30),
 ]);
 
-// 1.14 / 0.51 / 2.22, and RISING with N (1.89 at 2,000, 3.39 at 6,000) — a known
-// super-linear axis, so the bar is set above the measurement rather than at 2.5.
-// `fnStmtsPosOf` (compiler/emit_classify.vl) is 21.2% self time on the many arm and
-// absent from the one arm: a linear scan of `fnStmts` asked once per closure.
-axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
+// Fuel reads 1.27, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_classify.vl)
+// is the scan that once made this axis super-linear: `fnStmts` walked once per closure.
+axis("closures", 2.5, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
   twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
 
 // 2.06 / 1.03 / 1.92, stable over three runs (1.92 / 1.89 / 1.97) and holding at load 57.
@@ -472,7 +830,7 @@ axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
 // 0.035 / 0.029. The residual ~1.9 here is the many arm's extra function declarations.
 axis(
   "callback slots",
-  4.0,
+  2.5,
   "`anonLeafCloSlotMark` / `anonLeafParamFnTargetAt` are scaling with the callback-parameter count (D1514).",
   (d) => twoFiles(d, genCallbacks(300, 1), genCallbacks(300, 20)),
 );
@@ -490,6 +848,17 @@ axis(
 axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
 
+// 1.73 (0.116G / 0.067G fuel) against master `b05991d98`'s 5.75 (0.385G): a first instance's
+// slot write retired `buildFnMap`'s whole banked prefix, so every instance re-classified every
+// function (D3761). Still super-linear in N through the other whole-program passes of
+// `monoRebuild` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
+axis(
+  "generic first instances",
+  2.5,
+  "`buildFnMap` re-classifies the whole program per first instance of a generic (D3761).",
+  (d) => twoFiles(d, genFirstInsts(200, true), genFirstInsts(200, false)),
+);
+
 // 0.78 / 0.91 / 0.86, against 36.51 / 2.82 / 12.95 on the pre-D1657 compiler — the axis the
 // family was blind to. Each covariant binding is one `covarValueWriteState` query, and every
 // query walked the whole arena a dozen times over. Both arms declare the same functions and
@@ -501,6 +870,95 @@ axis(
   2.5,
   "The `cw*` alias closure is being re-derived per covariant binding rather than read off `cwIxBuild`'s index (D1628/D1657).",
   (d) => twoFiles(d, genCovar(1400, 1400), genCovar(1400, 70)),
+);
+
+// NARROWED MODULE BINDINGS read by top-level functions. Both arms declare `n` nullable module
+// `let`s, assign each once and declare `n` functions reading one each; only whether the
+// functions come after the assignments, and so are checked under their narrowings, differs.
+// A per-function pass over every narrowed binding is quadratic in the many arm (D2529).
+const genNarrowedGlobals = (n: number, after: boolean): string => {
+  const lets: string[] = [];
+  const asg: string[] = [];
+  const fns: string[] = [];
+  for (let i = 0; i < n; i++) {
+    lets.push(`let g${i}: i32 | null = null`);
+    asg.push(`g${i} = ${i % 13}`);
+    fns.push(`function f${i}() { return (g${i} ?? 0) + 1 }`);
+  }
+  const o = after ? [...lets, ...asg, ...fns] : [...lets, ...fns, ...asg];
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}()`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "narrowed module bindings",
+  2.5,
+  "A top-level function is asking about every narrowed module binding, not only the ones it reads (D2529).",
+  (d) => twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
+);
+
+// UN-ANNOTATED CALLBACK LAMBDAS. `n` lambdas `(g) => g(out)`, each called once with a
+// function, either all in one function over one list or one per function. A list handed to an
+// un-annotated parameter used as the callee asks which function each call of the lambda passes
+// it (D2748); asked by walking the scope once per lambda, the one-function arm is quadratic.
+const genCallbackLambdas = (n: number, oneFn: boolean): string => {
+  const o: string[] = [
+    "type Circle = { r: i32 }",
+    "type Sq = { s: i32 }",
+    "type Shape = Circle | Sq",
+    "function sum(xs: Shape[]): i32 { xs.length * 3 }",
+    "function lenC(xs: Circle[]): i32 { xs.length * 5 }",
+    "function main() {",
+    "  const sh: Shape[] = [{ r: 1 }]",
+    "  print(sum(sh))",
+  ];
+  if (oneFn) o.push("  const out = [{ r: 3 }]");
+  for (let i = 0; i < n; i++) {
+    if (oneFn) o.push(`  const ap${i} = (g) => g(out)`, `  print(ap${i}(lenC))`);
+  }
+  o.push("}", "main()");
+  for (let i = 0; i < n && !oneFn; i++) {
+    o.push(
+      `function f${i}() {`,
+      "  const out = [{ r: 3 }]",
+      `  const ap${i} = (g) => g(out)`,
+      `  print(ap${i}(lenC))`,
+      "}",
+      `f${i}()`,
+    );
+  }
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "un-annotated callback lambdas per function",
+  2.5,
+  "The lambda's calls are being found by a scope walk per lambda rather than off `dslEnsure`'s per-scope index (D2748).",
+  (d) => twoFiles(d, genCallbackLambdas(120, true), genCallbackLambdas(120, false)),
+);
+
+// CAPTURED NARROWED LOCALS. One function narrows `n` nullable locals by assignment and makes a
+// closure after each; in the many arm each closure captures its own local, in the other every
+// closure captures the first. Both arms make the same closures in one frame, so the emitter's
+// per-frame cost cancels and only the per-name capture question moves: a walk of the frame per
+// captured name is quadratic in the many arm (D2529).
+const genNarrowedCaptures = (n: number, distinct: boolean): string => {
+  const o: string[] = ["let acc = 0", "function m() {"];
+  for (let i = 0; i < n; i++) {
+    o.push(`  let g${i}: i32 | null = null`, `  g${i} = ${i % 13}`);
+    o.push(`  const h${i} = () => (g${distinct ? i : 0} ?? 0) + 1`, `  acc = acc + h${i}()`);
+  }
+  o.push("}", "m()", "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "captured narrowed locals",
+  2.5,
+  "A closure is re-walking its frame per captured name (D2529).",
+  (d) => twoFiles(d, genNarrowedCaptures(400, true), genNarrowedCaptures(400, false)),
 );
 
 // `n` calls handing one record to a function that reads a parameter field `n` times. `wide`
@@ -672,7 +1130,7 @@ const genManyClosedSiblingReads = (n: number, many: boolean): string => {
 
 axis(
   "reads after many closed sibling shadows",
-  2.5,
+  3.4,
   "`plBestDupAt` is stepping past every closed sibling instead of jumping via `plSortedSkip` (D2326).",
   (d) => twoFiles(d, genManyClosedSiblingReads(12000, true), genManyClosedSiblingReads(12000, false)),
 );
@@ -682,7 +1140,9 @@ axis(
 // (`u`, `u$s1`, …) once it is captured, so `startBlockLetRowOfSid` is asked about `n` DISTINCT
 // sids rather than one. Its own per-sid scan of every start statement made that O(n) per sid,
 // O(n²) overall — the query-side fix above does not touch this, since each sid is asked once
-// (D2326).
+// (D2326). A GROWTH pair — `n` blocks against `n/4` — because a one-block arm is an empty
+// compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; today it reads
+// 7.14, and with `startBlockLetRowOfSid`'s memo disabled 15.3.
 const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
   const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
   const blocks = many ? n : 1;
@@ -704,9 +1164,54 @@ const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
 
 axis(
   "many distinct captured sibling blocks",
-  10,
+  8.9,
   "`startBlockLetRowOfSid` re-scans every start statement per DISTINCT sid (D2326).",
-  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(3000, false)),
+  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(750, true)),
+);
+
+// `n` loops walking one name, each binding a copy of its loop variable that a closure
+// captures. A capture's binding and its enclosing loop are found by position among every loop
+// of that name in the frame, so a per-capture walk over all of them is O(n) per capture and
+// O(n²) overall; round 2 of #3281 was that, and trapped the compiler at n = 300 (D3139). A
+// GROWTH pair, `n` loops against `n/4`: linear reads 4 and quadratic 16. It reads 4.9, as
+// master before the positional lookup did, and 15.1 on the regressed compiler.
+const genLoopCaptures = (n: number): string => {
+  const o = ["function run(xs: i32[]) {"];
+  for (let i = 0; i < n; i++) {
+    o.push("  for q in xs {", "    const c = q", "    const f = () => c", "    print(f())", "  }");
+  }
+  o.push("}", "run([1])");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "loops each capturing a copy of one loop variable",
+  6.2,
+  "A capture is resolving its loop or binding by scanning every loop of its name (D3139).",
+  (d) => twoFiles(d, genLoopCaptures(200), genLoopCaptures(50)),
+);
+
+// `n` closures made under a narrowing of the module global `g`, each called by name. With a
+// top-level function writing `g`, every closure is asked whether it escapes its body and every
+// call whether it reads a narrowing a writer may have ended; without it neither is asked. Both
+// walks are once per body, not per closure (D2402). A closure-written LOCAL would price the
+// emitter's cell captures instead, which is not this axis.
+const genCapturedNarrowings = (n: number, writer: boolean): string => {
+  const o = ['let g: string | null = "ab"'];
+  if (writer) o.push("function setG() { g = null }");
+  o.push("function f(): i32 {", "  let t = 0", "  if g != null {");
+  for (let i = 0; i < n; i++) o.push(`    const c${i} = (): i32 => g.length`, `    t = t + c${i}()`);
+  o.push("  }", "  t", "}", "print(f())");
+  return o.join("\n") + "\n";
+};
+
+// The bar sits under the others' because the cheap arm is itself super-linear in closures
+// elsewhere, which compresses the ratio: the per-closure walk this guards read 2.2 here.
+axis(
+  "closures under a narrowing some function may end",
+  1.8,
+  "A closure made under a narrowing re-walks its enclosing body, or a call scans every capture record (D2402).",
+  (d) => twoFiles(d, genCapturedNarrowings(1600, true), genCapturedNarrowings(1600, false)),
 );
 
 // One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
@@ -801,10 +1306,10 @@ const genNesting = (n: number, nested: boolean): string => {
       kind === 0
         ? "{ const m = acc + 1; acc = m; "
         : kind === 1
-        ? `L${k}: while true { acc = acc + 1; `
+        ? `@L${k} while true { acc = acc + 1; `
         : "if a > 0 { acc = acc + 1; ",
     );
-    close.push(kind === 1 ? `acc = acc + 1; break L${k} } ` : "} ");
+    close.push(kind === 1 ? `acc = acc + 1; break @L${k} } ` : "} ");
   }
   const body = nested
     ? open.join("") + [...close].reverse().join("")
@@ -866,14 +1371,203 @@ const genConcatChains = (chains: number, len: number): string => {
   return o.join("\n") + "\n";
 };
 
-// One 300-operand concat per element type against 75 4-operand ones. Asking a concat's
-// list rep walked its whole left operand when the recorded type did not settle it, and the
-// per-query memo was a linear scan, so the long arm cost ~n^3 and trapped at n = 1000 (D2275).
+// A GROWTH pair: one 300-operand concat per element type against one 75-operand one, so
+// linear reads 4, quadratic 16 and cubic 64. Asking a concat's list rep walked its whole left
+// operand when the recorded type did not settle it, and the per-query memo was a linear scan,
+// so the long arm cost ~n^3 and trapped at n = 1000 (D2275). Quadratic today.
 axis(
   "list concat chain length",
-  2.5,
+  17.3,
   "A concat's list rep is re-derived from its operands instead of its recorded type, or `exprListRep`'s memo stopped being indexed by node (D2275).",
-  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(75, 4)),
+  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(1, 75)),
+);
+
+// D2445's GROWTH pair: one `n`-term `+` chain per operand width (i32, f32, f64, i64, string)
+// at 2,000 against 500, so linear reads 4 and quadratic 16. Each operator's emission asked its
+// operands' width, and each answer re-walked the whole left subtree, so the long arm was cubic
+// and trapped past about 600 terms; the arithmetic classifiers now memoise per node.
+const genOperatorChains = (n: number): string => {
+  const o: string[] = [];
+  for (const [f, ty, arg] of [["i", "i32", "1"], ["g", "f32", "0.25"], ["d", "f64", "0.5"], ["l", "i64", "3"], ["s", "string", '"ab"']]) {
+    o.push(`function ${f}(a: ${ty}): ${ty} {`, `  ${Array(n).fill("a").join(" + ")}`, "}");
+    o.push(f === "s" ? `print(${f}(${arg}).length)` : `print(${f}(${arg}))`);
+  }
+  // The same chains as the operand of a comparison, a condition and a `&&`, where the parser's
+  // mark has to land on the chain's own root rather than on the operator that wraps it.
+  const c = Array(n).fill("a").join(" + ");
+  o.push(
+    `function ceq(a: i32) { ${c} == 0 }`,
+    "print(ceq(1))",
+    `function cif(a: i32, limit: i32) { if ${c} > limit { return 1 } 0 }`,
+    "print(cif(1, 3))",
+    `function cand(b: boolean, a: i32) { b && ${c} > 3 }`,
+    "print(cand(true, 1))",
+    `function clt(a: f64) { ${c} < 0.5 }`,
+    "print(clt(0.5))",
+    `function cseq(a: string) { ${c} == \"x\" }`,
+    "print(cseq(\"x\"))",
+  );
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "arithmetic operator chain length",
+  5.0,
+  "An operand-width classifier re-walks its subtree per level (`exprIsF64`/`exprIsF32`/`exprIsI64`/`exprIsStrConcat`, compiler/emit_classify.vl); see D2445.",
+  (d) => twoFiles(d, genOperatorChains(2000), genOperatorChains(500)),
+);
+
+// D3417's GROWTH pair: one `n`-element literal per element kind (i32, f64, i64, a record) at
+// 40,000 against 10,000, so linear reads 4 and quadratic 16; it reads 2.9, the fixed cost of a
+// compile riding the short arm. A scalar literal past the operand cap is a data segment, and
+// each element is asked its width once per classification.
+const genArrayLiterals = (n: number): string => {
+  const o: string[] = [];
+  const els = (f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join(", ");
+  o.push(`const a: i32[] = [${els((i) => `${(i * 7919) % 2001 - 1000}`)}]`);
+  o.push(`const b = [${els((i) => `${i % 97}.5`)}]`);
+  o.push(`const c: i64[] = [${els((i) => `${i * 3}`)}]`);
+  o.push(`function mk() {\n  return [${els((i) => `{ k: ${i % 89} }`)}]\n}`);
+  o.push("print(a[a.length - 1] + mk()[1].k)", "print(b[3])", "print(c[c.length - 1])");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "array literal length",
+  5.0,
+  "A literal's elements are re-scanned per element, or a scalar literal past the operand cap stopped lowering as a data segment (`arrLitNumKind`, `arrLitDataBuild`; D3417).",
+  (d) => twoFiles(d, genArrayLiterals(40000), genArrayLiterals(10000)),
+);
+
+// A chain of `depth` generics, each calling the next, every body carrying deferred
+// constraints over its `T`; `calleeFirst` declares the chain bottom-up.
+const genGenericChain = (depth: number, calleeFirst: boolean): string => {
+  const fns: string[] = [];
+  for (let i = 0; i < depth; i++) {
+    const body = [`function g${i}<T>(x: T) {`, "  const a: i32 = x + 1", "  takes(x * 2)", "  print(x - a)"];
+    if (i + 1 < depth) body.push(`  g${i + 1}(x)`);
+    body.push("}");
+    fns.push(body.join("\n"));
+  }
+  if (calleeFirst) fns.reverse();
+  return ["function takes(n: i32) { print(n) }", ...fns, "g0(3)"].join("\n") + "\n";
+};
+
+// D3062's ORDER pair: one chain declared callee-first against caller-first. Each order's
+// constraints are recorded once before a caller is checked; a callee-first body walked twice
+// read 2.13 here, and fuel reads 0.60 without that.
+axis(
+  "generic chain declared callee-first",
+  1.25,
+  "A generic body is walked for its constraints and then again for real (`cstrProbeBefore`, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genGenericChain(60, true), genGenericChain(60, false)),
+);
+
+// D3101's GROWTH pair: the caller-first chain at depth 60 against 15, so linear reads 4 and
+// quadratic 16. Known super-linear: every call re-validates each constraint its callee
+// inherited from the rest of the chain. Fuel reads 17.7, so the bar is 1.25x that.
+axis(
+  "generic chain depth",
+  22.2,
+  "A call re-validates its callee's inherited constraints (`validate*Cstrs`, compiler/typecheck.vl); see D3101.",
+  (d) => twoFiles(d, genGenericChain(60, false), genGenericChain(15, false)),
+);
+
+// D3253's GROWTH pair: a caller-first generic chain whose every body also hands `[x]` to a
+// concrete list parameter, at depth 160 against 40, so linear reads 4. A composite argument's
+// demand re-noted to every caller up the chain read 82 here; resolved once at its pin it reads
+// 7.42, the same as master's 7.41 without the demand, so the bar is 1.25x that.
+const genCompArgChain = (depth: number): string => {
+  const o = ["function h(a: f64[]) { return a.length }"];
+  for (let i = 0; i < depth; i++) {
+    const next = i + 1 < depth ? `g${i + 1}(x) + ` : "";
+    o.push(`function g${i}<T>(x: T): i32 { return ${next}h([x]) }`);
+  }
+  o.push("print(g0(1.5))");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generic chain with list-literal arguments",
+  9.3,
+  "A composite argument's demand (`ACF_COMP`, compiler/typecheck.vl) is being moved out to every caller instead of resolved at its pin.",
+  (d) => twoFiles(d, genCompArgChain(160), genCompArgChain(40)),
+);
+
+// D3246's GROWTH pair: a chain of `n` literal bindings, each stored into the next, the first from
+// an `i64`, at 400 against 100, so linear reads 4 and quadratic 16. Every link takes `i64` from
+// the one before it, so the solve must carry the answer down the whole chain. Fuel reads 3.97,
+// so the bar is 1.25x that.
+const genLiteralChain = (n: number): string => {
+  const o = ["function big() { 3000000000 }", "let a0 = 0", "a0 = big()"];
+  for (let i = 1; i < n; i++) o.push(`let a${i} = 0`, `a${i} = a${i - 1}`);
+  o.push(`print(a${n - 1} + a0)`);
+  return o.join("\n") + "\n";
+};
+
+// The flow-narrowing join at an `if` (DECISIONS.md, "Flow narrowing: per-path facts meet at
+// joins") folds the ledger rows of its own subtree once, and hands its enclosing join one
+// summary row per key. Two GROWTH pairs, `n` against `n/4`, so linear reads 4 and quadratic 16:
+// `n` sequential joins of one name in one function, and joins nested `n` deep. Sequential reads
+// 3.98. Nested reads 5.26 and is super-linear in DEPTH, not size: a write walks the name's
+// narrowing layer per enclosing block (`narWriteStorage`, `narBindDepthOf`), as a nested
+// straight-line write already did on master `296e1141d` (8.2 there, 4.6 here). The ratio keeps
+// climbing with depth (8.0 at 400 against 100), so its bar, 1.25x the reading, records DEBT.
+const genSeqJoins = (n: number): string => {
+  const o = [
+    "function nn(v: i32): i32 | null {",
+    "  if v < 0 { return null }",
+    "  return v",
+    "}",
+    "function f(k: i32): i32 {",
+    "  let acc = 0",
+    "  let x = nn(k)",
+  ];
+  for (let i = 0; i < n; i++) {
+    o.push(`  x = nn(k - ${i % 3})`, `  if x == null { x = ${i % 7} } else { x = x + 1 }`, "  acc = acc + x");
+  }
+  o.push("  acc", "}", "print(f(1))");
+  return o.join("\n") + "\n";
+};
+
+const genNestedJoins = (n: number): string => {
+  const o = [
+    "function nn(v: i32): i32 | null {",
+    "  if v < 0 { return null }",
+    "  return v",
+    "}",
+    "function f(k: i32, c: boolean): i32 {",
+    "  let acc = 0",
+    "  let x = nn(k)",
+  ];
+  for (let i = 0; i < n; i++) {
+    const pad = "  ".repeat(i + 1);
+    o.push(`${pad}x = nn(k - ${i % 3})`, `${pad}if x == null { x = ${i % 7} }`, `${pad}acc = acc + x`, `${pad}if c {`);
+  }
+  for (let i = n - 1; i >= 0; i--) o.push(`${"  ".repeat(i + 1)}}`);
+  o.push("  acc", "}", "print(f(1, true))");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "literal binding store chain",
+  5.0,
+  "The literal-binding solve (`lbiSettleEdges`, compiler/typecheck.vl) is re-solving every binding per link.",
+  (d) => twoFiles(d, genLiteralChain(400), genLiteralChain(100)),
+);
+
+axis(
+  "sequential if joins of one name",
+  5.0,
+  "An `if`'s arm join (`applyArmJoins`, compiler/typecheck.vl) is folding ledger rows outside its own subtree.",
+  (d) => twoFiles(d, genSeqJoins(1200), genSeqJoins(300)),
+);
+
+axis(
+  "if joins nested deep",
+  6.6,
+  "An enclosing `if`'s join re-folds its inner joins' rows (`narCompactIf`, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genNestedJoins(120), genNestedJoins(30)),
 );
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
@@ -891,7 +1585,7 @@ axis(
 // quadratic. Measured 2026-09-03 at 40,000 appends: **16.10 on master, 0.32 after** (the
 // append arm 0.805 s -> 0.02 s against the builder arm 0.028 s / 0.03 s). Bar 2.5.
 const runProg = (src: string): Promise<Cost> =>
-  spawn(`run on ${src}`, ["run", src, "--compiler", COMPILER]);
+  spawn(`run on ${src}`, ["run", src, "--compiler", COMPILER], false);
 
 const genAppendLoop = (n: number): string =>
   [
@@ -995,6 +1689,68 @@ Deno.test({
   },
 });
 
+// The same axis at a PLACE the binding proof does not cover: a field, a list cell, a map value
+// and a prepend, each appended `n` times in one loop, against the same four strings built
+// through std's builder. Each place copied its whole prefix per append before the site-cached
+// lowering (D2625), which made the many arm quadratic in any one of the four.
+const genPlaceAppendLoop = (n: number): string =>
+  [
+    "function build(n: i32): string {",
+    '  const o = { s: "" }',
+    '  const xs = ["", ""]',
+    "  const m: {[i32]: string} = Map()",
+    '  let p = ""',
+    "  let i = 0",
+    "  while i < n {",
+    '    o.s = o.s + "0123456789"',
+    '    xs[1] = xs[1] + "0123456789"',
+    '    m[0] = (m[0] ?? "") + "0123456789"',
+    '    p = "0123456789" + p',
+    "    i = i + 1",
+    "  }",
+    '  return o.s + xs[1] + (m[0] ?? "") + p',
+    "}",
+    `print(build(${n}).length)`,
+    "",
+  ].join("\n");
+
+const genPlaceJoinBuild = (n: number): string =>
+  [
+    'import { join } from "std:str"',
+    "function build(n: i32): string {",
+    "  let parts: string[] = []",
+    "  let i = 0",
+    '  while i < 4 * n { parts.push("0123456789"); i = i + 1 }',
+    '  return join(parts, "")',
+    "}",
+    `print(build(${n}).length)`,
+    "",
+  ].join("\n");
+
+Deno.test({
+  name: "scaling shape: place string append loop",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_pstrappend_" });
+    try {
+      const [manySrc, oneSrc] = twoFiles(dir, genPlaceAppendLoop(20000), genPlaceJoinBuild(20000));
+      await grade(
+        "place string append loop",
+        2.5,
+        "20,000 appends each to a field, a list cell, a map value and a prepended local, " +
+          "against the same strings through std's builder: the site-cached lowering " +
+          "(`strSiteArm` / `emitStrSiteCat`, compiler/wasmEmit.vl) stopped firing for at least " +
+          "one of the four, so its appends copy the whole prefix again (D2625).",
+        () => runProg(manySrc),
+        () => runProg(oneSrc),
+        RUN_FLOOR,
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 // 1.27 / 1.13 / 1.12 (wall, idle-ish box). GETTER CALLEES (D2135): the per-function summary is
 // one walk per callee instance, memoised, so N distinct callee chains cost what N/K chains read
 // K times each do. A summary that scans the program per callee separates the two arms.
@@ -1026,6 +1782,324 @@ axis(
   2.5,
   "A call's shadow test is walking the frame body per call (`chainShadowsAt`, D2289).",
   (d) => twoFiles(d, genShadowedCallee(20000, true), genShadowedCallee(20000, false)),
+);
+
+// `fns` functions of `arms` sibling blocks, each binding its function's one list name to a
+// literal and returning it, against the same program with every binding annotated `i32[]`.
+// The declared union is load-bearing: it is what makes the emitter look for a destination
+// that would re-type an un-annotated literal. A later same-named binding had no known scope
+// there and scanned the whole arena, so each cost the program (D2685). At 4 x 1,200: 7.49 /
+// 0.53 / 14.13 on the seed before D2685, 0.52 / 0.46 / 1.13 after.
+const genListLits = (fns: number, arms: number, annotated: boolean): string => {
+  const t = annotated ? ": i32[]" : "";
+  const o = ["type U = i32 | string"];
+  for (let f = 0; f < fns; f++) {
+    o.push(`function f${f}(n: i32): i32[] {`);
+    for (let a = 0; a < arms; a++) {
+      o.push(`  if n == ${a} {`, `    const out${f}${t} = [n, n + ${a}]`, `    return out${f}`, "  }");
+    }
+    o.push(`  const out${f}${t} = [n]`, `  out${f}`, "}");
+  }
+  o.push("let acc = 0");
+  for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f}).length`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "un-annotated list literals",
+  2.5,
+  "An un-annotated list literal's destination scan (`dsScopeRootOf`, compiler/emit_classify.vl) lost its binding's scope and walked the arena (D2685).",
+  (d) => twoFiles(d, genListLits(4, 1200, false), genListLits(4, 1200, true)),
+);
+
+// `n` callees returning a list, each called once from ONE caller, with the returns inferred
+// against annotated. Asking about an inferred-return callee's body used to evict the caller's
+// let plan, which the caller's next question rebuilt, so each call cost the caller (D2687).
+const genInferredCallees = (n: number, annotated: boolean): string => {
+  const t = annotated ? ": i32[]" : "";
+  const o = ["type U = i32 | string"];
+  for (let f = 0; f < n; f++) {
+    o.push(`function f${f}(n: i32)${t} {`, `  const out: i32[] = [n, ${f % 13}]`, "  out", "}");
+  }
+  o.push("function main() {", "  let acc = 0");
+  for (let f = 0; f < n; f++) {
+    o.push(`  acc = acc + f${f}(${f % 5}).length`);
+    fill(o, f, 2);
+  }
+  o.push("  print(acc)", "}", "main()");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "calls to inferred-return callees",
+  2.5,
+  "Asking about an inferred-return callee rebuilt the calling function's let plan (`plEnsure`, compiler/emit_base.vl; D2687).",
+  (d) => twoFiles(d, genInferredCallees(3000, false), genInferredCallees(3000, true)),
+);
+
+// `fns` functions each binding an un-annotated list `out`, beside one function that assigns
+// its own local `20 * fns` times, named `out` in the many arm and `sink` in the one. A
+// binding's store scan walked its name's occurrences in every frame rather than its own
+// (`cwIxFrHead`, compiler/typecheck.vl; D2688), so the sink's rows cost each binding.
+const genSharedListName = (fns: number, shared: boolean): string => {
+  const o = ["type U = i32 | string"];
+  for (let f = 0; f < fns; f++) {
+    o.push(
+      `function g${f}(n: i32): i32[] {`,
+      "  if n == 0 {",
+      "    const out = [n, n + 1]",
+      "    return out",
+      "  }",
+      "  const out = [n]",
+      "  out",
+      "}",
+    );
+  }
+  const s = shared ? "out" : "sink";
+  o.push("function h(k: i32): i32 {", `  let ${s} = k`);
+  for (let j = 0; j < 20 * fns; j++) o.push(`  ${s} = ${s} + ${j % 7}`);
+  o.push(`  ${s}`, "}", "let acc = h(1)");
+  for (let f = 0; f < fns; f += 50) o.push(`acc = acc + g${f}(${f}).length`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "a list name shared across functions",
+  2.0,
+  "An un-annotated list const's store scan walked its name's occurrences in every function (`constStoresForeignList`, D2688).",
+  (d) => twoFiles(d, genSharedListName(2000, true), genSharedListName(2000, false)),
+);
+
+// `n` generics that each call every other one at `<T>`, as one cycle or as a chain (a call to
+// an earlier one goes to a concrete twin instead), with no `is` anywhere. Whether a generic is
+// keyed by its exact pins is asked once per template, so a cycle settles once at its root; a
+// "no" left unsettled inside the cycle re-walked it per ask, exponential in `n` (D2684).
+const genGenericCycle = (n: number, cycle: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(`function h${i}(n: i32): boolean { n > 0 }`);
+    o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const call = cycle || j > i ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
+      o.push(`  if n % ${n} == ${j} { return ${call} }`);
+    }
+    o.push("  false", "}");
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  o.push("const s: i32[] = []", `print(f0<i32[]>(s, ${n}))`, "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generics calling each other in a cycle",
+  2.5,
+  "A generic's exact-keying answer is being re-derived per ask inside a call cycle (D2684).",
+  (d) => twoFiles(d, genGenericCycle(14, true), genGenericCycle(14, false)),
+);
+
+// `n` generics that each call every other one at `<T>` over a `T | null` they compare with
+// `==`, against the same generics calling a concrete helper instead. Each call copies its
+// callee's deferred operator constraints into the caller under substitution, and a copy keyed
+// on its fresh arena index re-recorded every one, exponential in `n` (D2757). At 16: 3.9 s of
+// `vl check` alone on the seed before D2757.
+const genGenericClique = (n: number, clique: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(`function h${i}(n: i32): boolean { n > 0 }`);
+    o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const call = clique ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
+      o.push(`  if n % ${n} == ${j} { return ${call} }`);
+    }
+    o.push("  false", "}");
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < 3600; i++) fill(o, i, 6);
+  o.push("const s: i32[] = []", `print(f0<i32[]>(s, ${n}))`, "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generics calling each other in a complete graph",
+  2.5,
+  "A call to a generic is re-recording its callee's deferred constraints per copy (`noteBinCstr`, compiler/typecheck.vl; D2757).",
+  (d) => twoFiles(d, genGenericClique(16, true), genGenericClique(16, false)),
+);
+
+// #3300's review pair, and not a reshape: the SAME program with and without one parameter
+// name. A name anywhere turns on the redundant-annotation hint's look through each binding's
+// alias names, and a lookup that walked the alias table per binding cost 3,000 aliases x
+// 3,000 bindings (2.49 here). Aliases are super-linear on their own, so a many/one pair over
+// them would carry that debt; this pair holds the name's own price near 1.
+const genNamedFnAliases = (named: boolean): string => {
+  const o: string[] = [named ? "type G = (fn: i32) => i32" : "type G = (i32) => i32"];
+  for (let i = 0; i < 3000; i++) o.push(`type A${i} = i32`);
+  for (let i = 0; i < 3000; i++) o.push(`const x${i}: A${i} = ${i}`);
+  o.push("print(x0)");
+  return o.join("\n") + "\n";
+};
+axis(
+  "one function-type parameter name over 3,000 aliases",
+  1.25,
+  "An annotation's alias names are being resolved by walking the alias table (`aliasTsRootOf`, compiler/ast.vl).",
+  (d) => twoFiles(d, genNamedFnAliases(true), genNamedFnAliases(false)),
+);
+
+// ── allocation: the null collector's 4 GiB ───────────────────────────────────
+// These pairs pin the null collector, which never frees, so EVERYTHING the compiler
+// allocates counts against one 4 GiB heap. A per-entity
+// rebuild of a whole-program-sized table is invisible to fuel when the table is cheap to fill
+// and still costs the heap its full size each time: sunpa's `game.vl` (a 2 MB module graph
+// behind a small entry file) filled the heap and trapped the compiler, exit 70 (D3737). These
+// pairs grade the `[alloc]` line, the bytes a null-collector compile allocated, and are GROWTH
+// pairs: `n` against `n/4`, so linear reads under 4 (a fixed cost rides on both arms).
+const gradeAllocPair = async (
+  axis: string,
+  bar: number,
+  note: string,
+  mk: (dir: string) => [string, string],
+): Promise<number> => {
+  const dir = await Deno.makeTempDir({ prefix: `vl_scale_alloc_` });
+  try {
+    const [manySrc, oneSrc] = mk(dir);
+    const [m, o] = await Promise.all([
+      buildNull(manySrc, `${dir}/many.wasm`),
+      buildNull(oneSrc, `${dir}/one.wasm`),
+    ]);
+    const ratio = m.alloc / o.alloc;
+    const reading = `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${(o.alloc / 2 ** 20).toFixed(1)} MiB ` +
+      `(ratio ${ratio.toFixed(3)})`;
+    if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
+    if (ratio > bar) {
+      fail(
+        axis,
+        bar,
+        note,
+        reading,
+        "(The ratio is of what a null-collector compile allocated, which a table reset per entity " +
+          "multiplies even where fuel does not.)",
+      );
+    }
+    return ratio;
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
+  Deno.test({
+    name: `scaling shape: ${name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      await gradeAllocPair(name, bar, note, mk);
+    },
+  });
+
+// `n` functions, each with one `unit` of a shape whose name is its own, so the program's
+// symbol-id space grows with `n` as well.
+const genPerFunction = (n: number, unit: (u: number) => string[]): string => {
+  const o: string[] = [];
+  for (let f = 0; f < n; f++) o.push(`function f${f}(n: i32): i32 {`, "  let t = n", ...unit(f), "  t", "}");
+  o.push("let acc = 0");
+  for (let f = 0; f < Math.min(n, 40); f++) o.push(`acc = acc + f${f}(${f % 5})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+const loopUnit = (u: number) => [`  for v${u} in 0 to n { t = t + v${u} }`];
+const dupUnit = (u: number) => [
+  "  if t > 0 {",
+  `    const d${u} = t + 1`,
+  `    t = d${u}`,
+  "  } else {",
+  `    const d${u} = t + 2`,
+  `    t = d${u}`,
+  "  }",
+];
+const shapeUnit = (u: number) => [
+  `  const r${u}: { a${u}: { b${u}: i32 } } = { a${u}: { b${u}: t } }`,
+  `  t = t + r${u}.a${u}.b${u}`,
+];
+
+// D3737: each function's let/loop plan regrew its sid-indexed loop-variable heads from empty to
+// the program's symbol count. Reads 2.77; master `7529a4ea6` read 5.98.
+allocAxis(
+  "allocation: loop variables across functions",
+  4.5,
+  "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
+  (d) => twoFiles(d, genPerFunction(4000, loopUnit), genPerFunction(1000, loopUnit)),
+);
+
+// D3737: the same for the duplicate-binding heads. Reads 2.85; master `7529a4ea6` read 5.87.
+allocAxis(
+  "allocation: duplicate bindings across functions",
+  4.5,
+  "A per-function table indexed by symbol id is being replaced rather than cleared (`plBuildLetMap`, compiler/emit_base.vl).",
+  (d) => twoFiles(d, genPerFunction(4000, dupUnit), genPerFunction(1000, dupUnit)),
+);
+
+// D3737: the inline-shape intern's re-entrancy memo, keyed by the shape spelling's symbol id,
+// was dropped after each outermost intern and regrown to the whole id space by the next one.
+// Reads 2.51; master `7529a4ea6` read 8.73, and at 5,000 functions (706 KB) trapped the
+// compiler.
+allocAxis(
+  "allocation: nested inline record types across functions",
+  4.5,
+  "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
+  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
+// D3738: the same shape on FUEL. Every object literal scanned every struct row, field by field,
+// and the type section compared every row with every row for a prefix. Reads 4.61; master
+// `42c4d4c10` read 11.97.
+axis(
+  "nested inline record types across functions (fuel)",
+  6,
+  "A struct-row question is scanning every row (`objLitNameCands`, `structPrefixCands`, compiler/emit_classify.vl; `repRowOfTyStruct`, compiler/emit_rep.vl).",
+  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
+);
+
+// D3739: a fresh `const` at the top level asks which names the whole program uses other than as
+// a receiver, and a function's own fresh `const` between two of them used to make it walk the
+// program again. Reads 2.39; master `42c4d4c10` read 12.42.
+const genTopFreshConsts = (n: number): string => {
+  const o: string[] = [];
+  for (let f = 0; f < n; f++) {
+    o.push(`function f${f}(n: i32): i32 {`, "  const p = { v: n }", "  p.v + 1", "}");
+    o.push("if true {", `  const a = { v: f${f}(1) }`, "  print(a.v)", "}");
+  }
+  return o.join("\n") + "\n";
+};
+allocAxis(
+  "allocation: top-level fresh consts between functions",
+  4.5,
+  "The program-wide sole-reference walk (`crValUseEnter`, compiler/typecheck.vl) is walking the program per `const`.",
+  (d) => twoFiles(d, genTopFreshConsts(2000), genTopFreshConsts(500)),
+);
+
+// D3740: a `.get` binding pins its annotation while the module is emitted, which appends to the
+// arena, and the re-seat use index was rebuilt, and its per-literal memo regrown, at the next
+// object literal. Reads 1.86; master `42c4d4c10` read 12.61, and at 800 functions filled the heap.
+const growUnit = (u: number) => [
+  "  let m: Map<i32, i32> = Map()",
+  "  m[n] = n",
+  "  const had = m.get(n)",
+  `  const p = { x: n, y: ${u} }`,
+  "  t = t + keep(p)",
+  "  if had != null { t = t + had }",
+];
+const genArenaGrowth = (n: number): string =>
+  "type A = { x: i32, y: i32 }\ntype B = { x: f64, y: f64 }\nfunction keep(a: A): i32 { a.x + a.y }\n" +
+  genPerFunction(n, growUnit);
+allocAxis(
+  "allocation: map reads beside object literals across functions",
+  4.5,
+  "The re-seat use index (`rsIxReady`, compiler/emit_classify.vl) is being rebuilt as the arena grows.",
+  (d) => twoFiles(d, genArenaGrowth(400), genArenaGrowth(100)),
 );
 
 // ── the instrument's own control ─────────────────────────────────────────────
@@ -1085,6 +2159,61 @@ Deno.test({
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// THE FUEL GRADER'S CONTROL. The same program at 20x the statements against 1x: twenty times
+// the work by construction, so it must red a 2.5 bar, and only a broken fuel reading (no
+// `[fuel]` line parsed, a constant, both arms metered as one) can pass it. Its many arm is
+// linear, so no compiler improvement can turn it green.
+const genStatements = (n: number): string => {
+  const o = ["let acc = 0"];
+  for (let i = 0; i < n; i++) fill(o, i, 6);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+Deno.test({
+  name: "scaling shape: control — twenty times the work reds the fuel grader",
+  ignore: !ENABLED,
+  fn: async () => {
+    let red = "";
+    try {
+      await gradePair("fuel control", 2.5, "unreachable: the control exists to fail.", (d) =>
+        twoFiles(d, genStatements(4000), genStatements(200)));
+    } catch (e) {
+      red = String(e);
+    }
+    if (!red.includes("fuel control: the many-entity arm")) {
+      throw new Error(
+        "the fuel control did not red: 4,000 statements against 200 of the same came in under " +
+          `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
+          `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+      );
+    }
+  },
+});
+
+// THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
+// (reads about 5.5: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
+Deno.test({
+  name: "scaling shape: control — twenty times the work reds the allocation grader",
+  ignore: !ENABLED,
+  fn: async () => {
+    let red = "";
+    try {
+      await gradeAllocPair("allocation control", 2.5, "unreachable: the control exists to fail.", (d) =>
+        twoFiles(d, genStatements(4000), genStatements(200)));
+    } catch (e) {
+      red = String(e);
+    }
+    if (!red.includes("allocation control: the many-entity arm")) {
+      throw new Error(
+        "the allocation control did not red: 4,000 statements against 200 of the same came in " +
+          "under 2.5x the bytes allocated. The `[alloc]` reading has stopped measuring, so every " +
+          `allocation axis above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+      );
     }
   },
 });

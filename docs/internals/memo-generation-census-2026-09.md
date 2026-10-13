@@ -21,31 +21,37 @@ This page is the rest of the family, and the instrument that keeps it graded.
 module-level binding whose name carries a generation marker (`Epoch`, `Gen`, `Len`, `Ver`,
 `Seen`, `Root`, `Stamp`, `Head`), finds every guard that compares one, and fails if a stamp
 appears that its `ROWS` table does not classify or a row's anchor has been reworded away. On
-2026-09-05: **121 stamp variables, 34 read by a guard, 27 rows.**
+2026-09-05: **121 stamp variables, 34 read by a guard, 27 rows**; on 2026-10-06 (lane CT):
+**229 stamp variables, 47 read by a guard, 51 rows.**
 `tests/vl_memo_generation_test.ts` runs it on every PR in 0.4 s, so a new memo cannot join the
 tree ungraded.
 
 | verdict | rows | what it means |
 | --- | --- | --- |
-| `pass-stamped` | 3 | the key reads `emitPassGen`, or a phase flag that is one |
-| `no-refined-input` | 3 | every table its value reads is push-only or reset wholesale |
+| `pass-stamped` | 10 | the key reads `emitPassGen`, or a phase flag that is one |
+| `no-refined-input` | 8 | every table its value reads is push-only or reset wholesale |
 | `resume-reseeds` | 2 | a resume bank that writes the refined columns back before reusing them |
-| `not-a-memo` | 9 | a visit mark or a per-row flag — no cached ANSWER to go stale |
-| `probe` | 12 | safety is measured, not argued |
+| `not-a-memo` | 10 | a visit mark or a per-row flag — no cached ANSWER to go stale |
+| `probe` | 21 | safety is measured, not argued |
 
 ### The rows
 
 | memo | key reads | in-place-filled input after it can first be asked | verdict |
 | --- | --- | --- | --- |
 | `globalCellKind` | `tyMutEpoch`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | `fRetKind` and its five siblings (D1655) | pass-stamped |
+| `globalReadAsk` (`grStamp`/`grKnown`/`grVal`, one row per global: whether a global reads as an f64, an i64 or a string, D3051) | `globalCellKind`'s generation, so the same stamps | the same inputs `globalCellKind`'s ladder reads, through the same `letIs*` predicates | pass-stamped |
 | `refArrShapeIndex` (`ras*`) | `tyMutEpoch`, `cUserTypesVer`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | none named; the row also carries the arena epoch and the declared-type version, and the identity proof is the compiler's own codegen plus 3,045 corpus modules | pass-stamped |
 | `dsgReady` (declared-struct graph) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built | pass-stamped |
+| `rsIxReady` (a re-seated list's use index: parents and same-name identifier chains, D2914) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built; reset per program with the other sid-keyed tables | pass-stamped |
+| `rsIxGrow` (`rsIxEpoch`: the same index EXTENDED when the arena only grew, D3740) | `arenaEpochNow()` unchanged since the build | the nodes appended after `emitArenaFinal`, which hang off no node the root reaches except late annotation pins (`TypeRef`s under a `LetDecl`), which no query starts at or climbs through; a cross-check that rebuilt beside every extension found no other difference on sunpa's `game.vl`, the compiler and every `tests/cases` program. The per-binding answers are dropped at the entries written since, as a rebuild drops them | pass-stamped |
+| `objLitBindDestRow` (`rsRecRow`, a record literal's re-seated row, D2933; `rsLetDst` beside it for a list's) | `sNames.length`, and the use index's reset or growth | none reachable: answered only once `emitArenaFinal` is set, and both reset with the use index they read — since D3740 by clearing the entries written, not by replacing the table | pass-stamped |
+| `dslEnsure` (a scope's lambda bindings and named calls, D2748) | `dslRoot` (the scope), `dslLen` | none reachable: kept only once `emitArenaFinal` is set, rebuilt per query before | pass-stamped |
 | `variantSig` | `uFieldNames`/`uFieldStart`/`uFieldCount` lengths | none: it reads field NAMES, and all three tables are push-only | no-refined-input |
 | `objVariantIndex` (`ovn*`) | `uVariants`/`uFieldStart`/`uFieldCount` lengths | none, the same three tables through `variantSig` | no-refined-input |
 | `declStructNodeOf` | top-level `stmts.length` | none: it indexes `TypeDecl` nodes, which no pass rewrites | no-refined-input |
-| `buildFnMapResumable` | 8 collect lengths | `fRetKind` and siblings — and `buildFnMapReseedPrefix` writes the banked seed back over the prefix, which is what makes the resume exact rather than merely cheap | resume-reseeds |
+| `buildFnMapResumable` | 8 collect lengths | `fRetKind` and siblings — and `buildFnMapReseedPrefix` writes the banked seed back over the prefix, which is what makes the resume exact rather than merely cheap; a same-name slot write re-classifies its one row (D3761) | resume-reseeds |
 | `collectAResumable` | `P.nodes.length` + 7 collect lengths | the annotation sidecars; the bank is armed only for a run no arena-editing pass crosses | resume-reseeds |
-| `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen`, `gwBoxedSeen` (the getter walk's once-per-type report mark) | — | — | not-a-memo |
+| `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen`, `gwBoxedSeen` (the getter walk's once-per-type report mark), `rsRetSeenE`/`rsRetSeenL` (the re-seat return walk's once-per-query function mark, D2922) | — | — | not-a-memo |
 | `repKeyMemo` / `hcCanonMemo` | `tyMutEpoch` | its own canon-key columns | probe |
 | `repElemMemo` / `hcElemMemo` / `hcMvMemo` | `tyMutEpoch`, `cUserTypesVer`, `sNames.length` | its own columns | probe |
 | `repSlotCache` | `tyMutEpoch`, `cUserTypesVer`, `sNames.length` | `sFieldTypes`, which `unifyMixedLitRepArms` re-lays in place at the end of `collectS` | probe |
@@ -54,15 +60,26 @@ tree ungraded.
 | `structIndexOfObjCtx` (`sio*`) | `sNames.length`, the asking frame | `sFieldTypes`, through the field-set match | probe |
 | `startBlockLetRow` (`sbl*`) | `sblEpoch`, bumped beside `startStmts` | `startStmts`, re-pointed by `dispatchRewrite` | probe |
 | `memberSetIntern` (`msSetGen`/`msGen`) | `msGen` | the member-set rows | probe |
-| `parentLetCache` (`plCacheBlock`/`plGen`) | the cached BLOCK index | the arena bodies the rewrites re-point inside that block | probe |
+| `parentLetCache` (`plCacheBlock`/`plGen`, and since D2687 up to three parked plans in `plSaved*`, each with its own block and generation) | the cached BLOCK index, current or parked | the arena bodies the rewrites re-point inside that block; `plCacheBust` drops the parked plans with the current one | probe |
+| `parentLoopIndex` (`plLxIdx*`, D3139) | the SID, valid while the entry's `plGen` is the current plan's; dropped wholesale by `sidResetParentLet` | a rebuilt plan, which takes a fresh generation, so a stale entry never matches | probe |
 | `anonLeafIndex` (`anonIxSeen`) | `P.nodes.length` | its own link columns | probe |
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
 | `frameBindsCache` (`fcbSidGen`/`fcbGen`, D2289) | the asked FRAME; dropped by `resetParentLetCache` | the frame chain's params, lets and loop variables, which a rewrite could re-point | probe |
-| `fnStmtsPosIndex` (`fnPos*`) | `fnPosEpoch`, and the `fnStmts`/`monoOrigNode` prefix lengths already indexed | `fnStmts` slots overwritten by `monomorphize` — every such write calls `buildFnMapNoteFnSlotWrite`, which retires the index | probe |
+| `paramShadowCache` (`pshSidGen`/`pshGen`, D3293) | the asked FRAME and its body; dropped by `sidResetParentLet` | the frame's params and its body's lets and loop variables, which a rewrite could re-point | probe |
+| `fnStmtsPosIndex` (`fnPos*`) | `fnPosEpoch`, and the `fnStmts`/`monoOrigNode` prefix lengths already indexed | `fnStmts` slots overwritten by `monomorphize` — every such write calls `buildFnMapNoteFnSlotWrite` or `buildFnMapNoteFnStmtWrite` (D3761), each of which retires the index | probe |
 | `moduleLocalLetPlan` (`mllSort*`) | the NAME; dropped with its table by `resetParentLetCache` | none: the module block-local table is built once and reset wholesale | probe |
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
-| `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
-| `covarValueWriteState` (`cwArenaLen`) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
+| `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count, and since lane HS `arenaEpochNow()`, `arenaRefWritesNow()` and `fnStmts.length` | none reachable: armed only inside `computeRetInference`, `computeRetInference#2`, `dispatchRewrite` and (lane HS) `monomorphize`, and inside `monoRebuild`'s runs of `computeVoidFns` and `computeRetInference` after it reports an edit (D2771); those passes write no table `capScan` reads without a stamp seeing it: every rewrite mints a node or calls `capMemoNoteEdit`, `monomorphize`'s in-place writes (callee renames, `fnStmts`/`fnParent`/`fnInstOrigin` slots, a `parType`) all go through `monoArenaTouch`, which reports the edit, and the checker it re-runs replaces slots through `arenaNoteEdit` | pass-stamped |
+| `crValUseNames` (`cvu*`, `crValUseRoot`, D2584, D3739) | the root's node INDEX and the arena epoch of its walk; the program's root instead adds the slots the logged edits (`arenaNoteEdit`) rewrote, when every bump since was one; reset by `crReset` | the getter and operator banks (`getSiteFnOf`, `opSiteDecls`), which the checker fills in place as it reaches each function: so they are NOT cached — the walk keeps the `x.p` and `x[i]` sites they decide, and each entry to a root reads them afresh, as the old per-entry walk did. Was filed `no-refined-input` on the claim that the walk reads the syntax tree alone, which those two reads refute | probe |
+| `structFieldNameIndex` (`sfnLen`: per field name, the struct rows carrying it and the rows it comes first in, D3738) | the rows indexed so far; reset with the struct table | none: field names are push-only, and a row joins once its names are stored; the rows past the index are every reader's candidates | no-refined-input |
+| `structCanonIndex` (`scnLen`/`scnEpoch`: per canonical id, the struct rows whose own arena type has it, D3738) | `tyMutEpoch`, as `repKeyMemo`; the rows joined so far, in scan order | `sTyIx`, recorded after a row's header: a row joins only once it is recorded, and a row the name rung answers is asked again on every scan | probe |
+| `aliasRootIndex` (`aliasRootLen`, #3300) | `udTsNode.length`; reset by `tsReset` | none: `udTsNode`/`udTsWritten` are push-only, and `udName` is renamed only by the module merge, which runs before the first ask | no-refined-input |
+| `typeDeclNameIndex` (`tdnIxLen`/`tdnIxEpoch`: `nameIsStructDecl`'s set of `TypeDecl` names, lane CH) | `P.nodes.length` (an append extends it), `arenaEpochNow()` (a replacement rebuilds it); reset in `emitProgram` | none: a `TypeDecl`'s name is renamed in place only by the module merge, which runs before emit | no-refined-input |
+| `callsByCalleeIndex` (`cbcLen`/`cbcEpoch`/`cbcRefGen`: `fieldClosureFeOfRecvRaw`'s `Call` slots by callee identifier name, lane CH, keyed by name in lane HS) | `P.nodes.length`, `arenaEpochNow()`, `arenaRefWritesNow()` (bumped by `sidNoteNodeName` at every in-place rename and by the rewrites that repoint a callee); reset in `emitProgram` | none: a rename or callee repoint rebuilds it, and the arguments, which rewrites and `monomorphize` edit in place, are read live | no-refined-input |
+| `sigKeyOfTyMemo` (`sktGen`), `structIndexOfTypeNameMemo` (`sitnMemo`): `sigKeyOfTy` by type id and `structIndexOfTypeName` by name, lane HS; `typeRegistryGen` (`trgStamp`) is their key | `tyRegGenNow()`, read before the computation: `emitPassGen`, `tyMutEpoch`, `T.tys.length`, `P.nodes.length`, the arena epoch and ref writes, `cUserTypesVer`, `nodeTyWrites` (every `nodeTyIx` write, `nodeTySet`), `msGen`, `tyRegWrites` (the in-place struct and union row rewrites), and the lengths of the struct, union, variant, map-slot and ref-list tables; reset in `emitProgram` | the key is deliberately wider than any one answer's inputs, at the price of hits; no static closure of the two functions is small enough to audit (it reaches ~2,900 functions), so the safety rests on the cross-check and the disabled seed | probe |
+| `ieeeBytesMemo` (`ieeeMemoBytes`/`ieeeMemoOver`: a float lexeme's IEEE bytes and overflow flag by width, lane GH, D3737) | the lexeme and the width; never reset | none: the encoding is a pure function of the key | no-refined-input |
+| `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it (the per-(name, frame) chains of D2688, `cwIxP*`, included); and `nodeRepTyIx`, a checker sidecar written in place | probe |
+| `arithClassifierMemo` (`bcIn`/`bcBits`, D2445) | a SESSION: one classification, or one emission or reservation walk, of the region under a chain root the parser marked (`binRegion`); its tables cover that region's node range and are dropped when it closes | the emitter's local and narrowing state, which a walk could change between a region's first classification and a later one — the region holds only operators, parens and unary minus, whose operands are classified before any of them is emitted | probe |
 
 ## The `probe` verdict is a measurement — one row at a time
 
@@ -84,6 +101,7 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | row | compiler's own self-compile | distilled corpus |
 | --- | --- | --- |
 | `globalCellKind` | byte-identical to master's fixpoint | no cell changed class |
+| `globalReadAsk` (graded 2026-09-28 on lane NG's tree) | byte-identical | no cell changed class |
 | `declaredStructGraph` | byte-identical | not run (see below) |
 | `variantSig` | byte-identical | not run |
 | `objVariantIndex` | byte-identical | not run |
@@ -102,9 +120,17 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | `anonLeafIndex` | byte-identical | no cell changed class |
 | `fnChildIndex` | byte-identical | no cell changed class |
 | `frameBindsCache` (graded 2026-09-24; also 1,500 `@run` fixtures built byte-identical) | byte-identical | no cell changed class |
+| `paramShadowCache` (graded 2026-09-29 on lane SR's tree) | byte-identical | no cell changed class |
 | `covarValueWriteState` | byte-identical | no cell changed class |
 | `closureCaptureNames` (graded 2026-09-23, master `9847488c1` + D2017) | byte-identical | no cell changed class |
+| `closureCaptureNames` armed in `monomorphize` (graded 2026-10-07 on lane HS's tree; a debug seed recomputing every hit held on the compiler, sunpa and all 4,590 `tests/cases` programs; a control seed whose key moves only with the pass trapped on `generics/hole-lambda-calls-per-instance.vl`; a seed dropping only the three lane-HS stamps trapped on none of the 4,590, and one dropping only the edit count did not trap on that program, so `P.nodes.length` is the stamp that ends its stale answer) | byte-identical | not run |
+| `arithClassifierMemo` (graded 2026-09-30 on lane CT's tree after the review's gating round; all `tests/cases` programs build byte-identical against the disabled seed except the 700-term chain fixture, which the disabled seed cannot compile) | byte-identical | not run against the disabled seed; the enabled seed moved no cell |
 | `fnStmtsPosIndex`, `moduleLocalLetPlan` (graded 2026-09-25, each alone and both together; also all 3,592 `tests/cases` programs built byte-identical, against the disabled seed and against master's) | byte-identical | not run |
+| `typeDeclNameIndex` (graded 2026-10-06 on lane CH's tree, each alone; sunpa's `game.vl` also builds byte-identical against master's seed, which has neither) | byte-identical | not run against the disabled seed; the enabled seed moved no cell |
+| `callsByCalleeIndex` (graded 2026-10-07 on lane HS's tree; all 4,577 `tests/cases` programs build byte-identical against the disabled seed, the enabled one and master's; sunpa's `game.vl` builds byte-identical against the disabled seed and master's; a debug build that compared the index with the full scan at every query held on sunpa and on the 146 `tests/cases` programs that reach it, which the compiler's own source does not) | byte-identical | not run |
+| `sigKeyOfTyMemo`, `structIndexOfTypeNameMemo` (graded 2026-10-07 on lane HS's tree, both disabled together; all 4,577 `tests/cases` programs build byte-identical against the disabled seed, the enabled one and master's; sunpa's `game.vl` builds byte-identical against the disabled seed and master's; a debug build that recomputed every hit and trapped on a difference held on the compiler, sunpa and every `tests/cases` program, 3,235 and 2,861 of which hit the two memos) | byte-identical | not run |
+| `ieeeBytesMemo` (graded 2026-10-06 on lane GH's tree; sunpa's `game.vl` builds byte-identical against the disabled seed and against master's) | byte-identical | not run |
+| `crValUseNames`, `structCanonIndex` (graded 2026-10-06 on lane CT's tree, each alone; all 4,532 `tests/cases` programs build byte-identical against each disabled seed, against the enabled one and against master's; sunpa's `game.vl` builds byte-identical against master's) | byte-identical | not run |
 
 **Eighteen of twenty disable edits leave the compiler's own codegen of itself byte-identical
 to master's fixpoint**, and the twelve graded against the corpus — the eleven `probe` rows that

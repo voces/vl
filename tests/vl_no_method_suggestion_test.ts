@@ -148,9 +148,9 @@ Deno.test({
       eq(
         await errorsOf(
           dir,
-          "const st: {[string]: boolean} = Set()\nst.put(\"a\")\nprint(0)\n",
+          "const st: Set<string> = Set()\nst.put(\"a\")\nprint(0)\n",
         ),
-        ["unknown property `put` on {[string]: boolean}"],
+        ["unknown property `put` on Set<string>"],
         "a set keeps the bare text for `put`",
       );
     } finally {

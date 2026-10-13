@@ -18,10 +18,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# The self-compile's collector is a CHOICE, not the size heuristic's accident: the compiler
-# is a multi-file graph with a small entry file, so `auto` already picks null, and pinning it
-# keeps a heuristic change from silently moving the fixpoint's CPU (DECISIONS.md, "The
-# compiler's collector is picked by the size of the entry file").
+# The self-compile's collector is a CHOICE, not the default's accident: `auto` is copying,
+# and null is ~10% faster here, so pinning it keeps a default change from silently
+# moving the fixpoint's CPU (DECISIONS.md, "The compiler's collector is copying by default").
 export VL_COMPILE_GC=null
 SEED="${SEED:-build/vl-compiler.wasm}"
 WORK="$(mktemp -d)"
@@ -55,6 +54,6 @@ echo "NATIVE FIXPOINT HOLDS: stage3 == stage4 byte-for-byte ($(wc -c < "$WORK/st
 # the compiler, and that is the run that hangs (CLAUDE.md, "A COST REGRESSION SHOWS UP
 # ONE BOOTSTRAP STEP LATE"; measured 2026-09-02 on D1090, 32 s at L1 against 321 s at
 # L2). USER+SYS, not wall: the box is shared, and CPU seconds are the honest column.
-# `scripts/self-compile-time.sh` grades the same quantity against a committed baseline.
+# `scripts/self-compile-time.sh` grades the same build, in guest fuel, against a baseline.
 awk '/^user/{u=$2} /^sys/{s=$2} END{printf "stage4 self-compile CPU %.2fs\nSELF_COMPILE_USER_SECONDS=%.2f\n", u + s, u + s}' \
   "$WORK/stage4.time"

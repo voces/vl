@@ -23,6 +23,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -54,7 +55,7 @@ const assertPositioned = async (
   stage: string,
   want: string,
 ): Promise<void> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_" });
+  const dir = await makeTempDir({ prefix: "vl_diag_pos_" });
   try {
     const path = `${dir}/case.vl`;
     await Deno.writeTextFile(path, src);
@@ -139,7 +140,7 @@ Deno.test({
     // shown 1-based as [1:10]. Pins the name-token anchor (`declNameTokOf`,
     // matching unused-variable/prefer-const); the node's own anchor is its LAST
     // token — the closing `}` on line 3 — which is the wrong line entirely.
-    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_" });
+    const dir = await makeTempDir({ prefix: "vl_diag_pos_" });
     try {
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
@@ -164,7 +165,7 @@ Deno.test({
 // `check` above runs only parse+type; an EMIT-stage failure surfaces solely under
 // codegen, so its diagnostic position needs the build path.
 const build = async (path: string): Promise<{ code: number; err: string }> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_out_" });
+  const dir = await makeTempDir({ prefix: "vl_diag_pos_out_" });
   try {
     const { code, stderr } = await new Deno.Command(VL, {
       args: [
@@ -197,7 +198,7 @@ Deno.test({
     // positionless (line 0) as before — so a build/playground/LSP consumer can
     // point the reader at the offending function instead of rendering the message
     // bare. (`declNameTokOf` anchoring, matching the lint/type-diag convention.)
-    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_" });
+    const dir = await makeTempDir({ prefix: "vl_diag_pos_" });
     try {
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
@@ -239,33 +240,34 @@ Deno.test({
     // that had nothing to do with the failure.
     //
     // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 14 of line 11,
-    // printed 1-based as 11:15), and the start function arms a top-level STATEMENT cursor so
+    // (`emitFailAt`, the `Member` node → its property token, 0-based col 17 of line 11,
+    // printed 1-based as 11:18), and the start function arms a top-level STATEMENT cursor so
     // any other failure it raises lands on the statement instead of on a stale function.
     //
-    // The shared field here is a LIST (`xs`), which has no single-block result rep to
-    // dispatch on — so this is still a loud reject after call receivers were taught to
-    // dispatch, which is exactly why it is usable as a position witness.
-    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_top_" });
+    // The shared field here is a RECORD stored at a different shape per member, which the
+    // dispatch has no result rep for — so this is still a loud reject after a same-typed
+    // field learned to dispatch (D3562), which is exactly why it is usable as a position
+    // witness.
+    const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "type A = { xs: i32[], a: i32 }\n" +
-          "type B = { pad: boolean, xs: i32[] }\n" +
+        "type A = { xs: { x: i32 }, a: i32 }\n" +
+          "type B = { pad: boolean, xs: { x: i32, y: i32 } }\n" +
           "function g(flag: boolean): A | B {\n" +
-          "  if flag { return { xs: [1, 2], a: 3 } }\n" +
-          "  return { pad: true, xs: [4] }\n" +
+          "  if flag { return { xs: { x: 1 }, a: 3 } }\n" +
+          "  return { pad: true, xs: { x: 4, y: 5 } }\n" +
           "}\n" +
           "function pad(x: i32): i32 {\n" +
           "  return x + 1\n" +
           "}\n" +
           "print(pad(1))\n" +
-          "print(g(true).xs.length)\n",
+          "print(g(true).xs.x)\n",
       );
       const r = await build(path);
       if (r.code === 0) throw new Error("expected emit-stage rejection, got exit 0");
-      const needle = `${path}:11:15:`;
+      const needle = `${path}:11:18:`;
       if (!r.err.includes(needle)) {
         throw new Error(`expected stderr to contain "${needle}", got:\n${r.err}`);
       }
@@ -292,7 +294,7 @@ Deno.test({
 
 /** Write a `{relative path: source}` tree into a fresh temp dir. */
 const writeTree = async (files: Record<string, string>): Promise<string> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_diag_mod_" });
+  const dir = await makeTempDir({ prefix: "vl_diag_mod_" });
   for (const [rel, body] of Object.entries(files)) {
     const path = `${dir}/${rel}`;
     const slash = path.lastIndexOf("/");
@@ -476,7 +478,7 @@ Deno.test({
   name: "native-diag-pos: the same diagnostic reaches the same column through check and run",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_diag_pos_base_" });
+    const dir = await makeTempDir({ prefix: "vl_diag_pos_base_" });
     try {
       const path = `${dir}/case.vl`;
       // `"s"` opens at 1-based column 16 of line 1 — counted by hand, because a test that

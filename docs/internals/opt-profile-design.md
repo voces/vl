@@ -71,6 +71,7 @@ sites (`struct.new*` / `array.new*`) surviving in the module**, read out of
 | `union-box-payload-read` | same, with the narrowed payload READ | 3 | 2 | **2** |
 | `union-box-branch-local` | same box via a `let` written on two SEPARATE statements | 4 | 4 | **2** |
 | `list-wrapper-push` | scratch list GROWN by `.push` each trip | 6 | 3 | **2** |
+| `list-wrapper-push-reserved` | same three pushes, unconditional, so reserved (D3623) | 10 | **0** | **0** |
 
 The count is over the whole module, which is the honest upper bound: unoptimized,
 some sites live in helpers the loop calls; optimized, everything reachable has
@@ -242,9 +243,11 @@ fixtures so the rule stays honest.
    `-O3`, which is exactly what P1.3 asked for. What survives is `array.new_fixed`
    (the empty backing) + `array.new_default` + `array.copy` (the growth). Growth
    allocates an array whose indices are dynamic, and binaryen's Heap2Local
-   scalarizes structs and only fixed-size, constant-indexed arrays. **Filed, not
-   fixed**: a per-tick loop that wants zero allocation should size its scratch
-   list once (a literal, or a list hoisted out of the loop), not grow it per trip.
+   scalarizes structs and only fixed-size, constant-indexed arrays. A list whose
+   pushes are unconditional, at the top of its block or in constant-trip range
+   loops, is now reserved at their count and never grows (D3623), and
+   `list-wrapper-push-reserved` melts to zero at both rungs; the `list-wrapper-push`
+   row keeps the grown case by putting its pushes under an `if`.
 
 ---
 

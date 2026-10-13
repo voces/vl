@@ -54,11 +54,12 @@
 //
 // Run with:  deno test -A --no-check tests/vl_instance_state_leak_test.ts
 
+import { filePath } from "./support/filePath.ts";
 import { runWasm } from "./support/runWasm.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
-const CASES = new URL("./cases/", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
+const CASES = filePath(new URL("./cases/", import.meta.url));
 
 const seedExists = (() => {
   try {
@@ -191,7 +192,7 @@ const PROGRAMS: Program[] = [
       "function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return \"s\"\n}\n" +
       "const u = pick(false)\nconst s = u as? string\n" +
       'if s != null { print(s) } else { print("none") }\n' +
-      "const d = 2.5\nconst n = d as? i32\nif n != null { print(n) } else { print(0) }\n",
+      "let d = 2.5\nconst n = d as? i32\nif n != null { print(n) } else { print(0) }\n",
   },
   // ── maps: `mUsed`/`mStructIdx`, `mI32Used`/`mStructI32Idx` ──
   { id: "map-nullable-value", family: "mUsed", path: "maps/nullable-value-map.vl" },

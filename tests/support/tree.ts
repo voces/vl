@@ -11,9 +11,69 @@
 // because it is the tree the TEST file lives in. See CLAUDE.md, "`vl` resolves
 // `std:` from the EXE's checkout — a worktree probe measures the WRONG std".
 
-export const ROOT = new URL("../../", import.meta.url).pathname.replace(/\/$/, "");
-export const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
+import { filePath } from "./filePath.ts";
+export const ROOT = filePath(new URL("../../", import.meta.url)).replace(
+  /[\\/]$/,
+  "",
+);
+export const VL = `${ROOT}/scripts/vl-host/target/release/vl${
+  Deno.build.os === "windows" ? ".exe" : ""
+}`;
 export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
+
+/** A binaryen CLI tool: from `$VL_BINARYEN` (a directory of the native release
+ * binaries, the same version as package.json's) when set, else from
+ * `node_modules/.bin`, which is not on PATH. npm's build is binaryen compiled to
+ * JS/wasm under node: the modules it writes are byte-identical, but each call pays
+ * node's start-up and `-O` runs about 5x slower. `wasm-dis` always comes from npm:
+ * the native one prints `\r\n` on Windows, and the shape suites match text by line.
+ * On Windows npm's spawnable shim is `<tool>.cmd`. */
+export const binaryen = (tool: string): string => {
+  const win = Deno.build.os === "windows";
+  const native = Deno.env.get("VL_BINARYEN");
+  if (native && tool !== "wasm-dis") return `${native}/${tool}${win ? ".exe" : ""}`;
+  return `${ROOT}/node_modules/.bin/${tool}${win ? ".cmd" : ""}`;
+};
+
+/** The fastest `wasm-dis` available: the native one when `$VL_BINARYEN` names it.
+ * Its text needs `\r\n` folded on Windows, which the host (`--wat`) and `wasmDis` do. */
+export const hostWasmDis = (): string => {
+  const native = Deno.env.get("VL_BINARYEN");
+  if (!native) return binaryen("wasm-dis");
+  return `${native}/wasm-dis${Deno.build.os === "windows" ? ".exe" : ""}`;
+};
+
+type DisOutput = {
+  code: number;
+  success: boolean;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+};
+const lfOutput = (o: Deno.CommandOutput): DisOutput => ({
+  code: o.code,
+  success: o.success,
+  stdout: new TextEncoder().encode(
+    new TextDecoder().decode(o.stdout).replaceAll("\r\n", "\n"),
+  ),
+  stderr: o.stderr,
+});
+
+/** `wasm-dis <args>`, shaped like `Deno.Command`'s output, with `\n` line ends in its
+ * stdout on every platform, so a suite matching the text by line can use the native
+ * binary. */
+export const wasmDis = async (args: string[]): Promise<DisOutput> =>
+  lfOutput(
+    await new Deno.Command(hostWasmDis(), { args, stdout: "piped", stderr: "piped" })
+      .output(),
+  );
+
+/** `wasmDis`, synchronously. */
+export const wasmDisSync = (args: string[]): DisOutput =>
+  lfOutput(
+    new Deno.Command(hostWasmDis(), { args, stdout: "piped", stderr: "piped" })
+      .outputSync(),
+  );
+
 export const STD = `${ROOT}/std`;
 
 /** Whether `p` exists. `Deno.statSync` throws on a miss; this is the test suite's

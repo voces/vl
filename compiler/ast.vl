@@ -12,6 +12,7 @@
 // and child lists by `i32[]`, which sidesteps a recursive type alias VL cannot express.
 
 import { TokKind } from "./lexer"
+import { strListHas } from "./listutil"
 
 // A token consumed by the parser. `kind` is the lexer's closed `TokKind` atom, `pos` its
 // index in the stream (the cursor unit the parser and diagnostics use), and
@@ -50,6 +51,7 @@ export type BinExpr = {
   pos: i32,
   binCompound: string,
   binTpl: i32,
+  binRegion: i32, // 1 on a long arithmetic chain's root, where the classifier memo starts (D2445)
 } // a + b,  a = b,  a += b
 // A call `f(a, b)` or `f(a: 2, b: 1)`. `callArgs` are the argument value nodes in source
 // order and `callArgNames` the parallel per-argument name list ("" for a positional one);
@@ -109,20 +111,28 @@ export type IfStmt = { // if c {..} else {..}
   ifElse: i32, // else node (block or nested if), -1 if none
   pos: i32,
 }
-// Loops carry an optional label (`outer: while …` / `outer: for …`; "" = none),
-// the target of a labelled `break`/`continue` — mirroring the host's
-// `label: string | undefined` on `VLWhileNode`/`VLForNode`/`VLForInNode`.
+// Loops carry an optional label ("" = none), the target of `break @l` / `continue @l`.
+// `whileBlk` 1 is a labelled block `@B { … }`: a `while true` run once, which `break` leaves and
+// `continue` never targets. `whileLv` names the binding a non-null loop value leaves through
+// ("" for none), set by the emitter's value rewrite.
 export type WhileStmt = {
   whileCond: i32,
   whileBody: i32,
   whileLabel: string,
   pos: i32,
-} // [l:] while c { body }
-// `break` / `continue` loop-control statements. Each carries the optional loop label it
-// targets ("" for the innermost loop) plus a marker field (`brkKw` / `contKw`, the source
-// keyword text) that gives the two prefixes distinct field-name sets, which the header's
-// discrimination rule needs.
-export type BreakStmt = { brkKw: string, brkLabel: string, pos: i32 } // break [label]
+  whileBlk: i32,
+  whileLv: string,
+} // [l:] while c { body }, or l: { body }
+// `break` / `continue` loop-control statements. Each carries the optional label it targets
+// ("" for the innermost loop) plus a marker field (`brkKw` / `contKw`, the
+// source keyword text) that gives the two prefixes distinct field-name sets. `brkHasVal` is 1
+// for `break v`: the value is the statement just before the break in the same block.
+export type BreakStmt = {
+  brkKw: string,
+  brkLabel: string,
+  pos: i32,
+  brkHasVal: i32,
+} // break [:label] [value]
 export type ContinueStmt = { contKw: string, contLabel: string, pos: i32 } // continue [label]
 // `for v in A to B [step S] { body }` — a numeric range loop; `frStep` is the step
 // expression node index, or -1 for the implicit +1. `frExcl` marks the half-open `until`
@@ -288,11 +298,78 @@ export type Parser = {
 // reads `P.nodes` / `P.diags` back out.
 export let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }
 
+// The operator count from which a chain's root is marked `binRegion`. A chain the mark misses
+// costs the emitter time, never an answer.
+export const ARITH_CHAIN_MIN = 16
+
+// The operators whose result width follows their operands', which an arithmetic chain joins.
+export function opIsArith(op: string) {
+  op == "+"
+    || op == "-"
+    || op == "*"
+    || op == "/"
+    || op == "%"
+    || op == "&"
+    || op == "|"
+    || op == "^"
+    || op == "<<"
+    || op == ">>"
+    || op == ">>>"
+}
+
+// Whether any node carries `binRegion`, so a program with none tests one flag, not a field.
+export let arithRegionSeen = false
+
+// Mark the root of every run of `ARITH_CHAIN_MIN` or more arithmetic operators along the left
+// spine under `root` (a loop of the precedence climber), so a chain an operator outside the
+// arithmetic tiers wraps (`a + … + a == 0`) is marked at its own root (D2445).
+export function markArithRuns(root: i32) {
+  let cur = root
+  let top = -1
+  let n = 0
+  while cur >= 0 {
+    const e = P.nodes[cur]
+    if e is BinExpr {
+      if opIsArith(e.binOp) {
+        if n == 0 { top = cur }
+        n = n + 1
+      } else {
+        if n >= ARITH_CHAIN_MIN { markArithRegion(top) }
+        n = 0
+      }
+      cur = e.binLeft
+    } else {
+      cur = -1
+    }
+  }
+  if n >= ARITH_CHAIN_MIN { markArithRegion(top) }
+  0
+}
+
+// Mark node `ix`, when it is a binary operator, as the root of a long arithmetic chain.
+export function markArithRegion(ix: i32) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    n.binRegion = 1
+    arithRegionSeen = true
+  }
+  0
+}
+
 // The `P.diags` indices whose diagnostic came from a recovery that provably preserved the
 // program the author wrote: no token dropped, none invented. The driver lets the checker
 // run past parse diagnostics only when every one is in here. Sparse and index-keyed, since
 // a dense column would need pushing in lockstep by every `P.diags.push` in the tree.
 let dgLossless: i32[] = []
+// A parse diagnostic whose span runs past its anchor token: the `P.diags` index and the token
+// it ends at, pushed in pairs. Sparse for the same reason as `dgLossless`.
+let dgSpanIdx: i32[] = []
+let dgSpanTok: i32[] = []
+// A parse diagnostic's stable code, for one `check --fix` can act on: the `P.diags` index and
+// its code, pushed in pairs. Sparse for the same reason as `dgLossless`.
+let dgCodeIdx: i32[] = []
+let dgCodeVal: string[] = []
 
 // The `ObjLit` nodes of a bare `{}` standing as a statement, which the parser has already
 // refused as an empty block (D2223); the checker skips its own value refusal for these.
@@ -300,12 +377,21 @@ export const stmtBraceNodes: i32[] = []
 // The subset of `stmtBraceNodes` that end their block, whose value may be used: the parser
 // leaves their message to the checker, which knows whether a value is expected there.
 export const stmtBraceTails: i32[] = []
+// The bare names that are a whole braced statement, `{ steps }`: a block yielding the name,
+// which reads as a record shorthand to a JavaScript hand. The checker says so where a record is
+// wanted (DV-1216).
+export const braceNameStmts: i32[] = []
 
 // Clear the column (and `stmtBraceNodes`). Paired with `P.diags = []`; see `vcDgReset` in driver.vl.
 export function dgLosslessReset() {
   dgLossless = []
+  dgSpanIdx = []
+  dgSpanTok = []
+  dgCodeIdx = []
+  dgCodeVal = []
   while stmtBraceNodes.length > 0 { stmtBraceNodes.pop() }
   while stmtBraceTails.length > 0 { stmtBraceTails.pop() }
+  while braceNameStmts.length > 0 { braceNameStmts.pop() }
   0
 }
 
@@ -314,6 +400,45 @@ export function dgLosslessReset() {
 export function dgMarkLossless(i: i32) {
   dgLossless.push(i)
   0
+}
+
+// Make the `P.diags` index `i` span from its anchor through token `tok`. Callers pass the
+// index the push is about to occupy (`P.diags.length`), matching `dgMarkLossless`.
+export function dgMarkSpanEnd(i: i32, tok: i32) {
+  dgSpanIdx.push(i)
+  dgSpanTok.push(tok)
+  0
+}
+
+// The code of a JavaScript `===` or `!==`, which `check --fix` rewrites to VL's operator.
+export const STRICT_EQ_CODE = "strict-equality"
+
+// Give the `P.diags` index `i` the stable code `code`. Callers pass the index the push is about
+// to occupy (`P.diags.length`), matching `dgMarkLossless`.
+export function dgMarkCode(i: i32, code: string) {
+  dgCodeIdx.push(i)
+  dgCodeVal.push(code)
+  0
+}
+
+// The code of parse diagnostic `i`, or "" when it has none.
+export function dgCodeOf(i: i32): string {
+  let k = 0
+  while k < dgCodeIdx.length {
+    if dgCodeIdx[k] == i { return dgCodeVal[k] }
+    k = k + 1
+  }
+  ""
+}
+
+// The token parse diagnostic `i` ends at, or -1 when it ends at its own anchor.
+export function dgSpanEndTok(i: i32): i32 {
+  let k = 0
+  while k < dgSpanIdx.length {
+    if dgSpanIdx[k] == i { return dgSpanTok[k] }
+    k = k + 1
+  }
+  -1
 }
 
 // Whether every parse diagnostic raised so far is a lossless recovery's — vacuously true
@@ -347,11 +472,48 @@ export function arenaEpochBump() {
 
 export function arenaEpochNow(): i32 { arenaEpoch }
 
+// Every in-place write that changes which name an existing node refers to: an identifier
+// renamed (`sidNoteNodeName`) or a call's callee repointed. Monotone, like the epoch.
+let arenaRefWrites = 0
+
+export function arenaNoteRefWrite() {
+  arenaRefWrites = arenaRefWrites + 1
+  0
+}
+
+export function arenaRefWritesNow(): i32 { arenaRefWrites }
+
+// The slots the logged edits below rewrote, in order, and how many epoch bumps they made: a
+// reader whose read predates only logged bumps refreshes those slots instead of the tree.
+let arenaEditSlots: i32[] = []
+let arenaEditBumps = 0
+
+// Stamp an in-place edit of slot `ix`: its node replaced, or a child list of it rewritten.
+export function arenaNoteEdit(ix: i32) {
+  arenaEditSlots.push(ix)
+  arenaEditBumps = arenaEditBumps + 1
+  arenaEpochBump()
+}
+
+export function arenaEditCount(): i32 { arenaEditSlots.length }
+// The slot of logged edit `i`, or -1 past the log.
+export function arenaEditSlotAt(i: i32): i32 {
+  if i < 0 || i >= arenaEditSlots.length { return -1 }
+  arenaEditSlots[i]
+}
+export function arenaEditBumpCount(): i32 { arenaEditBumps }
+
+// Forget the logged slots; a reader holding a position into the log rereads the tree instead.
+export function arenaEditLogReset() {
+  arenaEditSlots = []
+  0
+}
+
 // Overwrite arena slot `ix` with the node at `from` — the four checker lowerings that
 // replace a node in place, stamped here so the bank cannot miss one.
 export function arenaReplaceNode(ix: i32, from: i32) {
   P.nodes[ix] = P.nodes[from]
-  arenaEpochBump()
+  arenaNoteEdit(ix)
   0
 }
 
@@ -359,7 +521,7 @@ export function arenaReplaceNode(ix: i32, from: i32) {
 // rewrite's two sites.
 export function arenaSetNode(ix: i32, n: Node) {
   P.nodes[ix] = n
-  arenaEpochBump()
+  arenaNoteEdit(ix)
   0
 }
 
@@ -419,7 +581,23 @@ export const CALLSITE_NAME = "__callsite__"
 export function paramDefaultTablesReset() {
   callSiteLoc = []
   defaultGlobalRef = []
+  retypedLet = []
   0
+}
+
+// `retypedLet[letIx]` marks a literal `let` the checker gave its uses' type (D3246): as a `const`
+// it would be its literal at every read instead, so `prefer-const` does not suggest it.
+let retypedLet: boolean[] = []
+
+export function markLetRetyped(letIx: i32) {
+  if letIx < 0 { return 0 }
+  while retypedLet.length <= letIx { retypedLet.push(false) }
+  retypedLet[letIx] = true
+  0
+}
+
+export function letWasRetyped(letIx: i32): boolean {
+  letIx >= 0 && letIx < retypedLet.length && retypedLet[letIx]
 }
 
 export function setCallSiteLoc(callIx: i32, locIx: i32) {
@@ -600,11 +778,90 @@ export function tsPop() {
 // construction, so `annTsOf` is a binary search; a missed reset is a wrong answer, not a hole.
 export let annTsNode: i32[] = []
 let annTsRoot: i32[] = []
+// The root as the parser banked it, which `clearAnnTs` never drops: what the author wrote,
+// for editor display only (`annTsWrittenOf`), since after canon it may describe another type.
+let annTsWritten: i32[] = []
+
+// A match arm pattern's value spelling, where the module merge renamed its type spelling to a
+// different name: a local value shadows the name there, so a `const` arm reads it (D3271).
+let matchPatValNames: {[i32]: string} = Map()
+
+export function setMatchPatValueName(nodeIx: i32, name: string) {
+  matchPatValNames[nodeIx] = name
+  0
+}
+
+// The value spelling of arm pattern `nodeIx`, or `typeName` where the merge kept the two equal.
+export function matchPatValueName(nodeIx: i32, typeName: string) {
+  matchPatValNames[nodeIx] ?? typeName
+}
 
 export function setAnnTs(nodeIx: i32, root: i32) {
   annTsNode.push(nodeIx)
   annTsRoot.push(root)
+  annTsWritten.push(root)
   0
+}
+
+// Explicit call-site type arguments (`f<A, B>(x)`): one row per call that wrote any, its
+// argument `TypeRef` nodes in source order. Pushed as the `Call` is minted, so `callTaCall`
+// is strictly increasing. `callTaEnds` holds each argument's source end offset (-1 when
+// synthesized), since a token span cannot say where a fused `>>` splits.
+let callTaCall: i32[] = []
+let callTaStart: i32[] = []
+let callTaCount: i32[] = []
+let callTaNodes: i32[] = []
+let callTaEnds: i32[] = []
+
+export function setCallTyArgs(callIx: i32, tyArgs: i32[], ends: i32[]) {
+  callTaCall.push(callIx)
+  callTaStart.push(callTaNodes.length)
+  callTaCount.push(tyArgs.length)
+  let i = 0
+  while i < tyArgs.length {
+    callTaNodes.push(tyArgs[i])
+    if i < ends.length { callTaEnds.push(ends[i]) } else { callTaEnds.push(-1) }
+    i = i + 1
+  }
+  0
+}
+
+// The `TypeRef` nodes the call `callIx` wrote as explicit type arguments, or an empty list.
+export function callTyArgsOf(callIx: i32): i32[] { callTyArgCol(callIx, false) }
+
+// Whether any call in the arena wrote explicit type arguments.
+export function callTyArgsAny(): boolean { callTaCall.length > 0 }
+
+// Whether the call `callIx` wrote explicit type arguments: `callTyArgsOf` without the list.
+export function callHasTyArgs(callIx: i32): boolean {
+  if callTaCall.length == 0 { return false }
+  callTyArgsOf(callIx).length > 0
+}
+
+// `callTyArgsOf`'s parallel list of source end offsets (-1 where synthesized).
+export function callTyArgEndsOf(callIx: i32): i32[] {
+  callTyArgCol(callIx, true)
+}
+
+function callTyArgCol(callIx: i32, ends: boolean): i32[] {
+  const out: i32[] = []
+  let lo = 0
+  let hi = callTaCall.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = callTaCall[mid]
+    if at == callIx {
+      let i = 0
+      while i < callTaCount[mid] {
+        const ti = callTaStart[mid] + i
+        if ends { out.push(callTaEnds[ti]) } else { out.push(callTaNodes[ti]) }
+        i = i + 1
+      }
+      return out
+    }
+    if at < callIx { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  out
 }
 
 // The multi-root twin, for a node whose type spellings are a list: a `UnionDecl`'s members
@@ -613,12 +870,15 @@ export function setAnnTs(nodeIx: i32, root: i32) {
 // `udTsRoot[first(node) + k]`. A member root may be -1, and the consumer falls back.
 let udTsNode: i32[] = []
 let udTsRoot: i32[] = []
+// `annTsWritten`'s twin: the member roots `clearUdTs` never drops, for display only.
+let udTsWritten: i32[] = []
 
 export function setUdTs(nodeIx: i32, roots: i32[]) {
   let i = 0
   while i < roots.length {
     udTsNode.push(nodeIx)
     udTsRoot.push(roots[i])
+    udTsWritten.push(roots[i])
     i = i + 1
   }
   0
@@ -1092,19 +1352,143 @@ export function clearUdTs(nodeIx: i32, k: i32) {
   0
 }
 
+// Undo every `clearAnnTs` and `clearUdTs`: each root reads what the parser banked again. The
+// twin of canon's spelling restore, so a re-check sees the trees for the names it gets back.
+export function restoreAnnTsAll() {
+  let i = 0
+  while i < annTsRoot.length {
+    annTsRoot[i] = annTsWritten[i]
+    i = i + 1
+  }
+  let k = 0
+  while k < udTsRoot.length {
+    udTsRoot[k] = udTsWritten[k]
+    k = k + 1
+  }
+  0
+}
+
 // The spelling-tree root recorded for `nodeIx`, or `-1` when none is — every non-`TypeRef`
 // node, an emitter-synthesized `TypeRef` built from a name that never passed through the
 // parser, and the string-only type spellings the parser still drops (`as`).
 export function annTsOf(nodeIx: i32) {
+  const r = annTsRowOf(nodeIx)
+  if r < 0 { return -1 }
+  annTsRoot[r]
+}
+
+// The spelling root the parser banked for `nodeIx` even when canon has since dropped it from
+// `annTsOf`, or -1. What the author wrote, for editor display; never a type's identity.
+export function annTsWrittenOf(nodeIx: i32) {
+  const r = annTsRowOf(nodeIx)
+  if r < 0 { return -1 }
+  annTsWritten[r]
+}
+
+// The row of `nodeIx` in the annotation columns, or -1 — a binary search over `annTsNode`.
+function annTsRowOf(nodeIx: i32) {
   let lo = 0
   let hi = annTsNode.length - 1
   while lo <= hi {
     const mid = lo + (hi - lo) / 2
     const at = annTsNode[mid]
-    if at == nodeIx { return annTsRoot[mid] }
+    if at == nodeIx { return mid }
     if at < nodeIx { lo = mid + 1 } else { hi = mid - 1 }
   }
   -1
+}
+
+// One-member alias name → its written spelling root, first declaration wins. Built from the
+// member table on the first ask and rebuilt only when that push-only table has grown, so
+// every checked binding may ask without walking it; `tsReset` drops it with the program.
+let aliasRootMap: {[string]: i32} = Map()
+let aliasRootLen = -1
+
+// The written spelling root of the one-member alias `type <name> = …`, or -1 when `name`
+// declares none. Asked per checked binding, so it reads the name map, never the table.
+function aliasTsRootOf(name: string) {
+  if aliasRootLen != udTsNode.length { aliasRootBuild() }
+  aliasRootMap[name] ?? -1
+}
+
+function aliasRootBuild() {
+  aliasRootMap = Map()
+  let r = 0
+  while r < udTsNode.length {
+    const n = udTsNode[r]
+    if n >= 0 && n < P.nodes.length {
+      const nd = P.nodes[n]
+      if nd is UnionDecl {
+        if nd.udVariants.length == 1 && !aliasRootMap.has(nd.udName) {
+          aliasRootMap[nd.udName] = udTsWritten[r]
+        }
+      }
+    }
+    r = r + 1
+  }
+  aliasRootLen = udTsNode.length
+  0
+}
+
+// The parameter names a function-type spelling wrote, or `[]` when it wrote none or does
+// not take exactly `arity` parameters. Sees through parentheses and a one-member alias
+// name; `depth` bounds an alias cycle. Display only: a function type's identity has no names.
+export function tsFnParamNames(root: i32, arity: i32, depth: i32): string[] {
+  const none: string[] = []
+  if root < 0 || root >= tsKind.length || depth > 8 { return none }
+  const k = tsKind[root]
+  if k == TS_PAREN && tsKidCount[root] == 1 {
+    return tsFnParamNames(tsKids[tsKidStart[root]], arity, depth + 1)
+  }
+  if k == TS_NAME {
+    return tsFnParamNames(aliasTsRootOf(tsText[root]), arity, depth + 1)
+  }
+  if k != TS_FUNC { return none }
+  const text = tsText[root]
+  if text.length == 0 || tsKidCount[root] - 1 != arity { return none }
+  const names: string[] = []
+  let start = 0
+  let i = 0
+  while i <= text.length {
+    if i == text.length || text[i] == ',' {
+      names.push(text.slice(start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if names.length != arity { return none }
+  names
+}
+
+// Whether this program wrote any parameter name in a function type, so a program that
+// wrote none pays nothing for `tsWritesParamNames`.
+let tsAnyParamNames = false
+export function tsNoteParamNames() {
+  tsAnyParamNames = true
+  0
+}
+
+// Whether spelling `root` names a function type's parameters anywhere, through one-member
+// alias names too; `depth` bounds an alias cycle. An annotation that does is documentation.
+export function tsWritesParamNames(root: i32, depth: i32): boolean {
+  if !tsAnyParamNames { return false }
+  if root < 0 || root >= tsKind.length || depth > 8 { return false }
+  const k = tsKind[root]
+  if k == TS_FUNC && tsText[root].length > 0 { return true }
+  if k == TS_NAME {
+    return tsWritesParamNames(aliasTsRootOf(tsText[root]), depth + 1)
+  }
+  let i = 0
+  while i < tsKidCount[root] {
+    if tsWritesParamNames(tsKids[tsKidStart[root] + i], depth) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// `tsFnParamNames` for the one-member alias spelled `name`.
+export function aliasFnParamNames(name: string, arity: i32): string[] {
+  tsFnParamNames(aliasTsRootOf(name), arity, 0)
 }
 
 // Drop the spelling root recorded for `nodeIx`, so `annTsOf` answers -1 and every consumer
@@ -1138,8 +1522,19 @@ export function tsReset() {
   tsStack = []
   annTsNode = []
   annTsRoot = []
+  annTsWritten = []
+  tsAnyParamNames = false
+  matchPatValNames = Map()
+  callTaCall = []
+  callTaStart = []
+  callTaCount = []
+  callTaNodes = []
+  callTaEnds = []
   udTsNode = []
   udTsRoot = []
+  udTsWritten = []
+  aliasRootMap = Map()
+  aliasRootLen = -1
   declGpNode = []
   declGpBase = []
   declGpStart = []
@@ -1157,6 +1552,7 @@ export function tsReset() {
   // the new program declares. Invisible from the CLI; live in the LSP and the harness.
   ufcsAliasReset()
   ufcsImpReset()
+  funcDeclNodes = []
   0
 }
 
@@ -1165,11 +1561,55 @@ export function tsReset() {
 // `parseTypeAtom`, so `tsToName(annTsOf(ix))` reproduces `TypeRef.tyName` character for
 // character. This is the tree's write-back; -1 renders "", the parser's recovery answer.
 export function tsToName(ix: i32): string {
+  const none: string[] = []
+  tsToNameGo(ix, none, none, true)
+}
+
+// `tsToName` with every type-position leaf naming one of `names` replaced by the parallel
+// entry of `reps`. A field name, a method name or a string-literal member is never such a
+// leaf, so only types are replaced.
+export function tsToNameSubst(
+  ix: i32,
+  names: string[],
+  reps: string[],
+): string {
+  tsToNameGo(ix, names, reps, true)
+}
+
+// A replaced leaf is grouped when it is a union, an intersection or a function type and
+// does not stand for the whole spelling, so `T[]` at `T = A | B` stays one element.
+function tsSubstLeaf(
+  leaf: string,
+  names: string[],
+  reps: string[],
+  top: boolean,
+): string {
+  let i = 0
+  while i < names.length && i < reps.length {
+    if names[i] == leaf {
+      const r = reps[i]
+      if top { return r }
+      if r.includes("|") || r.includes("&") || r.includes("=>") {
+        return "(" + r + ")"
+      }
+      return r
+    }
+    i = i + 1
+  }
+  leaf
+}
+
+function tsToNameGo(
+  ix: i32,
+  names: string[],
+  reps: string[],
+  top: boolean,
+): string {
   if ix < 0 { return "" }
   const k = tsKind[ix]
   const start = tsKidStart[ix]
   const cnt = tsKidCount[ix]
-  if k == TS_NAME { return tsText[ix] }
+  if k == TS_NAME { return tsSubstLeaf(tsText[ix], names, reps, top) }
   if k == TS_LITSTR { return tsText[ix] }
   if k == TS_LITNUM { return tsText[ix] }
   if k == TS_NULL { return "null" }
@@ -1178,15 +1618,21 @@ export function tsToName(ix: i32): string {
     // A read-only list view marks the `[]` node it binds, so the marker rides that suffix
     // and an inner array keeps its own spelling.
     if tsText[ix] == "readonly" {
-      return "readonly " + tsToName(tsKids[start]) + "[]"
+      return "readonly " + tsToNameGo(tsKids[start], names, reps, false) + "[]"
     }
-    return tsToName(tsKids[start]) + "[]"
+    return tsToNameGo(tsKids[start], names, reps, false) + "[]"
   }
-  if k == TS_NEG { return "!" + tsToName(tsKids[start]) }
+  if k == TS_NEG { return "!" + tsToNameGo(tsKids[start], names, reps, false) }
   if k == TS_MAP {
-    return "{[" + tsText[ix] + "]:" + tsToName(tsKids[start]) + "}"
+    return "{["
+      + tsSubstLeaf(tsText[ix], names, reps, true)
+      + "]:"
+      + tsToNameGo(tsKids[start], names, reps, false)
+      + "}"
   }
-  if k == TS_FIELD { return tsText[ix] + ":" + tsToName(tsKids[start]) }
+  if k == TS_FIELD {
+    return tsText[ix] + ":" + tsToNameGo(tsKids[start], names, reps, false)
+  }
   if (
     k == TS_APP
     || k == TS_PAREN
@@ -1203,16 +1649,23 @@ export function tsToName(ix: i32): string {
     let i = 0
     while i < last {
       if i > 0 { inner = inner + "," }
-      inner = inner + tsToName(tsKids[start + i])
+      inner = inner + tsToNameGo(tsKids[start + i], names, reps, false)
       i = i + 1
     }
     if k == TS_APP { return tsText[ix] + "<" + inner + ">" }
     if k == TS_PAREN { return "(" + inner + ")" }
     if k == TS_OBJ { return "{" + inner + "}" }
     if k == TS_METHOD {
-      return tsText[ix] + "(" + inner + "):" + tsToName(tsKids[start + cnt - 1])
+      return tsText[ix]
+        + "("
+        + inner
+        + "):"
+        + tsToNameGo(tsKids[start + cnt - 1], names, reps, false)
     }
-    return "(" + inner + ")=>" + tsToName(tsKids[start + cnt - 1])
+    return "("
+      + inner
+      + ")=>"
+      + tsToNameGo(tsKids[start + cnt - 1], names, reps, false)
   }
   // `TS_UNION` / `TS_ISECT` — the members joined by their own separator.
   let sep = "|"
@@ -1221,7 +1674,7 @@ export function tsToName(ix: i32): string {
   let i = 0
   while i < cnt {
     if i > 0 { out = out + sep }
-    out = out + tsToName(tsKids[start + i])
+    out = out + tsToNameGo(tsKids[start + i], names, reps, false)
     i = i + 1
   }
   out
@@ -1323,6 +1776,7 @@ export function mkBinary(op: string, left: i32, right: i32, pos: i32) {
     pos: pos,
     binCompound: "",
     binTpl: 0,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1343,6 +1797,7 @@ export function mkTplConcat(left: i32, right: i32, pos: i32) {
     pos: pos,
     binCompound: "",
     binTpl: 1,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1367,6 +1822,19 @@ export function mkTplHole(nodeIx: i32) {
 export function nodeIsTplHole(nodeIx: i32) {
   if nodeIx < 0 || nodeIx >= tplHole.length { return false }
   tplHole[nodeIx] == 1
+}
+
+// A record type naming a field twice, as (repeat, first) pairs of inert `ErrExpr` anchors on
+// the two field-name tokens, in parse order. Truncated and reset with `tplHole`; the checker's
+// duplicate-field refusal is the one reader.
+export let recDupField: i32[] = []
+
+// Record that the field named at anchor `dupIx` repeats the one at anchor `firstIx`.
+export function mkRecDupField(dupIx: i32, firstIx: i32) {
+  if dupIx < 0 || firstIx < 0 { return 0 }
+  recDupField.push(dupIx)
+  recDupField.push(firstIx)
+  0
 }
 
 // Parallel to `P.nodes` on `tplHole`'s contract. `1` marks a `Call` whose trailing arguments
@@ -1488,15 +1956,6 @@ function identCalleeAt(ix: i32) {
   ""
 }
 
-function strListHas(xs: string[], s: string) {
-  let k = 0
-  while k < xs.length {
-    if xs[k] == s { return true }
-    k = k + 1
-  }
-  false
-}
-
 // A compound assignment `target op= value`, desugared to `target = (target op
 // value)` for typecheck/emit but tagged with the SURFACE operator (`binCompound`)
 // so the printer reprints `target op= value`. The target node is shared between
@@ -1515,6 +1974,7 @@ export function mkCompoundAssign(
     pos: pos,
     binCompound: op,
     binTpl: 0,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1534,6 +1994,7 @@ export function mkPreIncr(incr: string, target: i32, pos: i32) {
     pos: pos,
     binCompound: incr,
     binTpl: 0,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1586,14 +2047,45 @@ let ufcsScopeTo: string[] = []
 let ufcsScopeExp: boolean[] = []
 let ufcsModBound: i32[] = []
 let ufcsModIx: i32[] = []
+// The rung member call `callIx` resolved through: the checker banks `MC_RUNG_BUILTIN` or
+// `MC_RUNG_SELF_FN` (0 for none) so the emitter's rewrite cannot pick the other (D2476); the
+// rewrite's `MC_RUNG_PER_INSTANCE` leaves a type-parameter receiver's call to each instance.
+// `MC_RUNG_FIELD` is never banked: only `memberRungOnTy` answers it.
+export const MC_RUNG_BUILTIN = 1
+export const MC_RUNG_SELF_FN = 2
+export const MC_RUNG_FIELD = 3
+export const MC_RUNG_PER_INSTANCE = 4
+let memberCallRung: i32[] = []
+export function memberCallRungAdd(callIx: i32, rung: i32) {
+  if callIx < 0 { return 0 }
+  while memberCallRung.length <= callIx { memberCallRung.push(0) }
+  // The rewrite's mark outlives a later re-check of the template at one instance's types.
+  if memberCallRung[callIx] == MC_RUNG_PER_INSTANCE { return 0 }
+  memberCallRung[callIx] = rung
+  0
+}
+// A copied call that banked no rung of its own answers its original's (D4030).
+export function memberCallRungOf(callIx: i32) {
+  if callIx >= 0 && callIx < memberCallRung.length {
+    if memberCallRung[callIx] != 0 { return memberCallRung[callIx] }
+  }
+  const at = ufcsSiteRoot(callIx)
+  if at != callIx && at >= 0 && at < memberCallRung.length {
+    return memberCallRung[at]
+  }
+  0
+}
 export function ufcsAliasReset() {
+  memberCallRung = []
   ufcsSiteTo = []
+  ufcsSiteFrom = []
   ufcsScopeMod = []
   ufcsScopeFrom = []
   ufcsScopeTo = []
   ufcsScopeExp = []
   ufcsModBound = []
   ufcsModIx = []
+  ovReset()
   0
 }
 // Bank the mangled self-function the UFCS member-call node `callIx` resolves to.
@@ -1607,6 +2099,24 @@ export function ufcsSiteAdd(callIx: i32, mangled: string) {
 function ufcsSiteOf(callIx: i32) {
   if callIx >= 0 && callIx < ufcsSiteTo.length { return ufcsSiteTo[callIx] }
   ""
+}
+// A call node minted as a copy of another, mapped to the node it copies, or -1. A copy is the
+// same call site, so it resolves as the merge-walked original does (D4030).
+let ufcsSiteFrom: i32[] = []
+// Record that call `to` copies call `from`; returns `to`.
+export function ufcsSiteCarry(to: i32, from: i32) {
+  if to < 0 || from < 0 || to == from { return to }
+  while ufcsSiteFrom.length <= to { ufcsSiteFrom.push(-1) }
+  ufcsSiteFrom[to] = from
+  to
+}
+// The merge-walked node call `callIx` copies, or `callIx` itself.
+function ufcsSiteRoot(callIx: i32) {
+  let at = callIx
+  while at >= 0 && at < ufcsSiteFrom.length && ufcsSiteFrom[at] >= 0 {
+    at = ufcsSiteFrom[at]
+  }
+  at
 }
 // Module `m` binds plain `plain` to the merged `self`-function `mangled` — one
 // row per name in that module's scope, declaration or import (alias included).
@@ -1682,9 +2192,170 @@ export function ufcsAliasInScope(nodeIx: i32, name: string) {
 // entry point for the three consumers that hold a call node, so the checker and the emitter
 // cannot pick different modules' functions for one call.
 export function ufcsAliasAtSite(callIx: i32, name: string) {
-  const site = ufcsSiteOf(callIx)
+  const at = ufcsSiteRoot(callIx)
+  const site = ufcsSiteOf(at)
   if site != "" { return site }
-  ufcsAliasInScope(callIx, name)
+  ufcsAliasInScope(at, name)
+}
+
+// Receiver overloading (owner ruling O1, `docs/internals/receiver-overloading.md`): a module
+// may bind one plain name to several functions whose first parameters' head classes are
+// pairwise disjoint. One set per (module, name), the local declaration first; a member call
+// that must choose names its set, and the chosen candidate is banked through `ufcsSiteAdd`.
+export let ovSetMod: i32[] = []
+export let ovSetName: string[] = []
+export let ovSetCands: string[][] = []
+// How the module names each candidate's module: its import specifier, "" for its own.
+export let ovSetSpecs: string[][] = []
+// A set the merge refused (two candidates overlap); its sites stay unresolved.
+export let ovSetBad: boolean[] = []
+let ovSiteRow: {[i32]: i32} = Map()
+// Plain calls the local declaration answers while the set has imported candidates too.
+let ovPlainRow: {[i32]: i32} = Map()
+// The head class of every merged function's first parameter (`ovHeadsOverlap`).
+export let ovFnHead: {[string]: string} = Map()
+// Per monomorphized instance, the candidate a generic body's member call took there.
+export let ovInstSite: i32[] = []
+export let ovInstRecv: string[] = []
+export let ovInstPick: string[] = []
+
+export function ovReset() {
+  ovSetMod = []
+  ovSetName = []
+  ovSetCands = []
+  ovSetSpecs = []
+  ovSetBad = []
+  ovSiteRow = Map()
+  ovPlainRow = Map()
+  ovFnHead = Map()
+  ovInstSite = []
+  ovInstRecv = []
+  ovInstPick = []
+  0
+}
+
+export function ovSetAdd(
+  m: i32,
+  name: string,
+  cands: string[],
+  specs: string[],
+) {
+  ovSetMod.push(m)
+  ovSetName.push(name)
+  ovSetCands.push(cands)
+  ovSetSpecs.push(specs)
+  ovSetBad.push(false)
+  ovSetMod.length - 1
+}
+
+// The set module `m` binds `name` to, or -1 when it binds one function or none.
+export function ovSetOf(m: i32, name: string) {
+  let i = 0
+  while i < ovSetMod.length {
+    if ovSetMod[i] == m && ovSetName[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+export function ovSiteAdd(callIx: i32, row: i32) {
+  ovSiteRow[callIx] = row
+  0
+}
+
+// The set member call `callIx` must choose from, or -1.
+export function ovSiteSetOf(callIx: i32) {
+  if ovSetMod.length == 0 { return -1 }
+  // A copied call that banked no set of its own answers its original's (D4030).
+  const row = ovSiteRow[callIx] ?? ovSiteRow[ufcsSiteRoot(callIx)] ?? -1
+  if row < 0 || ovSetBad[row] { return -1 }
+  row
+}
+
+export function ovPlainAdd(callIx: i32, row: i32) {
+  ovPlainRow[callIx] = row
+  0
+}
+
+// The set whose local declaration plain call `callIx` reached, or -1.
+export function ovPlainSetOf(callIx: i32) {
+  if ovSetMod.length == 0 { return -1 }
+  ovPlainRow[callIx] ?? -1
+}
+
+// Whether two head classes can both take one receiver: equal classes overlap, and an open
+// first parameter (`any`: a bare type parameter, a hole, a union) overlaps every class.
+export function ovHeadsOverlap(a: string, b: string) {
+  a == b || a == "any" || b == "any"
+}
+
+// The head class of a primitive type name, "" for any other name. The one classifier both the
+// merge (first-parameter spellings) and the checker (receiver types) ask.
+const OV_PRIM_NAMES = [
+  "string", "boolean", "i32", "i64", "f32", "f64", "u8", "u32", "u64",
+]
+const OV_PRIM_CLASSES = [
+  "str", "bool", "num", "num", "num", "num", "num", "num", "num",
+]
+export function ovPrimClass(name: string) {
+  let i = 0
+  while i < OV_PRIM_NAMES.length {
+    if OV_PRIM_NAMES[i] == name { return OV_PRIM_CLASSES[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// A head class as a diagnostic phrases it.
+export function ovHeadText(key: string) {
+  if key == "none" { return "no parameters" }
+  if key == "any" {
+    return "an open first parameter, which overlaps every kind"
+  }
+  if key == "str" { return "a `string` first" }
+  if key == "arr" { return "a list first" }
+  if key == "map" { return "a `Map` first" }
+  if key == "set" { return "a `Set` first" }
+  if key == "bool" { return "a `boolean` first" }
+  if key == "num" { return "a number first" }
+  if key == "fn" { return "a function first" }
+  if key.length > 4 && key.slice(0, 4) == "rec:" {
+    return "`" + ovDemangle(key.slice(4, key.length)) + "` first"
+  }
+  "an open first parameter, which overlaps every kind"
+}
+
+// `name$m3` → `name`: a merged name as its author spelled it.
+export function ovDemangle(nm: string) {
+  let i = 0
+  while i + 1 < nm.length {
+    if nm[i] == '$' && nm[i + 1] == 'm' { return nm.slice(0, i) }
+    i = i + 1
+  }
+  nm
+}
+
+// One candidate of set `row` as a diagnostic names it: its module and its head.
+export function ovCandText(row: i32, k: i32) {
+  const fnm = ovSetCands[row][k]
+  let from = "the local `" + ovSetName[row] + "`"
+  const sp = ovSetSpecs[row][k]
+  if sp != "" { from = "`" + ovSetName[row] + "` from \"" + sp + "\"" }
+  from + " (" + ovHeadText(ovFnHead[fnm] ?? "any") + ")"
+}
+
+// Every candidate of set `row`, joined for a sentence.
+export function ovCandsText(row: i32) {
+  let out = ""
+  let k = 0
+  const last = ovSetCands[row].length - 1
+  while k <= last {
+    if k > 0 && k == last { out = out + " and " }
+    else if k > 0 { out = out + ", " }
+    out = out + ovCandText(row, k)
+    k = k + 1
+  }
+  out
 }
 
 // UFCS candidates the entry file has not imported (D1230's diagnostic). UFCS is explicit:
@@ -1881,11 +2552,55 @@ export function getDeclExported(fnIx: i32): boolean {
   false
 }
 
+// The `export function`/`let`/`const` declarations the parser saw, by node: the parser drops
+// the keyword, and a caller in another module or the host may consume what one returns.
+let exportDeclNodes: {[i32]: boolean} = Map()
+
+export function exportDeclAdd(ix: i32) {
+  exportDeclNodes[ix] = true
+  ix
+}
+
+export function declExported(ix: i32): boolean { exportDeclNodes[ix] ?? false }
+
+// The `if` and `match` nodes the parser met in expression position, by node: the only places
+// an if-expression can sit outside a statement list, which the emitter scans for arm locals
+// instead of the whole arena (D2785). A `match` is recorded at the node its desugar replaces.
+export let valueIfNodes: i32[] = []
+
+export function valueIfAdd(ix: i32) {
+  valueIfNodes.push(ix)
+  ix
+}
+
+// Take back the record of an expression statement that is itself the `if` or `match`: it
+// stands in a statement list, where the statement walk reaches it.
+export function valueIfDrop(ix: i32) {
+  const n = valueIfNodes.length
+  if n > 0 && valueIfNodes[n - 1] == ix { valueIfNodes.pop() }
+  ix
+}
+
 // Per-compile reset, paired with `externReset`.
 export function getDeclReset() {
   getDeclNodes = []
   getDeclExps = []
+  exportDeclNodes = Map()
+  valueIfNodes = []
+  brkValSeen = false
+  lblBlkSeen = false
   0
+}
+
+// The name a caller writes for parameter `nm`: a parameter named like an ambient function is
+// renamed apart by the merge (`name$m<k>`), and its label stays the declared name.
+export function paramLabel(nm: string): string {
+  let i = nm.length - 1
+  while i >= 0 && nm[i] >= '0' && nm[i] <= '9' { i = i - 1 }
+  if i >= 1 && i < nm.length - 1 && nm[i] == 'm' && nm[i - 1] == '$' {
+    return nm.slice(0, i - 1)
+  }
+  nm
 }
 
 // Bind call arguments to parameter slots by name, then positionally — the single source of
@@ -1916,7 +2631,7 @@ export function orderArgsByParamNames(
       let pIx = -1
       let k = 0
       while k < paramNames.length {
-        if pIx < 0 && paramNames[k] == nm { pIx = k }
+        if pIx < 0 && paramLabel(paramNames[k]) == nm { pIx = k }
         k = k + 1
       }
       if pIx < 0 || slots[pIx] >= 0 {
@@ -2126,8 +2841,14 @@ export function mkFunc(
     fnBody: body,
     pos: pos,
   }
-  addNode(n)
+  const ix = addNode(n)
+  funcDeclNodes.push(ix)
+  ix
 }
+
+// Every `FuncDecl` `mkFunc` has built this compile, in arena order, so a pass that needs the
+// lambdas (which sit in expressions) reads them without scanning the arena. Cleared by `tsReset`.
+export let funcDeclNodes: i32[] = []
 
 export function mkIf(cond: i32, thenB: i32, els: i32, pos: i32) {
   const n: Node = { ifCond: cond, ifThen: thenB, ifElse: els, pos: pos }
@@ -2154,12 +2875,34 @@ export function isBareBlockIf(ix: i32): boolean {
 }
 
 // Loop constructors take the optional loop label last ("" = unlabelled).
-export function mkWhile(cond: i32, body: i32, label: string, pos: i32) {
+export function mkWhile(
+  cond: i32,
+  body: i32,
+  label: string,
+  pos: i32,
+  blk: i32,
+) {
+  if blk == 1 { lblBlkSeen = true }
   const n: Node = {
     whileCond: cond,
     whileBody: body,
     whileLabel: label,
     pos: pos,
+    whileBlk: blk,
+    whileLv: "",
+  }
+  addNode(n)
+}
+
+// A copy of the `while` `w` over the condition `cond` and body `body`, every other field kept.
+export function mkWhileAs(w: WhileStmt, cond: i32, body: i32) {
+  const n: Node = {
+    whileCond: cond,
+    whileBody: body,
+    whileLabel: w.whileLabel,
+    pos: w.pos,
+    whileBlk: w.whileBlk,
+    whileLv: w.whileLv,
   }
   addNode(n)
 }
@@ -2228,9 +2971,20 @@ export function mkMatch(
 }
 
 export function mkBreak(kw: string, label: string, pos: i32) {
-  const n: Node = { brkKw: kw, brkLabel: label, pos: pos }
+  mkBreakVal(kw, label, pos, 0)
+}
+
+// `mkBreak` for `break v`, whose value is the statement before it (`hasVal` 1).
+export function mkBreakVal(kw: string, label: string, pos: i32, hasVal: i32) {
+  if hasVal == 1 { brkValSeen = true }
+  const n: Node = { brkKw: kw, brkLabel: label, pos: pos, brkHasVal: hasVal }
   addNode(n)
 }
+
+// Whether this parse holds a `break v`, so a walk that only folds those can skip the tree.
+export let brkValSeen = false
+// Whether this parse holds a labelled block, whose tail can make it carry a value.
+export let lblBlkSeen = false
 
 export function mkContinue(kw: string, label: string, pos: i32) {
   const n: Node = { contKw: kw, contLabel: label, pos: pos }

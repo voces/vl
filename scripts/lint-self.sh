@@ -7,7 +7,8 @@
 # The compiler is a real module graph (entry.vl → driver → the pipeline), and a
 # single-file `vl check` lints EVERY module of the resolved graph (the
 # per-module lint tier), each finding attributed to its own file — so checking
-# the entry covers all of compiler/*.vl with source-file positions.
+# the entry covers all of compiler/*.vl with source-file positions. That needs
+# `--include-imports`: without it an import reports its errors only (plumb PL-055).
 # `prefer-const` stays safe on cross-module reassignment because EXPORTED
 # bindings are exempt (another module may rebind them). `std/` is linted as
 # ordinary modules EXCEPT for the four comment codes, which implement the
@@ -78,7 +79,7 @@ trap 'rm -rf "$WORK"' EXIT
 # rewritten (a rewrite moves the seed for a spelling), and a new one fails its --check.
 lint_graded() { # <target> <json path>
   local rc=0
-  "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
+  "$VL" check "$1" --severity info --include-imports --json > "$2" 2> "$2.err" || rc=$?
   cat "$2.err"
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
@@ -117,6 +118,9 @@ echo "== fmt-check: compiler/ std/ scripts/ tests/ bench/ (parallel per file) ==
 FMT_RC=0
 FMT_LOG="$WORK/fmt.log"
 : > "$FMT_LOG"
+# Each worker writes its own part (a chunk's lines can exceed what one append keeps whole).
+export FMT_PARTS="$WORK/fmt.parts"
+mkdir -p "$FMT_PARTS"
 # One `vl fmt --check` per file, classified by EXIT CODE: 0 clean, 1 drift, 2 the file does
 # not parse. rc 2 is out of scope, not a failure — `tests/cases/` holds deliberately-invalid
 # fixtures (a missing brace, an unterminated string) that exist to be refused, and the count
@@ -127,22 +131,48 @@ find compiler std scripts tests bench \
     -path scripts/silent-sweep/distilled -prune -o \
     -path scripts/capability-probes/matrix -prune -o \
     -name '*.vl' -print0 \
-  | xargs -0 -n 1 -P "$(nproc)" bash -c '
+  | xargs -0 -n 200 -P "$(nproc)" bash -c '
+      # One `vl fmt --check` per 200 files: it names each drifting file
+      # (`<f>: not formatted`) and each unparseable one (`fmt: <f>: parse error …`).
+      # A chunk with any other line, or another exit code, is redone one file at a
+      # time, so the classification is always the per-file one.
+      one() {
+        rc=0
+        "$VL" fmt --check "$1" >/dev/null 2>&1 || rc=$?
+        case "$rc" in
+          0) ;;
+          1) printf "drift\t%s\n" "$1" ;;
+          2) printf "unparsed\t%s\n" "$1" ;;
+          *) printf "crash%s\t%s\n" "$rc" "$1" ;;
+        esac
+      }
+      VL=$0
       rc=0
-      "$0" fmt --check "$1" >/dev/null 2>&1 || rc=$?
-      case "$rc" in
-        0) ;;
-        1) printf "drift\t%s\n" "$1" ;;
-        2) printf "unparsed\t%s\n" "$1" ;;
-        *) printf "crash%s\t%s\n" "$rc" "$1" ;;
-      esac' "$VL" >> "$FMT_LOG"
+      out=$("$VL" fmt --check "$@" 2>&1) || rc=$?
+      res=""
+      ok=1
+      case "$rc" in 0|1|2) ;; *) ok=0 ;; esac
+      if [ "$ok" = 1 ] && [ -n "$out" ]; then
+        while IFS= read -r l; do
+          case "$l" in
+            "fmt: "*": parse error"*) f=${l#fmt: }; res="$res$(printf "unparsed\t%s" "${f%%: parse error*}")
+" ;;
+            *": not formatted") res="$res$(printf "drift\t%s" "${l%: not formatted}")
+" ;;
+            *) ok=0 ;;
+          esac
+        done <<< "$out"
+      fi
+      part=$(mktemp "$FMT_PARTS/part.XXXXXX")
+      if [ "$ok" = 1 ]; then printf "%s" "$res" > "$part"; else for f in "$@"; do one "$f"; done > "$part"; fi' "$VL"
+cat "$FMT_PARTS"/part.* >> "$FMT_LOG" 2>/dev/null || true
 FMT_DRIFT=$(grep -c '^drift' "$FMT_LOG" || true)
 FMT_UNPARSED=$(grep -c '^unparsed' "$FMT_LOG" || true)
 FMT_CRASH=$(grep -c '^crash' "$FMT_LOG" || true)
 echo "fmt: $FMT_DRIFT drifting, $FMT_UNPARSED unparseable (out of scope), $FMT_CRASH crashed"
 if [ "$FMT_DRIFT" != 0 ] || [ "$FMT_CRASH" != 0 ]; then
   grep -E '^(drift|crash)' "$FMT_LOG" | sort | sed 's/^/  /'
-  echo "  run: vl fmt -w <path>   (one path per run)"
+  echo "  run: vl fmt -w <path>   (or several paths)"
   FMT_RC=1
 fi
 
@@ -151,6 +181,14 @@ GRAPH_RC=0
 wait "$GRAPH_PID" || GRAPH_RC=$?
 cat "$WORK/graph.log"
 [ "$GRAPH_RC" = 0 ] || exit "$GRAPH_RC"
+# Coverage guard: the graph run must attribute findings to more than the entry. Without
+# `--include-imports` every import's findings are withheld and this run would pass on
+# zero findings having linted nothing but entry.vl.
+GRAPH_FILES=$("$PY" -c 'import json,sys; print(len({d["file"] for d in json.load(open(sys.argv[1]))}))' "$WORK/graph.json")
+if [ "$GRAPH_FILES" -lt 2 ]; then
+  echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
+  exit 1
+fi
 [ "$FMT_RC" = 0 ] || exit "$FMT_RC"
 
 echo "self-lint + fmt-check clean ✅"

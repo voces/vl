@@ -1,12 +1,13 @@
 // `std:fmt` — rendering numbers as text, and parsing them back.
 //
-//     import { toString, parseI32, parseI64, parseF64 } from "std:fmt"
+//     import { toString, toFixed, parseI32, parseI64, parseF64 } from "std:fmt"
 //
-// `toString`'s domain is exactly `i32 | i64 | boolean | f64`, and it is this
-// module's export rather than a builtin — a file that declares its own
-// `toString` cannot also import this one. The float style is ECMAScript's, so
-// `print(x.toString())` and `print(x)` agree. `join`, `repeat` and `split` are
-// re-exported from `std:str`. No `f32`, no radix but ten, no unsigned parser.
+// `toString`'s domain is exactly `i32 | i64 | boolean | f64`, and it is this module's
+// export rather than a builtin — a file that declares its own `toString` cannot also
+// import this one. The float style is ECMAScript's, so `print(x.toString())` and
+// `print(x)` agree. `join`, `repeat` and `split` are re-exported from `std:str`. No
+// `f32`, no radix but ten, no unsigned parser, and no locale: the point is always `.`,
+// digits are never grouped, and the parsers accept only that.
 
 import { padStart } from "std:str"
 
@@ -598,6 +599,99 @@ function renderF64(x: f64): string {
   const body = layoutDec(dd.d, dd.n)
   if bits < 0 { return "-" + body }
   body
+}
+
+// `a >>= bits`, in place; the bits shifted out are dropped.
+function bnShrInto(a: i64[], bits: i32) {
+  const whole = bits / 32
+  const rem = bits % 32
+  const n = a.length
+  let i = 0
+  while i < n {
+    let v: i64 = 0
+    const src = i + whole
+    if src < n {
+      v = a[src] >>> rem
+      if rem > 0 && src + 1 < n {
+        v = v | ((a[src + 1] << (32 - rem)) & BN_MASK)
+      }
+    }
+    a[i] = v
+    i = i + 1
+  }
+}
+
+// `a /= d`, in place, answering the remainder. `d` must be in 1..=10^9, so the
+// remainder shifted up a limb still fits.
+function bnDivSmallInto(a: i64[], d: i64): i64 {
+  let rem: i64 = 0
+  let i = a.length - 1
+  while i >= 0 {
+    const cur = (rem << 32) | a[i]
+    a[i] = cur / d
+    rem = cur % d
+    i = i - 1
+  }
+  rem
+}
+
+// The decimal digits of the big natural `a`, which this consumes; "0" for zero.
+function bnToDecimal(a: i64[]): string {
+  if bnIsZero(a) { return "0" }
+  const chunks: i64[] = []
+  while !bnIsZero(a) { chunks.push(bnDivSmallInto(a, 1000000000)) }
+  let out = renderI64(chunks[chunks.length - 1])
+  let i = chunks.length - 2
+  while i >= 0 {
+    out = out + padStart(renderI64(chunks[i]), 9, "0")
+    i = i - 1
+  }
+  out
+}
+
+// `self` with exactly `digits` digits after the point, as JS's `x.toFixed(digits)`: plain
+// machine text (always `.`, never grouped) rounding the exact binary value half away from
+// zero, so `1.005.toFixed(2)` is `"1.00"` and `(-0.001).toFixed(2)` is `"-0.00"`. NaN, the
+// infinities and |self| >= 1e21 render as `toString` does; `digits` outside 0..=100 traps.
+export function toFixed(self: f64, digits: i32): string {
+  if digits < 0 || digits > 100 {
+    __trap__("std:fmt.toFixed: digits must be in 0..=100")
+  }
+  const bits = f64bits(self)
+  const be = ((bits >>> 52) & 2047) as! i32
+  if be == 2047 || abs(self) >= 1e21 { return renderF64(self) }
+  // `-0.0 < 0.0` is false, so negative zero renders unsigned, as the spec has it.
+  let sign = ""
+  if self < 0.0 { sign = "-" }
+
+  // |self| = m * 2^e exactly; the answer is m * 2^e * 10^digits rounded to an
+  // integer, ties upward, then printed with the point `digits` places from the end.
+  const frac = bits & 4503599627370495
+  let m = frac
+  let e = -1074
+  if be != 0 {
+    m = frac + 4503599627370496
+    e = be - 1075
+  }
+  const n = bnFromI64(m)
+  bnMulPow10(n, digits)
+  let body = "0"
+  if e >= 0 {
+    bnShlInto(n, e)
+    body = bnToDecimal(n)
+  } else if bnBitLen(n) >= 0 - e {
+    // Below 2^(-e-1) the scaled value is under one half and rounds to zero, which
+    // `body` already says; above it, adding the half and shifting is the rounding.
+    const half = bnFromI64(1)
+    bnShlInto(half, 0 - e - 1)
+    bnAddInto(n, half)
+    bnShrInto(n, 0 - e)
+    body = bnToDecimal(n)
+  }
+  if digits == 0 { return sign + body }
+  if body.length <= digits { body = padStart(body, digits + 1, "0") }
+  const point = body.length - digits
+  sign + body.slice(0, point) + "." + body.slice(point, body.length)
 }
 
 // ── text → f64 ───────────────────────────────────────────────────────────────

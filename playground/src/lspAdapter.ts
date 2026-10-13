@@ -30,6 +30,7 @@ import {
   type CompletionKind,
   displayableType,
   docMarkdown,
+  exactConstHover,
   importInsertionEdit,
   inlayHintsFromWasm,
   isDisplayableType,
@@ -46,6 +47,7 @@ import {
   snippetCompletions,
   typeLabelDetail,
   ufcsCompletions,
+  withEffects,
 } from "../../lsp/src/typeFeatures.ts";
 import {
   removeCharAt,
@@ -216,6 +218,18 @@ export const hover = async (
   // an absence-of-a-type sentinel (`<error>` for an annotation that didn't
   // resolve) counts as NO ANSWER and falls through to the next rung instead of
   // printing a type name VL does not have.
+  // An exact constant (an un-annotated literal `const`) shows its value, and at a use the
+  // type it took there, ahead of the type ladder — as `server.ts` does.
+  const exact = await checker
+    .constAt(text, entryKey, reader, pos.line, pos.character)
+    .catch(() => undefined);
+  if (exact) {
+    const { code, note } = exactConstHover(word.text, exact);
+    return {
+      contents: withEffects(docMarkdown(code, VL_LANGUAGE_ID, await at(checker.docAt)), note),
+      range: word.range,
+    };
+  }
   const t = displayableType(await at(checker.hoverTypeAt)) ??
     displayableType(await at(checker.memberTypeAt)) ??
     displayableType(await at(checker.typeAliasAt));
@@ -501,7 +515,7 @@ const VL_LANGUAGE_ID = "vital";
 // `detail`. A snippet carries its insert text + the snippet kind.
 const toCompletionItem = (c: Completion): CompletionItem => {
   const item: CompletionItem = { label: c.name, kind: c.kind };
-  if (c.detail !== undefined) item.labelDetail = typeLabelDetail(c.detail);
+  if (c.detail !== undefined) item.labelDetail = c.labelDetail ?? typeLabelDetail(c.detail);
   if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
     item.documentation = docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc);
   }

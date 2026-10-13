@@ -8,6 +8,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -76,7 +77,7 @@ const parseBatch = (out: string): Batch[] => {
 const withDir = async (
   fn: (dir: string) => Promise<void>,
 ): Promise<void> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_check_json_" });
+  const dir = await makeTempDir({ prefix: "vl_check_json_" });
   try {
     await fn(dir);
   } finally {
@@ -331,13 +332,11 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // The same shape `tests/cases/unions/same-field-names-i32-vs-boolean-reject.vl`
-      // carries: `vl check` accepts it and the emitter has no discriminator for it.
+      // A live emit-side refusal (`scripts/capability-probes/for-range-step-min-i32.vl`):
+      // `vl check` accepts it and the emitter refuses the step.
       await Deno.writeTextFile(
         file,
-        "type P = { a: i32 }\ntype Q = { a: boolean }\n" +
-          "const u: P | Q = { a: true }\n" +
-          'if u is P { print("IS-P") } else { print("IS-Q") }\n',
+        "for i in 10 to 1 step -2147483648 { print(i) }\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);

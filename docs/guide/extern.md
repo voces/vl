@@ -101,8 +101,20 @@ await WebAssembly.instantiate(bytes, { imports: { /* print sinks */ }, extern: {
 console.log(rax.value); // what the program last wrote
 ```
 
-`vl run` supplies no globals, so it refuses a module that imports one; build it with `vl build`
-and run it from a host, or link it to the unit that exports the global.
+`vl run` gives an extern global the value you pass with `--extern NAME=VALUE`, once per global:
+an integer for `i32` and `i64` (decimal, or hex with `0x`), `true`, `false`, `1` or `0` for
+`boolean`, and a number for `f32` and `f64` (one too large for the type is refused; `inf`,
+`-inf`, `nan` and `-0.0` are taken as written). Without one it refuses the program, even when
+nothing reads the global. `vl test` and `vl run --batch` take the same flag for every module
+they run:
+
+```sh
+vl run test.vl --extern CTXB=0 --extern scale=2.5
+vl test tools/ --extern CTXB=0
+```
+
+To run against a real value another unit owns, build it with `vl build` and run it from a host,
+or link it to the unit that exports the global.
 
 ## `export let` — a global another unit imports
 
@@ -149,3 +161,18 @@ string, a list, a struct) is not published to the host at all.
 
 The design and its rationale: `docs/internals/extern-design.md`, and `DECISIONS.md` §"Globals
 cross the wasm boundary".
+
+## Exported records and `--stable-layout`
+
+An entry-module `export function` may take or return a record, a list or a union. A JS host
+receives each as an opaque object: it can keep it, compare it with `===` and hand it back, but it
+cannot read its fields. So `-O` and `-O3` keep the memory layout and the identity of every record
+type an export's or import's signature names directly (`export function origin(): V3`, or `P |
+null`), and may store a record nested inside one (a field of an exported record, an element of
+an exported list, a union member's payload) inline in its parent, which changes its parent's
+layout. An exported list of such records may likewise hold its elements' fields side by side.
+
+A unit that another wasm module links against and reads field by field needs every reachable
+layout to stay as declared. Build it with `vl build -O --stable-layout` (or `-O3`): then no
+record any export or import can reach, through fields, list elements and union boxes, changes its
+layout. The flag needs `-O` or `-O3`, and a build without either changes no layout anyway.

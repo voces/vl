@@ -4,8 +4,9 @@
 // importing module (the ImportDecl AST node, review N27 follow-up).
 //
 // Policy pinned here (compiler/cli.vl):
-//   - a SINGLE-FILE target lints the whole graph: dep findings appear, labelled
-//     with the dep's path;
+//   - a SINGLE-FILE target lints the whole graph: under `--include-imports` dep
+//     findings appear, labelled with the dep's path (without it they are withheld —
+//     tests/vl_check_import_diag_test.ts pins that half);
 //   - a DIRECTORY target lints each file as its own entry only, so a shared
 //     dependency's findings are NOT re-reported once per importer.
 //
@@ -25,6 +26,7 @@ if (GATED && !ENABLED) {
 const check = async (
   target: string,
   cwd: string,
+  extra: string[] = [],
 ): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [
@@ -35,6 +37,7 @@ const check = async (
       "info",
       "--compiler",
       COMPILER,
+      ...extra,
     ],
     cwd,
     stdout: "piped",
@@ -75,7 +78,7 @@ Deno.test({
   fn: async () => {
     const dir = await setup();
     try {
-      const r = await check("main.vl", dir);
+      const r = await check("main.vl", dir, ["--include-imports"]);
       // unused-import fires in the IMPORTING module, labelled main.vl.
       if (!/main\.vl: warning \[1:\d+\] Unused import `missingUse`/.test(r.out)) {
         throw new Error(`missing unused-import in main.vl:\n${r.out}`);

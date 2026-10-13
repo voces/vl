@@ -13,9 +13,9 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, exists, ROOT, VL, binaryen } from "./support/tree.ts";
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(WASM_DIS);
@@ -112,6 +112,30 @@ print("\\{r} \\{n}")
 `,
     want: 1,
     out: "six 6\n",
+  },
+  // `const` arms (D3271) are read by value, so a dense set spelled as module, local and
+  // negative constants beside a literal is a table exactly as its literal spelling is.
+  const_arms: {
+    src: `const A = 1
+const B = 2
+const C = -3
+function dense(k: i32) {
+  const D = 4
+  match k {
+    A => 10
+    B => 20
+    C => 30
+    D => 40
+    5 => 50
+    _ => 0
+  }
+}
+print(dense(1))
+print(dense(-3))
+print(dense(9))
+`,
+    want: 1,
+    out: "10\n30\n0\n",
   },
   // Only a chain a `match` built is marked; a hand-written dense `else if` chain over the same
   // literals keeps its compares.

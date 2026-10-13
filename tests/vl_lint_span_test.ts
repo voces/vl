@@ -63,6 +63,9 @@ const codeFrom = (src: string, d: Diag): string => {
 
 const run = async (name: string, src: string): Promise<{ src: string; diags: Diag[] }> => {
   const dir = await Deno.makeTempDir({ prefix: "vl_lint_span_" });
+  // A repo-policy rule grades `compiler/` alone (docs/internals/lint-rule-scope.md), so
+  // its fixtures are named `compiler/<file>`, checked relative to the temp root.
+  if (name.startsWith("compiler/")) await Deno.mkdir(`${dir}/compiler`);
   await Deno.writeTextFile(`${dir}/${name}`, src);
   const diags = await check(dir, name);
   await Deno.remove(dir, { recursive: true });
@@ -89,11 +92,89 @@ const want = (got: string, expect: string, what: string) => {
 // ── the three ratcheted rules ───────────────────────────────────────────────
 
 Deno.test({
+  name: "lint span: byte-as-code-point covers the whole `s[i]` read (D3641)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "bytes.vl",
+      [
+        "type Named = { name: string }",
+        "function glyphOf(cp: i32) { cp }",
+        "function f(r: Named) { glyphOf(r.name[1]) + fromCodePoint(r.name[0]).length }",
+        "print(f({ name: \"Hrímey\" }))",
+        "",
+      ].join("\n"),
+    );
+    // A field read only the check can type: this is the typed face the CLI pairs.
+    const got = diags.filter((d) => d.code === "byte-as-code-point").map((d) => spanText(src, d));
+    want(JSON.stringify(got), JSON.stringify(["r.name[1]", "r.name[0]"]), "byte-as-code-point");
+  },
+});
+
+Deno.test({
+  name: "lint span: unused-pure-expression covers the discarded statement (D3673)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "discard.vl",
+      [
+        "type Cam = { x: f64, y: f64 }",
+        "function f(a: f64, b: f64, c: Cam) {",
+        "  const w = a * 3.0",
+        "    -b * 3.5",
+        "  const v = a * 3.0",
+        "    - b * 3.5",
+        "  c.x - c.y",
+        "  w",
+        "}",
+        "print(f(1.0, 1.0, { x: 1.0, y: 2.0 }))",
+        "",
+      ].join("\n"),
+    );
+    // The field reads only the check can type: this is the typed face the CLI pairs. `- b`
+    // with a space continues `v`, so only the `-b` line is a discarded statement.
+    const got = diags.filter((d) => d.code === "unused-pure-expression").map((d) => spanText(src, d));
+    want(JSON.stringify(got), JSON.stringify(["-b * 3.5", "c.x - c.y"]), "unused-pure-expression");
+  },
+});
+
+Deno.test({
+  name: "lint span: a `-` line after an `if` statement is told a space will not help (D3698)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "after-if.vl",
+      [
+        "function f(c: boolean, k: i32) {",
+        "  let r = 1",
+        "  if c { r = 2 }",
+        "  - k * 2",
+        "  r = r + 1",
+        "  -k * 2",
+        "  r",
+        "}",
+        "print(f(true, 3))",
+        "",
+      ].join("\n"),
+    );
+    // `- k * 2` after the `if` stays a statement, so the space advice would re-fire; `-k * 2`
+    // after the assignment would continue it with a space, so that one gets the space advice.
+    const got = diags.filter((d) => d.code === "unused-pure-expression")
+      .map((d) => [spanText(src, d), d.message.includes("parentheses") ? "parens" : "space"]);
+    want(
+      JSON.stringify(got),
+      JSON.stringify([["- k * 2", "parens"], ["-k * 2", "space"]]),
+      "unused-pure-expression",
+    );
+  },
+});
+
+Deno.test({
   name: "lint span: sentinel-index-unguarded covers the whole read, not the table",
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "sentinel.vl",
+      "compiler/sentinel.vl",
       [
         "type Node = { nKid: i32 }",
         "let nodes: Node[] = []",
@@ -121,7 +202,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "ladder.vl",
+      "compiler/ladder.vl",
       [
         "function pick(k: string): i32 {",
         "  if k == \"nulbool\" { return 1 }   // a trailing comment is not the ladder",
@@ -152,7 +233,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "scan.vl",
+      "compiler/scan.vl",
       [
         "type Node = { nKid: i32 }",
         "let sNames: string[] = []",
@@ -233,7 +314,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "comments.vl",
+      "compiler/comments.vl",
       [
         "print(0)",
         "",
@@ -303,7 +384,7 @@ Deno.test({
     // `endCol`). A rule that measured a multi-line lexeme would silently produce an
     // endCol past the line and the editor would clamp it somewhere arbitrary.
     const { src, diags } = await run(
-      "wide.vl",
+      "compiler/wide.vl",
       [
         "// a header block that runs past the four-line budget on purpose",
         "// second line",

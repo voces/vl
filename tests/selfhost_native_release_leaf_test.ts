@@ -9,6 +9,10 @@
 // The CONTROL runs a bare binaryen `-O` and must find the calls kept: otherwise a fixture
 // binaryen would inline anyway passes whether or not the host passes the size.
 //
+// The second test is plumb PL-053's shape (DECISIONS.md, "`-O` inlines a fast path"): a
+// NaN-exact float helper, an operation plus a branch to an out-of-line `nan32`, is inlined at
+// `-O`, and every result keeps the exact NaN bits the unoptimized module prints.
+//
 // @test-timing opt
 import {
   ENABLED,
@@ -23,11 +27,13 @@ import {
 const SRC = `${ROOT}/tests/fixtures/opt-leaf/leaf-helpers.vl`;
 const HELPERS = ["st8", "rg", "sr"];
 
-// The helpers still called in a `--names` disassembly. A `--names` function is `$<name>@<line>`.
-const helperCalls = (wat: string): string[] =>
+// The named functions still called in a `--names` disassembly. A `--names` function is
+// `$<name>@<line>`.
+const callsTo = (wat: string, names: string[]): string[] =>
   [...wat.matchAll(/\((?:return_)?call \$([A-Za-z0-9_]+)[@$\s)]/g)]
     .map((m) => m[1])
-    .filter((n) => HELPERS.includes(n));
+    .filter((n) => names.includes(n));
+const helperCalls = (wat: string): string[] => callsTo(wat, HELPERS);
 
 const run = async (bin: string, args: string[]) => {
   const p = await new Deno.Command(bin, {
@@ -112,6 +118,101 @@ Deno.test({
             missing.join(", ")
           }, so this fixture no longer\n` +
             "  exercises the host's inline size; give the helper a shape binaryen keeps as a call",
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+const NAN_SRC = `${ROOT}/tests/fixtures/opt-leaf/nan-exact.vl`;
+const FAST = ["fadd32", "fsub32", "fmul32", "fdiv32", "fadd64", "fmul64"];
+const SLOW = ["nan32", "nan64"];
+
+Deno.test({
+  name:
+    "native-release: -O inlines a NaN-exact float helper and keeps every NaN payload",
+  ignore: !ENABLED,
+  fn: async () => {
+    const want = logsOf(Deno.readTextFileSync(NAN_SRC));
+    const tmp = await Deno.makeTempDir();
+    try {
+      // The unoptimized module is the reference the @log lines were taken from.
+      const plain = `${tmp}/plain.wasm`;
+      const b0 = await vl(["build", NAN_SRC, "--names", "-o", plain]);
+      if (b0.code !== 0) {
+        throw new Error(`plain vl build failed: ${b0.err.trim()}`);
+      }
+      const opt1 = `${tmp}/o.wasm`;
+      const b1 = await vl([
+        "build",
+        NAN_SRC,
+        "-O",
+        "--names",
+        "--wat",
+        "-o",
+        opt1,
+      ]);
+      if (b1.code !== 0) {
+        throw new Error(`-O: vl build failed: ${b1.err.trim()}`);
+      }
+      const wat = Deno.readTextFileSync(`${tmp}/o.wat`);
+      const left = callsTo(wat, FAST);
+      if (left.length !== 0) {
+        throw new Error(
+          `-O: NaN-exact helpers are still called\n  want: no call to ${
+            FAST.join(", ")
+          }\n  got:  ${left.length} (${[...new Set(left)].join(", ")})`,
+        );
+      }
+      const slow = new Set(callsTo(wat, SLOW));
+      if (slow.size !== SLOW.length) {
+        throw new Error(
+          `-O: the slow path should stay out of line\n  want: calls to ${
+            SLOW.join(", ")
+          }\n  got:  ${[...slow].join(", ") || "none"}`,
+        );
+      }
+      for (const [label, mod] of [["unoptimized", plain], ["-O", opt1]]) {
+        const r = await vl(["run", mod]);
+        const got = r.out.replace(/\n$/, "").split("\n");
+        if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(want)) {
+          throw new Error(
+            `${label}: want ${JSON.stringify(want)}, got ${
+              JSON.stringify(got)
+            } rc=${r.code}`,
+          );
+        }
+      }
+
+      // CONTROL: PL-027's size of 8 keeps the helpers a call, so this fixture needs the raise.
+      const features = rustList(
+        Deno.readTextFileSync(`${ROOT}/scripts/vl-host/src/main.rs`),
+        "BINARYEN_FEATURES",
+      );
+      const opt = await run(WASM_OPT, [
+        plain,
+        "-g",
+        "--always-inline-max-function-size",
+        "8",
+        "-O",
+        ...features,
+        "-o",
+        `${tmp}/c.wasm`,
+      ]);
+      if (opt.code !== 0) {
+        throw new Error(`control wasm-opt failed: ${opt.err.trim()}`);
+      }
+      const dis = await run(WASM_DIS, [`${tmp}/c.wasm`, ...features]);
+      const kept = new Set(callsTo(dis.out, FAST));
+      const missing = FAST.filter((h) => !kept.has(h));
+      if (missing.length !== 0) {
+        throw new Error(
+          `CONTROL — size 8 already inlines ${
+            missing.join(", ")
+          }, so this fixture no longer\n` +
+            "  exercises the raised size; give the helper a shape size 8 keeps as a call",
         );
       }
     } finally {

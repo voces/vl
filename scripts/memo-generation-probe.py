@@ -57,7 +57,12 @@ ROWS = [
                         "gckGenN"], "pass-stamped",
      ("    if gckHave[letIx] == gckGen { return gckVal[letIx] }",
       "    if false && gckHave[letIx] == gckGen { return gckVal[letIx] }")),
-    ("refArrShapeIndex", ["rasGen", "rasRowGen", "rasGenTy", "rasGenUV", "rasGenS",
+    # D3051: whether a global reads as an f64, i64 or string, one answer per global, on
+    # `globalCellKind`'s generation and so on its stamps, which that row already carries.
+    ("globalReadAsk", ["grStamp"], "pass-stamped",
+     ("    if grStamp[gi] == gckGen && grLet[gi] == letIx && (grKnown[gi] & bit) != 0 {",
+      "    if false && grStamp[gi] == gckGen && grLet[gi] == letIx && (grKnown[gi] & bit) != 0 {")),
+    ("refArrShapeIndex",["rasGen", "rasRowGen", "rasGenTy", "rasGenUV", "rasGenS",
                           "rasGenSF", "rasGenU", "rasGenV", "rasGenN", "rasGenP"],
      "pass-stamped",
      ("  if rasRowGen[slot] != rasGen { return false }",
@@ -65,6 +70,21 @@ ROWS = [
     ("declaredStructGraph", ["dsgRoot", "dsgLen"], "pass-stamped",
      ("  if dsgRoot == emitRootIx && dsgLen == P.nodes.length { return true }",
       "  if false && dsgRoot == emitRootIx && dsgLen == P.nodes.length { return true }")),
+    ("reseatUseIndex", ["rsIxRoot", "rsIxLen"], "pass-stamped",
+     ("  if rsIxRoot == emitRootIx && rsIxLen == P.nodes.length { return true }",
+      "  if false && rsIxRoot == emitRootIx && rsIxLen == P.nodes.length { return true }")),
+    # D3740: an arena that only GREW since the use index was built (no slot rewritten, so the
+    # epoch is unchanged) extends it rather than rebuilding it; the per-binding answers are
+    # still dropped, at the entries written since, exactly where a rebuild drops them.
+    ("reseatUseIndexGrow", ["rsIxEpoch"], "pass-stamped",
+     ("    && rsIxEpoch == arenaEpochNow()",
+      "    && false && rsIxEpoch == arenaEpochNow()")),
+    ("reseatRecordRow", ["rsRecVer"], "pass-stamped",
+     ("    if rsRecRow[objIx] != -2 { return rsRecRow[objIx] }",
+      "    if false && rsRecRow[objIx] != -2 { return rsRecRow[objIx] }")),
+    ("lambdaCallIndex", ["dslRoot", "dslLen"], "pass-stamped",
+     ("  if dslRoot == scope && dslLen == P.nodes.length { return 0 }",
+      "  if false && dslRoot == scope && dslLen == P.nodes.length { return 0 }")),
     ("variantSig", ["uVarSigNamesLen", "uVarSigStartLen", "uVarSigCountLen"], "no-refined-input",
      ("  if (\n    uVarSigNamesLen != uFieldNames.length\n", "  if (\n    true\n")),
     ("objVariantIndex", ["ovnVarsLen", "ovnStartLen", "ovnCountLen"], "no-refined-input",
@@ -72,6 +92,11 @@ ROWS = [
     ("declStructIndex", ["declStructStmtsLen"], "no-refined-input",
      ("  if declStructStmtsLen != stmts.length { declStructIndexBuild(stmts) }",
       "  declStructIndexBuild(stmts)")),
+    # #3300: one-member alias name -> written spelling root. `udTsNode` and `udTsWritten` are
+    # push-only; `udName` is renamed only by the module merge, which runs before the first ask.
+    ("aliasRootIndex", ["aliasRootLen"], "no-refined-input",
+     ("  if aliasRootLen != udTsNode.length { aliasRootBuild() }",
+      "  aliasRootBuild()")),
     ("buildFnMapResume", ["fmSeenFns", "fmSeenUnSets", "fmSeenUnNames", "fmSeenVariants",
                           "fmSeenSNames", "fmSeenSFields", "fmSeenUFields", "fmSeenTyParams"],
      "resume-reseeds",
@@ -85,6 +110,7 @@ ROWS = [
     ("monoGeneric", ["monoGen"], "not-a-memo", None),
     ("definiteAssign", ["daGen"], "not-a-memo", None),
     ("lintGoalSeen", ["klGSeen"], "not-a-memo", None),
+    ("reseatReturnWalkMark", ["rsRetSeenE", "rsRetSeenL"], "not-a-memo", None),
     ("narrowingBank", ["npEpochs", "asgDeclEpochs"], "not-a-memo", None),
     ("checkVisitMarks", ["emitNameSeen", "nomNameSeen", "stSeenStack"], "not-a-memo", None),
     ("rootStmtList", ["gRootStmts"], "not-a-memo", None),
@@ -113,10 +139,19 @@ ROWS = [
       "    if false && msSetGen[hit] == msGen { return hit }")),
     # The disable edit targets the cached-BLOCK test, not the `plScanStmt` guard of the same
     # shape: that one is the plan's FIRST-WINS write rule, and inverting it changes the answer
-    # rather than dropping a cache — the compiler's own source then miscompiles.
+    # rather than dropping a cache — the compiler's own source then miscompiles. With the
+    # current-block hit gone and every miss built in place, no parked plan is ever read (D2687).
     ("parentLetCache",
-     ["plSidGen", "plLoopSidGen", "plGen", "plDupGen", "plSortGen"], "probe", "ALL:" +
-     "  if blockIx != plCacheBlock {" + "\x00" + "  if true {"),
+     ["plSidGen", "plLoopSidGen", "plGen", "plDupGen", "plSortGen"], "probe",
+     ("  if blockIx == plCacheBlock { return 0 }\n"
+      "  // No current plan (the first ask, or after a bust) — nothing to park, build in place.\n"
+      "  if plCacheBlock < 0 {",
+      "  if true {")),
+    # D3139: one sid's loop rows sorted by header, valid while the plan generation it was built
+    # under is current. Disabled, every long chain is re-indexed per query.
+    ("parentLoopIndex", ["plLxIdxGen"], "probe",
+     ("  if e >= 0 && plLxIdxGen[e] == plGen { return e }",
+      "  if false && e >= 0 && plLxIdxGen[e] == plGen { return e }")),
     ("anonLeafIndex", ["anonIxSeen", "anonIxBindHead"], "probe",
      ("  if anonIxOn && anonIxSeen == P.nodes.length { return 0 }",
       "  if false && anonIxOn && anonIxSeen == P.nodes.length { return 0 }")),
@@ -127,23 +162,33 @@ ROWS = [
      ("    if ercVal[slot] == 0 - 2 { return true }",
       "    if true { return true }")),
     # D2017: the key reads `emitPassGen` beside `P.nodes.length` and the reported-edit count,
-    # and the memo is armed only inside the passes `passKeepsCaptures` names.
+    # and the memo is armed only inside the passes `passKeepsCaptures` names and inside
+    # `monoRebuild`'s run of those two passes, which reports an edit first (D2771).
     ("closureCaptureNames", ["capMemoGen", "capMemoStamp"], "pass-stamped",
      ("  if capMemoStamp[fe] == capMemoGen {",
       "  if false && capMemoStamp[fe] == capMemoGen {")),
     ("covarValueWriteState", ["cwArenaLen", "cwRootNames", "cwRootFrames"], "probe",
-     ("  if root == \"\" { return 2 }\n  if P.nodes.length != cwArenaLen {",
-      "  if root == \"\" { return 2 }\n  if true {")),
+     ("function cwArenaSync() {\n  if P.nodes.length != cwArenaLen {",
+      "function cwArenaSync() {\n  if true {")),
     # D2289: one frame's "does the chain bind this name" answers, dropped whenever the asked frame
     # changes and on every `resetParentLetCache`.
     ("frameBindsCache", ["fcbSidGen"], "probe",
      ("  if sidArrGet(fcbSidGen, sid) != fcbGen { return -1 }",
       "  if true { return -1 }")),
+    # D3293: per frame and name, whether a body `let` or loop variable shadows a parameter.
+    ("paramShadowCache", ["pshSidGen"], "probe",
+     ("  if fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {",
+      "  if false && fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {")),
+    # D2445: the arithmetic classifiers' per-node answers over one parser-marked region, in tables
+    # allocated when a session opens and dropped when it closes; no stamp, the tables die with it.
+    ("arithClassifierMemo", [], "probe",
+     ("  if ((b >> (3 * k)) & 1) == 0 { return -1 }",
+      "  if true || ((b >> (3 * k)) & 1) == 0 { return -1 }")),
     ("listRepQuery", ["lrMemoGen"], "probe",
      ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
       "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),
     # `fnStmtsPosOf`'s arena-node → position index: extended by length on push, retired by
-    # `fnPosIndexDrop` at every in-place slot write (`buildFnMapNoteFnSlotWrite`) and reset.
+    # `fnPosIndexDrop` at every in-place slot write (`buildFnMapNoteFnSlotWrite`, `...FnStmtWrite`) and reset.
     ("fnStmtsPosIndex", ["fnPosEpoch", "fnPosFsLen", "fnPosMoLen", "fnPosFsStamp",
                          "fnPosMoStamp"], "probe",
      ("  if hit != 0 - 2 { return hit }",
@@ -153,6 +198,49 @@ ROWS = [
     ("moduleLocalLetPlan", [], "probe",
      ("  if off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }",
       "  if false && off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }")),
+    # `nameIsStructDecl`'s set of `TypeDecl` names: what a node IS changes only by a push (the
+    # length) or an in-place replacement (the epoch), and it reads every other field live.
+    # `fieldClosureFeOfRecvRaw`'s calls by callee name also key a rename or a callee repoint
+    # (`arenaRefWritesNow`, bumped by `sidNoteNodeName` and the callee writes); arguments are
+    # read live. Both reset in `emitProgram`.
+    ("typeDeclNameIndex", ["tdnIxLen", "tdnIxEpoch"], "no-refined-input",
+     ("  if P.nodes.length == tdnIxLen && tdnIxEpoch == arenaEpochNow() { return 0 }",
+      "  if false && P.nodes.length == tdnIxLen && tdnIxEpoch == arenaEpochNow() { return 0 }")),
+    ("callsByCalleeIndex", ["cbcLen", "cbcEpoch", "cbcRefGen"], "no-refined-input",
+     ("    P.nodes.length == cbcLen\n    && cbcEpoch == arenaEpochNow()",
+      "    false && P.nodes.length == cbcLen\n    && cbcEpoch == arenaEpochNow()")),
+    # `ieeeBytes`' encodings by lexeme and width (D3737): a pure function of its key, never reset.
+    ("ieeeBytesMemo", [], "no-refined-input",
+     ("  if hit != null {\n    gIeeeOverflow",
+      "  if hit != null && false {\n    gIeeeOverflow")),
+    # `crNoteSoleRef`'s names a root uses other than as a receiver (D2584, D3739): one walk per
+    # root and arena epoch, which the program's root extends by the slots the logged edits
+    # rewrote; the getter and operator sites are read against the checker's banks at each entry,
+    # never cached, since those fill in place as checking proceeds.
+    ("crValUseNames", ["cvuEpoch"], "probe",
+     ("  if cvuEpoch[slot] < 0 || moved {",
+      "  if true || cvuEpoch[slot] < 0 || moved {")),
+    # D3738: per field name, the struct rows carrying it and the rows it comes first in. Field
+    # names are push-only and a row joins once they are stored; reset with the struct table.
+    ("structFieldNameIndex", ["sfnLen"], "no-refined-input",
+     ("  while sfnLen < n {",
+      "  while false && sfnLen < n {")),
+    # D3738: per canonical id, the struct rows whose own arena type has it, joined in scan order
+    # on `tyMutEpoch`, as `repKeyMemo` is; a row the name rung answers is asked again each time.
+    ("structCanonIndex", ["scnLen", "scnEpoch"], "probe",
+     ("    if si == scnLen && si < sTyIx.length {",
+      "    if false && si == scnLen && si < sTyIx.length {")),
+    # Lane HS: `sigKeyOfTy` by type id and `structIndexOfTypeName` by name, each stamped with the
+    # type-registry generation `tyRegGenNow` read before the computation. The generation moves
+    # on the pass, the arena, type mutation, node-type writes, `tyRegNoteWrite` and the lengths
+    # of the struct, union, variant, map-slot and ref-list tables.
+    ("typeRegistryGen", ["trgStamp"], "not-a-memo", None),
+    ("sigKeyOfTyMemo", ["sktGen"], "probe",
+     ("  if sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }",
+      "  if false && sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }")),
+    ("structIndexOfTypeNameMemo", [], "probe",
+     ("    if hit[0] == gen { return hit[1] }",
+      "    if false && hit[0] == gen { return hit[1] }")),
 ]
 
 # A stamp is a MODULE-level binding whose name carries one of these markers; the shapes below
@@ -173,7 +261,7 @@ def module_stamps():
     """Module-level bindings whose name reads as a generation stamp."""
     out = {}
     for f in sorted(C.glob("*.vl")):
-        for i, ln in enumerate(f.read_text().split("\n"), 1):
+        for i, ln in enumerate(f.read_text(encoding="utf-8").split("\n"), 1):
             m = re.match(r"^(?:export )?(?:let|const) ([A-Za-z_][A-Za-z0-9_]*)\s*(?::|=)", ln)
             if m and STAMP_MARK.search(m.group(1)):
                 out[m.group(1)] = "%s:%d" % (f.name, i)
@@ -183,7 +271,7 @@ def module_stamps():
 def derive(stamps):
     hits = {}
     for f in sorted(C.glob("*.vl")):
-        for i, ln in enumerate(f.read_text().split("\n"), 1):
+        for i, ln in enumerate(f.read_text(encoding="utf-8").split("\n"), 1):
             if ln.strip().startswith("//"):
                 continue
             for g in GUARD:
@@ -212,7 +300,7 @@ def cmd_list():
             bad.append("UNCLASSIFIED stamp `%s` (declared %s) read at %s — add a ROWS row, and "
                        "a disable edit unless its key already reads `emitPassGen`"
                        % (s, stamps[s], ", ".join(hits[s][:3])))
-    src = "\n".join(f.read_text() for f in C.glob("*.vl"))
+    src = "\n".join(f.read_text(encoding="utf-8") for f in C.glob("*.vl"))
     for rid, ss, verdict, ed in ROWS:
         for s in ss:
             if s not in stamps:
@@ -241,12 +329,12 @@ def edits(only=None):
         if isinstance(ed, str):
             old, new = ed[len("ALL:"):].split("\x00")
             for f in sorted(C.glob("*.vl")):
-                if old in f.read_text():
+                if old in f.read_text(encoding="utf-8"):
                     out.append((f, old, new, rid, True))
             continue
         old, new = ed
         for f in sorted(C.glob("*.vl")):
-            if f.read_text().count(old) == 1:
+            if f.read_text(encoding="utf-8").count(old) == 1:
                 out.append((f, old, new, rid, False))
                 break
         else:
@@ -267,11 +355,11 @@ def cmd_run(args):
         if not (BACKUP / f.name).exists():
             shutil.copy(f, BACKUP / f.name)
     for f, old, new, rid, every in todo:
-        s = f.read_text()
+        s = f.read_text(encoding="utf-8")
         if not every and s.count(old) != 1:
             print("SKIP %s (anchor count %d)" % (rid, s.count(old)))
             continue
-        f.write_text(s.replace(old, new))
+        f.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
         print("disabled %-22s %s" % (rid, f.name))
     rc = subprocess.run([args.vl, "build", "compiler/entry.vl", "-o", args.out,
                          "--compiler", args.before], cwd=ROOT).returncode

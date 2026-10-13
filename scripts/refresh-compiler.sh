@@ -46,10 +46,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# The self-compile's collector is a CHOICE, not the size heuristic's accident: the compiler
-# is a multi-file graph with a small entry file, so `auto` already picks null, and pinning it
-# keeps a heuristic change from silently moving the fixpoint's CPU (DECISIONS.md, "The
-# compiler's collector is picked by the size of the entry file").
+# The self-compile's collector is a CHOICE, not the default's accident: `auto` is copying,
+# and null is ~10% faster here, so pinning it keeps a default change from silently
+# moving the fixpoint's CPU (DECISIONS.md, "The compiler's collector is copying by default").
 export VL_COMPILE_GC=null
 SEED="${SEED:-build/vl-compiler.wasm}"
 OUT="${OUT:-build/vl-compiler.wasm}"
@@ -238,14 +237,22 @@ warm() {
   "$VL" "$1" "$WORK/hello.vl" --compiler "$OUT" > /dev/null 2>&1 ||
     echo "  note: could not warm the \`$1\` sidecar — its first use re-JITs the seed" >&2
 }
-# The third tag is the copying-collector compile a large source gets (`compile_engine`,
-# main.rs); `$VL_COMPILE_GC=copying` reaches it with a small program.
+# The third tag is the copying-collector compile every `vl build`/`vl run` gets by default
+# (`compile_engine`, main.rs); this script pins null, so it names copying to reach it.
 warm_copying() {
   VL_COMPILE_GC=copying "$VL" build "$WORK/hello.vl" -o "$WORK/warm-copying.wasm" \
     --compiler "$OUT" > /dev/null 2>&1 ||
     echo "  note: could not warm the copying-compile sidecar — its first use re-JITs the seed" >&2
 }
-warm run & warm check & warm_copying & wait
+# The two fuel-metered tags (`$VL_FUEL=1`, under each compile collector) are what the
+# measurement rows compile under — scaling shape, self-compile time, plumb-shape — so
+# warming them keeps that JIT out of the gate.
+warm_fuel() {
+  VL_FUEL=1 VL_COMPILE_GC="$1" "$VL" build "$WORK/hello.vl" -o "$WORK/warm-fuel-$1.wasm" \
+    --compiler "$OUT" > /dev/null 2>&1 ||
+    echo "  note: could not warm the fuel/$1 sidecar — its first use re-JITs the seed" >&2
+}
+warm run & warm check & warm_copying & warm_fuel copying & warm_fuel null & wait
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
