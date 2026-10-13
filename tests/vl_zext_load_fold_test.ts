@@ -11,7 +11,7 @@
 //
 // @test-timing opt
 
-import { COMPILER, exists, nativeEnv, VL, binaryen } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen, wasmDis } from "./support/tree.ts";
 
 const WASM_OPT = binaryen("wasm-opt");
 const WASM_DIS = binaryen("wasm-dis");
@@ -105,10 +105,7 @@ const dis = async (dir: string, name: string, rung: string[]): Promise<string> =
   if (!b.success) {
     throw new Error(`vl build ${name} ${rung} failed: ${new TextDecoder().decode(b.stderr)}`);
   }
-  const d = await new Deno.Command(WASM_DIS, {
-    args: ["--enable-simd", "--enable-threads", out],
-    stdout: "piped",
-  }).output();
+  const d = await wasmDis(["--enable-simd", "--enable-threads", out]);
   return new TextDecoder().decode(d.stdout);
 };
 

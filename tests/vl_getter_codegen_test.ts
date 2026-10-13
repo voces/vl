@@ -16,7 +16,7 @@
 //
 // @test-timing opt
 
-import { COMPILER, exists, nativeEnv, VL, binaryen } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen, wasmDis } from "./support/tree.ts";
 
 const WASM_OPT = binaryen("wasm-opt");
 const WASM_DIS = binaryen("wasm-dis");
@@ -118,7 +118,7 @@ const build = async (dir: string, name: string, rung: Rung): Promise<Uint8Array>
 const wat = async (bytes: Uint8Array, dir: string): Promise<string> => {
   const f = `${dir}/dis.wasm`;
   Deno.writeFileSync(f, bytes);
-  const p = await new Deno.Command(WASM_DIS, { args: [f], stdout: "piped" }).output();
+  const p = await wasmDis([f]);
   return new TextDecoder().decode(p.stdout);
 };
 

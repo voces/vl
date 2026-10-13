@@ -11,7 +11,7 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen, wasmDis } from "./support/tree.ts";
 import { memoryLimits, sections } from "./support/wasmMemory.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER);
@@ -181,10 +181,7 @@ print(Buffer(16).base)
       const tmp = await Deno.makeTempDir();
       try {
         await Deno.writeFile(`${tmp}/m.wasm`, bytes);
-        const { stdout } = await new Deno.Command(WASM_DIS, {
-          args: [`${tmp}/m.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"],
-          stdout: "piped",
-        }).output();
+        const { stdout } = await wasmDis([`${tmp}/m.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"]);
         return (dec.decode(stdout).match(/\bi64\.atomic\.[a-z.0-9_]+/g) ?? []).sort();
       } finally {
         await Deno.remove(tmp, { recursive: true });
