@@ -26,7 +26,9 @@ restate measurements; follow the links.
 | L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
 | L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
-| L4–L14 | not started | |
+| L4–L7 | not started | |
+| L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
+| L9–L14 | not started | |
 | SMALL S-c front-end tidy | **partial** | `typecheck.vl` imports `./ast` once (byte-identical seed). Not byte-identical, so not done: the second `Tok` (the lexer's has no `pos`), the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check). `await` skipped: a surface decision. |
 | SMALL S-a, S-b, S-d … S-n | not started | |
 | RepDesc rulings | **open** since 2026-09-06 | `open-rulings.md`: `one-literal-union-rep`, `nullable-rep-rule-stated-once` |
@@ -171,7 +173,6 @@ Each is posted for question time; work that does not depend on it continues.
 These have no unmet prerequisite and touch disjoint files:
 
 - **A1**: L4 assertion harness (`typecheck.vl`).
-- **A3**: `tyquery.vl` with the four exact twins (`emit_classify.vl`, `emit_rep.vl`).
 - **A5**: errno agreement test (host + `std/fs.vl`).
 - **A6 / S-c**: one `./ast` import block in `typecheck.vl`. This conflicts with A1, so run it
   first; it is small.
