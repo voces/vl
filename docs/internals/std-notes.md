@@ -265,6 +265,11 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   (`fs-streaming-design.md` §5): `u8view` would promise the `[]` indexing the typed views
   have, `view` drops the width, `slice` copies on arrays. Not re-exported from `std:fs`.
 
+- **`type Buffer = Buf` is an alias, not a rename** (diderven DV-1212). `import { Buffer }`
+  could call the constructor but not write the type, unlike `IdTable`, whose one name is both.
+  `Buf` stays the name std's own signatures and diagnostics use, because every consumer
+  importing `std:buffer` already writes it; std has no deprecation path to retire it.
+
 ## `std:fs`
 
 - **`IoError` cannot extend the design doc's floor shape at this head.** It is meant to
