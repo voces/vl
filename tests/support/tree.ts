@@ -35,14 +35,45 @@ export const binaryen = (tool: string): string => {
   return `${ROOT}/node_modules/.bin/${tool}${win ? ".cmd" : ""}`;
 };
 
-/** The `wasm-dis` to hand the host as `VL_WASM_DIS`: the native one when
- * `$VL_BINARYEN` names it, since the host writes every `--wat` dump with `
-`. */
+/** The fastest `wasm-dis` available: the native one when `$VL_BINARYEN` names it.
+ * Its text needs `\r\n` folded on Windows, which the host (`--wat`) and `wasmDis` do. */
 export const hostWasmDis = (): string => {
   const native = Deno.env.get("VL_BINARYEN");
   if (!native) return binaryen("wasm-dis");
   return `${native}/wasm-dis${Deno.build.os === "windows" ? ".exe" : ""}`;
 };
+
+type DisOutput = {
+  code: number;
+  success: boolean;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+};
+const lfOutput = (o: Deno.CommandOutput): DisOutput => ({
+  code: o.code,
+  success: o.success,
+  stdout: new TextEncoder().encode(
+    new TextDecoder().decode(o.stdout).replaceAll("\r\n", "\n"),
+  ),
+  stderr: o.stderr,
+});
+
+/** `wasm-dis <args>`, shaped like `Deno.Command`'s output, with `\n` line ends in its
+ * stdout on every platform, so a suite matching the text by line can use the native
+ * binary. */
+export const wasmDis = async (args: string[]): Promise<DisOutput> =>
+  lfOutput(
+    await new Deno.Command(hostWasmDis(), { args, stdout: "piped", stderr: "piped" })
+      .output(),
+  );
+
+/** `wasmDis`, synchronously. */
+export const wasmDisSync = (args: string[]): DisOutput =>
+  lfOutput(
+    new Deno.Command(hostWasmDis(), { args, stdout: "piped", stderr: "piped" })
+      .outputSync(),
+  );
+
 export const STD = `${ROOT}/std`;
 
 /** Whether `p` exists. `Deno.statSync` throws on a miss; this is the test suite's

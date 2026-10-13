@@ -29,7 +29,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, binaryen } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen, wasmDisSync } from "./support/tree.ts";
 
 const WASM_DIS = binaryen("wasm-dis");
 
@@ -85,11 +85,7 @@ function funcCount(dir: string, name: string, src: string): number {
       }`,
     );
   }
-  const dis = new Deno.Command(WASM_DIS, {
-    args: [wasm],
-    stdout: "piped",
-    stderr: "piped",
-  }).outputSync();
+  const dis = wasmDisSync([wasm]);
   if (dis.code !== 0) {
     throw new Error(
       `wasm-dis ${name} failed (rc ${dis.code}): ${

@@ -26,7 +26,7 @@
 //
 // @test-timing opt
 
-import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen, wasmDis } from "./support/tree.ts";
 
 const WASM_DIS = binaryen("wasm-dis");
 const ENABLED = exists(VL) && exists(COMPILER) && exists(WASM_DIS);
@@ -200,8 +200,7 @@ const build = async (
       new TextDecoder().decode(p.stderr);
     throw new Error(`vl build ${name} failed: ${err}`);
   }
-  const d = await new Deno.Command(WASM_DIS, { args: [out], stdout: "piped" })
-    .output();
+  const d = await wasmDis([out]);
   return new TextDecoder().decode(d.stdout);
 };
 

@@ -10,7 +10,7 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, VL, binaryen } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL, binaryen, wasmDis } from "./support/tree.ts";
 import { memoryLimits } from "./support/wasmMemory.ts";
 
 const ENABLED = exists(VL) && exists(COMPILER);
@@ -45,10 +45,7 @@ const withSrc = async (cmd: "build" | "run", src: string, flags: string[]) => {
     const wasm = cmd === "build" && r.code === 0 ? await Deno.readFile(`${tmp}/t.wasm`) : null;
     let wat = "";
     if (wasm && exists(WASM_DIS)) {
-      const d = await new Deno.Command(WASM_DIS, {
-        args: [`${tmp}/t.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"],
-        stdout: "piped",
-      }).output();
+      const d = await wasmDis([`${tmp}/t.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"]);
       wat = dec.decode(d.stdout);
     }
     return { ...r, wasm, wat };
