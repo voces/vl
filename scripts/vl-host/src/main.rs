@@ -7119,7 +7119,7 @@ fn compile_and_run(
     let compile_engine = compile_engine(source.len())?;
     // `_located`, so a module the engine refuses can still be traced back to the
     // function that emitted it (D1578). The compile itself is unchanged.
-    let (bytes, session) = compile_vl_located(
+    let (mut bytes, session) = compile_vl_located(
         &compile_engine,
         compiler,
         source,
@@ -7128,6 +7128,10 @@ fn compile_and_run(
         Names::Full,
         link,
     )?;
+    // The third seam, like the other two: `None` on every real run.
+    if let Some(f) = fault_injection()? {
+        inject_fault(f, &mut bytes)?;
+    }
     match run_program(run_engine, &bytes, palette) {
         Err(e) => Err(locate_invalid_module(e, session, source_path, Some(&bytes))),
         ok => ok,
@@ -8091,6 +8095,12 @@ enum Fault {
     /// ref-element array type, against an empty stack: a count read off the module that must
     /// never size an allocation in the host (`heap_names`).
     HugeArrayNewFixed,
+    /// `ref.null $ty` handed to a `struct.get` of a different struct type, in body number
+    /// `body` (the first with room when `None`): the validator's `expected (ref null $type),
+    /// found (ref null $type)` with type `ty` as the found one, whatever the program was.
+    /// For the tests of the heap-type namer, which used to need a live miscompile that
+    /// produced such a sentence.
+    WrongRef { ty: u32, body: Option<u32> },
 }
 
 /// Read `$VL_FAULT_INJECT`. Unset or empty is `None` (the state every real run is
@@ -8107,10 +8117,28 @@ fn fault_injection() -> Result<Option<Fault>> {
         Some("corrupt-validate-bytes") => Ok(Some(Fault::CorruptValidateBytes)),
         Some("corrupt-start-fn-body") => Ok(Some(Fault::CorruptStartFnBody)),
         Some("huge-array-new-fixed") => Ok(Some(Fault::HugeArrayNewFixed)),
+        Some(other) if other.starts_with("wrong-ref:") => {
+            let bad = || {
+                Error::msg(format!(
+                    "vl: `$VL_FAULT_INJECT={other}` is not `wrong-ref:<type>[:<body>]` \
+                     with decimal indices"
+                ))
+            };
+            let mut it = other["wrong-ref:".len()..].split(':');
+            let ty = it.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+            let body = match it.next() {
+                None => None,
+                Some(b) => Some(b.parse().map_err(|_| bad())?),
+            };
+            if it.next().is_some() {
+                return Err(bad());
+            }
+            Ok(Some(Fault::WrongRef { ty, body }))
+        }
         Some(other) => bail!(
             "vl: unrecognized $VL_FAULT_INJECT fault `{other}` — the values this binary \
-             knows are `corrupt-validate-bytes`, `corrupt-start-fn-body` and \
-             `huge-array-new-fixed`. \
+             knows are `corrupt-validate-bytes`, `corrupt-start-fn-body`, \
+             `huge-array-new-fixed` and `wrong-ref:<type>[:<body>]`. \
              $VL_FAULT_INJECT is a TEST-ONLY hook for exercising the module-validation \
              path; unset it."
         ),
@@ -8125,7 +8153,88 @@ fn inject_fault(fault: Fault, bytes: &mut [u8]) -> Result<()> {
         Fault::CorruptValidateBytes => corrupt_first_function_body(bytes),
         Fault::CorruptStartFnBody => corrupt_start_function_body(bytes),
         Fault::HugeArrayNewFixed => huge_array_new_fixed(bytes),
+        Fault::WrongRef { ty, body } => wrong_ref(bytes, ty, body),
     }
+}
+
+/// The `Fault::WrongRef` rewrite: the chosen body becomes `00` (no locals), `ref.null
+/// $ty`, `struct.get $s 0` (the first struct type, other than `ty`, with a field),
+/// `unreachable` filler and `end`. Length-preserving. A type or body index
+/// the module does not have is an error that says how many it has, so a caller can sweep.
+fn wrong_ref(bytes: &mut [u8], ty: u32, body: Option<u32>) -> Result<()> {
+    use wasmparser::{Parser, Payload};
+    const F: &str = "VL_FAULT_INJECT=wrong-ref";
+    let (mut types, mut code, mut strukt) = (0u32, Vec::new(), None);
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| Error::msg(format!("{F}: the module does not decode: {e}")))? {
+            Payload::TypeSection(r) => {
+                for rg in r {
+                    let rg = rg.map_err(|e| Error::msg(format!("{F}: bad type section: {e}")))?;
+                    for st in rg.types() {
+                        if let wasmparser::CompositeInnerType::Struct(f) = &st.composite_type.inner
+                        {
+                            if strukt.is_none() && !f.fields.is_empty() && types != ty {
+                                strukt = Some(types);
+                            }
+                        }
+                        types += 1;
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(b) => code.push(b.range()),
+            _ => {}
+        }
+    }
+    if ty >= types {
+        bail!("{F}: the module has {types} types, not a type {ty}");
+    }
+    let Some(strukt) = strukt else {
+        bail!("{F}: the module has no struct type with a field other than type {ty}");
+    };
+    let sleb = |out: &mut Vec<u8>, n: u32| {
+        let mut v = n as i64;
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            let done = (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0);
+            out.push(if done { b } else { b | 0x80 });
+            if done {
+                break;
+            }
+        }
+    };
+    let mut instr = vec![0x00, 0xd0];
+    sleb(&mut instr, ty);
+    instr.extend([0xfb, 0x02]);
+    let mut at = Vec::new();
+    let mut v = strukt;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        at.push(if v == 0 { b } else { b | 0x80 });
+        if v == 0 {
+            break;
+        }
+    }
+    instr.extend(at);
+    instr.push(0x00);
+    let pick = match body {
+        Some(i) => match code.get(i as usize) {
+            Some(r) if r.end - r.start > instr.len() => Some(r.clone()),
+            Some(_) => bail!("{F}: body {i} has no room for the rewrite"),
+            None => bail!("{F}: the module has {} bodies, not a body {i}", code.len()),
+        },
+        None => code.iter().find(|r| r.end - r.start > instr.len()).cloned(),
+    };
+    let Some(r) = pick else {
+        bail!("{F}: no function body of {}+ bytes — nothing to corrupt", instr.len() + 1);
+    };
+    bytes[r.start..r.start + instr.len()].copy_from_slice(&instr);
+    for b in &mut bytes[(r.start + instr.len())..(r.end - 1)] {
+        *b = 0x00;
+    }
+    bytes[r.end - 1] = 0x0b;
+    Ok(())
 }
 
 /// The `Fault::HugeArrayNewFixed` rewrite: the first body with room becomes `00` (no locals),
