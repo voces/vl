@@ -43,6 +43,24 @@ there); the rest is the review's, and the full rubric is `std-api-review.md` §4
 `earlyoom` still SIGTERMs at 10% available, so check `free` before going wide, and drop back
 to 3 for anything that does run a full census block.
 
+## Disk — every tree, target and temp dir is removed by whoever made it
+
+On WSL a deleted file only frees space on the Windows side if the distro's disk image is
+sparse; otherwise the `.vhdx` keeps every byte it ever held (214 GB for 132 GB of data on
+2026-10-12). The image is the owner's to configure; keeping it small is ours:
+
+* **A worktree is removed when its work is on origin.** An agent finishing a PR, review or
+  probe ends with `git worktree remove --force <dir>`; a coordinator removes a merged agent's
+  worktree the same turn. New worktrees go under `.claude/worktrees/`, never a sibling dir.
+* **Scratch builds live in the scratchpad or `$TMPDIR`, under a trap that deletes them.** No
+  `.wasm`, seed or cargo target is left in `/tmp` or a worktree after the task ends.
+* **An isolated `cargo --target-dir` is deleted with the task.** Cargo never collects old
+  artifacts, so a target only grows.
+* **`scripts/disk-hygiene.sh`** reports every place this work grows, `--clean` removes what
+  is safe (clean worktrees already on origin, temp trees over a day old, cargo targets over
+  3 GB, old host backups), and `--check` runs at session start and flags a total over
+  25 GB. Run `--clean` when the check fires, and never while a gate or agent is running.
+
 ## Gates
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
