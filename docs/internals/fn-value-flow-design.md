@@ -643,6 +643,19 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      `monoLetWritesAreLams` and `monoValueFnTyConcrete`; the written-let guard moved into
      `monoCoerceLetValues`. The table is built whenever the pass runs. Over 15,100 files
      nothing moved.
+   - Sixth PR: the pass's write index is keyed by declaration. `monoLetWrites`, keyed by
+     `n:`/`c:` plus a name, becomes `monoDeclWrites` and `monoCellWrites`, keyed by the
+     write target's source declaration (`monoDeclCanon` of `identDeclOf`). Every reader asks
+     by declaration: `monoCoerceLetValues`, `monoCallWrittenLet`, `monoWrittenGenLetFrame`,
+     `monoWritesCoercedFirstCall` and `monoCoerceWrittenCell` take the read and find the
+     binding's frame copy (`monoReadLetFrame`), and lose their name parameter.
+     `monoLetWrittenAt` becomes `monoLetWrittenIn`, `monoNameWrittenLive` becomes
+     `monoLetWrittenLive`, and `monoCapturedLamFe` reads the callee's declaration instead of
+     walking frames by name. Over 15,100 files one module moved, with the same output:
+     `closures/hole-lambda-binding-one-signature`, whose last function was compiled
+     differently because other functions in the file wrote a binding of the same name.
+     Renaming that binding gives the old compiler the new module. `monoLetFrameOf` still has
+     21 callers, and the annotated-closure-result condition is not touched.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.

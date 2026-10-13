@@ -128,7 +128,7 @@ can move by double digits under load alone (see the stability note below) — a 
 would either be so loose it catches nothing or so tight it reds on contention, not on a real
 regression. Read `--check`'s output as a trend across runs and PRs, not a verdict on any one of
 them. `--write-baseline` is how a maintainer deliberately moves the standing number, the same way
-`comment-budget.py --write-baseline` moves that ratchet — in the same PR as whatever justifies
+`vl check --budget scripts/comment-budget-baseline.json --write-baseline` moves that ratchet — in the same PR as whatever justifies
 the change.
 
 ## Results

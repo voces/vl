@@ -63,7 +63,7 @@ trap 'rm -rf "$WORK"' EXIT
 # still violates in bulk, so they are held out of the `info` gate — but ONLY while their
 # baselines still owe them. Each allow-list is READ FROM its own baseline, so it empties
 # itself the day a trim, a banked scan, a named default or a bound test reaches zero;
-# meanwhile the four `--check` runs block any file going UP. (`comment-measurement-uncited`
+# meanwhile the ratchet rows block any file going UP. (`comment-measurement-uncited`
 # and `sentinel-index-strict-untested` are already at zero and so are already gated, which
 # is the exemption's whole design working one code at a time.) `vl check` has no per-code
 # gate, hence `--json` graded through one filter carrying every list.
@@ -83,9 +83,10 @@ lint_graded() { # <target> <json path>
   cat "$2.err"
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
-  "$PY" scripts/comment-budget.py --filter-lint "$2" \
+  "$VL" run scripts/lint-filter.vl -- "$2" \
+    $("$VL" check --budget scripts/comment-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/interp-budget-baseline.json --exempt-codes) \
-    $("$PY" scripts/scan-budget.py --exempt-codes) \
+    $("$VL" check --budget scripts/scan-budget-baseline.json --exempt-codes) \
     $("$PY" scripts/ladder-budget.py --exempt-codes) \
     $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes)
 }
@@ -184,7 +185,7 @@ cat "$WORK/graph.log"
 # Coverage guard: the graph run must attribute findings to more than the entry. Without
 # `--include-imports` every import's findings are withheld and this run would pass on
 # zero findings having linted nothing but entry.vl.
-GRAPH_FILES=$("$PY" -c 'import json,sys; print(len({d["file"] for d in json.load(open(sys.argv[1]))}))' "$WORK/graph.json")
+GRAPH_FILES=$(grep -o '"file": *"[^"]*"' "$WORK/graph.json" | sort -u | wc -l || true)
 if [ "$GRAPH_FILES" -lt 2 ]; then
   echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
   exit 1
