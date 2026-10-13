@@ -206,7 +206,7 @@ point, and nothing else writes the column.
   - `monoRenameGenAliasInit`;
   - `monoMakeInstanceGo` and `monoSpecializeConcrete` (`cal.identName = …`);
   - `monoLamCallByName`;
-  - `monoRespellLamAlias`.
+  - `monoRespellToLam` (was `monoRespellLamAlias`).
 
   The rules:
   - **An instance's Param** gets `declOrig[instParam] = templateParam`.
@@ -632,6 +632,17 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      they name a lambda as the instance frame spells it, and a cloned read resolves to the
      template's declaration, so the slot also needs a frame-copy answer first. The
      annotated-closure-result condition is not touched.
+   - Fifth PR: the frame-copy answer, and the three name walks retire. The table records,
+     per original declaration, the `LetDecl` it walked, the function declaring it, and the
+     `=` writes of the binding and of its capture cell (`d[0] = v`). `fnFlowAliasLam`,
+     `fnFlowCellLam` and `fnFlowRespellLam` answer a chain by declaration and return the
+     template's declaration; `monoDeclCopyIn` finds the instance's copy of it in the frame
+     or an enclosing one (`declOrigOf`). `fnFlowDeclWritten` asks whether that binding,
+     not any binding of its name, is written. `monoAliasChainLamFe`, `monoLetAliasLamFe`,
+     `monoRespellLamAlias` and `monoCoerceWrittenLet` are deleted, with
+     `monoLetWritesAreLams` and `monoValueFnTyConcrete`; the written-let guard moved into
+     `monoCoerceLetValues`. The table is built whenever the pass runs. Over 15,100 files
+     nothing moved.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.

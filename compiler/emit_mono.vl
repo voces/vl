@@ -282,9 +282,15 @@ import {
 } from "./emit_base"
 import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
 import {
+  FF_CHAIN_LONG,
+  fnFlowAliasLam,
+  fnFlowCellLam,
+  fnFlowDeclFn,
+  fnFlowDeclWritten,
   fnFlowLamPin,
   fnFlowReadGenFn,
   fnFlowReadWritten,
+  fnFlowRespellLam,
   fnFlowTableBuild,
 } from "./fn_flow_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
@@ -9491,7 +9497,7 @@ function monoCoerceFnValueName(
     // (a,b) => a + b`, or `const g = named`) — resolve the binding to its lifted slot so an
     // escaping lambda binding materializes at the boundary type too.
     // A reassigned `let` is read as itself: the generic functions written into it take this type.
-    if monoCoerceWrittenLet(e.identName, exprIx, ctx, tname) { return 0 }
+    if monoCoerceLetValues(e.identName, exprIx, ctx, tname, "n:") { return 0 }
     // An alias of a capture cell's read delivers that cell (D3948).
     if monoCoerceAliasOfCell(e.identName, exprIx, ctx, tname) { return 0 }
     let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
@@ -9628,32 +9634,16 @@ function monoCallWrittenLet(ix: i32, name: string, ctx: i32): i32 {
   const prev = monoSigCallRet
   monoSigCallRet = nodeTyIxOf(ix)
   monoCellSigByCall = true
-  monoCoerceWrittenLet(name, n.callFn, ctx, ct)
+  monoCoerceLetValues(name, n.callFn, ctx, ct, "n:")
   monoCellSigByCall = false
   monoSigCallRet = prev
   0
 }
 
-// For an un-annotated, reassigned `let` read at `at`: instances each named generic function its
-// initializer or a write in its frame names at function type `tname`, and answers true; false
-// for any other name. The read keeps the binding's value (D3930).
+// The `let` bindings `monoCoerceLetValues` is coercing, so a cycle of copies ends.
 const monoWrittenLetBusy: i32[] = []
-function monoCoerceWrittenLet(
-  name: string,
-  at: i32,
-  ctx: i32,
-  tname: string,
-): boolean {
-  // Asked of every value read, so the cheap tests come first: only a function type delivers a
-  // generic, and the pass indexes every write before it walks (a clone's is spelled the same).
-  if annArrowAt(tname) < 1 { return false }
-  if (monoLetWrites.get("n:" + name) ?? []).length == 0 { return false }
-  // A write of another binding of the name does not make this one written.
-  if !monoLetWrittenAt(name, monoLetFrameOf(name, at, ctx)) { return false }
-  monoCoerceLetValues(name, at, ctx, tname, "n:")
-}
 
-// `monoCoerceWrittenLet` for the capture cell `name[0]` a captured, written `let` becomes: its
+// `monoCoerceLetValues` for the capture cell `name[0]` a captured, written `let` becomes: its
 // seed and each `name[0] = v` take type `tname`, and the cell is retyped to the instance (D3939).
 function monoCoerceWrittenCell(
   name: string,
@@ -10041,11 +10031,12 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
   const elemAnn = fty.slice(0, arrow) + "=> " + sig.slice(semi + 1, sig.length)
   for e in lit.arrElems {
     if monoWrittenLetSeedFe(e, ctx) >= 0 {
-      monoCoerceWrittenLet(
+      monoCoerceLetValues(
         monoIdentNameOf(unwrapParen(e)),
         unwrapParen(e),
         ctx,
         elemAnn,
+        "n:",
       )
     }
   }
@@ -10523,7 +10514,9 @@ function monoAliasCellRead(name: string, at: i32, ctx: i32): i32[] {
   none
 }
 
-// The walk both share: `key` is `n:` for writes of the name, `c:` for writes of its cell.
+// For an un-annotated `let` read at `at` (`key` `n:`) that an `=` writes, or a capture cell
+// (`c:`): instances each named generic function its initializer or a write names at function
+// type `tname`, and answers true; false for any other read, which keeps its value (D3930).
 function monoCoerceLetValues(
   name: string,
   at: i32,
@@ -10531,6 +10524,9 @@ function monoCoerceLetValues(
   tname: string,
   key: string,
 ): boolean {
+  // Asked of every value read, so the cheap tests come first.
+  if annArrowAt(tname) < 1 { return false }
+  if key == "n:" && !fnFlowDeclWritten(at) { return false }
   monoLetWritesExtend()
   const lf = monoLetFrameOf(name, at, ctx)
   if lf[1] < 0 || i32ListHas(monoWrittenLetBusy, lf[1]) { return false }
@@ -12355,35 +12351,76 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
   none
 }
 
-// The lifted lambda an un-annotated `let` binding read at `at` in frame `ctx` holds from its
-// initializer, through a chain of un-annotated `const` and `let` bindings ending at one bound to
-// a hole lambda (`const c = (y) => …; const c2 = c; let d = c2`), or -1. Each link may be read
-// as a capture. The binding may be reassigned, so the caller does not re-spell it (D3833, D3844).
-function monoLetAliasLamFe(name: string, at: i32, ctx: i32): i32 {
-  monoAliasChainLamFe(name, at, ctx, false)
+// The lifted lambda the binding read at `at` in frame `ctx` holds, where the flow table names a
+// chain of un-annotated aliases ending at a hole lambda's `const` (`fnFlowAliasLam`); `viaLet`
+// counts a `let` already behind. -1 for none, a loud refusal past the table's longest chain.
+function monoAliasLamFe(at: i32, ctx: i32, viaLet: boolean): i32 {
+  monoChainLamFe(fnFlowAliasLam(at, viaLet), at, ctx)
 }
 
-// The lifted lambda the capture cell `cell` boxing a `let` holds: the rewrite turns a captured
-// `let d = c` that is written after capture into `let d = [c]` and each read into `d[0]`, so a
-// call through it is `d[0](x)` (D3845). -1 for any other binding.
-function monoCellLamFe(cell: string, at: i32, ctx: i32): i32 {
-  const lf = monoLetFrameOf(cell, at, ctx)
-  const li = lf[1]
-  if li < 0 { return -1 }
-  const d = P.nodes[li]
-  if !(d is LetDecl) { return -1 }
-  if d.letKw != "let" || d.letInit < 0 { return -1 }
-  const lit = P.nodes[d.letInit]
-  if !(lit is ArrayLit) { return -1 }
-  // Only the rewrite's own cell, which carries no source position: a list the program wrote
-  // can be reassigned whole or grown, writes this resolver does not follow.
-  if lit.pos >= 0 || lit.arrElems.length != 1 { return -1 }
-  // A name, or a read through another binding's cell (`let d2 = [d1[0]]`).
-  let el = monoIdentNameOf(lit.arrElems[0])
-  if el == "" { el = monoCellReadName(lit.arrElems[0]) }
-  if el == "" { return -1 }
-  if !monoLetWritesAreLams(cell, lf[0], true) { return -1 }
-  monoAliasChainLamFe(el, lit.arrElems[0], lf[0], true)
+// `monoAliasLamFe` for the capture cell read at `at` (`d[0]`): the rewrite turns a captured
+// `let d = c` that is written after capture into `let d = [c]` and each read into `d[0]` (D3845).
+function monoCellLamFe(at: i32, ctx: i32): i32 {
+  monoChainLamFe(fnFlowCellLam(at), at, ctx)
+}
+
+// The lifted lambda of the binding `e` a flow-table chain answer names, as frame `ctx` or the
+// frame enclosing it that declares it holds it; -1 for none.
+function monoChainLamFe(e: i32, at: i32, ctx: i32): i32 {
+  if e == FF_CHAIN_LONG {
+    return emitFailAt(
+      "emitProgram: a call through a chain of more than "
+        + i32ToStr(MONO_ALIAS_CHAIN_MAX)
+        + " un-annotated aliases of a lambda has no signature to lower at — annotate the lambda's parameters",
+      at,
+    )
+  }
+  const c = monoDeclCopyIn(e, ctx)
+  if c < 0 { return -1 }
+  const d = P.nodes[c]
+  if !(d is LetDecl) || d.letInit < 0 { return -1 }
+  const ls = fnStmtsPosOf(d.letInit)
+  if ls < 0 || !criFnIsAnonLambda(ls) { return -1 }
+  ls
+}
+
+// The declaration standing for the flow table's pre-mono declaration `e` in frame `ctx` or the
+// nearest enclosing frame declaring it, since an instance declares its own copy of each of its
+// template's; `e` itself at module scope, and -1 past eight frames.
+function monoDeclCopyIn(e: i32, ctx: i32): i32 {
+  if e < 0 || e >= P.nodes.length { return -1 }
+  if fnFlowDeclFn(e) == -1 { return e }
+  let fx = ctx
+  let hops = 0
+  while hops < 8 && fx >= 0 {
+    const c = monoBodyDeclCopy(monoNestedBodyOf(fx), e)
+    if c >= 0 { return c }
+    const slot = fnStmtsPosOf(fx)
+    if slot < 0 || slot >= fnParent.length { return -1 }
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return -1 }
+    fx = fnStmts[ps]
+    hops = hops + 1
+  }
+  -1
+}
+
+// The `let` in `body`, outside the functions nested in it, that is or copies declaration `e`.
+function monoBodyDeclCopy(body: i32, e: i32): i32 {
+  if body < 0 { return -1 }
+  let eo = declOrigOf(e)
+  if eo < 0 { eo = e }
+  const stack: i32[] = [body]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur >= 0 && cur < P.nodes.length {
+      if P.nodes[cur] is LetDecl {
+        if cur == e || cur == eo || declOrigOf(cur) == eo { return cur }
+      }
+      for k in nodeChildren(cur) { stack.push(k) }
+    }
+  }
+  -1
 }
 
 // The cell a read `cell[0]` at node `ix` names, or "" for any other node.
@@ -12398,64 +12435,6 @@ function monoCellReadName(ix: i32): string {
     }
   }
   ""
-}
-
-// The walk `monoLetAliasLamFe` takes from the name `nm` read at `ax` in frame `fr`; `viaLet`
-// says a `let` is already behind, the condition for an answer `monoRespellLamAlias` lacks.
-function monoAliasChainLamFe(
-  nm0: string,
-  ax0: i32,
-  fr0: i32,
-  viaLet: boolean,
-): i32 {
-  let nm = nm0
-  let ax = ax0
-  let fr = fr0
-  let sawLet = viaLet
-  let hops = 0
-  while hops < MONO_ALIAS_CHAIN_MAX {
-    const lf = monoLetFrameOf(nm, ax, fr)
-    const fx = lf[0]
-    const li = lf[1]
-    if li < 0 { return -1 }
-    const d = P.nodes[li]
-    if !(d is LetDecl) { return -1 }
-    if d.letType >= 0 || d.letInit < 0 { return -1 }
-    if hops > 0 || viaLet {
-      const sfe = identClosureFeAt(sidOf(nm), fx, ax)
-      // A module-scope `let` names its initializer's lambda too (D3847); it is a link, walked
-      // on below with its writes checked, not the chain's end (D3856).
-      if sfe >= 0 && !(d.letKw == "let" && fx < 0) {
-        if !criFnIsAnonLambda(sfe) || d.letKw != "const" { return -1 }
-        if !sawLet { return -1 }
-        return sfe
-      }
-    }
-    // The rewrite's capture cell `let d = [v]` holds `v`, and is written as `d[0] = …`.
-    let initIx = d.letInit
-    const cellEl = monoGeneratedCellElem(initIx)
-    if cellEl >= 0 { initIx = cellEl }
-    if d.letKw == "let" {
-      sawLet = true
-      // A `let` written anywhere with a value that is no hole lambda holds what this walk
-      // cannot name; the call stays unresolved and keeps its loud refusal.
-      if !monoLetWritesAreLams(nm, fx, cellEl >= 0) { return -1 }
-    }
-    // A name, or a read through another binding's capture cell (`let d4 = d2[0]`, D3850).
-    let next = monoIdentNameOf(initIx)
-    if next == "" { next = monoCellReadName(initIx) }
-    if next == "" { return -1 }
-    nm = next
-    ax = initIx
-    fr = fx
-    hops = hops + 1
-  }
-  emitFailAt(
-    "emitProgram: a call through a chain of more than "
-      + i32ToStr(MONO_ALIAS_CHAIN_MAX)
-      + " un-annotated aliases of a lambda has no signature to lower at — annotate the lambda's parameters",
-    ax0,
-  )
 }
 
 // The function type the capture cell read `at` (`cell[0]`) holds at the bindings of frame
@@ -12488,7 +12467,7 @@ function monoCellCall(
   // A call in a function nothing names never runs, so it asks nothing of the cell (D3864).
   const cellFr = monoLetFrameOf(cellNm, at, cctx)[0]
   const live = cellFr < 0 || !monoWriteFrameDead(ctx, cellFr)
-  const cfe = monoCellLamFe(cellNm, at, cctx)
+  const cfe = monoCellLamFe(at, cctx)
   if !viaAlias && cfe >= 0 && cfe < monoGen.length && monoGen[cfe] == 1 {
     monoLastInstFe = -1
     const rc = monoInstantiate(cfe, ix, ctx)
@@ -12566,7 +12545,7 @@ function monoWritesCoercedFirstCall(
   (monoBindCallSigs.get(lf[1]) ?? "") == ""
 }
 
-// The longest alias chain `monoAliasChainLamFe` follows before refusing.
+// The longest alias chain a walk here follows before refusing, as long as the flow table's.
 const MONO_ALIAS_CHAIN_MAX = 64
 
 // The hole lambda the value at node `vx`, read in frame `fx`, is: a lambda literal, or a name
@@ -12625,13 +12604,6 @@ function monoGeneratedCellElem(ix: i32): i32 {
   -1
 }
 
-// Whether node `vx`'s recorded type is a function type naming no type variable.
-function monoValueFnTyConcrete(vx: i32): boolean {
-  const t = nodeTyIxOf(vx)
-  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return false }
-  T.tys[t] is TyFunc
-}
-
 // The innermost function node among `root` and the functions lifted out of it whose body holds
 // node `ix`; `root` itself when none of them does.
 function monoFrameOfNode(ix: i32, root: i32): i32 {
@@ -12656,33 +12628,6 @@ function monoSubtreeHolds(root: i32, ix: i32): boolean {
     }
   }
   false
-}
-
-// Whether every write to the `let` named `name` declared in frame `fx` (the program, for -1),
-// in that frame or a function lifted out of it, stores a hole lambda. `cell` reads the writes
-// of the rewrite's capture cell, `name[0] = v`, instead of `name = v`.
-function monoLetWritesAreLams(name: string, fx: i32, cell: boolean): boolean {
-  monoLetWritesExtend()
-  let key = "n:" + name
-  if cell { key = "c:" + name }
-  for i in monoLetWrites.get(key) ?? [] {
-    const nd = P.nodes[i]
-    if nd is BinExpr {
-      if monoFrameHolds(fx, i) {
-        let wf = fx
-        if fx >= 0 { wf = monoFrameOfNode(i, fx) }
-        // A hole lambda, or a value whose function type is already concrete (a typed
-        // parameter, D3848): the call's arguments fit it, so the lambdas pin at them.
-        if (
-          monoLamValueFe(nd.binRight, wf) < 0
-          && !monoValueFnTyConcrete(nd.binRight)
-        ) {
-          return false
-        }
-      }
-    }
-  }
-  true
 }
 
 // The program's assignments by target: `n:<name>` for `name = v`, `c:<name>` for a capture
@@ -12716,47 +12661,23 @@ function monoLetWritesExtend() {
   0
 }
 
-// Re-spells callee `calleeIx` as the name its chain of un-annotated `const` aliases ends at,
-// when that is an un-annotated `const` binding of a lambda the call reads unshadowed. The
-// chain may live in an enclosing frame, read as a capture (D3825). Any other chain, or one
-// longer than eight, leaves the callee as written.
-function monoRespellLamAlias(calleeIx: i32, ctx: i32) {
+// Re-spells callee `calleeIx` as the un-annotated `const` binding of a lambda the flow table says
+// its chain of un-annotated `const` aliases ends at (`fnFlowRespellLam`), when the call reads that
+// binding unshadowed. The chain may live in an enclosing frame, read as a capture (D3825).
+function monoRespellToLam(calleeIx: i32, ctx: i32) {
   const cal = P.nodes[calleeIx]
   if !(cal is Ident) { return 0 }
   if identClosureFeAt(sidOfNode(calleeIx), ctx, calleeIx) >= 0 { return 0 }
-  let at = calleeIx
-  let name = cal.identName
-  let hops = 0
-  while hops < 8 {
-    const lf = monoLetFrameOf(name, at, ctx)
-    const fx = lf[0]
-    const li = lf[1]
-    if li < 0 { return 0 }
-    const d = P.nodes[li]
-    if !(d is LetDecl) { return 0 }
-    if d.letKw != "const" || d.letType >= 0 || d.letInit < 0 { return 0 }
-    const src = P.nodes[d.letInit]
-    if !(src is Ident) { return 0 }
-    const sfe = identClosureFeAt(sidOfNode(d.letInit), fx, d.letInit)
-    if sfe >= 0 {
-      if !criFnIsAnonLambda(sfe) { return 0 }
-      const si = identLetOfAt(sidOfNode(d.letInit), fx, d.letInit)
-      if si < 0 { return 0 }
-      const sd = P.nodes[si]
-      if !(sd is LetDecl) { return 0 }
-      if sd.letKw != "const" || sd.letType >= 0 { return 0 }
-      // The lambda's name must read the same binding where the call is, not a shadow of it.
-      if monoLetFrameOf(src.identName, calleeIx, ctx)[1] != si { return 0 }
-      collectANoteIdentRename(cal.identName)
-      cal.identName = src.identName
-      monoArenaTouch()
-      sidNoteNodeName(calleeIx, si)
-      return 0
-    }
-    at = d.letInit
-    name = src.identName
-    hops = hops + 1
-  }
+  const si = monoDeclCopyIn(fnFlowRespellLam(calleeIx), ctx)
+  if si < 0 { return 0 }
+  const sd = P.nodes[si]
+  if !(sd is LetDecl) { return 0 }
+  // The lambda's name must read the same binding where the call is, not a shadow of it.
+  if monoLetFrameOf(sd.letName, calleeIx, ctx)[1] != si { return 0 }
+  collectANoteIdentRename(cal.identName)
+  cal.identName = sd.letName
+  monoArenaTouch()
+  sidNoteNodeName(calleeIx, si)
   0
 }
 
@@ -12826,7 +12747,7 @@ function monoWalk(ix: i32, ctx: i32) {
       if fe < 0 {
         // A call through a `const` alias of a lambda's `const` binding is a call through
         // that binding, so it is re-spelled to it and instantiated per call alike (D2896).
-        monoRespellLamAlias(n.callFn, ctx)
+        monoRespellToLam(n.callFn, ctx)
         // A direct call through a value binding to a generic named function: resolve it
         // to the lifted slot and monomorphize per call site. Named functions only, and
         // re-read rather than reused from `dfe`, the coercion loop between having run.
@@ -12846,7 +12767,7 @@ function monoWalk(ix: i32, ctx: i32) {
         // A chain of aliases ending at a generic function by name is a call to it (D3894).
         if afe < 0 { afe = monoReadGenFnFe(n.callFn) }
         if afe < 0 {
-          afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx)
+          afe = monoAliasLamFe(n.callFn, ctx, false)
           // The call would be re-spelled to the lambda's own name, which a parameter or local
           // here may rebind: it keeps its `call_ref` through the alias then (D3861).
           if afe >= 0 && monoNameShadowedAt(monoSlotName(afe), n.callFn, ctx) {
@@ -12855,12 +12776,7 @@ function monoWalk(ix: i32, ctx: i32) {
           // A `const`-only chain is re-spelled above unless that name is rebound here; then
           // the lambda is pinned through the chain and the call keeps its `call_ref` (D3861).
           if afe < 0 {
-            const cfe = monoAliasChainLamFe(
-              callee.identName,
-              n.callFn,
-              ctx,
-              true,
-            )
+            const cfe = monoAliasLamFe(n.callFn, ctx, true)
             if cfe >= 0 {
               afe = cfe
               monoNoRename.push(n.callFn)
@@ -12923,7 +12839,7 @@ function monoWalk(ix: i32, ctx: i32) {
               const prev = monoSigCallRet
               monoSigCallRet = nodeTyIxOf(ix)
               monoCellSigByCall = true
-              monoCoerceWrittenLet(wlName, wlAt, wlFr, ctn)
+              monoCoerceLetValues(wlName, wlAt, wlFr, ctn, "n:")
               monoCellSigByCall = false
               monoSigCallRet = prev
             }
@@ -14633,8 +14549,8 @@ export function monomorphize(stmts: i32[]) {
     if monoHasConcreteHOFParam() { any = true }
   }
   if !any { return 0 }
-  // The flow table reads the tree before the walk rewrites it, and only a generic asks it.
-  if i32ListHas(monoGen, 1) { fnFlowTableBuild(stmts) }
+  // The flow table reads the tree before the walk rewrites it.
+  fnFlowTableBuild(stmts)
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0

@@ -5471,7 +5471,21 @@ function unionBoxHasNoRow(unionName: string): boolean {
   false
 }
 
+// Coerces the value of `exprIx` into the box of union `unionNameIn`. The caller's context is
+// restored on every exit.
 export function emitUnionCoerce(
+  body: u8[],
+  unionNameIn: string,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const saved = expCtxHere()
+  expCtxLeave(saved, emitUnionCoerceUnder(body, unionNameIn, exprIx, fnIx))
+}
+
+// `emitUnionCoerce`'s body: the arms that thread a list or f32 context apply it and leave it
+// for the wrapper's exit to undo.
+function emitUnionCoerceUnder(
   body: u8[],
   unionNameIn: string,
   exprIx: i32,
@@ -5697,14 +5711,11 @@ export function emitUnionCoerce(
       )
       if mapArmSlot >= 0 {
         fbI32Const(refArrSlotTag(mapArmSlot))
-        const savedMK = pendingListKind
-        const savedMS = pendingListSlot
-        pendingListKind = LBK_REF
-        pendingListSlot = mapArmSlot
-        const mrc = emitExpr(body, exprIx, fnIx)
-        pendingListKind = savedMK
-        pendingListSlot = savedMS
-        if mrc < 0 { return -1 }
+        const mc = expCtxHere()
+        mc.listKind = LBK_REF
+        mc.listSlot = mapArmSlot
+        expCtxApply(mc)
+        if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
         fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
         return 0
       }
@@ -5715,14 +5726,11 @@ export function emitUnionCoerce(
       const nmSlot = unionRefArrayArmSlotForNestedElem(unionName, true)
       if nmSlot >= 0 {
         fbI32Const(refArrSlotTag(nmSlot))
-        const savedNK = pendingListKind
-        const savedNS = pendingListSlot
-        pendingListKind = LBK_UNION
-        pendingListSlot = nmSlot
-        const nrc = emitExpr(body, exprIx, fnIx)
-        pendingListKind = savedNK
-        pendingListSlot = savedNS
-        if nrc < 0 { return -1 }
+        const nc = expCtxHere()
+        nc.listKind = LBK_UNION
+        nc.listSlot = nmSlot
+        expCtxApply(nc)
+        if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
         fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
         return 0
       }
@@ -6010,16 +6018,15 @@ export function emitUnionCoerce(
   } else if cak == 4 {
     if emitExprAsF64(body, exprIx, fnIx) < 0 { return -1 }
   } else if cak == 5 {
-    const savedF32 = pendingF32
-    pendingF32 = true
+    const fc = expCtxHere()
+    fc.wantF32 = true
+    expCtxApply(fc)
     if emitExprAsF32(body, exprIx, fnIx) < 0 { return -1 }
-    pendingF32 = savedF32
   } else if coerceListKind != LBK_I32_LIST {
-    const savedCLK = pendingListKind
-    pendingListKind = coerceListKind
-    const rcCLK = emitExpr(body, exprIx, fnIx)
-    pendingListKind = savedCLK
-    if rcCLK < 0 { return -1 }
+    const lc = expCtxHere()
+    lc.listKind = coerceListKind
+    expCtxApply(lc)
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   } else {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   }
@@ -20871,7 +20878,15 @@ function emitNonNullParamRecover(pk: VKind | null, argIx: i32, fnIx: i32) {
   0
 }
 
+// The call of a function value. The caller's context is restored on every exit.
 function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
+  const saved = expCtxHere()
+  expCtxLeave(saved, emitCallRefUnder(body, callIx, fnIx))
+}
+
+// `emitCallRef`'s body: each argument applies its parameter's context and leaves it for the
+// wrapper's exit to undo.
+function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
     const liftFe = cloLiftCalleeOf(c.callFn, fnIx)
@@ -20923,21 +20938,14 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
     // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
     const args = c.callArgs
     // each argument's valtype is decided by its parameter, so an enclosing wide-scalar
-    // context must not leak into it (cleared here, restored after, mirroring the index-
-    // receiver discipline) — else a bare i32 literal argument under an outer f32/atom
+    // context must not leak into it — else a bare i32 literal argument under an outer f32/atom
     // context lowers at the wrong valtype for the `call_ref` functype: invalid wasm.
-    const savedArgF32 = pendingF32
-    const savedArgF64 = pendingF64
-    const savedArgI64 = pendingI64
-    const savedArgLU = pendingLitUnion
-    const savedArgNulLU = pendingNulLitUnion
-    const savedArgNS = pendingNulString
-    const savedArgRaw = pendingRawNullRead
-    pendingF32 = false
-    pendingF64 = false
-    pendingLitUnion = 0
-    pendingNulLitUnion = false
-    pendingI64 = false
+    const argBase = expCtxHere()
+    argBase.wantF32 = false
+    argBase.wantF64 = false
+    argBase.litUnion = 0
+    argBase.nulLitUnion = false
+    argBase.wantI64 = false
     let i = 0
     while i < args.length {
       // D940 — the struct row the functype declares, seeded exactly as the direct call
@@ -20945,10 +20953,13 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
       // its own row by field set, the pre-merge row wherever the callee's parameter row
       // moved. The seed is the key's, so it agrees with the functype by construction.
       const pkk = sigParamKindAt(ckey, i)
-      seedValueArgShape(pkk, sigParamSlotAt(ckey, i))
+      expCtxApply(argBase)
+      const ac = expCtxHere()
+      expCtxSeedValueArg(ac, pkk, sigParamSlotAt(ckey, i))
       // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
-      pendingNulString = pkk == "nulstr"
-      pendingRawNullRead = false
+      ac.nulString = pkk == "nulstr"
+      ac.rawNullRead = false
+      expCtxApply(ac)
       const pck = sigParamCoerceKind(ckey, i)
       if pck == "i64" {
         if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
@@ -21012,7 +21023,6 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           const cvCtx = expCtxHere()
           cvCtx.variantIdx = cvSlot
           if emitExprExpect(body, args[i], fnIx, cvCtx) < 0 { return -1 }
-          pendingVariantIdx = -1
           if exprUnion(args[i], fnIx) {
             if variantHasCrossTagFits(cvSlot, args[i]) {
               return emitFailCrossTagDelivery(args[i], cvSlot)
@@ -21035,7 +21045,6 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           const cnvArg = P.nodes[unwrapParen(args[i])]
           if cnvArg is NullLit { cnvCtx.nulRefHeap = uVarHeap[cnvSlot] }
           if emitExprExpect(body, args[i], fnIx, cnvCtx) < 0 { return -1 }
-          pendingVariantIdx = -1
           if narrowedArmNeedsUnbox(args[i], fnIx) {
             emitNarrowedArmUnboxTo(
               armDestHeapOf("nulvariant", cnvSlot),
@@ -21094,15 +21103,6 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
       }
       i = i + 1
     }
-    pendingF32 = savedArgF32
-    pendingF64 = savedArgF64
-    pendingI64 = savedArgI64
-    pendingLitUnion = savedArgLU
-    pendingNulLitUnion = savedArgNulLU
-    pendingNulString = savedArgNS
-    pendingRawNullRead = savedArgRaw
-    // Left neutral, as the direct call leaves them.
-    seedValueArgShape(null, -1)
     callRefDepth = crDepth
     // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
     // the concrete `$fnsig` (the engine signature-checks the callee against it).
@@ -28934,26 +28934,34 @@ export function expCtxHere(): ExpCtx {
 // Seeds the container shape a value call's argument builds from its parameter's `$fnsig`
 // kind and slot, replacing the enclosing position's: a list literal argument of a closure
 // called into a `Clip[]` field is the parameter's `i32[]`, not the field's list (D3605).
-function seedValueArgShape(pk: VKind | null, slot: i32) {
-  pendingStructIdx = -1
-  pendingListKind = listBuildKindOfVKind(pk, slot)
-  pendingListSlot = 0
-  pendingMapSlot = -1
-  pendingI64 = false
+function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null, slot: i32) {
+  c.structIdx = -1
+  c.listKind = listBuildKindOfVKind(pk, slot)
+  c.listSlot = 0
+  c.mapSlot = -1
+  c.wantI64 = false
   match pk {
     "struct" | "nulstruct" => {
-      pendingStructIdx = slot
+      c.structIdx = slot
     }
     "reflist" => {
-      if slot >= 0 { pendingListSlot = slot }
+      if slot >= 0 { c.listSlot = slot }
     }
     "map" => {
-      pendingMapSlot = slot
+      c.mapSlot = slot
     }
     "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "nulreflist" | "i32" | "str" | "union" | "variant" | "nulvariant" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
       // No other kind carries a container slot a literal argument builds at.
     }
   }
+  0
+}
+
+// `expCtxSeedValueArg` over the ambient seeds.
+function seedValueArgShape(pk: VKind | null, slot: i32) {
+  const c = expCtxHere()
+  expCtxSeedValueArg(c, pk, slot)
+  expCtxApply(c)
   0
 }
 
