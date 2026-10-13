@@ -668,6 +668,30 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      annotated closure results. Over 15,100 files nothing moved. One caller of
      `monoLetFrameOf` stays, `monoRespellToLam`: it asks whether a name, written at the
      call, reads the binding, which is a question about spelling.
+   - Eighth PR: the respell stops renaming to the binding's name. `monoRespellLamFe` finds
+     the binding by declaration (`fnFlowRespellLam`, `monoDeclFrameIn`). For a lambda that
+     captures nothing, it renames the callee to the lifted function's own name, which no
+     binding can shadow. A capturing lambda keeps its spelling and is instanced through the
+     answer. With no name left to check, `monoLetFrameOf` is deleted. Over 15,100 files five
+     modules moved, all with the same output, all in `closures/`:
+     `alias-call-in-function-rebinding-lambda-name`, `binding-copied-through-uncalled-chain`,
+     `captured-lambda-alias-call`, `hole-lambda-binding-one-signature` and
+     `module-alias-call-beside-local-shadow`. Where the old respell declined on a shadowed
+     name, the call went through `call_indirect` or `call_ref`. It is now a direct call to
+     the instance. In `captured-lambda-alias-call`, the closures no longer capture the
+     renamed binding. `monoCoerceLetValues` still picks the pin from the first read rather
+     than from the let slot.
+   - Ninth PR: `monoCoerceLetValues` is split by job, and its `n:`/`c:` key goes.
+     `monoCoerceWrittenLetValues` records the written `let`'s signature and instances the
+     generics its initializer and writes name. `monoCoerceWrittenCell` takes and retypes a
+     capture cell's seed and writes. `monoLetWriteFrame` is the one walk both use to find the
+     live writes. Neither half reads its pin from the let slot yet. In shadow over
+     `tests/cases`, a pin read from the class disagreed with the recorded signature in 25
+     files, 7 of them running fixtures. The class is an undirected union: the
+     lambda copied into a binding and the other bindings it reaches share its class, so a
+     call through any of them pins the binding (`closures/delivered-alias-pins-written-lambda`
+     calls `e` at `string` directly while `d` is held at `i32`). The let slot can decide the
+     pin once its pins are the ones the binding's value flows to, not every pin in the class.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
