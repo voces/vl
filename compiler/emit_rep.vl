@@ -105,7 +105,6 @@ import {
   tyIsNullableLitUnion,
   tyIsValueUnionBox,
   tyIxIsVariantMember,
-  tyLitUnionAliasIx,
   tyMutEpoch,
   valueAtomKind,
 } from "./typecheck"
@@ -376,33 +375,7 @@ function repKeyMemoSync() {
 function repCanonFieldTy(ty: i32): i32 {
   const nb = numLitUnionBaseTy(ty)
   if nb >= 0 { return nb }
-  const sb = inlineLitUnionFieldBase(ty)
-  if sb >= 0 { return sb }
   ty
-}
-
-// D1093 — the `string` prim an inline string literal-union field keys as, or -1: the
-// multi-member twin of `repKeyGo`'s bare-`TyLit` arm. An inline `k: "a" | "b"`
-// field codes 3 (a plain string ref, same slot as `k: string`), so without this key
-// `variantStructHeapTwinAt` could never recognise the arm's own row. The alias spelling (`k: K`) is excluded: it codes 0, a different layout.
-function inlineLitUnionFieldBase(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  if !tyIsLitUnion(ty) { return -1 }
-  if tyLitUnionAliasIx(ty) >= 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length > 0 {
-      const m0 = T.tys[t.uMembers[0]]
-      if m0 is TyLit {
-        const b = litBaseTy(m0)
-        const bt = T.tys[b]
-        if bt is TyPrim {
-          if bt.primName == "string" { return b }
-        }
-      }
-    }
-  }
-  -1
 }
 
 // Which equivalence a rep key renders. `canon` is the full structural key; `elem` is the
@@ -2525,14 +2498,8 @@ function repOfTyFlat(ty: i32): RepDesc {
       return d
     }
     TyUnion => {
-      // A homogeneous string-literal union: a declared alias, or a checker-minted copy
-      // recognized through the alias provenance (`tyLitUnionAliasIx`), reps as the
-      // interned i32 atom. An inline one is name-softened to `string` by canon and stays
-      // uncovered here, since the atom-vs-string split is alias-ness, checker metadata rather than structure.
-      if tyIsLitUnion(ty) {
-        if tyLitUnionAliasIx(ty) >= 0 { return repMk("i32", 0, "") }
-        return repUncovered()
-      }
+      // A string literal union reps as the interned i32 atom, whatever its spelling.
+      if tyIsLitUnion(ty) { return repMk("i32", 0, "") }
       // The expanded nullable-litunion `"a" | "b" | null` is the same type as the two-part
       // `K | null` spelling, so it must get the same rep (the i32 atom + `-1` sentinel
       // niche, `rdNul` 3) — without this arm it repped as the union box while every read
@@ -2800,12 +2767,9 @@ function repOfMap(mKey: i32, mVal: i32, mSet: i32): RepDesc {
               return repMk("map", 0, "")
             }
           }
-          // An aliased-litunion value (`{[string]: K0}`): each value is the interned i32
-          // atom, so the map is the mono i32 map. The alias-only gate mirrors the
-          // array-element arm: an inline litunion value's spelling softens to `string` in canon names, so no index-level answer exists for it — uncovered, legacy owns.
-          if tyIsLitUnion(mVal) {
-            if tyLitUnionAliasIx(mVal) >= 0 { return repMk("map", 0, "") }
-          }
+          // A string-literal-union value is the interned i32 atom, so the map is the mono
+          // i32 map.
+          if tyIsLitUnion(mVal) { return repMk("map", 0, "") }
           // Composite values whose ladder admission is unconditional — a function value, an
           // array value, and a nested map value — each map to an mv kind with no name-domain
           // gate, so the descriptor decides identically. A struct value stays uncovered
@@ -3312,14 +3276,8 @@ function rtOfObjAs(memoTy: i32, objTy: i32, disc: i32, fieldTys: i32[]): i32 {
 }
 
 function rtOfUnion(ty: i32, members: i32[]): i32 {
-  if tyIsLitUnion(ty) {
-    // Alias-ness as explicit input (b1): a declared litunion alias, or a checker-
-    // minted copy now index-visible through the alias provenance (`tyLitUnionAliasIx`),
-    // is the interned i32 atom. A provenance-less index is a genuinely inline litunion,
-    // position-decided by canon instead — no single denotation exists, so it stays an explicit policy node and the flat projections carry its positional truths.
-    if tyLitUnionAliasIx(ty) >= 0 { return rtLeafOf("atom", 0, "", ty) }
-    return rtLeafOf("unsup", 0, "litunion:noalias", ty)
-  }
+  // A string literal union is the interned i32 atom, whatever its spelling.
+  if tyIsLitUnion(ty) { return rtLeafOf("atom", 0, "", ty) }
   // D-NULLITHOME: the expanded nullable-litunion `"a" | "b" | null` is the same type
   // the two-part `K | null` spelling builds as a `nul` node (disc 3, atom-sentinel),
   // so building it identically here lets the hash-cons fold both spellings into one
@@ -3386,10 +3344,7 @@ function rtNulDiscOf(inner: i32): i32 {
   if it is TyFunc { return 1 }
   if it is TyObj { return 1 }
   if it is TyUnion {
-    // Any litunion inner takes the atom sentinel, deliberately not gated on alias
-    // identity, mirroring the flat arm and canon: an alias-derived inner is atom-backed
-    // and a genuinely-inline `"a" | "b" | null` is preserved as atoms too
-    // (`nulLitUnionPreserve`). The inner node may still be the explicit `litunion:noalias` policy node — the discipline is decided even where the member vocabulary is open.
+    // Any string-literal-union inner, aliased or inline, takes the atom sentinel.
     if tyIsLitUnion(inner) { return 3 }
     if tyIsValueUnionBox(inner) { return 4 }
     if it.uMembers.length == 1 {
@@ -3505,12 +3460,7 @@ function rtListVKind(elem: i32): VKind | null {
   // Exhaustive over `RtKind` and `_`-less: the unnamed `box` takes `null` (a list element is
   // never a raw value box), so a new element kind must decide its list vocabulary here.
   match ek {
-    // An inline litunion element — the explicit `litunion:noalias` policy node
-    // (`rtOfUnion` keeps it, since the bare position's lowering is canon's, not
-    // compositional). At the list position the policy is settled: atom ids on the i32
-    // list, the same answer the alias spelling gets — the mirror of `rtNulDiscOf`'s `disc 3`.
     "unsup" => {
-      if rtReason[elem] == "litunion:noalias" { return "list" }
       return null
     }
     // Atom elements share the i32-list backing (interned i32 ids), as do
@@ -3580,13 +3530,6 @@ function rtNulVKind(ix: i32): VKind | null {
     if elem < 0 { return null }
     const ek = rtKind[elem]
     if ek == "i32" || ek == "bool" || ek == "atom" { return "nullist" }
-    // The flat nullable arm covers any litunion element as atom-backed (a pinned
-    // inline case runs as atoms too), mirrored here even where the tree keeps the
-    // element an explicit policy node. Alias-derived elements are real atom nodes
-    // since b1; only a genuinely-inline element stays position-decided (see `rtOfUnion`).
-    if ek == "unsup" {
-      if rtReason[elem] == "litunion:noalias" { return "nullist" }
-    }
     if ek == "str" { return "nulstrlist" }
     if ek == "f64" { return "nulf64list" }
     if ek == "i64" { return "nuli64list" }
@@ -3625,11 +3568,6 @@ function repTreeListElemName(ix: i32): string {
   if ek == "list" { return "list" }
   if ek == "nul" { return "struct" }
   if ek == "box" { return "union" }
-  // The nullable-list flat arm treats a policy-pending litunion element as
-  // atom-backed (see `rtNulVKind`) — its element vocabulary is "i32".
-  if ek == "unsup" {
-    if rtReason[elem] == "litunion:noalias" { return "i32" }
-  }
   ""
 }
 
