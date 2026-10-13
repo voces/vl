@@ -1,0 +1,303 @@
+// What the seed was built FROM, compared with what is checked out. The VL port of
+// `scripts/seed_provenance.py`, whose docstring is the full contract.
+//
+//     vl run scripts/seed-provenance.vl                         # check: rc 0 only on a match
+//     vl run scripts/seed-provenance.vl -- --write [--seed P]   # record P's source identity
+//     vl run scripts/seed-provenance.vl -- --self-test
+//
+// A seed is the compiler's own codegen of itself, so a grade against it is a grade of the
+// source it was built from. `refresh-compiler.sh` records the FNV-1a fold of `compiler/*.vl`
+// (`vl std --hash`'s fold) beside the seed; this recomputes it over the working tree.
+// Identities, never timestamps. Run from the checkout root: paths resolve against the
+// working directory. VL has no stderr sink, so everything prints to stdout.
+
+import { IoError, listDir, readFile, readTextFile, writeTextFile } from "std:fs"
+import { exit, runProgram } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import { insert } from "std:array"
+import { endsWith, join, split, startsWith } from "std:str"
+import { die, findFrom, stripWs, wsLen } from "./lib/common"
+
+const SEED = "build/vl-compiler.wasm"
+const ROOT = "."
+const SELF_TEST_SRC = "// a compiler source whose bytes are the whole point\n"
+
+function fnvFeed(h0: i64, data: u8[]): i64 {
+  let h = h0
+  let i = 0
+  while i < data.length {
+    h = (h ^ (data[i] as i64)) * 1099511628211
+    i = i + 1
+  }
+  h
+}
+
+function hex64(h: i64): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = 15
+  while k >= 0 {
+    const d = ((h >> ((k * 4) as i64)) & 15) as! i32
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+// FNV-1a over every `compiler/*.vl` in sorted name order, and how many there were.
+type Identity = { hash: string, files: i32 }
+
+function under(root: string, name: string): string {
+  if root == "." { return name }
+  root + "/" + name
+}
+
+// `names` in byte order (UTF-8 byte order is code point order, as Python's `sorted`).
+function sortNames(names: string[]): string[] {
+  const out: string[] = []
+  for n in names {
+    let at = out.length
+    while at > 0 && n < out[at - 1] { at = at - 1 }
+    out.insert(at, n)
+  }
+  out
+}
+
+function sourceIdentity(root: string): Identity {
+  const dir = under(root, "compiler")
+  const listed = listDir(dir)
+  if listed is IoError {
+    die("seed-provenance: cannot list \{dir} (\{listed.msg})", 1)
+    return { hash: "", files: 0 }
+  }
+  const all: string[] = []
+  for n in listed {
+    if endsWith(n, ".vl") { all.push(n) }
+  }
+  const names = sortNames(all)
+  const zero: u8[] = [0]
+  let h: i64 = -3750763034362895579
+  for n in names {
+    const src = readFile(dir + "/" + n)
+    if src is IoError {
+      die("seed-provenance: cannot read \{dir}/\{n} (\{src.msg})", 1)
+      return { hash: "", files: 0 }
+    }
+    h = fnvFeed(h, n.bytes())
+    h = fnvFeed(h, zero)
+    h = fnvFeed(h, toString(src.length).bytes())
+    h = fnvFeed(h, zero)
+    h = fnvFeed(h, src)
+    h = fnvFeed(h, zero)
+  }
+  { hash: hex64(h), files: names.length }
+}
+
+// What `refresh-compiler.sh` wrote: the first non-blank, non-`#` line's first word, or ""
+// when the seed has no recorded provenance.
+function recordedIdentity(sidecar: string): string {
+  const t = readTextFile(sidecar)
+  if t is IoError { return "" }
+  for raw in t.split("\n") {
+    const line = stripWs(raw)
+    if line != "" && !startsWith(line, "#") {
+      let e = 0
+      while e < line.length && wsLen(line, e) == 0 { e = e + 1 }
+      return line.slice(0, e)
+    }
+  }
+  ""
+}
+
+// The verdict (`match`, `differ` or `unknown`) and the summary line. `sabotage` forces
+// `match`, which is how the self-test proves its specimens would notice a guard that stopped
+// comparing.
+type Verdict = { status: string, line: string }
+
+function check(root: string, sidecar: string, sabotage: boolean): Verdict {
+  if sabotage { return { status: "match", line: "sabotaged" } }
+  const have = sourceIdentity(root)
+  const want = recordedIdentity(sidecar)
+  const n = toString(have.files)
+  if want == "" {
+    return {
+      status: "unknown",
+      line: "seed provenance: UNKNOWN (no \{sidecarShown(root, sidecar)}) · compiler/*.vl is \{have.hash} over \{n} files",
+    }
+  }
+  if want == have.hash {
+    return {
+      status: "match",
+      line: "seed provenance: \{want} · compiler/*.vl \{have.hash} over \{n} files — match",
+    }
+  }
+  {
+    status: "differ",
+    line: "seed provenance: \{want} · compiler/*.vl \{have.hash} over \{n} files — DIFFER",
+  }
+}
+
+// The sidecar path relative to `root`, as the Python's `os.path.relpath` prints it.
+function sidecarShown(root: string, sidecar: string): string {
+  if root != "." && startsWith(sidecar, root + "/") {
+    return sidecar.slice(root.length + 1, sidecar.length)
+  }
+  sidecar
+}
+
+// Text the guard printed and the exit code it answers (0 to carry on).
+type Guarded = { code: i32, out: string }
+
+function guard(
+  what: string,
+  moved: i32,
+  root: string,
+  sidecar: string,
+  sabotage: boolean,
+): Guarded {
+  const v = check(root, sidecar, sabotage)
+  const lines: string[] = [v.line]
+  if v.status == "differ" {
+    lines.push(
+      "\{what}: REFUSING — the seed was built from different `compiler/*.vl` than the ones\n  checked out, so every row would be graded against a compiler this tree does\n  not describe. Run `scripts/refresh-compiler.sh` and re-run.",
+    )
+    return { code: 2, out: join(lines, "\n") + "\n" }
+  }
+  if v.status == "unknown" && moved > 0 {
+    lines.push(
+      "\{what}: REFUSING to report \{toString(moved)} MOVED row(s) against a seed of unknown provenance —\n  a MOVED reading is quoted with the seed's identity beside the tree's or it is\n  not a reading. Run `scripts/refresh-compiler.sh` and re-run.",
+    )
+    return { code: 2, out: join(lines, "\n") + "\n" }
+  }
+  { code: 0, out: join(lines, "\n") + "\n" }
+}
+
+// ── the self-test ───────────────────────────────────────────────────────────────
+
+function sh(cmd: string, args: string[]): string {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("seed-provenance: cannot run \{cmd} (\{r.msg})", 1)
+    return ""
+  }
+  if r.code != 0 {
+    die("seed-provenance: \{cmd} exited \{toString(r.code)}", 1)
+    return ""
+  }
+  decodeUtf8Lossy(r.stdout)
+}
+
+function put(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null { die("seed-provenance: cannot write \{path} (\{w.msg})", 1) }
+}
+
+// A fresh tree with one compiler source; the sidecar, when asked for, records the tree's
+// own identity before `mutate` (when not "") rewrites the source.
+function specimen(writeSidecar: boolean, mutate: string): string {
+  const d = stripWs(sh("mktemp", ["-d"]))
+  sh("mkdir", ["-p", d + "/compiler", d + "/build"])
+  put(d + "/compiler/entry.vl", SELF_TEST_SRC)
+  if writeSidecar {
+    put(d + "/build/vl-compiler.wasm.src", sourceIdentity(d).hash + "\n")
+  }
+  if mutate != "" { put(d + "/compiler/entry.vl", mutate) }
+  d
+}
+
+// Each verdict on a specimen that must produce it, plus the sabotage of each.
+function selfTest(): i32 {
+  const bad: string[] = []
+  const cases = [
+    "a seed built from these very sources",
+    "one source byte changed under the seed", "no sidecar, nothing moved",
+    "no sidecar, a MOVED row in hand",
+  ]
+  const wantStatus = ["match", "differ", "unknown", "unknown"]
+  const wantRc = [0, 2, 0, 2]
+  const moved = [0, 0, 0, 3]
+  let c = 0
+  while c < cases.length {
+    const d = specimen(
+      c < 2,
+      if c == 1 { SELF_TEST_SRC + "// and now it is not\n" } else { "" },
+    )
+    const side = d + "/build/vl-compiler.wasm.src"
+    const v = check(d, side, false)
+    if v.status != wantStatus[c] {
+      bad.push("\{cases[c]}: status '\{v.status}', want '\{wantStatus[c]}'")
+    }
+    const g = guard("self-test", moved[c], d, side, false)
+    if g.code != wantRc[c] {
+      bad.push(
+        "\{cases[c]}: must exit \{toString(wantRc[c])}, got rc \{toString(g.code)}",
+      )
+    }
+    if c == 1 && !(findFrom(g.out, "refresh-compiler.sh", 0) >= 0) {
+      bad.push("the differ refusal must name refresh-compiler.sh")
+    }
+    if c == 3 && !(findFrom(g.out, "MOVED", 0) >= 0) {
+      bad.push("the unknown+moved refusal must say what it will not report")
+    }
+    sh("rm", ["-rf", d])
+    c = c + 1
+  }
+  // THE SABOTAGE: a guard that always answered `match` would satisfy the first case by
+  // luck, so break it on purpose and require the specimens to notice.
+  const t = specimen(false, "")
+  const none = t + "/no-sidecar"
+  if guard("sabotage", 3, t, none, true).code != 0 {
+    bad.push("the sabotage did not take effect (guard still refused)")
+  }
+  if guard("control", 3, t, none, false).code != 2 {
+    bad.push("with the real check restored, an unknown+MOVED tree must refuse")
+  }
+  sh("rm", ["-rf", t])
+  if bad.length > 0 {
+    print("seed-provenance self-test FAILED:")
+    for b in bad { print("  " + b) }
+    return 1
+  }
+  print(
+    "seed-provenance self-test ok — match passes, a one-byte source change refuses naming refresh-compiler.sh, and an unknown seed refuses only once a row has MOVED",
+  )
+  0
+}
+
+function main(args: string[]): i32 {
+  if args.length > 0 && args[0] == "--self-test" { return selfTest() }
+  let write = false
+  let seed = SEED
+  let i = 0
+  while i < args.length {
+    if args[i] == "--write" { write = true }
+    if args[i] == "--seed" {
+      if i + 1 >= args.length { die("seed-provenance: --seed needs a path", 2) }
+      seed = args[i + 1]
+    }
+    i = i + 1
+  }
+  if write {
+    const side = seed + ".src"
+    const id = sourceIdentity(ROOT)
+    put(
+      side,
+      "\{id.hash}\n# fnv1a-64 over \{toString(id.files)} compiler/*.vl, `std_hash`'s fold; written by scripts/refresh-compiler.sh\n",
+    )
+    print("wrote \{side} (\{id.hash} over \{toString(id.files)} files)")
+    return 0
+  }
+  const v = check(ROOT, SEED + ".src", false)
+  print(v.line)
+  if v.status == "match" { return 0 }
+  1
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("seed-provenance: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

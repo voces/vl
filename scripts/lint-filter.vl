@@ -1,0 +1,103 @@
+// Grades a `vl check --json` diagnostic dump for scripts/lint-self.sh.
+//
+//     vl run scripts/lint-filter.vl -- <diagnostics.json> [<exempt code> ...]
+//
+// Every finding whose `code` is not in the exempt list is printed as
+// `file:line:col: severity [code] message`; the exit code is 1 when any was kept.
+// The exempt codes are the ones a per-file budget baseline still owes
+// (`vl check --budget <baseline> --exempt-codes`), which that budget row gates itself.
+
+import { IoError, readTextFile } from "std:fs"
+import { Json, JsonError, parseJson } from "std:json"
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join } from "std:str"
+
+type JsonMap = { [string]: Json }
+
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// A string member of a diagnostic, or "" when it is absent or not a string.
+function strOf(d: JsonMap, key: string): string {
+  const v = d[key]
+  if v is string { return v }
+  ""
+}
+// A whole-number member of a diagnostic, or 0.
+function numOf(d: JsonMap, key: string): string {
+  const v = d[key]
+  if v is f64 {
+    const n = v as? i64
+    if n != null { return toString(n) }
+  }
+  "0"
+}
+
+function isExempt(code: string, exempt: string[]): boolean {
+  for e in exempt {
+    if e == code { return true }
+  }
+  false
+}
+
+function main(args: string[]) {
+  if args.length < 1 {
+    die(
+      "lint-filter: usage: lint-filter.vl <diagnostics.json> [<exempt code> ...]",
+      2,
+    )
+    return 0
+  }
+  const exempt: string[] = []
+  let i = 1
+  while i < args.length {
+    exempt.push(args[i])
+    i = i + 1
+  }
+  const text = readTextFile(args[0])
+  if text is IoError {
+    die("lint-filter: cannot read \{args[0]} (\{text.msg})", 2)
+    return 0
+  }
+  if text.length == 0 { return 0 }
+  const rows = parseJson(text)
+  if rows is JsonError {
+    die("lint-filter: \{args[0]} is not JSON: \{rows.msg}", 2)
+    return 0
+  }
+  if !(rows is Json[]) {
+    die("lint-filter: \{args[0]} is not a list of diagnostics", 2)
+    return 0
+  }
+  let kept = 0
+  let held = 0
+  for row in rows {
+    if row is JsonMap {
+      if isExempt(strOf(row, "code"), exempt) {
+        held = held + 1
+      } else {
+        kept = kept + 1
+        print(
+          "\{strOf(row, "file")}:\{numOf(row, "line")}:\{numOf(row, "col")}: \{strOf(row, "severity")} [\{strOf(row, "code")}] \{strOf(row, "message")}",
+        )
+      }
+    }
+  }
+  if held > 0 {
+    print("(\{held} finding(s) held by a budget ratchet: \{join(exempt, " ")})")
+  }
+  if kept > 0 { exit(1) }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("lint-filter: an argument is not UTF-8: \{argv.msg}", 2)
+} else {
+  main(argv)
+}

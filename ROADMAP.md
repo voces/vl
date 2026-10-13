@@ -115,7 +115,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 - ✅ **0. Guard rails against comment sprawl** — DONE with this PR. The
   `comment-block-too-long` (12 lines) and `comment-measurement-uncited` lint rules in
-  `compiler/lint.vl`, the per-file ratchet `scripts/comment-budget.py --check` (in
+  `compiler/lint.vl`, the per-file ratchet `vl check --budget scripts/comment-budget-baseline.json` (in
   `gate.sh` and CI), the baseline `scripts/comment-budget-baseline.json`, and the
   self-lint exemption that deletes itself when the baseline reaches zero. See CLAUDE.md,
   "Comments state the invariant; measurements live in the inventory".
@@ -469,8 +469,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   a `while` bounded by a whole-program table (`P.nodes`, `fnStmts`, `sNames`, `unNames`,
   `uVariants`, `globalStmts`) inside a function that is neither a pass-table row nor
   allow-listed; a scan resuming from a memo is exempt, since that is the fix. 132 stand,
-  ratcheted per file by `scripts/scan-budget.py --check`, which re-derives the pass list
-  from `runEmitPass` so the lint's copy cannot go stale. Byte-identical seed. **STATUS
+  ratcheted per file by `vl check --budget scripts/scan-budget-baseline.json`; the pass list is
+  re-derived from `runEmitPass` by `tests/vl_scan_passes_test.ts`, so the lint's copy cannot go stale. Byte-identical seed. **STATUS
   2026-09-06: ratchet now 88**, moved by #2629, #2654 and #2685. **Merge
   time**: `tests/vl_scaling_shape_test.ts` — seven pairs of the same work reshaped along
   one axis, graded on the TIME RATIO so machine speed and box load cancel. 16–25 s; the

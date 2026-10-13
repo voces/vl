@@ -258,7 +258,8 @@ Deno.test({
           `the written baseline is not this host's:\n${JSON.stringify(row)}`,
         );
       }
-      // A baseline both tools grade CPU against, every run quiet and every bar met.
+      // A baseline both tools grade CPU against, every run quiet and every bar met. RSS is
+      // set far above the stub's ~2 MB, which varies by 10% between runs on its own.
       const doctor = (f: (r: Record<string, unknown>) => void) => {
         const r = JSON.parse(JSON.stringify(row));
         for (const u of [r, r.tail]) {
@@ -266,6 +267,7 @@ Deno.test({
             control_cpu: 100,
             compile_cpu: 100,
             opt_cpu: 100,
+            rss_mb: 100,
           });
         }
         f(r);
