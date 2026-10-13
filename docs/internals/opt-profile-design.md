@@ -299,7 +299,8 @@ either flag set. §7.
 
 - `scripts/vl-host/src/main.rs` — `RELEASE_PASSES` (the flag set), `OPT_PASSES`,
   `BINARYEN_FEATURES` (shared with `--wat` so the binaryen call sites cannot
-  drift), `optimize_in_place`, and `run_once_hot_callees`, which prefixes both rungs with a
+  drift), `optimize_in_place`, and `rung_scan`, whose answer from the compiler's `optRungScan`
+  (`compiler/opt_scan.vl`) prefixes both rungs with a
   `--no-inline=<f>` per hot callee of run-once code (DECISIONS.md, "`-O3` keeps hot callees
   out of run-once code"; pinned by `tests/selfhost_native_release_runonce_test.ts` over
   `tests/fixtures/opt-runonce/`).
