@@ -48,8 +48,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# $PYTHON pins the interpreter gate.sh preflighted; bare `python3` otherwise.
-PY="${PYTHON:-python3}"
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
 [ -f build/vl-compiler.wasm ] || { echo "missing seed: build/vl-compiler.wasm (scripts/refresh-compiler.sh)"; exit 1; }
 
@@ -87,7 +85,7 @@ lint_graded() { # <target> <json path>
     $("$VL" check --budget scripts/comment-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/interp-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/scan-budget-baseline.json --exempt-codes) \
-    $("$PY" scripts/ladder-budget.py --exempt-codes) \
+    $("$VL" check --budget scripts/ladder-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes)
 }
 
