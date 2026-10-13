@@ -491,7 +491,7 @@ is its own class. Populations: `tests/cases` (5,209 programs) and the distilled 
 | class | `tests/cases` before → after rule L | programs | distilled before → after | minimal witness | verdict |
 | --- | --- | --- | --- | --- | --- |
 | **L** a string-literal run the row keeps as its litunion alias beside a non-literal member; the key softens it per member | **448 → 0** | 20 | **28 → 0** | key `string\|string\|i32`, row `K\|i32` (`literal-unions/inferred-join-beside-a-scalar.vl`) | **rule L, this PR** |
-| L′ a litunion alias with no non-literal beside it, or a union OF litunion aliases | 103 | 15 | 0 | key `string\|string\|string`, row `OA\|OB` (`literal-unions/declared-union-of-litunions.vl`); site 29 key `K0`, row `string\|string\|string` (`closures/nulclosure-litunion-map-result.vl`) | stays; a rule from the declaration's members is unmeasured |
+| L′ a litunion alias with no non-literal beside it, or a union OF litunion aliases | 103 | 15 | 0 | key `string\|string\|string`, row `OA\|OB` (`literal-unions/declared-union-of-litunions.vl`); site 29 key `K0`, row `string\|string\|string` (`closures/nulclosure-litunion-map-result.vl`) | stays; rule L′ measured at step 5 and takes U instead, §5 "Step 5" |
 | R a record arm by alias on one side, by shape on the other | 561 | 16 | 64 | row-named 531: key `{c:i32}\|{d:i32}`, row `Cat\|Dog` (`closures/closure-union-param-pin-litunion-first.vl`); key-named 24: key `i32\|R`, row `i32\|{f:i32}` (`generics/gradual-type-parameter-union.vl`); both 6 | stays on the name |
 | N1 the key folds a declared null-LAST union's `null` first | 261 | 1 | 0 | key `null\|{[string]:V}\|V[]\|f64`, row `{[string]:V}\|V[]\|f64\|null` (`unions/twice-narrowed-alias-list-arm-beside-fn-arm.vl`) | stays; rule N1 measured, refused |
 | N1′ the same, plus a second `null` from a nested nullable | 9 | 3 | 0 | key `null\|boolean\|…\|null`, row `boolean\|…\|null` (`types/nullable-over-a-union-that-boxes.vl`) | stays; rule N1′ measured, refused |
@@ -501,7 +501,7 @@ is its own class. Populations: `tests/cases` (5,209 programs) and the distilled 
 | D a numeric literal run softened to repeated scalars | 70 | 22 | 38 | key `i32\|i32\|null`, row `i32\|null` (`closures/inplace-lambda-nullable-union-result.vl`) | stays; rule D measured, refused |
 | G a generic application nested inside a member | 67 | 1 | 0 | key `{v:Box<i32>}\|i32`, row `{v:{v:i32}}\|i32` (`generics/nested-application-union-arm.vl`) | stays (4a miss #4) |
 | A the site offers an ARM, not the union: no key | 173 | 20 | 4 | `closures/closure-array-union-arm-field-call.vl`, `globals/nullable-global-variant-seed-leak.vl` | stays on the name |
-| U no rule set closes it | 32 | 3 | 0 | key six `string`s, row `SU\|EA` (`literal-unions/declared-union-of-litunions.vl`) | unclassified; L′'s neighbourhood |
+| U no rule set closes it | 32 | 3 | 0 | key six `string`s, row `SU\|EA` (`literal-unions/declared-union-of-litunions.vl`) | **32 → 0 by rule L′**, step 5 |
 | **total** | **2,248 → 1,800** | | **205 → 177** | | |
 
 **Rule L — the key regroups a string-literal run into its alias, as the render already does.**
@@ -559,29 +559,71 @@ the same regroup at **0** extra ROWS. The rule works at the call sites, not at t
   refused re-keying (`merge-diffset` 0 → 25).
 * **L′ has no non-literal member to anchor the regroup.** The render keeps a declared union of
   litunion aliases (`SU = SA | SB`) by its member NAMES, and `Kind | "x"` as `Kind | string`.
-  A key built from the declaration's members, the way `declaredStructUnionMembers` reads a
-  struct union, would cover both. It is unmeasured; the next PR can measure it the same way.
+  Step 5 measured a key from the declaration's members, below: it takes U, not L′.
 * **K is D1493.** Its re-keying was refused at `merge-diffset` 0 → 2.
 * **A offers a member type.** No type in scope names the declared union, so it needs a
   narrowed-from link (4b's ~416 class).
 
-**The switch is NOT in this PR, and here is what it needs.** Over both populations after rule L,
-**11 sites read only `agree` and `alias`**:
+### Step 5 — the first switch: 11 seams answer from the key
 
-* `internFuncTypeShapes/valueUnion`, 199 agree and 10 alias;
-* `nliInferIfLet`, 77 agree and 2 alias;
-* `riu/pun`, 75 agree and 1 alias;
-* `riu/refArrayArm`, 26 agree and 1 alias;
-* `inferRetArenaUnionIsDup`, `exprIsUnionStrEq/r`, `collectU/optCallRet`, `riu/nulCloValue`,
-  `nliInferOptChainLet`, `riu/nulCloVariant` and `riu/collapsedName`, 88 reaches together, all
-  `agree`.
+**Which sites.** After rule L, over both populations, 11 sites read only `agree`, `alias` and
+`neither` (no `name-only`, `differ`, `id-only` or `no-ty` reach). `unSiteOnKey` in
+`emit_classify.vl` names them, and each seam answers from `unRowOfKey` there:
 
-The `agree`-only seven can return the id answer and stay module-identical over both corpora by
-construction. The four with an `alias` reach return the FIRST row under the key, a different
-row INDEX, so they need module identity proven, not assumed. Every other site holds at least
-one `name-only`, `differ` or `id-only` reach from the classes above. Of those, `ctr/unionName`
-(771 `id-only`) and `unionNameOfExpr/is` (395) need their `id-only` classified the way this
-section classified `name-only`.
+| site | seam | `tests/cases` reaches | distilled |
+| --- | --- | --- | --- |
+| 8 `internFuncTypeShapes/valueUnion` | mint | 195 agree, 10 alias | 4 agree |
+| 21 `nliInferIfLet` | mint | 77 agree, 2 alias | 0 |
+| 31 `riu/pun` | `isUNameAB` | 73 agree, 1 alias, 64 neither | 2 agree |
+| 40 `riu/refArrayArm` | `isUNameAB` | 24 agree, 1 alias, 2 neither | 2 agree |
+| 9 `inferRetArenaUnionIsDup` | `isUNameAB` | 16 agree, 9 neither | 2 agree |
+| 12 `exprIsUnionStrEq/r` | `unionHasAtomAB` | 18 agree, 1 neither | 0 |
+| 47 `collectU/optCallRet` | mint | 15 agree | 0 |
+| 34 `riu/nulCloValue` | `isUNameKeyAB` | 12 agree, 4 neither | 0 |
+| 22 `nliInferOptChainLet` | mint | 11 agree | 0 |
+| 35 `riu/nulCloVariant` | `isUNameKeyAB` | 3 agree, 5 neither | 0 |
+| 43 `riu/collapsedName` | `isUNameKeyAB` | 1 agree, 5 neither | 0 |
+
+A boolean seam answers "a row carries the key" (`d >= 0`); an `alias` reach is a key-equal
+sibling, so the boolean is the same. A mint seam takes the caller's type
+(`registerValueUnionNameTy(name, ty)`) instead of `declTyIxOfName(name)`, so an `alias` reach
+can change which row a value names. `unionHasAtomAB` walks the key row's recorded atoms. A seam
+with no type, or `isUNameKeyAB` with no key, still answers from the name. Unarmed, a switched
+boolean seam no longer scans `unNames`.
+
+**The proof.** The seven `agree`-only sites are module-identical by construction. The four with
+an `alias` reach (8, 21, 31, 40) are proven, not assumed: `difftree.sh --identity` over
+`tests/cases` and the distilled corpus, 15,100 files, **10,013 modules built, 0 differ, 0
+uncompared**, and the candidate compiling master's source reproduces master's fixpoint. All
+four prove, so all eleven switch. The armed sweep reads the same totals before and after in both
+populations. The seam answer moved, and no reach count did.
+
+**Rule L′, measured and landed.** `declLitUnionAliasMembersOfTy` keys a declared union whose
+members are all litunion aliases or string literals, with at least one alias, by its declared
+member spellings, as its row records them. It reads the declaration through `cFillStmtIx`, one
+lookup. `canonUnionKeyTextOfTy` asks it only when rule L found no run.
+
+| | `tests/cases` before → after | distilled before → after |
+| --- | --- | --- |
+| `name-only` | 1,800 → **1,768** | 177 → **177** |
+| agree | 329,598 → 329,630 | 262,616 → 262,616 |
+| differ / alias / id-only | 68 / 1,974 / 810, unchanged | 0 / 101 / 552, unchanged |
+| `keySweep/tykey-differ` | 47 → 42 | 5 → 5 |
+| `keySweep/merge-diffset` / `merge-diffvar` | 0 / 0 → 0 / 0 | 0 / 0 → 0 / 0 |
+
+The 32 reaches it moved are class U, not class L′: 31 in
+`literal-unions/declared-union-of-litunions.vl` (`ctr/unionName` 13, `emitLetDeclStmt/nli` 6,
+`emitLetDeclStmt/union` 6, `letAnnUnionSlot` 6) and 1 in
+`literal-unions/is-litunion-arm-box-alias-spelling.vl`. Keying an all-literal declaration the
+same way moved nothing, so the rule requires an alias member. L′'s 103 reaches stay. Their key
+side offers the softened literals at a type that names no declaration, so no declaration
+lookup reaches them. With rule L′ the seed is still module-identical: `difftree.sh --identity`,
+0 differ of 10,013 built, and the licence test passes.
+
+**What the next switch needs.** Every other site holds at least one `name-only`, `differ` or
+`id-only` reach from the classes above. Of those, `ctr/unionName` (771 `id-only`) and
+`unionNameOfExpr/is` (395) need their `id-only` classified the way this section classified
+`name-only`.
 
 ## 6. The storage-class ladders
 
