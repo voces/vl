@@ -9485,7 +9485,7 @@ function monoCoerceFnValueName(
     // (a,b) => a + b`, or `const g = named`) — resolve the binding to its lifted slot so an
     // escaping lambda binding materializes at the boundary type too.
     // A reassigned `let` is read as itself: the generic functions written into it take this type.
-    if monoCoerceLetValues(exprIx, ctx, tname, "n:") { return 0 }
+    if monoCoerceWrittenLetValues(exprIx, ctx, tname) { return 0 }
     // An alias of a capture cell's read delivers that cell (D3948).
     if monoCoerceAliasOfCell(exprIx, ctx, tname) { return 0 }
     let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
@@ -9621,21 +9621,62 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   const prev = monoSigCallRet
   monoSigCallRet = nodeTyIxOf(ix)
   monoCellSigByCall = true
-  monoCoerceLetValues(n.callFn, ctx, ct, "n:")
+  monoCoerceWrittenLetValues(n.callFn, ctx, ct)
   monoCellSigByCall = false
   monoSigCallRet = prev
   0
 }
 
-// The `let` bindings `monoCoerceLetValues` is coercing, so a cycle of copies ends.
+// The `let` bindings being coerced, so a cycle of copies ends.
 const monoWrittenLetBusy: i32[] = []
 
-// `monoCoerceLetValues` for the capture cell read at `at` (`d[0]`) that a captured, written `let`
-// becomes: its seed and each `d[0] = v` take type `tname`, and the cell is retyped to the
-// instance (D3939).
+// For the capture cell read at `at` (`d[0]`) that a captured, written `let` becomes: its seed
+// and each live `d[0] = v` take function type `tname`, the cell is retyped to the instance, and
+// answers true (D3939). An annotated cell is taken only when its annotation names a type
+// parameter, whose writes every instance shares deliver at that instance's type (D3957).
 function monoCoerceWrittenCell(at: i32, ctx: i32, tname: string): boolean {
   if annArrowAt(tname) < 1 { return false }
-  monoCoerceLetValues(at, ctx, tname, "c:")
+  const lf = monoCoercibleLet(at, ctx)
+  if lf[1] < 0 { return false }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) { return false }
+  if d.letType >= 0 && !monoCellTyIsOpen(lf[1]) { return false }
+  monoCellSigByCall = false
+  const seed = monoGeneratedCellElem(d.letInit)
+  if seed < 0 { return false }
+  const name = d.letName
+  monoWrittenLetBusy.push(lf[1])
+  monoLastInstFe = -1
+  const took = monoCellValueTake(seed, tname, lf[0])
+  if took == 1 { monoBindSigFail(name) }
+  if took == 2 { monoCellValueFail(name) }
+  if monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
+    const it = monoPinSubTyOf(
+      monoCellElemTyOf(d.letInit, seed),
+      fnStmts[monoLastInstFe],
+    )
+    if monoTyConcreteFn(it) {
+      monoRetypeCell(lf[1], seed, it, monoCellReadsIn(lf[0], lf[1]))
+    }
+  }
+  for i in monoWritesOf("c:", lf[1]) {
+    const nd = P.nodes[i]
+    const wf = monoLetWriteFrame(lf, i)
+    if nd is BinExpr && wf.length == 1 {
+      const wt = monoCellValueTake(nd.binRight, tname, wf[0])
+      if wt == 1 {
+        if wf[0] == lf[0] || !monoFrameIsGenericInstance(lf[0]) {
+          monoBindSigFail(name)
+        } else {
+          monoCellWriterSigFail(name)
+        }
+      } else if wt == 2 {
+        monoCellValueFail(name)
+      }
+    }
+  }
+  monoWrittenLetBusy.pop()
+  true
 }
 
 // The declared generic function the capture cell read at `at` (`d[0]`) is seeded with by name, as
@@ -10005,7 +10046,7 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
   const elemAnn = fty.slice(0, arrow) + "=> " + sig.slice(semi + 1, sig.length)
   for e in lit.arrElems {
     if monoWrittenLetSeedFe(e, ctx) >= 0 {
-      monoCoerceLetValues(unwrapParen(e), ctx, elemAnn, "n:")
+      monoCoerceWrittenLetValues(unwrapParen(e), ctx, elemAnn)
     }
   }
   for w in monoListElemWrites(ctx, d.letName, at) {
@@ -10476,98 +10517,69 @@ function monoAliasCellRead(at: i32, ctx: i32): i32[] {
   none
 }
 
-// For an un-annotated `let` read at `at` (`key` `n:`) that an `=` writes, or a capture cell
-// (`c:`): instances each named generic function its initializer or a write names at function
-// type `tname`, and answers true; false for any other read, which keeps its value (D3930).
-function monoCoerceLetValues(
-  at: i32,
-  ctx: i32,
-  tname: string,
-  key: string,
-): boolean {
+// For an un-annotated `let` read at `at` that an `=` writes: records `tname` as the signature
+// every call and delivery of the binding, and of any binding it is copied into, must share, then
+// instances each named generic function its initializer or a live write names at that type, and
+// answers true; false for any other read, which keeps its value (D3930).
+function monoCoerceWrittenLetValues(at: i32, ctx: i32, tname: string): boolean {
   // Asked of every value read, so the cheap tests come first.
   if annArrowAt(tname) < 1 { return false }
-  if key == "n:" && !fnFlowDeclWritten(at) { return false }
-  const lf = monoReadLetFrame(at, ctx)
-  if lf[1] < 0 || i32ListHas(monoWrittenLetBusy, lf[1]) { return false }
+  if !fnFlowDeclWritten(at) { return false }
+  const lf = monoCoercibleLet(at, ctx)
+  if lf[1] < 0 { return false }
   const d = P.nodes[lf[1]]
-  if !(d is LetDecl) || d.letKw != "let" { return false }
-  const name = d.letName
-  // An annotated cell is coerced here only when its annotation names a type parameter, whose
-  // writes in a closure every instance shares deliver at each instance's own type (D3957).
-  if d.letType >= 0 && !(key == "c:" && monoCellTyIsOpen(lf[1])) {
-    return false
-  }
-  // A written binding holds one value at a time, so every call and delivery of it, and of any
-  // binding it is copied into, must want one signature.
-  if key == "n:" {
-    if monoCellSigByCall { monoCellSigSoft = lf[1] }
-    monoCellSigByCall = false
-    const ok = monoCellSigRecord(lf[1], tname)
-    monoCellSigSoft = -1
-    if !ok {
-      monoBindSigFail(name)
-      return true
-    }
-    if monoCellSigKept { return true }
-  }
+  if !(d is LetDecl) || d.letType >= 0 { return false }
+  if monoCellSigByCall { monoCellSigSoft = lf[1] }
   monoCellSigByCall = false
-  let seed = d.letInit
-  if key == "c:" {
-    seed = monoGeneratedCellElem(d.letInit)
-    if seed < 0 { return false }
+  const ok = monoCellSigRecord(lf[1], tname)
+  monoCellSigSoft = -1
+  if !ok {
+    monoBindSigFail(d.letName)
+    return true
   }
+  if monoCellSigKept { return true }
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
-  if key == "c:" {
-    const took = monoCellValueTake(seed, tname, lf[0])
-    if took == 1 { monoBindSigFail(name) }
-    if took == 2 { monoCellValueFail(name) }
-  } else {
-    monoCoerceNamedGeneric(seed, tname, lf[0])
-  }
-  if key == "c:" && monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
-    const it = monoPinSubTyOf(
-      monoCellElemTyOf(d.letInit, seed),
-      fnStmts[monoLastInstFe],
-    )
-    if monoTyConcreteFn(it) {
-      monoRetypeCell(lf[1], seed, it, monoCellReadsIn(lf[0], lf[1]))
-    }
-  }
-  for i in monoWritesOf(key, lf[1]) {
+  monoCoerceNamedGeneric(d.letInit, tname, lf[0])
+  for i in monoWritesOf("n:", lf[1]) {
     const nd = P.nodes[i]
-    if nd is BinExpr {
-      if monoFrameHolds(lf[0], i) {
-        let wf = lf[0]
-        if lf[0] >= 0 {
-          wf = monoFrameOfNode(i, lf[0])
-        } else {
-          wf = monoTopFrameOf(i)
-        }
-        // A write in a closure nothing names never runs, so it delivers nothing.
-        const dead = wf != lf[0] && monoWriteFrameDead(wf, lf[0])
-        if !dead && monoReadLetFrame(nd.binLeft, wf)[1] == lf[1] {
-          if key == "c:" {
-            const took = monoCellValueTake(nd.binRight, tname, wf)
-            if took == 1 {
-              if wf == lf[0] || !monoFrameIsGenericInstance(lf[0]) {
-                monoBindSigFail(name)
-              } else {
-                monoCellWriterSigFail(name)
-              }
-            } else if took == 2 {
-              monoCellValueFail(name)
-            }
-          } else {
-            monoCoerceNamedGeneric(nd.binRight, tname, wf)
-          }
-        }
-      }
+    const wf = monoLetWriteFrame(lf, i)
+    if nd is BinExpr && wf.length == 1 {
+      monoCoerceNamedGeneric(nd.binRight, tname, wf[0])
     }
   }
   monoWrittenLetBusy.pop()
   true
+}
+
+// The frame and declaration (`monoReadLetFrame`) of the `let` read at `at` in frame `ctx`, when
+// no coercion of that binding is already under way; `[-1, -1]` otherwise.
+function monoCoercibleLet(at: i32, ctx: i32): i32[] {
+  const none: i32[] = [-1, -1]
+  const lf = monoReadLetFrame(at, ctx)
+  if lf[1] < 0 || i32ListHas(monoWrittenLetBusy, lf[1]) { return none }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letKw != "let" { return none }
+  lf
+}
+
+// The frame write `i` runs in, as a one-element list, when it is an `=` to the binding `lf`
+// (`monoReadLetFrame`) names, in a frame that holds it and can run; empty otherwise. A write in a
+// closure nothing names never runs, so it delivers nothing.
+function monoLetWriteFrame(lf: i32[], i: i32): i32[] {
+  const none: i32[] = []
+  const nd = P.nodes[i]
+  if !(nd is BinExpr) || !monoFrameHolds(lf[0], i) { return none }
+  let wf = lf[0]
+  if lf[0] >= 0 {
+    wf = monoFrameOfNode(i, lf[0])
+  } else {
+    wf = monoTopFrameOf(i)
+  }
+  if wf != lf[0] && monoWriteFrameDead(wf, lf[0]) { return none }
+  if monoReadLetFrame(nd.binLeft, wf)[1] != lf[1] { return none }
+  const out: i32[] = [wf]
+  out
 }
 
 // Whether the capture cell declared at `di` holds, in its generic template (an instance's copy
@@ -12846,7 +12858,7 @@ function monoWalk(ix: i32, ctx: i32) {
               const prev = monoSigCallRet
               monoSigCallRet = nodeTyIxOf(ix)
               monoCellSigByCall = true
-              monoCoerceLetValues(wlAt, wlFr, ctn, "n:")
+              monoCoerceWrittenLetValues(wlAt, wlFr, ctn)
               monoCellSigByCall = false
               monoSigCallRet = prev
             }
