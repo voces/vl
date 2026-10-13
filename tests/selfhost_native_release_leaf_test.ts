@@ -19,6 +19,7 @@ import {
   logsOf,
   ROOT,
   rustList,
+  vlList,
   vl,
   WASM_DIS,
   WASM_OPT,
@@ -85,7 +86,7 @@ Deno.test({
       );
       const features = rustList(mainRs, "BINARYEN_FEATURES");
       if (
-        !rustList(mainRs, "OPT_PASSES").includes(
+        !vlList("OPT_PASSES").includes(
           "--always-inline-max-function-size",
         )
       ) {

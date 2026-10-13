@@ -85,7 +85,7 @@ const FEATURES = [
   "--enable-tail-call",
 ];
 
-/** The host's `vl build -O3` flag set (`main.rs` RELEASE_PASSES). */
+/** The `vl build -O3` flag set (`compiler/opt_scan.vl` RELEASE_PASSES). */
 const RELEASE = ["--closed-world", "-O3", "--gufa", "-O3"];
 
 const run = async (cmd: string, args: string[]): Promise<string> => {
