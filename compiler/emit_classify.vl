@@ -126,6 +126,7 @@ import {
   litUnionInlineNameOfTy,
   luDeclPosOf,
   mapDeliveryRecorded,
+  mapKeyKindOfTy,
   mapRetagAllRows,
   mapTyValIsBool,
   mapTyValIsLitUnion,
@@ -16649,14 +16650,422 @@ function joinedRecordRowOf(ix: i32): i32 {
 }
 
 // The struct row of the joined record `ty`: its own arena row, else the row an equal join
-// elsewhere interned under the same spelling, which is the one row both are built at.
+// elsewhere interned, else the row `structIndexOfTypeName`'s field-set scan picks for it.
 function joinRowOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   const r = structIndexOfTy(ty)
   if r >= 0 { return r }
-  const nm = tyToEmitName(ty)
-  if nm == "" { return -1 }
-  structIndexOfTypeName(nm)
+  joinRowScanOfTy(ty)
+}
+
+// `structIndexOfTypeName` asked of the record type `ty` rather than of its render: a shape row
+// interned for an equal type, else the field-set scan at the same three leniencies. -1 for a
+// type that is not a record with at least one field.
+function joinRowScanOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return -1 }
+  const ftys = t.objFieldTypes
+  if ftys.length == 0 { return -1 }
+  const wants: i32[] = []
+  for f in ftys { wants.push(jrWantOf(f)) }
+  const strict = jrScanK(ty, t.objFieldNames, ftys, wants, 0)
+  if strict >= 0 { return strict }
+  const box = jrScanK(ty, t.objFieldNames, ftys, wants, 1)
+  if box >= 0 { return box }
+  jrScanK(ty, t.objFieldNames, ftys, wants, 2)
+}
+
+// `shapeRowScanK` over field types, at the same three leniencies and with the same strict-pass
+// preference and unique-claimant rule. The strict pass first takes a row interned under a shape
+// spelling for a type equal to `ty`, as the name scan first looks its spelling up.
+function jrScanK(
+  ty: i32,
+  fnames: string[],
+  ftys: i32[],
+  wants: i32[],
+  lenient: i32,
+): i32 {
+  let uniq = -1
+  let fit = -1
+  let nHit = 0
+  let si = 0
+  const lim = sScanLim()
+  while si < lim {
+    if lenient == 0 && jrIsShapeRowOf(si, ty) { return si }
+    // A row whose field rows are still being appended is skipped, as the name scan does.
+    if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
+      si = si + 1
+      continue
+    }
+    if (lenient > 0 || fit < 0) && sFieldCount[si] == fnames.length {
+      let ok = true
+      let k = 0
+      while ok && k < fnames.length {
+        const fj = sFieldIndex(si, fnames[k])
+        if fj < 0 { ok = false }
+        else if !jrFieldFits(ftys[k], wants[k], si, fj, lenient) { ok = false }
+        else if !declRowFnFieldFits(ftys[k], si, fnames[k]) { ok = false }
+        k = k + 1
+      }
+      if ok {
+        if lenient == 0 {
+          if jrCode0Fits(fnames, ftys, si) { fit = si }
+          if uniq < 0 { uniq = si }
+        } else {
+          if lenient < 2 { return si }
+          if uniq < 0 { uniq = si }
+          nHit = nHit + 1
+        }
+      }
+    }
+    si = si + 1
+  }
+  if lenient == 0 {
+    if fit >= 0 { return fit }
+    return uniq
+  }
+  if lenient >= 2 {
+    if nHit == 1 { return uniq }
+  }
+  -1
+}
+
+// Whether row `si` is interned under a shape spelling and records a type equal to `ty`.
+function jrIsShapeRowOf(si: i32, ty: i32): boolean {
+  if si >= sTyIx.length || sTyIx[si] < 0 { return false }
+  const nm = sNames[si]
+  nm.length > 0 && nm[0] == '{' && tySame(sTyIx[si], ty)
+}
+
+// The field code `nameFieldCode` gives the spelling a record renders for its field of type `f`,
+// or -1 for a spelling that ladder does not code.
+function jrWantOf(f: i32): i32 {
+  if f < 0 || f >= T.tys.length { return -1 }
+  // A literal union renders its members inline inside a record, the string slot; its list is
+  // the atom list.
+  if tyIsLitUnion(f) { return FC_STR }
+  if tyIsLitUnionArray(f) { return FC_I32_LIST }
+  const t = T.tys[f]
+  // Exhaustive over `Ty` and `_`-less: each arm is the rung of the spelling ladder its render
+  // reaches.
+  match t {
+    TyPrim => {
+      return jrPrimCode(t.primName)
+    }
+    TyLit => {
+      const bt = T.tys[litBaseTy(t)]
+      if bt is TyPrim { return jrPrimCode(bt.primName) }
+      return -1
+    }
+    TyFunc => {
+      return FC_CLOSURE
+    }
+    TyMap => {
+      return FC_MAP
+    }
+    TyArray => {
+      return jrListCode(f, FC_REF_LIST)
+    }
+    TyNullable | TyUnion => {
+      return jrUnionWantOf(f)
+    }
+    TyErr | TyObj | TyVar | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// The field code of a field spelled as the primitive `p`, -1 for one the ladder does not code.
+function jrPrimCode(p: PrimName): i32 {
+  match p {
+    "i32" | "boolean" => {
+      return FC_I32
+    }
+    "f64" => {
+      return FC_F64
+    }
+    "i64" => {
+      return FC_I64
+    }
+    "f32" => {
+      return FC_F32
+    }
+    "string" => {
+      return FC_STR
+    }
+    "v128" | "void" | "null" | "never" | "u8" => {
+      return -1
+    }
+  }
+}
+
+// The list code the descriptor gives the list type `f`, else `dflt`.
+function jrListCode(f: i32, dflt: i32): i32 {
+  const d = repOfTy(f)
+  if d.rdCovered == 0 { return dflt }
+  const c = fieldCodeOfListRep(d.rdKind)
+  if c >= 0 { return c }
+  dflt
+}
+
+// `jrWantOf` for a nullable or a union: a niche where one member and `null` make one, the box
+// for a value union, and -1 for a union the ladder does not code.
+function jrUnionWantOf(f: i32): i32 {
+  const ms: i32[] = []
+  const hasNull = jrFlatMembers(f, ms)
+  if hasNull && ms.length > 1 {
+    // Literal members beside `null` with nothing else spell the nullable literal union.
+    let allLit = true
+    for m in ms {
+      const lt = T.tys[m]
+      if lt is TyLit {
+        if lt.litKind != "str" { allLit = false }
+      } else {
+        allLit = false
+      }
+    }
+    if allLit { return FC_NUL_LIT_UNION }
+  }
+  if hasNull && ms.length == 1 {
+    const m = ms[0]
+    if tyIsLitUnion(m) { return FC_NUL_LIT_UNION }
+    const mt = T.tys[m]
+    // Exhaustive over `Ty` and `_`-less: the niche each single member makes with `null`.
+    match mt {
+      TyPrim => {
+        if mt.primName == "string" { return FC_NUL_STR }
+        if mt.primName == "boolean" { return FC_NUL_BOOL }
+      }
+      TyFunc => {
+        return FC_NUL_CLOSURE
+      }
+      TyArray => {
+        if tyIsLitUnionArray(m) { return FC_NUL_I32_LIST }
+        return jrListCode(jrNullableOf(f, m), -1)
+      }
+      TyMap => {
+        if mapTyValKindLowerable(m) { return FC_NUL_MAP }
+        return -1
+      }
+      TyObj => {
+        return -1
+      }
+      TyErr | TyNullable | TyUnion | TyVar | TyLit | TyNeg => {
+        // No niche of its own; the box test below answers.
+      }
+    }
+  }
+  if isValueUnionTyOr(f) == 1 { return FC_UNION }
+  -1
+}
+
+// The nullable type `f` is when it wraps member `m` directly, else -1.
+function jrNullableOf(f: i32, m: i32): i32 {
+  const t = T.tys[f]
+  if t is TyNullable {
+    if t.nInner == m { return f }
+  }
+  -1
+}
+
+// Appends the non-null members `f` renders, in render order with structurally equal ones
+// dropped, and answers whether it carries `null`.
+function jrFlatMembers(f: i32, out: i32[]): boolean {
+  const seq: i32[] = []
+  jrMemberSeq(f, seq)
+  let n = false
+  for m in seq {
+    if m == JR_NULL { n = true } else { out.push(m) }
+  }
+  n
+}
+
+// The members `f` renders in order, `null` as `JR_NULL`, for comparing two box layouts.
+function jrMemberSeq(f: i32, out: i32[]) {
+  if f < 0 || f >= T.tys.length { return 0 }
+  const t = T.tys[f]
+  // Exhaustive over `Ty` and `_`-less: only a nullable, a union that is not a literal union and
+  // `null` itself are not one member.
+  match t {
+    TyNullable => {
+      jrMemberSeq(t.nInner, out)
+      return jrSeqPush(JR_NULL, out)
+    }
+    TyUnion => {
+      // A literal union is one member, as its render names it.
+      if tyIsLitUnion(f) { return jrSeqPush(f, out) }
+      for m in t.uMembers { jrMemberSeq(m, out) }
+      return 0
+    }
+    TyPrim => {
+      if t.primName == "null" { return jrSeqPush(JR_NULL, out) }
+      return jrSeqPush(f, out)
+    }
+    TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return jrSeqPush(f, out)
+    }
+  }
+}
+
+// The member-sequence entry for `null`, which is no arena index.
+const JR_NULL = -9
+
+// Appends member `f` unless an equal member is already in `out`.
+function jrSeqPush(f: i32, out: i32[]) {
+  for q in out {
+    if jrSameMember(q, f) { return 0 }
+  }
+  out.push(f)
+  0
+}
+
+function jrSameMember(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return a == b }
+  tySame(a, b)
+}
+
+// Whether field type `f`, of render code `want`, may sit at row `si`'s field `fj` at leniency
+// `lenient`: `shapeFieldTypeCompatK` asked of the type.
+function jrFieldFits(
+  f: i32,
+  want: i32,
+  si: i32,
+  fj: i32,
+  lenient: i32,
+): boolean {
+  const code = sFieldTypeAt(si, fj)
+  const elem = sFieldElemNameAt(si, fj)
+  if want < 0 || code < 0 {
+    if code == FC_STRUCT && elem != "" {
+      return jrCanonFits(nonNullTy(f), si, fj)
+    }
+    // A record field is a struct field, or a box's arm on the lenient pass only.
+    if code >= 0 && jrIsRecord(f) {
+      return code == FC_STRUCT || (code == FC_UNION && lenient >= 1)
+    }
+    return true
+  }
+  if want != code {
+    if lenient >= 1 && code == FC_UNION { return true }
+    if lenient >= 2 {
+      if want == FC_I32 {
+        if code == FC_I64 || code == FC_F32 || code == FC_NUL_LIT_UNION {
+          return true
+        }
+        // Only a field spelled `boolean` widens into the `boolean | null` niche.
+        if code == FC_NUL_BOOL { return jrIsBoolean(f) }
+      }
+      if want == FC_STR {
+        if code == FC_NUL_STR || code == FC_NUL_LIT_UNION { return true }
+        if code == FC_I32 { return elem != "" }
+      }
+    }
+    // A function returning a nullable renders without grouping, as the nullable closure does.
+    if code == FC_NUL_CLOSURE && want == FC_CLOSURE {
+      return jrRetIsNullable(f)
+    }
+    return false
+  }
+  if elem == "" { return true }
+  if want == FC_I32 { return !elemIsLitUnion(elem) }
+  if want == FC_I32_LIST {
+    return tyIsLitUnionArray(f) == nameIsLitUnionArray(elem)
+  }
+  if want == FC_MAP || want == FC_NUL_MAP { return jrMapValFits(f, si, fj) }
+  if want == FC_UNION { return jrBoxFits(f, si, fj) }
+  if want == FC_REF_LIST || want == FC_NUL_REF_LIST {
+    const at = T.tys[nonNullTy(f)]
+    if at is TyArray { return jrCanonFits(at.aElem, si, fj) }
+  }
+  true
+}
+
+// Whether `f`, or the type under its `| null`, is a record.
+function jrIsRecord(f: i32): boolean {
+  const b = nonNullTy(f)
+  b >= 0 && T.tys[b] is TyObj
+}
+
+// Whether `f` renders as `boolean`.
+function jrIsBoolean(f: i32): boolean {
+  const t = T.tys[f]
+  t is TyPrim && t.primName == "boolean"
+}
+
+// Whether the function type `f` returns a nullable.
+function jrRetIsNullable(f: i32): boolean {
+  const t = T.tys[f]
+  if t is TyFunc {
+    const ms: i32[] = []
+    return jrFlatMembers(t.fnRet, ms)
+  }
+  false
+}
+
+// Whether type `a` and row `si`'s field `fj` target are not proven distinct: their canonical
+// identities, the row's read off its element type and then off its element name.
+function jrCanonFits(a: i32, si: i32, fj: i32): boolean {
+  if a < 0 || tyHasTyVar(a) { return true }
+  const ka = repCanonId(a)
+  if ka < 0 { return true }
+  const et = sFieldElemTyIxAt(si, fj)
+  if et >= 0 && !tyHasTyVar(et) { return repCanonId(et) == ka }
+  const elem = sFieldElemNameAt(si, fj)
+  if elem == "" { return true }
+  let ke = repNameCanonId(elem)
+  if ke < 0 { ke = rowCanonIdOfName(elem) }
+  if ke < 0 { return true }
+  ka == ke
+}
+
+// Whether box field `f` and row `si`'s box field `fj` box the same member sequence, which is
+// the box's tag layout; true where the row's is unknown.
+function jrBoxFits(f: i32, si: i32, fj: i32): boolean {
+  const et = sFieldElemTyIxAt(si, fj)
+  if et < 0 { return true }
+  const qs: i32[] = []
+  const rs: i32[] = []
+  jrMemberSeq(f, qs)
+  jrMemberSeq(et, rs)
+  if qs.length != rs.length { return false }
+  let i = 0
+  while i < qs.length {
+    if !jrSameMember(qs[i], rs[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Whether map field `f` and row `si`'s map field `fj` store their values at one rep.
+function jrMapValFits(f: i32, si: i32, fj: i32): boolean {
+  const mt = T.tys[nonNullTy(f)]
+  if !(mt is TyMap) { return true }
+  const sa = mvSlotOfValTyK(mt.mVal, mapKeyKindOfTy(mt.mKey))
+  const sb = mvSlotOfMapValNameOrMono(sFieldElemNameAt(si, fj))
+  if sa >= 0 && sb >= 0 { return mvCanonRepOf(sa) == mvCanonRepOf(sb) }
+  true
+}
+
+// Whether a field shaped `{…, n: i32}` or `{…, n: boolean}` meets that same code-0 kind in row
+// `si`'s own type for every such field — `code0SpellingFitsRow` asked of field types.
+function jrCode0Fits(fnames: string[], ftys: i32[], si: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  let k = 0
+  while k < fnames.length {
+    let tk = 0
+    const ft = T.tys[ftys[k]]
+    if ft is TyPrim {
+      if ft.primName == "i32" { tk = 1 }
+      if ft.primName == "boolean" { tk = 2 }
+    }
+    if tk != 0 {
+      const rk = rowFieldCode0Kind(si, fnames[k])
+      if rk != 0 && rk != tk { return false }
+    }
+    k = k + 1
+  }
+  true
 }
 
 // Whether the non-literal record arm `tv` of a join built at struct row `slot` is built at a row
@@ -22902,7 +23311,7 @@ function shapeFieldTypeCompatK(
     // litunion-atom slots): a `{f: K0}` spelling must not adopt a plain row (a member
     // literal would emit as a string into an i32 slot), and a plain spelling must not
     // adopt an atom row (ids read back as booleans). Both sides decidable, proven-mismatch only.
-    if nameIsLitUnionType(t) != nameIsLitUnionType(elem) { return false }
+    if nameIsLitUnionType(t) != elemIsLitUnion(elem) { return false }
     return true
   }
   if want == FC_I32_LIST {
@@ -22938,6 +23347,9 @@ function shapeFieldTypeCompatK(
   }
   true
 }
+
+// Whether a row's recorded field type-name `elem` is a literal union.
+function elemIsLitUnion(elem: string): boolean { nameIsLitUnionType(elem) }
 
 // True unless the two nested-struct type spellings `ta` / `elem` are proven to denote
 // distinct structures: both resolve through the checker's canonical structural key
