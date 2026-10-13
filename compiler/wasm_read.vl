@@ -1,0 +1,288 @@
+// A reader over a wasm module's bytes: LEB128 and name reads, value, heap and block
+// types, and an instruction decoder that knows the immediates of every operator the
+// `-O` pipeline's modules carry (MVP, GC, SIMD, threads, bulk memory, exceptions).
+// The optimizer's passes read their input through it (docs/internals/optimizer-in-vl.md).
+// A truncated, over-long or unknown encoding sets the cursor's `failed` and moves it to
+// the end, so a reader loop stops instead of trapping; callers test `failed` once.
+
+// A cursor over `b[pos .. end)`. `imm` is the index immediate of the last decoded call,
+// `return_call` or `ref.func`.
+export type WasmCursor = {
+  b: u8[],
+  pos: i32,
+  end: i32,
+  failed: boolean,
+  imm: i32,
+}
+
+export function wcNew(b: u8[], pos: i32, end: i32): WasmCursor {
+  { b: b, pos: pos, end: end, failed: false, imm: 0 }
+}
+
+// Marks the cursor failed and exhausted; returns 0 so a reader can `return wcFail(c)`.
+export function wcFail(c: WasmCursor): i32 {
+  c.failed = true
+  c.pos = c.end
+  0
+}
+
+// The next byte, or 0 with the cursor failed past the end.
+export function wcByte(c: WasmCursor): i32 {
+  if c.pos >= c.end || c.pos < 0 { return wcFail(c) }
+  const v: i32 = c.b[c.pos]
+  c.pos = c.pos + 1
+  v
+}
+
+// Advances `n` bytes; fails when fewer than `n` remain.
+export function wcSkip(c: WasmCursor, n: i32): i32 {
+  if n < 0 || n > c.end - c.pos { return wcFail(c) }
+  c.pos = c.pos + n
+  0
+}
+
+// An unsigned LEB128 of at most 32 bits. A value above 2^31 - 1 reads negative, which no
+// index or count of a module this reader is given reaches.
+export function wcU32(c: WasmCursor): i32 {
+  let result = 0
+  let shift = 0
+  while !c.failed {
+    const byte = wcByte(c)
+    if shift == 28 && (byte & 0x70) != 0 { return wcFail(c) }
+    result = result | ((byte & 0x7f) << shift)
+    if (byte & 0x80) == 0 { return result }
+    shift = shift + 7
+    if shift > 28 { return wcFail(c) }
+  }
+  0
+}
+
+// Skips a LEB128 of either signedness and at most 64 bits (s32, s33, s64, u64).
+export function wcSkipLeb(c: WasmCursor): i32 {
+  let n = 0
+  while !c.failed {
+    const byte = wcByte(c)
+    n = n + 1
+    if (byte & 0x80) == 0 { return 0 }
+    if n >= 10 { return wcFail(c) }
+  }
+  0
+}
+
+// A heap type: an abstract one-byte shorthand, a type index, or `exact` and an index.
+export function wcHeapType(c: WasmCursor): i32 {
+  if c.pos < c.end && c.b[c.pos] == 0x62 { c.pos = c.pos + 1 }
+  wcSkipLeb(c)
+}
+
+// A value type: a number, vector or abstract reference shorthand, or `ref [null] <heap>`.
+export function wcValType(c: WasmCursor): i32 {
+  const b = wcByte(c)
+  if b == 0x63 || b == 0x64 { return wcHeapType(c) }
+  if b < 0x68 || b > 0x7f { return wcFail(c) }
+  0
+}
+
+// A block type: empty, one value type, or a type index (an s33).
+export function wcBlockType(c: WasmCursor): i32 {
+  if c.pos < c.end && (c.b[c.pos] == 0x63 || c.b[c.pos] == 0x64) {
+    c.pos = c.pos + 1
+    return wcHeapType(c)
+  }
+  wcSkipLeb(c)
+}
+
+// A memory immediate: alignment flags, a memory index when flag bit 6 is set, an offset.
+export function wcMemArg(c: WasmCursor): i32 {
+  const flags = wcU32(c)
+  if (flags & 0x40) != 0 { wcU32(c) }
+  wcSkipLeb(c)
+}
+
+// Decodes one instruction and its immediates. Returns the opcode byte for a one-byte
+// operator and `(prefix << 16) | sub` for a prefixed one; sets `imm` for `call` (0x10),
+// `return_call` (0x12) and `ref.func` (0xd2). An unknown operator fails the cursor.
+export function wcOp(c: WasmCursor): i32 {
+  const op = wcByte(c)
+  if c.failed { return -1 }
+  if op == 0x10 || op == 0x12 || op == 0xd2 {
+    c.imm = wcU32(c)
+    return op
+  }
+  if (
+    op <= 0x01
+    || op == 0x05
+    || op == 0x0a
+    || op == 0x0b
+    || op == 0x0f
+    || op == 0x19
+  ) {
+    return op
+  }
+  if op >= 0x02 && op <= 0x04 || op == 0x06 { wcBlockType(c); return op }
+  if (
+    op >= 0x07 && op <= 0x09
+    || op >= 0x0c && op <= 0x0d
+    || op >= 0x14 && op <= 0x15
+  ) {
+    wcU32(c)
+    return op
+  }
+  if op == 0x0e { wcBrTable(c); return op }
+  if op == 0x11 || op == 0x13 { wcU32(c); wcU32(c); return op }
+  if op == 0x18 { wcU32(c); return op }
+  if op >= 0x1a && op <= 0x1c || op == 0x1f { return wcOpSelectTry(c, op) }
+  if op >= 0x20 && op <= 0x26 { wcU32(c); return op }
+  if op >= 0x28 && op <= 0x3e { wcMemArg(c); return op }
+  if op == 0x3f || op == 0x40 { wcU32(c); return op }
+  if op == 0x41 || op == 0x42 { wcSkipLeb(c); return op }
+  if op == 0x43 { wcSkip(c, 4); return op }
+  if op == 0x44 { wcSkip(c, 8); return op }
+  if op >= 0x45 && op <= 0xc4 { return op }
+  if op == 0xd0 { wcHeapType(c); return op }
+  if op == 0xd1 || op == 0xd3 || op == 0xd4 { return op }
+  if op == 0xd5 || op == 0xd6 { wcU32(c); return op }
+  if op == 0xfb { return wcOpGc(c) }
+  if op == 0xfc { return wcOpMisc(c) }
+  if op == 0xfd { return wcOpSimd(c) }
+  if op == 0xfe { return wcOpAtomic(c) }
+  wcFail(c)
+  -1
+}
+
+// `br_table`: a vector of labels, then the default label.
+function wcBrTable(c: WasmCursor): i32 {
+  const n = wcU32(c)
+  let i = 0
+  while i <= n && !c.failed {
+    wcU32(c)
+    i = i + 1
+  }
+  0
+}
+
+// `drop` and `select` take nothing; `select t*` a vector of value types; `try_table` a
+// block type and a vector of catch clauses (a kind, a tag for kinds 0 and 1, a label).
+function wcOpSelectTry(c: WasmCursor, op: i32): i32 {
+  if op == 0x1a || op == 0x1b { return op }
+  if op == 0x1c {
+    const n = wcU32(c)
+    let i = 0
+    while i < n && !c.failed {
+      wcValType(c)
+      i = i + 1
+    }
+    return op
+  }
+  wcBlockType(c)
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const kind = wcByte(c)
+    if kind > 3 { return wcFail(c) }
+    if kind <= 1 { wcU32(c) }
+    wcU32(c)
+    i = i + 1
+  }
+  op
+}
+
+// The 0xfb (GC) family, sub-opcodes 0 to 30.
+function wcOpGc(c: WasmCursor): i32 {
+  const sub = wcU32(c)
+  const code = (0xfb << 16) | sub
+  if sub <= 1 || sub == 6 || sub == 7 || sub >= 11 && sub <= 14 || sub == 16 {
+    wcU32(c)
+    return code
+  }
+  if sub >= 2 && sub <= 5 || sub >= 8 && sub <= 10 || sub >= 17 && sub <= 19 {
+    wcU32(c)
+    wcU32(c)
+    return code
+  }
+  if sub == 15 || sub >= 26 && sub <= 30 { return code }
+  if sub >= 20 && sub <= 23 { wcHeapType(c); return code }
+  if sub == 24 || sub == 25 {
+    wcByte(c)
+    wcU32(c)
+    wcHeapType(c)
+    wcHeapType(c)
+    return code
+  }
+  wcFail(c)
+  -1
+}
+
+// The 0xfc family: saturating truncations, bulk memory and table operators.
+function wcOpMisc(c: WasmCursor): i32 {
+  const sub = wcU32(c)
+  const code = (0xfc << 16) | sub
+  if sub <= 7 { return code }
+  if sub == 8 || sub == 10 || sub == 12 || sub == 14 {
+    wcU32(c)
+    wcU32(c)
+    return code
+  }
+  if sub == 9 || sub == 11 || sub == 13 || sub >= 15 && sub <= 17 {
+    wcU32(c)
+    return code
+  }
+  wcFail(c)
+  -1
+}
+
+// The 0xfd (SIMD) family, relaxed SIMD included.
+function wcOpSimd(c: WasmCursor): i32 {
+  const sub = wcU32(c)
+  const code = (0xfd << 16) | sub
+  if sub <= 11 || sub == 92 || sub == 93 { wcMemArg(c); return code }
+  if sub == 12 || sub == 13 { wcSkip(c, 16); return code }
+  if sub >= 21 && sub <= 34 { wcByte(c); return code }
+  if sub >= 84 && sub <= 91 {
+    wcMemArg(c)
+    wcByte(c)
+    return code
+  }
+  if sub <= 0xff || sub >= 0x100 && sub <= 0x113 { return code }
+  wcFail(c)
+  -1
+}
+
+// The 0xfe (threads) family: `atomic.fence` takes one reserved byte, the rest a memarg.
+function wcOpAtomic(c: WasmCursor): i32 {
+  const sub = wcU32(c)
+  const code = (0xfe << 16) | sub
+  if sub == 3 { wcByte(c); return code }
+  if sub <= 2 || sub >= 0x10 && sub <= 0x4e { wcMemArg(c); return code }
+  wcFail(c)
+  -1
+}
+
+// Skips a constant expression through its closing `end`, appending the index of every
+// `ref.func` in it to `funcs`.
+export function wcConstExpr(c: WasmCursor, funcs: i32[]): i32 {
+  let depth = 0
+  while !c.failed {
+    const op = wcOp(c)
+    if op == 0xd2 { funcs.push(c.imm) }
+    if op >= 0x02 && op <= 0x04 || op == 0x06 || op == 0x1f {
+      depth = depth + 1
+    }
+    if op == 0x0b {
+      if depth == 0 { return 0 }
+      depth = depth - 1
+    }
+  }
+  0
+}
+
+// Checks the 8-byte preamble: magic `\0asm` and version 1.
+export function wcPreamble(c: WasmCursor): i32 {
+  const want = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+  let i = 0
+  while i < 8 {
+    if wcByte(c) != want[i] { return wcFail(c) }
+    i = i + 1
+  }
+  0
+}

@@ -6400,6 +6400,71 @@ fn rung_scan(bytes: &[u8]) -> (Vec<String>, Vec<&'static str>) {
     (run_once_hot_callees(&s), extra)
 }
 
+/// `rung_scan`, read by whichever side `$VL_OPT_RUNG_SCAN` names: unset or `rust` the host,
+/// `vl` the compiler's `optRungScan` (`compiler/opt_scan.vl`), and `both` runs the two and
+/// fails the build when they disagree — the parity oracle of rung R1 in
+/// `docs/internals/optimizer-in-vl.md`, which retires the host's side once it holds.
+fn rung_scan_selected(
+    bytes: &[u8],
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let host = || {
+        let (names, extra) = rung_scan(bytes);
+        (
+            names,
+            extra.into_iter().map(String::from).collect::<Vec<_>>(),
+        )
+    };
+    match std::env::var("VL_OPT_RUNG_SCAN")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" | "rust" => Ok(host()),
+        "vl" => vl_rung_scan(bytes, engine, compiler),
+        "both" => {
+            let h = host();
+            let v = vl_rung_scan(bytes, engine, compiler)?;
+            if h != v {
+                bail!("rung scan parity: the host read {h:?}, the compiler read {v:?}");
+            }
+            Ok(h)
+        }
+        other => bail!("unknown $VL_OPT_RUNG_SCAN `{other}` (rust | vl | both)"),
+    }
+}
+
+/// The compiler's reading of the rung's input, on a fresh instance: the module staged
+/// through `optInLoad`, the answer read back from `optOut` — the extra pass on its first
+/// line, one `--no-inline` name per later line.
+fn vl_rung_scan(
+    bytes: &[u8],
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (mut store, inst) = load_compiler(engine, compiler)?;
+    let reset = inst.get_typed_func::<(), i32>(&mut store, "optInReset")?;
+    let load = inst.get_typed_func::<i32, i32>(&mut store, "optInLoad")?;
+    let scan = inst.get_typed_func::<(), i32>(&mut store, "optRungScan")?;
+    let mem = io_mem(&mut store, &inst)
+        .ok_or_else(|| Error::msg("the compiler exports no staging memory for optInLoad"))?;
+    reset.call(&mut store, ())?;
+    let cap = mem.data_size(&store).max(1);
+    for chunk in bytes.chunks(cap) {
+        mem.write(&mut store, 0, chunk)?;
+        load.call(&mut store, chunk.len() as i32)?;
+    }
+    scan.call(&mut store, ())?;
+    let text = StrOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+    let mut lines = text.split('\n');
+    let extra = lines
+        .next()
+        .filter(|l| !l.is_empty())
+        .map(|l| vec![l.to_string()])
+        .unwrap_or_default();
+    Ok((lines.map(String::from).collect(), extra))
+}
+
 /// The binaryen names of the functions `-O`/`-O3` must NOT inline, because the only code
 /// that calls them runs once and calls them from inside a loop.
 ///
@@ -10633,7 +10698,18 @@ fn build_cmd(args: &[String]) -> Result<()> {
         let map = map_path.as_deref();
         let rows_in = map_rows.take();
         // The chain is a function of these and of `bytes` (stage S2's key); a hit skips it.
-        let options = format!("{flag}\0{names}\0{low_memory:?}\0{stable_layout}");
+        // A rung the compiler answers (`rung_scan_selected`) makes the seed one of them too.
+        let seed_reads = matches!(
+            std::env::var("VL_OPT_RUNG_SCAN").as_deref(),
+            Ok("vl" | "both")
+        );
+        let mut options = format!("{flag}\0{names}\0{low_memory:?}\0{stable_layout}");
+        if seed_reads {
+            let seed = compiler_hash(&compiler)
+                .map(|h| hex(&h))
+                .unwrap_or_default();
+            options.push_str(&format!("\0{seed}"));
+        }
         let action = opt_cache_action(
             &bytes,
             options,
@@ -10719,8 +10795,11 @@ fn build_cmd(args: &[String]) -> Result<()> {
             if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
                 passes.insert(0, "--low-memory-unused");
             }
-            let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
-            passes.extend(extra);
+            let (no_inline, extra) = phase!(
+                "opt.run_once_scan",
+                rung_scan_selected(rung_input, &compile_engine, &compiler)
+            )?;
+            passes.extend(extra.iter().map(String::as_str));
             phase!(
                 "opt.rung",
                 optimize_in_place(&sink_str, flag, &passes, &no_inline, map)
