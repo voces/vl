@@ -1,9 +1,9 @@
-// The function-value flow table in shadow mode (`docs/internals/fn-value-flow-design.md` §(f)
-// step 1). Before `monomorphize` it unions the checked tree's bindings into classes, each holding
-// the functions that may flow into it (sources) and the signatures it is called or annotated at
-// (pins); after the last pass it grades every function value the monomorphizer decided against
-// its class, and counts the verdicts as `flow | …` rows in the per-call shadow's bank. Off unless
-// a host arms it, and nothing reads it to decide anything.
+// The function-value flow table (`docs/internals/fn-value-flow-design.md` §(f)). Before
+// `monomorphize` it unions the checked tree's bindings into classes, each holding the functions
+// that may flow into it (sources) and the signatures it is called or annotated at (pins).
+// `monomorphize` reads it to pin a hole lambda that shares a class with a peer. Armed by a host,
+// it also grades every function value the monomorphizer decided against its class after the last
+// pass, and counts the verdicts as `flow | …` rows in the per-call shadow's bank.
 import {
   ArrayLit,
   AsExpr,
@@ -32,7 +32,6 @@ import {
 } from "./ast"
 import { callBindShadowCount, fnFlowSigFails } from "./call_bind_shadow"
 import { monoIsGenericDecl, unwrapParen } from "./emit_base"
-import { monoStubValueOk } from "./emit_mono"
 import { declTyIxOfName, repNameCanonId } from "./emit_rep"
 import {
   fnParent,
@@ -40,6 +39,7 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  monoStubValueOk,
 } from "./emit_state"
 import { i32ListHas, strListHas } from "./listutil"
 import {
@@ -1005,6 +1005,53 @@ function ffTyKey(t: i32): string {
 // nodes mono copies from which. Runs on every armed compile, generic or not.
 export function fnFlowShadowBuild(stmts: i32[]) {
   if ffMode == 0 { return 0 }
+  ffBuild(stmts)
+  identOrigArm(true)
+  0
+}
+
+// Build the table `monomorphize` reads, unless the armed shadow already built it this compile.
+export function fnFlowTableBuild(stmts: i32[]) {
+  if ffBuilt { return 0 }
+  ffBuild(stmts)
+}
+
+// The parameter types of the one signature every call through a class holding lambda `lam`
+// agrees on, where the class also holds another function (its peer); empty when it holds none,
+// nothing pins the class, two signatures do, or the lambda is walked inside a generic.
+export function fnFlowLamPin(lam: i32): i32[] {
+  const none: i32[] = []
+  let r = rdHead[lam] ?? -1
+  let pick = -1
+  let pickName = ""
+  let peered = false
+  while r >= 0 {
+    if rdKind[r] == 1 {
+      if rdWalk[r] != 0 { return none }
+      const root = ffFind(rdSlot[r])
+      if root < 0 { return none }
+      for f in ufSrc[root] {
+        if f != lam { peered = true }
+      }
+      for id in ufPin[root] {
+        if !ffPinOpen(id) {
+          const nm = ffJoin(ffPinNames(id))
+          if pick < 0 {
+            pick = id
+            pickName = nm
+          } else if nm != pickName {
+            return none
+          }
+        }
+      }
+    }
+    r = rdNext[r]
+  }
+  if pick < 0 || !peered { return none }
+  pinTys[pick]
+}
+
+function ffBuild(stmts: i32[]) {
   const noN: string[] = []
   const noT: i32[] = []
   ffCtxOf("", noN, noT)
@@ -1028,7 +1075,6 @@ export function fnFlowShadowBuild(stmts: i32[]) {
     }
   }
   ffBuilt = true
-  identOrigArm(true)
   0
 }
 
@@ -1081,17 +1127,21 @@ function ffJoin(xs: string[]): string {
   "(" + out + ")"
 }
 
+// Whether pin `id` leaves a parameter type unknown or open.
+function ffPinOpen(id: i32): boolean {
+  for t in pinTys[id] {
+    if t < 0 || tyHasTyVar(t) { return true }
+  }
+  false
+}
+
 // The distinct pins of slot `s`'s class, each rendered as one string, open ones left out.
 function ffClassPins(s: i32): string[] {
   const out: string[] = []
   const r = ffFind(s)
   if r < 0 { return out }
   for id in ufPin[r] {
-    let open = false
-    for t in pinTys[id] {
-      if t < 0 || tyHasTyVar(t) { open = true }
-    }
-    if !open {
+    if !ffPinOpen(id) {
       const j = ffJoin(ffPinNames(id))
       if !strListHas(out, j) { out.push(j) }
     }

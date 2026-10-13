@@ -584,10 +584,10 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
 
      | site | files moved | runs lost | a witness that needs it |
      | --- | --- | --- | --- |
-     | `monoPinLamFromPeer` | 5 | 3 | closures/hole-lambda-peer-through-cell-read |
-     | `monoAssignedPeerFe` | 3 | 2 | closures/hole-lambda-cell-seeded-from-cell-mutate-then-read |
-     | `monoInitPeerFe` | 2 | 2 | closures/hole-lambda-cell-takes-instance-type |
-     | `monoTargetPeerFe` | 3 | 2 | closures/hole-lambda-cell-takes-instance-type |
+     | `monoPinLamFromPeer` | 5 | 3 | retired by the third PR |
+     | `monoAssignedPeerFe` | 3 | 2 | retired by the third PR |
+     | `monoInitPeerFe` | 2 | 2 | retired by the third PR |
+     | `monoTargetPeerFe` | 3 | 2 | retired by the third PR |
      | `monoCoerceWrittenLet` | 22 | 2 | closures/written-let-of-generics-called-after-another-instance |
      | `monoCoerceWrittenCell` | 36 | 20 | closures/captured-cell-shared-writer-alias |
      | `monoAliasChainLamFe` | 19 | 13 | closures/hole-lambda-alias-mutate-then-read |
@@ -607,6 +607,20 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      `monoCellFnTyNameAt` finds its cell by `identDeclOf` on the read, not `monoLetFrameOf`
      on the name, and the outputs are byte-identical on all 15,331 files. Its open-type gate
      stays, because capture-by-reference needs it.
+   - Third PR: the peer pins are retired. `monomorphize` builds the table whenever a hole
+     lambda is generic, armed or not, and `fnFlowLamPin` answers a lambda whose class also
+     holds another function: the one pin every call through the class agrees on. A lambda
+     with no peer, a class with two pins, or one walked inside a generic gets no answer and
+     keeps its old path. `monoPinLamFromPeer`, `monoAssignedPeerFe`, `monoInitPeerFe` and
+     `monoTargetPeerFe` are deleted, and the round loop with them: a class already spans the
+     chain the rounds walked. Over the same 15,331 files, three moved. One is a fix:
+     `closures/hole-lambda-user-list-reassigned` (`d = [c]`, then `d = [e]`) was a loud
+     refusal and now prints `aC aE`. Two keep their output and emit smaller modules, because
+     a class the table calls multi-pin leaves the lambda at its own instance. The shadow's
+     disagreement rows fell from 1,512 to 1,501 and none was added. Without the peer
+     condition the table also answered lambdas inside annotated closure results, and six
+     fixtures trapped on an indirect call, so the condition stays until the let slot owns
+     those.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
