@@ -225,7 +225,7 @@ Deno.test("ratchet-hold: a code is not held OUTSIDE the trees its ratchet walks"
 });
 
 Deno.test("ratchet-hold: prefer-interpolation is held in the repo's trees and nowhere else", async () => {
-  // The compiler's standing `+` chains are baselined by scripts/interp-budget.py over
+  // The compiler's standing `+` chains are baselined by `vl check --budget` over
   // compiler/, std/ and scripts/. Held there; a new chain in a held file is loud; and a
   // consumer's own file — any other tree — sees every suggestion, unchanged.
   const INTERP = "prefer-interpolation";
@@ -363,9 +363,11 @@ Deno.test("ratchet-hold: a file outside the workspace is untouched", async () =>
 // baseline file holds a code, and which trees that baseline was measured over. A tree
 // that drifts one way makes the editor report "+N over baseline" for a baseline that
 // does not cover the file; the other way silences a file the gate does grade. So the
-// table is re-derived here from the scripts themselves.
+// table is re-derived here from the scripts themselves — or, for a baseline held by
+// `vl check --budget` (no script), from the baseline's own `targets` and `total`.
 
-/** `scripts/<x>-baseline.json` → the script that owns it, plus its census half. */
+/** `scripts/<x>-baseline.json` → the script that owns it, plus its census half; `[]`
+ * for a baseline `vl check --budget` holds and writes, which declares itself. */
 const OWNERS: Record<string, string[]> = {
   "scripts/ladder-budget-baseline.json": [
     "scripts/ladder-budget.py",
@@ -378,7 +380,17 @@ const OWNERS: Record<string, string[]> = {
   "scripts/scan-budget-baseline.json": ["scripts/scan-budget.py"],
   "scripts/comment-budget-baseline.json": ["scripts/comment-budget.py"],
   "scripts/export-budget-baseline.json": ["scripts/export-budget.py"],
-  "scripts/interp-budget-baseline.json": ["scripts/interp-budget.py"],
+  "scripts/interp-budget-baseline.json": [],
+};
+
+/** A self-declaring baseline's parsed `targets` and budgeted codes. */
+const selfDeclared = (baseline: string): { trees: Set<string>; codes: string[] } => {
+  const b = JSON.parse(Deno.readTextFileSync(`${ROOT}/${baseline}`));
+  const targets: string[] = b.targets ?? [];
+  return {
+    trees: new Set(targets.map((t) => t.split("/")[0])),
+    codes: Object.keys(b.total ?? {}),
+  };
 };
 
 /**
@@ -408,6 +420,12 @@ Deno.test("ratchet-hold: every code's baseline file exists and is the one the sc
     if (OWNERS[scope.baseline] === undefined) {
       throw new Error(`${code}: no owning script known for ${scope.baseline}`);
     }
+    if (OWNERS[scope.baseline].length === 0) {
+      if (selfDeclared(scope.baseline).trees.size === 0) {
+        throw new Error(`${code}: ${scope.baseline} names no \`targets\` for vl check --budget`);
+      }
+      continue;
+    }
     const owner = OWNERS[scope.baseline][0];
     const src = Deno.readTextFileSync(`${ROOT}/${owner}`);
     const name = scope.baseline.replace("scripts/", "");
@@ -422,7 +440,9 @@ Deno.test("ratchet-hold: every code's baseline file exists and is the one the sc
 
 Deno.test("ratchet-hold: every code's trees match the ratchet that owns it", () => {
   for (const [code, scope] of RATCHET_CODES) {
-    const want = declaredTrees(OWNERS[scope.baseline]);
+    const want = OWNERS[scope.baseline].length === 0
+      ? selfDeclared(scope.baseline).trees
+      : declaredTrees(OWNERS[scope.baseline]);
     const got = new Set(scope.trees.map((t) => t.replace(/\/$/, "")));
     const missing = [...want].filter((t) => !got.has(t));
     const extra = [...got].filter((t) => !want.has(t));
@@ -440,7 +460,11 @@ Deno.test("ratchet-hold: every code the scripts gate on is in the table", () => 
   // The scripts' own code constants, so a sixth code added to a ratchet cannot land
   // with the editor still publishing it as a live problem.
   const declared = new Set<string>();
-  for (const scripts of Object.values(OWNERS)) {
+  for (const [baseline, scripts] of Object.entries(OWNERS)) {
+    if (scripts.length === 0) {
+      for (const c of selfDeclared(baseline).codes) declared.add(c);
+      continue;
+    }
     const src = Deno.readTextFileSync(`${ROOT}/${scripts[0]}`);
     for (const m of src.matchAll(/^(?:CODE|[A-Z_]+)\s*=\s*"([a-z][a-z0-9-]+)"/gm)) {
       declared.add(m[1]);
