@@ -1529,6 +1529,16 @@ function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32, scode: i32) {
   -1
 }
 
+// Seeds `c` to build a ref-list field's value through row `slot`: a union element builds
+// boxes, a struct element refs, any other element at the row's own heap types.
+function expCtxFieldRefList(c: ExpCtx, slot: i32) {
+  c.listSlot = slot
+  if rlElemKindTbl[slot] == RLK_UNION { c.listKind = LBK_UNION }
+  else if rlElemKindTbl[slot] == RLK_STRUCT { c.listKind = LBK_REF }
+  else { c.listKind = LBK_REF_AT_SLOT }
+  0
+}
+
 // One struct field's value, from the field's context through the emission arm its code
 // selects to the two widen sites. Carved out of `emitObj`'s layout loop so the source-order
 // stash pass (D1510) can run exactly the same lowering, once per field. The caller has
@@ -1599,10 +1609,7 @@ function emitStructFieldValueUnder(
         "emitProgram: ref-list field element type is not interned",
       )
     }
-    c.listSlot = fslot
-    if rlElemKindTbl[fslot] == RLK_UNION { c.listKind = LBK_UNION }
-    else if rlElemKindTbl[fslot] == RLK_STRUCT { c.listKind = LBK_REF }
-    else { c.listKind = LBK_REF_AT_SLOT }
+    expCtxFieldRefList(c, fslot)
   } else if fieldCodeScalarListBuildKind(scode) >= 0 {
     c.listKind = fieldCodeScalarListBuildKind(scode)
   } else if scode == FC_NUL_I32_LIST {
@@ -1620,10 +1627,7 @@ function emitStructFieldValueUnder(
     // on a bare `null` value — ungated, a `[null]` element would consume it: invalid wasm.
     let fslot28 = sFieldRefSlot(si, fi)
     if fslot28 < 0 { fslot28 = 0 }
-    c.listSlot = fslot28
-    if rlElemKindTbl[fslot28] == RLK_UNION { c.listKind = LBK_UNION }
-    else if rlElemKindTbl[fslot28] == RLK_STRUCT { c.listKind = LBK_REF }
-    else { c.listKind = LBK_REF_AT_SLOT }
+    expCtxFieldRefList(c, fslot28)
 
     if fslot28 < rlWrapIdx.length {
       const nraF = P.nodes[unwrapParen(valIx)]
@@ -2188,7 +2192,7 @@ function guardVariantFieldSpan(vi: i32, where: string) {
 
 // One union-variant field's value — `emitStructFieldValue`'s twin, one table over, carved out
 // for the same reason: the source-order stash pass (D1510) runs exactly this lowering once per
-// field before the layout loop reads the slots back.
+// field. The caller's context is restored on every exit.
 function emitVariantFieldValue(
   body: u8[],
   vi: i32,
@@ -2196,9 +2200,19 @@ function emitVariantFieldValue(
   valIx: i32,
   fnIx: i32,
 ) {
-  pendingListKind = LBK_I32_LIST
-  pendingListSlot = 0
-  pendingNulRefHeap = -1
+  const saved = expCtxHere()
+  expCtxLeave(saved, emitVariantFieldValueUnder(body, vi, fj, valIx, fnIx))
+}
+
+// `emitVariantFieldValue`'s body: it applies the field's context and leaves it for the
+// wrapper's exit to undo.
+function emitVariantFieldValueUnder(
+  body: u8[],
+  vi: i32,
+  fj: i32,
+  valIx: i32,
+  fnIx: i32,
+) {
   const vcode = variantFieldTypeAt(vi, fj)
 
   const vcfv = P.nodes[unwrapParen(valIx)]
@@ -2209,45 +2223,44 @@ function emitVariantFieldValue(
       )
     }
   }
+  const c = expCtxHere()
+  c.listKind = LBK_I32_LIST
+  c.listSlot = 0
+  c.nulRefHeap = -1
   if vcode == FC_REF_LIST {
     let vslot = variantFieldRefSlot(vi, fj)
     if vslot < 0 { vslot = 0 }
-    pendingListSlot = vslot
+    c.listSlot = vslot
     if rlElemKindTbl[vslot] == RLK_UNION {
-      pendingListKind = LBK_UNION
+      c.listKind = LBK_UNION
     } else {
-      pendingListKind = LBK_REF
+      c.listKind = LBK_REF
     }
   } else if vcode == FC_NUL_I32_LIST {
-    pendingNulRefHeap = lTypeIdx
+    c.nulRefHeap = lTypeIdx
   } else if vcode == FC_NUL_REF_LIST {
     let vslot28 = variantFieldRefSlot(vi, fj)
     if vslot28 < 0 { vslot28 = 0 }
-    pendingListSlot = vslot28
-    if rlElemKindTbl[vslot28] == RLK_UNION { pendingListKind = LBK_UNION }
-    else if rlElemKindTbl[vslot28] == RLK_STRUCT { pendingListKind = LBK_REF }
-    else { pendingListKind = LBK_REF_AT_SLOT }
-    if vslot28 < rlWrapIdx.length { pendingNulRefHeap = rlWrapIdx[vslot28] }
+    expCtxFieldRefList(c, vslot28)
+    if vslot28 < rlWrapIdx.length { c.nulRefHeap = rlWrapIdx[vslot28] }
   } else if isNulScalarListFieldCode(vcode) {
     // A nullable scalar-backed list arm field — the struct literal's arm this ladder does not
     // otherwise grow: a bare `null` written here reaches `emitNullLitNode` with every seed at
     // its default and takes the loud `bare null needs a struct-typed context` reject (D1294).
-    pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(vcode))
+    c.listKind = nulScalarListBuildKind(nulScalarListCodeKind(vcode))
     const vnslV = P.nodes[unwrapParen(valIx)]
-    if vnslV is NullLit {
-      pendingNulRefHeap = nulScalarListFieldWrapHeap(vcode)
-    }
+    if vnslV is NullLit { c.nulRefHeap = nulScalarListFieldWrapHeap(vcode) }
   } else if vcode == FC_NUL_MAP {
     const vmslot29 = uFieldMapShape(vi, fj)
-    pendingMapSlot = vmslot29
-    pendingNulRefHeap = mapTypeIdxOf(vmslot29)
+    c.mapSlot = vmslot29
+    c.nulRefHeap = mapTypeIdxOf(vmslot29)
   } else if fieldCodeScalarListBuildKind(vcode) >= 0 {
-    pendingListKind = fieldCodeScalarListBuildKind(vcode)
+    c.listKind = fieldCodeScalarListBuildKind(vcode)
   }
 
-  const savedVPSI = pendingStructIdx
-  if vcode == FC_STRUCT { pendingStructIdx = uFieldTgtStructIdx(vi, fj) }
-  if vcode == FC_MAP { pendingMapSlot = uFieldMapShape(vi, fj) }
+  if vcode == FC_STRUCT { c.structIdx = uFieldTgtStructIdx(vi, fj) }
+  if vcode == FC_MAP { c.mapSlot = uFieldMapShape(vi, fj) }
+  expCtxApply(c)
 
   if vcode == FC_F64 {
     if emitExprAsF64(body, valIx, fnIx) < 0 { return -1 }
@@ -2256,28 +2269,22 @@ function emitVariantFieldValue(
   } else if vcode == FC_F32 {
     if emitExprAsF32(body, valIx, fnIx) < 0 { return -1 }
   } else if vcode == FC_NUL_STR {
-    const svNS = pendingNulString
-    pendingNulString = true
-    const rcNS = emitExpr(body, valIx, fnIx)
-    pendingNulString = svNS
-    if rcNS < 0 { return -1 }
+    const nsCtx = expCtxHere()
+    nsCtx.nulString = true
+    if emitExprExpect(body, valIx, fnIx, nsCtx) < 0 { return -1 }
   } else if vcode == FC_NUL_BOOL {
-    const svNB = pendingNulBool
-    pendingNulBool = true
-    const rcNB = emitExpr(body, valIx, fnIx)
-    pendingNulBool = svNB
-    if rcNB < 0 { return -1 }
+    const nbCtx = expCtxHere()
+    nbCtx.nulBool = true
+    if emitExprExpect(body, valIx, fnIx, nbCtx) < 0 { return -1 }
   } else if vcode == FC_NUL_LIT_UNION {
     const vnluCtx = expCtxHere()
     vnluCtx.litUnion = 1
     vnluCtx.nulLitUnion = true
     if emitExprExpect(body, valIx, fnIx, vnluCtx) < 0 { return -1 }
   } else if vcode == FC_NUL_CLOSURE {
-    const svNC = pendingNulClosure
-    pendingNulClosure = true
-    const rcNC = emitExpr(body, valIx, fnIx)
-    pendingNulClosure = svNC
-    if rcNC < 0 { return -1 }
+    const ncCtx = expCtxHere()
+    ncCtx.nulClosure = true
+    if emitExprExpect(body, valIx, fnIx, ncCtx) < 0 { return -1 }
   } else if variantFieldIsLitUnionArray(vi, fj) {
     const vlaCtx = expCtxHere()
     vlaCtx.litUnion = 1
@@ -2302,9 +2309,6 @@ function emitVariantFieldValue(
   } else {
     if emitExpr(body, valIx, fnIx) < 0 { return -1 }
   }
-  if vcode == FC_STRUCT { pendingStructIdx = savedVPSI }
-  if vcode == FC_MAP || vcode == FC_NUL_MAP { pendingMapSlot = -1 }
-  pendingListKind = LBK_I32_LIST
   0
 }
 
