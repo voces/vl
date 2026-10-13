@@ -2066,3 +2066,67 @@ received a structural name in either population**. Those twelve are the standing
 not a backlog: re-run the per-site oracle and convert one the day its RIGHT-ONLY column moves
 off zero — and then grade it on all three readings, not the first.
 
+
+## 13. The checked-rep column, and the literal-union family on it (L2 stage 3, D3)
+
+### 13.1 The column
+
+`nodeRep(ix)` (`compiler/emit_rep.vl`) is node `ix`'s rep as the checker's type decided it. The
+`expr*` classifiers read it through two predicates, `nodeRepIsAtom` and `nodeRepIsNulAtom`. A
+classifier now asks the descriptor, not a ladder over spellings.
+
+The column is a derived read, not a bank. A banked version keyed on five staleness axes was
+built and measured. Its stale check read 0 on every population below. It was still withdrawn:
+`tests/vl_memo_generation_test.ts` requires every new memo stamp to have a row in
+`scripts/memo-generation-probe.py`, and the no-new-Python ruling forbids adding that row.
+Banking returns when that probe is in VL. It would also key on `emitPassGen`, because an emit
+pass can fill a table that `repOfNode` reads (D1655).
+
+`RepDesc` gains `rdAtom`. `rdKind` says `i32` for both a plain i32 and a string literal union, so
+without the bit the descriptor could not answer this family at all. `repOfNullable` is now a
+`_`-less `match` over every `Ty` variant (ruling (b)), and its litunion arm answers the nullable
+atom (`rdNul` 3).
+
+### 13.2 The oracle, per site and per population
+
+Every converted site ran its old ladder and the column side by side (`VL_REP_SHADOW=1`), plus a
+stale check (on the banked build) comparing the banked descriptor with a fresh `repOfNode` at the same node.
+
+| population | files | AGREE notes | LEFT-ONLY | RIGHT-ONLY | STALE |
+| --- | --- | --- | --- | --- | --- |
+| `tests/cases` | 5,213 | 1,043,208 | 0 | 100 (all `callAlias`, 8 files) | 0 |
+| distilled `cells/` | 1,478 | all | 0 | 0 | 0 |
+| distilled `named/` | 8,647 | 834,752 | 0 | 0 | 0 |
+
+The derived cells hold no literal-union program, so that row is a control, not evidence.
+
+Fourteen sites converted: `nulCallFallback`, `nulCallRet`, `nulParam`, `nulLoopVar`,
+`nulLoopRead`, `nulOptLeaf`, `nulLetAnn`, `nulLetBox`, `nulBindParam`, `letAnn`, `param`,
+`bindParam`, `index` and `indexNul`.
+
+### 13.3 The three alias sites stay on their ladder
+
+`memberAlias`, `callAlias` and `callRetAlias` ask `nodeTyIsLitUnionAlias`, which is gated on the
+union registry, and they were measured, not switched. `callAlias` is the only site with a
+RIGHT-ONLY column: the column answers `atom` at 100 call nodes where the ladder declines. That
+is the column WIDENING the domain, not disagreeing inside it, and a widening is a behaviour
+change this byte-identity PR does not take. These sites move with registry step 5.
+
+### 13.4 Mixed unions, measured
+
+Under `one-literal-union-rep`, only an all-string literal union is an atom. The probe below ran
+correctly and the column agreed with the ladder at every node:
+
+| spelling | rep |
+| --- | --- |
+| `"a" \| string` | `string` (canon softens the literal) |
+| `"a" \| 1 \| null` | value-union box |
+| `"a" \| "b" \| string \| null` | `nulstr` |
+
+Numeric literal unions keep their base scalar and never set `rdAtom`.
+
+### 13.5 What is next, in order
+
+The nullable niche family (`exprNullableString`, `exprNullableList`, `exprNullableStruct`, …),
+then `exprString`, `exprRefArray`, `exprStringArray`, `exprArray`, `exprF64Array` and
+`exprListRep`. Each family goes under the same LEFT-ONLY / RIGHT-ONLY oracle.

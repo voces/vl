@@ -819,6 +819,8 @@ import {
   mvSlotOfValNameTyKArm,
   mvValTyIxOfNameRow,
   nodeMapValTyIx,
+  nodeRepIsAtom,
+  nodeRepIsNulAtom,
   nodeTyMapKeyIsLitUnion,
   nullValKind,
   recordMvValTyIx,
@@ -19073,13 +19075,12 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
 }
 
 // The literal-union parameter flavour of value call `callIx`'s parameter `idx`: `1` a `K`
-// atom param, `2` a `K | null` niche param, `0` neither — the `emitCallRef` twin of what
-// `emitCall` reads off a declared callee's `Param` node. Can't come from the `$fnsig` key:
-// a litunion param's token is deliberately `i`, identical to a plain i32's.
-export function cloCallParamLitUnion(callIx: i32, idx: i32) {
+// atom param, `2` a `K | null` niche param, `0` neither, read off `fnIx`'s pin of the callee
+// (D4352). Can't come from the `$fnsig` key: a litunion param's token is `i`, as an i32's is.
+export function cloCallParamLitUnion(callIx: i32, idx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
-    const ft = nodeTyIxOf(c.callFn)
+    const ft = cloCallParamFnTyOf(callIx, fnIx)
     if ft < 0 { return 0 }
     const t = T.tys[ft]
     if t is TyFunc {
@@ -19093,6 +19094,23 @@ export function cloCallParamLitUnion(callIx: i32, idx: i32) {
     }
   }
   0
+}
+
+// The function type value call `callIx`'s parameters are read off in instance `fnIx`: the
+// callee's recorded type when it is one, else the pin of the hole or type parameter it reads
+// (through `const` aliases); -1 when none is a function type.
+function cloCallParamFnTyOf(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ct = nodeTyIxOf(c.callFn)
+    if ct >= 0 && T.tys[ct] is TyFunc { return ct }
+    const hft = cloCallHoleFnTyOf(callIx, fnIx)
+    if hft >= 0 { return hft }
+    const pt = valueReadPinTy(c.callFn, fnIx, 0)
+    if pt >= 0 && pt < T.tys.length && T.tys[pt] is TyFunc { return pt }
+    return ct
+  }
+  -1
 }
 
 // The callee's own `TyFunc` arena row for value call `callIx`, or -1 — asked of the
@@ -23854,7 +23872,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
         if cfn is FuncDecl {
-          if cfn.fnRet >= 0 { return nodeTyIsNulLitUnion(cfn.fnRet) }
+          if cfn.fnRet >= 0 { return nodeRepIsNulAtom(cfn.fnRet) }
         }
       }
       // A call of a closure-typed VALUE (`p()` where `p: () => K | null`) — a param /
@@ -23875,9 +23893,9 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     }
     // Fallback, scoped to a call: a `K | null`-returning closure value call whose callee the
     // cases above miss — a chained closure call (`v(1)()` where `v: (i32) => (() => K | null)`).
-    // The cheap no-render `nodeTyIsNulLitUnion` reads the checker's per-node type, mirroring
+    // The checked-rep column reads the checker's per-node type, mirroring
     // `exprNullableString`'s fallback, which structurally excludes the litunion niche.
-    if !nodeTyIsNulLitUnion(exprIx) { return false }
+    if !nodeRepIsNulAtom(exprIx) { return false }
     // The callee's `$fnsig` decides the rep: a closure keyed with a boxed result hands back the
     // box whatever the checker's type says (D2535).
     const nlk = cloCallSigKey(unwrapParen(exprIx), fnIx)
@@ -23896,9 +23914,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
         while i < params.length {
           const p = P.nodes[params[i]]
           if p is Param {
-            if p.parName == e.identName {
-              return nodeTyIsNulLitUnion(p.parType)
-            }
+            if p.parName == e.identName { return nodeRepIsNulAtom(p.parType) }
           }
           i = i + 1
         }
@@ -23914,13 +23930,13 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     const nluSlot = declaredSlotOf(e.identName)
     if nluSlot >= 0 && nluSlot < localLitUnion.length {
       if localLitUnion[nluSlot] == 1 {
-        return nodeTyIsNulLitUnion(exprIx)
+        return nodeRepIsNulAtom(exprIx)
           || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
       }
     }
     // …and one asked outside its frame's emission, found by its loop (D3169).
     if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
-      return nodeTyIsNulLitUnion(exprIx)
+      return nodeRepIsNulAtom(exprIx)
     }
     return false
   }
@@ -23934,7 +23950,7 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if e is OptMember {
     const olc = optChainLeafFieldCode(exprIx, fnIx)
     if olc == FC_NUL_LIT_UNION { return true }
-    return olc == FC_I32 && nodeTyIsNulLitUnion(exprIx)
+    return olc == FC_I32 && nodeRepIsNulAtom(exprIx)
   }
   false
 }
@@ -23945,7 +23961,7 @@ export function letNulLitUnion(letIx: i32, fnIx: i32) {
   if letIx < 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 { return nodeTyIsNulLitUnion(d.letType) }
+    if d.letType >= 0 { return nodeRepIsNulAtom(d.letType) }
     if exprNulLitUnion(d.letInit, fnIx) { return true }
     return letInitIsNulLitBox(d.letInit, fnIx)
   }
@@ -23958,7 +23974,7 @@ export function letNulLitUnion(letIx: i32, fnIx: i32) {
 function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
   const ix = unwrapParen(init)
   if ix < 0 { return false }
-  if !nodeTyIsNulLitUnion(ix) { return false }
+  if !nodeRepIsNulAtom(ix) { return false }
   const e = P.nodes[ix]
   if !(e is Ident || e is Member || e is Index) { return false }
   letInitIsBox(ix, fnIx)
@@ -30612,9 +30628,7 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
     // annotation that softens to `string` over a non-atom init produces no atom, so this
     // declines it and the loud refusal stands for that shape (D1752).
     if d.letInit >= 0 {
-      if tyIsLitUnion(nodeTyIxOf(d.letType)) {
-        return exprIsLitAtom(d.letInit, fnIx)
-      }
+      if nodeRepIsAtom(d.letType) { return exprIsLitAtom(d.letInit, fnIx) }
     }
   }
   false
@@ -30631,7 +30645,7 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
     // The alias-index question, matching the rep, exactly as `exprIsLitAtom`'s param arm
     // asks it: a narrowed alias is a copy at a fresh index, so the registry misses while
     // the rep layer, which assigns the valtype through this same test, says `i32`.
-    return tyIsLitUnion(nodeTyIxOf(bn.parType))
+    return nodeRepIsAtom(bn.parType)
   }
   if bn is LetDecl {
     return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
@@ -30652,7 +30666,7 @@ export function localSlotIsLitAtom(slot: i32): boolean {
 function bindingIsNulLitUnion(bindIx: i32, ownerFnIx: i32) {
   if bindIx < 0 { return false }
   const bn = P.nodes[bindIx]
-  if bn is Param { return nodeTyIsNulLitUnion(bn.parType) }
+  if bn is Param { return nodeRepIsNulAtom(bn.parType) }
   if bn is LetDecl { return letNulLitUnion(bindIx, ownerFnIx) }
   false
 }
@@ -31258,7 +31272,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if pt >= 0 {
       // The same structural predicate the rep layer assigns the valtype by, so the consumer
       // agrees with the rep by construction.
-      const r = tyIsLitUnion(nodeTyIxOf(pt))
+      const r = nodeRepIsAtom(pt)
       return r
     }
     const gli = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
@@ -31304,14 +31318,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
     // numbers, whose values have no member id to widen — a case that needs both families in
     // one module to surface, since the classifier sits behind `gLitUnionUsed`.
-    const pluIx = unwrapParen(exprIx)
-    if nodeTyIsPureLitUnion(pluIx) {
-      if numLitUnionBaseTy(nodeTyIxOf(pluIx)) < 0 { return true }
-    }
+    if nodeRepIsAtom(unwrapParen(exprIx)) { return true }
     // The bare read types `K0 | null` (a missing key reads null) — the emit is the i32
     // atom either way (the not-found arm yields a non-member sentinel), so the nullable
     // spelling claims too.
-    if nodeTyIsNulLitUnion(unwrapParen(exprIx)) { return true }
+    if nodeRepIsNulAtom(unwrapParen(exprIx)) { return true }
     return false
   }
   if e is IfStmt {
