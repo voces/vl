@@ -656,6 +656,18 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      differently because other functions in the file wrote a binding of the same name.
      Renaming that binding gives the old compiler the new module. `monoLetFrameOf` still has
      21 callers, and the annotated-closure-result condition is not touched.
+   - Seventh PR: the capture-cell path and the other readers of `monoLetFrameOf` find a
+     binding by declaration (`monoReadLetFrame`). `monoRetypeCell` and `monoCellReadsIn`
+     take the cell's declaration and match a read `d[0]` by `identDeclOf` rather than by
+     its name. `monoCellSeed*`,
+     `monoAliasCellRead`, `monoWriteSourceBind`, `monoWriteNamesLam`, `monoNoteBind*` and
+     eight more lose their name parameter. `monoBodyDeclCopy` indexes each body once per
+     arena stamp, since a per-read body walk made the pass quadratic in reads. The peer
+     condition on `fnFlowLamPin` is deleted: `monoPinLamFromFlow` already keeps the
+     checker's signature for a concretely typed lambda, and that covers the lambdas inside
+     annotated closure results. Over 15,100 files nothing moved. One caller of
+     `monoLetFrameOf` stays, `monoRespellToLam`: it asks whether a name, written at the
+     call, reads the binding, which is a question about spelling.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
