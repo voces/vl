@@ -111,10 +111,10 @@ import {
 import { sidOf } from "./symbols"
 import { tyMapValOf } from "./tyquery"
 
-// One struct per classified type. `rdCovered` is 1 when the rep derives
-// structurally, 0 when the consumer must use its legacy path. `rdKind` is the `VKind`
-// member; `rdNul` says how `null` is encoded (ref, boolean/litunion sentinel, or boxed
-// atom tag); `rdSlot` the interned table slot (-1 at the arena level); `rdSigTok`/`rdListElem` the `$fnsig` token and list-element vocabulary.
+// One struct per classified type. `rdCovered` is 1 when the rep derives structurally, 0 when
+// the consumer must use its legacy path; `rdKind` is the `VKind` member, `rdNul` how `null` is
+// encoded (ref, boolean/litunion sentinel, or boxed atom tag), `rdSlot` the interned slot (-1 at
+// the arena level), `rdSigTok`/`rdListElem` the `$fnsig` token and list-element vocabulary.
 export type RepDesc = {
   rdCovered: i32,
   rdKind: VKind,
@@ -122,6 +122,8 @@ export type RepDesc = {
   rdSlot: i32,
   rdSigTok: string,
   rdListElem: string,
+  // 1 when the non-null value is a string-literal-union atom, which `rdKind` "i32" cannot tell.
+  rdAtom: i32,
 }
 
 // The descriptor a TABLE-column producer answers with — today the return-kind trio
@@ -328,6 +330,7 @@ function repUncovered(): RepDesc {
     rdSlot: -1,
     rdSigTok: "",
     rdListElem: "",
+    rdAtom: 0,
   }
   return d
 }
@@ -340,8 +343,17 @@ function repMk(kind: VKind, nul: i32, elem: string): RepDesc {
     rdSlot: -1,
     rdSigTok: repSigTokOfKind(kind),
     rdListElem: elem,
+    rdAtom: 0,
   }
   return d
+}
+
+// A string literal union's rep: the interned i32 atom, with `nul` 0 (bare) or 3 (the
+// `-1` null sentinel).
+function repAtomMk(nul: i32): RepDesc {
+  const d = repMk("i32", nul, "")
+  d.rdAtom = 1
+  d
 }
 
 // Canonical structural key (cycle-terminating): walked in full so `{a:i32}` and
@@ -2464,6 +2476,7 @@ export function repOfTy(ty: i32): RepDesc {
   if tk == null { return d }
   const td = repMk(tk, repTreeNulOf(tix), repTreeListElemName(tix))
   td.rdSlot = d.rdSlot
+  td.rdAtom = d.rdAtom
   td
 }
 
@@ -2499,12 +2512,12 @@ function repOfTyFlat(ty: i32): RepDesc {
     }
     TyUnion => {
       // A string literal union reps as the interned i32 atom, whatever its spelling.
-      if tyIsLitUnion(ty) { return repMk("i32", 0, "") }
+      if tyIsLitUnion(ty) { return repAtomMk(0) }
       // The expanded nullable-litunion `"a" | "b" | null` is the same type as the two-part
       // `K | null` spelling, so it must get the same rep (the i32 atom + `-1` sentinel
       // niche, `rdNul` 3) — without this arm it repped as the union box while every read
       // classified it from the arena as the atom, printing invalid wasm. No alias gate here: canon preserves a nullable litunion's members, so both spellings rep as the atom.
-      if tyIsNullableLitUnion(ty) { return repMk("i32", 3, "") }
+      if tyIsNullableLitUnion(ty) { return repAtomMk(3) }
       // A single-member object union is the canonicalized `{a} & {b}` struct
       // alias — reps as the struct itself.
       if t.uMembers.length == 1 {
@@ -2562,100 +2575,108 @@ function repOfPrim(pn: PrimName): RepDesc {
 }
 
 // A nullable's rep is decided by its INNER variant — four distinct null
-// disciplines exist (see `rdNul`), one per inner rep family.
+// disciplines exist (see `rdNul`), one per inner rep family. Exhaustive over
+// `Ty` and `_`-less, so a new arena variant must say which discipline it takes.
 function repOfNullable(inner: i32): RepDesc {
   if inner < 0 { return repUncovered() }
   const it = T.tys[inner]
-  if it is TyPrim {
-    // `string | null` — the nullable raw-array ref niche.
-    if it.primName == "string" { return repMk("nulstr", 1, "") }
-    // `boolean | null` — the i32 sentinel-2 niche; the VALTYPE is plain i32.
-    if it.primName == "boolean" { return repMk("i32", 2, "") }
-    // A nullable SCALAR (`i32 | null`, `f64 | null`, …) has no spare value to
-    // niche into — it boxes as a value union whose `null` is a member atom.
-    if (
-      it.primName == "i32"
-      || it.primName == "i64"
-      || it.primName == "f64"
-      || it.primName == "f32"
-      || it.primName == "v128"
-    ) {
-      return repMk("union", 4, "")
+  match it {
+    TyPrim => {
+      return repOfNullablePrim(it.primName)
     }
-    return repUncovered()
+    TyLit => {
+      // `"x" | null` — one string literal is `string`, as canon softens it, so the
+      // nullable is the `string | null` niche; the atom niche needs two members (D2827).
+      if it.litKind == "str" { return repMk("nulstr", 1, "") }
+    }
+    TyFunc => {
+      // `((…) => …) | null` — the closure fat-pointer made nullable.
+      return repMk("nulclosure", 1, "")
+    }
+    TyObj => {
+      // `S | null` over a standalone struct — the nullable struct ref. A VARIANT
+      // member's nullable stays with the name ladder (its slot vocabulary is the
+      // variant index, and the ladder's nulstruct arm resolves it by name).
+      if !tyIxIsVariantMember(inner) { return repMk("nulstruct", 1, "") }
+    }
+    TyUnion => {
+      // `K | null` over a litunion — the i32 atom with the -1 null sentinel.
+      if tyIsLitUnion(inner) { return repAtomMk(3) }
+      // `(A | B) | null` — the box already has a null member atom.
+      if tyIsValueUnionBox(inner) { return repMk("union", 4, "") }
+    }
+    TyArray => {
+      return repOfNullableArray(it.aElem)
+    }
+    TyMap => {
+      // The niche-exempt `{[string]: T} | null` — legacy owns it.
+    }
+    TyNullable => {
+      // A doubled nullable — canon flattens it before emit.
+    }
+    TyVar => {
+      // A generic parameter made nullable — the instance is what is asked about.
+    }
+    TyErr => {
+      // The error hole — a rejected program never reaches emit.
+    }
+    TyNeg => {
+      // A negation — consumed during checking.
+    }
   }
-  // `"x" | null` — one string literal is `string`, as canon softens it, so the nullable
-  // is the `string | null` niche; the atom niche needs two members (D2827).
-  if it is TyLit {
-    if it.litKind == "str" { return repMk("nulstr", 1, "") }
-    return repUncovered()
+  repUncovered()
+}
+
+// `T | null` over a primitive `T`, by name.
+function repOfNullablePrim(pn: PrimName): RepDesc {
+  // `string | null` — the nullable raw-array ref niche.
+  if pn == "string" { return repMk("nulstr", 1, "") }
+  // `boolean | null` — the i32 sentinel-2 niche; the VALTYPE is plain i32.
+  if pn == "boolean" { return repMk("i32", 2, "") }
+  // A nullable SCALAR has no spare value to niche into — it boxes as a value union
+  // whose `null` is a member atom.
+  if pn == "i32" || pn == "i64" || pn == "f64" || pn == "f32" || pn == "v128" {
+    return repMk("union", 4, "")
   }
-  // `((…) => …) | null` — the closure fat-pointer made nullable.
-  if it is TyFunc { return repMk("nulclosure", 1, "") }
-  if it is TyObj {
-    // `S | null` over a standalone struct — the nullable struct ref. A VARIANT
-    // member's nullable stays with the name ladder (its slot vocabulary is the
-    // variant index, and the ladder's nulstruct arm resolves it by name).
-    if tyIxIsVariantMember(inner) { return repUncovered() }
-    return repMk("nulstruct", 1, "")
+  repUncovered()
+}
+
+// `E[] | null` by element `E`. Only the shapes with a settled rep are covered; every
+// other nullable list must keep failing loudly through the legacy chain.
+function repOfNullableArray(elem: i32): RepDesc {
+  if elem < 0 { return repUncovered() }
+  const et = T.tys[elem]
+  if et is TyPrim {
+    // `i32[] | null` / `boolean[] | null` — the nullable i32-list ref.
+    if et.primName == "i32" || et.primName == "boolean" {
+      return repMk("nullist", 1, "i32")
+    }
+    // A DISTINCT-backing nullable scalar list — its own `(ref null $wrapper)` niche over
+    // the leaf list wrapper. A non-null list value subtypes the nullable slot.
+    if et.primName == "string" { return repMk("nulstrlist", 1, "string") }
+    if et.primName == "f64" { return repMk("nulf64list", 1, "f64") }
+    if et.primName == "i64" { return repMk("nuli64list", 1, "i64") }
+    if et.primName == "f32" { return repMk("nulf32list", 1, "f32") }
+    // D979 — the PACKED byte list joins the nullable-scalar-list family.
+    if et.primName == "u8" { return repMk("nulu8list", 1, "u8list") }
   }
-  if it is TyUnion {
-    // `K | null` over a litunion — the i32 atom with the -1 null sentinel (the
-    // members are preserved through canon for exactly this classification).
-    if tyIsLitUnion(inner) { return repMk("i32", 3, "") }
-    // `(A | B) | null` — the box already has a null member atom.
-    if tyIsValueUnionBox(inner) { return repMk("union", 4, "") }
-    return repUncovered()
-  }
-  if it is TyArray {
-    // `i32[] | null` / `boolean[] | null` / litunion `K[] | null` — the nullable i32-list
-    // ref (a litunion's atoms are interned i32 ids, sharing the i32-list backing). Every
-    // OTHER nullable list (scalar-elem, ref-elem) has no settled rep yet — those must keep
-    // failing loudly through the legacy chain.
-    if it.aElem >= 0 {
-      const et = T.tys[it.aElem]
-      if et is TyPrim {
-        if et.primName == "i32" || et.primName == "boolean" {
-          return repMk("nullist", 1, "i32")
-        }
-        // A DISTINCT-backing nullable scalar list — its own `(ref null $wrapper)` niche over
-        // the leaf list wrapper (`string[]|null` → `$mkListIdx`, `f64[]` → `$fl64TypeIdx`,
-        // `i64[]` → `$il64TypeIdx`, `f32[]` → `$fl32TypeIdx`). A non-null list value subtypes
-        // the nullable slot; a bare `null` is `ref.null $wrapper`.
-        if et.primName == "string" { return repMk("nulstrlist", 1, "string") }
-        if et.primName == "f64" { return repMk("nulf64list", 1, "f64") }
-        if et.primName == "i64" { return repMk("nuli64list", 1, "i64") }
-        if et.primName == "f32" { return repMk("nulf32list", 1, "f32") }
-        // D979 — the PACKED byte list joins the nullable-scalar-list family.
-        if et.primName == "u8" { return repMk("nulu8list", 1, "u8list") }
-      }
-      if tyIsLitUnion(it.aElem) { return repMk("nullist", 1, "i32") }
-      // `(string | null)[] | null` — a nullable-element string list under the outer null.
-      // The backing is the same `$mkListIdx` wrapper as `string[]` (a string element is
-      // already a nullable ref at the wasm level), so the nullable cell is the same
-      // `nulstrlist` niche as `string[] | null`. Left uncovered, the ladder fell through to the i32 default and pushed the wrapper ref into an i32 slot — invalid wasm.
-      if et is TyNullable {
-        const eit = T.tys[et.nInner]
-        if eit is TyPrim {
-          if eit.primName == "string" {
-            return repMk("nulstrlist", 1, "string")
-          }
-        }
-        // `({a, f, z} | null)[] | null` — a nullable-struct-element ref list under the outer
-        // null. The inner list is the plain struct ref list (its `(ref null $S)` backing
-        // already holds the element nulls), so the nullable cell is the established
-        // `nulreflist` (kind 18) niche, exactly like `S[][] | null`. Left uncovered, this paren-grouped shape fell through to the i32 default — invalid wasm.
-        if eit is TyObj {
-          if !tyIxIsVariantMember(et.nInner) {
-            return repMk("nulreflist", 1, "struct")
-          }
-        }
+  // A litunion `K[] | null` — atoms are interned i32 ids, sharing the i32-list backing.
+  if tyIsLitUnion(elem) { return repMk("nullist", 1, "i32") }
+  if et is TyNullable {
+    const eit = T.tys[et.nInner]
+    // `(string | null)[] | null` — the `$mkListIdx` backing already holds a nullable
+    // string element, so the cell is the same `nulstrlist` niche as `string[] | null`.
+    if eit is TyPrim {
+      if eit.primName == "string" { return repMk("nulstrlist", 1, "string") }
+    }
+    // `({…} | null)[] | null` — the plain struct ref list already holds the element
+    // nulls, so the cell is the `nulreflist` niche, exactly like `S[][] | null`.
+    if eit is TyObj {
+      if !tyIxIsVariantMember(et.nInner) {
+        return repMk("nulreflist", 1, "struct")
       }
     }
-    return repUncovered()
   }
-  // A nullable MAP (the niche-exempt `{[string]: T} | null`) and the rest —
-  // legacy owns them.
   repUncovered()
 }
 
@@ -2817,6 +2838,25 @@ export function repOfNode(nodeIx: i32): RepDesc {
     }
   }
   d
+}
+
+// The checked-rep column: node `ix`'s rep as the checker's type decided it, so a classifier
+// asks the descriptor instead of a ladder over spellings. A negative `ix` is uncovered.
+function nodeRep(ix: i32): RepDesc {
+  if ix < 0 { return repUncovered() }
+  repOfNode(ix)
+}
+
+// Whether node `ix` reps as the bare string-literal-union atom.
+export function nodeRepIsAtom(ix: i32): boolean {
+  const d = nodeRep(ix)
+  d.rdCovered == 1 && d.rdAtom == 1 && d.rdNul == 0
+}
+
+// Whether node `ix` reps as the nullable atom: the i32 atom with the `-1` null sentinel.
+export function nodeRepIsNulAtom(ix: i32): boolean {
+  const d = nodeRep(ix)
+  d.rdCovered == 1 && d.rdAtom == 1 && d.rdNul == 3
 }
 
 // Whether a type contains an i64/f64/f32 leaf anywhere — through arrays,
