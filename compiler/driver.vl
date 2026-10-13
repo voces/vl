@@ -8,6 +8,14 @@ import {
   cpAccTake,
   pushCps,
 } from "./strutil"
+import {
+  mimpAddExport,
+  mimpBegin,
+  mimpExportedByNote,
+  mimpNearMisses,
+  mimpNoteMoved,
+  mimpSpecsFor,
+} from "./missing_import"
 // The source-in / bytes-out driver — the interface `scripts/vl-host` embeds against.
 // A real `import`/`export` module that imports the pipeline (lexer → ast → parser →
 // typecheck → wasmEmit → lint → format) and exposes the host ABI
@@ -73,6 +81,11 @@ import {
 } from "./emit_bytes"
 import {
   W,
+  aTypeIdx,
+  aUsed,
+  ba8TypeIdx,
+  ba8Used,
+  bl8TypeIdx,
   emitErr,
   emitErrAt,
   emitFnSpanEnd,
@@ -88,12 +101,31 @@ import {
   gEmitSrcMap,
   globalNames,
   globalStmts,
+  lTypeIdx,
+  lUsed,
   localNames,
+  mStructIdx,
+  mUsed,
+  mkArrIdx,
+  mkListIdx,
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
   reExpName,
   reExpTarget,
+  rlBackIdx,
+  rlElemName,
+  rlWrapIdx,
+  sBackIdx,
+  sDeclared,
+  sHeapIdx,
+  sNames,
+  sTypeIdx,
+  slUsed,
+  uBoxIdx,
+  uDeclared,
+  uVarHeap,
+  uVariants,
 } from "./emit_state"
 
 import { extCollect } from "./extents"
@@ -114,8 +146,15 @@ import {
   P,
   TPL_RENDER_LOCAL,
   TS_APP,
+  TS_ARR,
+  TS_FIELD,
+  TS_FUNC,
+  TS_LITNUM,
+  TS_LITSTR,
   TS_MAP,
   TS_NAME,
+  TS_OBJ,
+  TS_PAREN,
   annTsOf,
   arenaEpochBump,
   arenaEpochNow,
@@ -128,6 +167,7 @@ import {
   declNameTok,
   declNameTokOf,
   dgAllLossless,
+  dgCodeOf,
   dgLosslessReset,
   dgSpanEndTok,
   extDeclLink,
@@ -151,6 +191,20 @@ import {
   mkProgram,
   mkStr,
   nodeToks,
+  ovCandText,
+  ovCandsText,
+  ovFnHead,
+  ovHeadsOverlap,
+  ovPlainAdd,
+  ovPrimClass,
+  ovSetAdd,
+  ovSetBad,
+  ovSetCands,
+  ovSetMod,
+  ovSetName,
+  ovSetOf,
+  ovSetSpecs,
+  ovSiteAdd,
   paramDefaultIsCallsite,
   paramDefaultTablesReset,
   recDupField,
@@ -190,7 +244,7 @@ import {
   sidOf,
   sidReset,
 } from "./symbols"
-import { nameIdentChar, skipQuotedName } from "./tyname"
+import { demangleSpelling, nameIdentChar, skipQuotedName } from "./tyname"
 import {
   T,
   canonRestoreSpellings,
@@ -198,8 +252,12 @@ import {
   checkNotIntrinsicName,
   checkProgram,
   demangleMsg,
+  discLeafCollect,
+  discLeafScalarAt,
+  discLeafTokAt,
   esDumpText,
   esTextOfDecl,
+  expInfSetEntryStd,
   initChecker,
   isBuiltinCallName,
   isBuiltinTyName,
@@ -224,11 +282,14 @@ import {
   jwSplice,
 } from "./json_walk"
 import {
+  expInfMsgAt,
+  expInfTokAt,
   isvalMsgAt,
   isvalTokAt,
   rcoalMsgAt,
   rcoalTokAt,
   redunMsgAt,
+  redunRetAt,
   redunTokAt,
   symConstAt,
   symDefAt,
@@ -319,6 +380,7 @@ import {
   lintReset,
   lintSetPath,
   lintSetPlusLinks,
+  lintSetScalarReads,
   lintSetSource,
   lintSetStrIndexes,
   lintSevAt,
@@ -530,6 +592,20 @@ let modRenameFrom: string[] = []
 let modRenameFirstBySid: i32[] = []
 let modRenameLastBySid: i32[] = []
 let modShadow: string[] = []
+// Parallel to `modShadow`: the name the binding is renamed to, or "" when it keeps its own.
+// Only a binding named like an ambient function is renamed (`modShadowBind`).
+let modShadowTo: string[] = []
+// The module whose suffix a renamed ambient-named binding takes.
+let modAmbMod = 0
+// The module whose statements `modRwStmt` is rewriting, -1 outside the rewrite.
+let modRwMod = -1
+// The callee `Ident` of the plain call being rewritten: a call, not a function value.
+let modRwCalleeIx = -1
+// Uses of an overloaded name the rewrite found, raised only when the set itself is legal:
+// the node, its set row, and whether it is a plain call (else a function value).
+let modOvUseIx: i32[] = []
+let modOvUseRow: i32[] = []
+let modOvUseCall: boolean[] = []
 // Registry of every top-level free `self`-function across all modules, keyed by its
 // mangled name with its parameter arity. Since the merge cannot rewrite a `Member`'s
 // `memProp` (a same-named struct field keeps precedence), it records a plain→mangled
@@ -987,10 +1063,91 @@ function jwSecondPass(root: i32): i32 {
   // with it. The style tier must not report a finding about code the author never wrote,
   // and the marker is the first generated token (`jwTokIsGenerated` reads it).
   jwSetGenTokStart(jwGenTok)
+  expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
   checkMemSharedOrigin()
   plusLinksBank()
   0
+}
+
+// The top-level names a single-source program declared under an ambient function's name, each
+// renamed to `name$m0` by `ambientRenameSingle`.
+let ambTopRenamed: string[] = []
+
+// Whether any node of the program binds an ambient function's name.
+function progBindsAmbientName(): boolean {
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let nm = ""
+    if n is FuncDecl { nm = n.fnName }
+    if n is LetDecl { nm = n.letName }
+    if n is Param { nm = n.parName }
+    if n is ForRange { nm = n.frVar }
+    if n is ForIn {
+      if isAmbientFnName(n.fiVar2) { return true }
+      nm = n.fiVar
+    }
+    if nm != "" && isAmbientFnName(nm) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The single-source half of the module merge's ambient rename: a binding named like an ambient
+// function shadows it for its whole scope, the call and its type alike (spec Q11), so a program
+// that binds one is walked once with only those rows. A program that binds none is untouched.
+function ambientRenameSingle(root: i32): i32 {
+  ambTopRenamed = []
+  if !progBindsAmbientName() { return 0 }
+  modRenameTo = []
+  modRenameFrom = []
+  modRenameFirstBySid = []
+  modRenameLastBySid = []
+  modSelfFnName = []
+  modSelfFnArity = []
+  modSelfFnMinArity = []
+  const r = P.nodes[root]
+  if r is Program {
+    for sx in r.progStmts {
+      const st = P.nodes[sx]
+      let nm = ""
+      if st is FuncDecl { nm = st.fnName }
+      if st is LetDecl { nm = st.letName }
+      if nm != "" && isAmbientFnName(nm) && !strListHas(ambTopRenamed, nm) {
+        ambTopRenamed.push(nm)
+        modRenamePush(nm, nm + "$m0")
+      }
+      if st is FuncDecl {
+        if isAmbientFnName(st.fnName) && st.fnParams.length > 0 {
+          const p0 = P.nodes[st.fnParams[0]]
+          if p0 is Param {
+            if p0.parName == "self" {
+              modSelfFnName.push(st.fnName + "$m0")
+              modSelfFnArity.push(st.fnParams.length)
+              modSelfFnMinArity.push(fnRequiredArity(st.fnParams))
+            }
+          }
+        }
+      }
+    }
+  }
+  modShadow = []
+  modShadowTo = []
+  modTyShadow = []
+  modRwMod = -1
+  modAmbMod = 0
+  modRwStmt(root)
+  modSelfFnName = []
+  modSelfFnArity = []
+  modSelfFnMinArity = []
+  0
+}
+
+// The wasm export target of a single-source program's top-level `name`.
+function ambTopTarget(name: string): string {
+  if strListHas(ambTopRenamed, name) { return name + "$m0" }
+  name
 }
 
 // 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
@@ -1029,7 +1186,9 @@ export function compileSrc(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  ambientRenameSingle(root)
   csPreMintLocs()
+  expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
   checkMemSharedOrigin()
   plusLinksBank()
@@ -1048,6 +1207,7 @@ export function compileSrc(): i32 {
   // instance left its aliases behind. The emitter exports only these entries.
   reExpName = []
   reExpTarget = []
+  const xSeen: {[string]: boolean} = Map()
   let xt = 0
   while xt + 2 < P.toks.length {
     const xk = P.toks[xt + 1].kind
@@ -1055,10 +1215,11 @@ export function compileSrc(): i32 {
       P.toks[xt].kind == "EXPORT"
       && (xk == "FUNCTION" || xk == "LET" || xk == "CONST")
       && P.toks[xt + 2].kind == "IDENT"
-      && !strListHas(reExpName, P.toks[xt + 2].text)
+      && !xSeen.has(P.toks[xt + 2].text)
     ) {
+      xSeen[P.toks[xt + 2].text] = true
       reExpName.push(P.toks[xt + 2].text)
-      reExpTarget.push(P.toks[xt + 2].text)
+      reExpTarget.push(ambTopTarget(P.toks[xt + 2].text))
     }
     xt = xt + 1
   }
@@ -1146,7 +1307,9 @@ export function checkSrc(): i32 {
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
   vcEpBank(vcSource(), root)
+  ambientRenameSingle(root)
   csPreMintLocs()
+  expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
   checkMemSharedOrigin()
   plusLinksBank()
@@ -1165,12 +1328,13 @@ export function checkSrc(): i32 {
 }
 
 // ── the typed sites the last check banked, for the lint ─────────────────────────
-// Per module and byte offset, whether each `+` link's left operand and each index read's
-// receiver checked as a string. Only a lint paired with that check reads them
-// (`lintUseCheck`): equal text under another import graph is another program.
+// Per module and byte offset: `+` left operands and index receivers that checked as a string,
+// and reads under a discarded operator statement that checked as a plain scalar. Only a lint
+// paired with that check reads them (`lintUseCheck`): equal text is another program elsewhere.
 let plSrcs: string[] = []
 let plLinks: {[i32]: i32}[] = []
 let plStrIdx: {[i32]: i32}[] = []
+let plScalar: {[i32]: i32}[] = []
 let plGen = 0
 let plBankGen = -1
 let plArmed = false
@@ -1182,6 +1346,7 @@ function plusLinksClear(): i32 {
   plSrcs = []
   plLinks = []
   plStrIdx = []
+  plScalar = []
   0
 }
 
@@ -1199,6 +1364,7 @@ function plusLinksBank(): i32 {
   plSrcs = []
   plLinks = []
   plStrIdx = []
+  plScalar = []
   plBankGen = plGen
   if modKeys.length == 0 {
     plSrcs.push(vcSource())
@@ -1215,28 +1381,44 @@ function plusLinksBank(): i32 {
     plLinks.push(e)
     const x: {[i32]: i32} = Map()
     plStrIdx.push(x)
+    const c: {[i32]: i32} = Map()
+    plScalar.push(c)
     k = k + 1
   }
-  plBankSites(plLinks, true)
-  plBankSites(plStrIdx, false)
+  plBankSites(plLinks, "plus")
+  plBankSites(plStrIdx, "strIdx")
+  plBankSites(plScalar, "scalar")
   0
 }
 
-// Fold the checker's rows into `banks`, one map per module: a site reads 1 only when every
-// check of it answered 1. `plus` picks the `+`-link table, else the index-read one.
-function plBankSites(banks: {[i32]: i32}[], plus: boolean): i32 {
-  let n = strIdxCount()
-  if plus { n = plusLinkCount() }
+// The checker's three site tables `plBankSites` folds.
+type PlTable = "plus" | "strIdx" | "scalar"
+
+// Fold the checker's rows of `table` into `banks`, one map per module: a site reads 1 only
+// when every check of it answered 1.
+function plBankSites(banks: {[i32]: i32}[], table: PlTable): i32 {
+  const n = match table {
+    "plus" => plusLinkCount()
+    "strIdx" => strIdxCount()
+    "scalar" => discLeafCollect()
+  }
   let i = 0
   while i < n {
     let tk = -1
     let v = 0
-    if plus {
-      tk = plusLinkTokAt(i)
-      v = plusLinkStrAt(i)
-    } else {
-      tk = strIdxTokAt(i)
-      v = strIdxStrAt(i)
+    match table {
+      "plus" => {
+        tk = plusLinkTokAt(i)
+        v = plusLinkStrAt(i)
+      }
+      "strIdx" => {
+        tk = strIdxTokAt(i)
+        v = strIdxStrAt(i)
+      }
+      "scalar" => {
+        tk = discLeafTokAt(i)
+        v = discLeafScalarAt(i)
+      }
     }
     if tk >= 0 && tk < P.toks.length {
       const m = modOfTok(tk)
@@ -1255,13 +1437,15 @@ function plBankSites(banks: {[i32]: i32}[], plus: boolean): i32 {
 // Hand the lint module `m`'s banked links when the bank covers `src`, else none.
 function plusLinksFor(m: i32, src: string): i32 {
   const ok = plArmed && m >= 0 && m < plSrcs.length && m < plLinks.length
-  if ok && m < plStrIdx.length && plSrcs[m] == src {
+  if ok && m < plStrIdx.length && m < plScalar.length && plSrcs[m] == src {
     lintSetPlusLinks(plLinks[m], true)
     lintSetStrIndexes(plStrIdx[m], true)
+    lintSetScalarReads(plScalar[m], true)
   } else {
     const none: {[i32]: i32} = Map()
     lintSetPlusLinks(none, false)
     lintSetStrIndexes(none, false)
+    lintSetScalarReads(none, false)
   }
   0
 }
@@ -1340,7 +1524,7 @@ let checkEntryPath = ""
 // Absolute and inside the staged checkout root — stripped to the relative remainder;
 // outside it, or with no root staged, "".
 export function lintScopeKeyOf(rawKey: string): string {
-  if rawKey.length == 0 || rawKey[0] != '/' { return rawKey }
+  if rawKey.length == 0 || !modSpecAbsolute(rawKey) { return rawKey }
   if vlCheckoutRoot.length == 0 { return "" }
   const p = vlCheckoutRoot + "/"
   if rawKey.length <= p.length || rawKey.slice(0, p.length) != p { return "" }
@@ -1354,7 +1538,7 @@ export function lintScopeKeyOf(rawKey: string): string {
 export function checkOriginKeyOf(rawKey: string): string {
   if rawKey.length == 0 { return rawKey }
   let abs = rawKey
-  if rawKey[0] != '/' {
+  if !modSpecAbsolute(rawKey) {
     if vlCwd.length == 0 { return "" }
     abs = modNormalize(vlCwd + "/" + rawKey)
   }
@@ -1698,7 +1882,9 @@ export function checkSrcSym(): i32 {
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
   vcEpBank(vcSource(), root)
+  ambientRenameSingle(root)
   csPreMintLocs()
+  expInfSetEntryStd(entryIsStdModule())
   checkProgram(root)
   checkMemSharedOrigin()
   plusLinksBank()
@@ -1734,6 +1920,14 @@ export function symBindingId(i: i32): i32 { symOccBinding(i) }
 // `modLoadStart`/`modLoadMod`; maps the occurrence's anchor token into that range.
 // Single-file mode (no module load) is always 0.
 export function modOfTok(tok: i32): i32 { srcmapModOfTok(tok) }
+
+// Whether the entry being checked is a std module: by its graph key, else by the entry path
+// relativized against the checkout root.
+function entryIsStdModule(): boolean {
+  if modKeys.length > 0 && modKeyIsStd(modKeys[0]) { return true }
+  const rel = checkOriginKeyOf(checkEntryPath)
+  rel.length >= 4 && rel.slice(0, 4) == "std/"
+}
 
 // `__memory_shared__()` is std-internal (D2355): a call outside std is refused, once
 // `checkProgram` fills `memSharedCalls` with every call it resolved to the intrinsic.
@@ -1987,6 +2181,8 @@ export function inlayModuleAt(i: i32): i32 { symOccModuleAt(symInlayOccAt(i)) }
 // where every module's AST is merged. Single-file mode has no module table, so
 // `modOfTok` returns 0 throughout (nothing filtered). Mirrors `inlayModuleAt`.
 export function redunModuleAt(i: i32): i32 { modOfTok(redunTokAt(i)) }
+// Whether finding `i` is a function's return annotation, which `check --fix` leaves alone.
+export function redunIsReturnAt(i: i32): boolean { redunRetAt(i) }
 
 // The redundant-annotation finding's message, per code point — the same byte ABI
 // `lintMsg*`/`diagMsg*` use. Type-informed, so it never appears in the parse-only
@@ -2008,6 +2204,11 @@ export function rcoalMsgByte(i: i32, j: i32): i32 { rcoalMsgAt(i)[j] }
 export function isvalModuleAt(i: i32): i32 { modOfTok(isvalTokAt(i)) }
 export function isvalMsgLen(i: i32): i32 { isvalMsgAt(i).length }
 export function isvalMsgByte(i: i32, j: i32): i32 { isvalMsgAt(i)[j] }
+
+// The inferred-export-parameter stream's module + message ABI, the same twin (D3817).
+export function expInfModuleAt(i: i32): i32 { modOfTok(expInfTokAt(i)) }
+export function expInfMsgLen(i: i32): i32 { expInfMsgAt(i).length }
+export function expInfMsgByte(i: i32, j: i32): i32 { expInfMsgAt(i)[j] }
 
 // Member hover: the rendered type string of the member access whose property name
 // is at (line, col) — `o.x`/`o?.y` — exposed per-codepoint like `typeStrAt`. A
@@ -2653,7 +2854,7 @@ export function emitFnSpanAt(off: i32): i32 {
   while i < emitFnSpanStart.length {
     // Kind 5 is a per-statement row banked for the `vl-src` section. This lookup answers the
     // invalid-module diagnostic, whose position is the declaration's by contract (D1578).
-    if emitFnSpanKindOf(i) != 5 {
+    if emitFnSpanKindOf(i) != 5 && emitFnSpanKindOf(i) != 6 {
       if off >= emitFnSpanStart[i] && off < emitFnSpanEnd[i] { return i }
     }
     i = i + 1
@@ -2661,10 +2862,10 @@ export function emitFnSpanAt(off: i32): i32 {
   -1
 }
 
-// What the body at row `i` is: 0 a user function, 1 a module-scope statement or
-// global initializer in the synthetic start function, 2 an export wrapper, 3 a
-// shared runtime helper, 4 the start function outside any statement, -1 for no row.
-// A closed set decoded in two places — here and the host's `SpanWhere::what`.
+// What the body at row `i` is: 0 a user function, 1 a module-scope statement or global
+// initializer, 2 an export wrapper, 3 a shared runtime helper, 4 the start function outside
+// any statement, 5 a statement and 6 an element read inside a body, -1 for no row. Decoded
+// here and in the host's `SpanWhere::what`.
 export function emitFnSpanKindOf(i: i32): i32 {
   if i < 0 || i >= emitFnSpanKind.length { return -1 }
   emitFnSpanKind[i]
@@ -2676,7 +2877,8 @@ function emitFnSpanTokIx(i: i32): i32 {
   // synthesized, so requiring a `declNameTok` would throw away its real position.
   // Kind 5 anchors the way a module-scope statement does — at the statement itself.
   const sk = emitFnSpanKindOf(i)
-  if sk == 1 || sk == 5 { return stmtAnchorTokIx(emitFnSpanNode[i]) }
+  // Kind 6 is an element read inside a body, anchored at the read itself.
+  if sk == 1 || sk == 5 || sk == 6 { return stmtAnchorTokIx(emitFnSpanNode[i]) }
   // The slot's pre-monomorphization original first: a mono instance, a lifted lambda
   // copy, and a pruned stub are all minted after parsing, so `addNode` anchors them
   // at the EOF token — a position that reads as real but points at the file's last
@@ -2736,6 +2938,11 @@ function emitSrcSection(): i32 {
     if files[m] == "" { files[m] = srcmapPathOf(m) }
     r = r + 1
   }
+  // A single-file program has no module table: its one file is the entry, spelled as the
+  // module table spells an entry, by its name.
+  if files.length > 0 && files[0] == "" {
+    files[0] = srcEntryName(checkEntryPath)
+  }
   const payload: u8[] = []
   const prev = wTarget(payload)
   wULEB(files.length)
@@ -2777,6 +2984,17 @@ function emitSrcSection(): i32 {
   // section's bytes at the offsets the rows name.
   wSection(0, sec)
   0
+}
+
+// The file name in path `p`: what follows its last `/`.
+function srcEntryName(p: string): string {
+  let cut = 0
+  let i = 0
+  while i < p.length {
+    if p[i] == '/' { cut = i + 1 }
+    i = i + 1
+  }
+  p.slice(cut, p.length)
 }
 
 // The `vl-extern-bool` custom section: the extern globals declared `boolean`, which cross as a
@@ -2826,6 +3044,90 @@ function emitFnSpanName(i: i32): string {
   ""
 }
 
+// The VL type wasm heap type `idx` of the module just emitted represents, or "" when it is
+// not one this names (a function type, a closure environment) or when several VL types share
+// it. A runtime rep shared by several VL types is named by its rep, never by one of its users.
+function emitTypeLabel(idx: i32): string {
+  if idx < 0 { return "" }
+  const named = emitTypeLabelNamed(idx)
+  if named != "" { return named }
+  if uDeclared && idx == uBoxIdx { return "union box" }
+  if aUsed {
+    if idx == sTypeIdx { return "string" }
+    if idx == sBackIdx { return "string bytes" }
+    if idx == aTypeIdx { return "i32 array (list and map storage)" }
+  }
+  if lUsed && idx == lTypeIdx { return "list of i32-represented elements" }
+  if ba8Used {
+    if idx == bl8TypeIdx { return "u8[]" }
+    if idx == ba8TypeIdx { return "u8[] storage" }
+  }
+  if slUsed || mUsed {
+    if idx == mkListIdx { return "string list" }
+    if idx == mkArrIdx { return "string list storage" }
+  }
+  if mUsed && idx == mStructIdx { return "string-keyed map or set" }
+  ""
+}
+
+// The one VL name a declared struct, union variant or ref-list slot gives heap type `idx`, or
+// "" when none does or two distinct names share it (a struct and its twins share one heap type).
+function emitTypeLabelNamed(idx: i32): string {
+  let found = ""
+  let clash = false
+  if sDeclared {
+    let i = 0
+    while i < sHeapIdx.length && i < sNames.length {
+      if sHeapIdx[i] == idx {
+        const n = demangleSpelling(sNames[i])
+        if found == "" { found = n }
+        else if found != n { clash = true }
+      }
+      i = i + 1
+    }
+  }
+  if uDeclared {
+    let v = 0
+    while v < uVarHeap.length && v < uVariants.length {
+      if uVarHeap[v] == idx {
+        const n = demangleSpelling(uVariants[v])
+        if found == "" { found = n }
+        else if found != n { clash = true }
+      }
+      v = v + 1
+    }
+  }
+  let r = 0
+  while r < rlElemName.length && r < rlWrapIdx.length && r < rlBackIdx.length {
+    if rlWrapIdx[r] == idx || rlBackIdx[r] == idx {
+      let n = emitTypeListOf(demangleSpelling(rlElemName[r]))
+      if rlBackIdx[r] == idx { n = n + " storage" }
+      if found == "" { found = n }
+      else if found != n { clash = true }
+    }
+    r = r + 1
+  }
+  if clash { return "" }
+  found
+}
+
+// The list type of element spelling `el`, parenthesised when it is a union.
+function emitTypeListOf(el: string): string {
+  let i = 0
+  while i < el.length {
+    if el[i] == '|' { return "(" + el + ")[]" }
+    i = i + 1
+  }
+  el + "[]"
+}
+
+export function emitTypeLabelLen(idx: i32): i32 { emitTypeLabel(idx).length }
+export function emitTypeLabelAt(idx: i32, j: i32): i32 {
+  const s = emitTypeLabel(idx)
+  if j >= 0 && j < s.length { return s[j] }
+  0
+}
+
 // The clause a diagnostic puts after "the emitted module failed to validate", for
 // the body at row `i` — "" when no row owns the offset. The host carries the same
 // ladder in Rust (`SpanWhere::what`), since `vl build`/`vl run` never enter the CLI
@@ -2835,16 +3137,19 @@ export function emitFnSpanWhere(i: i32): string {
   if k < 0 { return "" }
   if k == 1 || k == 4 { return " inside the module's top-level code" }
   if k == 2 {
-    return " inside the export wrapper for `" + emitFnSpanName(i) + "`"
+    return " inside the export wrapper for `" + emitFnSpanShown(i) + "`"
   }
   if k == 3 {
-    return " inside the shared runtime helper `" + emitFnSpanName(i) + "`"
+    return " inside the shared runtime helper `" + emitFnSpanShown(i) + "`"
   }
-  " inside `" + emitFnSpanName(i) + "`"
+  " inside `" + emitFnSpanShown(i) + "`"
 }
-export function emitFnSpanNameLen(i: i32): i32 { emitFnSpanName(i).length }
+
+// `emitFnSpanName` as the source spells it: a module merge's `$m1` suffix is not.
+function emitFnSpanShown(i: i32): string { demangleSpelling(emitFnSpanName(i)) }
+export function emitFnSpanNameLen(i: i32): i32 { emitFnSpanShown(i).length }
 export function emitFnSpanNameAt(i: i32, j: i32): i32 {
-  const s = emitFnSpanName(i)
+  const s = emitFnSpanShown(i)
   if j >= 0 && j < s.length { return s[j] }
   0
 }
@@ -2947,12 +3252,11 @@ export function diagEndCol(i: i32): i32 {
   }
   diagCol(i)
 }
-// The diagnostic's stable category code, "" when it has none. A type diagnostic
-// carries "unsupported-lowering" when the program is type-valid but uses a
-// construct codegen cannot lower yet, so tooling can tell an emitter-capability
-// rejection from a soundness verdict. Parse and emit diagnostics carry "".
-function vcDiagCode(i: i32): string {
-  if i < P.diags.length { return "" }
+// The diagnostic's stable category code, "" when it has none: "unsupported-lowering" on a
+// type-valid construct codegen cannot lower yet, apart from a soundness verdict. A parse
+// diagnostic carries one only when `check --fix` acts on it (`dgMarkCode`), an emit one never.
+export function vcDiagCode(i: i32): string {
+  if i < P.diags.length { return dgCodeOf(i) }
   const j = i - P.diags.length
   if j < T.diags.length { return T.diags[j].tcode }
   ""
@@ -2964,7 +3268,7 @@ export function diagCodeByte(i: i32, j: i32): i32 { vcDiagCode(i)[j] }
 // the coded-diagnostic ABI. The code names a bare category (`ufcs-not-imported`)
 // and this carries what that category needs, netstring-encoded so no value's
 // characters can bite the framing (`typecheck.diagDataField` documents it).
-function vcDiagData(i: i32): string {
+export function vcDiagData(i: i32): string {
   if i < P.diags.length { return "" }
   const j = i - P.diags.length
   if j < T.diags.length { return T.diags[j].tdata }
@@ -3337,6 +3641,35 @@ export function diagModule(i: i32): i32 {
 }
 
 // ── specifier resolution (ports of the host's pure string math) ───────────────
+// Whether import specifier `spec` separates segments with a backslash (`.\\util`, `C:\\x`).
+function modSpecBackslashed(spec: string): boolean {
+  for c in spec {
+    if c == '\\' { return true }
+  }
+  false
+}
+
+// Whether `spec` is an absolute path: a leading separator, or a drive letter and separator.
+function modSpecAbsolute(spec: string): boolean {
+  if spec.length > 0 && (spec[0] == '/' || spec[0] == '\\') { return true }
+  spec.length > 2 && spec[1] == ':' && (spec[2] == '/' || spec[2] == '\\')
+}
+
+// `spec` with each run of backslashes (one, or an escaped pair) a forward slash.
+function modSlashed(spec: string): string {
+  let out = ""
+  let i = 0
+  while i < spec.length {
+    if spec[i] == '\\' {
+      if i == 0 || spec[i - 1] != '\\' { out = out + "/" }
+    } else {
+      out = out + spec.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  out
+}
+
 function modIsRelative(spec: string): boolean {
   if spec.length >= 2 {
     if spec[0] == '.' && spec[1] == '/' { return true }
@@ -3445,7 +3778,7 @@ function modNormalize(path: string): string {
 // is its key verbatim; a relative spec gets `.vl` appended.
 function modResolveSpecifier(spec: string, fromKey: string): string {
   if modIsStdSpec(spec) { return spec }
-  if !modIsRelative(spec) { return "" }
+  if !modIsRelative(spec) || modSpecBackslashed(spec) { return "" }
   if modKeyIsStd(fromKey) { return "" }
   const base = modDirOf(fromKey)
   let joined = spec
@@ -3476,6 +3809,63 @@ function modExportRecord(
   expKwLine.push(kwLine)
   expKwCol.push(kwCol)
   0
+}
+
+// How far past `export` its declaration keyword sits, given the next two tokens: 2 past a
+// `flat` before `type`, or an `extern` before `function`/`let`/`const`; else 1. `more` says
+// a token follows the second, so a declared name can exist.
+function modExportDeclOff(
+  k1: TokKind,
+  t1: string,
+  k2: TokKind,
+  more: boolean,
+): i32 {
+  const flat = k1 == "IDENT" && t1 == "flat" && k2 == "TYPE"
+  const ext = k1 == "EXTERN" && k2 != "TYPE" && modExportDeclKind(k2)
+  if more && (flat || ext) { return 2 }
+  1
+}
+
+// The brace depth change token kind `k` makes: +1 for `{`, -1 for `}`, else 0.
+function modBraceStep(k: TokKind): i32 {
+  const open = k == "LBRACE"
+  const close = k == "RBRACE"
+  if open { return 1 }
+  if close { return -1 }
+  0
+}
+
+// Whether `k` opens a declaration an `export` names.
+function modExportDeclKind(k: TokKind): boolean {
+  k == "FUNCTION" || k == "LET" || k == "CONST" || k == "TYPE"
+}
+
+// The names `src` exports by a top-level declaration, as `modScan` records them, for a file
+// outside the module graph; null when it does not lex. Re-exports are not included.
+export function modExportNamesOf(src: string): string[] | null {
+  const out: string[] = []
+  const r = tokenize(src)
+  if r.diags.length > 0 { return null }
+  const toks = r.tokens
+  let depth = 0
+  let i = 0
+  while i < toks.length {
+    const k = toks[i].kind
+    depth = depth + modBraceStep(k)
+    if k == "EXPORT" && depth == 0 && i + 2 < toks.length {
+      const dOff = modExportDeclOff(
+        toks[i + 1].kind,
+        toks[i + 1].text,
+        toks[i + 2].kind,
+        i + 3 < toks.length,
+      )
+      if i + dOff + 1 < toks.length && modExportDeclKind(toks[i + dOff].kind) {
+        out.push(toks[i + dOff + 1].text)
+      }
+    }
+    i = i + 1
+  }
+  out
 }
 
 function modScan(m: i32, src: string): i32 {
@@ -3776,20 +4166,14 @@ function modScan(m: i32, src: string): i32 {
         // and the declaration keyword, so the declared name is one token further
         // along. This token-level scanner runs before any parse, so it must
         // recognize the `flat`/`type` pair itself, the same guard the parser uses.
-        let dOff = 1
-        if toks[i + 1].kind == "IDENT" && toks[i + 1].text == "flat" {
-          if i + 3 < toks.length && toks[i + 2].kind == "TYPE" { dOff = 2 }
-        }
-        // `export extern function n(…)` puts the `extern` keyword in the same slot `flat`
-        // takes, so the declared name is one token further along here too.
-        if toks[i + 1].kind == "EXTERN" {
-          if i + 3 < toks.length {
-            const xk = toks[i + 2].kind
-            if xk == "FUNCTION" || xk == "LET" || xk == "CONST" { dOff = 2 }
-          }
-        }
+        const dOff = modExportDeclOff(
+          toks[i + 1].kind,
+          toks[i + 1].text,
+          toks[i + 2].kind,
+          i + 3 < toks.length,
+        )
         const dk = toks[i + dOff].kind
-        if dk == "FUNCTION" || dk == "LET" || dk == "CONST" || dk == "TYPE" {
+        if modExportDeclKind(dk) {
           const dnt = toks[i + dOff + 1]
           modExportRecord(
             m,
@@ -3972,42 +4356,6 @@ function modMergedTargetOf(m: i32, name: string): string {
   }
   cn + "$m" + i32ToStr(cm)
 }
-// D1120 — a duplicate import is ambiguous only when the two bindings resolve to
-// different declarations. Tested on the resolved merged target (`modMergedTargetOf`),
-// not the specifier text, so the same name imported twice from one module is
-// redundant, not ambiguous. Anchored at the second occurrence, naming both specifiers.
-function modDiagDupImport(m: i32, i: i32, d: i32, spec: string): i32 {
-  const local = impLocal[i]
-  if local == "" { return 0 }
-  const here = modMergedTargetOf(d, impName[i])
-  let j = 0
-  while j < i {
-    if impMod[j] == m && impLocal[j] == local && impName[j] != "" {
-      const dj = modIndexOfKey(impKey[j])
-      if dj >= 0 {
-        if modMergedTargetOf(dj, impName[j]) != here {
-          modDiag(
-            m,
-            impNameLine[i],
-            impNameCol[i],
-            "Duplicate binding \""
-              + local
-              + "\": module `"
-              + modKeys[m]
-              + "` imports it from both \""
-              + impSpec[j]
-              + "\" and \""
-              + spec
-              + "\" — rename one (`as` on the import)",
-          )
-          return 0
-        }
-      }
-    }
-    j = j + 1
-  }
-  0
-}
 // Visits module `m`: resolves and validates its imports (unsupported specifier,
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps first.
 // The DFS recurses once per import-chain link, so an adversarially deep chain is
@@ -4058,6 +4406,31 @@ function modVisit(m: i32, depth: i32): i32 {
             "Unsupported import specifier \""
               + spec
               + "\" — std modules import only via `std:` specifiers (relative imports inside std are not allowed)",
+          )
+        } else if modSpecAbsolute(spec) {
+          // An absolute path would key the same file apart from its relative spelling, so it
+          // could load as two modules; refused until keys are canonical paths.
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
+            "Unsupported import specifier \""
+              + spec
+              + "\" — an absolute path is not an import specifier; write the path relative to this file (`./`, `../`)",
+          )
+        } else if modSpecBackslashed(spec) && !modKeyIsStd(spec) {
+          // A Windows-style separator: the specifier means the forward-slash path.
+          modDiagSpan(
+            m,
+            impSpecLine[i],
+            impSpecCol[i],
+            impSpecEnd[i],
+            "Unsupported import specifier \""
+              + spec
+              + "\" — an import path uses forward slashes: write \""
+              + modSlashed(spec)
+              + "\"",
           )
         } else {
           modDiagSpan(
@@ -4132,10 +4505,8 @@ function modVisit(m: i32, depth: i32): i32 {
                   + "\" is not exported by \""
                   + spec
                   + "\""
-                  + modBuiltinImportNote(impName[i]),
+                  + modNotExportedNote(m, d, impName[i], spec),
               )
-            } else {
-              modDiagDupImport(m, i, d, spec)
             }
           }
         }
@@ -4147,6 +4518,55 @@ function modVisit(m: i32, depth: i32): i32 {
   modOrder.push(m)
   0
 }
+// The tail of the not-exported refusal for `name` imported by module `m` from module `d`
+// as `spec`: the builtin note, else the modules that do export it, else `d`'s near misses.
+// One exporter is recorded for `check --fix`, which moves the name to that module's import.
+function modNotExportedNote(
+  m: i32,
+  d: i32,
+  name: string,
+  spec: string,
+): string {
+  const builtin = modBuiltinImportNote(name)
+  if builtin != "" { return builtin }
+  const specs = mimpSpecsFor(name, m, d)
+  if specs.length > 0 {
+    if specs.length == 1 { mimpNoteMoved(m, name, spec, specs[0]) }
+    return mimpExportedByNote(name, specs, m)
+  }
+  const near = mimpNearMisses(name, d)
+  if near.length == 0 { return "" }
+  let out = " — did you mean `" + near[0] + "`"
+  let i = 1
+  while i < near.length {
+    if i == near.length - 1 { out = out + " or `" } else { out = out + ", `" }
+    out = out + near[i] + "`"
+    i = i + 1
+  }
+  out + "?"
+}
+
+// Fills the missing-import index for this graph, once, before any diagnostic can ask it.
+// A re-export joins only when its origin exports no such name, i.e. under a new name;
+// otherwise it names a declaration already indexed, and the declaring module is the answer.
+function modMissingImportIndex() {
+  mimpBegin(modKeys, impMod, impKey, impSpec)
+  let e = 0
+  while e < expMod.length {
+    mimpAddExport(expName[e], expMod[e])
+    e = e + 1
+  }
+  let r = 0
+  while r < reExpMod.length {
+    const origin = modIndexOfKey(reExpKey[r])
+    if origin < 0 || !modExportsHas(origin, reExpPublic[r]) {
+      mimpAddExport(reExpPublic[r], reExpMod[r])
+    }
+    r = r + 1
+  }
+  0
+}
+
 // The tail of the not-exported refusal when the name is a builtin, which no module exports
 // because every module already sees it (D3621); "" for any other name.
 function modBuiltinImportNote(name: string): string {
@@ -4172,6 +4592,7 @@ function modCompile(emit: i32): i32 {
     modState.push(0)
     s = s + 1
   }
+  modMissingImportIndex()
   modVisit(0, 0)
   if modDiags.length > 0 {
     // Tokenless (no tokens are loaded yet): position, span + owner ride the
@@ -4235,13 +4656,10 @@ function modCompile(emit: i32): i32 {
   // quantifier spans the WHOLE graph — one lossy diagnostic in any module stops
   // the merge for all of them, which is what the shared arena requires anyway.
   if vcParseBlocked() { return 1 }
-  // 2b. Duplicate-binding check: a top-level declaration whose name collides
-  // with an import local would be silently ORPHANED by the merge rename (the
-  // import mapping wins, so every reference rewrites to the IMPORT's target) —
-  // diagnose the collision instead of misbinding.
+  // 2b. The reserved-name rules. Duplicate bindings are decided after the rewrite below,
+  // by `modCheckOverloads`, which needs every function's merged first-parameter type.
   let dc = 0
   while dc < modOrder.length {
-    modCheckDupBindings(modOrder[dc], roots[dc])
     // The same pre-rename window, and the only one: after `modBuildRename` the declared
     // name is `f64$mN` and the reserved-name rules have nothing left to recognise.
     modCheckReservedDecls(roots[dc])
@@ -4250,9 +4668,6 @@ function modCompile(emit: i32): i32 {
     modCheckReservedImports(modOrder[dc], roots[dc], modLoadStart[dc], tEnd)
     dc = dc + 1
   }
-  // A duplicate binding is never lossless-flagged, so this stays a hard stop —
-  // the merge rename below would misbind on it, which is not a diagnostic the
-  // checker could improve on.
   if vcParseBlocked() { return 1 }
   // 3 + 4. Per-module rename map + scope-aware arena rewrite. First register
   // every top-level `self`-function under its mangled name (across ALL modules)
@@ -4272,11 +4687,20 @@ function modCompile(emit: i32): i32 {
     // is one the CALLER binds rather than one any module happened to bank.
     modBankUfcsScope(modOrder[o2])
     ufcsModBoundAdd(modOrder[o2], roots[o2])
+    modNoteOverloads(modOrder[o2])
     modShadow = []
+    modShadowTo = []
     modTyShadow = []
+    modRwMod = modOrder[o2]
+    modAmbMod = modOrder[o2]
     modRwStmt(roots[o2])
     o2 = o2 + 1
   }
+  modRwMod = -1
+  // A duplicate binding is never lossless-flagged, so this stays a hard stop: a name two
+  // overlapping declarations share has no answer the checker could improve on.
+  modCheckOverloads(roots)
+  if vcParseBlocked() { return 1 }
   // 4b. Resolves each of the root module's re-exports to its merged target, aliasing
   // the bare `name` onto it in the export section. Only module 0's rows: a
   // dependency's re-export is that dependency's own surface, and aliasing every
@@ -4311,9 +4735,15 @@ function modCompile(emit: i32): i32 {
   // bare names too, appended to the same alias tables, exactly like a re-export.
   // The emitter exports only these alias tables, so an internal function (a lifted
   // lambda, a mono instance) never leaks into the wasm ABI.
+  const rexSeen: {[string]: boolean} = Map()
+  let rsi = 0
+  while rsi < reExpName.length {
+    rexSeen[reExpName[rsi]] = true
+    rsi = rsi + 1
+  }
   let rex = 0
   while rex < expMod.length {
-    if expMod[rex] == 0 && !strListHas(reExpName, expName[rex]) {
+    if expMod[rex] == 0 && !rexSeen.has(expName[rex]) {
       // An exported EXTERN publishes to VL importers and not to the wasm ABI: there is no
       // local function to forward to, so an alias row would name a target the merge never
       // defines. Its own import entry is what a host sees.
@@ -4321,6 +4751,7 @@ function modCompile(emit: i32): i32 {
         externLinkOf(expName[rex] + "$m0") < 0
         && externGlobalLinkOfName(expName[rex] + "$m0") < 0
       ) {
+        rexSeen[expName[rex]] = true
         reExpName.push(expName[rex])
         reExpTarget.push(expName[rex] + "$m0")
       }
@@ -4345,6 +4776,7 @@ function modCompile(emit: i32): i32 {
   }
   const merged = mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
   csPreMintLocs()
+  expInfSetEntryStd(entryIsStdModule())
   checkProgram(merged)
   checkMemSharedOrigin()
   plusLinksBank()
@@ -4385,48 +4817,6 @@ function modDeclBase(ix: i32, name: string): string {
 function modRwDeclBase(ix: i32): i32 {
   const b = declGpBaseOf(ix)
   if b != "" { setDeclGpBase(ix, modTypeRenamed(b)) }
-  0
-}
-// Diagnoses every top-level declaration of module `m` whose name collides with one
-// of its import locals. Without this, the merge rename skips the declaration (the
-// import mapping claims the name) and every reference silently rewrites to the
-// import's target instead. Anchored at the declaration's own name token.
-function modCheckDupBindings(m: i32, root: i32): i32 {
-  const impLocals: string[] = []
-  let ii = 0
-  while ii < impMod.length {
-    if impMod[ii] == m && impLocal[ii] != "" { impLocals.push(impLocal[ii]) }
-    ii = ii + 1
-  }
-  const r = P.nodes[root]
-  if r is Program {
-    const ss = r.progStmts
-    let si = 0
-    while si < ss.length {
-      const st = P.nodes[ss[si]]
-      let nm = ""
-      if st is FuncDecl { nm = st.fnName }
-      if st is LetDecl { nm = st.letName }
-      if st is TypeDecl { nm = st.tdName }
-      if st is UnionDecl { nm = st.udName }
-      if nm != "" {
-        const base = modDeclBase(ss[si], nm)
-        if strListHas(impLocals, base) {
-          P.diags.push(
-            {
-              msg: "Duplicate binding \""
-                + base
-                + "\": module `"
-                + modKeys[m]
-                + "` both imports and declares it — rename one (`as` on the import)",
-              at: declNameTokOf(ss[si]),
-            },
-          )
-        }
-      }
-      si = si + 1
-    }
-  }
   0
 }
 // The reserved-name rules, in a module either: a `type` may not take a builtin type name
@@ -4483,6 +4873,11 @@ function modCheckReservedImports(m: i32, root: i32, t0: i32, t1: i32): i32 {
   }
   0
 }
+// A type-position name only a `type` row may rename: a built-in type, or `Map`/`Set`, whose
+// value of the same name (an ambient function) a declaration may shadow without taking the type.
+function tyNameTypeRowOnly(name: string): boolean {
+  isBuiltinTyName(name) || name == "Map" || name == "Set"
+}
 // The type-position rename of one identifier segment — the last matching row's
 // target, or the segment unchanged. D1571's gate lives here rather than in either
 // reader, since the spelling tree and the character scanner are two spellings of
@@ -4493,7 +4888,7 @@ function modTyRenamedSeg(seg: string) {
   // A builtin type name is renamed only by a `type` row. Every other segment keeps
   // the last-row rule byte for byte, since a user name that is both a type and a
   // value mints one target for both.
-  if isBuiltinTyName(seg) {
+  if tyNameTypeRowOnly(seg) {
     if !strListHas(modBuiltinTyTargets, modRenameTo[row]) { return seg }
   }
   modRenameTo[row]
@@ -4537,20 +4932,21 @@ function modBuildRename(m: i32, root: i32): i32 {
       if st is TypeDecl { nm = st.tdName }
       if st is UnionDecl { nm = st.udName }
       if nm != "" {
+        // Declarations land ahead of the imports, so a value reference to a name both bind
+        // takes the local one (`modRenamed` reads the first row); `modCheckOverloads` decides
+        // whether the two may coexist at all.
         const base = modDeclBase(ss[si], nm)
-        if !strListHas(impLocals, base) {
-          modRenamePush(base, base + suffix)
-          // D1571 — a `type` declaration that took a BUILTIN name is the one row that may
-          // rewrite that name in type position. Registered on the TARGET, so an IMPORT of it
-          // needs no kind of its own: the import row renames onto this same `base$mN`.
-          if isBuiltinTyName(base) {
-            let isTyDecl = false
-            if st is TypeDecl { isTyDecl = true }
-            if st is UnionDecl { isTyDecl = true }
-            if isTyDecl {
-              if !strListHas(modBuiltinTyTargets, base + suffix) {
-                modBuiltinTyTargets.push(base + suffix)
-              }
+        modRenamePush(base, base + suffix)
+        // D1571 — a `type` declaration that took a BUILTIN name is the one row that may
+        // rewrite that name in type position. Registered on the TARGET, so an IMPORT of it
+        // needs no kind of its own: the import row renames onto this same `base$mN`.
+        if tyNameTypeRowOnly(base) {
+          let isTyDecl = false
+          if st is TypeDecl { isTyDecl = true }
+          if st is UnionDecl { isTyDecl = true }
+          if isTyDecl {
+            if !strListHas(modBuiltinTyTargets, base + suffix) {
+              modBuiltinTyTargets.push(base + suffix)
             }
           }
         }
@@ -4609,6 +5005,7 @@ function modCollectSelfFns(roots: i32[]): i32 {
     const m = modOrder[o]
     modBuildRename(m, roots[o])
     modShadow = []
+    modShadowTo = []
     const r = P.nodes[roots[o]]
     if r is Program {
       const ss = r.progStmts
@@ -4734,15 +5131,527 @@ function modBankUfcsScope(m: i32): i32 {
   }
   0
 }
+// The distinct targets the live rename map binds `name` to, in row order (local first).
+function modCandsOf(name: string): string[] {
+  const out: string[] = []
+  const s = sidLookup(name)
+  const first = sidArrGet(modRenameFirstBySid, s)
+  if first < 0 { return out }
+  const last = sidArrGet(modRenameLastBySid, s)
+  let r = first
+  while r <= last {
+    if modRenameFrom[r] == name && !strListHas(out, modRenameTo[r]) {
+      out.push(modRenameTo[r])
+    }
+    r = r + 1
+  }
+  out
+}
+// The import row through which module `m` binds `name` to `target`, or -1 (its own).
+function modOvImpRow(m: i32, name: string, target: string): i32 {
+  let ii = 0
+  while ii < impMod.length {
+    if impMod[ii] == m && impLocal[ii] == name && impName[ii] != "" {
+      const dd = modIndexOfKey(impKey[ii])
+      if dd >= 0 && modMergedTargetOf(dd, impName[ii]) == target { return ii }
+    }
+    ii = ii + 1
+  }
+  -1
+}
+// Banks every name module `m`'s live rename map binds to two or more targets as a set.
+// Whether the set may stand is `modCheckOverloads`' question, asked after the rewrite.
+function modNoteOverloads(m: i32): i32 {
+  let r = 0
+  while r < modRenameFrom.length {
+    const nm = modRenameFrom[r]
+    const s = sidLookup(nm)
+    if (
+      sidArrGet(modRenameFirstBySid, s) == r
+      && sidArrGet(modRenameLastBySid, s) != r
+    ) {
+      const cands = modCandsOf(nm)
+      if cands.length > 1 {
+        const specs: string[] = []
+        for c in cands {
+          const ii = modOvImpRow(m, nm, c)
+          if ii >= 0 { specs.push(impSpec[ii]) } else { specs.push("") }
+        }
+        ovSetAdd(m, nm, cands, specs)
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+// A plain call or a value use of an overloaded name. The local declaration answers a plain
+// call (lexical scope); any other use is refused once the set is known to be legal.
+function modOvNoteUse(identIx: i32, callIx: i32, name: string): i32 {
+  if ovSetMod.length == 0 || modRwMod < 0 { return 0 }
+  if strListHas(modShadow, name) { return 0 }
+  const row = ovSetOf(modRwMod, name)
+  if row < 0 { return 0 }
+  if callIx >= 0 && ovSetSpecs[row][0] == "" { return ovPlainAdd(callIx, row) }
+  modOvUseIx.push(identIx)
+  modOvUseRow.push(row)
+  modOvUseCall.push(callIx >= 0)
+  0
+}
+// Banks member call `ix` against its module's set for `prop`: one `self`-function among
+// the candidates is the answer outright, several leave the choice to the receiver's type.
+// False when `prop` names no set here, so the single-binding path runs unchanged.
+function modOvMemberSite(ix: i32, prop: string): boolean {
+  // A local binding of `prop` is no candidate: a method call resolves among functions only.
+  if ovSetMod.length == 0 || modRwMod < 0 { return false }
+  const row = ovSetOf(modRwMod, prop)
+  if row < 0 { return false }
+  const selfs: string[] = []
+  for c in ovSetCands[row] {
+    if modSelfFnDeclared(c) { selfs.push(c) }
+  }
+  if selfs.length == 0 { return false }
+  if selfs.length == 1 { ufcsSiteAdd(ix, selfs[0]) }
+  ovSiteAdd(ix, row)
+  true
+}
+// The token module `m` loaded at `line`:`col`, or -1.
+function modTokAt(m: i32, line: i32, col: i32): i32 {
+  let o = 0
+  while o < modLoadMod.length {
+    if modLoadMod[o] == m {
+      let t1 = P.toks.length
+      if o + 1 < modLoadStart.length { t1 = modLoadStart[o + 1] }
+      let t = modLoadStart[o]
+      while t < t1 {
+        const tok = P.toks[t]
+        if tok.line == line && tok.col == col { return t }
+        t = t + 1
+      }
+      return -1
+    }
+    o = o + 1
+  }
+  -1
+}
+// The head class of a first-parameter spelling (`ovHeadsOverlap`): the outer constructor
+// only, so `T[]` and `string[]` are both a list. A declared record, union or newtype is
+// its own class, a one-member alias its member's; a union or anything open overlaps all.
+function modOvHeadOfTs(
+  root: i32,
+  tps: string[],
+  tyDecls: {[string]: i32},
+  depth: i32,
+): string {
+  if root < 0 || depth <= 0 { return "any" }
+  const k = tsKind[root]
+  if k == TS_ARR { return "arr" }
+  if k == TS_MAP { return "map" }
+  if k == TS_FUNC { return "fn" }
+  if k == TS_LITSTR { return "str" }
+  if k == TS_LITNUM { return "num" }
+  if k == TS_PAREN && tsKidCount[root] == 1 {
+    return modOvHeadOfTs(tsKids[tsKidStart[root]], tps, tyDecls, depth - 1)
+  }
+  if k != TS_NAME && k != TS_APP { return "any" }
+  const t = tsText[root]
+  if t == "Map" { return "map" }
+  if t == "Set" { return "set" }
+  if k == TS_NAME {
+    if strListHas(tps, t) { return "any" }
+    const pc = ovPrimClass(t)
+    if pc != "" { return pc }
+  }
+  const d = tyDecls[t] ?? -1
+  if d < 0 { return "any" }
+  const dn = P.nodes[d]
+  if dn is TypeDecl { return "rec:" + t }
+  if dn is UnionDecl {
+    if dn.udNew != 0 { return "rec:" + t }
+    if dn.udVariants.length > 1 { return "any" }
+    const none: string[] = []
+    return modOvHeadOfTs(udTsRootAt(d, 0), none, tyDecls, depth - 1)
+  }
+  "any"
+}
+// The head class of function declaration `ix`'s first parameter; "none" with no parameters.
+function modOvHeadOfFn(ix: i32, tyDecls: {[string]: i32}): string {
+  const fd = P.nodes[ix]
+  if fd is FuncDecl {
+    if fd.fnParams.length == 0 { return "none" }
+    const p0 = P.nodes[fd.fnParams[0]]
+    if p0 is Param {
+      if p0.parType < 0 || p0.parRest != 0 { return "any" }
+      return modOvHeadOfTs(annTsOf(p0.parType), fd.fnTyParams, tyDecls, 8)
+    }
+  }
+  "any"
+}
+// The token a set candidate is bound at in module `m`: its import's name, or its declaration's.
+function modOvSiteTok(
+  m: i32,
+  name: string,
+  cand: string,
+  decls: {[string]: i32},
+): i32 {
+  const ii = modOvImpRow(m, name, cand)
+  if ii >= 0 { return modTokAt(m, impNameLine[ii], impNameCol[ii]) }
+  const d = decls[cand] ?? -1
+  if d >= 0 { return declNameTokOf(d) }
+  -1
+}
+// Decides every set the rewrite banked: functions whose heads are pairwise disjoint stand;
+// any other pair is a duplicate binding at the later of the two binding sites. Then refuses
+// the uses only a legal set reaches — a plain call with no local answer, a function value,
+// and a re-export — each naming the candidates.
+function modCheckOverloads(roots: i32[]): i32 {
+  if ovSetMod.length == 0 { return 0 }
+  const tyDecls: {[string]: i32} = Map()
+  const fnDecls: {[string]: i32} = Map()
+  // Every top-level declaration under the target its own module's rename row gives it
+  // (`name$mN`, spelled from its name token, since a type's merged name follows the LAST row),
+  // the binding site a refusal points at.
+  const decls: {[string]: i32} = Map()
+  let o = 0
+  while o < roots.length && o < modOrder.length {
+    const r = P.nodes[roots[o]]
+    if r is Program {
+      for si in r.progStmts {
+        const st = P.nodes[si]
+        if st is FuncDecl { fnDecls[st.fnName] = si }
+        if st is TypeDecl { tyDecls[modDeclBase(si, st.tdName)] = si }
+        if st is UnionDecl { tyDecls[modDeclBase(si, st.udName)] = si }
+        const tk = declNameTokOf(si)
+        if tk >= 0 && tk < P.toks.length {
+          decls[P.toks[tk].text + "$m" + i32ToStr(modOrder[o])] = si
+        }
+      }
+    }
+    o = o + 1
+  }
+  let row = 0
+  while row < ovSetMod.length {
+    modOvCheckSet(row, tyDecls, fnDecls, decls)
+    row = row + 1
+  }
+  let re = 0
+  while re < reExpMod.length {
+    const rr = ovSetOf(reExpMod[re], reExpLocal[re])
+    if rr >= 0 && !ovSetBad[rr] {
+      P.diags.push(
+        {
+          msg: "`export { "
+            + reExpPublic[re]
+            + " } from` cannot re-export `"
+            + reExpLocal[re]
+            + "`: here it names "
+            + ovCandsText(rr)
+            + ", and a module exports one function per name — rename the one to re-export (`export { "
+            + reExpLocal[re]
+            + " as … } from`)",
+          at: modTokAt(reExpMod[re], reExpNameLine[re], reExpNameCol[re]),
+        },
+      )
+    }
+    re = re + 1
+  }
+  let u = 0
+  while u < modOvUseIx.length {
+    const ur = modOvUseRow[u]
+    if !ovSetBad[ur] {
+      const nm = ovSetName[ur]
+      let what = ", so it cannot be used as a function value"
+      if modOvUseCall[u] {
+        what = ", and a plain call does not choose between them"
+      }
+      P.diags.push(
+        {
+          msg: "`"
+            + nm
+            + "` names "
+            + ovCandsText(ur)
+            + what
+            + " — call it as a method, `x."
+            + nm
+            + "(…)`, which picks by the receiver's type, or rename one with `as` on its import",
+          at: nodeToks[modOvUseIx[u]],
+        },
+      )
+    }
+    u = u + 1
+  }
+  modOvUseIx = []
+  modOvUseRow = []
+  modOvUseCall = []
+  0
+}
+// One set's verdict: heads recorded when it stands, the first overlapping pair reported
+// when it does not (`ovSetBad`).
+function modOvCheckSet(
+  row: i32,
+  tyDecls: {[string]: i32},
+  fnDecls: {[string]: i32},
+  decls: {[string]: i32},
+): i32 {
+  const cands = ovSetCands[row]
+  const heads: string[] = []
+  for c in cands {
+    const d = fnDecls[c] ?? -1
+    if d >= 0 { heads.push(modOvHeadOfFn(d, tyDecls)) } else { heads.push("") }
+  }
+  let i = 0
+  while i < cands.length {
+    let j = i + 1
+    while j < cands.length {
+      const notFns = heads[i] == "" || heads[j] == ""
+      const sameShape = !notFns
+        && modOvRecHeadsSameShape(heads[i], heads[j], tyDecls)
+      if notFns || ovHeadsOverlap(heads[i], heads[j]) || sameShape {
+        ovSetBad[row] = true
+        modOvDupDiag(row, i, j, heads, notFns, decls)
+        return 0
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let k = 0
+  while k < cands.length {
+    ovFnHead[cands[k]] = heads[k]
+    k = k + 1
+  }
+  0
+}
+// Whether heads `a` and `b` are two declared records of one shape. Records are structural, so
+// two names of one shape are one type and one head class (owner ruling on D3870); a newtype
+// (`new { … }`) stays its own.
+function modOvRecHeadsSameShape(
+  a: string,
+  b: string,
+  tyDecls: {[string]: i32},
+): boolean {
+  if a.length < 5 || b.length < 5 || a == b { return false }
+  if a.slice(0, 4) != "rec:" || b.slice(0, 4) != "rec:" { return false }
+  modDeclSameShape(
+    tyDecls[a.slice(4, a.length)] ?? -1,
+    tyDecls[b.slice(4, b.length)] ?? -1,
+    tyDecls,
+    8,
+  )
+}
+
+// Whether type declarations `da` and `db` are records of one shape (`modTsSameShape`).
+function modDeclSameShape(
+  da: i32,
+  db: i32,
+  tyDecls: {[string]: i32},
+  depth: i32,
+): boolean {
+  if da < 0 || db < 0 || depth <= 0 { return false }
+  if da == db { return true }
+  const an: string[] = []
+  const at: i32[] = []
+  const bn: string[] = []
+  const bt: i32[] = []
+  if (!modRecFields(da, -1, an, at) || !modRecFields(db, -1, bn, bt)) {
+    return false
+  }
+  modFieldsSameShape(an, at, bn, bt, tyDecls, depth)
+}
+
+// Whether two field lists name the same fields, in any order, of one type each.
+function modFieldsSameShape(
+  an: string[],
+  at: i32[],
+  bn: string[],
+  bt: i32[],
+  tyDecls: {[string]: i32},
+  depth: i32,
+): boolean {
+  if an.length != bn.length { return false }
+  let i = 0
+  while i < an.length {
+    let j = 0
+    while j < bn.length && bn[j] != an[i] { j = j + 1 }
+    if j >= bn.length { return false }
+    if !modTsSameShape(at[i], bt[j], tyDecls, depth - 1) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The fields of a record: declaration `d` when it is a plain record (a newtype is no record),
+// else inline object spelling `ts`; their names into `names`, type spellings into `tys`.
+function modRecFields(d: i32, ts: i32, names: string[], tys: i32[]): boolean {
+  if d >= 0 {
+    const n = P.nodes[d]
+    if !(n is TypeDecl) { return false }
+    if n.tdNew != 0 { return false }
+    for fi in n.tdFields {
+      const f = P.nodes[fi]
+      if !(f is FieldDef) { return false }
+      names.push(f.fdName)
+      tys.push(annTsOf(f.fdType))
+    }
+    return true
+  }
+  if ts < 0 || tsKind[ts] != TS_OBJ { return false }
+  let k = 0
+  while k < tsKidCount[ts] {
+    const fk = tsKids[tsKidStart[ts] + k]
+    if tsKind[fk] != TS_FIELD || tsKidCount[fk] != 1 { return false }
+    names.push(tsText[fk])
+    tys.push(tsKids[tsKidStart[fk]])
+    k = k + 1
+  }
+  true
+}
+
+// Spelling `ts` with its aliases resolved: a parenthesised type is its member, and a name for a
+// one-member alias (`type I = i32`) is that member's spelling.
+function modTsResolved(ts: i32, tyDecls: {[string]: i32}, depth: i32): i32 {
+  let t = ts
+  let n = 0
+  while t >= 0 && n < depth {
+    if tsKind[t] == TS_PAREN && tsKidCount[t] == 1 {
+      t = tsKids[tsKidStart[t]]
+    } else if tsKind[t] == TS_NAME {
+      const d = tyDecls[tsText[t]] ?? -1
+      if d < 0 { return t }
+      const dn = P.nodes[d]
+      if !(dn is UnionDecl) { return t }
+      if dn.udNew != 0 || dn.udVariants.length != 1 { return t }
+      t = udTsRootAt(d, 0)
+    } else {
+      return t
+    }
+    n = n + 1
+  }
+  t
+}
+
+// The record declaration name spelling `ts` resolves to, or -1.
+function modTsRecDecl(ts: i32, tyDecls: {[string]: i32}): i32 {
+  if ts < 0 || tsKind[ts] != TS_NAME { return -1 }
+  const d = tyDecls[tsText[ts]] ?? -1
+  if d < 0 || !(P.nodes[d] is TypeDecl) { return -1 }
+  d
+}
+
+// Whether type spellings `a` and `b` name one type: resolved through aliases, a record by its
+// fields whether named or inline, and a function type by its parameter and result types, whose
+// parameter names are documentation only.
+function modTsSameShape(
+  a0: i32,
+  b0: i32,
+  tyDecls: {[string]: i32},
+  depth: i32,
+): boolean {
+  if a0 < 0 || b0 < 0 || depth <= 0 { return false }
+  const a = modTsResolved(a0, tyDecls, depth)
+  const b = modTsResolved(b0, tyDecls, depth)
+  if a < 0 || b < 0 { return false }
+  const da = modTsRecDecl(a, tyDecls)
+  const db = modTsRecDecl(b, tyDecls)
+  const aRec = da >= 0 || tsKind[a] == TS_OBJ
+  const bRec = db >= 0 || tsKind[b] == TS_OBJ
+  if aRec || bRec {
+    if !aRec || !bRec { return false }
+    if da >= 0 && da == db { return true }
+    const an: string[] = []
+    const at: i32[] = []
+    const bn: string[] = []
+    const bt: i32[] = []
+    if (!modRecFields(da, a, an, at) || !modRecFields(db, b, bn, bt)) {
+      return false
+    }
+    return modFieldsSameShape(an, at, bn, bt, tyDecls, depth)
+  }
+  if tsKind[a] != tsKind[b] || tsKidCount[a] != tsKidCount[b] { return false }
+  if tsKind[a] != TS_FUNC && tsText[a] != tsText[b] { return false }
+  let k = 0
+  while k < tsKidCount[a] {
+    const ka = tsKids[tsKidStart[a] + k]
+    const kb = tsKids[tsKidStart[b] + k]
+    if !modTsSameShape(ka, kb, tyDecls, depth - 1) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// The duplicate-binding refusal for candidates `i` and `j` of set `row`, at the later site.
+function modOvDupDiag(
+  row: i32,
+  i: i32,
+  j: i32,
+  heads: string[],
+  notFns: boolean,
+  decls: {[string]: i32},
+): i32 {
+  const m = ovSetMod[row]
+  const nm = ovSetName[row]
+  const specs = ovSetSpecs[row]
+  let how = "imports it from both \"" + specs[i] + "\" and \"" + specs[j] + "\""
+  if specs[i] == "" || specs[j] == "" { how = "both imports and declares it" }
+  let msg = "Duplicate binding \""
+    + nm
+    + "\": module `"
+    + modKeys[m]
+    + "` "
+    + how
+    + " — rename one (`as` on the import)"
+  if !notFns {
+    ovFnHead[ovSetCands[row][i]] = heads[i]
+    ovFnHead[ovSetCands[row][j]] = heads[j]
+    msg = msg
+      + "; "
+      + ovCandText(row, i)
+      + " and "
+      + ovCandText(row, j)
+      + " overlap, and same-named functions coexist only when their first parameters differ in kind"
+  }
+  let at = modOvSiteTok(m, nm, ovSetCands[row][j], decls)
+  const ti = modOvSiteTok(m, nm, ovSetCands[row][i], decls)
+  if ti > at { at = ti }
+  P.diags.push({ msg: msg, at: at })
+  0
+}
 // A value reference: shadowed locals win, then the rename map, else unchanged. The
 // map is consulted first even though the shadow wins, since a name absent from the
 // map renames to itself either way — and it is the cheap order, since most calls on
 // a self-compile are locals with no map row, paying one `sidLookup` instead of a walk.
 function modRenamed(name: string): string {
   const row = sidArrGet(modRenameFirstBySid, sidLookup(name))
+  if row < 0 && !isAmbientFnName(name) { return name }
+  let i = modShadow.length - 1
+  while i >= 0 {
+    if modShadow[i] == name {
+      if modShadowTo[i] != "" { return modShadowTo[i] }
+      return name
+    }
+    i = i - 1
+  }
   if row < 0 { return name }
-  if strListHas(modShadow, name) { return name }
   modRenameTo[row]
+}
+// Whether `name` is one of the ambient functions a program reaches with no import. A binding of
+// one shadows it (spec Q11): the rewrite renames the binding and its references apart, so a bare
+// `print` that survives the rewrite is always the builtin.
+export function isAmbientFnName(name: string): boolean {
+  name == "print"
+    || name == "Map"
+    || name == "Set"
+    || name == "fromCodePoint"
+    || name == "fromCodePoints"
+}
+// Opens a local binding of `name` for the rest of its scope and answers the name it is declared
+// under: renamed apart from the builtin when `name` is ambient, else `name`.
+function modShadowBind(name: string): string {
+  let to = ""
+  if isAmbientFnName(name) { to = name + "$m" + i32ToStr(modAmbMod) }
+  modShadow.push(name)
+  modShadowTo.push(to)
+  if to == "" { return name }
+  to
 }
 // A type-position name ("A|B", "Point[]"): identifier segments rename through the map, quoted
 // ones copy verbatim. A block-local type is minted unique (`P` → `P$b7`) and needs no shadow;
@@ -4850,6 +5759,7 @@ function modTrimTo(stack: string[], saved: i32): string[] {
 }
 function modShadowTrim(saved: i32): i32 {
   modShadow = modTrimTo(modShadow, saved)
+  modShadowTo = modTrimTo(modShadowTo, saved)
   0
 }
 function modRwFunc(ix: i32): i32 {
@@ -4879,7 +5789,11 @@ function modRwFunc(ix: i32): i32 {
     while pi < n.fnParams.length {
       const p = P.nodes[n.fnParams[pi]]
       if p is Param {
-        modShadow.push(p.parName)
+        const pTo = modShadowBind(p.parName)
+        if pTo != p.parName {
+          p.parName = pTo
+          sidNoteNodeName(n.fnParams[pi])
+        }
         modRwType(p.parType)
         // A parameter default is an expression of the declaring module, so a
         // module-scope `const` default renames exactly like any other reference
@@ -4910,7 +5824,10 @@ function modShadowMatchBinds(n: MatchExpr, k: i32): i32 {
         let s = 0
         while s < bn.blkStmts.length {
           const st = P.nodes[bn.blkStmts[s]]
-          if st is LetDecl { modShadow.push(st.letName) }
+          if st is LetDecl {
+            st.letName = modShadowBind(st.letName)
+            sidNoteNodeName(bn.blkStmts[s])
+          }
           s = s + 1
         }
       }
@@ -4933,10 +5850,10 @@ function modRwBlock(ix: i32): i32 {
       if st is LetDecl {
         if st.letInit >= 0 { modRwExpr(st.letInit) }
         modRwType(st.letType)
-        modShadow.push(st.letName)
+        st.letName = modShadowBind(st.letName)
         sidNoteNodeName(n.blkStmts[i])
       } else if st is FuncDecl {
-        if st.fnName != "" { modShadow.push(st.fnName) }
+        if st.fnName != "" { modShadowBind(st.fnName) }
         modRwStmt(n.blkStmts[i])
       } else {
         modRwStmt(n.blkStmts[i])
@@ -5009,7 +5926,7 @@ function modRwStmt(ix: i32): i32 {
     modRwExpr(n.frTo)
     if n.frStep >= 0 { modRwExpr(n.frStep) }
     const frSaved = modShadow.length
-    modShadow.push(n.frVar)
+    n.frVar = modShadowBind(n.frVar)
     modRwStmt(n.frBody)
     modShadowTrim(frSaved)
     return 0
@@ -5017,8 +5934,8 @@ function modRwStmt(ix: i32): i32 {
   if n is ForIn {
     modRwExpr(n.fiIter)
     const fiSaved = modShadow.length
-    modShadow.push(n.fiVar)
-    if n.fiVar2 != "" { modShadow.push(n.fiVar2) }
+    n.fiVar = modShadowBind(n.fiVar)
+    if n.fiVar2 != "" { n.fiVar2 = modShadowBind(n.fiVar2) }
     modRwStmt(n.fiBody)
     modShadowTrim(fiSaved)
     return 0
@@ -5128,6 +6045,7 @@ function modRwExpr(ix: i32): i32 {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
   if n is Ident {
+    if modRwCalleeIx != ix { modOvNoteUse(ix, -1, n.identName) }
     n.identName = modRenamed(n.identName)
     // R4: the in-place name write the self-compile exercises hardest — the merge
     // renames every colliding top-level reference in every compiler module.
@@ -5141,10 +6059,17 @@ function modRwExpr(ix: i32): i32 {
     // alias instead, banked on this node (D1120), not under the plain name.
     const cf = P.nodes[n.callFn]
     if cf is Member {
-      const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
-      if target != "" { ufcsSiteAdd(ix, target) }
+      if !modOvMemberSite(ix, cf.memProp) {
+        const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
+        if target != "" { ufcsSiteAdd(ix, target) }
+      }
+    }
+    if cf is Ident {
+      modOvNoteUse(n.callFn, ix, cf.identName)
+      modRwCalleeIx = n.callFn
     }
     modRwExpr(n.callFn)
+    modRwCalleeIx = -1
     // Written type arguments are annotations in the caller's scope and rename like one (D2527).
     const tas = callTyArgsOf(ix)
     let ti = 0

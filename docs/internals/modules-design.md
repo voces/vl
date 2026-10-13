@@ -215,7 +215,7 @@ export type Point = { x: f64, y: f64 }
   exports stay gated on A9, which would generalise the split over every constructor and infer
   it rather than requiring the marker.
 - Re-exports (`export … from`) were deferred here and have since landed. What ships,
-  and what is still undecided, is §2.1.1.
+  and how the owner ruled its three questions, is §2.1.1.
 
 **Import — named imports, one line, from a specifier:**
 
@@ -275,7 +275,7 @@ import { distance as dist } from "./geometry"        // rename (in v1)
   *generated* code (the H3 self-hosted compiler) where two modules may export the
   same name. (Re-export, `export … from`, has since landed — §2.1.1.)
 
-### 2.1.1 Re-exports — what ships, and two open questions
+### 2.1.1 Re-exports — what ships, and the three questions the owner ruled
 
 **Shipped (#1196, #1197), pinned by `tests/cases/modules/reexport*/`:**
 
@@ -289,7 +289,7 @@ export { a, b as c } from "./mod"    // publishes `a` and `c`; `b` is NOT publis
   would: `export { f } from "./m2"` followed by `print(f())` runs with no `import`
   (`reexport`, `reexport-alongside-import`). JS and TS bind nothing locally here.
 - An `import { f } from "./m2"` beside `export { f } from "./m2"` is accepted with no
-  error and no warning: both reach one declaration, so the D1120 duplicate-binding
+  error and no warning (R2 rules it a warning; D4064): both reach one declaration, so the D1120 duplicate-binding
   rule does not fire, and the `duplicate-import` lint compares `import` statements only.
 - Only the ENTRY module's re-exports become wasm exports; a dependency's re-export
   is a VL-level name and stays out of the wasm ABI (#1197).
@@ -300,8 +300,8 @@ message spells the re-export of the same binding:
 `` `export { sinF64 }` names an imported binding; re-export it with `export { sinF64 } from "std:math"` ``.
 A name declared in the module is pointed at the declaration-site `export` keyword.
 
-**Open, for the owner (sunpa SP-014, SP-020).** Nothing written decides these; the
-local binding is pinned by fixtures that describe it, not by a ruling.
+**Ruled by the owner 2026-10-04: 1(a), 2 warn, 3(a)** (DECISIONS.md §"A re-export binds
+its name locally"). The questions as they were put (sunpa SP-014, SP-020):
 
 1. *Does a re-export bind locally?* (a) Yes, as today: one line both uses and
    publishes. std relies on it: `std:fs` uses `Buf` throughout with only
@@ -692,6 +692,9 @@ while Phase 2 proceeds; Phase 3 is purely additive tooling.
 - **Separate compilation + wasm-linking / component model** — adds a cross-module
   ABI + linker, fights monomorphization (forces re-instantiation or boxing), and
   the H-M2 goal is *one* module anyway. Rejected for whole-program compile.
+  If linked units ever arrive, each unit builds with `vl build --stable-layout`:
+  `-O` otherwise stores a record nested in an exported value inline, so two units
+  would see two layouts for one type (inline-records-design.md §6 Q2).
 - **A parallel module-only readonly-export mechanism** — rejected; encapsulated /
   readonly exports are an application of **A9 Readable/Writable** at the boundary
   (⬜ unstarted), not a new feature invented here.

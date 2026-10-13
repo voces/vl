@@ -139,7 +139,15 @@ CMD_PRINT_ERR  5   // write cliCmdData() (+ newline) to stderr; no commit
 CMD_READ_STDIN 6   // slurp stdin; commit via cliFileCommit(found, data)
 CMD_TEST_*   7-9   // see `test` below
 CMD_VALIDATE  10   // validate the module now in rbyte*; commit via cliValidateCommit(ok)
+CMD_TEST_ENQUEUE 11 // queue cliCmdPath() for `vl test`'s compile pool; no commit
+CMD_TEST_COMPILE 12 // compile every queued file; commit each via cliTestCompiledCommit(status)
 ```
+
+11 and 12 are NEGOTIATED rather than covered by the ABI generation below: the brain issues
+them only after the host has called `cliTestPoolStage(1)`, which a host that does not know
+them never calls, and a seed without that export is never asked. Either mismatched pair
+falls back to compiling every test file in the one instance, which is correct output, so
+neither needed a generation bump (`vl-test-design.md`, "The compile pool").
 
 ### The host↔seed ABI generation
 
@@ -333,7 +341,7 @@ Fields:
   trailing `emitErr` the emitter's one refusal, with the module phase's findings a
   prefix of `P.diags`); the other four are `compiler/cli.vl`'s report. The
   checker's advisory streams — `redundant-type`, `dead-coalesce-default`,
-  `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
+  `dead-null-test`, `deep-record-compare`, `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
   and `severity` is what says whether it refused.
 - `code` — the stable machine id: the lint rule id (`prefer-const`,
   `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
@@ -408,10 +416,18 @@ its ~2,989 per-case `vl check` spawns are 77% process floor
 (`docs/internals/test-timing-2026-09.md` §5a).
 
 `--batch` without `--json` takes the same many paths and prints the ordinary aggregate
-report; the per-file exit code has no human rendering, so it is `--json`'s alone. Every
-other spelling is untouched: without `--batch` a second positional is still the usage
-error `one path per run`, and single-path `--json` is byte-identical to what it was
-apart from the new `stage` key.
+report; the per-file exit code has no human rendering, so it is `--json`'s alone.
+
+**Without `--batch`, several paths are one aggregate run** (`vl check`, `vl fmt` and `vl
+test`; diderven DV-102). Each target is walked in argv order and keeps the shape its own
+target gives it — a named file is graded as `vl check <file>`, a walked one as a directory
+run. A file reached twice (named twice, `./a.vl` beside `a.vl`, or by its directory and by
+name) is checked once; `cliPathKey` compares the two spellings with `.` and `..` segments
+collapsed lexically. Every named file is read before any work starts, so a MISSING one exits
+2 naming it with nothing printed, fixed or formatted. A file that exists but does not PARSE
+is not that: it is reported as its own parse error and the other files still run, exactly as
+one bad file in a directory run does. Single-path `--json` is byte-identical to what it was
+apart from the `stage` key.
 
 ## `std:` diagnostics are withheld unless asked for (`--include-std`)
 
@@ -597,6 +613,8 @@ needs:
 | 7 | `CMD_TEST_STASH` | keep the module the brain just emitted (`rbyteLen`/`rbyteAt`/`rbyteStore`) |
 | 8 | `CMD_TEST_COLLECT` | instantiate each stashed module across a thread pool, read its `vlt*` registry back |
 | 9 | `CMD_TEST_RUN` | run the brain's plan across the pool, catching a trap per test |
+| 11 | `CMD_TEST_ENQUEUE` | queue one discovered file for the compile pool |
+| 12 | `CMD_TEST_COMPILE` | compile every queued file, each in a fresh compiler instance, and commit the outcomes in queue order |
 
 Everything else — discovery (the same walk with a `*.test.vl` predicate),
 compilation, the plan, `-t` filtering, the report and the exit code — is VL in
@@ -675,6 +693,22 @@ temp-file + rename. `tests/vl_module_cache_test.ts` pins hit, each rejection, op
 pruning order and throttle; the safety argument is DECISIONS.md §"A user module's
 Cranelift compile is cached".
 
+### The compile cache (host, opt-in)
+
+`VL_COMPILE_CACHE=1` keeps the module a `vl build`, or a pooled `vl test` file, emitted under
+`<cache dir>/compile/`, keyed on the seed, the host build, the keyed environment, what the host
+stages and every module the compiler was handed (incremental-compilation-design.md §4.1, S1).
+Under `-O`/`-O3` it also keeps the optimized module (and its `--source-map` map), keyed on the
+bytes the `-O` chain was given, so a hit skips the host's steps and `wasm-opt` (S2); its trace
+lines read `-O hit`, `-O miss`, …. Off by default.
+
+| variable | effect |
+| --- | --- |
+| `VL_NO_COMPILE_CACHE=1` | no lookup and no store, even when enabled |
+| `VL_COMPILE_CACHE_MAX_MB=<n>` | prune target, default 4096 |
+| `VL_COMPILE_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `stored`, `verified`, `off (<why>)` |
+| `VL_COMPILE_CACHE_VERIFY=1` | every hit also compiles cold; a difference exits **71** |
+
 ### `build` flags (today's host surface)
 
 `build` is the one command whose flags are still parsed entirely in Rust
@@ -696,6 +730,7 @@ Cranelift compile is cached".
 | `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
 | `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
 | `--low-memory-unused[=<bytes>]` | with `-O`/`-O3`: promise no access reaches the first `<bytes>` (default 1024; decimal or `0x`, 1..2^31-1), so `p + C` and `(p + C) as% i32` move `C` into the memarg while `C` plus the access's offset is below it; a heap base inside the region exits 2 (DECISIONS.md, "PL-061") |
+| `--stable-layout` | with `-O`/`-O3`: keep the layout of every record and list an export or import can reach through fields, list elements and union boxes; by default only a record a boundary signature names keeps it, and a list of nested records may be flattened (inline-records-design.md §6 Q2, S2); without an optimizing rung exits 2 |
 | `--compiler <f>` | the compiler module to compile with |
 
 The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*`/`--initial*`/

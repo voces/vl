@@ -63,6 +63,8 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `shadowed-local` | LANGUAGE | a block-scoped binding hiding one of the same function (D3579) | n/a (new) | everywhere |
 | `shadowed-function` | LANGUAGE | a function's binding hiding a module function or builtin that the function calls above it (D3599) | n/a (new) | everywhere |
 | `byte-as-code-point` | LANGUAGE | a string's byte `s[i]` passed straight to a code-point position (D3641) | n/a (new) | everywhere |
+| `float-list-as-vector` | LANGUAGE | a 2–4-element `f64[]`/`f32[]` literal returned, passed to a parameter read only at fixed indexes, or bound to a local read that way (`hint`; sunpa item b) | n/a (new) | everywhere |
+| `shift-mask-is-logical-shift` | LANGUAGE | `(x >> k) & mask` where the mask makes it exactly `x >>> k` (`hint`; sunpa item b) | n/a (new) | everywhere |
 | `prefer-interpolation` | LANGUAGE (decided) | see below; `scripts/interp-budget.py` holds the repo's own debt | not under `compiler/` | everywhere except `compiler/` (unchanged) |
 | `compiler-no-interpolation` | INTERNAL | the seed must load with no host imports (CLAUDE.md "After editing compiler/*.vl") | `compiler/` only | `compiler/` only (unchanged) |
 | `std-comment-audience` | INTERNAL | `docs/internals/std-api-review.md` §4; no baseline, gated at zero by `lint-self.sh` | `std/` / `std:` only | `std/` / `std:` only (unchanged) |

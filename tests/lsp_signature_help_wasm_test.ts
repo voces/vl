@@ -10,6 +10,7 @@
 // Cursor positions in the pure table are written as a `|` in the source string
 // and stripped before the scan, so the case reads the way the user's screen does.
 
+import { filePath } from "./support/filePath.ts";
 import {
   callSiteAt,
   repairedSource,
@@ -17,7 +18,7 @@ import {
 } from "../lsp/src/signatureHelp.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);

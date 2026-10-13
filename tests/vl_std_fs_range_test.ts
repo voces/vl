@@ -20,6 +20,7 @@
 //
 // @test-timing native
 
+import { makeTempDir } from "./support/filePath.ts";
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
 
 const STD = `${ROOT}/std`;
@@ -47,7 +48,7 @@ const makeFile = async (path: string): Promise<void> => {
 
 /** Compile and run `src` through the native `vl`, with `VL_STD` pinned to this tree. */
 const run = async (src: string): Promise<string> => {
-  const dir = await Deno.makeTempDir({ prefix: "vl_std_fs_range_" });
+  const dir = await makeTempDir({ prefix: "vl_std_fs_range_" });
   const entry = `${dir}/probe.vl`;
   await Deno.writeTextFile(entry, src);
   try {
@@ -135,7 +136,7 @@ Deno.test({
     "std:fs: readFileRange seeks — a window past 3 MiB holds that offset's bytes",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_range_data_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_range_data_" });
     const path = `${dir}/pattern.bin`;
     try {
       await makeFile(path);
@@ -160,7 +161,7 @@ Deno.test({
     "std:fs: the last window is short and the one after it is empty, not an error",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_range_tail_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_range_tail_" });
     const path = `${dir}/pattern.bin`;
     try {
       await makeFile(path);
@@ -183,7 +184,7 @@ Deno.test({
   name: "std:fs: fileSize tracks the file, and matches what a scan reads back",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_fs_range_size_" });
+    const dir = await makeTempDir({ prefix: "vl_fs_range_size_" });
     const path = `${dir}/grow.bin`;
     try {
       await Deno.writeFile(path, new Uint8Array(1000));

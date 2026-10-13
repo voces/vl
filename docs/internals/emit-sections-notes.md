@@ -197,7 +197,7 @@ THE SAFETY PREDICATE is P1 here plus P2/P3 in `globalPromotable` plus P4 below:
       nothing else.
 
 P4 subsumes the export question rather than testing it separately. An `export let`
-produces no export entry at all (`exportSlotOfTarget` matches `FuncDecl`s only), the
+produces no export entry at all (`fnFirstSlotByName` maps `FuncDecl`s only), the
 name section has no global-name subsection, and a VL program runs BY INSTANTIATION —
 the start section IS the top level, with nothing before it and nothing after it. So
 the start function's frame is the whole observable lifetime of a binding no other

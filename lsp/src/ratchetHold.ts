@@ -9,7 +9,7 @@
 // ratchet scripts read the CLI and its output is graded byte-for-byte elsewhere.
 
 import { readFileSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 
 /**
@@ -192,7 +192,8 @@ export const workspaceRelative = (
   filePath: string,
 ): string | undefined => {
   const rel = relative(root, filePath);
-  if (rel.length === 0 || rel.startsWith("..")) return undefined;
+  // On Windows a path on another drive has no relative form: `relative` returns it absolute.
+  if (rel.length === 0 || rel.startsWith("..") || isAbsolute(rel)) return undefined;
   return sep === "/" ? rel : rel.split(sep).join("/");
 };
 

@@ -83,10 +83,12 @@ import {
   strLitRecvTy,
   tyArrayElemIx,
   tyBearsNull,
+  tyEq,
   tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
+  tyIsMap,
   tyIsNulValueUnionBox,
   tyPrimNameOf,
   tySame,
@@ -134,6 +136,7 @@ import {
   UnionDecl,
   WhileStmt,
   addNode,
+  arenaNoteRefWrite,
   arenaSetNode,
   callSiteLocOf,
   elseIfLink,
@@ -195,6 +198,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { emitFailAt } from "./emit_bytes"
+import { cloUnboxPick } from "./emit_lift"
 import { assignTags, registerInlineUnion } from "./emit_collect"
 import {
   bodyRebuiltFrom,
@@ -600,6 +604,326 @@ function lvLeaves(
   brk == label && !shadow
 }
 
+// ── nullable scalar locals (SP-046) ────────────────────────────────────────────────────────
+
+// A function-local `const g = e` of type `S | null`, `S` a wide numeric scalar, whose every use
+// is a null test, a narrowed read or `g ?? d`, becomes `let $np: boolean = true` and
+// `const $nv: S = e ?? (if true { $np = false  0 } else { 0 })`: the fused `??` reads the
+// value without a box. Any other use, a capture or a shadowing name keeps the boxed binding.
+export function nulScalarSplit(rootIx: i32) {
+  const todo: i32[] = [rootIx]
+  const todoMode: i32[] = [0]
+  const blocks: i32[] = []
+  const lets: i32[] = []
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    let mode = todoMode.pop() ?? 0
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is FuncDecl {
+        if n.fnTyParams.length > 0 || mode == 2 { mode = 2 } else { mode = 1 }
+      }
+      if n is Block {
+        if mode == 1 {
+          for s in n.blkStmts {
+            if nssCandidate(s) {
+              blocks.push(ix)
+              lets.push(s)
+            }
+          }
+        }
+      }
+      for k in nodeChildren(ix) {
+        todo.push(k)
+        todoMode.push(mode)
+      }
+    }
+  }
+  let i = 0
+  while i < lets.length {
+    nssTry(blocks[i], lets[i])
+    i = i + 1
+  }
+  if lets.length > 0 {
+    capMemoNoteEdit()
+    plCacheBust()
+  }
+  0
+}
+
+// The scalar `S` of a `const` whose initializer is typed `S | null`, or -1.
+function nssScalarOf(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letKw != "const" || d.letInit < 0 { return -1 }
+    const t = nodeTyIxOf(d.letInit)
+    if t < 0 { return -1 }
+    const s = nonNullTy(t)
+    if s == t { return -1 }
+    const prim = tyPrimNameOf(s)
+    if prim == "i32" || prim == "i64" || prim == "f64" || prim == "f32" {
+      if nssFusedInit(d.letInit) { return s }
+    }
+  }
+  -1
+}
+
+// True when `e ?? d` over the initializer `ix` is a fused read that makes no box: a map read
+// (`m[k]`, `m.get(k)`), a scalar list's `.get(i)` or `.pop()`. Any other
+// producer already hands over a box, and splitting it only hides the box from the optimizer.
+function nssFusedInit(ix: i32): boolean {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Index { return tyIsMap(nodeTyIxOf(e.idxArr)) }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      const rt = nodeTyIxOf(callee.memObj)
+      if callee.memProp == "get" && e.callArgs.length == 1 {
+        return tyIsMap(rt) || tyArrayElemIx(rt) >= 0
+      }
+      if callee.memProp == "pop" && e.callArgs.length == 0 {
+        return tyArrayElemIx(rt) >= 0
+      }
+    }
+  }
+  nssBoxedProducer(ix)
+}
+
+// Every other initializer, a call returning `S | null` among them, is a producer whose value
+// is already a box when it arrives, so it is never split.
+function nssBoxedProducer(_ix: i32): boolean { false }
+
+function nssCandidate(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  nssScalarOf(ix) >= 0
+}
+
+// True when `ix` is the bare name `name`.
+function nssIsName(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  false
+}
+
+// True when node `ix` declares `name` (a shadow the walk does not follow), or is a `match`,
+// which the checker desugars before this pass and so is not expected here.
+function nssDeclares(ix: i32, name: string): boolean {
+  const n = P.nodes[ix]
+  if n is LetDecl { return n.letName == name }
+  if n is Param { return n.parName == name }
+  if n is ForRange { return n.frVar == name }
+  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
+  if n is FuncDecl { return n.fnName == name }
+  if n is MatchExpr { return true }
+  nssBindsNoName(ix)
+}
+
+// Every other node kind binds no name of its own.
+function nssBindsNoName(_ix: i32): boolean { false }
+
+// Classifies every use of the `const` at `letIx`, the statement of block `blk`, and rewrites
+// them and the binding when all qualify.
+function nssTry(blk: i32, letIx: i32) {
+  const b = P.nodes[blk]
+  const d = P.nodes[letIx]
+  if b is Block {
+    if d is LetDecl {
+      const s = nssScalarOf(letIx)
+      const t = nodeTyIxOf(d.letInit)
+      const name = d.letName
+      const st = b.blkStmts
+      let at = -1
+      let i = 0
+      while i < st.length {
+        if st[i] == letIx { at = i }
+        i = i + 1
+      }
+      if at < 0 { return 0 }
+      // The uses, by kind: a test yielding presence, one yielding absence, a read, a `??`.
+      const pres: i32[] = []
+      const abs: i32[] = []
+      const reads: i32[] = []
+      const coals: i32[] = []
+      const todo: i32[] = []
+      const inFn: boolean[] = []
+      let j = st.length - 1
+      while j > at {
+        todo.push(st[j])
+        inFn.push(false)
+        j = j - 1
+      }
+      while todo.length > 0 {
+        const ix = todo.pop() ?? -1
+        const fn = inFn.pop() ?? false
+        if ix >= 0 && ix < P.nodes.length {
+          if nssDeclares(ix, name) { return 0 }
+          const n = P.nodes[ix]
+          let kids = true
+          if n is Ident {
+            if n.identName == name {
+              if fn || !tyEq(nodeTyIxOf(ix), s) { return 0 }
+              reads.push(ix)
+            }
+          } else if n is BinExpr {
+            const op = n.binOp
+            if op == "==" || op == "!=" {
+              let operand = -1
+              if nssIsName(n.binLeft, name) && P.nodes[n.binRight] is NullLit {
+                operand = n.binLeft
+              }
+              if nssIsName(n.binRight, name) && P.nodes[n.binLeft] is NullLit {
+                operand = n.binRight
+              }
+              if operand >= 0 {
+                if fn || !tyEq(nodeTyIxOf(operand), t) { return 0 }
+                if op == "==" { abs.push(ix) } else { pres.push(ix) }
+                kids = false
+              }
+            } else if op == "??" && nssIsName(n.binLeft, name) {
+              if fn || !tyEq(nodeTyIxOf(n.binLeft), t) { return 0 }
+              coals.push(ix)
+              todo.push(n.binRight)
+              inFn.push(fn)
+              kids = false
+            }
+          } else if n is IsExpr {
+            if nssIsName(n.isObj, name) {
+              if fn || !tyEq(nodeTyIxOf(n.isObj), t) { return 0 }
+              if n.isVariant == "null" { abs.push(ix) }
+              else if n.isVariant == tyToStr(s) { pres.push(ix) }
+              else { return 0 }
+              kids = false
+            }
+          }
+          if kids {
+            const inner = fn || n is FuncDecl
+            for k in nodeChildren(ix) {
+              todo.push(k)
+              inFn.push(inner)
+            }
+          }
+        }
+      }
+      nssRewrite(b, at, d, s, pres, abs, reads, coals)
+    }
+  }
+  0
+}
+
+// Applies `nssTry`'s verdict: the two bindings replace the `const` at `st[at]`, and each use
+// is overwritten in place with its read of them.
+function nssRewrite(
+  b: Block,
+  at: i32,
+  d: LetDecl,
+  s: i32,
+  pres: i32[],
+  abs: i32[],
+  reads: i32[],
+  coals: i32[],
+) {
+  const pos = d.pos
+  const np = "$np" + i32ToStr(b.blkStmts[at])
+  const nv = "$nv" + i32ToStr(b.blkStmts[at])
+  const tb = lvTyBool()
+  const init = mkBool(1, pos)
+  nodeTyRecord(init, tb)
+  const npDecl = mkLet("let", np, synthTypeRefTy("boolean", pos, tb), init, pos)
+  nodeTyRecord(npDecl, lvTyVoid())
+  const npT = mkIdent(np, pos)
+  nodeTyRecord(npT, tb)
+  const clr = mkBool(0, pos)
+  nodeTyRecord(clr, tb)
+  const asg = mkBinary("=", npT, clr, pos)
+  nodeTyCarry(asg, clr)
+  const missSt: i32[] = [asg, nssZero(s, pos)]
+  const miss = mkBlock(missSt, pos)
+  nodeTyRecord(miss, s)
+  const otherSt: i32[] = [nssZero(s, pos)]
+  const other = mkBlock(otherSt, pos)
+  nodeTyRecord(other, s)
+  const cond = mkBool(1, -1)
+  nodeTyRecord(cond, tb)
+  const def = mkIf(cond, miss, other, pos)
+  nodeTyRecord(def, s)
+  valueIfAdd(def)
+  const co = mkBinary("??", d.letInit, def, pos)
+  nodeTyRecord(co, s)
+  const nvDecl = mkLet(
+    "const",
+    nv,
+    synthTypeRefTy(tyToEmitName(s), pos, s),
+    co,
+    pos,
+  )
+  nodeTyRecord(nvDecl, lvTyVoid())
+  const old = b.blkStmts
+  const st: i32[] = []
+  let i = 0
+  while i < old.length {
+    if i == at {
+      st.push(npDecl)
+      st.push(nvDecl)
+    } else {
+      st.push(old[i])
+    }
+    i = i + 1
+  }
+  b.blkStmts = st
+  for ix in pres { nssSetName(ix, np, tb) }
+  for ix in abs {
+    const id = mkIdent(np, -1)
+    nodeTyRecord(id, tb)
+    const un: Node = { unOp: "!", unArg: id, pos: P.nodes[ix].pos }
+    arenaSetNode(ix, un)
+    nodeTyRecord(ix, tb)
+  }
+  for ix in reads { nssSetName(ix, nv, s) }
+  for ix in coals {
+    const c = P.nodes[ix]
+    if c is BinExpr {
+      const ty = nodeTyIxOf(ix)
+      const cp = mkIdent(np, -1)
+      nodeTyRecord(cp, tb)
+      const cv = mkIdent(nv, -1)
+      nodeTyRecord(cv, s)
+      const thenSt: i32[] = [cv]
+      const thenB = mkBlock(thenSt, -1)
+      nodeTyRecord(thenB, ty)
+      const elseSt: i32[] = [c.binRight]
+      const elseB = mkBlock(elseSt, -1)
+      nodeTyRecord(elseB, ty)
+      const w: Node = { ifCond: cp, ifThen: thenB, ifElse: elseB, pos: c.pos }
+      arenaSetNode(ix, w)
+      nodeTyRecord(ix, ty)
+      valueIfAdd(ix)
+    }
+  }
+  0
+}
+
+// Overwrites node `ix` with a read of the name `name`, typed `ty`.
+function nssSetName(ix: i32, name: string, ty: i32) {
+  const w: Node = { identName: name, pos: P.nodes[ix].pos }
+  arenaSetNode(ix, w)
+  sidNoteNodeName(ix)
+  nodeTyRecord(ix, ty)
+  0
+}
+
+// A zero of scalar `s`, the value the miss arm yields and nothing reads.
+function nssZero(s: i32, pos: i32): i32 {
+  const prim = tyPrimNameOf(s)
+  let z = -1
+  if prim == "f64" || prim == "f32" {
+    z = mkNum("0.0", pos)
+  } else {
+    z = mkNum("0", pos)
+  }
+  nodeTyRecord(z, s)
+  z
+}
 // ── the build-decided `if` ───────────────────────────────────────────────────
 
 // Whether the statement at `ix` is an else-less `if __memory_shared__() { … }` whose call the
@@ -922,6 +1246,7 @@ function drwWalk(ix: i32, ctx: i32) {
     if c0 is OptMember {
       optWasOpt = true
       n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
+      arenaNoteRefWrite()
     }
     let optRecv = -1
     const callee = P.nodes[n.callFn]
@@ -941,6 +1266,7 @@ function drwWalk(ix: i32, ctx: i32) {
               false,
               callee.pos,
             )
+            arenaNoteRefWrite()
             return ix
           }
         }
@@ -1018,11 +1344,14 @@ function drwWalk(ix: i32, ctx: i32) {
         const ufcsFn = mkIdent(uName, -1)
         noteCallOrigin(ufcsFn, ix)
         n.callFn = ufcsFn
+        arenaNoteRefWrite()
       }
       drwFillDefaults(ix, ctx)
       return drwOptGuard(ix, ix, optRecv, n.pos, atStmt)
     }
-    n.callFn = drwWalk(n.callFn, ctx)
+    const nfn = drwWalk(n.callFn, ctx)
+    if nfn != n.callFn { arenaNoteRefWrite() }
+    n.callFn = nfn
     drwFillDefaults(ix, ctx)
     return ix
   }
@@ -2841,6 +3170,13 @@ function cboxTypedLeftName(n: BinExpr, boxed: string[]) {
 // `Q | null`) the tail becomes `const t = e; v = t; t`, arm by arm under a tail `if`; a
 // literal `e` keeps its store and is yielded as a copy, since the store encodes an atom (D2285).
 let cboxYieldCtr = 0
+
+// The `__cbv` locals `cboxYieldTail` moved a binding write's value into. That value is still
+// one a binding is written with, which the emitter tells apart from any other value (D4123).
+let cboxWriteLets: {[string]: i32} = Map()
+export function cboxIsWriteLet(name: string): boolean {
+  (cboxWriteLets[name] ?? 0) == 1
+}
 function cboxYieldTail(blockIx: i32, boxed: string[]) {
   const b = P.nodes[blockIx]
   if !(b is Block) { return 0 }
@@ -2875,6 +3211,7 @@ function cboxYieldTail(blockIx: i32, boxed: string[]) {
   }
   const tname = "__cbv" + i32ToStr(cboxYieldCtr)
   cboxYieldCtr = cboxYieldCtr + 1
+  cboxWriteLets[tname] = 1
   const tlet = mkLet("const", tname, -1, tn.binRight, -1)
   const store = mkIdent(tname, -1)
   nodeTyRecord(store, valTy)
@@ -3294,7 +3631,9 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is Call {
-    n.callFn = cboxWalk(n.callFn, boxed)
+    const nfn = cboxWalk(n.callFn, boxed)
+    if nfn != n.callFn { arenaNoteRefWrite() }
+    n.callFn = nfn
     const args = n.callArgs
     let ci = 0
     while ci < args.length {
@@ -3359,13 +3698,13 @@ function cboxNoInitMsg(nm: string) {
 
 // The frame's bindings `cboxByRef` says a closure must share, from `dlets`. A `let` with no
 // init takes a zero value to box; one whose type has none cannot be boxed and is refused,
-// since capturing it by value would be silently wrong.
-function cboxPick(dlets: string[], alam: string[]) {
+// since capturing it by value would be silently wrong. A name in `unboxed` stays a local.
+function cboxPick(dlets: string[], alam: string[], unboxed: string[]) {
   const boxed: string[] = []
   let di = 0
   while di < dlets.length {
     const nm = dlets[di]
-    if cboxByRef(nm, alam) {
+    if cboxByRef(nm, alam) && !strListHas(unboxed, nm) {
       let ok = true
       const lx = cboxLetIx[nm] ?? -1
       if (cboxKind[nm] ?? CBOX_LET) == CBOX_LET && lx >= 0 {
@@ -3392,10 +3731,50 @@ function cboxPick(dlets: string[], alam: string[]) {
   boxed
 }
 
+// The frame's `let`s of a scalar type that `cboxByRef` says a closure must share: those a
+// lifted closure can take by value and hand back (D3664).
+function cboxScalarLets(dlets: string[], alam: string[], tys: i32[]): string[] {
+  const out: string[] = []
+  let di = 0
+  while di < dlets.length {
+    const nm = dlets[di]
+    const lx = cboxLetIx[nm] ?? -1
+    if (
+      (cboxKind[nm] ?? CBOX_LET) == CBOX_LET
+      && lx >= 0
+      && cboxByRef(nm, alam)
+    ) {
+      const ld = P.nodes[lx]
+      if ld is LetDecl {
+        let ty = -1
+        if ld.letType >= 0 {
+          ty = nodeTyIxOf(ld.letType)
+        } else {
+          ty = nodeTyIxOf(ld.letInit)
+        }
+        const pn = tyPrimNameOf(ty)
+        if (
+          pn == "i32"
+          || pn == "i64"
+          || pn == "f64"
+          || pn == "f32"
+          || pn == "boolean"
+        ) {
+          out.push(nm)
+          tys.push(ty)
+        }
+      }
+    }
+    di = di + 1
+  }
+  out
+}
+
 // Per function frame (top-level or nested): boxes each binding a closure must share with it
 // (`cboxByRef`) — a `let`, a parameter, or a loop variable — and rewrites every use to go
 // through the cell. Usage-gated: a frame with no such binding rewrites nothing.
 export function captureBoxRewrite(_stmts: i32[]) {
+  cboxWriteLets = Map()
   cboxCellNames = Map()
   cboxReadTy = Map()
   cboxStoreCells = Map()
@@ -3415,7 +3794,9 @@ export function captureBoxRewrite(_stmts: i32[]) {
         pi = pi + 1
       }
       cboxScan(fn.fnBody, 0, dlets, alam)
-      const boxed = cboxPick(dlets, alam)
+      const tys: i32[] = []
+      const cands = cboxScalarLets(dlets, alam, tys)
+      const boxed = cboxPick(dlets, alam, cloUnboxPick(fe, cands, tys))
       if boxed.length > 0 {
         // A parameter's cell is seeded at the top of the body, from the argument. An optional
         // parameter's annotation names only the non-null part, so it takes its recorded type.
@@ -3458,7 +3839,7 @@ function cboxModuleFrame() {
     cboxScan(startStmts[si], 0, dlets, alam)
     si = si + 1
   }
-  const boxed = cboxPick(dlets, alam)
+  const boxed = cboxPick(dlets, alam, [])
   if boxed.length == 0 { return 0 }
   let wi = 0
   while wi < startStmts.length {

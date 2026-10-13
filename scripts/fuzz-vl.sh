@@ -123,19 +123,31 @@ findings=0
 known=0
 declare -A seen=()
 declare -A count=()
+# slurp VAR FILE: FILE's text without its trailing newlines (what `$(cat FILE)` gives), or
+# "" when it is missing — in builtins, because the loop below runs once per case and a
+# fork per read costs tens of milliseconds where `fork` is emulated (Git Bash on Windows).
+slurp() {
+  local __s=""
+  [ -f "$2" ] && IFS= read -r -d '' __s < "$2"
+  while [[ $__s == *$'\n' ]]; do __s=${__s%$'\n'}; done
+  printf -v "$1" '%s' "$__s"
+}
 for f in "$WORK"/case_*.vl; do
   [ -f "$f" ] || continue
-  b="$(basename "$f")"
-  expected="$(cat "$f.log" 2>/dev/null)"
-  shape="$(cat "$f.shape" 2>/dev/null)"
+  b=${f##*/}
+  slurp expected "$f.log"
+  slurp shape "$f.shape"
   err="$WORK/out/$b.err"
   why=""
   if [ -f "$err" ]; then
-    if grep -q "type error\|parse error\|emit error" "$err"; then why="REJECT"
-    elif grep -q "failed to compile\|failed to parse WebAssembly\|translation error\|Invalid input WebAssembly" "$err"; then why="INVALID-WASM"
-    else why="TRAP"; fi
+    slurp errtext "$err"
+    case "$errtext" in
+      *"type error"*|*"parse error"*|*"emit error"*) why="REJECT" ;;
+      *"failed to compile"*|*"failed to parse WebAssembly"*|*"translation error"*|*"Invalid input WebAssembly"*) why="INVALID-WASM" ;;
+      *) why="TRAP" ;;
+    esac
   else
-    actual="$(cat "$WORK/out/$b.out" 2>/dev/null)"
+    slurp actual "$WORK/out/$b.out"
     if [ "$actual" != "$expected" ]; then
       why="MISMATCH"
       err="$WORK/run.err"

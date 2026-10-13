@@ -19,7 +19,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen, hostWasmDis } from "./support/tree.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -29,7 +29,7 @@ const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const NATIVE = GATED && HAVE_SEED && exists(VL);
 if (GATED && !NATIVE) console.warn("[deep-else-chain] skipped — missing vl binary or seed wasm.");
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const HAVE_WASM_DIS = exists(WASM_DIS);
 
 // A dense integer `match` in return position: the shape the br_table lowering serves.
@@ -75,8 +75,10 @@ const vl = async (args: string[]) => {
       NO_COLOR: "1",
       VL_STD: `${ROOT}/std`,
       // binaryen's `wasm-dis` for `--wat`, which is a node script, hence PATH.
-      VL_WASM_DIS: `${ROOT}/node_modules/.bin/wasm-dis`,
+      VL_WASM_DIS: hostWasmDis(),
       PATH: Deno.env.get("PATH") ?? "",
+      // node cannot start on Windows without it.
+      ...(Deno.build.os === "windows" ? { SYSTEMROOT: Deno.env.get("SYSTEMROOT") ?? "" } : {}),
     },
     clearEnv: true,
   }).output();

@@ -39,7 +39,7 @@
 //
 // @test-timing opt
 
-import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv, binaryen } from "./support/tree.ts";
 
 const haveTool = async (name: string): Promise<boolean> => {
   try {
@@ -54,7 +54,7 @@ const haveTool = async (name: string): Promise<boolean> => {
   }
 };
 
-const WASM_OPT = `${ROOT}/node_modules/binaryen/bin/wasm-opt`;
+const WASM_OPT = binaryen("wasm-opt");
 const SRC = `${ROOT}/bench/buffer-view-bounds`;
 
 const haveBin = exists(VL);

@@ -15,6 +15,7 @@
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores, the same
 // convention the other wasm suites use.
 
+import { filePath } from "./support/filePath.ts";
 import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -24,7 +25,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   if (a !== e) throw new Error(`${msg ? msg + ": " : ""}expected ${e}, got ${a}`);
 };
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -76,7 +77,7 @@ Deno.test({
     }
     assertEquals(
       result.sourceFrames,
-      ["at 7:3  in `boom`", "at 11:1  in `__start__`"],
+      ["at main.vl:7:3  in `boom`", "at main.vl:11:1  in `__start__`"],
       "resolved trap frames",
     );
   },
@@ -107,6 +108,6 @@ Deno.test({
     if (!result.diagnostics.some((d) => d.severity === "error")) {
       throw new Error(`expected a runtime-error diagnostic, got ${JSON.stringify(result.diagnostics)}`);
     }
-    assertEquals(result.sourceFrames, ["at 4:1  in `__start__`"], "module-scope frame");
+    assertEquals(result.sourceFrames, ["at main.vl:4:7  in `__start__`"], "module-scope frame");
   },
 });

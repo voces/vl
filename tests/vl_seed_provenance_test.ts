@@ -90,7 +90,12 @@ async function record(env: Record<string, string>) {
 Deno.test("seed provenance: a `python3` that cannot start falls back rather than skipping", async () => {
   // The box this was found on has a Homebrew python3 first on PATH that exits before running a
   // line. `/bin/false` stands in for it: same observable — rc != 0, nothing recorded.
-  const { code, out, sidecar } = await record({ PYTHON: "/bin/false" });
+  // The default fallback is the distro's `/usr/bin/python3`, which Windows does not have, so
+  // there the seam names the PATH interpreter instead: the fallback branch is what is under test.
+  const { code, out, sidecar } = await record({
+    PYTHON: "/bin/false",
+    ...(Deno.build.os === "windows" ? { PYTHON_FALLBACK: "python3" } : {}),
+  });
   if (code !== 0) throw new Error(`want rc 0 via the fallback, got ${code}:\n${out}`);
   if (sidecar === null) throw new Error(`the fallback recorded no sidecar; output:\n${out}`);
   if (!/^[0-9a-f]{16}\n/.test(sidecar)) {

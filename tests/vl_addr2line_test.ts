@@ -22,10 +22,11 @@ import {
   VL,
   WASM_OPT,
 } from "./support/nativeRelease.ts";
+import { slashed as slash } from "./support/filePath.ts";
 
 // Real paths: the map names its sources relative to itself, which addr2line resolves.
 const DIR = ENABLED
-  ? Deno.realPathSync(`${ROOT}/tests/fixtures/source-map`)
+  ? slash(Deno.realPathSync(`${ROOT}/tests/fixtures/source-map`))
   : "";
 
 const run = async (args: string[], stdin?: string) => {
@@ -178,7 +179,7 @@ for (const flags of [["-O"], ["-O3"], ["-O3", "--names"]]) {
     }]`,
     ignore: !ENABLED,
     fn: async () => {
-      const tmp = await Deno.makeTempDir();
+      const tmp = slash(await Deno.makeTempDir());
       try {
         const wasm = `${tmp}/record.wasm`;
         const dump = `${tmp}/step.wasm`;
@@ -227,7 +228,7 @@ for (const flags of [[], ["-O"], ["-O3"], ["--names"], ["-O3", "--names"]]) {
     }]`,
     ignore: !ENABLED,
     fn: async () => {
-      const tmp = await Deno.makeTempDir();
+      const tmp = slash(await Deno.makeTempDir());
       try {
         const wasm = `${tmp}/pick.wasm`;
         await build(`${DIR}/pick.vl`, wasm, [...flags, "--source-map"]);
@@ -246,9 +247,9 @@ for (const flags of [[], ["-O"], ["-O3"], ["--names"], ["-O3", "--names"]]) {
         }
         const frame = topFrame(await trapTrace(wasm, "pick", 7));
         const got = await addr2line(wasm, frame);
-        expectLine(got, `${DIR}/pick.vl:5:3`, `${frame}`);
+        expectLine(got, `${DIR}/pick.vl:5:7`, `${frame}`);
         // An unnamed function gets no label (see the imports case).
-        const want = flags.includes("--names") ? "  in `pick`" : "5:3";
+        const want = flags.includes("--names") ? "  in `pick`" : "5:7";
         if (!got.endsWith(want)) {
           throw new Error(`want the answer to end \`${want}\`, got \`${got}\``);
         }
@@ -264,7 +265,7 @@ Deno.test({
     "vl addr2line: a 300-line function names the line deep inside it at -O3",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = await Deno.makeTempDir();
+    const tmp = slash(await Deno.makeTempDir());
     try {
       const trapAt = 251;
       const lines = [
@@ -292,7 +293,7 @@ Deno.test({
       }
       expectLine(
         await addr2line(wasm, topFrame(trace)),
-        `${Deno.realPathSync(tmp)}/big.vl:${trapAt}:3`,
+        `${slash(Deno.realPathSync(tmp))}/big.vl:${trapAt}:11`,
         "300-line body",
       );
     } finally {
@@ -305,7 +306,7 @@ Deno.test({
   name: "vl addr2line: a callee inlined at -O3 keeps the callee's line",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = await Deno.makeTempDir();
+    const tmp = slash(await Deno.makeTempDir());
     try {
       const wasm = `${tmp}/main.wasm`;
       await build(`${DIR}/inline/main.vl`, wasm, [
@@ -333,7 +334,7 @@ Deno.test({
   name: "vl addr2line: `-` annotates a pasted stack trace frame by frame",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = await Deno.makeTempDir();
+    const tmp = slash(await Deno.makeTempDir());
     try {
       const wasm = `${tmp}/main.wasm`;
       await build(`${DIR}/inline/main.vl`, wasm, ["--names", "--source-map"]);
@@ -360,7 +361,7 @@ Deno.test({
     "vl build: without --source-map, no map is written and no section is added",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = await Deno.makeTempDir();
+    const tmp = slash(await Deno.makeTempDir());
     try {
       for (const flags of [[], ["-O3"], ["-O3", "--names"]]) {
         const wasm = `${tmp}/pick.wasm`;
@@ -421,7 +422,7 @@ Deno.test({
     "vl addr2line: an offset in no function body has no answer (rc 1), never the last line",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = await Deno.makeTempDir();
+    const tmp = slash(await Deno.makeTempDir());
     try {
       const wasm = `${tmp}/pick.wasm`;
       await build(`${DIR}/pick.vl`, wasm, ["-O3", "--names", "--source-map"]);
@@ -446,7 +447,7 @@ Deno.test({
     "vl addr2line: an unnamed function in a module with imports gets no index label",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = await Deno.makeTempDir();
+    const tmp = slash(await Deno.makeTempDir());
     try {
       const wasm = `${tmp}/imports.wasm`;
       await build(`${DIR}/imports.vl`, wasm, ["--source-map"]);
@@ -476,7 +477,7 @@ Deno.test({
     "vl addr2line: the `vl-src` fallback names the entry file, and stdin need not be UTF-8",
   ignore: !ENABLED,
   fn: async () => {
-    const tmp = Deno.realPathSync(await Deno.makeTempDir());
+    const tmp = slash(Deno.realPathSync(await Deno.makeTempDir()));
     try {
       Deno.copyFileSync(`${DIR}/pick.vl`, `${tmp}/pick.vl`);
       const wasm = `${tmp}/pick.wasm`;
@@ -484,7 +485,7 @@ Deno.test({
       const frame = topFrame(await trapTrace(wasm, "pick", 7));
       expectLine(
         await addr2line(wasm, frame),
-        `${tmp}/pick.vl:5:3`,
+        `${tmp}/pick.vl:5:7`,
         "vl-src fallback",
       );
       const p = new Deno.Command(VL, {
@@ -499,7 +500,7 @@ Deno.test({
       await w.close();
       const r = await p.output();
       const out = new TextDecoder().decode(r.stdout);
-      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:3`)) {
+      if (r.code !== 0 || !out.includes(`=> ${tmp}/pick.vl:5:7`)) {
         throw new Error(`non-UTF-8 stdin: rc ${r.code}, got:\n${out}`);
       }
     } finally {

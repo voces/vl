@@ -4,6 +4,7 @@
 // `refresh-compiler.sh` yet) they self-ignore with build instructions, the same
 // convention as the native align suite. The diff helper tests run always.
 
+import { filePath } from "./support/filePath.ts";
 import {
   diffDefinition,
   diffDiagnostics,
@@ -13,7 +14,7 @@ import {
 } from "../lsp/src/wasmCheckerNode.ts";
 import type { VLDiagnostic } from "../compiler/diagnostics.ts";
 
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
   try {
     Deno.statSync(SEED);
@@ -1190,6 +1191,37 @@ Deno.test({ name: "wasm-checker: byte-as-code-point shows in the editor, over th
   }
 });
 
+Deno.test({ name: "wasm-checker: a discarded line led by `-x` shows in the editor, over the statement, and `- x` continues (D3673, D3698)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-040: `-b` with no space after the minus is its own statement, while `- b`
+  // continues `v`. The editor lints before it checks, so this is the untyped face: parameters
+  // annotated as scalars fire, while a field read and a local initialised by a call need the
+  // check's types and stay quiet here.
+  const src = "type Cam = { x: f64, y: f64 }\n" +
+    "function mk() { 2.0 }\n" +
+    "function f(a: f64, b: f64, c: Cam): f64 {\n" +
+    "  const w = a * 3.0\n" +
+    "    -b * 3.5\n" +
+    "  const v = a * 3.0\n" +
+    "    - b * 3.5\n" +
+    "  a + b\n" +
+    "  c.x - c.y\n" +
+    "  const t = mk()\n" +
+    "  t * 2.0\n" +
+    "  w\n" +
+    "}\n" +
+    "print(f(1.0, 1.0, { x: 1.0, y: 2.0 }))\n";
+  const diags = checker.lint(src).filter((x) => x.code === "unused-pure-expression");
+  const got = diags.map((d) => [rangeText(src, d.range), d.severity, d.message.slice(0, 34)]);
+  const want = [
+    ["-b * 3.5", "warning", "this line is a separate statement;"],
+    ["a + b", "warning", "This expression has no effect: it "],
+  ];
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  }
+});
+
 Deno.test({ name: "wasm-checker: lint returns [] on a parse error", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   if (checker.lint("function f( {\n").length !== 0) {
@@ -1723,7 +1755,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const path = new URL("../std/buffer.vl", import.meta.url).pathname;
+  const path = filePath(new URL("../std/buffer.vl", import.meta.url));
   const source = await Deno.readTextFile(path);
   const diags = await checker.check(source, path, noSiblings);
   const hit = diags.find((d) => d.message.includes("is internal to std"));

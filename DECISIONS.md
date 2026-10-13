@@ -1834,7 +1834,9 @@ it worked.
   (`/` is `div_s`) and already exposed one unsigned instruction as an operator
   (`>>>`). A `u32` would touch the type arena, every rep table, every widening
   rule and every emitter kind code to express something the operand need not
-  carry.
+  carry. *Amended 2026-10-03:* VL adds `u32` and `u64` as value types, and the
+  unsigned operations stay for `i32` and `i64` operands (§"`u32` and `u64` are value
+  types").
 - **No transcendental as a compiler intrinsic; they live in `std:math`.** No wasm
   opcode computes `sin`/`pow`/`exp`, so any implementation is a library whose last
   bit is a policy choice, and that library is not the compiler's. This entry first
@@ -4617,8 +4619,8 @@ target (`f64 → f32`, `i64 → f64`, `i32 → f32`) ROUNDS and never fails — 
 nearest representable float is the conversion, not a loss of the value's meaning. Loss is
 SPELLED where it happens: `trunc(d) as! i32`, `floor(d) as! i32`, `nearest(d) as! i32`,
 where `trunc`/`floor`/`ceil`/`nearest` are the existing `f64 → f64` intrinsics and the
-`as!` is provably infallible after them (the emitter peepholes the pair to the one
-`i32.trunc_f64_s`). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
+`as!` can then fail only on range (the emitter drops the integrality compare; see
+"An integral operand's cast tests only the range"). **No `asExactI32` / `asExactI64` ships in `std:fmt`** — that name
 would have been `as?` spelled as a function, a std API bent around the ignored-suffix gap
 (D1041), which is exactly what the 2026-09-01 "design is not bounded by the seed" rule
 forbids.
@@ -4769,8 +4771,9 @@ domain. The REP target decides the conversion opcode and the `i32 | null` box ro
 registers, the DOMAIN decides the range test and the `as!` message. Collapsing them either
 loses the range or registers a `u8|null` box that nothing builds — which is why the canon pass
 that rewrites `n.asTy` to the primitive spelling leaves `u8` alone, and why the emitter's
-`trunc(d) as! i32` peephole declines the `u8` domain (its premise is that the conversion
-instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255).
+`trunc(d) as! i32` peephole declined the `u8` domain (its premise was that the conversion
+instruction enforces the range, and `i32.trunc_f64_s` enforces i32's range, not 0..255; the
+range test that replaced it in SP-056 tests the domain's).
 
 **Grading list.** D1587, and D1583 which it supersedes; the 60-cell trio grid on that row;
 `tests/cases/numerics/as-cast-u8-trio.vl`, `as-cast-u8-trap-range.vl`,
@@ -4866,6 +4869,15 @@ LITERAL check type (`is null` / `is string` / `is Circle` still discriminate), a
 codegen — 18 programs graded against a pristine `origin/master` seed emit byte-identical wasm.
 
 ## `is A` over same-shape struct arms is a DISCRIMINANT-VALUE test: a literal-typed field is a type that is also a value, and membership is decided by the value (owner, 2026-09-02)
+
+> **Amended by D3870 (owner ruling C, 2026-10-08) and D3885 (owner ruling A, 2026-10-10).**
+> The principle stands: `is` asks whether the VALUE is a member of the type, and a
+> literal-typed field is decided by its value. What falls is the fallback to the tag, that
+> is, to the declaration a value was built under. Records are structural, so two same-shape
+> record types are one type and no tag records a value's declared name. The refusal of a
+> same-shape pair with no distinguishing literal field (`{v: i32} | {v: boolean}`), called a
+> design rule below, has no live ruling now. It is pending owner question Q4
+> (`docs/spec/OPEN-QUESTIONS.md`).
 
 **Ruling.** Two struct arms that share a field-name set and differ only in a literal-typed
 field — `type Circle = { kind: "circle", r: f64 }` / `type Square = { kind: "square", r: f64 }`
@@ -5362,7 +5374,8 @@ can begin an expression either — `=` and every compound form (`+= -= *= /= %= 
 `?.`) already joined at every depth; `is` and the four `as` casts join here for the first time.
 A `|>` pipe, if one is ever added, would join for the same reason.
 
-**Why unary minus is EXCLUDED.** `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
+**Why unary minus is EXCLUDED** *(amended 2026-10-05: a `-` followed by a space or tab now
+continues — see "A line-leading `-` continues only when whitespace follows it" below)*. `{ f()` ⏎ `-x }` is a legal block today meaning "call `f`, and
 the block's value is `-x`". Joining would silently turn it into `f() - x` — a value change with
 no diagnostic — so a leading-minus line stays a statement, and a program that wants subtraction
 puts the operator at the end of the previous line or in parentheses, as today. Swift, Kotlin, Go
@@ -5393,6 +5406,74 @@ normalises the layout away and that stays fine — the third ruling on this axis
 the leading dot and D1581.
 
 
+## A line-leading `-` continues only when whitespace follows it (D3698, 2026-10-05)
+
+**Ruling** (owner, on sunpa SP-040; amends the 2026-09-04 ruling above, which excluded `-`
+outright). A line whose first token is `-` FOLLOWED BY A SPACE OR TAB is a binary minus and
+continues the previous expression, like every other continuing operator. A `-` touching its
+operand stays a new statement:
+
+```vl
+const w = a * 3.0
+  - b * 3.5        // one expression: a * 3.0 - b * 3.5
+
+function f(): i32 {
+  g()
+  -x               // two statements: the block's value is -x
+}
+```
+
+sunpa's camera wrote the first form, computed `a * 3.0`, and discarded the second line in
+silence; #3383's lint named it after the fact. The spaced form is how every style guide and
+`vl fmt` itself write a broken subtraction, so it now means what it looks like.
+
+**Why `{ f()` ⏎ `-x }` still holds.** The 2026-09-04 reason for the exclusion is unchanged: a
+`-x` line is a legal statement, and a block's last one is its value. The spacing keeps both
+readings: nobody writes a negation as `- x`, and nobody writes a broken subtraction as `-x`.
+
+**The survey.** JavaScript and Lua continue on a leading `-` unconditionally (JS's ASI has no
+rule for it, Lua has no statement terminator), which is the `{ f() ⏎ -x }` hazard. Swift and
+Scala 3 decide by spacing, as here: Swift treats an operator with whitespace on both sides as
+binary and one touching its operand as prefix, and Scala 3 continues a line on a leading
+infix operator only when whitespace follows it. F# decides by indentation (an offside
+operator continues). Go, Kotlin, Ruby and Python start a new statement and make the author
+put the operator at the end of the line or open a bracket.
+
+**The exact rule.** The test is the next TOKEN, not a character: the `-` continues when the
+following token is on the same line and does not start right after it. The lexer skips only
+spaces and tabs between tokens on a line, so that gap is horizontal whitespace. A `-` at the
+end of its line (followed by a newline, or by a comment and then a newline) does NOT count as
+spaced and keeps its old reading — "space or tab" was chosen over "any whitespace" so that a
+lone `-` cannot join three lines. Compound tokens are unaffected by construction: `-=` already
+continued (it cannot begin an expression), `--` is the decrement and no binary operator, VL
+has no `->`, and `-1` lexes as `-` then `1`, so `- 1` continues and `-1` does not. One more
+exception, at every depth: a line that reads as a negative integer match pattern followed by
+`=>` (`-1 =>`, `- 1 | 2 =>`) is the next arm, never a subtraction from the previous arm's
+body, since no continued expression can be followed by `=>` there (D3699, which was already a
+parse error inside brackets). The pattern run may break after an or-pattern's `|`, as
+`parseMatch` allows.
+
+`- b` continues across blank lines and comment-only lines, like the other leading operators:
+the scan is the same `afterNewlines` run.
+
+**Inside brackets nothing changes.** The 2026-09-04 text said a leading `-` inside a bracket
+was a parse error; that was out of date — D1581's bracket gate already let `-` continue there,
+spaced or not, because no statement can end inside a bracket. Both spellings keep continuing.
+
+**The cost is whitespace significance**, which VL otherwise does not have between tokens
+on a line. It is confined to one token at one position (the first token of a line, outside
+brackets), and the two readings differ only where the space makes the author's intent
+visible. `vl fmt` now leads EVERY broken chain with its operator, `-` included, always as
+`- b` (the 2026-09-24 trailing exception is retired), and prints a negated negation as
+`-(-x)` rather than `- -x`, which at the start of a statement would now continue the line
+above.
+
+**Measured.** Every `.vl` file and `vl` code block in this repo and the consumers' sources
+(sunpa/src, plumb/src, glean) was scanned for a line-leading `-`. 0 spaced lines outside
+brackets existed before this change (the one in sunpa, `terrain.vl`, sits inside a `(`), so
+no existing program changes meaning; the tight `-x` lines (919 in the repo, 104 sunpa, 53
+plumb, 8 glean) parse as before by construction.
+
 ## `vl fmt` puts a broken chain's operator at the start of the line (2026-09-24)
 
 **Ruling** (owner). When `vl fmt` breaks a binary-operator chain that does not fit the width,
@@ -5409,7 +5490,8 @@ Only the operator moves. Which chains break, the flattening by precedence, and t
 indentation are unchanged, and so is the forced-paren form of an over-wide `if`/`while`
 condition, whose operands now lead with `&&` / `||` inside the parens.
 
-**A chain holding a `-` link keeps every operator trailing.** The ruling above excludes `-`
+**A chain holding a `-` link keeps every operator trailing.** *(Retired 2026-10-05 by D3698:
+a spaced `- b` now continues at every depth, so a `-` chain leads like any other.)* The ruling above excludes `-`
 from the line-continuing set: outside brackets `a` ⏎ `- b` is two statements, and at a
 binding it is a silent value change (`const v = a` then a discarded `-b`), not an error.
 The formatter does not track bracket depth, so it cannot know when a leading `-` would be
@@ -5439,7 +5521,7 @@ the same name imported twice from the same module, or through a re-export chain 
 the same declaration, is redundant and still RUNS; only two DIFFERENT declarations under one
 name are refused. Pinned both ways:
 `tests/cases/modules/duplicate-import-same-declaration/` and
-`tests/cases/modules/err-duplicate-import-two-modules/`.
+`tests/cases/modules/err-duplicate-binding/` (since receiver overloading, O1, two functions whose first parameters differ in kind coexist: `tests/cases/modules/overload-record-receivers/`).
 
 **Why it is a rule and not a lint: the meaning was reader-dependent.** The merge's rename map
 held two rows under one key and its readers disagreed about which won — `modRenamed` (VALUE
@@ -6942,6 +7024,8 @@ every local must have a non-boxing representation, decided from types before emi
 
 ## The compiler's collector is picked by the size of the entry file (2026-09-22) — plumb PL-002 follow-up
 
+*Superseded 2026-10-07: the default is now copying at every size, see "The compiler's collector is copying by default" below.*
+
 `vl build` and `vl run` used to compile under wasmtime's NULL collector always. It never frees,
 so a compile's peak memory is every byte the compiler ever allocated, and the GC heap's 32-bit
 index caps that at 4 GiB, a ~15.6 MB source. plumb compiles 1.16 GB of generated VL in 551 units
@@ -7060,6 +7144,60 @@ Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits. (2026-09-2
 this paragraph asked for now exists, `profiling-the-compiler.md` §"Measured 2026-09-24, second
 pass"; after D2317–D2319 the units sit at ~291 MB, and `P.nodes` plus `P.toks` are two thirds
 of what is left.)
+
+## The compiler's collector is copying by default (2026-10-07) — lane GC, sunpa build memory
+
+**Supersedes the entry-file threshold above.** `vl build` and `vl run` compile under the
+copying collector from a 256 MiB first heap at EVERY entry-file size (`compile_engine`,
+`scripts/vl-host/src/main.rs`). `$VL_COMPILE_GC=null|copying` stay as overrides (`auto` is
+copying), `$VL_COMPILE_GC_HEAP` still sets the first heap, and the self-compile scripts still
+pin null.
+
+**Why.** The threshold read the ENTRY file, so sunpa's `game.vl` — a 260 KB entry over a 2 MB
+module graph — compiled under null and held every byte the compiler allocated: 2.4 GB peak per
+build, and sunpa runs up to five builds at once, so memory set its slot cap. The +11–19% CPU
+that justified null below 1.5 MiB did not reproduce on this workload once the seed's sidecar is
+warm: null's cost is faulting in 2.4 GB of fresh pages, which copying, re-using one semispace
+pair, does not pay. One quiet run per cell unless noted, load 2–6, warm sidecars, wall / peak
+RSS (the vl process's `VmHWM`) / collections (`VL_GC_STATS=1`), all on master's seed:
+
+| input | null (master default) | copying 256 MiB (new default) | 512 MiB | 768 MiB | 1 GiB |
+| --- | --- | --- | --- | --- | --- |
+| sunpa `game.vl`, plain (3 interleaved) | 20.6–23.2 s / 2,440 MiB / 0 | 19.9–20.1 s / 563 MiB / 61 | 19.3 s / 564 / 28 | 19.8 s / 820 / 11 | 20.8 s / 1,075 / 7 |
+| sunpa `game.vl`, `-O3` (its `build:vl`) | 50.4 s / 2,435 MiB / 0 | 50.0 s / 559 MiB / 61 | 50.1 s / 559 / 28 | — | 50.1 s / 1,071 / 7 |
+| self-compile `compiler/entry.vl` (2 interleaved) | 8.4–9.1 s / 2,341 MiB / 0 | 9.7 s / 1,071 MiB / 26 | 10.0 s / 1,072 / 22 | 13.6 s / 815 / 42 | 9.3 s / 1,071 / 12 |
+| `print("hello")` | 0.02 s / 37 MiB | 0.02 s / 38 MiB | 0.02 s / 37 MiB | — | — |
+
+All of them emit the same bytes: sunpa's module and source map (plain and `-O3`) and the
+self-compile, which is the seed itself (`--prove-fixpoint` holds).
+
+**Why 256 MiB and not a bigger first heap.** wasmtime 47's copying heap collects whenever the
+last live size is under half its capacity (`should_collect_first`) and only otherwise doubles,
+and it never returns a semispace's pages, so the peak RSS is the heap's size, not the live set's.
+A first heap just above twice the live set collects over and over while reclaiming little: 384
+MiB on sunpa (192 MiB live, 192 MiB semispace) ran 138 collections at 25.0 s, 768 MiB on the
+self-compile (367 MiB live) 42 at 13.6 s. 256 MiB doubles past that band on both inputs, costs
+the most collections but the least memory, and keeps the engine configuration — and so the seed's
+`.cwasm` sidecar — that `refresh-compiler.sh` already warms. Each distinct value is a fresh
+Cranelift compile of the seed (~9 s, ~1.9 GB peak, once per host binary).
+
+**Why the self-compile stays null.** It is the one input here where null is faster (~10% wall,
+~16% CPU, against 54% less memory), and the gate runs it many times; the scripts pin it, so the
+default does not move it.
+
+**Declined.**
+* *A null start that switches to copying when the heap nears a size.* Impossible mid-instance:
+  the collector is an `Engine` setting, compiled into the seed's code (object headers, barriers,
+  the allocation path). Switching means restarting the compile, which pays the failed attempt's
+  peak first — the retry the section above declined.
+* *DRC (deferred reference counting).* sunpa `game.vl` plain had not finished at 600 s (null:
+  24 s); killed.
+* *A size threshold on the module graph instead of the entry file.* Not needed once copying is
+  no slower; the host also cannot sum imports before it compiles.
+
+**Rows that moved.** D2771, D2780 and D3407 filed a compiler trap that was the null heap filling
+with garbage; under copying their witnesses build in 8–10 s at about 300 MB, and the trap is
+closed while the exponential cost in their titles stays open.
 
 ## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
 
@@ -7448,6 +7586,131 @@ the written type's subtyping component. A subtype's value stands where its super
 expected, so a write through either reaches both. A module whose struct types span several
 groups keeps the shape rule. `$VL_MV_EXPLAIN=1` prints each type's and producer's verdict,
 for consumers to find their own disqualifier.
+
+## `-O` takes a record argument apart up to 64 fields, and an `if` that chooses a record (2026-10-06) — sunpa, D3754, D3766, D3767
+
+**Arguments get their own bound.** The eight-field bound above was set for results, where each
+field past the return registers goes through a return area. A parameter has no such area: its
+fields are ordinary arguments. A record ARGUMENT is now 1 to 64 fields (`MV_ARG_MAX_FIELDS`),
+each a number or a reference, and a result keeps eight numeric fields. A reference field is
+passed on as the reference, so identity holds; the never-written rule is unchanged, so its
+value cannot change while it is read early. A twin takes at most 128 parameters
+(`MV_TWIN_MAX_PARAMS`; V8 accepts 1,000), bounded per function when its field-only
+parameters are chosen, so no call site can widen a twin past it. The step validates its own
+output and keeps the input when that fails: a bad rewrite costs an optimization, not a build.
+
+**The bound is where the gain falls off, measured.** An N-field `f64` record built per call at
+two sites and passed to a callee too large to inline that reads every field, 6M calls, `-O3`,
+step off → on: V8 1.48x at 8 fields, 1.61x at 16, 1.70x at 24, 1.67x at 32, 1.50x at 48, 1.55x
+at 64, then 1.41x at 96 and 1.29x at 128; wasmtime 1.97x at 8 and 16, 2.03x at 32, 1.80x at
+64, 1.77x at 96, 1.61x at 128. It never reverses, but past 64 each step costs more than it
+saves relative to the allocation, and sunpa's widest record (36 fields) is well inside. A
+callee reading 5 of the fields gains at every width, since binaryen drops unread parameters.
+
+**A reference field to a struct nothing writes keeps its record whole for a small callee.**
+A value union's box is `{ tag, payload }`, the payload a box of its own. Passed to a callee of
+at most `ESCAPE_INLINE_MAX_BYTES`, the escape step inlines it and `--heap2local` removes both
+boxes; taken apart here, the payload box would still be made. The first cut missed this and
+sunpa's sound table made 12,800 more boxes through a `toString` twin that was no longer
+inlined. For a larger callee both are allocated without the step, so taking it apart still
+saves one.
+
+**An `if` that chooses a record leaves its fields (D3766).** sunpa's IK passes
+`if pb < 0 { sk.rootRotation } else { quatOf(g[pb]) }` to a field-only parameter, and its legs
+choose `if d0.z < d1.z { d1 } else { d0 }`. The step followed a record from its maker to its
+use and an `if`'s `end` was neither, so the producer arm allocated. A non-null single-record
+`if` that no branch targets is now a merge: when its value reaches a field use, its block type
+becomes multi-value and each arm leaves fields (a twin call, a deleted `struct.new`, a
+scalarized local's slots, or a stored record read at the arm's end). Reading early is sound
+for the reason every twin is: nothing writes the type.
+
+**A local handed to a result twin's fallback is a field use (D3767).** `unit(v, fallback)`
+returns `fallback` unchanged, a field use only in its result twin. A local passed there at a
+call whose own result is held as fields always reaches that twin, so it is held as fields too.
+
+**Measured on sunpa** `f81a945` under `feet-test` (10,938 frames), `-O3`, master → this:
+**413.4 → 396.5 `struct.new` a frame**: `qnorm.mv` 3.85 → 0, `cylAlong` 26.4 → 17.6, `unit.mv`
+10.9 → 9.1, the anim `Item` 1 → 0. Feet and gait outputs are byte-identical. What it did not
+reach is filed: the game-side `Item` is written elsewhere (D3765, a decision on fresh
+arguments), a stored record read whole (D3753) and a cache list (D3752).
+
+## `-O` stores a never-written small record inline in its parent (2026-10-05) — sunpa SP-039, D3678
+
+**The defect.** A store into a record field (`j.rot = qnorm(…)`) kept a fresh `Q` box per
+store, and the multi-value step above cannot remove it: a store is not a field use. Slice S1
+of `docs/internals/inline-records-design.md`.
+
+**The rule.** A host step before the multi-value step (`scripts/vl-host/src/inline.rs`)
+replaces a struct field of record type `V` with `V`'s fields when nothing can tell a shared
+box from a copy: `V` is never written (the multi-value step's charge, D3630), no `ref.eq` or
+`extern.convert_any` can see it, it is a leaf of the subtyping order, and no value crossing
+the module boundary can reach it (every type reachable from an import, export, exposed table
+or tag, through fields, elements and signatures; a reachable abstract `any`/`eq`/`struct`
+refuses every record some op hands to such a place, as a union box's payload). Following
+fields is the conservative default the design review asked for: a JS host cannot read a
+struct's fields, and sunpa pays for it (below). The owner ruled it out as the default the
+same day (next paragraph). A parent must be made by `struct.new` in a function body (not `new_default`, not
+a constant expression, D3679), never atomically, must not cross the boundary itself, and must
+lay the field out as its sub- and supertypes do. Every store must be non-null by type; a
+nullable record local that validates as non-null is declared so first.
+
+**Why a cost rule, not just a soundness rule.** A read that needs the whole record re-boxes,
+which allocates where sharing the box did not: sunpa's `Skeleton.rootRotation` is stored once
+and read whole every frame. So a field is inlined only when every read is free — field-read,
+held in a once-set local that is only field-read, or passed to a parameter the multi-value
+step takes as fields. That makes the step never add an allocation, at the price of D3680 (a
+whole read returned to a field-reading caller is free too, and not yet counted so).
+`$VL_INLINE_REBOX=1` lifts the rule so a grid can grade the re-box path.
+
+**Why the host and not the emitter.** The design's table: one module rewrite against ~500
+emitter field sites, and a failure mode of "the input is kept" against check-clean invalid
+wasm. Validation does not catch a shifted index that still type-checks, so every fixture
+grades by output, and the step was swept over the 4,514 `tests/cases` programs (104 changed
+by default, 119 with the cost rule lifted, at the store and at the spill path: all agree).
+
+**Measured.** sunpa's feet check (8,394 posed characters), output identical: `Q` boxes
+78,441 → 53,275 (9.3 → 6.3 per character). `V3` stays at 106,805 under the default rule,
+because the export `animationReady` returns a record with a `V3` field to JS; with
+`$VL_INLINE_BOUNDARY=direct` it falls to 89,937 (12.7 → 10.7).
+
+**The boundary is the signature (owner ruling 2026-10-05, §6 Q2; D3718).** A record's layout
+is not part of a module's boundary. Only a type a boundary signature names keeps its layout
+and identity, because a JS host can hold that object but cannot read a struct's fields; a
+record nested in one (a field, a list element, a union box's payload) may be inlined. A
+value handed to an `any`/`eq`/`struct` place is still refused while such a reference crosses
+a signature, since JS may then hold that very object. The conservative rule stays available
+as `vl build --stable-layout`, for a unit linked wasm to wasm or read field by field (the
+owner's (C), "unless C is easy": it was, the step already had the mode). The env knob is
+retired, since a flag is the supported spelling and two would drift. sunpa's feet check on
+`ce4e1c3`: `V3` 106,981 → 90,113, feet and gait output identical, and the
+`--stable-layout` module equals master's byte for byte apart from its map's file name.
+
+**Lists too: slice S2 (2026-10-05; D3681).** A `V[]` of such a record, its fields one number
+type, is flattened to one array of those numbers at `n` times the length
+(`scripts/vl-host/src/flat.rs`, run on S1's output; inline-records-design.md §7). Map value
+lists share the backing type and go with it. A list made by `filled(n, v)` (`array.new`) stays
+boxed: its slots share one box, so flat it would be `n` copies of the fields, `n` times the
+memory, past V8's array-length cap at `filled(40000000, q)` (review of the S2 PR). Three
+choices worth keeping:
+* **Every index is clamped, not trusted.** `i * n` wraps for an `i` the original would have
+  trapped on, and a wrapped index can land in bounds, reading a wrong element where the boxed
+  list trapped. So `x` becomes `select(x * n, -n, x <u ⌊(2^32 - n)/n⌋ + 1)`. VL's own indices
+  are already bounded by the list's length, but the step cannot see that from wasm, and the
+  select costs 13–16% of a flat read (D3720).
+* **The cost rule is S1's plus a read budget.** No read may add an allocation, and reads may
+  come to at most six whole elements per store site: on V8 a store saves what 6.5 flat element
+  reads cost over boxed ones (wasmtime 70). Iterate-only over a flat list is 1.6x slower on V8,
+  so a list filled once and read every frame regresses, and the static count cannot tell
+  (D3720). One whole read anywhere keeps every list of that record boxed (D3719).
+* **A nullable local is proved non-null by dataflow, for S1 too.** VL declares many record
+  locals `(ref null V)` because they are set in a nested block, and validating a tightened
+  local fails there. A forward pass over each body (a loop starts without the locals any set
+  inside it may null) shows which reads hold no null; a store casts such a read with
+  `ref.as_non_null`, which never traps. A `(V | null)[]` still stores real nulls and stays boxed.
+
+sunpa `ce4e1c3`'s feet check: `Q` boxes 601,198 → 37,120, feet and gait output byte-identical.
+Graded by output at `-O`/`-O3`, default, re-box-forced and spill-forced, over the `flat-*`
+fixtures and every `tests/cases` program the step touches.
 
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
@@ -9197,7 +9460,9 @@ tree read stays an editor reference.
 * **A radix literal is the bit pattern at its use's width under every operator (owner,
   2026-09-30, ruling A on radix arithmetic).** `0x80000000 / 2` at `i32` is -1073741824 and
   `0xFFFFFFFF % 7` at `i32` is -1, as on master and in Java and wasm; an unsigned reading is
-  spelled `divU`, `remU`, `ltU` or `>>>`. The width is the use's, which the fold cannot see, so a
+  spelled `divU`, `remU`, `ltU` or `>>>` (for `i32` and `i64` operands; since U1, a
+  `u32` or `u64` operand reads unsigned under `/`, `%` and `<`, §"`u32` and `u64` are value
+  types"). The width is the use's, which the fold cannot see, so a
   tree whose value depends on it is not folded and computes where it is used, as before:
   arithmetic (`+ - * / %`) over a pattern, `>>` and `~` over a pattern whose top bit is set at
   its own width (32 or 64 bits), any operation over a pattern wider than 32 bits (which an `i32`
@@ -9812,3 +10077,299 @@ expression, and to a whole cast chain.
 `std/` or `scripts/`, and two in consumers (plumb `~255 as% i64`, sunpa `-2.45 as f32`); each
 means the same value under both groupings. `vl fmt` output is byte-identical under both parsers
 over all 15,413 `.vl` files in the tree; the printer had always emitted `-x as T` bare.
+
+## An integral operand's cast tests only the range (2026-10-09) — sunpa SP-056
+
+**The rule.** When the operand of a numeric cast to an integer is `floor`, `ceil`, `trunc` or
+`nearest` of an f64 or f32 — written directly, or as a `const` that one of them initialises —
+the emitter drops the integrality compare (`trunc(d) == d`) and keeps the range test, in all three
+modes. The value is integral by construction, and NaN and ±Inf still fail the range test. An `as!`
+on such an operand still prints `as! i32 at <line>:<col>: not exact`; at an i32 or i64 domain it
+then traps at the conversion itself, whose range is exactly the test's, so the host's note names
+the range or NaN, as it did for master's direct spelling. At `u8` it traps at `unreachable`.
+Neither a `let` nor a chain of `const`s is followed (a name in the initialiser would resolve at
+the cast's scope), and a binding, global or function named `floor` declines.
+
+**What it replaced.** For the direct spelling only, a peephole skipped the whole test and relied
+on `i32.trunc_f64_s` trapping out of range. It had two faults. Its shadowing test was weaker than
+the call's: with `const floor = (x: f64): f64 => x + 0.5`, `floor(1.0) as! i32` printed `1`
+instead of trapping (`as-cast-integral-operand-trap-shadowed.vl` fails on master). And it was the
+slower code: on V8, a bare `i32.trunc_f64_s` after `f64.floor` costs more than the same conversion
+behind an explicit range test.
+
+**Measured** (Deno 2.9.6 / V8 15.0, `-O3`; sunpa's `vnoise` kernel, 5M points × 4; median of
+medians of 5–9 interleaved rounds of `run.ts`'s 7, load 15–30):
+
+| `vnoise` lowering | ms | vs Rust |
+| --- | --- | --- |
+| master: integral + range test, message, then trunc | 272–308 | 1.07–1.15x |
+| bare `i32.trunc_f64_s` (the peephole, applied to the `const`) | 298–318 | 1.15–1.2x |
+| bare `i32.trunc_sat_f64_s` | 320 | 1.2x |
+| **range test, then `i32.trunc_f64_s`** | **242–250** | **0.96–0.98x** |
+
+**Every `as!` reason is one call.** The reason used to be streamed a character at a time at
+each site, about 150 bytes a site, so keeping it on every new integral site cost sunpa's game
++2.4%. It is now printed by one `__as_fail__(line, col << 3 | domain row)` helper, reserved when
+the module has an `as!` with a sad path, so a site pays two constants and a call; binaryen
+specialises the helper on a constant argument. The helper prints the place in decimal at run
+time, so its body is the same for every site.
+
+| sunpa's game, `-O3`, no names | bytes |
+| --- | --- |
+| master | 2,718,883 |
+| the range-only rule, reason kept per character | 2,784,528 (+2.4%) |
+| the range-only rule, no reason on an integral site | 2,728,643 (+0.36%) |
+| **the range-only rule, every reason through `__as_fail__`** | **2,723,550 (+0.17%)** |
+
+On 100 sites in one function, `-O3`: fractional `(x + k) as! i32` 11,114 → 6,435 bytes, and
+`floor(…) as! u8` 10,814 → 5,831. `floor(…) as! i32` is 1,094 → 5,735, because master's sites
+carried neither the range test nor a reason. A module with one or two sites pays the helper's
+body: `bench/arrays/binsearch` `-O3` 648 → 757.
+
+**Rejected: inlining `signed` at `-O3`.** SP-056 also asked why the 10-op leaf `signed` stays a
+call. `-O3` inlines through binaryen's "lightweight" rule (no call, no loop, size ≤ 20), and
+`signed` with `hash` inlined into it measures 29–30, so it stays a call; `-O3` also does not carry
+`-O`'s `--always-inline-max-function-size 16`. Raising the flexible size to 40 inlines it, and on
+V8 the kernel is 4–6% SLOWER (259.8 against 243.7 ms), with or without V8's own wasm inliner;
+the game grows 3.2%. The call is not where the gap was.
+
+## A list index's guard is a branch to the trap, not a `select` (2026-10-09) — sunpa SP-056
+
+**The rule.** A list read or write tests `i u< len` and, when it fails, branches to an out-of-line
+read at index -1 of the backing, so the trap is still the engine's own `out of bounds array
+access`. A record list's backing traps by a one-element `array.copy` to index `array.len` instead,
+which `-O`'s flattening rewrites as it does a list's growth, where a read it would box. A copy to
+-1 also trapped, but flattened to dest -4 with length 4, whose end is exactly 2^32: out of range
+only for an engine that checks the sum without wrapping. At `len` it is out of range by construction. The guard used to be
+`array.get backing (select -1 i (i u< len))`: the same compare, but on the index's data path.
+A list whose backing this module never typed keeps the `select`.
+
+**Measured** (Deno 2.9.6 / V8 15.0, `-O3`; sunpa's `run.ts track 100000`, medians of 7, load 3–9;
+sums identical):
+
+| | track VL | track Rust | VL / Rust |
+| --- | --- | --- | --- |
+| master | 162.9–165.9 ms | 121.5–126.3 ms | 1.29–1.37x |
+| **the branch guard** | **127.9–133.1 ms** | 122.1–124.4 ms | **1.03–1.09x** |
+
+`bench/arrays/fill-sum` −22% and `binsearch` −7% on V8 (start function, medians of 5); wasmtime
+is flat to slightly faster. `noise` (no list reads) is unchanged.
+
+**The price is bytes.** Each guarded access carries the `if` and its trap: sunpa's game
+(`-O3`, no names) 2,736,128 → 2,898,196 (+5.9%); the seed 4,453,444 → 4,773,370 (+7.2%), its
+baseline rewritten here. Part of it is binaryen no longer merging repeated checks of one index,
+since a branch to a trap is not a pure `select` it can fold, so `-O` keeps more guards. The L2
+self-compile's guest fuel against master is −1.7% (59.64 G → 58.61 G). The release-shape rows
+moved in bytes only.
+
+**Rejected: versioning the loop.** SP-056's design was a range loop cloned behind one pre-entry
+check, the clone's candidate indices unguarded. Built and measured, interleaved at low load:
+versioning alone 1.027x master (slower), versioning with the branch guard 0.855x, the branch
+guard alone 0.776x. The hot reads that matter in `sample` are not in counted runs — the
+`while` scans of `k.times[i]`, the span reads, the norm — and the clones cost code the engine
+then has to compile and predict.
+
+**Rejected: `unreachable` in the untaken branch.** Measured equal on speed (0.773x) at +1.5% on
+the game instead of +6.0%, but the trap becomes `unreachable` with the note "a compiler-emitted
+trap" rather than the bounds trap the guide and `std:bytes` promise. Keeping the message was
+chosen; the smaller form is one line if that trade is wanted.
+
+## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
+
+**VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and
+`i64`, and the type picks the unsigned operation: `/`, `%`, comparison, `>>` and widening
+read the bits as unsigned. This amends §"Types & semantics", *"Unsigned integer ops are
+operations, not a `u32` type"*: `divU`, `ltU` and `>>>` stay, for `i32` and `i64` operands.
+Three consumers had built unsigned arithmetic by hand, and the type removes that class of
+bug. Design and options: `docs/internals/unsigned-types-design.md`.
+
+**Implicit conversions are only the lossless ones (U2 = A, 2026-10-03).** The lattice gains
+`u32 → i64`, `u32 → u64` and `u32 → f64`. Every other conversion is written `as` (exact or
+fail) or `as%` (wrap).
+
+**A radix literal with no context stays signed (U3 = A, 2026-10-03).** `print(0xDEADBEEF)`
+prints -559038737, as it does today. A literal is `u32` or `u64` only where its use names
+that type, so no existing program's output changes.
+
+**Mixed signed and unsigned operands are a check error (U4 = A, 2026-10-04).** `u + i` is
+refused, and the message says to write `i as u32` or `u as i32`. A literal operand adapts,
+and a shift count may be any integer. This is the rule of Rust, Go and Zig, and it follows
+from U2: `i32 ↔ u32` has no lossless edge.
+
+Questions U5–U14 of the design doc are not yet ruled. Nothing here is built.
+
+
+## A positional argument lands at its written index (Q8, committee on owner delegation, 2026-10-11)
+
+**The rule.** A positional argument may follow named ones only when every named argument
+before it sits in its own parameter position. Naming a parameter that a positional argument
+already filled is refused ("given twice"). In a method call `x.f(…)` the receiver is
+position 0. The principle: a positional argument always lands at its written index. This is
+Kotlin's rule since 1.4.
+
+```vl
+function box(w: i32, h: i32): i32 { w * 10 + h }
+box(w: 3, 2)   // ok: `w` is in position 0, so 2 lands at position 1 — 32
+box(h: 3, 2)   // refused: `h` is not in its own position
+box(3, w: 2)   // refused: `w` is given twice
+box(3, h: 2)   // ok — 32
+```
+
+**Before.** Named arguments bound first, and positional ones then filled the parameters
+still unbound in declaration order, wherever they stood. `box(h: 3, 2)` and `box(3, w: 2)`
+both printed 23: the positional argument moved to a later parameter without a word.
+
+**Why not Python's rule (positional first, always).** It would break 11 calls in diderven,
+`src/craft/recipes.vl`, of the shape `gear("Copper Sword", SN_ANVIL, base: 100, [...])`,
+where the label documents an argument that is already in its own position. This rule keeps
+those and checks the label. No consumer or corpus call relies on the old skip rule.
+
+The committee voted 2–1 for this option, amended from the open question's (b)
+(`docs/spec/OPEN-QUESTIONS.md` Q8). The checker does not enforce it yet (D4061).
+
+## `is` tests whether the value fits the type (owner ruling (A), 2026-10-10) — D3885
+
+**The rule.** `v is B` asks whether the value `v` holds fits `B` structurally, not which type
+`v` was declared at or built as. With `A = { x: i32 }` and `B = { x: 1 | 2 }`, a value
+`const a: A = { x: 1 }` gives `a is B` true, and `{ x: 7 }` gives false. Values carry no
+runtime declared-type tag.
+
+```vl
+type A = { x: i32 }
+type B = { x: 1 | 2 }
+function f(v: A | B): string { if v is B { return "B" } "A" }
+const a: A = { x: 1 }
+print(f(a))   // B
+```
+
+**Why.** VL's records are structural (D3870, option C: same-shape records are one type). An
+`is` that answered by declared type would need a hidden tag on every record and would
+contradict that ruling.
+
+**What it adds.** A HINT, not an error, where one arm contains another: `` `B` is contained
+in `A`, so `is B` tests the value `` (code `contained-arm-is-test`). Disjoint literal sets are
+a real discriminant and get no hint. The string-against-integer-literal check reject keeps
+its behaviour. Where the operand's declared type is a single record containing `B`, the
+compiler still answers by the declared type (D4058).
+
+## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
+
+**The rule.** A union of records whose arms share a field name is legal, whether or not a
+field is literal-typed in both. `u is A` answers whether the value structurally fits `A`,
+field by field. A tag may serve as a fast path only where it gives the same answer as the
+structural test.
+
+```vl
+type A = { v: i32 }
+type B = { v: boolean }
+function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+print(f({ v: true }))   // prints 2
+```
+
+**Why.** The owner: "'is' is not a nominal check; the language is structural", and "We can
+do a nominal check for perf reasons, but fundamentally the language is meant to be
+structural." This is the same principle as D3885 and D3870, applied to the union's formation
+rule. The 2026-09-02 refusal it replaces is retired.
+
+**Before.** The union was refused when formed, whichever way the `is` went. The checker does
+not admit it yet (D4056).
+
+## `x == L` narrows a literal union as `x is L` does (Q10 (a), owner ruling, 2026-10-12) — D4059
+
+**The rule.** For a literal union `K`, `x == L` narrows exactly as `x is L` does: in the
+then-branch, in the else-branch, after an exiting guard, and with `!=` reversed.
+
+```vl
+type K = "a" | "b" | "c"
+function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } 3 }
+```
+
+**Why.** The guide already said it, and `x is L` reads as `x == L` with narrowing. One
+spelling that narrows and one that does not was a trap. The checker does not do it yet
+(D4059).
+
+## A declaration shadows an ambient name of the same name (Q11 (b), owner ruling, 2026-10-12) — D4066
+
+**The rule.** A declaration named like an ambient name (a built-in type, `print`, `Map`,
+`Set`, a float or integer intrinsic) shadows it in its scope, for both the call and its
+type. Compiler intrinsics (`__name__`) stay refused.
+
+```vl
+function print(s: string): i32 { 7 }
+print("x")   // calls the program's own `print`, typed by its own signature
+```
+
+**Why.** A call and its type must agree about which name they mean; today a declared
+`print` is called but typed by the ambient one. Shadowing is how every other scope works.
+Built by D4066: the merge renames such a binding, so no spelling-matched site sees it.
+
+## A re-export binds its name locally (owner rulings R1–R3, 2026-10-04) — sunpa SP-014, SP-020
+
+**R1 (A).** `export { X } from "m"` publishes `X` and also binds `X` in the re-exporting
+module, as an import would. This is what shipped (#1196) and what `std:fs` relies on: it
+uses `Buf` in its signatures through `export { Buf } from "std:buffer"` alone. JS and TS
+bind nothing locally here; VL does, so one line both uses and publishes a name.
+
+**R2 (A).** An `import` of a name the same module also re-exports from the same specifier
+is redundant, and gets the duplicate-import WARNING with a `--fix` that removes the
+import. std's eight instances (`std:args` 1, `std:env` 4, `std:process` 3) are cleaned up
+in the change that lands the warning (D4064).
+
+**R3 (A).** `export { x }` without `from` stays refused when `x` is an import. There is one
+spelling for passing an import on, `export { x } from "m"`, and the refusal names it.
+
+The questions and options are `docs/internals/modules-design.md` §2.1.1.
+
+## No prelude: every library name is imported (owner ruling O7, 2026-10-07)
+
+**The rule.** No default prelude and no configurable one. Every library name, `std:str`'s
+and `std:array`'s included, is imported explicitly. The ambient names a module sees with
+no import are the intrinsic floor, not a prelude. This supersedes the configurable-prelude
+amendment in `docs/internals/modules-design.md` §2 (`builtin-methods-to-std.md` §O7).
+
+The owner's words were "stay explicit". The reasoning and the reopen condition below are
+not the owner's. They come from the five-reviewer debate memo the ruling was decided after
+(5–0 for explicit imports), and are recorded as that memo's argument.
+
+**The memo's argument.** `std:str` and `std:array` collide on several names (`lastIndexOf`,
+and under A′ `includes`, `indexOf`, `slice`, `get`), so a prelude would need type-directed
+dispatch or a new shadowable scope tier. Tooling carries the typing cost instead: `vl check
+--fix` adds the import, choosing the module by the receiver's type. The memo would reopen
+the question only if receiver overloading (O1) and a shadowable prelude tier both exist and
+the default set is versioned, or if agents keep retrying imports after the receiver-typed
+`--fix`.
+
+## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
+
+**The rule.** An exported record binding without an annotation takes the field types its
+importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
+an importer to `take(w: { x: i64, y: i64 })` widens `pt`'s layout in that program. Nothing
+refuses it, and no `--fix` adds an annotation.
+
+**Why.** In the owner's words: "don't want an auto fix. vl design principles is minimal
+annotations. I rather we have more complex incremental build machinery." An incremental
+build therefore keys a module on the layout demands its importers make
+(`docs/internals/incremental-compilation-design.md` §"Owner questions", Q1).
+
+## The module system's eight decided directions (owner review, 2026-06-06) — modules-design §5
+
+`docs/internals/modules-design.md` §5 lists eight directions the owner reviewed, folded in by
+commit `e295c6986` ("docs(modules): fold in owner review — std: scheme, no prelude,
+fine-grained modules, live-ref/readonly(A9) exports, `as` aliasing, no extension,
+visibility", 2026-06-06). The section says the formal record would land here at
+implementation; this is that record. Each direction in its own words:
+
+1. "Std specifier = the `std:` scheme (colon), not `std/`."
+2. "No implicit library prelude." (Restated and extended by O7, the section above.)
+3. "Fine-grained std modules." One module per concern, flat.
+4. "Export semantics = live references; readonly is A9." "Exported bindings are live
+   references"; "the imported name is read-only (no reassigning another module's `let`)".
+5. "Rename in v1; re-export deferred." `import { x as y }` is in; re-export has since landed
+   (the R1–R3 section above).
+6. "Omit the `.vl` extension in specifiers." "No index/directory guessing."
+7. "LSP cross-file / std navigation = Phase 3, perf-bounded." Tooling, not a module rule.
+8. "Visibility: v1 binary." "v1 = top-level `export` or private."
+
+Items 2 and 8 also carry open sub-questions in §5 (a shadowable convenience name;
+graduated visibility levels). They stay open. `docs/spec/modules.md` cites directions 4
+and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.

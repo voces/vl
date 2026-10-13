@@ -43,13 +43,32 @@ there); the rest is the review's, and the full rubric is `std-api-review.md` §4
 `earlyoom` still SIGTERMs at 10% available, so check `free` before going wide, and drop back
 to 3 for anything that does run a full census block.
 
+## Disk — every tree, target and temp dir is removed by whoever made it
+
+On WSL a deleted file only frees space on the Windows side if the distro's disk image is
+sparse; otherwise the `.vhdx` keeps every byte it ever held (214 GB for 132 GB of data on
+2026-10-12). The image is the owner's to configure; keeping it small is ours:
+
+* **A worktree is removed when its work is on origin.** An agent finishing a PR, review or
+  probe ends with `git worktree remove --force <dir>`; a coordinator removes a merged agent's
+  worktree the same turn. New worktrees go under `.claude/worktrees/`, never a sibling dir.
+* **Scratch builds live in the scratchpad or `$TMPDIR`, under a trap that deletes them.** No
+  `.wasm`, seed or cargo target is left in `/tmp` or a worktree after the task ends.
+* **An isolated `cargo --target-dir` is deleted with the task.** Cargo never collects old
+  artifacts, so a target only grows.
+* **`scripts/disk-hygiene.sh`** reports every place this work grows, `--clean` removes what
+  is safe (clean worktrees already on origin, temp trees over a day old, cargo targets over
+  3 GB, old host backups), and `--check` runs at session start and flags a total over
+  25 GB. Run `--clean` when the check fires, and never while a gate or agent is running.
+
 ## Gates
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
-time, CPU seconds and exit code. Twenty-five gates (26 on master); measured 2026-09-05 on a
-box at load 27, the wall clock was **79.8 s**, set by `distilled corpus` alone at 79.8 s with
-`ci-native` next at 55.5 s — everything else finishes in well under a minute in parallel. The
+time, CPU seconds and exit code. Thirty gates on master; measured 2026-10-12 at 3c2e2227a, back
+to back on one 24-thread box: **173 s** under WSL (every row at once) and **263 s** on Windows
+(at most 6 at once), set by `ci-native` and `filed witnesses`/`scaling shape` behind it. That is
+past the budget below; the September reading (79.8 s, 25 gates) was a smaller gate. The
 table has been per gate since #2564 (before that it read elapsed-to-report, and the old "68
 seconds for all nine" was that broken reading), and it now carries TWO columns: WALL is still
 each row's contended elapsed, CPU is its own user+sys, so a row that is slow and a row that is
@@ -382,10 +401,32 @@ row per refusal literal a witness reaches, 21 of them, all invisible to the word
 `run.py --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
 probe. `docs/internals/emit-refusal-wording-2026-09.md`.
 
-**And the distilled corpus contributes ZERO emit-side evidence** — `baseline.jsonl` is 4,620
-`runs` plus 2,944 `loud check reject`, with no emit rejects and no silent cells. That is why
-`goal-scoreboard.py` can print `total against the goal 0` while ~500 refusal sites stand, and
-it is the sharpest available statement of the "name the population in the sentence" rule.
+**The corpus's emit-side evidence comes only from its CURATED half.** On 2026-10-11
+`baseline.jsonl` held 10,065 cells:
+
+* 5,932 `runs` and 3,258 `loud check reject`;
+* 667 `loud emit reject`;
+* 208 clause-1 cells: 144 `runs but wrong value`, 54 `check-clean invalid wasm` and
+  10 `trap_loads`.
+
+All 875 cells against the goal are in `named/`, and every one is a review's PRICE: the cells
+a candidate moved loud→silent into a defect master already had. The 1,477 DERIVED cells are
+still only `runs` (1,223) and `loud check reject` (254). So the census's behavioural classes
+carry no emit reject and no silent cell. The 875 measure what reviews looked at, not how
+often the language fails.
+
+**Triage the clause-1 cells by ablation, not by message.** Their 30 distinct messages fall
+into 12 families, and every family has a row:
+
+* D3423 holds 118 of the 208;
+* D3361 holds 24, and D3367 holds 20;
+* D4046 holds 18;
+* D3336 holds 5;
+* D3357, D3369 and D2594 hold 4 each;
+* D3346, D2595 and D3961 hold 3 each;
+* D3398 holds 2.
+
+The other ~500 refusal sites still have no corpus cell. Name the population in the sentence.
 
 **AND THE PHRASE LIST ITSELF NEEDS AUDITING — it was reporting HALF.** Until #2122 the predicate
 matched four phrasings and found 12 literals; the compiler carried **12 more** that concede the
@@ -448,7 +489,7 @@ per-file ratchets now carry it (`comment-budget`, `ladder-budget`, `sentinel-bud
 has no entries to name). A baseline recording no `commit` falls back to the commit that last
 CHANGED it.
 
-`vl fmt -w` takes **one path per run**; a multi-path call fails and formats nothing.
+`vl fmt -w`, `vl check` and `vl test` take several paths (files or directories) in one run.
 
 ## Disassembly — `wasm-dis` is here, it is just not on `PATH`
 

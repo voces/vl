@@ -112,6 +112,64 @@ Deno.test({
 });
 
 Deno.test({
+  name: "lint span: unused-pure-expression covers the discarded statement (D3673)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "discard.vl",
+      [
+        "type Cam = { x: f64, y: f64 }",
+        "function f(a: f64, b: f64, c: Cam) {",
+        "  const w = a * 3.0",
+        "    -b * 3.5",
+        "  const v = a * 3.0",
+        "    - b * 3.5",
+        "  c.x - c.y",
+        "  w",
+        "}",
+        "print(f(1.0, 1.0, { x: 1.0, y: 2.0 }))",
+        "",
+      ].join("\n"),
+    );
+    // The field reads only the check can type: this is the typed face the CLI pairs. `- b`
+    // with a space continues `v`, so only the `-b` line is a discarded statement.
+    const got = diags.filter((d) => d.code === "unused-pure-expression").map((d) => spanText(src, d));
+    want(JSON.stringify(got), JSON.stringify(["-b * 3.5", "c.x - c.y"]), "unused-pure-expression");
+  },
+});
+
+Deno.test({
+  name: "lint span: a `-` line after an `if` statement is told a space will not help (D3698)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "after-if.vl",
+      [
+        "function f(c: boolean, k: i32) {",
+        "  let r = 1",
+        "  if c { r = 2 }",
+        "  - k * 2",
+        "  r = r + 1",
+        "  -k * 2",
+        "  r",
+        "}",
+        "print(f(true, 3))",
+        "",
+      ].join("\n"),
+    );
+    // `- k * 2` after the `if` stays a statement, so the space advice would re-fire; `-k * 2`
+    // after the assignment would continue it with a space, so that one gets the space advice.
+    const got = diags.filter((d) => d.code === "unused-pure-expression")
+      .map((d) => [spanText(src, d), d.message.includes("parentheses") ? "parens" : "space"]);
+    want(
+      JSON.stringify(got),
+      JSON.stringify([["- k * 2", "parens"], ["-k * 2", "space"]]),
+      "unused-pure-expression",
+    );
+  },
+});
+
+Deno.test({
   name: "lint span: sentinel-index-unguarded covers the whole read, not the table",
   ignore: !ENABLED,
   fn: async () => {

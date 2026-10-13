@@ -300,6 +300,62 @@ export let cloSigWalkRoots: i32[] = []
 // `mAssignTypeIndices`. The captured NAMES per function are recomputed on demand by
 // `captureNamesOf` (a flat `string[]` per call — `string[][]` is not self-host-emittable).
 export let fnEnvIdx: i32[] = []
+// Per lifted slot, parallel to `fnStmts`: the capture count of a function `cloLiftScan`
+// lambda-lifted (every use a direct call, so its captures travel as leading parameters after
+// the env and no closure value is built), or -1. `cloLiftFrame`/`cloLiftLet` pair each lifted
+// `const` binding with the frame that declares it, so that frame skips the binding (SP-037).
+export let cloLiftCapN: i32[] = []
+export let cloLiftFrame: i32[] = []
+export let cloLiftLet: i32[] = []
+export let cloLiftFe: i32[] = []
+// A captured `let` every capturer of which is lifted stays a plain local (D3664): the
+// FuncDecl nodes `captureBoxRewrite` left such a binding unboxed for, each of which
+// `cloLiftScan` must lift, and pairs of a capturer node with a binding it assigns.
+export let cloUnboxNeed: i32[] = []
+export let cloUnboxWrFn: i32[] = []
+export let cloUnboxWrName: string[] = []
+// Per lifted slot, the captures it assigns, returned after its result and written back by
+// every call site: `cloLiftWrStart[fe]`/`cloLiftWrN[fe]` slice the capture indices
+// `cloLiftWrIdx` and their names `cloLiftWrName`.
+export let cloLiftWrStart: i32[] = []
+export let cloLiftWrN: i32[] = []
+export let cloLiftWrIdx: i32[] = []
+export let cloLiftWrName: string[] = []
+
+// The parameter slot of capture `name` that lifted slot `fe` assigns, or -1.
+export function cloLiftWriteSlot(fe: i32, name: string): i32 {
+  if fe < 0 || fe >= cloLiftWrN.length { return -1 }
+  const start = cloLiftWrStart[fe]
+  let j = 0
+  while j < cloLiftWrN[fe] {
+    if cloLiftWrName[start + j] == name { return 1 + cloLiftWrIdx[start + j] }
+    j = j + 1
+  }
+  -1
+}
+
+// Clears the per-program unboxing and write-back tables.
+export function cloLiftWrReset() {
+  cloUnboxNeed = []
+  cloUnboxWrFn = []
+  cloUnboxWrName = []
+  cloLiftWrStart = []
+  cloLiftWrN = []
+  cloLiftWrIdx = []
+  cloLiftWrName = []
+  0
+}
+
+// The capture index of the `j`th capture lifted slot `fe` assigns.
+export function cloLiftWriteCapAt(fe: i32, j: i32): i32 {
+  cloLiftWrIdx[cloLiftWrStart[fe] + j]
+}
+
+// How many captures lifted slot `fe` assigns and returns.
+export function cloLiftWriteCount(fe: i32): i32 {
+  if fe < 0 || fe >= cloLiftWrN.length { return 0 }
+  cloLiftWrN[fe]
+}
 // Capture-list cache: every lifted function's captured names back-to-back in
 // `capNamesFlat`, with `capStartTbl[fe]`/`capCountTbl[fe]` its slice — the
 // self-hostable stand-in for a `string[][]`. Valid only while `capCacheOn`, set once
@@ -731,6 +787,9 @@ export let uBoxNewEnd = -1
 // written — two conditions, for the reason `uBoxNewEnd` states, reset per function.
 export let tailCallEnd = -1
 export let tailCallIdx = -1
+// The buffer offset just past the write-back that follows a call to a lifted function
+// assigning captures (D3664), so a self call in tail position can still become `return_call`.
+export let liftWbEnd = -1
 // Struct-type table: a flat store keyed by struct index (`sNames`, `sFieldNames`,
 // `sFieldTypes`, `sHeapIdx`), rebuilt by `collectS`, empty when the program declares
 // unions instead. `postMonoShapes` turns true once `monomorphize` runs, so
@@ -805,6 +864,15 @@ export let emitArenaFinal = false
 // a table a later pass still fills (`fRetKind` is one) may cache only within the pass that
 // computed it, so this is the generation such a memo stamps (D1655).
 export let emitPassGen = 0
+
+// Every in-place rewrite of a struct or union table row, which no table length shows; part of
+// the type-registry generation (`tyRegGenNow`, compiler/emit_classify.vl).
+export let tyRegWrites = 0
+
+export function tyRegNoteWrite() {
+  tyRegWrites = tyRegWrites + 1
+  0
+}
 
 export let sDeclared = false
 export let sNames: string[] = []
@@ -1127,6 +1195,12 @@ export let gHelpMapCompact: i32[] = []
 // reader `r`, then traps; the one body every guard site calls. Reserved when `gInitAny`; its
 // rows are interned while user bodies emit, before its own body (the last helper) is written.
 export let gHelpInitFail = -1
+// `__as_fail__(line, colRow)`: prints a failed `as!` cast's reason, its domain the row
+// `colRow & 7` of `gAsFailDoms` and its place `line:(colRow >> 3)`, none at line 0 (SP-056).
+// Reserved when `gNeedsAsFail`; rows are interned while user bodies emit.
+export let gHelpAsFail = -1
+export let gNeedsAsFail = false
+export let gAsFailDoms: string[] = []
 // A scalar list delivered as a wider `readonly` list from a source other handles may write is a
 // view that keeps its source (D3028). `svPairs` is the checker's `scalarViewPairs` less a pair this
 // module lacks the lists of; per pair (0 `i32`->`i64`, 1 `i32`->`f64`, 2 `f32`->`f64`) a view type
@@ -1188,6 +1262,59 @@ export let gStrDataParts: ByteChunk[] = []
 // Whether the expression being emitted is a global's constant initializer, where a literal
 // cannot chunk through locals and so builds as one `array.new_fixed` within the operand cap.
 export let gConstExprEmit = false
+// Module constants a body may read instead of allocating: an empty list's backing per array
+// type, each capture-free function's closure, a constant list only a `for` reads (`gSynthInit`).
+// They trail every other global, from `gSynthBase` (-1 until `emitGlobalSection` places them),
+// and their section is framed after the bodies, so a body may add one.
+export const SYNTH_EMPTY_BACKING = 0
+export const SYNTH_CLOSURE = 1
+export const SYNTH_CONST_LIST = 2
+export let gSynthBase = -1
+export let gSynthKind: i32[] = []
+export let gSynthArg: i32[] = []
+export let gSynthInit: u8[][] = []
+export let gSynthAt: {[i32]: i32} = Map()
+
+// The global holding synthetic constant (`kind`, `arg`), minted on first use, or -1 where none
+// can be read: before the global section is placed, or inside a constant initializer.
+export function synthGlobalIdx(kind: i32, arg: i32): i32 {
+  if gSynthBase < 0 || gConstExprEmit || arg < 0 { return -1 }
+  const key = arg * 2 + kind
+  const have = gSynthAt[key] ?? -1
+  if have >= 0 { return gSynthBase + have }
+  gSynthAt[key] = gSynthKind.length
+  gSynthKind.push(kind)
+  gSynthArg.push(arg)
+  gSynthInit.push([])
+  gSynthBase + gSynthKind.length - 1
+}
+
+// The global holding the list of wrapper type `wrapTy` that constant initializer `init` builds,
+// shared with an earlier list of the same bytes, or -1 where `synthGlobalIdx` would give none.
+export function synthConstListIdx(wrapTy: i32, init: u8[]): i32 {
+  if gSynthBase < 0 || gConstExprEmit || wrapTy < 0 { return -1 }
+  let i = 0
+  while i < gSynthKind.length {
+    if gSynthKind[i] == SYNTH_CONST_LIST && gSynthArg[i] == wrapTy {
+      if bytesEq(gSynthInit[i], init) { return gSynthBase + i }
+    }
+    i = i + 1
+  }
+  gSynthKind.push(SYNTH_CONST_LIST)
+  gSynthArg.push(wrapTy)
+  gSynthInit.push(init)
+  gSynthBase + gSynthKind.length - 1
+}
+
+function bytesEq(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
 // The arm blocks whose prelude locals `collectLocalsIf` allocated, as a mark column indexed by
 // arena node. Locals are claimed off a linear cursor, so the emitter may lower only a prelude
 // the collect pass walked; an unwalked one fails loudly at `emitIfArmOpen` rather than claiming

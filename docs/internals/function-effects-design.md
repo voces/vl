@@ -93,7 +93,7 @@ rules. None of them looks through a call.
 | --- | --- | --- | --- |
 | `exprEffectFree` | `compiler/emit_base.vl:745` | literals, identifiers, `Paren`/`Unary`/`BinExpr` (not `=`), `Member`, `OptMember`, `Index`, `is`, `as`, array and object literals of such. **Every other kind, `Call` and lambda included, answers false** (`exprEffectFreeUnclassified`, fail-closed) | D1510's struct-literal order stash |
 | `unionEqOperandOk` | `compiler/emit_base.vl:873` | identifiers, numeric and string literals, member, optional-member and index chains over those | whether a multi-compare union lowering may re-read its operand |
-| `upeIsPure` | `compiler/lint.vl:698` | literals, an identifier, array and struct literals of pure parts, **operators only over literal leaves** ("VL has operator overloading, and dispatch needs an object-typed left operand") | the `unused-pure-expression` lint |
+| `upeIsPure` / `upeScalarOperand` | `compiler/lint.vl:904` | literals, an identifier, array and struct literals of pure parts, **operators only over literals and reads of unbranded scalars** (no overload can take a number, boolean or string operand, and a field of an unbranded receiver is never a getter; D3673) | the `unused-pure-expression` lint |
 
 The disagreement between rows 1 and 3 is deliberate and correct. The lint runs on the source,
 where `a + b` may dispatch to a user `"+"`. The emitter runs after the pre-emit rewrite has

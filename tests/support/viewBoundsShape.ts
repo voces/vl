@@ -71,7 +71,7 @@
 // same) and `wasm-tools` on PATH. A missing prerequisite self-ignores rather than
 // fails, so read the suite's IGNORED COUNT, not just its pass count.
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL, binaryen } from "./tree.ts";
 
 const haveTool = async (name: string): Promise<boolean> => {
   try {
@@ -88,7 +88,7 @@ const haveTool = async (name: string): Promise<boolean> => {
 
 export { COMPILER, ROOT, VL };
 
-export const WASM_OPT = `${ROOT}/node_modules/binaryen/bin/wasm-opt`;
+export const WASM_OPT = binaryen("wasm-opt");
 export const SRC = `${ROOT}/bench/buffer-view-bounds`;
 
 const haveBin = exists(VL);

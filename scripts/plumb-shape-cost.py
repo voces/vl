@@ -32,11 +32,16 @@ import hashlib
 import json
 import os
 import re
-import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+
+try:
+    import resource  # POSIX only: Windows has no rusage, so CPU and RSS go ungraded there
+except ImportError:
+    resource = None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "plumb-shape-baseline.json")
@@ -71,7 +76,9 @@ def as_wasm_opt() -> int:
     with open(argv[0], "rb") as fh:
         row["const_ifs"] = fh.read().count(CONST_IF)
     code = 0
-    if real:
+    if real and not hasattr(os, "wait4"):
+        code = subprocess.run([real] + argv).returncode
+    elif real:
         p = subprocess.Popen([real] + argv)
         _, status, ru = os.wait4(p.pid, 0)
         row["cpu"] = ru.ru_utime + ru.ru_stime
@@ -119,7 +126,10 @@ def cpu_model() -> str:
 
 def control() -> float:
     """A fixed CPU workload that no compiler change can move: dict, string and sort traffic."""
-    t0 = resource.getrusage(resource.RUSAGE_SELF)
+    if resource is None:
+        c0 = time.process_time()
+    else:
+        t0 = resource.getrusage(resource.RUSAGE_SELF)
     acc = 0
     for rnd in range(3):
         d: dict[str, int] = {}
@@ -127,8 +137,10 @@ def control() -> float:
             k = f"k{(i * 2654435761 + rnd) & 0xFFFFF:x}"
             d[k] = d.get(k, 0) + i
         acc += len(sorted(d.items()))
-    t1 = resource.getrusage(resource.RUSAGE_SELF)
     assert acc > 0
+    if resource is None:
+        return time.process_time() - c0
+    t1 = resource.getrusage(resource.RUSAGE_SELF)
     return (t1.ru_utime - t0.ru_utime) + (t1.ru_stime - t0.ru_stime)
 
 
@@ -144,8 +156,22 @@ def box_ticks() -> tuple[int, int]:
 
 
 def run(cmd: list[str], env: dict, cwd: str) -> tuple[float, float, str]:
-    """Run `cmd` under `timeout`: its process tree's CPU seconds, peak RSS (MB) and stderr."""
+    """Run `cmd` under `timeout`: its process tree's CPU seconds, peak RSS (MB) and stderr.
+    Without `os.wait4` (Windows) both readings are None and only fuel and the facts grade."""
     global LAST_BUSY
+    if not hasattr(os, "wait4"):
+        try:
+            r = subprocess.run(cmd, env=env, cwd=cwd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=BUILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(f"plumb-shape: `{' '.join(cmd)}` timed out after {BUILD_TIMEOUT}s")
+            sys.exit(1)
+        err = r.stderr.decode(errors="replace")
+        if r.returncode != 0:
+            sys.stdout.write(err[-2000:])
+            print(f"plumb-shape: `{' '.join(cmd)}` failed (rc {r.returncode})")
+            sys.exit(1)
+        return None, None, err
     b0, t0 = box_ticks()
     p = subprocess.Popen(["timeout", str(BUILD_TIMEOUT)] + cmd, env=env, cwd=cwd,
                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -176,7 +202,12 @@ def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: 
         log = os.path.join(work, "opt.log")
         build = [vl, "build", "unit.vl", "--names", "-O", "--import-memory", "--compiler", seed,
                  "-o", "unit.wasm"]
-        benv = dict(env, VL_WASM_OPT=os.path.abspath(__file__), PLUMB_SHAPE_OPT_LOG=log,
+        wrapper = os.path.abspath(__file__)
+        if os.name == "nt":  # the host can spawn a .cmd, not a .py
+            wrapper = os.path.join(work, "wasm-opt.cmd")
+            with open(wrapper, "w") as fh:
+                fh.write(f'@"{sys.executable}" "{os.path.abspath(__file__)}" %*\n')
+        benv = dict(env, VL_WASM_OPT=wrapper, PLUMB_SHAPE_OPT_LOG=log,
                     PLUMB_SHAPE_REAL_WASM_OPT=real or "")
 
         # The fuel build skips `wasm-opt`: fuel counts only the guest, and binaryen is not it.
@@ -196,18 +227,18 @@ def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: 
             cpu, rss, _ = run(build, benv, work)
             opt, _ = read_opt_log(log)
             quiet = base_control is not None and ctl <= base_control * QUIET
-            rows.append((ctl, cpu - opt, opt, rss, quiet))
+            rows.append((ctl, None if cpu is None else cpu - opt, opt, rss, quiet))
             if samples:
                 print(f"  run {i}: control {ctl:.3f}s  compile {cpu - opt:.2f}s  -O {opt:.2f}s  "
-                      f"rss {rss:.0f} MB  busy {100 * LAST_BUSY:.0f}%  load {os.getloadavg()[0]:.1f}{'  quiet' if quiet else ''}")
+                      f"rss {rss:.0f} MB  busy {100 * LAST_BUSY:.0f}%  load {os.getloadavg()[0] if hasattr(os, 'getloadavg') else 0:.1f}{'  quiet' if quiet else ''}")
             # Once too few runs are left to reach MIN_QUIET, the rest could only re-read RSS.
             elif base_control is not None and sum(r[4] for r in rows) + runs - i - 1 < MIN_QUIET:
                 break
         q = [r for r in rows if r[4]] if base_control is not None else rows
         return {
             "fuel": fuel,
-            "rss_mb": round(min(r[3] for r in rows), 1),
-            "compile_cpu": round(min(r[1] for r in q), 3) if q else None,
+            "rss_mb": None if any(r[3] is None for r in rows) else round(min(r[3] for r in rows), 1),
+            "compile_cpu": round(min(r[1] for r in q), 3) if q and q[0][1] is not None else None,
             "opt_cpu": round(min(r[2] for r in q), 3) if q and real else None,
             "control_cpu": round(min(r[0] for r in rows), 3),
             "quiet_runs": len(q),
@@ -231,7 +262,8 @@ def head_commit() -> str:
 def main(argv: list[str]) -> int:
     if "PLUMB_SHAPE_REAL_WASM_OPT" in os.environ:
         return as_wasm_opt()
-    vl = os.environ.get("VL", os.path.join(ROOT, "scripts", "vl-host", "target", "release", "vl"))
+    vl = os.environ.get("VL", os.path.join(ROOT, "scripts", "vl-host", "target", "release",
+                                           "vl.exe" if os.name == "nt" else "vl"))
     seed = os.environ.get("SEED", os.path.join(ROOT, "build", "vl-compiler.wasm"))
     args = argv[1:]
     require_fuel = "--require-fuel" in args
@@ -325,7 +357,8 @@ def main(argv: list[str]) -> int:
             grade(tag + "fuel", None, None, BAR_FUEL, "", "this host predates $VL_FUEL (rebuild scripts/vl-host)")
         else:
             grade(tag + "fuel", m["fuel"], b["fuel"], BAR_FUEL, "")
-        grade(tag + "peak RSS", m["rss_mb"], b["rss_mb"], BAR_RSS, " MB")
+        grade(tag + "peak RSS", m["rss_mb"], b["rss_mb"], BAR_RSS, " MB",
+              None if m["rss_mb"] is not None else "this OS reports no rusage")
         # Exact: a rung input's shape does not depend on the box.
         for key, what in (("skip_ssa", "skips ssa-nomerge"), ("const_ifs", "const-1 ifs")):
             if key == "skip_ssa" and not host_skips and not require_fuel:
@@ -336,7 +369,9 @@ def main(argv: list[str]) -> int:
             if not ok:
                 bad.append(tag + what)
         cpu_why = None
-        if not same_host:
+        if m["compile_cpu"] is None:
+            cpu_why = "this OS reports no rusage"
+        elif not same_host:
             cpu_why = f"CPU is `{cpu_model()}`, the baseline's `{base.get('cpu_host')}`"
         elif m["quiet_runs"] < MIN_QUIET:
             cpu_why = (f"box busy — {m['quiet_runs']} of {m['runs_done']} runs had the control within "
