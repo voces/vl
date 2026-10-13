@@ -69,6 +69,11 @@ TWINS = {
     "nsl": ("emit_classify.vl", '''    const nsl1 = nulScalarListKindOfTy(i)
     const nsl2 = nulScalarListKind(nm + "|null")
     if nsl1 != nsl2 { out = out + " [nsl " + nm + " twin=" + (nsl1 ?? "null") + " orig=" + (nsl2 ?? "null") + "]" }'''),
+    # The original is the render itself when it spells a primitive, else "".
+    "tep": ("emit_classify.vl", '''    const tep1 = primNameStr(tyEmitPrimOf(i))
+    let tep2 = ""
+    if nm == "i32" || nm == "i64" || nm == "f32" || nm == "f64" || nm == "boolean" || nm == "string" || nm == "void" || nm == "null" || nm == "never" || nm == "u8" || nm == "v128" { tep2 = nm }
+    if tep1 != tep2 { out = out + " [tep " + nm + " twin=" + tep1 + " orig=" + tep2 + "]" }'''),
 }
 
 # A prelude, a type, and a value of it. Every kind must reach the emitter: a kind the checker
@@ -100,6 +105,12 @@ KINDS = {
     "arr2": ("", "i32[][]", "[[1]]"), "arr_nul": ("", "i32[] | null", "[1]"),
     "obj": ("", "{ x: i32 }", "{ x: 1 }"), "obj_nul": ("", "{ x: i32 } | null", "{ x: 1 }"),
     "neg": ("", "(i32 | string) & !string", "3"),
+    "lit_i64": ("", "5000000000", "5000000000"), "nul_bool": ("", "boolean | null", "true"),
+    "lu_rg": ('type S = "a" | "b"\n', '"a" | "b" | i32', "3"),
+    "lu_alias_mem": ('type S = "a" | "b"\n', "S | i32", "3"),
+    "lu_int_str": ("", '1 | 2 | "a" | "b"', "1"),
+    "vu_fn": ("", "((x: i32) => i32) | i32", "3"),
+    "rec": ("type L = { v: i32, next: L | null }\n", "L", "{ v: 1, next: null }"),
 }
 
 TEMPLATE = """{pre}type A = {ty}
