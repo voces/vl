@@ -16,9 +16,9 @@ import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
  * A ratcheted code: the baseline file that holds its per-file counts, and the trees
  * that baseline was measured over.
  *
- * THE TREES ARE PART OF THE SCOPE, not decoration. `comment-budget.py` walks
- * `compiler/` only (a std comment is graded by `std-comment-audience` instead), and
- * `scan-budget.py` walks `compiler/` and `std/`. Holding a code for a file its own
+ * THE TREES ARE PART OF THE SCOPE, not decoration. The comment baseline's `targets`
+ * are `compiler/` only (a std comment is graded by `std-comment-audience` instead),
+ * and the arena-scan baseline's are `compiler/` and `std/`. Holding a code for a file its own
  * ratchet never reads would report "+N over baseline" for a baseline that does not
  * cover it. `tests/lsp_ratchet_hold_test.ts` re-derives this table from the scripts
  * and fails on drift.

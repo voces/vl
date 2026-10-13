@@ -193,7 +193,7 @@ Deno.test("ratchet-hold: a workspace with NO baselines is untouched", async () =
 });
 
 Deno.test("ratchet-hold: a code is not held OUTSIDE the trees its ratchet walks", async () => {
-  // `comment-budget.py` walks `compiler/` only; a std comment is graded by
+  // the comment baseline names `compiler/` only; a std comment is graded by
   // `std-comment-audience`, which has no baseline. So a std file's comment findings
   // must publish as they always did, not as "+N over baseline".
   const dir = await workspace("scripts/comment-budget-baseline.json", {});
@@ -374,8 +374,8 @@ const OWNERS: Record<string, string[]> = {
     "scripts/ladder-census.py",
   ],
   "scripts/sentinel-budget-baseline.json": [],
-  "scripts/scan-budget-baseline.json": ["scripts/scan-budget.py"],
-  "scripts/comment-budget-baseline.json": ["scripts/comment-budget.py"],
+  "scripts/scan-budget-baseline.json": [],
+  "scripts/comment-budget-baseline.json": [],
   "scripts/export-budget-baseline.json": ["scripts/export-budget.py"],
   "scripts/interp-budget-baseline.json": [],
 };

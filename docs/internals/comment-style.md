@@ -2,7 +2,7 @@
 
 A comment is read by someone changing the code beside it, and is never re-graded, so
 anything that can go stale belongs where a gate re-runs it. The mechanical half of rules
-1, 2, 3 and 5 is `compiler/lint.vl`, ratcheted by `scripts/comment-budget.py`. (`std/`
+1, 2, 3 and 5 is `compiler/lint.vl`, ratcheted by `vl check --budget scripts/comment-budget-baseline.json`. (`std/`
 has its own consumer-facing rubric: `std-comment-audience`, `std-api-review.md` §4.)
 The two are DISJOINT and both halves enforce it: the lint grades the four codes under
 `compiler/` alone and the ratchet walks `compiler/` alone, so neither std's comments nor a
@@ -27,22 +27,21 @@ consumer's own file is ever read against this page (D1601; `lint-rule-scope.md`)
 5. **No emphasis by capitalisation.** Identifiers go in backticks, ordinary words in
    lower case. `comment-shouting` fires on two words of three-or-more capitals in a row
    outside backticks; the acronym allow-list (`ABI`, `AST`, `WASM`, `UFCS`, …) lives in
-   `cbIsAcronym` in `compiler/lint.vl` and its copy in `scripts/comment-budget.py`.
+   `cbIsAcronym` in `compiler/lint.vl`.
 6. **No cross-block narration.** Not "see three functions up", not "as above" — name the
    function, so the sentence survives the next reordering.
 
 ## The ratchet
 
 All four codes ride one ratchet, since the tree cannot reach zero in one PR.
-`python3 scripts/comment-budget.py --check` (a gate in `gate.sh` and in CI) fails when
-any FILE's count for any code goes up; `--write-baseline` lowers it, in the same PR as
-the trim that earned it, `--list <code>` names the blocks, and `--why` names the blocks
-that LEFT since the baseline's commit — so a fall can be attributed to the trim that
+`vl check --budget scripts/comment-budget-baseline.json` (a gate in `gate.sh` and in CI)
+fails when any FILE's count for any code goes up; `--write-baseline` lowers it, in the
+same PR as the trim that earned it, `vl check compiler --severity info` names the blocks,
+and `--budget-why` names the blocks that LEFT since the baseline's commit — so a fall can be attributed to the trim that
 earned it rather than read as a detector going quiet. `scripts/lint-self.sh`
 holds a code out of its `info` gate only while the committed baseline still owes it, so
-the exemption deletes itself at zero. `tests/vl_comment_budget_test.ts` pins the lint and
-the script to agree, hit line by hit line. The baseline schema and those four commands
-are `scripts/ratchet.py`, shared with the four sibling ratchets.
+the exemption deletes itself at zero. `tests/vl_comment_budget_test.ts` pins the lint's hit lines
+fixture by fixture. The baseline schema and those commands are `compiler/cli_budget.vl`.
 
 **A comment-only change must produce a byte-identical seed** — `scripts/refresh-compiler.sh`,
 then `cmp` against a seed built from the pre-trim source. One byte different means the edit
