@@ -416,7 +416,7 @@ will drift.
 | formatter | `compiler/format.vl` (`vl fmt`) | layout | — (it is the seed) |
 | lint | `compiler/lint.vl` (`vl lint`) | language and repo rules | — (it is the seed) |
 | test runner | `compiler/cli.vl` (`vl test`), host `main.rs` | executing test modules across a pool | discovery, compiling, planning, reporting |
-| ratchets | `scripts/ratchet.py` and `scripts/*-budget.py` | a per-file count that may only fall, with `--why` | the findings, when the rule exists in `lint.vl` |
+| ratchets | `compiler/cli_budget.vl` (`vl check --budget`) | a per-file count that may only fall, with `--why` | the findings, when the rule exists in `lint.vl` |
 | TS mirrors | `compiler/moduleGate.ts`, `compiler/vlSrcSection.ts` | the module-arming predicate; the `vl-src` section reader | nothing; each is a mirror |
 | TS vocabulary | `compiler/coreTypes.ts`, `compiler/diagnostics.ts`, `compiler/vlHostImports.ts` | shared types for the editor layer; the JS hosts' import table | nothing; leaves with no compiler logic |
 

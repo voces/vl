@@ -1,8 +1,8 @@
 // `vl check --budget` HOLDS AND WRITES THE INTERP RATCHET.
 //
 // The interp ratchet has no script: `vl check --budget scripts/interp-budget-baseline.json`
-// is its gate row and `--write-baseline` its writer, in the layout scripts/ratchet.py
-// writes (architecture-refactor-plan T2). This holds the three verbs to one answer:
+// is its gate row and `--write-baseline` its writer, in the layout the retired
+// scripts/ratchet.py wrote (architecture-refactor-plan T2). This holds the three verbs to one answer:
 //
 //   1. On the real tree, a fresh write must pass its own `--budget` with the ok line,
 //      `--budget-why` must find every entry where the write put it, and a second write

@@ -438,8 +438,8 @@ once per position, named `"<checkout-relative path>: <trimmed source line>"`. It
 the ratchet's verdict — `<label> budget ok — …` (exit 0) or `<label> budget REGRESSED — …`
 with one line per file whose count rose (exit 1) — and no diagnostics. `--budget-why`
 compares the baseline's stored `entries` with this run, by name (`LEFT`, `ENTERED`, count
-moved). `--write-baseline` rewrites the baseline from this run in scripts/ratchet.py's
-layout — its `label`/`targets`/`exclude` kept, `commit` re-read from the checkout's `.git`,
+moved). `--write-baseline` rewrites the baseline from this run in the layout the retired
+scripts/ratchet.py wrote — its `label`/`targets`/`exclude` kept, `commit` re-read from the checkout's `.git`,
 `entries` kept one per line — unless it names a Python `writer`, which then owns it and is
 what the remedy line names. `--exempt-codes` prints the codes whose `total` is still above
 zero, for `lint-self.sh`. `compiler/cli_budget.vl`; the first ratchet on it is interp
