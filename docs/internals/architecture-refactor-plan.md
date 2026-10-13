@@ -24,11 +24,12 @@ restate measurements; follow the links.
 | item | state | where |
 | --- | --- | --- |
 | L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
-| L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. Next: `valueAtomKind`'s union fallback and `mvValKindOfTy`. |
+| L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. The second read `valueAtomKindOfTy` and `nulScalarListKindOfTy` off the type (`tyEmitElemPrimOf`, `tyEmitElemNulPrimOf`, `tyEmitNamesOf`): 112 → 111. `valueAtomKindOfTy` still renders a union of members that share a list or closure rep (D4320), and `mapTyValKindLowerable` still renders an anonymous shape or a nullable union of shapes. Next: `armFieldUnionName`, `joinRowOfTy`, `listUnionEmitName`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
+| L4 one rollback for the quiet probes | first PR (A1) **in review** | The assertion and its measured list are in code-quality-2026-10.md L4. A2 (`CheckMark`) is next. |
 | L7 `pending*` into `ExpCtx` | **in progress as C3** | `emitReturnValue` builds its `ExpCtx` and restores the caller's on every exit: 25 `pending*` writes to 0 (`wasmEmit.vl` 463 to 436 lines). Next: `emitLetDeclStmt`. The never-cleared count (211 of 1,151) is not ratcheted yet. |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
-| L4–L6, L9–L14 | not started | |
+| L5–L6, L9–L14 | not started | |
 | SMALL S-c front-end tidy | **partial** | `typecheck.vl` imports `./ast` once (byte-identical seed). Not byte-identical, so not done: the second `Tok` (the lexer's has no `pos`), the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check). `await` skipped: a surface decision. |
 | SMALL S-a, S-b, S-d … S-n | not started | |
 | RepDesc rulings | **open** since 2026-09-06 | `open-rulings.md`: `one-literal-union-rep`, `nullable-rep-rule-stated-once` |
@@ -59,8 +60,8 @@ Update this table in the PR that moves an item.
 5. **A step removes or narrows its §7 line in the same PR**, and updates the status table above.
 6. **One writer per giant file at a time.** `typecheck.vl`, `emit_classify.vl`, `wasmEmit.vl`
    and `emit_mono.vl` each have one owning lane per wave (see Concurrency).
-7. **Fresh builder per PR**, with a handoff note, and at most two concurrent agents (owner CPU
-   cap). Merges go through `cb-audit`.
+7. **Fresh builder per PR**, with a handoff note, and up to six concurrent agents (CLAUDE.md).
+   Merges go through `cb-audit`.
 
 ## Dependency graph
 
@@ -92,7 +93,7 @@ order, subject to the one-writer rule.
 
 | step | item | file owner | proof |
 | --- | --- | --- | --- |
-| A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | byte-identical seed with the flag off |
+| A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | the fixpoint reproduces master's seed from master's source, and `vl check` text and emitted modules are identical over `tests/cases` and the corpus with the flag off |
 | A2 | L4: one `CheckMark` / `checkRollback`; each constraint family becomes a record of columns with one `truncate` | `typecheck.vl` | `vl check` and module identity; fuel A/B |
 | A3 | L8 first PR: `tyquery.vl` with the four exact type-step twins retired | `emit_classify.vl`, `emit_rep.vl` | byte-identical seed |
 | A4 | L14 first step: a per-entry type-index assertion | `emit_collect.vl`, `emit_sections.vl` | seed, fixpoint, rep-fuzz |
@@ -137,12 +138,13 @@ order, subject to the one-writer rule.
 
 ## Concurrency
 
-There are two lanes at a time, under the owner's CPU cap.
+Up to six agents run at once (CLAUDE.md); the owner lifted the CPU cap on 2026-10-12. Rule 6
+still holds: one writer per giant file.
 
 - **Lane 1: SC.** B1, then C1(d). It owns `emit_mono.vl` and its parts of `typecheck.vl`
   throughout.
-- **Lane 2: rotating.** It takes one step at a time from the earliest wave with an open step,
-  choosing a step whose file has no current writer. The intended order is:
+- **The other lanes** each take one step at a time from the earliest wave with an open step,
+  choosing a step whose file has no current writer. The intended order per file is:
   - A1 → A2 → C2 → D1 (one continuous claim on `typecheck.vl`, interleaved with SC by area);
   - A3 → B2 → D2 → D3 (`emit_classify.vl`);
   - C3 (`wasmEmit.vl`);
@@ -172,7 +174,7 @@ Each is posted for question time; work that does not depend on it continues.
 
 These have no unmet prerequisite and touch disjoint files:
 
-- **A1**: L4 assertion harness (`typecheck.vl`).
+- **A1**: L4 assertion harness (`typecheck.vl`). In review.
 - **A5**: errno agreement test (host + `std/fs.vl`).
 - **A6 / S-c**: one `./ast` import block in `typecheck.vl`. This conflicts with A1, so run it
   first; it is small.
