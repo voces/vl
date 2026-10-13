@@ -9569,18 +9569,34 @@ function monoWrittenGenLetFrame(name: string, at: i32, ctx: i32): i32[] {
         let wf = monoTopFrameOf(w)
         if lf[0] >= 0 { wf = monoFrameOfNode(w, lf[0]) }
         if monoLetFrameOf(name, wn.binLeft, wf)[1] == lf[1] {
-          if (
-            !monoNamesDeclaredGeneric(wn.binRight, wf)
-            && !monoNamesDeclaredGeneric(monoAdapterCallee(wn.binRight), wf)
-          ) {
-            return none
-          }
+          if !monoValueNamesGenerics(wn.binRight, wf, 0) { return none }
         }
       }
     }
   }
   if monoGeneratedCellElem(d.letInit) >= 0 { return none }
   lf
+}
+
+// Whether value `v`, read in frame `ctx`, names a declared generic function, directly, through
+// the checker's adapter lambda, or in every arm of an `if` expression (D4013).
+function monoValueNamesGenerics(v: i32, ctx: i32, depth: i32): boolean {
+  if v < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
+  if monoNamesDeclaredGeneric(v, ctx) { return true }
+  if monoNamesDeclaredGeneric(monoAdapterCallee(v), ctx) { return true }
+  const x = unwrapParen(v)
+  if x < 0 { return false }
+  const n = P.nodes[x]
+  if !(n is IfStmt) { return false }
+  monoArmNamesGenerics(n.ifThen, ctx, depth + 1)
+    && monoArmNamesGenerics(n.ifElse, ctx, depth + 1)
+}
+
+// Whether `if` arm `arm` (a block, or an `else if`) names declared generics in its value.
+function monoArmNamesGenerics(arm: i32, ctx: i32, depth: i32): boolean {
+  if arm < 0 { return false }
+  const tv = ifArmValueExpr(arm)
+  monoValueNamesGenerics(if tv >= 0 { tv } else { arm }, ctx, depth)
 }
 
 // The callee of `v` when it is the checker's adapter lambda `($fp0, …) => g($fp0, …)`, which a
@@ -10549,7 +10565,12 @@ function monoCoerceLetValues(
   const lf = monoLetFrameOf(name, at, ctx)
   if lf[1] < 0 || i32ListHas(monoWrittenLetBusy, lf[1]) { return false }
   const d = P.nodes[lf[1]]
-  if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return false }
+  if !(d is LetDecl) || d.letKw != "let" { return false }
+  // An annotated cell is coerced here only when its annotation names a type parameter, whose
+  // writes in a closure every instance shares deliver at each instance's own type (D3957).
+  if d.letType >= 0 && !(key == "c:" && monoCellTyIsOpen(lf[1])) {
+    return false
+  }
   // A written binding holds one value at a time, so every call and delivery of it, and of any
   // binding it is copied into, must want one signature.
   if key == "n:" {
@@ -10622,10 +10643,22 @@ function monoCoerceLetValues(
   true
 }
 
+// Whether the capture cell declared at `di` holds, in its generic template (an instance's copy
+// reads its `declOrigOf`), a type that names a type parameter.
+function monoCellTyIsOpen(di: i32): boolean {
+  const o = declOrigOf(di)
+  const d = P.nodes[if o >= 0 { o } else { di }]
+  if !(d is LetDecl) { return false }
+  const el = monoGeneratedCellElem(d.letInit)
+  el >= 0 && tyHasTyVar(monoCellElemTyOf(d.letInit, el))
+}
+
 // `monoCoerceFnValueName` for a value naming a declared generic function; a hole lambda's
 // binding keeps its own signature rules (D3857).
 function monoCoerceNamedGeneric(v: i32, tname: string, ctx: i32) {
-  if !monoNamesDeclaredGeneric(v, ctx) { return 0 }
+  if !monoNamesDeclaredGeneric(v, ctx) && !monoValueNamesGenerics(v, ctx, 0) {
+    return 0
+  }
   monoCoerceFnValueName(unwrapParen(v), tname, ctx, -1)
 }
 
@@ -12485,6 +12518,23 @@ function monoAliasChainLamFe(
   )
 }
 
+// The function type capture cell `cellNm`, read at `at` in frame `cctx`, holds at the bindings
+// of frame `ctx`; "" when its type names no type parameter or is no function type there.
+function monoCellFnTyNameAt(
+  cellNm: string,
+  at: i32,
+  cctx: i32,
+  ctx: i32,
+): string {
+  const di = monoLetFrameOf(cellNm, at, cctx)[1]
+  if di < 0 { return "" }
+  const d = P.nodes[di]
+  if !(d is LetDecl) || !monoCellTyIsOpen(di) { return "" }
+  const el = monoGeneratedCellElem(d.letInit)
+  if el < 0 { return "" }
+  monoConcreteFnTyName(monoPinSubTyOf(monoCellElemTyOf(d.letInit, el), ctx))
+}
+
 // The cell half of `monoWalk` for call `n` at `ix` in frame `ctx` through capture cell `cellNm`,
 // read at node `at` in frame `cctx` (the call's own callee, or the read an alias of it is
 // initialized with): -1 on a refusal, 1 when the call is settled, 0 to walk on.
@@ -12514,6 +12564,8 @@ function monoCellCall(
   let ctn = ""
   const sfe = monoCellSeedGenFe(cellNm, at, cctx)
   if sfe < 0 { ctn = monoConcreteFnTyName(nodeTyIxOf(n.callFn)) }
+  // A cell's type that names a type parameter is read at this call's instance (D3957).
+  if sfe < 0 && ctn == "" { ctn = monoCellFnTyNameAt(cellNm, at, cctx, ctx) }
   // An alias is a value the cell's writes may have replaced, so its call is never renamed.
   if viaAlias { monoNoRename.push(n.callFn) }
   if sfe >= 0 {
@@ -13049,7 +13101,12 @@ function monoWalk(ix: i32, ctx: i32) {
     if n.binOp == "=" {
       const tgt = P.nodes[n.binLeft]
       if tgt is Ident {
-        const atn = identFnTypeAnnName(tgt.identName, ctx)
+        let atn = identFnTypeAnnName(tgt.identName, ctx)
+        // An un-annotated local holds its initializer's type at this instance's bindings, which
+        // every later write delivers at (D3957).
+        if atn == "" {
+          atn = monoConcreteFnTyName(monoPinSubTyOf(nodeTyIxOf(n.binLeft), ctx))
+        }
         if atn != "" {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
         }
@@ -13062,14 +13119,15 @@ function monoWalk(ix: i32, ctx: i32) {
           if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
         }
       }
-      // An element store into a list or map of functions delivers at the element's type (D3867,
-      // D3881).
+      // An element store into a list or map of functions, a capture cell's among them, delivers
+      // at the element's type (D3867, D3881, D3953).
       if tgt is Index {
         let et = monoConcreteFnTyName(nodeTyIxOf(n.binLeft))
         if et == "" {
           et = monoConcreteFnTyName(monoMapValTy(nodeTyIxOf(tgt.idxArr)))
         }
         if et != "" {
+          if monoCoerceFnValueName(n.binRight, et, ctx, -1) < 0 { return -1 }
           if monoNoteBindDeliveryAt(n.binRight, et, ctx) < 0 { return -1 }
         }
       }
