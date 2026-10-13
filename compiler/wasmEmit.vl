@@ -8984,14 +8984,12 @@ function emitSpreadGroupBoxed(
   row: i32,
   fnIx: i32,
 ): i32 {
-  pendingListKind = LBK_UNION
-  pendingListSlot = row
+  expCtxSetListBuild(LBK_UNION, row)
   if !isSrc { return emitExpr(body, grp, fnIx) }
   const k = mfRecvKindOf(grp, fnIx)
   if k == "ref" {
     const s = refListSlotOfExpr(grp, fnIx)
-    pendingListKind = LBK_REF
-    pendingListSlot = s
+    expCtxSetListBuild(LBK_REF, s)
     if emitExpr(body, grp, fnIx) < 0 { return -1 }
     if s == row { return 0 }
     if rlWidenVariantOf(s, row) < 0 {
@@ -9013,8 +9011,7 @@ function emitSpreadGroupBoxed(
       grp,
     )
   }
-  pendingListKind = pendingKindOfMf(k, 0)
-  pendingListSlot = 0
+  expCtxSetListBuild(pendingKindOfMf(k, 0), 0)
   if emitExpr(body, grp, fnIx) < 0 { return -1 }
   emitScalarListBoxTop(spreadScalarVKind(k), ak, row)
 }
@@ -18767,16 +18764,9 @@ function fbNumOp(op: i32) {
 // width comes from the intrinsic's own signature, never the call's position — else an
 // f32-seeding context around a non-f32 operand hits `type mismatch` on a checked program.
 function emitNumIntrArg(body: u8[], ix: i32, k: i32, fnIx: i32) {
-  const savedF32 = pendingF32
-  const savedF64 = pendingF64
-  const savedI64 = pendingI64
-  pendingF32 = false
-  pendingF64 = false
-  pendingI64 = false
+  const saved = expCtxClearWidths()
   const r = emitExprAsKind(body, ix, k, fnIx)
-  pendingF32 = savedF32
-  pendingF64 = savedF64
-  pendingI64 = savedI64
+  expCtxRestoreWidths(saved)
   r
 }
 
@@ -28999,6 +28989,40 @@ function expCtxLeave(saved: ExpCtx, r: i32): i32 {
   r
 }
 
+// Clears the three numeric-literal widths (i64, f32, f64) over the ambient seeds and hands back
+// the context they were taken from, for `expCtxRestoreWidths`: the box a union destination
+// builds owns its members' widths, so a widening destination's must not reach it.
+function expCtxClearWidths(): ExpCtx {
+  const saved = expCtxHere()
+  const c = expCtxHere()
+  c.wantI64 = false
+  c.wantF32 = false
+  c.wantF64 = false
+  expCtxApply(c)
+  saved
+}
+
+// Puts back the three widths `expCtxClearWidths` took from `saved`, leaving every other
+// ambient seed as the emit under it left it.
+function expCtxRestoreWidths(saved: ExpCtx) {
+  const c = expCtxHere()
+  c.wantI64 = saved.wantI64
+  c.wantF32 = saved.wantF32
+  c.wantF64 = saved.wantF64
+  expCtxApply(c)
+  0
+}
+
+// Sets the list build a list literal builds at: a build code and, for the ref and union
+// codes, the row it builds at. Every other seed stays as it is.
+function expCtxSetListBuild(kind: i32, slot: i32) {
+  const c = expCtxHere()
+  c.listKind = kind
+  c.listSlot = slot
+  expCtxApply(c)
+  0
+}
+
 // Emit `exprIx` under the explicit expected-type context `ctx`: the ambient
 // seeds are saved, `ctx` applied, the expression emitted, and EVERY seed
 // restored — scoping the whole context to this one emit.
@@ -30612,21 +30636,14 @@ function njStash(
   if isUnion {
     // A join whose arms are scalars is built as the box here, as a union destination builds it;
     // the box owns its members' widths, so a widening destination's pending width is cleared.
-    const savedI64 = pendingI64
-    const savedF32 = pendingF32
-    const savedF64 = pendingF64
-    pendingI64 = false
-    pendingF32 = false
-    pendingF64 = false
+    const nsSaved = expCtxClearWidths()
     let sr = 0
     if exprUnion(ix, fnIx) {
       sr = emitExpr(body, ix, fnIx)
     } else {
       sr = emitUnionCoerce(body, tyToEmitName(nodeTyIxOf(ix)), ix, fnIx)
     }
-    pendingI64 = savedI64
-    pendingF32 = savedF32
-    pendingF64 = savedF64
+    expCtxRestoreWidths(nsSaved)
     if sr < 0 { return -1 }
     const bs = njSlot(26, "i32", key)
     fbLocalSet(bs)
@@ -32255,12 +32272,11 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   const cfn = P.nodes[fnStmts[target]]
   let cps: i32[] = []
   if cfn is FuncDecl { cps = cfn.fnParams }
-  const savedCapLU = pendingLitUnion
-  const savedCapNulLU = pendingNulLitUnion
-  const savedCapNS = pendingNulString
-  const savedCapRaw = pendingRawNullRead
-  pendingLitUnion = 0
-  pendingNulLitUnion = false
+  const capSaved = expCtxHere()
+  const capIn = expCtxHere()
+  capIn.litUnion = 0
+  capIn.nulLitUnion = false
+  expCtxApply(capIn)
   let cai = 0
   while cai < cargs.length {
     let cuNm = ""
@@ -32279,8 +32295,10 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         if nodeTyIsNulLitUnion(cpn.parType) { cpLit = true }
       }
     }
-    pendingNulString = cpKind == "nulstr"
-    pendingRawNullRead = false
+    const capArg = expCtxHere()
+    capArg.nulString = cpKind == "nulstr"
+    capArg.rawNullRead = false
+    expCtxApply(capArg)
     if cuNm != "" {
       if emitUnionBoxArg(body, cuNm, cargs[cai], fnIx) < 0 { return -1 }
     } else if cpKind == "i64" {
@@ -32310,10 +32328,12 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
     }
     cai = cai + 1
   }
-  pendingLitUnion = savedCapLU
-  pendingNulLitUnion = savedCapNulLU
-  pendingNulString = savedCapNS
-  pendingRawNullRead = savedCapRaw
+  const capOut = expCtxHere()
+  capOut.litUnion = capSaved.litUnion
+  capOut.nulLitUnion = capSaved.nulLitUnion
+  capOut.nulString = capSaved.nulString
+  capOut.rawNullRead = capSaved.rawNullRead
+  expCtxApply(capOut)
   seedValueArgShape(null, -1)
   callRefDepth = crDepth
   // The target's own interned `$fnsig` — the functype it is actually declared with — so the
@@ -32479,38 +32499,42 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
       }
       fbLocalSet(anLenL)
       if anIsNew {
-        pendingStructIdx = anElemStructIdx
-        const savedAVI = pendingVariantIdx
-        if anElemVariantIdx >= 0 { pendingVariantIdx = anElemVariantIdx }
+        const anSaved = expCtxHere()
+        const anCtx = expCtxHere()
+        anCtx.structIdx = anElemStructIdx
+        if anElemVariantIdx >= 0 { anCtx.variantIdx = anElemVariantIdx }
         // The fill is an ELEMENT of the list being allocated, so a LIST fill builds at the
         // element's own threading. Left on the destination's, an inline `[0, 0]` fill built at
         // the OUTER pair's heap types and the backing took the literal's i32s (D1629).
-        const savedANK = pendingListKind
-        const savedANS = pendingListSlot
         const anElemLK = refElemListBuildKind(anElemSlot)
         if anElemLK >= 0 {
-          pendingListKind = anElemLK
-          pendingListSlot = 0
+          anCtx.listKind = anElemLK
+          anCtx.listSlot = 0
           if anElemLK == LBK_REF_AT_SLOT {
             const anInner = rlElemInnerSlot(anElemSlot)
-            if anInner >= 0 { pendingListSlot = anInner }
+            if anInner >= 0 { anCtx.listSlot = anInner }
           }
         }
         // A `string | null` fill keeps its null: the string backing's slot is nullable, so the
         // read is seeded as a `(string | null)[]` element's is (DV-402).
-        const savedANS2 = pendingNulString
         if ank == 2 && exprNullableString(c.callArgs[1], fnIx) {
-          pendingNulString = true
+          anCtx.nulString = true
         }
+        expCtxApply(anCtx)
         arrNewFillDepth = arrNewFillDepth + 1
         const anFillRc = emitExpr(body, c.callArgs[1], fnIx)
         arrNewFillDepth = arrNewFillDepth - 1
-        pendingNulString = savedANS2
-        pendingListKind = savedANK
-        pendingListSlot = savedANS
+        // The fill's own list, string and null seeds go back; the struct and variant seeds
+        // stay the fill's until the success path clears them.
+        const anAfter = expCtxHere()
+        anAfter.nulString = anSaved.nulString
+        anAfter.listKind = anSaved.listKind
+        anAfter.listSlot = anSaved.listSlot
+        expCtxApply(anAfter)
         if anFillRc < 0 { return -1 }
-        pendingStructIdx = -1
-        pendingVariantIdx = savedAVI
+        anAfter.structIdx = -1
+        anAfter.variantIdx = anSaved.variantIdx
+        expCtxApply(anAfter)
         fbLocalGet(anLenL)
         fbArrayNew(anBack)
       } else {
