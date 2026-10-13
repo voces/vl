@@ -970,7 +970,9 @@ type TyIxCstrCols = {
 const printCstr: TyIxCstrCols = { ty: [], ix: [], fn: [] }
 // The vector-container twin of the `print` rows (`noteNestCstr`), deduped by type and owner.
 const nestCstr: TyIxCstrCols = { ty: [], ix: [], fn: [] }
-let nestCstrSeen: {[string]: boolean} = Map()
+// The row each type-and-owner key last matched. A probe's rollback can pop that row, so a hit
+// counts only when the row is still there and still matches.
+let nestCstrSeen: {[string]: i32} = Map()
 
 // Drops every row of `c` (`printCstr` or `nestCstr`) from `n` on, all columns together.
 function tyIxCstrTruncate(c: TyIxCstrCols, n: i32) {
@@ -23817,7 +23819,7 @@ function tpMembersListText(ty: i32): string {
 // ── One mark and one rollback for the quiet probes (L4) ──────────────────────
 // A quiet probe checks something, then drops what that check recorded: `checkMark()` on entry,
 // `checkRollback(m, set)` on exit. `set` names the table families the site rolls back, one bit
-// each; the per-site sets below are what each probe rolled back before this helper existed.
+// each; a site keeps a table by reading it before it rolls back.
 
 const RB_DIAGS = 1
 const RB_ARG = 2
@@ -23839,21 +23841,33 @@ const RB_DJOIN = 32768
 const RB_HOLE_FLOW = 65536
 // `holeShape*`, `holeArrayDemand`, `holeMap*` and `holeAlt*`.
 const RB_HOLES = 131072
-// `inferLet*`, `inferRet*`, `inferStack` and `inferTentative`.
+// `inferRet*`, `inferStack` and `inferTentative`.
 const RB_INFER = 262144
 // The lint-note tables: `redun*`, `rcoal*` and `isval*`.
 const RB_LINT = 524288
 const RB_TP_ENV = 1048576
+// `inferLet*`: the un-annotated bindings' value-union and niche rows.
+const RB_INFER_LET = 2097152
 
-// `inferReturnsPrePass` and `cstrProbeBefore`; `globalInitPrePass` drops its diagnostics per
-// initializer instead, so it rolls back `RB_LINT` alone.
-const RB_PREPASS = 524289
-// `solveUnannotParams`: `RB_PREPASS` plus bin, arg, print, dJoin and holeFlow.
-const RB_SOLVE = 624131
-// `monoRecheckBegin`/`End`: `RB_PREPASS` plus holes, bin, print, infer, tpEnv and calleeWrite.
-const RB_MONO = 1984001
-// `tpIfRecheck` around its re-check: the deferred-constraint families bar bin and print.
-const RB_PINNED = 31230
+// The per-site sets, each the sum of its bits. "Every constraint family" is arg, nest, ret, let,
+// bm, mem, ufcs, is, bin and print.
+// `cstrProbeBefore` keeps the constraint rows it exists to record (D3062): diagnostics, lint
+// notes, holes and dJoin.
+const RB_CSTR_PROBE = 688129
+// `inferReturnsPrePass` keeps the inferred returns, which are what it is for: diagnostics, lint
+// notes, every constraint family, holes, dJoin, coalHole, tpIf and inferLet.
+const RB_RETURNS = 2799615
+// `globalInitPrePass`: `RB_RETURNS` bar diagnostics, which it drops per initializer, and inferLet.
+const RB_GLOBAL_INIT = 702462
+// `solveUnannotParams` reads holeFlow before rolling back: diagnostics, lint notes, every
+// constraint family but nest, holes, holeFlow, dJoin and coalHole.
+const RB_SOLVE = 759803
+// `monoRecheckBegin`/`End`: diagnostics, lint notes, every constraint family but nest, holes,
+// infer, inferLet, tpEnv and calleeWrite.
+const RB_MONO = 4081659
+// `tpIfRecheck` around its re-check: every constraint family, escJoin, coalHole, tpIf and
+// calleeWrite.
+const RB_PINNED = 32766
 
 // Every rollback-able table's length, by family; a family's mark is its keyed column's length.
 type CheckMark = {
@@ -24001,13 +24015,15 @@ function checkRollback(m: CheckMark, set: i32) {
       holeFlowDst.pop()
     }
   }
-  if (set & RB_INFER) != 0 {
+  if (set & RB_INFER_LET) != 0 {
     while inferLetIx.length > m.inferLet { inferLetIx.pop() }
     while inferLetTy.length > m.inferLet { inferLetTy.pop() }
     while inferLetNulStrIx.length > m.inferLetNulStr { inferLetNulStrIx.pop() }
     while inferLetNulBoolIx.length > m.inferLetNulBool {
       inferLetNulBoolIx.pop()
     }
+  }
+  if (set & RB_INFER) != 0 {
     rollbackInferRet(m.inferRet)
     while inferStack.length > m.inferStack { inferStack.pop() }
     while inferTentative.length > m.inferTentative { inferTentative.pop() }
@@ -24019,6 +24035,7 @@ function checkRollback(m: CheckMark, set: i32) {
   }
   if (set & RB_DIAGS) != 0 {
     while T.diags.length > m.diags { T.diags.pop() }
+    numLitNotesDropFrom(m.diags)
   }
   0
 }
@@ -45823,9 +45840,9 @@ function solveUnannotParams(fnIx: i32) {
     if !anyHole { return 0 }
     paramSolveTried[key] = true
     if prbArmed { prbEnter() }
-    // Mirrors `inferReturnsPrePass`'s save/restore shape, plus the deferred-constraint tables
-    // whose rows the real pass re-records for itself. `dJoin` rows are keyed by call node rather
-    // than by hole name, so a probe's row would block the real pass from re-parking its reject.
+    // Rolls back every table the probe's body records except what it reads first (holeFlow);
+    // the real pass re-records the rest. A kept `dJoin` row, keyed by call node, would block
+    // the real pass from re-parking its reject.
     const m = checkMark()
     const savedSym = symEnabled
     const savedQuiet = inferQuiet
@@ -54999,7 +55016,7 @@ function inferReturnsPrePass() {
   if prbSkip == 1 {
     checkRollback(m, RB_LINT)
   } else {
-    checkRollback(m, RB_PREPASS)
+    checkRollback(m, RB_RETURNS)
   }
   inferQuiet = false
   if prbArmed { prbLeave("inferReturnsPrePass") }
@@ -55125,7 +55142,7 @@ function globalInitPrePass(lets: i32[]) {
   }
   inferQuiet = savedQuiet
   symEnabled = savedSym
-  checkRollback(m, RB_LINT)
+  checkRollback(m, RB_GLOBAL_INIT)
   if prbArmed { prbLeave("globalInitPrePass") }
   0
 }
@@ -55204,7 +55221,7 @@ function cstrProbeBefore(stmt: i32) {
   cstrProbe = false
   inferQuiet = savedQuiet
   symEnabled = savedSym
-  checkRollback(m, RB_PREPASS)
+  checkRollback(m, RB_CSTR_PROBE)
   if prbArmed { prbLeave("cstrProbeBefore") }
   0
 }
@@ -59308,13 +59325,24 @@ function noteNestCstr(t: i32, ix: i32) {
   if !tyHasHole(t) { return 0 }
   const owner = cstrOwnerTop()
   const key = i32ToStr(t) + ":" + i32ToStr(owner)
-  if nestCstrSeen.has(key) { return 0 }
-  nestCstrSeen.set(key, true)
+  const seen = nestCstrSeen.get(key) ?? -1
+  if (
+    seen >= 0
+    && seen < nestCstr.ty.length
+    && nestCstr.fn[seen] == owner
+    && tyEqSameHoles(nestCstr.ty[seen], t)
+  ) {
+    return 0
+  }
   let k = 0
   while k < nestCstr.ty.length {
-    if nestCstr.fn[k] == owner && tyEqSameHoles(nestCstr.ty[k], t) { return 0 }
+    if nestCstr.fn[k] == owner && tyEqSameHoles(nestCstr.ty[k], t) {
+      nestCstrSeen.set(key, k)
+      return 0
+    }
     k = k + 1
   }
+  nestCstrSeen.set(key, nestCstr.ty.length)
   nestCstr.ty.push(t)
   nestCstr.ix.push(ix)
   nestCstr.fn.push(owner)
