@@ -370,7 +370,6 @@ import {
   bl8TypeIdx,
   callRefDepth,
   callRefSlot,
-  capCacheOn,
   capCountTbl,
   capNamesFlat,
   capStartTbl,
@@ -387,6 +386,7 @@ import {
   curBuf,
   emitFailed,
   emitLetCursor,
+  emitPhaseReached,
   externIdxAt,
   f32PushScratchBase,
   f64PushScratchBase,
@@ -1317,7 +1317,7 @@ import { tyEmitPrimOf, tyPeelNul } from "./tyquery"
 // Fill the capture cache (`capStartTbl` / `capCountTbl` / `capNamesFlat` in `emit_state`)
 // with every lifted function's capture list — one walk per function instead of an
 // O(body) recompute per query. Call exactly once per program, after the last
-// arena-mutating pass; `emitProgram` clears the cache up front so earlier phases walk directly.
+// arena-mutating pass; earlier phases walk directly, and the pass loop then enters `capsCached`.
 export function capCacheBuild() {
   capStartTbl = []
   capCountTbl = []
@@ -1334,7 +1334,6 @@ export function capCacheBuild() {
     }
     fe = fe + 1
   }
-  capCacheOn = true
   0
 }
 
@@ -2086,7 +2085,7 @@ function emitCapturedRead(
   const envIdx = fnEnvIdxOf(fe)
   if envIdx < 0 { return 0 }
 
-  if capCacheOn && fe < capCountTbl.length {
+  if emitPhaseReached("capsCached") && fe < capCountTbl.length {
     const start = capStartTbl[fe]
     const cnt = capCountTbl[fe]
     let fi = 0
@@ -14959,14 +14958,14 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
     )
   }
   const cls = eqgElemClass(kind, slot)
-  if cls == 0 {
+  if cls == "none" {
     return emitFail(
       "emitProgram: list compare over an element rep with no core",
     )
   }
   const wrap = catWrapIdxOf(kind, slot)
   const back = catBackIdxOf(kind, slot)
-  const isRef = cls != 1
+  const isRef = cls != "scalar"
   fbLocalSet(bA + 1)   // B
   fbLocalSet(bA + 0)   // A
   fbBlock(127)         // block i32
@@ -14989,34 +14988,38 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
   fbI32Bin(78)         // 0x4e i32.ge_s — i >= n → done
   fbIf(64)
   fbElse()
-  if cls != 4 {
+  if cls != "struct" {
     if emitEqGElemRead(bA, 0, wrap, back, isRef) < 0 { return -1 }
     if emitEqGElemRead(bA, 1, wrap, back, isRef) < 0 { return -1 }
   }
-  if cls == 4 {
-    // A struct element, compared field-wise off two stashed locals. The pair is parked
-    // rather than left on the stack because `emitStructEqRec` re-reads each root once per
-    // field, and a `(ref null <elem heap>)` slot would trap `struct.get` on null —
-    // `eqgElemClass` claims only the non-nullable struct element kind, so it never does.
-    if emitEqGStructElem(body, slot, fnIx) < 0 { return -1 }
-    fbI32Eqz() // the compare leaves EQUALITY; the branch below tests MISMATCH
-  } else if cls == 1 {
-    // Two scalar leaves: one opcode, and it leaves the MISMATCH the branch below tests.
-    wU8(eqgNeOpcode(kind))
-  } else {
+  match cls {
+    "struct" => {
+      // A struct element, compared field-wise off two stashed locals. The pair is parked
+      // rather than left on the stack because `emitStructEqRec` re-reads each root once per
+      // field, and a `(ref null <elem heap>)` slot would trap `struct.get` on null —
+      // `eqgElemClass` claims only the non-nullable struct element kind, so it never does.
+      if emitEqGStructElem(body, slot, fnIx) < 0 { return -1 }
+      fbI32Eqz() // the compare leaves EQUALITY; the branch below tests MISMATCH
+    }
+    "scalar" => {
+      // Two scalar leaves: one opcode, and it leaves the MISMATCH the branch below tests.
+      wU8(eqgNeOpcode(kind))
+    }
     // A REF leaf — a string or an inner list — through its own core, which leaves
     // EQUALITY; the branch below tests mismatch, so negate once.
-    if cls == 2 {
+    "string" => {
       if emitStrEqCore(body) < 0 { return -1 }
-    } else {
+      fbI32Eqz() // 0x45
+    }
+    "list" => {
       if (
         emitListEqAnyRep(body, eqgInnerKind(slot), eqgInnerSlot(slot), fnIx)
         < 0
       ) {
         return -1
       }
+      fbI32Eqz() // 0x45
     }
-    fbI32Eqz() // 0x45
   }
   fbIf(64)
   fbI32Const(0)
