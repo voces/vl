@@ -10187,11 +10187,12 @@ export function catListKindOfBin(binIx: i32, fnIx: i32) {
 // compare does — one opcode per scalar leaf, the string helper for a string leaf, a recursion
 // for a nested list — so the accept set is narrower. `listOpKindOfBin` runs first.
 
-// What `emitListEqGCore` must do with one element of list rep (kind, slot): `1` compare two
-// scalar leaves with `eqgNeOpcode(kind)`, `2` compare two string leaves through the string-eq
-// helper, `3` recurse into the element's own list core, `0` no answer. Keyed on the rep and
+// What `emitListEqGCore` must do with one element of list rep (kind, slot): `scalar` compare
+// two leaves with `eqgNeOpcode(kind)`, `string` through the string-eq helper, `list` recurse
+// into the element's own list core, `struct` field-wise, `none` no answer. Keyed on the rep and
 // not the arena type, because the emitter's frames and heap indices are keyed that way.
-export function eqgElemClass(kind: i32, slot: i32) {
+export type EqgElemClass = "none" | "scalar" | "string" | "list" | "struct"
+export function eqgElemClass(kind: i32, slot: i32): EqgElemClass {
   // The scalar-leaf list reps: i32 (and everything that reps as one), f64, i64, f32, u8.
   if (
     kind == LBK_I32_LIST
@@ -10200,26 +10201,26 @@ export function eqgElemClass(kind: i32, slot: i32) {
     || kind == LBK_F32_LIST
     || kind == LBK_U8_LIST
   ) {
-    return 1
+    return "scalar"
   }
-  if kind == LBK_STR_LIST { return 2 }
+  if kind == LBK_STR_LIST { return "string" }
   if kind == LBK_REF {
-    if slot < 0 || slot >= rlElemKindTbl.length { return 0 }
+    if slot < 0 || slot >= rlElemKindTbl.length { return "none" }
     // An inner list of any rep compares through its own list core.
-    if rlElemListRep(rlElemKindTbl[slot]) != null { return 3 }
+    if rlElemListRep(rlElemKindTbl[slot]) != null { return "list" }
     // A struct element, field-wise, but only over the fields whose compare needs no frame of
     // its own. A nullable element is excluded here rather than by the row lookup, and the two
     // are not the same test: `(Circle | null)[]` resolves the same row a `Circle[]` does, so a
     // row-based gate would admit it and the field compare would `struct.get` through a null.
     if slot < rlElemNullable.length {
-      if rlElemNullable[slot] == 1 { return 0 }
+      if rlElemNullable[slot] == 1 { return "none" }
     }
     if eqgElemHasEqRow(slot) {
-      if eqgStructElemFlat(eqgElemEqRow(slot), 0) { return 4 }
+      if eqgStructElemFlat(eqgElemEqRow(slot), 0) { return "struct" }
     }
-    return 0
+    return "none"
   }
-  0
+  "none"
 }
 
 // ── the ref-list element's eq row, in both namespaces ─────────────────────────
@@ -10271,7 +10272,7 @@ export function eqgStructElemFlat(row: i32, depth: i32): boolean {
 }
 
 // The nested element's own list-rep kind, in `catListKindOfExpr`'s alphabet. Only a ref-list
-// slot has one; `eqgElemClass` answering 3 is the precondition.
+// slot has one; `eqgElemClass` answering `list` is the precondition.
 export function eqgInnerKind(slot: i32) {
   if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
   const k = rlElemListRep(rlElemKindTbl[slot])
@@ -10358,12 +10359,17 @@ export function leqCoreKindOfAtomKind(k: i32): i32 {
 // walks a table, and an inner-slot column pointing at its own row would hang the compiler.
 function eqgRepComparable(kind: i32, slot: i32, depth: i32): boolean {
   if depth > 32 { return false }
-  const c = eqgElemClass(kind, slot)
-  if c == 1 || c == 2 || c == 4 { return true }
-  if c == 3 {
-    return eqgRepComparable(eqgInnerKind(slot), eqgInnerSlot(slot), depth + 1)
+  match eqgElemClass(kind, slot) {
+    "scalar" | "string" | "struct" => {
+      return true
+    }
+    "list" => {
+      return eqgRepComparable(eqgInnerKind(slot), eqgInnerSlot(slot), depth + 1)
+    }
+    "none" => {
+      return false
+    }
   }
-  false
 }
 
 // One `==` operand's list rep, in `catListKindOfExpr`'s alphabet, through a `| null`.
