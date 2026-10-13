@@ -281,7 +281,12 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
-import { fnFlowLamPin, fnFlowTableBuild } from "./fn_flow_shadow"
+import {
+  fnFlowLamPin,
+  fnFlowReadGenFn,
+  fnFlowReadWritten,
+  fnFlowTableBuild,
+} from "./fn_flow_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
 import {
   drwFillDefaults,
@@ -5814,41 +5819,14 @@ function monoNameIsParamOnChain(name: string, fx: i32): boolean {
   false
 }
 
-// The generic function a chain of un-annotated, never-written aliases read at `at` in frame `ctx`
-// ends at by name (`const k = inner; const j = k`), as a slot; -1 for any other chain.
-function monoGenFnAliasChainFe(name: string, at: i32, ctx: i32): i32 {
-  let nm = name
-  let ax = at
-  let fr = ctx
-  let hops = 0
-  while hops < MONO_ALIAS_CHAIN_MAX {
-    const lf = monoLetFrameOf(nm, ax, fr)
-    if lf[1] < 0 { return -1 }
-    const d = P.nodes[lf[1]]
-    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return -1 }
-    if d.letKw != "const" && monoLetWrittenAt(nm, lf) { return -1 }
-    const iv = P.nodes[d.letInit]
-    if !(iv is Ident) { return -1 }
-    let fx = ctx
-    if lf[0] >= 0 { fx = lf[0] }
-    // A parameter of that name, a lambda's included, is the value the alias copies.
-    if monoNameIsParamOnChain(iv.identName, fx) { return -1 }
-    const fe = fnIndexOfInScopeAt(
-      sidOfNode(d.letInit),
-      iv.identName,
-      fx,
-      d.letInit,
-    )
-    if fe >= 0 {
-      if fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
-      return fe
-    }
-    nm = iv.identName
-    ax = d.letInit
-    fr = lf[0]
-    hops = hops + 1
-  }
-  -1
+// The template slot of the generic function the flow table says read `at` names through its
+// aliases (`fnFlowReadGenFn`); -1 for none.
+function monoReadGenFnFe(at: i32): i32 {
+  const d = fnFlowReadGenFn(at)
+  if d < 0 { return -1 }
+  const fe = fnStmtsPosOf(d)
+  if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 { return -1 }
+  fe
 }
 
 // The un-annotated `let` that a chain of un-annotated, never-written aliases read at `at` in frame
@@ -9518,7 +9496,7 @@ function monoCoerceFnValueName(
     if monoCoerceAliasOfCell(e.identName, exprIx, ctx, tname) { return 0 }
     let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
     // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
-    if gfe < 0 { gfe = monoGenFnAliasChainFe(e.identName, exprIx, ctx) }
+    if gfe < 0 { gfe = monoReadGenFnFe(exprIx) }
     // An alias a call renamed to one instance of a generic still delivers the generic (D3905).
     if (
       gfe >= 0
@@ -9961,7 +9939,7 @@ function monoListElemGenFe(e: i32, ctx: i32): i32 {
     }
   }
   if monoNamesDeclaredGeneric(x, ctx) { return monoFnFeOfIdent(x, nm, ctx) }
-  monoGenFnAliasChainFe(nm, x, ctx)
+  monoReadGenFnFe(x)
 }
 
 // The declared generic function seeding the written `let` of generics that value node `e` names
@@ -10745,7 +10723,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
     return 0
   }
   const nm = monoIdentNameOf(x)
-  if nm != "" && monoGenFnAliasChainFe(nm, x, ctx) >= 0 {
+  if nm != "" && monoReadGenFnFe(x) >= 0 {
     if !monoCellSigRecord(x, tname) { return 1 }
     if monoCoerceFnValueName(x, tname, ctx, -1) < 0 { return 2 }
     return 0
@@ -12377,36 +12355,6 @@ function monoLetFrameOf(name: string, at: i32, ctx: i32): i32[] {
   none
 }
 
-// Whether any binding on the alias chain from `name` read at `at` in frame `ctx` is assigned
-// anywhere in the program; a name assigned elsewhere answers yes, the safe direction.
-function monoAliasChainWritten(name: string, at: i32, ctx: i32): boolean {
-  let nm = name
-  let ax = at
-  let fr = ctx
-  let hops = 0
-  while hops < MONO_ALIAS_CHAIN_MAX {
-    if monoReadIsAssigned(nm, ax) { return true }
-    const lf = monoLetFrameOf(nm, ax, fr)
-    if lf[1] < 0 { return false }
-    const d = P.nodes[lf[1]]
-    if !(d is LetDecl) { return false }
-    // A capture cell exists because its binding is written after capture.
-    if (
-      monoGeneratedCellElem(d.letInit) >= 0
-      || monoCellReadName(d.letInit) != ""
-    ) {
-      return true
-    }
-    const src = monoIdentNameOf(d.letInit)
-    if src == "" { return false }
-    nm = src
-    ax = d.letInit
-    fr = lf[0]
-    hops = hops + 1
-  }
-  true
-}
-
 // The lifted lambda an un-annotated `let` binding read at `at` in frame `ctx` holds from its
 // initializer, through a chain of un-annotated `const` and `let` bindings ending at one bound to
 // a hole lambda (`const c = (y) => …; const c2 = c; let d = c2`), or -1. Each link may be read
@@ -12896,9 +12844,7 @@ function monoWalk(ix: i32, ctx: i32) {
         }
         if afe < 0 { afe = monoCapturedLamFe(n.callFn, callee.identName, ctx) }
         // A chain of aliases ending at a generic function by name is a call to it (D3894).
-        if afe < 0 {
-          afe = monoGenFnAliasChainFe(callee.identName, n.callFn, ctx)
-        }
+        if afe < 0 { afe = monoReadGenFnFe(n.callFn) }
         if afe < 0 {
           afe = monoLetAliasLamFe(callee.identName, n.callFn, ctx)
           // The call would be re-spelled to the lambda's own name, which a parameter or local
@@ -12923,10 +12869,7 @@ function monoWalk(ix: i32, ctx: i32) {
           // The chain names the lambda it is initialized with. Where a link is written, that
           // need not be the value the alias holds at this call, so the call keeps its
           // `call_ref` and only the lambda is pinned (D3849); an unwritten chain always holds it.
-          if (
-            afe >= 0
-            && monoAliasChainWritten(callee.identName, n.callFn, ctx)
-          ) {
+          if afe >= 0 && fnFlowReadWritten(n.callFn) {
             monoNoRename.push(n.callFn)
           }
         }
@@ -14690,15 +14633,8 @@ export function monomorphize(stmts: i32[]) {
     if monoHasConcreteHOFParam() { any = true }
   }
   if !any { return 0 }
-  // The flow table reads the tree before the walk rewrites it, and only a hole lambda asks it.
-  let lf = 0
-  while lf < monoGen.length {
-    if monoGen[lf] == 1 && criFnIsAnonLambda(lf) {
-      fnFlowTableBuild(stmts)
-      lf = monoGen.length
-    }
-    lf = lf + 1
-  }
+  // The flow table reads the tree before the walk rewrites it, and only a generic asks it.
+  if i32ListHas(monoGen, 1) { fnFlowTableBuild(stmts) }
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
