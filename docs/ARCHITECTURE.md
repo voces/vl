@@ -495,7 +495,7 @@ line in the PR that closes it. The order in which they are closed is
 | §2.3 | Independent solve-and-re-check mechanisms share a loop condition and a pass budget named after one of them; un-annotated parameters are inferred twice by different methods; the driver re-checks again for generated walkers. | [L5](internals/code-quality-2026-10.md#L5) |
 | §3.3, §4.1 | Emitter registries are keyed by spelling; type equality has eight notions. | [L6](internals/code-quality-2026-10.md#L6) |
 | §4.7 | Expected types reach the expression emitter through ambient module state; memos carry their own generation keys. | [L7](internals/code-quality-2026-10.md#L7) |
-| §2.3, §2.4 | Structural type steps are written separately in the checker and the emitter. | [L8](internals/code-quality-2026-10.md#L8) |
+| §2.3, §2.4 | Structural type steps are written separately in the checker and the emitter. The emitter's own exact twins now have one copy each in `compiler/tyquery.vl`; the checker's copies (`isNullTy`) and the four cross-phase twins are still separate. | [L8](internals/code-quality-2026-10.md#L8) |
 | §2.5, §6 | The host carries a wasm optimizer that its own manifest describes as absent, and the Deno and playground hosts cannot run `-O`. | [L10](internals/code-quality-2026-10.md#L10) |
 | §6 | Repo lint rules are written in both `lint.vl` and Python. | [L11](internals/code-quality-2026-10.md#L11) |
 | §6 | The LSP server and the playground each implement the feature ladder. | [L12](internals/code-quality-2026-10.md#L12) |
