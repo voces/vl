@@ -271,6 +271,11 @@ import {
   tokFirstLineEndCol,
 } from "./fmt_util"
 import {
+  IDENT_BUILTIN,
+  IDENT_DROP_FN_DECL,
+  identAuditDrop,
+  identColReset,
+  identSet,
   sidArrGet,
   sidArrPut,
   sidLookup,
@@ -5380,6 +5385,9 @@ function jwReset() {
 // surface, so a new checker module table belongs here and nowhere else.
 export function initChecker() {
   mimpClear()
+  identColReset()
+  identPendNode = []
+  identPendName = []
   jwReset()
   redunReset()
   rcoalReset()
@@ -5974,8 +5982,9 @@ export function initChecker() {
   scopeResName = []
   scopeResKind = []
   scopeResType = []
+  // Pushed for every compile: the binding-identity column resolves through it (`identResolve`).
+  symDeclScope.push(Map())
   if symEnabled != 0 {
-    symDeclScope.push(Map())
     // The global scope spans the whole file (looser than any nested scope).
     scopeSL.push(1)
     scopeSC.push(0)
@@ -14832,10 +14841,8 @@ function pushScope(owner: i32) {
   fnAliasScopes.push(Map())
   npFrames.push(npKeys.length)
   asgDeclFrames.push(asgDeclKeys.length)
-  if symEnabled != 0 {
-    symDeclScope.push(Map())
-    pushScopeSpan(owner)
-  }
+  symDeclScope.push(Map())
+  if symEnabled != 0 { pushScopeSpan(owner) }
   0
 }
 
@@ -14893,8 +14900,8 @@ function popScope() {
       asgDeclOver.pop()
     }
   }
+  if symDeclScope.length > 0 { symDeclScope.pop() }
   if symEnabled != 0 {
-    if symDeclScope.length > 0 { symDeclScope.pop() }
     if scopeSL.length > 0 {
       scopeSL.pop()
       scopeSC.pop()
@@ -14962,12 +14969,12 @@ function symStampVis(name: string, declNode: i32, kind: i32, spanIx: i32) {
 // `nameTok` its identifier token, from the parser's `declNameTok` side table, falling back to the
 // node anchor when unset.
 function symDecl(name: string, declNode: i32, ty: i32, kind: i32) {
-  if symEnabled == 0 { return 0 }
-  if symNameIsMinted(name) { return 0 }
   if symDeclScope.length > 0 {
     const top = symDeclScope.length - 1
     symDeclScope[top][name] = declNode
   }
+  if symEnabled == 0 { return 0 }
+  if symNameIsMinted(name) { return 0 }
   symRetainType(declNode, ty, kind)
   // Visibility for completion: a binding is visible across its own innermost scope. Stamped
   // before the occurrence dedup so a demand-inference re-check refreshes the span.
@@ -15024,13 +15031,13 @@ function symOccHasTok(tok: i32) {
 // the params and name are processed, so its binding must land one frame up to resolve recursive
 // and sibling references.
 function symDeclInOuter(name: string, declNode: i32, ty: i32, kind: i32) {
-  if symEnabled == 0 { return 0 }
   const outer = symDeclScope.length - 2
   if outer >= 0 {
     symDeclScope[outer][name] = declNode
   } else if symDeclScope.length > 0 {
     symDeclScope[symDeclScope.length - 1][name] = declNode
   }
+  if symEnabled == 0 { return 0 }
   symRetainType(declNode, ty, kind)
   // A function name is visible in the enclosing scope, where it binds, not its body — the
   // decl-scope frame is one out, so its span is one below the top. Stamped before the occurrence
@@ -15058,6 +15065,72 @@ function symResolve(name: string) {
     i = i - 1
   }
   -1
+}
+
+// The declaration `name` resolves to where it stands: the decl frame `lookup` answers from
+// when it holds one, else the innermost frame that does (a narrowing overlay declares no node).
+function identResolve(name: string) {
+  const d = lookupDepth(name)
+  if d >= 0 && d < symDeclScope.length {
+    const hit = symDeclScope[d][name] ?? -1
+    if hit >= 0 { return hit }
+  }
+  symResolve(name)
+}
+
+// Record the resolution of the read `ix` of `name` in the binding-identity column. A name with
+// no declaration in scope yet is a module binding declared below the read, or a builtin; the
+// pending pair is settled against the module frame by `identFlushPending`.
+let identPendNode: i32[] = []
+let identPendName: string[] = []
+
+function identNoteUse(ix: i32, name: string) {
+  if inferQuiet { return 0 }
+  const d = identResolve(name)
+  if d >= 0 { return identSet(ix, d) }
+  identPendNode.push(ix)
+  identPendName.push(name)
+  0
+}
+
+// The root binding of the narrowed place `ix` reads, noted as a use: an overlay hit returns
+// before the receiver is checked.
+function identNotePlace(ix: i32) {
+  const r = cwProjRootNode(ix)
+  if r < 0 { return 0 }
+  const n = P.nodes[r]
+  if n is Ident { identNoteUse(r, n.identName) }
+  0
+}
+
+// A use of `name` that resolves in the module frame whatever encloses it, settled when the
+// pass flushes.
+function identNoteModuleUse(ix: i32, name: string) {
+  if inferQuiet { return 0 }
+  identPendNode.push(ix)
+  identPendName.push(name)
+  0
+}
+
+function identFlushPending() {
+  let i = 0
+  while i < identPendNode.length {
+    let d = -1
+    if symDeclScope.length > 0 { d = symDeclScope[0][identPendName[i]] ?? -1 }
+    if d < 0 { d = IDENT_BUILTIN }
+    identSet(identPendNode[i], d)
+    i = i + 1
+  }
+  identPendNode = []
+  identPendName = []
+  0
+}
+
+// The module-scope declaration of `name` from the checker's last full pass, or -1. The emitter's
+// rewrites read it to give a minted callee its declaration.
+export function identModuleDeclOf(name: string) {
+  if symDeclScope.length == 0 { return -1 }
+  symDeclScope[0][name] ?? -1
 }
 
 // A name the compiler minted (`$` is not an identifier character, D1991's `$scrut…`): no
@@ -48749,6 +48822,7 @@ function checkParamDefaults(n: FuncDecl, params: i32[], paramTys: i32[]) {
         if paramDefaultIsCallsite(dIx) {
           // `__callsite__` is never checked as an expression — what is checked is the
           // destination, so the error surfaces here rather than at somebody else's call site.
+          identSet(dIx, IDENT_BUILTIN)
           if pt >= 0 && !tyIsCallerLoc(pt) {
             tErr(
               "parameter `"
@@ -53375,6 +53449,9 @@ function checkCallNode(n: Call, ix: i32) {
     const ot = checkOptCallNode(n, ix, cfn)
     if ot >= 0 { return ot }
   }
+  // A built-in call below answers without checking its callee, so the callee's binding is
+  // recorded here, before any of them.
+  if cfn is Ident { identNoteUse(n.callFn, cfn.identName) }
   if cfn is Ident {
     checkUnimplementedIntrinsicCall(cfn, ix)
     if cfn.identName == "__memory_shared__" && lookupDepth(cfn.identName) == 0 {
@@ -56342,13 +56419,13 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // `: void`, so the mismatch has to name the bare `return` that decided it.
   const savedBareRetVoid = curFnBareRetVoid
   curFnBareRetVoid = bareRetVoid
-  // LSP: the function name binds in the OUTER scope (decl-scope chain), but its
-  // body — params + statements — is checked under this pushed scope. Record the
-  // name occurrence against the enclosing decl scope before descending.
-  if symEnabled != 0 {
-    if n.fnName != "" && fnIx >= 0 {
-      symDeclInOuter(n.fnName, fnIx, mkFuncTy(paramTys, ret), 2)
-    }
+  // The function name binds in the OUTER scope (decl-scope chain), but its body — params +
+  // statements — is checked under this pushed scope. Bound in every compile, not only the
+  // LSP's: the binding-identity column resolves through the same chain.
+  // The audit's must-fire control switches both sites off, in a compile only.
+  const declSites = identAuditDrop != IDENT_DROP_FN_DECL || symEnabled != 0
+  if n.fnName != "" && fnIx >= 0 && declSites {
+    symDeclInOuter(n.fnName, fnIx, mkFuncTy(paramTys, ret), 2)
   }
   let dj = 0
   while dj < params.length {
@@ -56359,9 +56436,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       // body sees carries the loss. Marked HERE and not at the resolution because the
       // mark is keyed by the scope frame, and that frame is this one.
       if paramCollapsed[dj] { markCollapsedBinding(pNode2.parName) }
-      if symEnabled != 0 {
-        symDecl(pNode2.parName, params[dj], paramTys[dj], 1)
-      }
+      if declSites { symDecl(pNode2.parName, params[dj], paramTys[dj], 1) }
     }
     dj = dj + 1
   }
@@ -58832,6 +58907,7 @@ function checkNodeReal(ix: i32) {
         lbiInlineLit(ix, dlit, n.pos, n.identName)
         return checkNodeReal(ix)
       }
+      identNoteModuleUse(ix, n.identName)
       if T.scopes.length > 0 {
         if T.scopes[0].has(n.identName) {
           return T.scopes[0][n.identName] ?? TY_ERR
@@ -58894,6 +58970,7 @@ function checkNodeReal(ix: i32) {
     }
     // `ty` is this use's type as the checker resolved it — narrowed when the use
     // sits inside a guarded arm. Threaded in so the occurrence retains it.
+    identNoteUse(ix, n.identName)
     if symEnabled != 0 { symUse(ix, n.identName, ty) }
     if ovSetMod.length > 0 && ix != ckCalleeIx {
       ovNoteFnValue(ix, n.identName, ty)
@@ -60956,6 +61033,7 @@ export function checkProgram(rootIx: i32) {
     checkProgramAgain(rootIx)
   }
   symFlushPending()
+  identFlushPending()
   lbiSymTypes()
   lbiReport()
   recAdForcedReport()
@@ -68657,7 +68735,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       }
     }
   }
-  if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
+  symDecl(n.letName, ix, bound, 0)
   if n.letKw == "const" {
     const ctop = constScopes.length - 1
     if ctop >= 0 { constScopes[ctop][n.letName] = ix }
@@ -69458,7 +69536,7 @@ function resolveMatchConstPats(n: MatchExpr, hole: boolean) {
           if why == "" {
             const rd: Node = { identName: nm, pos: pn.pos }
             arenaSetNode(patIx, rd)
-            sidNoteNodeName(patIx)
+            sidNoteNodeName(patIx, -1)
           } else if !hole {
             matchPatRefused[patIx] = true
             tErr(why, patIx)
@@ -74055,6 +74133,16 @@ function getterReaches(from: i32, goal: i32): boolean {
   false
 }
 
+// The declaration of the getter registered as `fn`, or -1 when none is.
+function getterDeclOf(fn: string) {
+  let i = 0
+  while i < getFns.length {
+    if getFns[i] == fn { return getDecls[i] }
+    i = i + 1
+  }
+  -1
+}
+
 // Replaces every banked getter read `v.p` by the call `T.p(v)`, so the emitter sees an
 // ordinary call and keeps its rule that a member read is a load. The call keeps the member's
 // node index, type and source anchor.
@@ -74068,6 +74156,7 @@ function getterRewriteSites() {
     const m = P.nodes[site]
     if m is Member {
       const callee = mkIdent(getSiteFns[i], m.pos)
+      identSet(callee, getterDeclOf(getSiteFns[i]))
       adoptNodeTok(callee, site)
       while nodeTyIx.length <= callee { nodeTyIx.push(-1) }
       nodeTySet(callee, lookup(getSiteFns[i]))
@@ -74983,6 +75072,8 @@ function checkMemberNode(n: Member, ix: i32) {
   // Flat layout constant (webcraft P1.2): answered before the receiver is checked, since the
   // receiver is a TYPE name and checking it as an expression would be "undeclared identifier".
   const fl = flatMemberFold(n, ix)
+  // The receiver of a folded layout member names a type, which no value binding declares.
+  if fl == 1 || fl == 3 { identSet(n.memObj, IDENT_BUILTIN) }
   if fl == 1 { return TY_I32 }
   if fl == 2 { return TY_ERR }
   // A layout member on a type parameter: an `i32` whose value the monomorphizer
@@ -74994,6 +75085,7 @@ function checkMemberNode(n: Member, ix: i32) {
   if mKey != "" {
     const mOv = narrowedPathTy(mKey)
     if mOv >= 0 {
+      identNotePlace(n.memObj)
       crNoteLoopRead(mKey, ix)
       crNoteCaptureRead(mKey)
       return symMem(ix, mOv)
@@ -76645,6 +76737,7 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
   if omKey != "" {
     const omOv = narrowedPathTy(omKey)
     if omOv >= 0 {
+      identNotePlace(n.omObj)
       omGuardSet(ix, nonNullTy(omOv))
       crNoteLoopRead(omKey, ix)
       crNoteCaptureRead(omKey)
@@ -77275,7 +77368,7 @@ function checkForRangeNode(n: ForRange, ix: i32) {
   pushReBarrier(crLoopRdSlots.length)
   pushScope(ix)
   declare(n.frVar, TY_I32)
-  if symEnabled != 0 { symDecl(n.frVar, ix, TY_I32, 0) }
+  symDecl(n.frVar, ix, TY_I32, 0)
   // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
   const daFrMark = daMark()
   // The loop variable is always assigned in the body — clear it from the dead-zone so a body
@@ -77364,10 +77457,10 @@ function checkForInNode(n: ForIn, ix: i32) {
   pushReBarrier(crLoopRdSlots.length)
   pushScope(ix)
   declare(n.fiVar, elemTy)
-  if symEnabled != 0 { symDecl(n.fiVar, ix, elemTy, 0) }
+  symDecl(n.fiVar, ix, elemTy, 0)
   if n.fiVar2 != "" {
     declare(n.fiVar2, elem2Ty)
-    if symEnabled != 0 { symDecl(n.fiVar2, ix, elem2Ty, 0) }
+    symDecl(n.fiVar2, ix, elem2Ty, 0)
   }
   // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
   const daFiMark = daMark()
