@@ -9,6 +9,7 @@
 //              diagnostics, and the assertion must name exactly that table at that probe.
 //   clean    — the same program with the rollback intact moves no table there.
 //   disarmed — no rows at all.
+//   leaks    — programs that each showed one site leaving rows behind now move nothing.
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
 //
@@ -38,8 +39,8 @@ const ERR_IN_INFERRED = `function f(x: i32) {
 print(f(1))
 `;
 
-/** Compile `src` on a fresh instance; the rows the assertion counted. */
-const rows = (src: string, arm: number, skip: number) => {
+/** Check (or, with `build`, compile) `src` on a fresh instance; the rows the assertion counted. */
+const rows = (src: string, arm: number, skip: number, build = false) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
   exp.probeRollbackArm(arm);
@@ -47,7 +48,8 @@ const rows = (src: string, arm: number, skip: number) => {
   exp.modReset();
   exp.srcReset();
   for (const ch of src) exp.srcPush(ch.codePointAt(0)!);
-  exp.checkSrc();
+  if (build) exp.compileSrc();
+  else exp.checkSrc();
   const out = new Map<string, number>();
   for (let i = 0; i < exp.probeRollbackRowCount(); i++) {
     const b = new Uint8Array(exp.probeRollbackRowLen(i));
@@ -78,6 +80,37 @@ Deno.test({
     const got = show(rows(ERR_IN_INFERRED, 1, 0));
     const want = "inferReturnsPrePass | ran=1";
     if (got !== want) throw new Error(`want: ${want}\n  got:  ${got}`);
+  },
+});
+
+// Programs that each showed one site leaving rows behind before its set was widened; on the
+// census every one of them now moves no table at any probe.
+const LEAKED_BEFORE = [
+  "generics/declared-record-arg-to-record-pattern.vl", // monoRecheck: let
+  "generics/narrowed-nullable-at-pin.vl", // monoRecheck: mem
+  "generics/error-hole-field-write-lands-at-pin.vl", // solveUnannotParams: holes, is
+  "closures/captured-cell-alias-in-list-called-same-type.vl", // inferReturnsPrePass: print
+  "numerics/literal-binding-infers-from-uses.vl", // inferReturnsPrePass: nln notes
+  "inference/glean-vl005-inferred-union-return-hole-arm.vl", // globalInitPrePass: bin
+];
+
+Deno.test({
+  name: "probe rollback: the sites that leaked leave no table behind",
+  ignore,
+  fn() {
+    const bad: string[] = [];
+    for (const f of LEAKED_BEFORE) {
+      const src = Deno.readTextFileSync(
+        new URL(`./cases/${f}`, import.meta.url),
+      );
+      const moved = [...rows(src, 1, 0, true)].filter(([k]) =>
+        !k.endsWith("| ran")
+      );
+      if (moved.length > 0) bad.push(`${f}: ${show(new Map(moved))}`);
+    }
+    if (bad.length > 0) {
+      throw new Error(`want no table moved, got:\n  ${bad.join("\n  ")}`);
+    }
   },
 });
 

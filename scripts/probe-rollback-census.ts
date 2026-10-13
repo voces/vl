@@ -105,7 +105,7 @@ if (fingerprint) {
   for (const f of mine) {
     const { rc, exp } = compile(f, false);
     const parts: string[] = [String(rc)];
-    if (typeof rc === "number" && rc !== 0) {
+    if (typeof rc === "number") {
       for (let i = 0; i < exp.diagCount(); i++) {
         parts.push(
           `${exp.diagLine(i)}:${exp.diagCol(i)} ${
