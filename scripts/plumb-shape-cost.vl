@@ -10,21 +10,14 @@
 // workload run by a build of this file. `$PLUMB_SHAPE_RECORD` names a file that receives
 // every raw reading, in order, so another grader can replay the same measurement.
 
-import {
-  IoError,
-  appendTextFile,
-  pathExists,
-  pathKind,
-  readFile,
-  writeTextFile,
-} from "std:fs"
+import { IoError, appendTextFile, readFile, writeTextFile } from "std:fs"
 import { exit, runProgram } from "std:process"
-import { getEnv } from "std:env"
 import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
 import { parseF64, parseI32, parseI64, toFixed, toString } from "std:fmt"
 import { join, padEnd, padStart, split, startsWith } from "std:str"
 import { Json, parseJson } from "std:json"
+import { JsonMap, Proc, envOr, exists, isFile, jsonStr } from "./lib/common"
 
 const BASELINE = "scripts/plumb-shape-baseline.json"
 const GEN = "scripts/perf/gen-plumb-shape.vl"
@@ -39,8 +32,6 @@ const BAR_OPT_CPU = 0.25
 const QUIET = 1.15
 const MIN_QUIET = 2
 const REWRITE = "  vl run scripts/plumb-shape-cost.vl -- --write-baseline"
-
-type JsonMap = { [string]: Json }
 
 // Temp directories to remove before any exit.
 let temps: string[] = []
@@ -156,82 +147,7 @@ function pyJson(v: Json | null): string {
   "?"
 }
 
-function hexDigits(v: i32, n: i32): string {
-  const digits = "0123456789abcdef"
-  let out = ""
-  let k = n - 1
-  while k >= 0 {
-    const d = (v >> (k * 4)) & 15
-    out = out + digits.slice(d, d + 1)
-    k = k - 1
-  }
-  out
-}
-
-// The code point starting at byte `i` and its byte length, of valid UTF-8.
-type Cp = { cp: i32, n: i32 }
-
-function cpAt(s: string, i: i32): Cp {
-  const b = s[i]
-  if b < 0x80 { return { cp: b, n: 1 } }
-  let cp = 0
-  let n = 1
-  if b >= 0xF0 {
-    n = 4
-    cp = b & 7
-  } else if b >= 0xE0 {
-    n = 3
-    cp = b & 15
-  } else {
-    n = 2
-    cp = b & 31
-  }
-  let k = 1
-  while k < n && i + k < s.length {
-    cp = (cp << 6) | (s[i + k] & 63)
-    k = k + 1
-  }
-  { cp: cp, n: n }
-}
-
-function uEsc(cp: i32): string { "\\u" + hexDigits(cp, 4) }
-
-// `json.dumps(s)` with its default `ensure_ascii`: everything outside space..`~` escaped.
-function jsonStr(s: string): string {
-  const parts = ["\""]
-  let i = 0
-  while i < s.length {
-    const b = s[i]
-    if b < 0x80 {
-      if b == 34 { parts.push("\\\"") }
-      else if b == 92 { parts.push("\\\\") }
-      else if b == 10 { parts.push("\\n") }
-      else if b == 13 { parts.push("\\r") }
-      else if b == 9 { parts.push("\\t") }
-      else if b == 8 { parts.push("\\b") }
-      else if b == 12 { parts.push("\\f") }
-      else if b < 32 || b == 127 { parts.push(uEsc(b)) }
-      else { parts.push(s.slice(i, i + 1)) }
-      i = i + 1
-      continue
-    }
-    const c = cpAt(s, i)
-    if c.cp > 0xFFFF {
-      const v = c.cp - 0x10000
-      parts.push(uEsc(0xD800 | (v >> 10)))
-      parts.push(uEsc(0xDC00 | (v & 0x3FF)))
-    } else {
-      parts.push(uEsc(c.cp))
-    }
-    i = i + c.n
-  }
-  parts.push("\"")
-  join(parts, "")
-}
-
 // ── processes and files ───────────────────────────────────────────────────────────
-
-type Proc = { code: i32, out: string, err: string }
 
 function spawn(cmd: string, args: string[]): Proc {
   const r = runProgram(cmd, args)
@@ -260,24 +176,6 @@ function readText(path: string): string | null {
   const t = readFile(path)
   if t is IoError { return null }
   decodeUtf8Lossy(t)
-}
-
-function exists(path: string): boolean {
-  const e = pathExists(path)
-  if e is IoError { return false }
-  e
-}
-
-function isFile(path: string): boolean {
-  const k = pathKind(path)
-  if k is IoError { return false }
-  k == "file"
-}
-
-function envOr(name: string, dflt: string): string {
-  const v = getEnv(name)
-  if v is string { return v }
-  dflt
 }
 
 function note(line: string) {

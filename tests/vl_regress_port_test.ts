@@ -69,6 +69,11 @@ const tree = async (dir: string) => {
   for (const f of ["regress.py", "index.py", "cellmap.py", "regress.vl"]) {
     await Deno.copyFile(`${ROOT}/${D}/${f}`, `${dir}/${D}/${f}`);
   }
+  await Deno.mkdir(`${dir}/scripts/lib`, { recursive: true });
+  await Deno.copyFile(
+    `${ROOT}/scripts/lib/common.vl`,
+    `${dir}/scripts/lib/common.vl`,
+  );
   await Deno.copyFile(
     `${ROOT}/scripts/silent-sweep/census/gradecensus.py`,
     `${dir}/scripts/silent-sweep/census/gradecensus.py`,
