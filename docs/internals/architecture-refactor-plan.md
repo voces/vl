@@ -24,11 +24,12 @@ restate measurements; follow the links.
 | item | state | where |
 | --- | --- | --- |
 | L1 per-call binding, banked once | **in progress as lane SC** | Design #3531 is merged, and the binding column landed in shadow (#3556). Step 0 (identity column) is open as #3542. |
-| L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. Next: `valueAtomKind`'s union fallback and `mvValKindOfTy`. |
+| L2 rep from type | stage 1 **done**; stage 2 **partial** | The ratchet is `render-parse-budget` (#3536). #3562 moved the last `valueAtomKind` renders. B2's first family (a render compared to a primitive's name) moved to `tyEmitPrimOf` in `tyquery.vl`: 118 → 112 renders. The second read `valueAtomKindOfTy` and `nulScalarListKindOfTy` off the type (`tyEmitElemPrimOf`, `tyEmitElemNulPrimOf`, `tyEmitNamesOf`): 112 → 111. `valueAtomKindOfTy` still renders a union of members that share a list or closure rep (D4320), and `mapTyValKindLowerable` still renders an anonymous shape or a nullable union of shapes. Next: `armFieldUnionName`, `joinRowOfTy`, `listUnionEmitName`. |
 | L3 legality in the checker | family 1 **done** | #3557 closed D4070 and D4071. |
-| L7 `pending*` into `ExpCtx` | **in progress as C3** | `emitReturnValue` builds its `ExpCtx` and restores the caller's on every exit: 25 `pending*` writes to 0 (`wasmEmit.vl` 463 to 436 lines). Next: `emitLetDeclStmt`. The never-cleared count (211 of 1,151) is not ratcheted yet. |
+| L4 one rollback for the quiet probes | first PR (A1) **in review** | The assertion and its measured list are in code-quality-2026-10.md L4. A2 (`CheckMark`) is next. |
+| L7 `pending*` into `ExpCtx` | **in progress as C3** | `emitReturnValue` and `emitLetDeclStmt` each build their `ExpCtx` and restore the caller's on every exit: 25 and 34 `pending*` writes to 0 (`wasmEmit.vl` 463 to 401 lines). Next: `emitAssign`, then `emitDirectCall`. The never-cleared count (211 of 1,151) is not ratcheted yet. |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
-| L4–L6, L9–L14 | not started | |
+| L5–L6, L9–L14 | not started | |
 | SMALL S-c front-end tidy | **partial** | `typecheck.vl` imports `./ast` once (byte-identical seed). Not byte-identical, so not done: the second `Tok` (the lexer's has no `pos`), the operator-name table (a shared `isStrFuncName` shrinks the seed 299 bytes), `kindTag` (inlining grows it ~2.4 KB), `ErrExpr.errWhat`/`errAt` (a pos-only `ErrExpr` absorbs other pos-only literals at the `asObj` literal in `typecheck.vl` and fails to check). `await` skipped: a surface decision. |
 | SMALL S-a, S-b, S-d … S-n | not started | |
 | RepDesc rulings | **open** since 2026-09-06 | `open-rulings.md`: `one-literal-union-rep`, `nullable-rep-rule-stated-once` |
@@ -59,8 +60,8 @@ Update this table in the PR that moves an item.
 5. **A step removes or narrows its §7 line in the same PR**, and updates the status table above.
 6. **One writer per giant file at a time.** `typecheck.vl`, `emit_classify.vl`, `wasmEmit.vl`
    and `emit_mono.vl` each have one owning lane per wave (see Concurrency).
-7. **Fresh builder per PR**, with a handoff note, and at most two concurrent agents (owner CPU
-   cap). Merges go through `cb-audit`.
+7. **Fresh builder per PR**, with a handoff note, and up to six concurrent agents (CLAUDE.md).
+   Merges go through `cb-audit`.
 
 ## Dependency graph
 
@@ -92,7 +93,7 @@ order, subject to the one-writer rule.
 
 | step | item | file owner | proof |
 | --- | --- | --- | --- |
-| A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | byte-identical seed with the flag off |
+| A1 | L4 first PR: the table-length assertion after each of the seven quiet probes, behind a flag. This turns the UNDECIDED omissions into a measured list. | `typecheck.vl` | the fixpoint reproduces master's seed from master's source, and `vl check` text and emitted modules are identical over `tests/cases` and the corpus with the flag off |
 | A2 | L4: one `CheckMark` / `checkRollback`; each constraint family becomes a record of columns with one `truncate` | `typecheck.vl` | `vl check` and module identity; fuel A/B |
 | A3 | L8 first PR: `tyquery.vl` with the four exact type-step twins retired | `emit_classify.vl`, `emit_rep.vl` | byte-identical seed |
 | A4 | L14 first step: a per-entry type-index assertion | `emit_collect.vl`, `emit_sections.vl` | seed, fixpoint, rep-fuzz |
@@ -131,18 +132,19 @@ order, subject to the one-writer rule.
 | --- | --- | --- |
 | T1 | **Done.** The host process ABI: `std:process` (`runProgram`, `exit`) and `std:env` (`getEnv`) shipped with their host imports; see ROADMAP's "Host ABI for VL scripts". | — |
 | T2 | L11 the VL way: the per-file budgets move into `vl lint` itself (a baseline-reading budget mode), so the ratchets need neither Python nor spawn. The twin Python censuses retire as each rule's budget moves. | none |
-| T3 | **In progress.** `check-filed-witnesses.vl` and `distilled/regress.vl` (with `gradecensus.py`'s grading) are ported and run their gate rows; the Pythons stay, because `scripts/inventory/rows.py` imports the first and other census tools import `cellmap`, `index` and `gradecensus`. Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
+| T3 | **In progress.** `check-filed-witnesses.vl` and `distilled/regress.vl` (with `gradecensus.py`'s grading) are ported and run their gate rows; the Pythons stay, because `scripts/inventory/rows.py` imports the first and other census tools import `cellmap`, `index` and `gradecensus`. `plumb-shape-cost.vl` is the third: it runs the `plumb-shape cost` row in `gate.sh` and ci-native, and `tests/vl_plumb_shape_port_test.ts` replays one recorded set of readings through the Python and diffs report, exit code and baseline file. Its CPU is serial by design, so it has no fan-out; it reads rusage through GNU `time`, sets a child's directory and environment through `env -C`, and hashes through `sha256sum`, three host gaps with no `dogfood:` row yet. Its control workload is `scripts/perf/plumb-shape-control.vl`, which times differently from the Python's, so the baseline's CPU fields need one `--write-baseline` with the VL tool on a quiet box before CPU is graded again; fuel and RSS are unaffected. Its Python stays as the test's reference. Port instruments in gate order, each kept beside its Python version until the outputs are byte-identical, then the Python deleted: `check-filed-witnesses.py`, `regress.py` + `gradecensus.py`, `plumb-shape-cost.py`, `capability-probes/run.py`, the survey scripts. Each gap found is filed as a `dogfood:` row. | T1 |
 | T4 | L10: the `-O` optimizer | owner decision 3 below |
 | T5 | L12: the remaining LSP features | A7 |
 
 ## Concurrency
 
-There are two lanes at a time, under the owner's CPU cap.
+Up to six agents run at once (CLAUDE.md); the owner lifted the CPU cap on 2026-10-12. Rule 6
+still holds: one writer per giant file.
 
 - **Lane 1: SC.** B1, then C1(d). It owns `emit_mono.vl` and its parts of `typecheck.vl`
   throughout.
-- **Lane 2: rotating.** It takes one step at a time from the earliest wave with an open step,
-  choosing a step whose file has no current writer. The intended order is:
+- **The other lanes** each take one step at a time from the earliest wave with an open step,
+  choosing a step whose file has no current writer. The intended order per file is:
   - A1 → A2 → C2 → D1 (one continuous claim on `typecheck.vl`, interleaved with SC by area);
   - A3 → B2 → D2 → D3 (`emit_classify.vl`);
   - C3 (`wasmEmit.vl`);
@@ -172,7 +174,7 @@ Each is posted for question time; work that does not depend on it continues.
 
 These have no unmet prerequisite and touch disjoint files:
 
-- **A1**: L4 assertion harness (`typecheck.vl`).
+- **A1**: L4 assertion harness (`typecheck.vl`). In review.
 - **A5**: errno agreement test (host + `std/fs.vl`).
 - **A6 / S-c**: one `./ast` import block in `typecheck.vl`. This conflicts with A1, so run it
   first; it is small.
