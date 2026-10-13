@@ -6365,37 +6365,17 @@ impl ModuleScan {
     }
 }
 
-/// The rung's reading of its input module, by the compiler's `optRungScan`
-/// (`compiler/opt_scan.vl`) on a fresh instance: the `--no-inline` marks for each hot callee
-/// of run-once code, and the passes it adds (`--skip-pass=ssa-nomerge` past a set bound). The
-/// module is staged through `optInLoad`; `optOut` holds the pass on its first line (empty when
-/// none), then one name per line. A seed without these exports cannot build `-O`.
-fn rung_scan(
-    bytes: &[u8],
-    engine: &Engine,
-    compiler: &CompilerSource,
+/// The rung's reading of the module staged in `inst`, by the compiler's `optRungScan`
+/// (`compiler/opt_scan.vl`): the `--no-inline` marks for each hot callee of run-once code, and
+/// the passes it adds (`--skip-pass=ssa-nomerge` past a set bound). `optOut` holds the pass on
+/// its first line (empty when none), then one name per line.
+fn rung_scan_staged(
+    store: &mut Store<()>,
+    inst: &Instance,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let (mut store, inst) = load_compiler(engine, compiler)?;
-    let reset = inst
-        .get_typed_func::<(), i32>(&mut store, "optInReset")
-        .map_err(|e| {
-            e.context(
-                "`-O` reads its run-once marks through the compiler's `optRungScan`, \
-                 which this seed predates",
-            )
-        })?;
-    let load = inst.get_typed_func::<i32, i32>(&mut store, "optInLoad")?;
-    let scan = inst.get_typed_func::<(), i32>(&mut store, "optRungScan")?;
-    let mem = io_mem(&mut store, &inst)
-        .ok_or_else(|| Error::msg("the compiler exports no staging memory for optInLoad"))?;
-    reset.call(&mut store, ())?;
-    let cap = mem.data_size(&store).max(1);
-    for chunk in bytes.chunks(cap) {
-        mem.write(&mut store, 0, chunk)?;
-        load.call(&mut store, chunk.len() as i32)?;
-    }
-    scan.call(&mut store, ())?;
-    let text = StrOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+    let scan = inst.get_typed_func::<(), i32>(&mut *store, "optRungScan")?;
+    scan.call(&mut *store, ())?;
+    let text = StrOut::probe(store, inst, "optOut")?.read(store)?;
     let mut lines = text.split('\n');
     let extra = lines
         .next()
@@ -6403,6 +6383,143 @@ fn rung_scan(
         .map(|l| vec![l.to_string()])
         .unwrap_or_default();
     Ok((lines.map(String::from).collect(), extra))
+}
+
+/// Stages `bytes` as the compiler's `optIn`, through linear memory in chunks; the optimizer's
+/// exports (`compiler/opt_scan.vl`) read it. A seed without them cannot build `-O`.
+fn opt_stage(store: &mut Store<()>, inst: &Instance, bytes: &[u8]) -> Result<()> {
+    let reset = inst
+        .get_typed_func::<(), i32>(&mut *store, "optInReset")
+        .map_err(|e| {
+            e.context(
+                "`-O` reads its run-once marks through the compiler's `optRungScan`, \
+                 which this seed predates",
+            )
+        })?;
+    let load = inst.get_typed_func::<i32, i32>(&mut *store, "optInLoad")?;
+    let mem = io_mem(&mut *store, inst)
+        .ok_or_else(|| Error::msg("the compiler exports no staging memory for optInLoad"))?;
+    reset.call(&mut *store, ())?;
+    let cap = mem.data_size(&*store).max(1);
+    for chunk in bytes.chunks(cap) {
+        mem.write(&mut *store, 0, chunk)?;
+        load.call(&mut *store, chunk.len() as i32)?;
+    }
+    Ok(())
+}
+
+/// Which side builds the rung's argv and strips `vl-src` (rung R2): `$VL_OPT_ARGV` unset or
+/// `rust` the host, `vl` the compiler's `optRungArgv` / `optStripSrc`, `both` the two, failing
+/// the build when they disagree.
+#[derive(Clone, Copy, PartialEq)]
+enum OptArgvSide {
+    Rust,
+    Vl,
+    Both,
+}
+
+fn opt_argv_side() -> Result<OptArgvSide> {
+    match std::env::var("VL_OPT_ARGV").unwrap_or_default().as_str() {
+        "" | "rust" => Ok(OptArgvSide::Rust),
+        "vl" => Ok(OptArgvSide::Vl),
+        "both" => Ok(OptArgvSide::Both),
+        other => bail!("$VL_OPT_ARGV={other} — expected `rust`, `vl` or `both`"),
+    }
+}
+
+/// The rung's `wasm-opt` passes over `bytes`, the module it optimizes: the `--no-inline` marks,
+/// the low-memory pass, `-g` under `--names`, the rung's own passes and the scan's extra pass,
+/// in that order. The binaryen features, the source map and the paths are the caller's.
+fn rung_argv(
+    bytes: &[u8],
+    engine: &Engine,
+    compiler: &CompilerSource,
+    flag: &str,
+    passes: &[&str],
+    names: bool,
+    low_memory: Option<i64>,
+) -> Result<Vec<String>> {
+    let side = opt_argv_side()?;
+    let (mut store, inst) = load_compiler(engine, compiler)?;
+    opt_stage(&mut store, &inst, bytes)?;
+    let rust = if side == OptArgvSide::Vl {
+        None
+    } else {
+        let (no_inline, extra) = rung_scan_staged(&mut store, &inst)?;
+        let mut out: Vec<String> = no_inline
+            .iter()
+            .map(|n| format!("--no-inline={n}"))
+            .collect();
+        let mut passes = rung_passes(passes, names);
+        if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
+            passes.insert(0, "--low-memory-unused");
+        }
+        out.extend(passes.iter().map(|p| p.to_string()));
+        out.extend(extra);
+        Some(out)
+    };
+    let vl = if side == OptArgvSide::Rust {
+        None
+    } else {
+        let argv = inst.get_typed_func::<(i32, i32, i32), i32>(&mut store, "optRungArgv")?;
+        let rung = if flag == "-O3" { 3 } else { 1 };
+        let low = low_memory.map_or(0, |n| n as i32);
+        if argv.call(&mut store, (rung, names as i32, low))? != 1 {
+            bail!("the compiler's optRungArgv refused the rung {flag}");
+        }
+        let text = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+        let text = String::from_utf8_lossy(&text);
+        Some(
+            text.split_terminator('\n')
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    match (rust, vl) {
+        (Some(r), Some(v)) if r != v => bail!(
+            "$VL_OPT_ARGV=both: the rung's argv differs — host `{}`, compiler `{}`",
+            r.join(" "),
+            v.join(" ")
+        ),
+        (Some(r), _) => Ok(r),
+        (None, Some(v)) => Ok(v),
+        (None, None) => unreachable!("opt_argv_side picks at least one side"),
+    }
+}
+
+/// `bytes` without its `vl-src` section, for an `-O` build (`None` when it has none), by the
+/// side `$VL_OPT_ARGV` picks. The compiler answers on `session` when the build still holds one,
+/// else on a fresh instance.
+fn strip_src_selected(
+    bytes: &[u8],
+    session: Option<&mut (Store<()>, Instance)>,
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<Option<Vec<u8>>> {
+    let side = opt_argv_side()?;
+    let rust = (side != OptArgvSide::Vl).then(|| without_custom_section(bytes, "vl-src"));
+    let vl = if side == OptArgvSide::Rust {
+        None
+    } else {
+        let mut fresh = None;
+        let (store, inst) = match session {
+            Some(s) => s,
+            None => fresh.insert(load_compiler(engine, compiler)?),
+        };
+        opt_stage(store, inst, bytes)?;
+        let strip = inst.get_typed_func::<(), i32>(&mut *store, "optStripSrc")?;
+        let removed = strip.call(&mut *store, ())? == 1;
+        let out = BytesOut::probe(store, inst, "optOut")?.read(store)?;
+        Some(removed.then_some(out))
+    };
+    match (rust, vl) {
+        (Some(r), Some(v)) if r != v => {
+            bail!("$VL_OPT_ARGV=both: the `vl-src` strip differs between the host and the compiler")
+        }
+        (Some(r), _) => Ok(r),
+        (None, Some(v)) => Ok(v),
+        (None, None) => unreachable!("opt_argv_side picks at least one side"),
+    }
 }
 
 /// A callee at most this many body bytes may be inlined to let a caller's struct stay off
@@ -6859,7 +6976,7 @@ fn escape_inline_step(
         return Ok(None);
     };
     std::fs::write(path, &named)?;
-    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[], map)?;
+    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, map)?;
     let stepped = std::fs::read(path)
         .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
     // Inlining removes functions, so the step's output numbers them anew; the prefixed names
@@ -6914,7 +7031,9 @@ fn escape_inline_step(
 const BINARYEN_CORES_DEFAULT: usize = 4;
 
 /// Shell out to `wasm-opt` to rewrite the emitted module IN PLACE with one of the
-/// two rungs above, or with the escape step (`ESCAPE_INLINE_PASSES`) that runs before them.
+/// two rungs above (`passes` from `rung_argv`, its `--no-inline` marks first, since
+/// `--no-inline=` is itself a pass and must run before the inliner), or with the escape step
+/// (`ESCAPE_INLINE_PASSES`) that runs before them.
 ///
 /// A missing `wasm-opt` is a HARD ERROR, not a soft no-op. `-O` / `-O3` are never
 /// implied — a build only reaches here because the caller typed the flag — and
@@ -6928,11 +7047,10 @@ const BINARYEN_CORES_DEFAULT: usize = 4;
 ///
 /// `map`, when given, is the module's source map: binaryen reads it and writes it back
 /// rewritten for the module it writes (`--source-map`, D3561).
-fn optimize_in_place(
+fn optimize_in_place<S: AsRef<str>>(
     path: &str,
     flag: &str,
-    passes: &[&str],
-    no_inline: &[String],
+    passes: &[S],
     map: Option<&str>,
 ) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
@@ -6951,14 +7069,8 @@ fn optimize_in_place(
              or set $VL_WASM_OPT. (Build without {flag} to emit the unoptimized module.)"
         );
     };
-    // The marks go first: `--no-inline=` is itself a pass, and must run before the inliner.
-    let marks: Vec<String> = no_inline
-        .iter()
-        .map(|n| format!("--no-inline={n}"))
-        .collect();
     let mut argv: Vec<&str> = vec![path];
-    argv.extend(marks.iter().map(String::as_str));
-    argv.extend_from_slice(passes);
+    argv.extend(passes.iter().map(AsRef::as_ref));
     argv.extend_from_slice(BINARYEN_FEATURES);
     if let Some(m) = map {
         argv.extend_from_slice(&["--input-source-map", m, "--output-source-map", m]);
@@ -10551,7 +10663,15 @@ fn build_cmd(args: &[String]) -> Result<()> {
         std::fs::write(mp, build_source_map(&rows, input, &out))
             .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))?;
         map_rows = Some(rows);
-        if optimizing || !names {
+        // Under `-O` this is the build's only `vl-src` (the seed omits it otherwise), and the
+        // rows describe the emitter's bytes, which binaryen rewrites (rung R2).
+        if optimizing {
+            if let Some(b) =
+                strip_src_selected(&bytes, session.as_mut(), &compile_engine, &compiler)?
+            {
+                bytes = b;
+            }
+        } else if !names {
             if let Some(b) = without_custom_section(&bytes, "vl-src") {
                 bytes = b;
             }
@@ -10590,14 +10710,16 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // A `--names` build's `vl-src` rows are offsets into the EMITTER's bytes, and binaryen
         // rewrites every body; kept through `-g` they would name the wrong source line for a
         // trap, so they go before any `wasm-opt` run. A module without them is untouched.
-        if let Some(stripped) = without_custom_section(&bytes, "vl-src") {
-            bytes = stripped;
-            std::fs::write(&sink, &bytes)?;
+        if opt_argv_side()? != OptArgvSide::Vl {
+            if let Some(stripped) = without_custom_section(&bytes, "vl-src") {
+                bytes = stripped;
+                std::fs::write(&sink, &bytes)?;
+            }
         }
         let map = map_path.as_deref();
         let rows_in = map_rows.take();
         // The chain is a function of these and of `bytes` (stage S2's key); a hit skips it.
-        // The seed is one of them: its `optRungScan` reads the rung's input (`rung_scan`).
+        // The seed is one of them: its `optRungArgv` reads the rung's input (`rung_argv`).
         let seed = compiler_hash(&compiler)
             .map(|h| hex(&h))
             .unwrap_or_default();
@@ -10683,18 +10805,21 @@ fn build_cmd(args: &[String]) -> Result<()> {
                 escape_inline_step(&sink_str, flag, &bytes, map)
             )?;
             let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
-            let mut passes = rung_passes(passes, names);
-            if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
-                passes.insert(0, "--low-memory-unused");
-            }
-            let (no_inline, extra) = phase!(
+            let argv = phase!(
                 "opt.run_once_scan",
-                rung_scan(rung_input, &compile_engine, &compiler)
+                rung_argv(
+                    rung_input,
+                    &compile_engine,
+                    &compiler,
+                    flag,
+                    passes,
+                    names,
+                    low_memory
+                )
             )?;
-            passes.extend(extra.iter().map(String::as_str));
             phase!(
                 "opt.rung",
-                optimize_in_place(&sink_str, flag, &passes, &no_inline, map)
+                optimize_in_place(&sink_str, flag, &argv, map)
             )?;
             let module = std::fs::read(&sink).map_err(|e| {
                 Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))

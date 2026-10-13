@@ -6,31 +6,34 @@
 # build that times out on either side is UNCOMPARED, never counted as agreeing.
 #
 #   scripts/opt-parity.sh [--compiler <seed>] [--jobs N] [--timeout S] [--rung -O3]
-#       SIDE_A SIDE_B [path ...]
+#       [--flag <build flag> ...] SIDE_A SIDE_B [path ...]
 #
 # A side is `VAR=value` (that variable set for the checkout's own `vl`) or the path
 # of a `vl` binary: a rung's port is graded `VAR=rust VAR=vl`, its retirement
 # against a binary built before the Rust was deleted. Both sides use one seed.
 # Paths are .vl files or directories (searched for *.vl); the default is
 # tests/cases plus the distilled corpus. Run from the checkout root. Exits 1 when
-# any program disagrees, naming each; 2 on a usage error.
+# any program disagrees, naming each; 2 on a usage error. `--flag` passes one more
+# build flag to both sides (repeatable), and a `--source-map` build's map must agree too.
 set -u
 
 COMPILER=build/vl-compiler.wasm
 JOBS=4
 TIMEOUT=120
 RUNG=-O
+FLAGS=
 while [ $# -gt 0 ]; do
   case "$1" in
     --compiler) COMPILER=$2; shift 2 ;;
     --jobs) JOBS=$2; shift 2 ;;
     --timeout) TIMEOUT=$2; shift 2 ;;
     --rung) RUNG=$2; shift 2 ;;
+    --flag) FLAGS="$FLAGS $2"; shift 2 ;;
     *) break ;;
   esac
 done
 if [ $# -lt 2 ]; then
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
 A=$1 B=$2
@@ -74,7 +77,7 @@ one() {
     [ "$side" = b ] && spec=$B
     : > "$slot/log"
     env "$(side_env "$spec")" OPT_PARITY_LOG="$slot/log" VL_WASM_OPT="$WORK/shim.sh" \
-      timeout "$TIMEOUT" "$(side_bin "$spec")" build "$f" "$RUNG" -o "$slot/out.wasm" \
+      timeout "$TIMEOUT" "$(side_bin "$spec")" build "$f" "$RUNG" $FLAGS -o "$slot/out.wasm" \
       --compiler "$COMPILER" > "$slot/$side.stdout" 2> "$slot/$side.stderr"
     rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -85,16 +88,19 @@ one() {
     echo "$rc" > "$slot/$side.rc"
     mv "$slot/log" "$slot/$side.argv"
     if [ -f "$slot/out.wasm" ]; then mv "$slot/out.wasm" "$slot/$side.wasm"; fi
+    if [ -f "$slot/out.wasm.map" ]; then mv "$slot/out.wasm.map" "$slot/$side.map"; fi
   done
   if ! cmp -s "$slot/a.rc" "$slot/b.rc"; then
     echo "DIFFER $f (exit $(cat "$slot/a.rc") vs $(cat "$slot/b.rc"))"
   elif ! cmp -s "$slot/a.argv" "$slot/b.argv"; then
     echo "DIFFER $f (wasm-opt argv)"
   elif [ -f "$slot/a.wasm" ] || [ -f "$slot/b.wasm" ]; then
-    if cmp -s "$slot/a.wasm" "$slot/b.wasm"; then
-      echo "AGREE $f $(grep -c -e --no-inline= -e --skip-pass= "$slot/a.argv")"
-    else
+    if ! cmp -s "$slot/a.wasm" "$slot/b.wasm"; then
       echo "DIFFER $f (module bytes)"
+    elif { [ -f "$slot/a.map" ] || [ -f "$slot/b.map" ]; } && ! cmp -s "$slot/a.map" "$slot/b.map"; then
+      echo "DIFFER $f (source map)"
+    else
+      echo "AGREE $f $(grep -c -e --no-inline= -e --skip-pass= "$slot/a.argv")"
     fi
   else
     echo "AGREE-FAIL $f"
@@ -102,7 +108,7 @@ one() {
   rm -rf "$slot"
 }
 export -f one side_bin side_env
-export WORK A B VL COMPILER TIMEOUT RUNG
+export WORK A B VL COMPILER TIMEOUT RUNG FLAGS
 
 xargs -a "$WORK/files" -d '\n' -P "$JOBS" -I{} bash -c 'one "$1"' _ {} > "$WORK/verdicts"
 
@@ -112,6 +118,6 @@ marked=$(grep -c "^AGREE .* [1-9][0-9]*\$" "$WORK/verdicts")
 differ=$(grep -c '^DIFFER ' "$WORK/verdicts")
 uncompared=$(grep -c '^UNCOMPARED ' "$WORK/verdicts")
 grep -E '^(DIFFER|UNCOMPARED) ' "$WORK/verdicts" | sort
-echo "opt-parity $A vs $B ($RUNG): $total programs · $agree identical modules ·" \
+echo "opt-parity $A vs $B ($RUNG$FLAGS): $total programs · $agree identical modules ·" \
   "$both_fail both refused · $marked identical carrying a --no-inline or --skip-pass mark · $differ differ · $uncompared uncompared"
 [ "$differ" -eq 0 ]
