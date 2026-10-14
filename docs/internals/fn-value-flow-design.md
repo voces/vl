@@ -692,6 +692,27 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      call through any of them pins the binding (`closures/delivered-alias-pins-written-lambda`
      calls `e` at `string` directly while `d` is held at `i32`). The let slot can decide the
      pin once its pins are the ones the binding's value flows to, not every pin in the class.
+   - Tenth PR: the table records direction, and a written `let` with one directed pin is
+     held at it. Beside the class, each slot keeps the slots its value flows to and the pins
+     taken at it. A directed site (an initializer, `=`, a return, an argument, a list or
+     record element) adds one edge, source to destination; `??`, `if` and `match` flow both
+     arms into a fresh slot. `fnFlowLetPinSig` follows the edges from the `let`'s slot and
+     returns its one closed pin, "" for none, `FF_PIN_MANY` for two that differ, and
+     `FF_PIN_DECLINE` for a binding walked in more than one context.
+     `monoCoerceWrittenLetValues` takes the pin when it matches the read's signature, and
+     otherwise keeps `monoCellSigRecord`. The 55 files that reach that site (54 in
+     `tests/cases`, one named corpus cell) hold 101 records. Against the record, the
+     undirected class pin disagreed in 21 files, 14 of them running fixtures. The directed
+     pin disagrees in 9 and agrees in every file where it is single. Of the 9, 7 are
+     `FF_PIN_MANY`: the four `written-let-…-string-literal-union-and-string` and
+     `…-mixed-union` fixtures, whose record is a `monoSigJoin` of two pins, and three error
+     fixtures that refuse elsewhere. The other 2 are generics walked in two contexts.
+     Each decline was lifted alone over the 55 files and six probes. Refusing at
+     `FF_PIN_MANY` lost 4 runs (the join fixtures) and changed 3 refusals, so it stays. A
+     union of the contexts' pins for `FF_PIN_DECLINE`, keeping the binding unrecorded for "",
+     and refusing a single pin that differs from the read each moved nothing, and nothing
+     witnesses them. Over the 55 files the switch moved nothing. The record still decides
+     the join: it is order-based, and a join over the directed pins is the next step.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
