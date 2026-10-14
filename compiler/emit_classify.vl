@@ -579,7 +579,6 @@ import {
   dupSlotMore,
   emitCurFnIx,
   emitCurFnPos,
-  emitPassGen,
   emitPhaseReached,
   emitRootIx,
   exprArmLocalsAny,
@@ -760,8 +759,6 @@ import {
   startStmts,
   topFnNodes,
   topFnOrd,
-  tyRegNoteWrite,
-  tyRegWrites,
   uDeclared,
   uFieldCount,
   uFieldElemKeyKind,
@@ -769,7 +766,6 @@ import {
   uFieldElemTyIx,
   uFieldLitTyIx,
   uFieldNames,
-  uFieldReLays,
   uFieldStart,
   uFieldTyText,
   uFieldTypes,
@@ -880,6 +876,15 @@ import {
   tyPeelNul,
   tyStepElem,
 } from "./tyquery"
+import {
+  emitPassGen,
+  memoKeyNew,
+  memoMoved,
+  memoPassMoved,
+  tyRegNoteWrite,
+  tyRegWrites,
+  uFieldReLays,
+} from "./memo"
 
 // The `$fnsig` param-spine token for parameter `paramIx` — one token per distinct param
 // valtype, so two functions share a `$fnsig` exactly when their param valtypes byte-match.
@@ -6037,13 +6042,10 @@ export function captureCountOf(fe: i32) {
 // cache is. The memo is dropped when the pass ends, when a node is minted, or when the pass
 // reports an edit that mints nothing, so no answer outlives the tree it describes (D2017).
 let capMemoGen: i32 = 0 - 1
-let capMemoNodes: i32 = 0 - 1
-let capMemoEditsAt: i32 = 0 - 1
-// A slot replaced or a name rewritten in place, and a lifted function added: what
-// `monomorphize`, the one armed pass that clones and renames, does without a reported edit.
-let capMemoEpoch: i32 = 0 - 1
-let capMemoRefGen: i32 = 0 - 1
-let capMemoFnLen: i32 = 0 - 1
+// The pass, the node count and the reported edits; then a slot replaced or a name rewritten in
+// place, and a lifted function added: what `monomorphize`, the one armed pass that clones and
+// renames, does without a reported edit.
+const capMemoGenKey = memoKeyNew(6)
 let capMemoEdits: i32 = 0
 let capMemoStamp: i32[] = []
 let capMemoStart: i32[] = []
@@ -6069,20 +6071,14 @@ function capMemoUsable(fe: i32): boolean {
 
 // `capComputeNamesOf(fe)` through the pass memo; the caller has checked `capMemoUsable`.
 function capMemoNamesOf(fe: i32): string[] {
-  if (
-    capMemoGen != emitPassGen
-    || capMemoNodes != P.nodes.length
-    || capMemoEditsAt != capMemoEdits
-    || capMemoEpoch != arenaEpochNow()
-    || capMemoRefGen != arenaRefWritesNow()
-    || capMemoFnLen != fnStmts.length
-  ) {
+  let moved = memoPassMoved(capMemoGenKey, 0)
+  moved = memoMoved(capMemoGenKey, 1, P.nodes.length) || moved
+  moved = memoMoved(capMemoGenKey, 2, capMemoEdits) || moved
+  moved = memoMoved(capMemoGenKey, 3, arenaEpochNow()) || moved
+  moved = memoMoved(capMemoGenKey, 4, arenaRefWritesNow()) || moved
+  moved = memoMoved(capMemoGenKey, 5, fnStmts.length) || moved
+  if moved {
     capMemoGen = emitPassGen
-    capMemoNodes = P.nodes.length
-    capMemoEditsAt = capMemoEdits
-    capMemoEpoch = arenaEpochNow()
-    capMemoRefGen = arenaRefWritesNow()
-    capMemoFnLen = fnStmts.length
     capMemoStamp = []
     capMemoStart = []
     capMemoCount = []
@@ -13569,14 +13565,13 @@ function pxSlotOf(
 // field and widen one, which is the object-shape floor's accepting side and stays lenient.
 function elemRowsCaptureCompat(vn: string, dn: string): boolean {
   if ercBusy == 0 {
-    if ercGenP != emitPassGen {
+    if memoPassMoved(ercGenKey, 0) {
       ercCap = pxCapFor(sScanLim())
       ercKeyV = []
       ercKeyD = []
       ercStamp = []
       ercVal = []
       pxSized(ercCap, ercKeyV, ercKeyD, ercStamp, ercVal)
-      ercGenP = emitPassGen
       ercWalk = 0
     }
     ercWalk = ercWalk + 1
@@ -13592,7 +13587,7 @@ function elemRowsCaptureCompat(vn: string, dn: string): boolean {
 // shape bounds the walk and no depth counter does (D1705).
 let ercBusy: i32 = 0
 let ercCap: i32 = 0
-let ercGenP: i32 = 0 - 1
+const ercGenKey = memoKeyNew(1)
 let ercWalk: i32 = 0
 let ercKeyV: i32[] = []
 let ercKeyD: i32[] = []
@@ -25185,37 +25180,20 @@ let gckHave: i32[] = []
 let gckVal: VKind[] = []
 let gckDepth = 0
 let gckGen = 1
-let gckGenTy = -1
-let gckGenS = -1
-let gckGenSF = -1
-let gckGenU = -1
-let gckGenV = -1
-let gckGenN = -1
-let gckGenP = -1
+const gckGenKey = memoKeyNew(7)
 
-// Has any input the ladder reads changed since the columns' last stamp? The arena's
-// in-place epoch, the LENGTH of every append-only collect table a rung consults, and the
-// PASS a slot's answer belongs to — a rung reads `fRetKind`, which a pass further down the
-// table fills in place, so an answer may not outlive its own pass (D1655).
-function gckStale() {
-  if gckGenTy != tyMutEpoch { return true }
-  if gckGenS != sNames.length { return true }
-  if gckGenSF != sFieldCount.length { return true }
-  if gckGenU != unNames.length { return true }
-  if gckGenV != uVariants.length { return true }
-  if gckGenP != emitPassGen { return true }
-  gckGenN != P.nodes.length
-}
-
-function gckStamp() {
-  gckGenTy = tyMutEpoch
-  gckGenS = sNames.length
-  gckGenSF = sFieldCount.length
-  gckGenU = unNames.length
-  gckGenV = uVariants.length
-  gckGenN = P.nodes.length
-  gckGenP = emitPassGen
-  0
+// Has any input the ladder reads changed since the key last read it? The arena's in-place
+// epoch, the LENGTH of every append-only collect table a rung consults, and the PASS a slot's
+// answer belongs to — a rung reads `fRetKind`, which a pass further down the table fills in
+// place, so an answer may not outlive its own pass (D1655).
+function gckStale(): boolean {
+  let moved = memoMoved(gckGenKey, 0, tyMutEpoch)
+  moved = memoMoved(gckGenKey, 1, sNames.length) || moved
+  moved = memoMoved(gckGenKey, 2, sFieldCount.length) || moved
+  moved = memoMoved(gckGenKey, 3, unNames.length) || moved
+  moved = memoMoved(gckGenKey, 4, uVariants.length) || moved
+  moved = memoPassMoved(gckGenKey, 5) || moved
+  memoMoved(gckGenKey, 6, P.nodes.length) || moved
 }
 
 // Forget every answer in one step: a slot is a hit only while its own stamp equals the live
@@ -25235,7 +25213,7 @@ function gckDrop() {
     grVal = []
     gckGen = 1
   }
-  gckStamp()
+  0
 }
 
 // ── the module-global read memo (D3051) ──────────────────────────────────────
@@ -25692,40 +25670,21 @@ let rasKind: i32[] = []
 let rasElem: string[] = []
 let rasElemHave: i32[] = []
 
-// Has any input an arm reads changed since the rows' last stamp? The arena's in-place
+// Has any input an arm reads changed since the key last read it? The arena's in-place
 // epoch and the declared-type version, the LENGTH of every collect table an arm consults,
 // and the PASS — a column a later pass fills in place moves none of the others, so an
 // answer may not outlive its own pass (D1655).
-let rasGenTy = -1
-let rasGenUV = -1
-let rasGenS = -1
-let rasGenSF = -1
-let rasGenU = -1
-let rasGenV = -1
-let rasGenN = -1
-let rasGenP = -1
+const rasGenKey = memoKeyNew(8)
 
-function rasStale() {
-  if rasGenTy != tyMutEpoch { return true }
-  if rasGenUV != cUserTypesVer { return true }
-  if rasGenS != sNames.length { return true }
-  if rasGenSF != sFieldCount.length { return true }
-  if rasGenU != unNames.length { return true }
-  if rasGenV != uVariants.length { return true }
-  if rasGenP != emitPassGen { return true }
-  rasGenN != P.nodes.length
-}
-
-function rasStamp() {
-  rasGenTy = tyMutEpoch
-  rasGenUV = cUserTypesVer
-  rasGenS = sNames.length
-  rasGenSF = sFieldCount.length
-  rasGenU = unNames.length
-  rasGenV = uVariants.length
-  rasGenN = P.nodes.length
-  rasGenP = emitPassGen
-  0
+function rasStale(): boolean {
+  let moved = memoMoved(rasGenKey, 0, tyMutEpoch)
+  moved = memoMoved(rasGenKey, 1, cUserTypesVer) || moved
+  moved = memoMoved(rasGenKey, 2, sNames.length) || moved
+  moved = memoMoved(rasGenKey, 3, sFieldCount.length) || moved
+  moved = memoMoved(rasGenKey, 4, unNames.length) || moved
+  moved = memoMoved(rasGenKey, 5, uVariants.length) || moved
+  moved = memoPassMoved(rasGenKey, 6) || moved
+  memoMoved(rasGenKey, 7, P.nodes.length) || moved
 }
 
 // Forget every row in one step — a row answers only while its own stamp equals the live
@@ -25744,7 +25703,7 @@ function rasDrop() {
     rasElemHave = []
   }
   while rasRowGen.length < rasSlots { rasGrow() }
-  rasStamp()
+  0
 }
 
 // One empty row, appended to every column at once.
@@ -48791,11 +48750,11 @@ let sktKey: string[] = []
 // pass or the arena moves. A memo stamped with the value at the start of its computation
 // therefore cannot answer from inputs that changed since, including ones that computation changed.
 let trgGen = 0
-let trgStamp: i32[] = []
+let trgGenKey = memoKeyNew(21)
 
 export function tyRegMemoReset() {
   trgGen = trgGen + 1
-  trgStamp = []
+  trgGenKey = memoKeyNew(21)
   sitnMemo = Map()
   sktGen = []
   sktKey = []
@@ -48803,38 +48762,29 @@ export function tyRegMemoReset() {
 }
 
 export function tyRegGenNow(): i32 {
-  while trgStamp.length < 21 { trgStamp.push(-1) }
-  let moved = trgMoved(0, emitPassGen)
-  moved = trgMoved(1, tyMutEpoch) || moved
-  moved = trgMoved(2, T.tys.length) || moved
-  moved = trgMoved(3, P.nodes.length) || moved
-  moved = trgMoved(4, arenaEpochNow()) || moved
-  moved = trgMoved(5, arenaRefWritesNow()) || moved
-  moved = trgMoved(6, cUserTypesVer) || moved
-  moved = trgMoved(7, nodeTyWrites) || moved
-  moved = trgMoved(8, msGen) || moved
-  moved = trgMoved(9, tyRegWrites) || moved
-  moved = trgMoved(10, sNames.length) || moved
-  moved = trgMoved(11, sFieldCount.length) || moved
-  moved = trgMoved(12, sFieldNames.length) || moved
-  moved = trgMoved(13, sFieldElemName.length) || moved
-  moved = trgMoved(14, sTyIx.length) || moved
-  moved = trgMoved(15, unNames.length) || moved
-  moved = trgMoved(16, uVariants.length) || moved
-  moved = trgMoved(17, uFieldCount.length) || moved
-  moved = trgMoved(18, uFieldElemName.length) || moved
-  moved = trgMoved(19, mvValKind.length) || moved
-  moved = trgMoved(20, rlElemName.length) || moved
+  let moved = memoPassMoved(trgGenKey, 0)
+  moved = memoMoved(trgGenKey, 1, tyMutEpoch) || moved
+  moved = memoMoved(trgGenKey, 2, T.tys.length) || moved
+  moved = memoMoved(trgGenKey, 3, P.nodes.length) || moved
+  moved = memoMoved(trgGenKey, 4, arenaEpochNow()) || moved
+  moved = memoMoved(trgGenKey, 5, arenaRefWritesNow()) || moved
+  moved = memoMoved(trgGenKey, 6, cUserTypesVer) || moved
+  moved = memoMoved(trgGenKey, 7, nodeTyWrites) || moved
+  moved = memoMoved(trgGenKey, 8, msGen) || moved
+  moved = memoMoved(trgGenKey, 9, tyRegWrites) || moved
+  moved = memoMoved(trgGenKey, 10, sNames.length) || moved
+  moved = memoMoved(trgGenKey, 11, sFieldCount.length) || moved
+  moved = memoMoved(trgGenKey, 12, sFieldNames.length) || moved
+  moved = memoMoved(trgGenKey, 13, sFieldElemName.length) || moved
+  moved = memoMoved(trgGenKey, 14, sTyIx.length) || moved
+  moved = memoMoved(trgGenKey, 15, unNames.length) || moved
+  moved = memoMoved(trgGenKey, 16, uVariants.length) || moved
+  moved = memoMoved(trgGenKey, 17, uFieldCount.length) || moved
+  moved = memoMoved(trgGenKey, 18, uFieldElemName.length) || moved
+  moved = memoMoved(trgGenKey, 19, mvValKind.length) || moved
+  moved = memoMoved(trgGenKey, 20, rlElemName.length) || moved
   if moved { trgGen = trgGen + 1 }
   trgGen
-}
-
-// Whether stamp `i` differs from `v`, recording `v`. Every stamp is non-negative, so the
-// initial -1 always differs.
-function trgMoved(i: i32, v: i32): boolean {
-  if trgStamp[i] == v { return false }
-  trgStamp[i] = v
-  true
 }
 
 function sigKeyOfTyGo(funcTyIx: i32): string {

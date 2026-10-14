@@ -66,6 +66,16 @@ for (const set of ["native", "release"]) {
   });
 }
 
+// A SELF_SHARDED file divides its cases by `$VL_CI_SHARD=<k>/<n>`; a stale <n> would assert
+// some shares twice and others never.
+Deno.test("ci-shard: the native step's VL_CI_SHARD names the native shard count", () => {
+  const n = ci.match(/ci-shard\.sh native \$\{\{ matrix\.shard \}\} (\d+)/)?.[1];
+  const env = [...ci.matchAll(/VL_CI_SHARD: \$\{\{ matrix\.shard \}\}\/(\d+)/g)].map((m) => m[1]);
+  if (!n || env.length !== 1 || env[0] !== n) {
+    throw new Error(`want one \`VL_CI_SHARD: \${{ matrix.shard }}/${n}\` in ci.yml, got ${JSON.stringify(env)}`);
+  }
+});
+
 Deno.test("ci-shard: no file is in both the native and the release set", async () => {
   const native = await shard("native", "1", "1");
   const release = await shard("release", "1", "1");
