@@ -1,6 +1,11 @@
 # Codegen architecture: a builder layering for `wasmEmit.vl`
 
-> Status: **design / analysis, not landed.** This doc analyses the self-hosted
+> Status: **landed 2026-06-08.** The refactor this doc proposed shipped as the ten
+> phases of [`codegen-builder-migration-plan.md`](codegen-builder-migration-plan.md)
+> (#225–#234, Phase 0 through Phase I); the `w*`/`fb*` builder layer now lives in
+> `compiler/emit_bytes.vl`. What follows is the analysis as written before it landed, so
+> its line numbers and "proposes" describe the pre-refactor emitter.
+> This doc analyses the self-hosted
 > WasmGC emitter (`compiler/wasmEmit.vl`, `emitProgram`) and proposes a layered
 > builder refactor. It changes no code; it is the decision input for the refactor.
 > Owner's framing: *"the actual wasm code emission is kind of a mess — we're mixing

@@ -213,6 +213,7 @@ const OP_CALL_INDIRECT = 0x11
 const OP_RETURN_CALL = 0x12
 const OP_DROP = 0x1a
 const OP_SELECT = 0x1b
+const OP_SELECT_T = 0x1c
 // Locals / globals.
 const OP_LOCAL_GET = 0x20
 const OP_LOCAL_SET = 0x21
@@ -259,9 +260,15 @@ const OP_F64_LE = 0x65
 const OP_F64_GE = 0x66
 const OP_F32_TRUNC = 0x8f
 const OP_F64_TRUNC = 0x9d
+const OP_F32_NEG = 0x8c
+const OP_F64_NEG = 0x9a
 // Reference instructions.
 const OP_REF_NULL = 0xd0
+const OP_REF_IS_NULL = 0xd1
+const OP_REF_EQ = 0xd3
 const OP_REF_AS_NON_NULL = 0xd4
+const OP_BR_ON_NULL = 0xd5
+const OP_BR_ON_NON_NULL = 0xd6
 // GC prefix (0xfb) + its sub-opcodes (the byte following the prefix).
 const GC_PREFIX = 0xfb
 const GC_STRUCT_NEW = 0x00 // struct.new
@@ -280,6 +287,7 @@ const GC_ARRAY_GET_U = 0x0d // array.get_u
 const GC_ARRAY_SET = 0x0e // array.set
 const GC_ARRAY_LEN = 0x0f // array.len
 const GC_ARRAY_COPY = 0x11 // array.copy
+const GC_REF_TEST = 0x14 // ref.test (non-null)
 const GC_REF_CAST = 0x16 // ref.cast (non-null)
 // Value-type bytes.
 const VT_F64 = 0x7c
@@ -845,6 +853,15 @@ export function fbF32Trunc() {
   wU8(OP_F32_TRUNC)
   0
 }
+// f64.neg / f32.neg: 0x9a / 0x8c — flip the sign bit.
+export function fbF64Neg() {
+  wU8(OP_F64_NEG)
+  0
+}
+export function fbF32Neg() {
+  wU8(OP_F32_NEG)
+  0
+}
 // if: 0x04 <blocktype>. `blockType` is a single byte (0x40 void, or a valtype byte).
 export function fbIf(blockType: i32) {
   fbOpenIf()
@@ -883,6 +900,17 @@ export function fbIfRefNul(heapIdx: i32, nul: boolean) {
 }
 // `fbIfRefNul` for the NON-null form — `if (result (ref <heapIdx>))`.
 export function fbIfRef(heapIdx: i32) { fbIfRefNul(heapIdx, false) }
+// block: 0x02 <blocktype> with a ref result, the `block` twin of `fbIfRefNul`.
+export function fbBlockRefNul(heapIdx: i32, nul: boolean) {
+  fbOpenBlock()
+  if nul {
+    wU8(RT_REF_NULL) // 0x63 (ref null ht)
+  } else {
+    wU8(RT_REF) // 0x64 (ref ht)
+  }
+  wSLEB(heapIdx)
+  0
+}
 // block / loop: 0x02/0x03 <blocktype> (single byte, as `fbIf`).
 export function fbBlock(blockType: i32) {
   fbOpenBlock()
@@ -906,6 +934,18 @@ export function fbBrIf(depth: i32) {
   wULEB(depth)
   0
 }
+// br_on_null / br_on_non_null: 0xd5/0xd6 <depth-uleb>. `br_on_null` branches on a null and
+// leaves the non-null ref otherwise; `br_on_non_null` branches carrying the non-null ref.
+export function fbBrOnNull(depth: i32) {
+  wU8(OP_BR_ON_NULL)
+  wULEB(depth)
+  0
+}
+export function fbBrOnNonNull(depth: i32) {
+  wU8(OP_BR_ON_NON_NULL)
+  wULEB(depth)
+  0
+}
 // end: 0x0b, closing the innermost frame (or a function body, whose depth resets per function).
 export function fbEnd() {
   wU8(OP_END) // 0x0b end
@@ -921,6 +961,14 @@ export function fbDrop() {
 // carries the valtype explicitly and is hand-written at its two sites).
 export function fbSelect() {
   wU8(OP_SELECT) // 0x1b select
+  0
+}
+// The typed `select_t` (0x1c) over one non-null `(ref <heapIdx>)` result.
+export function fbSelectRef(heapIdx: i32) {
+  wU8(OP_SELECT_T)
+  wU8(1) // one result valtype
+  wU8(RT_REF) // 0x64 (ref ht)
+  wSLEB(heapIdx)
   0
 }
 export function fbUnreachable() {
@@ -1195,6 +1243,24 @@ export function fbRefNull(heapIdx: i32) {
 // `ref.as_non_null` (0xd4) — recover the non-null ref a nullable slot holds.
 export function fbRefAsNonNull() {
   wU8(OP_REF_AS_NON_NULL) // 0xd4 ref.as_non_null
+  0
+}
+// `ref.is_null` (0xd1): `[ref] -> [i32]`, 1 when the ref is null.
+export function fbRefIsNull() {
+  wU8(OP_REF_IS_NULL)
+  0
+}
+// `ref.eq` (0xd3): `[eqref, eqref] -> [i32]`, identity; two nulls compare equal.
+export function fbRefEq() {
+  wU8(OP_REF_EQ)
+  0
+}
+// `ref.test <ht>` (0xfb 0x14): 1 when the non-null operand is a `<heapIdx>`. The immediate is a
+// heaptype, so it is signed-LEB, as `fbRefCast`'s is.
+export function fbRefTest(heapIdx: i32) {
+  wU8(GC_PREFIX)
+  wU8(GC_REF_TEST)
+  wSLEB(heapIdx)
   0
 }
 // Record an unsupported-shape failure: keep the first message and drop any bytes
