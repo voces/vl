@@ -766,6 +766,41 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      - a written `let`. D4515 is its clause-1 witness.
 
      It retires nothing yet.
+   - Third PR: the binding may be a written `let`, so long as every write is a whole `=` of
+     a literal. Its literal may also come back from a non-generic function whose every
+     `return` is a literal. A read may go through `?.`. A binding that aliases another, or
+     is written into one, is planned with it. When any binding sharing a literal declines a
+     read, none of them is rewritten. A slot's sources may include the checker's adapter
+     lambda, `($fp0) => g($fp0)`, which counts as `g`. That closes D4515. Over 67 matrix
+     templates, runs go from 3,301 to 3,353, all in the four read templates:
+     - `fn-value-generic-list-read`: 48 to 56 of 66; its open twin, 10 to 19 of 64;
+     - `fn-value-generic-optional-read` (new): 43 to 60 of 66; its open twin, 5 to 23 of 64.
+
+     No cell is lost and no silent cell is new. These stay as they are:
+     - an annotated destination that pins the returned literal (D4575, D4576);
+     - a parameter (the argument and early-return positions, D4577);
+     - the literal reps behind `{ f: [g] }` and `[[g]]` (D4578);
+     - maps (D4579).
+
+     A direct read off a call, such as `pick()[0](2)`, is not rewritten, since that would
+     drop the call.
+
+     It retires nothing: each item on this step's list loses runs when ablated alone
+     (an early return, or the store site's call emptied), graded on the native-align fixtures.
+     - `monoPinGenericList`, which holds `monoCallsPerRead` and `monoFeIsSrc`: 12 fixtures.
+       They cover element writes, written-`let` seeds, list aliases, and the refusal of two
+       generic sources.
+     - `monoPinGenericRecord`: 3 fixtures, covering field writes and calls at two types.
+     - `monoNotePushDeliveries`: 5 fixtures, covering hole lambdas pushed or set into a
+       typed list or map.
+     - The store site's `monoStoreAnnName`: 3 fixtures, covering a generic stored after
+       construction, into a nullable slot, and through a parameter.
+     - The ObjLit arm of `monoCoerceFnValueName`: 3 fixtures. The ArrayLit arm: 8,
+       including D3940's nullable element.
+
+     The flow reads decide only reads of an un-annotated literal of explicitly generic
+     functions. These pins also decide writes, pushes, annotated destinations, and functions
+     generic only through an un-annotated parameter, which the table does not decide yet.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.

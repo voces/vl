@@ -1,6 +1,7 @@
 // Run the repro filed under every defect heading of a docs inventory and report which rows
-// no longer behave as filed. The VL port of `scripts/check-filed-witnesses.py`, whose
-// docstring is the full contract; the two print the same report byte for byte.
+// no longer behave as filed. A row's status line files an outcome, its `Repro:` block is the
+// witness, and an optional `Want:` block or `// PRINTS` line pins the output; `--strict`
+// also fails on a row it cannot grade. The row grammar is `scripts/lib/inventory.vl`.
 //
 //     vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] <doc-or-dir>...
 //     vl run scripts/check-filed-witnesses.vl -- --self-test
@@ -16,14 +17,7 @@ import { getEnv } from "std:env"
 import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
 import { parseI32, toString } from "std:fmt"
-import {
-  endsWith,
-  join,
-  lastIndexOf,
-  split,
-  startsWith,
-  toLowerAscii,
-} from "std:str"
+import { endsWith, join, startsWith, toLowerAscii } from "std:str"
 import {
   Proc,
   cpPrefix,
@@ -32,15 +26,33 @@ import {
   findFrom,
   firstLine,
   isDigit,
-  isDir,
   jsonStr,
-  lstripWs,
   rstripWs,
   splitLines,
   stripWs,
   univNl,
   wsLen,
 } from "./lib/common"
+import {
+  IdKey,
+  OUTCOMES_SORTED,
+  contains,
+  declaredOutcome,
+  headOf,
+  isAnyHead,
+  isRowHead,
+  isWordByte,
+  leadWord,
+  matchSec,
+  negatedBefore,
+  padTo,
+  resolve,
+  rstripByte,
+  skipWs,
+  sortKeys,
+  statusJoinContinues,
+  stripByte,
+} from "./lib/inventory"
 
 const VL = "./scripts/vl-host/target/release/vl"
 const COMPILER = "build/vl-compiler.wasm"
@@ -74,111 +86,7 @@ type Graded = {
   why: string,
 }
 
-// ── text helpers: the parts of Python's `str` and `re` this file reads with ─────────────
-
-// `s` without leading and trailing copies of the one-byte character `c`.
-function stripByte(s: string, c: i32): string {
-  let a = 0
-  let b = s.length
-  while a < b && s[a] == c { a = a + 1 }
-  while b > a && s[b - 1] == c { b = b - 1 }
-  s.slice(a, b)
-}
-
-function rstripByte(s: string, c: i32): string {
-  let b = s.length
-  while b > 0 && s[b - 1] == c { b = b - 1 }
-  s.slice(0, b)
-}
-
-function contains(s: string, needle: string): boolean {
-  findFrom(s, needle, 0) >= 0
-}
-
-// `s` left-justified to `w` code points, as `f"{s:<w}"` pads it.
-function padTo(s: string, w: i32): string {
-  let out = s
-  let n = s.cpLen()
-  while n < w {
-    out = out + " "
-    n = n + 1
-  }
-  out
-}
-
-function isAlpha(b: i32): boolean {
-  (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
-}
-
-function isUpper(b: i32): boolean { b >= 65 && b <= 90 }
-
-// A regex word character, with every non-ASCII byte read as punctuation.
-function isWordByte(b: i32): boolean { isDigit(b) || isAlpha(b) || b == 95 }
-
-// Whether `s` starts with `word` followed by a regex word boundary (`^word\b`).
-function leadWord(s: string, word: string): boolean {
-  if !startsWith(s, word) { return false }
-  s.length == word.length || !isWordByte(s[word.length])
-}
-
-// The count of leading `#`.
-function hashes(s: string): i32 {
-  let n = 0
-  while n < s.length && s[n] == 35 { n = n + 1 }
-  n
-}
-
-// Whether `s` is `^#{lo,hi}\s`: lo to hi hashes, then whitespace.
-function headOf(s: string, lo: i32, hi: i32): boolean {
-  const n = hashes(s)
-  n >= lo && n <= hi && wsLen(s, n) > 0
-}
-
-// The index past a run of whitespace starting at `i`.
-function skipWs(s: string, i: i32): i32 {
-  let j = i
-  while wsLen(s, j) > 0 { j = j + wsLen(s, j) }
-  j
-}
-
-// A row heading's id and title, or an empty id when `ln` is not one. The grammar is
-// `^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$`.
-type Sec = { id: string, title: string }
-
-function matchSec(ln: string): Sec {
-  const none: Sec = { id: "", title: "" }
-  if !headOf(ln, 2, 4) { return none }
-  const a = skipWs(ln, hashes(ln))
-  if a >= ln.length || !isUpper(ln[a]) { return none }
-  let i = a + 1
-  while i < ln.length && isDigit(ln[i]) { i = i + 1 }
-  if i == a + 1 { return none }
-  if ln[a] == 68 && i < ln.length {
-    let j = i
-    if ln[j] == 45 { j = j + 1 }
-    if j < ln.length && isAlpha(ln[j]) {
-      j = j + 1
-      while j < ln.length && (isAlpha(ln[j]) || isDigit(ln[j])) { j = j + 1 }
-      if wsLen(ln, j) > 0 { i = j }
-    }
-  }
-  if wsLen(ln, i) == 0 { return none }
-  let k = skipWs(ln, i)
-  if startsWith(ln.slice(k, ln.length), "—") { k = k + 3 }
-  else if k < ln.length && ln[k] == 45 { k = k + 1 }
-  else { return none }
-  if wsLen(ln, k) == 0 { return none }
-  { id: ln.slice(a, i), title: stripWs(ln.slice(skipWs(ln, k), ln.length)) }
-}
-
-// `^#{2,4}\s+D\d`: a heading that plainly names a D-row, parsed or not.
-function isRowHead(ln: string): boolean {
-  if !headOf(ln, 2, 4) { return false }
-  const a = skipWs(ln, hashes(ln))
-  a + 1 < ln.length && ln[a] == 68 && isDigit(ln[a + 1])
-}
-
-function isAnyHead(ln: string): boolean { headOf(ln, 1, 6) }
+// ── text helpers ─────────────────────────────────────────────────────────────────────
 
 // The `<name>.vl` of a `// file: <name>.vl` marker line, or "".
 function fileMark(ln: string): string {
@@ -240,60 +148,7 @@ function expandRepeats(src: string): string {
   out + src.slice(from, src.length)
 }
 
-// ── JSON, as Python's `json.dumps` spells a string ────────────────────────────────
-
-// ── the declared-status vocabulary ─────────────────────────────────────────────
-
-// Needle and outcome, in order: the first needle found wins, so the specific phrases
-// precede the substrings they contain.
-const DECLARED_NEEDLE = [
-  "now a loud check reject", "now a loud emit reject",
-  "runs today and must keep running", "closed", "loads then traps",
-  "trap after load", "check-clean invalid wasm", "check-clean silently wrong",
-  "check-clean wrong evaluation", "compiler trap", "loud emit reject",
-  "loud check reject",
-]
-const DECLARED_OUTCOME = [
-  "check_reject", "emit_reject", "runs", "runs", "trap_loads", "trap_loads",
-  "silent_invalid_wasm", "silent_wrong_value", "silent_wrong_evalcount",
-  "compiler_trap", "emit_reject", "check_reject",
-]
-const OUTCOMES_SORTED = "check_reject, compiler_trap, emit_reject, runs, silent_invalid_wasm, silent_wrong_evalcount, silent_wrong_value, trap_loads"
-
-const NEGATIONS = [
-  " not ", " never ", " no longer ", " isn't ", " is not ", " nor ",
-  " rather than ",
-]
-const CLAUSE_SEPS = [".", ";", "·", "—", ","]
-
-// Whether a negation in the same clause governs the match at byte `pos` of `low`.
-function negatedBefore(low: string, pos: i32): boolean {
-  let window = low.slice(0, pos)
-  for sep in CLAUSE_SEPS {
-    const cut = lastIndexOf(window, sep)
-    if cut != -1 { window = window.slice(cut + sep.length, window.length) }
-  }
-  window = " " + window + " "
-  for n in NEGATIONS {
-    if contains(window, n) { return true }
-  }
-  false
-}
-
-// The canonical outcome a status line files, or "" when it names none (or negates it).
-function declaredOutcome(status: string): string {
-  const low = toLowerAscii(status)
-  let k = 0
-  while k < DECLARED_NEEDLE.length {
-    const pos = findFrom(low, DECLARED_NEEDLE[k], 0)
-    if pos != -1 {
-      if negatedBefore(low, pos) { return "" }
-      return DECLARED_OUTCOME[k]
-    }
-    k = k + 1
-  }
-  ""
-}
+// ── JSON: a string escaped to ASCII, `\uXXXX` beyond it ──────────────────────────────
 
 // Whether the status files a parse-stage refusal: `parse[ -](error|stage)|at the parse\b`.
 function namesParseError(status: string): boolean {
@@ -349,7 +204,7 @@ function spawn(cmd: string, args: string[]): Proc {
   }
 }
 
-// The per-channel bound in seconds: `$WITNESS_TIMEOUT`, else 120 as the Python's `timeout=120`.
+// The per-channel bound in seconds: `$WITNESS_TIMEOUT`, else 120.
 function timeoutSecs(): string {
   const t = getEnv("WITNESS_TIMEOUT")
   if t is string {
@@ -610,11 +465,6 @@ function blankRow(doc: string): Row {
   }
 }
 
-function statusJoinContinues(line: string): boolean {
-  if stripWs(line) == "" { return false }
-  matchSec(line).id == "" && !isAnyHead(line)
-}
-
 // The indented program the `Repro` lead-in at `lines[i]` introduces, or "".
 function blockAt(lines: string[], i: i32): string {
   const body: string[] = []
@@ -743,131 +593,6 @@ function unparsedRowHeads(doc: string): string[] {
   out
 }
 
-// ── resolving the arguments ─────────────────────────────────────────────────────
-
-// A path spelled as Python's `pathlib` prints it: no empty or `.` segments.
-function normPath(p: string): string {
-  const segs: string[] = []
-  for s in p.split("/") {
-    if s != "" && s != "." { segs.push(s) }
-  }
-  const body = join(segs, "/")
-  if startsWith(p, "/") { return "/" + body }
-  if body == "" { return "." }
-  body
-}
-
-function under(dir: string, name: string): string {
-  if dir == "." { return name }
-  dir + "/" + name
-}
-
-// A row file's sort key: `D9` before `D10`, and `D661` before `D661A`.
-type IdKey = { pre: string, num: i64, rest: string, path: string }
-
-function idKey(stem: string, path: string): IdKey {
-  let i = 0
-  while i < stem.length && isAlpha(stem[i]) { i = i + 1 }
-  let j = i
-  while j < stem.length && isDigit(stem[j]) { j = j + 1 }
-  if i == 0 || j == i { return { pre: stem, num: 0, rest: "", path: path } }
-  let n: i64 = 0
-  let k = i
-  while k < j {
-    n = n * 10 + ((stem[k] - 48) as i64)
-    k = k + 1
-  }
-  {
-    pre: stem.slice(0, i),
-    num: n,
-    rest: stem.slice(j, stem.length),
-    path: path,
-  }
-}
-
-function idLess(a: IdKey, b: IdKey): boolean {
-  if a.pre != b.pre { return a.pre < b.pre }
-  if a.num != b.num { return a.num < b.num }
-  a.rest < b.rest
-}
-
-// `keys` in `idLess` order, stably. A hand merge sort rather than `std:array`'s `sort`:
-// a function value anywhere in this file makes the compiler trap on it (D4290).
-function sortKeys(keys: IdKey[]): IdKey[] {
-  if keys.length <= 1 { return keys }
-  const mid = keys.length / 2
-  const a = sortKeys(keys.slice(0, mid))
-  const b = sortKeys(keys.slice(mid, keys.length))
-  const out: IdKey[] = []
-  let i = 0
-  let j = 0
-  while i < a.length || j < b.length {
-    if j >= b.length || (i < a.length && !idLess(b[j], a[i])) {
-      out.push(a[i])
-      i = i + 1
-    } else {
-      out.push(b[j])
-      j = j + 1
-    }
-  }
-  out
-}
-
-// The source a split directory's README names, from its `inventory-split` marker, or "".
-function sourceMark(text: string): string {
-  for ln in text.split("\n") {
-    let s = ln
-    if !startsWith(s, "<!--") { continue }
-    s = lstripWs(s.slice(4, s.length))
-    if !startsWith(s, "inventory-split:") { continue }
-    s = lstripWs(s.slice(16, s.length))
-    if !startsWith(s, "source") || wsLen(s, 6) == 0 { continue }
-    s = lstripWs(s.slice(6, s.length))
-    let e = 0
-    while e < s.length && wsLen(s, e) == 0 { e = e + 1 }
-    const src = s.slice(0, e)
-    const rest = rstripWs(lstripWs(s.slice(e, s.length)))
-    if src == "" || rest != "-->" { continue }
-    return src
-  }
-  ""
-}
-
-// A doc path as given, or the row files under a directory, in id order.
-function resolve(arg: string): string[] {
-  if !isDir(arg) { return [arg] }
-  const dir = normPath(arg)
-  const names = listDir(arg)
-  if names is IoError {
-    die("check-filed-witnesses: cannot list \{arg} (\{names.msg})", 1)
-    return []
-  }
-  const keys: IdKey[] = []
-  for n in names {
-    if startsWith(n, "D") && endsWith(n, ".md") {
-      keys.push(idKey(n.slice(0, n.length - 3), under(dir, n)))
-    }
-  }
-  if keys.length > 0 {
-    const out: string[] = []
-    for k in sortKeys(keys) { out.push(k.path) }
-    return out
-  }
-  const readme = under(dir, "README.md")
-  let mark = ""
-  if exists(readme) { mark = sourceMark(readText(readme)) }
-  if mark == "" {
-    die(
-      arg
-        + ": holds no `D*.md` rows, and "
-        + readme
-        + " carries no `<!-- inventory-split: source ... -->` line to fall back to",
-      1,
-    )
-  }
-  [mark]
-}
-
 // ── grading a row against what its witness did ──────────────────────────────────
 
 // Stdout as a `Want:` block can spell it: no trailing whitespace or trailing blank lines.
@@ -927,7 +652,7 @@ function grade(
   { got: "runs", why: "" }
 }
 
-// ── seed provenance, as `scripts/seed_provenance.py` computes it ──────────────────
+// ── seed provenance, as `scripts/seed-provenance.vl` computes it ──────────────────
 
 function fnvFeed(h0: i64, data: u8[]): i64 {
   let h = h0
