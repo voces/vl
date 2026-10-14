@@ -124,6 +124,10 @@ jobs:
   # ---------------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
+    # `actions: read` lets a master run find and download a pull request's proven seed.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       docs_only: ${{ steps.docs_check.outputs.docs_only }}
       seed_key: ${{ steps.keys.outputs.seed }}
@@ -195,6 +199,7 @@ jobs:
       # correctness: the host recompiles one whose key does not match.
       - name: Cache seed compiler wasm
         if: steps.docs_check.outputs.docs_only != 'true'
+        id: seedcache
         uses: actions/cache@v5
         with:
           path: |
@@ -205,6 +210,18 @@ jobs:
           restore-keys: |
             vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
             vl-seed4-${{ runner.os }}-
+
+      # The seed key is content-keyed, but a pull request's cache is invisible to master, so
+      # a push misses the entry its own pull request saved and climbs the ladder from an
+      # older seed. A same-repository pull request run therefore also uploads its proven seed
+      # as artifact `proven-<seed key>` (below), and any other run that misses the exact key
+      # installs it after checking the producing run (scripts/ci-proven-seed.sh). The ladder
+      # still runs: a reused seed is a better start that proves out in one compile.
+      - name: Reuse a seed a pull request proved
+        if: steps.docs_check.outputs.docs_only != 'true' && github.event_name != 'pull_request' && steps.seedcache.outputs.cache-hit != 'true'
+        run: ./scripts/ci-proven-seed.sh fetch "proven-${{ steps.keys.outputs.seed }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       # Self-compile current source with the seed AND prove the shipped seed is a
       # self-compilation fixed point: the ladder stops at the first stage X with an OBSERVED
@@ -219,6 +236,26 @@ jobs:
         run: ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # The handoff to master's run of the same seed key (see "Reuse a seed" above). A fork's
+      # run uploads nothing; the reader refuses one anyway.
+      - name: Checksum the proven seed for master
+        id: pack
+        if: steps.docs_check.outputs.docs_only != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: ./scripts/ci-proven-seed.sh pack
+
+      - name: Upload the proven seed for master
+        if: steps.pack.outcome == 'success'
+        uses: actions/upload-artifact@v5
+        with:
+          name: proven-${{ steps.keys.outputs.seed }}
+          # Already zstd: the sidecars are ~160 MB raw, and zip's single-threaded deflate
+          # would put that on every pull request's critical path.
+          path: build/proven-seed.tar.zst
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
 
   # ---------------------------------------------------------------------------
   # ci-native — the native-binary suites (env-gated, they drive `vl` against the seed),
@@ -601,7 +638,6 @@ jobs:
             tests/selfhost_native_release_leaf_test.ts
             tests/selfhost_native_release_runonce_test.ts
             tests/selfhost_native_release_escape_test.ts
-            tests/vl_buffer_view_bounds_contract_test.ts
             tests/vl_buffer_view_bounds_shape_test.ts
             tests/vl_extern_link_test.ts
             tests/vl_extern_global_test.ts

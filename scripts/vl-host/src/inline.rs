@@ -51,6 +51,7 @@
 //! fixtures grade by output. `$VL_INLINE_EXPLAIN=1` prints, per record type and per candidate
 //! field, why it was taken or not.
 
+use crate::{upos, urange};
 use std::collections::{HashMap, HashSet};
 use wasmparser::{
     AbstractHeapType, CompositeInnerType, ExternalKind, FieldType, FuncValidatorAllocations,
@@ -903,9 +904,10 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         // A nullable local of a record type that is always set before it is read, and only
         // ever to a non-null value, is declared non-null when the body still validates so; the
         // values a store reads from it are then non-null by their type.
-        let start = body.range().start;
+        let span = urange(body.range());
+        let start = span.start;
         let mut tightened: Option<Vec<u8>> = None;
-        if let Some(pb) = tighten(&s, &bytes[start..body.range().end], start) {
+        if let Some(pb) = tighten(&s, &bytes[span.clone()], start) {
             let trial = wasmparser::FuncToValidate {
                 resources: to_validate.resources.clone(),
                 index: to_validate.index,
@@ -915,7 +917,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
             let mut tv = trial.into_validator(std::mem::take(&mut allocs));
             let ok = tv
                 .validate(&wasmparser::FunctionBody::new(
-                    wasmparser::BinaryReader::new(&pb, start),
+                    wasmparser::BinaryReader::new(&pb, start as u64),
                 ))
                 .is_ok();
             allocs = tv.into_allocations();
@@ -924,7 +926,9 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
             }
         }
         let body = match &tightened {
-            Some(pb) => wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(pb, start)),
+            Some(pb) => {
+                wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(pb, start as u64))
+            }
             None => body,
         };
         let mut fv = to_validate.into_validator(std::mem::take(&mut allocs));
@@ -958,11 +962,11 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
             local_runs.get(i.checked_sub(1)?).map(|&(_, t)| t)
         };
         let mut b = Body {
-            range: (body.range().start, body.range().end),
-            ops_start: lr.original_position(),
+            range: (span.start, span.end),
+            ops_start: upos(lr.original_position()),
             tightened: tightened
                 .as_ref()
-                .map(|pb| pb[..lr.original_position() - start].to_vec()),
+                .map(|pb| pb[..upos(lr.original_position()) - start].to_vec()),
             n_locals,
             sites: Vec::new(),
             touches: false,
@@ -1530,12 +1534,12 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
 /// field could inline declared non-null; `None` when it declares none. The two encodings are
 /// one byte apart and the same length, so every offset in the body is unchanged.
 fn tighten(s: &Scan, body: &[u8], start: usize) -> Option<Vec<u8>> {
-    let mut r = wasmparser::BinaryReader::new(body, start);
+    let mut r = wasmparser::BinaryReader::new(body, start as u64);
     let n = r.read_var_u32().ok()?;
     let mut at: Vec<usize> = Vec::new();
     for _ in 0..n {
         r.read_var_u32().ok()?;
-        let pos = r.original_position() - start;
+        let pos = upos(r.original_position()) - start;
         if let ValType::Ref(rt) = r.read::<ValType>().ok()? {
             let rec = concrete_index(rt.heap_type()).is_some_and(|v| s.records.contains(&v));
             if rt.is_nullable() && rec && body.get(pos) == Some(&0x63) {
@@ -2506,7 +2510,7 @@ fn rewrite(
         // Stream the body, with the plan, re-encoding every field index of a changed parent.
         let mut reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &bytes[b.ops_start..b.range.1],
-            b.ops_start,
+            b.ops_start as u64,
         ));
         let mut ops: Vec<(Operator, usize, usize)> = Vec::new();
         while !reader.eof() {
@@ -2516,9 +2520,9 @@ fn rewrite(
             let end = if reader.eof() {
                 b.range.1
             } else {
-                reader.original_position()
+                upos(reader.original_position())
             };
-            ops.push((op, off, end));
+            ops.push((op, upos(off), end));
         }
         let mut code: Vec<u8> = Vec::with_capacity(b.range.1 - b.ops_start + 64);
         let mut moved: Vec<(u32, u32)> = Vec::with_capacity(ops.len());
@@ -2655,11 +2659,11 @@ pub(crate) fn finish_body(
     moved: Vec<(u32, u32)>,
     extra: Vec<ValType>,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), String> {
-    let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0);
+    let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0 as u64);
     let n_entries = lr
         .read_var_u32()
         .map_err(|_| "a locals header does not decode")?;
-    let entries_start = lr.original_position();
+    let entries_start = upos(lr.original_position());
     let mut out: Vec<u8> = Vec::with_capacity(code.len() + 32);
     let mut groups: Vec<(u32, ValType)> = Vec::new();
     for t in extra {

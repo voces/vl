@@ -1,6 +1,6 @@
 // A GRADE IS A STATEMENT ABOUT THE COMPILER THE SEED WAS BUILT FROM, NOT ABOUT THE TREE.
 //
-// `build/vl-compiler.wasm` is the compiler's own codegen of itself, so `check-filed-witnesses.py`
+// `build/vl-compiler.wasm` is the compiler's own codegen of itself, so `check-filed-witnesses.vl`
 // and `survey-regrade.py` both grade against whatever source that artifact came from. On
 // 2026-09-06 that produced a confidently reported red: the witness checker was run by hand after
 // a branch switch, WITHOUT `refresh-compiler.sh`, so the row files were from one commit and the
@@ -13,8 +13,8 @@
 // BEHAVIORALLY, never by timestamp". `refresh-compiler.sh` records the FOLD of the sources it
 // compiled and `scripts/seed-provenance.vl` recomputes it — identities, not clocks.
 //
-// The recorder is a VL program now (it was `seed_provenance.py`, which stays only because the
-// two Python graders still import it). The first case drives its `--self-test`, which builds a
+// The recorder is a VL program now (it was `seed_provenance.py`, which stays only because
+// `survey-regrade.py` still imports it). The first case drives its `--self-test`, which builds a
 // specimen per verdict (match / differ / unknown) and sabotages the comparison to prove the
 // specimens would notice. The second pins the VL fold to the Python's, byte for byte, so the two
 // cannot drift while both exist.
@@ -207,11 +207,15 @@ Deno.test("seed provenance: refresh-compiler.sh does not degrade the miss to a n
 Deno.test("seed provenance: the graders consult it", async () => {
   // The guard is worthless if nobody calls it. Assert the wiring rather than trusting it —
   // a helper with a green self-test and no caller is the shape this repo has shipped before.
-  for (const f of ["check-filed-witnesses.py", "survey-regrade.py"]) {
+  const callers: [string, string][] = [
+    ["check-filed-witnesses.vl", "provenance(moved.length)"],
+    ["survey-regrade.py", "seed_provenance.guard("],
+  ];
+  for (const [f, call] of callers) {
     const src = await Deno.readTextFile(`${ROOT}/scripts/${f}`);
-    if (!src.includes("seed_provenance.guard(")) {
+    if (!src.includes(call)) {
       throw new Error(
-        `scripts/${f} does not call seed_provenance.guard() — a grade would be reported ` +
+        `scripts/${f} does not call ${call}) — a grade would be reported ` +
           `without saying which compiler produced it`,
       );
     }
