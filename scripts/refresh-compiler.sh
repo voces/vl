@@ -226,12 +226,7 @@ fi
 # WARM EVERY ENGINE TAG, not just the one this script happened to make: each keeps its own
 # sidecar, and a cold one at the start of a parallel suite has every worker re-JIT the seed
 # (docs/internals/perf-opportunities-2026-09.md §A5, item 3). scripts/warm-seed.sh owns the list.
-# `WARM_FUEL=0` skips the two fuel tags, for a caller whose cost rows warm their own.
-if [ "${WARM_FUEL:-1}" = 0 ]; then
-  VL="$VL" scripts/warm-seed.sh "$OUT"
-else
-  VL="$VL" scripts/warm-seed.sh --fuel "$OUT"
-fi
+VL="$VL" scripts/warm-seed.sh --fuel "$OUT"
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi

@@ -31,7 +31,9 @@ export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 export const binaryen = (tool: string): string => {
   const win = Deno.build.os === "windows";
   const native = Deno.env.get("VL_BINARYEN");
-  if (native && tool !== "wasm-dis") return `${native}/${tool}${win ? ".exe" : ""}`;
+  if (native && tool !== "wasm-dis") {
+    return `${native}/${tool}${win ? ".exe" : ""}`;
+  }
   return `${ROOT}/node_modules/.bin/${tool}${win ? ".cmd" : ""}`;
 };
 
@@ -63,7 +65,11 @@ const lfOutput = (o: Deno.CommandOutput): DisOutput => ({
  * binary. */
 export const wasmDis = async (args: string[]): Promise<DisOutput> =>
   lfOutput(
-    await new Deno.Command(hostWasmDis(), { args, stdout: "piped", stderr: "piped" })
+    await new Deno.Command(hostWasmDis(), {
+      args,
+      stdout: "piped",
+      stderr: "piped",
+    })
       .output(),
   );
 
@@ -93,13 +99,21 @@ export const exists = (p: string): boolean => {
  * still runs. */
 export const pythonBin = (): string => Deno.env.get("PYTHON") ?? "python3";
 
+/** `{ VL_ISA }` when the run pins the seed engine's ISA, else `{}`. */
+export const isaEnv = (): Record<string, string> => {
+  const isa = Deno.env.get("VL_ISA");
+  return isa ? { VL_ISA: isa } : {};
+};
+
 /**
  * The environment a native `vl` spawn takes: `RUST_BACKTRACE` holds a host panic
  * to one line, and `VL_STD` / `VL_COMPILER_WASM` pin both resolutions to THIS
  * tree. `PYTHON` rides along too, because a ratchet script the spawned `vl` (or
  * a wrapping script) shells out to python needs the same pinned interpreter, not
- * whatever `python3` resolves to on PATH. `Deno.Command` merges these over the
- * inherited environment.
+ * whatever `python3` resolves to on PATH. `VL_ISA` (the seed engine's pinned ISA)
+ * rides along when set, so a `clearEnv` spawn reads the sidecar the run warmed
+ * instead of JITing the seed. `Deno.Command` merges these over the inherited
+ * environment.
  *
  * `VL_COMPILER_WASM` changes which seed NO caller reads: `--compiler` wins over
  * the variable in the host's seed ladder, so a spawn that passes the flag is
@@ -115,5 +129,6 @@ export const nativeEnv = (
   VL_STD: STD,
   VL_COMPILER_WASM: COMPILER,
   PYTHON: pythonBin(),
+  ...isaEnv(),
   ...extra,
 });

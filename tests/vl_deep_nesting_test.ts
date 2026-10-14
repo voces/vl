@@ -16,7 +16,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, isaEnv } from "./support/tree.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -94,7 +94,7 @@ const vl = async (args: string[], extra: Record<string, string> = {}) => {
     stdout: "piped",
     stderr: "piped",
     cwd: ROOT,
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, PATH: Deno.env.get("PATH") ?? "", ...extra },
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, PATH: Deno.env.get("PATH") ?? "", ...isaEnv(), ...extra },
     clearEnv: true,
   }).output();
   const dec = new TextDecoder();
@@ -117,9 +117,12 @@ for (const [name, pick] of SHAPES) {
   const WANT = want(ls);
   Deno.test({ name: `deep nesting (native): ${N} levels, ${name}, checks and runs`, ignore: !NATIVE }, async () => {
     await withFile(gen(ls), async (file) => {
-      const chk = await vl(["check", file, "--compiler", COMPILER]);
+      // Two independent processes over one file, run side by side.
+      const [chk, run] = await Promise.all([
+        vl(["check", file, "--compiler", COMPILER]),
+        vl(["run", file, "--compiler", COMPILER]),
+      ]);
       if (chk.code !== 0) throw new Error(`vl check: want rc 0, got ${chk.code}\n${chk.err.slice(0, 600)}`);
-      const run = await vl(["run", file, "--compiler", COMPILER]);
       const got = run.out.trim().split("\n");
       if (run.code !== 0 || JSON.stringify(got) !== JSON.stringify(WANT)) {
         throw new Error(`vl run: want rc 0 and ${WANT}, got rc ${run.code} and ${got}\n${run.err.slice(0, 600)}`);

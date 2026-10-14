@@ -24,7 +24,7 @@
 //
 // @test-timing native
 
-import { ROOT, VL, exists } from "./support/tree.ts";
+import { ROOT, VL, exists, isaEnv } from "./support/tree.ts";
 
 import { collectStdSources, stdHash } from "../scripts/gen-std.ts";
 
@@ -41,7 +41,7 @@ const run = async (
     stdout: "piped",
     stderr: "piped",
     cwd: ROOT,
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", ...env },
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", ...isaEnv(), ...env },
     clearEnv: true,
   }).output();
   const dec = new TextDecoder();
