@@ -6,7 +6,8 @@
 // the end, so a reader loop stops instead of trapping; callers test `failed` once.
 
 // A cursor over `b[pos .. end)`. `imm` is the index immediate of the last decoded call,
-// `return_call` or `ref.func`.
+// `return_call` or `ref.func`, the type of the last `struct.new` or `struct.new_default`,
+// or the target heap type of the last cast, test or `br_on_cast` (-2 for an abstract one).
 export type WasmCursor = {
   b: u8[],
   pos: i32,
@@ -75,6 +76,36 @@ export function wcHeapType(c: WasmCursor): i32 {
   wcSkipLeb(c)
 }
 
+// A heap type, read as `wcHeapType` reads it: its type index, or -2 for an abstract one
+// (an s33 whose last byte carries the sign).
+function wcHeapIdx(c: WasmCursor): i32 {
+  if c.pos < c.end && c.b[c.pos] == 0x62 { c.pos = c.pos + 1 }
+  const at = c.pos
+  wcSkipLeb(c)
+  if c.failed { return -2 }
+  if (c.b[c.pos - 1] & 0x40) != 0 { return -2 }
+  let v = 0
+  let shift = 0
+  let i = at
+  while i < c.pos && shift <= 28 {
+    v = v | ((c.b[i] & 0x7f) << shift)
+    shift = shift + 7
+    i = i + 1
+  }
+  v
+}
+
+// A value type, read as `wcValType` reads it: -1 for i32, i64, f32 or f64, -3 for v128, -2
+// for an abstract reference, else the concrete reference's type index.
+export function wcValIdx(c: WasmCursor): i32 {
+  const b = wcByte(c)
+  if b == 0x63 || b == 0x64 { return wcHeapIdx(c) }
+  if b < 0x68 || b > 0x7f { wcFail(c); return -2 }
+  if b >= 0x7c { return -1 }
+  if b == 0x7b { return -3 }
+  -2
+}
+
 // A value type: a number, vector or abstract reference shorthand, or `ref [null] <heap>`.
 export function wcValType(c: WasmCursor): i32 {
   const b = wcByte(c)
@@ -100,8 +131,8 @@ export function wcMemArg(c: WasmCursor): i32 {
 }
 
 // Decodes one instruction and its immediates. Returns the opcode byte for a one-byte
-// operator and `(prefix << 16) | sub` for a prefixed one; sets `imm` for `call` (0x10),
-// `return_call` (0x12) and `ref.func` (0xd2). An unknown operator fails the cursor.
+// operator and `(prefix << 16) | sub` for a prefixed one; sets `imm` as `WasmCursor` says.
+// An unknown operator fails the cursor.
 export function wcOp(c: WasmCursor): i32 {
   const op = wcByte(c)
   if c.failed { return -1 }
@@ -191,7 +222,11 @@ function wcOpSelectTry(c: WasmCursor, op: i32): i32 {
 function wcOpGc(c: WasmCursor): i32 {
   const sub = wcU32(c)
   const code = (0xfb << 16) | sub
-  if sub <= 1 || sub == 6 || sub == 7 || sub >= 11 && sub <= 14 || sub == 16 {
+  if sub <= 1 {
+    c.imm = wcU32(c)
+    return code
+  }
+  if sub == 6 || sub == 7 || sub >= 11 && sub <= 14 || sub == 16 {
     wcU32(c)
     return code
   }
@@ -201,12 +236,15 @@ function wcOpGc(c: WasmCursor): i32 {
     return code
   }
   if sub == 15 || sub >= 26 && sub <= 30 { return code }
-  if sub >= 20 && sub <= 23 { wcHeapType(c); return code }
+  if sub >= 20 && sub <= 23 {
+    c.imm = wcHeapIdx(c)
+    return code
+  }
   if sub == 24 || sub == 25 {
     wcByte(c)
     wcU32(c)
     wcHeapType(c)
-    wcHeapType(c)
+    c.imm = wcHeapIdx(c)
     return code
   }
   wcFail(c)

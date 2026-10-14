@@ -1,0 +1,213 @@
+// A wasm module's function names: the reader of its `name` custom sections, and the writer
+// that replaces their function-name subsection and keeps every other byte. The `-O` escape
+// step renames functions through it (docs/internals/optimizer-in-vl.md).
+
+import { WasmCursor, wcByte, wcNew, wcU32 } from "./wasm_read"
+
+// Every function-name entry (subsection 1) of every `name` section, in order: the entry's
+// function index and its name, the bytes `[at, at + len)` of the module read. `other` holds
+// every other subsection byte for byte. `ok` is false when the section framing, a `name`
+// section's framing or a name's UTF-8 does not decode.
+export type WasmNames = {
+  ok: boolean,
+  idx: i32[],
+  at: i32[],
+  len: i32[],
+  other: u8[],
+}
+
+export function wnRead(b: u8[]): WasmNames {
+  const w: WasmNames = { ok: false, idx: [], at: [], len: [], other: [] }
+  if b.length < 8 { return w }
+  const c = wcNew(b, 8, b.length)
+  while c.pos < c.end {
+    const id = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { return w }
+    const end = c.pos + size
+    if id == 0 && !readNameSection(w, wcNew(b, c.pos, end)) { return w }
+    c.pos = end
+  }
+  w.ok = true
+  w
+}
+
+// Per function index below `n`, the row of its last entry in `w`, or -1.
+export function wnTable(w: WasmNames, n: i32): i32[] {
+  const t: i32[] = []
+  while t.length < n { t.push(-1) }
+  let r = 0
+  while r < w.idx.length {
+    const f = w.idx[r]
+    if f >= 0 && f < n { t[f] = r }
+    r = r + 1
+  }
+  t
+}
+
+// `b`, read as `w`, with every `name` section removed and one written at the end: `w`'s
+// module-name subsection, a function-name subsection of the `count` encoded `entries` (built
+// with `wnEntry`), then `w`'s other subsections. No `name` section when all three are
+// empty. Every section is re-framed with a minimal length.
+export function wnWrite(
+  b: u8[],
+  w: WasmNames,
+  count: i32,
+  entries: u8[],
+): u8[] {
+  const out: u8[] = []
+  copyBytes(out, b, 0, 8)
+  const c = wcNew(b, 8, b.length)
+  while c.pos < c.end {
+    const id = wcByte(c)
+    const size = wcU32(c)
+    const end = c.pos + size
+    if id != 0 || !isNameSection(wcNew(b, c.pos, end)) {
+      out.push(id)
+      wnPutLeb(out, size)
+      copyBytes(out, b, c.pos, size)
+    }
+    c.pos = end
+  }
+  let split = 0
+  if w.other.length > 0 && w.other[0] == 0 {
+    const m = wcNew(w.other, 1, w.other.length)
+    const l = wcU32(m)
+    split = m.pos + l
+  }
+  const section: u8[] = [4, 0x6e, 0x61, 0x6d, 0x65]
+  copyBytes(section, w.other, 0, split)
+  if count > 0 {
+    const sub: u8[] = []
+    wnPutLeb(sub, count)
+    copyBytes(sub, entries, 0, entries.length)
+    section.push(1)
+    wnPutLeb(section, sub.length)
+    copyBytes(section, sub, 0, sub.length)
+  }
+  copyBytes(section, w.other, split, w.other.length - split)
+  if section.length > 5 {
+    out.push(0)
+    wnPutLeb(out, section.length)
+    copyBytes(out, section, 0, section.length)
+  }
+  out
+}
+
+// Appends one function-name entry: the index `f`, then the name `src[at, at + len)`.
+export function wnEntry(out: u8[], f: i32, src: u8[], at: i32, len: i32) {
+  wnPutLeb(out, f)
+  wnPutLeb(out, len)
+  copyBytes(out, src, at, len)
+}
+
+// Appends a non-negative `v` as a minimal unsigned LEB128.
+export function wnPutLeb(out: u8[], v: i32) {
+  let x = v
+  while x >= 0x80 {
+    out.push((x & 0x7f) | 0x80)
+    x = x >> 7
+  }
+  out.push(x)
+}
+
+function copyBytes(out: u8[], src: u8[], at: i32, len: i32) {
+  let i = 0
+  while i < len {
+    out.push(src[at + i])
+    i = i + 1
+  }
+}
+
+// Whether the custom section at the cursor is named `name`.
+function isNameSection(c: WasmCursor): boolean {
+  const nlen = wcU32(c)
+  if c.failed || nlen != 4 || nlen > c.end - c.pos { return false }
+  isName(c.b, c.pos)
+}
+
+// Whether the four bytes at `at` spell `name`.
+function isName(b: u8[], at: i32): boolean {
+  b[at] == 0x6e && b[at + 1] == 0x61 && b[at + 2] == 0x6d && b[at + 3] == 0x65
+}
+
+// A custom section's subsections when it is a `name` section. False when its own name or a
+// subsection does not decode.
+function readNameSection(w: WasmNames, c: WasmCursor): boolean {
+  const nlen = wcU32(c)
+  if c.failed || nlen < 0 || nlen > c.end - c.pos { return false }
+  if nlen != 4 || !isName(c.b, c.pos) { return true }
+  c.pos = c.pos + 4
+  while c.pos < c.end {
+    const at = c.pos
+    const sub = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { return false }
+    const end = c.pos + size
+    if sub == 1 {
+      if !readFunctionNames(w, wcNew(c.b, c.pos, end)) { return false }
+    } else {
+      copyBytes(w.other, c.b, at, end - at)
+    }
+    c.pos = end
+  }
+  true
+}
+
+function readFunctionNames(w: WasmNames, c: WasmCursor): boolean {
+  const n = wcU32(c)
+  let i = 0
+  while i < n {
+    const f = wcU32(c)
+    const len = wcU32(c)
+    if c.failed || len < 0 || len > c.end - c.pos { return false }
+    if !utf8Valid(c.b, c.pos, len) { return false }
+    w.idx.push(f)
+    w.at.push(c.pos)
+    w.len.push(len)
+    c.pos = c.pos + len
+    i = i + 1
+  }
+  !c.failed
+}
+
+// Whether `b[at, at + len)` is well-formed UTF-8: no overlong form, surrogate or code point
+// past U+10FFFF.
+function utf8Valid(b: u8[], at: i32, len: i32): boolean {
+  let i = at
+  const end = at + len
+  while i < end {
+    const x: i32 = b[i]
+    let need = 0
+    let lo = 0x80
+    let hi = 0xbf
+    if x < 0x80 {
+      need = 0
+    } else if x >= 0xc2 && x <= 0xdf {
+      need = 1
+    } else if x >= 0xe0 && x <= 0xef {
+      need = 2
+      if x == 0xe0 { lo = 0xa0 }
+      if x == 0xed { hi = 0x9f }
+    } else if x >= 0xf0 && x <= 0xf4 {
+      need = 3
+      if x == 0xf0 { lo = 0x90 }
+      if x == 0xf4 { hi = 0x8f }
+    } else {
+      return false
+    }
+    if need > end - i - 1 { return false }
+    let k = 1
+    while k <= need {
+      const y: i32 = b[i + k]
+      if k == 1 {
+        if y < lo || y > hi { return false }
+      } else if y < 0x80 || y > 0xbf {
+        return false
+      }
+      k = k + 1
+    }
+    i = i + need + 1
+  }
+  true
+}
