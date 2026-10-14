@@ -6,7 +6,7 @@ other instrument here samples a population somebody already named:
 
 | instrument | population |
 | --- | --- |
-| `scripts/capability-probes/run.py` | one hand-written program per ALREADY-KNOWN gap |
+| `scripts/capability-probes.vl` | one hand-written program per ALREADY-KNOWN gap |
 | `scripts/silent-sweep/distilled/` | generated over TWELVE FIXED census axes |
 | `scripts/capability-matrix.vl` | one template, expanded over delivery positions |
 
@@ -213,8 +213,8 @@ it pins the fix instead of depending on the bug.
 
 Three of them earn their place beyond liveness. `synthetic/trap` is the only control that
 exercises the extra `vl build` this script runs to tell a PROGRAM trap from a COMPILER trap,
-which is the one piece of grading it adds to `capability-probes/run.py`'s. `synthetic/wrong`
-is the only one that would fail if the output contract went back to `run.py`'s SUBSTRING
+which is the one piece of grading it adds to `capability-probes.vl`'s. `synthetic/wrong`
+is the only one that would fail if the output contract went back to `capability-probes.vl`'s SUBSTRING
 test, which passes `"2"` against a printed `"12"`. `synthetic/modules-check` is the only one
 that says outright that the multi-file WRITER delivered two files: the three module agree
 pins would also fail if the imported section were dropped — their import would not resolve —
@@ -735,7 +735,7 @@ feature grid, which these five show composes.
 `tests/vl_day_one_sampler_test.ts`: a fixed-seed 40-program sample plus the eleven controls,
 **350 ms**, reached by `gate.sh`'s ci-native row and by CI's `tests/vl_*_test.ts` glob. It
 asserts four things, none of which is a hit count — the grade vocabulary (so `sample.py`
-and `capability-probes/run.py` cannot drift), that every axis the grammar declares was
+and `capability-probes.vl` cannot drift), that every axis the grammar declares was
 varied at least once, that every control speaks, and that at least three of them are
 SYNTHETIC disagreements. **A hit count moves every time a defect closes** — this sample's
 did, twice, within two days — and so does a control built on a live defect. Those four

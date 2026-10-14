@@ -43,23 +43,31 @@ type Ran = { code: number; out: string; err: string; trace: string[] };
 
 const PREFIX = "vl: compile cache ";
 
+/** Run `vl` with the cache on; an `extra` value of `null` removes that variable from the
+ * inherited environment rather than setting it (an empty `$VL_WASM_OPT` is a path, not unset). */
 const vl = async (
   args: string[],
   cwd: string,
-  extra: Record<string, string> = {},
+  extra: Record<string, string | null> = {},
 ): Promise<Ran> => {
+  const unset = Object.keys(extra).filter((k) => extra[k] === null);
+  const set = Object.fromEntries(Object.entries(extra).filter(([, v]) => v !== null)) as Record<string, string>;
+  const env = nativeEnv({
+    VL_CACHE_DIR: `${cwd}/../cache`,
+    VL_COMPILE_CACHE: "1",
+    VL_COMPILE_CACHE_TRACE: "1",
+    NO_COLOR: "1",
+    ...set,
+  });
+  const inherited = Deno.env.toObject();
+  for (const k of unset) delete inherited[k];
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
     cwd,
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({
-      VL_CACHE_DIR: `${cwd}/../cache`,
-      VL_COMPILE_CACHE: "1",
-      VL_COMPILE_CACHE_TRACE: "1",
-      NO_COLOR: "1",
-      ...extra,
-    }),
+    clearEnv: unset.length > 0,
+    env: unset.length > 0 ? { ...inherited, ...env } : env,
   }).output();
   const err = new TextDecoder().decode(stderr);
   return {
@@ -384,18 +392,30 @@ testOpt("-O3: each chain input misses; -o without --source-map does not", async 
     };
     await wrap("");
     /** Warm `args`, then run `next`; answer the chain's trace lines and the exit code. */
-    const after = async (args: string[], next: string[], env: Record<string, string> = {}, base = {}) => {
+    const after = async (
+      args: string[],
+      next: string[],
+      env: Record<string, string | null> = {},
+      base: Record<string, string | null> = {},
+    ) => {
       await vl(args, p, base);
       expect(optTrace((await vl(args, p, base)).trace), ["-O hit"], `warm (${args.join(" ")})`);
       const r = await vl(next, p, { ...base, ...env });
       return { code: r.code, t: optTrace(r.trace) };
     };
-    const missRows: [string, string[], string[], Record<string, string>, Record<string, string>?][] = [
+    // The PATH rows exercise the PATH scan, which `$VL_WASM_OPT` overrides when it is set, so
+    // they remove it from the inherited environment.
+    const missRows: [string, string[], string[], Record<string, string | null>][] = [
       ["the rung (-O3 → -O)", OPT, ["build", "main.vl", "-O", "-o", "o.wasm"], {}],
       ["a keyed VL_OPT variable", OPT, OPT, { VL_OPT_NO_MULTIVALUE: "1" }],
       ["a BINARYEN_* variable", OPT, OPT, { BINARYEN_CORES: "3" }],
       ["a wasm-opt wrapper as $VL_WASM_OPT", OPT, OPT, { VL_WASM_OPT: wrapper }],
-      ["a wasm-opt wrapper first on PATH", OPT, OPT, { PATH: `${bin}:${Deno.env.get("PATH") ?? ""}` }],
+      [
+        "a wasm-opt wrapper first on PATH",
+        OPT,
+        OPT,
+        { PATH: `${bin}:${Deno.env.get("PATH") ?? ""}`, VL_WASM_OPT: null },
+      ],
       [
         "-o under --source-map",
         [...OPT, "--source-map"],
@@ -413,7 +433,7 @@ testOpt("-O3: each chain input misses; -o without --source-map does not", async 
     await wrap(": swapped\n");
     expect(optTrace((await vl(OPT, p, viaWrapper)).trace)[0], "-O miss", "the wrapper's bytes changed");
     // No wasm-opt at all: never served, so the build still refuses.
-    const gone = await after(OPT, OPT, { PATH: `${tmp}/empty` });
+    const gone = await after(OPT, OPT, { PATH: `${tmp}/empty`, VL_WASM_OPT: null });
     expect([gone.code !== 0, gone.t], [true, ["-O miss"]], "wasm-opt missing");
     // Control: -o is not an input of the chain unless a source map names it.
     const o = await after(OPT, ["build", "main.vl", "-O3", "-o", "o3.wasm"]);

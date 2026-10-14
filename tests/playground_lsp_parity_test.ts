@@ -53,7 +53,9 @@ const here = new URL(".", import.meta.url);
 const read = (rel: string): string =>
   Deno.readTextFileSync(new URL(rel, here));
 
-const serverSrc = read("../lsp/src/server.ts");
+// The LSP side is the transport (`server.ts`) plus the features it calls
+// (`features.ts`), where the helpers `subBehaviours` names are composed.
+const serverSrc = read("../lsp/src/server.ts") + read("../lsp/src/features.ts");
 const adapterSrc = read("../playground/src/lspAdapter.ts");
 const mainSrc = read("../playground/src/main.ts");
 

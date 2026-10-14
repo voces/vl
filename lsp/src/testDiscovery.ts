@@ -46,6 +46,7 @@
 
 import type { LspRange } from "./typeFeatures.ts";
 import { tokenize } from "./vlLex.ts";
+import { columnMap } from "./utf16Columns.ts";
 
 // ---- the discovered tree -----------------------------------------------------
 
@@ -418,7 +419,7 @@ export interface FailureAnchor {
   isTarget: boolean;
   /** 0-based line — `std:test` counts from 1, editors from 0. */
   line: number;
-  /** 0-based column. */
+  /** 0-based UTF-16 column, the unit the editor counts in. */
   col: number;
 }
 
@@ -437,21 +438,27 @@ export interface FailureAnchor {
  *
  * `resolve` is INJECTED — `path.resolve` from the caller — because joining and
  * absoluteness are platform questions (a Windows drive letter, a backslash) and
- * this module deliberately imports nothing: it is loaded by Deno tests under the
+ * this module imports no platform module: it is loaded by Deno tests under the
  * root config, where a `node:` builtin does not type-check.
+ *
+ * `std:test` reports its column in UTF-8 BYTES (D4525), so `read` supplies the
+ * resolved file's text to convert it to UTF-16. A file that cannot be read keeps
+ * the byte column, which is off by the line's non-ASCII excess and nothing more.
  */
 export const failureAnchor = (
   loc: FailureLocation,
   cwd: string,
   target: string,
   resolve: (base: string, rel: string) => string,
+  read: (file: string) => string | undefined = () => undefined,
 ): FailureAnchor => {
   const file = resolve(cwd, loc.file);
+  const line = Math.max(0, loc.line - 1);
   return {
     file,
     isTarget: file === resolve(cwd, target),
-    line: Math.max(0, loc.line - 1),
-    col: Math.max(0, loc.col - 1),
+    line,
+    col: columnMap(read(file)).toUtf16(line, Math.max(0, loc.col - 1)),
   };
 };
 
