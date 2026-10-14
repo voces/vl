@@ -112,7 +112,7 @@ jobs:
   #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
   #          ├── ci-release-shape (4) the binaryen-backed suites, split by weight
-  #          └── ci-cost (4)          fuel/RSS cost ratchets — master pushes and nightly only
+  #          └── fuel-sidecars ── ci-cost (4)   fuel/RSS cost ratchets — master pushes and nightly only
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
   # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
@@ -307,6 +307,8 @@ jobs:
           deno test -A --no-check --parallel $files
         env:
           SELFHOST_NATIVE_ALIGN: "1"
+          # A SELF_SHARDED file (ci-shard.sh) runs in every shard and asserts only this share.
+          VL_CI_SHARD: ${{ matrix.shard }}/5
 
   # ---------------------------------------------------------------------------
   # checks — everything on the proven seed that is not a native suite: the ratchets, the
@@ -615,9 +617,49 @@ jobs:
   # still runs both on every local gate. Split four ways so the slowest part, not their sum,
   # follows `seed`: plumb-shape alone, and the scaling-shape file in thirds
   # (`$VL_SCALING_SHARD`), each pair still graded whole inside one job.
+  #
+  # `fuel-sidecars` warms the two fuel sidecars ONCE and saves them under `vl-fuel-<seed key>`;
+  # every `ci-cost` part restores them. Each part warming its own was four whole-seed JITs of
+  # the same bytes in parallel, the larger part of every part's runtime.
   # ---------------------------------------------------------------------------
-  ci-cost:
+  fuel-sidecars:
     needs: seed
+    if: github.event_name != 'pull_request' && needs.seed.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      # The writer of the key `ci-cost` restores; `ci-native`'s fuel shard shares it.
+      - name: Cache the fuel sidecars
+        uses: actions/cache@v5
+        with:
+          path: build/fuel-sidecars
+          key: vl-fuel-${{ needs.seed.outputs.seed_key }}
+
+      - name: Warm the fuel sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh --fuel --stash build/fuel-sidecars
+
+  ci-cost:
+    needs: [seed, fuel-sidecars]
     if: github.event_name != 'pull_request' && needs.seed.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -656,16 +698,16 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
-      # Shares `ci-native`'s fuel-sidecar cache: a restore turns the two fuel JITs into links.
-      - name: Cache the fuel sidecars
-        uses: actions/cache@v5
+      # Restore-only: `fuel-sidecars` wrote this key, so the two fuel JITs become links. Not
+      # `fail-on-cache-miss`: a sidecar is a cache, so a miss costs the warm below, never a grade.
+      - name: Restore the fuel sidecars
+        uses: actions/cache/restore@v5
         with:
           path: build/fuel-sidecars
           key: vl-fuel-${{ needs.seed.outputs.seed_key }}
 
-      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
-      # stays as the net for a runner that refuses the pinned level, where every test worker
-      # would otherwise JIT the seed at once.
+      # Near-instant after the restore above; it re-warms only what the restore missed, and is
+      # the net for a runner that refuses the pinned `$VL_ISA` level.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
