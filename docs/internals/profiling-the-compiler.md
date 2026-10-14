@@ -442,6 +442,43 @@ function above noise), and a chain of inferred returns declared callee-last is l
 (40.6M / 80.8M / 167.6M at 100 / 200 / 400), so it is not `computeRetInference`'s fixpoint
 rounds either. The mechanism is open.
 
+## Measured 2026-10-14 — `generic pins` at its bar, and a fuel unit that moved under it (D4607)
+
+wasmtime 47.0.2 → 49.0.2 (#3721) changed what a unit of fuel is: 49 charges `array.new_default`
+and `array.copy` 1 per element where 47's inline loops cost ~3–4, and it counts `call_ref`
+callees, which 47 dropped. Same seed (master `56e06d91c`'s proven seed), same programs, each
+reading identical on every run (three runs at 400 pins on each host):
+
+| pins | many, 47 | many, 49 | Δ | one, 47 | one, 49 | Δ | ratio 47 | ratio 49 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 0.883G | 0.869G | −1.65% | 0.605G | 0.595G | −1.72% | 1.460 | 1.461 |
+| 200 | 2.215G | 2.186G | −1.32% | 1.216G | 1.195G | −1.70% | 1.821 | 1.828 |
+| 400 | 6.329G | 6.269G | −0.94% | 2.538G | 2.497G | −1.62% | **2.494** | **2.511** |
+| 800 | 19.938G | 19.815G | −0.61% | 5.156G | 5.074G | −1.59% | 3.867 | 3.906 |
+
+The one arm is linear and saves a flat ~1.6% at every size. The many arm saves less as it
+grows, because its growing part is a scalar loop of `__str_eq__` with no bulk array op and no
+`call_ref` in it, whose fuel 49 does not change. So the shift is accounting, and the pair
+moved from 0.25% under its 2.5 bar to 0.4% over without the compiler changing. The bar
+becomes 2.52: 2.5 in 47's units is 2.5 × 2.511 / 2.494 = 2.517 in 49's.
+
+**The pair was already at the bar on 47, and that is D4607, not the engine.** It read ≤ 2.0
+when the axes moved to fuel (#3226, whose rule left it at the default). A guest profile of the
+many arm at 800 pins on 47 (`--names` seed, 6,504 samples) has `monoMakeInstanceGo` at 72.7%
+inclusive, of which `monoDeclIsAssigned` (a whole-arena scan for `x = …` by name) is 55.2% and
+`monoTopFrameOf` 11.4%, with `__str_eq__` 45.8% self under them; at 400 pins the scan is 40.5%.
+Both are reached from one line: `const written = monoNameWrittenAt(cal3.identName, calleeIx)`,
+which #3449 (D3857) hoisted out of the `cal3.identName != fn.fnName &&` short-circuit, so it
+now runs for every first instance, including the direct call by the generic's own name where
+its answer is unused; #3622 made each scan heavier (a declaration identity per hit, a frame
+walk per read). `monoRebuild`, which the axis's failure note used to name, is 2.6% inclusive
+(`collectA` 1.8%, `buildFnMap` 0.3%): the 2026-09-05 passes above still hold.
+
+Every other axis moved under 1% between the engines except `generic chain depth` (16.41 →
+16.76 against 22.2) and the three controls. None is within 5% of its bar; the nearest are
+`covariant record deliveries to a recursive callee` at 82.6% and `arithmetic operator chain
+length` at 82.0%.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.

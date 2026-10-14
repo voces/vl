@@ -759,7 +759,7 @@ For any doc whose rows are `### <ID> — <title>` + a `**<status>**` line + a `R
 that is one command:
 
 ```sh
-python3 scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2
+vl run scripts/check-filed-witnesses.vl -- --strict docs/internals/inventory docs/internals/inventory-2
 ```
 
 **THERE ARE TWO INVENTORIES AND THE COMMAND TAKES SEVERAL.** `inventory-2/` holds the
@@ -770,11 +770,9 @@ gap looks like: a row does not announce that nobody has re-run it.
 
 **The inventory is ONE FILE PER ROW** (`docs/internals/inventory/D1042.md`), because every
 defect PR appended to one file's tail and two concurrent PRs conflicted there nearly every
-hour. The command above takes either form — a directory of `D*.md`, or the monolith — so it
-is the same before and after the split lands. `scripts/inventory/ls.py --status open` is the
-queue, `TEMPLATE.md` is what a new row starts from, and `scripts/inventory/split.py --apply
---relink` is what performs the split, idempotently and only when its five losslessness
-checks pass.
+hour. The command above takes either form — a directory of `D*.md`, or the monolith.
+`vl run scripts/inventory/ls.vl -- --status open` is the queue, `--next` the next free id
+(skipping `RESERVED.md`), and `TEMPLATE.md` is what a new row starts from.
 
 It runs each row's OWN filed program — never a paraphrase, which is a different program —
 and prints which rows no longer behave as filed; non-zero exit means at least one moved.

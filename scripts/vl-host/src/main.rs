@@ -46,6 +46,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
+/// A wasmparser offset as an index into the module bytes this host holds. wasmparser reports
+/// offsets as `u64`; every one it hands back lies inside such a slice, so it fits a `usize`.
+pub(crate) fn upos(p: u64) -> usize {
+    p as usize
+}
+
+/// `upos` over a range: a body's or section's span in the module bytes.
+pub(crate) fn urange(r: std::ops::Range<u64>) -> std::ops::Range<usize> {
+    upos(r.start)..upos(r.end)
+}
+
 /// The opt-in whole-compile file cache (`VL_COMPILE_CACHE=1`; incremental-compilation-design.md S1).
 mod compile_cache;
 /// The inline-record step's second slice: flattened lists of small records (D3681, S2).
@@ -255,7 +266,14 @@ fn value_flags(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "run" => &["-e", "--compiler", "--out-dir", "--extern"],
         "build" => &["-o", "--compiler"],
-        "check" => &["--compiler", "--severity", "--exclude"],
+        "check" => &[
+            "--compiler",
+            "--severity",
+            "--exclude",
+            "--budget",
+            "--budget-why",
+            "--findings",
+        ],
         "fmt" => &["--compiler"],
         "test" => &["--compiler", "-t", "--jobs", "--exclude", "--extern"],
         "seed" => &["--out", "--compiler"],
@@ -4224,6 +4242,50 @@ fn run_program_with(
 // by `python` or `node`. There is no preopen set, no path allowlist and no chroot. If
 // VL ever grows a capability model, this is the layer it lands in.
 
+/// The WASI preview1 errnos this host can answer, and the only place it states their
+/// numbers: every handler below names one of these, never a literal.
+/// `tests/vl_errno_agreement_test.ts` holds this block, `std/fs.vl` and the WASI
+/// numbering in agreement, so a code added here or there without the other fails there.
+mod wasi {
+    pub const EACCES: i32 = 2;
+    pub const EAGAIN: i32 = 6;
+    pub const EBADF: i32 = 8;
+    pub const EBUSY: i32 = 10;
+    pub const EDQUOT: i32 = 19;
+    pub const EEXIST: i32 = 20;
+    pub const EFAULT: i32 = 21;
+    pub const EFBIG: i32 = 22;
+    pub const EILSEQ: i32 = 25;
+    pub const EINTR: i32 = 27;
+    pub const EINVAL: i32 = 28;
+    pub const EIO: i32 = 29;
+    pub const EISDIR: i32 = 31;
+    pub const ELOOP: i32 = 32;
+    pub const EMFILE: i32 = 33;
+    pub const EMLINK: i32 = 34;
+    pub const ENAMETOOLONG: i32 = 37;
+    pub const ENFILE: i32 = 41;
+    pub const ENOENT: i32 = 44;
+    pub const ENOMEM: i32 = 48;
+    pub const ENOSPC: i32 = 51;
+    pub const ENOSYS: i32 = 52;
+    pub const ENOTDIR: i32 = 54;
+    pub const ENOTEMPTY: i32 = 55;
+    pub const ENOTSUP: i32 = 58;
+    pub const EROFS: i32 = 69;
+    pub const ESPIPE: i32 = 70;
+    pub const EXDEV: i32 = 75;
+}
+
+/// `wasi_errno` for a failed open of `p`. Windows answers "access denied" for a directory
+/// opened as a file, where Linux answers EISDIR; asked only after the open has failed.
+fn wasi_errno_at(e: &std::io::Error, p: &std::path::Path) -> i32 {
+    if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied && p.is_dir() {
+        return wasi::EISDIR;
+    }
+    wasi_errno(e)
+}
+
 /// WASI preview1 errno for a `std::io::Error`.
 ///
 /// **The numbering is WASI's, not the host platform's**, and the two disagree on almost
@@ -4235,51 +4297,43 @@ fn run_program_with(
 /// `ErrorKind` FIRST, raw errno second. The kind is portable and stable, so the common
 /// filesystem outcomes map identically on every OS; the raw table below it is Linux
 /// numbering and only catches what no kind names. Anything unrecognized becomes `EIO`
-/// (29) rather than passing through as a number `std:fs` cannot interpret — an
+/// rather than passing through as a number `std:fs` cannot interpret — an
 /// unmatchable code reaches the caller as an error that looks like none of them.
-/// `wasi_errno` for a failed open of `p`. Windows answers "access denied" for a directory
-/// opened as a file, where Linux answers EISDIR; asked only after the open has failed.
-fn wasi_errno_at(e: &std::io::Error, p: &std::path::Path) -> i32 {
-    if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied && p.is_dir() {
-        return 31; // EISDIR
-    }
-    wasi_errno(e)
-}
-
 fn wasi_errno(e: &std::io::Error) -> i32 {
     use std::io::ErrorKind;
     match e.kind() {
-        ErrorKind::NotFound => return 44,           // ENOENT
-        ErrorKind::PermissionDenied => return 2,    // EACCES
-        ErrorKind::AlreadyExists => return 20,      // EEXIST
-        ErrorKind::IsADirectory => return 31,       // EISDIR
-        ErrorKind::NotADirectory => return 54,      // ENOTDIR
-        ErrorKind::DirectoryNotEmpty => return 55,  // ENOTEMPTY
-        ErrorKind::ReadOnlyFilesystem => return 69, // EROFS
-        ErrorKind::StorageFull => return 51,        // ENOSPC
-        ErrorKind::QuotaExceeded => return 19,      // EDQUOT
-        ErrorKind::FileTooLarge => return 22,       // EFBIG
-        ErrorKind::TooManyLinks => return 34,       // EMLINK
-        ErrorKind::InvalidFilename => return 37,    // ENAMETOOLONG
-        ErrorKind::CrossesDevices => return 75,     // EXDEV
-        ErrorKind::ResourceBusy | ErrorKind::ExecutableFileBusy => return 10, // EBUSY
-        ErrorKind::OutOfMemory => return 48,        // ENOMEM
-        ErrorKind::Interrupted => return 27,        // EINTR
-        ErrorKind::WouldBlock => return 6,          // EAGAIN
-        ErrorKind::Unsupported => return 58,        // ENOTSUP
-        ErrorKind::InvalidInput | ErrorKind::InvalidData => return 28, // EINVAL
+        ErrorKind::NotFound => return wasi::ENOENT,
+        ErrorKind::PermissionDenied => return wasi::EACCES,
+        ErrorKind::AlreadyExists => return wasi::EEXIST,
+        ErrorKind::IsADirectory => return wasi::EISDIR,
+        ErrorKind::NotADirectory => return wasi::ENOTDIR,
+        ErrorKind::DirectoryNotEmpty => return wasi::ENOTEMPTY,
+        ErrorKind::ReadOnlyFilesystem => return wasi::EROFS,
+        ErrorKind::StorageFull => return wasi::ENOSPC,
+        ErrorKind::QuotaExceeded => return wasi::EDQUOT,
+        ErrorKind::FileTooLarge => return wasi::EFBIG,
+        ErrorKind::TooManyLinks => return wasi::EMLINK,
+        ErrorKind::InvalidFilename => return wasi::ENAMETOOLONG,
+        ErrorKind::CrossesDevices => return wasi::EXDEV,
+        ErrorKind::ResourceBusy | ErrorKind::ExecutableFileBusy => return wasi::EBUSY,
+        ErrorKind::OutOfMemory => return wasi::ENOMEM,
+        ErrorKind::Interrupted => return wasi::EINTR,
+        ErrorKind::WouldBlock => return wasi::EAGAIN,
+        ErrorKind::Unsupported => return wasi::ENOTSUP,
+        ErrorKind::InvalidInput | ErrorKind::InvalidData => return wasi::EINVAL,
         _ => {}
     }
+    // The keys are Linux's own numbers; the answers are WASI's.
     match e.raw_os_error() {
-        Some(9) => 8,   // EBADF
-        Some(14) => 21, // EFAULT
-        Some(23) => 41, // ENFILE
-        Some(24) => 33, // EMFILE
-        Some(29) => 70, // ESPIPE
-        Some(38) => 52, // ENOSYS
-        Some(40) => 32, // ELOOP
-        Some(84) => 25, // EILSEQ
-        _ => 29,        // EIO — the honest "something went wrong" of the set
+        Some(9) => wasi::EBADF,
+        Some(14) => wasi::EFAULT,
+        Some(23) => wasi::ENFILE,
+        Some(24) => wasi::EMFILE,
+        Some(29) => wasi::ESPIPE,
+        Some(38) => wasi::ENOSYS,
+        Some(40) => wasi::ELOOP,
+        Some(84) => wasi::EILSEQ,
+        _ => wasi::EIO, // the honest "something went wrong" of the set
     }
 }
 
@@ -4428,7 +4482,7 @@ fn os_path(bytes: &[u8]) -> Result<std::path::PathBuf, i32> {
 fn os_path(bytes: &[u8]) -> Result<std::path::PathBuf, i32> {
     match std::str::from_utf8(bytes) {
         Ok(s) => Ok(std::path::PathBuf::from(s)),
-        Err(_) => Err(25), // EILSEQ
+        Err(_) => Err(wasi::EILSEQ),
     }
 }
 
@@ -4457,7 +4511,7 @@ fn os_string(bytes: &[u8]) -> Result<std::ffi::OsString, i32> {
 fn os_string(bytes: &[u8]) -> Result<std::ffi::OsString, i32> {
     match std::str::from_utf8(bytes) {
         Ok(s) => Ok(std::ffi::OsString::from(s)),
-        Err(_) => Err(25), // EILSEQ
+        Err(_) => Err(wasi::EILSEQ),
     }
 }
 
@@ -4498,25 +4552,25 @@ fn child_code(status: std::process::ExitStatus) -> i32 {
 fn fs_write_mode(p: &std::path::Path, off: i64, data: &[u8], mode: i32) -> i32 {
     use std::io::{Seek, SeekFrom, Write};
     if off < 0 {
-        return 28; // EINVAL
+        return wasi::EINVAL;
     }
     let mut o = std::fs::OpenOptions::new();
     match mode {
         0 => o.write(true).create(true).truncate(true),
         1 => o.write(true).create(off == 0),
         2 => o.append(true).create(true),
-        _ => return 28, // EINVAL
+        _ => return wasi::EINVAL,
     };
     let mut f = match o.open(p) {
         Ok(f) => f,
         Err(err) if mode == 1 && off > 0 && err.kind() == std::io::ErrorKind::NotFound => {
-            return 28; // EINVAL — past the end of a file that has no bytes
+            return wasi::EINVAL; // past the end of a file that has no bytes
         }
         Err(err) => return wasi_errno_at(&err, p),
     };
     if mode == 1 {
         match f.metadata() {
-            Ok(m) if (off as u64) > m.len() => return 28, // EINVAL
+            Ok(m) if (off as u64) > m.len() => return wasi::EINVAL,
             Ok(_) => {}
             Err(err) => return wasi_errno(&err),
         }
@@ -4634,14 +4688,14 @@ fn register_fs_imports(
                 }
             };
             let code = match std::fs::metadata(&p) {
-                Ok(m) if m.is_dir() => 31, // EISDIR
+                Ok(m) if m.is_dir() => wasi::EISDIR,
                 Ok(m) => match i64::try_from(m.len()) {
                     Ok(n) => {
                         *e.lock().unwrap() = 0;
                         results[0] = Val::I64(n);
                         return Ok(());
                     }
-                    Err(_) => 22, // EFBIG
+                    Err(_) => wasi::EFBIG,
                 },
                 Err(err) => wasi_errno(&err),
             };
@@ -4743,7 +4797,7 @@ fn register_fs_imports(
                     bail!("fs intrinsic: __fs_write_from__ expected an i32 mode");
                 };
                 let code = if addr < 0 || len < 0 {
-                    28 // EINVAL
+                    wasi::EINVAL
                 } else {
                     match os_path(&path) {
                         Err(bad) => bad,
@@ -4760,7 +4814,7 @@ fn register_fs_imports(
                             };
                             let (a, n) = (addr as usize, len as usize);
                             match mem.data(&c).get(a..).and_then(|t| t.get(..n)) {
-                                None => 21, // EFAULT
+                                None => wasi::EFAULT,
                                 Some(src) => fs_write_mode(&p, off, src, mode),
                             }
                         }
@@ -4855,7 +4909,7 @@ fn register_fs_imports(
                 let mut out: Vec<u8> = Vec::new();
                 let mut code = 0i32;
                 if off < 0 || len < 0 {
-                    code = 28; // EINVAL
+                    code = wasi::EINVAL;
                 } else {
                     match os_path(&path) {
                         Err(bad) => code = bad,
@@ -4920,7 +4974,7 @@ fn register_fs_imports(
                 let mut code = 0i32;
                 let mut wrote = 0i32;
                 if off < 0 || addr < 0 || cap < 0 {
-                    code = 28; // EINVAL
+                    code = wasi::EINVAL;
                 } else {
                     // OPENED EVEN FOR A ZERO-BYTE WINDOW, so a missing file is `ENOENT`
                     // here exactly as it is for `__fs_read_range__` with length 0. A
@@ -4949,7 +5003,7 @@ fn register_fs_imports(
                                     let n = cap as usize;
                                     let data = mem.data_mut(&mut c);
                                     match data.get_mut(a..).and_then(|tail| tail.get_mut(..n)) {
-                                        None => code = 21, // EFAULT
+                                        None => code = wasi::EFAULT,
                                         Some(dst) => {
                                             let mut filled = 0usize;
                                             while filled < n {
@@ -5018,7 +5072,7 @@ fn register_fs_imports(
                                     }
                                     match os_str_bytes(&name) {
                                         None => {
-                                            code = 25; // EILSEQ
+                                            code = wasi::EILSEQ;
                                             break;
                                         }
                                         Some(b) => {
@@ -5070,7 +5124,7 @@ fn register_fs_imports(
                         b
                     }
                     None => {
-                        *e.lock().unwrap() = 28; // EINVAL
+                        *e.lock().unwrap() = wasi::EINVAL;
                         Vec::new()
                     }
                 };
@@ -5101,7 +5155,7 @@ fn register_fs_imports(
                 let mut code = 0i32;
                 let mut rc = 0i32;
                 if parts.is_empty() || parts[0].is_empty() {
-                    code = 28; // EINVAL — the block names no command
+                    code = wasi::EINVAL; // the block names no command
                 } else {
                     let prog = parts.remove(0);
                     match os_string(&prog) {
@@ -5174,14 +5228,14 @@ fn register_fs_imports(
             let mut out: Vec<u8> = Vec::new();
             let mut code = 0i32;
             if name.is_empty() || name.contains(&0) || name.contains(&b'=') {
-                code = 28; // EINVAL
+                code = wasi::EINVAL;
             } else {
                 match os_string(&name) {
                     Err(bad) => code = bad,
                     Ok(n) => match std::env::var_os(&n) {
-                        None => code = 44, // ENOENT
+                        None => code = wasi::ENOENT,
                         Some(v) => match os_str_bytes(&v) {
-                            None => code = 25, // EILSEQ
+                            None => code = wasi::EILSEQ,
                             Some(b) => out = b,
                         },
                     },
@@ -7491,7 +7545,7 @@ fn wrong_ref(bytes: &mut [u8], ty: u32, body: Option<u32>) -> Result<()> {
                     }
                 }
             }
-            Payload::CodeSectionEntry(b) => code.push(b.range()),
+            Payload::CodeSectionEntry(b) => code.push(urange(b.range())),
             _ => {}
         }
     }
@@ -7577,7 +7631,7 @@ fn huge_array_new_fixed(bytes: &mut [u8]) -> Result<()> {
                     }
                 }
             }
-            Payload::CodeSectionEntry(b) => code.push(b.range()),
+            Payload::CodeSectionEntry(b) => code.push(urange(b.range())),
             _ => {}
         }
     }
@@ -8956,7 +9010,7 @@ fn code_section_start(bytes: &[u8]) -> Option<usize> {
     use wasmparser::{Parser, Payload};
     for payload in Parser::new(0).parse_all(bytes) {
         if let Ok(Payload::CodeSectionStart { range, .. }) = payload {
-            return Some(range.start);
+            return Some(upos(range.start));
         }
     }
     None
