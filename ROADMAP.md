@@ -134,7 +134,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   2026-09-02): the header is the first block with no code before it, blank lines and the
   leading `import` region allowed, and the diagnostic names which budget it applied.
 - ✅ **2. A position-matrix harness for capability briefs — DONE #2415.**
-  `scripts/capability-probes/matrix.py`; see the fuller row below, and CLAUDE.md's
+  `scripts/capability-matrix.vl` (was `matrix.py`); see the fuller row below, and CLAUDE.md's
   "A CAPABILITY GAP HAS A POSITION MATRIX".
 - ✅ **3. Split the inventory into one file per row — DONE (#2416 tooling, #2437 applied
   2026-09-03).** See the fuller row below; `scripts/inventory/split.py --apply
@@ -404,7 +404,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `tests/vl_inventory_refs_test.ts` (a cited row must EXIST — #2405 deleted a row and every
   gate stayed green) and the file-stem check in `vl_inventory_rows_test.ts`.
 - **Modernization program — (2) position-matrix harness, DONE #2415**:
-  `scripts/capability-probes/matrix.py` generates a capability's POSITION × FACE matrix from
+  `scripts/capability-matrix.vl` (ported from `matrix.py`) generates a capability's POSITION × FACE matrix from
   ONE `matrix/*.matrix.vl` template — twenty delivery and discrimination positions, both
   faces, one program per cell each printing a value only a correct conversion produces —
   and grades it in `run.py`'s vocabulary, exiting non-zero on `runs → not-runs` between two

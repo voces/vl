@@ -169,7 +169,7 @@ rather than merging it.
 
 **Proof for stages 2–3.** Byte-identical seed per domain-keeping conversion;
 `scripts/rep-fuzz-check.sh` (mandatory: rep layer and interner); `regress.py`;
-`capability-probes/matrix.py` on the matrices for the touched reps.
+`scripts/capability-matrix.vl` on the matrices for the touched reps.
 
 **Dependencies.** Stage 3 for literal unions and nullable reps needs the two open rulings
 `one-literal-union-rep` and `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md`,

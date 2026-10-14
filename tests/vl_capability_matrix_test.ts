@@ -1,6 +1,6 @@
 // THE POSITION-MATRIX HARNESS, GRADED AGAINST ITS OWN CONTROLS.
 //
-// `scripts/capability-probes/matrix.py` generates one program per delivery POSITION x FACE
+// `scripts/capability-matrix.vl` generates one program per delivery POSITION x FACE
 // from a single template. An instrument nobody validates measures nothing (CLAUDE.md: never
 // trust a probe until a control you KNOW should trigger it does), so this suite runs it on
 // four templates whose answers are already known: D1042's generic-pinned union, where every
@@ -15,17 +15,17 @@
 //
 // @test-timing instrument
 
-import { COMPILER, ROOT, VL, exists, pythonBin } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const MATRIX = `${ROOT}/scripts/capability-probes/matrix.py`;
+const MATRIX = `${ROOT}/scripts/capability-matrix.vl`;
 const TEMPLATES = `${ROOT}/scripts/capability-probes/matrix`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(MATRIX);
 if (GATED && !ENABLED) {
-  console.warn("[vl-capability-matrix] skipped — missing vl binary, seed wasm or matrix.py.");
+  console.warn("[vl-capability-matrix] skipped — missing vl binary, seed wasm or capability-matrix.vl.");
 }
 
-// The vocabulary run.py grades on. A verdict outside it means the two scripts have drifted.
+// The vocabulary `scripts/lib/probe-grade.vl` grades on. A verdict outside it means the two scripts have drifted.
 const VERDICTS = [
   "RUNS",
   "WRONG",
@@ -41,7 +41,7 @@ type Cell = { position: string; face: string; grade: string };
 
 const verdictOf = (grade: string): string => {
   const hit = VERDICTS.find((v) => grade === v || grade.startsWith(v + ":") || grade.startsWith(v + " "));
-  if (!hit) throw new Error(`grade ${JSON.stringify(grade)} is outside the run.py vocabulary`);
+  if (!hit) throw new Error(`grade ${JSON.stringify(grade)} is outside the probe-grade vocabulary`);
   return hit;
 };
 
@@ -65,13 +65,25 @@ const runMatrixOnce = async (
   template: string,
   only: string,
 ): Promise<{ code: number; cells: Cell[]; out: string }> => {
-  const args = [MATRIX, `${TEMPLATES}/${template}`, "--compiler", COMPILER, "--vl", VL];
+  const args = [
+    "run",
+    MATRIX,
+    "--compiler",
+    COMPILER,
+    "--",
+    `${TEMPLATES}/${template}`,
+    "--compiler",
+    COMPILER,
+    "--vl",
+    VL,
+  ];
   if (only) args.push("--only", only);
-  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
+    cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
-    env: { NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
   const cells: Cell[] = [];
@@ -106,13 +118,13 @@ const wantVerdict = (
 };
 
 Deno.test({
-  name: "matrix: every grade is in run.py's vocabulary, and both faces are generated",
+  name: "matrix: every grade is in the probe-grade vocabulary, and both faces are generated",
   ignore: !ENABLED,
   fn: async () => {
     const { cells } = await runMatrix("orerr-generic-pin.matrix.vl");
     for (const c of cells) verdictOf(c.grade);
     const positions = new Set(cells.map((c) => c.position));
-    // The standard list. A position dropped from matrix.py is a position no brief will
+    // The standard list. A position dropped from the matrix is a position no brief will
     // grade again, which is exactly how D965 lost global assignment in the first place.
     for (
       const p of [
@@ -155,7 +167,7 @@ Deno.test({
       ]
     ) {
       if (!positions.has(p)) {
-        throw new Error(`matrix.py no longer generates the ${p} position`);
+        throw new Error(`capability-matrix.vl no longer generates the ${p} position`);
       }
     }
     const faces = new Set(cells.map((c) => c.face));

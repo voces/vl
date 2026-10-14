@@ -1,0 +1,1087 @@
+// Generate and grade a capability's position x face matrix from one template: one program
+// per syntactic position the value can be delivered to, in the annotated and the
+// un-annotated face, each graded RUNS / WRONG / check refuses / emit refuses / SILENT /
+// COMPILER TRAP / TIMEOUT. Exits 1 on any `runs -> not-runs` between `--before` and the
+// after seed, or on any SILENT cell. The template format is `scripts/capability-probes/README.md`.
+//
+//     vl run scripts/capability-matrix.vl -- scripts/capability-probes/matrix/<t>.matrix.vl
+//     vl run scripts/capability-matrix.vl -- <t> --before old.wasm --after new.wasm
+//     vl run scripts/capability-matrix.vl -- <t> --only binding,array_push --keep
+//
+// Run it from the checkout root: default paths resolve against the working directory.
+// `$VL_PROBE_TIMEOUT` (default 120) bounds each `vl` call.
+
+import { IoError, readFile, writeTextFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, replaceAll, split, startsWith } from "std:str"
+import { includes } from "std:array"
+import {
+  cpPrefix,
+  die,
+  envOr,
+  findFrom,
+  splitLines,
+  stripWs,
+  univNl,
+  wsLen,
+} from "./lib/common"
+import { grade, spawn } from "./lib/probe-grade"
+
+const FACES = ["ann", "unann"]
+
+function faceLabel(face: string): string {
+  if face == "ann" { return "annotated" }
+  "un-annotated"
+}
+
+// ── text ─────────────────────────────────────────────────────────────────────────
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+// `text` with every line that is not blank indented by `n` spaces.
+function ind(text: string, n: i32): string {
+  let pad = ""
+  let k = 0
+  while k < n {
+    pad = pad + " "
+    k = k + 1
+  }
+  const out: string[] = []
+  for l in splitLines(text) {
+    if stripWs(l) != "" { out.push(pad + l) } else { out.push(l) }
+  }
+  join(out, "\n")
+}
+
+// `s` without leading and trailing `\n` bytes.
+function stripNl(s: string): string {
+  let a = 0
+  let b = s.length
+  while a < b && s[a] == 10 { a = a + 1 }
+  while b > a && s[b - 1] == 10 { b = b - 1 }
+  s.slice(a, b)
+}
+
+function isWordByte(b: i32): boolean {
+  (b >= 48 && b <= 57)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+    || b >= 0x80
+}
+
+// The byte index of `word` in `s` at or after `from` with no word byte on either side,
+// or -1: a `\bword\b` search.
+function findWord(s: string, word: string, from: i32): i32 {
+  let at = findFrom(s, word, from)
+  while at >= 0 {
+    const end = at + word.length
+    const before = at == 0 || !isWordByte(s[at - 1])
+    const after = end >= s.length || !isWordByte(s[end])
+    if before && after { return at }
+    at = findFrom(s, word, at + 1)
+  }
+  -1
+}
+
+// Every whole-word `word` in `s` replaced by `by`.
+function replaceWord(s: string, word: string, by: string): string {
+  const parts: string[] = []
+  let from = 0
+  let at = findWord(s, word, 0)
+  while at >= 0 {
+    parts.push(s.slice(from, at))
+    parts.push(by)
+    from = at + word.length
+    at = findWord(s, word, from)
+  }
+  parts.push(s.slice(from, s.length))
+  join(parts, "")
+}
+
+function basename(p: string): string {
+  let i = p.length
+  while i > 0 && p[i - 1] != 47 { i = i - 1 }
+  p.slice(i, p.length)
+}
+
+// `xs` in byte order: a hand insertion sort, since the lists are a few dozen long.
+function sorted(xs: string[]): string[] {
+  const out: string[] = []
+  for x in xs {
+    let k = out.length
+    out.push(x)
+    while k > 0 && x < out[k - 1] {
+      out[k] = out[k - 1]
+      k = k - 1
+    }
+    out[k] = x
+  }
+  out
+}
+
+// `'s'` as Python's `%r` quotes it, for the ASCII a position name can carry.
+function pyRepr(s: string): string {
+  let q = "'"
+  if contains(s, "'") && !contains(s, "\"") { q = "\"" }
+  const parts = [q]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    const c = s.slice(i, i + 1)
+    if c == q || b == 92 {
+      parts.push("\\" + c)
+    } else if b == 9 {
+      parts.push("\\t")
+    } else if b == 10 {
+      parts.push("\\n")
+    } else if b == 13 {
+      parts.push("\\r")
+    } else if b < 32 || b == 127 {
+      const h = "0123456789abcdef"
+      parts.push(
+        "\\x" + h.slice(b >> 4, (b >> 4) + 1) + h.slice(b & 15, (b & 15) + 1),
+      )
+    } else {
+      parts.push(c)
+    }
+    i = i + 1
+  }
+  parts.push(q)
+  join(parts, "")
+}
+
+// ── the template ─────────────────────────────────────────────────────────────────
+
+type Tpl = {
+  path: string,
+  name: string,
+  prelude: string,
+  value: string,
+  ty: string,
+  want: string,
+  setup: string,
+  guard: string,
+  fallback: string,
+  test: string,
+  hit: string,
+  miss: string,
+  value2: string,
+  ty2: string,
+  proof2: string,
+  want2: string,
+  proof: string,
+  skips: Map<string, string>,
+}
+
+// The section name of a `// @@NAME@@` marker line, or "".
+function marker(line: string): string {
+  let i = 0
+  while i < line.length && wsLen(line, i) > 0 { i = i + wsLen(line, i) }
+  if !startsWith(line.slice(i, line.length), "//") { return "" }
+  i = i + 2
+  while i < line.length && wsLen(line, i) > 0 { i = i + wsLen(line, i) }
+  if !startsWith(line.slice(i, line.length), "@@") { return "" }
+  i = i + 2
+  const start = i
+  while i < line.length {
+    const b = line[i]
+    if !((b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95) { break }
+    i = i + 1
+  }
+  if i == start || !startsWith(line.slice(i, line.length), "@@") { return "" }
+  const name = line.slice(start, i)
+  i = i + 2
+  while i < line.length && wsLen(line, i) > 0 { i = i + wsLen(line, i) }
+  if i != line.length { return "" }
+  name
+}
+
+function readText(path: string): string {
+  const raw = readFile(path)
+  if raw is IoError {
+    die("capability-matrix.vl: cannot read \{path} (\{raw.msg})", 1)
+    return ""
+  }
+  univNl(decodeUtf8Lossy(raw))
+}
+
+// Section `key` of the parsed sections `s`, or "".
+function section(s: Map<string, string>, key: string): string {
+  stripNl(s[key] ?? "")
+}
+
+function loadTpl(path: string): Tpl {
+  const text = readText(path)
+  const s: Map<string, string> = Map()
+  let cur = ""
+  let open = false
+  let buf: string[] = []
+  const pieces = text.split("\n")
+  let k = 0
+  while k < pieces.length {
+    let line = pieces[k]
+    if k + 1 < pieces.length { line = line + "\n" }
+    k = k + 1
+    if line == "" { continue }
+    const m = marker(line)
+    if m != "" {
+      if open { s[cur] = stripNl(join(buf, "")) }
+      cur = m
+      open = true
+      buf = []
+    } else if open {
+      buf.push(line)
+    }
+  }
+  if open { s[cur] = stripNl(join(buf, "")) }
+  const skips: Map<string, string> = Map()
+  for line in splitLines(section(s, "SKIP")) {
+    const c = findFrom(line, ":", 0)
+    if c >= 0 {
+      skips[stripWs(line.slice(0, c))] = stripWs(line.slice(c + 1, line.length))
+    }
+  }
+  let name = basename(path)
+  const ext = ".matrix.vl"
+  if (
+    name.length >= ext.length
+    && name.slice(name.length - ext.length, name.length) == ext
+  ) {
+    name = name.slice(0, name.length - ext.length)
+  }
+  const t: Tpl = {
+    path: path,
+    name: name,
+    prelude: section(s, "PRELUDE"),
+    value: section(s, "VALUE"),
+    ty: section(s, "TYPE"),
+    want: section(s, "WANT"),
+    setup: section(s, "SETUP"),
+    guard: section(s, "GUARD"),
+    fallback: section(s, "FALLBACK"),
+    test: section(s, "TEST"),
+    hit: section(s, "HIT"),
+    miss: section(s, "MISS"),
+    value2: section(s, "VALUE2"),
+    ty2: section(s, "TYPE2"),
+    proof2: section(s, "PROOF2"),
+    want2: section(s, "WANT2"),
+    proof: section(s, "PROOF"),
+    skips: skips,
+  }
+  if t.proof == "" && t.test != "" {
+    t.proof = "if \{t.test} {\n\{ind(t.hit, 2)}\n} else {\n\{ind(t.miss, 2)}\n}"
+  }
+  const need = [
+    ["VALUE", t.value],
+    ["TY", t.ty],
+    ["WANT", t.want],
+    ["PROOF", t.proof],
+  ]
+  for f in need {
+    if f[1] == "" {
+      die("\{path}: no @@\{f[0]}@@ section (and none derivable)", 1)
+    }
+  }
+  for f in [["WANT", t.want], ["WANT2", t.want2]] {
+    if contains(f[1], "\n") {
+      die("\{path}: @@\{f[0]}@@ must be one line — print one proving value", 1)
+    }
+  }
+  t
+}
+
+// The list type over `ty`, parenthesised when the element spelling is a union or has
+// a space: `i32[]` but `(i32 | "err")[]`.
+function arr(ty: string): string {
+  const t = stripWs(ty)
+  let wide = contains(t, "|")
+  let i = 0
+  while !wide && i < t.length {
+    if wsLen(t, i) > 0 { wide = true }
+    i = i + 1
+  }
+  if wide { return "(\{t})[]" }
+  t + "[]"
+}
+
+function bind(name: string, expr: string, face: string, ty: string): string {
+  if face == "ann" { return "const \{name}: \{ty} = \{expr}" }
+  "const \{name} = \{expr}"
+}
+
+// Does the template's own TEST already unwrap a nullable? The map positions then add no
+// second `!= null` guard of their own.
+function proofIsNullTest(t: Tpl): boolean {
+  t.test != "" && findWord(t.test, "null", 0) >= 0
+}
+
+// TEST/HIT/MISS rewritten to read `place` instead of the bound name `v`.
+function over(t: Tpl, place: string): string {
+  const test = replaceWord(t.test, "v", place)
+  const hit = ind(replaceWord(t.hit, "v", place), 2)
+  const miss = ind(replaceWord(t.miss, "v", place), 2)
+  "if \{test} {\n\{hit}\n} else {\n\{miss}\n}"
+}
+
+// ── assembly ─────────────────────────────────────────────────────────────────────
+
+// PRELUDE, `decls`, SETUP, `pre`, then `body`, nested in the GUARD when there is one.
+function assemble(
+  t: Tpl,
+  decls: string[],
+  pre: string[],
+  body: string[],
+): string {
+  const out: string[] = []
+  if t.prelude != "" { out.push(t.prelude) }
+  for d in decls {
+    if d != "" { out.push(d) }
+  }
+  if t.setup != "" { out.push(t.setup) }
+  for p in pre {
+    if p != "" { out.push(p) }
+  }
+  const inner: string[] = []
+  for b in body {
+    if b != "" { inner.push(b) }
+  }
+  if t.guard != "" {
+    out.push("if \{t.guard} {")
+    out.push(ind(join(inner, "\n"), 2))
+    out.push("}")
+  } else {
+    for b in inner { out.push(b) }
+  }
+  join(out, "\n") + "\n"
+}
+
+// The prelude, if any, then `rest`, as one program.
+function program(t: Tpl, rest: string[]): string {
+  const out: string[] = []
+  if t.prelude != "" { out.push(t.prelude) }
+  for r in rest { out.push(r) }
+  join(out, "\n") + "\n"
+}
+
+// One position's program, or the reason it is skipped.
+type Built = { ok: boolean, prog: string, skip: string }
+
+function made(prog: string): Built { { ok: true, prog: prog, skip: "" } }
+
+function skipped(why: string): Built { { ok: false, prog: "", skip: why } }
+
+const NO_TEST = "the template declares no @@TEST@@/@@HIT@@/@@MISS@@"
+
+// Each position's name and what its annotated face annotates, in report order.
+const POSITIONS = [
+  ["binding", "the binding"],
+  [
+    "return_inferred",
+    "the receiving binding (the return cannot be annotated here)",
+  ],
+  ["return_annotated", "the receiving binding"],
+  ["argument", "the parameter"],
+  ["struct_field_init", "the destination struct binding"],
+  [
+    "struct_field_assign", "the rebind that reads the field back",
+  ],
+  ["array_element", "the list binding"],
+  [
+    "array_element_assign", "the rebind that reads the element back",
+  ],
+  ["array_push", "the rebind that reads the element back"],
+  ["local_assign", "the reassigned local"],
+  ["global_init", "the global"],
+  ["global_assign", "the globals"],
+  ["map_value", "the map binding"],
+  ["map_set", "the map binding"],
+  ["closure_capture", "the captured binding"],
+  ["block_if", "the binding inside the block"],
+  ["block_if_capture", "the captured binding inside the block"],
+  ["block_while", "the binding inside the block"],
+  [
+    "block_while_capture", "the captured binding inside the block",
+  ],
+  ["block_bare", "the binding inside the block"],
+  [
+    "block_bare_capture", "the captured binding inside the block",
+  ],
+  ["fn_body", "the binding inside the function"],
+  [
+    "fn_body_capture", "the captured binding inside the function",
+  ],
+  ["is_in_if", "the binding"],
+  ["is_in_while", "the binding"],
+  ["is_in_and", "the binding"],
+  ["is_in_not", "the binding"],
+  ["else_if", "the binding"],
+  ["array_element_place", "the list binding"],
+  ["map_value_place", "the map binding"],
+  ["struct_field_place", "the destination struct binding"],
+  ["early_return_guard", "the parameter"],
+  ["two_instances", "both bindings"],
+]
+
+// A deliverer function, with SETUP and GUARD inside it, its return annotated or not.
+function returner(t: Tpl, face: string, annotated: boolean): Built {
+  if t.guard != "" && t.fallback == "" {
+    return skipped(
+      "the template has a GUARD and no @@FALLBACK@@ for the un-taken path",
+    )
+  }
+  const inner: string[] = []
+  if t.setup != "" { inner.push(t.setup) }
+  if t.guard != "" {
+    inner.push("if \{t.guard} { return \{t.value} }")
+    inner.push(t.fallback)
+  } else {
+    inner.push("return " + t.value)
+  }
+  let sig = "function __deliver() {"
+  if annotated { sig = "function __deliver(): \{t.ty} {" }
+  made(
+    program(
+      t,
+      [
+        sig,
+        ind(join(inner, "\n"), 2),
+        "}",
+        bind("v", "__deliver()", face, t.ty),
+        t.proof,
+      ],
+    ),
+  )
+}
+
+// The delivery and its proof, captured by a closure that rebinds it as `v`.
+function captured(t: Tpl, face: string): string[] {
+  [
+    bind("__c", t.value, face, t.ty),
+    "const __f = () => {",
+    ind("const v = __c\n" + t.proof, 2),
+    "}",
+    "__f()",
+  ]
+}
+
+// The delivery and its proof inside a module-scope block: `if`, `while` (one
+// iteration) or bare.
+function inBlock(t: Tpl, face: string, kind: string, capture: boolean): Built {
+  let inner = [bind("v", t.value, face, t.ty), t.proof]
+  if capture { inner = captured(t, face) }
+  const pre: string[] = []
+  let block: string[] = []
+  if kind == "if" {
+    block = ["if true {", ind(join(inner, "\n"), 2), "}"]
+  } else if kind == "while" {
+    pre.push("let __i = 0")
+    inner.push("__i = __i + 1")
+    block = ["while __i < 1 {", ind(join(inner, "\n"), 2), "}"]
+  } else {
+    block = ["{", ind(join(inner, "\n"), 2), "}"]
+  }
+  made(assemble(t, [], pre, block))
+}
+
+// The SETUP, the delivery and the proof all inside one function body.
+function inFn(t: Tpl, face: string, capture: boolean): Built {
+  let held = [bind("v", t.value, face, t.ty), t.proof]
+  if capture { held = captured(t, face) }
+  const inner: string[] = []
+  if t.setup != "" { inner.push(t.setup) }
+  if t.guard != "" {
+    inner.push("if \{t.guard} {")
+    inner.push(ind(join(held, "\n"), 2))
+    inner.push("}")
+  } else {
+    for h in held { inner.push(h) }
+  }
+  made(
+    program(
+      t,
+      ["function __frame() {", ind(join(inner, "\n"), 2), "}", "__frame()"],
+    ),
+  )
+}
+
+function disc(t: Tpl, face: string, shape: string): Built {
+  if t.test == "" { return skipped(NO_TEST) }
+  made(assemble(t, [], [], [bind("v", t.value, face, t.ty), shape]))
+}
+
+function mapDecl(t: Tpl, face: string): string {
+  if face == "ann" { return "const __m: { [string]: \{t.ty} } = Map()" }
+  "const __m = Map()"
+}
+
+// The value stored into a map by `store`, read back by `read` and rebound, guarded by
+// `!= null` unless the TEST is itself a null test.
+function mapCell(t: Tpl, face: string, store: string, read: string): Built {
+  const bound = bind("v", "__mv", face, t.ty) + "\n" + t.proof
+  const body = [store, "const __mv = " + read]
+  if proofIsNullTest(t) {
+    body.push(bound)
+  } else {
+    body.push("if __mv != null {")
+    body.push(ind(bound, 2))
+    body.push("}")
+  }
+  made(assemble(t, [], [mapDecl(t, face)], body))
+}
+
+function listDecl(t: Tpl, face: string): string {
+  if face == "ann" { return "const xs: \{arr(t.ty)} = [\{t.value}]" }
+  "const xs = [\{t.value}]"
+}
+
+function wDecl(t: Tpl, face: string): string[] {
+  if face == "ann" { return ["type __W = { f: \{t.ty} }"] }
+  []
+}
+
+function wInit(t: Tpl, face: string): string {
+  if face == "ann" { return "const w: __W = { f: \{t.value} }" }
+  "const w = { f: \{t.value} }"
+}
+
+function letDecl(t: Tpl, face: string, name: string, expr: string): string {
+  if face == "ann" { return "let \{name}: \{t.ty} = \{expr}" }
+  "let \{name} = \{expr}"
+}
+
+// The program for position `pos` in `face`.
+function buildAt(t: Tpl, pos: string, face: string): Built {
+  const ann = face == "ann"
+  if pos == "binding" {
+    return made(assemble(t, [], [], [bind("v", t.value, face, t.ty), t.proof]))
+  } else if pos == "return_inferred" {
+    return returner(t, face, false)
+  } else if pos == "return_annotated" {
+    return returner(t, face, true)
+  } else if pos == "argument" {
+    let sig = "function __take(a) {"
+    if ann { sig = "function __take(a: \{t.ty}) {" }
+    const decls = [sig, ind("const v = a\n" + t.proof, 2), "}"]
+    return made(assemble(t, decls, [], ["__take(\{t.value})"]))
+  } else if pos == "struct_field_init" {
+    return made(
+      assemble(
+        t,
+        wDecl(t, face),
+        [],
+        [wInit(t, face), "const v = w.f", t.proof],
+      ),
+    )
+  } else if pos == "struct_field_assign" {
+    const body = [
+      "const w: __W = { f: \{t.value} }",
+      "w.f = " + t.value,
+      bind("v", "w.f", face, t.ty),
+      t.proof,
+    ]
+    return made(assemble(t, ["type __W = { f: \{t.ty} }"], [], body))
+  } else if pos == "array_element" {
+    return made(
+      assemble(t, [], [], [listDecl(t, face), "const v = xs[0]", t.proof]),
+    )
+  } else if pos == "array_element_assign" {
+    const body = [
+      "const xs: \{arr(t.ty)} = [\{t.value}]",
+      "xs[0] = " + t.value,
+      bind("v", "xs[0]", face, t.ty),
+      t.proof,
+    ]
+    return made(assemble(t, [], [], body))
+  } else if pos == "array_push" {
+    const body = [
+      "xs.push(\{t.value})",
+      bind("v", "xs[0]", face, t.ty),
+      t.proof,
+    ]
+    return made(assemble(t, [], ["const xs: \{arr(t.ty)} = []"], body))
+  } else if pos == "local_assign" {
+    const inner: string[] = []
+    if t.setup != "" { inner.push(t.setup) }
+    const deliver = [letDecl(t, face, "v", t.value), "v = " + t.value, t.proof]
+    if t.guard != "" {
+      inner.push("if \{t.guard} {")
+      inner.push(ind(join(deliver, "\n"), 2))
+      inner.push("}")
+    } else {
+      for d in deliver { inner.push(d) }
+    }
+    return made(
+      program(
+        t,
+        ["function __la() {", ind(join(inner, "\n"), 2), "}", "__la()"],
+      ),
+    )
+  } else if pos == "global_init" {
+    if t.guard != "" {
+      return skipped(
+        "a module global's initialiser cannot nest inside the template's GUARD",
+      )
+    }
+    return made(
+      assemble(
+        t,
+        [],
+        [letDecl(t, face, "__g", t.value)],
+        ["const v = __g", t.proof],
+      ),
+    )
+  } else if pos == "global_assign" {
+    if t.guard != "" {
+      if t.fallback == "" {
+        return skipped(
+          "the template has a GUARD and no @@FALLBACK@@ to initialise the globals",
+        )
+      }
+      const pre = [
+        letDecl(t, face, "__a", t.fallback),
+        letDecl(t, face, "__b", t.fallback),
+      ]
+      const body = ["__a = " + t.value, "__b = __a", "const v = __b", t.proof]
+      return made(assemble(t, [], pre, body))
+    }
+    const pre = [
+      letDecl(t, face, "__a", t.value),
+      letDecl(t, face, "__b", t.value),
+    ]
+    return made(assemble(t, [], pre, ["__b = __a", "const v = __b", t.proof]))
+  } else if pos == "map_value" {
+    return mapCell(t, face, "__m[\"k\"] = " + t.value, "__m[\"k\"]")
+  } else if pos == "map_set" {
+    return mapCell(t, face, "__m.set(\"k\", \{t.value})", "__m.get(\"k\")")
+  } else if pos == "closure_capture" {
+    return made(assemble(t, [], [], captured(t, face)))
+  } else if pos == "block_if" {
+    return inBlock(t, face, "if", false)
+  } else if pos == "block_if_capture" {
+    return inBlock(t, face, "if", true)
+  } else if pos == "block_while" {
+    return inBlock(t, face, "while", false)
+  } else if pos == "block_while_capture" {
+    return inBlock(t, face, "while", true)
+  } else if pos == "block_bare" {
+    return inBlock(t, face, "bare", false)
+  } else if pos == "block_bare_capture" {
+    return inBlock(t, face, "bare", true)
+  } else if pos == "fn_body" {
+    return inFn(t, face, false)
+  } else if pos == "fn_body_capture" {
+    return inFn(t, face, true)
+  } else if pos == "is_in_if" {
+    return disc(
+      t,
+      face,
+      "if \{t.test} {\n\{ind(t.hit, 2)}\n} else {\n\{ind(t.miss, 2)}\n}",
+    )
+  } else if pos == "is_in_while" {
+    return disc(
+      t,
+      face,
+      "while \{t.test} {\n\{ind(t.hit, 2)}\n  break\n}\nif !(\{t.test}) {\n\{ind(t.miss, 2)}\n}",
+    )
+  } else if pos == "is_in_and" {
+    return disc(
+      t,
+      face,
+      "const __yes = 1 == 1\nif \{t.test} && __yes {\n\{ind(t.hit, 2)}\n}\nif !(\{t.test}) && __yes {\n\{ind(t.miss, 2)}\n}",
+    )
+  } else if pos == "is_in_not" {
+    return disc(
+      t,
+      face,
+      "if !(\{t.test}) {\n\{ind(t.miss, 2)}\n} else {\n\{ind(t.hit, 2)}\n}",
+    )
+  } else if pos == "else_if" {
+    return disc(
+      t,
+      face,
+      "const __z = 0\nif __z == 1 {\n  print(\"unreached\")\n} else if \{t.test} {\n\{ind(t.hit, 2)}\n} else {\n\{ind(t.miss, 2)}\n}",
+    )
+  } else if pos == "array_element_place" {
+    if t.test == "" { return skipped(NO_TEST) }
+    return made(assemble(t, [], [], [listDecl(t, face), over(t, "xs[0]")]))
+  } else if pos == "map_value_place" {
+    if t.test == "" { return skipped(NO_TEST) }
+    const proof = over(t, "__m[\"k\"]")
+    const body = ["__m[\"k\"] = " + t.value]
+    if proofIsNullTest(t) {
+      body.push(proof)
+    } else {
+      body.push("if __m[\"k\"] != null {")
+      body.push(ind(proof, 2))
+      body.push("}")
+    }
+    return made(assemble(t, [], [mapDecl(t, face)], body))
+  } else if pos == "struct_field_place" {
+    if t.test == "" { return skipped(NO_TEST) }
+    return made(
+      assemble(t, wDecl(t, face), [], [wInit(t, face), over(t, "w.f")]),
+    )
+  } else if pos == "early_return_guard" {
+    if t.test == "" { return skipped(NO_TEST) }
+    let sig = "function __guard(v) {"
+    if ann { sig = "function __guard(v: \{t.ty}) {" }
+    const inner = "if \{t.test} {\n\{ind(t.hit, 2)}\n  return\n}\n\{t.miss}"
+    return made(
+      assemble(t, [sig, ind(inner, 2), "}"], [], ["__guard(\{t.value})"]),
+    )
+  } else if pos == "two_instances" {
+    if t.value2 == "" { return skipped("the template declares no @@VALUE2@@") }
+    let ty2 = t.ty2
+    if ty2 == "" { ty2 = t.ty }
+    let proof2 = t.proof2
+    if proof2 == "" { proof2 = t.proof }
+    const one = [
+      "function __one() {",
+      ind(bind("v", t.value, face, t.ty) + "\n" + t.proof, 2),
+      "}",
+    ]
+    const two = [
+      "function __two() {",
+      ind(bind("v", t.value2, face, ty2) + "\n" + proof2, 2),
+      "}",
+    ]
+    const decls: string[] = []
+    for d in one { decls.push(d) }
+    for d in two { decls.push(d) }
+    return made(assemble(t, decls, [], ["__one()", "__two()"]))
+  }
+  die("capability-matrix.vl: no builder for position " + pos, 1)
+  skipped("")
+}
+
+// ── driving ──────────────────────────────────────────────────────────────────────
+
+function wantFor(t: Tpl, pos: string): string {
+  if pos == "two_instances" && t.want2 != "" {
+    return t.want + " then " + t.want2
+  }
+  t.want
+}
+
+type Cell = { verdict: string, detail: string }
+
+type Run = {
+  vl: string,
+  std: string,
+  outdir: string,
+  only: string[],
+  secs: string,
+}
+
+function selected(only: string[], pos: string): boolean {
+  if only.length == 0 { return true }
+  for o in only {
+    if o == pos { return true }
+  }
+  false
+}
+
+// Every selected cell of `t`, graded against `seed`, keyed `position/face`.
+function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
+  const cells: Map<string, Cell> = Map()
+  for p in POSITIONS {
+    const pos = p[0]
+    if !selected(r.only, pos) { continue }
+    for face in FACES {
+      const key = pos + "/" + face
+      let b = skipped("")
+      const why = t.skips[pos]
+      if why is string { b = skipped(why) } else { b = buildAt(t, pos, face) }
+      if !b.ok {
+        let reason = b.skip
+        if reason == "" { reason = "no reason given" }
+        cells[key] = { verdict: "skipped", detail: reason }
+        continue
+      }
+      const cid = "\{t.name}_\{pos}_\{face}"
+      const path = r.outdir + "/" + cid + ".vl"
+      const want = wantFor(t, pos)
+      const head = "// \{cid} — generated by capability-matrix.vl from \{basename(t.path)}. Should print \{want}.\n"
+      const w = writeTextFile(path, head + b.prog)
+      if w != null {
+        die("capability-matrix.vl: cannot write \{path} (\{w.msg})", 1)
+      }
+      const g = grade(
+        { vl: r.vl, seed: seed, std: r.std, probe: path, secs: r.secs },
+        want,
+      )
+      let detail = g.detail
+      if g.verdict == "WRONG" {
+        detail = g.out
+        if detail == "" { detail = "(no output)" }
+      }
+      cells[key] = { verdict: g.verdict, detail: detail }
+    }
+  }
+  cells
+}
+
+function short(c: Cell): string {
+  if c.verdict == "RUNS" { return "RUNS" }
+  if c.verdict == "skipped" { return "skipped" }
+  if c.verdict == "WRONG" {
+    return "WRONG " + cpPrefix(replaceAll(c.detail, "\n", " / "), 40)
+  }
+  const v = replaceAll(c.verdict, " (check rc 0)", "")
+  v + ": " + cpPrefix(replaceAll(c.detail, "\n", " "), 64)
+}
+
+function cellAt(cells: Map<string, Cell>, key: string): Cell {
+  cells[key] ?? { verdict: "", detail: "" }
+}
+
+function table(
+  only: string[],
+  hasBefore: boolean,
+  before: Map<string, Cell>,
+  after: Map<string, Cell>,
+): string {
+  const out: string[] = []
+  if !hasBefore {
+    out.push("| position | face | grade |")
+    out.push("| --- | --- | --- |")
+  } else {
+    out.push("| position | face | before | after |")
+    out.push("| --- | --- | --- | --- |")
+  }
+  for p in POSITIONS {
+    const pos = p[0]
+    if !selected(only, pos) { continue }
+    for face in FACES {
+      const key = pos + "/" + face
+      let cell = short(cellAt(after, key))
+      if hasBefore { cell = short(cellAt(before, key)) + " | " + cell }
+      out.push("| `\{pos}` | \{faceLabel(face)} | \{cell} |")
+    }
+  }
+  join(out, "\n")
+}
+
+// ── arguments, read as Python argparse reads them, usage errors exiting 2 ─────────
+
+const USAGE = "usage: capability-matrix.vl [-h] [--compiler COMPILER] [--before BEFORE] [--after AFTER]\n                            [--only ONLY] [--keep] [--out-dir OUT_DIR] [--vl VL]\n                            [--std STD] [--list-positions]\n                            [template]"
+
+const HELP = "\n\npositional arguments:\n  template             a *.matrix.vl under matrix/\n\noptions:\n  -h, --help           show this help message and exit\n  --compiler COMPILER  the seed to grade against\n  --before BEFORE      a second seed; the table gains a before column\n  --after AFTER        with --before, the seed the after column uses\n  --only ONLY          comma-separated positions\n  --keep               keep the generated programs\n  --out-dir OUT_DIR    where --keep leaves them (default: a temp dir kept)\n  --vl VL              the vl binary\n  --std STD            the std/ each run resolves\n  --list-positions     print the positions and the face each starts at"
+
+const OPTS = [
+  "--compiler", "--before", "--after", "--only", "--keep", "--out-dir", "--vl",
+  "--std", "--list-positions", "--help",
+]
+
+const FLAGS = ["--keep", "--list-positions", "--help"]
+
+function usageError(msg: string): i32 {
+  print(USAGE)
+  print("capability-matrix.vl: error: " + msg)
+  2
+}
+
+// The long option `arg` names, by exact spelling or unique prefix, or "" for none.
+function longOpt(arg: string): string {
+  if !startsWith(arg, "--") || arg.length < 3 { return "" }
+  let hit = ""
+  let n = 0
+  for o in OPTS {
+    if o == arg { return o }
+    if startsWith(o, arg) {
+      hit = o
+      n = n + 1
+    }
+  }
+  if n == 1 { return hit }
+  ""
+}
+
+function cwd(): string {
+  const p = spawn("pwd", ["-P"])
+  if p.code != 0 { die("capability-matrix.vl: pwd failed: " + p.err, 1) }
+  stripWs(p.out)
+}
+
+function main(args: string[]): i32 {
+  const abs = cwd()
+  const opt: Map<string, string> = Map()
+  opt["--compiler"] = abs + "/build/vl-compiler.wasm"
+  opt["--only"] = ""
+  opt["--vl"] = abs + "/scripts/vl-host/target/release/vl"
+  opt["--std"] = abs + "/std"
+  let template = ""
+  let haveTemplate = false
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    let val: string | null = null
+    const eq = findFrom(a, "=", 0)
+    if startsWith(a, "--") && eq > 0 {
+      val = a.slice(eq + 1, a.length)
+      a = a.slice(0, eq)
+    }
+    let o = longOpt(a)
+    if a == "-h" { o = "--help" }
+    if o == "" {
+      if (startsWith(args[i], "-") && args[i] != "-") || haveTemplate {
+        return usageError("unrecognized arguments: " + args[i])
+      }
+      template = args[i]
+      haveTemplate = true
+    } else if o == "--help" && val == null {
+      print(USAGE + HELP)
+      return 0
+    } else if includes(FLAGS, o) {
+      if val != null {
+        return usageError(
+          "argument \{o}: ignored explicit argument " + pyRepr(val ?? ""),
+        )
+      }
+      opt[o] = "1"
+    } else if val is string {
+      opt[o] = val
+    } else if i + 1 < args.length && !startsWith(args[i + 1], "-") {
+      opt[o] = args[i + 1]
+      i = i + 1
+    } else {
+      return usageError("argument \{o}: expected one argument")
+    }
+    i = i + 1
+  }
+
+  if opt["--list-positions"] != null {
+    for p in POSITIONS {
+      let name = p[0]
+      while name.length < 22 { name = name + " " }
+      print("\{name} face annotates \{p[1]}")
+    }
+    return 0
+  }
+  if !haveTemplate {
+    die(
+      "capability-matrix.vl: a template path is required (try --list-positions)",
+      1,
+    )
+  }
+  const t = loadTpl(template)
+  const only: string[] = []
+  for x in split(opt["--only"] ?? "", ",") {
+    const s = stripWs(x)
+    if s != "" && !includes(only, s) { only.push(s) }
+  }
+  for n in sorted(only) {
+    let known = false
+    for p in POSITIONS {
+      if p[0] == n { known = true }
+    }
+    if !known { die("unknown position \{pyRepr(n)} (try --list-positions)", 1) }
+  }
+
+  const keep = opt["--keep"] != null
+  const outDir = opt["--out-dir"] ?? ""
+  let outdir = ""
+  if outDir != "" {
+    outdir = outDir
+    const mk = spawn("mkdir", ["-p", outdir])
+    if mk.code != 0 {
+      die("capability-matrix.vl: cannot create \{outdir}: " + mk.err, 1)
+    }
+  } else {
+    const mk = spawn("mktemp", ["-d", "-t", "vl-matrix-\{t.name}-XXXXXXXX"])
+    if mk.code != 0 { die("capability-matrix.vl: mktemp failed: " + mk.err, 1) }
+    outdir = stripWs(mk.out)
+  }
+  const r: Run = {
+    vl: opt["--vl"] ?? "",
+    std: opt["--std"] ?? "",
+    outdir: outdir,
+    only: only,
+    secs: stripWs(envOr("VL_PROBE_TIMEOUT", "120")),
+  }
+  let afterSeed = opt["--after"] ?? ""
+  if afterSeed == "" { afterSeed = opt["--compiler"] ?? "" }
+  const beforeSeed = opt["--before"] ?? ""
+  const hasBefore = beforeSeed != ""
+  let before: Map<string, Cell> = Map()
+  if hasBefore { before = gradeAll(t, beforeSeed, r) }
+  const after = gradeAll(t, afterSeed, r)
+  if !keep && outDir == "" { spawn("rm", ["-rf", outdir]) }
+
+  print("# \{t.name} — position x face matrix")
+  print(
+    "\ntemplate `\{template}` · want `\{t.want}` · seed `\{basename(afterSeed)}`",
+  )
+  if hasBefore { print("before `\{basename(beforeSeed)}`") }
+  print("")
+  print(table(only, hasBefore, before, after))
+
+  let runs = 0
+  let silentN = 0
+  let skippedN = 0
+  let other = 0
+  let total = 0
+  const lostKeys: string[] = []
+  const silentKeys: string[] = []
+  for p in POSITIONS {
+    if !selected(only, p[0]) { continue }
+    for face in FACES {
+      const key = p[0] + "/" + face
+      const c = cellAt(after, key)
+      total = total + 1
+      if c.verdict == "RUNS" {
+        runs = runs + 1
+      } else if startsWith(c.verdict, "SILENT") {
+        silentN = silentN + 1
+        silentKeys.push(key)
+      } else if c.verdict == "skipped" {
+        skippedN = skippedN + 1
+      } else {
+        other = other + 1
+      }
+      if hasBefore {
+        if cellAt(before, key).verdict == "RUNS" && c.verdict != "RUNS" {
+          lostKeys.push(key)
+        }
+      }
+    }
+  }
+  const lost = sorted(lostKeys)
+  const silent = sorted(silentKeys)
+  print(
+    "\nruns \{toString(runs)} of \{toString(total - skippedN)} graded · \{toString(skippedN)} skipped · \{toString(silentN)} silent · \{toString(other)} other",
+  )
+  let lostTail = ""
+  if lost.length > 0 { lostTail = "   " + join(lost, ", ") }
+  print("runs -> not-runs  \{toString(lost.length)}\{lostTail}")
+  let silentTail = ""
+  if silent.length > 0 { silentTail = "   " + join(silent, ", ") }
+  print("-> silent         \{toString(silent.length)}\{silentTail}")
+  if keep || outDir != "" { print("\ngenerated programs kept in " + outdir) }
+  if lost.length > 0 {
+    print(
+      "\nA cell that ran and no longer runs is the one movement the gate refuses on.",
+    )
+  }
+  if silent.length > 0 {
+    print(
+      "\nA SILENT cell is check-clean invalid wasm: the position was not wired.",
+    )
+  }
+  if lost.length > 0 || silent.length > 0 { return 1 }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("capability-matrix.vl: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
