@@ -297,7 +297,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "comment rules: the ratchet baseline walks compiler/ only",
+  name: "comment rules: the ratchet baseline counts the compiler graph only",
   fn: () => {
     const b = JSON.parse(Deno.readTextFileSync(`${ROOT}/scripts/comment-budget-baseline.json`)) as {
       targets?: string[];
@@ -305,9 +305,9 @@ Deno.test({
       files?: Record<string, unknown>;
     };
     const targets = b.targets ?? [];
-    if (targets.length !== 1 || targets[0] !== "compiler") {
+    if (targets.length !== 1 || targets[0] !== "compiler/entry.vl") {
       throw new Error(
-        `the comment ratchet must walk compiler/ alone — the lint no longer produces std ` +
+        `the comment ratchet must count compiler/entry.vl's graph alone — the lint no longer produces std ` +
           `counts, so a baseline for them can never fall. targets: ${JSON.stringify(targets)}`,
       );
     }
