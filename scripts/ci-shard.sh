@@ -46,7 +46,7 @@ vl_check_fix_test.ts 5
 vl_large_source_test.ts 5
 vl_sentinel_index_test.ts 4
 vl_kind_ladder_test.ts 3
-vl_deep_else_chain_test.ts 58
+vl_deep_else_chain_test.ts 40
 vl_buffer_view_bounds_shape_test.ts 34
 selfhost_native_release_shape_test.ts 31
 vl_buffer_view_bounds_contract_test.ts 25
