@@ -8,7 +8,7 @@ other instrument here samples a population somebody already named:
 | --- | --- |
 | `scripts/capability-probes/run.py` | one hand-written program per ALREADY-KNOWN gap |
 | `scripts/silent-sweep/distilled/` | generated over TWELVE FIXED census axes |
-| `scripts/capability-probes/matrix.py` | one template, expanded over delivery positions |
+| `scripts/capability-matrix.vl` | one template, expanded over delivery positions |
 
 None can find a shape nobody thought of. On 2026-09-03 the peer track wrote twenty ordinary
 day-one programs by hand; eighteen ran and one was a clean defect (D1473) that every filed

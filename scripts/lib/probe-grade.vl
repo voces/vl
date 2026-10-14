@@ -1,0 +1,288 @@
+// The capability-probe grading vocabulary: run one program under a seed and name what
+// happened — RUNS, WRONG, check refuses, emit refuses, SILENT, COMPILER TRAP or TIMEOUT.
+// The verdict and detail bytes match the probe runner's, so the position matrix and the
+// probes read alike. Import with a relative path, e.g. `from "./lib/probe-grade"`.
+
+import { IoError } from "std:fs"
+import { runProgram } from "std:process"
+import { decodeUtf8Lossy } from "std:utf8"
+import { replaceAll, split, startsWith } from "std:str"
+import {
+  Proc,
+  cpPrefix,
+  die,
+  findFrom,
+  isDigit,
+  splitLines,
+  stripWs,
+  univNl,
+  wsLen,
+} from "./common"
+
+// Run `cmd` with `args` and wait for it; an unstartable command stops the script.
+export function spawn(cmd: string, args: string[]): Proc {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("cannot run \{cmd} (\{r.msg})", 1)
+    return { code: -1, out: "", err: "" }
+  }
+  {
+    code: r.code,
+    out: univNl(decodeUtf8Lossy(r.stdout)),
+    err: univNl(decodeUtf8Lossy(r.stderr)),
+  }
+}
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+function anyIn(s: string, needles: string[]): boolean {
+  for n in needles {
+    if contains(s, n) { return true }
+  }
+  false
+}
+
+function skipWs(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && wsLen(s, j) > 0 { j = j + wsLen(s, j) }
+  j
+}
+
+// The byte index past a run of ASCII digits from `i`, or -1 when there is none.
+function digitsEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isDigit(s[j]) { j = j + 1 }
+  if j == i { return -1 }
+  j
+}
+
+// `\w` over UTF-8 bytes: an ASCII letter, digit or `_`, or any non-ASCII byte.
+function isWordByte(b: i32): boolean {
+  isDigit(b)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+    || b >= 0x80
+}
+
+// From byte `i`, up to `n` code points that are not `\n` (nor `"` when `noQuote`): the
+// byte index just past them, as a `[^\n]{0,n}` or `[^\n"]{0,n}` match ends.
+function cpRunEnd(s: string, i: i32, n: i32, noQuote: boolean): i32 {
+  let j = i
+  let seen = 0
+  while j < s.length && seen < n {
+    const b = s[j]
+    if b == 10 || (noQuote && b == 34) { return j }
+    j = j + 1
+    while j < s.length && (s[j] & 0xC0) == 0x80 { j = j + 1 }
+    seen = seen + 1
+  }
+  j
+}
+
+// The leftmost byte at which one of `alts` starts in `s` and the alternative found
+// there, or `at: -1`: `re.search("(A|B|…)", s)`.
+type Hit = { at: i32, alt: string }
+
+function leftmost(s: string, alts: string[]): Hit {
+  let best: Hit = { at: -1, alt: "" }
+  for a in alts {
+    const at = findFrom(s, a, 0)
+    if at >= 0 && (best.at < 0 || at < best.at) { best = { at: at, alt: a } }
+  }
+  best
+}
+
+// Does `out` satisfy a `Should print …` contract: a substring, `X twice`, or a
+// sequence of lines `X then Y`?
+export function matches(want: string, out: string): boolean {
+  const w = stripWs(want)
+  if contains(w, " then ") {
+    const parts: string[] = []
+    for p in split(w, " then ") { parts.push(stripWs(p)) }
+    const lines: string[] = []
+    for l in splitLines(stripWs(out)) { lines.push(stripWs(l)) }
+    if parts.length != lines.length { return false }
+    let k = 0
+    while k < parts.length {
+      if parts[k] != lines[k] { return false }
+      k = k + 1
+    }
+    return true
+  }
+  contains(out, replaceAll(w, " twice", ""))
+}
+
+// A `Checked N file`, `Found N error` or bare `Error: <word> error` line: the check
+// phase's own scenery, never the refusal.
+function isScenery(l: string): boolean {
+  for pair in [["Checked ", " file"], ["Found ", " error"]] {
+    if startsWith(l, pair[0]) {
+      const e = digitsEnd(l, pair[0].length)
+      if e > 0 && startsWith(l.slice(e, l.length), pair[1]) { return true }
+    }
+  }
+  if !startsWith(l, "Error: ") { return false }
+  let i = 7
+  while i < l.length && isWordByte(l[i]) { i = i + 1 }
+  if i == 7 || !startsWith(l.slice(i, l.length), " error") { return false }
+  skipWs(l, i + 6) == l.length
+}
+
+// `l` without a leading `<path>:<line>:<col>:` and the whitespace after it.
+function dropPosPrefix(l: string): string {
+  let p = 1
+  while p < l.length && wsLen(l, p - 1) == 0 {
+    if l[p] == 58 {
+      const a = digitsEnd(l, p + 1)
+      if a > 0 && a < l.length && l[a] == 58 {
+        const b = digitsEnd(l, a + 1)
+        if b > 0 && b < l.length && l[b] == 58 {
+          return l.slice(skipWs(l, b + 1), l.length)
+        }
+      }
+    }
+    p = p + 1
+  }
+  l
+}
+
+// The refusal channel named from `vl check`'s rc and the combined output, and the
+// detail beside it. The channel is read from what happened to the module, never from
+// the sentence, and advice lines (hint, warning, info) are never the detail.
+export type Verdict = { where: string, detail: string }
+
+export function classify(chkRc: i32, err: string): Verdict {
+  const lines: string[] = []
+  for raw in splitLines(err) {
+    if (
+      contains(raw, "[HINT]")
+      || contains(raw, "[WARNING]")
+      || contains(raw, "[INFO]")
+    ) {
+      continue
+    }
+    if startsWith(raw, " ") || isScenery(raw) { continue }
+    const l = stripWs(dropPosPrefix(raw))
+    if l != "" && l != "[ERROR]:" { lines.push(l) }
+  }
+  const m = leftmost(
+    err,
+    ["not yet supported", "has no lowering", "not supported by codegen"],
+  )
+  let where = "emit refuses"
+  if chkRc != 0 {
+    where = "check refuses"
+  } else if anyIn(err, ["wasm backtrace", "call stack exhausted"]) {
+    where = "COMPILER TRAP (check rc 0)"
+  } else if (
+    anyIn(
+      err,
+      [
+        "Invalid input WebAssembly", "WebAssembly translation error",
+        "failed to parse WebAssembly",
+      ],
+    )
+  ) {
+    where = "SILENT (check rc 0)"
+  }
+  const inv = leftmost(
+    err,
+    ["Invalid input WebAssembly code", "type mismatch: expected "],
+  )
+  let detail = ""
+  if startsWith(where, "SILENT") || startsWith(where, "COMPILER TRAP") {
+    if inv.at >= 0 {
+      let n = 48
+      if inv.alt == "Invalid input WebAssembly code" { n = 60 }
+      detail = err.slice(
+        inv.at,
+        cpRunEnd(err, inv.at + inv.alt.length, n, false),
+      )
+    } else if lines.length > 0 {
+      detail = cpPrefix(lines[lines.length - 1], 70)
+    } else {
+      detail = cpPrefix(err, 70)
+    }
+  } else if m.at >= 0 {
+    detail = err.slice(m.at, cpRunEnd(err, m.at + m.alt.length, 54, true))
+  } else if lines.length > 0 {
+    detail = cpPrefix(lines[0], 70)
+  } else {
+    detail = cpPrefix(err, 70)
+  }
+  { where: where, detail: detail }
+}
+
+// One graded program: its verdict, the detail, its stripped stdout and the whole
+// refusal text the detail is a slice of.
+export type Graded = {
+  verdict: string,
+  detail: string,
+  out: string,
+  err: string,
+}
+
+// The `vl` binary, the seed, the `std/` it resolves, the program and the timeout in
+// seconds each `vl` call gets.
+export type Job = {
+  vl: string,
+  seed: string,
+  std: string,
+  probe: string,
+  secs: string,
+}
+
+function vlStd(j: Job, cmd: string): Proc {
+  spawn(
+    "env",
+    [
+      "VL_STD=" + j.std,
+      "timeout",
+      j.secs,
+      j.vl,
+      cmd,
+      j.probe,
+      "--compiler",
+      j.seed,
+    ],
+  )
+}
+
+// Grade `j.probe` against `want` (null: any output passes). `vl run` first, and
+// `vl check` only when the run failed, since only a failing program has a channel
+// to name.
+export function grade(j: Job, want: string | null): Graded {
+  const run = vlStd(j, "run")
+  if run.code == 124 {
+    return {
+      verdict: "TIMEOUT",
+      detail: "no answer in \{j.secs}s",
+      out: "",
+      err: "",
+    }
+  }
+  const out = stripWs(run.out)
+  if run.code == 0 {
+    if want is string {
+      if !matches(want, out) {
+        return { verdict: "WRONG", detail: out, out: out, err: "" }
+      }
+    }
+    return { verdict: "RUNS", detail: "", out: out, err: "" }
+  }
+  const chk = vlStd(j, "check")
+  if chk.code == 124 {
+    return {
+      verdict: "TIMEOUT",
+      detail: "check gave no answer in \{j.secs}s",
+      out: out,
+      err: "",
+    }
+  }
+  const err = chk.out + chk.err + run.out + run.err
+  const v = classify(chk.code, err)
+  { verdict: v.where, detail: v.detail, out: out, err: err }
+}
