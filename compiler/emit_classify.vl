@@ -182,6 +182,7 @@ import {
   nodeTyIsNulNumLitUnion,
   nodeTyIsNulScalarBox,
   nodeTyIsNulStruct,
+  nodeTyIsNullType,
   nodeTyIsNullable,
   nodeTyIsNullableOneRep,
   nodeTyIsObj,
@@ -1494,6 +1495,8 @@ export function retAnnKindChain(tyIx: i32): VKind {
   if retF64Flag(tyIx) == 1 { k = "f64" }
   if retF32Flag(tyIx) == 1 { k = "f32" }
   if retV128Flag(tyIx) == 1 { k = "v128" }
+  // The `null` unit type, the inferred `nulnone` return's annotated twin (D4550).
+  if tyIx >= 0 && nodeTyIsNullType(tyIx) { k = "nulnone" }
   k
 }
 
@@ -17726,6 +17729,9 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyIxOf(exprIx)) == TK_I64 {
     return true // typed-IR fast path (see exprIsF64)
   }
+  // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
+  const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
+  if cnnK >= 0 { return exprIsI64(cnnK, fnIx) }
   // An intrinsic `min` / `max` takes its operands' width, instance by instance.
   const mmk = minMaxKind(exprIx, fnIx)
   if mmk != "" { return mmk == "i64" }
@@ -18177,6 +18183,9 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyIxOf(exprIx)) == TK_F32 {
     return true // typed-IR fast path (see exprIsF64)
   }
+  // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
+  const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
+  if cnnK >= 0 { return exprIsF32(cnnK, fnIx) }
   // An intrinsic `min` / `max` takes its operands' width, instance by instance.
   const mmk = minMaxKind(exprIx, fnIx)
   if mmk != "" { return mmk == "f32" }
@@ -18323,6 +18332,9 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // Typed-IR fast path (additive — only turns false into true, so the syntactic derivation
   // below still applies to a node with no recorded type, e.g. a monomorphized instance body).
   if tyKindOf(nodeTyIxOf(exprIx)) == TK_F64 { return true }
+  // Over a `null`-typed LHS a `??` is its default, at the default's rep (D4550).
+  const cnnK = coalesceNulNoneDefaultIx(exprIx, fnIx)
+  if cnnK >= 0 { return exprIsF64(cnnK, fnIx) }
   // An intrinsic `min` / `max` takes its operands' width, instance by instance.
   const mmk = minMaxKind(exprIx, fnIx)
   if mmk != "" { return mmk == "f64" }
@@ -24705,6 +24717,8 @@ function annIsNulStrListDeep(tyIx: i32) {
 // not a second arm here, or the two would drift.
 function annRepKindOf(tyNodeIx: i32): VKind | null {
   if tyNodeIx < 0 { return null }
+  // An annotation naming the `null` unit type is the `nulnone` cell (D4550).
+  if nodeTyIsNullType(tyNodeIx) { return "nulnone" }
   const rd = repOfNode(tyNodeIx)
   if rd.rdCovered == 1 { return rd.rdKind }
   null
@@ -36650,13 +36664,15 @@ function coalesceNulNoneDefaultIx(exprIx: i32, fnIx: i32): i32 {
 
 // The binding half of `exprIsNulNone`: is the LetDecl at `letIx` a binding whose only value
 // is `null`? Two producers, matching the expression side: a never-filled infer-null hole
-// (D1576), and an un-annotated binding to a call returning `null` always. An annotated
-// binding never lands here: its annotation pins the rep, and `C | null = null` is `nulstruct`.
+// (D1576), and an un-annotated binding to a call returning `null` always. An annotation
+// lands here only when it names `null` itself; `C | null = null` is `nulstruct`.
 export function letIsNulNone(letIx: i32, fnIx: i32): boolean {
   if letIx < 0 { return false }
   const s = P.nodes[letIx]
   if s is LetDecl {
-    if s.letType >= 0 || s.letInit < 0 { return false }
+    // An annotation naming the `null` unit type pins the same cell (D4550).
+    if s.letType >= 0 { return nodeTyIsNullType(s.letType) }
+    if s.letInit < 0 { return false }
     const ini = P.nodes[unwrapParen(s.letInit)]
     if ini is NullLit { return letNullHoleUnfilled(letIx) }
     // A `null`-typed initializer a later write filled is that write's `T | null` (D3355).
@@ -38064,6 +38080,9 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // an un-annotated binding inferred the residual scalar cell and its `!= null` found no
     // nullable rep to test. Delegated to the name-typed mirror so the two cannot disagree.
     if e.binOp == "??" {
+      // Over a `null`-typed LHS the value is the default, at the default's rep (D4550).
+      const cnnU = coalesceNulNoneDefaultIx(exprIx, fnIx)
+      if cnnU >= 0 { return exprUnion(cnnU, fnIx) }
       if unionNameOfExpr(exprIx, fnIx) != "" { return true }
       // A niche joined to a default of another type is the box the lowering builds (D2373).
       if coalesceNicheJoinsToBox(exprIx, fnIx) { return true }
