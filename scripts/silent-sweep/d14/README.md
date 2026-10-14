@@ -59,4 +59,4 @@ grade-class comparison; only the distilled corpus and the corpus `cmp` see it. I
 form — the same arm at the HEAD of the floor block rather than at the floors — reads
 identically on this grid and takes **33 corpus modules** with it, `std/buffer.vl` first,
 because `Buf.length` is a real declared field. Nothing but
-`scripts/silent-sweep/corpuscmp.py` saw that.
+`scripts/silent-sweep/corpuscmp.vl` saw that.

@@ -109,7 +109,7 @@ back "module written", so a build stage stuck at "no module" would have graded t
 `compiler trap` and did not.
 
 The PUBLISHED grader was re-validated against the same compiler first:
-`scripts/silent-sweep/sabotage.py` → **15 wrong_value / 10 wrong_evalcount / 8 trap / 5
+`scripts/silent-sweep/sabotage.py` (since deleted) → **15 wrong_value / 10 wrong_evalcount / 8 trap / 5
 correct**, exactly as `REPRODUCE.md` publishes.
 
 > **`sabcensus.py`'s `check-clean invalid wasm` column is PERISHABLE — a specimen chosen to model

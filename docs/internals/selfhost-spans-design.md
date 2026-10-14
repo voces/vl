@@ -115,7 +115,7 @@ emitter never sees tokens, so it cannot perturb emitted bytes.
     `selfhost_pipeline_test.ts`, `selfhost_self_typecheck_test.ts`,
     `selfhost_emit_program_test.ts` (its `runCase` driver — note this file ALSO
     contains self-contained mini-programs that define their OWN local `Tok`, which
-    are left alone), plus `scripts/perf.ts` — all fill `start/line/col` from the
+    are left alone), plus `scripts/perf.ts` (since removed) — all fill `start/line/col` from the
     lexed token `t`.
   - 2 are hand-built helpers needing placeholders: `selfhost_typecheck_test.ts`'s
     `tok()` and the literal token lists in `selfhost_parser_test.ts`.

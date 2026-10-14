@@ -55,7 +55,7 @@ surviving the worktree.
 `88f21245`, seed 1,455,395 bytes (a self-compilation fixed point, so the seed identifies the
 commit rather than being asserted to).**
 
-`scripts/check-filed-witnesses.py` re-runs each row's own program and reports which no longer
+`scripts/check-filed-witnesses.vl` re-runs each row's own program and reports which no longer
 behave as filed. It could not parse a single row of THIS file, and so had never graded one:
 its parser required a `Repro:` lead-in, and this file writes the program directly under the
 status line (see the header above — *"every defect below carries its minimal program and its
@@ -126,7 +126,7 @@ table of measurements, and it was indistinguishable from one.
   that this file's pre-existing debt did not red the tree for an author who is not editing it;
   closing the debt is what lets it in.
 
-`python3 scripts/check-filed-witnesses.py --strict docs/internals/silent-class-inventory-2.md`
+`python3 scripts/check-filed-witnesses.vl --strict docs/internals/silent-class-inventory-2.md`
 now reports **14 graded · 14 as filed · 0 MOVED · 0 not graded**.
 
 ## 0. What was measured

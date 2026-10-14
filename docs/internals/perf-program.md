@@ -2438,7 +2438,7 @@ instantiate that module, so engine support is not only a question about user pro
 | `scripts/vl-host` (`vl run`) | wasmtime, `wasm_gc` + `wasm_function_references`, **never sets `wasm_tail_call`** | **runs** — prints `91392`, the module's `meta.expect` |
 | `tests/support/runWasm.ts` (`deno task test`) | deno 2.9.0 / V8 14.9 | **runs** — `logs=["91392"]`; 5M-deep descent also returns `407392` |
 | `lsp/src/wasmCheckerNode.ts` path | Node v24.18.0 / V8 | **runs** — `logs=["91392"]` |
-| `scripts/wasmtime-host.rs` | wasmtime, same `Config` | **retired spike** — no build wiring, docs-only, in no gate. Not executed; the identical `Config` is verified above. |
+| `scripts/wasmtime-host.rs` | wasmtime, same `Config` | **retired spike**, since deleted — no build wiring, docs-only, in no gate. Not executed; the identical `Config` is verified above. |
 
 NOT verified, and stated as such: a real BROWSER for `playground/`. The support floor
 argues it is safe — WasmGC ships no earlier than tail calls in any of the three engines
@@ -3159,12 +3159,13 @@ should be re-priced before the item is taken.
 
 ### 15.3 The harness
 
-`scripts/p7-*` is kept. `p7-time.sh` is the piece worth reusing: it reports
+`scripts/p7-time.sh` is kept, and is the piece worth reusing: it reports
 **MIN and MEDIAN of (user+sys) CPU milliseconds** rather than wall clock — far
 less contention-sensitive on a shared box, which is this repo's normal condition
 — interleaves every module once per round, and **asserts every module's stdout is
-identical before timing anything**. `p7-gen.sh`/`p7-patch.py` generate WAT
-variants from one base; `p7-build.sh`/`p7-probe.sh` build and disassemble.
+identical before timing anything**. The P7-specific rest of the family —
+`p7-gen.sh`/`p7-patch.py` (WAT variants from one base), `p7-build.sh`/`p7-probe.sh`
+(build and disassemble) and `p7-eq.sh` — was deleted once the item closed; git history has it.
 
 ### 15.4 The loop-shape gate fired, and it was checked rather than bumped
 

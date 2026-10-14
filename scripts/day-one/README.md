@@ -73,7 +73,7 @@ module's loop variable colliding with the importer's block `const`, a hole param
 across the import, an exported `type` read annotated and un-annotated — are not a face of
 any single-file plan. So its record in `AXES` carries `"generator": "modules"`, `render.py`
 delegates to `modules.make_pair`, and its split face is one source string carrying
-`// file:` markers — the same spelling `scripts/check-filed-witnesses.py` grades a two-file
+`// file:` markers — the same spelling `scripts/check-filed-witnesses.vl` grades a two-file
 witness with, so a hit can be pasted into an inventory row without being re-typed.
 
 `imports_pair` is the second, and what it varies is the IMPORT LIST: one std module against

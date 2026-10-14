@@ -1,5 +1,13 @@
 # Code-quality survey — the tooling, std and the host
 
+<!-- paths-as-of: 2026-09-04 -->
+> **Script paths are as of this survey.** Several tools it ran have since been retired: the
+> Python ratchets (`ratchet.py` and the `*-budget.py` family) are now
+> `vl check --budget scripts/<name>-budget-baseline.json`; `goal-scoreboard.py`,
+> `emitter-state-audit.py` and `seed-size.py` are their `.vl` ports of the same name;
+> `capability-probes/run.py` is `scripts/capability-probes.vl` and `capability-probes/matrix.py`
+> is `scripts/capability-matrix.vl`. The commands below are the record of what was run.
+
 Every line number is from **`facb9f610`**, the checkout this was measured on (`origin/master`
 had moved to `e05d21131` by the time it was written). Every number names the command that
 produced it in §9, and every finding carries the gate rows that would prove its fix safe.

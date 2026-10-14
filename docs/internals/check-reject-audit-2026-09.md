@@ -2,7 +2,7 @@
 
 **Measured 2026-09-03 on `76dfcc00`, a clean worktree with a seed refreshed from
 `compiler/*.vl` by `scripts/agent-setup.sh`.** Every witness below was run VERBATIM out of its
-filed row — extracted by `scripts/check-filed-witnesses.py`'s own parser so no program was
+filed row — extracted by `scripts/check-filed-witnesses.vl`'s own parser so no program was
 retyped — with `VL_STD` pinned to this worktree's `std/`.
 
 This is a MEASUREMENT, not a fix. Nothing in `compiler/`, nothing in either inventory, and no
@@ -371,8 +371,8 @@ D852) are filed CLOSED.
 ## What this audit does NOT say
 
 * **It does not say VL has 15 clause-2 violations.** It says 15 of 53 FILED rows are.
-  `goal-scoreboard.py` reads the corpus, which contributes zero emit-side evidence, and
-  `scripts/capability-probes/run.py --sites` is the finer instrument for the unfiled ones.
+  `goal-scoreboard.vl` (then `.py`) reads the corpus, which contributes zero emit-side evidence, and
+  `vl run scripts/capability-probes.vl` (then `capability-probes/run.py`) is the finer instrument for the unfiled ones.
 * **It does not re-derive the "25 rows in five days" number.** That claim's population was
   never written down; this one's is.
 * **It grades the WITNESS, not the family.** D661B's witness is unsound and its verdict is
@@ -382,7 +382,7 @@ D852) are filed CLOSED.
 ## Reproducing this
 
 ```sh
-python3 scripts/check-filed-witnesses.py --strict --json out.json \
+python3 scripts/check-filed-witnesses.vl --strict --json out.json \
     docs/internals/silent-class-inventory.md docs/internals/silent-class-inventory-2.md
 # then: the 53 rows whose `actual` is `check_reject`, each repro run verbatim with
 # VL_STD pinned to the worktree's std/.
