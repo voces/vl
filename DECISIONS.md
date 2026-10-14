@@ -569,7 +569,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **THE GATE'S CRITERION AND THE SHIPPING CRITERION ARE ONE CRITERION, and letting them drift
   cost this repo a large net win for a day** (2026-08-28, silent-class-inventory-2 D11 /
-  #1993 → #2003). `scripts/silent-sweep/distilled/regress.py` blocks on `runs → not-runs` and
+  #1993 → #2003). `scripts/silent-sweep/distilled/regress.vl` blocks on `runs → not-runs` and
   on nothing else, for a reason it states: *a program that did not work before and does not
   work now has not regressed in the sense a gate should stop the world for*. The shipping bar
   drifted stricter than that without anyone deciding it should, and #1993 refused a candidate
@@ -3320,7 +3320,7 @@ in. A grid that cannot fail is not a measurement, and neither of these announced
 ### Stating that rule did not stop the next grid from breaking it; RUNNING it did
 
 **The rule above was written down, and the very next grid over the same family broke it
-again.** D471/D425's generator (`scripts/silent-sweep/d471/opdeclgrid.py`) ordered its string
+again.** D471/D425's generator (`scripts/silent-sweep/d471/opdeclgrid.py`, since deleted) ordered its string
 and literal-union operands ASCENDING while its numeric ones descended, so `"ab" < "cd"` is
 natively `true` — and the `<` declarations returned `true`. Thirty-two cells could not have
 distinguished dispatch from inertness. Nobody noticed while writing the table; the run did.
@@ -4023,7 +4023,7 @@ compiler accepts". A refusal relabelled as a design rule is exactly the drift.
 
 ### The tripwire
 
-`scripts/silent-sweep/d741/gen741.py`'s 123 cells are in `distilled/named/`, 46 of them
+The deleted `scripts/silent-sweep/d741/gen741.py`'s 123 cells are in `distilled/named/`, 46 of them
 running. Any future candidate for (a)–(d) re-grades against them in one command and has to say
 which of the 46 it costs.
 
@@ -5968,7 +5968,7 @@ move is **1,834,521 → 1,996,118 (+8.8%)** across four landings on 2026-09-03 (
 endpoint is confirmed here — the fixpoint ladder at `ff4b5f04` prints 1,996,118 — and the
 starting figure is as reported, not re-derived.
 
-`scripts/seed-size.vl` makes it a gated number, in the shape `scripts/comment-budget.py`
+`scripts/seed-size.vl` makes it a gated number, in the shape the since-retired `scripts/comment-budget.py`
 already proved: a committed baseline, `--check` in `scripts/gate.sh` and in ci-native, and
 `--write-baseline` in the SAME PR as the change that earned the growth. A jump then names its
 own landing instead of being attributed weeks later.
@@ -8643,7 +8643,7 @@ narrowing form (`is`, `!= null`, `== null` with an early return, an `||` guard, 
 **THE PRICE.** A re-narrowed place meets the existing refusal of an `is` test that can never
 match: `if x is i32 { x = "s"; print(x is i32) }` over `i32 | string | null` printed `false` on
 master and is refused now, since `x` is a `string` there. 58 of the 4,600 cells of the
-narrowed-write grid (`scripts/capability-probes/narrowed-write-grid.py`) are that shape, all at
+narrowed-write grid (`scripts/capability-probes/narrowed-write-grid.py`, since deleted) are that shape, all at
 the test of the member the write left. #3184's review grid (2,373 cells) moves 22 cells from
 running to refused, all one shape: a one-branch write of a widening member whose condition was
 false on the run, read where the other member is expected, e.g. `if x is f64 { if c0() { x = 5 };
@@ -9496,7 +9496,7 @@ float literals under an `f32` operation (`y * (0.5 * 3.0 + y)`), which #3324 rea
 widening the operation above it, is now its constant, an `f32` literal beside `y`, so the
 operation stays at `f32` (`tests/cases/arith/float-literal-operation-nested-f32.vl`). The
 exact-constant grid
-(`scripts/capability-probes/const-exact-grid.py`, 36 initialisers x 15 uses x 2 spellings =
+(`scripts/capability-probes/const-exact-grid.py`, since deleted; 36 initialisers x 15 uses x 2 spellings =
 1,080 cells, expected values from Python's exact integers and fractions, and for the 180 cells
 of radix-pattern arithmetic master's own output) grades 1,080 of 1,080 as the rule says; against
 master `028dedb33`, 207 cells moved from a wrapped or step-rounded value (98 now refused, as `K`

@@ -8262,6 +8262,15 @@ export function mvArmHintOfTy(ty: i32): i32 {
   mvArmSigOfTy(ty)
 }
 
+// `mvArmHintOfTy` with the spelling fallback the mint's `mvValArmSig` push takes, so a find for
+// canonical value name `valName` asks what that mint recorded. An inline arm annotation's type
+// reaches no arm row; a type-only hint then declines the slot and a later call mints a twin (D4638).
+export function mvArmHintOfTyName(ty: i32, valName: string): i32 {
+  const h = mvArmHintOfTy(ty)
+  if h != -1 { return h }
+  mvArmSigOfName(valName, 8)
+}
+
 // The typed-find entry point, since every caller of the mv slot find holds the value's type
 // (D93). An un-hinted find matches a slot of any arm parity and lands on the first slot of
 // that structural key; the hint is a pure function of the argument the caller already had. A
@@ -8447,7 +8456,7 @@ function mvShapeOfValNameArmTyGo(
   // not the better-answer-at-a-mint the interner rule forbids: it never makes a find succeed
   // where it failed, only decline a slot whose arm is not this value's, so the mint below runs
   // in strictly more cases and is skipped in none.
-  const armH = mvArmHintOfTy(armTy)
+  const armH = mvArmHintOfTyName(armTy, valName)
   const aSh = mvSlotOfTyKArm(vTy, keyK, armH)
   if aSh >= 0 { return aSh }
   const nmSh = mvSlotByValNameKArm(valName, keyK, armH)
@@ -24914,14 +24923,11 @@ export function mapAnnShape(tyIx: i32) {
         // (D-MAPNODETY): every call site hands a node index, so an uncovered node (-1) keeps the name bridge.
         let aAn = -1
         const vtAn = nodeMapValTyIx(tyIx)
-        // …and the arm component of the slot's identity off the same node (D48): without it
-        // the mint could separate two twin-valued maps' slots while both functions kept
-        // returning the first one's map struct. `vn` is a render that can't tell an arm
-        // from its layout twin either; `vtAn` is the checker's own type and answers nominally.
-        const armAn = mvArmHintOfTy(vtAn)
-        // …and the same key rewrite the mint applies (D93): `mvArmKeyName` is a pure
-        // function of (rendered name, recorded type), so mint and find compute one key.
+        // The slot's key and arm hint come off this node exactly as the mint computes them
+        // (D48): `vn` alone cannot tell an arm from its layout twin, and a find that keys
+        // differently from the mint mints a second slot whose map struct is never filled in.
         const vnA = mvArmKeyName(vn, vtAn)
+        const armAn = mvArmHintOfTyName(vtAn, mvCanonValName(vnA))
         if vtAn >= 0 { aAn = mvSlotOfTyKArm(vtAn, kAn, armAn) }
         if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vnA, kAn, armAn) }
         if aAn >= 0 { return aAn }
@@ -25178,6 +25184,14 @@ function globalKind(initIx: i32): VKind {
   // The packed byte list — before `exprArray` below, which would claim any i32-element
   // list and type the cell as the 4-byte wrapper for a one-byte initializer.
   if exprU8Array(initIx, -1) { return "u8list" }
+  // A value `if`/`match` whose every arm denotes one union arm is that arm's cell, as the
+  // literal itself is above (D4639).
+  if (
+    nodeIsValueJoin(unwrapParen(initIx))
+    && objLitVariantIdxNoStructRow(initIx, -1) >= 0
+  ) {
+    return "variant"
+  }
   if exprUnion(initIx, -1) { return "union" }
   // A concrete-variant init (`const r = mk()` returning a union arm) is the raw variant
   // ref (kind 8), the module-scope twin of `buildLocals`' variant slot — before
@@ -33829,10 +33843,9 @@ function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
   true
 }
 
-// Whether every arm value of the value join at `ix` holds the atom, so the join is the atom too;
-// one string arm makes it a string ref (D1728, D3291).
-function holeJoinArmsAllAtom(ix: i32, fnIx: i32, depth: i32): boolean {
-  if depth > 4 { return false }
+// The value expression of each arm of the `if` chain or `match` at `ix`, -1 for an arm with no
+// tail value; empty when `ix` is neither, or is an `if` with no final `else`.
+function valueJoinArmValues(ix: i32): i32[] {
   const arms: i32[] = []
   const n = P.nodes[ix]
   if n is MatchExpr {
@@ -33843,22 +33856,30 @@ function holeJoinArmsAllAtom(ix: i32, fnIx: i32, depth: i32): boolean {
         arms.push(b)
       }
     }
-  } else {
-    let cur = ix
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        arms.push(ifArmValueExpr(c.ifThen))
-        if c.ifElse < 0 { return false }
-        if P.nodes[c.ifElse] is IfStmt {
-          cur = c.ifElse
-        } else {
-          arms.push(ifArmValueExpr(c.ifElse))
-        }
+    return arms
+  }
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt {
+      arms.push(ifArmValueExpr(c.ifThen))
+      if c.ifElse < 0 { return [] }
+      if P.nodes[c.ifElse] is IfStmt {
+        cur = c.ifElse
+      } else {
+        arms.push(ifArmValueExpr(c.ifElse))
       }
     }
   }
+  arms
+}
+
+// Whether every arm value of the value join at `ix` holds the atom, so the join is the atom too;
+// one string arm makes it a string ref (D1728, D3291).
+function holeJoinArmsAllAtom(ix: i32, fnIx: i32, depth: i32): boolean {
+  if depth > 4 { return false }
+  const arms = valueJoinArmValues(ix)
   if arms.length == 0 { return false }
   for v in arms {
     if v < 0 { return false }
@@ -36996,8 +37017,8 @@ export function variantIndexOfLet(letIx: i32, fnIx: i32) {
   -1
 }
 
-// The union-variant row an un-annotated object-literal initializer in function `fnIx` denotes:
-// `objVariantName`'s match, or -1 if `structIndexOfObj` already claims a row (D39, D51). Re-asks
+// The union-variant row an un-annotated object-literal initializer in function `fnIx` (or a value
+// join of such) denotes: `objVariantName`'s match, or -1 if `structIndexOfObj` claims a row. Re-asks
 // under the opposite precondition from `structIndexOfLet`'s -1, since a bare `{ r: n }` can have
 // two nominal claimants and only one remains once a struct row is ruled out.
 export function objLitVariantIdxNoStructRow(exprIx: i32, fnIx: i32) {
@@ -37010,7 +37031,19 @@ export function objLitVariantIdxNoStructRow(exprIx: i32, fnIx: i32) {
     if vn == "" { return -1 }
     return variantIndexOf(vn)
   }
-  -1
+  // A value `if`/`match` denotes the row only when every arm does; a literal arm is answered
+  // here and any other arm by `exprVariantIndex` (D4639).
+  const arms = valueJoinArmValues(oi)
+  if arms.length == 0 { return -1 }
+  let row = -1
+  for v in arms {
+    if v < 0 { return -1 }
+    let av = objLitVariantIdxNoStructRow(v, fnIx)
+    if av < 0 { av = exprVariantIndex(v, fnIx) }
+    if av < 0 || (row >= 0 && av != row) { return -1 }
+    row = av
+  }
+  row
 }
 
 // The same answer for a `LetDecl`'s INITIALIZER, and only for an UN-annotated binding:
@@ -48077,7 +48110,7 @@ function mvSlotOfMapValNameOrMonoKTy(ivIn: string, keyK: i32, valTy: i32): i32 {
   if mvValKindOfName(iv) == MVK_MONO { return -1 }
   // The find's half of the arm component (D48) — the same tri-state the mint threads,
   // answering nominally when `valTy` is known, else via `MV_ARM_NOHINT`.
-  const armMo = mvArmHintOfTy(valTy)
+  const armMo = mvArmHintOfTyName(valTy, iv)
   let aMo = -1
   if valTy >= 0 { aMo = mvSlotOfTyKArm(valTy, keyK, armMo) }
   if aMo < 0 { aMo = mvSlotOfValNameTyKArm(ivK, keyK, armMo) }

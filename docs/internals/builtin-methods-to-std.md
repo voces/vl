@@ -394,7 +394,7 @@ the `toString` ruling refused. It would also keep ≈1,600 lines alive, in the
 ladder-per-element-kind shape whose missing arms are this compiler's signature defect
 (OQ-3 reason 1).
 
-### 3.4 Compile cost — `scripts/plumb-shape-cost.py`
+### 3.4 Compile cost — `scripts/plumb-shape-cost.vl`
 
 **The gate itself passes on this branch, because nothing under `compiler/` changed:**
 
@@ -588,7 +588,7 @@ Each step closes with the corpus gate. A cell that ran must still run, which is 
 the codemod over `distilled/named/` and the census generators. Re-distil only if a class
 splits.
 
-### 5.2 The codemod — `scripts/codemods/builtin-to-std.py`
+### 5.2 The codemod — `scripts/codemods/builtin-to-std.py` (proposed, never committed)
 
 It follows `label-at.py`'s shape: `--check`, `PATH...`, a directory walked for `*.vl`, exit 0
 when nothing needed rewriting, and comments and strings never touched. The difference is that
@@ -950,7 +950,7 @@ check them.
 
 - **P1 — Codemod delivery.** Teach `vl check --fix` the `ufcs-not-imported` fixer (single
   candidate module, verify-and-revert), so a consumer runs one command. A thin
-  `scripts/codemods/builtin-to-std.py` drives the in-repo pass and `--check` (§5.2).
+  `scripts/codemods/builtin-to-std.py` (never committed; the no-Python ruling makes it VL) drives the in-repo pass and `--check` (§5.2).
 - **P2 — Step order.** As §5.1. `charCodeAt` goes first because it is free. `map`/`filter`
   answer SP-003 and need D1484 and D3557. `slice`/`get` need the `u8[]` twins and the
   `__array_copy__` lowering. The string pair goes last, because it alone needs O1.

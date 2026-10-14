@@ -150,7 +150,7 @@ producers for one answer grew in every pair.
 **Proposed shape.** Three stages, each useful alone.
 
 1. A ratchet on `tyToEmitName(` and the ten parsers outside the renderers and the annotation
-   path, in `scripts/ratchet.py` style.
+   path, as a `vl check --budget` ratchet (the retired `scripts/ratchet.py`'s successor).
 2. Type-taking twins for the parsers behind a render: `valueAtomKindOfTy` (the six
    `valueAtomKind(tyToEmitName(…))` sites, `wasmEmit.vl:16056, 16057, 32542, 32598, 32607,
    33056`), `mvValKindOfTy`, `tyIsArray`, `internShapeDeepTy` without its string argument,
@@ -547,7 +547,7 @@ blocks went 9 → 17. Errno numbers are stated in three places with no check bet
 (`wasi_errno`, `main.rs:4023–4053`; inline literals; `std/fs.vl:35`).
 
 **Proposed shape.** A table of imports; one errno source and a test that reads both sides;
-retire the dead `wasmtime-host.rs`. **First PR.** The errno test. **Cost.** 2–3 days.
+retire the dead `wasmtime-host.rs` (done in S-l). **First PR.** The errno test. **Cost.** 2–3 days.
 
 <a id="L14"></a>
 ### L14. Type section emitted from the recorded allocation order
@@ -598,7 +598,7 @@ the row says otherwise. Line numbers are at 5d4cd14dc.
 | | `value_flags` duplicates `cliParseArgs`'s value flags; `engineFailOffset` has a Rust twin and no test | `main.rs:233–245`; `driver.vl:3069` / `main.rs:1532` | one table test each | new tests | `value_flags` done (`tests/cli_host_tables_test.ts`): `--budget`, `--budget-why` and `--findings` are missing from it, pinned as a surface question; `engineFailOffset` not started, since the seed does not export it |
 | **S-j: LSP twins** | resolver mirror with no agreement test; lexer twin `vlLex.ts` (442 lines); `LEX_CLASS_TOKEN_TYPE` cites a missing path; `moduleGraph.ts` header describes a deleted pipeline | `typeFeatures.ts:1555` vs `driver.vl:3659`; `lsp/src/vlLex.ts`; `typeFeatures.ts:195–200`; `moduleGraph.ts:1–31` | export the resolver from the seed or add a table test; agreement test for the lexer (or replace it, UNDECIDED); fix the citation and header | lsp tests | done (#3696, items 1-4) |
 | **S-k: Python instruments** | `read_source` byte-identical in 4 scripts, `sources()` in 5; 6 ratchet `main()` ladders | `ratchet.py` and the census/budget scripts | import from `ratchet`; `ratchet.Ratchet.main` | identical `--check` output | superseded: the owner's no-Python direction removes the scripts instead of refactoring them |
-| **S-l: dead scripts and paths** | `scripts/p7-*`, `p7-patch.py`, `wasmtime-host.rs` and other unreferenced scripts; 14 of 734 doc mentions of scripts dangle | `scripts/`, `docs/` | delete or archive; fix the paths | `vl_inventory_refs_test` | not started |
+| **S-l: dead scripts and paths** | `scripts/p7-*`, `p7-patch.py`, `wasmtime-host.rs` and other unreferenced scripts; 14 of 734 doc mentions of scripts dangle | `scripts/`, `docs/` | delete or archive; fix the paths | `tests/vl_doc_script_paths_test.ts` | done: `p7-build`/`-eq`/`-gen`/`-probe.sh`, `p7-patch.py` and `wasmtime-host.rs` deleted (`p7-time.sh` kept, cited by five docs); 109 dangling doc mentions repointed or marked historical, and the new test holds the rest at zero |
 | **S-m: std (via std-api-reviewer)** | `std:seed` is a test fixture shipped as a module; std has no hex parse/format (glean defines `parseHex` 50×); one test bypasses `isStdKey` | `std/seed.vl`; `std/fmt.vl`; `tests/support/casesWasmOracle.ts:284` | repoint the tests and drop `std:seed`; propose `parseHex`/`toHex`; use `isStdKey` | std tests; std-api review | not started |
 | **S-n: tests index** | 194 `tests/*.ts` files named by runner prefix (load-bearing), with no index | `tests/` | a short `tests/README.md` mapping prefix → runner, topic → files | none | done: `tests/README.md`, held to the tree by `tests/tests_readme_test.ts` |
 

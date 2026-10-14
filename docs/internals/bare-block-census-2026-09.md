@@ -26,7 +26,7 @@ almost nothing else is.
 
 ## The derivation is a script
 
-`scripts/block-census.py` derives the population rather than grepping for it. It takes every
+`scripts/block-census.py` (deleted in #3645 with the other unreached Python) derived the population rather than grepping for it. It takes every
 function that names at least two of the four block-bearing statements — 73 statement-list walks
 over 21 files — and splits them three ways:
 
@@ -92,7 +92,7 @@ than settled by a fix.
 ## Re-running it
 
 ```sh
-python3 scripts/block-census.py
+python3 scripts/block-census.py   # deleted in #3645; recover it from git history
 ```
 
 It re-derives the walks and the pass-order cut from the tree, so a new pre-rewrite pass, or a

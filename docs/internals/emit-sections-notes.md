@@ -42,7 +42,7 @@ declared inside a generic body, because `collectFns` lifts it before
 `monomorphize` runs and one lifted function then served every instance. **That is
 built now**: `monoCloneLambdaSubst` / `monoPinBodyLambdas` instantiate the lambda
 per pin with the substituted annotations and `monomorphize`'s prune stubs the
-template, so the 68 cells of `scripts/silent-sweep/d426/lamgrid.py` that this
+template, so the 68 cells of `scripts/silent-sweep/d426/lamgrid.py` (since deleted) that this
 floor used to refuse all RUN (2026-08-30, D426's second close).
 
 WHAT STILL LANDS HERE is the case the substitution cannot serve: a type parameter

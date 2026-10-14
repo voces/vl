@@ -280,7 +280,7 @@ land — that invisibility is the defining property of the uncoloured model.
 
 1. **Host ABI batch** — argv, file read/write, directory listing. One batch: every import
    must land in **three hosts** (`scripts/vl-host/src/main.rs`,
-   `tests/support/runWasm.ts`, `scripts/wasmtime-host.rs`) plus a declaration in
+   `tests/support/runWasm.ts`, `scripts/wasmtime-host.rs`, since deleted) plus a declaration in
    `compiler/wasmEmit.vl`. Miss one and a program runs under the CLI and fails under
    `deno task test`.
 2. **`std:fs`** on the ruled error shape (floor `{msg: string}`, `IoError` adding `code`).

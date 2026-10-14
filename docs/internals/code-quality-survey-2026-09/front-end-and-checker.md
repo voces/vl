@@ -1,5 +1,13 @@
 # Code-quality survey — the front end and the checker
 
+<!-- paths-as-of: 2026-09-04 -->
+> **Script paths are as of this survey.** Several tools it ran have since been retired: the
+> Python ratchets (`ratchet.py` and the `*-budget.py` family) are now
+> `vl check --budget scripts/<name>-budget-baseline.json`; `goal-scoreboard.py`,
+> `emitter-state-audit.py` and `seed-size.py` are their `.vl` ports of the same name;
+> `capability-probes/run.py` is `scripts/capability-probes.vl` and `capability-probes/matrix.py`
+> is `scripts/capability-matrix.vl`. The commands below are the record of what was run.
+
 Read-only survey of `compiler/lexer.vl`, `parser.vl`, `ast.vl`, `tyname.vl`, `symbols.vl`,
 `strutil.vl`, `typecheck.vl`, `check_query.vl`, `check_state.vl`, `json_walk.vl`
 (41,206 lines, 1,493 functions, 750 exports). Line numbers are `e05d21131`; the profiles and

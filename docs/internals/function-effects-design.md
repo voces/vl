@@ -621,7 +621,7 @@ bound so that the user's getter's total passes 16 steps, the user's getter fails
 **loudly**, on upgrade. So nothing is unsound. What is missing is that **std's own CI would
 not notice** that it withdrew a property users depend on.
 
-**Recommended: `scripts/std-effects-baseline.json`**, one line per std export, recording its
+**Recommended: `scripts/std-effects-baseline.json`** (proposed, never committed), one line per std export, recording its
 derived predicates (`pure`, `terminating`, `getter-eligible`) and its **bound as a number**
 (`Bounded(n)` or `Unbounded`, §C1a). `--check` in `gate.sh` fails when any export **loses** a
 predicate or its **bound increases**. The bound has to be a number, not only the
@@ -853,7 +853,7 @@ getter text uses the word.)
 qualifier's consumers do not want cost (§E2). Cost has no one-way decision to protect.
 
 **I4. std's cost promise. OPEN**, deferred by D-Q6 to its own ruling.
-(a) A checked baseline, `scripts/std-effects-baseline.json`, and a rubric row (§E4); (b) a
+(a) A checked baseline, `scripts/std-effects-baseline.json` (never committed), and a rubric row (§E4); (b) a
 second keyword now (`bounded`, `cheap`); (c) none: inference only, so a std regression breaks
 users loudly on upgrade.
 *Recommend (a).* It is checked, has no syntax, and covers VL's one boundary. Choose (b)'s word

@@ -169,7 +169,7 @@ All instruments were kept out of the tree. Each one's shape, so it can be rebuil
   `$VL_PROFILE_GUEST` and fuel under `$VL_FUEL`, and takes `$VL_HEAP_MB` and `$VL_INLINE`.
   `instantiate_program` calls `start_guest_profile` and `arm_guest_profile` on the program's
   store, which makes `vl run x.wasm` profile the program instead of the compiler. After the run,
-  `run_program_with` prints the fuel consumed. Rank the profile with `scripts/profile-rank.py`.
+  `run_program_with` prints the fuel consumed. Rank the profile with `scripts/profile-rank.vl`.
 * **Rust on the same engine version.** A 40-line binary built against `wasmtime = "=47.0.2"` and
   `wasmtime-wasi = "=47.0.2"` (`p1::add_to_linker_sync`, one preopened directory, optional fuel).
 * **V8.** Twin sources with the args hard-coded, since JS cannot build the `u8[]` that

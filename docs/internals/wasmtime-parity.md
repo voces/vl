@@ -117,7 +117,7 @@ wasmtime run -W gc probe.wasm
 ```
 
 So run it through a tiny wasmtime-crate host that defines `imports::*` and
-enables GC (`scripts/wasmtime-host.rs`, see below):
+enables GC (`scripts/wasmtime-host.rs`, since deleted, see below):
 
 ```
 cargo run --release -- probe.wasm   # -> 132
@@ -175,12 +175,13 @@ so they never reach wasmtime; the rest were build-side skips.
 
 ## Reproducing / the host
 
-The host used for the spike lives at `scripts/wasmtime-host.rs` (standalone; it
+The host used for the spike lived at `scripts/wasmtime-host.rs`, since deleted from the tree
+(`git show 58f29d10c:scripts/wasmtime-host.rs` recovers the deleted file; standalone, it
 depends only on the `wasmtime` crate). To run it:
 
 ```
 mkdir host && cd host && cargo init --name vl-wasmtime-host
-# add `wasmtime = "45"` to Cargo.toml, copy scripts/wasmtime-host.rs to src/main.rs
+# add `wasmtime = "45"` to Cargo.toml; write the recovered (deleted) host to src/main.rs
 deno task build probe.vl -o probe.wasm
 cargo run --release -- probe.wasm
 ```
