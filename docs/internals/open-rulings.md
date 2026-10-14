@@ -1246,7 +1246,7 @@ temp-directory primitive. Writing into a directory that does not exist is `ENOEN
 would write to.
 
 **The witness is the second script the dogfooding lane ports, and this one BLOCKS it.**
-`scripts/check-filed-witnesses.py` grades every inventory row by writing its `Repro:` block to
+`scripts/check-filed-witnesses.vl` grades every inventory row by writing its `Repro:` block to
 a **fresh temp directory** and running `vl` there. **Eight rows across the two inventories carry
 a multi-file witness** — D1120, D1191, D1519, D1571, D1585, D1598, D1651 and D1654, the
 `// file: <name>.vl` form, added because a merge-time registry collision between two modules
@@ -1300,7 +1300,7 @@ of the floor meets.
 `padStart` / `padEnd`. A VL program that recognises a shape in text writes the scan by hand.
 
 **The witness is the same script, and here the finding is that this is NOT a blocker.**
-`scripts/check-filed-witnesses.py` spells seven patterns with `re` — the row heading and its
+`scripts/check-filed-witnesses.vl` spells seven patterns with `re` — the row heading and its
 id suffix grammar (`D661A`, `D804b`, `D1009-N`), the row-shaped-heading population counter,
 the any-heading row terminator, the `// file:` marker, the inventory-split source marker, and
 the parse-error status phrase. **All of them are hand-writable, and the hard one was
@@ -1343,7 +1343,7 @@ argument, no `kill`, and no way to interrupt it. A child that loops runs forever
 VL program with it.
 
 **The witness is the same script, and this one is a robustness regression rather than a
-blocker.** `scripts/check-filed-witnesses.py` spawns `vl` two or three times per row —
+blocker.** `scripts/check-filed-witnesses.vl` spawns `vl` two or three times per row —
 `check`, `run`, and `build` where the first two do not settle it — across 829 rows in inventory
 #1 alone, and **every one of those calls carries `timeout=120`**. That bound is not decoration:
 the rows this grader runs are, by construction, programs that provoke the compiler, and a

@@ -138,7 +138,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `scripts/capability-matrix.vl` (was `matrix.py`); see the fuller row below, and CLAUDE.md's
   "A CAPABILITY GAP HAS A POSITION MATRIX".
 - ✅ **3. Split the inventory into one file per row — DONE (#2416 tooling, #2437 applied
-  2026-09-03).** See the fuller row below; `scripts/inventory/split.py --apply
+  2026-09-03).** See the fuller row below; `scripts/inventory/split.py` (since deleted) `--apply
   --relink` against fresh master under an append freeze.
 - 🟡 **4. Key the union/variant registries by arena type id, and collapse the kind ladders —
   DESIGN + shim #2417, steps 1-3, 4a and 4b landed since.** Registries keyed by SPELLED names
@@ -399,7 +399,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `emitNumCastTrapMsg` embeds an `as!` site's `line:col`: over all 67 `tests/cases/std/*.vl`,
   15 modules differ, 0 beyond that print-char stream, 0 at runtime.
 - **Modernization program, item 3 — the defect inventory is ONE FILE PER ROW. DONE (#2437,
-  applied 2026-09-03).** `scripts/inventory/split.py --apply --relink` run
+  applied 2026-09-03).** `scripts/inventory/split.py --apply --relink` (since deleted) run
   against fresh master, under a freeze on inventory appends; every consumer already reads
   either form, so nothing else changes that day. Two gates came out of it:
   `tests/vl_inventory_refs_test.ts` (a cited row must EXIST — #2405 deleted a row and every

@@ -105,7 +105,7 @@ in `docs/internals/silent-class-inventory.md`.  Three things about them:
 
 ### Grader validation, re-run against the compilers actually measured with
 
-`scripts/silent-sweep/sabotage.py` reproduces its published counts exactly on the `88f21245`
+`scripts/silent-sweep/sabotage.py` (since deleted) reproduces its published counts exactly on the `88f21245`
 seed: **15 wrong_value / 10 wrong_evalcount / 8 trap / 5 correct**.
 
 `sabcensus.py` as it stood at `1559d80c` reproduced its published counts exactly there, and read

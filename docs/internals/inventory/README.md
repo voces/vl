@@ -52,7 +52,7 @@ minted twice on 2026-09-01. Check the id against MASTER, not your branch.
 > to stop — so check the id against MASTER, not against your own branch.
 > RESERVED D1242–D1244 — the position-matrix findings session (vl-b7f). The brief said
 > D1240–D1242; `git grep -nE 'D124[0-2]\b'` on the merged tree found D1240 and D1241
-> already minted, and `scripts/inventory/ls.py --next` answered D1242, so the block moved
+> already minted, and `scripts/inventory/ls.vl --next` answered D1242, so the block moved
 > up by two. Three ids, not a block of 20, because three is what was minted.
 > RESERVED D1474–D1476 — the day-one sampler session. `ls.py --next` answered D1474 on
 > master `cdfdc14e` and a grep of the tree found no higher id. Three ids, minted: two
@@ -98,7 +98,7 @@ is loud at load.
 *(Cell counts differ because the generator now skips more unreachable combinations, so this
 is not a cell-for-cell delta.)*
 
-**Per-row verdict, from `scripts/check-filed-witnesses.py` — which runs each row's OWN filed
+**Per-row verdict, from `scripts/check-filed-witnesses.vl` — which runs each row's OWN filed
 repro rather than a paraphrase:**
 
 | row | filed | today |

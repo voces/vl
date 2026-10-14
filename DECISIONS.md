@@ -569,7 +569,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **THE GATE'S CRITERION AND THE SHIPPING CRITERION ARE ONE CRITERION, and letting them drift
   cost this repo a large net win for a day** (2026-08-28, silent-class-inventory-2 D11 /
-  #1993 → #2003). `scripts/silent-sweep/distilled/regress.py` blocks on `runs → not-runs` and
+  #1993 → #2003). `scripts/silent-sweep/distilled/regress.vl` blocks on `runs → not-runs` and
   on nothing else, for a reason it states: *a program that did not work before and does not
   work now has not regressed in the sense a gate should stop the world for*. The shipping bar
   drifted stricter than that without anyone deciding it should, and #1993 refused a candidate

@@ -394,7 +394,7 @@ the `toString` ruling refused. It would also keep ≈1,600 lines alive, in the
 ladder-per-element-kind shape whose missing arms are this compiler's signature defect
 (OQ-3 reason 1).
 
-### 3.4 Compile cost — `scripts/plumb-shape-cost.py`
+### 3.4 Compile cost — `scripts/plumb-shape-cost.vl`
 
 **The gate itself passes on this branch, because nothing under `compiler/` changed:**
 

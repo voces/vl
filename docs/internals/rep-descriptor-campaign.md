@@ -359,7 +359,7 @@ Every conversion owes all five, and the first is the one that decides:
    is not yet evidence; say which modules left and grade those first.
 2. **Byte identity** of the emitted module over both populations — both arms built from ONE
    seed, compared on sha256 and exit code, never on file size.
-3. `scripts/silent-sweep/distilled/regress.py`: **0 `runs → not-runs`, 0 `→ silent`**.
+3. `scripts/silent-sweep/distilled/regress.vl`: **0 `runs → not-runs`, 0 `→ silent`**.
 4. `scripts/rep-fuzz-check.sh` exact — mandatory; the corpus and the fixpoint are both blind
    to REJECT→MISMATCH.
 5. `scripts/mono-tyaram-grid.sh` no BAD — for anything that touches the pin context.
