@@ -2902,4 +2902,5 @@ over a spread. These notes have an uncovered column side, so they count oracle v
 retried `criClassify` pass visits those expressions again. The emitted bytes are unchanged.
 
 **Next, in order:** items 1, 2, 4 and 5 of §13.14. Then the 65 `list → reflist` in
-`gradual-type-parameter-union.vl`, D4683 and D4684.
+`gradual-type-parameter-union.vl`. D4683 and D4684 have since closed (their rows give the
+mechanisms); the union twins they surfaced are D4711 and D4712.
