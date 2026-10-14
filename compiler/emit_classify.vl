@@ -9753,16 +9753,19 @@ function arrLitHasAtomElem(ix: i32, fnIx: i32) {
   false
 }
 
-// True if `retArgIx` is a literal-union atom returned from a function whose return type widens
-// it to a string — `string`, or a boxed union with a litunion or `string` arm. It widens at the
-// return, riding the string-op scratch frame. An inline literal-union return reps as a string
-// ref and so widens an atom operand; a named alias reps as the atom itself and must not.
-function retLitUnionInlineTy(tyIx: i32): boolean {
+// True if the return annotation at `tyIx` is an un-named (inline) literal union — a pure
+// litunion in the arena that is not a registered alias. The alias reps as an interned atom,
+// the inline form a string ref; `nodeTyIsLitUnionAlias` is the seam between them.
+export function retLitUnionInline(tyIx: i32): boolean {
   if tyIx < 0 { return false }
   if nodeTyIsLitUnionAlias(tyIx) { return false }
   tyIsLitUnion(nodeTyIxOf(tyIx))
 }
 
+// True if `retArgIx` is a literal-union atom returned from a function whose return type widens
+// it to a string — `string`, or a boxed union with a litunion or `string` arm. It widens at the
+// return, riding the string-op scratch frame. An inline literal-union return reps as a string
+// ref and so widens an atom operand; a named alias reps as the atom itself and must not.
 function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   if retArgIx < 0 { return false }
@@ -9777,7 +9780,7 @@ function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
     // `emitReturnValue`'s widen ladder. This is a reservation pass and that is an emit pass,
     // and the two must claim the same set arm for arm, or the widen runs against unreserved
     // locals. Reachable only through a monomorphized instance, whose element read is an atom.
-    if retLitUnionInlineTy(fn.fnRet) {
+    if retLitUnionInline(fn.fnRet) {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
       if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
     }
@@ -10264,7 +10267,7 @@ export function eqgInnerKind(slot: i32) {
 }
 
 // The nested element's ref-list slot, or 0 for an element rep that is not slot-keyed — the
-// same convention `catListSlotOfBin` uses, and for the same reason.
+// same convention `listOpSlotOfBin` uses, and for the same reason.
 export function eqgInnerSlot(slot: i32) {
   if slot < 0 || slot >= rlElemKindTbl.length { return 0 }
   if rlElemKindTbl[slot] == RLK_REF_LIST { return rlElemInnerSlot(slot) }
@@ -10414,22 +10417,11 @@ export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore) {
   -1
 }
 
-// The ref-list slot a generic-compare `==` runs over, or 0 for a rep that is not slot-keyed.
-// The `==` twin of `catListSlotOfBin`, split from the kind for the same reason.
-export function eqgListSlotOfBin(binIx: i32, fnIx: i32) {
-  const e = P.nodes[binIx]
-  if e is BinExpr {
-    const s = refListSlotOfExpr(e.binLeft, fnIx)
-    if s >= 0 { return s }
-  }
-  0
-}
-
-// The ref-list slot a `+` `BinExpr` concatenates over, or 0 for a rep that is not slot-keyed,
-// the frame's two ref slots reading their heap indices off the rep code alone. Split from
-// `catListKindOfBin` rather than packed into its return value: the callers needing the slot
-// need the kind too, and an encoded pair is a decode at every site.
-export function catListSlotOfBin(binIx: i32, fnIx: i32) {
+// The ref-list slot a list `==`, `!=` or `+` `BinExpr` runs over, read off its left operand,
+// or 0 for a rep that is not slot-keyed. Split from the op's kind rather than packed into its
+// return value: the callers needing the slot need the kind too, and an encoded pair is a
+// decode at every site.
+export function listOpSlotOfBin(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const s = refListSlotOfExpr(e.binLeft, fnIx)
@@ -11818,17 +11810,18 @@ export function uFieldElemTyIxRow(ix: i32): i32 {
 // second push would be the wrong tool: the row's other columns are already in place, so
 // pushing again skews the sidecar against every row after it.
 export function setSFieldElemRowTy(ix: i32, tyIx: i32): i32 {
-  if ix < 0 { return 0 }
-  while sFieldElemTyIx.length <= ix { sFieldElemTyIx.push(-1) }
-  sFieldElemTyIx[ix] = tyIx
-  tyRegNoteWrite()
-  0
+  setFieldElemRowTy(sFieldElemTyIx, ix, tyIx)
 }
 
 export function setUFieldElemRowTy(ix: i32, tyIx: i32): i32 {
+  setFieldElemRowTy(uFieldElemTyIx, ix, tyIx)
+}
+
+// The shared body of both writers, over one table's arena-type sidecar `tys`.
+function setFieldElemRowTy(tys: i32[], ix: i32, tyIx: i32): i32 {
   if ix < 0 { return 0 }
-  while uFieldElemTyIx.length <= ix { uFieldElemTyIx.push(-1) }
-  uFieldElemTyIx[ix] = tyIx
+  while tys.length <= ix { tys.push(-1) }
+  tys[ix] = tyIx
   tyRegNoteWrite()
   0
 }
@@ -14827,13 +14820,20 @@ export function unionStoreAtomKind(unionName: string, vk: i32): i32 {
   -1
 }
 
-// Record a distinct (kind, ref-list slot) source frame requirement.
-export function mfRecordSrc(kind: MfKind, slot: i32) {
+// The row of the (kind, ref-list slot) pair in the parallel frame tables `kinds`/`slots`, or
+// -1 when no frame requirement records it.
+function mfFrameIndex(kinds: MfKind[], slots: i32[], kind: MfKind, slot: i32) {
   let i = 0
-  while i < mfSrcKinds.length {
-    if mfSrcKinds[i] == kind && mfSrcSlots[i] == slot { return 0 }
+  while i < kinds.length {
+    if kinds[i] == kind && slots[i] == slot { return i }
     i = i + 1
   }
+  -1
+}
+
+// Record a distinct (kind, ref-list slot) source frame requirement.
+export function mfRecordSrc(kind: MfKind, slot: i32) {
+  if mfFrameIndex(mfSrcKinds, mfSrcSlots, kind, slot) >= 0 { return 0 }
   mfSrcKinds.push(kind)
   mfSrcSlots.push(slot)
   0
@@ -14843,11 +14843,7 @@ export function mfRecordSrc(kind: MfKind, slot: i32) {
 // the ref-list table slot for a kind-2 (ref-list) dest (so two struct-array filters of
 // different element types get distinct backing locals), -1 for a non-ref dest.
 export function mfRecordDst(kind: MfKind, slot: i32) {
-  let i = 0
-  while i < mfDstKinds.length {
-    if mfDstKinds[i] == kind && mfDstSlots[i] == slot { return 0 }
-    i = i + 1
-  }
+  if mfFrameIndex(mfDstKinds, mfDstSlots, kind, slot) >= 0 { return 0 }
   mfDstKinds.push(kind)
   mfDstSlots.push(slot)
   0
@@ -14855,25 +14851,15 @@ export function mfRecordDst(kind: MfKind, slot: i32) {
 
 // The wasm local holding the source wrapper ref for (kind, slot), or -1.
 export function mfSrcLocalFor(kind: MfKind, slot: i32) {
-  let i = 0
-  while i < mfSrcKinds.length {
-    if mfSrcKinds[i] == kind && mfSrcSlots[i] == slot {
-      if i < mfSrcBases.length { return mfSrcBases[i] }
-    }
-    i = i + 1
-  }
+  const i = mfFrameIndex(mfSrcKinds, mfSrcSlots, kind, slot)
+  if i >= 0 && i < mfSrcBases.length { return mfSrcBases[i] }
   -1
 }
 
 // The wasm local holding the dest backing ref for result (kind, slot), or -1.
 export function mfDstLocalFor(kind: MfKind, slot: i32) {
-  let i = 0
-  while i < mfDstKinds.length {
-    if mfDstKinds[i] == kind && mfDstSlots[i] == slot {
-      if i < mfDstBases.length { return mfDstBases[i] }
-    }
-    i = i + 1
-  }
+  const i = mfFrameIndex(mfDstKinds, mfDstSlots, kind, slot)
+  if i >= 0 && i < mfDstBases.length { return mfDstBases[i] }
   -1
 }
 
