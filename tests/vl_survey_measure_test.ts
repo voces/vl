@@ -7,13 +7,13 @@
 // "campaign" for an index #2607 had already built, and row 7 named `letListBuildKind` and
 // `letListBuildSlot`, which #2567 merged into `letListBuild` (16% -> 1.58% inclusive).
 //
-// `scripts/survey-regrade.py` re-runs each row's `Measure:` block. This is the CHEAP half
+// `scripts/survey-regrade.vl` re-runs each row's `Measure:` block. This is the CHEAP half
 // of that discipline, the same split `tests/vl_inventory_rows_test.ts` makes: it asserts
 // the STRUCTURE a re-runnable row must have and never runs a command or reads a profile,
-// so it costs milliseconds, needs no python and no compiler, and rides `deno task test`
+// so it costs milliseconds, needs no compiler, and rides `deno task test`
 // where every PR sees it. The behavioural half is the `survey measurements` gate row.
 //
-// THE KIND VOCABULARY IS READ OUT OF THE PYTHON, not re-spelled here. Two copies drift, and
+// THE KIND VOCABULARY IS READ OUT OF THE GRADER, not re-spelled here. Two copies drift, and
 // the drift is silent in the direction that matters: a kind the script accepts and this
 // rejects reds a correct row, and one this accepts and the script rejects lets an
 // ungradeable row through, which is the hole being closed.
@@ -23,7 +23,7 @@
 import { ROOT } from "./support/tree.ts";
 
 const DOC = `${ROOT}/docs/internals/code-quality-survey-2026-09/README.md`;
-const SCRIPT = `${ROOT}/scripts/survey-regrade.py`;
+const SCRIPT = `${ROOT}/scripts/survey-regrade.vl`;
 
 // `### row 7 — title`. The ranking tables above use `| 7 |` cells, which cannot hold a
 // block, so the blocks live in their own section keyed by the same row number.
@@ -32,13 +32,13 @@ const ROWHEAD = /^###\s+row\s+(\d+)\b/;
 const TABLEROW = /^\|\s*(\d+)\s*\|/;
 const LEAD = /^Measure:\s*$/;
 
-/** The `KINDS` tuple from the grader, so the two cannot answer differently. */
+/** The `KINDS` array from the grader, so the two cannot answer differently. */
 function kinds(src: string): string[] {
-  const m = /KINDS = \(([^)]*)\)/.exec(src);
+  const m = /const KINDS = \[([^\]]*)\]/.exec(src);
   if (m === null) {
     throw new Error(
-      `${SCRIPT}: no \`KINDS = (\` tuple found — the vocabulary moved, and this test reads ` +
-        `it from there so the two cannot drift. Update the regex or restore the tuple.`,
+      `${SCRIPT}: no \`const KINDS = [\` array found — the vocabulary moved, and this test reads ` +
+        `it from there so the two cannot drift. Update the regex or restore the array.`,
     );
   }
   const out = [...m[1].matchAll(/"([^"]+)"/g)].map((k) => k[1]);
@@ -131,7 +131,7 @@ Deno.test("survey: every ranked row carries a parseable Measure: block", async (
         bad.join("\n  ") +
         `\n\nGive the row a \`Measure:\` block under a \`### row N\` heading in the ` +
         `Measurements section, or \`kind: none\` with a \`why:\` naming the gate that does ` +
-        `grade it. See scripts/survey-regrade.py.`,
+        `grade it. See scripts/survey-regrade.vl.`,
     );
   }
 });

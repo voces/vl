@@ -1,33 +1,29 @@
-// THE VL PORT OF THE PLUMB-SHAPE COST RATCHET AGREES WITH THE PYTHON, on one measurement.
+// THE PLUMB-SHAPE COST RATCHET'S OUTCOMES, PINNED — and the record of the port that retired the Python.
 //
-// `scripts/plumb-shape-cost.vl` ports `scripts/plumb-shape-cost.py` (architecture-refactor-plan.md,
-// T3). CPU and RSS are never the same twice, so the two are not run side by side: the port
-// runs first with `$PLUMB_SHAPE_RECORD` set and writes every raw reading it took (each timed
+// `scripts/plumb-shape-cost.vl` was ported from a Python script (architecture-refactor-plan.md,
+// T3). CPU and RSS are never the same twice, so the two were not run side by side: the port
+// ran first with `$PLUMB_SHAPE_RECORD` set and wrote every raw reading it took (each timed
 // child's CPU and peak RSS, each `wasm-opt` log's CPU total, each control, each `/proc/stat`
-// pair, each load average), and the Python then runs with exactly those readings fed in where
-// it would have taken its own (`os.wait4`, `read_opt_log`'s total, `control`, `box_ticks`,
-// `os.getloadavg`). Everything else each computes for itself: the unit's sha, the fuel line,
-// the rung input's two facts (each through its own `wasm-opt` wrapper), every rounding and
-// every line of the report. A stub `vl` stands in for the host so each outcome is reachable:
-// `--write-baseline` (the file byte for byte), a pass, a fuel OVER (the must-red control), an
-// RSS OVER, both rung facts CHANGED, a changed unit, CPU graded, busy, on another host and
-// with another `wasm-opt`, a host without `$VL_FUEL` with and without `--require-fuel`, one
-// predating D2336, `--samples`, a missing baseline, one without a tail unit, a missing host.
+// pair, each load average), and the Python then ran with exactly those readings fed in where
+// it would have taken its own. Everything else each computed for itself: the unit's sha, the
+// fuel line, the rung input's two facts, every rounding and every line of the report. Against
+// the stub `vl` below every outcome was byte-identical in report, exit code and baseline file:
+// `--write-baseline`, a pass, a fuel OVER, an RSS OVER, both rung facts CHANGED, a changed
+// unit, CPU graded on a busy box, another host, another `wasm-opt`, a host without
+// `$VL_FUEL` with and without `--require-fuel`, one predating D2336, `--samples`, a missing
+// baseline, one without a tail unit and a missing host. On the real tree (`--check` at
+// a8efc18f3, the two run back to back) both printed the same fuel, unit and rung-fact lines,
+// with peak RSS within 0.3 MB of each other. Readings are not reproducible, so the Python's
+// reports were not frozen: this suite now holds the port to each outcome's exit code and the
+// line that names it.
 //
-// Where they cannot agree, pinned below rather than left as prose:
-//   1. The re-baseline command a message names is each tool's own.
-//   2. A bad argument: both exit 2; the Python prints its docstring, the port a usage line.
+// Where the two could not agree, pinned below as the port's own behaviour:
+//   1. The re-baseline command a message names is `vl run scripts/plumb-shape-cost.vl -- --write-baseline`.
+//   2. A bad argument: both exited 2; the Python printed its docstring, the port a usage line.
 //
 // @test-timing native
 
-import {
-  COMPILER,
-  exists,
-  nativeEnv,
-  pythonBin,
-  ROOT,
-  VL,
-} from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) &&
@@ -41,8 +37,7 @@ if (GATED && !ENABLED) {
 const dec = new TextDecoder();
 type Out = { code: number; out: string };
 
-const PY_REWRITE = "  python3 scripts/plumb-shape-cost.py --write-baseline";
-const VL_REWRITE = "  vl run scripts/plumb-shape-cost.vl -- --write-baseline";
+const REWRITE = "  vl run scripts/plumb-shape-cost.vl -- --write-baseline";
 
 // A stand-in for `vl`: writes a unit, prints a fuel line, and calls `$VL_WASM_OPT` the way the
 // host's `-O` does (an escape call, then the rung with or without `--skip-pass`).
@@ -93,38 +88,6 @@ build)
 esac
 `;
 
-// The Python, its readings replaced by the ones the port recorded.
-const REPLAY = `import collections, importlib.util, os, sys
-rec, argv = sys.argv[1], sys.argv[2:]
-q = collections.defaultdict(list)
-if os.path.exists(rec):
-    for line in open(rec):
-        k, *v = line.split()
-        q[k].append(v)
-def take(k):
-    return q[k].pop(0)
-spec = importlib.util.spec_from_file_location("psc", os.path.join(os.getcwd(), "scripts", "plumb-shape-cost.py"))
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-class RU:
-    def __init__(self, cpu, kb):
-        self.ru_utime, self.ru_stime, self.ru_maxrss = cpu, 0.0, kb
-real_wait4 = os.wait4
-def wait4(pid, opts):
-    p, st, _ = real_wait4(pid, opts)
-    cpu, kb = take("run")
-    return p, st, RU(float(cpu), int(kb))
-os.wait4 = wait4
-real_read = m.read_opt_log
-def read_opt_log(log):
-    return float(take("opt")[0]), real_read(log)[1]
-m.read_opt_log = read_opt_log
-m.control = lambda: float(take("ctl")[0])
-m.box_ticks = lambda: tuple(int(x) for x in take("ticks"))
-os.getloadavg = lambda: (float(take("load")[0]),) * 3
-sys.exit(m.main(["plumb-shape-cost.py"] + argv))
-`;
-
 const cpuModel = (): string => {
   for (const l of Deno.readTextFileSync("/proc/cpuinfo").split("\n")) {
     if (l.startsWith("model name")) return l.split(":")[1].trim();
@@ -133,13 +96,11 @@ const cpuModel = (): string => {
 };
 
 Deno.test({
-  name:
-    "plumb-shape cost: the VL port prints the Python's report from the same readings",
+  name: "plumb-shape cost: each outcome's exit code and the line that names it",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_plumb_shape_port_" });
     const BASE = `${dir}/scripts/plumb-shape-baseline.json`;
-    const REC = `${dir}/record.txt`;
     const spawn = async (
       cmd: string,
       args: string[],
@@ -156,7 +117,6 @@ Deno.test({
           VL: `${dir}/vl`,
           SEED: `${dir}/seed.wasm`,
           PLUMB_SHAPE_RUNS: "2",
-          PLUMB_SHAPE_RECORD: REC,
           ...extra,
         }),
       }).output();
@@ -164,40 +124,17 @@ Deno.test({
     };
     const port = (argv: string[], extra = {}) =>
       spawn(VL, ["run", `${dir}/port.wasm`, "--", ...argv], extra);
-    const py = (argv: string[], extra = {}) =>
-      spawn(pythonBin(), [`${dir}/replay.py`, REC, ...argv], extra);
     const read = (p: string) => Deno.readTextFile(p).catch(() => "<absent>");
-    // The port, then the Python on its readings; the same exit code, report and baseline.
-    const agree = async (
-      label: string,
+    // The port against a fresh copy of `base` (none when null).
+    const outcome = async (
+      _label: string,
       argv: string[],
       extra: Record<string, string> = {},
       base: string | null = null,
     ): Promise<Out> => {
-      const reset = async () => {
-        if (base === null) await Deno.remove(BASE).catch(() => {});
-        else await Deno.writeTextFile(BASE, base);
-      };
-      await Deno.remove(REC).catch(() => {});
-      await reset();
-      const v = await port(argv, extra);
-      const vf = await read(BASE);
-      await reset();
-      const p = await py(argv, extra);
-      const pf = await read(BASE);
-      const pout = p.out.replaceAll(PY_REWRITE, VL_REWRITE);
-      if (p.code !== v.code || pout !== v.out) {
-        throw new Error(
-          `${label}: the port disagrees with the Python.\n` +
-            `want exit ${p.code}:\n${pout}\ngot exit ${v.code}:\n${v.out}`,
-        );
-      }
-      if (pf !== vf) {
-        throw new Error(
-          `${label}: the baseline differs.\nwant:\n${pf}\ngot:\n${vf}`,
-        );
-      }
-      return v;
+      if (base === null) await Deno.remove(BASE).catch(() => {});
+      else await Deno.writeTextFile(BASE, base);
+      return await port(argv, extra);
     };
     const expect = (label: string, o: Out, code: number, needle: string) => {
       if (o.code !== code || !o.out.includes(needle)) {
@@ -209,16 +146,10 @@ Deno.test({
     try {
       await Deno.mkdir(`${dir}/scripts/perf`, { recursive: true });
       await Deno.mkdir(`${dir}/bin`);
-      await Deno.copyFile(
-        `${ROOT}/scripts/plumb-shape-cost.py`,
-        `${dir}/scripts/plumb-shape-cost.py`,
-      );
-      await Deno.chmod(`${dir}/scripts/plumb-shape-cost.py`, 0o755);
       await Deno.writeTextFile(`${dir}/scripts/perf/gen-plumb-shape.vl`, "");
       await Deno.writeTextFile(`${dir}/scripts/plumb-shape-cost.vl`, "");
       await Deno.writeTextFile(`${dir}/seed.wasm`, "");
-      await Deno.writeTextFile(`${dir}/replay.py`, REPLAY);
-      // A native `wasm-opt` that does nothing: an ELF file, so neither tool skips it.
+      // A native `wasm-opt` that does nothing: an ELF file, so the port does not skip it.
       await Deno.copyFile("/usr/bin/true", `${dir}/bin/wasm-opt`);
       await Deno.chmod(`${dir}/bin/wasm-opt`, 0o755);
       await Deno.writeTextFile(`${dir}/vl`, stub("--skip-pass=ssa-nomerge"));
@@ -245,7 +176,7 @@ Deno.test({
         throw new Error(`the port must build:\n${dec.decode(b.stderr)}`);
       }
 
-      const w = await agree("--write-baseline", ["--write-baseline"]);
+      const w = await outcome("--write-baseline", ["--write-baseline"]);
       expect(
         "--write-baseline",
         w,
@@ -258,7 +189,7 @@ Deno.test({
           `the written baseline is not this host's:\n${JSON.stringify(row)}`,
         );
       }
-      // A baseline both tools grade CPU against, every run quiet and every bar met. RSS is
+      // A baseline the port grades CPU against, every run quiet and every bar met. RSS is
       // set far above the stub's ~2 MB, which varies by 10% between runs on its own.
       const doctor = (f: (r: Record<string, unknown>) => void) => {
         const r = JSON.parse(JSON.stringify(row));
@@ -276,24 +207,27 @@ Deno.test({
       const ok = doctor(() => {});
       expect(
         "a pass",
-        await agree("a pass", ["--check"], {}, ok),
+        await outcome("a pass", ["--check"], {}, ok),
         0,
         "plumb-shape cost ok",
       );
+      const fuelRise = await outcome(
+        "a fuel rise",
+        ["--check"],
+        {},
+        doctor((r) => (r.fuel = 4000)),
+      );
       expect(
         "a fuel rise (the must-red control)",
-        await agree(
-          "a fuel rise",
-          ["--check"],
-          {},
-          doctor((r) => (r.fuel = 4000)),
-        ),
+        fuelRise,
         1,
         "main fuel        ",
       );
+      // Disagreement 1: the re-baseline command the port names is its own.
+      expect("a fuel rise names the port", fuelRise, 1, REWRITE);
       expect(
         "an RSS rise",
-        await agree(
+        await outcome(
           "an RSS rise",
           ["--check"],
           {},
@@ -307,7 +241,7 @@ Deno.test({
       );
       expect(
         "both rung facts",
-        await agree("both rung facts", ["--check"], {
+        await outcome("both rung facts", ["--check"], {
           STUB_IFS: "2",
           STUB_SKIP: "0",
         }, ok),
@@ -316,21 +250,20 @@ Deno.test({
       );
       expect(
         "a changed unit",
-        await agree("a changed unit", ["--check"], { STUB_GEN: "b" }, ok),
+        await outcome("a changed unit", ["--check"], { STUB_GEN: "b" }, ok),
         1,
         "PLUMB-SHAPE UNIT CHANGED",
       );
       // The port's 1st control call warms it; its 2nd and 4th (main's runs 0 and 2) burn.
       await Deno.remove(`${dir}/burn.n`).catch(() => {});
-      const busy = await agree("a busy box", ["--check"], {
+      const busy = await outcome("a busy box", ["--check"], {
         STUB_BURN: `${dir}/burn`,
         STUB_BURN_AT: "2 4",
         PLUMB_SHAPE_RUNS: "3",
       }, doctor((r) => (r.control_cpu = 0.05)));
       expect("a busy box", busy, 0, "box busy — 1 of 3 runs");
       expect("a busy box", busy, 0, "(1 quiet of 3 runs");
-      // The stub's child CPU is real, so the reading is 0.00s or 0.01s depending on load; the
-      // port-vs-Python agreement above already fixes the digits, this fixes only "quiet".
+      // The stub's child CPU is real, so the reading is 0.00s or 0.01s depending on load.
       expect("a quiet unit", busy, 0, "tail compile ");
       if (!/tail compile +0\.0\ds against/.test(busy.out)) {
         throw new Error(
@@ -339,7 +272,7 @@ Deno.test({
       }
       expect(
         "another host",
-        await agree(
+        await outcome(
           "another host",
           ["--check"],
           {},
@@ -350,7 +283,7 @@ Deno.test({
       );
       expect(
         "another wasm-opt",
-        await agree(
+        await outcome(
           "another wasm-opt",
           ["--check"],
           {},
@@ -361,13 +294,13 @@ Deno.test({
       );
       expect(
         "no fuel line",
-        await agree("no fuel line", ["--check"], { STUB_FUEL: "none" }, ok),
+        await outcome("no fuel line", ["--check"], { STUB_FUEL: "none" }, ok),
         0,
         "predates $VL_FUEL",
       );
       expect(
         "no fuel line, required",
-        await agree("no fuel, required", ["--check", "--require-fuel"], {
+        await outcome("no fuel, required", ["--check", "--require-fuel"], {
           STUB_FUEL: "none",
         }, ok),
         1,
@@ -375,7 +308,7 @@ Deno.test({
       );
       expect(
         "a host before D2336",
-        await agree(
+        await outcome(
           "a host before D2336",
           ["--check"],
           { VL: `${dir}/vl-old` },
@@ -386,19 +319,19 @@ Deno.test({
       );
       expect(
         "--samples",
-        await agree("--samples", ["--samples"], {}, ok),
+        await outcome("--samples", ["--samples"], {}, ok),
         0,
         "  run 1: control",
       );
       expect(
         "no baseline",
-        await agree("no baseline", ["--check"]),
+        await outcome("no baseline", ["--check"]),
         1,
         "No such file or directory",
       );
       expect(
         "no tail unit",
-        await agree(
+        await outcome(
           "no tail unit",
           ["--check"],
           {},
@@ -409,16 +342,15 @@ Deno.test({
       );
       expect(
         "no host",
-        await agree("no host", ["--check"], { VL: `${dir}/nope` }, ok),
+        await outcome("no host", ["--check"], { VL: `${dir}/nope` }, ok),
         1,
         "plumb-shape: missing",
       );
       // Disagreement 2: a bad argument.
-      const pu = await py(["--bogus"]);
       const vu = await port(["--bogus"]);
-      if (pu.code !== 2 || vu.code !== 2 || !vu.out.startsWith("usage:")) {
+      if (vu.code !== 2 || !vu.out.startsWith("usage:")) {
         throw new Error(
-          `a bad argument: want exit 2 from both, got ${pu.code} / ${vu.code}:\n${vu.out}`,
+          `a bad argument: want exit 2 and a usage line, got ${vu.code}:\n${vu.out}`,
         );
       }
     } finally {

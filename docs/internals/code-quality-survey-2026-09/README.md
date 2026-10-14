@@ -87,9 +87,9 @@ who lands a fix is not the person editing this page. Row 8 said "campaign" for w
 had already shipped, and its 11.75% had fallen under 1% with no one reading it.
 
 So each row below carries the command that produces its number and the number that command
-should read. `python3 scripts/survey-regrade.py docs/internals/code-quality-survey-2026-09/README.md`
+should read. `vl run scripts/survey-regrade.vl -- docs/internals/code-quality-survey-2026-09/README.md`
 re-runs the cheap ones and prints `row · filed · today · verdict`. A block that shells out
-to another script writes `"$PYTHON"`, which the runner binds to its own interpreter. It fails when a number is
+to a Python script writes `"$PYTHON"`, which the runner binds to `$PYTHON` or `python3`. It fails when a number is
 NOT RE-RUNNABLE — no block, an unparseable one, a command that errors — and merely REPORTS a
 row that moved, in either direction, because movement is the finding this page exists to
 carry. `--profile <guest-profile.json>` adds the share rows; `--strict` makes a moved row a
