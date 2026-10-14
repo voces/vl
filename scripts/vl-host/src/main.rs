@@ -5970,6 +5970,7 @@ fn rung_argv(
 ) -> Result<Vec<String>> {
     let (mut store, inst) = load_compiler(engine, compiler)?;
     opt_stage(&mut store, &inst, bytes)?;
+    opt_roundtrip_check(&mut store, &inst, bytes, "the rung's input")?;
     let argv = inst.get_typed_func::<(i32, i32, i32), i32>(&mut store, "optRungArgv")?;
     let rung = if flag == "-O3" { 3 } else { 1 };
     let low = low_memory.map_or(0, |n| n as i32);
@@ -6001,6 +6002,47 @@ fn strip_src(
     let removed = strip.call(&mut *store, ())? == 1;
     let out = BytesOut::probe(store, inst, "optOut")?.read(store)?;
     Ok(removed.then_some(out))
+}
+
+/// `$VL_OPT_ROUNDTRIP=1`: the compiler's module writer (`optRoundTrip`, rung R4 of
+/// docs/internals/optimizer-in-vl.md) must decode the staged `bytes` and write them back
+/// unchanged, or the build fails naming `what`; `fault` flips a bit of its answer first, the
+/// check's control. Unset or empty, nothing runs.
+fn opt_roundtrip_check(
+    store: &mut Store<()>,
+    inst: &Instance,
+    bytes: &[u8],
+    what: &str,
+) -> Result<()> {
+    let mode = std::env::var("VL_OPT_ROUNDTRIP").unwrap_or_default();
+    let fault = match mode.as_str() {
+        "" => return Ok(()),
+        "1" => false,
+        "fault" => true,
+        other => bail!("$VL_OPT_ROUNDTRIP={other} — expected `1` or `fault`"),
+    };
+    let write = inst
+        .get_typed_func::<(), i32>(&mut *store, "optRoundTrip")
+        .map_err(|e| e.context("$VL_OPT_ROUNDTRIP: this seed predates `optRoundTrip`"))?;
+    if write.call(&mut *store, ())? != 1 {
+        bail!("$VL_OPT_ROUNDTRIP: the compiler's module writer does not decode {what}");
+    }
+    let mut out = BytesOut::probe(store, inst, "optOut")?.read(store)?;
+    if fault {
+        if let Some(b) = out.last_mut() {
+            *b ^= 1;
+        }
+    }
+    if out != bytes {
+        let at = out.iter().zip(bytes).take_while(|(a, b)| a == b).count();
+        bail!(
+            "$VL_OPT_ROUNDTRIP: the compiler's module writer changes {what}: {} bytes in, {} \
+             out, the first difference at offset {at}",
+            bytes.len(),
+            out.len()
+        );
+    }
+    Ok(())
 }
 
 /// A body of at most this many bytes is one the escape step may inline (its callee bound,
@@ -9919,6 +9961,11 @@ fn build_cmd(args: &[String]) -> Result<()> {
                     .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))?;
             }
             std::fs::write(&sink, &bytes)?;
+            if std::env::var_os("VL_OPT_ROUNDTRIP").is_some_and(|v| !v.is_empty()) {
+                let (mut store, inst) = load_compiler(&compile_engine, &compiler)?;
+                opt_stage(&mut store, &inst, &bytes)?;
+                opt_roundtrip_check(&mut store, &inst, &bytes, "the emitted module")?;
+            }
             // A step that moves code has the map made again from its rows, each moved with the
             // op it names; a twin is a copy of its function, so it gets a copy of its rows.
             let remap =

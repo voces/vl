@@ -40,7 +40,7 @@ after, on one seed.
 | R1 | the run-once scan (`compiler/opt_scan.vl`); the default, its Rust deleted | retired (`$VL_OPT_RUNG_SCAN`) | the `wasm-opt` argv, which carries every mark the scan makes |
 | R2 | the `vl-src` strip and the rung's argv (`compiler/opt_scan.vl`); the default, its Rust deleted | retired (`$VL_OPT_ARGV`) | argv identity, and the stripped bytes with their source map |
 | R3 | the escape choice and its two renames (`compiler/opt_escape.vl`, `compiler/wasm_names.vl`); the default, its Rust deleted | retired (`$VL_OPT_ESCAPE`) | `$VL_OPT_ESCAPE_DUMP` byte-identical |
-| R4 | a module writer: sections, types, bodies (`inline::assemble`, `type_section`, `encode_sub`, `finish_body`) | — | decode then encode is the identity over every module R1 reads |
+| R4 | a module writer: sections, types, bodies (`inline::assemble`, `type_section`, `encode_sub`, `finish_body`) (`compiler/wasm_write.vl`) | `$VL_OPT_ROUNDTRIP` (a check, not a side) | decode then encode is the identity over every module R1 reads |
 | R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) | `$VL_OPT_MULTIVALUE` | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
 | R6 | the inline-record step | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
 | R7 | the list-flattening step | `$VL_OPT_FLAT` | `$VL_OPT_FLAT_DUMP` |
@@ -219,3 +219,45 @@ Rust deleted, on one seed:
 
 The control, the port's host against `VL_OPT_NO_MULTIVALUE=1` over tests/cases/closures,
 differs on 18 of 609, as it did for the port.
+
+## R4, the module writer
+
+`compiler/wasm_write.vl` decodes a module into a `WasmModule` and writes one back. `wmRead`
+keeps the type section as rec groups of `WasmSubType`, the function section as a list of type
+indices, and the code section as one `WasmBody` per function: its locals entries, and its code
+as a slice of the bytes read. Every other section is kept as the span it was read from.
+`wmWrite` writes those three sections from the model with minimal LEB128s, copies the rest in
+input order, and reports where each body's code begins in the output, which a source-map remap
+needs. A value type is one packed `i32`, its heap type's index readable without a lookup. The
+decoder refuses a shared heap type and a descriptor form; the host's writer has neither.
+
+R5 to R7 edit the model between the two calls. A new type goes in its own group at the end,
+and a new function at the end of both lists, so no existing index moves and the copied
+sections stay valid. A rewritten body gets new code bytes and `from` 0, and its new locals
+are appended one entry per run of a type, as `finish_body` does. The Rust stays the
+default until those rungs move onto this writer, and it is deleted with them.
+
+`$VL_OPT_ROUNDTRIP=1` makes the build check the writer. The compiler's `optRoundTrip` decodes
+the emitted module and every rung's input, writes each one back, and the build fails unless
+every byte matches. `fault` flips a bit of the answer before the comparison, which is the
+control. Parity is `VL_OPT_ROUNDTRIP=` against `VL_OPT_ROUNDTRIP=1`, so a module the writer
+changed is a build the second side refused. Every build is `-O` unless noted:
+
+| population | programs | identical | both refused | identical with a mark | identical through the step | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases | 5,224 | 4,123 | 1,101 | 1,184 | 639 | 0 | 0 |
+| distilled `cells/` | 1,477 | 1,223 | 254 | 1,103 | 270 | 0 | 0 |
+| distilled `named/` | 8,647 | 4,919 | 3,728 | 1,295 | 606 | 0 | 0 |
+| `-O3`: `cells/`, tests/cases/arrays and closures | 2,267 | 1,889 | 378 | 1,257 | 356 | 0 | 0 |
+| a generated plumb tail unit and its main, and `compiler/entry.vl` | 3 | 3 | 0 | 2 | 1 | 0 | 0 |
+
+The control, `VL_OPT_ROUNDTRIP=1` against `fault` over tests/cases/closures, differs on 511 of
+611: every program that builds. `tests/selfhost_native_opt_test.ts` holds both on three
+fixtures at both rungs.
+
+The seed grew by 1.0%, from 5,309,038 to 5,363,983 bytes, and the self-compile's guest fuel
+by 0.2%. The writer's own functions are 7,602 of those bytes. The rest is spread thinly over
+functions this rung does not touch, and the one cause read off the disassembly is type
+indices: the writer's record types take indices ahead of the compiler's busiest types, and an
+index past 127 costs a second LEB byte at every use. `$127` becoming `$135` is one such shift.
+

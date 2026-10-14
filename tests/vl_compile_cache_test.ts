@@ -514,7 +514,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   modPendingAt: "output", modPendingCount: "output", modPendingLen: "output",
   modReset: "input", modSrc: "input", optEscapeChoose: "input",
   optEscapeRestore: "input", optInLoad: "input", optInReset: "input", optOut: "output",
-  optRungArgv: "input", optRungScan: "input", optStripSrc: "input",
+  optRoundTrip: "input", optRungArgv: "input", optRungScan: "input", optStripSrc: "input",
   rbyte: "output", repShadowCount: "uncached",
   repShadowMsgAt: "uncached", repShadowMsgLen: "uncached", repShadowReasonAt: "uncached",
   repShadowReasonCount: "uncached", repShadowReasonLen: "uncached",
