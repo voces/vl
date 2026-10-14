@@ -19,7 +19,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, binaryen, hostWasmDis } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen, hostWasmDis, isaEnv } from "./support/tree.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -77,6 +77,7 @@ const vl = async (args: string[]) => {
       // binaryen's `wasm-dis` for `--wat`, which is a node script, hence PATH.
       VL_WASM_DIS: hostWasmDis(),
       PATH: Deno.env.get("PATH") ?? "",
+      ...isaEnv(),
       // node cannot start on Windows without it.
       ...(Deno.build.os === "windows" ? { SYSTEMROOT: Deno.env.get("SYSTEMROOT") ?? "" } : {}),
     },
@@ -94,15 +95,18 @@ for (const [name, gen, n] of PROGRAMS) {
     try {
       const file = `${dir}/main.vl`;
       await Deno.writeTextFile(file, src);
-      const chk = await vl(["check", file, "--compiler", COMPILER]);
+      // Three independent processes over one file, run side by side.
+      const [chk, run, fmt] = await Promise.all([
+        vl(["check", file, "--compiler", COMPILER]),
+        vl(["run", file, "--compiler", COMPILER]),
+        vl(["fmt", "--check", file, "--compiler", COMPILER]),
+      ]);
       if (chk.code !== 0) throw new Error(`vl check: want rc 0, got ${chk.code}\n${chk.err.slice(0, 600)}`);
-      const run = await vl(["run", file, "--compiler", COMPILER]);
       const got = run.out.trim().split("\n");
       if (run.code !== 0 || JSON.stringify(got) !== JSON.stringify(WANT)) {
         throw new Error(`vl run: want rc 0 and ${WANT}, got rc ${run.code} and ${got}\n${run.err.slice(0, 600)}`);
       }
       // `--check` answers 0 or 1 (formatted or not); a compiler trap is 70.
-      const fmt = await vl(["fmt", "--check", file, "--compiler", COMPILER]);
       if (fmt.code !== 0 && fmt.code !== 1) {
         throw new Error(`vl fmt --check: want rc 0 or 1, got ${fmt.code}\n${fmt.err.slice(0, 600)}`);
       }

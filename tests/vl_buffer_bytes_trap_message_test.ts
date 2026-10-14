@@ -17,7 +17,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, isaEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -38,7 +38,7 @@ const runCase = async (
     stdout: "piped",
     stderr: "piped",
     cwd: ROOT,
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, ...isaEnv() },
     clearEnv: true,
   }).output();
   return { code, out: new TextDecoder().decode(stdout) };
