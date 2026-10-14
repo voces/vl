@@ -801,6 +801,45 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      The flow reads decide only reads of an un-annotated literal of explicitly generic
      functions. These pins also decide writes, pushes, annotated destinations, and functions
      generic only through an un-annotated parameter, which the table does not decide yet.
+   - Fourth PR: the reads reach parameters and annotated destinations.
+     - An un-annotated parameter of a non-exported, non-method function is a candidate when
+       every use of the function is a direct positional call. Its literals are the arguments
+       passed there and any whole `=` to it, and passing a candidate on to another candidate
+       is a planned use. The flow-shadow table banks parameter slots too. Closes D4577.
+     - An annotated binding initialized by a call of a concrete function that returns only
+       literals delivers each returned literal at the annotation (`monoFlowAnnLits`). Every
+       call of that function must initialize a binding annotated alike. A generic in the
+       literal is instanced only where the instance returns the annotation's own type.
+       Without that, a widening annotation such as `(x: i32) => i32 | null` would read an
+       `i32` result as the nullable. Closes D4575.
+     - The record-covariance check reads a direct call as fresh when every value it returns
+       is fresh (`rcwCallSlotFresh`). The record is then delivered as the list is, including
+       through a nullable record slot. Closes D4576.
+
+     This is a pin at the annotation, not a rewritten read. Rewriting the reads of an annotated
+     binding to the generic's name produced check-clean invalid wasm under a widening
+     annotation, since the read then has the instance's type and not the slot's.
+
+     Over the eleven fn-value templates, runs go from 497 to 503:
+     - `fn-value-generic-list-read`: 56 to 59 of 66;
+     - its open twin: 19 to 21 of 64;
+     - `fn-value-generic-optional-read`: 60 to 61 of 66.
+
+     No cell is lost and no silent cell is new. D4578 (nested literal reps) and D4579 (maps)
+     stay open: both need a representation before any read is planned, which is the
+     interner's question rather than the flow table's.
+
+     It retires nothing. Each item was ablated alone again and graded over the 1,535 `@run`
+     fixtures that hold a generic or a lambda. Every item loses fixtures that pass with it:
+     - `monoPinGenericList`: 10, covering element writes, written-`let` seeds and list aliases.
+     - `monoPinGenericRecord`: 3, covering field writes and calls at two types.
+     - `monoNotePushDeliveries`: 7, covering pushes and map sets.
+     - The store site's `monoStoreAnnName`: 3, covering stores after construction.
+     - The ObjLit arm of `monoCoerceFnValueName`: 4. The ArrayLit arm: 8. Both now also
+       carry this PR's annotated deliveries.
+
+     What is left for these pins is writes and pushes, so the next retirement waits on the
+     table deciding a write.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
