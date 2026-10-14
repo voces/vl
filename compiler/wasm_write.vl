@@ -1,0 +1,361 @@
+// A wasm module decoded far enough to be written again: its type, function and code sections
+// as data, every other section kept byte for byte. `wmRead` then `wmWrite` gives back the
+// bytes read; an `-O` step that changes types, functions or bodies edits the model between
+// the two (docs/internals/optimizer-in-vl.md, rung R4). Names are `wasm_names.vl`'s.
+
+import {
+  WasmCursor,
+  wcByte,
+  wcFail,
+  wcNew,
+  wcPreamble,
+  wcU32,
+} from "./wasm_read"
+import { copyBytes, wnPutLeb } from "./wasm_names"
+
+// One type of the type section: `prefix` 0, 0x4f (`sub final`) or 0x50 (`sub`); `form` 0x60,
+// 0x5f, 0x5e or 0x5d. `params` holds a func's parameters, the fields' types, or a cont's index.
+// A value type packs its lead byte low and, under 0x63/0x64, its heap type above bit 8: an
+// abstract one's byte, or `0x100 + 2 * t` (+1 when exact) for type index `t`.
+export type WasmSubType = {
+  prefix: i32,
+  supers: i32[],
+  form: i32,
+  params: i32[],
+  results: i32[],
+  mutable: boolean[],
+}
+
+// A function body: its locals entries (`localCount[k]` locals of `localType[k]`), then its
+// code, the bytes `src[from, to)` through the final `end`.
+export type WasmBody = {
+  localCount: i32[],
+  localType: i32[],
+  src: u8[],
+  from: i32,
+  to: i32,
+}
+
+// A decoded module. Sections are in input order, each `b[secStart, secEnd)` with its id and
+// size; the type section is `groupSize` rec groups over `types` (an implicit group holds one
+// type), the function section `funcTypes`. `ok` is false when any of it does not decode.
+export type WasmModule = {
+  ok: boolean,
+  b: u8[],
+  secId: i32[],
+  secStart: i32[],
+  secEnd: i32[],
+  groupSize: i32[],
+  groupExplicit: boolean[],
+  types: WasmSubType[],
+  funcTypes: i32[],
+  bodies: WasmBody[],
+}
+
+// A written module, and per body the offset in `bytes` where its code (`src[from]`) starts.
+export type WasmWritten = {
+  bytes: u8[],
+  codeAt: i32[],
+}
+
+export function wmRead(b: u8[]): WasmModule {
+  const m: WasmModule = {
+    ok: false,
+    b: b,
+    secId: [],
+    secStart: [],
+    secEnd: [],
+    groupSize: [],
+    groupExplicit: [],
+    types: [],
+    funcTypes: [],
+    bodies: [],
+  }
+  const c = wcNew(b, 0, b.length)
+  wcPreamble(c)
+  while c.pos < c.end && !c.failed {
+    const start = c.pos
+    const id = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { return m }
+    const end = c.pos + size
+    const s = wcNew(b, c.pos, end)
+    if id == 1 { readTypes(m, s) }
+    if id == 3 { readFuncs(m, s) }
+    if id == 10 { readCode(m, s) }
+    if s.failed || (id == 1 || id == 3 || id == 10) && s.pos != end { return m }
+    m.secId.push(id)
+    m.secStart.push(start)
+    m.secEnd.push(end)
+    c.pos = end
+  }
+  m.ok = !c.failed
+  m
+}
+
+// `m` in the binary format: the type, function and code sections written from the model with
+// minimal LEB128s, every other section copied.
+export function wmWrite(m: WasmModule): WasmWritten {
+  const w: WasmWritten = { bytes: [], codeAt: [] }
+  const out = w.bytes
+  copyBytes(out, m.b, 0, 8)
+  let k = 0
+  while k < m.secId.length {
+    const id = m.secId[k]
+    if id == 1 || id == 3 || id == 10 {
+      const sec: u8[] = []
+      const at: i32[] = []
+      if id == 1 { writeTypes(sec, m) }
+      if id == 3 { writeVec(sec, m.funcTypes) }
+      if id == 10 { writeCode(sec, m, at) }
+      out.push(id)
+      wnPutLeb(out, sec.length)
+      const base = out.length
+      copyBytes(out, sec, 0, sec.length)
+      let i = 0
+      while i < at.length {
+        w.codeAt.push(base + at[i])
+        i = i + 1
+      }
+    } else {
+      copyBytes(out, m.b, m.secStart[k], m.secEnd[k] - m.secStart[k])
+    }
+    k = k + 1
+  }
+  w
+}
+
+// Appends the packed value type `v`.
+function putVal(out: u8[], v: i32) {
+  out.push(v & 0xff)
+  const h = v >> 8
+  if h == 0 { return }
+  if h < 0x100 {
+    out.push(h)
+    return
+  }
+  if (h & 1) != 0 { out.push(0x62) }
+  let x = (h - 0x100) >> 1
+  while x >= 0x40 {
+    out.push((x & 0x7f) | 0x80)
+    x = x >> 7
+  }
+  out.push(x)
+}
+
+// A value or field storage type, packed; fails the cursor on a shared heap type.
+function readVal(c: WasmCursor): i32 {
+  const lead = wcByte(c)
+  if lead != 0x63 && lead != 0x64 {
+    if lead < 0x68 || lead > 0x7f { return wcFail(c) }
+    return lead
+  }
+  let exact = 0
+  if c.pos < c.end && c.b[c.pos] == 0x62 {
+    c.pos = c.pos + 1
+    exact = 1
+  }
+  if c.pos < c.end && (c.b[c.pos] & 0xc0) == 0x40 {
+    const h = wcByte(c)
+    if exact == 1 || h == 0x65 { return wcFail(c) }
+    return lead | (h << 8)
+  }
+  const t = wcU32(c)
+  if t < 0 || t >= 0x200000 { return wcFail(c) }
+  lead | ((0x100 + 2 * t + exact) << 8)
+}
+
+function readVals(c: WasmCursor, out: i32[]) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    out.push(readVal(c))
+    i = i + 1
+  }
+}
+
+function readTypes(m: WasmModule, c: WasmCursor) {
+  const n = wcU32(c)
+  let g = 0
+  while g < n && !c.failed {
+    let count = 1
+    const explicit = c.pos < c.end && c.b[c.pos] == 0x4e
+    if explicit {
+      c.pos = c.pos + 1
+      count = wcU32(c)
+    }
+    m.groupSize.push(count)
+    m.groupExplicit.push(explicit)
+    let k = 0
+    while k < count && !c.failed {
+      m.types.push(readSubType(c))
+      k = k + 1
+    }
+    g = g + 1
+  }
+}
+
+function readSubType(c: WasmCursor): WasmSubType {
+  const t: WasmSubType = {
+    prefix: 0,
+    supers: [],
+    form: 0,
+    params: [],
+    results: [],
+    mutable: [],
+  }
+  if c.pos < c.end && (c.b[c.pos] == 0x50 || c.b[c.pos] == 0x4f) {
+    t.prefix = wcByte(c)
+    const n = wcU32(c)
+    let i = 0
+    while i < n && !c.failed {
+      t.supers.push(wcU32(c))
+      i = i + 1
+    }
+  }
+  t.form = wcByte(c)
+  if t.form == 0x60 {
+    readVals(c, t.params)
+    readVals(c, t.results)
+  } else if t.form == 0x5f {
+    const n = wcU32(c)
+    let i = 0
+    while i < n && !c.failed {
+      readField(c, t)
+      i = i + 1
+    }
+  } else if t.form == 0x5e {
+    readField(c, t)
+  } else if t.form == 0x5d {
+    t.params.push(wcU32(c))
+  } else {
+    wcFail(c)
+  }
+  t
+}
+
+function readField(c: WasmCursor, t: WasmSubType) {
+  t.params.push(readVal(c))
+  const mut = wcByte(c)
+  if mut > 1 { wcFail(c) }
+  t.mutable.push(mut == 1)
+}
+
+function readFuncs(m: WasmModule, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    m.funcTypes.push(wcU32(c))
+    i = i + 1
+  }
+}
+
+function readCode(m: WasmModule, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { wcFail(c); return }
+    const end = c.pos + size
+    const body: WasmBody = {
+      localCount: [],
+      localType: [],
+      src: c.b,
+      from: 0,
+      to: end,
+    }
+    const entries = wcU32(c)
+    let k = 0
+    while k < entries && !c.failed {
+      body.localCount.push(wcU32(c))
+      body.localType.push(readVal(c))
+      k = k + 1
+    }
+    if c.pos > end { wcFail(c); return }
+    body.from = c.pos
+    m.bodies.push(body)
+    c.pos = end
+    i = i + 1
+  }
+}
+
+function writeTypes(out: u8[], m: WasmModule) {
+  wnPutLeb(out, m.groupSize.length)
+  let t = 0
+  let g = 0
+  while g < m.groupSize.length {
+    if m.groupExplicit[g] {
+      out.push(0x4e)
+      wnPutLeb(out, m.groupSize[g])
+    }
+    let k = 0
+    while k < m.groupSize[g] {
+      writeSubType(out, m.types[t])
+      t = t + 1
+      k = k + 1
+    }
+    g = g + 1
+  }
+}
+
+function writeSubType(out: u8[], t: WasmSubType) {
+  if t.prefix != 0 {
+    out.push(t.prefix)
+    writeVec(out, t.supers)
+  }
+  out.push(t.form)
+  if t.form == 0x60 {
+    writeVals(out, t.params)
+    writeVals(out, t.results)
+  } else if t.form == 0x5d {
+    wnPutLeb(out, t.params[0])
+  } else {
+    if t.form == 0x5f { wnPutLeb(out, t.params.length) }
+    let i = 0
+    while i < t.params.length {
+      putVal(out, t.params[i])
+      out.push(if t.mutable[i] { 1 } else { 0 })
+      i = i + 1
+    }
+  }
+}
+
+function writeVals(out: u8[], vs: i32[]) {
+  wnPutLeb(out, vs.length)
+  let i = 0
+  while i < vs.length {
+    putVal(out, vs[i])
+    i = i + 1
+  }
+}
+
+function writeVec(out: u8[], xs: i32[]) {
+  wnPutLeb(out, xs.length)
+  let i = 0
+  while i < xs.length {
+    wnPutLeb(out, xs[i])
+    i = i + 1
+  }
+}
+
+// The code section's payload; `at` gets each body's code offset within it.
+function writeCode(out: u8[], m: WasmModule, at: i32[]) {
+  wnPutLeb(out, m.bodies.length)
+  let i = 0
+  while i < m.bodies.length {
+    const body = m.bodies[i]
+    const head: u8[] = []
+    wnPutLeb(head, body.localType.length)
+    let k = 0
+    while k < body.localType.length {
+      wnPutLeb(head, body.localCount[k])
+      putVal(head, body.localType[k])
+      k = k + 1
+    }
+    wnPutLeb(out, head.length + body.to - body.from)
+    copyBytes(out, head, 0, head.length)
+    at.push(out.length)
+    copyBytes(out, body.src, body.from, body.to - body.from)
+    i = i + 1
+  }
+}
