@@ -789,7 +789,6 @@ import {
   capturedNulListCellRead,
   catListKindOfBin,
   catListKindOfExpr,
-  catListSlotOfBin,
   cbRetVariantIdx,
   cloArmTagOfTy,
   cloCallArityFallbackUnsound,
@@ -842,7 +841,6 @@ import {
   eqgInnerKind,
   eqgInnerSlot,
   eqgListKindOfBin,
-  eqgListSlotOfBin,
   exactOperandTyOf,
   exactUnionLacksMap,
   exactUnionLacksTwin,
@@ -998,6 +996,7 @@ import {
   listIdxKindOf,
   listIdxWrapSlot,
   listOpKindOfBin,
+  listOpSlotOfBin,
   listRepOfFieldCode,
   litAtomWidenTexts,
   localIndexOf,
@@ -1123,6 +1122,7 @@ import {
   refPushScratchBaseFor,
   removeAtomFromSet,
   restoreNarrow,
+  retLitUnionInline,
   retMapFlag,
   retNeedsNonNullRecover,
   retNulMapFlag,
@@ -1258,7 +1258,7 @@ import {
   widenTmpSlot,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf, i32PairIndexOf } from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
@@ -14790,12 +14790,9 @@ function emitListEqRCore(body: u8[], slot: i32, base: i32) {
 
 // The reserved LEQR frame base for ref-list slot `slot`, or -1.
 function leqRBaseOfSlot(slot: i32) {
-  let i = 0
-  while i < fnListEqRSlots.length {
-    if fnListEqRSlots[i] == slot { return leqRBases[i] }
-    i = i + 1
-  }
-  -1
+  const i = i32ListIndexOf(fnListEqRSlots, slot)
+  if i < 0 { return -1 }
+  leqRBases[i]
 }
 
 // The two locals a STRUCT-element compare parked its element pair in, or -1 outside one.
@@ -15015,17 +15012,12 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
   0
 }
 
-// The reserved LEQG frame base for compare rep `(kind, slot)`, or -1. The lookup twin of
-// `lcatBaseOfRep`, over the pair the reservation scan pushed.
+// The reserved LEQG frame base for compare rep `(kind, slot)`, or -1, over the pair the
+// reservation scan pushed.
 function leqgBaseOfRep(kind: i32, slot: i32) {
-  let i = 0
-  while i < fnListEqGKinds.length {
-    if fnListEqGKinds[i] == kind && fnListEqGSlots[i] == slot {
-      return leqgBases[i]
-    }
-    i = i + 1
-  }
-  -1
+  const i = i32PairIndexOf(fnListEqGKinds, fnListEqGSlots, kind, slot)
+  if i < 0 { return -1 }
+  leqgBases[i]
 }
 
 // i32-list CONCAT `a + b`: a NEW list sized exactly lenA + lenB (one backing
@@ -15150,17 +15142,12 @@ function emitListConcatG(
   0
 }
 
-// The reserved LCAT frame base for concat rep `(kind, slot)`, or -1. The lookup twin of
-// `leqRBaseOfSlot`, over the pair the reservation scan pushed.
+// The reserved LCAT frame base for concat rep `(kind, slot)`, or -1, over the pair the
+// reservation scan pushed.
 function lcatBaseOfRep(kind: i32, slot: i32) {
-  let i = 0
-  while i < fnListCatKinds.length {
-    if fnListCatKinds[i] == kind && fnListCatSlots[i] == slot {
-      return lcatBases[i]
-    }
-    i = i + 1
-  }
-  -1
+  const i = i32PairIndexOf(fnListCatKinds, fnListCatSlots, kind, slot)
+  if i < 0 { return -1 }
+  lcatBases[i]
 }
 
 // Re-evaluate the field access chain `root.f1.f2…` onto `body`: the root expression, then
@@ -15259,7 +15246,7 @@ function emitEqNonNullCore(body: u8[], binIx: i32, fnIx: i32) {
         return emitListEqAnyRep(
           body,
           eqgListKindOfBin(binIx, fnIx, eqLop),
-          eqgListSlotOfBin(binIx, fnIx),
+          listOpSlotOfBin(binIx, fnIx),
           fnIx,
         )
       }
@@ -29463,15 +29450,6 @@ function retKindIsStr(fnPos: i32): boolean {
   fnPos >= 0 && fnPos < fRetKind.length && fRetKind[fnPos] == "str"
 }
 
-// True if the return annotation at `tyIx` is an un-named (inline) literal union — a pure
-// litunion in the arena that is not a registered alias. The alias reps as an interned atom,
-// the inline form a string ref; `nodeTyIsLitUnionAlias` is the seam between them.
-function retLitUnionInline(tyIx: i32): boolean {
-  if tyIx < 0 { return false }
-  if nodeTyIsLitUnionAlias(tyIx) { return false }
-  tyIsLitUnion(nodeTyIxOf(tyIx))
-}
-
 // The `select` tower for `emitAtomToStr`: member `i`'s string if its interned id matches
 // the stashed atom, else the chain for `i+1`. The last member is the unconditional default arm.
 function emitAtomToStrChain(body: u8[], texts: string[], i: i32) {
@@ -31683,7 +31661,7 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
         e.binRight,
         fnIx,
         catK,
-        catListSlotOfBin(exprIx, fnIx),
+        listOpSlotOfBin(exprIx, fnIx),
       )
     }
   }
@@ -31701,7 +31679,7 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
       if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
       svSyncRecv(e.binRight, fnIx)
-      if emitListEqAnyRep(body, gK, eqgListSlotOfBin(exprIx, fnIx), fnIx) < 0 {
+      if emitListEqAnyRep(body, gK, listOpSlotOfBin(exprIx, fnIx), fnIx) < 0 {
         return -1
       }
       if e.binOp == "!=" {

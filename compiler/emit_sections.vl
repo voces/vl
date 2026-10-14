@@ -3863,13 +3863,13 @@ function mapResyncFuncType() {
   0
 }
 
-// An integer-keyed mono map struct over the keys list wrapper `keysWrap` (`$lTypeIdx` for an
-// i32 key, `$il64TypeIdx` for an i64 one).
-function emitMonoMapStructType(keysWrap: i32) {
-  // Only field 0 differs from the string-keyed struct, which is why the resize and compaction are shared.
-  wU8(95)              // 0x5f struct (integer-keyed map)
+// The map struct body over the keys list wrapper `keysWrap`: `$mkListIdx` for a string key,
+// `$lTypeIdx` for an i32 key, `$il64TypeIdx` for an i64 one. Only field 0 differs between the
+// three, which is why the resize and compaction are shared.
+function tsMapStructBody(keysWrap: i32) {
+  wU8(95)              // 0x5f struct (map)
   wU8(mapFieldCount()) // 7 fields, 9 with seqs
-  wU8(100)             // field 0 keys: 0x64 (ref <keysWrap>) — non-null integer list
+  wU8(100)             // field 0 keys: 0x64 (ref <keysWrap>) — non-null
   wSLEB(keysWrap)
   wU8(1)               // mutable
   wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
@@ -7372,25 +7372,49 @@ function tsValueBox(rep: i32) {
   0
 }
 
-function tsI32Array() {
-  tsEntryAt(aTypeIdx, "i32 array")
-  wU8(94)  // 0x5e array ($aTypeIdx — the i32-list / map backing)
-  wU8(127) // 0x7f i32 storagetype
+// The entry `idx` as a mutable scalar array `(array (mut <storage>))`, `storage` a valtype or
+// packed storage-type byte.
+function tsArray(idx: i32, what: string, storage: i32) {
+  tsEntryAt(idx, what)
+  wU8(94) // 0x5e array
+  wU8(storage)
+  wU8(1)  // mutable
+  0
+}
+
+// The entry `idx` as a mutable nullable-ref array `(array (mut (ref null $elem)))`.
+function tsRefArray(idx: i32, what: string, elem: i32) {
+  tsEntryAt(idx, what)
+  wU8(94) // 0x5e array
+  wU8(99) // 0x63 (ref null ht)
+  wSLEB(elem)
+  wU8(1)  // mutable
+  0
+}
+
+// The body of a list wrapper `{ backing: (ref $back), len: i32, cap: i32 }` — the one triple
+// every list rep uses, over its own backing. The caller writes the entry header first.
+function tsListWrapBody(back: i32) {
+  wU8(95)  // 0x5f struct
+  wU8(3)   // 3 fields
+  wU8(100) // field 0 backing: 0x64 (ref ht) — non-null
+  wSLEB(back)
+  wU8(1)   // mutable
+  wU8(127) // field 1 len: 0x7f i32
+  wU8(1)   // mutable
+  wU8(127) // field 2 cap: 0x7f i32
   wU8(1)   // mutable
   0
 }
+
+// `$aTypeIdx`, the i32-list and map backing.
+function tsI32Array() { tsArray(aTypeIdx, "i32 array", 127) }
 
 // `string`'s own backing array heap type (`$sBackIdx`), minted from the same `aUsed` flag and
 // emitted immediately after it. Its storage type is packed i8 and its elements are UTF-8
 // bytes, not i32 code points. It is not `ba8TypeIdx` (the `u8[]` backing) even though the two
 // are now structurally identical: iso-recursive identity is (rec group, position), so keeping the index separate is what makes a missed lowering site invalid wasm instead of a silent share.
-function tsStrBack() {
-  tsEntryAt(sBackIdx, "string backing")
-  wU8(94)  // 0x5e array
-  wU8(120) // 0x78 i8 storagetype — PACKED UTF-8 bytes (Stage 2c)
-  wU8(1)   // mutable
-  0
-}
+function tsStrBack() { tsArray(sBackIdx, "string backing", 120) }
 
 // The string header (`$sTypeIdx`) — a `string` value is this struct, a view over the backing
 // above: `{ backing: (ref $sBackIdx), start: i32, len: i32, hash: i32 }`. Field indices are
@@ -7414,16 +7438,7 @@ function tsStrHeader() {
 
 function tsI32List() {
   tsEntryAt(lTypeIdx, "i32 list wrapper")
-  wU8(95)         // 0x5f struct
-  wU8(3)          // 3 fields
-  wU8(100)        // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(aTypeIdx) // ...to the raw array heap type
-  wU8(1)          // mutable
-  wU8(127)        // field 1 len: 0x7f i32
-  wU8(1)          // mutable
-  wU8(127)        // field 2 cap: 0x7f i32
-  wU8(1)          // mutable
-  0
+  tsListWrapBody(aTypeIdx)
 }
 
 // One (backing, wrapper) PAIR per distinct ref-list element type, interleaved so each
@@ -7431,203 +7446,76 @@ function tsI32List() {
 // out above. Each backing is `(array (mut (ref null $elem)))` over the slot's element
 // (struct heap idx / union box); each wrapper is `{ backing: (ref $back), len, cap }`.
 function tsRefBack(rti: i32) {
-  tsEntryAt(rlBackIdx[rti], "ref-list backing")
-  wU8(94) // 0x5e array (ref backing)
-  wU8(99) // 0x63 (ref null ht) — nullable element ref
-  wSLEB(rlElemHeap[rti])
-  wU8(1)  // mutable
-  0
+  tsRefArray(rlBackIdx[rti], "ref-list backing", rlElemHeap[rti])
 }
 
 function tsRefWrap(rti: i32) {
   tsEntryAt(rlWrapIdx[rti], "ref-list wrapper")
   rvOpenParent(rti)
-  wU8(95)               // 0x5f struct (ref-list wrapper)
-  wU8(3)                // 3 fields
-  wU8(100)              // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(rlBackIdx[rti]) // ...to THIS slot's ref backing
-  wU8(1)                // mutable
-  wU8(127)              // field 1 len: 0x7f i32
-  wU8(1)                // mutable
-  wU8(127)              // field 2 cap: 0x7f i32
-  wU8(1)                // mutable
-  0
+  tsListWrapBody(rlBackIdx[rti])
 }
 
+// The string-ref list types, shared by the map's keys list and any `string[]` field. The
+// backing's element is nullable so `array.new_default` defaults spare slots to null.
 function tsStrListBack() {
-  // The string-ref list types, shared by the map's keys list and any `string[]` field. The
-  // backing array `(array (mut (ref null $aTypeIdx)))` has a nullable string-ref element so
-  // `array.new_default` defaults spare slots to null; the list wrapper is the same
-  // `{backing,len,cap}` triple as the i32 list, over the string backing.
-  tsEntryAt(mkArrIdx, "string-list backing")
-  wU8(94) // 0x5e array (keys/string backing)
-  wU8(99) // 0x63 (ref null ht) — nullable string ref
-  wSLEB(sTypeIdx)
-  wU8(1)  // mutable
-  0
+  tsRefArray(mkArrIdx, "string-list backing", sTypeIdx)
 }
 
 function tsStrListWrap() {
   tsEntryAt(mkListIdx, "string-list wrapper")
-  wU8(95)  // 0x5f struct (string-list wrapper)
-  wU8(3)   // 3 fields
-  wU8(100) // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(mkArrIdx)
-  wU8(1)   // mutable
-  wU8(127) // field 1 len: 0x7f i32
-  wU8(1)   // mutable
-  wU8(127) // field 2 cap: 0x7f i32
-  wU8(1)   // mutable
-  0
+  tsListWrapBody(mkArrIdx)
 }
 
+// The string-keyed map struct — the open-addressing rep documented at `mUsed`, whose field
+// order matches the host's general-purpose rep (`compiler/builtins/maps.ts`).
 function tsMap() {
-  // The map struct — the 7-field open-addressing rep documented at `mUsed`. Field order and
-  // count match the host's general-purpose rep exactly (`compiler/builtins/maps.ts`): keys 0, vals 1, live 2, index 3, count 4, size 5, hashes 6.
   tsEntryAt(mStructIdx, "map")
-  wU8(95)              // 0x5f struct (map)
-  wU8(mapFieldCount()) // 7 fields (open-addressing hash map, host-aligned), 9 with seqs
-  wU8(100)             // field 0 keys: 0x64 (ref $mkListIdx) — non-null
-  wSLEB(mkListIdx)
-  wU8(1)               // mutable
-  wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
-  wSLEB(lTypeIdx)
-  wU8(1)               // mutable
-  wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
-  wSLEB(aTypeIdx)
-  wU8(1)               // mutable
-  wU8(100)             // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
-  wSLEB(aTypeIdx)
-  wU8(1)               // mutable
-  wU8(127)             // field 4 count: 0x7f i32
-  wU8(1)               // mutable
-  wU8(127)             // field 5 size: 0x7f i32
-  wU8(1)               // mutable
-  wU8(100)             // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
-  wSLEB(aTypeIdx)
-  wU8(1)               // mutable
-  mapSeqFieldTypes()
-  0
+  tsMapStructBody(mkListIdx)
 }
 
 function tsMapI32() {
   tsEntryAt(mStructI32Idx, "i32-keyed map")
-  emitMonoMapStructType(lTypeIdx)
-  0
+  tsMapStructBody(lTypeIdx)
 }
 
 // The i64-keyed twin, the same struct over the i64 list wrapper, minted right after it.
 function tsMapI64() {
   tsEntryAt(mStructI64Idx, "i64-keyed map")
-  emitMonoMapStructType(il64TypeIdx)
-  0
+  tsMapStructBody(il64TypeIdx)
 }
 
-function tsF64Array() {
-  // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
-  // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
-  tsEntryAt(fa64TypeIdx, "f64 array")
-  wU8(94)  // 0x5e array
-  wU8(124) // 0x7c f64 storagetype
-  wU8(1)   // mutable
-  0
-}
+// The scalar list families, each an array then its wrapper, in the type-index allocation
+// order: f64 (Slice 4), i64, f32, then u8.
+function tsF64Array() { tsArray(fa64TypeIdx, "f64 array", 124) }
 
-// The f64-list wrapper `{ backing: (ref $fa64TypeIdx), len: i32, cap: i32 }` — the
-// same `{backing,len,cap}` triple as the i32 list, over the f64 backing.
 function tsF64List() {
   tsEntryAt(fl64TypeIdx, "f64 list wrapper")
   svOpenParent(1)
-  wU8(95)            // 0x5f struct
-  wU8(3)             // 3 fields
-  wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(fa64TypeIdx) // ...to the f64 array heap type
-  wU8(1)             // mutable
-  wU8(127)           // field 1 len: 0x7f i32
-  wU8(1)             // mutable
-  wU8(127)           // field 2 cap: 0x7f i32
-  wU8(1)             // mutable
-  0
+  tsListWrapBody(fa64TypeIdx)
 }
 
-function tsI64Array() {
-  // The i64 array `(array (mut i64))` — `0x5e` array form, `0x7e` i64 storagetype,
-  // `0x01` mutable (the i64 sibling of the `5e 7c 01` f64 array). Emitted right after the
-  // f64 pair, matching the type-index allocation order.
-  tsEntryAt(ia64TypeIdx, "i64 array")
-  wU8(94)  // 0x5e array
-  wU8(126) // 0x7e i64 storagetype
-  wU8(1)   // mutable
-  0
-}
+function tsI64Array() { tsArray(ia64TypeIdx, "i64 array", 126) }
 
-// The i64-list wrapper `{ backing: (ref $ia64TypeIdx), len: i32, cap: i32 }`.
 function tsI64List() {
   tsEntryAt(il64TypeIdx, "i64 list wrapper")
   svOpenParent(0)
-  wU8(95)            // 0x5f struct
-  wU8(3)             // 3 fields
-  wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(ia64TypeIdx) // ...to the i64 array heap type
-  wU8(1)             // mutable
-  wU8(127)           // field 1 len: 0x7f i32
-  wU8(1)             // mutable
-  wU8(127)           // field 2 cap: 0x7f i32
-  wU8(1)             // mutable
-  0
+  tsListWrapBody(ia64TypeIdx)
 }
 
-function tsF32Array() {
-  // The f32 array `(array (mut f32))` — `0x5e` array form, `0x7d` f32 storagetype, `0x01`
-  // mutable (the f32 sibling of the `5e 7c 01` f64 / `5e 7e 01` i64 arrays). Emitted right
-  // after the i64 pair, matching the type-index allocation order.
-  tsEntryAt(fa32TypeIdx, "f32 array")
-  wU8(94)  // 0x5e array
-  wU8(125) // 0x7d f32 storagetype
-  wU8(1)   // mutable
-  0
-}
+function tsF32Array() { tsArray(fa32TypeIdx, "f32 array", 125) }
 
-// The f32-list wrapper `{ backing: (ref $fa32TypeIdx), len: i32, cap: i32 }`.
 function tsF32List() {
   tsEntryAt(fl32TypeIdx, "f32 list wrapper")
-  wU8(95)            // 0x5f struct
-  wU8(3)             // 3 fields
-  wU8(100)           // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(fa32TypeIdx) // ...to the f32 array heap type
-  wU8(1)             // mutable
-  wU8(127)           // field 1 len: 0x7f i32
-  wU8(1)             // mutable
-  wU8(127)           // field 2 cap: 0x7f i32
-  wU8(1)             // mutable
-  0
+  tsListWrapBody(fa32TypeIdx)
 }
 
-function tsU8Array() {
-  // The `u8[]` backing `(array (mut i8))` — the emitter's first packed storage type: `0x78` is
-  // not a valtype at all, only legal in an array element or struct field, one byte per element
-  // instead of the four an i32 array spends. The consequence every read site must honour: `array.get` is invalid on this type — the engine refuses the module, since a byte read must say how it extends. `fbArrayGet` dispatches to `array.get_u` off this heap index.
-  tsEntryAt(ba8TypeIdx, "u8 array")
-  wU8(94)  // 0x5e array
-  wU8(120) // 0x78 i8 PACKED storagetype
-  wU8(1)   // mutable
-  0
-}
+// The `u8[]` backing is the emitter's first packed storage type: `0x78` is not a valtype, so
+// `array.get` is invalid on it and `fbArrayGet` dispatches to `array.get_u` off this index.
+function tsU8Array() { tsArray(ba8TypeIdx, "u8 array", 120) }
 
 function tsU8List() {
   tsEntryAt(bl8TypeIdx, "u8 list wrapper")
-  // The `u8[]` wrapper `{ backing: (ref $ba8TypeIdx), len: i32, cap: i32 }` — the same
-  // triple every other list wrapper uses; only the backing it points at is packed.
-  wU8(95)           // 0x5f struct
-  wU8(3)            // 3 fields
-  wU8(100)          // field 0 backing: 0x64 (ref ht) — non-null
-  wSLEB(ba8TypeIdx) // ...to the packed byte array heap type
-  wU8(1)            // mutable
-  wU8(127)          // field 1 len: 0x7f i32
-  wU8(1)            // mutable
-  wU8(127)          // field 2 cap: 0x7f i32
-  wU8(1)            // mutable
-  0
+  tsListWrapBody(ba8TypeIdx)
 }
 
 function tsClosure() {
