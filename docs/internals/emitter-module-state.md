@@ -107,11 +107,13 @@ The remainder: `capFrame`, `sblEpoch`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInf
 `emitRootIx`, `cloStructIdx`, `cloSigBase`, `gMemLogIdx`, `monoProgStmts`, `msGen`,
 `msAtomTexts`/`msAtomIds`, `narrowStripNullOnly`, `narrowBareIdentOnly`, `pendingNulClosure`,
 `pendingNulList`, `pendingRawNullRead`, `gDivRemNonzero`, `repShadowOn`, `rtWalkN`,
-`rtUserVer`, `repSlotRepEpoch`, `repElemMemoEpoch`/`repElemMemoLen`/`repElemMemoUserVer`,
-`fnUsesUnionAs`, `fnUsesNumCast`, `gckDepth`, `gckGenTy`/`gckGenS`/`gckGenSF`/`gckGenU`/
-`gckGenV`/`gckGenN`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`, `unABMode`. The
-`rep*`/`rt*` epoch counters are generation stamps and are MEANT to outlive a program (`msPoolReset` bumps `msGen` rather than clearing it); `emitRootIx` is
-assigned in the prologue with a value, not cleared. Run
+`fnUsesUnionAs`, `fnUsesNumCast`, `gckDepth`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`,
+`unABMode`. `msGen` is a generation stamp MEANT to outlive a program (`msPoolReset` bumps it
+rather than clearing it); `emitRootIx` is assigned in the prologue with a value, not cleared.
+A memo key made by `memoKeyNew` (`compiler/memo.vl`) is registered, and `memoCompileReset`,
+the first call in `emitProgram`, clears every key and restarts the pass and registry
+counters, so the rep element and slot-cache memos, the variant sig and tag keys and the
+type-registry generation start each compile unread. Run
 `vl run scripts/emitter-state-audit.vl -- --names` for the per-name clear sites.
 
 ## How to settle a row here
