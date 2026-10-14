@@ -9138,6 +9138,15 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
       isI64Lit = false
       isStrLit = false
     }
+    // A string list under a threaded `null` seed is the `(string | null)[]` niche, whose first
+    // element may be a `null` the element probe cannot classify: a literal that records no type
+    // of its own, as the run a variadic `.push` appends, has only the threaded kind (D4553).
+    if pendingListKind == LBK_STR_LIST && pendingNulString && !isRefLit {
+      isStrLit = true
+      isF64Lit = false
+      isI64Lit = false
+      isF32Lit = false
+    }
     if elems.length == 0 {
       if pendingListKind == LBK_STR_LIST {
         isStrLit = true
@@ -22121,6 +22130,27 @@ function pendingKindOfMf(k: MfKind, row: i32) {
   }
 }
 
+// The context the run a variadic `.push` appends builds under: the receiver's own list build,
+// plus the element seeds the one-argument push gives its value, so a literal-union member
+// lowers as its atom id and a `null` as the slot's niche (D4553).
+function pushRunBuildCtx(recvIx: i32, fnIx: i32, kk: MfKind, row: i32): ExpCtx {
+  const c = expCtxHere()
+  c.listKind = pendingKindOfMf(kk, row)
+  c.listSlot = row
+  if arrElemLitUnionTy(recvIx, fnIx) >= 0 { c.litUnion = 1 }
+  if arrElemIsNulBoolAt(recvIx, fnIx) {
+    c.listKind = LBK_NUL_BOOL_LIST
+    c.nulBool = true
+  }
+  if nodeArrayElemIsNulLitUnion(recvIx) {
+    c.listKind = LBK_NUL_LIT_UNION_LIST
+    c.litUnion = 1
+    c.nulLitUnion = true
+  }
+  if arrElemIsNulStrAt(recvIx, fnIx) { c.nulString = true }
+  c
+}
+
 // `xs.push(a, b)` / `xs.push(...ys)` — the variadic appends. The arguments build as one list
 // at the receiver's own rep, so a spread argument is `emitArrSpread`'s business; the receiver
 // then grows once and the new elements arrive as a single `array.copy`. The one-argument
@@ -22130,18 +22160,6 @@ function emitPushMany(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Member {
-      // A nullable or literal-union element rides a SPINE whose list literal needs seeds
-      // this path does not thread, so those receivers keep the one-at-a-time spelling.
-      if (
-        arrElemLitUnionTy(callee.memObj, fnIx) >= 0
-        || nodeArrayElemIsNulBool(callee.memObj)
-        || nodeArrayElemIsNulLitUnion(callee.memObj)
-        || nodeArrayElemIsNulStr(callee.memObj)
-      ) {
-        return emitFail(
-          "emitProgram: a nullable or literal-union list takes one `.push` argument at a time",
-        )
-      }
       const kk = mfRecvKindOf(callee.memObj, fnIx)
       if kk == null {
         return emitFail("emitProgram: .push receiver is not a list")
@@ -22164,8 +22182,11 @@ function emitPushMany(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
       if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
       fbLocalSet(recvS)
       const lst = spreadRunLit(c.callArgs, callIx, c.pos)
-      expCtxSetListBuild(pendingKindOfMf(kk, row), row)
-      if emitExpr(body, lst, fnIx) < 0 { return -1 }
+      const runSaved = expCtxHere()
+      expCtxApply(pushRunBuildCtx(callee.memObj, fnIx, kk, row))
+      const lstRc = emitExpr(body, lst, fnIx)
+      expCtxApply(runSaved)
+      if lstRc < 0 { return -1 }
       expCtxSetListBuild(LBK_I32_LIST, 0)
       fbLocalSet(srcS)
       // tot = recv.len + new.len
