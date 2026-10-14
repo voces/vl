@@ -577,7 +577,7 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   a weaker injection read +34% and passed — as it also would have on the CPU row. It catches
   the D1090 class, a many-fold blowup; the shape family is what sees a smaller multiplier, and
   says where.
-* **`scripts/plumb-shape-cost.py`** — what one `vl build --names -O --import-memory` of a 2 MB
+* **`scripts/plumb-shape-cost.vl`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that
   compiles the generator differently reds too): ~250 functions with a heavy tail, one 8,000-line

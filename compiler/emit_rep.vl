@@ -111,6 +111,7 @@ import {
 } from "./typecheck"
 import { sidOf } from "./symbols"
 import { tyMapValOf } from "./tyquery"
+import { memoKeyClear, memoKeyNew, memoMoved3 } from "./memo"
 
 // One struct per classified type. `rdCovered` is 1 when the rep derives structurally, 0 when
 // the consumer must use its legacy path; `rdKind` is the `VKind` member, `rdNul` how `null` is
@@ -368,15 +369,17 @@ const repKeyStack: i32[] = []
 // checker's `tyMutEpoch`; any arena mutation advances the epoch and drops the whole
 // memo. Consulted only at top-level calls, since an interior key's back-edge is not a self-contained string.
 let repKeyMemo: string[] = []
+// A plain stamp rather than a `MemoKey`, as are `repSlotRepEpoch` and `rtEpoch`: each sync runs
+// on every ask, where a key's array read is a measurable share of the compile.
 let repKeyMemoEpoch = -1
 
 function repKeyMemoSync() {
   if repKeyMemoEpoch != tyMutEpoch {
+    repKeyMemoEpoch = tyMutEpoch
     repKeyMemo = []
     // The identity twin's memo shares this generation exactly — one sync, two columns,
     // so the two can never disagree about which generation they are in.
     hcCanonMemo = []
-    repKeyMemoEpoch = tyMutEpoch
   }
   0
 }
@@ -658,22 +661,13 @@ const repElemKeyStack: i32[] = []
 // `repSlotCacheSync` compares (`tyMutEpoch`, `cUserTypesVer`, `sNames.length`). Top of
 // recursion only: a de Bruijn back-edge is a function of the caller's depth, not of `ty`, so an inner answer is never banked.
 let repElemMemo: string[] = []
-let repElemMemoEpoch = -1
-let repElemMemoUserVer = -1
-let repElemMemoLen = -1
+const repElemGenKey = memoKeyNew(3)
 
 function repElemMemoSync() {
-  if (
-    repElemMemoEpoch != tyMutEpoch
-    || repElemMemoUserVer != cUserTypesVer
-    || repElemMemoLen != sNames.length
-  ) {
+  if memoMoved3(repElemGenKey, tyMutEpoch, cUserTypesVer, sNames.length) {
     repElemMemo = []
     hcElemMemo = [] // the identity twin's memo, on the same generation
     hcMvMemo = [] // the map-value twin's, on that same generation for the same reason
-    repElemMemoEpoch = tyMutEpoch
-    repElemMemoUserVer = cUserTypesVer
-    repElemMemoLen = sNames.length
   }
   0
 }
@@ -909,9 +903,7 @@ export function nodeMapValTyIx(nodeIx: i32): i32 {
 // alone, or -1 (the consumer keeps its nominal path). The struct table is keyed
 // nominally, so this resolver tries an exact arena-index match against a declared
 // slot's memoized type first, else the unique structurally-matching slot, else -1 — zero or many matches are left to the nominal path, never collapsed.
-let repSlotCacheEpoch = -1
-let repSlotCacheUserVer = -1
-let repSlotCacheLen = -1
+const repSlotCacheGenKey = memoKeyNew(3)
 let repSlotByDecl: i32[] = []
 let repSlotKeySi: i32[] = []
 let repSlotKeyN: i32[] = []
@@ -926,13 +918,11 @@ let repSlotKeyFirst: i32[] = []
 // resolves to), or `sNames` growth (push-only within a program; the cross-program
 // reset always rides an `initChecker` epoch advance).
 function repSlotCacheSync() {
-  if (
-    repSlotCacheEpoch == tyMutEpoch
-    && repSlotCacheUserVer == cUserTypesVer
-    && repSlotCacheLen == sNames.length
-  ) {
+  if !memoMoved3(repSlotCacheGenKey, tyMutEpoch, cUserTypesVer, sNames.length) {
     return 0
   }
+  // Cleared for the build, so an ask nested inside it rebuilds rather than reading a half-built cache.
+  memoKeyClear(repSlotCacheGenKey)
   repSlotByDecl = []
   repSlotKeySi = []
   repSlotKeyN = []
@@ -967,11 +957,9 @@ function repSlotCacheSync() {
     }
     si = si + 1
   }
-  // Stamp after the build: `repKeyGo`'s walk only reads the arena, so the
+  // Recorded after the build: `repKeyGo`'s walk only reads the arena, so the
   // generations compared at entry still hold for everything just recorded.
-  repSlotCacheEpoch = tyMutEpoch
-  repSlotCacheUserVer = cUserTypesVer
-  repSlotCacheLen = sNames.length
+  memoMoved3(repSlotCacheGenKey, tyMutEpoch, cUserTypesVer, sNames.length)
   0
 }
 
@@ -1071,7 +1059,7 @@ export function hcReset() {
   hcCanonMemo = []
   hcElemMemo = []
   hcMvMemo = []
-  repSlotCacheEpoch = -1
+  memoKeyClear(repSlotCacheGenKey)
   hcTag = []
   hcArgStart = []
   hcArgCount = []
@@ -2982,12 +2970,11 @@ export function repReset() {
   // `initChecker`'s epoch advance; this keeps the reset story in one place.)
   repKeyMemo = []
   repKeyMemoEpoch = -1
+  repSlotRepEpoch = -1
   repSlotByDecl = []
   repSlotKeySi = []
   repSlotKeyN = []
-  repSlotCacheEpoch = -1
-  repSlotCacheUserVer = -1
-  repSlotCacheLen = -1
+  memoKeyClear(repSlotCacheGenKey)
   // The recursive rep TREE (below) is arena-index-keyed too — force its next
   // `rtSync` to rebuild from scratch.
   repTreeDrop()
@@ -3156,12 +3143,14 @@ let rtByTy: i32[] = [] // Ty index → node index (-1 unfilled); the cycle break
 let rtIntern: {[string]: i32} = Map() // structural key → node (hash-cons)
 let rtWalkGen: i32[] = [] // per-node visit stamps (`repTreeUnsupReason`)
 let rtWalkN = 0
+// The generations `rtSync` last built at; plain stamps, as `repKeyMemo`'s comment says.
 let rtEpoch = -1
 let rtUserVer = -1
 
 // Invalidate the tree (the `repReset` hook): the next `rtSync` rebuilds.
 function repTreeDrop() {
   rtEpoch = -1
+  rtUserVer = -1
   0
 }
 

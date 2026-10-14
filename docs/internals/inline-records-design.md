@@ -332,7 +332,7 @@ The `-O`-only question is not new. It is fixed-arrays Q5, and the same answer ap
   per-module bound per function, as fixed-arrays §6.2 asks.
 * **The (b) read regression:** a later engine-side bounds-check elimination, or a
   struct-of-arrays layout, could remove it. Neither is assumed here.
-* `plumb-shape-cost.py` and `self-compile-time.sh` gate the pass's own cost. A type rewrite
+* `plumb-shape-cost.vl` and `self-compile-time.sh` gate the pass's own cost. A type rewrite
   over a 10 MB plumb module must stay linear.
 
 ## 7. S2 as built: flattened lists (D3681)

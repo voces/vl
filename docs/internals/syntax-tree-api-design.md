@@ -471,7 +471,7 @@ themselves. Four measures keep that bounded:
 * Each rule has a per-file fuel budget. A rule over budget is skipped for that file, and
   the status bar says so.
 * Budgets and the view build are measured in P3 against the self-compile tripwire and
-  `plumb-shape-cost.py`. A cost that fails there is what would justify §1(b).
+  `plumb-shape-cost.vl`. A cost that fails there is what would justify §1(b).
 
 ### 6.4 Execution: where rule code runs
 

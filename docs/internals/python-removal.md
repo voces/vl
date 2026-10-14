@@ -36,9 +36,9 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 5 | `render-parse budget` | done: `render-parse-census.vl` plus `vl check --budget --findings` | - |
 | 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/{rows,ls,split,selftest}.py` deleted, the row grammar is `scripts/lib/inventory.vl` | - |
 | 7 | `lint-self.sh` (`matrix.py`) | done: `scripts/capability-matrix.vl`, `matrix.py` deleted | - |
-| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` stays, imported by `survey-regrade.py` | deleted with it |
+| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` has no importer left (`check-filed-witnesses.py` and `survey-regrade.py` are deleted) and stays as `tests/vl_seed_provenance_test.ts`'s oracle | deleted with it |
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
-| - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `.py` kept as port-test oracle | delete `plumb-shape-cost.py`, `distilled/cellmap.py`, `corpuscmp.py`, `survey-regrade.py`, `grade.py`, `profile-rank.py` with their port tests |
+| - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `plumb-shape-cost.py`, `survey-regrade.py`, `check-filed-witnesses.py` and `distilled/{regress,index,redistil}.py` (+ `gradecensus.py`) deleted | delete `distilled/cellmap.py` and `corpuscmp.py`; `grade.py` and `profile-rank.py` have callers of their own (rows below) |
 
 Rows 1-5 are done and `ratchet.py` is deleted. `mono-tyaram-grid.sh` carries an inline python
 heredoc and moves with its own PR.
@@ -51,7 +51,7 @@ heredoc and moves with its own PR.
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
 | `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | done: `scripts/capability-probes.vl`; the `.py` is deleted and its port test pins goldens |
-| `scripts/seed_provenance.py` | 223 | I | scripts/survey-regrade.py | ported: `scripts/seed-provenance.vl` is on master; delete with it |
+| `scripts/seed_provenance.py` | 223 | I | tests/vl_seed_provenance_test.ts (oracle only) | ported: `scripts/seed-provenance.vl` is on master; delete with the test's oracle case |
 | `scripts/silent-sweep/distilled/regress.py` | 177 | G | scripts/lint-self.sh | deleted: `regress.vl` runs the gate rows |
 
 ### T: tests
@@ -67,13 +67,13 @@ heredoc and moves with its own PR.
 | `scripts/inventory/ls.py` | 200 | T | tests/vl_inventory_rows_test.ts | deleted: `scripts/inventory/ls.vl`, graded beside it flag by flag |
 | `scripts/ladder-census.py` | 884 | T | tests/lsp_ratchet_hold_test.ts tests/vl_kind_ladder_test.ts | scripts/ladder-census.vl (shares the budget walk) |
 | `scripts/memo-generation-probe.py` | 403 | T | tests/vl_memo_generation_test.ts | done: `scripts/memo-generation-probe.vl`, rows in `scripts/memo-generation-rows.json`; the `.py` is deleted |
-| `scripts/plumb-shape-cost.py` | 397 | T | tests/vl_plumb_shape_port_test.ts | ported: `scripts/plumb-shape-cost.vl` is on master; delete with its port test's oracle |
+| `scripts/plumb-shape-cost.py` | 397 | T | tests/vl_plumb_shape_port_test.ts | done: deleted; `scripts/plumb-shape-cost.vl` runs the gate row and the port test pins its outcomes |
 | `scripts/sentinel-census.py` | 481 | T | tests/vl_budget_mode_test.ts tests/vl_sentinel_index_test.ts | scripts/sentinel-census.vl (shares the budget walk) |
 | `scripts/silent-sweep/census/gradecensus.py` | 217 | T | tests/vl_regress_port_test.ts | deleted: `census/gradecensus.vl`, grading shared with `regress.vl` through `scripts/lib/census-grade.vl` |
 | `scripts/silent-sweep/distilled/cellmap.py` | 35 | I | none | `loadCells`/`dumpCells` in `scripts/lib/corpus.vl`; delete |
 | `scripts/silent-sweep/distilled/index.py` | 157 | T | tests/vl_regress_port_test.ts | deleted: `distilled/index.vl` |
-| `scripts/silent-sweep/grade.py` | 165 | T | tests/vl_seed_provenance_test.ts tests/vl_survey_measure_test.ts (+1) | scripts/silent-sweep/grade.vl |
-| `scripts/survey-regrade.py` | 463 | T | tests/vl_seed_provenance_test.ts tests/vl_survey_measure_test.ts (+1) | ported: `scripts/survey-regrade.vl` is on master; delete with its port test's oracle |
+| `scripts/silent-sweep/grade.py` | 165 | T | docs/internals/inventory/README.md (the test reach was `survey-regrade.py` matching as a substring; it is D) | scripts/silent-sweep/grade.vl |
+| `scripts/survey-regrade.py` | 463 | T | tests/vl_seed_provenance_test.ts tests/vl_survey_measure_test.ts (+1) | done: deleted; `scripts/survey-regrade.vl` runs the gate row, its port test holds it to the Python's frozen reports |
 | `scripts/wasm-runner-census.py` | 172 | T | tests/cases_wasm_0_test.ts tests/cases_wasm_1_test.ts (+3) | scripts/wasm-runner-census.vl (shares the budget walk) |
 
 ### I: imported
@@ -86,7 +86,7 @@ heredoc and moves with its own PR.
 | `scripts/inventory/rows.py` | 120 | I | scripts/inventory/ls.py (+2) | deleted: `scripts/lib/inventory.vl` |
 | `scripts/inventory/selftest.py` | 127 | I | scripts/inventory/split.py | retired with `split.py` |
 | `scripts/inventory/split.py` | 388 | I | scripts/check-filed-witnesses.py | retired: both inventories are split, and the generated `INDEX.md` it wrote (stale at 608 rows) went with it |
-| `scripts/profile-rank.py` | 98 | I | scripts/survey-regrade.py | scripts/profile-rank.vl |
+| `scripts/profile-rank.py` | 98 | I | scripts/perf/profile-parents.py scripts/perf/profile-phases.py (+1; `survey-regrade.py` is deleted) | scripts/profile-rank.vl |
 | `scripts/silent-sweep/corpuscmp.py` | 91 | D | dated reports and READMEs | port to VL or retire (decide at its turn) |
 | `scripts/silent-sweep/d451/mkcells.py` | 246 | X | nothing since `gradecensus.py` (a comment) was deleted | retire: closed grid; keep README + data, drop the generator |
 | `scripts/silent-sweep/distilled/redistil.py` | 153 | I | scripts/silent-sweep/distilled/index.py | deleted: `distilled/redistil.vl` |

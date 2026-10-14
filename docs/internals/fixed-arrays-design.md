@@ -1116,7 +1116,7 @@ S0's matrix carries a payload-NaN row per placement, read back with `reinterpret
 3. **The host step can decline** (a `br_table` exit, the growth bound, a module it cannot
    validate). The program then runs with boxes, correctly but with garbage. Control:
    `VL_MV_EXPLAIN=1` already says why; S1 adds fixed arrays to its report, and the
-   `plumb-shape-cost.py` and fuel instruments gain a fixed-array shape.
+   `plumb-shape-cost.vl` and fuel instruments gain a fixed-array shape.
 4. **Boxed placements rebuild on every write.** A loop writing a map-held matrix element by
    element is O(N²) with garbage. Control: the hint (§5.16), and the uniqueness optimisation
    later (§6.5).
