@@ -3350,7 +3350,7 @@ seed from current `compiler/*.vl` in ~40s.*
   population somebody already wrote down. First run (2026-09-03, 640 programs) filed D1474,
   D1475 and D1476 and reproduced both of its controls. **What it cannot sample is the whole
   backlog**: no `std:json`/`buffer`/`fs`, nothing over ~25 lines, and nothing whose expected
-  output Python cannot compute. Each is one record in `grammar.py`. Generics reach TWO
+  output the generator cannot compute. Each is one record in `grammar.vl`. Generics reach TWO
   parameters and no further (D1887/D1888); recursive types are four records with a
   non-recursive control (D1889); operator overloading is the `operator_vs_call` axis, whose
   UFCS control stayed green over 69 pairs while four mechanisms fell out (D1891-D1894);

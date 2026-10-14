@@ -1,6 +1,6 @@
 // THE DAY-ONE SAMPLER, GRADED AGAINST ITS OWN CONTROL.
 //
-// `scripts/day-one/sample.py` generates ORDINARY programs in PAIRS — two spellings of one
+// `scripts/day-one/sample.vl` generates ORDINARY programs in PAIRS — two spellings of one
 // program, one axis apart — and reports agree/disagree rather than runs/refuses. It is a
 // DISCOVERY instrument, so what belongs in the gate is not a hit count (that number moves
 // every time a defect closes) but the three things whose breakage would make a future zero
@@ -22,27 +22,30 @@
 //
 // @test-timing instrument
 
-import { COMPILER, ROOT, VL, exists, pythonBin } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
-const SAMPLE = `${ROOT}/scripts/day-one/sample.py`;
+const SAMPLE = `${ROOT}/scripts/day-one/sample.vl`;
+const MINIMISE = `${ROOT}/scripts/day-one/minimise.vl`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
-const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(SAMPLE);
+const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(SAMPLE) && exists(MINIMISE);
 if (GATED && !ENABLED) {
-  console.warn("[vl-day-one] skipped — missing vl binary, seed wasm or sample.py.");
+  console.warn("[vl-day-one] skipped — missing vl binary, seed wasm or sample.vl.");
 }
 
-const run = async (args: string[]): Promise<{ code: number; out: string }> => {
-  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-    args: [SAMPLE, ...args, "--compiler", COMPILER],
+const vlRun = async (script: string, args: string[]): Promise<{ code: number; out: string }> => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
+    args: ["run", script, "--compiler", COMPILER, "--", ...args, "--compiler", COMPILER],
+    cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
-    env: { NO_COLOR: "1" },
+    env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   return {
     code,
     out: new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
   };
 };
+const run = (args: string[]) => vlRun(SAMPLE, args);
 
 type Summary = {
   pairs: number;
@@ -62,12 +65,12 @@ const sample = (): Promise<Summary> => {
   if (!cached) {
     cached = (async () => {
       const { code, out } = await run(["--seed", "4242", "--count", "40", "--jobs", "4", "--json"]);
-      if (code !== 0) throw new Error(`sample.py --json exited ${code}:\n${out}`);
+      if (code !== 0) throw new Error(`sample.vl --json exited ${code}:\n${out}`);
       const line = out.trim().split("\n").pop() ?? "";
       try {
         return JSON.parse(line) as Summary;
       } catch {
-        throw new Error(`sample.py --json did not print JSON, got:\n${out}`);
+        throw new Error(`sample.vl --json did not print JSON, got:\n${out}`);
       }
     })();
   }
@@ -86,7 +89,7 @@ Deno.test({
       if (!s.grade_vocabulary.includes(g)) {
         throw new Error(
           `grade ${JSON.stringify(g)} is outside the vocabulary ` +
-            `${JSON.stringify(s.grade_vocabulary)} — sample.py and ` +
+            `${JSON.stringify(s.grade_vocabulary)} — sample.vl and ` +
             `scripts/capability-probes.vl have drifted`,
         );
       }
@@ -131,7 +134,7 @@ Deno.test({
       throw new Error(
         `want at least one multi-module program in the fixed-seed sample, got ` +
           `${s.multi_file}. The modules_split axis is declared and varied, so its split ` +
-          `face is rendering as a single file — see scripts/day-one/modules.py's render.`,
+          `face is rendering as a single file — see scripts/day-one/modules.vl's renderModules.`,
       );
     }
   },
@@ -161,6 +164,37 @@ Deno.test({
           `${synthetic.length}:\n${out}\nA control built on a live defect evaporates when ` +
           `the defect is fixed (D1473, #2476) — the synthetic ones are what stay true.`,
       );
+    }
+  },
+});
+
+Deno.test({
+  name: "day-one: minimise cuts a line the refusal does not need and keeps a called declaration",
+  ignore: !ENABLED,
+  fn: async () => {
+    // `unused` is a free cut; `helper` is still called by the surviving `print`, so the
+    // context guard must keep it even though removing it would still refuse.
+    const dir = await Deno.makeTempDir({ prefix: "vl-day-one-min-test-" });
+    try {
+      const file = `${dir}/w.vl`;
+      const src = [
+        "function helper(x: i32): i32 { return x + 1 }",
+        "const unused = 5",
+        'const k: i32 = "oops"',
+        "print(helper(k))",
+        "",
+      ];
+      await Deno.writeTextFile(file, src.join("\n"));
+      const { code, out } = await vlRun(MINIMISE, ["--file", file, "--want", "3"]);
+      const want = [src[0], src[2], src[3]].join("\n");
+      const lines = out.split("\n");
+      const ok = code === 0 && lines[0].startsWith("check refuses: ") &&
+        lines.slice(2, 5).join("\n") === want && !out.includes("unused");
+      if (!ok) {
+        throw new Error(`want rc 0, a check refusal and the witness\n${want}\ngot rc ${code}:\n${out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
   },
 });
