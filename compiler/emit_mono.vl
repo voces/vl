@@ -288,6 +288,7 @@ import {
   fnFlowAliasLam,
   fnFlowCellLam,
   fnFlowDeclFn,
+  fnFlowDeclKidSrc,
   fnFlowDeclWritten,
   fnFlowLamPin,
   fnFlowLetPinSigs,
@@ -9979,7 +9980,13 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
   if !monoListOnlyCalled(ctx, d.letName, at, lit.arrElems.length) { return 0 }
   let sig = ""
   let ft = -1
-  for c in monoListElemCalls(ctx, d.letName, at) {
+  let split = false
+  const calls = monoListElemCalls(ctx, d.letName, at)
+  const insts: i32[] = []
+  // The one generic every element holds, unwritten (`fnFlowDeclKidSrc`): each call takes it
+  // at its own instance, so the calls may differ (fn-value-flow-design.md §(e)).
+  const src = fnFlowDeclKidSrc(at, "e")
+  for c in calls {
     const call = P.nodes[c]
     if !(call is Call) { return 0 }
     const el = monoListElemOf(call.callFn, ctx)
@@ -9988,13 +9995,16 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
     if ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) { return 0 }
     let one = ""
     let g = monoListElemGenFe(el[0], el[1])
+    const own = monoFeIsSrc(g, src)
     // An element naming a written `let` of generics is called at the instance its seed takes, and
     // each value of the `let` is given that type below (D3978).
     if g < 0 { g = monoWrittenLetSeedFe(el[0], el[1]) }
+    if !own { insts.push(-1) }
     if g >= 0 {
       monoLastInstFe = -1
       if monoInstantiate(g, c, ctx) < 0 { return -1 }
       if monoLastInstFe < 0 { return 0 }
+      if own { insts.push(monoLastInstFe) }
       one = monoSlotSig(monoLastInstFe)
       if ft < 0 {
         ft = monoPinSubTyOf(nodeTyIxOf(el[0]), fnStmts[monoLastInstFe])
@@ -10014,8 +10024,11 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
       if ft < 0 { ft = t }
     }
     one = monoPinSigWithRet(one, ret)
-    if sig != "" && sig != one { return monoGenericListFail(d.letInit) }
-    sig = one
+    if sig == "" { sig = one }
+    else if sig != one { split = true }
+  }
+  if split && !monoCallsPerRead(calls, insts) {
+    return monoGenericListFail(d.letInit)
   }
   if sig == "" { return 0 }
   const semi = sig.indexOf(";")
@@ -10062,6 +10075,33 @@ function monoPinGenericList(d: LetDecl, at: i32, ctx: i32): i32 {
     }
   }
   0
+}
+
+// Whether slot `g` is the generic function declared at `src` (`fnFlowDeclKidSrc`).
+function monoFeIsSrc(g: i32, src: i32): boolean {
+  src >= 0 && g >= 0 && g < monoOrigNode.length && monoOrigNode[g] == src
+}
+
+// Points each call in `calls` at its own instance in `insts`, a direct call, when every call has
+// one: the element or field it reads holds that generic and nothing writes it. False otherwise.
+function monoCallsPerRead(calls: i32[], insts: i32[]): boolean {
+  if calls.length != insts.length { return false }
+  for fe in insts {
+    if fe < 0 || fe >= fnStmts.length { return false }
+  }
+  let i = 0
+  while i < calls.length {
+    const call = P.nodes[calls[i]]
+    if call is Call {
+      const at = P.nodes[call.callFn]
+      const callee = mkIdent(monoSlotName(insts[i]), at.pos)
+      sidNoteNodeName(callee, fnStmts[insts[i]])
+      call.callFn = callee
+      monoArenaTouch()
+    }
+    i = i + 1
+  }
+  true
 }
 
 // Pins a lambda literal `v` with an un-annotated parameter, written in frame `wf` into a list
@@ -10123,6 +10163,10 @@ function monoPinGenericRecord(d: LetDecl, at: i32, ctx: i32): i32 {
   while h < hot.length {
     let sig = ""
     let ft = -1
+    let split = false
+    const fcalls: i32[] = []
+    const insts: i32[] = []
+    const src = fnFlowDeclKidSrc(at, "f." + hot[h])
     for c in calls {
       const call = P.nodes[c]
       if call is Call {
@@ -10132,28 +10176,32 @@ function monoPinGenericRecord(d: LetDecl, at: i32, ctx: i32): i32 {
             const ret = nodeTyIxOf(c)
             if ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) { return 0 }
             let g = monoListElemGenFe(vals[h], ctx)
+            const own = monoFeIsSrc(g, src)
             if g < 0 { g = monoWrittenLetSeedFe(vals[h], ctx) }
             if g < 0 { return 0 }
             monoLastInstFe = -1
             if monoInstantiate(g, c, ctx) < 0 { return -1 }
             if monoLastInstFe < 0 { return 0 }
+            fcalls.push(c)
+            if own { insts.push(monoLastInstFe) } else { insts.push(-1) }
             const one = monoPinSigWithRet(monoSlotSig(monoLastInstFe), ret)
             if ft < 0 {
               ft = monoPinSubTyOf(nodeTyIxOf(vals[h]), fnStmts[monoLastInstFe])
             }
-            if sig != "" && sig != one {
-              return emitFailAt(
-                "emitProgram: a record field holding a generic function is called at more than "
-                  + "one argument type — one field holds one function value, and calls through "
-                  + "it want two. Annotate the field's function type, or bind a separate value "
-                  + "per type",
-                vals[h],
-              )
-            }
-            sig = one
+            if sig == "" { sig = one }
+            else if sig != one { split = true }
           }
         }
       }
+    }
+    if split && !monoCallsPerRead(fcalls, insts) {
+      return emitFailAt(
+        "emitProgram: a record field holding a generic function is called at more than "
+          + "one argument type — one field holds one function value, and calls through "
+          + "it want two. Annotate the field's function type, or bind a separate value "
+          + "per type",
+        vals[h],
+      )
     }
     if sig != "" {
       if !monoTyConcreteFn(ft) { return 0 }

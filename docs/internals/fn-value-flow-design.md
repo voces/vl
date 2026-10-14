@@ -734,6 +734,17 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.
    - Claims u02 (a list element) and u03 (a record field) under the single-source rule:
      emit refusals today, `runs` after.
+   - First PR: u02 and u03 run, and the decision is the table's. `fnFlowDeclKidSrc` reads a
+     binding's derived element (`e`) or field (`f.<name>`) slot and returns its one source
+     when every walk of the binding agrees and no write reaches the slot. When calls
+     through that slot want two signatures, `monoPinGenericList` and `monoPinGenericRecord`
+     point each call at its own instance as a direct call (`monoCallsPerRead`) instead of
+     refusing. Two sources, a written slot, or an element seeded by a written `let`
+     (D4246) keep the refusal. It closes D4242 and turns ten review witnesses from loud
+     emit rejects into runs (`rv3505` a02, a03, a14, a26, b04, b07, b20, b27; `rv3531` u02,
+     u03). Over the d3909, d3929 and d3960 grids, `rv3568` and the other `rv3484`–`rv3570`
+     witnesses nothing else moved. It retires nothing. The walks that find the calls are
+     still mono's, and maps, unions, spread, for-in and `?.` are not yet read from the table.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
