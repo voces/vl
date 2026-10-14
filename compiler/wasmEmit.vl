@@ -579,6 +579,7 @@ import {
   synthGlobalIdx,
   tailCallEnd,
   tailCallIdx,
+  tailCallTable,
   u8PushScratchBase,
   uBoxIdx,
   uBoxNewEnd,
@@ -683,6 +684,7 @@ import {
   fbRetExtra,
   fbReturn,
   fbReturnCall,
+  fbReturnCallIndirect,
   fbSelect,
   fbSelectRef,
   fbStrBack,
@@ -21101,6 +21103,7 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
     fbLocalGet(crSlot)
     fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
     fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
+    armTailCallIndirect(sig)
     return 0
   }
   emitFail("emitProgram: expected a call expression")
@@ -25261,42 +25264,79 @@ function unionBoxNewBytes() {
   probe
 }
 
-// The exact bytes `fbCall(fnIdx)` writes, produced BY that encoder into a scratch buffer
-// — the `unionBoxNewBytes` discipline, so the tail-call peephole's pattern cannot drift
-// from the instruction it matches if the funcidx's ULEB width changes.
-function callBytes(fnIdx: i32) {
+// The exact bytes the armed tail-call cursor's call wrote, produced BY its encoder into a
+// scratch buffer — the `unionBoxNewBytes` discipline, so the tail-call peephole's pattern
+// cannot drift from the instruction it matches if an index's ULEB width changes.
+function tailCallBytes() {
   const probe: u8[] = []
   const prev = wTarget(probe)
-  fbCall(fnIdx)
+  if tailCallTable < 0 {
+    fbCall(tailCallIdx)
+  } else {
+    fbCallIndirect(tailCallIdx, tailCallTable)
+  }
   wTarget(prev)
   probe
 }
 
-// Rewrite a trailing direct `call` into `return_call`, reporting whether it fired. A call
-// whose bytes are still the last thing written when `return` terminates is in tail
-// position by construction. Validity needs no result-type check, since `return_call`
-// imposes the same subtyping `return` already does; the one break is arity.
-function emitTailCallRet(fnIx: i32) {
-  if fbRetExtra.length > 0 { return emitLiftSelfTailRet(fnIx) }
-  if fnUsesUnionSink { return false }
-  if tailCallIdx < 0 { return false }
-  if tailCallEnd != wLen() { return false }
-  const pat = callBytes(tailCallIdx)
+// Whether the armed call's bytes end `back` bytes before the write cursor.
+function tailCallEndsAt(back: i32) {
+  const pat = tailCallBytes()
   const np = pat.length
-  let ok = true
   let i = 0
   while i < np {
-    if wPeekBack(i) != pat[np - 1 - i] { ok = false }
+    if wPeekBack(back + i) != pat[np - 1 - i] { return false }
     i = i + 1
   }
-  if !ok { return false }
+  true
+}
+
+// Unwrite the armed call, `back` bytes before the cursor, together with those bytes, and write
+// its tail form in their place; disarms the cursor.
+function tailCallRewrite(back: i32) {
+  wDropBack(back + tailCallBytes().length)
+  if tailCallTable < 0 {
+    fbReturnCall(tailCallIdx) // 0x12 return_call
+  } else {
+    fbReturnCallIndirect(tailCallIdx, tailCallTable) // 0x13 return_call_indirect
+  }
+  tailCallEnd = -1
+  tailCallIdx = -1
+  0
+}
+
+// Rewrite a trailing call into its tail form, reporting whether it fired. A call whose bytes
+// are still the last thing written when `return` terminates is in tail position by
+// construction. Validity needs no result-type check, since a tail call imposes the same
+// subtyping `return` already does; the one break is arity, so a void caller is declined here.
+function emitTailCallRet(fnIx: i32) {
+  if fbRetExtra.length > 0 { return emitLiftSelfTailRet(fnIx) }
+  if tailCallIdx < 0 || tailCallEnd != wLen() { return false }
+  if !tailCallEndsAt(0) { return false }
   const fnPos = fnStmtsPosOf(fnIx)
   if fnPos < 0 { return false }
   if fRetVoid[fnPos] == 1 { return false }
-  wDropBack(np)
-  fbReturnCall(tailCallIdx) // 0x12 return_call
-  tailCallEnd = -1
-  tailCallIdx = -1
+  tailCallRewrite(0)
+  true
+}
+
+// The tail-call rewrite at a void function's exit: the explicit `return f()` and the trailing
+// call statement. Only a direct call to a void callee that hands nothing back qualifies, since
+// `return` tolerates a leftover result and a tail call does not (D4654, D4655).
+export function emitVoidTailCall(fnIx: i32) {
+  if fbRetExtra.length > 0 || tailCallTable >= 0 { return false }
+  if tailCallIdx < 0 || tailCallEnd != wLen() { return false }
+  const fnPos = fnStmtsPosOf(fnIx)
+  if fnPos < 0 || fnPos >= fRetVoid.length || fRetVoid[fnPos] != 1 {
+    return false
+  }
+  const callee = tailCallIdx - gImports
+  if callee < 0 || callee >= fRetVoid.length || fRetVoid[callee] != 1 {
+    return false
+  }
+  if cloLiftWriteCount(callee) > 0 { return false }
+  if !tailCallEndsAt(0) { return false }
+  tailCallRewrite(0)
   true
 }
 
@@ -25304,21 +25344,12 @@ function emitTailCallRet(fnIx: i32) {
 // returns what the function itself would, so its write-back is dropped with it (D3664).
 function emitLiftSelfTailRet(fnIx: i32) {
   if fnUsesUnionSink || tailCallIdx < 0 || tailCallEnd < 0 { return false }
-  if liftWbEnd != wLen() { return false }
+  if tailCallTable >= 0 || liftWbEnd != wLen() { return false }
   const fnPos = fnStmtsPosOf(fnIx)
   if fnPos < 0 || tailCallIdx != gImports + fnPos { return false }
   const wb = wLen() - tailCallEnd
-  const pat = callBytes(tailCallIdx)
-  const np = pat.length
-  let i = 0
-  while i < np {
-    if wPeekBack(wb + i) != pat[np - 1 - i] { return false }
-    i = i + 1
-  }
-  wDropBack(wb + np)
-  fbReturnCall(tailCallIdx) // 0x12 return_call
-  tailCallEnd = -1
-  tailCallIdx = -1
+  if !tailCallEndsAt(wb) { return false }
+  tailCallRewrite(wb)
   liftWbEnd = -1
   true
 }
@@ -25612,6 +25643,8 @@ export function emitStmt(body: u8[], stmtIx: i32, fnIx: i32) {
       const rPos = fnStmtsPosOf(fnIx)
       if rPos >= 0 {
         if fRetVoid[rPos] == 1 {
+          // The checker splits `return f()` here into `f()` and this bare `return`.
+          if emitVoidTailCall(fnIx) { return 0 }
           fbReturn() // 0x0f return
           return 0
         }
@@ -25631,6 +25664,7 @@ export function emitStmt(body: u8[], stmtIx: i32, fnIx: i32) {
     if rvPos >= 0 && rvPos < fRetVoid.length {
       if fRetVoid[rvPos] == 1 {
         if emitStmt(body, s.retArg, fnIx) < 0 { return -1 }
+        if emitVoidTailCall(fnIx) { return 0 }
         fbReturn() // 0x0f return (void: nothing pushed)
         return 0
       }
@@ -32349,6 +32383,7 @@ function emitDirectCallTail(target: i32, fnIx: i32) {
   // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
   // rewrites the pair into `return_call`.
   tailCallIdx = gImports + target
+  tailCallTable = -1
   tailCallEnd = wLen()
   // A lifted callee hands back the captures it assigned after its result: each goes back
   // where this frame keeps it, the last result first (D3664).
@@ -32488,7 +32523,17 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   fbLocalGet(crSlot)
   fbStructGet(cloStructIdx, 1)      // the callee's wasm function index
   fbCallIndirect(csig, gFnTableIdx) // 0x11 <fnsig> <table>
+  armTailCallIndirect(csig)
   return 0
+}
+
+// Arm the tail-call cursor on the function-value call just written, so a `return` that
+// follows it directly becomes `return_call_indirect` (D4657).
+function armTailCallIndirect(sig: i32) {
+  tailCallIdx = sig
+  tailCallTable = gFnTableIdx
+  tailCallEnd = wLen()
+  0
 }
 
 // The `__array_new__(n, fill)` / `__array_new_default__(n)` intrinsic lowering.
