@@ -71,9 +71,10 @@ PROBE = """// {title}
 
 
 def next_id():
-    out = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "inventory",
-                                                       "ls.py"), "--next"],
-                         capture_output=True, text=True)
+    out = subprocess.run([os.path.join(ROOT, "scripts", "vl-host", "target", "release", "vl"),
+                          "run", "scripts/inventory/ls.vl", "--compiler",
+                          os.path.join(ROOT, "build", "vl-compiler.wasm"), "--", "--next"],
+                         capture_output=True, text=True, cwd=ROOT)
     return out.stdout.strip().split()[-1]
 
 
