@@ -8,9 +8,9 @@
 // The native half runs the seed on wasmtime's default stack (`VL_SEED_STACK=default`), the stack
 // the recursive passes fell on: the host's own stack is large enough to hide a recursion (D2182),
 // and a control proves the small one is in force by refusing a 1,000-deep `if` NEST there. The
-// `match` runs at 10,000 arms; the two chains at 6,000 links, past every depth a recursive pass
-// fell at, because checking them is quadratic in the length (D4557). Each witness prints three
-// values only the right arm produces, so a chain that dispatched wrongly cannot pass.
+// `match` and both chains run at 10,000 links, past every depth a recursive pass fell at, and
+// cheap to check because a link no longer walks the chain below it (D4557). Each witness prints
+// three values only the right arm produces, so a chain that dispatched wrongly cannot pass.
 //
 // GATING: the native half is env-gated (`SELFHOST_NATIVE_ALIGN=1`) and needs the binary; both
 // halves need the seed, and register as ignored without it. The br_table-count case ALSO
@@ -25,7 +25,6 @@ import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
 const N = 10_000;
-const CHAIN_N = 6_000;
 const HAVE_SEED = exists(COMPILER);
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const NATIVE = GATED && HAVE_SEED && exists(VL);
@@ -62,8 +61,8 @@ const want = (n: number) => ["22", String((n - 1) * 3 + 1), "-1"];
 // [name, generator, links natively, links under V8]
 const PROGRAMS: [string, (n: number) => string, number, number][] = [
   ["match", genMatch, N, N],
-  ["else-if statement chain", genElseIf, CHAIN_N, CHAIN_N],
-  ["if-expression chain", genIfExpr, CHAIN_N, CHAIN_N],
+  ["else-if statement chain", genElseIf, N, N],
+  ["if-expression chain", genIfExpr, N, N],
 ];
 
 // The same `if` nested rather than chained: the compiler recurses once per level.
