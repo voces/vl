@@ -2481,3 +2481,92 @@ reads a `(boolean | null)[]` as `list`; the module is byte-identical.
 3. The narrowed nullable read (cause 3) and the union holding a nullable union, 6,606 notes
    together.
 4. The numeric literal unions wait for registry step 5.
+
+### 13.12 The open generic element and the RIGHT-ONLY, ablated: one coverage step, none converted
+
+§13.11 left two items at the top of the list: 34,673 LEFT-ONLY with a type-variable element, and
+40,124 RIGHT-ONLY in `tests/cases`. Both were measured here the same way. A probe build tagged
+each `exprListRep` note with the context it was asked in. Forcing builds then made `exprListRep`
+return a different answer in one context at a time. `difftree --identity` against the unforced
+build of the same source shows whether anything reads that context's answer.
+
+**LEFT-ONLY with an open type, by where it is asked.** "Open" means the node's recorded type
+still holds a type variable after `nodeTyInOf`. All three populations together:
+
+| context of the query | before | after |
+| --- | --- | --- |
+| no function (`fnIx` -1) | 18,614 | 18,614 |
+| a generic template with no instance row | 13,600 | 13,600 |
+| a hole instance (`monoHoleSubRow`) | 5,359 | 510 |
+| a pinned instance (`monoPinSubRow`) | 234 | 234 |
+
+Of the 37,807 open notes, 32,214 are asked where no instance exists, so no pin can bind them. A
+second group has a non-open type: 15,115 notes are monomorphic, 3,611 untyped and 476 closed.
+
+**Which of those answers is read.** Each row below forces a build and compares it against the
+unforced one, over 15,110 files.
+
+| forced build | files that differ |
+| --- | --- |
+| null wherever the type is open and the column is uncovered | 178 (72 in `named/`, 20 in `tests/cases/generics`) |
+| the same, only where the function has no pin, exact or hole row | 7 |
+| the column's list wherever the ladder says none (every RIGHT-ONLY) | 374 |
+| the same, only for an `Ident` with no live local slot | 372 |
+
+The no-instance answers are read in only 7 files, all generic functions emitted from their
+template (`arrays/elem-rep-name-silent-on-covered-nodes.vl`: `atf<Tf>(zs: Tf[])`, where the
+parameter shadows an alias). The hole-instance answers are read in the other 171.
+
+**The coverage step: a composite over holes.** `holeOperandTyOf` reads only a bare hole, so a
+`_[]` or `(_ | null)[]` node in a hole instance stayed open. `holeCompositeTyOf`
+(`compiler/emit_classify.vl`) rebuilds a list or nullable type over holes at the instance's
+bindings. Each hole is read through `holePinReadOf`, which banks no pin. Only `nodeTyInOf` uses
+it, and `nodeTyInOf` is read only by the oracle, so no module can change (proof below).
+
+**`exprListRep`, pin column, notes (files):**
+
+| population | LEFT-ONLY before | LEFT-ONLY after | RIGHT-ONLY before | RIGHT-ONLY after | different list rep before → after |
+| --- | --- | --- | --- | --- | --- |
+| `tests/cases` | 22,250 (313) | 20,872 (299) | 40,124 (348) | 51,565 (353) | 884 (25) → 896 (27) |
+| distilled `cells/` | 0 | 0 | 18,898 (871) | 18,898 (871) | 114 (2) → 114 (2) |
+| distilled `named/` | 34,796 (320) | 31,288 (320) | 17,144 (543) | 17,536 (575) | 200 (24) → 200 (24) |
+
+LEFT-ONLY falls by 4,886. RIGHT-ONLY grows by 11,833 for the reason that dominates RIGHT-ONLY as a
+whole, described next. There are 12 new different-rep notes. The one this step looked at is
+`modules/std-array-building/entry.vl`: the ladder says `list` at a `T[]`
+literal and the column says `f64list`, the §13.11 `make<T>()` shape. The module is identical, so
+the ladder's answer there is not read.
+
+**RIGHT-ONLY is an out-of-scope read.** Grouped by node and by whether the name has a live local
+slot when it is asked:
+
+| population | `Ident`, no live slot | `Call` | `Index`, `BinExpr`, `Member`, other | `Ident`, live slot |
+| --- | --- | --- | --- | --- |
+| `tests/cases` | 32,451 | 1,283 | 6,028 | 362 |
+| distilled `cells/` | 11,646 | 7,252 | 0 | 0 |
+| distilled `named/` | 7,624 | 9,344 | 176 | 0 |
+
+`identListRep` answers a local from `declaredKind`, which reads the live scope stack. Asked from a
+collect pass, or from another function's emission, it finds no slot and says none, while the
+column reads the type. That none is load-bearing. Replacing it with the column's list fails 372
+files, and the first one fails with `emitProgram: ref valtype with no interned shape`. A
+caller asked "is this a list?", took the no, and went another way, and the shape that `reflist`
+route needs had not been interned yet.
+
+**No site converts.** No guard reaches 0 LEFT-ONLY and 0 RIGHT-ONLY. Two problems block it: the
+no-instance LEFT-ONLY cannot be covered by any pin, and the ladder's out-of-scope none is read.
+
+**What unblocks the most notes now:**
+
+1. Make the oracle compare like with like: skip, or report apart, a query whose answer depends on
+   scope state (an `Ident` with no live slot) or that has no instance (`fnIx` -1, or a template
+   with no row). That removes about 52k RIGHT-ONLY and about 32k LEFT-ONLY that no coverage step
+   can move. The 7 template files and the 372 out-of-scope files are the witnesses that must keep
+   their modules.
+2. The callers that read the out-of-scope none: find them by the forced build's 372 files, and
+   give each a scope-free question.
+3. The 510 hole-instance notes left, mostly `(_ | f64)[]` and other unions over a hole, which
+   `holeCompositeTyOf` does not rebuild because a union over a bound hole needs the checker's
+   join.
+4. The monomorphic LEFT-ONLY (15,049): a narrowed nullable read and a union holding a nullable
+   union, as in §13.11.
