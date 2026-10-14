@@ -515,7 +515,7 @@ fixpoint that re-runs every function on every merge.
 Every step keeps the keep-running list running. Each step is graded A/B against the
 previous seed on:
 
-- the d3960 oracle, now `scripts/capability-probes/generic-let-written-grid.py` (#3532,
+- the d3960 oracle, then `scripts/capability-probes/generic-let-written-grid.py` (#3532, deleted in #3645;
   567 cells, ruling C);
 - `d3909_fnvalue_positions.py` and `d3929_binding_of_generic.py`;
 - the rv3484–rv3531 witness corpora;

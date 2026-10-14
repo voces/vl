@@ -28280,7 +28280,7 @@ one file.
   `nameIsParenOpen` 11 → 10, `topLevelArrowIndex` 2 → 1, `annGenAppSpanEnds` 6 → 5,
   `aliasRefIsPlainName` 1 → **0 (deleted)**. Net **+1**, and the flatness is the point: the
   headline route replaces a resolver call with an ARENA READ, so a metric that counts named
-  resolver calls cannot see the largest change in the slice. (`scripts/parsercount.py` is not in
+  resolver calls cannot see the largest change in the slice. (`scripts/parsercount.py`, never committed, is not in
   the tree, so the CORE-list number could not be taken; this is the same caveat D-MAPSPELL
   recorded when it homed a net-new grammar.)
 * **Binary 1,038,973 → 1,039,984 B (+1,011).** Split: the destringify half alone is **−197 B** (a

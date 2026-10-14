@@ -10,7 +10,7 @@ grading belongs in `silent-class-inventory.md` as a row with a repro.
 **Two references in the archived text below are STALE, and are kept only because
 the move is verbatim.** `compiler/format.ts` was deleted in #458 ("kill-TS: retire
 the orphaned TS formatter"), so "the VL port of `compiler/format.ts`" and "like the
-host" name a file that no longer exists; `scripts/vl-compiler-driver.vl` is likewise
+host" name a file that no longer exists; `scripts/vl-compiler-driver.vl` (removed in #524) is likewise
 gone, and `docs/vl-tech-debt.md` is now `docs/internals/vl-tech-debt.md`. The
 trimmed comments in `compiler/format.vl` do not repeat them.
 
@@ -34,7 +34,7 @@ canonical VL source from it. Like the host it is a HYBRID:
 
 SOURCE + COMMENTS are supplied by the driver through module globals before the
 call: `fmtSetSource(src)` and `fmtAddComment(...)` (the lexer's retained
-comments). A driver (`scripts/vl-compiler-driver.vl`) lexes → parses → calls
+comments). A driver (`scripts/vl-compiler-driver.vl`, since removed) lexes → parses → calls
 `formatProgram`, then the host reads the result string char-by-char.
 
 ── WIDTHS ARE CODE POINTS, OFFSETS ARE BYTES ────────────────────────────────

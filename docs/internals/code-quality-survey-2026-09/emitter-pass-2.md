@@ -1,5 +1,13 @@
 # Code-quality survey — the emitter, second pass, 2026-09-05
 
+<!-- paths-as-of: 2026-09-05 -->
+> **Script paths are as of this survey.** Several tools it ran have since been retired: the
+> Python ratchets (`ratchet.py` and the `*-budget.py` family) are now
+> `vl check --budget scripts/<name>-budget-baseline.json`; `goal-scoreboard.py`,
+> `emitter-state-audit.py` and `seed-size.py` are their `.vl` ports of the same name;
+> `capability-probes/run.py` is `scripts/capability-probes.vl` and `capability-probes/matrix.py`
+> is `scripts/capability-matrix.vl`. The commands below are the record of what was run.
+
 Surveyed at `153760e1d`, the merge of #2607. Every line number is that commit's and every
 number names the command that produced it in §12. The seed used throughout is
 `build/vl-compiler.wasm` at 2,156,482 bytes, proved a fixpoint on this checkout —

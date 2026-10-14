@@ -609,7 +609,7 @@ right arity, `opSelfFnTy` still returns -1 unless the FIRST parameter is
 NAMED `self` — before it consults any type, which its own comment calls
 "the pollution rule". So an arity-2 declaration whose first parameter is
 named anything else is inert at EVERY receiver, an object one included:
-measured over 380 cells (`scripts/silent-sweep/d471-opdecl-grid.py`),
+measured over 380 cells (`scripts/silent-sweep/d471-opdecl-grid.py`, never committed),
 ZERO of them dispatch, against 60 that do the moment the parameter is
 renamed `self`.
 

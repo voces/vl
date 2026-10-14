@@ -314,7 +314,7 @@ union member needs `is`-narrowing before most operations reach a single member's
 all — `checkMemberNode`'s `sharedUnionFieldTy` gate). §K.1 recommends refusing that case loudly
 rather than guessing.
 
-**The proof obligation for the implementation.** `scripts/silent-sweep/distilled/regress.py`
+**The proof obligation for the implementation.** `scripts/silent-sweep/distilled/regress.vl`
 showing 0 classes moved and 0 `runs → not-runs`/`→ silent` is necessary but is a lower bound
 (CLAUDE.md's own standing caveat on that instrument) — it would not by itself catch a change
 that made an *already-resolving* call silently rebind to a *different* function that happens to

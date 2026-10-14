@@ -438,8 +438,8 @@ once per position, named `"<checkout-relative path>: <trimmed source line>"`. It
 the ratchet's verdict — `<label> budget ok — …` (exit 0) or `<label> budget REGRESSED — …`
 with one line per file whose count rose (exit 1) — and no diagnostics. `--budget-why`
 compares the baseline's stored `entries` with this run, by name (`LEFT`, `ENTERED`, count
-moved). `--write-baseline` rewrites the baseline from this run in the layout the retired
-scripts/ratchet.py wrote — its `label`/`targets`/`exclude` kept, `commit` re-read from the checkout's `.git`,
+moved). `--write-baseline` rewrites the baseline from this run in the layout the
+retired `scripts/ratchet.py` wrote — its `label`/`targets`/`exclude` kept, `commit` re-read from the checkout's `.git`,
 `entries` kept one per line — unless it names a Python `writer`, which then owns it and is
 what the remedy line names. `--exempt-codes` prints the codes whose `total` is still above
 zero, for `lint-self.sh`. `compiler/cli_budget.vl`; the first ratchet on it is interp
@@ -939,8 +939,8 @@ ladders name the void intrinsics one by one and both needed the slot-table quest
 than a name: the statement-position `drop` decision (`wasmEmit.vl`) and the tail-value
 classifier (`emit_classify.vl`). A miss in either is check-clean invalid wasm.
 
-**The three hosts do not implement the same set, and cannot.** `scripts/vl-host/src/main.rs`
-and `scripts/wasmtime-host.rs` implement all five. `tests/support/runWasm.ts` implements
+**The two hosts do not implement the same set, and cannot.** `scripts/vl-host/src/main.rs`
+implements all five. `tests/support/runWasm.ts` implements
 `__proc_exit__` alone — it unwinds as `VLExitError` carrying the code, because a test runner
 has no process to end — and refuses the other four with the message the filesystem floor
 already uses there: WasmGC values are opaque to JS and cannot be constructed from it. That

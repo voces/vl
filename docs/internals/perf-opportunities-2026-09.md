@@ -1337,7 +1337,7 @@ by name. `unionMemberSetOf` and `unionRowOf`'s first leg route through `unRowOfN
 than the estimate.** §B2 read `variantIndexOf` 3.45% self / 7.06% incl and `unRowOfName`
 3.35% / 6.23%; re-run on master b9ed79e3 (the profile and the CPU rows below are that base;
 identity was re-proved at c8a99305b after the last rebase) with the same instrument
-(`scripts/profile-rank.py`, a `--names` seed, six aggregated runs of
+(`scripts/profile-rank.vl`, a `--names` seed, six aggregated runs of
 `vl build compiler/entry.vl` over one source tree, 32–34k samples per arm) they are a fifth
 of that BEFORE the change:
 
@@ -1403,7 +1403,7 @@ stand clear:
 
 The second is a DELIBERATE cost fixture (D1513, and its own header says so) and the third
 pulls `std:json`, a fixed cost. `VL_PROFILE_GUEST` against a `--names` seed, ranked by SELF
-time with `scripts/profile-rank.py`, and with the 30x case as a control:
+time with `scripts/profile-rank.vl`, and with the 30x case as a control:
 
 | frame | `arm-list-elem-pin-at-depth` (330) | `global-reference-chain-cost` (166) | control `deep-is-json-shape-walk` (198) |
 | --- | ---: | ---: | ---: |
