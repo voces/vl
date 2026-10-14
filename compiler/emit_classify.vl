@@ -1445,6 +1445,17 @@ export function fnInferredRetLitAtom(i: i32): boolean {
   false
 }
 
+// The ref-list row name an un-annotated return of `rx` declares: the expression's own element
+// name when a row carries it, else the row its arena type names. A returned local's element
+// has no collected name during the return pass, and "" would leave the result valtype rowless.
+function criRetRefListElemName(rx: i32, fnIx: i32): string {
+  const nm = refListElemNameOfExpr(rx, fnIx)
+  if rlSlotByName(nm) >= 0 { return nm }
+  const rrs = rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(rx)))
+  if rrs >= 0 && rrs < rlElemName.length { return rlElemName[rrs] }
+  nm
+}
+
 // Store an inferred return-kind fact for function `i`: the write happens only when it
 // outranks the current kind (`retKindPri`), marking the `computeRetInference` fixed point
 // dirty. Returns true exactly when it does — the struct and nulstruct arms gate their
@@ -5128,7 +5139,7 @@ export function criClassify(rx0: i32, i: i32) {
     // return must read it off the return expression.
     if criSetRetKind(i, "reflist") {
       if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-        fRetRArrElem[i] = refListElemNameOfExpr(rx, fnStmts[i])
+        fRetRArrElem[i] = criRetRefListElemName(rx, fnStmts[i])
       }
     }
   }
@@ -9491,8 +9502,10 @@ export function applyPushPopBits(bits: i32) {
 }
 
 // Append the ref-list table slot of a ref `.push` receiver to `fnRefPushSlots` if not already
-// present, so each distinct pushed element type gets its own typed scratch frame.
+// present, so each distinct pushed element type gets its own typed scratch frame. A receiver
+// whose slot does not resolve (-1) records nothing: no row exists to type a frame with.
 export function recordRefPushSlot(slot: i32) {
+  if slot < 0 { return 0 }
   let i = 0
   while i < fnRefPushSlots.length {
     if fnRefPushSlots[i] == slot { return 0 }
@@ -46554,13 +46567,23 @@ function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
     }
     return gatedListRep(ik, "if-join")
   }
-  if e is Ident { return identListRep(exprIx, fnIx) }
-  if e is Member { return memberListRep(exprIx, fnIx) }
-  if e is Call {
-    return callListRep(exprIx, fnIx) ?? callColumnListRep(exprIx, fnIx)
+  if e is Ident {
+    const ik = identListRep(exprIx, fnIx)
+    if ik != null || identReadOutOfScope(exprIx, fnIx) { return ik }
+    return columnListRep(exprIx, fnIx)
   }
-  if e is Index { return indexListRep(exprIx, fnIx) }
-  if e is BinExpr { return binListRep(exprIx, fnIx) }
+  if e is Member {
+    return memberListRep(exprIx, fnIx) ?? columnListRep(exprIx, fnIx)
+  }
+  if e is Call {
+    return callListRep(exprIx, fnIx) ?? columnListRep(exprIx, fnIx)
+  }
+  if e is Index {
+    return indexListRep(exprIx, fnIx) ?? columnListRep(exprIx, fnIx)
+  }
+  if e is BinExpr {
+    return binListRep(exprIx, fnIx) ?? columnListRep(exprIx, fnIx)
+  }
   null
 }
 
@@ -46764,9 +46787,10 @@ function callListRep(exprIx: i32, fnIx: i32): VKind | null {
   null
 }
 
-// The non-null list the checked-rep column names for the call at `exprIx` at its instance's
-// type, or null: what a call answers when `callListRep`'s resolvers name nothing.
-function callColumnListRep(exprIx: i32, fnIx: i32): VKind | null {
+// The non-null list the checked-rep column names for the node at `exprIx` at its instance's
+// type, or null: what a call, member, index, binary operation or in-scope name read answers
+// when its own resolvers name nothing. Only a node typed as a non-null `TyArray` is read.
+function columnListRep(exprIx: i32, fnIx: i32): VKind | null {
   const ty = nodeTyInOf(exprIx, fnIx)
   if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyArray) { return null }
   const d = repOfNodeAt(exprIx, ty)
