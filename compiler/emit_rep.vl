@@ -2746,25 +2746,19 @@ function repOfArray(elem: i32): RepDesc {
   // `S[][]` — a list is a reference too, so a list OF lists is a ref list whatever the
   // inner element reps as; the inner list's own rep is its own query.
   if et is TyArray { return repMk("reflist", 0, "list") }
-  // `(S | null)[]` — a nullable STRUCT element is a `(ref null $S)` niche riding the ref
-  // list, the kind-1 arm `refArrShapeKindGo` already interns. Only the struct inner: a
-  // nullable string rides the STRING list and a nullable boolean or literal union the i32
-  // list, so "a nullable cell is a reference" does not make its list a ref list.
-  if et is TyNullable {
-    const nt = T.tys[et.nInner]
-    if nt is TyObj {
-      if !tyIxIsVariantMember(et.nInner) {
-        return repMk("reflist", 0, "struct")
-      }
-    }
-    return repUncovered()
-  }
+  if et is TyNullable { return repOfNulElemArray(elem, et.nInner) }
   if et is TyUnion {
     // `K[]` over a declared litunion alias, a provenanced copy, or a genuinely inline
     // `("a" | "b")[]` — all three are atom-id elements riding the i32 list. Canon softens
     // a bare inline union to `string`, but at the element position the two spellings are
     // one type, exactly as `repOfNullable`'s list arm already treats it — ungated here too.
     if tyIsLitUnion(elem) { return repMk("list", 0, "i32") }
+    // The expanded `("a" | "b" | null)[]` keeps its null in the atom's `-1` sentinel.
+    if tyIsNullableLitUnion(elem) { return repMk("list", 0, "i32") }
+    // The canonicalized `{a} & {b}` one-member union is the struct itself.
+    if et.uMembers.length == 1 {
+      if T.tys[et.uMembers[0]] is TyObj { return repMk("reflist", 0, "struct") }
+    }
     // A value-union BOX element the registry holds a row for — a reference, so a ref list.
     // `tyIsValueUnionBox` is the shape gate (a numeric litunion has a canon row too but reps
     // as its scalar list); the row is keyed on the interned canon id, never the spelling,
@@ -2774,7 +2768,66 @@ function repOfArray(elem: i32): RepDesc {
     }
     return repUncovered()
   }
-  // A nullable element and a non-literal union element — legacy owns those two.
+  // A map-key or negation element, or an unregistered union — legacy owns those.
+  repUncovered()
+}
+
+// `(E | null)[]` by inner `E`, one answer per null discipline (`rtNulDiscOf`): a sentinel
+// element rides its base list, a niche reference and a registered box ride the ref list.
+// `elem` is the nullable element itself, the type the union registry keys a box on.
+function repOfNulElemArray(elem: i32, inner: i32): RepDesc {
+  if inner < 0 { return repUncovered() }
+  const it = T.tys[inner]
+  match it {
+    TyPrim => {
+      if it.primName == "string" { return repMk("strlist", 0, "string") }
+      if it.primName == "boolean" { return repMk("list", 0, "i32") }
+      // A nullable scalar boxes as a value union, as `repOfNullablePrim` says.
+      if (
+        it.primName == "i32"
+        || it.primName == "i64"
+        || it.primName == "f64"
+        || it.primName == "f32"
+        || it.primName == "v128"
+      ) {
+        if unRowOfCanonId(elem) >= 0 { return repMk("reflist", 0, "union") }
+      }
+    }
+    TyFunc => {
+      return repMk("reflist", 0, "closure")
+    }
+    TyObj => {
+      // A union arm's niche is a ref-list element too; the slot layer resolves its heap.
+      return repMk("reflist", 0, "struct")
+    }
+    TyUnion => {
+      if tyIsLitUnion(inner) { return repMk("list", 0, "i32") }
+      if tyIsValueUnionBox(inner) {
+        if unRowOfCanonId(elem) >= 0 { return repMk("reflist", 0, "union") }
+      }
+    }
+    TyArray => {
+      return repMk("reflist", 0, "list")
+    }
+    TyMap => {
+      return repMk("reflist", 0, "map")
+    }
+    TyLit => {
+      // A one-literal nullable is softened to `string | null`; legacy owns it here.
+    }
+    TyNullable => {
+      // A doubled nullable — canon flattens it before emit.
+    }
+    TyVar => {
+      // A generic parameter — the instance is what is asked about.
+    }
+    TyErr => {
+      // The error hole — a rejected program never reaches emit.
+    }
+    TyNeg => {
+      // A negation — consumed during checking.
+    }
+  }
   repUncovered()
 }
 
@@ -3558,15 +3611,8 @@ function rtListVKind(elem: i32): VKind | null {
     "struct" | "closure" | "map" | "list" => {
       return "reflist"
     }
-    // `(S | null)[]` — a nullable STRUCT element is the `(ref null $S)` niche riding the ref
-    // list. Only that inner: a nullable string rides the STRING list and a nullable boolean or
-    // literal union the i32 list, so being a reference is not what makes the list a ref list.
     "nul" => {
-      const nin = rtChild[elem]
-      if nin >= 0 {
-        if rtKind[nin] == "struct" { return "reflist" }
-      }
-      return null
+      return rtNulElemListVKind(elem)
     }
     // A value-union BOX element the registry holds a row for — the box is a reference, so
     // the list is a ref list. Gated on the node's arena provenance, the same canon-id
@@ -3574,6 +3620,50 @@ function rtListVKind(elem: i32): VKind | null {
     "box" => {
       if unRowOfCanonId(rtTy[elem]) >= 0 { return "reflist" }
       return null
+    }
+  }
+}
+
+// `(E | null)[]`'s list kind by the element's null discipline, as `repOfNulElemArray` decides
+// it: a sentinel element rides the i32 list, a niche string the string list, a niche
+// reference and a registered box the ref list.
+function rtNulElemListVKind(elem: i32): VKind | null {
+  const d = rtDisc[elem]
+  if d == 2 || d == 3 { return "list" }
+  if d == 4 {
+    if unRowOfCanonId(rtTy[elem]) >= 0 { return "reflist" }
+    return null
+  }
+  const n = rtNulNicheElemName(elem)
+  if n == "" { return null }
+  if n == "string" { return "strlist" }
+  "reflist"
+}
+
+// The flat element vocabulary of a nullable list element, by the same discipline.
+function rtNulElemName(elem: i32): string {
+  const d = rtDisc[elem]
+  if d == 2 || d == 3 { return "i32" }
+  if d == 4 { return "union" }
+  rtNulNicheElemName(elem)
+}
+
+// The element name of a niche nullable `elem` by its inner's kind, or "" for any other
+// discipline and for an inner no niche list holds.
+function rtNulNicheElemName(elem: i32): string {
+  const nin = rtChild[elem]
+  if rtDisc[elem] != 1 || nin < 0 { return "" }
+  const k = rtKind[nin]
+  match k {
+    "str" => {
+      return "string"
+    }
+    "struct" | "closure" | "map" | "list" => {
+      return k
+    }
+    // A scalar or box inner takes a sentinel or a box, never a niche.
+    "i32" | "bool" | "i64" | "f64" | "f32" | "u8" | "atom" | "box" | "nul" | "unsup" => {
+      return ""
     }
   }
 }
@@ -3638,7 +3728,7 @@ function repTreeListElemName(ix: i32): string {
   if ek == "closure" { return "closure" }
   if ek == "map" { return "map" }
   if ek == "list" { return "list" }
-  if ek == "nul" { return "struct" }
+  if ek == "nul" { return rtNulElemName(elem) }
   if ek == "box" { return "union" }
   ""
 }
