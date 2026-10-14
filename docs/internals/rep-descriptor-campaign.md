@@ -2778,3 +2778,61 @@ is the column's consumer on these rungs. It is not yet replaced by it.
    different-rep notes.
 4. The narrowed family, now 7,343 notes. This is the slot-versus-narrowed rep split.
 5. The scope callers, found by §13.12's 372 files.
+
+### 13.15 The `.map` callback classifier reads the column, and a comparator riding `T` is pinned
+
+This step takes item 3 of §13.14 and closes D4647.
+
+**The classifier.** The 480 `Call` notes of §13.14, `listRep list → reflist`, have one cause,
+and it is not generic-specific. `function f(ys: A[]) { ys.map((x) => idA(x)) }` with a
+non-generic `idA(x: A): A` shows them too. Every note fires during `computeRetInference`.
+That pass walks `fnStmts` in order, so `f` asks `mfResultKindOf` about its callback before
+return inference has reached the callback. The callback's `fRetKind` is then still the default
+`i32`, and `mfResultKindOf` answers `i32`. At emission the kind is settled and the classifier
+agrees with the column. `f`'s own inferred return is taken by `criClassify`'s ref-list arm
+before the `exprArray` arm reads the classifier, so `tests/cases` and the distilled corpus hold
+no program whose output it changes. One filed row does move: D2575, a function returning a
+`.map` of an anonymous record. There the early `i32` gave `f` a plain list result over a body
+building a ref list, which was invalid wasm. Now the result is a ref list whose element has no
+ref-list row yet, and the program refuses loudly with `ref valtype with no interned shape`.
+That is a clause-1 row becoming clause 2, and the row is re-graded.
+
+`mfResultKindOf` now hands an un-annotated callback that reads `i32` to
+`mfI32ResultOrColumn`. That function answers from the call's checked list rep where the column
+covers the call and names a non-`i32` list.
+
+**The comparator (D4647).** `monoArgFnTypeName` named a function-typed argument only by its
+node type's name. A captured `lt: (a: T, b: T) => boolean` inside a lambda in a generic body
+has no name, because its type rides `T`, so `sorted(ys, lt)` refused on `less`. It now names
+the argument by its type pinned at the instance, when that type holds no type variable.
+Fixture: `tests/cases/generics/lambda-comparator-into-generic-call.vl`. The spelling with an
+un-annotated lambda parameter, `(ys) => sorted(ys, lt)[0]`, still refuses, on `self`. Its
+minimal witness needs no comparator, only a second argument whose type rides `T`, and it is
+filed as D4661.
+
+**Checks.** The "before" seed is §13.14's, 5,410,975 bytes. The "after" seed is 5,411,389
+bytes.
+
+* `difftree --identity` against the §13.14 seed, over 15,125 files: **10,040 built, 1 differs, 0
+  uncompared**. The one is the new fixture, which the §13.14 seed refuses.
+* Native fixpoint holds.
+* `rep-fuzz-check` is exact.
+* Distilled `regress.vl`: no cell changed class.
+* Filed witnesses: one row moved, D2575, from check-clean invalid wasm to a loud emit reject.
+
+**Counts.** These are `listRep` notes over 15,360 files. "Different" counts a note whose two
+sides are both covered and differ.
+
+| population | `list → reflist` before | after | different before | after |
+| --- | --- | --- | --- | --- |
+| `tests/cases` | 1,258 | 778 | 1,364 | 896 |
+| distilled `named/` | 152 | 0 | 200 | 48 |
+| distilled `cells/` | 114 | 114 | 114 | 114 |
+
+The `tests/cases` drop is 480, which is §13.14's `Call` growth from 59 to 539. No file's count
+rose. The 778 left in `tests/cases` and the 114 in `cells/` are not `.map` calls. They
+concentrate in empty-list and nullable-global files: `nullable-refarray-global-empty-init.vl`
+has 416, `assign-narrow-then-null-guard.vl` 100 and `nullable-list-global-mutators.vl` 84.
+
+**Next, in order:** items 1, 2, 4 and 5 of §13.14, then the empty-list `list → reflist`
+family above.

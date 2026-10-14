@@ -6574,7 +6574,7 @@ function emitFailCrossTagDelivery(exprIx: i32, vi: i32): i32 {
 // The collapse boundary, where a callback typed as one variant meets a mix of reps: an object
 // literal builds the bare variant, a narrowed union value unboxes, an already-bare variant
 // passes through, a value-`if` join recurses. The variant analogue of `emitUnionCoerce`.
-function emitVariantCoerce(body: u8[], vi: i32, exprIx: i32, fnIx: i32) {
+export function emitVariantCoerce(body: u8[], vi: i32, exprIx: i32, fnIx: i32) {
   const bareIx = unwrapParen(exprIx)
   const bare = P.nodes[bareIx]
   if bare is IfStmt { return emitVariantIfValue(body, vi, bareIx, fnIx) }
@@ -9616,13 +9616,21 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
               }
             }
           }
-          const elArmOwed = narrowedArmNeedsUnbox(elems[i], fnIx)
-          if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
-          // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
-          // `if s is Circle`. The slot's own element heap is the destination, the same one
-          // `rlBackIdx` types the backing array with.
-          if elArmOwed {
-            emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), elems[i])
+          if elemVariantIdx >= 0 && rlElemNullable[rslot] != 1 {
+            // A non-null ARM element takes every value through `emitVariantCoerce`, a join
+            // included; the coerce owns the narrowed unbox (D4639).
+            if emitVariantCoerce(body, elemVariantIdx, elems[i], fnIx) < 0 {
+              return -1
+            }
+          } else {
+            const elArmOwed = narrowedArmNeedsUnbox(elems[i], fnIx)
+            if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
+            // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
+            // `if s is Circle`. The slot's own element heap is the destination, the same one
+            // `rlBackIdx` types the backing array with.
+            if elArmOwed {
+              emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), elems[i])
+            }
           }
           // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
           // `(readonly Shape[])[]`.
@@ -11253,6 +11261,12 @@ function emitMapSetValExpr(
     // A UNION-valued map: box the stored value into the shared union box (a concrete
     // VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
     return emitUnionBoxArg(body, mvValName[mslot], valIx, fnIx)
+  }
+  // A non-null ARM-valued map takes every value through `emitVariantCoerce`, a join included,
+  // as an arm-typed local does; the coerce owns the narrowed unbox (D4639).
+  if mslot >= 0 && mvValKind[mslot] == MVK_STRUCT && !mvSlotNullable(mslot) {
+    const svArmVi = mvValVariantOf(mslot)
+    if svArmVi >= 0 { return emitVariantCoerce(body, svArmVi, valIx, fnIx) }
   }
   // Seed a non-i32 scalar-LIST value's inner list kind (as the `?? default` read
   // does) so a stored `m[k] = [1,2,3]` builds the i64/f64/string list wrapper, not
@@ -21049,6 +21063,7 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
           cuCtx.nulString = pkk == "nulstr"
           cuCtx.nulClosure = pkk == "nulclosure"
           cuCtx.nulList = pkk == "nullist"
+          cuCtx.nulNone = pkk == "nulnone"
           if emitExprExpect(body, args[i], fnIx, cuCtx) < 0 { return -1 }
           // A value narrowed out of a box into a struct parameter is unboxed, as the direct
           // call unboxes it (D1723); the slot is the key's, so the cast agrees with the bytes.
@@ -21105,6 +21120,20 @@ export function stubWriteRhsReset() { stubWriteRhs = 0 - 1 }
 
 // Lower an assignment `target = value` onto `body`: the value emits under the target's
 // `ExpCtx`, then the store. The caller's context is restored on every exit, failure included.
+// The variant row of the declared local `lhsIx` names when its cell holds a bare union arm
+// (`variant`), else -1. Every value assigned to such a cell is delivered as that arm.
+function assignArmCellVariantIdx(lhsIx: i32, fnIx: i32): i32 {
+  if identCellVKind(lhsIx, fnIx) != "variant" { return -1 }
+  const slot = identCellSlot(lhsIx)
+  if slot < 0 || slot >= localIsRef.length || slot >= localStructIdx.length {
+    return -1
+  }
+  if localIsRef[slot] != "variant" { return -1 }
+  const vi = localStructIdx[slot]
+  if vi < 0 || vi >= uVarHeap.length { return -1 }
+  vi
+}
+
 function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
   const saved = expCtxHere()
   expCtxLeave(saved, emitAssignUnder(body, binIx, fnIx))
@@ -21174,8 +21203,17 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
           // a concrete-variant RHS must be boxed unconditionally since a union global's
           // cell is always the box, and an arm cell is not the box either.
           const gUNm = letUnionNameOf(gLet, -1)
+          // The local arm's rule: a `variant` cell takes the bare arm whatever builds it, and
+          // the coerce owns that value's unbox and recover.
+          const gaCoerced = gaKind == "variant"
+            && gaArmIdx >= 0
+            && gaArmIdx < uVarHeap.length
           if gUNm != "" && !nameIsLitUnionType(gUNm) && !gaCellIsArm {
             if emitUnionBoxArg(body, gUNm, a.binRight, fnIx) < 0 { return -1 }
+          } else if gaCoerced {
+            if emitVariantCoerce(body, gaArmIdx, a.binRight, fnIx) < 0 {
+              return -1
+            }
           } else if exprIsI64(lhsIx, fnIx) {
             // an i64 global target widens an i32 RHS to i64: the bare `i32.const` otherwise
             // clashes with the i64 slot (the checker accepts the assignment, so it is a
@@ -21263,12 +21301,14 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
           )
           // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
           // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
-          if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+          if !gaCoerced && narrowedArmNeedsUnbox(a.binRight, fnIx) {
             emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx), a.binRight)
           }
           // the nullable-niche recover at the same boundary (D1115) — `g = y` under
           // `if y != null`, into a global whose cell is a non-null ref.
-          if nulNicheRecoverOwed(gaKind, a.binRight, fnIx) { fbRefAsNonNull() }
+          if !gaCoerced && nulNicheRecoverOwed(gaKind, a.binRight, fnIx) {
+            fbRefAsNonNull()
+          }
           return emitUserGlobalSet(gIdx) // 0x24 global.set, or a promoted `local.set`
         }
         return emitFail(
@@ -21293,7 +21333,12 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
       const aAtomCell = aUNm != ""
         && declaredKind(target.identName) != "union"
         && exprIsLitAtom(lhsIx, fnIx)
-      if aUNm != "" && !nameIsLitUnionType(aUNm) && !aAtomCell {
+      const aArmVi = assignArmCellVariantIdx(lhsIx, fnIx)
+      if aArmVi >= 0 {
+        // An arm cell takes the bare variant struct whatever builds it: an object literal, an
+        // `if` or `match` joining literals, a narrowed box (D4613, D4639).
+        if emitVariantCoerce(body, aArmVi, a.binRight, fnIx) < 0 { return -1 }
+      } else if aUNm != "" && !nameIsLitUnionType(aUNm) && !aAtomCell {
         // a literal-union target is an i32 atom, not a value-union box, and falls through
         // to the seed block below. A kind-4 union-box local boxes a concrete variant RHS
         // like a call arg/return; a kind-8 variant-init local keeps the raw variant rep, so
@@ -21414,14 +21459,18 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
       // the nullable-niche recover at the ASSIGNMENT boundary (D1115) — `z = y` under
       // `if y != null`, into a local or parameter whose slot is a non-null ref. The
       // destination is a NAME here, so its own cell kind is the destination kind.
-      if nulNicheRecoverOwed(identCellVKind(lhsIx, fnIx), a.binRight, fnIx) {
+      // An arm cell's coerce above owns both of the next two steps.
+      if (
+        aArmVi < 0
+        && nulNicheRecoverOwed(identCellVKind(lhsIx, fnIx), a.binRight, fnIx)
+      ) {
         fbRefAsNonNull()
       }
       // the narrowed-arm unbox at the ASSIGNMENT boundary, the binding boundary's twin: the
       // destination cell's own `(kind, slot)` columns are the destination, read through the
       // slot rather than the expression's type — the cell is a `variant` for an inferred
       // union's arm and `structIndexOfExpr` answers -1 for it (D1685).
-      if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+      if aArmVi < 0 && narrowedArmNeedsUnbox(a.binRight, fnIx) {
         const asgSlot = identCellSlot(lhsIx)
         if (
           asgSlot >= 0
@@ -24587,6 +24636,18 @@ function retNullIntoNonNullRef(retArg: i32, fnIx: i32, fnPos: i32): boolean {
   rk == "struct" || rk == "variant"
 }
 
+// The variant row an un-annotated return of function `fnPos` builds: the collapse arm's, else
+// the classified `variant` pair the functype's result is emitted from; -1 for any other return.
+function inferredRetVariantIdx(fnPos: i32): i32 {
+  const rvi = cbRetVariantIdx(fnPos)
+  if rvi >= 0 { return rvi }
+  if fnPos < 0 || fnPos >= fRetKind.length || fnPos >= fRetStructIdx.length {
+    return -1
+  }
+  if fRetKind[fnPos] == "variant" { return fRetStructIdx[fnPos] }
+  -1
+}
+
 // Lower a return-value expression `retArg` for function `fnIx`: build the return's `ExpCtx`
 // from the function's return type, emit through the matching helper under it, then restore
 // the caller's context. Does not emit `return` itself — the caller appends `fbReturn` or
@@ -24679,21 +24740,10 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     // An INFERRED variant return (a `.map` lambda collapsing to one variant): seed it from
     // the checker's recorded return shape so the else-arm's `{ … }` literal builds the bare
     // variant too, matching the then-arm's narrowed variant rep.
+    // The classified pair is the fact `emitOneFuncType` emits the result valtype from (D51).
     if fn.fnRet < 0 {
-      const rvi = cbRetVariantIdx(fnPos)
-      if rvi >= 0 {
-        ctx.variantIdx = rvi
-      } else if fnPos >= 0 && fnPos < fRetKind.length {
-        // the classified pair, when the collapse arm has nothing — the same fact
-        // `emitOneFuncType`'s inferred `variant` arm emits the result valtype from, so
-        // reading it here (D51) keeps the literal and the functype in agreement:
-        // otherwise the literal still boxes into a `(ref $uVarHeap[vi])` result, invalid wasm.
-        if fRetKind[fnPos] == "variant" {
-          if fnPos < fRetStructIdx.length {
-            ctx.variantIdx = fRetStructIdx[fnPos]
-          }
-        }
-      }
+      const rvi = inferredRetVariantIdx(fnPos)
+      if rvi >= 0 { ctx.variantIdx = rvi }
     }
     // D887 — an inferred nullable-struct return seeds the same struct context the
     // annotated `: {r: i32} | null` spelling seeds through `retNulRefFlag` above, so the
@@ -24802,8 +24852,10 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if retVariantFlag(fn.fnRet) == 1 {
       retVi = variantIndexOf(tyNameOf(fn.fnRet))
     }
+    // Every value an inferred arm return delivers, a join included, goes through
+    // `emitVariantCoerce`, not only the literal the seed above reaches (D4639).
     if fn.fnRet < 0 {
-      const rvi2 = cbRetVariantIdx(fnPos)
+      const rvi2 = inferredRetVariantIdx(fnPos)
       if rvi2 >= 0 { retVi = rvi2 }
     }
     if retF32Flag(fn.fnRet) == 1 { retF32 = true }
@@ -25679,6 +25731,9 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   const letArmOwed = narrowedArmNeedsUnbox(s.letInit, fnIx)
     || letInitTyIsNarrowedArm(stmtIx, fnIx)
     || letInitTyIsNarrowedNulArm(stmtIx, fnIx)
+  // A bare-arm cell's init is delivered by `emitVariantCoerce`, which owns the unbox and the
+  // niche recover both, so neither bottom step runs for it.
+  const letArmCell = localIsRef[slot] == "variant"
   // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
   // the element kind to pick the ref-list construction — record it for `emitArr`. An
   // un-annotated one takes its destination's instead (D381), and `letRefListSlot` is the
@@ -25860,6 +25915,11 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
         ),
       )
     }
+  } else if letArmCell {
+    // An arm cell takes the bare variant struct whatever builds it, as at assignment (D4639).
+    if emitVariantCoerce(body, localStructIdx[slot], s.letInit, fnIx) < 0 {
+      return expCtxLeave(saved, -1)
+    }
   } else if letUNm != "" {
     // The binding boundary is a box-typed destination, so an init that is one ARM of the union
     // boxes here exactly as an argument does (D1606) — `emitUnionCoerce` alone passes an arm
@@ -25981,7 +26041,7 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // widen sites above, since the cell's own (kind, slot) pair is the destination.
   // `letArmOwed` is taken before the init emits, since an init carrying its own `if`
   // moves the narrowing stack.
-  if letArmOwed {
+  if letArmOwed && !letArmCell {
     const letArmHeap = armDestHeapOf(localIsRef[slot], localStructIdx[slot])
     if letArmHeap >= 0 {
       emitArmUnboxCast(
@@ -25993,7 +26053,9 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // the nullable-niche recover at the BINDING boundary (D1115) — `const z: i32[] = y` under
   // `if y != null`. The cell's own kind is the destination, exactly as the two widen sites
   // above read it.
-  if nulNicheRecoverOwed(localIsRef[slot], s.letInit, fnIx) { fbRefAsNonNull() }
+  if !letArmCell && nulNicheRecoverOwed(localIsRef[slot], s.letInit, fnIx) {
+    fbRefAsNonNull()
+  }
   fbLocalSet(idx) // 0x21 local.set
   // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
   // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -28909,6 +28971,8 @@ function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null, slot: i32) {
   c.listSlot = 0
   c.mapSlot = -1
   c.wantI64 = false
+  // A `null`-typed parameter takes a bare `null` as `ref.null none` (D4550).
+  c.nulNone = pk == "nulnone"
   match pk {
     "struct" | "nulstruct" => {
       c.structIdx = slot
@@ -30439,6 +30503,11 @@ function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
   if fnIx >= 0 {
     const nnFn = P.nodes[fnIx]
     if nnFn is FuncDecl {
+      // A return annotated as the `null` unit type is the same cell (D4550).
+      if nnFn.fnRet >= 0 && nodeTyIsNullType(nnFn.fnRet) {
+        fbRefNullNone()
+        return 0
+      }
       if nnFn.fnRet < 0 {
         const nnPos = fnStmtsPosOf(fnIx)
         if nnPos >= 0 && nnPos < fRetKind.length {
@@ -32015,6 +32084,8 @@ function emitDirectCallArgsUnder(
     let cParamNulString = false
     let cParamNulClosure = false
     let cParamNulList = false
+    // A `null`-typed param position (D4550): a bare `null` argument is `ref.null none`.
+    let cParamNulNone = false
     let cParamNulRefArr = false
     let cParamNulRefArrHeap = -1
     // A `Circle | null` param position: the heap type a bare `null` ARGUMENT lowers as
@@ -32051,6 +32122,7 @@ function emitDirectCallArgsUnder(
           if retNulStringFlag(cpnb.parType) == 1 { cParamNulString = true }
           if nulCloFlag(cpnb.parType) == 1 { cParamNulClosure = true }
           if retNulListFlag(cpnb.parType) == 1 { cParamNulList = true }
+          if nodeTyIsNullType(cpnb.parType) { cParamNulNone = true }
           cParamNulSLKind = nulScalarListKindOfNode(cpnb.parType)
           if retNulVariantFlag(cpnb.parType) == 1 {
             const cpNvi = nulVariantIndexOf(cpnb.parType)
@@ -32176,6 +32248,7 @@ function emitDirectCallArgsUnder(
         argCtx.rawNullRead = false
         argCtx.nulClosure = cParamNulClosure
         argCtx.nulList = cParamNulList
+        argCtx.nulNone = cParamNulNone
         if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
           // The #964 seed-leak gate (stated in full at `emitObj`'s code-28 arm) at the
           // ARGUMENT boundary. Witness: `useIt([null])` on a `(S | null)[] | null` param
