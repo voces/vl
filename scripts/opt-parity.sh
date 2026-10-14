@@ -10,7 +10,9 @@
 #
 # A side is `VAR=value` (that variable set for the checkout's own `vl`) or the path
 # of a `vl` binary: a rung's port is graded `VAR=rust VAR=vl`, its retirement
-# against a binary built before the Rust was deleted. Both sides use one seed.
+# against a binary built before the Rust was deleted. Both sides use one seed. A
+# retired selector (`$VL_OPT_RUNG_SCAN`, `$VL_OPT_ARGV`, `$VL_OPT_ESCAPE`) is refused
+# as a side, since the host ignores it and the two sides would be one.
 # Paths are .vl files or directories (searched for *.vl); the default is
 # tests/cases plus the distilled corpus. Run from the checkout root. Exits 1 when
 # any program disagrees, naming each; 2 on a usage error. `--flag` passes one more
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ $# -lt 2 ]; then
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
 A=$1 B=$2
@@ -49,6 +51,13 @@ side_bin() { case "$1" in *=*) echo "$VL" ;; *) realpath "$1" ;; esac; }
 side_env() { case "$1" in *=*) echo "$1" ;; *) echo "OPT_PARITY_SIDE=$1" ;; esac; }
 for side in "$A" "$B"; do
   [ -x "$(side_bin "$side")" ] || { echo "opt-parity: no vl binary for side \`$side\`" >&2; exit 2; }
+  # A retired rung's selector is ignored by the host, so a side set by it compares nothing.
+  case "$side" in
+    VL_OPT_RUNG_SCAN=* | VL_OPT_ARGV=* | VL_OPT_ESCAPE=*)
+      echo "opt-parity: \`${side%%=*}\` selected a rung whose Rust is deleted; the host ignores it." \
+        "Grade against a vl binary built before the deletion instead" >&2
+      exit 2 ;;
+  esac
 done
 [ -f "$COMPILER" ] || { echo "opt-parity: no compiler seed at $COMPILER" >&2; exit 2; }
 export VL_STD=${VL_STD:-$ROOT/std}

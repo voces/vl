@@ -58,8 +58,8 @@ use wasmparser::{
 };
 
 /// The most fields a record returned as multi-value may have: the size the escape step's
-/// `ESCAPE_RECORD_MAX_FIELDS` already gives ruling (B). A vector (3), a quaternion (4) and
-/// plumb's five-field `Quat` fit; a 4x4 matrix (16) does not. Past the return registers (two
+/// `ESCAPE_RECORD_MAX_FIELDS` (`compiler/opt_escape.vl`) already gives ruling (B). A vector
+/// (3), a quaternion (4) and plumb's five-field `Quat` fit; a 4x4 matrix (16) does not. Past the return registers (two
 /// integer and two float values on x86-64) each field is a store and a load through a return
 /// area, which still costs well under the allocation it replaces: measured at 5, 6 and 8 `f64`
 /// fields the twin is 2.2-3.1x faster on V8 and 3-6x on wasmtime (DECISIONS.md, D3625). Past
