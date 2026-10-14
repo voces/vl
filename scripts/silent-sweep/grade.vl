@@ -1,0 +1,388 @@
+// Grade a silent-class sweep: one outcome column per cell, from its manifest entry and the
+// `.res` file `runcell.sh` wrote for it.
+//
+//     vl run scripts/silent-sweep/grade.vl -- <celldir> <resdir> [--csv out.csv]
+//
+// Columns, strictly separate: correct, wrong_value, wrong_evalcount, invalid_wasm, trap,
+// compiler_trap (a trap with no module written), loud_check_reject, loud_emit_reject,
+// hint_only_rc1 (check rc 1 with no [ERROR]), other_runtime_fail (never merged into
+// another), missing_result. Prints `records == cells` first; `--csv` writes one row per cell.
+
+import { writeTextFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { Base64Error, decodeBase64 } from "std:base64"
+import { toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { Json } from "std:json"
+import {
+  JsonMap,
+  cpPrefix,
+  die,
+  exists,
+  findFrom,
+  isDigit,
+  splitLines,
+  stripWs,
+} from "../lib/common"
+import {
+  anyIn,
+  padLeft,
+  padRight,
+  parseOrDie,
+  pyRepr,
+  readText,
+  sortStrings,
+} from "../lib/corpus"
+
+const COLUMNS = [
+  "correct", "wrong_value", "wrong_evalcount", "invalid_wasm", "trap",
+  "compiler_trap", "loud_check_reject", "loud_emit_reject", "hint_only_rc1",
+  "other_runtime_fail", "missing_result",
+]
+const SILENT = [
+  "wrong_value", "wrong_evalcount", "invalid_wasm", "trap", "compiler_trap",
+]
+
+const INVALID_MARKERS = [
+  "Invalid input WebAssembly code", "wasm validation", "failed to parse",
+  "type mismatch: expected", "WebAssembly translation error",
+  "validation error",
+]
+const TRAP_MARKERS = [
+  "wasm trap", "unreachable", "out of bounds", "divide by zero",
+  "null reference", "cast failure", "integer overflow",
+]
+const EMIT_MARKERS = [
+  "emit error", "emitProgram:", "emitFail", "unsupported statement",
+  "unsupported expression",
+]
+
+type Res = {
+  checkRc: string,
+  runRc: string,
+  buildSize: string,
+  checkErr: string,
+  runOut: string,
+  runErr: string,
+}
+
+type Verdict = { col: string, msg: string }
+
+function b64Text(v: string): string {
+  if v == "" { return "" }
+  const b = decodeBase64(v)
+  if b is Base64Error {
+    die("grade: a result field is not base64 (\{b.msg})", 1)
+    return ""
+  }
+  decodeUtf8Lossy(b)
+}
+
+function loadRes(path: string): Res {
+  const r: Res = {
+    checkRc: "",
+    runRc: "",
+    buildSize: "",
+    checkErr: "",
+    runOut: "",
+    runErr: "",
+  }
+  for line in splitLines(readText(path)) {
+    const sp = findFrom(line, " ", 0)
+    let k = line
+    let v = ""
+    if sp >= 0 {
+      k = line.slice(0, sp)
+      v = line.slice(sp + 1, line.length)
+    }
+    if k == "CHECKRC" { r.checkRc = v }
+    else if k == "RUNRC" { r.runRc = v }
+    else if k == "BUILDSIZE" { r.buildSize = v }
+    else if k == "CHECKERR" { r.checkErr = b64Text(v) }
+    else if k == "RUNOUT" { r.runOut = b64Text(v) }
+    else if k == "RUNERR" { r.runErr = b64Text(v) }
+  }
+  r
+}
+
+function firstMsg(text: string, tag: string): string {
+  for l in splitLines(text) {
+    if startsWith(l, tag) { return cpPrefix(l, 200) }
+  }
+  ""
+}
+
+// `l` without a leading `<path>.vl:<line>:<col>:` and the whitespace after it, so two cells
+// reporting the same cause group together.
+function stripPathPrefix(l: string): string {
+  let i = 0
+  while (
+    i < l.length
+    && l[i] != 58
+    && !(l[i] == 32 || (l[i] >= 9 && l[i] <= 13))
+  ) {
+    i = i + 1
+  }
+  if i >= l.length || l[i] != 58 || i < 3 || l.slice(i - 3, i) != ".vl" {
+    return l
+  }
+  let j = i + 1
+  let k = 0
+  while k < 2 {
+    const start = j
+    while j < l.length && isDigit(l[j]) { j = j + 1 }
+    if j == start || j >= l.length || l[j] != 58 { return l }
+    j = j + 1
+    k = k + 1
+  }
+  while j < l.length && (l[j] == 32 || (l[j] >= 9 && l[j] <= 13)) { j = j + 1 }
+  l.slice(j, l.length)
+}
+
+// The most informative single line of `text`.
+function oneLine(text: string): string {
+  const lines: string[] = []
+  for l in splitLines(text) {
+    const t = stripWs(l)
+    if t != "" { lines.push(t) }
+  }
+  for want in ["Invalid input WebAssembly code", "wasm trap", "emitProgram:", "type mismatch"] {
+    for l in lines {
+      if findFrom(l, want, 0) >= 0 { return cpPrefix(stripPathPrefix(l), 220) }
+    }
+  }
+  for l in lines {
+    if !startsWith(l, "Error:") && !startsWith(l, "Caused by") {
+      return cpPrefix(stripPathPrefix(l), 220)
+    }
+  }
+  if lines.length == 0 { return "" }
+  cpPrefix(lines[0], 220)
+}
+
+function reprList(xs: string[]): string {
+  const parts: string[] = []
+  for x in xs { parts.push(pyRepr(x)) }
+  "[" + join(parts, ", ") + "]"
+}
+
+function sameList(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+function classify(expected: string[], res: Res): Verdict {
+  let hasError = false
+  for l in splitLines(res.checkErr) {
+    if startsWith(l, "[ERROR]") { hasError = true }
+  }
+  if hasError {
+    return { col: "loud_check_reject", msg: firstMsg(res.checkErr, "[ERROR]") }
+  }
+  if res.checkRc == "1" {
+    let m = firstMsg(res.checkErr, "[HINT]")
+    if m == "" { m = firstMsg(res.checkErr, "[WARNING]") }
+    return { col: "hint_only_rc1", msg: m }
+  }
+  if res.runRc != "0" {
+    const e = res.runErr
+    if anyIn(e, INVALID_MARKERS) {
+      return { col: "invalid_wasm", msg: oneLine(e) }
+    }
+    if anyIn(e, TRAP_MARKERS) {
+      if res.buildSize == "0" || res.buildSize == "" {
+        return { col: "compiler_trap", msg: oneLine(e) }
+      }
+      return { col: "trap", msg: oneLine(e) }
+    }
+    if anyIn(e, EMIT_MARKERS) {
+      return { col: "loud_emit_reject", msg: oneLine(e) }
+    }
+    return { col: "other_runtime_fail", msg: oneLine(e) }
+  }
+  const got = split(res.runOut, "\n")
+  while got.length > 0 && got[got.length - 1] == "" { got.pop() }
+  if sameList(got, expected) { return { col: "correct", msg: "" } }
+  let gv: string[] = []
+  let gc = "None"
+  if got.length > 0 {
+    gv = got.slice(0, got.length - 1)
+    gc = got[got.length - 1]
+  }
+  const ev = expected.slice(0, expected.length - 1)
+  const ec = expected[expected.length - 1]
+  if sameList(gv, ev) && !(got.length > 0 && gc == ec) {
+    return { col: "wrong_evalcount", msg: "calls expected \{ec} got \{gc}" }
+  }
+  {
+    col: "wrong_value",
+    msg: "expected \{reprList(ev)} got \{reprList(gv)} (calls \{gc})",
+  }
+}
+
+// A manifest field as Python's `str()` spells it in a csv cell.
+function cellText(v: Json): string {
+  if v == null { return "" }
+  if v is string { return v }
+  if v is boolean {
+    if v { return "True" }
+    return "False"
+  }
+  if v is f64 {
+    const n = v as? i64
+    if n != null { return toString(n) }
+    return toString(v)
+  }
+  die("grade: a manifest field is not a scalar", 1)
+  ""
+}
+
+function field(cell: JsonMap, key: string, dflt: string): string {
+  const v = cell[key]
+  if v == null { return dflt }
+  cellText(v)
+}
+
+// One csv field as Python's `csv.writer` quotes it by default.
+function csvField(s: string): string {
+  if anyIn(s, [",", "\"", "\r", "\n"]) {
+    return "\"" + join(split(s, "\""), "\"\"") + "\""
+  }
+  s
+}
+
+function strings(v: Json, what: string): string[] {
+  const out: string[] = []
+  if v is Json[] {
+    for x in v {
+      if x is string {
+        out.push(x)
+      } else {
+        die("grade: \{what} holds a non-string", 1)
+      }
+    }
+    return out
+  }
+  die("grade: \{what} is not a list", 1)
+  out
+}
+
+type Row = {
+  name: string,
+  cell: JsonMap,
+  col: string,
+  msg: string,
+  expected: string[],
+}
+
+function main(argv: string[]): i32 {
+  const pos: string[] = []
+  let csv = ""
+  let i = 0
+  while i < argv.length {
+    if argv[i] == "--csv" && i + 1 < argv.length {
+      csv = argv[i + 1]
+      i = i + 2
+    } else {
+      pos.push(argv[i])
+      i = i + 1
+    }
+  }
+  if pos.length < 2 {
+    print(
+      "usage: vl run scripts/silent-sweep/grade.vl -- <celldir> <resdir> [--csv out.csv]",
+    )
+    return 2
+  }
+  const man = parseOrDie(readText(pos[0] + "/manifest.json"), "manifest.json")
+  let cells: JsonMap = Map()
+  if man is JsonMap {
+    const c = man["cells"]
+    if c is JsonMap { cells = c }
+  }
+  const counts: Map<string, i32> = Map()
+  for c in COLUMNS { counts[c] = 0 }
+  const rows: Row[] = []
+  let nres = 0
+  let total = 0
+  for name in sortStrings(cells.keys()) {
+    total = total + 1
+    const cv = cells[name]
+    if !(cv is JsonMap) {
+      die("grade: cell \{name} is not an object", 1)
+      return 1
+    }
+    const expected = strings(cv["expected"] ?? null, "\{name}.expected")
+    const p = pos[1] + "/" + name + ".res"
+    let v: Verdict = { col: "missing_result", msg: "" }
+    if exists(p) {
+      nres = nres + 1
+      v = classify(expected, loadRes(p))
+    }
+    counts[v.col] = (counts[v.col] ?? 0) + 1
+    rows.push(
+      { name: name, cell: cv, col: v.col, msg: v.msg, expected: expected },
+    )
+  }
+
+  const n = toString(total)
+  const agree = if nres == total { "OK" } else { "MISMATCH" }
+  print("cells=\{n} result_files=\{toString(nres)} MATCH=\{agree}")
+  print("")
+  print("== outcome columns ==")
+  for c in COLUMNS {
+    const k = counts[c] ?? 0
+    if k != 0 { print("\{padRight(c, 22)} \{padLeft(toString(k), 6)} / \{n}") }
+  }
+  print("")
+  let silent = 0
+  for c in SILENT { silent = silent + (counts[c] ?? 0) }
+  print(
+    "\{padRight("SILENT TOTAL", 22)} \{padLeft(toString(silent), 6)} / \{n}",
+  )
+
+  if csv != "" {
+    const lines: string[] = [
+      "cell,leg,rep,nul,pos,con,read,inp,spell,scope,outcome,msg,expected",
+    ]
+    for r in rows {
+      const fs = [
+        r.name,
+        field(r.cell, "leg", ""),
+        field(r.cell, "rep", ""),
+        field(r.cell, "nul", ""),
+        field(r.cell, "pos", ""),
+        field(r.cell, "con", ""),
+        field(r.cell, "read", ""),
+        field(r.cell, "inp", ""),
+        field(r.cell, "spell", "inline"),
+        field(r.cell, "scope", "fn"),
+        r.col,
+        r.msg,
+        join(r.expected, "|"),
+      ]
+      const q: string[] = []
+      for f in fs { q.push(csvField(f)) }
+      lines.push(join(q, ","))
+    }
+    const w = writeTextFile(csv, join(lines, "\r\n") + "\r\n")
+    if w != null { die("grade: cannot write \{csv} (\{w.msg})", 1) }
+    print("")
+    print("wrote \{csv}")
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("grade: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
