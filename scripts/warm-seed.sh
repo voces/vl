@@ -2,11 +2,13 @@
 # Warm the seed's `.cwasm` sidecars: one per ENGINE CONFIGURATION the host compiles the seed
 # under, so no later `vl` re-JITs it and parallel workers never race to.
 #
-#   scripts/warm-seed.sh [--fuel] [<seed>]     default seed: build/vl-compiler.wasm
+#   scripts/warm-seed.sh [--fuel] [--stash <dir>] [<seed>]     default seed: build/vl-compiler.wasm
 #
 # Three tags always: the null-collector compile (refresh-compiler.sh's pin), the
 # collecting `check`/`fmt`/`test` pump, and the copying compile every `vl build`/`vl run`
 # gets by default. `--fuel` adds the two `$VL_FUEL=1` tags the cost rows compile under.
+# `--stash <dir>` places every sidecar in <dir> beside the seed first, then places every
+# sidecar this run created into <dir>, so a CI cache of <dir> carries them to the next job.
 #
 # A sidecar's tag includes the host CPU's features unless `$VL_ISA` pins a level, so one
 # written on another machine (a CI cache restored on a different runner) can miss here and
@@ -17,12 +19,28 @@ cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
 FUEL=0
-if [ "${1:-}" = --fuel ]; then FUEL=1; shift; fi
+STASH=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fuel) FUEL=1; shift ;;
+    --stash) STASH="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
 SEED="${1:-build/vl-compiler.wasm}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 printf 'print(6 * 7)\n' > "$WORK/hello.vl"
+
+# A hard link where the two paths share a filesystem, a copy where they do not.
+place() { ln -f "$1" "$2/" 2>/dev/null || cp -f "$1" "$2/"; }
+if [ -n "$STASH" ] && [ -d "$STASH" ]; then
+  for f in "$STASH"/*.cwasm; do
+    if [ -e "$f" ]; then place "$f" "$(dirname "$SEED")"; fi
+  done
+fi
+before="$(ls "$SEED".*.cwasm 2>/dev/null || true)"
 
 note() { echo "  note: could not warm the $1 sidecar — its first use re-JITs the seed" >&2; }
 warm_null() {
@@ -43,3 +61,14 @@ warm_fuel() {
 warm_null & warm_check & warm_copying &
 if [ "$FUEL" = 1 ]; then warm_fuel copying & warm_fuel null & fi
 wait
+
+# Only a sidecar this run created goes into the stash, so a restored stash adds nothing to save.
+if [ -n "$STASH" ]; then
+  for f in "$SEED".*.cwasm; do
+    [ -e "$f" ] || continue
+    if printf '%s\n' "$before" | grep -qxF "$f"; then continue; fi
+    mkdir -p "$STASH"
+    place "$f" "$STASH"
+    echo "stashed $(basename "$f") in $STASH"
+  done
+fi
