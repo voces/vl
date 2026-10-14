@@ -7,7 +7,7 @@ is FUNC, and print FUNC's own self/incl share.
 `__str_eq__` at the top of a profile is a symptom, not a site: it is the
 name-keyed registries doing linear lookups. This attributes those samples to the
 registry that asked. With no FUNC it prints every frame's self/incl instead, so a
-function too small for `profile-rank.py`'s top-N can still be looked up.
+function too small for `profile-rank.vl`'s top-N can still be looked up.
 """
 import collections
 import json
