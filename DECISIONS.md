@@ -7435,7 +7435,7 @@ callers and is binaryen size ~20, over the `-O` rung's always-inline 16. It stay
 took 1.77–2.05 s and 270 MB under `vl run` at `-O` (1.76–1.91 s at `-O3`), against 0.57–0.70 s
 and 8 MB for plumb's module-globals workaround.
 
-**The rule.** The L4 escape step (`escape_inline_choice`) already inlined the callees a
+**The rule.** The L4 escape step (`optEscapeChoose`, `compiler/opt_escape.vl`; the host's `escape_inline_choice` until L10 R3) already inlined the callees a
 per-call struct is PASSED to. It now also chooses a callee that RETURNS one, on the same bounds
 (320 body bytes, no call cycle, the expanded and growth bounds), when:
 
