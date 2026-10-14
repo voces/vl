@@ -8,9 +8,9 @@
 # collecting `check`/`fmt`/`test` pump, and the copying compile every `vl build`/`vl run`
 # gets by default. `--fuel` adds the two `$VL_FUEL=1` tags the cost rows compile under.
 #
-# A sidecar's tag includes the host CPU's features, so one written on another machine (a CI
-# cache restored on a different runner) misses here and is rebuilt once, before any test
-# starts. Concurrent because each publish is an atomic rename; NON-FATAL because a sidecar
+# A sidecar's tag includes the host CPU's features unless `$VL_ISA` pins a level, so one
+# written on another machine (a CI cache restored on a different runner) can miss here and
+# is rebuilt once, before any test starts. Concurrent because each publish is an atomic rename; NON-FATAL because a sidecar
 # is a cache, so a failure costs one JIT later, never a wrong answer.
 set -euo pipefail
 cd "$(dirname "$0")/.."

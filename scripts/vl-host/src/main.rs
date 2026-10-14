@@ -1300,7 +1300,29 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
     if guest_fuel_on() {
         cfg.consume_fuel(true);
     }
+    pin_seed_isa(&mut cfg)?;
     Engine::new(&cfg)
+}
+
+/// `$VL_ISA=<cranelift x86 preset>` (e.g. `x86-64-v3`) compiles the seed for that feature
+/// level instead of the features inferred from this CPU. The `.cwasm` sidecar's tag then
+/// names the level rather than the CPU model, so a sidecar cached on one CI runner loads on
+/// another. A CPU lacking a pinned feature refuses the sidecar at load and recompiles.
+fn pin_seed_isa(cfg: &mut Config) -> Result<()> {
+    let isa = match std::env::var("VL_ISA") {
+        Ok(isa) if !isa.is_empty() => isa,
+        _ => return Ok(()),
+    };
+    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        bail!("$VL_ISA is supported only on x86_64 Linux hosts");
+    }
+    cfg.target("x86_64-unknown-linux-gnu")?;
+    // SAFETY: wasmtime checks every enabled ISA flag against the host CPU before it runs or
+    // deserializes code compiled under it, so an unsupported level fails loudly.
+    unsafe {
+        cfg.cranelift_flag_enable(&isa);
+    }
+    Ok(())
 }
 
 /// The engine for a ONE-SHOT compile (`vl build`, `vl run`) whose ENTRY FILE is

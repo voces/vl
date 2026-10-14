@@ -9,6 +9,12 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+# Compile the seed for a FIXED x86 feature level, not the runner's CPU: a `.cwasm` sidecar's
+# tag then names the level, so one cached on any runner loads on every other instead of each
+# job re-JITing the seed (scripts/vl-host `pin_seed_isa`). Every GitHub-hosted x86 runner is v3.
+env:
+  VL_ISA: x86-64-v3
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -102,7 +108,7 @@ jobs:
   #
   #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
-  #          ├── ci-release-shape (3) the binaryen-backed suites, split by weight
+  #          ├── ci-release-shape (4) the binaryen-backed suites, split by weight
   #          └── ci-cost              fuel/RSS cost ratchets — master pushes and nightly only
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
@@ -130,13 +136,14 @@ jobs:
 
       # The two exact keys every downstream job restores. The binary is keyed on everything
       # that determines it (rustc, Cargo.lock, the crate source); the seed on the compiler
-      # source it is the proven fixpoint of. `vl-seed3` (not `vl-seedpair`) because an entry
-      # now carries the seed's provenance file (`.src`), which the old entries lack.
+      # source it is the proven fixpoint of. `vl-seed4` is ONE namespace with publish-seed.yml and
+      # fuzz-nightly.yml (same paths, same `$VL_ISA`): an entry carries the provenance file
+      # (`.src`) and sidecars compiled for the pinned ISA, which the `vl-seedpair` ones lack.
       - name: Cache keys
         id: keys
         run: |
           echo "bin=vl-bin-${{ runner.os }}-$(rustc -V | tr ' ' '_')-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}" >> "$GITHUB_OUTPUT"
-          echo "seed=vl-seed3-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}" >> "$GITHUB_OUTPUT"
+          echo "seed=vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}" >> "$GITHUB_OUTPUT"
           echo "rustc=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
       # An exact hit means cargo would reproduce this same binary, so the build is skipped
@@ -187,7 +194,7 @@ jobs:
             build/vl-compiler.wasm.*.cwasm
           key: ${{ steps.keys.outputs.seed }}
           restore-keys: |
-            vl-seed3-${{ runner.os }}-
+            vl-seed4-${{ runner.os }}-
 
       # Self-compile current source with the seed AND prove the shipped seed is a
       # self-compilation fixed point: the ladder stops at the first stage X with an OBSERVED
@@ -199,6 +206,8 @@ jobs:
         run: ./scripts/refresh-compiler.sh --prove-fixpoint
         env:
           GH_TOKEN: ${{ github.token }}
+          # The fuel tags serve only `ci-cost`, which warms its own off the PR path.
+          WARM_FUEL: "0"
 
   # ---------------------------------------------------------------------------
   # ci-native — the native-binary suites (env-gated, they drive `vl` against the seed),
@@ -247,9 +256,9 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
-      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
-      # runner of another CPU model and every test worker would JIT the seed at once. Warm
-      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
@@ -306,9 +315,9 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
-      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
-      # runner of another CPU model and every test worker would JIT the seed at once. Warm
-      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
@@ -456,7 +465,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
 
@@ -525,9 +534,9 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
-      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
-      # runner of another CPU model and every test worker would JIT the seed at once. Warm
-      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
@@ -535,8 +544,8 @@ jobs:
 
       - name: Release-profile suites (-O3 / wasm-opt / wasm-dis / wasm-tools shape)
         run: |
-          files=$(bash scripts/ci-shard.sh release ${{ matrix.shard }} 3)
-          [ -n "$files" ] || { echo "release shard ${{ matrix.shard }} of 3 is empty" >&2; exit 1; }
+          files=$(bash scripts/ci-shard.sh release ${{ matrix.shard }} 4)
+          [ -n "$files" ] || { echo "release shard ${{ matrix.shard }} of 4 is empty" >&2; exit 1; }
           # shellcheck disable=SC2086  # one argument per file
           deno test -A --no-check --parallel $files
         env:
@@ -602,9 +611,9 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
-      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
-      # runner of another CPU model and every test worker would JIT the seed at once. Warm
-      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
@@ -695,9 +704,9 @@ jobs:
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
             build/vl-compiler.wasm.*.cwasm
-          key: vl-seed3-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          key: vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
           restore-keys: |
-            vl-seed3-${{ runner.os }}-
+            vl-seed4-${{ runner.os }}-
 
       # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
       - name: Ensure a seed to embed
