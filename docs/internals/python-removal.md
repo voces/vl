@@ -60,8 +60,8 @@ heredoc and moves with its own PR.
 | --- | --- | --- | --- | --- |
 | `scripts/check-filed-witnesses.py` | 712 | T | tests/vl_check_codegen_test.ts tests/vl_check_filed_witnesses_test.ts (+3) | deleted: `scripts/check-filed-witnesses.vl`; its test pins the report |
 | `scripts/codemods/label-at.py` | 322 | T | tests/vl_label_codemod_test.ts | scripts/codemods/label-at.vl |
-| `scripts/day-one/modules.py` | 552 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/modules.vl |
-| `scripts/day-one/sample.py` | 657 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/sample.vl (grades through `capability-probes.vl --grade-channel`, no longer imports `run.py`) |
+| `scripts/day-one/modules.py` | 552 | T | tests/vl_day_one_sampler_test.ts | done: deleted; `scripts/day-one/modules.vl`, matched by sample.vl's byte-identical runs |
+| `scripts/day-one/sample.py` | 657 | T | tests/vl_day_one_sampler_test.ts | done: deleted; `scripts/day-one/sample.vl` matched its stdout, `--json` and JSONL byte for byte (sample, `--report`, `--control`, `--replay`, `--axis`, `--exclude`), and `tests/vl_day_one_sampler_test.ts` runs it |
 | `scripts/emitter-state-audit.py` | 238 | T | tests/vl_emitter_state_audit_test.ts | done: `scripts/emitter-state-audit.vl`, output byte-identical to the Python's (default and `--names`) and now the L7 `emitter state budget` ratchet; the `.py` is deleted |
 | `scripts/goal-scoreboard.py` | 273 | T | tests/vl_invalid_module_position_test.ts tests/vl_live_sites_test.ts | done: `scripts/goal-scoreboard.vl`, pinned by `tests/vl_goal_scoreboard_test.ts`; the `.py` is deleted |
 | `scripts/inventory/ls.py` | 200 | T | tests/vl_inventory_rows_test.ts | deleted: `scripts/inventory/ls.vl`, graded beside it flag by flag |
@@ -80,9 +80,9 @@ heredoc and moves with its own PR.
 
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
-| `scripts/day-one/grammar.py` | 802 | I | scripts/day-one/sample.py | scripts/day-one/grammar.vl |
-| `scripts/day-one/imports.py` | 168 | I | scripts/day-one/sample.py | scripts/day-one/imports.vl |
-| `scripts/day-one/render.py` | 541 | I | scripts/day-one/modules.py | scripts/day-one/render.vl |
+| `scripts/day-one/grammar.py` | 802 | I | scripts/day-one/sample.py | done: deleted; `scripts/day-one/grammar.vl` |
+| `scripts/day-one/imports.py` | 168 | I | scripts/day-one/sample.py | done: deleted; `scripts/day-one/imports.vl` |
+| `scripts/day-one/render.py` | 541 | I | scripts/day-one/modules.py | done: deleted; `scripts/day-one/render.vl` |
 | `scripts/inventory/rows.py` | 120 | I | scripts/inventory/ls.py (+2) | deleted: `scripts/lib/inventory.vl` |
 | `scripts/inventory/selftest.py` | 127 | I | scripts/inventory/split.py | retired with `split.py` |
 | `scripts/inventory/split.py` | 388 | I | scripts/check-filed-witnesses.py | retired: both inventories are split, and the generated `INDEX.md` it wrote (stale at 608 rows) went with it |
@@ -144,19 +144,19 @@ heredoc and moves with its own PR.
 | `bench/strings/str-eq/main.py` | 64 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
 | `bench/strings/substr-search/main.py` | 41 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
 | `bench/strings/token-count/main.py` | 58 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
-| `scripts/day-one/file_row.py` | 160 | D | scripts/day-one/README.md | scripts/day-one/file_row.vl |
-| `scripts/day-one/minimise.py` | 258 | D | scripts/day-one/README.md | scripts/day-one/minimise.vl |
+| `scripts/day-one/file_row.py` | 160 | D | scripts/day-one/README.md | done: deleted; `scripts/day-one/file_row.vl` matched its draft except the regenerate line now naming `sample.vl` |
+| `scripts/day-one/minimise.py` | 258 | D | scripts/day-one/README.md | done: deleted; `scripts/day-one/minimise.vl` (library `reduce.vl`) matched it on every hit kind it could run, and ablates the `imports_pair` hits it crashed on; pinned by `tests/vl_day_one_sampler_test.ts` |
 | `scripts/emit-refusal-sites.py` | 226 | D | CLAUDE.md scripts/capability-probes/README.md | port to VL or retire (decide at its turn) |
 | `scripts/gen-atomic-cases.py` | 291 | D | doc tool (+4) | scripts/gen-atomic-cases.vl (fixture generator) |
 | `scripts/gen-conv-cases.py` | 398 | D | doc tool (+4) | scripts/gen-conv-cases.vl (fixture generator) |
 | `scripts/gen-shift-mask-fold.py` | 159 | D | doc tool (+4) | scripts/gen-shift-mask-fold.vl (fixture generator) |
 | `scripts/gen-simd-int-cases.py` | 450 | D | doc tool (+4) | scripts/gen-simd-int-cases.vl (fixture generator) |
 | `scripts/p7-patch.py` | 156 | D | doc tool (+4) | port to VL or retire (decide at its turn) |
-| `scripts/perf/parent-let-cache-probe.py` | 245 | D | doc tool (+4) | scripts/perf/parent-let-cache-probe.vl |
-| `scripts/perf/per-test-rank.py` | 56 | D | doc tool (+4) | scripts/perf/per-test-rank.vl |
-| `scripts/perf/profile-parents.py` | 59 | D | doc tool (+4) | scripts/perf/profile-parents.vl |
-| `scripts/perf/profile-phases.py` | 104 | D | doc tool (+4) | scripts/perf/profile-phases.vl |
-| `scripts/perf/string-concat-sites.py` | 94 | D | doc tool (+4) | scripts/perf/string-concat-sites.vl |
+| `scripts/perf/parent-let-cache-probe.py` | 245 | D | doc tool (+4) | done: deleted; a one-shot probe whose patch anchors were stale (emitter survey row 10 is closed) |
+| `scripts/perf/per-test-rank.py` | 56 | D | doc tool (+4) | done: deleted; `scripts/perf/per-test-rank.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
+| `scripts/perf/profile-parents.py` | 59 | D | doc tool (+4) | done: deleted; `scripts/perf/profile-parents.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
+| `scripts/perf/profile-phases.py` | 104 | D | doc tool (+4) | done: deleted; `scripts/perf/profile-phases.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
+| `scripts/perf/string-concat-sites.py` | 94 | D | doc tool (+4) | done: deleted; `scripts/perf/string-concat-sites.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
 | `scripts/rep-classifier-census.py` | 650 | D | doc tool (+4) | port to VL or retire (decide at its turn) |
 | `scripts/silent-sweep/census/coverage.py` | 77 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/coverage.vl`, pinned by `tests/vl_census_readers_test.ts` |
 | `scripts/silent-sweep/census/delta.py` | 117 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d243/README.md | done: deleted; `census/delta.vl`, pinned by `tests/vl_census_readers_test.ts` |
@@ -212,11 +212,11 @@ heredoc and moves with its own PR.
 | `scripts/silent-sweep/summ.py` | 25 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
 | `scripts/silent-sweep/tp-join/grid.py` | 275 | D | scripts/silent-sweep/d14/README.md scripts/silent-sweep/d188/README.md (+2) | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
 | `scripts/silent-sweep/verify.py` | 67 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
-| `scripts/std-math/arc-tables.py` | 40 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
-| `scripts/std-math/explog-tables.py` | 169 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
-| `scripts/std-math/math-grade.py` | 203 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
-| `scripts/std-math/trig-grade.py` | 78 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
-| `scripts/std-math/trig-remez.py` | 77 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
+| `scripts/std-math/arc-tables.py` | 40 | D | doc tool (+4) | done: deleted; the tables it generated are frozen in `std/math.vl` and `std-notes.md` records where they came from |
+| `scripts/std-math/explog-tables.py` | 169 | D | doc tool (+4) | done: deleted; the tables it generated are frozen in `std/math.vl` and `std-notes.md` records where they came from |
+| `scripts/std-math/math-grade.py` | 203 | D | doc tool (+4) | done: deleted; `scripts/std-math/math-grade.vl` grades against a 256-bit multiprecision reference (`bigfloat.vl`) and matched the mpmath grader's report, pinned by `tests/vl_std_math_grade_test.ts` |
+| `scripts/std-math/trig-grade.py` | 78 | D | doc tool (+4) | done: deleted; `scripts/std-math/trig-grade.vl` grades against a 256-bit multiprecision reference (`bigfloat.vl`) and matched the mpmath grader's report, pinned by `tests/vl_std_math_grade_test.ts` |
+| `scripts/std-math/trig-remez.py` | 77 | D | doc tool (+4) | done: deleted; the tables it generated are frozen in `std/math.vl` and `std-notes.md` records where they came from |
 | `scripts/twin-agreement.py` | 298 | D | L2 refactor (+6) | port to VL or retire (decide at its turn) |
 
 ### X: deleted in this PR
