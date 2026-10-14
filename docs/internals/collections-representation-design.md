@@ -360,7 +360,7 @@ The costs are larger than they look.
 * **The dense-int map breaks insertion order** unless the analysis proves ascending insertion
   or no iteration.
 * **Code size.** Every function that can receive two representations is either specialized or
-  unified with casts. The mono grid and `plumb-shape-cost.py` would both move.
+  unified with casts. The mono grid and `plumb-shape-cost.vl` would both move.
 * **Separate compilation — corrected.** Revision 1 said a whole-program representation "cannot
   cross a compilation unit", and scored A and E1 as "the ABI is the type". The implementer
   critic refuted the premise: **VL has no GC-type ABI.** A program's heap types are emitted
@@ -594,7 +594,7 @@ additive and `{[K]: boolean}` stays legal as a map of booleans.
 
 The compiler is itself the heaviest map consumer (324 `Map()` sites), so any map
 representation change is priced by the self-compile. **It is its own map benchmark**, and
-`plumb-shape-cost.py`'s fuel reading grades it without timing noise.
+`plumb-shape-cost.vl`'s fuel reading grades it without timing noise.
 
 | option | surface churn | compiler work | risk |
 | --- | --- | --- | --- |
@@ -714,7 +714,7 @@ generated code is graded on:
 
 * **V8 and wasmtime both**, V8 as the primary target. The perf critic measured one layout at
   2% on V8 and 241% on wasmtime; a change graded on one engine is not graded;
-* **`plumb-shape-cost.py`** (fuel and peak RSS), which prices helper growth and inlining
+* **`plumb-shape-cost.vl`** (fuel and peak RSS), which prices helper growth and inlining
   without timing noise, and the self-compile, since the compiler is its own map benchmark;
 * the D2370 randomized differential fixtures for anything in the map helpers, and the D2315
   walk-cursor fixtures for anything that touches iteration.

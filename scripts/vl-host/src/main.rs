@@ -3683,7 +3683,7 @@ fn start_guest_profile(engine: &Engine, module: &Module) -> Result<()> {
 /// Whether `$VL_FUEL=1` asks for the compiler's work as a COUNT: wasmtime fuel, about one
 /// unit per guest instruction, the same on every run whatever else the box is doing. A
 /// fuel engine compiles the seed to different code, so it caches under its own `.cwasm`
-/// sidecar. `scripts/plumb-shape-cost.py` grades it.
+/// sidecar. `scripts/plumb-shape-cost.vl` grades it.
 fn guest_fuel_on() -> bool {
     std::env::var("VL_FUEL").ok().as_deref() == Some("1")
 }
