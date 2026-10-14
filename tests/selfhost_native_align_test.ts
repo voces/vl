@@ -276,6 +276,26 @@ for (const rel of [...walkVl(CASES)].sort()) {
   else TIERS[tiers[0]].push(rel);
 }
 
+// ── CI sharding: `$VL_CI_SHARD=<k>/<n>` registers only the k-th of n shares ──────
+// ci.yml runs this file in every `ci-native` shard (it is SELF_SHARDED in
+// scripts/ci-shard.sh) so no one runner compiles and runs the whole corpus. Each tier, and
+// the exclusions, are dealt round-robin over their sorted lists, so the n shares partition
+// every case and each carries about 1/n of every tier. Discovery and the coverage test still
+// see the whole corpus. Unset (a local run, gate.sh), every case is registered.
+const DISCOVERED_EXCLUDED = new Set(EXCLUDED.map((e) => e.rel));
+const CI_SHARD = Deno.env.get("VL_CI_SHARD") ?? "";
+if (CI_SHARD !== "") {
+  const m = /^(\d+)\/(\d+)$/.exec(CI_SHARD);
+  const k = m ? Number(m[1]) : 0;
+  const n = m ? Number(m[2]) : 0;
+  if (!m || n < 1 || k < 1 || k > n) {
+    throw new Error(`$VL_CI_SHARD must be <k>/<n> with 1 <= k <= n, got ${JSON.stringify(CI_SHARD)}`);
+  }
+  const mine = (_: unknown, i: number) => i % n === k - 1;
+  for (const tier of Object.keys(TIERS) as Tier[]) TIERS[tier] = TIERS[tier].filter(mine);
+  EXCLUDED.splice(0, EXCLUDED.length, ...EXCLUDED.filter(mine));
+}
+
 // ── Batched `vl run` (RUN + TRAP tiers) ───────────────────────────────────────
 // One `vl run --batch` process runs MANY cases: the per-spawn fixed costs
 // (process + two wasmtime engine builds + loading the multi-MB compiler module)
@@ -707,9 +727,7 @@ Deno.test({
   name: "native-align coverage: every corpus case lands in exactly one tier",
   ignore: !ENABLED,
   fn: () => {
-    const stale = Object.keys(EXCLUSIONS).filter((rel) =>
-      !EXCLUDED.some((e) => e.rel === rel)
-    );
+    const stale = Object.keys(EXCLUSIONS).filter((rel) => !DISCOVERED_EXCLUDED.has(rel));
     if (stale.length) {
       throw new Error(
         `EXCLUSIONS names ${stale.length} case(s) discovery does not place in a tier ` +
