@@ -713,6 +713,22 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      and refusing a single pin that differs from the read each moved nothing, and nothing
      witnesses them. Over the 55 files the switch moved nothing. The record still decides
      the join: it is order-based, and a join over the directed pins is the next step.
+   - Eleventh PR: the join is read from the directed pins, and `monoCellSigRecord` is
+     deleted. `fnFlowLetPinSigs` returns every distinct closed pin the `let`'s value flows
+     to. Each slot also keeps the context that walked it, so a binding walked in two
+     contexts answers for the context whose instance the read's frame stands for
+     (`monoFrameInstTmpl`, the same fit `fnFlowLamPin` uses), and declines only when no
+     context fits. `monoLetPinTake` folds the pins with `monoSigJoin`. The join must be one
+     of the pins, pins that differ join only when the delivery returns nothing, and only
+     the binding's own call may arrive at a list the join widens. It answers coerce, keep
+     or refuse, and the answer does not depend on which delivery comes first. The four
+     cell sites that also called the record (`monoCellValueTakeAt`) never joined, so they
+     keep an equality check, `monoCellSigOne`. Over 15,110 files four moved. Three are
+     refusals that now name the written binding: the reassigned binding refuses at its
+     first delivery, so the `APPEND`-rung message and the copy's message no longer fire
+     first. The fourth, `written-let-copied-called-at-string-then-mixed-union`, prints the
+     same. D4300 moves from a trap to a loud emit reject, because its one pin is not the
+     call's widened argument type. No corpus cell moved.
 4. **Lists, maps, record fields, unions, spread, for-in, `?.`.**
    - Retires the `monoList*` set, `monoPinGenericList`, `monoNotePushDeliveries`,
      `monoStore*AnnName` and the ObjLit/ArrayLit arms of `monoCoerceFnValueName`.

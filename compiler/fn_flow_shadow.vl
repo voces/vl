@@ -101,10 +101,11 @@ let ufKidK: string[][] = []
 let ufKidS: i32[][] = []
 // The directed half, per slot rather than per class: the slots a slot's value flows into, and
 // the pins taken at the slot itself. A merge with no direction (two derived slots) flows both
-// ways. Per pre-mono declaration, its slot in each context that walks it.
+// ways. Per pre-mono declaration, its slot in each context that walks it, and that context.
 let dfTo: i32[][] = []
 let dfPin: i32[][] = []
 let ffDeclSlots: {[i32]: i32[]} = Map()
+let ffDeclSlotCtx: {[i32]: i32[]} = Map()
 
 // A pin is the parameter types a class is called or annotated at, in the context that read
 // them; `pinName` renders them once the compile is over.
@@ -172,6 +173,7 @@ export function fnFlowShadowBegin() {
   dfTo = []
   dfPin = []
   ffDeclSlots = Map()
+  ffDeclSlotCtx = Map()
   pinTys = []
   pinName = []
   ctxKeyIx = Map()
@@ -616,6 +618,9 @@ function ffStmt(ix: i32) {
     if !i32ListHas(ds, s) {
       ds.push(s)
       ffDeclSlots[o] = ds
+      const dc = ffDeclSlotCtx[o] ?? []
+      dc.push(ffCtx)
+      ffDeclSlotCtx[o] = dc
     }
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
     if n.letInit >= 0 {
@@ -1241,18 +1246,57 @@ export function fnFlowDeclWritten(at: i32): boolean {
 // when the walk saw no such declaration.
 export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
 
-// The one parameter list (`p1,p2,`) the calls and annotated destinations the `let` declared at
-// `d` flows into pin it at; "" when none does, `FF_PIN_MANY` when two disagree, and
-// `FF_PIN_DECLINE` without a table or when the binding is walked in more than one context.
-export function fnFlowLetPinSig(d: i32): string {
-  if !ffBuilt || d < 0 { return FF_PIN_DECLINE }
-  const slots = ffDeclSlots[ffOrigDecl(d)] ?? []
-  if slots.length != 1 { return FF_PIN_DECLINE }
-  ffPinSigOf(ffDirectedPins(slots[0]))
+// The distinct closed parameter lists (`p1,p2,`) the calls and annotated destinations the `let`
+// declared at `d` flows into pin it at, in the walk that instance `inst` of generic `tmpl` stands
+// for (both -1 outside an instance). `[FF_PIN_DECLINE]` without a table, for a binding no walk
+// reached, or when its walks disagree and the instance picks none of them out.
+export function fnFlowLetPinSigs(d: i32, inst: i32, tmpl: i32): string[] {
+  const decline: string[] = [FF_PIN_DECLINE]
+  if !ffBuilt || d < 0 { return decline }
+  const o = ffOrigDecl(d)
+  const slots = ffDeclSlots[o] ?? []
+  const ctxs = ffDeclSlotCtx[o] ?? []
+  if slots.length == 0 { return decline }
+  const first = ffPinSigsOf(ffDirectedPins(slots[0]))
+  let agree = true
+  let i = 1
+  while i < slots.length {
+    if !ffSameSigs(first, ffPinSigsOf(ffDirectedPins(slots[i]))) {
+      agree = false
+    }
+    i = i + 1
+  }
+  if agree { return first }
+  if tmpl < 0 || inst < 0 { return decline }
+  const ps = ffParamSpells(inst)
+  let pick = decline
+  i = 0
+  while i < slots.length && i < ctxs.length {
+    const c = ctxs[i]
+    if (
+      c >= 2
+      && (walked[i32ToStr(tmpl) + "@" + i32ToStr(c)] ?? false)
+      && ffCtxFits(tmpl, c, ps)
+    ) {
+      const sigs = ffPinSigsOf(ffDirectedPins(slots[i]))
+      if pick.length == 1 && pick[0] == FF_PIN_DECLINE { pick = sigs }
+      else if !ffSameSigs(pick, sigs) { return decline }
+    }
+    i = i + 1
+  }
+  pick
 }
 
-export const FF_PIN_MANY = "*"
 export const FF_PIN_DECLINE = "?"
+
+// Whether the lists `a` and `b` hold the same strings.
+function ffSameSigs(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for x in a {
+    if !strListHas(b, x) { return false }
+  }
+  true
+}
 
 // The pins taken at every slot `s`'s value reaches along the directed edges, `s` included.
 function ffDirectedPins(s: i32): i32[] {
@@ -1275,18 +1319,17 @@ function ffDirectedPins(s: i32): i32[] {
   out
 }
 
-// The one closed pin among `ids` as `p1,p2,`; "" for none and `FF_PIN_MANY` for two that differ.
-function ffPinSigOf(ids: i32[]): string {
-  let pick = ""
+// The distinct closed pins among `ids`, each as `p1,p2,`, in the order first taken.
+function ffPinSigsOf(ids: i32[]): string[] {
+  const out: string[] = []
   for id in ids {
     if !ffPinOpen(id) {
       let sig = ""
       for t in pinTys[id] { sig = sig + normTypeAtom(tyToStr(t)) + "," }
-      if pick == "" { pick = sig }
-      else if sig != pick { return FF_PIN_MANY }
+      if !strListHas(out, sig) { out.push(sig) }
     }
   }
-  pick
+  out
 }
 
 // The longest alias chain the lambda answers below follow; `FF_CHAIN_LONG` reports one longer.

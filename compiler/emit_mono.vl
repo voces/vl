@@ -285,13 +285,12 @@ import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
 import {
   FF_CHAIN_LONG,
   FF_PIN_DECLINE,
-  FF_PIN_MANY,
   fnFlowAliasLam,
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclWritten,
   fnFlowLamPin,
-  fnFlowLetPinSig,
+  fnFlowLetPinSigs,
   fnFlowReadGenFn,
   fnFlowReadWritten,
   fnFlowRespellLam,
@@ -10521,10 +10520,10 @@ function monoAliasCellRead(at: i32, ctx: i32): i32[] {
   none
 }
 
-// For an un-annotated `let` read at `at` that an `=` writes: records `tname` as the signature
-// every call and delivery of the binding, and of any binding it is copied into, must share, then
-// instances each named generic function its initializer or a live write names at that type, and
-// answers true; false for any other read, which keeps its value (D3930).
+// For an un-annotated `let` read at `at` that an `=` writes: takes `tname` against the join of
+// the pins the binding's value flows to (`monoLetPinTake`), then instances each named generic
+// function its initializer or a live write names at that type, and answers true; false for any
+// other read, which keeps its value (D3930).
 function monoCoerceWrittenLetValues(at: i32, ctx: i32, tname: string): boolean {
   // Asked of every value read, so the cheap tests come first.
   if annArrowAt(tname) < 1 { return false }
@@ -10533,21 +10532,14 @@ function monoCoerceWrittenLetValues(at: i32, ctx: i32, tname: string): boolean {
   if lf[1] < 0 { return false }
   const d = P.nodes[lf[1]]
   if !(d is LetDecl) || d.letType >= 0 { return false }
-  if monoCellSigByCall { monoCellSigSoft = lf[1] }
+  const byCall = monoCellSigByCall
   monoCellSigByCall = false
-  let ok = true
-  if monoLetPinHolds(lf[1], tname) {
-    monoCellSigKept = false
-    monoCellCoercedSig.set(lf[1], monoFnNameSig(tname))
-  } else {
-    ok = monoCellSigRecord(lf[1], tname)
-  }
-  monoCellSigSoft = -1
-  if !ok {
+  const take = monoLetPinTake(lf, tname, byCall)
+  if take == MONO_PIN_REFUSE {
     monoBindSigFail(d.letName)
     return true
   }
-  if monoCellSigKept { return true }
+  if take == MONO_PIN_KEEP { return true }
   monoWrittenLetBusy.push(lf[1])
   monoLastInstFe = -1
   monoCoerceNamedGeneric(d.letInit, tname, lf[0])
@@ -10562,13 +10554,77 @@ function monoCoerceWrittenLetValues(at: i32, ctx: i32, tname: string): boolean {
   true
 }
 
-// Whether the one pin the `let` declared at `v` flows to (`fnFlowLetPinSig`) is the parameter
-// list of `tname`: the binding is held at it whatever order its deliveries arrive in. A binding
-// with no pin, two, or more than one walk keeps the order-based record (`monoCellSigRecord`).
-function monoLetPinHolds(v: i32, tname: string): boolean {
-  const pin = fnFlowLetPinSig(v)
-  if pin == "" || pin == FF_PIN_MANY || pin == FF_PIN_DECLINE { return false }
-  pin == monoFnNameSig(tname)
+// `monoLetPinTake`'s answers: coerce the binding's values at the delivery's type, keep them at
+// the wider join, or refuse the binding (`monoBindSigFail`).
+const MONO_PIN_COERCE = 0
+const MONO_PIN_KEEP = 1
+const MONO_PIN_REFUSE = 2
+
+// How the written `let` `lf` takes a delivery at function type `tname`, in any delivery order: it
+// is held at the join (`monoSigJoin`) of its pins (`monoLetPins`), which must be one of them.
+// Differing pins join only when nothing is returned, and only the binding's own call (`byCall`),
+// which converts its argument, may arrive at a list the join widens.
+function monoLetPinTake(lf: i32[], tname: string, byCall: boolean): i32 {
+  const sig = monoFnNameSig(tname)
+  if sig == "" { return MONO_PIN_COERCE }
+  const pins = monoLetPins(lf)
+  if pins.length == 0 { return MONO_PIN_COERCE }
+  let join = pins[0]
+  let i = 1
+  while i < pins.length {
+    join = monoSigJoin(join, pins[i])
+    if join == "" { return MONO_PIN_REFUSE }
+    i = i + 1
+  }
+  if !strListHas(pins, join) { return MONO_PIN_REFUSE }
+  const quiet = monoSigRetVoid(tname)
+  if pins.length > 1 && !quiet { return MONO_PIN_REFUSE }
+  if sig == join { return MONO_PIN_COERCE }
+  if byCall && quiet && monoSigJoin(sig, join) == join { return MONO_PIN_KEEP }
+  MONO_PIN_REFUSE
+}
+
+// The pins (`fnFlowLetPinSigs`) of the written `let` `lf`, in the walk its frame's instance
+// stands for; empty when the table answers none.
+function monoLetPins(lf: i32[]): string[] {
+  let pins = fnFlowLetPinSigs(lf[1], -1, -1)
+  if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
+    const it = monoFrameInstTmpl(lf[0])
+    pins = fnFlowLetPinSigs(lf[1], it[0], it[1])
+  }
+  if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
+    const none: string[] = []
+    return none
+  }
+  pins
+}
+
+// `[instance, template]` for the generic instance frame `fx` is, or the nearest enclosing frame
+// that is one; `[-1, -1]` at module scope or outside any instance.
+function monoFrameInstTmpl(fx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  let f = fx
+  let hops = 0
+  while f >= 0 && hops < 8 {
+    const fe = fnStmtsPosOf(f)
+    if fe < 0 || fe >= fnStmts.length { return none }
+    let k = 0
+    while k < monoInstFe.length && k < monoInstOrig.length {
+      if monoInstFe[k] == fe {
+        const o = monoInstOrig[k]
+        if o < 0 || o >= monoOrigNode.length { return none }
+        const out: i32[] = [f, monoOrigNode[o]]
+        return out
+      }
+      k = k + 1
+    }
+    if fe >= fnParent.length { return none }
+    const ps = fnParent[fe]
+    if ps < 0 || ps >= fnStmts.length { return none }
+    f = fnStmts[ps]
+    hops = hops + 1
+  }
+  none
 }
 
 // The frame and declaration (`monoReadLetFrame`) of the `let` read at `at` in frame `ctx`, when
@@ -10679,7 +10735,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
     )
   }
   if monoNamesDeclaredGeneric(x, ctx) || monoNamesGenericInstance(x, ctx) {
-    if !monoCellSigRecord(x, tname) { return 1 }
+    if !monoCellSigOne(x, tname) { return 1 }
     monoCoerceNamedGeneric(x, tname, ctx)
     return 0
   }
@@ -10689,7 +10745,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
     // A hole lambda written as a literal is pinned at this type, as a call through the cell pins
     // it (D3950); the pin annotates it in place, so its parameters are read as first seen.
     if P.nodes[x] is FuncDecl && monoLamIsHole(lfe) {
-      if !monoCellSigRecord(monoOrigNode[lfe], tname) { return 1 }
+      if !monoCellSigOne(monoOrigNode[lfe], tname) { return 1 }
       if lfe < monoGen.length && monoGen[lfe] == 1 {
         return monoCellLamTake(lfe, x, tname, ctx)
       }
@@ -10697,7 +10753,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
     }
     // One reached by name keeps its binding's rules (D3857), with one signature per lambda.
     const key = monoLamSigKey(lfe)
-    if !monoCellSigRecord(key, tname) { return 1 }
+    if !monoCellSigOne(key, tname) { return 1 }
     // A lambda with every parameter annotated has its own type to compare.
     if key == fnStmts[lfe] {
       return monoCellConcreteTake(nodeTyIxOf(fnStmts[lfe]), tname, 0)
@@ -10712,7 +10768,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
   }
   const nm = monoIdentNameOf(x)
   if nm != "" && monoReadGenFnFe(x) >= 0 {
-    if !monoCellSigRecord(x, tname) { return 1 }
+    if !monoCellSigOne(x, tname) { return 1 }
     if monoCoerceFnValueName(x, tname, ctx, -1) < 0 { return 2 }
     return 0
   }
@@ -10904,19 +10960,6 @@ function monoFnNameSig(tname: string): string {
   sig
 }
 
-// The binding node whose own call is being recorded: that call converts its argument, so the
-// signature it records does not fix the binding's type. -1 outside such a call.
-let monoCellSigSoft = 0 - 1
-// Set by a call through a written `let` just before it coerces the `let` at the call's type;
-// cleared by the coercion's own record.
-let monoCellSigByCall = false
-// Whether the last `monoCellSigRecord` kept the wider signature already recorded, so the value
-// is not coerced again at the narrower one.
-let monoCellSigKept = false
-// The nodes recorded at a narrower signature by a delivery other than such a call, which no
-// wider signature may replace.
-let monoCellSigFirm: {[i32]: boolean} = Map()
-
 // The result type of the call whose signature is being recorded; -2 outside one, where a
 // signature's own function type spells its result.
 let monoSigCallRet = 0 - 2
@@ -10938,36 +10981,20 @@ function monoSigRetVoid(tname: string): boolean {
   false
 }
 
-// Records node `v` at the parameter list of function type `tname`; false when it holds another.
-// Two lists that join (`monoSigJoin`) are one, held at the join, when neither returns a value
-// and the one the join replaces did not come from a delivery that fixes a binding's type.
-function monoCellSigRecord(v: i32, tname: string): boolean {
-  monoCellSigKept = false
-  const soft = v == monoCellSigSoft
+// Set by a call through a written `let` just before it coerces the `let` at the call's type;
+// cleared by that coercion.
+let monoCellSigByCall = false
+
+// Records the value node `v` a capture cell takes at the parameter list of function type
+// `tname`; false when it already holds another.
+function monoCellSigOne(v: i32, tname: string): boolean {
   const sig = monoFnNameSig(tname)
   if sig == "" { return true }
   const had = monoCellCoercedSig.get(v) ?? ""
-  const quiet = monoSigRetVoid(tname)
-  if had == "" || had == sig {
-    monoCellCoercedSig.set(v, sig)
-    if !soft { monoCellSigFirm.set(v, true) }
-    if !quiet { monoCellSigValued.set(v, true) }
-    return true
-  }
-  if !quiet || (monoCellSigValued.get(v) ?? false) { return false }
-  const join = monoSigJoin(had, sig)
-  if join == sig {
-    if monoCellSigFirm.get(v) ?? false { return false }
-    monoCellCoercedSig.set(v, sig)
-    if !soft { monoCellSigFirm.set(v, true) }
-    return true
-  }
-  monoCellSigKept = join != "" && soft && had == join
-  monoCellSigKept
+  if had != "" && had != sig { return false }
+  monoCellCoercedSig.set(v, sig)
+  true
 }
-
-// The nodes recorded by a signature whose function returns a value, which join no other.
-let monoCellSigValued: {[i32]: boolean} = Map()
 
 // The parameter list both `a` and `b` (`p1,p2,`) pass their values as, pin by pin
 // (`monoPinJoin`); "" when some pair has none.
@@ -14529,8 +14556,6 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoCellCoercedSig = Map()
-  monoCellSigFirm = Map()
-  monoCellSigValued = Map()
   monoSigCallRet = -2
   monoHoleLamSlots = Map()
   monoBuiltinCbLamsBuilt = false
