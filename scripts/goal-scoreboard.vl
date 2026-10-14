@@ -1,0 +1,731 @@
+// Measure the standing goal from the distilled corpus baseline, without compiling anything:
+// `runs`, then clause 1 (check-clean but no correct run) and clause 2 (an emit reject after a
+// clean check, or a check reject whose own sentence concedes the program is type-valid).
+// Then the capability refusal sites by WORDING (a floor) and by WITNESS (`live-sites.json`).
+//
+//     vl run scripts/goal-scoreboard.vl -- [--baseline F] [--sites] [--top N] [--json OUT]
+//
+// Run it from the checkout root: paths resolve against the working directory. Run
+// `regress.vl <seed>` first if the numbers must describe a seed other than the baseline's.
+
+import { IoError, listDir, readFile, writeTextFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { padLeft, parseI32, toFixed, toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { Json, JsonError, parseJson } from "std:json"
+import {
+  JsonMap,
+  cpAt,
+  cpPrefix,
+  die,
+  findFrom,
+  hexDigits,
+  jsonStr,
+  lstripWs,
+  stripWs,
+  univNl,
+} from "./lib/common"
+import { spawn } from "./lib/probe-grade"
+
+const DEFAULT_BASELINE = "scripts/silent-sweep/distilled/baseline.jsonl"
+const LIVE_SITES = "scripts/capability-probes/live-sites.json"
+
+// The phrases a refusal uses to admit the refused program is type-valid, lower-cased. Bare
+// "unsupported" is deliberately absent: it also names internal invariants and design rules.
+const CONCEDES = [
+  "no lowering", "not yet supported", "not supported by codegen",
+  "type-valid but cannot build", "not supported yet", "not yet implemented",
+  "not yet callable", "not yet built",
+]
+
+function contains(s: string, needle: string): boolean {
+  findFrom(s, needle, 0) >= 0
+}
+
+// `s` with ASCII letters lower-cased; the phrases are ASCII, so this is the match `re.I` makes.
+function lowerAscii(s: string): string {
+  const parts: string[] = []
+  let start = 0
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b >= 65 && b <= 90 {
+      parts.push(s.slice(start, i))
+      parts.push("abcdefghijklmnopqrstuvwxyz".slice(b - 65, b - 64))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  parts.push(s.slice(start, s.length))
+  join(parts, "")
+}
+
+function concedes(msg: string): boolean {
+  const m = lowerAscii(msg)
+  for p in CONCEDES {
+    if contains(m, p) { return true }
+  }
+  false
+}
+
+// `s` padded with spaces to `w` code points on the right, as `{s:<w}` formats it.
+function padRight(s: string, w: i32): string {
+  let out = s
+  let n = s.cpLen()
+  while n < w {
+    out = out + " "
+    n = n + 1
+  }
+  out
+}
+
+function num(n: i32, w: i32): string { padLeft(toString(n), w, " ") }
+
+// `x` (not negative) to two places as Python's `.2f` does: an exact tie rounds to even,
+// where `toFixed` rounds it away from zero. Only a multiple of 1/8 can tie at this width.
+function fixed2(x: f64): string {
+  const c = x * 100.0
+  const fl = floor(c)
+  if c - fl == 0.5 {
+    const n = fl as! i64
+    if n % 2 == 0 { return toFixed((n as! f64) / 100.0, 2) }
+  }
+  toFixed(x, 2)
+}
+
+// `xs` in byte order, which for UTF-8 is Python's code-point order. A hand merge sort
+// rather than `std:array`'s `sort`, whose comparator lambda makes the compiler trap (D4290).
+function sortStrings(xs: string[]): string[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = sortStrings(xs.slice(0, mid))
+  const b = sortStrings(xs.slice(mid, xs.length))
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !(b[j] < a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// Whether Python's `str.isprintable` refuses the non-ASCII code point `cp`: the
+// separators, format and control characters, surrogates and private use. Unassigned
+// code points, which Python also refuses, are not tabled.
+function unprintable(cp: i32): boolean {
+  if cp <= 0xA0 || cp == 0xAD || cp == 0x1680 || cp == 0x3000 { return true }
+  if (cp >= 0x600 && cp <= 0x605) || cp == 0x61C || cp == 0x6DD || cp == 0x70F {
+    return true
+  }
+  if cp == 0x180E || (cp >= 0x2000 && cp <= 0x200F) { return true }
+  if (cp >= 0x2028 && cp <= 0x202F) || (cp >= 0x205F && cp <= 0x206F) {
+    return true
+  }
+  if (cp >= 0xD800 && cp <= 0xF8FF) || cp == 0xFEFF { return true }
+  if cp >= 0xFFF9 && cp <= 0xFFFB { return true }
+  cp == 0xE0001 || (cp >= 0xE0020 && cp <= 0xE007F) || cp >= 0xF0000
+}
+
+// `s` quoted as Python's `repr` quotes a string.
+function pyRepr(s: string): string {
+  let q = 39
+  if contains(s, "'") && !contains(s, "\"") { q = 34 }
+  const qs = s.slice(0, 0) + (if q == 39 { "'" } else { "\"" })
+  const parts = [qs]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == q || b == 92 { parts.push("\\" + s.slice(i, i + 1)) }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b < 32 || b == 127 { parts.push("\\x" + hexDigits(b, 2)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    const c = cpAt(s, i)
+    if !unprintable(c.cp) { parts.push(s.slice(i, i + c.n)) }
+    else if c.cp <= 0xFF { parts.push("\\x" + hexDigits(c.cp, 2)) }
+    else if c.cp <= 0xFFFF { parts.push("\\u" + hexDigits(c.cp, 4)) }
+    else { parts.push("\\U" + hexDigits(c.cp, 8)) }
+    i = i + c.n
+  }
+  parts.push(qs)
+  join(parts, "")
+}
+
+function readText(path: string): string {
+  const t = readFile(path)
+  if t is IoError {
+    die("goal-scoreboard: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(decodeUtf8Lossy(t))
+}
+
+// `path` as `os.path.relpath` shows it for the paths a caller passes: a leading `./` and
+// the working directory are dropped.
+function relPath(path: string): string {
+  let p = path
+  while startsWith(p, "./") { p = p.slice(2, p.length) }
+  if !startsWith(p, "/") { return p }
+  const pwd = spawn("pwd", ["-P"])
+  const here = stripWs(pwd.out) + "/"
+  if pwd.code == 0 && startsWith(p, here) {
+    return p.slice(here.length, p.length)
+  }
+  p
+}
+
+// ── the corpus ──────────────────────────────────────────────────────────────────────
+
+type Cell = { cls: string, msg: string }
+
+// The baseline's cells in file order, one JSON object per line; a repeated cell keeps
+// its first position and its last value, as a Python dict does.
+type Cells = { order: string[], byId: Map<string, Cell> }
+
+function loadCells(path: string): Cells {
+  const out: Cells = { order: [], byId: Map() }
+  for raw in readText(path).split("\n") {
+    const line = stripWs(raw)
+    if line.length == 0 { continue }
+    const j = parseJson(line)
+    if j is JsonError {
+      die("goal-scoreboard: a line of \{path} is not JSON: \{j.msg}", 1)
+      return out
+    }
+    if j is JsonMap {
+      const id = j["cell"]
+      const cls = j["class"]
+      const msg = j["msg"]
+      if id is string && cls is string {
+        if !out.byId.has(id) { out.order.push(id) }
+        out.byId[id] = { cls: cls, msg: if msg is string { msg } else { "" } }
+        continue
+      }
+    }
+    die("goal-scoreboard: a line of \{path} has no cell or class", 1)
+  }
+  out
+}
+
+function cellAt(c: Cells, id: string): Cell {
+  c.byId[id] ?? { cls: "", msg: "" }
+}
+
+// A tally in first-seen order, which is the order `most_common` breaks ties in.
+type Tally = { keys: string[], n: Map<string, i32> }
+
+function tally(): Tally { { keys: [], n: Map() } }
+
+function bump(t: Tally, k: string) {
+  const v = t.n[k]
+  if v is i32 {
+    t.n[k] = v + 1
+  } else {
+    t.keys.push(k)
+    t.n[k] = 1
+  }
+}
+
+function count(t: Tally, k: string): i32 { t.n[k] ?? 0 }
+
+// `t`'s keys by count, highest first, ties in first-seen order.
+function mostCommon(t: Tally): string[] { byCount(t, t.keys) }
+
+function byCount(t: Tally, xs: string[]): string[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = byCount(t, xs.slice(0, mid))
+  const b = byCount(t, xs.slice(mid, xs.length))
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && count(t, a[i]) >= count(t, b[j])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// ── one message's shape ────────────────────────────────────────────────────────────
+
+function isDigitAt(s: string, i: i32): boolean {
+  i < s.length && s[i] >= 48 && s[i] <= 57
+}
+
+// Every backquoted span becomes `X`; an unclosed backquote stays as written.
+function blankTicks(s: string): string {
+  const parts: string[] = []
+  let i = 0
+  let start = 0
+  while i < s.length {
+    if s[i] == 96 {
+      const close = findFrom(s, "`", i + 1)
+      if close < 0 { break }
+      parts.push(s.slice(start, i))
+      parts.push("`X`")
+      i = close + 1
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  parts.push(s.slice(start, s.length))
+  join(parts, "")
+}
+
+// Every number becomes N, except a primitive width (`i64`, `u8`, `f32`) which keeps its
+// digits: a normalised `iN[]` was once read as `i32[]` when every cell was `i64[]`.
+function blankNumbers(s: string): string {
+  const parts: string[] = []
+  let i = 0
+  let start = 0
+  while i < s.length {
+    const b = s[i]
+    const pre = (b == 105 || b == 117 || b == 102) && isDigitAt(s, i + 1)
+    if pre || isDigitAt(s, i) {
+      let e = if pre { i + 1 } else { i }
+      while isDigitAt(s, e) { e = e + 1 }
+      const tok = s.slice(i, e)
+      const w = if pre { tok.slice(1, tok.length) } else { "" }
+      const prim = w == "8" || w == "16" || w == "32" || w == "64"
+      parts.push(s.slice(start, i))
+      parts.push(if prim { tok } else { "N" })
+      i = e
+      start = e
+    } else {
+      i = i + 1
+    }
+  }
+  parts.push(s.slice(start, s.length))
+  join(parts, "")
+}
+
+// A message collapsed to its shape, so cells differing only in a type name group.
+function norm(msg: string): string {
+  let m = blankNumbers(blankTicks(msg))
+  if startsWith(m, "Error: ") { m = m.slice(7, m.length) }
+  if startsWith(m, "emit error") { m = lstripWs(m.slice(10, m.length)) }
+  cpPrefix(stripWs(m), 118)
+}
+
+// ── the compiler's self-declared capability literals ─────────────────────────────────
+
+type Lit = { loc: string, text: string, hit: boolean }
+
+// The end of the string literal opening at `q`, or -1 when the line does not close it.
+function literalEnd(line: string, q: i32): i32 {
+  let i = q + 1
+  while i < line.length {
+    const b = line[i]
+    if b == 34 { return i }
+    if b == 92 {
+      if i + 1 >= line.length { return -1 }
+      i = i + 2
+    } else {
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Every distinct string literal in `compiler/*.vl` that concedes the program is type-valid,
+// sorted, with its first location and whether the corpus's messages reach it. Comment
+// lines are skipped; the unit is the literal, never the source line.
+function capabilityLiterals(corpus: string): Lit[] {
+  const first: Map<string, string> = Map()
+  const names = listDir("compiler")
+  if names is IoError {
+    die("goal-scoreboard: cannot list compiler (\{names.msg})", 1)
+    return []
+  }
+  const files: string[] = []
+  for n in names {
+    if n.length >= 3 && n.slice(n.length - 3, n.length) == ".vl" {
+      files.push(n)
+    }
+  }
+  for fn in sortStrings(files) {
+    let ln = 0
+    for line in readText("compiler/" + fn).split("\n") {
+      ln = ln + 1
+      if startsWith(lstripWs(line), "//") { continue }
+      let i = 0
+      while i < line.length {
+        if line[i] != 34 {
+          i = i + 1
+          continue
+        }
+        const e = literalEnd(line, i)
+        if e < 0 {
+          i = i + 1
+          continue
+        }
+        const t = stripWs(line.slice(i + 1, e))
+        if t.cpLen() >= 12 && concedes(t) && !first.has(t) {
+          first[t] = fn + ":" + toString(ln)
+        }
+        i = e + 1
+      }
+    }
+  }
+  const out: Lit[] = []
+  for t in sortStrings(first.keys()) {
+    out.push(
+      { loc: first[t] ?? "", text: t, hit: contains(corpus, cpPrefix(t, 60)) },
+    )
+  }
+  out
+}
+
+type Site = { literal: string, probe: string }
+
+function loadLiveSites(path: string): Site[] {
+  const out: Site[] = []
+  const j = parseJson(readText(path))
+  if j is JsonError {
+    die("goal-scoreboard: \{path} is not JSON: \{j.msg}", 1)
+    return out
+  }
+  if j is JsonMap {
+    const sites = j["sites"]
+    if sites is Json[] {
+      for s in sites {
+        if s is JsonMap {
+          const lit = s["literal"]
+          const probe = s["probe"]
+          if lit is string && probe is string {
+            out.push({ literal: lit, probe: probe })
+            continue
+          }
+        }
+        die("goal-scoreboard: a site in \{path} has no literal or probe", 1)
+      }
+      return out
+    }
+  }
+  die("goal-scoreboard: \{path} has no `sites` list", 1)
+  out
+}
+
+// ── the report ─────────────────────────────────────────────────────────────────────
+
+type Opts = { baseline: string, sites: boolean, top: i32, json: string }
+
+function printGroup(title: string, ids: string[], c: Cells, top: i32) {
+  if ids.length == 0 { return }
+  const t = tally()
+  for id in ids { bump(t, norm(cellAt(c, id).msg)) }
+  print("\{title}: \{ids.length} cells, \{t.keys.length} distinct messages")
+  let k = 0
+  for m in mostCommon(t) {
+    if k >= top { break }
+    print("  " + num(count(t, m), 5) + "  " + m)
+    k = k + 1
+  }
+  print("")
+}
+
+function jsonReport(o: Opts, by: Tally, nums: string[][]) {
+  const lines = ["{", "  \"by_class\": {"]
+  const classes = sortStrings(by.keys)
+  let i = 0
+  for k in classes {
+    const sep = if i + 1 < classes.length { "," } else { "" }
+    lines.push("    " + jsonStr(k) + ": " + toString(count(by, k)) + sep)
+    i = i + 1
+  }
+  lines.push("  },")
+  i = 0
+  for kv in nums {
+    const sep = if i + 1 < nums.length { "," } else { "" }
+    lines.push("  \"" + kv[0] + "\": " + kv[1] + sep)
+    i = i + 1
+  }
+  lines.push("}")
+  const w = writeTextFile(o.json, join(lines, "\n"))
+  if w != null { die("goal-scoreboard: cannot write \{o.json} (\{w.msg})", 1) }
+  print("wrote " + o.json)
+}
+
+function run(o: Opts): i32 {
+  const cells = loadCells(o.baseline)
+  const total = cells.order.length
+  if total == 0 {
+    die("goal-scoreboard: \{o.baseline} holds no cells", 1)
+    return 1
+  }
+  const by = tally()
+  const silent: string[] = []
+  const emit: string[] = []
+  const conceded: string[] = []
+  const msgs: string[] = []
+  for id in cells.order {
+    const v = cellAt(cells, id)
+    bump(by, v.cls)
+    msgs.push(v.msg)
+    // Clause 1 is defined by exclusion, so a new outcome class defaults to counted.
+    if (
+      v.cls != "runs"
+      && v.cls != "loud check reject"
+      && v.cls != "loud emit reject"
+    ) {
+      silent.push(id)
+    }
+    if v.cls == "loud emit reject" { emit.push(id) }
+    if v.cls == "loud check reject" && concedes(v.msg) { conceded.push(id) }
+  }
+  const runs = count(by, "runs")
+  const against = silent.length + emit.length + conceded.length
+  const pct = (runs as! f64) * 100.0 / (total as! f64)
+
+  print("corpus: \{total} cells   (\{relPath(o.baseline)})")
+  print("")
+  print(
+    "  SCOREBOARD   runs   "
+      + num(runs, 5)
+      + " / \{total}   "
+      + padLeft(fixed2(pct), 5, " ")
+      + "%",
+  )
+  print("")
+  print(
+    "  clause 1  soundness violated       "
+      + num(silent.length, 5)
+      + "  (check rc 0, then no correct run)",
+  )
+  print(
+    "  clause 2  emit rejected after check"
+      + num(emit.length, 5)
+      + "  (check rc 0, backend refused)",
+  )
+  print(
+    "  clause 2  refusal concedes type-valid "
+      + num(conceded.length, 3)
+      + "  (checker refuses what the type system allows)",
+  )
+  print("            ----------------------------------")
+  print("            total against the goal   " + num(against, 5))
+  print("")
+  printGroup("clause 1 — silent", silent, cells, o.top)
+  printGroup("clause 2 — emit reject", emit, cells, o.top)
+  printGroup("clause 2 — conceded", conceded, cells, o.top)
+
+  const sites = capabilityLiterals(join(msgs, " \n"))
+  let blind = 0
+  const worded: Map<string, boolean> = Map()
+  for s in sites {
+    if !s.hit { blind = blind + 1 }
+    worded[s.text] = true
+  }
+  const live = loadLiveSites(LIVE_SITES)
+  let extra = 0
+  for s in live {
+    if !worded.has(s.literal) { extra = extra + 1 }
+  }
+  print(
+    "  "
+      + padRight("capability refusal sites, by WORDING", 42)
+      + num(sites.length, 5)
+      + "  <- a LOWER BOUND, not the population",
+  )
+  print(
+    "    "
+      + padRight("of those, reached by NO corpus cell", 40)
+      + num(blind, 5)
+      + "  <- invisible to the scoreboard above",
+  )
+  print(
+    "  "
+      + padRight("capability refusal sites, by WITNESS", 42)
+      + num(live.length, 5)
+      + "  <- live-sites.json, one probe each",
+  )
+  print(
+    "    "
+      + padRight("of those the wording count cannot see", 40)
+      + num(extra, 5)
+      + "  <- clause-2 violations no phrase list finds",
+  )
+  print("")
+  if blind > 0 {
+    print(
+      "The corpus is generated over fixed axes, so it can only score a gap it has a",
+    )
+    print(
+      "program for. `runs` can reach 100% with every site below still refusing.",
+    )
+    print(
+      "`scripts/capability-probes/` holds a hand-written program per gap; run",
+    )
+    print(
+      "`vl run scripts/capability-probes.vl` to grade the ones covered so far.",
+    )
+    print("")
+  }
+  if o.sites {
+    print(
+      "  BY WORDING — every literal in compiler/*.vl whose SENTENCE concedes the",
+    )
+    print(
+      "  refused program was type-valid. A refusal is not obliged to concede, so this",
+    )
+    print(
+      "  is a floor: 517 of the compiler's 533 emit-side refusal sites say nothing",
+    )
+    print("  about legality and none of them can appear here.")
+    for s in sites {
+      const tag = if s.hit { "HIT " } else { "ZERO" }
+      print(
+        "  \{tag}  compiler/\{padRight(s.loc, 22)} \{pyRepr(cpPrefix(s.text, 60))}",
+      )
+    }
+    print("")
+    print(
+      "  (a gap moved into typecheck.vl stops looking like a gap — the program",
+    )
+    print(
+      "   compiles no better than before, so these count the same as emit-side ones)",
+    )
+    print("")
+    print(
+      "  BY WITNESS — a refusal literal some check-clean program provably reaches.",
+    )
+    print(
+      "  `vl run scripts/capability-probes.vl -- --live-sites` re-grades every row;",
+    )
+    print(
+      "  a witness that starts running comes OFF the list in the PR that closed it.",
+    )
+    for s in live {
+      const seen = if worded.has(s.literal) { "WORDED" } else { "UNSEEN" }
+      print(
+        "  \{seen}  \{padRight(pyRepr(cpPrefix(s.literal, 58)), 62)} \{s.probe}",
+      )
+    }
+    print("")
+  }
+  if o.json.length > 0 {
+    jsonReport(
+      o,
+      by,
+      [
+        ["capability_literals", toString(sites.length)],
+        ["capability_literals_uncovered", toString(blind)],
+        ["capability_sites_witnessed", toString(live.length)],
+        ["capability_sites_witnessed_unworded", toString(extra)],
+        ["clause1_silent", toString(silent.length)],
+        ["clause2_conceded", toString(conceded.length)],
+        ["clause2_emit_reject", toString(emit.length)],
+        ["runs", toString(runs)],
+        ["total", toString(total)],
+      ],
+    )
+  }
+  0
+}
+
+// ── arguments, read as Python argparse reads them ────────────────────────────────────
+
+const USAGE = "usage: goal-scoreboard.vl [-h] [--baseline BASELINE] [--sites] [--top TOP] [--json OUT]"
+
+function usageError(msg: string): i32 {
+  print(USAGE)
+  print("goal-scoreboard.vl: error: " + msg)
+  2
+}
+
+// The long option `arg` names, by exact spelling or unique prefix, or "" for none.
+function longOpt(arg: string): string {
+  if !startsWith(arg, "--") || arg.length < 3 { return "" }
+  let hit = ""
+  let n = 0
+  for o in ["--baseline", "--sites", "--top", "--json", "--help"] {
+    if o == arg { return o }
+    if startsWith(o, arg) {
+      hit = o
+      n = n + 1
+    }
+  }
+  if n == 1 { return hit }
+  ""
+}
+
+function main(args: string[]): i32 {
+  const o: Opts = {
+    baseline: DEFAULT_BASELINE,
+    sites: false,
+    top: 12,
+    json: "",
+  }
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    let val: string | null = null
+    const eq = findFrom(a, "=", 0)
+    if startsWith(a, "--") && eq > 0 {
+      val = a.slice(eq + 1, a.length)
+      a = a.slice(0, eq)
+    }
+    const opt = if a == "-h" { "--help" } else { longOpt(a) }
+    if opt == "--help" {
+      print(USAGE)
+      return 0
+    }
+    if opt == "--sites" && val == null {
+      o.sites = true
+      i = i + 1
+      continue
+    }
+    if opt != "--baseline" && opt != "--top" && opt != "--json" {
+      return usageError("unrecognized arguments: " + args[i])
+    }
+    let v = ""
+    if val is string {
+      v = val
+    } else if i + 1 < args.length && !startsWith(args[i + 1], "-") {
+      v = args[i + 1]
+      i = i + 1
+    } else {
+      return usageError("argument " + opt + ": expected one argument")
+    }
+    if opt == "--baseline" {
+      o.baseline = v
+    } else if opt == "--json" {
+      o.json = v
+    } else {
+      const n = parseI32(v)
+      if n is i32 {
+        o.top = n
+      } else {
+        return usageError("argument --top: invalid int value: " + pyRepr(v))
+      }
+    }
+    i = i + 1
+  }
+  run(o)
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("goal-scoreboard: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

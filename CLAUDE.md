@@ -355,7 +355,7 @@ the close.
 not a point on this scoreboard. The gate's floor (block on `runs → not-runs`) is unchanged; this
 is the number that is supposed to climb.
 
-**`scripts/goal-scoreboard.py` is the measurement — do not hand-count this.** It reads the
+**`vl run scripts/goal-scoreboard.vl` is the measurement — do not hand-count this.** It reads the
 corpus baseline and prints `runs` plus both clauses' violations, instantly, without compiling.
 On 2026-08-30: **runs 3,704 / 7,021 (52.76%)**, clause 1 **92**, clause 2 **314** emit rejects
 and **45** check rejects that concede type-validity — **451 cells against the goal**. It also
@@ -370,7 +370,7 @@ WORDING admits a capability gap, and a refusal is not obliged to admit one:
 `emitProgram: narrowed union atom has no value box` reads like an internal invariant, fires on
 a `vl check`-clean program, and is a clause-2 violation the count never saw. A floor no
 check-clean program can reach is NOT a violation, so only a WITNESS settles which sites count.
-`scripts/capability-probes/run.py` is therefore the instrument and `--sites` is the headline:
+`vl run scripts/capability-probes.vl` is therefore the instrument and `--sites` is the headline:
 when they disagree the probe is right, and **`--sites` reaching zero is not clause 2 being met**.
 
 **THE `[23, 405]` BOUND IS NOW MEASURED, AND "MOSTLY UNREACHABLE DEFENSIVE FLOORS" WAS WRONG.**
@@ -398,7 +398,7 @@ grades **21 LIVE / 20 UNREACHABLE / 7 UNDECIDED** — **≈226–302 reachable**
 159–368), while thirteen of the fourteen literals the predicate DOES match were witnessed as
 floors on 2026-09-02. **`scripts/capability-probes/live-sites.json` is the honest count**: one
 row per refusal literal a witness reaches, 21 of them, all invisible to the wording list;
-`run.py --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
+`capability-probes.vl --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
 probe. `docs/internals/emit-refusal-wording-2026-09.md`.
 
 **The corpus's emit-side evidence comes only from its CURATED half.** On 2026-10-11
@@ -451,7 +451,7 @@ answer.
 REFUSAL SITES, not gaps closed. D937 built the five sites an inferred nullable-MAP return needs
 and the literal count did not move by one — correctly, because the same literal still refuses
 every non-`i32`-valued map, and *should*. Read that as the site narrowing, not as the fix
-failing. **`scripts/capability-probes/run.py` is the finer instrument** and it did move (1/6 →
+failing. **`scripts/capability-probes.vl` is the finer instrument** and it did move (1/6 →
 2/6): one probe per gap, graded `RUNS` / `check refuses` / `emit refuses` / `SILENT`. Add a
 probe when you find a gap, and grade a capability change on the probe runner AND `--sites`,
 never on `--sites` alone.
