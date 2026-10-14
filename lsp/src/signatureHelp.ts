@@ -53,6 +53,7 @@
 import {
   type LexPos,
   type LexToken,
+  lineStarts,
   scanStringLiteral,
   scanTemplate,
   type TemplateHole,
@@ -157,15 +158,6 @@ const closersFor = (stack: Group[], callAt: number): string => {
     out += CLOSER_OF[stack[j].open];
   }
   return out;
-};
-
-/** Byte offsets of each line start, for turning `LexPos` back into an offset. */
-const lineStarts = (text: string): number[] => {
-  const starts = [0];
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "\n") starts.push(i + 1);
-  }
-  return starts;
 };
 
 /**

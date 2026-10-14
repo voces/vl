@@ -12,6 +12,7 @@
 //   • `"…"` strings and `'…'` char literals sharing one escape set
 //     (`\n \t \r \\ \" \' \0 \b \f \v \xXX \uXXXX \u{…}`, plus
 //     backslash-newline line continuation, unknown escapes kept verbatim).
+//     A `"` string may span lines; a `'` literal ends at a newline.
 //   • INTERPOLATION HOLES `\{…}`, legal in a `"…"` string AND in a backtick
 //     template — one trigger, one state machine (`scanHole`), reached from both
 //     literal scanners. A `"` inside a hole is not the string's terminator, so
@@ -29,9 +30,10 @@
 //     source, escapes undecoded, since no consumer reads a template's value for
 //     anything but a test name.
 //
-// Positions are 0-based LSP coordinates (`line` / `character`). `\r` is
-// whitespace, so a CRLF document tokenizes identically to an LF one — the
-// carriage return is skipped and the `\n` after it advances the line.
+// Positions are 0-based LSP coordinates (`line` / `character`). A line break is
+// `\n`, `\r\n` or a lone `\r`, as in the lexer, so CRLF, LF and CR-only
+// documents tokenize alike. `tests/lsp_lex_agreement_wasm_test.ts` holds this
+// file to the seed's lexer over `tests/cases/`.
 //
 // Consumers: `testDiscovery.ts` (comments dropped — the `describe`/`it` scan
 // wants a token stream where "identifier immediately followed by `(`" means a
@@ -126,10 +128,6 @@ export interface StringScan {
   /** Index one past the closing quote (or past where the scan gave up). */
   next: number;
   terminated: boolean;
-  /** Newlines consumed by line continuations, for position tracking. */
-  lineBreaks: number;
-  /** Index of the last newline consumed, or -1. */
-  lastBreak: number;
 }
 
 /**
@@ -150,22 +148,37 @@ export const scanStringLiteral = (
   from: number,
   holes?: TemplateHole[],
 ): StringScan => {
+  const mark = holes?.length ?? 0;
+  const whole = scanQuoted(source, from, holes, false);
+  if (whole.terminated || source[from] !== '"') return whole;
+  holes?.splice(mark);
+  return scanQuoted(source, from, holes, true);
+};
+
+const scanQuoted = (
+  source: string,
+  from: number,
+  holes: TemplateHole[] | undefined,
+  stopAtNewline: boolean,
+): StringScan => {
   const quote = source[from];
   const interpolates = quote === '"';
   let value = "";
   let i = from + 1;
-  let lineBreaks = 0;
-  let lastBreak = -1;
   while (i < source.length) {
     const c = source[i];
-    if (c === quote) {
-      return { value, next: i + 1, terminated: true, lineBreaks, lastBreak };
-    }
-    if (c === "\n") {
-      // An unescaped newline ends the literal in the lexer too (unterminated).
-      // A hole's newlines are NOT this rule's business — a hole is an expression
-      // and may span lines — and they are consumed by `scanHole` below.
-      return { value, next: i, terminated: false, lineBreaks, lastBreak };
+    if (c === quote) return { value, next: i + 1, terminated: true };
+    if (c === "\n" || c === "\r") {
+      // A raw newline ends a char literal (unterminated) and is CONTENT in a `"`
+      // literal, as in the lexer. An unterminated `"` gives up at its first raw
+      // newline instead of at EOF, so one quote typed mid-edit does not swallow
+      // the rest of the document.
+      if (!interpolates || stopAtNewline) {
+        return { value, next: i, terminated: false };
+      }
+      value += c;
+      i++;
+      continue;
     }
     if (c !== "\\") {
       value += c;
@@ -176,22 +189,15 @@ export const scanStringLiteral = (
     if (e === undefined) break;
     if (interpolates && e === "{") {
       const hole = scanHole(source, i, holes);
-      // A hole may span lines; the caller tracks position from these.
-      for (let k = i; k < hole.next; k++) {
-        if (source[k] === "\n") {
-          lineBreaks++;
-          lastBreak = k;
-        }
-      }
       value += source.slice(i, hole.next);
       i = hole.next;
       continue;
     }
-    if (e === "\n") {
-      // Line continuation: the backslash and the newline both disappear.
-      lineBreaks++;
-      lastBreak = i + 1;
-      i += 2;
+    if (e === "\n" || e === "\r") {
+      // Line continuation: the backslash, the newline and the next line's
+      // indentation all disappear.
+      i += source[i + 2] === "\n" && e === "\r" ? 3 : 2;
+      while (source[i] === " " || source[i] === "\t") i++;
       continue;
     }
     if (e === "x") {
@@ -225,7 +231,7 @@ export const scanStringLiteral = (
     value += SIMPLE_ESCAPES[e] ?? e;
     i += 2;
   }
-  return { value, next: source.length, terminated: false, lineBreaks, lastBreak };
+  return { value, next: source.length, terminated: false };
 };
 
 /** A `\{…}` hole's CONTENT span — offsets into the source, `\{` and `}` excluded. */
@@ -316,6 +322,21 @@ export const scanTemplate = (
 };
 
 /**
+ * The offset of each line's first character, line 0 first, breaking where
+ * {@link tokenize} does — so a `LexPos` maps back to an offset as `starts[line]
+ * + character`.
+ */
+export const lineStarts = (text: string): number[] => {
+  const starts = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n" || (text[i] === "\r" && text[i + 1] !== "\n")) {
+      starts.push(i + 1);
+    }
+  }
+  return starts;
+};
+
+/**
  * Every token that matters, in order. Whitespace is dropped; comments are
  * dropped unless `opts.comments`. A TERMINATED char literal is dropped too (it
  * can never be a name and it can hold a `"` that would otherwise derail the
@@ -335,29 +356,38 @@ export const tokenize = (
     line,
     character: idx - lineStart,
   });
+  // Advances `line`/`lineStart` over the line breaks in `[from, to)`: `\n`,
+  // `\r\n`, or a lone `\r` — the lexer's three, so a literal spanning lines
+  // moves the cursor exactly as a newline outside one does.
+  const crossBreaks = (from: number, to: number): void => {
+    for (let k = from; k < to; k++) {
+      const ch = source[k];
+      if (ch === "\n" || (ch === "\r" && source[k + 1] !== "\n")) {
+        line++;
+        lineStart = k + 1;
+      }
+    }
+  };
   while (i < source.length) {
     const c = source[i];
-    if (c === "\n") {
-      line++;
+    if (c === "\n" || c === "\r") {
+      crossBreaks(i, i + 1);
       i++;
-      lineStart = i;
       continue;
     }
-    if (c === " " || c === "\t" || c === "\r" || c === "\f" || c === "\v") {
+    if (c === " " || c === "\t" || c === "\f" || c === "\v") {
       i++;
       continue;
     }
     if (c === "/" && source[i + 1] === "/") {
-      const nl = source.indexOf("\n", i);
-      const stop = nl < 0 ? source.length : nl;
+      let stop = i;
+      while (stop < source.length && source[stop] !== "\n" && source[stop] !== "\r") stop++;
       if (opts.comments === true) {
-        // A CRLF document's `\r` belongs to the line break, not the comment.
-        const textEnd = stop > i && source[stop - 1] === "\r" ? stop - 1 : stop;
         toks.push({
           kind: "comment",
-          s: source.slice(i, textEnd),
+          s: source.slice(i, stop),
           start: posAt(i),
-          end: posAt(textEnd),
+          end: posAt(stop),
         });
       }
       i = stop;
@@ -366,13 +396,7 @@ export const tokenize = (
     if (c === "`") {
       const start = posAt(i);
       const scan = scanTemplate(source, i);
-      const raw = source.slice(i, scan.next);
-      // A template is multiline by design, so its own newlines move the cursor.
-      const nl = raw.lastIndexOf("\n");
-      if (nl >= 0) {
-        for (let k = 0; k < raw.length; k++) if (raw[k] === "\n") line++;
-        lineStart = i + nl + 1;
-      }
+      crossBreaks(i, scan.next);
       const end = posAt(scan.next);
       if (scan.terminated) {
         toks.push({
@@ -391,10 +415,7 @@ export const tokenize = (
     if (c === '"' || c === "'") {
       const start = posAt(i);
       const scan = scanStringLiteral(source, i);
-      if (scan.lineBreaks > 0) {
-        line += scan.lineBreaks;
-        lineStart = scan.lastBreak + 1;
-      }
+      crossBreaks(i, scan.next);
       const end = posAt(scan.next);
       if (c === '"' && scan.terminated) {
         toks.push({ kind: "str", s: scan.value, start, end });
@@ -419,12 +440,18 @@ export const tokenize = (
     }
     if (isDigit(code)) {
       // A numeric run is one opaque token — never a call target, and keeping it
-      // whole stops `1.0` from emitting a `.` that would gate a later ident.
+      // whole stops `1.0` from emitting a `.` that would gate a later ident. A
+      // decimal exponent's sign belongs to it (`1e-5`); in `0x1e-5` it does not.
       const from = i;
+      const radix = source[i] === "0" && /[xXbBoO]/.test(source[i + 1] ?? "");
       while (i < source.length) {
         const cc = source.charCodeAt(i);
         if (isIdentPart(cc)) i++;
         else if (source[i] === "." && isDigit(source.charCodeAt(i + 1))) i++;
+        else if (
+          !radix && (source[i] === "+" || source[i] === "-") &&
+          (source[i - 1] === "e" || source[i - 1] === "E")
+        ) i++;
         else break;
       }
       toks.push({

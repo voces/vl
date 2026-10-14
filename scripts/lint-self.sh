@@ -36,7 +36,7 @@
 #     the next one added.
 #   * `scripts/capability-probes/matrix/` — a `*.matrix.vl` is a TEMPLATE, not a program:
 #     `// @@SECTION@@` blocks holding a prelude, a bare type spelling and free-text reasons,
-#     from which `matrix.py` GENERATES the programs a compiler sees. The hand-written probes
+#     from which `capability-matrix.vl` GENERATES the programs a compiler sees. The hand-written probes
 #     beside it are still checked.
 #
 # Unlike the lint above, fmt is PER-FILE (it needs no cross-file resolution), so the files

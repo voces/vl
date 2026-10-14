@@ -54,11 +54,13 @@ SEED="${SEED:-build/vl-compiler.wasm}"
 OUT="${OUT:-build/vl-compiler.wasm}"
 FALLBACK=1
 PROVE=0
+WARM_FUEL=--fuel
 for arg in "$@"; do
   case "$arg" in
     --no-fallback) FALLBACK=0 ;;
     --prove-fixpoint) PROVE=1 ;;
-    *) echo "usage: refresh-compiler.sh [--no-fallback] [--prove-fixpoint]" >&2; exit 2 ;;
+    --no-fuel-sidecars) WARM_FUEL="" ;;
+    *) echo "usage: refresh-compiler.sh [--no-fallback] [--prove-fixpoint] [--no-fuel-sidecars]" >&2; exit 2 ;;
   esac
 done
 
@@ -226,7 +228,8 @@ fi
 # WARM EVERY ENGINE TAG, not just the one this script happened to make: each keeps its own
 # sidecar, and a cold one at the start of a parallel suite has every worker re-JIT the seed
 # (docs/internals/perf-opportunities-2026-09.md §A5, item 3). scripts/warm-seed.sh owns the list.
-VL="$VL" scripts/warm-seed.sh --fuel "$OUT"
+# shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
+VL="$VL" scripts/warm-seed.sh $WARM_FUEL "$OUT"
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi

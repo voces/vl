@@ -37,6 +37,22 @@ const COMPILER = Deno.env.get("VL_SCALING_COMPILER") ?? `${ROOT}/build/vl-compil
 const ENABLED = exists(VL) && exists(COMPILER);
 if (!ENABLED) console.warn("[scaling-shape] skipped — missing vl binary or seed wasm.");
 
+// `$VL_SCALING_SHARD=k/n` runs every n-th registered case starting at the k-th, so ci.yml's
+// cost matrix can split the file across jobs; unset runs them all. Every grade is a fuel or
+// CPU ratio inside one case, so which job a case lands in cannot move its verdict.
+const SHARD = (() => {
+  const spec = Deno.env.get("VL_SCALING_SHARD") ?? "1/1";
+  const m = spec.match(/^(\d+)\/(\d+)$/);
+  const k = m ? Number(m[1]) : 0, n = m ? Number(m[2]) : 0;
+  if (!(n >= 1 && k >= 1 && k <= n)) throw new Error(`VL_SCALING_SHARD must be k/n with 1 <= k <= n, got ${spec}`);
+  return { k, n };
+})();
+let registered = 0;
+const shardTest = (def: Deno.TestDefinition) => {
+  const mine = registered++ % SHARD.n === SHARD.k - 1;
+  Deno.test({ ...def, ignore: (def.ignore ?? false) || !mine });
+};
+
 // Statements every pair repeats verbatim on BOTH sides. They damp the source-byte
 // asymmetry the extra declarations introduce and lift the cheaper arm clear of the
 // process-start floor, so the ratio stays a ratio rather than becoming a budget.
@@ -609,7 +625,7 @@ const twoFiles = (dir: string, many: string, one: string): [string, string] => {
 };
 
 const axis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
-  Deno.test({
+  shardTest({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
     fn: async () => {
@@ -1612,7 +1628,7 @@ const genJoinBuild = (n: number): string =>
     "",
   ].join("\n");
 
-Deno.test({
+shardTest({
   name: "scaling shape: string append loop",
   ignore: !ENABLED,
   fn: async () => {
@@ -1660,7 +1676,7 @@ const genGlobalJoinBuild = (n: number): string =>
     "",
   ].join("\n");
 
-Deno.test({
+shardTest({
   name: "scaling shape: module-global string append loop",
   ignore: !ENABLED,
   fn: async () => {
@@ -1727,7 +1743,7 @@ const genPlaceJoinBuild = (n: number): string =>
     "",
   ].join("\n");
 
-Deno.test({
+shardTest({
   name: "scaling shape: place string append loop",
   ignore: !ENABLED,
   fn: async () => {
@@ -1992,7 +2008,7 @@ const gradeAllocPair = async (
 };
 
 const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
-  Deno.test({
+  shardTest({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
     fn: async () => {
@@ -2158,7 +2174,7 @@ const fnFlowRatio = (mode: number): number => {
   return fnFlowWork(mod, genFnFlowChain(64), mode) / fnFlowWork(mod, genFnFlowOne(64), mode);
 };
 
-Deno.test({
+shardTest({
   name: "scaling shape: fn-flow",
   ignore: !exists(COMPILER),
   fn() {
@@ -2173,7 +2189,7 @@ Deno.test({
   },
 });
 
-Deno.test({
+shardTest({
   name: "scaling shape: control — a flow table keyed by call path reds fn-flow",
   ignore: !exists(COMPILER),
   fn() {
@@ -2214,7 +2230,7 @@ const genNestedLoop = (n: number, inner: number): string =>
     "",
   ].join("\n");
 
-Deno.test({
+shardTest({
   name: "scaling shape: control — a quadratic arm reds",
   ignore: !ENABLED,
   fn: async () => {
@@ -2259,7 +2275,7 @@ const genStatements = (n: number): string => {
   return o.join("\n") + "\n";
 };
 
-Deno.test({
+shardTest({
   name: "scaling shape: control — twenty times the work reds the fuel grader",
   ignore: !ENABLED,
   fn: async () => {
@@ -2282,7 +2298,7 @@ Deno.test({
 
 // THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
 // (reads about 5.5: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
-Deno.test({
+shardTest({
   name: "scaling shape: control — twenty times the work reds the allocation grader",
   ignore: !ENABLED,
   fn: async () => {

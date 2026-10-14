@@ -193,8 +193,8 @@ export type ExtLexicalToken = {
 };
 
 // The wasm lexical-token enum → its index in {@link SEMANTIC_TOKEN_TYPES}. Kept
-// in lockstep with the driver's `lexClassOf` (scripts/vl-compiler-driver.vl),
-// which is the source of truth for these class numbers.
+// in lockstep with `lexClassOf` (`compiler/driver.vl`), which is the source of
+// truth for these class numbers.
 const LEX_CLASS_TOKEN_TYPE: Record<number, number> = {
   0: TT.keyword,
   1: TT.operator,
@@ -1550,11 +1550,13 @@ const escapeRegExp = (s: string): string =>
  * mirror of `modResolveSpecifier` (`compiler/driver.vl`): a well-formed `std:`
  * specifier IS its key (verbatim); a relative specifier resolves against
  * `fromKey`'s directory with `.`/`..` normalization and `.vl` appended;
- * everything else (bare specifiers, relative-inside-std) is unresolvable.
+ * everything else (bare specifiers, a backslash anywhere, relative-inside-std)
+ * is unresolvable. `tests/lsp_rename_wasm_test.ts` holds it to the seed.
  */
 export const resolveImportSpecifier = (spec: string, fromKey: string): string => {
   if (/^std:[a-z0-9_]+(\/[a-z0-9_]+)*$/.test(spec)) return spec;
   if (!spec.startsWith("./") && !spec.startsWith("../")) return "";
+  if (spec.includes("\\")) return "";
   if (isStdKey(fromKey)) return "";
   const slash = fromKey.lastIndexOf("/");
   const base = slash >= 0 ? fromKey.slice(0, slash) : "";
