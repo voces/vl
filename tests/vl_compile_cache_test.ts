@@ -513,7 +513,9 @@ testOpt("-O3: an explain variable bypasses the chain, stores nothing", async () 
 // someone deciding which it is.
 const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   checkEntryPathCommit: "input", checkEntryPathPush: "input", cliArgCommit: "input",
-  cliArgPush: "input", cliArgReset: "input", cliCmdData: "output", cliCmdPath: "output",
+  cliArgPush: "input", cliArgReset: "input", cliCheckNextRoot: "uncached",
+  cliCheckPoolStage: "uncached", cliCheckPooledCommit: "uncached",
+  cliCheckPresetRoot: "uncached", cliCmdData: "output", cliCmdPath: "output",
   cliDirCommit: "input", cliDirEntryPush: "uncached", cliDirNamePush: "uncached",
   cliExitCode: "output", cliFileCommit: "input", cliNext: "output", cliResult: "input",
   cliTestCompiledCommit: "uncached", cliTestFileCommit: "uncached",
@@ -554,7 +556,8 @@ const COMMANDS: Record<string, "input" | "output" | "uncached"> = {
   CMD_WRITE_FILE: "uncached", CMD_PRINT_OUT: "output", CMD_PRINT_ERR: "output",
   CMD_READ_STDIN: "uncached", CMD_TEST_STASH: "output", CMD_TEST_COLLECT: "uncached",
   CMD_TEST_RUN: "uncached", CMD_VALIDATE: "uncached", CMD_TEST_ENQUEUE: "uncached",
-  CMD_TEST_COMPILE: "uncached",
+  CMD_TEST_COMPILE: "uncached", CMD_CHECK_ENQUEUE: "uncached", CMD_CHECK_POOL: "uncached",
+  CMD_CHECK_ROOT_DONE: "uncached",
 };
 
 Deno.test("compile cache: the seed is keyed on the bytes that compile, read once", async () => {

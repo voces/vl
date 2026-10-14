@@ -7227,6 +7227,29 @@ fn test_compile_workers(requested: i32, files: usize) -> usize {
     workers.min(cap).max(1)
 }
 
+/// What one `vl check` root worker is assumed to hold. A worker's instance is reused
+/// across roots and a wasm heap never shrinks, so it keeps the largest root's peak:
+/// checking `compiler/entry.vl` alone peaks at 1.1 GB.
+const CHECK_ROOT_BUDGET: u64 = 2 << 30;
+
+/// The check pool's worker ceiling unless `$VL_JOBS` names a count. Headroom is read
+/// once at start, and the gate runs several multi-root checks at once that each read the
+/// same figure, so a wider default let earlyoom kill a pooled check under a loaded box.
+const CHECK_POOL_MAX: usize = 2;
+
+/// How many instances a multi-root `vl check` runs at once: `test_compile_workers`'s
+/// rule at `CHECK_ROOT_BUDGET` a worker, and at most `CHECK_POOL_MAX` unless
+/// `$VL_JOBS` is set. Never below 1.
+fn check_root_workers(roots: usize) -> usize {
+    let workers = test_worker_count(0).min(roots);
+    let cap = match memory_headroom() {
+        Some(bytes) => (bytes / 2 / CHECK_ROOT_BUDGET) as usize,
+        None => TEST_COMPILE_UNMEASURED_CAP,
+    };
+    let ceiling = if vl_jobs().is_some() { usize::MAX } else { CHECK_POOL_MAX };
+    workers.min(cap).min(ceiling).max(1)
+}
+
 /// The memory this process may still take, in bytes: the smaller of the system's
 /// `MemAvailable` and its cgroup v2 headroom (`memory.max` minus `memory.current`, when
 /// `memory.max` is not `max`), so a container's limit counts as much as the machine's.
@@ -7362,6 +7385,152 @@ fn compile_test_file_cold(
     })
 }
 
+/// One `vl check` root-pool worker: a compiler instance on `module`, given the run's own
+/// argv and the parent's walk (`cliCheckPresetRoot`), driven in check-one mode
+/// (`cliCheckPoolStage(2, pick)`) to check the roots it is handed one at a time. Anything
+/// but a file read (a directory listing, a print) defers the root to the parent.
+/// Starting an instance costs far more than a small root, so one instance checks root
+/// after root (`cliCheckNextRoot`), exactly as the in-process loop would, a deferred root
+/// included; only a fault or an unexpected command retires it.
+struct CheckWorker {
+    store: Store<()>,
+    next: TypedFunc<(), i32>,
+    next_root: TypedFunc<i32, i32>,
+    cmd_path: StrOut,
+    cmd_data: StrOut,
+    result_in: StrIn,
+    file_commit: TypedFunc<i32, i32>,
+    exit_code: TypedFunc<(), i32>,
+}
+
+impl CheckWorker {
+    fn start(
+        engine: &Engine,
+        module: &Module,
+        source: &CompilerSource,
+        argv: &[String],
+        roots: &[(String, i32)],
+        pick: usize,
+    ) -> Result<Self> {
+        let (mut store, inst) = instantiate_compiler(engine, module, source)?;
+        let arg_reset = inst.get_typed_func::<(), i32>(&mut store, "cliArgReset")?;
+        let arg_push = inst.get_typed_func::<i32, i32>(&mut store, "cliArgPush")?;
+        let arg_commit = inst.get_typed_func::<(), i32>(&mut store, "cliArgCommit")?;
+        arg_reset.call(&mut store, ())?;
+        for a in argv {
+            for ch in a.chars() {
+                arg_push.call(&mut store, ch as i32)?;
+            }
+            arg_commit.call(&mut store, ())?;
+        }
+        stage_vl_root_and_cwd(&mut store, &inst)?;
+        inst.get_typed_func::<(i32, i32), i32>(&mut store, "cliCheckPoolStage")?
+            .call(&mut store, (2, pick as i32))?;
+        // The parent's walk, root by root, so this instance never lists a directory.
+        let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
+        let preset = inst.get_typed_func::<i32, i32>(&mut store, "cliCheckPresetRoot")?;
+        for (path, from_dir) in roots {
+            result_in.send(&mut store, path)?;
+            preset.call(&mut store, *from_dir)?;
+        }
+        Ok(CheckWorker {
+            next: inst.get_typed_func::<(), i32>(&mut store, "cliNext")?,
+            next_root: inst.get_typed_func::<i32, i32>(&mut store, "cliCheckNextRoot")?,
+            cmd_path: StrOut::probe(&mut store, &inst, "cliCmdPath")?,
+            cmd_data: StrOut::probe(&mut store, &inst, "cliCmdData")?,
+            result_in,
+            file_commit: inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?,
+            exit_code: inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?,
+            store,
+        })
+    }
+
+    /// Run to the end of the current root. `Some(payload)` is that root's whole
+    /// contribution to the report; `None` asks the parent to check it itself. The flag is
+    /// whether this instance may take another root: true after a clean deferral (any
+    /// non-zero code), false after any command the pool does not service.
+    fn run_root(&mut self) -> Result<(Option<String>, bool)> {
+        let store = &mut self.store;
+        loop {
+            match self.next.call(&mut *store, ())? {
+                CMD_CHECK_ROOT_DONE => break,
+                CMD_READ_FILE => match read_module_key(&self.cmd_path.read(&mut *store)?) {
+                    Some(s) => {
+                        self.result_in.send(&mut *store, &s)?;
+                        self.file_commit.call(&mut *store, 1)?;
+                    }
+                    None => {
+                        self.file_commit.call(&mut *store, 0)?;
+                    }
+                },
+                _ => return Ok((None, false)),
+            }
+        }
+        match self.exit_code.call(&mut *store, ())? {
+            0 => Ok((Some(self.cmd_data.read(&mut *store)?), true)),
+            _ => Ok((None, true)),
+        }
+    }
+}
+
+/// Check the `n` queued roots on `workers` threads, each keeping one `CheckWorker` for as
+/// many roots as it can. A root whose worker deferred or failed comes back `None`, so the
+/// parent checks it and a compiler fault surfaces exactly as it would have; only after a
+/// failure does the thread start a fresh instance for its next root.
+fn check_roots_pooled(
+    engine: &Engine,
+    module: &Module,
+    source: &CompilerSource,
+    argv: &[String],
+    roots: &[(String, i32)],
+    workers: usize,
+) -> Vec<Option<String>> {
+    let n = roots.len();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cursor = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<String>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let work = || {
+        let mut worker: Option<CheckWorker> = None;
+        loop {
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let t0 = std::time::Instant::now();
+            let outcome = (|| -> Result<(Option<String>, bool)> {
+                match worker.as_mut() {
+                    Some(w) => {
+                        w.next_root.call(&mut w.store, i as i32)?;
+                    }
+                    None => worker = Some(CheckWorker::start(engine, module, source, argv, roots, i)?),
+                }
+                match worker.as_mut() {
+                    Some(w) => w.run_root(),
+                    None => Ok((None, false)),
+                }
+            })();
+            let (payload, keep) = outcome.unwrap_or((None, false));
+            if !keep {
+                worker = None;
+            }
+            if test_trace_on() {
+                let how = if payload.is_some() { "pooled" } else { "deferred" };
+                eprintln!("vl-test-trace check root={i} ms={} {how}", t0.elapsed().as_millis());
+            }
+            *slots[i].lock().unwrap() = payload;
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..workers.max(1).min(n) {
+            let builder = std::thread::Builder::new().stack_size(MAIN_THREAD_STACK);
+            if builder.spawn_scoped(scope, &work).is_err() {
+                break;
+            }
+        }
+    });
+    slots.into_iter().map(|s| s.into_inner().unwrap()).collect()
+}
+
 /// Whether `$VL_TEST_TRACE=1` asked for the per-file scheduling trace below.
 fn test_trace_on() -> bool {
     std::env::var("VL_TEST_TRACE")
@@ -7411,6 +7580,9 @@ const CMD_TEST_RUN: i32 = 9;
 const CMD_VALIDATE: i32 = 10;
 const CMD_TEST_ENQUEUE: i32 = 11;
 const CMD_TEST_COMPILE: i32 = 12;
+const CMD_CHECK_ENQUEUE: i32 = 13;
+const CMD_CHECK_POOL: i32 = 14;
+const CMD_CHECK_ROOT_DONE: i32 = 15;
 
 // ── TEST-ONLY fault injection ($VL_FAULT_INJECT) ──────────────────────────────
 //
@@ -8140,6 +8312,11 @@ fn cli_pump(args: &[String]) -> Result<()> {
         if let Ok(stage) = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPoolStage") {
             stage.call(&mut store, 1)?;
         }
+        // `vl check`'s root pool, the same way: a seed without it checks every root here.
+        if let Ok(stage) = inst.get_typed_func::<(i32, i32), i32>(&mut store, "cliCheckPoolStage")
+        {
+            stage.call(&mut store, (1, -1))?;
+        }
     }
 
     let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
@@ -8158,6 +8335,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let mut test_queue: Vec<String> = Vec::new();
     let mut test_regs: Vec<TestRegistry> = Vec::new();
     let mut test_engine_slot: Option<Engine> = None;
+    let mut check_queue: Vec<(String, i32)> = Vec::new();
 
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
@@ -8291,6 +8469,51 @@ fn cli_pump(args: &[String]) -> Result<()> {
                         }
                         Ok(Err(text)) => {
                             result_in.send(&mut store, &text)?;
+                            commit.call(&mut store, 1)?;
+                        }
+                    }
+                }
+            }
+            CMD_CHECK_ENQUEUE => {
+                let path = cmd_path.read(&mut store)?;
+                let from_dir = cmd_data.read(&mut store)?.parse::<i32>().unwrap_or(0);
+                check_queue.push((path, from_dir));
+            }
+            CMD_CHECK_POOL => {
+                // Check every queued root, each in a fresh compiler instance given this
+                // run's argv, and commit the outcomes back IN QUEUE ORDER: the brain folds
+                // each payload in where checking the root itself would have reported it,
+                // and checks any root whose worker handed none back itself.
+                let workers = check_root_workers(check_queue.len());
+                if test_trace_on() {
+                    eprintln!("vl-test-trace workers phase=check n={workers}");
+                }
+                let commit =
+                    inst.get_typed_func::<i32, i32>(&mut store, "cliCheckPooledCommit")?;
+                let mut argv: Vec<String> = args.to_vec();
+                argv.push(color_arg.to_string());
+                let queue = std::mem::take(&mut check_queue);
+                // One worker would only move the work into a second instance, so
+                // `VL_JOBS=1` (or no memory for two) keeps every root in this one.
+                let outcomes: Vec<Option<String>> = if workers <= 1 {
+                    queue.iter().map(|_| None).collect()
+                } else {
+                    check_roots_pooled(
+                        &engine,
+                        &compiler_module,
+                        &compiler,
+                        &argv,
+                        &queue,
+                        workers,
+                    )
+                };
+                for outcome in outcomes {
+                    match outcome {
+                        Some(payload) => {
+                            result_in.send(&mut store, &payload)?;
+                            commit.call(&mut store, 0)?;
+                        }
+                        None => {
                             commit.call(&mut store, 1)?;
                         }
                     }
