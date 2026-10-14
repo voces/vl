@@ -19,7 +19,7 @@ From the repo root, after `bash scripts/agent-setup.sh`:
     #            (17,880 cells: 9,330 at scope=fn, 8,550 at scope=mod)
     python3 scratch-silent/gen.py       scratch-silent/cells2
     bash    scratch-silent/sweep.sh     scratch-silent/cells2 scratch-silent/res-main2
-    python3 scratch-silent/grade.py     scratch-silent/cells2 scratch-silent/res-main2 \
+    vl run  scripts/silent-sweep/grade.vl -- scratch-silent/cells2 scratch-silent/res-main2 \
             --csv scratch-silent/main2.csv
     python3 scratch-silent/pairscope.py scratch-silent/main2.csv
 
@@ -29,7 +29,7 @@ From the repo root, after `bash scripts/agent-setup.sh`:
     # declaration-ORDER grid  (219 cells)
     python3 scratch-silent/genorder.py  scratch-silent/cellsG
     bash    scratch-silent/sweep.sh     scratch-silent/cellsG scratch-silent/res-G
-    python3 scratch-silent/grade.py     scratch-silent/cellsG scratch-silent/res-G \
+    vl run  scripts/silent-sweep/grade.vl -- scratch-silent/cellsG scratch-silent/res-G \
             --csv scratch-silent/G.csv
 
     # grader sabotage — MUST report 15 wrong_value / 10 wrong_evalcount / 8 trap / 5 correct
@@ -37,7 +37,7 @@ From the repo root, after `bash scripts/agent-setup.sh`:
     #  the extra 8 make every column fire again in the module-scope shape the axis added)
     python3 scratch-silent/sabotage.py  scratch-silent/sab
     bash    scratch-silent/sweep.sh     scratch-silent/sab scratch-silent/res-sab
-    python3 scratch-silent/grade.py     scratch-silent/sab scratch-silent/res-sab \
+    vl run  scripts/silent-sweep/grade.vl -- scratch-silent/sab scratch-silent/res-sab \
             --csv scratch-silent/sab.csv
 
 ## Read it
@@ -89,7 +89,7 @@ reproduces the pre-axis grid.
 
 * **One result file per cell** (`runcell.sh` writes `<cell>.res`, never appends to a shared
   file), so `-P4` cannot tear a record.
-* `grade.py` prints `cells=N result_files=N MATCH=OK` and counts a missing result as its own
+* `grade.vl` prints `cells=N result_files=N MATCH=OK` and counts a missing result as its own
   column — a truncated sweep is loud, not a smaller population.
 * Cells are graded on the **run value**, never the build verdict.
 * `runcell.sh` runs a third `vl build` stage only when the run stage failed, to separate a

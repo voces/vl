@@ -438,7 +438,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   ratio held at 6–8× across all five master heads the branch was rebased onto.
   Guard: the `functions` pair of `tests/vl_scaling_shape_test.ts` (folded in from
   `tests/vl_module_predicate_scan_test.ts`), 1.0× after against 5.8× before.
-  Method: `docs/internals/profiling-the-compiler.md` + `scripts/profile-rank.py`. **NEXT on
+  Method: `docs/internals/profiling-the-compiler.md` + `scripts/profile-rank.vl`. **NEXT on
   this axis**, from the post-fix profile: `__str_eq__` at 19.2% self is the name-keyed
   registries doing linear lookups (`isUName`, `variantIndexOf`, `declaredSlotOf`,
   `__map_probe__`) — the registry-keying design track item 4 opened, not a hot-spot fix.

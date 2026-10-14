@@ -7,7 +7,7 @@ so build the seed with `--names` first — and profile with that seed, never shi
 ```sh
 vl build compiler/entry.vl -o /tmp/names.wasm --names --compiler build/vl-compiler.wasm
 VL_PROFILE_GUEST=/tmp/p.json vl check compiler/typecheck.vl --compiler /tmp/names.wasm
-python3 scripts/profile-rank.py /tmp/p.json 20      # rank by SELF time
+vl run scripts/profile-rank.vl -- /tmp/p.json 20   # rank by SELF time
 ```
 
 **EVERY ENTRY THE HOST DRIVES TAKES IT** — `check`, `build`, `run`, `fmt`, `test`, and the
@@ -20,7 +20,7 @@ never reaches (0.12 vs 0.84 CPU-s on one 17,600-line file).
 
 **ALLOCATION, NOT TIME: `VL_PROFILE_GUEST_ALLOC=1`.** The host then weights each sample by the
 bytes its resident set grew since the previous one. Under the null collector, which never frees,
-that growth is what the compiler allocated, so `profile-rank.py <p.json> 30 --alloc` ranks
+that growth is what the compiler allocated, so `profile-rank.vl -- <p.json> 30 --alloc` ranks
 functions by bytes. Read the INCL column: a sample's leaf is whatever ran when the epoch ticked,
 which is not always the allocator. Under `VL_FUEL=1`, `vl build` also prints `[alloc] guest:
 <bytes>`, the resident growth across the compile call, and `tests/vl_scaling_shape_test.ts`
@@ -48,7 +48,7 @@ Notes, each of which cost something to learn:
   normal run never reads it. The merge-gate guard is still `tests/vl_scaling_shape_test.ts`'s
   ratio, because a ratio needs no seed built with `--names`.
 * **Rank by SELF time, not inclusive.** A whole-arena scan called from one place shows up as
-  ~all self; a dispatcher shows up as ~all inclusive. `profile-rank.py` prints both.
+  ~all self; a dispatcher shows up as ~all inclusive. `profile-rank.vl` prints both.
 * **`__str_eq__` high in the list is a symptom, not a site** — it is the name-keyed
   registries (`isUName`, `variantIndexOf`, `declaredSlotOf`, `__map_probe__`) doing linear
   lookups. `python3 scripts/perf/profile-parents.py` ranks the immediate PARENT frame of every
