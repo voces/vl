@@ -181,6 +181,12 @@ const CMD_VALIDATE = 10 // validate the module now in rbyte*; report engine verd
 // state machine in compile-one mode (`cliTestPoolMode == 2`).
 const CMD_TEST_ENQUEUE = 11 // queue test file `cliCmdPath` for the compile pool
 const CMD_TEST_COMPILE = 12 // compile every queued file; commit each outcome in order
+// `vl check`'s root pool. A root's report is its whole graph checked with it as the
+// entry, so two roots share no result; they run in fresh instances instead, each one
+// this machine in check-one mode (`cliCheckPoolMode == 2`).
+const CMD_CHECK_ENQUEUE = 13   // queue check root `cliCmdPath` for the root pool
+const CMD_CHECK_POOL = 14      // check every queued root; commit each outcome in order
+const CMD_CHECK_ROOT_DONE = 15 // worker: root `cliCheckPick` is done (`cliExit`, `cliCmdData`)
 
 // The process exit codes (`docs/internals/cli-design.md` §Exit codes). The host reports
 // the same table, and `tests/cli_host_tables_test.ts` holds the two equal.
@@ -219,6 +225,9 @@ const ST_BUDGET_READ = 22     // got the `--budget` baseline's source
 const ST_BUDGET_GIT = 23      // got one file of `.git`, resolving HEAD for `--write-baseline`
 const ST_BUDGET_WROTE = 24    // the `--write-baseline` write was serviced
 const ST_BUDGET_FINDINGS = 25 // got the `--findings` report's source
+const ST_CHECK_ENQUEUED = 26  // the host queued one root for the root pool
+const ST_CHECK_POOLED = 27    // the host committed every queued root's outcome
+const ST_CHECK_NEXT = 28      // a worker awaits its next root (`cliCheckNextRoot`)
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -295,11 +304,12 @@ let cliFiles: string[] = []     // collected `.vl` paths — the check work-list
 // NAMED. It is what `cliDirMode` reads per file, so a `--batch` file target is graded
 // exactly as `vl check <file>` alone grades it — same lint scope, same report.
 let cliFileFromDir: i32[] = []
-let cliFileIdx = 0    // cursor into cliFiles for the per-file loop
-let cliCurFile = ""   // the file currently being checked (its path)
-let cliCurDir = ""    // the directory currently being listed (child-path base)
-let cliCurRel = ""    // the directory currently being listed, relative to the root
-let cliLastStage = "" // failing stage of the LAST file compiled (single-file note)
+let cliFileKeys: {[string]: i32} = Map() // `cliPathKey` of every queued path
+let cliFileIdx = 0                       // cursor into cliFiles for the per-file loop
+let cliCurFile = ""                      // the file currently being checked (its path)
+let cliCurDir = ""                       // the directory currently being listed (child-path base)
+let cliCurRel = ""                       // the directory currently being listed, relative to the root
+let cliLastStage = ""                    // failing stage of the LAST file compiled (single-file note)
 // Running tally across every file checked.
 let cliErrors = 0
 let cliWarnings = 0
@@ -346,10 +356,11 @@ let cliFixKindN: i32[] = []
 // offered as imports, so the diagnostic and `--fix` can name the module.
 let cliSibTried = 0
 let cliSibQueue: string[] = []
-let cliSibScanned: string[] = [] // candidate paths already scanned this run
-let cliSibExpKey: string[] = []  // one row per export: the file's path
-let cliSibExpName: string[] = [] // and the exported name
-let cliSibSkipped: string[] = [] // candidates that do not lex, named once in the summary
+let cliSibQEnd = 0                         // `cliSibQueue[0 .. cliSibQEnd)` is still to read, last first
+let cliSibScanned: {[string]: i32} = Map() // candidate paths already scanned this run
+let cliSibExpKey: string[] = []            // one row per export: the file's path
+let cliSibExpName: string[] = []           // and the exported name
+let cliSibSkipped: string[] = []           // candidates that do not lex, named once in the summary
 
 // ── verify-and-revert (D1091) ────────────────────────────────────────────────
 
@@ -419,6 +430,24 @@ let cliTestJobs = 0    // --jobs N (0 = let the host pick, one worker per core)
 let cliTestPoolMode = 0
 let cliTestUnreadable = "" // the pool's "cannot read <named file>" report, when one came back
 let cliTestEnqIdx = 0 // the next cliFiles index to hand the pool
+// `vl check`'s root pool, staged like the test pool's: 0 = none, 1 = the host checks
+// queued roots in parallel, 2 = this instance is a worker checking root `cliCheckPick`.
+let cliCheckPoolMode = 0
+let cliCheckPick = -1
+let cliCheckEnqIdx = 0
+// A worker's copy of the parent's walk (paths and `cliFileFromDir`), so it never re-walks.
+let cliPresetFiles: string[] = []
+let cliPresetFromDir: i32[] = []
+// Per root (parallel to `cliFiles`) once the pool has run: 0 = `cliPoolPayload` holds
+// the root's whole contribution to the report, 1 = this instance checks it itself.
+let cliPoolStatus: i32[] = []
+let cliPoolPayload: string[] = []
+// A worker's report baselines (what its own walk left), and its `--budget` notes as
+// five fields each, replayed by the parent through `budgetNote` in root order.
+let cliPwBase: i32[] = []
+let cliPwNotes: string[] = []
+let cliPpSrc = "" // the payload being applied, and the read cursor into it
+let cliPpPos = 0
 // Per collected file (parallel to `cliFiles`): the compile error text, "" when the
 // file compiled. A file that fails to compile is one failing entry in the report and
 // does not stop the run.
@@ -574,6 +603,7 @@ export function cliArgReset() {
   cliWalkStack = []
   cliWalkRel = []
   cliFiles = []
+  cliFileKeys = Map()
   cliFileFromDir = []
   cliFileIdx = 0
   cliCurFile = ""
@@ -625,6 +655,15 @@ export function cliArgReset() {
   cliTestPoolMode = 0
   cliTestUnreadable = ""
   cliTestEnqIdx = 0
+  cliCheckPoolMode = 0
+  cliCheckPick = -1
+  cliCheckEnqIdx = 0
+  cliPresetFiles = []
+  cliPresetFromDir = []
+  cliPoolStatus = []
+  cliPoolPayload = []
+  cliPwBase = []
+  cliPwNotes = []
   cliTestFileErr = []
   cliTestStash = []
   cliTestStashOf = []
@@ -659,7 +698,8 @@ export function cliArgReset() {
   cliSrcLines = []
   cliSibTried = 0
   cliSibQueue = []
-  cliSibScanned = []
+  cliSibQEnd = 0
+  cliSibScanned = Map()
   cliSibExpKey = []
   cliSibExpName = []
   cliSibSkipped = []
@@ -1375,6 +1415,8 @@ function cliCheckCurFileRest() {
   }
   if cliSibTried == 0 && mimpMissed.length > 0 {
     cliSibTried = 1
+    // The scan's candidates and cache are the run's, so a worker hands the root back.
+    if cliCheckPoolMode == 2 { return cliCheckWorkerDone() }
     return cliSibBegin()
   }
   // Error-tier diagnostics — capture them now, straight from the driver stores, before
@@ -1711,7 +1753,15 @@ function cliBudgetCollect() {
       if dgLine[d] >= 1 && dgLine[d] <= lines.length {
         text = lines[dgLine[d] - 1]
       }
-      if inside { budgetNote(dgCode[d], rel, dgLine[d], dgCol[d], text) }
+      if inside && cliCheckPoolMode == 2 {
+        cliPwNotes.push(dgCode[d])
+        cliPwNotes.push(rel)
+        cliPwNotes.push(i32ToStr(dgLine[d]))
+        cliPwNotes.push(i32ToStr(dgCol[d]))
+        cliPwNotes.push(text)
+      } else if inside {
+        budgetNote(dgCode[d], rel, dgLine[d], dgCol[d], text)
+      }
     }
     d = d + 1
   }
@@ -1974,6 +2024,199 @@ function cliTestWorkerDone(code: CliExit, msg: string) {
   CMD_DONE
 }
 
+// The check loop. With a host pool and two or more roots, every root is queued for the
+// pool first. `--fix` writes files and `--codegen` hands each module to the engine, so
+// both keep every root in this instance. A worker checks each root the host hands it.
+function cliCheckStart() {
+  if cliCheckPoolMode == 2 { return cliCheckWorkerBegin() }
+  if (
+    cliCheckPoolMode == 1
+    && cliFiles.length >= 2
+    && cliFix == 0
+    && cliCodegen == 0
+  ) {
+    cliCheckEnqIdx = 0
+    return cliCheckEnqueueNext()
+  }
+  cliStartFile()
+}
+
+// A worker begins root `cliCheckPick`, baselining the report so its payload is that
+// root's contribution alone. With no root left to check it ends.
+function cliCheckWorkerBegin() {
+  if cliCheckPick < 0 {
+    cliState = ST_DONE
+    return CMD_DONE
+  }
+  cliPwBase = []
+  cliPwNotes = []
+  if cliCheckPick >= cliFiles.length { return cliCheckWorkerDone() }
+  cliFileIdx = cliCheckPick
+  // Both are read only by the run's summary, which a worker never reaches; cleared, they
+  // defer only the root that set them, so the instance goes on to its next root.
+  cliBatchUnread = 0
+  cliInvalidModule = 0
+  cliPwBase = [
+    cliOut.length,
+    cliJsonItems.length,
+    cliBatchOut.length,
+    cliErrors,
+    cliWarnings,
+    cliGating,
+    cliStdHidden,
+    cliStdHiddenWarn,
+    cliImpHidden,
+    cliImpHiddenWarn,
+  ]
+  cliStartFile()
+}
+
+// Queue the next root for the pool, or — all queued — ask the host to check them.
+// Outcomes come back through `cliCheckPooledCommit`, in queue order.
+function cliCheckEnqueueNext() {
+  if cliCheckEnqIdx >= cliFiles.length {
+    cliState = ST_CHECK_POOLED
+    return CMD_CHECK_POOL
+  }
+  cliCmdPath = cliFiles[cliCheckEnqIdx]
+  cliCmdData = i32ToStr(cliFileFromDir[cliCheckEnqIdx])
+  cliCheckEnqIdx = cliCheckEnqIdx + 1
+  cliState = ST_CHECK_ENQUEUED
+  CMD_CHECK_ENQUEUE
+}
+
+// A worker's root is done: `EXIT_OK` with its payload in `cliCmdData`, or `EXIT_FAILED` when the
+// parent must check the root itself. That is a root whose report reads run-wide state:
+// the missing-import scan, an unreadable `--batch` entry, an invalid module. Either way
+// the host hands this instance its next root through `cliCheckNextRoot`.
+function cliCheckWorkerDone() {
+  cliExit = EXIT_FAILED
+  cliCmdData = ""
+  if (
+    cliPwBase.length > 0
+    && cliSibTried == 0
+    && cliBatchUnread == 0
+    && cliInvalidModule == 0
+  ) {
+    cliExit = EXIT_OK
+    cliCmdData = cliPwPayload()
+  }
+  cliState = ST_CHECK_NEXT
+  CMD_CHECK_ROOT_DONE
+}
+
+// The worker's root as one string of fields, each `<n>:` for an integer or `<bytes>:`
+// then that many bytes for a string: the root's path, its tally deltas, then the report
+// lines, `--json` items, `--batch` records and `--budget` notes it appended.
+function cliPwPayload() {
+  const buf: i32[] = []
+  cliPwStr(buf, cliFiles[cliCheckPick])
+  cliPwInt(buf, cliErrors - cliPwBase[3])
+  cliPwInt(buf, cliWarnings - cliPwBase[4])
+  cliPwInt(buf, cliGating - cliPwBase[5])
+  cliPwInt(buf, cliStdHidden - cliPwBase[6])
+  cliPwInt(buf, cliStdHiddenWarn - cliPwBase[7])
+  cliPwInt(buf, cliImpHidden - cliPwBase[8])
+  cliPwInt(buf, cliImpHiddenWarn - cliPwBase[9])
+  cliPwList(buf, cliOut, cliPwBase[0])
+  cliPwList(buf, cliJsonItems, cliPwBase[1])
+  cliPwList(buf, cliBatchOut, cliPwBase[2])
+  cliPwList(buf, cliPwNotes, 0)
+  fromCodePoints(buf)
+}
+function cliPwInt(buf: i32[], n: i32) {
+  pushCps(buf, i32ToStr(n))
+  buf.push(':')
+  0
+}
+function cliPwStr(buf: i32[], s: string) {
+  cliPwInt(buf, s.length)
+  pushCps(buf, s)
+  0
+}
+function cliPwList(buf: i32[], xs: string[], from: i32) {
+  cliPwInt(buf, xs.length - from)
+  let i = from
+  while i < xs.length {
+    cliPwStr(buf, xs[i])
+    i = i + 1
+  }
+  0
+}
+
+// The payload readers, over `cliPpSrc` from `cliPpPos`.
+function cliPpInt() {
+  let n = 0
+  while cliPpPos < cliPpSrc.length && cliPpSrc[cliPpPos] != ':' {
+    n = n * 10 + (cliPpSrc[cliPpPos] - '0')
+    cliPpPos = cliPpPos + 1
+  }
+  cliPpPos = cliPpPos + 1
+  n
+}
+function cliPpStr() {
+  const n = cliPpInt()
+  const s = cliPpSrc.slice(cliPpPos, cliPpPos + n)
+  cliPpPos = cliPpPos + n
+  s
+}
+
+// The integer `s` spells in decimal, as `i32ToStr` wrote it.
+function cliDigits(s: string) {
+  let n = 0
+  let i = 0
+  if s.length > 0 && s[0] == '-' { i = 1 }
+  while i < s.length {
+    n = n * 10 + (s[i] - '0')
+    i = i + 1
+  }
+  if s.length > 0 && s[0] == '-' { return 0 - n }
+  n
+}
+
+// Fold root `f`'s pooled payload into the run, as checking it here would have. The
+// per-root `cliLastStage`/`cliDirMode` are not carried: the summary reads them only for
+// a run of one root, which never pools.
+function cliPoolApply(f: i32) {
+  cliPpSrc = cliPoolPayload[f]
+  cliPoolPayload[f] = ""
+  cliPpPos = 0
+  cliPpStr()
+  cliErrors = cliErrors + cliPpInt()
+  cliWarnings = cliWarnings + cliPpInt()
+  cliGating = cliGating + cliPpInt()
+  cliStdHidden = cliStdHidden + cliPpInt()
+  cliStdHiddenWarn = cliStdHiddenWarn + cliPpInt()
+  cliImpHidden = cliImpHidden + cliPpInt()
+  cliImpHiddenWarn = cliImpHiddenWarn + cliPpInt()
+  let n = cliPpInt()
+  while n > 0 {
+    cliOut.push(cliPpStr())
+    n = n - 1
+  }
+  n = cliPpInt()
+  while n > 0 {
+    cliJsonItems.push(cliPpStr())
+    n = n - 1
+  }
+  n = cliPpInt()
+  while n > 0 {
+    cliBatchOut.push(cliPpStr())
+    n = n - 1
+  }
+  n = cliPpInt()
+  while n >= 5 {
+    const code = cliPpStr()
+    const rel = cliPpStr()
+    const line = cliDigits(cliPpStr())
+    const col = cliDigits(cliPpStr())
+    budgetNote(code, rel, line, col, cliPpStr())
+    n = n - 5
+  }
+  cliPpSrc = ""
+  0
+}
+
 // Begin the next test file, or — work-list exhausted — move on to collection.
 function cliStartTestFile() {
   if cliFileIdx >= cliFiles.length { return cliTestBeginCollect() }
@@ -2234,6 +2477,44 @@ export function cliTestCompiledCommit(status: i32) {
   }
   0
 }
+// ── the `vl check` root pool: what the host commits ─────────────────────────
+// Before the first `cliNext`, after argv: `mode` 1 = this host has a root pool, 2 = this
+// instance is one of its workers, checking root `pick` of the walk.
+export function cliCheckPoolStage(mode: i32, pick: i32) {
+  cliCheckPoolMode = mode
+  cliCheckPick = pick
+  0
+}
+// A worker's copy of one root of the parent's walk, in walk order: the path on the
+// shared `cliResult`, `fromDir` as the parent's `CMD_CHECK_ENQUEUE` reported it.
+export function cliCheckPresetRoot(fromDir: i32) {
+  cliPresetFiles.push(cpAccTake(cliResultAcc))
+  cliPresetFromDir.push(fromDir)
+  0
+}
+// A worker's next root after `CMD_CHECK_ROOT_DONE`: `pick` of the walk, or -1 to end.
+export function cliCheckNextRoot(pick: i32) {
+  cliCheckPick = pick
+  0
+}
+// One pooled root's outcome, in queue order: 0 = its worker's payload is on the shared
+// `cliResult`, anything else = this instance checks the root itself. A payload naming a
+// different root (the tree changed under the walk) is checked here too.
+export function cliCheckPooledCommit(status: i32) {
+  const payload = cpAccTake(cliResultAcc)
+  const f = cliPoolStatus.length
+  if f >= cliFiles.length { return 0 }
+  let st = 1
+  if status == 0 {
+    cliPpSrc = payload
+    cliPpPos = 0
+    if cliPpStr() == cliFiles[f] { st = 0 }
+    cliPpSrc = ""
+  }
+  cliPoolStatus.push(st)
+  if st == 0 { cliPoolPayload.push(payload) } else { cliPoolPayload.push("") }
+  0
+}
 // A test name, one code point at a time (the `cliDirNamePush` idiom).
 export function cliTestNamePush(c: i32) {
   cliTestNameAcc.push(c)
@@ -2395,9 +2676,8 @@ function cliSubName(): string {
 function cliAddFile(path: string, fromDir: i32) {
   if cliBatch == 0 {
     const key = cliPathKey(path)
-    for f in cliFiles {
-      if cliPathKey(f) == key { return 0 }
-    }
+    if cliFileKeys.has(key) { return 0 }
+    cliFileKeys.set(key, 1)
   }
   cliFiles.push(path)
   cliFileFromDir.push(fromDir)
@@ -2438,6 +2718,12 @@ function cliPathKey(path: string): string {
 
 // Expand the targets (the working directory when none is named) and walk the first.
 function cliBeginTargets() {
+  if cliCheckPoolMode == 2 && cliPresetFiles.length > 0 {
+    cliFiles = cliPresetFiles
+    cliFileFromDir = cliPresetFromDir
+    cliFileIdx = 0
+    return cliStartWork()
+  }
   if cliTargets.length == 0 { cliTargets = ["."] }
   cliTargetIdx = 0
   cliClassifyTarget()
@@ -2448,11 +2734,20 @@ function cliBeginTargets() {
 function cliStartWork() {
   if cliCmd == 1 { return cliStartFmtFile() }
   if cliCmd == 2 { return cliTestStart() }
-  cliStartFile()
+  cliCheckStart()
 }
 // Begin checking cliFiles[cliFileIdx] (read its source), or — work-list done —
 // build the summary and start printing.
 function cliStartFile() {
+  if cliCheckPoolMode == 2 && cliFileIdx != cliCheckPick {
+    return cliCheckWorkerDone()
+  }
+  // Roots the pool already checked contribute their payload here, in root order, so a
+  // root this instance checks itself lands between them exactly where it always did.
+  while cliFileIdx < cliPoolStatus.length && cliPoolStatus[cliFileIdx] == 0 {
+    cliPoolApply(cliFileIdx)
+    cliFileIdx = cliFileIdx + 1
+  }
   if cliFileIdx >= cliFiles.length {
     if cliBudget == 3 { return cliBudgetGitRead(budgetGitStart()) }
     if cliBudget != 0 { cliBudgetFinish() } else { cliFinishSummary() }
@@ -2549,6 +2844,7 @@ function cliSibBegin() {
     for f in cliFiles {
       if f != cliCurFile { cliSibQueue.push(f) }
     }
+    cliSibQEnd = cliSibQueue.length
     return cliSibReadNext()
   }
   cliDirNames = []
@@ -2571,16 +2867,17 @@ function cliSibListed() {
     }
     i = i + 1
   }
+  cliSibQEnd = cliSibQueue.length
   cliSibReadNext()
 }
 
 // Scan the next unscanned candidate, from the source cache or the host; with none left,
 // offer every scanned export to the checker and re-check the current file.
 function cliSibReadNext() {
-  while cliSibQueue.length > 0 {
-    const key = cliSibQueue[cliSibQueue.length - 1]
-    cliSibQueue = cliPopLast(cliSibQueue)
-    if !strListHas(cliSibScanned, key) {
+  while cliSibQEnd > 0 {
+    cliSibQEnd = cliSibQEnd - 1
+    const key = cliSibQueue[cliSibQEnd]
+    if !cliSibScanned.has(key) {
       const ci = cliSrcCacheGet(key)
       if ci < 0 {
         cliFetchKey = key
@@ -2610,7 +2907,7 @@ function cliSibReadNext() {
 
 // Record candidate `key`'s exported names (none when it could not be read).
 function cliSibScan(key: string, src: string, found: i32) {
-  cliSibScanned.push(key)
+  cliSibScanned.set(key, 1)
   if found == 0 { return 0 }
   const names = modExportNamesOf(src)
   if names == null {
@@ -3650,6 +3947,7 @@ export function cliNext() {
     cliWalkStack = []
     cliWalkRel = []
     cliFiles = []
+    cliFileKeys = Map()
     cliDirNames = []
     cliDirIsDirs = []
     cliSrcCacheKeys = []
@@ -3875,6 +4173,12 @@ export function cliNext() {
     return cliStartTestFile()
   }
   if st == ST_TEST_ENQUEUED { return cliTestEnqueueNext() }
+  if st == ST_CHECK_ENQUEUED { return cliCheckEnqueueNext() }
+  if st == ST_CHECK_NEXT { return cliCheckWorkerBegin() }
+  if st == ST_CHECK_POOLED {
+    cliFileIdx = 0
+    return cliStartFile()
+  }
   if st == ST_TEST_POOLED {
     if cliTestUnreadable != "" {
       return cliUsageStop("test: " + cliTestUnreadable)
