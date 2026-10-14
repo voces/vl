@@ -21106,6 +21106,21 @@ export function stubWriteRhsReset() { stubWriteRhs = 0 - 1 }
 
 // Lower an assignment `target = value` onto `body`: the value emits under the target's
 // `ExpCtx`, then the store. The caller's context is restored on every exit, failure included.
+// The variant row of the declared local `lhsIx` names when its cell holds a bare union arm
+// (`variant`) and the assigned value `rhsIx` is an object literal, else -1.
+function assignArmCellVariantIdx(lhsIx: i32, rhsIx: i32, fnIx: i32): i32 {
+  if !(P.nodes[unwrapParen(rhsIx)] is ObjLit) { return -1 }
+  if identCellVKind(lhsIx, fnIx) != "variant" { return -1 }
+  const slot = identCellSlot(lhsIx)
+  if slot < 0 || slot >= localIsRef.length || slot >= localStructIdx.length {
+    return -1
+  }
+  if localIsRef[slot] != "variant" { return -1 }
+  const vi = localStructIdx[slot]
+  if vi < 0 || vi >= uVarHeap.length { return -1 }
+  vi
+}
+
 function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
   const saved = expCtxHere()
   expCtxLeave(saved, emitAssignUnder(body, binIx, fnIx))
@@ -21294,7 +21309,14 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
       const aAtomCell = aUNm != ""
         && declaredKind(target.identName) != "union"
         && exprIsLitAtom(lhsIx, fnIx)
-      if aUNm != "" && !nameIsLitUnionType(aUNm) && !aAtomCell {
+      const aArmVi = assignArmCellVariantIdx(lhsIx, a.binRight, fnIx)
+      if aArmVi >= 0 {
+        // An arm cell's object literal builds the bare variant struct, seeded as the
+        // binding's own initializer is, rather than a union box (D4613).
+        const avCtx = expCtxHere()
+        avCtx.variantIdx = aArmVi
+        if emitExprExpect(body, a.binRight, fnIx, avCtx) < 0 { return -1 }
+      } else if aUNm != "" && !nameIsLitUnionType(aUNm) && !aAtomCell {
         // a literal-union target is an i32 atom, not a value-union box, and falls through
         // to the seed block below. A kind-4 union-box local boxes a concrete variant RHS
         // like a call arg/return; a kind-8 variant-init local keeps the raw variant rep, so
