@@ -1,0 +1,277 @@
+// Cluster the census's silent cells into families and name each family's coordinates.
+//
+//     vl run scripts/silent-sweep/census/families.vl -- <celldir> <graded.json> [<celldir> <graded.json> ...]
+//
+// Pass 1 groups by engine message, renormalised so a per-store function name or offset is
+// not a family; pass 2 by container x the nominal ingredients. Each family prints its size,
+// the axes constant across it, the axes that vary inside it, and its smallest cell as the
+// witness to run. A message is not a mechanism: ablate before filing. Run from the root.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, split } from "std:str"
+import { JsonMap, cpPrefix, die, findFrom } from "../../lib/common"
+import { padLeft, padRight } from "../../lib/corpus"
+import {
+  AX,
+  axis,
+  byCountDesc,
+  bytesOf,
+  collapseWs,
+  distinctSorted,
+  grading,
+  isSilent,
+  manifestCoords,
+  pathJoin,
+  pyFixed,
+  tally,
+} from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/families.vl -- <celldir> <graded.json> [<celldir> <graded.json> ...]"
+const RULE = "=============================================================================="
+
+type Cell = { dir: string, name: string, co: JsonMap, cls: string, msg: string }
+
+// Python's `\w` over ASCII: a letter, digit or underscore.
+function isWord(b: i32): boolean {
+  (b >= 48 && b <= 57)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+}
+
+function wordEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isWord(s[j]) { j = j + 1 }
+  j
+}
+
+// `re.sub(r"wasm\[0\]::function\[N\](::\w+)?", "wasm[0]::function[N]", m)`.
+function dropFnName(m: string): string {
+  const lit = "wasm[0]::function[N]"
+  const out: string[] = []
+  let i = 0
+  while true {
+    const at = findFrom(m, lit, i)
+    if at < 0 { break }
+    let end = at + lit.length
+    if findFrom(m, "::", end) == end && wordEnd(m, end + 2) > end + 2 {
+      end = wordEnd(m, end + 2)
+    }
+    out.push(m.slice(i, at) + lit)
+    i = end
+  }
+  out.push(m.slice(i, m.length))
+  join(out, "")
+}
+
+// `re.sub(r"\(at offset \w+\)", "(at offset N)", m)`.
+function dropParenOffset(m: string): string {
+  const lit = "(at offset "
+  const out: string[] = []
+  let i = 0
+  let from = 0
+  while true {
+    const at = findFrom(m, lit, from)
+    if at < 0 { break }
+    const w = wordEnd(m, at + lit.length)
+    if w > at + lit.length && w < m.length && m[w] == 41 {
+      out.push(m.slice(i, at) + "(at offset N)")
+      i = w + 1
+      from = i
+    } else {
+      from = at + 1
+    }
+  }
+  out.push(m.slice(i, m.length))
+  join(out, "")
+}
+
+// `re.sub(r"at offset N\w*", "at offset N", m)`.
+function dropOffsetTail(m: string): string {
+  const lit = "at offset N"
+  const out: string[] = []
+  let i = 0
+  while true {
+    const at = findFrom(m, lit, i)
+    if at < 0 { break }
+    out.push(m.slice(i, at) + lit)
+    i = wordEnd(m, at + lit.length)
+  }
+  out.push(m.slice(i, m.length))
+  join(out, "")
+}
+
+function renorm(m: string): string {
+  collapseWs(dropOffsetTail(dropParenOffset(dropFnName(m))))
+}
+
+type Sig = { constant: string, varies: string }
+
+function signature(cells: Cell[], ks: i32[]): Sig {
+  const names: string[] = []
+  const vals: Map<string, string> = Map()
+  const varies: string[] = []
+  for a in AX {
+    const vs: string[] = []
+    for k in ks { vs.push(axis(cells[k].co, a)) }
+    const d = distinctSorted(vs)
+    if d.length == 1 {
+      names.push(a)
+      vals[a] = d[0]
+    } else {
+      varies.push(a + "(" + toString(d.length) + ")")
+    }
+  }
+  const fx: string[] = []
+  for a in distinctSorted(names) { fx.push(a + "=" + (vals[a] ?? "")) }
+  let c = join(fx, ", ")
+  if c == "" { c = "(nothing)" }
+  let v = join(varies, ", ")
+  if v == "" { v = "(nothing)" }
+  { constant: c, varies: v }
+}
+
+function ingredients(co: JsonMap): string[] {
+  const out = [axis(co, "cont"), "-", "-", "-", "-"]
+  if axis(co, "twin") != "none" { out[1] = "twin" }
+  if axis(co, "union") != "nounion" { out[2] = "union" }
+  if axis(co, "claim") != "0" { out[3] = "claim" }
+  if axis(co, "declness") != "nodecl" { out[4] = "decl" }
+  out
+}
+
+function main(args: string[]): i32 {
+  if args.length % 2 != 0 { die(USAGE, 2) }
+  const cells: Cell[] = []
+  const at: Map<string, i32> = Map()
+  let i = 0
+  while i < args.length {
+    const d = args[i]
+    const res = grading(args[i + 1])
+    for k, co in manifestCoords(d) {
+      const g = res[k]
+      if g == null { continue }
+      const c: Cell = {
+        dir: d,
+        name: k,
+        co: co,
+        cls: g.cls,
+        msg: renorm(g.msg),
+      }
+      const id = d + "\t" + k
+      const was = at[id]
+      if was == null {
+        at[id] = cells.length
+        cells.push(c)
+      } else {
+        cells[was] = c
+      }
+    }
+    i = i + 2
+  }
+
+  const sil: i32[] = []
+  const byclass: Map<string, i32> = Map()
+  const corder: string[] = []
+  i = 0
+  while i < cells.length {
+    if isSilent(cells[i].cls) { sil.push(i) }
+    tally(byclass, corder, cells[i].cls, 1)
+    i = i + 1
+  }
+  let n = cells.length
+  if n < 1 { n = 1 }
+  print(
+    "graded \{toString(cells.length)} cells, \{toString(sil.length)} silent ("
+      + pyFixed(100.0 * (sil.length as f64) / (n as f64), 2)
+      + "%)",
+  )
+  for c in byCountDesc(corder, byclass) {
+    print("   " + padRight(c, 26) + " " + padLeft(toString(byclass[c] ?? 0), 7))
+  }
+
+  print("")
+  print(RULE)
+  print("PASS 1 — silent cells clustered by ENGINE MESSAGE")
+  print(RULE)
+  const bymsg: Map<string, i32[]> = Map()
+  const msize: Map<string, i32> = Map()
+  const morder: string[] = []
+  for k in sil {
+    const key = cells[k].cls + "\n" + cells[k].msg
+    if bymsg[key] == null { bymsg[key] = [] }
+    (bymsg[key] ?? []).push(k)
+    tally(msize, morder, key, 1)
+  }
+  for key in byCountDesc(morder, msize) {
+    const ks = bymsg[key] ?? []
+    const nl = findFrom(key, "\n", 0)
+    const s = signature(cells, ks)
+    let best = ks[0]
+    let bl = -1
+    for k in ks {
+      const b = bytesOf(pathJoin(cells[k].dir, cells[k].name + ".vl"))
+      if bl < 0 || b < bl {
+        best = k
+        bl = b
+      }
+    }
+    print("")
+    print(padLeft(toString(ks.length), 6) + "  " + key.slice(0, nl))
+    print("        msg: " + cpPrefix(key.slice(nl + 1, key.length), 150))
+    print("        constant: " + s.constant)
+    print("        varies  : " + s.varies)
+    print(
+      "        witness : \{cells[best].dir}/\{cells[best].name}.vl  (\{toString(bl)} bytes)",
+    )
+  }
+
+  print("")
+  print(RULE)
+  print("PASS 2 — silent cells by CONTAINER x nominal ingredients")
+  print(RULE)
+  const silBy: Map<string, i32> = Map()
+  const sorder: string[] = []
+  for k in sil { tally(silBy, sorder, join(ingredients(cells[k].co), "\t"), 1) }
+  const tot: Map<string, i32> = Map()
+  const torder: string[] = []
+  for c in cells { tally(tot, torder, join(ingredients(c.co), "\t"), 1) }
+  print(
+    "\{padRight("cont", 14)} \{padRight("twin", 5)} \{padRight("union", 6)} \{padRight("claim", 6)} \{padRight("decl", 5)} \{padLeft("silent", 8)} \{padLeft("total", 8)} \{padLeft("rate", 6)}",
+  )
+  for sig in byCountDesc(sorder, silBy) {
+    const p = split(sig, "\t")
+    const s = silBy[sig] ?? 0
+    const t = tot[sig] ?? 1
+    print(
+      "\{padRight(p[0], 14)} \{padRight(p[1], 5)} \{padRight(p[2], 6)} \{padRight(p[3], 6)} \{padRight(p[4], 5)} \{padLeft(toString(s), 8)} \{padLeft(toString(t), 8)} \{padLeft(pyFixed(100.0 * (s as f64) / (t as f64), 1), 5)}%",
+    )
+  }
+
+  print("")
+  print(
+    "== container x nominal-ingredient combinations with ZERO silent cells ==",
+  )
+  let zero = 0
+  let zcells = 0
+  for sig in torder {
+    if silBy[sig] == null {
+      zero = zero + 1
+      zcells = zcells + (tot[sig] ?? 0)
+    }
+  }
+  print(
+    "   \{toString(zero)} of \{toString(torder.length)} combinations, \{toString(zcells)} cells",
+  )
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("families: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

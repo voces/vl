@@ -1,5 +1,7 @@
 # The union-box read **CHANNEL** grid — the axis `d272` holds fixed
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 `gen290.py` builds 714 cells crossing `shape × cons × cont × annpat`. It exists for the
 same reason `d272` does, one level in: `d272` put the READ axis on the map and refuted
 D209's read-side candidate with it, but every one of its cells pins the literal payload

@@ -1,5 +1,7 @@
 # The D111 / D117 grid, and its ablation
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 1,710-cell grid that closed `silent-class-inventory.md` **D111** and **D117** and filed
 **D131** out of its residue. Kept because the closing numbers in that document — **72 moved,
 0 backward, 0 message-only** — and the two-root / three-edit split are only claims if the

@@ -1,5 +1,7 @@
 # The D112 grid
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 1,114-cell grid that closed `silent-class-inventory.md` **D112** and filed **D123** and
 **D124** out of its residue. Kept because the closing numbers in that document — **452
 moved, all `check-clean invalid wasm` → `runs`, 0 backward, 0 same-class message changes,
