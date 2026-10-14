@@ -1,0 +1,311 @@
+// Definite assignment: which uninitialized `let x: T` bindings are still unwritten on the
+// current path. The live set forks and joins at `if`/`else` and loops through an undo log, and
+// each function body checks inside its own frame. Rows are keyed by interned binding id, so
+// this module imports only `./symbols`; the checker drives the walk and reports a read before
+// assignment itself (`daCheckRead`).
+import { sidArrGet, sidArrPut, sidOf } from "./symbols"
+
+// An uninitialized `let x: T` starts unassigned and is non-null, so a read before it is provably
+// written on every preceding path is a "used before it is assigned" error. `daLive` is the live
+// set of binding ids still un-written on the current path, forked and joined explicitly at
+// `if`/`else` and loops; `daWriteTarget` exempts a plain-`=` left-hand ident.
+export let daLive: i32[] = []
+// `daPos` is `daLive`'s sid-keyed inverse: the id's index in `daLive`, or -1 when it is assigned,
+// and `daGen` the frame generation that index belongs to. A row an enclosing frame (or an earlier
+// check) wrote reads as absent on its generation alone, so opening a frame costs nothing per
+// entry — which is what keeps a function body off the module's whole dead zone.
+const daPos: i32[] = []
+const daGen: i32[] = []
+// Every generation is minted from `daGenSeq`, which only ever rises, so two SIBLING frames
+// never share one — a row the first left behind cannot read as live inside the second.
+let daGenSeq = 1
+let daCurGen = 1
+export let daWriteTarget = -1
+// The undo log — one row per change to the live set while a rollback point is open. `daOpA` is
+// the id's previous `daPos` for an add and the slot it left for a removal, `daOpB` its previous
+// `daGen`. Nothing is logged at depth 0, so a module's own dead zone costs no rows.
+let daOpKind: i32[] = []
+let daOpSid: i32[] = []
+let daOpA: i32[] = []
+let daOpB: i32[] = []
+let daMarkDepth = 0
+// The frame stack: the generation `daEnterFrame` displaced and its rollback point. The
+// enclosing live SET travels through the caller, so the stack itself stays flat.
+let daFrameGen: i32[] = []
+let daFrameMark: i32[] = []
+// A sid-keyed stamp for "is this id in that list?", answered in one read. `daHitSeq` only
+// rises, so a stamp an earlier question left cannot answer a later one.
+const daHitTok: i32[] = []
+let daHitSeq = 0
+
+// True if the interned id `sid` is currently in the live unassigned set. A row from another
+// generation is not in it, whatever index it holds.
+export function daIsUnassignedSid(sid: i32) {
+  if sidArrGet(daGen, sid) != daCurGen { return false }
+  sidArrGet(daPos, sid) >= 0
+}
+
+// Record one change to the live set so a rollback can invert it — `kind` 0 for an add, 1 for a
+// removal. Outside a rollback point nothing is recorded, which is what keeps the log the size
+// of the innermost open construct rather than of the whole check.
+function daLogOp(kind: i32, sid: i32, a: i32, b: i32) {
+  if daMarkDepth == 0 { return 0 }
+  daOpKind.push(kind)
+  daOpSid.push(sid)
+  daOpA.push(a)
+  daOpB.push(b)
+  0
+}
+
+// Mark the interned id `sid` unassigned on the current path.
+function daAddSid(sid: i32) {
+  if sid < 0 { return 0 }
+  if daIsUnassignedSid(sid) { return 0 }
+  // The row may still be an enclosing frame's; the log carries what it held, since that is
+  // what `daLeaveFrame` has to put back.
+  daLogOp(0, sid, sidArrGet(daPos, sid), sidArrGet(daGen, sid))
+  sidArrPut(daPos, sid, daLive.length)
+  sidArrPut(daGen, sid, daCurGen)
+  daLive.push(sid)
+  0
+}
+
+// Mark `name` unassigned on the current path (a `let x: T` with no initializer).
+export function daAdd(name: string) { daAddSid(sidOf(name)) }
+
+// Mark the interned id `sid` assigned, removing it from the live set by swapping the last entry
+// into its slot. Order is unobservable: nothing reads the set except as a membership test and
+// through the undo log.
+export function daMarkAssignedSid(sid: i32) {
+  if !daIsUnassignedSid(sid) { return 0 }
+  // Membership already said the slot is this frame's; the bound test is the standing rule for
+  // an index a reader can answer out of band (D1440).
+  const at = sidArrGet(daPos, sid)
+  if at < 0 || at >= daLive.length { return 0 }
+  daLogOp(1, sid, at, 0)
+  const moved = daLive[daLive.length - 1]
+  daLive[at] = moved
+  sidArrPut(daPos, moved, at)
+  daLive.pop()
+  sidArrPut(daPos, sid, -1)
+  0
+}
+
+// Mark `name` assigned on the current path (a write or a checked read). An empty live set
+// answers without interning, which is every read and write inside a body that declares no
+// uninitialized binding.
+export function daMarkAssigned(name: string) {
+  if daLive.length == 0 { return 0 }
+  daMarkAssignedSid(sidOf(name))
+}
+
+// Empty the live set of the current frame, in place. Every row leaves through `daLive` and
+// through the log, so `daPos` ends at -1 for exactly the ids this frame holds and a rollback
+// can put them all back.
+function daClear() {
+  // The self-host emitter lowers `.pop()` (and `.length`) as statements but not
+  // `.clear()`, so empty the array in place by popping until empty.
+  while daLive.length > 0 {
+    const at = daLive.length - 1
+    const sid = daLive[at]
+    daLogOp(1, sid, at, 0)
+    sidArrPut(daPos, sid, -1)
+    daLive.pop()
+  }
+  0
+}
+
+// Open a rollback point: the log's height now, to hand back to `daRollbackTo` and `daRelease`.
+export function daMark() {
+  daMarkDepth = daMarkDepth + 1
+  daOpKind.length
+}
+
+// Undo every change logged since `m`, newest first, restoring the live set the mark stands
+// for. Costs the changes, not the set.
+export function daRollbackTo(m: i32) {
+  while daOpKind.length > m {
+    const j = daOpKind.length - 1
+    const sid = daOpSid[j]
+    if daOpKind[j] == 0 {
+      if daLive.length > 0 { daLive.pop() }
+      sidArrPut(daPos, sid, daOpA[j])
+      sidArrPut(daGen, sid, daOpB[j])
+    } else {
+      // The removal swapped the last entry into `at`, so putting it back means moving that
+      // entry to the end again. `at` past the end names `sid` itself as that last entry.
+      const at = daOpA[j]
+      if at >= 0 && at < daLive.length {
+        const moved = daLive[at]
+        daLive.push(moved)
+        sidArrPut(daPos, moved, daLive.length - 1)
+        daLive[at] = sid
+      } else {
+        daLive.push(sid)
+      }
+      sidArrPut(daPos, sid, at)
+    }
+    daOpKind.pop()
+    daOpSid.pop()
+    daOpA.pop()
+    daOpB.pop()
+  }
+  0
+}
+
+// Close the rollback point `m`, dropping the changes it covers. At depth 0 the log is empty
+// again, which is the bound on how large it grows.
+export function daRelease(m: i32) {
+  while daOpKind.length > m {
+    daOpKind.pop()
+    daOpSid.pop()
+    daOpA.pop()
+    daOpB.pop()
+  }
+  daMarkDepth = daMarkDepth - 1
+  0
+}
+
+// The ids the changes since `m` touched, each with whether it is live at this moment, into
+// `sids`/`live`. Read back after a rollback: live there and not here is a removal the branch
+// made, live here and not there an addition. Duplicates are harmless — both are idempotent.
+export function daTouchedSince(m: i32, sids: i32[], live: i32[]) {
+  let i = m
+  while i < daOpSid.length {
+    const s = daOpSid[i]
+    sids.push(s)
+    if daIsUnassignedSid(s) { live.push(1) } else { live.push(0) }
+    i = i + 1
+  }
+  0
+}
+
+// Split what `daTouchedSince` recorded into the branch's additions and removals, against the
+// live set as it stands — which the caller must have rolled back to the fork point.
+export function daSplitDelta(
+  sids: i32[],
+  live: i32[],
+  adds: i32[],
+  rems: i32[],
+) {
+  let i = 0
+  while i < sids.length {
+    const s = sids[i]
+    if daIsUnassignedSid(s) {
+      if live[i] == 0 { rems.push(s) }
+    } else {
+      if live[i] == 1 { adds.push(s) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Stamp every id of `sids`, returning the token that then answers "is it in that list?".
+function daHitStamp(sids: i32[]) {
+  daHitSeq = daHitSeq + 1
+  let i = 0
+  while i < sids.length {
+    sidArrPut(daHitTok, sids[i], daHitSeq)
+    i = i + 1
+  }
+  daHitSeq
+}
+
+// Add every id of `adds` to the live set.
+function daAddAll(adds: i32[]) {
+  let i = 0
+  while i < adds.length {
+    daAddSid(adds[i])
+    i = i + 1
+  }
+  0
+}
+
+// Apply one arm's delta: what the arm assigned becomes assigned, what it declared and left
+// unwritten becomes unassigned.
+function daApplyDelta(adds: i32[], rems: i32[]) {
+  let i = 0
+  while i < rems.length {
+    daMarkAssignedSid(rems[i])
+    i = i + 1
+  }
+  daAddAll(adds)
+}
+
+// The live set after an `if`, from the two arms' deltas against the fork point — which is what
+// the set holds when this is called. An id is assigned after the join only if EVERY surviving
+// arm assigned it; a diverging arm contributes nothing, and two of them leave the join dead.
+export function daJoinArms(
+  thenDiv: boolean,
+  thenAdds: i32[],
+  thenRems: i32[],
+  hasElse: boolean,
+  elseDiv: boolean,
+  elseAdds: i32[],
+  elseRems: i32[],
+) {
+  if !hasElse {
+    // The fall-through IS the fork point, so nothing the then-arm assigned survives the join;
+    // only what it declared and left unwritten joins.
+    if !thenDiv { daAddAll(thenAdds) }
+    return 0
+  }
+  if thenDiv && elseDiv { return daClear() }
+  if thenDiv { return daApplyDelta(elseAdds, elseRems) }
+  if elseDiv { return daApplyDelta(thenAdds, thenRems) }
+  const tok = daHitStamp(elseRems)
+  let i = 0
+  while i < thenRems.length {
+    if sidArrGet(daHitTok, thenRems[i]) == tok {
+      daMarkAssignedSid(thenRems[i])
+    }
+    i = i + 1
+  }
+  daAddAll(thenAdds)
+  daAddAll(elseAdds)
+}
+
+// Start a check with an empty dead zone and no open frame. The generation bump is what makes
+// the sid-keyed columns safe across a `sidReset`: a row an earlier check left behind carries an
+// older generation, so a recycled id reads as absent rather than as that row.
+export function daResetForCheck() {
+  daLive = []
+  daFrameGen = []
+  daFrameMark = []
+  daOpKind = []
+  daOpSid = []
+  daOpA = []
+  daOpB = []
+  daMarkDepth = 0
+  daGenSeq = daGenSeq + 1
+  daCurGen = daGenSeq
+  0
+}
+
+// Open a nested flow context: the enclosing dead zone is set aside whole and the body checks
+// against an empty one, so a body costs its own uninitialized bindings and not the module's.
+// Returns the enclosing live set, to hand back to `daLeaveFrame`.
+export function daEnterFrame() {
+  const saved = daLive
+  daFrameGen.push(daCurGen)
+  daFrameMark.push(daMark())
+  daGenSeq = daGenSeq + 1
+  daCurGen = daGenSeq
+  daLive = []
+  saved
+}
+
+// Close the frame `daEnterFrame` opened, restoring `saved` as the live set. The rollback puts
+// back every sid-keyed row the body overwrote — the only enclosing state a frame can damage —
+// and the body's own live array is dropped with it.
+export function daLeaveFrame(saved: i32[]) {
+  const m = daFrameMark[daFrameMark.length - 1]
+  daFrameMark.pop()
+  daRollbackTo(m)
+  daRelease(m)
+  daCurGen = daFrameGen[daFrameGen.length - 1]
+  daFrameGen.pop()
+  daLive = saved
+  0
+}
