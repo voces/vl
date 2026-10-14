@@ -282,7 +282,7 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   is not yet a type and which `tyHasHole` answers FALSE for, so one peel reaches `-1` and the
   second read traps. 33 corpus modules died. **Every grid column stayed flat** — the grid's
   own cells do not write `null` into an un-annotated binding — and so did every histogram and
-  every `runs`/`not-runs` count. Only `corpuscmp.py`'s LOST column saw it, which is why it is
+  every `runs`/`not-runs` count. Only `corpuscmp`'s LOST column saw it, which is why it is
   the FIRST instrument a landing runs and not a formality after the grid is green.
 
 - **A PIN THAT RE-ASKS A BODY'S QUESTION MUST CALL THE FUNCTION THE BODY CALLED, NOT AN

@@ -4,7 +4,7 @@
     scripts/perf/guest-profile.sh /tmp/p build compiler/entry.vl
     python3 scripts/perf/profile-phases.py /tmp/p/entry.json
 
-`profile-rank.py` ranks FUNCTIONS; this ranks the driver's stages. Each sample is
+`profile-rank.vl` ranks FUNCTIONS; this ranks the driver's stages. Each sample is
 walked from the ROOT down and charged to the first frame naming a phase entry point,
 so a phase's number is inclusive of everything it calls and the phases partition the
 run. That is what separates the per-module half of a check (scan, lex, parse, rename)
