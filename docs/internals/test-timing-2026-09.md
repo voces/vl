@@ -165,7 +165,7 @@ Read from each test's code. Causes as briefed: (a) spawns the native binary per 
 | `selfhost_native_align_test.ts` | 36.1 s | **(a)+(c)** | was one `vl check` per case; batched in §5a |
 | `selfhost_native_diag_pos_test.ts` | 16.7 s | (a) | multi-module fixtures, one spawn each |
 | `vl_test_runner_test.ts` | 14.8 s | (a)+(d) | its parallel-SCHEDULE test is an instrument |
-| `vl_capability_matrix_test.ts` | 12.3 s | (d) | runs `matrix.py` over 26 positions × 2 faces |
+| `vl_capability_matrix_test.ts` | 12.3 s | (d) | runs the position matrix (then `matrix.py`) over 26 positions × 2 faces |
 | `selfhost_native_gc_test.ts` | 11.0 s | (a) | one spawn per collector per case |
 | `vl_check_codegen_test.ts` | 9.2 s | (c) | one test sweeps the whole corpus |
 | `selfhost_native_diag_code_test.ts` | 8.0 s | **(b)** | fixed here; §5b |

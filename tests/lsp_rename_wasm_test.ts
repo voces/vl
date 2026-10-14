@@ -186,6 +186,39 @@ Deno.test("rename: resolveImportSpecifier mirrors the compiler's string math", (
   }
 });
 
+// The mirror against the resolver it mirrors (`modResolveSpecifier`), read back
+// through `moduleSurface`, which omits an import whose specifier did not resolve.
+Deno.test({
+  name: "rename: resolveImportSpecifier agrees with the seed's resolver",
+  ignore,
+  fn() {
+    const specs = [
+      "./util", "../lib/x", "./a/../b", "./a/./b", "../../x", "../../../x", "./",
+      "./a//b", "std:test", "std:a/b_2", "std:", "std:Bad", "std:a/", "std:/a",
+      "std:a//b", "util", "/abs/x", ".\\util", "./a\\b", "C:\\x", "C:/x", "./x.vl",
+      "..", "./..", "./a/..", "std:list", "x/../y", "./é", "./a b",
+    ];
+    const froms = [
+      "/proj/main.vl", "/proj/sub/main.vl", "main.vl", "sub/main.vl", "std:list",
+      "std:a/b", "/main.vl", "C:/proj/main.vl",
+    ];
+    const bad: string[] = [];
+    let resolved = 0;
+    for (const from of froms) {
+      for (const spec of specs) {
+        const literal = spec.replaceAll("\\", "\\\\");
+        const surface = checker!.moduleSurface(`import { x } from "${literal}"\n`, from);
+        const seed = surface.imports[0]?.key ?? "";
+        const mirror = resolveImportSpecifier(spec, from);
+        if (seed !== "") resolved++;
+        if (seed !== mirror) bad.push(`(${spec}, ${from}): seed '${seed}', mirror '${mirror}'`);
+      }
+    }
+    assert(resolved > 50, `want > 50 resolved cases, got ${resolved}`);
+    assert(bad.length === 0, `want 0 disagreements, got ${bad.length}:\n${bad.join("\n")}`);
+  },
+});
+
 Deno.test("rename: scanImportSpecifiers locates plain + alias tokens with resolved keys", () => {
   const src = 'import { add, mul as times } from "./util"\n' +
     '// import { fake } from "./nope"\n' +

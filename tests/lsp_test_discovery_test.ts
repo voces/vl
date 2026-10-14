@@ -175,10 +175,17 @@ Deno.test("discovery: a char literal holding a quote does not derail the scan", 
 });
 
 Deno.test("discovery: an unterminated string does not hang or mis-scope", () => {
-  const src = `it("unterminated\nit("after", () => {})\n`;
-  // The unterminated literal ends at the newline (as it does in the lexer), so
+  // A `"` string may span lines, as in the lexer, so the quote on the next line
+  // closes it and the test is named across the newline.
+  eq(
+    leafPaths(discoverTests(`it("two\nlines", () => {})\n`)),
+    ["two\nlines"],
+    "a string spans the newline",
+  );
+  // With no closing quote anywhere, the literal ends at its first newline and
   // the next line is scanned normally.
-  eq(leafPaths(discoverTests(src)), ["after"], "the scan recovers at the newline");
+  const src = `it("unterminated\nit(name, () => {})\nit('x')\n`;
+  eq(leafPaths(discoverTests(src)), [], "the scan recovers at the newline");
   eq(discoverTests("").length, 0, "an empty source discovers nothing");
 });
 

@@ -2399,3 +2399,85 @@ RIGHT-ONLY. In order, what unblocks the most notes now:
 3. The 1,920 RIGHT-ONLY and 114 different-rep notes the pin read adds, ablated to the reader that
    decides each.
 4. The literal-union softening and the alias rungs wait for registry step 5.
+
+### 13.11 The nullable element by backing family (cause 2), measured: LEFT-ONLY falls 58%, none converted
+
+§13.10 named cause 2 as "a `reflist` of union or closure elements". The census of the uncovered
+column says otherwise: before this step a non-null union or closure element was already covered,
+and almost all of cause 2 was a NULLABLE element, which `repOfArray` declined for every inner but
+a struct. §9.6 refused the broad rule "a nullable cell is a reference" and named the right one:
+the element's backing family decides the list. That rule is now `repOfNulElemArray`
+(`compiler/emit_rep.vl`), one arm per inner, and `rtNulElemListVKind` is its tree twin:
+
+| `(E \| null)[]`, inner `E` | null discipline | list rep |
+| --- | --- | --- |
+| `string` | niche | `strlist` |
+| `boolean`, literal union | sentinel | `list` (i32) |
+| `i32`, `i64`, `f64`, `f32`, `v128`, value-union box | box | `reflist` of `union`, when the registry holds the box's row |
+| struct, union arm, closure, map, list | niche | `reflist` of that element |
+| type variable, literal, error, negation, doubled nullable | none | uncovered |
+
+Two non-null union shapes join them: an expanded `("a" | "b" | null)` element rides the i32 list,
+and a one-member union of a record (the canonical `{a} & {b}`) is that record's ref list. The flat
+element name of a nullable string or list element now names its family rather than `struct`.
+
+**Proof.** Identity: compiling master's source with the candidate gives master's fixpoint, and
+over 15,110 files 10,020 built with 0 differing and 0 uncompared, so no module left the
+population (§9.6's vacuous-oracle trap). `vtKindOfType`, which prefers the descriptor, now answers
+these shapes from it with no new contradiction: `strlist -> uncovered` 4,476 → 0,
+`reflist -> uncovered` 13,538 → 478, `list -> uncovered` 888 → 112. The flat/tree audit gains one
+line, `M[i:string]?[]` (a nullable map with an `i32` key), the same family as the existing
+`M[i:…][]` notes: the flat map arm is unconditional and the tree declines a non-string key.
+
+**`exprListRep`, pin column, notes (files).**
+
+| population | LEFT-ONLY before | LEFT-ONLY after | RIGHT-ONLY before | RIGHT-ONLY after | different list rep before → after |
+| --- | --- | --- | --- | --- | --- |
+| `tests/cases` | 75,145 (477) | 22,250 (313) | 36,238 (311) | 40,124 (348) | 880 (23) → 884 (25) |
+| distilled `cells/` | 0 | 0 | 18,898 (871) | 18,898 (871) | 114 (2) → 114 (2) |
+| distilled `named/` | 61,171 (550) | 34,796 (320) | 16,848 (510) | 17,144 (543) | 200 (24) → 200 (24) |
+
+LEFT-ONLY falls 136,316 → 57,046. The before row is §13.10's within 89 notes in `tests/cases`.
+RIGHT-ONLY grows 4,182, where the ladder answers nothing and the column now answers.
+
+**LEFT-ONLY by element, all three populations.**
+
+| ladder | element | before | after |
+| --- | --- | --- | --- |
+| `reflist` | `i32 \| null` | 30,070 | 0 |
+| `list` | `(literal union) \| null` | 11,200 | 0 |
+| `reflist` | `(value union) \| null` | 10,247 | 536 |
+| `reflist` | `T[] \| null` | 8,328 | 0 |
+| `list` | `boolean \| null` | 5,982 | 0 |
+| `strlist` | `string \| null` | 5,717 | 0 |
+| `reflist` | one-member union of a record | 1,997 | 0 |
+| `reflist` | nullable `f64` / closure / `i64` / map / record / `f32` / `v128` | 6,240 | 0 |
+
+The 536 left in that family are boxes with no registry row. The residue, largest first: an
+element that is a type variable (`list` 26,159, `reflist` 8,514, the open generic nodes of
+§13.10), a nullable list read through a narrowing (3,561, cause 3), a union holding a nullable
+union (3,045), a numeric literal union (2,959 in `list`, 208 in `i64list`; registry step 5), and
+nodes with no recorded type (3,564).
+
+**No site converts.** `exprListRep` keeps 22,250 LEFT-ONLY and 40,124 RIGHT-ONLY in
+`tests/cases` alone, and neither `vtKindOfType` nor any list classifier reaches 0 LEFT-ONLY and 0
+RIGHT-ONLY at its guard. The coverage lands for the readers that already prefer the descriptor.
+
+**The different-rep notes where the ladder says `list`.** 84 notes in 11 files (65 `f64[]`, 19
+`i64[]`). In `generics/explicit-type-arguments.vl` the node is the empty `[]` of
+`make<T>()`'s body at the `i64` and `f64` instances. Forcing `exprListRep` to return the column's
+answer there leaves the module byte-identical, so the ladder's `list` is not read. What builds
+the literal is the destination kind threaded into `emitArr`: `arrLitRetSeedFromKind`
+(`compiler/wasmEmit.vl`) seeds it from `fRetKind` of the instance, and `emptyArrHoleBuildKind`'s
+fallback is not reached. This step adds one such note in the other direction: 3 in
+`generics/for-in-generic-call-result-at-pin.vl`, where the ladder says `f64list` and the column
+reads a `(boolean | null)[]` as `list`; the module is byte-identical.
+
+**What unblocks the most notes now:**
+
+1. The open generic nodes: 34,673 LEFT-ONLY with a type-variable element, plus the RIGHT-ONLY
+   they cause.
+2. The 40,124 RIGHT-ONLY in `tests/cases`, which is now the larger half and is not yet ablated.
+3. The narrowed nullable read (cause 3) and the union holding a nullable union, 6,606 notes
+   together.
+4. The numeric literal unions wait for registry step 5.
