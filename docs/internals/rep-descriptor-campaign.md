@@ -2302,3 +2302,100 @@ block it, in the order they unblock the most notes:
 3. A slot's rep and the type of a narrowed read differ. The ladder answers the slot, the column
    the type, so a converted site needs the narrowing's rep, not the declared one.
 4. The literal-union softening and the alias rungs wait for registry step 5.
+
+### 13.10 The pin-aware read (cause 1), measured: the generic share falls, none converted
+
+`nodeRepIn(ix, fnIx)` (`compiler/emit_classify.vl`) reads the column inside one function.
+`nodeTyInOf` keeps the recorded type unless it holds a `TyVar`. Otherwise it asks, in order, the
+hole binding this instance gives the node, the exact instance's derived pin, the instance's
+parameter pins, and finally the one pin the program banked (`nodeTyPinIxOf`). `repOfNodeAt` is
+`repOfNode` at that type, with the same-shape union recovery still read off the node. The read
+interns nothing and renders no spelling, so the arena and canon stay one producer apart exactly
+as before; the "different list rep" rows below are where the instance's arena type and the
+ladder's answer disagree.
+
+The `exprListRep` half of the oracle is now in the tree: under `VL_REP_SHADOW=1` every
+disagreement between the ladder and `nodeRepIn` is reported as `repAB/listRep <ladder> -> <column>`,
+with `unc` for a column the descriptor does not cover. It is also the read's only caller.
+
+The §13.9 oracle was re-run on this base with both columns side by side: "raw" is §13.9's
+`repOfNode`, "pin" is `nodeRepIn`. The raw rows match §13.9's disagreement counts; AGREE moved
+with the base. A generic node is one whose recorded type holds a `TyVar`; it is "closed" when the
+pin read reaches a type with none, "open" when it does not.
+
+**`exprListRep`.**
+
+| population | column | AGREE | LEFT-ONLY | RIGHT-ONLY | different list rep |
+| --- | --- | --- | --- | --- | --- |
+| `tests/cases` | raw | 5,661,811 | 126,521 (623 files) | 35,029 (288) | 814 (15) |
+| `tests/cases` | pin | 5,711,785 | 75,234 (477) | 36,276 (311) | 880 (23) |
+| distilled `cells/` | raw | 215,569 | 1,581 (52) | 18,898 (871) | 114 (2) |
+| distilled `cells/` | pin | 217,150 | 0 | 18,898 (871) | 114 (2) |
+| distilled `named/` | raw | 4,395,724 | 70,802 (848) | 16,175 (480) | 152 (16) |
+| distilled `named/` | pin | 4,404,634 | 61,171 (550) | 16,848 (510) | 200 (24) |
+
+LEFT-ONLY over all three populations, by node:
+
+| node | raw | pin |
+| --- | --- | --- |
+| generic, closed | 66,137 | 3,638 |
+| generic, open | 37,916 | 37,916 |
+| monomorphic or untyped | 94,851 | 94,851 |
+| generic share of LEFT-ONLY | 52.3% | 30.5% |
+
+The generic LEFT-ONLY falls from 104,053 to 41,554 (60%), and by 94.5% where the pin read closes
+the type. The 3,638 closed notes left are a `reflist` the descriptor does not cover (2,710,
+cause 2), a `list` or `strlist` the column leaves uncovered at a closed type (832, not yet
+ablated), and a narrowed nullable list (96, cause 3). The open 37,916 are nodes no pin binds,
+31,051 of them in `named/`'s un-annotated hole programs.
+
+The pin read also adds disagreements, all at closed generic nodes: RIGHT-ONLY grows by 1,920
+(1,247 in `tests/cases`, 673 in `named/`), and "different list rep" by 114, where the ladder
+answers `list` and the instance type is `f64[]` (65), `i64[]` (19) or `f32[]` (6), or the ladder
+answers `reflist` at an `i32[]` (24). `generics/explicit-type-arguments.vl` is the plainest:
+`make<T>()` inside `pushed<T>` at `i64` and at `f64`, where the ladder says `list` and the pin
+read says `i64list` and `f64list`. The program prints the right values, so the ladder's answer at
+those nodes is not the rep the emitter uses; which reader decides there is not yet ablated.
+
+**`exprString`'s call rungs, `tests/cases`.** `cells/` and `named/` are unchanged by the pin read:
+`cells/` agrees everywhere, `named/` keeps its 94 `fnRet` LEFT-ONLY (68 untyped, 26 a monomorphic
+union).
+
+| rung | raw | pin | what is left |
+| --- | --- | --- | --- |
+| named function returns `string` | 112 LEFT (22 files) | 105 LEFT (20) | 65 untyped, 32 open generic, 8 monomorphic |
+| callee returns `string` | 44 LEFT (6) | 13 LEFT (3) | 9 `atom` (cause 4), 4 untyped |
+| hole-operand signature | 26 LEFT (10) | 0 | |
+| field closure true | 17 LEFT (2) | 10 LEFT (1) | 8 open generic, 2 untyped |
+| final false | 49 RIGHT (8) | 137 RIGHT (19) | the 49 atoms of §13.9, and 88 closed generic calls in 11 files |
+
+Every closed generic LEFT-ONLY in `exprString` reaches 0. The six rungs §13.9 found agreeing
+still agree.
+
+**Why the hole-operand rung does not convert.** The probe above runs where a rung fires, so it
+cannot see a RIGHT-ONLY: a rung returns a constant behind a guard about the call, and converting
+it replaces the guard. Graded at the guard, `tyKindOf(holeOperandTyOf(…)) == TK_STR` against
+`nodeRepIn(…).rdKind == "str"`, both under the rung's signature test:
+
+| population | AGREE | LEFT-ONLY | RIGHT-ONLY |
+| --- | --- | --- | --- |
+| `tests/cases` | 51,566 | 0 | 68 (20 files) |
+| distilled `cells/` | 1,136 | 0 | 0 |
+| distilled `named/` | 22,632 | 0 | 0 |
+
+In 60 of the 68 the call branch answers `true` anyway, through a field-closure rung. The other 8
+are `generics/hole-bound-inline-record-field-function.vl`, where `g()` calls a captured
+string-returning field closure: the pin read says `string`, `exprString` answers `false`, and the
+program prints the right value. The six agreeing rungs were not graded at the guard.
+
+**Verdict.** Cause 1 is the pin read, and it is in. No site converts on this measurement: the
+hole-operand guard is the only one at 0 LEFT-ONLY in all three populations, and it has 68
+RIGHT-ONLY. In order, what unblocks the most notes now:
+
+1. The descriptor covers a `reflist` of union or closure elements (§9): 61,363 monomorphic and
+   2,710 closed generic notes.
+2. The open generic nodes, 37,916 notes: a node no pin binds needs the binding the emitter
+   actually uses for that instance, not the one the program banked.
+3. The 1,920 RIGHT-ONLY and 114 different-rep notes the pin read adds, ablated to the reader that
+   decides each.
+4. The literal-union softening and the alias rungs wait for registry step 5.
