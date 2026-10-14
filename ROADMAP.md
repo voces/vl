@@ -3030,14 +3030,16 @@ in-language GC knobs.
   `build.rs`'s `VL_SEED_KEY` forces a full crate recompile of the embed job every push (§3 item 8,
   ~16 s on a job that is not the critical path — the 48 s first reading was runner variance, and
   §1.5.1 records that correction as the method point it is).
-- 🟡 **B18. Tail-call optimization.** A returned direct call is `return_call` (#1324,
+- ✅ **B18. Tail-call optimization.** A returned direct call is `return_call` (#1324,
   `perf-landscape.md` §P1: 2.01x, recursion depth ~32k → 5M), and wasmtime 49 runs it with tail
   calls on by default; witness `tests/cases/functions/tail-call-depth.vl`. A void function's
   `return f()` and trailing call, a union-returning function's returned call, and a returned
   call through a function value (`return_call_indirect`) followed (D4654–D4657), witness
-  `tests/cases/functions/tail-call-depth-void-union-indirect.vl`. REMAINING, each still a plain
-  `call`: a void caller's call through a function value, and a call ending the last `if` arm of
-  a void function (the arm's `end` follows it).
+  `tests/cases/functions/tail-call-depth-void-union-indirect.vl`. A void caller's call through a function
+  value, and a call ending the last arm of a tail-position `if` in a void function (any depth of
+  `if`, `else if` and bare blocks) followed (D4680, D4681), witness
+  `tests/cases/functions/tail-call-depth-void-arm-value.vl`. A call ending a loop body or
+  followed by more code is not in tail position and keeps its `call`.
 - ✅ **B-chore-liststore-fuse. The three split-form list stores in `emit_rep.vl` are re-fused.**
   #921's workarounds at the tree builders (`rtGo`'s array arm, `rtOfNullable`, `rtOfMap`) had to
   stay ONE seed generation, because the published seed's store lowering predated the indexed-store
