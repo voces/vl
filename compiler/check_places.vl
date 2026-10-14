@@ -1,0 +1,97 @@
+// Narrowing places and the get-site table: `placeKeyOf` names the place an expression reads
+// (a bare name, a property path, or a literal-subscript element of either), and the table
+// records which member reads the checker resolved to a getter, since a getter read is a call
+// result and never a place. Every answer is a walk of the node arena; nothing here reads a
+// type, so the checker and the match-scrutinee hoist import it and it imports only `./ast`.
+import {
+  Ident,
+  Index,
+  Member,
+  NumLit,
+  OptMember,
+  P,
+  Paren,
+  StrLit,
+} from "./ast"
+
+// The member reads the checker resolved to a getter, keyed by the `Member` node, and read by
+// `checkProgramEndGetters`, which rewrites each into a call before the emitter runs.
+export let getSiteNodes: i32[] = []
+export let getSiteFns: string[] = []
+
+// The getter a read `v.p` banked at member node `ix`, or "" when it read no getter.
+export function getSiteFnOf(ix: i32): string {
+  if getSiteNodes.length == 0 { return "" }
+  let i = 0
+  while i < getSiteNodes.length {
+    if getSiteNodes[i] == ix { return getSiteFns[i] }
+    i = i + 1
+  }
+  ""
+}
+
+export function getSiteBank(ix: i32, fn: string) {
+  let i = 0
+  while i < getSiteNodes.length {
+    if getSiteNodes[i] == ix {
+      getSiteFns[i] = fn
+      return 0
+    }
+    i = i + 1
+  }
+  getSiteNodes.push(ix)
+  getSiteFns.push(fn)
+  0
+}
+
+// The canonical narrowing key for a place — a bare name (`x`), a property path rooted at one
+// (`o.v`, `o.v.w`), or a constant-index element of either (`xs[0]`) — or "" for anything else.
+// `x?.y` keys the same place as `x.y`, and a constant index names one storage cell for as long as
+// nothing writes `xs` or that cell. Parentheses are not part of a place; that arm sits at the head.
+export function placeKeyOf(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Paren { return placeKeyOf(n.parInner) }
+  if n is Ident { return n.identName }
+  if n is Member {
+    // A getter read is a call result, never a narrowing place (§D3a rule 4).
+    if getSiteFnOf(ix) != "" { return "" }
+    const base = placeKeyOf(n.memObj)
+    if base == "" { return "" }
+    return base + "." + n.memProp
+  }
+  if n is OptMember {
+    const base = placeKeyOf(n.omObj)
+    if base == "" { return "" }
+    return base + "." + n.omProp
+  }
+  if n is Index {
+    const base = placeKeyOf(n.idxArr)
+    if base == "" { return "" }
+    const lit = subscriptKeyTextOf(n.idxIndex)
+    if lit == "" { return "" }
+    return base + "[" + lit + "]"
+  }
+  ""
+}
+
+// D1025 — the key text of a literal subscript: the digits of an integer literal, the raw lexeme
+// (quotes and all) of a string literal, or `""` when the node is neither. The spelling is the key,
+// so `xs[0]` and `xs[00]` are different keys — over-conservative in the harmless direction. The
+// quotes keep the two grammars from colliding: `m[0]` and `m["0"]` are two different places.
+export function subscriptKeyTextOf(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Paren { return subscriptKeyTextOf(n.parInner) }
+  if n is NumLit {
+    const t = n.numText
+    if t.length < 1 { return "" }
+    let i = 0
+    while i < t.length {
+      if t[i] < '0' || t[i] > '9' { return "" }
+      i = i + 1
+    }
+    return t
+  }
+  if n is StrLit { return n.strText }
+  ""
+}
