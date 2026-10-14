@@ -446,6 +446,12 @@ zero, for `lint-self.sh`. `compiler/cli_budget.vl`; the first ratchet on it is i
 (architecture-refactor-plan T2), which has no script any more: `tests/vl_budget_mode_test.ts`
 holds the three verbs to one answer.
 
+`--budget`, `--budget-why` and `--findings` take the next token as their value whatever it
+is, like `--severity` (owner ruling, 2026-10-14): `vl check --budget --help` is a usage
+error, exit 2, not help. The host's `value_flags` lists every flag `cliParseArgs` takes a
+value for, so its help scan skips the same token; `tests/cli_host_tables_test.ts` holds the
+two tables equal.
+
 ## `std:` diagnostics are withheld unless asked for (`--include-std`)
 
 A `vl check` target resolves its whole module graph, so every `import … from
@@ -943,9 +949,9 @@ is a measured wall in V8, not an omission, so a `tests/cases/` fixture touching 
 
 ## Exit codes, and which module trapped
 
-The whole table, and it is the host's to answer — the VL side picks between 0, 1
-and 2 (`cliUsageErr`, the severity gate), and the two the host owns alone are the
-two a VL program cannot reach:
+The whole table. The VL side names the codes it picks as `CliExit` in `compiler/cli.vl`, and
+`tests/cli_host_tables_test.ts` holds that union, this table and the host's
+`EXIT_COMPILER_BUG` to one list:
 
 | code | meaning | decided by |
 | --- | --- | --- |
@@ -953,7 +959,7 @@ two a VL program cannot reach:
 | 1 | the program or its compilation failed | `report`, `cliExitCode` |
 | 2 | usage — unparseable command line, unreadable input | `arg_error`, `cliUsageErr` |
 | 3 | `vl fmt` only: the formatted output failed to re-parse | `cli.vl` |
-| 70 | **the COMPILER itself crashed** | `report` / `EXIT_COMPILER_BUG` |
+| 70 | **the COMPILER itself crashed**, or `vl check --codegen` emitted a module the engine refused | `report` / `EXIT_COMPILER_BUG`; `cliCheckExit` |
 
 **70 exists because a trap does not say which module raised it.** Two wasm modules
 are live in a `vl run`: the seed the host loaded as the compiler, and the module it

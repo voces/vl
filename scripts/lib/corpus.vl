@@ -1,0 +1,452 @@
+// The distilled corpus's files: the one-object-per-line cellmaps (`baseline.jsonl`,
+// `expected.jsonl`), the index that gives every cell on disk a row, and the text,
+// process and JSON helpers the corpus tools read and write them with.
+//
+//     import { audit, complaint, dumpCells, loadCells } from "../../lib/corpus"
+//
+// Paths resolve against the working directory, so a caller runs from the checkout root.
+// A cellmap is written sorted by cell with `cell` first, so one changed cell is one line.
+
+import { IoError, listDir, readFile, writeTextFile } from "std:fs"
+import { runProgram } from "std:process"
+import { decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { Json, JsonError, parseJson } from "std:json"
+import {
+  JsonMap,
+  Proc,
+  cpAt,
+  die,
+  exists,
+  findFrom,
+  hexDigits,
+  isDir,
+  jsonStr,
+  stripWs,
+  univNl,
+} from "./common"
+
+const HERE = "scripts/silent-sweep/distilled"
+const INDEX_VL = "vl run scripts/silent-sweep/distilled/index.vl --"
+const REDISTIL_VL = "vl run scripts/silent-sweep/distilled/redistil.vl"
+
+// One `expected.jsonl` row: the census block and how many census cells it stands for.
+export type Idx = { block: string, represents: i32 }
+
+// ── text helpers: the parts of Python's `str` this file reads with ──────────────────
+
+export function anyIn(s: string, needles: string[]): boolean {
+  for n in needles {
+    if findFrom(s, n, 0) >= 0 { return true }
+  }
+  false
+}
+
+// `s` padded with spaces to `w` code points, on the right (`<w`) or the left (`>w`).
+export function padRight(s: string, w: i32): string {
+  let out = s
+  let n = s.cpLen()
+  while n < w {
+    out = out + " "
+    n = n + 1
+  }
+  out
+}
+
+export function padLeft(s: string, w: i32): string {
+  let out = s
+  let n = s.cpLen()
+  while n < w {
+    out = " " + out
+    n = n + 1
+  }
+  out
+}
+
+// `xs` in byte order, which for UTF-8 is Python's code-point order. A hand merge sort
+// rather than `std:array`'s `sort`, whose comparator lambda makes the compiler trap (D4290).
+export function sortStrings(xs: string[]): string[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = sortStrings(xs.slice(0, mid))
+  const b = sortStrings(xs.slice(mid, xs.length))
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !(b[j] < a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// ── Python's spellings of a string: `json.dumps` and `repr` ──────────────────────────
+
+// Whether Python's `str.isprintable` refuses the non-ASCII code point `cp`: the
+// separators, format and control characters, surrogates and private use. Unassigned
+// code points, which Python also refuses, are not tabled.
+function unprintable(cp: i32): boolean {
+  if cp <= 0xA0 || cp == 0xAD || cp == 0x1680 || cp == 0x3000 { return true }
+  if (cp >= 0x600 && cp <= 0x605) || cp == 0x61C || cp == 0x6DD || cp == 0x70F {
+    return true
+  }
+  if cp == 0x180E || (cp >= 0x2000 && cp <= 0x200F) { return true }
+  if (cp >= 0x2028 && cp <= 0x202F) || (cp >= 0x205F && cp <= 0x206F) {
+    return true
+  }
+  if (cp >= 0xD800 && cp <= 0xF8FF) || cp == 0xFEFF { return true }
+  if cp >= 0xFFF9 && cp <= 0xFFFB { return true }
+  cp == 0xE0001 || (cp >= 0xE0020 && cp <= 0xE007F) || cp >= 0xF0000
+}
+
+// `repr(s)` for a `str`, as `%r` prints it.
+export function pyRepr(s: string): string {
+  let q = 39
+  if findFrom(s, "'", 0) >= 0 && findFrom(s, "\"", 0) < 0 { q = 34 }
+  const qs = s.slice(0, 0) + (if q == 39 { "'" } else { "\"" })
+  const parts = [qs]
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 0x80 {
+      if b == q || b == 92 { parts.push("\\" + s.slice(i, i + 1)) }
+      else if b == 9 { parts.push("\\t") }
+      else if b == 10 { parts.push("\\n") }
+      else if b == 13 { parts.push("\\r") }
+      else if b < 32 || b == 127 { parts.push("\\x" + hexDigits(b, 2)) }
+      else { parts.push(s.slice(i, i + 1)) }
+      i = i + 1
+      continue
+    }
+    const c = cpAt(s, i)
+    if !unprintable(c.cp) { parts.push(s.slice(i, i + c.n)) }
+    else if c.cp <= 0xFF { parts.push("\\x" + hexDigits(c.cp, 2)) }
+    else if c.cp <= 0xFFFF { parts.push("\\u" + hexDigits(c.cp, 4)) }
+    else { parts.push("\\U" + hexDigits(c.cp, 8)) }
+    i = i + c.n
+  }
+  parts.push(qs)
+  join(parts, "")
+}
+
+// ── processes and files ──────────────────────────────────────────────────────────
+
+export function spawn(cmd: string, args: string[]): Proc {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    die("corpus: cannot run \{cmd} (\{r.msg})", 1)
+    return { code: -1, out: "", err: "" }
+  }
+  {
+    code: r.code,
+    out: univNl(decodeUtf8Lossy(r.stdout)),
+    err: univNl(decodeUtf8Lossy(r.stderr)),
+  }
+}
+
+export function readText(path: string): string {
+  const t = readFile(path)
+  if t is IoError {
+    die("corpus: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  univNl(decodeUtf8Lossy(t))
+}
+
+export function writeText(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null { die("corpus: cannot write \{path} (\{w.msg})", 1) }
+}
+
+// The `*.vl` basenames of `dir`, without the extension, as `glob` lists them.
+export function cellsIn(dir: string): string[] {
+  const out: string[] = []
+  if !isDir(dir) { return out }
+  const names = listDir(dir)
+  if names is IoError { return out }
+  for n in names {
+    if (
+      n.length > 3
+      && !startsWith(n, ".")
+      && n.slice(n.length - 3, n.length) == ".vl"
+    ) {
+      out.push(n.slice(0, n.length - 3))
+    }
+  }
+  out
+}
+
+export function parseOrDie(text: string, what: string): Json {
+  const j = parseJson(text)
+  if j is JsonError {
+    die("corpus: \{what} is not JSON: \{j.msg}", 1)
+    return null
+  }
+  j
+}
+
+export function strField(m: JsonMap, key: string): string {
+  const v = m[key]
+  if v is string { return v }
+  ""
+}
+
+export function numField(m: JsonMap, key: string): f64 {
+  const v = m[key]
+  if v is f64 { return v }
+  0.0
+}
+
+// ── the corpus files, one JSON object per line ──────────────────────────────────────
+
+// A Python `json.dumps` of a value read back from a cellmap file: integral numbers as
+// integers, maps in the order they were read.
+export function dumpJson(v: Json): string {
+  if v == null { return "null" }
+  if v is boolean {
+    if v { return "true" }
+    return "false"
+  }
+  if v is string { return jsonStr(v) }
+  if v is f64 {
+    const n = v as? i64
+    if n != null { return toString(n) }
+    return toString(v)
+  }
+  if v is JsonMap {
+    const parts: string[] = []
+    for k, x in v { parts.push(jsonStr(k) + ": " + dumpJson(x)) }
+    return "{" + join(parts, ", ") + "}"
+  }
+  const items: string[] = []
+  if v is Json[] {
+    for x in v { items.push(dumpJson(x)) }
+  }
+  "[" + join(items, ", ") + "]"
+}
+
+// A cellmap file read back: every non-blank line one object, keyed by its `cell`.
+export function loadCells(path: string): Map<string, JsonMap> {
+  const out: Map<string, JsonMap> = Map()
+  for line in readText(path).split("\n") {
+    if stripWs(line) == "" { continue }
+    const rec = parseOrDie(line, path)
+    if rec is JsonMap {
+      out[strField(rec, "cell")] = rec
+    } else {
+      die("corpus: a line of \{path} is not an object", 1)
+    }
+  }
+  out
+}
+
+// A cellmap file written: sorted by cell, `cell` first and the other keys sorted.
+export function dumpCells(path: string, cells: Map<string, JsonMap>) {
+  const lines: string[] = []
+  for c in sortStrings(cells.keys()) {
+    const rec = cells[c]
+    if rec == null { continue }
+    const keys: string[] = []
+    for k in rec.keys() {
+      if k != "cell" { keys.push(k) }
+    }
+    const parts = ["\"cell\": " + jsonStr(c)]
+    for k in sortStrings(keys) {
+      parts.push(jsonStr(k) + ": " + dumpJson(rec[k] ?? null))
+    }
+    lines.push("{" + join(parts, ", ") + "}\n")
+  }
+  writeText(path, join(lines, ""))
+}
+
+export function idxOf(rec: JsonMap): Idx {
+  {
+    block: strField(rec, "block"),
+    represents: numField(rec, "represents") as! i32,
+  }
+}
+
+// ── the corpus index: `expected.jsonl`, one row per cell on disk ─────────────────────
+
+const DERIVED = ["A", "B", "C", "D", "E"]
+
+export function isDerived(block: string): boolean {
+  for d in DERIVED {
+    if d == block { return true }
+  }
+  false
+}
+
+// The three ways the index and the corpus can disagree, each sorted.
+export type Gaps = { missing: string[], orphan: string[], unsourced: string[] }
+
+function sourceNames(): Map<string, boolean> {
+  const out: Map<string, boolean> = Map()
+  const path = HERE + "/named/sources.json"
+  if !exists(path) { return out }
+  const j = parseOrDie(readText(path), path)
+  if j is JsonMap {
+    for k in j.keys() { out[k] = true }
+  }
+  out
+}
+
+export function diskCells(): Map<string, boolean> {
+  const out: Map<string, boolean> = Map()
+  for c in cellsIn(HERE + "/cells") { out[c] = true }
+  for c in cellsIn(HERE + "/named") { out[c] = true }
+  out
+}
+
+export function audit(): Gaps {
+  const idx = loadCells(HERE + "/expected.jsonl")
+  const disk = diskCells()
+  const sources = sourceNames()
+  const missing: string[] = []
+  for c in disk.keys() {
+    if !idx.has(c) { missing.push(c) }
+  }
+  const orphan: string[] = []
+  const blocks: Map<string, boolean> = Map()
+  for c, rec in idx {
+    if !disk.has(c) { orphan.push(c) }
+    const b = strField(rec, "block")
+    if !isDerived(b) && !sources.has(b) { blocks[b] = true }
+  }
+  {
+    missing: sortStrings(missing),
+    orphan: sortStrings(orphan),
+    unsourced: sortStrings(blocks.keys()),
+  }
+}
+
+export function firstEight(xs: string[]): string {
+  const shown: string[] = []
+  for x in xs {
+    if shown.length < 8 { shown.push(x) }
+  }
+  let s = join(shown, ", ")
+  if xs.length > 8 { s = s + ", … and " + toString(xs.length - 8) + " more" }
+  s
+}
+
+// The loud sentence for a failing audit, naming the cells and the fix, or "".
+export function complaint(a: Gaps): string {
+  if a.missing.length == 0 && a.orphan.length == 0 && a.unsourced.length == 0 {
+    return ""
+  }
+  const out = [
+    "distilled: THE CORPUS INDEX IS INCOMPLETE — expected.jsonl does not describe the cells this run would grade, and grading anyway means defaulting an answer nobody computed.",
+  ]
+  if a.missing.length > 0 {
+    out.push(
+      "  \{toString(a.missing.length)} cell(s) on disk with NO row: "
+        + firstEight(a.missing),
+    )
+    out.push(
+      "    fix: \{INDEX_VL} --set <named-set> --missing   (a curated set),",
+    )
+    out.push(
+      "         or \{REDISTIL_VL}                        (a derived cell),",
+    )
+    out.push(
+      "         or regress.vl -- <seed.wasm> --write-baseline --set <named-set> in one move.",
+    )
+  }
+  if a.orphan.length > 0 {
+    out.push(
+      "  \{toString(a.orphan.length)} row(s) with NO cell: "
+        + firstEight(a.orphan),
+    )
+    out.push("    fix: \{INDEX_VL} --prune, or restore the missing `.vl`.")
+  }
+  if a.unsourced.length > 0 {
+    out.push(
+      "  \{toString(a.unsourced.length)} curated block(s) with no `named/sources.json` entry: "
+        + join(a.unsourced, ", "),
+    )
+    out.push(
+      "    fix: add the set's provenance — what named it and what it cost.",
+    )
+  }
+  join(out, "\n")
+}
+
+// Drop the rows whose `.vl` is gone; returns their cells, sorted.
+export function prune(): string[] {
+  const path = HERE + "/expected.jsonl"
+  const idx = loadCells(path)
+  const disk = diskCells()
+  const kept: Map<string, JsonMap> = Map()
+  const gone: string[] = []
+  for c, rec in idx {
+    if disk.has(c) { kept[c] = rec } else { gone.push(c) }
+  }
+  if gone.length > 0 { dumpCells(path, kept) }
+  sortStrings(gone)
+}
+
+// A curated row for each named cell, at `block`; answers how many. Exits 1 on a set with
+// no `named/sources.json` entry, a derived cell, or a cell that is not on disk.
+export function writeSet(block: string, names: string[]): i32 {
+  if !sourceNames().has(block) {
+    die(
+      "index: `\{block}` has no `named/sources.json` entry. A curated set carries its provenance there — what named it and what it cost — before it carries index rows.",
+      1,
+    )
+  }
+  const derived: Map<string, boolean> = Map()
+  for c in cellsIn(HERE + "/cells") { derived[c] = true }
+  const bad: string[] = []
+  for n in names {
+    if derived.has(n) { bad.push(n) }
+  }
+  if bad.length > 0 {
+    die(
+      "index: \{join(sortStrings(bad), ", ")} live in cells/, the DERIVED half. Their rows come from redistil.vl, never from a named set.",
+      1,
+    )
+  }
+  const onDisk: Map<string, boolean> = Map()
+  for c in cellsIn(HERE + "/named") { onDisk[c] = true }
+  const gone: string[] = []
+  for n in names {
+    if !onDisk.has(n) { gone.push(n) }
+  }
+  if gone.length > 0 {
+    const g = sortStrings(gone)
+    die(
+      "index: no `named/\{g[0]}.vl` (and \{toString(g.length - 1)} more). A row for a cell that is not there is the orphan half of the same defect.",
+      1,
+    )
+  }
+  const path = HERE + "/expected.jsonl"
+  const idx = loadCells(path)
+  for n in names {
+    const rec: JsonMap = Map()
+    rec["block"] = block
+    rec["represents"] = 1.0
+    idx[n] = rec
+  }
+  dumpCells(path, idx)
+  names.length
+}
+// ── the parent: stage chunks, fan them out, read the answers back ────────────────────
+
+export function makeTempDir(): string {
+  const p = spawn("mktemp", ["-d"])
+  if p.code != 0 { die("corpus: mktemp -d failed: " + p.err, 1) }
+  stripWs(p.out)
+}
+
+export function cwd(): string {
+  const p = spawn("pwd", ["-P"])
+  if p.code != 0 { die("corpus: pwd failed: " + p.err, 1) }
+  stripWs(p.out)
+}

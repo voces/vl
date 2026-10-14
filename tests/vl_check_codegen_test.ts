@@ -953,7 +953,7 @@ const CLEAN_SRC = `let x = 1\nprint(x)\n`;
 // THE CENSUS WAS RE-RUN AND THE CLASS IS EMPTY. All **140** rows of
 // `docs/internals/silent-class-inventory.md` and all **14** of `silent-class-inventory-2.md`
 // had their OWN filed programs graded against the closing tree
-// (`python3 scripts/check-filed-witnesses.py --json …`): 125 run, 10 loud emit rejects, 5 loud
+// (`check-filed-witnesses --json …`): 125 run, 10 loud emit rejects, 5 loud
 // check rejects, and **ZERO check-clean invalid wasm** — D311 was the last live member, and
 // after its pin is deleted the corpus carries no `@no-instantiate` directive at all. So this
 // takes the `null` branch the entry two paragraphs up wrote the instruction for, rather than

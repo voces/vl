@@ -145,7 +145,7 @@ then `emitModule`:
 1. **The pass table** is a dependency-ordered list of 46 rows, each `"<pass> > <prerequisite>…"`.
    The loop in `emitProgram` reads each row (`passRowName`), refuses to run one whose
    prerequisites have not all run (`passNeedsMet`, an `emitFail` naming the reordered pass),
-   dispatches it by name (`runEmitPass`), and bumps `emitPassGen` so a cross-pass memo cannot
+   dispatches it by name (`runEmitPass`), and bumps `emitPassGen` (`memoPassAdvance`, `memo.vl`) so a cross-pass memo cannot
    outlive the row that filled it. The order is **not** grouped by kind. Rewrites
    (`loopValueRewrite`, `dispatchRewrite`, `captureBoxRewrite`, the `synth*` annotation passes)
    interleave with the collect passes (`collectU`, `collectS`, `collectA`, `collectFns`,
@@ -465,7 +465,7 @@ uses `lintPathFor`. An unrelated project's own `src/compiler/` is never in scope
 parallel, and prints a per-gate table of wall time, CPU time and exit code. The rows are the
 Deno suites, the native and seed-backed suites (`ci-native`, including the editor suites whose
 list it reads from `ci.yml`), the native fixpoint, `lint-self.sh`, the distilled corpus
-(`scripts/silent-sweep/distilled/regress.py`, which blocks only on a `runs → not-runs` cell),
+(`scripts/silent-sweep/distilled/regress.vl`, which blocks only on a `runs → not-runs` cell),
 the filed-witness check, the seed-size and fuel ratchets, and the per-file lint ratchets. A tool
 change is graded by the gate rows that cover it, not by a hand run, and a gate is read by its
 exit code or its summary line. `CLAUDE.md` ("Gates") says what each row is for and its time

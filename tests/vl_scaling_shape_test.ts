@@ -861,8 +861,15 @@ axis(
 // went 18.6 - 20.4% inclusive -> 0.25 - 1.58% by re-seeding its prefix from a row cache, taking
 // the pair to 0.80 - 1.06 against 0.88 - 1.20; both arms clamp on `FLOOR` at 400 pins, so the
 // bar STAYS at the family default rather than tracking a number the harness cannot measure.
-axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
-  twoFiles(d, genPins(400, true), genPins(400, false)));
+// The bar is that default carried into wasmtime 49's fuel units, which read this unchanged
+// pair 0.68% higher than 47's; D4607, a whole-arena scan per first instance, holds the pair
+// at it (profiling-the-compiler.md, "Measured 2026-10-14").
+axis(
+  "generic pins",
+  2.52,
+  "`monoMakeInstanceGo` asks `monoNameWrittenAt` — a whole-arena scan — of every first instance (D4607).",
+  (d) => twoFiles(d, genPins(400, true), genPins(400, false)),
+);
 
 // 1.73 (0.116G / 0.067G fuel) against master `b05991d98`'s 5.75 (0.385G): a first instance's
 // slot write retired `buildFnMap`'s whole banked prefix, so every instance re-classified every
@@ -1622,6 +1629,25 @@ axis(
   2.0,
   "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/typecheck.vl).",
   (d) => twoFiles(d, genElseIfChains("value", 1, 2000), genElseIfChains("value", 20, 2000)),
+);
+
+// D3407: a `+` chain over a type parameter, one generic of `n` terms against `nf` generics of
+// `n / nf`. Each link's deferred result names the link below it twice, and resolving both at a
+// pin doubled the walk per term: 20 terms in one chain read 5.9e9 fuel on master `313eb4681`.
+const genGenericPlusChains = (nf: number, n: number): string => {
+  const o: string[] = [];
+  for (let f = 0; f < nf; f++) {
+    o.push(`function g${f}<T>(a: T): T {`, `  ${Array(n / nf).fill("a").join(" + ")}`, "}");
+  }
+  for (let f = 0; f < nf; f++) o.push(`print(g${f}(${f}))`);
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generic-body operator chain length",
+  2.5,
+  "A link of a `+` chain over a type parameter is resolving the link below it more than once at a pin (`substHoleTyReal`'s `HD_BINOP` arm or the `shMemo` answers, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genGenericPlusChains(1, 20), genGenericPlusChains(4, 20)),
 );
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────

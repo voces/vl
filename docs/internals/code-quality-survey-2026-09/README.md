@@ -219,13 +219,14 @@ Measure:
 This PR moved this row's number without closing it: threading `listOpKindOfBin` for row 9
 takes it from **10.8% to 4.49% inclusive**, measured on the same profile. The row's own
 remainder — 14 sites refuted, not merged — is unchanged, so the block is re-filed at the new
-cost rather than retired, in the PR that moved it.
+cost rather than retired, in the PR that moved it. Re-graded 2026-10-14 at `313eb4681`: 2.08%
+inclusive, after the L2 stage-3 and mono PRs of that week; the remainder is still unmerged.
 
 Measure:
 
     kind: profile-incl
     what: listOpKindOfBin
-    filed: 4.5
+    filed: 2.1
     tol: 2
     dir: both
 
@@ -234,7 +235,7 @@ Measure:
 Measure:
 
     kind: shell
-    cmd: grep -cE '^ *while .*< P\.nodes\.length' compiler/lint.vl
+    cmd: grep -cE '^ *while [A-Za-z_]+ < P\.nodes\.length' compiler/lint.vl
     filed: 1
     tol: 0
     dir: at-most

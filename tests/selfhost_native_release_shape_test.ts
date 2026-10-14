@@ -13,9 +13,13 @@ import {
   shapeOf,
   vl,
 } from "./support/nativeRelease.ts";
+import { concurrentTests } from "./support/concurrentTests.ts";
+
+// Every test builds into its own temp dir and shares no state, so they run a few at a time.
+const test = concurrentTests();
 
 for (const row of SHAPE_TABLE) {
-  Deno.test({
+  test({
     name: `native-release: bench/${row.bench} — emitted shape (${row.axis})`,
     ignore: !ENABLED,
     fn: async () => {

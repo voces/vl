@@ -30,7 +30,7 @@
 #
 # The two prunes, each for its own reason:
 #   * `scripts/silent-sweep/distilled/` — a corpus of deliberately odd programs; being
-#     un-idiomatic is what each cell is FOR. Graded by `distilled/regress.py`, not shipped.
+#     un-idiomatic is what each cell is FOR. Graded by `distilled/regress.vl`, not shipped.
 #     The prune covers the whole directory, not just `cells/`, because `named/` holds
 #     curated cells of the same kind and a per-subdirectory prune silently stops covering
 #     the next one added.
