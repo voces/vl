@@ -210,10 +210,10 @@ else
   mv "$SHIP" "$OUT"
   # The sanity run (and any ladder rung that compiled WITH $SHIP) left fresh `.cwasm`
   # sidecars beside it — the host's cached wasmtime compilations, ONE PER ENGINE
-  # CONFIGURATION (`$OUT.<engine tag>.cwasm`: `vl build`/`vl run` compile the seed
-  # under a different collector than `vl check`/`fmt`/`test`, so each keeps its own
-  # file and neither evicts the other). Move them all along so the next `vl`
-  # invocation deserializes instead of re-JITing, after clearing whatever sat beside
+  # CONFIGURATION (`$OUT.<seed key>.<engine tag>.cwasm`: the null-collector compile, the
+  # copying engine `vl build`/`vl run` and `vl check`/`fmt`/`test` share, and the fuel
+  # engines each keep their own file, and none evicts another). Move them all along so
+  # the next `vl` invocation deserializes instead of re-JITing, after clearing whatever sat beside
   # $OUT — a sidecar the move does not replace is stale, and the host would detect +
   # rebuild it anyway; removing it just keeps the set coherent on disk.
   rm -f "$OUT".cwasm "$OUT".*.cwasm
