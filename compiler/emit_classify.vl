@@ -41240,8 +41240,8 @@ function objNestedFieldCompat(
 
 // Whether the object literal at `litIx` fits struct row `si`: each scalar field of a kind the
 // row's stores (`declRowFieldKindFits`) and each nested literal fitting its own target row, to
-// `depth` levels (D3031); with `exact`, also the same field-name set. True for a non-literal or
-// an unknown row.
+// `depth` levels (D3031); with `exact`, also the same field-name set, less any nullable field
+// the literal leaves out (D4601). True for a non-literal or an unknown row.
 function objLitFitsRow(
   litIx: i32,
   si: i32,
@@ -41253,13 +41253,15 @@ function objLitFitsRow(
   }
   const v = P.nodes[litIx]
   if v is ObjLit {
-    if exact && v.objFields.length != sFieldCount[si] { return false }
+    if exact && v.objFields.length > sFieldCount[si] { return false }
+    let present = 0
     let fi = 0
     while fi < sFieldCount[si] {
       const name = sFieldNames[sFieldStart[si] + fi]
       const fv = objFieldVal(litIx, name)
+      if fv >= 0 { present = present + 1 }
       if fv < 0 {
-        if exact { return false }
+        if exact && !structRowFieldMayOmit(si, name) { return false }
       } else if sFieldTypeAt(si, fi) == FC_STRUCT {
         if (
           !objLitFitsRow(
@@ -41276,6 +41278,23 @@ function objLitFitsRow(
       }
       fi = fi + 1
     }
+    if exact && present != v.objFields.length { return false }
+  }
+  true
+}
+
+// Whether struct row `si`'s field `name` bears null, so a literal may leave it out; true when
+// the row records no type to ask.
+function structRowFieldMayOmit(si: i32, name: string): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  const ty = sTyIx[si]
+  if ty < 0 || ty >= T.tys.length { return true }
+  const o = T.tys[ty]
+  if !(o is TyObj) { return true }
+  let k = 0
+  while k < o.objFieldNames.length {
+    if o.objFieldNames[k] == name { return tyBearsNull(o.objFieldTypes[k]) }
+    k = k + 1
   }
   true
 }
@@ -41296,15 +41315,31 @@ export function objVariantNameCtx(objIx: i32, fnIx: i32) {
     const own = variantRowOfTy(nodeRepTyIxOf(objIx))
     // A bare `{}` names its arm only through the checker, having no field to match by (D2223).
     if own >= 0 && o.objFields.length == 0 { return uVariants[own] }
-    if own >= 0 && objMatchesVariantIdx(objIx, own, fnIx) {
+    if own >= 0 && objMatchesVariantIdxOmit(objIx, own, fnIx, true) {
       return uVariants[own]
+    }
+    // A literal leaving out a nullable field (D4601) is a row with the adopted record's names.
+    const rep = nodeRepTyIxOf(objIx)
+    if rep >= 0 && rep < T.tys.length {
+      const r = T.tys[rep]
+      if r is TyObj && r.objFieldNames.length > o.objFields.length {
+        let vo = ovnFirst(fieldNamesSig(r.objFieldNames))
+        while vo >= 0 && vo < uVariants.length {
+          if objMatchesVariantIdxOmit(objIx, vo, fnIx, true) {
+            return uVariants[vo]
+          }
+          vo = ovnNextOf(vo)
+        }
+      }
     }
     // Only a variant whose field-name signature equals the literal's can match — the matcher
     // below needs equal counts and every variant name present — so the bucket for that
     // signature holds every candidate, in the ascending order the scan visited them.
     let vi = ovnFirst(objLitFieldSig(objIx))
     while vi >= 0 {
-      if objMatchesVariantIdx(objIx, vi, fnIx) { return uVariants[vi] }
+      if objMatchesVariantIdxOmit(objIx, vi, fnIx, false) {
+        return uVariants[vi]
+      }
       vi = ovnNextOf(vi)
     }
   }
@@ -41330,6 +41365,11 @@ function objLitFieldSig(objIx: i32) {
       i = i + 1
     }
   }
+  fieldNamesSig(names)
+}
+
+// The signature of a field-name list: the names in `fieldNameOrder`, comma-joined.
+function fieldNamesSig(names: string[]) {
   const ord = fieldNameOrder(names)
   let out = ""
   let j = 0
@@ -41497,21 +41537,32 @@ function ovnNextOf(vi: i32) {
   ovnNext[vi]
 }
 
-// Whether the object literal at `objIx` matches variant `vi`: the field-name set equals the
-// variant's (order-independent), tightened per field — a map by `objMapFieldCompat`, a nested
-// struct by `objNestedFieldCompat`, a scalar by `variantFieldKindFits`. The one matcher behind
-// both `objVariantName` and `unionArmVariantForObj`, so the two never diverge.
-function objMatchesVariantIdx(objIx: i32, vi: i32, fnIx: i32): boolean {
+// Whether the object literal at `objIx` matches variant `vi`: equal field-name sets, tightened
+// per field by `objMapFieldCompat`, `objNestedFieldCompat` or `variantFieldKindFits`. With
+// `omit`, a field the literal leaves out matches when the variant may hold it as null (D4601),
+// asked only of an arm carrying the names of the record the checker adopted the literal as.
+function objMatchesVariantIdxOmit(
+  objIx: i32,
+  vi: i32,
+  fnIx: i32,
+  omit: boolean,
+): boolean {
   const o = P.nodes[objIx]
+  if vi < 0 || vi >= uFieldCount.length || vi >= uFieldStart.length {
+    return false
+  }
   if o is ObjLit {
     const cnt = uFieldCount[vi]
-    if cnt != o.objFields.length { return false }
+    if !omit && cnt != o.objFields.length { return false }
     const start = uFieldStart[vi]
     let allMatch = true
+    let present = 0
     let fj = 0
     while fj < cnt {
-      if objFieldVal(objIx, uFieldNames[start + fj]) < 0 {
-        allMatch = false
+      const at = objFieldVal(objIx, uFieldNames[start + fj])
+      if at >= 0 { present = present + 1 }
+      if at < 0 {
+        if !omit || !variantFieldMayOmit(vi, fj) { allMatch = false }
       } else if uFieldTypes[start + fj] == FC_MAP {
         if (
           !objMapFieldCompat(
@@ -41551,6 +41602,8 @@ function objMatchesVariantIdx(objIx: i32, vi: i32, fnIx: i32): boolean {
       }
       fj = fj + 1
     }
+    // Every entry the literal writes is one of the variant's fields.
+    if present != o.objFields.length { return false }
     return allMatch
   }
   false
@@ -41584,17 +41637,51 @@ export function unionArmVariantForObj(
   if u < 0 { u = bySet }
   else if bySet >= 0 && bySet < u { u = bySet }
   if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return -1 }
+  // A literal leaving out a nullable field (D4601) is the arm the checker adopted, which
+  // the field-name scan below cannot see: the omission matches a narrower arm by names alone.
+  const adopted = unionArmAdoptedOmitting(u, objIx, fnIx)
+  if adopted >= 0 { return adopted }
   let vi = unVarStart[u]
   while vi < unVarStart[u] + unVarCount[u] {
-    if objMatchesVariantIdx(objIx, vi, fnIx) { return vi }
+    if objMatchesVariantIdxOmit(objIx, vi, fnIx, false) { return vi }
     vi = vi + 1
   }
   -1
 }
 
+// The arm of union row `u` whose field-name set is that of the record the checker adopted the
+// literal at `objIx` as, when that record has fields the literal omits; -1 when the literal
+// omits nothing, or no single arm of `u` carries exactly those names and admits the omission.
+function unionArmAdoptedOmitting(u: i32, objIx: i32, fnIx: i32): i32 {
+  const o = P.nodes[objIx]
+  const rep = nodeRepTyIxOf(objIx)
+  if !(o is ObjLit) || rep < 0 || rep >= T.tys.length { return -1 }
+  if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return -1 }
+  const r = T.tys[rep]
+  if !(r is TyObj) || r.objFieldNames.length <= o.objFields.length { return -1 }
+  const own = variantRowOfTy(rep)
+  if own >= unVarStart[u] && own < unVarStart[u] + unVarCount[u] {
+    if objMatchesVariantIdxOmit(objIx, own, fnIx, true) { return own }
+  }
+  let hit = -1
+  let vi = unVarStart[u]
+  while vi < unVarStart[u] + unVarCount[u] && vi < uFieldCount.length {
+    let same = uFieldCount[vi] == r.objFieldNames.length
+    for n in r.objFieldNames {
+      if variantFieldIndex(vi, n) < 0 { same = false }
+    }
+    if same && objMatchesVariantIdxOmit(objIx, vi, fnIx, true) {
+      if hit >= 0 { return -1 }
+      hit = vi
+    }
+    vi = vi + 1
+  }
+  hit
+}
+
 // True if the plain struct at table index `ssi` has the same field layout (name set, count,
 // per-field type code) as the union-variant arm `vi` — the struct-index dual of
-// `objMatchesVariantIdx`. Recognizes a struct-typed value (an ident/call result, built as a
+// `objMatchesVariantIdxOmit`. Recognizes a struct-typed value (an ident/call result, built as a
 // distinct heap type from the arm's variant struct) as a union member so it can be re-boxed.
 function structIdxMatchesVariantIdx(ssi: i32, vi: i32): boolean {
   if ssi < 0 { return false }
