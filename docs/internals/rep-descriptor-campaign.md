@@ -2156,7 +2156,7 @@ Twenty sites read 0 LEFT-ONLY and 0 RIGHT-ONLY in all three populations, and the
 
 `nodeTyIsNullableString` lost its last caller and is deleted.
 
-### 13.6 Four sites stay on their ladder
+### 13.6 Four sites stay on their ladder (moved in §13.7)
 
 Each of these reads LEFT-ONLY: the ladder answers the niche where the column is uncovered.
 The column is narrower than the ladder here, not wrong, and switching would change behaviour.
@@ -2179,14 +2179,61 @@ These three move once the column covers a nullable variant member.
 `i32` sentinel. `repOfNullable`'s `TyArray` arm does not admit it. The witness is
 `tests/cases/lists/nullable-elem-list-nullable-binding.vl`.
 
-### 13.7 What is next, in order
+### 13.7 The four sites move, and two `repOfNullable` arms are added (D3c)
 
-`exprString`, then `exprRefArray`, `exprStringArray`, `exprArray`, `exprF64Array` and
-`exprListRep`, each under the same oracle. `exprString` was not converted here. Most of its
-rungs are about the call and the callee (`slice`, `pop`, closure-array calls, field closures,
-function-value signatures) rather than the node's own type. Only its `AsExpr` and `if`-join
-`TK_STR` rungs are candidates for the column.
+`repOfNullable` covers the two shapes §13.6 names, and its match is still `_`-less:
 
-Before those, cover a nullable variant member and a nullable-literal-union element in
-`repOfNullable`, then move the four sites in §13.6. The alias sites of §13.3 still wait for
-registry step 5.
+* **`S | null` where `S` is an object type.** `repNulObjKind(S)` picks the niche. It is
+  `nulvariant`, the `(ref null $uVarHeap[vi])` niche, when `S` is a union arm the variant table
+  registered (`uVarTyIx`) and no declared struct row claims it. Otherwise it is `nulstruct`.
+  `std:fs`'s `IoError` has a declared row, so `IoResult` stays `nulstruct`. The tree side
+  (`rtNulVKind`) asks the same function, where it used to return no kind for a union arm.
+* **`(K | null)[] | null` and `(boolean | null)[] | null`.** Both elements keep their null in
+  an `i32` sentinel, so the niche is `nullist` on the `i32` backing, as for `K[] | null`.
+
+The probe was built from #3680's head and wrapped each of the four sites, their two variant
+twins, and the three `exprString` rungs that read the node's own type. It was never committed.
+LEFT-ONLY means the ladder said yes and the column said no. `nrCallFb` was measured twice: against
+`nulstruct` alone, and against `nulstruct` or `nulvariant`.
+
+| site | `tests/cases` (4,982) AGREE / LEFT / RIGHT | `cells/` (1,477) | `named/` (8,647) |
+| --- | --- | --- | --- |
+| `nrCallFb` vs `nulstruct` | 52,369 / 171 (22 files) / 0 | 2,974 / 0 / 0 | 29,062 / 0 / 0 |
+| `nrCallFb` vs either object niche | 52,540 / 0 / 0 | 2,974 / 0 / 0 | 29,062 / 0 / 0 |
+| `nrParam` (`paramNulRef`) | 88,443 / 4 (1 file) / 0 | 5,327 / 0 / 0 | 56,994 / 0 / 0 |
+| `nrLetAnn` (`letIsNulRef`) | 63,356 / 0 / 0 | 21,315 / 0 / 0 | 33,242 / 0 / 0 |
+| `qnlLetAnn` (`letIsNulList`) | 63,753 / 0 / 0 | 20,251 / 0 / 0 | 31,781 / 0 / 0 |
+| `vParam` (`paramNulVariant`) | 72,939 / 0 / 0 | 2,442 / 0 / 0 | 49,513 / 0 / 0 |
+| `vLetAnn` (`letIsNulVariant`) | 61,456 / 0 / 0 | 20,238 / 0 / 0 | 32,814 / 0 / 0 |
+| `exprString` `AsExpr` rung | 5,433 / 0 / 0 | not reached | 2,386 / 0 / 0 |
+| `exprString` `if`-join rung | 2,782 / 0 / 0 | not reached | 473 / 0 / 0 |
+| `exprString` closure-call gate | 51,125 / 0 / 0 | 1,136 / 0 / 0 | 22,632 / 0 / 0 |
+
+`nrCallFb`'s 171 is the call fallback admitting a union arm's niche; compared with both object
+niches it reads 0. `paramNulVariant` and `letIsNulVariant` move with their struct twins. All ten
+are converted.
+
+`nrParam`'s 4 notes are one program, `tests/cases/closures/nullable-arm-param-function-value.vl`.
+`app<Circle | null>`'s instance spells its parameter by shape (`{r: i32} | null`), and its
+checked type is `Circle | null`, where `Circle` is an arm of `Shape`. The ladder reads the
+spelling and answers `nulstruct`. The column reads the type and answers `nulvariant`, so
+`paramNulVariant` takes the parameter instead. This is the one module the PR changes: the
+instance's parameter is typed `(ref null $Circle)` rather than `structref`, and two
+`ref.as_non_null` casts and one function type drop out. The program prints the same thing.
+
+The flat/tree shadow (`VL_REP_SHADOW`) reads 6 more `kind flat=nullist tree=nul/` lines over
+`tests/cases` than before, all from the new element arm. The tree's list builder names a
+nullable element `struct`, as it already does for `nulstrlist` and `nulreflist`. `repOfTy` falls
+back to the flat side when the tree has no kind, so nothing reads the gap.
+
+### 13.8 What is next, in order
+
+1. `exprString`'s remaining rungs. They ask about the call or the callee (`slice`, `pop`,
+   closure-array calls, field closures, function-value signatures), so they need a rep at the
+   call site, not the node's own type.
+2. `exprRefArray`, `exprStringArray`, `exprArray`, `exprF64Array` and `exprListRep`, each under
+   the same oracle.
+3. The tree's list builder gains the nullable-element arms (`nullist`, `nulstrlist`,
+   `nulreflist`), which closes the flat/tree disagreements above.
+
+The alias sites of §13.3 still wait for registry step 5.
