@@ -2684,6 +2684,11 @@ It still reads only a node whose type at its instance is a non-null `TyArray`.
   ref list, but whose element has no ref-list row, reached `recordRefPushSlot` with slot `-1`,
   which was stored. `recordRefPushSlot` now records nothing for `-1`.
 
+One filed row now runs and is closed: D4032, a lambda parameter annotated `T[]` in a generic
+body and passed to a generic function. Its fixture is
+`tests/cases/generics/lambda-array-param-into-generic-call.vl`. The `sorted(ys, lt)` spelling
+from its grading list now refuses one layer later, on the comparator, and is filed as D4647.
+
 **Two coverage steps** in `compiler/emit_rep.vl`, both aimed at the `Ident` LEFT-ONLY:
 
 * `repOfNullableArray` answers `nulreflist` for any nullable list whose base is a covered
