@@ -714,8 +714,8 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      witnesses them. Over the 55 files the switch moved nothing. The record still decides
      the join: it is order-based, and a join over the directed pins is the next step.
    - Eleventh PR: the join is read from the directed pins, and `monoCellSigRecord` is
-     deleted. `fnFlowLetPinSigs` returns every distinct closed pin the `let`'s value flows
-     to. Each slot also keeps the context that walked it, so a binding walked in two
+     deleted. `fnFlowLetPinSigs` (now `fnFlowDeclPathPinSigs`) returns every distinct closed
+     pin the `let`'s value flows to. Each slot also keeps the context that walked it, so a binding walked in two
      contexts answers for the context whose instance the read's frame stands for
      (`monoFrameInstTmpl`, the same fit `fnFlowLamPin` uses), and declines only when no
      context fits. `monoLetPinTake` folds the pins with `monoSigJoin`. The join must be one
@@ -840,6 +840,14 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
 
      What is left for these pins is writes and pushes, so the next retirement waits on the
      table deciding a write.
+   - Fifth PR: `monoPinGenericRecord` retires, with `monoRecordFieldUses` and
+     `monoMemberOfBinding`. A field of an un-annotated `const` record that holds a generic is
+     instanced at the one signature the table pins its `f.<name>` slot at
+     (`fnFlowDeclPathPinSigs`, which generalises `fnFlowLetPinSigs` to a path), and so is each
+     value a write `d.f = v` stores; the writes come from the mono write index under `f:`.
+     A field pinned at two signatures keeps the per-call rewrite of the flow reads, which now
+     also reach a generic declared inside a function where the read is in its scope. This
+     closes D4700, where the retired walk missed an alias call and emitted invalid wasm.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
