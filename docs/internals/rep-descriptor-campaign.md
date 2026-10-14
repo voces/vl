@@ -2237,3 +2237,68 @@ back to the flat side when the tree has no kind, so nothing reads the gap.
    `nulreflist`), which closes the flat/tree disagreements above.
 
 The alias sites of §13.3 still wait for registry step 5.
+
+### 13.9 `exprString`'s call rungs and the list classifiers: measured, none converted
+
+The §13.8 queue was run under the same oracle. Each site ran its old ladder beside `nodeRepIs`
+under `VL_REP_SHADOW=1`; the probe was built from the PR's base and never committed. A file counts
+once whatever its note count. "LEFT-ONLY" means the ladder answers and the column does not.
+
+**`exprString`, call and callee rungs.** The call branch has twelve rungs. Six (`slice`, `pop`,
+closure-array call, field closure typed by the checker, field closure false, closure value) agree
+everywhere.
+
+| population | built | AGREE | LEFT-ONLY | RIGHT-ONLY |
+| --- | --- | --- | --- | --- |
+| `tests/cases` | 4,120 of 5,222 | 66,257 | 199 (39 files) | 49 (8 files) |
+| distilled `cells/` | 1,223 of 1,477 | 1,136 | 0 | 0 |
+| distilled `named/` | 4,870 of 8,647 | 36,104 | 94 (39 files) | 0 |
+
+| rung | disagreement | cause |
+| --- | --- | --- |
+| named function returns `string` (`fnRetStringSid`) | 206 LEFT, 61 files | column uncovered at a call in a generic instance (the node type is a `TyVar`); 10 notes are `union`, in `closures/fn-arm-union-inferred-return.vl` and `inference/hole-join-generic-arg.vl` |
+| callee returns `string` (`calleeReturnsStringAt`) | 44 LEFT, 6 files | 9 notes `atom`, an inferred literal-union return (`unions/inferred-tag-return-atom.vl`); the rest uncovered `TyVar` |
+| hole-operand signature | 26 LEFT, 10 files | uncovered `TyVar` |
+| field closure true | 17 LEFT, 2 files | uncovered `TyVar` |
+| final false | 49 RIGHT, 8 files, all `tests/cases` | column says `str` where the emitter reps an atom, e.g. an inferred literal-union return in `literal-unions/narrowed-nullable-literal-delivery.vl` |
+
+These rungs already read a call-site rep (`repOfNameResult`, `repOfFnSlot`, `sigKeyRetKind`). The
+node column reads the call's own type, which in a generic instance is the unpinned `TyVar`, so it
+cannot replace them. The literal-union exclusions wait for registry step 5, as in §13.3.
+
+**`exprListRep` and its four projections.** `exprArray`, `exprRefArray`, `exprStringArray` and
+`exprF64Array` are one-line projections of `exprListRep` (D2275), so the oracle ran there.
+`AGREE` means both say "not a list" or both name the same list rep.
+
+| population | AGREE | LEFT-ONLY | RIGHT-ONLY | different list rep |
+| --- | --- | --- | --- | --- |
+| `tests/cases` | 5,645,058 | 126,430 (623 files) | 34,991 (288 files) | 814 (15 files) |
+| distilled `cells/` | 215,569 | 1,581 (52 files) | 18,898 (871 files) | 114 (2 files) |
+| distilled `named/` | 4,384,034 | 70,802 (848 files) | 16,175 (480 files) | 152 (16 files) |
+
+Bucketed over all three populations:
+
+| bucket | notes | files | cause |
+| --- | --- | --- | --- |
+| LEFT, generic instance, column uncovered | 103,973 | 877 | the column reads the raw `TyVar`; the ladder reads the pin (`nodeTyPinIxOf`) |
+| LEFT, monomorphic, column uncovered | 91,216 | 848 | descriptor coverage gap: a `reflist` of union or closure elements (§9) |
+| LEFT, monomorphic, column says nullable list | 3,550 | 96 | a narrowed read: the type is `T[] \| null`, the read is the list |
+| RIGHT, monomorphic, ladder declines | 68,321 | 1,575 | mostly an `Ident` whose slot is not a list while its type is, e.g. `generics/mono-callback-bound-arm-beside-layout-twin.vl`: the ladder answers the slot's rep, the column the type's |
+| RIGHT, generic instance | 1,743 | 66 | the same, under a pin |
+| different list rep | 1,080 | 33 | `list`→`reflist` 1,061 (`globals/nullable-refarray-global-empty-init.vl`), `strlist`→`reflist` 16, `f32list`→`f64list` 3 |
+
+The only node kind that reads 0 and 0 everywhere is `AsExpr`. It has 13 list-valued notes, all in
+`tests/cases/unions/as-trap-nullable-ref-niche.vl`, and its generic face cannot be measured
+because a generic `x as! T` over a list is refused at emit today. It is not converted on that
+evidence.
+
+**Verdict.** No site in the §13.8 queue converts; this section is the measurement. Four causes
+block it, in the order they unblock the most notes:
+
+1. The column has no pin-aware read. A node in a generic instance carries a `TyVar`, and every
+   ladder reads the instance type through the pin. A `nodeRepIs` that resolves the pin first is
+   the next step.
+2. The descriptor does not cover a `reflist` of union or closure elements (§9).
+3. A slot's rep and the type of a narrowed read differ. The ladder answers the slot, the column
+   the type, so a converted site needs the narrowing's rep, not the declared one.
+4. The literal-union softening and the alias rungs wait for registry step 5.
