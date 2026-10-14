@@ -54,7 +54,7 @@ const SCAN_EXT = /\.(md|vl|ts|py|sh|rs|yml)$/;
 //
 // THE SUFFIX IS PART OF THE ID. `### D1009-N` and `### D1009` are two rows, and reading the
 // first as `D1009` reported a duplicate that does not exist — the same widening
-// `check-filed-witnesses.py`'s `SEC` needed, for the same reason.
+// the witness grader's row heading needed, for the same reason.
 const HEAD = /^#{2,4}\s+(D\d{1,4}(?:-?[A-Za-z][A-Za-z0-9]*)?)\b/;
 // A cited id. Word-bounded on both sides so `D1042` matches and `AD10`, `D1042x` do not.
 const CITE = /(?<![A-Za-z0-9_])D(\d{1,4})(?![0-9A-Za-z_])/g;

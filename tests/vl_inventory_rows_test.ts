@@ -1,6 +1,6 @@
 // THE ROW DISCIPLINE, ENFORCED — every filed defect row carries a witness the checker can RUN.
 //
-// `scripts/check-filed-witnesses.py` exists because a defect inventory goes stale in ONE
+// `scripts/check-filed-witnesses.vl` exists because a defect inventory goes stale in ONE
 // direction: a fixed defect keeps reading as live. It re-runs each row's own program and
 // reports which no longer behave as filed. But it had a hole, and the hole was the shape of
 // the defects it was written to catch — A REAL CONDITION THAT NO INSTRUMENT REPORTED:
@@ -15,12 +15,12 @@
 //
 // This is the enforcement, and it is deliberately the CHEAP half: it asserts the STRUCTURE
 // a gradeable row must have and never runs a program, so it costs milliseconds, needs no
-// compiler and no python, and can therefore sit in `deno task test` where it is seen on
+// compiler and no grader run, and can therefore sit in `deno task test` where it is seen on
 // every PR. The BEHAVIOURAL half — does the witness still do what the row says — stays in
-// `check-filed-witnesses.py --strict`, which is slower (it compiles and runs ~100 programs)
+// `check-filed-witnesses.vl --strict`, which is slower (it compiles and runs ~100 programs)
 // and is the manual gate CLAUDE.md names.
 //
-// THE VOCABULARY IS READ OUT OF THE PYTHON, NOT RE-SPELLED HERE. Two copies of a list like
+// THE VOCABULARY IS READ OUT OF THE GRADER, NOT RE-SPELLED HERE. Two copies of a list like
 // this drift, and the drift is silent in exactly the direction that matters: a status word
 // the script accepts and this test does not would red the tree for a correct row, and one
 // this accepts and the script does not would let an ungradeable row through — which is the
@@ -46,7 +46,7 @@
 // every defect PR appended to one file's tail, so two concurrent PRs conflicted there
 // nearly every hour, once splicing two rows into the middle of a third. This reads a
 // DIRECTORY of one-row files, and a directory holding none yet falls back to the monolith
-// named in its own README — the same rule `check-filed-witnesses.py`'s `resolve` applies,
+// named in its own README — the same rule `scripts/lib/inventory.vl`'s `resolve` applies,
 // and read from the same marker line, so the two cannot answer differently while the split
 // is in flight. Two directories, not one: the inventories number independently and D1..D14
 // exist in both, which is also why the duplicate-id check below is per document.
@@ -54,7 +54,7 @@ const DIRS = [
   "docs/internals/inventory",
   "docs/internals/inventory-2",
 ];
-const CHECKER = "scripts/check-filed-witnesses.py";
+const CHECKER = "scripts/lib/inventory.vl";
 const SOURCE_MARK = /^<!--\s*inventory-split:\s*source\s+(\S+)\s*-->\s*$/m;
 
 /** The docs a directory stands for: its `D*.md` rows, or the monolith it came from. */
@@ -83,12 +83,12 @@ async function docsOf(dir: string): Promise<string[]> {
   return [m[1]];
 }
 
-// `### D12 — title` / `## A1 - title`, the same shape `check-filed-witnesses.py`'s `SEC`
+// `### D12 — title` / `## A1 - title`, the same shape `scripts/lib/inventory.vl`'s `matchSec`
 // matches. Analysis sections (`### Root A — …`) are deliberately NOT rows and are not
 // matched by either, so this cannot red on a heading that was never a defect.
 //
 // THE SUFFIX GRAMMAR IS WHATEVER AUTHORS REACHED FOR — `D661A`, `D804b`, `D1009-N` — and
-// the python was widened for the hyphen while this copy was not, so `D1009-N` was a row
+// the grader was widened for the hyphen while this copy was not, so `D1009-N` was a row
 // this test could not see: it would have accepted that row with no `Repro:` label at all.
 // `ROWHEAD` is the audit the widening cannot replace — count the POPULATION of row-shaped
 // headings and fail on any `SEC` misses, so the next id shape nobody anticipated reds
@@ -115,16 +115,16 @@ function statusJoinContinues(line: string): boolean {
 
 /** The declared-status vocabulary, read from the grader so the two cannot drift. */
 function vocabulary(src: string): string[] {
-  const block = src.split("DECLARED = [")[1];
+  const block = src.split("export const DECLARED_NEEDLE = [")[1];
   if (block === undefined) {
     throw new Error(
-      `${CHECKER}: no \`DECLARED = [\` list found — the status vocabulary moved, and this ` +
-        `test reads it from there so the two cannot drift. Update the parse.`,
+      `${CHECKER}: no \`export const DECLARED_NEEDLE = [\` list found — the status vocabulary ` +
+        `moved, and this test reads it from there so the two cannot drift. Update the parse.`,
     );
   }
-  const phrases = [...block.split("\n]")[0].matchAll(/\(\s*"([^"]+)"/g)].map((m) => m[1]);
+  const phrases = [...block.split("\n]")[0].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
   if (phrases.length === 0) {
-    throw new Error(`${CHECKER}: parsed \`DECLARED\` but found no phrases in it`);
+    throw new Error(`${CHECKER}: parsed \`DECLARED_NEEDLE\` but found no phrases in it`);
   }
   return phrases;
 }
@@ -275,7 +275,7 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
             `${doc}:${n + 1}  — row heading this parser did NOT recognise, so the row is ` +
               `in no check above\n      want: \`SEC\` to match every \`### D…\` heading\n` +
               `      got:  ${JSON.stringify(ln.trim().slice(0, 90))}. Widen \`SEC\`'s id ` +
-              `pattern to admit the suffix (and \`check-filed-witnesses.py\`'s), or ` +
+              `pattern to admit the suffix (and \`scripts/lib/inventory.vl\`'s), or ` +
               `rename the row.`,
           );
         }
@@ -339,7 +339,7 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
 
   // A DUPLICATE ROW ID IS INVISIBLE TO EVERY OTHER INSTRUMENT, and it reached master on
   // 2026-08-30. Two agents working concurrently each filed a `D626`; both landed, and
-  // `check-filed-witnesses.py --strict` reported `192 graded · 192 as filed · 0 MOVED ·
+  // `check-filed-witnesses.vl --strict` reported `192 graded · 192 as filed · 0 MOVED ·
   // 0 not graded` — because a duplicate id is not an ungradeable row. Both rows graded
   // fine INDIVIDUALLY. What breaks is everything that refers to a row BY ITS NUMBER:
   // a brief, a CHANGELOG entry, a `named/` set, the next agent told to "read D626".
@@ -350,7 +350,7 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
   // file — one file per row would otherwise make every id trivially unique and the check
   // vacuous exactly when it starts to matter, since two PRs can now each add a `D626.md`.
   //
-  // Cheap and structural, so it belongs here rather than in the python.
+  // Cheap and structural, so it belongs here rather than in the grader.
   const seen = new Map<string, string>();
   for (const [doc, id, where] of ids) {
     const prior = seen.get(`${doc}\u0000${id}`);
@@ -384,7 +384,7 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
 });
 
 // THE LABEL RULE, SEEN TO FIRE — on specimens whose answer is known by construction, the
-// same discipline `check-filed-witnesses.py --self-test` applies to the outcome vocabulary.
+// same discipline `check-filed-witnesses.vl --self-test` applies to the outcome vocabulary.
 // A rule that has never rejected anything is not known to reject anything, and the test
 // above cannot show it: every filed row passes, so a rule that accepted everything would
 // look identical. The retired fallback is a specimen here, so it stays retired. In process,
@@ -457,7 +457,7 @@ Deno.test("only a labelled indented block counts as a repro", () => {
 
 // THE STATUS JOIN, SEEN TO FIRE — a wrapped status line is bounded by its PARAGRAPH, not by a
 // line count. A six-line cap read an 8-line status as having none, so the row graded
-// `status line names no known outcome` in both this test and the python, and neither said
+// `status line names no known outcome` in both this test and the grader, and neither said
 // that LENGTH was the cause. The specimens pin the lift and the two stops that replace it.
 const STATUS_SPECIMENS: Array<[string, boolean, string]> = [
   ["a one-line status", true, "**closed 2026-09-07 — the witness prints `2`**"],
@@ -511,7 +511,7 @@ Deno.test("a wrapped status line joins to its paragraph, whatever its length", (
   }
 });
 
-// A RESERVED RANGE WHOSE WORK HAS LANDED MUST GO BACK. `RESERVED.md` is what `ls.py --next`
+// A RESERVED RANGE WHOSE WORK HAS LANDED MUST GO BACK. `RESERVED.md` is what `ls.vl --next`
 // skips, so a forgotten reservation silently widens the gap between the highest filed row and
 // the next id anyone is handed — the block is invisible to everyone except the tool that
 // steps over it. Stale means every id in the range is filed: the work it was taken for is
@@ -524,7 +524,7 @@ Deno.test("no reserved inventory range is stale", async () => {
   } catch {
     return; // no reservations file is a valid state: nothing is reserved.
   }
-  // Mirrors ls.py's RANGE. The holder runs non-greedily to the date because it may contain
+  // Mirrors ls.vl's parseRes. The holder runs non-greedily to the date because it may contain
   // spaces — a `\S+` holder parses zero lines and every check built on it passes vacuously.
   const RANGE = /^D(\d+)-D(\d+)\s+(.+?)\s+(\d{4}-\d{2}-\d{2})\s*(.*)$/;
   const filed = new Set<number>();
@@ -545,7 +545,7 @@ Deno.test("no reserved inventory range is stale", async () => {
     for (let n = lo; n <= hi; n++) if (!filed.has(n)) all = false;
     if (all) {
       stale.push(`D${lo}-D${hi} (${m[3]}, ${m[4]}) — every id filed; release it with ` +
-        `scripts/inventory/ls.py --release D${lo}-D${hi}`);
+        `vl run scripts/inventory/ls.vl -- --release D${lo}-D${hi}`);
     }
   }
   // A file with reservation-shaped lines that parse to nothing is the failure this guard is
