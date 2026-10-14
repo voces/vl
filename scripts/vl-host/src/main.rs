@@ -46,6 +46,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
+/// A wasmparser offset as an index into the module bytes this host holds. wasmparser reports
+/// offsets as `u64`; every one it hands back lies inside such a slice, so it fits a `usize`.
+pub(crate) fn upos(p: u64) -> usize {
+    p as usize
+}
+
+/// `upos` over a range: a body's or section's span in the module bytes.
+pub(crate) fn urange(r: std::ops::Range<u64>) -> std::ops::Range<usize> {
+    upos(r.start)..upos(r.end)
+}
+
 /// The opt-in whole-compile file cache (`VL_COMPILE_CACHE=1`; incremental-compilation-design.md S1).
 mod compile_cache;
 /// The inline-record step's second slice: flattened lists of small records (D3681, S2).
@@ -7491,7 +7502,7 @@ fn wrong_ref(bytes: &mut [u8], ty: u32, body: Option<u32>) -> Result<()> {
                     }
                 }
             }
-            Payload::CodeSectionEntry(b) => code.push(b.range()),
+            Payload::CodeSectionEntry(b) => code.push(urange(b.range())),
             _ => {}
         }
     }
@@ -7577,7 +7588,7 @@ fn huge_array_new_fixed(bytes: &mut [u8]) -> Result<()> {
                     }
                 }
             }
-            Payload::CodeSectionEntry(b) => code.push(b.range()),
+            Payload::CodeSectionEntry(b) => code.push(urange(b.range())),
             _ => {}
         }
     }
@@ -8956,7 +8967,7 @@ fn code_section_start(bytes: &[u8]) -> Option<usize> {
     use wasmparser::{Parser, Payload};
     for payload in Parser::new(0).parse_all(bytes) {
         if let Ok(Payload::CodeSectionStart { range, .. }) = payload {
-            return Some(range.start);
+            return Some(upos(range.start));
         }
     }
     None

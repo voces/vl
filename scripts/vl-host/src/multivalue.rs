@@ -51,6 +51,7 @@
 //! only when its first use is a set in the function's own frame. Any module this cannot parse
 //! or validate, or whose twins would add more than the growth bound, is left untouched.
 
+use crate::{upos, urange};
 use std::collections::{HashMap, HashSet, VecDeque};
 use wasmparser::{
     AbstractHeapType, CompositeInnerType, FuncValidatorAllocations, HeapType, Operator, Parser,
@@ -451,9 +452,10 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
             fv.define_locals(off, n, t).ok()?;
             locals.push((n, t));
         }
+        let span = urange(body.range());
         let mut b = Body {
-            range: (body.range().start, body.range().end),
-            ops_start: lr.original_position(),
+            range: (span.start, span.end),
+            ops_start: upos(lr.original_position()),
             locals,
             ins: Vec::new(),
             args: Vec::new(),
@@ -1622,7 +1624,7 @@ fn emit_body(
     let bytes = m.bytes;
     let mut ops = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
         &bytes[b.ops_start..b.range.1],
-        b.ops_start,
+        b.ops_start as u64,
     ));
     let mut k: u32 = 0;
     let mut moved: Vec<(u32, u32)> = Vec::new();
@@ -1631,8 +1633,9 @@ fn emit_body(
         let end = if ops.eof() {
             b.range.1
         } else {
-            ops.original_position()
+            upos(ops.original_position())
         };
+        let off = upos(off);
         let raw = &bytes[off..end];
         moved.push((off as u32, code.len() as u32));
         match plan.acts.get(&k) {
@@ -1754,9 +1757,9 @@ fn emit_body(
     }
     // A plan's local ops on unscalarized locals in a widened twin were re-encoded above; the
     // planned ones name new slots directly. The header: the old entries, then the new locals.
-    let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0);
+    let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0 as u64);
     let n_entries = lr.read_var_u32().ok()?;
-    let entries_start = lr.original_position();
+    let entries_start = upos(lr.original_position());
     let mut out: Vec<u8> = Vec::with_capacity(code.len() + 32);
     let mut groups: Vec<(u32, ValType)> = Vec::new();
     for t in extra {
