@@ -103,17 +103,19 @@ each guarded reservation is `if <fnUses*> { fbReserve(n) }`. Same pairing, same 
 the `fnUses*` flags are**, which is what makes the asymmetry table above the thing to keep
 right.
 
-The remainder: `capFrame`, `sblEpoch`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInfLet`,
-`emitRootIx`, `cloStructIdx`, `cloSigBase`, `gMemLogIdx`, `monoProgStmts`, `msGen`,
+The remainder: `capFrame`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInfLet`,
+`emitRootIx`, `cloStructIdx`, `cloSigBase`, `gMemLogIdx`, `monoProgStmts`,
 `msAtomTexts`/`msAtomIds`, `narrowStripNullOnly`, `narrowBareIdentOnly`, `pendingNulClosure`,
 `pendingNulList`, `pendingRawNullRead`, `gDivRemNonzero`, `repShadowOn`, `rtWalkN`,
 `fnUsesUnionAs`, `fnUsesNumCast`, `gckDepth`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`,
-`unABMode`. `msGen` is a generation stamp MEANT to outlive a program (`msPoolReset` bumps it
-rather than clearing it); `emitRootIx` is assigned in the prologue with a value, not cleared.
+`unABMode`. `emitRootIx` is assigned in the prologue with a value, not cleared.
 A memo key made by `memoKeyNew` (`compiler/memo.vl`) is registered, and `memoCompileReset`,
 the first call in `emitProgram`, clears every key and restarts the pass and registry
 counters, so the rep element and slot-cache memos, the variant sig and tag keys and the
-type-registry generation start each compile unread. Run
+type-registry generation start each compile unread. A stamp generation made by `memoGenNew`
+(`msGen`, `fnPosEpoch`, `lrGen`, `rsQueryGen`) is registered the same way, and the reset
+ADVANCES it rather than restarting it: a generation sent back to its start would read an
+earlier compile's stamps as current. Run
 `vl run scripts/emitter-state-audit.vl -- --names` for the per-name clear sites.
 
 ## How to settle a row here
