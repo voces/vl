@@ -1138,7 +1138,7 @@ source lives, and therefore cannot resolve a path relative to the repository it 
 
 **The witness is the same script, and it is now a shipped contract rather than a hypothetical.**
 The Python it replaced derived every path from `ratchet.ROOT`, which is
-`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at `scripts/ratchet.py:37` — the
+`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at the since-retired `scripts/ratchet.py:37` — the
 checkout, from the script's OWN path. That derivation has no VL spelling, and the four remaining
 ratchets still share the line, so this is not one script's problem: it is the shape the whole
 `scripts/` tree is written in. `scripts/seed-size.vl` therefore takes `"build/vl-compiler.wasm"`
@@ -1161,9 +1161,9 @@ meaningless for a module the playground compiled from a buffer, and it has to sa
 answers there.
 (c) **`cwd(): string | IoError` in `std:env`** — the process's working directory. It is where
 this module belongs (`std:env` is already the ambient-process reader), it composes with `std:fs`
-immediately, and every peer has it. It is a HOST IMPORT, so it lands in all three: a
+immediately, and every peer has it. It is a HOST IMPORT, so it lands in both hosts: a
 `__env_cwd__` slot beside `__env_get__` in `compiler/typecheck.vl`'s table,
-`scripts/vl-host/src/main.rs`, `scripts/wasmtime-host.rs`, and a refusal in
+`scripts/vl-host/src/main.rs`, and a refusal in
 `tests/support/runWasm.ts` (it answers a `u8[]`, so V8 cannot build it — the same wall the rest
 of the floor meets there).
 (d) **Neither: state that a script runs from the checkout root** and make that the documented
@@ -1196,7 +1196,7 @@ to one stream. There is no `eprint`, no `std:io`, and nothing in `std:fs` that n
 stream. A program whose diagnostics have to be separable from its data has one channel for
 both.
 
-**The witness is the third divergence in the first port.** `scripts/seed-size.py` raised
+**The witness is the third divergence in the first port.** The deleted `scripts/seed-size.py` raised
 `SystemExit`, which reaches STDERR; `scripts/seed-size.vl` prints the same sentence — a
 baseline that is not JSON, one with no `bytes` member, one that is absent — to STDOUT and exits
 1. `tests/vl_seed_size_test.ts` asserts that, so the difference is recorded rather than
@@ -1289,7 +1289,7 @@ answers uniqueness and cleanup in a single export, and its host implementation i
 that already exists on every platform. `makeDir`/`removeDir`/`removeFile` are the general
 answer and should follow, but they do not unblock anything on their own. Both are `std:fs`
 additions and host imports, so both take the `std-api-reviewer` pass and land in
-`scripts/vl-host/src/main.rs`, `scripts/wasmtime-host.rs` and a refusal in
+`scripts/vl-host/src/main.rs` and a refusal in
 `tests/support/runWasm.ts` — a `string` result crosses as a `u8[]`, the same V8 wall the rest
 of the floor meets.
 

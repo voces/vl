@@ -428,6 +428,10 @@ ever wanted, to ratchet **per-file CPU seconds** rather than per-test wall.
 
 ## 8 · Reproducing
 
+<!-- paths-as-of: 2026-09-05 -->
+`scripts/test-timing.py` was deleted in #3645 and `scripts/ratchet.py` retired in #3677; the
+commands below are the record of what was run, and git history has both scripts.
+
 ```sh
 gh run view 33978534356 --log > /tmp/ci.log
 python3 scripts/test-timing.py /tmp/ci.log                   # CI, auto-detected

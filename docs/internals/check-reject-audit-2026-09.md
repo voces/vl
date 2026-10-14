@@ -371,8 +371,8 @@ D852) are filed CLOSED.
 ## What this audit does NOT say
 
 * **It does not say VL has 15 clause-2 violations.** It says 15 of 53 FILED rows are.
-  `goal-scoreboard.py` reads the corpus, which contributes zero emit-side evidence, and
-  `scripts/capability-probes/run.py --sites` is the finer instrument for the unfiled ones.
+  `goal-scoreboard.vl` (then `.py`) reads the corpus, which contributes zero emit-side evidence, and
+  `vl run scripts/capability-probes.vl` (then `capability-probes/run.py`) is the finer instrument for the unfiled ones.
 * **It does not re-derive the "25 rows in five days" number.** That claim's population was
   never written down; this one's is.
 * **It grades the WITNESS, not the family.** D661B's witness is unsound and its verdict is

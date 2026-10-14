@@ -108,8 +108,8 @@ with the TS host). Split by subject:
   native Rust `vl` host with the compiler seed embedded (`cargo build --features embed-seed` via
   `scripts/build-binary.sh`) — a single self-contained file per target, no Deno/V8/node/binaryen.
 - `release.yml` builds all five targets per-OS (ubuntu for both Linux arches, macOS for both Darwin,
-  Windows for win-x64); `compiler/cli.ts` + `scripts/build-binary.ts` + `scripts/smoke-binary.ts` are
-  deleted. The DECISIONS "Distribute via `deno compile`" entry is marked RETIRED. (→ `CHANGELOG.md`)
+  Windows for win-x64); `compiler/cli.ts` + `scripts/build-binary.ts` + `scripts/smoke-binary.ts` are deleted.
+  The DECISIONS "Distribute via `deno compile`" entry is marked RETIRED. (→ `CHANGELOG.md`)
 
 ### J6 — final teardown (last)
 Once J0–J5 land:

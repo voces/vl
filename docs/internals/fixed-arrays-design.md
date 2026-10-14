@@ -876,7 +876,7 @@ rebuilds when the indices are constant (§6.2), leaving about one box per call, 
 cost. D21: measure S0a at `-O3` on sunpa's `m4Mul`; if it is no worse than today it ships, and
 otherwise it waits for S1.
 
-**The position matrix needs an optimisation-level face.** `scripts/capability-probes/run.py`
+**The position matrix needs an optimisation-level face.** `scripts/capability-probes.vl`
 runs `vl run` with no `-O`, so everything S1 adds would be invisible to it; the matrix grades
 2 faces × 2 levels (`-O0`, `-O3`). Templates, one per placement: local, parameter, result,
 loop-carried, field, global, list element, map value, union member, nullable, capture never

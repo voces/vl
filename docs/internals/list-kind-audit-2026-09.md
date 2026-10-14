@@ -103,7 +103,7 @@ and that is where the sweep found the new f32 defect (§3). Prediction, to be gr
 
 ## 3. The sweep — nine kinds x eight delivery families, every position, both faces
 
-`scripts/capability-probes/list-kind-grid.py` writes 72 `matrix/lk-<family>-<kind>.matrix.vl`
+`scripts/capability-probes/list-kind-grid.py` (deleted in #3645) wrote 72 `matrix/lk-<family>-<kind>.matrix.vl`
 templates and grades them through `matrix.py`. Kinds: `u8 i32 i64 f32 f64 string`, `struct`
 (`P[]`), `nested` (`i32[][]`), `nullelem` (`(i32|null)[]`). Families: a typed name (`plain`),
 `K[] | null` (`nullable`), `if c { xs } else { null }` (`join-null`) and its `null`-first mirror,

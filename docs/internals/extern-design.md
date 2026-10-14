@@ -185,8 +185,8 @@ a browser, so "`vl` does not implement this" is not a defect in a program that w
 under `vl`. A diagnostic there would fire on every correct WebGPU binding in the tree. The
 place that knows is the host that is actually loading the module, and it already says so.
 
-`scripts/wasmtime-host.rs` is the third host named in `concurrency-design.md` §8 and is
-deliberately untouched: it is a retired spike in no build and no gate
+The deleted `scripts/wasmtime-host.rs` was the third host named in `concurrency-design.md` §8 and was
+deliberately untouched: a retired spike in no build and no gate
 (`docs/internals/perf-program.md`).
 
 ## 5. Could `std:fs` be written as externs?

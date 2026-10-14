@@ -477,7 +477,7 @@ On D181's branch the `claim` family is **0** and `claim,cont` is **0**.
 3. `scripts/mono-tyaram-grid.sh` reported 157 OK / 104 REJECT once and 156 / 105 on every
    later run of the same byte-identical seed. `vl --compiler X` caches its Cranelift image in
    a `.cwasm` sidecar beside X, and a cold fan-out races to write it; prewarm serially before
-   any parallel grading, which is what `scripts/silent-sweep/d181/twin181.py` does and why.
+   any parallel grading, which is what `scripts/silent-sweep/d181/twin181.py` (since deleted) did and why.
 
 ---
 

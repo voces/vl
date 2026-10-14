@@ -1129,7 +1129,7 @@ plain `P[] == P[]` plus `P[] + P[]` calls `refListSlotOfExpr` 37 times and clamp
 them, so the miss needs a narrowed element or a nullable niche, which is exactly what five of
 the seven `tests/cases` modules already spell.
 
-**And its 74 call sites, classified** (`scripts/refslot-consumer-census.py`, which reads the
+**And its 74 call sites, classified** (`scripts/refslot-consumer-census.py`, since deleted, which reads the
 tree so the split is re-derivable):
 
 ```
@@ -2078,7 +2078,7 @@ classifier now asks the descriptor, not a ladder over spellings.
 The column is a derived read, not a bank. A banked version keyed on five staleness axes was
 built and measured. Its stale check read 0 on every population below. It was still withdrawn:
 `tests/vl_memo_generation_test.ts` requires every new memo stamp to have a row in
-`scripts/memo-generation-probe.py`, and the no-new-Python ruling forbids adding that row.
+`scripts/memo-generation-rows.json` (then `memo-generation-probe.py`, since ported to VL), and the no-new-Python ruling forbade adding that row.
 Banking returns when that probe is in VL. It would also key on `emitPassGen`, because an emit
 pass can fill a table that `repOfNode` reads (D1655).
 
