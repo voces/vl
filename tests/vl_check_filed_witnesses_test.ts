@@ -17,8 +17,9 @@
 //      one line on stdout, because VL has no stderr sink.
 //   3. A diagnostic that quotes the witness's temp path: the two stage witnesses in
 //      different temp directories, so a `detail` is compared up to that path.
-//   Not exercised here, by construction: a witness that runs past 120 s (the Python raises,
-//   the port classifies `timeout`'s exit 124), child output that is not UTF-8 (the Python
+//   4. A witness stopped by its timeout (`$WITNESS_TIMEOUT`, default 120 s): the Python
+//      raises, the port retries once and reports the row not graded (the last test).
+//   Not exercised here, by construction: child output that is not UTF-8 (the Python
 //   raises, the port decodes lossily), and a non-ASCII letter or digit next to a heading's
 //   id or a `Want`/`Repro` label (the port's `\s`, `\d` and `\b` read every non-ASCII byte
 //   as punctuation; its `\s` does admit Unicode spaces).
@@ -262,6 +263,39 @@ Deno.test({
               `stdout, got ${pb.code} / ${vb.code}:\n${vb.out}${vb.err}`,
           );
         }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// A channel `timeout` stopped is the box's load, not the witness: before this, a witness
+// that never finished fell through `classify` to `silent_invalid_wasm` (a filed row graded
+// that way at load 83–122 and `runs` alone). It is retried once, then reported not graded.
+Deno.test({
+  name: "check-filed-witnesses: a witness stopped by its timeout is not graded, never a filed outcome",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_cfw_timeout_" });
+    try {
+      const doc = `${dir}/rows.md`;
+      await Deno.writeTextFile(
+        doc,
+        `### D1 — a witness that never finishes\n**check-clean invalid wasm**\n\nRepro:\n\n` +
+          `${ind("let i = 0\nwhile true { i = i + 1 }")}\n`,
+      );
+      const { code, stdout } = await new Deno.Command(VL, {
+        args: ["run", "scripts/check-filed-witnesses.vl", "--compiler", COMPILER, "--", doc],
+        cwd: ROOT,
+        stdout: "piped",
+        stderr: "piped",
+        env: nativeEnv({ NO_COLOR: "1", JOBS: "1", WITNESS_TIMEOUT: "2" }),
+      }).output();
+      const out = dec.decode(stdout);
+      const want = "0 graded · 0 as filed · 0 MOVED · 1 not graded";
+      if (code !== 0 || !out.includes(want) || !out.includes("`vl run` was stopped after 2 s twice")) {
+        throw new Error(`want exit 0, "${want}" and the timeout reason, got exit ${code}:\n${out}`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
