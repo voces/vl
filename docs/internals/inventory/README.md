@@ -69,7 +69,7 @@ contradiction is stated in "Not a defect".
 
 The sweep is reproducible: `scripts/silent-sweep/gen.py` (main grid), `genorder.py`
 (declaration-order grid), `sabotage.py` (grader proof), `sweep.sh` (bounded runner, four
-concurrent `vl` invocations), `grade.py` (classifier), `counts.py` / `pivot.py` (tallies).
+concurrent `vl` invocations), `grade.vl` (classifier), `counts.py` / `pivot.py` (tallies).
 
 ---
 
@@ -331,7 +331,7 @@ has been made to fire on demand.
 
     python3 scripts/silent-sweep/gen.py       <cells>            # --scopes fn,mod (default)
     bash    scripts/silent-sweep/sweep.sh     <cells> <res>      # still xargs -P4
-    python3 scripts/silent-sweep/grade.py     <cells> <res> --csv scope.csv
+    vl run  scripts/silent-sweep/grade.vl  -- <cells> <res> --csv scope.csv
     python3 scripts/silent-sweep/pairscope.py scope.csv
 
 ---
@@ -727,7 +727,7 @@ graded `silent_invalid_wasm`. That is not a naming nit — it sends the reader t
 when the miscompile is in what the emitted code DOES, and D19 sat behind it for a day with a
 status line worded to grade as filed while its prose said the truth.
 
-The split now uses the same marker vocabulary `grade.py` separates its `invalid_wasm` and
+The split now uses the same marker vocabulary `grade.vl` separates its `invalid_wasm` and
 `trap` columns with, and `--self-test` makes it fire on demand — three specimens whose outcome
 is known by construction, predicted in source ahead of the run:
 
@@ -745,7 +745,7 @@ sharper classifier found no other row hiding behind the conflation** — D22, D2
 ### Structural guarantees
 * **One result file per cell.** `runcell.sh` writes `<cell>.res` and never appends to a
   shared file, so nothing can tear under `-P4`.
-* **`records == cells` asserted on every run** — printed by `grade.py` as
+* **`records == cells` asserted on every run** — printed by `grade.vl` as
   `cells=9126 result_files=9126 MATCH=OK` and `cells=219 result_files=219 MATCH=OK`.
 * **Graded on the run value, never the build verdict.** D1's boolean cell is check-clean,
   run-clean, rc 0 — a build-verdict grader scores it a pass. It is the top row here.
