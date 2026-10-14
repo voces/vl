@@ -62,7 +62,7 @@ heredoc and moves with its own PR.
 | `scripts/codemods/label-at.py` | 322 | T | tests/vl_label_codemod_test.ts | scripts/codemods/label-at.vl |
 | `scripts/day-one/modules.py` | 552 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/modules.vl |
 | `scripts/day-one/sample.py` | 657 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/sample.vl |
-| `scripts/emitter-state-audit.py` | 238 | T | tests/vl_emitter_state_audit_test.ts | scripts/emitter-state-audit.vl |
+| `scripts/emitter-state-audit.py` | 238 | T | tests/vl_emitter_state_audit_test.ts | done: `scripts/emitter-state-audit.vl`, output byte-identical to the Python's (default and `--names`) and now the L7 `emitter state budget` ratchet; the `.py` is deleted |
 | `scripts/goal-scoreboard.py` | 273 | T | tests/vl_invalid_module_position_test.ts tests/vl_live_sites_test.ts | scripts/goal-scoreboard.vl |
 | `scripts/inventory/ls.py` | 200 | T | tests/vl_inventory_rows_test.ts | scripts/inventory/ls.vl |
 | `scripts/ladder-census.py` | 884 | T | tests/lsp_ratchet_hold_test.ts tests/vl_kind_ladder_test.ts | scripts/ladder-census.vl (shares the budget walk) |
