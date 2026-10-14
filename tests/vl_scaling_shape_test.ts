@@ -1631,6 +1631,25 @@ axis(
   (d) => twoFiles(d, genElseIfChains("value", 1, 2000), genElseIfChains("value", 20, 2000)),
 );
 
+// D3407: a `+` chain over a type parameter, one generic of `n` terms against `nf` generics of
+// `n / nf`. Each link's deferred result names the link below it twice, and resolving both at a
+// pin doubled the walk per term: 20 terms in one chain read 5.9e9 fuel on master `313eb4681`.
+const genGenericPlusChains = (nf: number, n: number): string => {
+  const o: string[] = [];
+  for (let f = 0; f < nf; f++) {
+    o.push(`function g${f}<T>(a: T): T {`, `  ${Array(n / nf).fill("a").join(" + ")}`, "}");
+  }
+  for (let f = 0; f < nf; f++) o.push(`print(g${f}(${f}))`);
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generic-body operator chain length",
+  2.5,
+  "A link of a `+` chain over a type parameter is resolving the link below it more than once at a pin (`substHoleTyReal`'s `HD_BINOP` arm or the `shMemo` answers, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genGenericPlusChains(1, 20), genGenericPlusChains(4, 20)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds

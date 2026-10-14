@@ -14,6 +14,10 @@ import {
   logsOf,
   vl,
 } from "./support/nativeRelease.ts";
+import { concurrentTests } from "./support/concurrentTests.ts";
+
+// Every test builds into its own temp dir and shares no state, so they run a few at a time.
+const test = concurrentTests();
 
 // THE LOOP-ROTATION REGRESSION GATE. `vl build -O3` (and `-O`) is a LOSS on tight
 // scalar loops under wasmtime — 2.43x on `bench/arith/mixed-width`, 1.23x on
@@ -25,7 +29,7 @@ import {
 // change cannot make it quietly worse. Timing in CI is not a usable instrument;
 // the loop SHAPE is, because it is what the slowdown was traced to.
 for (const row of LOOP_TABLE) {
-  Deno.test({
+  test({
     name: `native-release: ${row.fixture} — loop shape (loops,rotated,carried) stays ${
       row.none.join("/")
     } → ${row.O.join("/")} → ${row.O3.join("/")}`,
@@ -70,7 +74,7 @@ for (const row of LOOP_TABLE) {
 }
 
 for (const rel of CASES_LIST) {
-  Deno.test({
+  test({
     name: `native-release: ${rel} — vl build -O3 stays valid + reproduces @log`,
     ignore: !ENABLED,
     fn: async () => {
