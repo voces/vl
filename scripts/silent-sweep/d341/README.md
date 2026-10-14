@@ -6,7 +6,7 @@ quotes, and the population its price was measured on.
 
 ```sh
 python3 scripts/silent-sweep/d341/mkgrid.py <outdir> --verify
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py <outdir> <seed.wasm> out.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- <outdir> <seed.wasm> out.json
 ```
 
 ## Why it is committed

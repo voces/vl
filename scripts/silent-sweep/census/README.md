@@ -90,7 +90,7 @@ it BY NAME rather than absorbing it. Measured limits found this way and kept out
 
 ## Validating the grader
 
-`sabcensus.py` provokes every column `gradecensus.py` can print, and reproduces its stated
+`sabcensus.py` provokes every column `gradecensus.vl` can print, and reproduces its stated
 counts exactly: **runs 4 / runs but wrong value 4 / trap_loads 3 / check-clean invalid wasm
 3 / loud emit reject 3 / loud check reject 3**. Three of the `runs but wrong value` cells
 are byte-identical to a `runs` control with a different manifest, which is what proves the
@@ -130,15 +130,15 @@ correct**, exactly as `REPRODUCE.md` publishes.
 
     bash scripts/agent-setup.sh                     # seed must be 1,452,766 bytes at 1559d80c
     python3 scripts/silent-sweep/census/mkmatrix.py  scratch-silent/census/matrix
-    JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py \
+    JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
         scratch-silent/census/matrix build/vl-compiler.wasm scratch-silent/census/matrix.json
     python3 scripts/silent-sweep/census/sabcensus.py scratch-silent/census/sab
-    JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py \
+    JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
         scratch-silent/census/sab build/vl-compiler.wasm scratch-silent/census/sab.json
 
     for B in A B C D E; do
       python3 scripts/silent-sweep/census/gencensus.py scratch-silent/census/cells$B --block $B
-      JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py \
+      JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
           scratch-silent/census/cells$B build/vl-compiler.wasm scratch-silent/census/$B.json
     done
 
@@ -173,8 +173,8 @@ MISMATCH line if either side has a cell the other lacks.
 
     for S in <sha1> <sha2>; do ... build seed from that commit ... ; done
     python3 scripts/silent-sweep/census/gencensus.py scratch-silent/census/cellsA --block A
-    JOBS=4 python3 .../gradecensus.py scratch-silent/census/cellsA seed-<sha1>.wasm before.json
-    JOBS=4 python3 .../gradecensus.py scratch-silent/census/cellsA seed-<sha2>.wasm after.json
+    JOBS=4 vl run .../gradecensus.vl -- scratch-silent/census/cellsA seed-<sha1>.wasm before.json
+    JOBS=4 vl run .../gradecensus.vl -- scratch-silent/census/cellsA seed-<sha2>.wasm after.json
     python3 scripts/silent-sweep/census/delta.py scratch-silent/census/cellsA before.json after.json
 
 **Read the transition matrix, not the two histograms.** A per-class count is a NET: a block can
@@ -302,7 +302,7 @@ without re-running 150,224 cells — it is how this row was confirmed live on `e
 **The named sets live here.** A per-row grid works the same way once it has named its movers:
 `d243-moved.json` is the 79 cells D243/D244/D200's landing moved (every one `-> runs`, so a
 later seed that does not run one of them has LOST it), materialised by
-`scripts/silent-sweep/d243/mkset.py` and graded by `gradecensus.py` like any other block in
+`scripts/silent-sweep/d243/mkset.py` and graded by `gradecensus.vl` like any other block in
 ~158 invocations. A named set is a list of COORDINATES the generator reproduces, never a copy
 of its output — `mkset.py` re-checks each name against the grid's own manifest and refuses if
 the generator has changed under it, which is the drift a committed copy would hide.
@@ -314,7 +314,7 @@ cell get worse", over a population the row's own grid does not contain.
 ## Resource discipline
 
 Four concurrent `vl` invocations, the same bound `scripts/silent-sweep/REPRODUCE.md` fixes.
-`gradecensus.py` runs a third `vl build` stage ONLY when the run stage failed with a trap
+`gradecensus.vl` runs a third `vl build` stage ONLY when the run stage failed with a trap
 marker, so the common cell costs two process spawns.
 
 ## RESULT — the axes that MOVE an outcome, and the ones that do not

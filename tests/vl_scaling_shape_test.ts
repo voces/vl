@@ -1586,6 +1586,44 @@ axis(
   (d) => twoFiles(d, genNestedJoins(120), genNestedJoins(30)),
 );
 
+// D4557: an `else if` chain whose arms yield a value, the same links as `nf` chains of `n / nf`.
+// Each link once asked about every link below it, a walk to the chain's end: 2,000 links in
+// one chain against twenty chains of 100 read 4.16 (`return` arms) and 9.13 (an `if`
+// expression) on master `69525dd17`, and 1.02 / 1.02 once the walks were memoised.
+const genElseIfChains = (shape: "return" | "value", nf: number, n: number): string => {
+  const o: string[] = [];
+  const links = n / nf;
+  for (let f = 0; f < nf; f++) {
+    o.push(`function f${f}(x: i32): i32 {`);
+    const arms: string[] = [];
+    for (let i = 0; i < links; i++) {
+      arms.push(shape === "return" ? `if x == ${i} { return ${i + f} }` : `if x == ${i} { ${i + f} }`);
+    }
+    const last = shape === "return" ? "{ return -1 }" : "{ -1 }";
+    o.push(shape === "return" ? `  ${arms.join(" else ")} else ${last}` : `  const r = ${arms.join(" else ")} else ${last}`);
+    if (shape === "value") o.push("  r");
+    o.push("}");
+  }
+  o.push("let acc = 0");
+  for (let f = 0; f < nf; f++) o.push(`acc = acc + f${f}(${f})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "else-if chain length, returning arms",
+  2.0,
+  "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genElseIfChains("return", 1, 2000), genElseIfChains("return", 20, 2000)),
+);
+
+axis(
+  "else-if chain length, an if expression",
+  2.0,
+  "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genElseIfChains("value", 1, 2000), genElseIfChains("value", 20, 2000)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds

@@ -45,7 +45,7 @@ Their coordinates are `scripts/silent-sweep/census/d282-d281-price.json`:
 ```sh
 python3 scripts/silent-sweep/d243/mkset.py /tmp/price \
     scripts/silent-sweep/census/d282-d281-price.json /tmp/d282cells
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/price <seed.wasm> /tmp/p.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/price <seed.wasm> /tmp/p.json
 ```
 
 The histogram must read `runs 36` and nothing else — 36 `vl` invocations rather than a grid.

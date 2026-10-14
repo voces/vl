@@ -12,7 +12,7 @@ engine instead: `vl check` rc 0 and `expected (ref null $type), found (ref $type
 ```sh
 python3 scripts/silent-sweep/census/gencensus.py /tmp/cellsE --block E
 python3 scripts/silent-sweep/d361/genbind.py /tmp/cellsE /tmp/gridB
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridB <seed.wasm> /tmp/g.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridB <seed.wasm> /tmp/g.json
 ```
 
 1,424 cells — every `pval=mixed` cell of block E that has a `(gN[0]).` read to respell. On

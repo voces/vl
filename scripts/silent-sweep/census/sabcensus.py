@@ -2,7 +2,7 @@
 """Grader sabotage for the CENSUS grader.
 
 A zero in an outcome column is only trustworthy once that column has been made to fire on
-demand, so every column `gradecensus.py` can print is provoked here by construction.
+demand, so every column `gradecensus.vl` can print is provoked here by construction.
 
 PREDICTED, stated before the run:
     runs                      4

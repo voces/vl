@@ -18,8 +18,8 @@ coordinates × 4 × 3 × 3 = **2,484 cells**, every `armtwin` cell with an exact
 python3 scripts/silent-sweep/census/gencensus.py /tmp/cellsA --block A     # the win coords
 python3 scripts/silent-sweep/d224/gen224.py      /tmp/gridT  /tmp/cellsA
 
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridT <master.wasm> /tmp/T-base.json
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridT <branch.wasm> /tmp/T-branch.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridT <master.wasm> /tmp/T-base.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridT <branch.wasm> /tmp/T-branch.json
 python3 scripts/silent-sweep/d224/pairs224.py /tmp/gridT /tmp/T-base.json /tmp/T-branch.json
 ```
 

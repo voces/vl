@@ -4,7 +4,7 @@ in seconds instead of re-running the whole block.
 
 `CLAUDE.md`'s cheap census substitute, applied to a per-row grid: once a full run has NAMED
 a set, that set copies into its own cell directory with its own manifest and
-`gradecensus.py` grades it like any other block. `scripts/silent-sweep/census/d243-moved.json`
+`gradecensus.vl` grades it like any other block. `scripts/silent-sweep/census/d243-moved.json`
 is the set this PR left behind — the 79 cells D243/D244/D200's landing moved, every one of
 them `-> runs`, so a later seed that does not run one of them has LOST it.
 
@@ -12,7 +12,7 @@ them `-> runs`, so a later seed that does not run one of them has LOST it.
     python3 scripts/silent-sweep/d243/genbox.py /tmp/gridQ --block Q
     python3 scripts/silent-sweep/d243/mkset.py /tmp/moved \\
         scripts/silent-sweep/census/d243-moved.json /tmp/gridP /tmp/gridQ
-    JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py /tmp/moved <seed.wasm> /tmp/m.json
+    JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/moved <seed.wasm> /tmp/m.json
 
 The printed histogram must be `runs 79` and nothing else.  It is ~158 `vl` invocations.
 
