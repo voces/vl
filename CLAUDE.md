@@ -484,8 +484,8 @@ result indistinguishable from the right one's, so say what was compared. And a r
 is not self-explaining: "it went down" and "it went down because #2465 added the arm" are
 different confidence levels, and only the second rules out a detector that stopped seeing
 something — the ratchets with stored entries name what left since the baseline's commit:
-`vl check --budget <baseline> --budget-why` for comment, scan, sentinel, interp, ladder and
-export (`render-parse-budget.py --why` on `scripts/ratchet.py`; `seed-size` is
+`vl check --budget <baseline> --budget-why` for comment, scan, sentinel, interp, ladder, export and
+render-parse (the last two over a `--findings` report; `seed-size` is
 a scalar and has no entries to name). A baseline recording no `commit` falls back to the commit that last
 CHANGED it.
 

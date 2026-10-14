@@ -41,6 +41,7 @@ import {
 } from "./tyname"
 import {
   EqCmpKind,
+  EqCore,
   MAP_KEY_I32,
   MAP_KEY_I64,
   MAP_KEY_STR,
@@ -10120,19 +10121,18 @@ function lrOf(rep: i32): ListRep {
   r
 }
 
-// The list-op operand kind of an expression: `0` an i32 list, `3` a string list, `4` an
-// `i32[][]`, or -1 for a non-list or an unsupported element kind. The four distinct-backing
-// scalar lists decline: `-1` is the right answer rather than a new code, since this home means
-// which of the three old cores and `eqgListKindOfBin` claims them one ladder over (D755).
-function listOpKindOf(exprIx: i32, fnIx: i32) {
+// The list-op operand core of an expression: `"i32list"`, `"strlist"` or `"reflist"` (an
+// `i32[][]`), or `"none"` for a non-list or an unsupported element kind. The four
+// distinct-backing scalar lists decline here; `eqgListKindOfBin` claims them (D755).
+function listOpKindOf(exprIx: i32, fnIx: i32): EqCore {
   const lr = listOpRepOf(exprIx, fnIx)
-  if lr.lrRep == LR_STR { return 3 }
+  if lr.lrRep == LR_STR { return "strlist" }
   if lr.lrRep == LR_REF {
-    if rlSlotIsKindList(lr.lrSlot, 4) { return 4 }
-    return -1
+    if rlSlotIsKindList(lr.lrSlot, 4) { return "reflist" }
+    return "none"
   }
-  if lr.lrRep == LR_I32 { return 0 }
-  -1
+  if lr.lrRep == LR_I32 { return "i32list" }
+  "none"
 }
 
 // ── list `+` concat rep detection — the one home ──────────────────────────────
@@ -10394,7 +10394,7 @@ function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
 // no core of its own, or -1. Both must resolve to the same rep and the same ref-list slot, as
 // `catListKindOfBin` requires and for the same reason: two ref lists at different slots have
 // different wrapper and backing heap types, and one core cannot read both.
-export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: i32) {
+export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
@@ -10402,15 +10402,15 @@ export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: i32) {
       if P.nodes[unwrapParen(e.binLeft)] is NullLit { return -1 }
       if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
       // The three existing cores decide every shape they claim.
-      if lopK >= 0 { return -1 }
+      if lopK != "none" { return -1 }
       // So does the checker's own token, the stronger of the two gates: `eqCmpKindOfOperand`
       // names the core the checker accepted this program for, so a token naming one of the old
-      // three is that core's shape however the classifiers read it. A token of -1 is the opaque
-      // case — a monomorphized instance — where the classifiers are the only channel.
+      // three is that core's shape however the classifiers read it. A token of `"none"` is the
+      // opaque case — a monomorphized instance — where the classifiers are the only channel.
       const tl = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binLeft, fnIx))
-      if tl >= 0 && tl != 7 { return -1 }
+      if tl != "none" && tl != "glist" { return -1 }
       const tr = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binRight, fnIx))
-      if tr >= 0 && tr != 7 { return -1 }
+      if tr != "none" && tr != "glist" { return -1 }
       const lk = eqgListKindOfExpr(e.binLeft, fnIx)
       if lk < 0 { return -1 }
       if eqgListKindOfExpr(e.binRight, fnIx) != lk { return -1 }
@@ -10452,20 +10452,20 @@ export function catListSlotOfBin(binIx: i32, fnIx: i32) {
   0
 }
 
-// The list-op kind of a `==`, `!=` or `+` whose operands are both lists of one kind, or -1
+// The list-op kind of a `==`, `!=` or `+` whose operands are both lists of one kind, or `"none"`
 // when it is not a list op, leaving the caller its existing dispatch.
-export function listOpKindOfBin(binIx: i32, fnIx: i32) {
+export function listOpKindOfBin(binIx: i32, fnIx: i32): EqCore {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
       const lk = listOpKindOf(e.binLeft, fnIx)
-      if lk < 0 { return -1 }
+      if lk == "none" { return "none" }
       const rk = listOpKindOf(e.binRight, fnIx)
-      if rk != lk { return -1 }
+      if rk != lk { return "none" }
       return lk
     }
   }
-  -1
+  "none"
 }
 
 // ── `==` compare-core selection — the one home ───────────────────────────────
@@ -10473,34 +10473,34 @@ export function listOpKindOfBin(binIx: i32, fnIx: i32) {
 // `lopK` is this node's own `listOpKindOfBin`, threaded in for the reason `eqgListKindOfBin`
 // states: both are asked of one node by callers that already hold the answer.
 
-// Which compare core a `==` needs, or -1 for none. Read by the frame-reservation scan and by
+// Which compare core a `==` needs, or `"none"`. Read by the frame-reservation scan and by
 // the core emitter, which must never disagree: a core the scan does not know about is emitted
 // against locals the function never declared. `nodeEqCmpKind` is the classifiers' fallback.
-export function eqCoreKindOfBin(binIx: i32, fnIx: i32, lopK: i32) {
+export function eqCoreKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore): EqCore {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
       // A bare `null` operand makes this a null test, which consumes no compare core at all.
       // Claiming one here would reserve a compare frame for every `xs != null` guard in the
       // language and shift every local index after it.
-      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return -1 }
-      if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
-      if lopK >= 0 { return lopK }
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return "none" }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return "none" }
+      if lopK != "none" { return lopK }
       // The generic list compare, above the string and closure rungs for the same reason the
       // three cores above it are: a list operand must be claimed by a list answer before a
       // scalar ladder reads it. Its own home declines every shape `listOpKindOfBin` claims, so
       // this rung can only add a rep that had no core at all.
-      if eqgListKindOfBin(binIx, fnIx, lopK) >= 0 { return 7 }
-      if exprIsStrEq(binIx, fnIx) { return 5 }
+      if eqgListKindOfBin(binIx, fnIx, lopK) >= 0 { return "glist" }
+      if exprIsStrEq(binIx, fnIx) { return "str" }
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
-        return 6
+        return "closure"
       }
       const tl = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binLeft, fnIx))
-      if tl >= 0 { return tl }
+      if tl != "none" { return tl }
       return eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binRight, fnIx))
     }
   }
-  -1
+  "none"
 }
 
 // ── the emitter's own name for a nullable ref niche, `fnIx`-scoped ────────────
@@ -11034,7 +11034,7 @@ export function fnHasStrOp(fnIx: i32) {
 // D966 — the arena type of an `__array_new__` call's fill argument, or -1. The element row for
 // the resulting list is interned from it, so the intern derives the element's kind rather than
 // assuming the struct one. `arrNewIntrKind` below is the kind itself: `__array_new__` reads
-// its fill, `__array_new_default__` its destination, and -1 is not an intrinsic allocation.
+// its fill, `__array_new_default__` its destination, and `"none"` is not an intrinsic allocation.
 export function arrNewFillTyIx(callIx: i32): i32 {
   const c = P.nodes[callIx]
   if c is Call {
@@ -11043,80 +11043,92 @@ export function arrNewFillTyIx(callIx: i32): i32 {
   -1
 }
 
-export function arrNewIntrKind(callIx: i32, fnIx: i32) {
+// The list rep an array intrinsic allocates, named by its `VKind`: the seven backings the
+// intrinsic builds. `"none"` is a call that is not an intrinsic allocation, or a fill no source
+// names.
+export type ArrNewKind = "none"
+  | "list"
+  | "f64list"
+  | "strlist"
+  | "reflist"
+  | "i64list"
+  | "u8list"
+  | "f32list"
+
+export function arrNewIntrKind(callIx: i32, fnIx: i32): ArrNewKind {
   const c = P.nodes[callIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
     if callee is Ident {
       if callee.identName == "__array_new__" {
         const ank = arrNewNamedKind(callIx, fnIx)
-        if ank >= 0 { return ank }
-        // Nothing named it, so `0` here is a guess. Every consumer of this classifier keeps
-        // reading it; the emitter asks `arrNewKindNamed` and refuses instead (D1630).
-        return 0
+        if ank != "none" { return ank }
+        // Nothing named it, so `"list"` here is a guess. Every consumer of this classifier
+        // keeps reading it; the emitter asks `arrNewKindNamed` and refuses instead (D1630).
+        return "list"
       }
       if callee.identName == "__array_new_default__" {
         return arrNewDefaultKind(callIx)
       }
     }
   }
-  -1
+  "none"
 }
 
 // True when something NAMED the `__array_new__` at `callIx` its element kind, rather than the
 // classifier above falling through to its i32 default. The emitter's own i32-list arm refuses
 // on `false` — the list it would build is then a guess about the fill's rep.
 export function arrNewKindNamed(callIx: i32, fnIx: i32) {
-  arrNewNamedKind(callIx, fnIx) >= 0
+  arrNewNamedKind(callIx, fnIx) != "none"
 }
 
-// The `__array_new__` element kind some source NAMES, or `-1` where none does. Three sources,
-// asked in that order: the fill's own rep, the destination's recorded type, and — inside a
-// monomorphized body, where that type is still the unpinned `T[]` — the instance's substituted
-// parameter annotation.
-function arrNewNamedKind(callIx: i32, fnIx: i32) {
+// The `__array_new__` element kind some source NAMES, or `"none"` where none does. Three
+// sources, asked in that order: the fill's own rep, the destination's recorded type, and —
+// inside a monomorphized body, where that type is still the unpinned `T[]` — the instance's
+// substituted parameter annotation.
+function arrNewNamedKind(callIx: i32, fnIx: i32): ArrNewKind {
   const c = P.nodes[callIx]
   if c is Call {
     if c.callArgs.length == 2 {
-      if exprIsF64(c.callArgs[1], fnIx) { return 1 }
+      if exprIsF64(c.callArgs[1], fnIx) { return "f64list" }
       // D963 — the i64 fill: `ia64TypeIdx` and `il64TypeIdx` are interned like the f64
       // pair above and `i64[]` lists lower and run. Ahead of the string and struct arms
       // for the same reason f64 is: a scalar fill cannot be either. An f32 fill needs no
       // arm here — a float literal types f64, so the two channels below name it (D1673).
-      if exprIsI64(c.callArgs[1], fnIx) { return 4 }
+      if exprIsI64(c.callArgs[1], fnIx) { return "i64list" }
       // A string fill builds the string list; a struct or object-literal fill builds the
       // ref list for that element struct.
-      if exprString(c.callArgs[1], fnIx) { return 2 }
+      if exprString(c.callArgs[1], fnIx) { return "strlist" }
       const anf = P.nodes[c.callArgs[1]]
-      if anf is ObjLit { return 3 }
-      if exprStruct(c.callArgs[1], fnIx) { return 3 }
-      if exprIsClosure(c.callArgs[1], fnIx) { return 3 }
-      if exprArray(c.callArgs[1], fnIx) { return 3 }
-      if exprRefArray(c.callArgs[1], fnIx) { return 3 }
-      if exprStringArray(c.callArgs[1], fnIx) { return 3 }
-      if exprMap(c.callArgs[1], fnIx) { return 3 }
+      if anf is ObjLit { return "reflist" }
+      if exprStruct(c.callArgs[1], fnIx) { return "reflist" }
+      if exprIsClosure(c.callArgs[1], fnIx) { return "reflist" }
+      if exprArray(c.callArgs[1], fnIx) { return "reflist" }
+      if exprRefArray(c.callArgs[1], fnIx) { return "reflist" }
+      if exprStringArray(c.callArgs[1], fnIx) { return "reflist" }
+      if exprMap(c.callArgs[1], fnIx) { return "reflist" }
       // A wide-scalar list fill is a ref-list element like every other list. The three arms
       // above claim one only where it is a module global; an `f64[]`/`i64[]`/`u8[]`/`f32[]`
       // parameter or local reaches here (D1631).
-      if exprF64Array(c.callArgs[1], fnIx) { return 3 }
-      if exprI64Array(c.callArgs[1], fnIx) { return 3 }
-      if exprU8Array(c.callArgs[1], fnIx) { return 3 }
-      if exprF32Array(c.callArgs[1], fnIx) { return 3 }
+      if exprF64Array(c.callArgs[1], fnIx) { return "reflist" }
+      if exprI64Array(c.callArgs[1], fnIx) { return "reflist" }
+      if exprU8Array(c.callArgs[1], fnIx) { return "reflist" }
+      if exprF32Array(c.callArgs[1], fnIx) { return "reflist" }
       // The fill named no kind, so the DESTINATION's rep decides. A union-typed fill answers
       // none of the questions above (D1630).
       const anDest = arrNewDestKind(callIx)
-      if anDest >= 0 { return anDest }
+      if anDest != "none" { return anDest }
       return arrNewFillAnnKind(callIx, fnIx)
     }
   }
-  -1
+  "none"
 }
 
 // The `__array_new__(n, fill)` element kind read off the DESTINATION — the checker's recorded
-// type for the call, the same source `arrNewDefaultKind` reads below. `-1` where that type
+// type for the call, the same source `arrNewDefaultKind` reads below. `"none"` where that type
 // names no list rep, an unpinned `T[]` inside a generic body being the live case, and the
 // fill ladder stays authoritative there.
-function arrNewDestKind(callIx: i32) {
+function arrNewDestKind(callIx: i32): ArrNewKind {
   const ty = nodeTyIxOf(callIx)
   const el = tyRefArrElemOf(ty)
   const k = tyListRepKind(ty, rlSlotOfTy(el))
@@ -11125,8 +11137,8 @@ function arrNewDestKind(callIx: i32) {
   // banked one and the collect pass interns off this very answer, so the row cannot be the
   // test; a RESOLVED non-primitive element is the ref list by construction, and the intern
   // follows. An unpinned `T` is not resolved and still declines.
-  if tyIsRefListElemTy(el) { return 3 }
-  -1
+  if tyIsRefListElemTy(el) { return "reflist" }
+  "none"
 }
 
 // True when arena type `el` is an element the REF list carries — every composite, since each
@@ -11152,8 +11164,8 @@ function tyIsRefListElemTy(el: i32) {
 // The `__array_new__` element kind named by an annotated-PARAMETER fill: the list a value of
 // the parameter's declared `VKind` is an element of. The one channel a monomorphized instance
 // still has, its annotation carrying the pin while the recorded type is the original's
-// unpinned `T`. `-1` for a fill that is not an annotated parameter.
-function arrNewFillAnnKind(callIx: i32, fnIx: i32) {
+// unpinned `T`. `"none"` for a fill that is not an annotated parameter.
+function arrNewFillAnnKind(callIx: i32, fnIx: i32): ArrNewKind {
   const c = P.nodes[callIx]
   if c is Call {
     if c.callArgs.length == 2 {
@@ -11164,86 +11176,97 @@ function arrNewFillAnnKind(callIx: i32, fnIx: i32) {
       }
     }
   }
-  -1
+  "none"
 }
 
-// `arrNewIntrKind`'s 0-6 vocabulary for a list over an ELEMENT of `VKind` k. The arms are the
-// five scalar backings and the two i32-sentinel niches; `-1` only for `nulnone`, a bare `null`
-// with no rep of its own. Every remaining kind is ref-repped, and the ladder below owns that
-// answer.
-function arrNewKindOfElemVKind(k: VKind): i32 {
-  if k == "i32" || k == "nulbool" { return 0 }
-  if k == "f64" { return 1 }
-  if k == "str" || k == "nulstr" { return 2 }
-  if k == "i64" { return 4 }
-  // The f32 pair is interned exactly as the i64 one is, so a generic instance's f32
-  // parameter fill names its kind here rather than reaching the emitter's floor (D1673).
-  if k == "f32" { return 6 }
-  if k == "nulnone" { return -1 }
-  arrNewKindOfListVKind("reflist")
-}
-
-// `arrNewIntrKind`'s 0-6 vocabulary for a list `VKind`: the seven backings this intrinsic
-// allocates, and `-1` for every other kind — each names a VALUE rather than a list of them,
-// and the `T[] | null` ones name a cell the allocation does not fill.
-function arrNewKindOfListVKind(k: VKind | null): i32 {
-  if k == "list" { return 0 }
-  if k == "f64list" { return 1 }
-  if k == "strlist" { return 2 }
-  if k == "reflist" { return 3 }
-  if k == "i64list" { return 4 }
-  if k == "u8list" { return 5 }
-  if k == "f32list" { return 6 }
-  if k == "i32" { return -1 }
-  if k == "i64" { return -1 }
-  if k == "f64" { return -1 }
-  if k == "f32" { return -1 }
-  if k == "str" { return -1 }
-  if k == "struct" { return -1 }
-  if k == "variant" { return -1 }
-  if k == "union" { return -1 }
-  if k == "map" { return -1 }
-  if k == "closure" { return -1 }
-  if k == "nulstruct" { return -1 }
-  if k == "nulvariant" { return -1 }
-  if k == "nulstr" { return -1 }
-  if k == "nulbool" { return -1 }
-  if k == "nulclosure" { return -1 }
-  if k == "nulmap" { return -1 }
-  if k == "nulnone" { return -1 }
-  if k == "nullist" { return -1 }
-  if k == "nulstrlist" { return -1 }
-  if k == "nulreflist" { return -1 }
-  if k == "nulf64list" { return -1 }
-  if k == "nuli64list" { return -1 }
-  if k == "nulf32list" { return -1 }
-  if k == "nulu8list" { return -1 }
-  if k == "v128" {
-    return -1 // a v128 is a value, not a list backing
+// The `ArrNewKind` of a list over an ELEMENT of `VKind` k. The arms are the five scalar
+// backings and the two i32-sentinel niches; `"none"` only for `nulnone`, a bare `null` with no
+// rep of its own. Every remaining kind is ref-repped.
+function arrNewKindOfElemVKind(k: VKind): ArrNewKind {
+  match k {
+    "i32" | "nulbool" => {
+      return "list"
+    }
+    "f64" => {
+      return "f64list"
+    }
+    "str" | "nulstr" => {
+      return "strlist"
+    }
+    "i64" => {
+      return "i64list"
+    }
+    "f32" => {
+      // The f32 pair is interned exactly as the i64 one is, so a generic instance's f32
+      // parameter fill names its kind here rather than reaching the emitter's floor (D1673).
+      return "f32list"
+    }
+    "nulnone" => {
+      return "none"
+    }
+    "struct" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "u8list" | "list" | "v128" => {
+      return "reflist"
+    }
   }
-  -1
+}
+
+// The `ArrNewKind` of a list `VKind`: the seven backings this intrinsic allocates, and `"none"`
+// for every other kind — each names a VALUE rather than a list of them, and the `T[] | null`
+// ones name a cell the allocation does not fill.
+function arrNewKindOfListVKind(k: VKind): ArrNewKind {
+  match k {
+    "list" => {
+      return "list"
+    }
+    "f64list" => {
+      return "f64list"
+    }
+    "strlist" => {
+      return "strlist"
+    }
+    "reflist" => {
+      return "reflist"
+    }
+    "i64list" => {
+      return "i64list"
+    }
+    "u8list" => {
+      return "u8list"
+    }
+    "f32list" => {
+      return "f32list"
+    }
+    "i32" | "i64" | "f64" | "f32" | "str" | "struct" | "variant" | "union" | "map" | "closure" | "nulstruct" | "nulvariant" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "nullist" | "nulstrlist" | "nulreflist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "v128" => {
+      return "none"
+    }
+  }
 }
 
 // The `__array_new_default__(n)` element kind, read off the checker's recorded type for the
 // call: `array.new_default` writes each slot's zero, so the kind is the destination's. An
-// unpinned hole answers `0`, matching the i32 default such a binding gets. Laddered over
+// unpinned hole answers `"list"`, matching the i32 default such a binding gets. Matched over
 // `PrimName`, the checker's own vocabulary, so the gate and the kind cannot drift (D1470).
-function arrNewDefaultKind(callIx: i32) {
+function arrNewDefaultKind(callIx: i32): ArrNewKind {
   const p = tyPrimLeafElemName(nodeTyIxOf(callIx))
-  if p == "f64" { return 1 }
-  if p == "i64" { return 4 }
-  if p == "u8" { return 5 }
-  if p == "f32" { return 6 }
-  if p == "i32" { return 0 }
-  if p == "boolean" { return 0 }
-  if p == "string" { return 0 }
-  if p == "void" { return 0 }
-  if p == "null" { return 0 }
-  if p == "never" { return 0 }
-  if p == "v128" {
-    return 0 // no v128 array element; the i32 default code stands
+  if p == null { return "list" }
+  match p {
+    "f64" => {
+      return "f64list"
+    }
+    "i64" => {
+      return "i64list"
+    }
+    "u8" => {
+      return "u8list"
+    }
+    "f32" => {
+      return "f32list"
+    }
+    "i32" | "boolean" | "string" | "void" | "null" | "never" | "v128" => {
+      // No v128 array element; the i32 default stands.
+      return "list"
+    }
   }
-  0
 }
 
 // The declared-local position of `name`: the innermost live lexical binding when the scope
@@ -22605,12 +22628,19 @@ export function fnMvValStashLocal(slot: i32) { fnMvBase + slot * 3 + 2 }
 // The `m.values()` per-mv-slot OUTPUT backing local for mv slot `slot`.
 export function fnMvValsOutLocal(slot: i32) { mvValsOutBase + slot }
 
-// The result list REP-kind of a `m.values()` call — `2` i32-list, `7` string-list, `12`
-// f64-list, `20` i64-list, `5` ref-list (struct / nested-list / nested-map values) — or -1
-// if `exprIx` is not a `.values()` over a map. The result element type IS the map's value
-// type, so each `expr*Array` classifier compares against its own rep.
-function mapValuesResultKind(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return -1 }
+// The list rep a `m.values()` result takes; `"none"` is a call that is not one.
+type MapValuesList = "none"
+  | "list"
+  | "strlist"
+  | "f64list"
+  | "i64list"
+  | "reflist"
+
+// The result list rep of a `m.values()` call, or `"none"` if `exprIx` is not a `.values()` over a
+// map. The result element type IS the map's value type, so each `expr*Array` classifier compares
+// against its own rep; a ref list is a struct / nested-list / nested-map value.
+function mapValuesResultKind(exprIx: i32, fnIx: i32): MapValuesList {
+  if exprIx < 0 { return "none" }
   const e = P.nodes[exprIx]
   if e is Call {
     const callee = P.nodes[e.callFn]
@@ -22619,37 +22649,37 @@ function mapValuesResultKind(exprIx: i32, fnIx: i32) {
         if exprMap(callee.memObj, fnIx) {
           const sh = mapShapeOfExpr(callee.memObj, fnIx)
           if sh == -1 {
-            return 2 // mono i32 map → i32 list
+            return "list" // mono i32 map → i32 list
           }
           if sh == -2 {
-            return 7 // a Set's values() ARE its string keys
+            return "strlist" // a Set's values() ARE its string keys
           }
           if sh == -4 || sh == -5 || sh == -6 {
             // The i32-keyed rep: a map's values are the mono i32 list, and a Set's
             // values ARE its i32 keys — the same i32 list either way.
-            return 2
+            return "list"
           }
           if sh == -7 {
-            return 20 // an i64 Set's values() ARE its i64 keys
+            return "i64list" // an i64 Set's values() ARE its i64 keys
           }
           if sh >= 0 {
             const vk = mvValKind[sh]
             if vk == MVK_STR {
-              return 7 // string-valued → string list
+              return "strlist" // string-valued → string list
             }
             if vk == MVK_F64 {
-              return 12 // f64-valued → f64 list
+              return "f64list" // f64-valued → f64 list
             }
             if vk == MVK_I64 {
-              return 20 // i64-valued → i64 list
+              return "i64list" // i64-valued → i64 list
             }
-            return 5 // struct / nested-list / nested-map → ref list
+            return "reflist" // struct / nested-list / nested-map → ref list
           }
         }
       }
     }
   }
-  -1
+  "none"
 }
 
 // The `fnStmts` position of the `FuncDecl` at arena index `fnIx`, or -1. The function
@@ -42257,7 +42287,7 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   if slsMv >= 0 { return refArrElemName(mvValName[slsMv]) }
   if e is Call {
     // `__array_new__(n, {…})` — the ref-list element name is the fill's struct.
-    if arrNewIntrKind(exprIx, fnIx) == 3 {
+    if arrNewIntrKind(exprIx, fnIx) == "reflist" {
       // The DESTINATION's element names the row first: the list is allocated at the heap
       // types it is stored into, and the fill's own spelling can be narrower — a `Node | null`
       // fill answers the bare `Node`, whose row the destination never interned (D1630). Taken
@@ -46090,9 +46120,6 @@ function nonNullListOrdinal(k: VKind): i32 {
 // 2, 3 and 5 (struct, union, map, closure) are not lists.
 const rlElemCodeByList: i32[] = [4, 11, 8, 10, 7, 6, 9]
 
-// The generic-compare kind (`catListKindOfExpr`'s alphabet) of each non-null list rep, by ordinal.
-const eqListKindByList: i32[] = [0, 10, 6, 7, 4, 3, 1]
-
 // The ref-list element code of a list element of rep `k`, or -1 for a rep that is not a
 // non-null list.
 export function rlElemCodeOfListRep(k: VKind): i32 {
@@ -46184,9 +46211,32 @@ function listRepOfFieldCodeFrom(code: i32, k: VKind): VKind | null {
 
 // The generic-compare kind of a list of rep `k`, or -1 for a rep that is not a non-null list.
 export function eqListKindOfListRep(k: VKind): i32 {
-  const o = nonNullListOrdinal(k)
-  if o < 0 { return -1 }
-  eqListKindByList[o]
+  match k {
+    "list" => {
+      return LBK_I32_LIST
+    }
+    "u8list" => {
+      return LBK_U8_LIST
+    }
+    "i64list" => {
+      return LBK_I64_LIST
+    }
+    "f32list" => {
+      return LBK_F32_LIST
+    }
+    "f64list" => {
+      return LBK_F64_LIST
+    }
+    "strlist" => {
+      return LBK_STR_LIST
+    }
+    "reflist" => {
+      return LBK_REF
+    }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
 }
 
 // True if `k` is one of the five non-null lists over a distinct scalar backing: every list but
@@ -46623,12 +46673,29 @@ function callListRep(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is Call {
     const ak = arrNewIntrKind(exprIx, fnIx)
-    if ak == 0 { return "list" }
-    if ak == 1 { return "f64list" }
-    if ak == 2 { return "strlist" }
-    if ak == 3 { return "reflist" }
-    if ak == 4 { return "i64list" }
-    if ak == 6 { return "f32list" }
+    match ak {
+      "list" => {
+        return "list"
+      }
+      "f64list" => {
+        return "f64list"
+      }
+      "strlist" => {
+        return "strlist"
+      }
+      "reflist" => {
+        return "reflist"
+      }
+      "i64list" => {
+        return "i64list"
+      }
+      "f32list" => {
+        return "f32list"
+      }
+      "u8list" | "none" => {
+        // Not a rep this answer names: the resolvers below read the call.
+      }
+    }
     const ck = gatedListRep(
       cloArrCallRetKind(exprIx, fnIx),
       "closure-array-call",
@@ -46654,9 +46721,20 @@ function callListRep(exprIx: i32, fnIx: i32): VKind | null {
       }
     }
     const vk = mapValuesResultKind(exprIx, fnIx)
-    if vk == 2 { return "list" }
-    if vk == 7 { return "strlist" }
-    if vk == 5 { return "reflist" }
+    match vk {
+      "list" => {
+        return "list"
+      }
+      "strlist" => {
+        return "strlist"
+      }
+      "reflist" => {
+        return "reflist"
+      }
+      "f64list" | "i64list" | "none" => {
+        // Not named here: the signature resolver below reads the call.
+      }
+    }
     // A value call the resolvers above miss (a narrowed closure arm, a struct-field or
     // indexed-element closure) resolves through its `$fnsig`, as the call emit does.
     const gk = cloCallSigKey(exprIx, fnIx)
