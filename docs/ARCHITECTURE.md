@@ -145,7 +145,7 @@ then `emitModule`:
 1. **The pass table** is a dependency-ordered list of 46 rows, each `"<pass> > <prerequisite>…"`.
    The loop in `emitProgram` reads each row (`passRowName`), refuses to run one whose
    prerequisites have not all run (`passNeedsMet`, an `emitFail` naming the reordered pass),
-   dispatches it by name (`runEmitPass`), and bumps `emitPassGen` so a cross-pass memo cannot
+   dispatches it by name (`runEmitPass`), and bumps `emitPassGen` (`memoPassAdvance`, `memo.vl`) so a cross-pass memo cannot
    outlive the row that filled it. The order is **not** grouped by kind. Rewrites
    (`loopValueRewrite`, `dispatchRewrite`, `captureBoxRewrite`, the `synth*` annotation passes)
    interleave with the collect passes (`collectU`, `collectS`, `collectA`, `collectFns`,
