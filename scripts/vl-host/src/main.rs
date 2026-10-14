@@ -6836,23 +6836,33 @@ fn rename_functions(
     Some(out)
 }
 
-/// The escape step on the module at `path` (holding `bytes`): name the chosen callees apart
-/// from everything else, inline them in one `wasm-opt` run, then give every function back the
-/// name it had, or none. Answers the rewritten bytes (also left at `path`), or `None` when no
-/// callee is chosen and the module is untouched. A `--source-map` build's map at `map` is
-/// carried through the run; the renames touch only the name section, after the code.
-fn escape_inline_step(
-    path: &str,
-    flag: &str,
-    bytes: &[u8],
-    map: Option<&str>,
-) -> Result<Option<Vec<u8>>> {
-    let Some(scan) = ModuleScan::parse(bytes) else {
-        return Ok(None);
-    };
-    let Some(chosen) = escape_inline_choice(&scan) else {
-        return Ok(None);
-    };
+/// Which side chooses the escape step's callees and renames its functions (rung R3):
+/// `$VL_OPT_ESCAPE` unset or `rust` the host, `vl` the compiler's `optEscapeChoose` /
+/// `optEscapeRestore`, `both` the two, failing the build when they disagree.
+#[derive(Clone, Copy, PartialEq)]
+enum OptEscapeSide {
+    Rust,
+    Vl,
+    Both,
+}
+
+fn opt_escape_side() -> Result<OptEscapeSide> {
+    match std::env::var("VL_OPT_ESCAPE").unwrap_or_default().as_str() {
+        "" | "rust" => Ok(OptEscapeSide::Rust),
+        "vl" => Ok(OptEscapeSide::Vl),
+        "both" => Ok(OptEscapeSide::Both),
+        other => bail!("$VL_OPT_ESCAPE={other} — expected `rust`, `vl` or `both`"),
+    }
+}
+
+/// The original module's function names, which the restore gives back.
+type EscapeNames = std::collections::HashMap<u32, String>;
+
+/// The host's renaming of `bytes` for the escape step, with the original names, or `None`
+/// when no callee is chosen.
+fn escape_choose_rust(bytes: &[u8]) -> Option<(Vec<u8>, EscapeNames)> {
+    let scan = ModuleScan::parse(bytes)?;
+    let chosen = escape_inline_choice(&scan)?;
     let n_funcs = scan.n_imports + scan.bodies.len() as u32;
     let named = rename_functions(bytes, n_funcs, |f, cur| {
         if f < scan.n_imports {
@@ -6862,17 +6872,16 @@ fn escape_inline_step(
         } else {
             Some(format!("{ESCAPE_OTHER_PREFIX}{f}"))
         }
-    });
-    let Some(named) = named else {
-        return Ok(None);
-    };
-    std::fs::write(path, &named)?;
-    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, map)?;
-    let stepped = std::fs::read(path)
-        .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
+    })?;
+    Some((named, scan.names))
+}
+
+/// The host's restore of the step's output `stepped`: every function's name back from
+/// `names`, by the original index its step name carries.
+fn escape_restore_rust(stepped: &[u8], names: &EscapeNames, flag: &str) -> Result<Vec<u8>> {
     // Inlining removes functions, so the step's output numbers them anew; the prefixed names
     // carry each one's ORIGINAL index, which is what finds its original name.
-    let after = ModuleScan::parse(&stepped).ok_or_else(|| {
+    let after = ModuleScan::parse(stepped).ok_or_else(|| {
         Error::msg(format!(
             "{flag}: the escape step wrote a module it cannot read"
         ))
@@ -6893,17 +6902,98 @@ fn escape_inline_step(
     {
         bail!("{flag}: the escape step's module lost the function names it was given");
     }
-    let restored = rename_functions(&stepped, n_after, |f, cur| {
+    rename_functions(stepped, n_after, |f, cur| {
         if f < after.n_imports {
             return cur.map(str::to_string);
         }
-        original(f, cur).and_then(|o| scan.names.get(&o).cloned())
+        original(f, cur).and_then(|o| names.get(&o).cloned())
     })
     .ok_or_else(|| {
         Error::msg(format!(
             "{flag}: the escape step wrote a module it cannot read"
         ))
-    })?;
+    })
+}
+
+/// The compiler's restore (`optEscapeRestore`) of `stepped`, on the instance whose
+/// `optEscapeChoose` renamed the step's input.
+fn escape_restore_vl(
+    store: &mut Store<()>,
+    inst: &Instance,
+    stepped: &[u8],
+    flag: &str,
+) -> Result<Vec<u8>> {
+    opt_stage(store, inst, stepped)?;
+    let restore = inst.get_typed_func::<(), i32>(&mut *store, "optEscapeRestore")?;
+    match restore.call(&mut *store, ())? {
+        1 => BytesOut::probe(store, inst, "optOut")?.read(store),
+        0 => bail!("{flag}: the escape step's module lost the function names it was given"),
+        -1 => bail!("{flag}: the escape step wrote a module it cannot read"),
+        rc => bail!("{flag}: the compiler's optEscapeRestore answered {rc}"),
+    }
+}
+
+/// The escape step on the module at `path` (holding `bytes`): name the chosen callees apart
+/// from everything else, inline them in one `wasm-opt` run, then give every function back the
+/// name it had, or none. Answers the rewritten bytes (also left at `path`), or `None` when no
+/// callee is chosen and the module is untouched. A `--source-map` build's map at `map` is
+/// carried through the run; the renames touch only the name section, after the code. The
+/// choice and the renames are made by the side `$VL_OPT_ESCAPE` picks.
+fn escape_inline_step(
+    path: &str,
+    flag: &str,
+    bytes: &[u8],
+    map: Option<&str>,
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<Option<Vec<u8>>> {
+    let side = opt_escape_side()?;
+    let rust = (side != OptEscapeSide::Vl).then(|| escape_choose_rust(bytes));
+    let mut session = None;
+    let vl = if side == OptEscapeSide::Rust {
+        None
+    } else {
+        let (store, inst) = session.insert(load_compiler(engine, compiler)?);
+        opt_stage(store, inst, bytes)?;
+        let choose = inst.get_typed_func::<(), i32>(&mut *store, "optEscapeChoose")?;
+        let chosen = choose.call(&mut *store, ())? == 1;
+        let out = BytesOut::probe(store, inst, "optOut")?.read(store)?;
+        Some(chosen.then_some(out))
+    };
+    let named = match (&rust, &vl) {
+        (Some(r), Some(v)) if r.as_ref().map(|(n, _)| n) != v.as_ref() => bail!(
+            "$VL_OPT_ESCAPE=both: the escape step's renamed input differs between the host \
+             and the compiler"
+        ),
+        (Some(r), _) => r.as_ref().map(|(n, _)| n.clone()),
+        (None, Some(v)) => v.clone(),
+        (None, None) => unreachable!("opt_escape_side picks at least one side"),
+    };
+    let Some(named) = named else {
+        return Ok(None);
+    };
+    std::fs::write(path, &named)?;
+    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, map)?;
+    let stepped = std::fs::read(path)
+        .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
+    let rust_restored = rust
+        .as_ref()
+        .and_then(Option::as_ref)
+        .map(|(_, names)| escape_restore_rust(&stepped, names, flag));
+    let vl_restored = session
+        .as_mut()
+        .map(|(store, inst)| escape_restore_vl(store, inst, &stepped, flag));
+    let restored = match (rust_restored, vl_restored) {
+        (Some(Ok(r)), Some(Ok(v))) if r != v => bail!(
+            "$VL_OPT_ESCAPE=both: the escape step's restored names differ between the host \
+             and the compiler"
+        ),
+        (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
+            bail!("$VL_OPT_ESCAPE=both: only one side restored the escape step's names: {e}")
+        }
+        (Some(r), _) | (None, Some(r)) => r?,
+        (None, None) => unreachable!("opt_escape_side picks at least one side"),
+    };
     if map.is_some() && code_section_start(&stepped) != code_section_start(&restored) {
         bail!("{flag}: restoring the escape step's names moved the code its source map describes");
     }
@@ -10683,7 +10773,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
             // function. It renumbers functions, so the run-once marks are read off its output.
             let stepped = phase!(
                 "opt.escape_step",
-                escape_inline_step(&sink_str, flag, &bytes, map)
+                escape_inline_step(&sink_str, flag, &bytes, map, &compile_engine, &compiler)
             )?;
             let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
             let argv = phase!(

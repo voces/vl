@@ -20,7 +20,7 @@ everything VL does to the module around it.
 | inline step | `inline::inline_step` (with `flat::flat_step`) | a field holding a small unwritten record stores its fields in the parent; a list of such records holds them side by side; `$VL_OPT_NO_INLINE` skips it |
 | multi-value step | `multivalue::multivalue_step` | a call site that only reads its small record result calls a twin returning the fields; `$VL_OPT_NO_MULTIVALUE` skips it |
 | source-map remap | `remap` closure | a step that moves code rebuilds the map from the rows each moved op carries |
-| escape step | `escape_inline_step` | chooses callees whose struct argument never escapes (`escape_inline_choice`), renames every function `L4c.<i>` / `L4n.<i>`, runs `wasm-opt -g --no-inline=L4n.* --always-inline-max-function-size 100000 --inlining`, restores the names |
+| escape step | `escape_inline_step`; the choice and renames are the host's (`escape_inline_choice`, `rename_functions`) or, under `$VL_OPT_ESCAPE=vl`, the compiler's `optEscapeChoose` / `optEscapeRestore` (`compiler/opt_escape.vl`) | chooses callees whose struct argument never escapes, renames every function `L4c.<i>` / `L4n.<i>`, runs `wasm-opt -g --no-inline=L4n.* --always-inline-max-function-size 100000 --inlining`, restores the names |
 | the rung's argv | `rung_argv`, which calls the compiler's `optRungArgv` (`compiler/opt_scan.vl`) | in order: `--no-inline=<name>` for each hot callee of run-once code (lane L8); `--low-memory-unused` at a `--low-memory-unused` of 1,024 bytes or more; `-g` under `--names`; `OPT_PASSES` (`--always-inline-max-function-size 16 -O`) or `RELEASE_PASSES` (`--closed-world -O3 --gufa -O3`); and `--skip-pass=ssa-nomerge` when a body has more than 8,192 `local.set`/`local.tee` |
 | the rung | `optimize_in_place` | one `wasm-opt` run over the sink with the passes above |
 
@@ -151,3 +151,41 @@ Rust deleted, on one seed:
 
 The control, the port's host against `VL_OPT_NO_MULTIVALUE=1` over tests/cases/closures,
 differs on 15 of 605. A seed without `optStripSrc` refuses `-O` by name.
+
+## R3, the escape choice and its renames
+
+`compiler/opt_escape.vl` exports `optEscapeChoose`, which chooses the callees for the staged
+module and writes it to `optOut` with every chosen callee named `L4c.<index>` and every other
+defined function `L4n.<index>` (answering 1, or 0 when nothing is chosen), and
+`optEscapeRestore`, which takes the step's output and gives every function back the name it
+had in the module `optEscapeChoose` renamed. `compiler/wasm_names.vl` is the name-section
+reader and writer both use: it keeps every other subsection byte for byte, and writes one
+`name` section at the end with minimal LEB lengths, as the host's `rename_functions` does.
+The scan behind the choice is R1's, run in a full mode that also reads the type, function,
+table and global sections and records each body's allocations and casts; `wasm_read.vl`
+gained the heap-type immediates of `struct.new`, `ref.test`, `ref.cast` and `br_on_cast`.
+
+`$VL_OPT_ESCAPE` selects the side: unset or `rust` the host's `escape_inline_choice` and
+`rename_functions`, `vl` the compiler's, `both` the two on one compiler instance, failing the
+build when the renamed input or the restored output differs. The host still runs `wasm-opt`
+between the two calls, and still checks that a `--source-map` build's code did not move.
+
+Parity of the port, `VL_OPT_ESCAPE=rust` against `vl`. `opt-parity.sh` now also compares the
+step's own output (`$VL_OPT_ESCAPE_DUMP`, written before the rung strips the names `-O` does
+not keep), and counts the builds that ran the step. Every build is `-O` unless noted:
+
+| population | programs | identical | both refused | identical with a mark | identical through the step | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases | 5,218 | 4,118 | 1,100 | 1,184 | 639 | 0 | 0 |
+| distilled `cells/` | 1,477 | 1,223 | 254 | 1,103 | 270 | 0 | 0 |
+| distilled `named/` | 8,647 | 4,919 | 3,728 | 1,295 | 606 | 0 | 0 |
+| `-O3`: `cells/`, tests/cases/arrays and closures | 2,265 | 1,886 | 379 | 1,257 | 356 | 0 | 0 |
+| a generated plumb tail unit and its main, and `compiler/entry.vl` | 3 | 3 | 0 | 2 | 1 | 0 | 0 |
+| tests/cases, `--source-map` | 5,218 | 4,118 | 1,100 | 1,184 | 639 | 0 | 0 |
+| tests/cases, `--names` | 5,218 | 4,118 | 1,100 | 1,184 | 639 | 0 | 0 |
+| tests/cases, `--names --source-map --low-memory-unused`, `both` against `vl` | 5,218 | 4,118 | 1,100 | 1,184 | 639 | 0 | 0 |
+
+`both` fails a build whose two renamed inputs or two restored outputs differ, so the last row
+compares the two sides build by build. The control, `vl` against `VL_OPT_NO_MULTIVALUE=1`
+over tests/cases/closures, differs on 18 of 609; on 2 of them the written modules agree and
+only the step's output differs, which is what the new comparison is for.
