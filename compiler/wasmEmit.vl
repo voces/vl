@@ -937,6 +937,7 @@ import {
   holeBindsFunc,
   holeCaptureTyOf,
   holeOperandTyOf,
+  holePinProvesNonNull,
   identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
@@ -2805,7 +2806,8 @@ function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
     && !(P.nodes[l] is NullLit)
     && (nodeTyProvesNonNull(l)
       || cellReadProvesNonNull(l)
-      || holeBindsFunc(l, fnIx))
+      || holeBindsFunc(l, fnIx)
+      || holePinProvesNonNull(l, fnIx))
   ) {
     return l
   }
@@ -2814,7 +2816,8 @@ function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
     && !(P.nodes[r] is NullLit)
     && (nodeTyProvesNonNull(r)
       || cellReadProvesNonNull(r)
-      || holeBindsFunc(r, fnIx))
+      || holeBindsFunc(r, fnIx)
+      || holePinProvesNonNull(r, fnIx))
   ) {
     return r
   }
@@ -33513,6 +33516,18 @@ function emitScalarWiden(from: i32, to: i32) {
   fbF64ConvertI32S()
 }
 
+// The receiver of a `??` field read: `cast` is the arm heap a one-arm-narrowed union box is
+// cast to, -2 a null-tested nullable arm asserted non-null, -1 the receiver read as it is.
+function emitCoalArmRecv(body: u8[], recvIx: i32, cast: i32, fnIx: i32) {
+  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  if cast >= 0 {
+    fbStructGet(uBoxIdx, 1)
+    fbRefCast(cast)
+  }
+  if cast == -2 { fbRefAsNonNull() }
+  0
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -34133,85 +34148,107 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // and select the default or the unboxed single remaining scalar atom. The receiver re-reads
   // in the non-null arm (a name/field chain, like the nullable-struct `?.` path).
   if lhs is Member {
+    // The receiver is a struct row or a union arm; an arm's field reads off its own heap
+    // type exactly as a row's does (D4667).
+    let mHeap = -1
+    let mfi = -1
+    let mphys = ""
+    let mCast = -1
     const msi = structIndexOfExpr(lhs.memObj, fnIx)
     if msi >= 0 {
-      const mfi = sFieldIndex(msi, lhs.memProp)
-      if mfi >= 0 {
-        if sFieldTypeAt(msi, mfi) == FC_UNION {
-          // A wider record's box is read at the receiver's own member set (D3006).
-          const mphys = sFieldElemNameAt(msi, mfi)
-          if memReadBoxAmbiguous(lhsIx, fnIx) {
-            return emitBoxAmbiguousFail(lhsIx)
+      mfi = sFieldIndex(msi, lhs.memProp)
+      if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_UNION {
+        mHeap = sHeapIdx[msi]
+        mphys = sFieldElemNameAt(msi, mfi)
+      }
+    } else {
+      // A box receiver narrowed to one arm is unwrapped to that arm, and a null-tested
+      // nullable arm asserted non-null, before the field read.
+      let mvi = exprVariantIndex(lhs.memObj, fnIx)
+      if mvi < 0 && memIsNarrowed(lhsIx) && exprUnion(lhs.memObj, fnIx) {
+        mvi = memNarrowVariantIndex(lhsIx)
+        if mvi >= 0 { mCast = uVarHeap[mvi] }
+      }
+      if mvi < 0 && exprNullableVariant(lhs.memObj, fnIx) {
+        mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
+        mCast = -2
+      }
+      if mvi >= 0 {
+        mfi = variantFieldIndex(mvi, lhs.memProp)
+        if mfi >= 0 && variantFieldTypeAt(mvi, mfi) == FC_UNION {
+          mHeap = uVarHeap[mvi]
+          mphys = variantFieldElemName(mvi, mfi)
+        }
+      }
+    }
+    if mHeap >= 0 {
+      // A wider record's box is read at the receiver's own member set (D3006).
+      if memReadBoxAmbiguous(lhsIx, fnIx) { return emitBoxAmbiguousFail(lhsIx) }
+      let munm = memReadBoxNarrowName(lhsIx, fnIx)
+      if munm == "" { munm = mphys }
+      // D-VALUNION + D-SETONCE — see the call arm above.
+      const msid = msSetOfText(munm)
+      if (
+        isValueUnionOfSet(msid, munm)
+        && unionHasAtomK(msid, munm, "null", nullValKind())
+      ) {
+        // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
+        let mak = unionResidualSoloKindOfSet(msid)
+        if mak == -2 {
+          mak = valueAtomKind(removeAtomFromSet(munm, "null")) // D-RESIDUE
+        }
+        if mak >= 0 && mak != nullValKind() {
+          if mak == 2 {
+            return emitFail(
+              "emitProgram: `??` over a string|null union field is not supported yet",
+            )
           }
-          let munm = memReadBoxNarrowName(lhsIx, fnIx)
-          if munm == "" { munm = mphys }
-          // D-VALUNION + D-SETONCE — see the call arm above.
-          const msid = msSetOfText(munm)
-          if (
-            isValueUnionOfSet(msid, munm)
-            && unionHasAtomK(msid, munm, "null", nullValKind())
-          ) {
-            // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
-            let mak = unionResidualSoloKindOfSet(msid)
-            if mak == -2 {
-              mak = valueAtomKind(removeAtomFromSet(munm, "null")) // D-RESIDUE
+          // A NULLABLE default keeps the result boxed — the SAME decision the ident
+          // and call arms make (`coalesceDefaultNullable`); the else arm re-reads the
+          // field's own box rather than unboxing it.
+          if coalesceDefaultNullable(e.binRight, fnIx) {
+            if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+            fbStructGet(mHeap, mfi) // the union box
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(nullBoxTag())
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
+            // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
+            // boxed-union `??` spellings that share this lowering.
+            if emitUnionCoerce(body, munm, e.binRight, fnIx) < 0 {
+              return -1 // d, its own box
             }
-            if mak >= 0 && mak != nullValKind() {
-              if mak == 2 {
-                return emitFail(
-                  "emitProgram: `??` over a string|null union field is not supported yet",
-                )
-              }
-              // A NULLABLE default keeps the result boxed — the SAME decision the ident
-              // and call arms make (`coalesceDefaultNullable`); the else arm re-reads the
-              // field's own box rather than unboxing it.
-              if coalesceDefaultNullable(e.binRight, fnIx) {
-                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-                fbStructGet(sHeapIdx[msi], mfi) // the union box
-                fbStructGet(uBoxIdx, 0)         // field 0: tag
-                fbI32Const(nullBoxTag())
-                fbI32Bin(70)                    // 0x46 i32.eq → null?
-                fbIfRef(uBoxIdx)                // 0x04 if, (ref $uBoxIdx) blocktype
-                // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
-                // boxed-union `??` spellings that share this lowering.
-                if emitUnionCoerce(body, munm, e.binRight, fnIx) < 0 {
-                  return -1 // d, its own box
-                }
-                fbElse() // 0x05 else — present → re-read the field
-                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-                fbStructGet(sHeapIdx[msi], mfi)
-                if munm != mphys {
-                  if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
-                }
-                fbEnd() // 0x0b end
-                return 0
-              }
-              if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-              fbStructGet(sHeapIdx[msi], mfi) // the union box
-              fbStructGet(uBoxIdx, 0)         // field 0: tag
-              fbI32Const(nullBoxTag())
-              fbI32Bin(70)                    // 0x46 i32.eq → null?
-              fbIf(valBlockTypeOfKind(mak))   // 0x04 if, value blocktype
-              if emitExprAsKind(body, e.binRight, mak, fnIx) < 0 { return -1 }
-              fbElse()                        // 0x05 else — present → unbox
-              if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-              fbStructGet(sHeapIdx[msi], mfi)
-              if munm != mphys {
-                if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
-              }
-              fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-              const mvb = vbHeapIdxOfKind(mak)
-              if mvb < 0 {
-                return emitFail(
-                  "emitProgram: union field atom has no value box",
-                )
-              }
-              fbRefCast(mvb)
-              fbStructGet(mvb, 0) // the scalar payload
-              fbEnd()             // 0x0b end
-              return 0
+            fbElse() // 0x05 else — present → re-read the field
+            if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+            fbStructGet(mHeap, mfi)
+            if munm != mphys {
+              if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
             }
+            fbEnd() // 0x0b end
+            return 0
           }
+          if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+          fbStructGet(mHeap, mfi)       // the union box
+          fbStructGet(uBoxIdx, 0)       // field 0: tag
+          fbI32Const(nullBoxTag())
+          fbI32Bin(70)                  // 0x46 i32.eq → null?
+          fbIf(valBlockTypeOfKind(mak)) // 0x04 if, value blocktype
+          if emitExprAsKind(body, e.binRight, mak, fnIx) < 0 { return -1 }
+          fbElse()                      // 0x05 else — present → unbox
+          if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+          fbStructGet(mHeap, mfi)
+          if munm != mphys {
+            if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
+          }
+          fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+          const mvb = vbHeapIdxOfKind(mak)
+          if mvb < 0 {
+            return emitFail("emitProgram: union field atom has no value box")
+          }
+          fbRefCast(mvb)
+          fbStructGet(mvb, 0) // the scalar payload
+          fbEnd()             // 0x0b end
+          return 0
         }
       }
     }

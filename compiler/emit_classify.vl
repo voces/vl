@@ -61,6 +61,7 @@ import {
   aliasNameOfTyIx,
   annUnionAtomsOf,
   anyLitUnionUsed,
+  arrLitUnionDestTaken,
   asgKeepsNarrowOf,
   asgNarTyIxOf,
   asgStoreTyOf,
@@ -266,6 +267,7 @@ import {
   tyNulLitUnionMemberTexts,
   tyOfMembers,
   tyPrimNameOf,
+  tyProvesNonNull,
   tyReachesUnion,
   tySame,
   tyScalarBaseIs,
@@ -7960,7 +7962,14 @@ export function mvValKindOfName(valName: string): i32 {
 export function mvValArmOfShape(name: string): i32 {
   if !nameIsWholeSpanShape(name) { return -1 }
   if structIndexByValName(name) >= 0 { return -1 }
-  variantIndexOfTypeName(name)
+  const exact = variantIndexOfTypeName(name)
+  if exact >= 0 { return exact }
+  // The widenings the adopter builds a literal at: `{q:i32}` into an arm's `i32 | null` box
+  // field or `string | null` niche. Only a sole claimant, since the render cannot say
+  // which of two widening arms adopted the literal (D4636).
+  const boxed = variantIndexOfShapeK(name, 1, true)
+  if boxed >= 0 { return boxed }
+  variantIndexOfShapeK(name, 2, true)
 }
 
 // The struct half: the declared row `structIndexOfObj` adopted the literal onto. -1 for a
@@ -14679,6 +14688,22 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       if afi >= 0 {
         if variantFieldTypeAt(avi, afi) == FC_UNION {
           return variantFieldElemName(avi, afi)
+        }
+      }
+    }
+    // The nullable receiver (`z: A | null` under its null test) reads the same arm field, so
+    // it names the same box — `emitMem`'s nullable twin unboxes through this answer (D4636).
+    // A named receiver only: asked of every link of a member chain, the walk is super-linear.
+    if (
+      avi < 0
+      && P.nodes[unwrapParen(m.memObj)] is Ident
+      && exprNullableVariant(m.memObj, fnIx)
+    ) {
+      const nvi = nulVariantIdxOfExpr(m.memObj, fnIx)
+      if nvi >= 0 && !armLayoutAmbiguousAt(nvi) {
+        const nfi = variantFieldIndex(nvi, m.memProp)
+        if nfi >= 0 && variantFieldTypeAt(nvi, nfi) == FC_UNION {
+          return variantFieldElemName(nvi, nfi)
         }
       }
     }
@@ -23037,7 +23062,7 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
                 ok = false
               }
             } else {
-              // An uncoded field is lenient, matching the render path's `shapeFieldTypeCompat`
+              // An uncoded field is lenient, matching the render path's `shapeFieldTypeCompatK`
               // (refutes only proven mismatches), with its one tightening: a code-15 nested-
               // struct field is checked by canonical rep, so two arms sharing a field-name set
               // but differing in nested layout cannot collide onto the wrong variant (B190).
@@ -23108,7 +23133,7 @@ function structIndexOfTypeNameGo(name: string) {
   // `{…}|{…}`, `{…}[]`) is not, so a nullable-struct name must not mis-match its leading shape.
   if nameIsWholeSpanShape(name) {
     // Collect the top-level field names + type texts (`shapeFieldParse`), then match by
-    // field-name set tightened with a field-type layout guard (`shapeFieldTypeCompat`):
+    // field-name set tightened with a field-type layout guard (`shapeFieldTypeCompatK`):
     // two shapes sharing field names but differing in a field's type must not collide.
     const fnames: string[] = []
     const ftypes: string[] = []
@@ -23307,14 +23332,6 @@ function unionMemberSetsCompat(ta: string, tb: string): boolean {
   sa == sb
 }
 
-// True if a shape field TYPE-string `t` (from `shapeFieldParse`) is compatible with the
-// emitter field CODE `code` — i.e. not a proven mismatch (both codes known and unequal).
-// When the type-string can't be classified the check stays lenient (never a false reject
-// of a real twin). A map field (code 19) is additionally tightened by its value rep.
-function shapeFieldTypeCompat(t: string, code: i32, elem: string): boolean {
-  shapeFieldTypeCompatK(t, code, elem, 0)
-}
-
 // Whether spelling `t` is an inline record or an application of a generic record alias.
 function nameIsRecordSpelling(t: string): boolean {
   if nameIsWholeSpanShape(t) { return true }
@@ -23322,10 +23339,10 @@ function nameIsRecordSpelling(t: string): boolean {
   gaeIndexOf(gaeHeadNameOf(t, gaeLtAt(t))) >= 0
 }
 
-// The leniency-levelled form (D461, widened D733). `0` is every caller's default, the
-// only one `variantIndexOfTypeName` asks for; `1` is `structIndexOfTypeName`'s second pass
-// (the union box), `2` its third (the literal widenings), each run only for a render no
-// earlier pass could place.
+// Whether shape field type-string `t` is not a proven mismatch with emitter field code
+// `code`: lenient when `t` cannot classify, a map field tightened by its value rep. `lenient`
+// 0 is the exact pass; 1 admits the union box and 2 the literal widenings, each run only for
+// a render no earlier pass could place (D733).
 function shapeFieldTypeCompatK(
   t: string,
   code: i32,
@@ -23581,39 +23598,55 @@ function jrSpelledAlike(a: i32, b: i32, depth: i32): boolean {
 function variantIndexOfTypeName(name: string) {
   const direct = variantIndexOf(name)
   if direct >= 0 { return direct }
-  if nameIsShapeOpen(name) {
-    const fnames: string[] = []
-    const ftypes: string[] = []
-    shapeFieldParse(name, fnames, ftypes)
-    let vi = 0
-    while vi < uVariants.length {
-      if uFieldCount[vi] == fnames.length {
-        let ok = true
-        let k = 0
-        while k < fnames.length {
-          const fj = variantFieldIndex(vi, fnames[k])
-          if fj < 0 {
-            ok = false
-          } else if (
-            !shapeFieldTypeCompat(
-              ftypes[k],
-              variantFieldTypeAt(vi, fj),
-              variantFieldElemName(vi, fj),
-            )
-          ) {
-            // A shared field NAME but a mismatched field TYPE — a distinct shape that
-            // merely collides on names (a closure returning `{a:i32,f:i64,z:f64}` is NOT
-            // the union arm `{a:boolean,f:()=>…,z:i32}`). Not this variant.
-            ok = false
-          }
-          k = k + 1
+  variantIndexOfShapeK(name, 0, false)
+}
+
+// The field-set scan of `variantIndexOfTypeName` at one `shapeFieldTypeCompatK` leniency.
+// `unique` declines when a second variant also matches, which a widened pass needs: there the
+// spelling does not pin the arm, so a first match would be a guess between declarations.
+function variantIndexOfShapeK(
+  name: string,
+  lenient: i32,
+  unique: boolean,
+): i32 {
+  if !nameIsShapeOpen(name) { return -1 }
+  const fnames: string[] = []
+  const ftypes: string[] = []
+  shapeFieldParse(name, fnames, ftypes)
+  let found = -1
+  let vi = 0
+  while vi < uVariants.length {
+    if uFieldCount[vi] == fnames.length {
+      let ok = true
+      let k = 0
+      while k < fnames.length {
+        const fj = variantFieldIndex(vi, fnames[k])
+        if fj < 0 {
+          ok = false
+        } else if (
+          !shapeFieldTypeCompatK(
+            ftypes[k],
+            variantFieldTypeAt(vi, fj),
+            variantFieldElemName(vi, fj),
+            lenient,
+          )
+        ) {
+          // A shared field NAME but a mismatched field TYPE — a distinct shape that
+          // merely collides on names (a closure returning `{a:i32,f:i64,z:f64}` is NOT
+          // the union arm `{a:boolean,f:()=>…,z:i32}`). Not this variant.
+          ok = false
         }
-        if ok { return vi }
+        k = k + 1
       }
-      vi = vi + 1
+      if ok {
+        if !unique { return vi }
+        if found >= 0 { return -1 }
+        found = vi
+      }
     }
+    vi = vi + 1
   }
-  -1
+  found
 }
 
 // The union-variant index a lifted callback `fe` returns when it collapses to a single
@@ -23626,7 +23659,7 @@ export function cbRetVariantIdx(fe: i32) {
   // The nominal arm on the name, the structural arm on the arena: `variantIndexOfTypeName`
   // runs both, but only the direct name match asks whether this IS a declared variant —
   // identity the arena can't recover (B208). The arena arm is stricter, refusing a
-  // field-set collision `shapeFieldTypeCompat` would let through (avoided by the `fRetKind` guard below).
+  // field-set collision `shapeFieldTypeCompatK` would let through (avoided by the `fRetKind` guard below).
   let vi = variantIndexOf(nm)
   if vi < 0 { vi = variantRowOfObjFieldSet(inferRetTyIxByNode(fnStmts[fe])) }
   if vi < 0 { return -1 }
@@ -26709,6 +26742,8 @@ function arrLitBoxElem(arrIx: i32): boolean {
 export function arrLitInferUnionElemName(arrIx: i32): string {
   const cen = arrLitBoxElemName(arrIx)
   if cen == "" { return "" }
+  // A destination's union types the elements, which box into it (D4635).
+  if arrLitUnionDestTaken(arrIx) { return "" }
   if arrLitIsRef(arrIx) && !arrLitObjBesideNonRecord(arrIx) { return "" }
   cen
 }
@@ -34062,6 +34097,11 @@ function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
 export function holeBindsFunc(ix: i32, fnIx: i32): boolean {
   const t = holeOrCapturedTyOf(ix, fnIx)
   t >= 0 && t < T.tys.length && T.tys[t] is TyFunc
+}
+
+// A hole read (`v.q` in `function g(v)`) whose pin in instance `fnIx` admits no `null` (D4637).
+export function holePinProvesNonNull(ix: i32, fnIx: i32): boolean {
+  tyProvesNonNull(nodeTyInOf(ix, fnIx))
 }
 
 // `holeOperandTyOf` of `ix`, or of the name it reads asked of each enclosing frame that
