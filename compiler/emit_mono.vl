@@ -11,6 +11,7 @@
 // program with no generic call creates none. The host oracle and the two deliberate
 // divergences: `docs/internals/monomorphization-design.md`.
 
+import { nodePos } from "./fmt_util"
 import {
   annGenAppSpanEnds,
   arrElemIs,
@@ -160,6 +161,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -177,6 +179,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  arenaSetNode,
   elseIfLink,
   hasNamedArgs,
   i32ToStr,
@@ -289,6 +292,7 @@ import {
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
+  fnFlowDeclPathSrc,
   fnFlowDeclWritten,
   fnFlowLamPin,
   fnFlowLetPinSigs,
@@ -9965,6 +9969,324 @@ function monoWrittenLetSeedFe(e: i32, ctx: i32): i32 {
   monoListElemGenFe(d.letInit, lf[0])
 }
 
+// ── reads of a literal slot that holds one generic ──────────────────────────────────────────
+// A read of an element or field of an un-annotated `const` literal that nothing mutates, whose
+// slot the flow table says holds one module-scope generic and no write, is that generic by name:
+// the read is rewritten to it, so each read takes its own instance (fn-value-flow-design.md §(f)).
+let mfrParent: {[i32]: i32} = Map()
+let mfrUses: {[i32]: i32[]} = Map()
+let mfrNameCount: {[string]: i32} = Map()
+let mfrTopGen: {[i32]: boolean} = Map()
+
+// Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
+function monoFlowReads(stmts: i32[]): i32 {
+  mfrParent = Map()
+  mfrUses = Map()
+  mfrNameCount = Map()
+  mfrTopGen = Map()
+  for s in stmts {
+    if monoIsGenericDecl(s) { mfrTopGen[s] = true }
+  }
+  const lets: i32[] = []
+  const seen: {[i32]: boolean} = Map()
+  const roots: i32[] = []
+  for s in stmts { roots.push(s) }
+  for f in fnStmts { roots.push(f) }
+  for root in roots {
+    const stack: i32[] = [root]
+    while stack.length > 0 {
+      const ix = stack.pop()
+      if ix >= 0 && ix < P.nodes.length && !(seen[ix] ?? false) {
+        seen[ix] = true
+        monoFlowReadsNote(ix, lets)
+        const kids = nodeChildren(ix)
+        let k = kids.length - 1
+        while k >= 0 {
+          const ch = kids[k]
+          if ch >= 0 {
+            mfrParent[ch] = ix
+            stack.push(ch)
+          }
+          k = k - 1
+        }
+      }
+    }
+  }
+  for d in lets { monoFlowReadsOf(d) }
+  0
+}
+
+// Banks node `ix` for `monoFlowReads`: a name read, a declared name, a candidate binding.
+function monoFlowReadsNote(ix: i32, lets: i32[]) {
+  const n = P.nodes[ix]
+  if n is Ident {
+    const d = identDeclOf(ix)
+    if d >= 0 {
+      const us = mfrUses[d] ?? []
+      us.push(ix)
+      mfrUses[d] = us
+    }
+  } else if n is LetDecl {
+    monoFlowReadsName(n.letName)
+    if n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
+      const v = P.nodes[unwrapParen(n.letInit)]
+      if v is ArrayLit {
+        if v.pos >= 0 { lets.push(ix) }
+      } else if v is ObjLit {
+        lets.push(ix)
+      }
+    }
+  } else if n is FuncDecl {
+    monoFlowReadsName(n.fnName)
+  } else if n is Param {
+    monoFlowReadsName(n.parName)
+  } else if n is ForIn {
+    monoFlowReadsName(n.fiVar)
+    monoFlowReadsName(n.fiVar2)
+  }
+  0
+}
+
+function monoFlowReadsName(nm: string) {
+  if nm != "" { mfrNameCount[nm] = (mfrNameCount[nm] ?? 0) + 1 }
+  0
+}
+
+// The module-scope generic function value node `v` names, as its declaration, when no other
+// declaration shares its name; -1 otherwise.
+function monoFlowLeafGen(v: i32): i32 {
+  if v < 0 { return -1 }
+  const n = P.nodes[v]
+  if !(n is Ident) { return -1 }
+  const g = identDeclOf(v)
+  if !(mfrTopGen[g] ?? false) { return -1 }
+  if (mfrNameCount[n.identName] ?? 0) != 1 { return -1 }
+  g
+}
+
+// The rewrites the reads of binding `d` admit, applied only when every read is one of: a call
+// or other read of a slot holding one generic, a list's `length`, a read of a slot holding no
+// generic, a `for … in` over a list or a spread of one whose elements all name generics.
+function monoFlowReadsOf(d: i32) {
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) { return 0 }
+  const lit = unwrapParen(dn.letInit)
+  const reads: i32[] = []
+  const gens: i32[] = []
+  const loops: i32[] = []
+  const spreads: i32[] = []
+  for u in mfrUses[d] ?? [] {
+    if !monoFlowReadPlan(d, u, lit, reads, gens, loops, spreads) { return 0 }
+  }
+  let i = 0
+  while i < reads.length {
+    monoFlowReadSet(reads[i], gens[i])
+    i = i + 1
+  }
+  i = 0
+  while i < loops.length {
+    monoFlowLoopSet(loops[i], loops[i + 1])
+    i = i + 2
+  }
+  i = 0
+  while i < spreads.length {
+    monoFlowSpreadSet(spreads[i], spreads[i + 1])
+    i = i + 2
+  }
+  0
+}
+
+// Plans read `u` of binding `d` initialized with literal `lit`, appending a rewrite to `reads`
+// and `gens`, or `[loop, list]` to `loops`, or `[spread, list]` to `spreads`; false for a read
+// that may mutate the value or escape with it, which keeps every read of `d` as it is.
+function monoFlowReadPlan(
+  d: i32,
+  u: i32,
+  lit: i32,
+  reads: i32[],
+  gens: i32[],
+  loops: i32[],
+  spreads: i32[],
+): boolean {
+  let cur = u
+  let val = lit
+  const path: string[] = []
+  let p = mfrParent[cur] ?? -1
+  while p >= 0 {
+    const pn = P.nodes[p]
+    if pn is Paren {
+      cur = p
+    } else if pn is Index && pn.idxArr == cur {
+      const el = monoFlowElemAt(val, pn.idxIndex)
+      if el < 0 { return false }
+      val = el
+      path.push("e")
+      cur = p
+    } else if pn is Member && pn.memObj == cur {
+      const vn = P.nodes[val]
+      if vn is ArrayLit { return pn.memProp == "length" && !monoFlowIsWrite(p) }
+      const fv = monoFlowFieldOf(val, pn.memProp)
+      if fv < 0 { return false }
+      val = fv
+      path.push("f." + pn.memProp)
+      cur = p
+    } else {
+      break
+    }
+    p = mfrParent[cur] ?? -1
+  }
+  const vn = P.nodes[val]
+  if vn is ObjLit { return false }
+  if vn is ArrayLit {
+    if p < 0 { return false }
+    const pn = P.nodes[p]
+    if pn is ForIn {
+      if pn.fiIter != cur || pn.fiVar2 != "" { return false }
+      const ep: string[] = []
+      for k in path { ep.push(k) }
+      ep.push("e")
+      const g = monoFlowElemsGen(val)
+      if g < 0 || fnFlowDeclPathSrc(d, ep) != g { return false }
+      loops.push(p)
+      loops.push(val)
+      return true
+    }
+    if pn is Spread {
+      const host = mfrParent[p] ?? -1
+      if host < 0 || !(P.nodes[host] is ArrayLit) { return false }
+      for e in vn.arrElems {
+        if monoFlowLeafGen(unwrapParen(e)) < 0 { return false }
+      }
+      spreads.push(p)
+      spreads.push(val)
+      return true
+    }
+    return false
+  }
+  if monoFlowIsWrite(cur) { return false }
+  const g = monoFlowLeafGen(val)
+  if g < 0 { return true }
+  if path.length == 0 || fnFlowDeclPathSrc(d, path) != g { return false }
+  reads.push(cur)
+  gens.push(g)
+  true
+}
+
+// The element of list literal `v` the literal index `k` reads, -1 when `v` is no list literal
+// free of spreads or `k` is not a literal index inside it.
+function monoFlowElemAt(v: i32, k: i32): i32 {
+  const ln = P.nodes[v]
+  const kn = P.nodes[k]
+  if !(ln is ArrayLit) || !(kn is NumLit) { return -1 }
+  for e in ln.arrElems {
+    if P.nodes[e] is Spread { return -1 }
+  }
+  const at = monoListLitIndex(kn.numText, ln.arrElems.length)
+  if at < 0 { return -1 }
+  unwrapParen(ln.arrElems[at])
+}
+
+// The value record literal `v` gives field `name`, -1 when `v` is no record literal free of
+// spreads or holds no such field.
+function monoFlowFieldOf(v: i32, name: string): i32 {
+  const on = P.nodes[v]
+  if !(on is ObjLit) { return -1 }
+  let out = -1
+  for fi in on.objFields {
+    const f = P.nodes[fi]
+    if f is FieldInit {
+      if f.fiName == name { out = unwrapParen(f.fiValue) }
+    } else {
+      return -1
+    }
+  }
+  out
+}
+
+// The one generic every element of list literal `v` names, -1 when they differ or any does not.
+function monoFlowElemsGen(v: i32): i32 {
+  const ln = P.nodes[v]
+  if !(ln is ArrayLit) || ln.arrElems.length == 0 { return -1 }
+  let g = -1
+  for e in ln.arrElems {
+    const eg = monoFlowLeafGen(unwrapParen(e))
+    if eg < 0 || (g >= 0 && eg != g) { return -1 }
+    g = eg
+  }
+  g
+}
+
+// Whether node `x` is the target of an assignment, plain or compound.
+function monoFlowIsWrite(x: i32): boolean {
+  const p = mfrParent[x] ?? -1
+  if p < 0 { return false }
+  const pn = P.nodes[p]
+  if pn is BinExpr {
+    if pn.binLeft != x { return false }
+    const op = pn.binOp
+    if op == "==" || op == "!=" || op == "<=" || op == ">=" { return false }
+    return op.length > 0 && op.slice(op.length - 1, op.length) == "="
+  }
+  pn is Unary && (pn.unOp == "++" || pn.unOp == "--")
+}
+
+// Rewrites read node `x` in place to a name read of generic `g`.
+function monoFlowReadSet(x: i32, g: i32) {
+  const gd = P.nodes[g]
+  if !(gd is FuncDecl) { return 0 }
+  const n: Node = { identName: gd.fnName, pos: nodePos(x) }
+  arenaSetNode(x, n)
+  sidNoteNodeName(x, g)
+  monoArenaTouch()
+  0
+}
+
+// Rewrites each read of loop `fl`'s binding to the generic every element of list literal `v`
+// names, unless a read writes it.
+function monoFlowLoopSet(fl: i32, v: i32) {
+  const g = monoFlowElemsGen(v)
+  if g < 0 { return 0 }
+  const us = mfrUses[fl] ?? []
+  for u in us {
+    if monoFlowIsWrite(u) { return 0 }
+  }
+  for u in us { monoFlowReadSet(u, g) }
+  0
+}
+
+// Replaces spread `sp` in its host list literal by one name read per element of list literal
+// `v`, each naming the generic that element names.
+function monoFlowSpreadSet(sp: i32, v: i32) {
+  const hx = mfrParent[sp] ?? -1
+  if hx < 0 { return 0 }
+  const host = P.nodes[hx]
+  const src = P.nodes[v]
+  if !(host is ArrayLit) || !(src is ArrayLit) { return 0 }
+  const out: i32[] = []
+  for e in host.arrElems {
+    if e == sp {
+      for se in src.arrElems {
+        const x = unwrapParen(se)
+        const g = monoFlowLeafGen(x)
+        if g >= 0 {
+          const gd = P.nodes[g]
+          if gd is FuncDecl {
+            const nx = mkIdent(gd.fnName, nodePos(sp))
+            sidNoteNodeName(nx, g)
+            nodeTyRecord(nx, nodeTyIxOf(x))
+            out.push(nx)
+          }
+        }
+      }
+    } else {
+      out.push(e)
+    }
+  }
+  host.arrElems = out
+  monoArenaTouch()
+  0
+}
+
 // Gives the un-annotated `const` list `d` declared at `at` the function type its element calls
 // take, as an annotation, so its generics are instanced at it. Leaves alone a list whose element
 // type is concrete, that is read other than by element calls, or whose calls it cannot type; -1
@@ -14678,6 +15000,7 @@ export function monomorphize(stmts: i32[]) {
   // The flow table reads the tree before the walk rewrites it.
   fnFlowTableBuild(stmts)
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
+  monoFlowReads(stmts)
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
   while i < stmts.length {

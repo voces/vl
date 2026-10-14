@@ -745,6 +745,23 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      u03). Over the d3909, d3929 and d3960 grids, `rv3568` and the other `rv3484`–`rv3570`
      witnesses nothing else moved. It retires nothing. The walks that find the calls are
      still mono's, and maps, unions, spread, for-in and `?.` are not yet read from the table.
+   - Second PR: a read that is not a direct call is rewritten to the generic's name. In an
+     un-annotated `const` list or record literal, every use of the binding must be a pure
+     read. When a read's slot holds one module-scope generic in the table
+     (`fnFlowDeclPathSrc`, which follows a path of `e` and `f.<name>` steps), the read becomes
+     a name read of that generic (`monoFlowReads`). So does each read of a `for … in` binding
+     over such a list, and each element a `[...xs]` spread copies. The existing alias and
+     direct-call machinery then instances it per call. Over the
+     `fn-value-generic-list-read` matrix, runs go from 37 to 48 of 66. Over its open twin they
+     go from 5 to 10 of 64. Nine `p1`/`p2` hand probes move from emit refusals to runs:
+     alias, nested record, for-in, `length`, spread, and the record alias. No cell is lost.
+     These stay as they are:
+     - maps, which may hold null;
+     - a returned union;
+     - `?.`, a check reject at the inferred return;
+     - a written `let`. D4515 is its clause-1 witness.
+
+     It retires nothing yet.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
