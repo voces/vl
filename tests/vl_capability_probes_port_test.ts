@@ -12,7 +12,7 @@
 // path (more probes than the port grades in-process) and the in-process one; a named
 // `--compiler`; and an empty probe directory. A one-word mutation of the port must red.
 //
-// The two TIMEOUT probes are graded alone under a 10 s bound; the rest run under 60 s, which
+// The two TIMEOUT probes grade in a tree of their own under a 10 s bound; the rest under 60 s, which
 // only a starved machine could reach, so load cannot turn an answering probe into a TIMEOUT.
 //
 // Where they cannot agree, pinned below rather than left as prose:
@@ -21,12 +21,22 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, pythonBin, ROOT, STD, VL } from "./support/tree.ts";
+import {
+  COMPILER,
+  exists,
+  nativeEnv,
+  pythonBin,
+  ROOT,
+  STD,
+  VL,
+} from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !ENABLED) {
-  console.warn("[vl-capability-probes-port] skipped — missing vl binary or seed wasm.");
+  console.warn(
+    "[vl-capability-probes-port] skipped — missing vl binary or seed wasm.",
+  );
 }
 
 const dec = new TextDecoder();
@@ -49,16 +59,19 @@ exit \${rc:-0}
 `;
 
 const CHECKED = "//! check-out: Checked 1 file, no errors.\\n";
-const LONG = "emitProgram: ü".padEnd(84, "x") + " — the late LIVE literal is here";
+const LONG = "emitProgram: ü".padEnd(84, "x") +
+  " — the late LIVE literal is here";
 
 // Probe name → its source. Names sort in the order listed.
 const PROBES: Record<string, string> = {
   "a-runs.vl": "// Should print 42.\n//! run-out: 42\\n\nprint(42)\n",
   "b-twice.vl": "// Should print 7 twice.   \n//! run-out: 7\\n7\\n\n",
-  "c-then.vl": "// A contract.\n// Should print 1 then 0\n//! run-out: 1\\r\\n 0 \\n\n",
-  "d-noheader.vl": "// Nothing to compare against.\n//! run-out: anything @S@\\n\n",
+  "c-then.vl":
+    "// A contract.\n// Should print 1 then 0\n//! run-out: 1\\r\\n 0 \\n\n",
+  "d-noheader.vl":
+    "// Nothing to compare against.\n//! run-out: anything @S@\\n\n",
   "e-wrong.vl":
-    "// Should print 5 then 6.\n//! run-out: it's \"q\" ü\\t\\x01 @C@\\n\n",
+    '// Should print 5 then 6.\n//! run-out: it\'s "q" ü\\t\\x01 @C@\\n\n',
   "f-check.vl": [
     "// Should print 1.",
     "//! run-rc: 1",
@@ -126,12 +139,13 @@ const PROBES: Record<string, string> = {
   ].join("\n"),
 };
 
-// The two probes that answer by never answering. They are graded alone, in a tree of their
+// The two probes that answer by never answering. They are graded apart, in a tree of their
 // own and under a bound long enough that no probe that DOES answer can be starved into one,
 // so the other seventeen are graded with a bound they cannot reach at all.
 const TIMEOUTS: Record<string, string> = {
   "o-timeout-run.vl": "// Should print 1.\n//! run-sleep: 600\n",
-  "p-timeout-check.vl": "//! run-rc: 1\n//! run-out: partial\\n\n//! check-sleep: 600\n",
+  "p-timeout-check.vl":
+    "//! run-rc: 1\n//! run-out: partial\\n\n//! check-sleep: 600\n",
 };
 const SLOW = "10";
 const FAST = "60";
@@ -153,7 +167,11 @@ const RED = [
   "s-drift.vl",
 ];
 
-const site = (literal: string, probe: string) => ({ literal, probe, row: "D0" });
+const site = (literal: string, probe: string) => ({
+  literal,
+  probe,
+  row: "D0",
+});
 const LIVE_LIT = "the late LIVE literal is here";
 const SITES = [
   site(LIVE_LIT, "r-live.vl"),
@@ -171,7 +189,9 @@ const SITES = [
 const tree = async (dir: string, probes: Record<string, string> = PROBES) => {
   await Deno.mkdir(`${dir}/${P}`, { recursive: true });
   await Deno.mkdir(`${dir}/compiler`, { recursive: true });
-  await Deno.mkdir(`${dir}/scripts/vl-host/target/release`, { recursive: true });
+  await Deno.mkdir(`${dir}/scripts/vl-host/target/release`, {
+    recursive: true,
+  });
   await Deno.copyFile(`${ROOT}/${P}/run.py`, `${dir}/${P}/run.py`);
   await Deno.copyFile(`${ROOT}/${P}.vl`, `${dir}/${P}.vl`);
   await Deno.symlink(STD, `${dir}/std`);
@@ -182,7 +202,10 @@ const tree = async (dir: string, probes: Record<string, string> = PROBES) => {
   for (const [n, src] of Object.entries(probes)) {
     await Deno.writeTextFile(`${dir}/${P}/${n}`, src);
   }
-  await Deno.writeTextFile(`${dir}/${P}/live-sites.json`, JSON.stringify({ sites: SITES }));
+  await Deno.writeTextFile(
+    `${dir}/${P}/live-sites.json`,
+    JSON.stringify({ sites: SITES }),
+  );
   // Every literal but the GONE one is in the compiler's source, quoted, across two files.
   await Deno.writeTextFile(
     `${dir}/compiler/a.vl`,
@@ -196,46 +219,60 @@ const tree = async (dir: string, probes: Record<string, string> = PROBES) => {
 };
 
 Deno.test({
-  name: "capability probes: the VL port prints the Python's report, byte for byte",
+  name:
+    "capability probes: the VL port prints the Python's report, byte for byte",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({ prefix: "vl_capability_probes_port_" });
-    const dirT = await Deno.makeTempDir({ prefix: "vl_capability_probes_port_t_" });
-    let cwd = dir;
-    let bound = FAST;
-    const spawn = async (cmd: string, args: string[]): Promise<Out> => {
-      const { code, stdout, stderr } = await new Deno.Command(cmd, {
-        args,
-        cwd,
-        stdout: "piped",
-        stderr: "piped",
-        env: nativeEnv({ NO_COLOR: "1", JOBS: "2", VL, VL_PROBE_TIMEOUT: bound }),
-      }).output();
-      return { code, out: dec.decode(stdout) + dec.decode(stderr) };
+    const dir = await Deno.makeTempDir({
+      prefix: "vl_capability_probes_port_",
+    });
+    const dirT = await Deno.makeTempDir({
+      prefix: "vl_capability_probes_port_t_",
+    });
+    // One runner per tree: `cwd` is the checkout the scripts grade, `bound` its timeout.
+    const runner = (cwd: string, bound: string) => {
+      const spawn = async (cmd: string, args: string[]): Promise<Out> => {
+        const { code, stdout, stderr } = await new Deno.Command(cmd, {
+          args,
+          cwd,
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({
+            NO_COLOR: "1",
+            JOBS: "2",
+            VL,
+            VL_PROBE_TIMEOUT: bound,
+          }),
+        }).output();
+        return { code, out: dec.decode(stdout) + dec.decode(stderr) };
+      };
+      const py = (argv: string[]) =>
+        spawn(pythonBin(), [`${P}/run.py`, ...argv]);
+      const port = (argv: string[]) =>
+        spawn(VL, ["run", `${P}.vl`, "--compiler", COMPILER, "--", ...argv]);
+      const agree = async (label: string, argv: string[], want: number) => {
+        // Concurrent: neither runner writes to the tree, and a TIMEOUT case is mostly waiting.
+        const [p, v] = await Promise.all([py(argv), port(argv)]);
+        if (p.code !== v.code || p.out !== v.out) {
+          throw new Error(
+            `${label}: the port disagrees with the Python.\n` +
+              `want exit ${p.code}:\n${p.out}\ngot exit ${v.code}:\n${v.out}`,
+          );
+        }
+        if (p.code !== want) {
+          throw new Error(
+            `${label}: want exit ${want} from both, got ${p.code}:\n${p.out}`,
+          );
+        }
+        return p.out;
+      };
+      return { py, port, agree };
     };
-    const py = (argv: string[]) => spawn(pythonBin(), [`${P}/run.py`, ...argv]);
-    const port = (argv: string[]) =>
-      spawn(VL, ["run", `${P}.vl`, "--compiler", COMPILER, "--", ...argv]);
-    const agree = async (label: string, argv: string[], want: number) => {
-      const p = await py(argv);
-      const v = await port(argv);
-      if (p.code !== v.code || p.out !== v.out) {
-        throw new Error(
-          `${label}: the port disagrees with the Python.\n` +
-            `want exit ${p.code}:\n${p.out}\ngot exit ${v.code}:\n${v.out}`,
-        );
-      }
-      if (p.code !== want) {
-        throw new Error(`${label}: want exit ${want} from both, got ${p.code}:\n${p.out}`);
-      }
-      return p.out;
-    };
-    try {
-      // The probes that never answer, alone, under the bound that lets them time out.
+    // The probes that never answer, in a tree of their own under the bound that lets them
+    // time out. Mostly waiting, so they grade beside the rest rather than before it.
+    const timeouts = async () => {
       await tree(dirT, TIMEOUTS);
-      cwd = dirT;
-      bound = SLOW;
-      const slow = await agree("the timeouts", [], 1);
+      const slow = await runner(dirT, SLOW).agree("the timeouts", [], 1);
       for (
         const v of [
           `TIMEOUT: no answer in ${SLOW}s`,
@@ -243,11 +280,14 @@ Deno.test({
         ]
       ) {
         if (!slow.includes(v)) {
-          throw new Error(`the fixture must reach \`${v}\`; the report is:\n${slow}`);
+          throw new Error(
+            `the fixture must reach \`${v}\`; the report is:\n${slow}`,
+          );
         }
       }
-      cwd = dir;
-      bound = FAST;
+    };
+    const rest = async () => {
+      const { py, port, agree } = runner(dir, FAST);
       await tree(dir);
       const all = await agree("the report", [], 1);
       for (
@@ -265,7 +305,9 @@ Deno.test({
         ]
       ) {
         if (!all.includes(v)) {
-          throw new Error(`the fixture must reach \`${v}\`; the report is:\n${all}`);
+          throw new Error(
+            `the fixture must reach \`${v}\`; the report is:\n${all}`,
+          );
         }
       }
       await agree("--floor", ["--floor"], 1);
@@ -281,7 +323,10 @@ Deno.test({
       // The must-red control: one verdict word changed in the port, in place, because the
       // fan-out's workers are built from that path.
       const src = await Deno.readTextFile(`${dir}/${P}.vl`);
-      const bad = src.replace('let where = "emit refuses"', 'let where = "emit refused"');
+      const bad = src.replace(
+        'let where = "emit refuses"',
+        'let where = "emit refused"',
+      );
       if (bad === src) throw new Error("the mutation did not apply");
       await Deno.writeTextFile(`${dir}/${P}.vl`, bad);
       const m = await port([]);
@@ -294,11 +339,14 @@ Deno.test({
       for (const n of RED) await Deno.remove(`${dir}/${P}/${n}`);
       await Deno.writeTextFile(
         `${dir}/${P}/live-sites.json`,
-        JSON.stringify({ sites: [site("emitProgram: a DRIFT literal", "c-then.vl")] }),
+        JSON.stringify({
+          sites: [site("emitProgram: a DRIFT literal", "c-then.vl")],
+        }),
       );
       await Deno.writeTextFile(
         `${dir}/${P}/c-then.vl`,
-        PROBES["c-then.vl"] + "//! run-rc: 3\n//! run-err: emitProgram: a DRIFT literal\\n\n",
+        PROBES["c-then.vl"] +
+          "//! run-rc: 3\n//! run-err: emitProgram: a DRIFT literal\\n\n",
       );
       await agree("a green --live-sites", ["--live-sites"], 0);
       await Deno.writeTextFile(`${dir}/${P}/c-then.vl`, PROBES["c-then.vl"]);
@@ -317,6 +365,10 @@ Deno.test({
           `an unknown flag: want exit 2 from both, got ${pu.code} / ${vu.code}:\n${vu.out}`,
         );
       }
+    };
+    try {
+      const done = await Promise.allSettled([timeouts(), rest()]);
+      for (const d of done) if (d.status === "rejected") throw d.reason;
     } finally {
       await Deno.remove(dir, { recursive: true });
       await Deno.remove(dirT, { recursive: true });

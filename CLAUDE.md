@@ -79,9 +79,9 @@ the wall past a couple of minutes, the gate is what needs rethinking, not the bu
 The parts, and what each is for:
 
 1. `deno task test`
-2. `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts` — the `ci-native` job, **not** part of the above. The ci-native
-   job ALSO runs an explicit list of seed-backed lsp/playground suites that match neither
-   glob (ci.yml's "Editor features on the wasm compiler" step); gate.sh runs those as its
+2. `SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts` — on CI the `ci-native` shards plus `ci-release-shape`, **not** part of
+   the above. CI's `checks` job ALSO runs an explicit list of seed-backed lsp/playground suites
+   that match neither glob (ci.yml's "Editor features on the wasm compiler" step); gate.sh runs those as its
    own gate, extracting the list FROM ci.yml at run time so the two files cannot drift
    (`tests/ci_seed_coverage_test.ts` guards the anchor). Nine green local gates on a branch
    that broke exactly those files is how #2105 merged red — hence the tenth gate.
@@ -174,11 +174,11 @@ than rebuilding its grid.
 priced in its bytes — and that price was read only when somebody went looking: **+8.8% across
 four landings on 2026-09-03**, noticed because a peer asked. Same ratchet shape as the comment
 budget: a committed one-line `scripts/seed-size-baseline.json`, `--check` in `gate.sh` and in
-ci-native, `--write-baseline` in the SAME PR as the growth it records. It reds only above
+CI's `checks` job, `--write-baseline` in the SAME PR as the growth it records. It reds only above
 **+3%** — shrinkage and small growth print and pass, because the thing being defended is
 *nobody noticed*, not a byte target. **And the deciding reading is the FIXPOINT's**: one
-self-compile off a stale seed is the PREVIOUS compiler's output, so ci-native takes it straight
-after `--prove-fixpoint`. Rationale and both measurements: DECISIONS.md §"The seed's size is a
+self-compile off a stale seed is the PREVIOUS compiler's output, so CI takes it on the `seed` job's
+`--prove-fixpoint` output. Rationale and both measurements: DECISIONS.md §"The seed's size is a
 per-landing number".
 
 **IT IS THE FIRST ORCHESTRATOR SCRIPT WRITTEN IN VL**, so it is compiled by the seed it
@@ -676,7 +676,7 @@ from comments that were confidently STALE, not long — a length budget alone wo
 corrected none of them.
 
 The tree cannot reach zero in one PR, so all four codes ride ONE RATCHET.
-`vl check --budget scripts/comment-budget-baseline.json` (a gate in `gate.sh` and in CI) fails
+`vl check --budget scripts/comment-budget-baseline.json` (held by `lint-self.sh` over its graph report, in `gate.sh` and in CI) fails
 when any FILE's count for any code goes up; `--write-baseline` lowers it, in the same PR as the
 trim that earned it, `vl check compiler --severity info` names the blocks and `--budget-why`
 names the ones that LEFT.
@@ -707,7 +707,7 @@ found (D1646/D1647) are `docs/internals/kind-ladder-lint.md`.
 
 `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
 across two functions where only one hands back. Ratchet: `vl check --budget
-scripts/ladder-budget-baseline.json` (a gate row), and `vl run scripts/ladder-sets.vl` beside it
+scripts/ladder-budget-baseline.json` (held by `lint-self.sh`), and `vl run scripts/ladder-sets.vl` beside it
 re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
 for the form with no kind literal in it, which is the only place #2400's hole is visible.
 

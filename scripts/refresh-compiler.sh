@@ -223,36 +223,10 @@ else
   done
 fi
 
-# WARM EVERY ENGINE TAG, not just the one this script happened to make. The host
-# compiles the seed under several engine configurations (`seed_engine`, main.rs): a null
-# collector for `build`/`run`, a collecting one for the `check`/`fmt`/`test` pump —
-# and each keeps its own sidecar. Only `run`'s was ever carried forward, so the
-# `check` tag was cold at the start of every ci-native step and every worker that
-# started before the first JIT published re-compiled the 1.8 MB seed itself.
-# Measured: ~280 s of redundant CPU per step, 45% of it
-# (docs/internals/perf-opportunities-2026-09.md §A5, item 3).
-# Concurrent because the publish is an atomic rename, and NON-FATAL: a warm sidecar
-# is a cache, so a failure here costs one JIT, never a refresh.
-warm() {
-  "$VL" "$1" "$WORK/hello.vl" --compiler "$OUT" > /dev/null 2>&1 ||
-    echo "  note: could not warm the \`$1\` sidecar — its first use re-JITs the seed" >&2
-}
-# The third tag is the copying-collector compile every `vl build`/`vl run` gets by default
-# (`compile_engine`, main.rs); this script pins null, so it names copying to reach it.
-warm_copying() {
-  VL_COMPILE_GC=copying "$VL" build "$WORK/hello.vl" -o "$WORK/warm-copying.wasm" \
-    --compiler "$OUT" > /dev/null 2>&1 ||
-    echo "  note: could not warm the copying-compile sidecar — its first use re-JITs the seed" >&2
-}
-# The two fuel-metered tags (`$VL_FUEL=1`, under each compile collector) are what the
-# measurement rows compile under — scaling shape, self-compile time, plumb-shape — so
-# warming them keeps that JIT out of the gate.
-warm_fuel() {
-  VL_FUEL=1 VL_COMPILE_GC="$1" "$VL" build "$WORK/hello.vl" -o "$WORK/warm-fuel-$1.wasm" \
-    --compiler "$OUT" > /dev/null 2>&1 ||
-    echo "  note: could not warm the fuel/$1 sidecar — its first use re-JITs the seed" >&2
-}
-warm run & warm check & warm_copying & warm_fuel copying & warm_fuel null & wait
+# WARM EVERY ENGINE TAG, not just the one this script happened to make: each keeps its own
+# sidecar, and a cold one at the start of a parallel suite has every worker re-JIT the seed
+# (docs/internals/perf-opportunities-2026-09.md §A5, item 3). scripts/warm-seed.sh owns the list.
+VL="$VL" scripts/warm-seed.sh --fuel "$OUT"
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi

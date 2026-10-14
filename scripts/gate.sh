@@ -153,10 +153,9 @@ run "native-fixpoint"          bash scripts/native-fixpoint.sh
 # self-compile against a row that already does two costs the table nothing.
 run "self-compile time"        bash scripts/self-compile-time.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
-# The comment-budget RATCHET: per-file counts of the four comment lint codes may only
-# fall. lint-self.sh holds those codes out of its own `info` gate while the baseline
-# is non-zero (it is at zero now, so they gate there outright); held by the lint itself.
-run "comment budget"           "$VL" check --budget scripts/comment-budget-baseline.json --compiler "$SEED"
+# The comment-budget, kind-ladder and sentinel-index RATCHETS are held inside
+# "lint-self + fmt": each counts the findings that row's compiler-graph lint already
+# produced (`vl check --budget --findings`) instead of walking compiler/ again.
 # The seed-size RATCHET: the compiler's own bytes, against a committed baseline, so a
 # jump names the landing that bought it rather than being found weeks later. It reads
 # the seed built above — ONE self-compile, which off a stale seed is the OLD codegen's
@@ -181,13 +180,9 @@ run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler 
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.
 run "arena-scan budget"        "$VL" check --budget scripts/scan-budget-baseline.json --compiler "$SEED"
-# The kind-ladder RATCHET, third of the same shape: a ladder over a closed kind set is
-# exhaustive over it or its default NAMES what it excludes. Its twin row re-derives the
-# lint's copy of every closed set from the `export type` that declares it and FAILS on drift.
-run "kind-ladder budget"       "$VL" check --budget scripts/ladder-budget-baseline.json --compiler "$SEED"
+# The kind-ladder RATCHET rides "lint-self + fmt"; this row re-derives the lint's copy of
+# every closed set from the `export type` that declares it and FAILS on drift.
 run "kind-ladder sets"         "$VL" run scripts/ladder-sets.vl --compiler "$SEED"
-# The sentinel-index RATCHET, fourth of the same shape, is held inside "lint-self + fmt":
-# it counts the findings that row's compiler-graph run already produced (`--findings`).
 # The dead-export RATCHET, fifth of the same shape: `unused-function` exempts an exported
 # declaration ("public surface"), so for a tree whose only consumer is itself the export
 # list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
