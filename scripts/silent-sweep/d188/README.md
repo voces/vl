@@ -1,5 +1,7 @@
 # d188 — the two grids #1992 was decided on
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 Both grade on the RUN, both print a `{cell: outcome}` JSON on stdout, and both take one
 argument: the seed to grade.
 

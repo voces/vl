@@ -1,5 +1,7 @@
 # The D224 grid — DE-CONFOUNDING the `twin` axis, and the message pairing
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 `silent-class-inventory.md` **D224** was refused for a price of 199 block-B cells that
 census block B **cannot attribute**: block B crosses `twin` only at its three CORNERS
 (`none/nounion/0`, `exact/unused/1`, `armtwin/used/2`), so every `twin=armtwin` cell in it

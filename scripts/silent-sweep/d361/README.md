@@ -1,5 +1,7 @@
 # d361 — the spelling census block E cannot reach
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 D361's witness and the census cell it is a respelling of differ by one word. Every block-E
 read is an ELEMENT read (`(gN[0]).r`), and at `cont=map_of_list × pval=mixed` that read hits
 `armRecvHoldsBareArm`'s ref-list-element decline, so the family grades a LOUD emit reject
@@ -25,7 +27,7 @@ It is the READING instrument, not the tripwire. The committed named set is
 `scripts/silent-sweep/census/d361-landed.json`: the **96** cells of block E ITSELF that the
 landing moves, which is the whole of that block's silent column (96 before, 0 after). Those
 are census cells, so they re-grade from the census generator with no second generator in the
-loop — `d243/mkset.py` materialises them and they are carried by the standing gate as
+loop — `census/mkset.vl` materialises them and they are carried by the standing gate as
 `d361-landed`. This directory's 1,424 cells exist to show that the class is four times
 larger than the spelling the census happens to carry, and that both spellings move together.
 

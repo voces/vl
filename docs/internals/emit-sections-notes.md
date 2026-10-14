@@ -250,7 +250,7 @@ read, and then traps `null reference` on the recover. The same binding inside
 a `function` has always lowered correctly, which is what made this invisible:
 the storage class of the executing body is the only thing that differs.
 
-Measured on the scope-crossed grid (`scripts/silent-sweep/gen.py --scopes`):
+Measured on the scope-crossed grid (`scripts/silent-sweep/gen.py --scopes`, since deleted):
 38 of 8,550 paired coordinates, all `scope=mod`, all on a MISSING key, all
 `wasm trap: null reference`; the function-scope twin of every one is correct.
 ```
