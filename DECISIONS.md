@@ -9161,7 +9161,7 @@ while sources written before the ruling are migrated — plumb's generated units
 population — and is deleted once plumb regenerates; nothing else depends on it. One old shape
 migrates silently and cannot be detected: an unused label on a loop first in a body,
 `function f() { L: while c { … } }`, is now an object holding the loop's value, which the
-checker refuses only when that value is `void`. `scripts/codemods/label-at.py` rewrites a tree,
+checker refuses only when that value is `void`. `scripts/codemods/label-at.vl` rewrites a tree,
 and rewrites that shape too.
 
 ## `{ name, … }` is an object too; only a lone `{ name }` is a block (2026-10-02) — D3475

@@ -384,7 +384,7 @@ sources of error push the estimate UP, not down: a time-boxed UNDECIDED favours
 unreachable-by-argument over live (which needs a program nobody has written), and the frame
 excludes the already-known-live sites.
 
-**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.py`.** Every hand-derivation of this
+**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.vl`.** Every hand-derivation of this
 population has been wrong, including both of the ones this paragraph used to quote: "511
 literals" came from an 8-line WINDOW grep that swept in neighbouring code, and **504 sites is
 not reproducible either** — the script reads **521** on the very tree that doc measured, with
