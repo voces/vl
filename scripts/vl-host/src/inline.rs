@@ -61,7 +61,7 @@ use wasmparser::{
 
 use crate::multivalue::{
     concrete_index, field_facts, function_names, put_uleb, put_val, BodyMove, FieldFacts, Num,
-    MV_RECORD_MAX_FIELDS,
+    Scalarized, MV_RECORD_MAX_FIELDS,
 };
 
 const NONE: u32 = u32::MAX;
@@ -1960,7 +1960,11 @@ pub(crate) fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) ->
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
 /// changes nothing. `stable_layout` (`vl build --stable-layout`) keeps the layout of every type
 /// a crossing value reaches, not only of the types a boundary signature names.
-pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<Stepped> {
+pub fn inline_step(
+    bytes: &[u8],
+    stable_layout: bool,
+    scalarized: &dyn Fn(&[u8]) -> Option<Scalarized>,
+) -> Option<Stepped> {
     let flag = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
     let explaining = flag("VL_INLINE_EXPLAIN");
     // `$VL_INLINE_REBOX=1`: inline a field even where a read re-boxes, so a grid can grade the
@@ -2015,11 +2019,13 @@ pub fn inline_step(bytes: &[u8], stable_layout: bool) -> Option<Stepped> {
     }
     // Slice S2 reads the field step's output, so a re-boxed field read it stores is seen.
     let flat = match &fields {
-        None => crate::flat::flat_step(&s, bytes, explaining, rebox_all, spill_all, &name),
+        None => crate::flat::flat_step(
+            &s, bytes, explaining, rebox_all, spill_all, &name, scalarized,
+        ),
         Some((out, _)) => match scan(out, stable_layout) {
-            Ok(Some(s2)) => {
-                crate::flat::flat_step(&s2, out, explaining, rebox_all, spill_all, &name)
-            }
+            Ok(Some(s2)) => crate::flat::flat_step(
+                &s2, out, explaining, rebox_all, spill_all, &name, scalarized,
+            ),
             _ => None,
         },
     };

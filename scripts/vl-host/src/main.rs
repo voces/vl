@@ -6165,98 +6165,6 @@ fn put_name(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// `bytes` with its function names replaced: `rename(index, current name)` answers each
-/// function's new name, or `None` for none. Every other section, and every other part of the
-/// `name` section, is kept byte for byte; a module with no `name` section gains one at the
-/// end. `None` when the module's section framing does not parse. The multi-value step's twin
-/// names are its last use; the escape step renames through `compiler/wasm_names.vl`.
-fn rename_functions(
-    bytes: &[u8],
-    n_funcs: u32,
-    rename: impl Fn(u32, Option<&str>) -> Option<String>,
-) -> Option<Vec<u8>> {
-    let header = bytes.get(..8)?;
-    let mut current: std::collections::HashMap<u32, String> = Default::default();
-    let mut out = header.to_vec();
-    let mut other_subsections: Vec<u8> = Vec::new();
-    let mut p = 8;
-    while p < bytes.len() {
-        let id = bytes[p];
-        p += 1;
-        let len = leb_u32(bytes, &mut p)? as usize;
-        let body = bytes.get(p..p.checked_add(len)?)?;
-        let start = p;
-        p += len;
-        if id == 0 {
-            let mut q = 0;
-            let nlen = leb_u32(body, &mut q)? as usize;
-            if body.get(q..q + nlen)? == b"name" {
-                q += nlen;
-                while q < body.len() {
-                    let sub = body[q];
-                    let at = q;
-                    q += 1;
-                    let slen = leb_u32(body, &mut q)? as usize;
-                    let payload = body.get(q..q + slen)?;
-                    q += slen;
-                    if sub == 1 {
-                        let mut r = 0;
-                        for _ in 0..leb_u32(payload, &mut r)? {
-                            let f = leb_u32(payload, &mut r)?;
-                            let l = leb_u32(payload, &mut r)? as usize;
-                            let n = std::str::from_utf8(payload.get(r..r + l)?).ok()?;
-                            r += l;
-                            current.insert(f, n.to_string());
-                        }
-                    } else {
-                        other_subsections.extend_from_slice(&body[at..q]);
-                    }
-                }
-                continue;
-            }
-        }
-        out.push(id);
-        put_leb_u32(&mut out, len as u32);
-        out.extend_from_slice(&bytes[start..start + len]);
-    }
-    let mut entries: Vec<u8> = Vec::new();
-    let mut count = 0u32;
-    for f in 0..n_funcs {
-        if let Some(n) = rename(f, current.get(&f).map(String::as_str)) {
-            put_leb_u32(&mut entries, f);
-            put_name(&mut entries, &n);
-            count += 1;
-        }
-    }
-    let mut section: Vec<u8> = Vec::new();
-    put_name(&mut section, "name");
-    // Subsection order is module (0), functions (1), then the rest; a module-name
-    // subsection, when there is one, leads `other_subsections` and must stay first.
-    let (module_sub, rest) = if other_subsections.first() == Some(&0) {
-        let mut q = 1;
-        let l = leb_u32(&other_subsections, &mut q)? as usize;
-        other_subsections.split_at(q + l)
-    } else {
-        other_subsections.split_at(0)
-    };
-    section.extend_from_slice(module_sub);
-    if count > 0 {
-        let mut sub = Vec::new();
-        put_leb_u32(&mut sub, count);
-        sub.extend_from_slice(&entries);
-        section.push(1);
-        put_leb_u32(&mut section, sub.len() as u32);
-        section.extend_from_slice(&sub);
-    }
-    section.extend_from_slice(rest);
-    if section.len() > 5 {
-        out.push(0);
-        put_leb_u32(&mut out, section.len() as u32);
-        out.extend_from_slice(&section);
-    }
-    Some(out)
-}
-
 /// The compiler's restore (`optEscapeRestore`) of `stepped`, on the instance whose
 /// `optEscapeChoose` renamed the step's input.
 fn escape_restore_vl(
@@ -6320,40 +6228,21 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
-/// Which side runs the multi-value step (rung R5): `$VL_OPT_MULTIVALUE` unset or `vl` the
-/// compiler's `optMultivalue`, `rust` the host, `both` the two, failing the build when their
-/// output, body moves or `$VL_MV_EXPLAIN` lines differ.
-#[derive(Clone, Copy, PartialEq)]
-enum OptMultivalueSide {
-    Rust,
-    Vl,
-    Both,
-}
-
-fn opt_multivalue_side() -> Result<OptMultivalueSide> {
-    match std::env::var("VL_OPT_MULTIVALUE")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "rust" => Ok(OptMultivalueSide::Rust),
-        "" | "vl" => Ok(OptMultivalueSide::Vl),
-        "both" => Ok(OptMultivalueSide::Both),
-        other => bail!("$VL_OPT_MULTIVALUE={other} — expected `rust`, `vl` or `both`"),
-    }
-}
-
 /// The step's answer: the rewritten module and its body moves, or `None` when it changes
 /// nothing.
 type MultivalueOut = Option<(Vec<u8>, Vec<multivalue::BodyMove>)>;
 
-/// The compiler's multi-value step on `bytes`, beside its `$VL_MV_EXPLAIN` lines. The host
-/// validates both its input and its output, and a rewrite that does not validate is dropped.
+/// The compiler's multi-value step (`optMultivalue`, rung R5) on `bytes`, beside its
+/// `$VL_MV_EXPLAIN` lines and, when `scalar`, what it holds field by field
+/// (`optMultivalueScalarized`). The host validates both its input and its output, and a
+/// rewrite that does not validate is dropped.
 fn multivalue_vl(
     bytes: &[u8],
     explaining: bool,
+    scalar: bool,
     engine: &Engine,
     compiler: &CompilerSource,
-) -> Result<(MultivalueOut, String)> {
+) -> Result<(MultivalueOut, String, Option<multivalue::Scalarized>)> {
     let validate = |b: &[u8]| {
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(b)
@@ -6370,7 +6259,7 @@ fn multivalue_vl(
             .map_err(|e| {
                 e.context(
                     "`-O` runs the multi-value step through the compiler's `optMultivalue`, \
-                     which this seed predates (`$VL_OPT_MULTIVALUE=rust` runs the host's)",
+                     which this seed predates",
                 )
             })?;
         let changed = step.call(&mut store, (explaining as i32, valid as i32))? == 1;
@@ -6394,7 +6283,7 @@ fn multivalue_vl(
                 Error::msg("the compiler's optMultivalueExplain wrote bytes that are not UTF-8")
             })?;
     if !changed {
-        return Ok((None, log));
+        return Ok((None, log, None));
     }
     // `$VL_MV_FAULT=1` corrupts the output first, to prove a rewrite that does not validate is
     // dropped.
@@ -6409,7 +6298,7 @@ fn multivalue_vl(
                 "mv-explain: step abandoned: its output does not validate: {e}\n"
             ));
         }
-        return Ok((None, log));
+        return Ok((None, log, None));
     }
     let bad = || Error::msg("the compiler's optMultivalueMoves wrote a stream it cannot read");
     let mut p = 0usize;
@@ -6430,58 +6319,69 @@ fn multivalue_vl(
     if p != stream.len() {
         return Err(bad());
     }
-    Ok((Some((out, moved)), log))
+    let held = if scalar {
+        Some(multivalue_scalarized_read(&mut store, &inst)?)
+    } else {
+        None
+    };
+    Ok((Some((out, moved)), log, held))
 }
 
-/// The multi-value step on `bytes` by the side `$VL_OPT_MULTIVALUE` picks, printing its
-/// `$VL_MV_EXPLAIN` lines.
+/// The `optMultivalueScalarized` stream of the step just run on `inst`.
+fn multivalue_scalarized_read(
+    store: &mut Store<()>,
+    inst: &Instance,
+) -> Result<multivalue::Scalarized> {
+    let scalarized = inst
+        .get_typed_func::<(), i32>(&mut *store, "optMultivalueScalarized")
+        .map_err(|e| {
+            e.context(
+                "`-O` reads what the multi-value step holds field by field through the \
+                 compiler's `optMultivalueScalarized`, which this seed predates",
+            )
+        })?;
+    scalarized.call(&mut *store, ())?;
+    let s = BytesOut::probe(store, inst, "optOut")?.read(store)?;
+    let bad = || Error::msg("the compiler's optMultivalueScalarized wrote a stream it cannot read");
+    let mut p = 0usize;
+    let mut locals = Vec::new();
+    for _ in 0..leb_u32(&s, &mut p).ok_or_else(bad)? {
+        let mut ls = std::collections::HashSet::new();
+        for _ in 0..leb_u32(&s, &mut p).ok_or_else(bad)? {
+            ls.insert(leb_u32(&s, &mut p).ok_or_else(bad)?);
+        }
+        locals.push(ls);
+    }
+    let mut params = std::collections::HashSet::new();
+    for _ in 0..leb_u32(&s, &mut p).ok_or_else(bad)? {
+        let f = leb_u32(&s, &mut p).ok_or_else(bad)?;
+        let j = leb_u32(&s, &mut p).ok_or_else(bad)?;
+        params.insert((f, j));
+    }
+    if p != s.len() {
+        return Err(bad());
+    }
+    Ok((locals, params))
+}
+
+/// What the multi-value step would hold field by field in `bytes`, were it run on it, for the
+/// list-flattening step's cost rule; `None` when it would leave the module untouched.
+fn multivalue_scalarized(
+    bytes: &[u8],
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<Option<multivalue::Scalarized>> {
+    Ok(multivalue_vl(bytes, false, true, engine, compiler)?.2)
+}
+
+/// The multi-value step on `bytes`, printing its `$VL_MV_EXPLAIN` lines.
 fn multivalue_step(
     bytes: &[u8],
     engine: &Engine,
     compiler: &CompilerSource,
 ) -> Result<MultivalueOut> {
     let explaining = std::env::var_os("VL_MV_EXPLAIN").is_some_and(|v| !v.is_empty() && v != "0");
-    let side = opt_multivalue_side()?;
-    let rust =
-        (side != OptMultivalueSide::Vl).then(|| multivalue::multivalue_rust(bytes, explaining));
-    let vl = if side == OptMultivalueSide::Rust {
-        None
-    } else {
-        Some(multivalue_vl(bytes, explaining, engine, compiler)?)
-    };
-    let (out, log) = match (rust, vl) {
-        (Some(r), Some(v)) => {
-            let what = match (&r.0, &v.0) {
-                (None, None) => None,
-                (Some((rb, rm)), Some((vb, vm))) => {
-                    let same_moves = rm.len() == vm.len()
-                        && rm
-                            .iter()
-                            .zip(vm)
-                            .all(|(a, b)| a.from == b.from && a.to == b.to && a.pairs == b.pairs);
-                    if rb != vb {
-                        Some("module bytes")
-                    } else if !same_moves {
-                        Some("body moves")
-                    } else {
-                        None
-                    }
-                }
-                _ => Some("whether it rewrites"),
-            }
-            .or((r.1 != v.1).then_some("explain lines"));
-            if let Some(what) = what {
-                bail!(
-                    "$VL_OPT_MULTIVALUE=both: the multi-value step differs between the host and \
-                     the compiler in {what}"
-                );
-            }
-            r
-        }
-        (Some(r), None) => r,
-        (None, Some(v)) => v,
-        (None, None) => unreachable!("opt_multivalue_side picks at least one side"),
-    };
+    let (out, log, _) = multivalue_vl(bytes, explaining, false, engine, compiler)?;
     eprint!("{log}");
     Ok(out)
 }
@@ -10435,10 +10335,23 @@ fn build_cmd(args: &[String]) -> Result<()> {
             // side, so a stored producer's result is then only read field by field and the
             // multi-value step below gives it a twin.
             if std::env::var_os("VL_OPT_NO_INLINE").is_none_or(|v| v.is_empty()) {
-                if let Some(st) = phase!(
+                // The list-flattening step asks the compiler's multi-value step what it would
+                // hold field by field; a failure to ask fails the build after the step returns.
+                let asked: std::cell::RefCell<Option<Error>> = Default::default();
+                let scalarized = |b: &[u8]| {
+                    multivalue_scalarized(b, &compile_engine, &compiler).unwrap_or_else(|e| {
+                        asked.borrow_mut().get_or_insert(e);
+                        None
+                    })
+                };
+                let stepped = phase!(
                     "opt.inline_step",
-                    inline::inline_step(&bytes, stable_layout)
-                ) {
+                    inline::inline_step(&bytes, stable_layout, &scalarized)
+                );
+                if let Some(e) = asked.into_inner() {
+                    return Err(e);
+                }
+                if let Some(st) = stepped {
                     bytes = st.bytes;
                     std::fs::write(&sink, &bytes)?;
                     if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
