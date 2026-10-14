@@ -86,6 +86,7 @@ import {
   covarValueWriteState,
   eqCoreKindOfTyToken,
   externValueSeen,
+  fieldNameOrder,
   flattenVariantsInto,
   fsIntrinsicSlot,
   fsRetIsVoid,
@@ -147,6 +148,7 @@ import {
   nameIsMemBulkIntrinsic,
   nameIsMemStoreIntrinsic,
   nameIsNewtypeBrand,
+  narrowKeyRoot,
   nodeArrayElemIsBareStrLit,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
@@ -179,7 +181,6 @@ import {
   nodeTyIsNulStruct,
   nodeTyIsNullable,
   nodeTyIsNullableOneRep,
-  nodeTyIsNullableStruct,
   nodeTyIsObj,
   nodeTyIsPureLitUnion,
   nodeTyIsStruct,
@@ -863,7 +864,7 @@ import {
   sidOfNode,
   sidText,
 } from "./symbols"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { strContains } from "./strutil"
 import {
   tyEmitElemNulPrimOf,
@@ -2106,14 +2107,7 @@ function fieldClosureFeOfInit(initIx: i32, prop: string, fnIx: i32) {
 }
 
 // The position of `key` in `cloSigKeys`, or -1.
-export function cloSigPosOfKey(key: string) {
-  let i = 0
-  while i < cloSigKeys.length {
-    if cloSigKeys[i] == key { return i }
-    i = i + 1
-  }
-  -1
-}
+export function cloSigPosOfKey(key: string) { strListIndexOf(cloSigKeys, key) }
 
 // The one place a `$fnsig` pool position becomes a type index (D351), so the four sites
 // needing one cannot declare a closure with one functype and call it at another. Two
@@ -2480,13 +2474,13 @@ function globalIsNulListSid(fnIx: i32, sid: i32, atIx: i32) {
 
 // True if the parameter `name` of function `fnIx` is a nullable struct (`S | null`).
 function paramNulRef(fnIx: i32, name: string) {
-  retNulRefFlag(paramTypeNode(fnIx, name)) == 1
+  nodeRepIs(paramTypeNode(fnIx, name), "nulstruct")
 }
 
 // True if parameter `name` of `fnIx` is a nullable union variant (`Circle | null`, kind
 // `nulvariant`) — the variant twin of `paramNulRef`, disjoint from it by construction.
 function paramNulVariant(fnIx: i32, name: string) {
-  retNulVariantFlag(paramTypeNode(fnIx, name)) == 1
+  nodeRepIs(paramTypeNode(fnIx, name), "nulvariant")
 }
 
 // True if the parameter `name` of function `fnIx` is a nullable map (`{[string]: V} | null`,
@@ -2512,7 +2506,7 @@ export function letIsNulRef(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      if retNulRefFlag(d.letType) == 1 { return true }
+      if nodeRepIs(d.letType, "nulstruct") { return true }
       // A value-union annotation pins the cell to the box whatever the init produces — D1606's
       // rule one niche over. Without it a `S | null` init under a `string | S | null`
       // annotation declares a `(ref null $S)` cell the boxed store cannot fill.
@@ -2530,7 +2524,7 @@ export function letIsNulVariant(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 {
-      if retNulVariantFlag(d.letType) == 1 { return true }
+      if nodeRepIs(d.letType, "nulvariant") { return true }
       // The same annotation pin its struct twin takes: a `V | null` init under a
       // `string | V | null` annotation is boxed at the store, so classifying from the init
       // declares a `(ref null $uVarHeap[vi])` cell with no variant index to name (D1721).
@@ -3572,10 +3566,10 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // an empty list and an out-of-range get are both null.
     if structListPopGetElem(exprIx, fnIx) >= 0 { return true }
     // Fallback, scoped to a call: a nullable-struct-returning closure value call whose callee
-    // the cases above miss, such as an indexed closure-array element.
-    // `nodeTyIsNullableStruct` reads the checker's per-node type without rendering it, so
-    // `letIsNulRef` classifies such a binding nullable and its `!= null` narrow gets context.
-    return nodeTyIsNullableStruct(exprIx)
+    // the cases above miss, such as an indexed closure-array element. Either object niche
+    // counts, a union arm's included, so `letIsNulRef` classifies such a binding nullable
+    // and its `!= null` narrow gets context.
+    return nodeRepIs(exprIx, "nulstruct") || nodeRepIs(exprIx, "nulvariant")
   }
   if e is Ident {
     if (
@@ -7159,16 +7153,6 @@ function capWidened(widened: string, key: string): boolean {
     k = k.slice(0, k.length - 3)
   }
   widened.indexOf("," + k + ",") >= 0
-}
-
-// The binding a narrowing key reads through: `xs` of `xs[0]`, `o` of `o.v.w`, a name itself.
-function narrowKeyRoot(key: string): string {
-  let i = 0
-  while i < key.length {
-    if key[i] == '.' || key[i] == '[' { return key.slice(0, i) }
-    i = i + 1
-  }
-  key
 }
 
 // Bank the declaration-site narrowing of every frame declared inside frame `fe`'s body, by
@@ -11760,27 +11744,6 @@ export function structEmitOrder(): i32[] {
       done[r] = true
     }
     r = r + 1
-  }
-  ord
-}
-
-export function fieldNameOrder(names: string[]): i32[] {
-  const ord: i32[] = []
-  let i = 0
-  while i < names.length {
-    ord.push(i)
-    i = i + 1
-  }
-  let a = 1
-  while a < ord.length {
-    let b = a
-    while b > 0 && names[ord[b - 1]] > names[ord[b]] {
-      const t = ord[b - 1]
-      ord[b - 1] = ord[b]
-      ord[b] = t
-      b = b - 1
-    }
-    a = a + 1
   }
   ord
 }
@@ -24986,24 +24949,10 @@ export function resetRetMapFlight() {
 }
 
 // True when `fe`'s tail-`if` assignment target is already being joined further up the stack.
-function tailAssignInFlight(fe: i32) {
-  let i = 0
-  while i < tailAssignFlight.length {
-    if tailAssignFlight[i] == fe { return true }
-    i = i + 1
-  }
-  false
-}
+function tailAssignInFlight(fe: i32) { i32ListHas(tailAssignFlight, fe) }
 
 // True when `fe`'s inferred map-return shape is already being resolved further up the stack.
-function retMapInFlight(fe: i32) {
-  let i = 0
-  while i < retMapFlight.length {
-    if retMapFlight[i] == fe { return true }
-    i = i + 1
-  }
-  false
-}
+function retMapInFlight(fe: i32) { i32ListHas(retMapFlight, fe) }
 
 // The map shape the CHECKER recorded on the call node at `callIx`, or -1 — the re-entry
 // answer, and the same rung `mapShapeOfExpr` / `mapRetExprShape` fall through to when the
@@ -26617,12 +26566,7 @@ export function fieldTypeRefusalMsg(name: string): string {
 // for either: a generic alias mints no concrete struct, each application interns its own
 // substituted shape through `gaeEnsure`, and `checkArrName`'s own accept set guards a name collision.
 export function fnTyParamName(base: string) {
-  let i = 0
-  while i < genTyParamNames.length {
-    if genTyParamNames[i] == base { return true }
-    i = i + 1
-  }
-  false
+  strListHas(genTyParamNames, base)
 }
 
 // True when `base` is a declared type parameter of either kind: a FuncDecl's names
@@ -30384,14 +30328,7 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
 }
 
 // The registry slot of generic-alias base `name`, or -1.
-function gaeIndexOf(name: string) {
-  let i = 0
-  while i < gaeBases.length {
-    if gaeBases[i] == name { return i }
-    i = i + 1
-  }
-  -1
-}
+function gaeIndexOf(name: string) { strListIndexOf(gaeBases, name) }
 
 // True when a generic-application argument is a FuncDecl type parameter rather than a real
 // type — the application belongs to a generic original and denotes no concrete struct. The
@@ -36053,14 +35990,7 @@ export function uVariantsPush(name: string) {
 
 // A row whose recorded type is exactly `ty` — the index rung of the hybrid identity below,
 // with no kind test of its own so the caller's own arms decide when it may fire (D1490).
-function unRowHasTyIx(ty: i32): boolean {
-  let u = 0
-  while u < unTyIx.length {
-    if unTyIx[u] == ty { return true }
-    u = u + 1
-  }
-  false
-}
+function unRowHasTyIx(ty: i32): boolean { i32ListHas(unTyIx, ty) }
 
 // "Is this a registered union", answered without the spelling — the hybrid identity. A
 // declared union's identity is its declaration, matching by arena index; an inline union
@@ -37668,7 +37598,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     // against the frame it is written in, so reading one from outside can name a row other
     // than the local's, while an annotation reads the same anywhere (D1636).
     const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
-    if mli >= 0 && letHasAnnotation(mli) && !letIsVariant(mli, -1) {
+    if mli >= 0 && globalHasTypeAnn(mli) && !letIsVariant(mli, -1) {
       return structIndexOfLet(mli, -1)
     }
     -1
@@ -37816,15 +37746,6 @@ function sharedFieldTgtStructIdx(recvIx: i32, prop: string, fnIx: i32): i32 {
     i = i + 1
   }
   r0
-}
-
-// True if the `LetDecl` at `letIx` carries a type annotation — the frame-independent half of
-// a binding. Its initializer resolves against the frame it is written in; the annotation
-// reads the same from anywhere, which is what a cross-frame resolver may rely on.
-function letHasAnnotation(letIx: i32) {
-  const d = P.nodes[letIx]
-  if d is LetDecl { return d.letType >= 0 }
-  false
 }
 
 // The struct table index a struct-typed `LetDecl` binds: from its annotation if
@@ -48039,13 +47960,13 @@ export function exprString(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprString(e.parInner, fnIx) }
   // `x as T` yields exactly `T`, asked of that recorded type rather than the operand — the
   // point of the cast. A numeric cast lands here too and correctly answers false.
-  if e is AsExpr { return tyKindOf(nodeTyIxOf(exprIx)) == TK_STR }
+  if e is AsExpr { return nodeRepIs(exprIx, "str") }
   // An if-expression whose branch join is a string: the checker proved both arms agree, so
   // the join's type (or the then-arm) classifies the whole `if` as kind 3, matching the emit.
   if e is IfStmt {
     // The join's checked type is arm-order-independent: a `string`-typed join may lead with
     // an atom arm, which widens at `emitRefIfArm` — so the value is still a string.
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR { return true }
+    if nodeRepIs(exprIx, "str") { return true }
     // Inside an instance a join over its type parameters is read at the pin (D3528).
     const sjt = nodeTyIxOf(exprIx)
     if sjt >= 0 && tyHasTyVar(sjt) {
@@ -48110,7 +48031,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
     }
     // A closure-value call whose sig the per-name resolvers can't key: resolve it the same way
     // the emitter does, gated on the checker's plain-`string` result to exclude litunion aliases.
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR {
+    if nodeRepIs(exprIx, "str") {
       if sigKeyRetKind(cloCallSigKey(exprIx, fnIx)) == "str" { return true }
     }
     return false

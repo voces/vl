@@ -52,6 +52,7 @@ import {
   uFieldElemKeyKind,
   uFieldElemName,
   uFieldElemTyIx,
+  uVarTyIx,
   uVariants,
   unMemAtomIds,
   unMemAtoms,
@@ -2594,10 +2595,7 @@ function repOfNullable(inner: i32): RepDesc {
       return repMk("nulclosure", 1, "")
     }
     TyObj => {
-      // `S | null` over a standalone struct — the nullable struct ref. A VARIANT
-      // member's nullable stays with the name ladder (its slot vocabulary is the
-      // variant index, and the ladder's nulstruct arm resolves it by name).
-      if !tyIxIsVariantMember(inner) { return repMk("nulstruct", 1, "") }
+      return repMk(repNulObjKind(inner), 1, "")
     }
     TyUnion => {
       // `K | null` over a litunion — the i32 atom with the -1 null sentinel.
@@ -2625,6 +2623,20 @@ function repOfNullable(inner: i32): RepDesc {
     }
   }
   repUncovered()
+}
+
+// The niche of `S | null` for object type `S`: `nulvariant`, the `(ref null $uVarHeap[vi])`
+// niche, when `S` is a union arm the variant table registered and no declared struct row
+// claims it (`std:fs`'s `IoError` has both); else `nulstruct`. Shared by the flat and tree sides.
+function repNulObjKind(objTy: i32): VKind {
+  if !tyIxIsVariantMember(objTy) { return "nulstruct" }
+  if repSlotOfTyDecl(objTy) >= 0 { return "nulstruct" }
+  let i = 0
+  while i < uVarTyIx.length {
+    if uVarTyIx[i] == objTy { return "nulvariant" }
+    i = i + 1
+  }
+  "nulstruct"
 }
 
 // `T | null` over a primitive `T`, by name.
@@ -2660,10 +2672,17 @@ function repOfNullableArray(elem: i32): RepDesc {
     // D979 — the PACKED byte list joins the nullable-scalar-list family.
     if et.primName == "u8" { return repMk("nulu8list", 1, "u8list") }
   }
-  // A litunion `K[] | null` — atoms are interned i32 ids, sharing the i32-list backing.
-  if tyIsLitUnion(elem) { return repMk("nullist", 1, "i32") }
+  // A litunion `K[] | null` — atoms are interned i32 ids, sharing the i32-list backing. A
+  // nullable-litunion element `(K | null)[] | null` rides its null in the same i32 sentinel.
+  if tyIsLitUnion(elem) || tyIsNullableLitUnion(elem) {
+    return repMk("nullist", 1, "i32")
+  }
   if et is TyNullable {
     const eit = T.tys[et.nInner]
+    // `(boolean | null)[] | null` — the sentinel-2 boolean element on the i32-list backing.
+    if eit is TyPrim {
+      if eit.primName == "boolean" { return repMk("nullist", 1, "i32") }
+    }
     // `(string | null)[] | null` — the `$mkListIdx` backing already holds a nullable
     // string element, so the cell is the same `nulstrlist` niche as `string[] | null`.
     if eit is TyPrim {
@@ -3566,9 +3585,9 @@ function rtNulVKind(ix: i32): VKind | null {
   if k == "str" { return "nulstr" }
   if k == "closure" { return "nulclosure" }
   if k == "struct" {
-    // A nullable VARIANT member's slot vocabulary is the variant index — the
-    // flat alphabet has no kind for it (the name ladder owns it).
-    if rtDisc[inner] == 1 { return null }
+    // A union arm's niche is decided per arena type; the node's builder decides it, as it
+    // already decides `rtSlot`.
+    if rtDisc[inner] == 1 { return repNulObjKind(rtTy[inner]) }
     return "nulstruct"
   }
   if k == "map" { return "nulmap" }

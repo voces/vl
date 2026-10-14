@@ -32,7 +32,7 @@ import {
   nodeChildren,
 } from "./ast"
 import { callBindShadowCount, fnFlowSigFails } from "./call_bind_shadow"
-import { monoIsGenericDecl, unwrapParen } from "./emit_base"
+import { monoIsGenericDecl, normTypeAtom, unwrapParen } from "./emit_base"
 import { declTyIxOfName, repNameCanonId } from "./emit_rep"
 import {
   fnParent,
@@ -65,6 +65,7 @@ import {
   substTyDeep,
   tyHasTyVar,
   tyToEmitName,
+  tyToStr,
 } from "./typecheck"
 
 // 0 off, 1 armed, 2 armed with names in each row, 3 armed and keyed by call path instead of by
@@ -98,6 +99,12 @@ let ufRes: i32[][] = []
 let ufTop: string[] = []
 let ufKidK: string[][] = []
 let ufKidS: i32[][] = []
+// The directed half, per slot rather than per class: the slots a slot's value flows into, and
+// the pins taken at the slot itself. A merge with no direction (two derived slots) flows both
+// ways. Per pre-mono declaration, its slot in each context that walks it.
+let dfTo: i32[][] = []
+let dfPin: i32[][] = []
+let ffDeclSlots: {[i32]: i32[]} = Map()
 
 // A pin is the parameter types a class is called or annotated at, in the context that read
 // them; `pinName` renders them once the compile is over.
@@ -162,6 +169,9 @@ export function fnFlowShadowBegin() {
   ufTop = []
   ufKidK = []
   ufKidS = []
+  dfTo = []
+  dfPin = []
+  ffDeclSlots = Map()
   pinTys = []
   pinName = []
   ctxKeyIx = Map()
@@ -204,6 +214,10 @@ function ffNew(): i32 {
   ufKidK.push(kk)
   const ks: i32[] = []
   ufKidS.push(ks)
+  const to: i32[] = []
+  dfTo.push(to)
+  const dp: i32[] = []
+  dfPin.push(dp)
   id
 }
 
@@ -273,8 +287,40 @@ function ffI32Merge(into: i32[], from: i32[]) {
   0
 }
 
-// Merge the classes of `a` and `b` (either may be -1, for no flow) and return a member.
+// Merge the classes of `a` and `b` (either may be -1, for no flow) and return a member; the
+// value flows both ways.
 function ffUnion(a: i32, b: i32): i32 {
+  ffEdge(a, b)
+  ffEdge(b, a)
+  ffMerge(a, b)
+}
+
+// `ffUnion` for a value that flows from `src` into `dst` only.
+function ffInto(dst: i32, src: i32): i32 {
+  ffEdge(src, dst)
+  ffMerge(dst, src)
+}
+
+// The value of either `a` or `b`, as a fresh slot both flow into, in their merged class.
+function ffJoin2(a: i32, b: i32): i32 {
+  if a < 0 || b < 0 { return ffMerge(a, b) }
+  const r = ffFind(ffMerge(a, b))
+  if r < 0 { return -1 }
+  const j = ffNew()
+  if j >= ufPar.length { return -1 }
+  ufPar[j] = r
+  ffEdge(a, j)
+  ffEdge(b, j)
+  j
+}
+
+function ffEdge(from: i32, to: i32) {
+  if from < 0 || to < 0 || from == to || from >= dfTo.length { return 0 }
+  dfTo[from].push(to)
+  0
+}
+
+function ffMerge(a: i32, b: i32): i32 {
   if a < 0 { return b }
   if b < 0 { return a }
   const ra = ffFind(a)
@@ -383,6 +429,7 @@ function ffAddPin(s: i32, tys: i32[]) {
   const id = pinTys.length
   pinTys.push(tys)
   ufPin[r].push(id)
+  dfPin[s].push(id)
   0
 }
 
@@ -538,13 +585,13 @@ function ffWalkFn(fn: i32) {
         } else {
           ffRecord(pi, 3, s, "parameter", fn, ffCtx)
         }
-        if p.parDefault >= 0 { ffUnion(s, ffFlow(p.parDefault, "default")) }
+        if p.parDefault >= 0 { ffInto(s, ffFlow(p.parDefault, "default")) }
       }
     }
     if fd.fnRet >= 0 {
       ffPinTy(ffSlot(ffRetKey(fn, ffCtx)), ffSubst(ffAnnTy(fd.fnRet)), 0)
     }
-    ffUnion(ffSlot(ffRetKey(fn, ffCtx)), ffFlow(fd.fnBody, "return"))
+    ffInto(ffSlot(ffRetKey(fn, ffCtx)), ffFlow(fd.fnBody, "return"))
   }
   0
 }
@@ -565,16 +612,21 @@ function ffStmt(ix: i32) {
     ffDeclFnOf[o] = ffFn
     const s = ffSlot(ffDeclKey(ix, ffCtx))
     ffAddDecl(s, ix)
+    const ds = ffDeclSlots[o] ?? []
+    if !i32ListHas(ds, s) {
+      ds.push(s)
+      ffDeclSlots[o] = ds
+    }
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
     if n.letInit >= 0 {
       ffDeclFrom[ix] = ffInitBinding(n.letInit)
-      ffUnion(s, ffFlow(n.letInit, "binding"))
+      ffInto(s, ffFlow(n.letInit, "binding"))
     }
     return 0
   }
   if n is RetStmt {
     if n.retArg >= 0 {
-      ffUnion(ffSlot(ffRetKey(ffFn, ffCtx)), ffFlow(n.retArg, "return"))
+      ffInto(ffSlot(ffRetKey(ffFn, ffCtx)), ffFlow(n.retArg, "return"))
     }
     return 0
   }
@@ -592,7 +644,7 @@ function ffStmt(ix: i32) {
     declCtx[ix] = ffCtx
     const s = ffSlot(ffDeclKey(ix, ffCtx))
     ffAddDecl(s, ix)
-    ffUnion(s, ffKid(ffFlow(n.fiIter, "loop"), "e"))
+    ffInto(s, ffKid(ffFlow(n.fiIter, "loop"), "e"))
     return ffStmt(n.fiBody)
   }
   if n is Block {
@@ -737,9 +789,9 @@ function ffFlow(ix: i32, pos: string): i32 {
     for el in n.arrElems {
       const en = P.nodes[el]
       if en is Spread {
-        ffUnion(e, ffKid(ffFlow(en.spdArg, "spread"), "e"))
+        ffInto(e, ffKid(ffFlow(en.spdArg, "spread"), "e"))
       } else {
-        ffUnion(e, ffFlow(el, "list element"))
+        ffInto(e, ffFlow(el, "list element"))
       }
     }
     return s
@@ -749,9 +801,9 @@ function ffFlow(ix: i32, pos: string): i32 {
     for fi in n.objFields {
       const f = P.nodes[fi]
       if f is FieldInit {
-        ffUnion(ffKid(s, "f." + f.fiName), ffFlow(f.fiValue, "field"))
+        ffInto(ffKid(s, "f." + f.fiName), ffFlow(f.fiValue, "field"))
       } else if f is Spread {
-        ffUnion(s, ffFlow(f.spdArg, "spread"))
+        ffInto(s, ffFlow(f.spdArg, "spread"))
       }
     }
     return s
@@ -773,21 +825,21 @@ function ffFlow(ix: i32, pos: string): i32 {
       ffNoteWrite(ix, n.binLeft)
       const pl = ffPlace(n.binLeft)
       ffMarkWritten(pl)
-      return ffUnion(pl, ffFlow(n.binRight, "write"))
+      return ffInto(pl, ffFlow(n.binRight, "write"))
     }
     if n.binOp == "??" {
-      return ffUnion(ffFlow(n.binLeft, pos), ffFlow(n.binRight, pos))
+      return ffJoin2(ffFlow(n.binLeft, pos), ffFlow(n.binRight, pos))
     }
     return ffKids(ix)
   }
   if n is IfStmt {
     ffFlow(n.ifCond, "condition")
-    return ffUnion(ffBlock(n.ifThen, pos), ffBlock(n.ifElse, pos))
+    return ffJoin2(ffBlock(n.ifThen, pos), ffBlock(n.ifElse, pos))
   }
   if n is MatchExpr {
     ffFlow(n.matchScrut, "operand")
     let s = -1
-    for b in n.matchBodies { s = ffUnion(s, ffBlock(b, pos)) }
+    for b in n.matchBodies { s = ffJoin2(s, ffBlock(b, pos)) }
     return s
   }
   if n is LetDecl { return ffStmt(ix) - 1 }
@@ -892,7 +944,7 @@ function ffSlotCall(ix: i32, s: i32): i32 {
       }
       if t < 0 { t = nodeTyIxOf(a) }
       tys.push(ffSubst(t))
-      ffUnion(ffKid(s, "p" + i32ToStr(i)), ffFlow(a, "argument"))
+      ffInto(ffKid(s, "p" + i32ToStr(i)), ffFlow(a, "argument"))
       i = i + 1
     }
     if s >= 0 { ffAddPin(s, tys) }
@@ -1028,7 +1080,7 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
         const a = n.callArgs[i]
         const f = ffFlow(a, "argument")
         if i < fd.fnParams.length {
-          ffUnion(ffSlot(ffDeclKey(fd.fnParams[i], ctx)), f)
+          ffInto(ffSlot(ffDeclKey(fd.fnParams[i], ctx)), f)
         }
         i = i + 1
       }
@@ -1188,6 +1240,54 @@ export function fnFlowDeclWritten(at: i32): boolean {
 // The function declaring the binding declaration `d` stands for, -1 at module scope, and -2
 // when the walk saw no such declaration.
 export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
+
+// The one parameter list (`p1,p2,`) the calls and annotated destinations the `let` declared at
+// `d` flows into pin it at; "" when none does, `FF_PIN_MANY` when two disagree, and
+// `FF_PIN_DECLINE` without a table or when the binding is walked in more than one context.
+export function fnFlowLetPinSig(d: i32): string {
+  if !ffBuilt || d < 0 { return FF_PIN_DECLINE }
+  const slots = ffDeclSlots[ffOrigDecl(d)] ?? []
+  if slots.length != 1 { return FF_PIN_DECLINE }
+  ffPinSigOf(ffDirectedPins(slots[0]))
+}
+
+export const FF_PIN_MANY = "*"
+export const FF_PIN_DECLINE = "?"
+
+// The pins taken at every slot `s`'s value reaches along the directed edges, `s` included.
+function ffDirectedPins(s: i32): i32[] {
+  const out: i32[] = []
+  const seen: {[i32]: boolean} = Map()
+  const work: i32[] = [s]
+  seen[s] = true
+  let i = 0
+  while i < work.length {
+    const x = work[i]
+    for id in dfPin[x] { out.push(id) }
+    for y in dfTo[x] {
+      if !(seen[y] ?? false) {
+        seen[y] = true
+        work.push(y)
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The one closed pin among `ids` as `p1,p2,`; "" for none and `FF_PIN_MANY` for two that differ.
+function ffPinSigOf(ids: i32[]): string {
+  let pick = ""
+  for id in ids {
+    if !ffPinOpen(id) {
+      let sig = ""
+      for t in pinTys[id] { sig = sig + normTypeAtom(tyToStr(t)) + "," }
+      if pick == "" { pick = sig }
+      else if sig != pick { return FF_PIN_MANY }
+    }
+  }
+  pick
+}
 
 // The longest alias chain the lambda answers below follow; `FF_CHAIN_LONG` reports one longer.
 const FF_CHAIN_MAX = 64
