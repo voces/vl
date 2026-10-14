@@ -87,7 +87,7 @@ Deno.test({
         throw new Error(
           `grade ${JSON.stringify(g)} is outside the vocabulary ` +
             `${JSON.stringify(s.grade_vocabulary)} — sample.py and ` +
-            `capability-probes/run.py have drifted`,
+            `scripts/capability-probes.vl have drifted`,
         );
       }
     }

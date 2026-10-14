@@ -256,10 +256,10 @@ run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_t
 # critical path is `distilled corpus` at ~155 s, so there is no reason to leave them ungated.
 run "survey measurements"      bash scripts/survey-profile.sh
 # THE PROBES' BEHAVIOURAL HALF. `tests/vl_live_sites_test.ts` checks the list's STRUCTURE
-# and says the compiling half is `run.py --live-sites`, which no gate ran: on 2026-09-24 four
+# and says the compiling half is `capability-probes.vl --live-sites`, which no gate ran: on 2026-09-24 four
 # of its rows had moved (one a compiler trap, one invalid wasm) and nothing was red (D2301).
 # `--floor` holds every probe to clause 1; a refusal passes, a trap or bad module does not.
-# Both run on `scripts/capability-probes.vl`, the VL port of `run.py`.
+# Both run on `scripts/capability-probes.vl`.
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""

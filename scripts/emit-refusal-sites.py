@@ -23,7 +23,7 @@ import argparse, collections, json, os, random, re, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "compiler")
 
-# `goal-scoreboard.py`'s predicate, verbatim: a refusal whose SENTENCE concedes the program
+# `goal-scoreboard.vl`'s predicate, verbatim: a refusal whose SENTENCE concedes the program
 # was type-valid. Kept in step by hand rather than imported, because this script's whole job
 # is to report what that predicate does NOT match — a shared import would make the two agree
 # by construction and there would be nothing to measure.

@@ -143,7 +143,7 @@ def main():
     open(rowpath, "w", encoding="utf-8").write(body)
     print("wrote " + rowpath)
     if a.probe_name:
-        # A capability probe is ONE file — `run.py` hands `vl` a single path. A
+        # A capability probe is ONE file — `capability-probes.vl` hands `vl` a single path. A
         # multi-module witness belongs in `tests/cases/modules/<name>/` instead, so say
         # so rather than writing a `// file:`-marked probe nothing can run.
         if len(MOD.split_files(wit)) > 1:

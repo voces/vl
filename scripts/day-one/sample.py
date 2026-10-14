@@ -12,34 +12,35 @@ is legal, so a hit arrives with its own control attached and needs no judgement 
 what the design permits. Both-fail is NOT a hit — it is a missing feature or a design
 question, and it is listed separately for a human.
 
-Grading is `scripts/capability-probes/run.py`'s, imported and not copied, so a day-one
-cell and a hand-written probe are read on one scale.
+Grading is `scripts/capability-probes.vl`'s (`--grade-channel`), called and not copied, so
+a day-one cell and a hand-written probe are read on one scale.
 
 DISCOVERY INSTRUMENT, NOT A GATE, at any size that is worth running for discovery.
 `--replay` is the gate half: it re-grades a saved sample and exits non-zero only on
 `RUNS -> not-RUNS`, which is the repo's bar. See docs/internals/day-one-sampler.md.
 """
 import argparse
+import atexit
 import collections
 import json
 import os
 import random
 import subprocess
 import sys
+import shutil
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(ROOT, "scripts", "capability-probes"))
 
 import grammar as G  # noqa: E402
 import imports as I  # noqa: E402
 import modules as M  # noqa: E402
 import render as R  # noqa: E402
-import run as probes  # noqa: E402
 
 VL = os.path.join(ROOT, "scripts", "vl-host", "target", "release", "vl")
 SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
@@ -51,6 +52,46 @@ def env():
     e = dict(os.environ)
     e["VL_STD"] = os.path.join(ROOT, "std")
     return e
+
+
+_GRADER = []
+_GRADER_LOCK = threading.Lock()
+
+
+def grader():
+    """`scripts/capability-probes.vl` built ONCE per process, deleted at exit."""
+    with _GRADER_LOCK:
+        if not _GRADER:
+            d = tempfile.mkdtemp(prefix="vl-day-one-grader-")
+            atexit.register(shutil.rmtree, d, True)
+            out = os.path.join(d, "grader.wasm")
+            b = subprocess.run([VL, "build", os.path.join(ROOT, "scripts", "capability-probes.vl"),
+                                "--compiler", SEED, "-o", out],
+                               capture_output=True, text=True, env=env())
+            if b.returncode != 0:
+                raise SystemExit("cannot build the grader:\n" + b.stdout + b.stderr)
+            _GRADER.append(out)
+        return _GRADER[0]
+
+
+def probe_grade(path, compiler, timeout):
+    """(verdict, detail, stdout) of one program, graded on its CHANNEL only."""
+    job = path + ".job"
+    with open(job, "w", encoding="utf-8") as fh:
+        fh.write("\n".join([VL, compiler, os.path.join(ROOT, "std"), path, str(timeout)]))
+    r = subprocess.run([VL, "run", grader(), "--", "--grade-channel", job],
+                       capture_output=True, text=True, env=env())
+    if r.returncode != 0:
+        raise SystemExit("the grader failed on %s:\n%s%s" % (path, r.stdout, r.stderr))
+    with open(job + ".out", "rb") as fh:
+        raw = fh.read()
+    fields, at = [], 0
+    while len(fields) < 4:
+        nl = raw.index(b"\n", at)
+        n = int(raw[at:nl])
+        fields.append(raw[nl + 1:nl + 1 + n].decode("utf-8", "replace"))
+        at = nl + 1 + n
+    return fields[0], fields[1], fields[2]
 
 
 def write_program(src, tmpdir, name):
@@ -77,18 +118,17 @@ def write_program(src, tmpdir, name):
 
 
 def grade_src(src, want, compiler, tmpdir, name):
-    """One program's verdict, in run.py's vocabulary plus a program TRAP.
+    """One program's verdict, in capability-probes.vl's vocabulary plus a program TRAP.
 
-    run.py cannot separate a compiler trap from the PROGRAM trapping, because both
+    capability-probes.vl cannot separate a compiler trap from the PROGRAM trapping, because both
     reach the host as a wasm backtrace out of one `vl run`. One extra `vl build` on
     that path settles it: a module that was written means the trap was the program's.
     """
     path = write_program(src, tmpdir, name)
-    # `want=None` so run.py grades the CHANNEL only; the output contract is checked
-    # here and it is EXACT. run.py's is a substring test, which a generated `want` of
+    # `want=None` so the grader grades the CHANNEL only; the output contract is checked
+    # here and it is EXACT. capability-probes.vl's is a substring test, which a generated `want` of
     # "2" would pass against a printed "2.5" — a RUNS-WRONG read as a RUNS.
-    verdict, detail, out = probes.grade(path, compiler, None,
-                                        vl=VL, env=env(), timeout=60)
+    verdict, detail, out = probe_grade(path, compiler, 60)
     if verdict == "RUNS" and [l.strip() for l in out.splitlines()] != want:
         verdict, detail = "RUNS-WRONG", "want %r, got %r" % (want, out)
     if verdict.startswith("COMPILER TRAP"):
@@ -105,9 +145,9 @@ def grade_src(src, want, compiler, tmpdir, name):
 VERDICTS = ["DISAGREE", "RUNS-WRONG", "AGREE-RUNS", "BOTH-FAIL-SAME",
             "BOTH-FAIL-DIFFER"]
 
-# run.py's vocabulary plus the two this script adds: RUNS-WRONG (its output contract is
-# EXACT, run.py's is a substring) and TRAP (program), which one extra `vl build` separates
-# from run.py's COMPILER TRAP. A grade outside this list means the two have drifted.
+# capability-probes.vl's vocabulary plus the two this script adds: RUNS-WRONG (its output contract is
+# EXACT, capability-probes.vl's is a substring) and TRAP (program), which one extra `vl build` separates
+# from capability-probes.vl's COMPILER TRAP. A grade outside this list means the two have drifted.
 GRADES = ["RUNS", "RUNS-WRONG", "check refuses", "emit refuses", "SILENT (check rc 0)",
           "COMPILER TRAP (check rc 0)", "TRAP (program)", "TIMEOUT"]
 
@@ -359,7 +399,7 @@ def imports_report(paths, compiler, jobs, reps=3, factor=3.0):
 # the emitter — so no emit refusal is a design rule and none can be permanent. The
 # TRAP control covers what an emit control would have given (a non-check channel,
 # deterministic and permanent) and additionally exercises the one piece of grading
-# this script adds to run.py's: the `vl build` that tells a PROGRAM trap from a
+# this script adds to capability-probes.vl's: the `vl build` that tells a PROGRAM trap from a
 # COMPILER trap.
 # ---------------------------------------------------------------------------
 
@@ -502,7 +542,7 @@ def _controls():
          "DISAGREE", ("RUNS", "TRAP (program)")),
 
         # SYNTHETIC, output contract. The `b` face runs and prints `12` against a `want`
-        # of `2`. run.py's contract is a SUBSTRING test and would pass that; this one is
+        # of `2`. capability-probes.vl's contract is a SUBSTRING test and would pass that; this one is
         # exact, and this control is what says so.
         ("synthetic/wrong", "rc 0 with the wrong value is a hit, not a pass",
          {"a": {"src": "print(2)\n", "want": ["2"], "face": "right"},
