@@ -7,15 +7,16 @@
 // quick-fix applies unchanged" — so the fix is the filter, and this file is what says the
 // filter is the whole of it.
 //
-// `server.ts` cannot be imported under Deno (it opens an LSP connection at module load), so
-// the two filters are exercised against the same lint stream the handler reads, through the
-// same helper it calls. The playground adapter has NO organize-imports path at all
+// The two filters are exercised against the same lint stream the handler reads, through the
+// same helper it calls, and the handler's own `codeActionsAt` (`lsp/src/features.ts`) is
+// run on the duplicate at the end. The playground adapter has NO organize-imports path at all
 // (`organizeImports`: server 1 use, adapter 0) — that gap is a `subBehaviours` row in
 // `playground_lsp_parity_test.ts`, not something this file can grade.
 
 import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { organizeImportEdits } from "../lsp/src/typeFeatures.ts";
+import { codeActionsAt } from "../lsp/src/features.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
@@ -28,7 +29,7 @@ const seedExists = (() => {
 })();
 const ignore = !seedExists;
 
-// The filter `server.ts` applies, named once so the test and the handler cannot drift.
+// The filter `codeActionsAt` applies, named once so the test and the handler cannot drift.
 const REDUNDANT = ["unused-import", "duplicate-import"];
 
 const organize = (src: string, codes: string[]) => {
@@ -199,17 +200,17 @@ Deno.test({ name: "organize imports: a clean file yields no edits", ignore }, ()
   if (edits.length !== 0) throw new Error(`want no edits, got ${JSON.stringify(edits)}`);
 });
 
-// The filter the handler applies is the one this file tests. `server.ts` cannot be imported
-// here, so the coupling is checked by reading its source — the same technique
-// `playground_lsp_parity_test.ts` uses.
-Deno.test("organize imports: server.ts filters on both redundant codes", () => {
-  const src = Deno.readTextFileSync(new URL("../lsp/src/server.ts", import.meta.url));
-  for (const code of REDUNDANT) {
-    if (!src.includes(`d.code === "${code}"`)) {
-      throw new Error(
-        `server.ts's organize-imports filter no longer names "${code}" — the handler and ` +
-          `this file's REDUNDANT list have drifted.`,
-      );
-    }
+// The filter the handler applies is the one this file tests: `codeActionsAt` is what the
+// LSP's `onCodeAction` calls, and its organize action must drop the duplicate specifier.
+Deno.test({ name: "organize imports: codeActionsAt drops a duplicate specifier", ignore }, () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const uri = "file:///t.vl";
+  const at = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
+  const only = ["source.organizeImports"];
+  const actions = codeActionsAt(DUP, uri, at, [], () => [], only, checker, undefined);
+  const want = JSON.stringify([organize(DUP, REDUNDANT)]);
+  const got = JSON.stringify(actions.map((a) => a.edit.changes[uri]));
+  if (want === "[[]]" || got !== want) {
+    throw new Error(`want one organize action with edits ${want}, got ${got}`);
   }
 });
