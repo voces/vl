@@ -100,9 +100,9 @@ jobs:
   # The NATIVE self-hosting path (scripts/vl-host + the self-host compiler wasm), end to
   # end with zero TS/deno in the compile+run loop past the seed, as a job GRAPH:
   #
-  #   seed ──┬── ci-native (4 shards) the auto-discovered native suites, split by weight
+  #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
-  #          ├── ci-release-shape     the binaryen-backed suites
+  #          ├── ci-release-shape (3) the binaryen-backed suites, split by weight
   #          └── ci-cost              fuel/RSS cost ratchets — master pushes and nightly only
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
@@ -214,7 +214,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
 
@@ -247,12 +247,20 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
+      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
+      # runner of another CPU model and every test worker would JIT the seed at once. Warm
+      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh
+
       # `--parallel` fans the test FILES across the cores (one worker process each); every
       # case spawns its own `vl` subprocess, so cases are isolated regardless of schedule.
       - name: Native binary suites (corpus alignment, build -O, vl CLI)
         run: |
-          files=$(bash scripts/ci-shard.sh ${{ matrix.shard }} 4)
-          [ -n "$files" ] || { echo "shard ${{ matrix.shard }} of 4 is empty" >&2; exit 1; }
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
+          [ -n "$files" ] || { echo "native shard ${{ matrix.shard }} of 5 is empty" >&2; exit 1; }
           # shellcheck disable=SC2086  # one argument per file
           deno test -A --no-check --parallel $files
         env:
@@ -297,6 +305,14 @@ jobs:
             build/vl-compiler.wasm.*.cwasm
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
+
+      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
+      # runner of another CPU model and every test worker would JIT the seed at once. Warm
+      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh
 
       # Dogfood: `vl` lints + fmt-checks its own source (`compiler/*.vl` + driver + `std/`),
       # gated at `info`, and holds the comment, kind-ladder and sentinel-index ratchets over
@@ -431,12 +447,16 @@ jobs:
   # extern link), which need `npm ci` (binaryen) and `wasm-tools`. Every gate in these files
   # is positive (seed, binary, binaryen), so the files that also match the native globs run
   # HERE only: this job is a strict superset of what the native shards would run of them.
-  # The explicit list is what tests/ci_seed_coverage_test.ts and scripts/ci-shard.sh read.
+  # The SUITES list is what tests/ci_seed_coverage_test.ts and scripts/ci-shard.sh read.
   # ---------------------------------------------------------------------------
   ci-release-shape:
     needs: seed
     if: needs.seed.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
 
@@ -505,26 +525,39 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
+      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
+      # runner of another CPU model and every test worker would JIT the seed at once. Warm
+      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh
+
       - name: Release-profile suites (-O3 / wasm-opt / wasm-dis / wasm-tools shape)
-        run: >-
-          deno test -A --no-check --parallel
-          tests/selfhost_native_opt_test.ts
-          tests/selfhost_native_release_test.ts
-          tests/selfhost_native_release_loops_test.ts
-          tests/selfhost_native_release_melt_test.ts
-          tests/selfhost_native_release_shape_test.ts
-          tests/selfhost_native_release_leaf_test.ts
-          tests/selfhost_native_release_runonce_test.ts
-          tests/selfhost_native_release_escape_test.ts
-          tests/vl_buffer_view_bounds_contract_test.ts
-          tests/vl_buffer_view_bounds_shape_test.ts
-          tests/vl_extern_link_test.ts
-          tests/vl_extern_global_test.ts
-          tests/vl_deep_else_chain_test.ts
-          tests/vl_getter_body_shape_test.ts
-          tests/vl_closure_lift_shape_test.ts
+        run: |
+          files=$(bash scripts/ci-shard.sh release ${{ matrix.shard }} 3)
+          [ -n "$files" ] || { echo "release shard ${{ matrix.shard }} of 3 is empty" >&2; exit 1; }
+          # shellcheck disable=SC2086  # one argument per file
+          deno test -A --no-check --parallel $files
         env:
           SELFHOST_NATIVE_ALIGN: "1"
+          # The release set: scripts/ci-shard.sh reads this list, and the native shards skip it.
+          SUITES: >-
+            tests/selfhost_native_opt_test.ts
+            tests/selfhost_native_release_test.ts
+            tests/selfhost_native_release_loops_test.ts
+            tests/selfhost_native_release_melt_test.ts
+            tests/selfhost_native_release_shape_test.ts
+            tests/selfhost_native_release_leaf_test.ts
+            tests/selfhost_native_release_runonce_test.ts
+            tests/selfhost_native_release_escape_test.ts
+            tests/vl_buffer_view_bounds_contract_test.ts
+            tests/vl_buffer_view_bounds_shape_test.ts
+            tests/vl_extern_link_test.ts
+            tests/vl_extern_global_test.ts
+            tests/vl_deep_else_chain_test.ts
+            tests/vl_getter_body_shape_test.ts
+            tests/vl_closure_lift_shape_test.ts
 
   # ---------------------------------------------------------------------------
   # ci-cost — the generated-code and compile-shape COST ratchets, on master pushes and
@@ -568,6 +601,14 @@ jobs:
             build/vl-compiler.wasm.*.cwasm
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
+
+      # A sidecar's name carries the host CPU's features, so a cached `.cwasm` misses on a
+      # runner of another CPU model and every test worker would JIT the seed at once. Warm
+      # them before any test starts: near-instant on a matching CPU, one JIT per tag otherwise.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh --fuel
 
       # Guest fuel and peak RSS of one `-O` build of each of two plumb-shaped units. No
       # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's

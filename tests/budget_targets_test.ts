@@ -32,7 +32,9 @@ Deno.test("budget targets: compiler/entry.vl's import closure is every compiler/
   const all = [...Deno.readDirSync(`${ROOT}/compiler`)]
     .filter((e) => e.isFile && e.name.endsWith(".vl"))
     .map((e) => e.name);
-  if (all.length < 10) throw new Error(`found only ${all.length} compiler/*.vl files`);
+  if (all.length < 10) {
+    throw new Error(`found only ${all.length} compiler/*.vl files`);
+  }
   const reached = closure("entry.vl");
   const outside = all.filter((f) => !reached.has(f)).sort();
   if (outside.length > 0) {
@@ -46,7 +48,9 @@ Deno.test("budget targets: compiler/entry.vl's import closure is every compiler/
 
 Deno.test("budget targets: the graph-counted baselines target compiler/entry.vl", () => {
   for (const path of BASELINES) {
-    const b = JSON.parse(Deno.readTextFileSync(`${ROOT}/${path}`)) as { targets?: string[] };
+    const b = JSON.parse(Deno.readTextFileSync(`${ROOT}/${path}`)) as {
+      targets?: string[];
+    };
     const want = JSON.stringify(["compiler/entry.vl"]);
     const got = JSON.stringify(b.targets ?? []);
     if (got !== want) {
