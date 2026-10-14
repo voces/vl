@@ -1,5 +1,7 @@
 # The D199 grid — a union ARM at a function-value boundary, and the receiver it is read through
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 210-cell grid that closed `silent-class-inventory.md` **D199**, **D222** and **D269**,
 and that found **D351**.
 
@@ -123,7 +125,7 @@ all, because `i*ar>i` is the only key the token alphabet can spell that renders
 ## Named sets out of this grid
 
 ```sh
-python3 scripts/silent-sweep/d243/mkset.py /tmp/set \
+vl run scripts/silent-sweep/census/mkset.vl -- /tmp/set \
     scripts/silent-sweep/census/d199-rungs.json /tmp/g199
 JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/set <seed.wasm> /tmp/s.json
 ```
@@ -136,7 +138,7 @@ JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/set <seed.wasm>
   of the pool costs. Two of them are already `d199-rungs` controls and stay in that block.
 
 Cells are named by COORDINATE (`d199_hof2_arm_i32_norm`), not by index, so a named set keeps
-its names when a later axis is added and `mkset.py`'s staleness check means what it says.
+its names when a later axis is added and `mkset.vl`'s staleness check means what it says.
 
 ## Resource discipline
 

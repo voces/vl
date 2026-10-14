@@ -1,5 +1,7 @@
 # The union-box READ grid — the axis every earlier grid held fixed
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 `gen272.py` builds 1,260 cells crossing the four axes below. It exists because a candidate
 fix for **D209** read zero backward on 57,492 cells of every grid this repo had — census
 block C (43,200), census block D (9,000), a 140-cell adoption grid, `d156`, `d88`, `d112` —

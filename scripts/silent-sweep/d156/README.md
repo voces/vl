@@ -1,5 +1,7 @@
 # The D156 / D158 grid — the ANNOTATION-POSITION axis
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 1,188-cell grid that measured `silent-class-inventory.md` **D156** and **D158** and filed
 **D171–D174** out of the result. Kept because the closing numbers in that document — the
 total split of the peel along the layout-twin axis (**36 loud→runs / 0 backward where the
