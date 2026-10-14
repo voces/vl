@@ -9,90 +9,15 @@
 // samples; read its INCL column, since a leaf is whatever ran when the epoch ticked. Without a
 // `--names` seed every frame reads `wasm-function[N]`. `docs/internals/profiling-the-compiler.md`.
 
-import { IoError, readTextFile } from "std:fs"
 import { exit } from "std:process"
 import { programArgs } from "std:args"
 import { Utf8Error } from "std:utf8"
 import { padLeft, parseI32, toFixed, toString } from "std:fmt"
-import { Json, JsonError, parseJson } from "std:json"
-
-type JsonMap = { [string]: Json }
+import { Json } from "std:json"
+import { die } from "./lib/common"
+import { arr, field, loadProfile, nodeName, rankDesc } from "./lib/profile"
 
 const USAGE = "usage: vl run scripts/profile-rank.vl -- <profile.json> [top] [--alloc]"
-
-function die(msg: string, code: i32) {
-  print(msg)
-  exit(code)
-}
-
-function field(m: JsonMap, key: string): Json { m[key] ?? null }
-
-function obj(v: Json, what: string): JsonMap {
-  if v is JsonMap { return v }
-  die("profile-rank: \{what} is not an object", 2)
-  const none: JsonMap = Map()
-  none
-}
-
-function arr(v: Json, what: string): Json[] {
-  if v is Json[] { return v }
-  die("profile-rank: \{what} is not an array", 2)
-  []
-}
-
-// An index column: each entry as an i32, -1 for a JSON null.
-function ints(v: Json, what: string): i32[] {
-  const out: i32[] = []
-  for x in arr(v, what) {
-    if x is f64 { out.push(x as! i32) } else { out.push(-1) }
-  }
-  out
-}
-
-function absent(v: Json): boolean {
-  if v is Json[] { return v.length == 0 }
-  v == null
-}
-
-// The name table: the thread's `stringArray` or `stringTable`, else the shared one; an empty
-// table counts as absent.
-function strings(prof: JsonMap, th: JsonMap): string[] {
-  let src = field(th, "stringArray")
-  if absent(src) { src = field(th, "stringTable") }
-  if absent(src) {
-    const shared = field(prof, "shared")
-    if shared is JsonMap { src = field(shared, "stringArray") }
-  }
-  const out: string[] = []
-  if src is Json[] {
-    for s in src {
-      if s is string { out.push(s) } else { out.push("") }
-    }
-  }
-  out
-}
-
-// `xs`'s indices ordered by `key` descending; equal keys keep their order (a stable merge
-// sort), which is how Python's `Counter.most_common` breaks ties.
-function rankDesc(ix: i32[], key: f64[]): i32[] {
-  if ix.length <= 1 { return ix }
-  const mid = ix.length / 2
-  const a = rankDesc(ix.slice(0, mid), key)
-  const b = rankDesc(ix.slice(mid, ix.length), key)
-  const out: i32[] = []
-  let i = 0
-  let j = 0
-  while i < a.length || j < b.length {
-    if j >= b.length || (i < a.length && key[a[i]] >= key[b[j]]) {
-      out.push(a[i])
-      i = i + 1
-    } else {
-      out.push(b[j])
-      j = j + 1
-    }
-  }
-  out
-}
 
 function pct(n: f64, total: f64): string {
   padLeft(toFixed(100.0 * n / total, 2), 7, " ")
@@ -114,48 +39,29 @@ function main(argv: string[]): i32 {
     if t == null { die("profile-rank: top is not an integer: " + pos[1], 2) }
     top = t ?? 20
   }
-  const text = readTextFile(pos[0])
-  if text is IoError {
-    die("profile-rank: cannot read \{pos[0]} (\{text.msg})", 2)
-    return 2
-  }
-  const parsed = parseJson(text)
-  if parsed is JsonError {
-    die("profile-rank: \{pos[0]} is not JSON (\{parsed.msg})", 2)
-    return 2
-  }
-  const prof = obj(parsed, "the profile")
-  const th = obj(arr(field(prof, "threads"), "threads")[0], "threads[0]")
-  const names = strings(prof, th)
-  const frameFunc = ints(
-    field(obj(field(th, "frameTable"), "frameTable"), "func"),
-    "func",
-  )
-  const funcName = ints(
-    field(obj(field(th, "funcTable"), "funcTable"), "name"),
-    "name",
-  )
-  const stackTable = obj(field(th, "stackTable"), "stackTable")
-  const prefix = ints(field(stackTable, "prefix"), "prefix")
-  const stFrame = ints(field(stackTable, "frame"), "frame")
-  const samples = obj(field(th, "samples"), "samples")
-  const stacks = ints(field(samples, "stack"), "stack")
-  const weightCol = field(samples, "threadCPUDelta")
+  const p = loadProfile(pos[0], "profile-rank")
+  const prefix = p.prefix
+  const stFrame = p.stFrame
+  const stacks = p.stacks
+  const weightCol = field(p.samples, "threadCPUDelta")
   if alloc && weightCol == null {
     print("--alloc: this profile carries no per-sample weights")
     return 2
   }
   const weights: Json[] = []
   if alloc {
-    for w in arr(weightCol, "threadCPUDelta") { weights.push(w) }
+    for w in arr(weightCol, "profile-rank", "threadCPUDelta") {
+      weights.push(w)
+    }
   }
 
   // Each stack node's name as an id, ids in first-seen order.
   const idOf: Map<string, i32> = Map()
   const idName: string[] = []
   const nodeId: i32[] = []
-  for f in stFrame {
-    const nm = names[funcName[frameFunc[f]]]
+  let s0 = 0
+  while s0 < stFrame.length {
+    const nm = nodeName(p, s0)
     const known = idOf[nm]
     if known != null {
       nodeId.push(known)
@@ -164,6 +70,7 @@ function main(argv: string[]): i32 {
       nodeId.push(idName.length)
       idName.push(nm)
     }
+    s0 = s0 + 1
   }
 
   // SELF per name, the leaves in the order they were first seen, and each node's weight.
