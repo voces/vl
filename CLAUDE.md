@@ -724,7 +724,7 @@ a read `<t>[<idx>]` whose base the function did not declare and whose index is a
 HOLE FIELD (one the module itself compares `< 0` / `>= 0`), or a fall-through `i32` parameter
 of a reader, with no comparison of `<idx>` against `0`, `-1` or any `.length` before it.
 Ratchet: `vl check --budget scripts/sentinel-budget-baseline.json` (386 + 0 when it landed, #2499), census
-`scripts/sentinel-census.py`, `--why` names what left since the baseline's commit.
+`vl run scripts/sentinel-census.vl`, `--why` names what left since the baseline's commit.
 `docs/internals/sentinel-index-lint.md`.
 
 **A TRAP'S BACKTRACE IS FUNCTION INDICES UNTIL THE SEED IS BUILT WITH `--names`.** `vl build
