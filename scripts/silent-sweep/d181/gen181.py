@@ -38,7 +38,7 @@ Usage:
 Grade with `gradecensus.py` (the census grader — this grid's manifest is the census's own
 shape), one seed per leg:
 
-    JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py <outdir> <seed.wasm> <out.json>
+    JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- <outdir> <seed.wasm> <out.json>
 """
 import json
 import os

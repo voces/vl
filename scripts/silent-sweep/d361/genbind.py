@@ -15,7 +15,7 @@ spelling, keeping the generator's own expectation.
 
     python3 scripts/silent-sweep/census/gencensus.py /tmp/cellsE --block E
     python3 scripts/silent-sweep/d361/genbind.py /tmp/cellsE /tmp/d361bind
-    JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/d361bind <seed.wasm> /tmp/g.json
+    JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/d361bind <seed.wasm> /tmp/g.json
 
 WHY THE WHOLE `mixed` SLICE AND NOT ONLY `map_of_list`.  The other ten containers are the
 control that says the map layer is an ingredient, and `rep` in {i32, str} is the control

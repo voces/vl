@@ -94,15 +94,15 @@ The parts, and what each is for:
 4. `scripts/rep-fuzz-check.sh` — **mandatory** for anything touching the rep layer or the
    interner; the corpus, the suites and the fixpoint are all blind to REJECT→MISMATCH
 5. `scripts/mono-tyaram-grid.sh` for monomorphizer changes
-6. **`scripts/silent-sweep/distilled/regress.py` — the census's content, in ~35 seconds.**
+6. **`scripts/silent-sweep/distilled/regress.vl` — the census's content, in ~35 seconds.**
    (Measured 2026-09-05 at load 33: 35.5 s alone, 269 CPU-s at 759%, so it does fan out; it
    is the gate's critical path, and 66.3 s of the 2026-09-04 reading was contention.)
    Two halves. `cells/` is DERIVED: 1,477 programs, one per behavioural equivalence class of
    the 250,238-cell census. `named/` is CURATED: the exact cells some real regression NAMED,
-   kept whole — 6,088 of them, so the corpus is 7,565 cells, and `regress.py`'s own summary
+   kept whole — 6,088 of them, so the corpus is 7,565 cells, and `regress.vl`'s own summary
    splits it exactly that way since #2623 gave the 584 curated cells that had no
    `expected.jsonl` row one. The population it divides by, 256,089, is the census plus one
-   per curated cell; `index.py` owns those rows and the grader refuses a cell without one.
+   per curated cell; `index.vl` owns those rows and the grader refuses a cell without one.
    It exits non-zero **only** on `runs → not-runs`; `→ silent` and every other
    movement is printed and read, not blocked on. A program that did not work before and does
    not work now has not regressed in the sense a gate should stop the world for.
@@ -129,7 +129,7 @@ outcome, a suspicion that a family exists that nothing has named yet. It is ~35 
 `JOBS=4` with the box to itself, so run it deliberately and alone: three agents running it
 concurrently is six full passes on 24 cores, which is what turned a one-hour change into a
 three-hour one (measured: load 114, a single `vl run` costing 0.037s). **After any full sweep,
-re-distil** — `scripts/silent-sweep/distilled/redistil.py`, then `regress.py --write-baseline`.
+re-distil** — `scripts/silent-sweep/distilled/redistil.vl`, then `regress.vl -- <seed> --write-baseline`.
 The corpus is only as good as the history it was collapsed from; re-distilling is what keeps
 the one real risk (a compiler that splits a class no earlier compiler split) falling rather
 than growing.
@@ -138,11 +138,12 @@ than growing.
 named set's coordinate JSON under `census/` are rewritten by nearly every defect PR, so their
 format is a review and merge concern. Pretty-printed, a 207-cell change was an 860-line diff and
 a rebase merged cell boundaries wrongly **without saying so** — twice in one day, once silently
-corrupting the baseline. Read and write them through `distilled/cellmap.py`, never `json.load`.
+corrupting the baseline. Read and write them through `loadCells`/`dumpCells` in `scripts/lib/corpus.vl`, never a
+whole-file JSON parse.
 Do not add a field nothing reads: `coords` was stored three times and read from none of them.
 
 **REFUSE A CANDIDATE ON `runs → not-runs`, NOT ON `loud → silent`.** The gate's criterion and
-the shipping criterion are the same one, and they were allowed to drift apart. `regress.py`
+the shipping criterion are the same one, and they were allowed to drift apart. `regress.vl`
 blocks only on a WORKING program breaking; a program that did not work before and does not work
 now has not regressed. D11's candidate was refused on 2026-08-28 for moving 48 cells
 loud→silent — while buying **72 cells loud→RUNS and losing ZERO runs**. That is a large net win
@@ -350,7 +351,7 @@ program was ill-typed all along. Grade a silent→loud close by whether a NEIGHB
 spelling runs and whether the refusal names a CONTRACT or a MECHANISM, not by the shape of
 the close.
 
-**Count progress in programs that RUN.** `regress.py` already prints it: `runs` was
+**Count progress in programs that RUN.** `regress.vl` already prints it: `runs` was
 **3,704 / 7,021 (52.8%)** on 2026-08-30. Silent→loud is hygiene, belongs in the record, and is
 not a point on this scoreboard. The gate's floor (block on `runs → not-runs`) is unchanged; this
 is the number that is supposed to climb.

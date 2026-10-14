@@ -8,7 +8,7 @@ cannot be re-run.
 python3 scripts/silent-sweep/d243/genbox.py /tmp/gridP --block P   # 3,200 cells
 python3 scripts/silent-sweep/d243/genbox.py /tmp/gridQ --block Q   #   160 cells
 
-JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridP <seed.wasm> /tmp/P.json
+JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridP <seed.wasm> /tmp/P.json
 python3 scripts/silent-sweep/census/delta.py /tmp/gridP <before.json> <after.json>
 ```
 
@@ -111,7 +111,7 @@ them `-> runs`. It re-grades against any new seed in ~158 `vl` invocations:
 ```sh
 python3 scripts/silent-sweep/d243/mkset.py /tmp/moved \
     scripts/silent-sweep/census/d243-moved.json /tmp/gridP /tmp/gridQ
-JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py /tmp/moved <seed.wasm> /tmp/m.json
+JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/moved <seed.wasm> /tmp/m.json
 ```
 
 The histogram must read `runs 79` and nothing else.

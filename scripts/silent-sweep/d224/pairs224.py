@@ -15,8 +15,8 @@ produces on master, which is what says the gate was an accidental loud floor rat
 refusal being spent.
 
     python3 scripts/silent-sweep/d224/gen224.py /tmp/gridT /tmp/cellsA
-    JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridT <base.wasm>   /tmp/T-base.json
-    JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridT <branch.wasm> /tmp/T-branch.json
+    JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridT <base.wasm>   /tmp/T-base.json
+    JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridT <branch.wasm> /tmp/T-branch.json
     python3 scripts/silent-sweep/d224/pairs224.py /tmp/gridT /tmp/T-base.json /tmp/T-branch.json
 """
 import collections

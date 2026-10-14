@@ -12,7 +12,7 @@
 
 const BINARY = /\.(wasm|png|jpg|jpeg|gif|ico|woff2?|ttf|pdf|zip|gz|cwasm)$/i;
 // The generated corpora are thousands of one-line files a conflict would break outright
-// (regress.py refuses to load them), so they are skipped for speed, not for tolerance.
+// (regress.vl refuses to load them), so they are skipped for speed, not for tolerance.
 const GENERATED = /^scripts\/silent-sweep\//;
 
 const listTracked = (): string[] => {
