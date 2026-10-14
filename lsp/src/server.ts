@@ -158,7 +158,7 @@ const workspaceReader = makeWorkspaceReader(
   getStdDir,
 );
 
-// The current document's module key: its filesystem path (resolveSpecifier
+// The current document's module key: its filesystem path (modResolveSpecifier
 // resolves relative imports against this). Falls back to a synthetic key for a
 // non-`file:` URI (e.g. untitled buffers) — such a doc has no resolvable
 // relative imports, so analysis degrades to single-file, which is correct.

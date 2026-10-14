@@ -1,34 +1,19 @@
-// Module-aware analysis for the LSP (roadmap cross-file LSP / H0 phase 3).
+// The LSP's view of the workspace as a module graph. The wasm checker resolves
+// and checks imports itself; this file supplies what it reads and turns its
+// module-level answers into editor locations:
 //
-// The single-file LSP path (`compile(text)` / `checkOnly(text)`) tokenizes and
-// type-checks ONE file against `defaultScope()`, so an `import { foo } from
-// "./x"` never resolves — `foo` is reported "undeclared" and genuine import
-// errors (bad path, not-exported, cycle) are never surfaced. The real compiler
-// understands modules via the graph driver (`compiler/modules.ts`): it reads
-// every reachable module through an injected `ModuleReader`, parses each against
-// `defaultScope()` SEEDED with its imports' resolved types, and validates each
-// import resolves to an actually-`export`ed name.
+//   • the MODULE READER (`makeWorkspaceReader`): keys are filesystem paths or
+//     `std:` keys; open document buffers win over disk (unsaved edits are seen),
+//     and `std:` is served by `withStd` — the workspace's own `std/` when it has
+//     one, else the embedded `STD_SOURCES` — so the editor agrees with the CLI;
+//   • `file://` URI ↔ path conversion, and the `vl-std:` scheme that opens an
+//     embedded std module read-only;
+//   • the workspace `.vl` crawl (`detectProjectRoot`, `enumerateWorkspaceFiles`);
+//   • cross-file find-references and the unused-export hints, both built on the
+//     checker's `moduleSurface` / `referencesInEntry` / `importedNameSources`.
 //
-// This module brings that graph awareness to the LSP WITHOUT the per-module
-// span-attribution problem that a naive "run the whole merged program and filter
-// diagnostics by file" would hit (the merged program concatenates modules and
-// mangles names, and `loadProgram` returns a single flat diagnostics array with
-// no module key on each diagnostic). Instead we resolve the CURRENT file's
-// imports here — reading siblings through the same open-buffer/disk reader — and
-//   1. build an `importedScope` mapping each imported LOCAL name to its resolved
-//      type (exactly how `loadProgram` seeds an importer's `initialScope`), so
-//      the current file can be re-parsed with imports treated as if declared
-//      locally (no spurious "undeclared"; hover/completion get the real types);
-//   2. collect the genuine import errors (unresolvable path, not-exported,
-//      unsupported specifier, import cycle) — every one of which is attributed to
-//      an import statement in the CURRENT file, so its range is already correct
-//      for the current document. We never surface a sibling file's body
-//      diagnostics on the current document (those belong to that file's own
-//      editor view), which is exactly what sidesteps cross-module span mapping.
-//
-// Runtime: the bundled server is node/esbuild, so disk reads use `node:fs`. The
-// reader prefers OPEN document buffers (unsaved edits are seen) and falls back to
-// disk. Specifier resolution mirrors `compiler/modules.ts`'s `resolveSpecifier`.
+// Runtime: the bundled server is node/esbuild, so disk reads use `node:fs`,
+// loaded lazily so the Deno tests can inject their own reader.
 
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
@@ -85,9 +70,9 @@ export const pathToUri = (path: string): string => {
  *      map bundled with the extension;
  *   2. the GENERATED embedded map (`std/embedded.ts`, `deno task gen-std`) —
  *      the no-filesystem path the bundled LSP and the playground rely on.
- * Every other key passes through unchanged. Used by BOTH LSP checkers: the TS
- * moduleGraph (via {@link makeWorkspaceReader}) and the wasm checker's fetch
- * loop (`wasmChecker.ts`), so the editor agrees with the CLI about std.
+ * Every other key passes through unchanged. Used by {@link makeWorkspaceReader}
+ * and by the wasm checker's fetch loop (`wasmCheckerNode.ts`), so the editor
+ * agrees with the CLI about std.
  *
  * `getStdDir` is a thunk because the workspace root is only known after
  * `onInitialize`, while readers are constructed at module load.
@@ -163,7 +148,7 @@ export const crossFileUriOf = (
  * test stand-in); `readDisk` is injectable so tests can avoid touching the real
  * filesystem (defaults to `node:fs`'s `readFileSync`).
  *
- * Keys are plain filesystem paths (what `resolveSpecifier` produces for relative
+ * Keys are plain filesystem paths (what `modResolveSpecifier` produces for relative
  * specifiers resolved from a path-shaped `fromKey`) or `std:` module keys,
  * served via {@link withStd} (workspace `std/` dir when `getStdDir` yields one,
  * else the embedded map). Open buffers are keyed by `file://` URI, so the
@@ -231,7 +216,7 @@ const defaultReadDisk = (path: string): string | undefined => {
 
 /** A resolved cross-file source location: the exporting module + decl range. */
 export type CrossFileSource = {
-  /** The exporting module's filesystem key (what `resolveSpecifier` produced). */
+  /** The exporting module's filesystem key (what `modResolveSpecifier` produced). */
   key: string;
   /** The exporting module's `file://` URI (for an LSP `Location` / xref link). */
   uri: string;
@@ -745,7 +730,7 @@ export const buildUnusedExportUseMap = async (
  * Source: `"vital"`.
  *
  * Struct fields are NOT checked here (structural typing makes field-level
- * usage analysis too fuzzy — see module-level comment). Only function and value
+ * usage analysis too fuzzy). Only function and value
  * exports are flagged.
  *
  * These hints are designed to be MERGED with the file's regular diagnostics
