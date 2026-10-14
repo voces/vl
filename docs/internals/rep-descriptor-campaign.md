@@ -2790,8 +2790,12 @@ That pass walks `fnStmts` in order, so `f` asks `mfResultKindOf` about its callb
 return inference has reached the callback. The callback's `fRetKind` is then still the default
 `i32`, and `mfResultKindOf` answers `i32`. At emission the kind is settled and the classifier
 agrees with the column. `f`'s own inferred return is taken by `criClassify`'s ref-list arm
-before the `exprArray` arm reads the classifier, so no program was found that prints a wrong
-value. The disagreement is latent.
+before the `exprArray` arm reads the classifier, so `tests/cases` and the distilled corpus hold
+no program whose output it changes. One filed row does move: D2575, a function returning a
+`.map` of an anonymous record. There the early `i32` gave `f` a plain list result over a body
+building a ref list, which was invalid wasm. Now the result is a ref list whose element has no
+ref-list row yet, and the program refuses loudly with `ref valtype with no interned shape`.
+That is a clause-1 row becoming clause 2, and the row is re-graded.
 
 `mfResultKindOf` now hands an un-annotated callback that reads `i32` to
 `mfI32ResultOrColumn`. That function answers from the call's checked list rep where the column
@@ -2814,6 +2818,7 @@ bytes.
 * Native fixpoint holds.
 * `rep-fuzz-check` is exact.
 * Distilled `regress.vl`: no cell changed class.
+* Filed witnesses: one row moved, D2575, from check-clean invalid wasm to a loud emit reject.
 
 **Counts.** These are `listRep` notes over 15,360 files. "Different" counts a note whose two
 sides are both covered and differ.
