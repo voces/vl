@@ -340,6 +340,7 @@ import {
   tsHasKind,
   tsKind,
   ufcsAliasAtSite,
+  ufcsSiteRoot,
 } from "./ast"
 import { numLexFitsI32, numLexIs2Pow31, numLexIsFloat } from "./emit_bignum"
 import {
@@ -1239,6 +1240,17 @@ function lambdaCheckedRetTy(i: i32): i32 {
     if f is TyFunc { return f.fnRet }
   }
   -1
+}
+
+// The kind a function `i` returning a record literal its union arm adopts is stored at: the
+// arm's nullable rep when the checker joined that return with `null`, else the bare arm (D4668).
+function criLitArmRetKind(i: i32): VKind {
+  let t = fnInferredRetTy(i)
+  if t < 0 { t = lambdaCheckedRetTy(i) }
+  if t >= 0 && t < T.tys.length {
+    if T.tys[t] is TyNullable { return "nulvariant" }
+  }
+  "variant"
 }
 
 // Settle un-annotated function `i`'s `nulstruct` result at `struct` when the checker typed
@@ -2666,7 +2678,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
         if cloRetValKind(ffe) == "nulvariant" { return cloRetValSlot(ffe) }
       }
     }
-    return -1
+    return popArmElemVariantRow(exprIx, fnIx)
   }
   if e is Ident {
     // A declared local carries its variant index in the slot's parallel column, put there
@@ -2830,6 +2842,15 @@ function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
     }
   }
   -1
+}
+
+// The variant row a `.pop()` / `.get(i)` over a union-arm element list yields as its
+// `Arm | null` niche, or -1 when the read is not one (D4668).
+function popArmElemVariantRow(exprIx: i32, fnIx: i32): i32 {
+  const slot = popRefRecvSlot(exprIx, fnIx)
+  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
+  if rlElemKindTbl[slot] != RLK_STRUCT { return -1 }
+  rlElemVariantRow(slot)
 }
 
 // True if evaluating the expression at `exprIx` yields a nullable i32-list ref — a
@@ -5305,7 +5326,7 @@ export function criClassify(rx0: i32, i: i32) {
       if rsx < 0 {
         const rov = objLitVariantIdxNoStructRow(rx, fnStmts[i])
         if rov >= 0 {
-          fRetKind[i] = "variant"
+          fRetKind[i] = criLitArmRetKind(i)
           criChanged = true
           fRetStructIdx[i] = rov
         } else {
@@ -5377,7 +5398,7 @@ export function criClassify(rx0: i32, i: i32) {
         if rsi < 0 {
           const rov = letObjLitVariantIdx(rll, fnStmts[i])
           if rov >= 0 {
-            fRetKind[i] = "variant"
+            fRetKind[i] = criLitArmRetKind(i)
             criChanged = true
             fRetStructIdx[i] = rov
           } else {
@@ -21985,8 +22006,10 @@ export function memberCallYieldsValue(stmtIx: i32) {
   if s is Call {
     const callee = P.nodes[s.callFn]
     if callee is Member {
-      // An unrecorded type (-1) is "cannot answer", never a value.
-      const t = nodeTyIxOf(stmtIx)
+      // An unrecorded type (-1) is "cannot answer", never a value. A per-instance copy of a
+      // call records no type of its own and answers the checked call it copies (D4670).
+      let t = nodeTyIxOf(stmtIx)
+      if t < 0 { t = nodeTyIxOf(ufcsSiteRoot(stmtIx)) }
       if t < 0 { return false }
       return tyPrimNameOf(t) != "void"
     }
@@ -36487,7 +36510,7 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
       if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulvariant" }
     }
-    return false
+    return popArmElemVariantRow(exprIx, fnIx) >= 0
   }
   if e is Ident {
     if (
