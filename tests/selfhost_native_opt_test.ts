@@ -154,3 +154,37 @@ Deno.test({
     }
   },
 });
+
+// `$VL_OPT_ROUNDTRIP=1` has the compiler's module writer (`compiler/wasm_write.vl`, rung R4 of
+// docs/internals/optimizer-in-vl.md) decode the emitted module and each rung's input and write
+// them back; the build fails unless every byte comes back. `fault` flips a bit of the writer's
+// answer, so it must fail the same build: the control that the comparison can see a difference.
+const ROUNDTRIP = ["opt-escape/state-helpers.vl", "opt-escape/escapes.vl", "opt-melt/list-wrapper-push.vl"];
+for (const rel of ROUNDTRIP) {
+  for (const rung of ["-O", "-O3"]) {
+    Deno.test({
+      name: `native-opt: ${rel} ${rung} — the compiler's module writer gives back the bytes it read`,
+      ignore: !ENABLED,
+      fn: async () => {
+        const src = filePath(new URL(`./fixtures/${rel}`, import.meta.url));
+        const tmp = await Deno.makeTempDir();
+        try {
+          const build = (mode: string) =>
+            vl(["build", src, rung, "-o", `${tmp}/o.wasm`], { VL_WASM_OPT: WASM_OPT, VL_OPT_ROUNDTRIP: mode });
+          const ok = await build("1");
+          if (ok.code !== 0) {
+            throw new Error(`${rel} ${rung}: want rc 0 with the check on, got ${ok.code}: ${ok.err.trim()}`);
+          }
+          const bad = await build("fault");
+          if (bad.code === 0 || !bad.err.includes("module writer changes the emitted module")) {
+            throw new Error(
+              `${rel} ${rung}: want the control to fail naming the emitted module, got rc ${bad.code}: ${bad.err.trim()}`,
+            );
+          }
+        } finally {
+          await Deno.remove(tmp, { recursive: true });
+        }
+      },
+    });
+  }
+}
