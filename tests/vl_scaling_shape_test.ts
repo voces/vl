@@ -861,13 +861,13 @@ axis(
 // went 18.6 - 20.4% inclusive -> 0.25 - 1.58% by re-seeding its prefix from a row cache, taking
 // the pair to 0.80 - 1.06 against 0.88 - 1.20; both arms clamp on `FLOOR` at 400 pins, so the
 // bar STAYS at the family default rather than tracking a number the harness cannot measure.
-// The bar is that default carried into wasmtime 49's fuel units, which read this unchanged
-// pair 0.68% higher than 47's; D4607, a whole-arena scan per first instance, holds the pair
-// at it (profiling-the-compiler.md, "Measured 2026-10-14").
+// On fuel the pair later crept to 2.494 (1.460 / 1.821 / 3.867 at 100 / 200 / 800) under a
+// whole-arena write scan per instance; skipping it for a call by the generic's own name took it
+// to 1.252 (1.136 / 1.175 / 1.420), and 1.25x that is under 2.5, so the default stands (D4607).
 axis(
   "generic pins",
-  2.52,
-  "`monoMakeInstanceGo` asks `monoNameWrittenAt` — a whole-arena scan — of every first instance (D4607).",
+  2.5,
+  "`monoRebuild` re-runs a whole-program pass, or `monoNameWrittenAt` scans the arena, per minted instance (D4607).",
   (d) => twoFiles(d, genPins(400, true), genPins(400, false)),
 );
 
