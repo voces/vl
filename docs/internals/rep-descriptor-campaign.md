@@ -2655,3 +2655,122 @@ but the caller is not ready for it.
    the narrowed list and the column reads the slot's nullable list.
 4. The scope callers, found by §13.12's 372 files.
 5. The open family is not a coverage target. No pin can bind it.
+
+### 13.14 Every rung reads the column, and two ref-list coverage steps (L2 stage 4)
+
+This step takes items 1 and 2 of §13.13. The rung that §13.13 refused now ships on all four
+node kinds, because its one failure was a producer defect and is fixed at the producer.
+
+**The rungs.** `syntacticListRep` falls back to `columnListRep`, which was `callColumnListRep`,
+on five node kinds:
+
+* `Ident`, when `identListRep` names nothing and the read is in scope (`identReadOutOfScope`
+  is false);
+* `Member`, `Index` and `BinExpr`, when their own resolver names nothing;
+* `Call`, as in stage 3.
+
+It still reads only a node whose type at its instance is a non-null `TyArray`.
+
+**Two producer fixes.**
+
+* `capture-union-list-element-store.vl` failed with `ref valtype with no interned shape`. The
+  cause is an un-annotated function that returns a typed local, `function elem() { const c:
+  (i32|f64)[][] = …; c[0] }`. With the `Index` rung, `computeRetInference`'s `exprRefArray` arm
+  fires and asks `refListElemNameOfExpr` for the element row, but that name is not collected
+  during the return pass. It answered `""`, which left the inferred result valtype without a row.
+  `criRetRefListElemName` now falls back to the row of the expression's arena type.
+* With the `Ident` rung, `tests/cases/scope/start-block-shadow-scratch-frame.vl` trapped inside the
+  compiler (out of bounds in `fbEmitLocalsVec`). A `.push` receiver that the column now names a
+  ref list, but whose element has no ref-list row, reached `recordRefPushSlot` with slot `-1`,
+  which was stored. `recordRefPushSlot` now records nothing for `-1`.
+
+**Two coverage steps** in `compiler/emit_rep.vl`, both aimed at the `Ident` LEFT-ONLY:
+
+* `repOfNullableArray` answers `nulreflist` for any nullable list whose base is a covered
+  `reflist`. That covers `S[] | null`, `S[][] | null`, `Circle[] | null` and closure or box
+  lists.
+* `repOfArray` gives a numeric literal-union list `(1 | 2)[]` its base scalar's list.
+
+**Checks.** Results against `origin/master` 147ef9a87:
+
+* `difftree --identity` over 15,122 files: **10,037 built, 3 differ, 0 uncompared**.
+* Fixpoint identity holds: the candidate compiling 147ef9a87's compiler gives 147ef9a87's
+  seed.
+* Two refreshes give the same seed, 5,408,872 bytes.
+
+The three files that differ are:
+
+* `loops/forin-over-called-literal-union-list.vl`: stage 3's fixture, which master refuses.
+* `scope/start-block-shadow-scratch-frame.vl` and `unions/twice-narrowed-list-ops.vl`: the same
+  output, each 10 bytes smaller. Master emitted a four-local `.push` scratch frame that nothing
+  read, and the candidate no longer emits it.
+
+Fuel and gates:
+
+* `plumb-shape cost`: main 8,322,829,696 and tail 6,012,123,476, identical to stage 3's seed.
+  Master is 8,312,368,728 and 6,006,638,556.
+* L2 self-compile fuel: 75.74G, against 75.07G on stage 3 (+0.9%) and 75.01G on master.
+* `rep-fuzz-check` is exact.
+* Distilled `regress.vl`: no cell changed class.
+
+**Counts, notes.** These are like-for-like unless the row names another family. The "before"
+seed is stage 3 and the "after" seed is this tree.
+
+| population | kind | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | LEFT-ONLY | 11,731 | 6,624 |
+| `tests/cases` | RIGHT-ONLY | 9,250 | 1,476 |
+| `tests/cases` | different rep | 878 | 1,358 |
+| distilled `named/` | LEFT-ONLY | 3,717 | 1,741 |
+| distilled `named/` | RIGHT-ONLY | 639 | 58 |
+| distilled `named/` | different rep | 200 | 200 |
+| distilled `cells/` | different rep | 114 | 114 |
+| `tests/cases` | narrowed | 3,754 | 7,147 |
+| distilled `named/` | narrowed | 28 | 196 |
+| `tests/cases` | open, LEFT / RIGHT | 5,435 / 1,057 | 5,453 / 1,055 |
+| distilled `named/` | open, RIGHT | 432 | 360 |
+| `tests/cases` | scope, RIGHT | 39,440 | 39,090 |
+| distilled `named/` | scope, RIGHT | 7,097 | 7,216 |
+
+Across all three populations, like-for-like RIGHT-ONLY falls from 9,889 to 1,534 and LEFT-ONLY
+from 15,448 to 8,365.
+
+By node kind in `tests/cases`:
+
+* RIGHT-ONLY: `Ident` 3,269 → 0, `Index` 2,874 → 0, `BinExpr` 1,202 → 0 and `Member` 427 → 0.
+  What is left is 1,438 on statement nodes the probe tags `other`, 28 on `If` and 10 on `Paren`.
+* LEFT-ONLY: `Ident` 7,777 → 3,879, `Call` 1,586 → 1,318, `Index` 1,372 → 746, `Member` 211 → 51
+  and `If` 110 → 5.
+
+The nullable notes did not vanish. 3,393 of them moved from LEFT-ONLY into `narrowed`, where
+the column now names the slot's `nulreflist` and the ladder names the narrowed list.
+
+**The different-rep growth is one existing classifier defect.** `Call` different-rep went from
+59 to 539, all `list → reflist`. The witness is `nest.map((ys) => ys.map((x) => id(x))[0])`
+with a generic `id<T>`. Now that `ys` resolves through the column, `callIsMapFilter` holds, and
+`mfResultKindOf` answers `i32` for a callback that returns a generic call at a record instance.
+The same disagreement shows on stage 3 with an annotated receiver, `function f(ys: A[]) {
+ys.map((x) => id(x)) }`. Both programs run correctly, because emission takes the recorded type
+first. It is the map/filter callback-return classifier on a generic call, and is not filed.
+
+**What is left of the `Ident` LEFT-ONLY**, 3,879:
+
+* 3,016 are `reflist` over a union-box or recursive-alias element: `Json[]`, `Json$m1[]`, and
+  a narrowed arm of a union list. They are concentrated in `deep-is-json-*` and
+  `pop-union-box-*`. `repOfArray` does not cover them, because `unRowOfCanonId` and
+  `tyIsValueUnionBox` do not answer for a recursive alias.
+* 647 have no node type.
+* The other 216 include 91 `strlist`, 66 nullable lists and 44 where the column answers none.
+
+**Nothing converts or retires yet.** Every node kind now has a column fallback, so the ladder
+is the column's consumer on these rungs. It is not yet replaced by it.
+
+**Next, in order:**
+
+1. `Ident` LEFT-ONLY over a recursive-alias or union-box element, the 3,016 above. Cover the
+   recursive alias in `repOfArray`.
+2. The 1,438 `other` RIGHT-ONLY notes, plus `If` and `Paren`.
+3. `mfResultKindOf` for a callback that returns a generic call, which is the `Call`
+   different-rep notes.
+4. The narrowed family, now 7,343 notes. This is the slot-versus-narrowed rep split.
+5. The scope callers, found by §13.12's 372 files.
