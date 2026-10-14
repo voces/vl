@@ -1,0 +1,476 @@
+// Writes tests/cases/atomics/{load-store,rmw,cmpxchg}.vl: every atomic intrinsic against
+// known memory, with the expected `@log` lines from an independent model of the wasm
+// threads proposal (an access is little-endian; a narrow load or rmw zero-extends the old
+// value; a narrow operand, replacement and cmpxchg `expected` wrap to the access width).
+// The corpus oracle runs the cases on V8; `vl run` runs them on wasmtime. Re-run after
+// changing the atomic table, from the checkout root:
+//
+//     vl run scripts/gen-atomic-cases.vl                 # write the cases
+//     vl run scripts/gen-atomic-cases.vl -- --verify     # also check every opcode
+//
+// `--out DIR` writes under DIR/atomics instead of tests/cases/atomics.
+
+import { programArgs } from "std:args"
+import { toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { Utf8Error } from "std:utf8"
+import { hasFlag } from "./lib/common"
+import {
+  NameAlt,
+  buildAndDisassemble,
+  casesRoot,
+  casesText,
+  codeSection,
+  coverageDirs,
+  fail,
+  findNames,
+  litI32,
+  litI64,
+  maskBits,
+  pairsRepr,
+  wrapBits,
+  writeOrDie,
+} from "./lib/wasm-cases"
+
+// ── the spec table: wasm name, 0xFE sub-opcode, VL name ─────────────────────────────
+// Written from the threads proposal's opcode list, not read from the compiler, so
+// `--verify` compares two independent sources (and binaryen's decoder as the third).
+
+type Width = { shape: string, bits: i32, n: string }
+type Row = { wasm: string, op: i32, vl: string }
+
+const WIDTHS: Width[] = [
+  { shape: "i32", bits: 32, n: "" },
+  { shape: "i64", bits: 64, n: "" },
+  { shape: "i32", bits: 8, n: "8" },
+  { shape: "i32", bits: 16, n: "16" },
+  { shape: "i64", bits: 8, n: "8" },
+  { shape: "i64", bits: 16, n: "16" },
+  { shape: "i64", bits: 32, n: "32" },
+]
+const RMW_OPS = ["add", "sub", "and", "or", "xor", "xchg", "cmpxchg"]
+
+function u(w: Width): string {
+  if w.n == "" { return "" }
+  "_u"
+}
+
+function specTable(): Row[] {
+  const rows: Row[] = [
+    {
+      wasm: "memory.atomic.notify",
+      op: 0x00,
+      vl: "__atomic_notify__",
+    },
+    {
+      wasm: "memory.atomic.wait32",
+      op: 0x01,
+      vl: "__atomic_wait32__",
+    },
+    {
+      wasm: "memory.atomic.wait64",
+      op: 0x02,
+      vl: "__atomic_wait64__",
+    },
+    { wasm: "atomic.fence", op: 0x03, vl: "__atomic_fence__" },
+  ]
+  for i in 0 until WIDTHS.length {
+    const w = WIDTHS[i]
+    rows.push(
+      {
+        wasm: w.shape + ".atomic.load" + w.n + u(w),
+        op: 0x10 + i,
+        vl: "__atomic_load" + w.n + u(w) + "_" + w.shape + "__",
+      },
+    )
+  }
+  for i in 0 until WIDTHS.length {
+    const w = WIDTHS[i]
+    rows.push(
+      {
+        wasm: w.shape + ".atomic.store" + w.n,
+        op: 0x17 + i,
+        vl: "__atomic_store" + w.n + "_" + w.shape + "__",
+      },
+    )
+  }
+  for k in 0 until RMW_OPS.length {
+    const op = RMW_OPS[k]
+    for i in 0 until WIDTHS.length {
+      const w = WIDTHS[i]
+      rows.push(
+        {
+          wasm: w.shape + ".atomic.rmw" + w.n + "." + op + u(w),
+          op: 0x1e + 7 * k + i,
+          vl: "__atomic_rmw" + w.n + "_" + op + u(w) + "_" + w.shape + "__",
+        },
+      )
+    }
+  }
+  rows
+}
+
+// ── the reference model ─────────────────────────────────────────────────────────────
+
+const BASE = 256 // a 16-byte window, 8-aligned; every access lands inside it
+const SEED = [
+  0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+  0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xF0, 0xFF,
+]
+
+// Naturally aligned, and not at the window's start.
+function offsetOf(bits: i32): i32 {
+  if bits == 8 { return 5 }
+  if bits == 16 { return 6 }
+  if bits == 32 { return 4 }
+  8
+}
+
+function topOf(shape: string): i32 {
+  if shape == "i32" { return 32 }
+  64
+}
+
+function get(mem: readonly i32[], off: i32, bits: i32): i64 {
+  let v: i64 = 0
+  let i = bits / 8 - 1
+  while i >= 0 {
+    v = (v << 8) | (mem[off + i] as i64)
+    i = i - 1
+  }
+  v
+}
+
+function put(mem: i32[], off: i32, bits: i32, v: i64) {
+  for i in 0 until bits / 8 {
+    mem[off + i] = ((v >>> ((8 * i) as i64)) & 0xFF) as% i32
+  }
+}
+
+// `xs` ascending with repeats dropped, as Python's `sorted(set(xs))`.
+function sortedUnique(xs: i32[]): i32[] {
+  const out: i32[] = []
+  for x in xs {
+    let i = 0
+    while i < out.length && out[i] < x { i = i + 1 }
+    if i < out.length && out[i] == x { continue }
+    out.push(x)
+    let j = out.length - 1
+    while j > i {
+      out[j] = out[j - 1]
+      j = j - 1
+    }
+    out[i] = x
+  }
+  out
+}
+
+function lit(v: i64, shape: string): string {
+  if shape == "i32" { return litI32(v) }
+  litI64(v)
+}
+
+function rmw(op: string, a: i64, b: i64): i64 {
+  if op == "add" { return a + b }
+  if op == "sub" { return a - b }
+  if op == "and" { return a & b }
+  if op == "or" { return a | b }
+  if op == "xor" { return a ^ b }
+  if op == "xchg" { return b }
+  fail("no model for rmw " + op)
+  0
+}
+
+// Signed at the row's shape; narrow rows see only their low bits.
+function operands(shape: string): i64[] {
+  if shape == "i32" {
+    return [1, -1, 0x7FFFFFFF, -2147483648, 0x1F0F, -0x1234568]
+  }
+  [1, -1, 0x7FFFFFFFFFFFFFFF, (1 as i64) << 63, 0x1F0F, -0x123456789ABC]
+}
+
+type Case = { name: string, blurb: string[], body: string[], logs: string[] }
+
+function newCase(name: string, blurb: string[]): Case {
+  { name: name, blurb: blurb, body: [], logs: [] }
+}
+
+function reset(c: Case): i32[] {
+  c.body.push("  seed()")
+  SEED.slice(0, 16)
+}
+
+function value(c: Case, expr: string, v: i64, shape: string) {
+  c.body.push("  print(" + expr + ")")
+  c.logs.push(toString(wrapBits(v, topOf(shape))))
+}
+
+function window(c: Case, mem: readonly i32[]) {
+  c.body.push("  window()")
+  c.logs.push(toString(get(mem, 0, 64)))
+  c.logs.push(toString(get(mem, 8, 64)))
+}
+
+function write(dir: string, c: Case) {
+  const text = ["// @run"]
+  for l in c.logs { text.push("// @log " + l) }
+  for l in c.blurb { text.push("// " + l) }
+  const tail = [
+    "// Generated by scripts/gen-atomic-cases.vl; the expected lines are its model of",
+    "// the wasm threads proposal. Edit the generator, not this file.",
+    "const BASE = " + toString(BASE),
+    "",
+    "function seed() {",
+    "  __store_i64__(BASE, " + toString(get(SEED, 0, 64)) + ")",
+    "  __store_i64__(BASE + 8, " + toString(get(SEED, 8, 64)) + ")",
+    "}",
+    "",
+    "function window() {",
+    "  print(__load_i64__(BASE))",
+    "  print(__load_i64__(BASE + 8))",
+    "}",
+    "",
+    "function main() {",
+  ]
+  for l in tail { text.push(l) }
+  for l in c.body { text.push(l) }
+  text.push("}")
+  text.push("main()")
+  text.push("")
+  writeOrDie(dir + "/" + c.name, join(text, "\n"))
+}
+
+function genLoadStore(dir: string) {
+  const c = newCase(
+    "load-store.vl",
+    [
+      "Every atomic load and store width at a naturally aligned address inside a seeded",
+      "16-byte window: a narrow load zero-extends, and a narrow store writes only its",
+      "own bytes, so the window's other bytes read back unchanged.",
+    ],
+  )
+  for w in WIDTHS {
+    const mem = reset(c)
+    const offs = sortedUnique([0, offsetOf(w.bits), 16 - w.bits / 8])
+    for off in offs {
+      const call = "__atomic_load"
+        + w.n
+        + u(w)
+        + "_"
+        + w.shape
+        + "__(BASE + "
+        + toString(off)
+        + ")"
+      value(c, call, get(mem, off, w.bits), w.shape)
+    }
+  }
+  for w in WIDTHS {
+    for v in operands(w.shape).slice(1, 4) {
+      const mem = reset(c)
+      const off = offsetOf(w.bits)
+      c.body.push(
+        "  __atomic_store"
+          + w.n
+          + "_"
+          + w.shape
+          + "__(BASE + "
+          + toString(off)
+          + ", "
+          + lit(v, w.shape)
+          + ")",
+      )
+      put(mem, off, w.bits, v)
+      window(c, mem)
+    }
+  }
+  write(dir, c)
+}
+
+function genRmw(dir: string) {
+  const c = newCase(
+    "rmw.vl",
+    [
+      "Every read-modify-write op at every width: the call answers the OLD value",
+      "(zero-extended when narrow) and memory holds op(old, operand) wrapped to the",
+      "width, with the window's other bytes unchanged. Operands carry bits above a",
+      "narrow width, which the access wraps away.",
+    ],
+  )
+  for op in RMW_OPS.slice(0, 6) {
+    for w in WIDTHS {
+      const all = operands(w.shape)
+      const vs: i64[] = []
+      for i in 0 until all.length {
+        if op == "add" || i % 2 == 0 { vs.push(all[i]) }
+      }
+      for v in vs {
+        const mem = reset(c)
+        const off = offsetOf(w.bits)
+        const old = get(mem, off, w.bits)
+        const call = "__atomic_rmw"
+          + w.n
+          + "_"
+          + op
+          + u(w)
+          + "_"
+          + w.shape
+          + "__(BASE + "
+          + toString(off)
+          + ", "
+          + lit(v, w.shape)
+          + ")"
+        value(c, call, old, w.shape)
+        put(mem, off, w.bits, rmw(op, old, maskBits(v, w.bits)))
+        window(c, mem)
+      }
+    }
+  }
+  // an operand read at run time, not folded from a literal
+  const mem = reset(c)
+  c.body.push("  let k = 3")
+  c.body.push("  k = k * 7")
+  value(c, "__atomic_rmw_sub_i32__(BASE + 4, k)", get(mem, 4, 32), "i32")
+  put(mem, 4, 32, get(mem, 4, 32) - 21)
+  window(c, mem)
+  write(dir, c)
+}
+
+const REPL: i64 = -0x5A5A5A5A5A5A5A5B // the replacement, read from a binding at its width
+
+function genCmpxchg(dir: string) {
+  const c = newCase(
+    "cmpxchg.vl",
+    [
+      "cmpxchg at every width, on a match and on a mismatch. Each answers the OLD value;",
+      "only a match stores the replacement. A narrow `expected` is wrapped to the access",
+      "width before the compare, so one whose high bits are set still matches.",
+    ],
+  )
+  c.body.push("  const r32 = " + toString(wrapBits(REPL, 32)))
+  c.body.push("  const r64 = " + toString(REPL))
+  for w in WIDTHS {
+    const name = "__atomic_rmw" + w.n + "_cmpxchg" + u(w) + "_" + w.shape + "__"
+    const off = offsetOf(w.bits)
+    const top = topOf(w.shape)
+    const cur = get(SEED, off, w.bits)
+    const cases = [wrapBits(cur, top), wrapBits(cur + 1, top)] // match, then mismatch
+    if w.n != "" {
+      const high = cur
+        | ((1 as i64) << (w.bits as i64))
+        | ((1 as i64) << ((top - 1) as i64))
+      cases.push(wrapBits(high, top)) // wraps to a match
+    }
+    for exp in cases {
+      const mem = reset(c)
+      const call = name
+        + "(BASE + "
+        + toString(off)
+        + ", "
+        + lit(exp, w.shape)
+        + ", r"
+        + toString(top)
+        + ")"
+      value(c, call, cur, w.shape)
+      if maskBits(exp, w.bits) == cur { put(mem, off, w.bits, REPL) }
+      window(c, mem)
+    }
+  }
+  write(dir, c)
+}
+
+function checkCoverage(root: string) {
+  const text = casesText(coverageDirs(root, "atomics"), [""])
+  const missing: string[] = []
+  for r in specTable() {
+    if !text.includes(r.vl + "(") { missing.push(r.vl) }
+  }
+  if missing.length > 0 {
+    fail("rows with no generated case: " + join(missing, ", "))
+  }
+}
+
+// Builds one module calling every intrinsic in spec order and checks (1) its 0xFE
+// sub-opcodes against the spec table, byte for byte, and (2) binaryen's disassembly names.
+function verify() {
+  const rows = specTable()
+  const lines: string[] = []
+  for r in rows {
+    const key = split(r.vl.slice(2, r.vl.length - 2), "_")[1]
+    let a = "16, 1"
+    if key == "notify" { a = "16, 1" }
+    else if key == "wait32" { a = "16, 1, 0 as i64" }
+    else if key == "wait64" { a = "16, 1 as i64, 0 as i64" }
+    else if key == "fence" { a = "" }
+    else if r.wasm.includes(".cmpxchg") { a = "16, 1, 2" }
+    else if r.wasm.includes(".load") { a = "16" }
+    const call = r.vl + "(" + a + ")"
+    if r.wasm.startsWith("atomic.fence") || r.wasm.includes(".store") {
+      lines.push(call)
+    } else {
+      lines.push("print(" + call + ")")
+    }
+  }
+  const built = buildAndDisassemble(
+    join(lines, "\n") + "\n",
+    ["--enable-threads", "--enable-gc", "--enable-reference-types"],
+  )
+  // Every sub-opcode is < 0x80, so each call site is the two bytes `0xFE <sub>`. The main
+  // function's body is straight-line calls on small constants, so in the CODE section no
+  // other 0xFE byte occurs; the sequence must equal the spec table's exactly.
+  const code = codeSection(built.wasm)
+  const ops: i32[] = []
+  for i in 0 until code.length - 1 {
+    if code[i] == 0xFE { ops.push(code[i + 1]) }
+  }
+  let same = ops.length == rows.length
+  for i in 0 until rows.length {
+    if same && ops[i] != rows[i].op { same = false }
+  }
+  const alts: NameAlt[] = [
+    { prefix: "memory.atomic.", tail: 1 },
+    { prefix: "atomic.fence", tail: 0 },
+    { prefix: "i32.atomic.", tail: 2 },
+    { prefix: "i64.atomic.", tail: 2 },
+  ]
+  const names = findNames(built.dis, alts)
+  const bad: string[][] = []
+  for i in 0 until rows.length {
+    if i < names.length && rows[i].wasm != names[i] {
+      bad.push([rows[i].wasm, names[i]])
+    }
+  }
+  let verdict = "DIFFERENT from"
+  if same { verdict = "equal to" }
+  print(
+    "opcodes: "
+      + toString(ops.length)
+      + " emitted, "
+      + verdict
+      + " the spec table's "
+      + toString(rows.length)
+      + "; wasm-dis: "
+      + toString(names.length)
+      + " decoded, "
+      + toString(bad.length)
+      + " disagree",
+  )
+  if !same || names.length != rows.length || bad.length > 0 {
+    fail("verify failed: " + pairsRepr(bad.slice(0, 5)))
+  }
+}
+
+function main() {
+  const args = programArgs()
+  if args is Utf8Error {
+    fail("gen-atomic-cases: an argument is not UTF-8")
+    return
+  }
+  const dir = casesRoot(args) + "/atomics"
+  genLoadStore(dir)
+  genRmw(dir)
+  genCmpxchg(dir)
+  checkCoverage(casesRoot(args))
+  if hasFlag(args, "--verify") { verify() }
+}
+
+main()

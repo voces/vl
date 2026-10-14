@@ -1,0 +1,283 @@
+// Writes tests/cases/bitwise/shift-mask-fold.vl: every shape wasmEmit.vl's shift/mask
+// strength reduction rewrites, and its declining neighbours, at the boundary values. Each
+// `@log` is computed here by a bit-exact model of the UNREDUCED expression.
+//
+//     vl run scripts/gen-shift-mask-fold.vl -- tests/cases/bitwise/shift-mask-fold.vl
+//
+// Run from the checkout root.
+
+import { programArgs } from "std:args"
+import { toString } from "std:fmt"
+import { join, startsWith } from "std:str"
+import { Utf8Error } from "std:utf8"
+import { fail, pow2, wrapBits, writeOrDie } from "./lib/wasm-cases"
+
+// One generated function: `name(p: ty) { expr }`, modelled as
+// `wrap(((shift(x, k) at width sw) & m) << j, outw)`.
+type Shape = {
+  name: string,
+  ty: string,
+  expr: string,
+  sw: i32,
+  arith: boolean,
+  k: i32,
+  m: i64,
+  j: i32,
+  outw: i32,
+}
+
+type Input = { lit: string, v: i64 }
+
+function model(f: Shape, x: i64): i64 {
+  let s: i64 = 0
+  if f.arith {
+    s = wrapBits(x, f.sw) >> (f.k as i64)
+  } else {
+    let u = x
+    if f.sw < 64 { u = x & (pow2(f.sw) - 1) }
+    s = u >>> (f.k as i64)
+  }
+  wrapBits((s & f.m) << (f.j as i64), f.outw)
+}
+
+function hexLower(v: i64): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let x = v
+  while x != 0 {
+    const d = (x & 15) as% i32
+    out = digits.slice(d, d + 1) + out
+    x = x >>> 4
+  }
+  "0x" + out
+}
+
+// Python's `mlit`: a small mask in decimal, a large one in hex.
+function mlit(m: i64): string {
+  if m < 1024 { return toString(m) }
+  hexLower(m)
+}
+
+function shape(
+  name: string,
+  ty: string,
+  expr: string,
+  sw: i32,
+  op: string,
+  k: i32,
+  m: i64,
+  j: i32,
+  outw: i32,
+): Shape {
+  {
+    name: name,
+    ty: ty,
+    expr: expr,
+    sw: sw,
+    arith: op == ">>",
+    k: k,
+    m: m,
+    j: j,
+    outw: outw,
+  }
+}
+
+function shapes(): Shape[] {
+  const fs: Shape[] = []
+  let n = 0
+  const ops = [">>>", ">>"]
+  // i32: ((x >>> k) & m) << j, and x >> k, and `* 2^j` on either side.
+  for op in ops {
+    for k in [0, 3, 31] {
+      const masks: i64[] = [0, 1023, 0x7FFFFFFF]
+      for m in masks {
+        const head = "((x " + op + " " + toString(k) + ") & " + mlit(m) + ")"
+        for j in [0, 3, 31] {
+          n = n + 1
+          fs.push(
+            shape(
+              "a" + toString(n),
+              "i32",
+              head + " << " + toString(j),
+              32,
+              op,
+              k,
+              m,
+              j,
+              32,
+            ),
+          )
+        }
+        for j in [3, 30] {
+          n = n + 1
+          let e = head + " * " + toString(pow2(j))
+          if j == 3 {
+            e = "8 * (" + mlit(m) + " & (x " + op + " " + toString(k) + "))"
+          }
+          fs.push(shape("a" + toString(n), "i32", e, 32, op, k, m, j, 32))
+        }
+      }
+    }
+  }
+  // i32 through top-level consts.
+  fs.push(
+    shape("c1", "i32", "((x >>> SH) & MASK) * SCALE", 32, ">>>", 3, 1023, 3, 32),
+  )
+  fs.push(
+    shape("c2", "i32", "((x >>> SH) & MASK) << SH", 32, ">>>", 3, 1023, 3, 32),
+  )
+  // i64: the same at width 64.
+  for op in ops {
+    for k in [0, 3, 63] {
+      const masks: i64[] = [1023, 0xFFFFFFFF]
+      for m in masks {
+        const head = "((x " + op + " " + toString(k) + ") & " + mlit(m) + ")"
+        for j in [0, 3, 63] {
+          n = n + 1
+          fs.push(
+            shape(
+              "b" + toString(n),
+              "i64",
+              head + " << " + toString(j),
+              64,
+              op,
+              k,
+              m,
+              j,
+              64,
+            ),
+          )
+        }
+        n = n + 1
+        fs.push(
+          shape("b" + toString(n), "i64", head + " * 8", 64, op, k, m, 3, 64),
+        )
+      }
+    }
+  }
+  // i64 -> i32 narrowing: (y >>> k) as% i32 & m, with and without a following << j or
+  // * 2^j, and ((y >>> k) & m) as% i32, with and without.
+  for op in ops {
+    for k in [0, 3, 31, 32] {
+      const narrowMasks: i64[] = [1, 1023, 0x7FFFFFFF]
+      const sh = "(y " + op + " " + toString(k) + ")"
+      for m in narrowMasks {
+        n = n + 1
+        fs.push(
+          shape(
+            "n" + toString(n),
+            "i64",
+            sh + " as% i32 & " + mlit(m),
+            64,
+            op,
+            k,
+            m,
+            0,
+            32,
+          ),
+        )
+        for j in [3, 31] {
+          n = n + 1
+          const e = "(" + sh + " as% i32 & " + mlit(m) + ") << " + toString(j)
+          fs.push(shape("n" + toString(n), "i64", e, 64, op, k, m, j, 32))
+        }
+        n = n + 1
+        const e8 = "(" + sh + " as% i32 & " + mlit(m) + ") * 8"
+        fs.push(shape("n" + toString(n), "i64", e8, 64, op, k, m, 3, 32))
+      }
+      const wideMasks: i64[] = [1023, 0xFFFFFFFF]
+      for m in wideMasks {
+        const e = "(" + sh + " & " + mlit(m) + ") as% i32"
+        n = n + 1
+        fs.push(shape("w" + toString(n), "i64", e, 64, op, k, m, 0, 32))
+        n = n + 1
+        fs.push(
+          shape("w" + toString(n), "i64", e + " << 3", 64, op, k, m, 3, 32),
+        )
+      }
+    }
+  }
+  fs
+}
+
+const HEADER = [
+  "// Every shape the emitter's shift/mask strength reduction rewrites, at the boundary",
+  "// values: `((x >>> k) & m) << j` and `* 2^j` at i32 and i64, `>>` where the mask misses",
+  "// the sign fill, and the i64 -> i32 narrowings. Shifts at 0, 31 and 63, masks at 0 and",
+  "// all-ones; the declining neighbours are here too, so both sides print the same values.",
+  "// Each line is one shape's results over the inputs, folded by `mix`. Generated by",
+  "// scripts/gen-shift-mask-fold.vl; see wasmEmit.vl `emitShiftMaskFold`.",
+  "const SH = 3", "const MASK = 1023", "const SCALE = 8",
+  "const IMIN = -2147483647 - 1", "const IMAX = 2147483647",
+  "const LMIN = (1 as i64) << 63", "const LMAX = LMIN - 1",
+  "const LMIX = 0x9e3779b97f4a7c15", "const LHALF: i64 = 0x80000000",
+  "const Z = 0 as i64", "const M1 = -1 as i64",
+  "function mix(h: i64, v: i64) { h * 1000003 + v }",
+  "function d5(a: i32, b: i32, c: i32, d: i32, e: i32) {", "  mix(",
+  "    mix(mix(mix(mix(0 as i64, a as i64), b as i64), c as i64), d as i64),",
+  "    e as i64,", "  )", "}",
+  "function d6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) {",
+  "  mix(mix(mix(mix(mix(mix(0 as i64, a), b), c), d), e), f)", "}",
+  "function n6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) {",
+  "  d6(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64)", "}",
+]
+
+// The lint hint the fixture's `y >> 32` narrowing earns; the case runner checks it.
+const HINT = "// @hint masking `y >> 32` to its low 32 bits is the logical shift `y >>> 32`"
+
+function main() {
+  const args = programArgs()
+  if args is Utf8Error || args.length < 1 {
+    fail("usage: vl run scripts/gen-shift-mask-fold.vl -- <out.vl>")
+    return
+  }
+  const i32In: Input[] = [
+    { lit: "0", v: 0 },
+    { lit: "-1", v: -1 },
+    { lit: "IMIN", v: 0 - pow2(31) },
+    { lit: "IMAX", v: pow2(31) - 1 },
+    { lit: "0x12345678", v: 0x12345678 },
+  ]
+  const i64In: Input[] = [
+    { lit: "Z", v: 0 },
+    { lit: "M1", v: -1 },
+    { lit: "LMIN", v: pow2(63) },
+    { lit: "LMAX", v: pow2(63) - 1 },
+    { lit: "LMIX", v: 0x9e3779b97f4a7c15 },
+    { lit: "LHALF", v: 0x80000000 },
+  ]
+  const fs = shapes()
+  const out = ["// @run"]
+  const body: string[] = []
+  for l in HEADER { body.push(l) }
+  for f in fs {
+    let p = "x"
+    if f.name.startsWith("n") || f.name.startsWith("w") { p = "y" }
+    body.push(
+      "function " + f.name + "(" + p + ": " + f.ty + ") { " + f.expr + " }",
+    )
+  }
+  for f in fs {
+    let ins = i32In
+    let d = "d5"
+    if f.ty == "i64" {
+      ins = i64In
+      d = "n6"
+      if f.name.startsWith("b") { d = "d6" }
+    }
+    let h: i64 = 0
+    const calls: string[] = []
+    for x in ins {
+      calls.push(f.name + "(" + x.lit + ")")
+      h = h * 1000003 + model(f, x.v)
+    }
+    body.push("print(" + d + "(" + join(calls, ", ") + "))")
+    out.push("// @log " + toString(h))
+  }
+  out.push(HINT)
+  for l in body { out.push(l) }
+  writeOrDie(args[0], join(out, "\n") + "\n")
+  print(toString(fs.length) + " functions, " + toString(fs.length) + " values")
+}
+
+main()

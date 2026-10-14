@@ -1,0 +1,398 @@
+// What the fixture generators under scripts/ share (`gen-atomic-cases`, `gen-conv-cases`,
+// `gen-simd-int-cases`, `gen-shift-mask-fold`): two's-complement wrapping at a width, the
+// VL literal of a wrapped value, IEEE-754 conversions computed from bit patterns, and the
+// `--verify` plumbing that builds a module and reads its code section and disassembly.
+// The float models decode bits by hand rather than through a VL cast, so a fixture's
+// expected lines never come from the compiler the fixture grades.
+
+import { IoError, listDir, readFile, readTextFile, writeTextFile } from "std:fs"
+import { exit, runProgram } from "std:process"
+import { Utf8Error, decodeUtf8 } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, startsWith, trim } from "std:str"
+import { envOr } from "./common"
+
+// Stop with exit code 1 after saying why; VL has no stderr sink, so this is stdout.
+export function fail(msg: string) {
+  print(msg)
+  exit(1)
+}
+
+// 2 to the `k`, for `k` in 0..63 (63 gives the i64 minimum's bits).
+export function pow2(k: i32): i64 { (1 as i64) << (k as i64) }
+
+// `v` reduced to its low `bits` bits and read as signed: Python's `signed(v, bits)`.
+export function wrapBits(v: i64, bits: i32): i64 {
+  if bits >= 64 { return v }
+  const u = v & (pow2(bits) - 1)
+  if ((u >>> ((bits - 1) as i64)) & 1) == 1 { return u - pow2(bits) }
+  u
+}
+
+// `v` reduced to its low `bits` bits, unsigned: Python's `v % (1 << bits)`. At 64 bits
+// the result is the same bits, read back as an i64.
+export function maskBits(v: i64, bits: i32): i64 {
+  if bits >= 64 { return v }
+  v & (pow2(bits) - 1)
+}
+
+// The VL literal of `v` wrapped to 32 bits; the minimum is spelled as arithmetic.
+export function litI32(v: i64): string {
+  const w = wrapBits(v, 32)
+  if w == 0 - pow2(31) { return "(-2147483647 - 1)" }
+  toString(w)
+}
+
+// The VL literal of an i64; the minimum is spelled as arithmetic.
+export function litI64(v: i64): string {
+  if v == pow2(63) { return "(-9223372036854775807 - 1)" }
+  toString(v)
+}
+
+// The directory standing in for `tests/cases`: `--out DIR`, else the checkout's own.
+export function casesRoot(args: readonly string[]): string {
+  let i = 0
+  while i + 1 < args.length {
+    if args[i] == "--out" { return args[i + 1] }
+    i = i + 1
+  }
+  "tests/cases"
+}
+
+export function writeOrDie(path: string, text: string) {
+  const r = writeTextFile(path, text)
+  if r is IoError { fail("cannot write " + path + ": " + r.msg) }
+}
+
+// The text of every file in `dirs` whose name starts with one of `prefixes`, run
+// together, for a coverage check that only asks whether a call appears. A directory that
+// cannot be listed stops the run.
+export function casesText(
+  dirs: readonly string[],
+  prefixes: readonly string[],
+): string {
+  const parts: string[] = []
+  for d in dirs {
+    const names = listDir(d)
+    if names is IoError {
+      fail("cannot list " + d + ": " + names.msg)
+      return ""
+    }
+    for f in names {
+      let keep = false
+      for p in prefixes {
+        if startsWith(f, p) { keep = true }
+      }
+      if !keep { continue }
+      const t = readTextFile(d + "/" + f)
+      if t is IoError {
+        fail("cannot read " + d + "/" + f + ": " + t.msg)
+        return ""
+      }
+      parts.push(t)
+    }
+  }
+  join(parts, "")
+}
+
+// The case directories a coverage check reads: `root/sub`, and the checkout's own when
+// `--out` moved the generated files, since hand-written cases there also count.
+export function coverageDirs(root: string, sub: string): string[] {
+  if root == "tests/cases" { return [root + "/" + sub] }
+  [root + "/" + sub, "tests/cases/" + sub]
+}
+
+// ── IEEE-754 from bit patterns ────────────────────────────────────────────────────────
+
+// The index of the highest set bit of a positive `v`.
+function highBit(v: i64): i32 {
+  let p = 0
+  while p < 63 && (v >>> ((p + 1) as i64)) != 0 { p = p + 1 }
+  p
+}
+
+// `sig >> shift` rounded to nearest, ties to even; `shift` in 1..63.
+function roundShift(sig: i64, shift: i32): i64 {
+  if shift >= 64 { return 0 }
+  const q = sig >>> (shift as i64)
+  const r = sig & (pow2(shift) - 1)
+  const half = pow2(shift - 1)
+  if r > half || (r == half && (q & 1) == 1) { return q + 1 }
+  q
+}
+
+const CANON32: i64 = 0x7FC00000
+const CANON64: i64 = 0x7FF8000000000000
+
+// f32 bits widened to f64 bits, exactly; any NaN becomes the positive canonical one.
+export function promoteBits(b: i64): i64 {
+  const sign = ((b >>> 31) & 1) << 63
+  const e = (b >>> 23) & 0xFF
+  const m = b & 0x7FFFFF
+  if e == 0xFF {
+    if m != 0 { return CANON64 }
+    return sign | 0x7FF0000000000000
+  }
+  if e == 0 {
+    if m == 0 { return sign }
+    const p = highBit(m)
+    const frac = (m << ((52 - p) as i64)) & (pow2(52) - 1)
+    return sign | (((p - 149 + 1023) as i64) << 52) | frac
+  }
+  sign | ((e - 127 + 1023) << 52) | (m << 29)
+}
+
+// f64 bits narrowed to f32 bits, rounding to nearest-even, overflowing to infinity and
+// underflowing through the subnormals; any NaN becomes the positive canonical one.
+export function demoteBits(b: i64): i64 {
+  const sign = ((b >>> 63) & 1) << 31
+  const e = ((b >>> 52) & 0x7FF) as% i32
+  const m = b & (pow2(52) - 1)
+  if e == 0x7FF {
+    if m != 0 { return CANON32 }
+    return sign | 0x7F800000
+  }
+  if e == 0 { return sign }
+  let ex = e - 1023
+  const sig = m | pow2(52)
+  if ex < -126 { return sign | roundShift(sig, 29 + (-126 - ex)) }
+  let q = roundShift(sig, 29)
+  if q == pow2(24) {
+    q = pow2(23)
+    ex = ex + 1
+  }
+  if ex > 127 { return sign | 0x7F800000 }
+  sign | (((ex + 127) as i64) << 23) | (q - pow2(23))
+}
+
+// The f64 bits of the integer `v`, which must be below 2^53 in magnitude (exact).
+export function intToF64Bits(v: i64): i64 {
+  if v == 0 { return 0 }
+  let sign: i64 = 0
+  let mag = v
+  if v < 0 {
+    sign = pow2(63)
+    mag = 0 - v
+  }
+  const p = highBit(mag)
+  sign
+    | (((p + 1023) as i64) << 52)
+    | ((mag << ((52 - p) as i64)) & (pow2(52) - 1))
+}
+
+// The f32 bits of the integer `v` (below 2^62 in magnitude), rounding to nearest-even.
+export function intToF32Bits(v: i64): i64 {
+  if v == 0 { return 0 }
+  let sign: i64 = 0
+  let mag = v
+  if v < 0 {
+    sign = pow2(31)
+    mag = 0 - v
+  }
+  let p = highBit(mag)
+  if p <= 23 {
+    return sign
+      | (((p + 127) as i64) << 23)
+      | ((mag << ((23 - p) as i64)) & (pow2(23) - 1))
+  }
+  let q = roundShift(mag, p - 23)
+  if q == pow2(24) {
+    q = pow2(23)
+    p = p + 1
+  }
+  sign | (((p + 127) as i64) << 23) | (q - pow2(23))
+}
+
+// The saturating truncation of a float, given as its bits (`isF32` picks the format), to a
+// `width`-bit integer of the given signedness, wrapped to `width` bits: NaN is 0 and an
+// out-of-range value, infinities included, clamps to the result's bound.
+export function truncSatBits(
+  b: i64,
+  isF32: boolean,
+  width: i32,
+  signed: boolean,
+): i64 {
+  let mbits = 52
+  let bias = 1023
+  let emax = 0x7FF
+  let neg = ((b >>> 63) & 1) == 1
+  if isF32 {
+    mbits = 23
+    bias = 127
+    emax = 0xFF
+    neg = ((b >>> 31) & 1) == 1
+  }
+  const e = ((b >>> (mbits as i64)) & (emax as i64)) as% i32
+  const m = b & (pow2(mbits) - 1)
+  if e == emax && m != 0 { return 0 }
+  let hi = pow2(width) - 1
+  let lo: i64 = 0
+  if signed {
+    hi = pow2(width - 1) - 1
+    lo = 0 - pow2(width - 1)
+  }
+  if width == 64 && !signed { hi = -1 }
+  const ex = e - bias
+  if e == emax || (signed && ex >= width - 1) || (!signed && ex >= width) {
+    if neg { return wrapBits(lo, width) }
+    return wrapBits(hi, width)
+  }
+  if ex < 0 || (neg && !signed) { return 0 }
+  const sig = m | pow2(mbits)
+  let mag = sig >>> ((mbits - ex) as i64)
+  if ex >= mbits { mag = sig << ((ex - mbits) as i64) }
+  if neg { return wrapBits(0 - mag, width) }
+  wrapBits(mag, width)
+}
+
+// Whether float `a` < float `b`, both given as bits: false when either is NaN, and +0 and
+// -0 compare equal.
+export function floatLt(a: i64, b: i64, isF32: boolean): boolean {
+  let signBit = pow2(63)
+  let inf: i64 = 0x7FF0000000000000
+  if isF32 {
+    signBit = pow2(31)
+    inf = 0x7F800000
+  }
+  const ma = a & (signBit - 1)
+  const mb = b & (signBit - 1)
+  if ma > inf || mb > inf { return false }
+  let ka = ma
+  if (a & signBit) != 0 { ka = 0 - ma }
+  let kb = mb
+  if (b & signBit) != 0 { kb = 0 - mb }
+  ka < kb
+}
+
+// ── reading a built module ────────────────────────────────────────────────────────────
+
+export type Leb = { v: i32, next: i32 }
+
+// The unsigned LEB128 at `i` and the index after it.
+export function leb(data: readonly i32[], i: i32): Leb {
+  let v = 0
+  let shift = 0
+  let j = i
+  while true {
+    const b = data[j]
+    v = v | ((b & 0x7F) << shift)
+    j = j + 1
+    shift = shift + 7
+    if b < 0x80 { break }
+  }
+  { v: v, next: j }
+}
+
+// The payload of the module's code section; stops the run when there is none.
+export function codeSection(data: readonly i32[]): i32[] {
+  let i = 8
+  while i < data.length {
+    const sid = data[i]
+    const s = leb(data, i + 1)
+    if sid == 10 { return data.slice(s.next, s.next + s.v) }
+    i = s.next + s.v
+  }
+  fail("no code section")
+  []
+}
+
+export type Built = { wasm: i32[], dis: string }
+
+function run(cmd: string, args: string[]): string {
+  const r = runProgram(cmd, args)
+  if r is IoError {
+    fail(cmd + ": " + r.msg)
+    return ""
+  }
+  const err = decodeUtf8(r.stderr)
+  if err is string && err.length > 0 { print(trim(err)) }
+  if r.code != 0 { fail(cmd + " exited " + toString(r.code)) }
+  const out = decodeUtf8(r.stdout)
+  if out is Utf8Error {
+    fail(cmd + " printed text that is not UTF-8")
+    return ""
+  }
+  out
+}
+
+// Builds `src` with `$VL` (else the checkout's binary) and the checkout's seed in a temp
+// directory, and answers the module's bytes and `wasm-dis` text under `disFlags`.
+export function buildAndDisassemble(src: string, disFlags: string[]): Built {
+  const dir = trim(run("mktemp", ["-d"]))
+  const srcPath = dir + "/all.vl"
+  const wasmPath = dir + "/all.wasm"
+  writeOrDie(srcPath, src)
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  run(
+    vl,
+    ["build", srcPath, "--compiler", "build/vl-compiler.wasm", "-o", wasmPath],
+  )
+  const bytes = readFile(wasmPath)
+  const disArgs = [wasmPath]
+  for f in disFlags { disArgs.push(f) }
+  const dis = run("node_modules/.bin/wasm-dis", disArgs)
+  run("rm", ["-rf", dir])
+  if bytes is IoError {
+    fail("cannot read " + wasmPath + ": " + bytes.msg)
+    return { wasm: [], dis: "" }
+  }
+  const wasm: i32[] = []
+  for b in bytes { wasm.push(b as i32) }
+  { wasm: wasm, dis: dis }
+}
+
+function isWord(b: i32): boolean {
+  (b >= 48 && b <= 57)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+}
+
+// One alternative of a `\((...)` search: a literal `prefix`, then `tail` 0 (nothing),
+// 1 (`\w+`) or 2 (`[\w.]+`).
+export type NameAlt = { prefix: string, tail: i32 }
+
+// Every name `(` introduces in `text` that matches one alternative, in order, as
+// Python's `re.findall` over the alternation would answer them.
+export function findNames(text: string, alts: readonly NameAlt[]): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < text.length {
+    if text[i] != 40 {
+      i = i + 1
+      continue
+    }
+    let hit = ""
+    for a in alts {
+      if hit != "" { break }
+      const s = i + 1
+      if s + a.prefix.length > text.length { continue }
+      if text.slice(s, s + a.prefix.length) != a.prefix { continue }
+      let j = s + a.prefix.length
+      if a.tail != 0 {
+        while (
+          j < text.length
+          && (isWord(text[j]) || (a.tail == 2 && text[j] == 46))
+        ) {
+          j = j + 1
+        }
+        if j == s + a.prefix.length { continue }
+      }
+      hit = text.slice(s, j)
+    }
+    if hit != "" {
+      out.push(hit)
+      i = i + 1 + hit.length
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Python's `repr` of a list of string pairs, for the failure message.
+export function pairsRepr(xs: readonly string[][]): string {
+  const parts: string[] = []
+  for p in xs { parts.push("('" + p[0] + "', '" + p[1] + "')") }
+  "[" + join(parts, ", ") + "]"
+}
