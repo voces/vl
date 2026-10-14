@@ -1,5 +1,7 @@
 # The D93 / D94 grid, and its ablation
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 300-cell CLAIMANT-PAIR grid that closed `silent-class-inventory.md` **D93 and D94**.
 Kept because the closing numbers in that document — **33 moved, 0 backward, silent 33 → 0**
 — and the composition verdict are only claims if the population cannot be re-run.

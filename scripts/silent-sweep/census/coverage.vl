@@ -1,0 +1,164 @@
+// Re-derive the census's coverage claim from the cells that were actually generated.
+//
+//     vl run scripts/silent-sweep/census/coverage.vl -- <celldir> [<celldir> ...]
+//
+// The generator states a pairwise guarantee; this reads the manifests back and checks it.
+// Prints the levels present per axis, every pair of axis values no cell contains, and the
+// full crossings of the axis groups that have interacted before. Over the first twelve axes
+// only: `annpat` is not one the generator crosses. Run from the checkout root.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join } from "std:str"
+import { JsonMap, die } from "../../lib/common"
+import { padLeft, padRight } from "../../lib/corpus"
+import {
+  AX,
+  axis,
+  distinctSorted,
+  manifestCoords,
+  pyTuple,
+} from "../../lib/census-read"
+
+// The distinct joins of `axes` over `coords`.
+function crossing(coords: JsonMap[], axes: string[]): Set<string> {
+  const out: Set<string> = Set()
+  for c in coords {
+    const v: string[] = []
+    for a in axes { v.push(axis(c, a)) }
+    out.add(join(v, "\t"))
+  }
+  out
+}
+
+function distinctCount(coords: JsonMap[], axes: string[]): i32 {
+  const seen: Set<string> = Set()
+  let n = 0
+  for c in coords {
+    const v: string[] = []
+    for a in axes { v.push(axis(c, a)) }
+    const k = join(v, "\t")
+    if !seen.has(k) {
+      seen.add(k)
+      n = n + 1
+    }
+  }
+  n
+}
+
+function main(args: string[]): i32 {
+  const ax = AX.slice(0, 12)
+  const coords: JsonMap[] = []
+  for d in args {
+    for _, co in manifestCoords(d) { coords.push(co) }
+  }
+  print(
+    "cells generated across \{toString(args.length)} blocks: \{toString(coords.length)}",
+  )
+
+  const levels: Map<string, string[]> = Map()
+  for a in ax {
+    const vals: string[] = []
+    for c in coords { vals.push(axis(c, a)) }
+    levels[a] = distinctSorted(vals)
+  }
+  print("")
+  print("== levels present per axis ==")
+  for a in ax {
+    const l = levels[a] ?? []
+    print(
+      "  \{padRight(a, 9)} \{padLeft(toString(l.length), 2)}  \{join(l, " ")}",
+    )
+  }
+
+  const missing: string[] = []
+  let total = 0
+  let i = 0
+  while i < ax.length {
+    let j = i + 1
+    while j < ax.length {
+      const a = ax[i]
+      const b = ax[j]
+      const seen = crossing(coords, [a, b])
+      const la = levels[a] ?? []
+      const lb = levels[b] ?? []
+      total = total + la.length * lb.length
+      for va in la {
+        for vb in lb {
+          if !seen.has(va + "\t" + vb) {
+            missing.push("\{a}=\{va} x \{b}=\{vb}")
+          }
+        }
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  print("")
+  print("== pairwise coverage over the levels actually present ==")
+  print(
+    "  covered \{toString(total - missing.length)} / \{toString(total)} pairs   (\{toString(missing.length)} missing)",
+  )
+  if missing.length > 0 {
+    print("  missing pairs:")
+    for m in missing { print("     " + m) }
+  }
+
+  const g4 = ["twin", "union", "claim", "store"]
+  print("")
+  print("== full crossing of twin x union x claim x store ==")
+  const q = crossing(coords, g4)
+  let want = 1
+  for a in g4 { want = want * (levels[a] ?? []).length }
+  const all4: string[][] = []
+  for t in levels["twin"] ?? [] {
+    for u in levels["union"] ?? [] {
+      for c in levels["claim"] ?? [] {
+        for s in levels["store"] ?? [] { all4.push([t, u, c, s]) }
+      }
+    }
+  }
+  const missq: string[][] = []
+  for t in all4 {
+    if !q.has(join(t, "\t")) { missq.push(t) }
+  }
+  print(
+    "  \{toString(distinctCount(coords, g4))} / \{toString(want)} combinations present",
+  )
+  for t in missq { print("     missing " + pyTuple(t)) }
+
+  print("")
+  print("== full crossing of twin x union x claim x store x escope ==")
+  const n5 = distinctCount(
+    coords,
+    ["twin", "union", "claim", "store", "escope"],
+  )
+  print(
+    "  \{toString(n5)} combinations present (20 of the 5x4 store x escope pairs have no spelling for 4 of them, so the ceiling is \{toString(5 * 3 * 3 * 16)})",
+  )
+
+  const g44 = ["cont", "annpos", "deliv", "pval"]
+  print("")
+  print("== full crossing of cont x annpos x deliv x pval ==")
+  let want4 = 1
+  for a in g44 { want4 = want4 * (levels[a] ?? []).length }
+  print(
+    "  \{toString(distinctCount(coords, g44))} / \{toString(want4)} combinations present",
+  )
+
+  print("")
+  print("== full crossing of rep x cont ==")
+  const n2 = distinctCount(coords, ["rep", "cont"])
+  const want2 = (levels["rep"] ?? []).length * (levels["cont"] ?? []).length
+  print("  \{toString(n2)} / \{toString(want2)} combinations present")
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("coverage: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

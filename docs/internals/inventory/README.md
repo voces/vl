@@ -67,7 +67,7 @@ value** against an expectation computed independently of the compiler. Nothing h
 inherited from an earlier filing. Where an earlier filing is contradicted, the
 contradiction is stated in "Not a defect".
 
-The sweep is reproducible: `scripts/silent-sweep/gen.py` (main grid), `genorder.py`
+The sweep was reproducible (its Python since deleted): `scripts/silent-sweep/gen.py` (main grid), `genorder.py`
 (declaration-order grid), `sabotage.py` (grader proof), `sweep.sh` (bounded runner, four
 concurrent `vl` invocations), `grade.vl` (classifier), `counts.py` / `pivot.py` (tallies).
 
@@ -281,7 +281,7 @@ statements at module top level, with no enclosing function and no call.
 
 **THE PAIRED RESULT, which is the only number that answers the question.** A module-scope
 grid's absolute silent count means nothing on its own, because its population is not the
-function-scope one. `scripts/silent-sweep/pairscope.py` compares the SAME
+function-scope one. `scripts/silent-sweep/pairscope.py` (since deleted) compared the SAME
 (leg, rep, nul, pos, con, read, inp, spell) coordinate at both scopes, so exactly one thing
 differs between a cell and its control:
 
@@ -329,10 +329,10 @@ and after the fix: `sabotage.py` → **12 wrong_value / 8 wrong_evalcount / 6 tr
 correct**, exactly as published. A zero in a silent column is worth nothing until that column
 has been made to fire on demand.
 
-    python3 scripts/silent-sweep/gen.py       <cells>            # --scopes fn,mod (default)
+    python3 scripts/silent-sweep/gen.py       <cells>            # --scopes fn,mod (default); since deleted
     bash    scripts/silent-sweep/sweep.sh     <cells> <res>      # still xargs -P4
     vl run  scripts/silent-sweep/grade.vl  -- <cells> <res> --csv scope.csv
-    python3 scripts/silent-sweep/pairscope.py scope.csv
+    python3 scripts/silent-sweep/pairscope.py scope.csv   # since deleted
 
 ---
 

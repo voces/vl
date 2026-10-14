@@ -6,6 +6,12 @@ the graded records of the runs the inventory reports.
 
 Findings live in `docs/internals/silent-class-inventory.md`.
 
+<!-- paths-as-of: 2026-10-14 --> The Python this page runs (`gen.py`, `genorder.py`,
+`pairscope.py`, `counts.py`, `final.py`, `verify.py`, `pivot.py`, `pivotG.py`, `mkrepro.py`,
+`summ.py`) was deleted with the rest of the silent-sweep Python (architecture-refactor-plan
+T3). The page records how the 2026-08 sweep was run; its standing successor is
+`scripts/silent-sweep/distilled/regress.vl`.
+
 ## Resource discipline
 
 `sweep.sh` fans **exactly four** concurrent `vl` invocations (`xargs -P4`) and nothing here

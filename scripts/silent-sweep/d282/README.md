@@ -1,5 +1,7 @@
 # The D282 grid — the ANONYMOUS claimant of a union arm's layout
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 324-cell grid that measured `silent-class-inventory.md` **D282** and priced **D281**.
 
 ```sh
@@ -43,13 +45,13 @@ price nothing could see is exactly the rung a later grid should be asked about.
 Their coordinates are `scripts/silent-sweep/census/d282-d281-price.json`:
 
 ```sh
-python3 scripts/silent-sweep/d243/mkset.py /tmp/price \
+vl run scripts/silent-sweep/census/mkset.vl -- /tmp/price \
     scripts/silent-sweep/census/d282-d281-price.json /tmp/d282cells
 JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/price <seed.wasm> /tmp/p.json
 ```
 
 The histogram must read `runs 36` and nothing else — 36 `vl` invocations rather than a grid.
-`gen282.py` writes the `manifest.json` both that grader and `mkset.py`'s staleness check read;
+`gen282.py` writes the `manifest.json` both that grader and `mkset.vl`'s staleness check read;
 the expectation in it is the GENERATOR's, never a compiler's.
 
 ## Axes

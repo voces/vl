@@ -160,7 +160,7 @@ times — on today's compiler those cells behave exactly like their class-mates,
 them worth keeping is what a *candidate* did to them, which nothing reading current behaviour
 can see. **Every refused candidate that named its price is a named set**, and the price is the
 thing worth keeping: it stops the next person paying it again without noticing. Commit the
-coordinate JSON under `scripts/silent-sweep/census/`, materialise with `d243/mkset.py`, and add
+coordinate JSON under `scripts/silent-sweep/census/`, materialise with `census/mkset.vl`, and add
 the cells to `distilled/named/` so the standing gate carries them.
 
 Two habits the full runs earned, still worth keeping: report `runs → not-runs` and `→ silent`

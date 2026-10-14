@@ -1,5 +1,7 @@
 # The D75 / D81 / D82 grid, and its ablation
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 3,144-cell grid that closed `silent-class-inventory.md` **D75, D81, D82 and D87**. Kept
 because the closing numbers in that document — **456 moved, 0 backward, silent 306 → 0** —
 and the five-way root split are only claims if the population cannot be re-run.

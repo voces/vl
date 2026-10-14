@@ -53,7 +53,7 @@ The full cross is 217,728,000 cells. The census is a fractional design in five b
 | **E** | `order` and `pval` crossed EXHAUSTIVELY against the nominal ingredients, so every cell has its exact twin | 19,224 |
 | | **total** | **250,238** |
 
-`coverage.py` re-derives the guarantee from the manifests rather than asserting it:
+`coverage.vl` re-derives the guarantee from the manifests rather than asserting it:
 
 * **2,185 of 2,217 axis-value pairs covered.** All 32 missing pairs are structurally
   impossible and are listed by name (a local has no module-scope spelling; only the `nul`
@@ -142,17 +142,16 @@ correct**, exactly as `REPRODUCE.md` publishes.
           scratch-silent/census/cells$B build/vl-compiler.wasm scratch-silent/census/$B.json
     done
 
-    python3 scripts/silent-sweep/census/coverage.py scratch-silent/census/cells{A,B,C,D,E}
-    python3 scripts/silent-sweep/census/families.py  <celldir> <json> ...
-    python3 scripts/silent-sweep/census/siblings.py  <celldir> <json> ...
-    python3 scripts/silent-sweep/census/rescue.py    <celldir> <json> ...
-    python3 scripts/silent-sweep/census/rows.py      <celldir> <json> ...
+    vl run scripts/silent-sweep/census/coverage.vl -- scratch-silent/census/cells{A,B,C,D,E}
+    vl run scripts/silent-sweep/census/families.vl -- <celldir> <json> ...
+    vl run scripts/silent-sweep/census/siblings.vl -- <celldir> <json> ...
+    vl run scripts/silent-sweep/census/rescue.vl --   <celldir> <json> ...
 
 `JOBS` defaults to 4 and nothing here raises it (`vl check` peaks around 650 MB RSS). The
 cell programs and result files are NOT committed — 250,238 files, ~180 MB; everything
 regenerates. Total wall time at `JOBS=4` is about 35 minutes.
 
-## Grading a MERGED change — the after-pass protocol (`delta.py`)
+## Grading a MERGED change — the after-pass protocol (`delta.vl`)
 
 An after-pass asks a different question from the census itself: not *how large is the surface*
 but *did this change move anything the wrong way*. Two rules, both learned by getting them
@@ -168,18 +167,18 @@ a trap of its own: `git checkout <sha> -- compiler/` STAGES those files, so it n
 
 **Generate the cells ONCE and grade that one directory against every seed.** Two directories
 generated at two commits are two populations, and a per-cell diff across them is meaningless.
-`delta.py` refuses to paper over this: it matches cells by name and prints a POPULATION
+`delta.vl` refuses to paper over this: it matches cells by name and prints a POPULATION
 MISMATCH line if either side has a cell the other lacks.
 
     for S in <sha1> <sha2>; do ... build seed from that commit ... ; done
     python3 scripts/silent-sweep/census/gencensus.py scratch-silent/census/cellsA --block A
     JOBS=4 vl run .../gradecensus.vl -- scratch-silent/census/cellsA seed-<sha1>.wasm before.json
     JOBS=4 vl run .../gradecensus.vl -- scratch-silent/census/cellsA seed-<sha2>.wasm after.json
-    python3 scripts/silent-sweep/census/delta.py scratch-silent/census/cellsA before.json after.json
+    vl run scripts/silent-sweep/census/delta.vl -- scratch-silent/census/cellsA before.json after.json
 
 **Read the transition matrix, not the two histograms.** A per-class count is a NET: a block can
 hold its silent total exactly while cells fall out of `runs` and different cells fall in.
-`delta.py` leads with the two numbers a merged change can be invalidated by — `runs` LOST and
+`delta.vl` leads with the two numbers a merged change can be invalidated by — `runs` LOST and
 moved INTO a silent class — and only then prints the matrix. Block A's own after-pass is why the
 second number is reported separately: it lost **0** `runs` and still moved **12** cells from a
 loud emit reject into check-clean invalid wasm, which the histograms hid entirely (the loud
@@ -302,9 +301,9 @@ without re-running 150,224 cells — it is how this row was confirmed live on `e
 **The named sets live here.** A per-row grid works the same way once it has named its movers:
 `d243-moved.json` is the 79 cells D243/D244/D200's landing moved (every one `-> runs`, so a
 later seed that does not run one of them has LOST it), materialised by
-`scripts/silent-sweep/d243/mkset.py` and graded by `gradecensus.vl` like any other block in
+`scripts/silent-sweep/census/mkset.vl` and graded by `gradecensus.vl` like any other block in
 ~158 invocations. A named set is a list of COORDINATES the generator reproduces, never a copy
-of its output — `mkset.py` re-checks each name against the grid's own manifest and refuses if
+of its output — `mkset.vl` re-checks each name against the grid's own manifest and refuses if
 the generator has changed under it, which is the drift a committed copy would hide.
 
 **A named set is not the after-pass and does not stand in for it.** It answers "did the cells
@@ -319,7 +318,7 @@ marker, so the common cell costs two process spawns.
 
 ## RESULT — the axes that MOVE an outcome, and the ones that do not
 
-`siblings.py` compares every pair of graded coordinates differing in EXACTLY ONE axis:
+`siblings.vl` compares every pair of graded coordinates differing in EXACTLY ONE axis:
 
 | axis | compared | outcome differs | rate | → silent | → loud |
 |---|---|---|---|---|---|
@@ -348,7 +347,7 @@ far more often than into or out of `runs`. It is worth one level, not four.
 
 Named and counted, because a silent cap reads as "covered everything":
 
-1. **32 axis-value pairs are structurally impossible** and are printed by `coverage.py`.
+1. **32 axis-value pairs are structurally impossible** and are printed by `coverage.vl`.
 2. ~~**`claim` × list-outermost containers × an inline-object payload** is unreachable: the
    alias spelling does not parse past one `[]` and the alias is not assignable from its own
    structural type.~~ **CLOSED 2026-08-28 (#1992, D188).** Both limits were one defect and

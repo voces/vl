@@ -1,5 +1,7 @@
 # The BOX-vs-ARM grids — the axes D243 / D244 / D200 turn on, crossed
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 3,360 cells in two blocks. Built 2026-08-27 for the PR that closed **D243**, **D244** and
 **D200**, and kept because the closing numbers below are only a claim if the population
 cannot be re-run.
@@ -9,10 +11,10 @@ python3 scripts/silent-sweep/d243/genbox.py /tmp/gridP --block P   # 3,200 cells
 python3 scripts/silent-sweep/d243/genbox.py /tmp/gridQ --block Q   #   160 cells
 
 JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridP <seed.wasm> /tmp/P.json
-python3 scripts/silent-sweep/census/delta.py /tmp/gridP <before.json> <after.json>
+vl run scripts/silent-sweep/census/delta.vl -- /tmp/gridP <before.json> <after.json>
 ```
 
-`gradecensus.py` and `delta.py` are reused verbatim — each takes the seed as an argument and
+`gradecensus.vl` and `delta.vl` are reused verbatim — each takes the seed as an argument and
 reads the generator's `manifest.json` for the expectation, so both sides of a delta are
 measured with ONE host binary and no tree switching, and the outcome vocabulary is the
 census's. **The expectation is computed by the GENERATOR, never by the compiler**: every cell
@@ -109,7 +111,7 @@ the population you happen to have built is not thereby inert.
 them `-> runs`. It re-grades against any new seed in ~158 `vl` invocations:
 
 ```sh
-python3 scripts/silent-sweep/d243/mkset.py /tmp/moved \
+vl run scripts/silent-sweep/census/mkset.vl -- /tmp/moved \
     scripts/silent-sweep/census/d243-moved.json /tmp/gridP /tmp/gridQ
 JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/moved <seed.wasm> /tmp/m.json
 ```

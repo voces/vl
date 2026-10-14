@@ -1,0 +1,193 @@
+// Materialise a named cell set into its own cell directory, so it re-grades on a new seed
+// without regenerating or re-running the grid it came from.
+//
+//     vl run scripts/silent-sweep/census/mkset.vl -- <outdir> <set.json> <griddir> [<griddir> ...]
+//     JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- <outdir> <seed.wasm> <out.json>
+//
+// A set is `{cells: {name: {coord, ...}}}` under `census/`. Each named cell is copied from
+// the grid whose manifest holds it, with its `expect` and coordinate; the new manifest's
+// `block` is the set's file name without `.json`. Refuses, exit 1, when a grid's coordinate
+// differs from the set's (the generator moved and the set is stale) or a name is in no grid.
+
+import { IoError, readFile, writeFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, split } from "std:str"
+import { Json } from "std:json"
+import { JsonMap, die } from "../../lib/common"
+import {
+  dumpJson,
+  parseOrDie,
+  pyRepr,
+  readText,
+  sortStrings,
+  spawn,
+  writeText,
+} from "../../lib/corpus"
+import { pathJoin } from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/mkset.vl -- <outdir> <set.json> <griddir> [<griddir> ...]"
+
+function readMap(path: string): JsonMap {
+  const j = parseOrDie(readText(path), path)
+  if j is JsonMap { return j }
+  die("mkset: \{path} is not a JSON object", 1)
+  const none: JsonMap = Map()
+  none
+}
+
+function sub(m: JsonMap, key: string): JsonMap {
+  const v = m[key] ?? null
+  if v is JsonMap { return v }
+  const none: JsonMap = Map()
+  none
+}
+
+// Python's `==` on two decoded JSON values: maps compare as key sets, lists in order.
+function same(a: Json, b: Json): boolean {
+  if a is JsonMap {
+    if b is JsonMap {
+      let n = 0
+      for k, v in a {
+        n = n + 1
+        const w = b[k]
+        if w == null && v != null { return false }
+        if !same(v, w ?? null) { return false }
+      }
+      let m = 0
+      for _ in b.values() { m = m + 1 }
+      return n == m
+    }
+    return false
+  }
+  if a is Json[] {
+    if b is Json[] {
+      if a.length != b.length { return false }
+      let i = 0
+      while i < a.length {
+        if !same(a[i], b[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    return false
+  }
+  if a is string {
+    if b is string { return a == b }
+    return false
+  }
+  if a is f64 {
+    if b is f64 { return a == b }
+    return false
+  }
+  if a is boolean {
+    if b is boolean { return a == b }
+    return false
+  }
+  b == null
+}
+
+// Python's `repr` of a decoded JSON value, as `%r` prints a coordinate.
+function repr(v: Json): string {
+  if v == null { return "None" }
+  if v is boolean {
+    if v { return "True" }
+    return "False"
+  }
+  if v is string { return pyRepr(v) }
+  if v is f64 { return dumpJson(v) }
+  if v is JsonMap {
+    const parts: string[] = []
+    for k, x in v { parts.push(pyRepr(k) + ": " + repr(x)) }
+    return "{" + join(parts, ", ") + "}"
+  }
+  const items: string[] = []
+  if v is Json[] {
+    for x in v { items.push(repr(x)) }
+  }
+  "[" + join(items, ", ") + "]"
+}
+
+function copy(from: string, to: string) {
+  const b = readFile(from)
+  if b is IoError {
+    die("mkset: cannot read \{from} (\{b.msg})", 1)
+    return
+  }
+  const w = writeFile(to, b)
+  if w != null { die("mkset: cannot write \{to} (\{w.msg})", 1) }
+}
+
+function main(args: string[]): i32 {
+  if args.length < 2 { die(USAGE, 2) }
+  const out = args[0]
+  const set = sub(readMap(args[1]), "cells")
+  const parts = split(args[1], "/")
+  let block = parts[parts.length - 1]
+  if (
+    block.length > 5
+    && block.slice(block.length - 5, block.length) == ".json"
+  ) {
+    block = block.slice(0, block.length - 5)
+  }
+  const mk = spawn("mkdir", ["-p", out])
+  if mk.code != 0 { die("mkset: cannot create \{out}: " + mk.err, 1) }
+
+  const expect: JsonMap = Map()
+  const coords: JsonMap = Map()
+  const found: Set<string> = Set()
+  let i = 2
+  while i < args.length {
+    const g = args[i]
+    const man = readMap(pathJoin(g, "manifest.json"))
+    const gc = sub(man, "coords")
+    const ge = sub(man, "expect")
+    for name, rec in set {
+      const have = gc[name]
+      if have == null { continue }
+      let want: Json = null
+      if rec is JsonMap { want = rec["coord"] ?? null }
+      if !same(have, want) {
+        const says = "set says \{repr(want)}, grid says \{repr(have)}"
+        die(
+          "\{name}: the generator no longer produces this coordinate — \{says}. The named set is stale; re-derive it rather than grading it.",
+          1,
+        )
+      }
+      copy(pathJoin(g, name + ".vl"), pathJoin(out, name + ".vl"))
+      expect[name] = ge[name] ?? null
+      coords[name] = have
+      found.add(name)
+    }
+    i = i + 1
+  }
+
+  const missing: string[] = []
+  for name, _ in set {
+    if !found.has(name) { missing.push(name) }
+  }
+  if missing.length > 0 {
+    die("not found in the grids given: " + join(sortStrings(missing), ", "), 1)
+  }
+
+  const n = expect.keys().length
+  const skips: JsonMap = Map()
+  const man: JsonMap = Map()
+  man["expect"] = expect
+  man["coords"] = coords
+  man["skips"] = skips
+  man["block"] = block
+  man["generated"] = n as f64
+  writeText(pathJoin(out, "manifest.json"), dumpJson(man))
+  print("materialised \{toString(n)} named cells into \{out}")
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("mkset: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
