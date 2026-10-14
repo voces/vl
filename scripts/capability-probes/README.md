@@ -1,6 +1,6 @@
 # Capability probes — the gaps the corpus cannot see
 
-`scripts/goal-scoreboard.py` measures the standing goal against the distilled corpus. The
+`scripts/goal-scoreboard.vl` measures the standing goal against the distilled corpus. The
 corpus is generated over a fixed set of axes, so **it can only score a gap it has a program
 for**, and `runs` can climb to 100% while a capability refusal stands untouched. Measured
 2026-08-30: **9 of the compiler's 14 capability message literals are reached by no corpus cell
@@ -10,12 +10,11 @@ This directory is the answer to that. One `.vl` per gap, each a program the type
 and codegen refuses. Every probe here **must eventually run**; until it does it is a standing
 clause-2 violation with a name.
 
-    python3 scripts/capability-probes/run.py
     scripts/vl-host/target/release/vl run scripts/capability-probes.vl \
-        --compiler build/vl-compiler.wasm --        # the VL port; the gate rows run this one
+        --compiler build/vl-compiler.wasm --        # the gate rows run this
 
-The port prints the same report and exits the same way, held to it byte for byte by
-`tests/vl_capability_probes_port_test.ts`; `run.py` stays because other scripts import it.
+It replaced `run.py` and prints its report byte for byte; the beside-run is pinned as
+goldens in `tests/vl_capability_probes_port_test.ts`.
 
 Exit 0 when every probe runs and prints what its header says. Non-zero names the ones that
 still refuse — which today is the point of the directory, so **it is not a merge gate.** It is
@@ -112,7 +111,7 @@ never descends into it.
 
 A probe earns its place by being reached by NO corpus cell. Check before adding:
 
-    python3 scripts/goal-scoreboard.py --sites | grep ZERO
+    vl run scripts/goal-scoreboard.vl -- --sites | grep ZERO
 
 Write the smallest program that reaches the refusal, put the expected output in a header
 comment, and name the file after the capability rather than after a row id — rows close, and
@@ -128,7 +127,7 @@ named file cannot.
 
 ## `live-sites.json` — the witness-backed count, beside the wording one
 
-`goal-scoreboard.py` has always counted the refusal literals whose SENTENCE concedes the
+`goal-scoreboard.vl` has always counted the refusal literals whose SENTENCE concedes the
 refused program was legal. **A refusal is not obliged to concede.** `emitProgram:
 fromCodePoints argument must be a named i32[] binding` fired on a `vl check`-clean program
 the whole time and matched no phrase, and #2665 closed it without the count moving by one in
@@ -139,7 +138,7 @@ either direction. Re-derived 2026-09-05: **517 of the compiler's 533 emit-side r
 literal, each naming a probe in this directory that reaches it, and the scoreboard prints
 both numbers with the wording one labelled as the lower bound it is.
 
-    python3 scripts/capability-probes/run.py --live-sites   # re-grade every row
+    vl run scripts/capability-probes.vl -- --live-sites # re-grade every row
     deno test -A --no-check tests/vl_live_sites_test.ts     # the structural half, in ms
 
 **It is a ratchet in one direction.** A row may only be ADDED with a probe that reaches its

@@ -1,35 +1,29 @@
-// THE VL PORT OF THE CAPABILITY-PROBE RUNNER AGREES WITH THE PYTHON, byte for byte.
+// THE CAPABILITY-PROBE RUNNER'S REPORT, PINNED to what the Python it replaced printed.
 //
-// `scripts/capability-probes.vl` ports `scripts/capability-probes/run.py`
-// (architecture-refactor-plan.md, T3). Both grade the probes at a fixed path under the
-// checkout with the checkout's own `vl`, so this builds a small checkout of their own —
-// the two scripts copied, `std/` and `build/` linked — whose `vl` is a STUB that answers
-// from directives in each probe. That is what reaches the outcomes no healthy seed can be
-// made to produce on demand: every verdict (RUNS, WRONG, check refuses, emit refuses,
-// SILENT, COMPILER TRAP, TIMEOUT before and after the check) and every `--live-sites` row
-// (LIVE, FELL, DRIFT, GONE, NOPROBE). It then requires the same stdout and exit code from
-// both for the default report, `--floor` and `--live-sites`, red and green; the fan-out
-// path (more probes than the port grades in-process) and the in-process one; a named
-// `--compiler`; and an empty probe directory. A one-word mutation of the port must red.
+// `scripts/capability-probes.vl` ported `scripts/capability-probes/run.py`
+// (architecture-refactor-plan.md, T3), and this suite graded the two BESIDE each other,
+// output for output, until the Python was deleted. Each golden under
+// `tests/fixtures/capability-probes-port/` is the PYTHON's stdout, stderr and exit code on
+// the last beside-run, with this suite's temp dirs and `std/` written as `@D@`, `@T@` and
+// `@S@`; the port printed every one byte for byte. The fixture is a small checkout whose
+// `vl` is a STUB answering from directives in each probe, which is what reaches the outcomes
+// no healthy seed produces on demand: every verdict (RUNS, WRONG, check refuses, emit
+// refuses, SILENT, COMPILER TRAP, TIMEOUT before and after the check), every `--live-sites`
+// row (LIVE, FELL, DRIFT, GONE, NOPROBE), red and green, the fan-out and in-process paths, a
+// named `--compiler` and an empty probe directory. A one-word mutation of the grader must red.
 //
-// The two TIMEOUT probes grade in a tree of their own under a 10 s bound; the rest under 60 s, which
-// only a starved machine could reach, so load cannot turn an answering probe into a TIMEOUT.
+// The two TIMEOUT probes grade in a tree of their own under a 10 s bound; the rest under 60 s,
+// which only a starved machine could reach, so load cannot turn an answering probe into one.
 //
-// Where they cannot agree, pinned below rather than left as prose:
-//   1. An argument error: both exit 2; the Python's argparse writes to stderr, the port's
+// Where they could not agree, pinned below rather than left as prose:
+//   1. An argument error: both exit 2; the Python's argparse wrote to stderr, the port's
 //      usage text goes to stdout, because VL has no stderr sink.
-//
+//   2. The usage and error lines name `capability-probes.vl`, where the Python's named
+//      `run.py`: a message naming a deleted script would be wrong.
+
 // @test-timing native
 
-import {
-  COMPILER,
-  exists,
-  nativeEnv,
-  pythonBin,
-  ROOT,
-  STD,
-  VL,
-} from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, STD, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -43,6 +37,7 @@ const dec = new TextDecoder();
 type Out = { code: number; out: string };
 
 const P = "scripts/capability-probes";
+const GOLD = `${ROOT}/tests/fixtures/capability-probes-port`;
 
 // The stub `vl`: `<cmd> <probe> --compiler <seed>`, answered from the probe's `//! <cmd>-…:`
 // lines. `@F@` is the probe's path, `@C@` the seed and `@S@` `$VL_STD`, so the
@@ -192,8 +187,11 @@ const tree = async (dir: string, probes: Record<string, string> = PROBES) => {
   await Deno.mkdir(`${dir}/scripts/vl-host/target/release`, {
     recursive: true,
   });
-  await Deno.copyFile(`${ROOT}/${P}/run.py`, `${dir}/${P}/run.py`);
   await Deno.copyFile(`${ROOT}/${P}.vl`, `${dir}/${P}.vl`);
+  await Deno.mkdir(`${dir}/scripts/lib`, { recursive: true });
+  for (const l of ["common.vl", "probe-grade.vl"]) {
+    await Deno.copyFile(`${ROOT}/scripts/lib/${l}`, `${dir}/scripts/lib/${l}`);
+  }
   await Deno.symlink(STD, `${dir}/std`);
   await Deno.symlink(`${ROOT}/build`, `${dir}/build`);
   const stub = `${dir}/scripts/vl-host/target/release/vl`;
@@ -220,7 +218,7 @@ const tree = async (dir: string, probes: Record<string, string> = PROBES) => {
 
 Deno.test({
   name:
-    "capability probes: the VL port prints the Python's report, byte for byte",
+    "capability probes: the runner prints the Python's pinned report, byte for byte",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({
@@ -246,27 +244,27 @@ Deno.test({
         }).output();
         return { code, out: dec.decode(stdout) + dec.decode(stderr) };
       };
-      const py = (argv: string[]) =>
-        spawn(pythonBin(), [`${P}/run.py`, ...argv]);
       const port = (argv: string[]) =>
         spawn(VL, ["run", `${P}.vl`, "--compiler", COMPILER, "--", ...argv]);
+      const norm = (s: string) =>
+        s.replaceAll(dirT, "@T@").replaceAll(dir, "@D@").replaceAll(STD, "@S@");
       const agree = async (label: string, argv: string[], want: number) => {
-        // Concurrent: neither runner writes to the tree, and a TIMEOUT case is mostly waiting.
-        const [p, v] = await Promise.all([py(argv), port(argv)]);
-        if (p.code !== v.code || p.out !== v.out) {
+        const slug = label.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "");
+        const gold = await Deno.readTextFile(`${GOLD}/${slug}.txt`);
+        const v = await port(argv);
+        const got = `exit ${v.code}\n` + norm(v.out);
+        if (got !== gold) {
           throw new Error(
-            `${label}: the port disagrees with the Python.\n` +
-              `want exit ${p.code}:\n${p.out}\ngot exit ${v.code}:\n${v.out}`,
+            `${label}: the runner disagrees with the Python's pinned report ` +
+              `(${GOLD}/${slug}.txt).\nwant:\n${gold}\ngot:\n${got}`,
           );
         }
-        if (p.code !== want) {
-          throw new Error(
-            `${label}: want exit ${want} from both, got ${p.code}:\n${p.out}`,
-          );
+        if (v.code !== want) {
+          throw new Error(`${label}: want exit ${want}, got ${v.code}:\n${v.out}`);
         }
-        return p.out;
+        return v.out;
       };
-      return { py, port, agree };
+      return { port, agree };
     };
     // The probes that never answer, in a tree of their own under the bound that lets them
     // time out. Mostly waiting, so they grade beside the rest rather than before it.
@@ -287,7 +285,7 @@ Deno.test({
       }
     };
     const rest = async () => {
-      const { py, port, agree } = runner(dir, FAST);
+      const { port, agree } = runner(dir, FAST);
       await tree(dir);
       const all = await agree("the report", [], 1);
       for (
@@ -320,17 +318,18 @@ Deno.test({
       await agree("a named --compiler", ["--compiler", `${dir}/other.wasm`], 1);
       await agree("--compiler=", ["--floor", `--compiler=${dir}/x.wasm`], 1);
 
-      // The must-red control: one verdict word changed in the port, in place, because the
+      // The must-red control: one verdict word changed in the grader, in place, because the
       // fan-out's workers are built from that path.
-      const src = await Deno.readTextFile(`${dir}/${P}.vl`);
+      const lib = `${dir}/scripts/lib/probe-grade.vl`;
+      const src = await Deno.readTextFile(lib);
       const bad = src.replace(
         'let where = "emit refuses"',
         'let where = "emit refused"',
       );
       if (bad === src) throw new Error("the mutation did not apply");
-      await Deno.writeTextFile(`${dir}/${P}.vl`, bad);
+      await Deno.writeTextFile(lib, bad);
       const m = await port([]);
-      await Deno.writeTextFile(`${dir}/${P}.vl`, src);
+      await Deno.writeTextFile(lib, src);
       if (m.out === all) {
         throw new Error(`a mutated port must disagree, and printed:\n${m.out}`);
       }
@@ -357,12 +356,14 @@ Deno.test({
       }
       await agree("no probes", [], 1);
 
-      // Disagreement 1: an argument error.
-      const pu = await py(["--nope"]);
+      // Disagreements 1 and 2: an argument error, on stdout, naming the VL script.
       const vu = await port(["--nope"]);
-      if (pu.code !== 2 || vu.code !== 2 || !vu.out.startsWith("usage:")) {
+      const wantU = "usage: capability-probes.vl [-h] [--compiler COMPILER] " +
+        "[--live-sites] [--floor]\n" +
+        "capability-probes.vl: error: unrecognized arguments: --nope\n";
+      if (vu.code !== 2 || vu.out !== wantU) {
         throw new Error(
-          `an unknown flag: want exit 2 from both, got ${pu.code} / ${vu.code}:\n${vu.out}`,
+          `an unknown flag: want exit 2 and\n${wantU}got exit ${vu.code}:\n${vu.out}`,
         );
       }
     };
