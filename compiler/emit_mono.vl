@@ -292,10 +292,10 @@ import {
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
+  fnFlowDeclPathPinSigs,
   fnFlowDeclPathSrcs,
   fnFlowDeclWritten,
   fnFlowLamPin,
-  fnFlowLetPinSigs,
   fnFlowReadGenFn,
   fnFlowReadWritten,
   fnFlowRespellLam,
@@ -10000,13 +10000,13 @@ function monoWrittenLetSeedFe(e: i32, ctx: i32): i32 {
 }
 
 // ── reads of a literal slot that holds one generic ──────────────────────────────────────────
-// A read of an element or field of an un-annotated `const` literal that nothing mutates, whose
-// slot the flow table says holds one module-scope generic and no write, is that generic by name:
-// the read is rewritten to it, so each read takes its own instance (fn-value-flow-design.md §(f)).
+// A read of an element or field of an un-annotated `const` literal nothing mutates, whose slot
+// the flow table says holds one generic and no write, is rewritten to that generic's name where
+// the name is in scope, so each read takes its own instance (fn-value-flow-design.md §(f)).
 let mfrParent: {[i32]: i32} = Map()
 let mfrUses: {[i32]: i32[]} = Map()
 let mfrNameCount: {[string]: i32} = Map()
-let mfrTopGen: {[i32]: boolean} = Map()
+let mfrGen: {[i32]: boolean} = Map()
 let mfrCand: {[i32]: boolean} = Map()
 let mfrVals: {[i32]: i32[]} = Map()
 let mfrValsState: {[i32]: i32} = Map()
@@ -10019,17 +10019,13 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrParent = Map()
   mfrUses = Map()
   mfrNameCount = Map()
-  mfrTopGen = Map()
+  mfrGen = Map()
   mfrCand = Map()
   mfrVals = Map()
   mfrValsState = Map()
   mfrDirty = Map()
   mfrAnnLits = Map()
   mfrAnnLets = []
-  for s in stmts {
-    // arena-tick exempt: a side table of this pass, not the arena
-    if monoFlowTyParamGen(s) { mfrTopGen[s] = true }
-  }
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -10182,6 +10178,8 @@ function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
     }
   } else if n is FuncDecl {
     monoFlowReadsName(n.fnName)
+    // arena-tick exempt: a side table of this pass, not the arena
+    if monoFlowTyParamGen(ix) { mfrGen[ix] = true }
   } else if n is Param {
     monoFlowReadsName(n.parName)
     if n.parType < 0 && n.parDefault < 0 && n.parOpt == 0 && n.parRest == 0 {
@@ -10202,7 +10200,7 @@ function monoFlowReadsName(nm: string) {
   0
 }
 
-// The module-scope generic function value node `v` names, as its declaration, when no other
+// The generic function value node `v` names, as its declaration, when no other
 // declaration shares its name, or when `v` is the checker's adapter lambda calling one; -1
 // otherwise.
 function monoFlowLeafGen(v: i32): i32 {
@@ -10217,7 +10215,7 @@ function monoFlowLeafGen(v: i32): i32 {
   }
   if !(n is Ident) { return -1 }
   const g = identDeclOf(v)
-  if !(mfrTopGen[g] ?? false) { return -1 }
+  if !(mfrGen[g] ?? false) { return -1 }
   if (mfrNameCount[n.identName] ?? 0) != 1 { return -1 }
   g
 }
@@ -10770,10 +10768,21 @@ function monoFlowIsWrite(x: i32): boolean {
   pn is Unary && (pn.unOp == "++" || pn.unOp == "--")
 }
 
-// Rewrites read node `x` in place to a name read of generic `g`.
+// Whether node `x` lies in the body of the function declaring generic `g`, or `g` is declared at
+// module scope: where the name `g` declares is in scope.
+function monoFlowInScope(x: i32, g: i32): boolean {
+  let o = mfrParent[g] ?? -1
+  while o >= 0 && !(P.nodes[o] is FuncDecl) { o = mfrParent[o] ?? -1 }
+  if o < 0 { return true }
+  let y = mfrParent[x] ?? -1
+  while y >= 0 && y != o { y = mfrParent[y] ?? -1 }
+  y == o
+}
+
+// Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope.
 function monoFlowReadSet(x: i32, g: i32) {
   const gd = P.nodes[g]
-  if !(gd is FuncDecl) { return 0 }
+  if !(gd is FuncDecl) || !monoFlowInScope(x, g) { return 0 }
   const n: Node = { identName: gd.fnName, pos: nodePos(x) }
   arenaSetNode(x, n)
   sidNoteNodeName(x, g)
@@ -10799,6 +10808,10 @@ function monoFlowSpreadSet(sp: i32, v: i32) {
   const host = P.nodes[hx]
   const src = P.nodes[v]
   if !(host is ArrayLit) || !(src is ArrayLit) { return 0 }
+  for se in src.arrElems {
+    const g = monoFlowLeafGen(unwrapParen(se))
+    if g >= 0 && !monoFlowInScope(sp, g) { return 0 }
+  }
   const out: i32[] = []
   for e in host.arrElems {
     if e == sp {
@@ -10992,16 +11005,13 @@ function monoPinSigWithRet(params: string, ret: i32): string {
   params + tyToEmitName(ret)
 }
 
-// Gives each field of the un-annotated `const` record `d` declared at `at` that holds a generic
-// function the type its calls `d.f(…)` give it, as `monoPinGenericList` does a list's elements:
-// the field's value and each write `d.f = v` are instanced at it. Declines unless every read of
-// the record is a field call, a field write, or a read of a field holding no generic function.
-function monoPinGenericRecord(d: LetDecl, at: i32, ctx: i32): i32 {
+// Instances each generic function a field of the un-annotated `const` record declared at `at` in
+// frame `ctx` holds, and each value a write `d.f = v` stores there, at the one signature the flow
+// table pins that field at (`monoDeclPathPins`); a field pinned at none or at two is left alone.
+function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
   if d.letInit < 0 || d.letKw != "const" { return 0 }
   const lit = P.nodes[d.letInit]
   if !(lit is ObjLit) { return 0 }
-  const hot: string[] = []
-  const vals: i32[] = []
   for fi in lit.objFields {
     const f = P.nodes[fi]
     if f is FieldInit {
@@ -11009,181 +11019,44 @@ function monoPinGenericRecord(d: LetDecl, at: i32, ctx: i32): i32 {
         monoListElemGenFe(f.fiValue, ctx) >= 0
         || monoWrittenLetSeedFe(f.fiValue, ctx) >= 0
       ) {
-        hot.push(f.fiName)
-        vals.push(f.fiValue)
+        if monoPinRecordField(at, f.fiName, f.fiValue, ctx) < 0 { return -1 }
       }
     }
-  }
-  if hot.length == 0 { return 0 }
-  const calls: i32[] = []
-  const writes: i32[] = []
-  if !monoRecordFieldUses(ctx, d.letName, at, hot, calls, writes) { return 0 }
-  let h = 0
-  while h < hot.length {
-    let sig = ""
-    let ft = -1
-    let split = false
-    const fcalls: i32[] = []
-    const insts: i32[] = []
-    const src = fnFlowDeclKidSrc(at, "f." + hot[h])
-    for c in calls {
-      const call = P.nodes[c]
-      if call is Call {
-        const m = P.nodes[call.callFn]
-        if m is Member {
-          if m.memProp == hot[h] {
-            const ret = nodeTyIxOf(c)
-            if ret < 0 || ret >= T.tys.length || tyHasTyVar(ret) { return 0 }
-            let g = monoListElemGenFe(vals[h], ctx)
-            const own = monoFeIsSrc(g, src)
-            if g < 0 { g = monoWrittenLetSeedFe(vals[h], ctx) }
-            if g < 0 { return 0 }
-            monoLastInstFe = -1
-            if monoInstantiate(g, c, ctx) < 0 { return -1 }
-            if monoLastInstFe < 0 { return 0 }
-            fcalls.push(c)
-            if own { insts.push(monoLastInstFe) } else { insts.push(-1) }
-            const one = monoPinSigWithRet(monoSlotSig(monoLastInstFe), ret)
-            if ft < 0 {
-              ft = monoPinSubTyOf(nodeTyIxOf(vals[h]), fnStmts[monoLastInstFe])
-            }
-            if sig == "" { sig = one }
-            else if sig != one { split = true }
-          }
-        }
-      }
-    }
-    if split && !monoCallsPerRead(fcalls, insts) {
-      return emitFailAt(
-        "emitProgram: a record field holding a generic function is called at more than "
-          + "one argument type — one field holds one function value, and calls through "
-          + "it want two. Annotate the field's function type, or bind a separate value "
-          + "per type",
-        vals[h],
-      )
-    }
-    if sig != "" {
-      if !monoTyConcreteFn(ft) { return 0 }
-      const semi = sig.indexOf(";")
-      const fty = monoSigFnTyName(sig.slice(0, semi + 1))
-      const arrow = fty.indexOf("=>")
-      if arrow < 0 { return 0 }
-      const ann = fty.slice(0, arrow) + "=> " + sig.slice(semi + 1, sig.length)
-      if monoCoerceFnValueName(vals[h], ann, ctx, -1) < 0 { return -1 }
-      const vt = nodeTyIxOf(vals[h])
-      if vt < 0 || tyHasTyVar(vt) { nodeTyRecord(vals[h], ft) }
-      for c in calls {
-        const call = P.nodes[c]
-        if call is Call {
-          const m = P.nodes[call.callFn]
-          if m is Member {
-            if m.memProp == hot[h] { nodeTyRecord(call.callFn, ft) }
-          }
-        }
-      }
-      for w in writes {
-        const wb = P.nodes[w]
-        if wb is BinExpr {
-          const m = P.nodes[wb.binLeft]
-          if m is Member {
-            if m.memProp == hot[h] {
-              let wf = monoTopFrameOf(w)
-              if ctx >= 0 { wf = monoFrameOfNode(w, ctx) }
-              if monoPinWrittenLam(wb.binRight, ann, wf) < 0 { return -1 }
-              if monoCoerceFnValueName(wb.binRight, ann, wf, -1) < 0 {
-                return -1
-              }
-            }
-          }
-        }
-      }
-      monoArenaTouch()
-    }
-    h = h + 1
   }
   0
 }
 
-// Whether node `o` is a read of the binding `name` declared at `decl` under frame `fx`.
-function monoMemberOfBinding(
-  o: i32,
-  name: string,
-  fx: i32,
-  decl: i32,
-): boolean {
-  const n = P.nodes[o]
-  if !(n is Ident) { return false }
-  n.identName == name && monoReadIsBinding(o, fx, decl)
-}
-
-// Collects into `calls` each call `name.f(…)` and into `writes` each write `name.f = v`, for `f`
-// in `hot`, in frame `fx`'s body of the record declared at `decl`; false when the record is read
-// any other way, except as `name.p` for a field `p` not in `hot`.
-function monoRecordFieldUses(
-  fx: i32,
-  name: string,
-  decl: i32,
-  hot: string[],
-  calls: i32[],
-  writes: i32[],
-): boolean {
-  const stack: i32[] = []
-  const ok: i32[] = []
-  if fx >= 0 {
-    const b = monoNestedBodyOf(fx)
-    if b < 0 { return false }
-    stack.push(b)
-  } else {
-    for st in monoProgStmts { stack.push(st) }
-  }
-  while stack.length > 0 {
-    const ix = stack.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
-      if n is Call {
-        const m = P.nodes[n.callFn]
-        if m is Member {
-          if (
-            strListHas(hot, m.memProp)
-            && monoMemberOfBinding(m.memObj, name, fx, decl)
-          ) {
-            ok.push(m.memObj)
-            calls.push(ix)
+// `monoPinRecordFields` for the field `name` initialized with `val`.
+function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
+  const lf: i32[] = [ctx, at]
+  const path: string[] = ["f." + name]
+  const pins = monoDeclPathPins(lf, path)
+  if pins.length != 1 { return 0 }
+  const ann = monoSigFnTyName(pins[0] + ";")
+  monoLastInstFe = -1
+  if monoCoerceFnValueName(val, ann, ctx, -1) < 0 { return -1 }
+  if monoLastInstFe < 0 { return 0 }
+  const ft = monoPinSubTyOf(nodeTyIxOf(val), fnStmts[monoLastInstFe])
+  if !monoTyConcreteFn(ft) { return 0 }
+  const vt = nodeTyIxOf(val)
+  if vt < 0 || tyHasTyVar(vt) { nodeTyRecord(val, ft) }
+  for w in monoWritesOf("f:", at) {
+    const wb = P.nodes[w]
+    const wf = monoLetWriteFrame(lf, w)
+    if wb is BinExpr && wf.length == 1 {
+      const m = P.nodes[wb.binLeft]
+      if m is Member {
+        if m.memProp == name {
+          if monoPinWrittenLam(wb.binRight, ann, wf[0]) < 0 { return -1 }
+          if monoCoerceFnValueName(wb.binRight, ann, wf[0], -1) < 0 {
+            return -1
           }
         }
       }
-      if n is BinExpr {
-        if n.binOp == "=" {
-          const m = P.nodes[n.binLeft]
-          if m is Member {
-            if (
-              strListHas(hot, m.memProp)
-              && monoMemberOfBinding(m.memObj, name, fx, decl)
-            ) {
-              ok.push(m.memObj)
-              writes.push(ix)
-            }
-          }
-        }
-      }
-      if n is Member {
-        if !strListHas(hot, n.memProp) { ok.push(n.memObj) }
-      }
-      if n is Ident {
-        if (
-          n.identName == name
-          && !i32ListHas(ok, ix)
-          && monoReadIsBinding(ix, fx, decl)
-        ) {
-          return false
-        }
-      }
-      const body = monoNestedBodyOf(ix)
-      if body >= 0 { stack.push(body) }
-      for ch in nodeChildren(ix) { stack.push(ch) }
     }
   }
-  true
+  monoArenaTouch()
+  0
 }
 
 // The element writes `name[k] = v` in frame `fx`'s body to the list declared at `decl`.
@@ -11491,13 +11364,19 @@ function monoLetPinTake(lf: i32[], tname: string, byCall: boolean): i32 {
   MONO_PIN_REFUSE
 }
 
-// The pins (`fnFlowLetPinSigs`) of the written `let` `lf`, in the walk its frame's instance
+// The pins (`fnFlowDeclPathPinSigs`) of the written `let` `lf`, in the walk its frame's instance
 // stands for; empty when the table answers none.
 function monoLetPins(lf: i32[]): string[] {
-  let pins = fnFlowLetPinSigs(lf[1], -1, -1)
+  const path: string[] = []
+  monoDeclPathPins(lf, path)
+}
+
+// `monoLetPins` for the slot `path` derives from the binding (`fnFlowDeclPathPinSigs`).
+function monoDeclPathPins(lf: i32[], path: string[]): string[] {
+  let pins = fnFlowDeclPathPinSigs(lf[1], path, -1, -1)
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const it = monoFrameInstTmpl(lf[0])
-    pins = fnFlowLetPinSigs(lf[1], it[0], it[1])
+    pins = fnFlowDeclPathPinSigs(lf[1], path, it[0], it[1])
   }
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const none: string[] = []
@@ -11546,12 +11425,14 @@ function monoCoercibleLet(at: i32, ctx: i32): i32[] {
 }
 
 // The frame write `i` runs in, as a one-element list, when it is an `=` to the binding `lf`
-// (`monoReadLetFrame`) names, in a frame that holds it and can run; empty otherwise. A write in a
-// closure nothing names never runs, so it delivers nothing.
+// (`monoReadLetFrame`) names or to one of its fields, in a frame that holds it and can run; empty
+// otherwise. A write in a closure nothing names never runs, so it delivers nothing.
 function monoLetWriteFrame(lf: i32[], i: i32): i32[] {
   const none: i32[] = []
   const nd = P.nodes[i]
   if !(nd is BinExpr) || !monoFrameHolds(lf[0], i) { return none }
+  const tg = P.nodes[nd.binLeft]
+  const lhs = if tg is Member { tg.memObj } else { nd.binLeft }
   let wf = lf[0]
   if lf[0] >= 0 {
     wf = monoFrameOfNode(i, lf[0])
@@ -11559,7 +11440,7 @@ function monoLetWriteFrame(lf: i32[], i: i32): i32[] {
     wf = monoTopFrameOf(i)
   }
   if wf != lf[0] && monoWriteFrameDead(wf, lf[0]) { return none }
-  if monoReadLetFrame(nd.binLeft, wf)[1] != lf[1] { return none }
+  if monoReadLetFrame(lhs, wf)[1] != lf[1] { return none }
   const out: i32[] = [wf]
   out
 }
@@ -13607,11 +13488,12 @@ function monoSubtreeHolds(root: i32, ix: i32): boolean {
 }
 
 // The program's assignments by the source declaration (`monoDeclCanon`) they write: `x = v` in
-// `monoDeclWrites`, a capture cell's `d[0] = v` in `monoCellWrites`; node indices. Banked on an
-// arena prefix, so the writes of an instance body cloned during the pass, whose targets read the
-// template's declaration, join it the next time it is asked.
+// `monoDeclWrites`, a cell's `d[0] = v` in `monoCellWrites`, a field's `d.f = v` in
+// `monoFieldWrites`; node indices. Banked on an arena prefix, so an instance body cloned during
+// the pass, whose targets read the template's declaration, joins the next time it is asked.
 let monoDeclWrites: {[i32]: i32[]} = Map()
 let monoCellWrites: {[i32]: i32[]} = Map()
+let monoFieldWrites: {[i32]: i32[]} = Map()
 let monoLetWritesSeen = 0
 // Every declaration written, in the order of its first write: `d` for `monoDeclWrites`, `-1 - d`
 // for `monoCellWrites`.
@@ -13644,6 +13526,14 @@ function monoLetWritesExtend() {
             wl.push(i)
             monoCellWrites.set(k, wl)
           }
+        } else if tg is Member && P.nodes[tg.memObj] is Ident {
+          const d = identDeclOf(tg.memObj)
+          if d >= 0 && d < P.nodes.length {
+            const k = monoDeclCanon(d)
+            const wl = monoFieldWrites.get(k) ?? []
+            wl.push(i)
+            monoFieldWrites.set(k, wl)
+          }
         }
       }
     }
@@ -13660,12 +13550,14 @@ function monoWriteListAt(k: i32): i32[] {
   monoDeclWrites.get(k) ?? none
 }
 
-// The writes of the binding declared at `d` (`key` `n:`), or of its capture cell (`c:`).
+// The writes of the binding declared at `d` (`key` `n:`), of its capture cell (`c:`), or of its
+// fields (`f:`).
 function monoWritesOf(key: string, d: i32): i32[] {
   monoLetWritesExtend()
   const none: i32[] = []
   if d < 0 || d >= P.nodes.length { return none }
   if key == "c:" { return monoCellWrites.get(monoDeclCanon(d)) ?? none }
+  if key == "f:" { return monoFieldWrites.get(monoDeclCanon(d)) ?? none }
   monoDeclWrites.get(monoDeclCanon(d)) ?? none
 }
 
@@ -13912,7 +13804,7 @@ function monoWalk(ix: i32, ctx: i32) {
       && n.letInit >= 0
       && P.nodes[n.letInit] is ObjLit
     ) {
-      if monoPinGenericRecord(n, ix, ctx) < 0 { return -1 }
+      if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
     }
     monoNoteInertInit(n, ix, ctx)
     // An annotated function-typed binding to a generic named function: materialize the
@@ -15498,6 +15390,7 @@ export function monomorphize(stmts: i32[]) {
   monoDeclWrites = Map()
   monoWriteOrder = []
   monoCellWrites = Map()
+  monoFieldWrites = Map()
   monoLetWritesSeen = 0
   monoLetWritesExtend()
   // The index follows the table it answers for, at the write and not at a build point:
