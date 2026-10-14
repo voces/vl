@@ -9200,6 +9200,11 @@ function monoFnValueParamTys(t: i32, n: i32): i32[] {
   out
 }
 
+// Set while a literal is delivered at an annotation with no adapter between them; the return
+// type `monoInstanceFor` must then reproduce, or "" for any return.
+let monoInstanceExactRet = false
+let monoInstanceRetName = ""
+
 // Materialize or reuse the instance of generic `origFe` for an annotated function-typed
 // binding, pinning each parameter to the annotation's param type name and pointing
 // `letInitIx` at it. Unlike the call-driven path this carries the value's concrete type
@@ -9263,6 +9268,14 @@ function monoInstanceFor(
         }
       }
       v = v + 1
+    }
+    if monoInstanceExactRet {
+      if fn.fnRet < 0 || monoInstanceRetName == "" { return 0 }
+      let rs = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
+      if monoAnnHasTyParam(rs, fn.fnTyParams) {
+        rs = monoSubstAnn(rs, fn.fnTyParams, tvN, tvV)
+      }
+      if normTypeAtom(rs) != monoInstanceRetName { return 0 }
     }
     const pinned: string[] = []
     // No argument node on this path: the pins are the parameter types of the function type the
@@ -9420,7 +9433,13 @@ function monoCoerceFnValueName(
     // materializes at the type its own slot declares.
     const fnames: string[] = []
     const ftexts: string[] = []
-    if monoStructFieldTypes(tname, fnames, ftexts) {
+    // A nullable record slot delivers the literal at the record it admits.
+    let known = monoStructFieldTypes(tname, fnames, ftexts)
+    if !known {
+      const rname = peelGroupParens(nonNulBaseOf(tname))
+      known = rname != tname && monoStructFieldTypes(rname, fnames, ftexts)
+    }
+    if known {
       const flds = e.objFields
       let k = 0
       while k < flds.length {
@@ -9518,6 +9537,12 @@ function monoCoerceFnValueName(
         ) {
           // A capturing nested generic's value is this frame's instance, as a call is (D3902).
           monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
+          monoInstanceRetName = ""
+          if monoInstanceExactRet {
+            monoInstanceRetName = normTypeAtom(
+              annRetNameOf(peelGroupParens(tname)),
+            )
+          }
           const vr = monoInstanceFor(gfe, pnames, exprIx, expTy)
           monoCallFrameSlot = -1
           return vr
@@ -9981,6 +10006,8 @@ let mfrCand: {[i32]: boolean} = Map()
 let mfrVals: {[i32]: i32[]} = Map()
 let mfrValsState: {[i32]: i32} = Map()
 let mfrDirty: {[i32]: boolean} = Map()
+let mfrAnnLits: {[i32]: i32[]} = Map()
+let mfrAnnLets: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -9992,6 +10019,8 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrVals = Map()
   mfrValsState = Map()
   mfrDirty = Map()
+  mfrAnnLits = Map()
+  mfrAnnLets = []
   for s in stmts {
     // arena-tick exempt: a side table of this pass, not the arena
     if monoFlowTyParamGen(s) { mfrTopGen[s] = true }
@@ -10025,6 +10054,7 @@ function monoFlowReads(stmts: i32[]): i32 {
     }
   }
   monoFlowReadsAll(lets)
+  for a in mfrAnnLets { monoFlowAnnLits(a) }
   for x in direct {
     const n = P.nodes[x]
     if n is Index {
@@ -10043,6 +10073,46 @@ function monoFlowReads(stmts: i32[]): i32 {
   }
   0
 }
+
+// Banks for annotated binding `a` the literals its initializer may be: a call of a concrete
+// function returning only literals, when every call of it initializes a binding annotated
+// alike, so each literal is delivered at that one type and its generics can be pinned there.
+function monoFlowAnnLits(a: i32) {
+  const an = P.nodes[a]
+  if !(an is LetDecl) || an.letType < 0 { return 0 }
+  const c = unwrapParen(an.letInit)
+  if c < 0 { return 0 }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return 0 }
+  const f = unwrapParen(cn.callFn)
+  if f < 0 || !(P.nodes[f] is Ident) { return 0 }
+  const fd = identDeclOf(f)
+  if fd < 0 { return 0 }
+  const fn = P.nodes[fd]
+  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return 0 }
+  const want = tyNameOf(an.letType)
+  for u in mfrUses[fd] ?? [] {
+    const uc = mfrParent[u] ?? -1
+    if uc < 0 { return 0 }
+    const ucn = P.nodes[uc]
+    if !(ucn is Call) || ucn.callFn != u { return 0 }
+    let h = mfrParent[uc] ?? -1
+    while h >= 0 && P.nodes[h] is Paren { h = mfrParent[h] ?? -1 }
+    if h < 0 { return 0 }
+    const hn = P.nodes[h]
+    if !(hn is LetDecl) || hn.letType < 0 || tyNameOf(hn.letType) != want {
+      return 0
+    }
+    if unwrapParen(hn.letInit) != uc { return 0 }
+  }
+  const vals = monoFlowDeclVals(fd)
+  // arena-tick exempt: a side table of this pass, not the arena
+  if vals.length > 0 { mfrAnnLits[a] = vals }
+  0
+}
+
+// The literals `monoFlowAnnLits` banked for the annotated binding declared at `a`.
+function monoFlowAnnLitsOf(a: i32): i32[] { mfrAnnLits[a] ?? [] }
 
 // Rewrites read `x` of element or field `el` of literal `host` to the generic `el` names, when
 // every element or field value of `host` is a name, so dropping the literal drops no effect.
@@ -10102,11 +10172,18 @@ function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
       // arena-tick exempt: a side table of this pass, not the arena
       mfrCand[ix] = true
       lets.push(ix)
+    } else if n.letInit >= 0 {
+      mfrAnnLets.push(ix)
     }
   } else if n is FuncDecl {
     monoFlowReadsName(n.fnName)
   } else if n is Param {
     monoFlowReadsName(n.parName)
+    if n.parType < 0 && n.parDefault < 0 && n.parOpt == 0 && n.parRest == 0 {
+      // arena-tick exempt: a side table of this pass, not the arena
+      mfrCand[ix] = true
+      lets.push(ix)
+    }
   } else if n is ForIn {
     monoFlowReadsName(n.fiVar)
     monoFlowReadsName(n.fiVar2)
@@ -10245,7 +10322,9 @@ function monoFlowDeclVals(d: i32): i32[] {
   // arena-tick exempt: a side table of this pass, not the arena
   mfrValsState[d] = 1
   const out: i32[] = []
-  const ok = monoFlowRetVals(d, out) || monoFlowLetVals(d, out)
+  const ok = monoFlowRetVals(d, out)
+    || monoFlowLetVals(d, out)
+    || monoFlowParamVals(d, out)
   if !ok {
     // arena-tick exempt: a side table of this pass, not the arena
     mfrValsState[d] = 3
@@ -10263,6 +10342,48 @@ function monoFlowDeclVals(d: i32): i32[] {
 function monoFlowLetVals(d: i32, out: i32[]): boolean {
   const dn = P.nodes[d]
   if !(dn is LetDecl) || !monoFlowValsOf(dn.letInit, out) { return false }
+  for u in mfrUses[d] ?? [] {
+    const w = monoFlowWholeWrite(u)
+    if w >= 0 && !monoFlowValsOf(w, out) { return false }
+  }
+  true
+}
+
+// Appends to `out` the literals un-annotated parameter `d` holds, from the argument every call
+// of its function passes there and every whole `=` to it; false when the function is reached
+// other than by a direct positional call this pass sees, or any of them may be anything else.
+function monoFlowParamVals(d: i32, out: i32[]): boolean {
+  if !(P.nodes[d] is Param) { return false }
+  const fx = mfrParent[d] ?? -1
+  if fx < 0 { return false }
+  const fn = P.nodes[fx]
+  if !(fn is FuncDecl) || fn.fnName == "" || monoNameIsExported(fn.fnName) {
+    return false
+  }
+  let k = 0 - 1
+  let i = 0
+  while i < fn.fnParams.length {
+    if fn.fnParams[i] == d { k = i }
+    i = i + 1
+  }
+  // A `self` first parameter admits a method spelling, whose callee is no name read.
+  const p0 = P.nodes[fn.fnParams[0]]
+  if k < 0 || (p0 is Param && p0.parName == "self") { return false }
+  const calls = mfrUses[fx] ?? []
+  if calls.length == 0 { return false }
+  for u in calls {
+    const c = mfrParent[u] ?? -1
+    if c < 0 { return false }
+    const cn = P.nodes[c]
+    if !(cn is Call) || cn.callFn != u || hasNamedArgs(cn.callArgNames) {
+      return false
+    }
+    if cn.callArgs.length != fn.fnParams.length { return false }
+    for a in cn.callArgs {
+      if P.nodes[a] is Spread { return false }
+    }
+    if !monoFlowValsOf(cn.callArgs[k], out) { return false }
+  }
   for u in mfrUses[d] ?? [] {
     const w = monoFlowWholeWrite(u)
     if w >= 0 && !monoFlowValsOf(w, out) { return false }
@@ -10489,6 +10610,7 @@ function monoFlowContainerUse(
   spreads: i32[],
 ): boolean {
   monoFlowAliasUse(p, cur)
+    || monoFlowArgUse(p, cur)
     || monoFlowBinUse(p, cur)
     || monoFlowLoopUse(d, p, cur, cv, path, loops)
     || monoFlowSpreadUse(p, cv, spreads)
@@ -10499,6 +10621,27 @@ function monoFlowAliasUse(p: i32, cur: i32): boolean {
   const pn = P.nodes[p]
   if !(pn is LetDecl) { return false }
   pn.letInit == cur && (mfrCand[p] ?? false) && monoFlowDeclVals(p).length > 0
+}
+
+// Whether `p` calls a function passing `cur` to a candidate parameter whose literals are known.
+function monoFlowArgUse(p: i32, cur: i32): boolean {
+  const pn = P.nodes[p]
+  if !(pn is Call) || pn.callFn == cur { return false }
+  const c = unwrapParen(pn.callFn)
+  if c < 0 || !(P.nodes[c] is Ident) { return false }
+  const fd = identDeclOf(c)
+  if fd < 0 { return false }
+  const fn = P.nodes[fd]
+  if !(fn is FuncDecl) { return false }
+  let i = 0
+  while i < pn.callArgs.length && i < fn.fnParams.length {
+    if pn.callArgs[i] == cur {
+      const d = fn.fnParams[i]
+      return (mfrCand[d] ?? false) && monoFlowDeclVals(d).length > 0
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether `p` writes `cur` whole into a candidate binding whose literals are known, or compares
@@ -13772,6 +13915,16 @@ function monoWalk(ix: i32, ctx: i32) {
     // carries that concrete type independent of any call — it may escape where call-driven
     // monomorphization cannot reach.
     if monoCoerceFnValue(n.letInit, n.letType, ctx) < 0 { return -1 }
+    // So is each literal a call in the initializer returns (`monoFlowAnnLits`).
+    // Each instance there must return the slot's own type, since nothing adapts it on the way.
+    monoInstanceExactRet = true
+    for lit in monoFlowAnnLitsOf(ix) {
+      if monoCoerceFnValue(lit, n.letType, monoTopFrameOf(lit)) < 0 {
+        monoInstanceExactRet = false
+        return -1
+      }
+    }
+    monoInstanceExactRet = false
     if monoNoteBindDelivery(n.letInit, n.letType, ctx) < 0 { return -1 }
     return monoWalk(n.letInit, ctx)
   }

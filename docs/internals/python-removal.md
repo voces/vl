@@ -36,9 +36,9 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 5 | `render-parse budget` | done: `render-parse-census.vl` plus `vl check --budget --findings` | - |
 | 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/{rows,ls,split,selftest}.py` deleted, the row grammar is `scripts/lib/inventory.vl` | - |
 | 7 | `lint-self.sh` (`matrix.py`) | done: `scripts/capability-matrix.vl`, `matrix.py` deleted | - |
-| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` has no importer left (`check-filed-witnesses.py` and `survey-regrade.py` are deleted) and stays as `tests/vl_seed_provenance_test.ts`'s oracle | deleted with it |
+| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` is deleted and `tests/vl_seed_provenance_test.ts` holds the VL fold to the values the Python printed on a fixed tree | - |
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
-| - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `plumb-shape-cost.py`, `survey-regrade.py`, `check-filed-witnesses.py` and `distilled/{regress,index,redistil}.py` (+ `gradecensus.py`) deleted | delete `distilled/cellmap.py` and `corpuscmp.py`; `grade.py` and `profile-rank.py` have callers of their own (rows below) |
+| - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `plumb-shape-cost.py`, `survey-regrade.py`, `check-filed-witnesses.py` and `distilled/{regress,index,redistil}.py` (+ `gradecensus.py`) deleted | done: `distilled/cellmap.py` is deleted (`loadCells`/`dumpCells`), and `corpuscmp.py`, `grade.py` and `profile-rank.py` are deleted for their VL ports (rows below) |
 
 Rows 1-5 are done and `ratchet.py` is deleted. `mono-tyaram-grid.sh` carries an inline python
 heredoc and moves with its own PR.
@@ -51,7 +51,7 @@ heredoc and moves with its own PR.
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
 | `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | done: `scripts/capability-probes.vl`; the `.py` is deleted and its port test pins goldens |
-| `scripts/seed_provenance.py` | 223 | I | tests/vl_seed_provenance_test.ts (oracle only) | ported: `scripts/seed-provenance.vl` is on master; delete with the test's oracle case |
+| `scripts/seed_provenance.py` | 223 | I | tests/vl_seed_provenance_test.ts (oracle only) | done: deleted; the test pins `seed-provenance.vl` to the Python's fold, sidecar and verdict lines over a fixed tree |
 | `scripts/silent-sweep/distilled/regress.py` | 177 | G | scripts/lint-self.sh | deleted: `regress.vl` runs the gate rows |
 
 ### T: tests
@@ -70,9 +70,9 @@ heredoc and moves with its own PR.
 | `scripts/plumb-shape-cost.py` | 397 | T | tests/vl_plumb_shape_port_test.ts | done: deleted; `scripts/plumb-shape-cost.vl` runs the gate row and the port test pins its outcomes |
 | `scripts/sentinel-census.py` | 481 | T | tests/vl_budget_mode_test.ts tests/vl_sentinel_index_test.ts | scripts/sentinel-census.vl (shares the budget walk) |
 | `scripts/silent-sweep/census/gradecensus.py` | 217 | T | tests/vl_regress_port_test.ts | deleted: `census/gradecensus.vl`, grading shared with `regress.vl` through `scripts/lib/census-grade.vl` |
-| `scripts/silent-sweep/distilled/cellmap.py` | 35 | I | none | `loadCells`/`dumpCells` in `scripts/lib/corpus.vl`; delete |
+| `scripts/silent-sweep/distilled/cellmap.py` | 35 | I | none | done: deleted; `loadCells`/`dumpCells` in `scripts/lib/corpus.vl` round-trip its files byte for byte |
 | `scripts/silent-sweep/distilled/index.py` | 157 | T | tests/vl_regress_port_test.ts | deleted: `distilled/index.vl` |
-| `scripts/silent-sweep/grade.py` | 165 | T | docs/internals/inventory/README.md (the test reach was `survey-regrade.py` matching as a substring; it is D) | scripts/silent-sweep/grade.vl |
+| `scripts/silent-sweep/grade.py` | 165 | T | docs/internals/inventory/README.md (the test reach was `survey-regrade.py` matching as a substring; it is D) | done: deleted; `scripts/silent-sweep/grade.vl` matched its stdout and csv byte for byte on two real sweeps, and `tests/vl_grade_test.ts` pins every column and the two named disagreements |
 | `scripts/survey-regrade.py` | 463 | T | tests/vl_seed_provenance_test.ts tests/vl_survey_measure_test.ts (+1) | done: deleted; `scripts/survey-regrade.vl` runs the gate row, its port test holds it to the Python's frozen reports |
 | `scripts/wasm-runner-census.py` | 172 | T | tests/cases_wasm_0_test.ts tests/cases_wasm_1_test.ts (+3) | scripts/wasm-runner-census.vl (shares the budget walk) |
 
@@ -86,8 +86,8 @@ heredoc and moves with its own PR.
 | `scripts/inventory/rows.py` | 120 | I | scripts/inventory/ls.py (+2) | deleted: `scripts/lib/inventory.vl` |
 | `scripts/inventory/selftest.py` | 127 | I | scripts/inventory/split.py | retired with `split.py` |
 | `scripts/inventory/split.py` | 388 | I | scripts/check-filed-witnesses.py | retired: both inventories are split, and the generated `INDEX.md` it wrote (stale at 608 rows) went with it |
-| `scripts/profile-rank.py` | 98 | I | scripts/perf/profile-parents.py scripts/perf/profile-phases.py (+1; `survey-regrade.py` is deleted) | scripts/profile-rank.vl |
-| `scripts/silent-sweep/corpuscmp.py` | 91 | D | dated reports and READMEs | port to VL or retire (decide at its turn) |
+| `scripts/profile-rank.py` | 98 | I | scripts/perf/profile-parents.py scripts/perf/profile-phases.py (+1; `survey-regrade.py` is deleted) | done: deleted; `scripts/profile-rank.vl` (`perf/guest-profile.sh` calls it) matched it on real profiles, and `tests/vl_profile_rank_test.ts` pins the rounding tie and the error lines it could not match |
+| `scripts/silent-sweep/corpuscmp.py` | 91 | D | dated reports and READMEs | done: deleted; `scripts/silent-sweep/corpuscmp.vl` matched it over the whole corpus and three candidate seeds, and `tests/vl_corpuscmp_test.ts` pins its verdicts |
 | `scripts/silent-sweep/d451/mkcells.py` | 246 | X | nothing since `gradecensus.py` (a comment) was deleted | retire: closed grid; keep README + data, drop the generator |
 | `scripts/silent-sweep/distilled/redistil.py` | 153 | I | scripts/silent-sweep/distilled/index.py | deleted: `distilled/redistil.vl` |
 | `scripts/silent-sweep/sabotage.py` | 162 | I | scripts/check-filed-witnesses.py | retired: nothing ran it (the grader only cited it); its proof that the silent columns fire is carried every gate run by the distilled corpus's known-silent `named/` cells |
