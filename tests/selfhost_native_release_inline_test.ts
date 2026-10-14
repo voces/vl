@@ -416,3 +416,68 @@ Deno.test({
     }
   },
 });
+
+// The compiler's census (`optInline`, docs/internals/optimizer-in-vl.md rung R6a) decides,
+// from the type and name sections, that a module holds nothing to inline, and hands every
+// other module to the host's step. `$VL_OPT_INLINE=both` fails a build where the host's scan
+// disagrees, and `$VL_INLINE_FAULT=1`, which makes the census skip every module, is the
+// control that it is consulted: `both` then fails on a fixture the host inlines.
+Deno.test({
+  name:
+    "native-release: the compiler's census agrees with the host's inline-record scan",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    const skip =
+      /^inline-explain: step skipped: no struct field or array element holds a leaf record/m;
+    try {
+      const build = (src: string, env: Record<string, string>) =>
+        vl(["build", src, "-O", "-o", `${tmp}/out.wasm`], {
+          VL_INLINE_EXPLAIN: "1",
+          ...env,
+        });
+      const plain = `${ROOT}/tests/cases/arith/float-remainder-f32.vl`;
+      for (const side of ["vl", "both"]) {
+        const b = await build(plain, { VL_OPT_INLINE: side });
+        if (b.code !== 0 || !skip.test(b.err)) {
+          throw new Error(
+            `VL_OPT_INLINE=${side} on ${plain}: want the census's skip line, got: ${b.err.trim()}`,
+          );
+        }
+      }
+      const fx = `${DIR}/stored-fields.vl`;
+      const faulted = await build(fx, {
+        VL_OPT_INLINE: "vl",
+        VL_INLINE_FAULT: "1",
+      });
+      if (
+        faulted.code !== 0 || !skip.test(faulted.err) ||
+        /: inlined;/.test(faulted.err)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT under vl: want the step skipped, got: ${faulted.err.trim()}`,
+        );
+      }
+      const caught = await build(fx, {
+        VL_OPT_INLINE: "both",
+        VL_INLINE_FAULT: "1",
+      });
+      if (
+        caught.code === 0 ||
+        !/census differs between the host and the compiler/.test(caught.err)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT under both: want the build refused, got ${caught.code}: ${caught.err.trim()}`,
+        );
+      }
+      const bad = await build(plain, { VL_OPT_INLINE: "nope" });
+      if (bad.code === 0 || !/expected `rust`, `vl` or `both`/.test(bad.err)) {
+        throw new Error(
+          `VL_OPT_INLINE=nope: want a refusal, got ${bad.code}: ${bad.err.trim()}`,
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});

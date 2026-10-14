@@ -1957,6 +1957,24 @@ pub(crate) fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) ->
     None
 }
 
+/// The explain line of a scan that leaves the module alone, or `None` when it found a candidate.
+fn skipped(scanned: &Result<Option<Scan>, String>) -> Option<String> {
+    match scanned {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(format!(
+            "inline-explain: step skipped: no struct field or array element holds a leaf record \
+             (1 to {MV_RECORD_MAX_FIELDS} numeric fields)"
+        )),
+        Err(why) => Some(format!("inline-explain: step skipped: {why}")),
+    }
+}
+
+/// The host scan's answer where the compiler's census (`optInline`, rung R6a) decided: its
+/// explain line when it leaves `bytes` alone, `None` when it found a candidate.
+pub fn census_rust(bytes: &[u8], stable_layout: bool) -> Option<String> {
+    skipped(&scan(bytes, stable_layout))
+}
+
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
 /// changes nothing. `stable_layout` (`vl build --stable-layout`) keeps the layout of every type
 /// a crossing value reaches, not only of the types a boundary signature names.
@@ -1977,18 +1995,9 @@ pub fn inline_step(
     let no_flat = flag("VL_OPT_NO_FLAT");
     let mut s = match scan(bytes, stable_layout) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            if explaining {
-                eprintln!(
-                    "inline-explain: step skipped: no struct field or array element holds a \
-                     leaf record (1 to {MV_RECORD_MAX_FIELDS} numeric fields)"
-                );
-            }
-            return None;
-        }
-        Err(why) => {
-            if explaining {
-                eprintln!("inline-explain: step skipped: {why}");
+        scanned => {
+            if let (true, Some(line)) = (explaining, skipped(&scanned)) {
+                eprintln!("{line}");
             }
             return None;
         }
