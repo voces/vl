@@ -292,7 +292,7 @@ import {
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
-  fnFlowDeclPathSrc,
+  fnFlowDeclPathSrcs,
   fnFlowDeclWritten,
   fnFlowLamPin,
   fnFlowLetPinSigs,
@@ -9977,6 +9977,10 @@ let mfrParent: {[i32]: i32} = Map()
 let mfrUses: {[i32]: i32[]} = Map()
 let mfrNameCount: {[string]: i32} = Map()
 let mfrTopGen: {[i32]: boolean} = Map()
+let mfrCand: {[i32]: boolean} = Map()
+let mfrVals: {[i32]: i32[]} = Map()
+let mfrValsState: {[i32]: i32} = Map()
+let mfrDirty: {[i32]: boolean} = Map()
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -9984,6 +9988,10 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrUses = Map()
   mfrNameCount = Map()
   mfrTopGen = Map()
+  mfrCand = Map()
+  mfrVals = Map()
+  mfrValsState = Map()
+  mfrDirty = Map()
   for s in stmts {
     // arena-tick exempt: a side table of this pass, not the arena
     if monoFlowTyParamGen(s) { mfrTopGen[s] = true }
@@ -10016,7 +10024,7 @@ function monoFlowReads(stmts: i32[]): i32 {
       }
     }
   }
-  for d in lets { monoFlowReadsOf(d) }
+  monoFlowReadsAll(lets)
   for x in direct {
     const n = P.nodes[x]
     if n is Index {
@@ -10090,13 +10098,10 @@ function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
     }
   } else if n is LetDecl {
     monoFlowReadsName(n.letName)
-    if n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
-      const v = P.nodes[unwrapParen(n.letInit)]
-      if v is ArrayLit {
-        if v.pos >= 0 { lets.push(ix) }
-      } else if v is ObjLit {
-        lets.push(ix)
-      }
+    if n.letType < 0 && n.letInit >= 0 {
+      // arena-tick exempt: a side table of this pass, not the arena
+      mfrCand[ix] = true
+      lets.push(ix)
     }
   } else if n is FuncDecl {
     monoFlowReadsName(n.fnName)
@@ -10116,10 +10121,18 @@ function monoFlowReadsName(nm: string) {
 }
 
 // The module-scope generic function value node `v` names, as its declaration, when no other
-// declaration shares its name; -1 otherwise.
+// declaration shares its name, or when `v` is the checker's adapter lambda calling one; -1
+// otherwise.
 function monoFlowLeafGen(v: i32): i32 {
   if v < 0 { return -1 }
   const n = P.nodes[v]
+  if n is FuncDecl {
+    const cf = monoAdapterCallee(v)
+    if cf < 0 { return -1 }
+    const c = unwrapParen(cf)
+    if c < 0 || !(P.nodes[c] is Ident) { return -1 }
+    return monoFlowLeafGen(c)
+  }
   if !(n is Ident) { return -1 }
   const g = identDeclOf(v)
   if !(mfrTopGen[g] ?? false) { return -1 }
@@ -10127,111 +10140,427 @@ function monoFlowLeafGen(v: i32): i32 {
   g
 }
 
-// The rewrites the reads of binding `d` admit, applied only when every read is one of: a call
-// or other read of a slot holding one generic, a list's `length`, a read of a slot holding no
-// generic, a `for … in` over a list or a spread of one whose elements all name generics.
-function monoFlowReadsOf(d: i32) {
+// Whether the slot at `path` of binding `d` holds generic `g` alone, unwritten: each source the
+// flow table records is `g` or an adapter lambda calling it.
+function monoFlowSrcIs(d: i32, path: string[], g: i32): boolean {
+  const srcs = fnFlowDeclPathSrcs(d, path)
+  if srcs.length == 0 { return false }
+  for x in srcs {
+    if x != g && monoFlowLeafGen(x) != g { return false }
+  }
+  true
+}
+
+// Whether node `v` is a list or record literal.
+function monoFlowIsLit(v: i32): boolean {
+  if v < 0 { return false }
+  const n = P.nodes[v]
+  n is ArrayLit || n is ObjLit
+}
+
+// The right-hand side when name read `u` is the whole target of a plain `=`, -1 otherwise.
+function monoFlowWholeWrite(u: i32): i32 {
+  const p = mfrParent[u] ?? -1
+  if p < 0 { return -1 }
+  const pn = P.nodes[p]
+  if pn is BinExpr {
+    if pn.binOp == "=" && pn.binLeft == u { return pn.binRight }
+  }
+  -1
+}
+
+// Appends to `out` every literal value node `x` may evaluate to: a list or record literal, the
+// values of a candidate binding it names, or a literal-index or field read of those; false when
+// it may evaluate to anything else.
+function monoFlowValsOf(x: i32, out: i32[]): boolean {
+  if x < 0 { return false }
+  const v = unwrapParen(x)
+  if v < 0 { return false }
+  const n = P.nodes[v]
+  if n is ArrayLit {
+    if n.pos < 0 { return false }
+    out.push(v)
+    return true
+  }
+  if n is ObjLit {
+    out.push(v)
+    return true
+  }
+  if n is Ident {
+    const d = identDeclOf(v)
+    if d < 0 || !(mfrCand[d] ?? false) { return false }
+    const dv = monoFlowDeclVals(d)
+    if dv.length == 0 { return false }
+    for y in dv { out.push(y) }
+    return true
+  }
+  if n is Call {
+    const c = unwrapParen(n.callFn)
+    if c < 0 || !(P.nodes[c] is Ident) { return false }
+    const fd = identDeclOf(c)
+    if fd < 0 { return false }
+    const fn = P.nodes[fd]
+    if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return false }
+    const rv = monoFlowDeclVals(fd)
+    if rv.length == 0 { return false }
+    for y in rv { out.push(y) }
+    return true
+  }
+  const base: i32[] = []
+  if n is Index {
+    if !monoFlowValsOf(n.idxArr, base) { return false }
+    for b in base {
+      const el = monoFlowElemAt(b, n.idxIndex)
+      if !monoFlowIsLit(el) { return false }
+      out.push(el)
+    }
+    return true
+  }
+  let obj = -1
+  let prop = ""
+  if n is Member {
+    obj = n.memObj
+    prop = n.memProp
+  } else if n is OptMember {
+    obj = n.omObj
+    prop = n.omProp
+  } else {
+    return false
+  }
+  if !monoFlowValsOf(obj, base) { return false }
+  for b in base {
+    const fv = monoFlowFieldOf(b, prop)
+    if !monoFlowIsLit(fv) { return false }
+    out.push(fv)
+  }
+  true
+}
+
+// The literals candidate binding `d` may hold, from its initializer and every whole `=` to it,
+// or that function `d` returns; empty when it may be anything else or depends on itself.
+function monoFlowDeclVals(d: i32): i32[] {
+  const st = mfrValsState[d] ?? 0
+  if st == 2 { return mfrVals[d] ?? [] }
+  if st != 0 { return [] }
+  // arena-tick exempt: a side table of this pass, not the arena
+  mfrValsState[d] = 1
+  const out: i32[] = []
+  const ok = monoFlowRetVals(d, out) || monoFlowLetVals(d, out)
+  if !ok {
+    // arena-tick exempt: a side table of this pass, not the arena
+    mfrValsState[d] = 3
+    return []
+  }
+  // arena-tick exempt: a side table of this pass, not the arena
+  mfrVals[d] = out
+  // arena-tick exempt: a side table of this pass, not the arena
+  mfrValsState[d] = 2
+  out
+}
+
+// Appends to `out` the literals binding `d` holds, from its initializer and every whole `=` to
+// it; false when `d` is no `let` or `const`, or any of them may be anything else.
+function monoFlowLetVals(d: i32, out: i32[]): boolean {
   const dn = P.nodes[d]
-  if !(dn is LetDecl) { return 0 }
-  const lit = unwrapParen(dn.letInit)
-  const reads: i32[] = []
-  const gens: i32[] = []
-  const loops: i32[] = []
-  const spreads: i32[] = []
+  if !(dn is LetDecl) || !monoFlowValsOf(dn.letInit, out) { return false }
   for u in mfrUses[d] ?? [] {
-    if !monoFlowReadPlan(d, u, lit, reads, gens, loops, spreads) { return 0 }
+    const w = monoFlowWholeWrite(u)
+    if w >= 0 && !monoFlowValsOf(w, out) { return false }
+  }
+  true
+}
+
+// Appends to `out` the literals function `d` returns, when every `return` in its body, outside
+// nested functions, returns a list or record literal and its last statement is one of them or a
+// literal; false otherwise.
+function monoFlowRetVals(d: i32, out: i32[]): boolean {
+  const dn = P.nodes[d]
+  if !(dn is FuncDecl) { return false }
+  const body = dn.fnBody
+  if body < 0 { return false }
+  const b = P.nodes[body]
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const last = unwrapParen(b.blkStmts[b.blkStmts.length - 1])
+  if monoFlowIsLit(last) {
+    if !monoFlowValsOf(last, out) { return false }
+  } else if last < 0 || !(P.nodes[last] is RetStmt) {
+    return false
+  }
+  const stack: i32[] = [body]
+  while stack.length > 0 {
+    const x = stack.pop()
+    const xn = P.nodes[x]
+    if xn is RetStmt {
+      if xn.retArg < 0 { return false }
+      const a = unwrapParen(xn.retArg)
+      if !monoFlowIsLit(a) || !monoFlowValsOf(a, out) { return false }
+    } else if !(xn is FuncDecl) {
+      for k in nodeChildren(x) {
+        if k >= 0 { stack.push(k) }
+      }
+    }
+  }
+  true
+}
+
+// The outermost literal whose tree holds literal `v`.
+function monoFlowLitRoot(v: i32): i32 {
+  let r = v
+  let x = v
+  let p = mfrParent[x] ?? -1
+  while p >= 0 {
+    const pn = P.nodes[p]
+    if pn is ArrayLit || pn is ObjLit { r = p }
+    else if !(pn is FieldInit || pn is Paren || pn is Spread) { break }
+    x = p
+    p = mfrParent[x] ?? -1
+  }
+  r
+}
+
+// Plans and applies the rewrites of every candidate binding in `lets`. A binding is rewritten
+// only when each of its reads is planned and no binding sharing one of its literal trees
+// declined, since a declined read may mutate a value the others read or let it escape.
+function monoFlowReadsAll(lets: i32[]) {
+  const pr: i32[] = []
+  const pl: i32[] = []
+  const ps: i32[] = []
+  for d in lets {
+    const vals = monoFlowDeclVals(d)
+    if vals.length > 0 {
+      const reads: i32[] = []
+      const loops: i32[] = []
+      const spreads: i32[] = []
+      let ok = true
+      for u in mfrUses[d] ?? [] {
+        if ok && !monoFlowUsePlan(d, u, vals, reads, loops, spreads) {
+          ok = false
+        }
+      }
+      if ok {
+        monoFlowTagPairs(pr, d, reads)
+        monoFlowTagPairs(pl, d, loops)
+        monoFlowTagPairs(ps, d, spreads)
+      } else {
+        // arena-tick exempt: a side table of this pass, not the arena
+        for v in vals { mfrDirty[monoFlowLitRoot(v)] = true }
+      }
+    }
   }
   let i = 0
-  while i < reads.length {
-    monoFlowReadSet(reads[i], gens[i])
-    i = i + 1
+  while i < pr.length {
+    if monoFlowDeclClean(pr[i]) { monoFlowReadSet(pr[i + 1], pr[i + 2]) }
+    i = i + 3
   }
   i = 0
-  while i < loops.length {
-    monoFlowLoopSet(loops[i], loops[i + 1])
-    i = i + 2
+  while i < pl.length {
+    if monoFlowDeclClean(pl[i]) { monoFlowLoopSet(pl[i + 1], pl[i + 2]) }
+    i = i + 3
   }
   i = 0
-  while i < spreads.length {
-    monoFlowSpreadSet(spreads[i], spreads[i + 1])
+  while i < ps.length {
+    if monoFlowDeclClean(ps[i]) { monoFlowSpreadSet(ps[i + 1], ps[i + 2]) }
+    i = i + 3
+  }
+  0
+}
+
+// Appends each pair of `pairs` to `out` as a triple led by binding `d`.
+function monoFlowTagPairs(out: i32[], d: i32, pairs: i32[]) {
+  let i = 0
+  while i + 1 < pairs.length {
+    out.push(d)
+    out.push(pairs[i])
+    out.push(pairs[i + 1])
     i = i + 2
   }
   0
 }
 
-// Plans read `u` of binding `d` initialized with literal `lit`, appending a rewrite to `reads`
-// and `gens`, or `[loop, list]` to `loops`, or `[spread, list]` to `spreads`; false for a read
-// that may mutate the value or escape with it, which keeps every read of `d` as it is.
-function monoFlowReadPlan(
+// Whether every literal tree binding `d` may hold is clear of a decline by another binding.
+function monoFlowDeclClean(d: i32): boolean {
+  for v in mfrVals[d] ?? [] {
+    if mfrDirty[monoFlowLitRoot(v)] ?? false { return false }
+  }
+  true
+}
+
+// The one generic every node in `vs` names: -1 when none names one, -2 when they disagree.
+function monoFlowCommonGen(vs: i32[]): i32 {
+  let g = -1
+  let first = true
+  for v in vs {
+    const vg = monoFlowLeafGen(v)
+    if !first && vg != g { return -2 }
+    g = vg
+    first = false
+  }
+  g
+}
+
+// Plans read `u` of binding `d`, which may hold any literal in `vals`, appending `[read, gen]`
+// to `reads`, `[loop, gen]` to `loops` or `[spread, list]` to `spreads`; false for a read that
+// may mutate the value, or let it escape where its slots are not read by name.
+function monoFlowUsePlan(
   d: i32,
   u: i32,
-  lit: i32,
+  vals: i32[],
   reads: i32[],
-  gens: i32[],
   loops: i32[],
   spreads: i32[],
 ): boolean {
+  if monoFlowWholeWrite(u) >= 0 { return true }
   let cur = u
-  let val = lit
+  let cv: i32[] = vals
   const path: string[] = []
   let p = mfrParent[cur] ?? -1
   while p >= 0 {
     const pn = P.nodes[p]
+    let prop = ""
+    let isField = false
+    if pn is Member {
+      isField = pn.memObj == cur
+      prop = pn.memProp
+    } else if pn is OptMember {
+      isField = pn.omObj == cur
+      prop = pn.omProp
+    }
     if pn is Paren {
       cur = p
     } else if pn is Index && pn.idxArr == cur {
-      const el = monoFlowElemAt(val, pn.idxIndex)
-      if el < 0 { return false }
-      val = el
+      const next: i32[] = []
+      for v in cv {
+        const el = monoFlowElemAt(v, pn.idxIndex)
+        if el < 0 { return false }
+        next.push(el)
+      }
+      cv = next
       path.push("e")
       cur = p
-    } else if pn is Member && pn.memObj == cur {
-      const vn = P.nodes[val]
-      if vn is ArrayLit { return pn.memProp == "length" && !monoFlowIsWrite(p) }
-      const fv = monoFlowFieldOf(val, pn.memProp)
-      if fv < 0 { return false }
-      val = fv
-      path.push("f." + pn.memProp)
+    } else if isField {
+      let lists = 0
+      for v in cv {
+        if P.nodes[v] is ArrayLit { lists = lists + 1 }
+      }
+      if lists > 0 {
+        return lists == cv.length && prop == "length" && !monoFlowIsWrite(p)
+      }
+      const next: i32[] = []
+      for v in cv {
+        const fv = monoFlowFieldOf(v, prop)
+        if fv < 0 { return false }
+        next.push(fv)
+      }
+      cv = next
+      path.push("f." + prop)
       cur = p
     } else {
       break
     }
     p = mfrParent[cur] ?? -1
   }
-  const vn = P.nodes[val]
-  if vn is ObjLit { return false }
-  if vn is ArrayLit {
-    if p < 0 { return false }
-    const pn = P.nodes[p]
-    if pn is ForIn {
-      if pn.fiIter != cur || pn.fiVar2 != "" { return false }
-      const ep: string[] = []
-      for k in path { ep.push(k) }
-      ep.push("e")
-      const g = monoFlowElemsGen(val)
-      if g < 0 || fnFlowDeclPathSrc(d, ep) != g { return false }
-      loops.push(p)
-      loops.push(val)
-      return true
-    }
-    if pn is Spread {
-      const host = mfrParent[p] ?? -1
-      if host < 0 || !(P.nodes[host] is ArrayLit) { return false }
-      for e in vn.arrElems {
-        if monoFlowLeafGen(unwrapParen(e)) < 0 { return false }
-      }
-      spreads.push(p)
-      spreads.push(val)
-      return true
-    }
-    return false
+  let lits = 0
+  for v in cv {
+    if monoFlowIsLit(v) { lits = lits + 1 }
+  }
+  if lits > 0 {
+    if lits != cv.length || p < 0 { return false }
+    return monoFlowContainerUse(d, p, cur, cv, path, loops, spreads)
   }
   if monoFlowIsWrite(cur) { return false }
-  const g = monoFlowLeafGen(val)
-  if g < 0 { return true }
-  if path.length == 0 || fnFlowDeclPathSrc(d, path) != g { return false }
+  const g = monoFlowCommonGen(cv)
+  if g == -1 { return true }
+  if g < 0 || !monoFlowSrcIs(d, path, g) { return false }
   reads.push(cur)
-  gens.push(g)
+  reads.push(g)
+  true
+}
+
+// Plans node `cur`, a read of binding `d` at `path` that may be any literal in `cv`, used by its
+// parent `p`: a binding or whole `=` whose own reads are planned, a null test, a `for … in` over
+// lists whose elements all name one generic, or a spread of one list literal.
+function monoFlowContainerUse(
+  d: i32,
+  p: i32,
+  cur: i32,
+  cv: i32[],
+  path: string[],
+  loops: i32[],
+  spreads: i32[],
+): boolean {
+  monoFlowAliasUse(p, cur)
+    || monoFlowBinUse(p, cur)
+    || monoFlowLoopUse(d, p, cur, cv, path, loops)
+    || monoFlowSpreadUse(p, cv, spreads)
+}
+
+// Whether `p` is a candidate binding initialized by `cur` whose literals are known.
+function monoFlowAliasUse(p: i32, cur: i32): boolean {
+  const pn = P.nodes[p]
+  if !(pn is LetDecl) { return false }
+  pn.letInit == cur && (mfrCand[p] ?? false) && monoFlowDeclVals(p).length > 0
+}
+
+// Whether `p` writes `cur` whole into a candidate binding whose literals are known, or compares
+// `cur` against `null`.
+function monoFlowBinUse(p: i32, cur: i32): boolean {
+  const pn = P.nodes[p]
+  if !(pn is BinExpr) { return false }
+  if pn.binOp == "=" && pn.binRight == cur {
+    const l = unwrapParen(pn.binLeft)
+    if l < 0 || !(P.nodes[l] is Ident) { return false }
+    const ld = identDeclOf(l)
+    return ld >= 0 && (mfrCand[ld] ?? false) && monoFlowDeclVals(ld).length > 0
+  }
+  if pn.binOp == "==" || pn.binOp == "!=" {
+    const o = if pn.binLeft == cur { pn.binRight } else { pn.binLeft }
+    return P.nodes[unwrapParen(o)] is NullLit
+  }
+  false
+}
+
+// Whether `p` is a `for … in` over `cur` whose lists in `cv` all hold one generic that the slot
+// of `d` at `path` holds alone; appends `[loop, gen]` to `loops` when so.
+function monoFlowLoopUse(
+  d: i32,
+  p: i32,
+  cur: i32,
+  cv: i32[],
+  path: string[],
+  loops: i32[],
+): boolean {
+  const pn = P.nodes[p]
+  if !(pn is ForIn) { return false }
+  if pn.fiIter != cur || pn.fiVar2 != "" { return false }
+  let g = -1
+  for v in cv {
+    const vg = monoFlowElemsGen(v)
+    if vg < 0 || (g >= 0 && vg != g) { return false }
+    g = vg
+  }
+  const ep: string[] = []
+  for k in path { ep.push(k) }
+  ep.push("e")
+  if !monoFlowSrcIs(d, ep, g) { return false }
+  loops.push(p)
+  loops.push(g)
+  true
+}
+
+// Whether `p` spreads the one list literal in `cv`, each element naming a generic, into a list
+// literal; appends `[spread, list]` to `spreads` when so.
+function monoFlowSpreadUse(p: i32, cv: i32[], spreads: i32[]): boolean {
+  if !(P.nodes[p] is Spread) || cv.length != 1 { return false }
+  const host = mfrParent[p] ?? -1
+  const vn = P.nodes[cv[0]]
+  if host < 0 || !(P.nodes[host] is ArrayLit) || !(vn is ArrayLit) {
+    return false
+  }
+  for e in vn.arrElems {
+    if monoFlowLeafGen(unwrapParen(e)) < 0 { return false }
+  }
+  spreads.push(p)
+  spreads.push(cv[0])
   true
 }
 
@@ -10304,11 +10633,8 @@ function monoFlowReadSet(x: i32, g: i32) {
   0
 }
 
-// Rewrites each read of loop `fl`'s binding to the generic every element of list literal `v`
-// names, unless a read writes it.
-function monoFlowLoopSet(fl: i32, v: i32) {
-  const g = monoFlowElemsGen(v)
-  if g < 0 { return 0 }
+// Rewrites each read of loop `fl`'s binding to generic `g`, unless a read writes it.
+function monoFlowLoopSet(fl: i32, g: i32) {
   const us = mfrUses[fl] ?? []
   for u in us {
     if monoFlowIsWrite(u) { return 0 }

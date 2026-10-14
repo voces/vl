@@ -9,7 +9,7 @@ python3 scripts/silent-sweep/d184/genlist.py /tmp/gridL --block L   # 1,188 cell
 python3 scripts/silent-sweep/d184/genlist.py /tmp/gridM --block M   #   396 cells
 python3 scripts/silent-sweep/d184/genlist.py /tmp/gridN --block N   #   640 cells
 
-JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py /tmp/gridL <seed.wasm> /tmp/L.json
+JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/gridL <seed.wasm> /tmp/L.json
 ```
 
 `gradecensus.py` is reused verbatim — it takes the seed as an argument and reads the

@@ -26408,6 +26408,40 @@ function nameIsGenAppDecl(name: string) {
   false
 }
 
+// `nameIsGenAppDecl` for an application `gaeEnsure` will intern: one whose arguments, at
+// any nesting, name no type parameter. `B<T>` in a generic original denotes no struct.
+export function nameIsConcreteGenAppDecl(name: string): boolean {
+  if !nameIsGenAppDecl(name) { return false }
+  !genAppRidesTyParam(name, 8)
+}
+
+function genAppRidesTyParam(name: string, depth: i32): boolean {
+  if depth <= 0 { return true }
+  const lt = gaeLtAt(name)
+  if lt <= 0 { return false }
+  const args: string[] = []
+  gaeSplitArgs(gaeArgsTextOf(name, lt), args)
+  let i = 0
+  while i < args.length {
+    if gaeArgIsTyParam(args[i]) { return true }
+    const leaf = arrLeafNameOf(nonNulBaseOf(args[i]))
+    // A generic alias's own parameter, which `gaeArgIsTyParam` (FuncDecl names only) misses.
+    if (
+      genTyParamLeaf(leaf)
+      && !gaeParamShadowed(leaf)
+      && !nameIsStructDecl(leaf)
+      && !isUName(leaf)
+    ) {
+      return true
+    }
+    if annGenAppSpanEnds(leaf) {
+      if genAppRidesTyParam(leaf, depth - 1) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // True if `name` is a STANDALONE struct `type` declaration's name — independent of
 // the (incrementally-built) struct table, so a struct field may reference a LATER
 // struct declaration. Union aliases and union variants are excluded (their fields
@@ -29329,8 +29363,11 @@ export function variantNestedShapeOkTy(ftxt: string, ty: i32): boolean {
       const fty = tyFieldTyOf(nmTy, fnames[fi])
       if nameFieldCodeTy(ftexts[fi], fty) < 0 {
         // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
-        // lowerable only if ITS shape is.
-        if !variantNestedShapeOkTy(ftexts[fi], fty) { okAll = false }
+        // lowerable only if ITS shape is. A concrete generic application is lowerable as the
+        // interner's own rung codes it (D4556).
+        const gb = nonNulBaseOf(ftexts[fi])
+        const ga = nameIsConcreteGenAppDecl(gb)
+        if !ga && !variantNestedShapeOkTy(ftexts[fi], fty) { okAll = false }
       }
       fieldCount = fieldCount + 1
     }
@@ -29601,10 +29638,14 @@ export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
 // an array element (`T[]`, or a paren-grouped nullable union arm), declining to mint
 // a shape row before the parameter is substituted.
 function shapeFieldsRideTyParam(rawTexts: string[]) {
-  if genTyParamNames.length == 0 { return false }
+  if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   let gp = 0
   while gp < rawTexts.length {
     const t = rawTexts[gp]
+    // An application over a parameter (`B<T>`) is the original's too: `gaeEnsure` never
+    // interns it, so a row coding it as a struct ref has no heap to point at (D4556).
+    const ga = arrLeafNameOf(nonNulBaseOf(t))
+    if nameIsGenAppDecl(ga) && genAppRidesTyParam(ga, 8) { return true }
     if nameIsArray(t) && !nameIsI32Array(t) && !nameIsRefArray(t) {
       if fnTyParamName(arrLeafNameOf(t)) { return true }
     }
@@ -29894,6 +29935,11 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
         if iidx >= 0 {
           fc = FC_STRUCT
           ftxt = sNames[iidx]
+        } else if nameIsConcreteGenAppDecl(base) {
+          // The declared field's generic-application rung (`fieldTypeCode`, D4556): a shape
+          // nested in a declaration interns before `collectGenAliasShapes`, so the instance
+          // has no row yet and is keyed by its application name, as a declared field is.
+          fc = FC_STRUCT
         }
       }
       // The arm-typed field's element name, the interner's copy of `fieldRefElemName`'s rung
