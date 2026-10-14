@@ -1,7 +1,8 @@
 # The emitter's module-scope state — where each piece is reset, and what is not
 
-**Re-derive before quoting: `python3 scripts/emitter-state-audit.py`.** Every number below
-is that script's output on 2026-09-04. A hand-written audit table goes stale in ONE
+**Re-derive before quoting: `vl run scripts/emitter-state-audit.vl`.** Every number below
+is the output of its Python predecessor on 2026-09-04. The NEVER count is a ratchet now
+(`-- --check`, baseline `scripts/emitter-state-baseline.json`). A hand-written audit table goes stale in ONE
 direction — a variable that gains a reset keeps reading as a hazard, and one that LOSES a
 reset keeps reading as safe, which is the direction that ships bugs.
 
@@ -111,7 +112,7 @@ The remainder: `capFrame`, `sblEpoch`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInf
 `gckGenV`/`gckGenN`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`, `unABMode`. The
 `rep*`/`rt*` epoch counters are generation stamps and are MEANT to outlive a program (`msPoolReset` bumps `msGen` rather than clearing it); `emitRootIx` is
 assigned in the prologue with a value, not cleared. Run
-`python3 scripts/emitter-state-audit.py --names` for the per-name clear sites.
+`vl run scripts/emitter-state-audit.vl -- --names` for the per-name clear sites.
 
 ## How to settle a row here
 
