@@ -15,8 +15,9 @@
 # elsewhere. tests/ci_shard_test.ts runs `--check` on both sets.
 #
 # THE SPLIT is greedy longest-first over WEIGHTS: a file's test seconds on a CI runner whose
-# seed sidecars are warm. A file missing from the table weighs 2, so a new test lands
-# somewhere and only a heavy one needs a row. Deterministic.
+# seed sidecars are warm, summed over its tests even where they run concurrently (the runner's
+# cores are the shared resource, so the sum is the cost). A file missing from the table weighs 2,
+# so a new test lands somewhere and only a heavy one needs a row. Deterministic.
 #
 # The files that read `$VL_FUEL` are placed as ONE unit, weighing their sum plus FUEL_WARM:
 # a shard holding any of them warms the two fuel sidecars (a whole-seed JIT each) before its
@@ -61,21 +62,20 @@ vl_check_fix_test.ts 5
 vl_large_source_test.ts 5
 vl_sentinel_index_test.ts 4
 vl_kind_ladder_test.ts 3
-vl_deep_else_chain_test.ts 40
-vl_buffer_view_bounds_shape_test.ts 34
-selfhost_native_release_shape_test.ts 31
-vl_buffer_view_bounds_contract_test.ts 25
-selfhost_native_release_escape_test.ts 24
-selfhost_native_release_melt_test.ts 19
-selfhost_native_release_loops_test.ts 18
-selfhost_native_opt_test.ts 9
-vl_getter_body_shape_test.ts 8
-selfhost_native_release_runonce_test.ts 7
-selfhost_native_release_leaf_test.ts 6
-vl_closure_lift_shape_test.ts 5
-vl_extern_link_test.ts 5
+vl_deep_else_chain_test.ts 11
+vl_buffer_view_bounds_shape_test.ts 40
+selfhost_native_release_shape_test.ts 30
+selfhost_native_release_escape_test.ts 20
+selfhost_native_release_melt_test.ts 25
+selfhost_native_release_loops_test.ts 12
+selfhost_native_opt_test.ts 13
+vl_getter_body_shape_test.ts 7
+selfhost_native_release_runonce_test.ts 6
+selfhost_native_release_leaf_test.ts 7
+vl_closure_lift_shape_test.ts 6
+vl_extern_link_test.ts 7
 selfhost_native_release_test.ts 4
-vl_extern_global_test.ts 4
+vl_extern_global_test.ts 5
 '
 
 usage() { echo "usage: ci-shard.sh <native|release> <k> <n> | --check <native|release> <n>" >&2; exit 2; }

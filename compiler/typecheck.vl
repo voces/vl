@@ -47922,12 +47922,71 @@ function mapPinReadTy(pin: i32): i32 {
 // narrowed or projected parameter (`nodeTyPinIxOf`), and without a row of its own it reads an
 // unresolved `TyVar` and classifies the value by its declared rep instead (D1693).
 function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
+  const ver = shMemoSync(bNames, bTys)
+  if ver >= 0 && shMemo.has(tyIx) { return shMemo.get(tyIx) ?? -1 }
   const r = substHoleTyReal(tyIx, bNames, bTys)
   if r >= 0 && hdRowOf(tyIx) >= 0 && !tyIsHole(r) {
     const t = T.tys[tyIx]
     if t is TyVar { notePinnedHole(t.tvName, r, tyVarOwnerOf(tyIx)) }
   }
+  if ver >= 0 && ver == shMemoVer && shMemoStampSame() { shMemo.set(tyIx, r) }
   r
+}
+
+// `substHoleTy`'s answers under one set of bindings, kept while nothing an answer reads can have
+// moved: each link of an operator chain resolves the link below it, so without them a chain
+// of n links costs n walks of the chain (D3407). A repeated answer notes no pin again, and
+// `notePinnedHole` ignores a repeated pin.
+let shMemo: {[i32]: i32} = Map()
+let shMemoNames: string[] = []
+let shMemoTys: i32[] = []
+let shMemoVer = 0
+// The state an answer reads beyond its bindings, stamped at each fill: the arena's size and
+// in-place epoch, the parked argument demands a pin re-asks, and the substitution mode.
+let shMemoArena = -1
+let shMemoEpoch = -1
+let shMemoParked = -1
+let shMemoMode = -1
+let shMemoDecl = -1
+let shMemoQuiet = false
+
+function shMemoStampSame(): boolean {
+  shMemoArena == T.tys.length
+    && shMemoEpoch == tyMutEpoch
+    && shMemoParked == argPinWant.length
+    && shMemoMode == substNestMode
+    && shMemoDecl == substNestDecl
+    && shMemoQuiet == inferQuiet
+}
+
+// Points the memo at `bNames`/`bTys` and the current state, emptying it when either moved, and
+// returns its version; -1 where an answer may not be kept: under a composite's cycle guard, or
+// while a join clash waits to be reported, which only a walk that runs reports.
+function shMemoSync(bNames: string[], bTys: i32[]): i32 {
+  if stSeenStack.length > 0 || joinClashMsg != "" { return -1 }
+  let same = shMemoStampSame()
+    && bNames.length == shMemoNames.length
+    && bTys.length == shMemoTys.length
+  let i = 0
+  while same && i < bTys.length {
+    if bTys[i] != shMemoTys[i] || bNames[i] != shMemoNames[i] { same = false }
+    i = i + 1
+  }
+  if !same {
+    shMemo = Map()
+    shMemoNames = []
+    shMemoTys = []
+    for nm in bNames { shMemoNames.push(nm) }
+    for ty in bTys { shMemoTys.push(ty) }
+    shMemoArena = T.tys.length
+    shMemoEpoch = tyMutEpoch
+    shMemoParked = argPinWant.length
+    shMemoMode = substNestMode
+    shMemoDecl = substNestDecl
+    shMemoQuiet = inferQuiet
+    shMemoVer = shMemoVer + 1
+  }
+  shMemoVer
 }
 
 // `substHoleTyReal`'s read of a hole against `bNames`/`bTys`, noting no pin: a direct binding,
@@ -48130,7 +48189,18 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     }
     // No dispatch: the body's own answer, which may itself name this hole (`return lt` for
     // the arithmetic tail) or be concrete (`TY_BOOL` for an ordering comparison).
-    return substTyDeep(hdInner[row], bNames, bTys)
+    const bInner = hdInner[row]
+    // An answer naming the operand is the operand's pin, already resolved above: resolving it
+    // again would double the walk per link of an operator chain (D3407).
+    if bInner == hdBase[row] && bNames.length > 0 {
+      const bv = T.tys[bInner]
+      if bv is TyVar {
+        if substNestMode == SUBST_ALL || substBindsNestRow(bInner, bv.tvName) {
+          return innerB
+        }
+      }
+    }
+    return substTyDeep(bInner, bNames, bTys)
   }
   // The element of an indexed hole (`self[i]`): resolve the hole to its pinned
   // argument; an array yields its element (its value type for `HD_ELEMV`, so a `u8` byte

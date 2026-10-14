@@ -1,9 +1,7 @@
 // The view-bounds shape suite's MACHINERY — the fixture table, the loop-membership
 // counter and the build-and-disassemble helper. The tests are in
-// `vl_buffer_view_bounds_shape_test.ts` (the 18 table rows) and
-// `vl_buffer_view_bounds_contract_test.ts` (the P1.4 contract), two files because
-// `deno test --parallel` gives one worker per FILE and the contract test alone is
-// 4 s of the 18 s they used to take back to back.
+// `vl_buffer_view_bounds_shape_test.ts`: the 18 table rows and the P1.4 contract, one
+// file so the contract reads the rows' `-O3` builds rather than repeating them.
 
 // THE VIEW BOUNDS CHECK, PINNED AS A SHAPE — webcraft P1.4.
 //
@@ -259,7 +257,7 @@ export const countInLoops = (wat: string): Counts => {
   return { trap, call, sget };
 };
 
-export const shapeOf = async (fixture: string, flag: string | null): Promise<Counts> => {
+const buildShape = async (fixture: string, flag: string | null): Promise<Counts> => {
   const dir = await Deno.makeTempDir({ prefix: "vl-viewbounds-" });
   try {
     const out = `${dir}/m.wasm`;
@@ -289,4 +287,14 @@ export const shapeOf = async (fixture: string, flag: string | null): Promise<Cou
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
+};
+
+// One build per (fixture, rung) for the whole file: the table row and the contract read the
+// same `-O3` module, so the second reader awaits the first one's build.
+const built = new Map<string, Promise<Counts>>();
+export const shapeOf = (fixture: string, flag: string | null): Promise<Counts> => {
+  const key = `${fixture} ${flag ?? ""}`;
+  let p = built.get(key);
+  if (!p) built.set(key, p = buildShape(fixture, flag));
+  return p;
 };
