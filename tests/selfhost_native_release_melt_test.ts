@@ -10,9 +10,13 @@ import {
   buildAndCount,
   logsOf,
 } from "./support/nativeRelease.ts";
+import { concurrentTests } from "./support/concurrentTests.ts";
+
+// Every test builds into its own temp dir and shares no state, so they run a few at a time.
+const test = concurrentTests();
 
 for (const row of MELT_TABLE) {
-  Deno.test({
+  test({
     name: `native-release: ${row.fixture} — allocation sites melt ${row.none}/${row.O}/${row.O3} at (none)/-O/-O3`,
     ignore: !ENABLED,
     fn: async () => {
