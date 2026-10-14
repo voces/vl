@@ -1,7 +1,7 @@
 import * as path from "path";
 import * as os from "node:os";
 import { unlink, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import {
   CancellationToken,
@@ -645,7 +645,16 @@ interface RunPaths {
  * `testDiscovery.ts` so it is unit-testable; only the vscode types are here.
  */
 const anchorLocation = (paths: RunPaths, loc: FailureLocation): Location => {
-  const at = failureAnchor(loc, paths.cwd, paths.target, path.resolve);
+  // The report's column is in bytes; the file as `vl test` read it (the mirror,
+  // for an unsaved buffer, which still exists here) converts it to UTF-16.
+  const read = (file: string): string | undefined => {
+    try {
+      return readFileSync(file, "utf8");
+    } catch {
+      return undefined;
+    }
+  };
+  const at = failureAnchor(loc, paths.cwd, paths.target, path.resolve, read);
   return new Location(
     at.isTarget ? paths.uri : Uri.file(at.file),
     new Position(at.line, at.col),

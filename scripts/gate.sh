@@ -169,6 +169,9 @@ run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED"
 # The PYTHON ratchet, written in VL: tracked .py files and lines may only fall (the owner's
 # directive is zero; docs/internals/python-removal.md is the census it works down).
 run "py budget"                "$VL" run scripts/py-budget.vl -- --check
+# Lane L7's ratchet: emitter module-scope `let`s that no prologue, pass or frame builder
+# clears may only fall (baseline scripts/emitter-state-baseline.json).
+run "emitter state budget"     "$VL" run scripts/emitter-state-audit.vl -- --check
 # THE COST OF GENERATED CODE: guest fuel and peak RSS of one `-O` build of each of two 2 MB
 # plumb-shaped units (a median one, and a one-function tail one), against a committed
 # baseline, plus two exact facts about the rung input. Fuel is a count, so the fan-out's
