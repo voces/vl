@@ -54,7 +54,7 @@ large case impossible rather than slow.
   that slot is used (`fsSlotWritesMemory`). The write-side mirror reads `data()` instead.
 - **Failure is `-errno` in the return plus the per-instance errno cell** — WASI numbering,
   mapped by `wasi_errno`. A write import returns `0` / `-errno` like `__fs_write__`.
-- **Three hosts.** `scripts/vl-host/src/main.rs` and `scripts/wasmtime-host.rs` implement the
+- **Two hosts.** `scripts/vl-host/src/main.rs` implements the
   floor; `tests/support/runWasm.ts` registers a THROWING stub for every fs slot, because a
   WasmGC `u8[]` is opaque to JS. (A `Buf`-sourced write is the one shape JS could half-serve —
   linear memory IS visible to JS — but its path is still a `u8[]`, so it stays a stub.)
@@ -322,7 +322,7 @@ header after the body is written, use `writeFileRange(out, 0, header)`.
    `fs.writeFileRange <path>: offset 12 is past the end (length 10)`. If the follow-up size
    read itself fails, the message falls back to `failed()`'s errno rendering; on a missing
    file, which has no size, it reads `length 0`.
-3. **Hosts**: `scripts/vl-host/src/main.rs` and `scripts/wasmtime-host.rs`. Both handlers LOOP
+3. **Hosts**: `scripts/vl-host/src/main.rs` (and the since-deleted `scripts/wasmtime-host.rs`). Both handlers LOOP
    until every byte is written (`write_all` / `write_all_at`), so a short count is never
    success. Slot 16 reads `data()[addr..addr+len]` in place and answers `-EFAULT` outside the
    memory, mirroring `__fs_read_into__`.

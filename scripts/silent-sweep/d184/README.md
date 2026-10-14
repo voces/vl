@@ -1,5 +1,7 @@
 # The LIST-CONTAINER grid — the axes D180 / D183 / D184 turn on, crossed
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 2,224 cells in three blocks. Built 2026-08-27 for the PR that closed **D180**, **D183** and
 **D184**, and kept because the closing numbers below are only a claim if the population
 cannot be re-run.

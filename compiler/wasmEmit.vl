@@ -579,6 +579,7 @@ import {
   synthGlobalIdx,
   tailCallEnd,
   tailCallIdx,
+  tailCallTable,
   u8PushScratchBase,
   uBoxIdx,
   uBoxNewEnd,
@@ -683,6 +684,7 @@ import {
   fbRetExtra,
   fbReturn,
   fbReturnCall,
+  fbReturnCallIndirect,
   fbSelect,
   fbSelectRef,
   fbStrBack,
@@ -935,6 +937,7 @@ import {
   holeBindsFunc,
   holeCaptureTyOf,
   holeOperandTyOf,
+  holePinProvesNonNull,
   identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
@@ -2803,7 +2806,8 @@ function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
     && !(P.nodes[l] is NullLit)
     && (nodeTyProvesNonNull(l)
       || cellReadProvesNonNull(l)
-      || holeBindsFunc(l, fnIx))
+      || holeBindsFunc(l, fnIx)
+      || holePinProvesNonNull(l, fnIx))
   ) {
     return l
   }
@@ -2812,7 +2816,8 @@ function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
     && !(P.nodes[r] is NullLit)
     && (nodeTyProvesNonNull(r)
       || cellReadProvesNonNull(r)
-      || holeBindsFunc(r, fnIx))
+      || holeBindsFunc(r, fnIx)
+      || holePinProvesNonNull(r, fnIx))
   ) {
     return r
   }
@@ -21101,6 +21106,7 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
     fbLocalGet(crSlot)
     fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
     fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
+    armTailCallIndirect(sig)
     return 0
   }
   emitFail("emitProgram: expected a call expression")
@@ -25261,42 +25267,79 @@ function unionBoxNewBytes() {
   probe
 }
 
-// The exact bytes `fbCall(fnIdx)` writes, produced BY that encoder into a scratch buffer
-// — the `unionBoxNewBytes` discipline, so the tail-call peephole's pattern cannot drift
-// from the instruction it matches if the funcidx's ULEB width changes.
-function callBytes(fnIdx: i32) {
+// The exact bytes the armed tail-call cursor's call wrote, produced BY its encoder into a
+// scratch buffer — the `unionBoxNewBytes` discipline, so the tail-call peephole's pattern
+// cannot drift from the instruction it matches if an index's ULEB width changes.
+function tailCallBytes() {
   const probe: u8[] = []
   const prev = wTarget(probe)
-  fbCall(fnIdx)
+  if tailCallTable < 0 {
+    fbCall(tailCallIdx)
+  } else {
+    fbCallIndirect(tailCallIdx, tailCallTable)
+  }
   wTarget(prev)
   probe
 }
 
-// Rewrite a trailing direct `call` into `return_call`, reporting whether it fired. A call
-// whose bytes are still the last thing written when `return` terminates is in tail
-// position by construction. Validity needs no result-type check, since `return_call`
-// imposes the same subtyping `return` already does; the one break is arity.
-function emitTailCallRet(fnIx: i32) {
-  if fbRetExtra.length > 0 { return emitLiftSelfTailRet(fnIx) }
-  if fnUsesUnionSink { return false }
-  if tailCallIdx < 0 { return false }
-  if tailCallEnd != wLen() { return false }
-  const pat = callBytes(tailCallIdx)
+// Whether the armed call's bytes end `back` bytes before the write cursor.
+function tailCallEndsAt(back: i32) {
+  const pat = tailCallBytes()
   const np = pat.length
-  let ok = true
   let i = 0
   while i < np {
-    if wPeekBack(i) != pat[np - 1 - i] { ok = false }
+    if wPeekBack(back + i) != pat[np - 1 - i] { return false }
     i = i + 1
   }
-  if !ok { return false }
+  true
+}
+
+// Unwrite the armed call, `back` bytes before the cursor, together with those bytes, and write
+// its tail form in their place; disarms the cursor.
+function tailCallRewrite(back: i32) {
+  wDropBack(back + tailCallBytes().length)
+  if tailCallTable < 0 {
+    fbReturnCall(tailCallIdx) // 0x12 return_call
+  } else {
+    fbReturnCallIndirect(tailCallIdx, tailCallTable) // 0x13 return_call_indirect
+  }
+  tailCallEnd = -1
+  tailCallIdx = -1
+  0
+}
+
+// Rewrite a trailing call into its tail form, reporting whether it fired. A call whose bytes
+// are still the last thing written when `return` terminates is in tail position by
+// construction. Validity needs no result-type check, since a tail call imposes the same
+// subtyping `return` already does; the one break is arity, so a void caller is declined here.
+function emitTailCallRet(fnIx: i32) {
+  if fbRetExtra.length > 0 { return emitLiftSelfTailRet(fnIx) }
+  if tailCallIdx < 0 || tailCallEnd != wLen() { return false }
+  if !tailCallEndsAt(0) { return false }
   const fnPos = fnStmtsPosOf(fnIx)
   if fnPos < 0 { return false }
   if fRetVoid[fnPos] == 1 { return false }
-  wDropBack(np)
-  fbReturnCall(tailCallIdx) // 0x12 return_call
-  tailCallEnd = -1
-  tailCallIdx = -1
+  tailCallRewrite(0)
+  true
+}
+
+// The tail-call rewrite at a void function's exit: the explicit `return f()` and the trailing
+// call statement. Only a direct call to a void callee that hands nothing back qualifies, since
+// `return` tolerates a leftover result and a tail call does not (D4654, D4655).
+export function emitVoidTailCall(fnIx: i32) {
+  if fbRetExtra.length > 0 || tailCallTable >= 0 { return false }
+  if tailCallIdx < 0 || tailCallEnd != wLen() { return false }
+  const fnPos = fnStmtsPosOf(fnIx)
+  if fnPos < 0 || fnPos >= fRetVoid.length || fRetVoid[fnPos] != 1 {
+    return false
+  }
+  const callee = tailCallIdx - gImports
+  if callee < 0 || callee >= fRetVoid.length || fRetVoid[callee] != 1 {
+    return false
+  }
+  if cloLiftWriteCount(callee) > 0 { return false }
+  if !tailCallEndsAt(0) { return false }
+  tailCallRewrite(0)
   true
 }
 
@@ -25304,21 +25347,12 @@ function emitTailCallRet(fnIx: i32) {
 // returns what the function itself would, so its write-back is dropped with it (D3664).
 function emitLiftSelfTailRet(fnIx: i32) {
   if fnUsesUnionSink || tailCallIdx < 0 || tailCallEnd < 0 { return false }
-  if liftWbEnd != wLen() { return false }
+  if tailCallTable >= 0 || liftWbEnd != wLen() { return false }
   const fnPos = fnStmtsPosOf(fnIx)
   if fnPos < 0 || tailCallIdx != gImports + fnPos { return false }
   const wb = wLen() - tailCallEnd
-  const pat = callBytes(tailCallIdx)
-  const np = pat.length
-  let i = 0
-  while i < np {
-    if wPeekBack(wb + i) != pat[np - 1 - i] { return false }
-    i = i + 1
-  }
-  wDropBack(wb + np)
-  fbReturnCall(tailCallIdx) // 0x12 return_call
-  tailCallEnd = -1
-  tailCallIdx = -1
+  if !tailCallEndsAt(wb) { return false }
+  tailCallRewrite(wb)
   liftWbEnd = -1
   true
 }
@@ -25612,6 +25646,8 @@ export function emitStmt(body: u8[], stmtIx: i32, fnIx: i32) {
       const rPos = fnStmtsPosOf(fnIx)
       if rPos >= 0 {
         if fRetVoid[rPos] == 1 {
+          // The checker splits `return f()` here into `f()` and this bare `return`.
+          if emitVoidTailCall(fnIx) { return 0 }
           fbReturn() // 0x0f return
           return 0
         }
@@ -25631,6 +25667,7 @@ export function emitStmt(body: u8[], stmtIx: i32, fnIx: i32) {
     if rvPos >= 0 && rvPos < fRetVoid.length {
       if fRetVoid[rvPos] == 1 {
         if emitStmt(body, s.retArg, fnIx) < 0 { return -1 }
+        if emitVoidTailCall(fnIx) { return 0 }
         fbReturn() // 0x0f return (void: nothing pushed)
         return 0
       }
@@ -32349,6 +32386,7 @@ function emitDirectCallTail(target: i32, fnIx: i32) {
   // enclosing `return` terminates, it is in tail position and `emitUnionRetSink`
   // rewrites the pair into `return_call`.
   tailCallIdx = gImports + target
+  tailCallTable = -1
   tailCallEnd = wLen()
   // A lifted callee hands back the captures it assigned after its result: each goes back
   // where this frame keeps it, the last result first (D3664).
@@ -32488,7 +32526,17 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   fbLocalGet(crSlot)
   fbStructGet(cloStructIdx, 1)      // the callee's wasm function index
   fbCallIndirect(csig, gFnTableIdx) // 0x11 <fnsig> <table>
+  armTailCallIndirect(csig)
   return 0
+}
+
+// Arm the tail-call cursor on the function-value call just written, so a `return` that
+// follows it directly becomes `return_call_indirect` (D4657).
+function armTailCallIndirect(sig: i32) {
+  tailCallIdx = sig
+  tailCallTable = gFnTableIdx
+  tailCallEnd = wLen()
+  0
 }
 
 // The `__array_new__(n, fill)` / `__array_new_default__(n)` intrinsic lowering.
@@ -33468,6 +33516,18 @@ function emitScalarWiden(from: i32, to: i32) {
   fbF64ConvertI32S()
 }
 
+// The receiver of a `??` field read: `cast` is the arm heap a one-arm-narrowed union box is
+// cast to, -2 a null-tested nullable arm asserted non-null, -1 the receiver read as it is.
+function emitCoalArmRecv(body: u8[], recvIx: i32, cast: i32, fnIx: i32) {
+  if emitExpr(body, recvIx, fnIx) < 0 { return -1 }
+  if cast >= 0 {
+    fbStructGet(uBoxIdx, 1)
+    fbRefCast(cast)
+  }
+  if cast == -2 { fbRefAsNonNull() }
+  0
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -34088,85 +34148,107 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // and select the default or the unboxed single remaining scalar atom. The receiver re-reads
   // in the non-null arm (a name/field chain, like the nullable-struct `?.` path).
   if lhs is Member {
+    // The receiver is a struct row or a union arm; an arm's field reads off its own heap
+    // type exactly as a row's does (D4667).
+    let mHeap = -1
+    let mfi = -1
+    let mphys = ""
+    let mCast = -1
     const msi = structIndexOfExpr(lhs.memObj, fnIx)
     if msi >= 0 {
-      const mfi = sFieldIndex(msi, lhs.memProp)
-      if mfi >= 0 {
-        if sFieldTypeAt(msi, mfi) == FC_UNION {
-          // A wider record's box is read at the receiver's own member set (D3006).
-          const mphys = sFieldElemNameAt(msi, mfi)
-          if memReadBoxAmbiguous(lhsIx, fnIx) {
-            return emitBoxAmbiguousFail(lhsIx)
+      mfi = sFieldIndex(msi, lhs.memProp)
+      if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_UNION {
+        mHeap = sHeapIdx[msi]
+        mphys = sFieldElemNameAt(msi, mfi)
+      }
+    } else {
+      // A box receiver narrowed to one arm is unwrapped to that arm, and a null-tested
+      // nullable arm asserted non-null, before the field read.
+      let mvi = exprVariantIndex(lhs.memObj, fnIx)
+      if mvi < 0 && memIsNarrowed(lhsIx) && exprUnion(lhs.memObj, fnIx) {
+        mvi = memNarrowVariantIndex(lhsIx)
+        if mvi >= 0 { mCast = uVarHeap[mvi] }
+      }
+      if mvi < 0 && exprNullableVariant(lhs.memObj, fnIx) {
+        mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
+        mCast = -2
+      }
+      if mvi >= 0 {
+        mfi = variantFieldIndex(mvi, lhs.memProp)
+        if mfi >= 0 && variantFieldTypeAt(mvi, mfi) == FC_UNION {
+          mHeap = uVarHeap[mvi]
+          mphys = variantFieldElemName(mvi, mfi)
+        }
+      }
+    }
+    if mHeap >= 0 {
+      // A wider record's box is read at the receiver's own member set (D3006).
+      if memReadBoxAmbiguous(lhsIx, fnIx) { return emitBoxAmbiguousFail(lhsIx) }
+      let munm = memReadBoxNarrowName(lhsIx, fnIx)
+      if munm == "" { munm = mphys }
+      // D-VALUNION + D-SETONCE — see the call arm above.
+      const msid = msSetOfText(munm)
+      if (
+        isValueUnionOfSet(msid, munm)
+        && unionHasAtomK(msid, munm, "null", nullValKind())
+      ) {
+        // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
+        let mak = unionResidualSoloKindOfSet(msid)
+        if mak == -2 {
+          mak = valueAtomKind(removeAtomFromSet(munm, "null")) // D-RESIDUE
+        }
+        if mak >= 0 && mak != nullValKind() {
+          if mak == 2 {
+            return emitFail(
+              "emitProgram: `??` over a string|null union field is not supported yet",
+            )
           }
-          let munm = memReadBoxNarrowName(lhsIx, fnIx)
-          if munm == "" { munm = mphys }
-          // D-VALUNION + D-SETONCE — see the call arm above.
-          const msid = msSetOfText(munm)
-          if (
-            isValueUnionOfSet(msid, munm)
-            && unionHasAtomK(msid, munm, "null", nullValKind())
-          ) {
-            // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
-            let mak = unionResidualSoloKindOfSet(msid)
-            if mak == -2 {
-              mak = valueAtomKind(removeAtomFromSet(munm, "null")) // D-RESIDUE
+          // A NULLABLE default keeps the result boxed — the SAME decision the ident
+          // and call arms make (`coalesceDefaultNullable`); the else arm re-reads the
+          // field's own box rather than unboxing it.
+          if coalesceDefaultNullable(e.binRight, fnIx) {
+            if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+            fbStructGet(mHeap, mfi) // the union box
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Const(nullBoxTag())
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
+            // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
+            // boxed-union `??` spellings that share this lowering.
+            if emitUnionCoerce(body, munm, e.binRight, fnIx) < 0 {
+              return -1 // d, its own box
             }
-            if mak >= 0 && mak != nullValKind() {
-              if mak == 2 {
-                return emitFail(
-                  "emitProgram: `??` over a string|null union field is not supported yet",
-                )
-              }
-              // A NULLABLE default keeps the result boxed — the SAME decision the ident
-              // and call arms make (`coalesceDefaultNullable`); the else arm re-reads the
-              // field's own box rather than unboxing it.
-              if coalesceDefaultNullable(e.binRight, fnIx) {
-                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-                fbStructGet(sHeapIdx[msi], mfi) // the union box
-                fbStructGet(uBoxIdx, 0)         // field 0: tag
-                fbI32Const(nullBoxTag())
-                fbI32Bin(70)                    // 0x46 i32.eq → null?
-                fbIfRef(uBoxIdx)                // 0x04 if, (ref $uBoxIdx) blocktype
-                // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
-                // boxed-union `??` spellings that share this lowering.
-                if emitUnionCoerce(body, munm, e.binRight, fnIx) < 0 {
-                  return -1 // d, its own box
-                }
-                fbElse() // 0x05 else — present → re-read the field
-                if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-                fbStructGet(sHeapIdx[msi], mfi)
-                if munm != mphys {
-                  if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
-                }
-                fbEnd() // 0x0b end
-                return 0
-              }
-              if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-              fbStructGet(sHeapIdx[msi], mfi) // the union box
-              fbStructGet(uBoxIdx, 0)         // field 0: tag
-              fbI32Const(nullBoxTag())
-              fbI32Bin(70)                    // 0x46 i32.eq → null?
-              fbIf(valBlockTypeOfKind(mak))   // 0x04 if, value blocktype
-              if emitExprAsKind(body, e.binRight, mak, fnIx) < 0 { return -1 }
-              fbElse()                        // 0x05 else — present → unbox
-              if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
-              fbStructGet(sHeapIdx[msi], mfi)
-              if munm != mphys {
-                if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
-              }
-              fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-              const mvb = vbHeapIdxOfKind(mak)
-              if mvb < 0 {
-                return emitFail(
-                  "emitProgram: union field atom has no value box",
-                )
-              }
-              fbRefCast(mvb)
-              fbStructGet(mvb, 0) // the scalar payload
-              fbEnd()             // 0x0b end
-              return 0
+            fbElse() // 0x05 else — present → re-read the field
+            if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+            fbStructGet(mHeap, mfi)
+            if munm != mphys {
+              if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
             }
+            fbEnd() // 0x0b end
+            return 0
           }
+          if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+          fbStructGet(mHeap, mfi)       // the union box
+          fbStructGet(uBoxIdx, 0)       // field 0: tag
+          fbI32Const(nullBoxTag())
+          fbI32Bin(70)                  // 0x46 i32.eq → null?
+          fbIf(valBlockTypeOfKind(mak)) // 0x04 if, value blocktype
+          if emitExprAsKind(body, e.binRight, mak, fnIx) < 0 { return -1 }
+          fbElse()                      // 0x05 else — present → unbox
+          if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
+          fbStructGet(mHeap, mfi)
+          if munm != mphys {
+            if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
+          }
+          fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+          const mvb = vbHeapIdxOfKind(mak)
+          if mvb < 0 {
+            return emitFail("emitProgram: union field atom has no value box")
+          }
+          fbRefCast(mvb)
+          fbStructGet(mvb, 0) // the scalar payload
+          fbEnd()             // 0x0b end
+          return 0
         }
       }
     }

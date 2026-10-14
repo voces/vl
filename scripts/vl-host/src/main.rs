@@ -6320,8 +6320,8 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
-/// Which side runs the multi-value step (rung R5): `$VL_OPT_MULTIVALUE` unset or `rust` the
-/// host, `vl` the compiler's `optMultivalue`, `both` the two, failing the build when their
+/// Which side runs the multi-value step (rung R5): `$VL_OPT_MULTIVALUE` unset or `vl` the
+/// compiler's `optMultivalue`, `rust` the host, `both` the two, failing the build when their
 /// output, body moves or `$VL_MV_EXPLAIN` lines differ.
 #[derive(Clone, Copy, PartialEq)]
 enum OptMultivalueSide {
@@ -6335,8 +6335,8 @@ fn opt_multivalue_side() -> Result<OptMultivalueSide> {
         .unwrap_or_default()
         .as_str()
     {
-        "" | "rust" => Ok(OptMultivalueSide::Rust),
-        "vl" => Ok(OptMultivalueSide::Vl),
+        "rust" => Ok(OptMultivalueSide::Rust),
+        "" | "vl" => Ok(OptMultivalueSide::Vl),
         "both" => Ok(OptMultivalueSide::Both),
         other => bail!("$VL_OPT_MULTIVALUE={other} — expected `rust`, `vl` or `both`"),
     }
@@ -6359,18 +6359,29 @@ fn multivalue_vl(
             .validate_all(b)
             .map(|_| ())
     };
-    let valid = validate(bytes).is_ok();
-    let (mut store, inst) = load_compiler(engine, compiler)?;
-    opt_stage(&mut store, &inst, bytes)?;
-    let step = inst
-        .get_typed_func::<(i32, i32), i32>(&mut store, "optMultivalue")
-        .map_err(|e| {
-            e.context(
-                "`$VL_OPT_MULTIVALUE` runs the multi-value step through the compiler's \
-                 `optMultivalue`, which this seed predates",
-            )
-        })?;
-    let changed = step.call(&mut store, (explaining as i32, valid as i32))? == 1;
+    // The step runs while another thread validates its input; an input that does not validate
+    // is stepped again from a fresh instance with `valid` 0, which leaves it alone, and the
+    // first run's answer (or trap) is discarded.
+    let run = |valid: bool| -> Result<_> {
+        let (mut store, inst) = load_compiler(engine, compiler)?;
+        opt_stage(&mut store, &inst, bytes)?;
+        let step = inst
+            .get_typed_func::<(i32, i32), i32>(&mut store, "optMultivalue")
+            .map_err(|e| {
+                e.context(
+                    "`-O` runs the multi-value step through the compiler's `optMultivalue`, \
+                     which this seed predates (`$VL_OPT_MULTIVALUE=rust` runs the host's)",
+                )
+            })?;
+        let changed = step.call(&mut store, (explaining as i32, valid as i32))? == 1;
+        Ok((store, inst, changed))
+    };
+    let (valid, stepped) = std::thread::scope(|s| {
+        let check = s.spawn(|| validate(bytes).is_ok());
+        let stepped = run(true);
+        (check.join().unwrap_or(false), stepped)
+    });
+    let (mut store, inst, changed) = if valid { stepped? } else { run(false)? };
     let mut out = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
     let moves = inst.get_typed_func::<(), i32>(&mut store, "optMultivalueMoves")?;
     moves.call(&mut store, ())?;

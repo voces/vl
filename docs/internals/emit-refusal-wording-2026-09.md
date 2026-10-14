@@ -1,6 +1,6 @@
 # The wording count is a floor, and here is the population under it — 2026-09-05
 
-`scripts/goal-scoreboard.py` counts the compiler's capability refusals by their WORDING: the
+`scripts/goal-scoreboard.vl` (then `goal-scoreboard.py`) counts the compiler's capability refusals by their WORDING: the
 message literals whose sentence concedes the refused program was type-valid. CLAUDE.md already
 says that number is a lower bound (D964). This file measures the gap between the bound and the
 thing it bounds, on the population the bound cannot see.
@@ -243,7 +243,7 @@ seed and matching no phrase: `ref valtype with no interned shape` (D1627), `func
 arity has no interned signature` (D1474), `monomorphize: unsupported argument type for`
 (D1596). **All 21 are invisible to the wording count.**
 
-    python3 scripts/capability-probes/run.py --live-sites   # re-grade every row
+    vl run scripts/capability-probes.vl -- --live-sites     # re-grade every row
     deno test -A --no-check tests/vl_live_sites_test.ts     # the structural half, in ms
 
 The list is a one-way ratchet. A row may only be added with a probe that exists and whose header

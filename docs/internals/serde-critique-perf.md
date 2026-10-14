@@ -540,7 +540,7 @@ rather than failing — the worst combination. Findings 1 and 2 are the same ris
 run-time and the compiler side.
 
 **The cheapest instrument: a capability probe that is a TIMING assertion, one file, ~10 lines.**
-`scripts/capability-probes/run.py` already grades one program per gap as
+`scripts/capability-probes.vl` already grades one program per gap as
 `RUNS` / `check refuses` / `emit refuses` / `SILENT`. Add one probe that walks a ref-bearing
 shape at two sizes — N and 4N — and **fails unless the ratio is under 6x**. A linear walk reads
 ~4x and passes; a quadratic one reads ~16x and fails, loudly, on the day the seen-set lands.

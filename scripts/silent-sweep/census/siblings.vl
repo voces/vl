@@ -1,0 +1,213 @@
+// Which axes move an outcome, and which are inert.
+//
+//     vl run scripts/silent-sweep/census/siblings.vl -- <celldir> <graded.json> [<celldir> <graded.json> ...]
+//
+// For every ordered pair of graded coordinates that differ in exactly one axis, records
+// whether the outcome differs. An axis that never changes an outcome is inert and shrinks
+// the next grid; one that does is where that grid spends its cells. Levels come from the
+// data, so an axis the blocks pinned reads as one level. Run from the checkout root.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, split } from "std:str"
+import { die } from "../../lib/common"
+import { padLeft, padRight } from "../../lib/corpus"
+import {
+  AX,
+  byCountDesc,
+  coordKey,
+  coordVals,
+  distinctSorted,
+  grading,
+  hasAxis,
+  isSilent,
+  manifestCoords,
+  pyFixed,
+  tally,
+} from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/siblings.vl -- <celldir> <graded.json> [<celldir> <graded.json> ...]"
+
+// `axes` ordered by descending `rate`, ties kept in `AX` order.
+function byRateDesc(axes: string[], rate: Map<string, f64>): string[] {
+  if axes.length <= 1 { return axes }
+  const mid = axes.length / 2
+  const a = byRateDesc(axes.slice(0, mid), rate)
+  const b = byRateDesc(axes.slice(mid, axes.length), rate)
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if (
+      j >= b.length
+      || (i < a.length && (rate[a[i]] ?? 0.0) >= (rate[b[j]] ?? 0.0))
+    ) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+function main(args: string[]): i32 {
+  if args.length % 2 != 0 { die(USAGE, 2) }
+  // Graded cells by (block tag, name), each one's coordinate first-wins into `index`.
+  const index: Map<string, string> = Map()
+  const order: string[] = []
+  const seen: Set<string> = Set()
+  let graded = 0
+  let i = 0
+  while i < args.length {
+    const parts = split(args[i], "/")
+    let tag = ""
+    let p = parts.length - 1
+    while p >= 0 && tag == "" {
+      tag = parts[p]
+      p = p - 1
+    }
+    const res = grading(args[i + 1])
+    for k, co in manifestCoords(args[i]) {
+      const g = res[k]
+      if g == null { continue }
+      let full = true
+      for a in AX {
+        if !hasAxis(co, a) { full = false }
+      }
+      if !full { continue }
+      const id = tag + "\t" + k
+      if !seen.has(id) {
+        seen.add(id)
+        graded = graded + 1
+      }
+      const key = coordKey(coordVals(co))
+      if index[key] == null {
+        index[key] = g.cls
+        order.push(key)
+      }
+    }
+    i = i + 2
+  }
+  print(
+    "distinct coordinates: \{toString(order.length)} (from \{toString(graded)} graded cells)",
+  )
+
+  const coords: string[][] = []
+  for k in order { coords.push(split(k, "\t")) }
+  const levels: Map<string, string[]> = Map()
+  const shown: string[] = []
+  let ai = 0
+  while ai < AX.length {
+    const vals: string[] = []
+    for c in coords { vals.push(c[ai]) }
+    const l = distinctSorted(vals)
+    levels[AX[ai]] = l
+    shown.push(AX[ai] + "=" + toString(l.length))
+    ai = ai + 1
+  }
+  print("levels seen per axis: " + join(shown, ", "))
+
+  const differ: Map<string, i32> = Map()
+  const compared: Map<string, i32> = Map()
+  const toSilent: Map<string, i32> = Map()
+  const toLoud: Map<string, i32> = Map()
+  const detail: Map<string, Map<string, i32>> = Map()
+  const detailOrder: Map<string, string[]> = Map()
+  for a in AX {
+    detail[a] = Map()
+    detailOrder[a] = []
+  }
+  let ci = 0
+  while ci < coords.length {
+    const coord = coords[ci]
+    const cls = index[order[ci]] ?? ""
+    ai = 0
+    while ai < AX.length {
+      const a = AX[ai]
+      const mine = coord[ai]
+      for lv in levels[a] ?? [] {
+        if lv == mine { continue }
+        coord[ai] = lv
+        const other = index[coordKey(coord)]
+        coord[ai] = mine
+        if other == null { continue }
+        compared[a] = (compared[a] ?? 0) + 1
+        if other != cls {
+          differ[a] = (differ[a] ?? 0) + 1
+          tally(
+            detail[a] ?? Map(),
+            detailOrder[a] ?? [],
+            cls + " -> " + other,
+            1,
+          )
+          if !isSilent(cls) && isSilent(other) {
+            toSilent[a] = (toSilent[a] ?? 0) + 1
+          }
+          if isSilent(cls) && !isSilent(other) {
+            toLoud[a] = (toLoud[a] ?? 0) + 1
+          }
+        }
+      }
+      ai = ai + 1
+    }
+    ci = ci + 1
+  }
+
+  print("")
+  print(
+    "== axis mobility: ordered pairs of coordinates differing in ONE axis ==",
+  )
+  print(
+    "\{padRight("axis", 10)} \{padLeft("compared", 10)} \{padLeft("outcome-≠", 10)} \{padLeft("rate", 8)}   \{padLeft("→silent", 8)} \{padLeft("→loud", 8)}",
+  )
+  const rate: Map<string, f64> = Map()
+  for a in AX {
+    const t = compared[a] ?? 0
+    if t > 0 {
+      rate[a] = ((differ[a] ?? 0) as f64) / (t as f64)
+    } else {
+      rate[a] = 0.0
+    }
+  }
+  for a in byRateDesc(AX, rate) {
+    const t = compared[a] ?? 0
+    let r = "n/a"
+    if t > 0 { r = pyFixed(rate[a] ?? 0.0, 3) }
+    print(
+      "\{padRight(a, 10)} \{padLeft(toString(t), 10)} \{padLeft(toString(differ[a] ?? 0), 10)} \{padLeft(r, 8)}   \{padLeft(toString(toSilent[a] ?? 0), 8)} \{padLeft(toString(toLoud[a] ?? 0), 8)}",
+    )
+  }
+
+  print("")
+  print("== per-axis transition detail (top 6 each) ==")
+  for a in AX {
+    const d = detail[a] ?? Map()
+    const keys = detailOrder[a] ?? []
+    if keys.length == 0 {
+      print(
+        "  "
+          + padRight(a, 10)
+          + " INERT over \{toString(compared[a] ?? 0)} one-step sibling pairs",
+      )
+      continue
+    }
+    const top: string[] = []
+    for k in byCountDesc(keys, d) {
+      if top.length >= 6 { break }
+      top.push(k + " x" + toString(d[k] ?? 0))
+    }
+    print("  " + padRight(a, 10) + " " + join(top, "; "))
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("siblings: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

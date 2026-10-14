@@ -1,5 +1,7 @@
 # d14 — `.length` vs `x[i]` on an unbounded type parameter
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 `lengrid.py`: **45 cells**. 15 argument reps × {`.length` through a generic `T`, `.length` on
 the concrete twin, `x[0]` through a generic `T`}.
 
@@ -59,4 +61,4 @@ grade-class comparison; only the distilled corpus and the corpus `cmp` see it. I
 form — the same arm at the HEAD of the floor block rather than at the floors — reads
 identically on this grid and takes **33 corpus modules** with it, `std/buffer.vl` first,
 because `Buf.length` is a real declared field. Nothing but
-`scripts/silent-sweep/corpuscmp.py` saw that.
+`scripts/silent-sweep/corpuscmp.vl` saw that.

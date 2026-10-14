@@ -88,7 +88,7 @@ heredoc and moves with its own PR.
 | `scripts/inventory/split.py` | 388 | I | scripts/check-filed-witnesses.py | retired: both inventories are split, and the generated `INDEX.md` it wrote (stale at 608 rows) went with it |
 | `scripts/profile-rank.py` | 98 | I | scripts/perf/profile-parents.py scripts/perf/profile-phases.py (+1; `survey-regrade.py` is deleted) | done: deleted; `scripts/profile-rank.vl` (`perf/guest-profile.sh` calls it) matched it on real profiles, and `tests/vl_profile_rank_test.ts` pins the rounding tie and the error lines it could not match |
 | `scripts/silent-sweep/corpuscmp.py` | 91 | D | dated reports and READMEs | done: deleted; `scripts/silent-sweep/corpuscmp.vl` matched it over the whole corpus and three candidate seeds, and `tests/vl_corpuscmp_test.ts` pins its verdicts |
-| `scripts/silent-sweep/d451/mkcells.py` | 246 | X | nothing since `gradecensus.py` (a comment) was deleted | retire: closed grid; keep README + data, drop the generator |
+| `scripts/silent-sweep/d451/mkcells.py` | 246 | X | nothing since `gradecensus.py` (a comment) was deleted | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
 | `scripts/silent-sweep/distilled/redistil.py` | 153 | I | scripts/silent-sweep/distilled/index.py | deleted: `distilled/redistil.vl` |
 | `scripts/silent-sweep/sabotage.py` | 162 | I | scripts/check-filed-witnesses.py | retired: nothing ran it (the grader only cited it); its proof that the silent columns fire is carried every gate run by the distilled corpus's known-silent `named/` cells |
 
@@ -158,60 +158,60 @@ heredoc and moves with its own PR.
 | `scripts/perf/profile-phases.py` | 104 | D | doc tool (+4) | scripts/perf/profile-phases.vl |
 | `scripts/perf/string-concat-sites.py` | 94 | D | doc tool (+4) | scripts/perf/string-concat-sites.vl |
 | `scripts/rep-classifier-census.py` | 650 | D | doc tool (+4) | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/census/coverage.py` | 77 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/coverage.vl |
-| `scripts/silent-sweep/census/delta.py` | 117 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d243/README.md | scripts/silent-sweep/census/delta.vl |
-| `scripts/silent-sweep/census/families.py` | 120 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/families.vl |
+| `scripts/silent-sweep/census/coverage.py` | 77 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/coverage.vl`, pinned by `tests/vl_census_readers_test.ts` |
+| `scripts/silent-sweep/census/delta.py` | 117 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d243/README.md | done: deleted; `census/delta.vl`, pinned by `tests/vl_census_readers_test.ts` |
+| `scripts/silent-sweep/census/families.py` | 120 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/families.vl`, pinned by `tests/vl_census_readers_test.ts` |
 | `scripts/silent-sweep/census/gencensus.py` | 867 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d181/README.md (+2) | scripts/silent-sweep/census/gencensus.vl |
 | `scripts/silent-sweep/census/mkmatrix.py` | 233 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/mkmatrix.vl |
-| `scripts/silent-sweep/census/rescue.py` | 81 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d181/README.md | scripts/silent-sweep/census/rescue.vl |
-| `scripts/silent-sweep/census/rows.py` | 73 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/rows.vl |
+| `scripts/silent-sweep/census/rescue.py` | 81 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d181/README.md | done: deleted; `census/rescue.vl`, pinned by `tests/vl_census_readers_test.ts` |
+| `scripts/silent-sweep/census/rows.py` | 73 | D | scripts/silent-sweep/census/README.md | done: deleted; its coordinate predicates were written for D155–D158 alone |
 | `scripts/silent-sweep/census/sabcensus.py` | 141 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/sabcensus.vl |
-| `scripts/silent-sweep/census/siblings.py` | 76 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/siblings.vl |
-| `scripts/silent-sweep/counts.py` | 61 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/d111/ablate111.py` | 117 | D | scripts/silent-sweep/d111/README.md scripts/silent-sweep/d131/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d111/gen111.py` | 212 | D | scripts/silent-sweep/d111/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d112/gen112.py` | 191 | D | scripts/silent-sweep/d112/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d131/gen131.py` | 219 | D | scripts/silent-sweep/d131/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d139/gen139.py` | 63 | D | scripts/silent-sweep/d139/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d139/grade139.py` | 51 | D | scripts/silent-sweep/d139/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d14/lengrid.py` | 96 | D | scripts/silent-sweep/d14/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d156/gen156.py` | 199 | D | scripts/silent-sweep/d156/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d181/gen181.py` | 82 | D | scripts/silent-sweep/d181/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d184/genlist.py` | 239 | D | scripts/silent-sweep/d184/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d188/aliasgrid.py` | 134 | D | scripts/silent-sweep/d188/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d188/isgrid.py` | 101 | D | scripts/silent-sweep/d188/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d199/gen199.py` | 184 | D | scripts/silent-sweep/d199/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d224/gen224.py` | 49 | D | scripts/silent-sweep/d224/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d224/pairs224.py` | 74 | D | scripts/silent-sweep/d224/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d243/genbox.py` | 316 | D | scripts/silent-sweep/d243/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d243/mkset.py` | 58 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d199/README.md (+2) | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d272/gen272.py` | 105 | D | scripts/silent-sweep/d272/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d282/gen282.py` | 140 | D | scripts/silent-sweep/d282/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d290/gen290.py` | 120 | D | scripts/silent-sweep/d290/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d341/mkgrid.py` | 204 | D | scripts/silent-sweep/d341/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d352/parengrid.py` | 142 | D | scripts/silent-sweep/d352/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d361/genbind.py` | 69 | D | scripts/silent-sweep/d361/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d52/delta.py` | 97 | D | scripts/silent-sweep/d52/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d52/gen52.py` | 280 | D | scripts/silent-sweep/d52/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d52/pivot52.py` | 32 | D | scripts/silent-sweep/d52/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d52/sweep52.py` | 151 | D | scripts/silent-sweep/d111/README.md scripts/silent-sweep/d131/README.md (+4) | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d87/ablate87.py` | 160 | D | scripts/silent-sweep/d87/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d87/gen87.py` | 286 | D | scripts/silent-sweep/d87/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d88/ablate88.py` | 84 | D | scripts/silent-sweep/d88/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d88/gen88.py` | 119 | D | scripts/silent-sweep/d88/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d88/grade88.py` | 75 | D | scripts/silent-sweep/d112/README.md scripts/silent-sweep/d156/README.md (+4) | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d94/ablate94.py` | 117 | D | scripts/silent-sweep/d94/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/d94/gen94.py` | 330 | D | scripts/silent-sweep/d94/README.md | retire: closed grid; keep README + data, drop the generator |
-| `scripts/silent-sweep/final.py` | 70 | D | scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/gen.py` | 628 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md (+1) | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/genorder.py` | 135 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md (+1) | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/mkrepro.py` | 728 | D | scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/pairscope.py` | 91 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/pivot.py` | 41 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/pivotG.py` | 25 | D | scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/summ.py` | 25 | D | scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
-| `scripts/silent-sweep/tp-join/grid.py` | 275 | D | scripts/silent-sweep/d14/README.md scripts/silent-sweep/d188/README.md (+2) | retire with the grids that import it |
-| `scripts/silent-sweep/verify.py` | 67 | D | scripts/silent-sweep/REPRODUCE.md | port to VL or retire (decide at its turn) |
+| `scripts/silent-sweep/census/siblings.py` | 76 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/siblings.vl`, pinned by `tests/vl_census_readers_test.ts` |
+| `scripts/silent-sweep/counts.py` | 61 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/d111/ablate111.py` | 117 | D | scripts/silent-sweep/d111/README.md scripts/silent-sweep/d131/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d111/gen111.py` | 212 | D | scripts/silent-sweep/d111/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d112/gen112.py` | 191 | D | scripts/silent-sweep/d112/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d131/gen131.py` | 219 | D | scripts/silent-sweep/d131/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d139/gen139.py` | 63 | D | scripts/silent-sweep/d139/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d139/grade139.py` | 51 | D | scripts/silent-sweep/d139/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d14/lengrid.py` | 96 | D | scripts/silent-sweep/d14/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d156/gen156.py` | 199 | D | scripts/silent-sweep/d156/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d181/gen181.py` | 82 | D | scripts/silent-sweep/d181/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d184/genlist.py` | 239 | D | scripts/silent-sweep/d184/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d188/aliasgrid.py` | 134 | D | scripts/silent-sweep/d188/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d188/isgrid.py` | 101 | D | scripts/silent-sweep/d188/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d199/gen199.py` | 184 | D | scripts/silent-sweep/d199/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d224/gen224.py` | 49 | D | scripts/silent-sweep/d224/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d224/pairs224.py` | 74 | D | scripts/silent-sweep/d224/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d243/genbox.py` | 316 | D | scripts/silent-sweep/d243/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d243/mkset.py` | 58 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d199/README.md (+2) | done: deleted; `census/mkset.vl`, pinned by `tests/vl_census_readers_test.ts` |
+| `scripts/silent-sweep/d272/gen272.py` | 105 | D | scripts/silent-sweep/d272/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d282/gen282.py` | 140 | D | scripts/silent-sweep/d282/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d290/gen290.py` | 120 | D | scripts/silent-sweep/d290/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d341/mkgrid.py` | 204 | D | scripts/silent-sweep/d341/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d352/parengrid.py` | 142 | D | scripts/silent-sweep/d352/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d361/genbind.py` | 69 | D | scripts/silent-sweep/d361/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d52/delta.py` | 97 | D | scripts/silent-sweep/d52/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d52/gen52.py` | 280 | D | scripts/silent-sweep/d52/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d52/pivot52.py` | 32 | D | scripts/silent-sweep/d52/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d52/sweep52.py` | 151 | D | scripts/silent-sweep/d111/README.md scripts/silent-sweep/d131/README.md (+4) | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d87/ablate87.py` | 160 | D | scripts/silent-sweep/d87/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d87/gen87.py` | 286 | D | scripts/silent-sweep/d87/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d88/ablate88.py` | 84 | D | scripts/silent-sweep/d88/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d88/gen88.py` | 119 | D | scripts/silent-sweep/d88/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d88/grade88.py` | 75 | D | scripts/silent-sweep/d112/README.md scripts/silent-sweep/d156/README.md (+4) | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d94/ablate94.py` | 117 | D | scripts/silent-sweep/d94/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/d94/gen94.py` | 330 | D | scripts/silent-sweep/d94/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/final.py` | 70 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/gen.py` | 628 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md (+1) | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/genorder.py` | 135 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md (+1) | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/mkrepro.py` | 728 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/pairscope.py` | 91 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/pivot.py` | 41 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/pivotG.py` | 25 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/summ.py` | 25 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
+| `scripts/silent-sweep/tp-join/grid.py` | 275 | D | scripts/silent-sweep/d14/README.md scripts/silent-sweep/d188/README.md (+2) | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
+| `scripts/silent-sweep/verify.py` | 67 | D | scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
 | `scripts/std-math/arc-tables.py` | 40 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
 | `scripts/std-math/explog-tables.py` | 169 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |
 | `scripts/std-math/math-grade.py` | 203 | D | doc tool (+4) | VL port with exact-rational tables, or retire after the tables are frozen |

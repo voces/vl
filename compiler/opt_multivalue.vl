@@ -80,7 +80,8 @@ const AR_FD = "11111111111111111111112001212111111111111111112111112111211121112
 const AR_FE = "21313100????????????????????????111111111111112020202020202021212121212121212121"
   + "212121212121212121212121212121212121212121212121212121212121212131313131313131"
 
-const arTabs: u8[][] = []
+const arTabs: i32[][] = []
+const plainAr: i32[] = []
 
 // The module read. A value type is packed as `wasm_write.vl` packs it, with a reference
 // shorthand spelled out as `ref null <abstract>`.
@@ -150,8 +151,8 @@ let gT1: i32[] = []
 // `end` ends, and the call and argument index a value is an argument of.
 let armEnd: {[i32]: i32} = Map()
 let mergeAt: {[i32]: i32} = Map()
-let consK: {[i32]: i32} = Map()
-let consJ: {[i32]: i32} = Map()
+let consK: i32[] = []
+let consJ: i32[] = []
 
 // The analysis: producers per function index; field-only parameters keyed `f * 64 + j`
 // (1 a member); per body its field-only locals, ascending.
@@ -161,9 +162,17 @@ let allowedKeys: i32[] = []
 let fo: {[i32]: i32} = Map()
 let foR: {[i32]: i32} = Map()
 let foLocal: i32[][] = []
-let candT: {[i32]: i32} = Map()
-let candN: {[i32]: i32} = Map()
-let live: {[i32]: i32} = Map()
+// The candidates of the body `fieldOnlyLocals` is reading, dense by local index: a slot is
+// current when its stamp equals `foGen` (per body) or `foRound` (per fixpoint round).
+let foGen = 0
+let foRound = 0
+const foChk: i32[] = []
+const foCand: i32[] = []
+const candT: i32[] = []
+const candN: i32[] = []
+const live: i32[] = []
+const foSeen: i32[] = []
+const foBad: i32[] = []
 
 // The plan being built, keyed by op ordinal, and every finished plan's acts by ordinal.
 let actKind: {[i32]: i32} = Map()
@@ -342,8 +351,8 @@ function resetModule(b: u8[]) {
   gT1 = []
   armEnd = Map()
   mergeAt = Map()
-  consK = Map()
-  consJ = Map()
+  consK = []
+  consJ = []
 }
 
 // Reads the types, imports, functions, tags and body ranges; false when any does not decode.
@@ -754,6 +763,24 @@ function localType(f: i32, l: i32): i32 {
   -1
 }
 
+// The type of every local of defined function `f`, params first, indexed by local.
+function localTypes(f: i32): i32[] {
+  const out: i32[] = []
+  for v in paramsOf(f) { out.push(v) }
+  const bi = f - nImports
+  let k = 0
+  while k < bLocN[bi].length {
+    const v = bLocT[bi][k]
+    let n = 0
+    while n < bLocN[bi][k] {
+      out.push(v)
+      n = n + 1
+    }
+    k = k + 1
+  }
+  out
+}
+
 function localRecord(f: i32, l: i32): i32 {
   const v = localType(f, l)
   if !isRef(v) { return -1 }
@@ -765,13 +792,7 @@ function localRecord(f: i32, l: i32): i32 {
 // Pops and pushes of a fixed-arity operator as `pops * 16 + pushes`; -1 when they depend on
 // its immediates, -2 for an operator the step does not read.
 function tableArity(op: i32): i32 {
-  if arTabs.length == 0 {
-    for s in [AR_00, AR_FB, AR_FC, AR_FD, AR_FE] {
-      const t: u8[] = []
-      for cp in s { t.push(cp) }
-      arTabs.push(t)
-    }
-  }
+  if arTabs.length == 0 { decodeArities() }
   let tab = 0
   let i = op
   if op > 0xff {
@@ -784,12 +805,64 @@ function tableArity(op: i32): i32 {
     else { return -2 }
   }
   const t = arTabs[tab]
-  if i < 0 || 2 * i + 1 >= t.length { return -2 }
-  const a: i32 = t[2 * i]
-  const b: i32 = t[2 * i + 1]
-  if a == 99 { return -1 }
-  if a == 63 { return -2 }
-  (a - 48) * 16 + b - 48
+  if i < 0 || i >= t.length { return -2 }
+  t[i]
+}
+
+// Decodes the `AR_*` strings into `arTabs`, and fills `plainAr`.
+function decodeArities() {
+  for s in [AR_00, AR_FB, AR_FC, AR_FD, AR_FE] {
+    const b: i32[] = []
+    for cp in s { b.push(cp) }
+    const t: i32[] = []
+    let i = 0
+    while i + 1 < b.length {
+      const a = b[i]
+      t.push(
+        if a == 99 { -1 } else if a == 63 { -2 } else { (a - 48) * 16 + b[i + 1] - 48 },
+      )
+      i = i + 2
+    }
+    arTabs.push(t)
+  }
+  let op = 0
+  while op < 256 {
+    const special = op == 0x00
+      || op >= 0x02 && op <= 0x15
+      || op >= 0x18 && op <= 0x19
+      || op == 0x1f
+      || op >= 0x20 && op <= 0x22
+      || op == 0xd5
+      || op == 0xd6
+    plainAr.push(
+      if special || op >= arTabs[0].length { -3 } else { arTabs[0][op] },
+    )
+    op = op + 1
+  }
+  let sub = 0
+  while sub < arTabs[1].length {
+    const special = sub == 0x00
+      || sub == 0x02
+      || sub == 0x05
+      || sub == 0x08
+      || sub == 0x18
+      || sub == 0x19
+    plainAr.push(if special { -3 } else { arTabs[1][sub] })
+    sub = sub + 1
+  }
+}
+
+// The arity of an operator `scanBody` handles by arity alone (packed as `tableArity` packs
+// it), or a negative number for one it reads further. `plainAr` holds the one-byte
+// operators, then the 0xfb ones by sub-opcode.
+function plainArity(op: i32): i32 {
+  if plainAr.length == 0 { decodeArities() }
+  if op >= 0 && op < 256 { return plainAr[op] }
+  if (op >> 16) == 0xfb {
+    const sub = op & 0xffff
+    if sub < plainAr.length - 256 { return plainAr[256 + sub] }
+  }
+  tableArity(op)
 }
 
 // The control frames of the body being scanned: height, block type's params and results,
@@ -805,7 +878,10 @@ let frElse: i32[] = []
 let frTail: i32[] = []
 let frT: i32[] = []
 let frBr: boolean[] = []
-let owner: i32[] = []
+// Per stack position below the current height, the op that wrote it (NONE when unknown);
+// the table only grows, and `ownLen` is the height the op being recorded sees.
+const owner: i32[] = []
+let ownLen = 0
 let seg: i32[] = []
 // The op being scanned.
 let sK = 0
@@ -851,9 +927,32 @@ function popFrame() {
   frBr.pop()
 }
 
+// Grows `owner` to hold `h` positions.
+function ownGrow(h: i32) {
+  while owner.length < h { owner.push(NONE) }
+}
+
+// An op that left the height at `h` from `old`: positions `[old, lo)` are unknown and
+// `[lo, h)` are op `k`'s.
+function ownWrite(old: i32, lo: i32, h: i32, k: i32) {
+  if owner.length < h { ownGrow(h) }
+  let p = old
+  while p < lo {
+    owner[p] = NONE
+    p = p + 1
+  }
+  p = lo
+  while p < h {
+    owner[p] = k
+    p = p + 1
+  }
+}
+
 // The producer of stack position `p` as the current op sees it.
 function producerAt(p: i32): i32 {
-  if !sReach || p < sBase || p < 0 || p >= owner.length { return NONE }
+  if !sReach || p < sBase || p < 0 || p >= ownLen || p >= owner.length {
+    return NONE
+  }
   const q = owner[p]
   if q != NONE && q >= sSegLo { return q }
   NONE
@@ -944,12 +1043,12 @@ function scanBody(bi: i32, f: i32): boolean {
   frTail = []
   frT = []
   frBr = []
-  owner = []
   seg = [0]
   pushFrame(0, sigP[ft].length, sigR[ft].length, false)
   bExits.push(false)
   bInsLo.push(iK.length)
   bOpBase.push(opTotal)
+  if plainAr.length == 0 { decodeArities() }
   const c = wcNew(mB, bOps[bi], bR1[bi])
   let h = 0
   let k = 0
@@ -957,200 +1056,146 @@ function scanBody(bi: i32, f: i32): boolean {
   while c.pos < c.end {
     if frH.length == 0 { return false }
     const at = c.pos
-    const op = wcOp(c)
-    if c.failed { return false }
-    const d = wcNew(mB, at + 1, c.pos)
+    // The commonest ops, with one-byte immediates, are read here; the rest by `wcOp`.
+    let op = -1
+    const b0: i32 = mB[at]
+    if b0 >= 0x45 && b0 <= 0xc4 {
+      op = b0
+      c.pos = at + 1
+    } else if b0 >= 0x20 && b0 <= 0x24 || b0 == 0x41 {
+      if at + 1 < c.end && mB[at + 1] < 0x80 {
+        op = b0
+        c.pos = at + 2
+      }
+    } else if b0 == 0xfb && at + 3 < c.end {
+      if mB[at + 1] == 0x02 && mB[at + 2] < 0x80 && mB[at + 3] < 0x80 {
+        op = 0xfb0002
+        c.pos = at + 4
+      }
+    }
+    if op < 0 {
+      op = wcOp(c)
+      if c.failed { return false }
+    }
+    // A `struct.get` is read by its arity (it pops the reference and pushes the field), and
+    // tells the op before it which field it reads.
+    if op == 0xfb0002 && last >= 0 {
+      const p1 = lebEnd(at + 1, c.pos)
+      follow(last, k, NX_GET, lebAt(p1, c.pos), lebAt(lebEnd(p1, c.pos), c.pos))
+    }
+    // An op read by its arity alone records nothing and leaves the control stack alone.
+    const par = if op == 0xfb0002 { 0x11 } else if op >= 0 && op < 256 { plainAr[op] } else { plainArity(op) }
+    if par >= 0 {
+      last = -1
+      const pushes = par & 15
+      const below = h - (par >> 4)
+      const fb = frH[frH.length - 1]
+      const old = h
+      h = (if below > fb { below } else { fb }) + pushes
+      if owner.length < h { ownGrow(h) }
+      const lo = h - pushes
+      let p = old
+      while p < lo {
+        owner[p] = NONE
+        p = p + 1
+      }
+      p = lo
+      while p < h {
+        owner[p] = k
+        p = p + 1
+      }
+      k = k + 1
+      continue
+    }
+    // A local op: one index, recorded only when the local holds a record.
+    if op >= 0x20 && op <= 0x22 {
+      const top = frH.length - 1
+      const base = frH[top]
+      const l: i32 = if c.pos == at + 2 { mB[at + 1] } else { lebAt(at + 1, c.pos) }
+      const prev = last
+      last = -1
+      if op == 0x21 && prev >= 0 { follow(prev, k, NX_SET, l, 0) }
+      if l >= 0 && l < localRec.length && localRec[l] {
+        sK = k
+        sReach = !frUnr[top]
+        sDepth = frH.length
+        sBase = base
+        sSegLo = seg[seg.length - 1]
+        ownLen = h
+        if op == 0x20 {
+          last = record(K_GET, l, NONE, argv.length)
+        } else {
+          const kind = if op == 0x21 { K_SET } else { K_TEE }
+          last = record(kind, l, producerBelow(h), argv.length)
+        }
+      }
+      const below = if op == 0x20 { h } else { h - 1 }
+      const old = h
+      h = if below > base { below } else { base }
+      if op != 0x21 { h = h + 1 }
+      ownWrite(old, if op != 0x21 { h - 1 } else { h }, h, k)
+      k = k + 1
+      continue
+    }
     const hb = h
     const depth = frH.length
     const top = depth - 1
+    const fnFrame = depth - 1
+    const base = frH[top]
     sK = k
     sReach = !frUnr[top]
     sDepth = depth
-    sBase = frH[top]
+    sBase = base
     sSegLo = seg[seg.length - 1]
-    const fnFrame = depth - 1
-    // The immediates the step reads.
-    let lbl = -1
-    let imm = 0
-    let imm2 = 0
-    if (
-      op == 0x0c
-      || op == 0x0d
-      || op == 0xd5
-      || op == 0xd6
-      || op >= 0x20 && op <= 0x22
-    ) {
-      lbl = wcU32(d)
-    } else if op == 0x07 || op == 0x08 || op == 0x14 || op == 0x11 {
-      imm = wcU32(d)
-    } else if op == 0xfb0018 || op == 0xfb0019 {
-      wcU32(d)
-      wcByte(d)
-      lbl = wcU32(d)
-    } else if (
-      op == 0xfb0000
-      || op == 0xfb0002
-      || op == 0xfb0005
-      || op == 0xfb0008
-    ) {
-      wcU32(d)
-      imm = wcU32(d)
-      imm2 = wcU32(d)
-    } else if op == 0x10 || op == 0x12 {
-      imm = c.imm
-    } else if op == 0x13 || op == 0x15 {
-      imm = wcU32(d)
-    }
-    // As the previous recorded op's next.
-    let nx = NX_OTHER
-    let na = 0
-    let nb = 0
-    if op == 0xfb0002 {
-      nx = NX_GET
-      na = imm
-      nb = imm2
-    } else if op == 0x21 {
-      nx = NX_SET
-      na = lbl
-    } else if (
-      op == 0x0f
-      || op == 0x0b && depth == 1
-      || op == 0x0c && lbl == fnFrame
-    ) {
-      nx = NX_EXIT
-    } else if op == 0x05 || op == 0x0b && frMg[top] {
-      nx = NX_ARM
-    }
-    // A branch to a frame delivers a value no arm's tail names.
-    if (
-      op == 0x0c
-      || op == 0x0d
-      || op == 0xd5
-      || op == 0xd6
-      || op == 0xfb0018
-      || op == 0xfb0019
-    ) {
-      markTarget(lbl)
-    } else if op == 0x0e {
-      const n = wcU32(d)
-      let i = 0
-      while i <= n {
-        markTarget(wcU32(d))
-        i = i + 1
-      }
-    } else if op == 0x1f {
-      let i = 0
-      while i < frMg.length {
-        if frMg[i] { frBr[i] = true }
-        i = i + 1
-      }
-    }
-    if last >= 0 {
-      if iK[last] + 1 == k {
-        iNext[last] = nx
-        iNA[last] = na
-        iNB[last] = nb
-      }
-      last = -1
-    }
-    // What the step records of the op.
-    let rp = 0
-    if op == 0x10 || op == 0x12 {
-      if imm < 0 || imm >= nFuncs { return false }
-      const cps = paramsOf(imm)
-      rp = resultsOf(imm).length
-      if imm >= nImports {
-        const pn = cps.length
-        const a0 = argv.length
-        let j = 0
-        while j < pn {
-          argv.push(if hb >= pn { producerAt(hb - pn + j) } else { NONE })
-          j = j + 1
-        }
-        last = record(if op == 0x10 { K_CALL } else { K_RCALL }, imm, NONE, a0)
-      } else if op == 0x12 {
-        bExits[bi] = true
-      }
-    } else if op == 0x14 || op == 0x11 {
-      if imm >= 0 && imm < nTypes && isFunc[imm] { rp = sigR[imm].length }
-    } else if op == 0x15 || op == 0x13 {
-      bExits[bi] = true
-    } else if op == 0xfb0000 {
-      if shapeOf(imm) { last = record(K_NEW, imm, NONE, argv.length) }
-    } else if op == 0xfb0005 {
-      tainted.push(imm)
-      if !writer.has(imm) { writer[imm] = f }
-    } else if op == 0x20 {
-      if lbl >= 0 && lbl < localRec.length && localRec[lbl] {
-        last = record(K_GET, lbl, NONE, argv.length)
-      }
-    } else if op == 0x21 || op == 0x22 {
-      if lbl >= 0 && lbl < localRec.length && localRec[lbl] {
-        const tp = if hb >= 1 { producerAt(hb - 1) } else { NONE }
-        last = record(
-          if op == 0x21 { K_SET } else { K_TEE },
-          lbl,
-          tp,
-          argv.length,
-        )
-      }
-    } else if (
-      op == 0x0f
-      || op == 0x0b && depth == 1
-      || op == 0x0c && lbl == fnFrame
-    ) {
-      const tp = if hb >= 1 { producerAt(hb - 1) } else { NONE }
-      record(K_EXIT, 0, tp, argv.length)
-    } else if op == 0x05 {
-      if frMg[top] {
-        frElse[top] = k
-        frTail[top] = if hb >= 1 { producerAt(hb - 1) } else { NONE }
-      }
-    } else if op == 0x0b {
-      if frMg[top] && frElse[top] != NONE && !frBr[top] {
-        const tail = if hb >= 1 { producerAt(hb - 1) } else { NONE }
-        const mi = gIf.length
-        gIf.push(frIf[top])
-        gElse.push(frElse[top])
-        gEnd.push(k)
-        gT.push(frT[top])
-        gT0.push(frTail[top])
-        gT1.push(tail)
-        armEnd[opTotal + frElse[top]] = mi
-        armEnd[opTotal + k] = mi
-        mergeAt[opTotal + k] = mi
-        last = record(K_MERGE, frT[top], NONE, argv.length)
-      }
-    } else if (
-      op == 0x0d
-      || op == 0xd5
-      || op == 0xd6
-      || op == 0xfb0018
-      || op == 0xfb0019
-    ) {
-      if lbl >= fnFrame { bExits[bi] = true }
-    } else if op == 0x0e {
-      const d2 = wcNew(mB, at + 1, c.pos)
-      const n = wcU32(d2)
-      let i = 0
-      while i <= n {
-        if wcU32(d2) >= fnFrame { bExits[bi] = true }
-        i = i + 1
-      }
-    } else if (
-      op == 0x06
-      || op == 0x1f
-      || op == 0x18
-      || op == 0x07
-      || op == 0x19
-    ) {
-      bExits[bi] = true
-    }
-    // The stack after the op, and the positions it writes.
+    ownLen = hb
+    // The previous recorded op, whose next this op is.
+    const prev = last
+    last = -1
+    // Each op's arm: its immediates, what it makes of `prev`, the branches it marks, what it
+    // records, and the stack after it (as `pushes`, `rp` and `grew` for the positions below).
     let pushes = 0
+    let rp = 0
     let grew = false
-    const base = sBase
-    if op == 0x02 || op == 0x03 || op == 0x06 || op == 0x1f || op == 0x04 {
+    if op == 0x0b || op == 0x18 {
+      if op == 0x0b && depth == 1 {
+        follow(prev, k, NX_EXIT, 0, 0)
+        record(K_EXIT, 0, producerBelow(hb), argv.length)
+      } else if op == 0x0b && frMg[top] {
+        follow(prev, k, NX_ARM, 0, 0)
+        if frElse[top] != NONE && !frBr[top] {
+          const mi = gIf.length
+          gIf.push(frIf[top])
+          gElse.push(frElse[top])
+          gEnd.push(k)
+          gT.push(frT[top])
+          gT0.push(frTail[top])
+          gT1.push(producerBelow(hb))
+          armEnd[opTotal + frElse[top]] = mi
+          armEnd[opTotal + k] = mi
+          mergeAt[opTotal + k] = mi
+          last = record(K_MERGE, frT[top], NONE, argv.length)
+        }
+      }
+      if op == 0x18 { bExits[bi] = true }
+      h = frH[top] + frR[top]
+      pushes = frR[top]
+      popFrame()
+      seg.pop()
+    } else if (
+      op == 0x02
+      || op == 0x03
+      || op == 0x04
+      || op == 0x06
+      || op == 0x1f
+    ) {
+      if op == 0x1f {
+        let i = 0
+        while i < frMg.length {
+          if frMg[i] { frBr[i] = true }
+          i = i + 1
+        }
+      }
+      if op == 0x06 || op == 0x1f { bExits[bi] = true }
       const bt = blockTypeAt(at + 1)
       if bt < 0 { return false }
       const bp = bt >> 16
@@ -1169,33 +1214,53 @@ function scanBody(bi: i32, f: i32): boolean {
       h = hp + bp
       pushes = bp
       grew = true
+      seg.push(k + 1)
     } else if op == 0x05 {
+      if frMg[top] {
+        follow(prev, k, NX_ARM, 0, 0)
+        frElse[top] = k
+        frTail[top] = producerBelow(hb)
+      }
       h = frH[top] + frP[top]
       frUnr[top] = false
       pushes = frP[top]
-    } else if op == 0x07 {
-      if imm < 0 || imm >= tagType.length { return false }
-      const tp = sigP[tagType[imm]].length
-      h = frH[top] + tp
-      frUnr[top] = false
-      pushes = tp
-    } else if op == 0x19 {
-      h = frH[top]
-      frUnr[top] = false
-    } else if op == 0x0b || op == 0x18 {
-      h = frH[top] + frR[top]
-      pushes = frR[top]
-      popFrame()
-    } else if (
-      op == 0x00
-      || op >= 0x08 && op <= 0x0a
-      || op == 0x0c
-      || op == 0x0e
-      || op == 0x0f
-      || op == 0x12
-      || op == 0x13
-      || op == 0x15
-    ) {
+      seg[seg.length - 1] = k + 1
+    } else if op == 0x10 || op == 0x12 {
+      const callee = c.imm
+      if callee < 0 || callee >= nFuncs { return false }
+      const cps = paramsOf(callee)
+      rp = resultsOf(callee).length
+      if callee >= nImports {
+        const pn = cps.length
+        const a0 = argv.length
+        let j = 0
+        while j < pn {
+          argv.push(if hb >= pn { producerAt(hb - pn + j) } else { NONE })
+          j = j + 1
+        }
+        last = record(
+          if op == 0x10 { K_CALL } else { K_RCALL },
+          callee,
+          NONE,
+          a0,
+        )
+      } else if op == 0x12 {
+        bExits[bi] = true
+      }
+      if op == 0x10 {
+        pushes = rp
+        h = max(hb - cps.length, base) + rp
+      } else {
+        h = base
+        frUnr[top] = true
+      }
+    } else if op == 0x0c {
+      const lbl = lebAt(at + 1, c.pos)
+      markTarget(lbl)
+      if lbl == fnFrame {
+        follow(prev, k, NX_EXIT, 0, 0)
+        record(K_EXIT, 0, producerBelow(hb), argv.length)
+      }
       h = base
       frUnr[top] = true
     } else if (
@@ -1205,6 +1270,14 @@ function scanBody(bi: i32, f: i32): boolean {
       || op == 0xfb0018
       || op == 0xfb0019
     ) {
+      const d = wcNew(mB, at + 1, c.pos)
+      if op > 0xff {
+        wcU32(d)
+        wcByte(d)
+      }
+      const lbl = wcU32(d)
+      markTarget(lbl)
+      if lbl >= fnFrame { bExits[bi] = true }
       const n = labelArity(lbl)
       if n < 0 { return false }
       let pops = n
@@ -1216,52 +1289,127 @@ function scanBody(bi: i32, f: i32): boolean {
       }
       if op == 0xd6 { pushes = n - 1 }
       h = max(hb - pops, base) + pushes
-    } else if op == 0x10 || op == 0x11 || op == 0x14 {
-      let ps = 0
-      if op == 0x10 {
-        ps = paramsOf(imm).length
-      } else {
-        if imm < 0 || imm >= nTypes || !isFunc[imm] { return false }
-        ps = sigP[imm].length + 1
+    } else if op == 0x0f {
+      follow(prev, k, NX_EXIT, 0, 0)
+      record(K_EXIT, 0, producerBelow(hb), argv.length)
+      h = base
+      frUnr[top] = true
+    } else if op == 0x0e {
+      const d = wcNew(mB, at + 1, c.pos)
+      const n = wcU32(d)
+      let i = 0
+      while i <= n {
+        const lbl = wcU32(d)
+        markTarget(lbl)
+        if lbl >= fnFrame { bExits[bi] = true }
+        i = i + 1
       }
+      h = base
+      frUnr[top] = true
+    } else if op == 0x11 || op == 0x14 {
+      const ti = lebAt(at + 1, c.pos)
+      if ti < 0 || ti >= nTypes || !isFunc[ti] { return false }
+      rp = sigR[ti].length
       pushes = rp
-      h = max(hb - ps, base) + rp
-    } else if op == 0xfb0000 {
-      if imm < 0 || imm >= nTypes || !isStruct[imm] { return false }
-      h = max(hb - fVals[imm].length, base) + 1
-      pushes = 1
-    } else if op == 0xfb0008 {
-      h = max(hb - imm2, base) + 1
-      pushes = 1
+      h = max(hb - sigP[ti].length - 1, base) + rp
+    } else if op == 0x13 || op == 0x15 {
+      bExits[bi] = true
+      h = base
+      frUnr[top] = true
+    } else if op == 0x07 {
+      bExits[bi] = true
+      const tag = lebAt(at + 1, c.pos)
+      if tag < 0 || tag >= tagType.length { return false }
+      const tp = sigP[tagType[tag]].length
+      h = frH[top] + tp
+      frUnr[top] = false
+      pushes = tp
+      seg[seg.length - 1] = k + 1
+    } else if op == 0x19 {
+      bExits[bi] = true
+      h = frH[top]
+      frUnr[top] = false
+      seg[seg.length - 1] = k + 1
+    } else if op == 0x00 || op >= 0x08 && op <= 0x0a {
+      h = base
+      frUnr[top] = true
+    } else if (op == 0xfb0000 || op == 0xfb0005 || op == 0xfb0008) {
+      const p1 = lebEnd(at + 1, c.pos)
+      const imm = lebAt(p1, c.pos)
+      const imm2 = lebAt(lebEnd(p1, c.pos), c.pos)
+      if op == 0xfb0000 {
+        if shapeOf(imm) { last = record(K_NEW, imm, NONE, argv.length) }
+        if imm < 0 || imm >= nTypes || !isStruct[imm] { return false }
+        h = max(hb - fVals[imm].length, base) + 1
+        pushes = 1
+      } else if op == 0xfb0008 {
+        h = max(hb - imm2, base) + 1
+        pushes = 1
+      } else {
+        if op == 0xfb0005 {
+          tainted.push(imm)
+          if !writer.has(imm) { writer[imm] = f }
+        }
+        const ar = tableArity(op)
+        if ar < 0 { return false }
+        pushes = ar & 15
+        h = max(hb - (ar >> 4), base) + pushes
+      }
     } else {
       const ar = tableArity(op)
       if ar < 0 { return false }
       pushes = ar & 15
       h = max(hb - (ar >> 4), base) + pushes
     }
-    const ha = h
-    let lo = max(ha - pushes, 0)
-    lo = min(lo, max(ha - rp, 0))
-    if grew { lo = min(lo, frH[frH.length - 1]) }
-    while owner.length < ha { owner.push(NONE) }
-    let p = lo
-    while p < ha {
-      owner[p] = k
-      p = p + 1
-    }
-    while owner.length > ha { owner.pop() }
-    if grew {
-      seg.push(k + 1)
-    } else if op == 0x05 || op == 0x07 || op == 0x19 {
-      seg[seg.length - 1] = k + 1
-    } else if op == 0x0b || op == 0x18 {
-      seg.pop()
-    }
+    // The positions the op writes.
+    let lo = h - (if pushes > rp { pushes } else { rp })
+    if lo < 0 { lo = 0 }
+    if grew && frH[frH.length - 1] < lo { lo = frH[frH.length - 1] }
+    ownWrite(hb, lo, h, k)
     k = k + 1
   }
   bInsHi.push(iK.length)
   opTotal = opTotal + k + 1
   true
+}
+
+// Records that the op after recorded op `prev` is `nx` (with its operands), when op `k` is it.
+function follow(prev: i32, k: i32, nx: i32, na: i32, nb: i32) {
+  if prev >= 0 && iK[prev] + 1 == k {
+    iNext[prev] = nx
+    iNA[prev] = na
+    iNB[prev] = nb
+  }
+}
+
+// The producer of the top of a stack of height `hb`, as the current op sees it.
+function producerBelow(hb: i32): i32 {
+  if hb >= 1 { producerAt(hb - 1) } else { NONE }
+}
+
+// The first unsigned LEB128 in `mB[p, end)`, an immediate the op reader has already checked.
+function lebAt(p: i32, end: i32): i32 {
+  let v = 0
+  let s = 0
+  let i = p
+  while i < end && i >= 0 && i < mB.length {
+    const b: i32 = mB[i]
+    v = v | ((b & 0x7f) << s)
+    if b < 0x80 { return v }
+    s = s + 7
+    i = i + 1
+  }
+  v
+}
+
+// The position just past the unsigned LEB128 at `p`, at most `end`.
+function lebEnd(p: i32, end: i32): i32 {
+  let i = p
+  while i < end && i >= 0 && i < mB.length {
+    if mB[i] < 0x80 { return i + 1 }
+    i = i + 1
+  }
+  end
 }
 
 function max(a: i32, b: i32): i32 {
@@ -1333,6 +1481,23 @@ function postPass() {
 
 // ---- Analysis ----
 
+// `n` (at least) copies of `v`, grown by doubling so each step is one bulk copy.
+function filledI32(n: i32, v: i32): i32[] {
+  let a: i32[] = [v]
+  while a.length < n { a = a + a }
+  a
+}
+
+// The ordinal of the call consuming the value made at global ordinal `key`, or NONE.
+function consAt(key: i32): i32 {
+  if key < 0 || key >= consK.length { NONE } else { consK[key] }
+}
+
+// The argument position at which `consAt(key)` takes that value.
+function consArg(key: i32): i32 {
+  if key < 0 || key >= consJ.length { 0 } else { consJ[key] }
+}
+
 // The recorded op of body `bi` at ordinal `k`, or -1.
 function at(bi: i32, k: i32): i32 {
   let lo = bInsLo[bi]
@@ -1356,9 +1521,9 @@ function fieldUse(f: i32, ii: i32, t: i32): boolean {
   if iNext[ii] == NX_GET { return sameArg(iNA[ii], t) }
   const bi = f - nImports
   const key = bOpBase[bi] + iK[ii]
-  if !consK.has(key) { return false }
-  const ci = at(bi, consK[key] ?? 0)
-  const j = consJ[key] ?? 0
+  if consAt(key) == NONE { return false }
+  const ci = at(bi, consAt(key))
+  const j = consArg(key)
   if ci < 0 { return false }
   const h = iA[ci]
   const pt = paramArgRecord(h, j)
@@ -1380,7 +1545,9 @@ function anyFo(): boolean {
 }
 
 function analyse() {
-  // Arguments' consumers.
+  // Arguments' consumers, by global ordinal.
+  consK = filledI32(opTotal, NONE)
+  consJ = filledI32(opTotal, 0)
   let bi = 0
   while bi < bR0.length {
     let ii = bInsLo[bi]
@@ -1531,7 +1698,26 @@ function analyse() {
 }
 
 function sameLocal(l: i32, t: i32): boolean {
-  (live[l] ?? 0) == 1 && candT.has(l) && sameShape(candT[l] ?? -1, t)
+  isCand(l) && live[l] == 1 && sameShape(candT[l], t)
+}
+
+// Whether local `l` is a candidate of the body being read.
+function isCand(l: i32): boolean {
+  l >= 0 && l < foCand.length && foCand[l] == foGen
+}
+
+// Grows the dense candidate tables to hold local `l`.
+function foGrow(l: i32): i32 {
+  while foCand.length <= l {
+    foChk.push(0)
+    foCand.push(0)
+    candT.push(0)
+    candN.push(0)
+    live.push(0)
+    foSeen.push(0)
+    foBad.push(0)
+  }
+  0
 }
 
 // Whether the value at ordinal `k` of body `bi`, of record type `t`, is an arm's value where
@@ -1552,34 +1738,39 @@ function armHeld(bi: i32, k: i32, t: i32, l: i32): boolean {
 function fieldOnlyLocals(f: i32): i32[] {
   const bi = f - nImports
   const np = paramsOf(f).length
-  candT = Map()
-  candN = Map()
-  live = Map()
+  foGen = foGen + 1
   const cands: i32[] = []
+  let lts: i32[] = []
+  let ltsRead = false
   let ii = bInsLo[bi]
   while ii < bInsHi[bi] {
     const kind = iKind[ii]
     const l = iA[ii]
-    if (
-      (kind == K_GET || kind == K_SET || kind == K_TEE)
-      && l >= np
-      && !candT.has(l)
-    ) {
-      const v = localType(f, l)
-      const t = concreteIdx(v)
-      if t >= 0 && shapeOf(t) {
-        candT[l] = t
-        candN[l] = if isNullable(v) { 1 } else { 0 }
-        cands.push(l)
-        live[l] = 1
+    if (kind == K_GET || kind == K_SET || kind == K_TEE) && l >= 0 {
+      foGrow(l)
+      if l >= np && foChk[l] != foGen {
+        foChk[l] = foGen
+        if !ltsRead {
+          lts = localTypes(f)
+          ltsRead = true
+        }
+        const v = if l < lts.length { lts[l] } else { -1 }
+        const t = concreteIdx(v)
+        if t >= 0 && shapeOf(t) {
+          foCand[l] = foGen
+          candT[l] = t
+          candN[l] = if isNullable(v) { 1 } else { 0 }
+          cands.push(l)
+          live[l] = 1
+        }
       }
     }
     ii = ii + 1
   }
+  if cands.length == 0 { return [] }
   let changed = true
   while changed {
-    const firstSeen: {[i32]: i32} = Map()
-    const bad: {[i32]: i32} = Map()
+    foRound = foRound + 1
     ii = bInsLo[bi]
     while ii < bInsHi[bi] {
       const kind = iKind[ii]
@@ -1590,10 +1781,10 @@ function fieldOnlyLocals(f: i32): i32[] {
       let ok = false
       if kind == K_TEE {
         seen = true
-      } else if kind == K_GET && candT.has(l) {
+      } else if kind == K_GET && isCand(l) {
         seen = true
-        const t = candT[l] ?? -1
-        const nullable = (candN[l] ?? 0) == 1
+        const t = candT[l]
+        const nullable = candN[l] == 1
         const copied = iNext[ii] == NX_SET
           && iNA[ii] != l
           && reach
@@ -1603,11 +1794,11 @@ function fieldOnlyLocals(f: i32): i32[] {
           || copied
           || arm
           || reach && viaResult(f, ii, t, l)
-        ok = use && (!nullable || firstSeen.has(l))
-      } else if kind == K_SET && candT.has(l) {
+        ok = use && (!nullable || foSeen[l] == foRound)
+      } else if kind == K_SET && isCand(l) {
         seen = true
-        const t = candT[l] ?? -1
-        const nullable = (candN[l] ?? 0) == 1
+        const t = candT[l]
+        const nullable = candN[l] == 1
         let src = -1
         if reach && iTop[ii] != NONE && iTop[ii] + 1 == k {
           src = at(bi, iTop[ii])
@@ -1626,19 +1817,19 @@ function fieldOnlyLocals(f: i32): i32[] {
           }
         }
         const firstOk = !nullable
-          || firstSeen.has(l)
+          || foSeen[l] == foRound
           || iDepth[ii] == 1 && reach
         ok = srcOk && firstOk
       }
-      if seen {
-        firstSeen[l] = 1
-        if !ok { bad[l] = 1 }
+      if seen && l >= 0 {
+        foSeen[l] = foRound
+        if !ok { foBad[l] = foRound }
       }
       ii = ii + 1
     }
     changed = false
     for l in cands {
-      if (live[l] ?? 0) == 1 && bad.has(l) {
+      if live[l] == 1 && foBad[l] == foRound {
         live[l] = 0
         changed = true
       }
@@ -1646,7 +1837,7 @@ function fieldOnlyLocals(f: i32): i32[] {
   }
   const out: i32[] = []
   for l in cands {
-    if (live[l] ?? 0) == 1 { out.push(l) }
+    if live[l] == 1 { out.push(l) }
   }
   sortInts(out)
   out
@@ -1656,9 +1847,9 @@ function fieldOnlyLocals(f: i32): i32[] {
 function viaResult(f: i32, ii: i32, t: i32, l: i32): boolean {
   const bi = f - nImports
   const key = bOpBase[bi] + iK[ii]
-  if !consK.has(key) { return false }
-  const ci = at(bi, consK[key] ?? 0)
-  const j = consJ[key] ?? 0
+  if consAt(key) == NONE { return false }
+  const ci = at(bi, consAt(key))
+  const j = consArg(key)
   if ci < 0 || iKind[ci] != K_CALL { return false }
   const h = iA[ci]
   const rt = resultRecord(h)
@@ -1980,6 +2171,128 @@ function planCall(
 
 function putUleb(out: u8[], v: i32) { wnPutLeb(out, v) }
 
+// The bytes `putUleb` writes for `v`.
+function lebWidth(v: i32): i32 {
+  let n = 1
+  let x = v
+  while x >= 0x80 {
+    n = n + 1
+    x = x >> 7
+  }
+  n
+}
+
+// The output module under construction, as pieces joined once at the end: `rpBuf[i]` from
+// `rpAt[i]` for `rpLen[i]` bytes. Short runs collect in `rpTail`; `rpSize` is the total so far.
+let rpBuf: u8[][] = []
+let rpAt: i32[] = []
+let rpLen: i32[] = []
+let rpFromMB: boolean[] = []
+let rpTail: u8[] = []
+let rpSize = 0
+
+function rpReset() {
+  rpBuf = []
+  rpAt = []
+  rpLen = []
+  rpFromMB = []
+  rpTail = []
+  rpSize = 0
+}
+
+function rpFlush() {
+  if rpTail.length == 0 { return }
+  rpBuf.push(rpTail)
+  rpAt.push(0)
+  rpLen.push(rpTail.length)
+  rpFromMB.push(false)
+  rpTail = []
+}
+
+function rpByte(x: i32) {
+  rpTail.push(x)
+  rpSize = rpSize + 1
+}
+
+function rpLeb(v: i32) {
+  putUleb(rpTail, v)
+  rpSize = rpSize + lebWidth(v)
+}
+
+// Appends `b[at, at + len)`, where `b` is a buffer other than the input module.
+function rpRange(b: u8[], at: i32, len: i32) {
+  if len <= 64 {
+    copyBytes(rpTail, b, at, len)
+  } else {
+    rpFlush()
+    rpBuf.push(b)
+    rpAt.push(at)
+    rpLen.push(len)
+    rpFromMB.push(false)
+  }
+  rpSize = rpSize + len
+}
+
+// Appends `mB[at, at + len)`, extending the last piece when it ends where this begins.
+function rpInput(at: i32, len: i32) {
+  const n = rpBuf.length
+  if (
+    rpTail.length == 0
+    && n > 0
+    && rpFromMB[n - 1]
+    && rpAt[n - 1] + rpLen[n - 1] == at
+  ) {
+    rpLen[n - 1] = rpLen[n - 1] + len
+  } else if len <= 64 {
+    copyBytes(rpTail, mB, at, len)
+  } else {
+    rpFlush()
+    rpBuf.push(mB)
+    rpAt.push(at)
+    rpLen.push(len)
+    rpFromMB.push(true)
+  }
+  rpSize = rpSize + len
+}
+
+// The pieces as one fresh buffer: each cut once, then joined pairwise, so a byte is copied
+// once per halving of the piece count.
+function rpJoin(): u8[] {
+  rpFlush()
+  let parts: u8[][] = []
+  let i = 0
+  while i < rpBuf.length {
+    parts.push(rpBuf[i].slice(rpAt[i], rpAt[i] + rpLen[i]))
+    i = i + 1
+  }
+  if parts.length == 0 { return [] }
+  while parts.length > 1 {
+    const next: u8[][] = []
+    let j = 0
+    while j + 1 < parts.length {
+      next.push(parts[j] + parts[j + 1])
+      j = j + 2
+    }
+    if j < parts.length { next.push(parts[j]) }
+    parts = next
+  }
+  parts[0]
+}
+
+// Whether `mB[at - lebWidth(v), at)` holds the bytes `putUleb` writes for `v`.
+function minimalLebBefore(at: i32, v: i32): boolean {
+  const w = lebWidth(v)
+  const p = at - w
+  if p < 0 || at > mB.length { return false }
+  let i = 0
+  while i < w {
+    const b: i32 = mB[p + i]
+    if (b >= 0x80) != (i < w - 1) { return false }
+    i = i + 1
+  }
+  lebAt(p, at) == v
+}
+
 function putSleb(out: u8[], v: i32) {
   let x = v
   let more = true
@@ -2279,8 +2592,11 @@ function assemble(): u8[] {
     }
     i = i + 1
   }
-  // The bodies, and per output body its pairs and source range.
+  // The bodies (each a range of a buffer), and per output body its pairs and source range.
   const bodies: u8[][] = []
+  const bodyAt: i32[] = []
+  const bodyLen: i32[] = []
+  const bodyIn: boolean[] = []
   const pairLo: i32[] = []
   const pairOld: i32[] = []
   const pairNew: i32[] = []
@@ -2300,15 +2616,19 @@ function assemble(): u8[] {
     srcFrom.push(bR0[bi])
     srcTo.push(bR1[bi])
     if p < nOrig && pLo[p] == pHi[p] {
-      const body: u8[] = []
-      copyBytes(body, mB, bR0[bi], bR1[bi] - bR0[bi])
-      bodies.push(body)
+      bodies.push(mB)
+      bodyAt.push(bR0[bi])
+      bodyIn.push(true)
+      bodyLen.push(bR1[bi] - bR0[bi])
     } else {
       const slo = if p < nOrig { 0 } else { twLo[p - nOrig] }
       const shi = if p < nOrig { 0 } else { twHi[p - nOrig] }
       if !emitBody(f, slo, shi, p) { return none }
       if p >= nOrig { growth = growth + eOut.length }
       bodies.push(eOut)
+      bodyAt.push(0)
+      bodyIn.push(false)
+      bodyLen.push(eOut.length)
       let q = 0
       while q < eOld.length {
         pairOld.push(eOld[q])
@@ -2340,8 +2660,8 @@ function assemble(): u8[] {
     i = i + 1
   }
   // Reassemble: the type, function and code sections grow; every other section is copied.
-  const out: u8[] = []
-  copyBytes(out, mB, 0, 8)
+  rpReset()
+  rpInput(0, 8)
   const pairAt: i32[] = []
   let saw = 0
   const c = wcNew(mB, 8, mB.length)
@@ -2369,29 +2689,51 @@ function assemble(): u8[] {
         saw = saw | 2
       }
     } else if id == 10 {
-      putUleb(s, bodies.length)
-      const starts: i32[] = []
-      for bb in bodies {
-        putUleb(s, bb.length)
-        starts.push(s.length)
-        copyBytes(s, bb, 0, bb.length)
+      // An unchanged body is taken with its size from the input when that size is spelled
+      // as `putUleb` spells it, so runs of unchanged bodies stay one piece.
+      let size = lebWidth(bodies.length)
+      let b = 0
+      while b < bodies.length {
+        size = size + lebWidth(bodyLen[b]) + bodyLen[b]
+        b = b + 1
       }
-      const head: u8[] = [10]
-      putUleb(head, s.length)
-      const base = out.length + head.length
-      for st in starts { pairAt.push(base + st) }
+      rpByte(10)
+      rpLeb(size)
+      rpLeb(bodies.length)
+      b = 0
+      while b < bodies.length {
+        const w = lebWidth(bodyLen[b])
+        if bodyIn[b] && minimalLebBefore(bodyAt[b], bodyLen[b]) {
+          pairAt.push(rpSize + w)
+          rpInput(bodyAt[b] - w, w + bodyLen[b])
+        } else {
+          rpLeb(bodyLen[b])
+          pairAt.push(rpSize)
+          if bodyIn[b] {
+            rpInput(bodyAt[b], bodyLen[b])
+          } else {
+            rpRange(bodies[b], bodyAt[b], bodyLen[b])
+          }
+        }
+        b = b + 1
+      }
       saw = saw | 4
     }
-    if id == 1 || id == 3 || id == 10 {
-      out.push(id)
-      putUleb(out, s.length)
-      copyBytes(out, s, 0, s.length)
-    } else {
-      copyBytes(out, mB, start, sectionEnd - start)
+    if id == 1 || id == 3 {
+      rpByte(id)
+      rpLeb(s.length)
+      rpRange(s, 0, s.length)
+    } else if id != 10 {
+      rpInput(start, sectionEnd - start)
     }
     c.pos = sectionEnd
   }
-  if saw != 7 { return none }
+  if saw != 7 {
+    rpReset()
+    return none
+  }
+  const out = rpJoin()
+  rpReset()
   // The moves.
   putUleb(movesOut, bodies.length)
   i = 0
@@ -2813,11 +3155,11 @@ function keepSite(
       "returned by the caller (read as fields only inside the caller's own ",
     )
     putText(reason, "result twin)")
-  } else if consK.has(key) {
+  } else if consAt(key) != NONE {
     putText(reason, "passed as argument ")
-    putDec(reason, consJ[key] ?? 0)
+    putDec(reason, consArg(key))
     putText(reason, " of ")
-    const ci = at(ix, consK[key] ?? 0)
+    const ci = at(ix, consAt(key))
     if ci >= 0 && (iKind[ci] == K_CALL || iKind[ci] == K_RCALL) {
       putName(reason, iA[ci])
     }

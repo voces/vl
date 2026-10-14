@@ -163,9 +163,9 @@ missing is the widths, the growth, the bulk ops, the export — and one emitter 
   print family (`imports: []` on a `__store_i32__` program, four print imports on a `__log__` one).
   **`imports.memory` is dead in both**, and has been since the native emitter started defining its
   own memory.
-- **`scripts/wasmtime-host.rs`** also defines `imports.memory`. It is a retired spike
+- **`scripts/wasmtime-host.rs`** (since deleted) also defined `imports.memory`. It was a retired spike
   (`docs/internals/wasmtime-parity.md` §"The host used for the spike"), not in CI and not built by
-  anything — it is not a live host for P0.2 purposes.
+  anything — it was not a live host for P0.2 purposes.
 
 ---
 

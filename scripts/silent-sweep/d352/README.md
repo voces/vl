@@ -1,5 +1,7 @@
 # d352 — the paren-place grid
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 `parengrid.py`: **184 cells**. Where a `(` may stand in a narrowed PLACE, on both sides of
 the guard, and whether the two spellings key the same place.
 

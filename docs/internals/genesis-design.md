@@ -9,7 +9,7 @@ proves the result is a byte-for-byte fixpoint. None of that touches TypeScript.
 
 The one remaining TS dependence WAS **genesis**: minting the *first* seed when
 none exists. That path used to be the legacy TS emitter (`deno run -A
-scripts/build-compiler-wasm.ts`, `compiler/compile.ts` → `toWasm.ts`), kept as a
+scripts/build-compiler-wasm.ts`, since removed, `compiler/compile.ts` → `toWasm.ts`), kept as a
 fallback for a cold clone / cold CI cache. It has since been **removed entirely**
 — the project does not maintain a second compiler. The published release is now
 the seed's source of truth; this doc describes that scheme and what replaced the
@@ -66,7 +66,7 @@ seed is republished on every master push, so `seed-latest` tracks master).
 
 ### No break-glass: the seed is the source of truth
 
-There is **no** TS genesis path. `scripts/build-compiler-wasm.ts` (the stage-0
+There is **no** TS genesis path. `scripts/build-compiler-wasm.ts` (removed; the stage-0
 emitter that drove `compile.ts`/`toWasm.ts`) and its `_selfhost_cache.ts` helper
 were **deleted** — the project keeps no second compiler, the explicit reason this
 break-glass was retired. The immutable **`seed-v0`** release anchors the auditable
