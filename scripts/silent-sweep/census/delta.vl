@@ -1,0 +1,273 @@
+// One census block graded against two seeds, cell by cell: did any cell move backward?
+//
+//     vl run scripts/silent-sweep/census/delta.vl -- <celldir> <before.json> <after.json> [--limit N]
+//
+// Two histograms are a net, and a net hides 300 cells lost behind 300 gained, so the unit
+// is the cell matched by name. Leads with `runs` lost, then moves into a silent class, then
+// the gains, the full transition matrix and the per-class totals. A cell in only one
+// grading is counted and named, never skipped. Run from the checkout root.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { join, split } from "std:str"
+import { JsonMap, cpPrefix, die } from "../../lib/common"
+import { padLeft, padRight, sortStrings } from "../../lib/corpus"
+import {
+  AX,
+  Graded,
+  byCountDesc,
+  distinctSorted,
+  grading,
+  isSilent,
+  manifestCoords,
+  pathJoin,
+  pyFixed,
+  pyList,
+  signed,
+  tally,
+} from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/delta.vl -- <celldir> <before.json> <after.json> [--limit N]"
+
+type Ctx = {
+  cells: string,
+  coords: Map<string, JsonMap>,
+  before: Map<string, Graded>,
+  after: Map<string, Graded>,
+  limit: i32,
+}
+
+function cls(g: Map<string, Graded>, c: string): string {
+  (g[c] ?? { cls: "", msg: "" }).cls
+}
+
+function msg(g: Map<string, Graded>, c: string): string {
+  (g[c] ?? { cls: "", msg: "" }).msg
+}
+
+function strAxis(co: JsonMap, a: string): string {
+  const v = co[a] ?? null
+  if v is string { return v }
+  ""
+}
+
+function show(x: Ctx, title: string, cells: string[], msgFromAfter: boolean) {
+  print("")
+  print("== \{title}: \{toString(cells.length)} ==")
+  if cells.length == 0 { return }
+  const first = x.coords[cells[0]] ?? Map()
+  const fixed: string[] = []
+  for a in AX {
+    if (first[a] ?? null) == null { continue }
+    const vals: string[] = []
+    for c in cells { vals.push(strAxis(x.coords[c] ?? Map(), a)) }
+    const v = distinctSorted(vals)
+    if v.length == 1 { fixed.push(a + "=" + v[0]) }
+  }
+  let constant = join(fixed, ", ")
+  if constant == "" { constant = "(nothing)" }
+  print("   constant across them: " + constant)
+  const counts: Map<string, i32> = Map()
+  const order: string[] = []
+  const parts: Map<string, string[]> = Map()
+  for c in cells {
+    let m = msg(x.before, c)
+    if msgFromAfter { m = msg(x.after, c) }
+    const row = [cls(x.before, c), cls(x.after, c), cpPrefix(m, 90)]
+    const k = join(row, "\n")
+    if counts[k] == null { parts[k] = row }
+    tally(counts, order, k, 1)
+  }
+  let shown = 0
+  for k in byCountDesc(order, counts) {
+    if shown >= x.limit { break }
+    shown = shown + 1
+    const r = parts[k] ?? []
+    print(
+      "   \{padLeft(toString(counts[k] ?? 0), 6)}  \{padRight(r[0], 24)} -> \{padRight(r[1], 24)} \{r[2]}",
+    )
+  }
+  let i = 0
+  while i < cells.length && i < 3 {
+    const c = cells[i]
+    print("   witness: " + pathJoin(x.cells, c) + ".vl")
+    print(
+      "       before: \{padRight(cls(x.before, c), 24)} \{cpPrefix(msg(x.before, c), 100)}",
+    )
+    print(
+      "       after : \{padRight(cls(x.after, c), 24)} \{cpPrefix(msg(x.after, c), 100)}",
+    )
+    i = i + 1
+  }
+}
+
+function pct(n: i32, d: i32): f64 {
+  let dd = d
+  if dd < 1 { dd = 1 }
+  100.0 * (n as f64) / (dd as f64)
+}
+
+function main(args: string[]): i32 {
+  let limit = 40
+  const pos: string[] = []
+  let i = 0
+  while i < args.length {
+    if args[i] == "--limit" && i + 1 < args.length {
+      const n = parseI32(args[i + 1])
+      if n == null { die("delta: --limit takes a number\n" + USAGE, 2) }
+      limit = n ?? 40
+      i = i + 2
+      continue
+    }
+    pos.push(args[i])
+    i = i + 1
+  }
+  if pos.length < 3 { die(USAGE, 2) }
+  const x: Ctx = {
+    cells: pos[0],
+    coords: manifestCoords(pos[0]),
+    before: grading(pos[1]),
+    after: grading(pos[2]),
+    limit: limit,
+  }
+
+  const bk: string[] = []
+  const onlyB: string[] = []
+  const common: string[] = []
+  for k, _ in x.before { bk.push(k) }
+  for k in bk {
+    if x.after[k] == null { onlyB.push(k) } else { common.push(k) }
+  }
+  const onlyA: string[] = []
+  let ak = 0
+  for k, _ in x.after {
+    ak = ak + 1
+    if x.before[k] == null { onlyA.push(k) }
+  }
+  const matched = sortStrings(common)
+  print(
+    "cells graded before: \{toString(bk.length)}   after: \{toString(ak)}   matched by name: \{toString(matched.length)}",
+  )
+  if onlyB.length > 0 || onlyA.length > 0 {
+    const sb = sortStrings(onlyB)
+    const sa = sortStrings(onlyA)
+    print("  ** POPULATION MISMATCH — not comparable without saying so **")
+    print(
+      "     only in before: \{toString(sb.length)}  "
+        + pyList(sb.slice(0, if sb.length < 5 { sb.length } else { 5 })),
+    )
+    print(
+      "     only in after : \{toString(sa.length)}  "
+        + pyList(sa.slice(0, if sa.length < 5 { sa.length } else { 5 })),
+    )
+  } else {
+    print("  same population on both seeds (no cell dropped or added)")
+  }
+
+  const lost: string[] = []
+  const gained: string[] = []
+  const into: string[] = []
+  const outof: string[] = []
+  for c in matched {
+    const b = cls(x.before, c)
+    const a = cls(x.after, c)
+    if b == "runs" && a != "runs" { lost.push(c) }
+    if a == "runs" && b != "runs" { gained.push(c) }
+    if !isSilent(b) && isSilent(a) { into.push(c) }
+    if isSilent(b) && !isSilent(a) { outof.push(c) }
+  }
+
+  const rule = "========================================================================"
+  print("")
+  print(rule)
+  print(
+    "N cells moved backward (`runs` before, NOT `runs` after): \{toString(lost.length)}",
+  )
+  print(
+    "N cells moved INTO a silent class:                        \{toString(into.length)}",
+  )
+  print(rule)
+
+  show(
+    x,
+    "`runs` LOST — the only move that can invalidate a merged change",
+    lost,
+    true,
+  )
+  show(x, "moved INTO a silent class", into, true)
+  show(x, "`runs` GAINED", gained, false)
+  show(x, "moved OUT OF a silent class", outof, false)
+
+  print("")
+  print("== full transition matrix (before -> after), every non-zero pair ==")
+  const mat: Map<string, i32> = Map()
+  const morder: string[] = []
+  const cb: Map<string, i32> = Map()
+  const ca: Map<string, i32> = Map()
+  const classes: string[] = []
+  let unchanged = 0
+  for c in matched {
+    const b = cls(x.before, c)
+    const a = cls(x.after, c)
+    tally(mat, morder, b + "\n" + a, 1)
+    if b == a { unchanged = unchanged + 1 }
+    tally(cb, classes, b, 1)
+    tally(ca, classes, a, 1)
+  }
+  print(
+    "   unchanged: \{toString(unchanged)} of \{toString(matched.length)} ("
+      + pyFixed(pct(unchanged, matched.length), 2)
+      + "%)   moved: \{toString(matched.length - unchanged)}",
+  )
+  for k in byCountDesc(morder, mat) {
+    const parts = k.split("\n")
+    const b = parts[0]
+    const a = parts[1]
+    let flag = ""
+    if b != a {
+      if (isSilent(a) && !isSilent(b)) || (b == "runs" && a != "runs") {
+        flag = "   <== BACKWARD"
+      } else {
+        flag = "   (forward)"
+      }
+    }
+    print(
+      "   \{padLeft(toString(mat[k] ?? 0), 8)}  \{padRight(b, 24)} -> \{padRight(a, 24)}\{flag}",
+    )
+  }
+
+  print("")
+  print("== per-class totals ==")
+  print(
+    "   \{padRight("class", 26)} \{padLeft("before", 10)} \{padLeft("after", 10)} \{padLeft("delta", 9)}",
+  )
+  let sb = 0
+  let sa = 0
+  for k in sortStrings(distinctSorted(classes)) {
+    const nb = cb[k] ?? 0
+    const na = ca[k] ?? 0
+    if isSilent(k) {
+      sb = sb + nb
+      sa = sa + na
+    }
+    print(
+      "   \{padRight(k, 26)} \{padLeft(toString(nb), 10)} \{padLeft(toString(na), 10)} \{padLeft(signed(na - nb), 9)}",
+    )
+  }
+  print(
+    "   \{padRight("SILENT TOTAL", 26)} \{padLeft(toString(sb), 10)} \{padLeft(toString(sa), 10)} \{padLeft(signed(sa - sb), 9)}",
+  )
+  print(
+    "   \{padRight("silent rate", 26)} \{padLeft(pyFixed(pct(sb, matched.length), 2), 9)}% \{padLeft(pyFixed(pct(sa, matched.length), 2), 9)}%",
+  )
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("delta: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

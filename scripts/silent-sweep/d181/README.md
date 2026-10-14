@@ -1,5 +1,7 @@
 # The D181 grid — the CONTAINER-ALIAS axis crossed with `annpat`
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 1,200-cell grid that closed `silent-class-inventory.md` **D181** — the census's largest
 single rescue family (2,254 silent coordinates whose ONLY one-step rescue is `claim=0`) — and
 filed **D187** and **D188** out of its residue. Kept because the closing numbers in that
@@ -156,7 +158,7 @@ Over the 247,427 DISTINCT coordinates, **4,434 move, all `check-clean invalid wa
 
 ### The families, RE-DERIVED on `e04b1567` rather than read from any published run
 
-`rescue.py`'s grouping was re-derived from this tree's own grading of the merged base. **Do
+`rescue.vl`'s grouping was re-derived from this tree's own grading of the merged base. **Do
 not quote a census family size; measure it** — every agent that re-derived one this week found
 it had moved (1,896 -> 1,518 -> 1,084 for `union`; 1,992 -> 2,032 -> 1,982 for `cont`).
 

@@ -1,5 +1,7 @@
 # d341 — the `elem_place` grid inventory-2 D11 is filed against
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 `mkgrid.py` writes 184 cells: **23 gap reps × 4 narrowing constructs × 2 runtime inputs**,
 every one narrowing `xs[0]` IN PLACE and then reading it. It is the denominator D11's row
 quotes, and the population its price was measured on.

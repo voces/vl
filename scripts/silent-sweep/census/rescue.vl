@@ -1,0 +1,187 @@
+// Name each silent cell's family by the one-step change that rescues it.
+//
+//     vl run scripts/silent-sweep/census/rescue.vl -- <celldir> <graded.json> [<celldir> <graded.json> ...]
+//
+// For every silent coordinate, lists the one-axis siblings that `runs`, and groups the
+// silent cells by the SET OF AXES that can rescue them, so the family is named by a
+// measurement rather than a story. A silent cell with no rescue is one the census located
+// but did not bound. Run from the checkout root.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, split } from "std:str"
+import { cpPrefix, die } from "../../lib/common"
+import { padLeft, padRight } from "../../lib/corpus"
+import {
+  AX,
+  byCountDesc,
+  bytesOf,
+  coordKey,
+  coordVals,
+  distinctSorted,
+  grading,
+  isSilent,
+  manifestCoords,
+  pathJoin,
+  tally,
+} from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/rescue.vl -- <celldir> <graded.json> [<celldir> <graded.json> ...]"
+
+type Group = { cells: string[][], rescues: string[][] }
+
+// The values `coords` take at axis `ai`, distinct and sorted.
+function levelsAt(coords: string[][], ai: i32): string[] {
+  const vals: string[] = []
+  for c in coords { vals.push(c[ai]) }
+  distinctSorted(vals)
+}
+
+// The `axis=value` pairs constant across `coords`, in `AX` order.
+function constants(coords: string[][]): string {
+  const fx: string[] = []
+  let ai = 0
+  while ai < AX.length {
+    const v = levelsAt(coords, ai)
+    if v.length == 1 { fx.push(AX[ai] + "=" + v[0]) }
+    ai = ai + 1
+  }
+  if fx.length == 0 { return "(nothing)" }
+  join(fx, ", ")
+}
+
+// The member of `coords` whose witness file is smallest, the first on a tie.
+function smallest(coords: string[][], path: Map<string, string>): string {
+  let best = ""
+  let bl = -1
+  for c in coords {
+    const p = path[coordKey(c)] ?? ""
+    const n = bytesOf(p)
+    if bl < 0 || n < bl {
+      best = p
+      bl = n
+    }
+  }
+  best
+}
+
+function main(args: string[]): i32 {
+  if args.length % 2 != 0 { die(USAGE, 2) }
+  const index: Map<string, string> = Map()
+  const path: Map<string, string> = Map()
+  const order: string[] = []
+  let i = 0
+  while i < args.length {
+    const d = args[i]
+    const res = grading(args[i + 1])
+    for k, co in manifestCoords(d) {
+      const g = res[k]
+      if g == null { continue }
+      const key = coordKey(coordVals(co))
+      if index[key] == null {
+        index[key] = g.cls
+        path[key] = pathJoin(d, k + ".vl")
+        order.push(key)
+      }
+    }
+    i = i + 2
+  }
+
+  const coords: string[][] = []
+  for k in order { coords.push(split(k, "\t")) }
+  const levels: string[][] = []
+  let ai = 0
+  while ai < AX.length {
+    levels.push(levelsAt(coords, ai))
+    ai = ai + 1
+  }
+  const sil: string[][] = []
+  for c in coords {
+    if isSilent(index[coordKey(c)] ?? "") { sil.push(c) }
+  }
+  print(
+    "silent coordinates: \{toString(sil.length)} of \{toString(coords.length)}",
+  )
+
+  const groups: Map<string, Group> = Map()
+  const gsize: Map<string, i32> = Map()
+  const gorder: string[] = []
+  const norescue: string[][] = []
+  for t in sil {
+    const resc: string[] = []
+    const axes: string[] = []
+    ai = 0
+    while ai < AX.length {
+      const mine = t[ai]
+      for lv in levels[ai] {
+        if lv == mine { continue }
+        t[ai] = lv
+        const other = index[coordKey(t)] ?? ""
+        t[ai] = mine
+        if other == "runs" {
+          resc.push(AX[ai] + "=" + lv)
+          axes.push(AX[ai])
+        }
+      }
+      ai = ai + 1
+    }
+    if resc.length == 0 {
+      norescue.push(t)
+      continue
+    }
+    const key = join(distinctSorted(axes), ",")
+    if groups[key] == null { groups[key] = { cells: [], rescues: [] } }
+    const g = groups[key] ?? { cells: [], rescues: [] }
+    g.cells.push(t)
+    g.rescues.push(resc)
+    tally(gsize, gorder, key, 1)
+  }
+
+  print("")
+  print("== silent cells grouped by WHICH AXES can rescue them ==")
+  print("\{padRight("rescuing axes", 46)}    cells   example witness")
+  for key in byCountDesc(gorder, gsize) {
+    const g = groups[key] ?? { cells: [], rescues: [] }
+    const ex = smallest(g.cells, path)
+    print(
+      "\{padRight(key, 46)} \{padLeft(toString(g.cells.length), 8)}   \{ex} (\{toString(bytesOf(ex))} bytes)",
+    )
+    const cc: Map<string, i32> = Map()
+    const ccOrder: string[] = []
+    for r in g.rescues {
+      for x in r { tally(cc, ccOrder, x, 1) }
+    }
+    const top: string[] = []
+    for x in byCountDesc(ccOrder, cc) {
+      if top.length >= 8 { break }
+      top.push(x + " x" + toString(cc[x] ?? 0))
+    }
+    print("      rescued by: " + join(top, ", "))
+    print("      constant  : " + constants(g.cells))
+  }
+
+  print("")
+  print("== silent cells with NO one-step rescue inside the census ==")
+  print("   \{toString(norescue.length)} cells")
+  if norescue.length > 0 {
+    ai = 0
+    while ai < AX.length {
+      print(
+        "     \{padRight(AX[ai], 9)} \{cpPrefix(join(levelsAt(norescue, ai), " "), 110)}",
+      )
+      ai = ai + 1
+    }
+    const ex = smallest(norescue, path)
+    print("     smallest: " + ex + " (\{toString(bytesOf(ex))} bytes)")
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("rescue: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

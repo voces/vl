@@ -1,5 +1,7 @@
 # The D88 / D100 grid, and its ablation
 
+<!-- paths-as-of: 2026-10-14 --> The Python generators and graders this record runs were deleted with the rest of the silent-sweep Python (architecture-refactor-plan T3); the cells it named live on in `scripts/silent-sweep/distilled/named/`, and a named set re-materialises with `scripts/silent-sweep/census/mkset.vl`.
+
 The 2,850-cell grid that closed `silent-class-inventory.md` **D88 and D100** and filed
 **D111** and **D112** out of its residue. Kept because the closing numbers in that document
 — **24 + 18 cells, pairwise intersection 0, union-of-singles set-identical to the full

@@ -61223,6 +61223,8 @@ export function checkProgramPass(rootIx: i32) {
   lbiDefaultExpr = Map()
   nolLits = []
   nolTaken = Map()
+  ulLitN = 0
+  ulTaken = Map()
   nolOperand = Map()
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
@@ -74549,6 +74551,7 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   if elemTy == TY_NULL { nolLits.push(_ix) }
+  if elemTy >= 0 && T.tys[elemTy] is TyUnion { ulLitN = ulLitN + 1 }
   return mkArrayTy(elemTy)
 }
 
@@ -74559,12 +74562,24 @@ let nolLits: i32[] = []
 let nolTaken: {[i32]: boolean} = Map()
 let nolOperand: {[i32]: boolean} = Map()
 
+// A list literal whose element joins to a union, and per literal what a delivery outside a
+// speculative check made of it: 1 when only destinations of another concrete union received it,
+// so it boxes into theirs and its own union is never built (D4635); 2 once one wants its own.
+let ulLitN = 0
+let ulTaken: {[i32]: i32} = Map()
+
+export function arrLitUnionDestTaken(ix: i32): boolean {
+  (ulTaken[ix] ?? 0) == 1
+}
+
 // Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
 // destination beside the value. A part whose own destination is `null[]`, or holds a type
 // variable that is not the enclosing generic's own, types nothing. A speculative delivery
 // under `inferQuiet` marks too: it names a destination the real check then delivers to.
 function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
-  if nolLits.length == 0 || srcExpr < 0 || dstTy < 0 { return 0 }
+  if (nolLits.length == 0 && ulLitN == 0) || srcExpr < 0 || dstTy < 0 {
+    return 0
+  }
   const todo: i32[] = [srcExpr]
   const dsts: i32[] = [dstTy]
   while todo.length > 0 {
@@ -74592,7 +74607,10 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
     let elDt = dt
     if dn >= 0 {
       const d = T.tys[dn]
-      if d is TyArray { elDt = d.aElem }
+      if d is TyArray {
+        elDt = d.aElem
+        if !inferQuiet && elDt >= 0 { ulNoteDelivery(at, elDt) }
+      }
     }
     for el in e.arrElems {
       const sp = P.nodes[el]
@@ -74628,6 +74646,21 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
     }
   } else {
     nolOperandParts(at)
+  }
+  0
+}
+
+// Records list literal `at` delivered into a list whose element is `elDt`, for `ulTaken`.
+function ulNoteDelivery(at: i32, elDt: i32) {
+  const own = nodeTyIxOf(at)
+  if own < 0 || !(T.tys[own] is TyArray) || ulTaken[at] == 2 { return 0 }
+  const ot = T.tys[own]
+  if ot is TyArray {
+    if !(T.tys[elDt] is TyUnion) || tyHasTyVar(elDt) || tySame(ot.aElem, elDt) {
+      ulTaken[at] = 2
+    } else {
+      ulTaken[at] = 1
+    }
   }
   0
 }

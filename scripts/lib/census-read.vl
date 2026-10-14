@@ -1,0 +1,204 @@
+// What the census READERS share: a block's manifest and grading read back, the axis and
+// silent-class vocabularies, and the parts of Python's printing they reproduce.
+//
+//     import { AX, isSilent, manifestCoords, grading } from "../../lib/census-read"
+//
+// A grading is `gradecensus.vl`'s output, `{cell: {class, msg}}`; a coordinate is one
+// manifest `coords` row. Paths resolve against the working directory.
+
+import { IoError, fileSize } from "std:fs"
+import { toFixed, toString } from "std:fmt"
+import { join } from "std:str"
+import { JsonMap, die, findFrom, wsLen } from "./common"
+import { parseOrDie, pyRepr, readText, sortStrings, strField } from "./corpus"
+
+// The census's thirteen axes, in the order every reader prints them.
+export const AX: string[] = [
+  "store", "escope", "declness", "twin", "union", "claim", "cont", "annpos",
+  "deliv", "pval", "order", "rep", "annpat",
+]
+
+// The classes no diagnostic announces.
+export function isSilent(cls: string): boolean {
+  cls == "runs but wrong value"
+    || cls == "check-clean invalid wasm"
+    || cls == "compiler trap"
+    || cls == "trap_loads"
+}
+
+export type Graded = { cls: string, msg: string }
+
+function readMap(path: string): JsonMap {
+  const j = parseOrDie(readText(path), path)
+  if j is JsonMap { return j }
+  die("census: \{path} is not a JSON object", 1)
+  const none: JsonMap = Map()
+  none
+}
+
+// `<dir>/manifest.json`'s `coords`: cell name to coordinate, in manifest order.
+export function manifestCoords(dir: string): Map<string, JsonMap> {
+  const out: Map<string, JsonMap> = Map()
+  const c = readMap(dir + "/manifest.json")["coords"] ?? null
+  if c is JsonMap {
+    for k, v in c {
+      if v is JsonMap { out[k] = v }
+    }
+  }
+  out
+}
+
+// A grading file: cell name to class and message, in file order.
+export function grading(path: string): Map<string, Graded> {
+  const out: Map<string, Graded> = Map()
+  for k, v in readMap(path) {
+    if v is JsonMap {
+      out[k] = { cls: strField(v, "class"), msg: strField(v, "msg") }
+    }
+  }
+  out
+}
+
+// One axis of a coordinate; a missing `annpat` is `outer`, any other missing axis "".
+export function axis(co: JsonMap, a: string): string {
+  const v = co[a] ?? null
+  if v is string { return v }
+  if a == "annpat" { return "outer" }
+  ""
+}
+
+export function hasAxis(co: JsonMap, a: string): boolean {
+  if a == "annpat" { return true }
+  (co[a] ?? null) is string
+}
+
+// A coordinate as one map key, its values in `AX` order.
+export function coordKey(vals: string[]): string { join(vals, "\t") }
+
+export function coordVals(co: JsonMap): string[] {
+  const out: string[] = []
+  for a in AX { out.push(axis(co, a)) }
+  out
+}
+
+// The distinct members of `xs`, sorted.
+export function distinctSorted(xs: string[]): string[] {
+  const seen: Set<string> = Set()
+  const out: string[] = []
+  for x in xs {
+    if !seen.has(x) {
+      seen.add(x)
+      out.push(x)
+    }
+  }
+  sortStrings(out)
+}
+
+// `keys` ordered by descending `counts`, ties kept in their given order, as Python's
+// stable `sorted(key=-n)` and `Counter.most_common` order them.
+export function byCountDesc(
+  keys: string[],
+  counts: Map<string, i32>,
+): string[] {
+  if keys.length <= 1 { return keys }
+  const mid = keys.length / 2
+  const a = byCountDesc(keys.slice(0, mid), counts)
+  const b = byCountDesc(keys.slice(mid, keys.length), counts)
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if (
+      j >= b.length
+      || (i < a.length && (counts[a[i]] ?? 0) >= (counts[b[j]] ?? 0))
+    ) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// Bump `counts[k]`, remembering `k`'s first appearance in `order`.
+export function tally(
+  counts: Map<string, i32>,
+  order: string[],
+  k: string,
+  by: i32,
+) {
+  const n = counts[k]
+  if n == null { order.push(k) }
+  counts[k] = (n ?? 0) + by
+}
+
+// `%.<digits>f`: `toFixed`, except that an exact tie rounds to even as Python does
+// (`50 / 160` is `31.2`, not `31.3`). A tie is told by the exact expansion ending in a 5.
+export function pyFixed(x: f64, digits: i32): string {
+  const full = toFixed(x, 100)
+  const point = findFrom(full, ".", 0)
+  if point < 0 { return toFixed(x, digits) }
+  const cut = point + 1 + digits
+  if full[cut] != 53 { return toFixed(x, digits) }
+  let k = cut + 1
+  while k < full.length {
+    if full[k] != 48 { return toFixed(x, digits) }
+    k = k + 1
+  }
+  let last = full[cut - 1]
+  if last == 46 { last = full[cut - 2] }
+  if (last - 48) % 2 == 1 { return toFixed(x, digits) }
+  if digits == 0 { return full.slice(0, point) }
+  full.slice(0, cut)
+}
+
+// `%+d`.
+export function signed(n: i32): string {
+  if n >= 0 { return "+" + toString(n) }
+  toString(n)
+}
+
+// Python's `repr` of a list (`[...]`) or tuple (`(...)`) of strings.
+export function pyList(xs: string[]): string {
+  const parts: string[] = []
+  for x in xs { parts.push(pyRepr(x)) }
+  "[" + join(parts, ", ") + "]"
+}
+
+export function pyTuple(xs: string[]): string {
+  const parts: string[] = []
+  for x in xs { parts.push(pyRepr(x)) }
+  if parts.length == 1 { return "(" + parts[0] + ",)" }
+  "(" + join(parts, ", ") + ")"
+}
+
+// `os.path.join(d, f)` for a relative `f`.
+export function pathJoin(d: string, f: string): string {
+  if d == "" || d.slice(d.length - 1, d.length) == "/" { return d + f }
+  d + "/" + f
+}
+
+// A file's size in bytes, stopping when it cannot be read.
+export function bytesOf(path: string): i32 {
+  const n = fileSize(path)
+  if n is IoError {
+    die("census: cannot stat \{path} (\{n.msg})", 1)
+    return 0
+  }
+  n as! i32
+}
+
+// `" ".join(s.split())`: every whitespace run one space, none at either end.
+export function collapseWs(s: string): string {
+  const words: string[] = []
+  let i = 0
+  while i < s.length {
+    while i < s.length && wsLen(s, i) > 0 { i = i + wsLen(s, i) }
+    const start = i
+    while i < s.length && wsLen(s, i) == 0 { i = i + 1 }
+    if i > start { words.push(s.slice(start, i)) }
+  }
+  join(words, " ")
+}
