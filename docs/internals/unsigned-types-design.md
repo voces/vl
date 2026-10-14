@@ -396,7 +396,7 @@ the valtype is identical.
 The **risk** of the normaliser is the converse: any site that asks `primName == "i32"` *without*
 going through it treats a `u32` as "not an i32" and falls to that site's default. That is
 exactly the "ladder with a hole" family in `CLAUDE.md`. The mitigation is to make
-`kind-ladder-incomplete`, plus a position matrix (`scripts/capability-probes/matrix.py`) with a
+`kind-ladder-incomplete`, plus a position matrix (`scripts/capability-matrix.vl`) with a
 `u32` template *and* an un-annotated template, part of the first PR rather than a follow-up.
 
 ### 3.2 Where the compiler switches on numeric kinds

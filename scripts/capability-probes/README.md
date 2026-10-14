@@ -57,22 +57,39 @@ CLAUDE.md warns hides, and five of those six turned out to be floors: the warnin
 that a gap can hide there, and wrong as a presumption that one does. **Probe before
 scheduling.**
 
-## The position matrix — `matrix.py`, one template, every position, both faces
+## The position matrix — `capability-matrix.vl`, one template, every position, both faces
 
 A capability is enforced in ONE place and served in MANY, so a fix is graded at every
 delivery position in the ANNOTATED and UN-ANNOTATED face. Hand-writing those ~40 programs is
 where the misses come from — D965 lost global assignment, D1193 was silent at seven of nine,
-D1197 is red at exactly one. Write the template instead:
+D1197 is red at exactly one. Write the template instead, and run from the checkout root:
 
-    python3 scripts/capability-probes/matrix.py matrix/orerr-generic-pin.matrix.vl
-    python3 scripts/capability-probes/matrix.py <t> --before old.wasm --after new.wasm
-    python3 scripts/capability-probes/matrix.py <t> --only array_push,global_assign --keep
+    vl run scripts/capability-matrix.vl -- scripts/capability-probes/matrix/orerr-generic-pin.matrix.vl
+    vl run scripts/capability-matrix.vl -- <t> --before old.wasm --after new.wasm
+    vl run scripts/capability-matrix.vl -- <t> --only array_push,global_assign --keep
 
-A `matrix/*.matrix.vl` is `// @@SECTION@@` blocks: `@@PRELUDE@@`, `@@VALUE@@`, `@@TYPE@@`,
-`@@WANT@@`, and either `@@PROOF@@` or `@@TEST@@`/`@@HIT@@`/`@@MISS@@` — the latter also
-unlocks the six discrimination positions. `@@SETUP@@`/`@@GUARD@@`/`@@FALLBACK@@` deliver a
-NARROWED value; `@@SKIP@@` takes `position: reason`. `matrix.py`'s docstring is the spec and
-`--list-positions` prints the twenty-six and what each face annotates.
+The script lives beside this directory rather than in it because every flat `.vl` here is
+a probe. `--list-positions` prints the positions and what each face annotates.
+
+### Template format
+
+A `matrix/*.matrix.vl` is sections, each opened by a `// @@NAME@@` line. Text before the
+first marker is a free header.
+
+    @@PRELUDE@@   type/function declarations the value needs (module scope)
+    @@VALUE@@     the expression under test, e.g. `orErr(5, false)`          [required]
+    @@TYPE@@      its type spelling for the annotated face, e.g. `i32 | "err"`  [required]
+    @@WANT@@      what the proof must print (the `Should print` contract)    [required]
+    @@PROOF@@     statements over the bound name `v`, printing WANT
+    @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
+                  `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination
+                  positions AND the three `*_place` ones, which re-read the delivery place
+                  instead of `v` (a template with no TEST skips them, with the reason printed)
+    @@SETUP@@     statements emitted in the delivery's own scope before it
+    @@GUARD@@     a boolean; the delivery nests inside `if GUARD { ... }` (a NARROWED value)
+    @@FALLBACK@@  an expression of TYPE for the paths a GUARD leaves un-taken
+    @@SKIP@@      `position: reason` lines
+    @@VALUE2@@ @@TYPE2@@ @@PROOF2@@ @@WANT2@@   a second instance, for `two_instances`
 
 **The `block_*` six were added for D1244**, whose shape — a closure capturing a ref local
 declared in a MODULE-SCOPE block — none of the original twenty could reach, so
@@ -83,11 +100,13 @@ plain-read variant. Every template is now red at `block_bare` (D1253's floor: a 
 those cells are D1244/D1253 speaking, not the template's own capability — read them as the
 harness reporting two standing rows rather than as a finding about the value under test.
 
-Grading is `run.py`'s, imported not copied. It exits non-zero on `runs -> not-runs` between
-two seeds or any `SILENT` after, so **a brief runs it before the fix and after it** and
-pastes both tables. `--keep` leaves the cells, which is how a red one becomes a probe here.
-A template is a fragment collection, not a program: `lint-self.sh` prunes `matrix/` from its
-fmt sweep, and `run.py`'s probe count is untouched because it never descends into it.
+Grading is `scripts/lib/probe-grade.vl`'s, the same vocabulary as the probe runner: RUNS /
+WRONG / check refuses / emit refuses / SILENT / COMPILER TRAP / TIMEOUT. It exits non-zero on
+`runs -> not-runs` between two seeds or any `SILENT` after, so **a brief runs it before the
+fix and after it** and pastes both tables. `--keep` leaves the cells, which is how a red one
+becomes a probe here. A template is a fragment collection, not a program: `lint-self.sh`
+prunes `matrix/` from its fmt sweep, and the probe runner's count is untouched because it
+never descends into it.
 
 ## Adding one
 
