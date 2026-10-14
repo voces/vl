@@ -36,7 +36,7 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 5 | `render-parse budget` | done: `render-parse-census.vl` plus `vl check --budget --findings` | - |
 | 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/{rows,ls,split,selftest}.py` deleted, the row grammar is `scripts/lib/inventory.vl` | - |
 | 7 | `lint-self.sh` (`matrix.py`) | done: `scripts/capability-matrix.vl`, `matrix.py` deleted | - |
-| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` has no importer left (`check-filed-witnesses.py` and `survey-regrade.py` are deleted) and stays as `tests/vl_seed_provenance_test.ts`'s oracle | deleted with it |
+| 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` is deleted and `tests/vl_seed_provenance_test.ts` holds the VL fold to the values the Python printed on a fixed tree | - |
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
 | - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `plumb-shape-cost.py`, `survey-regrade.py`, `check-filed-witnesses.py` and `distilled/{regress,index,redistil}.py` (+ `gradecensus.py`) deleted | delete `distilled/cellmap.py` and `corpuscmp.py`; `grade.py` and `profile-rank.py` have callers of their own (rows below) |
 
@@ -51,7 +51,7 @@ heredoc and moves with its own PR.
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
 | `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | done: `scripts/capability-probes.vl`; the `.py` is deleted and its port test pins goldens |
-| `scripts/seed_provenance.py` | 223 | I | tests/vl_seed_provenance_test.ts (oracle only) | ported: `scripts/seed-provenance.vl` is on master; delete with the test's oracle case |
+| `scripts/seed_provenance.py` | 223 | I | tests/vl_seed_provenance_test.ts (oracle only) | done: deleted; the test pins `seed-provenance.vl` to the Python's fold, sidecar and verdict lines over a fixed tree |
 | `scripts/silent-sweep/distilled/regress.py` | 177 | G | scripts/lint-self.sh | deleted: `regress.vl` runs the gate rows |
 
 ### T: tests

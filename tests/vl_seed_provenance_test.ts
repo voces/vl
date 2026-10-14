@@ -13,23 +13,16 @@
 // BEHAVIORALLY, never by timestamp". `refresh-compiler.sh` records the FOLD of the sources it
 // compiled and `scripts/seed-provenance.vl` recomputes it — identities, not clocks.
 //
-// The recorder is a VL program now (it was `seed_provenance.py`, which nothing imports any more
-// and stays only as the second case's oracle). The first case drives its `--self-test`, which builds a
-// specimen per verdict (match / differ / unknown) and sabotages the comparison to prove the
-// specimens would notice. The second pins the VL fold to the Python's, byte for byte, so the two
-// cannot drift while both exist.
+// The recorder is `scripts/seed-provenance.vl` (the Python it replaced is deleted). The first case
+// drives its `--self-test`, which builds a specimen per verdict (match / differ / unknown) and
+// sabotages the comparison to prove the specimens would notice. The second runs it over a fixed
+// four-file tree and holds the fold, the sidecar and every verdict line to the values the Python
+// printed on that same tree before it was deleted, so the identity cannot drift silently.
 //
 // No assertion library, per CLAUDE.md.
 // @test-timing native
 
-import {
-  COMPILER,
-  exists,
-  nativeEnv,
-  pythonBin,
-  ROOT,
-  VL,
-} from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -41,18 +34,18 @@ if (GATED && !ENABLED) {
 
 const dec = new TextDecoder();
 
-/** `scripts/seed-provenance.vl <argv>` from the checkout root (it resolves paths against the cwd). */
-async function provenance(argv: string[]) {
+/** `scripts/seed-provenance.vl <argv>` from `cwd` (it resolves every path against the cwd). */
+async function provenance(argv: string[], cwd = ROOT) {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [
       "run",
-      "scripts/seed-provenance.vl",
+      `${ROOT}/scripts/seed-provenance.vl`,
       "--compiler",
       COMPILER,
       "--",
       ...argv,
     ],
-    cwd: ROOT,
+    cwd,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
@@ -84,43 +77,87 @@ Deno.test({
   },
 });
 
+// The fixed tree: byte-order sorting (`B` before `a`), a multi-byte source (the fold feeds the
+// BYTE length), an empty source, and a non-`.vl` file the fold must skip. Every hex value below
+// is what `seed_provenance.py` printed on this tree, and the VL tool agreed on each. The one
+// place they did not agree is which tree `--write` folds: the Python folded the checkout its own
+// file sat in, the VL tool folds the working directory, which is what lets this case run.
+const FIXTURE: [string, string][] = [
+  ["compiler/a.vl", "const a = 1\n"],
+  ["compiler/B.vl", "// é ü — multi-byte\n"],
+  ["compiler/empty.vl", ""],
+  ["compiler/notes.md", "not folded\n"],
+];
+const FOLD = "589354f9bc116d5f";
+const FOLD_AFTER_EDIT = "225cf8e641f0b95c";
+
+function expectLine(
+  what: string,
+  got: { code: number; out: string },
+  rc: number,
+  line: string,
+) {
+  if (got.code !== rc || got.out !== line + "\n") {
+    throw new Error(
+      `${what}: want rc ${rc} and ${
+        JSON.stringify(line)
+      }, got rc ${got.code} and ${JSON.stringify(got.out)}`,
+    );
+  }
+}
+
 Deno.test({
   name:
-    "seed provenance: the VL fold writes the Python fold's sidecar byte for byte",
+    "seed provenance: the fold, the sidecar and each verdict line over a fixed tree",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_seed_prov_" });
     try {
-      const viaVl = await provenance(["--write", "--seed", `${dir}/vl.wasm`]);
-      if (viaVl.code !== 0) {
-        throw new Error(`--write failed (rc ${viaVl.code}):\n${viaVl.out}`);
+      await Deno.mkdir(`${dir}/compiler`);
+      await Deno.mkdir(`${dir}/build`);
+      for (const [f, text] of FIXTURE) {
+        await Deno.writeTextFile(`${dir}/${f}`, text);
       }
-      const py = await new Deno.Command(pythonBin(), {
-        args: [
-          "scripts/seed_provenance.py",
-          "--write",
-          "--seed",
-          `${dir}/py.wasm`,
-        ],
-        cwd: ROOT,
-        stdout: "null",
-        stderr: "piped",
-      }).output();
-      if (py.code !== 0) {
-        throw new Error(`python --write failed:\n${dec.decode(py.stderr)}`);
-      }
-      const a = await Deno.readTextFile(`${dir}/vl.wasm.src`);
-      const b = await Deno.readTextFile(`${dir}/py.wasm.src`);
-      if (a !== b) {
+      expectLine(
+        "no sidecar",
+        await provenance([], dir),
+        1,
+        `seed provenance: UNKNOWN (no build/vl-compiler.wasm.src) · compiler/*.vl is ${FOLD} over 3 files`,
+      );
+      expectLine(
+        "--write",
+        await provenance(["--write"], dir),
+        0,
+        `wrote build/vl-compiler.wasm.src (${FOLD} over 3 files)`,
+      );
+      const written = await Deno.readTextFile(
+        `${dir}/build/vl-compiler.wasm.src`,
+      );
+      const want =
+        `${FOLD}\n# fnv1a-64 over 3 compiler/*.vl, \`std_hash\`'s fold; ` +
+        "written by scripts/refresh-compiler.sh\n";
+      if (written !== want) {
         throw new Error(
-          `sidecars differ.\nvl: ${JSON.stringify(a)}\npy: ${
-            JSON.stringify(b)
+          `sidecar: want ${JSON.stringify(want)}, got ${
+            JSON.stringify(written)
           }`,
         );
       }
-      if (!/^[0-9a-f]{16}\n/.test(a)) {
-        throw new Error(`want a 16-hex identity first, got ${a}`);
-      }
+      expectLine(
+        "match",
+        await provenance([], dir),
+        0,
+        `seed provenance: ${FOLD} · compiler/*.vl ${FOLD} over 3 files — match`,
+      );
+      await Deno.writeTextFile(`${dir}/compiler/a.vl`, "changed\n", {
+        append: true,
+      });
+      expectLine(
+        "one source changed",
+        await provenance([], dir),
+        1,
+        `seed provenance: ${FOLD} · compiler/*.vl ${FOLD_AFTER_EDIT} over 3 files — DIFFER`,
+      );
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
