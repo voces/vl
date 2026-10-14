@@ -1,6 +1,6 @@
 // COMPILE TWO PROGRAMS IN ONE COMPILER INSTANCE — the shape no other instrument has.
 //
-// Every grader in this repo runs ONE program per process: `check-filed-witnesses.py`,
+// Every grader in this repo runs ONE program per process: `check-filed-witnesses.vl`,
 // `regress.vl`, the census, `corpuscmp`, `vl` itself. So a defect that needs a compiler
 // instance to carry state from one program into the next is invisible to all of them,
 // and D864 proves that is not hypothetical — a module-scope `??` over a nullable-struct
