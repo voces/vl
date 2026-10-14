@@ -6,7 +6,7 @@ invalidate a merged change: DID ANY CELL MOVE BACKWARD?
 
 WHY THIS IS A SEPARATE SCRIPT, AND WHY IT LEADS WITH THE BACKWARD COUNT.
 
-`gradecensus.py` prints a per-class histogram. Two histograms side by side are NOT a delta:
+`gradecensus.vl` prints a per-class histogram. Two histograms side by side are NOT a delta:
 a block can hold its silent total exactly while 300 cells fall out of `runs` and 300
 different cells fall in, and the summary line reads unchanged. The per-class counts are a
 NET, and a net is the one shape that hides a regression behind a fix. So the unit here is

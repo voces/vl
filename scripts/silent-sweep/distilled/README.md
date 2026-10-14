@@ -96,7 +96,7 @@ like thousands of neighbours. **What makes them worth keeping is not how they be
 what a specific candidate DID to them**, and no rule that reads current behaviour can see that.
 
 `named/` therefore holds those 72 cells **whole**. They are `runs` on master, so a future
-candidate that breaks one exits non-zero. `redistil.py` rebuilds `cells/` from scratch and
+candidate that breaks one exits non-zero. `redistil.vl` rebuilds `cells/` from scratch and
 never touches `named/`.
 
 ### A second instance, the same day — this is the norm, not the exception
@@ -135,8 +135,8 @@ It is therefore IN the gate (`scripts/gate.sh`), not beside it.
 ## Using it
 
 ```sh
-python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
-python3 scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm --write-baseline
+vl run scripts/silent-sweep/distilled/regress.vl -- build/vl-compiler.wasm
+vl run scripts/silent-sweep/distilled/regress.vl -- build/vl-compiler.wasm --write-baseline
 ```
 
 Both halves are graded, `cells/` and `named/`, and reported together.
@@ -148,7 +148,7 @@ this whole project exists to remove — but it is a thing to read, not a thing t
 
 `cells/manifest.json` carries the GENERATOR's expectation for each cell, never a compiler's,
 so `runs` still means "printed what the generator said it should" and a wrong-value cell is
-still visible as one. Grading reuses `census/gradecensus.py` unchanged rather than
+still visible as one. Grading shares `scripts/lib/census-grade.vl` with `census/gradecensus.vl` rather than
 reimplementing the outcome vocabulary — the two instruments cannot drift apart.
 
 ## What the census is still for
@@ -158,7 +158,7 @@ outcome, a suspicion that a family exists that nothing has named yet. Then re-di
 
 ```sh
 # after a full census run, rebuild the classes from the new snapshots
-python3 scripts/silent-sweep/distilled/redistil.py
+vl run scripts/silent-sweep/distilled/redistil.vl
 ```
 
 The corpus is only as good as the history it was collapsed from. A change in a genuinely
@@ -175,14 +175,14 @@ serialisation is a REVIEW and MERGE concern rather than a disk one. Pretty-print
 four lines on each cell: a 207-cell change arrived as an 860-line diff, and a rebase resolved
 cell boundaries wrongly **without saying so** — twice in one day, once silently corrupting the
 baseline. One JSON object per line, sorted by cell, makes a changed cell exactly one changed
-line and keeps a conflict inside the cell it belongs to. `cellmap.py` is the only reader and
-writer; use it rather than `json.load`.
+line and keeps a conflict inside the cell it belongs to. `loadCells`/`dumpCells` in
+`scripts/lib/corpus.vl` are the only reader and writer; use them rather than a whole-file parse.
 
 The same rule applies to a named set's coordinate JSON under `census/`: one line per cell.
 Those seven files were 9,147 lines for 572 cells and are now 615.
 
-Nothing reads a cell's `coords` from this directory. `redistil.py` sources coordinates from the
-census block manifests, and `gradecensus.py` reads only `manifest.json`'s `expect` map — so the
+Nothing reads a cell's `coords` from this directory. `redistil.vl` sources coordinates from the
+census block manifests, and `gradecensus.vl` reads only `manifest.json`'s `expect` map — so the
 copies that used to sit in `expected.json` and in both `manifest.json` files were written and
 never read back, three times over. They are gone; the census manifests remain the one source.
 
@@ -192,18 +192,18 @@ not one of the five census blocks `A`–`E`.
 
 ## `expected.jsonl` carries only what is READ, because a stale field reads as live
 
-It holds `block` and `represents`, and **every graded cell has a row** — `regress.py`
+It holds `block` and `represents`, and **every graded cell has a row** — `regress.vl`
 refuses to grade a corpus it cannot describe, in either direction, before it pays for the
 grade. It used to DEFAULT a missing row to block `A`, `represents` 0, and 584 curated cells
 from eleven `named/` landings had no row at all: the split line read 2,061/5,504 for
 directories holding 1,477/6,088, and a movement in any of those 584 would have reported
-`0 of 255505 census cells`. `redistil.py` owns the derived rows and carries the curated ones
-over untouched; `index.py` owns the curated half, and a landing that adds a named set writes
+`0 of 255505 census cells`. `redistil.vl` owns the derived rows and carries the curated ones
+over untouched; `index.vl` owns the curated half, and a landing that adds a named set writes
 both files in one move:
 
 ```sh
-python3 regress.py <seed.wasm> --write-baseline --set <named-set>
-python3 index.py --check          # every cell has a row, every row a cell, every set a source
+vl run scripts/silent-sweep/distilled/regress.vl -- <seed.wasm> --write-baseline --set <named-set>
+vl run scripts/silent-sweep/distilled/index.vl -- --check   # every cell has a row, every row a cell, every set a source
 ```
 
 A set name must already be a key in `named/sources.json`. That is the same rule one level

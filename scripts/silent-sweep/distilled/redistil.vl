@@ -1,0 +1,298 @@
+// Rebuild the derived half of the distilled corpus, `cells/`, from every graded census
+// snapshot on disk: one representative per behavioural class, where two census cells share
+// a class when every snapshot covering their block gave them the same (class, message).
+// The representative is the class's first cell, so an unchanged history rebuilds an
+// unchanged corpus. `named/` and its `expected.jsonl` rows are carried over untouched.
+//
+//     vl run scripts/silent-sweep/distilled/redistil.vl -- [--snapshots GLOB] [--dry-run]
+//
+// Run from the checkout root after a full census sweep, then re-baseline with
+// `regress.vl -- <seed.wasm> --write-baseline`.
+
+import { fileSize } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toFixed, toString } from "std:fmt"
+import { join, split, toUpperAscii } from "std:str"
+import { parseJson } from "std:json"
+import {
+  JsonMap,
+  die,
+  exists,
+  hasFlag,
+  isDigit,
+  jsonStr,
+} from "../../lib/common"
+import {
+  cellsIn,
+  cwd,
+  dumpCells,
+  isDerived,
+  loadCells,
+  readText,
+  sortStrings,
+  spawn,
+  strField,
+  writeText,
+} from "../../lib/corpus"
+
+const HERE = "scripts/silent-sweep/distilled"
+const MIN_SNAPSHOT = 200000
+
+// The paths `pattern` matches, `**` spanning directories, sorted; none when it matches none.
+function glob(pattern: string): string[] {
+  const p = spawn(
+    "bash",
+    [
+      "-O",
+      "globstar",
+      "-O",
+      "nullglob",
+      "-c",
+      "for f in $1; do printf '%s\\n' \"$f\"; done",
+      "glob",
+      pattern,
+    ],
+  )
+  if p.code != 0 { die("redistil: cannot expand \{pattern}: \{p.err}", 1) }
+  const out: string[] = []
+  for l in p.out.split("\n") {
+    if l != "" { out.push(l) }
+  }
+  sortStrings(out)
+}
+
+function baseName(path: string): string {
+  const parts = path.split("/")
+  parts[parts.length - 1]
+}
+
+// The block of a graded snapshot, an object of at least `MIN_SNAPSHOT` bytes whose first
+// key is a census cell id (`a000001`); "" for any other file.
+function snapBlock(file: string): string {
+  if baseName(file) == "manifest.json" { return "" }
+  const sz = fileSize(file)
+  if !(sz is i64) || sz < (MIN_SNAPSHOT as i64) { return "" }
+  const j = parseJson(readText(file))
+  if !(j is JsonMap) { return "" }
+  for k in j.keys() {
+    if k.length != 7 || k[0] < 97 || k[0] > 101 { return "" }
+    let i = 1
+    while i < 7 {
+      if !isDigit(k[i]) { return "" }
+      i = i + 1
+    }
+    return k.slice(0, 1)
+  }
+  ""
+}
+
+// A block's generated cell directory: the first `cells<B>` under a worktree's census
+// scratch with a `manifest.json` and more than 100 cells, or "".
+function cellSource(root: string, block: string): string {
+  for d in glob(root + "/.claude/worktrees/*/scratch-silent/census/cells" + block) {
+    if exists(d + "/manifest.json") && cellsIn(d).length > 100 { return d }
+  }
+  ""
+}
+
+function objField(m: JsonMap, key: string): JsonMap {
+  const v = m[key]
+  if v is JsonMap { return v }
+  Map()
+}
+
+// `n / d` rounded to a whole number, a tie to the even one, as Python's `.0f` rounds.
+function ratioHalfEven(n: i32, d: i32): string {
+  const q = n / d
+  const r2 = 2 * (n % d)
+  if r2 > d || (r2 == d && q % 2 == 1) { return toString(q + 1) }
+  toString(q)
+}
+
+// One block's result: its census cells, covering snapshots and the classes they form.
+type Block = { name: string, cells: i32, files: i32, reps: string[] }
+
+// The manifest `cells/` is graded from, as `json.dump(..., indent=1, sort_keys=True)`.
+function manifestJson(expect: Map<string, string>, n: i32): string {
+  const rows: string[] = []
+  for c in sortStrings(expect.keys()) {
+    rows.push("  " + jsonStr(c) + ": " + jsonStr(expect[c] ?? ""))
+  }
+  let ex = "{}"
+  if rows.length > 0 { ex = "{\n" + join(rows, ",\n") + "\n }" }
+  const note = "one representative per behavioural equivalence class of the census; rebuilt by redistil.vl"
+  "{\n \"block\": \"distilled\",\n \"expect\": \{ex},\n \"generated\": \{toString(n)},\n \"meta\": {\n  \"note\": \"\{note}\"\n }\n}"
+}
+
+function flagArg(args: string[], flag: string, dflt: string): string {
+  let k = 0
+  while k < args.length {
+    if args[k] == flag {
+      if k + 1 >= args.length { die("redistil: \{flag} needs a value", 2) }
+      return args[k + 1]
+    }
+    k = k + 1
+  }
+  dflt
+}
+
+function main(args: string[]): i32 {
+  const root = cwd()
+  const pat = flagArg(
+    args,
+    "--snapshots",
+    root + "/.claude/worktrees/*/scratch-silent/census/**/*.json",
+  )
+  const dry = hasFlag(args, "--dry-run")
+  const snaps: Map<string, string[]> = Map()
+  for f in glob(pat) {
+    const b = snapBlock(f)
+    if b == "" { continue }
+    const have = snaps[b] ?? []
+    have.push(f)
+    snaps[b] = have
+  }
+  if snaps.length == 0 {
+    print("no graded snapshots matched \{pat}")
+    return 1
+  }
+
+  const index: Map<string, JsonMap> = Map()
+  const expect: Map<string, string> = Map()
+  const blocks: Block[] = []
+  const staged: string[] = []
+  for b in sortStrings(snaps.keys()) {
+    const up = b.toUpperAscii()
+    const src = cellSource(root, up)
+    if src == "" {
+      print("block \{up}: no generated cell directory on disk — SKIP")
+      continue
+    }
+    const manJ = parseJson(readText(src + "/manifest.json"))
+    let man: JsonMap = Map()
+    if manJ is JsonMap { man = manJ }
+    const cells = sortStrings(objField(man, "coords").keys())
+    const inSet: Map<string, boolean> = Map()
+    for c in cells { inSet[c] = true }
+    const sig: Map<string, string> = Map()
+    for c in cells { sig[c] = "" }
+    let nfiles = 0
+    for f in snaps[b] ?? [] {
+      const j = parseJson(readText(f))
+      if !(j is JsonMap) { continue }
+      if j.length != cells.length { continue }
+      let covers = true
+      for k in j.keys() {
+        if !inSet.has(k) { covers = false }
+      }
+      if !covers { continue }
+      nfiles = nfiles + 1
+      for c in cells {
+        const v = j[c]
+        let cls = ""
+        let msg = ""
+        if v is JsonMap {
+          cls = strField(v, "class")
+          msg = strField(v, "msg")
+        }
+        sig[c] = (sig[c] ?? "") + jsonStr(cls) + jsonStr(msg)
+      }
+    }
+    if nfiles == 0 {
+      print("block \{up}: no snapshot covers the manifest cell set — SKIP")
+      continue
+    }
+    const groups: Map<string, string[]> = Map()
+    for c in cells {
+      const s = sig[c] ?? ""
+      const g = groups[s] ?? []
+      g.push(c)
+      groups[s] = g
+    }
+    const firsts: string[] = []
+    for _s, g in groups { firsts.push(g[0]) }
+    const reps = sortStrings(firsts)
+    blocks.push({ name: up, cells: cells.length, files: nfiles, reps: reps })
+    const red = toFixed(
+      100.0 * (1.0 - (reps.length as f64) / (cells.length as f64)),
+      2,
+    )
+    print(
+      "block \{up}: \{toString(cells.length)} cells, \{toString(nfiles)} snapshots -> \{toString(reps.length)} representatives (\{red}% redundant)",
+    )
+    const manExpect = objField(man, "expect")
+    for c in reps {
+      staged.push(src + "/" + c + ".vl")
+      const e = manExpect[c]
+      if e is string { expect[c] = e } else { expect[c] = "" }
+      const row: JsonMap = Map()
+      row["block"] = up
+      row["represents"] = ((groups[sig[c] ?? ""] ?? []).length as f64)
+      index[c] = row
+    }
+  }
+
+  let n = 0
+  let d = 0
+  for bl in blocks {
+    n = n + bl.cells
+    d = d + bl.reps.length
+  }
+  if d == 0 {
+    print("\nTOTAL: no block had both a cell directory and a covering snapshot")
+    return 1
+  }
+  const nf = n as f64
+  const df = d as f64
+  print(
+    "\nTOTAL: \{toString(n)} cells -> \{toString(d)} representatives (\{toFixed(100.0 * (1.0 - df / nf), 2)}% redundant, \{ratioHalfEven(n, d)}x)",
+  )
+  if dry {
+    print("--dry-run: nothing written")
+    return 0
+  }
+
+  const out = root + "/" + HERE + "/cells"
+  spawn("rm", ["-rf", out])
+  const mk = spawn("mkdir", ["-p", out])
+  if mk.code != 0 { die("redistil: cannot create \{out}: \{mk.err}", 1) }
+  if staged.length > 0 {
+    const cp = staged.slice(0, staged.length)
+    cp.push(out)
+    const r = spawn("cp", cp)
+    if r.code != 0 {
+      die("redistil: cannot copy the representatives: \{r.err}", 1)
+    }
+  }
+  writeText(out + "/manifest.json", manifestJson(expect, index.length))
+  const merged: Map<string, JsonMap> = Map()
+  let kept = 0
+  for c, rec in loadCells(HERE + "/expected.jsonl") {
+    if !isDerived(strField(rec, "block")) {
+      merged[c] = rec
+      kept = kept + 1
+    }
+  }
+  for c, rec in index { merged[c] = rec }
+  dumpCells(HERE + "/expected.jsonl", merged)
+  print(
+    "wrote \{out}/*.vl (\{toString(staged.length)} cells), cells/manifest.json and expected.jsonl (\{toString(index.length)} derived rows re-derived, \{toString(kept)} curated rows carried over)",
+  )
+  const ncur = cellsIn(HERE + "/named").length
+  if ncur > 0 {
+    print("named/ left untouched: \{toString(ncur)} curated cells")
+  }
+  print(
+    "now re-baseline:  vl run scripts/silent-sweep/distilled/regress.vl -- <seed.wasm> --write-baseline",
+  )
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("redistil: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
