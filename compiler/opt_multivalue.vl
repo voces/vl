@@ -1,0 +1,2856 @@
+// The `-O` multi-value step, ported from the host (docs/internals/optimizer-in-vl.md, rung
+// R5): a call whose small record result is only read field by field calls a twin of its
+// producer returning the fields as multi-value results, a record argument its callee only
+// reads is passed as its fields, and a local or an if/else holding such a record holds its
+// fields (DECISIONS.md, D3625). The host stages the module with `optInLoad`, calls
+// `optMultivalue` with whether to explain and whether the module validates, then reads the
+// rewritten module, `optMultivalueMoves` (where each output body's ops came from) and
+// `optMultivalueExplain` (the `$VL_MV_EXPLAIN` log) through `optOut*`. A module this cannot
+// decode is left untouched.
+
+import { WasmCursor, wcByte, wcNew, wcOp, wcU32 } from "./wasm_read"
+import { wmRead } from "./wasm_write"
+import {
+  copyBytes,
+  wnEntry,
+  wnPutLeb,
+  wnRead,
+  wnTable,
+  wnWrite,
+} from "./wasm_names"
+import { optInBytes, optOutSet } from "./opt_scan"
+
+// The most fields of a record returned as multi-value, and of one taken apart as an argument.
+const MV_RECORD_MAX_FIELDS = 8
+const MV_ARG_MAX_FIELDS = 64
+// The most parameters a twin may take.
+const MV_TWIN_MAX_PARAMS = 128
+// At most this many twins, adding at most the floor plus half the code section.
+const MV_MAX_TWINS = 4096
+const MV_GROWTH_FLOOR = 65536
+// A callee the escape step may inline is at most this many body bytes.
+const ESCAPE_INLINE_MAX_BYTES = 320
+const NONE = -1
+
+// A recorded op's kind.
+const K_CALL = 1
+const K_RCALL = 2
+const K_NEW = 3
+const K_GET = 4
+const K_SET = 5
+const K_TEE = 6
+const K_EXIT = 7
+const K_MERGE = 8
+
+// What the op after a recorded one is: a `struct.get`, a `local.set`, an exit, or the
+// `else`/`end` closing an arm of an `if`.
+const NX_OTHER = 0
+const NX_GET = 1
+const NX_SET = 2
+const NX_EXIT = 3
+const NX_ARM = 4
+
+// What a plan does at an op.
+const A_CALL = 1
+const A_DELETE = 2
+const A_GETF = 3
+const A_SETF = 4
+const A_PICK = 5
+const A_EXTRACT = 6
+const A_MERGEIF = 7
+
+// Per operator, two characters: its pops then its pushes, `cc` when they depend on its
+// immediates or the control stack, `??` when the step does not read it.
+const AR_00 = "0000cccccccccccccc0010cccccccccccccccccccccc????cccc103131????cc01101101101120??"
+  + "11111111111111111111111111112020202020202020200111010101011121212121212121212121"
+  + "11212121212121212121212121212121212121212121211111112121212121212121212121212121"
+  + "21111111212121212121212121212121212121111111111111112121212121212111111111111111"
+  + "21212121212121111111111111111111111111111111111111111111111111111111111111??????"
+  + "????????????????0111012111cccc??????????????????11cccccccccccc??????????????????"
+  + "????????????????????????????????"
+const AR_FB = "cc01111111202111cc212121212130114050404011111111cccc1111111111??cc11112121cccc"
+const AR_FC = "111111111111111130003030300030210130"
+const AR_FD = "11111111111111111111112001212111111111111111112111112111211121112111212121212121"
+  + "21212121212121212121212121212121212121212121212121212121212121212121212121112121"
+  + "21213111212121212020202011111111111111111121211111111121212121212121212111112121"
+  + "21211121111111111111211111212111111111212121212121212121112121212121??2121212121"
+  + "1111??1111????1111111121212121????21??????212121212121??212121211111??1111????11"
+  + "11111121212121????21??????21212121212121212121211111??1121212121212121211111??11"
+  + "212121212121212111111111111111112111111111313131313131313121212121212131"
+const AR_FE = "21313100????????????????????????111111111111112020202020202021212121212121212121"
+  + "212121212121212121212121212121212121212121212121212121212121212131313131313131"
+
+const arTabs: u8[][] = []
+
+// The module read. A value type is packed as `wasm_write.vl` packs it, with a reference
+// shorthand spelled out as `ref null <abstract>`.
+let mB: u8[] = []
+let nImports = 0
+let nFuncs = 0
+let nTypes = 0
+let funcType: i32[] = []
+let isFunc: boolean[] = []
+let isStruct: boolean[] = []
+let sigP: i32[][] = []
+let sigR: i32[][] = []
+let fVals: i32[][] = []
+let fMut: boolean[][] = []
+let fFinal: boolean[] = []
+// Per type: it has a record's fields; it is a record the step may take apart; it would be
+// one but for a write, so only a fresh argument takes it apart.
+let shapeOk: boolean[] = []
+let recOk: boolean[] = []
+let freshOk: boolean[] = []
+// Per type with a record's fields: the first type of the same shape.
+let shapeKey: i32[] = []
+let byIndex = false
+let comp: i32[] = []
+let writer: {[i32]: i32} = Map()
+let nested: {[i32]: i32} = Map()
+let tainted: i32[] = []
+let hasNames = false
+let tagType: i32[] = []
+let anyCandidate = false
+
+// Per body (code-section order): its byte range, where its ops start, its locals entries, and
+// its recorded ops, merges and op ordinals' key base.
+let bR0: i32[] = []
+let bR1: i32[] = []
+let bOps: i32[] = []
+let bLocN: i32[][] = []
+let bLocT: i32[][] = []
+let bExits: boolean[] = []
+let bInsLo: i32[] = []
+let bInsHi: i32[] = []
+let bOpBase: i32[] = []
+let opTotal = 0
+
+// The recorded ops of every body, in ordinal order within a body.
+let iK: i32[] = []
+let iKind: i32[] = []
+let iA: i32[] = []
+let iReach: boolean[] = []
+let iDepth: i32[] = []
+let iNext: i32[] = []
+let iNA: i32[] = []
+let iNB: i32[] = []
+let iTop: i32[] = []
+let iArgLo: i32[] = []
+let iArgHi: i32[] = []
+let argv: i32[] = []
+
+// Every merge: its `if`, `else` and `end` ordinals, its record type and each arm's value.
+let gIf: i32[] = []
+let gElse: i32[] = []
+let gEnd: i32[] = []
+let gT: i32[] = []
+let gT0: i32[] = []
+let gT1: i32[] = []
+// Keyed by `bOpBase + ordinal`: the merge an `else`/`end` closes an arm of, the merge an
+// `end` ends, and the call and argument index a value is an argument of.
+let armEnd: {[i32]: i32} = Map()
+let mergeAt: {[i32]: i32} = Map()
+let consK: {[i32]: i32} = Map()
+let consJ: {[i32]: i32} = Map()
+
+// The analysis: producers per function index; field-only parameters keyed `f * 64 + j`
+// (1 a member); per body its field-only locals, ascending.
+let producer: boolean[] = []
+let allowed: {[i32]: i32} = Map()
+let allowedKeys: i32[] = []
+let fo: {[i32]: i32} = Map()
+let foR: {[i32]: i32} = Map()
+let foLocal: i32[][] = []
+let candT: {[i32]: i32} = Map()
+let candN: {[i32]: i32} = Map()
+let live: {[i32]: i32} = Map()
+
+// The plan being built, keyed by op ordinal, and every finished plan's acts by ordinal.
+let actKind: {[i32]: i32} = Map()
+let actA: {[i32]: i32} = Map()
+let actB: {[i32]: i32} = Map()
+let rCalls: {[i32]: i32} = Map()
+let scalarL: {[i32]: i32} = Map()
+let pLo: i32[] = []
+let pHi: i32[] = []
+let pK: i32[] = []
+let pKind: i32[] = []
+let pA: i32[] = []
+let pB: i32[] = []
+
+// The twins: function, field-parameter mask (low and high words), result as fields.
+let twF: i32[] = []
+let twLo: i32[] = []
+let twHi: i32[] = []
+let twR: boolean[] = []
+let twHead: {[i32]: i32} = Map()
+let twNext: i32[] = []
+
+// New function types, by encoding.
+let sigEnc: u8[][] = []
+let sigHead: {[i32]: i32} = Map()
+let sigNext: i32[] = []
+let newTypes: u8[] = []
+let blockType: {[i32]: i32} = Map()
+
+// The body being emitted and its op offsets (old in the module, new in the body).
+let eOut: u8[] = []
+let eOld: i32[] = []
+let eNew: i32[] = []
+let slotBase: {[i32]: i32} = Map()
+let slotT: {[i32]: i32} = Map()
+let slotDecl: {[i32]: i32} = Map()
+let scratchNum: {[i32]: i32} = Map()
+let scratchRef: {[i32]: i32} = Map()
+
+let explaining = false
+let logOut: u8[] = []
+let movesOut: u8[] = []
+let nameW = wnRead([])
+let nameTab: i32[] = []
+
+// Runs the step on the staged module. Returns 1 with `optOut` holding the rewritten module, or
+// 0 with an empty answer when it changes nothing. `explain` 1 fills the log; `valid` 0 says
+// the module does not validate, so it is left alone.
+export function optMultivalue(explain: i32, valid: i32): i32 {
+  optOutSet([])
+  explaining = explain != 0
+  logOut = []
+  movesOut = []
+  const out = runStep(optInBytes(), valid != 0)
+  if out.length == 0 { return 0 }
+  optOutSet(out)
+  1
+}
+
+// The last rewrite's body moves: a count, then per output body its source body's byte range,
+// a pair count, and per op its offset in the input and in the output module (all ULEB128).
+export function optMultivalueMoves(): i32 {
+  optOutSet(movesOut)
+  0
+}
+
+// The last run's `$VL_MV_EXPLAIN` lines, each ending in a newline.
+export function optMultivalueExplain(): i32 {
+  optOutSet(logOut)
+  0
+}
+
+function runStep(b: u8[], valid: boolean): u8[] {
+  const none: u8[] = []
+  if !readModule(b) || !anyCandidate || !valid || !scanBodies() {
+    if explaining {
+      logText(
+        "mv-explain: step skipped: the module does not validate, or no function takes ",
+      )
+      logText("or returns a record (a struct that nothing writes, of 1 to ")
+      logDec(MV_ARG_MAX_FIELDS)
+      logText(" numeric or reference fields as an argument, 1 to ")
+      logDec(MV_RECORD_MAX_FIELDS)
+      logLine(" numeric fields as a result)")
+    }
+    return none
+  }
+  postPass()
+  analyse()
+  if !anyProducer() && !anyFo() {
+    if explaining { explain(0) }
+    return none
+  }
+  resetPlans()
+  let f = nImports
+  while f < nFuncs {
+    planContext(f, 0, 0, false)
+    f = f + 1
+  }
+  if explaining { explain(nFuncs - nImports) }
+  let w = 0
+  let tooMany = false
+  while w < twF.length {
+    if twF.length > MV_MAX_TWINS {
+      tooMany = true
+      break
+    }
+    planContext(twF[w], twLo[w], twHi[w], twR[w])
+    w = w + 1
+  }
+  if tooMany || twF.length == 0 {
+    if explaining && tooMany {
+      logText("mv-explain: step abandoned: more than ")
+      logDec(MV_MAX_TWINS)
+      logLine(" twins")
+    }
+    return none
+  }
+  assemble()
+}
+
+// ---- Reading the module ----
+
+function resetModule(b: u8[]) {
+  mB = b
+  nImports = 0
+  nFuncs = 0
+  nTypes = 0
+  funcType = []
+  isFunc = []
+  isStruct = []
+  sigP = []
+  sigR = []
+  fVals = []
+  fMut = []
+  fFinal = []
+  shapeOk = []
+  recOk = []
+  freshOk = []
+  shapeKey = []
+  byIndex = false
+  comp = []
+  writer = Map()
+  nested = Map()
+  tainted = []
+  hasNames = false
+  tagType = []
+  anyCandidate = false
+  bR0 = []
+  bR1 = []
+  bOps = []
+  bLocN = []
+  bLocT = []
+  bExits = []
+  bInsLo = []
+  bInsHi = []
+  bOpBase = []
+  opTotal = 0
+  iK = []
+  iKind = []
+  iA = []
+  iReach = []
+  iDepth = []
+  iNext = []
+  iNA = []
+  iNB = []
+  iTop = []
+  iArgLo = []
+  iArgHi = []
+  argv = []
+  gIf = []
+  gElse = []
+  gEnd = []
+  gT = []
+  gT0 = []
+  gT1 = []
+  armEnd = Map()
+  mergeAt = Map()
+  consK = Map()
+  consJ = Map()
+}
+
+// Reads the types, imports, functions, tags and body ranges; false when any does not decode.
+function readModule(b: u8[]): boolean {
+  resetModule(b)
+  const m = wmRead(b)
+  if !m.ok { return false }
+  const supA: i32[] = []
+  const supB: i32[] = []
+  let structGroups = 0
+  let t = 0
+  let g = 0
+  while g < m.groupSize.length {
+    let hasStruct = false
+    let k = 0
+    while k < m.groupSize[g] {
+      const st = m.types[t]
+      readType(st.form, st.prefix, st.params, st.results, st.mutable)
+      if st.form == 0x5f { hasStruct = true }
+      if st.supers.length > 0 {
+        supA.push(t)
+        supB.push(st.supers[0])
+      }
+      t = t + 1
+      k = k + 1
+    }
+    if hasStruct { structGroups = structGroups + 1 }
+    g = g + 1
+  }
+  nTypes = t
+  let s = 0
+  while s < m.secId.length {
+    const id = m.secId[s]
+    const c = wcNew(b, m.secStart[s], m.secEnd[s])
+    wcByte(c)
+    wcU32(c)
+    if id == 2 { readImports(c) }
+    if id == 13 { readTags(c) }
+    if id == 0 && isNameSection(c) { hasNames = true }
+    if id == 10 { readBodyStarts(c) }
+    if c.failed { return false }
+    s = s + 1
+  }
+  for ft in m.funcTypes { funcType.push(ft) }
+  nFuncs = funcType.length
+  if m.bodies.length != m.funcTypes.length || bR0.length != m.bodies.length {
+    return false
+  }
+  for body in m.bodies {
+    bOps.push(body.from)
+    bR1.push(body.to)
+    bLocN.push(body.localCount)
+    bLocT.push(normVals(body.localType))
+  }
+  let f = 0
+  while f < nFuncs {
+    const ft = funcType[f]
+    if ft < 0 || ft >= nTypes || !isFunc[ft] { return false }
+    f = f + 1
+  }
+  readComponents(supA, supB, structGroups)
+  true
+}
+
+function readType(
+  form: i32,
+  prefix: i32,
+  params: i32[],
+  results: i32[],
+  mutable: boolean[],
+) {
+  const isF = form == 0x60
+  const isS = form == 0x5f
+  isFunc.push(isF)
+  isStruct.push(isS)
+  const ps: i32[] = []
+  const rs: i32[] = []
+  if isF {
+    for v in params { ps.push(normVal(v)) }
+    for v in results { rs.push(normVal(v)) }
+  }
+  sigP.push(ps)
+  sigR.push(rs)
+  const fv: i32[] = []
+  const fm: boolean[] = []
+  let ok = isS
+  if isS {
+    let i = 0
+    while i < params.length {
+      const v = normVal(params[i])
+      fv.push(v)
+      fm.push(mutable[i])
+      if !fieldVal(v) { ok = false }
+      i = i + 1
+    }
+  }
+  if fv.length == 0 || fv.length > MV_ARG_MAX_FIELDS { ok = false }
+  fVals.push(fv)
+  fMut.push(fm)
+  fFinal.push(prefix != 0x50)
+  shapeOk.push(ok)
+  recOk.push(ok)
+}
+
+function readImports(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const modLen = wcU32(c)
+    c.pos = c.pos + modLen
+    const fieldLen = wcU32(c)
+    c.pos = c.pos + fieldLen
+    const kind = wcByte(c)
+    if kind == 0 {
+      funcType.push(wcU32(c))
+      nImports = nImports + 1
+    } else if kind == 1 {
+      skipValType(c)
+      skipLimits(c)
+    } else if kind == 2 {
+      skipLimits(c)
+    } else if kind == 3 {
+      skipValType(c)
+      wcByte(c)
+    } else if kind == 4 {
+      wcByte(c)
+      tagType.push(wcU32(c))
+    } else {
+      c.failed = true
+      c.pos = c.end
+    }
+    if c.pos > c.end {
+      c.failed = true
+      c.pos = c.end
+    }
+    i = i + 1
+  }
+}
+
+function skipValType(c: WasmCursor) {
+  const lead = wcByte(c)
+  if lead == 0x63 || lead == 0x64 {
+    if c.pos < c.end && c.b[c.pos] == 0x62 { c.pos = c.pos + 1 }
+    wcU32(c)
+  }
+}
+
+function skipLimits(c: WasmCursor) {
+  const flags = wcByte(c)
+  wcU32(c)
+  if (flags & 1) != 0 { wcU32(c) }
+}
+
+function readTags(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    wcByte(c)
+    tagType.push(wcU32(c))
+    i = i + 1
+  }
+}
+
+function isNameSection(c: WasmCursor): boolean {
+  const n = wcU32(c)
+  if c.failed || n != 4 || c.end - c.pos < 4 { return false }
+  const b = c.b
+  const p = c.pos
+  b[p] == 0x6e && b[p + 1] == 0x61 && b[p + 2] == 0x6d && b[p + 3] == 0x65
+}
+
+// Each body's start, the byte after its size.
+function readBodyStarts(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const size = wcU32(c)
+    bR0.push(c.pos)
+    c.pos = c.pos + size
+    if c.pos > c.end {
+      c.failed = true
+      c.pos = c.end
+    }
+    i = i + 1
+  }
+}
+
+// Subtyping components, `byIndex`, and the refusal of subtyped records judged by shape.
+function readComponents(supA: i32[], supB: i32[], structGroups: i32) {
+  let t = 0
+  while t < nTypes {
+    comp.push(t)
+    t = t + 1
+  }
+  let i = 0
+  while i < supA.length {
+    const a = supA[i]
+    const b = supB[i]
+    if a >= 0 && a < nTypes && b >= 0 && b < nTypes {
+      const ra = root(a)
+      const rb = root(b)
+      if ra < 0 || rb < 0 {}
+      else if ra > rb { comp[ra] = rb }
+      else { comp[rb] = ra }
+    }
+    i = i + 1
+  }
+  t = 0
+  while t < nTypes {
+    comp[t] = root(t)
+    t = t + 1
+  }
+  byIndex = structGroups <= 1
+  if !byIndex {
+    i = 0
+    while i < supA.length {
+      if supA[i] >= 0 && supA[i] < nTypes { recOk[supA[i]] = false }
+      if supB[i] >= 0 && supB[i] < nTypes { recOk[supB[i]] = false }
+      i = i + 1
+    }
+  }
+  shapeKeys()
+  let f = nImports
+  while f < nFuncs {
+    const ft = funcType[f]
+    for v in sigR[ft] {
+      if recordOf(v) >= 0 { anyCandidate = true }
+    }
+    for v in sigP[ft] {
+      if recordOf(v) >= 0 { anyCandidate = true }
+    }
+    f = f + 1
+  }
+}
+
+function root(t: i32): i32 {
+  let x = t
+  while comp[x] != x {
+    comp[x] = comp[comp[x]]
+    x = comp[x]
+  }
+  x
+}
+
+// Per type with a record's fields, the first type of the same fields, mutability and finality.
+function shapeKeys() {
+  const head: {[i32]: i32} = Map()
+  const next: i32[] = []
+  let t = 0
+  while t < nTypes {
+    next.push(-1)
+    shapeKey.push(-1)
+    if shapeOk[t] {
+      let h = 7
+      let i = 0
+      while i < fVals[t].length {
+        h = h * 31 + fVals[t][i]
+        if fMut[t][i] { h = h * 3 + 1 }
+        i = i + 1
+      }
+      if fFinal[t] { h = h + 17 }
+      let u = head[h] ?? -1
+      while u >= 0 && shapeKey[t] < 0 {
+        if sameFields(u, t) { shapeKey[t] = u }
+        u = next[u]
+      }
+      if shapeKey[t] < 0 {
+        shapeKey[t] = t
+        next[t] = head[h] ?? -1
+        head[h] = t
+      }
+    }
+    t = t + 1
+  }
+}
+
+function sameFields(a: i32, b: i32): boolean {
+  if fFinal[a] != fFinal[b] || fVals[a].length != fVals[b].length {
+    return false
+  }
+  let i = 0
+  while i < fVals[a].length {
+    if fVals[a][i] != fVals[b][i] || fMut[a][i] != fMut[b][i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// ---- Value types ----
+
+function normVal(v: i32): i32 {
+  const lead = v & 0xff
+  if lead >= 0x68 && lead <= 0x76 { return 0x63 | (lead << 8) }
+  v
+}
+
+function normVals(vs: i32[]): i32[] {
+  const out: i32[] = []
+  for v in vs { out.push(normVal(v)) }
+  out
+}
+
+function isNum(v: i32): boolean { v >= 0x7c && v <= 0x7f }
+
+function isRef(v: i32): boolean { (v & 0xff) == 0x63 || (v & 0xff) == 0x64 }
+
+function isNullable(v: i32): boolean { (v & 0xff) == 0x63 }
+
+// A reference's concrete type index, `exact` or not; -1 for anything else.
+function concreteIdx(v: i32): i32 {
+  if !isRef(v) { return -1 }
+  const h = v >> 8
+  if h < 0x100 { return -1 }
+  (h - 0x100) >> 1
+}
+
+function isExact(v: i32): boolean {
+  isRef(v) && (v >> 8) >= 0x100 && ((v >> 8) & 1) != 0
+}
+
+// Whether a field of this type may be held apart from its record.
+function fieldVal(v: i32): boolean {
+  if isNum(v) { return true }
+  if !isRef(v) { return false }
+  const h = v >> 8
+  if h < 0x100 { return h >= 0x69 && h <= 0x74 }
+  !isExact(v)
+}
+
+// The record a reference type names, or -1.
+function recordOf(v: i32): i32 {
+  if isExact(v) { return -1 }
+  const t = concreteIdx(v)
+  if t < 0 || t >= nTypes || !recOk[t] { return -1 }
+  t
+}
+
+function shapeOf(t: i32): boolean { t >= 0 && t < nTypes && recOk[t] }
+
+function argShape(t: i32): boolean {
+  t >= 0 && t < nTypes && (recOk[t] || freshOk[t])
+}
+
+function isFreshOnly(t: i32): boolean { t >= 0 && t < nTypes && freshOk[t] }
+
+function sameShape(a: i32, b: i32): boolean {
+  if !shapeOf(a) || !shapeOf(b) { return false }
+  if byIndex { a == b } else { shapeKey[a] == shapeKey[b] }
+}
+
+function sameArg(a: i32, b: i32): boolean {
+  sameShape(a, b) || a == b && isFreshOnly(a)
+}
+
+function fieldsOf(t: i32): i32[] {
+  if argShape(t) { return fVals[t] }
+  const none: i32[] = []
+  none
+}
+
+function paramsOf(f: i32): i32[] { sigP[funcType[f]] }
+
+function resultsOf(f: i32): i32[] { sigR[funcType[f]] }
+
+function paramRecord(f: i32, j: i32): i32 {
+  const ps = paramsOf(f)
+  if j < 0 || j >= ps.length { return -1 }
+  recordOf(ps[j])
+}
+
+function paramArgRecord(f: i32, j: i32): i32 {
+  const ps = paramsOf(f)
+  if j < 0 || j >= ps.length { return -1 }
+  const t = concreteIdx(ps[j])
+  if !argShape(t) { return -1 }
+  t
+}
+
+function resultRecord(f: i32): i32 {
+  const rs = resultsOf(f)
+  if rs.length != 1 || !isRef(rs[0]) || isNullable(rs[0]) { return -1 }
+  const t = recordOf(rs[0])
+  if t < 0 || fVals[t].length > MV_RECORD_MAX_FIELDS { return -1 }
+  for v in fVals[t] {
+    if !isNum(v) { return -1 }
+  }
+  t
+}
+
+function sameRecordResult(f: i32, g: i32): boolean {
+  const a = resultRecord(f)
+  const b = resultRecord(g)
+  a >= 0 && b >= 0 && sameShape(a, b)
+}
+
+// The type of local `l` of defined function `f`, or -1.
+function localType(f: i32, l: i32): i32 {
+  const ps = paramsOf(f)
+  if l < ps.length { return ps[l] }
+  const bi = f - nImports
+  let at = ps.length
+  let k = 0
+  while k < bLocN[bi].length {
+    if l - at < bLocN[bi][k] { return bLocT[bi][k] }
+    at = at + bLocN[bi][k]
+    k = k + 1
+  }
+  -1
+}
+
+function localRecord(f: i32, l: i32): i32 {
+  const v = localType(f, l)
+  if !isRef(v) { return -1 }
+  concreteIdx(v)
+}
+
+// ---- Scanning the bodies ----
+
+// Pops and pushes of a fixed-arity operator as `pops * 16 + pushes`; -1 when they depend on
+// its immediates, -2 for an operator the step does not read.
+function tableArity(op: i32): i32 {
+  if arTabs.length == 0 {
+    for s in [AR_00, AR_FB, AR_FC, AR_FD, AR_FE] {
+      const t: u8[] = []
+      for cp in s { t.push(cp) }
+      arTabs.push(t)
+    }
+  }
+  let tab = 0
+  let i = op
+  if op > 0xff {
+    const prefix = op >> 16
+    i = op & 0xffff
+    if prefix == 0xfb { tab = 1 }
+    else if prefix == 0xfc { tab = 2 }
+    else if prefix == 0xfd { tab = 3 }
+    else if prefix == 0xfe { tab = 4 }
+    else { return -2 }
+  }
+  const t = arTabs[tab]
+  if i < 0 || 2 * i + 1 >= t.length { return -2 }
+  const a: i32 = t[2 * i]
+  const b: i32 = t[2 * i + 1]
+  if a == 99 { return -1 }
+  if a == 63 { return -2 }
+  (a - 48) * 16 + b - 48
+}
+
+// The control frames of the body being scanned: height, block type's params and results,
+// whether a loop, whether unreachable, and the merge it may be.
+let frH: i32[] = []
+let frP: i32[] = []
+let frR: i32[] = []
+let frLoop: boolean[] = []
+let frUnr: boolean[] = []
+let frMg: boolean[] = []
+let frIf: i32[] = []
+let frElse: i32[] = []
+let frTail: i32[] = []
+let frT: i32[] = []
+let frBr: boolean[] = []
+let owner: i32[] = []
+let seg: i32[] = []
+// The op being scanned.
+let sK = 0
+let sReach = false
+let sDepth = 0
+let sBase = 0
+let sSegLo = 0
+
+function scanBodies(): boolean {
+  let bi = 0
+  while bi < bR0.length {
+    if !scanBody(bi, nImports + bi) { return false }
+    bi = bi + 1
+  }
+  true
+}
+
+function pushFrame(h: i32, p: i32, r: i32, loop: boolean) {
+  frH.push(h)
+  frP.push(p)
+  frR.push(r)
+  frLoop.push(loop)
+  frUnr.push(false)
+  frMg.push(false)
+  frIf.push(NONE)
+  frElse.push(NONE)
+  frTail.push(NONE)
+  frT.push(NONE)
+  frBr.push(false)
+}
+
+function popFrame() {
+  frH.pop()
+  frP.pop()
+  frR.pop()
+  frLoop.pop()
+  frUnr.pop()
+  frMg.pop()
+  frIf.pop()
+  frElse.pop()
+  frTail.pop()
+  frT.pop()
+  frBr.pop()
+}
+
+// The producer of stack position `p` as the current op sees it.
+function producerAt(p: i32): i32 {
+  if !sReach || p < sBase || p < 0 || p >= owner.length { return NONE }
+  const q = owner[p]
+  if q != NONE && q >= sSegLo { return q }
+  NONE
+}
+
+function record(kind: i32, a: i32, top: i32, argLo: i32): i32 {
+  iK.push(sK)
+  iKind.push(kind)
+  iA.push(a)
+  iReach.push(sReach)
+  iDepth.push(sDepth)
+  iNext.push(NX_OTHER)
+  iNA.push(0)
+  iNB.push(0)
+  iTop.push(top)
+  iArgLo.push(argLo)
+  iArgHi.push(argv.length)
+  iK.length - 1
+}
+
+// A block type's params and results as `params * 65536 + results`, and in `btVal` its one
+// value type (-1 when it has none).
+let btVal = -1
+
+function blockTypeAt(at: i32): i32 {
+  btVal = -1
+  const x: i32 = mB[at]
+  if x == 0x40 { return 0 }
+  if x == 0x63 || x == 0x64 {
+    const c = wcNew(mB, at + 1, mB.length)
+    let exact = 0
+    if c.b[c.pos] == 0x62 {
+      c.pos = c.pos + 1
+      exact = 1
+    }
+    const y: i32 = c.b[c.pos]
+    if (y & 0xc0) == 0x40 {
+      btVal = x | (y << 8)
+    } else {
+      btVal = x | ((0x100 + 2 * wcU32(c) + exact) << 8)
+    }
+    return 1
+  }
+  if x >= 0x68 && x <= 0x7f {
+    btVal = normVal(x)
+    return 1
+  }
+  const c = wcNew(mB, at, mB.length)
+  const t = wcU32(c)
+  if t < 0 || t >= nTypes || !isFunc[t] { return -1 }
+  sigP[t].length * 65536 + sigR[t].length
+}
+
+// The values a branch to relative depth `d` carries.
+function labelArity(d: i32): i32 {
+  const i = frH.length - 1 - d
+  if i < 0 || d < 0 { return -1 }
+  if frLoop[i] { frP[i] } else { frR[i] }
+}
+
+function markTarget(d: i32) {
+  const i = frH.length - 1 - d
+  if d >= 0 && i >= 0 && frMg[i] { frBr[i] = true }
+}
+
+function scanBody(bi: i32, f: i32): boolean {
+  const ft = funcType[f]
+  const localRec: boolean[] = []
+  for v in sigP[ft] { localRec.push(recordOf(v) >= 0) }
+  let e = 0
+  while e < bLocN[bi].length {
+    const r = recordOf(bLocT[bi][e]) >= 0
+    let n = 0
+    while n < bLocN[bi][e] {
+      localRec.push(r)
+      n = n + 1
+    }
+    e = e + 1
+  }
+  frH = []
+  frP = []
+  frR = []
+  frLoop = []
+  frUnr = []
+  frMg = []
+  frIf = []
+  frElse = []
+  frTail = []
+  frT = []
+  frBr = []
+  owner = []
+  seg = [0]
+  pushFrame(0, sigP[ft].length, sigR[ft].length, false)
+  bExits.push(false)
+  bInsLo.push(iK.length)
+  bOpBase.push(opTotal)
+  const c = wcNew(mB, bOps[bi], bR1[bi])
+  let h = 0
+  let k = 0
+  let last = -1
+  while c.pos < c.end {
+    if frH.length == 0 { return false }
+    const at = c.pos
+    const op = wcOp(c)
+    if c.failed { return false }
+    const d = wcNew(mB, at + 1, c.pos)
+    const hb = h
+    const depth = frH.length
+    const top = depth - 1
+    sK = k
+    sReach = !frUnr[top]
+    sDepth = depth
+    sBase = frH[top]
+    sSegLo = seg[seg.length - 1]
+    const fnFrame = depth - 1
+    // The immediates the step reads.
+    let lbl = -1
+    let imm = 0
+    let imm2 = 0
+    if (
+      op == 0x0c
+      || op == 0x0d
+      || op == 0xd5
+      || op == 0xd6
+      || op >= 0x20 && op <= 0x22
+    ) {
+      lbl = wcU32(d)
+    } else if op == 0x07 || op == 0x08 || op == 0x14 || op == 0x11 {
+      imm = wcU32(d)
+    } else if op == 0xfb0018 || op == 0xfb0019 {
+      wcU32(d)
+      wcByte(d)
+      lbl = wcU32(d)
+    } else if (
+      op == 0xfb0000
+      || op == 0xfb0002
+      || op == 0xfb0005
+      || op == 0xfb0008
+    ) {
+      wcU32(d)
+      imm = wcU32(d)
+      imm2 = wcU32(d)
+    } else if op == 0x10 || op == 0x12 {
+      imm = c.imm
+    } else if op == 0x13 || op == 0x15 {
+      imm = wcU32(d)
+    }
+    // As the previous recorded op's next.
+    let nx = NX_OTHER
+    let na = 0
+    let nb = 0
+    if op == 0xfb0002 {
+      nx = NX_GET
+      na = imm
+      nb = imm2
+    } else if op == 0x21 {
+      nx = NX_SET
+      na = lbl
+    } else if (
+      op == 0x0f
+      || op == 0x0b && depth == 1
+      || op == 0x0c && lbl == fnFrame
+    ) {
+      nx = NX_EXIT
+    } else if op == 0x05 || op == 0x0b && frMg[top] {
+      nx = NX_ARM
+    }
+    // A branch to a frame delivers a value no arm's tail names.
+    if (
+      op == 0x0c
+      || op == 0x0d
+      || op == 0xd5
+      || op == 0xd6
+      || op == 0xfb0018
+      || op == 0xfb0019
+    ) {
+      markTarget(lbl)
+    } else if op == 0x0e {
+      const n = wcU32(d)
+      let i = 0
+      while i <= n {
+        markTarget(wcU32(d))
+        i = i + 1
+      }
+    } else if op == 0x1f {
+      let i = 0
+      while i < frMg.length {
+        if frMg[i] { frBr[i] = true }
+        i = i + 1
+      }
+    }
+    if last >= 0 {
+      if iK[last] + 1 == k {
+        iNext[last] = nx
+        iNA[last] = na
+        iNB[last] = nb
+      }
+      last = -1
+    }
+    // What the step records of the op.
+    let rp = 0
+    if op == 0x10 || op == 0x12 {
+      if imm < 0 || imm >= nFuncs { return false }
+      const cps = paramsOf(imm)
+      rp = resultsOf(imm).length
+      if imm >= nImports {
+        const pn = cps.length
+        const a0 = argv.length
+        let j = 0
+        while j < pn {
+          argv.push(if hb >= pn { producerAt(hb - pn + j) } else { NONE })
+          j = j + 1
+        }
+        last = record(if op == 0x10 { K_CALL } else { K_RCALL }, imm, NONE, a0)
+      } else if op == 0x12 {
+        bExits[bi] = true
+      }
+    } else if op == 0x14 || op == 0x11 {
+      if imm >= 0 && imm < nTypes && isFunc[imm] { rp = sigR[imm].length }
+    } else if op == 0x15 || op == 0x13 {
+      bExits[bi] = true
+    } else if op == 0xfb0000 {
+      if shapeOf(imm) { last = record(K_NEW, imm, NONE, argv.length) }
+    } else if op == 0xfb0005 {
+      tainted.push(imm)
+      if !writer.has(imm) { writer[imm] = f }
+    } else if op == 0x20 {
+      if lbl >= 0 && lbl < localRec.length && localRec[lbl] {
+        last = record(K_GET, lbl, NONE, argv.length)
+      }
+    } else if op == 0x21 || op == 0x22 {
+      if lbl >= 0 && lbl < localRec.length && localRec[lbl] {
+        const tp = if hb >= 1 { producerAt(hb - 1) } else { NONE }
+        last = record(
+          if op == 0x21 { K_SET } else { K_TEE },
+          lbl,
+          tp,
+          argv.length,
+        )
+      }
+    } else if (
+      op == 0x0f
+      || op == 0x0b && depth == 1
+      || op == 0x0c && lbl == fnFrame
+    ) {
+      const tp = if hb >= 1 { producerAt(hb - 1) } else { NONE }
+      record(K_EXIT, 0, tp, argv.length)
+    } else if op == 0x05 {
+      if frMg[top] {
+        frElse[top] = k
+        frTail[top] = if hb >= 1 { producerAt(hb - 1) } else { NONE }
+      }
+    } else if op == 0x0b {
+      if frMg[top] && frElse[top] != NONE && !frBr[top] {
+        const tail = if hb >= 1 { producerAt(hb - 1) } else { NONE }
+        const mi = gIf.length
+        gIf.push(frIf[top])
+        gElse.push(frElse[top])
+        gEnd.push(k)
+        gT.push(frT[top])
+        gT0.push(frTail[top])
+        gT1.push(tail)
+        armEnd[opTotal + frElse[top]] = mi
+        armEnd[opTotal + k] = mi
+        mergeAt[opTotal + k] = mi
+        last = record(K_MERGE, frT[top], NONE, argv.length)
+      }
+    } else if (
+      op == 0x0d
+      || op == 0xd5
+      || op == 0xd6
+      || op == 0xfb0018
+      || op == 0xfb0019
+    ) {
+      if lbl >= fnFrame { bExits[bi] = true }
+    } else if op == 0x0e {
+      const d2 = wcNew(mB, at + 1, c.pos)
+      const n = wcU32(d2)
+      let i = 0
+      while i <= n {
+        if wcU32(d2) >= fnFrame { bExits[bi] = true }
+        i = i + 1
+      }
+    } else if (
+      op == 0x06
+      || op == 0x1f
+      || op == 0x18
+      || op == 0x07
+      || op == 0x19
+    ) {
+      bExits[bi] = true
+    }
+    // The stack after the op, and the positions it writes.
+    let pushes = 0
+    let grew = false
+    const base = sBase
+    if op == 0x02 || op == 0x03 || op == 0x06 || op == 0x1f || op == 0x04 {
+      const bt = blockTypeAt(at + 1)
+      if bt < 0 { return false }
+      const bp = bt >> 16
+      const br = bt & 0xffff
+      const pops = if op == 0x04 { bp + 1 } else { bp }
+      const hp = max(hb - pops, base)
+      pushFrame(hp, bp, br, op == 0x03)
+      if op == 0x04 && btVal >= 0 && isRef(btVal) && !isNullable(btVal) {
+        const t = recordOf(btVal)
+        if t >= 0 {
+          frMg[top + 1] = true
+          frIf[top + 1] = k
+          frT[top + 1] = t
+        }
+      }
+      h = hp + bp
+      pushes = bp
+      grew = true
+    } else if op == 0x05 {
+      h = frH[top] + frP[top]
+      frUnr[top] = false
+      pushes = frP[top]
+    } else if op == 0x07 {
+      if imm < 0 || imm >= tagType.length { return false }
+      const tp = sigP[tagType[imm]].length
+      h = frH[top] + tp
+      frUnr[top] = false
+      pushes = tp
+    } else if op == 0x19 {
+      h = frH[top]
+      frUnr[top] = false
+    } else if op == 0x0b || op == 0x18 {
+      h = frH[top] + frR[top]
+      pushes = frR[top]
+      popFrame()
+    } else if (
+      op == 0x00
+      || op >= 0x08 && op <= 0x0a
+      || op == 0x0c
+      || op == 0x0e
+      || op == 0x0f
+      || op == 0x12
+      || op == 0x13
+      || op == 0x15
+    ) {
+      h = base
+      frUnr[top] = true
+    } else if (
+      op == 0x0d
+      || op == 0xd5
+      || op == 0xd6
+      || op == 0xfb0018
+      || op == 0xfb0019
+    ) {
+      const n = labelArity(lbl)
+      if n < 0 { return false }
+      let pops = n
+      pushes = n
+      if op == 0x0d { pops = n + 1 }
+      if op == 0xd5 {
+        pops = n + 1
+        pushes = n + 1
+      }
+      if op == 0xd6 { pushes = n - 1 }
+      h = max(hb - pops, base) + pushes
+    } else if op == 0x10 || op == 0x11 || op == 0x14 {
+      let ps = 0
+      if op == 0x10 {
+        ps = paramsOf(imm).length
+      } else {
+        if imm < 0 || imm >= nTypes || !isFunc[imm] { return false }
+        ps = sigP[imm].length + 1
+      }
+      pushes = rp
+      h = max(hb - ps, base) + rp
+    } else if op == 0xfb0000 {
+      if imm < 0 || imm >= nTypes || !isStruct[imm] { return false }
+      h = max(hb - fVals[imm].length, base) + 1
+      pushes = 1
+    } else if op == 0xfb0008 {
+      h = max(hb - imm2, base) + 1
+      pushes = 1
+    } else {
+      const ar = tableArity(op)
+      if ar < 0 { return false }
+      pushes = ar & 15
+      h = max(hb - (ar >> 4), base) + pushes
+    }
+    const ha = h
+    let lo = max(ha - pushes, 0)
+    lo = min(lo, max(ha - rp, 0))
+    if grew { lo = min(lo, frH[frH.length - 1]) }
+    while owner.length < ha { owner.push(NONE) }
+    let p = lo
+    while p < ha {
+      owner[p] = k
+      p = p + 1
+    }
+    while owner.length > ha { owner.pop() }
+    if grew {
+      seg.push(k + 1)
+    } else if op == 0x05 || op == 0x07 || op == 0x19 {
+      seg[seg.length - 1] = k + 1
+    } else if op == 0x0b || op == 0x18 {
+      seg.pop()
+    }
+    k = k + 1
+  }
+  bInsHi.push(iK.length)
+  opTotal = opTotal + k + 1
+  true
+}
+
+function max(a: i32, b: i32): i32 {
+  if a > b { a } else { b }
+}
+
+function min(a: i32, b: i32): i32 {
+  if a < b { a } else { b }
+}
+
+// Charges writes, judging by index or by shape, and finds each record's nested sealed struct.
+function postPass() {
+  let t = 0
+  while t < nTypes {
+    freshOk.push(false)
+    t = t + 1
+  }
+  const writtenComp: {[i32]: i32} = Map()
+  for w in tainted {
+    if w >= 0 && w < nTypes { writtenComp[comp[w]] = 1 }
+  }
+  if byIndex {
+    t = 0
+    while t < nTypes {
+      if writtenComp.has(comp[t]) {
+        freshOk[t] = recOk[t]
+        recOk[t] = false
+      }
+      t = t + 1
+    }
+  } else {
+    const writtenShape: {[i32]: i32} = Map()
+    for w in tainted {
+      if w >= 0 && w < nTypes && shapeOk[w] { writtenShape[shapeKey[w]] = 1 }
+    }
+    t = 0
+    while t < nTypes {
+      if recOk[t] && writtenShape.has(shapeKey[t]) { recOk[t] = false }
+      t = t + 1
+    }
+  }
+  t = 0
+  while t < nTypes {
+    if argShape(t) {
+      let found = false
+      for v in fVals[t] {
+        if !found && isRef(v) {
+          const h = v >> 8
+          if h == 0x6e || h == 0x6d || h == 0x6b {
+            nested[t] = NONE
+            found = true
+          } else if h >= 0x100 {
+            const u = (h - 0x100) >> 1
+            if (
+              u < nTypes
+              && isStruct[u]
+              && (!byIndex || !writtenComp.has(comp[u]))
+            ) {
+              nested[t] = u
+              found = true
+            }
+          }
+        }
+      }
+    }
+    t = t + 1
+  }
+}
+
+// ---- Analysis ----
+
+// The recorded op of body `bi` at ordinal `k`, or -1.
+function at(bi: i32, k: i32): i32 {
+  let lo = bInsLo[bi]
+  let hi = bInsHi[bi]
+  while lo < hi {
+    const mid = lo + (hi - lo) / 2
+    if iK[mid] < k { lo = mid + 1 } else { hi = mid }
+  }
+  if lo < bInsHi[bi] && iK[lo] == k { lo } else { -1 }
+}
+
+function inSet(r: boolean, f: i32, j: i32): boolean {
+  if j < 0 || j >= 64 { return false }
+  if r { (foR[f * 64 + j] ?? 0) == 1 } else { (fo[f * 64 + j] ?? 0) == 1 }
+}
+
+// Whether recorded get `ii` of body `f`, of a record of type `t`, is a field use under the
+// current field-only parameters.
+function fieldUse(f: i32, ii: i32, t: i32): boolean {
+  if !iReach[ii] { return false }
+  if iNext[ii] == NX_GET { return sameArg(iNA[ii], t) }
+  const bi = f - nImports
+  const key = bOpBase[bi] + iK[ii]
+  if !consK.has(key) { return false }
+  const ci = at(bi, consK[key] ?? 0)
+  const j = consJ[key] ?? 0
+  if ci < 0 { return false }
+  const h = iA[ci]
+  const pt = paramArgRecord(h, j)
+  inSet(false, h, j) && pt >= 0 && sameArg(pt, t)
+}
+
+function anyProducer(): boolean {
+  for p in producer {
+    if p { return true }
+  }
+  false
+}
+
+function anyFo(): boolean {
+  for key in allowedKeys {
+    if (fo[key] ?? 0) == 1 { return true }
+  }
+  false
+}
+
+function analyse() {
+  // Arguments' consumers.
+  let bi = 0
+  while bi < bR0.length {
+    let ii = bInsLo[bi]
+    while ii < bInsHi[bi] {
+      if (iKind[ii] == K_CALL || iKind[ii] == K_RCALL) && iReach[ii] {
+        let j = 0
+        while j < iArgHi[ii] - iArgLo[ii] {
+          const q = argv[iArgLo[ii] + j]
+          if q != NONE {
+            consK[bOpBase[bi] + q] = iK[ii]
+            consJ[bOpBase[bi] + q] = j
+          }
+          j = j + 1
+        }
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+  // Producers: a greatest fixpoint.
+  producer = []
+  let f = 0
+  while f < nFuncs {
+    producer.push(
+      f >= nImports && resultRecord(f) >= 0 && !bExits[f - nImports],
+    )
+    f = f + 1
+  }
+  let changed = true
+  while changed {
+    const drop: i32[] = []
+    f = nImports
+    while f < nFuncs {
+      if producer[f] {
+        const b = f - nImports
+        let ii = bInsLo[b]
+        let bad = false
+        while ii < bInsHi[b] && !bad {
+          if iKind[ii] == K_RCALL {
+            const g = iA[ii]
+            if !producer[g] || !sameRecordResult(f, g) { bad = true }
+          }
+          ii = ii + 1
+        }
+        if bad { drop.push(f) }
+      }
+      f = f + 1
+    }
+    for x in drop { producer[x] = false }
+    changed = drop.length > 0
+  }
+  // The parameters that may be taken apart at all.
+  allowed = Map()
+  allowedKeys = []
+  fo = Map()
+  foR = Map()
+  f = nImports
+  while f < nFuncs {
+    const b = f - nImports
+    const small = bR1[b] - bR0[b] <= ESCAPE_INLINE_MAX_BYTES
+    const np = paramsOf(f).length
+    let width = np
+    for fresh in [false, true] {
+      let j = 0
+      while j < min(np, 64) {
+        const t = paramArgRecord(f, j)
+        if t >= 0 && isFreshOnly(t) == fresh {
+          const grow = fieldsOf(t).length - 1
+          if !(small && nested.has(t)) && width + grow <= MV_TWIN_MAX_PARAMS {
+            width = width + grow
+            allowed[f * 64 + j] = 1
+            allowedKeys.push(f * 64 + j)
+            fo[f * 64 + j] = 1
+          }
+        }
+        j = j + 1
+      }
+    }
+    f = f + 1
+  }
+  // Field-only parameters: a greatest fixpoint.
+  changed = true
+  while changed {
+    const drop: i32[] = []
+    for key in allowedKeys {
+      if (fo[key] ?? 0) == 1 {
+        const g = key / 64
+        const a = key % 64
+        const t = paramArgRecord(g, a)
+        const b = g - nImports
+        let ii = bInsLo[b]
+        let bad = false
+        while ii < bInsHi[b] && !bad {
+          const kind = iKind[ii]
+          if (kind == K_SET || kind == K_TEE) && iA[ii] == a { bad = true }
+          if kind == K_GET && iA[ii] == a && !fieldUse(g, ii, t) { bad = true }
+          ii = ii + 1
+        }
+        if bad { drop.push(key) }
+      }
+    }
+    for key in drop { fo[key] = 0 }
+    changed = drop.length > 0
+  }
+  // The result-twin set.
+  for key in allowedKeys {
+    if (fo[key] ?? 0) == 1 { foR[key] = 1 }
+  }
+  f = nImports
+  while f < nFuncs {
+    if producer[f] {
+      const rt = resultRecord(f)
+      const b = f - nImports
+      let j = 0
+      while j < min(paramsOf(f).length, 64) {
+        const key = f * 64 + j
+        const t = paramRecord(f, j)
+        if (
+          (fo[key] ?? 0) != 1
+          && allowed.has(key)
+          && t >= 0
+          && sameShape(t, rt)
+        ) {
+          let ok = true
+          let ii = bInsLo[b]
+          while ii < bInsHi[b] && ok {
+            const kind = iKind[ii]
+            if (kind == K_SET || kind == K_TEE) && iA[ii] == j { ok = false }
+            if kind == K_GET && iA[ii] == j {
+              ok = fieldUse(f, ii, t) || iReach[ii] && iNext[ii] == NX_EXIT
+            }
+            ii = ii + 1
+          }
+          if ok { foR[key] = 1 }
+        }
+        j = j + 1
+      }
+    }
+    f = f + 1
+  }
+  // Field-only locals.
+  foLocal = []
+  f = nImports
+  while f < nFuncs {
+    foLocal.push(fieldOnlyLocals(f))
+    f = f + 1
+  }
+}
+
+function sameLocal(l: i32, t: i32): boolean {
+  (live[l] ?? 0) == 1 && candT.has(l) && sameShape(candT[l] ?? -1, t)
+}
+
+// Whether the value at ordinal `k` of body `bi`, of record type `t`, is an arm's value where
+// the merge is itself held as fields (read field by field, or set to a field-only local
+// other than `l`).
+function armHeld(bi: i32, k: i32, t: i32, l: i32): boolean {
+  const key = bOpBase[bi] + k + 1
+  if !armEnd.has(key) { return false }
+  const mi = armEnd[key] ?? 0
+  if gT0[mi] != k && gT1[mi] != k || !sameShape(gT[mi], t) { return false }
+  const ei = at(bi, gEnd[mi])
+  if ei < 0 || !iReach[ei] { return false }
+  if iNext[ei] == NX_GET { return sameShape(iNA[ei], gT[mi]) }
+  if iNext[ei] == NX_SET { return iNA[ei] != l && sameLocal(iNA[ei], gT[mi]) }
+  false
+}
+
+function fieldOnlyLocals(f: i32): i32[] {
+  const bi = f - nImports
+  const np = paramsOf(f).length
+  candT = Map()
+  candN = Map()
+  live = Map()
+  const cands: i32[] = []
+  let ii = bInsLo[bi]
+  while ii < bInsHi[bi] {
+    const kind = iKind[ii]
+    const l = iA[ii]
+    if (
+      (kind == K_GET || kind == K_SET || kind == K_TEE)
+      && l >= np
+      && !candT.has(l)
+    ) {
+      const v = localType(f, l)
+      const t = concreteIdx(v)
+      if t >= 0 && shapeOf(t) {
+        candT[l] = t
+        candN[l] = if isNullable(v) { 1 } else { 0 }
+        cands.push(l)
+        live[l] = 1
+      }
+    }
+    ii = ii + 1
+  }
+  let changed = true
+  while changed {
+    const firstSeen: {[i32]: i32} = Map()
+    const bad: {[i32]: i32} = Map()
+    ii = bInsLo[bi]
+    while ii < bInsHi[bi] {
+      const kind = iKind[ii]
+      const l = iA[ii]
+      const k = iK[ii]
+      const reach = iReach[ii]
+      let seen = false
+      let ok = false
+      if kind == K_TEE {
+        seen = true
+      } else if kind == K_GET && candT.has(l) {
+        seen = true
+        const t = candT[l] ?? -1
+        const nullable = (candN[l] ?? 0) == 1
+        const copied = iNext[ii] == NX_SET
+          && iNA[ii] != l
+          && reach
+          && sameLocal(iNA[ii], t)
+        const arm = reach && iNext[ii] == NX_ARM && armHeld(bi, k, t, l)
+        const use = fieldUse(f, ii, t)
+          || copied
+          || arm
+          || reach && viaResult(f, ii, t, l)
+        ok = use && (!nullable || firstSeen.has(l))
+      } else if kind == K_SET && candT.has(l) {
+        seen = true
+        const t = candT[l] ?? -1
+        const nullable = (candN[l] ?? 0) == 1
+        let src = -1
+        if reach && iTop[ii] != NONE && iTop[ii] + 1 == k {
+          src = at(bi, iTop[ii])
+        }
+        let srcOk = !reach
+        if src >= 0 {
+          const sk = iKind[src]
+          if sk == K_CALL {
+            const g = iA[src]
+            const rt = resultRecord(g)
+            srcOk = producer[g] && rt >= 0 && sameShape(rt, t)
+          } else if sk == K_NEW || sk == K_MERGE {
+            srcOk = sameShape(iA[src], t)
+          } else if sk == K_GET {
+            srcOk = iA[src] != l && sameLocal(iA[src], t)
+          }
+        }
+        const firstOk = !nullable
+          || firstSeen.has(l)
+          || iDepth[ii] == 1 && reach
+        ok = srcOk && firstOk
+      }
+      if seen {
+        firstSeen[l] = 1
+        if !ok { bad[l] = 1 }
+      }
+      ii = ii + 1
+    }
+    changed = false
+    for l in cands {
+      if (live[l] ?? 0) == 1 && bad.has(l) {
+        live[l] = 0
+        changed = true
+      }
+    }
+  }
+  const out: i32[] = []
+  for l in cands {
+    if (live[l] ?? 0) == 1 { out.push(l) }
+  }
+  sortInts(out)
+  out
+}
+
+// An argument a result twin takes as fields, at a call whose own result is held as fields.
+function viaResult(f: i32, ii: i32, t: i32, l: i32): boolean {
+  const bi = f - nImports
+  const key = bOpBase[bi] + iK[ii]
+  if !consK.has(key) { return false }
+  const ci = at(bi, consK[key] ?? 0)
+  const j = consJ[key] ?? 0
+  if ci < 0 || iKind[ci] != K_CALL { return false }
+  const h = iA[ci]
+  const rt = resultRecord(h)
+  if !producer[h] || rt < 0 { return false }
+  const pt = paramRecord(h, j)
+  if !inSet(true, h, j) || pt < 0 || !sameShape(pt, t) || !iReach[ci] {
+    return false
+  }
+  const nx = iNext[ci]
+  if nx == NX_GET { return sameShape(iNA[ci], rt) }
+  if nx == NX_SET { return iNA[ci] != l && sameLocal(iNA[ci], rt) }
+  if nx == NX_ARM { return armHeld(bi, iK[ci], rt, l) }
+  fieldUse(f, ci, rt)
+}
+
+// Sorts ascending, in place.
+function sortInts(a: i32[]) {
+  if a.length < 2 { return }
+  const tmp: i32[] = []
+  for x in a { tmp.push(x) }
+  let width = 1
+  while width < a.length {
+    let lo = 0
+    while lo < a.length {
+      const mid = min(lo + width, a.length)
+      const hi = min(lo + 2 * width, a.length)
+      let i = lo
+      let j = mid
+      let k = lo
+      while k < hi {
+        if i < mid && (j >= hi || a[i] <= a[j]) {
+          tmp[k] = a[i]
+          i = i + 1
+        } else {
+          tmp[k] = a[j]
+          j = j + 1
+        }
+        k = k + 1
+      }
+      lo = hi
+    }
+    let k = 0
+    while k < a.length {
+      a[k] = tmp[k]
+      k = k + 1
+    }
+    width = width * 2
+  }
+}
+
+// ---- Plans ----
+
+function resetPlans() {
+  pLo = []
+  pHi = []
+  pK = []
+  pKind = []
+  pA = []
+  pB = []
+  twF = []
+  twLo = []
+  twHi = []
+  twR = []
+  twHead = Map()
+  twNext = []
+}
+
+function setAct(k: i32, kind: i32, a: i32, b: i32) {
+  actKind[k] = kind
+  actA[k] = a
+  actB[k] = b
+}
+
+function maskHas(lo: i32, hi: i32, j: i32): boolean {
+  if j < 0 || j >= 64 { return false }
+  if j < 32 { ((lo >> j) & 1) != 0 } else { ((hi >> (j - 32)) & 1) != 0 }
+}
+
+// The twin `(f, mask, r)`'s function index, made on first ask.
+function twinIndex(f: i32, lo: i32, hi: i32, r: boolean): i32 {
+  const key = f * 1000003 + lo * 7919 + hi * 104729 + (if r { 1 } else { 0 })
+  let i = twHead[key] ?? -1
+  while i >= 0 {
+    if twF[i] == f && twLo[i] == lo && twHi[i] == hi && twR[i] == r {
+      return nFuncs + i
+    }
+    i = twNext[i]
+  }
+  i = twF.length
+  twF.push(f)
+  twLo.push(lo)
+  twHi.push(hi)
+  twR.push(r)
+  twNext.push(twHead[key] ?? -1)
+  twHead[key] = i
+  nFuncs + i
+}
+
+// Merge `mi` leaves its record's fields: its `if` says so, and each arm leaves fields.
+function takeMerge(bi: i32, mi: i32) {
+  if actKind.has(gIf[mi]) { return }
+  setAct(gIf[mi], A_MERGEIF, gT[mi], 0)
+  armTake(bi, mi, gT0[mi], gElse[mi])
+  armTake(bi, mi, gT1[mi], gEnd[mi])
+}
+
+function armTake(bi: i32, mi: i32, tail: i32, close: i32) {
+  const t = gT[mi]
+  let si = -1
+  if tail != NONE && tail + 1 == close { si = at(bi, tail) }
+  if si >= 0 && iReach[si] {
+    const kind = iKind[si]
+    if (
+      kind == K_CALL
+      && producer[iA[si]]
+      && sameShape(resultRecord(iA[si]), t)
+    ) {
+      rCalls[tail] = 1
+      return
+    }
+    if kind == K_NEW && sameShape(iA[si], t) {
+      setAct(tail, A_DELETE, 0, 0)
+      return
+    }
+    if (
+      kind == K_GET
+      && (actKind[tail] ?? 0) == A_GETF
+      && (actB[tail] ?? 0) == -1
+    ) {
+      return
+    }
+  }
+  setAct(close, A_EXTRACT, t, 0)
+}
+
+function scalarLocal(l: i32, np: i32, lo: i32, hi: i32): boolean {
+  if l < np { maskHas(lo, hi, l) } else { scalarL.has(l) }
+}
+
+// One context's decisions, stored as a plan; calls are decided last to first, since a call's
+// own use is decided before it.
+function planContext(f: i32, slo: i32, shi: i32, r: boolean) {
+  actKind = Map()
+  actA = Map()
+  actB = Map()
+  rCalls = Map()
+  scalarL = Map()
+  const bi = f - nImports
+  const np = paramsOf(f).length
+  for l in foLocal[bi] { scalarL[l] = 1 }
+  const ilo = bInsLo[bi]
+  const ihi = bInsHi[bi]
+  const base = bOpBase[bi]
+  let ii = ilo
+  while ii < ihi {
+    const kind = iKind[ii]
+    const k = iK[ii]
+    const l = iA[ii]
+    const nx = iNext[ii]
+    if kind == K_GET && iReach[ii] && scalarLocal(l, np, slo, shi) {
+      if nx == NX_GET {
+        setAct(k, A_GETF, l, iNB[ii])
+        setAct(k + 1, A_DELETE, 0, 0)
+      } else if r && nx == NX_EXIT {
+        setAct(k, A_GETF, l, -1)
+      } else if (
+        nx == NX_SET && iNA[ii] >= np && scalarLocal(iNA[ii], np, slo, shi)
+        || nx == NX_ARM
+      ) {
+        setAct(k, A_GETF, l, -1)
+      }
+    } else if (
+      kind == K_SET
+      && l >= np
+      && scalarLocal(l, np, slo, shi)
+      && iReach[ii]
+    ) {
+      setAct(k, A_SETF, l, 0)
+      const si = if iTop[ii] == NONE { -1 } else { at(bi, iTop[ii]) }
+      if si >= 0 {
+        if iKind[si] == K_NEW { setAct(iK[si], A_DELETE, 0, 0) }
+        if iKind[si] == K_MERGE { takeMerge(bi, mergeAt[base + iK[si]] ?? 0) }
+      }
+    } else if kind == K_MERGE && iReach[ii] {
+      if nx == NX_GET && sameShape(iNA[ii], l) {
+        takeMerge(bi, mergeAt[base + k] ?? 0)
+        setAct(k + 1, A_PICK, iNB[ii], fieldsOf(l).length)
+      }
+    }
+    ii = ii + 1
+  }
+  if r {
+    const rt = resultRecord(f)
+    ii = ilo
+    while ii < ihi {
+      if iKind[ii] == K_EXIT {
+        const k = iK[ii]
+        const tp = iTop[ii]
+        let si = -1
+        if iReach[ii] && tp != NONE { si = at(bi, tp) }
+        let done = false
+        if si >= 0 {
+          const sk = iKind[si]
+          const s = iA[si]
+          if (
+            sk == K_CALL
+            && producer[s]
+            && tp + 1 == k
+            && sameRecordResult(f, s)
+          ) {
+            rCalls[tp] = 1
+            done = true
+          } else if sk == K_NEW && rt >= 0 && sameShape(s, rt) {
+            setAct(tp, A_DELETE, 0, 0)
+            done = true
+          } else if sk == K_GET && scalarLocal(s, np, slo, shi) && tp + 1 == k {
+            done = true
+          } else if (
+            sk == K_MERGE
+            && tp + 1 == k
+            && rt >= 0
+            && sameShape(s, rt)
+          ) {
+            takeMerge(bi, mergeAt[base + tp] ?? 0)
+            done = true
+          }
+        }
+        if !done { setAct(k, A_EXTRACT, rt, 0) }
+      }
+      ii = ii + 1
+    }
+  }
+  ii = ihi - 1
+  while ii >= ilo {
+    const kind = iKind[ii]
+    if (kind == K_CALL || kind == K_RCALL) && iReach[ii] {
+      planCall(f, bi, ii, np, slo, shi, r)
+    }
+    ii = ii - 1
+  }
+  const keys: i32[] = []
+  for k in actKind { keys.push(k) }
+  sortInts(keys)
+  pLo.push(pK.length)
+  for k in keys {
+    pK.push(k)
+    pKind.push(actKind[k] ?? 0)
+    pA.push(actA[k] ?? 0)
+    pB.push(actB[k] ?? 0)
+  }
+  pHi.push(pK.length)
+}
+
+function planCall(
+  f: i32,
+  bi: i32,
+  ii: i32,
+  np: i32,
+  slo: i32,
+  shi: i32,
+  r: boolean,
+) {
+  const h = iA[ii]
+  const k = iK[ii]
+  const tail = iKind[ii] == K_RCALL
+  let rr = if tail { r } else { rCalls.has(k) }
+  if !tail && !rr && producer[h] {
+    const rt = resultRecord(h)
+    if iNext[ii] == NX_GET && sameShape(iNA[ii], rt) {
+      rr = true
+      setAct(k + 1, A_PICK, iNB[ii], fieldsOf(rt).length)
+    } else if (
+      iNext[ii] == NX_SET
+      && iNA[ii] >= np
+      && scalarLocal(iNA[ii], np, slo, shi)
+    ) {
+      rr = true
+    }
+  }
+  let lo = 0
+  let hi = 0
+  let j = 0
+  while j < iArgHi[ii] - iArgLo[ii] {
+    const q = argv[iArgLo[ii] + j]
+    const si = if q == NONE || !inSet(rr, h, j) { -1 } else { at(bi, q) }
+    if si >= 0 {
+      const pt = paramArgRecord(h, j)
+      const sk = iKind[si]
+      const s = iA[si]
+      let ok = false
+      if sk == K_CALL {
+        ok = producer[s] && sameShape(resultRecord(s), pt)
+      } else if sk == K_NEW {
+        ok = sameArg(s, pt)
+      } else if sk == K_MERGE {
+        ok = sameShape(s, pt)
+      } else if sk == K_GET {
+        const lt = localRecord(f, s)
+        ok = scalarLocal(s, np, slo, shi)
+          && lt >= 0
+          && (sameShape(lt, pt) || s < np && sameArg(lt, pt))
+      }
+      if ok {
+        if j < 32 { lo = lo | (1 << j) } else { hi = hi | (1 << (j - 32)) }
+        if sk == K_CALL { rCalls[q] = 1 }
+        if sk == K_NEW { setAct(q, A_DELETE, 0, 0) }
+        if sk == K_GET { setAct(q, A_GETF, s, -1) }
+        if sk == K_MERGE { takeMerge(bi, mergeAt[bOpBase[bi] + q] ?? 0) }
+      }
+    }
+    j = j + 1
+  }
+  if lo == 0 && hi == 0 && !rr { return }
+  const to = twinIndex(h, lo, hi, rr)
+  setAct(k, A_CALL, to, if tail { 1 } else { 0 })
+}
+
+// ---- Emitting ----
+
+function putUleb(out: u8[], v: i32) { wnPutLeb(out, v) }
+
+function putSleb(out: u8[], v: i32) {
+  let x = v
+  let more = true
+  while more {
+    const byte = x & 0x7f
+    x = x >> 7
+    if x == 0 && (byte & 0x40) == 0 || x == -1 && (byte & 0x40) != 0 {
+      out.push(byte)
+      more = false
+    } else {
+      out.push(byte | 0x80)
+    }
+  }
+}
+
+// Appends value type `v`; false when the step cannot spell it.
+function putVal(out: u8[], v: i32): boolean {
+  const lead = v & 0xff
+  if lead >= 0x7b && lead <= 0x7f && (v >> 8) == 0 {
+    out.push(lead)
+    return true
+  }
+  if !isRef(v) { return false }
+  out.push(lead)
+  const h = v >> 8
+  if h < 0x100 {
+    if h < 0x69 || h > 0x74 { return false }
+    out.push(h)
+    return true
+  }
+  if isExact(v) { return false }
+  putSleb(out, (h - 0x100) >> 1)
+  true
+}
+
+function nullableOf(v: i32): i32 {
+  if isRef(v) { return (v & ~0xff) | 0x63 }
+  v
+}
+
+// Body `f` rewritten by plan `plan` for the context `(f, mask, r)`, into `eOut`, with each op's
+// module offset beside its body offset in `eOld`/`eNew`; false when it will not encode.
+function emitBody(f: i32, slo: i32, shi: i32, plan: i32): boolean {
+  eOut = []
+  eOld = []
+  eNew = []
+  slotBase = Map()
+  slotT = Map()
+  slotDecl = Map()
+  scratchNum = Map()
+  scratchRef = Map()
+  const bi = f - nImports
+  const np = paramsOf(f).length
+  const paramNew: i32[] = []
+  let at = 0
+  let j = 0
+  while j < np {
+    paramNew.push(at)
+    if maskHas(slo, shi, j) {
+      const t = paramArgRecord(f, j)
+      if t < 0 { return false }
+      slotBase[j] = at
+      slotT[j] = t
+      slotDecl[j] = 0
+      at = at + fieldsOf(t).length
+    } else {
+      at = at + 1
+    }
+    j = j + 1
+  }
+  const shift = at - np
+  let nextLocal = at
+  for n in bLocN[bi] { nextLocal = nextLocal + n }
+  const extra: i32[] = []
+  for l in foLocal[bi] {
+    const v = localType(f, l)
+    if !isRef(v) { return false }
+    const t = concreteIdx(v)
+    const fs = fieldsOf(t)
+    if t < 0 || fs.length == 0 { return false }
+    slotBase[l] = nextLocal
+    slotT[l] = t
+    slotDecl[l] = 1
+    for x in fs {
+      extra.push(nullableOf(x))
+      nextLocal = nextLocal + 1
+    }
+  }
+  const code: u8[] = []
+  const c = wcNew(mB, bOps[bi], bR1[bi])
+  let k = 0
+  let pi = pLo[plan]
+  const phi = pHi[plan]
+  while c.pos < c.end {
+    const off = c.pos
+    const op = wcOp(c)
+    if c.failed { return false }
+    const end = c.pos
+    eOld.push(off)
+    eNew.push(code.length)
+    while pi < phi && pK[pi] < k { pi = pi + 1 }
+    const act = if pi < phi && pK[pi] == k { pKind[pi] } else { 0 }
+    const a = if act != 0 { pA[pi] } else { 0 }
+    const b = if act != 0 { pB[pi] } else { 0 }
+    if act == A_CALL {
+      code.push(if b == 1 { 0x12 } else { 0x10 })
+      putUleb(code, a)
+    } else if act == A_MERGEIF {
+      if !blockType.has(a) { return false }
+      code.push(0x04)
+      putSleb(code, blockType[a] ?? 0)
+    } else if act == A_GETF {
+      if !slotBase.has(a) { return false }
+      const sb = slotBase[a] ?? 0
+      const fs = fieldsOf(slotT[a] ?? -1)
+      const decl = (slotDecl[a] ?? 0) == 1
+      if b >= 0 {
+        if b >= fs.length { return false }
+        getField(code, sb, fs, decl, b)
+      } else {
+        let i = 0
+        while i < fs.length {
+          getField(code, sb, fs, decl, i)
+          i = i + 1
+        }
+      }
+    } else if act == A_SETF {
+      if !slotBase.has(a) { return false }
+      const sb = slotBase[a] ?? 0
+      let i = fieldsOf(slotT[a] ?? -1).length - 1
+      while i >= 0 {
+        code.push(0x21)
+        putUleb(code, sb + i)
+        i = i - 1
+      }
+    } else if act == A_PICK {
+      if b == 0 || a >= b { return false }
+      let i = a + 1
+      while i < b {
+        code.push(0x1a)
+        i = i + 1
+      }
+      if a > 0 {
+        if op != 0xfb0002 { return false }
+        const d = wcNew(mB, off + 1, end)
+        wcU32(d)
+        const fs = fieldsOf(wcU32(d))
+        if a >= fs.length { return false }
+        const fnum = fs[a]
+        let sl = scratchNum[fnum] ?? -1
+        if sl < 0 {
+          sl = nextLocal
+          nextLocal = nextLocal + 1
+          extra.push(fnum)
+          scratchNum[fnum] = sl
+        }
+        code.push(0x21)
+        putUleb(code, sl)
+        i = 0
+        while i < a {
+          code.push(0x1a)
+          i = i + 1
+        }
+        code.push(0x20)
+        putUleb(code, sl)
+      }
+    } else if act == A_EXTRACT {
+      let sl = scratchRef[a] ?? -1
+      if sl < 0 {
+        sl = nextLocal
+        nextLocal = nextLocal + 1
+        extra.push(0x63 | ((0x100 + 2 * a) << 8))
+        scratchRef[a] = sl
+      }
+      code.push(0x21)
+      putUleb(code, sl)
+      let i = 0
+      while i < fieldsOf(a).length {
+        code.push(0x20)
+        putUleb(code, sl)
+        code.push(0xfb)
+        code.push(0x02)
+        putUleb(code, a)
+        putUleb(code, i)
+        i = i + 1
+      }
+      copyBytes(code, mB, off, end - off)
+    } else if act == A_DELETE {
+    } else if shift > 0 && op >= 0x20 && op <= 0x22 {
+      const d = wcNew(mB, off + 1, end)
+      const l = wcU32(d)
+      code.push(op)
+      putUleb(code, if l < np { paramNew[l] } else { l + shift })
+    } else {
+      copyBytes(code, mB, off, end - off)
+    }
+    k = k + 1
+  }
+  // The header: the old entries, then the new locals in runs.
+  const hc = wcNew(mB, bR0[bi], bOps[bi])
+  const nEntries = wcU32(hc)
+  const entriesStart = hc.pos
+  const gN: i32[] = []
+  const gV: i32[] = []
+  for v in extra {
+    if gV.length > 0 && gV[gV.length - 1] == v {
+      gN[gN.length - 1] = gN[gN.length - 1] + 1
+    } else {
+      gN.push(1)
+      gV.push(v)
+    }
+  }
+  putUleb(eOut, nEntries + gV.length)
+  copyBytes(eOut, mB, entriesStart, bOps[bi] - entriesStart)
+  let g = 0
+  while g < gV.length {
+    putUleb(eOut, gN[g])
+    if !putVal(eOut, gV[g]) { return false }
+    g = g + 1
+  }
+  const header = eOut.length
+  copyBytes(eOut, code, 0, code.length)
+  let i = 0
+  while i < eNew.length {
+    eNew[i] = eNew[i] + header
+    i = i + 1
+  }
+  true
+}
+
+function getField(code: u8[], base: i32, fs: i32[], decl: boolean, i: i32) {
+  code.push(0x20)
+  putUleb(code, base + i)
+  if decl && isRef(fs[i]) && !isNullable(fs[i]) { code.push(0xd4) }
+}
+
+// The index of the function type `(params) -> (results)`, added after the module's own on
+// first ask; -1 when a type cannot be spelled.
+function sigIndex(params: i32[], results: i32[]): i32 {
+  const enc: u8[] = [0x60]
+  putUleb(enc, params.length)
+  for v in params {
+    if !putVal(enc, v) { return -1 }
+  }
+  putUleb(enc, results.length)
+  for v in results {
+    if !putVal(enc, v) { return -1 }
+  }
+  let h = enc.length
+  for x in enc { h = h * 31 + x }
+  let i = sigHead[h] ?? -1
+  while i >= 0 {
+    if sameBytes(sigEnc[i], enc) { return nTypes + i }
+    i = sigNext[i]
+  }
+  i = sigEnc.length
+  sigEnc.push(enc)
+  sigNext.push(sigHead[h] ?? -1)
+  sigHead[h] = i
+  copyBytes(newTypes, enc, 0, enc.length)
+  nTypes + i
+}
+
+function sameBytes(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Builds the output module from the plans: new types, twin functions and bodies, names, and
+// the body moves. Empty when the step is abandoned.
+function assemble(): u8[] {
+  const none: u8[] = []
+  sigEnc = []
+  sigHead = Map()
+  sigNext = []
+  newTypes = []
+  blockType = Map()
+  const merged: i32[] = []
+  let i = 0
+  while i < pK.length {
+    if pKind[i] == A_MERGEIF { merged.push(pA[i]) }
+    i = i + 1
+  }
+  sortInts(merged)
+  i = 0
+  while i < merged.length {
+    if i == 0 || merged[i] != merged[i - 1] {
+      const noParams: i32[] = []
+      const ti = sigIndex(noParams, fieldsOf(merged[i]))
+      if ti < 0 { return none }
+      blockType[merged[i]] = ti
+    }
+    i = i + 1
+  }
+  // The bodies, and per output body its pairs and source range.
+  const bodies: u8[][] = []
+  const pairLo: i32[] = []
+  const pairOld: i32[] = []
+  const pairNew: i32[] = []
+  const srcFrom: i32[] = []
+  const srcTo: i32[] = []
+  let codeSize = 0
+  let growth = 0
+  const nOrig = nFuncs - nImports
+  let p = 0
+  while p < nOrig + twF.length {
+    const f = if p < nOrig { nImports + p } else { twF[p - nOrig] }
+    const bi = f - nImports
+    if p < nOrig { codeSize = codeSize + bR1[bi] - bR0[bi] }
+    pairLo.push(pairOld.length)
+    pairOld.push(bR0[bi])
+    pairNew.push(0)
+    srcFrom.push(bR0[bi])
+    srcTo.push(bR1[bi])
+    if p < nOrig && pLo[p] == pHi[p] {
+      const body: u8[] = []
+      copyBytes(body, mB, bR0[bi], bR1[bi] - bR0[bi])
+      bodies.push(body)
+    } else {
+      const slo = if p < nOrig { 0 } else { twLo[p - nOrig] }
+      const shi = if p < nOrig { 0 } else { twHi[p - nOrig] }
+      if !emitBody(f, slo, shi, p) { return none }
+      if p >= nOrig { growth = growth + eOut.length }
+      bodies.push(eOut)
+      let q = 0
+      while q < eOld.length {
+        pairOld.push(eOld[q])
+        pairNew.push(eNew[q])
+        q = q + 1
+      }
+    }
+    p = p + 1
+  }
+  pairLo.push(pairOld.length)
+  if growth > MV_GROWTH_FLOOR + codeSize / 2 {
+    if explaining {
+      logText("mv-explain: step abandoned: the twins add ")
+      logDec(growth)
+      logText(" bytes, past the bound of ")
+      logDec(MV_GROWTH_FLOOR)
+      logText(" plus half the ")
+      logDec(codeSize)
+      logLine("-byte code section")
+    }
+    return none
+  }
+  const twinTypes: i32[] = []
+  i = 0
+  while i < twF.length {
+    const ti = twinSig(i)
+    if ti < 0 { return none }
+    twinTypes.push(ti)
+    i = i + 1
+  }
+  // Reassemble: the type, function and code sections grow; every other section is copied.
+  const out: u8[] = []
+  copyBytes(out, mB, 0, 8)
+  const pairAt: i32[] = []
+  let saw = 0
+  const c = wcNew(mB, 8, mB.length)
+  while c.pos < c.end {
+    const start = c.pos
+    const id = wcByte(c)
+    const len = wcU32(c)
+    if c.failed || len < 0 || len > c.end - c.pos { return none }
+    const body = c.pos
+    const sectionEnd = c.pos + len
+    const s: u8[] = []
+    if id == 1 || id == 3 {
+      const r = wcNew(mB, body, sectionEnd)
+      const n = wcU32(r)
+      if r.failed { return none }
+      if id == 1 {
+        putUleb(s, n + sigEnc.length)
+        copyBytes(s, mB, r.pos, sectionEnd - r.pos)
+        copyBytes(s, newTypes, 0, newTypes.length)
+        saw = saw | 1
+      } else {
+        putUleb(s, n + twF.length)
+        copyBytes(s, mB, r.pos, sectionEnd - r.pos)
+        for ti in twinTypes { putUleb(s, ti) }
+        saw = saw | 2
+      }
+    } else if id == 10 {
+      putUleb(s, bodies.length)
+      const starts: i32[] = []
+      for bb in bodies {
+        putUleb(s, bb.length)
+        starts.push(s.length)
+        copyBytes(s, bb, 0, bb.length)
+      }
+      const head: u8[] = [10]
+      putUleb(head, s.length)
+      const base = out.length + head.length
+      for st in starts { pairAt.push(base + st) }
+      saw = saw | 4
+    }
+    if id == 1 || id == 3 || id == 10 {
+      out.push(id)
+      putUleb(out, s.length)
+      copyBytes(out, s, 0, s.length)
+    } else {
+      copyBytes(out, mB, start, sectionEnd - start)
+    }
+    c.pos = sectionEnd
+  }
+  if saw != 7 { return none }
+  // The moves.
+  putUleb(movesOut, bodies.length)
+  i = 0
+  while i < bodies.length {
+    putUleb(movesOut, srcFrom[i])
+    putUleb(movesOut, srcTo[i])
+    putUleb(movesOut, pairLo[i + 1] - pairLo[i])
+    let q = pairLo[i]
+    while q < pairLo[i + 1] {
+      putUleb(movesOut, pairOld[q])
+      putUleb(movesOut, pairAt[i] + pairNew[q])
+      q = q + 1
+    }
+    i = i + 1
+  }
+  if !hasNames { return out }
+  // A twin is named after its function, so a trap in it reads as that function.
+  const w = wnRead(out)
+  if !w.ok {
+    movesOut = []
+    return none
+  }
+  const total = nFuncs + twF.length
+  const table = wnTable(w, total)
+  const entries: u8[] = []
+  let count = 0
+  let f = 0
+  while f < total {
+    const r = if f < nFuncs { table[f] } else { table[twF[f - nFuncs]] }
+    if r >= 0 {
+      if f < nFuncs {
+        wnEntry(entries, f, out, w.at[r], w.len[r])
+      } else {
+        const name: u8[] = []
+        copyBytes(name, out, w.at[r], w.len[r])
+        for cp in ".mv" { name.push(cp) }
+        wnEntry(entries, f, name, 0, name.length)
+      }
+      count = count + 1
+    }
+    f = f + 1
+  }
+  wnWrite(out, w, count, entries)
+}
+
+// Twin `i`'s signature's type index, or -1.
+function twinSig(i: i32): i32 {
+  const f = twF[i]
+  const ps = paramsOf(f)
+  const params: i32[] = []
+  let j = 0
+  while j < ps.length {
+    if maskHas(twLo[i], twHi[i], j) {
+      for v in fieldsOf(paramArgRecord(f, j)) { params.push(v) }
+    } else {
+      params.push(ps[j])
+    }
+    j = j + 1
+  }
+  if twR[i] { return sigIndex(params, fieldsOf(resultRecord(f))) }
+  sigIndex(params, resultsOf(f))
+}
+
+// ---- Explaining ----
+
+function logText(s: string) {
+  for cp in s { logOut.push(cp) }
+}
+
+function logLine(s: string) {
+  logText(s)
+  logOut.push(10)
+}
+
+function logDec(v: i32) { putDec(logOut, v) }
+
+function putDec(out: u8[], v: i32) {
+  if v >= 10 { putDec(out, v / 10) }
+  out.push(48 + v % 10)
+}
+
+function putText(out: u8[], s: string) {
+  for cp in s { out.push(cp) }
+}
+
+// Function `f`'s name in the input's `name` section, else `func <f>`.
+function putName(out: u8[], f: i32) {
+  const r = if f >= 0 && f < nameTab.length { nameTab[f] } else { -1 }
+  if r >= 0 {
+    copyBytes(out, mB, nameW.at[r], nameW.len[r])
+  } else {
+    putText(out, "func ")
+    putDec(out, f)
+  }
+}
+
+// The `$VL_MV_EXPLAIN` lines: per struct type a function takes or returns, whether the step
+// may take it apart and why not; per function returning a record, whether it gets a result
+// twin, and what each of its call sites in the first `nPlans` plans does with it.
+function explain(nPlans: i32) {
+  nameW = wnRead(mB)
+  nameTab = if nameW.ok { wnTable(nameW, nFuncs) } else { wnTable(wnRead([]), 0) }
+  const seen: i32[] = []
+  let f = nImports
+  while f < nFuncs {
+    for v in paramsOf(f) { seeType(seen, v) }
+    for v in resultsOf(f) { seeType(seen, v) }
+    f = f + 1
+  }
+  sortInts(seen)
+  logText("mv-explain: writes are charged by ")
+  if byIndex {
+    logLine(
+      "type index and subtyping component (every struct type is in one rec group)",
+    )
+  } else {
+    logLine(
+      "shape (struct types span several rec groups), and a subtyped record is refused",
+    )
+  }
+  for t in seen { explainType(t) }
+  f = nImports
+  while f < nFuncs {
+    explainProducer(f, nPlans)
+    f = f + 1
+  }
+}
+
+function seeType(seen: i32[], v: i32) {
+  const t = concreteIdx(v)
+  if t < 0 || t >= nTypes || isFunc[t] { return }
+  for x in seen {
+    if x == t { return }
+  }
+  seen.push(t)
+}
+
+function explainType(t: i32) {
+  if !shapeOk[t] {
+    if !isStruct[t] { return }
+    logText("mv-explain: type ")
+    logDec(t)
+    logText(": refused: ")
+    if fVals[t].length == 0 {
+      logLine("has no fields")
+    } else if fVals[t].length > MV_ARG_MAX_FIELDS {
+      logLine("has more fields than the step's argument bound")
+    } else {
+      logLine("has a packed field, or a reference the step cannot spell")
+    }
+    return
+  }
+  const head: u8[] = []
+  putText(head, "mv-explain: type ")
+  putDec(head, t)
+  putText(head, " {")
+  let i = 0
+  while i < fVals[t].length {
+    if i > 0 { putText(head, ", ") }
+    const v = fVals[t][i]
+    if v == 0x7f { putText(head, "i32") }
+    else if v == 0x7e { putText(head, "i64") }
+    else if v == 0x7d { putText(head, "f32") }
+    else if v == 0x7c { putText(head, "f64") }
+    else { putText(head, "ref") }
+    i = i + 1
+  }
+  putText(head, "} (returned by ")
+  let n = 0
+  let g = nImports
+  while g < nFuncs && n < 3 {
+    if resultRecordAny(g) == t {
+      if n > 0 { putText(head, ", ") }
+      putName(head, g)
+      n = n + 1
+    }
+    g = g + 1
+  }
+  if n == 0 { putText(head, "no function") }
+  putText(head, ")")
+  copyBytes(logOut, head, 0, head.length)
+  const family: i32[] = []
+  let u = 0
+  while u < nTypes {
+    if u != t && comp[u] == comp[t] { family.push(u) }
+    u = u + 1
+  }
+  if shapeOf(t) && nested.has(t) {
+    logText(
+      ": candidate, kept whole for a callee the escape step may inline: a ",
+    )
+    logText("reference field holds ")
+    const h = nested[t] ?? NONE
+    if h == NONE {
+      logLine("any struct (an abstract reference)")
+    } else {
+      logText("type ")
+      logDec(h)
+      logLine(", a struct nothing writes")
+    }
+    return
+  }
+  if shapeOf(t) {
+    logLine(": candidate")
+    return
+  }
+  if !byIndex && family.length > 0 {
+    logText(": refused: in a subtyping relation with type(s) [")
+    i = 0
+    while i < family.length {
+      if i > 0 { logText(", ") }
+      logDec(family[i])
+      i = i + 1
+    }
+    logLine("]")
+    return
+  }
+  let culprit = -1
+  if byIndex {
+    if writer.has(t) {
+      culprit = t
+    } else {
+      for x in family {
+        if culprit < 0 && writer.has(x) { culprit = x }
+      }
+    }
+  } else {
+    u = 0
+    while u < nTypes && culprit < 0 {
+      if writer.has(u) && shapeOk[u] && shapeKey[u] == shapeKey[t] {
+        culprit = u
+      }
+      u = u + 1
+    }
+  }
+  if culprit < 0 {
+    logLine(": refused")
+    return
+  }
+  if culprit == t {
+    logText(": refused: its fields are written (struct.set ")
+    logDec(t)
+  } else {
+    logText(": refused: type ")
+    logDec(culprit)
+    logText(
+      if byIndex { ", in its subtyping component" } else { ", of the same shape" },
+    )
+    logText(", is written (struct.set ")
+    logDec(culprit)
+  }
+  logText(" in ")
+  putName(logOut, writer[culprit] ?? 0)
+  logText(")")
+  if isFreshOnly(t) {
+    logText(
+      "; still taken apart as a fresh argument (a struct.new passed straight to a ",
+    )
+    logText("parameter its callee only reads)")
+  }
+  logOut.push(10)
+}
+
+// The record-shaped type a function's single reference result names, before any refusal.
+function resultRecordAny(f: i32): i32 {
+  const rs = resultsOf(f)
+  if rs.length != 1 { return -1 }
+  const t = concreteIdx(rs[0])
+  if t < 0 || t >= nTypes || !shapeOk[t] { return -1 }
+  t
+}
+
+function explainProducer(f: i32, nPlans: i32) {
+  const rs = resultsOf(f)
+  if rs.length != 1 { return }
+  const t = concreteIdx(rs[0])
+  if t < 0 || t >= nTypes || !shapeOk[t] { return }
+  const why: u8[] = []
+  if !shapeOf(t) {
+    putText(why, "its record type ")
+    putDec(why, t)
+    putText(why, " is refused (above)")
+  } else if !resultShape(t) {
+    putText(why, "its record type ")
+    putDec(why, t)
+    putText(why, " has more than ")
+    putDec(why, MV_RECORD_MAX_FIELDS)
+    putText(
+      why,
+      " fields or a reference field, so it is taken apart only as an argument",
+    )
+  } else if isNullable(rs[0]) {
+    putText(why, "its result is nullable (a `T | null` return)")
+  } else if bExits[f - nImports] {
+    putText(
+      why,
+      "a br_if, br_table, br_on_*, try, return_call_ref or return_call_indirect can ",
+    )
+    putText(why, "leave it with its result")
+  } else if !producer[f] {
+    putText(why, "it tail-calls a function that gets no result twin")
+  }
+  if why.length > 0 {
+    logText("mv-explain: ")
+    putName(logOut, f)
+    logText(" -> type ")
+    logDec(t)
+    logText(": no result twin: ")
+    copyBytes(logOut, why, 0, why.length)
+    logOut.push(10)
+    return
+  }
+  // Its call sites in the original bodies: read as fields, or kept and why.
+  let served = 0
+  const keptWhy: u8[][] = []
+  const keptN: i32[] = []
+  const keptAt: u8[][][] = []
+  let ix = 0
+  while ix < nPlans {
+    const g = nImports + ix
+    let ii = bInsLo[ix]
+    while ii < bInsHi[ix] {
+      if iKind[ii] == K_CALL && iA[ii] == f && iReach[ii] {
+        if callsResultTwin(ix, iK[ii]) {
+          served = served + 1
+        } else {
+          keepSite(ix, g, ii, keptWhy, keptN, keptAt)
+        }
+      }
+      ii = ii + 1
+    }
+    ix = ix + 1
+  }
+  let nKept = 0
+  for x in keptN { nKept = nKept + x }
+  logText("mv-explain: ")
+  putName(logOut, f)
+  logText(" -> type ")
+  logDec(t)
+  logText(": result twin; ")
+  logDec(served)
+  logText(" call site(s) read it as fields, ")
+  logDec(nKept)
+  logLine(" keep the struct")
+  // Most sites first; ties keep their first-seen order.
+  const order: i32[] = []
+  let i = 0
+  while i < keptN.length {
+    let p = order.length
+    while p > 0 && keptN[order[p - 1]] < keptN[i] { p = p - 1 }
+    order.push(0)
+    let q = order.length - 1
+    while q > p {
+      order[q] = order[q - 1]
+      q = q - 1
+    }
+    order[p] = i
+    i = i + 1
+  }
+  for o in order {
+    logText("mv-explain:     ")
+    logDec(keptN[o])
+    logText(" ")
+    copyBytes(logOut, keptWhy[o], 0, keptWhy[o].length)
+    logText(" (in ")
+    let a = 0
+    while a < keptAt[o].length {
+      if a > 0 { logText(", ") }
+      copyBytes(logOut, keptAt[o][a], 0, keptAt[o][a].length)
+      a = a + 1
+    }
+    logLine(")")
+  }
+}
+
+function resultShape(t: i32): boolean {
+  if fVals[t].length > MV_RECORD_MAX_FIELDS { return false }
+  for v in fVals[t] {
+    if !isNum(v) { return false }
+  }
+  true
+}
+
+// Whether plan `ix` calls a result twin at ordinal `k`.
+function callsResultTwin(ix: i32, k: i32): boolean {
+  let i = pLo[ix]
+  while i < pHi[ix] {
+    if pK[i] == k {
+      if pKind[i] != A_CALL { return false }
+      const to = pA[i]
+      return to >= nFuncs && to - nFuncs < twR.length && twR[to - nFuncs]
+    }
+    i = i + 1
+  }
+  false
+}
+
+function keepSite(
+  ix: i32,
+  g: i32,
+  ii: i32,
+  keptWhy: u8[][],
+  keptN: i32[],
+  keptAt: u8[][][],
+) {
+  const reason: u8[] = []
+  const nx = iNext[ii]
+  const key = bOpBase[ix] + iK[ii]
+  if nx == NX_GET {
+    putText(reason, "read by a struct.get of type ")
+    putDec(reason, iNA[ii])
+  } else if nx == NX_SET {
+    putText(reason, "held in a local that another use keeps as a struct")
+  } else if nx == NX_ARM {
+    putText(reason, "chosen by an if/else whose value is kept as a struct")
+  } else if nx == NX_EXIT {
+    putText(
+      reason,
+      "returned by the caller (read as fields only inside the caller's own ",
+    )
+    putText(reason, "result twin)")
+  } else if consK.has(key) {
+    putText(reason, "passed as argument ")
+    putDec(reason, consJ[key] ?? 0)
+    putText(reason, " of ")
+    const ci = at(ix, consK[key] ?? 0)
+    if ci >= 0 && (iKind[ci] == K_CALL || iKind[ci] == K_RCALL) {
+      putName(reason, iA[ci])
+    }
+    putText(reason, ", which keeps it as a struct")
+  } else {
+    putText(
+      reason,
+      "stored (field, array, global), cast, compared, or passed to an import",
+    )
+  }
+  const where: u8[] = []
+  putName(where, g)
+  if nx == NX_SET {
+    putText(where, " local ")
+    putDec(where, iNA[ii])
+  }
+  let i = 0
+  while i < keptWhy.length {
+    if sameBytes(keptWhy[i], reason) {
+      keptN[i] = keptN[i] + 1
+      if keptAt[i].length < 3 {
+        let dup = false
+        for x in keptAt[i] {
+          if sameBytes(x, where) { dup = true }
+        }
+        if !dup { keptAt[i].push(where) }
+      }
+      return
+    }
+    i = i + 1
+  }
+  keptWhy.push(reason)
+  keptN.push(1)
+  const ats: u8[][] = [where]
+  keptAt.push(ats)
+}

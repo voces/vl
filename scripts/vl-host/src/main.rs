@@ -6320,6 +6320,161 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
+/// Which side runs the multi-value step (rung R5): `$VL_OPT_MULTIVALUE` unset or `rust` the
+/// host, `vl` the compiler's `optMultivalue`, `both` the two, failing the build when their
+/// output, body moves or `$VL_MV_EXPLAIN` lines differ.
+#[derive(Clone, Copy, PartialEq)]
+enum OptMultivalueSide {
+    Rust,
+    Vl,
+    Both,
+}
+
+fn opt_multivalue_side() -> Result<OptMultivalueSide> {
+    match std::env::var("VL_OPT_MULTIVALUE")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" | "rust" => Ok(OptMultivalueSide::Rust),
+        "vl" => Ok(OptMultivalueSide::Vl),
+        "both" => Ok(OptMultivalueSide::Both),
+        other => bail!("$VL_OPT_MULTIVALUE={other} — expected `rust`, `vl` or `both`"),
+    }
+}
+
+/// The step's answer: the rewritten module and its body moves, or `None` when it changes
+/// nothing.
+type MultivalueOut = Option<(Vec<u8>, Vec<multivalue::BodyMove>)>;
+
+/// The compiler's multi-value step on `bytes`, beside its `$VL_MV_EXPLAIN` lines. The host
+/// validates both its input and its output, and a rewrite that does not validate is dropped.
+fn multivalue_vl(
+    bytes: &[u8],
+    explaining: bool,
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<(MultivalueOut, String)> {
+    let validate = |b: &[u8]| {
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(b)
+            .map(|_| ())
+    };
+    let valid = validate(bytes).is_ok();
+    let (mut store, inst) = load_compiler(engine, compiler)?;
+    opt_stage(&mut store, &inst, bytes)?;
+    let step = inst
+        .get_typed_func::<(i32, i32), i32>(&mut store, "optMultivalue")
+        .map_err(|e| {
+            e.context(
+                "`$VL_OPT_MULTIVALUE` runs the multi-value step through the compiler's \
+                 `optMultivalue`, which this seed predates",
+            )
+        })?;
+    let changed = step.call(&mut store, (explaining as i32, valid as i32))? == 1;
+    let mut out = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+    let moves = inst.get_typed_func::<(), i32>(&mut store, "optMultivalueMoves")?;
+    moves.call(&mut store, ())?;
+    let stream = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+    let explain = inst.get_typed_func::<(), i32>(&mut store, "optMultivalueExplain")?;
+    explain.call(&mut store, ())?;
+    let mut log =
+        String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
+            .map_err(|_| {
+                Error::msg("the compiler's optMultivalueExplain wrote bytes that are not UTF-8")
+            })?;
+    if !changed {
+        return Ok((None, log));
+    }
+    // `$VL_MV_FAULT=1` corrupts the output first, to prove a rewrite that does not validate is
+    // dropped.
+    if std::env::var_os("VL_MV_FAULT").is_some_and(|v| !v.is_empty() && v != "0") {
+        out.push(0xff);
+    }
+    if let Err(e) =
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all()).validate_all(&out)
+    {
+        if explaining {
+            log.push_str(&format!(
+                "mv-explain: step abandoned: its output does not validate: {e}\n"
+            ));
+        }
+        return Ok((None, log));
+    }
+    let bad = || Error::msg("the compiler's optMultivalueMoves wrote a stream it cannot read");
+    let mut p = 0usize;
+    let mut moved = Vec::new();
+    let n = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+    for _ in 0..n {
+        let from = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+        let to = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+        let pairs = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+        let mut v = Vec::with_capacity(pairs as usize);
+        for _ in 0..pairs {
+            let old = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+            let new = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+            v.push((old, new));
+        }
+        moved.push(multivalue::BodyMove { from, to, pairs: v });
+    }
+    if p != stream.len() {
+        return Err(bad());
+    }
+    Ok((Some((out, moved)), log))
+}
+
+/// The multi-value step on `bytes` by the side `$VL_OPT_MULTIVALUE` picks, printing its
+/// `$VL_MV_EXPLAIN` lines.
+fn multivalue_step(
+    bytes: &[u8],
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<MultivalueOut> {
+    let explaining = std::env::var_os("VL_MV_EXPLAIN").is_some_and(|v| !v.is_empty() && v != "0");
+    let side = opt_multivalue_side()?;
+    let rust =
+        (side != OptMultivalueSide::Vl).then(|| multivalue::multivalue_rust(bytes, explaining));
+    let vl = if side == OptMultivalueSide::Rust {
+        None
+    } else {
+        Some(multivalue_vl(bytes, explaining, engine, compiler)?)
+    };
+    let (out, log) = match (rust, vl) {
+        (Some(r), Some(v)) => {
+            let what = match (&r.0, &v.0) {
+                (None, None) => None,
+                (Some((rb, rm)), Some((vb, vm))) => {
+                    let same_moves = rm.len() == vm.len()
+                        && rm
+                            .iter()
+                            .zip(vm)
+                            .all(|(a, b)| a.from == b.from && a.to == b.to && a.pairs == b.pairs);
+                    if rb != vb {
+                        Some("module bytes")
+                    } else if !same_moves {
+                        Some("body moves")
+                    } else {
+                        None
+                    }
+                }
+                _ => Some("whether it rewrites"),
+            }
+            .or((r.1 != v.1).then_some("explain lines"));
+            if let Some(what) = what {
+                bail!(
+                    "$VL_OPT_MULTIVALUE=both: the multi-value step differs between the host and \
+                     the compiler in {what}"
+                );
+            }
+            r
+        }
+        (Some(r), None) => r,
+        (None, Some(v)) => v,
+        (None, None) => unreachable!("opt_multivalue_side picks at least one side"),
+    };
+    eprint!("{log}");
+    Ok(out)
+}
+
 /// The `wasm-opt` worker count when `$BINARYEN_CORES` is unset. Measured on plumb units
 /// (DECISIONS.md, "`wasm-opt` runs on at most four threads"): four threads cost the CPU of
 /// one, while binaryen's default of one per core cost 1.2-1.7x that and 2.5x the memory.
@@ -10294,9 +10449,10 @@ fn build_cmd(args: &[String]) -> Result<()> {
             // The multi-value step goes before the escape step: a call site whose small record
             // is only read calls a twin returning the fields (D3625).
             if std::env::var_os("VL_OPT_NO_MULTIVALUE").is_none_or(|v| v.is_empty()) {
-                if let Some((mv, moved)) =
-                    phase!("opt.multivalue_step", multivalue::multivalue_step(&bytes))
-                {
+                if let Some((mv, moved)) = phase!(
+                    "opt.multivalue_step",
+                    multivalue_step(&bytes, &compile_engine, &compiler)
+                )? {
                     bytes = mv;
                     std::fs::write(&sink, &bytes)?;
                     if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
