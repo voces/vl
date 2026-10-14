@@ -750,8 +750,12 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      read. When a read's slot holds one module-scope generic in the table
      (`fnFlowDeclPathSrc`, which follows a path of `e` and `f.<name>` steps), the read becomes
      a name read of that generic (`monoFlowReads`). So does each read of a `for … in` binding
-     over such a list, and each element a `[...xs]` spread copies. The existing alias and
-     direct-call machinery then instances it per call. Over the
+     over such a list, and each element a `[...xs]` spread copies. A read straight out of a
+     literal whose elements or fields are all names, such as `[g][0]` or `{ f: g }.f`, is
+     rewritten the same way. The generic must declare type parameters and annotate every
+     parameter. A hole parameter would leave the literal's own unpinned occurrence refused. The
+     existing alias and direct-call machinery then instances it per call. This closes D4124,
+     D4125 and D4126, and their four `error-` fixtures now run. Over the
      `fn-value-generic-list-read` matrix, runs go from 37 to 48 of 66. Over its open twin they
      go from 5 to 10 of 64. Nine `p1`/`p2` hand probes move from emit refusals to runs:
      alias, nested record, for-in, `length`, spread, and the record alias. No cell is lost.

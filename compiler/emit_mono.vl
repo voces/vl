@@ -9985,9 +9985,10 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrNameCount = Map()
   mfrTopGen = Map()
   for s in stmts {
-    if monoIsGenericDecl(s) { mfrTopGen[s] = true }
+    if monoFlowTyParamGen(s) { mfrTopGen[s] = true }
   }
   const lets: i32[] = []
+  const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
   const roots: i32[] = []
   for s in stmts { roots.push(s) }
@@ -9998,7 +9999,7 @@ function monoFlowReads(stmts: i32[]): i32 {
       const ix = stack.pop()
       if ix >= 0 && ix < P.nodes.length && !(seen[ix] ?? false) {
         seen[ix] = true
-        monoFlowReadsNote(ix, lets)
+        monoFlowReadsNote(ix, lets, direct)
         const kids = nodeChildren(ix)
         let k = kids.length - 1
         while k >= 0 {
@@ -10013,13 +10014,70 @@ function monoFlowReads(stmts: i32[]): i32 {
     }
   }
   for d in lets { monoFlowReadsOf(d) }
+  for x in direct {
+    const n = P.nodes[x]
+    if n is Index {
+      monoFlowDirectSet(
+        x,
+        unwrapParen(n.idxArr),
+        monoFlowElemAt(unwrapParen(n.idxArr), n.idxIndex),
+      )
+    } else if n is Member {
+      monoFlowDirectSet(
+        x,
+        unwrapParen(n.memObj),
+        monoFlowFieldOf(unwrapParen(n.memObj), n.memProp),
+      )
+    }
+  }
   0
 }
 
-// Banks node `ix` for `monoFlowReads`: a name read, a declared name, a candidate binding.
-function monoFlowReadsNote(ix: i32, lets: i32[]) {
+// Rewrites read `x` of element or field `el` of literal `host` to the generic `el` names, when
+// every element or field value of `host` is a name, so dropping the literal drops no effect.
+function monoFlowDirectSet(x: i32, host: i32, el: i32) {
+  const g = monoFlowLeafGen(el)
+  if g < 0 || monoFlowIsWrite(x) { return 0 }
+  const hn = P.nodes[host]
+  if hn is ArrayLit {
+    for e in hn.arrElems {
+      if !(P.nodes[unwrapParen(e)] is Ident) { return 0 }
+    }
+  } else if hn is ObjLit {
+    for fi in hn.objFields {
+      const f = P.nodes[fi]
+      if !(f is FieldInit) { return 0 }
+      if !(P.nodes[unwrapParen(f.fiValue)] is Ident) { return 0 }
+    }
+  } else {
+    return 0
+  }
+  monoFlowReadSet(x, g)
+}
+
+// Whether `s` declares a generic function by type parameters alone: an un-annotated parameter
+// would leave the literal's own unpinned occurrence of it refused once its reads name it.
+function monoFlowTyParamGen(s: i32): boolean {
+  const fn = P.nodes[s]
+  if !(fn is FuncDecl) || fn.fnTyParams.length == 0 { return false }
+  for pi in fn.fnParams {
+    const p = P.nodes[pi]
+    if p is Param {
+      if p.parType < 0 { return false }
+    }
+  }
+  true
+}
+
+// Banks node `ix` for `monoFlowReads`: a name read, a declared name, a candidate binding, a
+// read straight out of a literal.
+function monoFlowReadsNote(ix: i32, lets: i32[], direct: i32[]) {
   const n = P.nodes[ix]
-  if n is Ident {
+  if n is Index {
+    if P.nodes[unwrapParen(n.idxArr)] is ArrayLit { direct.push(ix) }
+  } else if n is Member {
+    if P.nodes[unwrapParen(n.memObj)] is ObjLit { direct.push(ix) }
+  } else if n is Ident {
     const d = identDeclOf(ix)
     if d >= 0 {
       const us = mfrUses[d] ?? []
