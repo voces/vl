@@ -848,7 +848,7 @@ silent placement plus a hint (D25), never a type error.
 ### 6.7 Build slices, sized in agent-days
 
 Each slice is unobservable to programs from the previous one, so each ships alone; the
-position matrix (`scripts/capability-probes/matrix.py`) grades every slice, with a template per
+position matrix (`scripts/capability-matrix.vl`) grades every slice, with a template per
 placement and, in every template, an **aliasing proof** in both directions (write the
 destination and read the source, then the reverse, printing values that show independence).
 
