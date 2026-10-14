@@ -28318,6 +28318,15 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
     tErr(clash, annotDiagAt)
     return TY_ERR
   }
+  // A member that is itself `null` (`null | null`, `N | null` over `type N = null`) is the
+  // niche, not an inner type; with no other member the union is the `null` type (D4673).
+  const nonNull: i32[] = []
+  let anyNull = hasNull
+  for m in members {
+    if isNullTy(m) { anyNull = true } else { nonNull.push(m) }
+  }
+  if nonNull.length == 0 && anyNull { return TY_NULL }
+  if nonNull.length < members.length { return annUnionTy(nonNull, anyNull) }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
   // arena-tick exempt: a per-program mark on an annotation's row.
@@ -33040,6 +33049,8 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   if e is TyPrim {
     if e.primName == "i32" { return "list" }
     if e.primName == "boolean" { return "list" }
+    // `null[]` rides the i32 list with every element the same sentinel (D4671).
+    if e.primName == "null" { return "list" }
     if e.primName == "string" { return "strlist" }
     // The wide-scalar backings: `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of
     // one scalar each, exactly as `i32[]` is — lacking only a core, since
@@ -57759,6 +57770,9 @@ function fillTypeDeclAt(sx: i32) {
           let folded = -1
           if sawNull && nonNullU.length > 0 {
             folded = annUnionTy(nonNullU, true)
+          } else if sawNull {
+            // Every member is `null` (`type N = null | null`), which denotes `null` itself.
+            folded = TY_NULL
           }
           // The literal-union flatten, on the declaration side (`litUnionFlatMembers`, the
           // same transform `annUnionInnerTy` climbs): this arm builds its member list itself,
@@ -61453,6 +61467,7 @@ export function checkProgramPass(rootIx: i32) {
   nolTaken = Map()
   ulLitN = 0
   ulTaken = Map()
+  nolTakenOther = Map()
   nolOperand = Map()
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
@@ -63700,7 +63715,9 @@ export function nodeTyIsNulI32List(ix: i32) {
       if e >= 0 {
         const et = T.tys[e]
         if et is TyPrim {
-          return et.primName == "i32" || et.primName == "boolean"
+          return et.primName == "i32"
+            || et.primName == "boolean"
+            || et.primName == "null"
         }
         // A literal-union element (`K[] | null`) shares the i32-list backing exactly like
         // `i32[]` (the arena dual of `nameIsI32Array`'s litunion arm).
@@ -64947,6 +64964,13 @@ export function nodeArrayElemIsNulBool(ix: i32) {
   tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "boolean")
 }
 
+// Whether node `ix` has a recorded array type whose element is the `null` unit type (D4671), and
+// is not a null-only literal that a destination of another list type received.
+export function nodeArrayElemIsNullUnit(ix: i32): boolean {
+  if nolLitTakenOther(ix) { return false }
+  isNullTy(nodeArrayElemTyIx(ix))
+}
+
 // Whether node `ix` has a recorded array type whose element is a plain `string` — the
 // non-null twin of `nodeArrayElemIsNulStr`. Needed because `arrLitIsStr` classifies a literal
 // by its first element, so an atom-first literal under a `string[]` annotation built the atom
@@ -65198,6 +65222,15 @@ export function mapTyValIsNulBool(ty: i32) {
     }
     return sawNull && sawBool
   }
+  false
+}
+
+// Whether arena type `ty` is a map whose value is the `null` unit type: the mono i32 map, every
+// stored value the `boolean | null` sentinel `2` (D4671).
+export function mapTyValIsNullUnit(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return isNullTy(t.mVal) }
   false
 }
 
@@ -65581,6 +65614,8 @@ export function nodeTyIsNullable(ix: i32) {
 // True if node `ix`'s recorded type is the `null` type itself: the value is `null` on every path
 // that yields one, whatever its arms run first (D3355).
 export function nodeTyIsNullType(ix: i32): boolean { isNullTy(nodeTyIxOf(ix)) }
+// Whether arena type `ty` is the `null` unit type, the type-taking twin of `nodeTyIsNullType`.
+export function tyIsNullUnit(ty: i32): boolean { isNullTy(ty) }
 
 // Whether node `ix`'s recorded type provably admits no `null` — not `!nodeTyIsNullable(ix)`,
 // since an unrecorded node, an inference hole, or a `TyVar` all answer "not nullable" there
@@ -74785,9 +74820,15 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
 
 // D1832 — a list literal whose every element is `null`, those of them a typed destination
 // received, and those that sit as a `+` operand or a spread source, which no destination types.
-// `null[]` has no element rep, so `flushNullOnlyLits` refuses the untyped ones at program end.
+// An untyped one names no element type, so `flushNullOnlyLits` refuses it at program end.
 let nolLits: i32[] = []
 let nolTaken: {[i32]: boolean} = Map()
+// The null-only literals some destination other than `null[]` received: each is built at that
+// destination's list, never as a `null[]` (`nodeArrayElemIsNullUnit`).
+let nolTakenOther: {[i32]: boolean} = Map()
+export function nolLitTakenOther(ix: i32): boolean {
+  nolTakenOther[ix] ?? false
+}
 let nolOperand: {[i32]: boolean} = Map()
 
 // A list literal whose element joins to a union, and per literal what a delivery outside a
@@ -74801,9 +74842,9 @@ export function arrLitUnionDestTaken(ix: i32): boolean {
 }
 
 // Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
-// destination beside the value. A part whose own destination is `null[]`, or holds a type
-// variable that is not the enclosing generic's own, types nothing. A speculative delivery
-// under `inferQuiet` marks too: it names a destination the real check then delivers to.
+// destination beside the value. A part whose destination is a union offering only `null[]`, or
+// holds a type variable that is not the enclosing generic's own, types nothing. A speculative
+// delivery under `inferQuiet` marks too: it names a destination the real check then delivers to.
 function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
   if (nolLits.length == 0 && ulLitN == 0) || srcExpr < 0 || dstTy < 0 {
     return 0
@@ -74830,7 +74871,10 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
     if nolElemOnlyNull(dt) || (tyHasTyVar(dt) && !fsbTvsInScope(dt, 0)) {
       return 0
     }
+    // A generic parameter's `T[]` pinned at `null` by this very literal names nothing.
+    if lbiNoDest && nolIsNullList(dt) { return 0 }
     nolTaken[at] = true
+    if !nolIsNullList(dt) { nolTakenOther[at] = true }
     const dn = nonNullTy(dt)
     let elDt = dt
     if dn >= 0 {
@@ -74913,13 +74957,23 @@ function nolMarkOperand(ix: i32) {
   0
 }
 
-// Whether `ty`, through `null` and union members, offers a list only as `null[]`.
+// Whether `ty`, its `null` peeled, is `null[]` itself.
+function nolIsNullList(ty: i32): boolean {
+  const dn = nonNullTy(ty)
+  if dn < 0 { return false }
+  const t = T.tys[dn]
+  if t is TyArray { return t.aElem == TY_NULL }
+  false
+}
+
+// Whether `ty` is a union that offers a list only as `null[]`. A plain `null[]` destination names
+// the element type and types the literal (D4671); a union one does not say which arm it builds.
 function nolElemOnlyNull(ty: i32): boolean {
   const dn = nonNullTy(ty)
   if dn < 0 { return false }
   const t = T.tys[dn]
   match t {
-    TyArray => t.aElem == TY_NULL
+    TyArray => false
     TyUnion => nolMembersOnlyNull(t.uMembers)
     // None of these is a list, so a destination of one names no element type either way.
     TyErr | TyPrim | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyNullable | TyObj => false
