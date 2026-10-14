@@ -33,14 +33,14 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 2 | `arena-scan budget` | done: `vl check --budget` (#3648) | - |
 | 3 | `kind-ladder budget` | done: `vl check --budget` plus `ladder-sets.vl`; `ladder-census.py` stays as the discovery tool | - |
 | 4 | `dead-export budget` | done: `dead-exports.vl` plus `vl check --budget --findings` | - |
-| 5 | `render-parse budget` | `render-parse-budget.py` | `render-parse-budget.vl` |
+| 5 | `render-parse budget` | done: `render-parse-census.vl` plus `vl check --budget --findings` | - |
 | 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/rows.py` stays (reached by `ls.py`, `split.py`, `selftest.py`) | `inventory/rows.vl` with them |
 | 7 | `lint-self.sh` (`matrix.py`) | `capability-probes/matrix.py` | `matrix.vl` |
 | 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` stays, imported by `check-filed-witnesses.py` and `survey-regrade.py` | deleted with those two |
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
 | - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `.py` kept as port-test oracle | delete `plumb-shape-cost.py`, `check-filed-witnesses.py` (+ `inventory/{ls,split,selftest}.py`, `sabotage.py`), `capability-probes/run.py`, `distilled/{regress,index,cellmap,redistil}.py` (+ `gradecensus.py`, `corpuscmp.py`), `survey-regrade.py`, `grade.py`, `profile-rank.py` with their port tests |
 
-Row 5 is the last user of `ratchet.py`; it goes with that row. `mono-tyaram-grid.sh` carries an inline python
+Rows 1-5 are done and `ratchet.py` is deleted. `mono-tyaram-grid.sh` carries an inline python
 heredoc and moves with its own PR.
 
 ## Files
@@ -52,8 +52,6 @@ heredoc and moves with its own PR.
 | --- | --- | --- | --- | --- |
 | `scripts/capability-probes/matrix.py` | 687 | G | scripts/lint-self.sh | scripts/capability-probes/matrix.vl |
 | `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | ported: `scripts/capability-probes.vl` is on master; delete with its port test's oracle |
-| `scripts/ratchet.py` | 282 | G | scripts/gate.sh | goes with `render-parse-budget.py`, its last user |
-| `scripts/render-parse-budget.py` | 167 | G | .github/workflows/ci.yml scripts/gate.sh | scripts/render-parse-budget.vl |
 | `scripts/seed_provenance.py` | 223 | I | scripts/check-filed-witnesses.py scripts/survey-regrade.py | ported: `scripts/seed-provenance.vl` is on master; delete with those two |
 | `scripts/silent-sweep/distilled/regress.py` | 177 | G | scripts/lint-self.sh | ported: `scripts/silent-sweep/distilled/regress.vl` is on master; delete with its port test's oracle |
 

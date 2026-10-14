@@ -203,12 +203,18 @@ run "dead-export budget"       dead_export_budget
 # The prefer-interpolation RATCHET, sixth of the same shape and the first held by the
 # lint itself: `vl check --budget` walks the baseline's own targets in one process and
 # compares per-file counts (architecture-refactor-plan T2); `--write-baseline` rewrites
-# it in the layout scripts/ratchet.py writes, which tests/vl_budget_mode_test.ts holds.
+# it in the layout the retired ratchet.py wrote, which tests/vl_budget_mode_test.ts holds.
 run "interp budget"            "$VL" check --budget scripts/interp-budget-baseline.json --compiler "$SEED"
 # The render-parse RATCHET, seventh of the same shape: `tyToEmitName(` calls and the ten
 # type-string parsers in the emitter. A rep is decided from the checked type, not from
-# a rendered spelling parsed back (code-quality-2026-10.md L2). A pure file scan, no seed.
-run "render-parse budget"     "$PY" scripts/render-parse-budget.py --check
+# a rendered spelling parsed back (code-quality-2026-10.md L2). scripts/render-parse-census.vl
+# writes the report, `vl check --budget --findings` counts it.
+render_parse_budget() {
+  "$VL" run scripts/render-parse-census.vl --compiler "$SEED" -- --out "$LOGS/render-parse.json" &&
+    "$VL" check --budget scripts/render-parse-budget-baseline.json \
+      --findings "$LOGS/render-parse.json" --compiler "$SEED"
+}
+run "render-parse budget"      render_parse_budget
 # THE SHAPE FAMILY: pairs of the same work, one axis reshaped, graded on the ratio of
 # the compiler's guest FUEL (a count, so load cannot move it; the runtime pairs on CPU).
 # ~40 s, and it reds on the pre-#2419 compiler.
