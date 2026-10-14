@@ -1,0 +1,167 @@
+// Corpus byte-identity: build every corpus module with two seeds and compare the wasm.
+//
+//     JOBS=6 vl run scripts/silent-sweep/corpuscmp.vl -- <base.wasm> <cand.wasm>
+//
+// Prints every module whose bytes differ or whose build was LOST (the base built it, the
+// candidate does not), then one summary line; exits 1 on any LOST. A rung can change what a
+// module compiles to, or kill a real file, while every grade column stays flat. Population:
+// every `.vl` under `tests/cases/` and `std/`, minus those the BASE cannot build, which are
+// counted and never scored. A must-reject fixture added by the same change is LOST by
+// construction, so read LOST before calling it a regression. Run from the checkout root.
+
+import { IoError, listDir, readFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { endsWith, join, replaceAll, split } from "std:str"
+import { die, findFrom, isDir } from "../lib/common"
+import { cwd, makeTempDir, sortStrings, spawn, writeText } from "../lib/corpus"
+import { jobsFromEnv } from "../lib/census-grade"
+
+const SELF = "scripts/silent-sweep/corpuscmp.vl"
+const COMPILER = "build/vl-compiler.wasm"
+const VL = "scripts/vl-host/target/release/vl"
+
+// Every `.vl` file below `dir`, recursively, appended to `out`.
+function walk(dir: string, out: string[]) {
+  const names = listDir(dir)
+  if names is IoError {
+    die("corpuscmp: cannot list \{dir} (\{names.msg})", 1)
+    return
+  }
+  for n in names {
+    const p = dir + "/" + n
+    if isDir(p) { walk(p, out) }
+    else if endsWith(n, ".vl") { out.push(p) }
+  }
+}
+
+function modules(): string[] {
+  const out: string[] = []
+  walk("tests/cases", out)
+  walk("std", out)
+  sortStrings(out)
+}
+
+// The built bytes of `path` under `seed`, or null when the build fails.
+function build(path: string, seed: string, wasm: string): u8[] | null {
+  const r = spawn(VL, ["build", path, "-o", wasm, "--compiler", seed])
+  if r.code != 0 { return null }
+  const b = readFile(wasm)
+  spawn("rm", ["-f", wasm])
+  if b is IoError { return null }
+  b
+}
+
+function sameBytes(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The worker: one module's verdict as `<verdict>\t<path>` (`same`, `DIFFER`, `LOST`, `skip`).
+function one(base: string, cand: string, tmp: string, path: string): i32 {
+  const stem = tmp + "/" + replaceAll(path, "/", "_")
+  const a = build(path, base, stem + ".a.wasm")
+  if a == null {
+    print("skip\t" + path)
+    return 0
+  }
+  const b = build(path, cand, stem + ".b.wasm")
+  if b == null {
+    print("LOST\t" + path)
+    return 0
+  }
+  // D4664: a narrowed `u8[] | null` must pass through a `u8[]` binding before an argument.
+  const x: u8[] = a
+  const y: u8[] = b
+  if sameBytes(x, y) {
+    print("same\t" + path)
+  } else {
+    print("DIFFER\t" + path)
+  }
+  0
+}
+
+function main(args: string[]): i32 {
+  if args.length == 5 && args[0] == "--one" {
+    return one(args[1], args[2], args[3], args[4])
+  }
+  if args.length != 2 {
+    die("usage: vl run \{SELF} -- <base.wasm> <cand.wasm>", 2)
+  }
+  const jobs = jobsFromEnv(6)
+  const root = cwd()
+  const tmp = makeTempDir()
+  const worker = tmp + "/corpuscmp.wasm"
+  const b = spawn(VL, ["build", SELF, "--compiler", COMPILER, "-o", worker])
+  if b.code != 0 {
+    spawn("rm", ["-rf", tmp])
+    die("corpuscmp: cannot build \{SELF}:\n" + b.out + b.err, 1)
+  }
+  const mods = modules()
+  const list = tmp + "/modules"
+  spawn("mkdir", ["-p", tmp + "/out"])
+  writeText(list, join(mods, "\n") + "\n")
+  const x = spawn(
+    "env",
+    [
+      "VL_STD=" + root + "/std",
+      "xargs",
+      "-a",
+      list,
+      "-d",
+      "\\n",
+      "-P",
+      toString(jobs),
+      "-n",
+      "1",
+      VL,
+      "run",
+      worker,
+      "--",
+      "--one",
+      args[0],
+      args[1],
+      tmp + "/out",
+    ],
+  )
+  spawn("rm", ["-rf", tmp])
+  if x.code != 0 { die("corpuscmp: a worker failed:\n" + x.out + x.err, 1) }
+  const verdict: Map<string, string> = Map()
+  for l in x.out.split("\n") {
+    const t = findFrom(l, "\t", 0)
+    if t > 0 { verdict[l.slice(t + 1, l.length)] = l.slice(0, t) }
+  }
+  const diff: string[] = []
+  const lost: string[] = []
+  let same = 0
+  let skip = 0
+  for m in mods {
+    const v = verdict[m] ?? ""
+    if v == "same" { same = same + 1 }
+    else if v == "DIFFER" { diff.push(m) }
+    else if v == "LOST" { lost.push(m) }
+    else if v == "skip" { skip = skip + 1 }
+    else { die("corpuscmp: no verdict for \{m}", 1) }
+  }
+  for m in diff { print("DIFFER  " + m) }
+  for m in lost { print("LOST    " + m) }
+  print(
+    "corpus cmp: \{toString(mods.length)} modules · \{toString(same)} identical · \{toString(diff.length)} DIFFER · \{toString(lost.length)} LOST · \{toString(skip)} not buildable by the base",
+  )
+  if lost.length > 0 { return 1 }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("corpuscmp: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
