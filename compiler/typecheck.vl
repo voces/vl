@@ -25176,16 +25176,31 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
 // the plain struct). Restricted to structs whose fields the emitter boxes into a union today; a
 // field with no union-boxed rep would emit invalid wasm, so those arms stay a loud reject.
 function unionArmBoxSafe(tyIx: i32) {
+  const seen: i32[] = []
+  unionArmBoxSafeIn(tyIx, seen)
+}
+
+// `unionArmBoxSafe` over a record already on `seen`'s path answers true: a recursive record
+// (`next: Node | null`) is one reference slot, and its fields are being checked further up.
+function unionArmBoxSafeIn(tyIx: i32, seen: i32[]): boolean {
+  if tyIx < 0 { return false }
   const t = T.tys[tyIx]
   if !(t is TyObj) { return false }
-  const ftys = t.objFieldTypes
+  for s in seen {
+    if s == tyIx { return true }
+  }
+  seen.push(tyIx)
+  // A worklist of field types: a nullable or value-union field queues its inner types.
+  const ftys: i32[] = []
+  for f in t.objFieldTypes { ftys.push(f) }
   let i = 0
   while i < ftys.length {
+    if ftys[i] < 0 { return false }
     const ft = T.tys[ftys[i]]
     if ft is TyPrim {
       // scalar / string / boolean field — boxes cleanly
     } else if ft is TyObj {
-      if !unionArmBoxSafe(ftys[i]) { return false }
+      if !unionArmBoxSafeIn(ftys[i], seen) { return false }
     } else if tyIsLitUnion(ftys[i]) {
       // A literal-union field (`f: K0`) boxes as its interned i32 atom: the variant tables record
       // the union name (`uFieldElemName`, the `sFieldElemName` twin) and the variant construct path
@@ -25205,13 +25220,13 @@ function unionArmBoxSafe(tyIx: i32) {
       // the variant construct passes the lambda through and the narrowed member call routes to
       // `call_ref`. A nullable closure field stays out, its arm rep being unproven here.
     } else if ft is TyNullable {
-      // A nullable-litunion field (`f: K0 | null`, the code-30 i32 niche with the -1 sentinel) and a
-      // nullable-f32 field (`f: f32 | null`, the code-16 value box the plain struct field already
-      // carries) both box: the variant construct threads the same per-code arms the plain
-      // struct-literal path uses. Other nullable field types keep their loud reject.
-      const nfi = ft.nInner
-      if nfi < 0 { return false }
-      if !(tyIsLitUnion(nfi) || primNameOf(nfi) == "f32") { return false }
+      // A nullable field (`f: i32 | null`, `f: K0 | null`, `f: Bi | null`) has the rep the plain
+      // struct field already carries, so it boxes whenever its inner type does (D4601).
+      ftys.push(ft.nInner)
+    } else if ft is TyUnion {
+      // A value-union field (`f: i32 | string`) is the field's union box, the same one a plain
+      // struct literal builds; it boxes when every member does (D4601).
+      for m in ft.uMembers { ftys.push(m) }
     } else if ft is TyArray {
       // A list field (`xs: i32[]`, `ps: P[]`, `ss: string[]`): one reference slot in the arm's
       // struct, exactly as a nested `TyObj` field is. The variant box holds a ref to the arm struct
@@ -63932,8 +63947,17 @@ function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
 }
 // The member of `members` an object literal `e` of checked type `srcTy` is stored as: the
 // first record whose field names correspond and that `srcTy` is assignable to, else the first
-// whose names correspond, else -1.
+// whose names correspond, else -1. A literal adopted as a member that leaves out a nullable
+// field is that member, even though its written names do not correspond (D4601).
 function objLitUnionArm(e: ObjLit, srcTy: i32, members: i32[]): i32 {
+  if srcTy >= 0 && srcTy < T.tys.length {
+    const st = T.tys[srcTy]
+    if st is TyObj && st.objFieldNames.length > e.objFields.length {
+      for m in members {
+        if m == srcTy { return srcTy }
+      }
+    }
+  }
   let first = -1
   let mi = 0
   while mi < members.length {
