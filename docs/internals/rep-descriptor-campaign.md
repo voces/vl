@@ -2836,3 +2836,70 @@ has 416, `assign-narrow-then-null-guard.vl` 100 and `nullable-list-global-mutato
 
 **Next, in order:** items 1, 2, 4 and 5 of §13.14, then the empty-list `list → reflist`
 family above.
+
+### 13.16 An empty literal reads the column, and an inferred `.map` return names its row
+
+This step closes D2575, which §13.15 moved to a loud refusal, and takes the empty-list
+`list → reflist` family §13.15 left last.
+
+**D2575.** `computeRetInference` runs before `collectMapFilterUse`, and the second pass is
+what interns a `.map` result's ref-list row. Return inference therefore found no result slot
+for the callback, `refListElemNameOfExpr` answered "", and the function got a ref-list return
+with no element row. Emission refused that with `ref valtype with no interned shape`. The
+member arm now falls back to `mfStructResultRowName`, which names the row from the callback's
+own record (`sNames`) or union variant (`uVariants`). `criClassify` also retries a ref-list
+return whose row is still unnamed, and the fixpoint names it on a later pass. The witness, the
+used result, the expression-bodied function, a named record through `mk(e)` and a callback
+returning a union variant all run. Fixture: `tests/cases/lists/map-record-result-inferred-return.vl`.
+It delivers the result unused, indexed, as `.length`, into an annotated parameter, into a
+struct field, through `for`, and into a second `.map`. A generic `wrap<T>(xs: T[])` returning the
+same `.map` with a field typed `T` still refuses, on `only i32[] arrays and struct/union element
+arrays are supported`, before and after this step. It is filed as D4683.
+
+The same change closes D2303, `xs.map(toB)` with a named `toB` returned through a local, which
+the filed-witness grader found running. Its parameter-callback spelling, `go(f: (a: A) => B, xs)`
+returning `xs.map(f)`, still refuses with `ref valtype with no interned shape`. Naming the row
+from the call's arena element type was tried and did not move it, so no `B` ref-list row exists
+for that call at all. It is filed as D4684.
+
+**The empty literal.** A node-kind probe of §13.15's 896 different notes in `tests/cases` put
+**804** on an empty `[]`: 699 `list → reflist`, 71 `list → f64list`, 19 `list → i64list` and
+6 `list → f32list`. All 114 in `cells/` and the 24 `list → f64list` in `named/` were empty
+literals too. `arrLitListRep`'s `empty-hole` rung admits only the hole kinds it can name
+(string, f64, i64, f32), and a hole whose element is a record, or a type parameter pinned at an
+instance, has no hole kind at all. Such a literal fell through to the default `list`. An empty
+literal has no element to classify, so `arrLitListRep` now answers it from `columnListRep` at the
+instance before that default. This is the column read §13.14 gave every other rung, not a new
+special case.
+
+**Checks.** The "before" seed is §13.15's (#3752's head), 5,419,169 bytes. The "after" seed is
+5,420,200 bytes, +1,031 (+0.02%).
+
+* `difftree --identity` against the §13.15 seed, over 15,126 files: **10,041 built, 1 differs, 0
+  uncompared**. The one is the new fixture, which the §13.15 seed refuses. The empty-literal
+  rung changes no emitted byte.
+* Native fixpoint holds.
+* `rep-fuzz-check` is exact.
+* Filed witnesses: D2575 and D2303 move from a loud emit reject to closed.
+
+**Counts.** These are `listRep` notes over the same 15,360 files. "Different" counts a note whose
+two sides are both covered and differ.
+
+| population | `list → reflist` before | after | different before | after |
+| --- | --- | --- | --- | --- |
+| `tests/cases` | 778 | 76 | 896 | 98 |
+| distilled `named/` | 0 | 0 | 48 | 24 |
+| distilled `cells/` | 114 | 0 | 114 | 0 |
+
+Every `list → f64list`, `list → i64list` and `list → f32list` note is gone, in every
+population. The different notes left are 76 `list → reflist` across five generic files
+(`gradual-type-parameter-union.vl` has 65), 16 `strlist → reflist` in
+`inferred-return-list-join-relay.vl`, 3 `f64list → list`, 3 `f32list → f64list`, and in
+`named/` 24 `reflist → list` from the `rv3310_*` cells. No different count rose in any file.
+One family did rise: `listRep/open list → unc`, by 2 in `tests/cases` and 128 in `named/`. All
+of it is in the `d3125_*` cells and `niche-pin-sibling-closes.vl`, which map a generic callback
+over a spread. These notes have an uncovered column side, so they count oracle visits, and the
+retried `criClassify` pass visits those expressions again. The emitted bytes are unchanged.
+
+**Next, in order:** items 1, 2, 4 and 5 of §13.14. Then the 65 `list → reflist` in
+`gradual-type-parameter-union.vl`, D4683 and D4684.
