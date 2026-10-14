@@ -1,6 +1,6 @@
 // THE WITNESS-BACKED REFUSAL LIST MAY NOT GROW WITHOUT A WITNESS.
 //
-// `scripts/goal-scoreboard.py` prints two counts of the compiler's capability refusals. One
+// `scripts/goal-scoreboard.vl` prints two counts of the compiler's capability refusals. One
 // reads the WORDING — the literals whose sentence concedes the refused program was legal —
 // and it is a floor by construction: 517 of the 533 emit-side refusal sites say nothing
 // about legality, and `emitProgram: fromCodePoints argument must be a named i32[] binding`
@@ -11,7 +11,7 @@
 // on a program someone can run, so this test asserts the STRUCTURE — the probe exists, the
 // literal is still in the compiler, the probe says which literal it witnesses — in
 // milliseconds, without compiling anything. The BEHAVIOURAL half, does the witness still
-// refuse, is `python3 scripts/capability-probes/run.py --live-sites`, which compiles.
+// refuse, is `vl run scripts/capability-probes.vl -- --live-sites`, which compiles.
 //
 // No assertion library, per CLAUDE.md: every failure below throws with want and got.
 const LIST = "scripts/capability-probes/live-sites.json";

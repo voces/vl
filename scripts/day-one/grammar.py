@@ -14,7 +14,7 @@ docs/internals/day-one-sampler.md.
 
 Nothing here renders; `render.py` walks these records. Nothing here runs a program;
 `sample.py` does. Keeping the three apart is what lets the grammar grow without the
-grader's vocabulary drifting from `scripts/capability-probes/run.py`'s.
+grader's vocabulary drifting from `scripts/capability-probes.vl`'s.
 """
 
 # ---------------------------------------------------------------------------

@@ -8,23 +8,63 @@
 // playground bundle and under plain Deno.
 
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
+import {
+  type FixableDiagnostic,
+  fixableDiagnosticsForRange,
+  quickFixesForDiagnostic,
+  ufcsImportFixes,
+  ufcsImportModules,
+  ufcsMissingImportAt,
+} from "./codeActions.ts";
+import {
+  removeCharAt,
+  type StdSurfaceCache,
+  stdExportSurfaces,
+  wordEndingBefore,
+} from "./editorText.ts";
 import { foldingRanges, type VlFoldingKind } from "./folding.ts";
-import { crossFileReferences, type OpenDocument } from "./moduleGraph.ts";
+import {
+  crossFileReferences,
+  type OpenDocument,
+  type UnusedExportUseMap,
+} from "./moduleGraph.ts";
+import {
+  invalidNewNameReason,
+  planRenameAt,
+  type RenamePlan,
+  renameEdits,
+} from "./rename.ts";
 import { callSiteAt, repairedSource, signatureLabel } from "./signatureHelp.ts";
 import {
+  builtinCompletionsFromWasm,
+  type Completion,
   displayableType,
   docMarkdown,
   type DocumentHighlightSpan,
   documentHighlightsFromRefs,
   exactConstHover,
+  exportRefLenses,
   flatDocumentSymbols,
+  importInsertionEdit,
   inlayHintsFromWasm,
   isDisplayableType,
+  keywordCompletions,
   type LspRange,
+  memberCompletionsFromWasm,
   nestedDocumentSymbols,
+  organizeImportEdits,
   type OutlineNode,
+  refCountLensTitle,
+  scopeCompletionsFromBindings,
   semanticTokensDataFromWasm,
+  snippetCompletions,
+  stdAutoImportCompletions,
+  type StdExportCandidate,
   type TypeInlayHint,
+  typeCompletionsFromWasm,
+  ufcsCompletions,
+  type UfcsProbeModule,
+  ufcsProbeSource,
   withEffects,
 } from "./typeFeatures.ts";
 import type {
@@ -442,4 +482,370 @@ export const semanticTokensAt = async (
     : [];
   const lexical = checker.lexicalTokensAt(text);
   return semanticTokensDataFromWasm(idents, lexical, members, text);
+};
+
+// ---- rename -----------------------------------------------------------------
+
+/** A request the feature refuses, with the sentence the editor shows. */
+export type FeatureRefusal = { error: string };
+
+/** A text edit in the protocol's shape. */
+export type FeatureTextEdit = { range: LspRange; newText: string };
+
+/**
+ * The span and current name a rename at `pos` would replace. `isStdDecl` says
+ * which declaring module keys are std, whose names are refused. Null when the
+ * cursor is on nothing renameable.
+ */
+export const prepareRenameAt = async (
+  text: string,
+  pos: FeaturePosition,
+  ctx: FeatureContext,
+  isStdDecl: (key: string) => boolean,
+): Promise<{ range: LspRange; placeholder: string } | FeatureRefusal | null> => {
+  const plan = await renamePlan(text, pos, ctx, isStdDecl);
+  if (plan === undefined) return null;
+  if (plan.kind === "refused") return { error: plan.reason };
+  return { range: plan.range, placeholder: plan.word };
+};
+
+/**
+ * The edits renaming the symbol at `pos` to `newName`, by document URI. An export
+ * rename searches the same workspace as find-references; a local one never reads it.
+ */
+export const renameAt = async (
+  text: string,
+  pos: FeaturePosition,
+  newName: string,
+  ctx: FeatureContext,
+  workspace: FeatureWorkspace,
+  isStdDecl: (key: string) => boolean,
+): Promise<{ changes: Record<string, FeatureTextEdit[]> } | FeatureRefusal | null> => {
+  const badName = invalidNewNameReason(newName);
+  if (badName !== undefined) return { error: badName };
+  const plan = await renamePlan(text, pos, ctx, isStdDecl);
+  if (plan === undefined) return null;
+  if (plan.kind === "refused") return { error: plan.reason };
+  const exported = plan.kind === "export";
+  return await renameEdits(
+    plan,
+    newName,
+    text,
+    ctx.entryKey,
+    workspace.uri,
+    exported ? workspace.openDocs() : [],
+    exported ? workspace.diskFiles() : [],
+    ctx.reader,
+    ctx.checker,
+  );
+};
+
+const renamePlan = (
+  text: string,
+  pos: FeaturePosition,
+  ctx: FeatureContext,
+  isStdDecl: (key: string) => boolean,
+): Promise<RenamePlan | undefined> =>
+  planRenameAt(
+    text,
+    ctx.entryKey,
+    ctx.reader,
+    ctx.checker,
+    pos.line,
+    pos.character,
+    isStdDecl,
+  ).catch((err) => {
+    ctx.log(`[rename] planRenameAt failed: ${err}`);
+    return undefined;
+  });
+
+// ---- completion (D3) --------------------------------------------------------
+
+// Every std module, named by one of its exports, for the UFCS probe to import.
+// Workspace modules are not probed: the probe would compile up to the crawl cap on
+// every `.`, and the module declaring the receiver's type is already in the graph.
+const ufcsProbeModules = (
+  stdExports: Map<string, StdExportCandidate[]>,
+): UfcsProbeModule[] => {
+  const out: UfcsProbeModule[] = [];
+  for (const [key, exports] of stdExports) {
+    if (exports.length > 0) out.push({ key, anyExport: exports[0].name });
+  }
+  return out;
+};
+
+/**
+ * Completions at `pos`. After a `.`, the receiver's fields and then the UFCS
+ * functions it dispatches to, an unimported one carrying its import edit. Elsewhere,
+ * builtins under the scope's bindings under the type names, then std exports not in
+ * scope (with their import edit), keywords and snippets. `stdCache` memoises the std
+ * export surfaces across requests. Empty on a seed predating the scope queries.
+ */
+export const completionsAt = async (
+  text: string,
+  pos: FeaturePosition,
+  ctx: FeatureContext,
+  stdCache: StdSurfaceCache,
+): Promise<Completion[]> => {
+  const { checker, entryKey, reader, log } = ctx;
+  if (
+    checker.scopeAt === undefined ||
+    checker.builtinCompletions === undefined ||
+    checker.memberCompletionsAt === undefined
+  ) {
+    return [];
+  }
+  const formatImport = (stmt: string) => checker.formatSrc?.(stmt);
+  const stdExports = () => stdExportSurfaces(checker, reader, reader, stdCache);
+  const linePrefix = lineAt(text, pos.line).slice(0, pos.character);
+
+  if (linePrefix[linePrefix.length - 1] === ".") {
+    // The parser is not error-tolerant for `receiver.`, so the `.` is removed and a
+    // bare-identifier receiver is resolved at its own position.
+    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
+    const dotCol = pos.character - 1;
+    const members = receiver === null ? [] : await checker
+      .memberCompletionsAt(
+        removeCharAt(text, pos.line, dotCol),
+        entryKey,
+        reader,
+        pos.line,
+        dotCol - receiver.length,
+      )
+      .catch((err) => {
+        log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
+        return [];
+      });
+    const fields = memberCompletionsFromWasm(members);
+    const byName = new Set(fields.map((f) => f.name));
+    const ufcs = ufcsCompletions(
+      text,
+      entryKey,
+      await ufcsCandidatesAt(text, pos, ctx, async () => ufcsProbeModules(await stdExports())),
+      (name) => byName.has(name),
+      formatImport,
+    );
+    return [...fields, ...ufcs];
+  }
+
+  const bindings = await checker
+    .scopeAt(text, entryKey, reader, pos.line, pos.character)
+    .catch((err) => {
+      log(`[wasm-checker] scopeAt failed: ${err}`);
+      return [];
+    });
+  const byName = new Map<string, Completion>();
+  for (const c of builtinCompletionsFromWasm(checker.builtinCompletions())) {
+    byName.set(c.name, c);
+  }
+  for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+  // Type names never take a label a value already holds: at a use site the value is
+  // what the author reaches for.
+  const typeNames = await checker
+    .typeNamesAt?.(text, entryKey, reader)
+    .catch((err) => {
+      log(`[wasm-checker] typeNamesAt failed: ${err}`);
+      return [];
+    }) ?? [];
+  for (const c of typeCompletionsFromWasm(typeNames, (n) => byName.has(n))) {
+    byName.set(c.name, c);
+  }
+  const autoImports = stdAutoImportCompletions(
+    text,
+    await stdExports(),
+    (name) => byName.has(name),
+    formatImport,
+  );
+  return [
+    ...byName.values(),
+    ...autoImports,
+    ...keywordCompletions(false),
+    ...snippetCompletions(false),
+  ];
+};
+
+// The UFCS functions the receiver before the cursor's `.` dispatches to, over the
+// file's graph plus `modules`. Empty on a seed predating the query.
+const ufcsCandidatesAt = async (
+  text: string,
+  pos: FeaturePosition,
+  ctx: FeatureContext,
+  modules: () => Promise<UfcsProbeModule[]>,
+): Promise<{ name: string; detail: string; moduleKey: string }[]> => {
+  const { checker, entryKey, reader, log } = ctx;
+  if (checker.ufcsCandidatesAt === undefined) return [];
+  const probe = ufcsProbeSource(text, await modules(), pos);
+  return await checker
+    .ufcsCandidatesAt(
+      probe.source,
+      entryKey,
+      reader,
+      pos.line + probe.lineOffset,
+      pos.character,
+    )
+    .catch((err) => {
+      log(`[wasm-checker] ufcsCandidatesAt failed: ${err}`);
+      return [];
+    });
+};
+
+// ---- document formatting (D4) -----------------------------------------------
+
+/**
+ * The whole document through the seed's formatter, as one full-range edit. No
+ * edit when the text is already formatted, does not parse, or no seed loaded.
+ */
+export const formattingEditsAt = (
+  text: string,
+  checker: Pick<WasmChecker, "formatSrc"> | undefined,
+): FeatureTextEdit[] => {
+  const formatted = checker?.formatSrc?.(text);
+  if (formatted === undefined || formatted === text) return [];
+  const lines = text.split(/\r\n|\r|\n/);
+  const end = { line: lines.length - 1, character: lines[lines.length - 1].length };
+  return [{ range: { start: { line: 0, character: 0 }, end }, newText: formatted }];
+};
+
+// ---- code actions (B17, D9) -------------------------------------------------
+
+const QUICK_FIX = "quickfix";
+const ORGANIZE_IMPORTS = "source.organizeImports";
+
+/** A code action in the protocol's shape, over the host's diagnostic type `D`. */
+export type FeatureCodeAction<D> = {
+  title: string;
+  kind: typeof QUICK_FIX | typeof ORGANIZE_IMPORTS;
+  diagnostics?: D[];
+  isPreferred?: boolean;
+  edit: { changes: Record<string, FeatureTextEdit[]> };
+};
+
+// A filter matches a kind equal to it or nested under it, per the protocol.
+const kindMatchesOnly = (kind: string, only: string[] | undefined): boolean =>
+  only === undefined ||
+  only.some((k) => kind === k || kind.startsWith(k + "."));
+
+/**
+ * Quick fixes for the lint diagnostics over `range`, then organize imports.
+ * `contextDiagnostics` are the client's; `cached` are this host's published ones,
+ * so a fix is offered with the cursor off the exact range. Organize imports drops
+ * unused and duplicate specifiers, re-linted from `text`, and is absent when it
+ * would change nothing. `only` is the request's kind filter.
+ */
+export const codeActionsAt = <D extends FixableDiagnostic>(
+  text: string,
+  uri: string,
+  range: LspRange,
+  contextDiagnostics: D[],
+  cached: () => D[],
+  only: string[] | undefined,
+  checker: Pick<WasmChecker, "lint" | "formatSrc"> | undefined,
+  lintPath: string | undefined,
+): FeatureCodeAction<D>[] => {
+  const formatImport = (stmt: string) => checker?.formatSrc?.(stmt);
+  const actions: FeatureCodeAction<D>[] = [];
+  if (kindMatchesOnly(QUICK_FIX, only)) {
+    const known = cached();
+    for (const diag of fixableDiagnosticsForRange(contextDiagnostics, known, range)) {
+      const fixes = quickFixesForDiagnostic(text, diag.code, diag.range);
+      // The modules that can supply a missing UFCS import ride the diagnostic.
+      const ufcsName = ufcsMissingImportAt(text, diag);
+      if (ufcsName !== undefined) {
+        fixes.push(...ufcsImportFixes(
+          text,
+          ufcsName,
+          ufcsImportModules(diag, known),
+          (src, spec, name) => importInsertionEdit(src, spec, name, formatImport),
+        ));
+      }
+      for (const fix of fixes) {
+        actions.push({
+          title: fix.title,
+          kind: QUICK_FIX,
+          diagnostics: [diag],
+          isPreferred: fix.isPreferred,
+          edit: { changes: { [uri]: fix.edits } },
+        });
+      }
+    }
+  }
+  if (kindMatchesOnly(ORGANIZE_IMPORTS, only)) {
+    const redundant = (checker?.lint(text, lintPath) ?? [])
+      .filter((d) => d.code === "unused-import" || d.code === "duplicate-import")
+      .map((d) => d.range);
+    const edits = organizeImportEdits(text, redundant, formatImport);
+    if (edits.length > 0) {
+      actions.push({
+        title: "Organize imports",
+        kind: ORGANIZE_IMPORTS,
+        edit: { changes: { [uri]: edits } },
+      });
+    }
+  }
+  return actions;
+};
+
+// ---- code lens: export reference counts (D9.4) ------------------------------
+
+/** What a lens carries from compute to resolve (`CodeLens.data`, JSON-safe). */
+export type RefLensData = {
+  uri: string;
+  name: string;
+  line: number; // 0-based decl-name line
+  character: number; // 0-based decl-name col
+  title: string;
+};
+
+/**
+ * One "N refs" lens per export of `text`, counted from `useMap`, the unused-export
+ * pass's last result. An export the pass has not counted yet gets no lens.
+ */
+export const codeLensesAt = (
+  text: string,
+  uri: string,
+  ctx: FeatureContext,
+  useMap: UnusedExportUseMap,
+): { range: LspRange; data: RefLensData }[] => {
+  const surface = ctx.checker.moduleSurface(text, ctx.entryKey);
+  return exportRefLenses(surface.exports, useMap.get(ctx.entryKey)).map((l) => ({
+    range: {
+      start: { line: l.line, character: l.char },
+      end: { line: l.line, character: l.char + l.length },
+    },
+    data: {
+      uri,
+      name: l.name,
+      line: l.line,
+      character: l.char,
+      title: refCountLensTitle(l.count),
+    },
+  }));
+};
+
+/**
+ * The locations behind a lens's count, found on click by the cross-file search
+ * find-references uses, from the export's own document `text`. Empty when the
+ * search fails.
+ */
+export const codeLensLocationsAt = async (
+  data: RefLensData,
+  text: string,
+  ctx: FeatureContext,
+  workspace: FeatureWorkspace,
+): Promise<FeatureLocation[]> => {
+  const openDocs = workspace.openDocs();
+  const refs = await crossFileReferences(
+    data.name,
+    text,
+    ctx.entryKey,
+    openDocs,
+    ctx.reader,
+    ctx.checker,
+    true,
+    workspace.diskFiles(),
+  ).catch((err) => {
+    ctx.log(`[code-lens] reference crawl failed: ${err}`);
+    return undefined;
+  });
+  return refs ?? [];
 };

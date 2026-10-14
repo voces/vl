@@ -44,7 +44,7 @@ never reached.
 | `minimise.py` | greedy line removal to a minimal witness, then ablation BY AXIS |
 | `file_row.py` | a minimal witness → an inventory row draft + a standing capability probe |
 
-Grading is `scripts/capability-probes/run.py`'s, imported and not copied, so a day-one
+Grading is `scripts/capability-probes.vl`'s, run through its `--grade-channel` mode, so a day-one
 cell and a hand-written probe are read on one scale.
 
 ## The controls are SYNTHETIC, on purpose
