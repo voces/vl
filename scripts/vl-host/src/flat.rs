@@ -42,6 +42,7 @@ use crate::inline::{
     type_section, ASite, AUse, ArrKind, Opnd, Scan,
 };
 use crate::multivalue::{put_sleb, put_uleb, BodyMove, Num};
+use crate::upos;
 
 const NONE: u32 = u32::MAX;
 
@@ -577,7 +578,7 @@ fn rewrite(
         // Stream the body with the plan.
         let mut reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &bytes[b.ops_start..b.range.1],
-            b.ops_start,
+            b.ops_start as u64,
         ));
         let mut offs: Vec<(usize, usize)> = Vec::new();
         while !reader.eof() {
@@ -587,9 +588,9 @@ fn rewrite(
             let end = if reader.eof() {
                 b.range.1
             } else {
-                reader.original_position()
+                upos(reader.original_position())
             };
-            offs.push((off, end));
+            offs.push((upos(off), end));
         }
         let mut code: Vec<u8> = Vec::with_capacity(b.range.1 - b.ops_start + 64);
         let mut moved: Vec<(u32, u32)> = Vec::with_capacity(offs.len());

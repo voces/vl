@@ -27,6 +27,10 @@ import {
   WASM_DIS,
   WASM_OPT,
 } from "./support/nativeRelease.ts";
+import { concurrentTests } from "./support/concurrentTests.ts";
+
+// Every test builds into its own temp dir and shares no state, so they run a few at a time.
+const test = concurrentTests();
 
 const DIR = `${ROOT}/tests/fixtures/opt-escape`;
 // fixture -> whether every struct it allocates stays off the heap once the step has run
@@ -60,7 +64,7 @@ const run = async (bin: string, args: string[]) => {
 const linesOf = (out: string) => out.replace(/\n$/, "").split("\n");
 
 for (const [fx, melts] of FIXTURES) {
-  Deno.test({
+  test({
     name: `native-release: a per-call struct's helpers are inlined — ${fx}`,
     ignore: !ENABLED,
     fn: async () => {
@@ -161,7 +165,7 @@ for (const [fx, melts] of FIXTURES) {
 // build leaves the step with the names it came in with and none of the markers, and a build
 // without names leaves it with none. Read off the step's own output (`$VL_OPT_ESCAPE_DUMP`);
 // the next test pins what the rung that follows does with them.
-Deno.test({
+test({
   name:
     "native-release: the escape step hands every function its own name back",
   ignore: !ENABLED,
@@ -256,7 +260,7 @@ const customSections = (b: Uint8Array): string[] => {
 // function names a trap backtrace prints. Its `vl-src` rows do not survive, because they are
 // offsets into the UNOPTIMIZED module's bytes and would name the wrong source line. A build
 // without `--names` carries neither section, as before.
-Deno.test({
+test({
   name: "native-release: `--names` keeps function names through -O and -O3",
   ignore: !ENABLED,
   fn: async () => {

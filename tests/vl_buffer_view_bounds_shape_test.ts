@@ -1,8 +1,7 @@
-// The TABLE rows of the view-bounds shape suite — one test per
-// `bench/buffer-view-bounds/` fixture, graded at all three optimizer rungs. The
-// P1.4 contract moved to `vl_buffer_view_bounds_contract_test.ts` so `deno test
-// --parallel` can run the two concurrently; the machinery and the table (with the
-// prose that explains every cell) are in the shared support module.
+// The view-bounds shape suite — one test per `bench/buffer-view-bounds/` fixture, graded at
+// all three optimizer rungs, then the P1.4 contract over the same fixtures' `-O3` builds. One
+// file so each (fixture, rung) is built once and the rows run a few at a time; the machinery
+// and the table (with the prose that explains every cell) are in the shared support module.
 //
 // @test-timing opt
 import {
@@ -11,9 +10,12 @@ import {
   TABLE,
   shapeOf,
 } from "./support/viewBoundsShape.ts";
+import { concurrentTests } from "./support/concurrentTests.ts";
+
+const test = concurrentTests();
 
 for (const [fixture, row] of Object.entries(TABLE)) {
-  Deno.test({
+  test({
     name: `view-bounds shape: ${fixture}`,
     ignore: !ENABLED,
     fn: async () => {
@@ -41,3 +43,45 @@ for (const [fixture, row] of Object.entries(TABLE)) {
     },
   });
 }
+
+// The P1.4 CONTRACT itself, stated as three assertions that hold no matter what
+// the exact counts above are. These are what a kernel author is told, so they are
+// checked directly rather than inferred from the table.
+test({
+  name: "view-bounds contract: fenced checks survive -O3, the fast pattern is bare",
+  ignore: !ENABLED,
+  fn: async () => {
+    for (const shape of ["scale", "reduce", "axpy", "rows"]) {
+      const view = await shapeOf(`${shape}-view`, "-O3");
+      const buf = await shapeOf(`${shape}-buf`, "-O3");
+      const hoist = await shapeOf(`${shape}-hoist`, "-O3");
+      // (1) The fence is NOT eliminated by the release profile.
+      if (view.trap === 0) {
+        throw new Error(
+          `${shape}-view has no trap left inside its loop at -O3 — the per-access ` +
+            `bounds check was eliminated. That is a real improvement and a real ` +
+            `documentation change: buffer-design.md §M and webcraft-requirements.md ` +
+            `P1.4 both state that it survives.`,
+        );
+      }
+      // (2) The unfenced twin has no check, so the delta is the fence and nothing else.
+      if (buf.trap !== 0) {
+        throw new Error(
+          `${shape}-buf has ${buf.trap} trap(s) inside its loop at -O3 — the ` +
+            `"unfenced twin" is no longer unfenced, so (view - buf) stops measuring ` +
+            `the fence.`,
+        );
+      }
+      // (3) The stated fast pattern really is bare: no check, and no call but the ONE the
+      // run-once driver makes per trip — `-O3` keeps the kernel out of a driver that runs
+      // once (DECISIONS.md, "`-O3` keeps hot callees out of run-once code").
+      if (hoist.trap !== 0 || hoist.call > 1) {
+        throw new Error(
+          `${shape}-hoist is not bare at -O3: [trap,call] = [${hoist.trap},${hoist.call}]. ` +
+            `The fast pattern documented in §M5 must lower to the intrinsic with ` +
+            `nothing per access.`,
+        );
+      }
+    }
+  },
+});
