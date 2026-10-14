@@ -4,6 +4,16 @@ on:
   push:
     branches: [master]
   pull_request:
+  # Nightly: the `ci-cost` job runs only off pull requests.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# Compile the seed for a FIXED x86 feature level, not the runner's CPU: a `.cwasm` sidecar's
+# tag then names the level, so one cached on any runner loads on every other instead of each
+# job re-JITing the seed (scripts/vl-host `pin_seed_isa`). Every GitHub-hosted x86 runner is v3.
+env:
+  VL_ISA: x86-64-v3
 
 jobs:
   ci:
@@ -53,7 +63,7 @@ jobs:
 
       # `deno check` now covers only the surviving type leaves (coreTypes.ts,
       # diagnostics.ts) — the TS compiler core is deleted; the `.vl` compiler is
-      # type-checked by the native checker (lint-self.sh in ci-native).
+      # type-checked by the native checker (lint-self.sh in the `checks` job).
       - name: Type-check (compiler)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: deno check compiler/*.ts
@@ -93,123 +103,66 @@ jobs:
         working-directory: lsp
 
   # ---------------------------------------------------------------------------
-  # ci-native — gates the NATIVE self-hosting path (scripts/vl-host + the
-  # self-host compiler wasm), end to end with zero TS/deno in the compile+run
-  # loop past the seed. A SEPARATE, PARALLEL job: it never extends the `ci` job's
-  # critical path (the maintainer is duration-sensitive), and a slow cold cargo
-  # build here can't delay the deno suite's result.
+  # The NATIVE self-hosting path (scripts/vl-host + the self-host compiler wasm), end to
+  # end with zero TS/deno in the compile+run loop past the seed, as a job GRAPH:
   #
-  # Steps: build the vl-host binary → refresh the seed compiler wasm + prove the
-  # native fixpoint (the self-reproduction ladder: an observed
-  # `compile(X, source) == X` byte-equality for the shipped seed) → self-lint in
-  # the background while the native corpus alignment + `build -O` suites run
-  # (env-gated, drive the corpus through `vl`).
+  #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
+  #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
+  #          ├── ci-release-shape (4) the binaryen-backed suites, split by weight
+  #          └── ci-cost              fuel/RSS cost ratchets — master pushes and nightly only
   #
-  # Caching: ubuntu-latest ships cargo, so we cache ~/.cargo + the cargo target
-  # dir (cold wasmtime build ~2-4 min, warm seconds — busted only when
-  # scripts/vl-host/Cargo.lock changes), the finished `vl` binary (skips cargo
-  # entirely when rustc + lockfile + crate source are unchanged), and the seed +
-  # its `.cwasm` sidecars keyed on the compiler source it was built from. The
-  # binary cache is restored FIRST and gates the target-dir restore: on the 97.9%
-  # of runs where it hits, this job runs no cargo at all and skips the ~1.2 GB
-  # download entirely.
+  # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
+  # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
+  # both under exact keys. Every downstream job restores those exact keys and FAILS on a miss
+  # (`fail-on-cache-miss`), so every suite runs on the proven fixpoint of THIS commit's
+  # compiler source — never on an earlier rung, and never on a seed it built itself.
   #
-  # The release DISTRIBUTION build (`--features embed-seed`) used to be the last
-  # step here; it is now the parallel `ci-embed-seed` job, because it was the only
-  # reason this job restored the cargo target dir at all.
-  #
-  # Docs-only skip is mirrored from `ci` so a docs-only PR exits this job green
-  # too (keeping the stable job name satisfied for branch protection).
+  # The docs-only verdict is `seed`'s output; a docs-only change skips every downstream job.
   # ---------------------------------------------------------------------------
-  ci-native:
+  seed:
     runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.docs_check.outputs.docs_only }}
+      seed_key: ${{ steps.keys.outputs.seed }}
+      bin_key: ${{ steps.keys.outputs.bin }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      # Docs-only gate — the same shared detection the `ci` job uses (see
-      # .github/actions/docs-only).
       - name: Detect docs-only change
         id: docs_check
         uses: ./.github/actions/docs-only
 
-      # deno serves only the test tooling in this job (the corpus oracle + native
-      # suites). The seed is obtained natively — cache, else the release seed via
-      # scripts/fetch-seed.sh — so no Node/npm is needed here (the TS stage-0
-      # toolchain that required binaryen from npm is off this path).
-      - uses: denoland/setup-deno@v2
-        if: steps.docs_check.outputs.docs_only != 'true'
-        with:
-          deno-version: v2.x
+      # The two exact keys every downstream job restores. The binary is keyed on everything
+      # that determines it (rustc, Cargo.lock, the crate source); the seed on the compiler
+      # source it is the proven fixpoint of, then on what decides its sidecars (the host that
+      # JITs them and the tags warm-seed.sh warms), because actions/cache never re-saves an
+      # existing key and a stale sidecar would be re-JITed by every job. `vl-seed4` is ONE
+      # namespace with publish-seed.yml and fuzz-nightly.yml (same paths, same `$VL_ISA`): an
+      # entry carries the provenance file (`.src`) and sidecars compiled for the pinned ISA,
+      # which the `vl-seedpair` ones lack.
+      - name: Cache keys
+        id: keys
+        run: |
+          echo "bin=vl-bin-${{ runner.os }}-$(rustc -V | tr ' ' '_')-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}" >> "$GITHUB_OUTPUT"
+          echo "seed=vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/src/**', 'scripts/warm-seed.sh') }}" >> "$GITHUB_OUTPUT"
+          echo "rustc=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Deno modules
-        if: steps.docs_check.outputs.docs_only != 'true'
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/deno
-          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
-          restore-keys: |
-            deno-${{ runner.os }}-
-
-      # Cargo registry/index + the vl-host target dir — needed ONLY when the
-      # binary cache below missed and `cargo build` has to run.
-      # Cold wasmtime build is the only real cost here; warm restores drop it to
-      # seconds.
-      #
-      # The rustc version is part of the key ON PURPOSE: a target dir compiled by
-      # one rustc is fully fingerprint-invalidated under the next (ubuntu-latest
-      # bumps rustc often), AND actions/cache skips saving when the primary key
-      # already exists — so without the version in the key, one toolchain bump
-      # locks every later run into "restore stale → recompile all of wasmtime
-      # cold → never resave". Versioned keys make a bump a clean miss: rebuild
-      # once, save, warm thereafter. The broader restore-keys still carry the
-      # registry/index across versions (downloads are version-agnostic).
-      #
-      # The crate SOURCE is deliberately NOT in the key. It used to be, to keep the
-      # embedded-seed step from rebuilding against stale fingerprints — but that step
-      # rebuilds the crate on EVERY run regardless: `build.rs` declares
-      # `rerun-if-changed` on the seed wasm, and the seed-refresh step rewrites it
-      # earlier in the same job. So a src-keyed entry preserved nothing, while making
-      # every host-source commit miss and re-upload the whole ~1.2 GB target dir
-      # (~15s, and a fresh cache entry each time — at a 10 GB repo quota that evicts
-      # the cargo entry itself, whose next miss is a ~2m19s cold wasmtime build).
-      # Keyed on the lockfile + manifest instead, the deps that dominate those bytes
-      # are re-saved only when they actually change; `actions/cache` skips saving on
-      # an exact hit, so ordinary commits upload nothing. What a src change still
-      # costs is one crate rebuild (~8s) — which it costs either way, since a changed
-      # src invalidates the crate's fingerprint no matter what the key says.
-      - name: Rustc version (cargo cache key)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        id: rustc
-        run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
-
-      # The finished `vl` binary, keyed on EVERYTHING that determines it (rustc,
-      # Cargo.lock, the crate source). An exact hit means cargo would reproduce
-      # this same binary, so the build step is skipped outright — and "the host
-      # still compiles" stays covered every run regardless: the `ci-embed-seed`
-      # job compiles the same crate (a feature superset) from scratch inputs.
-      #
-      # Restored BEFORE the cargo/target cache on purpose. An exact hit here means
-      # NOTHING in this job runs cargo, so the ~1.2 GB target-dir restore can be
-      # skipped outright — and it is the second-largest step in the job (17 s
-      # median; measured 2026-07-29 over the last 30 full master-push runs). The
-      # hit rate is 97.9% (377/385 full runs since 07-15): only a
-      # `scripts/vl-host/src/**`, `build.rs`, manifest or lockfile change misses,
-      # and on a miss the gated restore below runs exactly as it did before.
+      # An exact hit means cargo would reproduce this same binary, so the build is skipped
+      # outright; "the host still compiles" stays covered every run by `ci-embed-seed`,
+      # which compiles the same crate (a feature superset) from scratch inputs.
       - name: Cache vl-host binary
         if: steps.docs_check.outputs.docs_only != 'true'
         id: vlbin
         uses: actions/cache@v5
         with:
           path: scripts/vl-host/target/release/vl
-          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+          key: ${{ steps.keys.outputs.bin }}
 
-      # GATED on the binary cache missing: this job's ONLY cargo consumer is the
-      # build step below, which is gated on the same condition. `ci-embed-seed`
-      # restores (and saves) this same cache under the same key, so a lockfile or
-      # toolchain move still populates it; this job just stops paying a 17 s
-      # download for a target dir it will not open.
+      # Restored only when the binary missed. The rustc version is in the key because a
+      # target dir compiled by one rustc is fully invalidated under the next, and
+      # actions/cache never re-saves an existing key. `ci-embed-seed` restores this same key.
       - name: Cache cargo + vl-host target
         if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
         uses: actions/cache@v5
@@ -218,9 +171,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             scripts/vl-host/target
-          key: cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
+          key: cargo-${{ runner.os }}-${{ steps.keys.outputs.rustc }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
+            cargo-${{ runner.os }}-${{ steps.keys.outputs.rustc }}-
             cargo-${{ runner.os }}-
 
       - name: Build vl-host (native tool)
@@ -228,208 +181,211 @@ jobs:
         run: cargo build --release
         working-directory: scripts/vl-host
 
-      # The rolling seed cache (F-tiers): an exact hit means the seed was built
-      # from THIS compiler source; a restore-keys hit hands refresh-compiler.sh a
-      # healthy older seed to SELF-compile current source with. On a cold cache
-      # refresh-compiler.sh fetches the release seed (scripts/fetch-seed.sh)
-      # rather than TS-minting. The fixpoint ladder below re-proves the seed
-      # every run, so neither a cache hit nor a fetched seed weakens the gate.
-      #
-      # The `.cwasm` sidecars (the host's wasmtime-compilation cache) ride along:
-      # on an exact hit every `vl` invocation in the job deserializes instead of
-      # re-JITing the seed. The glob is load-bearing — a sidecar is
-      # `build/vl-compiler.wasm.<seed key>.<engine tag>.cwasm`, one per ENGINE
-      # CONFIGURATION, so that `vl build`/`vl run` and `vl check`/`fmt`/`test`, which
-      # compile the seed differently, keep separate entries instead of evicting each
-      # other. Both are warmed by `refresh-compiler.sh` before the suites run.
-      # The key is the seed's CONTENT, so a restore whose bytes match hits however the
-      # mtimes land; a sidecar from another seed or wasmtime is simply not read, and an
-      # unreadable one at a live path makes the host recompile + rewrite (self-healing),
-      # so a stale sidecar can cost time but never correctness.
+      # The rolling seed cache: an exact hit is a seed proven from THIS compiler source (it
+      # was saved only after the ladder below passed); a restore-keys hit hands
+      # refresh-compiler.sh a healthy older seed to self-compile current source with; a cold
+      # cache fetches the release seed. The `.cwasm` sidecars (one per engine configuration)
+      # ride along, so no downstream `vl` re-JITs the seed. A stale sidecar costs time, never
+      # correctness: the host recompiles one whose key does not match.
       - name: Cache seed compiler wasm
         if: steps.docs_check.outputs.docs_only != 'true'
         uses: actions/cache@v5
         with:
           path: |
             build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
             build/vl-compiler.wasm.*.cwasm
-          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          key: ${{ steps.keys.outputs.seed }}
           restore-keys: |
-            vl-seedpair-${{ runner.os }}-
+            vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+            vl-seed4-${{ runner.os }}-
 
       # Self-compile current source with the seed AND prove the shipped seed is a
-      # self-compilation fixed point (`--prove-fixpoint`): the ladder stops at the
-      # first stage X with an OBSERVED `compile(X, source) == X` byte-equality —
-      # the same witness the classic stage3/stage4 rebuild produced, without
-      # recompiling byte-identical inputs. An exact seed-cache hit proves out in
-      # ONE compiler self-compile (the seed reproduces itself); a stale
-      # restore-keys/fetched seed climbs the classic two or three rungs. On a cold
-      # cache refresh-compiler.sh fetches the release `seed-latest` (one push
-      # stale is fine — the ladder re-proves it); a seed too stale to compile
-      # current source fails loud (re-fetch seed-latest / land the change in
-      # smaller steps). GH_TOKEN lets fetch-seed.sh use `gh release download` on
-      # the cold path.
+      # self-compilation fixed point: the ladder stops at the first stage X with an OBSERVED
+      # `compile(X, source) == X` byte-equality. An exact cache hit proves out in ONE
+      # self-compile; a stale seed climbs two or three rungs. Whatever rung proves out is
+      # what the cache entry above saves, so every downstream job runs the proven fixpoint.
       - name: Refresh seed + native fixpoint (self-reproduction ladder)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: ./scripts/refresh-compiler.sh --prove-fixpoint
         env:
           GH_TOKEN: ${{ github.token }}
 
-      # The seed-size RATCHET, HERE and not earlier: the step above just proved the
-      # fixpoint, so `build/vl-compiler.wasm` is the artifact that ships and its byte
-      # count is the compiler's own codegen of itself. One rung short (a plain refresh
-      # off a stale seed) measures the PREVIOUS compiler's output instead, which is why
-      # this reading — taken right after the ladder — is the deciding one. Growth past
-      # the bar fails; shrinkage and small growth just print. See scripts/seed-size.vl.
+  # ---------------------------------------------------------------------------
+  # ci-native — the native-binary suites (env-gated, they drive `vl` against the seed),
+  # discovered by convention: `selfhost_native_*` and `vl_*`, so a new native test is
+  # picked up by naming alone. `scripts/ci-shard.sh` splits that population across the
+  # matrix by measured weight and `tests/ci_shard_test.ts` holds the split to a partition.
+  # Files another step names (the release-profile and cost lists) run there instead.
+  # ---------------------------------------------------------------------------
+  ci-native:
+    needs: seed
+    if: needs.seed.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Cache Deno modules
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh --fuel
+
+      # `--parallel` fans the test FILES across the cores (one worker process each); every
+      # case spawns its own `vl` subprocess, so cases are isolated regardless of schedule.
+      - name: Native binary suites (corpus alignment, build -O, vl CLI)
+        run: |
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
+          [ -n "$files" ] || { echo "native shard ${{ matrix.shard }} of 5 is empty" >&2; exit 1; }
+          # shellcheck disable=SC2086  # one argument per file
+          deno test -A --no-check --parallel $files
+        env:
+          SELFHOST_NATIVE_ALIGN: "1"
+
+  # ---------------------------------------------------------------------------
+  # checks — everything on the proven seed that is not a native suite: the ratchets, the
+  # capability probes, the self-lint, the corpus oracle and the seed-backed editor suites.
+  # ---------------------------------------------------------------------------
+  checks:
+    needs: seed
+    if: needs.seed.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Cache Deno modules
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh
+
+      # Dogfood: `vl` lints + fmt-checks its own source (`compiler/*.vl` + driver + `std/`),
+      # gated at `info`, and holds the comment, kind-ladder and sentinel-index ratchets over
+      # the one compiler-graph lint it makes (`vl check --budget --findings`). STARTED in the
+      # background so it overlaps the steps below; "Self-lint (result)" collects it.
       #
-      # WRITTEN IN VL — the first orchestrator script the language runs on itself, so the
-      # ratchet is now compiled by the very seed it measures. That is why it runs here and
-      # not in the `ci` job: this one has the built binary and the proven fixpoint.
-      - name: Seed size (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: scripts/vl-host/target/release/vl run scripts/seed-size.vl --compiler build/vl-compiler.wasm -- --check
-
-      # The Python ratchet, also written in VL: tracked .py files and lines only fall.
-      # See docs/internals/python-removal.md.
-      - name: Python budget (ratchet)
-        run: scripts/vl-host/target/release/vl run scripts/py-budget.vl -- --check
-
-      # The capability probes' behavioural half, on the proven seed: every witness-backed
-      # refusal still refuses with its literal, and no probe traps the compiler, emits a
-      # module that does not validate, or runs to the wrong answer (D2301). ~5 s. Graded by
-      # `scripts/capability-probes.vl`, the VL port of `run.py`.
-      - name: Capability probes (live sites + clause-1 floor)
-        if: steps.docs_check.outputs.docs_only != 'true'
+      # `set +e` FIRST: the step shell is `bash -e` and a subshell inherits errexit, so a
+      # FAILING lint would abort at `timeout` and never write its rc. A leftover rc would
+      # make the result step exit 0 on a lint that never ran, hence the `rm`.
+      - name: Self-lint (start, concurrent with the steps below)
         run: |
-          scripts/vl-host/target/release/vl run scripts/capability-probes.vl --compiler build/vl-compiler.wasm -- --live-sites --compiler build/vl-compiler.wasm
-          scripts/vl-host/target/release/vl run scripts/capability-probes.vl --compiler build/vl-compiler.wasm -- --floor --compiler build/vl-compiler.wasm
-
-      # The generated-code cost RATCHET, on the proven seed: guest fuel and peak RSS of
-      # one `-O` build of each of two plumb-shaped units. Fuel is a count and the same on this
-      # runner as on any box, so it is graded here; CPU is not (another machine, shared cores).
-      # No binaryen in this job, so `-O`'s wasm-opt step is skipped; the wrapper still reads
-      # the rung input's two exact facts. `--require-fuel` because this job builds the host.
-      # The tool reads each build's rusage through GNU time, which it refuses to run without.
-      - name: Plumb-shape cost (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: |
-          test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
-          scripts/vl-host/target/release/vl run scripts/plumb-shape-cost.vl --compiler build/vl-compiler.wasm -- --check --require-fuel
-
-      # The prefer-interpolation RATCHET, also here because it needs the seed: the lint
-      # holds its own budget, walking the baseline's targets (compiler/, std/, scripts/)
-      # in one process. The standing chains are held, as lint-self.sh's `info` gate holds
-      # them; a file whose count rises fails. `--budget-why` names what moved.
-      - name: Interpolation budget (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: scripts/vl-host/target/release/vl check --budget scripts/interp-budget-baseline.json --compiler build/vl-compiler.wasm
-
-      # The comment-budget RATCHET, beside the self-lint whose `info` gate holds
-      # the two comment codes out while `scripts/comment-budget-baseline.json` is
-      # non-zero. Per-file counts may only fall; the lint holds it (`vl check --budget`).
-      - name: Comment budget (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: scripts/vl-host/target/release/vl check --budget scripts/comment-budget-baseline.json --compiler build/vl-compiler.wasm
-
-      # The kind-ladder RATCHET, same shape: a ladder over a closed kind set is exhaustive
-      # over it or its default names what it excludes. The sets step re-derives the lint's
-      # copy of every closed set from its `export type` and fails on drift.
-      - name: Kind-ladder budget (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: |
-          scripts/vl-host/target/release/vl check --budget scripts/ladder-budget-baseline.json --compiler build/vl-compiler.wasm
-          scripts/vl-host/target/release/vl run scripts/ladder-sets.vl --compiler build/vl-compiler.wasm
-
-      # The sentinel-index RATCHET rides lint-self.sh (`vl check --budget ... --findings`
-      # over the graph run it already makes), so it has no step of its own.
-
-      # The dead-export RATCHET, same shape. `unused-function` exempts an exported
-      # declaration by design ("public surface"), which for a tree whose only consumer
-      # is itself is a blind spot the size of the export list — 19 exports sat in it.
-      # This baseline is at ZERO, so any export the tree stops referencing fails here.
-      # scripts/dead-exports.vl writes the report, `vl check --budget --findings` counts it.
-      - name: Dead-export budget (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: |
-          scripts/vl-host/target/release/vl run scripts/dead-exports.vl --compiler build/vl-compiler.wasm -- --out "$RUNNER_TEMP/dead-exports.json"
-          scripts/vl-host/target/release/vl check --budget scripts/export-budget-baseline.json --findings "$RUNNER_TEMP/dead-exports.json" --compiler build/vl-compiler.wasm
-
-      # The render-parse RATCHET, same shape: `tyToEmitName(` calls and the ten
-      # type-string parsers in the emitter may only fall, so a rep is decided from the
-      # checked type rather than a rendered spelling parsed back.
-      # scripts/render-parse-census.vl writes the report, `vl check --budget --findings` counts it.
-      - name: Render-parse budget (ratchet)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: |
-          scripts/vl-host/target/release/vl run scripts/render-parse-census.vl --compiler build/vl-compiler.wasm -- --out "$RUNNER_TEMP/render-parse.json"
-          scripts/vl-host/target/release/vl check --budget scripts/render-parse-budget-baseline.json --findings "$RUNNER_TEMP/render-parse.json" --compiler build/vl-compiler.wasm
-
-      # Dogfood: `vl` lints + fmt-checks its own source (`compiler/*.vl` + driver
-      # + `std/`), gated at `info` (prefer-const / unused / warnings / errors all
-      # fail). STARTED here, in the background, so it overlaps the deno-driven
-      # native suites below (they only read the same binary + seed; nothing
-      # writes either until the embedded-seed step, which is fenced behind the
-      # result step). The exit code + log are collected by "Self-lint (result)".
-      - name: Self-lint (start, concurrent with the native suites)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: |
-          # Fully detached (stdio closed off the step's pipes), so the step
-          # returns immediately instead of the runner waiting on the held pipe.
-          # `timeout` is belt-and-suspenders: a hang (should not happen now the
-          # .cwasm sidecar publishes atomically, but the poll below is unbounded)
-          # exits 124 into the .rc, so "Self-lint (result)" fails FAST with the log
-          # instead of the whole job stalling until the workflow-level limit.
-          #
-          # `set +e` FIRST, and it is the whole reason this reports anything useful.
-          # The step shell is `bash -e`, and a subshell INHERITS errexit — so on the
-          # one outcome this harness exists to report, a FAILING lint, the subshell
-          # aborted at the non-zero `timeout` and never reached the `echo`. The result
-          # step then polled a file that would never appear and blamed a "died without
-          # writing its rc" it had itself caused, burning the full 450s poll and hiding
-          # the diagnostics in an uncollected log. A real `prefer-const` finding was
-          # reported this way as an infrastructure hang.
-          # A LEFTOVER rc would make the result step break out of its poll on the first
-          # iteration and exit 0 — a green lint that never ran. Inert on a fresh
-          # ubuntu-latest VM; not inert on a self-hosted runner.
           rm -f /tmp/lint-self.rc /tmp/lint-self.log
           ( set +e
             timeout 420 ./scripts/lint-self.sh > /tmp/lint-self.log 2>&1
             echo $? > /tmp/lint-self.rc ) < /dev/null > /dev/null 2>&1 &
 
-      # Fuzzing is NOT part of CI (2026-07-22): the pinned-seed rep-fuzz check is
-      # deterministic (16 frozen seeds -> identical programs every run), so re-running it
-      # per PR only re-proved facts that don't change between commits — every finding it
-      # ever caught is entombed as a tests/cases/ regression (the standing rule), which the
-      # suites below execute. Exploratory fuzzing runs LOCALLY (scripts/fuzz-sweep.sh fans
-      # fresh seeds across all cores; scripts/rep-fuzz-check.sh remains in the local
-      # pre-push gate), and each new finding is fixed + pinned as a test, not re-fuzzed.
+      # The seed-size RATCHET, on the proven fixpoint (the artifact that ships), so its byte
+      # count is the compiler's own codegen of itself. Growth past the bar fails.
+      - name: Seed size (ratchet)
+        run: scripts/vl-host/target/release/vl run scripts/seed-size.vl --compiler build/vl-compiler.wasm -- --check
 
-      # The native-binary suites (env-gated, drive `vl` against the seed) are
-      # discovered by convention — `selfhost_native_*` (corpus alignment / -O /
-      # conversion / diag positions) and `vl_*` (the `vl` CLI: check, fmt, …) — so
-      # a new native test is picked up by naming alone, no edit here.
-      # `--parallel` fans the test FILES across the cores (one worker process
-      # each); every case spawns its own `vl` subprocess, so cases are isolated
-      # regardless of schedule.
-      - name: Native binary suites (corpus alignment, build -O, vl CLI)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: deno test -A --no-check --parallel tests/selfhost_native_*_test.ts tests/vl_*_test.ts
-        env:
-          SELFHOST_NATIVE_ALIGN: "1"
+      # The Python ratchet: tracked .py files and lines only fall.
+      - name: Python budget (ratchet)
+        run: scripts/vl-host/target/release/vl run scripts/py-budget.vl -- --check
 
-      # The corpus oracle on the wasm compiler: the full directive corpus
-      # adjudicated by the refreshed seed under Deno. Explicit here because only
-      # this job has a seed — in the `ci` job's `deno task test` the shards
-      # self-ignore (no build/vl-compiler.wasm).
-      #
-      # FOUR FILES, not one, and `--parallel` for the same reason the native step
-      # has it: deno gives one worker per FILE, so the single file this used to be
-      # ran the whole corpus on ONE core — 44 s of the job (2026-09-03 survey,
-      # docs/internals/perf-opportunities-2026-09.md §A4). The shards are listed
-      # rather than globbed so `tests/ci_seed_coverage_test.ts` can hold this step
-      # to naming every one of them.
+      # The capability probes' behavioural half: every witness-backed refusal still refuses
+      # with its literal, and no probe traps the compiler, emits a module that does not
+      # validate, or runs to the wrong answer (D2301).
+      - name: Capability probes (live sites + clause-1 floor)
+        run: |
+          scripts/vl-host/target/release/vl run scripts/capability-probes.vl --compiler build/vl-compiler.wasm -- --live-sites --compiler build/vl-compiler.wasm
+          scripts/vl-host/target/release/vl run scripts/capability-probes.vl --compiler build/vl-compiler.wasm -- --floor --compiler build/vl-compiler.wasm
+
+      # The prefer-interpolation RATCHET walks compiler/, std/ and scripts/ — a population
+      # wider than the self-lint's compiler graph, so it keeps its own walk.
+      - name: Interpolation budget (ratchet)
+        run: scripts/vl-host/target/release/vl check --budget scripts/interp-budget-baseline.json --compiler build/vl-compiler.wasm
+
+      # The kind-ladder ratchet itself rides the self-lint; this re-derives the lint's copy
+      # of every closed set from the `export type` that declares it and fails on drift.
+      - name: Kind-ladder sets
+        run: scripts/vl-host/target/release/vl run scripts/ladder-sets.vl --compiler build/vl-compiler.wasm
+
+      # The dead-export RATCHET: `unused-function` exempts an exported declaration, which
+      # for a tree whose only consumer is itself is a blind spot. Baseline at zero.
+      - name: Dead-export budget (ratchet)
+        run: |
+          scripts/vl-host/target/release/vl run scripts/dead-exports.vl --compiler build/vl-compiler.wasm -- --out "$RUNNER_TEMP/dead-exports.json"
+          scripts/vl-host/target/release/vl check --budget scripts/export-budget-baseline.json --findings "$RUNNER_TEMP/dead-exports.json" --compiler build/vl-compiler.wasm
+
+      # The render-parse RATCHET: `tyToEmitName(` calls and the type-string parsers in the
+      # emitter may only fall, so a rep is decided from the checked type.
+      - name: Render-parse budget (ratchet)
+        run: |
+          scripts/vl-host/target/release/vl run scripts/render-parse-census.vl --compiler build/vl-compiler.wasm -- --out "$RUNNER_TEMP/render-parse.json"
+          scripts/vl-host/target/release/vl check --budget scripts/render-parse-budget-baseline.json --findings "$RUNNER_TEMP/render-parse.json" --compiler build/vl-compiler.wasm
+
+      # The corpus oracle on the wasm compiler: the full directive corpus adjudicated by the
+      # proven seed under Deno. Four files so `--parallel` spreads it over the cores; listed
+      # rather than globbed so tests/ci_seed_coverage_test.ts can hold this step to naming
+      # every shard.
       - name: Corpus oracle on the wasm compiler
-        if: steps.docs_check.outputs.docs_only != 'true'
         run: >-
           deno test -A --parallel
           tests/cases_wasm_0_test.ts
@@ -437,18 +393,13 @@ jobs:
           tests/cases_wasm_2_test.ts
           tests/cases_wasm_3_test.ts
 
-      # The seed-backed LSP / playground editor-feature suites (semantic tokens,
-      # hover, inlay hints, completion, the wasm-checker driver, cross-file
-      # go-to-def / references, member completion, unused-export hints). Like
-      # cases_wasm, they gate on build/vl-compiler.wasm and self-ignore in the
-      # `ci` job (no seed); only THIS job has the refreshed seed, so they're run
-      # explicitly here — otherwise they'd execute nowhere in CI. The set is
-      # enforced complete by tests/ci_seed_coverage_test.ts (a seed-backed test
-      # added without wiring it in here fails that guard, in the `ci` job).
+      # The seed-backed LSP / playground editor-feature suites. They gate on
+      # build/vl-compiler.wasm and self-ignore in the `ci` job (no seed), so they run
+      # explicitly here. tests/ci_seed_coverage_test.ts enforces the set complete, and
+      # scripts/gate.sh extracts this list by the step's NAME.
       - name: Editor features on the wasm compiler
-        if: steps.docs_check.outputs.docs_only != 'true'
         run: >-
-          deno test -A --no-check
+          deno test -A --no-check --parallel
           tests/lsp_semantic_tokens_test.ts
           tests/lsp_inlay_hint_test.ts
           tests/lsp_undisplayable_type_test.ts
@@ -485,28 +436,16 @@ jobs:
           tests/playground_trap_frames_test.ts
           tests/playground_import_actions_test.ts
 
-      # Collect the backgrounded self-lint: wait for its rc file, replay the full
-      # log, and fail the job on any lint/fmt finding. LAST step in the job — no
-      # later step may touch `target/release/vl`, because lint must not race an
-      # in-place binary rewrite. (That fence is why the embedded-seed build, which
-      # rewrites it, is a separate job now; see `ci-embed-seed`.)
+      # Collect the backgrounded self-lint. Bounded poll: the subshell wraps lint-self.sh
+      # in `timeout 420`, so 450 s is a margin over that and a dead subshell fails fast.
       - name: Self-lint (result)
-        if: steps.docs_check.outputs.docs_only != 'true'
         run: |
-          # Bounded poll: the backgrounded step wraps lint-self.sh in `timeout
-          # 420`, so 450s is a safety margin over that. Without a bound, a dead
-          # detached subshell (one that never reaches its own `echo $? >
-          # /tmp/lint-self.rc`) would spin here until the job-level timeout
-          # instead of failing fast with a clear cause.
           for _ in $(seq 1 450); do
             [ -f /tmp/lint-self.rc ] && break
             sleep 1
           done
           if [ ! -f /tmp/lint-self.rc ]; then
-            echo "self-lint result never arrived after 450s. The subshell wraps" >&2
-            echo "lint-self.sh in 'timeout 420' and runs under 'set +e', so a" >&2
-            echo "failing OR hanging lint still writes its rc — reaching here" >&2
-            echo "means the subshell itself was killed. Partial log, if any:" >&2
+            echo "self-lint result never arrived after 450s; the subshell itself was killed." >&2
             cat /tmp/lint-self.log >&2 || true
             exit 1
           fi
@@ -514,61 +453,34 @@ jobs:
           exit "$(cat /tmp/lint-self.rc)"
 
   # ---------------------------------------------------------------------------
-  # ci-release-shape — the eight binaryen-backed suites (the `vl build -O3`
-  # opt / allocation-melt / loop-shape / bench-shape rows, the
-  # buffer-view-bounds table + P1.4 contract, and the wasm-merge extern link), which run in NO CI job today:
-  # `ci` installs node deps but builds no seed, and `ci-native` builds the seed
-  # but never runs `npm ci`, so both jobs' `exists(wasm-opt)` gate is false and
-  # every one of these files self-ignores everywhere (measured locally at ~153
-  # CPU-seconds; docs/internals/test-timing-2026-09.md §4a). A SEPARATE,
-  # PARALLEL job — not folded into `ci-native` — so this coverage adds no wall
-  # time to either existing job's critical path.
-  #
-  # No `needs:` on `ci-native`: this job obtains the vl-host binary and the seed
-  # the same way `ci-native` does (cache first, build/self-compile on a miss),
-  # by reusing its "Cache vl-host binary" / "Cache cargo + vl-host target" /
-  # "Build vl-host" / "Cache seed compiler wasm" / "Refresh seed + native
-  # fixpoint" steps verbatim, rather than waiting on that job to publish either
-  # cache entry.
-  #
-  # The view-bounds half of the suite gates on a SECOND tool, `wasm-tools`
-  # (spec-grade WAT printer) — not an npm package, so `npm ci` alone is not
-  # enough; a dev box gets it from `cargo install wasm-tools`, so it is
-  # installed here from a prebuilt release binary (seconds, cached by version,
-  # vs. minutes to compile from source).
-  #
-  # The explicit file list is what lets tests/ci_seed_coverage_test.ts see this
-  # job's coverage; keep it in sync with that test's expectations if the ten
-  # files are ever renamed.
+  # ci-release-shape — the binaryen-backed suites (`vl build -O3` opt / allocation-melt /
+  # loop-shape / bench-shape rows, the buffer-view-bounds table + contract, the wasm-merge
+  # extern link), which need `npm ci` (binaryen) and `wasm-tools`. Every gate in these files
+  # is positive (seed, binary, binaryen), so the files that also match the native globs run
+  # HERE only: this job is a strict superset of what the native shards would run of them.
+  # The SUITES list is what tests/ci_seed_coverage_test.ts and scripts/ci-shard.sh read.
   # ---------------------------------------------------------------------------
   ci-release-shape:
+    needs: seed
+    if: needs.seed.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Detect docs-only change
-        id: docs_check
-        uses: ./.github/actions/docs-only
 
       - uses: denoland/setup-deno@v2
-        if: steps.docs_check.outputs.docs_only != 'true'
         with:
           deno-version: v2.x
 
-      # binaryen (wasm-opt/wasm-dis) is what this job exists to gate IN — `cache:
-      # npm` is actions/setup-node's own actions/cache wrapper keyed on
-      # package-lock.json, so the install is seconds after the first run
-      # (mirrors the `ci` job's own step).
       - uses: actions/setup-node@v5
-        if: steps.docs_check.outputs.docs_only != 'true'
         with:
           node-version: 22
           cache: npm
 
       - name: Cache Deno modules
-        if: steps.docs_check.outputs.docs_only != 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/deno
@@ -577,14 +489,11 @@ jobs:
             deno-${{ runner.os }}-
 
       - name: Install node deps
-        if: steps.docs_check.outputs.docs_only != 'true'
         run: npm ci
 
-      # The buffer-view-bounds suite's second gate. A prebuilt release tarball
-      # rather than `cargo install wasm-tools` (source build, minutes not
-      # seconds); cached on its pinned version so a repeat run costs nothing.
+      # The buffer-view-bounds suite's second gate: a prebuilt release tarball, cached on
+      # its pinned version.
       - name: Cache wasm-tools
-        if: steps.docs_check.outputs.docs_only != 'true'
         id: wasmtools
         uses: actions/cache@v5
         with:
@@ -592,13 +501,11 @@ jobs:
           key: wasm-tools-${{ runner.os }}-1.258.0
 
       - name: Install wasm-tools
-        if: steps.docs_check.outputs.docs_only != 'true' && steps.wasmtools.outputs.cache-hit != 'true'
+        if: steps.wasmtools.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.local/bin
           asset="wasm-tools-1.258.0-x86_64-linux.tar.gz"
           work="$(mktemp -d)"
-          # Prefer gh (honors auth / rate limits); fall back to curl against the
-          # public release CDN — same fallthrough scripts/fetch-seed.sh uses.
           if ! gh release download v1.258.0 --repo bytecodealliance/wasm-tools \
                  --pattern "$asset" --dir "$work" --clobber 2>/dev/null; then
             curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v1.258.0/$asset" -o "$work/$asset"
@@ -610,83 +517,121 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Add ~/.local/bin to PATH
-        if: steps.docs_check.outputs.docs_only != 'true'
         run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # --- everything below to the suite step is copied verbatim from
-      # ci-native's own seed-acquisition steps, so a cache hit there is a cache
-      # hit here too and neither job ever waits on the other. ---
-
-      - name: Rustc version (cargo cache key)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        id: rustc
-        run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
-
-      - name: Cache vl-host binary
-        if: steps.docs_check.outputs.docs_only != 'true'
-        id: vlbin
-        uses: actions/cache@v5
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
         with:
           path: scripts/vl-host/target/release/vl
-          key: vl-bin-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml', 'scripts/vl-host/build.rs', 'scripts/vl-host/src/**') }}
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
 
-      - name: Cache cargo + vl-host target
-        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            scripts/vl-host/target
-          key: cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-${{ hashFiles('scripts/vl-host/Cargo.lock', 'scripts/vl-host/Cargo.toml') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ steps.rustc.outputs.v }}-
-            cargo-${{ runner.os }}-
-
-      - name: Build vl-host (native tool)
-        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
-        run: cargo build --release
-        working-directory: scripts/vl-host
-
-      - name: Cache seed compiler wasm
-        if: steps.docs_check.outputs.docs_only != 'true'
-        uses: actions/cache@v5
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
         with:
           path: |
             build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
             build/vl-compiler.wasm.*.cwasm
-          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
-          restore-keys: |
-            vl-seedpair-${{ runner.os }}-
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
 
-      - name: Refresh seed + native fixpoint (self-reproduction ladder)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: ./scripts/refresh-compiler.sh --prove-fixpoint
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh
 
-      # The fourteen files themselves — kept EXPLICIT (not a glob) so
-      # tests/ci_seed_coverage_test.ts can see every one of them named in
-      # ci.yml, the same discipline the "Editor features" step already follows.
       - name: Release-profile suites (-O3 / wasm-opt / wasm-dis / wasm-tools shape)
-        if: steps.docs_check.outputs.docs_only != 'true'
-        run: >-
-          deno test -A --no-check --parallel
-          tests/selfhost_native_opt_test.ts
-          tests/selfhost_native_release_test.ts
-          tests/selfhost_native_release_loops_test.ts
-          tests/selfhost_native_release_melt_test.ts
-          tests/selfhost_native_release_shape_test.ts
-          tests/selfhost_native_release_leaf_test.ts
-          tests/selfhost_native_release_runonce_test.ts
-          tests/selfhost_native_release_escape_test.ts
-          tests/vl_buffer_view_bounds_contract_test.ts
-          tests/vl_buffer_view_bounds_shape_test.ts
-          tests/vl_extern_link_test.ts
-          tests/vl_extern_global_test.ts
-          tests/vl_deep_else_chain_test.ts
-          tests/vl_getter_body_shape_test.ts
-          tests/vl_closure_lift_shape_test.ts
+        run: |
+          files=$(bash scripts/ci-shard.sh release ${{ matrix.shard }} 4)
+          [ -n "$files" ] || { echo "release shard ${{ matrix.shard }} of 4 is empty" >&2; exit 1; }
+          # shellcheck disable=SC2086  # one argument per file
+          deno test -A --no-check --parallel $files
+        env:
+          SELFHOST_NATIVE_ALIGN: "1"
+          # The release set: scripts/ci-shard.sh reads this list, and the native shards skip it.
+          SUITES: >-
+            tests/selfhost_native_opt_test.ts
+            tests/selfhost_native_release_test.ts
+            tests/selfhost_native_release_loops_test.ts
+            tests/selfhost_native_release_melt_test.ts
+            tests/selfhost_native_release_shape_test.ts
+            tests/selfhost_native_release_leaf_test.ts
+            tests/selfhost_native_release_runonce_test.ts
+            tests/selfhost_native_release_escape_test.ts
+            tests/vl_buffer_view_bounds_contract_test.ts
+            tests/vl_buffer_view_bounds_shape_test.ts
+            tests/vl_extern_link_test.ts
+            tests/vl_extern_global_test.ts
+            tests/vl_deep_else_chain_test.ts
+            tests/vl_getter_body_shape_test.ts
+            tests/vl_closure_lift_shape_test.ts
+
+  # ---------------------------------------------------------------------------
+  # ci-cost — the generated-code and compile-shape COST ratchets, on master pushes and
+  # nightly rather than per PR. Both grade guest FUEL, a count no runner can move, so they
+  # are not flaky; they are scheduled because a cost regression is a price to name, not a
+  # correctness failure, and these two were a fifth of the native suites' CPU. `scripts/gate.sh`
+  # still runs both on every local gate.
+  # ---------------------------------------------------------------------------
+  ci-cost:
+    needs: seed
+    if: github.event_name != 'pull_request' && needs.seed.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Cache Deno modules
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
+      # stays as the net for a runner that refuses the pinned level, where every test worker
+      # would otherwise JIT the seed at once.
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh --fuel
+
+      # Guest fuel and peak RSS of one `-O` build of each of two plumb-shaped units. No
+      # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's
+      # rusage through GNU time, which it refuses to run without.
+      - name: Plumb-shape cost (ratchet)
+        run: |
+          test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
+          scripts/vl-host/target/release/vl run scripts/plumb-shape-cost.vl --compiler build/vl-compiler.wasm -- --check --require-fuel
+
+      # Same-work-different-shape program pairs graded on the ratio of their guest fuel.
+      - name: Cost ratchets (scaling shape)
+        run: deno test -A --no-check tests/vl_scaling_shape_test.ts
         env:
           SELFHOST_NATIVE_ALIGN: "1"
 
@@ -695,7 +640,7 @@ jobs:
   # push instead of only at release time.
   #
   # A SEPARATE, PARALLEL job because it is the only remaining cargo consumer and
-  # it shares nothing with `ci-native`'s suites. Measured 2026-07-29 over the last
+  # it shares nothing with the native suites. Measured 2026-07-29 over the last
   # 30 full master-push runs it cost that job 15 s of `cargo build` PLUS the 17 s
   # ~1.2 GB target-dir restore it was the only reason to pay — 32 s of a 89 s
   # median critical path, for work nothing downstream consumes. Out here it runs
@@ -706,12 +651,12 @@ jobs:
   # fallback), and its Cranelift compilation cache materializes so a shipped `vl`
   # does not re-JIT the seed every invocation.
   #
-  # The seed it embeds comes from the same rolling cache `ci-native` uses, else
-  # `scripts/fetch-seed.sh`. It deliberately does NOT wait for `ci-native`'s
+  # The seed it embeds comes from the same rolling cache the `seed` job writes, else
+  # `scripts/fetch-seed.sh`. It deliberately does NOT wait for the `seed` job's
   # freshly refreshed seed: every assertion here is about the DISTRIBUTION
   # MECHANISM (build.rs staging, the embedded fallback, the cache key), and any
   # healthy seed exercises all of it. The seed's own correctness is proven in
-  # `ci-native` by the fixpoint ladder, which is where that gate belongs.
+  # the `seed` job by the fixpoint ladder, which is where that gate belongs.
   # ---------------------------------------------------------------------------
   ci-embed-seed:
     runs-on: ubuntu-latest
@@ -729,10 +674,10 @@ jobs:
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
-      # RESTORE-ONLY, on `ci-native`'s key. This job's target dir holds
+      # RESTORE-ONLY, on the `seed` job's key. This job's target dir holds
       # `--features embed-seed` artifacts, and writing those under the shared key
-      # would hand `ci-native` a target dir whose `release/vl` is the embed-seed
-      # binary. `ci-native` is the writer: any input that busts this key (rustc,
+      # would hand `seed` a target dir whose `release/vl` is the embed-seed
+      # binary. `seed` is the writer: any input that busts this key (rustc,
       # Cargo.lock, Cargo.toml) also busts its `vl-bin` key, so it always misses,
       # restores, builds and saves. One cold wasmtime build after a toolchain bump
       # is the same cost as before the split.
@@ -751,7 +696,7 @@ jobs:
 
       # Also RESTORE-ONLY: any healthy seed will do here (see the job header), so
       # a restore-keys hit is a full hit and the fetch below covers a cold cache —
-      # while `ci-native` stays the sole writer of the seed pair, which is what
+      # while `seed` stays the sole writer of the seed pair, which is what
       # keeps the `.cwasm` sidecars riding along with the wasm they were built from.
       - name: Restore seed compiler wasm
         if: steps.docs_check.outputs.docs_only != 'true'
@@ -759,10 +704,11 @@ jobs:
         with:
           path: |
             build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
             build/vl-compiler.wasm.*.cwasm
-          key: vl-seedpair-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
+          key: vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
           restore-keys: |
-            vl-seedpair-${{ runner.os }}-
+            vl-seed4-${{ runner.os }}-
 
       # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
       - name: Ensure a seed to embed

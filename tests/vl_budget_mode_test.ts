@@ -4,12 +4,15 @@
 // is its gate row and `--write-baseline` its writer, in the layout the retired
 // scripts/ratchet.py wrote (architecture-refactor-plan T2). This holds the three verbs to one answer:
 //
-//   1. On the real tree, a fresh write must pass its own `--budget` with the ok line,
-//      `--budget-why` must find every entry where the write put it, and a second write
-//      over the first must be byte-identical (the layout is a fixed point).
+//   1. A fresh write must pass its own `--budget` with the ok line, `--budget-why` must
+//      find every entry where the write put it, and a second write over the first must be
+//      byte-identical (the layout is a fixed point).
 //   2. On a doctored copy (one file's count lowered, one entry dropped, one invented),
-//      over a narrowed population, `--budget` must red with exactly the doctored file's
-//      line and `--budget-why` must move a name both ways.
+//      `--budget` must red with exactly the doctored file's line and `--budget-why` must
+//      move a name both ways.
+//
+// Every verb runs over a NARROWED population: the verbs do not depend on its size, and the
+// committed baseline over the real tree is ci.yml's "Interpolation budget" step.
 //   3. `--exempt-codes` prints the codes the committed baseline still owes.
 //
 // @test-timing native
@@ -60,10 +63,10 @@ Deno.test({
   async fn() {
     const dir = await Deno.makeTempDir({ prefix: "vl_budget_mode_" });
     try {
-      // 1. The real tree.
+      // 1. A fresh write.
       const full = `${dir}/full.json`;
       await Deno.copyFile(BASELINE, full);
-      const w = await vl(["--budget", full, "--write-baseline"]);
+      const w = await vl(["--budget", full, "--write-baseline", ...NARROW]);
       if (w.code !== 0) {
         throw new Error(`--write-baseline: ${w.code}\n${w.out}${w.err}`);
       }
@@ -90,10 +93,10 @@ Deno.test({
         text.split('\n["').length,
       );
       const [check, why, again] = await Promise.all([
-        vl(["--budget", full]),
-        vl(["--budget-why", full]),
+        vl(["--budget", full, ...NARROW]),
+        vl(["--budget-why", full, ...NARROW]),
         Deno.copyFile(full, `${dir}/again.json`).then(() =>
-          vl(["--budget", `${dir}/again.json`, "--write-baseline"])
+          vl(["--budget", `${dir}/again.json`, "--write-baseline", ...NARROW])
         ),
       ]);
       expectEq("--budget on a fresh write: exit", 0, check.code);
@@ -122,7 +125,7 @@ Deno.test({
         await Deno.readTextFile(`${dir}/again.json`),
       );
 
-      // 2. A doctored baseline over a narrowed population.
+      // 2. A doctored baseline.
       const doc: Baseline = structuredClone(base);
       const was = doc.files[DOCTORED_FILE]?.[CODE] ?? 0;
       if (was < 1) {
@@ -191,9 +194,27 @@ Deno.test({
     try {
       const full = `${dir}/full.json`;
       await Deno.copyFile(path, full);
+      // The hold reads a report at exactly the baseline: the walk is the write's to prove.
+      const atBaseline = `${dir}/at-baseline.json`;
+      await Deno.writeTextFile(
+        atBaseline,
+        JSON.stringify(
+          Object.entries(
+            committed.files as Record<string, Record<string, number>>,
+          )
+            .flatMap(([file, codes]) =>
+              Object.entries(codes).flatMap(([code, n]) =>
+                Array.from(
+                  { length: n },
+                  (_, i) => ({ file, code, line: i + 1, col: 1 }),
+                )
+              )
+            ),
+        ),
+      );
       const [w, check, ex] = await Promise.all([
         vl(["--budget", full, "--write-baseline"]),
-        vl(["--budget", path]),
+        vl(["--budget", path, "--findings", atBaseline]),
         vl(["--budget", path, "--exempt-codes"]),
       ]);
       expectEq("--write-baseline: exit", 0, w.code);

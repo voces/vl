@@ -188,9 +188,13 @@ if [ "$GRAPH_FILES" -lt 2 ]; then
   echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
   exit 1
 fi
-# The sentinel-index ratchet counts the findings this graph run already produced, rather
-# than walking compiler/ a second time (`--findings`, the same `--include-imports` report).
-"$VL" check --budget scripts/sentinel-budget-baseline.json --findings "$WORK/graph.json" || exit $?
+# The comment, kind-ladder and sentinel-index ratchets count the findings this graph run
+# already produced (`--findings`, the same `--include-imports` report), rather than each
+# walking compiler/ again file by file. Their baselines target `compiler/entry.vl`, whose
+# import closure is every compiler/*.vl (tests/budget_targets_test.ts holds that).
+for budget in comment ladder sentinel; do
+  "$VL" check --budget "scripts/$budget-budget-baseline.json" --findings "$WORK/graph.json" || exit $?
+done
 [ "$FMT_RC" = 0 ] || exit "$FMT_RC"
 
 echo "self-lint + fmt-check clean ✅"
