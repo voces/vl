@@ -23,7 +23,10 @@ jobs:
         with:
           # Fetch enough history for `git diff` to compare against the base.
           # On push events base_sha is available; on PRs we need the base ref.
+          # Blobless: the docs-only diff reads trees only, and a blob any later
+          # step asks git for is fetched on demand.
           fetch-depth: 0
+          filter: blob:none
 
       # Docs-only gate — the shared detection (one implementation for both
       # jobs, so they cannot drift) lives in .github/actions/docs-only; heavy
@@ -109,7 +112,7 @@ jobs:
   #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
   #          ├── ci-release-shape (4) the binaryen-backed suites, split by weight
-  #          └── ci-cost              fuel/RSS cost ratchets — master pushes and nightly only
+  #          └── ci-cost (4)          fuel/RSS cost ratchets — master pushes and nightly only
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
   # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
@@ -126,9 +129,12 @@ jobs:
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
     steps:
+      # Blobless full history: the docs-only diff needs the merge-base's TREES, not every
+      # past blob, and the full-blob fetch was 18 s of this job's critical path.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          filter: blob:none
 
       - name: Detect docs-only change
         id: docs_check
@@ -205,9 +211,12 @@ jobs:
       # `compile(X, source) == X` byte-equality. An exact cache hit proves out in ONE
       # self-compile; a stale seed climbs two or three rungs. Whatever rung proves out is
       # what the cache entry above saves, so every downstream job runs the proven fixpoint.
+      # The two FUEL sidecars are left to the jobs that meter fuel (`ci-cost`, and a native
+      # shard whose files read `$VL_FUEL`): each is a whole-seed JIT, and warming them here
+      # put both on the critical path of every job.
       - name: Refresh seed + native fixpoint (self-reproduction ladder)
         if: steps.docs_check.outputs.docs_only != 'true'
-        run: ./scripts/refresh-compiler.sh --prove-fixpoint
+        run: ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -261,10 +270,13 @@ jobs:
       # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
       # stays as the net for a runner that refuses the pinned level, where every test worker
       # would otherwise JIT the seed at once.
+      # The fuel tags only for a shard that meters fuel; `seed` warms the rest.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
-          bash scripts/warm-seed.sh --fuel
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
+          # shellcheck disable=SC2086  # one argument per file
+          if grep -q VL_FUEL $files; then bash scripts/warm-seed.sh --fuel; else bash scripts/warm-seed.sh; fi
 
       # `--parallel` fans the test FILES across the cores (one worker process each); every
       # case spawns its own `vl` subprocess, so cases are isolated regardless of schedule.
@@ -575,12 +587,18 @@ jobs:
   # nightly rather than per PR. Both grade guest FUEL, a count no runner can move, so they
   # are not flaky; they are scheduled because a cost regression is a price to name, not a
   # correctness failure, and these two were a fifth of the native suites' CPU. `scripts/gate.sh`
-  # still runs both on every local gate.
+  # still runs both on every local gate. Split four ways so the slowest part, not their sum,
+  # follows `seed`: plumb-shape alone, and the scaling-shape file in thirds
+  # (`$VL_SCALING_SHARD`), each pair still graded whole inside one job.
   # ---------------------------------------------------------------------------
   ci-cost:
     needs: seed
     if: github.event_name != 'pull_request' && needs.seed.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [plumb, "1", "2", "3"]
     steps:
       - uses: actions/checkout@v5
 
@@ -625,15 +643,18 @@ jobs:
       # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's
       # rusage through GNU time, which it refuses to run without.
       - name: Plumb-shape cost (ratchet)
+        if: matrix.part == 'plumb'
         run: |
           test -x /usr/bin/time || (sudo apt-get update -q && sudo apt-get install -y -q time)
           scripts/vl-host/target/release/vl run scripts/plumb-shape-cost.vl --compiler build/vl-compiler.wasm -- --check --require-fuel
 
       # Same-work-different-shape program pairs graded on the ratio of their guest fuel.
       - name: Cost ratchets (scaling shape)
+        if: matrix.part != 'plumb'
         run: deno test -A --no-check tests/vl_scaling_shape_test.ts
         env:
           SELFHOST_NATIVE_ALIGN: "1"
+          VL_SCALING_SHARD: ${{ matrix.part }}/3
 
   # ---------------------------------------------------------------------------
   # ci-embed-seed — the release DISTRIBUTION build (roadmap H-M2), gated on every
@@ -664,6 +685,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          filter: blob:none
 
       - name: Detect docs-only change
         id: docs_check
