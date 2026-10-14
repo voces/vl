@@ -18,7 +18,7 @@ everything VL does to the module around it.
 | strip `vl-src` | `strip_src`, which calls the compiler's `optStripSrc` | a `--source-map` build's source rows describe the emitter's bytes, which every later step rewrites; it is the only `-O` build whose module carries them |
 | opt cache | `opt_cache_action` | keyed on the stripped bytes, the rung, `--names`, `--low-memory`, `--stable-layout`, the `wasm-opt` identity, the seed's digest and every `VL_*` variable; a hit skips the rest |
 | inline step | `inline::inline_step` (with `flat::flat_step`) | a field holding a small unwritten record stores its fields in the parent; a list of such records holds them side by side; `$VL_OPT_NO_INLINE` skips it |
-| multi-value step | `multivalue::multivalue_step` | a call site that only reads its small record result calls a twin returning the fields; `$VL_OPT_NO_MULTIVALUE` skips it |
+| multi-value step | `multivalue_step`: by `$VL_OPT_MULTIVALUE`, the host's `multivalue::multivalue_rust` or the compiler's `optMultivalue` (`compiler/opt_multivalue.vl`) | a call site that only reads its small record result calls a twin returning the fields; `$VL_OPT_NO_MULTIVALUE` skips it |
 | source-map remap | `remap` closure | a step that moves code rebuilds the map from the rows each moved op carries |
 | escape step | `escape_inline_step`, which calls the compiler's `optEscapeChoose` / `optEscapeRestore` (`compiler/opt_escape.vl`) and runs `wasm-opt` between them | chooses callees whose struct argument never escapes, renames every function `L4c.<i>` / `L4n.<i>`, runs `wasm-opt -g --no-inline=L4n.* --always-inline-max-function-size 100000 --inlining`, restores the names |
 | the rung's argv | `rung_argv`, which calls the compiler's `optRungArgv` (`compiler/opt_scan.vl`) | in order: `--no-inline=<name>` for each hot callee of run-once code (lane L8); `--low-memory-unused` at a `--low-memory-unused` of 1,024 bytes or more; `-g` under `--names`; `OPT_PASSES` (`--always-inline-max-function-size 16 -O`) or `RELEASE_PASSES` (`--closed-world -O3 --gufa -O3`); and `--skip-pass=ssa-nomerge` when a body has more than 8,192 `local.set`/`local.tee` |
@@ -41,7 +41,7 @@ after, on one seed.
 | R2 | the `vl-src` strip and the rung's argv (`compiler/opt_scan.vl`); the default, its Rust deleted | retired (`$VL_OPT_ARGV`) | argv identity, and the stripped bytes with their source map |
 | R3 | the escape choice and its two renames (`compiler/opt_escape.vl`, `compiler/wasm_names.vl`); the default, its Rust deleted | retired (`$VL_OPT_ESCAPE`) | `$VL_OPT_ESCAPE_DUMP` byte-identical |
 | R4 | a module writer: sections, types, bodies (`inline::assemble`, `type_section`, `encode_sub`, `finish_body`) (`compiler/wasm_write.vl`) | `$VL_OPT_ROUNDTRIP` (a check, not a side) | decode then encode is the identity over every module R1 reads |
-| R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) | `$VL_OPT_MULTIVALUE` | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
+| R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) (`compiler/opt_multivalue.vl`); beside the Rust | `$VL_OPT_MULTIVALUE` | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
 | R6 | the inline-record step | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
 | R7 | the list-flattening step | `$VL_OPT_FLAT` | `$VL_OPT_FLAT_DUMP` |
 
@@ -198,7 +198,7 @@ escape-only bounds and prefixes, and the `$VL_OPT_ESCAPE` selector are gone; `es
 now stages the module, calls `optEscapeChoose`, runs `wasm-opt` on its answer and calls
 `optEscapeRestore` on the same instance. A seed without `optEscapeChoose` refuses `-O` by name.
 `rename_functions` stays in the host for one more rung: the multi-value step names each twin
-`<name>.mv` under `--names` through it, so it leaves with R5. `opt-parity.sh` refuses a retired
+`<name>.mv` under `--names` through it, so it leaves when R5's Rust does. `opt-parity.sh` refuses a retired
 selector (`$VL_OPT_RUNG_SCAN`, `$VL_OPT_ARGV`, `$VL_OPT_ESCAPE`) as a side, since the host
 ignores it and both sides would be the same build.
 
@@ -231,7 +231,8 @@ input order, and reports where each body's code begins in the output, which a so
 needs. A value type is one packed `i32`, its heap type's index readable without a lookup. The
 decoder refuses a shared heap type and a descriptor form; the host's writer has neither.
 
-R5 to R7 edit the model between the two calls. A new type goes in its own group at the end,
+R6 and R7 edit the model between the two calls. R5 reads through `wmRead` but writes its
+three sections by appending to the bytes it read, as the host's step does. A new type goes in its own group at the end,
 and a new function at the end of both lists, so no existing index moves and the copied
 sections stay valid. A rewritten body gets new code bytes and `from` 0, and its new locals
 are appended one entry per run of a type, as `finish_body` does. The Rust stays the
@@ -261,3 +262,37 @@ functions this rung does not touch, and the one cause read off the disassembly i
 indices: the writer's record types take indices ahead of the compiler's busiest types, and an
 index past 127 costs a second LEB byte at every use. `$127` becoming `$135` is one such shift.
 
+
+## R5, the multi-value step, beside the Rust
+
+`compiler/opt_multivalue.vl` exports `optMultivalue`, which reads the staged module through
+`wmRead`, finds the record types a producer returns and every call site that only reads the
+record's fields, and writes the module with a twin per producer that returns those fields as
+multi-value. `optMultivalueMoves` hands back each rewritten body's move, which the host's
+source-map remap reads, and `optMultivalueExplain` the `$VL_MV_EXPLAIN` report. The host keeps
+`field_facts`, `scalarized`, the LEB writers, `concrete_index`, `function_names`, `BodyMove`
+and `Num`, and validates the answer as before: a rewrite that does not validate is dropped.
+
+`$VL_OPT_MULTIVALUE` selects the side: unset or `rust` the host's step, `vl` the compiler's,
+`both` the two on one input, failing the build when the module bytes, the body moves, whether
+it rewrites, or the explain lines differ. `opt-parity.sh` also compares the step's own output
+(`$VL_OPT_MV_DUMP`). `VL_OPT_MULTIVALUE=rust` against `vl`, every build `-O` unless noted:
+
+| population | programs | identical | both refused | identical with a mark | identical through the step | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/`, a plumb tail unit and its main, and `compiler/entry.vl` | 15,348 | 10,265 | 5,083 | 3,582 | 1,515 | 0 | 0 |
+| the same, `VL_OPT_NO_INLINE=1` | 15,348 | 10,265 | 5,083 | 3,586 | 1,519 | 0 | 0 |
+| `-O3`: `cells/`, tests/cases/arrays and closures | 2,267 | 1,889 | 378 | 1,257 | 356 | 0 | 0 |
+| tests/cases, `--source-map` | 5,224 | 4,123 | 1,101 | 1,184 | 639 | 0 | 0 |
+| tests/cases, `--names` | 5,224 | 4,123 | 1,101 | 1,184 | 639 | 0 | 0 |
+| tests/cases, `--names --source-map`, `both` against `vl` | 5,224 | 4,123 | 1,101 | 1,184 | 639 | 0 | 0 |
+
+Two controls over tests/cases/closures each differ on 26 of 611: `VL_MV_FAULT=0` against `1`
+on the compiler's side, and `vl` against `VL_OPT_NO_MULTIVALUE=1`.
+`tests/selfhost_native_release_multivalue_test.ts` builds every fixture under `both` and runs
+the fault test on each side.
+
+The seed grew by 2.1%, from 5,364,991 to 5,475,793 bytes, and the self-compile's guest fuel by
+2.75%. The plumb-shape fuel does not move, since it does not meter the optimizer's
+instance. The step itself is slower: on `compiler/entry.vl -O` the host's step takes 365 ms
+and the compiler's 2,134 ms, for the same 4,345,260-byte output.
