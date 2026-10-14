@@ -5,11 +5,12 @@
 // that recursed into the else ran out of stack past ~2,500 links — natively under wasmtime's
 // guest stack, and in the editor under V8's. The passes now loop along the chain's spine.
 //
-// The witnesses are generated at 10,000 links: past every depth the recursive passes fell at
-// (the first at 1,000), and still well inside the gate budget. Each prints three values that
-// only the right arm produces, so a chain that compiled but dispatched wrongly cannot pass. The
-// native if-expression case runs at 5,000: its module's engine compile grows super-linearly in
-// the depth (D2091), and 5,000 is still past where the recursive passes fell.
+// The native half runs the seed on wasmtime's default stack (`VL_SEED_STACK=default`), the stack
+// the recursive passes fell on: the host's own stack is large enough to hide a recursion (D2182),
+// and a control proves the small one is in force by refusing a 1,000-deep `if` NEST there. The
+// `match` and both chains run at 10,000 links, past every depth a recursive pass fell at, and
+// cheap to check because a link no longer walks the chain below it (D4557). Each witness prints
+// three values only the right arm produces, so a chain that dispatched wrongly cannot pass.
 //
 // GATING: the native half is env-gated (`SELFHOST_NATIVE_ALIGN=1`) and needs the binary; both
 // halves need the seed, and register as ignored without it. The br_table-count case ALSO
@@ -61,10 +62,16 @@ const want = (n: number) => ["22", String((n - 1) * 3 + 1), "-1"];
 const PROGRAMS: [string, (n: number) => string, number, number][] = [
   ["match", genMatch, N, N],
   ["else-if statement chain", genElseIf, N, N],
-  ["if-expression chain", genIfExpr, 5_000, N],
+  ["if-expression chain", genIfExpr, N, N],
 ];
 
-const vl = async (args: string[]) => {
+// The same `if` nested rather than chained: the compiler recurses once per level.
+const genNest = (n: number): string =>
+  `function f(a: i32): i32 {\n  let acc = 0\n  ${"if a > 0 { acc = acc + 1; ".repeat(n)}${"} ".repeat(n)}\n  acc\n}\nprint(f(1))\n`;
+
+const SMALL_STACK = { VL_SEED_STACK: "default" };
+
+const vl = async (args: string[], extra: Record<string, string> = {}) => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
     stdout: "piped",
@@ -78,6 +85,7 @@ const vl = async (args: string[]) => {
       VL_WASM_DIS: hostWasmDis(),
       PATH: Deno.env.get("PATH") ?? "",
       ...isaEnv(),
+      ...extra,
       // node cannot start on Windows without it.
       ...(Deno.build.os === "windows" ? { SYSTEMROOT: Deno.env.get("SYSTEMROOT") ?? "" } : {}),
     },
@@ -97,9 +105,9 @@ for (const [name, gen, n] of PROGRAMS) {
       await Deno.writeTextFile(file, src);
       // Three independent processes over one file, run side by side.
       const [chk, run, fmt] = await Promise.all([
-        vl(["check", file, "--compiler", COMPILER]),
-        vl(["run", file, "--compiler", COMPILER]),
-        vl(["fmt", "--check", file, "--compiler", COMPILER]),
+        vl(["check", file, "--compiler", COMPILER], SMALL_STACK),
+        vl(["run", file, "--compiler", COMPILER], SMALL_STACK),
+        vl(["fmt", "--check", file, "--compiler", COMPILER], SMALL_STACK),
       ]);
       if (chk.code !== 0) throw new Error(`vl check: want rc 0, got ${chk.code}\n${chk.err.slice(0, 600)}`);
       const got = run.out.trim().split("\n");
@@ -115,6 +123,21 @@ for (const [name, gen, n] of PROGRAMS) {
     }
   });
 }
+
+// The control: were `VL_SEED_STACK` ignored, the chains above would prove nothing about recursion.
+Deno.test({ name: "deep chain (native): the small stack refuses a 1,000-deep if NEST with exit 70", ignore: !NATIVE }, async () => {
+  const dir = await Deno.makeTempDir({ prefix: "vl-deep-chain-" });
+  try {
+    const file = `${dir}/main.vl`;
+    await Deno.writeTextFile(file, genNest(1_000));
+    const chk = await vl(["check", file, "--compiler", COMPILER], SMALL_STACK);
+    if (chk.code !== 70 || !chk.err.includes("call stack")) {
+      throw new Error(`vl check: want rc 70 and a call-stack report, got ${chk.code}\n${chk.err.slice(0, 600)}`);
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test({
   name: `deep chain (native): the ${N}-arm dense match still lowers to one br_table`,

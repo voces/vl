@@ -707,3 +707,53 @@ Deno.test("anchor: an unsaved buffer's MIRROR still counts as the target", () =>
   );
   eq(at.isTarget, true, "the mirror is the target");
 });
+
+// D4525: `std:test` reports its column in UTF-8 BYTES, and the editor counts UTF-16.
+// The report below is `vl test c.test.vl`'s real output, captured 2026-10-13 (master
+// 1b5b2df86): the matcher `toEqual` sits after `"é€😀"` (2 + 3 + 4 bytes, 1 + 1 + 2
+// UTF-16 units), so the byte column is 5 past the UTF-16 one.
+const WIDE_SRC = [
+  'import { describe, it, expect } from "std:test"',
+  "",
+  'it("u", () => {',
+  '  expect("é€😀").toEqual("x")',
+  "})",
+  'it("a", () => {',
+  '  expect("eE_A").toEqual("x")',
+  "})",
+  "",
+].join("\n");
+const WIDE_REPORT = [
+  "c.test.vl",
+  "  FAIL u",
+  '       expected "é€😀" to equal "x"',
+  "         at c.test.vl:4:23",
+  "  FAIL a",
+  '       expected "eE_A" to equal "x"',
+  "         at c.test.vl:7:18",
+  "1 file · 0 passed · 2 failed",
+  "",
+].join("\n");
+
+Deno.test("anchor: a byte column past non-ASCII text lands on the matcher in UTF-16 (D4525)", () => {
+  const lines = WIDE_SRC.split("\n");
+  const read = (file: string) => file === "/w/c.test.vl" ? WIDE_SRC : undefined;
+  const got = parseTestReport(WIDE_REPORT).results.map((r) =>
+    failureAnchor(r.location!, "/w", "c.test.vl", posixResolve, read)
+  );
+  eq(
+    got.map((a) => [a.line, a.col]),
+    [[3, lines[3].indexOf("toEqual")], [6, lines[6].indexOf("toEqual")]],
+    "each anchor sits on its `toEqual`, the wide line included",
+  );
+  // The ASCII line is the control: both units agree there.
+  eq(got[1].col, 17, "the ASCII control is unchanged");
+  // An unreadable file keeps the byte column rather than dropping the anchor.
+  const blind = failureAnchor(
+    { file: "c.test.vl", line: 4, col: 23 },
+    "/w",
+    "c.test.vl",
+    posixResolve,
+  );
+  eq(blind.col, 22, "no text, the byte column stands");
+});

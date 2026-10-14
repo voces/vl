@@ -38,7 +38,7 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 7 | `lint-self.sh` (`matrix.py`) | done: `scripts/capability-matrix.vl`, `matrix.py` deleted | - |
 | 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` stays, imported by `check-filed-witnesses.py` and `survey-regrade.py` | deleted with those two |
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
-| - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `.py` kept as port-test oracle | delete `plumb-shape-cost.py`, `check-filed-witnesses.py` (+ `inventory/{ls,split,selftest}.py`, `sabotage.py`), `capability-probes/run.py`, `distilled/{regress,index,cellmap,redistil}.py` (+ `gradecensus.py`, `corpuscmp.py`), `survey-regrade.py`, `grade.py`, `profile-rank.py` with their port tests |
+| - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `.py` kept as port-test oracle | delete `plumb-shape-cost.py`, `check-filed-witnesses.py` (+ `inventory/{ls,split,selftest}.py`, `sabotage.py`), `distilled/{regress,index,cellmap,redistil}.py` (+ `gradecensus.py`, `corpuscmp.py`), `survey-regrade.py`, `grade.py`, `profile-rank.py` with their port tests |
 
 Rows 1-5 are done and `ratchet.py` is deleted. `mono-tyaram-grid.sh` carries an inline python
 heredoc and moves with its own PR.
@@ -50,7 +50,7 @@ heredoc and moves with its own PR.
 
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
-| `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | ported: `scripts/capability-probes.vl` is on master; delete with its port test's oracle |
+| `scripts/capability-probes/run.py` | 274 | G | .github/workflows/ci.yml scripts/gate.sh | done: `scripts/capability-probes.vl`; the `.py` is deleted and its port test pins goldens |
 | `scripts/seed_provenance.py` | 223 | I | scripts/check-filed-witnesses.py scripts/survey-regrade.py | ported: `scripts/seed-provenance.vl` is on master; delete with those two |
 | `scripts/silent-sweep/distilled/regress.py` | 177 | G | scripts/lint-self.sh | ported: `scripts/silent-sweep/distilled/regress.vl` is on master; delete with its port test's oracle |
 
@@ -61,9 +61,9 @@ heredoc and moves with its own PR.
 | `scripts/check-filed-witnesses.py` | 712 | T | tests/vl_check_codegen_test.ts tests/vl_check_filed_witnesses_test.ts (+3) | ported: `scripts/check-filed-witnesses.vl` is on master; delete with its port test's oracle |
 | `scripts/codemods/label-at.py` | 322 | T | tests/vl_label_codemod_test.ts | scripts/codemods/label-at.vl |
 | `scripts/day-one/modules.py` | 552 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/modules.vl |
-| `scripts/day-one/sample.py` | 657 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/sample.vl |
-| `scripts/emitter-state-audit.py` | 238 | T | tests/vl_emitter_state_audit_test.ts | scripts/emitter-state-audit.vl |
-| `scripts/goal-scoreboard.py` | 273 | T | tests/vl_invalid_module_position_test.ts tests/vl_live_sites_test.ts | scripts/goal-scoreboard.vl |
+| `scripts/day-one/sample.py` | 657 | T | tests/vl_day_one_sampler_test.ts | scripts/day-one/sample.vl (grades through `capability-probes.vl --grade-channel`, no longer imports `run.py`) |
+| `scripts/emitter-state-audit.py` | 238 | T | tests/vl_emitter_state_audit_test.ts | done: `scripts/emitter-state-audit.vl`, output byte-identical to the Python's (default and `--names`) and now the L7 `emitter state budget` ratchet; the `.py` is deleted |
+| `scripts/goal-scoreboard.py` | 273 | T | tests/vl_invalid_module_position_test.ts tests/vl_live_sites_test.ts | done: `scripts/goal-scoreboard.vl`, pinned by `tests/vl_goal_scoreboard_test.ts`; the `.py` is deleted |
 | `scripts/inventory/ls.py` | 200 | T | tests/vl_inventory_rows_test.ts | scripts/inventory/ls.vl |
 | `scripts/ladder-census.py` | 884 | T | tests/lsp_ratchet_hold_test.ts tests/vl_kind_ladder_test.ts | scripts/ladder-census.vl (shares the budget walk) |
 | `scripts/memo-generation-probe.py` | 403 | T | tests/vl_memo_generation_test.ts | done: `scripts/memo-generation-probe.vl`, rows in `scripts/memo-generation-rows.json`; the `.py` is deleted |

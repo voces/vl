@@ -23061,24 +23061,42 @@ function tyHoldsNumericPrim(t: i32): boolean {
 // Whether every value the `if`, `match` or block at `ix` yields is a literal: a number, a
 // negated or parenthesised one, an operator tree of them, or `null`, and one is not `null`.
 // Such a value adapts to the type beside it in a join.
-function valueIsLitOnly(ix: i32): boolean {
-  if ix < 0 { return false }
-  let adapts = false
+function valueIsLitOnly(ix: i32): boolean { valueLitState(ix) == 1 }
+
+// `valueLitState` per node, kept only while an `else if` chain's tails run, where each link
+// asks about the whole link below it: the memo makes the chain cost one walk (D4557).
+let vloMemoOn = false
+let vloMemo: {[i32]: i32} = Map()
+
+// -1 when a value the `if`, `match` or block at `ix` yields does not adapt, 1 when every one
+// adapts and one is not `null`, 0 when every one is `null` or there is none.
+function valueLitState(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const root = cwPeel(ix)
+  if vloMemoOn && vloMemo.has(root) { return vloMemo.get(root) ?? -1 }
+  let st = 0
   const todo: i32[] = [ix]
-  while todo.length > 0 {
+  while todo.length > 0 && st >= 0 {
     const at = cwPeel(todo.pop() ?? -1)
     if at >= 0 && at < P.nodes.length {
-      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+      if at != root && vloMemoOn && vloMemo.has(at) {
+        const m = vloMemo.get(at) ?? -1
+        if m != 0 { st = m }
+      } else if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
         if !tailPushBlockTail(at, todo) {
           // The first value that does not adapt settles it, so a chain costs one leaf.
-          if !leafIsLit(at, 8) { return false }
-          // A `null` leaf adapts to nothing: an arm of only `null` leaves a sibling apart.
-          if !(P.nodes[parenPeelIx(at)] is NullLit) { adapts = true }
+          if !leafIsLit(at, 8) {
+            st = -1
+          } else if !(P.nodes[parenPeelIx(at)] is NullLit) {
+            // A `null` leaf adapts to nothing: an arm of only `null` leaves a sibling apart.
+            st = 1
+          }
         }
       }
     }
   }
-  adapts
+  if vloMemoOn { vloMemo.set(root, st) }
+  st
 }
 
 // `valueIsLitOnly(ix)` for an arm typed `ty`, asked only where it can decide a join: an arm
@@ -38286,6 +38304,34 @@ function rcwPendJoinOperand(op: i32, j: i32) {
 // The join leaves already refused by `listJoinWidenCheck`, so a leaf of two nested joins is
 // reported once.
 let ljwReported: i32[] = []
+// The joined type `listJoinWidenCheck` last walked each `if`, `match` or block against.
+// Every leaf under such a node is then reported or fits, so a later walk against the same type
+// skips it, and an `else if` chain whose links each join it costs one walk (D4557).
+let ljwWalked: {[i32]: i32} = Map()
+
+// `valueTailSplit` for `listJoinWidenCheck` at `j`: a node below `op` already walked against
+// `j` is left out with its leaves.
+function ljwTailSplit(op: i32, j: i32, spine: i32[], leaves: i32[]) {
+  const root = cwPeel(op)
+  const todo: i32[] = [op]
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if at != root && (ljwWalked.get(at) ?? -1) == j {
+        0
+      } else if (
+        tailPushIfArms(at, todo)
+        || tailPushMatchArms(at, todo)
+        || tailPushBlockTail(at, todo)
+      ) {
+        spine.push(at)
+      } else {
+        leaves.push(at)
+      }
+    }
+  }
+  0
+}
 
 // Whether a list of `src` joined as `dst` would change how some level's elements are stored,
 // through `| null` and nested lists. Unknown storage declines.
@@ -38325,7 +38371,10 @@ function listJoinStorageDiffers(src: i32, dst: i32, depth: i32): boolean {
 // literal leaf is built at the joined type and needs none (D2838, D2274).
 function listJoinWidenCheck(at: i32, op: i32, j: i32) {
   if op < 0 || j < 0 || j >= T.tys.length || valDiscarded(at) { return 0 }
-  const leaves = valueTailLeaves(op)
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  ljwTailSplit(op, j, spine, leaves)
+  for s in spine { ljwWalked.set(s, j) }
   let i = 0
   while i < leaves.length {
     const lf = leaves[i]
@@ -38365,6 +38414,7 @@ function listJoinWidenCheck(at: i32, op: i32, j: i32) {
 
 // Walk the join sites the occurrence index collected.
 function rcwPendJoins() {
+  ljwWalked = Map()
   let i = 0
   while i < cwFrJoins.length {
     const at = cwFrJoins[i]
@@ -50700,10 +50750,10 @@ function ufcsMissSpecsAt(memIx: i32) {
   ""
 }
 
-// A type parameter the callee's RETURN names and none of its PARAMETER annotations does: no
-// argument can bind it, and VL has no explicit type-argument spelling. A DECLARED return is
-// asked by its written spelling — a phantom `Bare<A>` parameter binds `A` its arena row drops
-// — and an INFERRED one by `retTy`, the settled result the call site already holds (D1819).
+// A type parameter the callee's RETURN, or a parameter of a function its body declares and
+// uses, names and none of its PARAMETER annotations does: no argument can bind it. Callers skip
+// a call with explicit type arguments. A DECLARED return is asked by its written spelling, an
+// INFERRED one by `retTy`, the settled result the call site already holds (D1819).
 function checkRetTyParamBound(declIx: i32, who: string, ix: i32, retTy: i32) {
   if inferQuiet { return 0 }
   if declIx < 0 { return 0 }
@@ -50711,16 +50761,13 @@ function checkRetTyParamBound(declIx: i32, who: string, ix: i32, retTy: i32) {
   if dn is FuncDecl {
     if dn.fnTyParams.length == 0 { return 0 }
     let rTs = -1
-    if dn.fnRet >= 0 {
-      rTs = annTsOf(dn.fnRet)
-      if rTs < 0 { return 0 }
-    }
+    if dn.fnRet >= 0 { rTs = annTsOf(dn.fnRet) }
     let k = 0
     while k < dn.fnTyParams.length {
       const one: string[] = [dn.fnTyParams[k]]
       let named = false
       if dn.fnRet >= 0 {
-        named = tsMentionsAnyName(rTs, one)
+        if rTs >= 0 { named = tsMentionsAnyName(rTs, one) }
       } else {
         named = tyMentionsTyVarNamed(retTy, dn.fnTyParams[k], 8)
       }
@@ -50747,11 +50794,93 @@ function checkRetTyParamBound(declIx: i32, who: string, ix: i32, retTy: i32) {
           )
           return 0
         }
+      } else if !anyParamMentionsTyParam(dn.fnParams, one) {
+        const inner = bodyFnParamNaming(dn.fnBody, dn.fnBody, one)
+        if inner >= 0 {
+          let w = "the callee"
+          if who != "" { w = "`" + who + "`" }
+          let what = "a function literal in its body takes it"
+          const fdn = P.nodes[inner]
+          if fdn is FuncDecl {
+            if fdn.fnName != "" {
+              what = "its body's function `" + fdn.fnName + "` takes it"
+            }
+          }
+          const lname = bodyFnLetName(dn.fnBody, inner)
+          if lname != "" {
+            what = "its body's function `" + lname + "` takes it"
+          }
+          tErr(
+            "cannot infer type parameter `"
+              + dn.fnTyParams[k]
+              + "`: no parameter of "
+              + w
+              + " names it, but "
+              + what
+              + " as a parameter type, so a call has nothing to bind it from — give `"
+              + dn.fnTyParams[k]
+              + "` a parameter position, or pass the type arguments explicitly",
+            ix,
+          )
+          return 0
+        }
       }
       k = k + 1
     }
   }
   0
+}
+
+// The first function under `ix` (a nested `function` or a lambda) one of whose parameter
+// annotations names `names[0]`, and which `body` uses: a lambda written in place, or a name
+// `body` references. -1 for none. A function declaring its own type parameter of that name
+// shadows it and is not entered.
+function bodyFnParamNaming(ix: i32, body: i32, names: string[]): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    if strListHas(n.fnTyParams, names[0]) { return -1 }
+    if anyParamMentionsTyParam(n.fnParams, names) {
+      if n.fnName != "" {
+        if subtreeNamesIdent(body, n.fnName) { return ix }
+      } else {
+        const lname = bodyFnLetName(body, ix)
+        if lname == "" { return ix }
+        if subtreeNamesIdent(body, lname) { return ix }
+      }
+    }
+  }
+  for c in nodeChildren(ix) {
+    const r = bodyFnParamNaming(c, body, names)
+    if r >= 0 { return r }
+  }
+  -1
+}
+
+// The name of the `let`/`const` under `ix` whose initialiser is the function node `fnIx`
+// (through parentheses), or "" when `fnIx` is not bound that way.
+function bodyFnLetName(ix: i32, fnIx: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letInit >= 0 && peelParenIx(n.letInit) == fnIx { return n.letName }
+  }
+  for c in nodeChildren(ix) {
+    const r = bodyFnLetName(c, fnIx)
+    if r != "" { return r }
+  }
+  ""
+}
+
+// Whether an identifier named `name` occurs anywhere under `ix`.
+function subtreeNamesIdent(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  for c in nodeChildren(ix) {
+    if subtreeNamesIdent(c, name) { return true }
+  }
+  false
 }
 
 // Does arena type `ty` name the type variable `name` anywhere in its tree? The arena twin of
@@ -52813,6 +52942,9 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
   // still checked so a type error inside it surfaces.
   if cfn.identName == "print" {
     const pargs = n.callArgs
+    if pargs.length != 1 {
+      tErr("print expects 1 argument, got " + i32ToStr(pargs.length), ix)
+    }
     let pj = 0
     while pj < pargs.length {
       const pt = checkNode(pargs[pj])
@@ -57130,6 +57262,14 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
         // return type" from the resulting error-only return.
         paramUninferable = true
       }
+    }
+    // A `void` result cannot be bound (spec T1.4), so no argument can reach a `void` parameter.
+    if !inferQuiet && isVoidTy(pt) {
+      tErr(
+        "a parameter cannot be `void`: a `void` result cannot be bound, so no call could pass one — give the parameter a value type",
+        params[pi],
+      )
+      pt = TY_ERR
     }
     // Records the param node's resolved type so the emitter can recover a
     // contextually-inferred callback param's type (`xs.map((x) => …)` over `f64[]` ⇒ x: f64)
@@ -69996,6 +70136,10 @@ function checkIfStmtNode(ix: i32) {
   }
   const savedOnTail = ifChainOnFnTail
   ifChainOnFnTail = ifChainSpine
+  const savedVloOn = vloMemoOn
+  const savedVlo = vloMemo
+  vloMemoOn = frames.length > 1
+  if vloMemoOn { vloMemo = Map() }
   let k = frames.length - 1
   let res = checkIfTailAt(frames[k], elseRes, false)
   while k > 0 {
@@ -70004,6 +70148,8 @@ function checkIfStmtNode(ix: i32) {
     checkNodeDone(inner.ifIx, res, savedTails[k])
     res = checkIfTailAt(frames[k], res, inner.exits)
   }
+  vloMemoOn = savedVloOn
+  vloMemo = savedVlo
   ifChainOnFnTail = savedOnTail
   ifChainSpine = savedChainSpine
   res

@@ -349,11 +349,44 @@ function spawn(cmd: string, args: string[]): Proc {
   }
 }
 
-// One `vl` subcommand on a witness, bounded at 120 s as the Python's `timeout=120` is.
-function vl(args: string[]): Proc {
-  const full = ["120", VL]
+// The per-channel bound in seconds: `$WITNESS_TIMEOUT`, else 120 as the Python's `timeout=120`.
+function timeoutSecs(): string {
+  const t = getEnv("WITNESS_TIMEOUT")
+  if t is string {
+    if parseI32(stripWs(t)) == null {
+      die("check-filed-witnesses: WITNESS_TIMEOUT is not an integer: " + t, 1)
+    }
+    return stripWs(t)
+  }
+  "120"
+}
+
+// Whether `timeout` stopped the channel (124) or a signal killed it (137, 143): a reading
+// of the box's load, not of the witness, so it never becomes a filed outcome.
+function wasKilled(p: Proc): boolean {
+  p.code == 124 || p.code == 137 || p.code == 143 || p.code < 0
+}
+
+function vlOnce(args: string[]): Proc {
+  const full = [timeoutSecs(), VL]
   for a in args { full.push(a) }
   spawn("timeout", full)
+}
+
+// One `vl` subcommand on a witness, bounded per `timeoutSecs`, retried once if killed.
+function vl(args: string[]): Proc {
+  const p = vlOnce(args)
+  if wasKilled(p) { return vlOnce(args) }
+  p
+}
+
+// The outcome for a channel killed on both tries; `grade` reports the row as not graded.
+function timedOut(channel: string): Ran {
+  {
+    outcome: "timed_out",
+    detail: "`vl \{channel}` was stopped after \{timeoutSecs()} s twice: load, or a slow compile; re-run the row alone",
+    stdout: "",
+  }
 }
 
 function readText(path: string): string {
@@ -422,6 +455,7 @@ function stageWitness(dir: string): string {
 function classify(dir: string): Ran {
   const f = stageWitness(dir)
   const chk = vl(["check", f, "--compiler", COMPILER])
+  if wasKilled(chk) { return timedOut("check") }
   if chk.code != 0 {
     const diag = stripWs(chk.out + chk.err)
     if contains(diag, "(parse error)") {
@@ -434,6 +468,7 @@ function classify(dir: string): Ran {
     return { outcome: "check_reject", detail: cpPrefix(diag, 200), stdout: "" }
   }
   const run = vl(["run", f, "--compiler", COMPILER])
+  if wasKilled(run) { return timedOut("run") }
   if run.code == 0 {
     return {
       outcome: "runs",
@@ -448,6 +483,7 @@ function classify(dir: string): Ran {
   }
   const out = dir + "/w.wasm"
   const bld = vl(["build", f, "--compiler", COMPILER, "-o", out])
+  if wasKilled(bld) { return timedOut("build") }
   if bld.code != 0 && !exists(out) {
     return { outcome: "compiler_trap", detail: detail, stdout: "" }
   }
@@ -852,6 +888,7 @@ function grade(
   want: string,
   ran: Ran,
 ): Verdict {
+  if ran.outcome == "timed_out" { return { got: "", why: ran.detail } }
   if ran.outcome == "witness_unparsed" {
     if !namesParseError(status) {
       return {
@@ -1177,6 +1214,15 @@ function mainReport(docs: string[], strict: boolean, outJson: string): i32 {
     print(
       "      a defect reachable only under a change that was REFUSED is a refutation pin: file the program that must keep RUNNING, with the status `runs today and must keep running`.",
     )
+    let stopped = false
+    for g in ungradable {
+      if endsWith(g.why, "re-run the row alone") { stopped = true }
+    }
+    if stopped {
+      print(
+        "      a row stopped by `timeout` or a signal measured the box, not the row: it is graded nothing, never a filed outcome. Re-run it on a quiet box, or raise $WITNESS_TIMEOUT.",
+      )
+    }
   }
   if unparsed.length > 0 {
     print(

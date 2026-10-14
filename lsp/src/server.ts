@@ -21,7 +21,6 @@ import {
   LSPErrorCodes,
   MarkupKind,
   ProposedFeatures,
-  Range,
   ResponseError,
   SemanticTokens,
   SignatureHelp,
@@ -38,8 +37,6 @@ import type {
 } from "../../compiler/diagnostics.ts";
 import {
   buildUnusedExportUseMap,
-  crossFileReferences,
-  type CrossFileSource,
   crossFileUriOf,
   detectProjectRoot,
   enumerateWorkspaceFiles,
@@ -48,13 +45,6 @@ import {
   unusedExportHints,
   uriToPath,
 } from "./moduleGraph.ts";
-import {
-  fixableDiagnosticsForRange,
-  quickFixesForDiagnostic,
-  ufcsImportFixes,
-  ufcsImportModules,
-  ufcsMissingImportAt,
-} from "./codeActions.ts";
 import {
   applyRatchetHold,
   invalidateRatchetBaselines,
@@ -67,67 +57,41 @@ import {
   type SeedOrigin,
   type SeedSource,
   type WasmChecker,
-  type WasmExactConstAt,
-  type WasmImportedSource,
-  type WasmMemberToken,
-  type WasmRange,
-  type WasmToken,
 } from "./wasmCheckerNode.ts";
 import {
-  builtinCompletionsFromWasm,
   type Completion,
   type CompletionKind,
-  displayableType,
-  exactConstHover,
   docMarkdown,
-  documentHighlightsFromRefs,
   type DocRefResolver,
-  exportRefLenses,
-  flatDocumentSymbols,
   type HighlightKind,
-  importInsertionEdit,
-  inlayHintsFromWasm,
-  isDisplayableType,
-  keywordCompletions,
-  type LspRange,
-  memberCompletionsFromWasm,
-  nestedDocumentSymbols,
-  organizeImportEdits,
   type OutlineNode,
   type OutlineSymbolKind,
-  refCountLensTitle,
-  scopeCompletionsFromBindings,
-  typeCompletionsFromWasm,
   SEMANTIC_TOKEN_LEGEND,
-  semanticTokensDataFromWasm,
-  snippetCompletions,
-  stdAutoImportCompletions,
-  type StdExportCandidate,
   typeLabelDetail,
-  ufcsCompletions,
-  ufcsProbeSource,
-  type UfcsProbeModule,
-  withEffects,
 } from "./typeFeatures.ts";
-import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
+import { isStdKey, type StdSurfaceCache } from "./editorText.ts";
 import {
-  isStdKey,
-  removeCharAt,
-  type StdSurfaceCache,
-  stdExportSurfaces,
-  wordEndingBefore,
-} from "./editorText.ts";
-import { foldingRangesAt } from "./features.ts";
-import {
-  callSiteAt,
-  repairedSource,
-  signatureLabel,
-} from "./signatureHelp.ts";
-
-// The language id the extension registers (`package.json` → contributes.languages,
-// id `vital`, scope `source.vital`). Used as the markdown fence info string so
-// hover code blocks render syntax-highlighted via the TextMate grammar.
-const VL_LANGUAGE_ID = "vital";
+  codeActionsAt,
+  codeLensesAt,
+  codeLensLocationsAt,
+  completionsAt,
+  definitionAt,
+  documentHighlightsAt,
+  documentSymbolsAt,
+  type FeatureContext,
+  type FeatureWorkspace,
+  foldingRangesAt,
+  formattingEditsAt,
+  hoverAt,
+  inlayHintsAt,
+  prepareRenameAt,
+  type RefLensData,
+  referencesAt,
+  renameAt,
+  semanticTokensAt,
+  signatureHelpAt,
+  VL_LANGUAGE_ID,
+} from "./features.ts";
 
 declare const process: NodeJS.Process;
 
@@ -172,48 +136,6 @@ let workspaceFolder: string | null;
 // absent or this host can't instantiate it (no WasmGC); every handler then
 // degrades to an empty/no-op result rather than a TS fallback.
 let wasmChecker: WasmChecker | undefined;
-
-// Shape a native `WasmImportedSource` (1-based line, 0-based col, exported-name
-// length) onto the host's `CrossFileSource` (0-based LSP range + URI), the form
-// go-to-definition and the doc-xref resolver consume. The URI is `file://` for
-// a path key; a `std:` key maps to the workspace's own `std/` file when one
-// exists, else a `vl-std:` URI the extension serves from the embedded map
-// (`crossFileUriOf` — mirrors `withStd`'s read precedence).
-const toCrossFileSource = (s: WasmImportedSource): CrossFileSource => {
-  const line = s.line > 0 ? s.line - 1 : 0;
-  return {
-    key: s.key,
-    uri: crossFileUriOf(s.key, getStdDir),
-    range: {
-      start: { line, character: s.col },
-      end: { line, character: s.col + s.length },
-    },
-  };
-};
-
-// Cross-file imported sources for the document at `uri`, off the self-hosted
-// checker's import/export pass — the exporting sibling's decl location for each
-// imported name (powers cross-file go-to-definition + doc-xref). Undefined when
-// no checker is loaded / the seed predates the export, or nothing resolved.
-const wasmImportedSources = async (
-  uri: string,
-  text: string,
-): Promise<Record<string, CrossFileSource> | undefined> => {
-  if (wasmChecker?.importedNameSources === undefined) {
-    return undefined;
-  }
-  const native = await wasmChecker
-    .importedNameSources(text, entryKeyOf(uri), workspaceReader)
-    .catch((err) => {
-      connection.console.log(`[wasm-symbols] importedNameSources failed: ${err}`);
-      return {} as Record<string, WasmImportedSource>;
-    });
-  const locals = Object.keys(native);
-  if (locals.length === 0) return undefined; // nothing resolved — fall back to TS
-  const out: Record<string, CrossFileSource> = {};
-  for (const local of locals) out[local] = toCrossFileSource(native[local]);
-  return out;
-};
 
 const severityMap: Record<VLSeverity, DiagnosticSeverity> = {
   error: DiagnosticSeverity.Error,
@@ -473,137 +395,64 @@ documents.onDidSave(async (_event) => {
 });
 
 
-// Go-to-definition: map the cursor to the binding it lands on, return that
-// binding's declaring span (D2). When the cursor lands on an IMPORTED name
-// (resolved via the module graph), jump CROSS-FILE to the export's declaration
-// in the exporting sibling module instead (H0 phase 3).
-//
-// Order matters: the single-file symbol table seeds imported names into scope
-// (so they're not "undeclared"), but their `Binding.decl` is the IMPORT
-// statement, not the real definition. So we check the imported-name resolution
-// FIRST for a name that is genuinely imported, and fall back to the single-file
-// declaration for everything local. A no-import file never hits the graph path.
+// The request context every seed-backed feature in `features.ts` takes: the
+// checker, the document's module key, the workspace reader and this connection's
+// log. Undefined when no seed loaded, and every handler then answers empty.
+const featureContext = (uri: string): FeatureContext | undefined =>
+  wasmChecker === undefined ? undefined : {
+    checker: wasmChecker,
+    entryKey: entryKeyOf(uri),
+    reader: workspaceReader,
+    log: (msg) => connection.console.log(msg),
+  };
+
+// The workspace a cross-module feature crawls: the open buffers and the capped
+// disk crawl under the workspace folder, or under the project root detected from
+// the document when no folder is open.
+const featureWorkspace = (uri: string): FeatureWorkspace => ({
+  uri,
+  openDocs: () => documents.all().map((d) => ({ uri: d.uri, text: d.getText() })),
+  diskFiles: () =>
+    enumerateWorkspaceFiles(
+      workspaceFolder
+        ? uriToPath(workspaceFolder)
+        : detectProjectRoot(entryKeyOf(uri)),
+    ),
+});
+
+// Go-to-definition (D2): an imported name jumps to the exporting module's
+// declaration, whose key maps to a `file://` URI or, for `std:`, to the
+// workspace's own `std/` file or the extension's `vl-std:` scheme.
 connection.onDefinition(async (params): Promise<Location | null> => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc) return null;
-  const text = doc.getText();
-
-  // Go-to-definition off the self-hosted checker (kill-TS). An IMPORTED name jumps
-  // CROSS-FILE first — to the exporting sibling's declaration via the native
-  // import/export pass (`wasmImportedSources`). This must precede the local
-  // `definitionAt`: for an imported name, `definitionAt` returns the canonical
-  // declaration's span in the DEPENDENCY, but the span carries no module, so the
-  // host would mis-attribute it to THIS file (landing on the import line). For a
-  // purely-local name the cross-file lookup misses and `definitionAt` gives the
-  // correct same-file declaration. No checker (no seed / no WasmGC) → no result.
-  if (wasmChecker === undefined) return null;
-
-  const lineText = doc.getText({
-    start: { line: params.position.line, character: 0 },
-    end: { line: params.position.line + 1, character: 0 },
-  });
-  const word = wordAt(lineText, params.position.character);
-  if (word) {
-    const sources = await wasmImportedSources(params.textDocument.uri, text);
-    const source = sources?.[word];
-    if (source) return Location.create(source.uri, source.range);
-  }
-
-  const nativeDecl = wasmChecker.definitionAt !== undefined
-    ? await wasmChecker
-      .definitionAt(
-        text,
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] definitionAt failed: ${err}`);
-        return undefined;
-      })
-    : undefined;
-  if (nativeDecl) return Location.create(params.textDocument.uri, nativeDecl);
-  return null;
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return null;
+  const target = await definitionAt(doc.getText(), params.position, ctx);
+  if (target === null) return null;
+  const uri = target.key === undefined
+    ? params.textDocument.uri
+    : crossFileUriOf(target.key, getStdDir);
+  return Location.create(uri, target.range);
 });
 
-// Find-references: every occurrence (declaration + uses) of the binding under
-// the cursor. For a CROSS-MODULE symbol (a name that is imported here, or an
-// exported local declaration), references are gathered across the current file,
-// every OTHER OPEN document, AND every `.vl` file on disk under the project root
-// that is not already open (the on-disk sibling crawl — H0 phase 3 complete).
-// The crawl is scoped and capped: see `crossFileReferences` + ROADMAP for the
-// root-detection strategy, the MAX_DISK_FILES cap, and the excluded dirs. A
-// purely-local (non-exported, non-imported) symbol falls back to single-file.
+// Find-references: single-file first, then the open buffers and the capped disk
+// crawl for a cross-module symbol (see `crossFileReferences` for the root
+// detection, the file cap and the excluded dirs).
 connection.onReferences(async (params): Promise<Location[] | null> => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc) return null;
-  const text = doc.getText();
-  const includeDeclaration = params.context?.includeDeclaration ?? true;
-
-  // Find-references off the self-hosted checker (kill-TS). No checker → no result.
-  if (wasmChecker === undefined) return null;
-
-  // The native references are SINGLE-FILE (the binding's occurrences in the entry
-  // module). Try that first; on a miss, the symbol may be cross-module, so run the
-  // cross-module crawl (itself wasm-backed, kill-TS step 3-C Stage 3).
-  const localRefs = wasmChecker.referencesAt !== undefined
-    ? await wasmChecker
-      .referencesAt(
-        text,
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-        includeDeclaration,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] referencesAt failed: ${err}`);
-        return [] as WasmRange[];
-      })
-    : [];
-  if (localRefs.length > 0) {
-    return localRefs.map((r) => Location.create(params.textDocument.uri, r));
-  }
-
-  const lineText = doc.getText({
-    start: { line: params.position.line, character: 0 },
-    end: { line: params.position.line + 1, character: 0 },
-  });
-  const word = wordAt(lineText, params.position.character);
-  if (word) {
-    const openDocs = documents.all().map((d) => ({ uri: d.uri, text: d.getText() }));
-    const entryKey = entryKeyOf(params.textDocument.uri);
-    const crawlRoot = workspaceFolder
-      ? uriToPath(workspaceFolder)
-      : detectProjectRoot(entryKey);
-    const diskFiles = enumerateWorkspaceFiles(crawlRoot);
-    const crossRefs = await crossFileReferences(
-      word,
-      text,
-      entryKey,
-      openDocs,
-      workspaceReader,
-      wasmChecker,
-      includeDeclaration,
-      diskFiles,
-    );
-    if (crossRefs !== undefined) {
-      return crossRefs.map((r) => Location.create(r.uri, r.range));
-    }
-  }
-  return null;
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return null;
+  const refs = await referencesAt(
+    doc.getText(),
+    params.position,
+    params.context?.includeDeclaration ?? true,
+    ctx,
+    featureWorkspace(params.textDocument.uri),
+  );
+  return refs?.map((r) => Location.create(r.uri, r.range)) ?? null;
 });
 
-// Document highlights (D9.1): every same-file occurrence of the symbol under
-// the cursor lights up on cursor rest — `referencesAt` verbatim (the survey's
-// cheapest polish item), single-file by design (highlights only ever apply to
-// the current document, so the cross-module crawl `onReferences` falls back to
-// has no business here). The declaration renders as a Write, uses as Reads:
-// `referencesAt` returns bare ranges, so the decl is identified by one extra
-// `definitionAt` at the same cursor (~0.1–1.3 ms — same budget as the
-// reference query itself); if that rung is unavailable every occurrence
-// degrades to Read (see `documentHighlightsFromRefs`). No checker → null.
+// Document highlights (D9.1): same-file occurrences, the declaration as a Write.
 const highlightKindMap: Record<HighlightKind, DocumentHighlightKind> = {
   read: DocumentHighlightKind.Read,
   write: DocumentHighlightKind.Write,
@@ -611,51 +460,19 @@ const highlightKindMap: Record<HighlightKind, DocumentHighlightKind> = {
 connection.onDocumentHighlight(
   async (params): Promise<DocumentHighlight[] | null> => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) return null;
-    if (wasmChecker?.referencesAt === undefined) return null;
-    const text = doc.getText();
-    const entryKey = entryKeyOf(params.textDocument.uri);
-    const refs = await wasmChecker
-      .referencesAt(
-        text,
-        entryKey,
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-        true, // the declaration is an occurrence to light up too
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] referencesAt failed: ${err}`);
-        return [] as WasmRange[];
-      });
-    if (refs.length === 0) return null;
-    const decl = wasmChecker.definitionAt !== undefined
-      ? await wasmChecker
-        .definitionAt(
-          text,
-          entryKey,
-          workspaceReader,
-          params.position.line,
-          params.position.character,
-        )
-        .catch(() => undefined)
-      : undefined;
-    return documentHighlightsFromRefs(refs, decl).map((h) => ({
+    const ctx = featureContext(params.textDocument.uri);
+    if (!doc || ctx === undefined) return null;
+    const spans = await documentHighlightsAt(doc.getText(), params.position, ctx);
+    return spans?.map((h) => ({
       range: h.range,
       kind: highlightKindMap[h.kind],
-    }));
+    })) ?? null;
   },
 );
 
-// Document symbols (D9.3): the NESTED outline — Outline view, breadcrumbs,
-// Ctrl+Shift+O, and the model VS Code's sticky scroll reads by default
-// (`editor.stickyScroll.defaultModel` = `outlineModel`). Built from the seed's
-// declaration extents, so `range` is the whole declaration and `selectionRange`
-// the name; a declaration nested in another is its CHILD.
-//
-// The flat form below it is the degraded path, not a second grade: a seed without
-// the extent export reports no extents, and the outline falls back to name-span
-// entries off `tokensAt` rather than disappearing. No checker → null.
+// Document symbols (D9.3): the nested outline that the Outline view, breadcrumbs,
+// Ctrl+Shift+O and sticky scroll (`editor.stickyScroll.defaultModel` =
+// `outlineModel`) read.
 const outlineKindMap: Record<OutlineSymbolKind, SymbolKind> = {
   function: SymbolKind.Function,
   variable: SymbolKind.Variable,
@@ -680,41 +497,10 @@ const outlineNodeToSymbol = (n: OutlineNode): DocumentSymbol => {
 connection.onDocumentSymbol(
   async (params): Promise<DocumentSymbol[] | null> => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) return null;
-    if (wasmChecker?.tokensAt === undefined) return null;
-    const text = doc.getText();
-    const entryKey = entryKeyOf(params.textDocument.uri);
-    const exportedNames = new Set(
-      wasmChecker.moduleSurface(text, entryKey).exports.map((e) => e.name),
-    );
-    // No extents means either an older seed or a file with no declarations at
-    // all, and the two want the same answer — the flat path produces nothing for
-    // the second either, so the ambiguity costs nothing.
-    const extents = wasmChecker.declExtentsAt(text);
-    if (extents.length > 0) {
-      return nestedDocumentSymbols(extents, exportedNames)
-        .map(outlineNodeToSymbol);
-    }
-    const idents = await wasmChecker
-      .tokensAt(text, entryKey, workspaceReader)
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
-        return [] as WasmToken[];
-      });
-    return flatDocumentSymbols(idents, text, exportedNames).map((s) => {
-      const range = {
-        start: { line: s.line, character: s.char },
-        end: { line: s.line, character: s.char + s.length },
-      };
-      const sym: DocumentSymbol = {
-        name: s.name,
-        kind: outlineKindMap[s.kind],
-        range,
-        selectionRange: range,
-      };
-      if (s.exported) sym.detail = "export";
-      return sym;
-    });
+    const ctx = featureContext(params.textDocument.uri);
+    if (!doc || ctx === undefined) return null;
+    const nodes = await documentSymbolsAt(doc.getText(), ctx);
+    return nodes?.map(outlineNodeToSymbol) ?? null;
   },
 );
 
@@ -735,82 +521,32 @@ connection.onFoldingRanges((params): FoldingRange[] | null => {
   return foldingRangesAt(doc.getText(), wasmChecker);
 });
 
-// Signature help (D9.10): the callee's parameters while typing a call, with the
-// argument under the cursor highlighted.
-//
-// TWO HALVES, EACH ANSWERING WHAT ONLY IT CAN. `callSiteAt` (host, lexical) finds
-// WHICH call the cursor is inside and which argument — a question about
-// half-typed source, where the checker sees a parse error and the answer has to
-// survive an unclosed paren. `signatureAt` (native, D9.10's one new export)
-// answers WHAT that callee's parameters are, as data. The survey's bridge grade
-// would have re-parsed a rendered `(a: i32, b: string) => T` here; it does not,
-// because the clean grade shipped with it (see `signatureHelp.ts`).
-//
-// The checker drops a UFCS call's `self` row, so `activeArgument` indexes
-// `params` directly at both spellings — `shout("x", 2)` highlights `self` at
-// argument 0, `"x".shout(2)` highlights `n`.
+// Signature help (D9.10): the callee's parameters while typing a call, the
+// argument under the cursor highlighted. The protocol addresses a parameter by
+// its offset pair into the label, since one substring can occur twice.
 connection.onSignatureHelp(async (params): Promise<SignatureHelp | null> => {
-  const document = documents.get(params.textDocument.uri);
-  if (!document) return null;
-  if (wasmChecker?.signatureAt === undefined) return null;
-  const text = document.getText();
-  const site = callSiteAt(text, params.position.line, params.position.character);
-  if (site === undefined) return null;
-  const ask = (source: string) =>
-    wasmChecker!
-      .signatureAt(
-        source,
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        site.callee.line,
-        site.callee.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] signatureAt failed: ${err}`);
-        return undefined;
-      });
-  // The buffer AS WRITTEN first. Only when that has no answer is the missing-`)`
-  // repair worth a second check — the closers the scan is holding say nothing
-  // about whether the document needs them (`f("a"|, 1)` is already balanced).
-  let sig = await ask(text);
-  if (sig === undefined) {
-    const repaired = repairedSource(
-      text,
-      params.position.line,
-      params.position.character,
-      site,
-    );
-    if (repaired !== undefined) sig = await ask(repaired);
-  }
-  if (sig === undefined) return null;
-  const { label, parameters } = signatureLabel(site.name, sig);
+  const doc = documents.get(params.textDocument.uri);
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return null;
+  const sig = await signatureHelpAt(doc.getText(), params.position, ctx);
+  if (sig === null) return null;
   return {
     signatures: [{
-      label,
-      // The protocol addresses a parameter by its OFFSET PAIR into the label, not
-      // by repeating its text — the same substring can occur twice in one
-      // signature (`(a: i32, b: i32)`) and the client must highlight the right one.
-      parameters: parameters.map(([start, end]) => ({ label: [start, end] })),
+      label: sig.label,
+      parameters: sig.parameters.map(([start, end]) => ({ label: [start, end] })),
     }],
     activeSignature: 0,
-    // Left UNCLAMPED on purpose: typing a fourth argument to a three-parameter
-    // function highlights nothing, which is the honest render of "too many".
-    activeParameter: site.activeArgument,
+    activeParameter: sig.activeParameter,
   };
 });
 
 // ---- rename symbol (+prepare) (D9.7) ----------------------------------------
 //
-// `prepareRename` classifies the position (via `planRenameAt`) and returns the
-// identifier's exact range + placeholder — or null off any renameable symbol,
-// or a ResponseError carrying WHY for a deliberate refusal (a std-declared
-// binding, an unattributable alias mix), which VS Code shows inline. `rename`
-// re-plans against the request-time text (prepare and rename are separate
-// requests; the buffer may have moved), validates the new name (identifier
-// grammar, no hard/soft keywords — `invalidNewNameReason`), and assembles the
-// `WorkspaceEdit`: single-file plans edit the current document; an exported
-// symbol runs the same open-docs + capped-disk-crawl candidate set as
-// find-references. Semantics table + safety refusals: `rename.ts`.
+// `prepareRenameAt` and `renameAt` answer; a deliberate refusal (a std-declared
+// binding, an unattributable alias mix, an invalid new name) becomes a
+// ResponseError carrying the reason, which VS Code shows inline. `rename`
+// re-plans against the request-time text, since prepare and rename are separate
+// requests. Semantics table and safety refusals: `rename.ts`.
 
 // What counts as a std declaration for rename's hard refusal: the `std:` key
 // scheme, plus the workspace's own `std/` dir (dogfooding in the compiler repo
@@ -824,346 +560,82 @@ const isStdKeyForRename = (key: string): boolean => {
 
 connection.onPrepareRename(async (params) => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc || wasmChecker === undefined) return null;
-  const plan = await planRenameAt(
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return null;
+  const answer = await prepareRenameAt(
     doc.getText(),
-    entryKeyOf(params.textDocument.uri),
-    workspaceReader,
-    wasmChecker,
-    params.position.line,
-    params.position.character,
+    params.position,
+    ctx,
     isStdKeyForRename,
-  ).catch((err) => {
-    connection.console.log(`[rename] planRenameAt failed: ${err}`);
-    return undefined;
-  });
-  if (plan === undefined) return null;
-  if (plan.kind === "refused") {
-    throw new ResponseError(LSPErrorCodes.RequestFailed, plan.reason);
+  );
+  if (answer !== null && "error" in answer) {
+    throw new ResponseError(LSPErrorCodes.RequestFailed, answer.error);
   }
-  return { range: plan.range, placeholder: plan.word };
+  return answer;
 });
 
 connection.onRenameRequest(async (params) => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc || wasmChecker === undefined) return null;
-  const badName = invalidNewNameReason(params.newName);
-  if (badName !== undefined) {
-    throw new ResponseError(LSPErrorCodes.RequestFailed, badName);
-  }
-  const text = doc.getText();
-  const entryKey = entryKeyOf(params.textDocument.uri);
-  const plan = await planRenameAt(
-    text,
-    entryKey,
-    workspaceReader,
-    wasmChecker,
-    params.position.line,
-    params.position.character,
-    isStdKeyForRename,
-  ).catch((err) => {
-    connection.console.log(`[rename] planRenameAt failed: ${err}`);
-    return undefined;
-  });
-  if (plan === undefined) return null;
-  if (plan.kind === "refused") {
-    throw new ResponseError(LSPErrorCodes.RequestFailed, plan.reason);
-  }
-  // The cross-module candidate set (export renames only): open docs + the
-  // capped disk crawl — identical scoping to find-references.
-  const openDocs = plan.kind === "export"
-    ? documents.all().map((d) => ({ uri: d.uri, text: d.getText() }))
-    : [];
-  const diskFiles = plan.kind === "export"
-    ? enumerateWorkspaceFiles(
-      workspaceFolder ? uriToPath(workspaceFolder) : detectProjectRoot(entryKey),
-    )
-    : [];
-  const result = await renameEdits(
-    plan,
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return null;
+  const answer = await renameAt(
+    doc.getText(),
+    params.position,
     params.newName,
-    text,
-    entryKey,
-    params.textDocument.uri,
-    openDocs,
-    diskFiles,
-    workspaceReader,
-    wasmChecker,
+    ctx,
+    featureWorkspace(params.textDocument.uri),
+    isStdKeyForRename,
   );
-  if ("error" in result) {
-    throw new ResponseError(LSPErrorCodes.RequestFailed, result.error);
+  if (answer === null) return null;
+  if ("error" in answer) {
+    throw new ResponseError(LSPErrorCodes.RequestFailed, answer.error);
   }
   const changes: Record<string, TextEdit[]> = {};
-  for (const [uri, edits] of Object.entries(result.changes)) {
+  for (const [uri, edits] of Object.entries(answer.changes)) {
     changes[uri] = edits.map((e) => TextEdit.replace(e.range, e.newText));
   }
   return { changes };
 });
 
-// Extract the identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on
-// `line`, or null if the cursor isn't on a word. We scan outward from the
-// cursor rather than regex-matching the whole line so the result is the single
-// word under the cursor.
-const wordAt = (line: string, character: number): string | null => {
-  const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
-  let start = character;
-  let end = character;
-  while (start > 0 && isWordChar(line[start - 1])) start--;
-  while (end < line.length && isWordChar(line[end])) end++;
-  if (start === end) return null;
-  const word = line.slice(start, end);
-  // Identifiers can't start with a digit; reject numeric literals.
-  return /^[A-Za-z_]/.test(word) ? word : null;
-};
-
-// Render a hover body through `docMarkdown`: the declaration's `///` block (D9.11)
-// as prose, then the type as a fenced `vital` code block the client syntax-highlights
-// via the TextMate grammar. One layout for hover and completion — the fence info string
-// must match the registered language id. An undocumented declaration is the bare fence,
-// byte for byte what this rendered before docs existed.
-const hoverMarkdown = (
-  code: string,
-  doc?: string,
-  effects?: string,
-): Hover["contents"] => ({
-  kind: "markdown",
-  value: withEffects(docMarkdown(code, VL_LANGUAGE_ID, doc), effects),
-});
-
+// Hover: the ladder in `hoverAt`, rendered as markdown.
+//
 // D8 stepwise alias expansion (hover verbosity): the renderer (`stringifyType`'s
-// `maxDepth`) supports peeling one alias layer per step, and the per-kind depths
-// below already wire it for the default view. The interactive +/- VERBOSITY
-// controls require the proposed LSP 3.18 hover-verbosity API
+// `maxDepth`) supports peeling one alias layer per step. The interactive +/-
+// controls need the proposed LSP 3.18 hover-verbosity API
 // (`HoverParams.context.verbosityLevel` + `Hover.canIncrease`/`canDecrease`),
-// which is NOT in the `vscode-languageserver@9` / protocol 3.17.5 in use here.
-// REMAINING PIECE (unblocked-by-design): once that protocol lands, read the
-// requested verbosity level off `params.context`, map it to `maxDepth`, and set
-// `canIncrease`/`canDecrease` on the returned `Hover` — no renderer change needed.
+// which `vscode-languageserver@9` / protocol 3.17.5 does not have. Once it lands,
+// map the requested level to `maxDepth` and set the two flags; no renderer change.
 connection.onHover(async (params): Promise<Hover | null> => {
-  const document = documents.get(params.textDocument.uri);
-  if (!document) return null;
-
-  // LSP-on-wasm Stage 2: the native hover type for the binding under the cursor.
-  // `"wasm"` returns it when present (else falls through to the TS hover, which
-  // also covers members + flow types the native path doesn't yet render);
-  // `"both"` logs the type-string divergence against the TS render below.
-  const wasmHoverType = async (): Promise<string | undefined> => {
-    if (wasmChecker?.hoverTypeAt === undefined) return undefined;
-    return await wasmChecker
-      .hoverTypeAt(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] hoverTypeAt failed: ${err}`);
-        return undefined;
-      });
-  };
-  // The native member-access type (`o.x`, `s.length`) under the cursor — the
-  // member hover the binding-only `hoverTypeAt` can't serve.
-  const wasmMemberType = async (): Promise<string | undefined> => {
-    if (wasmChecker?.memberTypeAt === undefined) return undefined;
-    return await wasmChecker
-      .memberTypeAt(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] memberTypeAt failed: ${err}`);
-        return undefined;
-      });
-  };
-  // The native type of a user `type` NAME (struct/union alias) under the cursor —
-  // the type-alias hover `hoverTypeAt` (value-binding only) can't serve.
-  const wasmTypeAlias = async (): Promise<string | undefined> => {
-    if (wasmChecker?.typeAliasAt === undefined) return undefined;
-    return await wasmChecker
-      .typeAliasAt(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] typeAliasAt failed: ${err}`);
-        return undefined;
-      });
-  };
-  // The exact constant under the cursor (an un-annotated literal `const`): its value and,
-  // at a use, the type it took there — it has no single type for `hoverTypeAt` to give.
-  const wasmConst = async (): Promise<WasmExactConstAt | undefined> => {
-    if (wasmChecker?.constAt === undefined) return undefined;
-    return await wasmChecker
-      .constAt(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] constAt failed: ${err}`);
-        return undefined;
-      });
-  };
-  // The `///` block above the DECLARATION the cursor's name resolves to (D9.11).
-  // Asked once for the whole ladder: the rungs disagree about which query answers the
-  // type, but they all name the same declaration, and `ensurePrepared` is memoised so
-  // the extra query does not re-check the document.
-  const wasmDoc = async (): Promise<string | undefined> => {
-    if (wasmChecker?.docAt === undefined) return undefined;
-    return await wasmChecker
-      .docAt(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] docAt failed: ${err}`);
-        return undefined;
-      });
-  };
-  // The effects summary of the function the cursor's name resolves to (what it writes,
-  // whether it allocates, its cost in steps, its host calls); undefined off a function.
-  const wasmEffects = async (): Promise<string | undefined> => {
-    if (wasmChecker?.effectsAt === undefined) return undefined;
-    return await wasmChecker
-      .effectsAt(
-        document.getText(),
-        entryKeyOf(params.textDocument.uri),
-        workspaceReader,
-        params.position.line,
-        params.position.character,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-symbols] effectsAt failed: ${err}`);
-        return undefined;
-      });
-  };
-  const wordForHover = wordAt(
-    document.getText({
-      start: { line: params.position.line, character: 0 },
-      end: { line: params.position.line + 1, character: 0 },
-    }),
-    params.position.character,
-  );
-
-  // ── Kill-TS: fully self-hosted hover in "wasm" mode ────────────────────────
-  // Value binding (`hoverTypeAt`, incl. imported names) → member access
-  // (`memberTypeAt`) → user `type` alias (`typeAliasAt`) → builtin (native
-  // builtin list). No checkOnly/parseSymbols/importedScope. Every user rung also
-  // carries the declaration's `///` block, from `docAt` (D9.11); a builtin has no
-  // declaration to document.
-  //
-  // Each rung is filtered through `displayableType`: the body is rendered as a
-  // fenced `vital` code block, i.e. a claim that the text is VL, so a native
-  // rendering carrying an absence-of-a-type sentinel (`<error>` for an annotation
-  // that didn't resolve) is treated as NO ANSWER and falls through to the next
-  // rung rather than printing a type name the language does not have.
-  if (wasmChecker === undefined) return null;
-  if (!wordForHover) return null;
-  const doc = await wasmDoc();
-  const exact = await wasmConst();
-  if (exact) {
-    const { code, note } = exactConstHover(wordForHover, exact);
-    return { contents: hoverMarkdown(code, doc, note) };
-  }
-  const t = displayableType(await wasmHoverType());
-  if (t) {
-    return {
-      contents: hoverMarkdown(`${wordForHover}: ${t}`, doc, await wasmEffects()),
-    };
-  }
-  const mt = displayableType(await wasmMemberType());
-  if (mt) {
-    return {
-      contents: hoverMarkdown(`${wordForHover}: ${mt}`, doc, await wasmEffects()),
-    };
-  }
-  const at = displayableType(await wasmTypeAlias());
-  if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`, doc) };
-  // Builtin (`print`/`i32`/…): the word in the native builtin set. No user
-  // declaration, so no `///` block can be above it.
-  const b = wasmChecker.builtinCompletions?.().find((x) => x.name === wordForHover);
-  if (b && isDisplayableType(b.detail)) {
-    return { contents: hoverMarkdown(`${wordForHover}: ${b.detail}`) };
-  }
-  return null;
+  const doc = documents.get(params.textDocument.uri);
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return null;
+  const value = await hoverAt(doc.getText(), params.position, ctx);
+  return value === null ? null : { contents: { kind: "markdown", value } };
 });
 
-// Inlay hints (D6): for every declaration that *lacks* a visible annotation,
-// surface the inferred type after the identifier (`x: i32`) — the headline
-// feature for a language that otherwise hides its types. Driven by the wasm
-// checker's `inlayHintsAt` + the `inlayHintsFromWasm` source-scan filters;
-// honours the request's `range`.
+// Inlay hints (D6): the inferred type after each declaration that lacks a visible
+// annotation (`x: i32`), within the request's range.
 connection.languages.inlayHint.on(async (params): Promise<InlayHint[]> => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc) return [];
-  const text = doc.getText();
-  const range: LspRange = params.range;
-  const toHint = (h: { line: number; char: number; label: string }): InlayHint => ({
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return [];
+  const hints = await inlayHintsAt(doc.getText(), params.range, ctx);
+  return hints.map((h): InlayHint => ({
     position: { line: h.line, character: h.char },
     label: h.label, // `: <type>`
     kind: InlayHintKind.Type,
     paddingLeft: true, // keep it unobtrusive: a space before `: type`
-  });
-
-  // Kill-TS: the inferred types + decl positions come from the native checker
-  // (`inlayHintsAt`); the source-scan annotation/range filters stay host-side
-  // (`inlayHintsFromWasm`). No checker → no hints.
-  if (wasmChecker?.inlayHintsAt === undefined) return [];
-  const candidates = await wasmChecker
-    .inlayHintsAt(text, entryKeyOf(params.textDocument.uri), workspaceReader)
-    .catch((err) => {
-      connection.console.log(`[wasm-checker] inlayHintsAt failed: ${err}`);
-      return [];
-    });
-  return inlayHintsFromWasm(candidates, range, text).map(toHint);
+  }));
 });
 
-// Semantic tokens (D5): richer, semantically-accurate highlighting beyond the
-// TextMate grammar. Identifiers are classified by their resolved binding kind
-// (local vs parameter vs function vs type) via the D2 symbol table — something a
-// grammar can't tell apart — and merged with a lexical pass over the token
-// stream for literals/keywords/operators plus recovered `//` comments. The
-// `data` array is the delta-encoded form LSP mandates (see `encodeSemanticTokens`).
+// Semantic tokens (D5): identifiers classified by resolved binding kind, which a
+// TextMate grammar cannot tell apart, merged with the lexical layer.
 connection.languages.semanticTokens.on(
   async (params): Promise<SemanticTokens> => {
     const doc = documents.get(params.textDocument.uri);
-    if (!doc) return { data: [] };
-    const text = doc.getText();
-    const uri = params.textDocument.uri;
-    if (wasmChecker === undefined) return { data: [] };
-
-    // Whole document off the self-hosted checker: identifiers (`tokensAt`) +
-    // members (`memberTokensAt`) + the lexical layer (`lexicalTokensAt` —
-    // keywords/operators/literals/comments). No TS. Each slice yields [] on any
-    // error / a seed predating its export.
-    const idents = wasmChecker.tokensAt !== undefined
-      ? await wasmChecker.tokensAt(text, entryKeyOf(uri), workspaceReader)
-        .catch((err) => {
-          connection.console.log(`[wasm-symbols] tokensAt failed: ${err}`);
-          return [] as WasmToken[];
-        })
-      : [];
-    const members = wasmChecker.memberTokensAt !== undefined
-      ? await wasmChecker.memberTokensAt(text, entryKeyOf(uri), workspaceReader)
-        .catch((err) => {
-          connection.console.log(`[wasm-symbols] memberTokensAt failed: ${err}`);
-          return [] as WasmMemberToken[];
-        })
-      : [];
-    const lexical = wasmChecker.lexicalTokensAt(text);
-    return { data: semanticTokensDataFromWasm(idents, lexical, members, text) };
+    const ctx = featureContext(params.textDocument.uri);
+    if (!doc || ctx === undefined) return { data: [] };
+    return { data: await semanticTokensAt(doc.getText(), ctx) };
   },
 );
 
@@ -1239,188 +711,18 @@ const toCompletionItem = (
   return item;
 };
 
-// ---- std auto-import completion source ---------------------------------------
-//
-// Per-std-module export surfaces (name/kind/type) for `stdAutoImportCompletions`,
-// via the shared `stdExportSurfaces` (`./editorText.ts`). The server's source read
-// tries the workspace's own `std/` first — dogfooding, so it offers what the
-// checker will actually accept — falling back to the embedded map; the cache is
-// keyed on source text so a workspace std edit refreshes its entry.
+// The std export surfaces `completionsAt` offers, cached across requests on each
+// module's source text, so a workspace `std/` edit refreshes its entry.
 const stdExportCache: StdSurfaceCache = new Map();
-const stdExportsForCompletion = (): Promise<Map<string, StdExportCandidate[]>> =>
-  wasmChecker === undefined
-    ? Promise.resolve(new Map())
-    : stdExportSurfaces(wasmChecker, workspaceReader, workspaceReader, stdExportCache);
 
-// ---- UFCS candidate source ---------------------------------------------------
-//
-// The modules the UFCS probe reaches into beyond the ones the file already
-// imports: every std module, named by ONE of its own exports (see
-// `ufcsProbeSource` for why one named specifier is the whole trick). The list
-// rides the same cached per-module surface the std auto-import pass builds, so
-// asking for it costs a Map walk, not a compile — and a module the file already
-// imports is dropped by `ufcsProbeSource` itself, since it is in the graph
-// already.
-//
-// WORKSPACE modules are NOT probed. `enumerateWorkspaceFiles` caps at 500 files
-// and a UFCS probe importing all of them would compile the project on every `.`;
-// what IS covered is every module the file already imports plus every module
-// THOSE reach — which includes the module declaring the receiver's type, because
-// a value of that type had to come from somewhere the file can already see.
-const ufcsProbeModules = async (): Promise<UfcsProbeModule[]> => {
-  const out: UfcsProbeModule[] = [];
-  for (const [key, exports] of await stdExportsForCompletion()) {
-    if (exports.length > 0) out.push({ key, anyExport: exports[0].name });
-  }
-  return out;
-};
-
-// The UFCS methods the receiver at (`line`, `character`) — the cursor, just after
-// the `.` — dispatches to, over the file's own graph PLUS the probe modules.
-// `[]` when the seed predates the export or the receiver resolves to nothing.
-const ufcsCandidatesForCursor = async (
-  text: string,
-  uri: string,
-  position: { line: number; character: number },
-  insertProbeProp: boolean,
-): Promise<{ name: string; detail: string; moduleKey: string }[]> => {
-  if (wasmChecker?.ufcsCandidatesAt === undefined) return [];
-  const probe = ufcsProbeSource(
-    text,
-    await ufcsProbeModules(),
-    insertProbeProp ? position : undefined,
-  );
-  return await wasmChecker
-    .ufcsCandidatesAt(
-      probe.source,
-      entryKeyOf(uri),
-      workspaceReader,
-      position.line + probe.lineOffset,
-      position.character,
-    )
-    .catch((err) => {
-      connection.console.log(`[wasm-checker] ufcsCandidatesAt failed: ${err}`);
-      return [];
-    });
-};
-
-// `wordEndingBefore` (the `<name>.` receiver) and `removeCharAt` (strip the
-// trailing `.`) are shared with the playground — `./editorText.ts`.
-
-// Completion (D3): scope-aware identifier suggestions everywhere, structural
-// member suggestions after `.`, plus keyword and snippet completions for
-// statement-position typing. Driven by the pure helpers in `typeFeatures.ts`
-// over the compiler's symbol table + program scope (which folds in builtins).
+// Completion (D3): `completionsAt` composes the scope, member, UFCS, type, std
+// auto-import, keyword and snippet sources; this maps them to protocol items.
 connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc) return [];
-  const text = doc.getText();
-  const uri = params.textDocument.uri;
-
-  // The text on the current line up to the cursor — to detect a `.` trigger and
-  // find the receiver name before it.
-  const linePrefix = doc.getText({
-    start: { line: params.position.line, character: 0 },
-    end: params.position,
-  });
-  const charBeforeCursor = linePrefix[linePrefix.length - 1];
-
-  // Fully self-hosted completion (kill-TS): native in-scope bindings (`scopeAt`,
-  // incl. imported names) + native builtins (`builtinCompletions`, the source the
-  // TS `defaultScope` used to provide) + native member completion — no
-  // `checkOnly`/`parseSymbols`/`importedScope`/`defaultScope`. Items carry no
-  // source `///` docs (the native scope set doesn't retain them). No checker (no
-  // seed, or one predating these exports) → no completions.
-  if (
-    wasmChecker === undefined ||
-    wasmChecker.scopeAt === undefined ||
-    wasmChecker.builtinCompletions === undefined ||
-    wasmChecker.memberCompletionsAt === undefined
-  ) {
-    return [];
-  }
-
-  if (charBeforeCursor === ".") {
-    // TWO SCANS, because `x.` has two answers and neither list contains the
-    // other. FIELDS come from the receiver's type; UFCS METHODS come from the
-    // program's free `self`-functions, including ones this file has not imported
-    // — VL never resolves those implicitly (DECISIONS.md, owner 2026-09-02), so
-    // the editor offers them WITH the import as an `additionalTextEdit`.
-    const receiver = wordEndingBefore(linePrefix, linePrefix.length - 1);
-    const dotCol = params.position.character - 1;
-    // The native parser isn't error-tolerant for the incomplete `receiver.`, so
-    // strip the trailing `.` and resolve the receiver as a bare expression at its
-    // own position. Empty for a receiver with no completable members (arrays/maps)
-    // or one that can't resolve. Only a BARE IDENTIFIER receiver can be re-found
-    // this way — the UFCS scan below has no such limit, which is why a null
-    // `receiver` no longer ends the request.
-    const members = receiver === null ? [] : await wasmChecker
-      .memberCompletionsAt(
-        removeCharAt(text, params.position.line, dotCol),
-        entryKeyOf(uri),
-        workspaceReader,
-        params.position.line,
-        dotCol - receiver.length,
-      )
-      .catch((err) => {
-        connection.console.log(`[wasm-checker] memberCompletionsAt failed: ${err}`);
-        return [];
-      });
-    const fields = memberCompletionsFromWasm(members);
-    const byName = new Set(fields.map((f) => f.name));
-    const ufcs = ufcsCompletions(
-      text,
-      entryKeyOf(uri),
-      await ufcsCandidatesForCursor(text, uri, params.position, true),
-      (name) => byName.has(name),
-      (stmt) => wasmChecker?.formatSrc?.(stmt),
-    );
-    return [...fields, ...ufcs].map((c) => toCompletionItem(c));
-  }
-
-  // Identifier completion: native in-scope user bindings + native builtins +
-  // keywords/snippets. A user binding shadows a same-named builtin (added last).
-  const bindings = await wasmChecker
-    .scopeAt(
-      text,
-      entryKeyOf(uri),
-      workspaceReader,
-      params.position.line,
-      params.position.character,
-    )
-    .catch((err) => {
-      connection.console.log(`[wasm-checker] scopeAt failed: ${err}`);
-      return [];
-    });
-  const byName = new Map<string, Completion>();
-  for (const c of builtinCompletionsFromWasm(wasmChecker.builtinCompletions())) {
-    byName.set(c.name, c);
-  }
-  for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
-  // The TYPE namespace, added last and never over a name a value already took: at a use
-  // site the value is what the author reaches for, and one label cannot mean both.
-  const typeNames = await wasmChecker
-    .typeNamesAt?.(text, entryKeyOf(uri), workspaceReader)
-    .catch((err) => {
-      connection.console.log(`[wasm-checker] typeNamesAt failed: ${err}`);
-      return [];
-    }) ?? [];
-  for (const c of typeCompletionsFromWasm(typeNames, (n) => byName.has(n))) {
-    byName.set(c.name, c);
-  }
-  const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
-  const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
-  const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
-  // std exports NOT in scope, offered with an import-statement rewrite on
-  // accept (`additionalTextEdits`) — spelled by the seed's own formatter so the
-  // rewritten import is exactly what `vl fmt` keeps.
-  const autoImports = stdAutoImportCompletions(
-    text,
-    await stdExportsForCompletion(),
-    (name) => byName.has(name),
-    (stmt) => wasmChecker?.formatSrc?.(stmt),
-  ).map((c) => toCompletionItem(c));
-  return [...identifiers, ...autoImports, ...keywords, ...snippets];
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return [];
+  const items = await completionsAt(doc.getText(), params.position, ctx, stdExportCache);
+  return items.map((c) => toCompletionItem(c));
 });
 
 // Document formatting (D4): rewrite the whole document through the self-hosted
@@ -1432,117 +734,28 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
 connection.onDocumentFormatting((params): TextEdit[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
-  const text = doc.getText();
-  const formatted = wasmChecker?.formatSrc?.(text);
-  if (formatted === undefined || formatted === text) return [];
-  const fullRange: Range = {
-    start: { line: 0, character: 0 },
-    end: doc.positionAt(text.length),
-  };
-  return [{ range: fullRange, newText: formatted }];
+  return formattingEditsAt(doc.getText(), wasmChecker);
 });
 
-// Quick-fixes (code actions) for lint diagnostics (B17) + organize imports
-// (D9). The editor passes the diagnostics overlapping the cursor/selection in
-// `params.context.diagnostics`; we key off each diagnostic's stable `code` and
-// precise `range` to compute plain text edits (see `codeActions.ts`), then wrap
-// them in `CodeAction` + `WorkspaceEdit` envelopes. We also fold in cached
-// `vital` diagnostics on an overlapping line, so a fix is still offered when
-// the cursor sits off the diagnostic's exact range. Only `vital`-sourced lint
-// diagnostics with a known code yield actions; everything else is ignored.
-//
-// `context.only` is honoured per the LSP kind hierarchy (a filter matches a
-// kind equal to it or nested under it), so an `editor.codeActionsOnSave`
-// request for `source.organizeImports` gets exactly the organize action and a
-// plain lightbulb request gets everything.
-const kindMatchesOnly = (kind: string, only: string[] | undefined): boolean =>
-  only === undefined ||
-  only.some((k) => kind === k || kind.startsWith(k + "."));
-
-// SYNCHRONOUS, and that is what the data channel bought: the missing-import fix
-// used to re-ask the checker which modules could supply the name, per lightbulb.
-// The diagnostic now carries that answer, so nothing here awaits.
+// Quick-fixes (code actions) for lint diagnostics (B17) + organize imports (D9),
+// computed by `codeActionsAt`. The cached `vital` diagnostics are folded in, so a
+// fix is still offered when the cursor sits off the diagnostic's exact range, and
+// `context.only` is honoured per the protocol's kind hierarchy, so a
+// `source.organizeImports` on-save request gets exactly that action.
 connection.onCodeAction((params): CodeAction[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
-  const source = doc.getText();
   const uri = params.textDocument.uri;
-  const only = params.context.only;
-
-  const actions: CodeAction[] = [];
-  if (kindMatchesOnly(CodeActionKind.QuickFix, only)) {
-    const cached = (diagnosticsByUri.get(uri) ?? []).map(toLspDiagnostic);
-    const diagnostics = fixableDiagnosticsForRange(
-      params.context.diagnostics,
-      cached,
-      params.range,
-    );
-    for (const diag of diagnostics) {
-      const fixes = quickFixesForDiagnostic(source, diag.code, diag.range);
-      // A missing UFCS import is the one fix whose candidate set the document
-      // cannot supply: which modules export a `self`-function this receiver
-      // dispatches to is the CHECKER's answer, and it already rides the
-      // diagnostic (`data.modules`, spelled as specifiers this file can write).
-      // No second query — the compiler decided it once, at the raise.
-      const ufcsName = ufcsMissingImportAt(source, diag);
-      if (ufcsName !== undefined) {
-        fixes.push(...ufcsImportFixes(
-          source,
-          ufcsName,
-          ufcsImportModules(diag, cached),
-          (src, spec, name) =>
-            importInsertionEdit(
-              src,
-              spec,
-              name,
-              (stmt) => wasmChecker?.formatSrc?.(stmt),
-            ),
-        ));
-      }
-      for (const fix of fixes) {
-        actions.push({
-          title: fix.title,
-          kind: CodeActionKind.QuickFix,
-          diagnostics: [diag],
-          isPreferred: fix.isPreferred,
-          edit: { changes: { [uri]: fix.edits } },
-        });
-      }
-    }
-  }
-
-  // Organize imports: per-STATEMENT rewrite aligned with `vl fmt`'s canon —
-  // redundant specifiers dropped, unused and duplicate alike (from the lint
-  // tier, re-run against the request-time text so a stale cache can't misplace
-  // an edit), survivors fmt-sorted via the seed's own formatter, a
-  // specifier-less statement's line deleted whole. Statements are never merged
-  // or reordered (fmt preserves statement order). No edits — the file is
-  // already organized — means NO action: an empty organize on every save is
-  // noise.
-  if (kindMatchesOnly(CodeActionKind.SourceOrganizeImports, only)) {
-    // BOTH redundant codes, not the unused one alone: a duplicate specifier
-    // introduces nothing either, and its lint is anchored at the second
-    // occurrence's imported-name token precisely so this rewrite applies to it
-    // unchanged.
-    const redundant = (wasmChecker?.lint(source, lintPathFor(uri)) ?? [])
-      .filter((d) =>
-        d.code === "unused-import" || d.code === "duplicate-import"
-      )
-      .map((d) => d.range);
-    const edits = organizeImportEdits(
-      source,
-      redundant,
-      (stmt) => wasmChecker?.formatSrc?.(stmt),
-    );
-    if (edits.length > 0) {
-      actions.push({
-        title: "Organize imports",
-        kind: CodeActionKind.SourceOrganizeImports,
-        edit: { changes: { [uri]: edits } },
-      });
-    }
-  }
-  return actions;
+  return codeActionsAt(
+    doc.getText(),
+    uri,
+    params.range,
+    params.context.diagnostics,
+    () => (diagnosticsByUri.get(uri) ?? []).map(toLspDiagnostic),
+    params.context.only,
+    wasmChecker,
+    lintPathFor(uri),
+  );
 });
 
 // ---- code lens: export reference counts (D9.4) -------------------------------
@@ -1564,68 +777,22 @@ connection.onCodeAction((params): CodeAction[] => {
 // command can't be targeted directly — the standard shim, same as
 // rust-analyzer's).
 
-/** What a lens carries from compute to resolve (`CodeLens.data`, JSON-safe). */
-type RefLensData = {
-  uri: string;
-  name: string;
-  line: number; // 0-based decl-name line
-  character: number; // 0-based decl-name col
-  title: string;
-};
-
 connection.onCodeLens((params): CodeLens[] => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc || wasmChecker === undefined) return [];
-  const entryKey = entryKeyOf(params.textDocument.uri);
-  const surface = wasmChecker.moduleSurface(doc.getText(), entryKey);
-  return exportRefLenses(surface.exports, lastUseMap.get(entryKey)).map(
-    (l): CodeLens => ({
-      range: {
-        start: { line: l.line, character: l.char },
-        end: { line: l.line, character: l.char + l.length },
-      },
-      data: {
-        uri: params.textDocument.uri,
-        name: l.name,
-        line: l.line,
-        character: l.char,
-        title: refCountLensTitle(l.count),
-      } satisfies RefLensData,
-    }),
-  );
+  const ctx = featureContext(params.textDocument.uri);
+  if (!doc || ctx === undefined) return [];
+  return codeLensesAt(doc.getText(), params.textDocument.uri, ctx, lastUseMap);
 });
 
+// A closed document or a missing seed resolves to an empty peek, not an error.
 connection.onCodeLensResolve(async (lens): Promise<CodeLens> => {
   const data = lens.data as RefLensData | undefined;
   if (data === undefined) return lens;
-  // The locations behind the count: the same cross-file machinery as
-  // find-references, driven from the export's decl (`crossFileReferences`
-  // resolves the canonical export and unions per-candidate occurrences — the
-  // entry file's own uses included). A closed document / degraded checker
-  // resolves to an empty peek rather than an error.
   const doc = documents.get(data.uri);
-  let locations: { uri: string; range: Range }[] = [];
-  if (doc && wasmChecker !== undefined) {
-    const entryKey = entryKeyOf(data.uri);
-    const openDocs = documents.all().map((d) => ({ uri: d.uri, text: d.getText() }));
-    const crawlRoot = workspaceFolder
-      ? uriToPath(workspaceFolder)
-      : detectProjectRoot(entryKey);
-    const refs = await crossFileReferences(
-      data.name,
-      doc.getText(),
-      entryKey,
-      openDocs,
-      workspaceReader,
-      wasmChecker,
-      true,
-      enumerateWorkspaceFiles(crawlRoot),
-    ).catch((err) => {
-      connection.console.log(`[code-lens] reference crawl failed: ${err}`);
-      return undefined;
-    });
-    if (refs !== undefined) locations = refs;
-  }
+  const ctx = featureContext(data.uri);
+  const locations = doc && ctx !== undefined
+    ? await codeLensLocationsAt(data, doc.getText(), ctx, featureWorkspace(data.uri))
+    : [];
   lens.command = {
     title: data.title,
     command: "vital.showReferences",

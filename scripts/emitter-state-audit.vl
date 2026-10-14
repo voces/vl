@@ -1,0 +1,639 @@
+// Where is the emitter's module-scope mutable state CLEARED, and the ratchet on what is not.
+//
+//     vl run scripts/emitter-state-audit.vl [-- --names]
+//     vl run scripts/emitter-state-audit.vl -- --check | --write-baseline [--baseline P]
+//
+// Every `let` at column 0 in an emitter module survives a compile, and one wasm instance
+// runs many compiles (the LSP, `tests/cases_wasm_test.ts`). For each one this finds every
+// assignment in `compiler/*.vl`, splits out the CLEARS (the declaration's initial value
+// written back) and classifies the variable by the function that clears it: the compile
+// prologue, a pass, a frame builder, some inner function, or NEVER.
+//
+// "Cleared" is textual: a variable rewritten unconditionally every compile reads as NEVER
+// and is fine. So NEVER is a list of things to ask about, not a defect list; the witness
+// that settles a row is `tests/vl_instance_state_leak_test.ts`. The frame-builder table
+// lists the `fnUses*` flags one of the two frame builders resets and the other does not
+// (D1006/D1007), pinned by `tests/vl_emitter_state_audit_test.ts`.
+//
+// `--check` exits 1 when the NEVER count is above `scripts/emitter-state-baseline.json`
+// (lane L7's ratchet); `--write-baseline` records it, in the same PR as the change that
+// earned it. Run from the checkout root: paths are relative to the working directory.
+
+import { IoError, listDir, readTextFile, writeTextFile } from "std:fs"
+import { JsonError, parseJson } from "std:json"
+import { programArgs } from "std:args"
+import { exit, runProgram } from "std:process"
+import { Utf8Error, decodeUtf8 } from "std:utf8"
+import { toString } from "std:fmt"
+import {
+  endsWith,
+  join,
+  padEnd,
+  padStart,
+  split,
+  startsWith,
+  trim,
+} from "std:str"
+import { sort } from "std:array"
+import { JsonMap, die, hasFlag, lstripWs, stripWs } from "./lib/common"
+
+const CDIR = "compiler"
+const BASELINE = "scripts/emitter-state-baseline.json"
+
+// The emitter's own modules. The checker and the front end have the same hazard and their
+// own reset homes; this audit is scoped to the emitter, where the filed rows live.
+const EMIT = [
+  "emit_state.vl", "emit_classify.vl", "emit_collect.vl", "emit_sections.vl",
+  "emit_base.vl", "emit_rep.vl", "emit_bytes.vl", "emit_query.vl",
+  "emit_mono.vl", "emit_rewrite.vl", "emit_bignum.vl", "wasmEmit.vl",
+]
+
+// `emitProgram`'s prologue and the `*Reset` helpers it calls there: state cleared in one of
+// these is clean before any pass of the next program runs. The one hand-kept input; a helper
+// added to the prologue and not here reads as "inner", more hazardous than it is.
+const PROLOGUE = [
+  "emitProgram", "emitModule", "compileSrc", "checkSrc", "checkSrcSym",
+  "srcReset", "modReset", "resetLitAtoms", "repReset", "msPoolReset",
+  "resetRetMapFlight", "resetParentLetCache", "sidResetParentLet",
+  "sidResetStartBlockLet", "hcReset", "sidKeyedTablesReset", "structTyIxReset",
+  "structNameIxReset", "sioMemoReset", "shapeSetIxReset", "cliArgReset",
+  "lintReset", "sidReset", "tsReset", "ufcsAliasReset", "dgLosslessReset",
+  "covarWriteReset", "repSlotCacheSync", "rtSync", "repShadowSweep",
+]
+
+// `emitProgram`'s ordered pass table (`runEmitPass`): once per compile, but after the
+// prologue, so a pass-cleared column is stale for anything an earlier pass reads.
+const PASS = [
+  "collectTyParamNames", "collectU", "collectS", "collectA", "collectFns",
+  "passCheckTopLevel", "buildFnMap", "computeVoidFns", "computeRetInference",
+  "dispatchRewrite", "captureBoxRewrite", "synthRetAnnots", "synthDstPinAnns",
+  "scanArrLitCommit", "monomorphize", "collectGenAliasShapes",
+  "collectAnnShapes", "synthGlobalEmptyListAnns", "synthVoidTwins",
+  "synthExternValues", "synthParamAnnots", "collectMapFilterUse",
+  "collectFnValUse", "collectCloSigs", "scanPrintUse", "checkFnParams",
+  "capCacheBuild", "capNarrowBuild", "synthCaptureEmptyListAnns",
+  "collectInlineUnions", "computeGlobalPromotion", "mAssignTypeIndices",
+  "collectStartLocals", "gaeCollectDecls", "emitGlobalSection",
+]
+
+// The two per-function frame builders; each stands for itself plus the same-module helpers
+// it calls, which are walked rather than listed so a split of a builder is followed.
+const FRAME_ROOTS = ["emitFuncCode", "emitStartFnCode"]
+
+// One module-scope mutable. A name declared twice keeps its first slot and its last
+// declaration, as the Python original's dict did.
+type Decl = { name: string, file: string, line: i32, init: string }
+
+// One `function` span, 1-based and inclusive.
+type Span = { name: string, a: i32, b: i32 }
+
+// One compiler source: its lines (split on "\n", a trailing empty piece kept), its spans,
+// and the enclosing function of each line ("<module>" outside every span).
+type Src = { file: string, lines: string[], spans: Span[], lineFn: string[] }
+
+function isIdStart(b: i32): boolean {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+function isIdChar(b: i32): boolean { isIdStart(b) || (b >= 48 && b <= 57) }
+
+// Python's `\s` over ASCII.
+function isSp(b: i32): boolean { b == 32 || (b >= 9 && b <= 13) }
+
+function strLess(a: string, b: string): boolean { a < b }
+
+function inList(xs: readonly string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+// The identifier starting at `i`, or "" when none starts there.
+function identAt(s: string, i: i32): string {
+  if i >= s.length || !isIdStart(s[i]) { return "" }
+  let j = i + 1
+  while j < s.length && isIdChar(s[j]) { j = j + 1 }
+  s.slice(i, j)
+}
+
+// `^(export )?let NAME [: TYPE] = INIT [// …]`, the declaration shape; null when `ln` is not
+// one. The type runs to the first `=`, and the init is cut at its first `//`.
+function declOf(ln: string, file: string, line: i32): Decl | null {
+  let i = 0
+  if startsWith(ln, "export ") { i = 7 }
+  if !startsWith(ln.slice(i, ln.length), "let ") { return null }
+  i = i + 4
+  const name = identAt(ln, i)
+  if name.length == 0 { return null }
+  i = i + name.length
+  while i < ln.length && isSp(ln[i]) { i = i + 1 }
+  if i < ln.length && ln[i] == 58 {
+    i = i + 1
+    while i < ln.length && isSp(ln[i]) { i = i + 1 }
+    const t0 = i
+    while i < ln.length && ln[i] != 61 { i = i + 1 }
+    if i == t0 || i >= ln.length { return null }
+  }
+  if i >= ln.length || ln[i] != 61 { return null }
+  let rest = ln.slice(i + 1, ln.length)
+  const cut = rest.indexOf("//")
+  if cut >= 0 { rest = rest.slice(0, cut) }
+  { name: name, file: file, line: line, init: stripWs(rest) }
+}
+
+function readSrc(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("emitter-state-audit: cannot read \{path} (\{t.msg})", 1)
+    return ""
+  }
+  t
+}
+
+// Every `function` span of `lines`: a span ends at a line that is exactly `}` or just
+// before the next `function` header.
+function spansOf(lines: string[]): Span[] {
+  const out: Span[] = []
+  let cur = ""
+  let start = 0
+  let i = 0
+  while i < lines.length {
+    const ln = lines[i]
+    let h = 0
+    if startsWith(ln, "export ") { h = 7 }
+    let name = ""
+    if startsWith(ln.slice(h, ln.length), "function ") {
+      name = identAt(ln, h + 9)
+    }
+    if name.length > 0 {
+      if cur.length > 0 { out.push({ name: cur, a: start, b: i }) }
+      cur = name
+      start = i + 1
+    } else if ln == "}" && cur.length > 0 {
+      out.push({ name: cur, a: start, b: i + 1 })
+      cur = ""
+    }
+    i = i + 1
+  }
+  if cur.length > 0 { out.push({ name: cur, a: start, b: lines.length }) }
+  out
+}
+
+function loadSrc(file: string): Src {
+  const lines = split(readSrc(CDIR + "/" + file), "\n")
+  const spans = spansOf(lines)
+  const lineFn: string[] = []
+  let i = 0
+  while i <= lines.length {
+    lineFn.push("<module>")
+    i = i + 1
+  }
+  for sp in spans {
+    let k = sp.a
+    while k <= sp.b {
+      if lineFn[k] == "<module>" { lineFn[k] = sp.name }
+      k = k + 1
+    }
+  }
+  { file: file, lines: lines, spans: spans, lineFn: lineFn }
+}
+
+// `root` plus the functions it calls that its own module declares: one level deep, since a
+// builder split into helpers keeps them beside itself. Empty when no module declares it.
+function frameSide(root: string, srcs: Src[]): string[] {
+  for s in srcs {
+    const own = Map<string, boolean>()
+    for sp in s.spans { own[sp.name] = true }
+    if own[root] == null { continue }
+    const side: string[] = [root]
+    for sp in s.spans {
+      if sp.name != root { continue }
+      const body = join(s.lines.slice(sp.a, sp.b), "\n")
+      let i = 0
+      while i < body.length {
+        if !isIdChar(body[i]) {
+          i = i + 1
+          continue
+        }
+        let j = i
+        while j < body.length && isIdChar(body[j]) { j = j + 1 }
+        const before = i == 0 || body[i - 1] != 46
+        if before && isIdStart(body[i]) {
+          let k = j
+          while k < body.length && isSp(body[k]) { k = k + 1 }
+          if k < body.length && body[k] == 40 {
+            const callee = body.slice(i, j)
+            if own[callee] != null && !inList(side, callee) {
+              side.push(callee)
+            }
+          }
+        }
+        i = j
+      }
+    }
+    return side
+  }
+  []
+}
+
+// One assignment the scan found: which declaration, which function, and whether it clears.
+type Write = { ix: i32, fn: string, clear: boolean }
+
+// Every `NAME = RHS` in `text` (a line with its comment cut) whose NAME is declared: NAME not
+// preceded by an identifier character or `.`, `=` not followed by `=`, and RHS running to the
+// first `}` or the end of the line.
+function writesIn(
+  text: string,
+  ixOf: Map<string, i32>,
+  decls: Decl[],
+  fn: string,
+  out: Write[],
+) {
+  let i = 0
+  while i < text.length {
+    if !isIdChar(text[i]) {
+      i = i + 1
+      continue
+    }
+    let j = i
+    while j < text.length && isIdChar(text[j]) { j = j + 1 }
+    const before = i == 0 || text[i - 1] != 46
+    let next = j
+    if before && isIdStart(text[i]) {
+      const ix = ixOf[text.slice(i, j)]
+      if ix != null {
+        let k = j
+        while k < text.length && isSp(text[k]) { k = k + 1 }
+        const eq = k < text.length && text[k] == 61
+        if eq && !(k + 1 < text.length && text[k + 1] == 61) {
+          k = k + 1
+          while k < text.length && isSp(text[k]) { k = k + 1 }
+          if k < text.length {
+            let t = k + 1
+            while t < text.length && text[t] != 125 { t = t + 1 }
+            let rhs = stripWs(text.slice(k, t))
+            let e = rhs.length
+            while e > 0 && rhs[e - 1] == 125 { e = e - 1 }
+            rhs = stripWs(rhs.slice(0, e))
+            out.push({ ix: ix, fn: fn, clear: rhs == decls[ix].init })
+            next = t + 1
+          }
+        }
+      }
+    }
+    i = next
+  }
+  0
+}
+
+// The compiler's sources, sorted by name.
+function compilerFiles(): string[] {
+  const ents = listDir(CDIR)
+  if ents is IoError {
+    die("emitter-state-audit: cannot list \{CDIR} (\{ents.msg})", 1)
+    return []
+  }
+  const out: string[] = []
+  for e in ents {
+    if endsWith(e, ".vl") { out.push(e) }
+  }
+  sort(out, strLess)
+  out
+}
+
+// The whole audit's result, for the report and the ratchet alike.
+type Audit = {
+  decls: Decl[],
+  kinds: string[],
+  homes: string[][],
+  writes: i32[],
+  assigned: string[][],
+  sides: string[][],
+}
+
+function addUnique(xs: string[], x: string) {
+  if !inList(xs, x) { xs.push(x) }
+  0
+}
+
+function audit(): Audit {
+  const files = compilerFiles()
+  const srcs: Src[] = []
+  for f in files { srcs.push(loadSrc(f)) }
+
+  const decls: Decl[] = []
+  const ixOf = Map<string, i32>()
+  for f in EMIT {
+    if !inList(files, f) { continue }
+    let s = srcs[0]
+    for x in srcs {
+      if x.file == f { s = x }
+    }
+    // The Python original iterated the file's lines, so a trailing empty piece is no line.
+    let n = s.lines.length
+    if n > 0 && s.lines[n - 1].length == 0 { n = n - 1 }
+    let i = 0
+    while i < n {
+      const d = declOf(s.lines[i], f, i + 1)
+      if d != null {
+        const at = ixOf[d.name]
+        if at != null {
+          decls[at] = d
+        } else {
+          ixOf[d.name] = decls.length
+          decls.push(d)
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  const sides: string[][] = []
+  for r in FRAME_ROOTS {
+    const side = frameSide(r, srcs)
+    if side.length == 0 {
+      die(
+        "no compiler/*.vl function declares: "
+          + r
+          + "\nthe frame-builder anchors moved; re-point FRAME_ROOTS.",
+        2,
+      )
+    }
+    sides.push(side)
+  }
+
+  const ws: Write[] = []
+  for s in srcs {
+    let n = s.lines.length
+    if n > 0 && s.lines[n - 1].length == 0 { n = n - 1 }
+    let i = 0
+    while i < n {
+      const ln = s.lines[i]
+      const lead = lstripWs(ln)
+      if !startsWith(lead, "//") && !declLead(ln) {
+        let text = ln
+        const cut = text.indexOf("//")
+        if cut >= 0 { text = text.slice(0, cut) }
+        writesIn(text, ixOf, decls, s.lineFn[i + 1], ws)
+      }
+      i = i + 1
+    }
+  }
+
+  const writes: i32[] = []
+  const homes: string[][] = []
+  const assigned: string[][] = []
+  for _d in decls {
+    writes.push(0)
+    homes.push([])
+    assigned.push([])
+  }
+  for w in ws {
+    writes[w.ix] = writes[w.ix] + 1
+    addUnique(assigned[w.ix], w.fn)
+    if w.clear { addUnique(homes[w.ix], w.fn) }
+  }
+
+  const frame: string[] = []
+  for side in sides {
+    for x in side { addUnique(frame, x) }
+  }
+  const kinds: string[] = []
+  let k = 0
+  while k < decls.length {
+    const h = homes[k]
+    sort(h, strLess)
+    let kind = "NEVER"
+    if h.length > 0 { kind = "inner" }
+    if anyIn(h, frame) { kind = "frame" }
+    if anyIn(h, PASS) { kind = "pass" }
+    if anyIn(h, PROLOGUE) { kind = "prologue" }
+    kinds.push(kind)
+    k = k + 1
+  }
+  {
+    decls: decls,
+    kinds: kinds,
+    homes: homes,
+    writes: writes,
+    assigned: assigned,
+    sides: sides,
+  }
+}
+
+// `^(export )?let\s`: the line is a declaration, so its `=` is no write.
+function declLead(ln: string): boolean {
+  let i = 3
+  if startsWith(ln, "export ") { i = 10 }
+  if !startsWith(ln.slice(i - 3, ln.length), "let") { return false }
+  i < ln.length && isSp(ln[i])
+}
+
+function anyIn(xs: readonly string[], set: readonly string[]): boolean {
+  for x in xs {
+    if inList(set, x) { return true }
+  }
+  false
+}
+
+function countKind(a: Audit, kind: string): i32 {
+  let n = 0
+  for k in a.kinds {
+    if k == kind { n = n + 1 }
+  }
+  n
+}
+
+function sortedIx(a: Audit, pred: (i32) => boolean): i32[] {
+  const ixs: i32[] = []
+  let i = 0
+  while i < a.decls.length {
+    if pred(i) { ixs.push(i) }
+    i = i + 1
+  }
+  sort(ixs, (x: i32, y: i32): boolean => a.decls[x].name < a.decls[y].name)
+  ixs
+}
+
+function yesNo(b: boolean): string {
+  if b { return "yes" }
+  "NO"
+}
+
+function report(a: Audit, names: boolean) {
+  print("module-scope mutables in the emitter: " + toString(a.decls.length))
+  for k in ["prologue", "pass", "frame", "inner", "NEVER"] {
+    print(
+      "  " + padEnd(k, 9, " ") + " " + padStart(toString(countKind(a, k)), 4, " "),
+    )
+  }
+  const ra = FRAME_ROOTS[0]
+  const rb = FRAME_ROOTS[1]
+  print(
+    "\nTHE TWO FRAME BUILDERS MUST AGREE — a flag one clears and the other does not",
+  )
+  print(
+    "survives into the next program's START function. Each side is the root plus the",
+  )
+  print("helpers its own module splits it into:")
+  let r = 0
+  while r < FRAME_ROOTS.length {
+    const rest: string[] = []
+    for x in a.sides[r] {
+      if x != FRAME_ROOTS[r] { rest.push(x) }
+    }
+    sort(rest, strLess)
+    let shown = join(rest, ", ")
+    if shown.length == 0 { shown = "-" }
+    print("  " + padEnd(FRAME_ROOTS[r], 16, " ") + " " + shown)
+    r = r + 1
+  }
+  print("")
+  const bad: string[] = []
+  const flags = sortedIx(
+    a,
+    (i: i32): boolean => startsWith(a.decls[i].name, "fnUses"),
+  )
+  for i in flags {
+    const n = a.decls[i].name
+    const sa = anyIn(a.assigned[i], a.sides[0])
+    const sb = anyIn(a.assigned[i], a.sides[1])
+    let tail = ""
+    if sa != sb {
+      bad.push(n)
+      tail = "   <-- ASYMMETRIC"
+    }
+    const fa = padEnd(yesNo(sa), 4, " ")
+    const fb = padEnd(yesNo(sb), 4, " ")
+    print("  \{padEnd(n, 20, " ")} \{ra} \{fa} \{rb} \{fb}\{tail}")
+  }
+  let badShown = join(bad, ", ")
+  if badShown.length == 0 { badShown = "none" }
+  print("  \{bad.length} of \{flags.length} asymmetric: \{badShown}")
+
+  const never = sortedIx(a, (i: i32): boolean => a.kinds[i] == "NEVER")
+  print(
+    "\nNEVER CLEARED (\{never.length}) — ask whether each is rewritten unconditionally per compile",
+  )
+  for i in never {
+    const d = a.decls[i]
+    const nm = padEnd(d.name, 24, " ")
+    const ln = padEnd(toString(d.line), 6, " ")
+    const ini = padEnd(d.init, 8, " ")
+    print("  \{nm} \{d.file}:\{ln} init=\{ini} writes=\{a.writes[i]}")
+  }
+
+  if names {
+    print("\nEVERY MUTABLE, with its clear sites")
+    const all = sortedIx(a, (_i: i32): boolean => true)
+    sort(all, (x: i32, y: i32): boolean => {
+      const dx = a.decls[x]
+      const dy = a.decls[y]
+      if dx.file != dy.file { return dx.file < dy.file }
+      dx.line < dy.line
+    })
+    for i in all {
+      const d = a.decls[i]
+      let hs = join(a.homes[i], ", ")
+      if hs.length == 0 { hs = "-" }
+      const k = padEnd(a.kinds[i], 9, " ")
+      const nm = padEnd(d.name, 26, " ")
+      const ln = padEnd(toString(d.line), 6, " ")
+      print("  \{k} \{nm} \{d.file}:\{ln} \{hs}")
+    }
+  }
+  0
+}
+
+// The short sha the baseline was written from: provenance for a reader, never an input.
+function headCommit(): string {
+  const r = runProgram("git", ["rev-parse", "--short", "HEAD"])
+  if r is IoError { return "unknown" }
+  if r.code != 0 { return "unknown" }
+  const t = decodeUtf8(r.stdout)
+  if t is Utf8Error { return "unknown" }
+  trim(t)
+}
+
+function loadNever(path: string): i32 {
+  const text = readTextFile(path)
+  if text is IoError {
+    die(
+      "emitter-state-audit: cannot read the baseline \{path} (\{text.msg}). Write one with\n  vl run scripts/emitter-state-audit.vl -- --write-baseline",
+      1,
+    )
+    return 0
+  }
+  const row = parseJson(text)
+  if row is JsonMap {
+    const v = row["never"]
+    if v is f64 {
+      const n = v as? i32
+      if n != null { return n }
+    }
+    die("emitter-state-audit: " + path + " has no integer `never` field", 1)
+    return 0
+  }
+  if row is JsonError {
+    die("emitter-state-audit: " + path + " is not JSON: " + row.msg, 1)
+    return 0
+  }
+  die("emitter-state-audit: " + path + " is not a JSON object", 1)
+  0
+}
+
+function flagValue(
+  args: readonly string[],
+  flag: string,
+  fallback: string,
+): string {
+  let i = 0
+  while i + 1 < args.length {
+    if args[i] == flag { return args[i + 1] }
+    i = i + 1
+  }
+  fallback
+}
+
+function main(args: readonly string[]) {
+  const baseline = flagValue(args, "--baseline", BASELINE)
+  if hasFlag(args, "--write-baseline") {
+    const a = audit()
+    const never = countKind(a, "NEVER")
+    const commit = headCommit()
+    const w = writeTextFile(
+      baseline,
+      "{\"never\": \{never}, \"commit\": \"\{commit}\"}\n",
+    )
+    if w != null {
+      die("emitter-state-audit: cannot write \{baseline} (\{w.msg})", 1)
+    }
+    print("wrote \{baseline}: \{never} never-cleared at \{commit}")
+    return 0
+  }
+  if hasFlag(args, "--check") {
+    const base = loadNever(baseline)
+    const a = audit()
+    const never = countKind(a, "NEVER")
+    const line = "never-cleared emitter state \{never} of \{a.decls.length} mutables (baseline \{base})"
+    if never > base {
+      print("emitter state budget EXCEEDED: " + line)
+      print(
+        "A module-scope `let` in an emitter module that no reset clears survives into the next compile on the same instance.\nClear it in `emitProgram`'s prologue, a pass or a frame builder, or derive it per call. Names:\n  vl run scripts/emitter-state-audit.vl",
+      )
+      exit(1)
+      return 0
+    }
+    print(line)
+    return 0
+  }
+  report(audit(), hasFlag(args, "--names"))
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("emitter-state-audit: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  main(argv)
+}

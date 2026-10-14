@@ -212,8 +212,8 @@ jobs:
       # self-compile; a stale seed climbs two or three rungs. Whatever rung proves out is
       # what the cache entry above saves, so every downstream job runs the proven fixpoint.
       # The two FUEL sidecars are left to the jobs that meter fuel (`ci-cost`, and a native
-      # shard whose files read `$VL_FUEL`): each is a whole-seed JIT, and warming them here
-      # put both on the critical path of every job.
+      # shard whose files read `$VL_FUEL`), which share them through their own `vl-fuel-`
+      # cache: each is a whole-seed JIT, and warming them here put both on the critical path.
       - name: Refresh seed + native fixpoint (self-reproduction ladder)
         if: steps.docs_check.outputs.docs_only != 'true'
         run: ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars
@@ -267,16 +267,35 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
+      # The fuel tags only for a shard that meters fuel; `seed` warms the rest.
+      - name: Does this shard meter fuel
+        id: fuel
+        run: |
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
+          # shellcheck disable=SC2086  # one argument per file
+          if grep -q VL_FUEL $files; then echo "need=true" >> "$GITHUB_OUTPUT"; fi
+
+      # The two fuel sidecars are a whole-seed JIT each, so they get their own cache keyed on
+      # the seed's: the first job to warm them saves, and every later job (and a later run on
+      # the same compiler) restores instead of re-JITing. `ci-cost` shares the key.
+      - name: Cache the fuel sidecars
+        if: steps.fuel.outputs.need == 'true'
+        uses: actions/cache@v5
+        with:
+          path: build/fuel-sidecars
+          key: vl-fuel-${{ needs.seed.outputs.seed_key }}
+
       # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
       # stays as the net for a runner that refuses the pinned level, where every test worker
       # would otherwise JIT the seed at once.
-      # The fuel tags only for a shard that meters fuel; `seed` warms the rest.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
-          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
-          # shellcheck disable=SC2086  # one argument per file
-          if grep -q VL_FUEL $files; then bash scripts/warm-seed.sh --fuel; else bash scripts/warm-seed.sh; fi
+          if [ "${{ steps.fuel.outputs.need }}" = true ]; then
+            bash scripts/warm-seed.sh --fuel --stash build/fuel-sidecars
+          else
+            bash scripts/warm-seed.sh
+          fi
 
       # `--parallel` fans the test FILES across the cores (one worker process each); every
       # case spawns its own `vl` subprocess, so cases are isolated regardless of schedule.
@@ -360,6 +379,10 @@ jobs:
       # The Python ratchet: tracked .py files and lines only fall.
       - name: Python budget (ratchet)
         run: scripts/vl-host/target/release/vl run scripts/py-budget.vl -- --check
+
+      # Lane L7's ratchet: emitter module-scope state that no reset clears only falls.
+      - name: Emitter state budget (ratchet)
+        run: scripts/vl-host/target/release/vl run scripts/emitter-state-audit.vl -- --check
 
       # The capability probes' behavioural half: every witness-backed refusal still refuses
       # with its literal, and no probe traps the compiler, emits a module that does not
@@ -633,13 +656,20 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
+      # Shares `ci-native`'s fuel-sidecar cache: a restore turns the two fuel JITs into links.
+      - name: Cache the fuel sidecars
+        uses: actions/cache@v5
+        with:
+          path: build/fuel-sidecars
+          key: vl-fuel-${{ needs.seed.outputs.seed_key }}
+
       # `$VL_ISA` makes the cached sidecars load on any runner, so this is near-instant; it
       # stays as the net for a runner that refuses the pinned level, where every test worker
       # would otherwise JIT the seed at once.
       - name: Warm the seed's sidecars
         run: |
           grep -m1 'model name' /proc/cpuinfo
-          bash scripts/warm-seed.sh --fuel
+          bash scripts/warm-seed.sh --fuel --stash build/fuel-sidecars
 
       # Guest fuel and peak RSS of one `-O` build of each of two plumb-shaped units. No
       # binaryen here, so `-O`'s wasm-opt step is skipped; the tool reads each build's

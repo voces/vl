@@ -15,7 +15,7 @@
 // fused `?? d` over a literal-union list's `pop()` — and it is check-clean invalid wasm
 // on the current seed. When D1413 is fixed this suite goes RED at the "still invalid"
 // assertion rather than silently measuring nothing; the replacement is any other
-// check-clean invalid-wasm program (`scripts/goal-scoreboard.py` names the population).
+// check-clean invalid-wasm program (`scripts/goal-scoreboard.vl` names the population).
 //
 // GATING: `SELFHOST_NATIVE_ALIGN=1` plus the built binary and seed, as vl_check_dir_test.ts.
 //
