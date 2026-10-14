@@ -105,15 +105,11 @@ function hostValueFlags(sub: string): string[] {
 }
 
 // The host strips `--extern` before the VL parser sees the argv
-// (`take_test_externs`), so only the host lists it.
+// (`take_test_externs`), so only the host lists it. Every other flag is in both
+// tables: the token after a value-taking flag is always its value (owner ruling
+// 2026-10-14), so `vl check --budget --help` is the same usage error, exit 2, as
+// `vl check --severity --help`.
 const HOST_ONLY: Record<string, string[]> = { test: ["--extern"] };
-// Taken as a value by the VL side, missing from `value_flags`: today
-// `vl check --budget --help` prints help (exit 0) where `--severity --help` is a
-// usage error (exit 2). Which of the two is right is a CLI surface question; the
-// list pins it until it is answered, and a change to either side reds here.
-const UNDECIDED: Record<string, string[]> = {
-  check: ["--budget", "--budget-why", "--findings"],
-};
 
 Deno.test("value-taking flags: value_flags agrees with cliParseArgs", () => {
   const vl = vlValueFlags();
@@ -124,10 +120,6 @@ Deno.test("value-taking flags: value_flags agrees with cliParseArgs", () => {
     const host = hostValueFlags(sub).filter((f) =>
       !(HOST_ONLY[sub] ?? []).includes(f)
     );
-    same(
-      `\`vl ${sub}\`: value_flags (plus the undecided) against cliParseArgs`,
-      flags,
-      [...host, ...(UNDECIDED[sub] ?? [])],
-    );
+    same(`\`vl ${sub}\`: value_flags against cliParseArgs`, flags, host);
   }
 });

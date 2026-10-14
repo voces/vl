@@ -446,6 +446,12 @@ zero, for `lint-self.sh`. `compiler/cli_budget.vl`; the first ratchet on it is i
 (architecture-refactor-plan T2), which has no script any more: `tests/vl_budget_mode_test.ts`
 holds the three verbs to one answer.
 
+`--budget`, `--budget-why` and `--findings` take the next token as their value whatever it
+is, like `--severity` (owner ruling, 2026-10-14): `vl check --budget --help` is a usage
+error, exit 2, not help. The host's `value_flags` lists every flag `cliParseArgs` takes a
+value for, so its help scan skips the same token; `tests/cli_host_tables_test.ts` holds the
+two tables equal.
+
 ## `std:` diagnostics are withheld unless asked for (`--include-std`)
 
 A `vl check` target resolves its whole module graph, so every `import … from
