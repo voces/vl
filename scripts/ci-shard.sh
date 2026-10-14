@@ -62,12 +62,11 @@ vl_large_source_test.ts 5
 vl_sentinel_index_test.ts 4
 vl_kind_ladder_test.ts 3
 vl_deep_else_chain_test.ts 40
-vl_buffer_view_bounds_shape_test.ts 34
-selfhost_native_release_shape_test.ts 31
-vl_buffer_view_bounds_contract_test.ts 25
-selfhost_native_release_escape_test.ts 24
-selfhost_native_release_melt_test.ts 19
-selfhost_native_release_loops_test.ts 18
+vl_buffer_view_bounds_shape_test.ts 11
+selfhost_native_release_shape_test.ts 9
+selfhost_native_release_escape_test.ts 8
+selfhost_native_release_melt_test.ts 6
+selfhost_native_release_loops_test.ts 6
 selfhost_native_opt_test.ts 9
 vl_getter_body_shape_test.ts 8
 selfhost_native_release_runonce_test.ts 7
