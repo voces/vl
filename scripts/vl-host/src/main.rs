@@ -1366,15 +1366,23 @@ fn compile_engine(source_len: usize) -> Result<Engine> {
     }
     COMPILE_UNDER_NULL.store(!matches!(collector, Collector::Copying), Ordering::Relaxed);
     match collector {
-        Collector::Copying => seed_engine_sized(
-            collector,
-            Some(compile_heap_initial(COPYING_COMPILE_HEAP_INITIAL)?),
-        ),
+        Collector::Copying => copying_seed_engine(),
         _ => seed_engine(collector),
     }
 }
 
-/// The copying compile's first GC heap, 128 MiB per semispace; the heap doubles from
+/// The seed engine under the copying collector, shared by the one-shot compile and the CLI
+/// pump. A serialized module loads only into an engine with the same tunables, the first
+/// GC heap size among them, so giving both the same heap makes them one configuration with
+/// one `.cwasm` sidecar instead of two copies of the same code.
+fn copying_seed_engine() -> Result<Engine> {
+    seed_engine_sized(
+        Collector::Copying,
+        Some(compile_heap_initial(COPYING_COMPILE_HEAP_INITIAL)?),
+    )
+}
+
+/// The copying seed store's first GC heap, 128 MiB per semispace; the heap doubles from
 /// here. Starting from 0 costs CPU: the small early heaps collect over and over. The knee
 /// of a 2 MB unit's CPU/RSS curve (D2319), and `$VL_COMPILE_GC_HEAP` overrides it.
 const COPYING_COMPILE_HEAP_INITIAL: u64 = 256 << 20;
@@ -1763,10 +1771,10 @@ fn embedded_seed() -> Option<&'static [u8]> {
 /// A short stable token naming the ENGINE CONFIGURATION a compiled module belongs to.
 ///
 /// A serialized module only deserializes into an engine whose config matches the one
-/// that compiled it, and this host builds SEVERAL from the same seed: the one-shot
-/// compile paths (`build`, `run`) use `Collector::Null` while the CLI pump (`check`,
-/// `fmt`, `test`) uses a collecting one, and the collector is part of the compiled
-/// code (it decides the GC barriers Cranelift emits). Every cache path is therefore
+/// that compiled it, and this host builds SEVERAL from the same seed: the copying engine
+/// that `build`, `run` and the CLI pump share, `run --batch`'s and the self-compile's
+/// null-collector one, and a fuel-metered twin of each. The collector is part of the
+/// compiled code (it decides the GC barriers Cranelift emits). Every cache path is therefore
 /// keyed on this token, so each configuration gets its OWN entry and all of them stay
 /// warm — one shared path instead has alternating commands overwrite each other and
 /// pay a full Cranelift recompile of the seed per alternation, a fixed cost that
@@ -5867,13 +5875,12 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// `--enable-tail-call` is the same shape of flag for the same reason. Binaryen 130
 /// HARD-FAILS validation on `return_call`/`return_call_indirect` without it —
 /// measured: `rc=1`, "return_call* requires tail calls", and NO OUTPUT FILE
-/// WRITTEN, so `vl build -O` would `bail!` on every tail-recursive program. It is
-/// enabled AHEAD of the emitter producing the opcode so the day it does, neither
-/// rung breaks. Measured with it: `return_call` survives both `-O` and the full
-/// release profile intact, and wasmtime 47 runs the result with no host change
-/// (the proposal is on by default there). Because the enables are orthogonal to
-/// the optimization level, this belongs in the SHARED list — a rung that missed it
-/// would fail on exactly the programs the other rung optimizes fine.
+/// WRITTEN, so `vl build -O` would `bail!` on every tail-recursive program, and the
+/// emitter writes `return_call` for a direct tail call (ROADMAP B18). Measured with
+/// it: `return_call` survives both `-O` and the full release profile intact, and
+/// wasmtime runs the result with no host change (the proposal is on by default).
+/// Because the enables are orthogonal to the optimization level, this belongs in the
+/// SHARED list — a rung that missed it would fail on exactly the programs the other rung optimizes fine.
 ///
 /// `--enable-simd` is the same shape once more — the fixed-width 128-bit SIMD flag.
 /// Binaryen 130 rejects any `0xFD` opcode (`v128.*`, `f32x4.*`, …) without it, the
@@ -8074,17 +8081,17 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // validates (and never, on a run that validates nothing).
     let fault = fault_injection()?;
 
-    // A COLLECTING collector, unlike the one-shot compile paths. The pump drives one
+    // A COLLECTING collector: the copying engine `vl build`/`vl run` compile under, so the
+    // two load one `.cwasm` sidecar (`copying_seed_engine`). The pump drives one
     // compiler instance across every file a directory walk finds, so its garbage grows
     // with the FILE COUNT; under the null collector the heap only ever grows and a walk
     // of a few dozen files dies with `wasm trap: allocation size too large`. Two copies
     // of this repo's own `compiler/` (54 files) were enough.
-    let engine = seed_engine(match std::env::var("VL_PUMP_GC").ok().as_deref() {
-        Some("null") => Collector::Null,
-        Some("tracing") => Collector::Copying,
-        Some("refcount") => Collector::DeferredReferenceCounting,
-        _ => Collector::Auto,
-    })?;
+    let engine = match std::env::var("VL_PUMP_GC").ok().as_deref() {
+        Some("null") => seed_engine(Collector::Null)?,
+        Some("refcount") => seed_engine(Collector::DeferredReferenceCounting)?,
+        _ => copying_seed_engine()?,
+    };
     let ((mut store, inst), compiler_module) = load_compiler_keep(&engine, &compiler)?;
 
     // TTY + NO_COLOR + TERM is host mechanism; the VL formatter can't probe isatty,

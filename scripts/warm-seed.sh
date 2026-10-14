@@ -4,9 +4,9 @@
 #
 #   scripts/warm-seed.sh [--fuel] [--stash <dir>] [<seed>]     default seed: build/vl-compiler.wasm
 #
-# Three tags always: the null-collector compile (refresh-compiler.sh's pin), the
-# collecting `check`/`fmt`/`test` pump, and the copying compile every `vl build`/`vl run`
-# gets by default. `--fuel` adds the two `$VL_FUEL=1` tags the cost rows compile under.
+# Two tags always: the null-collector compile (refresh-compiler.sh's pin), and the copying
+# seed engine that `vl build`/`vl run` and the `check`/`fmt`/`test` pump share. `--fuel` adds
+# the two `$VL_FUEL=1` tags the cost rows compile under.
 # `--stash <dir>` places every sidecar in <dir> beside the seed first, then places every
 # sidecar this run created into <dir>, so a CI cache of <dir> carries them to the next job.
 #
@@ -46,9 +46,6 @@ note() { echo "  note: could not warm the $1 sidecar — its first use re-JITs t
 warm_null() {
   VL_COMPILE_GC=null "$VL" run "$WORK/hello.vl" --compiler "$SEED" > /dev/null 2>&1 || note "null-compile"
 }
-warm_check() {
-  "$VL" check "$WORK/hello.vl" --compiler "$SEED" > /dev/null 2>&1 || note "check"
-}
 warm_copying() {
   VL_COMPILE_GC=copying "$VL" build "$WORK/hello.vl" -o "$WORK/copying.wasm" \
     --compiler "$SEED" > /dev/null 2>&1 || note "copying-compile"
@@ -58,7 +55,7 @@ warm_fuel() {
     --compiler "$SEED" > /dev/null 2>&1 || note "fuel/$1"
 }
 
-warm_null & warm_check & warm_copying &
+warm_null & warm_copying &
 if [ "$FUEL" = 1 ]; then warm_fuel copying & warm_fuel null & fi
 wait
 
