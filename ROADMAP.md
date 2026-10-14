@@ -3030,8 +3030,15 @@ in-language GC knobs.
   `build.rs`'s `VL_SEED_KEY` forces a full crate recompile of the embed job every push (§3 item 8,
   ~16 s on a job that is not the critical path — the 48 s first reading was runner variance, and
   §1.5.1 records that correction as the method point it is).
-- ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
-  position and emit it.
+- 🟡 **B18. Tail-call optimization.** SHIPPED for direct calls with a value result (#1324,
+  `perf-landscape.md` §P1: 2.01x, recursion depth ~32k → 5M); `emitTailCallRet` rewrites a
+  trailing `call` into `return_call`, and wasmtime 49 runs it with tail calls on by default.
+  Witness `tests/cases/functions/tail-call-depth.vl` (self + mutual, 5M deep) runs on the
+  wasmtime 49 host. Re-graded 2026-10-14 at 5M deep: a `string` result and a UFCS `self` method
+  also run. REMAINING, each still a plain `call` that exhausts the stack: a VOID function's
+  tail call (`return f(n - 1)` or a bare trailing `f(n - 1)`; `fRetVoid` declines it), a
+  function with a union result (`i32 | string`; `fnUsesUnionSink` declines it), and a call
+  through a function value (`const g = step; return g(…)`, no `return_call_ref`).
 - ✅ **B-chore-liststore-fuse. The three split-form list stores in `emit_rep.vl` are re-fused.**
   #921's workarounds at the tree builders (`rtGo`'s array arm, `rtOfNullable`, `rtOfMap`) had to
   stay ONE seed generation, because the published seed's store lowering predated the indexed-store

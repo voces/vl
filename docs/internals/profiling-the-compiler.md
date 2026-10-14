@@ -479,6 +479,56 @@ Every other axis moved under 1% between the engines except `generic chain depth`
 `covariant record deliveries to a recursive callee` at 82.6% and `arithmetic operator chain
 length` at 82.0%.
 
+## Measured 2026-10-14 (cont.) — the seed JIT's Cranelift settings, and one sidecar fewer
+
+Two wasmtime 49 knobs, A/B'd on the seed engine with everything else held: `compiler_inlining`
+(`Inlining::Yes`) and the SinglePass register allocator (`RegallocAlgorithm::SinglePass`, against
+the default backtracking one). Same seed, a private copy per setting, interleaved base / inline /
+single for three reps; CPU is user+sys of the `vl` process, and the box was shared with other
+agents throughout, so each row names the 1-minute load it ran under. Fuel is no use here: it
+counts guest instructions, and a code-quality change does not alter which ones run.
+
+| row | load | base | inline | single |
+| --- | ---: | ---: | ---: | ---: |
+| cold seed JIT (`vl build` of a 1-line file, no sidecar), CPU s | 39–242 | 40.7 · 40.7 · 42.6 | 47.0 · 62.7 · 56.9 | 25.8 · 29.5 · 31.0 |
+| … its peak RSS | | 1.97 GB | **7.25 GB** | 1.29 GB |
+| … the `.cwasm` it writes | | 44.5 MB | 61.9 MB | 73.7 MB |
+| self-compile of `compiler/entry.vl`, CPU s | 47–242 | 27.3 · 41.0 · 37.7 | 25.2 · 41.6 · 42.3 | 44.6 · 58.5 · 53.4 |
+| distilled corpus (`regress.vl`), CPU s | 39–101 | 118.9 · 104.9 · 69.7 | (126.0) · 110.5 · 82.5 | 161.6 · 118.3 · 129.7 |
+| distilled corpus, wall s | | 23.5 · 27.9 · 14.4 | 36.1 · 22.5 · 17.3 | 45.8 · 21.2 · 23.9 |
+
+All three settings produce a byte-identical compiler from the self-compile, and every distilled
+run reads 0 `runs → not-runs`. Neither knob is adopted:
+
+* **Inlining** pays 40% more CPU and 3.7x the memory to JIT the seed, and a 39% larger sidecar,
+  for no gain where the seed runs: against base in the same rep the self-compile reads −8%,
+  +1.5% and +12%, the corpus +5% and +18% (its first rep re-JITed a sidecar the warm-up
+  missed, 7.25 GB peak, so that reading is not comparable and is left out). A 7 GB cold compile is also a hazard of its
+  own on a box running six agents.
+* **SinglePass** JITs the seed 28% faster on 35% less memory, and the code it writes is slower
+  in every pairing: the self-compile +63%, +43% and +41%, the corpus +36%, +13% and +86%. A
+  cold JIT happens once per seed per engine; the code runs on every invocation after it.
+
+**The pump now shares `vl build`'s engine.** `vl check`/`fmt`/`test` used `Collector::Auto` with
+no first heap size while the copying compile asked for 256 MiB. On wasmtime 49 Auto resolves to
+the copying collector, so the two compiled identical code, but the heap size is one of the
+tunables a serialized module must match, so each held its own 44.5 MB sidecar. They now build
+one engine (`copying_seed_engine`), `scripts/warm-seed.sh` warms two tags instead of three
+(plus the two fuel tags under `--fuel`), and the pump starts at the copying compile's heap.
+Old pump (first heap 0) against new (256 MiB), interleaved, three reps, CPU s / peak RSS:
+
+| workload | load | old | new |
+| --- | ---: | --- | --- |
+| `vl check compiler/entry.vl` | 9–44 | 9.8 · 15.1 · 10.0 / 1,065 MB | 10.3 · 9.8 · 10.6 / 1,077 MB |
+| `vl check compiler` (directory) | 10–37 | 95.1 · 92.2 · 66.2 / 1,065 MB | 97.9 · 63.1 · 121.1 / 1,077 MB |
+| `vl fmt --check compiler` | 9–78 | 4.3 · 4.3 · 5.0 / 288 MB | **2.0 · 1.4 · 2.6** / 305 MB |
+| `vl test tests/fixtures --jobs 4` | 8–79 | 4.0 · 4.1 · 4.2 / 115 MB | 2.9 · 2.2 · 3.2 / 116 MB |
+| `vl test tests/fixtures --jobs 1` | 8–79 | 3.7 · 2.1 · 2.1 / 123 MB | 2.5 · 1.9 · 3.2 / 193 MB |
+| `vl check std` | | 0.2 / 55 MB | 0.2 / 141 MB |
+
+`fmt` halves because its many small files no longer collect a growing-from-zero heap over and
+over; `check` is within load noise; the price is up to ~86 MB more peak RSS on a small run.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
@@ -527,7 +577,7 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   a weaker injection read +34% and passed — as it also would have on the CPU row. It catches
   the D1090 class, a many-fold blowup; the shape family is what sees a smaller multiplier, and
   says where.
-* **`scripts/plumb-shape-cost.py`** — what one `vl build --names -O --import-memory` of a 2 MB
+* **`scripts/plumb-shape-cost.vl`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that
   compiles the generator differently reds too): ~250 functions with a heavy tail, one 8,000-line

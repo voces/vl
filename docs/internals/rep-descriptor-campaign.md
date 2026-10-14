@@ -2570,3 +2570,88 @@ no-instance LEFT-ONLY cannot be covered by any pin, and the ladder's out-of-scop
    join.
 4. The monomorphic LEFT-ONLY (15,049): a narrowed nullable read and a union holding a nullable
    union, as in §13.11.
+
+### 13.13 The oracle reports by family, and a call reads the column (L2 stage 3)
+
+This step takes item 1 of §13.12 and the largest part of what is left after it.
+
+**The oracle compares like with like.** `repABNoteListRep` now notes a disagreement under one of
+four families (`listRepFamilyOf`, `compiler/emit_classify.vl`):
+
+* `listRep/open`: the node's type after `nodeTyInOf` still holds a type variable;
+* `listRep/scope`: an `Ident` with no live slot, and no parameter, capture or module global of
+  that name (`identReadOutOfScope`);
+* `listRep/narrowed`: the column names a nullable list whose base is the ladder's list;
+* `listRep`: everything else, where both sides answer the same question.
+
+Only the note's name changed, and the four families add up exactly to §13.12's totals. Notes
+(files), on a seed that differs from master only in the family name:
+
+| population | family | LEFT-ONLY | RIGHT-ONLY | different rep |
+| --- | --- | --- | --- | --- |
+| `tests/cases` | narrowed | 3,754 (105) | 0 | 0 |
+| `tests/cases` | open | 5,435 (56) | 1,057 (39) | 18 |
+| `tests/cases` | scope | 14 (4) | 39,440 (237) | 0 |
+| `tests/cases` | like for like | 11,731 (179) | 11,026 (129) | 878 (26) |
+| distilled `cells/` | scope | 0 | 11,610 (832) | 0 |
+| distilled `cells/` | like for like | 0 | 7,288 (42) | 114 (2) |
+| distilled `named/` | narrowed | 28 (1) | 0 | 0 |
+| distilled `named/` | open | 27,543 (231) | 432 (26) | 0 |
+| distilled `named/` | scope | 0 | 7,097 (508) | 0 |
+| distilled `named/` | like for like | 3,717 (111) | 10,007 (121) | 200 (24) |
+
+The like-for-like family is the one a conversion has to empty: 15,448 LEFT-ONLY, 28,321
+RIGHT-ONLY and 1,192 different-rep notes. The largest pairs (ladder → column) are `none →
+reflist` 24,198, `reflist → uncovered` 9,737, `list → uncovered` 5,022, `none → list` 4,057 and `list →
+reflist` 1,044.
+
+**By node kind, like for like.** RIGHT-ONLY by `Call` is 7,252 (42) in `cells/`, 9,344 (29) in
+`named/` and 1,283 (29) in `tests/cases`; 17,843 of those are `none → reflist`. The other
+RIGHT-ONLY nodes in `tests/cases` are `Ident` 3,715, `Index` 2,874, `BinExpr` 1,202 and
+`Member` 474. LEFT-ONLY in `tests/cases` is `Ident` 7,777, `Call` 1,586, `Index` 1,372 and
+`ArrayLit` 607. The cause of the `Call` RIGHT-ONLY: `callListRep` returns `calleeListRep` for an
+`Ident` callee, and that resolver never answers `reflist` from the recorded return type. The
+witness is `cells/b015636.vl`, `reverse([c])`, a generic std call over a record list.
+
+**The coverage step: a call reads the column.** When `callListRep`'s resolvers name nothing,
+`callColumnListRep` answers the column's non-null list, if the column covers the node. It reads
+the column only for a node whose type is a `TyArray` at its instance. Without that filter, the
+`plumb-shape cost` main unit cost 32.5M more fuel than master; with it, 10.5M more (+0.12%).
+`difftree --identity` over 15,119 files: fixpoint identity OK, **10,035 built, 1 differ, 0
+uncompared**. The file that differs is the new fixture, which master refuses. Two refreshes give
+the same seed, and it is 5,394,300 bytes.
+
+Two filed rows now run and are closed: D3163 (a lambda literal called in place) and D3184 (a
+record's `"[]"` field-closure read), both a for-in over a literal-union list. Their fixture is
+`tests/cases/loops/forin-over-called-literal-union-list.vl`.
+
+| population | like-for-like RIGHT-ONLY before | after |
+| --- | --- | --- |
+| `tests/cases` | 11,026 (129) | 9,250 (103) |
+| distilled `cells/` | 7,288 (42) | 0 |
+| distilled `named/` | 10,007 (121) | 639 (92) |
+
+That is 28,321 → 9,889. LEFT-ONLY, different-rep and the other three families did not move.
+
+**The same rung on `Member`, `Index` and `BinExpr` is refused.** Applied to all four node kinds,
+it fails one file, `tests/cases/closures/capture-union-list-element-store.vl`, with `emitProgram:
+ref valtype with no interned shape`. That is §13.12's out-of-scope symptom: a caller reads the
+ladder's none and takes a route that has no shape interned. The column's answer is right there,
+but the caller is not ready for it.
+
+**Nothing converts or retires yet.**
+
+* `exprRefArray`'s `reflist` guard is still about 9.8k LEFT-ONLY and about 25.2k RIGHT-ONLY
+  across all families.
+* `arrLitRetSeedFromKind` stays where it is. It seeds the destination of an array literal from a
+  return's kind and covers the D2716 join, and a node's column cannot see that join.
+
+**Next, in order:**
+
+1. `Ident` LEFT-ONLY, 7,777 in `tests/cases`.
+2. The `Index`, `BinExpr` and `Member` RIGHT-ONLY. Fix the caller in
+   `capture-union-list-element-store.vl` first.
+3. The narrowed family, 3,782 notes. This is the slot-versus-narrowed rep split: the ladder reads
+   the narrowed list and the column reads the slot's nullable list.
+4. The scope callers, found by §13.12's 372 files.
+5. The open family is not a coverage target. No pin can bind it.

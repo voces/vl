@@ -1,7 +1,7 @@
 // A GRADE IS A STATEMENT ABOUT THE COMPILER THE SEED WAS BUILT FROM, NOT ABOUT THE TREE.
 //
 // `build/vl-compiler.wasm` is the compiler's own codegen of itself, so `check-filed-witnesses.vl`
-// and `survey-regrade.py` both grade against whatever source that artifact came from. On
+// and `survey-regrade.vl` both grade against whatever source that artifact came from. On
 // 2026-09-06 that produced a confidently reported red: the witness checker was run by hand after
 // a branch switch, WITHOUT `refresh-compiler.sh`, so the row files were from one commit and the
 // seed from another, and three rows whose fixes had landed graded as MOVED against a compiler
@@ -13,8 +13,8 @@
 // BEHAVIORALLY, never by timestamp". `refresh-compiler.sh` records the FOLD of the sources it
 // compiled and `scripts/seed-provenance.vl` recomputes it — identities, not clocks.
 //
-// The recorder is a VL program now (it was `seed_provenance.py`, which stays only because
-// `survey-regrade.py` still imports it). The first case drives its `--self-test`, which builds a
+// The recorder is a VL program now (it was `seed_provenance.py`, which nothing imports any more
+// and stays only as the second case's oracle). The first case drives its `--self-test`, which builds a
 // specimen per verdict (match / differ / unknown) and sabotages the comparison to prove the
 // specimens would notice. The second pins the VL fold to the Python's, byte for byte, so the two
 // cannot drift while both exist.
@@ -209,13 +209,15 @@ Deno.test("seed provenance: the graders consult it", async () => {
   // a helper with a green self-test and no caller is the shape this repo has shipped before.
   const callers: [string, string][] = [
     ["check-filed-witnesses.vl", "provenance(moved.length)"],
-    ["survey-regrade.py", "seed_provenance.guard("],
+    ["survey-regrade.vl", "= provenance("],
   ];
   for (const [f, call] of callers) {
     const src = await Deno.readTextFile(`${ROOT}/scripts/${f}`);
     if (!src.includes(call)) {
       throw new Error(
-        `scripts/${f} does not call ${call}) — a grade would be reported ` +
+        `scripts/${f} does not call ${
+          call.replace(/^= /, "")
+        }) — a grade would be reported ` +
           `without saying which compiler produced it`,
       );
     }
