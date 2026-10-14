@@ -33,6 +33,7 @@ import type { ModuleReader } from "../../compiler/coreTypes.ts";
 // the test that keeps them agreeing; the two TS ones used to be hand-maintained
 // twins and had silently lost the `export { … } from "…"` arm.
 import { needsModules } from "../../compiler/moduleGate.ts";
+import { columnMap } from "./utf16Columns.ts";
 
 /**
  * The seed's driver exports, as a flat numeric ABI (every arg/return is an
@@ -43,7 +44,7 @@ import { needsModules } from "../../compiler/moduleGate.ts";
  */
 export type Exports = Record<string, (...args: number[]) => number>;
 
-/** An LSP source span (0-based line, 0-based character — the LSP convention). */
+/** An LSP source span (0-based line, 0-based UTF-16 character — the LSP convention). */
 export type WasmRange = {
   start: { line: number; character: number };
   end: { line: number; character: number };
@@ -296,13 +297,13 @@ export type WasmUfcsCandidate = {
  * declaration with its inferred type, the native counterpart of the host's
  * `deriveInlayHints` symbol-table walk. `kind` 0 = a value binding (hint after the
  * name), 1 = a function (RETURN type, hint after the `)`); `line`/`col` are the
- * NAME end (1-based line, 0-based col); `type` the rendered inferred type. The
+ * NAME end (1-based line, 0-based UTF-16 col); `type` the rendered inferred type. The
  * host applies the source-scan annotation/range filters.
  */
 export type WasmInlayCandidate = {
   kind: number; // 0=value 1=function-return
   line: number; // 1-based name-end line
-  col: number; // 0-based name-end col
+  col: number; // 0-based UTF-16 name-end col
   type: string;
 };
 
@@ -325,7 +326,7 @@ export type WasmBuiltin = {
  * record) by the LOCAL binding name; `key` is the exporting sibling module's
  * resolved KEY, `exportedName` the name the sibling declares it under (the `name`
  * side of a `{ name as local }` specifier), `line`/`col` the export decl-name
- * token (1-based line, 0-based col — the native convention), `length` the
+ * token (1-based native line, 0-based UTF-16 col of the SIBLING's text), `length` the
  * exported name's length so the host can shape the decl-name end column. The host
  * maps these onto its `CrossFileSource` (0-based LSP range + `file://` URI); the
  * canonical-export resolver in `crossFileReferences` uses `exportedName`.
@@ -334,7 +335,7 @@ export type WasmImportedSource = {
   key: string;
   exportedName: string;
   line: number; // 1-based native line
-  col: number; // 0-based column
+  col: number; // 0-based UTF-16 column
   length: number; // exported name length (for the range end)
 };
 
@@ -342,7 +343,7 @@ export type WasmImportedSource = {
  * One export of a module's surface, from the wasm import/export pass — the native
  * counterpart of the host's `exportedDeclRanges` plus the `export`-keyword span.
  * `name` is the exported name; `declLine`/`declCol` locate the decl NAME (1-based
- * line, 0-based col — the native convention), `kwLine`/`kwCol` the `export`
+ * line, 0-based UTF-16 col), `kwLine`/`kwCol` the `export`
  * KEYWORD. Used by the project-wide unused-export pass to place its hints.
  *
  * `origin` is `""` for a name this module DECLARES and the resolved key of the
@@ -353,9 +354,9 @@ export type WasmImportedSource = {
 export type WasmModuleExport = {
   name: string;
   declLine: number; // 1-based native line
-  declCol: number; // 0-based column
+  declCol: number; // 0-based UTF-16 column
   kwLine: number; // 1-based native line of the `export` keyword
-  kwCol: number; // 0-based column of the `export` keyword
+  kwCol: number; // 0-based UTF-16 column of the `export` keyword
   origin: string; // "" when declared here; else the re-export's source module key
 };
 
@@ -696,7 +697,7 @@ export type WasmChecker = {
    * Cross-file find-references, per-candidate slice (kill-TS step 3-C Stage 3):
    * the occurrences IN `candidateSource` (committed as the entry, module 0) that
    * refer to the canonical export `target` (its declaring file `key` + exported
-   * `name` + 1-based decl-name `declLine` / 0-based `declCol`). Empty when the
+   * `name` + 1-based decl-name `declLine` / 0-based UTF-16 `declCol`). Empty when the
    * candidate doesn't reach the declaring module, the declaration isn't found at
    * `target`'s position, or the seed predates the module-tag exports. The
    * orchestrator (`crossFileReferences`) compiles each candidate file as its own
@@ -712,7 +713,7 @@ export type WasmChecker = {
       key: string;
       exportedName: string;
       declLine: number; // 1-based native line of the decl name
-      declCol: number; // 0-based column of the decl name
+      declCol: number; // 0-based UTF-16 column of the decl name
     },
   ) => Promise<WasmOccurrence[]>;
   /**
@@ -1148,14 +1149,31 @@ export const createWasmChecker = (
     typeof exp.defAt === "function" &&
     typeof exp.symSpanStartLine === "function";
 
+  // THE COLUMN BOUNDARY (D4490). Every column the seed reports is a UTF-8 byte
+  // offset into the line of the module that owns it, and every column it takes
+  // is one too; the LSP's are UTF-16. So a column leaving the seed goes through
+  // `columnMap(<owning module's text>).toUtf16`, and a cursor entering it through
+  // `seedCol`. Module 0, and a single-file compile, is the entry; a dependency's
+  // text is what `prepare` last pushed under its key (unknown → identity).
+  const moduleText = (exp: Exports, entry: string, m: number): string | undefined => {
+    if (m <= 0 || typeof exp.modKeyCount !== "function") return entry;
+    if (m >= exp.modKeyCount()) return undefined;
+    const key = readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j));
+    return pushedFor(exp).get(key)?.text;
+  };
+  const seedCol = (source: string, line: number, character: number): number =>
+    columnMap(source).toByte(line, character);
+
   // The k-th coordinate-set of occurrence `occ`, as a 0-based LSP range. The
-  // native spans are 1-based line / 0-based column (the diagnostic convention).
-  const occRange = (exp: Exports, occ: number): WasmRange => {
-    const sl = exp.symSpanStartLine(occ);
-    const el = exp.symSpanEndLine(occ);
+  // native spans are 1-based line / 0-based byte column, in the occurrence's module.
+  const occRange = (exp: Exports, occ: number, entry: string): WasmRange => {
+    const m = hasModuleTags(exp) ? exp.symOccModuleAt(occ) : 0;
+    const cols = columnMap(moduleText(exp, entry, m));
+    const sl = lspLineOf(exp.symSpanStartLine(occ));
+    const el = lspLineOf(exp.symSpanEndLine(occ));
     return {
-      start: { line: sl > 0 ? sl - 1 : 0, character: exp.symSpanStartCol(occ) },
-      end: { line: el > 0 ? el - 1 : 0, character: exp.symSpanEndCol(occ) },
+      start: { line: sl, character: cols.toUtf16(sl, exp.symSpanStartCol(occ)) },
+      end: { line: el, character: cols.toUtf16(el, exp.symSpanEndCol(occ)) },
     };
   };
 
@@ -1170,8 +1188,8 @@ export const createWasmChecker = (
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return undefined;
     await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
-    const occ = exp.defAt(line + 1, character);
-    return occ >= 0 ? occRange(exp, occ) : undefined;
+    const occ = exp.defAt(line + 1, seedCol(source, line, character));
+    return occ >= 0 ? occRange(exp, occ, source) : undefined;
   };
 
   const referencesAt = async (
@@ -1186,13 +1204,14 @@ export const createWasmChecker = (
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp)) return [];
     await ensurePrepared(exp, source, entryKey, read);
     const nativeLine = line + 1;
-    const count = exp.refsCountAt(nativeLine, character);
+    const col = seedCol(source, line, character);
+    const count = exp.refsCountAt(nativeLine, col);
     const out: WasmRange[] = [];
     for (let k = 0; k < count; k++) {
-      const occ = exp.refAt(nativeLine, character, k);
+      const occ = exp.refAt(nativeLine, col, k);
       if (occ < 0) continue;
       if (!includeDeclaration && exp.symIsDecl(occ) === 1) continue;
-      out.push(occRange(exp, occ));
+      out.push(occRange(exp, occ, source));
     }
     return out;
   };
@@ -1249,13 +1268,16 @@ export const createWasmChecker = (
     // module at `target`'s decl-name position. Every other occurrence of this
     // binding — including an importer's uses, which the merge rewrites to the
     // canonical symbol — shares this id.
+    // `target.declCol` is a UTF-16 column of the DECLARING module's text.
+    const declCol = columnMap(moduleText(exp, candidateSource, declModuleIndex))
+      .toByte(lspLineOf(target.declLine), target.declCol);
     const count = exp.symCount();
     let canonicalBinding = -1;
     for (let i = 0; i < count; i++) {
       if (exp.symOccModuleAt(i) !== declModuleIndex) continue;
       if (exp.symIsDecl(i) !== 1) continue;
       if (exp.symSpanStartLine(i) !== target.declLine) continue;
-      if (exp.symSpanStartCol(i) !== target.declCol) continue;
+      if (exp.symSpanStartCol(i) !== declCol) continue;
       canonicalBinding = exp.symBindingId(i);
       break;
     }
@@ -1266,15 +1288,7 @@ export const createWasmChecker = (
     for (let i = 0; i < count; i++) {
       if (exp.symOccModuleAt(i) !== 0) continue;
       if (exp.symBindingId(i) !== canonicalBinding) continue;
-      const sl = exp.symSpanStartLine(i);
-      const el = exp.symSpanEndLine(i);
-      out.push({
-        range: {
-          start: { line: sl > 0 ? sl - 1 : 0, character: exp.symSpanStartCol(i) },
-          end: { line: el > 0 ? el - 1 : 0, character: exp.symSpanEndCol(i) },
-        },
-        isDecl: exp.symIsDecl(i) === 1,
-      });
+      out.push({ range: occRange(exp, i, candidateSource), isDecl: exp.symIsDecl(i) === 1 });
     }
     return out;
   };
@@ -1292,7 +1306,7 @@ export const createWasmChecker = (
       return undefined;
     }
     await ensurePrepared(exp, source, entryKey, read);
-    const len = exp.typeStrAt(line + 1, character);
+    const len = exp.typeStrAt(line + 1, seedCol(source, line, character));
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.typeStrCharAt(j));
   };
@@ -1310,7 +1324,7 @@ export const createWasmChecker = (
       return undefined;
     }
     await ensurePrepared(exp, source, entryKey, read);
-    const len = exp.constAt(line + 1, character);
+    const len = exp.constAt(line + 1, seedCol(source, line, character));
     if (len <= 0) return undefined;
     const [role, type, ...fields] = readString(len, (j) => exp.constCharAt(j)).split("\n");
     if (role !== "decl" && role !== "use") return undefined;
@@ -1331,7 +1345,7 @@ export const createWasmChecker = (
       return undefined;
     }
     await ensurePrepared(exp, source, entryKey, read);
-    const len = exp.memberTypeStrAt(line + 1, character);
+    const len = exp.memberTypeStrAt(line + 1, seedCol(source, line, character));
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.memberTypeStrCharAt(j));
   };
@@ -1351,7 +1365,7 @@ export const createWasmChecker = (
     await ensurePrepared(exp, source, entryKey, read);
     // -1 is "nothing callable here"; 0 is a real zero-parameter signature, so
     // the sign is the only thing that separates them.
-    const count = exp.sigAt(line + 1, character);
+    const count = exp.sigAt(line + 1, seedCol(source, line, character));
     if (count < 0) return undefined;
     const params: { name: string; type: string; dflt: string }[] = [];
     for (let i = 0; i < count; i++) {
@@ -1388,7 +1402,7 @@ export const createWasmChecker = (
       return undefined;
     }
     await ensurePrepared(exp, source, entryKey, read);
-    const len = exp.typeAliasAt(line + 1, character);
+    const len = exp.typeAliasAt(line + 1, seedCol(source, line, character));
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.typeAliasCharAt(j));
   };
@@ -1406,7 +1420,7 @@ export const createWasmChecker = (
       return undefined;
     }
     await ensurePrepared(exp, source, entryKey, read);
-    const len = exp.docAt(line + 1, character);
+    const len = exp.docAt(line + 1, seedCol(source, line, character));
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.docCharAt(j));
   };
@@ -1424,7 +1438,7 @@ export const createWasmChecker = (
       return undefined;
     }
     await ensurePrepared(exp, source, entryKey, read);
-    const len = exp.effectsAt(line + 1, character);
+    const len = exp.effectsAt(line + 1, seedCol(source, line, character));
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.effectsCharAt(j));
   };
@@ -1468,6 +1482,7 @@ export const createWasmChecker = (
     // highlighting (`./mathx`'s decls bleeding onto the `import` line). Single-file
     // mode has no module table, so `symOccModuleAt` returns 0 for all (no filter).
     const byModule = hasModuleTags(exp);
+    const cols = columnMap(source);
     const out: WasmToken[] = [];
     for (let i = 0; i < count; i++) {
       if (byModule && exp.symOccModuleAt(i) !== 0) continue;
@@ -1475,13 +1490,12 @@ export const createWasmChecker = (
       // Only identifiers with a known binding kind are coloured by this slice;
       // a -1 (not a tracked binding) is skipped (the host's lexical pass owns it).
       if (bindKind < 0) continue;
-      const sl = exp.tokSpanStartLine(i); // 1-based native line
-      const startCol = exp.tokSpanStartCol(i);
-      const endCol = exp.tokSpanEndCol(i);
-      const length = endCol - startCol;
+      const line = lspLineOf(exp.tokSpanStartLine(i));
+      const startCol = cols.toUtf16(line, exp.tokSpanStartCol(i));
+      const length = cols.toUtf16(line, exp.tokSpanEndCol(i)) - startCol;
       if (length <= 0) continue; // defensive: a name never has a zero-width span
       out.push({
-        line: sl > 0 ? sl - 1 : 0,
+        line,
         char: startCol,
         length,
         bindKind,
@@ -1507,15 +1521,18 @@ export const createWasmChecker = (
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasMembers(exp)) return [];
     await ensurePrepared(exp, source, entryKey, read);
     const count = exp.memberCount();
+    const cols = columnMap(source);
     const out: WasmMemberToken[] = [];
     for (let i = 0; i < count; i++) {
-      const length = exp.memberLenAt(i);
-      if (length <= 0) continue; // defensive: a name never has a zero-width span
-      const line = exp.memberLineAt(i); // 1-based native line
+      const bytes = exp.memberLenAt(i);
+      if (bytes <= 0) continue; // defensive: a name never has a zero-width span
+      const line = lspLineOf(exp.memberLineAt(i));
+      const col = exp.memberColAt(i);
+      const char = cols.toUtf16(line, col);
       out.push({
-        line: line > 0 ? line - 1 : 0,
-        char: exp.memberColAt(i),
-        length,
+        line,
+        char,
+        length: cols.toUtf16(line, col + bytes) - char,
         isMethod: exp.memberIsMethodAt(i) === 1,
         // Younger than the rest of the member ABI, so probed per call.
         isGetter: typeof exp.memberIsGetterAt === "function" && exp.memberIsGetterAt(i) === 1,
@@ -1543,7 +1560,7 @@ export const createWasmChecker = (
     if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasScope(exp)) return [];
     await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
-    const count = exp.scopeAt(line + 1, character);
+    const count = exp.scopeAt(line + 1, seedCol(source, line, character));
     const out: WasmScopeBinding[] = [];
     for (let i = 0; i < count; i++) {
       // The native side rebuilds the per-index NAME buffer on each
@@ -1628,7 +1645,7 @@ export const createWasmChecker = (
     ) return [];
     await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
-    const count = exp.memberScanAt(line + 1, character);
+    const count = exp.memberScanAt(line + 1, seedCol(source, line, character));
     const out: WasmMemberCompletion[] = [];
     for (let i = 0; i < count; i++) {
       // Per-index buffers (like `scopeAt`): read this index's NAME fully, then its
@@ -1682,7 +1699,7 @@ export const createWasmChecker = (
     ) return [];
     await ensurePrepared(exp, source, entryKey, read);
     // Native lines are 1-based; the LSP cursor line is 0-based.
-    const count = exp.ufcsScanAt(line + 1, character);
+    const count = exp.ufcsScanAt(line + 1, seedCol(source, line, character));
     // The module table is read ONCE and indexed — a candidate names its module by
     // table index, and re-reading the key per candidate would be O(candidates ×
     // key length) wasm calls for a table of at most a dozen entries.
@@ -1744,6 +1761,7 @@ export const createWasmChecker = (
     // literal, …). Mirrors `tokensAt`'s module-0 filter; an older seed without
     // `inlayModuleAt` keeps every hint (single-file mode is module 0 throughout).
     const byModule = typeof exp.inlayModuleAt === "function";
+    const cols = columnMap(source);
     const out: WasmInlayCandidate[] = [];
     for (let i = 0; i < count; i++) {
       if (byModule && exp.inlayModuleAt(i) !== 0) continue;
@@ -1753,7 +1771,7 @@ export const createWasmChecker = (
       out.push({
         kind: exp.inlayKindAt(i),
         line: exp.inlayLineAt(i),
-        col: exp.inlayColAt(i),
+        col: cols.toUtf16(lspLineOf(exp.inlayLineAt(i)), exp.inlayColAt(i)),
         type,
       });
     }
@@ -1804,9 +1822,11 @@ export const createWasmChecker = (
       if (modKey === "") continue;
       const name = readString(exp.expNameLen(i), (j) => exp.expNameCharAt(i, j));
       if (name.length === 0) continue;
+      const line = exp.expDeclLineAt(i);
+      const cols = columnMap(moduleText(exp, source, mod));
       exportsByKey.set(`${modKey} ${name}`, {
-        line: exp.expDeclLineAt(i),
-        col: exp.expDeclColAt(i),
+        line,
+        col: cols.toUtf16(lspLineOf(line), exp.expDeclColAt(i)),
       });
     }
 
@@ -1878,6 +1898,8 @@ export const createWasmChecker = (
     // the staging memo describing the instance rather than only `prepare`'s own writes.
     pushedFor(exp).set(entryKey, { text: source, bytes: utf8Length(source) });
 
+    const cols = columnMap(source);
+    const at = (line: number, col: number) => cols.toUtf16(lspLineOf(line), col);
     const exports: WasmModuleExport[] = [];
     const expCount = exp.expCount();
     for (let i = 0; i < expCount; i++) {
@@ -1887,9 +1909,9 @@ export const createWasmChecker = (
       exports.push({
         name,
         declLine: exp.expDeclLineAt(i),
-        declCol: exp.expDeclColAt(i),
+        declCol: at(exp.expDeclLineAt(i), exp.expDeclColAt(i)),
         kwLine: exp.expKwLineAt(i),
-        kwCol: exp.expKwColAt(i),
+        kwCol: at(exp.expKwLineAt(i), exp.expKwColAt(i)),
         origin: "",
       });
     }
@@ -1916,9 +1938,9 @@ export const createWasmChecker = (
         exports.push({
           name,
           declLine: exp.reExpDeclLineAt(i),
-          declCol: exp.reExpDeclColAt(i),
+          declCol: at(exp.reExpDeclLineAt(i), exp.reExpDeclColAt(i)),
           kwLine: exp.reExpKwLineAt(i),
-          kwCol: exp.reExpKwColAt(i),
+          kwCol: at(exp.reExpKwLineAt(i), exp.reExpKwColAt(i)),
           origin,
         });
       }
@@ -1942,7 +1964,7 @@ export const createWasmChecker = (
   // `diagCol`/`diagEndLine`/`diagEndCol`) — shared by `checkSrc` AND `compileSrc`,
   // which write the same store — into LSP-shaped diagnostics. Native line is 1-based
   // (0 = positionless); col 0-based, and the end column counts from `diagEndLine`.
-  const readDiags = (exp: Exports): VLDiagnostic[] => {
+  const readDiags = (exp: Exports, source: string): VLDiagnostic[] => {
     const count = exp.diagCount();
     const diags: VLDiagnostic[] = [];
     // An older seed predates `diagEndCol`; degrade to zero-width ranges.
@@ -1972,13 +1994,18 @@ export const createWasmChecker = (
       const endLine = Math.max(endLineOf(i), line);
       const lspLine = line > 0 ? line - 1 : 0;
       const lspEndLine = line > 0 ? endLine - 1 : 0;
-      const startChar = line > 0 ? col : 0;
       // The `col` floor holds only within one line: a span ending on a LATER line ends at
       // a column of that line, which may sit anywhere, `0` included.
       const rawEnd = endColOf(i);
-      const endChar = line > 0
+      const byteEnd = line > 0
         ? (endLine > line ? rawEnd : Math.max(rawEnd, col))
         : 0;
+      // A dependency's diagnostic carries ITS module's columns.
+      const cols = columnMap(
+        moduleText(exp, source, typeof exp.diagModule === "function" ? exp.diagModule(i) : 0),
+      );
+      const startChar = line > 0 ? cols.toUtf16(lspLine, col) : 0;
+      const endChar = line > 0 ? cols.toUtf16(lspEndLine, byteEnd) : 0;
       const code = hasCodes
         ? readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j))
         : "";
@@ -2021,7 +2048,7 @@ export const createWasmChecker = (
     // follow would otherwise pay a second graph check to rebuild.
     if (hasSymbols(exp) && typeof exp.checkSymDiagsComplete === "function") {
       await ensurePrepared(exp, source, entryKey, read);
-      return readDiags(exp);
+      return readDiags(exp, source);
     }
     // A seed whose `checkSrcSym` skips the deep-`is` second pass reports FEWER
     // diagnostics than `checkSrc`, and this is the one surface that may not
@@ -2030,7 +2057,7 @@ export const createWasmChecker = (
     graphChecks++;
     exp.checkSrc();
     s.checked = false; // ran with the symbol table off — the sym tables are gone
-    return readDiags(exp);
+    return readDiags(exp, source);
   };
 
   // Whole-program codegen (the playground's Run path): compile `source` (as the
@@ -2070,7 +2097,7 @@ export const createWasmChecker = (
     graphChecks++;
     const status = exp.compileSrc(); // 0 ok; 1 lex/parse; 2 type; 3 emit
     staging.checked = false; // the emit path leaves no symbol tables behind
-    const diagnostics = readDiags(exp);
+    const diagnostics = readDiags(exp, source);
     if (status !== 0) return { bytes: undefined, diagnostics };
     const n = exp.rbyteLen();
     const bytes = new Uint8Array(n);
@@ -2173,6 +2200,7 @@ export const createWasmChecker = (
     }
     const n = exp.lintSrc();
     if (n <= 0) return []; // -1 = parse error, 0 = no lint diagnostics
+    const cols = columnMap(source);
     const out: VLDiagnostic[] = [];
     for (let i = 0; i < n; i++) {
       const message = readString(exp.lintMsgLen(i), (j) => exp.lintMsgByte(i, j));
@@ -2181,7 +2209,7 @@ export const createWasmChecker = (
       const line = exp.lintLine(i); // 1-based; 0 = positionless
       const col = exp.lintCol(i); // 0-based
       const lspLine = line > 0 ? line - 1 : 0;
-      const startChar = line > 0 ? col : 0;
+      const startChar = line > 0 ? cols.toUtf16(lspLine, col) : 0;
       // The rule's own span, exclusive, when the seed carries one (`lintEnd`); an
       // older seed falls back to the identifier guess above.
       const ruleEnd = typeof exp.lintEnd === "function"
@@ -2190,8 +2218,8 @@ export const createWasmChecker = (
       const endChar = line <= 0
         ? 0
         : ruleEnd !== undefined && ruleEnd > col
-        ? ruleEnd
-        : wordEndCol(source, lspLine, col);
+        ? cols.toUtf16(lspLine, ruleEnd)
+        : wordEndCol(source, lspLine, startChar);
       out.push({
         message,
         severity: asSeverity(sev),
@@ -2232,15 +2260,18 @@ export const createWasmChecker = (
     exp.srcReset();
     pushString(exp.srcPush, source);
     const n = exp.lexScan();
+    const cols = columnMap(source);
     const out: WasmLexicalToken[] = [];
     for (let i = 0; i < n; i++) {
-      const length = exp.lexLenAt(i);
-      if (length <= 0) continue; // defensive: a coloured token never has zero width
-      const line = exp.lexLineAt(i); // 1-based native line
+      const bytes = exp.lexLenAt(i);
+      if (bytes <= 0) continue; // defensive: a coloured token never has zero width
+      const line = lspLineOf(exp.lexLineAt(i));
+      const col = exp.lexColAt(i);
+      const char = cols.toUtf16(line, col);
       out.push({
-        line: line > 0 ? line - 1 : 0,
-        char: exp.lexColAt(i),
-        length,
+        line,
+        char,
+        length: cols.toUtf16(line, col + bytes) - char,
         tokenClass: exp.lexClassAt(i),
       });
     }
@@ -2263,6 +2294,11 @@ export const createWasmChecker = (
     exp.srcReset();
     pushString(exp.srcPush, source);
     const n = exp.extentScan();
+    const cols = columnMap(source);
+    const pos = (line: number, col: number) => {
+      const l = lspLineOf(line);
+      return { line: l, character: cols.toUtf16(l, col) };
+    };
     const out: WasmExtent[] = [];
     // Native row index → its index in `out`, or the nearest ANCESTOR that survived.
     // A seed one kind ahead of this extension emits rows this build cannot name;
@@ -2287,19 +2323,10 @@ export const createWasmChecker = (
           ? ""
           : readString(nameLen, (j) => exp.extentNameCharAt(i, j)),
         parent,
-        header: {
-          line: lspLineOf(exp.extentHdrLineAt(i)),
-          character: exp.extentHdrColAt(i),
-        },
+        header: pos(exp.extentHdrLineAt(i), exp.extentHdrColAt(i)),
         range: {
-          start: {
-            line: lspLineOf(exp.extentStartLineAt(i)),
-            character: exp.extentStartColAt(i),
-          },
-          end: {
-            line: lspLineOf(exp.extentEndLineAt(i)),
-            character: exp.extentEndColAt(i),
-          },
+          start: pos(exp.extentStartLineAt(i), exp.extentStartColAt(i)),
+          end: pos(exp.extentEndLineAt(i), exp.extentEndColAt(i)),
         },
       });
     }
