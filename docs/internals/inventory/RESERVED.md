@@ -4,13 +4,13 @@ One line per range, in the form:
 
     D<lo>-D<hi>  <holder>  <YYYY-MM-DD>  <what for>
 
-`scripts/inventory/ls.py --next` SKIPS every id in a live range and prints which ranges it
-skipped and who holds them, so the reservation is what the tool enforces rather than what two
-people remember. `--reserve` and `--release` edit this file; `tests/vl_inventory_rows_test.ts`
+`vl run scripts/inventory/ls.vl -- --next` SKIPS every id in a live range and prints which
+ranges it skipped and who holds them, so the reservation is what the tool enforces rather than
+what two people remember. `--reserve` and `--release` edit this file; `tests/vl_inventory_rows_test.ts`
 fails when a range is stale (every id in it filed) so a forgotten reservation is a red rather
 than a note that quietly widens.
 
-**WHY THIS FILE EXISTS.** `ls.py`'s own header used to say reserved blocks "remain a
+**WHY THIS FILE EXISTS.** The queue tool's own header used to say reserved blocks "remain a
 coordination convention written down in the inventory README, because two agents running this
 one second apart both get the same answer". That convention failed four times, and the fourth
 was two sessions colliding *while actively coordinating about ids in the same conversation* —

@@ -266,7 +266,14 @@ fn value_flags(cmd: &str) -> &'static [&'static str] {
     match cmd {
         "run" => &["-e", "--compiler", "--out-dir", "--extern"],
         "build" => &["-o", "--compiler"],
-        "check" => &["--compiler", "--severity", "--exclude"],
+        "check" => &[
+            "--compiler",
+            "--severity",
+            "--exclude",
+            "--budget",
+            "--budget-why",
+            "--findings",
+        ],
         "fmt" => &["--compiler"],
         "test" => &["--compiler", "-t", "--jobs", "--exclude", "--extern"],
         "seed" => &["--out", "--compiler"],

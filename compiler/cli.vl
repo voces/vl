@@ -182,6 +182,15 @@ const CMD_VALIDATE = 10 // validate the module now in rbyte*; report engine verd
 const CMD_TEST_ENQUEUE = 11 // queue test file `cliCmdPath` for the compile pool
 const CMD_TEST_COMPILE = 12 // compile every queued file; commit each outcome in order
 
+// The process exit codes (`docs/internals/cli-design.md` §Exit codes). The host reports
+// the same table, and `tests/cli_host_tables_test.ts` holds the two equal.
+type CliExit = 0 | 1 | 2 | 3 | 70
+const EXIT_OK = 0
+const EXIT_FAILED = 1        // the program, its check or a gate failed
+const EXIT_USAGE = 2         // an unusable command line or an unreadable input
+const EXIT_FMT_BUG = 3       // `vl fmt`: the formatted output failed to re-parse
+const EXIT_COMPILER_BUG = 70 // the compiler crashed, or emitted a module the engine refused
+
 // The state-machine states (cliState). `*_RECV` states resume after the host has
 // committed the result of the command the previous `cliNext` returned.
 const ST_INIT = 0             // parse argv, classify the target
@@ -220,7 +229,7 @@ let cliCmdData = ""             // data payload of the current command (a print 
 const cliResultAcc = cpAccNew() // the host pushes a file's contents here
 let cliFileSrc = ""             // last committed file contents
 let cliFileFound = 0            // 1 = the host read the file, 0 = missing
-let cliExit = 0                 // the process exit code, read after CMD_DONE
+let cliExit: CliExit = EXIT_OK  // the process exit code, read after CMD_DONE
 // A `--codegen` file whose emitted module the engine refused. `vl check` said rc 0 to
 // reach the emitter, so an invalid module is the compiler's fault by construction and
 // exits 70 (EX_SOFTWARE, the code `report` uses for a compiler trap) rather than 1: a
@@ -530,7 +539,7 @@ export function cliArgReset() {
   cpAccReset(cliResultAcc)
   cliFileSrc = ""
   cliFileFound = 0
-  cliExit = 0
+  cliExit = EXIT_OK
   cliInvalidModule = 0
   cliFileInvalid = 0
   cliFile = ""
@@ -898,7 +907,7 @@ function cliFmtJson(d: i32) {
 // would carry, and the diagnostics it appended to `cliJsonItems` from `from` on. A
 // record per file rather than one flat array, in which a CLEAN file reads exactly like
 // one nothing checked.
-function cliBatchRecord(file: string, exit: i32, from: i32) {
+function cliBatchRecord(file: string, exit: CliExit, from: i32) {
   const buf: i32[] = []
   pushCps(buf, "{\"file\":\"")
   pushCps(buf, cliJsonEsc(file))
@@ -1096,6 +1105,27 @@ function cliUsageErr(msg: string) {
   if cliArgErr == "" { cliArgErr = msg }
   0
 }
+// End the run: print `msg` on stderr and exit with the usage code.
+function cliUsageStop(msg: string) {
+  cliOut = [msg]
+  cliExit = EXIT_USAGE
+  cliBeginPrint()
+}
+// Whether flag `cliArgs[i]` has its value at `i + 1`: present and not itself a flag.
+// When it does not, records `msg` as the usage error.
+function cliTakeValue(i: i32, msg: string): boolean {
+  if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) { return true }
+  cliUsageErr(msg)
+  false
+}
+// Whether `a` is `prefix` (a `--flag=` spelling) followed by a non-empty value.
+function cliHasPrefixValue(a: string, prefix: string): boolean {
+  a.length > prefix.length && a.slice(0, prefix.length) == prefix
+}
+// The value after `prefix` in `a`, for an `a` that `cliHasPrefixValue` accepted.
+function cliPrefixValue(a: string, prefix: string): string {
+  a.slice(prefix.length, a.length)
+}
 // Parse the subcommand's args strictly: an unknown flag or a second positional
 // argument is a usage error (exit 2), never silently ignored — `vl check a.vl b.vl`
 // must not quietly check only `a.vl`. Flags are validated per subcommand; a
@@ -1138,36 +1168,30 @@ function cliParseArgs() {
       cliIncludeImports = 1
     } else if sub == "check" && a == "--severity" {
       cliSeverityGiven = 1
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliSeverity = cliArgs[i + 1]
+      const msg = "check: --severity requires a value (error, warning, info, hint)"
+      if cliTakeValue(i, msg) {
         i = i + 1
-      } else {
-        cliUsageErr(
-          "check: --severity requires a value (error, warning, info, hint)",
-        )
+        cliSeverity = cliArgs[i]
       }
-    } else if (
-      sub == "check"
-      && a.length > 11
-      && a.slice(0, 11) == "--severity="
-    ) {
-      cliSeverity = a.slice(11, a.length)
+    } else if sub == "check" && cliHasPrefixValue(a, "--severity=") {
+      cliSeverity = cliPrefixValue(a, "--severity=")
       cliSeverityGiven = 1
-    } else if a.length > 8 && a.slice(0, 8) == "--color=" {
-      if a.slice(8, a.length) == "always" { cliColor = 1 } else { cliColor = 0 }
-    } else if sub == "check" && a == "--exclude" {
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliAddExclude(cliArgs[i + 1])
-        i = i + 1
+    } else if cliHasPrefixValue(a, "--color=") {
+      if cliPrefixValue(a, "--color=") == "always" {
+        cliColor = 1
       } else {
-        cliUsageErr("check: --exclude requires a glob pattern")
+        cliColor = 0
+      }
+    } else if (sub == "check" || sub == "test") && a == "--exclude" {
+      if cliTakeValue(i, sub + ": --exclude requires a glob pattern") {
+        i = i + 1
+        cliAddExclude(cliArgs[i])
       }
     } else if (
-      sub == "check"
-      && a.length > 10
-      && a.slice(0, 10) == "--exclude="
+      (sub == "check" || sub == "test")
+      && cliHasPrefixValue(a, "--exclude=")
     ) {
-      cliAddExclude(a.slice(10, a.length))
+      cliAddExclude(cliPrefixValue(a, "--exclude="))
     } else if sub == "fmt" && (a == "-w" || a == "--write") {
       cliFmtWrite = 1
     } else if sub == "fmt" && a == "--check" {
@@ -1181,46 +1205,30 @@ function cliParseArgs() {
     } else if sub == "check" && (a == "--budget" || a == "--budget-why") {
       cliBudget = 1
       if a == "--budget-why" { cliBudget = 2 }
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliBudgetPath = cliArgs[i + 1]
+      if cliTakeValue(i, "check: " + a + " requires a baseline file") {
         i = i + 1
-      } else {
-        cliUsageErr("check: " + a + " requires a baseline file")
+        cliBudgetPath = cliArgs[i]
       }
     } else if sub == "check" && a == "--findings" {
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliBudgetFindings = cliArgs[i + 1]
+      if cliTakeValue(i, "check: --findings requires a `--json` report file") {
         i = i + 1
-      } else {
-        cliUsageErr("check: --findings requires a `--json` report file")
+        cliBudgetFindings = cliArgs[i]
       }
     } else if sub == "test" && a == "-t" {
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliTestFilter = cliArgs[i + 1]
+      const msg = "test: -t requires a substring to match test names against"
+      if cliTakeValue(i, msg) {
         i = i + 1
-      } else {
-        cliUsageErr("test: -t requires a substring to match test names against")
+        cliTestFilter = cliArgs[i]
       }
-    } else if sub == "test" && a.length > 3 && a.slice(0, 3) == "-t=" {
-      cliTestFilter = a.slice(3, a.length)
+    } else if sub == "test" && cliHasPrefixValue(a, "-t=") {
+      cliTestFilter = cliPrefixValue(a, "-t=")
     } else if sub == "test" && a == "--jobs" {
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliTestJobs = cliParseJobs(cliArgs[i + 1])
+      if cliTakeValue(i, "test: --jobs requires a positive count") {
         i = i + 1
-      } else {
-        cliUsageErr("test: --jobs requires a positive count")
+        cliTestJobs = cliParseJobs(cliArgs[i])
       }
-    } else if sub == "test" && a.length > 7 && a.slice(0, 7) == "--jobs=" {
-      cliTestJobs = cliParseJobs(a.slice(7, a.length))
-    } else if sub == "test" && a == "--exclude" {
-      if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
-        cliAddExclude(cliArgs[i + 1])
-        i = i + 1
-      } else {
-        cliUsageErr("test: --exclude requires a glob pattern")
-      }
-    } else if sub == "test" && a.length > 10 && a.slice(0, 10) == "--exclude=" {
-      cliAddExclude(a.slice(10, a.length))
+    } else if sub == "test" && cliHasPrefixValue(a, "--jobs=") {
+      cliTestJobs = cliParseJobs(cliPrefixValue(a, "--jobs="))
     } else if cliIsFlag(a) {
       cliUsageErr(sub + ": unknown flag `" + a + "`")
     } else if a.length > 0 {
@@ -1674,9 +1682,9 @@ function cliCheckCurFileRest() {
   }
   // `--batch --json`: this file's own verdict, sliced out of what it just appended.
   if cliBatch != 0 && cliJson != 0 {
-    let fexit = 0
-    if cliGating > gateBase { fexit = 1 }
-    if cliFileInvalid != 0 { fexit = 70 }
+    let fexit: CliExit = EXIT_OK
+    if cliGating > gateBase { fexit = EXIT_FAILED }
+    if cliFileInvalid != 0 { fexit = EXIT_COMPILER_BUG }
     cliBatchRecord(cliCurFile, fexit, jsonBase)
   }
   // This file is done (reported); advance to the next.
@@ -1722,9 +1730,9 @@ function cliBudgetFinish() {
   let text = ""
   for l in lines { text = text + l + "\n" }
   cliJsonOut = text
-  cliExit = 0
-  if budgetFailed() { cliExit = 1 }
-  if cliBudget == 2 && budgetFailed() { cliExit = 2 }
+  cliExit = EXIT_OK
+  if budgetFailed() { cliExit = EXIT_FAILED }
+  if cliBudget == 2 && budgetFailed() { cliExit = EXIT_USAGE }
   0
 }
 // `--write-baseline`: read `path` toward HEAD's commit, or — resolved, or "" when it
@@ -1763,7 +1771,7 @@ function cliBatchUnreadable() {
   cliBatchUnread = 1
   if cliJson != 0 {
     cliJsonItems.push(cliFmtJson(0))
-    cliBatchRecord(cliCurFile, 2, jsonBase)
+    cliBatchRecord(cliCurFile, EXIT_USAGE, jsonBase)
   } else {
     cliOut.push("check: cannot read " + cliCurFile)
   }
@@ -1844,10 +1852,7 @@ function cliFinishSummary() {
   // no human summary, with the exit code carrying the gate. Built in a code-point
   // buffer, since string concat per item is quadratic on a large directory run.
   if cliJson != 0 {
-    cliExit = 0
-    if cliGating > 0 { cliExit = 1 }
-    if cliBatchUnread != 0 { cliExit = 2 }
-    if cliInvalidModule > 0 { cliExit = 70 }
+    cliExit = cliCheckExit()
     // `--batch` already wrote a record per file; its stdout is those, not one array.
     if cliBatch != 0 { return cliHiddenNotes() }
     const buf: i32[] = []
@@ -1904,11 +1909,17 @@ function cliFinishSummary() {
   }
   cliOut.push(summary)
   cliHiddenNotes()
-  cliExit = 0
-  if cliGating > 0 { cliExit = 1 }
-  if cliBatchUnread != 0 { cliExit = 2 }
-  if cliInvalidModule > 0 { cliExit = 70 }
+  cliExit = cliCheckExit()
   0
+}
+
+// `vl check`'s exit code: a gating diagnostic fails the run, an unreadable `--batch` input
+// outranks that, and a module the engine refused outranks both.
+function cliCheckExit(): CliExit {
+  if cliInvalidModule > 0 { return EXIT_COMPILER_BUG }
+  if cliBatchUnread != 0 { return EXIT_USAGE }
+  if cliGating > 0 { return EXIT_FAILED }
+  EXIT_OK
 }
 
 // ── `vl test` — the runner brain (docs/internals/vl-test-design.md) ──────────
@@ -1956,7 +1967,7 @@ function cliTestEnqueueNext() {
 
 // A pool worker's end: exit 0 once the host holds its module, 1 with the file's report
 // entry in `cliCmdData` when it did not compile.
-function cliTestWorkerDone(code: i32, msg: string) {
+function cliTestWorkerDone(code: CliExit, msg: string) {
   cliCmdData = msg
   cliExit = code
   cliState = ST_DONE
@@ -1984,7 +1995,7 @@ function cliStartTestFile() {
 // Record why the current file produced no tests and move to the next one. The message
 // is the file's report entry; the run never stops for it.
 function cliTestFileFailed(msg: string) {
-  if cliTestPoolMode == 2 { return cliTestWorkerDone(1, msg) }
+  if cliTestPoolMode == 2 { return cliTestWorkerDone(EXIT_FAILED, msg) }
   cliTestFileErr[cliFileIdx] = msg
   cliFileIdx = cliFileIdx + 1
   cliStartTestFile()
@@ -2155,8 +2166,8 @@ function cliTestReport() {
   let code = "32"
   if cliTestFailed > 0 { code = "31" }
   cliOut.push(cliAnsi(cliColor, code, text))
-  cliExit = 0
-  if cliTestFailed > 0 { cliExit = 1 }
+  cliExit = EXIT_OK
+  if cliTestFailed > 0 { cliExit = EXIT_FAILED }
   cliBeginPrint()
 }
 
@@ -2337,7 +2348,7 @@ function cliWalkStep() {
   }
   if cliFiles.length == 0 && cliCmd == 2 {
     cliOut = ["test: no *.test.vl files found under " + cliFile]
-    cliExit = 0
+    cliExit = EXIT_OK
     return cliBeginPrint()
   }
   if cliFiles.length == 0 && cliCmd == 0 {
@@ -2345,7 +2356,7 @@ function cliWalkStep() {
     // --json still delivers a parseable (empty) array on stdout. `--batch` says it with
     // zero records instead — its stdout is records, never an array.
     if cliJson != 0 && cliBatch == 0 { cliJsonOut = "[]\n" }
-    cliExit = 0
+    cliExit = EXIT_OK
     return cliBeginPrint()
   }
   cliValIdx = 0
@@ -3594,10 +3605,10 @@ function cliFmtFailNote(path: string, status: i32) {
 // drift (exit 2); a round-trip gate trip outranks both (exit 3), since a formatter bug
 // must never look like mere drift.
 function cliFmtFinish() {
-  cliExit = 0
-  if cliFmtCheck != 0 && cliFmtDrift > 0 { cliExit = 1 }
-  if cliFmtBad > 0 { cliExit = 2 }
-  if cliFmtBug > 0 { cliExit = 3 }
+  cliExit = EXIT_OK
+  if cliFmtCheck != 0 && cliFmtDrift > 0 { cliExit = EXIT_FAILED }
+  if cliFmtBad > 0 { cliExit = EXIT_USAGE }
+  if cliFmtBug > 0 { cliExit = EXIT_FMT_BUG }
   if cliOut.length > 0 { return cliBeginPrint() }
   cliState = ST_DONE
   CMD_DONE
@@ -3609,16 +3620,8 @@ export function cliNext() {
   const st = cliState
   if st == ST_INIT {
     cliParseArgs()
-    if cliArgErr != "" {
-      cliOut = [cliArgErr]
-      cliExit = 2
-      return cliBeginPrint()
-    }
-    if cliArgs.length == 0 {
-      cliOut = ["vl: no subcommand"]
-      cliExit = 2
-      return cliBeginPrint()
-    }
+    if cliArgErr != "" { return cliUsageStop(cliArgErr) }
+    if cliArgs.length == 0 { return cliUsageStop("vl: no subcommand") }
     const sub = cliArgs[0]
     if sub == "fmt" {
       cliCmd = 1
@@ -3627,9 +3630,9 @@ export function cliNext() {
     } else if sub == "test" {
       cliCmd = 2
     } else {
-      cliOut = ["vl: this build's pump implements `check`, `fmt` and `test`"]
-      cliExit = 2
-      return cliBeginPrint()
+      return cliUsageStop(
+        "vl: this build's pump implements `check`, `fmt` and `test`",
+      )
     }
     cliOut = []
     cliErrors = 0
@@ -3668,9 +3671,7 @@ export function cliNext() {
     let err = "cannot read it"
     if cliFileFound != 0 { err = budgetLoad(cliFileSrc) }
     if err != "" {
-      cliOut = ["check: --budget " + cliBudgetPath + ": " + err]
-      cliExit = 2
-      return cliBeginPrint()
+      return cliUsageStop("check: --budget " + cliBudgetPath + ": " + err)
     }
     if cliBudget == 4 {
       cliJsonOut = budgetExemptLine() + "\n"
@@ -3691,20 +3692,16 @@ export function cliNext() {
     let err = "cannot read it"
     if cliFileFound != 0 { err = budgetNoteJson(cliFileSrc, cliBudgetFindings) }
     if err != "" {
-      cliOut = ["check: --findings " + cliBudgetFindings + ": " + err]
-      cliExit = 2
-      return cliBeginPrint()
+      return cliUsageStop("check: --findings " + cliBudgetFindings + ": " + err)
     }
     if cliBudget != 1 && budgetUnnamed() > 0 {
-      cliOut = [
+      return cliUsageStop(
         "check: --findings "
           + cliBudgetFindings
           + ": "
           + i32ToStr(budgetUnnamed())
           + " finding(s) carry no `text`, so --budget-why and --write-baseline cannot name them",
-      ]
-      cliExit = 2
-      return cliBeginPrint()
+      )
     }
     if cliBudget == 3 { return cliBudgetGitRead(budgetGitStart()) }
     cliBudgetFinish()
@@ -3733,9 +3730,7 @@ export function cliNext() {
   }
   if st == ST_VALIDATE_READ {
     if cliFileFound == 0 {
-      cliOut = [cliSubName() + ": cannot read " + cliFiles[cliValIdx]]
-      cliExit = 2
-      return cliBeginPrint()
+      return cliUsageStop(cliSubName() + ": cannot read " + cliFiles[cliValIdx])
     }
     cliSrcCachePut(cliFiles[cliValIdx], cliFileSrc, 1)
     cliValIdx = cliValIdx + 1
@@ -3752,9 +3747,7 @@ export function cliNext() {
       // record of its own, so the caller's file list and the records line up.
       if cliBatch != 0 { return cliBatchUnreadable() }
       if cliDirMode == 0 {
-        cliOut = ["check: cannot read " + cliCurFile]
-        cliExit = 2
-        return cliBeginPrint()
+        return cliUsageStop("check: cannot read " + cliCurFile)
       }
       cliFileIdx = cliFileIdx + 1
       return cliStartFile()
@@ -3814,9 +3807,7 @@ export function cliNext() {
   if st == ST_FMT_READ {
     if cliFileFound == 0 {
       if cliDirMode == 0 {
-        cliOut = ["fmt: cannot read " + cliCurFile]
-        cliExit = 2
-        return cliBeginPrint()
+        return cliUsageStop("fmt: cannot read " + cliCurFile)
       }
       cliFileIdx = cliFileIdx + 1
       return cliStartFmtFile()
@@ -3862,9 +3853,7 @@ export function cliNext() {
       // A named target that does not exist is a usage error; a file that vanished
       // between the walk and the read is one failing entry.
       if cliDirMode == 0 && cliTestPoolMode != 2 {
-        cliOut = ["test: cannot read " + cliCurFile]
-        cliExit = 2
-        return cliBeginPrint()
+        return cliUsageStop("test: cannot read " + cliCurFile)
       }
       return cliTestFileFailed("cannot read " + cliCurFile)
     }
@@ -3881,16 +3870,14 @@ export function cliNext() {
   }
   if st == ST_CHECK_VALIDATE { return cliCheckCurFileRest() }
   if st == ST_TEST_STASH {
-    if cliTestPoolMode == 2 { return cliTestWorkerDone(0, "") }
+    if cliTestPoolMode == 2 { return cliTestWorkerDone(EXIT_OK, "") }
     cliFileIdx = cliFileIdx + 1
     return cliStartTestFile()
   }
   if st == ST_TEST_ENQUEUED { return cliTestEnqueueNext() }
   if st == ST_TEST_POOLED {
     if cliTestUnreadable != "" {
-      cliOut = ["test: " + cliTestUnreadable]
-      cliExit = 2
-      return cliBeginPrint()
+      return cliUsageStop("test: " + cliTestUnreadable)
     }
     return cliTestBeginCollect()
   }
