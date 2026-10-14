@@ -1753,8 +1753,7 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32) {
   }
   const o = P.nodes[objIx]
   if o is ObjLit {
-    let si = pendingStructIdx
-    pendingStructIdx = -1
+    let si = expCtxTakeStruct()
     if si < 0 { si = structIndexOfObjCtx(objIx, fnIx) }
     if si < 0 {
       return emitFail(
@@ -10006,8 +10005,7 @@ function emitMapNew(_body: u8[]) {
   if !mUsed { return emitFail("emitProgram: Map() but map type not collected") }
   // The binding-seeded map SHAPE (consumed here): -1/-2 build the mono map; an mv
   // slot >= 0 builds THIS value type's map struct over its ref vals list.
-  let slot = pendingMapSlot
-  pendingMapSlot = -1
+  let slot = expCtxTakeMapSlot()
   if slot == -3 { return failMapValueType() }
   if slot == -2 { slot = -1 }
   if slot == -5 { slot = -4 }
@@ -14495,7 +14493,7 @@ function emitStrEq(body: u8[], binIx: i32, fnIx: i32) {
 // Whether string `==` node `binIx` lowers through the plain string core, so a literal operand
 // may take `emitStrEqLit` instead of `emitEqNonNullCore`.
 function strEqLitSideOk(binIx: i32, fnIx: i32): boolean {
-  eqCoreKindOfBin(binIx, fnIx, listOpKindOfBin(binIx, fnIx)) == 5
+  eqCoreKindOfBin(binIx, fnIx, listOpKindOfBin(binIx, fnIx)) == "str"
 }
 
 // Lower a string ordering comparison (`<`/`>`/`<=`/`>=`) onto a 0/1, built on one
@@ -15259,32 +15257,44 @@ function emitEqNonNullCore(body: u8[], binIx: i32, fnIx: i32) {
     // question re-derives it otherwise, on the same node.
     const eqLop = listOpKindOfBin(binIx, fnIx)
     const coreK = eqCoreKindOfBin(binIx, fnIx, eqLop)
-    if coreK == 0 { return emitListEqICore(body) }
-    if coreK == 3 { return emitListEqSCore(body) }
-    if coreK == 4 {
-      let lslot = refListSlotOfExpr(e.binLeft, fnIx)
-      if lslot < 0 { lslot = refListSlotOfExpr(e.binRight, fnIx) }
-      const lbase = leqRBaseOfSlot(lslot)
-      if lbase < 0 {
-        return emitFail("emitProgram: ref-list compare frame not reserved")
+    match coreK {
+      "i32list" => {
+        return emitListEqICore(body)
       }
-      return emitListEqRCore(body, lslot, lbase)
+      "strlist" => {
+        return emitListEqSCore(body)
+      }
+      "reflist" => {
+        let lslot = refListSlotOfExpr(e.binLeft, fnIx)
+        if lslot < 0 { lslot = refListSlotOfExpr(e.binRight, fnIx) }
+        const lbase = leqRBaseOfSlot(lslot)
+        if lbase < 0 {
+          return emitFail("emitProgram: ref-list compare frame not reserved")
+        }
+        return emitListEqRCore(body, lslot, lbase)
+      }
+      "str" => {
+        return emitStrEqCore(body)
+      }
+      "closure" => {
+        return emitCloEqCore(body)
+      }
+      "glist" => {
+        return emitListEqAnyRep(
+          body,
+          eqgListKindOfBin(binIx, fnIx, eqLop),
+          eqgListSlotOfBin(binIx, fnIx),
+          fnIx,
+        )
+      }
+      "none" => {
+        return emitFail(
+          "emitProgram: `"
+            + e.binOp
+            + "` over this operand rep has no compare core",
+        )
+      }
     }
-    if coreK == 5 { return emitStrEqCore(body) }
-    if coreK == 6 { return emitCloEqCore(body) }
-    if coreK == 7 {
-      return emitListEqAnyRep(
-        body,
-        eqgListKindOfBin(binIx, fnIx, eqLop),
-        eqgListSlotOfBin(binIx, fnIx),
-        fnIx,
-      )
-    }
-    return emitFail(
-      "emitProgram: `"
-        + e.binOp
-        + "` over this operand rep has no compare core",
-    )
   }
   emitFail("emitProgram: expected a `==`/`!=` for the compare core")
 }
@@ -15473,20 +15483,20 @@ function binEqGRepUnresolved(binIx: i32, fnIx: i32) {
     if !binPlusIsListByTy(nodeTyIxOf(e.binLeft), nodeTyIxOf(e.binRight)) {
       const tl = eqCoreKindOfTyToken(nodeEqCmpKind(e.binLeft))
       const tr = eqCoreKindOfTyToken(nodeEqCmpKind(e.binRight))
-      if tl != 7 && tr != 7 { return false }
+      if tl != "glist" && tr != "glist" { return false }
     }
     // A core's claim on the pair is trusted only when the rep-home classifier
     // (`catListKindOfExpr`) agrees which rep this is: `listOpKindOf` picks among only the
     // three old cores, so it can silently misclassify an unhandled rep (an `i64[]` falling
     // through to the i32 core) — a claim it cannot corroborate is not a claim. Reads zero on today's tree (D755) but guards the next rep added to one ladder and not the other.
     const lop = listOpKindOfBin(binIx, fnIx)
-    if lop >= 0 {
+    if lop != "none" {
       const ck = catListKindOfExpr(e.binLeft, fnIx)
       if ck >= 0 {
-        // core 0 is the i32 list, core 3 the string list, core 4 a ref list of i32 lists.
-        if lop == 0 && ck != LBK_I32_LIST { return true }
-        if lop == 3 && ck != LBK_STR_LIST { return true }
-        if lop == 4 && ck != LBK_REF { return true }
+        // the i32 list, the string list, and a ref list of i32 lists.
+        if lop == "i32list" && ck != LBK_I32_LIST { return true }
+        if lop == "strlist" && ck != LBK_STR_LIST { return true }
+        if lop == "reflist" && ck != LBK_REF { return true }
       }
       return false
     }
@@ -29070,6 +29080,43 @@ function expCtxSetListBuild(kind: i32, slot: i32) {
   0
 }
 
+// Consumes the record seed: returns it and resets it to -1, so a nested literal does not
+// inherit it. Every other ambient seed stays as it is.
+function expCtxTakeStruct(): i32 {
+  const c = expCtxHere()
+  const was = c.structIdx
+  c.structIdx = -1
+  expCtxApply(c)
+  was
+}
+
+// Consumes the bare-variant seed: returns it and resets it to -1.
+function expCtxTakeVariant(): i32 {
+  const c = expCtxHere()
+  const was = c.variantIdx
+  c.variantIdx = -1
+  expCtxApply(c)
+  was
+}
+
+// Consumes the map-shape seed a `Map()` builds: returns it and resets it to -1.
+function expCtxTakeMapSlot(): i32 {
+  const c = expCtxHere()
+  const was = c.mapSlot
+  c.mapSlot = -1
+  expCtxApply(c)
+  was
+}
+
+// Consumes the heap a bare `null` refs: returns it and resets it to -1.
+function expCtxTakeNulRefHeap(): i32 {
+  const c = expCtxHere()
+  const was = c.nulRefHeap
+  c.nulRefHeap = -1
+  expCtxApply(c)
+  was
+}
+
 // Emit `exprIx` under the explicit expected-type context `ctx`: the ambient
 // seeds are saved, `ctx` applied, the expression emitted, and EVERY seed
 // restored — scoping the whole context to this one emit.
@@ -30359,8 +30406,7 @@ function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
   // Reset the seed after CONSUMING it, so it never persists past this `null` (a stray
   // non-(-1) value would mis-type a later bare `null`).
   if pendingNulRefHeap >= 0 {
-    const nrh = pendingNulRefHeap
-    pendingNulRefHeap = -1
+    const nrh = expCtxTakeNulRefHeap()
     wU8(208) // 0xd0 ref.null
     wSLEB(nrh)
     return 0
@@ -30433,8 +30479,7 @@ function emitObjLitNode(body: u8[], _e: ObjLit, exprIx: i32, fnIx: i32) {
   // inherit the hint. Bounded, since the hint can be mis-paired — set from many sites,
   // some of which fall through to the struct table while the kind ladder said variant.
   if pendingVariantIdx >= 0 {
-    const pvi = pendingVariantIdx
-    pendingVariantIdx = -1
+    const pvi = expCtxTakeVariant()
     if pvi < uVariants.length {
       return emitVariantStruct(body, exprIx, pvi, fnIx)
     }
@@ -31740,9 +31785,9 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return 0
     }
   }
-  if lopK >= 0 {
+  if lopK != "none" {
     if e.binOp == "+" {
-      if lopK != 0 {
+      if lopK != "i32list" {
         return emitFail(
           "emitProgram: list concat over this element kind is not supported",
         )
@@ -32422,112 +32467,120 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
       // below; -1 for every kind whose element is a scalar or a string.
       let anElemSlot = -1
       const ank = arrNewIntrKind(callIx, fnIx)
-      if ank == 1 {
-        if !fa64Used {
-          return emitFail(
-            "emitProgram: __array_new__ f64 fill but f64 list types not collected",
-          )
-        }
-        anBack = fa64TypeIdx
-        anWrap = fl64TypeIdx
-      } else if ank == 4 {
-        // D963 — I64 fill → the i64 list pair.
-        if !ia64Used {
-          return emitFail(
-            "emitProgram: __array_new__ i64 fill but i64 list types not collected",
-          )
-        }
-        anBack = ia64TypeIdx
-        anWrap = il64TypeIdx
-      } else if ank == 5 {
-        // D1470 — the PACKED byte list. Reachable only from `__array_new_default__`
-        // (`arrNewDefaultKind`): `array.new_default` zeroes an `i8` slot exactly as it
-        // zeroes an `i32` one, so the destination's own pair is all this needs.
-        if !ba8Used {
-          return emitFail(
-            "emitProgram: __array_new_default__ u8 element but u8 list types not collected",
-          )
-        }
-        anBack = ba8TypeIdx
-        anWrap = bl8TypeIdx
-      } else if ank == 6 {
-        // D1470 — the f32 list, from `__array_new_default__`'s destination or, since D1673,
-        // from an f32 FILL. A float literal fill is not one: it types f64, and the checker
-        // refuses it against an `f32[]` destination before the emitter sees it.
-        if !fa32Used {
-          return emitFail(
-            "emitProgram: __array_new_default__ f32 element but f32 list types not collected",
-          )
-        }
-        anBack = fa32TypeIdx
-        anWrap = fl32TypeIdx
-      } else if ank == 2 {
-        // STRING fill → the string list (`array.new` of the shared string-ref
-        // backing; a non-null string ref stores into the nullable slot directly).
-        if !slUsed {
-          return emitFail(
-            "emitProgram: __array_new__ string fill but string list types not collected",
-          )
-        }
-        anBack = mkArrIdx
-        anWrap = mkListIdx
-      } else if ank == 3 {
-        // STRUCT fill → the ref list of the element struct (its interned slot).
-        if !rlUsed {
-          return emitFail(
-            "emitProgram: __array_new__ struct fill but ref list types not collected",
-          )
-        }
-        // The STRICT slot: this arm picks the list's backing and wrapper heap types, so an
-        // unresolved element must refuse, not clamp. Slot 0 is a real row, and clamping to
-        // it built the module at whichever element interned first (D1605).
-        const anSlot = refListSlotOfExprStrict(callIx, fnIx)
-        const anBad = anSlot >= rlWrapIdx.length || anSlot >= rlBackIdx.length
-        if anSlot < 0 || anBad {
-          return emitFail(
-            "emitProgram: __array_new__ fill type not yet supported natively",
-          )
-        }
-        anBack = rlBackIdx[anSlot]
-        anWrap = rlWrapIdx[anSlot]
-        anElemSlot = anSlot
-        anElemStructIdx = rlElemStructRow(anSlot)
-        if anElemStructIdx < 0 {
-          anElemVariantIdx = variantIndexOf(nonNulBaseOf(rlElemName[anSlot]))
-        }
-      } else {
-        if !aUsed || !lUsed {
-          return emitFail(
-            "emitProgram: array intrinsic but list types not collected",
-          )
-        }
-        if anIsNew {
-          const anFill = c.callArgs[1]
-          const anFillNode = P.nodes[anFill]
-          // The i32 list is this arm's answer for an i32 or boolean fill and also
-          // `arrNewIntrKind`'s fall-through. Where nothing named the kind — not the fill, not
-          // the destination, not an instance's parameter annotation — the list is a guess,
-          // and a guess about the fill's rep is silent invalid wasm (D1630).
-          if !arrNewKindNamed(callIx, fnIx) {
+      match ank {
+        "f64list" => {
+          if !fa64Used {
             return emitFail(
-              "emitProgram: __array_new__ fill names no element rep, and its destination names none either",
+              "emitProgram: __array_new__ f64 fill but f64 list types not collected",
             )
           }
-          // The i64 and f32 guards that sat here are gone (D1673): both pairs are interned,
-          // so those fills take kinds 4 and 6 above and never reach this fall-through. A
-          // stale reason in a refusal is still a refusal.
-          let anFillRef = false
-          if anFillNode is ObjLit { anFillRef = true }
-          if exprIsClosure(anFill, fnIx) { anFillRef = true }
-          if exprArray(anFill, fnIx) { anFillRef = true }
-          if exprRefArray(anFill, fnIx) { anFillRef = true }
-          if exprStringArray(anFill, fnIx) { anFillRef = true }
-          if exprMap(anFill, fnIx) { anFillRef = true }
-          if anFillRef {
-            // Remaining ref-fill long tail: closures / nested arrays / maps.
+          anBack = fa64TypeIdx
+          anWrap = fl64TypeIdx
+        }
+        "i64list" => {
+          // D963 — I64 fill → the i64 list pair.
+          if !ia64Used {
+            return emitFail(
+              "emitProgram: __array_new__ i64 fill but i64 list types not collected",
+            )
+          }
+          anBack = ia64TypeIdx
+          anWrap = il64TypeIdx
+        }
+        "u8list" => {
+          // D1470 — the PACKED byte list. Reachable only from `__array_new_default__`
+          // (`arrNewDefaultKind`): `array.new_default` zeroes an `i8` slot exactly as it
+          // zeroes an `i32` one, so the destination's own pair is all this needs.
+          if !ba8Used {
+            return emitFail(
+              "emitProgram: __array_new_default__ u8 element but u8 list types not collected",
+            )
+          }
+          anBack = ba8TypeIdx
+          anWrap = bl8TypeIdx
+        }
+        "f32list" => {
+          // D1470 — the f32 list, from `__array_new_default__`'s destination or, since D1673,
+          // from an f32 FILL. A float literal fill is not one: it types f64, and the checker
+          // refuses it against an `f32[]` destination before the emitter sees it.
+          if !fa32Used {
+            return emitFail(
+              "emitProgram: __array_new_default__ f32 element but f32 list types not collected",
+            )
+          }
+          anBack = fa32TypeIdx
+          anWrap = fl32TypeIdx
+        }
+        "strlist" => {
+          // STRING fill → the string list (`array.new` of the shared string-ref
+          // backing; a non-null string ref stores into the nullable slot directly).
+          if !slUsed {
+            return emitFail(
+              "emitProgram: __array_new__ string fill but string list types not collected",
+            )
+          }
+          anBack = mkArrIdx
+          anWrap = mkListIdx
+        }
+        "reflist" => {
+          // STRUCT fill → the ref list of the element struct (its interned slot).
+          if !rlUsed {
+            return emitFail(
+              "emitProgram: __array_new__ struct fill but ref list types not collected",
+            )
+          }
+          // The STRICT slot: this arm picks the list's backing and wrapper heap types, so an
+          // unresolved element must refuse, not clamp. Slot 0 is a real row, and clamping to
+          // it built the module at whichever element interned first (D1605).
+          const anSlot = refListSlotOfExprStrict(callIx, fnIx)
+          const anBad = anSlot >= rlWrapIdx.length || anSlot >= rlBackIdx.length
+          if anSlot < 0 || anBad {
             return emitFail(
               "emitProgram: __array_new__ fill type not yet supported natively",
             )
+          }
+          anBack = rlBackIdx[anSlot]
+          anWrap = rlWrapIdx[anSlot]
+          anElemSlot = anSlot
+          anElemStructIdx = rlElemStructRow(anSlot)
+          if anElemStructIdx < 0 {
+            anElemVariantIdx = variantIndexOf(nonNulBaseOf(rlElemName[anSlot]))
+          }
+        }
+        "list" | "none" => {
+          if !aUsed || !lUsed {
+            return emitFail(
+              "emitProgram: array intrinsic but list types not collected",
+            )
+          }
+          if anIsNew {
+            const anFill = c.callArgs[1]
+            const anFillNode = P.nodes[anFill]
+            // The i32 list is this arm's answer for an i32 or boolean fill and also
+            // `arrNewIntrKind`'s fall-through. Where nothing named the kind — not the fill, not
+            // the destination, not an instance's parameter annotation — the list is a guess,
+            // and a guess about the fill's rep is silent invalid wasm (D1630).
+            if !arrNewKindNamed(callIx, fnIx) {
+              return emitFail(
+                "emitProgram: __array_new__ fill names no element rep, and its destination names none either",
+              )
+            }
+            // The i64 and f32 guards that sat here are gone (D1673): both pairs are interned,
+            // so those fills take kinds 4 and 6 above and never reach this fall-through. A
+            // stale reason in a refusal is still a refusal.
+            let anFillRef = false
+            if anFillNode is ObjLit { anFillRef = true }
+            if exprIsClosure(anFill, fnIx) { anFillRef = true }
+            if exprArray(anFill, fnIx) { anFillRef = true }
+            if exprRefArray(anFill, fnIx) { anFillRef = true }
+            if exprStringArray(anFill, fnIx) { anFillRef = true }
+            if exprMap(anFill, fnIx) { anFillRef = true }
+            if anFillRef {
+              // Remaining ref-fill long tail: closures / nested arrays / maps.
+              return emitFail(
+                "emitProgram: __array_new__ fill type not yet supported natively",
+              )
+            }
           }
         }
       }
@@ -32558,7 +32611,7 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         }
         // A `string | null` fill keeps its null: the string backing's slot is nullable, so the
         // read is seeded as a `(string | null)[]` element's is (DV-402).
-        if ank == 2 && exprNullableString(c.callArgs[1], fnIx) {
+        if ank == "strlist" && exprNullableString(c.callArgs[1], fnIx) {
           anCtx.nulString = true
         }
         expCtxApply(anCtx)
