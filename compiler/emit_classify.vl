@@ -878,8 +878,10 @@ import {
 } from "./tyquery"
 import {
   emitPassGen,
+  memoKeyClear,
   memoKeyNew,
   memoMoved,
+  memoMoved3,
   memoPassMoved,
   tyRegNoteWrite,
   tyRegWrites,
@@ -23056,18 +23058,17 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
 // (the anonymous literals interned the same sets). -1 if neither.
 export function structIndexOfTypeName(name: string) {
   const gen = tyRegGenNow()
+  if memoMoved(trgReadGenKey, 0, gen) { sitnMemo = Map() }
   const hit = sitnMemo[name]
-  if hit != null {
-    if hit[0] == gen { return hit[1] }
-  }
+  if hit != null { return hit }
   const si = structIndexOfTypeNameGo(name)
-  sitnMemo[name] = [gen, si]
+  if trgGen == gen { sitnMemo[name] = si }
   si
 }
 
-// `structIndexOfTypeName`'s answers by name, each stamped with the `tyRegGenNow` read before
-// computing it.
-let sitnMemo: {[string]: i32[]} = Map()
+// `structIndexOfTypeName`'s answers by name, all for the generation `trgReadGenKey` last read;
+// an answer whose own computation moved the generation is not kept.
+let sitnMemo: {[string]: i32} = Map()
 
 function structIndexOfTypeNameGo(name: string) {
   const si = structIndexByName(name)
@@ -31901,24 +31902,18 @@ function vshtPop(r: i32): i32 {
 }
 
 // The `variantSig` memo — a dense prefix of the variant rows, extended on first ask, since
-// the twin search asks for every ordered pair. Stamped on the length of each table the sig
+// the twin search asks for every ordered pair. Keyed on the length of each table the sig
 // reads: every write to those is a `push` or `collectU`'s whole-table reset, so three equal
 // lengths mean no write since the fill.
 let uVarSigMemo: string[] = []
-let uVarSigNamesLen = -1
-let uVarSigStartLen = -1
-let uVarSigCountLen = -1
+const uVarSigGenKey = memoKeyNew(3)
 
 // Drops the memo and `variantTagKey`'s. `collectU` rebuilds the variant tables from empty and a second module can
-// refill them to the same three lengths with different names, which the stamp cannot see.
+// refill them to the same three lengths with different names, which the key cannot see.
 export function variantSigMemoDrop() {
   uVarSigMemo = []
-  uVarSigNamesLen = -1
-  uVarSigStartLen = -1
-  uVarSigCountLen = -1
-  uTagKeyStartLen = -1
-  uTagKeyTyLen = -1
-  uTagKeyReLays = -1
+  memoKeyClear(uVarSigGenKey)
+  memoKeyClear(uTagKeyGenKey)
   0
 }
 
@@ -31928,14 +31923,14 @@ export function variantSigMemoDrop() {
 // AST-style unions use DISTINCT field-name prefixes per variant, so every sig differs.
 export function variantSig(vi: i32) {
   if (
-    uVarSigNamesLen != uFieldNames.length
-    || uVarSigStartLen != uFieldStart.length
-    || uVarSigCountLen != uFieldCount.length
+    memoMoved3(
+      uVarSigGenKey,
+      uFieldNames.length,
+      uFieldStart.length,
+      uFieldCount.length,
+    )
   ) {
     uVarSigMemo = []
-    uVarSigNamesLen = uFieldNames.length
-    uVarSigStartLen = uFieldStart.length
-    uVarSigCountLen = uFieldCount.length
   }
   // A row outside either span table takes the direct call, so an out-of-range ask still
   // reads its own row rather than filling a prefix that would trap one row early.
@@ -31968,19 +31963,14 @@ function variantSigGo(vi: i32) {
 // sharing a field-name set share a tag only when they agree field by field, so `{v: i32}` and
 // `{v: string}` are told apart by the tag (D4056).
 export function variantTagKey(vi: i32): string {
-  // Stamped on the tables' lengths and on the re-lay generation: a literal field re-laid in
+  // Keyed on the tables' lengths and on the re-lay generation: a literal field re-laid in
   // place moves no length (D1655).
   if (
-    uTagKeyStartLen != uFieldStart.length
-    || uTagKeyTyLen != uVarTyIx.length
-    || uTagKeyReLays != uFieldReLays
+    memoMoved3(uTagKeyGenKey, uFieldStart.length, uVarTyIx.length, uFieldReLays)
   ) {
     uTagKeyMemo = []
     uTagKeyGroups = Map()
     uTagKeyGroupOf = []
-    uTagKeyStartLen = uFieldStart.length
-    uTagKeyTyLen = uVarTyIx.length
-    uTagKeyReLays = uFieldReLays
   }
   if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
     return variantSig(vi)
@@ -32020,9 +32010,7 @@ function variantSigPeers(vi: i32): i32[] {
 let uTagKeyMemo: string[] = []
 let uTagKeyGroups: {[string]: i32[]} = Map()
 let uTagKeyGroupOf: i32[][] = []
-let uTagKeyStartLen = -1
-let uTagKeyTyLen = -1
-let uTagKeyReLays = -1
+const uTagKeyGenKey = memoKeyNew(3)
 
 // Whether rows `a` and `b`, which share a field-name set, hold the same values in every field.
 // A row with no arena type compares by its type text; a map field also by its element, key
@@ -48801,20 +48789,26 @@ export function sigKeyOfTy(funcTyIx: i32): string {
   k
 }
 
-// `sigKeyOfTy`'s answers by type id, each stamped with the `tyRegGenNow` read before computing it.
+// `sigKeyOfTy`'s answers by type id, each stamped with the `tyRegGenNow` read before computing
+// it. A stamp per entry rather than a key, since a dense array read is cheaper than a map's on
+// this path.
 let sktGen: i32[] = []
 let sktKey: string[] = []
+
+// The registry generation `sitnMemo` last read.
+const trgReadGenKey = memoKeyNew(1)
 
 // The type-registry generation: it moves when anything type-name or signature resolution reads
 // may have changed: a table grows, a row or node type is rewritten in place, a type mutates, a
 // pass or the arena moves. A memo stamped with the value at the start of its computation
 // therefore cannot answer from inputs that changed since, including ones that computation changed.
 let trgGen = 0
-let trgGenKey = memoKeyNew(21)
+const trgGenKey = memoKeyNew(21)
 
 export function tyRegMemoReset() {
-  trgGen = trgGen + 1
-  trgGenKey = memoKeyNew(21)
+  trgGen = 0
+  memoKeyClear(trgGenKey)
+  memoKeyClear(trgReadGenKey)
   sitnMemo = Map()
   sktGen = []
   sktKey = []

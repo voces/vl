@@ -141,3 +141,77 @@ Deno.test({
     }
   },
 });
+
+// The root pool checks each root in a fresh instance and folds its report back in root
+// order, so its output must be the in-process run's byte for byte. The fixture holds the
+// cases that could tell them apart: a root whose diagnostics depend on which file is the
+// entry, the missing-import scan (whose multi-exporter text reads earlier roots' scans,
+// so the parent checks those roots itself), a sibling that does not lex, and an
+// import's withheld warning.
+Deno.test({
+  name: "vl-check-dir: the root pool's report is the in-process report, byte for byte",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_pool_" });
+    try {
+      const files: Record<string, string> = {
+        "a.vl": "export function f(x) { return x * 2 }\n",
+        "b.vl": 'import { f } from "./a"\nprint(f("s"))\n',
+        "c.vl": 'import { f } from "./a"\nprint(f(3))\n',
+        "d.vl": "export function helper() { return 1 }\n",
+        "e.vl": "print(helper())\n",
+        "g.vl": "print(helper2())\nprint(helper())\n",
+        "h.vl": "export function helper2() { return 2 }\nexport function helper() { return 3 }\n",
+        "i.vl": 'let s = "unterminated\n',
+        "j.vl": "let x = 1\nprint(x)\n",
+        "k.vl": 'import { w } from "./j2"\nprint(w)\n',
+        "j2.vl": "export const w = 1\nlet unused = 2\n",
+      };
+      for (const [name, src] of Object.entries(files)) {
+        await Deno.writeTextFile(`${dir}/${name}`, src);
+      }
+      const named = ["b.vl", "e.vl", "j.vl", "k.vl", "missing.vl"].map((f) => `${dir}/${f}`);
+      const shapes: string[][] = [
+        [dir],
+        [dir, "--json"],
+        [dir, "--severity", "info", "--json"],
+        [dir, "--concise", "--include-imports"],
+        ["--batch", "--json", ...named],
+      ];
+      const run = async (args: string[], jobs: string) => {
+        const r = await new Deno.Command(VL, {
+          args: ["check", ...args, "--compiler", COMPILER],
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: jobs, VL_TEST_TRACE: "1" }),
+        }).output();
+        const err = new TextDecoder().decode(r.stderr).split("\n");
+        const trace = err.filter((l) => l.startsWith("vl-test-trace workers phase=check"));
+        return {
+          code: r.code,
+          out: new TextDecoder().decode(r.stdout),
+          err: err.filter((l) => !l.startsWith("vl-test-trace")).join("\n"),
+          trace: trace.join("\n"),
+        };
+      };
+      for (const args of shapes) {
+        const serial = await run(args, "1");
+        const pooled = await run(args, "4");
+        // The control: a pool of two or more actually ran (memory may cap it below
+        // four), so the comparison below is not vacuous.
+        if (!/n=([2-9]|\d\d)/.test(pooled.trace)) {
+          throw new Error(`${args.join(" ")}: want a pool of 2+ workers, got ${JSON.stringify(pooled.trace)}`);
+        }
+        for (const k of ["code", "out", "err"] as const) {
+          if (serial[k] !== pooled[k]) {
+            throw new Error(
+              `${args.join(" ")}: ${k} differs\nwant (VL_JOBS=1):\n${serial[k]}\ngot (pool):\n${pooled[k]}`,
+            );
+          }
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
