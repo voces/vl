@@ -1,0 +1,386 @@
+// Grade a math-grid.vl transcript against a 256-bit reference: max/mean ulp error per
+// function, width and section. Exits 1 if any finite point misses the documented 1-ulp bound,
+// an exact power does not come out exact, or an IEEE 754 edge case (NaN, infinity, signed
+// zero) is wrong. math-check.sh runs it.
+//
+//   vl run scripts/std-math/math-grade.vl -- <transcript>
+//
+// Run from the checkout root: a transcript past one chunk is graded by building this file.
+
+import { programArgs } from "std:args"
+import { parseI32, parseI64, toString } from "std:fmt"
+import { join, split } from "std:str"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { die } from "../lib/common"
+import { padLeft, padRight, pyRepr } from "../lib/corpus"
+import { Acc, gradeMain, note, pyFixed, sortedKeys, stat } from "./grade-common"
+import {
+  BF,
+  absBF,
+  add,
+  atan2BF,
+  atanBF,
+  cmp,
+  cmpAbs,
+  div,
+  expBF,
+  floorLog2,
+  fromF64,
+  ldexp,
+  logBF,
+  mul,
+  neg,
+  one,
+  piBF,
+  roundNearest,
+  sqrtBF,
+  sub,
+  toF64,
+  zero,
+} from "./bigfloat"
+
+const SELF = "scripts/std-math/math-grade.vl"
+const INF = 1.0 / 0.0
+const NAN = 0.0 / 0.0
+const PI = 3.141592653589793
+const F64_NAN: i64 = 9221120237041090560
+const F32_NAN = 2143289344
+const RP = 320
+const SIGN: i64 = -9223372036854775808
+
+function isNan(x: f64): boolean { x != x }
+
+function isInf(x: f64): boolean { x == INF || x == 0.0 - INF }
+
+function signBit(x: f64): boolean { f64bits(x) < 0 }
+
+// -x by its sign bit, so that -(0.0) is -0.0 as Python reads it.
+function negF(x: f64): f64 { f64fromBits(f64bits(x) ^ SIGN) }
+
+function copySign(m: f64, s: f64): f64 {
+  if signBit(m) != signBit(s) { return negF(m) }
+  m
+}
+
+function ieeeExp(x: f64): f64 | null {
+  if isNan(x) { return NAN }
+  if x == INF { return INF }
+  if x == 0.0 - INF { return 0.0 }
+  null
+}
+
+function ieeeLog(x: f64): f64 | null {
+  if isNan(x) || x < 0.0 { return NAN }
+  if x == 0.0 { return 0.0 - INF }
+  if x == INF { return INF }
+  if x == 1.0 { return 0.0 }
+  null
+}
+
+function isInt(y: f64): boolean { y == floor(y) }
+
+function isOdd(y: f64): boolean {
+  isInt(y) && abs(y) < 9007199254740992.0 && (trunc(y) as! i64) % 2 != 0
+}
+
+// C99 Annex F pow for every pair the kernel does not compute; null otherwise.
+function ieeePow(x: f64, y: f64): f64 | null {
+  if y == 0.0 || x == 1.0 { return 1.0 }
+  if isNan(x) || isNan(y) { return NAN }
+  if isInf(y) {
+    if abs(x) == 1.0 { return 1.0 }
+    if (abs(x) > 1.0) == (y > 0.0) { return INF }
+    return 0.0
+  }
+  const flip = isOdd(y) && signBit(x)
+  if x == 0.0 || isInf(x) {
+    let m = 0.0
+    if (x == 0.0) == (y < 0.0) { m = INF }
+    if flip { return negF(m) }
+    return m
+  }
+  if x < 0.0 && !isInt(y) { return NAN }
+  null
+}
+
+function ieeeAtan(x: f64): f64 | null {
+  if isNan(x) { return NAN }
+  if isInf(x) { return copySign(PI / 2.0, x) }
+  if x == 0.0 { return x }
+  null
+}
+
+function ieeeAsin(x: f64): f64 | null {
+  if isNan(x) || abs(x) > 1.0 { return NAN }
+  if x == 0.0 { return x }
+  null
+}
+
+function ieeeAcos(x: f64): f64 | null {
+  if isNan(x) || abs(x) > 1.0 { return NAN }
+  if x == 1.0 { return 0.0 }
+  null
+}
+
+// atan2(y, x), y the first operand as the transcript writes it.
+function ieeeAtan2(y: f64, x: f64): f64 | null {
+  if isNan(x) || isNan(y) { return NAN }
+  const negX = signBit(x)
+  if isInf(x) {
+    let m = 0.0
+    if isInf(y) {
+      m = PI / 4.0
+      if negX { m = 3.0 * PI / 4.0 }
+    } else if negX {
+      m = PI
+    }
+    return copySign(m, y)
+  }
+  if y == 0.0 {
+    if negX { return copySign(PI, y) }
+    return copySign(0.0, y)
+  }
+  if x == 0.0 || isInf(y) { return copySign(PI / 2.0, y) }
+  null
+}
+
+function ieeeHypot(x: f64, y: f64): f64 | null {
+  if isInf(x) || isInf(y) { return INF }
+  if isNan(x) || isNan(y) { return NAN }
+  if x == 0.0 && y == 0.0 { return 0.0 }
+  null
+}
+
+function edge(fn: string, x: f64, y: f64): f64 | null {
+  if fn == "E" { return ieeeExp(x) }
+  if fn == "L" { return ieeeLog(x) }
+  if fn == "A" { return ieeeAtan(x) }
+  if fn == "S" { return ieeeAsin(x) }
+  if fn == "C" { return ieeeAcos(x) }
+  if fn == "P" { return ieeePow(x, y) }
+  if fn == "T" { return ieeeAtan2(x, y) }
+  if fn == "H" { return ieeeHypot(x, y) }
+  die("unknown function kind " + fn, 2)
+  null
+}
+
+// The edge result's bits against the expected value's, NaN as the canonical quiet NaN.
+function specialErr(gb: i64, want: f64, w: i32): f64 {
+  let bits = f64bits(want)
+  if w == 32 { bits = f32bits(want as f32) as i64 }
+  if isNan(want) {
+    bits = F64_NAN
+    if w == 32 { bits = F32_NAN as i64 }
+  }
+  if gb == bits { return 0.0 }
+  INF
+}
+
+// |x|^n for an integer n, |n| <= 65536, by squaring at 1100 bits.
+function powInt(x: BF, n: i64): BF {
+  let r = one()
+  let b = absBF(x)
+  let k = n
+  if k < 0 { k = 0 - k }
+  while k > 0 {
+    if (k & 1) == 1 { r = mul(r, b, 1100) }
+    k = k >> 1
+    if k > 0 { b = mul(b, b, 1100) }
+  }
+  if n < 0 { return div(one(), r, 1100) }
+  r
+}
+
+function oneMinusSq(x: BF): BF { sub(one(), mul(x, x, 2 * RP), RP) }
+
+// The reference at 320 bits, before rounding to mpmath's 256.
+function reference(fn: string, x: f64, y: f64): BF {
+  const bx = fromF64(x)
+  if fn == "E" { return expBF(bx, RP) }
+  if fn == "L" { return logBF(bx, RP) }
+  if fn == "A" { return atanBF(bx, RP) }
+  if fn == "S" {
+    if abs(x) == 1.0 {
+      const h = ldexp(piBF(RP), -1)
+      if x < 0.0 { return neg(h) }
+      return h
+    }
+    return atanBF(div(bx, sqrtBF(oneMinusSq(bx), RP), RP), RP)
+  }
+  if fn == "C" { return atan2BF(sqrtBF(oneMinusSq(bx), RP), bx, RP) }
+  const by = fromF64(y)
+  if fn == "T" { return atan2BF(bx, by, RP) }
+  if fn == "H" {
+    return sqrtBF(add(mul(bx, bx, 2 * RP), mul(by, by, 2 * RP), 2 * RP), RP)
+  }
+  let r = zero()
+  if isInt(y) && abs(y) <= 65536.0 {
+    r = powInt(bx, trunc(y) as! i64)
+  } else {
+    r = expBF(mul(by, logBF(absBF(bx), RP), RP), RP - 20)
+  }
+  if x < 0.0 && isOdd(y) { r = neg(r) }
+  r
+}
+
+function topOf(w: i32): BF {
+  if w == 64 { return sub(ldexp(one(), 1024), ldexp(one(), 970), 64) }
+  sub(ldexp(one(), 128), ldexp(one(), 103), 64)
+}
+
+const TOP64 = topOf(64)
+const TOP32 = topOf(32)
+
+// |y - ref| in ulps of ref's binade, with the width's overflow and subnormal floors.
+function ulpErr(y: f64, ref: BF, w: i32): f64 {
+  let top = TOP64
+  let frac = 52
+  let least = -1022
+  if w == 32 {
+    top = TOP32
+    frac = 23
+    least = -126
+  }
+  if cmpAbs(ref, top) >= 0 {
+    if y == INF && ref.s > 0 { return 0.0 }
+    if y == 0.0 - INF && ref.s < 0 { return 0.0 }
+    return INF
+  }
+  if isInf(y) || isNan(y) { return INF }
+  if ref.s == 0 {
+    if y == 0.0 { return 0.0 }
+    return INF
+  }
+  let e = floorLog2(ref)
+  if e < least { e = least }
+  toF64(ldexp(absBF(sub(fromF64(y), ref, 4000)), frac - e))
+}
+
+// Whether `ref` is exactly a value of the width, inside the Python's 1e300 sanity window.
+function representable(ref: BF, w: i32): boolean {
+  if cmpAbs(ref, fromF64(1e300)) > 0 { return false }
+  if ref.s != 0 && cmpAbs(ref, fromF64(1e-300)) < 0 { return false }
+  let v = toF64(ref)
+  if w == 32 {
+    if abs(v) > 3.4e38 { return false }
+    v = (v as f32) as f64
+  }
+  cmp(fromF64(v), ref) == 0
+}
+
+function valueAt(p: string[], i: i32, w: i32): f64 {
+  if w == 32 { return f32fromBits(parseI32(p[i]) ?? 0) as f64 }
+  f64fromBits(parseI64(p[i]) ?? 0)
+}
+
+function bitsAt(p: string[], i: i32, w: i32): i64 {
+  if w == 32 { return (parseI32(p[i]) ?? 0) as i64 }
+  parseI64(p[i]) ?? 0
+}
+
+function grade(ln: string, acc: Acc) {
+  const p = split(ln, " ")
+  const k = p[0]
+  let w = 64
+  let fn = k
+  const lower = "elpascth"
+  const upper = "ELPASCTH"
+  let i = 0
+  while i < upper.length {
+    if k == lower.slice(i, i + 1) {
+      w = 32
+      fn = upper.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  const binary = fn == "P" || fn == "T" || fn == "H"
+  let gi = 2
+  if binary { gi = 3 }
+  if p.length != gi + 1 { die("not a math-grid line: " + ln, 2) }
+  const x = valueAt(p, 1, w)
+  let y = 0.0
+  if binary { y = valueAt(p, 2, w) }
+  const gb = bitsAt(p, gi, w)
+  const got = valueAt(p, gi, w)
+  const ws = toString(w)
+  const want = edge(fn, x, y)
+  if want != null {
+    note(acc, join([fn, ws, "edge"], "\t"), specialErr(gb, want, w), x)
+    return
+  }
+  const ref = roundNearest(reference(fn, x, y), 256)
+  let err = ulpErr(got, ref, w)
+  if ref.s != 0 && got == 0.0 && signBit(got) != (ref.s < 0) { err = INF }
+  if (
+    fn == "P"
+    && isInt(x)
+    && isInt(y)
+    && representable(ref, w)
+    && cmp(fromF64(got), ref) != 0
+  ) {
+    acc.misses[0] = acc.misses[0] + 1
+  }
+  let least = -1022
+  if w == 32 { least = -126 }
+  let sec = "normal"
+  if ref.s == 0 || floorLog2(ref) < least { sec = "subnormal" }
+  note(acc, join([fn, ws, sec], "\t"), err, x)
+}
+
+function nameOf(fn: string): string {
+  if fn == "E" { return "exp" }
+  if fn == "L" { return "log" }
+  if fn == "P" { return "pow" }
+  if fn == "A" { return "atan" }
+  if fn == "S" { return "asin" }
+  if fn == "C" { return "acos" }
+  if fn == "T" { return "atan2" }
+  "hypot"
+}
+
+function report(acc: Acc) {
+  const head = "\{padRight("fn", 5)} \{padRight("w", 2)} \{padRight("section", 9)}"
+  print(
+    "\{head} \{padLeft("points", 9)} \{padLeft("max ulp", 9)} \{padLeft("mean ulp", 9)} \{padLeft(">0.5ulp", 8)}",
+  )
+  for key in sortedKeys(acc) {
+    const kp = split(key, "\t")
+    const st = stat(acc, key)
+    const name = "\{padRight(nameOf(kp[0]), 5)} \{padLeft(kp[1], 2)} \{padRight(kp[2], 9)}"
+    const mean = pyFixed(st.tot / (st.n as f64), 4)
+    print(
+      "\{name} \{padLeft(toString(st.n), 9)} \{padLeft(pyFixed(st.mx, 4), 9)} \{padLeft(mean, 9)} \{padLeft(toString(st.over), 8)}",
+    )
+  }
+  const bad: string[] = []
+  for key in acc.order {
+    if stat(acc, key).mx >= 1.0 {
+      const kp = split(key, "\t")
+      bad.push("(\{pyRepr(kp[0])}, \{kp[1]}, \{pyRepr(kp[2])})")
+    }
+  }
+  const misses = acc.misses[0]
+  if bad.length > 0 || misses > 0 {
+    print(
+      "BOUND MISSED (>= 1 ulp, or a wrong edge case): [\{join(bad, ", ")}] inexact exact powers: \{toString(misses)}",
+    )
+    exit(1)
+  }
+  print(
+    "all points within the documented 1-ulp bound; every edge case as IEEE 754 specifies",
+  )
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("math-grade: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  const acc = gradeMain(
+    SELF,
+    argv,
+    "usage: vl run scripts/std-math/math-grade.vl -- <transcript>",
+    grade,
+  )
+  if acc != null { report(acc) }
+}
