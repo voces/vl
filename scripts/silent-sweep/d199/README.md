@@ -6,8 +6,8 @@ and that found **D351**.
 ```sh
 python3 scripts/silent-sweep/d199/gen199.py /tmp/g199
 
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/g199 <master.wasm> /tmp/g/base.json
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/g199 <branch.wasm> /tmp/g/branch.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/g199 <master.wasm> /tmp/g/base.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/g199 <branch.wasm> /tmp/g/branch.json
 ```
 
 `gradecensus.py` is reused verbatim — it takes the seed as an argument, so both sides are
@@ -125,7 +125,7 @@ all, because `i*ar>i` is the only key the token alphabet can spell that renders
 ```sh
 python3 scripts/silent-sweep/d243/mkset.py /tmp/set \
     scripts/silent-sweep/census/d199-rungs.json /tmp/g199
-JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/set <seed.wasm> /tmp/s.json
+JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/set <seed.wasm> /tmp/s.json
 ```
 
 - `census/d199-rungs.json` — 15 cells: nine that one named rung and only that rung buys, plus

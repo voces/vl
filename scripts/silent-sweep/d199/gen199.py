@@ -9,7 +9,7 @@ apart from the three fixtures the rows own. So the family has to be BUILT to be 
 this is the build.
 
     python3 scripts/silent-sweep/d199/gen199.py /tmp/g199
-    JOBS=6 python3 scripts/silent-sweep/census/gradecensus.py /tmp/g199 <seed.wasm> /tmp/x.json
+    JOBS=6 vl run scripts/silent-sweep/census/gradecensus.vl -- /tmp/g199 <seed.wasm> /tmp/x.json
 
 **The expectation is the GENERATOR's, never a compiler's**: every cell prints `7`, and the
 two two-callee shapes print `7` twice.

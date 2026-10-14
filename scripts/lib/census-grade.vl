@@ -1,0 +1,501 @@
+// Grade census cells against one seed on the full outcome vocabulary: `runs`, `runs but
+// wrong value`, `trap_loads`, `check-clean invalid wasm`, `loud emit reject`, `loud check
+// reject` and `compiler trap`. The expectation comes from the cell directory's
+// `manifest.json`, never from the compiler.
+//
+//     import { gradeChunk, gradeParts } from "../../lib/census-grade"
+//
+// A tool calls `gradeParts` with its own source path, and its `main` hands
+// `--grade-chunk <file>` to `gradeChunk`: the chunks are graded by `xargs -P` over a build
+// of that tool, because `runProgram` waits for its child. Run from the checkout root.
+
+import { fileSize } from "std:fs"
+import { parseI32, toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { Json } from "std:json"
+import {
+  JsonMap,
+  Proc,
+  cpPrefix,
+  die,
+  envOr,
+  exists,
+  findFrom,
+  firstLine,
+  isDigit,
+  jsonStr,
+  splitLines,
+  stripWs,
+  wsLen,
+} from "./common"
+import {
+  anyIn,
+  cwd,
+  makeTempDir,
+  numField,
+  parseOrDie,
+  pyRepr,
+  readText,
+  sortStrings,
+  spawn,
+  strField,
+  writeText,
+} from "./corpus"
+
+const COMPILER = "build/vl-compiler.wasm"
+const CHUNK = 100
+
+// One graded cell: its outcome class and the normalised message beside it.
+export type Res = { cls: string, msg: string }
+
+// ── the message normaliser ──────────────────────────────────────────────────────
+
+// The end of `\.vl:\d+:\d+:?` starting at byte `q`, or -1 when it does not match there.
+function vlPosEnd(s: string, q: i32): i32 {
+  if !startsWith(s.slice(q, s.length), ".vl:") { return -1 }
+  let i = q + 4
+  const d0 = i
+  while i < s.length && isDigit(s[i]) { i = i + 1 }
+  if i == d0 || i >= s.length || s[i] != 58 { return -1 }
+  i = i + 1
+  const d1 = i
+  while i < s.length && isDigit(s[i]) { i = i + 1 }
+  if i == d1 { return -1 }
+  if i < s.length && s[i] == 58 { i = i + 1 }
+  i
+}
+
+// `re.sub(r"\S*\.vl:\d+:\d+:?", "", m)` over text whose only whitespace is a space: each
+// space-free run loses its prefix through the rightmost `.vl:<line>:<col>` it holds.
+function dropVlPos(m: string): string {
+  const parts: string[] = []
+  let p = 0
+  while p < m.length {
+    if m[p] == 32 {
+      parts.push(" ")
+      p = p + 1
+      continue
+    }
+    let e = p
+    while e < m.length && m[e] != 32 { e = e + 1 }
+    let cut = -1
+    let q = e - 1
+    while q >= p && cut < 0 {
+      cut = vlPosEnd(m, q)
+      q = q - 1
+    }
+    if cut < 0 {
+      parts.push(m.slice(p, e))
+      p = e
+    } else {
+      p = cut
+    }
+  }
+  join(parts, "")
+}
+
+// `<word>\d+<close>` → `<word>N<close>` at every match, as `re.sub` rewrites it.
+function numbersToN(m: string, word: string, close: string): string {
+  const parts: string[] = []
+  let from = 0
+  let at = findFrom(m, word, 0)
+  while at >= 0 {
+    let i = at + word.length
+    const d0 = i
+    while i < m.length && isDigit(m[i]) { i = i + 1 }
+    if i > d0 && startsWith(m.slice(i, m.length), close) {
+      parts.push(m.slice(from, at))
+      parts.push(word + "N" + close)
+      from = i + close.length
+      at = findFrom(m, word, from)
+    } else {
+      at = findFrom(m, word, at + 1)
+    }
+  }
+  parts.push(m.slice(from, m.length))
+  join(parts, "")
+}
+
+// A message as it is compared: whitespace collapsed, offsets and function indices and source
+// positions erased, cut to 220 code points.
+export function norm(msg: string): string {
+  const words: string[] = []
+  let i = 0
+  while i < msg.length {
+    while i < msg.length && wsLen(msg, i) > 0 { i = i + wsLen(msg, i) }
+    const a = i
+    while i < msg.length && wsLen(msg, i) == 0 { i = i + 1 }
+    if i > a { words.push(msg.slice(a, i)) }
+  }
+  let m = join(words, " ")
+  m = numbersToN(m, "offset ", "")
+  m = numbersToN(m, "function[", "]")
+  m = dropVlPos(m)
+  cpPrefix(stripWs(m), 220)
+}
+
+// ── grading one cell ─────────────────────────────────────────────────────────────
+
+const INVALID = [
+  "Invalid input WebAssembly code", "WebAssembly translation error",
+  "wasm validation", "failed to parse",
+]
+const TRAP = [
+  "wasm trap", "unreachable", "out of bounds", "divide by zero",
+  "null reference", "cast failure", "integer overflow",
+]
+const EMIT = [
+  "emit error", "emitProgram:", "emitFail", "unsupported statement",
+  "unsupported expression",
+]
+
+// What a chunk worker needs: the binary, the seed, `std/`, the part and its scratch dir.
+type Ctx = { vl: string, seed: string, std: string, part: string, tmp: string }
+
+// `vl` on the cells under `VL_STD`, bounded at `secs`; a `timeout` exit of 124 is a
+// timed-out stage.
+function vlStd(c: Ctx, secs: string, args: string[]): Proc {
+  const full = ["VL_STD=" + c.std, "timeout", secs, c.vl]
+  for a in args { full.push(a) }
+  spawn("env", full)
+}
+
+function wrongValue(exp: string, got: string): Res {
+  {
+    cls: "runs but wrong value",
+    msg: "want " + pyRepr(exp) + " got " + pyRepr(cpPrefix(got, 80)),
+  }
+}
+
+// One cell graded alone: check, run and, for a trap, build, each in its own process.
+function gradeOne(c: Ctx, name: string, exp: string): Res {
+  const f = c.part + "/" + name + ".vl"
+  const chk = vlStd(c, "120", ["check", f, "--compiler", c.seed])
+  if chk.code == 124 { return { cls: "compiler trap", msg: "check timeout" } }
+  const cout = chk.out + chk.err
+  let errLine = ""
+  let hasErr = false
+  for l in splitLines(cout) {
+    if !hasErr && startsWith(l, "[ERROR]") {
+      hasErr = true
+      errLine = l
+    }
+  }
+  if hasErr || chk.code != 0 {
+    if hasErr { return { cls: "loud check reject", msg: norm(errLine) } }
+    return { cls: "loud check reject", msg: norm(cout) }
+  }
+  const r = vlStd(c, "120", ["run", f, "--compiler", c.seed])
+  if r.code == 124 { return { cls: "compiler trap", msg: "run timeout" } }
+  if r.code == 0 {
+    const got = stripWs(r.out)
+    if got == exp { return { cls: "runs", msg: "" } }
+    return wrongValue(exp, got)
+  }
+  const rerr = r.err + r.out
+  if anyIn(rerr, EMIT) { return { cls: "loud emit reject", msg: norm(rerr) } }
+  if anyIn(rerr, INVALID) {
+    return { cls: "check-clean invalid wasm", msg: norm(rerr) }
+  }
+  if anyIn(rerr, TRAP) {
+    const w = c.tmp + "/" + name + ".o.wasm"
+    spawn("timeout", ["120", c.vl, "build", f, "--compiler", c.seed, "-o", w])
+    let wrote = false
+    const sz = fileSize(w)
+    if sz is i64 { wrote = sz > 0 }
+    if !wrote { return { cls: "compiler trap", msg: norm(rerr) } }
+    return { cls: "trap_loads", msg: norm(rerr) }
+  }
+  { cls: "check-clean invalid wasm", msg: norm(rerr) }
+}
+
+// `vl check --batch` over the chunk; a cell it cannot classify exactly as `gradeOne`
+// would is left out of `res` and out of the check-clean list returned.
+function batchCheck(c: Ctx, names: string[], res: Map<string, Res>): string[] {
+  const clean: string[] = []
+  const args = ["check", "--batch", "--json"]
+  for n in names { args.push(c.part + "/" + n + ".vl") }
+  args.push("--compiler")
+  args.push(c.seed)
+  const p = vlStd(c, "600", args)
+  if p.code == 124 { return clean }
+  const recs: JsonMap[] = []
+  for l in splitLines(p.out) {
+    if stripWs(l) == "" { continue }
+    const j = parseOrDie(l, "a `vl check --batch --json` line")
+    if j is JsonMap {
+      recs.push(j)
+    } else {
+      die("census-grade: a check record is not an object", 1)
+    }
+  }
+  if recs.length != names.length { return clean }
+  let k = 0
+  while k < names.length {
+    const r = recs[k]
+    const errs: string[] = []
+    const ds = r["diagnostics"]
+    if ds is Json[] {
+      for d in ds {
+        if d is JsonMap {
+          if strField(d, "severity") == "error" {
+            errs.push(strField(d, "message"))
+          }
+        }
+      }
+    }
+    const code = numField(r, "exit")
+    if code == 0.0 && errs.length == 0 {
+      clean.push(names[k])
+    } else if code == 1.0 && errs.length > 0 {
+      res[names[k]] = {
+        cls: "loud check reject",
+        msg: norm("[ERROR]: " + firstLine(errs[0])),
+      }
+    }
+    k = k + 1
+  }
+  clean
+}
+
+// `vl run --batch` over the check-clean cells of a chunk.
+function batchRun(
+  c: Ctx,
+  names: string[],
+  expect: Map<string, string>,
+  res: Map<string, Res>,
+) {
+  const od = c.tmp + "/run"
+  spawn("mkdir", ["-p", od])
+  const args = ["run", "--batch", "--out-dir", od]
+  for n in names { args.push(c.part + "/" + n + ".vl") }
+  args.push("--compiler")
+  args.push(c.seed)
+  const p = vlStd(c, "600", args)
+  if p.code == 124 { return 0 }
+  for n in names {
+    const o = od + "/" + n + ".vl.out"
+    const e = od + "/" + n + ".vl.err"
+    if !exists(o) { continue }
+    const got = readText(o)
+    const exp = expect[n] ?? ""
+    if !exists(e) {
+      const g = stripWs(got)
+      if g == exp {
+        res[n] = { cls: "runs", msg: "" }
+      } else {
+        res[n] = wrongValue(exp, g)
+      }
+      continue
+    }
+    const rerr = "Error: " + readText(e) + got
+    if anyIn(rerr, EMIT) {
+      res[n] = { cls: "loud emit reject", msg: norm(rerr) }
+    }
+  }
+  0
+}
+
+// ── the chunk worker: `--grade-chunk <file>` ─────────────────────────────────────────
+
+// A chunk file is six header lines (vl, seed, std, part, scratch, batch flag) and then one
+// cell per two lines, its name and its expected stdout as a JSON string. The answer goes
+// to `<file>.out`, one `name\tclass\tmsg` line per cell.
+export function gradeChunk(file: string) {
+  const lines = readText(file).split("\n")
+  const c: Ctx = {
+    vl: lines[0],
+    seed: lines[1],
+    std: lines[2],
+    part: lines[3],
+    tmp: lines[4],
+  }
+  const batch = lines[5] == "1"
+  const names: string[] = []
+  const expect: Map<string, string> = Map()
+  let k = 6
+  while k + 1 < lines.length {
+    const e = parseOrDie(lines[k + 1], file)
+    if e is string {
+      expect[lines[k]] = e
+    } else {
+      die("census-grade: a chunk expectation is not a string", 1)
+    }
+    names.push(lines[k])
+    k = k + 2
+  }
+  const res: Map<string, Res> = Map()
+  if batch {
+    const clean = batchCheck(c, names, res)
+    if clean.length > 0 { batchRun(c, clean, expect, res) }
+  }
+  const out: string[] = []
+  for n in names {
+    let r = res[n]
+    if r == null { r = gradeOne(c, n, expect[n] ?? "") }
+    out.push("\{n}\t\{r.cls}\t\{r.msg}\n")
+  }
+  writeText(file + ".out", join(out, ""))
+}
+
+// A chunk staged for a worker, and the part it belongs to.
+type Chunk = { file: string, part: string }
+
+// A cell directory to grade, under the name its answers are filed by.
+export type Part = { name: string, dir: string }
+
+// Stage every chunk of the cell directory `p.dir` under `root`, sorted by cell.
+function stagePart(
+  root: string,
+  abs: string,
+  p: Part,
+  seed: string,
+  batch: boolean,
+  chunks: Chunk[],
+) {
+  let dir = p.dir
+  if !startsWith(dir, "/") { dir = abs + "/" + dir }
+  const man = parseOrDie(
+    readText(dir + "/manifest.json"),
+    dir + "/manifest.json",
+  )
+  const expect: Map<string, string> = Map()
+  if man is JsonMap {
+    const e = man["expect"]
+    if e is JsonMap {
+      for k, v in e {
+        if v is string { expect[k] = v }
+      }
+    }
+  }
+  const names = sortStrings(expect.keys())
+  let size = CHUNK
+  if !batch { size = 1 }
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  let flag = "0"
+  if batch { flag = "1" }
+  let at = 0
+  const dirs: string[] = ["-p"]
+  const pending: string[] = []
+  while at < names.length {
+    const tmp = root + "/" + toString(chunks.length)
+    const body = [vl, seed, abs + "/std", dir, tmp, flag]
+    let k = 0
+    while k < size && at < names.length {
+      body.push(names[at])
+      body.push(jsonStr(expect[names[at]] ?? ""))
+      at = at + 1
+      k = k + 1
+    }
+    dirs.push(tmp)
+    pending.push(tmp + "/chunk")
+    pending.push(join(body, "\n"))
+    chunks.push({ file: tmp + "/chunk", part: p.name })
+  }
+  if dirs.length > 1 {
+    const r = spawn("mkdir", dirs)
+    if r.code != 0 { die("census-grade: mkdir failed: " + r.out + r.err, 1) }
+  }
+  let k = 0
+  while k < pending.length {
+    writeText(pending[k], pending[k + 1])
+    k = k + 2
+  }
+}
+
+// `$JOBS` as an integer, or `dflt` when it is unset; exits 1 when it is not a number.
+export function jobsFromEnv(dflt: i32): i32 {
+  const j = envOr("JOBS", toString(dflt))
+  const n = parseI32(stripWs(j))
+  if n == null { die("census-grade: JOBS is not an integer: " + j, 1) }
+  n ?? dflt
+}
+
+// Each part's answers by its name; on a worker failure `rc` is non-zero and `failed`
+// names the part whose chunk did not answer.
+export type Fanned = {
+  rc: i32,
+  failed: string,
+  parts: Map<string, Map<string, Res>>,
+}
+
+// Grade every part against `seed`, `jobs` chunks at a time, by workers built from the
+// tool at `self` (which must hand `--grade-chunk` to `gradeChunk`).
+export function gradeParts(
+  self: string,
+  parts: Part[],
+  seed: string,
+  jobs: i32,
+): Fanned {
+  const out: Map<string, Map<string, Res>> = Map()
+  const abs = cwd()
+  const root = makeTempDir()
+  const batch = envOr("GRADE_BATCH", "1") != "0"
+  const chunks: Chunk[] = []
+  for p in parts { stagePart(root, abs, p, seed, batch, chunks) }
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  if chunks.length > 0 {
+    const grader = root + "/grader.wasm"
+    const b = spawn(vl, ["build", self, "--compiler", COMPILER, "-o", grader])
+    if b.code != 0 {
+      spawn("rm", ["-rf", root])
+      die("census-grade: cannot build \{self}:\n" + b.out + b.err, 1)
+    }
+    const files: string[] = []
+    for ch in chunks { files.push(ch.file) }
+    writeText(root + "/chunks", join(files, "\n") + "\n")
+    const x = spawn(
+      "xargs",
+      [
+        "-a",
+        root + "/chunks",
+        "-d",
+        "\\n",
+        "-P",
+        toString(jobs),
+        "-n",
+        "1",
+        vl,
+        "run",
+        grader,
+        "--",
+        "--grade-chunk",
+      ],
+    )
+    if x.code != 0 {
+      let failed = chunks[0].part
+      for ch in chunks {
+        if !exists(ch.file + ".out") { failed = ch.part }
+      }
+      spawn("rm", ["-rf", root])
+      return { rc: x.code, failed: failed, parts: out }
+    }
+  }
+  for p in parts {
+    const mine: Map<string, Res> = Map()
+    for ch in chunks {
+      if ch.part != p.name { continue }
+      for l in readText(ch.file + ".out").split("\n") {
+        if l == "" { continue }
+        const f = l.split("\t")
+        mine[f[0]] = { cls: f[1], msg: f[2] }
+      }
+    }
+    out[p.name] = mine
+  }
+  spawn("rm", ["-rf", root])
+  { rc: 0, failed: "", parts: out }
+}
+
+// The graded map as `json.dump(res, indent=0, sort_keys=True)` writes it.
+export function gradeJson(res: Map<string, Res>): string {
+  if res.length == 0 { return "{}" }
+  const parts: string[] = []
+  for c in sortStrings(res.keys()) {
+    const r = res[c] ?? { cls: "", msg: "" }
+    parts.push(
+      "\{jsonStr(c)}: {\n\"class\": \{jsonStr(r.cls)},\n\"msg\": \{jsonStr(r.msg)}\n}",
+    )
+  }
+  "{\n" + join(parts, ",\n") + "\n}"
+}
