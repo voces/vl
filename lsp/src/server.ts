@@ -1774,6 +1774,9 @@ connection.onInitialize((params) => {
   );
   return {
     capabilities: {
+      // The protocol's default, said out loud: the checker converts the seed's
+      // UTF-8 byte columns at its boundary (`utf16Columns.ts`, D4490).
+      positionEncoding: "utf-16",
       textDocumentSync: {
         openClose: true,
         change: TextDocumentSyncKind.Full,

@@ -10,7 +10,8 @@
 // each operator character is a one-character vlLex punct; a template part lies
 // inside a vlLex string; and every vlLex numeric run is one seed number.
 //
-// Seed columns are UTF-8 bytes; they are mapped to UTF-16 per line here. A file
+// `lexicalTokensAt` reports UTF-16 columns (the checker converts the seed's UTF-8
+// bytes at its boundary, D4490), the unit vlLex's offsets are in. A file
 // with an unterminated literal is skipped: the two recover from it differently
 // on purpose (vlLex stops a `"` at the newline so a mid-edit quote does not
 // swallow the document).
@@ -36,23 +37,13 @@ interface Span {
   b: number;
 }
 
-const utf8Len = (ch: string): number => {
-  const c = ch.codePointAt(0) ?? 0;
-  return c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
-};
-
-/** Seed byte column `byte` on line `l` as a source offset. */
-const byteOffset = (src: string, starts: number[], l: number, byte: number): number => {
-  const from = starts[l] ?? src.length;
-  let b = 0;
-  let i = from;
-  while (b < byte && i < src.length) {
-    const ch = String.fromCodePoint(src.codePointAt(i) ?? 0);
-    b += utf8Len(ch);
-    i += ch.length;
-  }
-  return i;
-};
+/** A 0-based line and UTF-16 column as a source offset. */
+const offsetOf = (
+  src: string,
+  starts: number[],
+  l: number,
+  ch: number,
+): number => (starts[l] ?? src.length) + ch;
 
 /**
  * Every disagreement between vlLex's tokens of `lexSrc` and the seed's lexical
@@ -72,12 +63,14 @@ const disagreements = (
     a: (starts[t.start.line] ?? lexSrc.length) + t.start.character,
     b: (starts[t.end.line] ?? lexSrc.length) + t.end.character,
   }));
-  if (vt.some((t) => t.kind === "punct" && /^["'`]$/.test(t.s))) return undefined;
+  if (vt.some((t) => t.kind === "punct" && /^["'`]$/.test(t.s))) {
+    return undefined;
+  }
   const seedStarts = lineStarts(seedSrc);
   const st = checker.lexicalTokensAt(seedSrc).map((t) => ({
     cls: t.tokenClass,
-    a: byteOffset(seedSrc, seedStarts, t.line, t.char),
-    b: byteOffset(seedSrc, seedStarts, t.line, t.char + t.length),
+    a: offsetOf(seedSrc, seedStarts, t.line, t.char),
+    b: offsetOf(seedSrc, seedStarts, t.line, t.char + t.length),
   }));
   const text = (s: Span) => JSON.stringify(seedSrc.slice(s.a, s.b));
   const byStart = new Map<number, (typeof vt)[number]>();
@@ -99,18 +92,28 @@ const disagreements = (
   const key = (s: Span) => `${s.a}:${s.b}`;
   const seedComments = new Set(st.filter((t) => t.cls === 4).map(key));
   const lexComments = new Set(vt.filter((t) => t.kind === "comment").map(key));
-  for (const k of seedComments) if (!lexComments.has(k)) out.push(`seed-only comment ${k}`);
-  for (const k of lexComments) if (!seedComments.has(k)) out.push(`vlLex-only comment ${k}`);
+  for (const k of seedComments) {
+    if (!lexComments.has(k)) out.push(`seed-only comment ${k}`);
+  }
+  for (const k of lexComments) {
+    if (!seedComments.has(k)) out.push(`vlLex-only comment ${k}`);
+  }
   for (const t of st) {
     if (t.cls === 4) continue;
     const box = container(t);
     if (t.cls === 5) {
-      if (box?.kind !== "str") out.push(`template part outside a vlLex string at ${t.a} ${text(t)}`);
+      if (box?.kind !== "str") {
+        out.push(`template part outside a vlLex string at ${t.a} ${text(t)}`);
+      }
       continue;
     }
     if (box !== undefined) {
-      if (box.kind === "str" && seedSrc.slice(box.a, box.b).includes("\\{")) continue;
-      out.push(`class ${t.cls} inside a vlLex ${box.kind} at ${t.a} ${text(t)}`);
+      if (box.kind === "str" && seedSrc.slice(box.a, box.b).includes("\\{")) {
+        continue;
+      }
+      out.push(
+        `class ${t.cls} inside a vlLex ${box.kind} at ${t.a} ${text(t)}`,
+      );
       continue;
     }
     if (t.cls === 1) {
@@ -125,13 +128,19 @@ const disagreements = (
     }
     const v = byStart.get(t.a);
     if (v?.b !== t.b) {
-      out.push(`class ${t.cls} span at ${t.a}: seed ${text(t)}, vlLex ${v ? text(v) : "none"}`);
+      out.push(
+        `class ${t.cls} span at ${t.a}: seed ${text(t)}, vlLex ${
+          v ? text(v) : "none"
+        }`,
+      );
     }
   }
   const seedNumbers = new Set(st.filter((t) => t.cls === 2).map(key));
   for (const t of vt) {
     if (t.kind === "punct" && /^[0-9]/.test(t.s) && !seedNumbers.has(key(t))) {
-      out.push(`vlLex number not a seed number at ${t.a} ${JSON.stringify(t.s)}`);
+      out.push(
+        `vlLex number not a seed number at ${t.a} ${JSON.stringify(t.s)}`,
+      );
     }
   }
   return out;
@@ -175,34 +184,61 @@ Deno.test({
       for (const m of d) bad.push(`${f.slice(CASES.length + 1)}: ${m}`);
     }
     if (graded < 1000) {
-      throw new Error(`want >= 1000 graded files, got ${graded} (${skipped} skipped)`);
+      throw new Error(
+        `want >= 1000 graded files, got ${graded} (${skipped} skipped)`,
+      );
     }
-    if (skipped > 20) throw new Error(`want <= 20 skipped files, got ${skipped}`);
+    if (skipped > 20) {
+      throw new Error(`want <= 20 skipped files, got ${skipped}`);
+    }
     if (bad.length > 0) {
-      throw new Error(`want 0 disagreements, got ${bad.length}:\n${bad.slice(0, 30).join("\n")}`);
+      throw new Error(
+        `want 0 disagreements, got ${bad.length}:\n${
+          bad.slice(0, 30).join("\n")
+        }`,
+      );
     }
   },
 });
 
 Deno.test({
-  name: "vlLex agreement: the comparison reports a shifted comment and a split number",
+  name:
+    "vlLex agreement: the comparison reports a shifted comment and a split number",
   ignore: !seedExists,
   fn() {
     const c = checker();
-    const comment = disagreements(c, "let a = 1 // c\n", "let a = 1  // c\n") ?? [];
+    const comment = disagreements(c, "let a = 1 // c\n", "let a = 1  // c\n") ??
+      [];
     if (!comment.some((m) => m.includes("comment"))) {
-      throw new Error(`want a comment disagreement, got ${JSON.stringify(comment)}`);
+      throw new Error(
+        `want a comment disagreement, got ${JSON.stringify(comment)}`,
+      );
+    }
+    // Non-ASCII before a token: both sides count UTF-16 units, so this agrees.
+    const wide = disagreements(
+      c,
+      'let s = "é😀" // c\nlet n = 2\n',
+      'let s = "é😀" // c\nlet n = 2\n',
+    );
+    if (wide === undefined || wide.length > 0) {
+      throw new Error(
+        `want 0 disagreements past non-ASCII, got ${JSON.stringify(wide)}`,
+      );
     }
     const number = disagreements(c, "let a = 1e5\n", "let a = 1 + 5\n") ?? [];
     if (!number.some((m) => m.includes("number"))) {
-      throw new Error(`want a number disagreement, got ${JSON.stringify(number)}`);
+      throw new Error(
+        `want a number disagreement, got ${JSON.stringify(number)}`,
+      );
     }
   },
 });
 
 Deno.test("vlLex: an exponent's sign is part of a decimal number, not a radix one", () => {
   const nums = (src: string) =>
-    tokenize(src).filter((t) => t.kind === "punct" && /^[0-9]/.test(t.s)).map((t) => t.s);
+    tokenize(src).filter((t) => t.kind === "punct" && /^[0-9]/.test(t.s)).map((
+      t,
+    ) => t.s);
   const got = JSON.stringify([...nums("1e-5 2E+10 1.5e-3"), ...nums("0x1e-5")]);
   const want = JSON.stringify(["1e-5", "2E+10", "1.5e-3", "0x1e", "5"]);
   if (got !== want) throw new Error(`want ${want}, got ${got}`);
@@ -213,7 +249,11 @@ Deno.test("vlLex: a string spans lines, a lone CR breaks a line, a stray quote s
   const s = multi.find((t) => t.kind === "str");
   const t = multi.find((x) => x.kind === "ident" && x.s === "t");
   if (s?.s !== "a\nb" || t?.start.line !== 2) {
-    throw new Error(`want "a\\nb" and t on line 2, got ${JSON.stringify(s?.s)} and ${t?.start.line}`);
+    throw new Error(
+      `want "a\\nb" and t on line 2, got ${
+        JSON.stringify(s?.s)
+      } and ${t?.start.line}`,
+    );
   }
   const cr = tokenize("let a = 1\rlet b = 2", { comments: true });
   const b = cr.find((x) => x.s === "b");
@@ -222,7 +262,13 @@ Deno.test("vlLex: a string spans lines, a lone CR breaks a line, a stray quote s
   }
   const stray = tokenize('let s = "abc\nlet u = 1');
   const u = stray.find((x) => x.s === "u");
-  if (u?.start.line !== 1) throw new Error(`want u on line 1, got ${JSON.stringify(u?.start)}`);
+  if (u?.start.line !== 1) {
+    throw new Error(`want u on line 1, got ${JSON.stringify(u?.start)}`);
+  }
   const cont = tokenize('"a\\\n    b"');
-  if (cont[0]?.s !== "ab") throw new Error(`want "ab" from a continuation, got ${JSON.stringify(cont[0]?.s)}`);
+  if (cont[0]?.s !== "ab") {
+    throw new Error(
+      `want "ab" from a continuation, got ${JSON.stringify(cont[0]?.s)}`,
+    );
+  }
 });
