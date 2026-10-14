@@ -107,9 +107,11 @@ for (const [fx, want] of FIXTURES) {
           const dump = `${tmp}/step${rung}.wasm`;
           const built = async (step: boolean) => {
             const out = `${tmp}/m${rung}${step ? "" : "-off"}.wasm`;
+            // `both` fails the build unless the host's step and the compiler's agree.
             const b = await vl(["build", src, rung, "-o", out], {
               VL_OPT_NO_MULTIVALUE: step ? "" : "1",
               VL_OPT_MV_DUMP: step ? dump : "",
+              VL_OPT_MULTIVALUE: "both",
             });
             if (b.code !== 0) {
               throw new Error(
@@ -168,50 +170,53 @@ for (const [fx, want] of FIXTURES) {
 
 // A rewrite that does not validate is dropped and the input kept: `$VL_MV_FAULT=1` corrupts
 // the step's output, and the build must still succeed and print the plain output, with no
-// step output written.
-Deno.test({
-  name:
-    "native-release: a multi-value rewrite that does not validate is dropped",
-  ignore: !ENABLED,
-  fn: async () => {
-    const src = `${DIR}/heap-held.vl`;
-    const logs = logsOf(Deno.readTextFileSync(src));
-    const tmp = await Deno.makeTempDir();
-    try {
-      const dump = `${tmp}/step.wasm`;
-      const out = `${tmp}/m.wasm`;
-      const b = await vl(["build", src, "-O", "-o", out], {
-        VL_MV_FAULT: "1",
-        VL_OPT_MV_DUMP: dump,
-      });
-      if (b.code !== 0) {
-        throw new Error(`build with a faulted step failed: ${b.err.trim()}`);
-      }
-      const r = await vl(["run", out]);
-      const got = linesOf(r.out);
-      if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(logs)) {
-        throw new Error(
-          `want ${JSON.stringify(logs)}, got ${
-            JSON.stringify(got)
-          } rc=${r.code}`,
-        );
-      }
-      let wrote = true;
+// step output written, by the host's step and by the compiler's.
+for (const side of ["rust", "vl"]) {
+  Deno.test({
+    name:
+      `native-release: a multi-value rewrite that does not validate is dropped (${side})`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const src = `${DIR}/heap-held.vl`;
+      const logs = logsOf(Deno.readTextFileSync(src));
+      const tmp = await Deno.makeTempDir();
       try {
-        Deno.statSync(dump);
-      } catch {
-        wrote = false;
+        const dump = `${tmp}/step.wasm`;
+        const out = `${tmp}/m.wasm`;
+        const b = await vl(["build", src, "-O", "-o", out], {
+          VL_MV_FAULT: "1",
+          VL_OPT_MV_DUMP: dump,
+          VL_OPT_MULTIVALUE: side,
+        });
+        if (b.code !== 0) {
+          throw new Error(`build with a faulted step failed: ${b.err.trim()}`);
+        }
+        const r = await vl(["run", out]);
+        const got = linesOf(r.out);
+        if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(logs)) {
+          throw new Error(
+            `want ${JSON.stringify(logs)}, got ${
+              JSON.stringify(got)
+            } rc=${r.code}`,
+          );
+        }
+        let wrote = true;
+        try {
+          Deno.statSync(dump);
+        } catch {
+          wrote = false;
+        }
+        if (wrote) {
+          throw new Error(
+            "want no step output: the faulted rewrite should be dropped",
+          );
+        }
+      } finally {
+        await Deno.remove(tmp, { recursive: true });
       }
-      if (wrote) {
-        throw new Error(
-          "want no step output: the faulted rewrite should be dropped",
-        );
-      }
-    } finally {
-      await Deno.remove(tmp, { recursive: true });
-    }
-  },
-});
+    },
+  });
+}
 
 // A twin carries its function's name with `.mv` after it, so a trap inside one reads as the
 // function it came from in a `--names` build. Read off the step's own output.
@@ -225,7 +230,7 @@ Deno.test({
       const dump = `${tmp}/step.wasm`;
       const b = await vl(
         ["build", src, "-O", "--names", "-o", `${tmp}/m.wasm`],
-        { VL_OPT_MV_DUMP: dump },
+        { VL_OPT_MV_DUMP: dump, VL_OPT_MULTIVALUE: "both" },
       );
       if (b.code !== 0) throw new Error(`build: ${b.err.trim()}`);
       const features = rustList(mainRs(), "BINARYEN_FEATURES");
@@ -266,7 +271,11 @@ Deno.test({
         const dump = `${tmp}/step${explain ? "-x" : ""}.wasm`;
         const b = await vl(
           ["build", src, "-O3", "--names", "-o", `${tmp}/m.wasm`],
-          { VL_OPT_MV_DUMP: dump, VL_MV_EXPLAIN: explain ? "1" : "" },
+          {
+            VL_OPT_MV_DUMP: dump,
+            VL_MV_EXPLAIN: explain ? "1" : "",
+            VL_OPT_MULTIVALUE: "both",
+          },
         );
         if (b.code !== 0) throw new Error(`build: ${b.err.trim()}`);
         return { err: b.err, bytes: Deno.readFileSync(dump) };

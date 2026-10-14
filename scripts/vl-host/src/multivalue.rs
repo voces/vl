@@ -53,6 +53,7 @@
 
 use crate::{upos, urange};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use wasmparser::{
     AbstractHeapType, CompositeInnerType, FuncValidatorAllocations, HeapType, Operator, Parser,
     Payload, StorageType, TypeRef, UnpackedIndex, ValType, ValidPayload, Validator, WasmFeatures,
@@ -1832,23 +1833,39 @@ fn without_fresh(m: &Module, mut pairs: HashSet<(u32, u32)>) -> HashSet<(u32, u3
 }
 
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
-/// changes nothing.
-pub fn multivalue_step(bytes: &[u8]) -> Option<(Vec<u8>, Vec<BodyMove>)> {
-    let explaining = std::env::var_os("VL_MV_EXPLAIN").is_some_and(|v| !v.is_empty() && v != "0");
-    step(bytes, explaining).map(|(out, moved, _)| (out, moved))
+/// changes nothing, beside the `$VL_MV_EXPLAIN` lines when `explaining`.
+pub fn multivalue_rust(
+    bytes: &[u8],
+    explaining: bool,
+) -> (Option<(Vec<u8>, Vec<BodyMove>)>, String) {
+    let mut log = String::new();
+    let out = step(bytes, explaining, &mut log).map(|(out, moved, _)| (out, moved));
+    (out, log)
 }
 
 /// What the step would hold field by field in `bytes`, were it run on it: per defined function
 /// the locals it scalarizes, and the `(function, parameter)` pairs a call passes as fields.
 /// `None` when the step would leave the module untouched, so it scalarizes nothing.
 pub(crate) fn scalarized(bytes: &[u8]) -> Option<(Vec<HashSet<u32>>, HashSet<(u32, u32)>)> {
-    step(bytes, false).map(|(_, _, a)| (a.fo_local, a.fo_param_r))
+    step(bytes, false, &mut String::new()).map(|(_, _, a)| (a.fo_local, a.fo_param_r))
 }
 
-fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analysis)> {
+/// One `$VL_MV_EXPLAIN` line onto the step's log.
+macro_rules! say {
+    ($log:expr, $($arg:tt)*) => {{
+        let _ = writeln!($log, $($arg)*);
+    }};
+}
+
+fn step(
+    bytes: &[u8],
+    explaining: bool,
+    log: &mut String,
+) -> Option<(Vec<u8>, Vec<BodyMove>, Analysis)> {
     let Some(m) = scan(bytes) else {
         if explaining {
-            eprintln!(
+            say!(
+                log,
                 "mv-explain: step skipped: the module does not validate, or no function takes \
                  or returns a record (a struct that nothing writes, of 1 to \
                  {MV_ARG_MAX_FIELDS} numeric or reference fields as an argument, 1 to \
@@ -1860,7 +1877,7 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
     let a = analyse(&m);
     if a.producer.is_empty() && a.fo_param.is_empty() {
         if explaining {
-            explain(&m, &a, &[], &[]);
+            explain(&m, &a, &[], &[], log);
         }
         return None;
     }
@@ -1886,7 +1903,7 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
         }
     }
     if explaining {
-        explain(&m, &a, &plans, &twins);
+        explain(&m, &a, &plans, &twins, log);
     }
     let mut twin_plans: Vec<Plan> = Vec::new();
     while let Some(t) = work.pop_front() {
@@ -1908,7 +1925,10 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
     }
     if too_many || twins.is_empty() {
         if explaining && too_many {
-            eprintln!("mv-explain: step abandoned: more than {MV_MAX_TWINS} twins");
+            say!(
+                log,
+                "mv-explain: step abandoned: more than {MV_MAX_TWINS} twins"
+            );
         }
         return None;
     }
@@ -1994,7 +2014,8 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
         .collect();
     if growth > MV_GROWTH_FLOOR + code_size / 2 {
         if explaining {
-            eprintln!(
+            say!(
+                log,
                 "mv-explain: step abandoned: the twins add {growth} bytes, past the bound of \
                  {MV_GROWTH_FLOOR} plus half the {code_size}-byte code section"
             );
@@ -2098,7 +2119,10 @@ fn step(bytes: &[u8], explaining: bool) -> Option<(Vec<u8>, Vec<BodyMove>, Analy
     }
     if let Err(e) = Validator::new_with_features(WasmFeatures::all()).validate_all(&out) {
         if explaining {
-            eprintln!("mv-explain: step abandoned: its output does not validate: {e}");
+            say!(
+                log,
+                "mv-explain: step abandoned: its output does not validate: {e}"
+            );
         }
         return None;
     }
@@ -2149,7 +2173,7 @@ fn field_refusal(bytes: &[u8], t: u32) -> Option<&'static str> {
 /// `$VL_MV_EXPLAIN=1`: on stderr, per struct type a function takes or returns, whether the step
 /// may take it apart and why not; per function returning a record, whether it gets a result
 /// twin and why not, and what each of its call sites that keeps the struct does with it.
-fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
+fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin], log: &mut String) {
     let names = function_names(m.bytes);
     let name = |f: u32| {
         names
@@ -2173,7 +2197,8 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
         }
     }
     seen.sort_unstable();
-    eprintln!(
+    say!(
+        log,
         "mv-explain: writes are charged by {}",
         if m.by_index {
             "type index and subtyping component (every struct type is in one rec group)"
@@ -2185,7 +2210,7 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
         let fields = m.shape_all.get(t as usize).cloned().flatten();
         let Some((fs, _)) = &fields else {
             if let Some(why) = field_refusal(m.bytes, t).filter(|w| *w != "not a struct") {
-                eprintln!("mv-explain: type {t}: refused: {why}");
+                say!(log, "mv-explain: type {t}: refused: {why}");
             }
             continue;
         };
@@ -2224,14 +2249,18 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
             } else {
                 format!("type {h}, a struct nothing writes")
             };
-            eprintln!(
+            say!(
+                log,
                 "{head}: candidate, kept whole for a callee the escape step may inline: a \
                  reference field holds {held}"
             );
         } else if m.shape_of_type(t).is_some() {
-            eprintln!("{head}: candidate");
+            say!(log, "{head}: candidate");
         } else if !m.by_index && !family.is_empty() {
-            eprintln!("{head}: refused: in a subtyping relation with type(s) {family:?}");
+            say!(
+                log,
+                "{head}: refused: in a subtyping relation with type(s) {family:?}"
+            );
         } else {
             let culprit = if m.by_index {
                 std::iter::once(t)
@@ -2248,11 +2277,13 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
                 ""
             };
             match culprit {
-                Some(u) if u == t => eprintln!(
+                Some(u) if u == t => say!(
+                    log,
                     "{head}: refused: its fields are written (struct.set {t} in {}){fresh}",
                     name(m.writer[&u])
                 ),
-                Some(u) => eprintln!(
+                Some(u) => say!(
+                    log,
                     "{head}: refused: type {u}, {}, is written (struct.set {u} in {}){fresh}",
                     if m.by_index {
                         "in its subtyping component"
@@ -2261,7 +2292,7 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
                     },
                     name(m.writer[&u])
                 ),
-                None => eprintln!("{head}: refused"),
+                None => say!(log, "{head}: refused"),
             }
         }
     }
@@ -2295,7 +2326,11 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
             None
         };
         if let Some(why) = why {
-            eprintln!("mv-explain: {} -> type {t}: no result twin: {why}", name(f));
+            say!(
+                log,
+                "mv-explain: {} -> type {t}: no result twin: {why}",
+                name(f)
+            );
             continue;
         }
         // Its call sites in the original bodies: read as fields, or kept and why.
@@ -2351,14 +2386,15 @@ fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin]) {
             }
         }
         let n_kept: usize = kept.iter().map(|k| k.1).sum();
-        eprintln!(
+        say!(
+            log,
             "mv-explain: {} -> type {t}: result twin; {served} call site(s) read it as fields, \
              {n_kept} keep the struct",
             name(f)
         );
         kept.sort_by(|x, y| y.1.cmp(&x.1));
         for (reason, n, at) in kept {
-            eprintln!("mv-explain:     {n} {reason} (in {})", at.join(", "));
+            say!(log, "mv-explain:     {n} {reason} (in {})", at.join(", "));
         }
     }
 }

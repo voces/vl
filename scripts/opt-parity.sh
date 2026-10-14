@@ -17,7 +17,7 @@
 # tests/cases plus the distilled corpus. Run from the checkout root. Exits 1 when
 # any program disagrees, naming each; 2 on a usage error. `--flag` passes one more
 # build flag to both sides (repeatable), and a `--source-map` build's map must agree too,
-# as must the escape step's output (`$VL_OPT_ESCAPE_DUMP`), whose names `-O` then strips.
+# as must the escape and multi-value steps' outputs (`$VL_OPT_ESCAPE_DUMP`, `$VL_OPT_MV_DUMP`).
 set -u
 
 COMPILER=build/vl-compiler.wasm
@@ -87,7 +87,7 @@ one() {
     [ "$side" = b ] && spec=$B
     : > "$slot/log"
     env "$(side_env "$spec")" OPT_PARITY_LOG="$slot/log" VL_WASM_OPT="$WORK/shim.sh" \
-      VL_OPT_ESCAPE_DUMP="$slot/out.escape" \
+      VL_OPT_ESCAPE_DUMP="$slot/out.escape" VL_OPT_MV_DUMP="$slot/out.mv" \
       timeout "$TIMEOUT" "$(side_bin "$spec")" build "$f" "$RUNG" $FLAGS -o "$slot/out.wasm" \
       --compiler "$COMPILER" > "$slot/$side.stdout" 2> "$slot/$side.stderr"
     rc=$?
@@ -101,6 +101,7 @@ one() {
     if [ -f "$slot/out.wasm" ]; then mv "$slot/out.wasm" "$slot/$side.wasm"; fi
     if [ -f "$slot/out.wasm.map" ]; then mv "$slot/out.wasm.map" "$slot/$side.map"; fi
     if [ -f "$slot/out.escape" ]; then mv "$slot/out.escape" "$slot/$side.escape"; fi
+    if [ -f "$slot/out.mv" ]; then mv "$slot/out.mv" "$slot/$side.mv"; fi
   done
   if ! cmp -s "$slot/a.rc" "$slot/b.rc"; then
     echo "DIFFER $f (exit $(cat "$slot/a.rc") vs $(cat "$slot/b.rc"))"
@@ -114,6 +115,8 @@ one() {
     elif { [ -f "$slot/a.escape" ] || [ -f "$slot/b.escape" ]; } \
       && ! cmp -s "$slot/a.escape" "$slot/b.escape"; then
       echo "DIFFER $f (escape step output)"
+    elif { [ -f "$slot/a.mv" ] || [ -f "$slot/b.mv" ]; } && ! cmp -s "$slot/a.mv" "$slot/b.mv"; then
+      echo "DIFFER $f (multi-value step output)"
     else
       echo "AGREE $f $(grep -c -e --no-inline= -e --skip-pass= "$slot/a.argv") $([ -f "$slot/a.escape" ] && echo 1 || echo 0)"
     fi

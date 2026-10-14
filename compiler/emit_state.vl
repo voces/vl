@@ -1,4 +1,5 @@
 import { i32ListHas } from "./listutil"
+import { memoGenAdvance, memoGenNew, memoKeyNew, memoMoved } from "./memo"
 
 // `emit_state.vl` — the emitter's shared mutable state: the output buffer (`W`),
 // WasmGC type-index globals, the collection tables, scratch-slot bases, and
@@ -1470,7 +1471,7 @@ export let msSetMiss: {[string]: i32} = Map()
 // stamped and a stamp mismatch reads as uncovered, keeping the consumer on its
 // member-name path instead of answering from a previous program's rows. Bumped at the
 // top of `emitProgram` and whenever `recordUnMemTys` sees the member columns reset.
-export let msGen = 1
+export const msGen = memoGenNew(1)
 export let uVariants: string[] = []
 // Variant-name lookup for `variantIndexOf`, O(1): an interned name's sid to its first
 // `uVariants` row. First wins because two unions may push one variant name, which is what
@@ -1890,7 +1891,9 @@ export let monoProgStmts: i32[] = []
 // `monoOrigNode` position, each valid only where its stamp equals `fnPosEpoch`. Pushes extend
 // it lazily by length; an in-place slot write (via `buildFnMapNoteFnSlotWrite`) or a table
 // reset must call `fnPosIndexDrop`, which retires every entry at once by moving the epoch.
-let fnPosEpoch = 0
+const fnPosEpoch = memoGenNew(0)
+// The epoch the indexed prefixes below belong to, so any move restarts them.
+const fnPosLenKey = memoKeyNew(1)
 let fnPosFsLen = 0
 let fnPosMoLen = 0
 const fnPosFs: i32[] = []
@@ -1900,16 +1903,10 @@ const fnPosMoStamp: i32[] = []
 // Did either indexed prefix hold a negative entry? Only then can a negative query match.
 let fnPosNeg = false
 
-export function fnPosIndexDrop() {
-  fnPosEpoch = fnPosEpoch + 1
-  fnPosFsLen = 0
-  fnPosMoLen = 0
-  fnPosNeg = false
-  0
-}
+export function fnPosIndexDrop() { memoGenAdvance(fnPosEpoch) }
 
 // The epoch `fnPosIndexDrop` last moved to: an index stamped with an older one is stale.
-export function fnPosEpochNow() { fnPosEpoch }
+export function fnPosEpochNow() { fnPosEpoch.at }
 
 // Record position `at` for arena node `ix` in one of the two columns, the first one winning.
 function fnPosPut(pos: i32[], stamp: i32[], ix: i32, at: i32) {
@@ -1921,8 +1918,8 @@ function fnPosPut(pos: i32[], stamp: i32[], ix: i32, at: i32) {
     stamp.push(-1)
     pos.push(-1)
   }
-  if stamp[ix] == fnPosEpoch { return 0 }
-  stamp[ix] = fnPosEpoch
+  if stamp[ix] == fnPosEpoch.at { return 0 }
+  stamp[ix] = fnPosEpoch.at
   pos[ix] = at
   0
 }
@@ -1933,6 +1930,11 @@ function fnPosPut(pos: i32[], stamp: i32[], ix: i32, at: i32) {
 export function fnStmtsIndexOf(fnIx: i32) {
   if fnPosFsLen > fnStmts.length || fnPosMoLen > monoOrigNode.length {
     fnPosIndexDrop()
+  }
+  if memoMoved(fnPosLenKey, 0, fnPosEpoch.at) {
+    fnPosFsLen = 0
+    fnPosMoLen = 0
+    fnPosNeg = false
   }
   while fnPosFsLen < fnStmts.length {
     fnPosPut(fnPosFs, fnPosFsStamp, fnStmts[fnPosFsLen], fnPosFsLen)
@@ -1946,10 +1948,10 @@ export function fnStmtsIndexOf(fnIx: i32) {
     if fnPosNeg { return 0 - 2 }
     return -1
   }
-  if fnIx < fnPosFsStamp.length && fnPosFsStamp[fnIx] == fnPosEpoch {
+  if fnIx < fnPosFsStamp.length && fnPosFsStamp[fnIx] == fnPosEpoch.at {
     return fnPosFs[fnIx]
   }
-  if fnIx < fnPosMoStamp.length && fnPosMoStamp[fnIx] == fnPosEpoch {
+  if fnIx < fnPosMoStamp.length && fnPosMoStamp[fnIx] == fnPosEpoch.at {
     return fnPosMo[fnIx]
   }
   -1
