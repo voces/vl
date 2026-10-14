@@ -2696,16 +2696,15 @@ from its grading list now refuses one layer later, on the comparator, and is fil
   lists.
 * `repOfArray` gives a numeric literal-union list `(1 | 2)[]` its base scalar's list.
 
-**Checks.** Results against `origin/master` 147ef9a87:
+**Checks.** Results against `origin/master` 9f5f84908, which includes stage 3:
 
-* `difftree --identity` over 15,122 files: **10,037 built, 3 differ, 0 uncompared**.
-* Fixpoint identity holds: the candidate compiling 147ef9a87's compiler gives 147ef9a87's
-  seed.
-* Two refreshes give the same seed, 5,408,872 bytes.
+* `difftree --identity` over 15,124 files: **10,039 built, 3 differ, 0 uncompared**.
+* Fixpoint identity holds.
+* Two refreshes give the same seed, 5,410,975 bytes.
 
 The three files that differ are:
 
-* `loops/forin-over-called-literal-union-list.vl`: stage 3's fixture, which master refuses.
+* `generics/lambda-array-param-into-generic-call.vl`: D4032's fixture, which master refuses.
 * `scope/start-block-shadow-scratch-frame.vl` and `unions/twice-narrowed-list-ops.vl`: the same
   output, each 10 bytes smaller. Master emitted a four-local `.push` scratch frame that nothing
   read, and the candidate no longer emits it.
