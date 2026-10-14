@@ -8,9 +8,9 @@ document are only a claim if the population cannot be re-run.
 ```sh
 python3 scripts/silent-sweep/d181/gen181.py /tmp/d181cells
 
-JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py \
+JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
     /tmp/d181cells <master.wasm> /tmp/g/base.json
-JOBS=4 python3 scripts/silent-sweep/census/gradecensus.py \
+JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
     /tmp/d181cells <branch.wasm> /tmp/g/branch.json
 ```
 

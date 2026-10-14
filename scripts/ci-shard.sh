@@ -30,7 +30,7 @@ vl_test_runner_test.ts 25
 vl_deep_nesting_test.ts 25
 vl_check_filed_witnesses_test.ts 20
 vl_survey_regrade_port_test.ts 17
-vl_regress_port_test.ts 16
+vl_distilled_tools_test.ts 30
 vl_memo_generation_test.ts 12
 vl_std_fs_write_test.ts 12
 vl_emitter_state_audit_test.ts 10
