@@ -1,6 +1,11 @@
 # Codegen builder migration plan: refactoring `wasmEmit.vl` onto a thin builder
 
-> Status: **executable migration plan, not landed.** This operationalizes the
+> Status: **landed 2026-06-08 — every phase in §2 shipped**: Phase 0 #225, A #226,
+> B #227, C #228, D #229, E #230, F #231, G #232, H #233, I #234. The builder layer is
+> `compiler/emit_bytes.vl`. The plan below is kept as the record of how it was done; its
+> line numbers describe the pre-refactor `wasmEmit.vl`.
+>
+> This operationalizes the
 > recommendation in [`docs/internals/codegen-architecture.md`](codegen-architecture.md)
 > (branch `claude/codegen-architecture-analysis`): refactor the self-hosted WasmGC
 > emitter (`compiler/wasmEmit.vl`, `emitProgram`) onto a **thin 3-layer streaming
