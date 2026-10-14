@@ -17,12 +17,13 @@ import {
   wcSkip,
   wcSkipLeb,
   wcU32,
+  wcValIdx,
   wcValType,
 } from "./wasm_read"
 
 // A callee at most this many body bytes, loop-free and calling no defined function, is
 // left inlinable into run-once code.
-const RUN_ONCE_INLINE_LEAF_BYTES = 160
+export const RUN_ONCE_INLINE_LEAF_BYTES = 160
 // A function with more `local.set`/`local.tee` than this makes the rung skip `ssa-nomerge`.
 const SSA_SPLIT_MAX_SETS = 8192
 // The low region binaryen's own `--low-memory-unused` assumes; a smaller promise does not
@@ -39,8 +40,11 @@ let optIn: u8[] = []
 let optOut: u8[] = []
 
 // What one decode of the module found. Bodies are in code-section order; call sites are
-// flattened, one row per direct call of a defined function.
-type ScanState = {
+// flattened, one row per direct call of a defined function, a body's rows from its
+// `bodySiteStart`. Only a `full` scan reads the types, the function, table and global
+// sections, and each body's `struct.new` types (`allocType`) and cast targets.
+export type ScanState = {
+  full: boolean,
   nImports: i32,
   start: i32,
   escapes: i32[],
@@ -54,6 +58,16 @@ type ScanState = {
   nameIdx: i32[],
   nameAt: i32[],
   nameLen: i32[],
+  funcTypes: i32[],
+  typeStruct: boolean[],
+  typeParams: i32[][],
+  typeResults: i32[][],
+  typeFields: i32[][],
+  subtyped: i32[],
+  held: i32[],
+  bodySiteStart: i32[],
+  bodyAllocStart: i32[],
+  allocType: i32[],
 }
 
 // Empties the staged module before a new one is loaded.
@@ -105,7 +119,7 @@ export function optOutStore(off: i32, count: i32): i32 {
 // function-index order. Returns 1, or 0 with an empty answer when the module did not decode.
 export function optRungScan(): i32 {
   optOut = []
-  const s = newScanState()
+  const s = newScanState(false)
   if !scanModule(s) { return 0 }
   if ssaSplit(s) { outText("--skip-pass=ssa-nomerge") }
   const hot = runOnceHotCallees(s)
@@ -126,7 +140,7 @@ export function optRungScan(): i32 {
 export function optRungArgv(rung: i32, names: i32, lowMemory: i32): i32 {
   optOut = []
   if rung != 1 && rung != 3 { return 0 }
-  const s = newScanState()
+  const s = newScanState(false)
   const scanned = scanModule(s)
   if scanned {
     const hot = runOnceHotCallees(s)
@@ -201,8 +215,15 @@ function isSrcName(c: WasmCursor): boolean {
     && c.b[at + 5] == 0x63
 }
 
-function newScanState(): ScanState {
+// The staged module, for a pass that reads it beside this file's.
+export function optInBytes(): u8[] { optIn }
+
+// Replaces the answer `optOut*` reads back.
+export function optOutSet(b: u8[]) { optOut = b }
+
+export function newScanState(full: boolean): ScanState {
   {
+    full: full,
     nImports: 0,
     start: -1,
     escapes: [],
@@ -216,6 +237,16 @@ function newScanState(): ScanState {
     nameIdx: [],
     nameAt: [],
     nameLen: [],
+    funcTypes: [],
+    typeStruct: [],
+    typeParams: [],
+    typeResults: [],
+    typeFields: [],
+    subtyped: [],
+    held: [],
+    bodySiteStart: [],
+    bodyAllocStart: [],
+    allocType: [],
   }
 }
 
@@ -277,9 +308,9 @@ function nameTable(s: ScanState): i32[] {
   t
 }
 
-// Decodes every section the scan reads and steps over the rest. False when any of it
-// does not decode.
-function scanModule(s: ScanState): boolean {
+// Decodes every section the scan reads of the staged module and steps over the rest.
+// False when any of it does not decode.
+export function scanModule(s: ScanState): boolean {
   const c = wcNew(optIn, 0, optIn.length)
   wcPreamble(c)
   while !c.failed && c.pos < c.end {
@@ -288,7 +319,11 @@ function scanModule(s: ScanState): boolean {
     if c.failed || size > c.end - c.pos { return false }
     const sec = wcNew(optIn, c.pos, c.pos + size)
     if id == 0 { scanCustom(s, sec) }
+    else if id == 1 && s.full { scanTypes(s, sec) }
     else if id == 2 { scanImports(s, sec) }
+    else if id == 3 && s.full { scanFuncs(s, sec) }
+    else if id == 4 && s.full { scanTables(s, sec) }
+    else if id == 6 && s.full { scanGlobals(s, sec) }
     else if id == 7 { scanExports(s, sec) }
     else if id == 8 { s.start = wcU32(sec) }
     else if id == 9 { scanElements(s, sec) }
@@ -312,12 +347,12 @@ function scanImports(s: ScanState, c: WasmCursor) {
       wcU32(c)
       s.nImports = s.nImports + 1
     } else if kind == 1 {
-      wcValType(c)
+      hold(s, wcValIdx(c))
       skipLimits(c)
     } else if kind == 2 {
       skipLimits(c)
     } else if kind == 3 {
-      wcValType(c)
+      hold(s, wcValIdx(c))
       wcByte(c)
     } else if kind == 4 {
       wcByte(c)
@@ -325,6 +360,135 @@ function scanImports(s: ScanState, c: WasmCursor) {
     } else {
       wcFail(c)
     }
+    i = i + 1
+  }
+}
+
+// Records a type some heap location can hold; numbers and abstract references are not one.
+function hold(s: ScanState, t: i32) {
+  if t >= 0 { s.held.push(t) }
+}
+
+// Per type index: whether it is a struct, a function type's concrete parameter and result
+// types, and a struct's fields (-1 for a number, a concrete reference's type, or -2 for
+// anything else). A type declared as a subtype and its supertype are both `subtyped`.
+function scanTypes(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    let count = 1
+    if c.pos < c.end && c.b[c.pos] == 0x4e {
+      c.pos = c.pos + 1
+      count = wcU32(c)
+    }
+    let k = 0
+    while k < count && !c.failed {
+      scanSubType(s, c)
+      k = k + 1
+    }
+    i = i + 1
+  }
+}
+
+function scanSubType(s: ScanState, c: WasmCursor) {
+  const ix = s.typeStruct.length
+  if c.pos < c.end && (c.b[c.pos] == 0x50 || c.b[c.pos] == 0x4f) {
+    c.pos = c.pos + 1
+    const supers = wcU32(c)
+    if supers > 1 { wcFail(c); return }
+    if supers == 1 {
+      s.subtyped.push(ix)
+      s.subtyped.push(wcU32(c))
+    }
+  }
+  const form = wcByte(c)
+  const params: i32[] = []
+  const results: i32[] = []
+  const fields: i32[] = []
+  if form == 0x5f {
+    const nf = wcU32(c)
+    let f = 0
+    while f < nf && !c.failed {
+      fields.push(scanField(s, c))
+      f = f + 1
+    }
+  } else if form == 0x5e {
+    scanField(s, c)
+  } else if form == 0x60 {
+    concreteTypes(c, params)
+    concreteTypes(c, results)
+  } else if form == 0x5d {
+    wcU32(c)
+  } else {
+    wcFail(c)
+  }
+  s.typeStruct.push(form == 0x5f)
+  s.typeParams.push(params)
+  s.typeResults.push(results)
+  s.typeFields.push(fields)
+}
+
+// A field's storage type and mutability; a value type some field holds is heap-held.
+function scanField(s: ScanState, c: WasmCursor): i32 {
+  let t = -2
+  if c.pos < c.end && (c.b[c.pos] == 0x78 || c.b[c.pos] == 0x77) {
+    c.pos = c.pos + 1
+  } else {
+    const v = wcValIdx(c)
+    hold(s, v)
+    if v >= -1 { t = v }
+  }
+  wcByte(c)
+  t
+}
+
+// A vector of value types; appends each concrete reference's type index to `out`.
+function concreteTypes(c: WasmCursor, out: i32[]) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const v = wcValIdx(c)
+    if v >= 0 { out.push(v) }
+    i = i + 1
+  }
+}
+
+function scanFuncs(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    s.funcTypes.push(wcU32(c))
+    i = i + 1
+  }
+}
+
+// A table's element type is heap-held; an initializer expression is decoded but not read.
+function scanTables(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  const unread: i32[] = []
+  let i = 0
+  while i < n && !c.failed {
+    const init = c.pos < c.end && c.b[c.pos] == 0x40
+    if init {
+      c.pos = c.pos + 1
+      if wcByte(c) != 0 { wcFail(c) }
+    }
+    hold(s, wcValIdx(c))
+    skipLimits(c)
+    if init { wcConstExpr(c, unread) }
+    i = i + 1
+  }
+}
+
+// A global's type is heap-held; its initializer is decoded but not read.
+function scanGlobals(s: ScanState, c: WasmCursor) {
+  const n = wcU32(c)
+  const unread: i32[] = []
+  let i = 0
+  while i < n && !c.failed {
+    hold(s, wcValIdx(c))
+    wcByte(c)
+    wcConstExpr(c, unread)
     i = i + 1
   }
 }
@@ -393,6 +557,8 @@ function scanCode(s: ScanState, c: WasmCursor) {
 }
 
 function scanBody(s: ScanState, c: WasmCursor, caller: i32, size: i32) {
+  s.bodySiteStart.push(s.siteCallee.length)
+  s.bodyAllocStart.push(s.allocType.length)
   const groups = wcU32(c)
   let g = 0
   while g < groups && !c.failed {
@@ -429,6 +595,10 @@ function scanBody(s: ScanState, c: WasmCursor, caller: i32, size: i32) {
       s.escapes.push(c.imm)
     } else if op == 0x21 || op == 0x22 {
       sets = sets + 1
+    } else if s.full && op >= 0xfb0000 && op <= 0xfb0019 {
+      const sub = op & 0xffff
+      if sub <= 1 { s.allocType.push(c.imm) }
+      else if sub >= 20 { hold(s, c.imm) }
     }
   }
   if c.failed { return }
@@ -479,17 +649,41 @@ function scanFunctionNames(s: ScanState, c: WasmCursor) {
   }
 }
 
-function isDefined(s: ScanState, f: i32): boolean {
+export function isDefined(s: ScanState, f: i32): boolean {
   f >= s.nImports && f - s.nImports < s.bodySize.length
 }
 
-// Run-once code is the defined start function and every function reached only by direct
-// calls from outside any loop of run-once code. A callee is marked when every direct call
-// of it comes from run-once code, one of them inside a loop, and it is not a small
-// loop-free leaf. Ascending function index.
+// A callee is marked when every direct call of it comes from run-once code (`runOnceSet`),
+// one of them inside a loop, and it is not a small loop-free leaf. Ascending function index.
 function runOnceHotCallees(s: ScanState): i32[] {
   const hot: i32[] = []
   if !isDefined(s, s.start) { return hot }
+  const n = s.nImports + s.bodySize.length
+  const outside = siteBlocked(s, runOnceSet(s), n, false)
+  const looped: boolean[] = []
+  while looped.length < n { looped.push(false) }
+  let k = 0
+  while k < s.siteCallee.length {
+    const f = s.siteCallee[k]
+    if f >= 0 && f < n && s.siteInLoop[k] { looped[f] = true }
+    k = k + 1
+  }
+  let f = s.nImports
+  while f < n {
+    const b = f - s.nImports
+    const big = s.bodyLoop[b]
+      || s.bodyCalls[b]
+      || s.bodySize[b] > RUN_ONCE_INLINE_LEAF_BYTES
+    if looped[f] && !outside[f] && big { hot.push(f) }
+    f = f + 1
+  }
+  hot
+}
+
+// Per function index, whether it is run-once code: the defined start function and every
+// function reached only by direct calls from outside any loop of run-once code. None when
+// the start function is not defined.
+export function runOnceSet(s: ScanState): boolean[] {
   const n = s.nImports + s.bodySize.length
   const once: boolean[] = []
   const escaped: boolean[] = []
@@ -499,6 +693,7 @@ function runOnceHotCallees(s: ScanState): i32[] {
     escaped.push(false)
     sited.push(false)
   }
+  if !isDefined(s, s.start) { return once }
   once[s.start] = true
   let e = 0
   while e < s.escapes.length {
@@ -526,25 +721,7 @@ function runOnceHotCallees(s: ScanState): i32[] {
       f = f + 1
     }
   }
-  const outside = siteBlocked(s, once, n, false)
-  const looped: boolean[] = []
-  while looped.length < n { looped.push(false) }
-  k = 0
-  while k < s.siteCallee.length {
-    const f = s.siteCallee[k]
-    if f >= 0 && f < n && s.siteInLoop[k] { looped[f] = true }
-    k = k + 1
-  }
-  let f = s.nImports
-  while f < n {
-    const b = f - s.nImports
-    const big = s.bodyLoop[b]
-      || s.bodyCalls[b]
-      || s.bodySize[b] > RUN_ONCE_INLINE_LEAF_BYTES
-    if sited[f] && looped[f] && !outside[f] && big { hot.push(f) }
-    f = f + 1
-  }
-  hot
+  once
 }
 
 // Per function, whether some direct call of it comes from a caller outside `once`, or
