@@ -1,0 +1,258 @@
+// The list-origin walk: where a delivered list comes from (`listOriginExpr`), following a
+// literal `const` to the literal it names unless a store into it carries a list built elsewhere,
+// and whether a call's result is built at the type it flows into (`callResultIsInferred`). The
+// list-widening and record-width checks ask it; it owns only its recursion bound and does not
+// import the checker.
+import {
+  ArrayLit,
+  BinExpr,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  ObjLit,
+  P,
+  Spread,
+} from "./ast"
+import { ctnLitInitOf } from "./check_ctn_lit_bind"
+import { nodeTyIxOf, nodeTyOf } from "./check_node_tys"
+import { parenPeelIx } from "./check_places"
+import { lookupFnDeclNode } from "./check_scopes"
+import { tyHasTyVar } from "./check_ty_shape"
+import { T, TyFunc, tyContainsList } from "./check_types"
+import {
+  CW_OCC_USE,
+  covarRootFrame,
+  cwIxBuild,
+  cwIxFrHead,
+  cwIxFrNext,
+  cwIxKind,
+  cwIxNode,
+  cwIxPNext,
+  cwIxUnkHead,
+  cwUseStoreNode,
+} from "./check_write_scan"
+
+// Is `ix` a bare `Map()` / `Set()` constructor call?
+export function exprIsCollCtorCall(ix: i32): boolean {
+  const iv = P.nodes[ix]
+  if iv is Call {
+    const cn = P.nodes[iv.callFn]
+    if cn is Ident { return cn.identName == "Map" || cn.identName == "Set" }
+  }
+  false
+}
+
+// `listOriginExpr`'s answer for a value whose type inference chose.
+export const LW_INFERRED = -2
+
+// Where the list `expr` delivers comes from: a literal `const` resolves to the literal it
+// names, a `Map()`/`Set()` const or a call whose result no annotation fixes is LW_INFERRED,
+// and anything else is itself. -1 stays -1.
+export function listOriginExpr(expr: i32): i32 {
+  if expr < 0 { return -1 }
+  let x = parenPeelIx(expr)
+  let hops = 0
+  while hops < 16 {
+    if x < 0 || x >= P.nodes.length { return -1 }
+    const e = P.nodes[x]
+    if e is Ident {
+      const init = ctnLitInitOf(e.identName)
+      if init < 0 { return x }
+      // A const whose contents receive an existing list holds more than its literal built.
+      if constStoresForeignList(e.identName, covarRootFrame(x)) { return x }
+      if exprIsCollCtorCall(init) { return LW_INFERRED }
+      x = parenPeelIx(init)
+      hops = hops + 1
+      continue
+    }
+    if callResultIsInferred(x) { return LW_INFERRED }
+    return x
+  }
+  x
+}
+
+// Does a store INTO the value the name (`nm`, `fr`) is bound to — an element or field store
+// (`ls[0] = v`, `o.xs = v`, `m[k] = v`) or a mutating method (`ls.push(v)`, `m.set(k, v)`), at
+// any projection depth — put there a list that is not itself fresh (`lwValueIsFresh`)?
+function constStoresForeignList(nm: string, fr: i32): boolean {
+  if nm == "" { return true }
+  if lwFreshDepth > 8 { return true }
+  lwFreshDepth = lwFreshDepth + 1
+  cwIxBuild()
+  let found = false
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while (ixA >= 0 || ixU >= 0) && !found {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    if cwIxKind[r] == CW_OCC_USE {
+      const st = cwUseStoreNode(cwIxNode[r])
+      if st >= 0 && lwStoreCarriesForeignList(st) { found = true }
+    }
+  }
+  lwFreshDepth = lwFreshDepth - 1
+  found
+}
+
+// The recursion bound shared by `constStoresForeignList` and `lwValueIsFresh`, which reach each
+// other through a const that stores into itself.
+let lwFreshDepth = 0
+
+// Does the store at `st` (an assignment or a mutating call) carry a list that is not fresh?
+function lwStoreCarriesForeignList(st: i32): boolean {
+  if st < 0 || st >= P.nodes.length { return true }
+  const n = P.nodes[st]
+  if n is BinExpr { return !lwValueIsFresh(n.binRight) }
+  lwCallCarriesForeignList(st)
+}
+
+// `lwStoreCarriesForeignList` for a mutating call: any argument not fresh. A store node of any
+// other shape is not one this reads, so it counts as foreign.
+function lwCallCarriesForeignList(st: i32): boolean {
+  const n = P.nodes[st]
+  if n is Call {
+    let i = 0
+    while i < n.callArgs.length {
+      if !lwValueIsFresh(n.callArgs[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  true
+}
+
+// Is the value at `v` either free of lists or built fresh: a literal whose own lists are fresh,
+// a literal const nothing foreign is stored into, or a result `callResultIsInferred` trusts?
+function lwValueIsFresh(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length { return false }
+  // A value the check has not typed yet (a store after the delivery) is judged by its origin.
+  const vt = nodeTyIxOf(v)
+  if vt >= 0 && !tyContainsList(vt, 8) { return true }
+  if lwFreshDepth > 8 { return false }
+  lwFreshDepth = lwFreshDepth + 1
+  const o = listOriginExpr(v)
+  let fresh = false
+  if o == LW_INFERRED { fresh = true }
+  else if o >= 0 && o < P.nodes.length { fresh = lwLitIsFresh(o) }
+  lwFreshDepth = lwFreshDepth - 1
+  fresh
+}
+
+// Is the node `o` a list or object literal all of whose parts are fresh (`lwValueIsFresh`)? A
+// spread of a list-holding source is not.
+function lwLitIsFresh(o: i32): boolean {
+  const n = P.nodes[o]
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      const el = P.nodes[n.arrElems[i]]
+      if el is Spread {
+        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return false }
+      } else if !lwValueIsFresh(n.arrElems[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  lwObjLitIsFresh(o)
+}
+
+// `lwLitIsFresh` for an object literal: every field value fresh.
+function lwObjLitIsFresh(o: i32): boolean {
+  const n = P.nodes[o]
+  if n is ObjLit {
+    let i = 0
+    while i < n.objFields.length {
+      const fi = P.nodes[n.objFields[i]]
+      if fi is FieldInit {
+        if !lwValueIsFresh(fi.fiValue) { return false }
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Does the argument at `ix` hand an EXISTING list to the call? A literal is new, so only the
+// lists inside it that come from elsewhere count.
+function argCarriesList(ix: i32): boolean {
+  const px = parenPeelIx(ix)
+  if px < 0 || px >= P.nodes.length { return false }
+  const e = P.nodes[px]
+  if e is ArrayLit {
+    let i = 0
+    while i < e.arrElems.length {
+      const el = P.nodes[e.arrElems[i]]
+      if el is Spread {
+        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return true }
+      } else if argCarriesList(e.arrElems[i]) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ObjLit {
+    let i = 0
+    while i < e.objFields.length {
+      const fi = P.nodes[e.objFields[i]]
+      if fi is FieldInit {
+        if argCarriesList(fi.fiValue) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  tyContainsList(nodeTyIxOf(px), 8)
+}
+
+// Does any argument of `c` hand in an existing list?
+export function callPassesList(c: Call): boolean {
+  let i = 0
+  while i < c.callArgs.length {
+    if argCarriesList(c.callArgs[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Is `ix` a call whose result is built at the type it flows into: the fill intrinsic, a
+// function with no declared return, or a generic whose declared result names a type parameter
+// and which no existing list goes into (`filled(2, { r: 1 })`, not `id(xs)`)?
+function callResultIsInferred(ix: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Call {
+    const cn = P.nodes[e.callFn]
+    if cn is Ident {
+      if cn.identName == "__array_new__" { return true }
+      const fd = lookupFnDeclNode(cn.identName)
+      if fd >= 0 {
+        const f = P.nodes[fd]
+        if f is FuncDecl {
+          if f.fnRet < 0 { return true }
+          if f.fnTyParams.length > 0 && fnDeclRetHasTyVar(fd) {
+            return !callPassesList(e)
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// Does the declared result of the function declared at `fd` name one of its type parameters?
+export function fnDeclRetHasTyVar(fd: i32): boolean {
+  const ft = nodeTyOf(fd)
+  if ft < 0 || ft >= T.tys.length { return false }
+  const f = T.tys[ft]
+  if f is TyFunc { return tyHasTyVar(f.fnRet) }
+  false
+}

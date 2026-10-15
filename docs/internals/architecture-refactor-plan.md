@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the host answers `EPERM` for a POSIX EPERM (`permission_errno`). Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the diagnostic notes moved to `check_mismatch_notes.vl` and the redundant-annotation hint to `check_redundant_annot.vl`; 54,647 → 53,847 lines. Next: the list-origin walk under `listOriginExpr`. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: the list-origin walk moved to `check_list_origin.vl` and the join gate's name scan to `check_nj_gate.vl`; 53,847 → 53,368 lines. Next: the literal-union flattening under `litUnionPreserve`. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -439,6 +439,13 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - The 23 `recAd*` rows and their resets and queries moved to `compiler/check_rec_adopt_rows.vl`; `check_pins.vl` calls its resets as before. The widened-literal tables moved to `compiler/check_wide_lits.vl`, which `wideLitsReset` clears and `wasmEmit.vl` and `emit_classify.vl` read. `joinByWant` moved to `check_tp_join.vl` and `joinRowsReset` clears it. `calleeNameOf` joined `check_callee.vl`, and `tailValueLeaves` and `joinLeavesOf` joined `check_unconsumed.vl`.
   - Each seed compiles the other tree's source to that tree's fixpoint byte for byte, and the seed grows 54 bytes (5,735,720 to 5,735,774). Output identity holds over 15,200 files (0 differ), and the distilled corpus moved no cell. Two `kind-ladder-incomplete` findings moved, one into `check_callee.vl` and one into `check_redundant_annot.vl`.
   - Measured after these moves (2,405 declarations), the next roots are the list-origin walk under `listOriginExpr` (18 declarations, 3 `let`s, 250 lines, 8 names back) and the `nj*` gate scan under `njFnReached` (14, 5 `let`s, 232 lines, 8 back).
+- The list-origin walk and the join gate's name scan moved out, with the two state families they read, and `typecheck.vl` fell from 53,847 to 53,368 lines. None of the four modules imports `typecheck.vl`.
+  - `compiler/check_list_origin.vl` (14 declarations) holds `listOriginExpr`, `LW_INFERRED`, the fresh-value tests (`lw*`), `constStoresForeignList`, `callPassesList`, `callResultIsInferred`, `exprIsCollCtorCall` and `fnDeclRetHasTyVar`. Its one `let`, `lwFreshDepth`, is a recursion bound reset by each walk.
+  - The container-literal binding rows moved to `compiler/check_ctn_lit_bind.vl`; `ctnLitBindReset` and `ctnLitBindPopTo` replace the checker's direct clears in `isvalReset` and `collBindPopTo`.
+  - `compiler/check_nj_gate.vl` (13 declarations) holds `njFnReached`, the gate's name scan and helper-shape tests, `njMatchDesugared`, `collectValuedReturns` and `a20RetWalk`; `njGateReset` clears its three tables, and `emit_mono.vl` imports `collectValuedReturns` from it.
+  - The integer-match heads and desugared-match scrutinees moved to `compiler/check_match_heads.vl`, written through `noteIntMatchHead` and `noteMatchScrut` and cleared by `matchHeadsReset`; `wasmEmit.vl` reads `intMatchHeadAt` and `matchScrutAt` from it.
+  - Each seed compiles the other tree's source to that tree's fixpoint byte for byte, and the seed shrinks 1 byte (5,735,774 to 5,735,773). Output identity holds over 15,200 files (0 differ), and the distilled corpus moved no cell. No ladder or sentinel finding moved.
+  - Measured after these moves (2,370 declarations), the next roots are the literal-union flattening under `litUnionPreserve` (12 declarations, 2 `let`s, 226 lines, 9 names back) and the closure under `crNoteSoleRef` (10, 3 `let`s, 225 lines, 6 back).
 
 ### SMALL log
 
