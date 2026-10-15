@@ -1,9 +1,10 @@
 // `check_num_lit_state.vl` — the numeric-literal state the checker keeps, and the operations
 // that read only it, the scope chain and the node-type table. The literal-binding solver's
 // tables (`lbi*`: binding marks, candidate rows, edges, pins, refusals, inlined reads) with its
-// row order, settle and apply steps; the exact-constant tables (`cex*`) and their notes; the
-// numeric-literal note queues (`nl*`, `nln*`); and the binding-mark helpers they share. The
-// checker resets these tables and owns every step that reports through `tErr`.
+// row order, settle and apply steps; the exact-constant tables (`cex*`), their notes and the
+// rewrite of a folded tree, whose names stay symbol occurrences; the numeric-literal note
+// queues (`nl*`, `nln*`); and the binding-mark helpers they share. The checker resets these
+// tables and owns every step that reports through `tErr`.
 
 import {
   ArrayLit,
@@ -64,7 +65,9 @@ import {
   cexKeepLeaf,
   cexLeafNotConst,
   cexLitPeel,
+  cexNamesNone,
   cexOp,
+  cexPosNone,
   cexRetypeLeaf,
   cexShapeNotTree,
   cexShown,
@@ -98,7 +101,9 @@ import {
 import { parenPeelIx } from "./check_places"
 import { rcwModOf, rcwWhere } from "./check_record_writes"
 import { lookup, lookupDepth, numIntrShadowed } from "./check_scopes"
+import { symEnabled, symOccTy } from "./check_state"
 import { demangleName, isIdentCharAt } from "./check_suggest"
+import { symDeclScope, symPendNode, symUse, symUseDecl } from "./check_sym_occ"
 import { nullableInnerOrNone, primNameOf } from "./check_ty_shape"
 import {
   T,
@@ -122,6 +127,7 @@ import {
   cexBitwise,
   cexDiv,
   cexFitsSigned,
+  cexLexeme,
   cexMul,
   cexNeg,
   cexNot,
@@ -1846,4 +1852,74 @@ export function argIsNullLit(ix: i32): boolean {
   const x = parenPeelIx(ix)
   if x < 0 || x >= P.nodes.length { return false }
   P.nodes[x] is NullLit
+}
+
+// Record the rewritten read `ix` as an occurrence of the name it stands for, for the editor.
+export function lbiSymRead(ix: i32) {
+  const nm = lbiInlinedName[ix] ?? ""
+  if nm == "" { return 0 }
+  const o = symOccTy.length
+  const pend = symPendNode.length
+  if (lbiDefaultExpr[ix] ?? false) && symDeclScope.length > 0 {
+    // A default's name is the module binding's, wherever the omitting call stands.
+    const d = symDeclScope[0][nm] ?? -1
+    if d >= 0 { symUseDecl(ix, nm, -1, d) }
+  } else {
+    symUse(ix, nm, lookup(nm))
+  }
+  if symOccTy.length > o {
+    lbiOccIx.push(o)
+    lbiOccNode.push(ix)
+  } else if symPendNode.length > pend {
+    lbiOccIx.push(-1)
+    lbiOccNode.push(ix)
+  }
+  0
+}
+
+// Rewrite the node `ix` into the literal of `v`, a negation over it when `v` is negative. The
+// names the tree read stay references for the editor.
+export function cexRewrite(ix: i32, v: Cex) {
+  if symEnabled != 0 { cexNoteNames(ix, 0) }
+  const pos = nodePosOf(ix)
+  const lex = cexLexeme(v)
+  if v.cxNeg {
+    const inner = mkNum(lex, pos)
+    while nodeTyIx.length <= inner { nodeTyIx.push(-1) }
+    cexFolded[inner] = true
+    arenaSetNode(ix, { unOp: "-", unArg: inner, pos: pos })
+  } else {
+    arenaSetNode(ix, { numText: lex, pos: pos })
+  }
+  cexFolded[ix] = true
+  0
+}
+
+// Record every name the tree at `ix` reads as an editor occurrence of the `const` it names.
+function cexNoteNames(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return 0 }
+  const e = P.nodes[ix]
+  if e is Paren { return cexNoteNames(e.parInner, depth + 1) }
+  if e is Unary { return cexNoteNames(e.unArg, depth + 1) }
+  if e is BinExpr {
+    cexNoteNames(e.binLeft, depth + 1)
+    return cexNoteNames(e.binRight, depth + 1)
+  }
+  if e is Ident {
+    lbiInlinedName[ix] = e.identName
+    lbiSymRead(ix)
+    return 0
+  }
+  cexNamesNone()
+}
+
+// The source position of the tree at `ix`: its leftmost leaf's.
+function nodePosOf(ix: i32): i32 {
+  const e = P.nodes[ix]
+  if e is BinExpr { return nodePosOf(e.binLeft) }
+  if e is Paren { return e.pos }
+  if e is Unary { return e.pos }
+  if e is NumLit { return e.pos }
+  if e is Ident { return e.pos }
+  cexPosNone()
 }
