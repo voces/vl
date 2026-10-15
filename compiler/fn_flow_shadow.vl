@@ -98,15 +98,18 @@ let ufKidK: string[][] = []
 let ufKidS: i32[][] = []
 // The directed half, per slot rather than per class: the slots a slot's value flows into, and
 // the pins taken at the slot itself. A merge with no direction (two derived slots) flows both
-// ways. Per pre-mono declaration, its slot in each context that walks it, and that context.
+// ways. Per pre-mono declaration or list or record literal, its slot in each context that walks
+// it, and that context.
 let dfTo: i32[][] = []
 let dfPin: i32[][] = []
 let ffDeclSlots: {[i32]: i32[]} = Map()
 let ffDeclSlotCtx: {[i32]: i32[]} = Map()
 
 // A pin is the parameter types a class is called or annotated at, in the context that read
-// them; `pinName` renders them once the compile is over.
+// them, and the return an annotation gives it (-1 for a call); `pinName` renders them once the
+// compile is over.
 let pinTys: i32[][] = []
+let pinRet: i32[] = []
 let pinName: string[][] = []
 
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
@@ -172,6 +175,7 @@ export function fnFlowShadowBegin() {
   ffDeclSlots = Map()
   ffDeclSlotCtx = Map()
   pinTys = []
+  pinRet = []
   pinName = []
   ctxKeyIx = Map()
   ctxPerFn = Map()
@@ -422,11 +426,12 @@ function ffTyHasFn(ty: i32, depth: i32): boolean {
 }
 
 // ── sources and pins ─────────────────────────────────────────────────────────────────────────
-function ffAddPin(s: i32, tys: i32[]) {
+function ffAddPin(s: i32, tys: i32[], ret: i32) {
   const r = ffFind(s)
   if r < 0 { return 0 }
   const id = pinTys.length
   pinTys.push(tys)
+  pinRet.push(ret)
   ufPin[r].push(id)
   dfPin[s].push(id)
   0
@@ -439,7 +444,7 @@ function ffPinTy(s: i32, ty: i32, depth: i32) {
   if !ffTyHasFn(ty, 0) { return 0 }
   const t = T.tys[ty]
   if t is TyFunc {
-    if !tyHasTyVar(ty) { ffAddPin(s, t.fnParamTypes) }
+    if !tyHasTyVar(ty) { ffAddPin(s, t.fnParamTypes, t.fnRet) }
     ffPinTy(ffKid(s, "r"), t.fnRet, depth + 1)
     let i = 0
     while i < t.fnParamTypes.length {
@@ -793,6 +798,7 @@ function ffFlow(ix: i32, pos: string): i32 {
   if n is Block { return ffBlock(ix, pos) }
   if n is ArrayLit {
     const s = ffNew()
+    ffBankDeclSlot(ffOrigDecl(ix), s)
     const e = ffKid(s, "e")
     for el in n.arrElems {
       const en = P.nodes[el]
@@ -806,6 +812,7 @@ function ffFlow(ix: i32, pos: string): i32 {
   }
   if n is ObjLit {
     const s = ffNew()
+    ffBankDeclSlot(ffOrigDecl(ix), s)
     for fi in n.objFields {
       const f = P.nodes[fi]
       if f is FieldInit {
@@ -955,7 +962,7 @@ function ffSlotCall(ix: i32, s: i32): i32 {
       ffInto(ffKid(s, "p" + i32ToStr(i)), ffFlow(a, "argument"))
       i = i + 1
     }
-    if s >= 0 { ffAddPin(s, tys) }
+    if s >= 0 { ffAddPin(s, tys, -1) }
     const res = ffKid(s, "r")
     const rr = ffFind(res)
     if rr >= 0 && !typed && !i32ListHas(ufRes[rr], ffFn) {
@@ -1036,6 +1043,30 @@ function ffMethod(ix: i32, recv: i32, name: string): i32 {
   -1
 }
 
+// The closed type the argument in `args` to a parameter of generic `fn` annotated as the bare type
+// variable `tp` has, for a binding `t` the checker left open (it binds from the first argument
+// that names `tp`, which may be a generic function's own); `t` when no such argument is closed.
+function ffBareParamArgTy(fn: i32, args: i32[], tp: string, t: i32): i32 {
+  const fd = P.nodes[fn]
+  if !(fd is FuncDecl) { return t }
+  let i = 0
+  while i < fd.fnParams.length && i < args.length {
+    const p = P.nodes[fd.fnParams[i]]
+    if p is Param {
+      const pt = ffAnnTy(p.parType)
+      if pt >= 0 && pt < T.tys.length {
+        const pv = T.tys[pt]
+        if pv is TyVar {
+          const at = ffSubst(nodeTyIxOf(args[i]))
+          if pv.tvName == tp && at >= 0 && !tyHasTyVar(at) { return at }
+        }
+      }
+    }
+    i = i + 1
+  }
+  t
+}
+
 // A direct call: a generic callee is walked once per instance, keyed by the bindings its call
 // makes; a concrete one once, where it is declared. Arguments flow into its parameter slots.
 function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
@@ -1049,7 +1080,10 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
         const bT: i32[] = []
         let key = "F" + i32ToStr(fn) + "<"
         for tp in fd.fnTyParams {
-          const t = ffSubst(callBindTyOf(ix, tp))
+          let t = ffSubst(callBindTyOf(ix, tp))
+          if t < 0 || tyHasTyVar(t) {
+            t = ffBareParamArgTy(fn, n.callArgs, tp, t)
+          }
           bN.push(tp)
           bT.push(t)
           key = key + ffTyKey(t) + ","
@@ -1250,14 +1284,36 @@ export function fnFlowDeclWritten(at: i32): boolean {
 export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
 
 // The distinct closed parameter lists (`p1,p2,`) calls and annotated destinations pin the slot
-// `path` (steps `f.<name>`; empty is the binding) of the binding `d` at, in the walk instance
-// `inst` of generic `tmpl` stands for (-1, -1 outside one). `[FF_PIN_DECLINE]` with no table, no
-// walk of `d`, or walks that disagree with none picked out by the instance.
+// `path` (steps `e`, `v`, `f.<name>`; empty is the value) of the binding or literal `d` at, in the
+// walk instance `inst` of generic `tmpl` stands for (-1, -1 outside one). `[FF_PIN_DECLINE]` with no
+// table, no walk of `d`, or walks that disagree with none picked out by the instance.
 export function fnFlowDeclPathPinSigs(
   d: i32,
   path: string[],
   inst: i32,
   tmpl: i32,
+): string[] {
+  ffDeclPathPinKeys(d, path, inst, tmpl, false)
+}
+
+// `fnFlowDeclPathPinSigs` answering the distinct returns annotated destinations pin the slot at
+// instead; a call's pin names no return and is left out.
+export function fnFlowDeclPathPinRets(
+  d: i32,
+  path: string[],
+  inst: i32,
+  tmpl: i32,
+): string[] {
+  ffDeclPathPinKeys(d, path, inst, tmpl, true)
+}
+
+// The pins' parameter lists, or their returns when `rets`, as `fnFlowDeclPathPinSigs` picks them.
+function ffDeclPathPinKeys(
+  d: i32,
+  path: string[],
+  inst: i32,
+  tmpl: i32,
+  rets: boolean,
 ): string[] {
   const decline: string[] = [FF_PIN_DECLINE]
   if !ffBuilt || d < 0 { return decline }
@@ -1265,11 +1321,11 @@ export function fnFlowDeclPathPinSigs(
   const slots = ffDeclSlots[o] ?? []
   const ctxs = ffDeclSlotCtx[o] ?? []
   if slots.length == 0 { return decline }
-  const first = ffPathPinSigs(slots[0], path)
+  const first = ffPathPinKeys(slots[0], path, rets)
   let agree = true
   let i = 1
   while i < slots.length {
-    if !ffSameSigs(first, ffPathPinSigs(slots[i], path)) { agree = false }
+    if !ffSameSigs(first, ffPathPinKeys(slots[i], path, rets)) { agree = false }
     i = i + 1
   }
   if agree { return first }
@@ -1284,7 +1340,7 @@ export function fnFlowDeclPathPinSigs(
       && (walked[i32ToStr(tmpl) + "@" + i32ToStr(c)] ?? false)
       && ffCtxFits(tmpl, c, ps)
     ) {
-      const sigs = ffPathPinSigs(slots[i], path)
+      const sigs = ffPathPinKeys(slots[i], path, rets)
       if pick.length == 1 && pick[0] == FF_PIN_DECLINE { pick = sigs }
       else if !ffSameSigs(pick, sigs) { return decline }
     }
@@ -1295,14 +1351,15 @@ export function fnFlowDeclPathPinSigs(
 
 export const FF_PIN_DECLINE = "?"
 
-// The closed pins (`ffPinSigsOf`) taken downstream of the slot `path` derives from slot `s`;
-// empty when no walk derived a step of the path.
-function ffPathPinSigs(s: i32, path: string[]): string[] {
+// The closed pins (`ffPinSigsOf`, or `ffPinRetsOf` when `rets`) taken downstream of the slot
+// `path` derives from slot `s`; empty when no walk derived a step of the path.
+function ffPathPinKeys(s: i32, path: string[], rets: boolean): string[] {
   let r = s
   for k in path {
     r = ffKidOf(ffFind(r), k)
     if r < 0 { return [] }
   }
+  if rets { return ffPinRetsOf(ffDirectedPins(r)) }
   ffPinSigsOf(ffDirectedPins(r))
 }
 
@@ -1392,6 +1449,18 @@ function ffPinSigsOf(ids: i32[]): string[] {
       let sig = ""
       for t in pinTys[id] { sig = sig + normTypeAtom(tyToStr(t)) + "," }
       if !strListHas(out, sig) { out.push(sig) }
+    }
+  }
+  out
+}
+
+// The distinct returns of the closed pins among `ids` an annotation took, in the order first taken.
+function ffPinRetsOf(ids: i32[]): string[] {
+  const out: string[] = []
+  for id in ids {
+    if !ffPinOpen(id) && pinRet[id] >= 0 {
+      const r = normTypeAtom(tyToStr(pinRet[id]))
+      if !strListHas(out, r) { out.push(r) }
     }
   }
   out
