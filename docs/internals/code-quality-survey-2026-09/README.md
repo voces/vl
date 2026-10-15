@@ -97,7 +97,7 @@ had already shipped, and its 11.75% had fallen under 1% with no one reading it.
 So each row below carries the command that produces its number and the number that command
 should read. `vl run scripts/survey-regrade.vl -- docs/internals/code-quality-survey-2026-09/README.md`
 re-runs the cheap ones and prints `row · filed · today · verdict`. A block that shells out
-to a Python script writes `"$PYTHON"`, which the runner binds to `$PYTHON` or `python3`. It fails when a number is
+to a script writes its command in `cmd:`. It fails when a number is
 NOT RE-RUNNABLE — no block, an unparseable one, a command that errors — and merely REPORTS a
 row that moved, in either direction, because movement is the finding this page exists to
 carry. `--profile <guest-profile.json>` adds the share rows; `--strict` makes a moved row a
@@ -127,7 +127,7 @@ does not.
 Measure:
 
     kind: shell
-    cmd: "$PYTHON" scripts/emitter-state-audit.py | grep -E 'emitFuncCode (yes|no) +emitStartFnCode (yes|no)' | grep -v 'yes *emitStartFnCode yes' | wc -l
+    cmd: scripts/vl-host/target/release/vl run scripts/emitter-state-audit.vl --compiler build/vl-compiler.wasm | grep -E 'emitFuncCode (yes|no) +emitStartFnCode (yes|no)' | grep -v 'yes *emitStartFnCode yes' | wc -l
     filed: 0
     tol: 0
     dir: at-most
