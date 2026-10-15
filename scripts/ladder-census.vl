@@ -98,6 +98,8 @@ type Src = {
   st: string[],
   fns: Fn[],
   fnNames: Map<string, boolean>,
+  // The import locals binding a top-level function of the sibling module they name.
+  imported: Map<string, boolean>,
 }
 
 // The tree's closed sets, a member index per kind, and the field-to-set table.
@@ -115,7 +117,57 @@ function loadSrc(rel: string, path: string): Src {
   const fns = functions(lines)
   const fnNames: Map<string, boolean> = Map()
   for f in fns { fnNames[f.name] = true }
-  { rel: rel, lines: lines, st: st, fns: fns, fnNames: fnNames }
+  const imported: Map<string, boolean> = Map()
+  {
+    rel: rel,
+    lines: lines,
+    st: st,
+    fns: fns,
+    fnNames: fnNames,
+    imported: imported,
+  }
+}
+
+// Fill each source's `imported` from the `import { … } from "./x"` statements the driver
+// resolves, against the sibling sources already loaded: a default calling one of those has
+// delegated as much as one calling a function of its own module, as the lint reads it.
+function linkImports(srcs: Src[]) {
+  const byRel: Map<string, Map<string, boolean>> = Map()
+  for s in srcs { byRel[s.rel] = s.fnNames }
+  for s in srcs {
+    const text = join(s.lines, "\n")
+    let i = 0
+    while i < text.length {
+      if startsWith(text.slice(i, i + 8), "import {") {
+        const rb = findFrom(text, "}", i)
+        const fk = skipWs(text, rb + 1)
+        const q = skipWs(text, fk + 4)
+        const qe = findFrom(text, "\"", q + 1)
+        const rel = text.slice(q + 1, qe)
+        if (
+          rb > i
+          && text.slice(fk, fk + 4) == "from"
+          && qe > q
+          && startsWith(rel, "./")
+        ) {
+          let key = "compiler/" + rel.slice(2, rel.length)
+          if !endsWith(key, ".vl") { key = key + ".vl" }
+          const fns = byRel[key] ?? Map()
+          for part in split(text.slice(i + 8, rb), ",") {
+            const words = split(strip(part), " ")
+            const name = words[0]
+            let local = name
+            if words.length == 3 && words[1] == "as" { local = words[2] }
+            if fns.has(name) && local != "" { s.imported[local] = true }
+          }
+        }
+      }
+      const nl = findFrom(text, "\n", i)
+      if nl < 0 { break }
+      i = nl + 1
+    }
+  }
+  0
 }
 
 function world(): World {
@@ -437,8 +489,8 @@ function tailOf(src: Src, last: i32, hi: i32): i32[] {
 }
 
 // Whether the lines at `idxs` name what the ladder excludes: a refusal channel, a quoted
-// sentence, or a call to another function of the module. Reads the stripped line, so a
-// comment is never a default.
+// sentence, or a call to another function of the module or one it imports. Reads the
+// stripped line, so a comment is never a default.
 function regionNames(src: Src, idxs: readonly i32[]): boolean {
   for i in idxs {
     const s = src.st[i]
@@ -456,7 +508,9 @@ function regionNames(src: Src, idxs: readonly i32[]): boolean {
       k = k + 1
     }
     for c in callNames(s, false) {
-      if src.fnNames.has(c) || hasStr(NAMING_CALLS, c) { return true }
+      if src.fnNames.has(c) || src.imported.has(c) || hasStr(NAMING_CALLS, c) {
+        return true
+      }
     }
   }
   false
@@ -1052,6 +1106,7 @@ function main(args: string[]) {
   }
   const srcs: Src[] = []
   for m in modules(TOOL, ".") { srcs.push(loadSrc(m[0], m[1])) }
+  linkImports(srcs)
   const per: Ladder[][] = []
   const lads: Ladder[] = []
   for src in srcs {
