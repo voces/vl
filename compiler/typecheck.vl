@@ -428,6 +428,23 @@ import {
   wsSuppress,
   wsValueRead,
 } from "./check_width"
+import {
+  daAdd,
+  daEnterFrame,
+  daIsUnassignedSid,
+  daJoinArms,
+  daLeaveFrame,
+  daLive,
+  daMark,
+  daMarkAssigned,
+  daMarkAssignedSid,
+  daRelease,
+  daResetForCheck,
+  daRollbackTo,
+  daSplitDelta,
+  daTouchedSince,
+  daWriteTarget,
+} from "./check_definite"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -3584,307 +3601,6 @@ function flushUninferred(depth: i32) {
 }
 
 // ── definite-assignment flow ─────────────────────────────────────────────────
-
-// An uninitialized `let x: T` starts unassigned and is non-null, so a read before it is provably
-// written on every preceding path is a "used before it is assigned" error. `daLive` is the live
-// set of binding ids still un-written on the current path, forked and joined explicitly at
-// `if`/`else` and loops; `daWriteTarget` exempts a plain-`=` left-hand ident.
-let daLive: i32[] = []
-// `daPos` is `daLive`'s sid-keyed inverse: the id's index in `daLive`, or -1 when it is assigned,
-// and `daGen` the frame generation that index belongs to. A row an enclosing frame (or an earlier
-// check) wrote reads as absent on its generation alone, so opening a frame costs nothing per
-// entry — which is what keeps a function body off the module's whole dead zone.
-const daPos: i32[] = []
-const daGen: i32[] = []
-// Every generation is minted from `daGenSeq`, which only ever rises, so two SIBLING frames
-// never share one — a row the first left behind cannot read as live inside the second.
-let daGenSeq = 1
-let daCurGen = 1
-let daWriteTarget = -1
-// The undo log — one row per change to the live set while a rollback point is open. `daOpA` is
-// the id's previous `daPos` for an add and the slot it left for a removal, `daOpB` its previous
-// `daGen`. Nothing is logged at depth 0, so a module's own dead zone costs no rows.
-let daOpKind: i32[] = []
-let daOpSid: i32[] = []
-let daOpA: i32[] = []
-let daOpB: i32[] = []
-let daMarkDepth = 0
-// The frame stack: the generation `daEnterFrame` displaced and its rollback point. The
-// enclosing live SET travels through the caller, so the stack itself stays flat.
-let daFrameGen: i32[] = []
-let daFrameMark: i32[] = []
-// A sid-keyed stamp for "is this id in that list?", answered in one read. `daHitSeq` only
-// rises, so a stamp an earlier question left cannot answer a later one.
-const daHitTok: i32[] = []
-let daHitSeq = 0
-
-// True if the interned id `sid` is currently in the live unassigned set. A row from another
-// generation is not in it, whatever index it holds.
-function daIsUnassignedSid(sid: i32) {
-  if sidArrGet(daGen, sid) != daCurGen { return false }
-  sidArrGet(daPos, sid) >= 0
-}
-
-// Record one change to the live set so a rollback can invert it — `kind` 0 for an add, 1 for a
-// removal. Outside a rollback point nothing is recorded, which is what keeps the log the size
-// of the innermost open construct rather than of the whole check.
-function daLogOp(kind: i32, sid: i32, a: i32, b: i32) {
-  if daMarkDepth == 0 { return 0 }
-  daOpKind.push(kind)
-  daOpSid.push(sid)
-  daOpA.push(a)
-  daOpB.push(b)
-  0
-}
-
-// Mark the interned id `sid` unassigned on the current path.
-function daAddSid(sid: i32) {
-  if sid < 0 { return 0 }
-  if daIsUnassignedSid(sid) { return 0 }
-  // The row may still be an enclosing frame's; the log carries what it held, since that is
-  // what `daLeaveFrame` has to put back.
-  daLogOp(0, sid, sidArrGet(daPos, sid), sidArrGet(daGen, sid))
-  sidArrPut(daPos, sid, daLive.length)
-  sidArrPut(daGen, sid, daCurGen)
-  daLive.push(sid)
-  0
-}
-
-// Mark `name` unassigned on the current path (a `let x: T` with no initializer).
-function daAdd(name: string) { daAddSid(sidOf(name)) }
-
-// Mark the interned id `sid` assigned, removing it from the live set by swapping the last entry
-// into its slot. Order is unobservable: nothing reads the set except as a membership test and
-// through the undo log.
-function daMarkAssignedSid(sid: i32) {
-  if !daIsUnassignedSid(sid) { return 0 }
-  // Membership already said the slot is this frame's; the bound test is the standing rule for
-  // an index a reader can answer out of band (D1440).
-  const at = sidArrGet(daPos, sid)
-  if at < 0 || at >= daLive.length { return 0 }
-  daLogOp(1, sid, at, 0)
-  const moved = daLive[daLive.length - 1]
-  daLive[at] = moved
-  sidArrPut(daPos, moved, at)
-  daLive.pop()
-  sidArrPut(daPos, sid, -1)
-  0
-}
-
-// Mark `name` assigned on the current path (a write or a checked read). An empty live set
-// answers without interning, which is every read and write inside a body that declares no
-// uninitialized binding.
-function daMarkAssigned(name: string) {
-  if daLive.length == 0 { return 0 }
-  daMarkAssignedSid(sidOf(name))
-}
-
-// Empty the live set of the current frame, in place. Every row leaves through `daLive` and
-// through the log, so `daPos` ends at -1 for exactly the ids this frame holds and a rollback
-// can put them all back.
-function daClear() {
-  // The self-host emitter lowers `.pop()` (and `.length`) as statements but not
-  // `.clear()`, so empty the array in place by popping until empty.
-  while daLive.length > 0 {
-    const at = daLive.length - 1
-    const sid = daLive[at]
-    daLogOp(1, sid, at, 0)
-    sidArrPut(daPos, sid, -1)
-    daLive.pop()
-  }
-  0
-}
-
-// Open a rollback point: the log's height now, to hand back to `daRollbackTo` and `daRelease`.
-function daMark() {
-  daMarkDepth = daMarkDepth + 1
-  daOpKind.length
-}
-
-// Undo every change logged since `m`, newest first, restoring the live set the mark stands
-// for. Costs the changes, not the set.
-function daRollbackTo(m: i32) {
-  while daOpKind.length > m {
-    const j = daOpKind.length - 1
-    const sid = daOpSid[j]
-    if daOpKind[j] == 0 {
-      if daLive.length > 0 { daLive.pop() }
-      sidArrPut(daPos, sid, daOpA[j])
-      sidArrPut(daGen, sid, daOpB[j])
-    } else {
-      // The removal swapped the last entry into `at`, so putting it back means moving that
-      // entry to the end again. `at` past the end names `sid` itself as that last entry.
-      const at = daOpA[j]
-      if at >= 0 && at < daLive.length {
-        const moved = daLive[at]
-        daLive.push(moved)
-        sidArrPut(daPos, moved, daLive.length - 1)
-        daLive[at] = sid
-      } else {
-        daLive.push(sid)
-      }
-      sidArrPut(daPos, sid, at)
-    }
-    daOpKind.pop()
-    daOpSid.pop()
-    daOpA.pop()
-    daOpB.pop()
-  }
-  0
-}
-
-// Close the rollback point `m`, dropping the changes it covers. At depth 0 the log is empty
-// again, which is the bound on how large it grows.
-function daRelease(m: i32) {
-  while daOpKind.length > m {
-    daOpKind.pop()
-    daOpSid.pop()
-    daOpA.pop()
-    daOpB.pop()
-  }
-  daMarkDepth = daMarkDepth - 1
-  0
-}
-
-// The ids the changes since `m` touched, each with whether it is live at this moment, into
-// `sids`/`live`. Read back after a rollback: live there and not here is a removal the branch
-// made, live here and not there an addition. Duplicates are harmless — both are idempotent.
-function daTouchedSince(m: i32, sids: i32[], live: i32[]) {
-  let i = m
-  while i < daOpSid.length {
-    const s = daOpSid[i]
-    sids.push(s)
-    if daIsUnassignedSid(s) { live.push(1) } else { live.push(0) }
-    i = i + 1
-  }
-  0
-}
-
-// Split what `daTouchedSince` recorded into the branch's additions and removals, against the
-// live set as it stands — which the caller must have rolled back to the fork point.
-function daSplitDelta(sids: i32[], live: i32[], adds: i32[], rems: i32[]) {
-  let i = 0
-  while i < sids.length {
-    const s = sids[i]
-    if daIsUnassignedSid(s) {
-      if live[i] == 0 { rems.push(s) }
-    } else {
-      if live[i] == 1 { adds.push(s) }
-    }
-    i = i + 1
-  }
-  0
-}
-
-// Stamp every id of `sids`, returning the token that then answers "is it in that list?".
-function daHitStamp(sids: i32[]) {
-  daHitSeq = daHitSeq + 1
-  let i = 0
-  while i < sids.length {
-    sidArrPut(daHitTok, sids[i], daHitSeq)
-    i = i + 1
-  }
-  daHitSeq
-}
-
-// Add every id of `adds` to the live set.
-function daAddAll(adds: i32[]) {
-  let i = 0
-  while i < adds.length {
-    daAddSid(adds[i])
-    i = i + 1
-  }
-  0
-}
-
-// Apply one arm's delta: what the arm assigned becomes assigned, what it declared and left
-// unwritten becomes unassigned.
-function daApplyDelta(adds: i32[], rems: i32[]) {
-  let i = 0
-  while i < rems.length {
-    daMarkAssignedSid(rems[i])
-    i = i + 1
-  }
-  daAddAll(adds)
-}
-
-// The live set after an `if`, from the two arms' deltas against the fork point — which is what
-// the set holds when this is called. An id is assigned after the join only if EVERY surviving
-// arm assigned it; a diverging arm contributes nothing, and two of them leave the join dead.
-function daJoinArms(
-  thenDiv: boolean,
-  thenAdds: i32[],
-  thenRems: i32[],
-  hasElse: boolean,
-  elseDiv: boolean,
-  elseAdds: i32[],
-  elseRems: i32[],
-) {
-  if !hasElse {
-    // The fall-through IS the fork point, so nothing the then-arm assigned survives the join;
-    // only what it declared and left unwritten joins.
-    if !thenDiv { daAddAll(thenAdds) }
-    return 0
-  }
-  if thenDiv && elseDiv { return daClear() }
-  if thenDiv { return daApplyDelta(elseAdds, elseRems) }
-  if elseDiv { return daApplyDelta(thenAdds, thenRems) }
-  const tok = daHitStamp(elseRems)
-  let i = 0
-  while i < thenRems.length {
-    if sidArrGet(daHitTok, thenRems[i]) == tok {
-      daMarkAssignedSid(thenRems[i])
-    }
-    i = i + 1
-  }
-  daAddAll(thenAdds)
-  daAddAll(elseAdds)
-}
-
-// Start a check with an empty dead zone and no open frame. The generation bump is what makes
-// the sid-keyed columns safe across a `sidReset`: a row an earlier check left behind carries an
-// older generation, so a recycled id reads as absent rather than as that row.
-function daResetForCheck() {
-  daLive = []
-  daFrameGen = []
-  daFrameMark = []
-  daOpKind = []
-  daOpSid = []
-  daOpA = []
-  daOpB = []
-  daMarkDepth = 0
-  daGenSeq = daGenSeq + 1
-  daCurGen = daGenSeq
-  0
-}
-
-// Open a nested flow context: the enclosing dead zone is set aside whole and the body checks
-// against an empty one, so a body costs its own uninitialized bindings and not the module's.
-// Returns the enclosing live set, to hand back to `daLeaveFrame`.
-function daEnterFrame() {
-  const saved = daLive
-  daFrameGen.push(daCurGen)
-  daFrameMark.push(daMark())
-  daGenSeq = daGenSeq + 1
-  daCurGen = daGenSeq
-  daLive = []
-  saved
-}
-
-// Close the frame `daEnterFrame` opened, restoring `saved` as the live set. The rollback puts
-// back every sid-keyed row the body overwrote — the only enclosing state a frame can damage —
-// and the body's own live array is dropped with it.
-function daLeaveFrame(saved: i32[]) {
-  const m = daFrameMark[daFrameMark.length - 1]
-  daFrameMark.pop()
-  daRollbackTo(m)
-  daRelease(m)
-  daCurGen = daFrameGen[daFrameGen.length - 1]
-  daFrameGen.pop()
-  daLive = saved
-  0
-}
-
 // Check a read of `name`: if it is still unassigned on this path, report it and drop it so the
 // same hole does not re-fire on every later read.
 function daCheckRead(name: string, at: i32) {
@@ -28090,6 +27806,15 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
     tErr(clash, annotDiagAt)
     return TY_ERR
   }
+  // A member that is itself `null` (`null | null`, `N | null` over `type N = null`) is the
+  // niche, not an inner type; with no other member the union is the `null` type (D4673).
+  const nonNull: i32[] = []
+  let anyNull = hasNull
+  for m in members {
+    if isNullTy(m) { anyNull = true } else { nonNull.push(m) }
+  }
+  if nonNull.length == 0 && anyNull { return TY_NULL }
+  if nonNull.length < members.length { return annUnionTy(nonNull, anyNull) }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
   // arena-tick exempt: a per-program mark on an annotation's row.
@@ -32812,6 +32537,8 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   if e is TyPrim {
     if e.primName == "i32" { return "list" }
     if e.primName == "boolean" { return "list" }
+    // `null[]` rides the i32 list with every element the same sentinel (D4671).
+    if e.primName == "null" { return "list" }
     if e.primName == "string" { return "strlist" }
     // The wide-scalar backings: `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of
     // one scalar each, exactly as `i32[]` is — lacking only a core, since
@@ -57531,6 +57258,9 @@ function fillTypeDeclAt(sx: i32) {
           let folded = -1
           if sawNull && nonNullU.length > 0 {
             folded = annUnionTy(nonNullU, true)
+          } else if sawNull {
+            // Every member is `null` (`type N = null | null`), which denotes `null` itself.
+            folded = TY_NULL
           }
           // The literal-union flatten, on the declaration side (`litUnionFlatMembers`, the
           // same transform `annUnionInnerTy` climbs): this arm builds its member list itself,
@@ -61225,6 +60955,7 @@ export function checkProgramPass(rootIx: i32) {
   nolTaken = Map()
   ulLitN = 0
   ulTaken = Map()
+  nolTakenOther = Map()
   nolOperand = Map()
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
@@ -63472,7 +63203,9 @@ export function nodeTyIsNulI32List(ix: i32) {
       if e >= 0 {
         const et = T.tys[e]
         if et is TyPrim {
-          return et.primName == "i32" || et.primName == "boolean"
+          return et.primName == "i32"
+            || et.primName == "boolean"
+            || et.primName == "null"
         }
         // A literal-union element (`K[] | null`) shares the i32-list backing exactly like
         // `i32[]` (the arena dual of `nameIsI32Array`'s litunion arm).
@@ -64719,6 +64452,13 @@ export function nodeArrayElemIsNulBool(ix: i32) {
   tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "boolean")
 }
 
+// Whether node `ix` has a recorded array type whose element is the `null` unit type (D4671), and
+// is not a null-only literal that a destination of another list type received.
+export function nodeArrayElemIsNullUnit(ix: i32): boolean {
+  if nolLitTakenOther(ix) { return false }
+  isNullTy(nodeArrayElemTyIx(ix))
+}
+
 // Whether node `ix` has a recorded array type whose element is a plain `string` — the
 // non-null twin of `nodeArrayElemIsNulStr`. Needed because `arrLitIsStr` classifies a literal
 // by its first element, so an atom-first literal under a `string[]` annotation built the atom
@@ -64970,6 +64710,15 @@ export function mapTyValIsNulBool(ty: i32) {
     }
     return sawNull && sawBool
   }
+  false
+}
+
+// Whether arena type `ty` is a map whose value is the `null` unit type: the mono i32 map, every
+// stored value the `boolean | null` sentinel `2` (D4671).
+export function mapTyValIsNullUnit(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return isNullTy(t.mVal) }
   false
 }
 
@@ -65353,6 +65102,8 @@ export function nodeTyIsNullable(ix: i32) {
 // True if node `ix`'s recorded type is the `null` type itself: the value is `null` on every path
 // that yields one, whatever its arms run first (D3355).
 export function nodeTyIsNullType(ix: i32): boolean { isNullTy(nodeTyIxOf(ix)) }
+// Whether arena type `ty` is the `null` unit type, the type-taking twin of `nodeTyIsNullType`.
+export function tyIsNullUnit(ty: i32): boolean { isNullTy(ty) }
 
 // Whether node `ix`'s recorded type provably admits no `null` — not `!nodeTyIsNullable(ix)`,
 // since an unrecorded node, an inference hole, or a `TyVar` all answer "not nullable" there
@@ -74557,9 +74308,15 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
 
 // D1832 — a list literal whose every element is `null`, those of them a typed destination
 // received, and those that sit as a `+` operand or a spread source, which no destination types.
-// `null[]` has no element rep, so `flushNullOnlyLits` refuses the untyped ones at program end.
+// An untyped one names no element type, so `flushNullOnlyLits` refuses it at program end.
 let nolLits: i32[] = []
 let nolTaken: {[i32]: boolean} = Map()
+// The null-only literals some destination other than `null[]` received: each is built at that
+// destination's list, never as a `null[]` (`nodeArrayElemIsNullUnit`).
+let nolTakenOther: {[i32]: boolean} = Map()
+export function nolLitTakenOther(ix: i32): boolean {
+  nolTakenOther[ix] ?? false
+}
 let nolOperand: {[i32]: boolean} = Map()
 
 // A list literal whose element joins to a union, and per literal what a delivery outside a
@@ -74573,9 +74330,9 @@ export function arrLitUnionDestTaken(ix: i32): boolean {
 }
 
 // Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
-// destination beside the value. A part whose own destination is `null[]`, or holds a type
-// variable that is not the enclosing generic's own, types nothing. A speculative delivery
-// under `inferQuiet` marks too: it names a destination the real check then delivers to.
+// destination beside the value. A part whose destination is a union offering only `null[]`, or
+// holds a type variable that is not the enclosing generic's own, types nothing. A speculative
+// delivery under `inferQuiet` marks too: it names a destination the real check then delivers to.
 function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
   if (nolLits.length == 0 && ulLitN == 0) || srcExpr < 0 || dstTy < 0 {
     return 0
@@ -74602,7 +74359,10 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
     if nolElemOnlyNull(dt) || (tyHasTyVar(dt) && !fsbTvsInScope(dt, 0)) {
       return 0
     }
+    // A generic parameter's `T[]` pinned at `null` by this very literal names nothing.
+    if lbiNoDest && nolIsNullList(dt) { return 0 }
     nolTaken[at] = true
+    if !nolIsNullList(dt) { nolTakenOther[at] = true }
     const dn = nonNullTy(dt)
     let elDt = dt
     if dn >= 0 {
@@ -74685,13 +74445,23 @@ function nolMarkOperand(ix: i32) {
   0
 }
 
-// Whether `ty`, through `null` and union members, offers a list only as `null[]`.
+// Whether `ty`, its `null` peeled, is `null[]` itself.
+function nolIsNullList(ty: i32): boolean {
+  const dn = nonNullTy(ty)
+  if dn < 0 { return false }
+  const t = T.tys[dn]
+  if t is TyArray { return t.aElem == TY_NULL }
+  false
+}
+
+// Whether `ty` is a union that offers a list only as `null[]`. A plain `null[]` destination names
+// the element type and types the literal (D4671); a union one does not say which arm it builds.
 function nolElemOnlyNull(ty: i32): boolean {
   const dn = nonNullTy(ty)
   if dn < 0 { return false }
   const t = T.tys[dn]
   match t {
-    TyArray => t.aElem == TY_NULL
+    TyArray => false
     TyUnion => nolMembersOnlyNull(t.uMembers)
     // None of these is a list, so a destination of one names no element type either way.
     TyErr | TyPrim | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyNullable | TyObj => false
