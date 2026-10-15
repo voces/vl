@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: `HOST_FLOOR` (`main.rs`) is the host floor in one table, held to the compiler by `tests/vl_host_floor_test.ts`. Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the quiet-probe rollback and the rows it truncates moved into `check_rollback`, `check_hole_rows` and `check_infer_rows`; 58,207 → 57,052 lines. Next: `crReset`, which frees 40. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: the capture-retire, narrowing-bank, symbol-occurrence and effect-summary tables moved into four modules that own their resets; 57,217 → 56,579 lines. Next: `fnWriteShapes`, which frees 28. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -410,6 +410,10 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   | `symFlushPending` | 16, 9 `let`s, 100 lines | 23 (483) |
   | `cexNoteNames` with `cexRewrite` | 22, 9 `let`s, 186 lines | 19 (414) |
   | `fnWriteShapes` | 61, 20 `let`s, 758 lines | 5 (92) |
+- Four table families moved into modules that own their resets, and `cexRewrite` joined `check_num_lit_state.vl`. `typecheck.vl` fell from 57,217 to 56,579 lines, and no new module imports it.
+  - `check_capture_rows.vl` holds the 72 capture-retire tables and `crReset`. `check_nar_bank.vl` holds the narrowing bank (`asgDecl*`, `noteNarShadow`, `narDeclaredTy`) with `narBankReset` and the scope frame steps. `check_sym_occ.vl` holds `symDecl`, `symUse`, `symResolve`, the pending uses and the scope span stack, with `symOccReset`, `symScopePush`, `symSpanPush` and `symScopePop`. `check_effect_rows.vl` holds the effect-summary rows and `esReset`.
+  - Each seed compiles the other tree's source to that tree's fixpoint byte for byte. Output identity holds over 15,195 files (0 differ), and the distilled corpus moved no cell. Two `kind-ladder-incomplete` findings moved with `symMem` and `symMemMethod` into `check_sym_occ.vl`.
+  - Measured after these moves (2,597 declarations, 723 pure), the next roots are `fnWriteShapes` (60 declarations, 19 `let`s, 759 lines; frees 28, 594 lines) and `fnWriteFreePaths` (37, 11 `let`s, 464; frees 25, 514). `crRootCaptureWiden` (41, 6 `let`s, 554; frees 24, 520) reaches the callee lookup (`findFnDecl*`, `builtinMethod*`, `opIdx*`), which would move first as its own module.
 
 ### SMALL log
 
