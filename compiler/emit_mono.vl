@@ -17,9 +17,6 @@ import {
   arrElemIs,
   arrElemNameRaw,
   arrElemSuffixed,
-  gaeArgsTextOf,
-  gaeHeadNameOf,
-  gaeLtAt,
   listElemNameOf,
   nameIsArray,
   nameIsBraceSpanEnds,
@@ -30,30 +27,15 @@ import {
   unionMemberCount,
 } from "./tyname"
 import {
-  T,
-  TyArray,
-  TyErr,
-  TyFunc,
-  TyLit,
-  TyMap,
-  TyNeg,
-  TyNullable,
-  TyObj,
-  TyPrim,
-  TyUnion,
-  TyVar,
   assignable,
   bindGenUnionArmInto,
   bindGenWalk,
   blockLastStmt,
-  cUserTypes,
   callBindTyOf,
   canonEmitName,
   collectValuedReturns,
-  declAnnRawTyName,
   flatConstOfNameProp,
   flattenVariantsInto,
-  genAppNameOfTy,
   holeNamesTpJoin,
   holePinReadOf,
   i32TyIx,
@@ -65,7 +47,6 @@ import {
   joinPinnedArmLit,
   joinPinnedArmTys,
   litTyOfExpr,
-  litUnionAliasNameOfTy,
   memberRungOnTy,
   mkArrayTy,
   monoInferListElem,
@@ -96,7 +77,6 @@ import {
   nulNumScalarUnionName,
   nulRecListNominalName,
   nulRecNominalName,
-  numLitUnionBaseName,
   numUnionMinted,
   numUnionResultTy,
   opSelfFnNameForRecv,
@@ -105,39 +85,57 @@ import {
   recordClonedIsVarTy,
   recordClonedIsVarTyIx,
   recordClonedNodeTy,
-  structNameOfTy,
   substNullFoldOffFor,
   substNullFoldRestore,
   substTyDeep,
   tpIfJoinPinName,
   tpIfJoinPinTy,
-  tyArrayElemIx,
-  tyBearsNull,
-  tyEq,
   tyExcludesNull,
-  tyFieldTyOf,
   tyHasTyVar,
   tyHasTyVarWasCapped,
   tyIsArmedDeferredJoin,
   tyIsGradualUnion,
-  tyIsLitUnion,
-  tyIsLitUnionArray,
-  tyIsMap,
   tyIsNumUnion,
   tyIsNumericBox,
   tyIsTpJoinUnion,
   tyIsWriteLandRead,
-  tyPrimNameOf,
   tyProvesNonNull,
+  uniqueGenericDeclNamed,
+  valueUnionRetName,
+} from "./typecheck"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cUserTypes,
+  genAppNameOfTy,
+  litUnionAliasNameOfTy,
+  numLitUnionBaseName,
+  structNameOfTy,
+  tyArrayElemIx,
+  tyBearsNull,
+  tyEq,
+  tyFieldTyOf,
+  tyIsLitUnion,
+  tyIsLitUnionArray,
+  tyIsMap,
+  tyPrimNameOf,
   tyRenderSoftensLits,
   tyScalarBasePrim,
   tyToEmitName,
   tyToStr,
   tyToStructStr,
   tyVarRenameRow,
-  uniqueGenericDeclNamed,
-  valueUnionRetName,
-} from "./typecheck"
+} from "./check_types"
 import { blockHasBareReturn, fnResultUnconsumed } from "./check_unconsumed"
 import {
   ArrayLit,
@@ -252,11 +250,8 @@ import {
 import {
   annArrowAt,
   annFnDecompose,
-  annObjFieldSplit,
   annRetNameOf,
   drwDispatchOp,
-  gaeApplyFieldTy,
-  gaeSplitArgs,
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
@@ -275,7 +270,6 @@ import {
   nodeIsTypeDecl,
   normTypeAtom,
   noteCallOrigin,
-  nullClosureArrElem,
   nullablePartOf,
   parenUnionArrElemName,
   parentLetOf,
@@ -293,6 +287,7 @@ import {
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
+  fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
   fnFlowDeclPathSrcs,
   fnFlowDeclWritten,
@@ -2900,7 +2895,7 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
   if n is IsExpr { return monoReIsExpr(ix, kids[0]) }
   if n is AsExpr { return mkAsExpr(kids[0], n.asTy, n.asMode, n.pos) }
   if n is Spread { return mkSpread(kids[0], n.pos) }
-  if n is ArrayLit { return mkArrayLit(kids, n.pos) }
+  if n is ArrayLit { return monoCopyOf(ix, mkArrayLit(kids, n.pos)) }
   if n is ObjLit {
     const fs: i32[] = []
     let fi = 0
@@ -2913,7 +2908,7 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
       fs.push(nf)
       fi = fi + 1
     }
-    return mkObjLit(fs, n.pos)
+    return monoCopyOf(ix, mkObjLit(fs, n.pos))
   }
   ix
 }
@@ -3129,7 +3124,7 @@ function monoHoleListLitCopy(initIx: i32): i32 {
   if ix < 0 { return initIx }
   const n = P.nodes[ix]
   if n is ArrayLit {
-    const nx = mkArrayLit(n.arrElems, n.pos)
+    const nx = monoCopyOf(ix, mkArrayLit(n.arrElems, n.pos))
     nodeTyRecord(nx, t)
     return nx
   }
@@ -3144,7 +3139,7 @@ function monoHoleIterLitCopy(iterIx: i32): i32 {
   if ix < 0 { return iterIx }
   const n = P.nodes[ix]
   if n is ArrayLit {
-    const nx = mkArrayLit(n.arrElems, n.pos)
+    const nx = monoCopyOf(ix, mkArrayLit(n.arrElems, n.pos))
     nodeTyRecord(nx, substTyDeep(nodeTyIxOf(ix), monoCgcHoleN, monoCgcHoleT))
     monoHoleListLitTy = -1
     return nx
@@ -5294,7 +5289,7 @@ function monoPinMapLambdas(
       ei = ei + 1
     }
     if !echanged { return ix }
-    return mkArrayLit(es, n.pos)
+    return monoCopyOf(ix, mkArrayLit(es, n.pos))
   }
   if n is Spread {
     const sa = monoPinMapLambdas(n.spdArg, pNames, pElems, pElemTys)
@@ -6808,7 +6803,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
       ei = ei + 1
     }
     if !echanged { return ix }
-    return mkArrayLit(es, n.pos)
+    return monoCopyOf(ix, mkArrayLit(es, n.pos))
   }
   if n is ObjLit {
     const fl: i32[] = []
@@ -6828,7 +6823,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
       oi = oi + 1
     }
     if !ochanged { return ix }
-    return mkObjLit(fl, n.pos)
+    return monoCopyOf(ix, mkObjLit(fl, n.pos))
   }
   // A generic function read as a value (a list element, a field, a binding) is renamed to
   // its instance per enclosing instance, so it gets its own node, typed at this instance (D3909).
@@ -7200,7 +7195,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
       ei = ei + 1
     }
     if !echanged { return ix }
-    return mkArrayLit(es, n.pos)
+    return monoCopyOf(ix, mkArrayLit(es, n.pos))
   }
   if n is ObjLit {
     const fl: i32[] = []
@@ -7220,7 +7215,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
       oi = oi + 1
     }
     if !ochanged { return ix }
-    return mkObjLit(fl, n.pos)
+    return monoCopyOf(ix, mkObjLit(fl, n.pos))
   }
   ix
 }
@@ -9336,98 +9331,12 @@ function monoInstanceFor(
   0
 }
 
-// The field names and field type-names of the struct type `tname` names, appended in
-// parallel to `outNames` / `outTexts`; false when `tname` names no struct. A declared
-// alias is read off the `TypeDecl`'s own `FieldDef` nodes, so each field type arrives as
-// an arena `TypeRef`; an inline shape falls back to `annObjFieldSplit`.
-function monoStructFieldTypes(
-  tname: string,
-  outNames: string[],
-  outTexts: string[],
-) {
-  if tname == "" { return false }
-  let i = 0
-  while i < monoProgStmts.length {
-    const s = P.nodes[monoProgStmts[i]]
-    if s is TypeDecl {
-      if s.tdName == tname {
-        const fs = s.tdFields
-        let j = 0
-        while j < fs.length {
-          const fd = P.nodes[fs[j]]
-          if fd is FieldDef {
-            outNames.push(fd.fdName)
-            outTexts.push(tyNameOf(fd.fdType))
-          }
-          j = j + 1
-        }
-        return true
-      }
-    }
-    i = i + 1
-  }
-  if annGenAppSpanEnds(tname) {
-    if monoGenAliasFieldTypes(tname, outNames, outTexts) { return true }
-  }
-  annObjFieldSplit(tname, outNames, outTexts) == 1
-}
-
-// `monoStructFieldTypes` for a generic alias applied at `app` (`R<string>`): each field's
-// declared type with the alias's parameters replaced by the application's arguments. False
-// when no generic `TypeDecl` has that head, or the arity differs (D3909).
-function monoGenAliasFieldTypes(
-  app: string,
-  outNames: string[],
-  outTexts: string[],
-): boolean {
-  const lt = gaeLtAt(app)
-  const head = gaeHeadNameOf(app, lt)
-  const args: string[] = []
-  gaeSplitArgs(gaeArgsTextOf(app, lt), args)
-  let i = 0
-  while i < monoProgStmts.length {
-    const s = P.nodes[monoProgStmts[i]]
-    if s is TypeDecl {
-      if annGenAppSpanEnds(s.tdName) {
-        const dlt = gaeLtAt(s.tdName)
-        if gaeHeadNameOf(s.tdName, dlt) == head {
-          const pnames: string[] = []
-          gaeSplitArgs(gaeArgsTextOf(s.tdName, dlt), pnames)
-          if pnames.length != args.length { return false }
-          monoGenAliasFieldsInto(s.tdFields, pnames, args, outNames, outTexts)
-          return true
-        }
-      }
-    }
-    i = i + 1
-  }
-  false
-}
-
-// The `FieldDef`s `fs` of a generic alias into `outNames` / `outTexts`, each type read at
-// its declared spelling and substituted at `pnames := args`.
-function monoGenAliasFieldsInto(
-  fs: i32[],
-  pnames: string[],
-  args: string[],
-  outNames: string[],
-  outTexts: string[],
-) {
-  let j = 0
-  while j < fs.length {
-    const fd = P.nodes[fs[j]]
-    if fd is FieldDef {
-      let raw = ""
-      if fd.fdType >= 0 {
-        raw = declAnnRawTyName(fd.fdType)
-        if raw == "" { raw = tyNameOf(fd.fdType) }
-      }
-      outNames.push(fd.fdName)
-      outTexts.push(gaeApplyFieldTy(raw, pnames, args))
-    }
-    j = j + 1
-  }
-  0
+// Coerces `v`, the element or field at slot `path` of literal `lit`, at the one signature the
+// flow table pins that slot at in frame `ctx`; a nested literal reads its own slots instead.
+function monoCoerceLitPart(v: i32, lit: i32, path: string[], ctx: i32) {
+  const nm = monoSlotPinName(lit, path, ctx)
+  if nm == "" && !monoFlowIsLit(unwrapParen(v)) { return 0 }
+  monoCoerceFnValueName(v, nm, ctx, -1)
 }
 
 // The `fnStmts` slot of the function an `Ident` names — the one resolver every question
@@ -9441,9 +9350,9 @@ function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
 }
 
 // Coerce a generic function value (or a composite of them) flowing into the expected type
-// named by `tname`: materialize the instance for an `Ident` naming a generic, or recurse
-// into an array literal's elements and an object literal's field values against their
-// declared types. The checker has already proved the instantiation valid; this emits it.
+// named by `tname`: materialize the instance for an `Ident` naming a generic. A list or
+// record literal ignores `tname`: each element or field value takes the flow table's pin
+// for its own slot. The checker has already proved the instantiation valid; this emits it.
 function monoCoerceFnValueName(
   exprIx: i32,
   tname: string,
@@ -9453,61 +9362,19 @@ function monoCoerceFnValueName(
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
   if e is ObjLit {
-    // A function-valued struct field. The composite arms are mutually recursive with the
-    // `Ident` arm below, so a generic function nested any depth down a literal
-    // materializes at the type its own slot declares.
-    const fnames: string[] = []
-    const ftexts: string[] = []
-    // A nullable record slot delivers the literal at the record it admits.
-    let known = monoStructFieldTypes(tname, fnames, ftexts)
-    if !known {
-      const rname = peelGroupParens(nonNulBaseOf(tname))
-      known = rname != tname && monoStructFieldTypes(rname, fnames, ftexts)
-    }
-    if known {
-      const flds = e.objFields
-      let k = 0
-      while k < flds.length {
-        const f = P.nodes[flds[k]]
-        if f is FieldInit {
-          let d = 0
-          while d < fnames.length {
-            if fnames[d] == f.fiName {
-              if (
-                monoCoerceFnValueName(
-                  f.fiValue,
-                  normTypeAtom(ftexts[d]),
-                  ctx,
-                  -1,
-                )
-                < 0
-              ) {
-                return -1
-              }
-            }
-            d = d + 1
-          }
-        }
-        k = k + 1
+    for fx in e.objFields {
+      const f = P.nodes[fx]
+      if f is FieldInit {
+        const path: string[] = ["f." + f.fiName]
+        if monoCoerceLitPart(f.fiValue, exprIx, path, ctx) < 0 { return -1 }
       }
     }
     return 0
   }
   if e is ArrayLit {
-    // A nullable function element delivers each non-null element at its function type (D3940).
-    const nulFn = nullClosureArrElem(tname)
-    if nameIsClosureArray(tname) || monoArrElemHoldsFn(tname) || nulFn != "" {
-      // The `[]` cut stays raw here rather than `listElemNameOf`, whose naive paren
-      // strip would mangle a non-wrapped function-type element (`(i32)=>(i32)` →
-      // `i32)=>(i32`). `nameIsClosureArray` implies `nameIsArray`.
-      let elemName = normTypeAtom(arrElemNameRaw(tname))
-      if nulFn != "" { elemName = normTypeAtom(nulFn) }
-      const es = e.arrElems
-      let k = 0
-      while k < es.length {
-        if monoCoerceFnValueName(es[k], elemName, ctx, -1) < 0 { return -1 }
-        k = k + 1
-      }
+    for x in e.arrElems {
+      const path: string[] = ["e"]
+      if monoCoerceLitPart(x, exprIx, path, ctx) < 0 { return -1 }
     }
     return 0
   }
@@ -9796,9 +9663,14 @@ function monoCellSeedIsLamLit(at: i32, ctx: i32): boolean {
   seed >= 0 && P.nodes[seed] is FuncDecl
 }
 
-// A function type spelling whose parameters are the pins of signature `sig` (`p1,p2,;`); the
-// return is not read by the coercions this feeds. "" for an empty signature.
+// A function type spelling whose parameters are the pins of signature `sig` (`p1,p2,;`), returning
+// `void` where no return is known. "" for an empty signature.
 function monoSigFnTyName(sig: string): string {
+  monoSigFnTyNameRet(sig, "void")
+}
+
+// `monoSigFnTyName` returning `ret`, for an exact-return instance (`monoInstanceExactRet`).
+function monoSigFnTyNameRet(sig: string, ret: string): string {
   if sig == "" { return "" }
   let out = "("
   let first = true
@@ -9807,7 +9679,7 @@ function monoSigFnTyName(sig: string): string {
     out = out + pn
     first = false
   }
-  out + ")=>void"
+  out + ")=>" + ret
 }
 
 // For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
@@ -11266,16 +11138,33 @@ function monoLetPins(lf: i32[]): string[] {
 
 // `monoLetPins` for the slot `path` derives from the binding (`fnFlowDeclPathPinSigs`).
 function monoDeclPathPins(lf: i32[], path: string[]): string[] {
-  let pins = fnFlowDeclPathPinSigs(lf[1], path, -1, -1)
+  monoDeclPathKeys(lf, path, false)
+}
+
+// `monoDeclPathPins`, or the returns annotations pin the slot at (`fnFlowDeclPathPinRets`) when
+// `rets`.
+function monoDeclPathKeys(lf: i32[], path: string[], rets: boolean): string[] {
+  let pins = monoDeclPathKeysIn(lf[1], path, -1, -1, rets)
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const it = monoFrameInstTmpl(lf[0])
-    pins = fnFlowDeclPathPinSigs(lf[1], path, it[0], it[1])
+    pins = monoDeclPathKeysIn(lf[1], path, it[0], it[1], rets)
   }
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const none: string[] = []
     return none
   }
   pins
+}
+
+function monoDeclPathKeysIn(
+  d: i32,
+  path: string[],
+  inst: i32,
+  tmpl: i32,
+  rets: boolean,
+): string[] {
+  if rets { return fnFlowDeclPathPinRets(d, path, inst, tmpl) }
+  fnFlowDeclPathPinSigs(d, path, inst, tmpl)
 }
 
 // `[instance, template]` for the generic instance frame `fx` is, or the nearest enclosing frame
@@ -14232,18 +14121,21 @@ function monoPlacePinName(e: i32, kid: string, ctx: i32): string {
   const d = monoPlaceRoot(e, path, 0)
   if d < 0 { return "" }
   if kid != "" { path.push(kid) }
+  monoSlotPinName(d, path, ctx)
+}
+
+// The function type the slot `path` derives from binding or literal `d` delivers at in frame
+// `ctx`: the one signature the flow table pins it at (`monoDeclPathPins`), returning the one
+// return annotations give it, else `void`; "" for no signature or two.
+function monoSlotPinName(d: i32, path: string[], ctx: i32): string {
   const lf: i32[] = [ctx, d]
   const pins = monoDeclPathPins(lf, path)
   if pins.length != 1 { return "" }
-  monoSigFnTyName(pins[0] + ";")
-}
-
-// Whether list type `tname`'s element can hold a function value a level down: a list or a
-// record, whose literal elements are then coerced at the element type too.
-function monoArrElemHoldsFn(tname: string): boolean {
-  if !nameIsArray(tname) { return false }
-  const en = normTypeAtom(arrElemNameRaw(tname))
-  nameIsArray(en) || annGenAppSpanEnds(en) || nameIsBraceSpanEnds(en)
+  const rets = monoDeclPathKeys(lf, path, true)
+  if rets.length != 1 || rets[0] == FF_PIN_DECLINE {
+    return monoSigFnTyName(pins[0] + ";")
+  }
+  monoSigFnTyNameRet(pins[0] + ";", rets[0])
 }
 
 // The value type of map type `ty`, or -1 for any other type.
