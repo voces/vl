@@ -10174,6 +10174,15 @@ the game instead of +6.0%, but the trap becomes `unreachable` with the note "a c
 trap" rather than the bounds trap the guide and `std:bytes` promise. Keeping the message was
 chosen; the smaller form is one line if that trade is wanted.
 
+**Amended 2026-10-15 (D4782): the trap branch ends in `unreachable` AFTER its bounds trap.**
+A branch that fell through left the index unchecked on that path, so `-O` kept every later
+check of it. Under wasmtime that cost `bench/arrays/reverse-inplace` 55% (1787 → 2769 ms on
+an M1). With the closing `unreachable`, binaryen drops the repeated checks and shares one trap
+block, and the message is still the bounds trap. Against the branch alone: reverse-inplace
+2784 → 1721 ms on wasmtime and 2713 → 2259 on V8, matmul 2152 → 1586 and 1747 → 1513, and
+sunpa's `track` 121.1 → 121.6 ms on V8, where `select` reads 150.8. The price is `struct-soa`
+on wasmtime, +5%. All variants and benches are in D4782.
+
 ## `u32` and `u64` are value types (owner rulings U1–U4, 2026-10-03 and 2026-10-04)
 
 **VL gets `u32` and `u64` (U1 = A, 2026-10-03).** They are value types beside `i32` and

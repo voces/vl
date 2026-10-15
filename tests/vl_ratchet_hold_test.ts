@@ -29,21 +29,35 @@ const HELD_CODES = [
   "arena-scan-outside-pass",
 ];
 
+/** Sibling modules off disk, the role the editor's workspace reader plays. */
+const diskReader = (key: string): string | undefined => {
+  try {
+    return Deno.readTextFileSync(key);
+  } catch {
+    return undefined;
+  }
+};
+
 /** The file's lint findings for the ratcheted codes, before any hold. Staged with
- * its real path, the way the editor does (`server.ts`'s `lintPathFor`) — every one of
- * `HELD_CODES` grades `compiler/` alone (docs/internals/lint-rule-scope.md). */
-const rawFindings = () => {
+ * its real path and inside its module graph, the way the editor does (`server.ts`'s
+ * `lintPathFor` + `lintInGraph`) — every one of `HELD_CODES` grades `compiler/` alone
+ * (docs/internals/lint-rule-scope.md), and `sentinel-index-unguarded` reads the map
+ * globals the file imports. */
+const lintFindings = async (src: string) => {
   const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
+  return await checker.lintInGraph(src, REL, TARGET, diskReader);
+};
+const rawFindings = async () => {
   const src = Deno.readTextFileSync(TARGET);
-  return { src, diags: checker.lint(src, REL) };
+  return { src, diags: await lintFindings(src) };
 };
 
 Deno.test({
   name: "ratchet-hold: typecheck.vl's ratcheted findings all sit at or under baseline",
   ignore: !ENABLED,
-  fn: () => {
+  fn: async () => {
     invalidateRatchetBaselines();
-    const { diags } = rawFindings();
+    const { diags } = await rawFindings();
     const held = diags.filter((d) => HELD_CODES.includes(String(d.code)));
     if (held.length < 100) {
       throw new Error(
@@ -62,12 +76,39 @@ Deno.test({
   },
 });
 
+// The control for the graph staging above: typecheck.vl reads map globals it imports
+// (`fnDeclIx` from check_write_scan.vl), which one file's text cannot tell from a list, and
+// hands ladder defaults to functions it imports (`zeroBytesBindScan` to `rcwModOf`), which
+// one file's text cannot tell from an undeclared call. Without the graph both are hits the
+// CLI's graph lint, and so the baseline, never counts.
+Deno.test({
+  name: "ratchet-hold: the editor reads an imported map global and function the way the CLI does",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = Deno.readTextFileSync(TARGET);
+    const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
+    const aloneDs = checker.lint(src, REL);
+    const graphDs = await lintFindings(src);
+    for (const code of ["sentinel-index-unguarded", "kind-ladder-incomplete"]) {
+      const count = (ds: { code?: unknown }[]) => ds.filter((d) => d.code === code).length;
+      const alone = count(aloneDs);
+      const inGraph = count(graphDs);
+      if (inGraph >= alone) {
+        throw new Error(
+          `want fewer ${code} hits inside the module graph than alone; ` +
+            `alone ${alone}, in graph ${inGraph}`,
+        );
+      }
+    }
+  },
+});
+
 Deno.test({
   name: "ratchet-hold: showHeld brings the same backlog back as greyed hints",
   ignore: !ENABLED,
-  fn: () => {
+  fn: async () => {
     invalidateRatchetBaselines();
-    const { diags } = rawFindings();
+    const { diags } = await rawFindings();
     const held = diags.filter((d) => HELD_CODES.includes(String(d.code)));
     const out = applyRatchetHold(diags, TARGET, ROOT, true);
     const shown = out.filter((d) => HELD_CODES.includes(String(d.code)));
@@ -88,7 +129,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     invalidateRatchetBaselines();
-    const { src, diags } = rawFindings();
+    const { src, diags } = await rawFindings();
     const before = diags.filter((d) => d.code === "kind-ladder-incomplete").length;
 
     // A two-arm ladder over a closed set with no default — the shape the rule names —
@@ -104,8 +145,7 @@ Deno.test({
       "}",
       "",
     ].join("\n");
-    const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
-    const after = checker.lint(added, REL);
+    const after = await lintFindings(added);
     const ladders = after.filter((d) => d.code === "kind-ladder-incomplete");
     if (ladders.length !== before + 1) {
       throw new Error(
@@ -158,9 +198,9 @@ Deno.test({
 Deno.test({
   name: "ratchet-hold: prefer-interpolation is EXCLUDED (not merely held) for typecheck.vl once its path is staged",
   ignore: !ENABLED,
-  fn: () => {
+  fn: async () => {
     invalidateRatchetBaselines();
-    const { diags } = rawFindings(); // staged with REL, like the editor now does
+    const { diags } = await rawFindings(); // staged with REL, like the editor now does
     const found = diags.filter((d) => d.code === "prefer-interpolation");
     if (found.length !== 0) {
       throw new Error(

@@ -862,6 +862,38 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      through `monoDeclPathPins`); a slot pinned at none or two delivers nothing here, as the
      annotation read did for a non-local root. A capture cell's read is no place root, since
      the cell path delivers it. The concrete half of `monoNotePushDeliveries` stays.
+   - Eighth PR: the list and record literal arms of `monoCoerceFnValueName` stop reading the
+     expected type's spelling (`monoStructFieldTypes`, `monoGenAliasFieldTypes` and
+     `monoArrElemHoldsFn` retire). Each element or field value is delivered at the one
+     signature the table pins the literal's own `e` / `f.<name>` slot at (`monoSlotPinName`),
+     returning the annotation's return when one pins it; a nested literal reads its own slots.
+     Three table changes carry it: a literal banks its slot by declaration (a mono remake
+     records its origin), a pin keeps the return its annotation gives, and a type parameter the
+     checker leaves open takes the closed type of an argument to a bare parameter of that type.
+     The concrete half of `monoNotePushDeliveries` still stays: reading only the slot pin there
+     loses exactly the five hole-lambda push fixtures its ablation loses.
+   - Ninth PR: the concrete half of `monoNotePushDeliveries` retires. A push or `set` reads only
+     the table's pin of the element or value slot (`monoDeliverAtPin`), and a hole lambda it
+     names takes its per-signature instance there (`monoNoteBindDeliveryAt`). The five fixtures
+     did not need a new model. The table had no pin for them because `ffMethod` stored a pushed
+     or `set` value with `ffUnion`, so the edges ran both ways. The element slot then reached
+     the lambda's slot and, through it, every other slot the lambda went to. In `twoLists`,
+     `fs.e` saw the `i32` pin of `gs.e`. In `…-set-into-map-then-called-directly`, `ms.v` saw
+     the `string` pin of the direct call `tw("s")`. Each slot had two pins and answered "".
+     Every slot had its own single pin; the instancing per delivery was already
+     `monoNoteBindDeliveryAt`'s job. A stored value now flows into the slot only (`ffInto`),
+     as an element write and a literal element already did. With the probe on the old
+     element-type read over 15,399 files (`tests/cases` and the distilled corpus), the pin
+     and the element type now agree wherever the element type is concrete, except one
+     return. In `literal-unions/const-literal-widening`, the pin reads `() => void` where the
+     type reads `() => string`. The value there is a lambda literal, which neither delivery
+     path instances. Reverting the edge alone loses exactly the five. The element store
+     `p[k] = v` in `monoWalk` keeps its own concrete element-type read, which no ablation
+     here touched. Two modules of 10,204 built change bytes, with the same output. In
+     `generics/binding-of-generic-function-delivered-as-value` the old code coerced a push
+     twice when pin and element type agreed, and the second pass read `k` through the alias's
+     global. In `closures/hole-lambda-pushed-into-typed-list` the edge alone moves it: `c` no
+     longer shares its pushes' pin, so `fs[0] = c` reads the instance's global directly.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.

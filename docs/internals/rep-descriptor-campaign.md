@@ -3041,3 +3041,181 @@ column: in `tests/cases`, `narrowed-fn-arm-place-call.vl` 239, `narrowed-field-r
 clone); 42 over `_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over
 `(9000000000 | 1 | 9000000001)[]`; in `named/`, the `d3125_*` `(i32 | string | null)[]` 99 and
 `d3140_*` 128. Then items 2, 4 and 5 of §13.14.
+
+### 13.20 A capture cell seeded from another cell's read carries its type
+
+This step takes the 154 `Ident` LEFT-ONLY notes §13.19 left at nodes with no type.
+
+**Correction to §13.19.** Those nodes are not monomorphizer clones. A probe that tags each noted
+node with the pass that minted it puts all 154 in `captureBoxRewrite`, which runs before
+`monomorphize`. The mono-side fix §13.19 proposed would have moved none of them.
+
+**Mechanism.** `cboxWalk`'s `LetDecl` arm rewrites the initialiser before it boxes the binding.
+So in `let d2 = d1`, where `d1` is itself a boxed capture, the initialiser is already `d1[0]` when
+`cboxBoxLet` runs. That `Index` node is minted by the rewrite and has no type; its read's type is
+banked in `cboxReadTy`. The un-annotated branch of `cboxBoxLet` asked only `nodeTyIxOf`, got `-1`,
+and recorded no `cboxCellTy` for `d2`. Every later read of `d2` was then minted untyped too.
+`cboxBoxLet` now falls back to `cboxReadTy` for the initialiser, so the cell gets `T[]` from the
+read it was seeded with.
+
+**Checks.** The "before" seed is origin/master's fixpoint (5df39d4a2), 5,560,369 bytes. The
+"after" seed is 5,560,483 bytes, +114.
+
+* `difftree --identity` over 15,162 files: **10,203 built, 0 differ, 0 uncompared**, and the candidate compiling master's
+  source gives master's fixpoint.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, `regress.vl` moves no cell, and `seed-size --check` passes.
+
+**Counts.** Like-for-like `listRep` notes, measured with §13.17's probe, in `tests/cases`:
+
+| row | before | after |
+| --- | --- | --- |
+| `Ident` LEFT-ONLY | 341 | 187 |
+| other LEFT-ONLY | 2,516 (52 files) | 2,300 (51 files) |
+
+No note was added and no other row moved. The `Ident` notes removed are exactly the 154:
+`hole-lambda-cell-seeded-from-cell-mutate-then-read.vl` 122 and
+`hole-lambda-cell-takes-instance-type.vl` 32. The other LEFT-ONLY drop is one group of 216
+non-`Ident` notes in the second file, at nodes read through the same cell. `named/` was not
+re-swept; its 227 are the `d3125_*` and `d3140_*` notes below, which are typed nodes.
+
+**Next, in order:** 42 over `_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over
+`(9000000000 | 1 | 9000000001)[]`; in `named/`, the `d3125_*` `(i32 | string | null)[]` 99 and
+`d3140_*` 128. These are typed nodes whose type has no column yet, not missing types. Then items
+2, 4 and 5 of §13.14.
+
+### 13.21 A nullable value-union element only an instance forms reads the column
+
+This step takes the `d3125_*` `(i32 | string | null)[]` notes of §13.19's list, the largest
+typed family left in `named/`.
+
+**Mechanism.** `repOfNulElemArray` answered a `(A | B | null)[]` element only when the union
+registry held a row for `A | B | null` itself. A generic body that forms the nullable only at an
+instance registers no such row. In the ablated witness
+
+```
+function t<T>(x: T) {
+  const n = [x].map((e) => {
+    if e != null { return e }
+    return null
+  })
+  for y in n { print(y) }
+}
+const a: i32 | string = 4
+t(a)
+```
+
+the registry holds `i32 | string` alone, so the column was uncovered at `n` while the ladder
+answered `reflist`. Both ingredients are needed: the same body over a parameter `x: i32 | string`,
+or with `n` annotated `(T | null)[]`, registers the nullable and agrees. The box over `A | B`
+already holds `null` as a member atom, which is what `repOfNullable` says for the scalar, and the
+module emits one box heap for both. The arm now also accepts the inner's row.
+
+**Not in this family.** `d3140_*`'s `(i32 | K | L | null)[]` is a different mechanism. Its element
+is a three-member union whose canon id differs from the registered `i32 | string | null` row's,
+so neither the element's row nor the inner's is found. That is a canon question, not a missing
+fallback.
+
+**Checks.** The "before" seed is origin/master's fixpoint (39a5bd855), 5,566,857 bytes. The
+"after" seed is 5,566,871 bytes, +14.
+
+* `difftree --identity` over 15,163 files: **10,204 built, 0 differ, 0 uncompared**,
+  and the candidate compiling master's source gives master's fixpoint.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, `regress.vl` moves no cell, and `seed-size --check` passes.
+
+**Counts.** `listRep` notes, measured with §13.17's probe (each note keyed by node kind and the
+node's type at its instance), on base 7e3864ba5, before §13.20 landed:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| distilled `named/` | `(i32 \| string \| null)[]`, `Ident` / `Call` / other | 99 / 108 / 18 | 0 |
+| distilled `named/` | like-for-like LEFT-ONLY | 2,520 | 2,295 |
+| `tests/cases` | like-for-like LEFT-ONLY | 2,814 | 2,814 |
+
+No note was added and no other row moved in either population. The removed notes are in six
+`d3125_gen_J1_*_P*_5` cells.
+
+**What else the probe shows.** The other `d3125_*` notes, 1,744 of them on `Call` (972 `list`,
+520 `reflist`, 252 `f64list`), are at a call node with no type at its instance, such as
+`mk(x).map(…)` inside a generic body. They are untyped nodes, so they need a producer, as §13.19's
+did, and are not a column question.
+
+**Next, in order:** in `tests/cases`, 42 `Ident` and 51 `Member` over `_[] | null`; 32 `Ident`
+and 32 `ArrayLit` over `(Rec2[] | null | Rec[] | null)[]`; 23 over
+`(9000000000 | 1 | 9000000001)[]`. In `named/`, `d3140_*` 128, and the untyped `d3125_*` `Call`
+nodes above. Then items 2, 4 and 5 of §13.14.
+
+### 13.22 A call an instance re-makes carries its template's type
+
+This step takes the untyped `d3125_*` `Call` notes of §13.21: 1,744 in `named/`, split 972
+`list`, 520 `reflist` and 252 `f64list`.
+
+**Mechanism.** A probe that tags each node with the pass that minted it puts all 1,744 in
+`monomorphize`. The ablated witness is
+
+```
+function mk<T>(x: T): T[] { return [x] }
+function t<T>(x: T) {
+  const n = mk(x)
+  for y in n { print(y) }
+}
+t(1)
+```
+
+Each instance of `t` gets its own copy of every direct generic call, so that the per-instance
+rename of `mk` lands on nodes no other instance sees (`monoCloneGenericCalls`, D2854). The copy
+of a list literal recorded its template's type, and a later pin read substitutes it (D2849). The
+copy of a call recorded nothing, so `nodeTyInOf` answered `-1` at `mk(x)`. It also answered `-1`
+at an outer call that was re-made only because its receiver or an argument was copied, as in
+`mk(x).map(…)`. Both ingredients are needed: a generic call, inside a body that is
+instantiated. The same call in a non-generic `t(x: i32)` is not copied, and `[x].map(…)` in a
+generic body copies no call.
+
+`monoCloneGenericCalls` now gives every re-made node its template's type unless the re-make
+recorded one of its own (a cell read or a lambda value call already does). It reads a hole at the
+instance exactly as the list literal did. The checker computed that type for the template, and
+the instance's pins resolve it as they do for every node the instance shares.
+
+**Checks.** The seed is 5,591,453 bytes, +39 over master's fixpoint at 61cbebd14 (5,591,414).
+
+* Over 15,163 files, 10,204 built, 3 differ and 0 are uncompared. The 3 are
+  `captured-cell-written-alias-{of-generic-two-instances,of-seed-generic,two-representations}.vl`,
+  each +145 bytes with unchanged output. Each has `() => { k = al }` in a generic body, where
+  the tail assignment is the closure's value. The checker types the closure as returning the
+  assigned function, and the non-generic twin (`captured-cell-written-alias-non-generic-outer.vl`)
+  already emits it that way. The re-made instance closure recorded no type, so it was emitted
+  as returning nothing. It now carries the template's type and agrees with the twin; the
+  caller drops the value.
+* D4304 closes. In a generic body, a `match` arm called a destructured field `a` that is
+  spelled like the generic function `a`. The instance's copy of that call, with no type, was
+  read by its spelling. It now carries the field call's type, and the witness prints `5 true`.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, `regress.vl` loses no runs (its seven `rv3310_*` `trap_loads`
+  movements are the same on master's seed), `lint-self` raises no budget, and `seed-size --check`
+  passes.
+
+**Counts.** `listRep` notes from the same probe, keyed by node kind and the node's type at its
+instance. Both probe seeds were built on the same base:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| distilled `named/` | untyped `Call`, LEFT-ONLY | 1,744 (78 files) | 0 |
+| distilled `named/` | like-for-like LEFT-ONLY | 2,295 | 551 |
+| `tests/cases` | untyped `Call`, LEFT-ONLY | 1,094 (18 files) | 41 |
+| `tests/cases` | untyped `Index`, LEFT-ONLY | 766 | 751 |
+| `tests/cases` | like-for-like LEFT-ONLY | 2,444 | 1,376 |
+
+No note was added and no other row moved in either population. `tests/cases` has the same
+mechanism: `for-in-generic-call-result-at-pin.vl` 551, `hole-map-tail-value.vl` 158, and the
+15 `Index` notes in `list-literal-around-generic-call-in-generic-body.vl`.
+
+**What is left untyped.** In `named/`, 90 `d3125_*` notes on an `if` expression that mono
+re-makes around two `[...[x]].map(…)` arms. That node is not one `monoCloneGenericCalls` copies.
+In `tests/cases`, 41 `Call` notes (`entry.vl` 30, `numlitunion-alias-under-closure-type.vl` 6,
+`array-filled-elements.vl` 5); 751 `Index` notes minted by `captureBoxRewrite` in four
+`capture-*` files and `union-copy-captured.vl`; and 9 rest or spread `ArrayLit` packs minted by
+the checker.
+
+**Next, in order:** the untyped remainders above, each by its minting pass; then the typed
+remainders of §13.21 (`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.

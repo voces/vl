@@ -13,6 +13,16 @@ excludes** — an `emitFail`, a sentence, or a delegation to the ladder that own
 fall-through to `-1` / `""` / `false` / `0` satisfies nothing: the kinds nobody handled take an
 answer meant for a different case, and the program compiles.
 
+**A delegation is a call to a top-level function of the module or one it imports.** The rule
+reads one module's text, so the driver stages the import locals that bind a column-0 `function`
+of the module they name (`lintSetImportedFns`, built beside `sentinel-index-unguarded`'s imported
+map globals), in the CLI's graph lint and the editor's `lintInGraph` alike. Without it, moving a
+callee to another module turned every ladder handing it the rest into a hit: the L9 carves raised
+the baseline on pure moves (#3798, #3802), and the fix took 30 such entries out of it.
+`scripts/ladder-census.vl` resolves `import { … } from "./x"` against its sibling sources the
+same way, and the two agree on the count. An imported table read is not a call and still fires
+(`tests/vl_kind_ladder_test.ts`'s `imported.vl`).
+
 Four defects in one week are the population it was built from: no `nulvariant` rung (#2400), no
 `IfStmt` arm ([D981](inventory/D981.md)), no unbounded-`TyVar` arm
 ([D1004](inventory/D1004.md)/[D1221](inventory/D1221.md)), no module-block arm
@@ -32,7 +42,8 @@ So a `match` counts as an incomplete ladder, reported **at the `match` keyword**
 * its named arms are at least two, and are all members of one closed set;
 * those arms do not already cover the whole set (if they do, the `_` is unreachable);
 * and the `_` arm's body fails the same named-default test the `if` form applies — no refusal
-  channel, no sentence of twelve characters or more, no call to another function of the module.
+  channel, no sentence of twelve characters or more, no call to another function of the module
+  or one it imports.
 
 An or-pattern (`A | B => …`) contributes each alternative. The `_` arm's region is its own line,
 plus the block it opens when the body is braced across lines — the shape `vl fmt` writes for

@@ -1,0 +1,27 @@
+#!/bin/sh
+# GNU `timeout` for a host without coreutils (macOS). gate.sh appends this directory to the
+# END of PATH, so a real `timeout` always wins and this runs only where none exists.
+# Supports what the tree uses: `timeout [-k DUR] DUR CMD [ARG...]`, DUR in s/m/h/d.
+# Exit status: 124 when DUR expired, 128+N when CMD died of signal N, else CMD's own.
+exec perl -e '
+  use strict; use Time::HiRes qw(alarm);
+  sub secs { my %u = ("" => 1, s => 1, m => 60, h => 3600, d => 86400);
+             $_[0] =~ /^([0-9.]+)([smhd]?)$/ or do { print STDERR "timeout: bad duration $_[0]\n"; exit 125 };
+             $1 * $u{$2} }
+  my $k = 0;
+  if (@ARGV && $ARGV[0] eq "-k") { shift; $k = secs(shift) }
+  @ARGV >= 2 or do { print STDERR "usage: timeout [-k DUR] DUR CMD [ARG...]\n"; exit 125 };
+  my $t = secs(shift);
+  my $pid = fork;
+  defined $pid or do { print STDERR "timeout: fork: $!\n"; exit 125 };
+  if (!$pid) { exec { $ARGV[0] } @ARGV; print STDERR "timeout: $ARGV[0]: $!\n"; exit($!{ENOENT} ? 127 : 126) }
+  my $expired = 0;
+  $SIG{ALRM} = sub { $expired = 1; kill "TERM", $pid;
+                     if ($k) { $SIG{ALRM} = sub { kill "KILL", $pid }; alarm $k } };
+  for my $s (qw(TERM INT HUP)) { $SIG{$s} = sub { kill $s, $pid } }
+  alarm $t if $t > 0;
+  my $r; do { $r = waitpid($pid, 0) } until $r == $pid || ($r == -1 && !$!{EINTR});
+  my $st = $?;
+  exit 124 if $expired;
+  exit($st & 127 ? 128 + ($st & 127) : $st >> 8);
+' -- "$@"
