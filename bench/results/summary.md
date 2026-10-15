@@ -9,7 +9,6 @@ machine during this sweep. Re-run `bench/run.sh` on an idle box for authoritativ
 | cpu pinning | `taskset -c 2-5` |
 | rustc | rustc 1.96.0 (ac68faa20 2026-05-25) |
 | deno | deno 2.9.0 (stable, release, x86_64-unknown-linux-gnu) |
-| python | Python 3.11.2 |
 | vl repo commit | 1d3a8559 |
 | VL execution | prebuilt `.wasm` (`vl run x.wasm`); compile time is a separate column |
 | ratios | computed on **startup-subtracted** times |
@@ -22,7 +21,6 @@ machine during this sweep. Re-run `bench/run.sh` on an idle box for authoritativ
 | vl | 4.51 |
 | vl-run-src | 10.05 |
 | deno | 14.53 |
-| python | 9.77 |
 
 `vl-run-src` is compile+run of an empty program in one process; `vl` is a prebuilt module.
 
@@ -42,57 +40,55 @@ Outliers (a single sample >1.5x its own configuration's median): **13 of 1270 sa
 
 ## Results
 
-Times are medians in **ms**, startup-subtracted. `py(norm)` is Python's reduced-N time
-multiplied by that benchmark's scale factor; `-` means the benchmark's own audit says no
-scalar factor is valid. `vl/rust` is HEADROOM, not a loss.
+Times are medians in **ms**, startup-subtracted. `vl/rust` is HEADROOM, not a loss.
 
-| benchmark | rust | vl | vl -O3 | deno | py(raw) | py(norm) | vl/rust | vl/deno | vl/deno(min) | py/vl | verdict | flags |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|
-| strings/str-eq | 38.7 | 936.1 | 931.8 | 136.1 | 86.0 | 688.4 | 24.19 | 6.88 | 6.89 | 0.7 | PRIORITY-LOSS | RUST-GAP-24x, PYTHON-RED-ALERT-0.7x, STARTUP>10%(python) |
-| strings/substr-search | 38.4 | 661.4 | 712.6 | 128.0 | 138.7 | 138.7 | 17.21 | 5.17 | 5.13 | 0.2 | PRIORITY-LOSS | RUST-GAP-17x, PYTHON-RED-ALERT-0.2x, STARTUP>10%(deno) |
-| arrays/matmul | 115.2 | 1666.4 | 1692.6 | 595.7 | 1818.6 | 32371.3 | 14.47 | 2.80 | 2.68 | 19.4 | PRIORITY-LOSS | RUST-GAP-14x |
-| algorithms/lambda-hot | 123.0 | 565.7 | 187.7 | 221.6 | 1069.6 | 26740.3 | 4.60 | 2.55 | 2.51 | 47.3 | PRIORITY-LOSS | IDIOM-GAP-2.03x(opt), O3-GAP-3.01x |
-| collections/set-ops | 434.2 | 948.6 | 945.8 | 409.6 | 232.2 | 928.9 | 2.18 | 2.32 | 2.26 | 1.0 | PRIORITY-LOSS | PYTHON-RED-ALERT-1.0x |
-| arrays/struct-soa | 110.1 | 1168.5 | 1209.7 | 519.8 | 2140.8 | 17839.3 | 10.61 | 2.25 | 2.29 | 15.3 | PRIORITY-LOSS | RUST-GAP-11x |
-| collections/map-string | 774.8 | 1386.2 | 1273.6 | 684.2 | 381.5 | 1526.1 | 1.79 | 2.03 | 1.94 | 1.1 | PRIORITY-LOSS | PYTHON-RED-ALERT-1.1x |
-| collections/word-freq | 225.4 | 1219.4 | 1215.8 | 716.0 | 205.0 | 2050.2 | 5.41 | 1.70 | 1.73 | 1.7 | LOSS | PYTHON-RED-ALERT-1.7x |
-| arrays/sort-heap | 343.3 | 904.0 | 918.9 | 597.2 | 4261.0 | 17044.0 | 2.63 | 1.51 | 1.52 | 18.9 | LOSS |  |
-| arrays/reverse-inplace | 237.5 | 1752.0 | 1856.2 | 1163.7 | 1770.5 | 28327.5 | 7.38 | 1.51 | 1.58 | 16.2 | LOSS |  |
-| algorithms/spectralnorm | 1046.7 | 2614.6 | 2442.8 | 1765.5 | 976.5 | 97647.0 | 2.50 | 1.48 | 1.51 | 37.3 | LOSS |  |
-| collections/map-i32 | 422.7 | 1262.7 | 1229.0 | 951.7 | 380.4 | 1521.5 | 2.99 | 1.33 | 1.35 | 1.2 | LOSS | PYTHON-RED-ALERT-1.2x |
-| algorithms/nbody | 1479.9 | 3352.7 | 3532.5 | 2582.7 | 1202.7 | 120267.5 | 2.27 | 1.30 | 1.26 | 35.9 | LOSS |  |
-| strings/int-format | 384.6 | 843.1 | 807.7 | 666.0 | 195.2 | 5857.4 | 2.19 | 1.27 | 1.26 | 6.9 | LOSS |  |
-| recursion/mutual | 577.3 | 829.0 | 827.2 | 682.3 | 1334.6 | 66729.4 | 1.44 | 1.22 | 1.22 | 80.5 | PAR |  |
-| recursion/flatcall-inlined | 1032.9 | 1484.7 | 1462.0 | 1232.3 | 615.0 | 61496.7 | 1.44 | 1.20 | 1.21 | 41.4 | PAR |  |
-| recursion/flatcall | 1018.7 | 1486.7 | 1470.0 | 1237.0 | 905.4 | 90540.5 | 1.46 | 1.20 | 1.18 | 60.9 | PAR |  |
-| collections/struct-field | 459.3 | 1051.9 | 359.9 | 899.0 | 560.5 | 112103.4 | 2.29 | 1.17 | 1.19 | 106.6 | PAR | O3-GAP-2.92x |
-| arith/floatops | 515.0 | 422.6 | 424.6 | 379.5 | 403.9 | 40387.0 | 0.82 | 1.11 | 1.10 | 95.6 | PAR |  |
-| strings/slice-extract | 305.4 | 1326.1 | 1316.3 | 1235.3 | 609.4 | 18282.7 | 4.34 | 1.07 | 1.08 | 13.8 | PAR | IDIOM-GAP-1.30x(opt) |
-| algorithms/mandelbrot | 2871.0 | 3373.8 | 3069.1 | 3171.1 | 1510.1 | 96649.3 | 1.18 | 1.06 | 1.07 | 28.6 | PAR |  |
-| arith/bitops | 299.4 | 334.8 | 319.4 | 330.1 | 384.1 | 38411.6 | 1.12 | 1.01 | 1.02 | 114.7 | PAR |  |
-| arith/intdivmod | 250.9 | 510.5 | 501.2 | 508.5 | 96.6 | 9656.9 | 2.03 | 1.00 | 1.02 | 18.9 | PAR | IDIOM-GAP-2.03x(opt) |
-| algorithms/dispatch-table | 151.5 | 421.9 | 290.5 | 421.7 | 1296.6 | 12966.0 | 2.79 | 1.00 | 1.01 | 30.7 | PAR | O3-GAP-1.45x |
-| arith/f64-accum | 573.8 | 558.6 | 566.8 | 574.6 | 74.0 | 7397.6 | 0.97 | 0.97 | 0.98 | 13.2 | PAR | STARTUP>11%(python) |
-| arith/i32-accum | 63.3 | 341.1 | 352.1 | 353.5 | 219.4 | 21936.1 | 5.39 | 0.96 | 0.96 | 64.3 | PAR | IDIOM-GAP-2.16x(opt) |
-| strings/char-scan | 270.8 | 1526.1 | 1317.1 | 1663.7 | 2213.1 | 22131.1 | 5.64 | 0.92 | 0.89 | 14.5 | PAR | O3-GAP-1.16x |
-| algorithms/binarytrees | 4318.7 | 4776.7 | 5355.0 | 5477.2 | 3707.6 | 59322.3 | 1.11 | 0.87 | 0.89 | 12.4 | PAR |  |
-| arith/mixed-width | 185.0 | 223.1 | 515.0 | 278.9 | 188.4 | 18837.9 | 1.21 | 0.80 | 0.78 | 84.4 | PAR | O3-REGRESSION-2.31x |
-| recursion/treewalk | 595.0 | 694.9 | 720.0 | 906.4 | 2421.4 | - | 1.17 | 0.77 | 0.72 | - | WIN | PY-UNNORMALISABLE |
-| collections/struct-array-scan | 234.8 | 706.5 | 726.8 | 967.3 | 554.0 | 11080.2 | 3.01 | 0.73 | 0.68 | 15.7 | WIN | IDIOM-GAP-1.35x(opt) |
-| arrays/binsearch | 1112.6 | 1655.7 | 2032.8 | 2371.4 | 1116.4 | 22327.0 | 1.49 | 0.70 | 0.69 | 13.5 | WIN | O3-REGRESSION-1.23x |
-| algorithms/map-filter-reduce | 137.7 | 642.1 | 575.1 | 969.6 | 705.1 | 7050.7 | 4.66 | 0.66 | 0.68 | 11.0 | WIN |  |
-| arrays/struct-aos | 500.5 | 1722.2 | 1766.5 | 2656.0 | 2580.8 | 21506.0 | 3.44 | 0.65 | 0.65 | 12.5 | WIN |  |
-| arith/convert | 329.8 | 289.1 | 296.3 | 449.0 | 236.1 | 23607.9 | 0.88 | 0.64 | 0.65 | 81.7 | WIN |  |
-| strings/token-count | 345.7 | 1517.9 | 1615.8 | 2455.7 | 1244.1 | 24882.9 | 4.39 | 0.62 | 0.61 | 16.4 | WIN |  |
-| recursion/fib | 571.2 | 962.4 | 933.3 | 1578.7 | 660.2 | 19166.4 | 1.69 | 0.61 | 0.62 | 19.9 | WIN |  |
-| arrays/fill-sum | 106.9 | 970.1 | 1024.6 | 1592.0 | 1799.7 | 17996.8 | 9.07 | 0.61 | 0.61 | 18.6 | WIN |  |
-| collections/struct-alloc | 709.0 | 298.9 | 282.3 | 490.7 | 324.2 | 7278.4 | 0.42 | 0.61 | 0.59 | 24.4 | WIN |  |
-| arith/i64-accum | 117.7 | 355.3 | 318.3 | 625.9 | 233.4 | 23337.6 | 3.02 | 0.57 | 0.54 | 65.7 | WIN | IDIOM-GAP-1.16x(main_global) |
-| arith/bitcount | 236.2 | 177.5 | 185.3 | 320.1 | 119.8 | 11977.1 | 0.75 | 0.55 | 0.57 | 67.5 | WIN |  |
-| arrays/push-growth | 115.2 | 589.6 | 494.2 | 1316.4 | 1441.4 | 7207.2 | 5.12 | 0.45 | 0.45 | 12.2 | WIN | O3-GAP-1.19x |
-| recursion/deeprec | 688.4 | 1036.4 | 1049.7 | 2344.3 | 821.3 | - | 1.51 | 0.44 | 0.44 | - | WIN | PY-UNNORMALISABLE |
-| recursion/ackermann | 270.3 | 498.4 | 510.1 | 1386.2 | 1602.7 | 41028.1 | 1.84 | 0.36 | 0.36 | 82.3 | WIN |  |
-| recursion/tailcall | 122.9 | 621.1 | 620.4 | 1756.6 | 828.1 | - | 5.05 | 0.35 | 0.36 | - | WIN | PY-UNNORMALISABLE |
+| benchmark | rust | vl | vl -O3 | deno | vl/rust | vl/deno | vl/deno(min) | verdict | flags |
+|---|--:|--:|--:|--:|--:|--:|--:|---|---|
+| strings/str-eq | 38.7 | 936.1 | 931.8 | 136.1 | 24.19 | 6.88 | 6.89 | PRIORITY-LOSS | RUST-GAP-24x |
+| strings/substr-search | 38.4 | 661.4 | 712.6 | 128.0 | 17.21 | 5.17 | 5.13 | PRIORITY-LOSS | RUST-GAP-17x, STARTUP>10%(deno) |
+| arrays/matmul | 115.2 | 1666.4 | 1692.6 | 595.7 | 14.47 | 2.80 | 2.68 | PRIORITY-LOSS | RUST-GAP-14x |
+| algorithms/lambda-hot | 123.0 | 565.7 | 187.7 | 221.6 | 4.60 | 2.55 | 2.51 | PRIORITY-LOSS | IDIOM-GAP-2.03x(opt), O3-GAP-3.01x |
+| collections/set-ops | 434.2 | 948.6 | 945.8 | 409.6 | 2.18 | 2.32 | 2.26 | PRIORITY-LOSS |  |
+| arrays/struct-soa | 110.1 | 1168.5 | 1209.7 | 519.8 | 10.61 | 2.25 | 2.29 | PRIORITY-LOSS | RUST-GAP-11x |
+| collections/map-string | 774.8 | 1386.2 | 1273.6 | 684.2 | 1.79 | 2.03 | 1.94 | PRIORITY-LOSS |  |
+| collections/word-freq | 225.4 | 1219.4 | 1215.8 | 716.0 | 5.41 | 1.70 | 1.73 | LOSS |  |
+| arrays/sort-heap | 343.3 | 904.0 | 918.9 | 597.2 | 2.63 | 1.51 | 1.52 | LOSS |  |
+| arrays/reverse-inplace | 237.5 | 1752.0 | 1856.2 | 1163.7 | 7.38 | 1.51 | 1.58 | LOSS |  |
+| algorithms/spectralnorm | 1046.7 | 2614.6 | 2442.8 | 1765.5 | 2.50 | 1.48 | 1.51 | LOSS |  |
+| collections/map-i32 | 422.7 | 1262.7 | 1229.0 | 951.7 | 2.99 | 1.33 | 1.35 | LOSS |  |
+| algorithms/nbody | 1479.9 | 3352.7 | 3532.5 | 2582.7 | 2.27 | 1.30 | 1.26 | LOSS |  |
+| strings/int-format | 384.6 | 843.1 | 807.7 | 666.0 | 2.19 | 1.27 | 1.26 | LOSS |  |
+| recursion/mutual | 577.3 | 829.0 | 827.2 | 682.3 | 1.44 | 1.22 | 1.22 | PAR |  |
+| recursion/flatcall-inlined | 1032.9 | 1484.7 | 1462.0 | 1232.3 | 1.44 | 1.20 | 1.21 | PAR |  |
+| recursion/flatcall | 1018.7 | 1486.7 | 1470.0 | 1237.0 | 1.46 | 1.20 | 1.18 | PAR |  |
+| collections/struct-field | 459.3 | 1051.9 | 359.9 | 899.0 | 2.29 | 1.17 | 1.19 | PAR | O3-GAP-2.92x |
+| arith/floatops | 515.0 | 422.6 | 424.6 | 379.5 | 0.82 | 1.11 | 1.10 | PAR |  |
+| strings/slice-extract | 305.4 | 1326.1 | 1316.3 | 1235.3 | 4.34 | 1.07 | 1.08 | PAR | IDIOM-GAP-1.30x(opt) |
+| algorithms/mandelbrot | 2871.0 | 3373.8 | 3069.1 | 3171.1 | 1.18 | 1.06 | 1.07 | PAR |  |
+| arith/bitops | 299.4 | 334.8 | 319.4 | 330.1 | 1.12 | 1.01 | 1.02 | PAR |  |
+| arith/intdivmod | 250.9 | 510.5 | 501.2 | 508.5 | 2.03 | 1.00 | 1.02 | PAR | IDIOM-GAP-2.03x(opt) |
+| algorithms/dispatch-table | 151.5 | 421.9 | 290.5 | 421.7 | 2.79 | 1.00 | 1.01 | PAR | O3-GAP-1.45x |
+| arith/f64-accum | 573.8 | 558.6 | 566.8 | 574.6 | 0.97 | 0.97 | 0.98 | PAR |  |
+| arith/i32-accum | 63.3 | 341.1 | 352.1 | 353.5 | 5.39 | 0.96 | 0.96 | PAR | IDIOM-GAP-2.16x(opt) |
+| strings/char-scan | 270.8 | 1526.1 | 1317.1 | 1663.7 | 5.64 | 0.92 | 0.89 | PAR | O3-GAP-1.16x |
+| algorithms/binarytrees | 4318.7 | 4776.7 | 5355.0 | 5477.2 | 1.11 | 0.87 | 0.89 | PAR |  |
+| arith/mixed-width | 185.0 | 223.1 | 515.0 | 278.9 | 1.21 | 0.80 | 0.78 | PAR | O3-REGRESSION-2.31x |
+| recursion/treewalk | 595.0 | 694.9 | 720.0 | 906.4 | 1.17 | 0.77 | 0.72 | WIN |  |
+| collections/struct-array-scan | 234.8 | 706.5 | 726.8 | 967.3 | 3.01 | 0.73 | 0.68 | WIN | IDIOM-GAP-1.35x(opt) |
+| arrays/binsearch | 1112.6 | 1655.7 | 2032.8 | 2371.4 | 1.49 | 0.70 | 0.69 | WIN | O3-REGRESSION-1.23x |
+| algorithms/map-filter-reduce | 137.7 | 642.1 | 575.1 | 969.6 | 4.66 | 0.66 | 0.68 | WIN |  |
+| arrays/struct-aos | 500.5 | 1722.2 | 1766.5 | 2656.0 | 3.44 | 0.65 | 0.65 | WIN |  |
+| arith/convert | 329.8 | 289.1 | 296.3 | 449.0 | 0.88 | 0.64 | 0.65 | WIN |  |
+| strings/token-count | 345.7 | 1517.9 | 1615.8 | 2455.7 | 4.39 | 0.62 | 0.61 | WIN |  |
+| recursion/fib | 571.2 | 962.4 | 933.3 | 1578.7 | 1.69 | 0.61 | 0.62 | WIN |  |
+| arrays/fill-sum | 106.9 | 970.1 | 1024.6 | 1592.0 | 9.07 | 0.61 | 0.61 | WIN |  |
+| collections/struct-alloc | 709.0 | 298.9 | 282.3 | 490.7 | 0.42 | 0.61 | 0.59 | WIN |  |
+| arith/i64-accum | 117.7 | 355.3 | 318.3 | 625.9 | 3.02 | 0.57 | 0.54 | WIN | IDIOM-GAP-1.16x(main_global) |
+| arith/bitcount | 236.2 | 177.5 | 185.3 | 320.1 | 0.75 | 0.55 | 0.57 | WIN |  |
+| arrays/push-growth | 115.2 | 589.6 | 494.2 | 1316.4 | 5.12 | 0.45 | 0.45 | WIN | O3-GAP-1.19x |
+| recursion/deeprec | 688.4 | 1036.4 | 1049.7 | 2344.3 | 1.51 | 0.44 | 0.44 | WIN |  |
+| recursion/ackermann | 270.3 | 498.4 | 510.1 | 1386.2 | 1.84 | 0.36 | 0.36 | WIN |  |
+| recursion/tailcall | 122.9 | 621.1 | 620.4 | 1756.6 | 5.05 | 0.35 | 0.36 | WIN |  |
 
 ## Extra VL spellings (opt.vl / toplevel.vl / globals.vl / ...)
 

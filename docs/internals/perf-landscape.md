@@ -9,6 +9,11 @@ domination and stdout equivalence before any ratio here was quoted.
 Raw data: `bench/results/{results.json,summary.md,raw.ndjson}`. Deep dives on the five worst
 rows: `bench/findings/*.md`.
 
+> **The CPython column is gone from the harness.** The owner's no-Python directive removed every
+> `bench/**/main.py`, the `py(raw)`/`py(norm)`/`py/vl` columns, `PYTHON-RED-ALERT` and
+> `PY-UNNORMALISABLE`. The CPython figures below are the record of the dated sweeps they came from;
+> no current run reproduces them.
+
 > ## THE 08-02 TABLES ARE SUPERSEDED — read this before quoting a number from §3 or §4
 >
 > Eight PRs have landed against this suite since the 08-02 sweep: **P1** `return_call`
@@ -1380,9 +1385,6 @@ BENCH_REPORT_ONLY=1 bench/run.sh      # regenerate results.json/summary.md from 
   `strings/substr-search` at `PASSES=240` puts Rust at ~195 ms and VL at ~4.3 s (`expect` needs
   re-recording). `strings/str-eq` **cannot** be raised — VL would exceed ~9 s — so its correction
   must stay subtractive.
-- Raise `nPython` ~3x on `arith/f64-accum` (71.8 ms, 17% CPython startup) and `arith/intdivmod`
-  (99.4 ms, 13%) before normalising; their reductions are 100x, so the launcher share is multiplied
-  by 100.
 
 ---
 

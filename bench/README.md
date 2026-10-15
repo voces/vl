@@ -1,13 +1,12 @@
 # VL cross-runtime benchmark suite
 
-Places VL in the performance landscape against three runtimes chosen to **bracket** it, and
+Places VL in the performance landscape against two runtimes chosen to **bracket** it, and
 finds every place VL is slower than it should be.
 
 | runtime | role | what a gap means |
 |---|---|---|
 | **Rust** (rustc 1.96, `-O`) | the native ceiling | the ratio is VL's **headroom**, not a loss. 2-3x off native is respectable for WasmGC; **10x+ is a finding** |
 | **deno / V8** (2.9) | the closest peer — a JIT'd *dynamic* language | VL is statically typed and AOT-compiled. **VL losing to JS is a defect** |
-| **Python 3.11** | the interpreter floor | VL should win by a wide margin. **Under 5x faster is a RED ALERT** |
 | **VL** | the subject | idiomatic spelling first; a hand-optimized variant only where the idiom measured slow |
 
 > The project's explicit goal is that **users must not need hacks to get good performance.**
@@ -28,9 +27,9 @@ bench/
     summary.md               the human table
     raw.ndjson               every individual measurement, unaggregated
   <category>/<name>/
-    main.vl main.rs main.js main.py    the four idiomatic versions
+    main.vl main.rs main.js    the three idiomatic versions
     opt.vl | toplevel.vl | globals.vl | ...   OPTIONAL extra VL spellings
-    meta.json                {"name","category","axis","n","nPython","expect",...}
+    meta.json                {"name","category","axis","n","expect",...}
 ```
 
 `meta.json` keys the harness reads:
@@ -38,7 +37,6 @@ bench/
 | key | meaning |
 |---|---|
 | `expect` | exact stdout every full-N runtime must produce |
-| `expectPython` | exact stdout for the reduced-N Python run (falls back to `expect`) |
 | `expect<Variant>` | exact stdout for `<variant>.vl`, e.g. `expectOpt` for `opt.vl` (falls back to `expect`) |
 | `void` | a non-empty string **excludes** the benchmark from the sweep; the string is the reason and is reproduced verbatim in `summary.md` |
 | `axis` | one-line description of what is being measured |
@@ -90,7 +88,7 @@ every `-O3` number was an `-O0` number.)
 reports the median; `results.json` carries the full vector.
 
 **4. Startup is measured and subtracted.** Every runtime is timed on an empty program
-(`fn main(){}` / `function main(){} main()` / empty `.js` / empty `.py`). All ratios in
+(`fn main(){}` / `function main(){} main()` / empty `.js`). All ratios in
 `summary.md` are computed on **startup-subtracted (net)** times, so a 40ms benchmark compares
 languages rather than process launchers. Raw times are kept in `results.json`. Any benchmark where
 a runtime's startup exceeds 10% of its measured time is flagged `STARTUP><n>%(<runtime>)` — treat
@@ -105,25 +103,14 @@ Four sibling hw threads (2 physical cores) is the compromise, and the choice is 
 `results.json` under `method.taskset`.
 
 **6. stdout is verified on every single run.** Each timed run's stdout is `cmp`'d against
-`expect` (or `expectPython` / `expect<Variant>`). A mismatch aborts that configuration, records
+`expect` (or `expect<Variant>`). A mismatch aborts that configuration, records
 `MISMATCH` with the offending output, and **no timing from it ever reaches the results table**.
 
 **7. Failures are results.** A benchmark that will not build or run in a language gets a
 `BUILD-FAIL` / `RUN-FAIL` row with the captured stderr rather than being skipped. A benchmark VL
 cannot run is the most important row in the table.
 
-**8. Python's reduced N is normalized explicitly, never silently.** Python is given a smaller N so
-it does not force the other three to be too short to measure. `meta.json` states the reduction in
-prose, so the scalar factor is transcribed into a table at the top of the report generator inside
-`run.sh` (`PYSCALE`), each entry carrying its own justification. `summary.md` prints **both**
-`py(raw)` and `py(norm) = raw × factor`. Three benchmarks (`recursion/deeprec`,
-`recursion/tailcall`, `recursion/treewalk`) have `None`: their own adversarial audits establish
-that no single scalar factor is valid — `deeprec`/`tailcall` change *both* depth and repeat count
-so Python is running a different workload, and `treewalk`'s Python time is dominated by the
-one-time tree build. Those print `-` and are flagged `PY-UNNORMALISABLE`. **A reduced-N Python
-number is never compared against a full-N number.**
-
-**9. Dead-code elimination and folded loops** are the responsibility of each benchmark (every one
+**8. Dead-code elimination and folded loops** are the responsibility of each benchmark (every one
 consumes and prints its accumulator, and each `meta.json` records an N-vs-2N or exact-work-ratio
 scale check). Benchmarks that could not be made honest are marked `void` in their `meta.json` and
 excluded here with the reason printed.
@@ -190,13 +177,6 @@ several `main.rs` files are **auto-vectorized** by LLVM (documented per-benchmar
 `meta.json:audit`) — on those the ratio is largely SIMD width, not scalar codegen quality, because
 VL emits no SIMD. Read those with the audit note in hand.
 
-### versus Python — the floor
-
-`py(norm) / vl` is how many times faster VL is than CPython. Under **5x** is flagged
-`PYTHON-RED-ALERT-<n>x`. Under **1x** means the interpreter is beating the compiled language,
-which is only ever explicable when Python's builtin is a C routine (e.g. `str.find` in
-`strings/substr-search`) — and even then it is a finding about VL's builtin.
-
 ### VL-internal flags
 
 | flag | meaning |
@@ -206,7 +186,6 @@ which is only ever explicable when Python's builtin is a C routine (e.g. `str.fi
 | `O3-REGRESSION-<n>x` | `-O3` made it n× **slower** |
 | `O3-NOOP` | the `-O3` module is byte-identical to `-O0` |
 | `STARTUP><n>%(<rt>)` | that runtime's empty-program time is >10% of its measurement |
-| `PY-UNNORMALISABLE` | no valid scalar factor for Python's reduced N |
 
 ---
 
