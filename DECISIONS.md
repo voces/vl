@@ -10252,6 +10252,27 @@ a real discriminant and get no hint. The string-against-integer-literal check re
 its behaviour. Where the operand's declared type is a single record containing `B`, the
 compiler still answers by the declared type (D4058).
 
+## `is` over a list tests every element (owner ruling (a), 2026-10-14) — D4771
+
+**The rule.** `xs is K[]` is true when every element of `xs` fits `K`, at every nesting
+depth; an empty list fits every list type. It extends D3885 from record fields to list
+elements, and lowers to a loop over the elements.
+
+```vl
+type K = 0 | 1
+const b: i32[] = [5, 6]
+print(b is K[])   // false
+```
+
+**Why.** `i32[]` and `K[]` share one list rep, so a test that read the rep folded to true
+for any list. Under D3885 `is` asks whether the value fits, and a list fits when its
+elements do.
+
+**What it keeps.** A `string[]` tested against a string literal set does not narrow to
+`S[]` in the then-branch, because strings and atoms are stored differently; the same reason
+D4058 keeps a record's declared type. A box union's list arm is still tested by its tag
+(D4778, D4779).
+
 ## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
 
 **The rule.** A union of records whose arms share a field name is legal, whether or not a
