@@ -104,3 +104,4 @@ D4854-D4857  lane-L2  2026-10-15  L2 §13.29 (box-element lists): D4854 filed cl
 D4862-D4865  lane-L2  2026-10-15  L2 §13.30 (a kept-apart list join re-joined at the pin): D3367 closed, D4862 filed open (a type parameter's list and a concrete list collapse at a nullable-element pin)
 D4866-D4869  lane-L2  2026-10-15  L2 §13.31 (small listRep DIFF classes): D4866 filed closed (a call's return re-check records one instance's destination on a generic body's shared list literal)
 D4878-D4881  lane-L2  2026-10-15  L2 §13.32 (the listRep `-> none` class): none filed
+D4894-D4897  lane-D4894  2026-10-15  closing D4894 (a list literal of list literals with different leaves): D4894 filed closed; D4895, D4896 filed open
