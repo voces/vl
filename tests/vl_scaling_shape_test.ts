@@ -2328,6 +2328,32 @@ shardTest({
   },
 });
 
+// D4942's GROWTH pair. One generic anywhere turns on the function-value flow table and the
+// monomorphizer's walk over the WHOLE program, so every function here, which reads one shared
+// list, pushes a local one and writes a module `let`, is a site for the flow table's class
+// merge and for the walk's frame questions. 1,600 functions against 400, so linear reads 4.
+const genGenericProgram = (n: number): string => {
+  const o = ["let G: i32[] = [1, 2, 3]", "let T = 0", "function id<V>(v: V): V { v }"];
+  for (let i = 0; i < n; i++) {
+    o.push(`function f${i}(): i32 {`, "  const a = G[0]", "  const xs: i32[] = []", "  xs.push(a)");
+    o.push("  T = T + 1", `  xs[0] + ${i}`, "}");
+  }
+  o.push("let s = 0");
+  for (let i = 0; i < n; i++) o.push(`s = s + f${i}()`);
+  o.push("print(id(s) + T)");
+  return o.join("\n") + "\n";
+};
+
+// Fuel reads 4.02; master read 30.88, from `ffMerge` copying the larger
+// class into the smaller with a linear membership test per fact, and from per-site walks of the
+// whole program in `monomorphize` (`monoFrameHolds`, `monoTopFrameOf`, `monoTopFnUnnamed`).
+axis(
+  "functions in a program with one generic",
+  5.0,
+  "A flow-table merge (`ffMerge`, compiler/fn_flow_shadow.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
+  (d) => twoFiles(d, genGenericProgram(1600), genGenericProgram(400)),
+);
+
 // THE FUEL GRADER'S CONTROL. The same program at 20x the statements against 1x: twenty times
 // the work by construction, so it must red a 2.5 bar, and only a broken fuel reading (no
 // `[fuel]` line parsed, a constant, both arms metered as one) can pass it. Its many arm is
