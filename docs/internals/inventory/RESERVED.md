@@ -105,3 +105,4 @@ D4862-D4865  lane-L2  2026-10-15  L2 §13.30 (a kept-apart list join re-joined a
 D4866-D4869  lane-L2  2026-10-15  L2 §13.31 (small listRep DIFF classes): D4866 filed closed (a call's return re-check records one instance's destination on a generic body's shared list literal)
 D4878-D4881  lane-L2  2026-10-15  L2 §13.32 (the listRep `-> none` class): none filed
 D4894-D4897  lane-D4894  2026-10-15  closing D4894 (a list literal of list literals with different leaves): D4894 filed closed; D4895, D4896 filed open
+D4902-D4905  lane-D4896  2026-10-15  closing D4896 (a boolean-leaf list union member keyed onto `i32[]`): D4896 closed, D4902 filed open (a string-literal-union list literal delivered into `f64[] | K[]`)
