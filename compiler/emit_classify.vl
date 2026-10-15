@@ -142,6 +142,7 @@ import {
   joinRowTy,
   letNullHoleFilledTy,
   letNullHoleUnfilled,
+  listIsFitsAcrossReps,
   luDeclPosOf,
   mapDeliveryRecorded,
   mapRetagAllRows,
@@ -759,6 +760,7 @@ import {
   unTyIx,
   unVarCount,
   unVarStart,
+  vbAtomListUsed,
   vbBoolListTop,
   vbF32Used,
   vbF64Used,
@@ -9002,6 +9004,9 @@ function pushNarrowIs(name: string, variant: string, condIx: i32) {
   const ity = isVarTyIxOf(condIx)
   const cn = P.nodes[condIx]
   if cn is IsExpr && isFitsAcrossTagRows(variant, ity, cn.isObj) {
+    return narrowTop
+  }
+  if cn is IsExpr && listIsFitsAcrossReps(nodeTyIxOf(cn.isObj), ity) {
     return narrowTop
   }
   pushNarrowRep(name, isVariantSpelling(variant, ity), ity, -1)
@@ -21287,7 +21292,9 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       const fiVa = narrowVariants[fiSl]
       if fiVa != "" {
         if nameIsArray(fiVa) {
-          if isUName(arrElemNameRaw(fiVa)) { return "union" }
+          // A literal union's element is an atom, never a box (D4907).
+          const fiAtoms = tyIsLitUnionArray(narrowTys[fiSl])
+          if isUName(arrElemNameRaw(fiVa)) && !fiAtoms { return "union" }
         }
       }
     }
@@ -32806,6 +32813,13 @@ export function scalarTagOf(atom: string) {
 // settled before `emitModule` runs. Conditional rather than a flat 14, since a flat lift
 // would renumber every tag in a program with no `u8[]`, though any base keeps the three bands disjoint.
 export function uAtomBandTop(): i32 {
+  if vbAtomListUsed { return atomListCode() + 1 }
+  atomListCode()
+}
+
+// The code of the atom-leaf list arm (`atomListArmTag`): the first code above every other
+// value-atom code, so a module with no such arm keeps its numbering.
+function atomListCode(): i32 {
   if mTwinExtra > 0 { return mTwinCodeBase() + mTwinExtra }
   if vbBoolListTop >= 0 { return mTwinCodeBase() }
   if mIntMonoArmUsed { return 17 }
@@ -32961,6 +32975,25 @@ export function boolListArmTag(d: i32): i32 {
   if d < 0 || d > vbBoolListTop { return -1 }
   if d == 0 { return scalarTagOfKind(17) }
   scalarTagOfKind(18 + d)
+}
+
+// The box tag a list of string-literal atoms takes where some union also holds another list
+// on the i32 storage, or -1 in a module with no such union, where it tags as `i32[]` does.
+export function atomListArmTag(): i32 {
+  if !vbAtomListUsed { return -1 }
+  scalarTagOfKind(atomListCode())
+}
+
+// Whether `ty` is a one-layer list of string-literal atoms, `K[]` or `(K | null)[]` (D4906).
+export function tyIsAtomLeafList(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyArray) { return false }
+  let e = t.aElem
+  if e < 0 || e >= T.tys.length { return false }
+  const et = T.tys[e]
+  if et is TyNullable { e = et.nInner }
+  tyIsLitUnion(e)
 }
 
 // The globally-stable tag of the ref-element-array arm whose interned reflist slot is `slot`,
@@ -35029,7 +35062,20 @@ export function markValueUnionAtoms(name: string) {
     }
     i = i + 1
   }
+  if cov && unionMixesAtomList(mems) { vbAtomListUsed = true }
   0
+}
+
+// Whether the arms `mems` hold a list of string-literal atoms beside another i32-storage list.
+function unionMixesAtomList(mems: i32[]): boolean {
+  let atom = false
+  let other = false
+  for m in mems {
+    if unMemAtomKind(m) == 7 {
+      if tyIsAtomLeafList(m) { atom = true } else { other = true }
+    }
+  }
+  atom && other
 }
 
 // Interns the reflist wrapper slot for every ref-element-array arm of the union `name` — its
