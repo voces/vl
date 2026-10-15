@@ -1,0 +1,491 @@
+// The notes a refused assignment, argument or return appends to its sentence: `letAssignMsg`,
+// and the boolean-into-number, char-literal-into-string, `u8` storage-list and literal-member
+// notes that it and the argument and return refusals share. Two tables live here: the right
+// sides stored into a `u8` cell (`noteU8StoreRhs`), and the `filled(n, 0)` calls `check --fix`
+// answers with `zeroBytes(n)`, with the modules that bind `zeroBytes` themselves.
+// `mismatchNotesReset` clears both per program; nothing here imports the checker.
+import {
+  ArrayLit,
+  Call,
+  CharLit,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  ImportDecl,
+  Index,
+  LetDecl,
+  NumLit,
+  ObjLit,
+  P,
+  Param,
+  StrLit,
+  annTsWrittenOf,
+  i32ToStr,
+  tsFnParamNames,
+} from "./ast"
+import { callDeclFnIx, calleeNameOf } from "./check_callee"
+import { nodeTyIxOf } from "./check_node_tys"
+import { fillIsLitZero } from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import { rcwModOf } from "./check_record_writes"
+import { demangleName } from "./check_suggest"
+import {
+  isNumeric,
+  isStringTy,
+  primNameOf,
+  tyIsOrHasBoolean,
+} from "./check_ty_shape"
+import {
+  T,
+  TY_NULL,
+  TyArray,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  canonIntLexeme,
+  nomNameOfTy,
+  objFieldType,
+  primNameStr,
+  softenLitTy,
+  tyToStr,
+} from "./check_types"
+import { tyIsNumUnion } from "./check_union_mint"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import { srcmapPathOf } from "./srcmap"
+
+// The right-hand nodes of index writes into a `u8` cell, whose refusal names the byte width
+// rather than the `i32` the cell reads as; kept by node so the pin's re-ask finds it too.
+let u8StoreRhs: i32[] = []
+// The `std:array` `filled(n, 0)` calls delivered where a `u8[]` is wanted: their refusal carries
+// `CODE_ZERO_BYTES`, which `check --fix` answers with `zeroBytes(n)`.
+export let zeroBytesFixIx: i32[] = []
+// The modules binding `zeroBytes` other than by importing `std:bytes`'s, over the first
+// `zeroBytesScanned` nodes (`zeroBytesBindScan`).
+let zeroBytesBindMods: i32[] = []
+let zeroBytesScanned = 0
+
+// The boolean-into-number note for the first field of record `g` that owes one against `w`.
+function boolForNumberFieldNote(g: TyObj, w: TyObj): string {
+  const names = w.objFieldNames
+  let i = 0
+  while i < names.length {
+    const gf = objFieldType(g, names[i])
+    if gf >= 0 {
+      const note = boolForNumberNoteOf(
+        gf,
+        w.objFieldTypes[i],
+        "field `" + names[i] + "`",
+      )
+      if note != "" { return note }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Records `rhs` when `lhs` is an index into a list whose element is stored as `u8`.
+export function noteU8StoreRhs(lhs: i32, rhs: i32) {
+  if lhs < 0 || rhs < 0 { return 0 }
+  const l = P.nodes[lhs]
+  if !(l is Index) { return 0 }
+  const at = nodeTyIxOf(l.idxArr)
+  if at < 0 { return 0 }
+  const a = T.tys[at]
+  if !(a is TyArray) { return 0 }
+  if primNameOf(a.aElem) != "u8" { return 0 }
+  if !u8StoreRhsHas(rhs) { u8StoreRhs.push(rhs) }
+  0
+}
+function u8StoreRhsHas(ix: i32): boolean {
+  let i = 0
+  while i < u8StoreRhs.length {
+    if u8StoreRhs[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The fix a `boolean` offered where a number is wanted owes: it never converts implicitly, so
+// the note names the explicit `as` that does, at the wanted width, or "" for any other pair.
+// A list of booleans against a list of numbers is asked of its elements.
+export function boolForNumberNote(got: i32, want: i32): string {
+  boolForNumberNoteOf(got, want, "it")
+}
+// `boolForNumberNote` for right-hand side `srcIx`, at the byte width when it is stored into a
+// `u8` cell.
+function boolForNumberNoteAt(srcIx: i32, got: i32, want: i32): string {
+  if srcIx >= 0 && u8StoreRhsHas(srcIx) {
+    if primNameOf(softenLitTy(got)) == "boolean" {
+      return " — a `boolean` is not a number; convert it with `b as u8`"
+    }
+  }
+  boolForNumberNoteOf(got, want, "it")
+}
+function boolForNumberNoteOf(got: i32, want: i32, what: string): string {
+  if got < 0 || want < 0 { return "" }
+  const ga = T.tys[got]
+  const wa = T.tys[want]
+  if ga is TyArray {
+    if wa is TyArray {
+      return boolForNumberNoteOf(ga.aElem, wa.aElem, "each element")
+    }
+  }
+  if ga is TyObj {
+    if wa is TyObj { return boolForNumberFieldNote(ga, wa) }
+  }
+  if !tyIsOrHasBoolean(got) { return "" }
+  const wn = primNameStr(primNameOf(want))
+  if wn != "i32" && wn != "u8" && wn != "i64" && wn != "f32" && wn != "f64" {
+    return ""
+  }
+  // A brand is named itself: `b as A1` converts into it, where `b as i32` would be refused.
+  let tn = nomNameOfTy(want)
+  if tn == "" { tn = wn }
+  " — a `boolean` is not a number; convert " + what + " with `b as " + tn + "`"
+}
+
+// The direct spelling's sentence for a value that does not fit its destination, in one home
+// because two sites have to say it and must not drift: `checkLetDeclNode`'s own gate and
+// `validateLetCstrs`' pin. `name` is the fork: a declaration can name the binding, a write
+// to an already declared place cannot. The single-quote-into-`string` footnote lives here too.
+export function charLitForStringNote(srcIx: i32, want: i32): string {
+  if !isStringTy(want) { return "" }
+  if srcIx < 0 || srcIx >= P.nodes.length { return "" }
+  const n = P.nodes[srcIx]
+  if n is CharLit {
+    let inner = n.charText
+    if inner.length >= 2 { inner = inner.slice(1, inner.length - 1) }
+    let quotable = true
+    let i = 0
+    while i < inner.length {
+      if inner[i] == '"' || inner[i] == '\\' { quotable = false }
+      i = i + 1
+    }
+    const lead = " — a char literal is its i32 code point; use double quotes for a string"
+    if quotable { return lead + ": \"" + inner + "\"" }
+    return lead
+  }
+  ""
+}
+
+// The fix a list of numbers delivered where a `u8[]` is wanted owes: `u8` is a storage type,
+// so no generic builds one and no value list converts to one. Names `filled` when `srcIx` is
+// its call, and notes a literal-zero fill for `check --fix`. A record is asked of its fields.
+export function storageListNote(srcIx: i32, got: i32, want: i32): string {
+  const body = storageListBody(srcIx, got, want)
+  if body == "" { return "" }
+  " — " + body
+}
+function storageListBody(srcIx: i32, got: i32, want: i32): string {
+  if got < 0 || want < 0 { return "" }
+  const ga = T.tys[got]
+  const wa = T.tys[want]
+  if ga is TyObj {
+    if wa is TyObj { return storageListFieldBody(srcIx, ga, wa) }
+  }
+  if !(ga is TyArray) || !(wa is TyArray) { return "" }
+  if primNameStr(primNameOf(wa.aElem)) != "u8" { return "" }
+  const el = softenLitTy(ga.aElem)
+  if !isNumeric(el) || primNameStr(primNameOf(el)) == "" { return "" }
+  const src = "`" + tyToStr(got) + "`"
+  const make = "`zeroBytes(n)` from \"std:bytes\", which returns a `u8[]`"
+  const fill = storageFilledFill(parenPeelIx(srcIx))
+  if fill >= 0 {
+    const lead = "`filled` builds "
+      + src
+      + " here: `u8` is a storage type, so a generic's `T` is never `u8`. "
+    if fillIsLitZero(fill) {
+      const call = parenPeelIx(srcIx)
+      if zeroBytesNameFree(call) && !i32ListHas(zeroBytesFixIx, call) {
+        zeroBytesFixIx.push(call)
+      }
+      return lead + "For zeroed bytes use " + make
+    }
+    return lead + "Make the bytes with " + make + ", and fill it by a loop"
+  }
+  let conv = ""
+  if primNameStr(primNameOf(el)) != "i32" {
+    conv = ", converting each with `as! u8`"
+  }
+  "`u8` is a storage type, so "
+    + src
+    + " is never a `u8[]`; make one with "
+    + make
+    + ", and copy each element in by index"
+    + conv
+}
+
+// `storageListBody` for the first field of record `g` that owes one against `w`, reading the
+// field's own value when `srcIx` is the record literal.
+function storageListFieldBody(srcIx: i32, g: TyObj, w: TyObj): string {
+  const lit = parenPeelIx(srcIx)
+  const names = w.objFieldNames
+  let i = 0
+  while i < names.length {
+    const gf = objFieldType(g, names[i])
+    if gf >= 0 {
+      const body = storageListBody(
+        objLitFieldValue(lit, names[i]),
+        gf,
+        w.objFieldTypes[i],
+      )
+      if body != "" { return "field `" + names[i] + "`: " + body }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The value node of field `name` in record literal `ix`, or -1.
+function objLitFieldValue(ix: i32, name: string) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const o = P.nodes[ix]
+  if !(o is ObjLit) { return -1 }
+  for f in o.objFields {
+    const fi = P.nodes[f]
+    if fi is FieldInit {
+      if fi.fiName == name { return fi.fiValue }
+    }
+  }
+  -1
+}
+
+// The fill argument of `ix` when it is a two-argument call of `std:array`'s `filled`, else -1.
+function storageFilledFill(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const cn = P.nodes[ix]
+  if !(cn is Call) { return -1 }
+  if cn.callArgs.length != 2 { return -1 }
+  if demangleName(calleeNameOf(ix)) != "filled" { return -1 }
+  const d = callDeclFnIx(cn, ix)
+  if d < 0 || srcmapPathOf(rcwModOf(d)) != "std:array" { return -1 }
+  cn.callArgs[1]
+}
+
+// Whether no binding named `zeroBytes` but an import of `std:bytes`'s exists anywhere in the
+// module of node `at`, so rewriting a call there to `zeroBytes(n)` cannot reach another one.
+// A file scan rather than the scope chain: a module binding declared later is not yet in scope.
+function zeroBytesNameFree(at: i32): boolean {
+  const m = rcwModOf(at)
+  if m < 0 { return false }
+  zeroBytesBindScan()
+  !i32ListHas(zeroBytesBindMods, m)
+}
+
+// Extends `zeroBytesBindMods` over the nodes added since the last call, so the arena is
+// walked once however many calls ask.
+function zeroBytesBindScan() {
+  const zb = "zeroBytes"
+  let i = zeroBytesScanned
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    let hit = false
+    if n is LetDecl {
+      hit = demangleName(n.letName) == zb
+    } else if n is FuncDecl {
+      hit = demangleName(n.fnName) == zb
+    } else if n is Param {
+      hit = demangleName(n.parName) == zb
+    } else if n is ForRange {
+      hit = demangleName(n.frVar) == zb
+    } else if n is ForIn {
+      hit = demangleName(n.fiVar) == zb || demangleName(n.fiVar2) == zb
+    } else if n is ImportDecl {
+      hit = n.impPath != "std:bytes" && strListHas(n.impLocals, zb)
+    }
+    if hit {
+      const hm = rcwModOf(i)
+      if !i32ListHas(zeroBytesBindMods, hm) { zeroBytesBindMods.push(hm) }
+    }
+    i = i + 1
+  }
+  zeroBytesScanned = P.nodes.length
+  0
+}
+
+export function letAssignMsg(
+  srcIx: i32,
+  got: i32,
+  want: i32,
+  name: string,
+  annIx: i32,
+) {
+  if name == "" {
+    return "cannot assign "
+      + tyToStr(got)
+      + " to "
+      + tyToStr(want)
+      + charLitForStringNote(srcIx, want)
+      + boolForNumberNoteAt(srcIx, got, want)
+      + storageListNote(srcIx, got, want)
+      + litMemberNote(srcIx, want, 8)
+  }
+  // An object literal (`{}` / `{x: 1}`) assigned to a map type is a category error, not a
+  // width mismatch — point at the fix (`Map()`) rather than the opaque
+  // "cannot assign {} to … of type {[string]: …}".
+  const wantT = T.tys[want]
+  let objToMap = false
+  if wantT is TyMap {
+    if srcIx >= 0 {
+      const srcN = P.nodes[srcIx]
+      if srcN is ObjLit { objToMap = true }
+    }
+  }
+  if objToMap {
+    return "An object literal isn't a map value — construct a map with "
+      + "`Map()` (or a set with `Set()`), e.g. `let m: {[string]: i32} = Map()`"
+  }
+  // Both sides numeric but not assignable ⇒ a lossy/narrowing edge the lossless-only
+  // implicit-widening rule won't take silently. Explain the lossiness rather than
+  // the opaque "cannot assign i32 to f32".
+  if (isNumeric(got) || tyIsNumUnion(got)) && isNumeric(want) {
+    return tyToStr(got)
+      + " doesn't fit in "
+      + tyToStr(want)
+      + " — the conversion is lossy and must be made explicit with `as` "
+      + "(write `x as "
+      + tyToStr(want)
+      + "`)"
+  }
+  "cannot assign "
+    + tyToStr(got)
+    + " to '"
+    + name
+    + "' of type "
+    + annotTyStr(want, annIx)
+    + charLitForStringNote(srcIx, want)
+    + boolForNumberNote(got, want)
+    + storageListNote(srcIx, got, want)
+    + litMemberNote(srcIx, want, 8)
+}
+
+// The first string or integer literal in source `srcIx` that its destination in `want`, a
+// literal union reached through list elements and record fields, does not admit, as a sentence
+// tail naming its path from the source root; "" when every literal fits or none is reached.
+export function litMemberNote(srcIx: i32, want: i32, depth: i32): string {
+  litMemberAt(srcIx, want, depth, "")
+}
+
+function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
+  if srcIx < 0 || want < 0 || depth <= 0 { return "" }
+  const x = parenPeelIx(srcIx)
+  if x < 0 || x >= P.nodes.length { return "" }
+  const n = P.nodes[x]
+  let w = T.tys[want]
+  let wIx = want
+  if w is TyNullable {
+    wIx = w.nInner
+    if wIx < 0 { return "" }
+    w = T.tys[wIx]
+  }
+  if n is ArrayLit && w is TyArray {
+    let i = 0
+    while i < n.arrElems.length {
+      const r = litMemberAt(
+        n.arrElems[i],
+        w.aElem,
+        depth - 1,
+        path + "[" + i32ToStr(i) + "]",
+      )
+      if r != "" { return r }
+      i = i + 1
+    }
+    return ""
+  }
+  if n is ObjLit && w is TyObj {
+    for f in n.objFields {
+      const fn = P.nodes[f]
+      if fn is FieldInit {
+        const k = strListIndexOf(w.objFieldNames, fn.fiName)
+        if k >= 0 {
+          let sub = fn.fiName
+          if path != "" { sub = path + "." + fn.fiName }
+          const r = litMemberAt(fn.fiValue, w.objFieldTypes[k], depth - 1, sub)
+          if r != "" { return r }
+        }
+      }
+    }
+    return ""
+  }
+  if !(w is TyUnion) { return "" }
+  let kind = ""
+  let text = ""
+  let shown = ""
+  if n is StrLit {
+    kind = "str"
+    shown = n.strText
+    if shown.length >= 2 { text = shown.slice(1, shown.length - 1) }
+  } else if n is NumLit {
+    kind = "int"
+    shown = n.numText
+    text = canonIntLexeme(n.numText)
+  } else {
+    return ""
+  }
+  // The literal members, `null` aside; any other member means the union is not a literal set.
+  let members = ""
+  let listed = 0
+  let lits = 0
+  for m in w.uMembers {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind == kind && mt.litText == text { return "" }
+      lits = lits + 1
+      if listed < 8 {
+        if members != "" { members = members + " | " }
+        if mt.litKind == "str" {
+          members = members + "\"" + mt.litText + "\""
+        } else {
+          members = members + mt.litText
+        }
+        listed = listed + 1
+      }
+    } else if m != TY_NULL {
+      return ""
+    }
+  }
+  if lits == 0 { return "" }
+  if lits > listed {
+    members = members + " … and " + i32ToStr(lits - listed) + " more"
+  }
+  let named = tyToStr(wIx)
+  if named == members || named.indexOf("|") >= 0 {
+    named = ""
+  } else {
+    named = named + ": "
+  }
+  let at = ""
+  if path != "" { at = " (at `" + path + "`)" }
+  " — `" + shown + "` is not one of " + named + members + at
+}
+
+// `tyToStr(want)`, except that a function type whose annotation `annIx` named its parameters
+// shows those names: the author's spelling in a sentence, never in a type's identity.
+function annotTyStr(want: i32, annIx: i32) {
+  const t = T.tys[want]
+  if !(t is TyFunc) || annIx < 0 { return tyToStr(want) }
+  const n = t.fnParamTypes.length
+  const names = tsFnParamNames(annTsWrittenOf(annIx), n, 0)
+  if names.length == 0 { return tyToStr(want) }
+  let s = "("
+  let i = 0
+  while i < n {
+    if i > 0 { s = s + ", " }
+    s = s + names[i] + ": " + tyToStr(t.fnParamTypes[i])
+    i = i + 1
+  }
+  s + ") => " + tyToStr(t.fnRet)
+}
+
+// Clears the `u8` store and `zeroBytes` tables, before a program's check.
+export function mismatchNotesReset() {
+  u8StoreRhs = []
+  zeroBytesFixIx = []
+  zeroBytesBindMods = []
+  zeroBytesScanned = 0
+  0
+}

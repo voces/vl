@@ -35,7 +35,6 @@ import {
   cmpF32LitAdopts,
   dstIntWidth,
   exprIsNumLit,
-  fillIsLitZero,
   floatIntrWidth,
   intLitIsNegated,
   intLitLexemeOf,
@@ -188,7 +187,6 @@ import {
   addNode,
   adoptNodeTok,
   annTsOf,
-  annTsWrittenOf,
   arenaEditBumpCount,
   arenaEditCount,
   arenaEditSlotAt,
@@ -301,7 +299,6 @@ import {
   stmtAlwaysExits,
   stmtBraceNodes,
   stmtBraceTails,
-  tsFnParamNames,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -310,7 +307,6 @@ import {
   tsText,
   tsToName,
   tsToNameSubst,
-  tsWritesParamNames,
   udTsRootAt,
   ufcsAliasAtSite,
   ufcsAliasInScope,
@@ -343,7 +339,6 @@ import {
   sidOfNode,
 } from "./symbols"
 import {
-  expInfPinLets,
   isvalCol,
   isvalEnd,
   isvalLine,
@@ -433,7 +428,6 @@ import {
   tyTopLevelSplit,
 } from "./tyname"
 // The file a node came from, named in a record-covariance refusal that crosses modules.
-import { srcmapPathOf } from "./srcmap"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import {
   stdRecvLoad,
@@ -455,11 +449,60 @@ import {
   blockHasBareReturn,
   breakValueAt,
   fnResultUnconsumed,
+  joinLeavesOf,
   tailPushBlockTail,
   tailPushIfArms,
   tailPushMatchArms,
+  tailValueLeaves,
   ucCompute,
 } from "./check_unconsumed"
+import {
+  recAdAt,
+  recAdBound,
+  recAdDecl,
+  recAdDst,
+  recAdElem,
+  recAdErrAt,
+  recAdErrMsg,
+  recAdForced,
+  recAdForcedDecl,
+  recAdLoose,
+  recAdMentions,
+  recAdNoAdopt,
+  recAdOrigDecl,
+  recAdOrigFn,
+  recAdOrigName,
+  recAdOrigNode,
+  recAdOrigTy,
+  recAdOwn,
+  recAdPinDecl,
+  recAdPinSpell,
+  recAdPinTy,
+  recAdPinned,
+  recAdRaising,
+  recAdWidth,
+} from "./check_rec_adopt_rows"
+import { inlayHole, recordRedundantAnnot } from "./check_redundant_annot"
+import {
+  isWideLitJoin,
+  mkWideStrLitTy,
+  nodeHasWideStrLit,
+  nodeWideStrLitText,
+  noteWideLitNode,
+  wideLitByNode,
+  wideLitTyIxs,
+  wideLitsReset,
+} from "./check_wide_lits"
+import {
+  boolForNumberNote,
+  charLitForStringNote,
+  letAssignMsg,
+  litMemberNote,
+  mismatchNotesReset,
+  noteU8StoreRhs,
+  storageListNote,
+  zeroBytesFixIx,
+} from "./check_mismatch_notes"
 import {
   PrimName,
   RC_ELEM,
@@ -508,7 +551,6 @@ import {
   cUserTypesVer,
   cVariantMemberTyIxSet,
   cVariantMemberTyIxs,
-  canonIntLexeme,
   ctxKeepsLitUnion,
   demangleMsg,
   gaAppArgCount,
@@ -586,7 +628,6 @@ import {
   tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyIsParamHole,
-  tyIsPlainScalar,
   tyIsPrimNamed,
   tyIsStructBearingUnion,
   tyIxIsView,
@@ -610,7 +651,6 @@ import {
   tyReachesSelf,
   tyReachesUnion,
   tyRefusesArrayDemand,
-  tyRepVaries,
   tySame,
   tyScalarBaseIs,
   tyToEmitName,
@@ -995,7 +1035,6 @@ import {
   tyIsFnArmUnion,
   tyIsIntMatchScrut,
   tyIsLitUnionLike,
-  tyIsOrHasBoolean,
   tyIsOrNestsV128,
   tyIsU8ArrayTy,
   tyIsV128Brand,
@@ -1504,6 +1543,7 @@ import {
   holeNameIsParamOf,
   holeParamBesideConcrete,
   holeTpJoinNames,
+  joinByWant,
   joinRowsReset,
   joinTyParamNull,
   keptParamUnion,
@@ -1654,6 +1694,7 @@ import {
   builtinMethodNamesOf,
   callArgPlaces,
   callDeclFnIx,
+  calleeNameOf,
   calleeReset,
   crIsDispatchSite,
   findFnDeclIn,
@@ -1915,17 +1956,6 @@ let arrDefCallTy: i32[] = []
 // Recorded as an unordered pair and read by `arrDefHoleToI32` before it reaches for `i32`.
 let holeLinkA: i32[] = []
 let holeLinkB: i32[] = []
-
-// The right-hand nodes of index writes into a `u8` cell, whose refusal names the byte width
-// rather than the `i32` the cell reads as; kept by node so the pin's re-ask finds it too.
-let u8StoreRhs: i32[] = []
-// The `std:array` `filled(n, 0)` calls delivered where a `u8[]` is wanted: their refusal carries
-// `CODE_ZERO_BYTES`, which `check --fix` answers with `zeroBytes(n)`.
-let zeroBytesFixIx: i32[] = []
-// The modules binding `zeroBytes` other than by importing `std:bytes`'s, over the first
-// `zeroBytesScanned` nodes (`zeroBytesBindScan`).
-let zeroBytesBindMods: i32[] = []
-let zeroBytesScanned = 0
 
 // The sentence forms, one per (wording, predicate) pair the fourteen arms use. Separate values
 // even where two share a wording — `set`'s key retries the newtype rule while its value asks
@@ -4095,8 +4125,6 @@ let tpApartConcrete = false
 let tpIfJoinAt: {[i32]: i32} = Map()
 // The type an `if` or `match` used as a value is delivered to, seeded by `seedExpected`.
 let joinWantAt: {[i32]: i32} = Map()
-// The joins typed by their destination rather than their arms.
-let joinByWant: {[i32]: boolean} = Map()
 // The if-expressions a binding, an argument or a return delivers (`tpIfMarkOk`).
 let tpIfOkAt: {[i32]: boolean} = Map()
 
@@ -4975,7 +5003,6 @@ export function initChecker() {
   genFnCstrBusy = false
   tpIfJoinAt = Map()
   joinWantAt = Map()
-  joinByWant = Map()
   tpIfOkAt = Map()
   recordJoinMinted = false
   T.scopes = []
@@ -5072,10 +5099,7 @@ export function initChecker() {
   letCstr.seq = []
   bmCstr.seq = []
   cstrSeqNext = 0
-  u8StoreRhs = []
-  zeroBytesFixIx = []
-  zeroBytesBindMods = []
-  zeroBytesScanned = 0
+  mismatchNotesReset()
   bmCstr.got = []
   bmCstr.want = []
   bmCstr.ctx = []
@@ -5294,8 +5318,7 @@ export function initChecker() {
   luPosByTy = []
   luIxCursor = 0
   luPending = []
-  wideLitTyIxs = []
-  wideLitByNode = []
+  wideLitsReset()
   luHiddenTyIxs = []
   luSynthDone = false
   gaAppTyIxs = []
@@ -9214,18 +9237,6 @@ function crCondDropWalk(ix: i32, acc: string): string {
   out
 }
 
-// The callee's written name, for the diagnostic. `"?"` when the callee is neither a
-// bare name nor a member access (a parenthesised or computed callee).
-function calleeNameOf(callIx: i32) {
-  const cn = P.nodes[callIx]
-  if cn is Call {
-    const cf = P.nodes[cn.callFn]
-    if cf is Ident { return cf.identName }
-    if cf is Member { return cf.memProp }
-  }
-  "?"
-}
-
 // Did an assignment, rather than a call, retire this narrowing? Both causes write the same
 // `npInvBy` column and need different answers, so the question has one home. A direct `w.f = e` is
 // a statement the emit walk passes over exactly as it passes `f = e`, and the emit half retires
@@ -10699,33 +10710,6 @@ export function identFlushPending() {
 export function identModuleDeclOf(name: string) {
   if symDeclScope.length == 0 { return -1 }
   symDeclScope[0][name] ?? -1
-}
-
-// Whether `ty` is an unresolved hole an inlay hint should suppress: a generic type variable, an
-// error placeholder, or a union whose members are all holes — `any | any` is not a type VL can
-// spell, and a union with any resolved member keeps its hint. Deliberately not extended to
-// `TyNullable`, whose `_ | null` is determined. Depth-bounded; exhausting the budget keeps it.
-export function inlayHole(ty: i32) { inlayHoleDeep(ty, 16) }
-
-function inlayHoleDeep(ty: i32, depth: i32): boolean {
-  if ty < 0 { return true }
-  if depth <= 0 { return false }
-  const t = T.tys[ty]
-  if t is TyVar { return true }
-  if t is TyErr { return true }
-  if t is TyUnion {
-    const ms = t.uMembers
-    // An empty member list is not a union of holes but a degenerate arena entry, and answering
-    // "hole" for it would suppress on a shape this rule has nothing to say about.
-    if ms.length == 0 { return false }
-    let i = 0
-    while i < ms.length {
-      if !inlayHoleDeep(ms[i], depth - 1) { return false }
-      i = i + 1
-    }
-    return true
-  }
-  false
 }
 
 // ── the node-anchored findings' span ─────────────────────────────────────────
@@ -13484,152 +13468,6 @@ function redunReset() {
   redunType = []
   redunTok = []
   redunRet = []
-  0
-}
-
-// Whether a literal at `ix` takes its type from a declared destination rather than its own parts:
-// any record literal, and a list literal with a `null`, record or list literal element.
-function literalTypedByAnnot(ix: i32) {
-  if P.nodes[ix] is ObjLit { return true }
-  for e in arrayLitElemsOf(ix) {
-    if P.nodes[e] is NullLit || P.nodes[e] is ObjLit || P.nodes[e] is ArrayLit {
-      return true
-    }
-  }
-  false
-}
-
-// Whether the value the initializer `ix` yields keeps its annotated type only through what the
-// annotation supplies: a literal typed by it in any tail, a list literal holding a union or a
-// function, an alias to a list of more than scalars, a generic call's result holding a union, or
-// a cast to more than a scalar. Each builds differently without the annotation (D3800).
-function initTypedByAnnot(ix: i32): boolean {
-  const leaves: i32[] = []
-  tailValueLeaves(ix, leaves)
-  for lf in leaves {
-    if literalTypedByAnnot(lf) { return true }
-    const n = P.nodes[lf]
-    const t = nodeTyOf(lf)
-    if n is ArrayLit {
-      for e in n.arrElems {
-        if tyRepVaries(nodeTyOf(e), 4) { return true }
-      }
-    } else if n is Call {
-      const cn = P.nodes[n.callFn]
-      if cn is Ident {
-        const fd = fnDeclIx[cn.identName] ?? -1
-        if fnIsGenericDecl(fd) && tyRepVaries(t, 4) { return true }
-      }
-    } else if n is AsExpr {
-      if !tyIsPlainScalar(t) { return true }
-    } else if n is Ident {
-      const el = tyArrayElemIx(t)
-      if el >= 0 && !tyIsPlainScalar(el) { return true }
-    }
-  }
-  false
-}
-
-// Whether the declaration `fd` is a generic function: a type parameter, or a parameter without
-// a type, which each call site solves.
-function fnIsGenericDecl(fd: i32): boolean {
-  if fd < 0 || fd >= P.nodes.length { return false }
-  const n = P.nodes[fd]
-  if n is FuncDecl {
-    if n.fnTyParams.length > 0 { return true }
-    for p in n.fnParams {
-      const pn = P.nodes[p]
-      if pn is Param {
-        if pn.parType < 0 { return true }
-      }
-    }
-  }
-  false
-}
-
-// The elements of the list literal at `ix`, or none when it is not one.
-function arrayLitElemsOf(ix: i32): i32[] {
-  const nd = P.nodes[ix]
-  if nd is ArrayLit { return nd.arrElems }
-  []
-}
-
-// Record `let <name>: T = init` as redundant when init's own type == the annotation.
-// `declIx` is the LetDecl node (for its name token); `n` carries letName/letInit.
-function recordRedundantAnnot(
-  n: LetDecl,
-  declIx: i32,
-  initTy: i32,
-  annot: i32,
-) {
-  // Only a concrete init type that renders identically to the annotation. A hole (an empty
-  // `[]`/`Map()`, a lone `null`), an error, or `never` is never redundant.
-  if inlayHole(initTy) { return 0 }
-  if isNeverTy(initTy) { return 0 }
-  if annot == TY_ERR { return 0 }
-  if !tyEq(initTy, annot) { return 0 }
-  // An exported binding's annotation documents the module's API, so it is never redundant (D3597).
-  if declExported(declIx) { return 0 }
-  // One that typed an export's parameter is what types it (D3817).
-  if i32ListHas(expInfPinLets, declIx) { return 0 }
-  // A record literal takes the annotation's record type, which can be the nominal type an `is` or
-  // an equality reads, and a list literal holding `null` or a literal of its own takes its element
-  // type from it: the initializer is typed BY the annotation, so the comparison is circular (D3597).
-  if n.letInit >= 0 && initTypedByAnnot(n.letInit) { return 0 }
-  // A call of a function that took this annotation as its result is typed by it, not redundant.
-  if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
-  // So is an `if` or `match` whose literal arms took the annotation's type.
-  if n.letInit >= 0 && joinTypedByWant(n.letInit) { return 0 }
-  // Without its annotation a `const` bound to a string literal holds that literal's type, so a
-  // `string` annotation there is what lets it compare with other strings (D2198).
-  if n.letKw == "const" && n.letInit >= 0 {
-    const lin = P.nodes[n.letInit]
-    if lin is StrLit { return 0 }
-    if isWideLitJoin(nodeUnwidenedTyOf(n.letInit)) { return 0 }
-  }
-  const nameTok = declNameTokOf(declIx)
-  if nameTok < 0 { return 0 }
-  if jwTokIsGenerated(nameTok) { return 0 }
-  // The fix deletes the annotation, so the span runs from just after the name to the assignment
-  // `=`. That `=` is found by scanning the tokens between, the annotation being multi-token: it is
-  // the first `EQUAL` at bracket depth 0 that is not part of `=>`, i.e. not followed by `>`.
-  let eqTok = -1
-  let depth = 0
-  // Stops at that `=`: a scan to the end of the token stream would cost every annotated
-  // binding the whole program (D2686).
-  let t = nameTok + 1
-  while t < P.toks.length && eqTok < 0 {
-    const kd = P.toks[t].kind
-    if kd == "LPAREN" || kd == "LBRACK" || kd == "LBRACE" {
-      depth = depth + 1
-    } else if kd == "RPAREN" || kd == "RBRACK" || kd == "RBRACE" {
-      depth = depth - 1
-    } else if depth == 0 && kd == "EQUAL" {
-      let isArrow = false
-      if t + 1 < P.toks.length {
-        if P.toks[t + 1].kind == "GT" { isArrow = true }
-      }
-      if !isArrow { eqTok = t }
-    }
-    t = t + 1
-  }
-  if eqTok < 0 { return 0 }
-  // An annotation that names a function type's parameters documents them; inference cannot.
-  if tsWritesParamNames(annTsWrittenOf(n.letType), 0) { return 0 }
-  // The span starts at the `:` token, always `nameTok + 1` for an annotated decl. Using the
-  // colon's own position rather than `nameTok.col + name.length` is robust to the module merge
-  // mangling the binding name (`local$m0`), which would otherwise push the start into the type.
-  const colonTok = nameTok + 1
-  if colonTok >= P.toks.length { return 0 }
-  redunSLine.push(P.toks[colonTok].line)
-  redunSCol.push(P.toks[colonTok].col)
-  redunELine.push(P.toks[eqTok].line)
-  redunECol.push(P.toks[eqTok].col)
-  redunName.push(demangleName(n.letName))
-  // User-facing (the finding's message quotes it) — the user render, not the raw one.
-  redunType.push(tyToStrUser(initTy))
-  redunTok.push(nameTok)
-  redunRet.push(false)
   0
 }
 
@@ -24031,76 +23869,6 @@ function recLitFits(lit: i32, dst: i32, depth: i32): boolean {
 // every use sees it. A re-check that refuses anything but the adopted value handed on whole
 // undoes it, unless it changed a number's width (DECISIONS.md "Record covariance").
 
-// This pass's demands: the declaration, the record the binding (or its list's element) holds,
-// the record it is delivered as, whether it is a list's element, and the delivery.
-let recAdDecl: i32[] = []
-let recAdOwn: i32[] = []
-let recAdDst: i32[] = []
-let recAdElem: boolean[] = []
-let recAdAt: i32[] = []
-// The solve's answer: declarations to re-check with an annotation, and the refusals it owes.
-let recAdPinDecl: i32[] = []
-let recAdPinTy: string[] = []
-let recAdPinSpell: string[] = []
-let recAdErrMsg: string[] = []
-let recAdErrAt: i32[] = []
-// Declarations whose adoption a re-check refused, and the nodes the pins replaced; both last
-// the whole program's check.
-let recAdNoAdopt: {[i32]: boolean} = Map()
-// The declarations an adoption currently rewrites, the types they are bound at in this pass,
-// and how many of this pass's refusals are about something other than an adopted value as a
-// whole: those are what a literal's own type served, so they undo the adoption.
-let recAdPinned: {[i32]: boolean} = Map()
-// Bindings adopted at a record that stores a number at another width or kind: their reads
-// compute at the adopted type, so a re-check's refusal stands instead of undoing them (D3339).
-let recAdWidth: {[i32]: boolean} = Map()
-// This pass's deliveries accepted only because they adopt (`recAdForce`), and their bindings.
-let recAdForced: i32[] = []
-let recAdForcedDecl: i32[] = []
-// Parallel to `recAdOrigDecl`: each rewritten declaration's name, whether it is a function, and
-// the type the adoption wrote.
-let recAdOrigName: string[] = []
-let recAdOrigFn: boolean[] = []
-let recAdOrigTy: string[] = []
-let recAdBound: i32[] = []
-let recAdLoose = 0
-let recAdRaising = false
-let recAdOrigDecl: i32[] = []
-let recAdOrigNode: Node[] = []
-
-// Drop one pass's demands; the pins and the refused set outlive it.
-export function recAdPassReset() {
-  recAdBound = []
-  recAdLoose = 0
-  recAdForced = []
-  recAdForcedDecl = []
-  recAdDecl = []
-  recAdOwn = []
-  recAdDst = []
-  recAdElem = []
-  recAdAt = []
-  recAdPinDecl = []
-  recAdPinTy = []
-  recAdPinSpell = []
-  recAdErrMsg = []
-  recAdErrAt = []
-  0
-}
-
-// Drop everything, before a program's first pass.
-export function recAdReset() {
-  recAdPassReset()
-  recAdNoAdopt = Map()
-  recAdPinned = Map()
-  recAdWidth = Map()
-  recAdOrigName = []
-  recAdOrigFn = []
-  recAdOrigTy = []
-  recAdOrigDecl = []
-  recAdOrigNode = []
-  0
-}
-
 // The declaration of the binding the read `at` names, when it holds only an object literal or
 // a list literal. -1 otherwise.
 function recFreshDeclOf(at: i32): i32 {
@@ -24664,13 +24432,6 @@ function recAdRecOf(ty: i32): i32 {
   }
 }
 
-// Does `x` read, within a few levels, a binding or call whose type an adoption wrote? An
-// annotation such a value meets is what adopted it, never redundant.
-function recAdAdoptedCall(x: i32): boolean {
-  if recAdOrigDecl.length == 0 { return false }
-  recAdMentions(x, 6)
-}
-
 // The note a refusal of an adopted value carries: which binding or function took which type.
 function recAdNoteFor(at: i32): string {
   const t = recAdRecOf(nodeTyIxOf(at))
@@ -24698,28 +24459,6 @@ function recAdNoteFor(at: i32): string {
     + "` holds only a literal, so it is built as the `"
     + recAdOrigTy[pick]
     + "` it is delivered to; annotate it to keep its own type, and copy it for the other use)"
-}
-
-// Does an adopted declaration bind `name`? By name only: this decides a hint, not a type.
-function recAdIsAdoptedName(name: string): boolean {
-  strListHas(recAdOrigName, name)
-}
-
-function recAdMentions(x: i32, depth: i32): boolean {
-  if x < 0 || x >= P.nodes.length || depth <= 0 { return false }
-  const n = P.nodes[x]
-  if n is Ident { return recAdIsAdoptedName(n.identName) }
-  if n is Call {
-    const cn = P.nodes[n.callFn]
-    if cn is Ident {
-      if recAdIsAdoptedName(cn.identName) { return true }
-    }
-  }
-  if n is FuncDecl { return false }
-  for c in nodeChildren(x) {
-    if recAdMentions(c, depth - 1) { return true }
-  }
-  false
 }
 
 // Push the refusals the last solve owed.
@@ -26773,245 +26512,6 @@ function coalDefNote(ix: i32, face: i32, rt: i32) {
   0
 }
 
-// The boolean-into-number note for the first field of record `g` that owes one against `w`.
-function boolForNumberFieldNote(g: TyObj, w: TyObj): string {
-  const names = w.objFieldNames
-  let i = 0
-  while i < names.length {
-    const gf = objFieldType(g, names[i])
-    if gf >= 0 {
-      const note = boolForNumberNoteOf(
-        gf,
-        w.objFieldTypes[i],
-        "field `" + names[i] + "`",
-      )
-      if note != "" { return note }
-    }
-    i = i + 1
-  }
-  ""
-}
-
-// Records `rhs` when `lhs` is an index into a list whose element is stored as `u8`.
-function noteU8StoreRhs(lhs: i32, rhs: i32) {
-  if lhs < 0 || rhs < 0 { return 0 }
-  const l = P.nodes[lhs]
-  if !(l is Index) { return 0 }
-  const at = nodeTyIxOf(l.idxArr)
-  if at < 0 { return 0 }
-  const a = T.tys[at]
-  if !(a is TyArray) { return 0 }
-  if primNameOf(a.aElem) != "u8" { return 0 }
-  if !u8StoreRhsHas(rhs) { u8StoreRhs.push(rhs) }
-  0
-}
-function u8StoreRhsHas(ix: i32): boolean {
-  let i = 0
-  while i < u8StoreRhs.length {
-    if u8StoreRhs[i] == ix { return true }
-    i = i + 1
-  }
-  false
-}
-
-// The fix a `boolean` offered where a number is wanted owes: it never converts implicitly, so
-// the note names the explicit `as` that does, at the wanted width, or "" for any other pair.
-// A list of booleans against a list of numbers is asked of its elements.
-function boolForNumberNote(got: i32, want: i32): string {
-  boolForNumberNoteOf(got, want, "it")
-}
-// `boolForNumberNote` for right-hand side `srcIx`, at the byte width when it is stored into a
-// `u8` cell.
-function boolForNumberNoteAt(srcIx: i32, got: i32, want: i32): string {
-  if srcIx >= 0 && u8StoreRhsHas(srcIx) {
-    if primNameOf(softenLitTy(got)) == "boolean" {
-      return " — a `boolean` is not a number; convert it with `b as u8`"
-    }
-  }
-  boolForNumberNoteOf(got, want, "it")
-}
-function boolForNumberNoteOf(got: i32, want: i32, what: string): string {
-  if got < 0 || want < 0 { return "" }
-  const ga = T.tys[got]
-  const wa = T.tys[want]
-  if ga is TyArray {
-    if wa is TyArray {
-      return boolForNumberNoteOf(ga.aElem, wa.aElem, "each element")
-    }
-  }
-  if ga is TyObj {
-    if wa is TyObj { return boolForNumberFieldNote(ga, wa) }
-  }
-  if !tyIsOrHasBoolean(got) { return "" }
-  const wn = primNameStr(primNameOf(want))
-  if wn != "i32" && wn != "u8" && wn != "i64" && wn != "f32" && wn != "f64" {
-    return ""
-  }
-  // A brand is named itself: `b as A1` converts into it, where `b as i32` would be refused.
-  let tn = nomNameOfTy(want)
-  if tn == "" { tn = wn }
-  " — a `boolean` is not a number; convert " + what + " with `b as " + tn + "`"
-}
-
-// The direct spelling's sentence for a value that does not fit its destination, in one home
-// because two sites have to say it and must not drift: `checkLetDeclNode`'s own gate and
-// `validateLetCstrs`' pin. `name` is the fork: a declaration can name the binding, a write
-// to an already declared place cannot. The single-quote-into-`string` footnote lives here too.
-function charLitForStringNote(srcIx: i32, want: i32): string {
-  if !isStringTy(want) { return "" }
-  if srcIx < 0 || srcIx >= P.nodes.length { return "" }
-  const n = P.nodes[srcIx]
-  if n is CharLit {
-    let inner = n.charText
-    if inner.length >= 2 { inner = inner.slice(1, inner.length - 1) }
-    let quotable = true
-    let i = 0
-    while i < inner.length {
-      if inner[i] == '"' || inner[i] == '\\' { quotable = false }
-      i = i + 1
-    }
-    const lead = " — a char literal is its i32 code point; use double quotes for a string"
-    if quotable { return lead + ": \"" + inner + "\"" }
-    return lead
-  }
-  ""
-}
-
-// The fix a list of numbers delivered where a `u8[]` is wanted owes: `u8` is a storage type,
-// so no generic builds one and no value list converts to one. Names `filled` when `srcIx` is
-// its call, and notes a literal-zero fill for `check --fix`. A record is asked of its fields.
-function storageListNote(srcIx: i32, got: i32, want: i32): string {
-  const body = storageListBody(srcIx, got, want)
-  if body == "" { return "" }
-  " — " + body
-}
-function storageListBody(srcIx: i32, got: i32, want: i32): string {
-  if got < 0 || want < 0 { return "" }
-  const ga = T.tys[got]
-  const wa = T.tys[want]
-  if ga is TyObj {
-    if wa is TyObj { return storageListFieldBody(srcIx, ga, wa) }
-  }
-  if !(ga is TyArray) || !(wa is TyArray) { return "" }
-  if primNameStr(primNameOf(wa.aElem)) != "u8" { return "" }
-  const el = softenLitTy(ga.aElem)
-  if !isNumeric(el) || primNameStr(primNameOf(el)) == "" { return "" }
-  const src = "`" + tyToStr(got) + "`"
-  const make = "`zeroBytes(n)` from \"std:bytes\", which returns a `u8[]`"
-  const fill = storageFilledFill(parenPeelIx(srcIx))
-  if fill >= 0 {
-    const lead = "`filled` builds "
-      + src
-      + " here: `u8` is a storage type, so a generic's `T` is never `u8`. "
-    if fillIsLitZero(fill) {
-      const call = parenPeelIx(srcIx)
-      if zeroBytesNameFree(call) && !i32ListHas(zeroBytesFixIx, call) {
-        zeroBytesFixIx.push(call)
-      }
-      return lead + "For zeroed bytes use " + make
-    }
-    return lead + "Make the bytes with " + make + ", and fill it by a loop"
-  }
-  let conv = ""
-  if primNameStr(primNameOf(el)) != "i32" {
-    conv = ", converting each with `as! u8`"
-  }
-  "`u8` is a storage type, so "
-    + src
-    + " is never a `u8[]`; make one with "
-    + make
-    + ", and copy each element in by index"
-    + conv
-}
-
-// `storageListBody` for the first field of record `g` that owes one against `w`, reading the
-// field's own value when `srcIx` is the record literal.
-function storageListFieldBody(srcIx: i32, g: TyObj, w: TyObj): string {
-  const lit = parenPeelIx(srcIx)
-  const names = w.objFieldNames
-  let i = 0
-  while i < names.length {
-    const gf = objFieldType(g, names[i])
-    if gf >= 0 {
-      const body = storageListBody(
-        objLitFieldValue(lit, names[i]),
-        gf,
-        w.objFieldTypes[i],
-      )
-      if body != "" { return "field `" + names[i] + "`: " + body }
-    }
-    i = i + 1
-  }
-  ""
-}
-
-// The value node of field `name` in record literal `ix`, or -1.
-function objLitFieldValue(ix: i32, name: string) {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const o = P.nodes[ix]
-  if !(o is ObjLit) { return -1 }
-  for f in o.objFields {
-    const fi = P.nodes[f]
-    if fi is FieldInit {
-      if fi.fiName == name { return fi.fiValue }
-    }
-  }
-  -1
-}
-
-// The fill argument of `ix` when it is a two-argument call of `std:array`'s `filled`, else -1.
-function storageFilledFill(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const cn = P.nodes[ix]
-  if !(cn is Call) { return -1 }
-  if cn.callArgs.length != 2 { return -1 }
-  if demangleName(calleeNameOf(ix)) != "filled" { return -1 }
-  const d = callDeclFnIx(cn, ix)
-  if d < 0 || srcmapPathOf(rcwModOf(d)) != "std:array" { return -1 }
-  cn.callArgs[1]
-}
-
-// Whether no binding named `zeroBytes` but an import of `std:bytes`'s exists anywhere in the
-// module of node `at`, so rewriting a call there to `zeroBytes(n)` cannot reach another one.
-// A file scan rather than the scope chain: a module binding declared later is not yet in scope.
-function zeroBytesNameFree(at: i32): boolean {
-  const m = rcwModOf(at)
-  if m < 0 { return false }
-  zeroBytesBindScan()
-  !i32ListHas(zeroBytesBindMods, m)
-}
-
-// Extends `zeroBytesBindMods` over the nodes added since the last call, so the arena is
-// walked once however many calls ask.
-function zeroBytesBindScan() {
-  const zb = "zeroBytes"
-  let i = zeroBytesScanned
-  while i < P.nodes.length {
-    const n = P.nodes[i]
-    let hit = false
-    if n is LetDecl {
-      hit = demangleName(n.letName) == zb
-    } else if n is FuncDecl {
-      hit = demangleName(n.fnName) == zb
-    } else if n is Param {
-      hit = demangleName(n.parName) == zb
-    } else if n is ForRange {
-      hit = demangleName(n.frVar) == zb
-    } else if n is ForIn {
-      hit = demangleName(n.fiVar) == zb || demangleName(n.fiVar2) == zb
-    } else if n is ImportDecl {
-      hit = n.impPath != "std:bytes" && strListHas(n.impLocals, zb)
-    }
-    if hit {
-      const hm = rcwModOf(i)
-      if !i32ListHas(zeroBytesBindMods, hm) { zeroBytesBindMods.push(hm) }
-    }
-    i = i + 1
-  }
-  zeroBytesScanned = P.nodes.length
-  0
-}
-
 // Whether an accepted assignment of right side `rhs`, a `rt` value, into a place of type
 // `placeTy` yields the place's type: the two are one type in another spelling (a union's member
 // order), or `rhs` is a literal built at the place's type because a `rt` value could reach the
@@ -27066,180 +26566,6 @@ function asgNestedRhsBuilt(x: i32): boolean {
     if e.binOp == "=" { return asgRhsBuiltAtPlace(e.binRight) }
   }
   false
-}
-
-function letAssignMsg(
-  srcIx: i32,
-  got: i32,
-  want: i32,
-  name: string,
-  annIx: i32,
-) {
-  if name == "" {
-    return "cannot assign "
-      + tyToStr(got)
-      + " to "
-      + tyToStr(want)
-      + charLitForStringNote(srcIx, want)
-      + boolForNumberNoteAt(srcIx, got, want)
-      + storageListNote(srcIx, got, want)
-      + litMemberNote(srcIx, want, 8)
-  }
-  // An object literal (`{}` / `{x: 1}`) assigned to a map type is a category error, not a
-  // width mismatch — point at the fix (`Map()`) rather than the opaque
-  // "cannot assign {} to … of type {[string]: …}".
-  const wantT = T.tys[want]
-  let objToMap = false
-  if wantT is TyMap {
-    if srcIx >= 0 {
-      const srcN = P.nodes[srcIx]
-      if srcN is ObjLit { objToMap = true }
-    }
-  }
-  if objToMap {
-    return "An object literal isn't a map value — construct a map with "
-      + "`Map()` (or a set with `Set()`), e.g. `let m: {[string]: i32} = Map()`"
-  }
-  // Both sides numeric but not assignable ⇒ a lossy/narrowing edge the lossless-only
-  // implicit-widening rule won't take silently. Explain the lossiness rather than
-  // the opaque "cannot assign i32 to f32".
-  if (isNumeric(got) || tyIsNumUnion(got)) && isNumeric(want) {
-    return tyToStr(got)
-      + " doesn't fit in "
-      + tyToStr(want)
-      + " — the conversion is lossy and must be made explicit with `as` "
-      + "(write `x as "
-      + tyToStr(want)
-      + "`)"
-  }
-  "cannot assign "
-    + tyToStr(got)
-    + " to '"
-    + name
-    + "' of type "
-    + annotTyStr(want, annIx)
-    + charLitForStringNote(srcIx, want)
-    + boolForNumberNote(got, want)
-    + storageListNote(srcIx, got, want)
-    + litMemberNote(srcIx, want, 8)
-}
-
-// The first string or integer literal in source `srcIx` that its destination in `want`, a
-// literal union reached through list elements and record fields, does not admit, as a sentence
-// tail naming its path from the source root; "" when every literal fits or none is reached.
-function litMemberNote(srcIx: i32, want: i32, depth: i32): string {
-  litMemberAt(srcIx, want, depth, "")
-}
-
-function litMemberAt(srcIx: i32, want: i32, depth: i32, path: string): string {
-  if srcIx < 0 || want < 0 || depth <= 0 { return "" }
-  const x = parenPeelIx(srcIx)
-  if x < 0 || x >= P.nodes.length { return "" }
-  const n = P.nodes[x]
-  let w = T.tys[want]
-  let wIx = want
-  if w is TyNullable {
-    wIx = w.nInner
-    if wIx < 0 { return "" }
-    w = T.tys[wIx]
-  }
-  if n is ArrayLit && w is TyArray {
-    let i = 0
-    while i < n.arrElems.length {
-      const r = litMemberAt(
-        n.arrElems[i],
-        w.aElem,
-        depth - 1,
-        path + "[" + i32ToStr(i) + "]",
-      )
-      if r != "" { return r }
-      i = i + 1
-    }
-    return ""
-  }
-  if n is ObjLit && w is TyObj {
-    for f in n.objFields {
-      const fn = P.nodes[f]
-      if fn is FieldInit {
-        const k = strListIndexOf(w.objFieldNames, fn.fiName)
-        if k >= 0 {
-          let sub = fn.fiName
-          if path != "" { sub = path + "." + fn.fiName }
-          const r = litMemberAt(fn.fiValue, w.objFieldTypes[k], depth - 1, sub)
-          if r != "" { return r }
-        }
-      }
-    }
-    return ""
-  }
-  if !(w is TyUnion) { return "" }
-  let kind = ""
-  let text = ""
-  let shown = ""
-  if n is StrLit {
-    kind = "str"
-    shown = n.strText
-    if shown.length >= 2 { text = shown.slice(1, shown.length - 1) }
-  } else if n is NumLit {
-    kind = "int"
-    shown = n.numText
-    text = canonIntLexeme(n.numText)
-  } else {
-    return ""
-  }
-  // The literal members, `null` aside; any other member means the union is not a literal set.
-  let members = ""
-  let listed = 0
-  let lits = 0
-  for m in w.uMembers {
-    const mt = T.tys[m]
-    if mt is TyLit {
-      if mt.litKind == kind && mt.litText == text { return "" }
-      lits = lits + 1
-      if listed < 8 {
-        if members != "" { members = members + " | " }
-        if mt.litKind == "str" {
-          members = members + "\"" + mt.litText + "\""
-        } else {
-          members = members + mt.litText
-        }
-        listed = listed + 1
-      }
-    } else if m != TY_NULL {
-      return ""
-    }
-  }
-  if lits == 0 { return "" }
-  if lits > listed {
-    members = members + " … and " + i32ToStr(lits - listed) + " more"
-  }
-  let named = tyToStr(wIx)
-  if named == members || named.indexOf("|") >= 0 {
-    named = ""
-  } else {
-    named = named + ": "
-  }
-  let at = ""
-  if path != "" { at = " (at `" + path + "`)" }
-  " — `" + shown + "` is not one of " + named + members + at
-}
-
-// `tyToStr(want)`, except that a function type whose annotation `annIx` named its parameters
-// shows those names: the author's spelling in a sentence, never in a type's identity.
-function annotTyStr(want: i32, annIx: i32) {
-  const t = T.tys[want]
-  if !(t is TyFunc) || annIx < 0 { return tyToStr(want) }
-  const n = t.fnParamTypes.length
-  const names = tsFnParamNames(annTsWrittenOf(annIx), n, 0)
-  if names.length == 0 { return tyToStr(want) }
-  let s = "("
-  let i = 0
-  while i < n {
-    if i > 0 { s = s + ", " }
-    s = s + names[i] + ": " + tyToStr(t.fnParamTypes[i])
-    i = i + 1
-  }
-  s + ") => " + tyToStr(t.fnRet)
 }
 
 // A builtin method argument's sentence, in one home because the arm and the pin
@@ -36717,58 +36043,11 @@ export function blockLastStmt(ix: i32): i32 {
   b.blkStmts[n - 1]
 }
 
-// The value expressions a tail at `ix` yields: each arm of an `if`/`else` or `match`, followed
-// down nested ones and an arm's block tail, else `ix` itself. A worklist, so a long `else if`
-// chain costs no stack. A block whose tail follows an exit yields nothing (D2234).
-function tailValueLeaves(ix: i32, out: i32[]) {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = cwPeel(todo.pop() ?? -1)
-    if at >= 0 && at < P.nodes.length {
-      if (
-        !tailPushIfArms(at, todo)
-        && !tailPushMatchArms(at, todo)
-        && !tailPushBlockTail(at, todo)
-      ) {
-        out.push(at)
-      }
-    }
-  }
-  0
-}
-
 // Banks destination `ty` on every `if` and `match` whose value reaches it through `ix`'s arms.
 function seedJoinWant(ix: i32, ty: i32) {
   if ty < 0 { return 0 }
   for at in joinLeavesOf(ix) { joinWantAt.set(at, ty) }
   0
-}
-
-// Every `if` and `match` whose value is `ix`'s, through arms and block tails.
-function joinLeavesOf(ix: i32): i32[] {
-  const out: i32[] = []
-  const todo: i32[] = [ix]
-  let guard = 0
-  while todo.length > 0 && guard < 64 {
-    guard = guard + 1
-    const at = parenPeelIx(todo.pop() ?? -1)
-    if at >= 0 && at < P.nodes.length {
-      const an = P.nodes[at]
-      if an is IfStmt || an is MatchExpr { out.push(at) }
-      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
-        tailPushBlockTail(at, todo)
-      }
-    }
-  }
-  out
-}
-
-// Whether a join under `ix` took its type from its destination, so is typed by an annotation.
-function joinTypedByWant(ix: i32): boolean {
-  for at in joinLeavesOf(ix) {
-    if joinByWant.has(at) { return true }
-  }
-  false
 }
 
 // The type a valued `if` or `match` at `ix` joined to `join` takes instead, or -1: the
@@ -45292,22 +44571,6 @@ function constStrLitBound(n: LetDecl, initTy: i32): i32 {
   widenLitTy(initTy)
 }
 
-// Arena indices of the literal types a `const` inferred from its initializer. Each is minted
-// fresh, so the flag belongs to that binding's type alone: kept at every read, and widened to
-// its base where the value is stored somewhere reassignable — a `let`, a list or object literal,
-// a type argument.
-let wideLitTyIxs: boolean[] = []
-
-// The widening literal type of string lexeme `lex` (quotes kept), or `fallback` when `lex` is
-// not a quoted literal.
-function mkWideStrLitTy(lex: string, fallback: i32): i32 {
-  const lt = litMemberTy(lex)
-  if lt < 0 { return fallback }
-  while wideLitTyIxs.length <= lt { wideLitTyIxs.push(false) }
-  wideLitTyIxs[lt] = true
-  lt
-}
-
 // Whether a compare keeps operand type `x` at its `const` literal: only beside a literal-typed
 // other side (or its nullable) that the literal is a member of. Anywhere else it compares as the
 // `string` it is; `constLitNeverMeets` refuses a literal side it can never equal.
@@ -45500,69 +44763,6 @@ function flattenStrLits(ty: i32, out: i32[]) {
     TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {}
   }
   0
-}
-
-// Whether `ty` is a widening literal, or a union made only of them.
-function isWideLitJoin(ty: i32): boolean {
-  if isWideLitTy(ty) { return true }
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length == 0 { return false }
-    let i = 0
-    while i < t.uMembers.length {
-      if !isWideLitTy(t.uMembers[i]) { return false }
-      i = i + 1
-    }
-    return true
-  }
-  false
-}
-
-// Whether `ty` is a widening literal: a `const` inferred it and nobody declared it.
-function isWideLitTy(ty: i32): boolean {
-  if ty < 0 || ty >= wideLitTyIxs.length { return false }
-  wideLitTyIxs[ty]
-}
-
-// The type a node had before `widenLitTy`, by node index; -1 where widening changed nothing.
-let wideLitByNode: i32[] = []
-
-function noteWideLitNode(ix: i32, ty: i32) {
-  while wideLitByNode.length <= ix { wideLitByNode.push(-1) }
-  wideLitByNode[ix] = ty
-  0
-}
-
-// Whether node `ix` read a `const` bound to a string literal. The recorded type of such a node
-// is `string`; this and `nodeWideStrLitText` are the one place the literal is asked for (D2157).
-export function nodeHasWideStrLit(ix: i32): boolean {
-  if ix < 0 || ix >= wideLitByNode.length { return false }
-  const ty = wideLitByNode[ix]
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyLit { return t.litKind == "str" }
-  false
-}
-
-// Node `ix`'s type before a `const` literal inside it widened to `string` — a join of such
-// literals is a literal union a literal-typed destination narrows from — else its recorded type.
-export function nodeUnwidenedTyOf(ix: i32): i32 {
-  if ix >= 0 && ix < wideLitByNode.length {
-    if wideLitByNode[ix] >= 0 { return wideLitByNode[ix] }
-  }
-  nodeTyIxOf(ix)
-}
-
-// The raw text (no quotes) of the literal `nodeHasWideStrLit` found at `ix`; ask that first,
-// since `const E = ""` holds a literal whose text is empty.
-export function nodeWideStrLitText(ix: i32): string {
-  if ix < 0 || ix >= wideLitByNode.length { return "" }
-  const ty = wideLitByNode[ix]
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyLit { return t.litText }
-  ""
 }
 
 // `ty` with every widening literal inside it replaced by its base scalar: a union of them
