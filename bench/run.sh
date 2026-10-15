@@ -30,6 +30,8 @@ set -u -o pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
+# Stand-ins for GNU tools a host lacks (macOS has no `timeout`); last on PATH, so real ones win.
+export PATH="$PATH:$ROOT/scripts/compat"
 
 REPS="${BENCH_REPS:-5}"
 [ "${BENCH_QUICK:-0}" = "1" ] && REPS=1
@@ -100,13 +102,13 @@ echo
 # jstr <s>  -> a JSON string literal, safely escaped.
 #   Backslash, quote, newline, tab and return get their short escapes; every other
 #   control character becomes \u00XX. Bytes >= 0x80 pass through as UTF-8.
-JSTR_SED=(-e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/\\n/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g')
-for _c in $(seq 1 31); do
-  case $_c in 9|10|13) continue;; esac
-  _h=$(printf '%02x' "$_c")
-  JSTR_SED+=(-e "s/\\x$_h/\\\\u00$_h/g")
-done
-jstr() { printf '"'; sed -z "${JSTR_SED[@]}"; printf '"'; }
+#   perl rather than `sed -z`, which BSD sed (macOS) does not have.
+jstr() {
+  printf '"'
+  perl -0777 -pe 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g; s/\t/\\t/g; s/\r/\\r/g;
+                  s/([\x00-\x1f])/sprintf("\\u%04x", ord $1)/ge'
+  printf '"'
+}
 
 emit() { # emit <json-object-line>
   printf '%s\n' "$1" >> "$NDJSON"
@@ -122,7 +124,8 @@ run_once() {
   [ "$1" = "--" ] && shift
   local s e
   s=$(date +%s%N)
-  timeout -k 5 "$TIMEOUT" "${PINCMD[@]}" "$@" >"$so" 2>"$se"
+  # `${a[@]+...}`: bash 3.2 (macOS) reads an empty array as unset under `set -u`.
+  timeout -k 5 "$TIMEOUT" ${PINCMD[@]+"${PINCMD[@]}"} "$@" >"$so" 2>"$se"
   LAST_RC=$?
   e=$(date +%s%N)
   LAST_MS=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.3f",(b-a)/1000000.0}')

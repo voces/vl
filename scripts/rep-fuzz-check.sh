@@ -28,7 +28,7 @@ BASELINE="${BASELINE:-scripts/rep-fuzz-baseline.txt}"
 
 # Soundness ratchet: reject any baselined line whose class isn't REJECT, before spending any
 # time on the fuzz run itself. See the header note above.
-unsound_baseline="$(grep -P '^(INVALID-WASM|TRAP|MISMATCH)\t' "$BASELINE" 2>/dev/null || true)"
+unsound_baseline="$(grep -E $'^(INVALID-WASM|TRAP|MISMATCH)\t' "$BASELINE" 2>/dev/null || true)"
 if [ -n "$unsound_baseline" ]; then
   echo "✗ unsound classes (INVALID-WASM/TRAP/MISMATCH) are never baselineable — fix the miscompile or convert it to a loud REJECT:"
   echo "$unsound_baseline" | sed 's/^/    ! /'
@@ -65,7 +65,7 @@ for p in "${pids[@]}"; do wait "$p" || true; done   # fuzz-vl.sh exits 1 on find
 cat "$WORK"/s*.tsv 2>/dev/null | sort -u > "$WORK/cur.txt" || : > "$WORK/cur.txt"
 # `|| true`: an EMPTY baseline (the ZERO goal) makes grep exit 1, which under `set -e` would abort
 # before the all-clear can print. Tolerate no matches.
-{ grep -P '\t' "$BASELINE" || true; } | sort -u > "$WORK/base.txt"
+{ grep $'\t' "$BASELINE" || true; } | sort -u > "$WORK/base.txt"
 
 new="$(comm -23 "$WORK/cur.txt" "$WORK/base.txt")"    # failing now, not baselined -> regression / worse
 stale="$(comm -13 "$WORK/cur.txt" "$WORK/base.txt")"  # baselined, not failing now -> graduate
@@ -83,7 +83,7 @@ cur_n=$(wc -l < "$WORK/cur.txt" | tr -d ' ')
 # `grep -c` prints the count AND exits 1 when it's 0, so `|| echo 0` would append a
 # SECOND "0" (breaking the `$((…))` below the moment unsound hits 0 — the goal state).
 # Take the first line only, defaulting to 0.
-unsound_n=$( { grep -cvP '^REJECT\t' "$WORK/cur.txt" 2>/dev/null || true; } | head -1 )
+unsound_n=$( { grep -cv $'^REJECT\t' "$WORK/cur.txt" 2>/dev/null || true; } | head -1 )
 unsound_n=${unsound_n:-0}
 if [ "$rc" -eq 0 ]; then
   echo "rep-fuzz-check: exact ✅  ($cur_n baselined failures — $unsound_n unsound, $((cur_n - unsound_n)) reject; 0 new, 0 stale)"

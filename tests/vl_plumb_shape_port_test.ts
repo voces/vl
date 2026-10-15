@@ -88,7 +88,9 @@ build)
 esac
 `;
 
+// As the script reads it: "unknown" where there is no `/proc/cpuinfo` (macOS).
 const cpuModel = (): string => {
+  if (!exists("/proc/cpuinfo")) return "unknown";
   for (const l of Deno.readTextFileSync("/proc/cpuinfo").split("\n")) {
     if (l.startsWith("model name")) return l.split(":")[1].trim();
   }

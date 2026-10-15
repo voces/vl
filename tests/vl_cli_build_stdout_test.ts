@@ -210,8 +210,9 @@ Deno.test({
 });
 
 // A REAL pty, because the guard reads `is_terminal()` and a pipe cannot exercise it.
-// Deno has no pty API, so util-linux `script` drives one: it runs the command with stdout
-// on a pty slave, exits with the command's code (`-e`) and prints what the terminal got.
+// Deno has no pty API, so `script` drives one: it runs the command with stdout on a pty
+// slave, exits with the command's code and prints what the terminal got. util-linux needs
+// `-e` for that code and takes the command as one string; BSD `script` takes argv as given.
 const shQuote = (s: string): string => `'${s.replaceAll("'", `'\\''`)}'`;
 
 Deno.test({
@@ -223,7 +224,9 @@ Deno.test({
       let run: Deno.CommandOutput;
       try {
         run = await new Deno.Command("script", {
-          args: ["-qefc", argv.map(shQuote).join(" "), "/dev/null"],
+          args: Deno.build.os === "linux"
+          ? ["-qefc", argv.map(shQuote).join(" "), "/dev/null"]
+          : ["-q", "/dev/null", ...argv],
           cwd: dir,
           env: nativeEnv({ NO_COLOR: "1" }),
           stdin: "null",
