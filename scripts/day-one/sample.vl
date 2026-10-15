@@ -1,0 +1,997 @@
+// Sample ordinary VL programs IN PAIRS and report where two spellings disagree.
+//
+//     vl run scripts/day-one/sample.vl -- --seed 1 --count 40 [--out run.jsonl]
+//     vl run scripts/day-one/sample.vl -- --replay run.jsonl        # regression mode
+//
+// `--count` counts PROGRAMS, two per pair; each pair is one program spelled two ways along
+// one axis, and the verdict is agree / disagree. `--replay` exits non-zero only on
+// `RUNS -> not-RUNS`. Run it from the checkout root. See docs/internals/day-one-sampler.md.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseF64, parseI32, toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import {
+  JsonMap,
+  cpPrefix,
+  die,
+  findFrom,
+  pyFixed,
+  splitLines,
+  stripWs,
+} from "../lib/common"
+import {
+  cwd,
+  makeTempDir,
+  padLeft,
+  padRight,
+  pyRepr,
+  sortStrings,
+  spawn,
+  writeText,
+} from "../lib/corpus"
+import { axisIds, exclude } from "./grammar"
+import { Ctx, Item, Result, gradeAll, gradeJob, writeProgram } from "./grade"
+import { byId, renderImports, spec as importsSpec, triple } from "./imports"
+import { splitFiles } from "./modules"
+import {
+  dumpSorted,
+  int,
+  jfaces,
+  jstrs,
+  loadJsonl,
+  obj,
+  side,
+  str,
+  strs,
+} from "./pairs"
+import { makePair, renderSpec } from "./render"
+import { newRng, shuffle } from "./rng"
+
+const SELF = "scripts/day-one/sample.vl"
+
+const VERDICTS = [
+  "DISAGREE", "RUNS-WRONG", "AGREE-RUNS", "BOTH-FAIL-SAME", "BOTH-FAIL-DIFFER",
+]
+
+// The probe vocabulary plus RUNS-WRONG and TRAP (program); a grade outside it means
+// this script and `lib/probe-grade.vl` have drifted.
+const GRADES = [
+  "RUNS", "RUNS-WRONG", "check refuses", "emit refuses", "SILENT (check rc 0)",
+  "COMPILER TRAP (check rc 0)", "TRAP (program)", "TIMEOUT",
+]
+
+// ── grading pairs ─────────────────────────────────────────────────────────────────
+
+function verdictOf(ga: Result, gb: Result): string {
+  if ga.grade == "RUNS-WRONG" || gb.grade == "RUNS-WRONG" {
+    return "RUNS-WRONG"
+  }
+  const ra = ga.grade == "RUNS"
+  const rb = gb.grade == "RUNS"
+  if ra && rb { return "AGREE-RUNS" }
+  if ra != rb { return "DISAGREE" }
+  if ga.grade == gb.grade && ga.message == gb.message {
+    return "BOTH-FAIL-SAME"
+  }
+  "BOTH-FAIL-DIFFER"
+}
+
+function setResult(s: JsonMap, r: Result) {
+  s["grade"] = r.grade
+  s["message"] = r.message
+  s["got"] = r.got
+}
+
+// Grade both faces of every pair in place, `jobs` programs at a time.
+function gradePairs(c: Ctx, pairs: JsonMap[], jobs: i32) {
+  const dir = makeTempDir()
+  const items: Item[] = []
+  for p in pairs {
+    const tag = "s"
+      + toString(int(p, "seed"))
+      + "_i"
+      + toString(int(p, "index"))
+    for sd in ["a", "b"] {
+      const s = obj(p, sd)
+      items.push({ src: str(s, "src"), want: strs(s, "want"), name: tag + sd })
+    }
+  }
+  const res = gradeAll(c, items, dir, jobs, SELF)
+  spawn("rm", ["-rf", dir])
+  let k = 0
+  for p in pairs {
+    setResult(obj(p, "a"), res[k])
+    setResult(obj(p, "b"), res[k + 1])
+    p["verdict"] = verdictOf(res[k], res[k + 1])
+    k = k + 2
+  }
+}
+
+// `count` PROGRAMS = count/2 pairs. `cover` front-loads a shuffled full axis list, so
+// a small sample still varies every axis; `axis` aims the whole sample at one.
+function buildSample(
+  seed: i32,
+  count: i32,
+  cover0: boolean,
+  axis: string,
+): JsonMap[] {
+  const r = newRng(seed as i64)
+  let cover = cover0
+  let todo: string[] = []
+  if axis != "" {
+    let n = 0
+    while n < count / 2 + 8 {
+      todo.push(axis)
+      n = n + 1
+    }
+    cover = true
+  } else {
+    todo = axisIds()
+    shuffle(r, todo)
+  }
+  const pairs: JsonMap[] = []
+  const seen: Map<string, boolean> = Map()
+  let tries = 0
+  const goal = if count / 2 > 1 { count / 2 } else { 1 }
+  while pairs.length < goal && tries < count * 60 {
+    tries = tries + 1
+    let want = ""
+    if cover && todo.length > 0 {
+      want = todo[0]
+      todo = todo.slice(1, todo.length)
+    }
+    const p = makePair(r, want)
+    if p == null {
+      if want != "" { todo.push(want) }
+      continue
+    }
+    const key = str(obj(p, "a"), "src") + "\u{0}" + str(obj(p, "b"), "src")
+    if seen[key] != null {
+      if want != "" { todo.push(want) }
+      continue
+    }
+    seen[key] = true
+    p["seed"] = seed as f64
+    p["index"] = pairs.length as f64
+    pairs.push(p)
+  }
+  pairs
+}
+
+// ── reports ───────────────────────────────────────────────────────────────────────
+
+type Count = { key: string, n: i32 }
+
+function bump(cs: Count[], key: string, by: i32) {
+  for c in cs {
+    if c.key == key {
+      c.n = c.n + by
+      return
+    }
+  }
+  cs.push({ key: key, n: by })
+}
+
+function countOf(cs: Count[], key: string): i32 {
+  for c in cs {
+    if c.key == key { return c.n }
+  }
+  0
+}
+
+// `sorted(counts.items(), key=(-n, key))`, by insertion: the lists are short.
+function byCount(cs: Count[]): Count[] {
+  const out: Count[] = []
+  for c in cs {
+    let i = out.length
+    while (
+      i > 0
+      && (out[i - 1].n < c.n || (out[i - 1].n == c.n && c.key < out[i - 1].key))
+    ) {
+      i = i - 1
+    }
+    out.push(c)
+    let j = out.length - 1
+    while j > i {
+      out[j] = out[j - 1]
+      j = j - 1
+    }
+    out[i] = c
+  }
+  out
+}
+
+function table(keys: string[], title: string) {
+  const cs: Count[] = []
+  for k in keys { bump(cs, k, 1) }
+  print("\n" + title)
+  for c in byCount(cs) {
+    print("  " + padRight(c.key, 26) + " " + padLeft(toString(c.n), 4))
+  }
+}
+
+function sides(pairs: JsonMap[]): JsonMap[] {
+  const out: JsonMap[] = []
+  for p in pairs {
+    out.push(obj(p, "a"))
+    out.push(obj(p, "b"))
+  }
+  out
+}
+
+function cols(xs: string[], w: i32): string {
+  const out: string[] = []
+  for x in xs { out.push(padLeft(x, w)) }
+  join(out, " ")
+}
+
+// Agreements per axis: an axis the sample never exercised prints as such, not as zero.
+function axisTable(pairs: JsonMap[]) {
+  print("\nby axis (order = expected yield)")
+  print(
+    "  "
+      + padRight("axis", 24)
+      + " "
+      + cols(["pairs", "hit", "agree", "both", "wrong"], 5),
+  )
+  for ax in axisIds() {
+    const c: Count[] = []
+    let total = 0
+    for p in pairs {
+      if str(p, "axis") == ax {
+        bump(c, str(p, "verdict"), 1)
+        total = total + 1
+      }
+    }
+    if total == 0 {
+      print(
+        "  \{padRight(ax, 24)} \{padLeft("0", 5)}   NOT EXERCISED by this sample",
+      )
+      continue
+    }
+    const both = countOf(c, "BOTH-FAIL-SAME") + countOf(c, "BOTH-FAIL-DIFFER")
+    const row = [
+      toString(total),
+      toString(countOf(c, "DISAGREE")),
+      toString(countOf(c, "AGREE-RUNS")),
+      toString(both),
+      toString(countOf(c, "RUNS-WRONG")),
+    ]
+    print("  " + padRight(ax, 24) + " " + cols(row, 5))
+  }
+}
+
+function isHit(p: JsonMap): boolean {
+  const v = str(p, "verdict")
+  v == "DISAGREE" || v == "RUNS-WRONG"
+}
+
+type Feature = { key: string, hit: i32, n: i32 }
+
+// Hit rate per feature, highest first and then the most-drawn, stable over first sight.
+function featureTable(pairs: JsonMap[]) {
+  const fs: Feature[] = []
+  for p in pairs {
+    for f in strs(p, "features") {
+      let found = false
+      for x in fs {
+        if x.key == f {
+          x.n = x.n + 1
+          if isHit(p) { x.hit = x.hit + 1 }
+          found = true
+        }
+      }
+      if !found { fs.push({ key: f, hit: if isHit(p) { 1 } else { 0 }, n: 1 }) }
+    }
+  }
+  const out: Feature[] = []
+  for f in fs {
+    const rate = (f.hit as f64) / (f.n as f64)
+    let i = out.length
+    while i > 0 {
+      const o = out[i - 1]
+      const orate = (o.hit as f64) / (o.n as f64)
+      if orate < rate || (orate == rate && o.n < f.n) {
+        i = i - 1
+      } else {
+        break
+      }
+    }
+    out.push(f)
+    let j = out.length - 1
+    while j > i {
+      out[j] = out[j - 1]
+      j = j - 1
+    }
+    out[i] = f
+  }
+  print("\nhit rate per feature (aim the next sample with this)")
+  for f in out {
+    const pct = pyFixed(100.0 * (f.hit as f64) / (f.n as f64), 1)
+    print(
+      "  \{padRight(f.key, 20)} \{padLeft(toString(f.hit), 3)}/\{padRight(toString(f.n), 4)} \{padLeft(pct, 5)}%",
+    )
+  }
+}
+
+// Programs spelled as more than one module: the axis table cannot say the split face ran.
+function multiFile(pairs: JsonMap[]): i32 {
+  let n = 0
+  for s in sides(pairs) {
+    if splitFiles(str(s, "src")).length > 1 { n = n + 1 }
+  }
+  n
+}
+
+function sid(p: JsonMap): string {
+  "s" + toString(int(p, "seed")) + "/" + toString(int(p, "index"))
+}
+
+function report(pairs: JsonMap[]) {
+  print(
+    "\n\{pairs.length} pairs = \{2 * pairs.length} programs · \{multiFile(pairs)} of them multi-module",
+  )
+  const vs: string[] = []
+  for p in pairs { vs.push(str(p, "verdict")) }
+  table(vs, "pair verdicts")
+  const gs: string[] = []
+  for s in sides(pairs) { gs.push(str(s, "grade")) }
+  table(gs, "program grades")
+  axisTable(pairs)
+  featureTable(pairs)
+  const hits: JsonMap[] = []
+  for p in pairs {
+    if isHit(p) { hits.push(p) }
+  }
+  print(
+    "\n"
+      + toString(hits.length)
+      + " HIT(S) — one spelling runs, the other does not",
+  )
+  for p in hits {
+    const a = obj(p, "a")
+    const b = obj(p, "b")
+    print(
+      "  \{sid(p)}  axis=\{str(p, "axis")}  A[\{str(a, "face")}]=\{str(a, "grade")}  B[\{str(b, "face")}]=\{str(b, "grade")}",
+    )
+    const msg = if str(a, "message") != "" { str(a, "message") } else { str(b, "message") }
+    print("        " + cpPrefix(msg, 100))
+  }
+  const both: JsonMap[] = []
+  for p in pairs {
+    if startsWith(str(p, "verdict"), "BOTH-FAIL") { both.push(p) }
+  }
+  print(
+    "\n"
+      + toString(both.length)
+      + " BOTH-FAIL — a missing feature or a design question, not a hit",
+  )
+  for p in both.slice(0, if both.length < 20 { both.length } else { 20 }) {
+    const a = obj(p, "a")
+    print("  \{sid(p)}  \{str(a, "grade")}  \{cpPrefix(str(a, "message"), 82)}")
+  }
+}
+
+// ── saved samples ─────────────────────────────────────────────────────────────────
+
+function writeJsonl(path: string, pairs: JsonMap[]) {
+  const lines: string[] = []
+  for p in pairs { lines.push(dumpSorted(p) + "\n") }
+  writeText(path, join(lines, ""))
+}
+
+function keepSide(s: JsonMap): JsonMap {
+  const m: JsonMap = Map()
+  for k, v in s {
+    if k == "src" || k == "want" || k == "face" { m[k] = v }
+  }
+  m
+}
+
+// Re-grade a saved sample; non-zero only when a program that ran no longer does.
+function replay(c: Ctx, path: string, jobs: i32): i32 {
+  const old = loadJsonl(path)
+  const fresh: JsonMap[] = []
+  for p in old {
+    const q: JsonMap = Map()
+    for k, v in p {
+      if k != "verdict" { q[k] = v }
+    }
+    q["a"] = keepSide(obj(p, "a"))
+    q["b"] = keepSide(obj(p, "b"))
+    fresh.push(q)
+  }
+  gradePairs(c, fresh, jobs)
+  const moved: string[] = []
+  const lost: string[] = []
+  let i = 0
+  while i < old.length {
+    for sd in ["a", "b"] {
+      const was = str(obj(old[i], sd), "grade")
+      const now = str(obj(fresh[i], sd), "grade")
+      if was == now { continue }
+      const row = sid(old[i]) + sd + "  " + was + " -> " + now
+      if was == "RUNS" { lost.push(row) } else { moved.push(row) }
+    }
+    i = i + 1
+  }
+  for r in moved { print("  moved   " + r) }
+  for r in lost { print("  RUNS LOST  " + r) }
+  print(
+    "\n\{moved.length + lost.length} program(s) moved · \{lost.length} RUNS lost",
+  )
+  if lost.length > 0 { 1 } else { 0 }
+}
+
+// The least of `reps` `vl build` wall times of `src`, in ms: compile only, and the
+// minimum is what a contended box lets rows be compared by.
+function buildMs(
+  c: Ctx,
+  src: string,
+  dir: string,
+  name: string,
+  reps: i32,
+): f64 {
+  const path = writeProgram(src, dir, name)
+  const out = dir + "/" + name + ".wasm"
+  let best = -1.0
+  let k = 0
+  while k < reps {
+    const t = spawn(
+      "bash",
+      [
+        "-c",
+        "TIMEFORMAT=%3R; time env VL_STD=\"$1\" \"$2\" build \"$3\" -o \"$4\" --compiler \"$5\" >/dev/null 2>&1",
+        "t",
+        c.std,
+        c.vl,
+        path,
+        out,
+        c.compiler,
+      ],
+    )
+    const lines = splitLines(stripWs(t.err))
+    const secs = parseF64(
+      if lines.length > 0 { lines[lines.length - 1] } else { "" },
+    )
+    if secs == null { die("sample: cannot time a build: " + t.err, 1) }
+    const ms = (secs ?? 0.0) * 1000.0
+    if best < 0.0 || ms < best { best = ms }
+    k = k + 1
+  }
+  best
+}
+
+type Timed = { first: string, second: string, a: f64, b: f64, t: f64 }
+
+function ratioOf(r: Timed): f64 {
+  const sum = r.a + r.b
+  r.t / (if sum > 0.000001 { sum } else { 0.000001 })
+}
+
+// The `imports_pair` axis's timing half (D1514's shape): `together` against the SUM of
+// the two alone-times, re-rendered from each saved spec so a grammar fix reaches it.
+function importsReport(c: Ctx, paths: string[]): i32 {
+  const reps = 3
+  const factor = 3.0
+  const seen: Map<string, boolean> = Map()
+  const specs: JsonMap[] = []
+  for f in paths {
+    for p in loadJsonl(f) {
+      if str(p, "axis") != "imports_pair" { continue }
+      const sp = obj(p, "spec")
+      const ids = sortStrings([str(sp, "first"), str(sp, "second")])
+      const key = ids[0] + "\u{0}" + ids[1]
+      if seen[key] != null { continue }
+      seen[key] = true
+      specs.push(sp)
+    }
+  }
+  if specs.length == 0 {
+    print(
+      "no imports_pair pairs in " + join(paths, ", ") + " — nothing to time",
+    )
+    return 0
+  }
+  const dir = makeTempDir()
+  const rows: Timed[] = []
+  let i = 0
+  for sp in specs {
+    const ms: f64[] = []
+    let k = 0
+    for l in triple(sp) {
+      ms.push(
+        buildMs(c, l.src, dir, "t" + toString(i) + "_" + toString(k), reps),
+      )
+      k = k + 1
+    }
+    rows.push(
+      {
+        first: str(sp, "first"),
+        second: str(sp, "second"),
+        a: ms[0],
+        b: ms[1],
+        t: ms[2],
+      },
+    )
+    i = i + 1
+  }
+  spawn("rm", ["-rf", dir])
+  const order: Timed[] = []
+  for r in rows {
+    let j = order.length
+    while j > 0 && ratioOf(order[j - 1]) < ratioOf(r) { j = j - 1 }
+    order.push(r)
+    let m = order.length - 1
+    while m > j {
+      order[m] = order[m - 1]
+      m = m - 1
+    }
+    order[j] = r
+  }
+  print(
+    "\n\{rows.length} module pair(s) · min of \{reps} `vl build` runs each · times in ms",
+  )
+  const head = cols(["aloneA", "aloneB", "together"], 8)
+  print(
+    "  \{padRight("first", 14)} \{padRight("second", 14)} \{head} \{padLeft("ratio", 7)}",
+  )
+  let flagged = 0
+  for r in order {
+    const ratio = ratioOf(r)
+    let mark = ""
+    if ratio > factor {
+      mark = "  SUPERLINEAR"
+      flagged = flagged + 1
+    }
+    const names = "\{padRight(byId(r.first).module, 14)} \{padRight(byId(r.second).module, 14)}"
+    const times = cols([pyFixed(r.a, 1), pyFixed(r.b, 1), pyFixed(r.t, 1)], 8)
+    print("  \{names} \{times} \{padLeft(pyFixed(ratio, 2), 7)}\{mark}")
+  }
+  print(
+    "\n\{flagged} pair(s) over \{pyFixed(factor, 1)}x the sum of the two alone-times",
+  )
+  0
+}
+
+// ── the controls ──────────────────────────────────────────────────────────────────
+// The liveness controls are SYNTHETIC, each resting on a rule the design will always
+// enforce; closed rows are AGREE pins. A control built on a live defect evaporates the
+// day the defect is fixed (D1473, #2476).
+
+type Control = {
+  id: string,
+  why: string,
+  pair: JsonMap,
+  verdict: string,
+  ga: string,
+  gb: string,
+}
+
+function pairOf(a: JsonMap, b: JsonMap): JsonMap {
+  const p: JsonMap = Map()
+  p["a"] = a
+  p["b"] = b
+  p
+}
+
+function faceList(kv: string[]): Map<string, string> {
+  const m: Map<string, string> = Map()
+  let i = 0
+  while i + 1 < kv.length {
+    m[kv[i]] = kv[i + 1]
+    i = i + 2
+  }
+  m
+}
+
+function specList(kv: string[]): JsonMap { jfaces(faceList(kv)) }
+
+// Both faces rendered from the grammar, `b` with `axis` flipped to `other`.
+function rendered(
+  sp: JsonMap,
+  faces: Map<string, string>,
+  axis: string,
+  other: string,
+): JsonMap {
+  const fb: Map<string, string> = Map()
+  for k, v in faces { fb[k] = v }
+  fb[axis] = other
+  const ra = renderSpec(sp, faces)
+  const rb = renderSpec(sp, fb)
+  pairOf(side(ra.src, ra.want, faces[axis] ?? ""), side(rb.src, rb.want, other))
+}
+
+function splitPin(single: string, split2: string, want: string[]): JsonMap {
+  pairOf(side(single, want, "single"), side(split2, want, "split"))
+}
+
+const D1473_SPEC = [
+  "value", "dunion", "read", "eq_narrow", "position", "binding", "scenery",
+  "push", "source", "literal",
+]
+const D1473_FACES = [
+  "named_vs_inline", "named", "annotated_vs_inferred", "annotated", "narrowing",
+  "eq_narrow", "fusion", "bound", "pinning", "direct", "scope", "module",
+  "scenery", "bare", "init_vs_assign", "init",
+]
+const D1500_SPEC = [
+  "value", "i32", "read", "bare", "position", "binding", "scenery", "push",
+  "source", "index",
+]
+const D1500_FACES = [
+  "named_vs_inline", "named", "annotated_vs_inferred", "inferred", "narrowing",
+  "bare", "fusion", "bound", "pinning", "direct", "scope", "function",
+  "scenery", "bare", "init_vs_assign", "init",
+]
+
+// The three module rows as two-file agree pins: each row's cross-module witness beside
+// the same program spelled as one file.
+const D1593_SINGLE = "type E = { msg: string }\nfunction pick(): i32 | E { return 7 }\nconst T = __array_new__(4, 0)\nfor n in 0 to 3 {\n  let c = n\n  c = c + 1\n  T[n] = c\n}\nprint(T[3])\nif true {\n  const n = pick()\n  if n is E { print(0) } else { print(n) }\n}\n"
+const D1593_SPLIT = "// file: table.vl\nexport const T = __array_new__(4, 0)\nfor n in 0 to 3 {\n  let c = n\n  c = c + 1\n  T[n] = c\n}\n// file: entry.vl\nimport { T } from \"./table\"\ntype E = { msg: string }\nfunction pick(): i32 | E { return 7 }\nprint(T[3])\nif true {\n  const n = pick()\n  if n is E { print(0) } else { print(n) }\n}\n"
+const D1595_SINGLE = "const T = __array_new__(2, 0)\nfor n in 0 to 1 { T[n] = n }\nprint(T[1])\nif true {\n  const n = \"hi\"\n  print(n)\n}\n"
+const D1595_SPLIT = "// file: loop.vl\nexport const T = __array_new__(2, 0)\nfor n in 0 to 1 { T[n] = n }\n// file: entry.vl\nimport { T } from \"./loop\"\nprint(T[1])\nif true {\n  const n = \"hi\"\n  print(n)\n}\n"
+const D1596_SINGLE = "type Cell = { base: i32 }\nfunction mk(n: i32): Cell { return { base: n } }\nfunction ld(self: Cell) { self.base }\nfunction adler32(buf) { buf.ld() }\nif true {\n  const out = mk(1)\n  print(adler32(out))\n}\n"
+const D1596_SPLIT = "// file: buf.vl\nexport type Cell = { base: i32 }\nexport function mk(n: i32): Cell { return { base: n } }\nexport function ld(self: Cell) { self.base }\n// file: entry.vl\nimport { Cell, ld, mk } from \"./buf\"\nfunction adler32(buf) { buf.ld() }\nif true {\n  const out = mk(1)\n  print(adler32(out))\n}\n"
+
+const MODULE_SIX = "// file: a.vl\nexport function six(): i32 { return 6 }\n// file: main.vl\nimport { six } from \"./a\"\n"
+
+// Two std imports in one module, both used, for a control that fails on a TYPE.
+const IMPORTS_TWO = "import { filled } from \"std:array\"\nimport { toString } from \"std:fmt\"\n"
+
+function controls(): Control[] {
+  // The imports pin's wants are written out, never taken from the render under test.
+  const imp = importsSpec("array", "fmt")
+  [
+    {
+      id: "synthetic/check",
+      why: "a design type error beside the program it breaks",
+      pair: pairOf(
+        side("const v: i32 = 7\nprint(v)\n", ["7"], "legal"),
+        side("const v: i32 = \"seven\"\nprint(v)\n", ["7"], "ill-typed"),
+      ),
+      verdict: "DISAGREE",
+      ga: "RUNS",
+      gb: "check refuses",
+    },
+    {
+      id: "synthetic/trap",
+      why: "a bounds-checked index, which is a design rule",
+      pair: pairOf(
+        side("const xs: i32[] = [1, 2]\nprint(xs[1])\n", ["2"], "in range"),
+        side("const xs: i32[] = [1, 2]\nprint(xs[9])\n", ["2"], "out of range"),
+      ),
+      verdict: "DISAGREE",
+      ga: "RUNS",
+      gb: "TRAP (program)",
+    },
+    {
+      id: "synthetic/wrong",
+      why: "rc 0 with the wrong value is a hit, not a pass",
+      pair: pairOf(
+        side("print(2)\n", ["2"], "right"),
+        side("print(12)\n", ["2"], "wrong"),
+      ),
+      verdict: "RUNS-WRONG",
+      ga: "RUNS",
+      gb: "RUNS-WRONG",
+    },
+    {
+      id: "D1473/agree",
+      why: "closed #2476 — inline arms must keep matching named",
+      pair: rendered(
+        specList(D1473_SPEC),
+        faceList(D1473_FACES),
+        "named_vs_inline",
+        "inline",
+      ),
+      verdict: "AGREE-RUNS",
+      ga: "RUNS",
+      gb: "RUNS",
+    },
+    {
+      id: "D1500/agree",
+      why: "closed #2479 — `let v = 0` then `v = xs[0]` must run",
+      pair: rendered(
+        specList(D1500_SPEC),
+        faceList(D1500_FACES),
+        "init_vs_assign",
+        "assign",
+      ),
+      verdict: "AGREE-RUNS",
+      ga: "RUNS",
+      gb: "RUNS",
+    },
+    {
+      id: "synthetic/modules-check",
+      why: "an imported `i32` into a `string` destination is a design type error",
+      pair: pairOf(
+        side(MODULE_SIX + "const v: i32 = six()\nprint(v * 7)\n", ["42"], "legal"),
+        side(
+          MODULE_SIX + "const v: string = six()\nprint(v * 7)\n",
+          ["42"],
+          "ill-typed",
+        ),
+      ),
+      verdict: "DISAGREE",
+      ga: "RUNS",
+      gb: "check refuses",
+    },
+    {
+      id: "synthetic/imports-check",
+      why: "a std `string` result into an `i32` destination, two imports deep",
+      pair: pairOf(
+        side(
+          IMPORTS_TWO + "const v: string = toString(filled(3, 0).length)\nprint(v)\n",
+          ["3"],
+          "legal",
+        ),
+        side(
+          IMPORTS_TWO + "const v: i32 = toString(filled(3, 0).length)\nprint(v)\n",
+          ["3"],
+          "ill-typed",
+        ),
+      ),
+      verdict: "DISAGREE",
+      ga: "RUNS",
+      gb: "check refuses",
+    },
+    {
+      id: "imports_pair/agree",
+      why: "one std import and two must agree at the same first half",
+      pair: pairOf(
+        side(renderImports(imp, "alone").src, ["3"], "alone"),
+        side(renderImports(imp, "together").src, ["3", "41!"], "together"),
+      ),
+      verdict: "AGREE-RUNS",
+      ga: "RUNS",
+      gb: "RUNS",
+    },
+    {
+      id: "D1593/agree",
+      why: "closed #2521 — a module's loop variable must not claim the importer's block binding",
+      pair: splitPin(D1593_SINGLE, D1593_SPLIT, ["4", "7"]),
+      verdict: "AGREE-RUNS",
+      ga: "RUNS",
+      gb: "RUNS",
+    },
+    {
+      id: "D1595/agree",
+      why: "closed #2523 — scratch-frame detection across the merged start function",
+      pair: splitPin(D1595_SINGLE, D1595_SPLIT, ["1", "hi"]),
+      verdict: "AGREE-RUNS",
+      ga: "RUNS",
+      gb: "RUNS",
+    },
+    {
+      id: "D1596/agree",
+      why: "closed #2524 — a hole parameter pinned from a block binding across the import",
+      pair: splitPin(D1596_SINGLE, D1596_SPLIT, ["1"]),
+      verdict: "AGREE-RUNS",
+      ga: "RUNS",
+      gb: "RUNS",
+    },
+  ]
+}
+
+function pyPair(a: string, b: string): string { "(\{pyRepr(a)}, \{pyRepr(b)})" }
+
+// Grade every control and say which ones are not speaking.
+function control(c: Ctx, jobs: i32): i32 {
+  const rows = controls()
+  const pairs: JsonMap[] = []
+  let i = 0
+  for r in rows {
+    const p = r.pair
+    p["seed"] = -1.0
+    p["index"] = i as f64
+    p["axis"] = "control"
+    p["features"] = jstrs(["control"])
+    pairs.push(p)
+    i = i + 1
+  }
+  gradePairs(c, pairs, jobs)
+  const bad: string[] = []
+  i = 0
+  for r in rows {
+    const g = pairs[i]
+    const ga = str(obj(g, "a"), "grade")
+    const gb = str(obj(g, "b"), "grade")
+    const v = str(g, "verdict")
+    const ok = v == r.verdict && ga == r.ga && gb == r.gb
+    if !ok {
+      bad.push(
+        "  \{r.id} (\{r.why})\n    want \{r.verdict} \{pyPair(r.ga, r.gb)}, got \{v} \{pyPair(ga, gb)}",
+      )
+    }
+    const said = if ok { "OK" } else { "NOT SPEAKING" }
+    print(
+      "  \{padRight(r.id, 16)} \{padRight(v, 13)} \{padRight(ga, 11)} / \{padRight(gb, 18)} \{said}",
+    )
+    i = i + 1
+  }
+  if bad.length > 0 {
+    print(
+      "\n"
+        + toString(bad.length)
+        + " control(s) NOT SPEAKING — the sampler cannot be believed:",
+    )
+    for b in bad { print(b) }
+    return 1
+  }
+  print("\nall " + toString(rows.length) + " controls speaking")
+  0
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────────
+
+const USAGE = "usage: sample.vl [-h] [--seed SEED] [--count COUNT] [--out OUT] [--compiler COMPILER] [--jobs JOBS] [--replay REPLAY] [--report REPORT [REPORT ...]] [--imports-report IMPORTS_REPORT [IMPORTS_REPORT ...]] [--control] [--no-cover] [--axis AXIS] [--exclude EXCLUDE] [--json]"
+
+function usageError(msg: string): i32 {
+  print(USAGE)
+  print("sample.vl: error: " + msg)
+  2
+}
+
+function counted(keys: string[]): JsonMap {
+  const m: JsonMap = Map()
+  for k in keys {
+    const n = m[k]
+    m[k] = if n is f64 { n + 1.0 } else { 1.0 }
+  }
+  m
+}
+
+function main(args: string[]): i32 {
+  if args.length == 2 && args[0] == "--grade-job" {
+    gradeJob(args[1])
+    return 0
+  }
+  const abs = cwd()
+  let seed = 1
+  let count = 40
+  let out = ""
+  let compiler = abs + "/build/vl-compiler.wasm"
+  let jobs = 4
+  let replayPath = ""
+  const reports: string[] = []
+  const importsReports: string[] = []
+  let doControl = false
+  let noCover = false
+  let axis = ""
+  let excl = ""
+  let asJson = false
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    let val: string | null = null
+    const eq = findFrom(a, "=", 0)
+    if startsWith(a, "--") && eq > 0 {
+      val = a.slice(eq + 1, a.length)
+      a = a.slice(0, eq)
+    }
+    if a == "-h" || a == "--help" {
+      print(USAGE)
+      return 0
+    }
+    if a == "--control" || a == "--no-cover" || a == "--json" {
+      if a == "--control" { doControl = true }
+      if a == "--no-cover" { noCover = true }
+      if a == "--json" { asJson = true }
+      i = i + 1
+      continue
+    }
+    if a == "--report" || a == "--imports-report" {
+      const into = if a == "--report" { reports } else { importsReports }
+      if val is string { into.push(val) }
+      i = i + 1
+      while i < args.length && !startsWith(args[i], "-") {
+        into.push(args[i])
+        i = i + 1
+      }
+      if into.length == 0 {
+        return usageError("argument " + a + ": expected at least one argument")
+      }
+      continue
+    }
+    const known = [
+      "--seed", "--count", "--out", "--compiler", "--jobs", "--replay",
+      "--axis", "--exclude",
+    ]
+    let isKnown = false
+    for k in known {
+      if k == a { isKnown = true }
+    }
+    if !isKnown { return usageError("unrecognized arguments: " + args[i]) }
+    let v = ""
+    if val is string {
+      v = val
+      i = i + 1
+    } else {
+      if i + 1 >= args.length {
+        return usageError("argument " + a + ": expected one argument")
+      }
+      v = args[i + 1]
+      i = i + 2
+    }
+    if a == "--seed" || a == "--count" || a == "--jobs" {
+      const n = parseI32(v)
+      if n == null {
+        return usageError("argument " + a + ": invalid int value: " + pyRepr(v))
+      }
+      if a == "--seed" { seed = n ?? 0 }
+      if a == "--count" { count = n ?? 0 }
+      if a == "--jobs" { jobs = n ?? 0 }
+    } else if a == "--out" {
+      out = v
+    } else if a == "--compiler" {
+      compiler = v
+    } else if a == "--replay" {
+      replayPath = v
+    } else if a == "--axis" {
+      axis = v
+    } else {
+      excl = v
+    }
+  }
+  const ids: string[] = []
+  for x in split(excl, ",") {
+    if x != "" { ids.push(x) }
+  }
+  exclude(ids)
+  const c: Ctx = {
+    vl: abs + "/scripts/vl-host/target/release/vl",
+    compiler: compiler,
+    std: abs + "/std",
+  }
+  if doControl { return control(c, jobs) }
+  if reports.length > 0 {
+    const pairs: JsonMap[] = []
+    for f in reports {
+      for p in loadJsonl(f) { pairs.push(p) }
+    }
+    report(pairs)
+    return 0
+  }
+  if importsReports.length > 0 { return importsReport(c, importsReports) }
+  if replayPath != "" { return replay(c, replayPath, jobs) }
+
+  const pairs = buildSample(seed, count, !noCover, axis)
+  gradePairs(c, pairs, jobs)
+  if out != "" { writeJsonl(out, pairs) }
+  if asJson {
+    const vs: string[] = []
+    const axes: Map<string, boolean> = Map()
+    for p in pairs {
+      vs.push(str(p, "verdict"))
+      axes[str(p, "axis")] = true
+    }
+    const axisList: string[] = []
+    for k, _v in axes { axisList.push(k) }
+    const gs: string[] = []
+    for s in sides(pairs) { gs.push(str(s, "grade")) }
+    const m: JsonMap = Map()
+    m["pairs"] = pairs.length as f64
+    m["verdicts"] = counted(vs)
+    m["axes"] = jstrs(sortStrings(axisList))
+    m["grammar_axes"] = jstrs(sortStrings(axisIds()))
+    m["verdict_vocabulary"] = jstrs(sortStrings(VERDICTS))
+    m["grade_vocabulary"] = jstrs(sortStrings(GRADES))
+    m["grades"] = counted(gs)
+    m["multi_file"] = multiFile(pairs) as f64
+    print(dumpSorted(m))
+    return 0
+  }
+  report(pairs)
+  if out != "" { print("\nwrote " + out) }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("sample: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

@@ -50,7 +50,7 @@ if [ -z "${VL_WASM_OPT:-}" ] && [ -x "$ROOT/node_modules/binaryen/bin/wasm-opt" 
   export VL_WASM_OPT="$ROOT/node_modules/binaryen/bin/wasm-opt"
 fi
 
-mkdir -p "$WORK" "$OUT" || exit 1
+mkdir -p "$WORK" "$WORK/exp" "$OUT" || exit 1
 NDJSON="$OUT/raw.ndjson"
 # BENCH_REPORT_ONLY=1 regenerates results.json + summary.md from an existing
 # raw.ndjson without re-measuring anything.
@@ -83,6 +83,8 @@ command -v deno    >/dev/null 2>&1 || have_deno=0
 RUSTC_V="$(rustc --version 2>/dev/null | head -1)"
 DENO_V="$(deno --version 2>/dev/null | head -1)"
 VL_V="$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null)"
+# bench/meta.vl and bench/report.vl run on the vl binary, so it is not optional.
+[ "$have_vl" = "1" ] || { echo "no vl binary at $VL (bench/meta.vl and bench/report.vl run on it)" >&2; exit 1; }
 
 echo "== VL benchmark harness =="
 echo "   root      $ROOT"
@@ -96,7 +98,15 @@ echo
 
 # --- json helpers ------------------------------------------------------------
 # jstr <s>  -> a JSON string literal, safely escaped.
-jstr() { python3 -c 'import json,sys;sys.stdout.write(json.dumps(sys.stdin.read()))'; }
+#   Backslash, quote, newline, tab and return get their short escapes; every other
+#   control character becomes \u00XX. Bytes >= 0x80 pass through as UTF-8.
+JSTR_SED=(-e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/\\n/g' -e 's/\t/\\t/g' -e 's/\r/\\r/g')
+for _c in $(seq 1 31); do
+  case $_c in 9|10|13) continue;; esac
+  _h=$(printf '%02x' "$_c")
+  JSTR_SED+=(-e "s/\\x$_h/\\\\u00$_h/g")
+done
+jstr() { printf '"'; sed -z "${JSTR_SED[@]}"; printf '"'; }
 
 emit() { # emit <json-object-line>
   printf '%s\n' "$1" >> "$NDJSON"
@@ -241,40 +251,12 @@ for meta in $metas; do
   if [ -n "$FILTER" ] && ! printf '%s' "$bench" | grep -Eq "$FILTER"; then continue; fi
 
   # --- read meta -------------------------------------------------------------
-  # Emits, on separate lines: VOID-reason (or empty), axis, then
-  # writes the expect files for main and each extra .vl variant.
-  info=$(python3 - "$meta" "$WORK" <<'PYEOF'
-import json,sys,os,re
-meta_path, work = sys.argv[1], sys.argv[2]
-m = json.load(open(meta_path))
-d = os.path.dirname(meta_path)
-cat = os.path.basename(os.path.dirname(d)); nm = os.path.basename(d)
-bench = cat + "/" + nm
-exp = m.get("expect", "")
-os.makedirs(os.path.join(work, "exp"), exist_ok=True)
-def w(tag, s):
-    p = os.path.join(work, "exp", (bench.replace("/", "_")) + "." + tag + ".expect")
-    open(p, "w").write(s)
-    return p
-w("main", exp)
-variants = []
-for f in sorted(os.listdir(d)):
-    if not f.endswith(".vl") or f == "main.vl":
-        continue
-    stem = f[:-3]
-    key = "expect" + "".join(p.capitalize() for p in re.split(r"[-_]", stem))
-    w(stem, m.get(key, exp))
-    variants.append(stem)
-print(json.dumps({
-    "void": m.get("void", ""),
-    "axis": m.get("axis", ""),
-    "variants": variants,
-}))
-PYEOF
-)
-  voidreason=$(printf '%s' "$info" | python3 -c 'import json,sys;print(json.load(sys.stdin)["void"])')
-  axis=$(printf '%s' "$info" | python3 -c 'import json,sys;print(json.load(sys.stdin)["axis"])')
-  variants=$(printf '%s' "$info" | python3 -c 'import json,sys;print(" ".join(json.load(sys.stdin)["variants"]))')
+  # bench/meta.vl writes the expect files for main and each extra .vl variant, and
+  # the VOID reason, axis and variant list as <workdir>/exp/<cat>_<name>.{void,axis,variants}.
+  "$VL" run bench/meta.vl -- "$meta" "$WORK" || { echo "-- $bench : meta.json unreadable --" >&2; exit 1; }
+  voidreason=$(cat "$WORK/exp/${cat_}_${nm}.void")
+  axis=$(cat "$WORK/exp/${cat_}_${nm}.axis")
+  variants=$(cat "$WORK/exp/${cat_}_${nm}.variants")
 
   if [ -n "$voidreason" ]; then
     ej=$(printf '%s' "$voidreason" | jstr)
@@ -368,351 +350,10 @@ fi  # end of the measuring phase (skipped under BENCH_REPORT_ONLY)
 # =============================================================================
 echo
 echo "-- writing report --"
-BENCH_RAW="$NDJSON" BENCH_OUTDIR="$OUT" BENCH_REPS_R="$REPS" BENCH_PIN_R="$PIN_RECORDED" \
-BENCH_RUSTC="$RUSTC_V" BENCH_DENO="$DENO_V" BENCH_COMMIT="$VL_V" \
-BENCH_QUICK_R="${BENCH_QUICK:-0}" BENCH_NOISE_R="$NOISE_BENCH" \
-python3 - <<'PYREPORT'
-import json, os, re, sys, datetime
-
-raw   = os.environ["BENCH_RAW"]
-outd  = os.environ["BENCH_OUTDIR"]
-reps  = int(os.environ["BENCH_REPS_R"])
-pin   = os.environ["BENCH_PIN_R"]
-quick = os.environ["BENCH_QUICK_R"] == "1"
-
-# --- verdict thresholds (defended in bench/README.md) -----------------------
-DENO_WIN, DENO_PAR, DENO_PRIORITY = 0.80, 1.25, 2.00
-RUST_HEADROOM_FLAG = 10.0
-
-recs = [json.loads(l) for l in open(raw) if l.strip()]
-runs, builds, metas, voids = {}, {}, {}, []
-notes = {}
-for r in recs:
-    k = r.get("kind")
-    if k == "note":
-        notes.setdefault(r["bench"], []).append(r["note"])
-    elif k == "run":
-        runs.setdefault(r["bench"], {})[r["config"]] = r
-    elif k == "build":
-        builds.setdefault(r["bench"], {})[r["config"]] = r
-    elif k == "meta":
-        metas[r["bench"]] = r
-    elif k == "void":
-        voids.append(r)
-
-startup = {}
-for cfg, rec in runs.get("_startup", {}).items():
-    startup[cfg] = rec["median_ms"] if rec["status"] == "OK" else None
-
-def med(b, cfg):
-    r = runs.get(b, {}).get(cfg)
-    if r and r["status"] == "OK" and r["median_ms"] is not None:
-        return float(r["median_ms"])
-    return None
-
-def mini(b, cfg):
-    r = runs.get(b, {}).get(cfg)
-    if r and r["status"] == "OK" and r["min_ms"] is not None:
-        return float(r["min_ms"])
-    return None
-
-def st(b, cfg):
-    r = runs.get(b, {}).get(cfg)
-    return r["status"] if r else "ABSENT"
-
-def net(ms, base_cfg):
-    """Startup-subtracted time. Ratios are computed on NET times so a short
-    benchmark compares languages rather than process launchers."""
-    if ms is None:
-        return None
-    b = startup.get(base_cfg)
-    if b is None:
-        return ms
-    return max(ms - b, 0.001)
-
-def ratio(a, b):
-    if a is None or b is None or b <= 0:
-        return None
-    return a / b
-
-def f(x, nd=1):
-    return "-" if x is None else ("%.*f" % (nd, x))
-
-# --- noise floor ------------------------------------------------------------
-noise = []
-for cfg, base in (("vl-repeat", "vl"), ("rust-repeat", "rust"), ("deno-repeat", "deno")):
-    a = med("_noise", cfg)
-    nb = os.environ.get("BENCH_NOISE_R", "arith/i32-accum")
-    b = med(nb, base)
-    if a and b:
-        noise.append({"runtime": base, "bench": nb, "first_median_ms": b,
-                      "repeat_median_ms": a, "spread_pct": abs(a - b) / b * 100.0})
-# within-config spread (max-min)/median across every OK run, as a second read
-spreads = []
-for b, cfgs in runs.items():
-    if b.startswith("_"):
-        continue
-    for c, r in cfgs.items():
-        if r["status"] == "OK" and r["median_ms"]:
-            spreads.append((float(r["max_ms"]) - float(r["min_ms"])) / float(r["median_ms"]) * 100.0)
-spreads.sort()
-def pct(p):
-    return spreads[min(len(spreads) - 1, int(len(spreads) * p))] if spreads else None
-
-# Outlier accounting. On a shared box the dominant artefact is a SINGLE run per
-# configuration landing 2-3x high because an unrelated process ran. Count them,
-# so the report can say whether the spread is broad noise (bad — the medians are
-# soft) or isolated interference (fine — the median absorbs it).
-n_runs_total = n_runs_with_outlier = n_indiv_outliers = 0
-for b, cfgs in runs.items():
-    for c, r in cfgs.items():
-        if r["status"] != "OK" or not r["times_ms"]:
-            continue
-        n_runs_total += 1
-        m = float(r["median_ms"])
-        o = [t for t in r["times_ms"] if float(t) > 1.5 * m]
-        if o:
-            n_runs_with_outlier += 1
-            n_indiv_outliers += len(o)
-n_samples_total = sum(len(r["times_ms"]) for c in runs.values() for r in c.values())
-noise_floor_pct = max([n["spread_pct"] for n in noise] + [pct(0.5) or 0.0]) if (noise or spreads) else 0.0
-
-# --- per-benchmark rows -----------------------------------------------------
-rows = []
-for b in sorted(metas):
-    cat, nm = b.split("/", 1)
-    axis = metas[b].get("axis", "")
-    varlist = [v for v in metas[b].get("variants", "").split() if v]
-    r_rust = med(b, "rust")
-    r_vl   = med(b, "vl")
-    r_o1   = med(b, "vl-O")
-    r_o3   = med(b, "vl-O3")
-    r_deno = med(b, "deno")
-    variants = {v: med(b, "vl-" + v) for v in varlist}
-
-    # min-of-N cross-check: less contaminated by a noisy neighbour, and the
-    # honest tie-breaker when the median-based verdict sits near a threshold.
-    mn_vl = net(mini(b, "vl"), "vl"); mn_deno = net(mini(b, "deno"), "deno")
-    mn_rust = net(mini(b, "rust"), "rust")
-    vl_deno_min = ratio(mn_vl, mn_deno)
-    vl_rust_min = ratio(mn_vl, mn_rust)
-
-    n_rust = net(r_rust, "rust"); n_vl = net(r_vl, "vl")
-    n_o1 = net(r_o1, "vl")
-    n_o3 = net(r_o3, "vl"); n_deno = net(r_deno, "deno")
-    n_var = {v: net(x, "vl") for v, x in variants.items()}
-
-    vl_deno = ratio(n_vl, n_deno)
-    vl_rust = ratio(n_vl, n_rust)
-    o3_deno = ratio(n_o3, n_deno)
-    best_vl = min([x for x in [n_vl, n_o1, n_o3] + list(n_var.values()) if x], default=None)
-    best_vl_deno = ratio(best_vl, n_deno)
-
-    if vl_deno is None:
-        verdict = "NO-DATA"
-    elif vl_deno > DENO_PRIORITY:
-        verdict = "PRIORITY-LOSS"
-    elif vl_deno > DENO_PAR:
-        verdict = "LOSS"
-    elif vl_deno < DENO_WIN:
-        verdict = "WIN"
-    else:
-        verdict = "PAR"
-
-    flags = []
-    if vl_rust is not None and vl_rust > RUST_HEADROOM_FLAG:
-        flags.append("RUST-GAP-%.0fx" % vl_rust)
-    # opt/variant gap: idiomatic vs the fastest hand-spelling = a DEFECT signal
-    if n_var:
-        bestv = min(n_var.values())
-        if n_vl and bestv and n_vl / bestv > 1.15:
-            vn = [k for k, v in n_var.items() if v == bestv][0]
-            flags.append("IDIOM-GAP-%.2fx(%s)" % (n_vl / bestv, vn))
-    if n_vl and n_o3 and n_vl / n_o3 > 1.15:
-        flags.append("O3-GAP-%.2fx" % (n_vl / n_o3))
-    if n_vl and n_o3 and n_o3 / n_vl > 1.15:
-        flags.append("O3-REGRESSION-%.2fx" % (n_o3 / n_vl))
-    # The two optimizer failure modes, which a default-vs-O3 pair cannot tell
-    # apart. OPT-LOSES: BOTH optimized rungs are worse than no optimization, so
-    # the loser is wasm-opt on this shape. O3-WORSE-THAN-O: -O is the best rung
-    # and -O3's extra passes give the win back. Different diagnoses, different
-    # fixes -- see perf-landscape.md 2.4a.
-    if n_vl and n_o1 and n_o3:
-        best_opt = min(n_o1, n_o3)
-        if best_opt / n_vl > 1.05:
-            flags.append("OPT-LOSES-%.2fx" % (best_opt / n_vl))
-        if n_o3 / n_o1 > 1.10:
-            flags.append("O3-WORSE-THAN-O-%.2fx" % (n_o3 / n_o1))
-        if n_o1 / n_o3 > 1.10:
-            flags.append("O-WORSE-THAN-O3-%.2fx" % (n_o1 / n_o3))
-    flags.extend(notes.get(b, []))
-    # startup contamination
-    for lab, rawms, base in (("rust", r_rust, "rust"), ("deno", r_deno, "deno"), ("vl", r_vl, "vl")):
-        if rawms and startup.get(base) and startup[base] / rawms > 0.10:
-            flags.append("STARTUP>%d%%(%s)" % (int(startup[base] / rawms * 100), lab))
-
-    statuses = {c: st(b, c) for c in ("rust", "vl", "vl-O", "vl-O3", "deno")}
-    bad = {c: s for c, s in statuses.items() if s not in ("OK",)}
-    bstat = {c: r["status"] for c, r in builds.get(b, {}).items() if r["status"] != "OK"}
-
-    rows.append(dict(
-        bench=b, category=cat, name=nm, axis=axis,
-        raw_ms=dict(rust=r_rust, vl=r_vl, vl_O=r_o1, vl_O3=r_o3, deno=r_deno, variants=variants),
-        net_ms=dict(rust=n_rust, vl=n_vl, vl_O=n_o1, vl_O3=n_o3, deno=n_deno, variants=n_var),
-        vl_over_deno=vl_deno, vl_over_rust=vl_rust,
-        vl_over_deno_minofN=vl_deno_min, vl_over_rust_minofN=vl_rust_min,
-        vlO3_over_deno=o3_deno, best_vl_over_deno=best_vl_deno,
-        verdict=verdict, flags=flags,
-        failures=bad, build_failures=bstat,
-        compile_ms=dict(
-            vl=(builds.get(b, {}).get("vl-build") or {}).get("median_ms"),
-            vl_O3=(builds.get(b, {}).get("vl-build-O3") or {}).get("median_ms"),
-            rustc_O=(builds.get(b, {}).get("rustc-O-build") or {}).get("median_ms")),
-    ))
-
-results = dict(
-    generated=datetime.datetime.now().isoformat(timespec="seconds"),
-    preliminary=True,
-    quick=quick,
-    method=dict(
-        reps=reps, statistic="median of reps (min/max also recorded)",
-        taskset=pin,
-        ratios_use="startup-subtracted (net) times",
-        vl_execution="prebuilt .wasm via `vl run <file.wasm>`; compile time measured separately",
-        note="OTHER WORK MAY HAVE BEEN ON THE MACHINE — treat as PRELIMINARY.",
-    ),
-    versions=dict(rustc=os.environ.get("BENCH_RUSTC", ""),
-                  deno=os.environ.get("BENCH_DENO", ""),
-                  vl_repo_commit=os.environ.get("BENCH_COMMIT", "")),
-    thresholds=dict(deno_win=DENO_WIN, deno_par=DENO_PAR, deno_priority=DENO_PRIORITY,
-                    rust_headroom_flag=RUST_HEADROOM_FLAG),
-    startup_baseline_ms=startup,
-    noise=dict(repeat_probe=noise, within_config_spread_pct=dict(
-        p50=pct(0.5), p90=pct(0.9), p99=pct(0.99)), noise_floor_pct=noise_floor_pct,
-        outliers=dict(rule=">1.5x that configuration's own median",
-                      configurations=n_runs_total,
-                      configurations_with_an_outlier=n_runs_with_outlier,
-                      individual_samples=n_samples_total,
-                      outlier_samples=n_indiv_outliers)),
-    void=[dict(bench=v["bench"], reason=v["reason"]) for v in voids],
-    benchmarks=rows,
-)
-os.makedirs(outd, exist_ok=True)
-json.dump(results, open(os.path.join(outd, "results.json"), "w"), indent=2)
-
-# --- summary.md -------------------------------------------------------------
-L = []
-A = L.append
-A("# VL cross-runtime benchmark results (PRELIMINARY)")
-A("")
-A("Generated %s by `bench/run.sh`. **PRELIMINARY** — other work may have been on the" % results["generated"])
-A("machine during this sweep. Re-run `bench/run.sh` on an idle box for authoritative numbers.")
-A("")
-A("| | |")
-A("|---|---|")
-A("| reps per configuration | %d (median reported; min/max in results.json) |" % reps)
-A("| cpu pinning | `taskset -c %s` |" % pin)
-A("| rustc | %s |" % results["versions"]["rustc"])
-A("| deno | %s |" % results["versions"]["deno"])
-A("| vl repo commit | %s |" % results["versions"]["vl_repo_commit"])
-A("| VL execution | prebuilt `.wasm` (`vl run x.wasm`); compile time is a separate column |")
-A("| ratios | computed on **startup-subtracted** times |")
-A("")
-A("## Startup baseline (empty program)")
-A("")
-A("| runtime | median ms |")
-A("|---|---|")
-for k in ("rust", "vl", "vl-run-src", "deno"):
-    if k in startup:
-        A("| %s | %s |" % (k, f(startup[k], 2)))
-A("")
-A("`vl-run-src` is compile+run of an empty program in one process; `vl` is a prebuilt module.")
-A("")
-A("## Noise floor")
-A("")
-if noise:
-    A("| runtime | bench | first median ms | repeat median ms | spread |")
-    A("|---|---|---|---|---|")
-    for n in noise:
-        A("| %s | %s | %s | %s | %.1f%% |" % (n["runtime"], n["bench"],
-          f(n["first_median_ms"], 2), f(n["repeat_median_ms"], 2), n["spread_pct"]))
-A("")
-A("Within-configuration (max-min)/median across every measured run: p50 %s%%, p90 %s%%, p99 %s%%."
-  % (f(pct(0.5)), f(pct(0.9)), f(pct(0.99))))
-A("")
-A("Outliers (a single sample >1.5x its own configuration's median): **%d of %d samples**, "
-  "affecting %d of %d configurations. Almost every affected configuration has exactly ONE such "
-  "sample, i.e. this is isolated interference from unrelated work on the box rather than broad "
-  "noise — which is why the median of %d absorbs it and why the `vl/deno(min)` column below "
-  "should agree with `vl/deno`. Where they disagree, believe neither and re-run."
-  % (n_indiv_outliers, n_samples_total, n_runs_with_outlier, n_runs_total, reps))
-A("")
-A("**Noise floor taken as %.1f%%.** Differences smaller than this are not differences." % noise_floor_pct)
-A("")
-A("## Results")
-A("")
-A("Times are medians in **ms**, startup-subtracted. `vl/rust` is HEADROOM, not a loss.")
-A("")
-A("| benchmark | rust | vl | vl -O | vl -O3 | deno | vl/rust | vl/deno | vl/deno(min) | verdict | flags |")
-A("|---|--:|--:|--:|--:|--:|--:|--:|--:|---|---|")
-order = {"PRIORITY-LOSS": 0, "LOSS": 1, "NO-DATA": 2, "PAR": 3, "WIN": 4}
-for r in sorted(rows, key=lambda r: (order.get(r["verdict"], 9),
-                                     -(r["vl_over_deno"] or 0))):
-    A("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-        r["bench"], f(r["net_ms"]["rust"]), f(r["net_ms"]["vl"]),
-        f(r["net_ms"]["vl_O"]), f(r["net_ms"]["vl_O3"]),
-        f(r["net_ms"]["deno"]),
-        f(r["vl_over_rust"], 2), f(r["vl_over_deno"], 2), f(r["vl_over_deno_minofN"], 2),
-        r["verdict"], ", ".join(r["flags"]) or ""))
-A("")
-A("## Extra VL spellings (opt.vl / toplevel.vl / globals.vl / ...)")
-A("")
-A("A gap between `main.vl` and a hand-spelled variant is a **defect to file**, never a tip.")
-A("")
-A("| benchmark | vl (idiomatic) | variant | variant ms | idiomatic/variant |")
-A("|---|--:|---|--:|--:|")
-for r in rows:
-    for v, ms in sorted(r["net_ms"]["variants"].items()):
-        A("| %s | %s | %s | %s | %s |" % (r["bench"], f(r["net_ms"]["vl"]), v, f(ms),
-          f(ratio(r["net_ms"]["vl"], ms), 2)))
-A("")
-A("## Compile time (never inside an execution number)")
-A("")
-A("| benchmark | vl build | vl build -O3 | rustc -O |")
-A("|---|--:|--:|--:|")
-for r in rows:
-    c = r["compile_ms"]
-    A("| %s | %s | %s | %s |" % (r["bench"], f(c["vl"]), f(c["vl_O3"]), f(c["rustc_O"])))
-A("")
-fails = [r for r in rows if r["failures"] or r["build_failures"]]
-A("## Failures")
-A("")
-if not fails:
-    A("None — every benchmark built and ran in every language.")
-else:
-    A("| benchmark | what | status | error |")
-    A("|---|---|---|---|")
-    for r in fails:
-        for c, s in sorted(r["build_failures"].items()):
-            rec = builds[r["bench"]][c]
-            A("| %s | %s | %s | `%s` |" % (r["bench"], c, s,
-              (rec.get("error", "") or "").replace("|", "\\|").replace("\n", " ")[:220]))
-        for c, s in sorted(r["failures"].items()):
-            rec = runs[r["bench"]].get(c, {})
-            A("| %s | %s | %s | `%s` |" % (r["bench"], c, s,
-              (rec.get("error", "") or "").replace("|", "\\|").replace("\n", " ")[:220]))
-A("")
-A("## VOID benchmarks (excluded)")
-A("")
-if not voids:
-    A("None.")
-else:
-    for v in voids:
-        A("- **%s** — %s" % (v["bench"], v["reason"][:600]))
-A("")
-open(os.path.join(outd, "summary.md"), "w").write("\n".join(L) + "\n")
-print("rows=%d void=%d fails=%d" % (len(rows), len(voids), len(fails)))
-PYREPORT
+"$VL" run bench/report.vl -- --raw "$NDJSON" --out "$OUT" --reps "$REPS" \
+  --pin "$PIN_RECORDED" --quick "${BENCH_QUICK:-0}" --noise "$NOISE_BENCH" \
+  --rustc "$RUSTC_V" --deno "$DENO_V" --commit "$VL_V" \
+  --generated "$(date +%Y-%m-%dT%H:%M:%S)"
 rc=$?
 echo "done (rc=$rc): $OUT/results.json  $OUT/summary.md"
 exit $rc

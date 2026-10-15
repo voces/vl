@@ -1,0 +1,205 @@
+// Grading one day-one program: write it out, run it under a seed, and name the outcome in
+// `lib/probe-grade.vl`'s vocabulary plus RUNS-WRONG (the output contract here is exact)
+// and TRAP (program), which one extra `vl build` separates from a compiler trap.
+//
+//     import { Ctx, gradeSrc, gradeAll } from "./grade"
+
+import { parseI32, toString } from "std:fmt"
+import { join, startsWith } from "std:str"
+import { die, findFrom, splitLines, stripWs } from "../lib/common"
+import { pyRepr, readText, spawn, writeText } from "../lib/corpus"
+import { grade } from "../lib/probe-grade"
+import { splitFiles } from "./modules"
+
+// The `vl` binary, the seed graded against and the `std/` it resolves.
+export type Ctx = { vl: string, compiler: string, std: string }
+
+// A program's grade, the refusal's detail beside it, and its stripped stdout.
+export type Result = { grade: string, message: string, got: string }
+
+// One program to grade: its source, the exact lines it must print, and a file name
+// unique within the run.
+export type Item = { src: string, want: string[], name: string }
+
+// `src` materialised under `dir`, returning the ENTRY path. A `// file:`-marked source
+// gets a directory of its own, so relative imports resolve; its last section is the entry.
+export function writeProgram(src: string, dir: string, name: string): string {
+  const parts = splitFiles(src)
+  if parts.length == 1 {
+    const path = dir + "/" + name + ".vl"
+    writeText(path, src)
+    return path
+  }
+  const here = dir + "/" + name
+  const mk = spawn("mkdir", ["-p", here])
+  if mk.code != 0 { die("day-one: cannot create " + here + ": " + mk.err, 1) }
+  for f in parts { writeText(here + "/" + f.name, f.src) }
+  here + "/" + parts[parts.length - 1].name
+}
+
+// `repr` of a list of strings, as `%r` prints it.
+function pyStrList(xs: string[]): string {
+  const parts: string[] = []
+  for x in xs { parts.push(pyRepr(x)) }
+  "[" + join(parts, ", ") + "]"
+}
+
+function sameLines(out: string, want: string[]): boolean {
+  const got = splitLines(out)
+  if got.length != want.length { return false }
+  let i = 0
+  while i < got.length {
+    if stripWs(got[i]) != want[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Grade one program on its channel, then check its output against `want` exactly.
+export function gradeSrc(
+  c: Ctx,
+  src: string,
+  want: string[],
+  dir: string,
+  name: string,
+): Result {
+  const path = writeProgram(src, dir, name)
+  const g = grade(
+    { vl: c.vl, seed: c.compiler, std: c.std, probe: path, secs: "60" },
+    null,
+  )
+  let verdict = g.verdict
+  let detail = g.detail
+  if verdict == "RUNS" && !sameLines(g.out, want) {
+    verdict = "RUNS-WRONG"
+    detail = "want " + pyStrList(want) + ", got " + pyRepr(g.out)
+  }
+  if startsWith(verdict, "COMPILER TRAP") {
+    const b = spawn(
+      "env",
+      [
+        "VL_STD=" + c.std,
+        c.vl,
+        "build",
+        path,
+        "-o",
+        path + ".wasm",
+        "--compiler",
+        c.compiler,
+      ],
+    )
+    if b.code == 0 { verdict = "TRAP (program)" }
+  }
+  if verdict == "WRONG" { verdict = "RUNS-WRONG" }
+  { grade: verdict, message: detail, got: g.out }
+}
+
+// ── the fan-out: one job file per program, graded by `xargs -P` over a built worker ──
+
+function field(s: string): string { toString(s.length) + "\n" + s }
+
+function fields(text: string, n: i32, what: string): string[] {
+  const out: string[] = []
+  let at = 0
+  while out.length < n {
+    const nl = findFrom(text, "\n", at)
+    if nl < 0 { die("day-one: a job file is truncated: " + what, 1) }
+    const len = parseI32(text.slice(at, nl)) ?? 0
+    out.push(text.slice(nl + 1, nl + 1 + len))
+    at = nl + 1 + len
+  }
+  out
+}
+
+// The worker half: grade the program staged in `file`, answering in `file.out`.
+export function gradeJob(file: string) {
+  const text = readText(file)
+  const head = fields(text, 7, file)
+  const n = parseI32(head[6]) ?? 0
+  const all = fields(text, 7 + n, file)
+  const c: Ctx = { vl: all[0], compiler: all[1], std: all[2] }
+  const r = gradeSrc(c, all[5], all.slice(7, 7 + n), all[3], all[4])
+  writeText(file + ".out", field(r.grade) + field(r.message) + field(r.got))
+}
+
+// Grade every item under `dir`, `jobs` at a time. `worker` is a script whose
+// `-- --grade-job FILE` mode calls `gradeJob`; it is built once, into `dir`.
+export function gradeAll(
+  c: Ctx,
+  items: Item[],
+  dir: string,
+  jobs: i32,
+  worker: string,
+): Result[] {
+  const res: Result[] = []
+  if items.length <= 2 || jobs <= 1 {
+    for it in items { res.push(gradeSrc(c, it.src, it.want, dir, it.name)) }
+    return res
+  }
+  const files: string[] = []
+  for it in items {
+    const f = dir + "/" + it.name + ".job"
+    let body = field(c.vl)
+      + field(c.compiler)
+      + field(c.std)
+      + field(dir)
+      + field(it.name)
+    body = body + field(it.src) + field(toString(it.want.length))
+    for w in it.want { body = body + field(w) }
+    writeText(f, body)
+    files.push(f)
+  }
+  const wasm = dir + "/grader.wasm"
+  const b = spawn(
+    "env",
+    [
+      "VL_STD=" + c.std,
+      c.vl,
+      "build",
+      worker,
+      "--compiler",
+      c.compiler,
+      "-o",
+      wasm,
+    ],
+  )
+  if b.code != 0 {
+    die("day-one: cannot build the grader:\n" + b.out + b.err, 1)
+  }
+  writeText(dir + "/jobs", join(files, "\n") + "\n")
+  const x = spawn(
+    "env",
+    [
+      "VL_STD=" + c.std,
+      "xargs",
+      "-a",
+      dir + "/jobs",
+      "-d",
+      "\\n",
+      "-P",
+      toString(jobs),
+      "-n",
+      "1",
+      c.vl,
+      "run",
+      wasm,
+      "--",
+      "--grade-job",
+    ],
+  )
+  if x.code != 0 {
+    die(
+      "day-one: a grading worker failed (rc="
+        + toString(x.code)
+        + "):\n"
+        + x.out
+        + x.err,
+      1,
+    )
+  }
+  for f in files {
+    const a = fields(readText(f + ".out"), 3, f + ".out")
+    res.push({ grade: a[0], message: a[1], got: a[2] })
+  }
+  res
+}

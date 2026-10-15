@@ -87,7 +87,7 @@ Detail: `docs/internals/modules-design.md`, `docs/internals/parser-notes.md`.
 ### 2.3 Checker
 
 `compiler/typecheck.vl` (with `check_state.vl`, `check_query.vl`, `check_pins.vl`,
-`check_unconsumed.vl`, `check_places.vl`, `check_match_hoist.vl`, `check_width.vl`, `check_definite.vl`, `check_suggest.vl`, `check_narrow_ends.vl`, `const_exact.vl`, `tyname.vl`), `checkProgram(root)`.
+`check_unconsumed.vl`, `check_places.vl`, `check_match_hoist.vl`, `check_width.vl`, `check_definite.vl`, `check_suggest.vl`, `check_narrow_ends.vl`, `check_capture_loss.vl`, `const_exact.vl`, `tyname.vl`), `checkProgram(root)`.
 
 - **In:** the arena. **Out:** a type for every expression node (in the type arena, [§3.2](#32-the-type-arena)),
   symbol tables, constraint tables, and all type diagnostics. It may also **write annotations back

@@ -195,7 +195,7 @@ is the LSP (§C2).
 
 ### B3 · `__str_eq__` is a symptom — whose loop it is
 
-`profile-parents.py <profile> __str_eq__` ranks the immediate CALLER of every sample whose
+`profile-parents.vl -- <profile> __str_eq__` ranks the immediate CALLER of every sample whose
 leaf is `__str_eq__` (1,800 of 10,433). As a share of the whole run / of `__str_eq__`:
 `variantIndexOf` 3.61% / 20.9%, `unRowOfName` 2.89% / 16.7%, `__map_probe__` 1.82% / 10.6%,
 `declaredSlotOf` 1.14% / 6.6%, `litUnionAliasOfLitTexts` 0.73% / 4.2%,
@@ -759,7 +759,7 @@ checked-form cache keyed on unchanged source.
 
 Two instruments. `scripts/perf/lsp-keystroke.ts` drives the driver exports the way
 `prepare` + `ensurePrepared` do and times the halves the host can see;
-`scripts/perf/guest-profile.sh` with `scripts/perf/profile-phases.py` splits the guest half
+`scripts/perf/guest-profile.sh` with `scripts/perf/profile-phases.vl` splits the guest half
 by PIPELINE STAGE rather than by function. Read the second-edit row — the first pays for a
 cold scan cache, the second is the steady state.
 
@@ -1005,7 +1005,7 @@ builder there (`join`, `replaceAll`, `repeat`, `padFill`, `mapAsciiCase`) fills 
 and calls `fromCodePoints` once — **28 ms against 12,475 ms** for a 40,000-piece `join`
 (`std/str.vl:406-425`). `compiler/fmt_util.vl:216-243` records the same lesson the hard
 way: the accumulator "was O(n²) and blew the compiler's NON-FREEING null-GC heap on a large
-file". `string-concat-sites.py` counts what has not had that treatment: **165 `x = x +
+file". `string-concat-sites.vl` counts what has not had that treatment: **165 `x = x +
 <string>` sites, 129 inside a loop, 13 at depth ≥ 2**, and **451 chains of 3+ string
 operands, 131 inside a loop**. Both are LOWER BOUNDS — the detector credits a binding as a
 string only from an explicit `: string` or `= ""`, so an inferred accumulator is missed (a
@@ -1503,7 +1503,7 @@ self-compile moves 3.99 -> 3.93 CPU-s (min of 6 interleaved), which is what 74.6
 frame predicts and is at the box's resolution limit.
 
 `vl check` on all three programs is at or under 0.03 CPU-s on both arms, and
-`scripts/perf/profile-phases.py` says why: `emitProgram` is 99.68%, 100.00% and 97.94% of
+`scripts/perf/profile-phases.vl` says why: `emitProgram` is 99.68%, 100.00% and 97.94% of
 these three compiles, against 1, 0 and 4 samples on the whole check side. This term lives in
 the emitter, so the `check` half of the pipeline never sees enough of it to move — which is
 also why the row's own instrument, the corpus at `vl build`, was the one that found it.

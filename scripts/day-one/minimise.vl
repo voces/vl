@@ -1,0 +1,184 @@
+// Reduce a day-one hit to its minimal witness, then say which ingredients it needs:
+// a line removal is kept only while the grade AND the message hold, and the ablation
+// re-renders the pair's plan one axis face at a time. Group hits by that table, never by
+// the refusal's sentence. Run from the checkout root:
+//
+//     vl run scripts/day-one/minimise.vl -- run.jsonl [--index N] [--both]
+//     vl run scripts/day-one/minimise.vl -- --file witness.vl [--want "LINE\nLINE"]
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseI32 } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { JsonMap, cpPrefix, die, findFrom, rstripWs } from "../lib/common"
+import {
+  cwd,
+  makeTempDir,
+  padRight,
+  pyRepr,
+  readText,
+  spawn,
+} from "../lib/corpus"
+import { Ctx } from "./grade"
+import { int, loadJsonl, str, strs } from "./pairs"
+import { ablatePair, failingSide, minimise, sideSrc, sideWant } from "./reduce"
+
+const USAGE = "usage: minimise.vl [-h] [--file FILE] [--want WANT] [--index INDEX] [--both] [--compiler COMPILER] [jsonl]"
+
+function usageError(msg: string): i32 {
+  print(USAGE)
+  print("minimise.vl: error: \{msg}")
+  2
+}
+
+function row(a: string, b: string, c: string, d: string): string {
+  "  \{padRight(a, 24)} \{padRight(b, 28)} \{padRight(c, 16)} \{d}"
+}
+
+function reportOne(c: Ctx, pair: JsonMap) {
+  const side = failingSide(pair)
+  const other = if side == "a" { "b" } else { "a" }
+  const dir = makeTempDir()
+  const m = minimise(c, sideSrc(pair, side), sideWant(pair, side), dir)
+  const ab = ablatePair(c, pair, side, dir)
+  spawn("rm", ["-rf", dir])
+  const sa = pair[side]
+  const so = pair[other]
+  let sface = ""
+  let sgrade = ""
+  let oface = ""
+  let ograde = ""
+  if sa is JsonMap {
+    sface = str(sa, "face")
+    sgrade = str(sa, "grade")
+  }
+  if so is JsonMap {
+    oface = str(so, "face")
+    ograde = str(so, "grade")
+  }
+  print(
+    "========================================================================",
+  )
+  print(
+    "s\{int(pair, "seed")}/\{int(pair, "index")}  axis=\{str(pair, "axis")}  \{side}(\{sface})=\{sgrade}   twin \{other}(\{oface})=\{ograde}",
+  )
+  print("  \{cpPrefix(m.base.message, 110)}")
+  const lines = split(rstripWs(m.wit), "\n")
+  print("\nminimal witness (\{lines.length} lines):\n")
+  for l in lines { print("    \{l}") }
+  print("\nablation — one ingredient at a time")
+  print(row("axis", "flip", "outcome", "vs base"))
+  for r in ab.rows { print(row(r.axis, r.flip, r.grade, r.same)) }
+  print("\nfeatures: \{join(strs(pair, "features"), ", ")}")
+}
+
+function main(args: string[]): i32 {
+  const abs = cwd()
+  let jsonl = ""
+  let file = ""
+  let want = ""
+  let index = -1
+  let hasIndex = false
+  let both = false
+  let compiler = abs + "/build/vl-compiler.wasm"
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    let val: string | null = null
+    const eq = findFrom(a, "=", 0)
+    if startsWith(a, "--") && eq > 0 {
+      val = a.slice(eq + 1, a.length)
+      a = a.slice(0, eq)
+    }
+    if a == "-h" || a == "--help" {
+      print(USAGE)
+      return 0
+    }
+    if a == "--both" {
+      both = true
+      i = i + 1
+      continue
+    }
+    if !startsWith(a, "-") || a == "-" {
+      if jsonl != "" { return usageError("unrecognized arguments: \{a}") }
+      jsonl = a
+      i = i + 1
+      continue
+    }
+    if a != "--file" && a != "--want" && a != "--index" && a != "--compiler" {
+      return usageError("unrecognized arguments: \{args[i]}")
+    }
+    let v = ""
+    if val is string {
+      v = val
+      i = i + 1
+    } else {
+      if i + 1 >= args.length {
+        return usageError("argument \{a}: expected one argument")
+      }
+      v = args[i + 1]
+      i = i + 2
+    }
+    if a == "--file" {
+      file = v
+    } else if a == "--want" {
+      want = v
+    } else if a == "--compiler" {
+      compiler = v
+    } else {
+      const n = parseI32(v)
+      if n == null {
+        return usageError("argument --index: invalid int value: \{pyRepr(v)}")
+      }
+      index = n ?? 0
+      hasIndex = true
+    }
+  }
+  const c: Ctx = {
+    vl: abs + "/scripts/vl-host/target/release/vl",
+    compiler: compiler,
+    std: abs + "/std",
+  }
+
+  if file != "" {
+    const ws: string[] = []
+    for w in split(want, "\n") {
+      if w != "" { ws.push(w) }
+    }
+    const dir = makeTempDir()
+    const m = minimise(c, readText(file), ws, dir)
+    spawn("rm", ["-rf", dir])
+    print("\{m.base.grade}: \{cpPrefix(m.base.message, 110)}\n")
+    print(m.wit)
+    return 0
+  }
+  if jsonl == "" { return usageError("one of jsonl or --file is required") }
+
+  const verdicts = ["DISAGREE", "RUNS-WRONG"]
+  if both {
+    verdicts.push("BOTH-FAIL-SAME")
+    verdicts.push("BOTH-FAIL-DIFFER")
+  }
+  const hits: JsonMap[] = []
+  for p in loadJsonl(jsonl) {
+    let hit = false
+    for v in verdicts {
+      if str(p, "verdict") == v { hit = true }
+    }
+    if hit && (!hasIndex || int(p, "index") == index) { hits.push(p) }
+  }
+  if hits.length == 0 {
+    print("no hits in \{jsonl}")
+    return 0
+  }
+  for p in hits { reportOne(c, p) }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("minimise: an argument is not UTF-8: \{argv.msg}", 2)
+} else {
+  exit(main(argv))
+}
