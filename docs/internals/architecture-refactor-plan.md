@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the host answers `EPERM` for a POSIX EPERM (`permission_errno`). Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the callee lookup moved to `check_callee.vl` and the write-effect summaries to `check_write_effects.vl`; 56,579 → 55,507 lines. Next: the `covarWriteThrough` steps. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: the covariant write predicate moved to `check_covar_write.vl` and the capture widening to `check_capture_widen.vl`; 55,524 → 54,647 lines. Next: the diagnostic notes under `letAssignMsg`. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -421,6 +421,12 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - `compiler/check_write_effects.vl` gained the summary engine (42 declarations): `fnWriteEffects`, `fnWriteShapes`, `fnWriteFreePaths`, their caches, the cycle cut and the provisional rows. `weReset` and `weUnresDrop` replace the checker's direct writes.
   - Each seed compiles the other tree's source to that tree's fixpoint byte for byte, and the seed grows 16 bytes (5,735,117 to 5,735,133). Output identity holds over 15,196 files (0 differ), and the distilled corpus moved no cell. One `kind-ladder-incomplete` finding moved with `callDeclFnIx` into `check_callee.vl`.
   - Measured after these moves (2,521 declarations), the next roots are the `covarWriteThrough` steps (19 declarations, no `let`s, 480 lines, 2 names back) and `crRootCaptureWiden` (24, 347 lines). `crRootCaptureWiden` reaches `inferQuiet`, which `constrainEmptyExpr`, `f32LitJoinOf`, `arrDefOperandElemPeek` and `asgReadElemPin` also write, so that flag moves to a state module first.
+- The covariant write predicate and a top-level function's capture widening moved out, and `typecheck.vl` fell from 55,524 to 54,647 lines. Neither module imports `typecheck.vl`.
+  - `compiler/check_covar_write.vl` (22 declarations) holds `covarWriteThrough`, `covarValueWriteState` and its alias closure (`cw*`), with `covarValueWriteAt`, `covarDeclFrame` and `covarRootFreshLocal`. `wasmEmit.vl` and `emit_classify.vl` now import those from it. It owns no table; `covarWriteReset` stays in the checker.
+  - `inferQuiet` moved to `check_cursor.vl`, and `cursorReset` clears it.
+  - `compiler/check_capture_widen.vl` (23 declarations) holds `crRootCaptureWiden` and the shared capture-retire steps: `crCurRoot`, `crFnBase`, the write and info keys, the bank lookups, the widened-binding rows and the benign-call tests. Its one `let`, `crReadAcc`, is set at the start of each walk.
+  - Each seed compiles the other tree's source to that tree's fixpoint byte for byte, and the seed grows 5 bytes (5,735,715 to 5,735,720). Output identity holds over 15,200 files (0 differ), and the distilled corpus moved no cell. One `kind-ladder-incomplete` finding moved with the `cw*` steps into `check_covar_write.vl`.
+  - Measured after these moves (2,476 declarations), the next roots are the diagnostic notes under `letAssignMsg` (22 declarations, 4 `let`s, 435 lines, 11 names back) and the redundant-annotation hints under `recordRedundantAnnot` (21, 5 `let`s, 296 lines, 11 back).
 
 ### SMALL log
 
