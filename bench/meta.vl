@@ -1,0 +1,102 @@
+// Reads one benchmark's meta.json for bench/run.sh and leaves its answers on disk.
+//
+//     vl run bench/meta.vl -- <path/to/meta.json> <workdir>
+//
+// Writes, under <workdir>/exp/, with `<b>` the benchmark as `category_name`:
+//   <b>.main.expect      the exact stdout of main.vl, main.js and main.rs (`expect`)
+//   <b>.<v>.expect       the same for each extra `<v>.vl` beside main.vl (`expect<V>`,
+//                        falling back to `expect`)
+//   <b>.void             the `void` reason, empty when the benchmark is live
+//   <b>.axis             the `axis` text
+//   <b>.variants         the extra variant names, sorted, space separated
+// Paths are relative to the working directory (the checkout root when run.sh calls it).
+
+import { IoError, listDir, readTextFile, writeTextFile } from "std:fs"
+import { Json, JsonError, parseJson } from "std:json"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { exit } from "std:process"
+import {
+  endsWith,
+  join,
+  lastIndexOf,
+  replaceAll,
+  split,
+  toLowerAscii,
+  toUpperAscii,
+} from "std:str"
+import { sorted } from "std:array"
+
+type JsonMap = { [string]: Json }
+
+function die(msg: string): never {
+  print("bench/meta: " + msg)
+  exit(1)
+}
+
+function put(path: string, text: string) {
+  // Create `<workdir>/exp` through a write into it: the shell made the directory.
+  const w = writeTextFile(path, text)
+  if w != null { die("cannot write \{path} (\{w.msg})") }
+}
+
+// A string member, or `fallback` when the member is absent or is not a string.
+function strOr(m: JsonMap, key: string, fallback: string): string {
+  const v = m[key]
+  if v is string { return v }
+  fallback
+}
+
+// `opt-in` -> `OptIn`: each part with its first letter upper-cased and the rest lower-cased.
+function capitalize(part: string): string {
+  if part.length == 0 { return part }
+  toUpperAscii(part.slice(0, 1)) + toLowerAscii(part.slice(1, part.length))
+}
+
+// The meta key for a variant's expected output: `expect` + `Opt`, `ToplevelGlobals`, ...
+function expectKey(stem: string): string {
+  let key = "expect"
+  for part in split(stem.replaceAll("_", "-"), "-") {
+    key = key + capitalize(part)
+  }
+  key
+}
+
+function less(a: string, b: string): boolean { a < b }
+
+function main(metaPath: string, work: string) {
+  const text = readTextFile(metaPath)
+  if text is IoError { die("cannot read \{metaPath} (\{text.msg})") }
+  const m = parseJson(text)
+  if m is JsonError { die(metaPath + " is not JSON: " + m.msg) }
+  if !(m is JsonMap) { die(metaPath + " is not a JSON object") }
+  const dir = metaPath.slice(0, metaPath.lastIndexOf("/"))
+  const parts = split(dir, "/")
+  const bench = parts[parts.length - 2] + "_" + parts[parts.length - 1]
+  const base = work + "/exp/" + bench
+  const expect = strOr(m, "expect", "")
+  put(base + ".main.expect", expect)
+  const names = listDir(dir)
+  if names is IoError { die("cannot list \{dir} (\{names.msg})") }
+  const variants: string[] = []
+  for f in sorted(names, less) {
+    if f.endsWith(".vl") && f != "main.vl" {
+      const stem = f.slice(0, f.length - 3)
+      put(base + "." + stem + ".expect", strOr(m, expectKey(stem), expect))
+      variants.push(stem)
+    }
+  }
+  put(base + ".void", strOr(m, "void", ""))
+  put(base + ".axis", strOr(m, "axis", ""))
+  put(base + ".variants", join(variants, " "))
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("an argument is not UTF-8: " + argv.msg)
+} else if argv.length != 2 {
+  die("usage: vl run bench/meta.vl -- <meta.json> <workdir>")
+} else {
+  main(argv[0], argv[1])
+}

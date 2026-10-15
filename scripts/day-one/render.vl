@@ -1,0 +1,923 @@
+// Turns a plan and a set of axis FACES into one ordinary VL program. `planPair` picks a
+// plan and one axis, and renders the program twice with only that axis's face flipped,
+// so the spelling that runs proves the other one legal. Substitution is plain string
+// replacement: the grammar's spellings are full of braces. docs/internals/day-one-sampler.md.
+//
+//     import { makePair, renderSpec } from "./render"
+
+import { join, replaceAll } from "std:str"
+import { JsonMap, findFrom, splitLines } from "../lib/common"
+import { sortStrings } from "../lib/corpus"
+import {
+  AXES,
+  Axis,
+  POSITIONS,
+  Position,
+  Read,
+  SCENERY,
+  SCOPES,
+  SECOND_PIN,
+  SOURCES,
+  Scenery,
+  SecondPin,
+  Source,
+  VALUES,
+  Value,
+  excluded,
+} from "./grammar"
+import { makePair as importsPair } from "./imports"
+import { makePair as modulesPair } from "./modules"
+import { jfaces, jstrs, newPair, side, str } from "./pairs"
+import { Rng, below, random, sample2, weighted } from "./rng"
+
+const IND = "  "
+
+export type Plan = {
+  value: Value,
+  read: Read,
+  position: Position,
+  scenery: Scenery,
+  source: Source,
+  secondPin: SecondPin,
+  axes: Axis[],
+}
+
+export type Rendered = { src: string, want: string[] }
+
+function has(s: string, sub: string): boolean { findFrom(s, sub, 0) >= 0 }
+
+function ty(val: Value, named: boolean): string {
+  if named { val.named } else { val.inline }
+}
+
+// `T[]` binds tighter than `|` and `=>`, so a union or function element needs parentheses.
+function arr(t: string): string {
+  if has(t, "|") || has(t, "=>") { "(" + t + ")[]" } else { t + "[]" }
+}
+
+// `(i32) => i32 | null` is an arrow returning a nullable; a function type is wrapped first.
+function par(t: string): string {
+  if has(t, "=>") { "(" + t + ")" } else { t }
+}
+
+function occurrences(s: string, sub: string): i32 {
+  let n = 0
+  let at = findFrom(s, sub, 0)
+  while at >= 0 {
+    n = n + 1
+    at = findFrom(s, sub, at + sub.length)
+  }
+  n
+}
+
+// ── plans ─────────────────────────────────────────────────────────────────────────
+
+const ASSIGNABLE = ["binding", "global_init", "closure_capture"]
+const FUSIBLE = [
+  "binding", "return", "struct_field", "list_element", "map_value",
+]
+
+function inList(xs: string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+// A read that mentions the value twice cannot be fused onto its producer.
+function fusible(pos: Position, read: Read): boolean {
+  let n = 0
+  for l in read.lines { n = n + occurrences(l, "{v}") }
+  n == 1 && inList(FUSIBLE, pos.id)
+}
+
+// Reads of `val` printing what `read` prints through a different test.
+function narrowGroup(val: Value, read: Read): string[] {
+  const out: string[] = []
+  if read.narrow == "" { return out }
+  for r in val.reads {
+    if r.narrow != "" && sameWant(r.want, read.want) { out.push(r.id) }
+  }
+  out
+}
+
+// Reads of `val` going through the same operator as `read`.
+function opGroup(val: Value, read: Read): string[] {
+  const out: string[] = []
+  if read.op == "" { return out }
+  for r in val.reads {
+    if r.op == read.op { out.push(r.id) }
+  }
+  out
+}
+
+function sameWant(x: string[], y: string[]): boolean {
+  if x.length != y.length { return false }
+  let i = 0
+  while i < x.length {
+    if x[i] != y[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The axes this plan can vary; a generator axis brings its own grammar and is skipped.
+function applicableAxes(val: Value, pos: Position, read: Read): Axis[] {
+  const out: Axis[] = []
+  for ax in AXES {
+    if ax.generator != "" { continue }
+    const need = ax.needs
+    if need == "decls" && val.decls.length == 0 { continue }
+    if ax.id == "named_vs_inline" && val.noInline { continue }
+    if need == "narrow_group" && narrowGroup(val, read).length < 2 { continue }
+    if need == "op_group" && opGroup(val, read).length < 2 { continue }
+    if need == "fusible" && !fusible(pos, read) { continue }
+    if need == "pinnable" && pos.id == "assignment" { continue }
+    if need == "free_scope" && (pos.wraps || pos.fixedScope != "") { continue }
+    if need == "assignable" && !(val.alt != "" && inList(ASSIGNABLE, pos.id)) {
+      continue
+    }
+    out.push(ax)
+  }
+  out
+}
+
+// The index into `ids` of one drawn by weight among those not excluded, or -1.
+function pickIdx(r: Rng, ids: string[], ws: i32[]): i32 {
+  const keep: i32[] = []
+  const kw: i32[] = []
+  let i = 0
+  while i < ids.length {
+    if !excluded(ids[i]) {
+      keep.push(i)
+      kw.push(ws[i])
+    }
+    i = i + 1
+  }
+  if keep.length == 0 { return -1 }
+  keep[weighted(r, kw)]
+}
+
+function ones(n: i32): i32[] {
+  const out: i32[] = []
+  while out.length < n { out.push(1) }
+  out
+}
+
+// A plan is the program; the axis is what the pair varies about it.
+function pickPlan(r: Rng, axisId: string): Plan | null {
+  const vIds: string[] = []
+  const vWs: i32[] = []
+  for v in VALUES {
+    vIds.push(v.id)
+    vWs.push(v.weight)
+  }
+  const pIds: string[] = []
+  const pWs: i32[] = []
+  for p in POSITIONS {
+    pIds.push(p.id)
+    pWs.push(p.weight)
+  }
+  const scIds: string[] = []
+  for s in SCENERY { scIds.push(s.id) }
+  const srcIds: string[] = []
+  const srcWs: i32[] = []
+  for s in SOURCES {
+    srcIds.push(s.id)
+    srcWs.push(s.weight)
+  }
+  let tries = 0
+  while tries < 200 {
+    tries = tries + 1
+    const vi = pickIdx(r, vIds, vWs)
+    const pi = pickIdx(r, pIds, pWs)
+    if vi < 0 || pi < 0 { return null }
+    const val = VALUES[vi]
+    const pos = POSITIONS[pi]
+    const rIds: string[] = []
+    for x in val.reads { rIds.push(x.id) }
+    const ri = pickIdx(r, rIds, ones(rIds.length))
+    if ri < 0 { continue }
+    const read = val.reads[ri]
+    const nullable = inList(val.features, "nullable")
+    if pos.id == "map_value" && (val.alt == "" || nullable) { continue }
+    const sci = pickIdx(r, scIds, ones(scIds.length))
+    const si = pickIdx(r, srcIds, srcWs)
+    if sci < 0 || si < 0 { return null }
+    const src = SOURCES[si]
+    if src.needsAlt && val.alt == "" { continue }
+    if src.noNullable && nullable { continue }
+    const sps: SecondPin[] = []
+    const spIds: string[] = []
+    const spWs: i32[] = []
+    for x in SECOND_PIN {
+      if x.expr != "" || val.alt != "" {
+        sps.push(x)
+        spIds.push(x.id)
+        spWs.push(x.weight)
+      }
+    }
+    const spi = pickIdx(r, spIds, spWs)
+    if spi < 0 { return null }
+    const axes = applicableAxes(val, pos, read)
+    if axes.length == 0 { continue }
+    if axisId != "" {
+      let found = false
+      for a in axes {
+        if a.id == axisId { found = true }
+      }
+      if !found { continue }
+    }
+    return {
+      value: val,
+      read: read,
+      position: pos,
+      scenery: SCENERY[sci],
+      source: src,
+      secondPin: sps[spi],
+      axes: axes,
+    }
+  }
+  null
+}
+
+function pick2(r: Rng, xs: string[]): string { xs[below(r, xs.length)] }
+
+// Every axis's face, held identical across the pair except the one under test.
+function baseFaces(r: Rng, plan: Plan, axis: Axis): Map<string, string> {
+  const val = plan.value
+  const pos = plan.position
+  const f: Map<string, string> = Map()
+  f["named_vs_inline"] = "named"
+  f["annotated_vs_inferred"] = pick2(r, ["annotated", "inferred"])
+  f["narrowing"] = plan.read.id
+  f["fusion"] = "bound"
+  f["pinning"] = ["direct", "generic", "hole", "generic2"][weighted(r, [6, 2, 2, 2])]
+  if pos.fixedScope != "" {
+    f["scope"] = pos.fixedScope
+  } else if pos.wraps {
+    f["scope"] = "module"
+  } else {
+    const ids: string[] = []
+    const ws: i32[] = []
+    for s in SCOPES {
+      ids.push(s.id)
+      ws.push(s.weight)
+    }
+    f["scope"] = ids[pickIdx(r, ids, ws)]
+  }
+  f["scenery"] = pick2(r, ["bare", "neighbour"])
+  f["init_vs_assign"] = "init"
+  if fusible(pos, plan.read) { f["fusion"] = pick2(r, ["fused", "bound"]) }
+  if axis.pinFusion != "" { f["fusion"] = axis.pinFusion }
+  // A `let` seeded with a literal infers the right type only for some values.
+  if axis.id == "init_vs_assign" && !val.altInfers {
+    f["annotated_vs_inferred"] = "annotated"
+  }
+  f
+}
+
+function sample(r: Rng, xs: string[]): string[] {
+  const ij = sample2(r, xs.length)
+  [xs[ij[0]], xs[ij[1]]]
+}
+
+// The pair's two faces of `axis`.
+function flip(r: Rng, plan: Plan, axis: Axis): string[] {
+  const aid = axis.id
+  if aid == "narrowing" { return sample(r, narrowGroup(plan.value, plan.read)) }
+  if aid == "operator_vs_call" {
+    return sample(r, opGroup(plan.value, plan.read))
+  }
+  if aid == "scope" {
+    const ids: string[] = []
+    for s in SCOPES { ids.push(s.id) }
+    return sample(r, ids)
+  }
+  if aid == "pinning" {
+    return ["direct", pick2(r, ["generic", "hole", "generic2"])]
+  }
+  // `is Rect` has no inline twin: grade it against the nearest legal read.
+  if aid == "named_vs_inline" && plan.read.namedOnly {
+    return ["named", "inline"]
+  }
+  [axis.faces[0], axis.faces[1]]
+}
+
+export type PlannedPair = {
+  plan: Plan,
+  axis: Axis,
+  fa: Map<string, string>,
+  fb: Map<string, string>,
+}
+
+function nearestLegalRead(val: Value): string {
+  for r in val.reads {
+    if !r.namedOnly { return r.id }
+  }
+  ""
+}
+
+// One program, two spellings, one axis apart.
+function planPair(r: Rng, axisId: string): PlannedPair | null {
+  const plan = pickPlan(r, axisId)
+  if plan == null { return null }
+  let ai = -1
+  if axisId != "" {
+    let i = 0
+    while i < plan.axes.length {
+      if plan.axes[i].id == axisId && ai < 0 { ai = i }
+      i = i + 1
+    }
+  } else {
+    const ids: string[] = []
+    const ws: i32[] = []
+    for a in plan.axes {
+      ids.push(a.id)
+      ws.push(a.weight)
+    }
+    ai = pickIdx(r, ids, ws)
+  }
+  if ai < 0 { return null }
+  const axis = plan.axes[ai]
+  const fa = baseFaces(r, plan, axis)
+  const v = flip(r, plan, axis)
+  const fb: Map<string, string> = Map()
+  for k, x in fa { fb[k] = x }
+  fa[axis.id] = v[0]
+  fb[axis.id] = v[1]
+  // `render` selects the read through `narrowing`, so this axis writes there too.
+  if axis.id == "operator_vs_call" {
+    fa["narrowing"] = v[0]
+    fb["narrowing"] = v[1]
+  }
+  if axis.id == "named_vs_inline" && plan.read.namedOnly {
+    const near = nearestLegalRead(plan.value)
+    if near == "" { return null }
+    fb["narrowing"] = near
+  }
+  { plan: plan, axis: axis, fa: fa, fb: fb }
+}
+
+// ── render ────────────────────────────────────────────────────────────────────────
+
+function face(faces: Map<string, string>, k: string): string { faces[k] ?? "" }
+
+// A missing `alt` where the original formatted it into the source rather than failing.
+function pyAlt(alt: string): string {
+  if alt == "" { "None" } else { alt }
+}
+
+// Whether `render(plan, faces)` builds a program: false when the faces name a read the
+// value lacks, or need an `alt` the value does not have. Ablation skips those flips.
+export function renders(plan: Plan, faces: Map<string, string>): boolean {
+  const val = plan.value
+  let found = false
+  for x in val.reads {
+    if x.id == face(faces, "narrowing") { found = true }
+  }
+  if !found { return false }
+  if val.alt != "" { return true }
+  if face(faces, "pinning") == "generic2" && plan.secondPin.expr == "" {
+    return false
+  }
+  const sid = plan.source.id
+  !(sid == "map_read" || sid == "coalesce" || plan.position.id == "map_value")
+}
+
+// One face of the pair: its source and the lines it must print.
+export function render(plan: Plan, faces: Map<string, string>): Rendered {
+  const val = plan.value
+  let read = val.reads[0]
+  for x in val.reads {
+    if x.id == face(faces, "narrowing") {
+      read = x
+      break
+    }
+  }
+  const named = face(faces, "named_vs_inline") == "named"
+  const ann = face(faces, "annotated_vs_inferred") == "annotated"
+  const t = ty(val, named)
+  const head: string[] = []
+  const decls: string[] = []
+  const stmts: string[] = []
+  if face(faces, "scenery") == "neighbour" {
+    for l in plan.scenery.lines {
+      if plan.scenery.isImport { head.push(l) } else { decls.push(l) }
+    }
+  }
+  if named {
+    for d in val.decls { decls.push("type " + d.name + " = " + d.rhs) }
+  }
+  // The record's own module declarations, in both faces.
+  for f in val.fns { decls.push(f) }
+  let expr = val.expr
+  if expr == "" {
+    decls.push("function mkval(): " + t + " {")
+    for l in val.mk { decls.push(IND + replaceAll(l, "{T}", t)) }
+    decls.push("}")
+    expr = "mkval()"
+  }
+  const pin = face(faces, "pinning")
+  if pin == "generic" {
+    decls.push("function pass<T>(x: T): T { return x }")
+    expr = "pass(" + expr + ")"
+  } else if pin == "hole" {
+    decls.push("function passh(x) { return x }")
+    expr = "passh(" + expr + ")"
+  } else if pin == "generic2" {
+    // `same` binds both holes to the value's own rep through its `alt`.
+    const sp = plan.secondPin
+    const second = if sp.expr != "" { sp.expr } else { val.alt }
+    for l in sp.decls { decls.push(l) }
+    decls.push("function pass2<A, B>(a: A, b: B): A { return a }")
+    expr = "pass2(\{expr}, \{second})"
+  }
+  const body = deliver(plan, faces, t, expr, read, ann, decls, stmts)
+  const src: string[] = []
+  for l in head { src.push(l) }
+  for l in decls { src.push(l) }
+  for l in body { src.push(l) }
+  { src: join(src, "\n") + "\n", want: read.want }
+}
+
+function readLines(read: Read, v: string): string[] {
+  const out: string[] = []
+  for l in read.lines { out.push(replaceAll(l, "{v}", v)) }
+  out
+}
+
+function annot(ann: boolean, t: string): string {
+  if ann { ": " + t } else { "" }
+}
+
+function bind(
+  stmts: string[],
+  t: string,
+  ann: boolean,
+  producer: string,
+  name: string,
+): string {
+  stmts.push("const " + name + annot(ann, t) + " = " + producer)
+  name
+}
+
+// Where the value comes from; each source sets itself up in `into`.
+function source(
+  plan: Plan,
+  t: string,
+  expr: string,
+  ann: boolean,
+  decls: string[],
+  into: string[],
+): string {
+  const sid = plan.source.id
+  const alt = plan.value.alt
+  if sid == "call" {
+    decls.push("function srcOf(): \{t} { return \{expr} }")
+    return "srcOf()"
+  }
+  if sid == "index" {
+    into.push("const srcArr\{annot(ann, arr(t))} = [\{expr}]")
+    return "srcArr[0]"
+  }
+  if sid == "field" {
+    into.push(
+      "const srcBox\{annot(ann, "{ it: " + t + " }")} = { it: \{expr} }",
+    )
+    return "srcBox.it"
+  }
+  if sid == "map_read" {
+    into.push("const srcMap" + annot(ann, "{[string]: " + t + "}") + " = Map()")
+    into.push("srcMap[\"k\"] = " + expr)
+    return "(srcMap[\"k\"] ?? " + alt + ")"
+  }
+  if sid == "coalesce" {
+    into.push("const srcOpt: " + par(t) + " | null = " + expr)
+    return "(srcOpt ?? " + alt + ")"
+  }
+  expr
+}
+
+function indented(xs: string[]): string[] {
+  const out: string[] = []
+  for x in xs { out.push(IND + x) }
+  out
+}
+
+// The statements for the chosen position, wrapped in the chosen scope.
+function deliver(
+  plan: Plan,
+  faces: Map<string, string>,
+  t: string,
+  expr0: string,
+  read: Read,
+  ann: boolean,
+  decls: string[],
+  stmts: string[],
+): string[] {
+  const pid = plan.position.id
+  const fused = face(faces, "fusion") == "fused"
+  const val = plan.value
+  const assign = face(faces, "init_vs_assign") == "assign"
+  // A `return` puts the expression in a module-level helper, so its setup goes beside it.
+  const toDecls = pid == "argument" || pid == "global_init" || pid == "return"
+  const expr = source(
+    plan,
+    t,
+    expr0,
+    ann,
+    decls,
+    if toDecls { decls } else { stmts },
+  )
+  if pid == "argument" {
+    decls.push("function take(p" + annot(ann, t) + ") {")
+    for l in indented(readLines(read, "p")) { decls.push(l) }
+    decls.push("}")
+    return ["take(" + expr + ")"]
+  }
+  if pid == "global_init" {
+    if assign {
+      decls.push("let gv" + annot(ann, t) + " = " + pyAlt(val.alt))
+      decls.push("gv = " + expr)
+    } else {
+      decls.push("const gv" + annot(ann, t) + " = " + expr)
+    }
+    decls.push("function go() {")
+    for l in indented(readLines(read, "gv")) { decls.push(l) }
+    decls.push("}")
+    return ["go()"]
+  }
+  let v = ""
+  if pid == "binding" {
+    if assign {
+      stmts.push("let v" + annot(ann, t) + " = " + pyAlt(val.alt))
+      stmts.push("v = " + expr)
+      v = "v"
+    } else {
+      v = if fused { expr } else { bind(stmts, t, ann, expr, "v") }
+    }
+  } else if pid == "return" {
+    decls.push("function make()\{annot(ann, t)} { return \{expr} }")
+    v = if fused { "make()" } else { bind(stmts, t, ann, "make()", "v") }
+  } else if pid == "assignment" {
+    stmts.push("let v" + annot(ann, t) + " = " + expr)
+    stmts.push("v = " + expr)
+    v = "v"
+  } else if pid == "struct_field" {
+    stmts.push(
+      "const box\{annot(ann, "{ item: " + t + " }")} = { item: \{expr} }",
+    )
+    v = if fused { "box.item" } else { bind(stmts, t, ann, "box.item", "v") }
+  } else if pid == "list_element" {
+    stmts.push("const arr\{annot(ann, arr(t))} = [\{expr}]")
+    v = if fused { "arr[0]" } else { bind(stmts, t, ann, "arr[0]", "v") }
+  } else if pid == "map_value" {
+    stmts.push("const tbl" + annot(ann, "{[string]: " + t + "}") + " = Map()")
+    stmts.push("tbl[\"k\"] = " + expr)
+    const got = "(tbl[\"k\"] ?? " + val.alt + ")"
+    v = if fused { got } else { bind(stmts, t, ann, got, "v") }
+  } else if pid == "closure_capture" {
+    if assign {
+      stmts.push("let held" + annot(ann, t) + " = " + pyAlt(val.alt))
+      stmts.push("held = " + expr)
+    } else {
+      bind(stmts, t, ann, expr, "held")
+    }
+    stmts.push("const get = () => held")
+    v = bind(stmts, t, ann, "get()", "v")
+  }
+  for l in readLines(read, v) { stmts.push(l) }
+  scope(face(faces, "scope"), stmts, decls)
+}
+
+// A one-iteration `while`: the shape the first external consumer wrote.
+function whileOf(stmts: string[]): string[] {
+  const out = ["let i = 0", "while i < 1 {"]
+  for l in indented(stmts) { out.push(l) }
+  out.push(IND + "i = i + 1")
+  out.push("}")
+  out
+}
+
+function blockOf(stmts: string[]): string[] {
+  const out = ["if true {"]
+  for l in indented(stmts) { out.push(l) }
+  out.push("}")
+  out
+}
+
+function scope(sc: string, stmts: string[], decls: string[]): string[] {
+  if sc == "module" { return stmts }
+  if sc == "module_block" { return blockOf(stmts) }
+  if sc == "module_while" { return whileOf(stmts) }
+  let inner = stmts
+  if sc == "fn_block" { inner = blockOf(stmts) }
+  else if sc == "fn_while" { inner = whileOf(stmts) }
+  decls.push("function go() {")
+  for l in indented(inner) { decls.push(l) }
+  decls.push("}")
+  ["go()"]
+}
+
+// ── delta ─────────────────────────────────────────────────────────────────────────
+
+// The longest matching block of `a[alo:ahi]` and `b[blo:bhi]`, as difflib finds it.
+function longest(
+  a: string[],
+  b: string[],
+  b2j: Map<string, i32[]>,
+  alo: i32,
+  ahi: i32,
+  blo: i32,
+  bhi: i32,
+): i32[] {
+  let besti = alo
+  let bestj = blo
+  let best = 0
+  let prev: i32[] = []
+  while prev.length < b.length + 1 { prev.push(0) }
+  let i = alo
+  while i < ahi {
+    const next: i32[] = []
+    while next.length < b.length + 1 { next.push(0) }
+    const js = b2j[a[i]] ?? []
+    for j in js {
+      if j < blo { continue }
+      if j >= bhi { break }
+      const k = (if j > 0 { prev[j - 1] } else { 0 }) + 1
+      next[j] = k
+      if k > best {
+        besti = i - k + 1
+        bestj = j - k + 1
+        best = k
+      }
+    }
+    prev = next
+    i = i + 1
+  }
+  while besti > alo && bestj > blo && a[besti - 1] == b[bestj - 1] {
+    besti = besti - 1
+    bestj = bestj - 1
+    best = best + 1
+  }
+  while (
+    besti + best < ahi
+    && bestj + best < bhi
+    && a[besti + best] == b[bestj + best]
+  ) {
+    best = best + 1
+  }
+  [besti, bestj, best]
+}
+
+// `difflib.unified_diff(a, b, n=0)` reduced to its `-`/`+` lines.
+function diffLines(a: string[], b: string[]): string[] {
+  const b2j: Map<string, i32[]> = Map()
+  let j = 0
+  while j < b.length {
+    const xs = b2j[b[j]] ?? []
+    xs.push(j)
+    b2j[b[j]] = xs
+    j = j + 1
+  }
+  if b.length >= 200 {
+    const ntest = b.length / 100 + 1
+    const popular: string[] = []
+    for k, xs in b2j {
+      if xs.length > ntest { popular.push(k) }
+    }
+    for k in popular { b2j.delete(k) }
+  }
+  const blocks: i32[][] = []
+  const queue: i32[][] = [[0, a.length, 0, b.length]]
+  while queue.length > 0 {
+    const q = queue.pop()
+    const m = longest(a, b, b2j, q[0], q[1], q[2], q[3])
+    if m[2] > 0 {
+      blocks.push(m)
+      if q[0] < m[0] && q[2] < m[1] { queue.push([q[0], m[0], q[2], m[1]]) }
+      if m[0] + m[2] < q[1] && m[1] + m[2] < q[3] {
+        queue.push([m[0] + m[2], q[1], m[1] + m[2], q[3]])
+      }
+    }
+  }
+  let s = 1
+  while s < blocks.length {
+    let t = s
+    while t > 0 && blocks[t - 1][0] > blocks[t][0] {
+      const x = blocks[t]
+      blocks[t] = blocks[t - 1]
+      blocks[t - 1] = x
+      t = t - 1
+    }
+    s = s + 1
+  }
+  const joined: i32[][] = []
+  let i1 = 0
+  let j1 = 0
+  let k1 = 0
+  for m in blocks {
+    if i1 + k1 == m[0] && j1 + k1 == m[1] {
+      k1 = k1 + m[2]
+    } else {
+      if k1 > 0 { joined.push([i1, j1, k1]) }
+      i1 = m[0]
+      j1 = m[1]
+      k1 = m[2]
+    }
+  }
+  if k1 > 0 { joined.push([i1, j1, k1]) }
+  joined.push([a.length, b.length, 0])
+  const out: string[] = []
+  let i = 0
+  j = 0
+  for m in joined {
+    while i < m[0] {
+      out.push("-" + a[i])
+      i = i + 1
+    }
+    while j < m[1] {
+      out.push("+" + b[j])
+      j = j + 1
+    }
+    i = m[0] + m[2]
+    j = m[1] + m[2]
+  }
+  const kept: string[] = []
+  for l in out {
+    const p = l.slice(0, if l.length < 3 { l.length } else { 3 })
+    if p != "---" && p != "+++" { kept.push(l) }
+  }
+  kept
+}
+
+// What the pair varied, concretely: an `agree` with no delta cannot be told from an
+// axis the sample never reached.
+function delta(
+  axis: Axis,
+  fa: Map<string, string>,
+  fb: Map<string, string>,
+  plan: Plan,
+  srcA: string,
+  srcB: string,
+): JsonMap {
+  const lines = diffLines(splitLines(srcA), splitLines(srcB))
+  const held: Map<string, string> = Map()
+  for k, v in fa {
+    if k != axis.id { held[k] = v }
+  }
+  const m: JsonMap = Map()
+  m["axis"] = axis.id
+  m["faceA"] = face(fa, axis.id)
+  m["faceB"] = face(fb, axis.id)
+  m["value"] = plan.value.id
+  m["read"] = plan.read.id
+  m["position"] = plan.position.id
+  m["scope"] = face(fa, "scope")
+  m["held"] = jfaces(held)
+  m["diff"] = jstrs(
+    lines.slice(0, if lines.length < 12 { lines.length } else { 12 }),
+  )
+  m
+}
+
+// The plan as ids, so a saved sample can be rendered again.
+export function specOf(plan: Plan): JsonMap {
+  const m: JsonMap = Map()
+  m["value"] = plan.value.id
+  m["read"] = plan.read.id
+  m["position"] = plan.position.id
+  m["scenery"] = plan.scenery.id
+  m["source"] = plan.source.id
+  m["second_pin"] = plan.secondPin.id
+  m
+}
+
+export function planOf(spec: JsonMap): Plan {
+  let val = VALUES[0]
+  for v in VALUES {
+    if v.id == str(spec, "value") { val = v }
+  }
+  let read = val.reads[0]
+  for x in val.reads {
+    if x.id == str(spec, "read") { read = x }
+  }
+  let pos = POSITIONS[0]
+  for p in POSITIONS {
+    if p.id == str(spec, "position") { pos = p }
+  }
+  let sc = SCENERY[0]
+  for s in SCENERY {
+    if s.id == str(spec, "scenery") { sc = s }
+  }
+  const srcId = if str(spec, "source") == "" { "literal" } else { str(spec, "source") }
+  let src = SOURCES[0]
+  for s in SOURCES {
+    if s.id == srcId { src = s }
+  }
+  const spId = if str(spec, "second_pin") == "" { "i32" } else { str(spec, "second_pin") }
+  let sp = SECOND_PIN[0]
+  for s in SECOND_PIN {
+    if s.id == spId { sp = s }
+  }
+  {
+    value: val,
+    read: read,
+    position: pos,
+    scenery: sc,
+    source: src,
+    secondPin: sp,
+    axes: [],
+  }
+}
+
+export function renderSpec(
+  spec: JsonMap,
+  faces: Map<string, string>,
+): Rendered {
+  render(planOf(spec), faces)
+}
+
+// `xnp_<narrow>` when either face routes a narrowed value through the generic pin.
+function xnpTags(
+  plan: Plan,
+  f: Map<string, string>,
+  into: Map<string, boolean>,
+) {
+  for x in plan.value.reads {
+    if x.id == face(f, "narrowing") {
+      if x.xnp != "" { into["xnp_" + x.xnp] = true }
+      return
+    }
+  }
+}
+
+function features(
+  plan: Plan,
+  fa: Map<string, string>,
+  fb: Map<string, string>,
+): string[] {
+  const f: Map<string, boolean> = Map()
+  for x in plan.value.features { f[x] = true }
+  f[plan.position.id] = true
+  f[plan.read.id] = true
+  f[face(fa, "scope")] = true
+  if face(fa, "pinning") == "generic2" || face(fb, "pinning") == "generic2" {
+    f["pin2_" + plan.secondPin.id] = true
+  }
+  if plan.read.mix != "" { f["widen_" + plan.read.mix] = true }
+  xnpTags(plan, fa, f)
+  xnpTags(plan, fb, f)
+  if plan.read.opw != "" { f["opw_" + plan.read.opw] = true }
+  if plan.read.xrep != "" { f["xrep_" + plan.read.xrep] = true }
+  const out: string[] = []
+  for k, _v in f { out.push(k) }
+  sortStrings(out)
+}
+
+// One sample: two spellings of one program and what was varied. A generator axis is
+// drawn by its own weight, so its rate over a sample is a rate over many draws.
+export function makePair(r: Rng, axisId0: string): JsonMap | null {
+  let axisId = axisId0
+  const gIds: string[] = []
+  const gWs: i32[] = []
+  let gTotal = 0
+  let total = 0
+  for a in AXES {
+    total = total + a.weight
+    if a.generator != "" && !excluded(a.id) {
+      gIds.push(a.id)
+      gWs.push(a.weight)
+      gTotal = gTotal + a.weight
+    }
+  }
+  if axisId == "" && gIds.length > 0 {
+    if random(r) < (gTotal as f64) / (total as f64) {
+      axisId = gIds[pickIdx(r, gIds, gWs)]
+    }
+  }
+  if axisId != "" {
+    for a in AXES {
+      if a.id == axisId && a.generator == "modules" { return modulesPair(r) }
+      if a.id == axisId && a.generator == "imports" { return importsPair(r) }
+    }
+  }
+  const got = planPair(r, axisId)
+  if got == null { return null }
+  const plan = got.plan
+  const axis = got.axis
+  const a = render(plan, got.fa)
+  const b = render(plan, got.fb)
+  if a.src == b.src { return null }
+  newPair(
+    axis.id,
+    specOf(plan),
+    jfaces(got.fa),
+    jfaces(got.fb),
+    side(a.src, a.want, face(got.fa, axis.id)),
+    side(b.src, b.want, face(got.fb, axis.id)),
+    features(plan, got.fa, got.fb),
+    delta(axis, got.fa, got.fb, plan, a.src, b.src),
+  )
+}

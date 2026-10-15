@@ -3,8 +3,8 @@
 #
 # Builds scripts/std-math/trig-grid.vl at -O0 and -O3, runs both under wasmtime (`vl run`)
 # and V8 (Deno), requires all four transcripts to agree bit for bit on every RESULT, then
-# grades the -O0 transcript against mpmath (max/mean ulp per width, function and range).
-# Needs `python3 -c 'import mpmath'` (pip install mpmath). ~1 min with the box to itself.
+# grades the -O0 transcript against a 256-bit reference (trig-grade.vl: max/mean ulp per width,
+# function and range).
 #
 #   scripts/std-math/trig-check.sh [out-dir]
 set -euo pipefail
@@ -30,4 +30,5 @@ for t in grid.v8 grid-o3.wasmtime grid-o3.v8; do
   fi
 done
 echo "determinism: $(wc -l < "$OUT/grid.wasmtime.txt") points, results identical across wasmtime/V8 x -O0/-O3"
-python3 scripts/std-math/trig-grade.py "$OUT/grid.wasmtime.txt"
+export VL SEED
+"$VL" run scripts/std-math/trig-grade.vl --compiler "$SEED" -- "$OUT/grid.wasmtime.txt"

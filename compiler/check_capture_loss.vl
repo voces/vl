@@ -1,0 +1,114 @@
+// The capture-loss notes (D2407, D2529): a narrowing a nested function cannot keep makes the
+// checker read the name at its declared type, and a refusal of that read gains a sentence saying
+// which function lost the narrowing and what to re-test. The checker records each lost read with
+// `crLostPush`, drops the records of a scope it leaves with `crLostPopTo`, and asks `crLostNote`
+// when it builds a diagnostic. This module imports only `./ast` and `./fmt_util`; the function
+// and scope depth a record belongs to are passed by the caller.
+import { P, i32ToStr, nodeToks } from "./ast"
+import { nodeLastTok, nodeStartTok } from "./fmt_util"
+
+// Does node `outer`'s source span hold node `inner`'s first token?
+export function crSpans(outer: i32, inner: i32): boolean {
+  if outer < 0 || inner < 0 { return false }
+  const t = nodeStartTok(inner)
+  const a = nodeStartTok(outer)
+  if t < 0 || a < 0 { return false }
+  t >= a && t <= nodeLastTok(outer)
+}
+
+// The source line of a node, or 0 when it has no anchor token.
+export function nodeLineOf(at: i32) {
+  if at >= 0 && at < nodeToks.length {
+    const tk = nodeToks[at]
+    if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
+  }
+  0
+}
+
+// The lost reads, innermost last: whether the read is a bare name (else a property path), its
+// key, the node read, the function that lost the narrowing, and the scope depth of the read.
+let crLostBare: boolean[] = []
+let crLostKeys: string[] = []
+let crLostIxs: i32[] = []
+let crLostFns: i32[] = []
+let crLostDepths: i32[] = []
+
+// Record a read of `key` at node `ix` whose narrowing function `fnIx` lost, at scope depth `depth`.
+export function crLostPush(
+  key: string,
+  ix: i32,
+  fnIx: i32,
+  depth: i32,
+  bare: boolean,
+): i32 {
+  crLostKeys.push(key)
+  crLostIxs.push(ix)
+  crLostFns.push(fnIx)
+  crLostDepths.push(depth)
+  crLostBare.push(bare)
+  0
+}
+
+// Forget every record.
+export function crLostReset(): i32 {
+  crLostKeys = []
+  crLostIxs = []
+  crLostFns = []
+  crLostDepths = []
+  crLostBare = []
+  0
+}
+
+// Whether any read is recorded.
+export function crLostAny(): boolean { crLostIxs.length > 0 }
+
+// Drop the records read deeper than scope depth `depth`.
+export function crLostPopTo(depth: i32): i32 {
+  while (
+    crLostDepths.length > 0
+    && crLostDepths[crLostDepths.length - 1] > depth
+  ) {
+    crLostKeys.pop()
+    crLostIxs.pop()
+    crLostFns.pop()
+    crLostDepths.pop()
+    crLostBare.pop()
+  }
+  0
+}
+
+// The note a diagnostic at node `at` gains when it spans a recorded read, newest first; "" when
+// none does or the message already says the name is not narrowed.
+export function crLostNote(msg: string, at: i32): string {
+  let i = crLostIxs.length - 1
+  while i >= 0 {
+    const k = crLostKeys[i]
+    if (
+      crSpans(at, crLostIxs[i])
+      && msg.indexOf("'" + k + "' is not narrowed") < 0
+    ) {
+      if crLostBare[i] {
+        return " — '"
+          + k
+          + "' is not narrowed inside the function on line "
+          + i32ToStr(nodeLineOf(crLostFns[i]))
+          + ": it may run before '"
+          + k
+          + "' is narrowed, or after a write that may store null; re-test '"
+          + k
+          + "' inside it"
+      }
+      return " — '"
+        + k
+        + "' is not narrowed inside the function on line "
+        + i32ToStr(nodeLineOf(crLostFns[i]))
+        + ": it is returned, stored or handed on, so it may run after '"
+        + k
+        + "' is written through another reference to the object; re-test '"
+        + k
+        + "' inside it"
+    }
+    i = i - 1
+  }
+  ""
+}

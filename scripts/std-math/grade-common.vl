@@ -1,0 +1,354 @@
+// What trig-grade.vl and math-grade.vl share: per-key ulp statistics, Python's spellings of
+// a float (`%9.4f` and `repr`), and the fan-out that grades a long transcript in chunks.
+//
+//     import { Acc, gradeMain, note, pyFixed, pyFloatRepr } from "./grade-common"
+//
+// A grader hands `gradeMain` its own path and a function that grades one transcript line
+// into an `Acc`. Statistics merge in transcript order, which is the order the Python's
+// pool met them in, so ties and "first seen" read the same way.
+
+import { IoError, listDir } from "std:fs"
+import { parseI32, parseI64, toFixed, toString } from "std:fmt"
+import { join, split } from "std:str"
+import { die, envOr, findFrom, stripWs } from "../lib/common"
+import { readText, sortStrings, spawn, writeText } from "../lib/corpus"
+
+// One key's points: count, max and total error, how many exceed half an ulp, and the
+// error and input of the LAST point at the maximum (the Python's `>=`).
+export type Stat = { n: i32, mx: f64, tot: f64, over: i32, we: f64, wx: f64 }
+
+// The keys in the order they were first met, their statistics, and how many exact powers
+// came back inexact (math-grade's second failure; trig-grade leaves it 0).
+export type Acc = { stats: Map<string, Stat>, order: string[], misses: i32[] }
+
+export function newAcc(): Acc { { stats: Map(), order: [], misses: [0] } }
+
+// Add a point with error `e` at input `x` under `key`.
+export function note(acc: Acc, key: string, e: f64, x: f64) {
+  const s = acc.stats[key]
+  if s == null {
+    acc.order.push(key)
+    let o = 0
+    if e > 0.5 { o = 1 }
+    acc.stats[key] = { n: 1, mx: e, tot: e, over: o, we: e, wx: x }
+    return
+  }
+  let o = s.over
+  if e > 0.5 { o = o + 1 }
+  let mx = s.mx
+  if e > mx { mx = e }
+  let we = s.we
+  let wx = s.wx
+  if e >= we {
+    we = e
+    wx = x
+  }
+  acc.stats[key] = {
+    n: s.n + 1,
+    mx: mx,
+    tot: s.tot + e,
+    over: o,
+    we: we,
+    wx: wx,
+  }
+}
+
+function merge(acc: Acc, key: string, c: Stat) {
+  const s = acc.stats[key]
+  if s == null {
+    acc.order.push(key)
+    acc.stats[key] = c
+    return
+  }
+  let mx = s.mx
+  if c.mx > mx { mx = c.mx }
+  let we = s.we
+  let wx = s.wx
+  if c.we >= we {
+    we = c.we
+    wx = c.wx
+  }
+  acc.stats[key] = {
+    n: s.n + c.n,
+    mx: mx,
+    tot: s.tot + c.tot,
+    over: s.over + c.over,
+    we: we,
+    wx: wx,
+  }
+}
+
+export function stat(acc: Acc, key: string): Stat {
+  acc.stats[key] ?? { n: 0, mx: 0.0, tot: 0.0, over: 0, we: 0.0, wx: 0.0 }
+}
+
+export function sortedKeys(acc: Acc): string[] { sortStrings(acc.order) }
+
+// ── Python's float text ──────────────────────────────────────────────────────────────
+
+// `%.<digits>f`: `toFixed`, except that an exact tie rounds to even as Python does, and the
+// infinities read `inf`. The tie shows in the exact expansion as a 5 followed by zeros.
+export function pyFixed(x: f64, digits: i32): string {
+  if x != x { return "nan" }
+  if x == 1.0 / 0.0 { return "inf" }
+  if x == -1.0 / 0.0 { return "-inf" }
+  const full = toFixed(x, 100)
+  const point = findFrom(full, ".", 0)
+  const cut = point + 1 + digits
+  if full[cut] != 53 { return toFixed(x, digits) }
+  let k = cut + 1
+  while k < full.length {
+    if full[k] != 48 { return toFixed(x, digits) }
+    k = k + 1
+  }
+  let last = full[cut - 1]
+  if last == 46 { last = full[cut - 2] }
+  if (last - 48) % 2 == 1 { return toFixed(x, digits) }
+  if digits == 0 { return full.slice(0, point) }
+  full.slice(0, cut)
+}
+
+// Python's `repr` of a float: the shortest digits that read back (as `toString` finds them),
+// fixed between 1e-4 and 1e16 and scientific with a two-digit exponent outside.
+export function pyFloatRepr(x: f64): string {
+  if x != x { return "nan" }
+  if x == 1.0 / 0.0 { return "inf" }
+  if x == -1.0 / 0.0 { return "-inf" }
+  let sign = ""
+  if f64bits(x) < 0 { sign = "-" }
+  if x == 0.0 { return sign + "0.0" }
+  const js = toString(abs(x))
+  let mant = js
+  let ex = 0
+  const at = findFrom(js, "e", 0)
+  if at >= 0 {
+    mant = js.slice(0, at)
+    let es = js.slice(at + 1, js.length)
+    if es[0] == 43 { es = es.slice(1, es.length) }
+    ex = parseI32(es) ?? 0
+  }
+  let ip = mant
+  let fp = ""
+  const dot = findFrom(mant, ".", 0)
+  if dot >= 0 {
+    ip = mant.slice(0, dot)
+    fp = mant.slice(dot + 1, mant.length)
+  }
+  let digits = ip + fp
+  let decpt = ip.length + ex
+  while digits.length > 1 && digits[0] == 48 {
+    digits = digits.slice(1, digits.length)
+    decpt = decpt - 1
+  }
+  while digits.length > 1 && digits[digits.length - 1] == 48 {
+    digits = digits.slice(0, digits.length - 1)
+  }
+  if decpt > -4 && decpt <= 16 {
+    if decpt <= 0 {
+      let z = ""
+      let i = 0
+      while i < 0 - decpt {
+        z = z + "0"
+        i = i + 1
+      }
+      return sign + "0." + z + digits
+    }
+    if decpt >= digits.length {
+      let z = ""
+      let i = digits.length
+      while i < decpt {
+        z = z + "0"
+        i = i + 1
+      }
+      return sign + digits + z + ".0"
+    }
+    return sign
+      + digits.slice(0, decpt)
+      + "."
+      + digits.slice(decpt, digits.length)
+  }
+  let m = digits.slice(0, 1)
+  if digits.length > 1 { m = m + "." + digits.slice(1, digits.length) }
+  const e10 = decpt - 1
+  let es = "+"
+  let ea = e10
+  if e10 < 0 {
+    es = "-"
+    ea = 0 - e10
+  }
+  let ed = toString(ea)
+  if ed.length < 2 { ed = "0" + ed }
+  sign + m + "e" + es + ed
+}
+
+// ── the fan-out ──────────────────────────────────────────────────────────────────────
+
+// Lines per worker; `GRADE_CHUNK` lowers it so a small transcript can take the fan-out path.
+function chunkSize(): i32 { parseI32(envOr("GRADE_CHUNK", "100000")) ?? 100000 }
+
+function gradeText(text: string, line: (string, Acc) => void, acc: Acc) {
+  let at = 0
+  while at < text.length {
+    let nl = findFrom(text, "\n", at)
+    if nl < 0 { nl = text.length }
+    if nl > at { line(text.slice(at, nl), acc) }
+    at = nl + 1
+  }
+}
+
+// One worker's answer: a line per key, the key's tab-separated parts then n, max, total,
+// over, worst error and worst input (floats as their bits), and a last `misses` line.
+function dump(acc: Acc): string {
+  const out: string[] = []
+  for k in acc.order {
+    const s = stat(acc, k)
+    out.push(
+      join(
+        [
+          k,
+          toString(s.n),
+          toString(f64bits(s.mx)),
+          toString(f64bits(s.tot)),
+          toString(s.over),
+          toString(f64bits(s.we)),
+          toString(f64bits(s.wx)),
+        ],
+        "\t",
+      ),
+    )
+  }
+  out.push("misses\t" + toString(acc.misses[0]))
+  join(out, "\n") + "\n"
+}
+
+function bitsAt(p: string[], i: i32): f64 { f64fromBits(parseI64(p[i]) ?? 0) }
+
+function intAt(p: string[], i: i32): i32 { parseI32(p[i]) ?? 0 }
+
+function absorb(acc: Acc, text: string) {
+  for ln in split(text, "\n") {
+    const p = split(ln, "\t")
+    if p.length == 2 && p[0] == "misses" {
+      acc.misses[0] = acc.misses[0] + intAt(p, 1)
+    } else if p.length == 9 {
+      merge(
+        acc,
+        join(p.slice(0, 3), "\t"),
+        {
+          n: intAt(p, 3),
+          mx: bitsAt(p, 4),
+          tot: bitsAt(p, 5),
+          over: intAt(p, 6),
+          we: bitsAt(p, 7),
+          wx: bitsAt(p, 8),
+        },
+      )
+    }
+  }
+}
+
+function lineCount(path: string): i32 {
+  const w = spawn("wc", ["-l", path])
+  if w.code != 0 { die("cannot count the lines of \{path}: \{w.err}", 2) }
+  parseI32(split(stripWs(w.out), " ")[0]) ?? 0
+}
+
+// Grade `path` line by line. Past one chunk it is split, `self` is built once, and the
+// chunks are graded `$JOBS` at a time (default 14, the Python's pool) by `xargs -P`.
+function gradePath(
+  self: string,
+  path: string,
+  line: (string, Acc) => void,
+): Acc {
+  const acc = newAcc()
+  const chunk = chunkSize()
+  if lineCount(path) <= chunk {
+    gradeText(readText(path), line, acc)
+    return acc
+  }
+  const mk = spawn("mktemp", ["-d"])
+  if mk.code != 0 { die("mktemp -d failed: " + mk.err, 2) }
+  const root = stripWs(mk.out)
+  const sp = spawn(
+    "split",
+    ["-l", toString(chunk), "-d", "-a", "5", path, root + "/c"],
+  )
+  if sp.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("cannot split \{path}: \{sp.err}", 2)
+  }
+  const names = listDir(root)
+  if names is IoError {
+    spawn("rm", ["-rf", root])
+    die("cannot list \{root}", 2)
+    return acc
+  }
+  const chunks: string[] = []
+  for n in sortStrings(names) { chunks.push(root + "/" + n) }
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const grader = root + "/grader.wasm"
+  const b = spawn(
+    vl,
+    [
+      "build",
+      self,
+      "--compiler",
+      envOr("SEED", "build/vl-compiler.wasm"),
+      "-o",
+      grader,
+    ],
+  )
+  if b.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("cannot build \{self}:\n" + b.out + b.err, 2)
+  }
+  writeText(root + "/jobs", join(chunks, "\n") + "\n")
+  const x = spawn(
+    "xargs",
+    [
+      "-a",
+      root + "/jobs",
+      "-d",
+      "\\n",
+      "-P",
+      envOr("JOBS", "14"),
+      "-n",
+      "1",
+      vl,
+      "run",
+      grader,
+      "--",
+      "--grade-chunk",
+    ],
+  )
+  if x.code != 0 {
+    spawn("rm", ["-rf", root])
+    die(
+      "a grading worker failed (rc=\{toString(x.code)}):\n" + x.out + x.err,
+      2,
+    )
+  }
+  for c in chunks { absorb(acc, readText(c + ".out")) }
+  spawn("rm", ["-rf", root])
+  acc
+}
+
+// The grader's entry: `<transcript>` grades it and returns the statistics; a worker's
+// `--grade-chunk <file>` writes `<file>.out` and returns null.
+export function gradeMain(
+  self: string,
+  args: string[],
+  usage: string,
+  line: (string, Acc) => void,
+): Acc | null {
+  if args.length == 2 && args[0] == "--grade-chunk" {
+    const acc = newAcc()
+    gradeText(readText(args[1]), line, acc)
+    writeText(args[1] + ".out", dump(acc))
+    return null
+  }
+  if args.length != 1 || args[0].length == 0 || args[0][0] == 45 {
+    die(usage, 2)
+  }
+  gradePath(self, args[0], line)
+}

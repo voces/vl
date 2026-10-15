@@ -1,0 +1,1531 @@
+// The grammar of ORDINARY VL programs, as data: the shapes a tutorial would contain,
+// weighted toward the textbook end, which the sampler pairs two spellings of. Nothing
+// here renders (`render.vl` walks these records) and nothing runs a program
+// (`sample.vl` does). docs/internals/day-one-sampler.md.
+//
+//     import { VALUES, AXES } from "./grammar"
+
+import { split } from "std:str"
+
+// One way a value is consumed. `want` is the exact stdout the pair is graded on; an
+// empty tag field means the read does not carry it. `namedOnly` marks a read whose
+// spelling needs a declared name (`is Rect`), which the inline face cannot write.
+export type Read = {
+  id: string,
+  lines: string[],
+  want: string[],
+  narrow: string,
+  namedOnly: boolean,
+  mix: string,
+  op: string,
+  opw: string,
+  xnp: string,
+  xrep: string,
+}
+
+export type Decl = { name: string, rhs: string }
+
+// One ordinary type in both spellings. `expr` is "" when `mk` builds the value inside
+// a helper returning `{T}`; `fns` are module declarations the record brings.
+export type Value = {
+  id: string,
+  weight: i32,
+  decls: Decl[],
+  named: string,
+  inline: string,
+  expr: string,
+  mk: string[],
+  alt: string,
+  altInfers: boolean,
+  noInline: boolean,
+  fns: string[],
+  features: string[],
+  reads: Read[],
+}
+
+export type Position = {
+  id: string,
+  weight: i32,
+  wraps: boolean,
+  noNullable: boolean,
+  fixedScope: string,
+}
+
+export type Scope = { id: string, weight: i32 }
+
+export type Source = {
+  id: string,
+  weight: i32,
+  needsAlt: boolean,
+  noNullable: boolean,
+}
+
+export type Scenery = { id: string, lines: string[], isImport: boolean }
+
+// The second argument of the two-hole pin; `expr` "" is the `same` control, filled
+// from the value's own `alt` at render.
+export type SecondPin = {
+  id: string,
+  weight: i32,
+  expr: string,
+  decls: string[],
+}
+
+// What a pair varies. `needs` names what a plan must offer for the axis to apply,
+// `pinFusion` forces the fusion face, and `generator` names an axis with its own grammar.
+export type Axis = {
+  id: string,
+  weight: i32,
+  faces: string[],
+  needs: string,
+  pinFusion: string,
+  generator: string,
+}
+
+// Grammar ids the caller asked every generator to stop drawing (`--exclude`).
+const EXCLUDED: string[] = []
+
+export function exclude(ids: string[]) {
+  for i in ids { EXCLUDED.push(i) }
+}
+
+export function excluded(id: string): boolean {
+  for e in EXCLUDED {
+    if e == id { return true }
+  }
+  false
+}
+
+// A read from its id, a space-separated tag list (`narrow=eq named_only`), its lines
+// and its wanted output.
+function rd(id: string, tags: string, lines: string[], want: string[]): Read {
+  const r: Read = {
+    id: id,
+    lines: lines,
+    want: want,
+    narrow: "",
+    namedOnly: false,
+    mix: "",
+    op: "",
+    opw: "",
+    xnp: "",
+    xrep: "",
+  }
+  for t in split(tags, " ") {
+    if t == "" { continue }
+    if t == "named_only" {
+      r.namedOnly = true
+      continue
+    }
+    let eq = 0
+    while eq < t.length && t[eq] != 61 { eq = eq + 1 }
+    const k = t.slice(0, eq)
+    const v = t.slice(eq + 1, t.length)
+    if k == "narrow" { r.narrow = v }
+    else if k == "mix" { r.mix = v }
+    else if k == "op" { r.op = v }
+    else if k == "opw" { r.opw = v }
+    else if k == "xnp" { r.xnp = v }
+    else if k == "xrep" { r.xrep = v }
+  }
+  r
+}
+
+function d(name: string, rhs: string): Decl { { name: name, rhs: rhs } }
+
+function cat(a: string[], b: string[]): string[] {
+  const out: string[] = []
+  for x in a { out.push(x) }
+  for x in b { out.push(x) }
+  out
+}
+
+// A nominal record's `alt`: a call, so the value keeps its brand un-annotated.
+function opAlt(name: string, ty: string): string[] {
+  [
+    "function \{name}(): \{ty} {",
+    "  const r: " + ty + " = { x: 9 }",
+    "  return r",
+    "}",
+  ]
+}
+
+const OP_MK = ["const r: {T} = { x: 3 }", "return r"]
+const REC_INLINE = "{ name: string, n: i32 }"
+const REC_EXPR = "{ name: \"ada\", n: 3 }"
+const REC_ALT = "{ name: \"zed\", n: 0 }"
+const THRU = "function thru<T>(x: T): T { return x }"
+
+function recDecl(): Decl { d("Rec", REC_INLINE) }
+
+export const VALUES: Value[] = [
+  {
+    id: "i32",
+    weight: 4,
+    decls: [],
+    named: "i32",
+    inline: "i32",
+    expr: "7",
+    mk: [],
+    alt: "0",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["scalar"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["7"]),
+      rd(
+        "same_add",
+        "mix=same",
+        ["print({v} + 1)"],
+        ["8"],
+      ),
+      rd(
+        "mix_i64",
+        "mix=i32->i64",
+        ["print({v} + 9000000000)"],
+        ["9000000007"],
+      ),
+      rd(
+        "mix_f64",
+        "mix=i32->f64",
+        ["print({v} + 2.5)"],
+        ["9.5"],
+      ),
+      rd(
+        "mix_f64_mul",
+        "mix=i32->f64",
+        ["print({v} * 2.5)"],
+        ["17.5"],
+      ),
+      rd(
+        "mix_cmp_i64",
+        "mix=i32->i64",
+        [
+          "if {v} < 9000000000 { print(1) } else { print(0) }",
+        ],
+        ["1"],
+      ),
+    ],
+  },
+  {
+    id: "f64",
+    weight: 2,
+    decls: [],
+    named: "f64",
+    inline: "f64",
+    expr: "2.5",
+    mk: [],
+    alt: "0.0",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["scalar", "f64"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["2.5"]),
+      rd(
+        "arith",
+        "mix=same",
+        ["print({v} * 2.0)"],
+        ["5"],
+      ),
+      rd(
+        "same_add",
+        "mix=same",
+        ["print({v} + 2.5)"],
+        ["5"],
+      ),
+      rd(
+        "mix_lit_i32",
+        "mix=i32->f64",
+        ["print({v} + 1)"],
+        ["3.5"],
+      ),
+    ],
+  },
+  {
+    id: "f32",
+    weight: 2,
+    decls: [],
+    named: "f32",
+    inline: "f32",
+    expr: "",
+    mk: ["return 1.5"],
+    alt: "0.0",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["scalar", "f32"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["1.5"]),
+      rd(
+        "same_add",
+        "mix=same",
+        ["print({v} + 1.5)"],
+        ["3"],
+      ),
+      rd(
+        "mix_f64",
+        "mix=f32->f64",
+        ["const wf: f64 = 2.5", "print({v} + wf)"],
+        ["4"],
+      ),
+      rd(
+        "lit_default",
+        "mix=lit->f32",
+        ["print({v} + 1)"],
+        ["2.5"],
+      ),
+    ],
+  },
+  {
+    id: "string",
+    weight: 3,
+    decls: [],
+    named: "string",
+    inline: "string",
+    expr: "\"hello\"",
+    mk: [],
+    alt: "\"\"",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["scalar", "string"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["hello"]),
+      rd(
+        "concat",
+        "",
+        ["print({v} + \"!\")"],
+        ["hello!"],
+      ),
+      rd("len", "", ["print({v}.length)"], ["5"]),
+    ],
+  },
+  {
+    id: "boolean",
+    weight: 2,
+    decls: [],
+    named: "boolean",
+    inline: "boolean",
+    expr: "true",
+    mk: [],
+    alt: "false",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["scalar"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["true"]),
+      rd(
+        "branch",
+        "",
+        ["if {v} { print(1) } else { print(0) }"],
+        ["1"],
+      ),
+    ],
+  },
+  {
+    id: "i64",
+    weight: 2,
+    decls: [],
+    named: "i64",
+    inline: "i64",
+    expr: "9000000000",
+    mk: [],
+    alt: "0",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["scalar", "i64"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["9000000000"]),
+      rd(
+        "same_add",
+        "mix=same",
+        ["print({v} + 9000000000)"],
+        ["18000000000"],
+      ),
+      rd(
+        "mix_lit_i32",
+        "mix=i32->i64",
+        ["print({v} + 1)"],
+        ["9000000001"],
+      ),
+      rd(
+        "mix_div",
+        "mix=i32->i64",
+        ["print({v} / 2)"],
+        ["4500000000"],
+      ),
+    ],
+  },
+  {
+    id: "rec",
+    weight: 4,
+    decls: [recDecl()],
+    named: "Rec",
+    inline: REC_INLINE,
+    expr: REC_EXPR,
+    mk: [],
+    alt: REC_ALT,
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["struct"],
+    reads: [
+      rd("field", "", ["print({v}.n)"], ["3"]),
+      rd("strfield", "", ["print({v}.name)"], ["ada"]),
+    ],
+  },
+  {
+    id: "dunion",
+    weight: 5,
+    decls: [
+      d("Circle", "{ kind: \"circle\", r: f64 }"),
+      d("Rect", "{ kind: \"rect\", w: f64, h: f64 }"),
+      d("Shape", "Circle | Rect"),
+    ],
+    named: "Shape",
+    inline: "{ kind: \"circle\", r: f64 } | { kind: \"rect\", w: f64, h: f64 }",
+    expr: "",
+    mk: ["return { kind: \"rect\", w: 2.0, h: 3.0 }"],
+    alt: "{ kind: \"circle\", r: 1.0 }",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["union", "struct", "discriminant"],
+    reads: [
+      rd(
+        "eq_narrow",
+        "narrow=eq",
+        [
+          "if {v}.kind == \"rect\" { print({v}.w) } else { print(0) }",
+        ],
+        ["2"],
+      ),
+      rd(
+        "is_narrow",
+        "narrow=is named_only",
+        [
+          "if {v} is Rect { print({v}.w) } else { print(0) }",
+        ],
+        ["2"],
+      ),
+      rd(
+        "match_bind",
+        "narrow=match named_only",
+        [
+          "match {v} {", "  Rect{w} => print(w)", "  Circle => print(0)", "}",
+        ],
+        ["2"],
+      ),
+      rd("shared", "", ["print({v}.kind)"], ["rect"]),
+    ],
+  },
+  {
+    id: "sunion",
+    weight: 2,
+    decls: [
+      d("Dot", "{ kind: i32, r: f64 }"),
+      d("Box", "{ kind: i32, w: f64 }"),
+      d("Fig", "Dot | Box"),
+    ],
+    named: "Fig",
+    inline: "{ kind: i32, r: f64 } | { kind: i32, w: f64 }",
+    expr: "",
+    mk: ["return { kind: 2, w: 4.0 }"],
+    alt: "{ kind: 1, r: 1.0 }",
+    altInfers: false,
+    noInline: false,
+    fns: [THRU],
+    features: ["union", "struct"],
+    reads: [
+      rd("shared", "", ["print({v}.kind)"], ["2"]),
+      rd(
+        "is_narrow",
+        "narrow=is named_only",
+        [
+          "if {v} is Box { print({v}.w) } else { print(0) }",
+        ],
+        ["4"],
+      ),
+      rd(
+        "match_bind",
+        "narrow=match named_only",
+        [
+          "match {v} {", "  Box{w} => print(w)", "  Dot => print(0)", "}",
+        ],
+        ["4"],
+      ),
+      rd(
+        "is_pin",
+        "narrow=is named_only xnp=is",
+        [
+          "if {v} is Box { print(thru({v}).w) } else { print(0) }",
+        ],
+        ["4"],
+      ),
+      rd(
+        "match_pin",
+        "narrow=match named_only xnp=match",
+        [
+          "match {v} {", "  Box{w} => print(thru(w))", "  Dot => print(0)", "}",
+        ],
+        ["4"],
+      ),
+    ],
+  },
+  {
+    id: "litunion",
+    weight: 3,
+    decls: [d("Color", "\"red\" | \"green\"")],
+    named: "Color",
+    inline: "\"red\" | \"green\"",
+    expr: "",
+    mk: ["return \"red\""],
+    alt: "\"green\"",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["litunion"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["red"]),
+      rd(
+        "eq_narrow",
+        "narrow=eq",
+        [
+          "if {v} == \"red\" { print(1) } else { print(0) }",
+        ],
+        ["1"],
+      ),
+      rd(
+        "match_lit",
+        "narrow=match",
+        [
+          "match {v} {", "  \"red\" => print(1)", "  \"green\" => print(0)",
+          "}",
+        ],
+        ["1"],
+      ),
+    ],
+  },
+  {
+    id: "nullable_ref",
+    weight: 4,
+    decls: [recDecl(), d("MaybeRec", "Rec | null")],
+    named: "MaybeRec",
+    inline: REC_INLINE + " | null",
+    expr: "",
+    mk: ["return " + REC_EXPR],
+    alt: "null",
+    altInfers: false,
+    noInline: false,
+    fns: [THRU],
+    features: ["nullable", "struct"],
+    reads: [
+      rd(
+        "nullcheck",
+        "narrow=ne_null",
+        [
+          "if {v} != null { print({v}.n) } else { print(0) }",
+        ],
+        ["3"],
+      ),
+      rd(
+        "ne_pin",
+        "narrow=ne_null xnp=ne_null",
+        [
+          "if {v} != null { print(thru({v}).n) } else { print(0) }",
+        ],
+        ["3"],
+      ),
+      rd(
+        "match_null_pin",
+        "narrow=match named_only xnp=match",
+        [
+          "match {v} {", "  Rec{n} => print(thru(n))", "  null => print(0)",
+          "}",
+        ],
+        ["3"],
+      ),
+      rd(
+        "isnull",
+        "narrow=is_null",
+        [
+          "if {v} is null { print(0) } else { print({v}.n) }",
+        ],
+        ["3"],
+      ),
+      rd(
+        "coalesce",
+        "",
+        ["print(({v} ?? " + REC_ALT + ").n)"],
+        ["3"],
+      ),
+      rd(
+        "match_null",
+        "narrow=match named_only",
+        [
+          "match {v} {", "  Rec{n} => print(n)", "  null => print(0)", "}",
+        ],
+        ["3"],
+      ),
+    ],
+  },
+  {
+    id: "nullable_scalar",
+    weight: 3,
+    decls: [d("MaybeN", "i32 | null")],
+    named: "MaybeN",
+    inline: "i32 | null",
+    expr: "",
+    mk: ["return 4"],
+    alt: "null",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["nullable", "scalar"],
+    reads: [
+      rd("coalesce", "", ["print({v} ?? 0)"], ["4"]),
+      rd(
+        "nullcheck",
+        "narrow=ne_null",
+        [
+          "if {v} != null { print({v}) } else { print(0) }",
+        ],
+        ["4"],
+      ),
+      rd(
+        "isnull",
+        "narrow=is_null",
+        [
+          "if {v} is null { print(0) } else { print({v}) }",
+        ],
+        ["4"],
+      ),
+      rd(
+        "match_null",
+        "narrow=match",
+        [
+          "match {v} {", "  i32 => print({v})", "  null => print(0)", "}",
+        ],
+        ["4"],
+      ),
+    ],
+  },
+  {
+    id: "list_i32",
+    weight: 3,
+    decls: [],
+    named: "i32[]",
+    inline: "i32[]",
+    expr: "[1, 2, 3]",
+    mk: [],
+    alt: "[0]",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["list", "scalar"],
+    reads: [
+      rd("len", "", ["print({v}.length)"], ["3"]),
+      rd("elem", "", ["print({v}[0])"], ["1"]),
+      rd(
+        "forin",
+        "",
+        [
+          "let sum = 0", "for it in {v} { sum = sum + it }", "print(sum)",
+        ],
+        ["6"],
+      ),
+    ],
+  },
+  {
+    id: "list_rec",
+    weight: 3,
+    decls: [recDecl()],
+    named: "Rec[]",
+    inline: REC_INLINE + "[]",
+    expr: "[" + REC_EXPR + "]",
+    mk: [],
+    alt: "[" + REC_ALT + "]",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["list", "struct"],
+    reads: [
+      rd("len", "", ["print({v}.length)"], ["1"]),
+      rd("elem", "", ["print({v}[0].n)"], ["3"]),
+      rd(
+        "forin",
+        "",
+        ["for it in {v} { print(it.n) }"],
+        ["3"],
+      ),
+    ],
+  },
+  {
+    id: "map_str_i32",
+    weight: 2,
+    decls: [],
+    named: "{[string]: i32}",
+    inline: "{[string]: i32}",
+    expr: "",
+    mk: [
+      "const m: {T} = Map()", "m[\"k\"] = 4", "return m",
+    ],
+    alt: "Map()",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["map", "scalar"],
+    reads: [
+      rd("size", "", ["print({v}.length)"], ["1"]),
+      rd("read", "", ["print({v}[\"k\"] ?? 0)"], ["4"]),
+    ],
+  },
+  {
+    id: "map_str_rec",
+    weight: 2,
+    decls: [recDecl()],
+    named: "{[string]: Rec}",
+    inline: "{[string]: " + REC_INLINE + "}",
+    expr: "",
+    mk: [
+      "const m: {T} = Map()",
+      "m[\"k\"] = " + REC_EXPR,
+      "return m",
+    ],
+    alt: "Map()",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["map", "struct"],
+    reads: [
+      rd("size", "", ["print({v}.length)"], ["1"]),
+      rd(
+        "read",
+        "",
+        ["print(({v}[\"k\"] ?? " + REC_ALT + ").n)"],
+        ["3"],
+      ),
+    ],
+  },
+  {
+    id: "closure",
+    weight: 2,
+    decls: [d("Inc", "(i32) => i32")],
+    named: "Inc",
+    inline: "(i32) => i32",
+    expr: "(x: i32) => x + 1",
+    mk: [],
+    alt: "(x: i32) => x",
+    altInfers: true,
+    noInline: false,
+    fns: [],
+    features: ["closure"],
+    reads: [rd("call", "", ["print({v}(4))"], ["5"])],
+  },
+  {
+    id: "valunion",
+    weight: 3,
+    decls: [d("Val", "i32 | string")],
+    named: "Val",
+    inline: "i32 | string",
+    expr: "",
+    mk: ["return 3"],
+    alt: "\"x\"",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["union", "scalar"],
+    reads: [
+      rd(
+        "is_narrow",
+        "narrow=is",
+        [
+          "if {v} is i32 { print({v}) } else { print(0) }",
+        ],
+        ["3"],
+      ),
+      rd(
+        "match_atom",
+        "narrow=match",
+        [
+          "match {v} {", "  i32 => print({v})", "  string => print(0)", "}",
+        ],
+        ["3"],
+      ),
+      rd(
+        "as_q",
+        "",
+        ["print({v} as? i32 ?? -1)"],
+        ["3"],
+      ),
+      rd("bare", "", ["print({v})"], ["3"]),
+    ],
+  },
+  {
+    id: "rec_node",
+    weight: 3,
+    decls: [d("Node", "{ v: i32, next: Node | null }")],
+    named: "Node",
+    inline: "Node",
+    expr: "",
+    mk: ["return { v: 1, next: { v: 2, next: null } }"],
+    alt: "{ v: 9, next: null }",
+    altInfers: false,
+    noInline: true,
+    fns: [],
+    features: ["struct", "recursive", "nullable"],
+    reads: [
+      rd("depth0", "", ["print({v}.v)"], ["1"]),
+      rd(
+        "depth1",
+        "",
+        [
+          "const nx = {v}.next",
+          "if nx != null { print(nx.v) } else { print(0) }",
+        ],
+        ["2"],
+      ),
+      rd(
+        "depth2",
+        "",
+        [
+          "const n1 = {v}.next", "if n1 != null {", "  const n2 = n1.next",
+          "  if n2 != null { print(n2.v) } else { print(0) }",
+          "} else { print(0) }",
+        ],
+        ["0"],
+      ),
+    ],
+  },
+  {
+    id: "rec_tree",
+    weight: 2,
+    decls: [d("Tree", "{ t: i32, kids: Tree[] }")],
+    named: "Tree",
+    inline: "Tree",
+    expr: "",
+    mk: ["return { t: 7, kids: [] }"],
+    alt: "{ t: 0, kids: [] }",
+    altInfers: false,
+    noInline: true,
+    fns: [],
+    features: ["struct", "recursive", "list"],
+    reads: [
+      rd("depth0", "", ["print({v}.t)"], ["7"]),
+      rd("kids", "", ["print({v}.kids.length)"], ["0"]),
+    ],
+  },
+  {
+    id: "rec_mutual",
+    weight: 2,
+    decls: [
+      d("Leaf", "{ w: i32, up: Branch | null }"),
+      d("Branch", "{ kids: Leaf | null }"),
+    ],
+    named: "Branch",
+    inline: "Branch",
+    expr: "",
+    mk: ["return { kids: { w: 5, up: null } }"],
+    alt: "{ kids: null }",
+    altInfers: false,
+    noInline: true,
+    fns: [],
+    features: ["struct", "recursive", "nullable"],
+    reads: [
+      rd(
+        "depth1",
+        "",
+        [
+          "const k = {v}.kids", "if k != null { print(k.w) } else { print(0) }",
+        ],
+        ["5"],
+      ),
+      rd(
+        "depth2",
+        "",
+        [
+          "const k = {v}.kids", "if k != null {", "  const u = k.up",
+          "  if u != null { print(1) } else { print(0) }",
+          "} else { print(0) }",
+        ],
+        ["0"],
+      ),
+    ],
+  },
+  {
+    id: "rec_flat",
+    weight: 2,
+    decls: [
+      d("Tail", "{ v: i32 }"),
+      d("Head", "{ v: i32, next: Tail | null }"),
+    ],
+    named: "Head",
+    inline: "{ v: i32, next: { v: i32 } | null }",
+    expr: "",
+    mk: ["return { v: 1, next: { v: 2 } }"],
+    alt: "{ v: 9, next: null }",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["struct", "nullable"],
+    reads: [
+      rd("depth0", "", ["print({v}.v)"], ["1"]),
+      rd(
+        "depth1",
+        "",
+        [
+          "const nx = {v}.next",
+          "if nx != null { print(nx.v) } else { print(0) }",
+        ],
+        ["2"],
+      ),
+    ],
+  },
+  {
+    id: "litunion3",
+    weight: 2,
+    decls: [d("Grade", "\"a\" | \"b\" | \"c\"")],
+    named: "Grade",
+    inline: "\"a\" | \"b\" | \"c\"",
+    expr: "",
+    mk: ["return \"b\""],
+    alt: "\"a\"",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["litunion"],
+    reads: [
+      rd("bare", "", ["print({v})"], ["b"]),
+      rd(
+        "eq_narrow",
+        "narrow=eq",
+        [
+          "if {v} == \"b\" || {v} == \"c\" { print(2) } else { print(9) }",
+        ],
+        ["2"],
+      ),
+      rd(
+        "match_or",
+        "narrow=match",
+        [
+          "match {v} {", "  \"a\" => print(9)", "  \"b\" | \"c\" => print(2)",
+          "}",
+        ],
+        ["2"],
+      ),
+    ],
+  },
+  {
+    id: "op_add",
+    weight: 3,
+    decls: [d("Vec", "new { x: i32 }")],
+    named: "Vec",
+    inline: "Vec",
+    expr: "",
+    mk: OP_MK,
+    alt: "altVec()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function \"+\"(self: Vec, other: Vec): Vec {",
+        "  const r: Vec = { x: self.x + other.x }", "  return r", "}",
+        "function plusVec(self: Vec, other: Vec): Vec {",
+        "  const r: Vec = { x: self.x + other.x }", "  return r", "}",
+        "const opW: Vec = { x: 4 }",
+      ],
+      opAlt("altVec", "Vec"),
+    ),
+    features: ["struct", "operator", "op_add"],
+    reads: [
+      rd("op", "op=+", ["print(({v} + opW).x)"], ["7"]),
+      rd(
+        "call",
+        "op=+",
+        ["print(plusVec({v}, opW).x)"],
+        ["7"],
+      ),
+    ],
+  },
+  {
+    id: "op_mul",
+    weight: 2,
+    decls: [d("Sca", "new { x: i32 }")],
+    named: "Sca",
+    inline: "Sca",
+    expr: "",
+    mk: OP_MK,
+    alt: "altSca()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function \"*\"(self: Sca, k: i32): Sca {",
+        "  const r: Sca = { x: self.x * k }", "  return r", "}",
+        "function mulSca(self: Sca, k: i32): Sca {",
+        "  const r: Sca = { x: self.x * k }", "  return r", "}",
+      ],
+      opAlt("altSca", "Sca"),
+    ),
+    features: ["struct", "operator", "op_mul"],
+    reads: [
+      rd("op", "op=*", ["print(({v} * 4).x)"], ["12"]),
+      rd(
+        "call",
+        "op=*",
+        ["print(mulSca({v}, 4).x)"],
+        ["12"],
+      ),
+    ],
+  },
+  {
+    id: "op_cmp",
+    weight: 2,
+    decls: [d("Ord", "new { x: i32 }")],
+    named: "Ord",
+    inline: "Ord",
+    expr: "",
+    mk: OP_MK,
+    alt: "altOrd()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function \"<\"(self: Ord, other: Ord): boolean {",
+        "  return self.x < other.x", "}",
+        "function ltOrd(self: Ord, other: Ord): boolean {",
+        "  return self.x < other.x", "}", "const opO: Ord = { x: 4 }",
+      ],
+      opAlt("altOrd", "Ord"),
+    ),
+    features: ["struct", "operator", "op_cmp"],
+    reads: [
+      rd(
+        "op",
+        "op=<",
+        ["if {v} < opO { print(1) } else { print(0) }"],
+        ["1"],
+      ),
+      rd(
+        "call",
+        "op=<",
+        [
+          "if ltOrd({v}, opO) { print(1) } else { print(0) }",
+        ],
+        ["1"],
+      ),
+    ],
+  },
+  {
+    id: "op_index",
+    weight: 3,
+    decls: [d("Box", "new { x: i32 }")],
+    named: "Box",
+    inline: "Box",
+    expr: "",
+    mk: OP_MK,
+    alt: "altBox()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function \"[]\"(self: Box, i: i32): i32 { return self.x + i }",
+        "function \"[]=\"(self: Box, i: i32, k: i32) {",
+        "  print(self.x + i + k)", "}",
+        "function idxBox(self: Box, i: i32): i32 { return self.x + i }",
+        "function setBox(self: Box, i: i32, k: i32) {",
+        "  print(self.x + i + k)", "}",
+      ],
+      opAlt("altBox", "Box"),
+    ),
+    features: ["struct", "operator", "op_index"],
+    reads: [
+      rd("get_op", "op=[]", ["print({v}[4])"], ["7"]),
+      rd(
+        "get_call",
+        "op=[]",
+        ["print(idxBox({v}, 4))"],
+        ["7"],
+      ),
+      rd("set_op", "op=[]=", ["{v}[4] = 5"], ["12"]),
+      rd(
+        "set_call",
+        "op=[]=",
+        ["setBox({v}, 4, 5)"],
+        ["12"],
+      ),
+    ],
+  },
+  {
+    id: "op_none",
+    weight: 2,
+    decls: [d("Pln", "new { x: i32 }")],
+    named: "Pln",
+    inline: "Pln",
+    expr: "",
+    mk: OP_MK,
+    alt: "altPln()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function plusPln(self: Pln, k: i32): i32 { return self.x + k }",
+      ],
+      opAlt("altPln", "Pln"),
+    ),
+    features: ["struct", "operator", "op_none"],
+    reads: [
+      rd(
+        "call",
+        "op=none",
+        ["print(plusPln({v}, 4))"],
+        ["7"],
+      ),
+      rd(
+        "ufcs",
+        "op=none",
+        ["print({v}.plusPln(4))"],
+        ["7"],
+      ),
+    ],
+  },
+  {
+    id: "op_mixw_mul",
+    weight: 2,
+    decls: [d("Mw", "new { x: i32 }")],
+    named: "Mw",
+    inline: "Mw",
+    expr: "",
+    mk: OP_MK,
+    alt: "altMw()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function \"*\"(self: Mw, k: f64): f64 { return self.x * k }",
+        "function mulMw(self: Mw, k: f64): f64 { return self.x * k }",
+      ],
+      opAlt("altMw", "Mw"),
+    ),
+    features: ["struct", "operator", "op_mixw", "opw_mix"],
+    reads: [
+      rd(
+        "op",
+        "op=* opw=mix",
+        ["print({v} * 2.5)"],
+        ["7.5"],
+      ),
+      rd(
+        "call",
+        "op=* opw=mix",
+        ["print(mulMw({v}, 2.5))"],
+        ["7.5"],
+      ),
+    ],
+  },
+  {
+    id: "op_mixw_add",
+    weight: 2,
+    decls: [d("Aw", "new { x: i32 }")],
+    named: "Aw",
+    inline: "Aw",
+    expr: "",
+    mk: OP_MK,
+    alt: "altAw()",
+    altInfers: true,
+    noInline: true,
+    fns: cat(
+      [
+        "function \"+\"(self: Aw, k: i64): i64 { return self.x + k }",
+        "function addAw(self: Aw, k: i64): i64 { return self.x + k }",
+      ],
+      opAlt("altAw", "Aw"),
+    ),
+    features: ["struct", "operator", "op_mixw", "opw_mix"],
+    reads: [
+      rd(
+        "op",
+        "op=+ opw=mix",
+        ["print({v} + 9000000000)"],
+        ["9000000003"],
+      ),
+      rd(
+        "call",
+        "op=+ opw=mix",
+        ["print(addAw({v}, 9000000000))"],
+        ["9000000003"],
+      ),
+    ],
+  },
+  {
+    id: "op_samew",
+    weight: 2,
+    decls: [d("Sw", "new { y: f64 }")],
+    named: "Sw",
+    inline: "Sw",
+    expr: "",
+    mk: ["const r: {T} = { y: 3.0 }", "return r"],
+    alt: "altSw()",
+    altInfers: true,
+    noInline: true,
+    fns: [
+      "function \"*\"(self: Sw, k: f64): f64 { return self.y * k }",
+      "function mulSw(self: Sw, k: f64): f64 { return self.y * k }",
+      "function altSw(): Sw {", "  const r: Sw = { y: 9.0 }", "  return r", "}",
+    ],
+    features: ["struct", "operator", "op_samew", "opw_same"],
+    reads: [
+      rd(
+        "op",
+        "op=* opw=same",
+        ["print({v} * 2.5)"],
+        ["7.5"],
+      ),
+      rd(
+        "call",
+        "op=* opw=same",
+        ["print(mulSw({v}, 2.5))"],
+        ["7.5"],
+      ),
+    ],
+  },
+  {
+    id: "mix_cross",
+    weight: 2,
+    decls: [d("Rec", "{ n: i32 }"), d("Mix", "i32 | Rec")],
+    named: "Mix",
+    inline: "i32 | { n: i32 }",
+    expr: "",
+    mk: ["return { n: 3 }"],
+    alt: "5",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["union", "struct", "scalar", "xrep_cross"],
+    reads: [
+      rd(
+        "is_rec",
+        "narrow=is named_only xrep=cross",
+        [
+          "if {v} is Rec { print({v}.n) } else { print(0) }",
+        ],
+        ["3"],
+      ),
+      rd(
+        "match_rec",
+        "narrow=match named_only xrep=cross",
+        [
+          "match {v} {", "  Rec{n} => print(n)", "  i32 => print(0)", "}",
+        ],
+        ["3"],
+      ),
+    ],
+  },
+  {
+    id: "mix_cross_rev",
+    weight: 2,
+    decls: [d("Rec", "{ n: i32 }"), d("Mix", "i32 | Rec")],
+    named: "Mix",
+    inline: "i32 | { n: i32 }",
+    expr: "",
+    mk: ["return 5"],
+    alt: "{ n: 9 }",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["union", "struct", "scalar", "xrep_cross"],
+    reads: [
+      rd(
+        "is_i32",
+        "narrow=is xrep=cross",
+        [
+          "if {v} is i32 { print({v}) } else { print(0) }",
+        ],
+        ["5"],
+      ),
+      rd(
+        "match_i32",
+        "narrow=match named_only xrep=cross",
+        [
+          "match {v} {", "  i32 => print({v})", "  Rec => print(0)", "}",
+        ],
+        ["5"],
+      ),
+    ],
+  },
+  {
+    id: "mix_same",
+    weight: 2,
+    decls: [d("Rec", "{ n: i32 }"), d("Mix", "i32 | Rec")],
+    named: "Mix",
+    inline: "i32 | { n: i32 }",
+    expr: "",
+    mk: ["return { n: 3 }"],
+    alt: "{ n: 9 }",
+    altInfers: false,
+    noInline: false,
+    fns: [],
+    features: ["union", "struct", "scalar", "xrep_same"],
+    reads: [
+      rd(
+        "is_rec",
+        "narrow=is named_only xrep=same",
+        [
+          "if {v} is Rec { print({v}.n) } else { print(0) }",
+        ],
+        ["3"],
+      ),
+      rd(
+        "match_rec",
+        "narrow=match named_only xrep=same",
+        [
+          "match {v} {", "  Rec{n} => print(n)", "  i32 => print(0)", "}",
+        ],
+        ["3"],
+      ),
+    ],
+  },
+]
+
+function pos(id: string, weight: i32, wraps: boolean): Position {
+  { id: id, weight: weight, wraps: wraps, noNullable: false, fixedScope: "" }
+}
+
+// Every syntactic place the value can be delivered before it is read. `wraps` puts the
+// read inside the delivery (an un-annotated parameter is a hole).
+export const POSITIONS: Position[] = [
+  pos("binding", 4, false),
+  pos("argument", 4, true),
+  pos("return", 4, false),
+  pos("assignment", 2, false),
+  pos("struct_field", 3, false),
+  pos("list_element", 3, false),
+  {
+    id: "map_value",
+    weight: 2,
+    wraps: false,
+    noNullable: true,
+    fixedScope: "",
+  },
+  {
+    id: "global_init",
+    weight: 2,
+    wraps: true,
+    noNullable: false,
+    fixedScope: "module",
+  },
+  pos("closure_capture", 3, false),
+]
+
+export const SCOPES: Scope[] = [
+  { id: "module", weight: 3 },
+  { id: "function", weight: 4 },
+  { id: "fn_block", weight: 2 },
+  { id: "module_block", weight: 2 },
+  { id: "fn_while", weight: 3 },
+  { id: "module_while", weight: 2 },
+]
+
+// Where the delivered value comes from; `needsAlt` sources build a `T | null` on the
+// way and coalesce back.
+export const SOURCES: Source[] = [
+  {
+    id: "literal",
+    weight: 6,
+    needsAlt: false,
+    noNullable: false,
+  },
+  {
+    id: "call",
+    weight: 4,
+    needsAlt: false,
+    noNullable: false,
+  },
+  {
+    id: "index",
+    weight: 4,
+    needsAlt: false,
+    noNullable: false,
+  },
+  {
+    id: "field",
+    weight: 3,
+    needsAlt: false,
+    noNullable: false,
+  },
+  {
+    id: "map_read",
+    weight: 2,
+    needsAlt: true,
+    noNullable: false,
+  },
+  {
+    id: "coalesce",
+    weight: 2,
+    needsAlt: true,
+    noNullable: true,
+  },
+]
+
+// A plausible unrelated neighbour; each vetoed something in a filed row.
+export const SCENERY: Scenery[] = [
+  {
+    id: "push",
+    lines: ["const bag = [1]", "bag.push(2)"],
+    isImport: false,
+  },
+  {
+    id: "self_fn",
+    lines: [
+      "function tally(self: i32[]): i32 { return self.length }",
+    ],
+    isImport: false,
+  },
+  {
+    id: "hof",
+    lines: ["const apply = (f: (i32) => i32) => f(1)"],
+    isImport: false,
+  },
+  {
+    id: "unused_type",
+    lines: ["type Note = { q: i32 }"],
+    isImport: false,
+  },
+  {
+    id: "unused_import",
+    lines: ["import { toString } from \"std:fmt\""],
+    isImport: true,
+  },
+]
+
+export const SECOND_PIN: SecondPin[] = [
+  {
+    id: "i32",
+    weight: 3,
+    expr: "1",
+    decls: [],
+  },
+  {
+    id: "string",
+    weight: 3,
+    expr: "\"s\"",
+    decls: [],
+  },
+  {
+    id: "f64",
+    weight: 2,
+    expr: "1.5",
+    decls: [],
+  },
+  {
+    id: "boolean",
+    weight: 2,
+    expr: "true",
+    decls: [],
+  },
+  {
+    id: "list",
+    weight: 2,
+    expr: "[1]",
+    decls: [],
+  },
+  {
+    id: "struct",
+    weight: 2,
+    expr: "{ q: 1 }",
+    decls: [],
+  },
+  {
+    id: "nullable",
+    weight: 2,
+    expr: "nulOf()",
+    decls: [
+      "function nulOf(): i32 | null { return 2 }",
+    ],
+  },
+  {
+    id: "same",
+    weight: 3,
+    expr: "",
+    decls: [],
+  },
+]
+
+function ax(id: string, weight: i32, faces: string[], needs: string): Axis {
+  {
+    id: id,
+    weight: weight,
+    faces: faces,
+    needs: needs,
+    pinFusion: "",
+    generator: "",
+  }
+}
+
+// The axes in expected-yield order, which is the order every report prints them in.
+export const AXES: Axis[] = [
+  ax(
+    "named_vs_inline",
+    6,
+    ["named", "inline"],
+    "decls",
+  ),
+  {
+    id: "annotated_vs_inferred",
+    weight: 5,
+    faces: ["annotated", "inferred"],
+    needs: "",
+    pinFusion: "bound",
+    generator: "",
+  },
+  ax("narrowing", 4, ["*"], "narrow_group"),
+  ax("fusion", 3, ["fused", "bound"], "fusible"),
+  ax(
+    "pinning",
+    3,
+    ["direct", "generic", "hole", "generic2"],
+    "pinnable",
+  ),
+  ax(
+    "scope",
+    3,
+    ["module", "function", "fn_block", "module_block"],
+    "free_scope",
+  ),
+  ax("scenery", 3, ["bare", "neighbour"], ""),
+  ax("operator_vs_call", 4, ["*"], "op_group"),
+  {
+    id: "init_vs_assign",
+    weight: 5,
+    faces: ["init", "assign"],
+    needs: "assignable",
+    pinFusion: "bound",
+    generator: "",
+  },
+  {
+    id: "modules_split",
+    weight: 5,
+    faces: ["single", "split"],
+    needs: "",
+    pinFusion: "",
+    generator: "modules",
+  },
+  {
+    id: "imports_pair",
+    weight: 4,
+    faces: ["alone", "together"],
+    needs: "",
+    pinFusion: "",
+    generator: "imports",
+  },
+]
+
+export function axisIds(): string[] {
+  const out: string[] = []
+  for a in AXES { out.push(a.id) }
+  out
+}

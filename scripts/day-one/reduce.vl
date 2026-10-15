@@ -1,0 +1,424 @@
+// Reducing a day-one hit: delta-debug its source by line removal to a minimal witness,
+// then re-render its plan one axis face at a time and re-grade each flip (the ablation).
+// `minimise.vl` prints both; `file_row.vl` drafts an inventory row from them.
+//
+//     import { minimise, ablatePair } from "./reduce"
+
+import { toString } from "std:fmt"
+import { join, split, startsWith } from "std:str"
+import { JsonMap, rstripWs, stripWs } from "../lib/common"
+import { AXES } from "./grammar"
+import { Ctx, Result, gradeSrc } from "./grade"
+import { ablations as importsAblations, renderImports } from "./imports"
+import {
+  ablations as modulesAblations,
+  fileMark,
+  renderModules,
+  specOf as modSpecOf,
+} from "./modules"
+import { faceMap, obj, str, strs } from "./pairs"
+import { planOf, render, renders } from "./render"
+
+// The witness left after line removal, and the grade it was held to.
+export type Minimised = { wit: string, base: Result }
+
+// One flip of the ablation: the axis, `from -> to`, its grade, and `same` or `MOVED`.
+export type Row = { axis: string, flip: string, grade: string, same: string }
+
+// The ablation's base grade and its rows.
+export type Ablation = { base: Result, rows: Row[] }
+
+type Context = {
+  declared: Map<string, boolean>,
+  mustCall: Map<string, boolean>,
+  files: i32,
+}
+
+function key(r: Result): string { "\{r.grade}\n\{r.message}" }
+
+function isWord(b: i32): boolean {
+  (b >= 48 && b <= 57)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+}
+
+function wordEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isWord(s[j]) { j = j + 1 }
+  j
+}
+
+function at(s: string, i: i32, sub: string): boolean {
+  i + sub.length <= s.length && s.slice(i, i + sub.length) == sub
+}
+
+// The enclosing-block chain of each line, one string per line: a cut that deletes a `}`
+// and the next `{` together keeps every depth but reparents the lines below it.
+function chains(lines: string[]): string[] {
+  const out: string[] = []
+  const stack: string[] = []
+  for l in lines {
+    out.push(join(stack, "\n"))
+    let i = 0
+    while i < l.length {
+      if l[i] == 123 { stack.push(l) }
+      else if l[i] == 125 && stack.length > 0 { stack.pop() }
+      i = i + 1
+    }
+  }
+  out
+}
+
+function sameStrs(x: string[], y: string[]): boolean {
+  if x.length != y.length { return false }
+  let i = 0
+  while i < x.length {
+    if x[i] != y[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Names declared as `function <name>` or `const <name> = (`.
+function declared(text: string): Map<string, boolean> {
+  const out: Map<string, boolean> = Map()
+  let i = 0
+  while i < text.length {
+    if at(text, i, "function ") {
+      const e = wordEnd(text, i + 9)
+      if e > i + 9 {
+        out[text.slice(i + 9, e)] = true
+        i = e
+        continue
+      }
+    }
+    if at(text, i, "const ") && (i == 0 || !isWord(text[i - 1])) {
+      const e = wordEnd(text, i + 6)
+      if e > i + 6 && at(text, e, " = (") {
+        out[text.slice(i + 6, e)] = true
+        i = e + 4
+        continue
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// How often `<name>(` appears with no word character before it.
+function calls(text: string, name: string): i32 {
+  const pat = "\{name}("
+  let n = 0
+  let i = 0
+  while i + pat.length <= text.length {
+    if at(text, i, pat) && (i == 0 || !isWord(text[i - 1])) {
+      n = n + 1
+      i = i + pat.length
+    } else {
+      i = i + 1
+    }
+  }
+  n
+}
+
+function fileCount(lines: string[]): i32 {
+  let n = 0
+  for l in lines {
+    if fileMark(l) != "" { n = n + 1 }
+  }
+  n
+}
+
+// What a removal may not break: a declaration whose call survives, a call whose
+// declaration survives, and the number of `// file:` sections.
+function context(src: string): Context {
+  const decl = declared(src)
+  const must: Map<string, boolean> = Map()
+  for name, _v in decl {
+    if calls(src, name) > 1 { must[name] = true }
+  }
+  { declared: decl, mustCall: must, files: fileCount(split(src, "\n")) }
+}
+
+// Whether a line `export <word> <name>` exists, `<name>` ending at a word boundary.
+function exportsName(text: string, nm: string): boolean {
+  for l in split(text, "\n") {
+    if !startsWith(l, "export ") { continue }
+    const e = wordEnd(l, 7)
+    if e == 7 || !at(l, e, " \{nm}") { continue }
+    const after = e + 1 + nm.length
+    if after >= l.length || !isWord(l[after]) { return true }
+  }
+  false
+}
+
+// Every name imported from a sibling `./` section is still exported by some section.
+function importsHold(text: string): boolean {
+  let i = 0
+  while i < text.length {
+    if (i == 0 || text[i - 1] == 10) && at(text, i, "import {") {
+      let j = i + 8
+      while j < text.length && text[j] != 125 { j = j + 1 }
+      if at(text, j, "} from \"./") {
+        for x in split(text.slice(i + 8, j), ",") {
+          const nm = stripWs(x)
+          if nm != "" && !exportsName(text, nm) { return false }
+        }
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+function countOf(text: string, b: i32): i32 {
+  let n = 0
+  let i = 0
+  while i < text.length {
+    if text[i] == b { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+// A candidate is the same program minus lines: same block chains, no block emptied,
+// every called name still declared and every needed declaration still called.
+function plausible(lines: string[], keep: string[], ctx: Context): boolean {
+  if !sameStrs(chains(lines), keep) { return false }
+  let i = 0
+  while i + 1 < lines.length {
+    const a = rstripWs(lines[i])
+    if a.length > 0 && a[a.length - 1] == 123 && stripWs(lines[i + 1]) == "}" {
+      return false
+    }
+    i = i + 1
+  }
+  const text = join(lines, "\n")
+  if fileCount(lines) != ctx.files { return false }
+  if !importsHold(text) { return false }
+  const here = declared(text)
+  for name, _v in ctx.declared {
+    const n = calls(text, name)
+    const isHere = here[name] ?? false
+    if n > 0 && !isHere { return false }
+    if (ctx.mustCall[name] ?? false) && isHere && n < 2 { return false }
+  }
+  countOf(text, 123) == countOf(text, 125)
+    && countOf(text, 40) == countOf(text, 41)
+    && findIn(text, "print(")
+}
+
+function findIn(s: string, sub: string): boolean {
+  let i = 0
+  while i + sub.length <= s.length {
+    if at(s, i, sub) { return true }
+    i = i + 1
+  }
+  false
+}
+
+function cutOut<T>(xs: T[], i: i32, cut: i32): T[] {
+  const out: T[] = []
+  let k = 0
+  while k < xs.length {
+    if k < i || k >= i + cut { out.push(xs[k]) }
+    k = k + 1
+  }
+  out
+}
+
+function trimNl(s: string): string {
+  let e = s.length
+  while e > 0 && s[e - 1] == 10 { e = e - 1 }
+  s.slice(0, e)
+}
+
+// The greedy loop: largest cut first, kept only while grade AND message hold, to a fixpoint.
+export function minimise(
+  c: Ctx,
+  src: string,
+  want: string[],
+  dir: string,
+): Minimised {
+  const base = gradeSrc(c, src, want, dir, "m0")
+  let lines = split(trimNl(src), "\n")
+  const ctx = context(src)
+  let n = 0
+  let changed = true
+  while changed {
+    changed = false
+    let i = 0
+    while i < lines.length {
+      const ch = chains(lines)
+      let kept = false
+      let cut = lines.length - i
+      while cut > 0 {
+        const cand = cutOut(lines, i, cut)
+        const keep = cutOut(ch, i, cut)
+        if cand.length > 0 && plausible(cand, keep, ctx) {
+          n = n + 1
+          const got = gradeSrc(
+            c,
+            join(cand, "\n") + "\n",
+            want,
+            dir,
+            "m\{toString(n)}",
+          )
+          if key(got) == key(base) {
+            lines = cand
+            changed = true
+            kept = true
+            break
+          }
+        }
+        cut = cut - 1
+      }
+      if !kept { i = i + 1 }
+    }
+  }
+  { wit: join(lines, "\n") + "\n", base: base }
+}
+
+function sideOf(pair: JsonMap, side: string): JsonMap { obj(pair, side) }
+
+function verdictOf(got: Result, base: Result): string {
+  if key(got) == key(base) { "same" } else { "MOVED" }
+}
+
+// One axis at a time: the plan re-rendered with that axis at each other face it renders.
+function ablatePlan(
+  c: Ctx,
+  pair: JsonMap,
+  side: string,
+  dir: string,
+): Ablation {
+  const spec = obj(pair, "spec")
+  const faces = faceMap(
+    obj(pair, if side == "a" { "facesA" } else { "facesB" }),
+  )
+  const plan = planOf(spec)
+  const r = render(plan, faces)
+  const base = gradeSrc(c, r.src, r.want, dir, "ab0")
+  const rows: Row[] = []
+  let k = 0
+  for ax in AXES {
+    if ax.generator != "" { continue }
+    let opts = ax.faces
+    if ax.id == "narrowing" {
+      opts = []
+      for x in plan.value.reads { opts.push(x.id) }
+    } else if ax.id == "named_vs_inline" && plan.value.decls.length == 0 {
+      continue
+    }
+    const cur = faces[ax.id] ?? ""
+    for f in opts {
+      if f == "*" || f == cur { continue }
+      const trial: Map<string, string> = Map()
+      for kk, vv in faces { trial[kk] = vv }
+      trial[ax.id] = f
+      if !renders(plan, trial) { continue }
+      const t = render(plan, trial)
+      if t.src == r.src { continue }
+      k = k + 1
+      const got = gradeSrc(c, t.src, t.want, dir, "ab\{toString(k)}")
+      rows.push(
+        {
+          axis: ax.id,
+          flip: "\{cur} -> \{f}",
+          grade: got.grade,
+          same: verdictOf(got, base),
+        },
+      )
+    }
+  }
+  { base: base, rows: rows }
+}
+
+// One unit at a time, for a `modules_split` pair: each unit dropped with its dependents,
+// the names un-collided, and each moved unit kept in the entry.
+function ablateModules(
+  c: Ctx,
+  pair: JsonMap,
+  side: string,
+  dir: string,
+): Ablation {
+  const sp = modSpecOf(obj(pair, "spec"))
+  const face = str(sideOf(pair, side), "face")
+  const r = renderModules(sp, face)
+  const base = gradeSrc(c, r.src, r.want, dir, "abm0")
+  const rows: Row[] = []
+  let k = 0
+  for ab in modulesAblations(sp) {
+    k = k + 1
+    const t = renderModules(ab.spec, face)
+    if t.src == r.src { continue }
+    const got = gradeSrc(c, t.src, t.want, dir, "abm\{toString(k)}")
+    rows.push(
+      {
+        axis: "units",
+        flip: ab.label,
+        grade: got.grade,
+        same: verdictOf(got, base),
+      },
+    )
+  }
+  { base: base, rows: rows }
+}
+
+// One module at a time, for an `imports_pair` pair: each swap that keeps the other module.
+function ablateImports(
+  c: Ctx,
+  pair: JsonMap,
+  side: string,
+  dir: string,
+): Ablation {
+  const sp = obj(pair, "spec")
+  const face = str(sideOf(pair, side), "face")
+  const r = renderImports(sp, face)
+  const base = gradeSrc(c, r.src, r.want, dir, "abi0")
+  const rows: Row[] = []
+  let k = 0
+  for ab in importsAblations(sp) {
+    k = k + 1
+    const t = renderImports(ab.spec, face)
+    if t.src == r.src { continue }
+    const got = gradeSrc(c, t.src, t.want, dir, "abi\{toString(k)}")
+    rows.push(
+      {
+        axis: "modules",
+        flip: ab.label,
+        grade: got.grade,
+        same: verdictOf(got, base),
+      },
+    )
+  }
+  { base: base, rows: rows }
+}
+
+// The ablation for a pair's failing side, by the axis's own grammar.
+export function ablatePair(
+  c: Ctx,
+  pair: JsonMap,
+  side: string,
+  dir: string,
+): Ablation {
+  const axis = str(pair, "axis")
+  if axis == "modules_split" { return ablateModules(c, pair, side, dir) }
+  if axis == "imports_pair" { return ablateImports(c, pair, side, dir) }
+  ablatePlan(c, pair, side, dir)
+}
+
+// The side that does not run: `a` unless `a` runs.
+export function failingSide(pair: JsonMap): string {
+  if str(sideOf(pair, "a"), "grade") != "RUNS" { "a" } else { "b" }
+}
+
+// The side's source and the lines it must print.
+export function sideSrc(pair: JsonMap, side: string): string {
+  str(sideOf(pair, side), "src")
+}
+
+export function sideWant(pair: JsonMap, side: string): string[] {
+  strs(sideOf(pair, side), "want")
+}

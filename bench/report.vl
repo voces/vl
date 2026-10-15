@@ -1,0 +1,939 @@
+// The report half of bench/run.sh: raw.ndjson in, results.json and summary.md out.
+//
+//     vl run bench/report.vl -- --raw F --out DIR --reps N --pin LIST --quick 0|1 \
+//        --noise BENCH --rustc V --deno V --commit SHA --generated ISO8601
+//
+// Every ratio is computed on startup-subtracted ("net") times, so a short benchmark
+// compares languages rather than process launchers. The verdict is VL against deno; rust
+// is headroom and never a loss. The thresholds and flags are defended in bench/README.md.
+// Prints `rows=N void=N fails=N`. Paths are relative to the working directory.
+
+import { IoError, readTextFile, writeTextFile } from "std:fs"
+import { Json, JsonError, parseJson, toJson } from "std:json"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { exit } from "std:process"
+import { codePoints, join, replaceAll, split, startsWith, trim } from "std:str"
+import { parseI32, toFixed } from "std:fmt"
+import { sorted } from "std:array"
+
+type JsonMap = { [string]: Json }
+
+// One measured configuration (a `run`) or one compile (a `build`).
+type Rec = {
+  bench: string,
+  config: string,
+  status: string,
+  med: f64 | null,
+  mn: f64 | null,
+  mx: f64 | null,
+  times: f64[],
+  error: string,
+}
+
+type Meta = { axis: string, variants: string }
+type Void = { bench: string, reason: string }
+type Var = { name: string, raw: f64 | null, net: f64 | null }
+type Fail = { config: string, status: string }
+type Noise = {
+  runtime: string,
+  bench: string,
+  first: f64,
+  repeat: f64,
+  spread: f64,
+}
+
+type Row = {
+  bench: string,
+  category: string,
+  name: string,
+  axis: string,
+  rawRust: f64 | null,
+  rawVl: f64 | null,
+  rawO: f64 | null,
+  rawO3: f64 | null,
+  rawDeno: f64 | null,
+  netRust: f64 | null,
+  netVl: f64 | null,
+  netO: f64 | null,
+  netO3: f64 | null,
+  netDeno: f64 | null,
+  vars: Var[],
+  vlOverDeno: f64 | null,
+  vlOverRust: f64 | null,
+  vlOverDenoMin: f64 | null,
+  vlOverRustMin: f64 | null,
+  o3OverDeno: f64 | null,
+  bestOverDeno: f64 | null,
+  verdict: string,
+  flags: string[],
+  fails: Fail[],
+  buildFails: Fail[],
+  cVl: f64 | null,
+  cO3: f64 | null,
+  cRustc: f64 | null,
+}
+
+// Verdict thresholds, VL net time over deno net time.
+const DENO_WIN = 0.80
+const DENO_PAR = 1.25
+const DENO_PRIORITY = 2.00
+const RUST_HEADROOM_FLAG = 10.0
+
+const runs: { [string]: Rec } = Map()
+const builds: { [string]: Rec } = Map()
+const metas: { [string]: Meta } = Map()
+const notes: { [string]: string[] } = Map()
+const voids: Void[] = []
+// Insertion-ordered keys: `runs`/`builds` keys are "bench\tconfig".
+const runKeys: string[] = []
+const buildKeys: string[] = []
+const metaKeys: string[] = []
+const startupCfgs: string[] = []
+
+function die(msg: string): never {
+  print("bench/report: " + msg)
+  exit(1)
+}
+
+// ---- reading the NDJSON -------------------------------------------------------
+
+function text(m: JsonMap, k: string): string {
+  const v = m[k]
+  if v is string { return v }
+  ""
+}
+
+function num(m: JsonMap, k: string): f64 | null {
+  const v = m[k]
+  if v is f64 { return v }
+  null
+}
+
+function timesOf(m: JsonMap): f64[] {
+  const out: f64[] = []
+  const v = m["times_ms"]
+  if v is Json[] {
+    for t in v {
+      if t is f64 { out.push(t) }
+    }
+  }
+  out
+}
+
+function recOf(m: JsonMap): Rec {
+  {
+    bench: text(m, "bench"),
+    config: text(m, "config"),
+    status: text(m, "status"),
+    med: num(m, "median_ms"),
+    mn: num(m, "min_ms"),
+    mx: num(m, "max_ms"),
+    times: timesOf(m),
+    error: text(m, "error"),
+  }
+}
+
+function key(b: string, cfg: string): string { b + "\t" + cfg }
+
+function load(raw: string) {
+  const body = readTextFile(raw)
+  if body is IoError { die("cannot read \{raw} (\{body.msg})") }
+  for line in split(body, "\n") {
+    if line.trim().length == 0 { continue }
+    const j = parseJson(line)
+    if j is JsonMap {
+      const kind = text(j, "kind")
+      const b = text(j, "bench")
+      if kind == "note" {
+        const cur = notes[b]
+        if cur == null {
+          notes[b] = [text(j, "note")]
+        } else {
+          cur.push(text(j, "note"))
+        }
+      } else if kind == "run" {
+        const r = recOf(j)
+        const k = key(b, r.config)
+        if !runs.has(k) { runKeys.push(k) }
+        if b == "_startup" && !runs.has(k) { startupCfgs.push(r.config) }
+        runs[k] = r
+      } else if kind == "build" {
+        const r = recOf(j)
+        const k = key(b, r.config)
+        if !builds.has(k) { buildKeys.push(k) }
+        builds[k] = r
+      } else if kind == "meta" {
+        if !metas.has(b) { metaKeys.push(b) }
+        metas[b] = { axis: text(j, "axis"), variants: text(j, "variants") }
+      } else if kind == "void" {
+        voids.push({ bench: b, reason: text(j, "reason") })
+      }
+    } else if j is JsonError {
+      die(raw + ": a line is not JSON: " + j.msg)
+    } else {
+      die(raw + ": a line is not a JSON object")
+    }
+  }
+}
+
+// ---- lookups ------------------------------------------------------------------
+
+function runOf(b: string, cfg: string): Rec | null {
+  const k = key(b, cfg)
+  const r = runs[k]
+  if r == null { return null }
+  r
+}
+
+function runAt(k: string): Rec {
+  const r = runs[k]
+  if r == null { die("internal: no run recorded for " + k) }
+  r
+}
+
+function buildAt(k: string): Rec {
+  const r = builds[k]
+  if r == null { die("internal: no build recorded for " + k) }
+  r
+}
+
+function metaAt(b: string): Meta {
+  const m = metas[b]
+  if m == null { die("internal: no meta recorded for " + b) }
+  m
+}
+
+function notesFor(b: string): string[] {
+  const ns = notes[b]
+  if ns == null { return [] }
+  ns
+}
+
+function buildOf(b: string, cfg: string): Rec | null {
+  const k = key(b, cfg)
+  const r = builds[k]
+  if r == null { return null }
+  r
+}
+
+// The median of an OK run, else null.
+function med(b: string, cfg: string): f64 | null {
+  const r = runOf(b, cfg)
+  if r == null { return null }
+  if r.status == "OK" { return r.med }
+  null
+}
+
+function mini(b: string, cfg: string): f64 | null {
+  const r = runOf(b, cfg)
+  if r == null { return null }
+  if r.status == "OK" { return r.mn }
+  null
+}
+
+function status(b: string, cfg: string): string {
+  const r = runOf(b, cfg)
+  if r == null { return "ABSENT" }
+  r.status
+}
+
+// The empty program's median for a runtime, null when it did not run OK.
+function startup(cfg: string): f64 | null { med("_startup", cfg) }
+
+// Python-style truthiness of an optional time: present and non-zero.
+function pos(x: f64 | null): f64 {
+  if x == null { return 0.0 }
+  x
+}
+
+// Startup-subtracted time, so ratios compare languages rather than process launchers.
+function net(ms: f64 | null, baseCfg: string): f64 | null {
+  if ms == null { return null }
+  const s = startup(baseCfg)
+  if s == null { return ms }
+  const d = ms - s
+  if d < 0.001 { return 0.001 }
+  d
+}
+
+function ratio(a: f64 | null, b: f64 | null): f64 | null {
+  if a == null { return null }
+  if b == null { return null }
+  if b <= 0.0 { return null }
+  a / b
+}
+
+// ---- formatting ---------------------------------------------------------------
+
+function f(x: f64 | null, nd: i32): string {
+  if x == null { return "-" }
+  toFixed(x, nd)
+}
+
+// `x` truncated toward zero, for a non-negative `x` (Python's int()).
+function truncNonNeg(x: f64): i32 {
+  let i = 0
+  while ((i + 1) as! f64) <= x { i = i + 1 }
+  i
+}
+
+// At most `n` characters of `s`.
+function clip(s: string, n: i32): string {
+  const cps = s.codePoints()
+  if cps.length <= n { return s }
+  fromCodePoints(cps.slice(0, n))
+}
+
+function numJ(x: f64 | null): Json {
+  if x == null { return null }
+  x
+}
+
+function intJ(n: i32): Json { n as! f64 }
+
+function obj(): JsonMap {
+  const m: JsonMap = Map()
+  m
+}
+
+function less(a: string, b: string): boolean { a < b }
+
+// ---- statistics ---------------------------------------------------------------
+
+function lessF(a: f64, b: f64): boolean { a < b }
+
+function pctOf(spreads: f64[], p: f64): f64 | null {
+  if spreads.length == 0 { return null }
+  let i = truncNonNeg((spreads.length as! f64) * p)
+  if i > spreads.length - 1 { i = spreads.length - 1 }
+  spreads[i]
+}
+
+function minOf(xs: f64[]): f64 | null {
+  if xs.length == 0 { return null }
+  let m = xs[0]
+  for x in xs {
+    if x < m { m = x }
+  }
+  m
+}
+
+// ---- one benchmark row ----------------------------------------------------------
+
+function failsOf(b: string): Fail[] {
+  const out: Fail[] = []
+  for c in ["rust", "vl", "vl-O", "vl-O3", "deno"] {
+    const s = status(b, c)
+    if s != "OK" { out.push({ config: c, status: s }) }
+  }
+  out
+}
+
+function buildFailsOf(b: string): Fail[] {
+  const out: Fail[] = []
+  for k in buildKeys {
+    const r = buildAt(k)
+    if r.bench == b && r.status != "OK" {
+      out.push({ config: r.config, status: r.status })
+    }
+  }
+  out
+}
+
+function verdictOf(vlDeno: f64 | null): string {
+  if vlDeno == null { return "NO-DATA" }
+  if vlDeno > DENO_PRIORITY { return "PRIORITY-LOSS" }
+  if vlDeno > DENO_PAR { return "LOSS" }
+  if vlDeno < DENO_WIN { return "WIN" }
+  "PAR"
+}
+
+function flagsOf(
+  b: string,
+  vlRust: f64 | null,
+  nVl: f64 | null,
+  nO: f64 | null,
+  nO3: f64 | null,
+  vars: Var[],
+): string[] {
+  const flags: string[] = []
+  if vlRust != null && vlRust > RUST_HEADROOM_FLAG {
+    flags.push("RUST-GAP-" + toFixed(vlRust, 0) + "x")
+  }
+  // The idiomatic spelling against the fastest hand-spelling is a defect signal.
+  const nets: f64[] = []
+  for v in vars {
+    if v.net != null { nets.push(v.net) }
+  }
+  const bestv = minOf(nets)
+  if (
+    bestv != null
+    && pos(nVl) != 0.0
+    && bestv != 0.0
+    && pos(nVl) / bestv > 1.15
+  ) {
+    let vn = ""
+    for v in vars {
+      if vn == "" && v.net == bestv { vn = v.name }
+    }
+    flags.push("IDIOM-GAP-\{toFixed(pos(nVl) / bestv, 2)}x(\{vn})")
+  }
+  if pos(nVl) != 0.0 && pos(nO3) != 0.0 && pos(nVl) / pos(nO3) > 1.15 {
+    flags.push("O3-GAP-" + toFixed(pos(nVl) / pos(nO3), 2) + "x")
+  }
+  if pos(nVl) != 0.0 && pos(nO3) != 0.0 && pos(nO3) / pos(nVl) > 1.15 {
+    flags.push("O3-REGRESSION-" + toFixed(pos(nO3) / pos(nVl), 2) + "x")
+  }
+  // The two optimizer failure modes a default-vs-O3 pair cannot tell apart: OPT-LOSES
+  // (both optimized rungs lose, so wasm-opt is the loser) and O3-WORSE-THAN-O (-O is the
+  // best rung and -O3's extra passes give the win back). See perf-landscape.md 2.4a.
+  if pos(nVl) != 0.0 && pos(nO) != 0.0 && pos(nO3) != 0.0 {
+    let bestOpt = pos(nO)
+    if pos(nO3) < bestOpt { bestOpt = pos(nO3) }
+    if bestOpt / pos(nVl) > 1.05 {
+      flags.push("OPT-LOSES-" + toFixed(bestOpt / pos(nVl), 2) + "x")
+    }
+    if pos(nO3) / pos(nO) > 1.10 {
+      flags.push("O3-WORSE-THAN-O-" + toFixed(pos(nO3) / pos(nO), 2) + "x")
+    }
+    if pos(nO) / pos(nO3) > 1.10 {
+      flags.push("O-WORSE-THAN-O3-" + toFixed(pos(nO) / pos(nO3), 2) + "x")
+    }
+  }
+  if notes.has(b) {
+    for n in notesFor(b) { flags.push(n) }
+  }
+  flags
+}
+
+function startupFlag(
+  raw: f64 | null,
+  cfg: string,
+  label: string,
+  flags: string[],
+) {
+  const s = startup(cfg)
+  if pos(raw) != 0.0 && pos(s) != 0.0 && pos(s) / pos(raw) > 0.10 {
+    flags.push("STARTUP>\{truncNonNeg(pos(s) / pos(raw) * 100.0)}%(\{label})")
+  }
+}
+
+function buildRow(b: string): Row {
+  const parts = split(b, "/")
+  const meta = metaAt(b)
+  const axis = meta.axis
+  const rawRust = med(b, "rust")
+  const rawVl = med(b, "vl")
+  const rawO = med(b, "vl-O")
+  const rawO3 = med(b, "vl-O3")
+  const rawDeno = med(b, "deno")
+  const vars: Var[] = []
+  for v in split(meta.variants, " ") {
+    if v.length > 0 {
+      const raw = med(b, "vl-" + v)
+      vars.push({ name: v, raw: raw, net: net(raw, "vl") })
+    }
+  }
+  // min-of-N cross-check: less contaminated by a noisy neighbour, and the honest
+  // tie-breaker when the median-based verdict sits near a threshold.
+  const mnVl = net(mini(b, "vl"), "vl")
+  const mnDeno = net(mini(b, "deno"), "deno")
+  const mnRust = net(mini(b, "rust"), "rust")
+  const netRust = net(rawRust, "rust")
+  const netVl = net(rawVl, "vl")
+  const netO = net(rawO, "vl")
+  const netO3 = net(rawO3, "vl")
+  const netDeno = net(rawDeno, "deno")
+  const vlDeno = ratio(netVl, netDeno)
+  const vlRust = ratio(netVl, netRust)
+  const cands: f64[] = []
+  for x in [netVl, netO, netO3] {
+    if pos(x) != 0.0 { cands.push(pos(x)) }
+  }
+  for v in vars {
+    if pos(v.net) != 0.0 { cands.push(pos(v.net)) }
+  }
+  const flags = flagsOf(b, vlRust, netVl, netO, netO3, vars)
+  startupFlag(rawRust, "rust", "rust", flags)
+  startupFlag(rawDeno, "deno", "deno", flags)
+  startupFlag(rawVl, "vl", "vl", flags)
+  const cVl = buildOf(b, "vl-build")
+  const cO3 = buildOf(b, "vl-build-O3")
+  const cRustc = buildOf(b, "rustc-O-build")
+  {
+    bench: b,
+    category: parts[0],
+    name: parts[1],
+    axis: axis,
+    rawRust: rawRust,
+    rawVl: rawVl,
+    rawO: rawO,
+    rawO3: rawO3,
+    rawDeno: rawDeno,
+    netRust: netRust,
+    netVl: netVl,
+    netO: netO,
+    netO3: netO3,
+    netDeno: netDeno,
+    vars: vars,
+    vlOverDeno: vlDeno,
+    vlOverRust: vlRust,
+    vlOverDenoMin: ratio(mnVl, mnDeno),
+    vlOverRustMin: ratio(mnVl, mnRust),
+    o3OverDeno: ratio(netO3, netDeno),
+    bestOverDeno: ratio(minOf(cands), netDeno),
+    verdict: verdictOf(vlDeno),
+    flags: flags,
+    fails: failsOf(b),
+    buildFails: buildFailsOf(b),
+    cVl: if cVl == null { null } else { cVl.med },
+    cO3: if cO3 == null { null } else { cO3.med },
+    cRustc: if cRustc == null { null } else { cRustc.med },
+  }
+}
+
+// ---- results.json ---------------------------------------------------------------
+
+// Two-space indented JSON, the shape `json.dump(..., indent=2)` writes.
+function pretty(j: Json, ind: string): string {
+  if j is JsonMap {
+    const inner = ind + "  "
+    const parts: string[] = []
+    for k in j.keys() {
+      parts.push(inner + scalar(k) + ": " + pretty(j[k], inner))
+    }
+    if parts.length == 0 { return "{}" }
+    return "{\n\{join(parts, ",\n")}\n\{ind}}"
+  }
+  if j is Json[] {
+    if j.length == 0 { return "[]" }
+    const inner = ind + "  "
+    const parts: string[] = []
+    for e in j { parts.push(inner + pretty(e, inner)) }
+    return "[\n\{join(parts, ",\n")}\n\{ind}]"
+  }
+  scalar(j)
+}
+
+function scalar(j: Json): string {
+  const t = toJson(j)
+  if t is string { return t }
+  die("cannot render a value: " + t.msg)
+}
+
+function varsJson(vars: Var[], useNet: boolean): Json {
+  const m = obj()
+  for v in vars {
+    if useNet { m[v.name] = numJ(v.net) } else { m[v.name] = numJ(v.raw) }
+  }
+  m
+}
+
+function failsJson(fs: Fail[]): Json {
+  const m = obj()
+  for x in fs { m[x.config] = x.status }
+  m
+}
+
+function rowJson(r: Row): Json {
+  const raw = obj()
+  raw["rust"] = numJ(r.rawRust)
+  raw["vl"] = numJ(r.rawVl)
+  raw["vl_O"] = numJ(r.rawO)
+  raw["vl_O3"] = numJ(r.rawO3)
+  raw["deno"] = numJ(r.rawDeno)
+  raw["variants"] = varsJson(r.vars, false)
+  const nt = obj()
+  nt["rust"] = numJ(r.netRust)
+  nt["vl"] = numJ(r.netVl)
+  nt["vl_O"] = numJ(r.netO)
+  nt["vl_O3"] = numJ(r.netO3)
+  nt["deno"] = numJ(r.netDeno)
+  nt["variants"] = varsJson(r.vars, true)
+  const comp = obj()
+  comp["vl"] = numJ(r.cVl)
+  comp["vl_O3"] = numJ(r.cO3)
+  comp["rustc_O"] = numJ(r.cRustc)
+  const flags: Json[] = []
+  for x in r.flags { flags.push(x) }
+  const m = obj()
+  m["bench"] = r.bench
+  m["category"] = r.category
+  m["name"] = r.name
+  m["axis"] = r.axis
+  m["raw_ms"] = raw
+  m["net_ms"] = nt
+  m["vl_over_deno"] = numJ(r.vlOverDeno)
+  m["vl_over_rust"] = numJ(r.vlOverRust)
+  m["vl_over_deno_minofN"] = numJ(r.vlOverDenoMin)
+  m["vl_over_rust_minofN"] = numJ(r.vlOverRustMin)
+  m["vlO3_over_deno"] = numJ(r.o3OverDeno)
+  m["best_vl_over_deno"] = numJ(r.bestOverDeno)
+  m["verdict"] = r.verdict
+  m["flags"] = flags
+  m["failures"] = failsJson(r.fails)
+  m["build_failures"] = failsJson(r.buildFails)
+  m["compile_ms"] = comp
+  m
+}
+
+// ---- summary.md -----------------------------------------------------------------
+
+function verdictRank(v: string): i32 {
+  if v == "PRIORITY-LOSS" { return 0 }
+  if v == "LOSS" { return 1 }
+  if v == "NO-DATA" { return 2 }
+  if v == "PAR" { return 3 }
+  if v == "WIN" { return 4 }
+  9
+}
+
+// Worst loss first: by verdict, then by VL/deno descending (a missing ratio sorts as 0).
+function rowBefore(a: Row, b: Row): boolean {
+  const ra = verdictRank(a.verdict)
+  const rb = verdictRank(b.verdict)
+  if ra != rb { return ra < rb }
+  pos(a.vlOverDeno) > pos(b.vlOverDeno)
+}
+
+function cell(s: string): string {
+  clip(replaceAll(replaceAll(s, "|", "\\|"), "\n", " "), 220)
+}
+
+function failRows(rows: Row[], L: string[]) {
+  for r in rows {
+    for x in sorted(r.buildFails, failLess) {
+      const rec = buildOf(r.bench, x.config)
+      let err = ""
+      if rec != null { err = rec.error }
+      L.push("| \{r.bench} | \{x.config} | \{x.status} | `\{cell(err)}` |")
+    }
+    for x in sorted(r.fails, failLess) {
+      const rec = runOf(r.bench, x.config)
+      let err = ""
+      if rec != null { err = rec.error }
+      L.push("| \{r.bench} | \{x.config} | \{x.status} | `\{cell(err)}` |")
+    }
+  }
+}
+
+function failLess(a: Fail, b: Fail): boolean { a.config < b.config }
+
+function varLess(a: Var, b: Var): boolean { a.name < b.name }
+
+function main(args: readonly string[]) {
+  const raw = flag(args, "--raw", "")
+  const outd = flag(args, "--out", "")
+  const reps = flag(args, "--reps", "5")
+  const pin = flag(args, "--pin", "none")
+  const quick = flag(args, "--quick", "0") == "1"
+  const noiseBench = flag(args, "--noise", "arith/i32-accum")
+  const rustc = flag(args, "--rustc", "")
+  const deno = flag(args, "--deno", "")
+  const commit = flag(args, "--commit", "")
+  const generated = flag(args, "--generated", "")
+  if raw == "" || outd == "" { die("--raw and --out are required") }
+  load(raw)
+
+  // Noise floor: an identical configuration run a second time, and the spread within
+  // every measured configuration.
+  const noise: Noise[] = []
+  const pairs = [
+    ["vl-repeat", "vl"],
+    ["rust-repeat", "rust"],
+    ["deno-repeat", "deno"],
+  ]
+  for p in pairs {
+    const a = med("_noise", p[0])
+    const b = med(noiseBench, p[1])
+    if pos(a) != 0.0 && pos(b) != 0.0 {
+      const x = pos(a)
+      const y = pos(b)
+      let d = x - y
+      if d < 0.0 { d = 0.0 - d }
+      noise.push(
+        {
+          runtime: p[1],
+          bench: noiseBench,
+          first: y,
+          repeat: x,
+          spread: d / y * 100.0,
+        },
+      )
+    }
+  }
+  const spreads: f64[] = []
+  let runsTotal = 0
+  let runsWithOutlier = 0
+  let indivOutliers = 0
+  let samplesTotal = 0
+  for k in runKeys {
+    const r = runAt(k)
+    samplesTotal = samplesTotal + r.times.length
+    if r.status == "OK" && r.med != null && r.times.length > 0 {
+      const m = pos(r.med)
+      runsTotal = runsTotal + 1
+      let o = 0
+      for t in r.times {
+        if t > 1.5 * m { o = o + 1 }
+      }
+      if o > 0 {
+        runsWithOutlier = runsWithOutlier + 1
+        indivOutliers = indivOutliers + o
+      }
+      if !r.bench.startsWith("_") && m != 0.0 {
+        spreads.push((pos(r.mx) - pos(r.mn)) / m * 100.0)
+      }
+    }
+  }
+  const spreadSorted = sorted(spreads, lessF)
+  const p50 = pctOf(spreadSorted, 0.5)
+  const p90 = pctOf(spreadSorted, 0.9)
+  const p99 = pctOf(spreadSorted, 0.99)
+  let noiseFloor = 0.0
+  if noise.length > 0 || spreadSorted.length > 0 {
+    noiseFloor = pos(p50)
+    for n in noise {
+      if n.spread > noiseFloor { noiseFloor = n.spread }
+    }
+  }
+
+  const rows: Row[] = []
+  for b in sorted(metaKeys, less) { rows.push(buildRow(b)) }
+
+  // ---- results.json
+  const startupJ = obj()
+  for c in startupCfgs { startupJ[c] = numJ(startup(c)) }
+  const probes: Json[] = []
+  for n in noise {
+    const m = obj()
+    m["runtime"] = n.runtime
+    m["bench"] = n.bench
+    m["first_median_ms"] = n.first
+    m["repeat_median_ms"] = n.repeat
+    m["spread_pct"] = n.spread
+    probes.push(m)
+  }
+  const within = obj()
+  within["p50"] = numJ(p50)
+  within["p90"] = numJ(p90)
+  within["p99"] = numJ(p99)
+  const outliers = obj()
+  outliers["rule"] = ">1.5x that configuration's own median"
+  outliers["configurations"] = intJ(runsTotal)
+  outliers["configurations_with_an_outlier"] = intJ(runsWithOutlier)
+  outliers["individual_samples"] = intJ(samplesTotal)
+  outliers["outlier_samples"] = intJ(indivOutliers)
+  const noiseJ = obj()
+  noiseJ["repeat_probe"] = probes
+  noiseJ["within_config_spread_pct"] = within
+  noiseJ["noise_floor_pct"] = noiseFloor
+  noiseJ["outliers"] = outliers
+  const method = obj()
+  method["reps"] = intJ(parseCount(reps))
+  method["statistic"] = "median of reps (min/max also recorded)"
+  method["taskset"] = pin
+  method["ratios_use"] = "startup-subtracted (net) times"
+  method["vl_execution"] = "prebuilt .wasm via `vl run <file.wasm>`; compile time measured separately"
+  method["note"] = "OTHER WORK MAY HAVE BEEN ON THE MACHINE — treat as PRELIMINARY."
+  const versions = obj()
+  versions["rustc"] = rustc
+  versions["deno"] = deno
+  versions["vl_repo_commit"] = commit
+  const thresholds = obj()
+  thresholds["deno_win"] = DENO_WIN
+  thresholds["deno_par"] = DENO_PAR
+  thresholds["deno_priority"] = DENO_PRIORITY
+  thresholds["rust_headroom_flag"] = RUST_HEADROOM_FLAG
+  const voidJ: Json[] = []
+  for v in voids {
+    const m = obj()
+    m["bench"] = v.bench
+    m["reason"] = v.reason
+    voidJ.push(m)
+  }
+  const benchJ: Json[] = []
+  for r in rows { benchJ.push(rowJson(r)) }
+  const res = obj()
+  res["generated"] = generated
+  res["preliminary"] = true
+  res["quick"] = quick
+  res["method"] = method
+  res["versions"] = versions
+  res["thresholds"] = thresholds
+  res["startup_baseline_ms"] = startupJ
+  res["noise"] = noiseJ
+  res["void"] = voidJ
+  res["benchmarks"] = benchJ
+  const wj = writeTextFile(outd + "/results.json", pretty(res, "") + "\n")
+  if wj != null { die("cannot write results.json (" + wj.msg + ")") }
+
+  // ---- summary.md
+  const L: string[] = []
+  L.push("# VL cross-runtime benchmark results (PRELIMINARY)")
+  L.push("")
+  L.push(
+    "Generated \{generated} by `bench/run.sh`. **PRELIMINARY** — other work may have been on the",
+  )
+  L.push(
+    "machine during this sweep. Re-run `bench/run.sh` on an idle box for authoritative numbers.",
+  )
+  L.push("")
+  L.push("| | |")
+  L.push("|---|---|")
+  L.push(
+    "| reps per configuration | \{reps} (median reported; min/max in results.json) |",
+  )
+  L.push("| cpu pinning | `taskset -c \{pin}` |")
+  L.push("| rustc | \{rustc} |")
+  L.push("| deno | \{deno} |")
+  L.push("| vl repo commit | \{commit} |")
+  L.push(
+    "| VL execution | prebuilt `.wasm` (`vl run x.wasm`); compile time is a separate column |",
+  )
+  L.push("| ratios | computed on **startup-subtracted** times |")
+  L.push("")
+  L.push("## Startup baseline (empty program)")
+  L.push("")
+  L.push("| runtime | median ms |")
+  L.push("|---|---|")
+  for k in ["rust", "vl", "vl-run-src", "deno"] {
+    if runs.has(key("_startup", k)) { L.push("| \{k} | \{f(startup(k), 2)} |") }
+  }
+  L.push("")
+  L.push(
+    "`vl-run-src` is compile+run of an empty program in one process; `vl` is a prebuilt module.",
+  )
+  L.push("")
+  L.push("## Noise floor")
+  L.push("")
+  if noise.length > 0 {
+    L.push("| runtime | bench | first median ms | repeat median ms | spread |")
+    L.push("|---|---|---|---|---|")
+    for n in noise {
+      L.push(
+        "| \{n.runtime} | \{n.bench} | \{f(n.first, 2)} | \{f(n.repeat, 2)} | \{toFixed(n.spread, 1)}% |",
+      )
+    }
+  }
+  L.push("")
+  L.push(
+    "Within-configuration (max-min)/median across every measured run: p50 \{f(p50, 1)}%, p90 \{f(p90, 1)}%, p99 \{f(p99, 1)}%.",
+  )
+  L.push("")
+  const outlierNote = "Outliers (a single sample >1.5x its own configuration's median): **\{indivOutliers} of \{samplesTotal} samples**, affecting \{runsWithOutlier} of \{runsTotal} configurations. "
+  const outlierWhy = "Almost every affected configuration has exactly ONE such sample, i.e. this is isolated interference from unrelated work on the box rather than broad noise — which is why the median of \{reps} absorbs it and why the `vl/deno(min)` column below should agree with `vl/deno`. Where they disagree, believe neither and re-run."
+  L.push(outlierNote + outlierWhy)
+  L.push("")
+  L.push(
+    "**Noise floor taken as \{toFixed(noiseFloor, 1)}%.** Differences smaller than this are not differences.",
+  )
+  L.push("")
+  L.push("## Results")
+  L.push("")
+  L.push(
+    "Times are medians in **ms**, startup-subtracted. `vl/rust` is HEADROOM, not a loss.",
+  )
+  L.push("")
+  L.push(
+    "| benchmark | rust | vl | vl -O | vl -O3 | deno | vl/rust | vl/deno | vl/deno(min) | verdict | flags |",
+  )
+  L.push("|---|--:|--:|--:|--:|--:|--:|--:|--:|---|---|")
+  for r in sorted(rows, rowBefore) {
+    const cols = [
+      f(r.netRust, 1),
+      f(r.netVl, 1),
+      f(r.netO, 1),
+      f(r.netO3, 1),
+      f(r.netDeno, 1),
+      f(r.vlOverRust, 2),
+      f(r.vlOverDeno, 2),
+      f(r.vlOverDenoMin, 2),
+    ]
+    L.push(
+      "| \{r.bench} | \{join(cols, " | ")} | \{r.verdict} | \{join(r.flags, ", ")} |",
+    )
+  }
+  L.push("")
+  L.push("## Extra VL spellings (opt.vl / toplevel.vl / globals.vl / ...)")
+  L.push("")
+  L.push(
+    "A gap between `main.vl` and a hand-spelled variant is a **defect to file**, never a tip.",
+  )
+  L.push("")
+  L.push(
+    "| benchmark | vl (idiomatic) | variant | variant ms | idiomatic/variant |",
+  )
+  L.push("|---|--:|---|--:|--:|")
+  for r in rows {
+    for v in sorted(r.vars, varLess) {
+      L.push(
+        "| \{r.bench} | \{f(r.netVl, 1)} | \{v.name} | \{f(v.net, 1)} | \{f(ratio(r.netVl, v.net), 2)} |",
+      )
+    }
+  }
+  L.push("")
+  L.push("## Compile time (never inside an execution number)")
+  L.push("")
+  L.push("| benchmark | vl build | vl build -O3 | rustc -O |")
+  L.push("|---|--:|--:|--:|")
+  for r in rows {
+    L.push(
+      "| \{r.bench} | \{f(r.cVl, 1)} | \{f(r.cO3, 1)} | \{f(r.cRustc, 1)} |",
+    )
+  }
+  L.push("")
+  const failing: Row[] = []
+  for r in rows {
+    if r.fails.length > 0 || r.buildFails.length > 0 { failing.push(r) }
+  }
+  L.push("## Failures")
+  L.push("")
+  if failing.length == 0 {
+    L.push("None — every benchmark built and ran in every language.")
+  } else {
+    L.push("| benchmark | what | status | error |")
+    L.push("|---|---|---|---|")
+    failRows(failing, L)
+  }
+  L.push("")
+  L.push("## VOID benchmarks (excluded)")
+  L.push("")
+  if voids.length == 0 {
+    L.push("None.")
+  } else {
+    for v in voids { L.push("- **\{v.bench}** — \{clip(v.reason, 600)}") }
+  }
+  L.push("")
+  const ws = writeTextFile(outd + "/summary.md", join(L, "\n") + "\n")
+  if ws != null { die("cannot write summary.md (\{ws.msg})") }
+  print("rows=\{rows.length} void=\{voids.length} fails=\{failing.length}")
+  0
+}
+
+function parseCount(s: string): i32 {
+  const n = parseI32(s)
+  if n == null { return 0 }
+  n
+}
+
+// The argument after `flag`, or `fallback` when the flag is absent or last.
+function flag(args: readonly string[], name: string, fallback: string): string {
+  let i = 0
+  while i < args.length {
+    if args[i] == name {
+      if i + 1 < args.length { return args[i + 1] }
+      return fallback
+    }
+    i = i + 1
+  }
+  fallback
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("an argument is not UTF-8: " + argv.msg)
+} else {
+  main(argv)
+}

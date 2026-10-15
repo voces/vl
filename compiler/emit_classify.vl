@@ -12221,7 +12221,11 @@ export function rlElemLitStructRow(slot: i32): i32 {
   const ar = rlElemStructIdxAt(slot)
   if ar >= 0 { return ar }
   const ln = nonNulBaseOf(rlElemName[slot])
-  structIndexByName(ln)
+  const bn = structIndexByName(ln)
+  if bn >= 0 || variantIndexOf(ln) >= 0 { return bn }
+  // An inline record element: its literal's `#anon` row recorded another arena index of the
+  // same type, which the canonical identity matches, never a field-shape guess (D4721).
+  repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
 }
 
 // Whether a ref-list slot's element is a nullable niche: the arena test
@@ -26776,12 +26780,30 @@ function arrLitBoxElem(arrIx: i32): boolean {
 // design — a literal an earlier rung already claims must not be registered here — and
 // carries no scalar exclusion, since repeating `arrLitUnionElemName`'s would be a chicken-and-egg.
 export function arrLitInferUnionElemName(arrIx: i32): string {
+  const nun = arrLitNulUnionElemName(arrIx)
+  if nun != "" && !arrLitUnionDestTaken(arrIx) { return nun }
   const cen = arrLitBoxElemName(arrIx)
   if cen == "" { return "" }
   // A destination's union types the elements, which box into it (D4635).
   if arrLitUnionDestTaken(arrIx) { return "" }
   if arrLitIsRef(arrIx) && !arrLitObjBesideNonRecord(arrIx) { return "" }
   cen
+}
+
+// The box row of a literal whose recorded element is a nullable value union of two or more
+// members (`string | {x: i32} | null`), or "": no niche holds it, and no annotation spells it
+// for registration to find, so the literal names the row the annotated spelling would (D4720).
+function arrLitNulUnionElemName(arrIx: i32): string {
+  const ae = tyArrayElemIx(nodeTyIxOf(arrIx))
+  if ae < 0 || ae >= T.tys.length { return "" }
+  const el = T.tys[ae]
+  if !(el is TyNullable) { return "" }
+  if el.nInner < 0 || el.nInner >= T.tys.length { return "" }
+  const inner = T.tys[el.nInner]
+  if !(inner is TyUnion) { return "" }
+  if inner.uMembers.length < 2 || tyIsLitUnion(el.nInner) { return "" }
+  if arrLitNulRefElemKind(arrIx) != RLK_UNION { return "" }
+  tyToNominalName(ae)
 }
 
 // Whether the literal's first element is an object literal while its recorded element union
@@ -27348,6 +27370,11 @@ export function arrLitElemKind(arrIx: i32) {
         // A union-variant element boxes into the union (kind 2); a plain struct is kind 1.
         // Must agree arm for arm with `arrLitElemName`'s object arm, one shared predicate.
         if arrLitObjElemBoxVariant(arrIx) != "" { return RLK_UNION }
+        // A later `null` names the nullable row ahead of the struct, as `arrLitElemName`'s
+        // object arm does: the niche of one record, or the box of a wider union (D4720).
+        if arrLitNulRefElemName(arrIx) != "" {
+          return arrLitNulRefElemKind(arrIx)
+        }
         return RLK_STRUCT
       }
     }
@@ -28695,6 +28722,16 @@ function anonListWiderThanLits(ix: i32, lc: i32): boolean {
   k == TK_F32
 }
 
+// Does the literal hold a bare `null` element?
+function arrLitHasNullElem(a: ArrayLit): boolean {
+  let j = 0
+  while j < a.arrElems.length {
+    if P.nodes[a.arrElems[j]] is NullLit { return true }
+    j = j + 1
+  }
+  false
+}
+
 // The struct row a ref list literal's elements name: the first element's, when every other
 // element is an object literal of that row or `null` (a `ref null` slot holds it), else -1.
 // A mixed `[{ x: 1 }, "t"]` is a union list, which the arena names instead (D4688).
@@ -28915,6 +28952,9 @@ export function anonFieldElemName(valIx: i32, code: i32) {
     const av = P.nodes[valIx]
     if av is ArrayLit {
       const esi = arrLitRefListRow(av)
+      // A `null` element keeps its niche in the key, the spelling the arena route gives
+      // `[p, null]`, so the element read is classified nullable (D4721).
+      if esi >= 0 && arrLitHasNullElem(av) { return sNames[esi] + "|null" }
       if esi >= 0 { return sNames[esi] }
     }
     // D1515/D1688 — the arena, once the literal route has declined: a list produced by
@@ -37871,11 +37911,11 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
       // Nominal exact-name match first — AFTER-not-FIRST relative to the arena rung (#1061).
       const sbn = structIndexByName(nm)
       if sbn >= 0 { return sbn }
-      // Node route: the element receiver `v[i]` carries its adopted checked type, so resolve
-      // its row through the canonical-key vocabulary directly (`repRowOfTyStruct`), the
-      // read-side dual of `structIdxOfElemName`. Distinguishes a same-fieldset nested twin by
-      // the full nested field type. Falls to the lenient fieldset scan when uncovered.
-      const rr = repRowOfTyStruct(nodeRepTyIxOf(exprIx), sScanLim())
+      // Node route: resolve the receiver's checked type, `| null` peeled like the name above,
+      // through the canonical-key vocabulary (`repRowOfTyStruct`), the read-side dual of
+      // `structIdxOfElemName`. Tells a same-fieldset nested twin apart by its full field types
+      // (D4721); falls to the lenient fieldset scan when uncovered.
+      const rr = repRowOfTyStruct(tyPeelNul(nodeRepTyIxOf(exprIx)), sScanLim())
       if rr >= 0 { return rr }
       // The arena already said "not an object", so the field-set matcher is not asked:
       // `structIndexOfTypeName` parses a field set that a non-`TyObj` recorded type does not

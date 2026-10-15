@@ -122,8 +122,8 @@ ${row("1", " — holds", sh("echo 42", "42", "0"))}${
 }${
   row(
     "32",
-    " — the python variable",
-    sh('[ -n "$PYTHON" ] && echo 7', "7", "0"),
+    " — an inherited variable",
+    sh('[ -n "$HOME" ] && echo 7', "7", "0"),
   )
 }${
   row("33", " — a duplicate key and a bare key", [

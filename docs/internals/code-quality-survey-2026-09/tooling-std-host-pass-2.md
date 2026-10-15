@@ -6,7 +6,9 @@
 > `vl check --budget scripts/<name>-budget-baseline.json`; `goal-scoreboard.py`,
 > `emitter-state-audit.py` and `seed-size.py` are their `.vl` ports of the same name;
 > `capability-probes/run.py` is `scripts/capability-probes.vl` and `capability-probes/matrix.py`
-> is `scripts/capability-matrix.vl`. The commands below are the record of what was run.
+> is `scripts/capability-matrix.vl`; the `scripts/perf/*.py` profilers are their `.vl` ports
+> of the same name, and `parent-let-cache-probe.py` was deleted, its patch anchors stale. The
+> commands below are the record of what was run.
 
 Every number here was produced by a command named in §19, on a worktree at **`a03a40784`**
 (rebased onto `4b0af3a47`, which is docs-only — the two trees are byte-identical outside

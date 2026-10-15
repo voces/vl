@@ -987,7 +987,8 @@ only cross-host variance is IEEE-754 itself.
   `6381956970095103·2^797`, the double closest to a multiple of π/2.
 - **Kernels.** Degree-6-in-`x²` minimax polynomials for `sin` (relative error 2^-57.1) and
   `cos` (2^-62.1) on `[0, (π/4)²]`, from a Remez exchange in mpmath
-  (`scripts/std-math/trig-remez.py sin64|cos64`), fed through fdlibm's tail-carrying kernel
+  (`scripts/std-math/trig-remez.py sin64|cos64`, deleted once the coefficients were frozen in
+  std:math), fed through fdlibm's tail-carrying kernel
   shapes so `redLo` is honoured. The f32 pair uses degree-4 kernels (2^-36.8 / 2^-33.1,
   `sin32|cos32`) evaluated in f64 on `redHi` alone, then one f64→f32 rounding.
 - **The f32 pair evaluates in f64, a deliberate departure from std-math-design §C.4.** That
@@ -1010,7 +1011,8 @@ only cross-host variance is IEEE-754 itself.
   trick on constants in this module must be precomputed the same way.
 - **Measured** (`scripts/std-math/trig-check.sh`, 2.88M points: 1M uniform in `[-1e6, 1e6]`
   at each width, 200k random bit patterns, near-multiples of π/2 for `k ≤ 20000` and random
-  `k < 2^50` with their ±1-ulp neighbours, and specials; graded by mpmath). Max error:
+  `k < 2^50` with their ±1-ulp neighbours, and specials; graded by mpmath, since ported to
+  `trig-grade.vl`, which reproduces that grading byte for byte). Max error:
   `sinF64` 0.772 ulp, `cosF64` 0.761 ulp, `sinF32`/`cosF32` 0.5014 ulp, against a published
   bound of 1 ulp. `scripts/std-math/trig-f32-exhaustive.vl` runs all 2,139,095,040
   non-negative finite f32 against the f64 pair (~150 s at `-O3`): worst 0.50148 ulp for both,
@@ -1073,11 +1075,11 @@ only cross-host variance is IEEE-754 itself.
   `expKernelF32` in f64, whose ~2^-36 argument error is invisible at f32. The NaN `powWith`
   returns is mapped to the f32 quiet NaN explicitly, because a demoted NaN's bits are the
   engine's choice.
-- **Constants and coefficients** come from `scripts/std-math/explog-tables.py` (mpmath; the
-  Remez exchange is the trig script's). Every literal is the script's `repr`, so no constant
+- **Constants and coefficients** came from `scripts/std-math/explog-tables.py` (mpmath, deleted
+  once the tables were frozen in std:math; the Remez exchange was the trig script's). Every literal is the script's `repr`, so no constant
   is built from another (the exact-constant trap in the trig notes above does not arise).
 - **Measured** (`scripts/std-math/math-check.sh`, 12,535,598 points over every function in
-  this landing, graded by mpmath at 256 bits; for these three: uniform sweeps over each function's whole finite range, the unit interval, tiny
+  this landing, graded at 256 bits by mpmath, since ported to `math-grade.vl`; for these three: uniform sweeps over each function's whole finite range, the unit interval, tiny
   arguments, subnormal results, random bit patterns, `log` within 1e-6 of 1, `pow` with `x`
   within 1e-9 of 1 and `|y|` up to 1e12, every small integer power, and every pair of 39
   edge values). Max error: `expF64` 0.5265 ulp, `logF64` 0.5000, `powF64` 0.5284 (0.5043 in
@@ -1124,7 +1126,7 @@ only cross-host variance is IEEE-754 itself.
   `|u| ≤ 7/16` by `atan(t) = atan(c) + atan((t - c)/(1 + c·t))`, `c ∈ {1/2, 1}` (fdlibm's
   breakpoints), the reduced quotient kept as a double-double by `divParts` (the quotient's
   rounding error recovered with a Dekker product), then `u + u³·P(u²)`, P a degree-10
-  minimax fit (`scripts/std-math/arc-tables.py`, 2^-56.8 relative; the floor is the
+  minimax fit (`scripts/std-math/arc-tables.py`, deleted once the table was frozen; 2^-56.8 relative; the floor is the
   rounding of P's own coefficients). `arcParts(n, d)` is the angle of `(d, n)` in `[0, π]`:
   the smaller of `n`/`|d|` over the larger, then `π - a` or `π/2 ± a` added in
   double-double. Every public f64 function is a thin edge-case layer over it: `atan2`
@@ -1150,7 +1152,7 @@ only cross-host variance is IEEE-754 itself.
   same reason), on a degree-6 kernel (`atanKernelF32`, 2^-38 relative) without
   double-doubles; `asinF32`/`acosF32` form `1 - x·x` in f64, exact enough at f32;
   `hypotF32` is `sqrt(x·x + y·y)` in f64, where neither square can overflow.
-- **Measured** (`scripts/std-math/math-check.sh`, mpmath at 256 bits; the same run as
+- **Measured** (`scripts/std-math/math-check.sh`, 256 bits; the same run as
   exp/log/pow above): `atanF64` 0.6149 ulp, `asinF64` 0.6477, `acosF64` 0.6531,
   `atan2F64` 0.6468, `hypotF64` 0.5000 (0.7496 for subnormal results); every f32 one 0.5000. The
   exhaustive f32 run (`math-f32-exhaustive.vl`) covers every `atanF32`, `asinF32`,

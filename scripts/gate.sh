@@ -43,13 +43,6 @@ if [ -n "${VL_TMP:-}" ]; then
 fi
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
-# Ten rows below shell a python3, and a broken one exits rc=1 in milliseconds — the same
-# code an over-budget ratchet returns, so ten rows red at once and the cause is in none of
-# them. $PYTHON pins an interpreter for every row without editing a script, and the
-# preflight row names the one that answered. Exported for the scripts a row shells.
-PY="${PYTHON:-python3}"; export PYTHON="$PY"
-# Files are UTF-8; without this a Windows Python reads them as cp1252.
-export PYTHONUTF8=1
 # The native binary and the seed, for the rows written in VL. One row is today
 # (`seed size`, ported from Python); the paths are the ones every suite derives.
 VL="${VL:-$PWD/scripts/vl-host/target/release/vl}"
@@ -92,9 +85,6 @@ run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1
 cpusec() { local tot=0 p m x
            for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(awk -v t="$tot" -v m="$m" -v x="$x" 'BEGIN { print t + m * 60 + x }'); done
            printf '%s' "$tot"; }
-
-# FIRST ROW, so the table's first line names the cause once instead of ten times.
-run "python preflight"         bash scripts/python-preflight.sh "$LOGS/python.diag"
 
 # THE SUITE ROWS' FILE SETS, derived here so each file runs in exactly ONE row: 46 ran
 # twice and 2 ran three times, which is that much extra contention on the two rows whose
@@ -170,9 +160,8 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 # first orchestrator script the language runs on itself — and it is why the row sits
 # after the build rather than beside the file scans.
 run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
-# The PYTHON ratchet, written in VL: tracked .py files and lines may only fall (the owner's
-# directive is zero; docs/internals/python-removal.md is the census it works down).
-run "py budget"                "$VL" run scripts/py-budget.vl -- --check
+# No Python anywhere in the tree: a tracked .py file or a python invocation in a script fails.
+run "no-python"                "$VL" run scripts/no-python.vl
 # Lane L7's ratchet: emitter module-scope `let`s that no prologue, pass or frame builder
 # clears may only fall (baseline scripts/emitter-state-baseline.json).
 run "emitter state budget"     "$VL" run scripts/emitter-state-audit.vl -- --check
@@ -301,9 +290,6 @@ for i in "${!PIDS[@]}"; do
 done
 
 if [ $FAIL -ne 0 ]; then
-  # A broken interpreter reds every python row with the ratchets' own exit code, so say it
-  # once, here, rather than leaving ten identical `rc=1` rows to be read as a regression.
-  [ -s "$LOGS/python.diag" ] && { echo; cat "$LOGS/python.diag"; }
   echo; echo "GATE FAILED — logs in $LOGS"; exit 1
 fi
 if [ "$FAST" = 1 ]; then
