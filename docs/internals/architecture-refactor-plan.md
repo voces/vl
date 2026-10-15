@@ -34,7 +34,7 @@ restate measurements; follow the links.
 | L10 the `-O` optimizer | **in progress as T4**. Last: R6a, the inline-record census (`compiler/opt_inline.vl`), runs beside the Rust. Next: R6b (walk and decision), R6c (rewrite), then R7, list flattening. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
-| L13 host import surface, errno once | first PR (A5) **done**. Last: `tests/vl_errno_agreement_test.ts` (#3732) holds the errno numbering in agreement. Next: the import table. | [L13 log](#l13-log) |
+| L13 host import surface, errno once | first PR (A5) **done**. Last: `HOST_FLOOR` (`main.rs`) is the host floor in one table, held to the compiler by `tests/vl_host_floor_test.ts`. Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
 | L9 split `typecheck.vl` | D1 **in progress**. Last: `compiler/check_types.vl`, the type arena `T` and the queries that read only it. Next: carve the families that reach `T` and nothing else of the checker. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
@@ -313,6 +313,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - `tests/vl_errno_agreement_test.ts` (#3732) holds it, `std/fs.vl` and WASI preview1's numbering in agreement, lists each one-sided code with its reason, and refuses an errno literal in `main.rs` or an errno const elsewhere in `std/`.
 - It found no wrong number; `EPERM` is named by std and never answered by the host (a POSIX EPERM reads as `PermissionDenied` and becomes `EACCES`).
 - Next: the import table (the `scripts/wasmtime-host.rs` spike is deleted).
+- The host floor (17 imports under `std:fs`, `std:args`, `std:process`, `std:env`) was stated in six places with no check between them: the compiler's slot list (`fsIntrinsicNameAt`), the checker's `declare` rows, the builtin list's `blPush` rows, `register_fs_imports`' 17 hand-written blocks, the Deno stubs, and the std callers. `HOST_FLOOR` in `main.rs` is now one row per import (name, signature, handler); `tests/vl_host_floor_test.ts` holds its names to the slot list, the checker, the builtin list and the stubs, and its signatures to the checker and the builtin list; the registrar refuses an import whose declared arity differs from its row. The seed is byte-identical and output identity holds. Next: derive the compiler's per-slot predicates (`fsArgIsU8List` … `fsSlotTouchesMemory`) from one signature table.
 
 ### L9 log
 

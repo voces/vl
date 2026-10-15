@@ -4622,17 +4622,107 @@ fn fs_write_mode(p: &std::path::Path, off: i64, data: &[u8], mode: i32) -> i32 {
     }
 }
 
-/// Register the fs imports the module actually declares.
+/// What every host-floor handler closes over, one per instance.
 ///
-/// GATED ON THE MODULE, twice over: a name the module does not import is never
-/// defined (harmless but pointless), and a name it does import is defined with the
-/// module's OWN `FuncType`, so a signature drift between emitter and host is an
-/// instantiation error naming the import rather than a wrong answer at runtime.
+/// `errno` is shared by every handler: zeroed on each success, set to a POSITIVE WASI errno
+/// on each failure. `__fs_errno__` only reads it, and the slots that cannot fail
+/// (`__args_count__`, `__proc_out__`, `__proc_err__`) leave it alone, so `lastErrno()` stays
+/// meaningful right after an unrelated failed call.
 ///
-/// `errno` is per-instance, shared by every handler: zeroed on each success, set to a
-/// POSITIVE WASI errno on each failure. `__fs_errno__` only reads it, and
-/// `__args_count__` deliberately does not touch it — it cannot fail, so leaving the
-/// cell alone keeps `lastErrno()` meaningful right after an unrelated failed call.
+/// `proc_io` holds the last `__proc_run__`'s captured streams, for the two slots that fetch
+/// them: a wasm import returns ONE value, and stdout, stderr and the exit code are three.
+/// Per instance, so a `--batch` case cannot read another's; cleared at the START of each run,
+/// so a failed spawn answers empty.
+///
+/// `list` is the module's own `u8[]` wrapper and backing (`u8_list_types`), which every row
+/// whose result is a `u8[]` needs to build one.
+#[derive(Clone)]
+struct Floor {
+    errno: Arc<Mutex<i32>>,
+    proc_io: Arc<Mutex<(Vec<u8>, Vec<u8>)>>,
+    list: Option<(StructType, ArrayType)>,
+}
+
+impl Floor {
+    fn set_errno(&self, code: i32) {
+        *self.errno.lock().unwrap() = code;
+    }
+
+    /// A guest `u8[]` holding `bytes`. Registration skips every row that needs this when the
+    /// module's list types were not found, so the `None` arm is a drift between the two.
+    fn u8_list(&self, c: &mut Caller<'_, ()>, bytes: &[u8]) -> Result<Val> {
+        let Some((st, at)) = &self.list else {
+            bail!("fs intrinsic: no u8[] wrapper type in this module's imports");
+        };
+        make_u8_list(c, st, at, bytes)
+    }
+}
+
+/// One host-floor handler: the instance's `Floor`, the caller, the arguments and the result
+/// slots, exactly as `Linker::func_new` hands them over.
+type FloorFn = fn(&Floor, &mut Caller<'_, ()>, &[Val], &mut [Val]) -> Result<()>;
+
+/// The host floor: every `imports` function beneath `std:fs`, `std:args`, `std:process` and
+/// `std:env`, one row each: the import name, its signature in the compiler's own spelling
+/// (`builtinList` in `compiler/driver.vl`), and its handler. `tests/vl_host_floor_test.ts`
+/// holds the names and signatures to the compiler's slot table and builtin list.
+const HOST_FLOOR: &[(&str, &str, FloorFn)] = &[
+    ("__fs_errno__", "() => i32", floor_fs_errno),
+    ("__args_count__", "() => i32", floor_args_count),
+    ("__fs_stat__", "(u8[]) => i32", floor_fs_stat),
+    ("__fs_size__", "(u8[]) => i64", floor_fs_size),
+    ("__fs_write__", "(u8[], u8[]) => i32", floor_fs_write),
+    (
+        "__fs_write_at__",
+        "(u8[], i64, u8[], i32) => i32",
+        floor_fs_write_at,
+    ),
+    (
+        "__fs_write_from__",
+        "(u8[], i64, i32, i32, i32) => i32",
+        floor_fs_write_from,
+    ),
+    ("__proc_exit__", "(i32) => void", floor_proc_exit),
+    ("__fs_read__", "(u8[]) => u8[]", floor_fs_read),
+    (
+        "__fs_read_range__",
+        "(u8[], i64, i32) => u8[]",
+        floor_fs_read_range,
+    ),
+    (
+        "__fs_read_into__",
+        "(u8[], i64, i32, i32) => i32",
+        floor_fs_read_into,
+    ),
+    ("__fs_list__", "(u8[]) => u8[]", floor_fs_list),
+    ("__args_get__", "(i32) => u8[]", floor_args_get),
+    ("__proc_run__", "(u8[]) => i32", floor_proc_run),
+    ("__proc_out__", "() => u8[]", floor_proc_out),
+    ("__proc_err__", "() => u8[]", floor_proc_err),
+    ("__env_get__", "(u8[]) => u8[]", floor_env_get),
+];
+
+/// The parameter and result counts a `HOST_FLOOR` signature states: `void` is no result.
+fn floor_sig_arity(sig: &str) -> (usize, usize) {
+    let (params, result) = sig.split_once(" => ").unwrap_or((sig, ""));
+    let inner = params.trim_start_matches('(').trim_end_matches(')');
+    let n = if inner.is_empty() {
+        0
+    } else {
+        inner.split(", ").count()
+    };
+    (n, usize::from(result != "void"))
+}
+
+/// Register the host-floor imports the module actually declares, from `HOST_FLOOR`.
+///
+/// GATED ON THE MODULE, twice over: a name the module does not import is never defined, and
+/// a name it does import is defined with the module's OWN `FuncType`, so a signature drift
+/// between emitter and host is an instantiation error naming the import rather than a wrong
+/// answer at runtime. A declared arity that differs from the row's is refused here, naming
+/// the import, rather than read out of bounds by the handler.
+///
+/// A row whose result is a `u8[]` is skipped when the module's list types were not found.
 fn register_fs_imports(
     linker: &mut Linker<()>,
     module: &Module,
@@ -4646,647 +4736,650 @@ fn register_fs_imports(
             _ => None,
         })
         .collect();
-    let has = |n: &str| declared.iter().find(|(name, _)| name == n).cloned();
-    let types = u8_list_types(module);
-    // The last `__proc_run__`'s captured streams, for the two slots that fetch them. Held
-    // beside `errno` and for the same reason: a wasm import returns ONE value, and stdout,
-    // stderr and the exit code are three. Per instance, so a `--batch` case cannot read
-    // another's; cleared at the START of each run, so a failed spawn answers empty.
-    let proc_io: Arc<Mutex<(Vec<u8>, Vec<u8>)>> = Arc::new(Mutex::new((Vec::new(), Vec::new())));
-
-    // `__fs_errno__()` — the out-of-band reason for the last failed call. Reads only.
-    if let Some((_, ft)) = has("__fs_errno__") {
-        let e = errno.clone();
-        linker.func_new("imports", "__fs_errno__", ft, move |_c, _a, results| {
-            results[0] = Val::I32(*e.lock().unwrap());
-            Ok(())
+    let floor = Floor {
+        errno: errno.clone(),
+        proc_io: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
+        list: u8_list_types(module),
+    };
+    for &(name, sig, handler) in HOST_FLOOR {
+        let Some((_, ft)) = declared.iter().find(|(n, _)| n == name) else {
+            continue;
+        };
+        if sig.ends_with("=> u8[]") && floor.list.is_none() {
+            continue;
+        }
+        let (params, results) = floor_sig_arity(sig);
+        if ft.params().len() != params || ft.results().len() != results {
+            bail!(
+                "host import `{name}` is declared with {} parameter(s) and {} result(s), \
+                 but this host provides `{sig}`",
+                ft.params().len(),
+                ft.results().len()
+            );
+        }
+        let f = floor.clone();
+        linker.func_new("imports", name, ft.clone(), move |mut c, args, results| {
+            handler(&f, &mut c, args, results)
         })?;
     }
+    Ok(())
+}
 
-    // `__args_count__()` — how many arguments followed the source file on the `vl run`
-    // command line. Cannot fail, so it does not write `errno`.
-    if let Some((_, ft)) = has("__args_count__") {
-        linker.func_new("imports", "__args_count__", ft, move |_c, _a, results| {
-            let n = PROGRAM_ARGS.lock().unwrap().len();
-            results[0] = Val::I32(i32::try_from(n).unwrap_or(i32::MAX));
-            Ok(())
-        })?;
+/// `__fs_errno__()` — the out-of-band reason for the last failed call. Reads only.
+fn floor_fs_errno(
+    f: &Floor,
+    _c: &mut Caller<'_, ()>,
+    _a: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    results[0] = Val::I32(*f.errno.lock().unwrap());
+    Ok(())
+}
+
+/// `__args_count__()` — how many arguments followed the source file on the `vl run`
+/// command line. Cannot fail, so it does not write `errno`.
+fn floor_args_count(
+    _f: &Floor,
+    _c: &mut Caller<'_, ()>,
+    _a: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let n = PROGRAM_ARGS.lock().unwrap().len();
+    results[0] = Val::I32(i32::try_from(n).unwrap_or(i32::MAX));
+    Ok(())
+}
+
+/// `__fs_stat__(path)` — 0 = file, 1 = dir, negative = -errno. Follows symlinks
+/// (`metadata`, not `symlink_metadata`), so a link to a directory answers `dir`.
+/// Anything that is neither a directory nor a regular file — a fifo, a socket, a
+/// device — answers `file`, which is what `is_dir()` being false means and is the
+/// honest answer for a floor with a two-valued `FileKind` above it.
+fn floor_fs_stat(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let p = match os_path(&path) {
+        Ok(p) => p,
+        Err(code) => {
+            f.set_errno(code);
+            results[0] = Val::I32(-code);
+            return Ok(());
+        }
+    };
+    match std::fs::metadata(&p) {
+        Ok(m) => {
+            f.set_errno(0);
+            results[0] = Val::I32(if m.is_dir() { 1 } else { 0 });
+        }
+        Err(err) => {
+            let code = wasi_errno(&err);
+            f.set_errno(code);
+            results[0] = Val::I32(-code);
+        }
     }
+    Ok(())
+}
 
-    // `__fs_stat__(path)` — 0 = file, 1 = dir, negative = -errno. Follows symlinks
-    // (`metadata`, not `symlink_metadata`), so a link to a directory answers `dir`.
-    // Anything that is neither a directory nor a regular file — a fifo, a socket, a
-    // device — answers `file`, which is what `is_dir()` being false means and is the
-    // honest answer for a floor with a two-valued `FileKind` above it.
-    if let Some((_, ft)) = has("__fs_stat__") {
-        let e = errno.clone();
-        linker.func_new("imports", "__fs_stat__", ft, move |mut c, args, results| {
-            let path = read_u8_list(&mut c, &args[0])?;
-            let p = match os_path(&path) {
-                Ok(p) => p,
-                Err(code) => {
-                    *e.lock().unwrap() = code;
-                    results[0] = Val::I32(-code);
-                    return Ok(());
-                }
-            };
-            match std::fs::metadata(&p) {
-                Ok(m) => {
-                    *e.lock().unwrap() = 0;
-                    results[0] = Val::I32(if m.is_dir() { 1 } else { 0 });
-                }
-                Err(err) => {
-                    let code = wasi_errno(&err);
-                    *e.lock().unwrap() = code;
-                    results[0] = Val::I32(-code);
+/// `__fs_size__(path)` — the file's size in bytes, negative = -errno. A size is never
+/// negative, so one i64 carries both answers unambiguously; the errno cell is written
+/// too, so a caller may read the reason the same way every other slot reports it.
+///
+/// A DIRECTORY IS `-EISDIR` rather than the dirent's own byte count, which is a block
+/// figure no caller can act on. Decided here rather than above, because the alternative
+/// is a second syscall and a TOCTOU window — the same reason `__fs_read__` does not
+/// pre-stat. A size past `i64::MAX` is `-EFBIG` rather than a silent clamp.
+fn floor_fs_size(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let p = match os_path(&path) {
+        Ok(p) => p,
+        Err(code) => {
+            f.set_errno(code);
+            results[0] = Val::I64(-i64::from(code));
+            return Ok(());
+        }
+    };
+    let code = match std::fs::metadata(&p) {
+        Ok(m) if m.is_dir() => wasi::EISDIR,
+        Ok(m) => match i64::try_from(m.len()) {
+            Ok(n) => {
+                f.set_errno(0);
+                results[0] = Val::I64(n);
+                return Ok(());
+            }
+            Err(_) => wasi::EFBIG,
+        },
+        Err(err) => wasi_errno(&err),
+    };
+    f.set_errno(code);
+    results[0] = Val::I64(-i64::from(code));
+    Ok(())
+}
+
+/// `__fs_write__(path, data)` — 0 = ok, negative = -errno. Whole-file, truncating,
+/// creating when absent: `std::fs::write`'s own semantics, which are `O_WRONLY |
+/// O_CREAT | O_TRUNC`. No parent directories are created — a missing parent is
+/// `ENOENT`, which is what the syscall says and not something to paper over here.
+fn floor_fs_write(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let data = read_u8_list(c, &args[1])?;
+    let p = match os_path(&path) {
+        Ok(p) => p,
+        Err(code) => {
+            f.set_errno(code);
+            results[0] = Val::I32(-code);
+            return Ok(());
+        }
+    };
+    match std::fs::write(&p, &data) {
+        Ok(()) => {
+            f.set_errno(0);
+            results[0] = Val::I32(0);
+        }
+        Err(err) => {
+            let code = wasi_errno(&err);
+            f.set_errno(code);
+            results[0] = Val::I32(-code);
+        }
+    }
+    Ok(())
+}
+
+/// `__fs_write_at__(path, offset, data, mode)` — `data` written by `fs_write_mode`'s
+/// `mode`: 0 = ok, negative = -errno. The `u8[]` source of `writeFileRange` and
+/// `appendFile`; `writeFile`'s stays on `__fs_write__`.
+fn floor_fs_write_at(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let Val::I64(off) = args[1] else {
+        bail!("fs intrinsic: __fs_write_at__ expected an i64 offset");
+    };
+    let data = read_u8_list(c, &args[2])?;
+    let Val::I32(mode) = args[3] else {
+        bail!("fs intrinsic: __fs_write_at__ expected an i32 mode");
+    };
+    let code = match os_path(&path) {
+        Err(bad) => bad,
+        Ok(p) => fs_write_mode(&p, off, &data, mode),
+    };
+    f.set_errno(code);
+    results[0] = Val::I32(-code);
+    Ok(())
+}
+
+/// `__fs_write_from__(path, offset, addr, len, mode)` — the same write, its bytes read
+/// IN PLACE from the module's exported linear memory at `[addr, addr + len)`, so a `Buf`
+/// reaches `write(2)` with no copy. A source outside the memory is `-EFAULT`, the
+/// mirror of `__fs_read_into__`'s destination. A zero-length source still opens the
+/// file, so a replace truncates and a missing file is created.
+fn floor_fs_write_from(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let Val::I64(off) = args[1] else {
+        bail!("fs intrinsic: __fs_write_from__ expected an i64 offset");
+    };
+    let Val::I32(addr) = args[2] else {
+        bail!("fs intrinsic: __fs_write_from__ expected an i32 address");
+    };
+    let Val::I32(len) = args[3] else {
+        bail!("fs intrinsic: __fs_write_from__ expected an i32 length");
+    };
+    let Val::I32(mode) = args[4] else {
+        bail!("fs intrinsic: __fs_write_from__ expected an i32 mode");
+    };
+    let code = if addr < 0 || len < 0 {
+        wasi::EINVAL
+    } else {
+        match os_path(&path) {
+            Err(bad) => bad,
+            Ok(p) if len == 0 => fs_write_mode(&p, off, &[], mode),
+            Ok(p) => {
+                // The emitter forces the memory to exist and to be exported
+                // whenever this slot is used, so a miss is a drift between
+                // the two halves, not something a program can spell.
+                let Some(Extern::Memory(mem)) = c.get_export("memory") else {
+                    bail!(
+                        "fs intrinsic: __fs_write_from__ needs the module's \
+                         exported `memory`, which this module does not have"
+                    );
+                };
+                let (a, n) = (addr as usize, len as usize);
+                match mem.data(&*c).get(a..).and_then(|t| t.get(..n)) {
+                    None => wasi::EFAULT,
+                    Some(src) => fs_write_mode(&p, off, src, mode),
                 }
             }
-            Ok(())
-        })?;
-    }
+        }
+    };
+    f.set_errno(code);
+    results[0] = Val::I32(-code);
+    Ok(())
+}
 
-    // `__fs_size__(path)` — the file's size in bytes, negative = -errno. A size is never
-    // negative, so one i64 carries both answers unambiguously; the errno cell is written
-    // too, so a caller may read the reason the same way every other slot reports it.
-    //
-    // A DIRECTORY IS `-EISDIR` rather than the dirent's own byte count, which is a block
-    // figure no caller can act on. Decided here rather than above, because the alternative
-    // is a second syscall and a TOCTOU window — the same reason `__fs_read__` does not
-    // pre-stat. A size past `i64::MAX` is `-EFBIG` rather than a silent clamp.
-    if let Some((_, ft)) = has("__fs_size__") {
-        let e = errno.clone();
-        linker.func_new("imports", "__fs_size__", ft, move |mut c, args, results| {
-            let path = read_u8_list(&mut c, &args[0])?;
-            let p = match os_path(&path) {
-                Ok(p) => p,
-                Err(code) => {
-                    *e.lock().unwrap() = code;
-                    results[0] = Val::I64(-i64::from(code));
-                    return Ok(());
-                }
-            };
-            let code = match std::fs::metadata(&p) {
-                Ok(m) if m.is_dir() => wasi::EISDIR,
-                Ok(m) => match i64::try_from(m.len()) {
-                    Ok(n) => {
-                        *e.lock().unwrap() = 0;
-                        results[0] = Val::I64(n);
-                        return Ok(());
-                    }
-                    Err(_) => wasi::EFBIG,
-                },
-                Err(err) => wasi_errno(&err),
-            };
-            *e.lock().unwrap() = code;
-            results[0] = Val::I64(-i64::from(code));
-            Ok(())
-        })?;
-    }
+/// `__proc_exit__(code)` — end the process NOW with `code`, answering nothing. The one
+/// import that never returns, so the guest sees no result and there is no errno to set.
+/// Both streams are flushed first: a `println!` line sink is line-buffered, and an exit
+/// that dropped the program's own last line would be a silent loss.
+fn floor_proc_exit(
+    _f: &Floor,
+    _c: &mut Caller<'_, ()>,
+    args: &[Val],
+    _r: &mut [Val],
+) -> Result<()> {
+    let Val::I32(code) = args[0] else {
+        bail!("__proc_exit__: expected an i32 code");
+    };
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
+    std::process::exit(code);
+}
 
-    // `__fs_write__(path, data)` — 0 = ok, negative = -errno. Whole-file, truncating,
-    // creating when absent: `std::fs::write`'s own semantics, which are `O_WRONLY |
-    // O_CREAT | O_TRUNC`. No parent directories are created — a missing parent is
-    // `ENOENT`, which is what the syscall says and not something to paper over here.
-    if let Some((_, ft)) = has("__fs_write__") {
-        let e = errno.clone();
-        linker.func_new(
-            "imports",
-            "__fs_write__",
-            ft,
-            move |mut c, args, results| {
-                let path = read_u8_list(&mut c, &args[0])?;
-                let data = read_u8_list(&mut c, &args[1])?;
-                let p = match os_path(&path) {
-                    Ok(p) => p,
-                    Err(code) => {
-                        *e.lock().unwrap() = code;
-                        results[0] = Val::I32(-code);
-                        return Ok(());
-                    }
-                };
-                match std::fs::write(&p, &data) {
-                    Ok(()) => {
-                        *e.lock().unwrap() = 0;
-                        results[0] = Val::I32(0);
-                    }
-                    Err(err) => {
-                        let code = wasi_errno(&err);
-                        *e.lock().unwrap() = code;
-                        results[0] = Val::I32(-code);
-                    }
-                }
-                Ok(())
-            },
-        )?;
-    }
+/// `__fs_read__(path)` — the whole file, or EMPTY with `errno` set.
+///
+/// READING A DIRECTORY IS `-EISDIR`, and it arrives here as the OS's own answer
+/// rather than as a pre-flight check: `std:fs` deliberately does not stat before
+/// reading (a syscall per read, plus a TOCTOU window where the thing stat'd is not
+/// the thing opened), so the host must let `read` fail and report why. On Linux the
+/// open succeeds and the `read` returns EISDIR; `wasi_errno` maps
+/// `ErrorKind::IsADirectory` to 31 on every platform that names it.
+fn floor_fs_read(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let out = match os_path(&path)
+        .and_then(|p| std::fs::read(&p).map_err(|err| wasi_errno_at(&err, &p)))
+    {
+        Ok(bytes) => {
+            f.set_errno(0);
+            bytes
+        }
+        Err(code) => {
+            f.set_errno(code);
+            Vec::new()
+        }
+    };
+    results[0] = f.u8_list(c, &out)?;
+    Ok(())
+}
 
-    // `__fs_write_at__(path, offset, data, mode)` — `data` written by `fs_write_mode`'s
-    // `mode`: 0 = ok, negative = -errno. The `u8[]` source of `writeFileRange` and
-    // `appendFile`; `writeFile`'s stays on `__fs_write__`.
-    if let Some((_, ft)) = has("__fs_write_at__") {
-        let e = errno.clone();
-        linker.func_new(
-            "imports",
-            "__fs_write_at__",
-            ft,
-            move |mut c, args, results| {
-                let path = read_u8_list(&mut c, &args[0])?;
-                let Val::I64(off) = args[1] else {
-                    bail!("fs intrinsic: __fs_write_at__ expected an i64 offset");
-                };
-                let data = read_u8_list(&mut c, &args[2])?;
-                let Val::I32(mode) = args[3] else {
-                    bail!("fs intrinsic: __fs_write_at__ expected an i32 mode");
-                };
-                let code = match os_path(&path) {
-                    Err(bad) => bad,
-                    Ok(p) => fs_write_mode(&p, off, &data, mode),
-                };
-                *e.lock().unwrap() = code;
-                results[0] = Val::I32(-code);
-                Ok(())
-            },
-        )?;
-    }
-
-    // `__fs_write_from__(path, offset, addr, len, mode)` — the same write, its bytes read
-    // IN PLACE from the module's exported linear memory at `[addr, addr + len)`, so a `Buf`
-    // reaches `write(2)` with no copy. A source outside the memory is `-EFAULT`, the
-    // mirror of `__fs_read_into__`'s destination. A zero-length source still opens the
-    // file, so a replace truncates and a missing file is created.
-    if let Some((_, ft)) = has("__fs_write_from__") {
-        let e = errno.clone();
-        linker.func_new(
-            "imports",
-            "__fs_write_from__",
-            ft,
-            move |mut c, args, results| {
-                let path = read_u8_list(&mut c, &args[0])?;
-                let Val::I64(off) = args[1] else {
-                    bail!("fs intrinsic: __fs_write_from__ expected an i64 offset");
-                };
-                let Val::I32(addr) = args[2] else {
-                    bail!("fs intrinsic: __fs_write_from__ expected an i32 address");
-                };
-                let Val::I32(len) = args[3] else {
-                    bail!("fs intrinsic: __fs_write_from__ expected an i32 length");
-                };
-                let Val::I32(mode) = args[4] else {
-                    bail!("fs intrinsic: __fs_write_from__ expected an i32 mode");
-                };
-                let code = if addr < 0 || len < 0 {
-                    wasi::EINVAL
-                } else {
-                    match os_path(&path) {
-                        Err(bad) => bad,
-                        Ok(p) if len == 0 => fs_write_mode(&p, off, &[], mode),
-                        Ok(p) => {
-                            // The emitter forces the memory to exist and to be exported
-                            // whenever this slot is used, so a miss is a drift between
-                            // the two halves, not something a program can spell.
-                            let Some(Extern::Memory(mem)) = c.get_export("memory") else {
-                                bail!(
-                                    "fs intrinsic: __fs_write_from__ needs the module's \
-                                     exported `memory`, which this module does not have"
-                                );
-                            };
-                            let (a, n) = (addr as usize, len as usize);
-                            match mem.data(&c).get(a..).and_then(|t| t.get(..n)) {
-                                None => wasi::EFAULT,
-                                Some(src) => fs_write_mode(&p, off, src, mode),
-                            }
+/// `__fs_read_range__(path, offset, length)` — at most `length` bytes starting at byte
+/// `offset`, or EMPTY with `errno` set. Fewer than `length` near the end of the file and
+/// EMPTY at or past it, neither of which is an error: a scan walks a file by advancing
+/// the offset until the answer is empty with `errno == 0`. A negative offset or length is
+/// `EINVAL`, matching the check `std:fs` makes before the call.
+///
+/// `take(length).read_to_end` rather than a `length`-sized zeroed buffer, because the
+/// length is the caller's WINDOW and not the file's: eagerly allocating it would cost a
+/// gigabyte to read ten bytes from a short file. Reading a directory is `-EISDIR` from
+/// the OS's own failed read, exactly as `__fs_read__` above.
+fn floor_fs_read_range(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = read_u8_list(c, &args[0])?;
+    let Val::I64(off) = args[1] else {
+        bail!("fs intrinsic: __fs_read_range__ expected an i64 offset");
+    };
+    let Val::I32(len) = args[2] else {
+        bail!("fs intrinsic: __fs_read_range__ expected an i32 length");
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut code = 0i32;
+    if off < 0 || len < 0 {
+        code = wasi::EINVAL;
+    } else {
+        match os_path(&path) {
+            Err(bad) => code = bad,
+            Ok(p) => match std::fs::File::open(&p) {
+                Err(err) => code = wasi_errno_at(&err, &p),
+                Ok(mut fh) => match fh.seek(SeekFrom::Start(off as u64)) {
+                    Err(err) => code = wasi_errno(&err),
+                    Ok(_) => {
+                        if let Err(err) = fh.take(u64::from(len as u32)).read_to_end(&mut out) {
+                            code = wasi_errno(&err);
                         }
                     }
-                };
-                *e.lock().unwrap() = code;
-                results[0] = Val::I32(-code);
-                Ok(())
+                },
             },
-        )?;
+        }
     }
-
-    // `__proc_exit__(code)` — end the process NOW with `code`, answering nothing. The one
-    // import that never returns, so the guest sees no result and there is no errno to set.
-    // Both streams are flushed first: a `println!` line sink is line-buffered, and an exit
-    // that dropped the program's own last line would be a silent loss.
-    if let Some((_, ft)) = has("__proc_exit__") {
-        linker.func_new("imports", "__proc_exit__", ft, move |_c, args, _r| {
-            let Val::I32(code) = args[0] else {
-                bail!("__proc_exit__: expected an i32 code");
-            };
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            std::io::stderr().flush().ok();
-            std::process::exit(code);
-        })?;
+    if code != 0 {
+        out.clear();
     }
+    f.set_errno(code);
+    results[0] = f.u8_list(c, &out)?;
+    Ok(())
+}
 
-    let Some((st, at)) = types else {
-        // No `u8[]`-returning fs import is declared, so nothing below can be registered
-        // — and nothing below is needed. Not an error: `__fs_stat__` + `__fs_errno__`
-        // is a complete program.
-        return Ok(());
+/// `__fs_read_into__(path, offset, addr, cap)` — at most `cap` bytes from byte `offset`
+/// of the file, written STRAIGHT INTO the module's exported linear memory at byte
+/// `addr`. Answers the number of bytes written, or negative `-errno`; `errno` is set on
+/// every path so a caller may read the reason the same way every other slot reports it.
+///
+/// The whole point is that no GC array is allocated and no byte is copied twice: the
+/// `read(2)` lands in the guest's own pages. The read LOOPS until the window is full or
+/// the file ends, so a short answer means end of file rather than a short syscall — that
+/// is what makes the count a stop condition a scan can use. Offset at or past the end is
+/// 0 bytes and not an error, exactly as `__fs_read_range__` answers empty, and a window
+/// of 0 bytes still opens the file so the two agree about a missing one.
+///
+/// A destination outside the memory is `-EFAULT`: it cannot arise from a `Buf` that
+/// `std:buffer`'s allocator handed out, since that grows the memory to cover it, so this
+/// is the floor refusing a hand-built address rather than a case a caller reaches.
+fn floor_fs_read_into(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = read_u8_list(c, &args[0])?;
+    let Val::I64(off) = args[1] else {
+        bail!("fs intrinsic: __fs_read_into__ expected an i64 offset");
     };
-
-    // `__fs_read__(path)` — the whole file, or EMPTY with `errno` set.
-    //
-    // READING A DIRECTORY IS `-EISDIR`, and it arrives here as the OS's own answer
-    // rather than as a pre-flight check: `std:fs` deliberately does not stat before
-    // reading (a syscall per read, plus a TOCTOU window where the thing stat'd is not
-    // the thing opened), so the host must let `read` fail and report why. On Linux the
-    // open succeeds and the `read` returns EISDIR; `wasi_errno` maps
-    // `ErrorKind::IsADirectory` to 31 on every platform that names it.
-    if let Some((_, ft)) = has("__fs_read__") {
-        let e = errno.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new("imports", "__fs_read__", ft, move |mut c, args, results| {
-            let path = read_u8_list(&mut c, &args[0])?;
-            let out = match os_path(&path)
-                .and_then(|p| std::fs::read(&p).map_err(|err| wasi_errno_at(&err, &p)))
-            {
-                Ok(bytes) => {
-                    *e.lock().unwrap() = 0;
-                    bytes
-                }
-                Err(code) => {
-                    *e.lock().unwrap() = code;
-                    Vec::new()
-                }
-            };
-            results[0] = make_u8_list(&mut c, &st, &at, &out)?;
-            Ok(())
-        })?;
-    }
-
-    // `__fs_read_range__(path, offset, length)` — at most `length` bytes starting at byte
-    // `offset`, or EMPTY with `errno` set. Fewer than `length` near the end of the file and
-    // EMPTY at or past it, neither of which is an error: a scan walks a file by advancing
-    // the offset until the answer is empty with `errno == 0`. A negative offset or length is
-    // `EINVAL`, matching the check `std:fs` makes before the call.
-    //
-    // `take(length).read_to_end` rather than a `length`-sized zeroed buffer, because the
-    // length is the caller's WINDOW and not the file's: eagerly allocating it would cost a
-    // gigabyte to read ten bytes from a short file. Reading a directory is `-EISDIR` from
-    // the OS's own failed read, exactly as `__fs_read__` above.
-    if let Some((_, ft)) = has("__fs_read_range__") {
-        let e = errno.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new(
-            "imports",
-            "__fs_read_range__",
-            ft,
-            move |mut c, args, results| {
-                use std::io::{Read, Seek, SeekFrom};
-                let path = read_u8_list(&mut c, &args[0])?;
-                let Val::I64(off) = args[1] else {
-                    bail!("fs intrinsic: __fs_read_range__ expected an i64 offset");
-                };
-                let Val::I32(len) = args[2] else {
-                    bail!("fs intrinsic: __fs_read_range__ expected an i32 length");
-                };
-                let mut out: Vec<u8> = Vec::new();
-                let mut code = 0i32;
-                if off < 0 || len < 0 {
-                    code = wasi::EINVAL;
-                } else {
-                    match os_path(&path) {
-                        Err(bad) => code = bad,
-                        Ok(p) => match std::fs::File::open(&p) {
-                            Err(err) => code = wasi_errno_at(&err, &p),
-                            Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
-                                Err(err) => code = wasi_errno(&err),
-                                Ok(_) => {
-                                    if let Err(err) =
-                                        f.take(u64::from(len as u32)).read_to_end(&mut out)
-                                    {
-                                        code = wasi_errno(&err);
-                                    }
-                                }
-                            },
-                        },
-                    }
-                }
-                if code != 0 {
-                    out.clear();
-                }
-                *e.lock().unwrap() = code;
-                results[0] = make_u8_list(&mut c, &st, &at, &out)?;
-                Ok(())
-            },
-        )?;
-    }
-
-    // `__fs_read_into__(path, offset, addr, cap)` — at most `cap` bytes from byte `offset`
-    // of the file, written STRAIGHT INTO the module's exported linear memory at byte
-    // `addr`. Answers the number of bytes written, or negative `-errno`; `errno` is set on
-    // every path so a caller may read the reason the same way every other slot reports it.
-    //
-    // The whole point is that no GC array is allocated and no byte is copied twice: the
-    // `read(2)` lands in the guest's own pages. The read LOOPS until the window is full or
-    // the file ends, so a short answer means end of file rather than a short syscall — that
-    // is what makes the count a stop condition a scan can use. Offset at or past the end is
-    // 0 bytes and not an error, exactly as `__fs_read_range__` answers empty, and a window
-    // of 0 bytes still opens the file so the two agree about a missing one.
-    //
-    // A destination outside the memory is `-EFAULT`: it cannot arise from a `Buf` that
-    // `std:buffer`'s allocator handed out, since that grows the memory to cover it, so this
-    // is the floor refusing a hand-built address rather than a case a caller reaches.
-    if let Some((_, ft)) = has("__fs_read_into__") {
-        let e = errno.clone();
-        linker.func_new(
-            "imports",
-            "__fs_read_into__",
-            ft,
-            move |mut c, args, results| {
-                use std::io::{Read, Seek, SeekFrom};
-                let path = read_u8_list(&mut c, &args[0])?;
-                let Val::I64(off) = args[1] else {
-                    bail!("fs intrinsic: __fs_read_into__ expected an i64 offset");
-                };
-                let Val::I32(addr) = args[2] else {
-                    bail!("fs intrinsic: __fs_read_into__ expected an i32 address");
-                };
-                let Val::I32(cap) = args[3] else {
-                    bail!("fs intrinsic: __fs_read_into__ expected an i32 capacity");
-                };
-                let mut code = 0i32;
-                let mut wrote = 0i32;
-                if off < 0 || addr < 0 || cap < 0 {
-                    code = wasi::EINVAL;
-                } else {
-                    // OPENED EVEN FOR A ZERO-BYTE WINDOW, so a missing file is `ENOENT`
-                    // here exactly as it is for `__fs_read_range__` with length 0. A
-                    // buffer with no room left is not a reason to stop answering the
-                    // question the caller asked about the FILE.
-                    match os_path(&path) {
-                        Err(bad) => code = bad,
-                        Ok(p) => match std::fs::File::open(&p) {
-                            Err(err) => code = wasi_errno_at(&err, &p),
-                            Ok(mut f) => match f.seek(SeekFrom::Start(off as u64)) {
-                                Err(err) => code = wasi_errno(&err),
-                                Ok(_) if cap == 0 => {}
-                                Ok(_) => {
-                                    // The emitter forces the memory to exist and to be
-                                    // exported whenever this slot is used, so a miss is a
-                                    // drift between the two halves, not something a
-                                    // program can spell.
-                                    let Some(Extern::Memory(mem)) = c.get_export("memory") else {
-                                        bail!(
-                                            "fs intrinsic: __fs_read_into__ needs the \
-                                             module's exported `memory`, which this \
-                                             module does not have"
-                                        );
-                                    };
-                                    let a = addr as usize;
-                                    let n = cap as usize;
-                                    let data = mem.data_mut(&mut c);
-                                    match data.get_mut(a..).and_then(|tail| tail.get_mut(..n)) {
-                                        None => code = wasi::EFAULT,
-                                        Some(dst) => {
-                                            let mut filled = 0usize;
-                                            while filled < n {
-                                                match f.read(&mut dst[filled..]) {
-                                                    Ok(0) => break,
-                                                    Ok(k) => filled += k,
-                                                    Err(err)
-                                                        if err.kind()
-                                                            == std::io::ErrorKind::Interrupted => {}
-                                                    Err(err) => {
-                                                        code = wasi_errno(&err);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            wrote = filled as i32;
-                                        }
-                                    }
-                                }
-                            },
-                        },
-                    }
-                }
-                if code != 0 {
-                    wrote = -code;
-                }
-                *e.lock().unwrap() = code;
-                results[0] = Val::I32(wrote);
-                Ok(())
-            },
-        )?;
-    }
-
-    // `__fs_list__(path)` — the directory's entry NAMES, separated by 0x00 (NUL), or EMPTY
-    // with `errno` set.
-    //
-    // `.` and `..` are filtered HERE, per the contract, so `std:fs` need not know
-    // whether a given platform's `read_dir` yields them (Unix's does not; the filter
-    // costs two comparisons and makes the answer platform-independent). A newline is a
-    // legal byte in a POSIX filename, so a name containing one is genuinely ambiguous
-    // in this encoding — that is the documented cost of a flat separated block, and
-    // `std:fs` treats 0x00 as a separator either way. NUL is the one byte a POSIX
-    // filename cannot contain, so a name holding a newline still lists as ONE entry.
-    if let Some((_, ft)) = has("__fs_list__") {
-        let e = errno.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new("imports", "__fs_list__", ft, move |mut c, args, results| {
-            let path = read_u8_list(&mut c, &args[0])?;
-            let mut block: Vec<u8> = Vec::new();
-            let mut code = 0i32;
-            match os_path(&path) {
-                Err(bad) => code = bad,
-                Ok(p) => match std::fs::read_dir(&p) {
+    let Val::I32(addr) = args[2] else {
+        bail!("fs intrinsic: __fs_read_into__ expected an i32 address");
+    };
+    let Val::I32(cap) = args[3] else {
+        bail!("fs intrinsic: __fs_read_into__ expected an i32 capacity");
+    };
+    let mut code = 0i32;
+    let mut wrote = 0i32;
+    if off < 0 || addr < 0 || cap < 0 {
+        code = wasi::EINVAL;
+    } else {
+        // OPENED EVEN FOR A ZERO-BYTE WINDOW, so a missing file is `ENOENT`
+        // here exactly as it is for `__fs_read_range__` with length 0. A
+        // buffer with no room left is not a reason to stop answering the
+        // question the caller asked about the FILE.
+        match os_path(&path) {
+            Err(bad) => code = bad,
+            Ok(p) => match std::fs::File::open(&p) {
+                Err(err) => code = wasi_errno_at(&err, &p),
+                Ok(mut fh) => match fh.seek(SeekFrom::Start(off as u64)) {
                     Err(err) => code = wasi_errno(&err),
-                    Ok(entries) => {
-                        for ent in entries {
-                            match ent {
-                                Err(err) => {
-                                    code = wasi_errno(&err);
-                                    break;
-                                }
-                                Ok(ent) => {
-                                    let name = ent.file_name();
-                                    if name == "." || name == ".." {
-                                        continue;
-                                    }
-                                    match os_str_bytes(&name) {
-                                        None => {
-                                            code = wasi::EILSEQ;
+                    Ok(_) if cap == 0 => {}
+                    Ok(_) => {
+                        // The emitter forces the memory to exist and to be
+                        // exported whenever this slot is used, so a miss is a
+                        // drift between the two halves, not something a
+                        // program can spell.
+                        let Some(Extern::Memory(mem)) = c.get_export("memory") else {
+                            bail!(
+                                "fs intrinsic: __fs_read_into__ needs the \
+                                 module's exported `memory`, which this \
+                                 module does not have"
+                            );
+                        };
+                        let a = addr as usize;
+                        let n = cap as usize;
+                        let data = mem.data_mut(&mut *c);
+                        match data.get_mut(a..).and_then(|tail| tail.get_mut(..n)) {
+                            None => code = wasi::EFAULT,
+                            Some(dst) => {
+                                let mut filled = 0usize;
+                                while filled < n {
+                                    match fh.read(&mut dst[filled..]) {
+                                        Ok(0) => break,
+                                        Ok(k) => filled += k,
+                                        Err(err)
+                                            if err.kind() == std::io::ErrorKind::Interrupted => {}
+                                        Err(err) => {
+                                            code = wasi_errno(&err);
                                             break;
                                         }
-                                        Some(b) => {
-                                            if !block.is_empty() {
-                                                block.push(0x00);
-                                            }
-                                            block.extend_from_slice(&b);
-                                        }
                                     }
                                 }
+                                wrote = filled as i32;
                             }
                         }
                     }
                 },
-            }
-            if code != 0 {
-                block.clear();
-            }
-            *e.lock().unwrap() = code;
-            results[0] = make_u8_list(&mut c, &st, &at, &block)?;
-            Ok(())
-        })?;
-    }
-
-    // `__args_get__(i)` — argument `i` as bytes, or EMPTY with `errno = EINVAL` for an
-    // index outside `0 .. __args_count__()`.
-    if let Some((_, ft)) = has("__args_get__") {
-        let e = errno.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new(
-            "imports",
-            "__args_get__",
-            ft,
-            move |mut c, args, results| {
-                let Val::I32(i) = args[0] else {
-                    bail!("__args_get__: expected an i32 index");
-                };
-                let picked = {
-                    let all = PROGRAM_ARGS.lock().unwrap();
-                    if i < 0 {
-                        None
-                    } else {
-                        all.get(i as usize).cloned()
-                    }
-                };
-                let out = match picked {
-                    Some(b) => {
-                        *e.lock().unwrap() = 0;
-                        b
-                    }
-                    None => {
-                        *e.lock().unwrap() = wasi::EINVAL;
-                        Vec::new()
-                    }
-                };
-                results[0] = make_u8_list(&mut c, &st, &at, &out)?;
-                Ok(())
             },
-        )?;
+        }
     }
+    if code != 0 {
+        wrote = -code;
+    }
+    f.set_errno(code);
+    results[0] = Val::I32(wrote);
+    Ok(())
+}
 
-    // `__proc_run__(argv)` — run a program to completion and answer its exit code, or a
-    // negative `-errno` when it could not be started. NO SHELL, NO STDIN: the block is an
-    // argv and not a command line, so nothing here expands a glob or splits on a space, and
-    // the child's stdin is `/dev/null`. `errno` is 0 whenever the child ran, non-zero only
-    // when it did not — the exit code itself is an ANSWER, never a failure.
-    if let Some((_, ft)) = has("__proc_run__") {
-        let e = errno.clone();
-        let io = proc_io.clone();
-        linker.func_new(
-            "imports",
-            "__proc_run__",
-            ft,
-            move |mut c, args, results| {
-                let block = read_u8_list(&mut c, &args[0])?;
-                let mut parts = split_argv(&block);
-                // Cleared before the spawn, so a failed one leaves the previous run's output
-                // unreadable rather than answering it a second time.
-                *io.lock().unwrap() = (Vec::new(), Vec::new());
-                let mut code = 0i32;
-                let mut rc = 0i32;
-                if parts.is_empty() || parts[0].is_empty() {
-                    code = wasi::EINVAL; // the block names no command
-                } else {
-                    let prog = parts.remove(0);
-                    match os_string(&prog) {
-                        Err(bad) => code = bad,
-                        Ok(p) => {
-                            let mut cmd = std::process::Command::new(&p);
-                            cmd.stdin(std::process::Stdio::null());
-                            for a in &parts {
-                                match os_string(a) {
-                                    Err(bad) => {
-                                        code = bad;
-                                        break;
-                                    }
-                                    Ok(s) => {
-                                        cmd.arg(s);
-                                    }
-                                }
+/// `__fs_list__(path)` — the directory's entry NAMES, separated by 0x00 (NUL), or EMPTY
+/// with `errno` set.
+///
+/// `.` and `..` are filtered HERE, per the contract, so `std:fs` need not know
+/// whether a given platform's `read_dir` yields them (Unix's does not; the filter
+/// costs two comparisons and makes the answer platform-independent). A newline is a
+/// legal byte in a POSIX filename, so a name containing one is genuinely ambiguous
+/// in this encoding — that is the documented cost of a flat separated block, and
+/// `std:fs` treats 0x00 as a separator either way. NUL is the one byte a POSIX
+/// filename cannot contain, so a name holding a newline still lists as ONE entry.
+fn floor_fs_list(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let path = read_u8_list(c, &args[0])?;
+    let mut block: Vec<u8> = Vec::new();
+    let mut code = 0i32;
+    match os_path(&path) {
+        Err(bad) => code = bad,
+        Ok(p) => match std::fs::read_dir(&p) {
+            Err(err) => code = wasi_errno(&err),
+            Ok(entries) => {
+                for ent in entries {
+                    match ent {
+                        Err(err) => {
+                            code = wasi_errno(&err);
+                            break;
+                        }
+                        Ok(ent) => {
+                            let name = ent.file_name();
+                            if name == "." || name == ".." {
+                                continue;
                             }
-                            if code == 0 {
-                                match cmd.output() {
-                                    Err(err) => code = wasi_errno(&err),
-                                    Ok(out) => {
-                                        rc = child_code(out.status);
-                                        *io.lock().unwrap() = (out.stdout, out.stderr);
+                            match os_str_bytes(&name) {
+                                None => {
+                                    code = wasi::EILSEQ;
+                                    break;
+                                }
+                                Some(b) => {
+                                    if !block.is_empty() {
+                                        block.push(0x00);
                                     }
+                                    block.extend_from_slice(&b);
                                 }
                             }
                         }
                     }
                 }
-                *e.lock().unwrap() = code;
-                results[0] = Val::I32(if code != 0 { -code } else { rc });
-                Ok(())
-            },
-        )?;
+            }
+        },
     }
+    if code != 0 {
+        block.clear();
+    }
+    f.set_errno(code);
+    results[0] = f.u8_list(c, &block)?;
+    Ok(())
+}
 
-    // `__proc_out__()` / `__proc_err__()` — the last `__proc_run__`'s captured streams,
-    // EMPTY before the first run and after a failed one. Neither can fail, so like
-    // `__args_count__` they leave `errno` alone: the reason the spawn failed stays readable
-    // after the caller has asked for the output.
-    if let Some((_, ft)) = has("__proc_out__") {
-        let io = proc_io.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new("imports", "__proc_out__", ft, move |mut c, _a, results| {
-            let bytes = io.lock().unwrap().0.clone();
-            results[0] = make_u8_list(&mut c, &st, &at, &bytes)?;
-            Ok(())
-        })?;
-    }
-    if let Some((_, ft)) = has("__proc_err__") {
-        let io = proc_io.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new("imports", "__proc_err__", ft, move |mut c, _a, results| {
-            let bytes = io.lock().unwrap().1.clone();
-            results[0] = make_u8_list(&mut c, &st, &at, &bytes)?;
-            Ok(())
-        })?;
-    }
+/// `__args_get__(i)` — argument `i` as bytes, or EMPTY with `errno = EINVAL` for an
+/// index outside `0 .. __args_count__()`.
+fn floor_args_get(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let Val::I32(i) = args[0] else {
+        bail!("__args_get__: expected an i32 index");
+    };
+    let picked = {
+        let all = PROGRAM_ARGS.lock().unwrap();
+        if i < 0 {
+            None
+        } else {
+            all.get(i as usize).cloned()
+        }
+    };
+    let out = match picked {
+        Some(b) => {
+            f.set_errno(0);
+            b
+        }
+        None => {
+            f.set_errno(wasi::EINVAL);
+            Vec::new()
+        }
+    };
+    results[0] = f.u8_list(c, &out)?;
+    Ok(())
+}
 
-    // `__env_get__(name)` — the variable's value as bytes, or EMPTY with `errno` set:
-    // `ENOENT` when it is not set, `EINVAL` for a name no environment can hold (empty, or
-    // carrying `=` or NUL), `EILSEQ` for a value this platform cannot hand over as bytes.
-    // A variable set to the EMPTY string answers empty with `errno` 0, which is the split.
-    if let Some((_, ft)) = has("__env_get__") {
-        let e = errno.clone();
-        let (st, at) = (st.clone(), at.clone());
-        linker.func_new("imports", "__env_get__", ft, move |mut c, args, results| {
-            let name = read_u8_list(&mut c, &args[0])?;
-            let mut out: Vec<u8> = Vec::new();
-            let mut code = 0i32;
-            if name.is_empty() || name.contains(&0) || name.contains(&b'=') {
-                code = wasi::EINVAL;
-            } else {
-                match os_string(&name) {
-                    Err(bad) => code = bad,
-                    Ok(n) => match std::env::var_os(&n) {
-                        None => code = wasi::ENOENT,
-                        Some(v) => match os_str_bytes(&v) {
-                            None => code = wasi::EILSEQ,
-                            Some(b) => out = b,
-                        },
-                    },
+/// `__proc_run__(argv)` — run a program to completion and answer its exit code, or a
+/// negative `-errno` when it could not be started. NO SHELL, NO STDIN: the block is an
+/// argv and not a command line, so nothing here expands a glob or splits on a space, and
+/// the child's stdin is `/dev/null`. `errno` is 0 whenever the child ran, non-zero only
+/// when it did not — the exit code itself is an ANSWER, never a failure.
+fn floor_proc_run(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let block = read_u8_list(c, &args[0])?;
+    let mut parts = split_argv(&block);
+    // Cleared before the spawn, so a failed one leaves the previous run's output
+    // unreadable rather than answering it a second time.
+    *f.proc_io.lock().unwrap() = (Vec::new(), Vec::new());
+    let mut code = 0i32;
+    let mut rc = 0i32;
+    if parts.is_empty() || parts[0].is_empty() {
+        code = wasi::EINVAL; // the block names no command
+    } else {
+        let prog = parts.remove(0);
+        match os_string(&prog) {
+            Err(bad) => code = bad,
+            Ok(p) => {
+                let mut cmd = std::process::Command::new(&p);
+                cmd.stdin(std::process::Stdio::null());
+                for a in &parts {
+                    match os_string(a) {
+                        Err(bad) => {
+                            code = bad;
+                            break;
+                        }
+                        Ok(s) => {
+                            cmd.arg(s);
+                        }
+                    }
+                }
+                if code == 0 {
+                    match cmd.output() {
+                        Err(err) => code = wasi_errno(&err),
+                        Ok(out) => {
+                            rc = child_code(out.status);
+                            *f.proc_io.lock().unwrap() = (out.stdout, out.stderr);
+                        }
+                    }
                 }
             }
-            if code != 0 {
-                out.clear();
-            }
-            *e.lock().unwrap() = code;
-            results[0] = make_u8_list(&mut c, &st, &at, &out)?;
-            Ok(())
-        })?;
+        }
     }
+    f.set_errno(code);
+    results[0] = Val::I32(if code != 0 { -code } else { rc });
+    Ok(())
+}
+
+/// `__proc_out__()` — the last `__proc_run__`'s captured stdout, EMPTY before the first run
+/// and after a failed one. Cannot fail, so like `__args_count__` it leaves `errno` alone:
+/// the reason the spawn failed stays readable after the caller has asked for the output.
+fn floor_proc_out(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    _a: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let bytes = f.proc_io.lock().unwrap().0.clone();
+    results[0] = f.u8_list(c, &bytes)?;
+    Ok(())
+}
+
+/// `__proc_err__()` — the last `__proc_run__`'s captured stderr, as `__proc_out__`.
+fn floor_proc_err(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    _a: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let bytes = f.proc_io.lock().unwrap().1.clone();
+    results[0] = f.u8_list(c, &bytes)?;
+    Ok(())
+}
+
+/// `__env_get__(name)` — the variable's value as bytes, or EMPTY with `errno` set:
+/// `ENOENT` when it is not set, `EINVAL` for a name no environment can hold (empty, or
+/// carrying `=` or NUL), `EILSEQ` for a value this platform cannot hand over as bytes.
+/// A variable set to the EMPTY string answers empty with `errno` 0, which is the split.
+fn floor_env_get(
+    f: &Floor,
+    c: &mut Caller<'_, ()>,
+    args: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let name = read_u8_list(c, &args[0])?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut code = 0i32;
+    if name.is_empty() || name.contains(&0) || name.contains(&b'=') {
+        code = wasi::EINVAL;
+    } else {
+        match os_string(&name) {
+            Err(bad) => code = bad,
+            Ok(n) => match std::env::var_os(&n) {
+                None => code = wasi::ENOENT,
+                Some(v) => match os_str_bytes(&v) {
+                    None => code = wasi::EILSEQ,
+                    Some(b) => out = b,
+                },
+            },
+        }
+    }
+    if code != 0 {
+        out.clear();
+    }
+    f.set_errno(code);
+    results[0] = f.u8_list(c, &out)?;
     Ok(())
 }
 
