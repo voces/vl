@@ -1,7 +1,5 @@
-// The playground adapter's IMPORT-editing behaviours — the three that
-// `SUB_GAPS` in `playground_lsp_parity_test.ts` tracked as gaps under the
-// "completion" and "code actions" feature labels, now composed by the adapter
-// (ROADMAP row 32's residue):
+// The playground adapter's IMPORT-editing behaviours, which it gets from the
+// shared `completionsAt` / `codeActionsAt` in `lsp/src/features.ts`:
 //   - `stdAutoImportCompletions` — an unimported std name is offered with the
 //     `import { … } from "std:…"` rewrite on accept (`additionalTextEdits`).
 //   - `ufcsImportFixes` — a missing-UFCS-import diagnostic offers "Import

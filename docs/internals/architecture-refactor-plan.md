@@ -36,7 +36,7 @@ restate measurements; follow the links.
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the host answers `EPERM` for a POSIX EPERM (`permission_errno`). Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
 | L9 split `typecheck.vl` | D1 **in progress**. Last: the capture-retire, narrowing-bank, symbol-occurrence and effect-summary tables moved into four modules that own their resets; 57,217 → 56,579 lines. Next: `fnWriteShapes`, which frees 28. | [L9 log](#l9-log) |
-| L12 | not started (has A7) | |
+| L12 | **in review**. Last: the playground adapter calls every `lsp/src/features.ts` function and gains references, highlights, outline and rename; playground TS 3,687 → 3,471 lines. Next: nothing; the lane is done once this merges. | [L12 log](#l12-log) |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
 | RepDesc rulings | **ruled** 2026-10-13. `one-literal-union-rep` applied (#3653); `nullable-rep-rule-stated-once` ruled (b). | [RepDesc log](#repdesc-log) |
@@ -470,3 +470,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - L12: the remaining LSP features.
 - **Done:** every seed-backed feature lives in `lsp/src/features.ts` beside folding (definition, references, document highlights, document symbols, signature help, hover, inlay hints and semantic tokens in the first PR; completion, formatting, code actions, code lens and rename in the second), each taking a `FeatureContext` (checker, module key, reader, log) and answering in plain shapes.
 - `server.ts` is transport: it fetches the document, calls the feature and converts to protocol types.
+
+### L12 log
+
+- The playground adapter is a transport over `lsp/src/features.ts`, as `server.ts` is: `lspAdapter.ts` 614 → 389 lines. Where the two hosts disagreed, the shared behaviour was kept: hover's effect summary, UFCS completions with import edits, the protocol's code-action kind hierarchy, seed folding extents, `=>` token fusion and `\r\n` word scans. `tests/playground_lsp_parity_test.ts` now asserts that both hosts call each row's shared function. Code lens stays out because the playground keeps no use-map.

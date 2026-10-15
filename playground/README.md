@@ -15,27 +15,38 @@ environment-agnostic
 The **Run** path compiles VL → wasm on the seed too (`createWasmChecker.compile`
 → the driver's `compileSrc`) and executes the bytes with the pure `runWasm`
 (a `WebAssembly.instantiate` over the VL host-import ABI — `compiler/compile.ts`,
-no front end). `src/lspAdapter.ts` is the editor-feature bridge: it drives the
-checker + the LSP-neutral assembly helpers (`lsp/src/typeFeatures.ts`'s `*FromWasm`
-family) and `src/main.ts` maps its results onto Monaco's provider APIs. It never
+no front end). `src/lspAdapter.ts` is the editor-feature bridge: a thin transport
+over `lsp/src/features.ts`, the same feature functions the Node LSP's `server.ts`
+calls, and `src/main.ts` maps their results onto Monaco's provider APIs. It never
 imports the Node-bound `lsp/src/server.ts`.
 
-Two TS-compiler bits remain (their migration to the seed is the last step):
-**diagnostics** still use the codegen-free TS `checkOnly`, and the **WAT** pane is
-rendered by **binaryen** (`wasmToWat`, lazily loaded) disassembling the seed's
+Diagnostics come from the seed too. The **WAT** pane is rendered by **binaryen** (`wasmToWat`, lazily loaded) disassembling the seed's
 emitted bytes — binaryen no longer compiles VL.
 
 ## Editor / LSP features (client-side)
 
+Every row but diagnostics is one `lsp/src/features.ts` function that the VS Code
+server calls too (`tests/playground_lsp_parity_test.ts` holds both hosts to it).
+
 | Feature | Monaco surface | Backed by |
 | --- | --- | --- |
-| Diagnostics (incl. B17 unused-var lint, greyed via the `unnecessary` tag) | `setModelMarkers` (debounced on edit) | `checkOnly` (TS) |
-| Semantic-token syntax colouring | `DocumentSemanticTokensProvider` | wasm `tokensAt`/`memberTokensAt`/`lexicalTokensAt` → `semanticTokensDataFromWasm` |
-| Hover (type at cursor, incl. members + type aliases) | `HoverProvider` | wasm `hoverTypeAt`/`memberTypeAt`/`typeAliasAt` + builtins |
-| Inlay hints (inferred types) | `InlayHintsProvider` | wasm `inlayHintsAt` → `inlayHintsFromWasm` |
-| Go-to-definition | `DefinitionProvider` | wasm `definitionAt` |
-| Completion (identifiers + members + keywords/snippets) | `CompletionItemProvider` (`.`-triggered) | wasm `scopeAt`/`builtinCompletions`/`memberCompletionsAt` |
-| Format (whole document) | the **Format** button | wasm `formatSrc` (`format.vl`) |
+| Diagnostics (incl. B17 unused-var lint, greyed via the `unnecessary` tag) | `setModelMarkers` (debounced on edit) | the seed checker's `check` + `lint` |
+| Semantic-token syntax colouring | `DocumentSemanticTokensProvider` | `semanticTokensAt` |
+| Hover (type, docs, effect summary) | `HoverProvider` | `hoverAt` |
+| Inlay hints (inferred types) | `InlayHintsProvider` | `inlayHintsAt` |
+| Go-to-definition | `DefinitionProvider` | `definitionAt` |
+| Find references | `ReferenceProvider` | `referencesAt` |
+| Document highlights | `DocumentHighlightProvider` | `documentHighlightsAt` |
+| Outline | `DocumentSymbolProvider` | `documentSymbolsAt` |
+| Rename | `RenameProvider` | `prepareRenameAt` / `renameAt` |
+| Completion (identifiers, members, UFCS, std auto-import, keywords) | `CompletionItemProvider` (`.`-triggered) | `completionsAt` |
+| Signature help | `SignatureHelpProvider` | `signatureHelpAt` |
+| Code actions (quick fixes, organize imports) | `CodeActionProvider` | `codeActionsAt` |
+| Folding | `FoldingRangeProvider` | `foldingRangesAt` |
+| Format (whole document) | the **Format** button | `formattingEditsAt` |
+
+Code lens is not offered: its counts read the workspace use-map that the
+server's save pass keeps, and the playground keeps none.
 
 A small Monarch grammar provides a synchronous fallback for strings/comments/
 numbers; the semantic-token provider does the accurate identifier/member
@@ -215,7 +226,7 @@ playground/
                     {{JS}}/{{CSS}} are resolved into dist/index.html by build.ts
   src/
     main.ts         Monaco + LSP-provider wiring to the DOM (the bundle entry)
-    lspAdapter.ts   pure browser "language server": wraps the pure LSP helpers
+    lspAdapter.ts   pure browser "language server": transport over lsp/src/features.ts
     playground.ts   DOM-free Run path: seed compile (compileSrc) -> runWasm -> WAT
     samples.ts      seed programs (from tests/cases/**)
     generated/      seedName.ts — the seed's hashed name (written by build.ts,

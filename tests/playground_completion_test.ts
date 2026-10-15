@@ -1,6 +1,6 @@
 // Playground completion parity: the browser `lspAdapter.completion` export is the
 // Monaco-free bridge `main.ts`'s `registerCompletionItemProvider` consumes. It
-// mirrors `server.ts`'s `onCompletion` (D3): member completion after a `.`
+// calls the same `completionsAt` as `server.ts` (D3): member completion after a `.`
 // receiver, scope-aware identifier completion otherwise (plus keyword + snippet
 // items). As of the playground wasm migration it drives the SAME self-hosted
 // seed the Node LSP runs (injected via `initLsp`, the headless analogue of the
@@ -104,7 +104,7 @@ Deno.test({ name: "completion: a `.` with no resolvable receiver yields no items
 Deno.test({ name: "completion: a `.` detected from the line prefix (no triggerChar) still completes members", ignore }, async () => {
   init();
   // Monaco fires completion on typing too (not only the `.` trigger); the adapter
-  // falls back to the char before the cursor, mirroring `server.ts`.
+  // falls back to the char before the cursor, inside the shared `completionsAt`.
   const src = "let p = { x: 1 }\nconst v = p.\n";
   const cs = await completion(src, { line: 1, character: 12 }); // no triggerChar
   assertEquals(labels(cs), ["x"], "member detected from the line prefix");

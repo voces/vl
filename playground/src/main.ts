@@ -3,15 +3,11 @@
 // Wires the Monaco editor + the client-side "language server" to the DOM.
 // Bundled into dist/playground.js by build.ts.
 //
-// VL's language server runs IN THE BROWSER: the compiler and the LSP
-// feature-helpers are pure TS, so the same logic `lsp/src/server.ts` runs per
-// request runs here on the current Monaco model. `lspAdapter.ts` is the bridge
-// (pure, Monaco-free); this file maps its results onto Monaco's provider APIs:
-//   - diagnostics  → `monaco.editor.setModelMarkers` (debounced on edit, per file)
-//   - semantic tokens → a `DocumentSemanticTokensProvider`
-//   - hover        → a `HoverProvider`
-//   - inlay hints  → an `InlayHintsProvider`
-//   - definition   → a `DefinitionProvider`
+// VL's language server runs IN THE BROWSER: `lspAdapter.ts` calls the same
+// `lsp/src/features.ts` functions `lsp/src/server.ts` does, against the wasm
+// seed, and returns Monaco-free data; this file maps it onto Monaco's providers.
+// Diagnostics go to `monaco.editor.setModelMarkers` (debounced on edit, per file);
+// every other feature is a registered provider.
 //
 // The surface is a branded restyle (light/dark theme pair) with three structural
 // features layered on the existing real compiler/LSP/share/format:
@@ -289,37 +285,42 @@ monaco.languages.registerDocumentSemanticTokensProvider(VL_LANGUAGE_ID, {
   releaseDocumentSemanticTokens: () => {},
 });
 
-// --- hover provider ----------------------------------------------------------
+// --- position features ---------------------------------------------------------
+//
+// The adapter answers in LSP form (0-based), files by project key; these convert
+// to Monaco's 1-based ranges and the `inmemory://vl/<key>` model URIs.
+const toMonacoRange = (r: lsp.LspRange): monaco.Range =>
+  new monaco.Range(
+    r.start.line + 1,
+    r.start.character + 1,
+    r.end.line + 1,
+    r.end.character + 1,
+  );
+
+const lspPositionOf = (position: monaco.IPosition): lsp.LspPosition => ({
+  line: position.lineNumber - 1,
+  character: position.column - 1,
+});
+
+const lspRangeOf = (range: monaco.IRange): lsp.LspRange => ({
+  start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
+  end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
+});
 
 monaco.languages.registerHoverProvider(VL_LANGUAGE_ID, {
   provideHover: async (model, position) => {
-    const result = await lsp.hover(model.getValue(), {
-      line: position.lineNumber - 1, // Monaco 1-based line → LSP 0-based
-      character: position.column - 1, // Monaco 1-based col → LSP 0-based
-    }, entryKeyOf(model));
+    const result = await lsp.hover(model.getValue(), lspPositionOf(position), entryKeyOf(model));
     if (!result) return null;
-    const range = result.range
-      ? new monaco.Range(
-        result.range.start.line + 1,
-        result.range.start.character + 1,
-        result.range.end.line + 1,
-        result.range.end.character + 1,
-      )
-      : undefined;
-    // Already markdown — the adapter composed the `///` prose and the `vital` fence
-    // through `docMarkdown` (D9.11), the same layout `server.ts` and completion use.
-    return { range, contents: [{ value: result.contents }] };
+    return {
+      range: result.range ? toMonacoRange(result.range) : undefined,
+      contents: [{ value: result.contents }],
+    };
   },
 });
 
-// --- inlay hints provider ----------------------------------------------------
-
 monaco.languages.registerInlayHintsProvider(VL_LANGUAGE_ID, {
   provideInlayHints: async (model, range) => {
-    const hints = await lsp.inlayHints(model.getValue(), {
-      start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
-      end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
-    }, entryKeyOf(model));
+    const hints = await lsp.inlayHints(model.getValue(), lspRangeOf(range), entryKeyOf(model));
     return {
       hints: hints.map((h) => ({
         position: { lineNumber: h.line + 1, column: h.character + 1 },
@@ -332,123 +333,148 @@ monaco.languages.registerInlayHintsProvider(VL_LANGUAGE_ID, {
   },
 });
 
-// --- definition provider -----------------------------------------------------
-
 monaco.languages.registerDefinitionProvider(VL_LANGUAGE_ID, {
   provideDefinition: async (model, position) => {
-    const def = await lsp.definition(model.getValue(), {
-      line: position.lineNumber - 1,
-      character: position.column - 1,
-    }, entryKeyOf(model));
+    const def = await lsp.definition(model.getValue(), lspPositionOf(position), entryKeyOf(model));
     if (!def) return null;
-    // A cross-file jump (`def.file`) targets a sibling module's model; a same-file
-    // jump stays in the current model.
-    const targetUri = def.file ? modelUri(def.file) : model.uri;
+    // A cross-file jump (`def.file`) targets a sibling module's model.
     return {
-      uri: targetUri,
-      range: new monaco.Range(
-        def.start.line + 1,
-        def.start.character + 1,
-        def.end.line + 1,
-        def.end.character + 1,
+      uri: def.file ? modelUri(def.file) : model.uri,
+      range: toMonacoRange({ start: def.start, end: def.end }),
+    };
+  },
+});
+
+monaco.languages.registerReferenceProvider(VL_LANGUAGE_ID, {
+  provideReferences: async (model, position, context) => {
+    const refs = await lsp.references(
+      model.getValue(),
+      lspPositionOf(position),
+      context.includeDeclaration,
+      entryKeyOf(model),
+    );
+    return refs?.map((r) => ({ uri: modelUri(r.file), range: toMonacoRange(r.range) })) ?? null;
+  },
+});
+
+monaco.languages.registerDocumentHighlightProvider(VL_LANGUAGE_ID, {
+  provideDocumentHighlights: async (model, position) => {
+    const spans = await lsp.documentHighlights(
+      model.getValue(),
+      lspPositionOf(position),
+      entryKeyOf(model),
+    );
+    return spans?.map((s) => ({
+      range: toMonacoRange(s.range),
+      kind: s.kind === "write"
+        ? monaco.languages.DocumentHighlightKind.Write
+        : monaco.languages.DocumentHighlightKind.Read,
+    })) ?? null;
+  },
+});
+
+const SYMBOL_KIND: Record<lsp.OutlineNode["kind"], monaco.languages.SymbolKind> = {
+  function: monaco.languages.SymbolKind.Function,
+  variable: monaco.languages.SymbolKind.Variable,
+  constant: monaco.languages.SymbolKind.Constant,
+  type: monaco.languages.SymbolKind.Struct,
+};
+
+const toDocumentSymbol = (n: lsp.OutlineNode): monaco.languages.DocumentSymbol => ({
+  name: n.name,
+  detail: n.exported ? "export" : "",
+  kind: SYMBOL_KIND[n.kind],
+  tags: [],
+  range: toMonacoRange(n.range),
+  selectionRange: toMonacoRange(n.selection),
+  children: n.children.map(toDocumentSymbol),
+});
+
+monaco.languages.registerDocumentSymbolProvider(VL_LANGUAGE_ID, {
+  provideDocumentSymbols: async (model) =>
+    (await lsp.documentSymbols(model.getValue(), entryKeyOf(model)))?.map(toDocumentSymbol) ??
+      null,
+});
+
+monaco.languages.registerRenameProvider(VL_LANGUAGE_ID, {
+  resolveRenameLocation: async (model, position) => {
+    const prep = await lsp.prepareRename(
+      model.getValue(),
+      lspPositionOf(position),
+      entryKeyOf(model),
+    );
+    if (prep === null) return undefined;
+    if ("error" in prep) {
+      return { range: new monaco.Range(1, 1, 1, 1), text: "", rejectReason: prep.error };
+    }
+    return { range: toMonacoRange(prep.range), text: prep.placeholder };
+  },
+  provideRenameEdits: async (model, position, newName) => {
+    const answer = await lsp.rename(
+      model.getValue(),
+      lspPositionOf(position),
+      newName,
+      entryKeyOf(model),
+    );
+    if (answer === null) return { edits: [] };
+    if ("error" in answer) return { edits: [], rejectReason: answer.error };
+    return {
+      edits: Object.entries(answer.changes).flatMap(([file, edits]) =>
+        edits.map((e) => ({
+          resource: modelUri(file),
+          textEdit: { range: toMonacoRange(e.range), text: e.newText },
+          versionId: undefined,
+        }))
       ),
     };
   },
 });
 
-// --- code action (quick-fix) provider ----------------------------------------
+// --- code action provider ----------------------------------------------------
 //
-// Mirrors `server.ts`'s `onCodeAction`: for the lint diagnostics overlapping the
-// cursor/selection, compute the applicable quick-fixes (`lspAdapter.codeActions`
-// → `lsp/src/codeActions.ts`) and wrap each as a Monaco `CodeAction` with a
-// `WorkspaceEdit` against the current model. Monaco's "Auto Fix" lightbulb then
-// applies the `isPreferred` fix. The context markers Monaco passes carry the
-// diagnostic `code` (we stash it on each marker in `toMarker`), so the dispatch
-// picks the right fix — exactly the `code`-keyed mapping the editor uses.
+// Quick fixes for the markers under the cursor (each marker carries its
+// diagnostic `code`, stashed in `toMarker`) and organize imports, filtered by the
+// request's kind.
 monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
   provideCodeActions: async (model, range, context) => {
-    // Monaco markers → the `VLDiagnostic`-shaped context (0-based LSP coords)
-    // `lspAdapter.codeActions` expects. Monaco stores `code` as a string or
-    // `{ value }` object, so normalise both.
+    // Monaco stores `code` as a string or a `{ value }` object.
     const contextDiagnostics: lsp.VLDiagnostic[] = context.markers
       .map((m) => ({
         message: m.message,
         severity: "warning" as const,
         source: "vital" as const,
         code: typeof m.code === "object" ? m.code?.value : m.code,
-        range: {
-          start: { line: m.startLineNumber - 1, character: m.startColumn - 1 },
-          end: { line: m.endLineNumber - 1, character: m.endColumn - 1 },
-        },
+        range: lspRangeOf(m),
       }));
-
-    const fixes = await lsp.codeActions(
+    const actions = await lsp.codeActions(
       model.getValue(),
-      {
-        start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
-        end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
-      },
+      lspRangeOf(range),
       contextDiagnostics,
       entryKeyOf(model),
+      context.only === undefined ? undefined : [context.only],
     );
-
-    type Edit = {
-      range: { start: lsp.LspPosition; end: lsp.LspPosition };
-      newText: string;
-    };
-    const toResourceEdits = (edits: Edit[]) => ({
-      edits: edits.map((e) => ({
-        resource: model.uri,
-        textEdit: {
-          range: new monaco.Range(
-            e.range.start.line + 1,
-            e.range.start.character + 1,
-            e.range.end.line + 1,
-            e.range.end.character + 1,
-          ),
-          text: e.newText,
+    return {
+      actions: actions.map((a) => ({
+        title: a.title,
+        kind: a.kind,
+        isPreferred: a.isPreferred,
+        edit: {
+          edits: a.edits.map((e) => ({
+            resource: model.uri,
+            textEdit: { range: toMonacoRange(e.range), text: e.newText },
+            versionId: model.getVersionId(),
+          })),
         },
-        versionId: model.getVersionId(),
       })),
-    });
-
-    const actions: monaco.languages.CodeAction[] = fixes.map((fix) => ({
-      title: fix.title,
-      kind: "quickfix",
-      isPreferred: fix.isPreferred,
-      edit: toResourceEdits(fix.edits),
-    }));
-
-    // Organize imports — a SOURCE action (`editor.action.organizeImports`, or the
-    // command palette), not a lightbulb quick-fix. Offered only when it would
-    // change something, so an already-organized file gets no empty action.
-    const wantsSource = context.only === "source.organizeImports" ||
-      context.only === undefined;
-    if (wantsSource) {
-      const organizeEdits = await lsp.organizeImports(model.getValue(), entryKeyOf(model));
-      if (organizeEdits.length > 0) {
-        actions.push({
-          title: "Organize imports",
-          kind: "source.organizeImports",
-          edit: toResourceEdits(organizeEdits),
-        });
-      }
-    }
-
-    return { actions, dispose: () => {} };
+      dispose: () => {},
+    };
   },
 }, { providedCodeActionKinds: ["quickfix", "source.organizeImports"] });
 
 // --- completion provider -----------------------------------------------------
 //
-// Mirrors `server.ts`'s `onCompletion` (D3): scope-aware identifier suggestions
-// everywhere, structural MEMBER suggestions after a `.` receiver (struct fields +
-// the receiver type's built-in methods), plus keyword and snippet completions for
-// statement-position typing. `lspAdapter.completion` makes all the render
-// decisions (inline label detail, highlighted `documentation` panel, snippet
-// flag) so this provider is a thin Monaco shape-mapper. `triggerCharacters: ["."]`
-// re-fires completion right after a property access, matching the server's
-// `completionProvider.triggerCharacters`.
+// `triggerCharacters: ["."]` re-fires completion right after a property access,
+// as the server's `completionProvider.triggerCharacters` does.
 const COMPLETION_KIND: Record<lsp.CompletionItem["kind"], monaco.languages.CompletionItemKind> = {
   variable: monaco.languages.CompletionItemKind.Variable,
   parameter: monaco.languages.CompletionItemKind.Variable,
@@ -464,7 +490,7 @@ monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
   provideCompletionItems: async (model, position, context) => {
     const items = await lsp.completion(
       model.getValue(),
-      { line: position.lineNumber - 1, character: position.column - 1 },
+      lspPositionOf(position),
       context.triggerCharacter,
       entryKeyOf(model),
     );
@@ -478,46 +504,31 @@ monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
       word.endColumn,
     );
     return {
-      suggestions: items.map((c) => {
-        const isSnippet = c.insertText !== undefined;
-        // A std auto-import item carries both a providing-module `description`
-        // (right-aligned on the row) and the `import { … }` rewrite as
-        // `additionalTextEdits` (applied alongside the name on accept).
-        const label = (c.labelDetail || c.description)
+      suggestions: items.map((c) => ({
+        label: (c.labelDetail || c.description)
           ? { label: c.label, detail: c.labelDetail, description: c.description }
-          : c.label;
-        return {
-          label,
-          kind: COMPLETION_KIND[c.kind],
-          insertText: c.insertText ?? c.label,
-          insertTextRules: isSnippet
-            ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
-            : undefined,
-          documentation: c.documentation
-            ? { value: c.documentation }
-            : undefined,
-          additionalTextEdits: c.additionalTextEdits?.map((e) => ({
-            range: new monaco.Range(
-              e.range.start.line + 1,
-              e.range.start.character + 1,
-              e.range.end.line + 1,
-              e.range.end.character + 1,
-            ),
-            text: e.newText,
-          })),
-          range,
-        };
-      }),
+          : c.label,
+        kind: COMPLETION_KIND[c.kind],
+        insertText: c.insertText ?? c.label,
+        insertTextRules: c.insertText !== undefined
+          ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+          : undefined,
+        documentation: c.documentation ? { value: c.documentation } : undefined,
+        additionalTextEdits: c.additionalTextEdits?.map((e) => ({
+          range: toMonacoRange(e.range),
+          text: e.newText,
+        })),
+        range,
+      })),
     };
   },
 });
 
 // --- folding range provider --------------------------------------------------
 //
-// The only provider here that is not seed-backed: `lsp.foldingRanges` is a
-// token scan, so it works before the checker loads and while it is failing to.
-// Monaco's `FoldingRange` is 1-based and inclusive on both ends, so both lines
-// shift by one from the LSP form the adapter speaks.
+// Folding answers before the checker loads (the lexical scan) and adds the
+// declaration extents once it has. Monaco's `FoldingRange` is 1-based and
+// inclusive on both ends.
 const FOLDING_KIND: Record<string, monaco.languages.FoldingRangeKind> = {
   comment: monaco.languages.FoldingRangeKind.Comment,
   imports: monaco.languages.FoldingRangeKind.Imports,
@@ -534,19 +545,17 @@ monaco.languages.registerFoldingRangeProvider(VL_LANGUAGE_ID, {
 
 // --- signature help provider -------------------------------------------------
 //
-// Mirrors `server.ts`'s `onSignatureHelp` and its trigger set: `(` and `,` open
-// / advance the popup, `)` retriggers so closing an inner call hands the session
-// back to the outer one. Monaco's `SignatureHelpResult` is disposable, and its
-// `ParameterInformation.label` takes the same offset pair into the signature
-// label the protocol does — so the adapter's shape passes straight through.
+// The server's trigger set: `(` and `,` open / advance the popup, `)` retriggers
+// so closing an inner call hands the session back to the outer one.
 monaco.languages.registerSignatureHelpProvider(VL_LANGUAGE_ID, {
   signatureHelpTriggerCharacters: ["(", ","],
   signatureHelpRetriggerCharacters: [")"],
   provideSignatureHelp: async (model, position) => {
-    const result = await lsp.signatureHelp(model.getValue(), {
-      line: position.lineNumber - 1, // Monaco 1-based line → LSP 0-based
-      character: position.column - 1, // Monaco 1-based col → LSP 0-based
-    }, entryKeyOf(model));
+    const result = await lsp.signatureHelp(
+      model.getValue(),
+      lspPositionOf(position),
+      entryKeyOf(model),
+    );
     if (!result) return null;
     return {
       value: {
@@ -715,7 +724,7 @@ const toMarker = (d: VLDiagnostic): monaco.editor.IMarkerData => {
     endColumn: empty ? start.character + 2 : end.character + 1,
     source: d.source,
     // Stash the stable lint `code` so the code-action provider can pick the right
-    // quick-fix from the marker Monaco hands back (mirrors `server.ts`'s cache).
+    // quick-fix from the marker Monaco hands back.
     code: d.code !== undefined ? String(d.code) : undefined,
     tags,
   };
