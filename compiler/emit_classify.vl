@@ -10234,11 +10234,78 @@ export function catListKindOfExpr(exprIx: i32, fnIx: i32) {
   -1
 }
 
-// The concat rep of a `+` `BinExpr` whose operands are both lists of one rep, or -1. Both must
-// resolve to the same rep and the same ref-list slot: two ref lists at different slots have
-// different backing heap types, and `array.copy` between them is a validation error rather
-// than a coercion, so a pairing this declines keeps the refusal it has today.
+// The concat rep of a list `+` `BinExpr`, or -1. Two operands of one rep and slot answer that
+// rep; ref lists at different slots have different heap types, so `array.copy` between them
+// would not validate. Otherwise one operand that widens into the other's rep
+// (`catWidenSideOfBin`) answers the wider operand's kind.
 export function catListKindOfBin(binIx: i32, fnIx: i32) {
+  const k = catSameKindOfBin(binIx, fnIx)
+  if k >= 0 || binIx < 0 { return k }
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const side = catWidenSideOfBin(binIx, fnIx)
+    if side == 2 { return catListKindOfExpr(e.binLeft, fnIx) }
+    if side == 1 { return catListKindOfExpr(e.binRight, fnIx) }
+  }
+  -1
+}
+
+// The ref-list row a list `+` concatenates at, or 0 for a rep that is not slot-keyed: the
+// widened-into operand's row for a mixed pair, else `listOpSlotOfBin`'s.
+export function catSlotOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if catSameKindOfBin(binIx, fnIx) < 0 {
+      let into = -1
+      const side = catWidenSideOfBin(binIx, fnIx)
+      if side == 2 { into = e.binLeft }
+      if side == 1 { into = e.binRight }
+      if into >= 0 {
+        const s = refListSlotOfExpr(into, fnIx)
+        if s >= 0 { return s }
+        return 0
+      }
+    }
+  }
+  listOpSlotOfBin(binIx, fnIx)
+}
+
+// The operand of a list `+` over two reps that is copied into the other's before the concat:
+// 1 the left, 2 the right, 0 neither. The checker types the concat at the operand the other
+// is assignable to, so exactly one direction can hold.
+export function catWidenSideOfBin(binIx: i32, fnIx: i32): i32 {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp != "+" { return 0 }
+    if catSameKindOfBin(binIx, fnIx) >= 0 { return 0 }
+    if catOperandWidensTo(e.binRight, e.binLeft, fnIx) { return 2 }
+    if catOperandWidensTo(e.binLeft, e.binRight, fnIx) { return 1 }
+  }
+  0
+}
+
+// Whether list `src` reaches list `dst`'s rep by an element-converting copy: boxed into a
+// union element (`spreadSrcBoxes`), or one of the lossless scalar widenings.
+function catOperandWidensTo(src: i32, dst: i32, fnIx: i32): boolean {
+  const dk = catListKindOfExpr(dst, fnIx)
+  if dk == LBK_REF {
+    const row = refListSlotOfExpr(dst, fnIx)
+    if row < 0 || row >= rlElemKindTbl.length { return false }
+    if rlElemKindTbl[row] != RLK_UNION { return false }
+    return spreadSrcBoxes(src, row, fnIx) == 1
+  }
+  const sk = catListKindOfExpr(src, fnIx)
+  const sp = tyArrayElemPrimName(nodeTyIxOf(src))
+  const fromI32 = sk == LBK_I32_LIST && sp == "i32"
+  if dk == LBK_F64_LIST {
+    return fromI32 || (sk == LBK_F32_LIST && sp == "f32")
+  }
+  if dk == LBK_I64_LIST { return fromI32 }
+  false
+}
+
+// `catListKindOfBin` over two operands already of one rep and one ref-list row.
+function catSameKindOfBin(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "+" {
@@ -42850,6 +42917,10 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       if cl != "" {
         if cl == refListElemNameOfExpr(e.binRight, fnIx) { return cl }
       }
+      // A mixed pair concatenates at the row the narrower operand is copied into.
+      const side = catWidenSideOfBin(exprIx, fnIx)
+      if side == 2 { return cl }
+      if side == 1 { return refListElemNameOfExpr(e.binRight, fnIx) }
     }
   }
   ""
