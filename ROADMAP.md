@@ -1878,6 +1878,11 @@ in-language GC knobs.
 ## Track A — Type system (`typecheck.vl`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
+- 💤 **A-LISTAS. List `as` conversion (`b as K[]`) — deferred until someone asks.** Owner ruling
+  (c) on #3792: `if (b is K[])` narrows only the element reads of `b`, and delivering `b` as a
+  `K[]` is a check error that names the `map` copy ([D4928](internals/inventory/D4928.md)). A
+  list `as` would be that copy spelled shorter; nothing needs it yet.
+
 - ✅ **A-OPMOD. CLOSED 2026-09-06 ([D1770](internals/inventory/D1770.md)) — both the
   checker's and the emitter's lookups asked the UNMANGLED name a merge had renamed, and
   both now resolve through the one key resolver the UFCS gate already used. The mangling
