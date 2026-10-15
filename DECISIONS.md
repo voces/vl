@@ -10284,10 +10284,28 @@ the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests
 and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
 string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every list depth
 (D4914), and two atom-list arms sharing a tag test their atoms (D4938). An arm in a disjoint
-rep fits when it is empty (D4915): a local or global binding it narrows is re-boxed as an empty
-list of the tested arm, so the then-branch reads that arm's rep; a capture, field or element
-receiver cannot be stored back and still traps on its narrowed read (D4939). `is K[]` with a
-numeric `K` over a union with no `K[]` arm is still refused (D4778).
+rep fits when it is empty (D4915).
+
+**An `is` that fits that way stores a new empty list back into the place (D4949).** The
+local, global, record field, list element or captured variable it tested now holds an empty
+list of the tested arm, so the then-branch reads, pushes into and delivers that arm's rep. A
+captured variable a closure tests so becomes a shared cell, as one a closure assigns does.
+
+```vl
+const e: f64[] = []
+const b: { items: f64[] | string[] } = { items: e }
+if b.items is string[] { b.items.push("v") }
+print(b.items.length)   // 1
+print(e.length)         // 0
+```
+
+The old list cannot change rep in place, since another reference typed as the other arm (`e`
+here) would then hold a `string`. Nor can the push go through the old list, which cannot hold
+the new element. The price: after such an `is`, the place and any earlier reference to the old
+empty list no longer share writes, so an `e.push(1.5)` after the test is not seen through
+`b.items`, where with no `is` it would be. A place the `is` has no store for still reads an
+empty list of the tested arm (D4939).
+`is K[]` with a numeric `K` over a union with no `K[]` arm is still refused (D4778).
 
 ## A reassigned function binding called at several types holds one closure per type (owner ruling, 2026-10-15) — D3975
 
