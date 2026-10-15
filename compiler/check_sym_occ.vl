@@ -1,0 +1,384 @@
+// `check_sym_occ.vl` — the editor's symbol rows as the checker writes them. `symDecl` and
+// `symUse` record each binding and each identifier occurrence, `symResolve` finds a name's
+// declaration through the open decl-scope stack, and a use before its module-level
+// declaration waits in the pending list until `symFlushPending`. The open-scope span stack
+// bounds where a binding is visible, and tokens past the generated-walker mark are skipped.
+// `symOccReset` clears the rows per program; `symScopePush`, `symSpanPush` and
+// `symScopePop` follow the checker's scopes.
+
+import { Member, OptMember, P, declNameTokOf, i32ToStr, nodeToks } from "./ast"
+import { narDeclaredTy } from "./check_nar_bank"
+import {
+  SYM_MEM_METHOD,
+  symBindKind,
+  symBindNode,
+  symBindType,
+  symEnabled,
+  symMemCol,
+  symMemEndCol,
+  symMemLine,
+  symMemNode,
+  symMemTy,
+  symOccDecl,
+  symOccIsDecl,
+  symOccTok,
+  symOccTy,
+  symVisEC,
+  symVisEL,
+  symVisKind,
+  symVisName,
+  symVisNode,
+  symVisSC,
+  symVisSL,
+} from "./check_state"
+
+export let symDeclScope: {[string]: i32}[] = []
+
+// The open-scope span stack, pushed and popped in lockstep with `symDeclScope`: the top is
+// the span of the scope a `symDecl` binds into, and a narrowing-only scope pushes a
+// full-file sentinel. `SCOPE_EOF` is past any real source line, so the global scope holds
+// every in-file position while staying the loosest, and an inner scope always shadows it.
+export const SCOPE_EOF = 1000000000
+export let scopeSL: i32[] = []
+export let scopeSC: i32[] = []
+export let scopeEL: i32[] = []
+export let scopeEC: i32[] = []
+
+// The first token of the generated walkers, or -1 before the driver appends them. The walker
+// fragment is parsed onto the end of the token stream, so one comparison separates a finding
+// about the user's source from one about code they never wrote. The style tier is filtered out;
+// errors are not, since a diagnostic inside a walker means the generator emitted something bad.
+export let jwGenTokStart = -1
+export function jwSetGenTokStart(t: i32): i32 {
+  jwGenTokStart = t
+  0
+}
+export function jwTokIsGenerated(tok: i32): boolean {
+  if jwGenTokStart < 0 { return false }
+  tok >= jwGenTokStart
+}
+
+// ── LSP symbol-table recording (no-ops when `symEnabled == 0`) ───────────────
+// A binding's type-arena index, retained by `bindingId` (its decl node index) so hover can render
+// it after the scope closed. The last write for a node wins — a re-check during demand-inference
+// overwrites with the resolved type.
+export function symRetainType(declNode: i32, ty: i32, kind: i32) {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindNode[i] == declNode {
+      symBindType[i] = ty
+      symBindKind[i] = kind
+      return 0
+    }
+    i = i + 1
+  }
+  symBindNode.push(declNode)
+  symBindType.push(ty)
+  symBindKind.push(kind)
+  0
+}
+
+// A declaration's anchor token: its own name token from the parser's side table, falling back to
+// the node anchor when unset. The one place the three recorders agree on which token a binding
+// answers at, so a test about that token (`jwTokIsGenerated`) reads the same value everywhere.
+function symDeclTok(declNode: i32) {
+  const named = declNameTokOf(declNode)
+  if named >= 0 { return named }
+  if declNode >= 0 && declNode < nodeToks.length { return nodeToks[declNode] }
+  -1
+}
+
+// Stamp a binding's visibility scope for the position query, from open-scope span `spanIx`, a
+// `scope*` stack index; skipped when the index is out of range. The first stamp per binding wins,
+// so a demand-inference re-entry — which runs the body from an artificially deep stack — cannot
+// clobber a top-level function's correct global span.
+export function symStampVis(
+  name: string,
+  declNode: i32,
+  kind: i32,
+  spanIx: i32,
+) {
+  if spanIx < 0 || spanIx >= scopeSL.length { return 0 }
+  if jwTokIsGenerated(symDeclTok(declNode)) { return 0 }
+  let k = 0
+  while k < symVisNode.length {
+    if symVisNode[k] == declNode { return 0 }
+    k = k + 1
+  }
+  symVisName.push(name)
+  symVisNode.push(declNode)
+  symVisKind.push(kind)
+  symVisSL.push(scopeSL[spanIx])
+  symVisSC.push(scopeSC[spanIx])
+  symVisEL.push(scopeEL[spanIx])
+  symVisEC.push(scopeEC[spanIx])
+  0
+}
+
+// Record a declaration: bind `name → declNode` in the innermost decl scope, emit the declaration's
+// own occurrence anchored at its name token, and retain its type. `declNode` is the bindingId and
+// `nameTok` its identifier token, from the parser's `declNameTok` side table, falling back to the
+// node anchor when unset.
+export function symDecl(name: string, declNode: i32, ty: i32, kind: i32) {
+  if symDeclScope.length > 0 {
+    const top = symDeclScope.length - 1
+    symDeclScope[top][name] = declNode
+  }
+  if symEnabled == 0 { return 0 }
+  if symNameIsMinted(name) { return 0 }
+  symRetainType(declNode, ty, kind)
+  // Visibility for completion: a binding is visible across its own innermost scope. Stamped
+  // before the occurrence dedup so a demand-inference re-check refreshes the span.
+  symStampVis(name, declNode, kind, scopeSL.length - 1)
+  symOccPushDecl(declNode)
+}
+
+// Record the declaration occurrence of `declNode`, once per source token: a function body
+// re-checked during demand-inference would otherwise stamp the same identifier twice. A
+// declaration is never narrowed — it is the binding, and its type is the one `symRetainType`
+// just banked. See `symOccTy` in `check_state`.
+function symOccPushDecl(declNode: i32) {
+  const tok = symDeclTok(declNode)
+  if symOccSkipTok(tok) { return 0 }
+  symOccTok.push(tok)
+  symOccRecordTok(tok)
+  symOccDecl.push(declNode)
+  symOccIsDecl.push(1)
+  symOccTy.push(-1)
+  0
+}
+
+// Token-keyed membership set mirroring `symOccTok`, so the dedup guard is O(1)
+// instead of a linear scan over every prior occurrence (which made recording the
+// occurrence list O(n²)). Reset in lockstep with `symOccTok` (see the check
+// preamble) and inserted into at every occurrence append (`symOccRecordTok`).
+export let symOccTokSet: {[string]: boolean} = Map()
+
+// Record token `tok` into the membership set (mirrors a `symOccTok.push(tok)`).
+// Negative tokens are never deduped, matching `symOccHasTok`, so they are skipped.
+function symOccRecordTok(tok: i32) {
+  if tok < 0 { return 0 }
+  symOccTokSet[i32ToStr(tok)] = true
+  0
+}
+
+// Whether an occurrence at token `tok` must NOT be recorded: it is already recorded (the dedup),
+// or the token is GENERATED. The deep-`is` second pass splices walkers onto the token stream and
+// re-checks, and the editor must not colour, hint or complete over code the author never wrote —
+// the same rule the style tier applies through `jwTokIsGenerated`.
+function symOccSkipTok(tok: i32) {
+  if jwTokIsGenerated(tok) { return true }
+  symOccHasTok(tok)
+}
+
+// Whether an occurrence at token `tok` is already recorded (the dedup guard).
+// O(1) via `symOccTokSet`, kept in sync with `symOccTok` at every append/reset.
+function symOccHasTok(tok: i32) {
+  if tok < 0 { return false }
+  // A member-call cannot be a bare tail expression (the emitter rejects it as a
+  // statement) — bind the `.has` result first (see `sliceNode` in format.vl).
+  const present = symOccTokSet.has(i32ToStr(tok))
+  present
+}
+
+// Like `symDecl`, but binds into the enclosing decl scope, one level out from the innermost. A
+// function name lives in the scope surrounding its body, yet its body scope is already pushed when
+// the params and name are processed, so its binding must land one frame up to resolve recursive
+// and sibling references.
+export function symDeclInOuter(
+  name: string,
+  declNode: i32,
+  ty: i32,
+  kind: i32,
+) {
+  const outer = symDeclScope.length - 2
+  if outer >= 0 {
+    symDeclScope[outer][name] = declNode
+  } else if symDeclScope.length > 0 {
+    symDeclScope[symDeclScope.length - 1][name] = declNode
+  }
+  if symEnabled == 0 { return 0 }
+  symRetainType(declNode, ty, kind)
+  // A function name is visible in the enclosing scope, where it binds, not its body — the
+  // decl-scope frame is one out, so its span is one below the top. Stamped before the occurrence
+  // dedup, as in `symDecl`.
+  let outerSpan = scopeSL.length - 2
+  if outerSpan < 0 { outerSpan = scopeSL.length - 1 }
+  symStampVis(name, declNode, kind, outerSpan)
+  symOccPushDecl(declNode)
+}
+
+// Resolve `name` to its binding's decl node through the decl-scope chain
+// (innermost first — mirrors `lookup`), or `-1` if it is not a tracked binding
+// (a builtin/intrinsic, or an import seeded with no decl node).
+export function symResolve(name: string) {
+  let i = symDeclScope.length - 1
+  while i >= 0 {
+    if symDeclScope[i].has(name) { return symDeclScope[i][name] ?? (-1) }
+    i = i - 1
+  }
+  -1
+}
+
+// A name the compiler minted (`$` is not an identifier character, D1991's `$scrut…`): no
+// editor feature may show, colour or complete it.
+export function symNameIsMinted(name: string) {
+  name.length > 0 && name[0] == '$'
+}
+
+// Record a use occurrence of the identifier node `useNode`, whose anchor token is the identifier.
+// It resolves through the decl-scope chain, and a name with no tracked binding records nothing.
+// `curTy` is retained per occurrence (`symOccTy`) so a position query can render the narrowed type
+// — only under a live narrowing shadow, so an un-narrowed use stores -1 and hovers as its final type.
+export function symUse(useNode: i32, name: string, curTy: i32) {
+  if symEnabled == 0 { return 0 }
+  if symNameIsMinted(name) { return 0 }
+  const decl = symResolve(name)
+  if decl < 0 {
+    symPendNode.push(useNode)
+    symPendName.push(name)
+    return 0
+  }
+  symUseDecl(useNode, name, curTy, decl)
+}
+
+// Uses whose name has no recorded binding where they stand: a read of a module binding declared
+// below it. `symFlushPending` resolves them against the module frame after the walk.
+export let symPendNode: i32[] = []
+export let symPendName: string[] = []
+
+export function symFlushPending() {
+  if symEnabled == 0 || symDeclScope.length == 0 { return 0 }
+  let i = 0
+  while i < symPendNode.length {
+    const decl = symDeclScope[0][symPendName[i]] ?? -1
+    if decl >= 0 { symUseDecl(symPendNode[i], symPendName[i], -1, decl) }
+    i = i + 1
+  }
+  symPendNode = []
+  symPendName = []
+  0
+}
+
+// Record the use `useNode` of `name` as an occurrence of the binding declared at `decl`.
+export function symUseDecl(useNode: i32, name: string, curTy: i32, decl: i32) {
+  let tok = -1
+  if useNode >= 0 && useNode < nodeToks.length { tok = nodeToks[useNode] }
+  if symOccSkipTok(tok) { return 0 }
+  symOccTok.push(tok)
+  symOccRecordTok(tok)
+  symOccDecl.push(decl)
+  symOccIsDecl.push(0)
+  let occTy = -1
+  if curTy >= 0 {
+    if narDeclaredTy(name, -1) >= 0 { occTy = curTy }
+  }
+  symOccTy.push(occTy)
+  0
+}
+
+// Record a member-access node's resolved type + its property-name span, keyed by
+// the node (last write wins — a re-check during demand-inference overwrites the
+// hole with the pinned type). A no-op unless `symEnabled` and the type resolved.
+// Returns `ty` so it can wrap a member arm's return: `return symMem(ix, ft)`.
+export function symMem(ix: i32, ty: i32) {
+  if symEnabled == 0 { return ty }
+  if ty < 0 { return ty }
+  if ix < 0 || ix >= nodeToks.length { return ty }
+  const tk = nodeToks[ix]
+  if tk < 0 || tk >= P.toks.length { return ty }
+  // Generated walker code, on the same rule as `symOccSkipTok`.
+  if jwTokIsGenerated(tk) { return ty }
+  const t = P.toks[tk]
+  // Property-name length, to bound the span the cursor must fall within.
+  let pl = 0
+  const nd = P.nodes[ix]
+  if nd is Member { pl = nd.memProp.length }
+  else if nd is OptMember { pl = nd.omProp.length }
+  let i = 0
+  while i < symMemNode.length {
+    if symMemNode[i] == ix {
+      symMemTy[i] = ty
+      return ty
+    }
+    i = i + 1
+  }
+  symMemNode.push(ix)
+  symMemTy.push(ty)
+  symMemLine.push(t.line)
+  symMemCol.push(t.col)
+  symMemEndCol.push(t.col + pl)
+  ty
+}
+
+// Record a method-call callee member name (`xs.push`, `m.set`, `s.slice`) for semantic tokens. A
+// method call's callee never flows through the member-read arm, the builtin arms typing and
+// returning it directly, so `symMem` never sees it; this records its property-name span as a
+// `method`. A later `symMem` for the same node overwrites the type, so member hover still works.
+export function symMemMethod(ix: i32) {
+  if symEnabled == 0 { return ix }
+  if ix < 0 || ix >= nodeToks.length { return ix }
+  const tk = nodeToks[ix]
+  if tk < 0 || tk >= P.toks.length { return ix }
+  // Generated walker code, on the same rule as `symOccSkipTok`.
+  if jwTokIsGenerated(tk) { return ix }
+  const t = P.toks[tk]
+  let pl = 0
+  const nd = P.nodes[ix]
+  if nd is Member { pl = nd.memProp.length }
+  else if nd is OptMember { pl = nd.omProp.length }
+  let i = 0
+  while i < symMemNode.length {
+    if symMemNode[i] == ix { return ix }
+    i = i + 1
+  }
+  symMemNode.push(ix)
+  symMemTy.push(SYM_MEM_METHOD)
+  symMemLine.push(t.line)
+  symMemCol.push(t.col)
+  symMemEndCol.push(t.col + pl)
+  ix
+}
+
+// Clear the occurrence rows' sync set, the pending uses and both scope stacks, then open the
+// module scope: a decl-scope map always, and the full-file span when symbols are collected.
+export function symOccReset() {
+  symOccTokSet = Map()
+  symPendNode = []
+  symPendName = []
+  symDeclScope = []
+  scopeSL = []
+  scopeSC = []
+  scopeEL = []
+  scopeEC = []
+  symDeclScope.push(Map())
+  if symEnabled != 0 { symSpanPush(1, 0, SCOPE_EOF, 0) }
+  0
+}
+
+// Open a scope's decl-scope map.
+export function symScopePush() {
+  symDeclScope.push(Map())
+  0
+}
+
+// Push the open scope's span, from its first token's position to the end of its last.
+export function symSpanPush(startL: i32, startC: i32, endL: i32, endC: i32) {
+  scopeSL.push(startL)
+  scopeSC.push(startC)
+  scopeEL.push(endL)
+  scopeEC.push(endC)
+  0
+}
+
+// Close the innermost scope's decl-scope map and, when symbols are collected, its span.
+export function symScopePop() {
+  if symDeclScope.length > 0 { symDeclScope.pop() }
+  if symEnabled != 0 && scopeSL.length > 0 {
+    scopeSL.pop()
+    scopeSC.pop()
+    scopeEL.pop()
+    scopeEC.pop()
+  }
+  0
+}
