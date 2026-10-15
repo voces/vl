@@ -26850,23 +26850,55 @@ function listJoinWidenCheck(at: i32, op: i32, j: i32) {
         if listJoinStorageDiffers(src, dst, 1) {
           hint = containerWidenCopyHint(src, dst)
         }
-        tErr(
-          tyToStr(src)
-            + " is not "
-            + tyToStr(dst)
-            + ": this join would hold both, and a container never widens implicitly. Its "
-            + "elements would be stored differently, so it would be a copy, and a write through "
-            + "either list would not reach the other. Build it as `"
-            + tyToStr(sourceBuildTy(dst))
-            + "`"
-            + hint,
-          lf,
-        )
+        ljwRefuse(src, dst, sourceBuildTy(dst), hint, lf)
       }
     }
     i = i + 1
   }
   0
+}
+
+// The join refusal: `src` would be held as `dst`, and `build` is what the source should be built as.
+function ljwRefuse(src: i32, dst: i32, build: i32, hint: string, at: i32) {
+  tErr(
+    tyToStr(src)
+      + " is not "
+      + tyToStr(dst)
+      + ": this join would hold both, and a container never widens implicitly. Its "
+      + "elements would be stored differently, so it would be a copy, and a write through "
+      + "either list would not reach the other. Build it as `"
+      + tyToStr(build)
+      + "`"
+      + hint,
+    at,
+  )
+}
+
+// Refuses a spread or list `+` operand `op` copied into a list of element `de` when a level
+// BELOW the copied one is stored differently: the copy converts its own level's scalars
+// (D965), but an element list would have to be copied too (D4861).
+function ljwCopiedLevelCheck(at: i32, op: i32, de: i32) {
+  const p = cwPeel(op)
+  if p < 0 || p >= P.nodes.length || de < 0 || de >= T.tys.length { return 0 }
+  const n = P.nodes[p]
+  if n is ArrayLit {
+    for el in n.arrElems {
+      const en = P.nodes[el]
+      if en is Spread {
+        ljwCopiedLevelCheck(at, en.spdArg, de)
+      } else {
+        listJoinWidenCheck(at, el, de)
+      }
+    }
+    return 0
+  }
+  if i32ListHas(ljwReported, p) { return 0 }
+  const lt = nonNullTy(nodeTyOf(p))
+  if lt < 0 || lt >= T.tys.length { return 0 }
+  const se = arrElemTyOrNone(lt)
+  if se < 0 || !listJoinStorageDiffers(se, de, 8) { return 0 }
+  ljwReported.push(p)
+  ljwRefuse(nonNullTy(se), nonNullTy(de), sourceBuildTy(mkArrayTy(de)), "", p)
 }
 
 // Walk the join sites the occurrence index collected.
@@ -26888,8 +26920,10 @@ function rcwPendJoins() {
               // A spread operand's elements join the literal's element type: the operand list
               // is delivered into the literal's own list type.
               rcwPendJoinOperand(el.spdArg, jt)
+              ljwCopiedLevelCheck(at, el.spdArg, at2.aElem)
             } else {
               rcwPendJoinOperand(n.arrElems[e], at2.aElem)
+              listJoinWidenCheck(at, n.arrElems[e], at2.aElem)
             }
             e = e + 1
           }
@@ -26908,6 +26942,12 @@ function rcwPendJoins() {
             listJoinWidenCheck(at, rcwBlockTail(n.ifElse), jt)
           }
         }
+      }
+    } else if n is BinExpr && n.binOp == "+" {
+      const le = if jt >= 0 && jt < T.tys.length { arrElemTyOrNone(jt) } else { -1 }
+      if le >= 0 {
+        ljwCopiedLevelCheck(at, n.binLeft, le)
+        ljwCopiedLevelCheck(at, n.binRight, le)
       }
     } else if n is BinExpr {
       if jt >= 0 {
