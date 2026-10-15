@@ -41,7 +41,7 @@ use crate::inline::{
     assemble, cast_if, crossing, encode_sub, finish_body, gc_op, local_op, record_refusal, ref_ty,
     type_section, ASite, AUse, ArrKind, Opnd, Scan,
 };
-use crate::multivalue::{put_sleb, put_uleb, BodyMove, Num};
+use crate::multivalue::{put_sleb, put_uleb, BodyMove, Num, Scalarized};
 use crate::upos;
 
 const NONE: u32 = u32::MAX;
@@ -170,6 +170,7 @@ pub(crate) fn flat_step(
     rebox_all: bool,
     spill_all: bool,
     name: &dyn Fn(u32) -> String,
+    scalarized: &dyn Fn(&[u8]) -> Option<Scalarized>,
 ) -> Option<(Vec<u8>, Vec<BodyMove>)> {
     let mut cands: Vec<u32> = s.arrays.keys().copied().collect();
     cands.sort_unstable();
@@ -294,7 +295,7 @@ pub(crate) fn flat_step(
         // Does the multi-value step take apart every read counted free?
         let relied = |a: &u32| flat.contains_key(a) && !rebox_all;
         if held.iter().any(|(a, ..)| relied(a)) || args.iter().any(|(a, ..)| relied(a)) {
-            let took = crate::multivalue::scalarized(&out);
+            let took = scalarized(&out);
             let mut left: HashSet<u32> = HashSet::new();
             for &(a, f, l) in held.iter().filter(|(a, ..)| relied(a)) {
                 let ok = took.as_ref().is_some_and(|(locals, _)| {

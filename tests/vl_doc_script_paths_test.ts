@@ -37,7 +37,13 @@ function markdownFiles(): string[] {
   return out.sort();
 }
 
+// A cargo build output (`scripts/vl-host/target/release/vl`) exists only after a build, which a
+// fresh checkout such as CI's has not run: it names a real path when its crate exists.
+const CARGO_OUTPUT = /^(.*?)\/target(\/|$)/;
+
 function exists(p: string): boolean {
+  const cargo = CARGO_OUTPUT.exec(p);
+  if (cargo) return exists(`${cargo[1]}/Cargo.toml`);
   try {
     Deno.statSync(p);
     return true;

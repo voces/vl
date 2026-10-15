@@ -1,59 +1,18 @@
-//! The `-O`/`-O3` multi-value step (lane MV, D3625; the owner's ruling (B) on small record
-//! results): a call whose small record result is only read field by field calls a twin of its
-//! producer that returns the fields as wasm multi-value results, so no `struct.new` is made.
+//! The host's half of the `-O`/`-O3` multi-value step (lane MV, D3625). The step itself, a
+//! call whose small record result is only read field by field calling a twin that returns
+//! the fields as wasm multi-value results, is the compiler's (`optMultivalue` in
+//! `compiler/opt_multivalue.vl`, rung R5 of `docs/internals/optimizer-in-vl.md`).
 //!
-//! The step is a module-to-module rewrite run before the escape step. Its unit is the CALL
-//! SITE, which is what the escape step's inlining cannot express (`--no-inline` is per callee,
-//! and its escape test is per wasm type: D3262, D3263).
-//!
-//! **What qualifies.** A record is a struct type that no `struct.set` (or atomic write) anywhere
-//! in the module can reach. A value of such a type cannot change after it is made, so reading
-//! its fields early reads what a later `struct.get` would. As an argument it may have 1 to
-//! `MV_ARG_MAX_FIELDS` fields, each a number or a reference (passed on as the same object); as a
-//! result, 1 to `MV_RECORD_MAX_FIELDS` fields, each an `i32`, `i64`, `f32` or `f64` (D3754). When every struct type sits in one rec
-//! group (VL's emitter puts them there), two type indices are never one wasm type, so a write
-//! reaches the type it names and that type's subtyping component (a subtype's value stands
-//! where its supertype is expected): sunpa's `V3` is a declared subtype of a `{ x, y }` record
-//! and stays a record while neither is written (D3630). Otherwise a write reaches every type of
-//! its shape, and a type in any subtyping relation is refused. `$VL_MV_EXPLAIN=1` prints why
-//! each record type and producer was taken or refused.
-//! When types are judged by index, a record type that IS written is still taken apart as a
-//! fresh argument (D3765): a `struct.new` handed straight to a parameter its callee uses
-//! field-only has no other reference, so no write can reach it while the call runs. Only that argument, and a field
-//! parameter of a twin it fills, qualifies; a producer's result, a merge, a local and an exit
-//! of a written type keep the struct.
-//! A producer is a function whose one result is a non-null reference to a record. A record
-//! value is used *field-only* when it reaches nothing but `struct.get`s, a field-only local,
-//! a field-only parameter of another call, or (inside a result twin) the twin's own exit. A
-//! local is field-only, and held as one wasm local per field, when every value it is set to
-//! is a producer's result, a `struct.new`, a merge or another field-only local, and every read
-//! of it is a field use. Identity (`ref.eq`), a cast, a store, a capture and an ordinary
-//! argument all keep the struct: they are none of these uses.
-//!
-//! **Merges (D3766).** An `if`/`else` whose one result is a non-null record and that no
-//! branch targets is a merge. One whose value reaches a field use leaves the fields instead:
-//! its block type turns multi-value, and each arm leaves fields (a twin call, a deleted
-//! `struct.new`, a field-only local's slots, or any other record read field by field at the
-//! arm's end). A local read as an arm's value is a field use when the merge's own value is a
-//! `struct.get`'s or a field-only local's.
-//!
-//! **The twins.** A twin of `f` is keyed by `(f, S, r)`: `S` the record parameters it takes
-//! as fields (a parameter qualifies when `f` uses it field-only), `r` whether it returns its
-//! record as fields. A call site picks the twin its own arguments and use allow, so the same
-//! producer allocates where its result escapes and not where it is read. A returned
-//! `struct.new` is deleted (its fields are already on the stack in order); a returned value of
-//! any other origin is read field by field at the return. Twins are made on demand by a
-//! worklist, chains included (`qmul(qnorm(a), b)` passes `qnorm`'s fields straight on).
-//!
-//! **What is left alone.** A function with a `br_if`/`br_table`/`br_on_*`/`try` that can leave
-//! it with its result, or a `return_call_ref`/`return_call_indirect`, gets no result twin, and
-//! nor does one that tail-calls such a function. A local whose type is nullable is scalarized
-//! only when its first use is a set in the function's own frame. Any module this cannot parse
-//! or validate, or whose twins would add more than the growth bound, is left untouched.
+//! What stays here is the step's analysis as the inline-record and list-flattening steps read
+//! it: `field_facts` names the parameters a callee uses field by field and the record types
+//! no write reaches, so those steps keep a record the multi-value step would take apart.
+//! A record is a struct type no `struct.set` (or atomic write) can reach; judged by index
+//! when every struct type sits in one rec group, by shape otherwise (D3630, D3765). Beside it
+//! are the wasm encoding helpers (`put_uleb`, `put_sleb`, `put_val`), the body-move map
+//! (`BodyMove`) and the name-section reader the other steps share.
 
-use crate::{upos, urange};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
+use crate::urange;
+use std::collections::{HashMap, HashSet};
 use wasmparser::{
     AbstractHeapType, CompositeInnerType, FuncValidatorAllocations, HeapType, Operator, Parser,
     Payload, StorageType, TypeRef, UnpackedIndex, ValType, ValidPayload, Validator, WasmFeatures,
@@ -78,11 +37,6 @@ pub const MV_ARG_MAX_FIELDS: usize = 64;
 /// function's record parameters, in order, may be taken as fields only while its own
 /// parameters plus their fields stay within it, so every twin of it does.
 const MV_TWIN_MAX_PARAMS: usize = 128;
-
-/// At most this many twins, and at most `MV_GROWTH_FLOOR` plus half the code section in their
-/// bodies; a module past either gets no step at all.
-const MV_MAX_TWINS: usize = 4096;
-const MV_GROWTH_FLOOR: usize = 64 << 10;
 
 const NONE: u32 = u32::MAX;
 
@@ -135,37 +89,15 @@ fn result_shape(s: &Shape) -> bool {
 enum Next {
     Other,
     StructGet(u32, u32),
-    LocalSet(u32),
-    Exit,
-    /// The `else` or `end` that closes an arm of an `if`.
-    ArmEnd,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Call(u32),
     ReturnCall(u32),
-    StructNew(u32),
     LocalGet(u32),
     LocalSet(u32),
     LocalTee(u32),
-    /// `return`, the body's final `end`, or a `br` to the function's own frame: an op that
-    /// hands the top of the stack back as the function's result.
-    Exit,
-    /// The `end` of an `if`/`else` whose one result is a non-null record and that no branch
-    /// targets: the value either arm leaves (`Body::merges`).
-    Merge(u32),
-}
-
-/// An `if`/`else` choosing between two records: its ops, and the op that leaves each arm's
-/// value (`NONE` when unknown).
-#[derive(Clone, Debug)]
-struct Merge {
-    if_k: u32,
-    else_k: u32,
-    end_k: u32,
-    t: u32,
-    tails: [u32; 2],
 }
 
 /// One recorded op of a body: its ordinal among the body's ops and what the analysis needs.
@@ -174,12 +106,7 @@ struct Ins {
     k: u32,
     kind: Kind,
     reach: bool,
-    /// Control depth before the op: 1 is the function's own frame.
-    depth: u32,
     next: Next,
-    /// The ordinal of the op that pushed the value this op consumes from the top, for a
-    /// `local.set`/`local.tee` and an exit; `NONE` when unknown or from another frame.
-    top: u32,
     /// For a call: the producers of its arguments, as a range into `Body::args`.
     args: (u32, u32),
 }
@@ -187,18 +114,12 @@ struct Ins {
 struct Body {
     /// The body's bytes in the module: locals header and operators.
     range: (usize, usize),
-    ops_start: usize,
     locals: Vec<(u32, ValType)>,
     ins: Vec<Ins>,
     args: Vec<u32>,
     /// Some branch other than a plain `br` can leave the function with its result, or a
     /// `return_call_ref`/`return_call_indirect` does: no result twin.
     exits_otherwise: bool,
-    merges: Vec<Merge>,
-    /// Per `else` or `end` closing an arm of a merge: the merge.
-    arm_end: HashMap<u32, usize>,
-    /// Per merge `end`: the merge.
-    merge_at: HashMap<u32, usize>,
 }
 
 impl Body {
@@ -213,8 +134,7 @@ impl Body {
     }
 }
 
-struct Module<'a> {
-    bytes: &'a [u8],
+struct Module {
     n_imports: u32,
     /// Per function (imports first): its type index.
     func_type: Vec<u32>,
@@ -242,7 +162,7 @@ struct Module<'a> {
     names: bool,
 }
 
-impl Module<'_> {
+impl Module {
     fn sig(&self, f: u32) -> &(Vec<ValType>, Vec<ValType>) {
         self.func_sig[self.func_type[f as usize] as usize]
             .as_ref()
@@ -271,21 +191,6 @@ impl Module<'_> {
     fn is_fresh_only(&self, t: u32) -> bool {
         self.fresh.get(t as usize).is_some_and(|s| s.is_some())
     }
-    /// The type of local `i` of defined function `f`.
-    fn local_type(&self, f: u32, i: u32) -> Option<ValType> {
-        let params = &self.sig(f).0;
-        if (i as usize) < params.len() {
-            return Some(params[i as usize]);
-        }
-        let mut at = params.len() as u32;
-        for &(n, t) in &self.body(f).locals {
-            if i < at + n {
-                return Some(t);
-            }
-            at += n;
-        }
-        None
-    }
 }
 
 pub(crate) fn concrete_index(h: HeapType) -> Option<u32> {
@@ -298,9 +203,8 @@ pub(crate) fn concrete_index(h: HeapType) -> Option<u32> {
 
 /// Parse and validate `bytes`, recording what the step reads. `None` when the module does not
 /// parse or validate, or holds no record a producer returns or a parameter takes.
-fn scan(bytes: &[u8]) -> Option<Module<'_>> {
+fn scan(bytes: &[u8]) -> Option<Module> {
     let mut m = Module {
-        bytes,
         n_imports: 0,
         func_type: Vec::new(),
         func_sig: Vec::new(),
@@ -456,21 +360,13 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
         let span = urange(body.range());
         let mut b = Body {
             range: (span.start, span.end),
-            ops_start: upos(lr.original_position()),
             locals,
             ins: Vec::new(),
             args: Vec::new(),
             exits_otherwise: false,
-            merges: Vec::new(),
-            arm_end: HashMap::new(),
-            merge_at: HashMap::new(),
         };
-        // Per open control frame (the function's own first): the merge it may be, as
-        // `(if, else, then-arm value, record type, a branch targets it)`.
-        let mut frames: Vec<Option<(u32, u32, u32, u32, bool)>> = vec![None];
         let f = fi;
         fi += 1;
-        let n_params = m.sig(f).0.len() as u32;
         // Whether local `i` holds a record reference (only those ops are recorded).
         let mut local_rec: Vec<bool> = m
             .sig(f)
@@ -482,7 +378,6 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
             let r = m.record_of(t).is_some();
             local_rec.extend(std::iter::repeat_n(r, n as usize));
         }
-        let _ = n_params;
         // The op that pushed each operand-stack position.
         let mut owner: Vec<u32> = Vec::new();
         // Per open frame: the ordinal its current segment's ops start at.
@@ -515,62 +410,21 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                     struct_type_index,
                     field_index,
                 } => Next::StructGet(*struct_type_index, *field_index),
-                Operator::LocalSet { local_index } => Next::LocalSet(*local_index),
-                Operator::Return => Next::Exit,
-                Operator::End if depth == 1 => Next::Exit,
-                Operator::Br { relative_depth } if *relative_depth == fn_frame => Next::Exit,
-                Operator::Else => Next::ArmEnd,
-                Operator::End if matches!(frames.last(), Some(Some(_))) => Next::ArmEnd,
                 _ => Next::Other,
             };
-            // A branch to a frame delivers a value no arm's tail names.
-            let mut target = |d: u32| {
-                let n = frames.len();
-                if let Some(Some(f)) = (d as usize)
-                    .checked_add(1)
-                    .and_then(|x| n.checked_sub(x).and_then(|i| frames.get_mut(i)))
-                {
-                    f.4 = true;
-                }
-            };
-            match &op {
-                Operator::Br { relative_depth }
-                | Operator::BrIf { relative_depth }
-                | Operator::BrOnNull { relative_depth }
-                | Operator::BrOnNonNull { relative_depth }
-                | Operator::BrOnCast { relative_depth, .. }
-                | Operator::BrOnCastFail { relative_depth, .. } => target(*relative_depth),
-                Operator::BrTable { targets } => {
-                    for t in targets
-                        .targets()
-                        .chain(std::iter::once(Ok(targets.default())))
-                    {
-                        target(t.ok()?);
-                    }
-                }
-                // A catch delivers to a label too; refuse every enclosing merge.
-                Operator::TryTable { .. } => {
-                    for f in frames.iter_mut().flatten() {
-                        f.4 = true;
-                    }
-                }
-                _ => {}
-            }
             if let Some(li) = last_recorded.take() {
                 if b.ins[li].k + 1 == k {
                     b.ins[li].next = as_next;
                 }
             }
-            let mut record = |kind: Kind, top: u32, args: &[u32]| {
+            let mut record = |kind: Kind, args: &[u32]| {
                 let a0 = b.args.len() as u32;
                 b.args.extend_from_slice(args);
                 b.ins.push(Ins {
                     k,
                     kind,
                     reach,
-                    depth,
                     next: Next::Other,
-                    top,
                     args: (a0, b.args.len() as u32),
                 });
                 b.ins.len() - 1
@@ -597,7 +451,7 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                         } else {
                             Kind::ReturnCall(callee)
                         };
-                        last_recorded = Some(record(kind, NONE, &args));
+                        last_recorded = Some(record(kind, &args));
                     } else if matches!(op, Operator::ReturnCall { .. }) {
                         // An import has no twin to tail-call.
                         b.exits_otherwise = true;
@@ -612,12 +466,6 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                 }
                 Operator::ReturnCallRef { .. } | Operator::ReturnCallIndirect { .. } => {
                     b.exits_otherwise = true;
-                }
-                Operator::StructNew { struct_type_index } => {
-                    if m.shape_of_type(*struct_type_index).is_some() {
-                        last_recorded =
-                            Some(record(Kind::StructNew(*struct_type_index), NONE, &[]));
-                    }
                 }
                 Operator::StructSet {
                     struct_type_index, ..
@@ -651,57 +499,17 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                 }
                 Operator::LocalGet { local_index } => {
                     if local_rec.get(*local_index as usize) == Some(&true) {
-                        last_recorded = Some(record(Kind::LocalGet(*local_index), NONE, &[]));
+                        last_recorded = Some(record(Kind::LocalGet(*local_index), &[]));
                     }
                 }
                 Operator::LocalSet { local_index } | Operator::LocalTee { local_index } => {
                     if local_rec.get(*local_index as usize) == Some(&true) {
-                        let top = if hb >= 1 { producer(hb - 1) } else { NONE };
                         let kind = if matches!(op, Operator::LocalSet { .. }) {
                             Kind::LocalSet(*local_index)
                         } else {
                             Kind::LocalTee(*local_index)
                         };
-                        last_recorded = Some(record(kind, top, &[]));
-                    }
-                }
-                Operator::Return => {
-                    let top = if hb >= 1 { producer(hb - 1) } else { NONE };
-                    record(Kind::Exit, top, &[]);
-                }
-                Operator::End if depth == 1 => {
-                    let top = if hb >= 1 { producer(hb - 1) } else { NONE };
-                    record(Kind::Exit, top, &[]);
-                }
-                Operator::Br { relative_depth } if *relative_depth == fn_frame => {
-                    let top = if hb >= 1 { producer(hb - 1) } else { NONE };
-                    record(Kind::Exit, top, &[]);
-                }
-                Operator::Else => {
-                    if let Some(Some(f)) = frames.last_mut() {
-                        f.1 = k;
-                        f.2 = if hb >= 1 { producer(hb - 1) } else { NONE };
-                    }
-                }
-                Operator::End if depth > 1 => {
-                    if let Some(Some((if_k, else_k, then_tail, t, branched))) =
-                        frames.last().cloned()
-                    {
-                        if else_k != NONE && !branched {
-                            let tail = if hb >= 1 { producer(hb - 1) } else { NONE };
-                            b.merges.push(Merge {
-                                if_k,
-                                else_k,
-                                end_k: k,
-                                t,
-                                tails: [then_tail, tail],
-                            });
-                            let mi = b.merges.len() - 1;
-                            b.arm_end.insert(else_k, mi);
-                            b.arm_end.insert(k, mi);
-                            b.merge_at.insert(k, mi);
-                            last_recorded = Some(record(Kind::Merge(t), NONE, &[]));
-                        }
+                        last_recorded = Some(record(kind, &[]));
                     }
                 }
                 Operator::BrIf { relative_depth }
@@ -751,22 +559,6 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
                 owner[p] = k;
             }
             owner.truncate(ha);
-            match &op {
-                Operator::If {
-                    blockty: wasmparser::BlockType::Type(v @ ValType::Ref(r)),
-                } if !r.is_nullable() => {
-                    frames.push(m.record_of(*v).map(|(t, _)| (k, NONE, NONE, t, false)));
-                }
-                Operator::Block { .. }
-                | Operator::Loop { .. }
-                | Operator::If { .. }
-                | Operator::Try { .. }
-                | Operator::TryTable { .. } => frames.push(None),
-                Operator::End | Operator::Delegate { .. } => {
-                    frames.pop();
-                }
-                _ => {}
-            }
             match op {
                 Operator::Block { .. }
                 | Operator::Loop { .. }
@@ -842,20 +634,11 @@ fn scan(bytes: &[u8]) -> Option<Module<'_>> {
     Some(m)
 }
 
-/// A twin's key: the function, the parameters it takes as fields (a bit per parameter
-/// index, at most 64), and whether it returns its record as fields.
-type Twin = (u32, u64, bool);
-
 struct Analysis {
     /// The functions whose record result a twin may return as fields.
     producer: HashSet<u32>,
     /// `(f, a)`: parameter `a` of `f` is used field-only.
     fo_param: HashSet<(u32, u32)>,
-    /// The same in a twin that returns its record as fields, where handing the parameter
-    /// back as the result is a field use too (`unit(a, fallback)` returning `fallback`).
-    fo_param_r: HashSet<(u32, u32)>,
-    /// Per defined function: the non-parameter locals it holds field by field.
-    fo_local: Vec<HashSet<u32>>,
 }
 
 /// Whether a value of record type `a` may be taken apart where record type `b` is named: the
@@ -871,11 +654,6 @@ fn same_shape(m: &Module, a: u32, b: u32) -> bool {
         }
         _ => false,
     }
-}
-
-/// The record type a parameter or a function's single result names.
-fn param_record(m: &Module, f: u32, j: u32) -> Option<u32> {
-    m.record_of(*m.sig(f).0.get(j as usize)?).map(|(t, _)| t)
 }
 
 /// The record type a parameter names, a written one included: one a fresh argument may fill.
@@ -1033,424 +811,10 @@ fn analyse(m: &Module) -> Analysis {
             fo.remove(&d);
         }
     }
-    // The result-twin set: the field-only parameters, and those whose every other use is
-    // the exit, as long as the function can be a result twin at all.
-    let mut fo_r: HashSet<(u32, u32)> = fo.clone();
-    for f in defined().filter(|f| producer.contains(f)) {
-        let Some(rt) = result_record(m, f) else {
-            continue;
-        };
-        for j in 0..m.sig(f).0.len().min(64) as u32 {
-            if fo.contains(&(f, j))
-                || !allowed.contains(&(f, j))
-                || !param_record(m, f, j).is_some_and(|t| same_shape(m, t, rt))
-            {
-                continue;
-            }
-            let t = param_record(m, f, j).expect("checked above");
-            let ok = m.body(f).ins.iter().all(|i| match i.kind {
-                Kind::LocalSet(l) | Kind::LocalTee(l) => l != j,
-                Kind::LocalGet(l) if l == j => {
-                    field_use(f, i, t, &fo) || (i.reach && i.next == Next::Exit)
-                }
-                _ => true,
-            });
-            if ok {
-                fo_r.insert((f, j));
-            }
-        }
-    }
-    // Field-only locals, per body.
-    let mut fo_local = Vec::with_capacity(m.bodies.len());
-    for f in defined() {
-        let b = m.body(f);
-        let ix = (f - m.n_imports) as usize;
-        let n_params = m.sig(f).0.len() as u32;
-        let mut cands: HashMap<u32, (u32, bool)> = HashMap::new();
-        for i in &b.ins {
-            if let Kind::LocalGet(l) | Kind::LocalSet(l) | Kind::LocalTee(l) = i.kind {
-                if l >= n_params && !cands.contains_key(&l) {
-                    if let Some(ValType::Ref(r)) = m.local_type(f, l) {
-                        if let Some(t) = r.heap_type().into_concrete_index() {
-                            if m.shape_of_type(t).is_some() {
-                                cands.insert(l, (t, r.is_nullable()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // A greatest fixpoint, since a copy `const q = p` keeps both only while both qualify.
-        let mut live: HashSet<u32> = cands.keys().copied().collect();
-        let same_local = |l: u32, t: u32, live: &HashSet<u32>| {
-            live.contains(&l) && cands.get(&l).is_some_and(|&(lt, _)| same_shape(m, lt, t))
-        };
-        // Whether the value at ordinal `k`, of record type `t`, is an arm's value where the
-        // merge is itself held as fields (read field by field, or set to a field-only local
-        // other than `l`).
-        let arm_held = |k: u32, t: u32, l: u32, live: &HashSet<u32>| {
-            b.arm_end.get(&(k + 1)).is_some_and(|&mi| {
-                let mg = &b.merges[mi];
-                mg.tails.contains(&k)
-                    && same_shape(m, mg.t, t)
-                    && b.at(mg.end_k).is_some_and(|e| {
-                        e.reach
-                            && match e.next {
-                                Next::StructGet(st, _) => same_shape(m, st, mg.t),
-                                Next::LocalSet(q) => q != l && same_local(q, mg.t, live),
-                                _ => false,
-                            }
-                    })
-            })
-        };
-        loop {
-            let mut first_seen: HashSet<u32> = HashSet::new();
-            let mut bad: HashSet<u32> = HashSet::new();
-            for i in &b.ins {
-                let (l, ok) = match i.kind {
-                    Kind::LocalTee(l) => (l, false),
-                    Kind::LocalGet(l) => match cands.get(&l) {
-                        Some(&(t, nullable)) => {
-                            let copied = matches!(i.next, Next::LocalSet(q)
-                                if q != l && i.reach && same_local(q, t, &live));
-                            // An arm's value, where the merge is itself held as fields.
-                            let arm =
-                                i.reach && i.next == Next::ArmEnd && arm_held(i.k, t, l, &live);
-                            // An argument a result twin takes as fields, at a call whose own
-                            // result is held as fields: into a local (`unit(v, fallback)`), an
-                            // arm of a merge held as fields, or straight into a field-only
-                            // parameter (`turn(unit(v, fallback))`).
-                            let via_r = i.reach
-                                && consumers[ix].get(&i.k).is_some_and(|&(ck, j)| {
-                                    let c = b.at(ck).expect("a consumer is recorded");
-                                    let Kind::Call(h) = c.kind else { return false };
-                                    let Some(rt) =
-                                        result_record(m, h).filter(|_| producer.contains(&h))
-                                    else {
-                                        return false;
-                                    };
-                                    fo_r.contains(&(h, j))
-                                        && param_record(m, h, j)
-                                            .is_some_and(|pt| same_shape(m, pt, t))
-                                        && c.reach
-                                        && match c.next {
-                                            Next::StructGet(st, _) => same_shape(m, st, rt),
-                                            Next::LocalSet(q) => q != l && same_local(q, rt, &live),
-                                            Next::ArmEnd => arm_held(c.k, rt, l, &live),
-                                            _ => field_use(f, c, rt, &fo),
-                                        }
-                                });
-                            (
-                                l,
-                                (field_use(f, i, t, &fo) || copied || arm || via_r)
-                                    && (!nullable || first_seen.contains(&l)),
-                            )
-                        }
-                        None => continue,
-                    },
-                    Kind::LocalSet(l) => match cands.get(&l) {
-                        Some(&(t, nullable)) => {
-                            let src = (i.reach && i.top != NONE && i.top + 1 == i.k)
-                                .then(|| b.at(i.top))
-                                .flatten();
-                            let ok = match src.map(|s| s.kind) {
-                                Some(Kind::Call(g)) => {
-                                    producer.contains(&g)
-                                        && result_record(m, g)
-                                            .is_some_and(|rt| same_shape(m, rt, t))
-                                }
-                                Some(Kind::StructNew(st)) | Some(Kind::Merge(st)) => {
-                                    same_shape(m, st, t)
-                                }
-                                Some(Kind::LocalGet(p)) => p != l && same_local(p, t, &live),
-                                _ => !i.reach,
-                            };
-                            let first_ok =
-                                !nullable || first_seen.contains(&l) || (i.depth == 1 && i.reach);
-                            (l, ok && first_ok)
-                        }
-                        None => continue,
-                    },
-                    _ => continue,
-                };
-                first_seen.insert(l);
-                if !ok {
-                    bad.insert(l);
-                }
-            }
-            let before = live.len();
-            live.retain(|l| !bad.contains(l));
-            if live.len() == before {
-                break;
-            }
-        }
-        fo_local.push(live);
-    }
     Analysis {
         producer,
         fo_param: fo,
-        fo_param_r: fo_r,
-        fo_local,
     }
-}
-
-trait IntoConcrete {
-    fn into_concrete_index(self) -> Option<u32>;
-}
-
-impl IntoConcrete for HeapType {
-    fn into_concrete_index(self) -> Option<u32> {
-        concrete_index(self)
-    }
-}
-
-/// What a context's rewrite does at each op ordinal it changes.
-#[derive(Clone, Debug)]
-enum Act {
-    /// Re-encode a call or tail call to this function index.
-    Call(u32, bool),
-    Delete,
-    /// The field gets of a scalarized local: `Some(i)` the one field the next `struct.get`
-    /// reads (that `struct.get` is deleted), `None` all of them.
-    GetFields(u32, Option<u32>),
-    /// A scalarized local's set, from a twin's results or a deleted `struct.new`.
-    SetFields(u32),
-    /// A `struct.get` of field `i` from the `n` fields a twin call or a merge left.
-    PickField(u32, u32),
-    /// Read every field of the record of this type on the stack, then the op itself (an exit,
-    /// or the `else`/`end` closing a merge's arm).
-    Extract(u32),
-    /// A merge's `if`, now leaving its record's fields.
-    MergeIf(u32),
-}
-
-struct Plan {
-    acts: HashMap<u32, Act>,
-}
-
-/// Merge `mi` leaves its record's fields: its `if` says so, and each arm leaves fields. A
-/// producer's call there returns them, a `struct.new` there is deleted, a scalarized local is
-/// read field by field (planned with the local), and any other value is read at the arm's end.
-fn take_merge(
-    m: &Module,
-    a: &Analysis,
-    b: &Body,
-    mi: usize,
-    acts: &mut HashMap<u32, Act>,
-    r_calls: &mut HashSet<u32>,
-) {
-    let mg = &b.merges[mi];
-    if acts.contains_key(&mg.if_k) {
-        return;
-    }
-    acts.insert(mg.if_k, Act::MergeIf(mg.t));
-    for (tail, close) in mg.tails.into_iter().zip([mg.else_k, mg.end_k]) {
-        let src = (tail != NONE && tail + 1 == close)
-            .then(|| b.at(tail))
-            .flatten()
-            .filter(|s| s.reach);
-        match src.map(|s| s.kind) {
-            Some(Kind::Call(h))
-                if a.producer.contains(&h)
-                    && result_record(m, h).is_some_and(|rt| same_shape(m, rt, mg.t)) =>
-            {
-                r_calls.insert(tail);
-            }
-            Some(Kind::StructNew(st)) if same_shape(m, st, mg.t) => {
-                acts.insert(tail, Act::Delete);
-            }
-            Some(Kind::LocalGet(_)) if matches!(acts.get(&tail), Some(Act::GetFields(_, None))) => {
-            }
-            _ => {
-                acts.insert(close, Act::Extract(mg.t));
-            }
-        }
-    }
-}
-
-/// One context's decisions: its plan and the twins it calls.
-///
-/// Calls are decided last to first, because a call's own use (the op after it, or a later
-/// call it is an argument of) is decided before it: whether a call returns fields fixes
-/// which of its parameters it may pass as fields.
-fn plan_context(
-    m: &Module,
-    a: &Analysis,
-    ctx: Twin,
-    twin_index: &mut dyn FnMut(Twin) -> u32,
-) -> Plan {
-    let (f, s_mask, r) = ctx;
-    let b = m.body(f);
-    let ix = (f - m.n_imports) as usize;
-    let n_params = m.sig(f).0.len() as u32;
-    let scalar_local = |l: u32| -> bool {
-        if l < n_params {
-            l < 64 && s_mask & (1u64 << l) != 0
-        } else {
-            a.fo_local[ix].contains(&l)
-        }
-    };
-    let local_record = |l: u32| -> Option<u32> {
-        match m.local_type(f, l)? {
-            ValType::Ref(rf) => concrete_index(rf.heap_type()),
-            _ => None,
-        }
-    };
-    let mut acts: HashMap<u32, Act> = HashMap::new();
-    // Ordinals of producer calls whose result must come back as fields.
-    let mut r_calls: HashSet<u32> = HashSet::new();
-    // Scalarized locals' own gets and sets, and the `struct.new` a set takes.
-    for i in &b.ins {
-        match i.kind {
-            Kind::LocalGet(l) if scalar_local(l) && i.reach => {
-                if let Next::StructGet(_, field) = i.next {
-                    acts.insert(i.k, Act::GetFields(l, Some(field)));
-                    acts.insert(i.k + 1, Act::Delete);
-                } else if r && i.next == Next::Exit {
-                    acts.insert(i.k, Act::GetFields(l, None));
-                } else if matches!(i.next, Next::LocalSet(q) if q >= n_params && scalar_local(q))
-                    || i.next == Next::ArmEnd
-                {
-                    acts.insert(i.k, Act::GetFields(l, None));
-                }
-                // Otherwise it is a field argument, planned with its call below.
-            }
-            Kind::LocalSet(l) if l >= n_params && scalar_local(l) && i.reach => {
-                acts.insert(i.k, Act::SetFields(l));
-                if let Some(src) = b.at(i.top) {
-                    match src.kind {
-                        Kind::StructNew(_) => {
-                            acts.insert(src.k, Act::Delete);
-                        }
-                        Kind::Merge(_) => {
-                            take_merge(m, a, b, b.merge_at[&src.k], &mut acts, &mut r_calls);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Kind::Merge(t) if i.reach => {
-                if let Next::StructGet(st, field) = i.next {
-                    if same_shape(m, st, t) {
-                        take_merge(m, a, b, b.merge_at[&i.k], &mut acts, &mut r_calls);
-                        acts.insert(i.k + 1, Act::PickField(field, fields_of(m, t).len() as u32));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // The exits of a result twin: a `struct.new` handed back is deleted, a producer call
-    // returns fields, a field parameter is pushed field by field; anything else is read.
-    if r {
-        for i in &b.ins {
-            if i.kind != Kind::Exit {
-                continue;
-            }
-            let src = (i.reach && i.top != NONE).then(|| b.at(i.top)).flatten();
-            match src.map(|s| s.kind) {
-                Some(Kind::Call(h))
-                    if a.producer.contains(&h)
-                        && i.top + 1 == i.k
-                        && same_record_result(m, f, h) =>
-                {
-                    r_calls.insert(i.top);
-                }
-                Some(Kind::StructNew(st))
-                    if result_record(m, f).is_some_and(|rt| same_shape(m, st, rt)) =>
-                {
-                    acts.insert(i.top, Act::Delete);
-                }
-                Some(Kind::LocalGet(l)) if scalar_local(l) && i.top + 1 == i.k => {}
-                Some(Kind::Merge(st))
-                    if i.top + 1 == i.k
-                        && result_record(m, f).is_some_and(|rt| same_shape(m, st, rt)) =>
-                {
-                    take_merge(m, a, b, b.merge_at[&i.top], &mut acts, &mut r_calls);
-                }
-                _ => {
-                    let rt = result_record(m, f).expect("a result twin's function is a producer");
-                    acts.insert(i.k, Act::Extract(rt));
-                }
-            }
-        }
-    }
-    for i in b.ins.iter().rev() {
-        let Some(h) = callee_of(i) else { continue };
-        if !i.reach {
-            continue;
-        }
-        let tail = matches!(i.kind, Kind::ReturnCall(_));
-        // This call's own use.
-        let mut rr = if tail { r } else { r_calls.contains(&i.k) };
-        if !tail && !rr && a.producer.contains(&h) {
-            let rt = result_record(m, h).expect("a producer returns a record");
-            match i.next {
-                Next::StructGet(st, field) if same_shape(m, st, rt) => {
-                    rr = true;
-                    acts.insert(
-                        i.k + 1,
-                        Act::PickField(field, fields_of(m, rt).len() as u32),
-                    );
-                }
-                Next::LocalSet(l) if l >= n_params && scalar_local(l) => rr = true,
-                _ => {}
-            }
-        }
-        let fo = if rr { &a.fo_param_r } else { &a.fo_param };
-        // Which arguments it passes as fields.
-        let mut s = 0u64;
-        for (j, &q) in b.args_of(i).iter().enumerate() {
-            let j = j as u32;
-            if q == NONE || j >= 64 || !fo.contains(&(h, j)) {
-                continue;
-            }
-            let pt = param_arg_record(m, h, j).expect("a field-only parameter names a record");
-            let Some(src) = b.at(q) else { continue };
-            // A written record qualifies only fresh: a `struct.new` here, or a field parameter
-            // of this twin, which only a fresh argument fills.
-            let ok = match src.kind {
-                Kind::Call(g) => {
-                    a.producer.contains(&g)
-                        && result_record(m, g).is_some_and(|rt| same_shape(m, rt, pt))
-                }
-                Kind::StructNew(st) => same_arg(m, st, pt),
-                Kind::Merge(st) => same_shape(m, st, pt),
-                Kind::LocalGet(l) => {
-                    scalar_local(l)
-                        && local_record(l).is_some_and(|lt| {
-                            same_shape(m, lt, pt) || (l < n_params && same_arg(m, lt, pt))
-                        })
-                }
-                _ => false,
-            };
-            if !ok {
-                continue;
-            }
-            s |= 1u64 << j;
-            match src.kind {
-                Kind::Call(_) => {
-                    r_calls.insert(q);
-                }
-                Kind::StructNew(_) => {
-                    acts.insert(q, Act::Delete);
-                }
-                Kind::LocalGet(l) => {
-                    acts.insert(q, Act::GetFields(l, None));
-                }
-                Kind::Merge(_) => {
-                    take_merge(m, a, b, b.merge_at[&q], &mut acts, &mut r_calls);
-                }
-                _ => {}
-            }
-        }
-        if s == 0 && !rr {
-            continue;
-        }
-        let to = twin_index((h, s, rr));
-        acts.insert(i.k, Act::Call(to, tail));
-    }
-    Plan { acts }
 }
 
 pub(crate) fn put_uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -1510,277 +874,9 @@ pub(crate) fn put_val(out: &mut Vec<u8>, v: ValType) -> Option<()> {
     Some(())
 }
 
-/// `v`, or its nullable form when it is a reference: the type of a declared local holding it.
-fn nullable(v: ValType) -> Option<ValType> {
-    match v {
-        ValType::Ref(r) => Some(ValType::Ref(wasmparser::RefType::new(true, r.heap_type())?)),
-        _ => Some(v),
-    }
-}
-
 fn fields_of(m: &Module, t: u32) -> Vec<ValType> {
     m.arg_shape(t)
         .map_or_else(Vec::new, |s| s.0.iter().map(|&(v, _)| v).collect())
-}
-
-/// A twin's signature.
-fn twin_sig(m: &Module, (f, s, r): Twin) -> (Vec<ValType>, Vec<ValType>) {
-    let (ps, rs) = m.sig(f);
-    let mut params = Vec::new();
-    for (j, &p) in ps.iter().enumerate() {
-        if j < 64 && s & (1u64 << j) != 0 {
-            let t = param_arg_record(m, f, j as u32).expect("a twin's field parameter is a record");
-            params.extend(fields_of(m, t));
-        } else {
-            params.push(p);
-        }
-    }
-    let results = if r {
-        fields_of(
-            m,
-            result_record(m, f).expect("a result twin's function is a producer"),
-        )
-    } else {
-        rs.clone()
-    };
-    (params, results)
-}
-
-/// The body of `ctx` rewritten by `plan`, with each op's old module offset beside its new
-/// offset in the body, or `None` when an op will not decode or encode.
-fn emit_body(
-    m: &Module,
-    a: &Analysis,
-    ctx: Twin,
-    plan: &Plan,
-    block_type: &HashMap<u32, u32>,
-) -> Option<(Vec<u8>, Vec<(u32, u32)>)> {
-    let (f, s, r) = ctx;
-    let b = m.body(f);
-    let ix = (f - m.n_imports) as usize;
-    let ps = &m.sig(f).0;
-    let n_params = ps.len() as u32;
-    // Old local index to new: a field parameter widens to its fields.
-    let mut param_new: Vec<u32> = Vec::with_capacity(ps.len());
-    let mut at = 0u32;
-    for j in 0..n_params {
-        param_new.push(at);
-        at += if j < 64 && s & (1u64 << j) != 0 {
-            fields_of(m, param_arg_record(m, f, j)?).len() as u32
-        } else {
-            1
-        };
-    }
-    let shift = at - n_params;
-    let n_declared: u32 = b.locals.iter().map(|&(n, _)| n).sum();
-    let mut next_local = at + n_declared;
-    let mut extra: Vec<ValType> = Vec::new();
-    let mut new_local = |t: ValType, extra: &mut Vec<ValType>| {
-        extra.push(t);
-        next_local += 1;
-        next_local - 1
-    };
-    // Field slots of each scalarized local, and whether they are declared locals: a declared
-    // slot for a non-null reference field is nullable (a set may not dominate every get in
-    // wasm's block-scoped sense) and each get re-asserts it, which cannot trap where the
-    // original `struct.get` read the same set.
-    let mut slots: HashMap<u32, (u32, Vec<ValType>, bool)> = HashMap::new();
-    for j in 0..n_params {
-        if j < 64 && s & (1u64 << j) != 0 {
-            slots.insert(
-                j,
-                (
-                    param_new[j as usize],
-                    fields_of(m, param_arg_record(m, f, j)?),
-                    false,
-                ),
-            );
-        }
-    }
-    let mut fo_locals: Vec<u32> = a.fo_local[ix].iter().copied().collect();
-    fo_locals.sort_unstable();
-    for l in fo_locals {
-        let Some(ValType::Ref(rf)) = m.local_type(f, l) else {
-            return None;
-        };
-        let fs = fields_of(m, concrete_index(rf.heap_type())?);
-        let mut base = None;
-        for &v in &fs {
-            let x = new_local(nullable(v)?, &mut extra);
-            base.get_or_insert(x);
-        }
-        slots.insert(l, (base?, fs, true));
-    }
-    let remap = |l: u32| -> u32 {
-        if l < n_params {
-            param_new[l as usize]
-        } else {
-            l + shift
-        }
-    };
-    let mut scratch_num: HashMap<ValType, u32> = HashMap::new();
-    let mut scratch_ref: HashMap<u32, u32> = HashMap::new();
-    let _ = r;
-    let mut code: Vec<u8> = Vec::with_capacity(b.range.1 - b.ops_start + 16);
-    let bytes = m.bytes;
-    let mut ops = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
-        &bytes[b.ops_start..b.range.1],
-        b.ops_start as u64,
-    ));
-    let mut k: u32 = 0;
-    let mut moved: Vec<(u32, u32)> = Vec::new();
-    while !ops.eof() {
-        let (op, off) = ops.read_with_offset().ok()?;
-        let end = if ops.eof() {
-            b.range.1
-        } else {
-            upos(ops.original_position())
-        };
-        let off = upos(off);
-        let raw = &bytes[off..end];
-        moved.push((off as u32, code.len() as u32));
-        match plan.acts.get(&k) {
-            Some(Act::Delete) => {}
-            Some(Act::Call(to, tail)) => {
-                code.push(if *tail { 0x12 } else { 0x10 });
-                put_uleb(&mut code, *to as u64);
-            }
-            Some(Act::MergeIf(t)) => {
-                code.push(0x04);
-                put_sleb(&mut code, *block_type.get(t)? as i64);
-            }
-            Some(Act::GetFields(l, which)) => {
-                let (base, fs, declared) = slots.get(l)?;
-                let get = |code: &mut Vec<u8>, i: u32| -> Option<()> {
-                    code.push(0x20);
-                    put_uleb(code, (*base + i) as u64);
-                    if *declared
-                        && matches!(fs.get(i as usize)?, ValType::Ref(r) if !r.is_nullable())
-                    {
-                        code.push(0xd4);
-                    }
-                    Some(())
-                };
-                match which {
-                    Some(i) => get(&mut code, *i)?,
-                    None => {
-                        for i in 0..fs.len() as u32 {
-                            get(&mut code, i)?;
-                        }
-                    }
-                }
-            }
-            Some(Act::SetFields(l)) => {
-                let (base, fs, _) = slots.get(l)?;
-                for i in (0..fs.len() as u32).rev() {
-                    code.push(0x21);
-                    put_uleb(&mut code, (*base + i) as u64);
-                }
-            }
-            Some(Act::PickField(i, n)) => {
-                let (i, n) = (*i, *n);
-                if n == 0 || i >= n {
-                    return None;
-                }
-                for _ in i + 1..n {
-                    code.push(0x1a);
-                }
-                if i > 0 {
-                    let Operator::StructGet {
-                        struct_type_index, ..
-                    } = op
-                    else {
-                        return None;
-                    };
-                    let fs = fields_of(m, struct_type_index);
-                    let fnum = *fs.get(i as usize)?;
-                    let sl = match scratch_num.get(&fnum) {
-                        Some(&x) => x,
-                        None => {
-                            let x = new_local(fnum, &mut extra);
-                            scratch_num.insert(fnum, x);
-                            x
-                        }
-                    };
-                    code.push(0x21);
-                    put_uleb(&mut code, sl as u64);
-                    for _ in 0..i {
-                        code.push(0x1a);
-                    }
-                    code.push(0x20);
-                    put_uleb(&mut code, sl as u64);
-                }
-            }
-            Some(Act::Extract(t)) => {
-                let t = *t;
-                let sl = match scratch_ref.get(&t) {
-                    Some(&x) => x,
-                    None => {
-                        let x = new_local(
-                            ValType::Ref(wasmparser::RefType::new(
-                                true,
-                                HeapType::Concrete(UnpackedIndex::Module(t)),
-                            )?),
-                            &mut extra,
-                        );
-                        scratch_ref.insert(t, x);
-                        x
-                    }
-                };
-                code.push(0x21);
-                put_uleb(&mut code, sl as u64);
-                for i in 0..fields_of(m, t).len() as u32 {
-                    code.push(0x20);
-                    put_uleb(&mut code, sl as u64);
-                    code.extend_from_slice(&[0xfb, 0x02]);
-                    put_uleb(&mut code, t as u64);
-                    put_uleb(&mut code, i as u64);
-                }
-                code.extend_from_slice(raw);
-            }
-            None => match op {
-                Operator::LocalGet { local_index } if shift > 0 => {
-                    code.push(0x20);
-                    put_uleb(&mut code, remap(local_index) as u64);
-                }
-                Operator::LocalSet { local_index } if shift > 0 => {
-                    code.push(0x21);
-                    put_uleb(&mut code, remap(local_index) as u64);
-                }
-                Operator::LocalTee { local_index } if shift > 0 => {
-                    code.push(0x22);
-                    put_uleb(&mut code, remap(local_index) as u64);
-                }
-                _ => code.extend_from_slice(raw),
-            },
-        }
-        k += 1;
-    }
-    // A plan's local ops on unscalarized locals in a widened twin were re-encoded above; the
-    // planned ones name new slots directly. The header: the old entries, then the new locals.
-    let mut lr = wasmparser::BinaryReader::new(&bytes[b.range.0..b.ops_start], b.range.0 as u64);
-    let n_entries = lr.read_var_u32().ok()?;
-    let entries_start = upos(lr.original_position());
-    let mut out: Vec<u8> = Vec::with_capacity(code.len() + 32);
-    let mut groups: Vec<(u32, ValType)> = Vec::new();
-    for t in extra {
-        match groups.last_mut() {
-            Some((n, gt)) if *gt == t => *n += 1,
-            _ => groups.push((1, t)),
-        }
-    }
-    put_uleb(&mut out, (n_entries as usize + groups.len()) as u64);
-    out.extend_from_slice(&bytes[entries_start..b.ops_start]);
-    for (n, t) in groups {
-        put_uleb(&mut out, n as u64);
-        put_val(&mut out, t)?;
-    }
-    let header = out.len() as u32;
-    out.extend_from_slice(&code);
-    for pair in &mut moved {
-        pair.1 += header;
-    }
-    Some((out, moved))
 }
 
 /// One body of the step's output and where its ops came from: the input body `from..to`
@@ -1832,581 +928,10 @@ fn without_fresh(m: &Module, mut pairs: HashSet<(u32, u32)>) -> HashSet<(u32, u3
     pairs
 }
 
-/// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
-/// changes nothing, beside the `$VL_MV_EXPLAIN` lines when `explaining`.
-pub fn multivalue_rust(
-    bytes: &[u8],
-    explaining: bool,
-) -> (Option<(Vec<u8>, Vec<BodyMove>)>, String) {
-    let mut log = String::new();
-    let out = step(bytes, explaining, &mut log).map(|(out, moved, _)| (out, moved));
-    (out, log)
-}
-
-/// What the step would hold field by field in `bytes`, were it run on it: per defined function
-/// the locals it scalarizes, and the `(function, parameter)` pairs a call passes as fields.
-/// `None` when the step would leave the module untouched, so it scalarizes nothing.
-pub(crate) fn scalarized(bytes: &[u8]) -> Option<(Vec<HashSet<u32>>, HashSet<(u32, u32)>)> {
-    step(bytes, false, &mut String::new()).map(|(_, _, a)| (a.fo_local, a.fo_param_r))
-}
-
-/// One `$VL_MV_EXPLAIN` line onto the step's log.
-macro_rules! say {
-    ($log:expr, $($arg:tt)*) => {{
-        let _ = writeln!($log, $($arg)*);
-    }};
-}
-
-fn step(
-    bytes: &[u8],
-    explaining: bool,
-    log: &mut String,
-) -> Option<(Vec<u8>, Vec<BodyMove>, Analysis)> {
-    let Some(m) = scan(bytes) else {
-        if explaining {
-            say!(
-                log,
-                "mv-explain: step skipped: the module does not validate, or no function takes \
-                 or returns a record (a struct that nothing writes, of 1 to \
-                 {MV_ARG_MAX_FIELDS} numeric or reference fields as an argument, 1 to \
-                 {MV_RECORD_MAX_FIELDS} numeric fields as a result)"
-            );
-        }
-        return None;
-    };
-    let a = analyse(&m);
-    if a.producer.is_empty() && a.fo_param.is_empty() {
-        if explaining {
-            explain(&m, &a, &[], &[], log);
-        }
-        return None;
-    }
-    let n_funcs = m.func_type.len() as u32;
-    let mut twins: Vec<Twin> = Vec::new();
-    let mut twin_at: HashMap<Twin, u32> = HashMap::new();
-    let mut work: VecDeque<Twin> = VecDeque::new();
-    let mut plans: Vec<Plan> = Vec::with_capacity(m.bodies.len());
-    let mut too_many = false;
-    {
-        let mut index = |t: Twin| -> u32 {
-            if let Some(&i) = twin_at.get(&t) {
-                return i;
-            }
-            let i = n_funcs + twins.len() as u32;
-            twins.push(t);
-            twin_at.insert(t, i);
-            work.push_back(t);
-            i
-        };
-        for f in m.n_imports..n_funcs {
-            plans.push(plan_context(&m, &a, (f, 0, false), &mut index));
-        }
-    }
-    if explaining {
-        explain(&m, &a, &plans, &twins, log);
-    }
-    let mut twin_plans: Vec<Plan> = Vec::new();
-    while let Some(t) = work.pop_front() {
-        if twins.len() > MV_MAX_TWINS {
-            too_many = true;
-            break;
-        }
-        let mut index = |t: Twin| -> u32 {
-            if let Some(&i) = twin_at.get(&t) {
-                return i;
-            }
-            let i = n_funcs + twins.len() as u32;
-            twins.push(t);
-            twin_at.insert(t, i);
-            work.push_back(t);
-            i
-        };
-        twin_plans.push(plan_context(&m, &a, t, &mut index));
-    }
-    if too_many || twins.is_empty() {
-        if explaining && too_many {
-            say!(
-                log,
-                "mv-explain: step abandoned: more than {MV_MAX_TWINS} twins"
-            );
-        }
-        return None;
-    }
-    // New function types: first one per record a merge leaves as fields, as a block type.
-    let n_types = m.func_sig.len() as u32;
-    let mut sig_at: HashMap<(Vec<ValType>, Vec<ValType>), u32> = HashMap::new();
-    let mut new_types: Vec<u8> = Vec::new();
-    let mut sig_index =
-        |sig: (Vec<ValType>, Vec<ValType>), new_types: &mut Vec<u8>| -> Option<u32> {
-            let next = n_types + sig_at.len() as u32;
-            let ti = *sig_at.entry(sig.clone()).or_insert(next);
-            if ti == next {
-                new_types.push(0x60);
-                put_uleb(new_types, sig.0.len() as u64);
-                for &v in &sig.0 {
-                    put_val(new_types, v)?;
-                }
-                put_uleb(new_types, sig.1.len() as u64);
-                for &v in &sig.1 {
-                    put_val(new_types, v)?;
-                }
-            }
-            Some(ti)
-        };
-    let mut block_type: HashMap<u32, u32> = HashMap::new();
-    let mut merged: Vec<u32> = plans
-        .iter()
-        .chain(&twin_plans)
-        .flat_map(|p| p.acts.values())
-        .filter_map(|act| match act {
-            Act::MergeIf(t) => Some(*t),
-            _ => None,
-        })
-        .collect();
-    merged.sort_unstable();
-    merged.dedup();
-    for t in merged {
-        let ti = sig_index((Vec::new(), fields_of(&m, t)), &mut new_types)?;
-        block_type.insert(t, ti);
-    }
-    // The bodies: every original one (rewritten where its plan says), then each twin's.
-    // Each original body also keeps its op offsets, old beside new-within-the-body.
-    let mut bodies: Vec<std::borrow::Cow<[u8]>> = Vec::with_capacity(m.bodies.len() + twins.len());
-    let mut body_moves: Vec<Vec<(u32, u32)>> = Vec::with_capacity(m.bodies.len());
-    let mut code_size = 0usize;
-    for (i, plan) in plans.iter().enumerate() {
-        let f = m.n_imports + i as u32;
-        let b = &m.bodies[i];
-        code_size += b.range.1 - b.range.0;
-        if plan.acts.is_empty() {
-            bodies.push(std::borrow::Cow::Borrowed(&bytes[b.range.0..b.range.1]));
-            body_moves.push(vec![(b.range.0 as u32, 0)]);
-        } else {
-            let (body, moves) = emit_body(&m, &a, (f, 0, false), plan, &block_type)?;
-            bodies.push(std::borrow::Cow::Owned(body));
-            body_moves.push(
-                std::iter::once((b.range.0 as u32, 0))
-                    .chain(moves)
-                    .collect(),
-            );
-        }
-    }
-    let mut growth = 0usize;
-    for (t, plan) in twins.iter().zip(&twin_plans) {
-        let (body, moves) = emit_body(&m, &a, *t, plan, &block_type)?;
-        growth += body.len();
-        bodies.push(std::borrow::Cow::Owned(body));
-        let b = m.body(t.0);
-        body_moves.push(
-            std::iter::once((b.range.0 as u32, 0))
-                .chain(moves)
-                .collect(),
-        );
-    }
-    // The input body each output body came from.
-    let sources: Vec<(u32, u32)> = (0..m.bodies.len())
-        .map(|i| m.n_imports + i as u32)
-        .chain(twins.iter().map(|t| t.0))
-        .map(|f| {
-            let r = m.body(f).range;
-            (r.0 as u32, r.1 as u32)
-        })
-        .collect();
-    if growth > MV_GROWTH_FLOOR + code_size / 2 {
-        if explaining {
-            say!(
-                log,
-                "mv-explain: step abandoned: the twins add {growth} bytes, past the bound of \
-                 {MV_GROWTH_FLOOR} plus half the {code_size}-byte code section"
-            );
-        }
-        return None;
-    }
-    // Then one per distinct twin signature.
-    let mut twin_types: Vec<u32> = Vec::with_capacity(twins.len());
-    for &t in &twins {
-        twin_types.push(sig_index(twin_sig(&m, t), &mut new_types)?);
-    }
-    // Reassemble: the type, function and code sections grow; every other section is copied.
-    let mut out = bytes[..8].to_vec();
-    let mut moved: Vec<BodyMove> = Vec::new();
-    let mut p = 8usize;
-    let mut saw = (false, false, false);
-    while p < bytes.len() {
-        let id = bytes[p];
-        let mut q = p + 1;
-        let len = super::leb_u32(bytes, &mut q)? as usize;
-        let body = bytes.get(q..q.checked_add(len)?)?;
-        let section_end = q + len;
-        let mut payload: Option<Vec<u8>> = None;
-        match id {
-            1 => {
-                let mut r = 0usize;
-                let n = super::leb_u32(body, &mut r)?;
-                let mut s = Vec::with_capacity(body.len() + new_types.len() + 4);
-                put_uleb(&mut s, (n + sig_at.len() as u32) as u64);
-                s.extend_from_slice(&body[r..]);
-                s.extend_from_slice(&new_types);
-                payload = Some(s);
-                saw.0 = true;
-            }
-            3 => {
-                let mut r = 0usize;
-                let n = super::leb_u32(body, &mut r)?;
-                let mut s = Vec::with_capacity(body.len() + twins.len() * 2 + 4);
-                put_uleb(&mut s, (n + twins.len() as u32) as u64);
-                s.extend_from_slice(&body[r..]);
-                for &ti in &twin_types {
-                    put_uleb(&mut s, ti as u64);
-                }
-                payload = Some(s);
-                saw.1 = true;
-            }
-            10 => {
-                let mut s = Vec::with_capacity(body.len() + growth + 16);
-                put_uleb(&mut s, bodies.len() as u64);
-                let mut starts = Vec::with_capacity(bodies.len());
-                for b in &bodies {
-                    put_uleb(&mut s, b.len() as u64);
-                    starts.push(s.len());
-                    s.extend_from_slice(b);
-                }
-                // The payload lands after the section's id and size.
-                let mut head = vec![id];
-                put_uleb(&mut head, s.len() as u64);
-                let base = (out.len() + head.len()) as u32;
-                for ((moves, &at), &(from, to)) in body_moves.iter().zip(&starts).zip(&sources) {
-                    let at = base + at as u32;
-                    let pairs = moves.iter().map(|&(old, new)| (old, at + new)).collect();
-                    moved.push(BodyMove { from, to, pairs });
-                }
-                payload = Some(s);
-                saw.2 = true;
-            }
-            _ => {}
-        }
-        match payload {
-            Some(s) => {
-                out.push(id);
-                put_uleb(&mut out, s.len() as u64);
-                out.extend_from_slice(&s);
-            }
-            None => out.extend_from_slice(&bytes[p..section_end]),
-        }
-        p = section_end;
-    }
-    if saw != (true, true, true) {
-        return None;
-    }
-    if m.names {
-        let originals: Vec<u32> = twins.iter().map(|t| t.0).collect();
-        let total = n_funcs + twins.len() as u32;
-        // A twin is named after its function, so a trap in it reads as that function.
-        let names = function_names(&out);
-        out = super::rename_functions(&out, total, |f, cur| {
-            if f < n_funcs {
-                cur.map(str::to_string)
-            } else {
-                let o = originals[(f - n_funcs) as usize];
-                names.get(&o).map(|n| format!("{n}.mv"))
-            }
-        })?;
-    }
-    // A rewrite the validator refuses is a missed optimization, not a failed build: the input
-    // is kept. `$VL_MV_FAULT=1` corrupts the output first, to prove that path.
-    if std::env::var_os("VL_MV_FAULT").is_some_and(|v| !v.is_empty() && v != "0") {
-        out.push(0xff);
-    }
-    if let Err(e) = Validator::new_with_features(WasmFeatures::all()).validate_all(&out) {
-        if explaining {
-            say!(
-                log,
-                "mv-explain: step abandoned: its output does not validate: {e}"
-            );
-        }
-        return None;
-    }
-    // For `scalarized`, whose callers may count only on what is taken apart at every site.
-    let mut a = a;
-    a.fo_param_r = without_fresh(&m, std::mem::take(&mut a.fo_param_r));
-    Some((out, moved, a))
-}
-
-/// Why struct type `t` is not one the step takes apart, read off the type section; `None` when
-/// its fields alone would qualify it.
-fn field_refusal(bytes: &[u8], t: u32) -> Option<&'static str> {
-    let mut ix = 0u32;
-    for payload in Parser::new(0).parse_all(bytes) {
-        let Ok(Payload::TypeSection(r)) = payload else {
-            continue;
-        };
-        for group in r.into_iter().flatten() {
-            for sub in group.into_types() {
-                if ix == t {
-                    let ct = &sub.composite_type;
-                    let CompositeInnerType::Struct(st) = &ct.inner else {
-                        return Some("not a struct");
-                    };
-                    if ct.shared || ct.descriptor_idx.is_some() || ct.describes_idx.is_some() {
-                        return Some("shared, or has a descriptor");
-                    }
-                    if st.fields.is_empty() {
-                        return Some("has no fields");
-                    }
-                    if st.fields.len() > MV_ARG_MAX_FIELDS {
-                        return Some("has more fields than the step's argument bound");
-                    }
-                    let held = |f: &wasmparser::FieldType| match f.element_type {
-                        StorageType::Val(v) => field_val(v),
-                        _ => false,
-                    };
-                    return (!st.fields.iter().all(held))
-                        .then_some("has a packed field, or a reference the step cannot spell");
-                }
-                ix += 1;
-            }
-        }
-    }
-    Some("not a struct")
-}
-
-/// `$VL_MV_EXPLAIN=1`: on stderr, per struct type a function takes or returns, whether the step
-/// may take it apart and why not; per function returning a record, whether it gets a result
-/// twin and why not, and what each of its call sites that keeps the struct does with it.
-fn explain(m: &Module, a: &Analysis, plans: &[Plan], twins: &[Twin], log: &mut String) {
-    let names = function_names(m.bytes);
-    let name = |f: u32| {
-        names
-            .get(&f)
-            .cloned()
-            .unwrap_or_else(|| format!("func {f}"))
-    };
-    let n_funcs = m.func_type.len() as u32;
-    let defined = m.n_imports..n_funcs;
-    let ref_type = |v: &ValType| match v {
-        ValType::Ref(r) => concrete_index(r.heap_type()).map(|t| (t, r.is_nullable())),
-        _ => None,
-    };
-    let mut seen: Vec<u32> = Vec::new();
-    for f in defined.clone() {
-        let (ps, rs) = m.sig(f);
-        for (t, _) in ps.iter().chain(rs.iter()).filter_map(ref_type) {
-            if !seen.contains(&t) && m.func_sig.get(t as usize).is_some_and(|s| s.is_none()) {
-                seen.push(t);
-            }
-        }
-    }
-    seen.sort_unstable();
-    say!(
-        log,
-        "mv-explain: writes are charged by {}",
-        if m.by_index {
-            "type index and subtyping component (every struct type is in one rec group)"
-        } else {
-            "shape (struct types span several rec groups), and a subtyped record is refused"
-        }
-    );
-    for &t in &seen {
-        let fields = m.shape_all.get(t as usize).cloned().flatten();
-        let Some((fs, _)) = &fields else {
-            if let Some(why) = field_refusal(m.bytes, t).filter(|w| *w != "not a struct") {
-                say!(log, "mv-explain: type {t}: refused: {why}");
-            }
-            continue;
-        };
-        let spelled: Vec<&str> = fs
-            .iter()
-            .map(|(v, _)| match Num::of(*v) {
-                Some(Num::I32) => "i32",
-                Some(Num::I64) => "i64",
-                Some(Num::F32) => "f32",
-                Some(Num::F64) => "f64",
-                None => "ref",
-            })
-            .collect();
-        let producers: Vec<String> = defined
-            .clone()
-            .filter(|&g| result_record_any(m, g) == Some(t))
-            .take(3)
-            .map(name)
-            .collect();
-        let head = format!(
-            "mv-explain: type {t} {{{}}} (returned by {})",
-            spelled.join(", "),
-            if producers.is_empty() {
-                "no function".to_string()
-            } else {
-                producers.join(", ")
-            }
-        );
-        let comp = m.comp.get(t as usize).copied().unwrap_or(t);
-        let family: Vec<u32> = (0..m.comp.len() as u32)
-            .filter(|&u| u != t && m.comp[u as usize] == comp)
-            .collect();
-        if let (Some(_), Some(&h)) = (m.shape_of_type(t), m.nested.get(&t)) {
-            let held = if h == NONE {
-                "any struct (an abstract reference)".to_string()
-            } else {
-                format!("type {h}, a struct nothing writes")
-            };
-            say!(
-                log,
-                "{head}: candidate, kept whole for a callee the escape step may inline: a \
-                 reference field holds {held}"
-            );
-        } else if m.shape_of_type(t).is_some() {
-            say!(log, "{head}: candidate");
-        } else if !m.by_index && !family.is_empty() {
-            say!(
-                log,
-                "{head}: refused: in a subtyping relation with type(s) {family:?}"
-            );
-        } else {
-            let culprit = if m.by_index {
-                std::iter::once(t)
-                    .chain(family.iter().copied())
-                    .find(|u| m.writer.contains_key(u))
-            } else {
-                (0..m.shape_all.len() as u32)
-                    .find(|&u| m.writer.contains_key(&u) && m.shape_all[u as usize] == fields)
-            };
-            let fresh = if m.is_fresh_only(t) {
-                "; still taken apart as a fresh argument (a struct.new passed straight to a \
-                 parameter its callee only reads)"
-            } else {
-                ""
-            };
-            match culprit {
-                Some(u) if u == t => say!(
-                    log,
-                    "{head}: refused: its fields are written (struct.set {t} in {}){fresh}",
-                    name(m.writer[&u])
-                ),
-                Some(u) => say!(
-                    log,
-                    "{head}: refused: type {u}, {}, is written (struct.set {u} in {}){fresh}",
-                    if m.by_index {
-                        "in its subtyping component"
-                    } else {
-                        "of the same shape"
-                    },
-                    name(m.writer[&u])
-                ),
-                None => say!(log, "{head}: refused"),
-            }
-        }
-    }
-    let consumers: Vec<HashMap<u32, (u32, u32)>> = m.bodies.iter().map(arg_consumers).collect();
-    for f in defined.clone() {
-        let rs = &m.sig(f).1;
-        let Some((t, nullable)) = (rs.len() == 1).then(|| ref_type(&rs[0])).flatten() else {
-            continue;
-        };
-        if m.shape_all.get(t as usize).is_none_or(|s| s.is_none()) {
-            continue;
-        }
-        let why = if m.shape_of_type(t).is_none() {
-            Some(format!("its record type {t} is refused (above)"))
-        } else if !m.shape_of_type(t).is_some_and(result_shape) {
-            Some(format!(
-                "its record type {t} has more than {MV_RECORD_MAX_FIELDS} fields or a reference \
-                 field, so it is taken apart only as an argument"
-            ))
-        } else if nullable {
-            Some("its result is nullable (a `T | null` return)".to_string())
-        } else if m.body(f).exits_otherwise {
-            Some(
-                "a br_if, br_table, br_on_*, try, return_call_ref or return_call_indirect can \
-                 leave it with its result"
-                    .to_string(),
-            )
-        } else if !a.producer.contains(&f) {
-            Some("it tail-calls a function that gets no result twin".to_string())
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            say!(
-                log,
-                "mv-explain: {} -> type {t}: no result twin: {why}",
-                name(f)
-            );
-            continue;
-        }
-        // Its call sites in the original bodies: read as fields, or kept and why.
-        let mut served = 0usize;
-        let mut kept: Vec<(String, usize, Vec<String>)> = Vec::new();
-        for (ix, plan) in plans.iter().enumerate() {
-            let g = m.n_imports + ix as u32;
-            let b = &m.bodies[ix];
-            for i in &b.ins {
-                if i.kind != Kind::Call(f) || !i.reach {
-                    continue;
-                }
-                let as_fields = matches!(plan.acts.get(&i.k), Some(Act::Call(to, _))
-                    if *to >= n_funcs
-                        && twins.get((*to - n_funcs) as usize).is_some_and(|t| t.2));
-                if as_fields {
-                    served += 1;
-                    continue;
-                }
-                let reason = match (i.next, consumers[ix].get(&i.k)) {
-                    (Next::StructGet(st, _), _) => format!("read by a struct.get of type {st}"),
-                    (Next::LocalSet(_), _) => {
-                        "held in a local that another use keeps as a struct".to_string()
-                    }
-                    (Next::ArmEnd, _) => {
-                        "chosen by an if/else whose value is kept as a struct".to_string()
-                    }
-                    (Next::Exit, _) => {
-                        "returned by the caller (read as fields only inside the caller's own \
-                         result twin)"
-                            .to_string()
-                    }
-                    (_, Some(&(ck, j))) => {
-                        let h = b.at(ck).and_then(callee_of).map_or_else(String::new, name);
-                        format!("passed as argument {j} of {h}, which keeps it as a struct")
-                    }
-                    _ => "stored (field, array, global), cast, compared, or passed to an import"
-                        .to_string(),
-                };
-                let at = match i.next {
-                    Next::LocalSet(l) => format!("{} local {l}", name(g)),
-                    _ => name(g),
-                };
-                match kept.iter_mut().find(|k| k.0 == reason) {
-                    Some(k) => {
-                        k.1 += 1;
-                        if k.2.len() < 3 && !k.2.contains(&at) {
-                            k.2.push(at);
-                        }
-                    }
-                    None => kept.push((reason, 1, vec![at])),
-                }
-            }
-        }
-        let n_kept: usize = kept.iter().map(|k| k.1).sum();
-        say!(
-            log,
-            "mv-explain: {} -> type {t}: result twin; {served} call site(s) read it as fields, \
-             {n_kept} keep the struct",
-            name(f)
-        );
-        kept.sort_by(|x, y| y.1.cmp(&x.1));
-        for (reason, n, at) in kept {
-            say!(log, "mv-explain:     {n} {reason} (in {})", at.join(", "));
-        }
-    }
-}
-
-/// The record-shaped type a function's single reference result names, before any refusal.
-fn result_record_any(m: &Module, f: u32) -> Option<u32> {
-    let [ValType::Ref(r)] = m.sig(f).1.as_slice() else {
-        return None;
-    };
-    let t = concrete_index(r.heap_type())?;
-    m.shape_all.get(t as usize)?.as_ref().map(|_| t)
-}
+/// What the multi-value step holds field by field in a module: per defined function the locals
+/// it scalarizes, and the `(function, parameter)` pairs a call passes as fields. The step itself
+/// is the compiler's (`optMultivalueScalarized` in `compiler/opt_multivalue.vl`).
+pub(crate) type Scalarized = (Vec<HashSet<u32>>, HashSet<(u32, u32)>);
 
 /// Each function's name in the module's `name` section.
 pub(crate) fn function_names(bytes: &[u8]) -> HashMap<u32, String> {

@@ -7512,8 +7512,8 @@ field by field and drop it. The escape step above could not reach them: a module
 per-type test refused every producer (D3263), and where it did inline, a producer with two
 results (`unit`) merged them, which `--heap2local` cannot melt (D3625's witness, and D3598).
 
-**The rule.** The step the ruling names, at the call boundary, as a host step before the
-escape step (`scripts/vl-host/src/multivalue.rs`). A record is a struct type of 1 to 8 fields,
+**The rule.** The step the ruling names, at the call boundary, as a step before the
+escape step (`compiler/opt_multivalue.vl` since R5 of the `-O` port; the host's `multivalue.rs` until then). A record is a struct type of 1 to 8 fields,
 each `i32`/`i64`/`f32`/`f64`, that no `struct.set` (or atomic write) anywhere in the module
 can reach (by type and subtyping component since D3630, below). A producer returns a non-null reference to one; a function gets
 a twin per `(field parameters, fields result)` pair a call site asks for. A call calls a twin
