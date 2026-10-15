@@ -1157,6 +1157,7 @@ import {
   spreadDstBackSlot,
   spreadElemWidens,
   spreadGroupWrapSlot,
+  spreadLitElemRow,
   spreadOwnBoxRow,
   spreadSourcesStrOrAtoms,
   spreadSourcesWidenTo,
@@ -9051,7 +9052,8 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
         "emitProgram: a spread's source is not a list this rep knows",
       )
     }
-    const row = spreadDestRow(elems, fnIx)
+    const ownRow = spreadDestRow(elems, fnIx)
+    const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx)
     const wrap = spreadWrapIdx(kk, row)
     const back = spreadBackIdx(kk, row)
     if wrap < 0 || back < 0 {
@@ -9089,6 +9091,8 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       const gk = spreadGroupSrcKind(groups[g], elems, kk, fnIx)
       let groupKind = pk
       if gk != kk { groupKind = pendingKindOfMf(gk, 0) }
+      // A fresh source built at a row no source has is built at exactly that row (D4871).
+      if row != ownRow && groupKind == LBK_REF { groupKind = LBK_REF_AT_SLOT }
       expCtxSetListBuild(groupKind, row)
       if emitExpr(body, groups[g], fnIx) < 0 { return -1 }
       svSyncRecv(groups[g], fnIx)
@@ -9116,6 +9120,29 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
     return spreadJoinGroups(slots, wrap, back, kk, row, seq)
   }
   emitFail("emitProgram: expected an array literal")
+}
+
+// The ref-list row spread literal `arrIx` of kind `kk` builds at: the threaded destination's
+// row, else the literal's own typed element's, when every source of another row is itself a
+// list literal, built there as any literal is (D4871); else `own`, the first source's.
+function spreadFreshDestRow(arrIx: i32, kk: MfKind, own: i32, fnIx: i32): i32 {
+  const a = P.nodes[arrIx]
+  if kk != "ref" || !(a is ArrayLit) { return own }
+  let want = spreadLitElemRow(arrIx)
+  if pendingListKind == LBK_REF || pendingListKind == LBK_REF_AT_SLOT {
+    want = pendingListSlot
+  }
+  if want == own || want < 0 || want >= rlElemName.length { return own }
+  const elems = a.arrElems
+  for el in elems {
+    const src = spreadArgOf(el)
+    if src >= 0 {
+      const lit = unwrapParen(src)
+      const isLit = lit >= 0 && lit < P.nodes.length && P.nodes[lit] is ArrayLit
+      if !isLit && refListSlotOfExpr(src, fnIx) != want { return own }
+    }
+  }
+  want
 }
 
 // Join a spread literal's item groups, each already a list at (`kk`, `row`) in its own frame
