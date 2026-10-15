@@ -40,8 +40,14 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
 | - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `plumb-shape-cost.py`, `survey-regrade.py`, `check-filed-witnesses.py` and `distilled/{regress,index,redistil}.py` (+ `gradecensus.py`) deleted | done: `distilled/cellmap.py` is deleted (`loadCells`/`dumpCells`), and `corpuscmp.py`, `grade.py` and `profile-rank.py` are deleted for their VL ports (rows below) |
 
-Rows 1-5 are done and `ratchet.py` is deleted. `mono-tyaram-grid.sh` carries an inline python
-heredoc and moves with its own PR.
+Rows 1-5 are done and `ratchet.py` is deleted. The four inline python heredocs in shell are
+done (T3): `mono-tyaram-grid.sh` generates its cells with `scripts/mono-tyaram-cells.vl` (the 261
+cells are byte-identical to the Python's), `scripts/perf/seed-sections.sh` calls
+`scripts/perf/seed-sections.vl`, `scripts/run-lint-diff.sh` splices the source with `sed -z`, and
+`bench/run.sh` reads each `meta.json` with `bench/meta.vl` and writes its report with
+`bench/report.vl`. The bench harness also lost its Python column (the `main.py` rows above are
+now unreferenced by it), so `results.json` and `summary.md` have no `python` members from the next
+sweep on.
 
 ## Files
 

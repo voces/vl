@@ -35,67 +35,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# $PYTHON pins the interpreter gate.sh preflighted; bare `python3` otherwise.
-PYBIN="${PYTHON:-python3}"
 OUT="${1:-$(mktemp -d)}"
 COMP="${2:-build/vl-compiler.wasm}"
 [ -x "$VL" ] || { echo "missing vl binary: $VL" >&2; exit 1; }
 mkdir -p "$OUT/cells"
 
-"$PYBIN" - "$OUT/cells" <<'PY'
-import sys
-d = sys.argv[1]
-reps = {"i32": "1", "string": '"a"', "f64": "1.5"}
-# name: (preamble, annotation, build-from-%V%, reduce-from-r)
-ctors = {
- "bare":     ("",                                 "T",                   "%V%",         "1"),
- "arr":      ("",                                 "T[]",                 "[%V%]",       "r.length"),
- "arr2":     ("",                                 "T[][]",               "[[%V%]]",     "r.length"),
- "shape":    ("",                                 "{ a: T }",            "{ a: %V% }",  "1"),
- "inlarr":   ("",                                 "{ g: T[] }",          "{ g: [%V%] }","r.g.length"),
- "inlparen": ("",                                 "{ g: (T | null)[] }", "{ g: [%V%] }","r.g.length"),
- "nul":      ("",                                 "T | null",            "%V%",         "1"),
- "fn":       ("",                                 "(T) => T",            "(x: T) => x", "1"),
- "ga":       ("type BoxS<X> = { v: X }\n",        "BoxS<T>",             "{ v: %V% }",  "1"),
- "gaarr":    ("type BoxA<X> = { v: X[] }\n",      "BoxA<T>",             "{ v: [%V%] }","r.v.length"),
- "gaargarr": ("type BoxG<X> = { v: X }\n",        "BoxG<T[]>",           "{ v: [%V%] }","r.v.length"),
- "gapnul":   ("type BoxN<X> = { v: X | null }\n", "BoxN<T>",             "{ v: %V% }",  "1"),
- # Added after the widened sweep that found the map-value hole: every one of these is a
- # constructor the original twelve did not reach, and `mapval` is the cell that was BAD.
- "twoparam": ("type Pr<A, B> = { a: A, b: B }\n",  "Pr<T, i32>",          "{ a: %V%, b: 1 }",   "1"),
- "appofapp": ("type C<X> = { v: X }\n",            "C<C<T>>",             "{ v: { v: %V% } }",  "1"),
- "apparr":   ("type C<X> = { v: X }\n",            "C<T>[]",              "[{ v: %V% }]",       "r.length"),
- "arrapp":   ("type CA<X> = { v: X[] }\n",         "CA<T>",               "{ v: [%V%] }",       "r.v.length"),
- "mapval":   ("",                                   "{[string]: T}",       "Map()",              "1"),
- "unionpar": ("",                                   "T | i32",             "%V%",                "1"),
- "nulapp":   ("type CN<X> = { v: X }\n",           "CN<T> | null",        "{ v: %V% }",         "1"),
- "fnret":    ("",                                   "() => T",             "() => %V%",          "1"),
- "arrfn":    ("",                                   "((T) => T)[]",        "[(x: T) => x]",      "r.length"),
- "shapefn":  ("",                                   "{ f: (T) => T }",     "{ f: (x: T) => x }", "1"),
- "deepshape":("",                                   "{ a: { b: { c: T } } }","{ a: { b: { c: %V% } } }","1"),
- "arrnulapp":("type CX<X> = { v: X }\n",           "(CX<T> | null)[]",    "[{ v: %V% }]",       "r.length"),
- # Added after the deep-composition sweep. The map-value hole showed that a constructor the
- # grid does not spell is a constructor it cannot clear, and every one of these nests a map
- # or a union one level further than anything above.
- "maparr":   ("",                                   "{[string]: T}[]",     "[Map()]",            "r.length"),
- "arrmap":   ("",                                   "{[string]: T[]}",     "Map()",              "1"),
- "mapmap":   ("",                                   "{[string]: {[string]: T}}","Map()",         "1"),
- "arr2un":   ("",                                   "(T | null)[][]",      "[[%V%]]",            "r.length"),
- "mapapp":   ("type CM<X> = { v: X }\n",           "{[string]: CM<T>}",   "Map()",              "1"),
-}
-n = 0
-for rname, lit in reps.items():
-    for cname, (pre, ann, build, red) in ctors.items():
-        bv = build.replace("%V%", "v")   # inside the generic the parameter is `v`
-        bl = build.replace("%V%", lit)   # at the call site, a literal
-        n += 1; open(f"{d}/ret_{cname}_{rname}.vl", "w").write(
-            f"{pre}function f<T>(v: T): {ann} {{\n  {bv}\n}}\n\nconst r = f({lit})\nprint({red})\n")
-        n += 1; open(f"{d}/loc_{cname}_{rname}.vl", "w").write(
-            f"{pre}function f<T>(v: T): i32 {{\n  const r: {ann} = {bv}\n  1\n}}\n\nprint(f({lit}))\n")
-        n += 1; open(f"{d}/par_{cname}_{rname}.vl", "w").write(
-            f"{pre}function f<T>(v: {ann}): i32 {{\n  1\n}}\n\nprint(f({bl}))\n")
-print(f"generated {n} cells", file=sys.stderr)
-PY
+"$VL" run scripts/mono-tyaram-cells.vl -- "$OUT/cells" >&2
 
 : > "$OUT/results.txt"
 mkdir -p "$OUT/res"

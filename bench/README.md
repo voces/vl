@@ -21,6 +21,8 @@ finds every place VL is slower than it should be.
 ```
 bench/
   run.sh                     the harness (this is the only executable; owns results/)
+  meta.vl                    reads one meta.json for run.sh (expect files, void, axis, variants)
+  report.vl                  writes results.json and summary.md from raw.ndjson
   README.md                  this file
   results/
     results.json             one record per benchmark per configuration
