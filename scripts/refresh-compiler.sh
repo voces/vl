@@ -46,10 +46,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# The self-compile's collector is a CHOICE, not the default's accident: `auto` is copying,
-# and null is ~10% faster here, so pinning it keeps a default change from silently
-# moving the fixpoint's CPU (DECISIONS.md, "The compiler's collector is copying by default").
-export VL_COMPILE_GC=null
+# The self-compile's collector is a CHOICE, not the default's accident: copying from a 2 GiB
+# first heap, owned by scripts/self-compile-gc.sh (DECISIONS.md, "The self-compile runs under
+# copying from a 2 GiB heap").
+. scripts/self-compile-gc.sh
 SEED="${SEED:-build/vl-compiler.wasm}"
 OUT="${OUT:-build/vl-compiler.wasm}"
 FALLBACK=1
@@ -210,7 +210,7 @@ else
   mv "$SHIP" "$OUT"
   # The sanity run (and any ladder rung that compiled WITH $SHIP) left fresh `.cwasm`
   # sidecars beside it — the host's cached wasmtime compilations, ONE PER ENGINE
-  # CONFIGURATION (`$OUT.<seed key>.<engine tag>.cwasm`: the null-collector compile, the
+  # CONFIGURATION (`$OUT.<seed key>.<engine tag>.cwasm`: the self-compile's, the null-collector compile, the
   # copying engine `vl build`/`vl run` and `vl check`/`fmt`/`test` share, and the fuel
   # engines each keep their own file, and none evicts another). Move them all along so
   # the next `vl` invocation deserializes instead of re-JITing, after clearing whatever sat beside
