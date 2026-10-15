@@ -550,7 +550,6 @@ import {
   mkObjTy,
   mkPrim,
   nomNameOfTy,
-  numLitUnionBaseName,
   numLitUnionBaseTy,
   nwBaseTyIxs,
   nwDeclNames,
@@ -564,10 +563,8 @@ import {
   tvNestOf,
   tyAllMaps,
   tyAmong,
-  tyArrElemTy,
   tyArrHasEq,
   tyArrayElemIx,
-  tyArrayElemPrimIs,
   tyBearsNull,
   tyBuiltinIndexable,
   tyContainsList,
@@ -582,7 +579,6 @@ import {
   tyHasLitLeaf,
   tyHasMapMember,
   tyHasNullHole,
-  tyHasRepHoleAt,
   tyHoldsListUnion,
   tyHoldsObj,
   tyHoldsRecord,
@@ -590,23 +586,18 @@ import {
   tyIsDeclaredParam,
   tyIsEmitRepresentable,
   tyIsFuncArena,
-  tyIsFuncTy,
   tyIsHole,
   tyIsListView,
   tyIsLitUnion,
-  tyIsLitUnionAlias,
   tyIsLitUnionArray,
-  tyIsMap,
   tyIsMapJoinUnion,
   tyIsNewtypeBrand,
   tyIsNicheNulScalarElem,
   tyIsNulI32BackedListInner,
-  tyIsNulStringRep,
   tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyIsParamHole,
   tyIsPlainScalar,
-  tyIsPlainStructTy,
   tyIsPrimIx,
   tyIsPrimNamed,
   tyIsStructBearingUnion,
@@ -625,25 +616,19 @@ import {
   tyNameAtoms,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
-  tyNulInnerIsPrim,
-  tyNulInnerTy,
-  tyNumScalarBaseName,
   tyObjHasMapField,
   tyParamNamesPart,
   tyPinsEmptyHoles,
   tyPrimNameOf,
   tyPrintsAsRef,
   tyReachesBrand,
-  tyReachesClosure,
   tyReachesEmptyHole,
-  tyReachesMap,
   tyReachesSelf,
   tyReachesUnion,
   tyRefusesArrayDemand,
   tyRepVaries,
   tySame,
   tyScalarBaseIs,
-  tyScalarBasePrim,
   tyToEmitName,
   tyToEmitNameAt,
   tyToNominalName,
@@ -957,7 +942,6 @@ import {
   armLiteralBaseTy,
   arrElemTyOrNone,
   arrElemValueTy,
-  emptyTextList,
   flattenVariantsInto,
   homogLitUnionBase,
   intLitUnionBasesOf,
@@ -999,7 +983,6 @@ import {
   tyMentionsVoid,
   tyNamesNominal,
   tyNestsV128,
-  tyNulLitUnionMemberTexts,
   tyObjFieldIsLitUnion,
   tyPeelElems,
   tyReachesHole,
@@ -1022,7 +1005,6 @@ import {
   ESC_I32,
   ESC_I64,
   ESC_UNKNOWN,
-  MAP_KEY_STR,
   arrSpineIsMap,
   arrSpineIsNominal,
   arrSpineIsObj,
@@ -1038,7 +1020,6 @@ import {
   isValueUnionName,
   litScalarBoxLeaves,
   litUnionArrayElemOf,
-  mapKeyKindOfTy,
   mapKeyTySupported,
   mapTyValExcludesNull,
   mapTyValIsBool,
@@ -1065,20 +1046,17 @@ import {
   tyIsI32SentinelNullable,
   tyIsNulStrBoxUnion,
   tyIsValueUnion,
-  tyMapKeyKindSpan,
   tyPrintUnionArmsInDomain,
   tyPrintsAsUnionBox,
   unionArmBoxSafe,
   unionRidesI32Spine,
 } from "./check_ty_rep"
 import {
-  EqCmpKind,
   REC_STORE_DEPTH,
   containerElemClassDiffers,
   containerWidenServed,
   containerWidenWhy,
   covarNonNullArms,
-  eqCmpKindOfTy,
   eqRefusals,
   fieldStorageEq,
   fvaFnMayDiffer,
@@ -1225,6 +1203,20 @@ import {
   numLitReadLeafPush,
   numLitReadNotePush,
 } from "./check_num_lit_state"
+import {
+  colAt,
+  nodeArrayElemTyIx,
+  nodeTyArrayElemRepName,
+  nodeTyIsLitUnion,
+  nodeTyIsNulLitUnion,
+  nodeTyIsNulString,
+  nodeTyIx,
+  nodeTyIxOf,
+  nodeTyOf,
+  nodeTyRecord,
+  nodeTySet,
+  nodeTyWrites,
+} from "./check_node_tys"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -4674,20 +4666,6 @@ let inferLetNulBoolIx: i32[] = []
 let inferJoinTys: i32[] = []
 let inferJoinTySet: boolean[] = []
 let bodyChecked: {[string]: boolean} = Map()
-// Typed-IR foundation: node index → resolved type-arena index, recorded for every node on the
-// real (non-quiet) check pass so the emitter consumes the checker's computed type instead of
-// re-deriving it syntactically. A flat table sized to the node arena at `checkProgram`; nodes the
-// emitter synthesizes later fall past the end and read -1, so a consumer falls back syntactically.
-let nodeTyIx: i32[] = []
-
-// Bumped by every indexed write into `nodeTyIx` (`nodeTySet`), so an emit memo reading node
-// types can tell when one is rewritten in place.
-export let nodeTyWrites = 0
-
-function nodeTySet(ix: i32, ty: i32) {
-  nodeTyIx[ix] = ty
-  nodeTyWrites = nodeTyWrites + 1
-}
 // Un-annotated bindings whose initializer is a `??` or an `if` join, the only ones the emitter
 // may pin to a list union (D2844). Appended per checked binding; a repeat is harmless.
 export let letJoinCandidates: i32[] = []
@@ -6612,12 +6590,6 @@ function memberCalleeKind(cf: Member) {
   // `self`-function this reading cannot see: opaque.
   if t is TyObj || t is TyArray || t is TyMap { return -1 }
   -2
-}
-
-// The type recorded for a node by the check that already visited it, or -1.
-function nodeTyOf(ix: i32) {
-  if ix < 0 || ix >= nodeTyIx.length { return -1 }
-  nodeTyIx[ix]
 }
 
 // The names a function binds: its parameters, every `let`/`const` in its body at any depth, both
@@ -24426,18 +24398,6 @@ export function isTransparentAlias(name: string) {
   singleMemberAliasTyIx(name) >= 0
 }
 
-// The decision form as the node query — `tyScalarBaseIs` where the emitter holds a node.
-export function nodeScalarBaseIs(ix: i32, nm: PrimName): boolean {
-  tyScalarBasePrim(nodeTyIxOf(ix)) == nm
-}
-
-// The base numeric scalar node `ix`'s recorded type reps as, or "" — `tyNumScalarBaseName`
-// as the node query the emitter asks (it holds nodes, not arena indices, and reads every
-// other type fact of an `is` receiver through a wrapper of exactly this shape).
-export function nodeNumScalarBaseName(ix: i32) {
-  tyNumScalarBaseName(nodeTyIxOf(ix))
-}
-
 // True if `name` is an application of a declared generic alias whose argument list closes
 // the whole name (`Box<i32>`), not `Box<i32>[]` or `Box<i32>|Tag`, whose suffix a caller
 // peels first. Checked against the generic-alias registry (`gaIndexOf`), not taken on the
@@ -25616,12 +25576,6 @@ export function canonEmitTypeNames() {
     i = i + 1
   }
   0
-}
-
-// The `==` lowering token for the value AST node `ix` reads — `eqCmpKindOfTy` of the type the
-// checker banked for it. The emitter's whole view of the comparability question.
-export function nodeEqCmpKind(ix: i32): EqCmpKind {
-  eqCmpKindOfTy(nodeTyIxOf(ix))
 }
 
 // —— the one home for "is this `+` a list concat", the `+` twin of the `==` home above ——
@@ -49001,26 +48955,6 @@ function vbUnionMemberName(mIx: i32): string {
   ""
 }
 
-// True if node `ix`'s recorded type is a pure literal union (every member a `TyLit` of one
-// base scalar): it reps as the interned i32 atom or that scalar, never the value-union box, so
-// the emitter's union-box classifiers must not claim it. A mixed-base one (`1 | "a"`, or two
-// integer widths) is the box, exactly as `isValueUnionBox` decides (D3491, D4199).
-export function nodeTyIsPureLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length < 2 { return false }
-    let i = 0
-    while i < t.uMembers.length {
-      if !(T.tys[t.uMembers[i]] is TyLit) { return false }
-      i = i + 1
-    }
-    return !isValueUnionBox(ty)
-  }
-  false
-}
-
 // The public entry point: checks the program rooted at node `rootIx`, returning the number
 // of diagnostics raised (diagnostics also accumulate on `T.diags`).
 // ── extern declarations ──────────────────────────────────────────────────────
@@ -50094,24 +50028,6 @@ function a20RetWalk(ix: i32, tail: boolean, out: i32[]) {
   0
 }
 
-// D969 — carries a checked type onto a node the checker never saw. A rewrite that synthesizes
-// a node is type-blind as well as node-erasing (`nodeTyIx` has no entry for it), so a
-// meaning-preserving rewrite must hand the old node's type to the new one. The one place that
-// writes the column, so its growth discipline (`push(-1)` up to the index) lives here.
-export function nodeTyCarry(dst: i32, src: i32) {
-  if dst < 0 { return 0 }
-  nodeTyRecord(dst, nodeTyIxOf(src))
-}
-
-// `nodeTyCarry` for a synthesized node whose type no existing node holds, such as the list a
-// boxed capture's cell is. A negative `ty` records nothing.
-export function nodeTyRecord(dst: i32, ty: i32) {
-  if dst < 0 || ty < 0 { return 0 }
-  while nodeTyIx.length <= dst { nodeTyIx.push(-1) }
-  nodeTySet(dst, ty)
-  0
-}
-
 // The type `p?.f(…)` has once its receiver guard holds — the callee's own return, before the
 // `| null` the optional call wraps around it. Banked per call site: the node's recorded type
 // is the whole optional call's, and the guarded arm the emit-time desugar builds yields only
@@ -50170,16 +50086,6 @@ export function optCallRestamp(ix: i32) {
   0
 }
 
-// Element `i` of a per-node column, or -1 when `i` is outside it.
-function colAt(col: i32[], i: i32): i32 {
-  if i >= 0 && i < col.length { return col[i] }
-  -1
-}
-
-// The resolved type-arena index the checker recorded for AST node `ix`, or -1 if none (an
-// emitter-synthesized node, or a node never checked). The emitter reads the `Ty` at this
-// index to lower the node by its checked type rather than re-deriving it syntactically.
-export function nodeTyIxOf(ix: i32) { colAt(nodeTyIx, ix) }
 // Annotation atom count (#1055): how many top-level `|`-joined atoms the annotation node
 // `ix`'s emit-time spelling has, banked by `canonEmitTypeNames`. -1 for a node that is not a
 // `TypeRef` or that postdates the bank (an emitter-synthesized annotation); >= 1 otherwise.
@@ -50950,58 +50856,6 @@ export function recordClonedIsVarTy(nodeIx: i32, name: string) {
 // annotation node at all (`parType` stays -1), so it has no `recordClonedNodeTy` return to
 // bank; this is the one type it needs and the constant is here rather than exported mutable.
 export function i32TyIx() { TY_I32 }
-// The primitive-type name the checker recorded for node `ix` — `T.tys[nodeTyIx[ix]]`'s
-// `primName` when it resolved to a `TyPrim`, else "". A structural query over the `Ty` arena,
-// so a scalar rep is decided from the checked type rather than a re-parsed annotation name.
-export function nodeTyPrimName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyPrim { return t.primName }
-  ""
-}
-
-// Node `ix`'s recorded type with up to seven one-member `UnionDecl` wrappers peeled, or -1 when it
-// is unrecorded or still wrapped after the bound. A canonicalized object intersection
-// (`{a} & {b}`) arrives as `TyUnion[TyObj]`, so the peel is load-bearing.
-function nodeTyPeelOneMember(ix: i32): i32 {
-  let cur = nodeTyIxOf(ix)
-  let peels = 0
-  while peels < 8 {
-    if cur < 0 { return -1 }
-    const t = T.tys[cur]
-    if t is TyUnion {
-      if t.uMembers.length != 1 { return cur }
-      cur = t.uMembers[0]
-    } else {
-      return cur
-    }
-    peels = peels + 1
-  }
-  -1
-}
-
-// Whether node `ix`'s recorded type is a function type (`TyFunc`). Structural, so a func
-// array (`((i32)=>i32)[]`, a `TyArray`) or a nullable closure (a `TyNullable`) is excluded
-// for free, unlike a depth-aware `=>` test on the rendered name.
-export function nodeTyIsFunc(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyFunc { return true }
-  false
-}
-// An ARRAY of functions (`TyArray` over `TyFunc`) — the element twin of `nodeTyIsFunc`, for
-// a ref-list cell whose element is a closure. `aElem` is bound-tested rather than trusted:
-// an unresolved element is the hole `-1`, and `T.tys[-1]` traps (D1440).
-export function nodeTyIsFuncArray(ix: i32) {
-  tyIsFuncTy(tyArrElemTy(nodeTyIxOf(ix)))
-}
-// A NULLABLE function (`TyNullable` over `TyFunc`) — the niche twin of `nodeTyIsFunc`, for
-// the `nulclosure` rep. `nInner` is bound-tested for the reason above (D1440).
-export function nodeTyIsNulFunc(ix: i32) {
-  tyIsFuncTy(tyNulInnerTy(nodeTyIxOf(ix)))
-}
 
 // `nodeTyArrayElemRepName` with a hole element resolved through its banked pin. A container
 // whose own type is not a hole can still have one for its element — `const xs = [a]` over a
@@ -51028,86 +50882,6 @@ export function nodeTyArrayElemPinRepName(ix: i32): string {
     // what that shape is missing, and the floor is doing its job (D1740).
   }
   ""
-}
-
-// The wasm element-rep name of the array type recorded for node `ix`, normalized to the
-// emitter's list-rep vocabulary — "i32" (`i32[]`, `boolean[]`, or a litunion `K[]`, all
-// sharing the i32 atom backing), "f64"/"f32"/"i64", "string", or "" when `ix` is not a
-// recorded array or its element is a ref/nested list. Mirrors `nameIsI32Array`/etc.
-export function nodeTyArrayElemRepName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyArray {
-    const e = t.aElem
-    if e >= 0 {
-      const et = T.tys[e]
-      if et is TyPrim {
-        if et.primName == "boolean" { return "i32" }
-        return et.primName
-      }
-      // A `(boolean | null)[]` element (the boolean sentinel niche) shares the i32 backing
-      // (0/1, spare 2 = null); only the `null -> 2` coercion and the sentinel read/print differ.
-      if et is TyNullable {
-        if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
-        const en = T.tys[et.nInner]
-        if en is TyPrim {
-          if en.primName == "boolean" { return "i32" }
-          // A `(string | null)[]` element is the string ref made nullable — `string[]` is
-          // already `(ref null $aTypeIdx)`, so only construct/read of the null case differs.
-          if en.primName == "string" { return "string" }
-        }
-      }
-      if tyIsLitUnion(e) { return "i32" }
-      // A numeric literal-union element (`type K = 1.5 | 2.5`) has no atom — its members are
-      // plain scalar values, so its list is the base scalar's list, not a second rep.
-      const nb = numLitUnionBaseName(e)
-      if nb != "" { return nb }
-      // A `(K | null)[]` element (the litunion atom niche) shares the i32 backing (ids >= 0,
-      // spare `-1` = null) exactly like the non-null `K[]` case above.
-      if tyIsNullableLitUnion(e) { return "i32" }
-    }
-  }
-  ""
-}
-// The widened scalar rep of node `ix`'s type — like `nodeTyPrimName`, but a string literal
-// union (`"a"|"b"`) reports "string" (its one-way widening). "" for a non-prim/non-litunion,
-// letting the `string` classifier read the arena without misclassifying a litunion.
-export function nodeTyWidenedRepName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyPrim { return t.primName }
-  if tyIsLitUnion(ty) { return "string" }
-  // A single literal or homogeneous numeric literal union widens to its base scalar here too,
-  // matching `canonEmitName`'s softening — a mixed `"a"|7` stays the value-union box instead.
-  const soft = softenLitTy(ty)
-  if soft != ty {
-    const st = T.tys[soft]
-    if st is TyPrim { return st.primName }
-  }
-  ""
-}
-// Whether node `ix`'s type is `string | null` (kind 16) — a `TyNullable` over `string` or one
-// string literal (D2827); a `K | null` litunion niche is not this.
-export function nodeTyIsNulString(ix: i32) { tyIsNulStringRep(nodeTyIxOf(ix)) }
-// Whether node `ix`'s recorded type contains a type variable — it is one, or one sits under
-// a constructor (`T[]`, `T | null`, `{v: T}`). Inside a monomorphized instance the operand
-// nodes are shared with the generic template, so the banked type is still `T` and this is
-// correct about the type variable and useless about the instance (D42).
-export function nodeTyHasTyVar(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  tyHasHole(ty)
-}
-// `nodeTyHasTyVar` minus the one position a type variable can sit in without deciding the
-// value's rep: a closure parameter's valtype is the fat pointer at every instantiation, so a
-// `T` under a `=>` does not decide the rep the way a bare `T` parameter's annotation does
-// (D426).
-export function nodeTyHasRepTyVar(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  tyHasRepHoleAt(ty, 0)
 }
 
 // D1045's nominal-escape rule (DECISIONS.md): the source name of a body-scoped nominal type
@@ -51182,85 +50956,6 @@ function refuseLocalNomEscape(t: i32, at: i32) {
   )
   0
 }
-// Whether node `ix`'s type is `boolean | null` (the i32 sentinel-2 niche). Lets `exprNulBool`
-// recover the niche from the checker's recorded type for an expression whose syntactic form
-// it can't trace (a `(boolean | null)[]` element read, an inferred `const`), routing `!=
-// null`/`?? d`/print to the sentinel compare. Mirrors `nodeTyIsNulString`.
-export function nodeTyIsNulBool(ix: i32) {
-  tyNulInnerIsPrim(nodeTyIxOf(ix), "boolean")
-}
-// Whether node `ix`'s type is a nullable numeric scalar (`i32|null`, `i64|null`, `f64|null`,
-// `f32|null`) — its inner has no spare value to niche into, so it reps as the value-union
-// `{tag, value}` box. The niche nullables (`string`/`boolean`/litunion/struct/closure/list
-// `| null`) are structurally excluded — they are not box values.
-export function nodeTyIsNulScalarBox(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    // D1575 — `nInner` is -1 while the a-infer-null hole is open (`let x = null`); unguarded
-    // this traps the compiler on a check-clean program. An open hole is no prim, so false.
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    const inner = T.tys[t.nInner]
-    if inner is TyPrim {
-      return (inner.primName == "i32"
-        || inner.primName == "i64"
-        || inner.primName == "f64"
-        || inner.primName == "f32")
-    }
-  }
-  false
-}
-// Whether node `ix`'s type is `i32[] | null` / `boolean[] | null` (kind 15, nullable i32-list)
-// — a `TyNullable` whose inner is an array of the `i32`/`boolean` prim (both i32-repped). A
-// litunion array is excluded, matching `nameIsNulI32List` (which tests only those two names).
-export function nodeTyIsNulI32List(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    const it = T.tys[t.nInner]
-    if it is TyArray {
-      const e = it.aElem
-      if e >= 0 {
-        const et = T.tys[e]
-        if et is TyPrim {
-          return et.primName == "i32"
-            || et.primName == "boolean"
-            || et.primName == "null"
-        }
-        // A literal-union element (`K[] | null`) shares the i32-list backing exactly like
-        // `i32[]` (the arena dual of `nameIsI32Array`'s litunion arm).
-        if tyIsLitUnion(e) { return true }
-        // A niche-nullable i32-backed element (`(K | null)[] | null`) rides its null in the
-        // same i32 sentinel and the outer `| null` is the same niche, matching the non-null case.
-        if tyIsNullableLitUnion(e) { return true }
-        if et is TyNullable {
-          if et.nInner < 0 || et.nInner >= T.tys.length { return false }
-          const ei = T.tys[et.nInner]
-          if ei is TyPrim { return ei.primName == "boolean" }
-        }
-      }
-    }
-  }
-  false
-}
-// Whether node `ix`'s type is an array of functions (`((i32)=>i32)[]`) — a `TyArray` whose
-// element is a `TyFunc` (a closure-element ref list, kind 5). Mirrors `nameIsClosureArray`.
-export function nodeTyIsClosureArray(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    const e = t.aElem
-    if e >= 0 {
-      const et = T.tys[e]
-      if et is TyFunc { return true }
-    }
-  }
-  false
-}
 // —— dense membership over the `Ty`-arena index sets ————————————————————————
 // Each nominal-identity sidecar set is membership-tested through a parallel `boolean[]`
 // indexed by the arena index itself, since the emitter probes membership on nearly every
@@ -51278,136 +50973,6 @@ function cTyIxSetAdd(xs: i32[], flags: boolean[], v: i32) {
     flags[v] = true
   }
   0
-}
-// Whether node `ix`'s recorded type is a declared struct and not a union-variant member — the
-// nominal analogue of `isSName(tyNameOf(ix))`, read from the checker's arena-index sets
-// instead of an AST scan. Under-approximates (an uncovered struct reads false), so callers
-// keep the name test as a fallback.
-export function nodeTyIsStruct(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  if cTyIxSetHas(cVariantMemberTyIxSet, ty) { return false }
-  if cTyIxSetHas(cStructTyIxSet, ty) { return true }
-  const t = T.tys[ty]
-  if t is TyObj { return true }
-  if t is TyUnion {
-    // A struct-alias union — a canonicalized `{a} & {b}` intersection wraps its merged object
-    // shape in a one-member union; the emitter interns it as a struct (`isSName`), so match it.
-    if t.uMembers.length == 1 {
-      const m = T.tys[t.uMembers[0]]
-      if m is TyObj { return true }
-    }
-  }
-  false
-}
-// Whether node `ix`'s recorded type is an object union-variant member — the nominal analogue
-// of `variantIndexOf(tyNameOf(ix)) >= 0`. The `is TyObj` guard excludes a transparent
-// single-member primitive alias (`type Id = i32`), whose member lands in the set but denotes
-// the scalar, not a variant box.
-export function nodeTyIsVariant(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  if !cTyIxSetHas(cVariantMemberTyIxSet, ty) { return false }
-  const t = T.tys[ty]
-  if t is TyObj { return true }
-  false
-}
-
-// Whether node `ix`'s recorded type is a nullable plain struct (`S | null`), a variant excluded.
-export function nodeTyIsNulStruct(ix: i32) {
-  tyIsPlainStructTy(tyNulInnerTy(nodeTyIxOf(ix)))
-}
-// Whether node `ix`'s recorded type is a union box — a `TyUnion` of more than one member, or a
-// `TyNullable`. A literal union is excluded (an interned i32 atom, not a box). The arena twin
-// of `isUName`, which tests a spelling-keyed registry whose member lists do not correspond to
-// the arena's — asking the type directly needs no identity, only shape.
-export function nodeTyIsUnionish(ix: i32): boolean {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  if tyIsLitUnion(ty) { return false }
-  const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length > 1 { return true }
-    // The same one-member wrapper `nodeTyIsUnionAlias` unwraps: a self-referential union with a
-    // `null` arm. The gate and the lowering must agree, or the parameter lowers as `i32` (invalid wasm).
-    if t.uMembers.length == 1 {
-      const m = T.tys[t.uMembers[0]]
-      if m is TyNullable { return true }
-    }
-    return false
-  }
-  if t is TyNullable { return true }
-  false
-}
-
-// Whether node `ix`'s recorded type denotes a struct (`TyObj`), seeing through the parser's
-// one-member `UnionDecl` wrapper. The arena twin of `isSName`, needing shape and no identity —
-// every gap in the name registry (generic instances, `#anon0` shapes) stops mattering. The
-// peel is load-bearing: a canonicalized object intersection (`{a} & {b}`) arrives as `TyUnion[TyObj]`.
-export function nodeTyIsStructish(ix: i32): boolean {
-  const ty = nodeTyPeelOneMember(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyObj { return true }
-  false
-}
-
-// Whether node `ix`'s recorded type denotes an array (`TyArray`), seeing through the parser's
-// one-member `UnionDecl` wrapper (the same transparency `nodeTyIsStructish` needs). The arena
-// twin of `nameIsArray`, which tested the rendering for a trailing `]` — that test also
-// claimed a union whose last arm is an array, which `nodeTyIsUnionish` now claims first.
-export function nodeTyIsArrayish(ix: i32): boolean {
-  const ty = nodeTyPeelOneMember(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray { return true }
-  false
-}
-
-// Whether node `ix`'s recorded type is a nullable-boolean list — `TyArray` over a
-// `TyNullable` over `TyPrim("boolean")`, the `(boolean | null)[]` seed kind. The arena twin of
-// `nameIsNulBoolList`. The element here is a niche (0/1, spare 2 for null), not a box, so the
-// elem-rep readers that answer for a plain `boolean[]` do not claim it.
-export function nodeTyIsNulBoolList(ix: i32): boolean {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    const e = t.aElem
-    if e < 0 { return false }
-    const et = T.tys[e]
-    if et is TyNullable {
-      const inner = et.nInner
-      if inner < 0 { return false }
-      const it = T.tys[inner]
-      if it is TyPrim { return it.primName == "boolean" }
-    }
-  }
-  false
-}
-
-// `tyReachesClosure` over node `ix`'s recorded type, at the emitter's standard peel bound.
-export function nodeTyReachesClosure(ix: i32): boolean {
-  tyReachesClosure(nodeTyIxOf(ix), 8)
-}
-
-// Whether node `ix`'s recorded type is an array of a declared struct (`S[]`) — the clean base
-// case of the emitter's recursive `nameIsRefArray`. Confirms only the plain struct-element
-// list (element in `cStructTyIxs`, not a variant member); other ref arrays fall to the name path.
-export function nodeTyIsStructArray(ix: i32) {
-  tyIsPlainStructTy(tyArrElemTy(nodeTyIxOf(ix)))
-}
-// Whether node `ix`'s recorded type is a nullable literal union — the per-node form of
-// `tyIsNullableLitUnion`, the one home of this question. Canon preserves a nullable litunion's
-// members in both the `TyNullable` and the expanded `TyUnion` spelling, so both must classify
-// here, or a niche cell builds as a union box while every read lowers the atom (D-NULLITHOME).
-export function nodeTyIsNulLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable { return tyIsNullableLitUnion(ty) }
-  if t is TyUnion { return tyIsNullableLitUnion(ty) }
-  false
 }
 
 // The registered litunion alias's own arena index whose member set is exactly the str-literal
@@ -51431,15 +50996,6 @@ export function litUnionAliasTyOfMembers(members: i32[]): i32 {
   const a = luPosOfTexts(texts)
   if a < 0 { return -1 }
   cUnionTyIxs[a]
-}
-
-export function nodeTyIsLitUnionAlias(ix: i32) {
-  tyIsLitUnionAlias(nodeTyIxOf(ix))
-}
-
-// Node-taking wrapper over `tyBearsNull`.
-export function nodeTyBearsNull(ix: i32): boolean {
-  tyBearsNull(nodeTyIxOf(ix))
 }
 
 // A value/struct union box (`isUName`'s registry) or a nullable-numeric-literal-union base
@@ -51559,53 +51115,6 @@ export function listFitLitLeafOf(testTy: i32, recvTy: i32, layers: i32[]): i32 {
   tt
 }
 
-// Whether node `ix`'s type is `((...) => ...) | null` (kind 19, nullable closure) — a
-// `TyNullable` whose inner is a `TyFunc`. Mirrors `nameIsNulClosure`; the structure excludes
-// a nullable non-closure for free.
-export function nodeTyIsNulClosure(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    const inner = T.tys[t.nInner]
-    if inner is TyFunc { return true }
-  }
-  false
-}
-
-// Whether node `ix`'s recorded array element is the `boolean` primitive — structurally, with
-// no render and no compare. Replaces `nodeArrayElemName(ix) == "boolean"`, whose `TyPrim` arm
-// is a `tyToStructStr` call with no other consumer than that compare.
-export function nodeTyArrayElemIsBoolPrim(ix: i32): boolean {
-  tyArrayElemPrimIs(nodeTyIxOf(ix), "boolean")
-}
-
-// Whether node `ix`'s recorded array element is NULLABLE — a `TyArray` over a `TyNullable`.
-// The `| null` that a shared rep hides: `(string | null)[]` and `string[]` are one wasm type,
-// so only the arena can tell a pin which of them it holds (D1897).
-export function nodeTyArrayElemIsNullable(ix: i32): boolean {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    if t.aElem < 0 || t.aElem >= T.tys.length { return false }
-    const el = T.tys[t.aElem]
-    if el is TyNullable { return true }
-  }
-  false
-}
-// The nested form: an array of arrays whose leaf element is the `boolean` primitive. Replaces
-// two grammar cuts over a render (`arrElemNameRaw(arrElemNameRaw(...))`) with two direct
-// `TyArray` hops.
-export function nodeTyNestedElemIsBoolPrim(ix: i32): boolean {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray { return tyArrayElemPrimIs(t.aElem, "boolean") }
-  false
-}
-
 // The element type name of the array the checker recorded for node `ix` (e.g. `"f64"`, an
 // inline `{v: i32}` shape), or "" when `ix` has no recorded concrete array type. A generic
 // element (a `TyVar`) returns "" — a generic build's annotation is substituted by the
@@ -51682,67 +51191,6 @@ export function nodeArrayElemName(ix: i32) {
   ""
 }
 export function inferLetTyAt(i: i32) { inferLetTy[i] }
-
-// The canonical emit render of node `ix`'s recorded struct type (`tyToEmitName` — spaceless,
-// litunion-alias preserving), or "" when not a `TyObj` or unrepresentable. Tried before
-// `nodeTyName`'s spaced render, which flattens an alias field and can match the wrong
-// same-fieldset row. Scoped to the resolution site so annotation-synthesis keeps its own spelling.
-export function nodeTyCanonObjName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyObj {
-    // A recursive type (`type L = {n: L | null}`) has no finite canonical render — `tyToEmitName`
-    // carries no back-edge vocabulary, so this declines past depth 16 rather than recursing unboundedly.
-    if tyDeeperThan(ty, 16) { return "" }
-    return tyToEmitName(ty)
-  }
-  ""
-}
-
-// Whether node `ix`'s recorded type is the `string` primitive — asked of the arena instead of
-// `nodeTyName(ix) == "string"`, which rendered a spelling only to compare it against a
-// constant. `TyPrim`-only, deliberately: a literal union canon-softens to `string` at several
-// positions, and a caller that wants the softened answer should read the render instead.
-export function nodeTyIsStringPrim(ix: i32): boolean {
-  primNameOf(nodeTyIxOf(ix)) == "string"
-}
-
-// The rendered name of the scalar/string type the checker recorded for node `ix` (`"f64"`,
-// `"string"`, `"i32"`, ...), or "" when none, generic, or composite. The emitter reads this for
-// an un-annotated callback param (`xs.map((x) => ...)`) to synthesize its annotation, so the
-// param's valtype follows the contextually-inferred element instead of defaulting to i32.
-export function nodeTyName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyPrim {
-    if t.primName == "void" { return "" }
-    return tyToStructStr(ty)
-  }
-  // A struct type renders its inline shape; `synthParamAnnots` resolves that to the declared
-  // struct's nominal name, so an un-annotated struct-element callback param gets the same annotation.
-  if t is TyObj { return tyToStructStr(ty) }
-  // A FUNCTION type renders its closure-annotation name (`(i32) => i32`) so an un-annotated
-  // closure VALUE from a call result (`const g = f(4)`) recovers a sig-keyable name.
-  if t is TyFunc { return tyToEmitName(ty) }
-  // A ref-list type renders its recursive emit name so an un-annotated ref-list callback param
-  // recovers a name `synthParamAnnots` resolves — without it the param defaulted silently to i32.
-  if t is TyArray { return tyToEmitName(ty) }
-  ""
-}
-
-// Whether node `ix`'s recorded type is a value union (`Cat | Dog`, 2+ members) — a `TyNullable`
-// is excluded. Lets `synthParamAnnots` give an un-annotated union-element callback param a
-// union annotation. This is the checker's view, distinct from `exprUnion` (the emitter's rep
-// classification) — the two disagree wherever a rep classifier has a gap.
-export function nodeTyIsUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyUnion { return t.uMembers.length >= 2 }
-  false
-}
 
 // Whether `ty` still holds an unresolved `TyVar`: `substTyDeep` leaves an unbound parameter in
 // place, and a partly-substituted type recorded on an instance is a wrong type. An acyclic type
@@ -51926,49 +51374,6 @@ export function anyLitUnionUsed() {
   false
 }
 
-// The element type of node `ix`'s array type, or -1 — the public reader of
-// `nodeArrayElemPeelTy` for callers that need the element type itself rather than a
-// yes/no about it (the emitter's atom-widening path needs the members).
-export function nodeArrayElemTyIx(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return -1 }
-  const t = T.tys[pty]
-  if t is TyArray { return t.aElem }
-  -1
-}
-
-// Whether node `ix` has a recorded array type whose element is a literal union (`K[]`) — a
-// direct `Ty` check, no name round-trip (a rendered `"a" | "b"` would not re-parse).
-export function nodeArrayElemIsLitUnion(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return false }
-  const t = T.tys[pty]
-  if t is TyArray {
-    const r = tyIsLitUnion(t.aElem)
-    return r
-  }
-  false
-}
-
-// The recorded type of node `ix` with one nullable wrapper peeled — a nullable-list receiver
-// (`(K | null)[] | null`) indexed in its checker-proved non-null branch still records the
-// nullable type on the receiver node, so the element probes below must see through the
-// wrapper. -1 (out-of-arena) when unrecorded.
-function nodeArrayElemPeelTy(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyNullable { return t.nInner }
-  ty
-}
-
-// Whether node `ix` has a recorded array type whose element is `boolean | null` (a
-// `(boolean | null)[]` literal). The emitter seeds `pendingNulBool` for such a literal's
-// elements so a `null` element lowers as the sentinel 2.
-export function nodeArrayElemIsNulBool(ix: i32) {
-  tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "boolean")
-}
-
 // Whether node `ix` has a recorded array type whose element is the `null` unit type (D4671), and
 // is not a null-only literal that a destination of another list type received.
 export function nodeArrayElemIsNullUnit(ix: i32): boolean {
@@ -51976,61 +51381,10 @@ export function nodeArrayElemIsNullUnit(ix: i32): boolean {
   isNullTy(nodeArrayElemTyIx(ix))
 }
 
-// Whether node `ix` has a recorded array type whose element is a plain `string` — the
-// non-null twin of `nodeArrayElemIsNulStr`. Needed because `arrLitIsStr` classifies a literal
-// by its first element, so an atom-first literal under a `string[]` annotation built the atom
-// list while the binding's slot held the string wrapper (check-clean invalid wasm without this).
-export function nodeArrayElemIsStr(ix: i32) {
-  primNameOf(nodeArrayElemTyIx(ix)) == "string"
-}
-
-// Whether node `ix` has a recorded array type whose element is a bare string literal — the
-// one-member spelling `nodeArrayElemIsLitUnion` declines, since that asks `tyIsLitUnion` and a
-// `"a"` is a `TyLit`, not a `TyUnion` (D1460). The list this reps as is the string one, not the
-// atom one, so it is a sibling of `nodeArrayElemIsStr` rather than of the litunion exclusion.
-export function nodeArrayElemIsBareStrLit(ix: i32) {
-  const e = nodeArrayElemTyIx(ix)
-  if e < 0 { return false }
-  const et = T.tys[e]
-  if et is TyLit { return et.litKind == "str" }
-  false
-}
-
-// Whether node `ix` has a recorded array type whose element is `string | null`. The element is
-// stored `(ref null $sTypeIdx)`, so a read `p[i]` stays nullable rather than recovering
-// non-null the way a plain `string[]` element does. Mirrors `nodeArrayElemIsNulBool`.
-export function nodeArrayElemIsNulStr(ix: i32) {
-  tyIsNulStringRep(nodeArrayElemTyIx(ix))
-}
-
-// Whether node `ix` has a recorded array type whose element is `K | null` (a literal union
-// made nullable). The emitter seeds `pendingLitUnion` (member literals lower as their interned
-// ids) and `pendingNulLitUnion` (a `null` element lowers as the sentinel `-1`) — the atom-niche
-// analogue of `nodeArrayElemIsNulBool`.
-export function nodeArrayElemIsNulLitUnion(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return false }
-  const t = T.tys[pty]
-  if t is TyArray { return tyIsNullableLitUnion(t.aElem) }
-  false
-}
-
 // —— the one home for "does a value of this type occupy one i32 cell" ——————————
 // Two questions, decided by different machinery, both asked by three call sites
 // (`eqCmpKindOfArrayElem`, `concatElemIsI32Backed`, `tyScalarBackedListKind`) that share one
 // function rather than three private copies — disagreement between them writes a module the engine refuses.
-
-// The emitter's per-NODE query for the rule above: node `ix`'s recorded type is a nullable
-// numeric literal union, so its cell is the value-union box.
-export function nodeTyIsNulNumLitUnion(ix: i32) {
-  nulNumLitUnionBaseName(nodeTyIxOf(ix)) != ""
-}
-
-// The emitter's per-node query: node `ix` has a recorded literal-union type.
-export function nodeTyIsLitUnion(ix: i32) {
-  const r = tyIsLitUnion(nodeTyIxOf(ix))
-  return r
-}
 
 // Whether node `ix`'s type (its pin, for a hole) is a map whose value is a numeric literal union
 // (`{[string]: 1.5 | 2.5}`). Needed separately because `tyIsLitUnion` is string-only by
@@ -52095,71 +51449,6 @@ export function nodeTyMapValLitUnionTexts(ix: i32) {
   mapTyValLitUnionTexts(nodeTyPinIxOf(ix))
 }
 
-// The member literal texts of node `ix`'s literal-union type, in source order — for widening
-// an atom to its member `string`. Empty if `ix`'s recorded type is not a union, which
-// deliberately excludes both a bare literal and a `K | null` nullable.
-export function nodeLitUnionMemberTexts(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return emptyTextList() }
-  const t = T.tys[ty]
-  if t is TyUnion { return tyLitMemberTexts(ty) }
-  emptyTextList()
-}
-
-// The member literal texts of node `ix`'s nullable literal-union type — both spellings (`K |
-// null`, and the expanded `"a" | "b" | null`). The null arm contributes no text, so the list is
-// exactly the widenable members. Empty when `ix` is not the nullable niche — how `print`'s
-// dispatch tells the two widening chains apart, asked first since the expanded spelling satisfies both.
-export function nodeNulLitUnionMemberTexts(ix: i32) {
-  tyNulLitUnionMemberTexts(nodeTyIxOf(ix))
-}
-
-// Whether node `ix`'s recorded type has at least one string-literal member and every one also
-// appears in `texts` — the question `k is T` folds to a constant true on. A nullable node
-// answers false by construction (`tyLitMemberTexts` declines it): its null arm is a member of
-// no tested set, so `K | null is K` is a runtime test, not a constant.
-export function nodeLitMembersWithin(ix: i32, texts: string[]) {
-  const mine = tyLitMemberTexts(nodeTyIxOf(ix))
-  if mine.length == 0 { return false }
-  let i = 0
-  while i < mine.length {
-    let found = false
-    let j = 0
-    while j < texts.length {
-      if texts[j] == mine[i] { found = true }
-      j = j + 1
-    }
-    if !found { return false }
-    i = i + 1
-  }
-  true
-}
-
-// Whether node `ix` has a recorded object (struct) type — a cheap, no-render variant-tag
-// check. Gates the emitter's `nodeTyName`-rendering struct fallback so the costly `tyToStr`
-// runs only on a confirmed struct receiver the syntactic cases missed.
-export function nodeTyIsObj(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  t is TyObj
-}
-
-// Whether node `ix`'s recorded type reaches a map — through a `TyNullable` hop or as a member
-// of a `TyUnion`, not only as a bare `TyMap`. The span twin of `nameIsMap`, which accepts
-// `{[string]:i32} | null` and `{[string]:V} | i64` alike. The exact twin (`nodeTyIsMap`) is not
-// interchangeable — substituting it moved corpus rows at `fnHasMapParam`.
-export function nodeTyReachesMap(ix: i32): boolean {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  tyReachesMap(ty)
-}
-
-// Whether node `ix` has a recorded map type (`{[K]: V}`) — a cheap, no-render variant-tag
-// check, the map dual of `nodeTyIsObj`. Gates the emitter's map classifiers so a map-returning
-// closure value call whose callee they miss still routes through the map lowering.
-export function nodeTyIsMap(ix: i32) { tyIsMap(nodeTyIxOf(ix)) }
-
 // Whether node `ix` is a map whose VALUE type provably admits no `null` (`{[K]: V}`, not
 // `{[K]: V | null}`); false for a non-map or an unknown value type.
 export function nodeTyMapValExcludesNull(ix: i32) {
@@ -52171,97 +51460,6 @@ export function nodeTyMapValExcludesNull(ix: i32) {
 // calls it only as a map-shape fallback (`mapShapeOfExpr`), never on the hot path.
 export function nodeTyMapValName(ix: i32) { mapTyValName(nodeTyPinIxOf(ix)) }
 
-// The whole map spelling of node `ix`'s recorded map type — `{[K]:V}`, character-for-character
-// the synthetic name `parseType` builds for an annotated map. "" when `ix` is not a map or
-// either half is still a hole. The key-and-value twin of `nodeTyMapValName`, for consumers
-// (`emit_mono.monoArgTyName`) that need the map's own identity, not its value's.
-export function nodeTyMapName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyMap { return tyToEmitName(ty) }
-  ""
-}
-
-// The key kind of node `ix`'s recorded map type under one `| null` or any list depth — the span
-// form `nameIsI32KeyedMap` has (accepting `{[i32]: V}[]` too). Kept wider than the exact twin
-// `nodeTyMapKeyKind` deliberately: its callers are type-minting flags, where under-answering
-// leaves a needed type unminted and the module invalid.
-export function nodeTyMapKeyKindSpan(ix: i32): i32 {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return MAP_KEY_STR }
-  tyMapKeyKindSpan(ty)
-}
-
-// The key kind (`mapKeyKindOfTy`) of node `ix`'s recorded map type, one `| null` wrapper
-// tolerated; `MAP_KEY_STR` for a node with no map type.
-export function nodeTyMapKeyKind(ix: i32): i32 {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return MAP_KEY_STR }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return MAP_KEY_STR }
-    const it = T.tys[t.nInner]
-    if it is TyMap { return mapKeyKindOfTy(it.mKey) }
-    return MAP_KEY_STR
-  }
-  if t is TyMap { return mapKeyKindOfTy(t.mKey) }
-  MAP_KEY_STR
-}
-
-// Whether node `ix` has a recorded nullable-struct type (`P | null`) — a cheap, no-render
-// check. The nullable dual of `nodeTyIsObj`: gates the emitter's nullable consumer
-// classifiers so a nullable-struct-returning closure value call whose callee they miss still classifies.
-export function nodeTyIsNullableStruct(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    const it = T.tys[t.nInner]
-    return it is TyObj
-  }
-  false
-}
-
-// Whether node `ix`'s recorded type is `T | null` for one rep — a `TyNullable` whose inner is
-// not a value union. The gate the emitter's if-expression rep rung reads (D1560): `joinTys`
-// folds two nullable arms of different shapes into a union box, whose rep is neither arm's
-// niche — a rung that took its rep from one arm would name a heap type the other member can't hold.
-export function nodeTyIsNullableOneRep(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    // D1575 — an open hole is not "one rep", it is no rep at all: answer false so the `??`
-    // rewrite declines and the loud refusal it already owes lands, rather than reading arena -1.
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    if tyIsLitUnion(t.nInner) { return true }
-    if T.tys[t.nInner] is TyUnion { return false }
-    return true
-  }
-  false
-}
-
-// True if node `ix` has a recorded NULLABLE type (`TyNullable`, any inner). The emitter
-// uses it to decide whether a `??` result stays nullable — a `?? null` (or a nullable-typed
-// default) leaves the coalesce result nullable, so the ref-value recover must be skipped.
-export function nodeTyIsNullable(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  T.tys[ty] is TyNullable
-}
-
-// True if node `ix`'s recorded type is the `null` type itself: the value is `null` on every path
-// that yields one, whatever its arms run first (D3355).
-export function nodeTyIsNullType(ix: i32): boolean { isNullTy(nodeTyIxOf(ix)) }
-
-// Whether node `ix`'s recorded type provably admits no `null` — not `!nodeTyIsNullable(ix)`,
-// since an unrecorded node, an inference hole, or a `TyVar` all answer "not nullable" there
-// while being unknown here. Every "don't know" answers false, since the one consumer (`??`
-// over a non-nullable lhs) turns a wrong true into a rep mismatch, invalid wasm.
-export function nodeTyExcludesNull(ix: i32) { tyExcludesNull(nodeTyIxOf(ix)) }
-
 // Whether a null test of a value typed `ty` is dead: no member admits `null`, one a recursive
 // alias hides included, which `assignable` sees and the member walk does not.
 export function tyProvesNonNull(ty: i32): boolean {
@@ -52271,22 +51469,6 @@ export function tyProvesNonNull(ty: i32): boolean {
 // `tyProvesNonNull` of node `ix`'s recorded type, for the emitter's fold of a dead null test.
 export function nodeTyProvesNonNull(ix: i32): boolean {
   tyProvesNonNull(nodeTyIxOf(ix))
-}
-
-// The emitter-format shape name of a nullable-struct node `ix`'s inner struct (`{x:i32}` for a
-// `P | null`), or "" otherwise. Renders, so the emitter calls it only as a struct-index
-// fallback — never on the hot path. The nullable sibling of `nodeTyName`, resolving via
-// `structIndexOfTypeName`.
-export function nodeNulStructInnerName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
-    const it = T.tys[t.nInner]
-    if it is TyObj { return tyToEmitName(t.nInner) }
-  }
-  ""
 }
 
 // The emitter-format union name of node `ix` (a value union or a struct union), or "" if its
@@ -54832,16 +54014,6 @@ export function intMatchHeadAt(ix: i32) {
 export function matchScrutAt(ix: i32) {
   if ix < 0 { return false }
   matchScrutNode[ix] ?? false
-}
-
-// The integer width of node `ix`'s recorded type: 1 for `i32`, 2 for `i64`, 0 for anything
-// else, an unrecorded node (a monomorphized clone reads -1) included.
-export function nodeTyIntWidth(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 || ty >= T.tys.length { return 0 }
-  if !tyIsIntMatchScrut(ty) { return 0 }
-  if primNameOf(ty) == "i64" { return 2 }
-  1
 }
 
 // `match` over a value union desugars to the `is`-chain `desugarMatchAt` already builds (each
