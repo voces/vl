@@ -100,3 +100,4 @@ D4778-D4781  lane-D4771  2026-10-14  closing D4771 (`is` over a list tests every
 D4842-D4845  lane-SC  2026-10-15  L1 step 5 (capture cells): D4842 filed open (a hole lambda copied into a capture cell called at a second type); L1 step 6: D4842 closed, D4843 filed open (a hole lambda called through a capture cell, then written back into it directly)
 D4846-D4849  lane-SC  2026-10-15  L1 step 7 (a generic delivered at the enclosing generic's type parameters): none filed
 D4850-D4853  lane-L2  2026-10-15  L2 §13.27 (hole lists): none filed
+D4854-D4857  lane-L2  2026-10-15  L2 §13.29 (box-element lists): D4854 filed closed (a captured walk variable over a local box-element list literal typed from its first element)
