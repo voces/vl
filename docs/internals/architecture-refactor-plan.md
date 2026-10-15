@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a parenthesised and a `?.` list read fall back to the column (campaign §13.28). Next: the `if` join's recorded `T[]` at a pin, the `-> none` and DIFF classes, the narrowed family, the scope callers. | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a box-element list reads the ref list from the column (campaign §13.29). Next: the `-> none` class, the remaining DIFF, the `if` join at a pin (D2832), the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: step 7 done; its refusal names the pin and the delivery. Next: step 8, the multi-pin decision (D3975), then the (c) literal; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -257,6 +257,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - A box element whose row the registry key reaches but its canon id misses reads the column (`unRowOfKey` moves into `emit_rep.vl`), and a single-literal list `"x"[]` is a `strlist`: `tests/cases` like-for-like LEFT-ONLY 535 → 425, `named/` 161 → 161 (its `d3140_*` 128 and `tests/cases`' i64 23 are registry-key classes L′ and D, left on purpose); 0 modules differ; the hole list's 317 notes all take the ladder's i32 default, and the proposal is that the checker records that default (campaign §13.26).
 - A closed hole list (`_[]`, `_[] | null`) reads the `i32` element the checker records after the last pin (`recordClosedHoles`, a column beside `nodeTyIx`, so hover and `--json` keep `_[]` and the D16 readers still see the hole): `tests/cases` like-for-like LEFT-ONLY 365 → 69, `named/` 149 → 128; 0 modules differ (campaign §13.27).
 - A parenthesised read and a `?.` read of a list fall back to the column, as the `Ident`/`Member`/`Call` rungs do; the `if` join stays none because its recorded `T[]` is a union box at a pin (D2832): `tests/cases` like-for-like RIGHT-ONLY 1,476 → 28, `named/` 10 → 0, LEFT-ONLY unchanged; 0 modules differ (campaign §13.28).
+- A list whose element type is a value union the column boxes reads the ref list (`valueUnionBoxList`), and a captured walk variable over such a literal built at its destination's row binds the box: `tests/cases` like-for-like DIFF 180 → 12, `-> none` / LEFT-ONLY / RIGHT-ONLY unchanged; 0 modules differ over master's tree; D4854 (check-clean invalid wasm) filed and closed (campaign §13.29).
 
 ### L3 log
 

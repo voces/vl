@@ -3749,3 +3749,83 @@ family and class. No file gains a note in either population.
 reads whose recorded type is the un-narrowed union; the DIFF class, led by `(string | i32)[]`
 literals reading `strlist` against the column's `reflist`; the narrowed family; and the scope
 callers.
+
+### 13.29 A list of boxes is the ref list, whatever its first element spells
+
+After §13.28 the like-for-like residue in `tests/cases` is 60 `-> none`, 180 DIFF, 69 LEFT-ONLY
+and 28 RIGHT-ONLY. The `-> none` notes come from about a dozen files, each a different shape:
+narrowed reads at module scope, reads in generic bodies, `if` and `??` joins. No single rung
+closes many of them. The DIFF class has one shape. In 168 of its 180 notes the element type is
+a value union the column boxes (`(string | i32)[]`, `(i64[][] | boolean)[]`, `Json[]`). The
+column answers the ref list, and the ladder answers `strlist` or `list` from the first element
+or the callee. That is the largest class one rung can close, so it is the one this step closes.
+
+**The column is right.** Disassembly of `capture-resolved-at-enclosing-binding.vl` shows
+`["a", 3, "b"]` built as an array of box structs (tag and `anyref`), which is the ref list. The
+ladder's `strlist` came from `arrLitIsStr`, which reads the first element after `arrLitIsRef`
+missed. Its `list` on a call or a read came from the callee's or the declaration's rung.
+
+**Design.** `exprListRepOf` asks `valueUnionBoxList` ahead of `syntacticListRep`. It answers the
+ref list for a node whose element type at the instance is a `TyUnion` when `columnListRep` also
+answers the ref list. A local read with no live slot is left to the scope rung.
+
+**What it moved.** A first version answered only that rung. It made `capture-resolved-at-enclosing-binding.vl`
+invalid wasm. A capture's env field is typed outside the frame, so `frameBlindIter` re-asks the
+local iterable through its initializer, the literal. `forInElemKind` then asked
+`refListSlotOfExpr` for the literal's row. The literal is built at the annotation's row
+(`(K | i32)`), which its own spelling `(string | i32)` does not name, so the lookup missed and
+the field fell to `i32`. The old `strlist` answer had typed the field as a string. That was
+right only because the narrowed member was a string. The same path was already invalid wasm on
+master whenever the first element was an `i32` or an `f64`. That defect is filed and closed as
+[D4854](inventory/D4854.md), with the fixture `closures/capture-walk-variable-box-list-literal.vl`.
+`forInElemKind` now binds the box when the slot misses and the element type is a value-union
+box. Gating the rung on a row instead would have closed 12 of the 168 notes.
+
+**Counts.** `listRep` notes, base and candidate both on `7cccbcaf7` (§13.28).
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | DIFF, box element (8 rows in 7 files) | 168 | 0 |
+| `tests/cases` | DIFF, other | 12 | 12 |
+| `tests/cases` | `-> none` | 60 | 60 |
+| `tests/cases` | LEFT-ONLY | 69 | 69 |
+| `tests/cases` | RIGHT-ONLY | 28 | 28 |
+| `tests/cases` | `open` LEFT-ONLY | 6,300 | 6,296 |
+| `tests/cases` | `scope` RIGHT-ONLY | 39,130 | 39,248 |
+| distilled `named/` | DIFF | 24 | 24 |
+| distilled `named/` | `open` LEFT-ONLY | 31,295 | 29,945 |
+
+A note's count is the number of times the query ran, not the number of nodes. The `scope` and
+`open` changes are counts on keys the base already had, and no (file, note) key is new in
+either population. In `capture-resolved-at-enclosing-binding.vl`, `(K$m0 | i32)[]` scope notes
+went from 322 to 436, and in `capture-union-closure-write-narrowed-read.vl` from 20 to 34. Both
+are re-asks of `vs` now that its literal answers the ref list. The `d3125_gen`/`d3125_hole`
+`T[]` reads fall, for example from 168 to 96. The `-> none`, LEFT-ONLY, RIGHT-ONLY, narrowed and
+`named/` scope families are unchanged.
+
+**Checks.** Rebased on master `a33e5643a`. The base fixpoint is 5,707,771 bytes and the candidate
+5,707,994, +223.
+
+* `difftree --identity` over master's 15,178 files: **10,218 built, 0 differ, 0 uncompared**.
+  The candidate compiling the base's source gives the base's fixpoint.
+* The new fixture is the one behaviour change. It was invalid wasm on master in all three of its
+  functions, and it runs now.
+* Native fixpoint holds at 5,707,994 bytes.
+* `rep-fuzz-check` is exact, with 0 baselined failures.
+* `regress.vl`: 0 runs lost, 0 to silent. The 7 other movements are the known `rv3310_*`
+  `trap_loads -> trap_loads` cells.
+* `lint-self` is clean, `seed-size --check` passes (+1.1% on its baseline), and the ladder,
+  sentinel and arena-scan budgets hold.
+* `SELFHOST_NATIVE_ALIGN=1` over `tests/selfhost_native_*_test.ts`: 5,239 passed, 0 failed.
+
+**Next.**
+* The 72 `-> none` notes. Each needs its own narrowing record.
+* The other DIFF notes:
+  * `rv3310` `i32[]` `reflist -> list`, 24 notes in `named/`;
+  * `f64[]` read as `f32list`, and `(boolean | null)[]` read as `f64list`, 6 notes;
+  * a generic call's `list` against `reflist`, 5 notes.
+* The `if` join recorded as `T[]` at a pin (D2832).
+* The narrowed family.
+* The scope callers.
+* `["p", 1] + ["q"]` refuses at emit (`the two operands of this list + do not resolve to one list
+  rep`), while `["p", 1] + ["q", 2]` runs. This is a clause-2 candidate and is not yet filed.
