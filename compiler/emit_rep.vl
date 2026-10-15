@@ -54,6 +54,7 @@ import {
   uFieldElemTyIx,
   uVarTyIx,
   uVariants,
+  unKey,
   unMemAtomIds,
   unMemAtoms,
   unMemKinds,
@@ -74,6 +75,7 @@ import {
   vbV128Used,
 } from "./emit_state"
 import {
+  canonUnionKeyOfTy,
   nodeRepTyIxOf,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
@@ -2772,6 +2774,24 @@ function unRowOfNullableOver(inner: i32): i32 {
   -1
 }
 
+// The union registry row whose minted `unKey` equals the key canon obtains for `ty`, or -1.
+// Unlike the canon id, the key keeps apart rows the box ABI needs distinct, and it reaches a
+// row registered under a spelling the arena node's canon id does not share.
+// `docs/internals/registry-by-type-id.md` §5.
+export function unRowOfKey(ty: i32): i32 { unRowOfKeyId(canonUnionKeyOfTy(ty)) }
+
+// The same reverse index from the key itself, for a producer with no arena node at all
+// (`registerInlineUnion`'s sub-spellings). `docs/internals/registry-by-type-id.md` §5, step 4b.
+export function unRowOfKeyId(k: i32): i32 {
+  if k < 0 { return -1 }
+  let u = 0
+  while u < unKey.length {
+    if unKey[u] == k { return u }
+    u = u + 1
+  }
+  -1
+}
+
 // An array's rep is decided by its ELEMENT variant — one wrapper level, never
 // the element's own descriptor (which is what keeps this arm cycle-free).
 function repOfArray(elem: i32): RepDesc {
@@ -2806,6 +2826,11 @@ function repOfArray(elem: i32): RepDesc {
   // inner element reps as; the inner list's own rep is its own query.
   if et is TyArray { return repMk("reflist", 0, "list") }
   if et is TyNullable { return repOfNulElemArray(elem, et.nInner) }
+  // `"x"[]` — a single string literal softens to `string`, as the nullable element does.
+  if et is TyLit {
+    if et.litKind == "str" { return repMk("strlist", 0, "string") }
+    return repUncovered()
+  }
   if et is TyUnion {
     // `K[]` over a declared litunion alias, a provenanced copy, or a genuinely inline
     // `("a" | "b")[]` — all three are atom-id elements riding the i32 list. Canon softens
@@ -2836,10 +2861,12 @@ function repOfArray(elem: i32): RepDesc {
     }
     // A value-union BOX element the registry holds a row for — a reference, so a ref list.
     // `tyIsValueUnionBox` is the shape gate (a numeric litunion has a canon row too but reps
-    // as its scalar list); the row is keyed on the interned canon id, never the spelling,
-    // which names a declared alias where the arena renders structurally.
+    // as its scalar list). The row is found by canon id, else by key, since an arena node
+    // need not share the canon id of the spelling that registered the row.
     if tyIsValueUnionBox(elem) {
-      if unRowOfCanonId(elem) >= 0 { return repMk("reflist", 0, "union") }
+      if unRowOfCanonId(elem) >= 0 || unRowOfKey(elem) >= 0 {
+        return repMk("reflist", 0, "union")
+      }
     }
     // A join of records with no box row is a list of the one arm its literals denote, a
     // struct-element ref list like `S[]`.

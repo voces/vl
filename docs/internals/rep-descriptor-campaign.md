@@ -3499,3 +3499,126 @@ differently.
    as `rv3310_*`'s `string[] | boolean[]`, where the ladder reads a string list.
 
 Then the RIGHT-ONLY families and items 2, 4 and 5 of §13.14.
+
+### 13.26 A box element the registry keys reads the column, and so does a single-literal list
+
+§13.25 left five column classes. This step takes the two that have a principled fix in the
+column itself, measures the others, and proposes a resolution for the hole list.
+
+**Method.** The §13.25 probe: `repABNoteListRep` keys each `listRep` note by node kind and the
+node's type at its instance, and every `tests/cases/**/*.vl` and `distilled/named/*.vl` is built
+with `VL_REP_SHADOW=1`. Both probe seeds are built on master at `4e9ba8bd9`, which does not
+carry §13.23 (#3809). So `tests/cases` LEFT-ONLY carries §13.23's 751 untyped `Index` notes in
+both columns, and the like-for-like counts below leave them out.
+
+**A box element whose canon id misses its row (80 notes in `tests/cases`).** In
+`generics/nullable-fold-nominal-lists-and-literal-box.vl` (64 notes) the checker records
+`(Rec2[] | null | Rec[] | null)[]`. In `generics/map-declared-return-flattens-at-pin.vl` (16) a
+pin records `(i32 | string | f64)[]`. `repOfArray` covered a box element only when
+`unRowOfCanonId` found a row with the element's canon id. Here the collect pass registered the
+row under a spelling whose canon id differs, so the lookup missed and the column was uncovered.
+The ladder answers `reflist`. The row's minted `unKey` does equal the key canon gives the
+element, and the key is the identity `registry-by-type-id.md` §5 designs the registry around.
+`repOfArray` now asks `unRowOfKey` after `unRowOfCanonId`. `unRowOfKey` and `unRowOfKeyId`
+move from `emit_classify.vl` to `emit_rep.vl` so the descriptor can call them, and the
+classifier imports them from there.
+
+**`(f64 | 2)[]` (10 notes in `tests/cases`).** §13.25 listed this as a numeric literal-union
+list. It is not one: the ladder boxes it (`reflist`), the row is `f64 | i32`, and the key route
+above covers it. `literal-unions/float-literal-type-suggested-fix-runs.vl` holds all ten.
+
+**A single-literal list (20 notes in `tests/cases`).** `"aa"[]` and `"ea"[]`
+(`literal-unions/narrowed-single-literal-rep-consumption.vl`, 16) and `"red"[]`
+(`functions/pin-string-concat-litunion-arg.vl`, 4) have a `TyLit` element, and `repOfArray` had
+no `TyLit` arm. One string literal softens to `string`, as `repOfNulElemArray`'s `TyLit` arm
+already says for `("x" | null)[]`, so the list is a `strlist`, which is the ladder's answer. A
+numeric `TyLit` element stays uncovered: no note in either population has one.
+
+**What the key route does not reach, and why it stays.** Each of these is a class that
+`registry-by-type-id.md` §"Prerequisite (3)" measured. The row and the element's key differ by
+a rewrite rule that the registry has not adopted. Covering them in the descriptor would mean
+inventing that rule in a second place.
+
+* `distilled/named/` `d3140_r2_sb_{KgLn,gKnL}__{i32,bool}__*_F5a.vl`, 128 notes: the element
+  key is `i32|K|L|null` or `K|L|null|i32`, and the row is `i32|string|null`. The row softens
+  litunion aliases `K` and `L` to `string` and dedupes them; the key keeps the aliases. This is
+  class L′, the litunion alias with no non-literal member beside the run.
+* `arrays/allocating-literal-chunked-in-body.vl`, 23 notes: the element key is `i64|i32|i64`,
+  and the row is `i64|i32`. The key softens `9000000000 | 1 | 9000000001` literal by literal
+  and keeps the repeat. This is class D, measured and refused.
+
+**Counts.** `listRep` LEFT-ONLY notes, base and candidate both on `4e9ba8bd9`:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | `(Rec2[] \| null \| Rec[] \| null)[]` | 64 | 0 |
+| `tests/cases` | `(i32 \| string \| f64)[]` | 16 | 0 |
+| `tests/cases` | `(f64 \| 2)[]` | 10 | 0 |
+| `tests/cases` | `"aa"[]`, `"ea"[]`, `"red"[]` | 20 | 0 |
+| `tests/cases` | `(9000000000 \| 1 \| 9000000001)[]` (class D) | 23 | 23 |
+| `tests/cases` | like-for-like LEFT-ONLY (without §13.23's 751) | 535 | 425 |
+| distilled `named/` | `d3140_*` union elements (class L′) | 128 | 128 |
+| distilled `named/` | like-for-like LEFT-ONLY | 161 | 161 |
+
+No file gained a note in either population. The DIFF and RIGHT-ONLY families are unchanged:
+`tests/cases` has 180 DIFF and 1,476 RIGHT-ONLY, and `named/` has 24 DIFF and 10 RIGHT-ONLY.
+
+**Checks.** Master's fixpoint is 5,678,178 bytes and the candidate 5,678,238, +60.
+
+* `difftree --identity` over 15,172 files: **10,213 built, 0 differ, 0 uncompared**. The
+  candidate compiling master's source gives master's fixpoint.
+* Native fixpoint holds.
+* `rep-fuzz-check` is exact. `regress.vl` loses no runs and moves no cell to silent. Its seven
+  `rv3310_*` `trap_loads` movements are the ones §13.22 recorded.
+* `lint-self` is clean, `seed-size --check` passes, and the ladder budget holds.
+
+**The hole list: measured, and a proposal.** `tests/cases` has 296 notes, 203 on `_[]` and 93
+on `_[] | null`. They come from six files:
+
+* `empty-list-join-null-sibling.vl`: 84
+* `lambda-empty-array-literal-return.vl`: 49
+* `empty-list-join-null-field.vl`: 23
+* `inferred-return-empty-through-binding.vl`: 21
+* `unannotated-empty-return-elem-rep.vl`: 21
+* `empty-list-arg-pinned-by-callee.vl`: 5
+
+`named/` has 21, all in `d626_ctl_directlit.vl` (12 `ArrayLit`, 9 `Call`). **In all 317 notes
+the ladder answers `list`, the i32 list.** No noted hole takes a destination's element, so
+the emitter builds every noted hole as `i32[]` by its default (D2228's "the nullable i32 list a
+plain local gets").
+
+There are three resolutions:
+
+* **(a)** The oracle files a hole under `open`, as it does a type variable.
+* **(b)** `repOfArray` answers `list` for `elem < 0`.
+* **(c)** The checker resolves an unpinned hole to the designed default `i32` where the hole
+  closes, the end of the scope that could still pin it, and records `i32[]` on the node.
+
+**Recommendation: (c).** It is the rule this stage has followed since §13.23: record the type
+where it is minted. Once the default is a checker fact, the ladder's default and the column
+read the same type and the default lives in one place.
+
+(a) hides 317 nodes the emitter does build, so the column could never retire the ladder there.
+(b) puts a language rule in the descriptor, and it would also answer for a hole that a later
+pass fails to resolve. Today a failed resolution stays visible as uncovered.
+
+What (c) must respect:
+
+* The hole readers D16 relies on (`emptyArrHoleKind`, `emptyArrHoleBuildKind`) read hole-ness
+  to unify with the consuming slot, so the default must land after every pin.
+* `vl check --json` and hover print `_[]` today and would print `i32[]`; `difftree --identity`
+  compares check text, so it will name every such file.
+* `repOfArray` keeps declining `elem < 0`, so a hole the checker misses stays a LEFT-ONLY note.
+
+**Not taken here.** These remain after this step:
+
+* The 60 `-> none` notes in `tests/cases` and 12 in `named/`. The node's recorded type is not a
+  list (for example `string | null`, `f32[] | string`, `rv3310_*`'s `string[] | boolean[]`),
+  while the ladder reads a list.
+* In `tests/cases`, `Json$m1 | null` (12) and `{[string]: i32} | null` (12).
+* `(string | i32)[]` and `(i32 | null)[]` (7 each), where the ladder answers `list` for a union
+  element.
+* The recorded-type spellings `(string[] | {w: i32})[]` (4) and `(i32[] | i32)[]` (2), which
+  soften an alias or a member that the row keeps.
+* The DIFF family, led by `(string | i32)[]` (142 in `tests/cases`), where the ladder answers a
+  scalar list and the column answers the box.
