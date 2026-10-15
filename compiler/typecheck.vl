@@ -337,6 +337,7 @@ import {
   IDENT_DROP_FN_DECL,
   identAuditDrop,
   identColReset,
+  identDeclOf,
   identSet,
   sidNoteNodeName,
   sidOf,
@@ -1973,6 +1974,10 @@ let ovFnValDecl: i32[] = []
 let ovFnValName: string[] = []
 // The element type a named `map`/`filter` callback is typed by, keyed on its `Ident` node.
 let ovCbElem: {[i32]: i32} = Map()
+// The function a local `let`/`const` is declared in, and the binding a plain `x = e` write stores
+// into, keyed on `e`: what a pin asks to tell whether a call can reach the written value.
+let letDeclFn: {[i32]: i32} = Map()
+let wrDstDecl: {[i32]: i32} = Map()
 
 // D1230 — the missing-import answer, banked at the callee member node by the call site that
 // computed it and read back by the member arm that raises the sentence: only the call knows the
@@ -5103,6 +5108,8 @@ export function initChecker() {
   ovFnValDecl = []
   ovFnValName = []
   ovCbElem = Map()
+  letDeclFn = Map()
+  wrDstDecl = Map()
   ufcsMissAt = []
   ufcsMissSpecs = []
   ufcsWhyAt = []
@@ -28854,6 +28861,61 @@ function validateRetCstrs(
   0
 }
 
+// Whether unnamed call `c` cannot reach the function value row `ci` writes to a local binding:
+// the call sits in the binding's own function, is not through it, and that function reads the
+// binding only as a callee or a write target. Type variables bind by name, so the call's bindings
+// would otherwise adjudicate a write whose generic merely shares a parameter name (D4890).
+function wrUnreachedBy(ci: i32, c: i32, calleeFn: i32): boolean {
+  if calleeFn != CSTR_NODECL { return false }
+  const got = letCstr.got[ci]
+  if got < 0 || got >= T.tys.length || !(T.tys[got] is TyFunc) { return false }
+  const d = wrDstDecl.get(letCstr.ix[ci]) ?? -1
+  if d < 0 || d >= P.nodes.length || c < 0 || c >= P.nodes.length {
+    return false
+  }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) { return false }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return false }
+  if identNameAt(cn.callFn) == dn.letName { return false }
+  const fx = letDeclFn.get(d) ?? -1
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) { return false }
+  const quiet: {[i32]: i32} = Map()
+  const stack: i32[] = [fd.fnBody]
+  let inside = false
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if at == c { inside = true }
+      if n is Call { quiet.set(n.callFn, 1) }
+      if n is BinExpr && n.binOp == "=" { quiet.set(n.binLeft, 1) }
+      // A read of another binding of the name is not this one's; an unresolved read counts.
+      if identNameAt(at) == dn.letName && !quiet.has(at) {
+        const r = identDeclOf(at)
+        if r == d || r < 0 { return false }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  // Elsewhere, a call instantiates the binding's body only if that body is generic.
+  inside || (wrFnClosed(fx) && wrFnClosed(letCstr.fn[ci]))
+}
+
+// Whether declaration `fx` is a function with no type parameter and no un-annotated parameter.
+function wrFnClosed(fx: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) || fd.fnTyParams.length > 0 { return false }
+  for p in fd.fnParams {
+    const pn = P.nodes[p]
+    if !(pn is Param) || pn.parType < 0 { return false }
+  }
+  true
+}
+
 // Whether the deferred destination constraints this binding resolves hold — the twin of
 // `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
 // need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
@@ -28872,6 +28934,7 @@ function validateLetCstrs(
     if (
       cstrOwnedBy(letCstr.fn[ci], calleeFn)
       && !nestCstrOutside(letCstr.ix[ci])
+      && !wrUnreachedBy(ci, ix, calleeFn)
     ) {
       cvNow = cvPick(CV_LET, ci, cvWas)
       const lg = substTyDeep(letCstr.got[ci], bNames, bTys)
@@ -44828,6 +44891,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
       // `xs[0] = e`) — records the pair for the pin using `asgLt`, the storage type actually asked.
       noteLetCstr(coalPinTy(n.binRight, rt), asgLt, n.binRight, "")
+      if P.nodes[n.binLeft] is Ident {
+        wrDstDecl.set(n.binRight, identDeclOf(n.binLeft))
+      }
       // And the slots of a literal source too: an array literal whose element join dropped a
       // hole reaches this gate hole-free, so the slots (not the pair) are the real question.
       if !tyHasHole(rt) {
@@ -45709,6 +45775,8 @@ function exitFirstOnSpine(ix: i32, depth: i32): boolean {
 }
 
 function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
+  if curFnDeclIx >= 0 { letDeclFn.set(ix, curFnDeclIx) }
+  if n.letInit >= 0 { wrDstDecl.set(n.letInit, ix) }
   if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
     const lp = cwPeel(n.letInit)
     if lp >= 0 {

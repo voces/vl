@@ -989,7 +989,7 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      - Ablations: with the old call removed and nothing added, 6 `@run` fixtures are lost;
        with the new pass doing nothing and the cell store at the pin, 4. The candidate keeps
        all of them. 0 of 3,849 `@run` fixtures move. Of 1,432 others, one refusal now names
-       `d1` instead of `d3` (`error-cell-peer-called-at-two-types`; `d1` is the binding
+       `d1` instead of `d3` (`cell-peer-called-at-two-types`; `d1` is the binding
        pinned at both types). 2 of 10,210 modules differ: that fixture, and
        `hole-lambda-binding-one-signature`, where the store `d2 = g` in the uncalled `w5` is
        now delivered at `d2`'s `i32` pin and mints an instance of `g` that the stripped body
