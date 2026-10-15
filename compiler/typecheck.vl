@@ -1720,6 +1720,9 @@ import {
   callDeclFnIx,
   calleeNameOf,
   calleeReset,
+  cbPendClear,
+  cbPendNames,
+  cbPendTys,
   crIsDispatchSite,
   findFnDeclIn,
   mapMethodNames,
@@ -1734,6 +1737,7 @@ import {
   opIdxSiteNode,
   opSiteArgs,
   opSiteDecls,
+  recvTyOf,
 } from "./check_callee"
 import {
   covarRootFreshLocal,
@@ -2021,6 +2025,10 @@ let ovFnValDecl: i32[] = []
 let ovFnValName: string[] = []
 // The element type a named `map`/`filter` callback is typed by, keyed on its `Ident` node.
 let ovCbElem: {[i32]: i32} = Map()
+// The element narrowing a `map`/`filter` callback's parameter or a `for` variable starts with,
+// keyed on the callback or the loop (`elemFactFor`); a leaf of -1 is none.
+let efLeaf: {[i32]: i32} = Map()
+let efSteps: {[i32]: i32} = Map()
 // The function a local `let`/`const` is declared in, and the binding a plain `x = e` write stores
 // into, keyed on `e`: what a pin asks to tell whether a call can reach the written value.
 let letDeclFn: {[i32]: i32} = Map()
@@ -5136,6 +5144,8 @@ export function initChecker() {
   ovFnValDecl = []
   ovFnValName = []
   ovCbElem = Map()
+  efLeaf = Map()
+  efSteps = Map()
   letDeclFn = Map()
   wrDstDecl = Map()
   ufcsMissAt = []
@@ -8073,8 +8083,7 @@ function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   let decl = narDeclaredTy(name, -1)
   if decl < 0 { decl = lookup(name) }
   if decl < 0 || assignable(decl, dstTy) { return false }
-  let copy = "'" + name + ".map((x) => x)'"
-  if !byName { copy = "a 'map' over '" + name + "'" }
+  const copy = "'" + name + mapCopyText(depth) + "'"
   tErr(
     "'"
       + name
@@ -8087,6 +8096,21 @@ function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     ix,
   )
   true
+}
+
+// The `.map(…)` that copies a list `depth` lists deep whose elements are narrowed: one `map` per
+// level, so no inner list of the narrowed one is shared with the copy.
+function mapCopyText(depth: i32): string {
+  const vars = ["x", "r", "q", "p"]
+  let text = ".map((x) => x)"
+  let k = 1
+  while k < depth {
+    let v = "e" + i32ToStr(k)
+    if k < vars.length { v = vars[k] }
+    text = ".map((" + v + ") => " + v + text + ")"
+    k = k + 1
+  }
+  text
 }
 
 // The innermost overlay slot holding an element entry of the bare name `name` (`name[*]…`),
@@ -33434,6 +33458,7 @@ function checkMemberCallNode(
         if cbArg.fnName == "" && rt.aElem >= 0 {
           recordCbExpected(cargs[0], [rt.aElem])
         }
+        if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
       }
       const cbTy = checkNode(cargs[0])
       const cb = T.tys[cbTy]
@@ -38058,6 +38083,10 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       if declSites { symDecl(pNode2.parName, params[dj], paramTys[dj], 1) }
     }
     dj = dj + 1
+  }
+  if params.length == 1 {
+    const pn1 = P.nodes[params[0]]
+    if pn1 is Param { narrowFreshBinding(pn1.parName, fnIx) }
   }
   checkParamNestedFnClash(n, params)
   const body = P.nodes[n.fnBody]
@@ -51759,6 +51788,126 @@ function elemEveryReadTy(ix: i32): i32 {
   t
 }
 
+// The key (`s[*]`, `m[*][*]`) of the element-only narrowing in force on the list `recvIx` names
+// (`s is S[]` over a `string[]`, `pushElemReadFact`), or "".
+function elemOnlyKeyOf(recvIx: i32): string {
+  const ri = peelParenIx(recvIx)
+  if ri < 0 || ri >= P.nodes.length { return "" }
+  const r = P.nodes[ri]
+  if !(r is Ident) { return "" }
+  const slot = elemEverySlotOf(r.identName)
+  if slot < 0 || narFitNameOf(slot) != "" { return "" }
+  const key = npKeys[slot]
+  if narrowedPathTy(key) < 0 { return "" }
+  crNoteCaptureRead(key)
+  key
+}
+
+// The narrowing an element of `recvIx` carries into the parameter of the callback literal `cbIx`
+// handed to its `map`/`filter` (`elemOnlyKeyOf`), as `elemFactFor` banks it, or false. Only a
+// callback that runs in place and, asked as a loop body is, writes no element of the receiver
+// out of the leaf nor calls what may, is handed elements that all still fit.
+function cbElemNarrowFor(recvIx: i32, cbIx: i32): boolean {
+  const key = elemOnlyKeyOf(recvIx)
+  if key == "" { return false }
+  const r = P.nodes[peelParenIx(recvIx)]
+  const fd = P.nodes[cbIx]
+  if !(r is Ident) || !(fd is FuncDecl) { return false }
+  const leaf = narrowedPathTy(key)
+  const bound: string[] = []
+  fnBoundNames(cbIx, bound)
+  cbPendClear()
+  cbPendAdd(cbIx, nodeTyOf(recvIx), bound)
+  cbPendCollect(fd.fnBody, bound)
+  const writes = (!crCallbackKeeps(cbIx, r.identName)
+    || crLoopLeavingPathWrite(fd.fnBody, key, leaf) >= 0
+    || crFirstElemWritingCall(fd.fnBody, key) >= 0)
+  cbPendClear()
+  if writes { return false }
+  elemFactFor(cbIx, r.identName, key)
+}
+
+// Gives the single parameter of the callback literal `cbIx`, run over a list of type `listTy`, its
+// element type in `cbPendNames`, when the name is bound nowhere else in `bound`.
+function cbPendAdd(cbIx: i32, listTy: i32, bound: string[]) {
+  if listTy < 0 || cbIx < 0 || cbIx >= P.nodes.length { return 0 }
+  const lt = T.tys[nonNullTy(listTy)]
+  const fd = P.nodes[cbIx]
+  if !(lt is TyArray) || !(fd is FuncDecl) || fd.fnParams.length != 1 {
+    return 0
+  }
+  if lt.aElem < 0 { return 0 }
+  const p = P.nodes[fd.fnParams[0]]
+  if !(p is Param) { return 0 }
+  let seen = 0
+  let i = 0
+  while i < bound.length {
+    if bound[i] == p.parName { seen = seen + 1 }
+    i = i + 1
+  }
+  if seen != 1 { return 0 }
+  cbPendNames.push(p.parName)
+  cbPendTys.push(lt.aElem)
+  0
+}
+
+// Every callback literal in the subtree `ix` handed to `map`/`filter` on a list `recvTyOf` knows
+// gets its parameter typed by `cbPendAdd`, outer calls first.
+function cbPendCollect(ix: i32, bound: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Member && n.callArgs.length == 1 {
+      if cf.memProp == "map" || cf.memProp == "filter" {
+        const cb = peelParenIx(n.callArgs[0])
+        if cb >= 0 && P.nodes[cb] is FuncDecl {
+          cbPendAdd(cb, recvTyOf(cf.memObj), bound)
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      cbPendCollect(kids[k], bound)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Banks, under `at`, the fact an element of the list `name` brings to a fresh binding from the
+// list's element key `key`: its leaf, and how many element steps of the binding it narrows.
+function elemFactFor(at: i32, name: string, key: string): boolean {
+  efLeaf[at] = narrowedPathTy(key)
+  efSteps[at] = (key.length - name.length) / LIST_EVERY_STEP.length - 1
+  true
+}
+
+// Narrow the binding `name`, just declared in the current scope, by the fact banked under `at`
+// (`elemFactFor`): the leaf itself at no steps, as a guard would, else every element so deep.
+function narrowFreshBinding(name: string, at: i32) {
+  const leaf = efLeaf[at] ?? -1
+  const steps = efSteps[at] ?? -1
+  if leaf < 0 || steps < 0 || name == "" { return 0 }
+  if steps == 0 {
+    const decl = lookup(name)
+    if decl < 0 || tySame(decl, leaf) || !assignable(leaf, decl) { return 0 }
+    return applyNarrows([name], [leaf])
+  }
+  let key = name
+  let k = 0
+  while k < steps {
+    key = key + LIST_EVERY_STEP
+    k = k + 1
+  }
+  applyNarrows([key], [leaf])
+}
+
 // ── object literal ──────────────────────────────────────────────────────────
 // `{x: e, y: e}` types as a structural `TyObj` whose fields carry each value's checked type.
 // Assignability against an annotation/param/return then matches it to a declared struct by
@@ -53494,6 +53643,15 @@ function checkForInNode(n: ForIn, ix: i32) {
   pushScope(ix)
   declare(n.fiVar, elemTy)
   symDecl(n.fiVar, ix, elemTy, 0)
+  // Every element read under an element-only narrowing fits its leaf: a write in the loop that
+  // may leave it ended it before the loop (`crLoopPreRetire`).
+  efLeaf[ix] = -1
+  if it is TyArray {
+    const fr = P.nodes[peelParenIx(n.fiIter)]
+    const fk = elemOnlyKeyOf(n.fiIter)
+    if fr is Ident && fk != "" { elemFactFor(ix, fr.identName, fk) }
+    narrowFreshBinding(n.fiVar, ix)
+  }
   if n.fiVar2 != "" {
     declare(n.fiVar2, elem2Ty)
     symDecl(n.fiVar2, ix, elem2Ty, 0)
