@@ -1,0 +1,228 @@
+// `check_capture_rows.vl` — the tables behind "a call that may reassign a narrowed binding ends
+// the narrowing" (D2390): the function bodies and statements being checked, the names a call
+// retired and the reads refused after it, the emitter's retire banks, the captured-narrowing
+// records and loss banks, the alias and sole-reference rows, and the memos the capture walks
+// keep. The checker owns every step that reads the type arena or the scope chain; `crReset`
+// clears the tables once per program.
+
+import { arenaEditLogReset } from "./ast"
+import { crLostReset } from "./check_capture_loss"
+import {
+  crByRefAnyMemo,
+  crByRefMemo,
+  crMemoDone,
+  crNulledBuilt,
+  crNulledNames,
+  crwRoot,
+} from "./check_capture_walks"
+
+// Operator sites that dispatched to a closure field of the left operand, and every operator site
+// that dispatched at all.
+export let crOpOpaque: {[i32]: boolean} = Map()
+export let crOpCall: {[i32]: boolean} = Map()
+
+// Assignments that ended a path narrowing through another place that may name the same object.
+// They settle like a call (`crPathCallRetire`), since the emitter cannot see the alias.
+export let crAliasWr: {[i32]: boolean} = Map()
+// Narrowings a hole body ended by a rule that holds at every pin, keyed `<ender>|<path key>`: a
+// write to the place or a prefix of it, a variable-index write under it, or a call that writes
+// the path through an argument or a free variable by name. An alias or cell-tag verdict is decided
+// on types the hole does not have yet, so a read after it keeps master's behaviour (D3287).
+export let npKillSure: {[string]: boolean} = Map()
+// Enclosing functions' path slots such a write inside a nested function ends, with the depth of
+// the function holding the write. They hold again when that body closes: its calls run the write.
+export let crAliasNestSlots: i32[] = []
+// Calls inside a nested body that ended an enclosing function's narrowing there (`crAliasNestSlots`).
+export let crNestCallRet: {[i32]: boolean} = Map()
+export let crAliasNestDepths: i32[] = []
+
+// Bindings whose object no other place refers to: a `const` bound to a new object whose name is
+// used only as a receiver (`x.f`, `x[i]`) in its root, with the scope depth of its declaration.
+export let crSoleNames: string[] = []
+export let crSoleDepths: i32[] = []
+// The root `crValUseNames` describes, the names that root uses other than as a receiver, the
+// receivers of its operator sites, and per receiver the props of its `x.p` sites a getter is
+// named (D3760).
+export let crValUseRoot = -2
+export let crValUseNames: {[string]: boolean} = Map()
+export let crValUseDyn: {[string]: boolean} = Map()
+export let crValUseGetProps: {[string]: string[]} = Map()
+// Per root walked (D3739): the arena epoch, logged-edit bump count and edit-log position of its
+// walk, its banking-free names, and the sites `x.p` and `x[i]` whose receiver counts only where
+// a getter or an operator may run there.
+export let cvuSlotOf: {[i32]: i32} = Map()
+export let cvuEpoch: i32[] = []
+export let cvuBumps: i32[] = []
+export let cvuLogAt: i32[] = []
+export let cvuNames: {[string]: boolean}[] = []
+export let cvuMemIx: i32[][] = []
+export let cvuMemName: string[][] = []
+export let cvuIdxIx: i32[][] = []
+export let cvuIdxName: string[][] = []
+
+// The names a function body reads at the declared type because `crCaptureLosesNarrowing` said so.
+export let crCapLossBank: {[i32]: string} = Map()
+export let crCapLossAny = false
+
+// The function bodies being checked, innermost last: the scope depth each body starts at, since
+// a narrowing below it belongs to an enclosing function, and the root its closures are read from.
+export let crFnBases: i32[] = []
+export let crFnRoots: i32[] = []
+// Per function body, the overlay height and barrier count at its entry: a path slot or a loop
+// below them belongs to an enclosing function.
+export let crFnNpBases: i32[] = []
+export let crFnReBases: i32[] = []
+export let crFnIxs: i32[] = []
+// Calls whose path retirement is banked for the emitter, for a monomorphization re-check.
+export let crCallSettled: {[i32]: boolean} = Map()
+export let crProgRoot = -1
+// The statements being checked, innermost last, with the function depth each belongs to and
+// where its pending and read rows start. A statement is the unit the emitter retires at, so it
+// is the unit a read is refused in.
+export let crStmtIxs: i32[] = []
+export let crStmtFns: i32[] = []
+export let crStmtPend: i32[] = []
+export let crStmtRd: i32[] = []
+// The scope count on entering each statement, so a scope depth names the statement holding it.
+export let crStmtScopes: i32[] = []
+// Names a call retired inside a statement still being checked, with the call and the narrowed
+// type. A read later in that statement is refused.
+export let crPendNames: string[] = []
+export let crPendCalls: i32[] = []
+export let crPendNarTys: i32[] = []
+export let crPendDepths: i32[] = []
+// Every retirement, for the note on a later misuse: the name, the call, the narrowed type, the
+// type it reads at now, and the root it happened under.
+export let crRetNames: string[] = []
+export let crRetCalls: i32[] = []
+export let crRetNarTys: i32[] = []
+export let crRetWideTys: i32[] = []
+export let crRetRoots: i32[] = []
+export let crRetLoops: boolean[] = []
+// Reads of a retired name in the statements still being checked: the row of the table above,
+// and the reading identifier.
+export let crRdRet: i32[] = []
+export let crRdIx: i32[] = []
+// The emitter's half, keyed by node: names retired after a statement, before a loop, and dropped
+// from a condition's narrowings. Each value is `,`-joined with a leading `,`.
+export let crAfterBank: {[i32]: string} = Map()
+export let crBeforeBank: {[i32]: string} = Map()
+export let crCondDropBank: {[i32]: string} = Map()
+// Per `&&`/`||` node, the left operand's facts its right operand retired (`crNoteRhsRetired`).
+export let crRhsRetired: {[i32]: string} = Map()
+// What retired each: the `&&`/`||` node, the name, and the write or call that ended it.
+export let crRhsOps: i32[] = []
+export let crRhsNames: string[] = []
+export let crRhsBys: i32[] = []
+export let crCapWidenBank: {[i32]: string} = Map()
+// Per body, the names `crEscWalk` found escaping it, for this check.
+export let crEscNames: {[i32]: string} = Map()
+// How many live records `crCapRec*` hold per handle, so a call of any other name skips the scan.
+export let crCapRecCount: {[string]: i32} = Map()
+// Nested functions that kept a captured narrowing, called only by handle in the body making them:
+// that body's function depth, the handle, the name, the type captured, and the function.
+export let crCapRecDepths: i32[] = []
+export let crCapRecHandles: string[] = []
+export let crCapRecNames: string[] = []
+export let crCapRecTys: i32[] = []
+export let crCapRecFns: i32[] = []
+export let crCondDropN = 0
+// Per `root#name`: 0 when no closure writes the name, 1 when every function that can reach a
+// writer is only ever called by name, 2 when one escaped. The names such calls use ride beside.
+export let crInfoMemo: {[string]: i32} = Map()
+export let crHandleMemo: {[string]: string} = Map()
+
+export function crReset() {
+  crFnBases = []
+  crFnRoots = []
+  crFnNpBases = []
+  crFnReBases = []
+  crFnIxs = []
+  crCallSettled = Map()
+  crProgRoot = -1
+  crStmtIxs = []
+  crStmtFns = []
+  crStmtPend = []
+  crStmtRd = []
+  crStmtScopes = []
+  crPendNames = []
+  crPendCalls = []
+  crPendNarTys = []
+  crPendDepths = []
+  crRetNames = []
+  crRetCalls = []
+  crRetNarTys = []
+  crRetWideTys = []
+  crRetRoots = []
+  crRetLoops = []
+  crRdRet = []
+  crRdIx = []
+  crAfterBank = Map()
+  crBeforeBank = Map()
+  crCondDropBank = Map()
+  crRhsRetired = Map()
+  crRhsOps = []
+  crRhsNames = []
+  crRhsBys = []
+  crCapWidenBank = Map()
+  crEscNames = Map()
+  crLostReset()
+  crCapLossBank = Map()
+  crCapLossAny = false
+  crWideNames = []
+  crWideDepths = []
+  crCapRecCount = Map()
+  crCapRecDepths = []
+  crCapRecHandles = []
+  crCapRecNames = []
+  crCapRecTys = []
+  crCapRecFns = []
+  crCondDropN = 0
+  crwRoot = -2
+  crInfoMemo = Map()
+  crAsgMemo = Map()
+  crByRefMemo = Map()
+  crByRefAnyMemo = Map()
+  crDeclMemo = Map()
+  crReadMemo = Map()
+  crReadLists = Map()
+  crMemoDone = Map()
+  crNulledNames = Map()
+  crNulledBuilt = false
+  crHandleMemo = Map()
+  crOpOpaque = Map()
+  crOpCall = Map()
+  crAliasWr = Map()
+  npKillSure = Map()
+  crAliasNestSlots = []
+  crNestCallRet = Map()
+  crAliasNestDepths = []
+  crSoleNames = []
+  crSoleDepths = []
+  crValUseRoot = -2
+  crValUseNames = Map()
+  crValUseDyn = Map()
+  crValUseGetProps = Map()
+  cvuSlotOf = Map()
+  cvuEpoch = []
+  cvuBumps = []
+  cvuLogAt = []
+  arenaEditLogReset()
+  cvuNames = []
+  cvuMemIx = []
+  cvuMemName = []
+  cvuIdxIx = []
+  cvuIdxName = []
+  0
+}
+
+export let crWideNames: string[] = []
+export let crWideDepths: i32[] = []
+
+// `crNameAssignedInRoot` per `"<root>#<name>"`: asked once per capture, it would otherwise
+// rebuild the writer analysis each time the question moves between a function and the module.
+export let crAsgMemo: {[string]: boolean} = Map()
+
+export let crDeclMemo: {[string]: boolean} = Map()
+export let crReadMemo: {[string]: boolean} = Map()
+export let crReadLists: {[i32]: string} = Map()
