@@ -4013,3 +4013,92 @@ candidate 5,713,599, +512.
   `rv3310_in_*` notes in `named/`.
 * The `unc` notes, where the column does not cover the node.
 * D4862, D3368, the `if` join at a pin (D2832), the narrowed family, the scope callers.
+
+### 13.32 The `-> none` class: a union or nullable record the column holds as no list
+
+In this class the ladder names a list rep and the column covers the node as something that is
+not a list. Before this change it held 62 notes in `tests/cases` and 20 in `named/`. Every
+program was run and disassembled, with its un-annotated spelling and a second delivery
+position. **No note was a defect, and in all but one family the record and the column were
+right.** The value is a box, a nullable scalar or a nullable struct. The module-block global
+`ua: i32[] | boolean` is `(struct (field i32) (field anyref))` in the wasm. The `rv3310_*`
+match join is built as a box with tags 9, 17 and 7.
+
+The ladder misread the node from what it was built from:
+
+* a declaration or initializer, through `identListRep`, `globalListRep` and the `letIsArray`
+  initializer fallback (`module-block-union-binding.vl`, `f32-list-union-member.vl`,
+  `nul-scalar-elem-list-union-arm-widens.vl`, `readonly-list-member-narrows-and-reads.vl`);
+* an `if` or `match` join's arms (`type-param-list-join-storage-apart.vl`, the `rv3310_*` cells,
+  `coalesce-list-union-binding-boxes.vl`);
+* `declaredKind` of a name that another module block declares as `Circle[] | null`
+  (`pop-union-box-element.vl`, `Circle | null` and `string | null`).
+
+The misanswers stayed latent. Their consumers either discard the answer (`collectLocals` asks
+`letIsStringArray` and then gates on `!letIsUnion`) or keep it apart from a box anyway
+(`listOpRepOf` in `startFnDetectScratch`, `globalCellKind` in `dispatchRewrite`).
+
+**The rule.** `exprListRepOf` already answers no list for a recorded scalar, object, function
+or map type. It now does the same for a recorded union or nullable type whose descriptor is
+covered and is no list (`vkListClass(...) == 0`). This applies only where the record is the
+pin's own (`pin == raw`) and the node is not a call.
+
+**The narrowed name is left to the ladder.** The first candidate had no exception, and
+`generics/generic-body-list-union-read-ops.vl` became check-clean invalid wasm inside
+`complement`. In `if v is i32[] { … } else { v[0] }` over a generic body's `T[] | i32[]`, the
+complement cannot narrow a type parameter's list. So the instance's record for `v` stays the
+whole union, while the emitter holds `v` narrowed to the string list (`unionIdentReadKind` 9).
+The base re-boxes that read at tag 10 and casts the payload to the string list. The first
+candidate re-boxed it at tag 1. A name the emitter holds narrowed (`narrowSlotOf(name) >= 0`,
+`identReadNarrowed`) now skips the rule. The new fixture
+`generics/generic-complement-list-union-positions.vl` reads the complement at an index, through
+an alias, as a list element, in a closure, and in a `for … in`. It is invalid wasm on the first
+candidate and runs on master and on this change. Those 6 notes are the one family where the
+ladder is right and the record is not. Recording the narrowed arm at the pin would close them,
+and the new fixture adds 66 more notes of the same kind (`list -> none` 40, `strlist -> none` 26).
+
+**Counts.** Plain `listRep` notes (queries), base master `5be21bb0a` (§13.31), candidate this
+change. The new fixture is counted on its own.
+
+| population | class | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | `reflist -> none` | 34 | 8 |
+| `tests/cases` | `list -> none` | 12 | 0 |
+| `tests/cases` | `strlist -> none` | 10 | 6 |
+| `tests/cases` | `f32list -> none` | 6 | 0 |
+| `named/` | `reflist -> none` | 12 | 0 |
+| `named/` | `strlist -> none` | 8 | 0 |
+| both | every other plain class (`-> unc`, `none ->`) | 218 | 218 |
+| new fixture | `list -> none`, `strlist -> none` | — | 40, 26 |
+
+The 8 `reflist -> none` left are one `Call` in `mono-callback-bound-arm-beside-layout-twin.vl`.
+That is a call's record, which can belong to another instantiation, so the rule does not apply
+there. The 6 `strlist -> none` are the narrowed complement above.
+
+The other families moved only in how often the ladder asks. Nothing was aimed at them:
+
+* In the `scope` family, `tests/cases` `none -> reflist` fell from 30,332 to 28,903, and
+  `named/` `none -> reflist` rose from 8,655 to 8,673. The early return stops recursion into
+  declarations, and some callers now ask a join's arms one at a time.
+* The `open` family's `list -> reflist` ×18 (`return-join-nested-type-param-list.vl`) is no
+  longer asked.
+* The `narrowed` family is unchanged.
+
+**Checks.** The base fixpoint is 5,713,599 bytes and the candidate 5,713,809, +210.
+
+* `difftree --identity` over master's 15,186 files: the candidate compiling master's source gives
+  master's fixpoint. **10,227 built, 0 differ, 0 uncompared.**
+* Native fixpoint holds at 5,713,809 bytes.
+* `regress.vl`: 0 runs lost, 0 to silent, no cell changed class.
+* `rep-fuzz-check` is exact, with 0 baselined failures.
+* `lint-self` is clean, and `seed-size --check` passes (+1.2% on its baseline).
+* `check-filed-witnesses --strict` over both inventories: 2,769 graded, 2,769 as filed, 0 moved.
+* `SELFHOST_NATIVE_ALIGN=1` over `tests/selfhost_native_*_test.ts`: 5,247 passed, 0 failed.
+
+**Next.**
+* Record the narrowed arm on a type parameter's complement at the pin. That closes the 6
+  `generic-body-list-union-read-ops.vl` notes and the new fixture's 66, and lets the
+  `identReadNarrowed` exception go.
+* The mono-callback `Call` ×8.
+* The `unc` notes, where the column does not cover the node.
+* D3346, D4862, D3368, the `if` join at a pin (D2832), the narrowed family, the scope callers.

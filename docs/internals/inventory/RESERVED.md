@@ -103,3 +103,4 @@ D4850-D4853  lane-L2  2026-10-15  L2 §13.27 (hole lists): none filed
 D4854-D4857  lane-L2  2026-10-15  L2 §13.29 (box-element lists): D4854 filed closed (a captured walk variable over a local box-element list literal typed from its first element)
 D4862-D4865  lane-L2  2026-10-15  L2 §13.30 (a kept-apart list join re-joined at the pin): D3367 closed, D4862 filed open (a type parameter's list and a concrete list collapse at a nullable-element pin)
 D4866-D4869  lane-L2  2026-10-15  L2 §13.31 (small listRep DIFF classes): D4866 filed closed (a call's return re-check records one instance's destination on a generic body's shared list literal)
+D4878-D4881  lane-L2  2026-10-15  L2 §13.32 (the listRep `-> none` class): none filed
