@@ -1,0 +1,175 @@
+// Python's `random.Random(seed)` for an integer seed, draw for draw: the MT19937 state,
+// `random()`, `getrandbits`, and the `choice` / `choices` / `sample` / `shuffle` /
+// `randint` built on them. A saved day-one sample names its seed, and the same seed has
+// to regenerate the same pairs the Python sampler drew, so this is exact, not similar.
+//
+//     import { Rng, newRng, random } from "./rng"
+
+// The generator state: 624 words and the read position, as CPython's `_random` keeps them.
+export type Rng = { mt: i32[], idx: i32 }
+
+const N = 624
+const M = 397
+
+function initGenrand(r: Rng, s: i32) {
+  r.mt[0] = s
+  let i = 1
+  while i < N {
+    const p = r.mt[i - 1]
+    r.mt[i] = 1812433253 * (p ^ (p >>> 30)) + i
+    i = i + 1
+  }
+  r.idx = N
+}
+
+// A generator seeded with `seed` as `random.Random(seed)` seeds one: the 32-bit words of
+// `abs(seed)`, least significant first, through `init_by_array`.
+export function newRng(seed: i64): Rng {
+  const r: Rng = { mt: [], idx: N }
+  let k = 0
+  while k < N {
+    r.mt.push(0)
+    k = k + 1
+  }
+  let a = seed
+  if a < 0 { a = 0 - a }
+  const key: i32[] = []
+  while a > 0 {
+    key.push((a & 0xFFFFFFFF) as% i32)
+    a = a >>> 32
+  }
+  if key.length == 0 { key.push(0) }
+  initGenrand(r, 19650218)
+  let i = 1
+  let j = 0
+  k = if N > key.length { N } else { key.length }
+  while k > 0 {
+    const p = r.mt[i - 1]
+    r.mt[i] = (r.mt[i] ^ ((p ^ (p >>> 30)) * 1664525)) + key[j] + j
+    i = i + 1
+    j = j + 1
+    if i >= N {
+      r.mt[0] = r.mt[N - 1]
+      i = 1
+    }
+    if j >= key.length { j = 0 }
+    k = k - 1
+  }
+  k = N - 1
+  while k > 0 {
+    const p = r.mt[i - 1]
+    r.mt[i] = (r.mt[i] ^ ((p ^ (p >>> 30)) * 1566083941)) - i
+    i = i + 1
+    if i >= N {
+      r.mt[0] = r.mt[N - 1]
+      i = 1
+    }
+    k = k - 1
+  }
+  r.mt[0] = 0x80000000 as% i32
+  r
+}
+
+function twist(r: Rng) {
+  let k = 0
+  while k < N {
+    const y = (r.mt[k] & (0x80000000 as% i32))
+      | (r.mt[(k + 1) % N] & 0x7FFFFFFF)
+    let v = r.mt[(k + M) % N] ^ (y >>> 1)
+    if (y & 1) != 0 { v = v ^ (0x9908B0DF as% i32) }
+    r.mt[k] = v
+    k = k + 1
+  }
+  r.idx = 0
+}
+
+// The next 32 tempered bits, as a non-negative `i64`.
+function next32(r: Rng): i64 {
+  if r.idx >= N { twist(r) }
+  let y = r.mt[r.idx]
+  r.idx = r.idx + 1
+  y = y ^ (y >>> 11)
+  y = y ^ ((y << 7) & (0x9D2C5680 as% i32))
+  y = y ^ ((y << 15) & (0xEFC60000 as% i32))
+  y = y ^ (y >>> 18)
+  (y as i64) & 0xFFFFFFFF
+}
+
+// `random()`: a float in [0, 1) from 53 bits.
+export function random(r: Rng): f64 {
+  const a = next32(r) >>> 5
+  const b = next32(r) >>> 6
+  ((a as f64) * 67108864.0 + (b as f64)) * (1.0 / 9007199254740992.0)
+}
+
+// `getrandbits(k)` for `0 <= k <= 32`.
+function bits(r: Rng, k: i32): i64 {
+  if k == 0 { return 0 }
+  next32(r) >>> ((32 - k) as i64)
+}
+
+// `_randbelow(n)`: uniform in [0, n) for `n >= 1`, by rejection on `bit_length(n)` bits.
+export function below(r: Rng, n: i32): i32 {
+  let k = 0
+  while (n >>> k) != 0 { k = k + 1 }
+  let v = bits(r, k)
+  while v >= (n as i64) { v = bits(r, k) }
+  v as! i32
+}
+
+// `randint(lo, hi)`, both ends included.
+export function randint(r: Rng, lo: i32, hi: i32): i32 {
+  lo + below(r, hi - lo + 1)
+}
+
+// `choices(range(n), weights)[0]`: an index drawn by weight; -1 when `weights` is empty.
+export function weighted(r: Rng, weights: i32[]): i32 {
+  if weights.length == 0 { return -1 }
+  const cum: f64[] = []
+  let t = 0
+  for w in weights {
+    t = t + w
+    cum.push(t as f64)
+  }
+  const x = random(r) * (t as f64)
+  let lo = 0
+  let hi = weights.length - 1
+  while lo < hi {
+    const mid = (lo + hi) / 2
+    if x < cum[mid] { hi = mid } else { lo = mid + 1 }
+  }
+  lo
+}
+
+// `sample(range(n), 2)`: two distinct indices in the order drawn. CPython's pool path,
+// which is the one it takes for every population up to 21 long.
+export function sample2(r: Rng, n: i32): i32[] {
+  if n > 21 { return [] }
+  const pool: i32[] = []
+  let i = 0
+  while i < n {
+    pool.push(i)
+    i = i + 1
+  }
+  const out: i32[] = []
+  i = 0
+  while i < 2 {
+    const j = below(r, n - i)
+    out.push(pool[j])
+    pool[j] = pool[n - i - 1]
+    i = i + 1
+  }
+  out
+}
+
+// `shuffle(xs)` in place.
+export function shuffle(r: Rng, xs: string[]) {
+  let i = xs.length - 1
+  while i >= 1 {
+    const j = below(r, i + 1)
+    const t = xs[i]
+    xs[i] = xs[j]
+    xs[j] = t
+    i = i - 1
+  }
+}

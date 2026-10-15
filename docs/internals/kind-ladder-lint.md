@@ -1,6 +1,6 @@
 # `kind-ladder-incomplete` / `kind-ladder-split` — a dispatch that answers about part of a closed set
 
-Rule in `compiler/lint.vl`, tree-wide census in `scripts/ladder-census.py`, ratchet in
+Rule in `compiler/lint.vl`, tree-wide census in `scripts/ladder-census.vl`, ratchet in
 `vl check --budget scripts/ladder-budget-baseline.json`, set drift in `scripts/ladder-sets.vl`,
 fixtures pinned by `tests/vl_kind_ladder_test.ts`. The survey that
 sized the population is `ladder-audit-2026-09.md`; the arena half's prior sweep is
@@ -168,7 +168,7 @@ is a dispatch.
 
 ## A LITUNION SET IS MATCHABLE — the refusal is about NULLABLE, not literal
 
-Eleven of the thirteen closed sets are `lit` (`ladder-census.py --sets` says so in its second
+Eleven of the thirteen closed sets are `lit` (`ladder-census.vl -- --sets` says so in its second
 column): only `Node` and `Ty` are declared unions of object types. The pilot recorded that two
 `VKind` sites were refused with
 
@@ -394,7 +394,7 @@ split into five kinds, none a clean byte-identical conversion:
 
 The first two buckets are the bulk (353 of 376) and were never conversion candidates; the last
 four are the litunion residue the sweep read to the end. The set column's per-site attribution
-is the discovery half — `scripts/ladder-census.py --list kind-ladder-incomplete` — and this table
+is the discovery half — `vl run scripts/ladder-census.vl -- --list` — and this table
 is what it grades against.
 
 ## One implementation, and the set copy it keeps
@@ -403,7 +403,7 @@ is what it grades against.
 counts those same findings per file for the ratchet, so the lint is the only walk the gate runs.
 `tests/vl_kind_ladder_test.ts` grades it over the fixtures against pinned LINES, and
 `scripts/ladder-sets.vl` re-derives every closed set from the `export type` that declares it
-and fails when the lint's copy has drifted. `ladder-census.py` is a second walk kept for
+and fails when the lint's copy has drifted. `ladder-census.vl` is a second walk kept for
 discovery only; nothing gates on it agreeing.
 
 **And ten fixtures is not the tree.** Comparing both walks over every compiler module, filtered
@@ -416,10 +416,10 @@ suite cannot find a shape none of its fixtures has.
 ## Running it
 
 ```sh
-python3 scripts/ladder-census.py                      # the ladder table, by set and by ending
-python3 scripts/ladder-census.py --sets               # every closed set, its members, its home
-python3 scripts/ladder-census.py --split              # the split walks
-python3 scripts/ladder-census.py --pred               # the form with no kind literal in it
+vl run scripts/ladder-census.vl --                      # the ladder table, by set and by ending
+vl run scripts/ladder-census.vl -- --sets               # every closed set, its members, its home
+vl run scripts/ladder-census.vl -- --split              # the split walks
+vl run scripts/ladder-census.vl -- --pred               # the form with no kind literal in it
 vl check --budget scripts/ladder-budget-baseline.json                   # the gate: a file may only go down
 vl check --budget-why scripts/ladder-budget-baseline.json               # what LEFT since the baseline's commit
 vl check --budget scripts/ladder-budget-baseline.json --write-baseline  # after a real fix, in the same PR

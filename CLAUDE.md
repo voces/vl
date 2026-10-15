@@ -386,7 +386,7 @@ sources of error push the estimate UP, not down: a time-boxed UNDECIDED favours
 unreachable-by-argument over live (which needs a program nobody has written), and the frame
 excludes the already-known-live sites.
 
-**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.py`.** Every hand-derivation of this
+**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.vl`.** Every hand-derivation of this
 population has been wrong, including both of the ones this paragraph used to quote: "511
 literals" came from an 8-line WINDOW grep that swept in neighbouring code, and **504 sites is
 not reproducible either** — the script reads **521** on the very tree that doc measured, with
@@ -711,7 +711,7 @@ found (D1646/D1647) are `docs/internals/kind-ladder-lint.md`.
 `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
 across two functions where only one hands back. Ratchet: `vl check --budget
 scripts/ladder-budget-baseline.json` (held by `lint-self.sh`), and `vl run scripts/ladder-sets.vl` beside it
-re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
+re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.vl` is the discovery half — `--sets`, `--split`, and `--pred`
 for the form with no kind literal in it, which is the only place #2400's hole is visible.
 
 ## A TABLE READ BOUND-TESTS ITS INDEX, OR TAKES A READER WHOSE MISS CANNOT BE A REAL ROW
@@ -726,7 +726,7 @@ a read `<t>[<idx>]` whose base the function did not declare and whose index is a
 HOLE FIELD (one the module itself compares `< 0` / `>= 0`), or a fall-through `i32` parameter
 of a reader, with no comparison of `<idx>` against `0`, `-1` or any `.length` before it.
 Ratchet: `vl check --budget scripts/sentinel-budget-baseline.json` (386 + 0 when it landed, #2499), census
-`scripts/sentinel-census.py`, `--why` names what left since the baseline's commit.
+`vl run scripts/sentinel-census.vl`, `--why` names what left since the baseline's commit.
 `docs/internals/sentinel-index-lint.md`.
 
 **A TRAP'S BACKTRACE IS FUNCTION INDICES UNTIL THE SEED IS BUILT WITH `--names`.** `vl build

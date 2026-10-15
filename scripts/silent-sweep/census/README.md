@@ -40,6 +40,13 @@ readings rather than blind spots.
 | `rep` | 16 payload field types: the scalars, string, three literal-union backings, list, map, struct, union arm, nullable | the rep vocabulary |
 | `annpat` | outer, none, inner, mid, all — WHICH intermediate level is annotated | **new, and it is the axis D180 turns on** |
 
+**Structural entanglements, declared rather than hidden.** Four coordinates carry a container
+annotation whatever `annpos` says, because the language has no other spelling for them:
+`store=param` (a parameter must be annotated), `deliv=calleedeliv` / `deliv=closurearg` (a
+callee or lambda parameter must be), `deliv=structread` (the wrapper struct must be a declared
+type), and `cont=structfield*` (an object-literal struct binding must be). An analysis holds
+them fixed rather than reading them as noise.
+
 ## The design, and what it guarantees
 
 The full cross is 217,728,000 cells. The census is a fractional design in five blocks:
@@ -71,7 +78,7 @@ lines, so its cells carry MORE nominal ingredients than `order=norm`'s, and bloc
 
 ## Validating the vocabulary before the grid inherits it
 
-`mkmatrix.py` builds `rep × cont` (192 cells) in the CLEAN shape — everything declared by
+`mkmatrix.vl` builds `rep × cont` (192 cells) in the CLEAN shape — everything declared by
 name, annotated on the binding, no twin, no union, no alias. **All 192 run.** Anything that
 is not `runs` there is a language limit or a harness spelling error, and the census excludes
 it BY NAME rather than absorbing it. Measured limits found this way and kept out:
@@ -90,7 +97,7 @@ it BY NAME rather than absorbing it. Measured limits found this way and kept out
 
 ## Validating the grader
 
-`sabcensus.py` provokes every column `gradecensus.vl` can print, and reproduces its stated
+`sabcensus.vl` provokes every column `gradecensus.vl` can print, and reproduces its stated
 counts exactly: **runs 4 / runs but wrong value 4 / trap_loads 3 / check-clean invalid wasm
 3 / loud emit reject 3 / loud check reject 3**. Three of the `runs but wrong value` cells
 are byte-identical to a `runs` control with a different manifest, which is what proves the
@@ -98,7 +105,7 @@ grader reads the expectation and not the output.
 
 Two of its cells were mispredicted on the first run and the PROGRAMS, not the prediction,
 were corrected — `const c = [[7]]` runs, and `type W = { f: Circle }` runs until `Circle` is
-a union arm. Both are recorded in the file, because a sabotage whose stated counts it does
+a union arm. Both are recorded here, because a sabotage whose stated counts it does
 not reproduce is worse than none.
 
 `compiler trap` could not be provoked from source when the sabotage was written, and the
@@ -112,7 +119,7 @@ The PUBLISHED grader was re-validated against the same compiler first:
 `scripts/silent-sweep/sabotage.py` (since deleted) → **15 wrong_value / 10 wrong_evalcount / 8 trap / 5
 correct**, exactly as `REPRODUCE.md` publishes.
 
-> **`sabcensus.py`'s `check-clean invalid wasm` column is PERISHABLE — a specimen chosen to model
+> **`sabcensus.vl`'s `check-clean invalid wasm` column is PERISHABLE — a specimen chosen to model
 > a live defect stops modelling it the day that defect closes.** Measured: the file as it stood
 > at `1559d80c` reproduced 3 invalid-wasm / 4 runs there, and **2 / 5** from `c55269c9` onward,
 > because its `iw_d155` cell was fixed by **#1965 (D155)** — the very row it was modelled on.
@@ -129,15 +136,15 @@ correct**, exactly as `REPRODUCE.md` publishes.
 ## Running it
 
     bash scripts/agent-setup.sh                     # seed must be 1,452,766 bytes at 1559d80c
-    python3 scripts/silent-sweep/census/mkmatrix.py  scratch-silent/census/matrix
+    vl run scripts/silent-sweep/census/mkmatrix.vl -- scratch-silent/census/matrix
     JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
         scratch-silent/census/matrix build/vl-compiler.wasm scratch-silent/census/matrix.json
-    python3 scripts/silent-sweep/census/sabcensus.py scratch-silent/census/sab
+    vl run scripts/silent-sweep/census/sabcensus.vl -- scratch-silent/census/sab
     JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
         scratch-silent/census/sab build/vl-compiler.wasm scratch-silent/census/sab.json
 
     for B in A B C D E; do
-      python3 scripts/silent-sweep/census/gencensus.py scratch-silent/census/cells$B --block $B
+      vl run scripts/silent-sweep/census/gencensus.vl -- scratch-silent/census/cells$B --block $B
       JOBS=4 vl run scripts/silent-sweep/census/gradecensus.vl -- \
           scratch-silent/census/cells$B build/vl-compiler.wasm scratch-silent/census/$B.json
     done
@@ -171,7 +178,7 @@ generated at two commits are two populations, and a per-cell diff across them is
 MISMATCH line if either side has a cell the other lacks.
 
     for S in <sha1> <sha2>; do ... build seed from that commit ... ; done
-    python3 scripts/silent-sweep/census/gencensus.py scratch-silent/census/cellsA --block A
+    vl run scripts/silent-sweep/census/gencensus.vl -- scratch-silent/census/cellsA --block A
     JOBS=4 vl run .../gradecensus.vl -- scratch-silent/census/cellsA seed-<sha1>.wasm before.json
     JOBS=4 vl run .../gradecensus.vl -- scratch-silent/census/cellsA seed-<sha2>.wasm after.json
     vl run scripts/silent-sweep/census/delta.vl -- scratch-silent/census/cellsA before.json after.json

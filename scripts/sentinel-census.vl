@@ -1,0 +1,1056 @@
+// The sentinel-index census: the discovery instrument behind `sentinel-index-unguarded` and
+// `sentinel-index-strict-untested` (docs/internals/sentinel-index-lint.md). A hit is a table
+// read `<table>[<idx>]` whose index came from something that answers an in-band "no answer"
+// (a call, or a field the module compares against 0 or -1), with no bound test before it.
+//
+//     vl run scripts/sentinel-census.vl -- [--root DIR] [--limit N] [--code CODE]
+//     vl run scripts/sentinel-census.vl -- [--root DIR] --readers [--hits] | --holes | --tables
+//     vl run scripts/sentinel-census.vl -- [--root DIR] --counts | --grade FILE
+//
+// With no mode flag it prints every hit. compiler/lint.vl carries the same walk per module,
+// written independently, and tests/vl_sentinel_index_test.ts holds the two to the same hits.
+// Grades `compiler/*.vl` under the working directory (or DIR): run it from the checkout root.
+
+import { IoError, listDir, readFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { decodeUtf8Lossy } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { join, repeat, split } from "std:str"
+import { die, findFrom, jsonStr } from "./lib/common"
+import { byCountDesc, tally } from "./lib/census-read"
+import { padLeft, padRight, sortStrings } from "./lib/corpus"
+
+const UNGUARDED = "sentinel-index-unguarded"
+const STRICT = "sentinel-index-strict-untested"
+const CODES = [UNGUARDED, STRICT]
+
+type Src = { rel: string, path: string }
+type Fn = { name: string, lo: i32, hi: i32 }
+type Hit = {
+  rel: string,
+  fn: string,
+  line: i32,
+  col: i32,
+  table: string,
+  idx: string,
+  producer: string,
+  code: string,
+}
+type Prod = { kind: string, prod: string }
+
+// ── bytes, read the way the census reads a source: one byte per character ──────────
+
+function isIdStart(b: i32): boolean {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+function isIdChar(b: i32): boolean { isIdStart(b) || (b >= 48 && b <= 57) }
+
+function isDigit(b: i32): boolean { b >= 48 && b <= 57 }
+
+// A word character as a regex `\w` sees a Latin-1 byte: alphanumeric or `_`.
+function isWord(b: i32): boolean {
+  if b < 0x80 { return isIdChar(b) }
+  if (
+    b == 0xAA
+    || b == 0xB2
+    || b == 0xB3
+    || b == 0xB5
+    || b == 0xB9
+    || b == 0xBA
+  ) {
+    return true
+  }
+  if b >= 0xBC && b <= 0xBE { return true }
+  b >= 0xC0 && b != 0xD7 && b != 0xF7
+}
+
+// Whitespace as a regex `\s` sees a Latin-1 byte.
+function isSpace(b: i32): boolean {
+  (b >= 9 && b <= 13) || (b >= 28 && b <= 32) || b == 0x85 || b == 0xA0
+}
+
+function at(s: string, i: i32): i32 {
+  if i < 0 || i >= s.length { return -1 }
+  s[i]
+}
+
+function wordAt(s: string, i: i32): boolean {
+  i >= 0 && i < s.length && isWord(s[i])
+}
+
+function startsAt(s: string, i: i32, lit: string): boolean {
+  i >= 0 && i + lit.length <= s.length && s.slice(i, i + lit.length) == lit
+}
+
+function skipSp(s: string, i: i32): i32 {
+  let k = i
+  while k < s.length && isSpace(s[k]) { k = k + 1 }
+  k
+}
+
+// The end of the identifier starting at `i`, or `i` when none starts there.
+function identEnd(s: string, i: i32): i32 {
+  if i >= s.length || !isIdStart(s[i]) { return i }
+  let k = i + 1
+  while k < s.length && isIdChar(s[k]) { k = k + 1 }
+  k
+}
+
+function isBlank(s: string): boolean {
+  for b in s.bytes() {
+    if !isSpace(b as i32) { return false }
+  }
+  true
+}
+
+function strip(s: string): string {
+  let a = 0
+  let b = s.length
+  while a < b && isSpace(s[a]) { a = a + 1 }
+  while b > a && isSpace(s[b - 1]) { b = b - 1 }
+  s.slice(a, b)
+}
+
+function endsWith(s: string, suf: string): boolean {
+  s.length >= suf.length && s.slice(s.length - suf.length, s.length) == suf
+}
+
+// ── sources and stripping ────────────────────────────────────────────────────────
+
+function readSource(path: string): string {
+  const b = readFile(path)
+  if b is IoError {
+    die("sentinel-census: cannot read \{path} (\{b.msg})", 1)
+    return ""
+  }
+  decodeUtf8Lossy(b)
+}
+
+// `compiler/*.vl` under `root`: the tree the ratchet polices.
+function sources(root: string): Src[] {
+  const dir = root + "/compiler"
+  const names = listDir(dir)
+  if names is IoError {
+    die("sentinel-census: cannot list \{dir} (\{names.msg})", 1)
+    return []
+  }
+  const out: Src[] = []
+  for n in sortStrings(names) {
+    if endsWith(n, ".vl") {
+      out.push({ rel: "compiler/" + n, path: dir + "/" + n })
+    }
+  }
+  out
+}
+
+// `ln` cut at its `//` comment, every string or char literal's content blanked to `x` with
+// the quotes kept. Blanking keeps the length, so a column found here is the raw line's.
+function stripLine(ln: string): string {
+  const out: string[] = []
+  const b = ln.length
+  let i = 0
+  let a = 0
+  while i < b {
+    const c = ln[i]
+    if c == 47 && i + 1 < b && ln[i + 1] == 47 { break }
+    if c == 34 || c == 39 {
+      out.push(ln.slice(a, i + 1))
+      i = i + 1
+      let n = 0
+      while i < b && ln[i] != c {
+        if ln[i] == 92 && i + 1 < b {
+          n = n + 1
+          i = i + 1
+        }
+        n = n + 1
+        i = i + 1
+      }
+      out.push(repeat("x", n))
+      a = i
+      if i < b { i = i + 1 }
+      continue
+    }
+    i = i + 1
+  }
+  out.push(ln.slice(a, i))
+  join(out, "")
+}
+
+function strippedLines(src: string): string[] {
+  const out: string[] = []
+  for ln in split(src, "\n") { out.push(stripLine(ln)) }
+  out
+}
+
+// ── functions ────────────────────────────────────────────────────────────────────
+
+// The name a column-0 `[export ]function <name>(` header declares, or "".
+function fnHead(ln: string): string {
+  let i = 0
+  if startsAt(ln, 0, "export ") { i = 7 }
+  if !startsAt(ln, i, "function ") { return "" }
+  const e = identEnd(ln, i + 9)
+  if e == i + 9 || at(ln, skipSp(ln, e)) != 40 { return "" }
+  ln.slice(i + 9, e)
+}
+
+// The line the function opening at `lo` closes on: `lo` for a one-liner, `hi` when the
+// braces never balance. Mirrors `klFnEnd` in compiler/lint.vl.
+function fnEnd(lines: string[], lo: i32, hi: i32): i32 {
+  let depth = 0
+  let opened = false
+  let n = lo
+  while n <= hi {
+    for ch in lines[n].bytes() {
+      if ch == 123 {
+        depth = depth + 1
+        opened = true
+      } else if ch == 125 {
+        depth = depth - 1
+      }
+    }
+    if opened && depth <= 0 { return n }
+    n = n + 1
+  }
+  hi
+}
+
+// Every top-level function, its body ending where its braces close and never past the
+// next header, trailing blank lines dropped.
+function functions(lines: string[]): Fn[] {
+  const heads: Fn[] = []
+  let i = 0
+  while i < lines.length {
+    const nm = fnHead(lines[i])
+    if nm != "" { heads.push({ name: nm, lo: i, hi: i }) }
+    i = i + 1
+  }
+  const out: Fn[] = []
+  let k = 0
+  while k < heads.length {
+    const h = heads[k]
+    let end = fnEnd(lines, h.lo, lines.length - 1)
+    if k + 1 < heads.length && heads[k + 1].lo - 1 < end {
+      end = heads[k + 1].lo - 1
+    }
+    while end > h.lo && isBlank(lines[end]) { end = end - 1 }
+    out.push({ name: h.name, lo: h.lo, hi: end })
+    k = k + 1
+  }
+  out
+}
+
+// ── the line shapes ──────────────────────────────────────────────────────────────
+
+// Where a hole test's comparison starting at `k` ends: `<`/`>=` against a bare 0, or any
+// comparison against a negative literal. -1 when there is none.
+function holeOp(s: string, k: i32): i32 {
+  for op in ["<", ">="] {
+    if startsAt(s, k, op) {
+      const j = skipSp(s, k + op.length)
+      const nx = at(s, j + 1)
+      if at(s, j) == 48 && !isDigit(nx) && nx != 46 { return j + 1 }
+    }
+  }
+  for op in ["<", ">", "<=", ">=", "==", "!="] {
+    if startsAt(s, k, op) {
+      const j = skipSp(s, k + op.length)
+      if at(s, j) == 45 { return j + 1 }
+    }
+  }
+  -1
+}
+
+// Every `<x>.<field>` the line compares against 0 or a negative literal adds `<field>`.
+function holeTests(s: string, out: Set<string>) {
+  let p = 0
+  while p < s.length {
+    if isIdStart(s[p]) && !wordAt(s, p - 1) {
+      const e1 = identEnd(s, p)
+      if at(s, e1) == 46 {
+        const e2 = identEnd(s, e1 + 1)
+        if e2 > e1 + 1 {
+          const end = holeOp(s, skipSp(s, e2))
+          if end >= 0 {
+            out.add(s.slice(e1 + 1, e2))
+            p = end
+            continue
+          }
+        }
+      }
+    }
+    p = p + 1
+  }
+}
+
+// `return` at `p` with a word boundary before it.
+function returnAt(s: string, p: i32): boolean {
+  startsAt(s, p, "return") && !wordAt(s, p - 1)
+}
+
+// Whether the line hands back a literal -1: `return -1`, `return 0 - 1`, or a bare `-1`.
+function negAnswer(s: string): boolean {
+  let k = skipSp(s, 0)
+  if startsAt(s, k, "-1") && skipSp(s, k + 2) == s.length { return true }
+  let p = 0
+  while p < s.length {
+    if returnAt(s, p) {
+      const j = skipSp(s, p + 6)
+      if j > p + 6 {
+        if startsAt(s, j, "-1") && !wordAt(s, j + 2) { return true }
+        if at(s, j) == 48 {
+          k = skipSp(s, j + 1)
+          if at(s, k) == 45 {
+            k = skipSp(s, k + 1)
+            if at(s, k) == 49 && !wordAt(s, k + 1) { return true }
+          }
+        }
+      }
+    }
+    p = p + 1
+  }
+  false
+}
+
+// The callee of the line's first `return <f>(`, else of a two-space-indented `<f>(`, or "".
+function forwardedCall(s: string): string {
+  let p = 0
+  while p < s.length {
+    if returnAt(s, p) {
+      const j = skipSp(s, p + 6)
+      const e = identEnd(s, j)
+      if j > p + 6 && e > j && at(s, skipSp(s, e)) == 40 {
+        return s.slice(j, e)
+      }
+    }
+    p = p + 1
+  }
+  if !startsAt(s, 0, "  ") { return "" }
+  const e = identEnd(s, 2)
+  if e > 2 && at(s, skipSp(s, e)) == 40 { return s.slice(2, e) }
+  ""
+}
+
+// A `let`/`const` declaration's name, or a `for <x> in` loop variable, or "".
+function declName(s: string): string {
+  const k = skipSp(s, 0)
+  let j = -1
+  if startsAt(s, k, "let") { j = k + 3 }
+  else if startsAt(s, k, "const") { j = k + 5 }
+  if j >= 0 {
+    const n = skipSp(s, j)
+    const e = identEnd(s, n)
+    if n > j && e > n { return s.slice(n, e) }
+  }
+  if startsAt(s, k, "for") {
+    const n = skipSp(s, k + 3)
+    const e = identEnd(s, n)
+    if n > k + 3 && e > n {
+      const q = skipSp(s, e)
+      if q > e && startsAt(s, q, "in") && !wordAt(s, q + 2) {
+        return s.slice(n, e)
+      }
+    }
+  }
+  ""
+}
+
+// Every `<name>:` in `s`, or only those annotated `: i32` when `i32Only`.
+function paramNames(s: string, i32Only: boolean, out: Set<string>) {
+  let p = 0
+  while p < s.length {
+    if isIdStart(s[p]) {
+      const e = identEnd(s, p)
+      const k = skipSp(s, e)
+      if at(s, k) == 58 {
+        if !i32Only {
+          out.add(s.slice(p, e))
+          p = k + 1
+          continue
+        }
+        const t = skipSp(s, k + 1)
+        if startsAt(s, t, "i32") && !wordAt(s, t + 3) {
+          out.add(s.slice(p, e))
+          p = t + 3
+          continue
+        }
+      }
+    }
+    p = p + 1
+  }
+}
+
+// Whether the line holds a `return` at its start or after whitespace or `{`.
+function hasReturn(s: string): boolean {
+  let p = 0
+  while p < s.length {
+    if startsAt(s, p, "return") && !wordAt(s, p + 6) {
+      if p == 0 || isSpace(s[p - 1]) || s[p - 1] == 123 { return true }
+    }
+    p = p + 1
+  }
+  false
+}
+
+// The name of a module-level `[export ]let|const <name>: {[` map global, or "".
+function mapGlobal(s: string): string {
+  let i = 0
+  if startsAt(s, 0, "export ") { i = 7 }
+  if startsAt(s, i, "let ") { i = i + 4 }
+  else if startsAt(s, i, "const ") { i = i + 6 }
+  else { return "" }
+  const e = identEnd(s, i)
+  if e == i { return "" }
+  const k = skipSp(s, e)
+  if at(s, k) != 58 || !startsAt(s, skipSp(s, k + 1), "{[") { return "" }
+  s.slice(i, e)
+}
+
+// ── bindings ─────────────────────────────────────────────────────────────────────
+
+// Where the bound name starts: after `let`/`const` and whitespace when `decl`, after the
+// indentation otherwise. -1 when no name starts there.
+function bindStart(s: string, decl: boolean): i32 {
+  let k = skipSp(s, 0)
+  if decl {
+    let j = -1
+    if startsAt(s, k, "let") { j = k + 3 }
+    else if startsAt(s, k, "const") { j = k + 5 }
+    if j < 0 { return -1 }
+    k = skipSp(s, j)
+    if k == j { return -1 }
+  }
+  if identEnd(s, k) == k { return -1 }
+  k
+}
+
+// The end of a `: <word>` annotation starting at `e`, or -1.
+function wordType(s: string, e: i32): i32 {
+  const j = skipSp(s, e)
+  if at(s, j) != 58 { return -1 }
+  let t = skipSp(s, j + 1)
+  const t0 = t
+  while t < s.length && isIdChar(s[t]) { t = t + 1 }
+  if t == t0 { return -1 }
+  t
+}
+
+type Bind = { name: string, rhs: string, field: string }
+
+const NO_BIND: Bind = { name: "", rhs: "", field: "" }
+
+// After `=` at `pos`: `<f>(` gives `f`.
+function callRhs(s: string, pos: i32): string {
+  const j = skipSp(s, pos)
+  if at(s, j) != 61 { return "" }
+  const f = skipSp(s, j + 1)
+  const e = identEnd(s, f)
+  if e == f || at(s, skipSp(s, e)) != 40 { return "" }
+  s.slice(f, e)
+}
+
+// `x = f(…)`, with an optional `let`/`const` and `: <word>` annotation.
+function bindCall(s: string): Bind {
+  for decl in [true, false] {
+    const n = bindStart(s, decl)
+    if n < 0 { continue }
+    const e = identEnd(s, n)
+    const t = wordType(s, e)
+    let f = ""
+    if t >= 0 { f = callRhs(s, t) }
+    if f == "" { f = callRhs(s, e) }
+    if f != "" { return { name: s.slice(n, e), rhs: f, field: "" } }
+  }
+  NO_BIND
+}
+
+// After `=` at `pos`: `<y>.<f>` and nothing else gives `f`.
+function fieldRhs(s: string, pos: i32): string {
+  const j = skipSp(s, pos)
+  if at(s, j) != 61 { return "" }
+  const a = skipSp(s, j + 1)
+  const e1 = identEnd(s, a)
+  if e1 == a || at(s, e1) != 46 { return "" }
+  const e2 = identEnd(s, e1 + 1)
+  if e2 == e1 + 1 || skipSp(s, e2) != s.length { return "" }
+  s.slice(e1 + 1, e2)
+}
+
+// `x = y.f`, the right-hand side read as the text after the line's first `=`.
+function bindField(s: string): Bind {
+  for decl in [true, false] {
+    const n = bindStart(s, decl)
+    if n < 0 { continue }
+    const e = identEnd(s, n)
+    const t = wordType(s, e)
+    let f = ""
+    if t >= 0 { f = fieldRhs(s, t) }
+    if f == "" { f = fieldRhs(s, e) }
+    if f != "" {
+      let q = 0
+      while s[q] != 61 { q = q + 1 }
+      return {
+        name: s.slice(n, e),
+        rhs: strip(s.slice(q + 1, s.length)),
+        field: f,
+      }
+    }
+  }
+  NO_BIND
+}
+
+// Any other single-target assignment `x = …` or `x: T = …`, which unbinds `x`.
+function bindAny(s: string): string {
+  for decl in [true, false] {
+    const n = bindStart(s, decl)
+    if n < 0 { continue }
+    const e = identEnd(s, n)
+    const j = skipSp(s, e)
+    if at(s, j) == 58 {
+      let q = j + 1
+      while q < s.length && s[q] != 61 { q = q + 1 }
+      if q < s.length && at(s, q + 1) != 61 { return s.slice(n, e) }
+    }
+    if at(s, j) == 61 && at(s, j + 1) != 61 { return s.slice(n, e) }
+  }
+  ""
+}
+
+// ── guards and reads ─────────────────────────────────────────────────────────────
+
+// A byte that may not precede a guard's operand or a bare `0`.
+function inOperand(b: i32): boolean { isIdChar(b) || b == 46 }
+
+// The end of `x` or `x.f` starting at `p`, or `p` when no name starts there.
+function pathEnd(s: string, p: i32): i32 {
+  const e1 = identEnd(s, p)
+  if e1 == p || at(s, e1) != 46 { return e1 }
+  const e2 = identEnd(s, e1 + 1)
+  if e2 == e1 + 1 { return e1 }
+  e2
+}
+
+// The ends of every `<name>.length` that a run of name characters starting at `j` can
+// stop at, last first.
+function lengthEnds(s: string, j: i32): i32[] {
+  const out: i32[] = []
+  if !isIdStart(at(s, j)) { return out }
+  let e = j + 1
+  while e < s.length && inOperand(s[e]) { e = e + 1 }
+  let k = e - 7
+  while k >= j + 1 {
+    if startsAt(s, k, ".length") && !wordAt(s, k + 7) { out.push(k + 7) }
+    k = k - 1
+  }
+  out
+}
+
+// Where a guard's bound starting at `j` ends: `0`, `-1` or `<name>.length`. -1 for none.
+function boundEnd(s: string, j: i32): i32 {
+  const c = at(s, j)
+  if c == 48 {
+    const nx = at(s, j + 1)
+    if !isDigit(nx) && nx != 46 { return j + 1 }
+  }
+  if c == 45 {
+    const k = skipSp(s, j + 1)
+    if at(s, k) == 49 && !wordAt(s, k + 1) { return k + 1 }
+  }
+  const ends = lengthEnds(s, j)
+  if ends.length > 0 { return ends[0] }
+  -1
+}
+
+const OPS = ["<=", ">=", "<", ">", "==", "!="]
+
+// Every name the line compares against 0, -1 or a `.length`, on either side.
+function guards(s: string, out: Set<string>) {
+  // the name on the left
+  let p = 0
+  while p < s.length {
+    if isIdStart(s[p]) && !(p > 0 && inOperand(s[p - 1])) {
+      const ge = pathEnd(s, p)
+      const k = skipSp(s, ge)
+      let end = -1
+      if at(s, ge) != 46 {
+        for op in OPS {
+          if end < 0 && startsAt(s, k, op) {
+            end = boundEnd(s, skipSp(s, k + op.length))
+          }
+        }
+      }
+      if end >= 0 {
+        out.add(s.slice(p, ge))
+        p = end
+        continue
+      }
+    }
+    p = p + 1
+  }
+  // the name on the right
+  p = 0
+  while p < s.length {
+    const lhs: i32[] = []
+    const c = s[p]
+    if c == 48 && !(p > 0 && inOperand(s[p - 1])) {
+      const nx = at(s, p + 1)
+      if !isDigit(nx) && nx != 46 { lhs.push(p + 1) }
+    } else if c == 45 {
+      const k = skipSp(s, p + 1)
+      if at(s, k) == 49 && !wordAt(s, k + 1) { lhs.push(k + 1) }
+    } else {
+      for e in lengthEnds(s, p) { lhs.push(e) }
+    }
+    let done = -1
+    for l in lhs {
+      if done >= 0 { break }
+      const k = skipSp(s, l)
+      for op in OPS {
+        if done < 0 && startsAt(s, k, op) {
+          const j = skipSp(s, k + op.length)
+          const ge = pathEnd(s, j)
+          if ge > j {
+            out.add(s.slice(j, ge))
+            done = ge
+          }
+        }
+      }
+    }
+    if done >= 0 { p = done } else { p = p + 1 }
+  }
+}
+
+type Read = { col: i32, table: string, idx: string }
+
+// A byte that may not precede a read's table: a name character, `.`, `]` or `)`.
+function beforeRead(b: i32): boolean { inOperand(b) || b == 93 || b == 41 }
+
+// Every `<t>[<i>]` or `<g>.<t>[<g>.<f>]` subscript read in the line, 0-based column.
+function reads(s: string): Read[] {
+  const out: Read[] = []
+  let p = 0
+  while p < s.length {
+    if isIdStart(s[p]) && !(p > 0 && beforeRead(s[p - 1])) {
+      const te = pathEnd(s, p)
+      if at(s, te) == 91 {
+        const j = skipSp(s, te + 1)
+        const ie = pathEnd(s, j)
+        const k = skipSp(s, ie)
+        if ie > j && at(s, k) == 93 {
+          out.push({ col: p, table: s.slice(p, te), idx: s.slice(j, ie) })
+          p = k + 1
+          continue
+        }
+      }
+    }
+    p = p + 1
+  }
+  out
+}
+
+// ── the derivations, per module ──────────────────────────────────────────────────
+
+// Every field the module compares against 0 or -1: the module admitting it can be absent.
+function holeFields(lines: string[]): Set<string> {
+  const out: Set<string> = Set()
+  for ln in lines { holeTests(ln, out) }
+  out
+}
+
+// The module's map globals; a map subscript reads back null on a miss, never out of bounds.
+function moduleMaps(lines: string[]): Set<string> {
+  const out: Set<string> = Set()
+  for ln in lines {
+    const m = mapGlobal(ln)
+    if m != "" { out.add(m) }
+  }
+  out
+}
+
+// The header's last line: the first holding the `{` that opens the body.
+function headerEnd(lines: string[], lo: i32, hi: i32): i32 {
+  let i = lo
+  while i <= hi {
+    if findFrom(lines[i], "{", 0) >= 0 { return i }
+    i = i + 1
+  }
+  lo
+}
+
+// The header's parameter names (all, or only the `i32` ones), from the first line's `(`.
+function headerNames(
+  lines: string[],
+  lo: i32,
+  hi: i32,
+  i32Only: boolean,
+): Set<string> {
+  const out: Set<string> = Set()
+  const last = headerEnd(lines, lo, hi)
+  let i = lo
+  while i <= last {
+    let s = lines[i]
+    let ok = true
+    if i == lo {
+      let k = 0
+      while k < s.length && s[k] != 40 { k = k + 1 }
+      if k == s.length { ok = false } else { s = s.slice(k, s.length) }
+    }
+    if ok { paramNames(s, i32Only, out) }
+    i = i + 1
+  }
+  out
+}
+
+// Every name the function declares itself: parameters and `let`/`const`/`for` bindings.
+function declaredIn(lines: string[], lo: i32, hi: i32): Set<string> {
+  const out = headerNames(lines, lo, hi, false)
+  let i = lo
+  while i <= hi {
+    const d = declName(lines[i])
+    if d != "" { out.add(d) }
+    i = i + 1
+  }
+  out
+}
+
+function answersInBand(lines: string[], lo: i32, hi: i32): boolean {
+  let i = lo
+  while i <= hi {
+    if negAnswer(lines[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The module's readers: a literal -1 answer, closed under "returns a reader's result" for
+// at most four rounds. Decides only whether a parameter read counts, never a producer.
+function moduleReaders(lines: string[], fns: Fn[]): Set<string> {
+  const out: Set<string> = Set()
+  for f in fns {
+    if answersInBand(lines, f.lo, f.hi) { out.add(f.name) }
+  }
+  let round = 0
+  while round < 4 {
+    const add: string[] = []
+    for f in fns {
+      if out.has(f.name) { continue }
+      let i = f.lo
+      while i <= f.hi {
+        const c = forwardedCall(lines[i])
+        if c != "" && out.has(c) {
+          add.push(f.name)
+          break
+        }
+        i = i + 1
+      }
+    }
+    if add.length == 0 { break }
+    for a in add { out.add(a) }
+    round = round + 1
+  }
+  out
+}
+
+// Every hit in one module, one linear pass per function: a guard counts only where it
+// precedes the read, and a re-binding forgets what the name was bound to.
+function hitsIn(rel: string, src: string): Hit[] {
+  const lines = strippedLines(src)
+  const holes = holeFields(lines)
+  const maps = moduleMaps(lines)
+  const fns = functions(lines)
+  const readersHere = moduleReaders(lines, fns)
+  const out: Hit[] = []
+  for f in fns {
+    const local = declaredIn(lines, f.lo, f.hi)
+    let params: Set<string> = Set()
+    if readersHere.has(f.name) { params = headerNames(lines, f.lo, f.hi, true) }
+    const producer: Map<string, Prod> = Map()
+    const guarded: Set<string> = Set()
+    let returned = false
+    let i = f.lo
+    while i <= f.hi {
+      const s = lines[i]
+      guards(s, guarded)
+      for r in reads(s) {
+        if (
+          local.has(split(r.table, ".")[0])
+          || maps.has(r.table)
+          || guarded.has(r.idx)
+        ) {
+          continue
+        }
+        let kind = ""
+        let prod = ""
+        const dot = split(r.idx, ".")
+        if dot.length > 1 {
+          if !holes.has(dot[1]) { continue }
+          kind = "field"
+          prod = r.idx
+        } else {
+          const p = producer[r.idx]
+          if p != null {
+            kind = p.kind
+            prod = p.prod
+          } else if returned && params.has(r.idx) {
+            kind = "param"
+            prod = "the parameter `" + r.idx + "`"
+          } else {
+            continue
+          }
+        }
+        let code = UNGUARDED
+        if kind == "call" && endsWith(prod, "Strict") { code = STRICT }
+        out.push(
+          {
+            rel: rel,
+            fn: f.name,
+            line: i + 1,
+            col: r.col + 1,
+            table: r.table,
+            idx: r.idx,
+            producer: prod,
+            code: code,
+          },
+        )
+      }
+      if hasReturn(s) { returned = true }
+      let name = ""
+      const mc = bindCall(s)
+      const mf = bindField(s)
+      if mc.name != "" {
+        name = mc.name
+        producer[name] = { kind: "call", prod: mc.rhs }
+      } else if mf.name != "" && holes.has(mf.field) {
+        name = mf.name
+        producer[name] = { kind: "field", prod: mf.rhs }
+      } else {
+        name = bindAny(s)
+        if name != "" { producer.delete(name) }
+      }
+      if name != "" {
+        guarded.delete(name)
+        params.delete(name)
+      }
+      i = i + 1
+    }
+  }
+  out
+}
+
+function allHits(root: string): Hit[] {
+  const out: Hit[] = []
+  for src in sources(root) {
+    for h in hitsIn(src.rel, readSource(src.path)) { out.push(h) }
+  }
+  out
+}
+
+type Why = { rel: string, why: string }
+
+// Every function the tree shows answering in band: a literal -1 answer, a `*Strict` twin,
+// or the clamping sibling of one. Reporting only: the rule does not filter on this set.
+function readers(root: string): Map<string, Why> {
+  const fns: Set<string> = Set()
+  const relOf: Map<string, string> = Map()
+  const neg: Map<string, boolean> = Map()
+  for src in sources(root) {
+    const lines = strippedLines(readSource(src.path))
+    for f in functions(lines) {
+      fns.add(f.name)
+      relOf[f.name] = src.rel
+      neg[f.name] = answersInBand(lines, f.lo, f.hi)
+    }
+  }
+  const out: Map<string, Why> = Map()
+  for fn in fns {
+    if neg[fn] ?? false {
+      out[fn] = { rel: relOf[fn] ?? "", why: "answers a literal -1" }
+    }
+  }
+  for fn in fns {
+    if !endsWith(fn, "Strict") { continue }
+    const base = fn.slice(0, fn.length - 6)
+    if !fns.has(base) { continue }
+    if out[fn] == null {
+      out[fn] = {
+        rel: relOf[fn] ?? "",
+        why: "a *Strict twin: -1 is its documented answer",
+      }
+    }
+    out[base] = {
+      rel: relOf[base] ?? "",
+      why: "has a *Strict twin, so this one CLAMPS a miss to a real row",
+    }
+  }
+  out
+}
+
+// ── front ends ───────────────────────────────────────────────────────────────────
+
+function keysOf(m: Map<string, Why>): string[] {
+  const out: string[] = []
+  for k in m.keys() { out.push(k) }
+  sortStrings(out)
+}
+
+function cmdReaders(root: string, withHits: boolean): i32 {
+  const rd = readers(root)
+  const names = keysOf(rd)
+  print("\{toString(names.length)} readers derived from compiler/*.vl\n")
+  if withHits {
+    const used: Map<string, i32> = Map()
+    const order: string[] = []
+    for h in allHits(root) {
+      if rd[h.producer] != null { tally(used, order, h.producer, 1) }
+    }
+    print(
+      "\{toString(order.length)} of them produce an UNGUARDED index somewhere:\n",
+    )
+    for fn in byCountDesc(sortStrings(order), used) {
+      const w = rd[fn] ?? { rel: "", why: "" }
+      print(
+        "  \{padLeft(toString(used[fn] ?? 0), 4)}  \{padRight(fn, 34)}\{w.rel}  — \{w.why}",
+      )
+    }
+    return 0
+  }
+  for fn in names {
+    const w = rd[fn] ?? { rel: "", why: "" }
+    print("  \{padRight(fn, 40)}\{padRight(w.rel, 28)}\{w.why}")
+  }
+  0
+}
+
+function cmdHoles(root: string): i32 {
+  for src in sources(root) {
+    const set = holeFields(strippedLines(readSource(src.path)))
+    const h: string[] = []
+    for x in set { h.push(x) }
+    if h.length > 0 {
+      print(
+        "\{src.rel}  (\{toString(h.length)})\n    \{join(sortStrings(h), " ")}",
+      )
+    }
+  }
+  0
+}
+
+function cmdTables(root: string): i32 {
+  for src in sources(root) {
+    const seen: Map<string, i32> = Map()
+    const order: string[] = []
+    for h in hitsIn(src.rel, readSource(src.path)) {
+      tally(seen, order, h.table, 1)
+    }
+    if order.length > 0 {
+      print(src.rel)
+      for t in byCountDesc(sortStrings(order), seen) {
+        print("    \{padLeft(toString(seen[t] ?? 0), 4)}  \{t}")
+      }
+    }
+  }
+  0
+}
+
+function cmdTable(root: string, limit: i32, code: string): i32 {
+  let n = 0
+  for h in allHits(root) {
+    if code != "" && h.code != code { continue }
+    let tag = ""
+    if h.code != UNGUARDED { tag = "  [" + h.code + "]" }
+    print(
+      "\{h.rel}:\{toString(h.line)}  \{h.fn}  \{h.table}[\{h.idx}]  <- \{h.producer}\{tag}",
+    )
+    n = n + 1
+    if limit != 0 && n >= limit { break }
+  }
+  0
+}
+
+// One file's hits as JSON `{code: [[line, col, table, idx], ...]}`, graded where it is.
+function cmdGrade(path: string): i32 {
+  const rows: Map<string, string[]> = Map()
+  for c in CODES { rows[c] = [] }
+  for h in hitsIn(path, readSource(path)) {
+    const r = rows[h.code] ?? []
+    r.push(
+      "[\{toString(h.line)}, \{toString(h.col)}, \{jsonStr(h.table)}, \{jsonStr(h.idx)}]",
+    )
+  }
+  const parts: string[] = []
+  for c in CODES {
+    parts.push(jsonStr(c) + ": [" + join(rows[c] ?? [], ", ") + "]")
+  }
+  print("{" + join(parts, ", ") + "}")
+  0
+}
+
+// `{file: {code: hits}}` over the tree, files in order, only files with a hit.
+function cmdCounts(root: string): i32 {
+  const files: string[] = []
+  const n: Map<string, i32> = Map()
+  for h in allHits(root) {
+    if n[h.rel + "\n" + UNGUARDED] == null {
+      files.push(h.rel)
+      for c in CODES { n[h.rel + "\n" + c] = 0 }
+    }
+    const k = h.rel + "\n" + h.code
+    n[k] = (n[k] ?? 0) + 1
+  }
+  const parts: string[] = []
+  for f in files {
+    const inner: string[] = []
+    for c in CODES {
+      inner.push(jsonStr(c) + ": " + toString(n[f + "\n" + c] ?? 0))
+    }
+    parts.push(jsonStr(f) + ": {" + join(inner, ", ") + "}")
+  }
+  print("{" + join(parts, ", ") + "}")
+  0
+}
+
+// The value after `flag`, or "" when the flag is absent; a flag with no value stops.
+function valueOf(args: string[], flag: string): string {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag {
+      if i + 1 >= args.length {
+        die("sentinel-census: \{flag} takes a value", 1)
+      }
+      return args[i + 1]
+    }
+    i = i + 1
+  }
+  ""
+}
+
+function has(args: string[], flag: string): boolean {
+  for a in args {
+    if a == flag { return true }
+  }
+  false
+}
+
+function main(args: string[]): i32 {
+  let root = valueOf(args, "--root")
+  if root == "" { root = "." }
+  if has(args, "--counts") { return cmdCounts(root) }
+  if has(args, "--grade") { return cmdGrade(valueOf(args, "--grade")) }
+  if has(args, "--readers") { return cmdReaders(root, has(args, "--hits")) }
+  if has(args, "--holes") { return cmdHoles(root) }
+  if has(args, "--tables") { return cmdTables(root) }
+  let limit = 0
+  if has(args, "--limit") {
+    const v = parseI32(valueOf(args, "--limit"))
+    if v == null { die("sentinel-census: --limit takes a number", 1) }
+    limit = v ?? 0
+  }
+  cmdTable(root, limit, valueOf(args, "--code"))
+}
+
+const argv = programArgs()
+if argv is string[] { exit(main(argv)) }
+print("sentinel-census: the arguments are not UTF-8")
+exit(2)

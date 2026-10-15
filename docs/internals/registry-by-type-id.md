@@ -702,7 +702,7 @@ Holes ranked by reachability (the class can genuinely reach the operation):
 | 4 | `retLocalCellKind` `emit_classify.vl:4008` | `u8list` missing from a payload-free allow-list its sibling rung does write |
 | 5 | `emitMapValDefault` / `emitMapSetValExpr` | `u8list` missing from a 4-of-5 fan; the two are byte-identical chains |
 
-**THE CENSUS IS A SCRIPT NOW — `python3 scripts/ladder-census.py`.** It reads the closed sets
+**THE CENSUS IS A SCRIPT NOW — `vl run scripts/ladder-census.vl`.** It reads the closed sets
 from the tree (`--sets`: twelve, `VKind` and `Node` and `Ty` among them), tables every ladder by
 set / arms / missing / how it ENDS, and has two sections nothing else has: `--split` for one walk
 divided across two functions, and `--pred` for the form below. The numbers in this section were

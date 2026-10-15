@@ -3787,12 +3787,12 @@ wrong to reuse can still be wrong on its own terms, and those are two separate r
 
 ### The census cannot see this family, and that is checkable rather than probable
 
-`gencensus.py` emits exactly ONE generic declaration across all 250,238 cells —
+`gencensus.vl` emits exactly ONE generic declaration across all 250,238 cells —
 `function idg<T>(x: T): T { return x }` — and its body contains no binary operator. So no census
 cell records a deferred constraint, none reaches `binOpDefinedFor`, and block D (9,000 cells,
 graded on both compilers) and the distilled corpus (1,477 representatives) each moved zero cells
 at this landing. **A zero from a population that structurally cannot contain the family is not
-evidence of safety, and the difference is one `grep` away** — `grep -n "<T>" gencensus.py` is one
+evidence of safety, and the difference is one `grep` away** — `grep -n "<T>" gencensus.vl` is one
 line. Report the grep beside the zero; a reader who sees only the zero will read it as coverage.
 
 ### The price, and why the override holds
@@ -8111,7 +8111,7 @@ half-resolved union. `LitKind` lost its `"flt"` member.
 refused: 100 corpus cells (all minted by the census's `f64lit` rep, `type F = 1.5 | 2.5`) and 29
 `tests/cases` fixtures; none in `compiler/`, `std/` or other scripts. Of the corpus cells, 35
 graded `runs`: 21 only DECLARED `F` in a shared prelude and keep running with the line removed,
-and 14 used it and are design refusals now. `gencensus.py` keeps its `f64lit` level, because cell ids are sequential over the axes and dropping a level renumbers every block and orphans the committed named sets; those cells are now design refusals. `mkmatrix.py`, whose preludes only declared the alias, drops it.
+and 14 used it and are design refusals now. `gencensus.vl` keeps its `f64lit` level, because cell ids are sequential over the axes and dropping a level renumbers every block and orphans the committed named sets; those cells are now design refusals. `mkmatrix.vl`, whose preludes only declared the alias, drops it.
 
 ## A `return` outside any function is refused (owner ruling, 2026-09-23) — D2262, plumb PL-028
 
@@ -9161,7 +9161,7 @@ while sources written before the ruling are migrated — plumb's generated units
 population — and is deleted once plumb regenerates; nothing else depends on it. One old shape
 migrates silently and cannot be detected: an unused label on a loop first in a body,
 `function f() { L: while c { … } }`, is now an object holding the loop's value, which the
-checker refuses only when that value is `void`. `scripts/codemods/label-at.py` rewrites a tree,
+checker refuses only when that value is `void`. `scripts/codemods/label-at.vl` rewrites a tree,
 and rewrites that shape too.
 
 ## `{ name, … }` is an object too; only a lone `{ name }` is a block (2026-10-02) — D3475

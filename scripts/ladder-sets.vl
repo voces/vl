@@ -9,196 +9,21 @@
 // fails here rather than moving the ladder budget for no reason a reader can find.
 // Paths resolve against the working directory; run it from the checkout root.
 
-import { IoError, listDir, readTextFile } from "std:fs"
 import { programArgs } from "std:args"
-import { exit } from "std:process"
 import { Utf8Error } from "std:utf8"
-import { endsWith, join, split, startsWith, trim, trimEnd } from "std:str"
+import { endsWith, join, split, startsWith, trimEnd } from "std:str"
 import { sort } from "std:array"
+import { die } from "./lib/common"
+import {
+  ClosedSet,
+  closedSets,
+  fieldIndex,
+  findSet,
+  readOrDie,
+  strLess,
+} from "./lib/ladder-walk"
 
-type ClosedSet = {
-  name: string,
-  members: string[],
-  isType: boolean,
-  at: string,
-}
-
-function die(msg: string, code: i32) {
-  print(msg)
-  exit(code)
-}
-
-function isWord(c: i32): boolean {
-  (c >= 'a' && c <= 'z')
-    || (c >= 'A' && c <= 'Z')
-    || (c >= '0' && c <= '9')
-    || c == '_'
-}
-function isSpace(c: i32): boolean {
-  c == ' ' || c == '\t' || c == '\n' || c == '\r'
-}
-
-// Code-point order, the order Python's `sorted` gives a `str`.
-function strLess(a: string, b: string): boolean {
-  let i = 0
-  while i < a.length && i < b.length {
-    if a[i] != b[i] { return a[i] < b[i] }
-    i = i + 1
-  }
-  a.length < b.length
-}
-
-function readOrDie(path: string): string {
-  const t = readTextFile(path)
-  if t is IoError {
-    die("ladder-sets: cannot read \{path} (\{t.msg})", 2)
-    return ""
-  }
-  t
-}
-
-// `compiler/*.vl` under `root`, as `[relative, path]` pairs in name order.
-function modules(root: string): string[][] {
-  const names = listDir("\{root}/compiler")
-  if names is IoError {
-    die("ladder-sets: cannot list \{root}/compiler (\{names.msg})", 2)
-    return []
-  }
-  const vl: string[] = []
-  for n in names {
-    if endsWith(n, ".vl") { vl.push(n) }
-  }
-  sort(vl, strLess)
-  const out: string[][] = []
-  for n in vl { out.push(["compiler/\{n}", "\{root}/compiler/\{n}"]) }
-  out
-}
-
-// `ln` cut at its `//` comment; a quoted literal is kept whole, so a `//` inside one
-// does not cut it.
-function cutComment(ln: string): string {
-  let i = 0
-  while i < ln.length {
-    const c = ln[i]
-    if c == '/' && i + 1 < ln.length && ln[i + 1] == '/' {
-      return ln.slice(0, i)
-    }
-    if c == '"' || c == '\'' {
-      i = i + 1
-      while i < ln.length && ln[i] != c {
-        if ln[i] == '\\' && i + 1 < ln.length { i = i + 1 }
-        i = i + 1
-      }
-    }
-    i = i + 1
-  }
-  ln
-}
-
-// The name and right-hand side of a `[export ]type NAME = RHS` line, or [] when `ln`
-// is not one.
-function typeHead(ln: string): string[] {
-  let i = 0
-  if startsWith(ln, "export ") { i = 7 }
-  if ln.slice(i, i + 5) != "type " { return [] }
-  i = i + 5
-  const a = i
-  if i >= ln.length || !(isWord(ln[i]) && !(ln[i] >= '0' && ln[i] <= '9')) {
-    return []
-  }
-  while i < ln.length && isWord(ln[i]) { i = i + 1 }
-  if ln.slice(i, i + 3) != " = " { return [] }
-  [ln.slice(a, i), ln.slice(i + 3, ln.length)]
-}
-
-function isTypeName(p: string): boolean {
-  if p.length == 0 || p[0] < 'A' || p[0] > 'Z' { return false }
-  for c in p {
-    if !isWord(c) { return false }
-  }
-  true
-}
-
-// Every closed set the compiler declares: a `type X = a | b | …` of at least three
-// members, all string literals or all type names. `|` may lead the next line or trail
-// this one; blank and comment lines between continuations are skipped. A later
-// declaration of the same name replaces an earlier one.
-function closedSets(root: string): ClosedSet[] {
-  const out: ClosedSet[] = []
-  for m in modules(root) {
-    const lines = split(readOrDie(m[1]), "\n")
-    let n = 0
-    while n < lines.length {
-      const head = typeHead(lines[n])
-      if head.length == 0 {
-        n = n + 1
-        continue
-      }
-      let rhs = cutComment(head[1])
-      let j = n + 1
-      while j < lines.length {
-        const t = trim(lines[j])
-        if startsWith(t, "//") || t == "" {
-          j = j + 1
-          continue
-        }
-        if startsWith(t, "|") || endsWith(trimEnd(rhs), "|") {
-          rhs = "\{rhs} \{cutComment(t)}"
-          j = j + 1
-          continue
-        }
-        break
-      }
-      const lits: string[] = []
-      const tys: string[] = []
-      const parts = split(rhs, "|")
-      for raw in parts {
-        const p = trim(raw)
-        if p.length >= 2 && p[0] == '"' && p[p.length - 1] == '"' {
-          lits.push(p.slice(1, p.length - 1))
-        }
-        if isTypeName(p) { tys.push(p) }
-      }
-      let members: string[] = []
-      let isType = false
-      if lits.length == parts.length && parts.length >= 3 {
-        members = lits
-      } else if tys.length == parts.length && parts.length >= 3 {
-        members = tys
-        isType = true
-      }
-      if members.length > 0 {
-        const set: ClosedSet = {
-          name: head[0],
-          members: members,
-          isType: isType,
-          at: "\{m[0]}:\{n + 1}",
-        }
-        let k = 0
-        let replaced = false
-        while k < out.length {
-          if out[k].name == head[0] {
-            out[k] = set
-            replaced = true
-          }
-          k = k + 1
-        }
-        if !replaced { out.push(set) }
-      }
-      n = j
-    }
-  }
-  out
-}
-
-function findSet(sets: ClosedSet[], name: string): i32 {
-  let i = 0
-  while i < sets.length {
-    if sets[i].name == name { return i }
-    i = i + 1
-  }
-  -1
-}
+const TOOL = "ladder-sets"
 
 // The quoted strings of `const NAME = [ … ]` in `src`: from the line that opens it to
 // the first line ending in `]`. Numbers are kept too, as their text, for `klSetIsType`.
@@ -309,102 +134,6 @@ function kindWord(isType: boolean): string {
   "string literals"
 }
 
-// `{field: set}` for every field some `type X = { f: T }` declares with a closed set as
-// its whole type, kept only when every declaration of that field names the same set.
-// Pairs are read up to the record's first `}`, as `f: T` runs anywhere in it.
-function fieldIndex(
-  root: string,
-  sets: ClosedSet[],
-  fields: string[],
-  setOf: string[],
-) {
-  const ambiguous: string[] = []
-  for m in modules(root) {
-    const src = readOrDie(m[1])
-    let i = 0
-    while i < src.length {
-      const body = recordBodyAt(src, i)
-      if body < 0 {
-        i = i + 1
-        continue
-      }
-      let k = body
-      while k < src.length && src[k] != '}' {
-        if isWord(src[k]) && (k == body || !isWord(src[k - 1])) {
-          let e = k
-          while e < src.length && isWord(src[e]) { e = e + 1 }
-          let c = e
-          while c < src.length && isSpace(src[c]) { c = c + 1 }
-          if c < src.length && src[c] == ':' {
-            let t = c + 1
-            while t < src.length && isSpace(src[t]) { t = t + 1 }
-            if (
-              t < src.length
-              && isWord(src[t])
-              && !(src[t] >= '0' && src[t] <= '9')
-            ) {
-              let te = t
-              while te < src.length && isWord(src[te]) { te = te + 1 }
-              const f = src.slice(k, e)
-              const ty = src.slice(t, te)
-              if findSet(sets, ty) >= 0 {
-                let at = -1
-                let q = 0
-                while q < fields.length {
-                  if fields[q] == f { at = q }
-                  q = q + 1
-                }
-                if at < 0 {
-                  fields.push(f)
-                  setOf.push(ty)
-                } else if setOf[at] != ty {
-                  ambiguous.push(f)
-                }
-              }
-              k = te
-              continue
-            }
-          }
-          k = e
-          continue
-        }
-        k = k + 1
-      }
-      i = k
-    }
-  }
-  // A field two declarations type differently names no one set.
-  let w = 0
-  let r = 0
-  while r < fields.length {
-    let amb = false
-    for a in ambiguous {
-      if a == fields[r] { amb = true }
-    }
-    if !amb {
-      fields[w] = fields[r]
-      setOf[w] = setOf[r]
-      w = w + 1
-    }
-    r = r + 1
-  }
-  while fields.length > w {
-    fields.pop()
-    setOf.pop()
-  }
-  0
-}
-
-// The index just past `{` when `type <word> = {` starts at `i`, else -1.
-function recordBodyAt(src: string, i: i32): i32 {
-  if src.slice(i, i + 5) != "type " { return -1 }
-  let k = i + 5
-  const a = k
-  while k < src.length && isWord(src[k]) { k = k + 1 }
-  if k == a || src.slice(k, k + 4) != " = {" { return -1 }
-  k + 4
-}
-
 // The lint's field table against the tree's: the same fields, each naming the same set.
 function checkFields(
   root: string,
@@ -414,7 +143,7 @@ function checkFields(
 ) {
   const fields: string[] = []
   const setOf: string[] = []
-  fieldIndex(root, sets, fields, setOf)
+  fieldIndex(TOOL, root, sets, fields, setOf)
   const mineF = constList(lint, "klFieldNames")
   const mineS = constList(lint, "klFieldSetNames")
   if mineF.length != mineS.length {
@@ -473,8 +202,8 @@ function main(args: string[]) {
     }
     i = i + 1
   }
-  const sets = closedSets(root)
-  const lint = readOrDie("\{root}/compiler/lint.vl")
+  const sets = closedSets(TOOL, root)
+  const lint = readOrDie(TOOL, "\{root}/compiler/lint.vl")
   const badSets: string[] = []
   checkSets(sets, lint, badSets)
   if badSets.length > 0 {
