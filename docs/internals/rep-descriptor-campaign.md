@@ -3622,3 +3622,70 @@ What (c) must respect:
   soften an alias or a member that the row keeps.
 * The DIFF family, led by `(string | i32)[]` (142 in `tests/cases`), where the ladder answers a
   scalar list and the column answers the box.
+
+### 13.27 A closed hole list reads its default element from the column
+
+§13.26 measured the hole list and proposed (c): the checker resolves an unpinned hole to the
+designed `i32` element where it closes. This step takes (c) under one constraint: what a user
+sees does not change. Hover, `vl check --json`, diagnostics and every printed type keep `_[]`.
+
+**Design.** The default is a checker fact on a separate column, not a retype of the node.
+
+* `typecheck.vl` gains `holeElemIx`, read through `nodeHoleElemOf`. After `pinReport()`, the
+  last step of `checkProgram`, `recordClosedHoles` walks `nodeTyIx` once and records `i32` at
+  every node whose type is still `_[]` or `_[] | null`. No pin runs after it, so the hole has
+  closed.
+* `nodeTyIx` keeps the hole. Hover, `--json` and diagnostics read it, so they print `_[]` as
+  before. `tests/lsp_undisplayable_type_test.ts` pins this on a closed hole: hover reads
+  `_[] | null` on the binding and `() => _[]` on the function.
+* `repOfNodeAt` asks `nodeHoleElemOf` only when the type it is asked at is the node's own
+  recorded type. Then `_[]` reads `repOfArray(i32)` and `_[] | null` reads
+  `repOfNullableArray(i32)`. A node asked at an instance's type reads that type, so a pin made
+  per instance still decides. `repOfArray` keeps declining `elem < 0`, so a hole the checker
+  misses stays a LEFT-ONLY note.
+
+**The D16 hole readers still see the hole.** `emptyArrHoleKind` (which `emptyArrHoleBuildKind`
+calls), `emptyArrHoleElemName` and `emptyArrUnionArmSlot` read `nodeTyIxOf` or
+`nodeRepTyIxOf`, which this step does not write. A probe in `emptyArrHoleKind` over
+`tests/cases` graded every read. 7,772 reads in 454 files found a pinned element. 203 reads in 7
+files found the hole still open with the default recorded beside it. No read found an open hole
+with no default. The checker's own hole readers (`unresolvedHole`, `flushUninferred`,
+`arrDefHoleToI32`, `constrainEmpty`, `calleeWritePin`) run during the walks, before the default
+is recorded. D16's witness still runs.
+
+**Counts.** `listRep` LEFT-ONLY notes, base and candidate both on `ce4a4d91a` (§13.26). The
+like-for-like `tests/cases` row leaves out §13.23's 751 `Index` notes, as §13.26 did.
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | `ArrayLit _[]` | 167 | 0 |
+| `tests/cases` | `Call _[]` | 27 | 0 |
+| `tests/cases` | `Ident _[]` | 9 | 0 |
+| `tests/cases` | `Ident _[] \| null` | 42 | 0 |
+| `tests/cases` | `other _[] \| null` | 51 | 0 |
+| `tests/cases` | like-for-like LEFT-ONLY | 365 | 69 |
+| distilled `named/` | `ArrayLit _[]`, `Call _[]` (`d626_ctl_directlit.vl`) | 21 | 0 |
+| distilled `named/` | LEFT-ONLY | 149 | 128 |
+
+The 93 `_[] | null` notes move to the narrowed family as `listRep/narrowed … -> none`. That is
+where the annotated `i32[] | null` binding in the same files already sits: the narrowed read is
+an `i32[]`, while the column answers the nullable list. Two files gain those notes,
+`arrays/empty-list-join-null-sibling.vl` (28) and `objects/empty-list-join-null-field.vl` (65).
+No other file gains a note in either population. The `_[]` notes on an open type variable are
+unchanged.
+
+What `tests/cases` LEFT-ONLY keeps: class D's 23, `Json$m1 | null` and `{[string]: i32} | null`
+(12 each), `(string | i32)[]` and `(i32 | null)[]` (7 each), and eight notes on three
+union-element spellings that soften a member the row keeps.
+`named/` keeps class L′'s 128.
+
+**Checks.** The base fixpoint is 5,678,238 bytes and the candidate 5,679,117, +879.
+
+* `difftree --identity` over 15,172 files: **10,213 built, 0 differ, 0 uncompared**. The
+  candidate compiling the base's source gives the base's fixpoint.
+* Native fixpoint holds.
+* `rep-fuzz-check` is exact. `regress.vl` loses no runs and moves no cell to silent. Its seven
+  `rv3310_*` `trap_loads` movements are the ones §13.22 recorded.
+* `lint-self` is clean, `seed-size --check` passes, and the ladder and sentinel budgets hold.
+* `selfhost_native_align`, `lsp_undisplayable_type`, `vl_check_json`, the hover suites and
+  `vl_compile_cache` pass, 5,111 steps.
