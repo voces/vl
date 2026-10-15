@@ -24,7 +24,7 @@ restate measurements; follow the links.
 | item | state | where |
 | --- | --- | --- |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, sixth part retires `monoPinGenericList` (a list element pinned at the table's `e` signature, D4301). Next: the remaining step-4 retirements (`monoNotePushDeliveries`, `monoStoreAnnName`, the literal arms of `monoCoerceFnValueName`); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: the list oracle reports by family and a call with no resolved list reads the column (campaign §13.13). Next: `Ident` LEFT-ONLY, then the `Index`/`BinExpr`/`Member` RIGHT-ONLY. | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a recursive-alias list element reads the column (campaign §13.17). Next: the rest of `Ident` LEFT-ONLY, then `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
@@ -235,6 +235,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The list oracle now reports by family (open, scope, narrowed, like for like), and a call with no resolved list reads the column: like-for-like RIGHT-ONLY 28,321 → 9,889, no existing module differs, and D3163 and D3184 close (campaign §13.13).
 - `exprRefArray` and `arrLitRetSeedFromKind` do not convert yet.
 - Next: `Ident` LEFT-ONLY (7,777), the `Index`/`BinExpr`/`Member` RIGHT-ONLY, the narrowed family (the slot vs narrowed rep split), then the scope callers.
+- A recursive-alias list element (`Json[]`) reads the column: like-for-like LEFT-ONLY 6,857 → 3,809, two modules lose unread locals (campaign §13.17; §13.14–§13.16 had already taken `Ident` LEFT-ONLY 7,777 → 3,928).
 
 ### L3 log
 
