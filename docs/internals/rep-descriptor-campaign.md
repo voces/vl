@@ -2944,3 +2944,53 @@ now compared against `reflist` rather than an uncovered column. The distilled `c
 **Next, in order:** the 1,186 `Ident` LEFT-ONLY left: 688 with no resolved type in five files,
 about 300 over a nullable literal-union element (`(N | null)[]`, `("x" | null)[]`, which
 `nulNumLitUnionBaseName` names), 42 over `_[] | null`. Then items 2, 4 and 5 of §13.14.
+
+### 13.18 A nullable literal-union list element reads the column
+
+This step takes the nullable literal-union share of §13.17's `Ident` LEFT-ONLY.
+
+**Mechanism.** `repOfNulElemArray` had no answer for two `(E | null)[]` elements:
+
+* `(N | null)[]` over a numeric literal union, such as `type N = 1 | 2`. The element is
+  `TyNullable(N)`, and `N` is neither a string literal union nor a value-union box, so the
+  `TyUnion` arm fell through. The value boxes as its base scalar made nullable, and the
+  registry keys that box on the rendered `i32|null`, so `unRowOfCanonId` of `N | null` finds no
+  row. The arm now asks `unRowOfNullableOver(base)`, the row of a `TyNullable` whose inner has
+  the base's canon id, and answers `reflist`/`union` when there is one.
+* `("x" | null)[]`. One string literal softens to `string`, so the element is `string | null`
+  and the list is `strlist`, as `repOfNullable`'s `TyLit` arm already says for the scalar.
+
+**`_[] | null` does not fall out of this rung.** Its element is an unfilled hole, and
+`repOfArray` claims no rep for a hole on purpose. The ladder's `list` there is D2228's default
+for a join that no use pins, which is a choice about the hole rather than a rep of the type.
+
+**The 688 with no resolved type are not cheaper.** `nodeTyInOf` answers `-1` at those nodes, so
+no `repOf` arm can answer them. They need a producer to record a type, in five files:
+`narrowed-fn-arm-place-call.vl` 239, `narrowed-field-receiver.vl` 197,
+`hole-lambda-cell-seeded-from-cell-mutate-then-read.vl` 122, `adopted-string-atom-print-route.vl`
+104 and `hole-lambda-cell-takes-instance-type.vl` 32.
+
+**Checks.** The "before" seed is origin/master's fixpoint (bd9e38039), 5,561,857 bytes. The
+"after" seed is 5,562,211 bytes, +354.
+
+* `difftree --identity` over 15,159 files: **10,200 built, 0 differ, 0 uncompared**, and the
+  candidate compiling master's source gives master's fixpoint.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, and `regress.vl` moves no cell.
+
+**Counts.** Like-for-like `listRep` notes in `tests/cases`, measured with §13.17's probe (the
+note keyed by node kind and the node's type at its instance), by node kind and side:
+
+| kind / side | before | after |
+| --- | --- | --- |
+| `Ident` LEFT-ONLY | 1,186 | 881 |
+| `Call` LEFT-ONLY | 1,252 | 1,161 |
+
+Like-for-like LEFT-ONLY falls 3,809 → 3,413. The notes removed are `(LI | null)[]` 125,
+`(N | null)[]` 93 and `("x" | null)[]` 87 on `Ident`, and `(1 | 2 | null)[]` 91 on `Call` in
+`forin-values-nullable-and-box-value-loop-var.vl`. No other note in `tests/cases` changed, and the
+distilled `cells/` and `named/` notes are identical before and after.
+
+**Next, in order:** the 881 `Ident` LEFT-ONLY left: the 688 above, which need a producer; 42 over
+`_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over a mixed-width numeric literal
+union `(9000000000 | 1 | 9000000001)[]`. Then items 2, 4 and 5 of §13.14.
