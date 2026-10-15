@@ -699,11 +699,13 @@ function mapLocals(list: string, maps: Set<string>, out: Set<string>) {
   0
 }
 
-// The import locals of `src`, in directory `dir`, that bind a map global of the module they
-// come from: a subscript of one is a key read as much as the module's own. The column-0
-// `import { … } from "./x"` and `export { … } from "./x"` statements, as the driver resolves them.
-function importedMaps(src: string, dir: string): Set<string> {
-  const out: Set<string> = Set()
+// One relative import statement: its `{ … }` specifier list and the module path it names.
+type RelImport = { list: string, path: string }
+
+// The column-0 `import { … } from "./x"` and `export { … } from "./x"` statements of `src`,
+// in directory `dir`, as the driver resolves them.
+function relImports(src: string, dir: string): RelImport[] {
+  const out: RelImport[] = []
   let i = 0
   while i < src.length {
     let p = -1
@@ -718,7 +720,7 @@ function importedMaps(src: string, dir: string): Set<string> {
         if at(src, q) == 34 && qe > q && at(src, q + 1) == 46 {
           let path = dir + "/" + src.slice(q + 1, qe)
           if !endsWith(path, ".vl") { path = path + ".vl" }
-          mapLocals(src.slice(p + 1, rb), mapsOfPath(path), out)
+          out.push({ list: src.slice(p + 1, rb), path: path })
         }
       }
     }
@@ -727,6 +729,54 @@ function importedMaps(src: string, dir: string): Set<string> {
     i = nl + 1
   }
   out
+}
+
+// The import locals of `src`, in directory `dir`, that bind a map global of the module they
+// come from: a subscript of one is a key read as much as the module's own.
+function importedMaps(src: string, dir: string): Set<string> {
+  const out: Set<string> = Set()
+  for im in relImports(src, dir) {
+    mapLocals(im.list, mapsOfPath(im.path), out)
+  }
+  out
+}
+
+// The hole fields of every module `roots` reach through relative imports, themselves included,
+// as the driver unions them over the graph it resolved: a field is absent wherever it is read.
+function graphHoles(roots: string[]): Set<string> {
+  const out: Set<string> = Set()
+  const seen: Set<string> = Set()
+  const todo: string[] = []
+  for r in roots { todo.push(normPath(r)) }
+  let k = 0
+  while k < todo.length {
+    const path = todo[k]
+    k = k + 1
+    if seen.has(path) { continue }
+    seen.add(path)
+    const b = readFile(path)
+    if b is IoError { continue }
+    const src = decodeUtf8Lossy(b)
+    for f in holeFields(strippedLines(src)) { out.add(f) }
+    for im in relImports(src, dirOf(path)) { todo.push(normPath(im.path)) }
+  }
+  out
+}
+
+// `path` with each `/./` step dropped and each `dir/../` folded, so one module has one key.
+function normPath(path: string): string {
+  const out: string[] = []
+  for seg in split(path, "/") {
+    if seg == "." && out.length > 0 { continue }
+    if seg == ".." && out.length > 0 && out[out.length - 1] != ".." {
+      if out[out.length - 1] != "." {
+        out.pop()
+        continue
+      }
+    }
+    out.push(seg)
+  }
+  join(out, "/")
 }
 
 // The directory holding `path`, or "." for a bare file name.
@@ -822,11 +872,13 @@ function moduleReaders(lines: string[], fns: Fn[]): Set<string> {
 }
 
 // Every hit in one module, one linear pass per function: a guard counts only where it
-// precedes the read, and a re-binding forgets what the name was bound to.
-function hitsIn(rel: string, path: string): Hit[] {
+// precedes the read, and a re-binding forgets what the name was bound to. `graph` is the
+// hole fields of the modules graded beside it (`graphHoles`).
+function hitsIn(rel: string, path: string, graph: Set<string>): Hit[] {
   const src = readSource(path)
   const lines = strippedLines(src)
   const holes = holeFields(lines)
+  for f in graph { holes.add(f) }
   const maps = moduleMaps(lines)
   for m in importedMaps(src, dirOf(path)) { maps.add(m) }
   const fns = functions(lines)
@@ -909,10 +961,18 @@ function hitsIn(rel: string, path: string): Hit[] {
   out
 }
 
+// The hole fields of the whole tree under `root`, which is the compiler's module graph.
+function treeHoles(root: string): Set<string> {
+  const paths: string[] = []
+  for src in sources(root) { paths.push(src.path) }
+  graphHoles(paths)
+}
+
 function allHits(root: string): Hit[] {
   const out: Hit[] = []
+  const graph = treeHoles(root)
   for src in sources(root) {
-    for h in hitsIn(src.rel, src.path) { out.push(h) }
+    for h in hitsIn(src.rel, src.path, graph) { out.push(h) }
   }
   out
 }
@@ -1008,10 +1068,11 @@ function cmdHoles(root: string): i32 {
 }
 
 function cmdTables(root: string): i32 {
+  const graph = treeHoles(root)
   for src in sources(root) {
     const seen: Map<string, i32> = Map()
     const order: string[] = []
-    for h in hitsIn(src.rel, src.path) { tally(seen, order, h.table, 1) }
+    for h in hitsIn(src.rel, src.path, graph) { tally(seen, order, h.table, 1) }
     if order.length > 0 {
       print(src.rel)
       for t in byCountDesc(sortStrings(order), seen) {
@@ -1041,7 +1102,7 @@ function cmdTable(root: string, limit: i32, code: string): i32 {
 function cmdGrade(path: string): i32 {
   const rows: Map<string, string[]> = Map()
   for c in CODES { rows[c] = [] }
-  for h in hitsIn(path, path) {
+  for h in hitsIn(path, path, graphHoles([path])) {
     const r = rows[h.code] ?? []
     r.push(
       "[\{toString(h.line)}, \{toString(h.col)}, \{jsonStr(h.table)}, \{jsonStr(h.idx)}]",

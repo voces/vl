@@ -1,0 +1,358 @@
+// Literal types: a literal's base primitive, the bases of a literal union, the value of an
+// integer lexeme, whether a hex literal is 64 bits wide, and the element rep an array
+// literal is built at. Emptied by `literalsReset`. Does not import the checker.
+import { numLexFitsI32, numLexIsFloat, parseI32 } from "./emit_bignum"
+import { ArrayLit, FieldInit, NumLit, ObjLit, P, Paren, Unary } from "./ast"
+import {
+  T,
+  TyArray,
+  TyLit,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  cUnionTyIxs,
+  litBaseTy,
+  luPosOfTexts,
+  tyDeeperThan,
+  tyIsLitUnionArray,
+  tyIsNicheNulScalarElem,
+  tyIsPrimNamed,
+} from "./check_types"
+import {
+  flattenVariantsInto,
+  isNullTy,
+  isNumericPrimTy,
+} from "./check_ty_shape"
+import { nodeTyIx, nodeTyIxOf, nodeTySet } from "./check_node_tys"
+import { inferQuiet } from "./check_cursor"
+
+// The base primitive of a literal or a union of literals sharing one base (`0 | 1 | 2` is
+// `i32`); any other type, and -1, unchanged.
+export function litMembersBaseTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const lb = litBaseOrNeg(ty)
+  if lb >= 0 { return lb }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let base = -1
+    for m in t.uMembers {
+      const b = litBaseOrNeg(m)
+      if b < 0 || (base >= 0 && b != base) { return ty }
+      base = b
+    }
+    if base >= 0 { return base }
+  }
+  ty
+}
+
+// The base primitive of literal type `ty`, or -1 when `ty` is not a literal.
+function litBaseOrNeg(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  -1
+}
+
+// Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
+// 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
+// `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
+// re-stamped `nodeTyIx` — DECISIONS.md §"A hex literal is a bit pattern".
+export let litWide64: boolean[] = []
+export function litWide64Push(v: boolean) { litWide64.push(v) }
+export function litWide64SetAt(k: i32, v: boolean) { litWide64[k] = v }
+
+// A literal's base type (`5` is an `i32`), for a store that is no literal union; `ty` otherwise.
+export function litPeekBaseTy(ty: i32): i32 {
+  if ty < 0 { return ty }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  ty
+}
+
+// The distinct base scalars of a union of integer literals and numbers, a literal among them,
+// whose members span two bases (`1 | 9000000000 | i32`), else an empty list: the box it lowers as
+// holds each member at its base, as `intLitUnionBasesOf`'s does.
+export function litNumUnionBasesOf(t: i32): i32[] {
+  const none: i32[] = []
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) { return none }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  const out: i32[] = []
+  let lits = 0
+  for v in vs {
+    if v < 0 { return none }
+    const vt = T.tys[v]
+    let b = v
+    if vt is TyLit {
+      if vt.litKind != "int" { return none }
+      b = litBaseTy(vt)
+      lits = lits + 1
+    } else if !isNumericPrimTy(v) {
+      return none
+    }
+    let seen = false
+    for o in out {
+      if o == b { seen = true }
+    }
+    if !seen { out.push(b) }
+  }
+  if lits == 0 || out.length < 2 { return none }
+  out
+}
+
+// Record the destination array type on an ArrayLit whose element reps differently from the
+// literal's own inference (a niche-nullable scalar, or `string` over a literal union), ahead of
+// `assignableExpr`'s plain-assignable short-circuit. A pin's re-check records nothing: its literal
+// is a generic body's node, shared by every instance (D4866).
+export function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  if litPinN.length > 0 { return 0 }
+  let dtix = dstTy
+  const dN = T.tys[dtix]
+  if dN is TyNullable { dtix = dN.nInner }
+  // An unfilled A-infer-null hole (`let x = null`) peels to no inner — nothing to record, and
+  // indexing the arena at -1 traps the compiler.
+  if dtix < 0 { return 0 }
+  const d = T.tys[dtix]
+  const e = P.nodes[srcExpr]
+  if e is Paren {
+    // Record on the wrapping `Paren` too, not only the inner literal: the emitter's typed-IR fast
+    // paths (`exprStringArray` and siblings) consult whichever node a consumer holds, and a Paren
+    // keeping its stale pre-adoption record would re-claim the wrong rep at classification.
+    if recordElemRepArrayLit(e.parInner, dtix, depth) == 1 {
+      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+      nodeTySet(srcExpr, dtix)
+      return 1
+    }
+    return 0
+  }
+  if d is TyArray {
+    if tyIsNicheNulScalarElem(d.aElem) {
+      if e is ArrayLit {
+        while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+        nodeTySet(srcExpr, dtix)
+        return 1
+      }
+    }
+    // The other direction of the same disagreement: a `string[]` destination over a literal whose
+    // own element is a literal union (`const ys: string[] = [k]`). The two reps genuinely differ —
+    // an atom is an interned i32 id, the destination's element a `(ref $array)` — and it belongs on
+    // this side of the short-circuit, `K[]` being covariantly assignable. Gated on the disagreement.
+    if tyIsPrimNamed(d.aElem, "string") {
+      if e is ArrayLit {
+        if tyIsLitUnionArray(nodeTyIxOf(srcExpr)) {
+          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+          nodeTySet(srcExpr, dtix)
+          return 1
+        }
+      }
+    }
+    // The element-wise descent, the `TyObj` arm below written for the sibling container. An array
+    // destination has the identical short-circuit, so `const c: (K | null)[][] = [[null]]` would
+    // leave the inner `[null]` at its self-inferred `null[]`, and every emitter probe that seeds a
+    // niche element reads that type (D117). Only the elements re-stamp; `depth - 1` bounds the walk.
+    if e is ArrayLit {
+      if !tyDeeperThan(dtix, 16) {
+        let ai = 0
+        while ai < e.arrElems.length {
+          recordElemRepArrayLit(e.arrElems[ai], d.aElem, depth - 1)
+          ai = ai + 1
+        }
+      }
+    }
+    return 0
+  }
+  // A niche-nul-elem array nested in a struct-field literal value (`{f: [null]}` against
+  // `{f: (K | null)[] | null}`): the whole ObjLit is covariantly `assignable`, so
+  // `assignableExpr`'s field-wise recursion is never reached — descend here, mirroring
+  // `recordNullHoleObjAdopt`. Only the inner niche array re-stamps; `tyDeeperThan` guards recursion.
+  if d is TyObj {
+    if e is ObjLit {
+      if tyDeeperThan(dstTy, 16) { return 0 }
+      const dfn = d.objFieldNames
+      const dft = d.objFieldTypes
+      let k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          let dj = -1
+          let j = 0
+          while j < dfn.length {
+            if dfn[j] == f.fiName { dj = j }
+            j = j + 1
+          }
+          if dj >= 0 { recordElemRepArrayLit(f.fiValue, dft[dj], depth - 1) }
+        }
+        k = k + 1
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// The bindings of the pin whose deferred destinations are being re-asked, empty elsewhere.
+export let litPinN: string[] = []
+export function litPinNSet(v: string[]) { litPinN = v }
+
+export let litPinT: i32[] = []
+export function litPinTSet(v: i32[]) { litPinT = v }
+
+// Has this radix literal node adopted a 64-bit destination? Read by `checkNodeReal` so a re-check
+// keeps the adopted width, and by the emitter's union-atom picker.
+export function litWide64Of(ix: i32) {
+  if ix >= 0 {
+    if ix < litWide64.length { return litWide64[ix] }
+  }
+  false
+}
+
+// The value of an integer lexeme, saturated at 256 — "256" means "above the `u8` range", whatever
+// the lexeme is. Saturating rather than folding keeps this free of the bignum path
+// `numLexFitsI32` needs: the walk stops the moment the accumulator passes 255. Radix prefixes
+// and `_` separators are honoured; a lexeme with a digit its radix does not admit saturates too.
+export function u8LexValue(t: string) {
+  let base = 10
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  let v = 0
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      let d = -1
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      if d < 0 || d >= base { return 256 }
+      v = v * base + d
+      if v > 255 { return 256 }
+    }
+    i = i + 1
+  }
+  v
+}
+
+// Is the claimed pair's source (`shapeAdaptSrcExpr`, already peeled) an object literal?
+// That is the whole difference between the two wordings, and it must be asked of the pair
+// the walk stopped on, not the outer expression, which answers both cases the wrong way.
+export function litShapeDropSrcExpr(claimedExpr: i32) {
+  if claimedExpr < 0 { return false }
+  const ce = P.nodes[claimedExpr]
+  if ce is ObjLit { return true }
+  false
+}
+
+// The one base scalar every literal in `ty` widens to, through lists, nullables and unions;
+// -1 when there is none, or the literals mix bases (`1 | "a"`), a union with no one scalar rep.
+export function litUnionOneBase(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyNullable { return litUnionOneBase(t.nInner, depth - 1) }
+  if t is TyArray { return litUnionOneBase(t.aElem, depth - 1) }
+  if t is TyUnion {
+    let b = -1
+    for m in t.uMembers {
+      if !isNullTy(m) {
+        const mb = litUnionOneBase(m, depth - 1)
+        if mb < 0 || (b >= 0 && mb != b) { return -1 }
+        b = mb
+      }
+    }
+    return b
+  }
+  litUnionNoBase()
+}
+
+// Every other type (a primitive, record, map or function) is no literal set, so has no base.
+function litUnionNoBase(): i32 { -1 }
+
+// The registered litunion alias's own arena index whose member set is exactly the str-literal
+// types `members`, or -1 — the arena twin of `litUnionAliasOfLitTexts`, needed because an
+// identity-based classifier (`nodeTyIsLitUnionAlias`) compares by index, not name, so a
+// freshly-minted union with `K`'s exact members is not `K` to it without this lookup.
+export function litUnionAliasTyOfMembers(members: i32[]): i32 {
+  if members.length < 2 { return -1 }
+  const texts: string[] = []
+  let i = 0
+  while i < members.length {
+    const m = T.tys[members[i]]
+    if m is TyLit {
+      if m.litKind != "str" { return -1 }
+      texts.push(m.litText)
+    } else {
+      return -1
+    }
+    i = i + 1
+  }
+  const a = luPosOfTexts(texts)
+  if a < 0 { return -1 }
+  cUnionTyIxs[a]
+}
+
+// ── for range ──────────────────────────────────────────────────────────────
+// Whether the expression at `ix` is an integer literal this pass folds — a `NumLit` fitting
+// i32, a unary `+`/`-` over one, or either in parens. A `const` binding is not folded: the
+// checker keeps no constant-value scope, so folding one would widen "constant" for no reader (D1588).
+export function constIntExprIs(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is Paren { return constIntExprIs(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" || e.unOp == "+" { return constIntExprIs(e.unArg) }
+    return false
+  }
+  constIntLeafIs(ix)
+}
+
+// The leaf the sign/paren peel above delegates to: a `NumLit` answers from its lexeme, and a
+// name, call, operator or index is simply not constant — "no compile-time value" is the whole
+// answer, not a hole, since the direction rule then does not apply and the range keeps its
+// runtime contract (D1588).
+function constIntLeafIs(ix: i32) {
+  const e = P.nodes[ix]
+  if e is NumLit {
+    if numLexIsFloat(e.numText) { return false }
+    return numLexFitsI32(e.numText)
+  }
+  false
+}
+
+// The folded i32 value of a `constIntExprIs` node. Asks the predicate first: every i32 is a
+// legal bound and step, so no value here could mean "not constant" — an in-band sentinel
+// would make each caller-side guard dead code. Anything else folds to 0 and must not be
+// reached (D1588).
+export function constIntExprVal(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const e = P.nodes[ix]
+  if e is Paren { return constIntExprVal(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return 0 - constIntExprVal(e.unArg) }
+    if e.unOp == "+" { return constIntExprVal(e.unArg) }
+    return 0
+  }
+  constIntLeafVal(ix)
+}
+
+// `constIntLeafIs`'s value twin, paired arm for arm: the `NumLit` its predicate accepted
+// folds through the lexeme's own base, and every other kind answers 0 — a real bound, so
+// reachable only by a caller that skipped the predicate (D1588).
+function constIntLeafVal(ix: i32) {
+  const e = P.nodes[ix]
+  if e is NumLit { return parseI32(e.numText) }
+  0
+}
+
+export function literalsReset() { litWide64 = [] }

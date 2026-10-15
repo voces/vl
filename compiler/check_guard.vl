@@ -1,0 +1,131 @@
+// Guard functions: the registry of null-test guards, the fact a call to one proves about its
+// argument, and the place a null compare tests.
+// Emptied by `guardReset`. Does not import the checker.
+import { BinExpr, Call, Ident, IsExpr, Member, NullLit, P, Paren } from "./ast"
+
+// The `is`-guard alternative rows (indices into `holeAlt*`) whose then-branch is currently
+// being checked. A `return` inside one is reached only by an argument that satisfies the
+// alternative, so the type it contributes to the inferred return is recorded as a guarded
+// member (`?galt.`, see `mkGuardedRetTy`) rather than an unconditional one; innermost wins.
+export let guardAltStack: i32[] = []
+export function guardAltStackPop(): i32 | null { guardAltStack.pop() }
+export function guardAltStackPush(v: i32) { guardAltStack.push(v) }
+
+// Inferred type-guard functions: a named function whose body is exactly
+// `return <null-test-on-a-param>` becomes a guard, so calling it in a condition narrows the
+// argument's null-ness. Parallel arrays: the guard's name, the tested param's index, and 1 when
+// the non-null branch is the then arm (`self != null`), 0 when it is the else (`p == null`).
+export let guardNames: string[] = []
+export function guardNamesPush(v: string) { guardNames.push(v) }
+
+export let guardParamIdxs: i32[] = []
+export function guardParamIdxsPush(v: i32) { guardParamIdxs.push(v) }
+
+export let guardThens: i32[] = []
+export function guardThensPush(v: i32) { guardThens.push(v) }
+
+// The node index of the place compared against `null` in a `x == null` /
+// `x != null` / `null == x` comparison, or -1 (not a null compare).
+export function nullCmpPlace(condIx: i32) {
+  const cond = P.nodes[condIx]
+  if cond is BinExpr {
+    const lhs = P.nodes[cond.binLeft]
+    const rhs = P.nodes[cond.binRight]
+    if rhs is NullLit { return cond.binLeft }
+    if lhs is NullLit { return cond.binRight }
+  }
+  -1
+}
+
+// The argument place a guard call narrows in the branch where its non-null side is `wantThen`
+// (1 for then, 0 for else), or -1: not a registered guard call, wrong direction, or no stable
+// argument. Handles the inline form (`present(v)`) and the UFCS form (`v.present()`, where the
+// receiver fills the guard's `self` param 0).
+export function guardCallPlace(cond: Call, wantThen: i32) {
+  const cfn = P.nodes[cond.callFn]
+  let gname = ""
+  let gRecv = -1
+  if cfn is Ident {
+    gname = cfn.identName
+  } else if cfn is Member {
+    gname = cfn.memProp
+    gRecv = cfn.memObj
+  }
+  if gname == "" { return -1 }
+  const gi = guardIndexOf(gname)
+  if gi < 0 { return -1 }
+  if guardThens[gi] != wantThen { return -1 }
+  const pIdx = guardParamIdxs[gi]
+  const cargs = cond.callArgs
+  if gRecv >= 0 {
+    if pIdx == 0 { return gRecv }
+    if pIdx - 1 < cargs.length { return cargs[pIdx - 1] }
+    return -1
+  }
+  if pIdx < cargs.length { return cargs[pIdx] }
+  -1
+}
+
+// The innermost guard registration for `name`, or -1 (not a guard).
+function guardIndexOf(name: string) {
+  let i = guardNames.length - 1
+  while i >= 0 {
+    if guardNames[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// The A6b guard fact of a function body's result expression over the params: the index of
+// the param whose null-ness it tests, or -1. Encodes the branch direction in the result —
+// `paramIndex * 2 + 1` when the non-null branch is `then` (`x != null`, `x is T`), `paramIndex
+// * 2` when it is `else` (`x == null`, `x is null`) — mirroring the host's `conditionNarrowing`.
+export function guardFactOf(exprIx: i32, paramNames: string[]) {
+  const e = P.nodes[exprIx]
+  if e is Paren { return guardFactOf(e.parInner, paramNames) }
+  if e is IsExpr {
+    const obj = P.nodes[e.isObj]
+    if obj is Ident {
+      let gi = 0
+      while gi < paramNames.length {
+        if paramNames[gi] == obj.identName {
+          if e.isVariant == "null" { return gi * 2 }
+          return gi * 2 + 1
+        }
+        gi = gi + 1
+      }
+    }
+    return -1
+  }
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const placeIx = nullCmpPlace(exprIx)
+      if placeIx >= 0 {
+        const p = P.nodes[placeIx]
+        if p is Ident {
+          let gj = 0
+          while gj < paramNames.length {
+            if paramNames[gj] == p.identName {
+              if e.binOp == "!=" { return gj * 2 + 1 }
+              return gj * 2
+            }
+            gj = gj + 1
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// —— numeric-opcode intrinsics ————————————————————————————————————————————————
+// Operations that are a single wasm instruction, not a library: bitcasts, float ops (`sqrt
+// abs floor ceil trunc nearest`, `min max copysign`), and integer ops (`clz ctz popcnt`,
+// `rotl rotr divU remU`, unsigned comparisons over the same signed `i32`/`i64`). Transcendentals are absent: no wasm opcode computes one, so `sin` would be a policy choice, not a primitive.
+
+export function guardReset() {
+  guardAltStack = []
+  guardNames = []
+  guardParamIdxs = []
+  guardThens = []
+}

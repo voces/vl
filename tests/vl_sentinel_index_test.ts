@@ -147,7 +147,7 @@ function bad(t: Row): i32 {
 `,
     unguarded: ["11:3"],
     strict: [],
-    says: { code: UNGUARDED, text: "a field this module tests against 0 elsewhere" },
+    says: { code: UNGUARDED, text: "a field its module graph tests against 0 elsewhere" },
   },
   {
     // D1462 and #2498, reduced: the producer LAUNDERS a hole four hops down and carries
@@ -303,6 +303,32 @@ function viaMap(n: i32): i32 {
 `,
     unguarded: ["16:40"],
     strict: [],
+  },
+  {
+    // A hole field is one some module in the GRAPH tests against 0: moving the read out of
+    // the module that holds the test must not hide it (the typecheck.vl carve moved three).
+    name: "graphhole.vl",
+    deps: [{
+      name: "graphhole_row.vl",
+      src: `export type Row = { inner: i32 }
+
+export function innerOk(t: Row): i32 {
+  if t.inner < 0 { return 0 }
+  1
+}
+`,
+    }],
+    src: `import { Row, innerOk } from "./graphhole_row"
+
+let tys: i32[] = []
+
+function bad(t: Row): i32 {
+  tys[t.inner] + innerOk(t)
+}
+`,
+    unguarded: ["6:3"],
+    strict: [],
+    says: { code: UNGUARDED, text: "a field its module graph tests against 0 elsewhere" },
   },
 ];
 

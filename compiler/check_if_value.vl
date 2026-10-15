@@ -1,0 +1,474 @@
+// Value-position `if`, `match` and blocks: whether a node is total, which arms yield no
+// value, each completing-arm join, the f32 joins adopted, and discarded values.
+// Emptied by `ifValueReset`. Does not import the checker.
+import {
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  ContinueStmt,
+  ForIn,
+  ForRange,
+  IfStmt,
+  LetDecl,
+  MatchExpr,
+  P,
+  Paren,
+  RetStmt,
+  Unary,
+  WhileStmt,
+  callIsNever,
+  nodeChildren,
+  stmtAlwaysExits,
+} from "./ast"
+import { TY_ERR, TY_F64, TY_VOID } from "./check_types"
+import { parenPeelIx } from "./check_places"
+import { crUnParen } from "./check_narrow_ends"
+import { isVoidTy } from "./check_ty_shape"
+import { nodeTyIx, nodeTyIxOf, nodeTySet } from "./check_node_tys"
+import { inferQuiet, tpEnvNames } from "./check_cursor"
+import { dJoinNode, dJoinTy } from "./check_tp_join"
+import { discRoots } from "./check_discarded"
+import { ifCondIsDiscriminating } from "./check_match_desugar"
+import {
+  exitFirstAt,
+  exitFirstLetSeen,
+  exitFirstLets,
+  exitFirstOnSpine,
+  lpColAt,
+  lpColSet,
+} from "./check_null_holes"
+import { valueTailSplit } from "./check_num_adopt"
+import { isStmtNode, loopCarriesValue, lpOn } from "./check_bind_rows"
+
+// The parked joins `inferRetTyOf` has handed a return accumulator: a call's join, not a join of
+// the returning body's own arms.
+export let dJoinRelayed: {[i32]: boolean} = Map()
+
+// True if executing `ix` always yields a return value or diverges. `tail` says a bare trailing
+// value expression IS the implicit return; inside a bare `{ … }` statement it is not. A `Block`
+// is total iff its last statement is, an `if`/`else` iff both arms are, a `while true { … }` is.
+// Unlike `stmtAlwaysExits`, this counts the implicit return.
+function nodeIsTotalAt(ix: i32, tail: boolean) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    if st.length == 0 { return false }
+    // A statement that always exits ends the block, whatever dead code follows it.
+    let si = 0
+    while si < st.length - 1 {
+      if stmtAlwaysExits(st[si]) { return true }
+      si = si + 1
+    }
+    return nodeIsTotalAt(st[st.length - 1], tail)
+  }
+  if n is RetStmt { return true }
+  if n is BreakStmt { return true }
+  if n is ContinueStmt { return true }
+  if n is Call {
+    if callIsNever(ix) { return true }
+  }
+  if n is IfStmt {
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      const at = cur
+      cur = -1
+      if c is IfStmt {
+        if c.ifElse < 0 {
+          // An else-less `if`: a discriminating `is` / literal-equality chain may be
+          // exhaustive, so this defers to the dedicated exhaustiveness check, which knows the
+          // union's variants. A plain else-less `if` always has a fall-through and is not total.
+          return ifCondIsDiscriminating(c.ifCond)
+        }
+        // An arm that completes with no value falls off the end, whatever the other arm does.
+        if ifYieldsNoValue(at) { return false }
+        if !nodeIsTotalAt(c.ifThen, tail) { return false }
+        if P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          return nodeIsTotalAt(c.ifElse, tail)
+        }
+      }
+    }
+    return false
+  }
+  if n is WhileStmt {
+    // A loop carrying a value yields it in a value position.
+    if tail && loopCarriesValue(ix) { return true }
+    // A labelled block is total when its body is and no `break @B` leaves it (D3259).
+    if n.whileBlk == 1 {
+      return nodeIsTotalAt(n.whileBody, false)
+        && !breaksToLabel(n.whileBody, n.whileLabel)
+    }
+    // `while true { … }` never completes normally — it diverges or returns inside.
+    const c = P.nodes[n.whileCond]
+    if c is BoolLit { return c.boolVal != 0 }
+    return false
+  }
+  // A bare trailing value expression is the implicit return — in a value position only.
+  if !tail { return false }
+  if isStmtNode(ix) { return false }
+  if ifYieldsNoValue(ix) { return false }
+  // A `void` call in tail position is a statement: it yields nothing to return.
+  const tt = nodeTyIxOf(ix)
+  !(tt >= 0 && isVoidTy(tt))
+}
+
+// Whether a `break @label` sits anywhere under node `root`; a label is unique on its path.
+function breaksToLabel(root: i32, label: string): boolean {
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is BreakStmt {
+        if n.brkLabel == label { return true }
+      }
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+// Totality of a function BODY, which `emitFuncBody` trusts to pad a fall-through with
+// `unreachable`. A body ending in a bare `{ … }` has no implicit return — that block is a
+// statement, and `emitFuncBody`'s tail ladder drops its value — so only what DIVERGES inside it
+// makes the body total. A bare-block expression makes this arm `nodeIsTotalAt(last, true)` (D1902).
+export function nodeIsTotal(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    if st.length > 0 {
+      const last = st[st.length - 1]
+      if P.nodes[last] is Block { return nodeIsTotalAt(last, false) }
+    }
+  }
+  nodeIsTotalAt(ix, true)
+}
+
+// The if-expressions a binding, an argument or a return delivers (`tpIfMarkOk`).
+export let tpIfOkAt: {[i32]: boolean} = Map()
+
+// Per node: true at an `if` some completing arm of which yields no value (a `void` tail, an empty
+// arm, a statement, or such an `if` nested as its tail). That `if` is a statement, never a value.
+// Keyed maps rather than node columns: few nodes are `if`s, and a column is as long as the
+// highest one (D2319).
+export let ifNoValueAt: {[i32]: boolean} = Map()
+export function ifNoValueAtSetAt(k: i32, v: boolean) { ifNoValueAt[k] = v }
+
+// Per node: an `if`/`else`'s completing-arm value join (`ifTailValTyOf`), -1 where unrecorded.
+export let ifValTyAt: {[i32]: i32} = Map()
+export function ifValTyAtSetAt(k: i32, v: i32) { ifValTyAt[k] = v }
+
+// The `if` and `match` nodes `joinF32LitTails` re-typed f32, so an enclosing join that stays f64
+// can hand them back the type they had before (`f32JoinRevert`); the count gates that walk.
+export let f32JoinAdopted: {[i32]: boolean} = Map()
+export function f32JoinAdoptedSetAt(k: i32, v: boolean) {
+  f32JoinAdopted[k] = v
+}
+
+export let f32JoinAdoptCount = 0
+export function f32JoinAdoptCountSet(v: i32) { f32JoinAdoptCount = v }
+
+// Per node: true at an `if` or block whose value is discarded — a statement that is not its
+// block's value, a loop body, or the tail of a void body. Such an `if` is `void` whatever its
+// arms hold, so a value nobody reads is never typed for lowering (D2631).
+export let valDiscardAt: {[i32]: boolean} = Map()
+
+// Per discarded `if`: the value it would have had, typed on no node. A block's tail and the
+// editor's view of an unread function read it, so what a user sees is what they wrote.
+export let discardValTyAt: {[i32]: i32} = Map()
+export function discardValTyAtSetAt(k: i32, v: i32) { discardValTyAt[k] = v }
+
+// Marks `ix`, when it is an if-expression, as delivered where an instance builds a join of two
+// list types as their union: a binding's initializer, a call's argument, a returned value.
+export function tpIfMarkOk(ix: i32) {
+  if tpEnvNames.length == 0 || ix < 0 || ix >= P.nodes.length { return 0 }
+  const u = crUnParen(ix)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const un = P.nodes[u]
+  if un is IfStmt || un is MatchExpr { tpIfOkAt.set(u, true) }
+  0
+}
+
+// The type the return accumulator should see for node `nodeIx`, whose checked type came back as
+// `t`: the parked uncollapsed deferred join when this node is a call whose join the site could not
+// decide, else `t` itself. The one consumer allowed to see a deferred join outside `substTyDeep`,
+// `elaborateInferRets` treating such a return as generic, like the bare `TyVar` it stands in for.
+export function inferRetTyOf(nodeIx: i32, t: i32) {
+  if nodeIx < 0 { return t }
+  let k = 0
+  while k < dJoinNode.length {
+    if dJoinNode[k] == nodeIx {
+      if dJoinTy[k] >= 0 {
+        dJoinRelayed[dJoinTy[k]] = true
+        return dJoinTy[k]
+      }
+      return t
+    }
+    k = k + 1
+  }
+  t
+}
+
+// An inner join `joinF32LitTails` re-typed f32 under the join at `ix`, which does not adopt:
+// the inner one takes back the `f64` it has without adoption, so its literals keep their value.
+export function f32JoinRevert(ix: i32) {
+  if f32JoinAdoptCount == 0 || ix < 0 { return 0 }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(ix, spine, leaves)
+  let s = 0
+  while s < spine.length {
+    const at = spine[s]
+    if at != ix && (f32JoinAdopted[at] ?? false) {
+      if !inferQuiet && at < nodeTyIx.length { nodeTySet(at, TY_F64) }
+      if ifValTyAt.has(at) { ifValTyAt[at] = TY_F64 }
+      f32JoinAdopted[at] = false
+    }
+    s = s + 1
+  }
+  0
+}
+
+// The type an arm at `armIx` typed `ty` contributes to a join that does not adopt f32: `f64`, the
+// type it has without adoption, when its tail is a join `joinF32LitTails` re-typed.
+export function f32ArmPlainTy(armIx: i32, ty: i32): i32 {
+  if f32JoinAdoptCount == 0 || armIx < 0 { return ty }
+  let at = parenPeelIx(armIx)
+  // A block arm's value is its last statement.
+  while at >= 0 && P.nodes[at] is Block {
+    const b = P.nodes[at]
+    at = -1
+    if b is Block {
+      if b.blkStmts.length > 0 {
+        at = parenPeelIx(b.blkStmts[b.blkStmts.length - 1])
+      }
+    }
+  }
+  if at >= 0 && (f32JoinAdopted[at] ?? false) { return TY_F64 }
+  ty
+}
+
+// True when the `if` at `ix` yields no value on some completing arm — a statement, whatever
+// its arms' join reads. -1 and every non-`if` node answer false.
+export function ifYieldsNoValue(ix: i32): boolean {
+  if ix < 0 { return false }
+  ifNoValueAt[ix] ?? false
+}
+
+// Clears `ix`'s no-value verdict. An unrecorded node already reads false, so only a recorded
+// `true` is written.
+export function ifNoValueClear(ix: i32) {
+  if ifNoValueAt[ix] ?? false { ifNoValueAt[ix] = false }
+}
+
+// Does the if-arm `armIx`, which completes, finish without a value? `armTy` is its tail type
+// as the arm join sees it: `void` for an empty arm, a statement or a void call; an `if` tail
+// with a value-less arm of its own joins to a type mentioning `void`, so it is asked directly.
+export function ifArmGivesNoValue(armIx: i32, armTy: i32): boolean {
+  if armTy == TY_VOID { return true }
+  if armIx < 0 { return false }
+  const a = P.nodes[armIx]
+  if a is Block {
+    const n = a.blkStmts.length
+    if n == 0 { return true }
+    return ifYieldsNoValue(a.blkStmts[n - 1])
+  }
+  // Any other arm node (a `match` arm's bare expression) carries its own verdict.
+  ifYieldsNoValue(armIx)
+}
+
+// A `match` at `ix` keeps the `if`/`else` rule on its arms: `matchTallyBegin` clears its verdict,
+// `matchArmTally` folds one arm (an exiting arm adds nothing, a value-less one marks it), and
+// `matchTallyEnd` banks the completing arms' join. The running join is -1 until an arm adds.
+export function matchTallyBegin(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  ifNoValueClear(ix)
+  -1
+}
+
+export function matchTallyEnd(ix: i32, acc: i32) {
+  if ix < 0 { return 0 }
+  if acc < 0 { ifValTyAt[ix] = TY_VOID } else { ifValTyAt[ix] = acc }
+  0
+}
+
+// Clears the no-value verdict down the tail spine at `ix` (an `if`, its arms' tails, its
+// `else if` links). Called for a function whose return is not void: only a void context
+// discards a tail value (DECISIONS.md), so there each value arm returns and a value-less
+// arm falls through like any other path, to `null` or to the missing-return refusal.
+export function clearTailVerdict(ix: i32) {
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const at = cur
+    cur = -1
+    ifNoValueClear(at)
+    const n = P.nodes[at]
+    if n is IfStmt {
+      clearTailVerdict(blockLastStmt(n.ifThen))
+      clearTailVerdict(blockLastStmt(n.ifElse))
+      cur = n.ifElse
+    }
+  }
+  0
+}
+
+// The last statement of the block at `ix`, or -1 for an empty block or a non-block node.
+export function blockLastStmt(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const b = P.nodes[ix]
+  if !(b is Block) { return -1 }
+  const n = b.blkStmts.length
+  if n == 0 { return -1 }
+  b.blkStmts[n - 1]
+}
+
+// The value an `if`/`else` at `ix` yields as a tail: the join of the arms that complete, an
+// exiting arm contributing nothing (`void` when none completes). `fallback` for any other node.
+export function ifTailValTyOf(ix: i32, fallback: i32): i32 {
+  if ix < 0 { return fallback }
+  const v = ifValTyAt[ix] ?? -1
+  if v < 0 { return fallback }
+  v
+}
+
+// An if-arm's tail value as `ifTailValTyOf` sees it: a nested `if`/`else` tail answers its own
+// completing-arm join instead of the arm join `armTy`, which counts an exiting arm as `void`.
+export function ifArmValTy(armIx: i32, armTy: i32): i32 {
+  if armIx < 0 { return armTy }
+  const a = P.nodes[armIx]
+  if a is Block {
+    const n = a.blkStmts.length
+    if n > 0 { return ifTailValTyOf(a.blkStmts[n - 1], armTy) }
+    return armTy
+  }
+  // Any other arm node (an `else if` link, a `match` arm's bare expression) answers its own.
+  ifTailValTyOf(armIx, armTy)
+}
+
+// Notes an un-annotated binding of a loop value or of a construct whose first arm always exits;
+// asked only in a program holding one of them.
+export function noteExitFirstLet(n: LetDecl, ix: i32) {
+  if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
+    let ini = n.letInit
+    while ini >= 0 && P.nodes[ini] is Paren {
+      const pn = P.nodes[ini]
+      if pn is Paren { ini = pn.parInner }
+    }
+    // A loop value's binding is read through the result binding the emitter mints, which
+    // a classifier asked at module scope or through a capture cannot see into.
+    const loopVal = lpOn && loopCarriesValue(ini)
+    const firstExits = exitFirstAt.length > 0 && exitFirstOnSpine(ini, 0)
+    if (loopVal || firstExits) && lpColAt(exitFirstLetSeen, ix) != 1 {
+      lpColSet(exitFirstLetSeen, ix, 1)
+      exitFirstLets.push(ix)
+    }
+  }
+  0
+}
+
+// ── loop and labelled-block values ──────────────────────────────────────────
+// The loops and labelled blocks being checked, innermost last: each one's label, the join of
+// the `break` values leaving it (-1 before the first) and whether an exit leaves it with no
+// value. `lpBase` is where the entries of the function being checked start.
+export let lpLabels: string[] = []
+export function lpLabelsPop(): string | null { lpLabels.pop() }
+
+export let lpJoin: i32[] = []
+export function lpJoinPop(): i32 | null { lpJoin.pop() }
+export function lpJoinSetAt(k: i32, v: i32) { lpJoin[k] = v }
+
+export let lpBare: boolean[] = []
+export function lpBarePop(): boolean | null { lpBare.pop() }
+export function lpBareSetAt(k: i32, v: boolean) { lpBare[k] = v }
+
+export let lpBase = 0
+export function lpBaseSet(v: i32) { lpBase = v }
+
+export function lpPush(label: string) {
+  if !lpOn { return 0 }
+  lpLabels.push(label)
+  lpJoin.push(-1)
+  lpBare.push(false)
+  0
+}
+
+// The loop entry a `break`/`continue` labelled `label` targets ("" = the innermost), or -1.
+export function lpTargetOf(label: string): i32 {
+  let i = lpLabels.length - 1
+  while i >= lpBase {
+    if label == "" || lpLabels[i] == label { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// The value a discarded statement at `ix` would have had: a discarded `if`'s recorded value,
+// else its own type `ty`.
+export function discardedValTyOf(ix: i32, ty: i32): i32 {
+  if ix < 0 { return ty }
+  const dv = discardValTyAt[ix] ?? -1
+  if dv >= 0 { return dv }
+  ty
+}
+
+// An unread function's tail value as inference would have taken it: an `if` with a value-less
+// arm is a statement, and a value-if answers the join of its completing arms.
+export function discardedTailTy(ix: i32, ty: i32): i32 {
+  if isStmtNode(ix) && !(P.nodes[ix] is IfStmt) { return TY_VOID }
+  if ifYieldsNoValue(ix) { return TY_VOID }
+  const v = discardedValTyOf(ix, ty)
+  if v == TY_VOID || v == TY_ERR { return TY_VOID }
+  inferRetTyOf(ix, ifTailValTyOf(ix, v))
+}
+
+// Marks the `if` or block at `ix` as discarded (`valDiscardAt`), and a `match` (`tpIfMarkDiscard`);
+// any other node is left alone.
+export function markValDiscard(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is IfStmt || n is Block || n is MatchExpr { valDiscardAt[ix] = true }
+  if n is BinExpr || n is Unary || n is Paren { discRoots.push(ix) }
+  if lpOn && (n is WhileStmt || n is ForRange || n is ForIn) {
+    valDiscardAt[ix] = true
+  }
+  if tpEnvNames.length > 0 { tpIfMarkDiscard(ix) }
+  0
+}
+
+// A discarded `match` builds no value, so its join is never read as one list (D2832).
+function tpIfMarkDiscard(ix: i32) {
+  if P.nodes[ix] is MatchExpr { tpIfOkAt.set(ix, true) }
+  0
+}
+
+export function valDiscarded(ix: i32): boolean {
+  if ix < 0 { return false }
+  valDiscardAt[ix] ?? false
+}
+
+export function ifValueReset() {
+  tpIfOkAt = Map()
+  dJoinRelayed = Map()
+  ifNoValueAt = Map()
+  ifValTyAt = Map()
+  f32JoinAdopted = Map()
+  f32JoinAdoptCount = 0
+  valDiscardAt = Map()
+  lpLabels = []
+  lpJoin = []
+  lpBare = []
+  lpBase = 0
+  discardValTyAt = Map()
+}

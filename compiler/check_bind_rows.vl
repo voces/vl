@@ -1,0 +1,1086 @@
+// Binding rows: the depth-tagged marks for collapsed, object-literal and function-literal
+// bindings, the rows a write above its declaration waits in, and each call's bind row.
+// Emptied by `bindRowsReset`. Does not import the checker.
+import {
+  exprIsNumLit,
+  numLitFitsStore,
+  numLitInsertBySpan,
+  numLitValuesFit,
+} from "./check_num_lits"
+import { lookup, lookupFnAliasNode, lookupFnDeclNode } from "./check_scopes"
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  BreakStmt,
+  ContinueStmt,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  ObjLit,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  Spread,
+  TypeDecl,
+  UnionDecl,
+  WhileStmt,
+  declHasExportKw,
+  nodeChildren,
+} from "./ast"
+import {
+  nodeLastTok,
+  nodeSpanEndTok,
+  nodeStartTok,
+  tokFirstLineEndCol,
+} from "./fmt_util"
+import {
+  isvalCol,
+  isvalEnd,
+  isvalLine,
+  isvalLit,
+  isvalMsg,
+  isvalName,
+  isvalTok,
+  isvalType,
+} from "./check_state"
+import { strListHas } from "./listutil"
+import { tailValueLeaves } from "./check_unconsumed"
+import { ctnLitBindPopTo, ctnLitBindReset } from "./check_ctn_lit_bind"
+import {
+  T,
+  TY_ERR,
+  TY_NULL,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  objFieldType,
+  primNameStr,
+  tyHasInferHole,
+  tySame,
+  tyToStrUser,
+} from "./check_types"
+import { parenPeelIx } from "./check_places"
+import { demangleName } from "./check_suggest"
+import { fnDeclIx } from "./check_write_scan"
+import { isNullTy, nonNullTy, primNameOf, tyHasTyVar } from "./check_ty_shape"
+import {
+  bindMarkDeclOf,
+  bindMarkHas,
+  bindMarkPopTo,
+  bindMarkPush,
+  lbiNoDest,
+  lbiPopTo,
+  nlAsgGot,
+  nlAsgTgt,
+  nlCmpdInner,
+  nlCmpdTgt,
+  nlFnBind,
+  nlFnDecl,
+  nlFnLits,
+  nlFnName,
+  nlFnTy,
+  nlFnWant,
+  nlWantTy,
+  nlnAnn,
+  nlnDecl,
+  nlnDiag,
+  nlnLeaf,
+  nlnLeafTy,
+  nlnMsg,
+  nlnSlot,
+  nlnText,
+  nlnUse,
+  nlnWant,
+  numLitBindDecl,
+  numLitBindDepth,
+  numLitBindName,
+  numLitFnNote,
+} from "./check_num_lit_state"
+import { nodeArrayElemTyIx, nodeTyIxOf } from "./check_node_tys"
+import { inferQuiet, tpEnvNames } from "./check_cursor"
+import { cstrOwnerTop } from "./check_cstr_rows"
+import { lpColAt, lpValTy } from "./check_null_holes"
+import { valueTailSplit } from "./check_num_adopt"
+import { identNameAt } from "./check_narrow_paths"
+
+// D1048 — the collapsed-binding marks: bindings whose declared type dropped a subsumed literal
+// arm, and function declarations whose declared return did. Read at an `is <literal>` to decide
+// whether the test is a tag test or a value compare. Depth-tagged sparse rows: `popScope` drops
+// the rows it retires, and a read pairs the row's depth with `lookupDepth`, so shadowing works.
+let collBindDepth: i32[] = []
+
+let collBindName: string[] = []
+
+// The `FuncDecl` nodes whose return annotation collapsed. Module-scoped rather than
+// depth-tagged: a decl node is unique for the whole program, and pass 1 hoists every top-level
+// signature before any body runs, so a forward call is already covered.
+let collRetFnNodes: i32[] = []
+
+// D1609 — the un-annotated object-literal bindings: names a `let`/`const` binds, with no type
+// annotation, to an object literal. The nested-width-pair exemption asks which binding a source
+// name resolves to, and only a scope answers that; a whole-arena name scan takes an unrelated
+// function's binding. Depth-tagged sparse rows, read through `lookupDepth` exactly like `collBind`.
+let objLitBindDepth: i32[] = []
+
+let objLitBindName: string[] = []
+
+// The same rows for an un-annotated `let`/`const` whose initializer is a lambda with no return
+// annotation: a function-value mismatch reading the name finds the lambda through them.
+let fnLitBindDepth: i32[] = []
+
+let fnLitBindName: string[] = []
+
+let fnLitBindDecl: i32[] = []
+
+// The token a node-anchored FINDING starts at: the node's first token, else its last, since a
+// node minted after parsing owns no start. `-1` when it has neither, which drops the finding
+// rather than placing it where the author wrote nothing. The raise family's
+// `tErrPushNodeSpan` takes the same two rungs, for the same reason.
+export function findingStartTok(ix: i32) {
+  const first = nodeStartTok(ix)
+  if first >= 0 { return first }
+  nodeLastTok(ix)
+}
+
+// That finding's 0-based exclusive end column: the node's last token on the start line, so the
+// span covers the construct the message names. Degrades to `tk`'s own end.
+export function findingEndCol(ix: i32, tk: i32) {
+  const end = nodeSpanEndTok(ix)
+  if end >= 0 { return tokFirstLineEndCol(end) }
+  tokFirstLineEndCol(tk)
+}
+
+export function isvalReset() {
+  isvalLine = []
+  isvalCol = []
+  isvalEnd = []
+  isvalTok = []
+  isvalName = []
+  isvalType = []
+  isvalLit = []
+  isvalMsg = []
+  collBindDepth = []
+  collBindName = []
+  objLitBindDepth = []
+  objLitBindName = []
+  ctnLitBindReset()
+  numLitBindDepth = []
+  numLitBindName = []
+  numLitBindDecl = []
+  fnLitBindDepth = []
+  fnLitBindName = []
+  fnLitBindDecl = []
+  fsbReset()
+  callBindRow = Map()
+  callBindNames = []
+  callBindTys = []
+  nlnDiag = []
+  nlnMsg = []
+  nlnText = []
+  nlnDecl = []
+  nlnUse = []
+  nlnSlot = []
+  nlnWant = []
+  nlnAnn = []
+  nlnLeaf = []
+  nlnLeafTy = []
+  nlAsgTgt = -1
+  nlAsgGot = -1
+  nlWantTy = -1
+  nlCmpdInner = -1
+  nlCmpdTgt = -1
+  collRetFnNodes = []
+  collapsedAliases = Map()
+  annotCollapsed = Map()
+  collapsedTy = -1
+  0
+}
+
+// Mark the binding just declared at the innermost scope as one whose declared type collapsed a
+// subsumed literal arm. Called right after `declare`, so the depth it records is the frame
+// `lookupDepth` answers with at every use.
+export function markCollapsedBinding(name: string) {
+  bindMarkPush(collBindDepth, collBindName, name, T.scopes.length - 1)
+}
+
+// Did `name` resolve to a binding whose declared type collapsed (D1048)?
+function bindingCollapsed(name: string) {
+  bindMarkHas(collBindDepth, collBindName, name)
+}
+
+// Mark the binding just declared at `depth` as un-annotated with an object-literal initializer.
+// The module hoist records its globals at depth 0 before any body is checked, so a body that
+// reads a global declared later resolves it the same way straight-line code does (D1609).
+export function markObjLitBinding(name: string, depth: i32) {
+  bindMarkPush(objLitBindDepth, objLitBindName, name, depth)
+}
+
+// Did `name` resolve to an un-annotated object-literal binding (D1609)?
+function bindingIsObjLit(name: string) {
+  bindMarkHas(objLitBindDepth, objLitBindName, name)
+}
+
+// Drop the marks the scope just popped retired, for every depth-tagged table at once.
+export function collBindPopTo(depth: i32) {
+  lbiPopTo(depth)
+  bindMarkPopTo(collBindDepth, collBindName, depth)
+  bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
+  ctnLitBindPopTo(depth)
+  // Tested inline: a module-level literal keeps this table non-empty in nearly every scope.
+  const nl = numLitBindDepth.length
+  if nl > 0 && numLitBindDepth[nl - 1] >= depth {
+    bindMarkPopTo(numLitBindDepth, numLitBindName, depth)
+    while numLitBindDecl.length > numLitBindName.length { numLitBindDecl.pop() }
+  }
+  const fl = fnLitBindDepth.length
+  if fl > 0 && fnLitBindDepth[fl - 1] >= depth {
+    bindMarkPopTo(fnLitBindDepth, fnLitBindName, depth)
+    while fnLitBindDecl.length > fnLitBindName.length { fnLitBindDecl.pop() }
+  }
+  fsbPopTo(depth)
+}
+
+// ── literal-binding inference ──────────────────────────────────────────────────────────────
+// A `let` initialised by a bare numeric literal takes its type from its deliveries and stores, and
+// such a `const` is its literal at every read (DECISIONS.md §"A literal binding takes its type
+// from its uses"). A moved `let` is re-checked with its type written as its annotation (D3246).
+
+// D3960 — a `let` whose un-annotated initializer is a generic function or an un-annotated lambda
+// keeps that generic type (owner ruling C), so a concrete function written to it is refused with
+// the annotation that would make the binding hold one. Rows are depth-tagged like `fnLitBind`; a
+// write to a module binding above its declaration waits for the declaration in `fsbPend*`.
+export let fsbDepth: i32[] = []
+
+export let fsbName: string[] = []
+
+export let fsbRowDecl: i32[] = []
+export function fsbRowDeclPush(v: i32) { fsbRowDecl.push(v) }
+
+export let fsbPendName: string[] = []
+export function fsbPendNamePush(v: string) { fsbPendName.push(v) }
+
+export let fsbPendIx: i32[] = []
+export function fsbPendIxPush(v: i32) { fsbPendIx.push(v) }
+
+export let fsbPendTy: i32[] = []
+export function fsbPendTyPush(v: i32) { fsbPendTy.push(v) }
+
+// The per-call binding column: what each generic call bound, by call node, as the type-variable
+// names the callee's signature rides and the arena type each is bound to. Every non-speculative
+// check of the call overwrites its row, so a re-check pass's answer stands; `initChecker` empties it.
+let callBindRow: {[i32]: i32} = Map()
+
+let callBindNames: string[][] = []
+
+let callBindTys: i32[][] = []
+
+// The shadow's must-fire control: 1 records nothing, 2 records every type as the error type.
+// Only a host sets it (`callBindDropSet`), and only to prove the shadow sees the column.
+let callBindDrop = 0
+
+export function callBindDropSet(k: i32) {
+  callBindDrop = k
+  0
+}
+
+export function callBindNote(ix: i32, names: string[], tys: i32[]) {
+  if inferQuiet || ix < 0 || callBindDrop == 1 { return 0 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  let i = 0
+  while i < names.length && i < tys.length {
+    nm.push(names[i])
+    if callBindDrop == 2 { ty.push(TY_ERR) } else { ty.push(tys[i]) }
+    i = i + 1
+  }
+  const r = callBindRow[ix] ?? -1
+  if r >= 0 {
+    callBindNames[r] = nm
+    callBindTys[r] = ty
+    return 0
+  }
+  callBindRow[ix] = callBindNames.length
+  callBindNames.push(nm)
+  callBindTys.push(ty)
+  0
+}
+
+// Whether call `ix` has a row: a generic call some full check pass resolved.
+export function callBindHas(ix: i32): boolean { (callBindRow[ix] ?? -1) >= 0 }
+
+// The arena type call `ix` bound type variable `name` to, or -1 when it has no row or bound
+// nothing there.
+export function callBindTyOf(ix: i32, name: string): i32 {
+  const r = callBindRow[ix] ?? -1
+  if r < 0 { return -1 }
+  const nm = callBindNames[r]
+  let i = 0
+  while i < nm.length {
+    if nm[i] == name { return callBindTys[r][i] }
+    i = i + 1
+  }
+  -1
+}
+
+// D3968 — the functions written to a marked binding, as the owners of their deferred constraints
+// (a written generic's declaration, else the body the write stands in), and every call through
+// such a binding with what it bound, so each owner's constraints are re-asked at that call.
+export let fsbOwnDecl: i32[] = []
+
+export let fsbOwnFn: i32[] = []
+
+export let fsbOwnTy: i32[] = []
+
+export let fsbCallArgTys: i32[][] = []
+export function fsbCallArgTysPush(v: i32[]) { fsbCallArgTys.push(v) }
+
+// Per call: how many owner rows it has re-asked, the ones known at its own check.
+export let fsbCallOwnN: i32[] = []
+export function fsbCallOwnNPush(v: i32) { fsbCallOwnN.push(v) }
+export function fsbCallOwnNSetAt(k: i32, v: i32) { fsbCallOwnN[k] = v }
+
+export let fsbCallIx: i32[] = []
+export function fsbCallIxPush(v: i32) { fsbCallIx.push(v) }
+
+export let fsbCallDecl: i32[] = []
+export function fsbCallDeclPush(v: i32) { fsbCallDecl.push(v) }
+
+export let fsbCallUsed: i32[] = []
+export function fsbCallUsedPush(v: i32) { fsbCallUsed.push(v) }
+
+export let fsbCallWho: string[] = []
+export function fsbCallWhoPush(v: string) { fsbCallWho.push(v) }
+
+export let fsbCallHNames: string[][] = []
+export function fsbCallHNamesPush(v: string[]) { fsbCallHNames.push(v) }
+
+export let fsbCallHNo: i32[][] = []
+export function fsbCallHNoPush(v: i32[]) { fsbCallHNo.push(v) }
+
+export let fsbCallHNode: i32[][] = []
+export function fsbCallHNodePush(v: i32[]) { fsbCallHNode.push(v) }
+
+function fsbReset() {
+  fsbDepth = []
+  fsbName = []
+  fsbRowDecl = []
+  fsbPendName = []
+  fsbPendIx = []
+  fsbPendTy = []
+  fsbOwnDecl = []
+  fsbOwnFn = []
+  fsbOwnTy = []
+  fsbCallArgTys = []
+  fsbCallOwnN = []
+  fsbCallIx = []
+  fsbCallDecl = []
+  fsbCallUsed = []
+  fsbCallWho = []
+  fsbCallHNames = []
+  fsbCallHNo = []
+  fsbCallHNode = []
+  0
+}
+
+function fsbPopTo(depth: i32) {
+  const l = fsbDepth.length
+  if l > 0 && fsbDepth[l - 1] >= depth {
+    bindMarkPopTo(fsbDepth, fsbName, depth)
+    while fsbRowDecl.length > fsbName.length { fsbRowDecl.pop() }
+  }
+  0
+}
+
+// The declaration of the marked binding the name read at `ix` resolves to, or -1. A marked list
+// is reached only through an element, `fs[i]`, which stands for every function written to it.
+export function fsbDeclAtNode(ix: i32): i32 {
+  if fsbName.length == 0 || ix < 0 { return -1 }
+  const p = parenPeelIx(ix)
+  const e = fsbElemBase(p)
+  if e >= 0 {
+    const ld = bindMarkDeclOf(fsbDepth, fsbName, fsbRowDecl, identNameAt(e))
+    if ld >= 0 && fsbDeclIsList(ld) { return ld }
+    return -1
+  }
+  const d = bindMarkDeclOf(fsbDepth, fsbName, fsbRowDecl, identNameAt(p))
+  if d >= 0 && fsbDeclIsList(d) { return -1 }
+  d
+}
+
+// The list the element read `a[i]` at `p` indexes, or -1 when `p` is not an element read.
+function fsbElemBase(p: i32): i32 {
+  const n = P.nodes[p]
+  if n is Index { return parenPeelIx(n.idxArr) }
+  -1
+}
+
+// Whether the marked binding `decl` is a list of functions rather than a function.
+export function fsbDeclIsList(decl: i32): boolean {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letInit >= 0 && P.nodes[parenPeelIx(n.letInit)] is ArrayLit {
+      return true
+    }
+  }
+  false
+}
+
+// Whether the un-annotated list literal `init`, of type `bound`, holds a generic function value.
+export function fsbIsGenericList(init: i32, bound: i32): boolean {
+  const bt = T.tys[bound]
+  if !(bt is TyArray) { return false }
+  const et = bt.aElem
+  if et < 0 || et >= T.tys.length || !(T.tys[et] is TyFunc) { return false }
+  const a = P.nodes[parenPeelIx(init)]
+  if a is ArrayLit {
+    for e in a.arrElems {
+      if fsbIsGeneric(e, nodeTyIxOf(e)) { return true }
+    }
+  }
+  false
+}
+
+// Whether the function value `ix` of type `ty` is generic: its type has a type variable of its
+// own or an inference hole, it is a lambda with an un-annotated parameter, or it names a binding
+// that is one of those.
+export function fsbIsGeneric(ix: i32, ty: i32): boolean {
+  if ty >= 0 && ty < T.tys.length && tyHasTyVar(ty) {
+    if tyHasInferHole(ty, 0) || !fsbTvsInScope(ty, 0) { return true }
+  }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return false }
+  if fsbIsHoleLambda(p) || fsbDeclAtNode(p) >= 0 { return true }
+  const n = P.nodes[p]
+  if n is Ident {
+    // A declared generic is generic whatever its type variables are named, even like the
+    // enclosing generic's own.
+    const gd = fnDeclIx[n.identName] ?? lookupFnDeclNode(n.identName)
+    if gd >= 0 && gd < P.nodes.length {
+      const gn = P.nodes[gd]
+      if gn is FuncDecl {
+        if gn.fnTyParams.length > 0 { return true }
+      }
+    }
+    const d = bindMarkDeclOf(
+      fnLitBindDepth,
+      fnLitBindName,
+      fnLitBindDecl,
+      n.identName,
+    )
+    if d >= 0 {
+      const l = P.nodes[d]
+      if l is LetDecl { return fsbIsHoleLambda(parenPeelIx(l.letInit)) }
+    }
+  }
+  false
+}
+
+// Whether node `p` is a lambda with a parameter that has no annotation.
+export function fsbIsHoleLambda(p: i32): boolean {
+  if p < 0 || p >= P.nodes.length { return false }
+  const f = P.nodes[p]
+  if f is FuncDecl {
+    if f.fnName != "" { return false }
+    for px in f.fnParams {
+      const pn = P.nodes[px]
+      if pn is Param {
+        if pn.parType < 0 { return true }
+      }
+    }
+  }
+  false
+}
+
+// Whether every type variable `ty` names is a parameter of the enclosing generic.
+function fsbTvsInScope(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return true }
+  const t = T.tys[ty]
+  match t {
+    TyVar => strListHas(tpEnvNames, t.tvName)
+    TyArray => fsbTvsInScope(t.aElem, depth + 1)
+    TyNullable => fsbTvsInScope(t.nInner, depth + 1)
+    TyNeg => fsbTvsInScope(t.negTy, depth + 1)
+    TyMap => fsbTvsInScope(t.mKey, depth + 1) && fsbTvsInScope(t.mVal, depth + 1)
+    TyObj => fsbTvsAllInScope(t.objFieldTypes, depth)
+    TyUnion => fsbTvsAllInScope(t.uMembers, depth)
+    TyFunc => fsbTvsAllInScope(t.fnParamTypes, depth) && fsbTvsInScope(t.fnRet, depth + 1)
+    TyPrim | TyErr | TyLit => true
+  }
+}
+
+function fsbTvsAllInScope(tys: i32[], depth: i32): boolean {
+  for x in tys {
+    if !fsbTvsInScope(x, depth + 1) { return false }
+  }
+  true
+}
+
+// Record the owner of the constraints of the generic `rhs`, of type `rt`, written to the binding
+// `decl`.
+export function fsbNoteOwner(decl: i32, rhs: i32, rt: i32) {
+  if decl < 0 { return 0 }
+  // A lambda written in place has holes no other expression shares, so its enclosing body's
+  // constraints over them are its own; a binding of one is left to that binding's own calls.
+  let o = -1
+  const n = P.nodes[parenPeelIx(rhs)]
+  if n is Ident {
+    o = fnDeclIx[n.identName] ?? lookupFnDeclNode(n.identName)
+    if o < 0 { o = lookupFnAliasNode(n.identName) }
+    if o < 0 { return 0 }
+  } else if fsbIsHoleLambda(parenPeelIx(rhs)) {
+    o = cstrOwnerTop()
+  } else {
+    return 0
+  }
+  let i = 0
+  while i < fsbOwnDecl.length {
+    if fsbOwnDecl[i] == decl && fsbOwnFn[i] == o && fsbOwnTy[i] == rt {
+      return 0
+    }
+    i = i + 1
+  }
+  fsbOwnDecl.push(decl)
+  fsbOwnFn.push(o)
+  fsbOwnTy.push(rt)
+  0
+}
+
+// Mark the binding `name` declared by `decl` at `depth` when its initializer is a lambda with no
+// return annotation and the declaration has none either.
+export function markFnLitBinding(name: string, depth: i32, decl: i32) {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letType >= 0 || n.letInit < 0 { return 0 }
+    const f = P.nodes[parenPeelIx(n.letInit)]
+    if f is FuncDecl {
+      if f.fnName == "" && f.fnRet < 0 {
+        bindMarkPush(fnLitBindDepth, fnLitBindName, name, depth)
+        fnLitBindDecl.push(decl)
+      }
+    }
+  }
+  0
+}
+
+// Queue the note for a mismatch at `at` whose value is, or holds in a record or list literal, a
+// function whose un-annotated return defaulted from numeric literals, when annotating that return
+// with the destination's return type fixes it. True when it queues one.
+export function numLitFnNoteQueue(msg: string, at: i32, di: i32): boolean {
+  const leaf = numLitFnLeafFor(at, nlWantTy, 8)
+  if leaf < 0 { return false }
+  const ann = primNameStr(primNameOf(nlFnWant))
+  nlnDiag.push(di)
+  nlnMsg.push(msg)
+  nlnText.push(numLitFnNote(ann, at))
+  nlnDecl.push(nlFnDecl)
+  nlnUse.push(nlFnName)
+  nlnSlot.push("fn")
+  nlnWant.push(nlFnWant)
+  nlnAnn.push(ann)
+  nlnLeaf.push(leaf)
+  nlnLeafTy.push(-1)
+  true
+}
+
+// The function value within `v` that a `want`-typed destination refuses and whose return
+// annotation fixes, through record and list literals; -1 when none.
+function numLitFnLeafFor(v: i32, want: i32, depth: i32): i32 {
+  const p = parenPeelIx(v)
+  if depth <= 0 || want < 0 || want >= T.tys.length { return -1 }
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const wt = T.tys[want]
+  if wt is TyFunc {
+    if numLitFnFits(p, wt) { return p }
+    return -1
+  }
+  numLitFnLeafInRecord(p, want, depth)
+}
+
+// `numLitFnLeafFor` through the fields of record literal `p` delivered to a record type `want`;
+// every other value goes on to `numLitFnLeafInList`.
+function numLitFnLeafInRecord(p: i32, want: i32, depth: i32): i32 {
+  const n = P.nodes[p]
+  if n is ObjLit {
+    const wt = T.tys[want]
+    if wt is TyObj {
+      for fi in n.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const r = numLitFnLeafFor(
+            f.fiValue,
+            objFieldType(wt, f.fiName),
+            depth - 1,
+          )
+          if r >= 0 { return r }
+        }
+      }
+    }
+    return -1
+  }
+  numLitFnLeafInList(p, want, depth)
+}
+
+// `numLitFnLeafFor` through the elements of list literal `p` delivered to a list type `want`; -1
+// for every other value, which delivers no function this walk can name.
+function numLitFnLeafInList(p: i32, want: i32, depth: i32): i32 {
+  const n = P.nodes[p]
+  if n is ArrayLit {
+    const wt = T.tys[want]
+    if wt is TyArray {
+      for el in n.arrElems {
+        const r = numLitFnLeafFor(el, wt.aElem, depth - 1)
+        if r >= 0 { return r }
+      }
+    }
+  }
+  -1
+}
+
+// Is `p` a function name, a lambda binding or a lambda whose return has no annotation and
+// defaulted from the numeric literals it returns, and which `wt` takes once that return is
+// annotated `wt`'s? Same parameters, a return type the literals also fit, each value kept exactly.
+// Sets the `nlFn*` state on a yes.
+function numLitFnFits(p: i32, wt: TyFunc): boolean {
+  const n = P.nodes[p]
+  let fd = -1
+  let bind = -1
+  let name = ""
+  let got = -1
+  if n is Ident {
+    name = n.identName
+    got = lookup(name)
+    fd = lookupFnDeclNode(name)
+    bind = fd
+    if fd < 0 {
+      bind = bindMarkDeclOf(fnLitBindDepth, fnLitBindName, fnLitBindDecl, name)
+      if bind < 0 || bind >= P.nodes.length { return false }
+      const bn = P.nodes[bind]
+      if bn is LetDecl { fd = parenPeelIx(bn.letInit) }
+    }
+  } else if n is FuncDecl {
+    fd = p
+    bind = p
+    got = nodeTyIxOf(p)
+  }
+  if fd < 0 || fd >= P.nodes.length || got < 0 || got >= T.tys.length {
+    return false
+  }
+  const f = P.nodes[fd]
+  const gt = T.tys[got]
+  if f is FuncDecl && gt is TyFunc {
+    if f.fnRet >= 0 || f.fnTyParams.length > 0 { return false }
+    // Another module may use an exported function's result where only the old return fits.
+    if declHasExportKw(bind) { return false }
+    const np = gt.fnParamTypes.length
+    if np != wt.fnParamTypes.length || np != f.fnParams.length { return false }
+    let i = 0
+    while i < np {
+      if !tySame(gt.fnParamTypes[i], wt.fnParamTypes[i]) { return false }
+      i = i + 1
+    }
+    const wn = primNameStr(primNameOf(wt.fnRet))
+    if !numLitFitsStore(primNameStr(primNameOf(gt.fnRet)), wn, false) {
+      return false
+    }
+    const lits = numLitFnReturns(fd)
+    if lits.length == 0 { return false }
+    for l in lits {
+      if !numLitValuesFit(l, wn) { return false }
+    }
+    nlFnDecl = fd
+    nlFnBind = bind
+    nlFnName = name
+    nlFnTy = got
+    nlFnWant = wt.fnRet
+    nlFnLits = lits
+    return true
+  }
+  false
+}
+
+// The numeric literals function `fd` returns, by `return` or as a tail value, in source order;
+// empty when it returns anything else. A nested function's returns are its own.
+function numLitFnReturns(fd: i32): i32[] {
+  const out: i32[] = []
+  const f = P.nodes[fd]
+  if f is FuncDecl {
+    const leaves: i32[] = []
+    tailValueLeaves(f.fnBody, leaves)
+    const stack: i32[] = [f.fnBody]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      const rn = P.nodes[ix]
+      if rn is RetStmt {
+        if rn.retArg >= 0 { leaves.push(rn.retArg) }
+      }
+      if !(rn is FuncDecl) {
+        for c in nodeChildren(ix) {
+          if c >= 0 && c < P.nodes.length { stack.push(c) }
+        }
+      }
+    }
+    for lf in leaves {
+      if !isStmtNode(lf) {
+        if !exprIsNumLit(lf) { return [] }
+        numLitInsertBySpan(out, parenPeelIx(lf))
+      }
+    }
+  }
+  out
+}
+
+// Mark or test a function declaration whose return annotation collapsed. Deduped: pass 1 hoists
+// the signature, `checkFuncDeclNode` resolves it again, and a probe re-check runs the whole body
+// a third time.
+export function markCollapsedRet(fnIx: i32) {
+  if fnIx < 0 { return 0 }
+  if fnRetCollapsed(fnIx) { return 0 }
+  collRetFnNodes.push(fnIx)
+  0
+}
+
+export function fnRetCollapsed(fnIx: i32) {
+  if fnIx < 0 { return false }
+  let i = 0
+  while i < collRetFnNodes.length {
+    if collRetFnNodes[i] == fnIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Record the finding at an `is <literal>` whose operand's declared type collapsed.
+// `ix` is the `IsExpr` node; `name` the operand binding; `objTy` its (collapsed) type;
+// `lit` the tested spelling exactly as the author wrote it.
+function recordCollapsedIs(ix: i32, name: string, objTy: i32, lit: string) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  const t = P.toks[tk]
+  // An exact repeat (same anchor) is the re-check of one node, not a second finding — the
+  // de-duplication `recordDeadCoalesce` and `tErrCoded` both apply.
+  let i = 0
+  while i < isvalTok.length {
+    if isvalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  isvalLine.push(t.line)
+  isvalCol.push(t.col)
+  isvalEnd.push(findingEndCol(ix, tk))
+  isvalTok.push(tk)
+  isvalName.push(demangleName(name))
+  // User-facing (the finding's message quotes it) — the user render, not the raw one.
+  isvalType.push(tyToStrUser(objTy))
+  isvalLit.push(lit)
+  isvalMsg.push("")
+  0
+}
+
+// The third bank on the same wire, and it exists because the collapse is invisible in its own
+// result: `string | "err"` resolves to `string`, so nothing about the answer distinguishes it from
+// a `string` nobody wrote a union for. `collapsedTy` is the arena index the resolution in flight
+// collapsed to, or -1; a consumer compares it against its own resolved type. Memoized alongside.
+export let collapsedTy = -1
+export function collapsedTySet(v: i32) { collapsedTy = v }
+
+// The declared aliases whose union spelling collapsed (`type R = string | "err"`). The declaration
+// route builds its member list itself and never reaches the annotation home, so it records here and
+// `declaredTyOfName` re-banks on every later reference — which is what carries the provenance
+// across `function f(): R`.
+export let collapsedAliases: {[string]: boolean} = Map()
+export function collapsedAliasesSetAt(k: string, v: boolean) {
+  collapsedAliases[k] = v
+}
+
+// `annotNameMemo`'s companion: the `collapsedTy` a name's resolution banked.
+export let annotCollapsed: {[string]: i32} = Map()
+export function annotCollapsedSetAt(k: string, v: i32) { annotCollapsed[k] = v }
+
+// Is `srcExpr` a name bound, without an annotation, to an object literal? An un-annotated
+// binding has no pinned wasm type of its own, so the emitter lays it out at the shape it flows
+// into, which is what makes a nested width pair sound; an annotated source keeps its type and
+// the pair is unsound (D938). Resolved through the scope chain, never by arena order (D1609).
+export function srcIsUnannotatedObjBinding(srcExpr: i32): boolean {
+  if srcExpr < 0 { return false }
+  const e = P.nodes[srcExpr]
+  if e is Paren { return srcIsUnannotatedObjBinding(e.parInner) }
+  if e is Ident { return bindingIsObjLit(e.identName) }
+  false
+}
+
+// Whether `ix` is a statement node, not a value-producing expression. A body whose last node
+// / `return` argument is a value expression has a value-return position; one ending in a bare
+// statement is genuinely void. The redundant-return fixpoint defers only value-return
+// functions poisoned by a cycle, so genuine void recursion is never mis-flagged.
+export function isStmtNode(ix: i32) {
+  const nd = P.nodes[ix]
+  if nd is LetDecl { return true }
+  if nd is IfStmt { return true }
+  if nd is WhileStmt { return !loopCarriesValue(ix) }
+  if nd is BreakStmt { return true }
+  if nd is ContinueStmt { return true }
+  if nd is RetStmt { return true }
+  if nd is ForRange { return !loopCarriesValue(ix) }
+  if nd is ForIn { return !loopCarriesValue(ix) }
+  // A body-scoped `type` is a declaration (D1045), so a block ending in one is valueless,
+  // exactly as one ending in a `let` is — otherwise the trailing declaration would be read as the block's value.
+  if nd is TypeDecl { return true }
+  if nd is UnionDecl { return true }
+  // A bare `{ … }` is a statement exactly as the `IfStmt` above is — `drwBareBlock` lowers it
+  // to `if true { … }`, so reading it as a value position gave the two spellings of one
+  // program different answers (D1901).
+  if nd is Block { return true }
+  false
+}
+
+// Whether node `ix` has a recorded array type whose element is the `null` unit type (D4671), and
+// is not a null-only literal that a destination of another list type received.
+export function nodeArrayElemIsNullUnit(ix: i32): boolean {
+  if nolLitTakenOther(ix) { return false }
+  isNullTy(nodeArrayElemTyIx(ix))
+}
+
+// —— the one home for "does a value of this type occupy one i32 cell" ——————————
+// Two questions, decided by different machinery, both asked by three call sites
+// (`eqCmpKindOfArrayElem`, `concatElemIsI32Backed`, `tyScalarBackedListKind`) that share one
+// function rather than three private copies — disagreement between them writes a module the engine refuses.
+
+// D1832 — a list literal whose every element is `null`, those of them a typed destination
+// received, and those that sit as a `+` operand or a spread source, which no destination types.
+// An untyped one names no element type, so `flushNullOnlyLits` refuses it at program end.
+export let nolLits: i32[] = []
+export function nolLitsPush(v: i32) { nolLits.push(v) }
+export function nolLitsSet(v: i32[]) { nolLits = v }
+
+export let nolTaken: {[i32]: boolean} = Map()
+export function nolTakenSet(v: {[i32]: boolean}) { nolTaken = v }
+
+// The null-only literals some destination other than `null[]` received: each is built at that
+// destination's list, never as a `null[]` (`nodeArrayElemIsNullUnit`).
+export let nolTakenOther: {[i32]: boolean} = Map()
+export function nolTakenOtherSet(v: {[i32]: boolean}) { nolTakenOther = v }
+
+export function nolLitTakenOther(ix: i32): boolean {
+  nolTakenOther[ix] ?? false
+}
+
+export let nolOperand: {[i32]: boolean} = Map()
+export function nolOperandSet(v: {[i32]: boolean}) { nolOperand = v }
+
+// A list literal whose element joins to a union, and per literal what a delivery outside a
+// speculative check made of it: 1 when only destinations of another concrete union received it,
+// so it boxes into theirs and its own union is never built (D4635); 2 once one wants its own.
+export let ulLitN = 0
+export function ulLitNSet(v: i32) { ulLitN = v }
+
+export let ulTaken: {[i32]: i32} = Map()
+export function ulTakenSet(v: {[i32]: i32}) { ulTaken = v }
+
+export function arrLitUnionDestTaken(ix: i32): boolean {
+  (ulTaken[ix] ?? 0) == 1
+}
+
+// Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
+// destination beside the value. A part whose destination is a union offering only `null[]`, or
+// holds a type variable that is not the enclosing generic's own, types nothing. A speculative
+// delivery under `inferQuiet` marks too: it names a destination the real check then delivers to.
+export function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
+  if (nolLits.length == 0 && ulLitN == 0) || srcExpr < 0 || dstTy < 0 {
+    return 0
+  }
+  const todo: i32[] = [srcExpr]
+  const dsts: i32[] = [dstTy]
+  while todo.length > 0 {
+    const at = parenPeelIx(todo.pop() ?? -1)
+    const dt = dsts.pop() ?? -1
+    if at >= 0 && at < P.nodes.length && dt >= 0 {
+      nolPushParts(at, dt, todo, dsts)
+    }
+  }
+  0
+}
+
+// The value parts of node `at` a delivery into `dt` reaches, each beside its own destination: a
+// list literal's elements, an object literal's field values, and a value `if`, `match` or
+// block's tails. Marks a list literal taken when `dt` names its element type, and one that is
+// a `+` operand or a spread source as an operand.
+function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
+  const e = P.nodes[at]
+  if e is ArrayLit {
+    if nolElemOnlyNull(dt) || (tyHasTyVar(dt) && !fsbTvsInScope(dt, 0)) {
+      return 0
+    }
+    // A generic parameter's `T[]` pinned at `null` by this very literal names nothing.
+    if lbiNoDest && nolIsNullList(dt) { return 0 }
+    nolTaken[at] = true
+    if !nolIsNullList(dt) { nolTakenOther[at] = true }
+    const dn = nonNullTy(dt)
+    let elDt = dt
+    if dn >= 0 {
+      const d = T.tys[dn]
+      if d is TyArray {
+        elDt = d.aElem
+        if !inferQuiet && elDt >= 0 { ulNoteDelivery(at, elDt) }
+      }
+    }
+    for el in e.arrElems {
+      const sp = P.nodes[el]
+      if sp is Spread {
+        nolMarkOperand(sp.spdArg)
+      } else {
+        todo.push(el)
+        dsts.push(elDt)
+      }
+    }
+  } else if e is ObjLit {
+    const dn = nonNullTy(dt)
+    if dn < 0 { return 0 }
+    const d = T.tys[dn]
+    if d is TyObj {
+      for fi in e.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          todo.push(f.fiValue)
+          dsts.push(objFieldType(d, f.fiName))
+        }
+      }
+    }
+  } else if e is IfStmt || e is MatchExpr || e is Block {
+    const spine: i32[] = []
+    const leaves: i32[] = []
+    valueTailSplit(at, spine, leaves)
+    for lf in leaves {
+      if lf != at {
+        todo.push(lf)
+        dsts.push(dt)
+      }
+    }
+  } else {
+    nolOperandParts(at)
+  }
+  0
+}
+
+// Records list literal `at` delivered into a list whose element is `elDt`, for `ulTaken`.
+function ulNoteDelivery(at: i32, elDt: i32) {
+  const own = nodeTyIxOf(at)
+  if own < 0 || !(T.tys[own] is TyArray) || ulTaken[at] == 2 { return 0 }
+  const ot = T.tys[own]
+  if ot is TyArray {
+    if !(T.tys[elDt] is TyUnion) || tyHasTyVar(elDt) || tySame(ot.aElem, elDt) {
+      ulTaken[at] = 2
+    } else {
+      ulTaken[at] = 1
+    }
+  }
+  0
+}
+
+// Every other node delivers its value whole, so a destination types no list literal in it; a
+// `+` is the one whose operands still need recording, for the refusal's wording.
+function nolOperandParts(at: i32) {
+  const e = P.nodes[at]
+  if e is BinExpr && e.binOp == "+" {
+    nolMarkOperand(e.binLeft)
+    nolMarkOperand(e.binRight)
+  }
+  0
+}
+
+// Records the null-only list literal at `ix`, if it is one, as a `+` operand or spread source.
+function nolMarkOperand(ix: i32) {
+  const at = parenPeelIx(ix)
+  if at >= 0 && at < P.nodes.length && P.nodes[at] is ArrayLit {
+    nolOperand[at] = true
+  }
+  0
+}
+
+// Whether `ty`, its `null` peeled, is `null[]` itself.
+function nolIsNullList(ty: i32): boolean {
+  const dn = nonNullTy(ty)
+  if dn < 0 { return false }
+  const t = T.tys[dn]
+  if t is TyArray { return t.aElem == TY_NULL }
+  false
+}
+
+// Whether `ty` is a union that offers a list only as `null[]`. A plain `null[]` destination names
+// the element type and types the literal (D4671); a union one does not say which arm it builds.
+function nolElemOnlyNull(ty: i32): boolean {
+  const dn = nonNullTy(ty)
+  if dn < 0 { return false }
+  const t = T.tys[dn]
+  match t {
+    TyArray => false
+    TyUnion => nolMembersOnlyNull(t.uMembers)
+    // None of these is a list, so a destination of one names no element type either way.
+    TyErr | TyPrim | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyNullable | TyObj => false
+  }
+}
+
+// Whether union members `ms` hold a list, and every list among them is `null[]`.
+function nolMembersOnlyNull(ms: i32[]): boolean {
+  let seen = false
+  for m in ms {
+    const mt = T.tys[m]
+    if mt is TyArray {
+      if mt.aElem != TY_NULL { return false }
+      seen = true
+    }
+  }
+  seen
+}
+
+// D1048's second hint — `is <literal>` over an operand whose union collapsed (`string | "err"`
+// canon-collapses to `string`), which costs the discrimination the author thought they wrote:
+// `r is "err"` now asks `r == "err"`. Asks the provenance (`bindingCollapsed`), never the type —
+// the collapsed operand IS a plain `string`, so a type-based rule would fire on every legitimate use.
+export function recordCollapsedIsAt(
+  n: IsExpr,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+) {
+  if collBindName.length == 0 { return 0 }
+  if chkTy < 0 || objTy < 0 { return 0 }
+  const ct = T.tys[chkTy]
+  if !(ct is TyLit) { return 0 }
+  const on = P.nodes[n.isObj]
+  if !(on is Ident) { return 0 }
+  if !bindingCollapsed(on.identName) { return 0 }
+  recordCollapsedIs(ix, on.identName, objTy, n.isVariant)
+  0
+}
+// ── optional member `o?.field` ─────────────────────────────────────────────
+// Null-safe access: a nullable receiver reads the field off its inner type and re-wraps the
+// result nullable (`{x: i32} | null` ?. x -> `i32 | null`); a non-null receiver reads plainly.
+
+// Whether the parse holds a `break v` or a labelled block, the only sources of a loop value;
+// every loop-value check is skipped without one, so such a program pays nothing.
+export let lpOn = false
+export function lpOnSet(v: boolean) { lpOn = v }
+
+// Whether the loop at `ix` carries a value: a `break v` leaves it, or it is a labelled block
+// with a value tail. Such a loop is an expression, not a statement.
+export function loopCarriesValue(ix: i32): boolean {
+  lpOn && lpColAt(lpValTy, ix) >= 0
+}
+
+export function bindRowsReset() { lpOn = false }
