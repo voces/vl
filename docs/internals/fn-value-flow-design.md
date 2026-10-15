@@ -855,6 +855,13 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      writes come from the mono write index under `e:`. An element pinned at two signatures
      keeps the flow reads' per-call rewrite, which now re-plans a list a spread copied into.
      This closes D4301, where a call through a non-constant index pinned nothing.
+   - Seventh PR: `monoStoreAnnName` retires, with `monoLocalAnnName`, `monoInstTyName` and
+     `monoFieldAnnName`. A value stored into `p[k]` or `p.f`, pushed onto `p` or `set` into
+     map `p` is delivered at the one signature the table pins that slot at in the frame
+     (`monoPlacePinName`: the place's root declaration and its `e`/`v`/`f.<name>` path, read
+     through `monoDeclPathPins`); a slot pinned at none or two delivers nothing here, as the
+     annotation read did for a non-local root. A capture cell's read is no place root, since
+     the cell path delivers it. The concrete half of `monoNotePushDeliveries` stays.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
