@@ -12987,7 +12987,11 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
       if tIdx >= 0 && recIsFitsAcrossTags(isCur, tIdx) {
         const nn = nonNullNarrowTy(isCur)
         if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
-      } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
+      } else if (
+        tIdx >= 0
+        && recFitNarrowKeepsRep(isCur, tIdx)
+        && listFitNarrowKeepsRep(isCur, tIdx)
+      ) {
         pushNarrowFact(isPl, tIdx, names, tys)
         pushDiscrimParentFact(
           isPl,
@@ -60372,6 +60376,54 @@ export function oneListUnionRender(ty: i32): string {
   r
 }
 
+// The literal set `x is T` asks every element of a list `x` to fit (D4771): `T` is `L[]…[]`
+// over a set `L` of one literal kind, and `recvTy` is a list (or a `oneListUnionRender` union)
+// nested as deep, or -1 when unknown. Pushes the receiver's array at each depth, then its leaf
+// element (-1 each when unknown), and returns `L`; -1 for any other shape, pushing nothing.
+export function listFitLitLeafOf(testTy: i32, recvTy: i32, layers: i32[]): i32 {
+  const known = recvTy >= 0
+  let tt = testTy
+  let rt = recvTy
+  const got: i32[] = []
+  while tt >= 0 && T.tys[tt] is TyArray {
+    if known {
+      if rt >= 0 && oneListUnionRender(rt) != "" {
+        const ru = T.tys[rt]
+        if ru is TyUnion { rt = ru.uMembers[0] }
+      }
+      if rt < 0 { return -1 }
+      const ra = T.tys[rt]
+      if !(ra is TyArray) { return -1 }
+      got.push(rt)
+      rt = ra.aElem
+    } else {
+      got.push(-1)
+    }
+    const ta = T.tys[tt]
+    if ta is TyArray { tt = ta.aElem }
+  }
+  if got.length == 0 || tt < 0 || (known && rt < 0) { return -1 }
+  const members: i32[] = []
+  const lt = T.tys[tt]
+  if lt is TyUnion {
+    for m in lt.uMembers { members.push(m) }
+  } else {
+    members.push(tt)
+  }
+  let kind = ""
+  for m in members {
+    if m < 0 { return -1 }
+    const ml = T.tys[m]
+    if !(ml is TyLit) { return -1 }
+    const mk = if ml.litKind == "str" { "str" } else { "num" }
+    if kind != "" && kind != mk { return -1 }
+    kind = mk
+  }
+  for g in got { layers.push(g) }
+  layers.push(rt)
+  tt
+}
+
 // A `{tag, value}` value/struct union box: `TyUnion`, 2+ members, not a pure literal union, nor
 // a union of lists that all spell one list (`oneListUnionRender`).
 function isValueUnionBox(tyix: i32) {
@@ -72033,6 +72085,15 @@ function recFitNarrowKeepsRep(cur: i32, chk: i32): boolean {
     }
   }
   true
+}
+
+// Whether narrowing a list `cur` to `chk` keeps its storage: a string list tested against a
+// string literal set holds strings where `chk` holds atoms, so it stays `cur` (D4771).
+function listFitNarrowKeepsRep(cur: i32, chk: i32): boolean {
+  const layers: i32[] = []
+  const lit = listFitLitLeafOf(chk, nonNullTy(cur), layers)
+  if lit < 0 || tyLitMemberTexts(lit).length == 0 { return true }
+  tyLitMemberTexts(layers[layers.length - 1]).length > 0
 }
 
 // For `r is B` over a single record `r: A` (or `A | null`) where every `B` is an `A` but not

@@ -17,6 +17,7 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  listFitLitLeafOf,
   listWidenRetagAny,
   listWidenRetagRowsOf,
   litNumUnionBasesOf,
@@ -3328,6 +3329,272 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   1
 }
 
+// `xs is L[]` over a list whose elements are a wider type than the literal set `L`: true when
+// every element, at every nesting depth, is a member of `L`, so an empty list fits (D4771,
+// extending D3885). 0 when the test is not that shape, 1 when emitted, -1 when refused.
+function emitListFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return 0 }
+  if nd.isVariant == "null" || exprUnion(nd.isObj, fnIx) { return 0 }
+  // A generic receiver tests its instance's type, or only its rep where the instance names no
+  // type; a nullable one is false on null.
+  const declTy = nodeTyIxOf(nd.isObj)
+  const instTy = if declTy < 0 || tyHasTyVar(declTy) { exactOperandTyOf(nd.isObj, fnIx) } else { declTy }
+  const nullable = nodeTyIsNullable(nd.isObj)
+  const recvTy = if nullable { nonNullTy(instTy) } else { instTy }
+  const layers: i32[] = []
+  const lit = listFitLitLeafOf(isVarTyIxOf(isIx), recvTy, layers)
+  if lit < 0 { return 0 }
+  const rep = exprListRep(nd.isObj, fnIx)
+  if (
+    recvTy < 0
+    && rep != "list"
+    && rep != "i64list"
+    && rep != "strlist"
+    && rep != "reflist"
+  ) {
+    return 0
+  }
+  const depth = layers.length - 1
+  const slots: i32[] = []
+  const scalar = listFitScalarOf(nd.isObj, rep, layers, slots, isIx, fnIx)
+  if scalar == "" { return -1 }
+  const scalarKind: MfKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
+  const scalarV: VKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
+  // How an element compares with a member of `L`: at its integer base, `i64w` for an `i32`
+  // widened to `i64`, as a string, or as an atom.
+  const numBase = numLitUnionBaseName(lit)
+  const wide = tyIntLitWideTexts(lit)
+  const numLexes = if wide.length > 0 { wide } else { tyNumLitMemberTexts(lit) }
+  const lexes = if numLexes.length > 0 { numLexes } else { tyLitMemberTexts(lit) }
+  const leaf = layers[depth]
+  const leafBase = if leaf < 0 { "" } else if numLitUnionBaseName(leaf) != "" { numLitUnionBaseName(leaf) } else { tyPrimNameOf(leaf) }
+  let leafKind = ""
+  if numLexes.length > 0 {
+    if leaf >= 0 && leafBase != scalar {
+      leafKind = ""
+    } else if scalar == "i64" {
+      leafKind = "i64"
+    } else if scalar == "i32" {
+      leafKind = if numBase == "i32" { "i32" } else { "i64w" }
+    }
+  } else if scalar == "str" {
+    if leaf < 0 || leafBase == "string" { leafKind = "str" }
+  } else if scalar == "i32" {
+    if leaf < 0 || tyLitMemberTexts(leaf).length > 0 { leafKind = "atom" }
+  }
+  if leafKind == "" || lexes.length == 0 {
+    return emitFailAt(
+      "emitProgram: `is` over a list tests its elements against a literal set this element type has no compare for",
+      isIx,
+    )
+  }
+  if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+  if (
+    emitListFitLoop(
+      body,
+      slots,
+      0,
+      nullable,
+      scalarKind,
+      scalarV,
+      leafKind,
+      lexes,
+      fnIx,
+    )
+    < 0
+  ) {
+    return -1
+  }
+  1
+}
+
+// The innermost list's element rep — `i32`, `i64` or `str` — of list `recv` (rep `rep`) nested
+// as deep as `layers` says, pushing each enclosing ref list's slot onto `slots`, outermost
+// first; "" after a refusal at `isIx` when the rep does not nest that way or disagrees with a
+// known type in `layers`.
+function listFitScalarOf(
+  recv: i32,
+  rep: VKind | null,
+  layers: i32[],
+  slots: i32[],
+  isIx: i32,
+  fnIx: i32,
+): string {
+  const depth = layers.length - 1
+  if depth == 1 {
+    if rep == "list" { return "i32" }
+    if rep == "i64list" { return "i64" }
+    if rep == "strlist" { return "str" }
+    emitFailAt(LIST_FIT_REP_MSG, isIx)
+    return ""
+  }
+  if rep != "reflist" { return listFitRepMiss(isIx) }
+  let s = refListSlotOfExpr(recv, fnIx)
+  let k = 1
+  while k < depth {
+    if s < 0 || s >= rlElemKindTbl.length || s >= rlElemNullable.length {
+      return listFitRepMiss(isIx)
+    }
+    if rlElemNullable[s] != 0 { return listFitRepMiss(isIx) }
+    if layers[k] >= 0 && rlSlotOfTy(layers[k]) != s {
+      return listFitRepMiss(isIx)
+    }
+    slots.push(s)
+    const ek = rlElemKindTbl[s]
+    if k < depth - 1 {
+      if ek != RLK_REF_LIST { return listFitRepMiss(isIx) }
+      s = rlElemInnerSlot(s)
+    } else {
+      if ek == RLK_I32_LIST { return "i32" }
+      if ek == RLK_I64_LIST { return "i64" }
+      if ek == RLK_STR_LIST { return "str" }
+      return listFitRepMiss(isIx)
+    }
+    k = k + 1
+  }
+  listFitRepMiss(isIx)
+}
+
+const LIST_FIT_REP_MSG = "emitProgram: `is` over a list tests its elements, and this list's rep is not the one its type names"
+
+// Refuses the fit test at `isIx` for a list rep it cannot walk, answering "".
+function listFitRepMiss(isIx: i32): string {
+  emitFailAt(LIST_FIT_REP_MSG, isIx)
+  ""
+}
+
+// The fit loop over the list on the stack at nesting `at`: `slots[at]`'s ref list while `at`
+// is inside `slots`, else the `scalarKind` list. Leaves 1 when every element fits, else 0.
+// A `nullable` list leaves 0 when it is null.
+function emitListFitLoop(
+  body: u8[],
+  slots: i32[],
+  at: i32,
+  nullable: boolean,
+  scalarKind: MfKind,
+  scalarV: VKind,
+  leafKind: string,
+  lexes: string[],
+  fnIx: i32,
+): i32 {
+  const inner = at < slots.length
+  const kind: MfKind = if inner { "ref" } else { scalarKind }
+  const slot = if inner { slots[at] } else { 0 }
+  const wrapTy = if inner { rlWrapIdx[slot] } else { scalarListWrap(scalarV) }
+  const backTy = if inner { rlBackIdx[slot] } else { scalarListBack(scalarV) }
+  const wL = listFitSlot(kind, slot, 11)
+  const bL = listFitSlot(kind, slot, 3)
+  const nL = listFitSlot("i32", 0, 4)
+  const iL = listFitSlot("i32", 0, 4)
+  fbLocalSet(wL)
+  if nullable {
+    fbLocalGet(wL)
+    fbRefIsNull()
+    fbIf(127)
+    fbI32Const(0)
+    fbElse()
+  }
+  fbLocalGet(wL)
+  fbStructGet(wrapTy, 0)
+  fbLocalSet(bL)
+  fbLocalGet(wL)
+  fbStructGet(wrapTy, 1)
+  fbLocalSet(nL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block (result i32) { loop { 1 if i >= n; 0 unless element i fits; i += 1 } }
+  fbBlock(127)
+  fbLoop(64)
+  fbI32Const(1)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbDrop()
+  fbI32Const(0)
+  fbLocalGet(bL)
+  fbLocalGet(iL)
+  fbArrayGet(backTy)
+  if inner {
+    if (
+      emitListFitLoop(
+        body,
+        slots,
+        at + 1,
+        false,
+        scalarKind,
+        scalarV,
+        leafKind,
+        lexes,
+        fnIx,
+      )
+      < 0
+    ) {
+      return -1
+    }
+  } else if emitListFitElem(body, scalarKind, leafKind, lexes, fnIx) < 0 {
+    return -1
+  }
+  fbI32Eqz()
+  fbBrIf(1)
+  fbDrop()
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbUnreachable()
+  fbEnd()
+  if nullable { fbEnd() }
+  0
+}
+
+// Whether the scalar element on the stack is a member of `lexes`, leaving 0/1.
+function emitListFitElem(
+  body: u8[],
+  scalarKind: MfKind,
+  leafKind: string,
+  lexes: string[],
+  fnIx: i32,
+): i32 {
+  const eL = listFitSlot(scalarKind, 0, 2)
+  fbLocalSet(eL)
+  let i = 0
+  while i < lexes.length {
+    fbLocalGet(eL)
+    if leafKind == "str" {
+      fbRefAsNonNull()
+      if emitStrEqLit(body, mkStr(quoteLex(lexes[i]), -1), fnIx) < 0 {
+        return -1
+      }
+    } else if leafKind == "atom" {
+      fbI32Const(internAtom(quoteLex(lexes[i])))
+      fbI32Bin(70) // 0x46 i32.eq
+    } else if leafKind == "i64w" {
+      fbI64ExtendI32S()
+      emitNumLitConstEq("i64", lexes[i])
+    } else {
+      emitNumLitConstEq(leafKind, lexes[i])
+    }
+    if i > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A fresh lazy-frame slot of `liBack` code `code` for frame kind `kind` (ref-list row `slot`):
+// never shared, so a nested fit loop keeps its own.
+function listFitSlot(kind: MfKind, slot: i32, code: i32): i32 {
+  liKinds.push(kind)
+  liSlots.push(slot)
+  liBack.push(code)
+  listIdxScratchBase + liKinds.length
+}
+
 // One read of the record-fit receiver: the stash cast back to `heap` (left uncast when `heap`
 // is -1, for the null test) when `staged`, else the receiver expression itself.
 function emitRecordFitRecv(
@@ -3577,6 +3844,8 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   }
   const rfit = emitRecordFitIs(body, isIx, fnIx)
   if rfit != 0 { return if rfit < 0 { -1 } else { 0 } }
+  const lfit = emitListFitIs(body, isIx, fnIx)
+  if lfit != 0 { return if lfit < 0 { -1 } else { 0 } }
   if nd0 is IsExpr {
     const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
     if imk >= 0 {
