@@ -21335,7 +21335,11 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   if dn is TyNullable { dt = dn.nInner }
   // At a concrete destination a nested generic is the function-value adapter's to check, which
   // reports the same demand as its reason.
-  if dt < 0 || tyHasTyVar(dt) != nested { return 0 }
+  const open = tyHasTyVar(dt)
+  if dt < 0 || (nested && !open) { return 0 }
+  // A generic declared elsewhere is deferred only to the generic whose body is being checked,
+  // so every type variable of the destination must be that generic's.
+  if !nested && open && !tyVarsOfEnclosingGeneric(dt) { return 0 }
   const s = T.tys[st]
   const d = T.tys[dt]
   if !(s is TyFunc) || !(d is TyFunc) { return 0 }
@@ -21355,11 +21359,18 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   const noArgs: i32[] = []
   const modeWas = substNestMode
   const declWas = substNestDecl
+  const strictWas = cstrOwnedStrict
   let owner = decl
   if nested {
     owner = CSTR_NODECL
     substNestMode = SUBST_NESTED
     substNestDecl = decl
+  } else if open {
+    // A destination typed by the enclosing generic's parameters defers what it cannot decide to
+    // that generic, as a direct call in its body does; only the delivered function's own
+    // constraints are re-asked (D3923).
+    substNestMode = SUBST_DECLARED
+    cstrOwnedStrict = true
   }
   pinBmCstrElems(bNames, bTys, srcExpr, owner, noArgs)
   validateBinCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
@@ -21371,6 +21382,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   validateBmCstrs(bNames, bTys, srcExpr, owner, who)
   validateMemCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
   validateUfcsCstrs(bNames, bTys, srcExpr, owner, who)
+  cstrOwnedStrict = strictWas
   substNestMode = modeWas
   substNestDecl = declWas
   0
@@ -37200,6 +37212,14 @@ function argIsOwnGenericFnValue(argIx: i32): boolean {
   false
 }
 
+// Is argument `argIx`, parentheses peeled, a list or object literal?
+function argIsLitAggregate(argIx: i32): boolean {
+  const ax = cwPeel(argIx)
+  if ax < 0 || ax >= P.nodes.length { return false }
+  const a = P.nodes[ax]
+  a is ArrayLit || a is ObjLit
+}
+
 // `params` without its first entry: a member call's argument list starts after `self`.
 function paramsAfterFirstTy(params: i32[]): i32[] {
   const out: i32[] = []
@@ -42654,6 +42674,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     dstBindLitTyParams(ix, ft.fnRet, params, args, bNames, bTys, dstNames)
   }
   const argOrder = lambdaLastOrder(params, args)
+  // Each argument's destination as its own turn saw it, for the literals re-delivered below.
+  const argExp: i32[] = []
+  while argExp.length < args.length { argExp.push(-1) }
   let oi = 0
   while oi < argOrder.length {
     const i = argOrder[oi]
@@ -42687,6 +42710,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     bindGenWalk(params[i], at, bNames, bTys)
     bindGenUnionArm(params[i], at, uNames, uTys)
     const expected = substTyDeep(params[i], bNames, bTys)
+    argExp[i] = expected
     // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
     // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
     // `assignable` answers true vacuously — needing its own message here, or the
@@ -42803,6 +42827,24 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       }
     }
     oi = oi + 1
+  }
+  // A list or record literal holding a generic function, met before a later argument bound the
+  // type parameter its element type rides, is delivered again at the bound type (D3923).
+  if !inferQuiet {
+    let li = 0
+    while li < args.length && li < params.length {
+      if (
+        argExp[li] >= 0
+        && tyHasTyVar(argExp[li])
+        && argIsLitAggregate(args[li])
+      ) {
+        const fin = substTyDeep(params[li], bNames, bTys)
+        if fin != argExp[li] {
+          genFnValueCstrs(args[li], nodeTyOf(args[li]), fin)
+        }
+      }
+      li = li + 1
+    }
   }
   if dstNames.length > 0 && !inferQuiet {
     dstRetypeLitArgs(dstNames, params, args, bNames, bTys)
@@ -52611,6 +52653,62 @@ function tyHasTyVarAt(ty: i32, depth: i32) {
     return false
   }
   false
+}
+
+// Whether every type variable in `ty` belongs to the named generic whose body is being checked.
+function tyVarsOfEnclosingGeneric(ty: i32): boolean {
+  if curFnEscName == "" { return false }
+  let d = fnDeclIx[curFnEscName] ?? -1
+  if d < 0 { d = lookupFnDeclNode(curFnEscName) }
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
+  tyVarsOwnedBy(ty, curFnEscName, fd.fnTyParams, 64)
+}
+
+// Whether every type variable in `ty` is one function `owner` declared: recorded as its, or
+// unrecorded and named in its type parameters `names`. A type too deep to walk answers false.
+function tyVarsOwnedBy(
+  ty: i32,
+  owner: string,
+  names: string[],
+  depth: i32,
+): boolean {
+  if ty < 0 || ty >= T.tys.length { return true }
+  if depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyVar {
+    const o = tyVarOwnerOf(ty)
+    return o == owner || (o == "" && strListHas(names, t.tvName))
+  }
+  if t is TyArray { return tyVarsOwnedBy(t.aElem, owner, names, depth - 1) }
+  if t is TyNullable { return tyVarsOwnedBy(t.nInner, owner, names, depth - 1) }
+  if t is TyNeg { return tyVarsOwnedBy(t.negTy, owner, names, depth - 1) }
+  if t is TyMap {
+    return tyVarsOwnedBy(t.mKey, owner, names, depth - 1)
+      && tyVarsOwnedBy(t.mVal, owner, names, depth - 1)
+  }
+  if t is TyObj { return tysOwnedBy(t.objFieldTypes, owner, names, depth - 1) }
+  if t is TyFunc {
+    return tysOwnedBy(t.fnParamTypes, owner, names, depth - 1)
+      && tyVarsOwnedBy(t.fnRet, owner, names, depth - 1)
+  }
+  if t is TyUnion { return tysOwnedBy(t.uMembers, owner, names, depth - 1) }
+  // Every other kind holds a type variable only if `tyHasTyVarGo` finds one.
+  !tyHasTyVarGo(ty, depth)
+}
+
+// `tyVarsOwnedBy` over each of `tys`.
+function tysOwnedBy(
+  tys: i32[],
+  owner: string,
+  names: string[],
+  depth: i32,
+): boolean {
+  for t in tys {
+    if !tyVarsOwnedBy(t, owner, names, depth) { return false }
+  }
+  true
 }
 
 // The function a call runs through when its callee's pin is `ty`: `ty` itself, or the function

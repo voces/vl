@@ -1015,6 +1015,35 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
 7. **Checker refusal.** The checker re-checks each source at its class's pins and refuses
    an ill-typed delivery with both positions named (D4010, D3975, D3923). This step depends
    only on step 1, so it can move ahead of step 3.
+   - First PR: a generic delivered at the enclosing generic's own type parameters defers to
+     that generic (D3923).
+     - `genFnValueCstrsAt` used to skip any destination with an open type outside a nested
+       check. When every type variable of the destination belongs to the generic whose body
+       is being checked (`tyVarsOfEnclosingGeneric`: owned by it, or unowned and named in its
+       type parameters), the delivered function's constraints are now deferred to that
+       generic, as a direct call in its body is, and re-asked at each of its calls. Only the
+       delivered function's own constraints are re-asked (`cstrOwnedStrict`, as
+       `fsbRecheckOne` does).
+     - In `checkCallOnFuncTy`, a list or record literal argument whose expected type was
+       open is re-delivered at the call's final substitution, so `g([len])` reaches the same
+       deferral as `const f: … = len`.
+     - Ablations, one ingredient removed at a time. Without the strict owner,
+       `generic-function-stored-through-parameter-inferred-local-and-map` stops running:
+       ownerless constraints of another generic are re-asked. Without the enclosing-generic
+       gate, four error fixtures gain a cascade (`k = plus` delivers `plus` at another
+       generic's `(U) => void` inside `main`). Without the unowned-name fallback, the type
+       variables of a local annotation are not recognised and two positions stay invalid
+       wasm. Without the re-delivery, the list-literal positions stay invalid wasm.
+     - 0 of 3,750 `@run` fixtures move. Of 1,123 others, only the new
+       `error-generic-fn-value-at-enclosing-type-param` moves (invalid wasm on master to five
+       check errors). 1 of 10,218 modules differs: that fixture. The five `rv3487` positions
+       (q03, q11–q14) go from invalid wasm to check reject, and the 68 `rv3531` witnesses and
+       the ten fn-value matrices do not move.
+     - The refusal names the pin (`a(7)`: `a` prints its type parameter here), not both
+       positions. Naming the delivery as well is still owed.
+     - Not in this PR: D3975 is a source pinned at two types, so it is step 8's. D4010 was
+       already closed. The (c) literal stays blocked: the shadow histogram still shows
+       undecided and disagreeing kinds in fixtures that run.
 8. **The multi-pin decision** (§(g)): either the instance record or a named refusal.
 
 Steps 2–5 can each be reverted on their own, because the table runs beside the code it
