@@ -1,10 +1,10 @@
 // THE OWNER-FACING READING: `compiler/typecheck.vl` opened in the editor.
 //
-// On master the extension published 213 Problems for that file — 155
-// `kind-ladder-incomplete`, 44 `sentinel-index-unguarded`, 14
-// `arena-scan-outside-pass` — every one of them debt the committed ratchets already
-// hold at or above the file's count. This drives the REAL lint over the REAL file
-// against the REAL baselines, so the number cannot be asserted from a recording.
+// Every `kind-ladder-incomplete`, `sentinel-index-unguarded` and
+// `arena-scan-outside-pass` finding in that file is debt the committed ratchets already
+// hold at or above the file's count, so the editor must publish none of them. This
+// drives the REAL lint over the REAL file against the REAL baselines, so the number
+// cannot be asserted from a recording.
 //
 // Seed-backed, and named `vl_*` so ci-native's glob runs it (see
 // tests/ci_seed_coverage_test.ts).
@@ -59,9 +59,10 @@ Deno.test({
     invalidateRatchetBaselines();
     const { diags } = await rawFindings();
     const held = diags.filter((d) => HELD_CODES.includes(String(d.code)));
-    if (held.length < 100) {
+    // Non-vacuity only: the typecheck.vl carves move findings out, so no size floor.
+    if (held.length === 0) {
       throw new Error(
-        `the premise of this test is that the file carries a large held backlog; ` +
+        `the premise of this test is that the file carries a held backlog; ` +
           `got only ${held.length} findings for ${HELD_CODES.join(", ")}`,
       );
     }
