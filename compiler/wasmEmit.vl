@@ -4305,7 +4305,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     i = i + 1
   }
   if empties {
-    return emitListIsRebox(nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
+    return emitListIsRebox(body, nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
   }
   1
 }
@@ -4363,9 +4363,11 @@ function listArmWrapOfTy(a: i32): i32 {
 }
 
 // With an `is L` answer on the stack, re-boxes receiver `recv` (staged in `slot`) as an empty
-// `L` when it fitted as an empty list of another arm, so the narrowed branch reads an `L`
-// payload when `recv` is a binding it can store back to.
+// `L` when it fitted as an empty list of another arm, and stores the box back into `recv`, so
+// the narrowed branch reads and writes an `L` (D4949). The place takes a new list rather than
+// the old one changing rep: a reference typed as the other arm must never hold an `L` element.
 function emitListIsRebox(
+  body: u8[],
   recv: i32,
   slot: i32,
   chk: i32,
@@ -4376,20 +4378,9 @@ function emitListIsRebox(
 ): i32 {
   const chkWrap = listArmWrapOfTy(chk)
   const chkBack = if chkWrap < 0 { -1 } else { listBackOfWrap(chkWrap) }
-  const rn = P.nodes[recv]
-  let local = -1
-  let glob = -1
-  if rn is Ident {
-    const li = localIndexOf(fnIx, rn.identName)
-    if li >= 0 && identSlotIsUnionBox(fnIx, rn.identName) { local = li }
-    if li < 0 && !capturedIsUnionBox(fnIx, rn.identName) {
-      const g = globalIndexOf(rn.identName)
-      if g >= 0 && !globalCellIsImmutable(g) { glob = g }
-    }
-  }
-  // A capture, field or element is not stored back, so its narrowed read of such an empty list
-  // traps on the cast (D4939) where the tag alone took the wrong branch.
-  if chkBack < 0 || (local < 0 && glob < 0) { return 1 }
+  const st = listIsStoreBackOf(recv, fnIx)
+  // A place with no store-back reads an empty `L` stand-in, and a push into it traps (D4939).
+  if chkBack < 0 || st.kind == LIS_NONE { return 1 }
   const res = listFitSlot("i32", 0, 4)
   fbLocalTee(res)
   fbIf(64)
@@ -4407,18 +4398,82 @@ function emitListIsRebox(
     i = i + 1
   }
   fbIf(64)
+  if st.obj >= 0 && emitExpr(body, st.obj, fnIx) < 0 { return -1 }
+  if st.kind == LIS_ELEM {
+    fbStructGet(rlWrapIdx[st.at], 0) // the backing; the read just made proved the index
+    if emitExpr(body, st.idx, fnIx) < 0 { return -1 }
+  }
   fbI32Const(chkTag)
   fbBacking(chkBack, 0)
   fbI32Const(0)
   fbI32Const(0)
   fbStructNew(chkWrap)
   fbStructNew(uBoxIdx)
-  if local >= 0 { fbLocalSet(local) }
-  else if emitUserGlobalSet(glob) < 0 { return -1 }
+  if st.kind == LIS_LOCAL {
+    fbLocalSet(st.at)
+  } else if st.kind == LIS_GLOBAL {
+    if emitUserGlobalSet(st.at) < 0 { return -1 }
+  } else if st.kind == LIS_FIELD {
+    fbStructSet(sHeapIdx[st.at], st.field)
+  } else {
+    fbArraySet(rlBackIdx[st.at])
+  }
   fbEnd()
   fbEnd()
   fbLocalGet(res)
   1
+}
+
+// Where `emitListIsRebox` stores its box: nowhere, a local, a mutable global, a field of a
+// record row, or an element of a list of boxes.
+const LIS_NONE = 0
+const LIS_LOCAL = 1
+const LIS_GLOBAL = 2
+const LIS_FIELD = 3
+const LIS_ELEM = 4
+type ListIsStore = { kind: i32, at: i32, field: i32, obj: i32, idx: i32 }
+
+function listIsStore(
+  kind: i32,
+  at: i32,
+  field: i32,
+  obj: i32,
+  idx: i32,
+): ListIsStore {
+  { kind: kind, at: at, field: field, obj: obj, idx: idx }
+}
+
+// The store-back `emitListIsRebox` can make into `recv`: `at` is the local, global, struct row
+// or ref-list slot, `field` the struct field, `obj` and `idx` the container and index to
+// re-evaluate. A capture `captureBoxRewrite` turned into a cell arrives as that cell's element.
+function listIsStoreBackOf(recv: i32, fnIx: i32): ListIsStore {
+  const rn = P.nodes[unwrapParen(recv)]
+  if rn is Ident {
+    const li = localIndexOf(fnIx, rn.identName)
+    if li >= 0 && identSlotIsUnionBox(fnIx, rn.identName) {
+      return listIsStore(LIS_LOCAL, li, -1, -1, -1)
+    }
+    const g = if li >= 0 || capturedIsUnionBox(fnIx, rn.identName) { -1 } else { globalIndexOf(rn.identName) }
+    if g >= 0 && !globalCellIsImmutable(g) {
+      return listIsStore(LIS_GLOBAL, g, -1, -1, -1)
+    }
+  } else if placeNarrowKeyOf(recv) != "" {
+    // Only a place the narrowing names is re-read, so re-evaluating its path has no effect.
+    if rn is Member {
+      const si = structIndexOfExpr(rn.memObj, fnIx)
+      const fi = if si < 0 || si >= sHeapIdx.length { -1 } else { sFieldIndex(si, rn.memProp) }
+      if fi >= 0 && sFieldTypeAt(si, fi) == FC_UNION {
+        return listIsStore(LIS_FIELD, si, fi, rn.memObj, -1)
+      }
+    } else if rn is Index {
+      const rs = if exprMap(rn.idxArr, fnIx) || !exprRefArray(rn.idxArr, fnIx) { -1 } else { refListSlotOfExpr(rn.idxArr, fnIx) }
+      if rs >= 0 && rs < rlWrapIdx.length && rlElemKindTbl[rs] == RLK_UNION {
+        return listIsStore(LIS_ELEM, rs, -1, rn.idxArr, rn.idxIndex)
+      }
+    }
+  }
+  // Any other operand, or a place whose storage is not a union box, keeps no store.
+  listIsStore(LIS_NONE, -1, -1, -1, -1)
 }
 
 // `recv is X` over an operand read at the rep the narrowing stack leaves it. Fixed,
