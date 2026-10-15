@@ -481,3 +481,80 @@ Deno.test({
     }
   },
 });
+
+// The compiler's decision (`optInlineDecide`, rung R6b) of which fields to inline and why the
+// others stay references is the one the host rewrites by under `vl` and `both`; `both` fails a
+// build where the host decides otherwise. `$VL_INLINE_FAULT=2`, which refuses every field, is
+// the control that the decision is consulted.
+Deno.test({
+  name:
+    "native-release: the compiler's inline-record decision agrees with the host's",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    const explain = (err: string) =>
+      err.split("\n").filter((l) => l.startsWith("inline-explain: ")).join(
+        "\n",
+      );
+    try {
+      const build = (spec: string, env: Record<string, string>) => {
+        const [fx, ...flags] = spec.split(" ");
+        return vl(
+          ["build", `${DIR}/${fx}.vl`, "-O", ...flags, "-o", `${tmp}/out.wasm`],
+          { VL_INLINE_EXPLAIN: "1", ...env },
+        );
+      };
+      const specs = [
+        "stored-fields",
+        "kept-written",
+        "kept-nullable",
+        "kept-export",
+        "proof-rows",
+        "stable-export-union-record",
+        "stable-export-union-record --stable-layout",
+      ];
+      for (const spec of specs) {
+        for (const rebox of ["0", "1"]) {
+          const env = { VL_INLINE_REBOX: rebox };
+          const host = await build(spec, { ...env, VL_OPT_INLINE: "rust" });
+          const both = await build(spec, { ...env, VL_OPT_INLINE: "both" });
+          if (
+            host.code !== 0 || both.code !== 0 ||
+            explain(host.err) !== explain(both.err)
+          ) {
+            throw new Error(
+              `${spec} (VL_INLINE_REBOX=${rebox}): want both sides to agree\n  host ` +
+                `${host.code}: ${host.err.trim()}\n  both ${both.code}: ${both.err.trim()}`,
+            );
+          }
+        }
+      }
+      const faulted = await build("stored-fields", {
+        VL_OPT_INLINE: "vl",
+        VL_INLINE_FAULT: "2",
+      });
+      if (
+        faulted.code !== 0 || /: inlined;/.test(faulted.err) ||
+        !/not inlined: refused by \$VL_INLINE_FAULT/.test(faulted.err)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT=2 under vl: want every field refused, got: ${faulted.err.trim()}`,
+        );
+      }
+      const caught = await build("stored-fields", {
+        VL_OPT_INLINE: "both",
+        VL_INLINE_FAULT: "2",
+      });
+      if (
+        caught.code === 0 ||
+        !/decision differs between the host and the compiler/.test(caught.err)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT=2 under both: want the build refused, got ${caught.code}: ${caught.err.trim()}`,
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});

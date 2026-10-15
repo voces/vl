@@ -535,7 +535,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   modKeyAtCharAt: "output", modKeyAtLen: "output", modKeyCount: "output",
   modPendingAt: "output", modPendingCount: "output", modPendingLen: "output",
   modReset: "input", modSrc: "input", optEscapeChoose: "input",
-  optEscapeRestore: "input", optInLoad: "input", optInline: "input", optMultivalue: "input",
+  optEscapeRestore: "input", optInLoad: "input", optInline: "input", optInlineDecide: "input", optMultivalue: "input",
   optMultivalueExplain: "input", optMultivalueMoves: "input",
   optMultivalueScalarized: "input", optInReset: "input", optOut: "output",
   optRoundTrip: "input", optRungArgv: "input", optRungScan: "input", optStripSrc: "input",

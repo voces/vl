@@ -41,6 +41,8 @@ type Fixture = {
   split: number[];
   /** A substring the ONE message of its code must contain. */
   says?: { code: string; text: string };
+  /** Sibling modules written beside the fixture before it is graded. */
+  deps?: { name: string; src: string }[];
 };
 
 // Every fixture dispatches on a `string` against `VKind` members, so it needs no type
@@ -331,6 +333,44 @@ print(fieldPrimLadder(c))
     split: [],
     says: { code: INCOMPLETE, text: "PrimName" },
   },
+  {
+    // A default handing the rest to an IMPORTED function delegates as much as one calling a
+    // function of its own module, under the import's own name or an `as` alias — moving a
+    // callee to another module (the L9 carves) must not turn its callers into hits. An
+    // imported table read is not a call, so the third ladder still fires.
+    name: "imported.vl",
+    deps: [{
+      name: "imported_owner.vl",
+      src: `export function owner(k: string): i32 { k.length }
+export const table: i32[] = [1]
+`,
+    }],
+    src: `import { owner, owner as handOff, table } from "./imported_owner"
+
+function viaImport(k: string): i32 {
+  if k == "nulbool" { return 1 }
+  if k == "f64list" { return 2 }
+  if k == "u8list" { return 3 }
+  owner(k)
+}
+
+function viaAlias(k: string): i32 {
+  if k == "nulmap" { return 1 }
+  if k == "nulvariant" { return 2 }
+  handOff(k)
+}
+
+function stillHoled(k: string): i32 {
+  if k == "strlist" { return 1 }
+  if k == "reflist" { return 2 }
+  table[0]
+}
+
+print(viaImport("x") + viaAlias("x") + stillHoled("x"))
+`,
+    incomplete: [17],
+    split: [],
+  },
 ];
 
 type Hits = { lines: Record<string, number[]>; msgs: Record<string, string[]> };
@@ -377,6 +417,9 @@ Deno.test({
 
     for (const f of FIXTURES) {
       const path = `${dir}/compiler/${f.name}`;
+      for (const d of f.deps ?? []) {
+        await Deno.writeTextFile(`${dir}/compiler/${d.name}`, d.src);
+      }
       await Deno.writeTextFile(path, f.src);
       const l = await lint(dir, f.name);
 
