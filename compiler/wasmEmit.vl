@@ -47,10 +47,7 @@ import {
   mapUnboxTyOf,
   matchConstPatLitAt,
   matchScrutAt,
-  nodeHasWideStrLit,
   nodeTyProvesNonNull,
-  nodeUnwidenedTyOf,
-  nodeWideStrLitText,
   nominalStructNameOfTy,
   numPairOpTy,
   recArmPartialFields,
@@ -62,12 +59,19 @@ import {
   valueTailLeaves,
   widenRetagRowsOf,
 } from "./typecheck"
+import {
+  nodeHasWideStrLit,
+  nodeUnwidenedTyOf,
+  nodeWideStrLitText,
+} from "./check_wide_lits"
 import { covarRootFreshLocal, covarValueWriteState } from "./check_covar_write"
 import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
 import {
+  listArmFitAcrossReps,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   primNameStr,
+  tyArrayElemIx,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -576,6 +580,7 @@ import {
   unionAsSlot,
   unionSinkBase,
   variantReboxSlot,
+  vbAtomListUsed,
   vbBoolListTop,
 } from "./emit_state"
 import {
@@ -744,6 +749,7 @@ import {
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
+  atomListArmTag,
   atomNarrowOp,
   bcSpineEnter,
   bcSpineLeave,
@@ -1175,6 +1181,7 @@ import {
   twoListUseMsg,
   tyAnnRefListKind,
   tyAnnRefListSlot,
+  tyIsAtomLeafList,
   tyIsUnionMemberOf,
   tyIsUnionShaped,
   tyMentionsSet,
@@ -2696,6 +2703,9 @@ function isArmTagOfTy(ity: i32): i32 {
   let ak = unMemAtomKind(ity)
 
   if ak == 11 { return cloArmTagOfTy(ity) }
+  if ak == 7 && vbAtomListUsed && tyIsAtomLeafList(ity) {
+    return atomListArmTag()
+  }
   if ak == 17 { return boolListArmTag(0) }
   if ak == 18 {
     if vbBoolListTop < 0 { return -1 }
@@ -4166,6 +4176,77 @@ function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
   placeNarrowKeyOf(recvIx)
 }
 
+// `x is L` for a list type `L` over a box union with a list arm that keeps its elements in
+// another rep yet may fit `L` (`string[]` beside a list of string literals): `L`'s own tag, or
+// each such arm's tag with its elements tested where they need not all fit (D4779). 0 when the
+// test is not that shape, 1 when emitted, -1 when refused.
+function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return 0 }
+  if nd.isVariant == "null" || !exprUnion(nd.isObj, fnIx) { return 0 }
+  if nodeTyIsNullable(nd.isObj) { return 0 }
+  const chk = isVarTyIxOf(isIx)
+  const nm = unionNameOfExpr(nd.isObj, fnIx)
+  if tyArrayElemIx(chk) < 0 || nm == "" { return 0 }
+  const atoms: string[] = []
+  const arms: i32[] = []
+  if !unionSetArmTys(nm, atoms, arms) { return 0 }
+  const tags: i32[] = []
+  const fits: i32[] = []
+  let across = false
+  for a in arms {
+    const own = tySame(a, chk)
+    const k = if own { 1 } else { listArmFitAcrossReps(a, chk) }
+    if k != 0 {
+      const t = isArmTagOfTy(a)
+      if t < 0 { return 0 }
+      tags.push(t)
+      fits.push(k)
+      if !own { across = true }
+    }
+  }
+  if !across { return 0 }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+  fbLocalSet(slot)
+  const lexes = tyLitMemberTexts(tyArrayElemIx(chk))
+  const noSlots: i32[] = []
+  fbI32Const(0)
+  let i = 0
+  while i < tags.length {
+    fbLocalGet(slot)
+    fbRefAsNonNull()
+    fbStructGet(uBoxIdx, 0)
+    fbI32Const(tags[i])
+    fbI32Bin(70) // 0x46 i32.eq
+    if fits[i] == 2 {
+      fbIf(127)
+      fbLocalGet(slot)
+      fbRefAsNonNull()
+      fbStructGet(uBoxIdx, 1)
+      if emitUnionPayloadUnbox(body, 9) < 0 { return -1 }
+      const fit = emitListFitLoop(
+        body,
+        noSlots,
+        0,
+        false,
+        "str",
+        "str",
+        "str",
+        lexes,
+        fnIx,
+      )
+      if fit < 0 { return -1 }
+      fbElse()
+      fbI32Const(0)
+      fbEnd()
+    }
+    fbI32Bin(114) // 0x72 i32.or
+    i = i + 1
+  }
+  1
+}
+
 // `recv is X` over an operand read at the rep the narrowing stack leaves it. Fixed,
 // load-bearing arm order: niche null tests, atom/literal-union membership, box-tag compares,
 // mono-static folds, then the variant tag+discriminant compare. A niche `is` assumes the checker
@@ -4189,6 +4270,8 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   if rfit != 0 { return if rfit < 0 { -1 } else { 0 } }
   const lfit = emitListFitIs(body, isIx, fnIx)
   if lfit != 0 { return if lfit < 0 { -1 } else { 0 } }
+  const lxr = emitListIsAcrossReps(body, isIx, fnIx)
+  if lxr != 0 { return if lxr < 0 { -1 } else { 0 } }
   if nd0 is IsExpr {
     const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
     if imk >= 0 {
@@ -6635,7 +6718,11 @@ function emitUnionCoerceUnder(
   // tag is emitted, and the box TAG, the rides-the-anyref test and the scalar value
   // box below are all projections of it (`scalarTagOf` / `atomIsRefKind` /
   // `vbHeapIdxOfAtom` each re-derived it from the spelling).
-  fbI32Const(scalarTagOfKind(cak))
+  if cak == 7 && vbAtomListUsed && exprIsAtomList(bareIx, fnIx) {
+    fbI32Const(atomListArmTag())
+  } else {
+    fbI32Const(scalarTagOfKind(cak))
+  }
   if cak == 3 {
     if emitExprAsI64(body, exprIx, fnIx) < 0 { return -1 }
   } else if cak == 4 {

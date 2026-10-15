@@ -10279,8 +10279,44 @@ elements do.
 
 **What it keeps.** A `string[]` tested against a string literal set does not narrow to
 `S[]` in the then-branch, because strings and atoms are stored differently; the same reason
-D4058 keeps a record's declared type. A box union's list arm is still tested by its tag
-(D4778, D4779).
+D4058 keeps a record's declared type. A box union's list arm is tested by its tag only where
+the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests its elements,
+and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
+string-literal atoms beside an `i32[]` arm holds its own tag (D4906). `is K[]` with a numeric
+`K` over a union with no `K[]` arm is still refused (D4778).
+
+## A reassigned function binding called at several types holds one closure per type (owner ruling, 2026-10-15) — D3975
+
+**The rule.** A written function binding called at more than one argument type compiles.
+Its rep is an instance record with one closure slot per call type: a write such as `f = k`
+fills every slot, and each call reads its own slot.
+
+```vl
+function id<T>(x: T): T { return x }
+function k<T>(x: T): T { return x }
+let f = id
+f = k
+print(f(1))     // 1
+print(f("s"))   // s
+```
+
+**Delivery is by value.** Where the binding goes to a place that holds one plain function
+(a list element of `((x: i32) => i32)[]`, a parameter, a field, a return, a `push`, a map
+value, an annotated `let`), the compiler stores the instance at the destination's type. A
+later write to `f` does not reach the stored value. A destination with no fixed function
+type (an un-annotated list, an inferred return) has no instance to pick and keeps the emit
+refusal.
+
+**Cost.** Only a binding that is both reassigned and called at two or more types changes
+rep. Every other call, plain or generic, compiles byte-identically; the difftree
+`--identity` proof differs only on programs master refused.
+
+**`==`.** Every `==`/`!=` read of the binding reads one slot, so equality compares the
+function the binding holds, as it does for a plain function binding; the record itself is
+never compared. Of the three options (compare the held function, compare slot by slot,
+refuse `==` on such a binding) this is the conservative one, and the other two stay open.
+A15's line that `==` on two functions is a check error does not describe the compiler:
+`==` on two function bindings compiles and compares the function held.
 
 ## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
 

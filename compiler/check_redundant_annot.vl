@@ -1,0 +1,236 @@
+// The redundant-annotation hint: `recordRedundantAnnot` records `let x: T = init` when the
+// initializer's own type is already `T` and nothing the annotation supplies built it, with the
+// span `check --fix` deletes. Its "typed by the annotation" tests read the adopted records
+// (`check_rec_adopt_rows.vl`), the joins typed by their destination and the widened literals;
+// `inlayHole` is the hole test the inlay hints share. It owns no table; the checker calls it.
+import {
+  ArrayLit,
+  AsExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  NullLit,
+  ObjLit,
+  P,
+  Param,
+  StrLit,
+  annTsWrittenOf,
+  declExported,
+  declNameTokOf,
+  tsWritesParamNames,
+} from "./ast"
+import { nodeTyOf } from "./check_node_tys"
+import { recAdAdoptedCall } from "./check_rec_adopt_rows"
+import {
+  expInfPinLets,
+  redunECol,
+  redunELine,
+  redunName,
+  redunRet,
+  redunSCol,
+  redunSLine,
+  redunTok,
+  redunType,
+} from "./check_state"
+import { demangleName } from "./check_suggest"
+import { jwTokIsGenerated } from "./check_sym_occ"
+import { joinByWant } from "./check_tp_join"
+import { isNeverTy } from "./check_ty_shape"
+import {
+  T,
+  TY_ERR,
+  TyErr,
+  TyUnion,
+  TyVar,
+  tyArrayElemIx,
+  tyEq,
+  tyIsPlainScalar,
+  tyRepVaries,
+  tyToStrUser,
+} from "./check_types"
+import { joinLeavesOf, tailValueLeaves } from "./check_unconsumed"
+import { isWideLitJoin, nodeUnwidenedTyOf } from "./check_wide_lits"
+import { fnDeclIx } from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+
+// Whether `ty` is an unresolved hole an inlay hint should suppress: a generic type variable, an
+// error placeholder, or a union whose members are all holes — `any | any` is not a type VL can
+// spell, and a union with any resolved member keeps its hint. Deliberately not extended to
+// `TyNullable`, whose `_ | null` is determined. Depth-bounded; exhausting the budget keeps it.
+export function inlayHole(ty: i32) { inlayHoleDeep(ty, 16) }
+
+function inlayHoleDeep(ty: i32, depth: i32): boolean {
+  if ty < 0 { return true }
+  if depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyErr { return true }
+  if t is TyUnion {
+    const ms = t.uMembers
+    // An empty member list is not a union of holes but a degenerate arena entry, and answering
+    // "hole" for it would suppress on a shape this rule has nothing to say about.
+    if ms.length == 0 { return false }
+    let i = 0
+    while i < ms.length {
+      if !inlayHoleDeep(ms[i], depth - 1) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether a literal at `ix` takes its type from a declared destination rather than its own parts:
+// any record literal, and a list literal with a `null`, record or list literal element.
+function literalTypedByAnnot(ix: i32) {
+  if P.nodes[ix] is ObjLit { return true }
+  for e in arrayLitElemsOf(ix) {
+    if P.nodes[e] is NullLit || P.nodes[e] is ObjLit || P.nodes[e] is ArrayLit {
+      return true
+    }
+  }
+  false
+}
+
+// Whether the value the initializer `ix` yields keeps its annotated type only through what the
+// annotation supplies: a literal typed by it in any tail, a list literal holding a union or a
+// function, an alias to a list of more than scalars, a generic call's result holding a union, or
+// a cast to more than a scalar. Each builds differently without the annotation (D3800).
+function initTypedByAnnot(ix: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  for lf in leaves {
+    if literalTypedByAnnot(lf) { return true }
+    const n = P.nodes[lf]
+    const t = nodeTyOf(lf)
+    if n is ArrayLit {
+      for e in n.arrElems {
+        if tyRepVaries(nodeTyOf(e), 4) { return true }
+      }
+    } else if n is Call {
+      const cn = P.nodes[n.callFn]
+      if cn is Ident {
+        const fd = fnDeclIx[cn.identName] ?? -1
+        if fnIsGenericDecl(fd) && tyRepVaries(t, 4) { return true }
+      }
+    } else if n is AsExpr {
+      if !tyIsPlainScalar(t) { return true }
+    } else if n is Ident {
+      const el = tyArrayElemIx(t)
+      if el >= 0 && !tyIsPlainScalar(el) { return true }
+    }
+  }
+  false
+}
+
+// Whether the declaration `fd` is a generic function: a type parameter, or a parameter without
+// a type, which each call site solves.
+function fnIsGenericDecl(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const n = P.nodes[fd]
+  if n is FuncDecl {
+    if n.fnTyParams.length > 0 { return true }
+    for p in n.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parType < 0 { return true }
+      }
+    }
+  }
+  false
+}
+
+// The elements of the list literal at `ix`, or none when it is not one.
+function arrayLitElemsOf(ix: i32): i32[] {
+  const nd = P.nodes[ix]
+  if nd is ArrayLit { return nd.arrElems }
+  []
+}
+
+// Record `let <name>: T = init` as redundant when init's own type == the annotation.
+// `declIx` is the LetDecl node (for its name token); `n` carries letName/letInit.
+export function recordRedundantAnnot(
+  n: LetDecl,
+  declIx: i32,
+  initTy: i32,
+  annot: i32,
+) {
+  // Only a concrete init type that renders identically to the annotation. A hole (an empty
+  // `[]`/`Map()`, a lone `null`), an error, or `never` is never redundant.
+  if inlayHole(initTy) { return 0 }
+  if isNeverTy(initTy) { return 0 }
+  if annot == TY_ERR { return 0 }
+  if !tyEq(initTy, annot) { return 0 }
+  // An exported binding's annotation documents the module's API, so it is never redundant (D3597).
+  if declExported(declIx) { return 0 }
+  // One that typed an export's parameter is what types it (D3817).
+  if i32ListHas(expInfPinLets, declIx) { return 0 }
+  // A record literal takes the annotation's record type, which can be the nominal type an `is` or
+  // an equality reads, and a list literal holding `null` or a literal of its own takes its element
+  // type from it: the initializer is typed BY the annotation, so the comparison is circular (D3597).
+  if n.letInit >= 0 && initTypedByAnnot(n.letInit) { return 0 }
+  // A call of a function that took this annotation as its result is typed by it, not redundant.
+  if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
+  // So is an `if` or `match` whose literal arms took the annotation's type.
+  if n.letInit >= 0 && joinTypedByWant(n.letInit) { return 0 }
+  // Without its annotation a `const` bound to a string literal holds that literal's type, so a
+  // `string` annotation there is what lets it compare with other strings (D2198).
+  if n.letKw == "const" && n.letInit >= 0 {
+    const lin = P.nodes[n.letInit]
+    if lin is StrLit { return 0 }
+    if isWideLitJoin(nodeUnwidenedTyOf(n.letInit)) { return 0 }
+  }
+  const nameTok = declNameTokOf(declIx)
+  if nameTok < 0 { return 0 }
+  if jwTokIsGenerated(nameTok) { return 0 }
+  // The fix deletes the annotation, so the span runs from just after the name to the assignment
+  // `=`. That `=` is found by scanning the tokens between, the annotation being multi-token: it is
+  // the first `EQUAL` at bracket depth 0 that is not part of `=>`, i.e. not followed by `>`.
+  let eqTok = -1
+  let depth = 0
+  // Stops at that `=`: a scan to the end of the token stream would cost every annotated
+  // binding the whole program (D2686).
+  let t = nameTok + 1
+  while t < P.toks.length && eqTok < 0 {
+    const kd = P.toks[t].kind
+    if kd == "LPAREN" || kd == "LBRACK" || kd == "LBRACE" {
+      depth = depth + 1
+    } else if kd == "RPAREN" || kd == "RBRACK" || kd == "RBRACE" {
+      depth = depth - 1
+    } else if depth == 0 && kd == "EQUAL" {
+      let isArrow = false
+      if t + 1 < P.toks.length {
+        if P.toks[t + 1].kind == "GT" { isArrow = true }
+      }
+      if !isArrow { eqTok = t }
+    }
+    t = t + 1
+  }
+  if eqTok < 0 { return 0 }
+  // An annotation that names a function type's parameters documents them; inference cannot.
+  if tsWritesParamNames(annTsWrittenOf(n.letType), 0) { return 0 }
+  // The span starts at the `:` token, always `nameTok + 1` for an annotated decl. Using the
+  // colon's own position rather than `nameTok.col + name.length` is robust to the module merge
+  // mangling the binding name (`local$m0`), which would otherwise push the start into the type.
+  const colonTok = nameTok + 1
+  if colonTok >= P.toks.length { return 0 }
+  redunSLine.push(P.toks[colonTok].line)
+  redunSCol.push(P.toks[colonTok].col)
+  redunELine.push(P.toks[eqTok].line)
+  redunECol.push(P.toks[eqTok].col)
+  redunName.push(demangleName(n.letName))
+  // User-facing (the finding's message quotes it) — the user render, not the raw one.
+  redunType.push(tyToStrUser(initTy))
+  redunTok.push(nameTok)
+  redunRet.push(false)
+  0
+}
+
+// Whether a join under `ix` took its type from its destination, so is typed by an annotation.
+function joinTypedByWant(ix: i32): boolean {
+  for at in joinLeavesOf(ix) {
+    if joinByWant.has(at) { return true }
+  }
+  false
+}
