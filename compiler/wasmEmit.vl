@@ -775,6 +775,8 @@ import {
   capturedNulListCellRead,
   catListKindOfBin,
   catListKindOfExpr,
+  catSlotOfBin,
+  catWidenSideOfBin,
   cbRetVariantIdx,
   cloArmTagOfTy,
   cloCallArityFallbackUnsound,
@@ -15480,6 +15482,7 @@ function emitListConcatG(
   fnIx: i32,
   kind: i32,
   slot: i32,
+  widen: i32,
 ) {
   const bA = lcatBaseOfRep(kind, slot)
   if bA < 0 {
@@ -15494,14 +15497,12 @@ function emitListConcatG(
   const back = catBackIdxOf(kind, slot)
   // Both operands reach the stack before the frame is written: the frame is shared per
   // rep, so a concat nested in the right operand would otherwise overwrite A (D2331).
-  if emitExpr(body, leftIx, fnIx) < 0 { return -1 }
-  // A NARROWED nullable operand's cell still holds a `(ref null …)` while the frame slot
-  // is non-null — the same recovery the compare cores make, off the same one home.
-  if emitEqRecoverNarrowed(leftIx, fnIx) < 0 { return -1 }
-  svSyncRecv(leftIx, fnIx)
-  if emitExpr(body, rightIx, fnIx) < 0 { return -1 }
-  if emitEqRecoverNarrowed(rightIx, fnIx) < 0 { return -1 }
-  svSyncRecv(rightIx, fnIx)
+  if emitCatOperand(body, leftIx, fnIx, kind, slot, widen == 1) < 0 {
+    return -1
+  }
+  if emitCatOperand(body, rightIx, fnIx, kind, slot, widen == 2) < 0 {
+    return -1
+  }
   fbLocalSet(bA + 1)   // B
   fbLocalSet(bA + 0)   // A
   fbLocalGet(bA + 0)
@@ -15537,6 +15538,45 @@ function emitListConcatG(
   fbLocalGet(bA + 3)
   fbLocalGet(bA + 3)
   fbStructNew(wrap)
+  0
+}
+
+// One operand of `emitListConcatG`, left on the stack at concat rep `(kind, slot)`. A `widen`
+// operand is of the narrower rep (`catWidenSideOfBin`) and is copied into the concat's: boxed
+// into a union-box row as a spread group is, or converted element-wise for a scalar list.
+function emitCatOperand(
+  body: u8[],
+  opIx: i32,
+  fnIx: i32,
+  kind: i32,
+  slot: i32,
+  widen: boolean,
+) {
+  if widen && kind == LBK_REF {
+    return emitSpreadGroupBoxed(body, opIx, true, slot, fnIx)
+  }
+  if widen {
+    const sk = mfRecvKindOf(opIx, fnIx)
+    let dk: VKind | null = null
+    if kind == LBK_F64_LIST { dk = "f64" }
+    if kind == LBK_I64_LIST { dk = "i64" }
+    if sk == null || dk == null {
+      return emitFailAt(
+        "emitProgram: a list `+` widening reached an operand `catWidenSideOfBin` does not admit",
+        opIx,
+      )
+    }
+    expCtxSetListBuild(pendingKindOfMf(sk, 0), 0)
+    if emitExpr(body, opIx, fnIx) < 0 { return -1 }
+    if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
+    svSyncRecv(opIx, fnIx)
+    return emitScalarListWidenTop(body, spreadScalarVKind(sk), dk)
+  }
+  if emitExpr(body, opIx, fnIx) < 0 { return -1 }
+  // A NARROWED nullable operand's cell still holds a `(ref null …)` while the frame slot
+  // is non-null — the same recovery the compare cores make, off the same one home.
+  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
+  svSyncRecv(opIx, fnIx)
   0
 }
 
@@ -32370,7 +32410,8 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
         e.binRight,
         fnIx,
         catK,
-        listOpSlotOfBin(exprIx, fnIx),
+        catSlotOfBin(exprIx, fnIx),
+        catWidenSideOfBin(exprIx, fnIx),
       )
     }
   }
