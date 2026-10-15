@@ -558,7 +558,6 @@ import {
   tvNestOf,
   tyAllMaps,
   tyAmong,
-  tyArrHasEq,
   tyArrayElemIx,
   tyBearsNull,
   tyBuiltinIndexable,
@@ -1373,8 +1372,13 @@ import {
 import {
   cstrOwnerStack,
   curFnDeclIx,
+  cursorReset,
   lamCheckDepth,
   lamRefoldDepth,
+  njFnStack,
+  tpEnvNames,
+  tpEnvTyOfName,
+  tpEnvTys,
 } from "./check_cursor"
 import {
   mkUnionTy,
@@ -1396,11 +1400,9 @@ import {
   CV_RET,
   CV_UFCS,
   argCstr,
-  argCstrTruncate,
   binCstr,
-  binCstrTruncate,
   bmCstr,
-  bmCstrTruncate,
+  compArgCstrOk,
   cstrOwnerTop,
   cstrSeqNext,
   cvMark,
@@ -1408,43 +1410,58 @@ import {
   cvPick,
   cvViaAt,
   isCstr,
-  isCstrTruncate,
   letCstr,
-  letCstrTruncate,
   memCstr,
-  memCstrTruncate,
   nestCstr,
   nestCstrSeen,
   noteArgCstr,
   noteBinCstr,
   noteBmCstr,
   noteIsCstr,
+  noteLetCstr,
   noteMemCstr,
   noteNestCstr,
   notePrintCstr,
   noteRetCstr,
   printCstr,
   retCstr,
-  retCstrTruncate,
   tpGradualRecv,
-  tyIxCstrTruncate,
   ufcsCstr,
-  ufcsCstrTruncate,
 } from "./check_cstr_rows"
 import {
   coalParamDefault,
+  dJoinNode,
+  dJoinTy,
   deferredJoinOverOpenParams,
+  escJoinFn,
+  escJoinIx,
+  escJoinTy,
+  escJoinWho,
   holeNameIsParamOf,
   holeTpJoinNames,
+  joinRowsReset,
   joinTyParamNull,
   keptParamUnion,
   markTpJoinApart,
   noteHoleTpJoin,
+  noteTpIfRe,
   paramHoleName,
   paramJoinDropsNull,
   sameDeclaredTyParam,
   tpArmJoinDepth,
   tpGradualView,
+  tpIfFn,
+  tpIfFnHasRow,
+  tpIfJoin,
+  tpIfNode,
+  tpIfOk,
+  tpIfReCount,
+  tpIfReFn,
+  tpIfReNames,
+  tpIfReOwner,
+  tpIfReParams,
+  tpIfReStart,
+  tpIfReTys,
   tpJoinUnions,
   tpOpenJoin,
   tyIsDeferredJoin,
@@ -1456,6 +1473,78 @@ import {
   unionHasDeclaredParam,
   writtenTpUnion,
 } from "./check_tp_join"
+import {
+  arrayDemandKey,
+  calleeWriteAt,
+  calleeWriteGot,
+  calleeWriteRow,
+  coalHoleFn,
+  coalHoleTy,
+  holeAltHoleIx,
+  holeAltNames,
+  holeAltPreN,
+  holeAltResidualTy,
+  holeAltRowOf,
+  holeAltTailN,
+  holeAltTys,
+  holeArrayDemand,
+  holeDemandStr,
+  holeDemandTy,
+  holeFlowDst,
+  holeFlowSrc,
+  holeHasIsAlt,
+  holeIsArrayWriteDemanded,
+  holeMapDemandTy,
+  holeMapNames,
+  holeMapOf,
+  holeMapTys,
+  holeRowsReset,
+  holeShapeFieldCount,
+  holeShapeNames,
+  holeShapeOf,
+  holeShapeTys,
+  holeWriteKey,
+  isHoleMapDemandTy,
+  noteArrayDemand,
+  noteCoalResultHole,
+  noteHoleAlt,
+  noteHoleFlowGo,
+  rowIsArrayDemanded,
+} from "./check_hole_rows"
+import {
+  inferLetIx,
+  inferLetNulBoolIx,
+  inferLetNulStrIx,
+  inferLetTy,
+  inferRetAtomCount,
+  inferRetFn,
+  inferRetLogLit,
+  inferRetLogSeed,
+  inferRetLogTy,
+  inferRetTy,
+  inferRetTyIx,
+  inferRowsReset,
+  inferStack,
+  inferTentative,
+  inferTentativeTake,
+  onInferStack,
+} from "./check_infer_rows"
+import {
+  MonoSave,
+  RB_CSTR_PROBE,
+  RB_GLOBAL_INIT,
+  RB_LINT,
+  RB_MONO,
+  RB_PINNED,
+  RB_RETURNS,
+  RB_SOLVE,
+  checkMark,
+  checkRollback,
+  prbArmed,
+  prbEnter,
+  prbLeave,
+  prbSkip,
+} from "./check_rollback"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -1553,13 +1642,6 @@ let gaParamNames: string[] = []
 let gaParamStart: i32[] = []
 let gaParamCount: i32[] = []
 
-// The type-param binding environment consulted by `nameToTy` (innermost last): a generic
-// function's `<T>` names bind to their TyVars while its annotations resolve
-// (`resolveAnnot`), and an alias application's params bind to the argument types while the
-// alias body resolves (`applyGenAlias`).
-let tpEnvNames: string[] = []
-let tpEnvTys: i32[] = []
-
 // ── constraints phase 1: the bound environment and the coherence ledger ──────
 
 // `cBoundDecls` — every `type Showable = { toString(): string }` in the program, name → the
@@ -1597,16 +1679,6 @@ let cohWitness: string[] = []
 let cohSiteLine: i32[] = []
 let cohSiteCol: i32[] = []
 
-// Demanded hole shapes: a member access on an inference-hole param (`self.x` where `self`
-// is the hole `?add.0`) records field `x` on the hole's demanded shape, a TyObj that grows
-// one derived hole (`?fld.x.?add.0`) per accessed field. Each call site checks its argument
-// against the shape, and `substTyDeep` resolves the derived holes against the bindings.
-let holeShapeNames: string[] = []
-let holeShapeTys: i32[] = []
-// Hole names the body indexed (`self[i]`), so the hole demands an array: the call site
-// rejects a non-indexable scalar argument bound to such a param (`head(5)` where the body
-// read `self[0]`).
-let holeArrayDemand: string[] = []
 // Hole names whose body applied an `as` cast to the hole itself (`a as i32`), one row per
 // cast site. Both type-level obligations — a bare `as` needs a declared home for what it
 // propagates, and `as?` yields `T | null` exactly when the cast can fail — are decided from
@@ -1633,25 +1705,6 @@ let holeCastRet: i32[] = []
 let holeCastArgN: i32[] = []
 let holeCastArgExp: i32[] = []
 let holeCastArgIx: i32[] = []
-// Hole names whose body used the map/set surface (`self.set(k, v)`, `.get`, `.has`,
-// `.delete`, `.add`, `.keys()`, `.values()`), so the hole demands a map; the parallel
-// `holeMapTys` entry is that map — an open `{[?]: ?}` the body's own operations pin in
-// place. The map dual of `holeArrayDemand`, carrying a type rather than only a flag.
-let holeMapNames: string[] = []
-let holeMapTys: i32[] = []
-
-// Alternative hole constraints contributed by an `is` guard over the hole itself: the
-// tested types are alternatives, not extra fields, so the call-arg check accepts an
-// argument satisfying the demanded shape or one of them. `holeAltPreN[k]` counts the shape
-// fields reached before the guard, `holeAltTailN[k]` those at its end, -1 when it diverges.
-let holeAltNames: string[] = []
-let holeAltTys: i32[] = []
-let holeAltPreN: i32[] = []
-let holeAltTailN: i32[] = []
-// The arena index of the hole each alternative constrains, the same hole `holeAltNames[k]`
-// names. `mkGuardedRetTy` needs a handle on that hole, not just its name, to build a
-// guarded-member derivation whose base points at it.
-let holeAltHoleIx: i32[] = []
 
 // The `is`-guard alternative rows (indices into `holeAlt*`) whose then-branch is currently
 // being checked. A `return` inside one is reached only by an argument that satisfies the
@@ -1681,30 +1734,12 @@ let njGateSeen = 0
 let njGateMemo: {[i32]: boolean} = Map()
 // The held-back call nodes `njExprHeld` answers for.
 let njHeldNodes: {[i32]: boolean} = Map()
-// `njFnIx` saved across each `monoRecheckBegin`/`monoRecheckEnd` pair.
-let njFnStack: i32[] = []
 // The deferred return joins of runtime witnesses, which re-join apart wherever they collapse.
 let apartHoleJoins: {[i32]: boolean} = Map()
 
-// The uncollapsed deferred join a call site could not decide, parked under that call's node
-// index. `collapseDeferredJoin` hands the emitter-safe collapse out as the call's type — a
-// deferred join has no runtime shape — but that collapse is lossy, so the return-inference
-// path reads the parked join back (`inferRetTyOf`). Only that path reads it.
-let dJoinNode: i32[] = []
-let dJoinTy: i32[] = []
 // The parked joins `inferRetTyOf` has handed a return accumulator: a call's join, not a join of
 // the returning body's own arms.
 let dJoinRelayed: {[i32]: boolean} = Map()
-
-// Deferred joins that escaped a call site lossily — the collapse handed out one arm while the
-// join still named holes this site could not pin. Parallel arrays: the uncollapsed join, the
-// call node to anchor a diagnostic on, and the callee's name. `validateEscJoins` re-folds each
-// at the pinning call and rejects loudly when the arms really do disagree.
-let escJoinTy: i32[] = []
-let escJoinIx: i32[] = []
-let escJoinWho: string[] = []
-// The body each join escaped inside (`cstrOwnerTop`), -1 at module scope (D2805).
-let escJoinFn: i32[] = []
 
 // The operator a deferred unary negation is recorded under, both operands its argument.
 const OP_NEG = "unary -"
@@ -1737,23 +1772,6 @@ const ACF_INDEX = -3
 // unpinned hole to `i32`; `checkArrayNewDefaultElems` refuses a pinned element with no zero.
 let arrDefCallIx: i32[] = []
 let arrDefCallTy: i32[] = []
-// D3746 — a hole callee's write into an open list handed over as a BINDING, which the call may
-// not pin (the binding's own later writes still decide it): the row and the written value's
-// type. The flush gives a row still open at scope close the first write's element.
-let calleeWriteRow: i32[] = []
-let calleeWriteGot: i32[] = []
-// The call node that recorded each `calleeWriteRow` write, where `checkCalleeWrites` reports (D3775).
-let calleeWriteAt: i32[] = []
-
-// Drops every `calleeWrite*` row from `n` on, all columns together.
-function calleeWriteTruncate(n: i32) {
-  while calleeWriteRow.length > n {
-    calleeWriteRow.pop()
-    calleeWriteGot.pop()
-    calleeWriteAt.pop()
-  }
-  0
-}
 
 // D1470 — two open array holes that met at a store (`b = a` between two un-annotated bindings,
 // and every other position `constrainEmpty` covers). Neither pins the other, and a later use
@@ -1800,22 +1818,6 @@ const OP_CALL_PIN = "()"
 // A call under a null test of its callee: a pin of the `null` type leaves the branch dead, so
 // the call is not refused there, though the direct spelling refuses it (D3197).
 const OP_CALL_GUARDED_PIN = "?()"
-
-// D1702 — the `HD_COAL` result holes a body minted, so the pin can substitute them. Nothing
-// else asks: a `??` result is not a constraint, so no validator reaches it and `substHoleTy`
-// never banks its pin. The emitter's `??` arm turns on that pin, so the rows exist to be
-// substituted for the BANK, not for a diagnostic; the answer is discarded.
-let coalHoleTy: i32[] = []
-let coalHoleFn: i32[] = []
-
-// Drops every `coalHole*` row from `n` on, both columns together.
-function coalHoleTruncate(n: i32) {
-  while coalHoleTy.length > n {
-    coalHoleTy.pop()
-    coalHoleFn.pop()
-  }
-  0
-}
 
 // D3252 — per `??` node whose default is a hole that fit its left's face vacuously, the
 // derived hole (`HD_COALD`) a destination's deferred constraint records in its place; -1 else.
@@ -1887,11 +1889,6 @@ let pinFnTy: {[i32]: i32} = Map()
 // Declarations whose solve has been attempted, keyed by decl node index — a body is probed at
 // most once, whether or not the probe found anything to solve.
 let paramSolveTried: {[string]: boolean} = Map()
-// Hole → concrete destination, recorded only while `paramSolveProbe` is set. `assignableExpr`
-// is the one seam every binding / argument / return / field / element / store flows through, so
-// a single hook there sees every such usage.
-let holeFlowSrc: i32[] = []
-let holeFlowDst: i32[] = []
 let paramSolveProbe = false
 // Set while pass 1.9 walks a generic body only to record its deferred constraints, so the
 // walk takes no memo and patches no return (`cstrPrePass`).
@@ -3051,16 +3048,6 @@ function refuseOpenNullHoleArg(argIx: i32, who: string) {
   0
 }
 
-// Whether `ty` is a hole-parameter's demanded map, which the call sites fill.
-function isHoleMapDemandTy(ty: i32): boolean {
-  let i = 0
-  while i < holeMapTys.length {
-    if holeMapTys[i] == ty { return true }
-    i = i + 1
-  }
-  false
-}
-
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32) {
   pendNames.push(name)
@@ -4036,23 +4023,8 @@ let tpIfJoinAt: {[i32]: i32} = Map()
 let joinWantAt: {[i32]: i32} = Map()
 // The joins typed by their destination rather than their arms.
 let joinByWant: {[i32]: boolean} = Map()
-// The same joins by owning declaration, re-asked at each call that pins the owner.
-let tpIfFn: i32[] = []
-let tpIfJoin: i32[] = []
-let tpIfNode: i32[] = []
-// Whether each row's join is delivered where an instance builds its union (`tpIfMarkOk`).
-let tpIfOk: boolean[] = []
 // The if-expressions a binding, an argument or a return delivers (`tpIfMarkOk`).
 let tpIfOkAt: {[i32]: boolean} = Map()
-// A call from a generic body whose pin leaves such a join open: the callee, the caller that
-// pins it later, and the callee's bindings and parameter types in the caller's terms.
-let tpIfReFn: i32[] = []
-let tpIfReOwner: i32[] = []
-let tpIfReStart: i32[] = []
-let tpIfReCount: i32[] = []
-let tpIfReNames: string[] = []
-let tpIfReTys: i32[] = []
-let tpIfReParams: i32[][] = []
 
 // Whether any join has made one record of two (`joinObjFieldwise`). Only ever set, so the
 // emitter passes that build a join's arms at its row can skip a program with none (D2731).
@@ -4152,21 +4124,8 @@ let opBinHoleDeclNode: i32[] = []
 let opBinHoleDeclAnn: boolean[] = []
 let opBinDispatched: string[] = []
 let opBinDeclined: string[] = []
-// An un-annotated function's hoisted return type is the pending sentinel `-2` until its body is
-// checked, and a forward call infers its callee (found through `fnDeclIx`) on demand. `inferStack`
-// is the in-progress set for cycle detection; `inferObserved` / `inferSawErr` accumulate what a
-// pending body yielded, first concrete wins.
-let inferStack: string[] = []
 let inferObserved = -1
 let inferSawErr = false
-// Every witness `noteInferredRet` joined for the functions being inferred, in order, and
-// whether it is a tail `if` arm's seed. A tail `if` that yields no value replays the non-seed
-// rows from its mark, so its arms' values leave the inferred return (`dropTailIfSeeds`).
-let inferRetLogTy: i32[] = []
-let inferRetLogSeed: boolean[] = []
-// Per row of that log, whether the witness is a literal; and whether every witness joined into
-// `inferObserved` so far is one, so a runtime witness beside it joins apart (`joinArmLit`).
-let inferRetLogLit: boolean[] = []
 let inferObservedLit = true
 // Whether the witness `noteInferredRet` is handed next is a literal, set by its caller.
 let inferRetNextLit = false
@@ -4254,23 +4213,7 @@ let nestedUnannotTys: i32[] = []
 // (`structUnionRetName`). The floor must accept exactly the unions the emitter can lower, all
 // members named, so it uses the same predicate as the export.
 export let gRootStmts: i32[] = []
-// Parallel arrays (name → inferred concrete return-type name) for each un-annotated top-level
-// function, exported so the emitter classifies a return from the inferred type rather than
-// re-deriving it from the return expression, which misses a plain-variable return. Kept out of the
-// AST `fnRet` so `fmt` never re-adds the annotation; arrays, because a string-valued map mis-lowers.
-let inferRetFn: string[] = []
-let inferRetTy: string[] = []
-// The top-level atom count of the recorded name, parallel to `inferRetTy`: the emitter's
-// anonymous-nominal residual asks whether a recorded name spells a union, and the recorder banks
-// the answer so the consumer is a lookup. The count belongs to the name producer — how many atoms
-// it joined — not to a walk of the type it rendered, which disagrees at a litunion member.
-let inferRetAtomCount: i32[] = []
 
-// The arena-index sibling of `inferRetTy`: the `Ty`-arena index of each recorded inferred return
-// type, so the emitter's inferred-return loop drives the structural arena walks off the resolved
-// type, covering unions and closures the rendered-name walk does not surface. `-1` when the
-// recorder had no arena index, which falls through the walks harmlessly.
-let inferRetTyIx: i32[] = []
 // Name → its first index in the arrays, so the hot `inferRetNameOf` is an O(1) map lookup rather
 // than a linear scan. An i32-valued map kept in sync by `recordInferRet`, first-wins. The arrays
 // stay for the emitter's indexed access (`inferRetCount`/`inferRetTyAt`) and to hold the string
@@ -4279,22 +4222,6 @@ let inferRetIdx: {[string]: i32} = Map()
 // An un-annotated function whose returns disagree and join to one list type, keyed as
 // `inferRetIdx` is: the joined `Ty` index, which no single return's own list rep names (D2716).
 let inferJoinListIdx: {[string]: i32} = Map()
-// The binding analogue of `inferRetFn`/`inferRetTy`: an un-annotated `const`/`let` whose inferred
-// type is a value union, recorded by its LetDecl node index so the emitter classifies and lowers
-// it like an annotated value-union binding even when the initializer is one it cannot statically
-// classify. Captured during the check, with the scope still live.
-let inferLetIx: i32[] = []
-let inferLetTy: string[] = []
-// The niche analogue of `inferLetIx`: an un-annotated `const x = if c { "hi" } else null` infers
-// `string | null`, a niche ref rep rather than a value-union box, so `valueUnionRetName` renders
-// "" and `inferLetIx` skips it. Recorded by LetDecl node index so `letIsNulString` classifies the
-// slot as the kind-16 nullable-string rep and reuses the annotated lowering.
-let inferLetNulStrIx: i32[] = []
-// The `boolean | null` companion of `inferLetNulStrIx` — the other niche scalar nullable, an i32
-// 0/1 with sentinel 2 for null. Same recording discipline: an un-annotated
-// `const x = if c { true } else { null }` by LetDecl node index, so the emitter classifies the
-// slot as the niche i32 rep and reuses the annotated lowering.
-let inferLetNulBoolIx: i32[] = []
 // The struct-bearing union types an inline join (a `??` or a value `if`) produced, in order and
 // once each: no declaration spells them, so without a row here an arm has no tag in any box.
 let inferJoinTys: i32[] = []
@@ -4525,7 +4452,6 @@ let bareBraceMark: i32[] = []
 // Nesting depth of a speculative `assignableExpr` (one union member tried of several): a `{}`
 // is judged once, by the outer delivery that sees every member.
 let bareBraceSpec = 0
-let inferTentative: string[] = []
 let unresolvedFns: string[] = []
 let fnSawValueRet = false
 
@@ -4979,6 +4905,10 @@ export function initChecker() {
   rcoalReset()
   isvalReset()
   covarWriteReset()
+  cursorReset()
+  holeRowsReset()
+  joinRowsReset()
+  inferRowsReset()
   cbExpNode = []
   cbExpOff = []
   cbExpLen = []
@@ -5001,18 +4931,7 @@ export function initChecker() {
   tpIfJoinAt = Map()
   joinWantAt = Map()
   joinByWant = Map()
-  tpIfFn = []
-  tpIfJoin = []
-  tpIfNode = []
-  tpIfOk = []
   tpIfOkAt = Map()
-  tpIfReFn = []
-  tpIfReOwner = []
-  tpIfReStart = []
-  tpIfReCount = []
-  tpIfReNames = []
-  tpIfReTys = []
-  tpIfReParams = []
   recordJoinMinted = false
   T.scopes = []
   scopeDepthsOf = Map()
@@ -5033,8 +4952,6 @@ export function initChecker() {
   annotNameMemoNegVer = Map()
   annotPart = Map()
   annotClash = Map()
-  tpEnvNames = []
-  tpEnvTys = []
   cBoundDecls = Map()
   tpBoundNames = []
   tpBoundAnns = []
@@ -5045,9 +4962,6 @@ export function initChecker() {
   bgSrcStack = []
   bgDstStack = []
   stSeenStack = []
-  holeShapeNames = []
-  holeShapeTys = []
-  holeArrayDemand = []
   holeCastNames = []
   holeCastMode = []
   holeCastVar = []
@@ -5059,14 +4973,7 @@ export function initChecker() {
   holeCastArgN = []
   holeCastArgExp = []
   holeCastArgIx = []
-  holeMapNames = []
-  holeMapTys = []
   holeElseTested = Map()
-  holeAltNames = []
-  holeAltTys = []
-  holeAltPreN = []
-  holeAltTailN = []
-  holeAltHoleIx = []
   hdReset()
   guardAltStack = []
   joinHoleUnions = []
@@ -5076,23 +4983,15 @@ export function initChecker() {
   njGateMemo = Map()
   njHeldNodes = Map()
   njFnIx = -1
-  njFnStack = []
   njPinFn = -1
   apartHoleJoins = Map()
-  dJoinNode = []
-  dJoinTy = []
   dJoinRelayed = Map()
-  escJoinTy = []
-  escJoinIx = []
-  escJoinWho = []
-  escJoinFn = []
   binCstr.lt = []
   binCstr.op = []
   binCstr.rt = []
   binCstr.fn = []
   cvViaAt = Map()
   cvNow = -1
-  cstrOwnerStack = []
   argCstr.at = []
   argCstr.exp = []
   argCstr.who = []
@@ -5113,9 +5012,6 @@ export function initChecker() {
   isCstr.fn = []
   arrDefCallIx = []
   arrDefCallTy = []
-  calleeWriteRow = []
-  calleeWriteGot = []
-  calleeWriteAt = []
   holeLinkA = []
   holeLinkB = []
   retCstr.got = []
@@ -5147,9 +5043,7 @@ export function initChecker() {
   memCstr.ix = []
   memCstr.fn = []
   memCstr.dem = []
-  coalHoleTy = []
   coalDefHole = []
-  coalHoleFn = []
   ufcsCstr.ty = []
   ufcsCstr.prop = []
   ufcsCstr.ix = []
@@ -5163,7 +5057,6 @@ export function initChecker() {
   ovFnValDecl = []
   ovFnValName = []
   ovCbElem = Map()
-  curFnDeclIx = -1
   ufcsMissAt = []
   ufcsMissSpecs = []
   ufcsWhyAt = []
@@ -5184,8 +5077,6 @@ export function initChecker() {
   argPinChecking = false
   pinFnTy = Map()
   paramSolveTried = Map()
-  holeFlowSrc = []
-  holeFlowDst = []
   paramSolveProbe = false
   cstrProbe = false
   cstrCandIx = Map()
@@ -5229,17 +5120,9 @@ export function initChecker() {
   nestedUnannotFns = []
   nestedUnannotTys = []
   gRootStmts = []
-  inferRetFn = []
-  inferRetTy = []
-  inferRetAtomCount = []
-  inferRetTyIx = []
   irReset()
   inferRetIdx = Map()
   inferJoinListIdx = Map()
-  inferLetIx = []
-  inferLetTy = []
-  inferLetNulStrIx = []
-  inferLetNulBoolIx = []
   inferJoinTys = []
   inferJoinTySet = []
   bodyChecked = Map()
@@ -5313,20 +5196,15 @@ export function initChecker() {
   bareBraceLits = []
   bareBraceMark = []
   bareBraceSpec = 0
-  inferTentative = []
   unresolvedFns = []
   fnSawValueRet = false
   retNatural = -1
   retNaturalErr = false
   daResetForCheck()
   daWriteTarget = -1
-  inferStack = []
   inferObserved = -1
   inferObservedLit = true
   inferSawErr = false
-  inferRetLogTy = []
-  inferRetLogSeed = []
-  inferRetLogLit = []
   inferVoidRetSites = []
   inferVoidRetBlks = []
   chkStmtBlk = -1
@@ -12755,18 +12633,6 @@ function eqListFieldPath(ty: i32, seen: i32[]): string {
   out
 }
 
-function rcoalTruncate(n: i32) {
-  while rcoalLine.length > n { rcoalLine.pop() }
-  while rcoalCol.length > n { rcoalCol.pop() }
-  while rcoalEnd.length > n { rcoalEnd.pop() }
-  while rcoalTok.length > n { rcoalTok.pop() }
-  while rcoalType.length > n { rcoalType.pop() }
-  while rcoalMsg.length > n { rcoalMsg.pop() }
-  while rcoalWhy.length > n { rcoalWhy.pop() }
-  while rcoalCode.length > n { rcoalCode.pop() }
-  0
-}
-
 // ── `is <literal>` over a collapsed operand (D1048) ──────────────────────────
 
 function isvalReset() {
@@ -12814,18 +12680,6 @@ function isvalReset() {
   collapsedAliases = Map()
   annotCollapsed = Map()
   collapsedTy = -1
-  0
-}
-
-function isvalTruncate(n: i32) {
-  while isvalLine.length > n { isvalLine.pop() }
-  while isvalCol.length > n { isvalCol.pop() }
-  while isvalEnd.length > n { isvalEnd.pop() }
-  while isvalTok.length > n { isvalTok.pop() }
-  while isvalName.length > n { isvalName.pop() }
-  while isvalType.length > n { isvalType.pop() }
-  while isvalLit.length > n { isvalLit.pop() }
-  while isvalMsg.length > n { isvalMsg.pop() }
   0
 }
 
@@ -17203,15 +17057,6 @@ function validateTpIfJoins(
   0
 }
 
-function tpIfFnHasRow(fn: i32): boolean {
-  let k = 0
-  while k < tpIfFn.length {
-    if tpIfFn[k] == fn { return true }
-    k = k + 1
-  }
-  false
-}
-
 // The joins of `fn` at the concrete bindings `bNames`/`bTys`: one that stays apart where it is
 // not built as a union refuses the call, and otherwise the body is re-checked there.
 function tpIfPinCheck(
@@ -17261,51 +17106,6 @@ function tpIfPinCheck(
       + msg,
     ix,
   )
-  0
-}
-
-// Parks the bindings of a call to `fn` its caller `owner` pins later, with `fn`'s parameters.
-function noteTpIfRe(
-  fn: i32,
-  owner: i32,
-  names: string[],
-  tys: i32[],
-  params: i32[],
-) {
-  let k = 0
-  while k < tpIfReFn.length {
-    if (
-      tpIfReFn[k] == fn
-      && tpIfReOwner[k] == owner
-      && tpIfReCount[k] == tys.length
-    ) {
-      let same = true
-      let q = 0
-      while q < tys.length && same {
-        if !tyEq(tpIfReTys[tpIfReStart[k] + q], tys[q]) { same = false }
-        q = q + 1
-      }
-      if same { return 0 }
-    }
-    k = k + 1
-  }
-  tpIfReFn.push(fn)
-  tpIfReOwner.push(owner)
-  tpIfReStart.push(tpIfReNames.length)
-  tpIfReCount.push(names.length)
-  let i = 0
-  while i < names.length {
-    tpIfReNames.push(names[i])
-    tpIfReTys.push(tys[i])
-    i = i + 1
-  }
-  const ps: i32[] = []
-  let p = 0
-  while p < params.length {
-    ps.push(params[p])
-    p = p + 1
-  }
-  tpIfReParams.push(ps)
   0
 }
 
@@ -17428,471 +17228,6 @@ function tpMembersListText(ty: i32): string {
     i = i + 1
   }
   out
-}
-
-// ── One mark and one rollback for the quiet probes (L4) ──────────────────────
-// A quiet probe checks something, then drops what that check recorded: `checkMark()` on entry,
-// `checkRollback(m, set)` on exit. `set` names the table families the site rolls back, one bit
-// each; a site keeps a table by reading it before it rolls back.
-
-const RB_DIAGS = 1
-const RB_ARG = 2
-const RB_NEST = 4
-const RB_RET = 8
-const RB_LET = 16
-const RB_BM = 32
-const RB_MEM = 64
-const RB_UFCS = 128
-const RB_IS = 256
-const RB_BIN = 512
-const RB_PRINT = 1024
-const RB_ESC_JOIN = 2048
-const RB_COAL_HOLE = 4096
-// `tpIf*` and `tpIfRe*`; the latter's `Names`/`Tys` are spans `tpIfReStart` indexes, not rows.
-const RB_TP_IF = 8192
-const RB_CALLEE_WRITE = 16384
-const RB_DJOIN = 32768
-const RB_HOLE_FLOW = 65536
-// `holeShape*`, `holeArrayDemand`, `holeMap*` and `holeAlt*`.
-const RB_HOLES = 131072
-// `inferRet*`, `inferStack` and `inferTentative`.
-const RB_INFER = 262144
-// The lint-note tables: `redun*`, `rcoal*` and `isval*`.
-const RB_LINT = 524288
-const RB_TP_ENV = 1048576
-// `inferLet*`: the un-annotated bindings' value-union and niche rows.
-const RB_INFER_LET = 2097152
-
-// The per-site sets, each the sum of its bits. "Every constraint family" is arg, nest, ret, let,
-// bm, mem, ufcs, is, bin and print.
-// `cstrProbeBefore` keeps the constraint rows it exists to record (D3062): diagnostics, lint
-// notes, holes and dJoin.
-const RB_CSTR_PROBE = 688129
-// `inferReturnsPrePass` keeps the inferred returns, which are what it is for: diagnostics, lint
-// notes, every constraint family, holes, dJoin, coalHole, tpIf and inferLet.
-const RB_RETURNS = 2799615
-// `globalInitPrePass`: `RB_RETURNS` bar diagnostics, which it drops per initializer, and inferLet.
-const RB_GLOBAL_INIT = 702462
-// `solveUnannotParams` reads holeFlow before rolling back: diagnostics, lint notes, every
-// constraint family but nest, holes, holeFlow, dJoin and coalHole.
-const RB_SOLVE = 759803
-// `monoRecheckBegin`/`End`: diagnostics, lint notes, every constraint family but nest, holes,
-// infer, inferLet, tpEnv and calleeWrite.
-const RB_MONO = 4081659
-// `tpIfRecheck` around its re-check: every constraint family, escJoin, coalHole, tpIf and
-// calleeWrite.
-const RB_PINNED = 32766
-
-// Every rollback-able table's length, by family; a family's mark is its keyed column's length.
-type CheckMark = {
-  diags: i32,
-  argC: i32,
-  nestC: i32,
-  retC: i32,
-  letC: i32,
-  bmC: i32,
-  memC: i32,
-  ufcsC: i32,
-  isC: i32,
-  binC: i32,
-  printC: i32,
-  escJoin: i32,
-  coalHole: i32,
-  tpIf: i32,
-  tpIfRe: i32,
-  calleeWrite: i32,
-  dJoin: i32,
-  holeFlow: i32,
-  holeShapeNames: i32,
-  holeShapeTys: i32,
-  holeArrayDemand: i32,
-  holeMap: i32,
-  holeAlt: i32,
-  inferLet: i32,
-  inferLetNulStr: i32,
-  inferLetNulBool: i32,
-  inferRet: i32,
-  inferStack: i32,
-  inferTentative: i32,
-  redun: i32,
-  rcoal: i32,
-  isval: i32,
-  tpEnv: i32,
-}
-
-function checkMark(): CheckMark {
-  {
-    diags: T.diags.length,
-    argC: argCstr.at.length,
-    nestC: nestCstr.ty.length,
-    retC: retCstr.got.length,
-    letC: letCstr.got.length,
-    bmC: bmCstr.got.length,
-    memC: memCstr.ty.length,
-    ufcsC: ufcsCstr.ty.length,
-    isC: isCstr.ty.length,
-    binC: binCstr.op.length,
-    printC: printCstr.ty.length,
-    escJoin: escJoinTy.length,
-    coalHole: coalHoleTy.length,
-    tpIf: tpIfFn.length,
-    tpIfRe: tpIfReFn.length,
-    calleeWrite: calleeWriteRow.length,
-    dJoin: dJoinNode.length,
-    holeFlow: holeFlowSrc.length,
-    holeShapeNames: holeShapeNames.length,
-    holeShapeTys: holeShapeTys.length,
-    holeArrayDemand: holeArrayDemand.length,
-    holeMap: holeMapNames.length,
-    holeAlt: holeAltNames.length,
-    inferLet: inferLetIx.length,
-    inferLetNulStr: inferLetNulStrIx.length,
-    inferLetNulBool: inferLetNulBoolIx.length,
-    inferRet: inferRetFn.length,
-    inferStack: inferStack.length,
-    inferTentative: inferTentative.length,
-    redun: redunName.length,
-    rcoal: rcoalTok.length,
-    isval: isvalTok.length,
-    tpEnv: tpEnvNames.length,
-  }
-}
-
-// Truncates each family in `set` back to its length in `m`.
-function checkRollback(m: CheckMark, set: i32) {
-  if (set & RB_TP_ENV) != 0 {
-    while tpEnvNames.length > m.tpEnv {
-      tpEnvNames.pop()
-      tpEnvTys.pop()
-    }
-  }
-  if (set & RB_HOLES) != 0 {
-    while holeShapeNames.length > m.holeShapeNames { holeShapeNames.pop() }
-    while holeShapeTys.length > m.holeShapeTys { holeShapeTys.pop() }
-    while holeArrayDemand.length > m.holeArrayDemand { holeArrayDemand.pop() }
-    while holeMapNames.length > m.holeMap {
-      holeMapNames.pop()
-      holeMapTys.pop()
-    }
-    while holeAltNames.length > m.holeAlt {
-      holeAltNames.pop()
-      holeAltTys.pop()
-      holeAltPreN.pop()
-      holeAltTailN.pop()
-      holeAltHoleIx.pop()
-    }
-  }
-  if (set & RB_BIN) != 0 { binCstrTruncate(m.binC) }
-  if (set & RB_ARG) != 0 { argCstrTruncate(m.argC) }
-  if (set & RB_PRINT) != 0 { tyIxCstrTruncate(printCstr, m.printC) }
-  if (set & RB_NEST) != 0 { tyIxCstrTruncate(nestCstr, m.nestC) }
-  if (set & RB_IS) != 0 { isCstrTruncate(m.isC) }
-  if (set & RB_RET) != 0 { retCstrTruncate(m.retC) }
-  if (set & RB_LET) != 0 { letCstrTruncate(m.letC) }
-  if (set & RB_BM) != 0 { bmCstrTruncate(m.bmC) }
-  if (set & RB_MEM) != 0 { memCstrTruncate(m.memC) }
-  if (set & RB_UFCS) != 0 { ufcsCstrTruncate(m.ufcsC) }
-  if (set & RB_ESC_JOIN) != 0 {
-    while escJoinTy.length > m.escJoin {
-      escJoinTy.pop()
-      escJoinIx.pop()
-      escJoinWho.pop()
-      escJoinFn.pop()
-    }
-  }
-  if (set & RB_COAL_HOLE) != 0 { coalHoleTruncate(m.coalHole) }
-  if (set & RB_TP_IF) != 0 {
-    while tpIfFn.length > m.tpIf {
-      tpIfFn.pop()
-      tpIfJoin.pop()
-      tpIfNode.pop()
-      tpIfOk.pop()
-    }
-    while tpIfReFn.length > m.tpIfRe {
-      tpIfReFn.pop()
-      tpIfReOwner.pop()
-      tpIfReStart.pop()
-      tpIfReCount.pop()
-      tpIfReParams.pop()
-    }
-  }
-  if (set & RB_CALLEE_WRITE) != 0 { calleeWriteTruncate(m.calleeWrite) }
-  if (set & RB_DJOIN) != 0 {
-    while dJoinNode.length > m.dJoin {
-      dJoinNode.pop()
-      dJoinTy.pop()
-    }
-  }
-  if (set & RB_HOLE_FLOW) != 0 {
-    while holeFlowSrc.length > m.holeFlow {
-      holeFlowSrc.pop()
-      holeFlowDst.pop()
-    }
-  }
-  if (set & RB_INFER_LET) != 0 {
-    while inferLetIx.length > m.inferLet { inferLetIx.pop() }
-    while inferLetTy.length > m.inferLet { inferLetTy.pop() }
-    while inferLetNulStrIx.length > m.inferLetNulStr { inferLetNulStrIx.pop() }
-    while inferLetNulBoolIx.length > m.inferLetNulBool {
-      inferLetNulBoolIx.pop()
-    }
-  }
-  if (set & RB_INFER) != 0 {
-    rollbackInferRet(m.inferRet)
-    while inferStack.length > m.inferStack { inferStack.pop() }
-    while inferTentative.length > m.inferTentative { inferTentative.pop() }
-  }
-  if (set & RB_LINT) != 0 {
-    redunTruncate(m.redun)
-    rcoalTruncate(m.rcoal)
-    isvalTruncate(m.isval)
-  }
-  if (set & RB_DIAGS) != 0 {
-    while T.diags.length > m.diags { T.diags.pop() }
-    numLitNotesDropFrom(m.diags)
-  }
-  0
-}
-
-// ── The quiet probes' rollback assertion (L4) ────────────────────────────────
-// Off unless a host arms it (`probeRollbackArm`). Armed, each quiet probe marks the length of
-// every table some probe rolls back, and on leaving counts each table whose length moved, naming
-// which probe leaves which table behind instead of reading it off the rollback lists.
-
-const PRB_TABLES: string[] = [
-  "T.diags", "argCstrAt", "argCstrExp", "argCstrWho", "argCstrFn",
-  "argCstrNode", "argCstrForm", "nestCstrTy", "nestCstrIx", "nestCstrFn",
-  "calleeWriteRow", "calleeWriteGot", "calleeWriteAt", "isCstrTy", "isCstrChk",
-  "isCstrName", "isCstrIx", "isCstrFn", "retCstrGot", "retCstrWant",
-  "retCstrIx", "retCstrFn", "retCstrWOnly", "letCstrGot", "letCstrWant",
-  "letCstrIx", "letCstrFn", "letCstrName", "letCstrSeq", "bmCstrGot",
-  "bmCstrWant", "bmCstrCtx", "bmCstrIx", "bmCstrFn", "bmCstrForm",
-  "bmCstrLabel", "bmCstrSeq", "memCstrTy", "memCstrProp", "memCstrIx",
-  "memCstrFn", "memCstrDem", "ufcsCstrTy", "ufcsCstrProp", "ufcsCstrIx",
-  "ufcsCstrFn", "ufcsCstrP0", "ufcsCstrMore", "escJoinTy", "escJoinIx",
-  "escJoinWho", "escJoinFn", "coalHoleTy", "coalHoleFn", "tpIfFn", "tpIfJoin",
-  "tpIfNode", "tpIfOk", "tpIfReFn", "tpIfReOwner", "tpIfReStart", "tpIfReCount",
-  "tpIfReNames", "tpIfReTys", "tpIfReParams", "binCstrOp", "binCstrLt",
-  "binCstrRt", "binCstrFn", "printCstrTy", "printCstrIx", "printCstrFn",
-  "dJoinNode", "dJoinTy", "holeFlowSrc", "holeFlowDst", "holeShapeNames",
-  "holeShapeTys", "holeArrayDemand", "holeMapNames", "holeMapTys",
-  "holeAltNames", "holeAltTys", "holeAltPreN", "holeAltTailN", "holeAltHoleIx",
-  "inferLetIx", "inferLetTy", "inferLetNulStrIx", "inferLetNulBoolIx",
-  "inferRetFn", "inferRetTy", "inferRetTyIx", "inferRetAtomCount",
-  "inferRetRung", "inferRetLogTy", "inferRetLogSeed", "inferRetLogLit",
-  "inferStack", "inferTentative", "tpEnvNames", "tpEnvTys", "redunSLine",
-  "redunSCol", "redunELine", "redunECol", "redunName", "redunType", "redunTok",
-  "redunRet", "rcoalLine", "rcoalCol", "rcoalEnd", "rcoalTok", "rcoalType",
-  "rcoalMsg", "rcoalWhy", "rcoalCode", "isvalLine", "isvalCol", "isvalEnd",
-  "isvalTok", "isvalName", "isvalType", "isvalLit", "isvalMsg", "nlnDiag",
-  "nlnMsg", "nlnText", "nlnDecl", "nlnUse", "nlnSlot", "nlnWant", "nlnAnn",
-  "nlnLeaf", "nlnLeafTy", "njFnStack", "cstrOwnerStack",
-]
-
-// The current length of each `PRB_TABLES` entry, in that order.
-function prbLens(): i32[] {
-  [
-    T.diags.length,
-    argCstr.at.length,
-    argCstr.exp.length,
-    argCstr.who.length,
-    argCstr.fn.length,
-    argCstr.node.length,
-    argCstr.form.length,
-    nestCstr.ty.length,
-    nestCstr.ix.length,
-    nestCstr.fn.length,
-    calleeWriteRow.length,
-    calleeWriteGot.length,
-    calleeWriteAt.length,
-    isCstr.ty.length,
-    isCstr.chk.length,
-    isCstr.name.length,
-    isCstr.ix.length,
-    isCstr.fn.length,
-    retCstr.got.length,
-    retCstr.want.length,
-    retCstr.ix.length,
-    retCstr.fn.length,
-    retCstr.wOnly.length,
-    letCstr.got.length,
-    letCstr.want.length,
-    letCstr.ix.length,
-    letCstr.fn.length,
-    letCstr.name.length,
-    letCstr.seq.length,
-    bmCstr.got.length,
-    bmCstr.want.length,
-    bmCstr.ctx.length,
-    bmCstr.ix.length,
-    bmCstr.fn.length,
-    bmCstr.form.length,
-    bmCstr.label.length,
-    bmCstr.seq.length,
-    memCstr.ty.length,
-    memCstr.prop.length,
-    memCstr.ix.length,
-    memCstr.fn.length,
-    memCstr.dem.length,
-    ufcsCstr.ty.length,
-    ufcsCstr.prop.length,
-    ufcsCstr.ix.length,
-    ufcsCstr.fn.length,
-    ufcsCstr.p0.length,
-    ufcsCstr.more.length,
-    escJoinTy.length,
-    escJoinIx.length,
-    escJoinWho.length,
-    escJoinFn.length,
-    coalHoleTy.length,
-    coalHoleFn.length,
-    tpIfFn.length,
-    tpIfJoin.length,
-    tpIfNode.length,
-    tpIfOk.length,
-    tpIfReFn.length,
-    tpIfReOwner.length,
-    tpIfReStart.length,
-    tpIfReCount.length,
-    tpIfReNames.length,
-    tpIfReTys.length,
-    tpIfReParams.length,
-    binCstr.op.length,
-    binCstr.lt.length,
-    binCstr.rt.length,
-    binCstr.fn.length,
-    printCstr.ty.length,
-    printCstr.ix.length,
-    printCstr.fn.length,
-    dJoinNode.length,
-    dJoinTy.length,
-    holeFlowSrc.length,
-    holeFlowDst.length,
-    holeShapeNames.length,
-    holeShapeTys.length,
-    holeArrayDemand.length,
-    holeMapNames.length,
-    holeMapTys.length,
-    holeAltNames.length,
-    holeAltTys.length,
-    holeAltPreN.length,
-    holeAltTailN.length,
-    holeAltHoleIx.length,
-    inferLetIx.length,
-    inferLetTy.length,
-    inferLetNulStrIx.length,
-    inferLetNulBoolIx.length,
-    inferRetFn.length,
-    inferRetTy.length,
-    inferRetTyIx.length,
-    inferRetAtomCount.length,
-    inferRetRung.length,
-    inferRetLogTy.length,
-    inferRetLogSeed.length,
-    inferRetLogLit.length,
-    inferStack.length,
-    inferTentative.length,
-    tpEnvNames.length,
-    tpEnvTys.length,
-    redunSLine.length,
-    redunSCol.length,
-    redunELine.length,
-    redunECol.length,
-    redunName.length,
-    redunType.length,
-    redunTok.length,
-    redunRet.length,
-    rcoalLine.length,
-    rcoalCol.length,
-    rcoalEnd.length,
-    rcoalTok.length,
-    rcoalType.length,
-    rcoalMsg.length,
-    rcoalWhy.length,
-    rcoalCode.length,
-    isvalLine.length,
-    isvalCol.length,
-    isvalEnd.length,
-    isvalTok.length,
-    isvalName.length,
-    isvalType.length,
-    isvalLit.length,
-    isvalMsg.length,
-    nlnDiag.length,
-    nlnMsg.length,
-    nlnText.length,
-    nlnDecl.length,
-    nlnUse.length,
-    nlnSlot.length,
-    nlnWant.length,
-    nlnAnn.length,
-    nlnLeaf.length,
-    nlnLeafTy.length,
-    njFnStack.length,
-    cstrOwnerStack.length,
-  ]
-}
-
-let prbArmed = false
-// The must-fire control: 1 makes `inferReturnsPrePass` keep its quiet diagnostics.
-let prbSkip = 0
-let prbMarks: i32[][] = []
-let prbRowKey: string[] = []
-let prbRowN: i32[] = []
-
-// Arm (1) or disarm (0) the assertion for the compiles that follow; arming clears the rows.
-export function probeRollbackArm(on: i32) {
-  prbArmed = on != 0
-  prbMarks = []
-  prbRowKey = []
-  prbRowN = []
-  0
-}
-
-// Test-only: 1 skips one rollback (`prbSkip`), so a control can prove the assertion fires.
-export function probeRollbackSkipSet(k: i32) {
-  prbSkip = k
-  0
-}
-
-export function probeRollbackRowCount() { prbRowKey.length }
-export function probeRollbackRowLen(i: i32) { prbRowKey[i].length }
-export function probeRollbackRowAt(i: i32, j: i32) { prbRowKey[i][j] }
-export function probeRollbackRowN(i: i32) { prbRowN[i] }
-
-function prbCount(key: string) {
-  let i = 0
-  while i < prbRowKey.length {
-    if prbRowKey[i] == key {
-      prbRowN[i] = prbRowN[i] + 1
-      return 0
-    }
-    i = i + 1
-  }
-  prbRowKey.push(key)
-  prbRowN.push(1)
-  0
-}
-
-// A probe begins: mark every table's length. Callers test `prbArmed` first.
-function prbEnter() {
-  prbMarks.push(prbLens())
-  0
-}
-
-// Probe `site` has rolled back: one `site | ran` row, and one `site | table | +` (or `-`) row
-// for each table whose length differs from its mark.
-function prbLeave(site: string) {
-  const m = prbMarks.pop() ?? []
-  prbCount(site + " | ran")
-  const cur = prbLens()
-  let i = 0
-  while i < cur.length && i < m.length {
-    if cur[i] > m[i] { prbCount(site + " | " + PRB_TABLES[i] + " | +") }
-    if cur[i] < m[i] { prbCount(site + " | " + PRB_TABLES[i] + " | -") }
-    i = i + 1
-  }
-  0
 }
 
 // Whether `o` holds a member apart from some member of `u` (`tyParamsPart`) that no member of
@@ -20034,19 +19369,6 @@ export function primTyOfName(name: string) {
   if name == "v128" {
     v128Seen = true
     return TY_V128
-  }
-  -1
-}
-
-// A live type-parameter binding — a generic function's `<T>` while its annotations resolve, or a
-// generic alias application's params while its body resolves — innermost wins. `tpEnvTys` only ever
-// receives `mkTyVar` results and already-resolved argument types, both >= 0, so -1 unambiguously
-// means "not bound".
-function tpEnvTyOfName(name: string) {
-  let tpi = tpEnvNames.length - 1
-  while tpi >= 0 {
-    if tpEnvNames[tpi] == name { return tpEnvTys[tpi] }
-    tpi = tpi - 1
   }
   -1
 }
@@ -29409,95 +28731,6 @@ function bindOf(bNames: string[], bTys: i32[], name: string) {
   -1
 }
 
-// The demanded shape (TyObj arena index) of hole `name`, or -1.
-function holeShapeOf(name: string) {
-  let i = 0
-  while i < holeShapeNames.length {
-    if holeShapeNames[i] == name { return holeShapeTys[i] }
-    i = i + 1
-  }
-  -1
-}
-
-// How many fields hole `name`'s demanded shape carries right now (0 when it has no shape
-// yet). The shape's `TyObj` grows in place, so an alternative records a count, not a snapshot type.
-function holeShapeFieldCount(name: string) {
-  const shape = holeShapeOf(name)
-  if shape < 0 { return 0 }
-  const st = T.tys[shape]
-  if st is TyObj { return st.objFieldNames.length }
-  0
-}
-
-// The `holeAlt*` row hole `name` already carries for tested type `ty`, or -1. Matched
-// structurally (`tyEq`) rather than by arena index, since every pass over the body
-// re-resolves the `is` annotation to a fresh arena entry — the index differs while the type
-// does not.
-function holeAltRowOf(name: string, ty: i32) {
-  if ty < 0 { return -1 }
-  let i = 0
-  while i < holeAltNames.length {
-    if holeAltNames[i] == name && tyEq(holeAltTys[i], ty) { return i }
-    i = i + 1
-  }
-  -1
-}
-
-// Registers an `is`-guard alternative `ty` for hole `name`, with the fields demanded so far
-// pinned as its required prefix. Returns the new row's index so the guard can patch
-// `holeAltTailN` once its arms are checked, or -1 when there is nothing to patch.
-function noteHoleAlt(holeIx: i32, name: string, ty: i32) {
-  if ty < 0 { return -1 }
-  // A body is checked more than once (the return-inference pre-pass, then the real pass)
-  // and the demanded shape accumulates across them — never cleared — so only the first walk
-  // sees it grow from empty. A re-check keeps the existing row verbatim (returning -1, so
-  // the guard does not re-patch its tail) rather than appending a duplicate.
-  let i = 0
-  while i < holeAltNames.length {
-    if holeAltNames[i] == name && tyEq(holeAltTys[i], ty) { return -1 }
-    i = i + 1
-  }
-  const pre = holeShapeFieldCount(name)
-  holeAltNames.push(name)
-  holeAltTys.push(ty)
-  holeAltPreN.push(pre)
-  holeAltTailN.push(-1)
-  holeAltHoleIx.push(holeIx)
-  holeAltNames.length - 1
-}
-
-// The demanded-shape fields an argument satisfying alternative `k` still reaches: the
-// prefix demanded before the guard, plus (when the guard's then-branch does not diverge)
-// the suffix demanded after it. Returns -1 when nothing is required.
-function holeAltResidualTy(shape: i32, k: i32) {
-  if shape < 0 { return -1 }
-  const st = T.tys[shape]
-  if st is TyObj {
-    const names: string[] = []
-    const tys: i32[] = []
-    const all = st.objFieldNames
-    const allTys = st.objFieldTypes
-    let i = 0
-    while i < holeAltPreN[k] && i < all.length {
-      names.push(all[i])
-      tys.push(allTys[i])
-      i = i + 1
-    }
-    const tail = holeAltTailN[k]
-    if tail >= 0 {
-      let j = tail
-      while j < all.length {
-        names.push(all[j])
-        tys.push(allTys[j])
-        j = j + 1
-      }
-    }
-    if names.length == 0 { return -1 }
-    return mkObjTy(names, tys)
-  }
-  -1
-}
-
 // `srcExpr < 0` (a dispatch probe with no argument node — a UFCS receiver, an operator
 // operand) checks the type alone, so the literal-aware / rep-sidecar recording in
 // `assignableExpr` is not driven by a node index it does not have.
@@ -29586,104 +28819,10 @@ function holeDemandOk(name: string, srcExpr: i32, at: i32) {
   false
 }
 
-// Alternative `k` as the caller actually experiences it: the `is`-tested type conjoined
-// with the demanded fields a guard-taking argument still reaches. `holeDemandOk` requires
-// both, so rendering the tested type alone produced a self-contradictory diagnostic that
-// named an arm the rejected argument appears to satisfy.
-function holeAltRenderTy(shape: i32, k: i32) {
-  const alt = holeAltTys[k]
-  const resid = holeAltResidualTy(shape, k)
-  if resid < 0 { return alt }
-  const at = T.tys[alt]
-  const rt = T.tys[resid]
-  if at is TyObj {
-    if rt is TyObj {
-      const names: string[] = []
-      const tys: i32[] = []
-      let i = 0
-      while i < rt.objFieldNames.length {
-        if objFieldType(at, rt.objFieldNames[i]) < 0 {
-          names.push(rt.objFieldNames[i])
-          tys.push(rt.objFieldTypes[i])
-        }
-        i = i + 1
-      }
-      let j = 0
-      while j < at.objFieldNames.length {
-        names.push(at.objFieldNames[j])
-        tys.push(at.objFieldTypes[j])
-        j = j + 1
-      }
-      return mkObjTy(names, tys)
-    }
-  }
-  alt
-}
-
-// The full expectation for hole `name` as one type: the demanded shape alone, or — when the
-// body also `is`-tested the hole — the disjunction of every accepted arm, so the diagnostic
-// and hover both name all of them. Each alternative renders with its still-required
-// residual folded in. -1 when the hole demands nothing.
-function holeDemandTy(name: string) {
-  // A map demand is the whole expectation on its own — `holeDemandOk` requires it
-  // unconditionally, so it is not one arm of the disjunction.
-  const hmd = holeMapOf(name)
-  if hmd >= 0 { return hmd }
-  const shape = holeShapeOf(name)
-  const members: i32[] = []
-  let k = 0
-  while k < holeAltNames.length {
-    if holeAltNames[k] == name {
-      const m = holeAltRenderTy(shape, k)
-      if !tyArrHasEq(members, m) { members.push(m) }
-    }
-    k = k + 1
-  }
-  if shape >= 0 {
-    if !tyArrHasEq(members, shape) { members.push(shape) }
-  }
-  if members.length == 0 { return -1 }
-  if members.length == 1 { return members[0] }
-  mkUnionTy(members)
-}
-
-// `holeDemandTy` rendered — the `expected …` half of a failed hole-demand check.
-function holeDemandStr(name: string) {
-  const d = holeDemandTy(name)
-  // "Demands nothing" is the same blank `tyToStrAt` writes for an absent arena entry,
-  // and it must stay the same token: this string lands in the `expected …` half of a
-  // message whose `got …` half comes from that renderer.
-  if d < 0 { return "_" }
-  tyToStr(d)
-}
-
-// Records that hole `name` is indexed (so it demands an array). Idempotent.
-function noteArrayDemand(name: string) {
-  let i = 0
-  while i < holeArrayDemand.length {
-    if holeArrayDemand[i] == name { return 0 }
-    i = i + 1
-  }
-  holeArrayDemand.push(name)
-  0
-}
-
-// A WRITE demand rides the same column under a key no hole name can spell, and it carries
-// the owning function: a declared type parameter's hole is named `T`, so three functions
-// each declaring `<T>` would share one row and a name-only key would fire on all three.
-// The owner is `curFnEscName` where the body records it and the callee at the pin.
-function holeWriteKey(fnName: string, tvName: string): string {
-  "!w!" + fnName + "!" + tvName
-}
-
 // The body wrote THROUGH this hole (`xs.push(v)`, `xs[0] = v`), not merely indexed it. A
 // read-only list view is refused at such a pin and accepted at every other.
 function noteArrayWriteDemand(tvName: string) {
   noteArrayDemand(holeWriteKey(curFnEscName, tvName))
-}
-
-function holeIsArrayWriteDemanded(fnName: string, tvName: string) {
-  holeIsArrayDemanded(holeWriteKey(fnName, tvName))
 }
 
 // The pin's own refusal: an un-annotated type parameter whose body writes the list cannot
@@ -29729,18 +28868,6 @@ function holeMapMethod(name: string) {
     || name == "add"
     || name == "keys"
     || name == "values"
-}
-
-// The demanded map type of hole `name` (the arena index of a `TyMap` whose key/value the
-// callee's own map operations pin in place, exactly as `.push` pins an empty `[]`'s
-// element), or -1 when the hole has no map demand. Parallel columns, like `holeShape*`.
-function holeMapOf(name: string) {
-  let i = 0
-  while i < holeMapNames.length {
-    if holeMapNames[i] == name { return holeMapTys[i] }
-    i = i + 1
-  }
-  -1
 }
 
 // Get-or-create hole `name`'s demanded map: an open `{[?]: ?}` on first use, then the same
@@ -29981,60 +29108,6 @@ function fnLitRetMismatchSite(fn: FuncDecl, expected: i32, at: i32) {
   -1
 }
 
-function holeMapDemandTy(name: string, isSet: boolean) {
-  const have = holeMapOf(name)
-  if have >= 0 { return have }
-  let mv = -1
-  let ms = 0
-  if isSet {
-    mv = TY_BOOL
-    ms = 1
-  }
-  const ty = mkMapTy(-1, mv, ms)
-  holeMapNames.push(name)
-  holeMapTys.push(ty)
-  ty
-}
-
-// Whether any `is` guard in the body tested hole `name` — `holeAltNames` is the record, and
-// this is the boolean half. The alternatives are what the guard's branch handles on its own
-// path, so a rung that decides from the pin alone must decline (D1342).
-function holeHasIsAlt(name: string) {
-  let a = 0
-  while a < holeAltNames.length {
-    if holeAltNames[a] == name { return true }
-    a = a + 1
-  }
-  false
-}
-
-// The array-demand key of type variable row `row`: a declared type parameter is keyed by
-// its declaring function, since every generic may call its own `T` (D3884); a hole, or a row
-// with no recorded owner, by its name.
-function arrayDemandKey(row: i32): string {
-  const t = T.tys[row]
-  if !(t is TyVar) { return "" }
-  const owner = tyVarOwnerOf(row)
-  if owner == "" || t.tvName == "" || t.tvName[0] == '?' { return t.tvName }
-  "!r!" + owner + "!" + t.tvName
-}
-
-// Whether a parameter typed by row `row` is indexed in its function's body.
-function rowIsArrayDemanded(row: i32): boolean {
-  const t = T.tys[row]
-  if !(t is TyVar) { return false }
-  holeIsArrayDemanded(arrayDemandKey(row)) || holeIsArrayDemanded(t.tvName)
-}
-
-function holeIsArrayDemanded(name: string) {
-  let i = 0
-  while i < holeArrayDemand.length {
-    if holeArrayDemand[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
-
 // Does constraint `owner` belong to the body a call to `calleeFn` will instantiate? A
 // declared callee adjudicates its own body's constraints and nobody else's; an owner-less
 // constraint always applies; a call that cannot name its callee consults everything.
@@ -30118,43 +29191,6 @@ function coalDefNote(ix: i32, face: i32, rt: i32) {
   if d < 0 { return 0 }
   while coalDefHole.length <= ix { coalDefHole.push(-1) }
   coalDefHole[ix] = d
-  0
-}
-
-// Records a deferred destination constraint when either side carries a hole — the body
-// cannot decide it then. Stamped with the owning declaration, for the same reason
-// `noteBinCstr` is. No `wOnly` column: that column exists at the return seam only to gate
-// D561's newtype exemption, and this seam has no exemption to gate.
-function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
-  if tyHasHole(got) || tyHasHole(want) {
-    const owner = cstrOwnerTop()
-    // Outside every generic, a type parameter can only be a generic function value's own, which
-    // its delivery binds and adjudicates (`genFnValueCstrs`); a row would be re-asked of every
-    // later generic call whose parameter shares the name (D3104).
-    if owner < 0 && tpEnvNames.length == 0 {
-      if !tyHasInferHole(got, 0) && !tyHasInferHole(want, 0) { return 0 }
-    }
-    let k = 0
-    while k < letCstr.got.length {
-      if letCstr.fn[k] == owner {
-        if (
-          tyEqSameHoles(letCstr.got[k], got)
-          && tyEqSameHoles(letCstr.want[k], want)
-        ) {
-          return 0
-        }
-      }
-      k = k + 1
-    }
-    letCstr.got.push(got)
-    letCstr.want.push(want)
-    letCstr.ix.push(ix)
-    letCstr.fn.push(owner)
-    letCstr.name.push(name)
-    letCstr.seq.push(cstrSeqNext)
-    cstrSeqNext = cstrSeqNext + 1
-    cvMark(CV_LET, letCstr.fn.length - 1)
-  }
   0
 }
 
@@ -31724,61 +30760,6 @@ function noteHoleFlow(src: i32, dst: i32, at: i32) {
   noteHoleFlowGo(src, dst, 6)
 }
 
-// The parallel src/dst walk `noteHoleFlow` records through: a bare hole meeting a concrete
-// destination is the answer, and a composite source (`{f: u}`, `[u]`, a map store) descends
-// into the matching destination position so the per-position hole is reached instead of
-// short-circuited by `assignable`. Only matching shapes descend — a mismatch stays a diagnostic.
-function noteHoleFlowGo(src: i32, dst: i32, depth: i32) {
-  if depth <= 0 { return 0 }
-  if src < 0 || dst < 0 { return 0 }
-  if tyIsHole(src) {
-    if tyIsDeferredJoin(dst) { return 0 }
-    if isNeverTy(dst) { return 0 }
-    if tyReachesHole(dst, 8) { return 0 }
-    const dt = T.tys[dst]
-    if dt is TyErr { return 0 }
-    // A multi-arm union destination is a choice, not an answer (D1520) — adopting it whole
-    // makes the body reject its own operators. A literal union is one rep and stays solvable.
-    if dt is TyUnion {
-      if !tyIsLitUnion(dst) && numLitUnionBaseTy(dst) < 0 { return 0 }
-    }
-    holeFlowSrc.push(src)
-    holeFlowDst.push(dst)
-    return 0
-  }
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyArray {
-    if d is TyArray { return noteHoleFlowGo(s.aElem, d.aElem, depth - 1) }
-    return 0
-  }
-  if s is TyMap {
-    if d is TyMap { return noteHoleFlowGo(s.mVal, d.mVal, depth - 1) }
-    return 0
-  }
-  if s is TyNullable {
-    if d is TyNullable { return noteHoleFlowGo(s.nInner, d.nInner, depth - 1) }
-    return 0
-  }
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < s.objFieldNames.length {
-        let j = 0
-        while j < d.objFieldNames.length {
-          if d.objFieldNames[j] == s.objFieldNames[i] {
-            noteHoleFlowGo(s.objFieldTypes[i], d.objFieldTypes[j], depth - 1)
-          }
-          j = j + 1
-        }
-        i = i + 1
-      }
-    }
-    return 0
-  }
-  0
-}
-
 // The type an un-annotated parameter takes — the single source of truth. A parameter whose
 // own body pinned it takes that type as if annotated; one nothing pinned takes a fresh
 // inference hole. Every producer (the pass-1 hoist, `checkFuncDeclNode`, the emitter's
@@ -32025,21 +31006,6 @@ function validateEscJoins(bNames: string[], bTys: i32[], calleeFn: i32) {
     ci = ci + 1
   }
   0
-}
-
-// Is `at` a composite argument whose hole only a pin can decide against the concrete `exp`? A
-// function value is its delivery's to adjudicate (`genFnValueCstrs`), and outside every generic
-// a hole is such a value's own, so neither is recorded (D3104).
-function compArgCstrOk(at: i32, exp: i32): boolean {
-  if at < 0 || at >= T.tys.length { return false }
-  const t = T.tys[at]
-  if (
-    !(t is TyArray || t is TyObj || t is TyMap || t is TyNullable || t is TyUnion)
-  ) {
-    return false
-  }
-  if cstrOwnerTop() < 0 && tpEnvNames.length == 0 { return false }
-  tyHasHole(at) && !tyHasHole(exp)
 }
 
 // A composite argument demand at the pin that closes it: its node is asked the direct call's
@@ -33017,21 +31983,6 @@ function bankCoalHoles(bNames: string[], bTys: i32[], calleeFn: i32) {
     }
     ci = ci + 1
   }
-  0
-}
-
-// Records a `??` result hole so the pin can bank it. Stamped with the owning declaration for
-// the by-name `TyVar` reason `noteMemCstr` needs it; a row is kept once.
-function noteCoalResultHole(ty: i32) {
-  if ty < 0 { return 0 }
-  const owner = cstrOwnerTop()
-  let k = 0
-  while k < coalHoleTy.length {
-    if coalHoleTy[k] == ty && coalHoleFn[k] == owner { return 0 }
-    k = k + 1
-  }
-  coalHoleTy.push(ty)
-  coalHoleFn.push(owner)
   0
 }
 
@@ -39913,16 +38864,6 @@ function resolveAnnotAt(
   r
 }
 
-// Is `name` currently being inferred (on the in-progress stack)?
-function onInferStack(name: string) {
-  let i = 0
-  while i < inferStack.length {
-    if inferStack[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
-
 // Record a type a PENDING body produced (a `return e` or the trailing expression):
 // the first CONCRETE type wins; an error type only notes that something err-ish
 // flowed back (an in-cycle call), which distinguishes "void body" from "no basis".
@@ -40417,8 +39358,7 @@ function inferReturnsPrePass() {
   let rounds = 0
   while shrinking && rounds < 2000 {
     rounds = rounds + 1
-    const work = inferTentative
-    inferTentative = []
+    const work = inferTentativeTake()
     let r = 0
     while r < work.length {
       resetReturnPending(work[r])
@@ -40649,18 +39589,6 @@ function cstrProbeBefore(stmt: i32) {
   symEnabled = savedSym
   checkRollback(m, RB_CSTR_PROBE)
   if prbArmed { prbLeave("cstrProbeBefore") }
-  0
-}
-
-export function redunTruncate(n: i32) {
-  while redunSLine.length > n { redunSLine.pop() }
-  while redunSCol.length > n { redunSCol.pop() }
-  while redunELine.length > n { redunELine.pop() }
-  while redunECol.length > n { redunECol.pop() }
-  while redunName.length > n { redunName.pop() }
-  while redunType.length > n { redunType.pop() }
-  while redunTok.length > n { redunTok.pop() }
-  while redunRet.length > n { redunRet.pop() }
   0
 }
 
@@ -45636,13 +44564,6 @@ function recordInferRet(
   0
 }
 
-// The top-level atom count of the inferred-return name at row `i` (`inferRetTyAt`'s
-// sibling): >= 1 for every recorded row, -1 only for an out-of-range index.
-export function inferRetAtomCountAt(i: i32) {
-  if i < 0 || i >= inferRetAtomCount.length { return -1 }
-  inferRetAtomCount[i]
-}
-
 // The inferred-return null question, asked of the arena type `recordInferRet` banked beside
 // the name, not of the rendered spelling (which only ever split on `|`). `ty < 0` returns
 // false because every name-keyed row carries a real arena index; the node-keyed `#`-prefixed
@@ -45764,10 +44685,6 @@ function isObjShapeName(nm: string) {
   tyTopIndexOf(nm, '|', 0, 0) < 0
 }
 
-// Iteration over the inferred-return table: the emitter's `collectU` registers any value-union
-// names here so their box reps are interned even when an inferred return is the program's only
-// value union. `inferRetTyAt` is the rendered type name.
-export function inferRetCount() { inferRetFn.length }
 // The row index, resolved once — so a consumer that wants both the recorded name and the
 // recorded type reads one lookup and two columns instead of two lookups that happen to agree.
 // Every `recordInferRet` call site passes both, so no row can carry a name without a type.
@@ -45785,31 +44702,6 @@ export function inferRetRowByNode(nodeIx: i32): i32 {
 // One predicate per converted arm, exported so the rung numbering stays this file's business.
 // Safe against named rows only because `#` cannot open an identifier — `synthRetAnnots` keys
 // by node (`"#" + nodeIx`) while the named loop keys by function name, disjoint by construction.
-
-export function inferRetTyAt(i: i32) {
-  if i < 0 || i >= inferRetTy.length { return "" }
-  inferRetTy[i]
-}
-// The `Ty`-arena index of the `i`th recorded inferred return (`-1` if none) — the emitter's
-// `collectU` drives the structural arena walks off this so an inferred return's reachable
-// unions/closures register/intern exactly like an annotated one.
-export function inferRetTyIxAt(i: i32) {
-  if i < 0 || i >= inferRetTyIx.length { return -1 }
-  inferRetTyIx[i]
-}
-
-// The emitter reads this to classify an un-annotated binding (`const x = if c { v } else
-// null`) from its inferred value-union type name, keyed by `LetDecl` node index, rather than
-// re-deriving it from the initializer. "" when the binding is not an inferred value union.
-export function inferLetNameOf(letIx: i32) {
-  let i = 0
-  while i < inferLetIx.length {
-    if inferLetIx[i] == letIx { return inferLetTy[i] }
-    i = i + 1
-  }
-  ""
-}
-export function inferLetCount() { inferLetIx.length }
 
 // Records the type of join node `ix` when it is a struct-bearing union or carries a literal-union
 // arm, and registers its struct members as arms, as the binding route does (D2373). Only a `??`
@@ -45834,7 +44726,6 @@ function noteInferJoin(ix: i32, t: i32) {
 }
 export function inferJoinCount() { inferJoinTys.length }
 export function inferJoinTyAt(i: i32) { inferJoinTys[i] }
-export function inferLetIxAt(i: i32) { inferLetIx[i] }
 // D970 — does this body return two different concrete types? The A20 gate uses it to tell a
 // join over the function's own literals (which every instantiation shares) from a per-call-site
 // result (which must not register a box). A return whose type carries a type variable is
@@ -47050,7 +45941,6 @@ export function nodeArrayElemName(ix: i32) {
   }
   ""
 }
-export function inferLetTyAt(i: i32) { inferLetTy[i] }
 
 // Whether every type variable in `ty` belongs to the named generic whose body is being checked.
 function tyVarsOfEnclosingGeneric(ty: i32): boolean {
@@ -47254,19 +46144,6 @@ export function nodeUnionName(ix: i32) {
   ""
 }
 
-// Rolls the inferred-return table back to `mark` — all five columns `recordInferRet` pushes,
-// not two. The index (`inferRetIdx`) is deliberately not rolled back: a `.delete()` would be
-// costly, and the readers are bounds-checked instead, the same defence at a fraction of the
-// cost. Unreachable from the name-keyed recorder — only the node-keyed re-check path calls it.
-function rollbackInferRet(mark: i32) {
-  while inferRetFn.length > mark { inferRetFn.pop() }
-  while inferRetTy.length > mark { inferRetTy.pop() }
-  while inferRetTyIx.length > mark { inferRetTyIx.pop() }
-  while inferRetAtomCount.length > mark { inferRetAtomCount.pop() }
-  while inferRetRung.length > mark { inferRetRung.pop() }
-  0
-}
-
 // Monomorphic body inference: lifts the element-hole ceiling for an un-annotated param by
 // re-checking the shared body with each param bound to `paramTyIxs` (arena indices), fully
 // isolated (`inferQuiet`, every append-only table truncated back). Returns the resolved list
@@ -47306,10 +46183,6 @@ export function monoInferListElem(
 // How many pinned re-checks (`monoRecheckBegin`) are open. The body under one is shared by
 // every instance, so a check-time arena rewrite that depends on the pin must not run.
 let monoRecheckDepth = 0
-
-// What `monoRecheckBegin` saves and `monoRecheckEnd` restores: the two suppression flags and
-// the tables' lengths, of which it rolls back `RB_MONO`.
-type MonoSave = { quiet: boolean, sym: i32, mark: CheckMark }
 
 // The pinned re-check itself, in one home, opened and closed around the caller's read.
 // `monoInferListElem`, `monoInferLocalScalar` and `monoInferRetExprTy` ask the same question,
@@ -47593,30 +46466,6 @@ export function monoInferRetSetListTy(
       return -1
     }
   }
-}
-
-// Whether the LetDecl at `letIx` is recorded as an inferred `string | null` niche
-// if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
-// consults this so the slot classifies as kind 16 and reuses the annotated lowering.
-export function isInferLetNulStr(letIx: i32) {
-  let i = 0
-  while i < inferLetNulStrIx.length {
-    if inferLetNulStrIx[i] == letIx { return true }
-    i = i + 1
-  }
-  false
-}
-
-// The `boolean | null` companion of `isInferLetNulStr`: whether the LetDecl at `letIx`
-// is recorded as an inferred `boolean | null` niche if-binding. The emitter's
-// `letNulBool` consults this so the slot classifies as the niche i32 rep.
-export function isInferLetNulBool(letIx: i32) {
-  let i = 0
-  while i < inferLetNulBoolIx.length {
-    if inferLetNulBoolIx[i] == letIx { return true }
-    i = i + 1
-  }
-  false
 }
 
 // —— value-union name classification (moved from wasmEmit to break the typecheck<->emitter

@@ -1,0 +1,493 @@
+// `check_hole_rows.vl` — what a generic body's own uses demand of an un-annotated parameter.
+// A member read grows the hole's demanded shape, an index demands an array, a map operation a
+// map, and an `is` guard records an alternative; each call site checks its argument against
+// the demand (`holeDemandTy`). Kept here too: the `??` result holes the pin substitutes, the
+// hole-to-destination flows a parameter solve reads, and a hole callee's writes into a
+// binding's open list. `holeRowsReset` clears every table per program; the `*Truncate` steps
+// roll them back for a quiet probe.
+
+import {
+  T,
+  TY_BOOL,
+  TyArray,
+  TyErr,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  TyVar,
+  mkMapTy,
+  mkObjTy,
+  numLitUnionBaseTy,
+  objFieldType,
+  tyArrHasEq,
+  tyEq,
+  tyIsHole,
+  tyIsLitUnion,
+  tyToStr,
+} from "./check_types"
+import { mkUnionTy } from "./check_union_mint"
+import { tyVarOwnerOf } from "./check_hole_pins"
+import { tyIsDeferredJoin } from "./check_tp_join"
+import { isNeverTy, tyReachesHole } from "./check_ty_shape"
+import { cstrOwnerTop } from "./check_cstr_rows"
+
+// Demanded hole shapes: a member access on an inference-hole param (`self.x` where `self`
+// is the hole `?add.0`) records field `x` on the hole's demanded shape, a TyObj that grows
+// one derived hole (`?fld.x.?add.0`) per accessed field. Each call site checks its argument
+// against the shape, and `substTyDeep` resolves the derived holes against the bindings.
+export let holeShapeNames: string[] = []
+export let holeShapeTys: i32[] = []
+
+// Hole names the body indexed (`self[i]`), so the hole demands an array: the call site
+// rejects a non-indexable scalar argument bound to such a param (`head(5)` where the body
+// read `self[0]`).
+export let holeArrayDemand: string[] = []
+
+// Hole names whose body used the map/set surface (`self.set(k, v)`, `.get`, `.has`,
+// `.delete`, `.add`, `.keys()`, `.values()`), so the hole demands a map; the parallel
+// `holeMapTys` entry is that map — an open `{[?]: ?}` the body's own operations pin in
+// place. The map dual of `holeArrayDemand`, carrying a type rather than only a flag.
+export let holeMapNames: string[] = []
+export let holeMapTys: i32[] = []
+
+// Alternative hole constraints contributed by an `is` guard over the hole itself: the
+// tested types are alternatives, not extra fields, so the call-arg check accepts an
+// argument satisfying the demanded shape or one of them. `holeAltPreN[k]` counts the shape
+// fields reached before the guard, `holeAltTailN[k]` those at its end, -1 when it diverges.
+export let holeAltNames: string[] = []
+export let holeAltTys: i32[] = []
+export let holeAltPreN: i32[] = []
+export let holeAltTailN: i32[] = []
+
+// The arena index of the hole each alternative constrains, the same hole `holeAltNames[k]`
+// names. `mkGuardedRetTy` needs a handle on that hole, not just its name, to build a
+// guarded-member derivation whose base points at it.
+export let holeAltHoleIx: i32[] = []
+
+// D1702 — the `HD_COAL` result holes a body minted, so the pin can substitute them. Nothing
+// else asks: a `??` result is not a constraint, so no validator reaches it and `substHoleTy`
+// never banks its pin. The emitter's `??` arm turns on that pin, so the rows exist to be
+// substituted for the BANK, not for a diagnostic; the answer is discarded.
+export let coalHoleTy: i32[] = []
+export let coalHoleFn: i32[] = []
+
+// Drops every `coalHole*` row from `n` on, both columns together.
+export function coalHoleTruncate(n: i32) {
+  while coalHoleTy.length > n {
+    coalHoleTy.pop()
+    coalHoleFn.pop()
+  }
+  0
+}
+
+// Hole → concrete destination, recorded only while `paramSolveProbe` is set. `assignableExpr`
+// is the one seam every binding / argument / return / field / element / store flows through, so
+// a single hook there sees every such usage.
+export let holeFlowSrc: i32[] = []
+export let holeFlowDst: i32[] = []
+
+// D3746 — a hole callee's write into an open list handed over as a BINDING, which the call may
+// not pin (the binding's own later writes still decide it): the row and the written value's
+// type. The flush gives a row still open at scope close the first write's element.
+export let calleeWriteRow: i32[] = []
+export let calleeWriteGot: i32[] = []
+
+// The call node that recorded each `calleeWriteRow` write, where `checkCalleeWrites` reports (D3775).
+export let calleeWriteAt: i32[] = []
+
+// Drops every `calleeWrite*` row from `n` on, all columns together.
+export function calleeWriteTruncate(n: i32) {
+  while calleeWriteRow.length > n {
+    calleeWriteRow.pop()
+    calleeWriteGot.pop()
+    calleeWriteAt.pop()
+  }
+  0
+}
+
+// Whether `ty` is a hole-parameter's demanded map, which the call sites fill.
+export function isHoleMapDemandTy(ty: i32): boolean {
+  let i = 0
+  while i < holeMapTys.length {
+    if holeMapTys[i] == ty { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The demanded shape (TyObj arena index) of hole `name`, or -1.
+export function holeShapeOf(name: string) {
+  let i = 0
+  while i < holeShapeNames.length {
+    if holeShapeNames[i] == name { return holeShapeTys[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// How many fields hole `name`'s demanded shape carries right now (0 when it has no shape
+// yet). The shape's `TyObj` grows in place, so an alternative records a count, not a snapshot type.
+export function holeShapeFieldCount(name: string) {
+  const shape = holeShapeOf(name)
+  if shape < 0 { return 0 }
+  const st = T.tys[shape]
+  if st is TyObj { return st.objFieldNames.length }
+  0
+}
+
+// The `holeAlt*` row hole `name` already carries for tested type `ty`, or -1. Matched
+// structurally (`tyEq`) rather than by arena index, since every pass over the body
+// re-resolves the `is` annotation to a fresh arena entry — the index differs while the type
+// does not.
+export function holeAltRowOf(name: string, ty: i32) {
+  if ty < 0 { return -1 }
+  let i = 0
+  while i < holeAltNames.length {
+    if holeAltNames[i] == name && tyEq(holeAltTys[i], ty) { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Registers an `is`-guard alternative `ty` for hole `name`, with the fields demanded so far
+// pinned as its required prefix. Returns the new row's index so the guard can patch
+// `holeAltTailN` once its arms are checked, or -1 when there is nothing to patch.
+export function noteHoleAlt(holeIx: i32, name: string, ty: i32) {
+  if ty < 0 { return -1 }
+  // A body is checked more than once (the return-inference pre-pass, then the real pass)
+  // and the demanded shape accumulates across them — never cleared — so only the first walk
+  // sees it grow from empty. A re-check keeps the existing row verbatim (returning -1, so
+  // the guard does not re-patch its tail) rather than appending a duplicate.
+  let i = 0
+  while i < holeAltNames.length {
+    if holeAltNames[i] == name && tyEq(holeAltTys[i], ty) { return -1 }
+    i = i + 1
+  }
+  const pre = holeShapeFieldCount(name)
+  holeAltNames.push(name)
+  holeAltTys.push(ty)
+  holeAltPreN.push(pre)
+  holeAltTailN.push(-1)
+  holeAltHoleIx.push(holeIx)
+  holeAltNames.length - 1
+}
+
+// The demanded-shape fields an argument satisfying alternative `k` still reaches: the
+// prefix demanded before the guard, plus (when the guard's then-branch does not diverge)
+// the suffix demanded after it. Returns -1 when nothing is required.
+export function holeAltResidualTy(shape: i32, k: i32) {
+  if shape < 0 { return -1 }
+  const st = T.tys[shape]
+  if st is TyObj {
+    const names: string[] = []
+    const tys: i32[] = []
+    const all = st.objFieldNames
+    const allTys = st.objFieldTypes
+    let i = 0
+    while i < holeAltPreN[k] && i < all.length {
+      names.push(all[i])
+      tys.push(allTys[i])
+      i = i + 1
+    }
+    const tail = holeAltTailN[k]
+    if tail >= 0 {
+      let j = tail
+      while j < all.length {
+        names.push(all[j])
+        tys.push(allTys[j])
+        j = j + 1
+      }
+    }
+    if names.length == 0 { return -1 }
+    return mkObjTy(names, tys)
+  }
+  -1
+}
+
+// Alternative `k` as the caller actually experiences it: the `is`-tested type conjoined
+// with the demanded fields a guard-taking argument still reaches. `holeDemandOk` requires
+// both, so rendering the tested type alone produced a self-contradictory diagnostic that
+// named an arm the rejected argument appears to satisfy.
+function holeAltRenderTy(shape: i32, k: i32) {
+  const alt = holeAltTys[k]
+  const resid = holeAltResidualTy(shape, k)
+  if resid < 0 { return alt }
+  const at = T.tys[alt]
+  const rt = T.tys[resid]
+  if at is TyObj {
+    if rt is TyObj {
+      const names: string[] = []
+      const tys: i32[] = []
+      let i = 0
+      while i < rt.objFieldNames.length {
+        if objFieldType(at, rt.objFieldNames[i]) < 0 {
+          names.push(rt.objFieldNames[i])
+          tys.push(rt.objFieldTypes[i])
+        }
+        i = i + 1
+      }
+      let j = 0
+      while j < at.objFieldNames.length {
+        names.push(at.objFieldNames[j])
+        tys.push(at.objFieldTypes[j])
+        j = j + 1
+      }
+      return mkObjTy(names, tys)
+    }
+  }
+  alt
+}
+
+// The full expectation for hole `name` as one type: the demanded shape alone, or — when the
+// body also `is`-tested the hole — the disjunction of every accepted arm, so the diagnostic
+// and hover both name all of them. Each alternative renders with its still-required
+// residual folded in. -1 when the hole demands nothing.
+export function holeDemandTy(name: string) {
+  // A map demand is the whole expectation on its own — `holeDemandOk` requires it
+  // unconditionally, so it is not one arm of the disjunction.
+  const hmd = holeMapOf(name)
+  if hmd >= 0 { return hmd }
+  const shape = holeShapeOf(name)
+  const members: i32[] = []
+  let k = 0
+  while k < holeAltNames.length {
+    if holeAltNames[k] == name {
+      const m = holeAltRenderTy(shape, k)
+      if !tyArrHasEq(members, m) { members.push(m) }
+    }
+    k = k + 1
+  }
+  if shape >= 0 {
+    if !tyArrHasEq(members, shape) { members.push(shape) }
+  }
+  if members.length == 0 { return -1 }
+  if members.length == 1 { return members[0] }
+  mkUnionTy(members)
+}
+
+// `holeDemandTy` rendered — the `expected …` half of a failed hole-demand check.
+export function holeDemandStr(name: string) {
+  const d = holeDemandTy(name)
+  // "Demands nothing" is the same blank `tyToStrAt` writes for an absent arena entry,
+  // and it must stay the same token: this string lands in the `expected …` half of a
+  // message whose `got …` half comes from that renderer.
+  if d < 0 { return "_" }
+  tyToStr(d)
+}
+
+// Records that hole `name` is indexed (so it demands an array). Idempotent.
+export function noteArrayDemand(name: string) {
+  let i = 0
+  while i < holeArrayDemand.length {
+    if holeArrayDemand[i] == name { return 0 }
+    i = i + 1
+  }
+  holeArrayDemand.push(name)
+  0
+}
+
+// A WRITE demand rides the same column under a key no hole name can spell, and it carries
+// the owning function: a declared type parameter's hole is named `T`, so three functions
+// each declaring `<T>` would share one row and a name-only key would fire on all three.
+// The owner is `curFnEscName` where the body records it and the callee at the pin.
+export function holeWriteKey(fnName: string, tvName: string): string {
+  "!w!" + fnName + "!" + tvName
+}
+
+export function holeIsArrayWriteDemanded(fnName: string, tvName: string) {
+  holeIsArrayDemanded(holeWriteKey(fnName, tvName))
+}
+
+// The demanded map type of hole `name` (the arena index of a `TyMap` whose key/value the
+// callee's own map operations pin in place, exactly as `.push` pins an empty `[]`'s
+// element), or -1 when the hole has no map demand. Parallel columns, like `holeShape*`.
+export function holeMapOf(name: string) {
+  let i = 0
+  while i < holeMapNames.length {
+    if holeMapNames[i] == name { return holeMapTys[i] }
+    i = i + 1
+  }
+  -1
+}
+
+export function holeMapDemandTy(name: string, isSet: boolean) {
+  const have = holeMapOf(name)
+  if have >= 0 { return have }
+  let mv = -1
+  let ms = 0
+  if isSet {
+    mv = TY_BOOL
+    ms = 1
+  }
+  const ty = mkMapTy(-1, mv, ms)
+  holeMapNames.push(name)
+  holeMapTys.push(ty)
+  ty
+}
+
+// Whether any `is` guard in the body tested hole `name` — `holeAltNames` is the record, and
+// this is the boolean half. The alternatives are what the guard's branch handles on its own
+// path, so a rung that decides from the pin alone must decline (D1342).
+export function holeHasIsAlt(name: string) {
+  let a = 0
+  while a < holeAltNames.length {
+    if holeAltNames[a] == name { return true }
+    a = a + 1
+  }
+  false
+}
+
+// The array-demand key of type variable row `row`: a declared type parameter is keyed by
+// its declaring function, since every generic may call its own `T` (D3884); a hole, or a row
+// with no recorded owner, by its name.
+export function arrayDemandKey(row: i32): string {
+  const t = T.tys[row]
+  if !(t is TyVar) { return "" }
+  const owner = tyVarOwnerOf(row)
+  if owner == "" || t.tvName == "" || t.tvName[0] == '?' { return t.tvName }
+  "!r!" + owner + "!" + t.tvName
+}
+
+// Whether a parameter typed by row `row` is indexed in its function's body.
+export function rowIsArrayDemanded(row: i32): boolean {
+  const t = T.tys[row]
+  if !(t is TyVar) { return false }
+  holeIsArrayDemanded(arrayDemandKey(row)) || holeIsArrayDemanded(t.tvName)
+}
+
+function holeIsArrayDemanded(name: string) {
+  let i = 0
+  while i < holeArrayDemand.length {
+    if holeArrayDemand[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The parallel src/dst walk `noteHoleFlow` records through: a bare hole meeting a concrete
+// destination is the answer, and a composite source (`{f: u}`, `[u]`, a map store) descends
+// into the matching destination position so the per-position hole is reached instead of
+// short-circuited by `assignable`. Only matching shapes descend — a mismatch stays a diagnostic.
+export function noteHoleFlowGo(src: i32, dst: i32, depth: i32) {
+  if depth <= 0 { return 0 }
+  if src < 0 || dst < 0 { return 0 }
+  if tyIsHole(src) {
+    if tyIsDeferredJoin(dst) { return 0 }
+    if isNeverTy(dst) { return 0 }
+    if tyReachesHole(dst, 8) { return 0 }
+    const dt = T.tys[dst]
+    if dt is TyErr { return 0 }
+    // A multi-arm union destination is a choice, not an answer (D1520) — adopting it whole
+    // makes the body reject its own operators. A literal union is one rep and stays solvable.
+    if dt is TyUnion {
+      if !tyIsLitUnion(dst) && numLitUnionBaseTy(dst) < 0 { return 0 }
+    }
+    holeFlowSrc.push(src)
+    holeFlowDst.push(dst)
+    return 0
+  }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray { return noteHoleFlowGo(s.aElem, d.aElem, depth - 1) }
+    return 0
+  }
+  if s is TyMap {
+    if d is TyMap { return noteHoleFlowGo(s.mVal, d.mVal, depth - 1) }
+    return 0
+  }
+  if s is TyNullable {
+    if d is TyNullable { return noteHoleFlowGo(s.nInner, d.nInner, depth - 1) }
+    return 0
+  }
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < s.objFieldNames.length {
+        let j = 0
+        while j < d.objFieldNames.length {
+          if d.objFieldNames[j] == s.objFieldNames[i] {
+            noteHoleFlowGo(s.objFieldTypes[i], d.objFieldTypes[j], depth - 1)
+          }
+          j = j + 1
+        }
+        i = i + 1
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// Records a `??` result hole so the pin can bank it. Stamped with the owning declaration for
+// the by-name `TyVar` reason `noteMemCstr` needs it; a row is kept once.
+export function noteCoalResultHole(ty: i32) {
+  if ty < 0 { return 0 }
+  const owner = cstrOwnerTop()
+  let k = 0
+  while k < coalHoleTy.length {
+    if coalHoleTy[k] == ty && coalHoleFn[k] == owner { return 0 }
+    k = k + 1
+  }
+  coalHoleTy.push(ty)
+  coalHoleFn.push(owner)
+  0
+}
+
+// Drops the demand rows past each length: the shape's two columns separately, the array
+// demands, the map rows and the `is` alternatives.
+export function holeRowsTruncate(
+  shapeNames: i32,
+  shapeTys: i32,
+  arrays: i32,
+  maps: i32,
+  alts: i32,
+) {
+  while holeShapeNames.length > shapeNames { holeShapeNames.pop() }
+  while holeShapeTys.length > shapeTys { holeShapeTys.pop() }
+  while holeArrayDemand.length > arrays { holeArrayDemand.pop() }
+  while holeMapNames.length > maps {
+    holeMapNames.pop()
+    holeMapTys.pop()
+  }
+  while holeAltNames.length > alts {
+    holeAltNames.pop()
+    holeAltTys.pop()
+    holeAltPreN.pop()
+    holeAltTailN.pop()
+    holeAltHoleIx.pop()
+  }
+  0
+}
+
+// Drops every `holeFlow*` row from `n` on, both columns together.
+export function holeFlowTruncate(n: i32) {
+  while holeFlowSrc.length > n {
+    holeFlowSrc.pop()
+    holeFlowDst.pop()
+  }
+  0
+}
+
+// Clears every table here for a new program.
+export function holeRowsReset() {
+  holeShapeNames = []
+  holeShapeTys = []
+  holeArrayDemand = []
+  holeMapNames = []
+  holeMapTys = []
+  holeAltNames = []
+  holeAltTys = []
+  holeAltPreN = []
+  holeAltTailN = []
+  holeAltHoleIx = []
+  coalHoleTy = []
+  coalHoleFn = []
+  holeFlowSrc = []
+  holeFlowDst = []
+  calleeWriteRow = []
+  calleeWriteGot = []
+  calleeWriteAt = []
+  0
+}
