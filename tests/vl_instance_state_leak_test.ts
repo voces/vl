@@ -93,6 +93,27 @@ type Program = {
   src?: string;
 };
 
+/** `closures/record-field-written-in-two-scopes.vl` with its two writers named `main` and `set`. */
+const fieldWriters = (main: string, set: string): string =>
+  [
+    'function gA<U>(u: U) { print("A"); print(u) }',
+    'function gC<W>(w: W) { print("C"); print(w) }',
+    `function ${main}() {`,
+    "  const y = { h: gC, n: 2 }",
+    "  if y.n > 1 { y.h = gA }",
+    "  y.h(3)",
+    "  const z = y",
+    "  z.h(4)",
+    "  print(y.n)",
+    "}",
+    `${main}()`,
+    "const t = { h: gC }",
+    `function ${set}() { t.h = gA }`,
+    `${set}()`,
+    't.h("x")',
+    "",
+  ].join("\n");
+
 const PROGRAMS: Program[] = [
   // ── packed byte, `ba8Used` / `ba8TypeIdx` / `bl8TypeIdx` — D986's own family ──
   {
@@ -226,6 +247,12 @@ const PROGRAMS: Program[] = [
     path: "memory/store-narrow-widths-round-trip.vl",
   },
   { id: "mem-bulk-copy", family: "memUsed", path: "memory/bulk-copy-and-fill.vl" },
+  // ── one generic turns on the flow table and the mono walk, whose whole-program tables
+  // (`monoProgTop`, `monoProgNames`, the flow slot sets and pin-key memo) are banked per
+  // compile (D4942). The pair has one shape and differs only in its writers' names, so a names
+  // table carried over from the other says this program's writers are never called.
+  { id: "field-writers-main", family: "mono program tables (D4942)", src: fieldWriters("main", "set") },
+  { id: "field-writers-mn", family: "mono program tables (D4942)", src: fieldWriters("mn", "put") },
 
   // ── the NON-MINTERS: the second half of D986's shape ────────────────────────────────
   // A program whose own type section and start-function frame are decided entirely by what

@@ -30,7 +30,7 @@ restate measurements; follow the links.
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
 | L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: `expCtxReset` clears the 17 pending seeds at compile start, never-cleared 172 of 1,156 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
-| L6 registries by key | step 5 **in progress**. Last: second switch (#3661), `unionNameOfExpr/is` on the key, 12 sites. Next: `ctr/unionName` (site 42), blocked on the struct-union alias sibling (class As). | [L6 log](#l6-log) |
+| L6 registries by key | step 5 **in progress**. Last: third switch, 24 sites on the key. Next: a key sibling's mint adopts the key row, which unblocks sites 42, 24, 44, 45 and 46. | [L6 log](#l6-log) |
 | L10 the `-O` optimizer | **in progress as T4**. Last: R6d, the compiler's inline-record step is the default and the host's fields step is deleted; 0 of 15,406 programs differ. Next: R7, list flattening. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
@@ -327,6 +327,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - Prerequisite (3), the `name-only` rule, is classified (#3651): 2,248 → 1,800 with rule L (distilled 205 → 177); the residual is eleven classes, each with a stay reason or an unmeasured rule.
 - Step 5, first switch (#3655): 11 seams answer from the key, and the key reads a declared union of litunion aliases.
 - Second switch (#3661): `unionNameOfExpr/is` is on the key, 12 sites in total; `ctr/unionName` (site 42) is blocked on the struct-union alias sibling (class As) owning its own variant slice.
+- Third switch: 13 more sites, 24 in total. The new sites are `neither`-only sites and fallback seams whose `name-only` reaches keep the spelling's answer, and `unionMemberTysOfAB` gained the switch. The module diff refused 5 candidates: 4 `id-only` mint guards (24, 44, 45, 46) and site 11, whose `agree` rows give different answers on an alias spelling. Identity holds with 0 differ of 10,282 built, and render-parse stays at 98 / 378.
 
 ### L10 log
 
