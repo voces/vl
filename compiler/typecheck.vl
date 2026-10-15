@@ -5487,6 +5487,8 @@ export function initChecker() {
   binCstr.op = []
   binCstr.rt = []
   binCstr.fn = []
+  cvViaAt = Map()
+  cvNow = -1
   cstrOwnerStack = []
   argCstr.at = []
   argCstr.exp = []
@@ -17325,6 +17327,8 @@ function tErrPush(
     const lnote = crLostNote(msg, at)
     if lnote != "" { msg = msg + lnote }
   }
+  // A demand re-asked at a pin away from the delivery it came through names that delivery.
+  if cvNow >= 0 && at != cvNow { msg = msg + cvViaNote(cvNow) }
   if code == "" && zeroBytesFixIx.length > 0 && i32ListHas(zeroBytesFixIx, at) {
     code = CODE_ZERO_BYTES
   }
@@ -20450,6 +20454,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   const modeWas = substNestMode
   const declWas = substNestDecl
   const strictWas = cstrOwnedStrict
+  const cvWas = cvNow
   let owner = decl
   if nested {
     owner = CSTR_NODECL
@@ -20461,6 +20466,8 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
     // constraints are re-asked (D3923).
     substNestMode = SUBST_DECLARED
     cstrOwnedStrict = true
+    // What is deferred carries this delivery, which the refusal at the pin names.
+    cvNow = srcExpr
   }
   pinBmCstrElems(bNames, bTys, srcExpr, owner, noArgs)
   validateBinCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
@@ -20473,6 +20480,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   validateMemCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
   validateUfcsCstrs(bNames, bTys, srcExpr, owner, who)
   cstrOwnedStrict = strictWas
+  cvNow = cvWas
   substNestMode = modeWas
   substNestDecl = declWas
   0
@@ -32274,6 +32282,50 @@ function cstrOwnedBy(owner: i32, calleeFn: i32) {
   owner == calleeFn
 }
 
+// The constraint tables a demand deferred through a function-value delivery can sit in.
+const CV_BIN = 0
+const CV_PRINT = 1
+const CV_ARG = 2
+const CV_RET = 3
+const CV_LET = 4
+const CV_BM = 5
+const CV_MEM = 6
+const CV_UFCS = 7
+// The delivery each deferred row reached its owner through, keyed `row * 16 + table`: the
+// delivered generic's name node, so the pin's refusal names the delivery as well (D3923).
+let cvViaAt: {[i32]: i32} = Map()
+// The delivery the demand being recorded or re-asked arrived through, -1 for none.
+let cvNow = -1
+
+// Stamps row `row` of table `tbl`, just appended, with the delivery in force.
+function cvMark(tbl: i32, row: i32) {
+  const k = row * 16 + tbl
+  if cvNow >= 0 || cvViaAt.has(k) { cvViaAt[k] = cvNow }
+  0
+}
+
+// The delivery row `row` of table `tbl` came through, else `outer`.
+function cvPick(tbl: i32, row: i32, outer: i32): i32 {
+  const v = cvViaAt[row * 16 + tbl] ?? -1
+  if v >= 0 { return v }
+  outer
+}
+
+// The clause naming delivery `at` that a refusal raised elsewhere ends with, "" for none.
+function cvViaNote(at: i32): string {
+  if at < 0 || at >= P.nodes.length { return "" }
+  const n = P.nodes[at]
+  if !(n is Ident) { return "" }
+  let where = ""
+  const ln = nodeLineOf(at)
+  if ufcsModOfNode(at) <= 0 && ln > 0 { where = " at line " + i32ToStr(ln) }
+  " (the demand is `"
+    + n.identName
+    + "`'s, used as a function value"
+    + where
+    + ")"
+}
+
 // The type an equality's deferred constraint records for operand `opIx` of type `ty`: a
 // literal's own literal type, which a literal-union pin compares against as the direct spelling
 // does (`eqLitMemberOk`), else `ty`.
@@ -32343,6 +32395,7 @@ function noteBinCstr(lt: i32, op: string, rt: i32) {
     binCstr.op.push(op)
     binCstr.rt.push(rt)
     binCstr.fn.push(owner)
+    cvMark(CV_BIN, binCstr.fn.length - 1)
   }
   0
 }
@@ -32393,6 +32446,7 @@ function noteRetCstr(got: i32, want: i32, ix: i32) {
     retCstr.ix.push(ix)
     retCstr.fn.push(owner)
     if gotHole { retCstr.wOnly.push(0) } else { retCstr.wOnly.push(1) }
+    cvMark(CV_RET, retCstr.fn.length - 1)
   }
   0
 }
@@ -32429,6 +32483,7 @@ function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
     letCstr.name.push(name)
     letCstr.seq.push(cstrSeqNext)
     cstrSeqNext = cstrSeqNext + 1
+    cvMark(CV_LET, letCstr.fn.length - 1)
   }
   0
 }
@@ -33008,6 +33063,7 @@ function noteBmCstr(
     bmCstr.label.push(label)
     bmCstr.seq.push(cstrSeqNext)
     cstrSeqNext = cstrSeqNext + 1
+    cvMark(CV_BM, bmCstr.fn.length - 1)
   }
   0
 }
@@ -34009,6 +34065,7 @@ function noteMemCstr(recv: i32, prop: string, ix: i32, dem: boolean) {
     memCstr.ix.push(ix)
     memCstr.fn.push(owner)
     memCstr.dem.push(dem)
+    cvMark(CV_MEM, memCstr.fn.length - 1)
   }
   0
 }
@@ -34048,6 +34105,7 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
     ufcsCstr.p0.push(p0)
     const noMore: i32[] = []
     ufcsCstr.more.push(noMore)
+    cvMark(CV_UFCS, ufcsCstr.fn.length - 1)
   }
   0
 }
@@ -34286,6 +34344,7 @@ function noteArgCstr(at: i32, exp: i32, who: string, form: i32, node: i32) {
   argCstr.fn.push(owner)
   argCstr.node.push(node)
   argCstr.form.push(form)
+  cvMark(CV_ARG, argCstr.fn.length - 1)
   0
 }
 
@@ -34360,6 +34419,7 @@ function notePrintCstr(pt: i32, argIx: i32) {
     printCstr.ty.push(pt)
     printCstr.ix.push(argIx)
     printCstr.fn.push(owner)
+    cvMark(CV_PRINT, printCstr.fn.length - 1)
   }
   0
 }
@@ -34376,12 +34436,14 @@ function validatePrintCstrs(
   who: string,
 ) {
   const nOrigP = printCstr.ty.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigP {
     if (
       cstrOwnedBy(printCstr.fn[ci], calleeFn)
       && !nestCstrOutside(printCstr.ix[ci])
     ) {
+      cvNow = cvPick(CV_PRINT, ci, cvWas)
       const cpt = substTyDeep(printCstr.ty[ci], bNames, bTys)
       if (
         calleeFn >= 0
@@ -34418,6 +34480,7 @@ function validatePrintCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -34868,12 +34931,14 @@ function validateArgCstrs(
   hArgNode: i32[],
 ) {
   const nOrig = argCstr.at.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrig {
     if !cstrOwnedBy(argCstr.fn[ci], calleeFn) {
       ci = ci + 1
       continue
     }
+    cvNow = cvPick(CV_ARG, ci, cvWas)
     const rat = substTyDeep(argCstr.at[ci], bNames, bTys)
     const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
     if argCstr.form[ci] == ACF_COMP {
@@ -34908,6 +34973,7 @@ function validateArgCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -34981,12 +35047,14 @@ function validateRetCstrs(
   who: string,
 ) {
   const nOrigR = retCstr.got.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigR {
     if (
       cstrOwnedBy(retCstr.fn[ci], calleeFn)
       && !nestCstrOutside(retCstr.ix[ci])
     ) {
+      cvNow = cvPick(CV_RET, ci, cvWas)
       const rg = substTyDeep(retCstr.got[ci], bNames, bTys)
       const rw = substTyDeep(retCstr.want[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership
@@ -35027,6 +35095,7 @@ function validateRetCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -35042,12 +35111,14 @@ function validateLetCstrs(
   who: string,
 ) {
   const nOrigL = letCstr.got.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigL {
     if (
       cstrOwnedBy(letCstr.fn[ci], calleeFn)
       && !nestCstrOutside(letCstr.ix[ci])
     ) {
+      cvNow = cvPick(CV_LET, ci, cvWas)
       const lg = substTyDeep(letCstr.got[ci], bNames, bTys)
       const lw = substTyDeep(letCstr.want[ci], bNames, bTys)
       // Re-records only when the callee is named, for the same ownership reason
@@ -35081,6 +35152,7 @@ function validateLetCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -35224,9 +35296,11 @@ function validateBmCstrs(
   who: string,
 ) {
   const nOrigB = bmCstr.got.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigB {
     if cstrOwnedBy(bmCstr.fn[ci], calleeFn) && !nestCstrOutside(bmCstr.ix[ci]) {
+      cvNow = cvPick(CV_BM, ci, cvWas)
       const bg = substTyDeep(bmCstr.got[ci], bNames, bTys)
       const bw = substTyDeep(bmCstr.want[ci], bNames, bTys)
       let bc = bmCstr.ctx[ci]
@@ -35269,6 +35343,7 @@ function validateBmCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -35284,12 +35359,14 @@ function validateUfcsCstrs(
   who: string,
 ) {
   const nOrigU = ufcsCstr.ty.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigU {
     if (
       cstrOwnedBy(ufcsCstr.fn[ci], calleeFn)
       && !nestCstrOutside(ufcsCstr.ix[ci])
     ) {
+      cvNow = cvPick(CV_UFCS, ci, cvWas)
       const ur = substTyDeep(ufcsCstr.ty[ci], bNames, bTys)
       if (
         calleeFn >= 0
@@ -35385,6 +35462,7 @@ function validateUfcsCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -35616,12 +35694,14 @@ function validateMemCstrs(
   hArgNode: i32[],
 ) {
   const nOrigM = memCstr.ty.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigM {
     if (
       cstrOwnedBy(memCstr.fn[ci], calleeFn)
       && !nestCstrOutside(memCstr.ix[ci])
     ) {
+      cvNow = cvPick(CV_MEM, ci, cvWas)
       const mr = substTyDeep(memCstr.ty[ci], bNames, bTys)
       if (
         calleeFn >= 0
@@ -35717,6 +35797,7 @@ function validateMemCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
@@ -35933,9 +36014,11 @@ function validateBinCstrs(
   hArgNode: i32[],
 ) {
   const nOrigB = binCstr.op.length
+  const cvWas = cvNow
   let ci = 0
   while ci < nOrigB {
     if cstrOwnedBy(binCstr.fn[ci], calleeFn) {
+      cvNow = cvPick(CV_BIN, ci, cvWas)
       let clt = substTyDeep(binCstr.lt[ci], bNames, bTys)
       let crt = substTyDeep(binCstr.rt[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
@@ -36102,6 +36185,7 @@ function validateBinCstrs(
     }
     ci = ci + 1
   }
+  cvNow = cvWas
   0
 }
 
