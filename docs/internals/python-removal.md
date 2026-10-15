@@ -96,54 +96,54 @@ heredoc and moves with its own PR.
 
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
-| `bench/algorithms/binarytrees/main.py` | 64 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/algorithms/dispatch-table/main.py` | 77 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/algorithms/lambda-hot/main.py` | 60 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/algorithms/mandelbrot/main.py` | 62 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/algorithms/map-filter-reduce/main.py` | 60 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/algorithms/nbody/main.py` | 153 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/algorithms/spectralnorm/main.py` | 69 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/bitcount/main.py` | 10 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/bitops/main.py` | 18 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/convert/main.py` | 11 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/f64-accum/main.py` | 11 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/floatops/main.py` | 18 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/i32-accum/main.py` | 11 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/i64-accum/main.py` | 9 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/intdivmod/main.py` | 11 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arith/mixed-width/main.py` | 16 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/binsearch/main.py` | 44 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/fill-sum/main.py` | 20 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/matmul/main.py` | 28 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/push-growth/main.py` | 19 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/push-known-size/main.py` | 26 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/reverse-inplace/main.py` | 29 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/sort-heap/main.py` | 64 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/struct-aos/main.py` | 31 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/arrays/struct-soa/main.py` | 26 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/live-set-churn/main.py` | 31 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/map-i32/main.py` | 44 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/map-string/main.py` | 44 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/set-ops/main.py` | 53 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/struct-alloc/main.py` | 52 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/struct-array-scan/main.py` | 40 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/struct-field/main.py` | 56 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/collections/word-freq/main.py` | 67 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/ackermann/main.py` | 16 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/deeprec/main.py` | 14 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/fib/main.py` | 8 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/flatcall-inlined/main.py` | 8 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/flatcall/main.py` | 12 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/mutual/main.py` | 20 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/tailcall/main.py` | 14 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/recursion/treewalk/main.py` | 37 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/char-scan/main.py` | 39 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/concat-build/main.py` | 23 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/int-format/main.py` | 23 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/slice-extract/main.py` | 36 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/str-eq/main.py` | 64 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/substr-search/main.py` | 41 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
-| `bench/strings/token-count/main.py` | 58 | D | bench/run.sh bench/README.md | drop the python column from bench/run.sh (comparison language, not tooling) |
+| `bench/algorithms/binarytrees/main.py` | 64 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/algorithms/dispatch-table/main.py` | 77 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/algorithms/lambda-hot/main.py` | 60 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/algorithms/mandelbrot/main.py` | 62 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/algorithms/map-filter-reduce/main.py` | 60 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/algorithms/nbody/main.py` | 153 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/algorithms/spectralnorm/main.py` | 69 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/bitcount/main.py` | 10 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/bitops/main.py` | 18 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/convert/main.py` | 11 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/f64-accum/main.py` | 11 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/floatops/main.py` | 18 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/i32-accum/main.py` | 11 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/i64-accum/main.py` | 9 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/intdivmod/main.py` | 11 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arith/mixed-width/main.py` | 16 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/binsearch/main.py` | 44 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/fill-sum/main.py` | 20 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/matmul/main.py` | 28 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/push-growth/main.py` | 19 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/push-known-size/main.py` | 26 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/reverse-inplace/main.py` | 29 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/sort-heap/main.py` | 64 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/struct-aos/main.py` | 31 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/arrays/struct-soa/main.py` | 26 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/live-set-churn/main.py` | 31 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/map-i32/main.py` | 44 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/map-string/main.py` | 44 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/set-ops/main.py` | 53 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/struct-alloc/main.py` | 52 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/struct-array-scan/main.py` | 40 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/struct-field/main.py` | 56 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/collections/word-freq/main.py` | 67 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/ackermann/main.py` | 16 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/deeprec/main.py` | 14 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/fib/main.py` | 8 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/flatcall-inlined/main.py` | 8 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/flatcall/main.py` | 12 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/mutual/main.py` | 20 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/tailcall/main.py` | 14 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/recursion/treewalk/main.py` | 37 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/char-scan/main.py` | 39 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/concat-build/main.py` | 23 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/int-format/main.py` | 23 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/slice-extract/main.py` | 36 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/str-eq/main.py` | 64 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/substr-search/main.py` | 41 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
+| `bench/strings/token-count/main.py` | 58 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
 | `scripts/day-one/file_row.py` | 160 | D | scripts/day-one/README.md | scripts/day-one/file_row.vl |
 | `scripts/day-one/minimise.py` | 258 | D | scripts/day-one/README.md | scripts/day-one/minimise.vl |
 | `scripts/emit-refusal-sites.py` | 226 | D | CLAUDE.md scripts/capability-probes/README.md | port to VL or retire (decide at its turn) |
