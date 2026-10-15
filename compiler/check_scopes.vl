@@ -1,0 +1,211 @@
+// `check_scopes.vl` — the checker's scope chain and the queries that resolve a name through it.
+// `T.scopes` holds each frame's name-to-type map; beside it run the inverted chain
+// (`scopeDepthsOf`, a name's binding depths) and three parallel per-frame tables: which names
+// are `const`, which name a `FuncDecl`, and which alias one. `declare` binds a name in the
+// innermost frame; `lookup`, `lookupDepth` and the `*DeclOf`/`lookupFn*` queries read the
+// innermost binding, so shadowing holds. The checker pushes and pops the frames and resets
+// the tables.
+
+import { FuncDecl, Ident, P, i32ToStr } from "./ast"
+import { demangleName } from "./check_suggest"
+import { T } from "./check_types"
+import {
+  CW_OCC_FDECL,
+  cwIxBuild,
+  cwIxChain,
+  cwIxKind,
+  cwIxNext,
+  cwIxNode,
+  fnDeclIx,
+} from "./check_write_scan"
+
+// The const-binding chain, parallel to `T.scopes`: each frame records which of its names carry
+// `const` — an immutable name, not immutable data, so a field write through a const stays
+// legal. Kept module-level rather than a `Checker` field so the exported struct shape is
+// unchanged.
+export let constScopes: {[string]: i32}[] = []
+
+// Every module `const` by name, its declaration, from the hoist: the answer `constDeclOf` gives
+// for a module constant read before the checker reaches its declaration.
+export let moduleConstDecl: {[string]: i32} = Map()
+
+// The scope chain inverted: for each name, the depths of the frames binding it, outermost first,
+// so the innermost binding is the last entry. `declare` and `popScope` keep it in step with
+// `T.scopes`, and a lookup reads one entry instead of walking every frame (D2190).
+export let scopeDepthsOf: {[string]: i32[]} = Map()
+
+// The function-declaration chain, parallel to `T.scopes`: each frame records the arena node of
+// every `FuncDecl` declared in it. `fnDeclIx` answers that for top-level functions only; this
+// answers it for a nested one too, under the scope chain's shadowing rule, which is what a call
+// needs to recover the callee's parameter list and the defaults a call site may omit.
+export let fnDeclScopes: {[string]: i32}[] = []
+
+// The function-alias chain, parallel to `T.scopes`: for a binding whose initializer is a bare
+// ident naming a declared function (`const f = addT`), the arena node of that declaration.
+// `fnDeclScopes` deliberately answers -1 there, a function value keeping the exact-arity gate a
+// value call has. Its one consumer is constraint ownership; a closure parameter is left out.
+export let fnAliasScopes: {[string]: i32}[] = []
+
+// The scope-chain depth of the innermost binding of `name`, or -1 when undeclared. `lookup` is
+// the same walk reading the type out; this one reads the frame it came from, which is what the
+// narrowing bank validates its entries against.
+export function lookupDepth(name: string) {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return -1 }
+  ds[ds.length - 1]
+}
+
+// True if `name` resolves (innermost-first) to a `const` binding.
+export function isConstName(name: string) {
+  const i = lookupDepth(name)
+  if i >= 0 && i < constScopes.length { return constScopes[i].has(name) }
+  false
+}
+
+// Bind `name` to type-arena index `ty` in the innermost scope.
+export function declare(name: string, ty: i32) {
+  const top = T.scopes.length - 1
+  if !T.scopes[top].has(name) {
+    const ds = scopeDepthsOf[name]
+    if ds == null { scopeDepthsOf[name] = [top] } else { ds.push(top) }
+  }
+  T.scopes[top][name] = ty
+  0
+}
+
+// Record `nodeIx` as the `FuncDecl` that `name` declares in the current scope.
+export function declareFnDeclNode(name: string, nodeIx: i32) {
+  const top = fnDeclScopes.length - 1
+  if top >= 0 { fnDeclScopes[top][name] = nodeIx }
+  0
+}
+
+// The declaration a binding of `name` aliases, or -1 — `fnAliasScopes` read under the scope chain's
+// own shadowing rule, exactly like `isConstName` and `lookupFnDeclNode`. Its one consumer is
+// deferred-constraint ownership; see the table's header for why it is separate.
+export function lookupFnAliasNode(name: string) {
+  const i = lookupDepth(name)
+  if i >= 0 && i < fnAliasScopes.length { return fnAliasScopes[i][name] ?? -1 }
+  -1
+}
+
+// The `const` declaration `name` currently resolves to, or -1 when its innermost binding is not a
+// `const`. A module constant the checker has not reached yet answers from its hoist (D3271).
+export function constDeclOf(name: string) {
+  const i = lookupDepth(name)
+  if i < 0 { return -1 }
+  if i < constScopes.length {
+    const d = constScopes[i][name] ?? -1
+    if d >= 0 { return d }
+  }
+  if i == 0 { return moduleConstDecl[name] ?? -1 }
+  -1
+}
+
+// The `FuncDecl` node `name` currently resolves to, or -1 when it resolves to something that is not
+// a function declaration. The walk stops at the first scope that binds `name` at all and asks only
+// that frame — the scope chain's own shadowing rule — so a local binding that shadows a function
+// name answers -1, and the call keeps the exact-arity gate a function value must have.
+export function lookupFnDeclNode(name: string) {
+  const i = lookupDepth(name)
+  if i >= 0 && i < fnDeclScopes.length { return fnDeclScopes[i][name] ?? -1 }
+  -1
+}
+
+// Look `name` up through the scope chain, innermost first. Returns its type-arena
+// index, or `-1` if undeclared (innermost-wins, so shadowing works).
+export function lookup(name: string) {
+  const i = lookupDepth(name)
+  if i < 0 { return -1 }
+  T.scopes[i][name] ?? -1
+}
+
+// The declaration of the function `name` names: the one in scope, else the only function of
+// that name anywhere (a walk after the pass is out of every function's scope). -1 otherwise.
+export function recFnDeclByName(name: string): i32 {
+  const fd = lookupFnDeclNode(name)
+  if fd >= 0 { return fd }
+  cwIxBuild()
+  let found = -1
+  let r = cwIxChain(name)
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_FDECL {
+      if found >= 0 && found != cwIxNode[r] { return -1 }
+      found = cwIxNode[r]
+    }
+    r = cwIxNext[r]
+  }
+  found
+}
+
+// The merged spelling of plain `name` that `fnDeclIx` is keyed on, or "". A merge renames
+// every declaration, so any gate that asks the table by the name a SITE spells arrives
+// unmangled and misses — the UFCS `self`-name gate (D1654) and the operator dispatch, whose
+// site is `a + b` and has no name to rewrite at all. `lookup` is the visibility test.
+export function mergedDeclKeyOf(name: string) {
+  for k in fnDeclIx.keys() {
+    if demangleName(k) == name && lookup(k) >= 0 { return k }
+  }
+  ""
+}
+
+// The parameter nodes of the `FuncDecl` that `name` denotes under the scope chain, or the empty
+// list when it denotes a binding instead. The UFCS callee is a member property with no callee
+// node, which is why this is keyed by name where `calleeDeclParams` takes a node.
+export function declParamsInScope(name: string) {
+  const none: i32[] = []
+  const dIx = lookupFnDeclNode(name)
+  if dIx >= 0 {
+    const d = P.nodes[dIx]
+    if d is FuncDecl { return d.fnParams }
+  }
+  none
+}
+
+// The declared parameter nodes behind a call's callee, when the call is direct — an `Ident`
+// the scope chain resolves to a `FuncDecl` (top-level or nested). A closure-valued callee has
+// no declaration to read defaults from, so it answers the empty list and every default-driven
+// relaxation is off for it: a function value keeps full arity.
+export function calleeDeclParams(calleeIx: i32) {
+  const none: i32[] = []
+  const cf = P.nodes[calleeIx]
+  if cf is Ident {
+    const dIx = lookupFnDeclNode(cf.identName)
+    if dIx >= 0 {
+      const d = P.nodes[dIx]
+      if d is FuncDecl { return d.fnParams }
+    }
+  }
+  none
+}
+
+// Is `name` bound at MODULE scope by a `const`? `T.scopes[0]` is the module
+// frame, and asking IT rather than walking the chain is the point: a parameter
+// default's names resolve at the DECLARATION, and the declaration's own
+// parameters and locals are exactly what must NOT answer here.
+export function isModuleScopeConst(name: string) {
+  if T.scopes.length == 0 { return false }
+  if !T.scopes[0].has(name) { return false }
+  if constScopes.length == 0 { return false }
+  // Bound, not returned as a bare tail: a member-call cannot be a tail
+  // expression (`emitProgram: unsupported member-call statement`).
+  const isC = constScopes[0].has(name)
+  isC
+}
+
+// Whether `name` is bound by the program — a declared function (hoisted, so a forward
+// reference counts) or any in-scope binding. A user definition wins over the intrinsic of the
+// same name, so adding an intrinsic can never capture a call that already resolves to the
+// program's own function; the emitter reads the same rule off its own function table.
+export function numIntrShadowed(name: string) {
+  if (fnDeclIx[name] ?? -1) >= 0 { return true }
+  lookup(name) >= 0
+}
+
+// The module-level `FuncDecl` named `raw` (or its merged `raw$m<m>`), or -1.
+export function moduleFnDeclOf(raw: string, m: i32) {
+  if fnDeclScopes.length == 0 { return -1 }
+  let d = fnDeclScopes[0][raw] ?? -1
+  if d < 0 && m >= 0 { d = fnDeclScopes[0][raw + "$m" + i32ToStr(m)] ?? -1 }
+  d
+}
