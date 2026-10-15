@@ -63,7 +63,9 @@ sparse; otherwise the `.vhdx` keeps every byte it ever held (214 GB for 132 GB o
 
 ## Gates
 
-**`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
+**`scripts/gate.sh` runs the whole ladder and is the thing to run.** It refuses inside a builder
+worktree (`.claude/worktrees/`, override `GATE_IN_WORKTREE=1`): the merge queue gates every PR on
+the merged tree, and builders running it as well spent 66 full runs in one day. Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
 time, CPU seconds and exit code. Thirty gates on master; measured 2026-10-12 at 3c2e2227a, back
 to back on one 24-thread box: **173 s** under WSL (every row at once) and **263 s** on Windows
