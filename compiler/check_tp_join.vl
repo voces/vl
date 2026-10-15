@@ -1,9 +1,10 @@
 // `check_tp_join.vl` — joins over type parameters, and the gradual parameters they read.
 // A join of two type parameters, or of a parameter and a concrete type, is kept apart as an
 // implicit parameter rather than boxed (`tpOpenJoin`, `keptParamUnion`), and re-joins at each
-// pin; the tables here name the unions and holes kept apart. The predicates over
-// declared and gradual parameters (`tyIsNamedParamHole`, `tyIsGradualParam`,
-// `tyParamOfInnermostBody`) are what those decisions read.
+// pin; the tables here name the unions and holes kept apart, and the deferred joins a call
+// site parks or lets escape. The predicates over declared and gradual parameters
+// (`tyIsNamedParamHole`, `tyIsGradualParam`, `tyParamOfInnermostBody`) are what those
+// decisions read. `joinRowsReset` clears the join rows per program.
 
 import { FuncDecl, P, Param, i32ToStr } from "./ast"
 import { cstrOwnerStack, lamCheckDepth, lamRefoldDepth } from "./check_cursor"
@@ -26,6 +27,7 @@ import {
   TyVar,
   mkNullableTy,
   tyBearsNull,
+  tyEq,
   tyIsDeclaredParam,
   tyIsHole,
 } from "./check_types"
@@ -479,4 +481,156 @@ export function holeNameIsParamOf(
     k = k + 1
   }
   false
+}
+
+// The uncollapsed deferred join a call site could not decide, parked under that call's node
+// index. `collapseDeferredJoin` hands the emitter-safe collapse out as the call's type — a
+// deferred join has no runtime shape — but that collapse is lossy, so the return-inference
+// path reads the parked join back (`inferRetTyOf`). Only that path reads it.
+export let dJoinNode: i32[] = []
+export let dJoinTy: i32[] = []
+
+// Deferred joins that escaped a call site lossily — the collapse handed out one arm while the
+// join still named holes this site could not pin. Parallel arrays: the uncollapsed join, the
+// call node to anchor a diagnostic on, and the callee's name. `validateEscJoins` re-folds each
+// at the pinning call and rejects loudly when the arms really do disagree.
+export let escJoinTy: i32[] = []
+export let escJoinIx: i32[] = []
+export let escJoinWho: string[] = []
+
+// The body each join escaped inside (`cstrOwnerTop`), -1 at module scope (D2805).
+export let escJoinFn: i32[] = []
+
+// The if-joins a generic body keeps apart (`tpIfJoinAt`), by owning declaration, re-asked at
+// each call that pins the owner.
+export let tpIfFn: i32[] = []
+export let tpIfJoin: i32[] = []
+export let tpIfNode: i32[] = []
+
+// Whether each row's join is delivered where an instance builds its union (`tpIfMarkOk`).
+export let tpIfOk: boolean[] = []
+
+// A call from a generic body whose pin leaves such a join open: the callee, the caller that
+// pins it later, and the callee's bindings and parameter types in the caller's terms.
+export let tpIfReFn: i32[] = []
+export let tpIfReOwner: i32[] = []
+export let tpIfReStart: i32[] = []
+export let tpIfReCount: i32[] = []
+export let tpIfReNames: string[] = []
+export let tpIfReTys: i32[] = []
+export let tpIfReParams: i32[][] = []
+
+export function tpIfFnHasRow(fn: i32): boolean {
+  let k = 0
+  while k < tpIfFn.length {
+    if tpIfFn[k] == fn { return true }
+    k = k + 1
+  }
+  false
+}
+
+// Parks the bindings of a call to `fn` its caller `owner` pins later, with `fn`'s parameters.
+export function noteTpIfRe(
+  fn: i32,
+  owner: i32,
+  names: string[],
+  tys: i32[],
+  params: i32[],
+) {
+  let k = 0
+  while k < tpIfReFn.length {
+    if (
+      tpIfReFn[k] == fn
+      && tpIfReOwner[k] == owner
+      && tpIfReCount[k] == tys.length
+    ) {
+      let same = true
+      let q = 0
+      while q < tys.length && same {
+        if !tyEq(tpIfReTys[tpIfReStart[k] + q], tys[q]) { same = false }
+        q = q + 1
+      }
+      if same { return 0 }
+    }
+    k = k + 1
+  }
+  tpIfReFn.push(fn)
+  tpIfReOwner.push(owner)
+  tpIfReStart.push(tpIfReNames.length)
+  tpIfReCount.push(names.length)
+  let i = 0
+  while i < names.length {
+    tpIfReNames.push(names[i])
+    tpIfReTys.push(tys[i])
+    i = i + 1
+  }
+  const ps: i32[] = []
+  let p = 0
+  while p < params.length {
+    ps.push(params[p])
+    p = p + 1
+  }
+  tpIfReParams.push(ps)
+  0
+}
+
+// Drops the deferred-join rows past `n`, both columns together.
+export function dJoinTruncate(n: i32) {
+  while dJoinNode.length > n {
+    dJoinNode.pop()
+    dJoinTy.pop()
+  }
+  0
+}
+
+// Drops the escaped-join rows past `n`, every column together.
+export function escJoinTruncate(n: i32) {
+  while escJoinTy.length > n {
+    escJoinTy.pop()
+    escJoinIx.pop()
+    escJoinWho.pop()
+    escJoinFn.pop()
+  }
+  0
+}
+
+// Drops the `tpIf*` rows past `rows` and the `tpIfRe*` rows past `res`; the latter's names and
+// types are spans `tpIfReStart` indexes, so they are left for the next row to overwrite.
+export function tpIfTruncate(rows: i32, res: i32) {
+  while tpIfFn.length > rows {
+    tpIfFn.pop()
+    tpIfJoin.pop()
+    tpIfNode.pop()
+    tpIfOk.pop()
+  }
+  while tpIfReFn.length > res {
+    tpIfReFn.pop()
+    tpIfReOwner.pop()
+    tpIfReStart.pop()
+    tpIfReCount.pop()
+    tpIfReParams.pop()
+  }
+  0
+}
+
+// Clears the deferred, escaped and `tpIf*` join rows for a new program.
+export function joinRowsReset() {
+  tpIfFn = []
+  tpIfJoin = []
+  tpIfNode = []
+  tpIfOk = []
+  tpIfReFn = []
+  tpIfReOwner = []
+  tpIfReStart = []
+  tpIfReCount = []
+  tpIfReNames = []
+  tpIfReTys = []
+  tpIfReParams = []
+  dJoinNode = []
+  dJoinTy = []
+  escJoinTy = []
+  escJoinIx = []
+  escJoinWho = []
+  escJoinFn = []
+  0
 }

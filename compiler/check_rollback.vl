@@ -1,0 +1,568 @@
+// `check_rollback.vl` — one mark and one rollback for the checker's quiet probes.
+// A quiet probe checks something, then drops what that check recorded: `checkMark()` on entry,
+// `checkRollback(m, set)` on exit. `set` names the table families the site rolls back, one bit
+// each, and the `RB_*` site sets name each probe's choice; a site keeps a table by reading it
+// before it rolls back. Each family's rows live in their own module, which owns the truncate.
+// The rollback assertion (`probeRollbackArm`, `prbEnter`/`prbLeave`) checks those choices
+// against every table's length, for the tests that pin which probe leaves what behind.
+
+import {
+  argCstr,
+  argCstrTruncate,
+  binCstr,
+  binCstrTruncate,
+  bmCstr,
+  bmCstrTruncate,
+  isCstr,
+  isCstrTruncate,
+  letCstr,
+  letCstrTruncate,
+  memCstr,
+  memCstrTruncate,
+  nestCstr,
+  printCstr,
+  retCstr,
+  retCstrTruncate,
+  tyIxCstrTruncate,
+  ufcsCstr,
+  ufcsCstrTruncate,
+} from "./check_cstr_rows"
+import {
+  cstrOwnerStack,
+  njFnStack,
+  tpEnvNames,
+  tpEnvTruncate,
+  tpEnvTys,
+} from "./check_cursor"
+import {
+  calleeWriteAt,
+  calleeWriteGot,
+  calleeWriteRow,
+  calleeWriteTruncate,
+  coalHoleFn,
+  coalHoleTruncate,
+  coalHoleTy,
+  holeAltHoleIx,
+  holeAltNames,
+  holeAltPreN,
+  holeAltTailN,
+  holeAltTys,
+  holeArrayDemand,
+  holeFlowDst,
+  holeFlowSrc,
+  holeFlowTruncate,
+  holeMapNames,
+  holeMapTys,
+  holeRowsTruncate,
+  holeShapeNames,
+  holeShapeTys,
+} from "./check_hole_rows"
+import {
+  inferLetIx,
+  inferLetNulBoolIx,
+  inferLetNulStrIx,
+  inferLetTruncate,
+  inferLetTy,
+  inferRetAtomCount,
+  inferRetFn,
+  inferRetLogLit,
+  inferRetLogSeed,
+  inferRetLogTy,
+  inferRetTruncate,
+  inferRetTy,
+  inferRetTyIx,
+  inferStack,
+  inferTentative,
+} from "./check_infer_rows"
+import {
+  nlnAnn,
+  nlnDecl,
+  nlnDiag,
+  nlnLeaf,
+  nlnLeafTy,
+  nlnMsg,
+  nlnSlot,
+  nlnText,
+  nlnUse,
+  nlnWant,
+  numLitNotesDropFrom,
+} from "./check_num_lit_state"
+import { inferRetRung } from "./check_ret_names"
+import {
+  isvalCol,
+  isvalEnd,
+  isvalLine,
+  isvalLit,
+  isvalMsg,
+  isvalName,
+  isvalTok,
+  isvalTruncate,
+  isvalType,
+  rcoalCode,
+  rcoalCol,
+  rcoalEnd,
+  rcoalLine,
+  rcoalMsg,
+  rcoalTok,
+  rcoalTruncate,
+  rcoalType,
+  rcoalWhy,
+  redunECol,
+  redunELine,
+  redunName,
+  redunRet,
+  redunSCol,
+  redunSLine,
+  redunTok,
+  redunTruncate,
+  redunType,
+} from "./check_state"
+import {
+  dJoinNode,
+  dJoinTruncate,
+  dJoinTy,
+  escJoinFn,
+  escJoinIx,
+  escJoinTruncate,
+  escJoinTy,
+  escJoinWho,
+  tpIfFn,
+  tpIfJoin,
+  tpIfNode,
+  tpIfOk,
+  tpIfReCount,
+  tpIfReFn,
+  tpIfReNames,
+  tpIfReOwner,
+  tpIfReParams,
+  tpIfReStart,
+  tpIfReTys,
+  tpIfTruncate,
+} from "./check_tp_join"
+import { T } from "./check_types"
+
+const RB_DIAGS = 1
+const RB_ARG = 2
+const RB_NEST = 4
+const RB_RET = 8
+const RB_LET = 16
+const RB_BM = 32
+const RB_MEM = 64
+const RB_UFCS = 128
+const RB_IS = 256
+const RB_BIN = 512
+const RB_PRINT = 1024
+const RB_ESC_JOIN = 2048
+const RB_COAL_HOLE = 4096
+
+// `tpIf*` and `tpIfRe*`; the latter's `Names`/`Tys` are spans `tpIfReStart` indexes, not rows.
+const RB_TP_IF = 8192
+const RB_CALLEE_WRITE = 16384
+const RB_DJOIN = 32768
+const RB_HOLE_FLOW = 65536
+
+// `holeShape*`, `holeArrayDemand`, `holeMap*` and `holeAlt*`.
+const RB_HOLES = 131072
+
+// `inferRet*`, `inferStack` and `inferTentative`.
+const RB_INFER = 262144
+
+// The lint-note tables: `redun*`, `rcoal*` and `isval*`.
+export const RB_LINT = 524288
+const RB_TP_ENV = 1048576
+
+// `inferLet*`: the un-annotated bindings' value-union and niche rows.
+const RB_INFER_LET = 2097152
+
+// The per-site sets, each the sum of its bits. "Every constraint family" is arg, nest, ret, let,
+// bm, mem, ufcs, is, bin and print.
+// `cstrProbeBefore` keeps the constraint rows it exists to record (D3062): diagnostics, lint
+// notes, holes and dJoin.
+export const RB_CSTR_PROBE = 688129
+
+// `inferReturnsPrePass` keeps the inferred returns, which are what it is for: diagnostics, lint
+// notes, every constraint family, holes, dJoin, coalHole, tpIf and inferLet.
+export const RB_RETURNS = 2799615
+
+// `globalInitPrePass`: `RB_RETURNS` bar diagnostics, which it drops per initializer, and inferLet.
+export const RB_GLOBAL_INIT = 702462
+
+// `solveUnannotParams` reads holeFlow before rolling back: diagnostics, lint notes, every
+// constraint family but nest, holes, holeFlow, dJoin and coalHole.
+export const RB_SOLVE = 759803
+
+// `monoRecheckBegin`/`End`: diagnostics, lint notes, every constraint family but nest, holes,
+// infer, inferLet, tpEnv and calleeWrite.
+export const RB_MONO = 4081659
+
+// `tpIfRecheck` around its re-check: every constraint family, escJoin, coalHole, tpIf and
+// calleeWrite.
+export const RB_PINNED = 32766
+
+// Every rollback-able table's length, by family; a family's mark is its keyed column's length.
+export type CheckMark = {
+  diags: i32,
+  argC: i32,
+  nestC: i32,
+  retC: i32,
+  letC: i32,
+  bmC: i32,
+  memC: i32,
+  ufcsC: i32,
+  isC: i32,
+  binC: i32,
+  printC: i32,
+  escJoin: i32,
+  coalHole: i32,
+  tpIf: i32,
+  tpIfRe: i32,
+  calleeWrite: i32,
+  dJoin: i32,
+  holeFlow: i32,
+  holeShapeNames: i32,
+  holeShapeTys: i32,
+  holeArrayDemand: i32,
+  holeMap: i32,
+  holeAlt: i32,
+  inferLet: i32,
+  inferLetNulStr: i32,
+  inferLetNulBool: i32,
+  inferRet: i32,
+  inferStack: i32,
+  inferTentative: i32,
+  redun: i32,
+  rcoal: i32,
+  isval: i32,
+  tpEnv: i32,
+}
+
+export function checkMark(): CheckMark {
+  {
+    diags: T.diags.length,
+    argC: argCstr.at.length,
+    nestC: nestCstr.ty.length,
+    retC: retCstr.got.length,
+    letC: letCstr.got.length,
+    bmC: bmCstr.got.length,
+    memC: memCstr.ty.length,
+    ufcsC: ufcsCstr.ty.length,
+    isC: isCstr.ty.length,
+    binC: binCstr.op.length,
+    printC: printCstr.ty.length,
+    escJoin: escJoinTy.length,
+    coalHole: coalHoleTy.length,
+    tpIf: tpIfFn.length,
+    tpIfRe: tpIfReFn.length,
+    calleeWrite: calleeWriteRow.length,
+    dJoin: dJoinNode.length,
+    holeFlow: holeFlowSrc.length,
+    holeShapeNames: holeShapeNames.length,
+    holeShapeTys: holeShapeTys.length,
+    holeArrayDemand: holeArrayDemand.length,
+    holeMap: holeMapNames.length,
+    holeAlt: holeAltNames.length,
+    inferLet: inferLetIx.length,
+    inferLetNulStr: inferLetNulStrIx.length,
+    inferLetNulBool: inferLetNulBoolIx.length,
+    inferRet: inferRetFn.length,
+    inferStack: inferStack.length,
+    inferTentative: inferTentative.length,
+    redun: redunName.length,
+    rcoal: rcoalTok.length,
+    isval: isvalTok.length,
+    tpEnv: tpEnvNames.length,
+  }
+}
+
+// Truncates each family in `set` back to its length in `m`.
+export function checkRollback(m: CheckMark, set: i32) {
+  if (set & RB_TP_ENV) != 0 { tpEnvTruncate(m.tpEnv) }
+  if (set & RB_HOLES) != 0 {
+    holeRowsTruncate(
+      m.holeShapeNames,
+      m.holeShapeTys,
+      m.holeArrayDemand,
+      m.holeMap,
+      m.holeAlt,
+    )
+  }
+  if (set & RB_BIN) != 0 { binCstrTruncate(m.binC) }
+  if (set & RB_ARG) != 0 { argCstrTruncate(m.argC) }
+  if (set & RB_PRINT) != 0 { tyIxCstrTruncate(printCstr, m.printC) }
+  if (set & RB_NEST) != 0 { tyIxCstrTruncate(nestCstr, m.nestC) }
+  if (set & RB_IS) != 0 { isCstrTruncate(m.isC) }
+  if (set & RB_RET) != 0 { retCstrTruncate(m.retC) }
+  if (set & RB_LET) != 0 { letCstrTruncate(m.letC) }
+  if (set & RB_BM) != 0 { bmCstrTruncate(m.bmC) }
+  if (set & RB_MEM) != 0 { memCstrTruncate(m.memC) }
+  if (set & RB_UFCS) != 0 { ufcsCstrTruncate(m.ufcsC) }
+  if (set & RB_ESC_JOIN) != 0 { escJoinTruncate(m.escJoin) }
+  if (set & RB_COAL_HOLE) != 0 { coalHoleTruncate(m.coalHole) }
+  if (set & RB_TP_IF) != 0 { tpIfTruncate(m.tpIf, m.tpIfRe) }
+  if (set & RB_CALLEE_WRITE) != 0 { calleeWriteTruncate(m.calleeWrite) }
+  if (set & RB_DJOIN) != 0 { dJoinTruncate(m.dJoin) }
+  if (set & RB_HOLE_FLOW) != 0 { holeFlowTruncate(m.holeFlow) }
+  if (set & RB_INFER_LET) != 0 {
+    inferLetTruncate(m.inferLet, m.inferLetNulStr, m.inferLetNulBool)
+  }
+  if (set & RB_INFER) != 0 {
+    inferRetTruncate(m.inferRet, m.inferStack, m.inferTentative)
+  }
+  if (set & RB_LINT) != 0 {
+    redunTruncate(m.redun)
+    rcoalTruncate(m.rcoal)
+    isvalTruncate(m.isval)
+  }
+  if (set & RB_DIAGS) != 0 {
+    while T.diags.length > m.diags { T.diags.pop() }
+    numLitNotesDropFrom(m.diags)
+  }
+  0
+}
+
+const PRB_TABLES: string[] = [
+  "T.diags", "argCstrAt", "argCstrExp", "argCstrWho", "argCstrFn",
+  "argCstrNode", "argCstrForm", "nestCstrTy", "nestCstrIx", "nestCstrFn",
+  "calleeWriteRow", "calleeWriteGot", "calleeWriteAt", "isCstrTy", "isCstrChk",
+  "isCstrName", "isCstrIx", "isCstrFn", "retCstrGot", "retCstrWant",
+  "retCstrIx", "retCstrFn", "retCstrWOnly", "letCstrGot", "letCstrWant",
+  "letCstrIx", "letCstrFn", "letCstrName", "letCstrSeq", "bmCstrGot",
+  "bmCstrWant", "bmCstrCtx", "bmCstrIx", "bmCstrFn", "bmCstrForm",
+  "bmCstrLabel", "bmCstrSeq", "memCstrTy", "memCstrProp", "memCstrIx",
+  "memCstrFn", "memCstrDem", "ufcsCstrTy", "ufcsCstrProp", "ufcsCstrIx",
+  "ufcsCstrFn", "ufcsCstrP0", "ufcsCstrMore", "escJoinTy", "escJoinIx",
+  "escJoinWho", "escJoinFn", "coalHoleTy", "coalHoleFn", "tpIfFn", "tpIfJoin",
+  "tpIfNode", "tpIfOk", "tpIfReFn", "tpIfReOwner", "tpIfReStart", "tpIfReCount",
+  "tpIfReNames", "tpIfReTys", "tpIfReParams", "binCstrOp", "binCstrLt",
+  "binCstrRt", "binCstrFn", "printCstrTy", "printCstrIx", "printCstrFn",
+  "dJoinNode", "dJoinTy", "holeFlowSrc", "holeFlowDst", "holeShapeNames",
+  "holeShapeTys", "holeArrayDemand", "holeMapNames", "holeMapTys",
+  "holeAltNames", "holeAltTys", "holeAltPreN", "holeAltTailN", "holeAltHoleIx",
+  "inferLetIx", "inferLetTy", "inferLetNulStrIx", "inferLetNulBoolIx",
+  "inferRetFn", "inferRetTy", "inferRetTyIx", "inferRetAtomCount",
+  "inferRetRung", "inferRetLogTy", "inferRetLogSeed", "inferRetLogLit",
+  "inferStack", "inferTentative", "tpEnvNames", "tpEnvTys", "redunSLine",
+  "redunSCol", "redunELine", "redunECol", "redunName", "redunType", "redunTok",
+  "redunRet", "rcoalLine", "rcoalCol", "rcoalEnd", "rcoalTok", "rcoalType",
+  "rcoalMsg", "rcoalWhy", "rcoalCode", "isvalLine", "isvalCol", "isvalEnd",
+  "isvalTok", "isvalName", "isvalType", "isvalLit", "isvalMsg", "nlnDiag",
+  "nlnMsg", "nlnText", "nlnDecl", "nlnUse", "nlnSlot", "nlnWant", "nlnAnn",
+  "nlnLeaf", "nlnLeafTy", "njFnStack", "cstrOwnerStack",
+]
+
+// The current length of each `PRB_TABLES` entry, in that order.
+function prbLens(): i32[] {
+  [
+    T.diags.length,
+    argCstr.at.length,
+    argCstr.exp.length,
+    argCstr.who.length,
+    argCstr.fn.length,
+    argCstr.node.length,
+    argCstr.form.length,
+    nestCstr.ty.length,
+    nestCstr.ix.length,
+    nestCstr.fn.length,
+    calleeWriteRow.length,
+    calleeWriteGot.length,
+    calleeWriteAt.length,
+    isCstr.ty.length,
+    isCstr.chk.length,
+    isCstr.name.length,
+    isCstr.ix.length,
+    isCstr.fn.length,
+    retCstr.got.length,
+    retCstr.want.length,
+    retCstr.ix.length,
+    retCstr.fn.length,
+    retCstr.wOnly.length,
+    letCstr.got.length,
+    letCstr.want.length,
+    letCstr.ix.length,
+    letCstr.fn.length,
+    letCstr.name.length,
+    letCstr.seq.length,
+    bmCstr.got.length,
+    bmCstr.want.length,
+    bmCstr.ctx.length,
+    bmCstr.ix.length,
+    bmCstr.fn.length,
+    bmCstr.form.length,
+    bmCstr.label.length,
+    bmCstr.seq.length,
+    memCstr.ty.length,
+    memCstr.prop.length,
+    memCstr.ix.length,
+    memCstr.fn.length,
+    memCstr.dem.length,
+    ufcsCstr.ty.length,
+    ufcsCstr.prop.length,
+    ufcsCstr.ix.length,
+    ufcsCstr.fn.length,
+    ufcsCstr.p0.length,
+    ufcsCstr.more.length,
+    escJoinTy.length,
+    escJoinIx.length,
+    escJoinWho.length,
+    escJoinFn.length,
+    coalHoleTy.length,
+    coalHoleFn.length,
+    tpIfFn.length,
+    tpIfJoin.length,
+    tpIfNode.length,
+    tpIfOk.length,
+    tpIfReFn.length,
+    tpIfReOwner.length,
+    tpIfReStart.length,
+    tpIfReCount.length,
+    tpIfReNames.length,
+    tpIfReTys.length,
+    tpIfReParams.length,
+    binCstr.op.length,
+    binCstr.lt.length,
+    binCstr.rt.length,
+    binCstr.fn.length,
+    printCstr.ty.length,
+    printCstr.ix.length,
+    printCstr.fn.length,
+    dJoinNode.length,
+    dJoinTy.length,
+    holeFlowSrc.length,
+    holeFlowDst.length,
+    holeShapeNames.length,
+    holeShapeTys.length,
+    holeArrayDemand.length,
+    holeMapNames.length,
+    holeMapTys.length,
+    holeAltNames.length,
+    holeAltTys.length,
+    holeAltPreN.length,
+    holeAltTailN.length,
+    holeAltHoleIx.length,
+    inferLetIx.length,
+    inferLetTy.length,
+    inferLetNulStrIx.length,
+    inferLetNulBoolIx.length,
+    inferRetFn.length,
+    inferRetTy.length,
+    inferRetTyIx.length,
+    inferRetAtomCount.length,
+    inferRetRung.length,
+    inferRetLogTy.length,
+    inferRetLogSeed.length,
+    inferRetLogLit.length,
+    inferStack.length,
+    inferTentative.length,
+    tpEnvNames.length,
+    tpEnvTys.length,
+    redunSLine.length,
+    redunSCol.length,
+    redunELine.length,
+    redunECol.length,
+    redunName.length,
+    redunType.length,
+    redunTok.length,
+    redunRet.length,
+    rcoalLine.length,
+    rcoalCol.length,
+    rcoalEnd.length,
+    rcoalTok.length,
+    rcoalType.length,
+    rcoalMsg.length,
+    rcoalWhy.length,
+    rcoalCode.length,
+    isvalLine.length,
+    isvalCol.length,
+    isvalEnd.length,
+    isvalTok.length,
+    isvalName.length,
+    isvalType.length,
+    isvalLit.length,
+    isvalMsg.length,
+    nlnDiag.length,
+    nlnMsg.length,
+    nlnText.length,
+    nlnDecl.length,
+    nlnUse.length,
+    nlnSlot.length,
+    nlnWant.length,
+    nlnAnn.length,
+    nlnLeaf.length,
+    nlnLeafTy.length,
+    njFnStack.length,
+    cstrOwnerStack.length,
+  ]
+}
+
+// Off unless a host arms it (`probeRollbackArm`). Armed, each quiet probe marks every table's
+// length on entry and counts each table whose length moved on leaving, naming which probe
+// leaves which table behind.
+export let prbArmed = false
+
+// The must-fire control: 1 makes `inferReturnsPrePass` keep its quiet diagnostics.
+export let prbSkip = 0
+let prbMarks: i32[][] = []
+let prbRowKey: string[] = []
+let prbRowN: i32[] = []
+
+// Arm (1) or disarm (0) the assertion for the compiles that follow; arming clears the rows.
+export function probeRollbackArm(on: i32) {
+  prbArmed = on != 0
+  prbMarks = []
+  prbRowKey = []
+  prbRowN = []
+  0
+}
+
+// Test-only: 1 skips one rollback (`prbSkip`), so a control can prove the assertion fires.
+export function probeRollbackSkipSet(k: i32) {
+  prbSkip = k
+  0
+}
+
+export function probeRollbackRowCount() { prbRowKey.length }
+
+export function probeRollbackRowLen(i: i32) { prbRowKey[i].length }
+
+export function probeRollbackRowAt(i: i32, j: i32) { prbRowKey[i][j] }
+
+export function probeRollbackRowN(i: i32) { prbRowN[i] }
+
+function prbCount(key: string) {
+  let i = 0
+  while i < prbRowKey.length {
+    if prbRowKey[i] == key {
+      prbRowN[i] = prbRowN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  prbRowKey.push(key)
+  prbRowN.push(1)
+  0
+}
+
+// A probe begins: mark every table's length. Callers test `prbArmed` first.
+export function prbEnter() {
+  prbMarks.push(prbLens())
+  0
+}
+
+// Probe `site` has rolled back: one `site | ran` row, and one `site | table | +` (or `-`) row
+// for each table whose length differs from its mark.
+export function prbLeave(site: string) {
+  const m = prbMarks.pop() ?? []
+  prbCount(site + " | ran")
+  const cur = prbLens()
+  let i = 0
+  while i < cur.length && i < m.length {
+    if cur[i] > m[i] { prbCount(site + " | " + PRB_TABLES[i] + " | +") }
+    if cur[i] < m[i] { prbCount(site + " | " + PRB_TABLES[i] + " | -") }
+    i = i + 1
+  }
+  0
+}
+
+// What `monoRecheckBegin` saves and `monoRecheckEnd` restores: the two suppression flags and
+// the tables' lengths, of which it rolls back `RB_MONO`.
+export type MonoSave = { quiet: boolean, sym: i32, mark: CheckMark }

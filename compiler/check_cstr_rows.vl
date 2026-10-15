@@ -6,7 +6,7 @@
 // keep one row per structurally equal constraint of a body, and `tpGradualRecv` records the
 // member read a gradual receiver defers to its pin.
 
-import { cstrOwnerStack } from "./check_cursor"
+import { cstrOwnerStack, tpEnvNames } from "./check_cursor"
 import { tpGradualView, tyIsDeferredJoin } from "./check_tp_join"
 import { wsVarTy } from "./check_ty_shape"
 import {
@@ -18,6 +18,7 @@ import {
   TyUnion,
   tyEqSameHoles,
   tyHasHole,
+  tyHasInferHole,
 } from "./check_types"
 import { wsNoteInstErr } from "./check_width"
 import { i32ToStr } from "./ast"
@@ -352,7 +353,6 @@ export function cstrOwnerTop() {
 
 // The constraint tables a demand deferred through a function-value delivery can sit in.
 export const CV_BIN = 0
-
 export const CV_PRINT = 1
 export const CV_ARG = 2
 export const CV_RET = 3
@@ -648,4 +648,56 @@ export function noteNestCstr(t: i32, ix: i32) {
   nestCstr.ix.push(ix)
   nestCstr.fn.push(owner)
   0
+}
+
+// Records a deferred destination constraint when either side carries a hole — the body
+// cannot decide it then. Stamped with the owning declaration, for the same reason
+// `noteBinCstr` is. No `wOnly` column: that column exists at the return seam only to gate
+// D561's newtype exemption, and this seam has no exemption to gate.
+export function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
+  if tyHasHole(got) || tyHasHole(want) {
+    const owner = cstrOwnerTop()
+    // Outside every generic, a type parameter can only be a generic function value's own, which
+    // its delivery binds and adjudicates (`genFnValueCstrs`); a row would be re-asked of every
+    // later generic call whose parameter shares the name (D3104).
+    if owner < 0 && tpEnvNames.length == 0 {
+      if !tyHasInferHole(got, 0) && !tyHasInferHole(want, 0) { return 0 }
+    }
+    let k = 0
+    while k < letCstr.got.length {
+      if letCstr.fn[k] == owner {
+        if (
+          tyEqSameHoles(letCstr.got[k], got)
+          && tyEqSameHoles(letCstr.want[k], want)
+        ) {
+          return 0
+        }
+      }
+      k = k + 1
+    }
+    letCstr.got.push(got)
+    letCstr.want.push(want)
+    letCstr.ix.push(ix)
+    letCstr.fn.push(owner)
+    letCstr.name.push(name)
+    letCstr.seq.push(cstrSeqNext)
+    cstrSeqNext = cstrSeqNext + 1
+    cvMark(CV_LET, letCstr.fn.length - 1)
+  }
+  0
+}
+
+// Is `at` a composite argument whose hole only a pin can decide against the concrete `exp`? A
+// function value is its delivery's to adjudicate (`genFnValueCstrs`), and outside every generic
+// a hole is such a value's own, so neither is recorded (D3104).
+export function compArgCstrOk(at: i32, exp: i32): boolean {
+  if at < 0 || at >= T.tys.length { return false }
+  const t = T.tys[at]
+  if (
+    !(t is TyArray || t is TyObj || t is TyMap || t is TyNullable || t is TyUnion)
+  ) {
+    return false
+  }
+  if cstrOwnerTop() < 0 && tpEnvNames.length == 0 { return false }
+  tyHasHole(at) && !tyHasHole(exp)
 }
