@@ -96,4 +96,4 @@ D4199-D4205  lane-CK  2026-10-12  review of #3577: mixed-literal-union element r
 D4300-D4319  lane-SC  2026-10-13  function-value flow table (§(f) step 1) disagreements on silent review witnesses: D4300-D4304 filed open
 D4746-D4749  lane-D4720  2026-10-14  closing D4720/D4721 (nullable union and inline-record list literals): none filed
 D4770-D4773  lane-D4743  2026-10-14  closing D4743/D4744/D4745 (unions of one-list members): D4770, D4771 filed open
-D4782-D4785  lane-PF  2026-10-14  bench regression triage (vidi sweep vs 2026-08-03): D4782 list-index guard, D4783 string rep, D4784 int formatting filed open
+D4778-D4781  lane-D4771  2026-10-14  closing D4771 (`is` over a list tests every element): D4778, D4779 filed open

@@ -3041,3 +3041,45 @@ column: in `tests/cases`, `narrowed-fn-arm-place-call.vl` 239, `narrowed-field-r
 clone); 42 over `_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over
 `(9000000000 | 1 | 9000000001)[]`; in `named/`, the `d3125_*` `(i32 | string | null)[]` 99 and
 `d3140_*` 128. Then items 2, 4 and 5 of §13.14.
+
+### 13.20 A capture cell seeded from another cell's read carries its type
+
+This step takes the 154 `Ident` LEFT-ONLY notes §13.19 left at nodes with no type.
+
+**Correction to §13.19.** Those nodes are not monomorphizer clones. A probe that tags each noted
+node with the pass that minted it puts all 154 in `captureBoxRewrite`, which runs before
+`monomorphize`. The mono-side fix §13.19 proposed would have moved none of them.
+
+**Mechanism.** `cboxWalk`'s `LetDecl` arm rewrites the initialiser before it boxes the binding.
+So in `let d2 = d1`, where `d1` is itself a boxed capture, the initialiser is already `d1[0]` when
+`cboxBoxLet` runs. That `Index` node is minted by the rewrite and has no type; its read's type is
+banked in `cboxReadTy`. The un-annotated branch of `cboxBoxLet` asked only `nodeTyIxOf`, got `-1`,
+and recorded no `cboxCellTy` for `d2`. Every later read of `d2` was then minted untyped too.
+`cboxBoxLet` now falls back to `cboxReadTy` for the initialiser, so the cell gets `T[]` from the
+read it was seeded with.
+
+**Checks.** The "before" seed is origin/master's fixpoint (5df39d4a2), 5,560,369 bytes. The
+"after" seed is 5,560,483 bytes, +114.
+
+* `difftree --identity` over 15,162 files: **10,203 built, 0 differ, 0 uncompared**, and the candidate compiling master's
+  source gives master's fixpoint.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, `regress.vl` moves no cell, and `seed-size --check` passes.
+
+**Counts.** Like-for-like `listRep` notes, measured with §13.17's probe, in `tests/cases`:
+
+| row | before | after |
+| --- | --- | --- |
+| `Ident` LEFT-ONLY | 341 | 187 |
+| other LEFT-ONLY | 2,516 (52 files) | 2,300 (51 files) |
+
+No note was added and no other row moved. The `Ident` notes removed are exactly the 154:
+`hole-lambda-cell-seeded-from-cell-mutate-then-read.vl` 122 and
+`hole-lambda-cell-takes-instance-type.vl` 32. The other LEFT-ONLY drop is one group of 216
+non-`Ident` notes in the second file, at nodes read through the same cell. `named/` was not
+re-swept; its 227 are the `d3125_*` and `d3140_*` notes below, which are typed nodes.
+
+**Next, in order:** 42 over `_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over
+`(9000000000 | 1 | 9000000001)[]`; in `named/`, the `d3125_*` `(i32 | string | null)[]` 99 and
+`d3140_*` 128. These are typed nodes whose type has no column yet, not missing types. Then items
+2, 4 and 5 of §13.14.
