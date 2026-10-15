@@ -5992,12 +5992,7 @@ function retireAliasedNarrowings(
     const apart = recvFresh && kRoot != recvName && !hidden
     const skip0 = kRoot != recvName && !hidden && crSoleRefBinding(kRoot)
     const keeps = (!hidden
-      && elemOnlyStoreKeeps(
-      i,
-      subscriptDepthOf(tgtIx),
-      asgRhsIx(atIx),
-      rt,
-    ))
+      && elemOnlyStoreKeeps(i, elemDepthOf(tgtIx), asgRhsIx(atIx), rt))
     const hits = !own
       && !fam
       && !apart
@@ -6219,7 +6214,7 @@ function retireNarrowingsForWrite(
     const root = indexRootKeyOf(tgtIx)
     if root == "" { return 0 }
     const pfx = root + "["
-    const depth = subscriptDepthOf(tgtIx)
+    const depth = elemDepthOf(tgtIx)
     const val = asgRhsIx(atIx)
     let r = 0
     while r < npKeys.length {
@@ -6228,7 +6223,7 @@ function retireNarrowingsForWrite(
         keyHasPrefix(npKeys[r], pfx)
         && !(keyHasPrefix(npKeys[r], root + LIST_EVERY_STEP)
           && narFitNameOf(r) != "")
-        && !(placeRootOf(npKeys[r]) == root && elemOnlyStoreKeeps(r, depth, val, rt))
+        && !(elemKeyBase(npKeys[r]) == root && elemOnlyStoreKeeps(r, depth, val, rt))
       ) {
         let rprev = -1
         if npInvBy[r] < 0 { rprev = npTys[r] }
@@ -7464,23 +7459,27 @@ function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // The list itself, or a row of it still a list (`b[0]` under `b is K[][]`, D4945).
   const pfx = elemRecvPrefix(ix)
   if pfx == "" { return false }
-  const name = placeRootOf(pfx)
-  const rows = (pfx.length - name.length) / LIST_EVERY_STEP.length
+  const name = elemKeyBase(pfx)
+  const rows = elemKeyDepth(pfx)
   const slot = elemEverySlotOf(name)
   if slot < 0 || npInvBy[slot] >= 0 { return false }
   const key = npKeys[slot]
   const leaf = npTys[slot]
-  const depth = (key.length - name.length) / LIST_EVERY_STEP.length - rows
+  const depth = elemKeyDepth(key) - rows
   if depth <= 0 { return false }
   const byName = narFitNameOf(slot) != ""
   if byName && !assignable(srcTy, dstTy) { return false }
   if !byName && !listLeafFits(leaf, dstTy, depth) { return false }
-  let decl = narDeclaredTy(name, -1)
-  if decl < 0 { decl = lookup(name) }
-  let r = 0
-  while r < rows && decl >= 0 {
-    decl = placeElemTy(listUnionWidest(nonNullTy(decl)))
-    r = r + 1
+  // A field or subscript place is typed as declared, the narrowing being on its elements alone.
+  let decl = srcTy
+  if !isPathKey(name) {
+    decl = narDeclaredTy(name, -1)
+    if decl < 0 { decl = lookup(name) }
+    let r = 0
+    while r < rows && decl >= 0 {
+      decl = placeElemTy(listUnionWidest(nonNullTy(decl)))
+      r = r + 1
+    }
   }
   if decl < 0 || narDeclFitsDst(decl, dstTy) { return false }
   const text = narRowText(ix)
@@ -7499,13 +7498,15 @@ function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
-// The list `ix` reads (a name, or a subscript chain over one) as a message spells it: a literal
-// or named subscript as written, any other as `[…]`.
+// The list `ix` reads (a name or field path, or a subscript chain over one) as a message spells
+// it: a literal or named subscript as written, any other as `[…]`.
 function narRowText(ix: i32): string {
   const p = peelParenIx(ix)
   if p < 0 || p >= P.nodes.length { return "" }
   const n = P.nodes[p]
   if n is Ident { return n.identName }
+  if n is Member { return narRowText(n.memObj) + "." + n.memProp }
+  if n is OptMember { return narRowText(n.omObj) + "?." + n.omProp }
   if !(n is Index) { return "" }
   const k = P.nodes[peelParenIx(n.idxIndex)]
   const sub = if k is NumLit { k.numText } else if k is Ident { k.identName } else { "…" }
@@ -7535,14 +7536,14 @@ function mapCopyText(depth: i32): string {
   text
 }
 
-// The innermost overlay slot holding an element entry of the bare name `name` (`name[*]…`),
-// whether or not it is still in force, or -1.
-function elemEverySlotOf(name: string): i32 {
-  const pfx = name + LIST_EVERY_STEP
+// The innermost overlay slot holding an element entry of the place `base` (`base[*]…`, `base` a
+// name or a field or literal-subscript path), whether or not it is still in force, or -1.
+function elemEverySlotOf(base: string): i32 {
+  const pfx = base + LIST_EVERY_STEP
   let i = npKeys.length - 1
   while i >= 0 {
     const k = npKeys[i]
-    if keyHasPrefix(k, pfx) && keyIsListEvery(k) && k.indexOf(".") < 0 {
+    if keyHasPrefix(k, pfx) && keyIsListEvery(k) && elemKeyBase(k) == base {
       return i
     }
     i = i - 1
@@ -8172,8 +8173,7 @@ function elemOnlyStoreKeeps(
   }
   const key = npKeys[slot]
   const leaf = npTys[slot]
-  if leaf < 0 || !keyIsListEvery(key) || key.indexOf(".") >= 0 { return false }
-  if (key.length - placeRootOf(key).length) / LIST_EVERY_STEP.length != depth {
+  if leaf < 0 || !keyIsListEvery(key) || elemKeyDepth(key) != depth {
     return false
   }
   let vt = loopWritePeekTy(valIx, leaf)
@@ -8189,9 +8189,9 @@ function pushKeepsElemOnly(cn: Call, key: string): boolean {
     return false
   }
   const slot = narrowedPathIx(key)
-  const depth = subscriptDepthOf(cf.memObj)
+  const depth = elemDepthOf(cf.memObj)
   if slot < 0 || depth < 0 { return false }
-  if placeRootOf(elemRecvPrefix(cf.memObj)) != placeRootOf(key) { return false }
+  if elemKeyBase(elemRecvPrefix(cf.memObj)) != elemKeyBase(key) { return false }
   for a in cn.callArgs {
     if spreadArgOf(a) >= 0 { return false }
     if !elemOnlyStoreKeeps(slot, depth + 1, a, nodeTyOf(a)) { return false }
@@ -8209,18 +8209,30 @@ function asgRhsIx(atIx: i32): i32 {
   -1
 }
 
-// How many subscripts the place `ix` reads below a bare name (`b[i][j]` is 2), or -1.
-function subscriptDepthOf(ix: i32): i32 {
-  let d = 0
-  let cur = peelParenIx(ix)
-  while cur >= 0 && cur < P.nodes.length {
-    const n = P.nodes[cur]
-    if n is Ident { return d }
-    if !(n is Index) { return -1 }
-    d = d + 1
-    cur = peelParenIx(n.idxArr)
+// How many element steps the place `ix` reads below the base of its element prefix
+// (`elemRecvPrefix`: `b[i][j]` is 2, `o.xs[i]` is 1), or -1 when it has none.
+function elemDepthOf(ix: i32): i32 {
+  const pfx = elemRecvPrefix(ix)
+  if pfx == "" { return -1 }
+  elemKeyDepth(pfx)
+}
+
+// How many `[*]` steps end the element key `k`.
+function elemKeyDepth(k: string): i32 {
+  (k.length - elemKeyBase(k).length) / LIST_EVERY_STEP.length
+}
+
+// The element key `k` without the `[*]` steps that end it: the place its list entry is keyed on
+// (`b[*][*]` is `b`, `o.xs[*]` is `o.xs`).
+function elemKeyBase(k: string): string {
+  let e = k.length
+  while (
+    e >= LIST_EVERY_STEP.length
+    && k.slice(e - LIST_EVERY_STEP.length, e) == LIST_EVERY_STEP
+  ) {
+    e = e - LIST_EVERY_STEP.length
   }
-  -1
+  k.slice(0, e)
 }
 
 // `crFirstWritingCall` for an element entry `key`: a `push` on a list narrowed by name is
@@ -8452,7 +8464,7 @@ function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
   if t is Member { same = last == "." + t.memProp }
   if t is Index {
     const ks = narrowedPathIx(key)
-    if ks >= 0 && elemOnlyStoreKeeps(ks, subscriptDepthOf(tgt), val, -1) {
+    if ks >= 0 && elemOnlyStoreKeeps(ks, elemDepthOf(tgt), val, -1) {
       return false
     }
     // A store through a list narrowed by name is checked against its narrowed element.
@@ -9429,7 +9441,7 @@ function pushElemReadFact(
   tys: i32[],
 ) {
   let key = placeKeyOf(placeIx)
-  if key == "" || isPathKey(key) { return 0 }
+  if key == "" { return 0 }
   let d = nonNullTy(cur)
   let n = chk
   while d >= 0 && n >= 0 && T.tys[d] is TyArray && T.tys[n] is TyArray {
@@ -9695,11 +9707,7 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
         ) {
           pushElemReadFact(isPl, isCur, tIdx, names, tys)
         }
-      } else if (
-        tIdx >= 0
-        && P.nodes[peelParenIx(isPl)] is Ident
-        && listNarrowsElemsOnly(isCur, tIdx)
-      ) {
+      } else if tIdx >= 0 && listNarrowsElemsOnly(isCur, tIdx) {
         // A list keeps its declared type and narrows its element reads (ruling (c), D4945).
         const nn = nonNullNarrowTy(isCur)
         if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
@@ -37898,6 +37906,14 @@ export function listDisjointDepth(recvTy: i32, testTy: i32): i32 {
   ) {
     return d
   }
+  // A record lacking a field the tested record names can never fit it (D4962).
+  const ro = T.tys[r]
+  const to = T.tys[t]
+  if ro is TyObj && to is TyObj {
+    for f in to.objFieldNames {
+      if !strListHas(ro.objFieldNames, f) { return d }
+    }
+  }
   -1
 }
 
@@ -45186,21 +45202,13 @@ function checkIndexNode(n: Index, ix: i32) {
   tErr(indexFloorMsg(arrTy), ix)
   return TY_ERR
 }
-// The element a read `xs[i]…[j]` holds under an element-only narrowing of `xs`
-// (`pushElemReadFact`), or -1. A store through the place is typed as declared and ends it.
+// The element a read `xs[i]…[j]` holds under an element-only narrowing of `xs` (a name, a field
+// path or a literal subscript, `pushElemReadFact`), or -1. A store through the place is typed as
+// declared and ends it.
 function elemEveryReadTy(ix: i32): i32 {
   if luWriteTgt[ix] ?? false { return -1 }
-  let key = ""
-  let cur = ix
-  let n = P.nodes[cur]
-  while n is Index {
-    key = key + LIST_EVERY_STEP
-    cur = peelParenIx(n.idxArr)
-    if cur < 0 || cur >= P.nodes.length { return -1 }
-    n = P.nodes[cur]
-  }
-  if !(n is Ident) { return -1 }
-  key = n.identName + key
+  const key = elemRecvPrefix(ix)
+  if !keyIsListEvery(key) { return -1 }
   const slot = narrowedPathIx(key)
   if slot < 0 || narFitNameOf(slot) != "" { return -1 }
   const t = narrowedPathTy(key)
@@ -45214,7 +45222,7 @@ function elemEveryReadTy(ix: i32): i32 {
 function elemOnlyKeyOf(recvIx: i32): string {
   const pfx = elemRecvPrefix(recvIx)
   if pfx == "" { return "" }
-  const slot = elemEverySlotOf(placeRootOf(pfx))
+  const slot = elemEverySlotOf(elemKeyBase(pfx))
   if slot < 0 || narFitNameOf(slot) != "" { return "" }
   const key = npKeys[slot]
   if key.length <= pfx.length || narrowedPathTy(key) < 0 { return "" }
@@ -45222,14 +45230,18 @@ function elemOnlyKeyOf(recvIx: i32): string {
   key
 }
 
-// The element key prefix of the list `ix` reads: its name, then `[*]` per subscript (`m[i]` is
-// `m[*]`), or "" when it is not a name or a subscript chain over one.
+// The element key prefix of the list `ix` reads: its place (a name, a field path `o.xs`, or a
+// literal subscript `m[0]` an element entry is keyed on), then `[*]` per subscript (`m[i]` is
+// `m[*]`), or "" when it is no subscript chain over a place.
 function elemRecvPrefix(ix: i32): string {
   const p = peelParenIx(ix)
   if p < 0 || p >= P.nodes.length { return "" }
   const n = P.nodes[p]
   if n is Ident { return n.identName }
+  const own = placeKeyOf(p)
+  if n is Member || n is OptMember { return own }
   if !(n is Index) { return "" }
+  if own != "" && elemEverySlotOf(own) >= 0 { return own }
   const inner = elemRecvPrefix(n.idxArr)
   if inner == "" { return "" }
   inner + LIST_EVERY_STEP
