@@ -2994,3 +2994,50 @@ distilled `cells/` and `named/` notes are identical before and after.
 **Next, in order:** the 881 `Ident` LEFT-ONLY left: the 688 above, which need a producer; 42 over
 `_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over a mixed-width numeric literal
 union `(9000000000 | 1 | 9000000001)[]`. Then items 2, 4 and 5 of §13.14.
+
+### 13.19 A narrowed place read records its receiver's types
+
+This step takes the `Ident` LEFT-ONLY notes of §13.18 at nodes with no recorded type.
+
+**Mechanism.** A flow-narrowed place read returns its overlay type before the checker visits the
+receiver. `checkMemberNode` and `checkOptMemberNode` find `placeKeyOf(ix)` with
+`narrowedPathTy >= 0`, return `symMem(ix, …)`, and call only `identNotePlace(n.memObj)`. So in
+`if ws[0].f != null { ws[0].f.push(1) }`, in `hs[0].f()` under `is`, and in `(lv5[0]).r5`, the
+nodes `ws` and `ws[0]` never get a type, and `nodeTyInOf` answers `-1` there. `identNotePlace`
+now first calls `placeRecvTysNote`, which walks `Member`, `OptMember`, `Index` and `Paren` down to
+the root and records `widenLitTy(placeCurTy(…))` at each node. It records nothing under
+`inferQuiet` or where `placeCurTy` has no answer. These are types the checker already computes for
+the same place on its unnarrowed path.
+
+**What remains with no type is not a checker path.** The 154 notes left at `-1` sit in two files:
+`hole-lambda-cell-seeded-from-cell-mutate-then-read.vl` 122 and
+`hole-lambda-cell-takes-instance-type.vl` 32. The ablation needs two functions that each bind a
+hole lambda, and in one of them a nested function that writes a cell holding the lambda. Either
+function alone does not reproduce. The noted nodes are made by the monomorphizer: it clones the
+nested function per pin (`emit_mono.vl`, the hole-lambda cell clone) after the check, so no checker
+path visits them. The fix is to record the template's type at the clone, as the clone of an
+annotation already does. That is a mono-side change and is not taken here.
+
+**Checks.** The "before" seed is origin/master's fixpoint (015da254b), 5,560,055 bytes. The
+"after" seed is 5,560,424 bytes, +369.
+
+* `difftree --identity` over 15,162 files: **10,203 built, 0 differ, 0 uncompared**, and the
+  candidate compiling master's source gives master's fixpoint.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, and `regress.vl` moves no cell.
+
+**Counts.** Like-for-like `listRep` notes, measured with §13.17's probe, `Ident` LEFT-ONLY:
+
+| population | before | after |
+| --- | --- | --- |
+| `tests/cases` | 881 (19 files) | 341 (16 files) |
+| distilled `named/` | 861 (16 files) | 227 (10 files) |
+
+No note was added and no other row moved. The notes removed are all `reflist` against an unset
+column: in `tests/cases`, `narrowed-fn-arm-place-call.vl` 239, `narrowed-field-receiver.vl` 197 and
+`adopted-string-atom-print-route.vl` 104; in `named/`, six `*_isnar_*` cells, 634 notes.
+
+**Next, in order:** the 154 clone-minted nodes above (mono records the template's type at the
+clone); 42 over `_[] | null`; 32 over `(Rec2[] | null | Rec[] | null)[]`; 23 over
+`(9000000000 | 1 | 9000000001)[]`; in `named/`, the `d3125_*` `(i32 | string | null)[]` 99 and
+`d3140_*` 128. Then items 2, 4 and 5 of §13.14.
