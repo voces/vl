@@ -545,7 +545,6 @@ import {
   tyObjHasMapField,
   tyParamNamesPart,
   tyPinsEmptyHoles,
-  tyPrimNameIs,
   tyPrimNameOf,
   tyPrintsAsRef,
   tyReachesBrand,
@@ -899,13 +898,11 @@ import {
   primNameOf,
   sameNumeric,
   tyAdmitsNull,
-  tyEqNoneIsMap,
   tyExcludesNull,
   tyFnRetIsLitUnion,
   tyHasNullMember,
   tyHasObjMember,
   tyHasTyVarDeep,
-  tyHasV128Member,
   tyHoldsNumericPrim,
   tyHoldsOpenNullHole,
   tyHoldsWideScalar,
@@ -923,7 +920,6 @@ import {
   tyObjFieldIsLitUnion,
   tyPeelElems,
   tyReachesHole,
-  tyUnionIsOneLitCell,
   unionAliasMembersFaithful,
   unionArmSubsumedBy,
   unionArrayArmForLit,
@@ -935,7 +931,6 @@ import {
   unionLeavesInto,
   unionMemberCountOf,
   unionObjArmForLit,
-  unionSoleNonNullMember,
 } from "./check_ty_shape"
 import {
   ESC_ATOM,
@@ -961,7 +956,6 @@ import {
   litScalarBoxLeaves,
   litUnionArrayElemOf,
   mapKeyKindOfTy,
-  mapKeyRepTy,
   mapKeyTySupported,
   mapTyValExcludesNull,
   mapTyValIsBool,
@@ -994,41 +988,51 @@ import {
   unionArmBoxSafe,
   unionRidesI32Spine,
 } from "./check_ty_rep"
+import {
+  EqCmpKind,
+  REC_STORE_DEPTH,
+  containerElemClassDiffers,
+  containerWidenServed,
+  containerWidenWhy,
+  covarNonNullArms,
+  eqCmpKindOfTy,
+  eqRefusals,
+  fieldStorageEq,
+  fvaFnMayDiffer,
+  fvaLitBase,
+  fvaNestedFnDiffers,
+  holeArgScalarRefused,
+  isWidenNotVariant,
+  joinWidensMap,
+  listJoinStorageDiffers,
+  listPairNeedsCopy,
+  litNumUnionConverts,
+  mapTwinTestMsg,
+  mixesNumeric,
+  numWidens,
+  numWidensName,
+  objFieldNameSetsEq,
+  objNumWidens,
+  primAmong,
+  recAdLanding,
+  recDeclaredRowOf,
+  recFloatField,
+  recIntToFloat,
+  recNamesDeepEq,
+  recNumChanges,
+  recNumClass,
+  recNumMergeField,
+  recStorageField,
+  recStorageFieldOf,
+  scalarElemWidenServed,
+  scalarPrimPair,
+  widenMemberPairs,
+  widerNumeric,
+} from "./check_ty_relate"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
 // AST's convention). A nested type is always an `i32` index into `T.tys`.
-
-// The comparability vocabulary — which lowering a `==`/`!=` operand's rep takes. `""` and
-// `"none"` are different answers and both are load-bearing: the checker rejects `"none"`
-// (`has no lowering`) while `""` means "not a niche", so absence is not folded into one.
-export type EqCmpKind = ""
-  | "str"
-  | "scalar"
-  | "closure"
-  | "struct"
-  | "none"
-  | "list"
-  | "strlist"
-  | "reflist"
-  | "glist"
-  | "nulglist"
-  | "nulstr"
-  | "nulclosure"
-  | "nulstruct"
-  | "nullist"
-  | "nulstrlist"
-  | "nulreflist"
-
-// The compare core a `==`/`!=` lowers through. `"none"` is "no core of its own", a real answer
-// the caller branches on.
-export type EqCore = "none"
-  | "i32list"
-  | "strlist"
-  | "reflist"
-  | "glist"
-  | "str"
-  | "closure"
 
 // The data channel's encoding, documented here and nowhere else: `tdata` is a flat
 // sequence of netstrings — `<byte-length> ":" <bytes> ","` — read as alternating key and
@@ -19072,43 +19076,6 @@ function tErrPush(
 
 // ── small numeric / string helpers (no union narrowing) ──────────────────────
 
-// Numeric widening lattice: may a value of primitive type `sn` implicitly flow into a `dn`-typed
-// slot? Only the lossless edges — `i32 → i64`, `i32 → f64`, `f32 → f64`, plus every type to itself
-// — since each preserves the value exactly and codegen inserts the convert at the boundary.
-// `i32 → f32` and `i64 → f64` are rejected as lossy, as is every narrowing and float-to-integer.
-function numWidensName(sn: PrimName | null, dn: PrimName | null) {
-  if sn == dn { return false }
-  if sn == "i32" {
-    if dn == "i64" || dn == "f64" { return true }
-  }
-  if sn == "f32" {
-    if dn == "f64" { return true }
-  }
-  false
-}
-
-// True when `src`→`dst` is an implicit numeric widening (see `numWidensName` —
-// the lossless edges only; i32→f32 / i64→f64 are rejected as lossy).
-function numWidens(src: i32, dst: i32) {
-  numWidensName(primNameOf(src), primNameOf(dst))
-}
-
-// Are `a` and `b` two numeric operands of different but compatible types, so a mixed arithmetic or
-// comparison widens the narrower side to the wider one? True exactly when one operand widens to
-// the other, in either direction. The shared op type is then the wider of the two (`widerNumeric`).
-function mixesNumeric(a: i32, b: i32) {
-  if numWidens(a, b) { return true }
-  if numWidens(b, a) { return true }
-  false
-}
-
-// The wider of two mixed numeric operands, which is the result and op type: whichever the other
-// widens into. The caller guarantees `mixesNumeric(a, b)`.
-function widerNumeric(a: i32, b: i32) {
-  if numWidens(a, b) { return b }
-  a
-}
-
 // Is the expression at `ix` a bare scalar literal — a number, a string, a boolean, or one of those
 // behind parens or a unary sign? These are the expressions a nominal newtype destination adopts
 // without an explicit conversion: a literal carries no prior identity, so it is not a candidate for
@@ -19311,78 +19278,6 @@ function setMapRecordClashField(a: i32, b: i32, isJoin: boolean): string {
     k = k + 1
   }
   ""
-}
-
-// Asked only where a test must tell two arms apart: `x is T`, a `match` arm or an `as` naming
-// the map `chk`, over the members `mems`. A numeric literal-union value reps as its base, so
-// `{[K]: 1 | 2}` and `{[K]: i32}` are one box member and the test could not answer (D2493).
-function mapTwinTestMsg(mems: i32[], chk: i32, what: string): string {
-  if chk < 0 { return "" }
-  // A union pattern (`is A | string`) tests each of its members; a twin it names both halves
-  // of is told apart by neither, so only a twin left outside the pattern is refused.
-  const want: i32[] = []
-  mapTwinFlatten([chk], want, 4)
-  const flat: i32[] = []
-  mapTwinFlatten(mems, flat, 4)
-  let w = 0
-  while w < want.length {
-    const c = want[w]
-    const ct = T.tys[c]
-    if ct is TyMap {
-      let i = 0
-      while i < flat.length {
-        const b = flat[i]
-        const bt = T.tys[b]
-        if bt is TyMap {
-          if mapPairSharesRep(ct, bt) && !tyArrHasEq(want, b) {
-            return what
-              + " cannot tell "
-              + tyToStr(c)
-              + " from "
-              + tyToStr(b)
-              + " yet: they share one representation — wrap each in a record with a discriminant field"
-          }
-        }
-        i = i + 1
-      }
-    }
-    w = w + 1
-  }
-  ""
-}
-
-// The members `mems` names, with a nested union or nullable spread into its own members.
-function mapTwinFlatten(mems: i32[], out: i32[], depth: i32) {
-  if depth <= 0 { return 0 }
-  let i = 0
-  while i < mems.length {
-    const m = mems[i]
-    if m >= 0 {
-      const t = T.tys[m]
-      if t is TyUnion { mapTwinFlatten(t.uMembers, out, depth - 1) }
-      else if t is TyNullable { mapTwinFlatten([t.nInner], out, depth - 1) }
-      else { out.push(m) }
-    }
-    i = i + 1
-  }
-  0
-}
-
-// Whether two maps (neither a Set) are one box member though not one type: keys that hash
-// alike, and values equal once a numeric literal union is read as its base.
-function mapPairSharesRep(a: TyMap, b: TyMap): boolean {
-  if a.mSet != 0 || b.mSet != 0 { return false }
-  if a.mKey < 0 || b.mKey < 0 || a.mVal < 0 || b.mVal < 0 { return false }
-  if mapKeyRepTy(a.mKey) != mapKeyRepTy(b.mKey) { return false }
-  if tyEq(a.mVal, b.mVal) { return false }
-  tyEq(mapValSoftBase(a.mVal), mapValSoftBase(b.mVal))
-}
-
-// A map value as its box member reads it: a numeric literal union's base, else itself.
-export function mapValSoftBase(v: i32): i32 {
-  const b = numLitUnionBaseTy(v)
-  if b >= 0 { return b }
-  v
 }
 
 // `V | null` when one side is a declared type parameter and the other is `null`, else -1.
@@ -19817,39 +19712,6 @@ export function numUnionConverts(src: i32, dst0: i32): boolean {
     if !sameNumeric(m, dst) && !numWidens(m, dst) { return false }
   }
   true
-}
-
-// Whether a union of integer literals and numbers `src`, a literal among them, delivers into the
-// numeric primitive `dst`: it holds each literal exactly and each number widens to it, so the box
-// converts at the member it holds (D3523).
-export function litNumUnionConverts(src: i32, dst: i32): boolean {
-  if src < 0 || src >= T.tys.length || !(T.tys[src] is TyUnion) { return false }
-  if !isNumericPrimTy(dst) { return false }
-  const vs: i32[] = []
-  flattenVariantsInto(src, vs)
-  let lits = 0
-  for v in vs {
-    if v < 0 { return false }
-    const vt = T.tys[v]
-    if vt is TyLit {
-      if vt.litKind != "int" || !intLexHeldBy(vt.litText, dst) { return false }
-      lits = lits + 1
-    } else if !isNumericPrimTy(v) {
-      return false
-    } else if !sameNumeric(v, dst) && !numWidens(v, dst) {
-      return false
-    }
-  }
-  lits > 0 && vs.length > 1
-}
-
-// Whether the numeric primitive `dst` holds the integer literal spelled `text` exactly: any
-// integer literal fits `i64`; the narrower and the float widths ask the lexeme.
-function intLexHeldBy(text: string, dst: i32): boolean {
-  if sameNumeric(dst, TY_I64) { return true }
-  if sameNumeric(dst, TY_I32) { return numLexFitsI32(text) }
-  if sameNumeric(dst, TY_F64) { return intLexemeIsExactF64(text) }
-  sameNumeric(dst, TY_F32) && intLexemeIsExactF32(text)
 }
 
 // Whether `x as dst` over the numeric union `src` is a conversion no member can fail: `dst` is
@@ -21786,37 +21648,6 @@ function tyParamOfOpenBody(p: i32): boolean {
     }
   }
   false
-}
-
-// Whether collapsing the map `src` into the wider map `dst` would store a key or value
-// differently (`containerElemClassDiffers`, the class a delivery's map arm compares, and a
-// map-valued value asked the same way): the two keep their own storage, so the join is their
-// union. A same-storage pair collapses to the wider map, as master did (D2666).
-function joinWidensMap(src: i32, dst: i32): boolean {
-  if src < 0 || dst < 0 { return false }
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyMap {
-    if d is TyMap {
-      if containerElemClassDiffers(joinStoreTy(s.mKey), joinStoreTy(d.mKey)) {
-        return true
-      }
-      if containerElemClassDiffers(joinStoreTy(s.mVal), joinStoreTy(d.mVal)) {
-        return true
-      }
-      if mapValBoxDiffers(s.mVal, d.mVal) { return true }
-      return joinWidensMap(s.mVal, d.mVal)
-    }
-  }
-  false
-}
-
-// The type a map key or value is stored as: a numeric literal union is its base scalar, which
-// its own map shares with the base's map, so the pair does not keep separate storage.
-function joinStoreTy(ty: i32): i32 {
-  const b = numLitUnionBaseTy(ty)
-  if b >= 0 { return b }
-  ty
 }
 
 // The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
@@ -27790,419 +27621,10 @@ export function canonEmitTypeNames() {
   0
 }
 
-// ── value-comparability: may `ty` be compared with the default structural `==`? ──
-// Sound only when every component is itself value-comparable: a function field compares by
-// reference and does not make its object non-equatable; an array is equatable iff its
-// element is, an object iff all fields are. A non-discriminated union, nullable or map field is not.
-function isEquatable(ty: i32, seen: i32[]) {
-  if ty < 0 { return true }
-  const t = T.tys[ty]
-  if t is TyPrim {
-    // Every scalar primitive (incl. string, bool) is value-comparable; `void`/`null`
-    // never reach a structural compare (a nullness test short-circuits earlier).
-    return true
-  }
-  if t is TyErr { return true }
-  if t is TyVar { return true }
-  if t is TyFunc { return true }
-  if t is TyArray { return isEquatable(t.aElem, seen) }
-  if t is TyObj {
-    let si = 0
-    while si < seen.length {
-      if seen[si] == ty { return true }
-      si = si + 1
-    }
-    seen.push(ty)
-    const ftys = t.objFieldTypes
-    let i = 0
-    let ok = true
-    while i < ftys.length {
-      if !isEquatable(ftys[i], seen) { ok = false }
-      i = i + 1
-    }
-    seen.pop()
-    return ok
-  }
-  // A literal union is value-comparable: `type K = "a" | "b"` reps as one interned i32 atom
-  // and `type N = 1 | 2` as its base scalar — a single cell with nothing to be
-  // non-comparable about (D45). Narrower than the `+` home's predicate, which also accepts
-  // a mixed-base union (a value-union box, not one cell). An i32-sentinel nullable is value-comparable the same way (D101).
-  if t is TyNullable {
-    if tyIsI32SentinelNullable(ty) { return true }
-    // Every other `T | null` is comparable exactly when `T` is: `null == null` is true,
-    // one-sided null is false, otherwise it is `T`'s own compare — nothing needs
-    // discriminating first. A genuinely undefined inner still refuses through the
-    // recursion: a map, a struct union, a mixed-base union (D1180).
-    return isEquatable(t.nInner, seen)
-  }
-  // The emitter-capability half is separate: `eqCmpKindOfArrayElem` decides whether a list
-  // of these has a compare core (an i64/f64-based numeric union has none). This gate
-  // answers only the soundness question.
-  if t is TyUnion {
-    if tyUnionIsOneLitCell(ty) { return true }
-    // The expanded sentinel spelling — `"a" | "b" | null` written inline or through an
-    // alias is a `TyUnion` with a null member rather than a `TyNullable`, and it is the
-    // same one i32 cell. An un-annotated `["a", null]` is not this shape (it infers as
-    // `string | null`, the ref niche).
-    if tyIsI32SentinelNullable(ty) { return true }
-  }
-  // A single literal type (`type S = "a"`) reps as its base scalar, so it is
-  // value-comparable for the same reason its union is, and cannot be mixed-base since it
-  // has one member.
-  if t is TyLit { return true }
-  // TyUnion / TyNullable / TyMap: not structurally value-comparable.
-  false
-}
-
-// —— `==`/`!=` lowerability: the one home for "can these operands be compared, and how" ——
-// `isEquatable` answers whether an object/array's components are value-comparable, a
-// soundness rule; this answers which compare core, if any, exists for the operand's own
-// rep. "" is opaque; "none" is no lowering; a bare name is a non-null core; `nul*` is a ref niche running that core under a null guard.
-export function eqCmpKindOfTy(ty: i32): EqCmpKind {
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyPrim {
-    if t.primName == "string" { return "str" }
-    // `void` / `null` / `never` never reach a value compare — a null test decides first.
-    return "scalar"
-  }
-  if t is TyErr { return "" }
-  if t is TyVar { return "" }
-  if t is TyNeg { return "" }
-  if t is TyLit { return "" }
-  if t is TyFunc { return "closure" }
-  if t is TyObj { return "struct" }
-  if t is TyMap { return "none" }
-  if t is TyArray { return eqCmpKindOfArrayElem(t.aElem) }
-  if t is TyNullable { return eqCmpKindOfNulInner(t.nInner) }
-  if t is TyUnion {
-    // A declared nullable alias (`type L = i32[] | null`) resolves through `UnionDecl` and
-    // lands here as `TyUnion[i32[], null]`, while the inline spelling is a `TyNullable` —
-    // the same rep, two arena shapes. Both must reach the niche answer.
-    const uInner = unionSoleNonNullMember(ty)
-    if uInner >= 0 { return eqCmpKindOfNulInner(uInner) }
-    return ""
-  }
-  ""
-}
-
-// The `==` token for an array whose element type is `elem`. The emitter has exactly three
-// list-compare cores, so this is a closed list and every other element rep is "none". A
-// hole element (`-1`) takes the i32 core, matching `exprArray`'s empty-literal
-// classification. Deliberately the tighter mirror of `eqgStructElemFlat`, so a disagreement is a refusal, never an invalid module.
-function eqStructElemFlatTy(ty: i32, depth: i32): boolean {
-  if ty < 0 { return false }
-  if depth > 8 { return false }
-  const t = T.tys[ty]
-  if t is TyObj {
-    const ftys = t.objFieldTypes
-    // A fieldless struct is not admitted. Its compare is a constant 1, correct — but "no
-    // fields" is also what an unresolved shape looks like from here.
-    if ftys.length == 0 { return false }
-    let i = 0
-    let ok = true
-    while i < ftys.length {
-      if !eqStructFieldFlatTy(ftys[i], depth + 1) { ok = false }
-      i = i + 1
-    }
-    return ok
-  }
-  false
-}
-
-// One field of a flat record: a native scalar, or a nested struct that is itself flat.
-function eqStructFieldFlatTy(ty: i32, depth: i32): boolean {
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyPrim {
-    if t.primName == "i32" { return true }
-    if t.primName == "boolean" { return true }
-    if t.primName == "f64" { return true }
-    return false
-  }
-  if t is TyObj { return eqStructElemFlatTy(ty, depth) }
-  false
-}
-
-function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
-  if elem < 0 { return "list" }
-  const e = T.tys[elem]
-  if e is TyVar { return "" }
-  if e is TyErr { return "" }
-  if e is TyPrim {
-    if e.primName == "i32" { return "list" }
-    if e.primName == "boolean" { return "list" }
-    // `null[]` rides the i32 list with every element the same sentinel (D4671).
-    if e.primName == "null" { return "list" }
-    if e.primName == "string" { return "strlist" }
-    // The wide-scalar backings: `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of
-    // one scalar each, exactly as `i32[]` is — lacking only a core, since
-    // `emitListEqICore` is hard-wired to `i32.ne`. `emitListEqGCore` takes the wrapper,
-    // backing and opcode as arguments, so the element axis decides only with what (D751).
-    if e.primName == "f64" { return "glist" }
-    if e.primName == "i64" { return "glist" }
-    if e.primName == "f32" { return "glist" }
-    if e.primName == "u8" { return "glist" }
-    return "none"
-  }
-  if e is TyArray {
-    const ie = e.aElem
-    if ie < 0 { return "reflist" }
-    const i2 = T.tys[ie]
-    // A hole one hop down is unanswered, not refused — this arm answered "none" while the
-    // element arm one level up answers "" for the same `TyVar`, a false reject:
-    // `function eqT<T>(a: T[][], b: T[][])` at `T = i32` refused naming a type variable to a
-    // caller who wrote neither. "" defers to the pin, where the substituted type lives (D422).
-    if i2 is TyVar { return "" }
-    if i2 is TyErr { return "" }
-    if i2 is TyPrim {
-      if i2.primName == "i32" { return "reflist" }
-      if i2.primName == "boolean" { return "reflist" }
-    }
-    // `K[][]` is a ref list of i32 lists — the same shape `i32[][]` is, since the atom /
-    // i32-base backing makes the inner `K[]` that very list. Asked with the same two tests as `i32`/`boolean`.
-    if i2 is TyUnion {
-      if tyLitUnionIsI32Backed(ie) { return "reflist" }
-      // The expanded `("a" | "b" | null)[][]` spelling, whose inner element is a `TyUnion`
-      // with a null member rather than a `TyNullable`.
-      if tyIsI32SentinelNullable(ie) { return "reflist" }
-    }
-    // `(K | null)[][]` and `(boolean | null)[][]` are ref lists of i32 lists for the same
-    // reason `K[][]` is — the sentinel niche makes the inner list that very i32 list (D101).
-    if i2 is TyNullable {
-      if tyIsI32SentinelNullable(ie) { return "reflist" }
-    }
-    // Every other nested list, by recursion: the arms above cover exactly the shapes
-    // `emitListEqRCore` happens to handle, a ref list whose element is an i32 list.
-    // Everything else nested answers "none" for no reason but that. Asked of `ie`, not of `e`:
-    // `e` here is the element `ie[]`, so what decides a list of `e` is whether `e` itself can be compared.
-    const inner = eqCmpKindOfArrayElem(ie)
-    if inner == "" { return "" }
-    if inner != "none" { return "glist" }
-    return "none"
-  }
-  // An i32-sentinel nullable element rides the same i32 list its base does (D101):
-  // `tyScalarBackedListKind` has answered `"list"` for `K[]`, `(K | null)[]` and
-  // `(boolean | null)[]` all along. The box- and ref-niche nullables stay "none". A struct
-  // element, field-wise, is the flat subset D752 answers.
-  if e is TyObj {
-    if eqStructElemFlatTy(elem, 0) { return "glist" }
-    return "none"
-  }
-  if e is TyNullable {
-    if tyIsI32SentinelNullable(elem) { return "list" }
-    return "none"
-  }
-  // A literal-union element rides the same i32 list `i32[]`/`boolean[]` do — a string union
-  // as its interned atom id, a numeric one as its base scalar — so `emitListEqICore` is its
-  // core (D45). Only the `i32` base rides that list; an `i64`/`f64` base rides its own
-  // wrapper with no core. No `f32` arm, and it is unreachable: `litBaseTy` never answers `f32`.
-  if e is TyUnion {
-    if tyLitUnionIsI32Backed(elem) { return "list" }
-    // The expanded `("a" | "b" | null)[]` spelling of the sentinel niche (D101).
-    if tyIsI32SentinelNullable(elem) { return "list" }
-    // A numeric literal union on a wide base reps as that base's list, and now has that
-    // base's core: `type F = 1.5 | 2.5` is one f64 cell per element and `F[]` is the f64
-    // list — the honest half stays, though: a mixed-base union is a value-union box, not one cell (D751).
-    if numLitUnionHasBase(elem) { return "glist" }
-    return "none"
-  }
-  "none"
-}
-
-// The `==` token for a nullable `inner | null`. The box- and sentinel-repped nullables
-// answer "" (already correct on every runtime input, comparing tag-first); every remaining
-// nullable is a `(ref null …)` niche, needing the null guard only when its non-null rep has a core.
-function eqCmpKindOfNulInner(inner: i32): EqCmpKind {
-  if inner < 0 { return "" }
-  const it = T.tys[inner]
-  if it is TyPrim {
-    if it.primName == "string" { return "nulstr" }
-    return ""
-  }
-  // `"x" | null` reps as `string | null` (D2827).
-  if it is TyLit {
-    if it.litKind == "str" { return "nulstr" }
-    return ""
-  }
-  if it is TyUnion { return "" }
-  if it is TyErr { return "" }
-  if it is TyVar { return "" }
-  if it is TyNeg { return "" }
-  if it is TyNullable { return eqCmpKindOfNulInner(it.nInner) }
-  if it is TyFunc { return "nulclosure" }
-  if it is TyObj { return "nulstruct" }
-  if it is TyMap { return "none" }
-  if it is TyArray {
-    const ak = eqCmpKindOfArrayElem(it.aElem)
-    // Exhaustive over `EqCmpKind` and `_`-less: the four list cores take their nullable-niche
-    // token; every other core is not a list, and the element's own core stands (a real answer).
-    match ak {
-      "list" => {
-        return "nullist"
-      }
-      "strlist" => {
-        return "nulstrlist"
-      }
-      "reflist" => {
-        return "nulreflist"
-      }
-      "glist" => {
-        // The generic list core under the null guard, named rather than falling through as
-        // `"glist"`: `eqKindIsNulNiche` reads this to decide whether the compare gets a guard
-        // at all — a nullable on the plain path would `ref.as_non_null` and trap on the null.
-        return "nulglist"
-      }
-      "" | "str" | "scalar" | "closure" | "struct" | "none" | "nulglist" | "nulstr" | "nulclosure" | "nulstruct" | "nullist" | "nulstrlist" | "nulreflist" => {
-        // Not a list core; the element's own core stands.
-        return ak
-      }
-    }
-  }
-  ""
-}
-
 // The `==` lowering token for the value AST node `ix` reads — `eqCmpKindOfTy` of the type the
 // checker banked for it. The emitter's whole view of the comparability question.
 export function nodeEqCmpKind(ix: i32): EqCmpKind {
   eqCmpKindOfTy(nodeTyIxOf(ix))
-}
-
-// One `eqCmpKindOfTy` token → its compare core. The nullable niche and its non-null base
-// share a core by construction; a token with no core of its own is `"none"`. Moved here from
-// `emit_classify` so the checker and the emitter read one map instead of two guesses about
-// "which core".
-export function eqCoreKindOfTyToken(k: EqCmpKind): EqCore {
-  // Exhaustive over `EqCmpKind` and `_`-less: `"none"` is a real answer, so a new kind must
-  // say whether it shares a core rather than inherit that by omission.
-  match k {
-    "list" | "nullist" => {
-      return "i32list"
-    }
-    "strlist" | "nulstrlist" => {
-      return "strlist"
-    }
-    "reflist" | "nulreflist" => {
-      return "reflist"
-    }
-    "glist" | "nulglist" => {
-      return "glist"
-    }
-    "str" | "nulstr" => {
-      return "str"
-    }
-    "closure" | "nulclosure" => {
-      return "closure"
-    }
-    "" | "scalar" | "struct" | "none" | "nulstruct" => {
-      return "none"
-    }
-  }
-}
-
-// —— the one home for "may these two operands be `==`/`!=`, and if not, what do we say" ——
-// Two gates, in order: the structural soundness gate (`isEquatable`) and the
-// emitter-capability gate (`eqCmpKindOfTy`); both refusals are appended. A function, not two
-// inline gates, since `binOpDefinedFor`/`validateBinCstrs` ask the same question at the call site (D35).
-export function eqRefusals(
-  op: string,
-  lt: i32,
-  rt: i32,
-  structural: boolean,
-  msgs: string[],
-  unsup: i32[],
-) {
-  // How many sentences the soundness gate produced, so the capability gate below can tell
-  // whether a map operand has already been spoken for. Two sentences about one design rule
-  // read as two separate problems.
-  const msgsBefore = msgs.length
-  // A vector has four lanes and no single truth value, so `==` is not defined on it; the
-  // lane-wise compare is a function of the vector's own module.
-  let vecTy = -1
-  if primNameOf(lt) == "v128" { vecTy = lt }
-  if primNameOf(rt) == "v128" { vecTy = rt }
-  // Two operands that may each hold a vector (`v128 | null`, `v128 | i32`) may compare two.
-  if vecTy < 0 && tyHasV128Member(lt) && tyHasV128Member(rt) { vecTy = lt }
-  // A null test compares no lanes.
-  if isNullTy(lt) || isNullTy(rt) { vecTy = -1 }
-  if vecTy >= 0 {
-    msgs.push(
-      "`"
-        + op
-        + "` does not compare 128-bit vectors: "
-        + tyToStr(vecTy)
-        + " has four lanes and no single answer — compare lane by lane (`eqF32x4` in std:simd) and select on the mask",
-    )
-    unsup.push(0)
-    return 0
-  }
-  if structural && lt >= 0 {
-    const lT = T.tys[lt]
-    let isStruct = false
-    if lT is TyObj { isStruct = true }
-    else if lT is TyArray { isStruct = true }
-    if isStruct {
-      const seen: i32[] = []
-      if !isEquatable(lt, seen) {
-        // The remedy clause names something that exists: naming an unimplemented operator
-        // changed nothing, since the declaration parsed and got discarded. `==` is now
-        // refused at the declaration itself, so the two sentences have to agree or the trap
-        // has only moved (D46).
-        msgs.push(
-          tyToStr(lt)
-            + " isn't equatable (a field is not value-comparable) — compare a projection whose components are value-comparable, and only one that no two distinct values share",
-        )
-        unsup.push(0)
-      }
-    }
-  }
-  // A null test is exempt — it is not a value compare, and `emitNulIsNullTest` owns it for
-  // every rep.
-  if !isNullTy(lt) && !isNullTy(rt) {
-    const eqLk = eqCmpKindOfTy(lt)
-    const eqRk = eqCmpKindOfTy(rt)
-    if eqLk == "none" || eqRk == "none" {
-      let eqBad = lt
-      if eqLk != "none" { eqBad = rt }
-      if tyEqNoneIsMap(eqBad, 0) {
-        // A map: the domain rule, off the unsupported-lowering channel, said once — the
-        // soundness gate already says it for the container spelling, and this is the bare
-        // one it could not reach.
-        if msgs.length == msgsBefore {
-          msgs.push(
-            tyToStr(eqBad)
-              + " isn't equatable — a map has no defined value equality: its entries are insertion-ORDERED and observable that way (`for k in m`, `m.keys()`), so `==` would have to pick between order-sensitive and set-like and neither is what both callers mean — compare `m.length`, or the values at the keys you name",
-          )
-          unsup.push(0)
-        }
-      } else {
-        msgs.push("`" + op + "` over " + tyToStr(eqBad) + " has no lowering")
-        unsup.push(1)
-      }
-    } else {
-      // The pair, not each operand: both answering a token is not the same as both
-      // answering the SAME token. `emitEqNonNullCore` runs one core chosen from the left
-      // operand, falling back to the right, so a mutually assignable pair whose reps take
-      // two different cores lowers one over the other's storage — check-clean invalid wasm without this (D45).
-      const eqLc = eqCoreKindOfTyToken(eqLk)
-      const eqRc = eqCoreKindOfTyToken(eqRk)
-      if eqLc != "none" && eqRc != "none" && eqLc != eqRc {
-        msgs.push(
-          "`"
-            + op
-            + "` over "
-            + tyToStr(lt)
-            + " and "
-            + tyToStr(rt)
-            + " has no lowering: the two are mutually assignable but store their elements "
-            + "differently, and one compare core cannot read both — compare two values of the "
-            + "same type, or convert one container to the other's element type first",
-        )
-        unsup.push(1)
-      }
-    }
-  }
-  0
 }
 
 // —— the one home for "is this `+` a list concat", the `+` twin of the `==` home above ——
@@ -28261,30 +27683,6 @@ function fnSlotNulDiffers(src: i32, dst: i32) {
   tyBearsNull(src) != tyBearsNull(dst)
 }
 
-// A struct type with a numerically wider field on the destination side (`{f: i32}` vs
-// `{f: i64}`): assignable as a value (construction converts at the field store) but not as
-// a function-type slot, since a function value's functype fixes the field rep. The object
-// dual of the scalar invariance in `fnSlotAssignable`; a literal still works, since the checker adopts the wider field type for a literal.
-function objNumWidens(src: i32, dst: i32) {
-  if src < 0 || dst < 0 { return false }
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < d.objFieldNames.length {
-        const sf = objFieldType(s, d.objFieldNames[i])
-        if sf >= 0 {
-          if numWidens(sf, d.objFieldTypes[i]) { return true }
-          if objNumWidens(sf, d.objFieldTypes[i]) { return true }
-        }
-        i = i + 1
-      }
-    }
-  }
-  false
-}
-
 // The object pair the last `objShapeAdapterless` walk stopped on. Entered with the pair the
 // author wrote (`Cat[]` into `Animal[]`) while the reason lives at a nested pair (`Cat` into
 // `Animal`); the diagnostic names both, so the container is never mistaken for the unsupported thing.
@@ -28316,46 +27714,6 @@ function ctorExprOf(ix: i32) {
   cur
 }
 
-// Whether every field name of `dst` is a field name of `src` and the two have the same
-// field count — the shapes agree on which fields exist, whatever their order or types. The
-// emitter can rebuild a value field-by-field exactly when this holds.
-function objFieldNameSetsEq(src: i32, dst: i32): boolean {
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyObj {
-    if d is TyObj {
-      if s.objFieldNames.length != d.objFieldNames.length { return false }
-      let i = 0
-      while i < d.objFieldNames.length {
-        if objFieldType(s, d.objFieldNames[i]) < 0 { return false }
-        i = i + 1
-      }
-      return true
-    }
-  }
-  false
-}
-
-// Do a container's source and destination element types land in different storage
-// classes? Neither side may be unknown. The three lossless scalar element widenings the
-// converting copy serves are the only pairs where a differing class stops being a refusal
-// (D965). The map arms below must keep refusing: `emitScalarListWidenSite` copies a list, and a map has no such copy built.
-function scalarElemWidenServed(se: i32, de: i32): boolean {
-  const sc = elemStoreClassOf(se, 8)
-  if sc == ESC_UNKNOWN { return false }
-  const dc = elemStoreClassOf(de, 8)
-  if dc == ESC_UNKNOWN { return false }
-  if sc == ESC_I32 {
-    if dc == ESC_I64 { return true }
-    if dc == ESC_F64 { return true }
-    return false
-  }
-  if sc == ESC_F32 {
-    if dc == ESC_F64 { return true }
-  }
-  false
-}
-
 // Record the pair `se` -> `de` as delivered as a view (`scalarViewPairs`).
 function noteScalarView(se: i32, de: i32) {
   const sc = elemStoreClassOf(se, 8)
@@ -28366,14 +27724,6 @@ function noteScalarView(se: i32, de: i32) {
   if sc == ESC_F32 && dc == ESC_F64 { bit = 4 }
   if (scalarViewPairs & bit) == 0 { scalarViewPairs = scalarViewPairs + bit }
   0
-}
-
-function containerElemClassDiffers(se: i32, de: i32): boolean {
-  const sc = elemStoreClassOf(se, 8)
-  if sc == ESC_UNKNOWN { return false }
-  const dc = elemStoreClassOf(de, 8)
-  if dc == ESC_UNKNOWN { return false }
-  sc != dc
 }
 
 // Is a list element `de` strictly wider than `se`, so a store through the wider handle could
@@ -29062,17 +28412,6 @@ export function refViewCarry(srcExpr: i32, read: i32) {
     refViewRoNodes.push(read)
   }
   0
-}
-
-// How many members of a union are not `null`.
-function covarNonNullArms(ms: i32[]): i32 {
-  let n = 0
-  let i = 0
-  while i < ms.length {
-    if !isNullTy(ms[i]) { n = n + 1 }
-    i = i + 1
-  }
-  n
 }
 
 // Reported at the assignment rather than the write, since the assignment is what the
@@ -30546,38 +29885,6 @@ function ljwTailSplit(op: i32, j: i32, spine: i32[], leaves: i32[]) {
   0
 }
 
-// Whether a list of `src` joined as `dst` would change how some level's elements are stored,
-// through `| null` and nested lists. Unknown storage declines.
-function listJoinStorageDiffers(src: i32, dst: i32, depth: i32): boolean {
-  if (
-    src < 0
-    || dst < 0
-    || src >= T.tys.length
-    || dst >= T.tys.length
-    || depth <= 0
-  ) {
-    return false
-  }
-  const d = T.tys[dst]
-  if d is TyNullable { return listJoinStorageDiffers(src, d.nInner, depth - 1) }
-  const s = T.tys[src]
-  match s {
-    TyNullable => {
-      return listJoinStorageDiffers(s.nInner, dst, depth - 1)
-    }
-    TyArray => {
-      const de = arrElemTyOrNone(dst)
-      if de < 0 { return false }
-      if containerElemClassDiffers(s.aElem, de) { return true }
-      return listJoinStorageDiffers(s.aElem, de, depth - 1)
-    }
-    // A join reaching any other shape is not a list the join could copy.
-    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
-      return false
-    }
-  }
-}
-
 // Refuses each value an `if`, `match`, `??` or inferred return set hands to its joined list
 // type `j` when the join would store that list's elements differently: that takes a copy,
 // and a list never widens by copying (DECISIONS.md §"No implicit container widening"). A list
@@ -31094,9 +30401,6 @@ function listWidenClaim(x: i32, src: i32, dst: i32): boolean {
 // A record is shared, never rebuilt, so only a fresh one (an object literal, or a binding or
 // function holding only one) may be delivered where a record of its field names stores a field
 // differently; it is built there. Any other record is refused at the delivery.
-
-// How deep a field's storage is compared before the rule stops asking.
-const REC_STORE_DEPTH = 8
 
 // Where a delivered record comes from: an object or list literal it names through un-annotated
 // bindings that hold only that literal, or itself. -1 stays -1.
@@ -31927,89 +31231,6 @@ function recElemWalk(box: i32, src: i32, dst: i32, depth: i32): boolean {
   recWidenWalk(-1, src, dst, depth - 1)
 }
 
-// The first field of `d` that `s` stores differently, or "".
-function recStorageField(s: TyObj, d: TyObj): string {
-  let i = 0
-  while i < d.objFieldNames.length {
-    const sf = objFieldType(s, d.objFieldNames[i])
-    if sf >= 0 && !fieldStorageEq(sf, d.objFieldTypes[i], REC_STORE_DEPTH) {
-      return d.objFieldNames[i]
-    }
-    i = i + 1
-  }
-  ""
-}
-
-// Do two field types share one storage? The same type does; a list and its `readonly` view do;
-// an integer literal type is stored as `i32`; two records do when every field does. What the
-// rule cannot see into (a hole, the depth bound) is taken as shared, so it never refuses.
-function fieldStorageEq(a: i32, b: i32, depth: i32): boolean {
-  if a == b { return true }
-  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return true }
-  if depth <= 0 { return true }
-  if tyReachesHole(a, 8) || tyReachesHole(b, 8) { return true }
-  if tyEq(a, b) { return true }
-  if intLitStored(a) && intLitStored(b) { return true }
-  const ta = T.tys[a]
-  match ta {
-    TyArray => {
-      const eb = tyArrayElemIx(b)
-      return eb >= 0 && fieldStorageEq(ta.aElem, eb, depth - 1)
-    }
-    TyNullable => {
-      const nb = recNulInner(b)
-      return nb >= 0 && fieldStorageEq(ta.nInner, nb, depth - 1)
-    }
-    TyMap => {
-      return recMapStorageEq(ta, b, depth)
-    }
-    TyObj => {
-      return recObjStorageEq(ta, a, b)
-    }
-    // Any other pair of types that are not one type is stored apart.
-    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
-      return false
-    }
-  }
-}
-
-// The type under `ty`'s `| null`, or -1 when `ty` is not nullable.
-function recNulInner(ty: i32): i32 {
-  const t = T.tys[ty]
-  if t is TyNullable { return t.nInner }
-  -1
-}
-
-// Do the record `ta` (at `a`) and the type `b` share a storage: a record of the same field names
-// whose every field does?
-function recObjStorageEq(ta: TyObj, a: i32, b: i32): boolean {
-  const tb = T.tys[b]
-  if tb is TyObj {
-    return objFieldNameSetsEq(a, b) && recStorageField(ta, tb) == ""
-  }
-  false
-}
-
-// Do the map `ta` and the type `b` share a storage: a map whose keys and values do?
-function recMapStorageEq(ta: TyMap, b: i32, depth: i32): boolean {
-  const tb = T.tys[b]
-  if tb is TyMap {
-    return fieldStorageEq(ta.mKey, tb.mKey, depth - 1)
-      && fieldStorageEq(ta.mVal, tb.mVal, depth - 1)
-  }
-  false
-}
-
-// `recStorageField` of two records by index, or "" when either is not a record.
-function recStorageFieldOf(a: i32, b: i32): string {
-  const ta = T.tys[a]
-  const tb = T.tys[b]
-  if ta is TyObj {
-    if tb is TyObj { return recStorageField(ta, tb) }
-  }
-  ""
-}
-
 // Does the function declared at `fd` return an object literal written in its own body?
 function recHasLitLeaf(fd: i32): boolean {
   for lf in recFnValueLeaves(fd) {
@@ -32041,16 +31262,6 @@ function recAtPinnedArg(at: i32): boolean {
 
 // The records this pass's annotations spell inline (`{ f: i32 }`); each is a declared row too.
 let recAnnObjs: i32[] = []
-
-// Is `ut` a record of `own`'s field names and storage that `dst` stores differently?
-function recDeclaredRowOf(ut: i32, own: i32, dst: i32): boolean {
-  ut >= 0
-    && ut < T.tys.length
-    && T.tys[ut] is TyObj
-    && objFieldNameSetsEq(ut, own)
-    && fieldStorageEq(own, ut, REC_STORE_DEPTH)
-    && !fieldStorageEq(ut, dst, REC_STORE_DEPTH)
-}
 
 // A literal built inside a function, or handed through a generic call, is built at the row of a
 // declared record of its own field storage when one exists, not where the call delivers it; into
@@ -32151,186 +31362,6 @@ function recLitFits(lit: i32, dst: i32, depth: i32): boolean {
     i = i + 1
   }
   true
-}
-
-// Does the record `dst` store as a bare `f32` or `f64` a field the record `src` holds as an
-// integer, at any depth of records?
-function recIntToFloat(src: i32, dst: i32, depth: i32): boolean {
-  recFloatField(src, dst) != "" || recIntToFloatNested(src, dst, depth)
-}
-
-// The first field of `dst` that is a bare float where `src` holds an integer, or "".
-function recFloatField(src: i32, dst: i32): string {
-  if src < 0 || dst < 0 || src >= T.tys.length || dst >= T.tys.length {
-    return ""
-  }
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < d.objFieldNames.length {
-        const sf = objFieldType(s, d.objFieldNames[i])
-        const dc = recNumClass(d.objFieldTypes[i])
-        if (
-          sf >= 0
-          && recNumClass(sf) == "i32"
-          && !(T.tys[d.objFieldTypes[i]] is TyNullable)
-        ) {
-          if dc == "f64" || dc == "f32" { return d.objFieldNames[i] }
-        }
-        i = i + 1
-      }
-    }
-  }
-  ""
-}
-
-// `recIntToFloat` over the fields of `dst` that are records.
-function recIntToFloatNested(src: i32, dst: i32, depth: i32): boolean {
-  if (
-    depth <= 0
-    || src < 0
-    || dst < 0
-    || src >= T.tys.length
-    || dst >= T.tys.length
-  ) {
-    return false
-  }
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < d.objFieldNames.length {
-        const sf = objFieldType(s, d.objFieldNames[i])
-        if sf >= 0 && recIntToFloat(sf, d.objFieldTypes[i], depth - 1) {
-          return true
-        }
-        i = i + 1
-      }
-    }
-  }
-  false
-}
-
-// Does `dst` store some number `src` holds at another width or kind (`i32` into `i64` or `f64`),
-// through records, lists, maps and `| null`? Adopting such a destination changes what a read of
-// the source computes, so the adoption is never undone (D3339).
-function recNumChanges(src: i32, dst: i32, depth: i32): boolean {
-  if (
-    src < 0
-    || dst < 0
-    || src >= T.tys.length
-    || dst >= T.tys.length
-    || depth <= 0
-  ) {
-    return false
-  }
-  const sc = recNumClass(src)
-  if sc != "" { return !recNumHolds(dst, sc) }
-  const s = T.tys[src]
-  match s {
-    TyObj => {
-      return recNumChangesFields(s, dst, depth)
-    }
-    TyArray => {
-      const de = tyArrayElemIx(nonNulTyOf(dst))
-      return de >= 0 && recNumChanges(s.aElem, de, depth - 1)
-    }
-    TyNullable => {
-      return recNumChanges(s.nInner, nonNulTyOf(dst), depth - 1)
-    }
-    TyMap => {
-      return recNumChangesMap(s, dst, depth)
-    }
-    // A leaf that is not a number, or a union, keeps whatever it holds.
-    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
-      return false
-    }
-  }
-}
-
-// `recNumChanges` over each field the record `dst` shares with `s`.
-function recNumChangesFields(s: TyObj, dst: i32, depth: i32): boolean {
-  const d = T.tys[nonNulTyOf(dst)]
-  if d is TyObj {
-    let i = 0
-    while i < d.objFieldNames.length {
-      const sf = objFieldType(s, d.objFieldNames[i])
-      if sf >= 0 && recNumChanges(sf, d.objFieldTypes[i], depth - 1) {
-        return true
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-
-// `recNumChanges` over a map's values.
-function recNumChangesMap(s: TyMap, dst: i32, depth: i32): boolean {
-  const d = T.tys[nonNulTyOf(dst)]
-  if d is TyMap { return recNumChanges(s.mVal, d.mVal, depth - 1) }
-  false
-}
-
-// The numeric storage `ty` has without its `| null`: "i32" (an integer literal type too),
-// "i64", "f32" or "f64", or "" for anything else.
-function recNumClass(ty: i32): string {
-  const b = nonNulTyOf(ty)
-  if b < 0 || b >= T.tys.length { return "" }
-  if intLitStored(b) { return "i32" }
-  const t = T.tys[b]
-  if t is TyPrim {
-    const n = t.primName
-    if n == "i64" || n == "f32" || n == "f64" { return n }
-  }
-  ""
-}
-
-// Does `dst`, or a member of it, store a number of class `c`?
-function recNumHolds(dst: i32, c: string): boolean {
-  if recNumClass(dst) == c { return true }
-  const b = nonNulTyOf(dst)
-  if b < 0 || b >= T.tys.length { return false }
-  const t = T.tys[b]
-  if t is TyUnion {
-    for m in t.uMembers {
-      if recNumClass(m) == c { return true }
-    }
-  }
-  false
-}
-
-// Is `ty` stored as a plain `i32`: `i32` itself, an integer literal type, or a union of them?
-function intLitStored(ty: i32): boolean {
-  const t = T.tys[ty]
-  match t {
-    TyPrim => {
-      return t.primName == "i32"
-    }
-    TyLit => {
-      return t.litKind == "int"
-    }
-    TyUnion => {
-      if t.uMembers.length < 1 { return false }
-      for m in t.uMembers {
-        if !recIsIntLit(m) { return false }
-      }
-      return true
-    }
-    // Any other type is stored as something other than one `i32`.
-    TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyNeg => {
-      return false
-    }
-  }
-}
-
-// Is `ty` an integer literal type?
-function recIsIntLit(ty: i32): boolean {
-  const t = T.tys[ty]
-  if t is TyLit { return t.litKind == "int" }
-  false
 }
 
 // —— adoption: a binding or function holding only literals takes the record it is delivered to ——
@@ -32561,44 +31592,6 @@ function recAdNoteFields(lit: i32, d: i32) {
   0
 }
 
-// Do the records `a` and `b` name the same fields at every depth, through lists, maps and
-// `| null`? A width adoption needs it: a destination that drops a nested field is a shape
-// its literal cannot be written at, so that delivery keeps its own-type build.
-function recNamesDeepEq(a: i32, b: i32, depth: i32): boolean {
-  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || depth <= 0 {
-    return true
-  }
-  const sa = nonNulTyOf(a)
-  const sb = nonNulTyOf(b)
-  if sa < 0 || sb < 0 { return true }
-  const ta = T.tys[sa]
-  const tb = T.tys[sb]
-  match ta {
-    TyObj => {
-      if !objFieldNameSetsEq(sa, sb) { return false }
-      if !(tb is TyObj) { return false }
-      let i = 0
-      while i < ta.objFieldNames.length {
-        const bf = objFieldType(tb, ta.objFieldNames[i])
-        if !recNamesDeepEq(ta.objFieldTypes[i], bf, depth - 1) { return false }
-        i = i + 1
-      }
-      return true
-    }
-    TyArray => {
-      return recNamesDeepEq(ta.aElem, tyArrayElemIx(sb), depth - 1)
-    }
-    TyMap => {
-      if tb is TyMap { return recNamesDeepEq(ta.mVal, tb.mVal, depth - 1) }
-      return true
-    }
-    // A leaf, a union or a function names no fields of its own.
-    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyNullable => {
-      return true
-    }
-  }
-}
-
 // Push one demand on the declaration `decl`: a binding, or a function with no declared result.
 function recAdPushDecl(
   decl: i32,
@@ -32638,23 +31631,6 @@ function recAdPushDecl(
   recAdElem.push(elem)
   recAdAt.push(at)
   0
-}
-
-// The member of the union `dst` the record `own` lands on (D3443): its one record member of the
-// same field names, unless one of them already stores it as `own` does. Otherwise `dst`.
-function recAdLanding(own: i32, dst: i32): i32 {
-  const d = T.tys[dst]
-  if !(d is TyUnion) { return dst }
-  let hit = -1
-  for m in d.uMembers {
-    const mm = nonNulTyOf(m)
-    if mm >= 0 && T.tys[mm] is TyObj && objFieldNameSetsEq(own, mm) {
-      if hit >= 0 || fieldStorageEq(own, mm, REC_STORE_DEPTH) { return dst }
-      hit = mm
-    }
-  }
-  if hit < 0 { return dst }
-  hit
 }
 
 // The list member of the union `dst` a list literal lands on: its one list of records.
@@ -32842,55 +31818,6 @@ function recAdMergeRefuse(
   )
   recAdErrAt.push(decl)
   0
-}
-
-// The first field of the record `dst` that stores two of the numbers the record `src`'s union
-// field holds as one member (`i32 | f64` into `f64 | string`), through records; "" for none.
-function recNumMergeField(src: i32, dst: i32, depth: i32): string {
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < d.objFieldNames.length {
-        const sf = objFieldType(s, d.objFieldNames[i])
-        if sf >= 0 && recNumMerges(sf, d.objFieldTypes[i], depth - 1) {
-          return d.objFieldNames[i]
-        }
-        i = i + 1
-      }
-    }
-  }
-  ""
-}
-
-// Does `dst` hold one of `src`'s numeric classes only by converting it to another class `src`
-// also holds? Through `| null` and records; a list or map element is the list rule's.
-function recNumMerges(src: i32, dst: i32, depth: i32): boolean {
-  if (
-    src < 0
-    || dst < 0
-    || src >= T.tys.length
-    || dst >= T.tys.length
-    || depth <= 0
-  ) {
-    return false
-  }
-  const sb = nonNulTyOf(src)
-  const db = nonNulTyOf(dst)
-  if sb < 0 || db < 0 { return false }
-  const s = T.tys[sb]
-  if s is TyObj { return recNumMergeField(sb, db, depth) != "" }
-  if !(s is TyUnion) { return false }
-  let lost = false
-  let kept = false
-  for m in s.uMembers {
-    const c = recNumClass(m)
-    if c != "" {
-      if recNumHolds(db, c) { kept = true } else { lost = true }
-    }
-  }
-  lost && kept
 }
 
 // Has `decl` already a refusal this solve?
@@ -33557,21 +32484,6 @@ function listElemDiffers(se: i32, de: i32): boolean {
   listElemWidens(se, de) || containerElemClassDiffers(se, de)
 }
 
-// Does a list of `se` delivered as a list of `de` take an element-converting copy rather than
-// share? The numeric pairs (D965) and a plain record into a boxed union (D791).
-function listPairNeedsCopy(se: i32, de: i32): boolean {
-  if scalarElemWidenServed(se, de) { return true }
-  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
-    return false
-  }
-  const st = T.tys[se]
-  if st is TyObj {
-    const dt = T.tys[de]
-    if dt is TyUnion { return covarNonNullArms(dt.uMembers) >= 2 }
-  }
-  false
-}
-
 // `listOriginExpr`'s answer for a value whose type inference chose.
 const LW_INFERRED = -2
 
@@ -34121,17 +33033,6 @@ function mapCopyBuilds(de: i32): boolean {
   true
 }
 
-// Is `src` -> `dst` a list pair the read-only converting copy serves (D965)? Only those
-// are refused for being written rather than refused outright.
-function containerWidenServed(src: i32, dst: i32): boolean {
-  const s = T.tys[src]
-  const d = T.tys[dst]
-  if s is TyArray {
-    if d is TyArray { return scalarElemWidenServed(s.aElem, d.aElem) }
-  }
-  false
-}
-
 // Is `src` -> `dst` a list pair refused only because `dst` is mutable, so `readonly dst`
 // would accept it? A converting-copy pair (D965) or one whose element keeps its storage.
 function containerWidenReadonlyServes(src: i32, dst: i32): boolean {
@@ -34251,20 +33152,6 @@ function viewifyLists(src: i32, dst: i32, depth: i32): i32 {
       return dst
     }
   }
-}
-
-// The reason sentence for `containerWidenReadonlyServes`'s pairs: a copy that would stop
-// sharing writes, or a wider handle whose store the source's element type forbids.
-function containerWidenWhy(src: i32, dst: i32): string {
-  if containerWidenServed(src, dst) {
-    return "Its elements would be stored differently, so it would be a copy, and a write "
-      + "through either list would not reach the other."
-  }
-  "A store through "
-    + tyToStr(dst)
-    + " could put in an element that "
-    + tyToStr(src)
-    + " does not allow."
 }
 
 // Is `ty` stored as one of the four numeric element classes?
@@ -37516,43 +36403,6 @@ function holeArgOriginNode(ci: i32, hNames: string[], hArgNode: i32[]): i32 {
   }
   if ci < 0 || ci >= argCstr.node.length { return -1 }
   argCstr.node[ci]
-}
-
-// Whether `a` and `b` are two different unbranded primitives `holeArgScalarRefused` decides over.
-function scalarPrimPair(a: i32, b: i32): boolean {
-  const st = softenLitTy(a)
-  if nomNameOfTy(st) != "" || nomNameOfTy(b) != "" { return false }
-  const sn = primNameOf(st)
-  const dn = primNameOf(b)
-  scalarPrimName(sn) && scalarPrimName(dn) && sn != dn
-}
-
-// Whether a scalar argument `rat` handed to a hole callee whose pinned parameter is scalar
-// `rexp` is one no spelling of the direct call admits: two unbranded primitives that differ,
-// where neither a widening nor a literal's adoption of the parameter's width (an integer into
-// `f32`/`f64`/`i64`, a float into `f32`) could fit it.
-function holeArgScalarRefused(rat: i32, rexp: i32): boolean {
-  if !scalarPrimPair(rat, rexp) { return false }
-  const sn = primNameOf(softenLitTy(rat))
-  const dn = primNameOf(rexp)
-  if numWidensName(sn, dn) { return false }
-  !strListHas(HOLE_ARG_FIT_PAIRS, primNameStr(sn) + ">" + primNameStr(dn))
-}
-
-// The scalar pairs beyond the widenings some spelling of a direct call admits: a literal
-// adopting its parameter's width.
-const HOLE_ARG_FIT_PAIRS = [
-  "i32>f32", "i32>i64", "i64>f32", "i64>f64", "f64>f32",
-]
-
-// The primitives `holeArgScalarRefused` decides over; any other name defers to the emitter.
-function scalarPrimName(n: PrimName | null): boolean {
-  n == "i32"
-    || n == "i64"
-    || n == "f32"
-    || n == "f64"
-    || n == "boolean"
-    || n == "string"
 }
 
 // Records a deferred `print` constraint when the printed type still carries a hole, so the
@@ -53669,40 +52519,6 @@ function recordWidenRetag(srcExpr: i32, srcTy: i32, dm: i32[]) {
   0
 }
 
-// The scalar members of union box `srcTy` that the non-null members `dm` hold only widened,
-// pushed onto `from` beside the member each widens to on `to`; nothing when `srcTy` is no box.
-function widenMemberPairs(srcTy: i32, dm: i32[], from: i32[], to: i32[]) {
-  if srcTy < 0 || srcTy >= T.tys.length { return 0 }
-  const leaves: i32[] = []
-  unionLeavesInto(srcTy, leaves, 8)
-  // A box holds a literal member under its base's tag (D3491), so the base is what widens.
-  const sm: i32[] = []
-  for l in leaves {
-    let b = l
-    const lt = T.tys[l]
-    if lt is TyLit { b = litBaseTy(lt) }
-    if !tyAmong(b, sm) { sm.push(b) }
-  }
-  // A box is a union of two non-null members, or `i32 | null`; any other nullable is a niche.
-  if sm.length == 0 { return 0 }
-  if sm.length == 1 && !(tyPrimNameIs(sm[0], "i32") && tyHasNullMember(srcTy)) {
-    return 0
-  }
-  let i = 0
-  while i < sm.length {
-    const a = sm[i]
-    if !tyAmong(a, dm) {
-      const w = widenTargetOf(a, dm)
-      if w >= 0 {
-        from.push(a)
-        to.push(w)
-      }
-    }
-    i = i + 1
-  }
-  0
-}
-
 // Whether a union box element `se` stored where `de` is wanted needs a member widened, which
 // changes what its box holds: a list or map of them is stored differently (D2982).
 function unionElemMemberWidens(se: i32, de: i32): boolean {
@@ -53715,28 +52531,6 @@ function unionElemMemberWidens(se: i32, de: i32): boolean {
   const to: i32[] = []
   widenMemberPairs(se, dm, from, to)
   from.length > 0
-}
-
-// The member of `dm` scalar `a` widens to without loss: `i64` then `f64` for an `i32`, `f64` for
-// an `f32`; -1 for any other `a`, or when `dm` holds neither.
-function widenTargetOf(a: i32, dm: i32[]): i32 {
-  if tyPrimNameIs(a, "i32") {
-    const w = primAmong("i64", dm)
-    if w >= 0 { return w }
-    return primAmong("f64", dm)
-  }
-  if tyPrimNameIs(a, "f32") { return primAmong("f64", dm) }
-  -1
-}
-
-// The first of `tys` that is the primitive `name`, or -1.
-function primAmong(name: string, tys: i32[]): i32 {
-  let i = 0
-  while i < tys.length {
-    if tyPrimNameIs(tys[i], name) { return tys[i] }
-    i = i + 1
-  }
-  -1
 }
 
 // Whether `recordMapRetag` or `recordWidenRetag` recorded a row at `ix`: one gate for the
@@ -63495,108 +62289,6 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
 // rep traps. The delivery is rewritten in place into `(p…): R => f(p…)` at the destination's
 // type and checked as written code; a conversion that code cannot make is refused there.
 
-// Whether slot types `a` and `b` may lower to different wasm reps. Conservative: only an equal
-// type, or a list differing only in `readonly`, is known to agree.
-function fvaSlotMayDiffer(a0: i32, b0: i32, depth: i32): boolean {
-  if a0 == b0 { return false }
-  if a0 < 0 || b0 < 0 || depth <= 0 { return true }
-  // A single literal is stored as its base scalar.
-  const a = fvaLitBase(a0)
-  const b = fvaLitBase(b0)
-  if a == b || tyEq(a, b) { return false }
-  if a < 0 || a >= T.tys.length { return true }
-  const ta = T.tys[a]
-  match ta {
-    TyArray => {
-      const be = fvaElemOf(b)
-      if be == -2 { return true }
-      return fvaSlotMayDiffer(ta.aElem, be, depth - 1)
-    }
-    TyNullable => {
-      const bi = fvaInnerOf(b)
-      if bi == -2 { return true }
-      return fvaSlotMayDiffer(ta.nInner, bi, depth - 1)
-    }
-    TyFunc => {
-      if !fvaIsFn(b) { return true }
-      return fvaFnMayDiffer(a, b, depth - 1)
-    }
-    TyUnion => {
-      // A union's box keys each member by its type, so member order is not rep.
-      return !fvaSameMembers(ta.uMembers, b, depth - 1)
-    }
-    TyPrim | TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => {
-      return true
-    }
-  }
-}
-
-// `t`'s base scalar when it is a single literal type, else `t`.
-function fvaLitBase(t: i32): i32 {
-  const n = T.tys[t]
-  if n is TyLit { return litBaseTy(n) }
-  t
-}
-
-// Whether union `b` has exactly the members `ms` has, in any order.
-function fvaSameMembers(ms: i32[], b: i32, depth: i32): boolean {
-  const u = T.tys[b]
-  if u is TyUnion {
-    if u.uMembers.length != ms.length { return false }
-    for m in ms {
-      let found = false
-      for n in u.uMembers {
-        if !found && !fvaSlotMayDiffer(m, n, depth) { found = true }
-      }
-      if !found { return false }
-    }
-    return true
-  }
-  false
-}
-
-// The element of list type `t`, or -2 when `t` is not a list.
-function fvaElemOf(t: i32): i32 {
-  const n = T.tys[t]
-  if n is TyArray { return n.aElem }
-  -2
-}
-
-// The inner type of nullable `t`, or -2 when `t` is not nullable.
-function fvaInnerOf(t: i32): i32 {
-  const n = T.tys[t]
-  if n is TyNullable { return n.nInner }
-  -2
-}
-
-// The value type of map `t`, or -2 when `t` is not a map.
-function fvaValOf(t: i32): i32 {
-  const n = T.tys[t]
-  if n is TyMap { return n.mVal }
-  -2
-}
-
-function fvaIsFn(t: i32): boolean { T.tys[t] is TyFunc }
-
-// Whether two function types may lower to different `$fnsig`s.
-function fvaFnMayDiffer(s: i32, d: i32, depth: i32): boolean {
-  const st = T.tys[s]
-  const dt = T.tys[d]
-  if st is TyFunc && dt is TyFunc {
-    if st.fnParamTypes.length != dt.fnParamTypes.length { return true }
-    if fvaSlotMayDiffer(st.fnRet, dt.fnRet, depth) { return true }
-    let i = 0
-    while i < st.fnParamTypes.length {
-      if fvaSlotMayDiffer(st.fnParamTypes[i], dt.fnParamTypes[i], depth) {
-        return true
-      }
-      i = i + 1
-    }
-    return false
-  }
-  true
-}
-
 // The annotation node naming `ty` for the adapter, or -1 when it has no spelling. The checker
 // reads the type itself; the spelling is the display name, which the emitter reads as the
 // author's own annotation, since the emit spelling renders a named record structurally.
@@ -63811,58 +62503,6 @@ function fvaLambda(
     pos: pos,
   }
   n
-}
-
-// Whether a function held `level` containers into `s` may differ in rep from the one at the
-// same place in `d`. Only a pair of function types answers true; any other mismatch is some
-// other rule's.
-function fvaNestedFnDiffers(s: i32, d: i32, level: i32, depth: i32): boolean {
-  if s == d || s < 0 || d < 0 || depth <= 0 { return false }
-  if s >= T.tys.length || d >= T.tys.length { return false }
-  const st = T.tys[s]
-  match st {
-    TyFunc => {
-      if level == 0 || !fvaIsFn(d) { return false }
-      if tyReachesHole(s, 8) || tyReachesHole(d, 8) { return false }
-      return fvaFnMayDiffer(s, d, 8)
-    }
-    TyNullable => {
-      return fvaNestedFnDiffers(st.nInner, fvaInnerOf(d), level + 1, depth - 1)
-    }
-    TyArray => {
-      return fvaNestedFnDiffers(st.aElem, fvaElemOf(d), level + 1, depth - 1)
-    }
-    TyMap => {
-      return fvaNestedFnDiffers(st.mVal, fvaValOf(d), level + 1, depth - 1)
-    }
-    TyObj => {
-      return fvaNestedFieldDiffers(st, d, level, depth)
-    }
-    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
-      return false
-    }
-  }
-}
-
-// `fvaNestedFnDiffers` over the fields record `d` shares with `st`.
-function fvaNestedFieldDiffers(
-  st: TyObj,
-  d: i32,
-  level: i32,
-  depth: i32,
-): boolean {
-  const dt = T.tys[d]
-  if dt is TyObj {
-    let i = 0
-    while i < dt.objFieldNames.length {
-      const sf = objFieldType(st, dt.objFieldNames[i])
-      if fvaNestedFnDiffers(sf, dt.objFieldTypes[i], level + 1, depth - 1) {
-        return true
-      }
-      i = i + 1
-    }
-  }
-  false
 }
 
 // The refusal for a container whose functions would need an adapter each.
@@ -64775,57 +63415,6 @@ function recDupFieldErrs() {
 // ── type guard `x is T` ─────────────────────────────────────────────────────
 // Always a `bool`. Checks the operand and that `T` names a known type. The actual narrowing of
 // `x` to `T` happens in the then branch of an enclosing `if`; used elsewhere it is a boolean test.
-
-// D228 — a numeric widening (`assignable`'s lattice) is a conversion, not a variant: codegen
-// inserts a real instruction at the boundary, so the slot's value is not the source type and
-// no runtime tag says it is. The hole is the whole lattice, not one spelling — every edge is
-// admitted, through a nullable inner and a union member alike.
-function widenScanFinds(
-  cn: PrimName,
-  chkTy: i32,
-  ty: i32,
-  depth: i32,
-): boolean {
-  if depth <= 0 { return false }
-  if ty < 0 { return false }
-  if chkTy == ty { return true }
-  if cn == primNameOf(ty) { return true }
-  const t = T.tys[ty]
-  if t is TyNullable { return widenScanFinds(cn, chkTy, t.nInner, depth - 1) }
-  if t is TyUnion {
-    const ms = t.uMembers
-    let i = 0
-    while i < ms.length {
-      if widenScanFinds(cn, chkTy, ms[i], depth - 1) { return true }
-      i = i + 1
-    }
-  }
-  false
-}
-
-function isWidenNotVariant(chkTy: i32, baseTy: i32) {
-  const cn = primNameOf(chkTy)
-  if cn == null { return false }
-  if chkTy == baseTy { return false }
-  const b = T.tys[baseTy]
-  if b is TyUnion {
-    const ms = b.uMembers
-    let i = 0
-    while i < ms.length {
-      if widenScanFinds(cn, chkTy, ms[i], 8) { return false }
-      // A type parameter member may be this primitive at a pin (`T | i32`, D2950).
-      if ms[i] >= 0 && ms[i] < T.tys.length && T.tys[ms[i]] is TyVar {
-        return false
-      }
-      i = i + 1
-    }
-    // `assignable` said yes and no member is this primitive, so the route it found is a
-    // widening edge into one of them.
-    return true
-  }
-  if cn == primNameOf(baseTy) { return false }
-  numWidens(chkTy, baseTy)
-}
 
 // Extracted from `checkNodeReal`'s `IsExpr` arm (C3: thin the dispatcher).
 // ── the deep-`is` predicates (D1035) ────────────────────────────────────────
