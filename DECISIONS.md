@@ -10279,8 +10279,11 @@ elements do.
 
 **What it keeps.** A `string[]` tested against a string literal set does not narrow to
 `S[]` in the then-branch, because strings and atoms are stored differently; the same reason
-D4058 keeps a record's declared type. A box union's list arm is still tested by its tag
-(D4778, D4779).
+D4058 keeps a record's declared type. A box union's list arm is tested by its tag only where
+the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests its elements,
+and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
+string-literal atoms beside an `i32[]` arm holds its own tag (D4906). `is K[]` with a numeric
+`K` over a union with no `K[]` arm is still refused (D4778).
 
 ## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
 
