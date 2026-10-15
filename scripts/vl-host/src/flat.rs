@@ -617,7 +617,7 @@ fn rewrite(
         bodies.push(std::borrow::Cow::Owned(out));
         body_moves.push(moves);
     }
-    let types = type_section(s, &|out, t| encode_sub(out, s, t, &HashMap::new(), flat))?;
+    let types = type_section(s, &|out, t| encode_sub(out, s, t, flat))?;
     let (out, moved) = assemble(s, bytes, types, &bodies, &body_moves)?;
     Ok((out, moved, stats))
 }

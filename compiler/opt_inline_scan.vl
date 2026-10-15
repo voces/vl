@@ -1,8 +1,9 @@
-// The `-O` inline-record step's decision, ported from the host (docs/internals/optimizer-in-vl.md,
-// rung R6b): which struct fields holding a leaf record are stored inline, and why each other one
-// stays a reference. It walks every body under an emulation of the validator's operand stack.
-// The host stages the module with `optInLoad`, calls `optInlineDecide`, and reads the decision
-// through `optOut*`; the rewrite stays the host's. A module this cannot read is left undecided.
+// The `-O` inline-record step (docs/internals/optimizer-in-vl.md, rungs R6b to R6d): which
+// struct fields holding a leaf record are stored inline, why each other one stays a reference,
+// and the module rewritten so. It walks every body under an emulation of the validator's
+// operand stack. The host stages the module with `optInLoad`, calls
+// `optInlineRewrite`, and reads the module and its explain lines through `optOut*`. A module
+// this cannot read is left alone.
 
 import {
   WasmCursor,
@@ -14,7 +15,7 @@ import {
   wcU32,
 } from "./wasm_read"
 import { WasmModule, wmRead } from "./wasm_write"
-import { wnRead, wnTable } from "./wasm_names"
+import { copyBytes, wnPutLeb, wnRead, wnTable } from "./wasm_names"
 import { optInBytes, optOutSet } from "./opt_scan"
 import { mvFieldOnlyParams, mvTableArity } from "./opt_multivalue"
 import { namesFields } from "./opt_inline"
@@ -149,6 +150,35 @@ let boField: i32[] = []
 let boNull: boolean[] = []
 let boProd: i32[] = []
 let boFrom: i32[] = []
+let bsK: i32[] = []
+let bsSet: boolean[] = []
+let touch = false
+
+// Kept per body for the rewrite: whether an op names a parent, whether its record locals are
+// declared non-null, its local count, and its sites `[rbLo, rbHi)`, each with its op, kind and
+// operands (field, producer, the record type a `struct.new` producer makes, and the cast).
+let rbTouch: boolean[] = []
+let rbTight: boolean[] = []
+let rbLocals: i32[] = []
+let rbLo: i32[] = []
+let rbHi: i32[] = []
+let rsK: i32[] = []
+let rsReach: boolean[] = []
+let rsTy: i32[] = []
+let rsSet: boolean[] = []
+let rsLo: i32[] = []
+let rsHi: i32[] = []
+let roField: i32[] = []
+let roProd: i32[] = []
+let roNew: i32[] = []
+let roCast: boolean[] = []
+
+// The decision: per candidate pair (by `potKeys` index) the record it inlines or -1 and why
+// not, and per record type asked whether it may be copied.
+let decInl: i32[] = []
+let decWhy: u8[][] = []
+let decRecs: i32[] = []
+let decRecWhy: u8[][] = []
 
 // The immediates of the op being walked.
 let imA = 0
@@ -159,35 +189,14 @@ let imBtK = 0
 let imBtV = 0
 let imL: i32[] = []
 
-// The step's decision on the staged module, the host's step to rewrite by it. Returns 1 with
-// the decision in `optOut`, or 0 when the host must decide. `stable` is `--stable-layout`,
-// `rebox` inlines a field whatever its whole-record reads, `valid` says the module validates,
-// and `fault` 2 refuses every field, so a parity run can show it sees this answer.
-export function optInlineDecide(
-  stable: i32,
-  rebox: i32,
-  valid: i32,
-  fault: i32,
-): i32 {
-  optOutSet([])
-  if valid == 0 { return 0 }
-  bad = false
-  const out = decide(optInBytes(), stable != 0, rebox != 0, fault == 2)
-  if bad { return 0 }
-  optOutSet(out)
-  1
-}
-
-function decide(
-  b: u8[],
-  stable: boolean,
-  rebox: boolean,
-  fault: boolean,
-): u8[] {
-  const out: u8[] = []
-  if !readModule(b) || bad { bad = true; return out }
+// The step's decision on `b`, into `decInl`/`decWhy` per candidate pair and `decRecs`/
+// `decRecWhy` per record; sets `bad` when the module cannot be read. `stable` is
+// `--stable-layout`, `rebox` inlines a field whatever its whole-record reads, and `fault`
+// refuses every field.
+function decide(b: u8[], stable: boolean, rebox: boolean, fault: boolean) {
+  if !readModule(b) || bad { bad = true; return }
   findCandidates()
-  if potKeys.length == 0 && !anyRecord() { bad = true; return out }
+  if potKeys.length == 0 && !anyRecord() { bad = true; return }
   findCrossing(!stable)
   resetFound()
   let bi = 0
@@ -195,12 +204,9 @@ function decide(
     scanBody(bi)
     bi = bi + 1
   }
-  if bad || M.bodies.length + nImports != funcType.length {
-    bad = true; return out
-  }
+  if bad || M.bodies.length + nImports != funcType.length { bad = true; return }
   closeErased(!stable)
-  if potKeys.length > 0 { decideFields(out, rebox, fault) }
-  out
+  if potKeys.length > 0 { decideFields(rebox, fault) }
 }
 
 // ---- Reading the module ----
@@ -969,6 +975,25 @@ function resetFound() {
   nlNew = []
   nlOff = []
   nlF = []
+  rbTouch = []
+  rbTight = []
+  rbLocals = []
+  rbLo = []
+  rbHi = []
+  rsK = []
+  rsReach = []
+  rsTy = []
+  rsSet = []
+  rsLo = []
+  rsHi = []
+  roField = []
+  roProd = []
+  roNew = []
+  roCast = []
+  decInl = []
+  decWhy = []
+  decRecs = []
+  decRecWhy = []
 }
 
 // Walks body `bi`: under its locals declared non-null when that still validates, else as
@@ -1019,7 +1044,7 @@ function scanBody(bi: i32) {
     l = l + 1
   }
   if walk(bi, true) != 0 { bad = true; return }
-  afterWalk(f)
+  afterWalk(f, tight)
 }
 
 // One pass over body `bi`: 0 when it validates, 1 when a local declared non-null fails, 2 when
@@ -1059,6 +1084,9 @@ function walk(bi: i32, rec: boolean): i32 {
   flHi = []
   flLab = []
   bsOff = []
+  bsK = []
+  bsSet = []
+  touch = false
   bsTy = []
   bsNew = []
   bsLo = []
@@ -1614,9 +1642,21 @@ function record(
   }
   if reach { erase(op, f) }
   const sub = if (op >> 16) == 0xfb { op & 0xffff } else { -1 }
+  if (
+    sub >= 0
+    && sub <= 5
+    && sub != 1
+    && imA >= 0
+    && imA < nTypes
+    && isParent[imA]
+  ) {
+    touch = true
+  }
   if sub == 0 && isParent[imA] {
     const m = M.types[imA].params.length
     bsOff.push(off)
+    bsK.push(k)
+    bsSet.push(false)
     bsTy.push(imA)
     bsNew.push(reach)
     bsLo.push(boField.length)
@@ -1633,6 +1673,8 @@ function record(
     if writer[imA] < 0 { writer[imA] = f }
     if isParent[imA] && potential.has(imA * PAIR + imB) {
       bsOff.push(off)
+      bsK.push(k)
+      bsSet.push(true)
       bsTy.push(imA)
       bsNew.push(false)
       bsLo.push(boField.length)
@@ -1778,9 +1820,33 @@ function erase(op: i32, f: i32) {
 
 // ---- After the walk: which stores are of non-null values, and how each read is used ----
 
-function afterWalk(f: i32) {
+function afterWalk(f: i32, tight: boolean) {
   const nonNull = nonNullGets(post.length)
+  rbTouch.push(touch)
+  rbTight.push(tight)
+  rbLocals.push(locT.length)
+  rbLo.push(rsK.length)
   let s = 0
+  while s < bsK.length {
+    rsK.push(bsK[s])
+    rsReach.push(bsOff[s] >= 0)
+    rsTy.push(bsTy[s])
+    rsSet.push(bsSet[s])
+    rsLo.push(roField.length)
+    let o = bsLo[s]
+    while o < bsHi[s] {
+      const q = boProd[o]
+      roField.push(boField[o])
+      roProd.push(q)
+      roNew.push(if q != NONE { newOf[q] } else { -1 })
+      roCast.push(boNull[o] && q != NONE && nonNull[q])
+      o = o + 1
+    }
+    rsHi.push(roField.length)
+    s = s + 1
+  }
+  rbHi.push(rsK.length)
+  s = 0
   while s < bsOff.length {
     if bsOff[s] >= 0 {
       let o = bsLo[s]
@@ -2104,7 +2170,7 @@ function recordRefusal(v: i32): u8[] {
 
 // Writes the decision: per record type `r <v>[ <why>]`, then per candidate field in order
 // `p <p> <j> <v> i <local> <arg>` when inlined, `p <p> <j> <v> n <why>` when not.
-function decideFields(out: u8[], rebox: boolean, fault: boolean) {
+function decideFields(rebox: boolean, fault: boolean) {
   sortAsc(potKeys)
   const pairIx: {[i32]: i32} = Map()
   let i = 0
@@ -2122,15 +2188,9 @@ function decideFields(out: u8[], rebox: boolean, fault: boolean) {
   sortAsc(records)
   for v in records {
     const why = recordRefusal(v)
-    putText(out, "r ")
-    putDec(out, v)
-    if why.length > 0 {
-      out.push(32)
-      putBytes(out, why)
-    } else {
-      okRec[v] = true
-    }
-    out.push(10)
+    decRecs.push(v)
+    decRecWhy.push(why)
+    if why.length == 0 { okRec[v] = true }
   }
   if argP.length > 0 {
     const fo: {[i32]: i32} = Map()
@@ -2226,27 +2286,8 @@ function decideFields(out: u8[], rebox: boolean, fault: boolean) {
     i = i + 1
   }
   fixpoint(pairIx, inl, refused, needDst, needSrc, needWhy)
-  i = 0
-  while i < potKeys.length {
-    const key = potKeys[i]
-    putText(out, "p ")
-    putDec(out, key / PAIR)
-    out.push(32)
-    putDec(out, key % PAIR)
-    out.push(32)
-    putDec(out, potential[key] ?? 0)
-    if inl[i] >= 0 {
-      putText(out, " i ")
-      putDec(out, rdLocal[key] ?? 0)
-      out.push(32)
-      putDec(out, rdArg[key] ?? 0)
-    } else {
-      putText(out, " n ")
-      putBytes(out, refused[i])
-    }
-    out.push(10)
-    i = i + 1
-  }
+  decInl = inl
+  decWhy = refused
 }
 
 // A subtype and its supertype lay a shared field out alike, and a field fed from another
@@ -2317,6 +2358,828 @@ function fixpoint(
       i = i + 1
     }
   }
+}
+
+// ---- The rewrite ----
+
+let rwLog: u8[] = []
+let rwSum: u8[] = []
+let rwMoves: u8[] = []
+let rwErr = ""
+let layIx: i32[] = []
+let layStart: i32[][] = []
+let layRec: i32[][] = []
+let stStores: {[i32]: i32} = Map()
+let stAtProd: {[i32]: i32} = Map()
+let stSpilled: {[i32]: i32} = Map()
+let stFieldReads: {[i32]: i32} = Map()
+let stReboxed: {[i32]: i32} = Map()
+
+// The body being rewritten: its added locals, and per op the code that replaces it or follows
+// it (an index into `rwCodes`).
+let rwExtra: i32[] = []
+let rwNext = 0
+let rwRep: {[i32]: i32} = Map()
+let rwAft: {[i32]: i32} = Map()
+let rwCodes: u8[][] = []
+let opOff: i32[] = []
+let opEnd: i32[] = []
+let opCode: i32[] = []
+let opA: i32[] = []
+let opB: i32[] = []
+
+// The step on the staged module: decides, then rewrites. Returns 1 with the module in `optOut`,
+// or 0 when it leaves the module alone. `stable` and `rebox` are as in `decide`; `spill` takes
+// every store apart at the store; `fault` 2 refuses every field, and 3 ends each rewritten
+// body's locals with an empty entry (a valid module with other bytes).
+export function optInlineRewrite(
+  stable: i32,
+  rebox: i32,
+  spill: i32,
+  valid: i32,
+  fault: i32,
+): i32 {
+  optOutSet([])
+  rwLog = []
+  rwSum = []
+  rwMoves = []
+  if valid == 0 { return 0 }
+  bad = false
+  decide(optInBytes(), stable != 0, rebox != 0, fault == 2)
+  if bad || potKeys.length == 0 || decInl.length != potKeys.length {
+    rwLog = []
+    return 0
+  }
+  explainRecords()
+  let inlined = 0
+  for v in decInl {
+    if v >= 0 { inlined = inlined + 1 }
+  }
+  if inlined == 0 {
+    let i = 0
+    while i < potKeys.length {
+      explainPair(i)
+      i = i + 1
+    }
+    putText(rwLog, "inline-explain: no field inlined\n")
+    return 0
+  }
+  rwErr = ""
+  const out = rewrite(spill != 0, fault == 3)
+  if rwErr.length > 0 {
+    putText(rwLog, "inline-explain: step abandoned: ")
+    putText(rwLog, rwErr)
+    rwLog.push(10)
+    rwMoves = []
+    return 0
+  }
+  let i = 0
+  const parents: i32[] = []
+  while i < potKeys.length {
+    explainPair(i)
+    const p = potKeys[i] / PAIR
+    if decInl[i] >= 0 && !hasL(parents, p) { parents.push(p) }
+    i = i + 1
+  }
+  putText(rwSum, "inline-explain: ")
+  putDec(rwSum, inlined)
+  putText(rwSum, " field(s) of ")
+  putDec(rwSum, parents.length)
+  putText(rwSum, " type(s) inlined\n")
+  optOutSet(out)
+  1
+}
+
+// The last rewrite's body moves: a count, then per output body its input body's byte range, a
+// pair count, and per op its offset in the input and in the output module (all ULEB128).
+export function optInlineMoves(): i32 {
+  optOutSet(rwMoves)
+  0
+}
+
+// The last run's `$VL_INLINE_EXPLAIN` lines up to the output's validation, each ending in a
+// newline.
+export function optInlineExplain(): i32 {
+  optOutSet(rwLog)
+  0
+}
+
+// The last rewrite's closing explain line, for the host to print once its output validates.
+export function optInlineSummary(): i32 {
+  optOutSet(rwSum)
+  0
+}
+
+function explainRecords() {
+  let r = 0
+  while r < decRecs.length {
+    const v = decRecs[r]
+    putText(rwLog, "inline-explain: type ")
+    putDec(rwLog, v)
+    putText(rwLog, " {")
+    let i = 0
+    for x in M.types[v].params {
+      if i > 0 { putText(rwLog, ", ") }
+      putText(
+        rwLog,
+        if x == 0x7f { "i32" } else if x == 0x7e { "i64" } else if x == 0x7d { "f32" } else { "f64" },
+      )
+      i = i + 1
+    }
+    if decRecWhy[r].length == 0 {
+      putText(rwLog, "}: candidate\n")
+    } else {
+      putText(rwLog, "}: refused: ")
+      putBytes(rwLog, decRecWhy[r])
+      rwLog.push(10)
+    }
+    r = r + 1
+  }
+}
+
+function explainPair(i: i32) {
+  const key = potKeys[i]
+  putText(rwLog, "inline-explain: type ")
+  putDec(rwLog, key / PAIR)
+  putText(rwLog, " field ")
+  putDec(rwLog, key % PAIR)
+  putText(rwLog, " (type ")
+  putDec(rwLog, potential[key] ?? 0)
+  if decInl[i] < 0 {
+    putText(rwLog, "): not inlined: ")
+    putBytes(rwLog, decWhy[i])
+    rwLog.push(10)
+    return
+  }
+  putText(rwLog, "): inlined; ")
+  putDec(rwLog, stStores[key] ?? 0)
+  putText(rwLog, " store(s) (")
+  putDec(rwLog, stAtProd[key] ?? 0)
+  putText(rwLog, " taken apart at the producer, ")
+  putDec(rwLog, stSpilled[key] ?? 0)
+  putText(rwLog, " spilled), ")
+  putDec(rwLog, stFieldReads[key] ?? 0)
+  putText(rwLog, " read(s) as fields, ")
+  putDec(rwLog, stReboxed[key] ?? 0)
+  putText(rwLog, " re-boxed (")
+  putDec(rwLog, rdLocal[key] ?? 0)
+  putText(rwLog, " into a field-read local, ")
+  putDec(rwLog, rdArg[key] ?? 0)
+  putText(rwLog, " into a field parameter)\n")
+}
+
+function bump(m: {[i32]: i32}, key: i32) { m[key] = (m[key] ?? 0) + 1 }
+
+function recLen(v: i32): i32 { M.types[v].params.length }
+
+// The module with each inlined field's record stored in its parent, every body naming a parent
+// rewritten, and `rwMoves` filled; sets `rwErr` when it cannot.
+function rewrite(spill: boolean, fault: boolean): u8[] {
+  const none: u8[] = []
+  stStores = Map()
+  stAtProd = Map()
+  stSpilled = Map()
+  stFieldReads = Map()
+  stReboxed = Map()
+  layIx = []
+  layStart = []
+  layRec = []
+  for _ in M.types { layIx.push(-1) }
+  const inlOf: {[i32]: i32} = Map()
+  let i = 0
+  while i < potKeys.length {
+    if decInl[i] >= 0 { inlOf[potKeys[i]] = decInl[i] }
+    i = i + 1
+  }
+  i = 0
+  while i < potKeys.length {
+    const p = potKeys[i] / PAIR
+    if decInl[i] >= 0 && layIx[p] < 0 {
+      layIx[p] = layStart.length
+      const start: i32[] = []
+      const rec: i32[] = []
+      let at = 0
+      let j = 0
+      while j < fieldCount(p) {
+        start.push(at)
+        const v = inlOf[p * PAIR + j] ?? -1
+        rec.push(v)
+        at = at + (if v >= 0 { recLen(v) } else { 1 })
+        j = j + 1
+      }
+      start.push(at)
+      layStart.push(start)
+      layRec.push(rec)
+    }
+    i = i + 1
+  }
+  const hdr = bodyStarts()
+  if rwErr.length > 0 { return none }
+  const bodies: u8[][] = []
+  const moves: i32[][] = []
+  let bi = 0
+  while bi < M.bodies.length {
+    const body = M.bodies[bi]
+    if !rbTouch[bi] {
+      const b: u8[] = []
+      copyBytes(b, B, hdr[bi], body.to - hdr[bi])
+      bodies.push(b)
+      moves.push([hdr[bi], 0])
+    } else {
+      const mv: i32[] = []
+      const b = rewriteBody(bi, hdr[bi], spill, fault, mv)
+      if rwErr.length > 0 { return none }
+      bodies.push(b)
+      moves.push(mv)
+    }
+    bi = bi + 1
+  }
+  const types: u8[] = []
+  wnPutLeb(types, M.groupSize.length)
+  let t = 0
+  let g = 0
+  while g < M.groupSize.length {
+    const n = M.groupSize[g]
+    if M.groupExplicit[g] {
+      types.push(0x4e)
+      wnPutLeb(types, n)
+    } else if n != 1 {
+      rwErr = "an implicit rec group holds several types"
+      return none
+    }
+    let k = 0
+    while k < n {
+      if !encodeSub(types, t) {
+        rwErr = "a type does not re-encode"
+        return none
+      }
+      t = t + 1
+      k = k + 1
+    }
+    g = g + 1
+  }
+  assemble(types, bodies, moves, hdr)
+}
+
+// Each body's start in the module: where its locals header begins, past its size.
+function bodyStarts(): i32[] {
+  const out: i32[] = []
+  let s = 0
+  while s < M.secId.length {
+    if M.secId[s] == 10 {
+      const c = wcNew(B, M.secStart[s], M.secEnd[s])
+      wcByte(c)
+      wcU32(c)
+      const n = wcU32(c)
+      let i = 0
+      while i < n && !c.failed {
+        const size = wcU32(c)
+        out.push(c.pos)
+        c.pos = c.pos + size
+        i = i + 1
+      }
+    }
+    s = s + 1
+  }
+  if out.length != M.bodies.length { rwErr = "a section does not frame" }
+  out
+}
+
+function newLocal(t: i32): i32 {
+  rwExtra.push(t)
+  rwNext = rwNext + 1
+  rwNext - 1
+}
+
+function refT(nullable: boolean, t: i32): i32 {
+  (if nullable { 0x63 } else { 0x64 }) | ((0x100 + 2 * t) << 8)
+}
+
+function gcOp(out: u8[], sub: i32, t: i32, field: i32) {
+  out.push(0xfb)
+  wnPutLeb(out, sub)
+  wnPutLeb(out, t)
+  if field >= 0 { wnPutLeb(out, field) }
+}
+
+function castIf(out: u8[], cast: boolean) {
+  if cast { out.push(0xd4) }
+}
+
+function localOp(out: u8[], op: i32, l: i32) {
+  out.push(op)
+  wnPutLeb(out, l)
+}
+
+function keep(c: u8[]): i32 {
+  rwCodes.push(c)
+  rwCodes.length - 1
+}
+
+// Body `bi`, whose header starts at `h0`, with its sites taken apart and every field index of
+// a changed parent re-encoded; `mv` gets its moves.
+function rewriteBody(
+  bi: i32,
+  h0: i32,
+  spill: boolean,
+  fault: boolean,
+  mv: i32[],
+): u8[] {
+  const none: u8[] = []
+  rwExtra = []
+  rwNext = rbLocals[bi]
+  rwRep = Map()
+  rwAft = Map()
+  rwCodes = []
+  let s = rbLo[bi]
+  while s < rbHi[bi] {
+    planSite(s, spill)
+    if rwErr.length > 0 { return none }
+    s = s + 1
+  }
+  const body = M.bodies[bi]
+  opOff = []
+  opEnd = []
+  opCode = []
+  opA = []
+  opB = []
+  const c = wcNew(B, body.from, body.to)
+  while c.pos < c.end {
+    const off = c.pos
+    imA = 0
+    imB = 0
+    const op = wcOp(c)
+    if c.failed || !decodeImm(op, off, c.pos) {
+      rwErr = "a body does not decode"
+      return none
+    }
+    opOff.push(off)
+    opEnd.push(c.pos)
+    opCode.push(op)
+    opA.push(imA)
+    opB.push(imB)
+  }
+  const out: u8[] = []
+  const moved: i32[] = []
+  const n = opOff.length
+  let i = 0
+  while i < n {
+    const k = i
+    moved.push(opOff[i])
+    moved.push(out.length)
+    let consumed = 1
+    const sub = if (opCode[i] >> 16) == 0xfb { opCode[i] & 0xffff } else { -1 }
+    const p = opA[i]
+    const j = opB[i]
+    const L = if sub >= 2 && sub <= 5 && p >= 0 && p < nTypes { layIx[p] } else { -1 }
+    const rep = rwRep[k] ?? -1
+    if rep >= 0 {
+      putBytes(out, rwCodes[rep])
+    } else if L >= 0 && sub == 2 {
+      const nj = layStart[L][j]
+      const v = layRec[L][j]
+      if v < 0 {
+        gcOp(out, 2, p, nj)
+      } else {
+        let q = i + 1
+        if q < n && opCode[q] == 0xd4 { q = q + 1 }
+        let x = -1
+        if q < n && opCode[q] == (0xfb << 16) + 2 {
+          const t = opA[q]
+          let clear = !rwAft.has(k)
+          let r = i + 1
+          while r <= q {
+            if rwRep.has(r) || rwAft.has(r) { clear = false }
+            r = r + 1
+          }
+          if holds(t, v) && opB[q] < fieldCount(t) && clear { x = opB[q] }
+        }
+        const key = p * PAIR + j
+        if x >= 0 {
+          bump(stFieldReads, key)
+          gcOp(out, 2, p, nj + x)
+          consumed = q + 1 - i
+        } else {
+          bump(stReboxed, key)
+          const m = recLen(v)
+          if m == 1 {
+            gcOp(out, 2, p, nj)
+          } else {
+            const tp = newLocal(refT(true, p))
+            localOp(out, 0x21, tp)
+            let y = 0
+            while y < m {
+              localOp(out, 0x20, tp)
+              gcOp(out, 2, p, nj + y)
+              y = y + 1
+            }
+          }
+          gcOp(out, 0, v, -1)
+          // The box is non-null already; a cast after it would hide the allocation from the
+          // multi-value step.
+          if (
+            i + 1 < n
+            && opCode[i + 1] == 0xd4
+            && !rwRep.has(k + 1)
+            && !rwAft.has(k)
+          ) {
+            consumed = 2
+          }
+        }
+      }
+    } else if L >= 0 && (sub == 3 || sub == 4) {
+      gcOp(out, sub, p, layStart[L][j])
+    } else if L >= 0 && sub == 5 {
+      if layRec[L][j] >= 0 {
+        rwErr = "an inlined field's store was not planned"
+        return none
+      }
+      gcOp(out, 5, p, layStart[L][j])
+    } else {
+      copyBytes(out, B, opOff[i], opEnd[i] - opOff[i])
+    }
+    const aft = rwAft[k] ?? -1
+    if aft >= 0 { putBytes(out, rwCodes[aft]) }
+    let q = 1
+    while q < consumed {
+      moved.push(opOff[i + q])
+      moved.push(out.length)
+      q = q + 1
+    }
+    i = i + consumed
+  }
+  finishBody(bi, h0, out, moved, fault, mv)
+}
+
+// Plans site `s`: the code that replaces its op, and what follows each producer taken apart.
+function planSite(s: i32, spill: boolean) {
+  const none: u8[] = []
+  const p = rsTy[s]
+  if p < 0 || p >= layIx.length || layIx[p] < 0 { return }
+  const L = layIx[p]
+  if rsSet[s] {
+    const o = rsLo[s]
+    const j = roField[o]
+    const v = layRec[L][j]
+    if v < 0 { return }
+    const key = p * PAIR + j
+    bump(stStores, key)
+    const tv = newLocal(refT(false, v))
+    const tp = newLocal(refT(true, p))
+    const c: u8[] = []
+    const prod = roProd[o]
+    if rsReach[s] && prod != NONE && !spill {
+      const a: u8[] = []
+      castIf(a, roCast[o])
+      localOp(a, 0x21, tv)
+      if rwAft.has(prod) || rwRep.has(prod) {
+        rwErr = "two rewrites claim one producer"
+        return
+      }
+      rwAft[prod] = keep(a)
+      bump(stAtProd, key)
+    } else {
+      castIf(c, roCast[o])
+      localOp(c, 0x21, tv)
+      bump(stSpilled, key)
+    }
+    localOp(c, 0x21, tp)
+    const base = layStart[L][j]
+    let i = 0
+    while i < recLen(v) {
+      localOp(c, 0x20, tp)
+      localOp(c, 0x20, tv)
+      gcOp(c, 2, v, i)
+      gcOp(c, 5, p, base + i)
+      i = i + 1
+    }
+    rwRep[rsK[s]] = keep(c)
+    return
+  }
+  const ins: i32[] = []
+  let o = rsLo[s]
+  while o < rsHi[s] {
+    if layRec[L][roField[o]] >= 0 { ins.push(o) }
+    o = o + 1
+  }
+  if ins.length == 0 { return }
+  let atProducers = rsReach[s] && !spill
+  for x in ins {
+    const prod = roProd[x]
+    if prod == NONE || rwAft.has(prod) || rwRep.has(prod) {
+      atProducers = false
+    }
+  }
+  if atProducers {
+    for x in ins {
+      const v = layRec[L][roField[x]]
+      const key = p * PAIR + roField[x]
+      bump(stStores, key)
+      bump(stAtProd, key)
+      if roNew[x] == v {
+        rwRep[roProd[x]] = keep(none)
+      } else {
+        const tv = newLocal(refT(false, v))
+        const a: u8[] = []
+        castIf(a, roCast[x])
+        localOp(a, 0x21, tv)
+        let i = 0
+        while i < recLen(v) {
+          localOp(a, 0x20, tv)
+          gcOp(a, 2, v, i)
+          i = i + 1
+        }
+        rwAft[roProd[x]] = keep(a)
+      }
+    }
+    return
+  }
+  const params = M.types[p].params
+  const first = roField[ins[0]]
+  const ls: i32[] = []
+  let j = first
+  while j < params.length {
+    const v = layRec[L][j]
+    let t = params[j]
+    if v >= 0 { t = refT(false, v) }
+    else if t == 0x78 || t == 0x77 { t = 0x7f }
+    ls.push(newLocal(t))
+    j = j + 1
+  }
+  const c: u8[] = []
+  let i = ls.length - 1
+  while i >= 0 {
+    let cast = false
+    for x in ins {
+      if roField[x] == first + i && roCast[x] { cast = true }
+    }
+    castIf(c, cast)
+    localOp(c, 0x21, ls[i])
+    i = i - 1
+  }
+  i = 0
+  while i < ls.length {
+    const v = layRec[L][first + i]
+    if v >= 0 {
+      const key = p * PAIR + first + i
+      bump(stStores, key)
+      bump(stSpilled, key)
+      let y = 0
+      while y < recLen(v) {
+        localOp(c, 0x20, ls[i])
+        gcOp(c, 2, v, y)
+        y = y + 1
+      }
+    } else {
+      localOp(c, 0x20, ls[i])
+    }
+    i = i + 1
+  }
+  gcOp(c, 0, p, -1)
+  rwRep[rsK[s]] = keep(c)
+}
+
+// The rewritten body: its locals header (the old entries, their record locals declared
+// non-null when that validated, then the added locals in runs of one type) and `code`; `fault`
+// appends an empty `0 x i32` entry.
+function finishBody(
+  bi: i32,
+  h0: i32,
+  code: u8[],
+  moved: i32[],
+  fault: boolean,
+  mv: i32[],
+): u8[] {
+  const none: u8[] = []
+  const body = M.bodies[bi]
+  const h = wcNew(B, h0, body.from)
+  const n = wcU32(h)
+  const entries = h.pos
+  const flip: i32[] = []
+  let e = 0
+  while e < n && !h.failed {
+    wcU32(h)
+    const at = h.pos
+    const v = rdVal(h)
+    const r = refIdx(v)
+    if rbTight[bi] && B[at] == 0x63 && r >= 0 && isRecord[r] { flip.push(at) }
+    e = e + 1
+  }
+  if h.failed {
+    rwErr = "a locals header does not decode"
+    return none
+  }
+  const gN: i32[] = []
+  const gT: i32[] = []
+  for t in rwExtra {
+    if gT.length > 0 && gT[gT.length - 1] == t {
+      gN[gN.length - 1] = gN[gN.length - 1] + 1
+    } else {
+      gN.push(1)
+      gT.push(t)
+    }
+  }
+  if fault {
+    gN.push(0)
+    gT.push(0x7f)
+  }
+  const out: u8[] = []
+  wnPutLeb(out, n + gN.length)
+  const at0 = out.length
+  copyBytes(out, B, entries, body.from - entries)
+  for at in flip { out[at0 + at - entries] = 0x64 }
+  let g = 0
+  while g < gN.length {
+    wnPutLeb(out, gN[g])
+    if !putValLong(out, gT[g]) {
+      rwErr = "a local's type does not encode"
+      return none
+    }
+    g = g + 1
+  }
+  const header = out.length
+  putBytes(out, code)
+  mv.push(h0)
+  mv.push(0)
+  let i = 0
+  while i < moved.length {
+    mv.push(moved[i])
+    mv.push(moved[i + 1] + header)
+    i = i + 2
+  }
+  out
+}
+
+// Type `t` in the binary format, every value type in its long form, a parent's inlined fields
+// expanded to its record's; false when it holds a type this cannot write.
+function encodeSub(out: u8[], t: i32): boolean {
+  const st = M.types[t]
+  if st.form != 0x60 && st.form != 0x5e && st.form != 0x5f { return false }
+  if st.prefix == 0x50 || st.supers.length > 0 {
+    out.push(if st.prefix == 0x4f { 0x4f } else { 0x50 })
+    wnPutLeb(out, st.supers.length)
+    for s in st.supers { wnPutLeb(out, s) }
+  }
+  out.push(st.form)
+  if st.form == 0x60 {
+    wnPutLeb(out, st.params.length)
+    for v in st.params {
+      if !putValLong(out, v) { return false }
+    }
+    wnPutLeb(out, st.results.length)
+    for v in st.results {
+      if !putValLong(out, v) { return false }
+    }
+    return true
+  }
+  const L = if st.form == 0x5f { layIx[t] } else { -1 }
+  if L < 0 {
+    if st.form == 0x5f { wnPutLeb(out, st.params.length) }
+    let i = 0
+    while i < st.params.length {
+      if !putField(out, st.params[i], st.mutable[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  const start = layStart[L]
+  wnPutLeb(out, start[start.length - 1])
+  let j = 0
+  while j < st.params.length {
+    const v = layRec[L][j]
+    if v < 0 {
+      if !putField(out, st.params[j], st.mutable[j]) { return false }
+    } else {
+      for x in M.types[v].params {
+        if !putValLong(out, x) { return false }
+        out.push(if st.mutable[j] { 1 } else { 0 })
+      }
+    }
+    j = j + 1
+  }
+  true
+}
+
+function putField(out: u8[], v: i32, mutable: boolean): boolean {
+  if v == 0x78 || v == 0x77 { out.push(v) }
+  else if !putValLong(out, v) { return false }
+  out.push(if mutable { 1 } else { 0 })
+  true
+}
+
+// A packed value type in its long form: a reference as `0x63`/`0x64` and its heap. False for an
+// exact or packed type, or a heap this does not write.
+function putValLong(out: u8[], v: i32): boolean {
+  const lead = v & 0xff
+  if lead >= 0x7b && lead <= 0x7f {
+    out.push(lead)
+    return true
+  }
+  let nullable = 0x63
+  let h = lead
+  if lead == 0x63 || lead == 0x64 {
+    nullable = lead
+    h = v >> 8
+  }
+  if h >= 0x100 {
+    if ((h - 0x100) & 1) != 0 { return false }
+    out.push(nullable)
+    putSleb(out, (h - 0x100) >> 1)
+    return true
+  }
+  if (
+    !(h == 0x70
+      || h == 0x6f
+      || h == 0x6e
+      || h == 0x71
+      || h == 0x72
+      || h == 0x73
+      || h == 0x6d
+      || h == 0x6b
+      || h == 0x6a
+      || h == 0x6c
+      || h == 0x69
+      || h == 0x74)
+  ) {
+    return false
+  }
+  out.push(nullable)
+  out.push(h)
+  true
+}
+
+// The module with the type section `types` and the code section of `bodies`, every other
+// section copied; fills `rwMoves`.
+function assemble(
+  types: u8[],
+  bodies: u8[][],
+  moves: i32[][],
+  hdr: i32[],
+): u8[] {
+  const none: u8[] = []
+  const out: u8[] = []
+  copyBytes(out, B, 0, 8)
+  rwMoves = []
+  let sawT = false
+  let sawC = false
+  let s = 0
+  while s < M.secId.length {
+    const id = M.secId[s]
+    if id == 1 {
+      sawT = true
+      out.push(1)
+      wnPutLeb(out, types.length)
+      putBytes(out, types)
+    } else if id == 10 {
+      sawC = true
+      const sec: u8[] = []
+      wnPutLeb(sec, bodies.length)
+      const starts: i32[] = []
+      for b in bodies {
+        wnPutLeb(sec, b.length)
+        starts.push(sec.length)
+        putBytes(sec, b)
+      }
+      const head: u8[] = [10]
+      wnPutLeb(head, sec.length)
+      const base = out.length + head.length
+      wnPutLeb(rwMoves, bodies.length)
+      let bi = 0
+      while bi < bodies.length {
+        const at = base + starts[bi]
+        const mv = moves[bi]
+        wnPutLeb(rwMoves, hdr[bi])
+        wnPutLeb(rwMoves, M.bodies[bi].to)
+        wnPutLeb(rwMoves, mv.length / 2)
+        let i = 0
+        while i < mv.length {
+          wnPutLeb(rwMoves, mv[i])
+          wnPutLeb(rwMoves, at + mv[i + 1])
+          i = i + 2
+        }
+        bi = bi + 1
+      }
+      putBytes(out, head)
+      putBytes(out, sec)
+    } else {
+      copyBytes(out, B, M.secStart[s], M.secEnd[s] - M.secStart[s])
+    }
+    s = s + 1
+  }
+  if !sawT || !sawC {
+    rwErr = "no type or code section"
+    return none
+  }
+  out
+}
+
+function putSleb(out: u8[], v: i32) {
+  let x = v
+  while x >= 0x40 {
+    out.push((x & 0x7f) | 0x80)
+    x = x >> 7
+  }
+  out.push(x)
 }
 
 // ---- Text ----

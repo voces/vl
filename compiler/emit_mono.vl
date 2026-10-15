@@ -2870,6 +2870,14 @@ function monoRemintCallTpl(ix: i32, callee: i32, args: i32[]): i32 {
   nc
 }
 
+// A list literal a pass re-makes for its items alone: the copy answers the template's type, so
+// it carries the type recorded on `ix`.
+function monoRemakeListLitTpl(ix: i32, es: i32[], pos: i32): i32 {
+  const nx = monoCopyOf(ix, mkArrayLit(es, pos))
+  nodeTyCarry(nx, ix)
+  nx
+}
+
 // `monoExprRemake`'s node maker. A call keeps its explicit type arguments, and an `is` its
 // banked row.
 function monoExprMake(ix: i32, kids: i32[]): i32 {
@@ -5303,7 +5311,7 @@ function monoPinMapLambdas(
       ei = ei + 1
     }
     if !echanged { return ix }
-    return monoCopyOf(ix, mkArrayLit(es, n.pos))
+    return monoRemakeListLitTpl(ix, es, n.pos)
   }
   if n is Spread {
     const sa = monoPinMapLambdas(n.spdArg, pNames, pElems, pElemTys)
@@ -7210,7 +7218,7 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
       ei = ei + 1
     }
     if !echanged { return ix }
-    return monoCopyOf(ix, mkArrayLit(es, n.pos))
+    return monoRemakeListLitTpl(ix, es, n.pos)
   }
   if n is ObjLit {
     const fl: i32[] = []
@@ -7452,7 +7460,9 @@ function monoFoldTyParamLayout(
       ei = ei + 1
     }
     if !echanged { return ix }
-    return mkArrayLit(es, n.pos)
+    const nl = mkArrayLit(es, n.pos)
+    nodeTyCarry(nl, ix)
+    return nl
   }
   if n is ObjLit {
     const fl: i32[] = []
@@ -9533,8 +9543,8 @@ function monoAdapterCallee(v: i32): i32 {
 }
 
 // For call `ix` in frame `ctx` through a written, un-annotated `let`: coerces the generic
-// functions its initializer and writes name at the function type the call is recorded at; -1 when
-// another call through it takes another type (refused).
+// functions its initializer and writes name at the one signature the flow table pins the binding
+// at, else at the instance this call takes; -1 when another call takes another type (refused).
 function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   const n = P.nodes[ix]
   if !(n is Call) { return 0 }
@@ -9542,9 +9552,9 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   if lf[1] < 0 { return 0 }
   const d = P.nodes[lf[1]]
   if !(d is LetDecl) { return 0 }
-  let ct = monoConcreteFnTyName(nodeTyIxOf(n.callFn))
-  // A `let` that keeps its seed's generic type is called at the instance its arguments take of
-  // that generic; the call is never renamed to it, since a write may have replaced the value.
+  let ct = monoSlotPinName(lf[1], [], lf[0])
+  // With no single pin the call takes the instance its arguments make of the seed; the call is
+  // never renamed to it, since a write may have replaced the value.
   if ct == "" {
     const g = monoListElemGenFe(d.letInit, lf[0])
     if g < 0 { return 0 }
@@ -11499,8 +11509,10 @@ function monoCellConcreteTake(t: i32, tname: string, open: i32): i32 {
   const f = T.tys[ft]
   if f is TyPrim { return 0 }
   if !(f is TyFunc) { return 2 }
-  const want = monoFnNameSig(tname)
-  if want == "" || monoFnNameSig(monoConcreteFnTyName(ft)) != want { return 1 }
+  // A function type with no parameters has the empty parameter list, which is no refusal.
+  if annArrowAt(peelGroupParens(nonNulBaseOf(tname))) < 1 { return 1 }
+  const has = monoConcreteFnTyName(ft)
+  if has == "" || monoFnNameSig(has) != monoFnNameSig(tname) { return 1 }
   0
 }
 
@@ -13103,19 +13115,14 @@ function monoCellReadName(ix: i32): string {
   ""
 }
 
-// The function type the capture cell read `at` (`cell[0]`) holds at the bindings of frame
-// `ctx`; "" when its type names no type parameter or is no function type there.
-function monoCellFnTyNameAt(at: i32, ctx: i32): string {
-  if at < 0 || at >= P.nodes.length { return "" }
+// The function type the capture cell read `at` (`cell[0]`) is called at in frame `ctx`: the one
+// signature the flow table pins the cell's element at; "" for none or two.
+function monoCellPinName(at: i32, ctx: i32): string {
+  if !monoIsCellRead(at) { return "" }
   const r = P.nodes[at]
   if !(r is Index) { return "" }
-  const di = identDeclOf(r.idxArr)
-  if di < 0 || di >= P.nodes.length { return "" }
-  const d = P.nodes[di]
-  if !(d is LetDecl) || !monoCellTyIsOpen(di) { return "" }
-  const el = monoGeneratedCellElem(d.letInit)
-  if el < 0 { return "" }
-  monoConcreteFnTyName(monoPinSubTyOf(monoCellElemTyOf(d.letInit, el), ctx))
+  const cp: string[] = ["e"]
+  monoSlotPinName(identDeclOf(r.idxArr), cp, ctx)
 }
 
 // The cell half of `monoWalk` for call `n` at `ix` in frame `ctx` through the capture cell
@@ -13142,12 +13149,10 @@ function monoCellCall(
   }
   // A cell seeded with a named generic is called at the instance this call's arguments take
   // of the seed, since retyping the cell rewrites the callee's recorded type; any other cell
-  // at the callee's type (D3939).
+  // at the one signature the flow table pins its element at in this frame (D3939, D3957).
   let ctn = ""
   const sfe = monoCellSeedGenFe(at, cctx)
-  if sfe < 0 { ctn = monoConcreteFnTyName(nodeTyIxOf(n.callFn)) }
-  // A cell's type that names a type parameter is read at this call's instance (D3957).
-  if sfe < 0 && ctn == "" { ctn = monoCellFnTyNameAt(at, ctx) }
+  if sfe < 0 { ctn = monoCellPinName(at, ctx) }
   // An alias is a value the cell's writes may have replaced, so its call is never renamed.
   if viaAlias { monoNoRename.push(n.callFn) }
   if sfe >= 0 {
@@ -13680,11 +13685,9 @@ function monoWalk(ix: i32, ctx: i32) {
       const tgt = P.nodes[n.binLeft]
       if tgt is Ident {
         let atn = identFnTypeAnnName(tgt.identName, ctx)
-        // An un-annotated local holds its initializer's type at this instance's bindings, which
-        // every later write delivers at (D3957).
-        if atn == "" {
-          atn = monoConcreteFnTyName(monoPinSubTyOf(nodeTyIxOf(n.binLeft), ctx))
-        }
+        // An un-annotated local's write delivers at the one signature the flow table pins the
+        // binding at in this frame (D3957).
+        if atn == "" { atn = monoPlacePinName(n.binLeft, "", ctx) }
         if atn != "" {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
         }

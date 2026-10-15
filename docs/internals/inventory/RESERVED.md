@@ -97,3 +97,4 @@ D4300-D4319  lane-SC  2026-10-13  function-value flow table (§(f) step 1) disag
 D4746-D4749  lane-D4720  2026-10-14  closing D4720/D4721 (nullable union and inline-record list literals): none filed
 D4770-D4773  lane-D4743  2026-10-14  closing D4743/D4744/D4745 (unions of one-list members): D4770, D4771 filed open
 D4778-D4781  lane-D4771  2026-10-14  closing D4771 (`is` over a list tests every element): D4778, D4779 filed open
+D4842-D4845  lane-SC  2026-10-15  L1 step 5 (capture cells): D4842 filed open (a hole lambda copied into a capture cell called at a second type)

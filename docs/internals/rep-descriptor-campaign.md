@@ -3220,6 +3220,84 @@ the checker.
 **Next, in order:** the untyped remainders above, each by its minting pass; then the typed
 remainders of §13.21 (`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.
 
+### 13.23 A capture cell's read carries the type the name read had
+
+This step takes the 751 untyped `Index` notes §13.22 left in `tests/cases`, split 365
+`reflist`, 198 `list`, 95 `i64list`, 73 `f64list` and 20 `strlist`. They are in nine files,
+not the five §13.22 named: `capture-union-list-literal-reassign.vl` 266,
+`capture-union-closure-write-member-grid.vl` 260, `capture-ref-array-assign.vl` 99,
+`capture-nullable-closure-null-write.vl` 53, `capture-mutation-init-kinds.vl` 26,
+`capture-nullable-scalar-list-tail-write.vl` 20, and 9 each in `union-copy-captured.vl`,
+`captured-inferred-union-binding-cell.vl` and `capture-by-reference.vl`.
+
+**Mechanism.** The minting-pass probe puts all 751 in `captureBoxRewrite`. The ablated witness is
+
+```
+function g() {
+  let xs = [1, 2]
+  const f = () => { xs = [3] }
+  f()
+  print(xs.length)
+}
+g()
+```
+
+A binding a closure writes becomes a one-element cell, and each read `xs` is rewritten to
+`c[0]` (`cboxWalk`). The cell `c` recorded the list type of the cell, and a store target `c[0]`
+was typed by the `BinExpr` arm. The read `c[0]` recorded nothing, so `nodeTyInOf` answered
+`-1` there. Both ingredients are needed: a binding written inside a closure, and a read of it.
+The same read without the closure write is not rewritten.
+
+A read `c[0]` now records the type the checker gave the `Ident` it replaces. That is the read's
+own type, narrowing included, so it agrees with what the classifier ladder already answers.
+Two other choices were tried and refused:
+
+* The cell's element type (`tyArrayElemIx` of the cell's type) removes the same 751 notes but
+  adds others. A union cell read where it has been narrowed asks the ladder for one member's
+  rep and the column for the union's, and nullable list cells move to the `narrowed` family.
+* Typing a function-valued read refuses `capture-by-reference.vl` at emit: "the reassigned
+  function binding `f` holds functions called at more than one argument type". The check that
+  refuses it (`monoBindSigFail`) counts a typed cell read of `f` as a call site. So a read whose
+  type is a function type stays untyped. A function read never asks a list question, so this
+  leaves no `listRep` note behind. The minimised program needs about 90 lines of the file; a
+  six-line `let f = () => 1; const gf = () => f(); f = () => 2` alone does not refuse.
+
+A literal-union read needed no exclusion once store targets are skipped: the earlier failure at
+`captured-litunion-assign.vl:38` came from typing the store target.
+
+**Checks.** The seed is 5,593,420 bytes, +122 over master's fixpoint at f854256e9 (5,593,298).
+
+* Over 15,167 files, 10,208 built, 0 differ and 0 are uncompared, and the candidate compiles
+  master's compiler source to master's fixpoint (`difftree --identity`).
+* D2413 and D3356 close; neither witness is in that population. Both refused because a cell
+  read had no type for the classifiers to read: `.length`, an index and a `for … in` over a
+  `u8[]` cell found no byte list, and `print` of an `AB | null` cell found no member texts.
+  Each now runs, plain and under a null check, pinned by
+  `captured-cell-u8-list-read.vl` and `captured-cell-nullable-litunion-print.vl`.
+* Native fixpoint holds: stage3 == stage4 byte-for-byte.
+* `rep-fuzz-check` is exact, `regress.vl` loses no runs, `lint-self` raises no budget, and
+  `seed-size --check` passes (+2.1% over its baseline).
+
+**Counts.** `listRep` notes from the same probe, keyed by node kind, minting pass and type. Both
+probe seeds were built on the same base:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | untyped `Index`, LEFT-ONLY | 751 (9 files) | 0 |
+| `tests/cases` | like-for-like LEFT-ONLY | 1,376 | 625 |
+| distilled `named/` | every note | unchanged | unchanged |
+
+Per file and family, no other note count moved in either population.
+
+**What is left untyped.** In `tests/cases`: 98 `ArrayLit` notes minted by the checker, 41 `Call`
+notes minted by mono, 2 `IfStmt` notes minted by mono (`join-type-param-list-in-body.vl`) and 1
+`BinExpr.right` minted after the last pass. In `named/`: the 90 `d3125_*` `IfStmt` notes and 24
+`ArrayLit` notes, both minted by mono.
+
+**Next, in order:** the mono `IfStmt` notes (92 over both populations), then the checker's
+`ArrayLit` packs, then the 41 `Call` notes; then the typed remainders of §13.21 (`_[] | null`,
+`d3140_*`); then items 2, 4 and 5 of §13.14.
+
 ### 13.24 Three nodes minted untyped record their type: a re-made `if` link, a rest pack, a re-made call
 
 This step takes the untyped remainders §13.22 named, each by the pass that minted it. The
@@ -3311,3 +3389,113 @@ like-for-like LEFT-ONLY is 484.
 
 **Next, in order:** the `d511_*` `ArrayLit`; then the typed remainders of §13.21
 (`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.
+
+### 13.25 The last untyped nodes record their type, and a join of records reads the column
+
+This step takes the two untyped remainders §13.24 named, then the largest typed family left. The
+counts are from §13.24's probe, which tags each node with its kind, its type at the instance and
+the pass that minted it.
+
+**The re-associated `??` chain (1 `BinExpr` note in `tests/cases`).** `emitCoalesceGo` rewrites
+`a ?? b ?? d` to `a ?? (b ?? d)` at emit, and mints both links. It recorded their type only when
+the chain is one box (D2373), so the inner link of a list chain reached the list classifier with
+no type. The witness is
+
+```
+function mkList(n: i32): i32[] | null {
+  if n == 0 { return null }
+  return [n]
+}
+function midCall(n: i32, r: i32[] | null) {
+  const v = r ?? mkList(n) ?? [7]
+  print(v[0])
+}
+midCall(0, null)
+```
+
+Otherwise the outer link now carries the chain's type. The inner link's type lies between `d`'s and
+the chain's, so it carries the chain's type when that is `d`'s too, and nothing otherwise.
+Carrying the outer link's type alone does not remove the note, because the noted node is the
+inner link.
+
+**The mono list literal (24 `ArrayLit` notes in `named/`).** Every one is in
+`d511_{coal,xor}_nest_arrlit_typar.vl`. The ablated witness is
+
+```
+function g<T>(a: T, b: T): i32 { const xs = [a ?? b]; return xs.length }
+```
+
+called with two `i32`s. At the pin `monoPinBinOps` folds the dead `??`, and it re-made the list
+literal around the folded element with no type. Three passes re-make a list literal from changed
+items alone: `monoPinMapLambdas`, `monoPinBinOps` and `monoFoldTyParamLayout`. Each now carries
+the template's recorded type, the first two through `monoRemakeListLitTpl` (the list twin of
+`monoRemintCallTpl`).
+
+**A join of records (294 notes: 288 in 48 `d223e*` cells, 6 in `tests/cases`; 2 more in
+`tests/cases` over another join).** In
+
+```
+type Cir2 = { c2: i32 }
+type Sq2 = { s2: i32 }
+type Shape2 = Cir2 | Sq2
+type Circle = { r: Shape2 }
+const lv1 = [{ r: { c2: 1 } }, { r: { s2: 1 } }]
+```
+
+the checker records `({r: {c2: i32}} | {r: {s2: i32}})[]`, a join of the two literals' shapes.
+The emitter lists the one arm both literals denote (`arrLitObjElemsOneVariant`, D361), which is
+a struct ref list, and the ladder answers `reflist`. `repOfArray` covered a union element only
+as a literal union or a registered box, so the column was uncovered. A union whose members are
+all records, with no box row, is now a struct-element ref list, like `S[]`. A box over the same
+members still answers first. Without `Circle` declared, the same literal is a loud emit reject
+(`object literal is missing a struct field`), so the arm covers nothing that builds differently.
+
+**Checks.** Against master at `49c433040` (with #3812, without #3809): master's fixpoint is
+5,677,537 bytes and the candidate 5,678,313, +776.
+
+* `difftree --identity`: 15,170 files, **10,211 built, 0 differ, 0 uncompared**, and the
+  candidate compiling master's source gives master's fixpoint. The same holds against a base
+  that also carries #3809 (10,213 built, 0 differ).
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact. `regress.vl` loses no runs; its seven `rv3310_*` `trap_loads`
+  movements are the ones §13.22 recorded. `lint-self` is clean and `seed-size --check` passes.
+* `check-filed-witnesses --strict`: 2,758 graded, all as filed, none moved.
+
+**Counts.** `listRep` notes, LEFT-ONLY like-for-like, measured on master at `a3c78c3fe` plus
+#3809 (§13.23, not yet merged) and #3812, before and after this step:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | untyped `BinExpr` (emit) | 1 | 0 |
+| `tests/cases` | join of records | 8 | 0 |
+| `tests/cases` | like-for-like LEFT-ONLY | 544 | 535 |
+| distilled `named/` | untyped `ArrayLit` (monomorphize) | 24 | 0 |
+| distilled `named/` | `({r: {c2: i32}} \| {r: {s2: i32}})[]` | 288 | 0 |
+| distilled `named/` | like-for-like LEFT-ONLY | 473 | 161 |
+
+No file gained a note. The base reads 544 where §13.24 predicted 484: the base also carries
+#3806, which landed between them.
+
+**No LEFT-ONLY node is untyped any more**, in either population. What remains is a column
+question: every note is at a node with a type that the descriptor does not cover or answers
+differently.
+
+**What L2 stage 3 needs next.** By column class, in `tests/cases` (535) and `named/` (161):
+
+1. The hole list `_[]` and `_[] | null`: 296 in `tests/cases` (203 + 93), 21 in `named/`
+   (`d626_ctl_directlit.vl`). §13.18 leaves a hole list uncovered on purpose, since it has no
+   element to choose a rep from, so these notes are a decision before they are a change: either
+   the oracle files them under `open` as it does a type variable, or the hole is resolved where
+   the ladder resolves it (the destination's pin).
+2. A union element with no row: `d3140_*`'s `(i32 | K | L | null)[]` (128 in `named/`), a canon
+   id question as §13.21 says; `(Rec2[] | null | Rec[] | null)[]` (64);
+   `(i32 | string | f64)[]` (16); `(string | i32)[]` and `(i32[] | i32)[]`.
+3. A numeric literal union over `i64` or `f64`: `(9000000000 | 1 | 9000000001)[]` (23) and
+   `(f64 | 2)[]` (10). `repOfArray`'s numeric literal-union arm does not answer either; the
+   reason is not yet ablated.
+4. A single-literal list: `"ea"[]`, `"aa"[]`, `"red"[]` (20), where the ladder says `strlist` and
+   the column says uncovered.
+5. A covered column that answers no list (`-> none`, 60 in `tests/cases`, 12 in `named/`), such
+   as `rv3310_*`'s `string[] | boolean[]`, where the ladder reads a string list.
+
+Then the RIGHT-ONLY families and items 2, 4 and 5 of §13.14.
