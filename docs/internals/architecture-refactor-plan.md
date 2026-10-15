@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: `HOST_FLOOR` (`main.rs`) is the host floor in one table, held to the compiler by `tests/vl_host_floor_test.ts`. Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the `tyHasTyVar`/`inferRet*` closure and the type-parameter join steps moved into six modules (`check_hole_pins`, `check_ret_names`, `check_cursor`, `check_union_mint`, `check_cstr_rows`, `check_tp_join`); 60,422 → 58,176 lines. Next: the `prb*` steps, which free 47. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: the quiet-probe rollback and the rows it truncates moved into `check_rollback`, `check_hole_rows` and `check_infer_rows`; 58,207 → 57,052 lines. Next: `crReset`, which frees 40. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -395,6 +395,20 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   | `fnWriteShapes` | 61, 20 `let`s, 758 lines | 5 (92) |
 
   `fnWriteShapes` now frees only 5, because the join steps it shared went with them.
+- The `prb*` steps and `checkRollback` moved together, since the rollback assertion marks every table the rollback truncates. `typecheck.vl` fell from 58,207 to 57,052 lines. None of the three new modules imports `typecheck.vl`.
+  - `compiler/check_rollback.vl` holds `checkMark`, `checkRollback`, the `RB_*` site sets, `MonoSave` and the rollback assertion (`prb*`, `probeRollback*`). `checkRollback` no longer writes a table: each family's module owns its truncate.
+  - `compiler/check_hole_rows.vl` holds the hole demand, flow, `??` result and callee-write rows; `compiler/check_infer_rows.vl` holds the inferred-return and inferred-binding rows, the cycle stack and the tentative set. `check_tp_join.vl` gained the deferred, escaped and `tpIf*` join rows, and `check_cursor.vl` the type-parameter environment.
+  - `initChecker` calls `cursorReset`, `holeRowsReset`, `joinRowsReset` and `inferRowsReset` in place of the 52 per-table lines.
+  - The candidate's seed and the base's each compile the other tree's source to that tree's fixpoint byte for byte, output identity holds over 15,191 files (0 differ), and the distilled corpus moved no cell. Two `kind-ladder-incomplete` and two `sentinel-index-unguarded` findings moved with their functions into `check_hole_rows.vl`.
+- Measured on the file after those moves (2,745 declarations, 601 pure), the next moves are:
+
+  | Roots | Closure | Frees |
+  | --- | --- | --- |
+  | `crReset` (the capture-retire tables) | 73 declarations, 72 `let`s, 217 lines | 40 (544 lines) |
+  | `crRootCaptureWiden` | 59, 23 `let`s, 592 lines | 29 (506) |
+  | `symFlushPending` | 16, 9 `let`s, 100 lines | 23 (483) |
+  | `cexNoteNames` with `cexRewrite` | 22, 9 `let`s, 186 lines | 19 (414) |
+  | `fnWriteShapes` | 61, 20 `let`s, 758 lines | 5 (92) |
 
 ### SMALL log
 
