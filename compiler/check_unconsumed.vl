@@ -2,7 +2,7 @@
 // shares with the checker and the emitter: whether a body holds a bare `return` or a
 // `return <value>`, and whether a statement is the value of a `break v`. Every answer is a walk
 // of the node arena; nothing here reads a type, so the checker imports it and it imports only
-// `./ast`. `ucCompute` fills the table once per program and `fnResultUnconsumed` reads it.
+// `./ast`, `parenPeelIx` and `cwPeel`. `tailValueLeaves` and `joinLeavesOf` follow a value's tails. `ucCompute` fills the table once per program and `fnResultUnconsumed` reads it.
 import {
   Block,
   BreakStmt,
@@ -26,6 +26,8 @@ import {
   nodeChildren,
   stmtAlwaysExits,
 } from "./ast"
+import { parenPeelIx } from "./check_places"
+import { cwPeel } from "./check_write_scan"
 
 // Un-annotated top-level functions whose result no caller consumes, by declaration node: the
 // checker hoists and checks each as `: void` and `computeVoidFns` agrees, so a tail value
@@ -450,4 +452,43 @@ export function tailPushBlockTail(p: i32, todo: i32[]): boolean {
     return true
   }
   false
+}
+
+// The value expressions a tail at `ix` yields: each arm of an `if`/`else` or `match`, followed
+// down nested ones and an arm's block tail, else `ix` itself. A worklist, so a long `else if`
+// chain costs no stack. A block whose tail follows an exit yields nothing (D2234).
+export function tailValueLeaves(ix: i32, out: i32[]) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if (
+        !tailPushIfArms(at, todo)
+        && !tailPushMatchArms(at, todo)
+        && !tailPushBlockTail(at, todo)
+      ) {
+        out.push(at)
+      }
+    }
+  }
+  0
+}
+
+// Every `if` and `match` whose value is `ix`'s, through arms and block tails.
+export function joinLeavesOf(ix: i32): i32[] {
+  const out: i32[] = []
+  const todo: i32[] = [ix]
+  let guard = 0
+  while todo.length > 0 && guard < 64 {
+    guard = guard + 1
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      const an = P.nodes[at]
+      if an is IfStmt || an is MatchExpr { out.push(at) }
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        tailPushBlockTail(at, todo)
+      }
+    }
+  }
+  out
 }
