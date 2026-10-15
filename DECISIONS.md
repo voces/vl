@@ -10408,3 +10408,47 @@ implementation; this is that record. Each direction in its own words:
 Items 2 and 8 also carry open sub-questions in §5 (a shadowable convenience name;
 graduated visibility levels). They stay open. `docs/spec/modules.md` cites directions 4
 and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.
+
+## An unbound type parameter defaults at the call (D4551 option (b), 2026-10-15) — D4551, D4910
+
+**The rule.** An inferred call that leaves a type parameter unbound, because no parameter
+annotation of the callee names it and no type argument is written, binds it to `i32`
+(`MONO_UNBOUND_TY_PARAM_DEFAULT`, `monoDefaultUnboundTyParams` in `compiler/emit_mono.vl`). The
+instance is keyed as the explicit call would be, so `opT(a)` and `opT<i32, i32>(a)` share one.
+
+```vl
+function opT<T, U>(a: T[]) {
+  const q: U[] = []
+  return inner(q) + a.length   // was invalid wasm: `q` was a list over a hole
+}
+print(opT([1]))                // 2, as opT<i32, i32>([1])
+```
+
+**Why a default and not a refusal.** D1819 accepts `countOf<T>()`, whose local `xs: T[]` is
+read through `.length`; refusing every body local that names an unbound parameter would
+re-rule that accept set, and the program has nothing a caller could get wrong. Such a
+parameter names only body locals, and those hold no value of it: nothing outside the body can
+deliver one, and nothing inside can make one.
+
+**The invariant: the choice is not observable.** Any default must give every program the
+same output. It is enforced in three places:
+
+* **Scope.** Only a parameter that no parameter annotation names is defaulted. One a
+  parameter names is bound by its argument or stays an inference error.
+* **No values.** A local of an unbound parameter can only be empty (`[]`, `null`, a record
+  over such lists), so a read of its length, its nullness or its elements agrees under every
+  default.
+* **`is` answers by the value.** `q is K[]` over a list whose element type is disjoint from
+  `K`'s at some depth tests emptiness (D4910, by the D4771 ruling), so an empty `q` is a `K[]`
+  for every `K`, in the body and in any generic it is passed to.
+
+**Measured.** A build with the default set to `f64` against the shipped `i32` build, over a
+probe set covering the witness, explicit bindings, `countOf`, nullable locals, closures, list
+literals, transitive `is`, nested lists and record fields: identical output.
+
+**The one residual is D4911.** Where an arm the `is` narrows reads the receiver as `K[]`, the
+value test stands down (the instance's value cannot be read at that type) and the test keeps
+its static answer from the element type, so `if q is f64[] { print(q.length) }` prints under
+an `f64` default and not under `i32`. That is a defect in every instance, not in the default:
+the explicit `opT<i32, i32>` answers the same, and so did master with the parameter unbound.
+`i32` is chosen because it is that answer.

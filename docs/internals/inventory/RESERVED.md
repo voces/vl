@@ -107,3 +107,4 @@ D4878-D4881  lane-L2  2026-10-15  L2 §13.32 (the listRep `-> none` class): none
 D4894-D4897  lane-D4894  2026-10-15  closing D4894 (a list literal of list literals with different leaves): D4894 filed closed; D4895, D4896 filed open
 D4902-D4905  lane-D4896  2026-10-15  closing D4896 (a boolean-leaf list union member keyed onto `i32[]`): D4896 closed, D4902 filed open (a string-literal-union list literal delivered into `f64[] | K[]`)
 D4906-D4909  lane-D4902  2026-10-15  closing D4902 (an atom-list literal delivered into `f64[] | K[]`): D4906, D4907 filed open (`is K[]` over `i32[] | K[]`; a `for` over a box union's `K[]` arm); D4903-D4905 left unused
+D4910-D4913  lane-D4551  2026-10-15  D4551 option (b) (default an unbound type parameter): D4551 and D4910 closed; D4911 (an arm reading the narrowed receiver keeps the fold), D4912 (union receiver), D4913 (`V[] | string` with a string argument) filed open
