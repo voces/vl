@@ -46,6 +46,9 @@
 # the schedule differs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# `vl` resolves `std:` from the binary's checkout, and a worktree shares that binary;
+# without this a worktree lints its own std/ as a non-std module and fails on it.
+export VL_STD="${VL_STD:-$PWD/std}"
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
