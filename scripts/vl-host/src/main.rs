@@ -6228,6 +6228,54 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
+/// Which side decides the inline-record step's census (rung R6a): `$VL_OPT_INLINE` unset or
+/// `rust` the host's scan alone, `vl` the compiler's `optInline` first, `both` the two, failing
+/// the build when the compiler leaves a module alone and the host's scan says otherwise.
+#[derive(Clone, Copy, PartialEq)]
+enum OptInlineSide {
+    Rust,
+    Vl,
+    Both,
+}
+
+fn opt_inline_side() -> Result<OptInlineSide> {
+    match std::env::var("VL_OPT_INLINE").unwrap_or_default().as_str() {
+        "" | "rust" => Ok(OptInlineSide::Rust),
+        "vl" => Ok(OptInlineSide::Vl),
+        "both" => Ok(OptInlineSide::Both),
+        other => bail!("$VL_OPT_INLINE={other} — expected `rust`, `vl` or `both`"),
+    }
+}
+
+/// The compiler's census of the inline-record step (`optInline`, rung R6a) on `bytes`: its
+/// `$VL_INLINE_EXPLAIN` line when it leaves the module alone, or `None` when the host's step
+/// must scan it. `$VL_INLINE_FAULT=1` makes it leave every module alone, so a parity run can
+/// show it sees this answer.
+fn inline_vl(
+    bytes: &[u8],
+    explaining: bool,
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<Option<String>> {
+    let (mut store, inst) = load_compiler(engine, compiler)?;
+    opt_stage(&mut store, &inst, bytes)?;
+    let census = inst
+        .get_typed_func::<(i32, i32), i32>(&mut store, "optInline")
+        .map_err(|e| {
+            e.context(
+                "`$VL_OPT_INLINE` runs the inline-record step's census through the compiler's \
+                 `optInline`, which this seed predates (`$VL_OPT_INLINE=rust` runs the host's)",
+            )
+        })?;
+    let fault = std::env::var_os("VL_INLINE_FAULT").is_some_and(|v| !v.is_empty() && v != "0");
+    if census.call(&mut store, (explaining as i32, fault as i32))? == 1 {
+        return Ok(None);
+    }
+    let log = String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
+        .map_err(|_| Error::msg("the compiler's optInline wrote bytes that are not UTF-8"))?;
+    Ok(Some(log))
+}
+
 /// The step's answer: the rewritten module and its body moves, or `None` when it changes
 /// nothing.
 type MultivalueOut = Option<(Vec<u8>, Vec<multivalue::BodyMove>)>;
@@ -10344,10 +10392,47 @@ fn build_cmd(args: &[String]) -> Result<()> {
                         None
                     })
                 };
-                let stepped = phase!(
-                    "opt.inline_step",
-                    inline::inline_step(&bytes, stable_layout, &scalarized)
-                );
+                let side = opt_inline_side()?;
+                let explaining = std::env::var_os("VL_INLINE_EXPLAIN")
+                    .is_some_and(|v| !v.is_empty() && v != "0");
+                let decided = if side == OptInlineSide::Rust {
+                    None
+                } else {
+                    phase!(
+                        "opt.inline_census",
+                        inline_vl(
+                            &bytes,
+                            explaining || side == OptInlineSide::Both,
+                            &compile_engine,
+                            &compiler
+                        )
+                    )?
+                };
+                let stepped = match decided {
+                    Some(log) => {
+                        if side == OptInlineSide::Both {
+                            let host = inline::census_rust(&bytes, stable_layout)
+                                .map(|l| format!("{l}\n"));
+                            if host.as_deref() != Some(log.as_str()) {
+                                bail!(
+                                    "$VL_OPT_INLINE=both: the inline-record step's census \
+                                     differs between the host and the compiler: the compiler \
+                                     says `{}`, the host `{}`",
+                                    log.trim_end(),
+                                    host.as_deref().unwrap_or("a candidate").trim_end()
+                                );
+                            }
+                        }
+                        if explaining {
+                            eprint!("{log}");
+                        }
+                        None
+                    }
+                    None => phase!(
+                        "opt.inline_step",
+                        inline::inline_step(&bytes, stable_layout, &scalarized)
+                    ),
+                };
                 if let Some(e) = asked.into_inner() {
                     return Err(e);
                 }
