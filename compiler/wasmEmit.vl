@@ -989,6 +989,7 @@ import {
   listIdxWrapSlot,
   listOpKindOfBin,
   listOpSlotOfBin,
+  listPayloadStashSlot,
   listRepOfFieldCode,
   litAtomWidenTexts,
   localIndexOf,
@@ -5927,10 +5928,7 @@ function emitUnionUnboxTail(ak: i32) {
     return 0
   }
   const lw = listWrapHeapOfKind(ak)
-  if lw >= 0 {
-    fbRefCast(lw) // the payload IS the list WRAPPER ref
-    return 0
-  }
+  if lw >= 0 { return emitListPayloadCast(lw) }
   const vb = vbHeapIdxOfKind(ak)
   if vb < 0 {
     return emitFail("emitProgram: narrowed union atom has no value box")
@@ -5958,7 +5956,7 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
       )
     }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(rlWrapIdx[slot]) // the payload IS the arm's list wrapper
+    emitListPayloadCast(rlWrapIdx[slot])
     return 1
   }
   if narrowedMapOfPlace(exprIx) != "" {
@@ -5986,7 +5984,34 @@ function emitRefArrayUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
   if slot < 0 {
     return emitFail("emitProgram: narrowed ref-array arm has no reflist slot")
   }
-  fbRefCast(rlWrapIdx[slot]) // 0xfb 0x16 <reflist wrapper> — the payload IS the wrapper ref
+  emitListPayloadCast(rlWrapIdx[slot])
+}
+
+// Set while a `.push` receiver is emitted: an append into a stand-in empty list would be lost,
+// so a push keeps the plain cast and traps loudly instead (D4949).
+let listCastForPush = false
+
+// The box's `anyref` payload on the stack, as the list wrapper `wrap` a narrowed read expects.
+// An `is L` fits an empty list of another list arm (D4771), and a capture, field or element
+// cannot be re-boxed as `L`, so a payload of another wrapper reads as an empty `L` (D4939).
+function emitListPayloadCast(wrap: i32) {
+  const back = listBackOfWrap(wrap)
+  if back < 0 || listCastForPush {
+    fbRefCast(wrap)
+    return 0
+  }
+  const st = listPayloadStashSlot()
+  fbLocalTee(st)
+  fbRefTest(wrap)
+  fbIfRef(wrap)
+  fbLocalGet(st)
+  fbRefCast(wrap)
+  fbElse()
+  fbBacking(back, 0)
+  fbI32Const(0)
+  fbI32Const(0)
+  fbStructNew(wrap)
+  fbEnd()
   0
 }
 
@@ -23266,7 +23291,10 @@ function pushDestVKind(rslot: i32): VKind | null {
 // share. Called from two points because a push whose value stages a receiver must resolve
 // its own after that value (D1280); one function so the two cannot pass different arguments.
 function pushRecvLocal(body: u8[], objIx: i32, fnIx: i32, base: i32) {
-  listOpRecvLocal(body, objIx, fnIx, base, -1, ".push")
+  listCastForPush = true
+  const r = listOpRecvLocal(body, objIx, fnIx, base, -1, ".push")
+  listCastForPush = false
+  r
 }
 
 // The `pendingListKind` a list of element kind `k` is built at — the mapping `emitArr`'s own
@@ -23350,7 +23378,10 @@ function emitPushMany(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
       const totL = widenTmpSlot(3000 + seq)
       // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
       // restage it, which is how a hoisted receiver gets clobbered.
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      listCastForPush = true
+      const recvRc = emitExpr(body, callee.memObj, fnIx)
+      listCastForPush = false
+      if recvRc < 0 { return -1 }
       if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
       fbLocalSet(recvS)
       const lst = spreadRunLit(c.callArgs, callIx, c.pos)

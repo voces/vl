@@ -6823,10 +6823,11 @@ function retireNarrowingsForWrite(
     const pfx = root + "["
     let r = 0
     while r < npKeys.length {
-      // A store through the narrowed list itself is checked against its narrowed element.
+      // A store through a list narrowed by name is checked against its narrowed element.
       if (
         keyHasPrefix(npKeys[r], pfx)
-        && !keyHasPrefix(npKeys[r], root + LIST_EVERY_STEP)
+        && !(keyHasPrefix(npKeys[r], root + LIST_EVERY_STEP)
+          && narFitNameOf(r) != "")
       ) {
         let rprev = -1
         if npInvBy[r] < 0 { rprev = npTys[r] }
@@ -8038,6 +8039,101 @@ function listUnionWidest(t: i32): i32 {
   t
 }
 
+// A list narrowed by its elements (`b is K[]`) narrows its reads only: delivered whole, or as a
+// field or element of a literal, to a type its declared type does not fit, it would outlive the
+// guard as a `K[]` the declared type still writes (D4928). Reports each such delivery and answers
+// true when it reported one; a `map` copy is the conversion.
+function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if srcExpr < 0 || dstTy < 0 { return false }
+  const ix = peelParenIx(srcExpr)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const s = P.nodes[ix]
+  if s is ObjLit { return narListDeliveryFields(s, nonNullTy(dstTy)) }
+  if s is ArrayLit {
+    const dn = nonNullTy(dstTy)
+    if dn < 0 { return false }
+    const da = T.tys[dn]
+    if !(da is TyArray) { return false }
+    let hit = false
+    for e in s.arrElems {
+      if narListDeliveryErr(e, nodeTyOf(e), da.aElem) { hit = true }
+    }
+    return hit
+  }
+  if !(s is Ident) { return false }
+  const name = s.identName
+  const slot = elemEverySlotOf(name)
+  if slot < 0 || npInvBy[slot] >= 0 { return false }
+  const key = npKeys[slot]
+  const leaf = npTys[slot]
+  const depth = (key.length - name.length) / LIST_EVERY_STEP.length
+  const byName = narFitNameOf(slot) != ""
+  if byName && !assignable(srcTy, dstTy) { return false }
+  if !byName && !listLeafFits(leaf, dstTy, depth) { return false }
+  let decl = narDeclaredTy(name, -1)
+  if decl < 0 { decl = lookup(name) }
+  if decl < 0 || assignable(decl, dstTy) { return false }
+  let copy = "'" + name + ".map((x) => x)'"
+  if !byName { copy = "a 'map' over '" + name + "'" }
+  tErr(
+    "'"
+      + name
+      + "' is narrowed by `is` only for reading its elements; it is still declared "
+      + tyToStr(decl)
+      + " and a later write may widen it, so it cannot be delivered as "
+      + tyToStr(dstTy)
+      + ". Copy it with "
+      + copy,
+    ix,
+  )
+  true
+}
+
+// The innermost overlay slot holding an element entry of the bare name `name` (`name[*]…`),
+// whether or not it is still in force, or -1.
+function elemEverySlotOf(name: string): i32 {
+  const pfx = name + LIST_EVERY_STEP
+  let i = npKeys.length - 1
+  while i >= 0 {
+    const k = npKeys[i]
+    if keyHasPrefix(k, pfx) && keyIsListEvery(k) && k.indexOf(".") < 0 {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether a list `depth` deep whose leaf is `leaf` is delivered to `dst` leaf for leaf.
+function listLeafFits(leaf: i32, dst: i32, depth: i32): boolean {
+  let d = dst
+  let k = 0
+  while k < depth {
+    const dn = nonNullTy(d)
+    if dn < 0 { return false }
+    const da = T.tys[dn]
+    if !(da is TyArray) { return false }
+    d = da.aElem
+    k = k + 1
+  }
+  d >= 0 && assignable(leaf, d)
+}
+
+// `narListDeliveryErr` over the fields of a record literal delivered to the record type `dst`.
+function narListDeliveryFields(o: ObjLit, dst: i32): boolean {
+  let hit = false
+  for fx in o.objFields {
+    const f = P.nodes[fx]
+    if f is FieldInit {
+      const ft = tyFieldTyOf(dst, f.fiName)
+      if ft >= 0 && narListDeliveryErr(f.fiValue, nodeTyOf(f.fiValue), ft) {
+        hit = true
+      }
+    }
+  }
+  hit
+}
+
 // Whether the overlay key `k` is an element entry `narFitElems` pushed.
 function keyIsListEvery(k: string): boolean {
   k.length > LIST_EVERY_STEP.length
@@ -8271,6 +8367,9 @@ function crCaptureWiden(fnIx: i32) {
           crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", nm)
           crCapLossBank[fnIx] = crwAddName(crCapLossBank[fnIx] ?? ",", nm)
           crCapLossAny = true
+        } else if crElemNarrowLive(nm) && !crCallbackKeeps(fnIx, nm) {
+          crDeclareWidened(nm, wide)
+          crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", nm)
         } else if crCaptureMayGoStale(fnIx, nm) {
           if escapes < 0 { escapes = crLambdaEscapes(fnIx) }
           const fnWriter = crMayBeWritten(nm)
@@ -8298,6 +8397,13 @@ function crCaptureWiden(fnIx: i32) {
     r = r + 1
   }
   0
+}
+
+// Whether `name` holds a live element narrowing (`name is K[]`). A function capturing it may run
+// after any element write, which no assignment of `name` marks, so it reads `name` as declared.
+function crElemNarrowLive(name: string): boolean {
+  const i = narrowedPathIx(name + LIST_EVERY_STEP)
+  i >= 0 && npInvBy[i] < 0
 }
 
 // Whether the nested function `fnIx` may read a captured narrowing of `name` after it stopped
@@ -8723,7 +8829,14 @@ function crFirstWritingCall(ix: i32, name: string): i32 {
   -1
 }
 
-// `crFirstWritingCall` for an element entry `key`: a `push` on the narrowed list itself is
+// Whether the element entry `key` stands beside a narrowing of its list's name, so a store or
+// append through that name is checked against the narrowed element.
+function elemKeyStoresChecked(key: string): boolean {
+  const i = narrowedPathIx(key)
+  i >= 0 && narFitNameOf(i) != ""
+}
+
+// `crFirstWritingCall` for an element entry `key`: a `push` on a list narrowed by name is
 // checked against its narrowed element, so only its arguments are asked.
 function crFirstElemWritingCall(ix: i32, key: string): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
@@ -8734,7 +8847,9 @@ function crFirstElemWritingCall(ix: i32, key: string): i32 {
     if cf is Member {
       const ro = P.nodes[peelParenIx(cf.memObj)]
       if ro is Ident {
-        own = cf.memProp == "push" && key == ro.identName + LIST_EVERY_STEP
+        own = (cf.memProp == "push"
+          && key == ro.identName + LIST_EVERY_STEP
+          && elemKeyStoresChecked(key))
       }
     }
   }
@@ -8901,11 +9016,13 @@ function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
   let same = false
   if t is Member { same = last == "." + t.memProp }
   if t is Index {
-    // A store through the narrowed list itself is checked against its narrowed element.
+    // A store through a list narrowed by name is checked against its narrowed element.
     if last == LIST_EVERY_STEP && steps.length == 1 {
       const ra = P.nodes[peelParenIx(t.idxArr)]
       if ra is Ident {
-        if ra.identName == placeRootOf(key) { return false }
+        if ra.identName == placeRootOf(key) && elemKeyStoresChecked(key) {
+          return false
+        }
       }
     }
     // A literal subscript names its cell, as the straight-line rule reads it (D3317).
@@ -10163,6 +10280,34 @@ function isectDistribute(members: i32[], other: i32) {
 
 // Append one narrowing fact (place key → type) when the place is stable and
 // the narrowed type resolved (-1 means "no fact" and is skipped).
+// A list `cur` that keeps its storage under `xs is chk` (a string list against a string literal
+// set) still narrows its innermost element reads: the fact `xs[*]…[*]` holds `chk`'s leaf.
+function pushElemReadFact(
+  placeIx: i32,
+  cur: i32,
+  chk: i32,
+  names: string[],
+  tys: i32[],
+) {
+  let key = placeKeyOf(placeIx)
+  if key == "" || isPathKey(key) { return 0 }
+  let d = nonNullTy(cur)
+  let n = chk
+  while d >= 0 && n >= 0 && T.tys[d] is TyArray && T.tys[n] is TyArray {
+    const da = T.tys[d]
+    const na = T.tys[n]
+    if da is TyArray && na is TyArray {
+      key = key + LIST_EVERY_STEP
+      d = da.aElem
+      n = na.aElem
+    }
+  }
+  if d < 0 || n < 0 || tySame(d, n) || !isPathKey(key) { return 0 }
+  names.push(key)
+  tys.push(n)
+  0
+}
+
 function pushNarrowFact(placeIx: i32, ty: i32, names: string[], tys: i32[]) {
   if ty < 0 { return 0 }
   const key = placeKeyOf(placeIx)
@@ -10407,6 +10552,13 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
       ) {
         const nn = nonNullNarrowTy(isCur)
         if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
+        // A list that keeps its storage still narrows its element reads (ruling (c), D4928).
+        if (
+          listIsFitsAcrossReps(isCur, tIdx)
+          && recFitNarrowKeepsRep(isCur, tIdx)
+        ) {
+          pushElemReadFact(isPl, isCur, tIdx, names, tys)
+        }
       } else if (
         tIdx >= 0
         && recFitNarrowKeepsRep(isCur, tIdx)
@@ -10422,6 +10574,8 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
           false,
           "intersect",
         )
+      } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
+        pushElemReadFact(isPl, isCur, tIdx, names, tys)
       }
     }
     return 0
@@ -16670,6 +16824,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // function a hole reaches — and every binding / argument / return / field / element / store
   // position flows through here. Inert unless the parameter-solve probe is running.
   noteHoleFlow(srcTy, dstTy, srcExpr)
+  if !inferQuiet && narListDeliveryErr(srcExpr, srcTy, dstTy) { return true }
   if assignable(srcTy, dstTy) {
     if !inferQuiet && srcExpr >= 0 { genFnValueCstrs(srcExpr, srcTy, dstTy) }
     if fvaAdapt(srcExpr, srcTy, dstTy) { return true }
@@ -51568,6 +51723,8 @@ function checkIndexNode(n: Index, ix: i32) {
     }
   }
   if at is TyArray {
+    const ev = elemEveryReadTy(ix)
+    if ev >= 0 { return ev }
     // The element's value type — a `u8[]` read is an `i32`, never a `u8`. Same shape as the
     // string arm below: `string` is `(array i32)` with no `char` type above it (DECISIONS A7).
     return arrElemValueTy(at.aElem)
@@ -51580,6 +51737,28 @@ function checkIndexNode(n: Index, ix: i32) {
   tErr(indexFloorMsg(arrTy), ix)
   return TY_ERR
 }
+// The element a read `xs[i]…[j]` holds under an element-only narrowing of `xs`
+// (`pushElemReadFact`), or -1. A store through the place is typed as declared and ends it.
+function elemEveryReadTy(ix: i32): i32 {
+  if luWriteTgt[ix] ?? false { return -1 }
+  let key = ""
+  let cur = ix
+  let n = P.nodes[cur]
+  while n is Index {
+    key = key + LIST_EVERY_STEP
+    cur = peelParenIx(n.idxArr)
+    if cur < 0 || cur >= P.nodes.length { return -1 }
+    n = P.nodes[cur]
+  }
+  if !(n is Ident) { return -1 }
+  key = n.identName + key
+  const slot = narrowedPathIx(key)
+  if slot < 0 || narFitNameOf(slot) != "" { return -1 }
+  const t = narrowedPathTy(key)
+  if t >= 0 { crNoteCaptureRead(key) }
+  t
+}
+
 // ── object literal ──────────────────────────────────────────────────────────
 // `{x: e, y: e}` types as a structural `TyObj` whose fields carry each value's checked type.
 // Assignability against an annotation/param/return then matches it to a declared struct by
