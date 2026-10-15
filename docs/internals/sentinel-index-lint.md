@@ -39,7 +39,8 @@ line before the next):
 
 > A **TABLE READ** is `<t>[<idx>]` where `<t>` is a bare name or a two-segment path `<g>.<f>`
 > that the reading function did **not** declare — not one of its parameters, not one of its
-> `let` / `const` / `for` names — and is not one of the module's own MAP globals.
+> `let` / `const` / `for` names — and is not a MAP global: one of the module's own, or an
+> import local naming one of the module it comes from.
 >
 > An index `<idx>` is **SENTINEL-BEARING** when, at the read, it is
 >
@@ -66,6 +67,14 @@ Both derivations — hole fields and map globals — are read **per module**, fr
 text, so `compiler/lint.vl` (which sees one module) and `sentinel-census.vl` (which sees the
 tree) cannot disagree. Nothing is hard-coded: there is no list of tables, no list of readers, no
 list of hole fields.
+
+The one derivation that crosses a module is an IMPORTED map global. A module's text cannot tell
+`import { fnDeclIx }` from an imported list, so the driver resolves each import against the
+module it names and stages the locals that bind a column-0 `{[…]}` global there
+(`lintSetImportedMaps`), and the census reads the named sibling file. Without it, moving a map
+to another module turns every key read of it into a hit: #3788 moved `fnDeclIx` out of
+`typecheck.vl` and that file's count rose by 13, and `msAtomIds`, `msSetByText` and
+`monoGradualAsScalar` (exported from `emit_state.vl`) carried five more.
 
 ### What the guard model approximates
 
