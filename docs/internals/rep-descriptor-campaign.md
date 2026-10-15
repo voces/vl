@@ -3145,3 +3145,77 @@ did, and are not a column question.
 and 32 `ArrayLit` over `(Rec2[] | null | Rec[] | null)[]`; 23 over
 `(9000000000 | 1 | 9000000001)[]`. In `named/`, `d3140_*` 128, and the untyped `d3125_*` `Call`
 nodes above. Then items 2, 4 and 5 of §13.14.
+
+### 13.22 A call an instance re-makes carries its template's type
+
+This step takes the untyped `d3125_*` `Call` notes of §13.21: 1,744 in `named/`, split 972
+`list`, 520 `reflist` and 252 `f64list`.
+
+**Mechanism.** A probe that tags each node with the pass that minted it puts all 1,744 in
+`monomorphize`. The ablated witness is
+
+```
+function mk<T>(x: T): T[] { return [x] }
+function t<T>(x: T) {
+  const n = mk(x)
+  for y in n { print(y) }
+}
+t(1)
+```
+
+Each instance of `t` gets its own copy of every direct generic call, so that the per-instance
+rename of `mk` lands on nodes no other instance sees (`monoCloneGenericCalls`, D2854). The copy
+of a list literal recorded its template's type, and a later pin read substitutes it (D2849). The
+copy of a call recorded nothing, so `nodeTyInOf` answered `-1` at `mk(x)`. It also answered `-1`
+at an outer call that was re-made only because its receiver or an argument was copied, as in
+`mk(x).map(…)`. Both ingredients are needed: a generic call, inside a body that is
+instantiated. The same call in a non-generic `t(x: i32)` is not copied, and `[x].map(…)` in a
+generic body copies no call.
+
+`monoCloneGenericCalls` now gives every re-made node its template's type unless the re-make
+recorded one of its own (a cell read or a lambda value call already does). It reads a hole at the
+instance exactly as the list literal did. The checker computed that type for the template, and
+the instance's pins resolve it as they do for every node the instance shares.
+
+**Checks.** The seed is 5,591,453 bytes, +39 over master's fixpoint at 61cbebd14 (5,591,414).
+
+* Over 15,163 files, 10,204 built, 3 differ and 0 are uncompared. The 3 are
+  `captured-cell-written-alias-{of-generic-two-instances,of-seed-generic,two-representations}.vl`,
+  each +145 bytes with unchanged output. Each has `() => { k = al }` in a generic body, where
+  the tail assignment is the closure's value. The checker types the closure as returning the
+  assigned function, and the non-generic twin (`captured-cell-written-alias-non-generic-outer.vl`)
+  already emits it that way. The re-made instance closure recorded no type, so it was emitted
+  as returning nothing. It now carries the template's type and agrees with the twin; the
+  caller drops the value.
+* D4304 closes. In a generic body, a `match` arm called a destructured field `a` that is
+  spelled like the generic function `a`. The instance's copy of that call, with no type, was
+  read by its spelling. It now carries the field call's type, and the witness prints `5 true`.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, `regress.vl` loses no runs (its seven `rv3310_*` `trap_loads`
+  movements are the same on master's seed), `lint-self` raises no budget, and `seed-size --check`
+  passes.
+
+**Counts.** `listRep` notes from the same probe, keyed by node kind and the node's type at its
+instance. Both probe seeds were built on the same base:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| distilled `named/` | untyped `Call`, LEFT-ONLY | 1,744 (78 files) | 0 |
+| distilled `named/` | like-for-like LEFT-ONLY | 2,295 | 551 |
+| `tests/cases` | untyped `Call`, LEFT-ONLY | 1,094 (18 files) | 41 |
+| `tests/cases` | untyped `Index`, LEFT-ONLY | 766 | 751 |
+| `tests/cases` | like-for-like LEFT-ONLY | 2,444 | 1,376 |
+
+No note was added and no other row moved in either population. `tests/cases` has the same
+mechanism: `for-in-generic-call-result-at-pin.vl` 551, `hole-map-tail-value.vl` 158, and the
+15 `Index` notes in `list-literal-around-generic-call-in-generic-body.vl`.
+
+**What is left untyped.** In `named/`, 90 `d3125_*` notes on an `if` expression that mono
+re-makes around two `[...[x]].map(…)` arms. That node is not one `monoCloneGenericCalls` copies.
+In `tests/cases`, 41 `Call` notes (`entry.vl` 30, `numlitunion-alias-under-closure-type.vl` 6,
+`array-filled-elements.vl` 5); 751 `Index` notes minted by `captureBoxRewrite` in four
+`capture-*` files and `union-copy-captured.vl`; and 9 rest or spread `ArrayLit` packs minted by
+the checker.
+
+**Next, in order:** the untyped remainders above, each by its minting pass; then the typed
+remainders of §13.21 (`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.
