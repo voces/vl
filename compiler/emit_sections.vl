@@ -352,6 +352,7 @@ import {
   gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
+  gHelpStrFromBytes,
   gHelpStrHash,
   gHelpSvGet,
   gHelpSvLen,
@@ -381,6 +382,7 @@ import {
   gNeedsF64Print,
   gNeedsF64Rem,
   gNeedsI64Print,
+  gNeedsStrFromBytes,
   gPromoInStart,
   gPromoOk,
   gPromoSlot,
@@ -3366,6 +3368,56 @@ function emitStrBytesFnCode(out: u8[]) {
   helpFrameBody(out, body)
 }
 
+// `__str_from_bytes__(src, at, count) -> (ref str)` — a fresh exact-fit string over the bytes
+// `src[at .. at + count]`, which the caller guarantees are UTF-8. A range outside `src`'s live
+// length traps, so stale capacity past `len` is never read. Params: src(0) `(ref $bl8TypeIdx)`,
+// at(1), count(2). Locals: out(3), a non-null `(ref $sBackIdx)` set before reads.
+function emitStrFromBytesFnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(1)
+  wULEB(1)
+  wU8(100) // 0x64 (ref $sBackIdx) — out
+  wSLEB(sBackIdx)
+  // at < 0 | count < 0 | (at + count) >u src.len — both non-negative, so the sum cannot wrap unsigned.
+  fbLocalGet(1)
+  fbI32Const(0)
+  fbI32Bin(72) // i32.lt_s
+  fbLocalGet(2)
+  fbI32Const(0)
+  fbI32Bin(72) // i32.lt_s
+  fbI32Bin(114) // i32.or
+  fbLocalGet(1)
+  fbLocalGet(2)
+  fbI32Bin(106) // i32.add
+  fbLocalGet(0)
+  fbStructGet(bl8TypeIdx, 1)
+  fbI32Bin(75) // i32.gt_u
+  fbI32Bin(114) // i32.or
+  fbIf(64)
+  fbUnreachable()
+  fbEnd()
+  // out = array.new_default $sBack count; array.copy out 0 src.backing at count
+  fbLocalGet(2)
+  fbArrayNewDefault(sBackIdx)
+  fbLocalSet(3)
+  fbLocalGet(3)
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbStructGet(bl8TypeIdx, 0)
+  fbLocalGet(1)
+  fbLocalGet(2)
+  fbArrayCopy(sBackIdx, ba8TypeIdx)
+  // The whole-backing header over the exact fit.
+  fbLocalGet(3)
+  fbI32Const(0)
+  fbLocalGet(2)
+  fbStrNew()
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // The wrap-trap's reason, streamed through the same base print pair `__trap__("reason")`
 // uses — ONLY when the module already reserves it (`gImports >= 4`), never forced: the
 // self-hosted compiler is `Map`'s heaviest user and must keep zero imports (D2290). With
@@ -5221,6 +5273,7 @@ function emitNameSection(n: i32) {
   count = count + svHelperCount()
   count = count + rvHelperCount()
   if gHelpAsFail >= 0 { count = count + 1 }
+  if gHelpStrFromBytes >= 0 { count = count + 1 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -5373,6 +5426,10 @@ function emitNameSection(n: i32) {
   if gHelpAsFail >= 0 {
     wULEB(gHelpAsFail)
     wName("__as_fail__")
+  }
+  if gHelpStrFromBytes >= 0 {
+    wULEB(gHelpStrFromBytes)
+    wName("__str_from_bytes__")
   }
   wTarget(mapPrev)
 
@@ -5694,6 +5751,12 @@ function emitModule(_stmts: i32[]) {
   gAsFailDoms = []
   if gNeedsAsFail {
     gHelpAsFail = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // `__str_from_bytes__` (D4784), after them.
+  gHelpStrFromBytes = -1
+  if gNeedsStrFromBytes {
+    gHelpStrFromBytes = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
 
@@ -6346,6 +6409,12 @@ function scanPrintUse() {
         if pcallee.identName == "__trap__" {
           if pn.callArgs.length == 1 { gImports = 4 }
         }
+        // `__str_from_bytes__` reserves its helper, and the packed pair and string types it names.
+        if pcallee.identName == "__str_from_bytes__" {
+          gNeedsStrFromBytes = true
+          ba8Used = true
+          aUsed = true
+        }
         // A numeric-opcode intrinsic yields a scalar the annotation scan below cannot see:
         // `f64bits(x)` is an i64 and `f32fromBits(b)` an f32 in a program that may spell neither type
         // anywhere. Read the call's own recorded type, so the print router never routes to an undeclared import.
@@ -6628,6 +6697,7 @@ export function emitProgram(rootIx: i32) {
   // `__f64_rem__` this module's tail never emits. `scanPrintUse` writes it (D1586).
   gNeedsF64Rem = false
   gNeedsAsFail = false
+  gNeedsStrFromBytes = false
   gMapDeletes = false
   // The hole instances' bindings are read by passes that run before `monomorphize` refills
   // them, so an earlier program's rows would name another arena's types (D2921).
@@ -7902,6 +7972,9 @@ function emitTypeSection(
   if gHelpAsFail >= 0 {
     helpFuncType("ii", "") // __as_fail__: (line, col << 3 | domain row) -> ()
   }
+  if gHelpStrFromBytes >= 0 {
+    helpFuncType("yii", "s") // __str_from_bytes__: (u8[], at, count) -> (ref str)
+  }
   // The export-wrapper functypes last (#1265), one per export entry, each the target's own
   // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
   // `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift from the function it forwards to. Empty unless `fnValUsed`.
@@ -8906,6 +8979,12 @@ function buildCodePayload(
     const entry: u8[] = []
     if emitAsFailFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__as_fail__")
+  }
+  if gHelpStrFromBytes >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitStrFromBytesFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_from_bytes__")
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
