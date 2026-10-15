@@ -98,4 +98,5 @@ D4746-D4749  lane-D4720  2026-10-14  closing D4720/D4721 (nullable union and inl
 D4770-D4773  lane-D4743  2026-10-14  closing D4743/D4744/D4745 (unions of one-list members): D4770, D4771 filed open
 D4778-D4781  lane-D4771  2026-10-14  closing D4771 (`is` over a list tests every element): D4778, D4779 filed open
 D4842-D4845  lane-SC  2026-10-15  L1 step 5 (capture cells): D4842 filed open (a hole lambda copied into a capture cell called at a second type); L1 step 6: D4842 closed, D4843 filed open (a hole lambda called through a capture cell, then written back into it directly)
+D4846-D4849  lane-SC  2026-10-15  L1 step 7 (a generic delivered at the enclosing generic's type parameters): none filed
 D4850-D4853  lane-L2  2026-10-15  L2 §13.27 (hole lists): none filed
