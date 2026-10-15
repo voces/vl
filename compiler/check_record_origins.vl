@@ -1,0 +1,291 @@
+// Where a record value comes from and where it lands, by syntax: the argument a generic call
+// hands straight back, the parameter an argument pins (un-annotated, or of a generic), the
+// declaration a read names past a loop's shadowing binder, and the joins, coalesce operands and
+// index bases a value's tail passes through. The checker's record adoption and widening walks
+// ask these; nothing here reads a type or the checker's tables.
+// This module imports `./ast`, `./check_scopes`, `./check_write_scan` and `./listutil`.
+import {
+  BinExpr,
+  Block,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  LetDecl,
+  MatchExpr,
+  Node,
+  P,
+  Param,
+  TypeRef,
+} from "./ast"
+import { recFnDeclByName } from "./check_scopes"
+import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_ASG_RHS,
+  CW_UP_ELEM,
+  CW_UP_FIELD,
+  CW_UP_LETINIT,
+  CW_UP_SPREAD,
+  covarRootFrame,
+  cwIxBuild,
+  cwIxFrHead,
+  cwIxFrNext,
+  cwIxKind,
+  cwIxNode,
+  cwIxPNext,
+  cwIxParent,
+  cwIxUnkHead,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwPeelValue,
+} from "./check_write_scan"
+import { strListHas } from "./listutil"
+
+// The argument a call hands straight back: a generic function whose declared result is a bare
+// type parameter `T` that exactly one parameter is declared as. -1 for any other call.
+export function recPassThroughArg(x: i32): i32 {
+  const c = P.nodes[x]
+  if c is Call {
+    const cn = P.nodes[c.callFn]
+    if cn is Ident {
+      const fd = recFnDeclByName(cn.identName)
+      if fd < 0 { return -1 }
+      const f = P.nodes[fd]
+      if f is FuncDecl {
+        if f.fnTyParams.length == 0 || f.fnRet < 0 { return -1 }
+        const rt = P.nodes[f.fnRet]
+        if rt is TypeRef {
+          if !strListHas(f.fnTyParams, rt.tyName) { return -1 }
+          let at = -1
+          let i = 0
+          while i < f.fnParams.length {
+            const pn = P.nodes[f.fnParams[i]]
+            if pn is Param {
+              if pn.parType >= 0 {
+                const pt = P.nodes[pn.parType]
+                if pt is TypeRef {
+                  if pt.tyName == rt.tyName {
+                    if at >= 0 { return -1 }
+                    at = i
+                  }
+                }
+              }
+            }
+            i = i + 1
+          }
+          if at >= 0 && at < c.callArgs.length { return c.callArgs[at] }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The `let`/`const` declaration of `name` the read `x` resolves to in its frame: the latest one
+// declared before it, else the first after it (a function reading a later global). -1 for none.
+export function recBindDeclOf(x: i32, name: string): i32 {
+  cwIxBuild()
+  const fr = covarRootFrame(x)
+  let before = -1
+  let after = -1
+  let ixA = cwIxFrHead(name, fr)
+  let ixU = cwIxUnkHead(name, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    if cwIxKind[r] == CW_OCC_BIND {
+      const b = cwIxNode[r]
+      if b < x {
+        if b > before { before = b }
+      } else if after < 0 || b < after {
+        after = b
+      }
+    }
+  }
+  let d = before
+  if d < 0 { d = after }
+  if d < 0 || !(P.nodes[d] is LetDecl) { return -1 }
+  if recLoopShadows(x, name, d) { return -1 }
+  d
+}
+
+// Does a `for` loop binding `name` enclose the read `x` without enclosing the declaration `d`?
+// Its binder is not in the occurrence index, and it shadows `d` inside the loop.
+function recLoopShadows(x: i32, name: string, d: i32): boolean {
+  let at = x
+  let steps = 0
+  while at >= 0 && at < cwIxParent.length && steps < 256 {
+    const n = P.nodes[at]
+    if recLoopBinds(n, name) { return !recEncloses(at, d) }
+    at = cwIxParent[at]
+    steps = steps + 1
+  }
+  false
+}
+
+// Does the node `n` bind `name` as a `for` loop's variable?
+function recLoopBinds(n: Node, name: string): boolean {
+  recForInBinds(n, name) || recForRangeBinds(n, name)
+}
+
+// Does `n` bind `name` as a `for … in` loop's variable?
+function recForInBinds(n: Node, name: string): boolean {
+  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
+  false
+}
+
+// Does `n` bind `name` as a range loop's variable?
+function recForRangeBinds(n: Node, name: string): boolean {
+  if n is ForRange { return n.frVar == name }
+  false
+}
+
+// Is `outer` an ancestor of `inner`?
+function recEncloses(outer: i32, inner: i32): boolean {
+  let at = inner
+  let steps = 0
+  while at >= 0 && at < cwIxParent.length && steps < 256 {
+    if at == outer { return true }
+    at = cwIxParent[at]
+    steps = steps + 1
+  }
+  false
+}
+
+// Is `u` an argument to a parameter that takes its type from the argument: an un-annotated one,
+// or one of a generic function? Such a parameter is specialised at the value's own row.
+export function recOwnIsPin(u: i32): boolean {
+  if u < 0 || u >= cwIxUp.length || cwIxUpKind[u] != CW_UP_ARG { return false }
+  const cn = P.nodes[cwIxUp[u]]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return true }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl {
+        if fn.fnTyParams.length > 0 { return true }
+        return recNumParamAt(cwIxUp[u], cwIxUpAux[u]) >= 0
+      }
+    }
+  }
+  false
+}
+
+// The un-annotated parameter at position `pos` of the function the call `c` names, or -1.
+function recNumParamAt(c: i32, pos: i32): i32 {
+  const cn = P.nodes[c]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return -1 }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl {
+        if pos < 0 || pos >= fn.fnParams.length { return -1 }
+        const pn = P.nodes[fn.fnParams[pos]]
+        if pn is Param {
+          if pn.parType < 0 { return fn.fnParams[pos] }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// How a refusal names the kept declaration `d`.
+export function recKeptWhat(d: i32): string {
+  const n = P.nodes[d]
+  if n is LetDecl { return "`" + n.letName + "`, which holds only literals," }
+  "this value"
+}
+
+// The container an element read `x` reads from, or -1 when `x` is no element read.
+export function recIndexBase(x: i32): i32 {
+  const n = P.nodes[x]
+  if n is Index { return n.idxArr }
+  -1
+}
+
+// The two operands of `x` when it is a `??`, else none.
+export function recCoalesceOperands(x: i32): i32[] {
+  const n = P.nodes[x]
+  if n is BinExpr {
+    if n.binOp == "??" { return [n.binLeft, n.binRight] }
+  }
+  []
+}
+
+// Is the returned value `lf` a binding that is also handed to another place (an argument, a
+// store, a list or object literal, another binding), so another handle shares it?
+export function recLeafEscapes(lf: i32): boolean {
+  const p = cwPeelValue(lf)
+  if p < 0 || p >= P.nodes.length { return false }
+  const e = P.nodes[p]
+  if e is Ident {
+    const fr = covarRootFrame(p)
+    let r = cwIxFrHead(e.identName, fr)
+    while r >= 0 {
+      const u = cwIxNode[r]
+      if cwIxKind[r] == CW_OCC_USE && u != p && u < cwIxUpKind.length {
+        const k = cwIxUpKind[u]
+        if (
+          k == CW_UP_ARG
+          || k == CW_UP_ASG_RHS
+          || k == CW_UP_ELEM
+          || k == CW_UP_FIELD
+          || k == CW_UP_LETINIT
+          || k == CW_UP_SPREAD
+        ) {
+          return true
+        }
+      }
+      r = cwIxFrNext(r, fr)
+    }
+  }
+  false
+}
+
+// Is `x` a value `if`, `match` or block?
+export function recIsJoin(x: i32): boolean {
+  const n = P.nodes[x]
+  n is IfStmt || n is MatchExpr || n is Block
+}
+
+// Is `at` an argument of a generic function or a method, whose parameter the call pins?
+export function recAtPinnedArg(at: i32): boolean {
+  cwIxBuild()
+  if at < 0 || at >= cwIxUp.length || cwIxUpKind[at] != CW_UP_ARG {
+    return false
+  }
+  const cn = P.nodes[cwIxUp[at]]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return true }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl { return fn.fnTyParams.length > 0 }
+    }
+    return true
+  }
+  false
+}
+
+// The initializer of the declaration `d`, or -1.
+export function recDeclInit(d: i32): i32 {
+  const n = P.nodes[d]
+  if n is LetDecl { return n.letInit }
+  -1
+}
