@@ -27,15 +27,17 @@ cat compiler/ast.vl compiler/parser.vl compiler/lint.vl scripts/lint-harness.vl 
 # line carrying `from "`, then blank the whole span.
 sed -i -E '/^import \{/{:a;/from "/!{N;ba};s/.*//}' "$WORK/asm.vl"
 
-# Splice the target source in as a VL string literal (Python does the escaping
-# so embedded backslashes/quotes/newlines survive intact).
-python3 - "$TARGET" "$WORK/asm.vl" <<'PY'
-import sys
-target, asm = sys.argv[1], sys.argv[2]
-src = open(target, "r").read()
-lit = '"' + src.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
-text = open(asm, "r").read().replace("LINT_SOURCE", lit)
-open(asm, "w").write(text)
-PY
+# Splice the target source in as a VL string literal. The harness ends with the one call
+# `runLint(LINT_SOURCE)`; that line is replaced by a call carrying the source with `\`, `"`
+# and newlines escaped, so embedded backslashes/quotes/newlines survive intact. `sed -z`
+# reads the file as one record, so a file with no final newline gets no `\n` added.
+CALL='runLint(LINT_SOURCE)'
+grep -qxF "$CALL" "$WORK/asm.vl" || { echo "run-lint-diff: harness has no '$CALL' line" >&2; exit 1; }
+sed -i -e "/^runLint(LINT_SOURCE)\$/d" "$WORK/asm.vl"
+{
+  printf 'runLint("'
+  sed -z -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\n/\\n/g' "$TARGET"
+  printf '")\n'
+} >> "$WORK/asm.vl"
 
 "$VL" run "$WORK/asm.vl" --compiler "$SEED"

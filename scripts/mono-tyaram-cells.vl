@@ -1,0 +1,198 @@
+// The cell generator behind scripts/mono-tyaram-grid.sh: every constructor a generic
+// type parameter can sit behind, crossed with three representations and three delivery
+// positions (return, local, parameter), one `.vl` file per cell.
+//
+//     vl run scripts/mono-tyaram-cells.vl -- <outdir>
+//
+// A new hole found by hand is added to `CTORS` so the next run covers it. Prints
+// `generated N cells`; the shell wrapper sends that line to stderr.
+
+import { writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { exit } from "std:process"
+
+import { replaceAll } from "std:str"
+
+// pre: declarations before the function; ann: the annotation over T; build: the value
+// with `%V%` standing for the element; red: how the call site reduces the result to a
+// printable number.
+type Ctor = {
+  name: string,
+  pre: string,
+  ann: string,
+  build: string,
+  red: string,
+}
+
+function ctor(
+  name: string,
+  pre: string,
+  ann: string,
+  build: string,
+  red: string,
+): Ctor {
+  { name: name, pre: pre, ann: ann, build: build, red: red }
+}
+
+const REP_NAMES = ["i32", "string", "f64"]
+const REP_LITS = ["1", "\"a\"", "1.5"]
+
+const CTORS = [
+  ctor("bare", "", "T", "%V%", "1"),
+  ctor("arr", "", "T[]", "[%V%]", "r.length"),
+  ctor("arr2", "", "T[][]", "[[%V%]]", "r.length"),
+  ctor("shape", "", "{ a: T }", "{ a: %V% }", "1"),
+  ctor("inlarr", "", "{ g: T[] }", "{ g: [%V%] }", "r.g.length"),
+  ctor(
+    "inlparen",
+    "",
+    "{ g: (T | null)[] }",
+    "{ g: [%V%] }",
+    "r.g.length",
+  ),
+  ctor("nul", "", "T | null", "%V%", "1"),
+  ctor("fn", "", "(T) => T", "(x: T) => x", "1"),
+  ctor(
+    "ga",
+    "type BoxS<X> = { v: X }\n",
+    "BoxS<T>",
+    "{ v: %V% }",
+    "1",
+  ),
+  ctor(
+    "gaarr",
+    "type BoxA<X> = { v: X[] }\n",
+    "BoxA<T>",
+    "{ v: [%V%] }",
+    "r.v.length",
+  ),
+  ctor(
+    "gaargarr",
+    "type BoxG<X> = { v: X }\n",
+    "BoxG<T[]>",
+    "{ v: [%V%] }",
+    "r.v.length",
+  ),
+  ctor(
+    "gapnul",
+    "type BoxN<X> = { v: X | null }\n",
+    "BoxN<T>",
+    "{ v: %V% }",
+    "1",
+  ),
+  ctor(
+    "twoparam",
+    "type Pr<A, B> = { a: A, b: B }\n",
+    "Pr<T, i32>",
+    "{ a: %V%, b: 1 }",
+    "1",
+  ),
+  ctor(
+    "appofapp",
+    "type C<X> = { v: X }\n",
+    "C<C<T>>",
+    "{ v: { v: %V% } }",
+    "1",
+  ),
+  ctor(
+    "apparr",
+    "type C<X> = { v: X }\n",
+    "C<T>[]",
+    "[{ v: %V% }]",
+    "r.length",
+  ),
+  ctor(
+    "arrapp",
+    "type CA<X> = { v: X[] }\n",
+    "CA<T>",
+    "{ v: [%V%] }",
+    "r.v.length",
+  ),
+  ctor("mapval", "", "{[string]: T}", "Map()", "1"),
+  ctor("unionpar", "", "T | i32", "%V%", "1"),
+  ctor(
+    "nulapp",
+    "type CN<X> = { v: X }\n",
+    "CN<T> | null",
+    "{ v: %V% }",
+    "1",
+  ),
+  ctor("fnret", "", "() => T", "() => %V%", "1"),
+  ctor("arrfn", "", "((T) => T)[]", "[(x: T) => x]", "r.length"),
+  ctor("shapefn", "", "{ f: (T) => T }", "{ f: (x: T) => x }", "1"),
+  ctor(
+    "deepshape",
+    "",
+    "{ a: { b: { c: T } } }",
+    "{ a: { b: { c: %V% } } }",
+    "1",
+  ),
+  ctor(
+    "arrnulapp",
+    "type CX<X> = { v: X }\n",
+    "(CX<T> | null)[]",
+    "[{ v: %V% }]",
+    "r.length",
+  ),
+  ctor("maparr", "", "{[string]: T}[]", "[Map()]", "r.length"),
+  ctor("arrmap", "", "{[string]: T[]}", "Map()", "1"),
+  ctor("mapmap", "", "{[string]: {[string]: T}}", "Map()", "1"),
+  ctor("arr2un", "", "(T | null)[][]", "[[%V%]]", "r.length"),
+  ctor(
+    "mapapp",
+    "type CM<X> = { v: X }\n",
+    "{[string]: CM<T>}",
+    "Map()",
+    "1",
+  ),
+]
+
+function put(path: string, text: string) {
+  const w = writeTextFile(path, text)
+  if w != null {
+    print("mono-tyaram-cells: cannot write \{path} (\{w.msg})")
+    exit(1)
+  }
+}
+
+function main(dir: string) {
+  let n = 0
+  let r = 0
+  while r < REP_NAMES.length {
+    const rname = REP_NAMES[r]
+    const lit = REP_LITS[r]
+    for c in CTORS {
+      // Inside the generic the parameter is `v`; at the call site it is a literal.
+      const bv = replaceAll(c.build, "%V%", "v")
+      const bl = replaceAll(c.build, "%V%", lit)
+      const stem = "\{c.name}_\{rname}"
+      put(
+        "\{dir}/ret_\{stem}.vl",
+        "\{c.pre}function f<T>(v: T): \{c.ann} {\n  \{bv}\n}\n\nconst r = f(\{lit})\nprint(\{c.red})\n",
+      )
+      put(
+        "\{dir}/loc_\{stem}.vl",
+        "\{c.pre}function f<T>(v: T): i32 {\n  const r: \{c.ann} = \{bv}\n  1\n}\n\nprint(f(\{lit}))\n",
+      )
+      put(
+        "\{dir}/par_\{stem}.vl",
+        "\{c.pre}function f<T>(v: \{c.ann}): i32 {\n  1\n}\n\nprint(f(\{bl}))\n",
+      )
+      n = n + 3
+    }
+    r = r + 1
+  }
+  print("generated \{n} cells")
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  print("mono-tyaram-cells: an argument is not UTF-8: " + argv.msg)
+  exit(2)
+} else if argv.length != 1 {
+  print("usage: vl run scripts/mono-tyaram-cells.vl -- <outdir>")
+  exit(2)
+} else {
+  main(argv[0])
+}
