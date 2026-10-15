@@ -3219,3 +3219,95 @@ the checker.
 
 **Next, in order:** the untyped remainders above, each by its minting pass; then the typed
 remainders of §13.21 (`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.
+
+### 13.24 Three nodes minted untyped record their type: a re-made `if` link, a rest pack, a re-made call
+
+This step takes the untyped remainders §13.22 named, each by the pass that minted it. The
+counts are from the same probe, which tags each node with its minting pass and, for a
+monomorphizer node, its minting site.
+
+**Mono `if` (92 notes: 90 in `named/`, 2 in `tests/cases`).** Every one is minted in
+`monoIfChainRebuildPinned`. When a link's parts changed and the link did not need retyping, the
+pass re-made it with `mkIf` and recorded no type. Its unpinned twin, `monoIfChainRebuild`,
+already records the original link's type. The witness is
+
+```
+function pick<T>(c: boolean, t: T): i32 { const q = if c { [t] } else { ["z", "y"] }; q.length }
+print(pick(true, "s"))
+```
+
+Both arms `[t]` do not reproduce, because neither arm is then re-made. The re-made link now
+records the template's join, which the pin reads, as the twin does.
+
+**Checker rest pack (98 `ArrayLit` notes in 8 `tests/cases` files).** `restCallPack` mints a
+list literal for a rest call's trailing arguments during the check. `checkNodeDone` records a
+type only for a node below `nodeTyIx.length`, which is sized to the arena when the check starts,
+so the pack's type was dropped. The pack now grows `nodeTyIx` before it is checked, as
+`lbiCopyLit` does for its copy. The witness is `function sum(...xs: i32[]) { return xs.length }`
+called as `sum(1, 2)`.
+
+This one changes code, and it closes [D4830](inventory/D4830.md). In a generic body, a pack
+inferred as `(i32 | boolean)[]` had no type, so the list classifier fell back to the element
+spine and packed an `i32` list. The concrete spelling `...xs: (i32 | boolean)[]` and the list
+face `f([3, true])` both box it. `each(3, true)` printed `3` and `1`, and a `T` return was a loud
+emit reject (`narrowed union atom has no value box`). The pack is now the boxed list, and both
+run.
+
+**Mono `Call` (41 notes in 3 `tests/cases` files).** Four passes re-make a call when its parts
+changed and record nothing: `monoPinMapLambdas` (both arms), `monoBakeCallback`,
+`monoPinBinOps` and `monoFoldTyParamLayout`. Two of them minted all 41. `monoBakeCallback`
+minted the 11 in `array-filled-elements.vl` (5) and `numlitunion-alias-under-closure-type.vl`
+(6). `monoPinBinOps` minted the 30 in `entry.vl` of `generic-ufcs-imported-self-fn`: 5 are a
+re-made call, and 25 are the UFCS dispatch it makes when it rewrites `x.f(…)` to `f(x, …)`. Each of these passes rewrites only
+the call's parts, so the copy answers its template's type. They now make it through
+`monoRemintCallTpl`, which carries the type recorded on the template, and the UFCS call carries
+it too. `monoCloneGenericCalls` and `monoExprMake` keep `monoRemintCall`, because they record
+their own type.
+
+**Checks.** The seed is 5,593,516 bytes, +218 over master's fixpoint at `cad7f9a6a`
+(5,593,298).
+
+* Over 15,167 files, 10,208 built, 3 differ and 0 are uncompared. The run compared against the
+  master at `a3c78c3fe`, one commit ahead of the base. Two of the three,
+  `hole-lambda-pushed-into-typed-list.vl` and `binding-of-generic-function-delivered-as-value.vl`,
+  build the same module under the base seed and the candidate, so #3806 moved them. The third
+  is `rest-element-hole-joins.vl`, +7 bytes with unchanged output. Its `f(1, true)` pack is now
+  the boxed list, as D4830 describes.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact. `regress.vl` loses no runs, and its seven `rv3310_*` `trap_loads`
+  movements are the ones §13.22 recorded on master's seed. `lint-self` raises no budget, and
+  `seed-size --check` passes.
+* `check-filed-witnesses --strict` moved four open rows to `runs`, each printing its `Want`, and
+  they close. A candidate without the `Call` carry still refuses D3209 and D3548 and runs D3297
+  and D4306, so the re-made call closes the first two and the re-made `if` link the other two.
+  * D3209: a lambda argument's `f()` widened at a `string | null` return.
+  * D3548: an `__array_new__` fill `f(xs[0])` through a function parameter.
+  * D3297: a tail `if` assigning a capturing lambda in both arms.
+  * D4306: a closure whose tail `if` writes a capture cell in both arms.
+
+  Their pins are `remade-callback-call-records-type.vl` and `remade-if-link-records-type.vl`.
+  D4830 and D1856 grade as filed.
+
+**Counts.** `listRep` notes from the probe, keyed by node kind and the node's type at its
+instance. Both probe seeds were built on the same base, without §13.23:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | untyped `ArrayLit` (checker), LEFT-ONLY | 98 | 0 |
+| `tests/cases` | untyped `Call` (monomorphize), LEFT-ONLY | 41 | 0 |
+| `tests/cases` | untyped `IfStmt` (monomorphize), LEFT-ONLY | 2 | 0 |
+| `tests/cases` | like-for-like LEFT-ONLY | 1,376 | 1,235 |
+| distilled `named/` | untyped `IfStmt` (monomorphize), LEFT-ONLY | 90 | 0 |
+| distilled `named/` | like-for-like LEFT-ONLY | 551 | 461 |
+
+No file gained a `listRep` note. Two other rows moved. In `named/`, 6 `IfStmt` notes in each of
+five `d3125_hole_*` files now carry a type with a hole, so they move to the `open` family. In
+`tests/cases`, 16 `scope` notes go away (`generic-body-list-union-read-ops.vl` 24 → 10,
+`join-gated-list-and-lambda.vl` 7 → 5). With §13.23's 751 `Index` notes also gone, `tests/cases`
+like-for-like LEFT-ONLY is 484.
+
+**What is left untyped.** In `tests/cases`, one `BinExpr.right` note; in `named/`, 24
+`ArrayLit` notes the monomorphizer mints in `d511_{coal,xor}_nest_arrlit_typar.vl`.
+
+**Next, in order:** the `d511_*` `ArrayLit`; then the typed remainders of §13.21
+(`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.
