@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, fifth part retires `monoPinGenericRecord` (a record field pinned at the table's per-field signature, D4700). Next: the step-4 container retirements; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
+| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, sixth part retires `monoPinGenericList` (a list element pinned at the table's `e` signature, D4301). Next: the remaining step-4 retirements (`monoNotePushDeliveries`, `monoStoreAnnName`, the literal arms of `monoCoerceFnValueName`); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a nullable literal-union list element reads the column (campaign §13.18). Next: a type at the 688 `Ident` nodes that have none, then `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: `tests/vl_errno_agreement_test.ts` (#3732) holds the errno numbering in agreement. Next: the import table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: `compiler/check_capture_walks.vl`, the syntax-only closure-capture walks. Next: another callee-closed carve of `typecheck.vl`. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: `compiler/check_write_scan.vl`, the syntax half of the covariant write scan. Next: another callee-closed carve of `typecheck.vl`. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -213,6 +213,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The container retirements of step 4 are still open: each listed item loses runs when ablated alone, because the pins also decide writes and pushes.
 - The other name lists stay name-keyed until a witness reaches them.
 - The fifth part retires `monoPinGenericRecord` (with `monoRecordFieldUses` and `monoMemberOfBinding`): a record field and its writes are pinned at the table's per-field signature, closing D4700.
+- The sixth part retires `monoPinGenericList` (with `monoFeIsSrc`, `monoCallsPerRead`, `monoPinSigWithRet`, `monoListElemWrites`, `monoListElemCalls`): a list element and its writes, `d[0] = v` included, are pinned at the table's `e` signature, and a spread copy re-plans the list it expanded into; closes D4301.
 
 ### L2 log
 
@@ -330,6 +331,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The `crValUse*` walk stays: `crValUseEnter` reads the arena epoch and edit log, the getter and operator tables and the program root.
 - The seed is 535 bytes smaller and differs in function order, and output identity holds.
 - The syntax-only closure-capture walks are `compiler/check_capture_walks.vl`: the writer analysis of a root (`crwEnsure`, `crwVisit`, `crs*`), the by-reference capture walk (`crCaptureByRef`, `crbrWalk`), the nulled-name walk (`crNulledWalk`) and the escape and mention walkers, 74 declarations in 696 lines that import `./ast`, `./check_narrow_ends` and `./check_places`, with 33 names crossing into the checker; none of it reads the type arena or the scope chain. It was found by a reference graph over the file: the closure of the `crw`, `crbr`, `crs`, `crNulled` and `crBy` families, widened by every `cr` function whose callees all lay inside it. The seed is 3 bytes larger (5,559,561 to 5,559,564) and differs in function order; `difftree.sh --identity` reads `15156 files · 10196 built · 0 differ · 0 uncompared` with the fixpoint holding, and `regress.vl` reads `no cell changed class`.
+- The syntax half of the covariant write scan is `compiler/check_write_scan.vl`: the frame table (which binding a name means), the occurrence index (`cwIx*`), callee, parameter and receiver resolution, and the escape, seal and claim walks, with `fnDeclIx`, `fnDeclParamsOf` and `declFirstParamIsSelf` moved alongside. It is 177 declarations in 2,053 lines that import `./ast`, `./symbols`, `./listutil` and `./check_suggest`, with 107 names crossing into the checker (2 of them also into `wasmEmit.vl`, 1 into `check_pins.vl`); none of it reads the type arena, the scope chain or `tErr`. It was found by a reference graph over the file as the closure of the `cw` family; the `cw` and `rcw` functions that read types stay. Seven exported void helpers now return an `i32` their callers drop (D2631), so the seed is 26 bytes larger (5,561,857 to 5,561,883) and otherwise differs in function order; `difftree.sh --identity` reads `15159 files · 10200 built · 0 differ · 0 uncompared` with the fixpoint holding, and `regress.vl` reads `no cell changed class`. Two ratchets rose because the lints read one module at a time: 13 `fnDeclIx[…]` subscripts are no longer known to be map reads (sentinel-index), and one ladder that delegates to `cwPeel` gained a finding (kind-ladder).
 
 ### SMALL log
 

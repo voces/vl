@@ -95,3 +95,4 @@ D4190-D4195  lane-CK  2026-10-12  D1832 ruling (a): D4190, D4191 typed-destinati
 D4199-D4205  lane-CK  2026-10-12  review of #3577: mixed-literal-union element rep, narrowed-arm writes, index-place compares
 D4300-D4319  lane-SC  2026-10-13  function-value flow table (§(f) step 1) disagreements on silent review witnesses: D4300-D4304 filed open
 D4746-D4749  lane-D4720  2026-10-14  closing D4720/D4721 (nullable union and inline-record list literals): none filed
+D4770-D4773  lane-D4743  2026-10-14  closing D4743/D4744/D4745 (unions of one-list members): D4770, D4771 filed open
