@@ -1,0 +1,753 @@
+// `check_ret_names.vl` — the rep names an inferred return type is given.
+// Each producer answers one shape of inferred return (a struct-field box, a value union, a
+// nullable or literal-union element list, a map union, ...) with the name the emitter reads,
+// or "" when the shape is not its own. The producer that answers records its own rung
+// (`inferRetNameRung`, banked per function in `inferRetRung`) and the name's top-level atom
+// count (`inferRetNameAtoms`); the `inferRetRungIs*` queries read the banked rung back.
+// The producers read only the arena; `irReset` clears the state per program.
+
+import {
+  isValueUnionName,
+  litScalarBoxLeaves,
+  litUnionArrayElemOf,
+  nameIsLitUnionArmValueUnion,
+  retAtomsCheap,
+  tyIsValueUnion,
+} from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  litUnionAliasNameOfTy,
+  primNameStr,
+  tyArrayElemIx,
+  tyHasLitLeaf,
+  tyIsEmitRepresentable,
+  tyIsLitUnion,
+  tyIsPrimNamed,
+  tyNameAtoms,
+  tyObjHasMapField,
+  tyPrimNameOf,
+  tyToEmitName,
+  tyToStructStr,
+  tyUnionHasLitUnionArrayMember,
+} from "./check_types"
+
+// The top-level atom count of the name the last inferred-return name producer returned — the
+// number `unionMemberCount` would report for it, produced by the producer that joined it. Every
+// producer writes it immediately before each non-empty return (`irAtoms` / `irRendered` do both
+// in one expression), so the last rung to answer non-empty owns the recorded name and width.
+export let inferRetNameAtoms = 1
+
+// ── the rung column ──────────────────────────────────────────────────────────
+
+// Which producer answered for a recorded inferred-return row. The cascade is a run of
+// short-circuiting producers and the one that answers non-empty is the decision, so the producer
+// records it rather than every consumer re-deriving it from the name. The fall-through is not a
+// producer and takes `IR_RUNG_NONE`; its three admitted shapes carry their own `IR_REC_*` codes.
+export const IR_RUNG_NONE = 0 // the `recordable` fall-through — determines nothing
+export const IR_RUNG_SFB = 28 // `structFieldBoxRetName`, the cascade's initializer
+
+// Rungs 1..27 are the `if unm == ""` producers in source order; 28 and 29 are out of band — 28 is
+// the cascade's initializer, not an `if unm == ""` rung at all, and 29 is a second leg of rung 8's
+// producer. A new cascade producer takes the next in-band number by renaming, never by
+// renumbering: the predicate below is a positional claim about which rungs 6 and 7 are.
+export const IR_RUNG_STRUCT_MAP_FIELD = 1
+export const IR_RUNG_STRUCT_PLAIN = 2
+export const IR_RUNG_VALUE_UNION = 3
+export const IR_RUNG_LITUNION_ARR_VU = 4
+export const IR_RUNG_STRUCT_UNION = 5
+export const IR_RUNG_NULLABLE = 6
+export const IR_RUNG_NUL_LITUNION = 7
+const IR_RUNG_NUL_ELEM_LIST = 8
+
+// `nulElemListRetName` is two producers in one body, and this is the second. Its numeric leg
+// (`(f64|null)[]` and friends) renders a value-union box claimed by `synthRetAnnots`' arm 4; its
+// niche legs (`(boolean|null)[]`, `(string|null)[]`, `(K|null)[]`) render shapes that arm's
+// predicate rejects, so they reach no arm and stay unpinned. The split lets each leg say which.
+const IR_RUNG_NUL_ELEM_LIST_NICHE = 29
+
+// D1062 — `nulListRetName`, out of band (30) because it is not a cascade position at all: it is
+// reached only by the named-function loop (`elaborateInferRets`), never by the lambda cascade, so
+// an in-band number would assert a position it does not occupy. The named loop asks it after
+// `nullableRetName` declines, and the two never both answer, one claiming the i32-backed inners.
+export const IR_RUNG_NUL_LIST_RET = 30
+export const IR_RUNG_NUL_STRUCT_ELEM_LIST = 9
+export const IR_RUNG_NUL_MAP_ELEM_LIST = 10
+export const IR_RUNG_NUL_LIST_ELEM_LIST = 11
+export const IR_RUNG_ELEM_VU_LIST = 12
+export const IR_RUNG_ELEM_VARIANT_BOX_LIST = 13
+export const IR_RUNG_ELEM_MAP_UNION_LIST = 14
+export const IR_RUNG_ELEM_REFARM_VU_LIST = 15
+export const IR_RUNG_NESTED_ELEM_UNION_LIST = 16
+export const IR_RUNG_STRUCT_FIELD_BOX_ELEM_LIST = 17
+export const IR_RUNG_STRUCT_ELEM_LIST = 18
+export const IR_RUNG_NUL_CLOSURE_ELEM_LIST = 19
+export const IR_RUNG_CLO_ARM_VU = 20
+export const IR_RUNG_MAP_UNION = 21
+export const IR_RUNG_REFARM_UNION = 22
+export const IR_RUNG_VARIANT_BOX = 23
+export const IR_RUNG_NESTED_LEAF_LIST = 24
+export const IR_RUNG_MAP_ELEM_LIST = 25
+export const IR_RUNG_LITUNION_ELEM_LIST = 26
+export const IR_RUNG_LITUNION_ALIAS = 27
+
+// ── the fall-through's three gates ───────────────────────────────────────────
+
+// Not producers, which is why they are not rungs: `recordable` admits three unrelated shapes
+// through one `||`, and these name which gate admitted the row. The three admitted sets are
+// pairwise disjoint on every input, so the `||` order is not load-bearing — widen a gate and
+// disjointness has to be re-argued rather than assumed.
+export const IR_REC_CLASSIFIABLE = 40 // `isClassifiableRetName` — NOT "scalar": it admits `i32[]`/`string[]` too
+export const IR_REC_OBJ_SHAPE = 41 // `isObjShapeName`
+export const IR_REC_SCALAR_LIST = 42 // `isScalarListRetName`
+
+// D1567 — the `null` type, which is not a nullable of anything: a function whose every returned
+// value is a bare `null` types `TyPrim:null`, so no other producer here answers.
+export const IR_REC_NULL_ONLY = 43
+// The named-function loop is a second cascade over the same producers and banks the same codes:
+// a rung identifies the producer, not the cascade it is reached through. Left unbanked, every
+// named row reads `IR_RUNG_NONE` — "no producer answered" where one plainly did — which is
+// unobservable while `synthRetAnnots` keys named rows by function name, and a trap once it does not.
+
+export let inferRetNameRung = IR_RUNG_NONE
+
+// `let`, not `const` — it is reset per program beside the other `inferRet*` columns. As a `const`
+// it survives `initChecker`, so row indices from an earlier program shift every lookup, which
+// shows only where one compiler instance compiles many programs.
+export let inferRetRung: i32[] = []
+
+// Record the rung that answered. Applied to the result so the cascade stays short-circuiting —
+// the producers have side effects (several register unions) and must not be called eagerly.
+export function irRung(rung: i32, nm: string): string {
+  if nm != "" { inferRetNameRung = rung }
+  nm
+}
+
+// `irAtoms` for a producer that reports its own rung — used where one function body is really two
+// producers and the cascade's single `irRung` wrap cannot tell them apart. The cascade must not
+// also wrap such a producer, or its code would overwrite the leg's.
+function irAtomsRung(nm: string, atoms: i32, rung: i32): string {
+  inferRetNameAtoms = atoms
+  inferRetNameRung = rung
+  nm
+}
+
+export function irAtoms(nm: string, atoms: i32): string {
+  inferRetNameAtoms = atoms
+  return nm
+}
+
+// `irAtoms` for a name that is a `tyToEmitName` render: adopt the renderer's own reported width
+// (`tyNameAtoms`). Written as a call so the render is evaluated before `tyNameAtoms` is read,
+// with no dependence on argument evaluation order.
+export function irRendered(nm: string): string {
+  inferRetNameAtoms = tyNameAtoms
+  return nm
+}
+
+// Flattens a (possibly nested) union/nullable type into its leaf atom names, pushing each
+// into `out` ("null" for the nullable slot). `joinTys` can nest a nullable around a union, so
+// this recurses. Builds the emitter-format `a|b|null` union name for an inferred return
+// (`splitUnionAtoms` splits on a bare `|`, not `tyToStr`'s ` | `).
+function collectRetAtoms(er: i32, out: string[]) {
+  if er < 0 { return 0 }
+  const t = T.tys[er]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      collectRetAtoms(t.uMembers[i], out)
+      i = i + 1
+    }
+  } else if t is TyNullable {
+    collectRetAtoms(t.nInner, out)
+    out.push("null")
+  } else {
+    out.push(tyToStructStr(er))
+  }
+  0
+}
+
+// The canonical emitter name for an inferred return `er` if it is a bare struct whose every
+// field is emit-nameable and at least one field is a union or nullable (a boxed/niche field
+// slot), else "". A closure-result body literal self-infers the plain field shape, so
+// `synthRetAnnots` pins `fnRet` to this canonical name, matching the annotated form (the struct-field dual of `valueUnionRetName`/`mapUnionRetName`).
+export function structFieldBoxRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyObj) { return "" }
+  let hasBox = false
+  let i = 0
+  while i < t.objFieldTypes.length {
+    const ft = T.tys[t.objFieldTypes[i]]
+    if ft is TyUnion {
+      // Every member must be a scalar / string-literal / object (a boxable value or
+      // struct-mixed union). A closure / map / list / nullable member is not lowerable as a
+      // boxed struct-field slot — the annotated form itself rejects those, so pinning would
+      // turn a working shape into a new loud reject. Declines the whole struct then.
+      let m = 0
+      let uClo = 0
+      let uObj = 0
+      while m < ft.uMembers.length {
+        const mt = T.tys[ft.uMembers[m]]
+        if mt is TyObj { uObj = uObj + 1 }
+        if !(mt is TyPrim) && !(mt is TyLit) && !(mt is TyObj) {
+          // A litunion-alias member kept nested in the arena (`K0 | boolean`): rides the box
+          // as the i32 atom / string ref, `tyToEmitName` renders the alias, and the annotated
+          // spelling lowers — admitted. Without this the whole struct declined and the
+          // closure-field lambda recorded the spaced self render instead of the canonical pin.
+          if mt is TyFunc {
+            // One closure member beside a struct sibling (`(() => i64) | {w: i32}`): rides the
+            // box anyref as the kind-11 ref atom (#965), and the annotated spelling lowers. A
+            // second closure member is declined conservatively — discriminable in principle
+            // (each tags its own interned signature slot), but untested on this naming path.
+            uClo = uClo + 1
+            if uClo > 1 { return "" }
+          } else if mt is TyMap {
+            // A map member (`{[string]: {a, f, z}} | i32`): rides the box tagged by
+            // `mapSlotTag` (the #865/#868 map-union rep), and the annotated spelling of such a
+            // field lowers fully. Requires the canonical render to succeed first (the
+            // `vbUnionMemberName` map-admission twin), or the struct declines instead of mis-pinning.
+            if !tyIsEmitRepresentable(ft.uMembers[m]) { return "" }
+          } else if !tyIsLitUnion(ft.uMembers[m]) {
+            return ""
+          }
+        }
+        m = m + 1
+      }
+      if uClo > 0 && uObj == 0 { return "" }
+      hasBox = true
+    } else if ft is TyNullable {
+      // A nullable struct field (`{f: f64 | null}`, `{f: S | null}`) — a niche slot the
+      // annotated form already lowers. Recorded as box-bearing (so the pin fires) when the
+      // inner is a prim/literal/object; an unlowerable inner (closure/map/list) declines the
+      // whole struct as before, so the lambda takes the proven annotated-form path.
+      const nin = T.tys[ft.nInner]
+      if !(nin is TyPrim) && !(nin is TyLit) && !(nin is TyObj) {
+        // A nullable struct-element-list field (`{f: {f: string}[] | null}` — the code-28
+        // nul-ref-list slot the annotated form already lowers): admitted so the lambda pins to
+        // the canonical render, rather than keeping the `?`-spelled shape no pin arm matches.
+        // Other inners (closure/map/scalar-backed lists) keep the decline, since their nullable field slots are not all lowerable.
+        let nulListOk = false
+        if nin is TyArray {
+          if nin.aElem >= 0 {
+            const nel = T.tys[nin.aElem]
+            if nel is TyObj { nulListOk = true }
+          }
+        }
+        if !nulListOk { return "" }
+      }
+      hasBox = true
+    } else if ft is TyObj {
+      // A nested struct field (`{f: {f: i32 | string}}`): the boxed slot may sit one level
+      // down, so this recurses to fire the pin for a lambda whose nested literal field adopted
+      // a union-field shape. A nested shape with no box contributes nothing — the "" is a
+      // plain no-box, not a decline, since its own unlowerable unions still fail loudly elsewhere.
+      if structFieldBoxRetName(t.objFieldTypes[i]) != "" { hasBox = true }
+    }
+    i = i + 1
+  }
+  if !hasBox { return "" }
+  irRendered(tyToEmitName(er))
+}
+
+// The canonical emitter name for an inferred return `er` if it is a bare struct carrying a
+// map field anywhere in its (recursively nested-struct) field tree, else "". A map-carrying
+// struct a lambda body literal builds has no field-set anchor for its nested literals, so
+// `synthRetAnnots` pins `fnRet` to this name, matching the annotated form's own threading.
+export function structMapFieldRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyObj) { return "" }
+  if !tyObjHasMapField(er) { return "" }
+  irRendered(tyToEmitName(er))
+}
+
+// The canonical emitter name for an inferred return `er` if it is a list whose element is a
+// `structFieldBoxRetName` struct (a struct with a boxed union/nullable field slot), else "".
+// A closure-result array literal of such structs self-infers the plain element shape, so
+// `synthRetAnnots` pins `fnRet` to this name, matching the annotated form's boxed-field elements.
+export function structFieldBoxElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyArray) { return "" }
+  if t.aElem < 0 { return "" }
+  if structFieldBoxRetName(t.aElem) == "" { return "" }
+  irRendered(tyToEmitName(er))
+}
+
+// The emitter-format union name (`i32|string`, `i32|null`) for an inferred return type `er`
+// if it is a value union the emitter can box (≥2 non-null value atoms, or one numeric scalar
+// + null), else "". Drives `registerValueUnionName`, the `"union"` return kind, and
+// `emitUnionCoerce` at the return site, exactly like the annotated path — built only for unions that are value unions, to avoid a render-join-resplit of every non-union return.
+export function valueUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  // Decline a union with any composite leaf WITHOUT rendering it (`retAtomsCheap`) —
+  // its atom cannot classify anyway, and the render of a recursive struct leaf is
+  // exponential in the `tyToStr` depth cap.
+  if !retAtomsCheap(er) { return "" }
+  if !tyIsValueUnion(er) { return litUnionArmValueUnionRetName(er) }
+  const atoms: string[] = []
+  collectRetAtoms(er, atoms)
+  let nm = ""
+  let i = 0
+  while i < atoms.length {
+    if i > 0 { nm = nm + "|" }
+    nm = nm + atoms[i]
+    i = i + 1
+  }
+  // One atom per LEAF, exactly: `tyIsValueUnion`'s own invariant is that under
+  // `retAtomsCheap` every admitted leaf renders to a single top-level atom (no `|`, no
+  // `=>`, balanced groupers), so the join's width is the leaf count. (#1115.)
+  irAtoms(nm, atoms.length)
+}
+
+// The emitter name (`K|i32`) of an inferred union `er` whose string literals group into a
+// literal-union arm beside other value atoms, as the annotated spelling boxes it, or "". The
+// flattened join `"a" | "b" | i32` has no value atom for a literal, so the atom walk declines it (D2952).
+export function litUnionArmValueUnionRetName(er: i32) {
+  if !tyHasLitLeaf(er, 8) { return "" }
+  const nm = tyToEmitName(er)
+  // Literals of two bases or more, beside plain scalars, are the value box every annotated
+  // position lowers (`1 | 9000000000`, `1 | "s"`, D3512).
+  if litScalarBoxLeaves(er) && isValueUnionName(nm) { return irRendered(nm) }
+  if !nameIsLitUnionArmValueUnion(nm) { return "" }
+  irRendered(nm)
+}
+
+// The emitter-format union name (`K0[]|i64`) for an inferred return `er` that is a value
+// union with a litunion-array member and a scalar sibling. `valueUnionRetName` declines
+// because rendering the array member flattens its litunion element, but `K0[]` is a value
+// atom and boxes like `i32[] | i64`, so this renders each member with `tyToEmitName` instead.
+export function litUnionArrayValueUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if !(t is TyUnion) { return "" }
+  const members = t.uMembers
+  if members.length < 2 { return "" }
+  // No litunion-array member, no name to build: decline from the arena before the per-member
+  // `tyToEmitName` render. The loop below still recomputes `hasLitArr` as the actual verdict.
+  if !tyUnionHasLitUnionArrayMember(er) { return "" }
+  let hasLitArr = false
+  let name = ""
+  // A member's render can be wider than one atom (`tyToEmitName`'s nullable arm spells
+  // `X|null`), so the join width is the sum of member widths, not the member count (#1115).
+  let psum = 0
+  let i = 0
+  while i < members.length {
+    const mn = tyToEmitName(members[i])
+    const mw = tyNameAtoms
+    if mn == "" { return "" }
+    if litUnionArrayElemOf(mn) != "" { hasLitArr = true }
+    if i > 0 { name = name + "|" }
+    name = name + mn
+    psum = psum + mw
+    i = i + 1
+  }
+  if !hasLitArr { return "" }
+  if isValueUnionName(name) { return irAtoms(name, psum) }
+  ""
+}
+
+// D1062 — the emitter-format name of an inferred nullable-list return `er`: a `TyNullable`
+// whose inner is an array of any element type. Rendered non-spaced so `nullablePartOf`
+// recognizes it. A separate producer from `nullableRetName`'s i32-backed arm — that one also
+// serves the lambda pin and must match the value-call token; this one serves only the named-fn pin.
+export function nulListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
+    const it = T.tys[t.nInner]
+    if it is TyArray {
+      const lnm = tyToEmitName(t.nInner)
+      // The array's separators sit inside its element render; `null` adds one atom (#1115).
+      if lnm != "" { return irAtoms(lnm + "|null", tyNameAtoms + 1) }
+    }
+  }
+  ""
+}
+
+// The emitter-format name of an inferred nullable-litunion return `er` (`() => K0 | null`):
+// niched as the i32 atom with `-1` = null, so `synthRetAnnots` routes an anonymous lambda
+// through the same rep the annotated form lowers. Renders the litunion by its alias; an
+// alias-less inline litunion has no name and stays "". "" for any non-nullable-litunion.
+export function nulLitUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyNullable {
+    const alias = litUnionAliasNameOfTy(t.nInner)
+    // An alias identifier plus the `null` arm — two atoms (#1115).
+    if alias != "" { return irAtoms(alias + "|null", 2) }
+  }
+  ""
+}
+
+// The emitter-format name of an inferred element-nullable list return `er` — `(f64|null)[]`
+// etc: a `TyArray` whose element is a nullable numeric scalar. Elements are value-union
+// `{tag, payload}` boxes, the same rep the annotated return uses, so `synthRetAnnots` can pin
+// a lambda to it. "" unless `er` is such an array (a struct/string/boolean element differs).
+export function nulElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    // The hole declines here (`tyArrayElemIx`): an un-annotated lambda returning a bare `[]`
+    // reached this ladder with element index `-1`, an out-of-bounds `array.get`.
+    const ei = tyArrayElemIx(er)
+    if ei < 0 { return "" }
+    const et = T.tys[ei]
+    if et is TyNullable {
+      // The inner's primitive name is read off the arena (`tyPrimNameOf`) rather than a
+      // `tyToStr` render — the decision here is structural, the name only spells the payload.
+      const inner = tyPrimNameOf(et.nInner)
+      if inner == "f64" || inner == "i32" || inner == "i64" || inner == "f32" {
+        // The box leg — a value union, claimed by `synthRetAnnots`'s arm 4.
+        return irAtomsRung(
+          "(" + primNameStr(inner) + "|null)[]",
+          1,
+          IR_RUNG_NUL_ELEM_LIST,
+        )
+      }
+      // The niche leaves — `(boolean|null)[]`, `(string|null)[]`, `(K|null)[]` — each ride an
+      // existing non-box list rep the annotated return already lowers.
+      if inner == "boolean" || inner == "string" {
+        // A niche leg: arm 4's `nameIsNulBool`/`nameIsNulString` guards reject these and no
+        // later arm claims them, so they are recorded and left unpinned.
+        return irAtomsRung(
+          "(" + primNameStr(inner) + "|null)[]",
+          1,
+          IR_RUNG_NUL_ELEM_LIST_NICHE,
+        )
+      }
+      const alias = litUnionAliasNameOfTy(et.nInner)
+      if alias != "" {
+        // The third leg, and a niche for the same reason (`nameIsNulLitUnion`).
+        return irAtomsRung(
+          "(" + alias + "|null)[]",
+          1,
+          IR_RUNG_NUL_ELEM_LIST_NICHE,
+        )
+      }
+    }
+  }
+  ""
+}
+
+// The emitter-format name of a litunion-alias-element list return `er` — `K0[]`: the adoption
+// gate for a member-literal-bodied lambda. `synthRetAnnots` pins the lambda's `fnRet` to it so
+// the body literal builds the i32 atom list instead of self-classifying a string list into the
+// i32-list functype result (invalid wasm). An alias-less inline litunion element declines.
+export function litUnionElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    if tyIsLitUnion(t.aElem) {
+      const an = litUnionAliasNameOfTy(t.aElem)
+      if an != "" { return irAtoms(an + "[]", 1) }
+    }
+  }
+  ""
+}
+
+// The emitter-format name of a nullable-map-element list return `er` —
+// `({[string]: boolean} | null)[]`: elements are the kind-3 map struct made nullable, the
+// same rep the annotated named-function-value spelling already lowers, so `synthRetAnnots`
+// can pin a lambda to it. The nullable-map sibling of `nulStructElemListRetName`. "" otherwise.
+export function nulMapElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyNullable {
+      if et.nInner < 0 || et.nInner >= T.tys.length { return "" }
+      const it = T.tys[et.nInner]
+      if it is TyMap { return irRendered(tyToEmitName(er)) }
+    }
+  }
+  ""
+}
+
+// The emitter-format name of a map-element list return `er` — `{[string]: f32}[]`: elements
+// are a string-keyed map, the same kind-3 ref-list rep the annotated form lowers, so
+// `synthRetAnnots` can pin a lambda's `fnRet` to it. A map value the emitter cannot lower
+// keeps rejecting loudly on the annotated path itself. "" otherwise.
+export function mapElemListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyMap { return irRendered(tyToEmitName(er)) }
+  }
+  ""
+}
+
+// The emitter-format name of an inferred element-value-union list return `er` —
+// `(i64|boolean)[]`: elements are value-union `{tag, payload}` boxes, the same rep the
+// annotated form lowers, so `synthRetAnnots` can pin a lambda to it. The value-union sibling
+// of `nulElemListRetName` (which owns the `(scalar|null)[]` niche). "" otherwise.
+export function elemValueUnionListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    // `tyIsValueUnion` is the structural dual of `isValueUnionName` over the joined atom
+    // render, decided from the arena before anything is rendered.
+    if tyIsValueUnion(t.aElem) { return irRendered(tyToEmitName(er)) }
+  }
+  ""
+}
+
+// The emitter-format name of an inferred element-map-union list return `er` —
+// `({[string]: string} | f64)[]`: elements are `mapUnionRetName`'s `{tag, payload}` boxes,
+// the same rep the annotated form lowers. The map-union sibling of
+// `elemVariantBoxListRetName` (which declines map members). "" otherwise.
+export function elemMapUnionListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const en = mapUnionRetName(t.aElem)
+    if en != "" { return irAtoms("(" + en + ")[]", 1) }
+  }
+  ""
+}
+
+// The emitter-format name of a closure-arm value union return `er` (`(()=>string)|i64`): a
+// union mixing at least one function-type member with scalar prims. A closure member is the
+// kind-11 ref atom; the render preserves a litunion result's alias so the inner value call's
+// `$fnsig` token agrees. "" for any other shape.
+export function cloArmValueUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  // A nullable closure-arm value union normalizes to `TyNullable` over the union — the box
+  // already carries a null member atom, so render the inner union and append `|null`.
+  if t is TyNullable {
+    const inner = cloArmValueUnionRetName(t.nInner)
+    // The inner union keeps its own top-level `|`s, so `null` adds one atom to the width
+    // the recursion just reported (#1115).
+    if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
+    return ""
+  }
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return "" }
+    let hasClo = false
+    let name = ""
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      let mn = ""
+      if m is TyFunc {
+        let ips = ""
+        const pts = m.fnParamTypes
+        let pj = 0
+        while pj < pts.length {
+          const pn = tyToEmitName(pts[pj])
+          if pn == "" { return "" }
+          if pj > 0 { ips = ips + "," }
+          ips = ips + pn
+          pj = pj + 1
+        }
+        let irs = litUnionAliasNameOfTy(m.fnRet)
+        if irs == "" { irs = tyToEmitName(m.fnRet) }
+        if irs == "" { return "" }
+        mn = "((" + ips + ")=>" + irs + ")"
+        hasClo = true
+      } else if m is TyPrim {
+        mn = m.primName
+      } else {
+        return ""
+      }
+      if i > 0 { name = name + "|" }
+      name = name + mn
+      i = i + 1
+    }
+    if !hasClo { return "" }
+    // Every member render is ONE atom — a prim's own name, or a closure PARENTHESIZED
+    // (which puts its separators and its `=>` inside a grouper) — so the join's width is
+    // the member count (#1115).
+    if isValueUnionName(name) { return irAtoms(name, members.length) }
+  }
+  ""
+}
+
+// The emitter-format name of an inferred nested-list return `er` with a scalar/string leaf —
+// `i64[][]`, `string[][]`, or deeper. `synthRetAnnots` pins a lambda's `fnRet` to this so the
+// body literal builds under the return-position seed instead of self-classifying an i32
+// default. An `i32[][]`/`boolean[][]` leaf is excluded (already agrees with no pin needed).
+export function nestedLeafListRetName(er: i32) {
+  if er < 0 { return "" }
+  const t = T.tys[er]
+  if t is TyArray {
+    if t.aElem < 0 { return "" }
+    const et = T.tys[t.aElem]
+    if et is TyArray {
+      if et.aElem < 0 { return "" }
+      const lt = T.tys[et.aElem]
+      if lt is TyPrim {
+        const pn = lt.primName
+        if pn == "i64" || pn == "f64" || pn == "f32" || pn == "string" {
+          return irRendered(tyToEmitName(er))
+        }
+        return ""
+      }
+      if lt is TyArray {
+        // Deeper nesting: the leaf decides — recurse on the inner array.
+        if nestedLeafListRetName(t.aElem) != "" {
+          return irRendered(tyToEmitName(er))
+        }
+      }
+    }
+  }
+  ""
+}
+
+// The emitter-format name of an inferred map-member union return `er` (`{[string]:f32}|{w:i32}`):
+// a union with at least one map member and every member a map, object or scalar/string prim.
+// Rendered in the emitter's map-first vocabulary (`nameIsMap`) so `synthRetAnnots` can pin a
+// lambda to it, routing it through `registerInlineUnion`'s box path. "" for any other shape.
+export function mapUnionRetName(er: i32) {
+  if er < 0 { return "" }
+  // A nullable map-member union unwraps to its inner union for the member gate; the final
+  // render still uses the original (possibly-nullable) `er`, keeping the `|null` spelling.
+  let uIx = er
+  const tn = T.tys[er]
+  if tn is TyNullable { uIx = tn.nInner }
+  // `uIx` can be an unfilled infer-null hole (`-1`) reached only through a lambda's return, so
+  // it must be bounds-checked before indexing `T.tys` (D1576).
+  if uIx < 0 || uIx >= T.tys.length { return "" }
+  const t = T.tys[uIx]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return "" }
+    // At least one map member, and every member a map, object, or scalar/string prim (riding
+    // the box as its value atom). A litunion/array/closure/nullable member declines.
+    let hasMap = false
+    // non-null count — `TY_NULL` is a `TyPrim`; see the gate after the loop.
+    let muNonNull = 0
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      // The non-null count, taken before the shape arms so it narrows nothing.
+      if !tyIsPrimNamed(members[i], "null") { muNonNull = muNonNull + 1 }
+      if m is TyMap {
+        hasMap = true
+      } else if !(m is TyObj) {
+        if !(m is TyPrim) { return "" }
+      }
+      i = i + 1
+    }
+    if !hasMap { return "" }
+    // At least two non-null members: `TY_NULL` is a `TyPrim`, so a single-real-member union
+    // like `null|{[string]:f32}` reaches here but is never registered under this name.
+    if muNonNull < 2 { return "" }
+    return irRendered(tyToEmitName(er))
+  }
+  ""
+}
+
+// Did the checker's adoption ladder settle this inferred return on a value-union producer?
+// Three rungs mint one — the plain value union, the litunion-array value union, and the
+// closure-arm value union — bucketing every reach by banked rung shows the separation is
+// exact, with no mixed rung; the checker already knew, the emitter only asked the render.
+export function inferRetRungIsValueUnion(i: i32): boolean {
+  const r = inferRetRungAt(i)
+  if r == IR_RUNG_VALUE_UNION { return true }
+  if r == IR_RUNG_LITUNION_ARR_VU { return true }
+  r == IR_RUNG_CLO_ARM_VU
+}
+
+function inferRetRungAt(i: i32): i32 {
+  if i < 0 || i >= inferRetRung.length { return -1 }
+  inferRetRung[i]
+}
+
+// Rung 16 — `nestedElemUnionListRetName`.
+export function inferRetRungIsNestedElemUnionList(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_NESTED_ELEM_UNION_LIST
+}
+
+// Rung 24 — `nestedLeafListRetName`.
+export function inferRetRungIsNestedLeafList(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_NESTED_LEAF_LIST
+}
+
+// Rung 26 — `litUnionElemListRetName`.
+export function inferRetRungIsLitUnionElemList(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_LITUNION_ELEM_LIST
+}
+
+// Rung 25 — `mapElemListRetName`.
+export function inferRetRungIsMapElemList(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_MAP_ELEM_LIST
+}
+
+// Arm 4's set — every producer whose render is a paren-grouped value-union array. Nine rungs,
+// including `nulElemListRetName`'s box leg but not its niche legs (`IR_RUNG_NUL_ELEM_LIST_NICHE`).
+export function inferRetRungIsParenUnionElemList(i: i32): boolean {
+  const r = inferRetRungAt(i)
+  if r == IR_RUNG_NUL_ELEM_LIST { return true }
+  if r == IR_RUNG_NUL_STRUCT_ELEM_LIST { return true }
+  if r == IR_RUNG_NUL_MAP_ELEM_LIST { return true }
+  if r == IR_RUNG_NUL_LIST_ELEM_LIST { return true }
+  if r == IR_RUNG_ELEM_VU_LIST { return true }
+  if r == IR_RUNG_ELEM_VARIANT_BOX_LIST { return true }
+  if r == IR_RUNG_ELEM_MAP_UNION_LIST { return true }
+  if r == IR_RUNG_ELEM_REFARM_VU_LIST { return true }
+  if r == IR_RUNG_NUL_CLOSURE_ELEM_LIST { return true }
+  false
+}
+
+// Arm 1's set — every producer whose render is a union the emitter boxes. Closes a cross-pass
+// dependence: `mapUnionRetName`/`refArmUnionRetName` now carry the same `>= 2 non-null` gate
+// `variantBoxUnionRetName` already had, so admission does not depend on a later pass's union
+// registry (`isUName`) — the cost is losing that registry's interlock as a safety net.
+export function inferRetRungIsStructElemList(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_STRUCT_ELEM_LIST
+}
+
+export function inferRetRungIsBoxedUnion(i: i32): boolean {
+  const r = inferRetRungAt(i)
+  if r == IR_RUNG_VALUE_UNION { return true }
+  if r == IR_RUNG_LITUNION_ARR_VU { return true }
+  if r == IR_RUNG_STRUCT_UNION { return true }
+  if r == IR_RUNG_CLO_ARM_VU { return true }
+  if r == IR_RUNG_MAP_UNION { return true }
+  if r == IR_RUNG_REFARM_UNION { return true }
+  if r == IR_RUNG_VARIANT_BOX { return true }
+  if r == IR_RUNG_LITUNION_ALIAS { return true }
+  false
+}
+
+// The fall-through's scalar-list leg. `isScalarListRetName`'s admitted set is exactly
+// `{"i64[]", "f32[]", "f64[]"}` — `arrElemNameRaw` rejects anything not ending `[]` and
+// otherwise drops exactly those two characters, so the two predicates share one cut.
+export function inferRetRungIsScalarListRet(i: i32): boolean {
+  inferRetRungAt(i) == IR_REC_SCALAR_LIST
+}
+
+// Rungs 6 and 7 — `nullableRetName` and `nulLitUnionRetName`, the only producers that mint a
+// top-level nullable name. Both mint `<part> + "|null"` and nothing else, so asking "is this
+// row's name a nullable" is asking exactly which producer answered.
+export function inferRetRungIsNulListRet(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_NUL_LIST_RET
+}
+
+export function inferRetRungIsNullable(i: i32): boolean {
+  const r = inferRetRungAt(i)
+  r == IR_RUNG_NULLABLE || r == IR_RUNG_NUL_LITUNION
+}
+
+// Clears the per-function rung column; the checker calls it once per program.
+export function irReset() { inferRetRung = [] }
+
+// Clears the last producer's rung before a cascade runs, so a cascade nobody answers reads none.
+export function irRungClear() { inferRetNameRung = IR_RUNG_NONE }
