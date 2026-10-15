@@ -1,0 +1,1096 @@
+// `check_num_lit_state.vl` — the numeric-literal state the checker keeps, and the operations
+// that read nothing else. The literal-binding solver's tables (`lbi*`: binding marks, candidate
+// rows, edges, pins, refusals, inlined reads) with its row order, settle and apply steps; the
+// exact-constant tables (`cex*`) and their notes; the numeric-literal note queues (`nl*`,
+// `nln*`); and the binding-mark helpers they share. The checker resets and writes these tables
+// and owns every step that reads the scope chain, a node's type or `tErr`.
+
+import {
+  BinExpr,
+  Block,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  NumLit,
+  P,
+  Param,
+  Paren,
+  Unary,
+  declHasExportKw,
+  i32ToStr,
+  markLetRetyped,
+  mkTypeRef,
+  ufcsModOfNode,
+} from "./ast"
+import { nodeLineOf } from "./check_capture_loss"
+import {
+  LBI_EDGE,
+  LBI_EDGE_FWD,
+  LBI_FIT_F32,
+  LBI_FIT_F64,
+  LBI_FIT_I32,
+  LBI_FIT_I64,
+  LBI_FIT_SAME,
+  LBI_FLOAT,
+  LBI_INT,
+  LBI_KEYS,
+  LBI_LIT,
+  LBI_LO,
+  LBI_LOCAL,
+  LBI_NOT_F32,
+  LBI_TREE,
+  LBI_UP,
+  LBI_WIDE_ANY,
+  LBI_WIDE_I64,
+  cexKeepLeaf,
+  cexLitPeel,
+  cexShown,
+  exprIsNumLit,
+  intLitLexemeOf,
+  lbiChoose,
+  lbiChosenOf,
+  lbiEdgeKind,
+  lbiFits,
+  lbiIntTy,
+  lbiLitDefault,
+  lbiNameKey,
+  lbiNeeds,
+  lbiNumTy,
+  lbiReadNeutral,
+  lbiRowTakes,
+  lbiTreeLeaves,
+  letDeclIsUnannotNumLit,
+  numLitText,
+} from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import { rcwModOf, rcwWhere } from "./check_record_writes"
+import { demangleName } from "./check_suggest"
+import { nullableInnerOrNone } from "./check_ty_shape"
+import {
+  T,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TyFunc,
+  tyToStr,
+} from "./check_types"
+import {
+  Cex,
+  cexFitsSigned,
+  cexOfLexeme,
+  cexOk,
+  cexPatternHex,
+} from "./const_exact"
+import { numLexRadixBits } from "./emit_bignum"
+import { sidArrGet, sidArrPut, sidOf } from "./symbols"
+
+// The same rows for an un-annotated `let`/`const` whose initializer is a numeric literal or a list
+// of them, with its declaration. A mismatch whose value reads one of these names the declaration
+// and the annotation that would fix it; the note is appended at the end of the check
+// (`numLitNotesApply`).
+export let numLitBindDepth: i32[] = []
+export let numLitBindName: string[] = []
+export let numLitBindDecl: i32[] = []
+
+// Pending notes: the diagnostic's index and raw message, the note, and the declaration it names.
+export let nlnDiag: i32[] = []
+export let nlnMsg: string[] = []
+export let nlnText: string[] = []
+export let nlnDecl: i32[] = []
+export let nlnUse: string[] = []
+// Per note: the slot a refused store wrote (`=` a scalar, `=[]` a whole list, `[]` an element,
+// `.f` a field; "" for a read), and the stored (element) type the note suggests.
+export let nlnSlot: string[] = []
+export let nlnWant: i32[] = []
+// Per note: the annotation it suggests for the binding, or "" for a note about a field literal.
+export let nlnAnn: string[] = []
+// Per read note on a scalar binding: the read it names and the type it suggests; -1 otherwise.
+export let nlnLeaf: i32[] = []
+export let nlnLeafTy: i32[] = []
+// The target and the value's type of the assignment whose refusal is being raised, or -1.
+export let nlAsgTgt = -1
+export let nlAsgGot = -1
+// The destination type of the mismatch being raised, when its site knows one, or -1.
+export let nlWantTy = -1
+// The annotation the last read note suggested (`numLitDefaultNote`), and the type the binding a
+// composite or arithmetic value reads should carry (`numLitLeafFor`).
+export let nlDefaultAnn = ""
+export let nlDefaultTy = -1
+// While `numLitReadsRefuted` grades: each noted scalar binding's name and the type its note
+// suggests, so an operand that is another noted binding is read at its annotated type.
+export let nlSugg: {[string]: i32} = Map()
+export let nlLeafWant = -1
+// While a compound assignment's value (`s + v` of `s += v`) is checked: that node and the target.
+export let nlCmpdInner = -1
+export let nlCmpdTgt = -1
+
+// Record `name` in a depth-tagged mark table at `depth`. The shared half of every such table:
+// a sparse row per marked binding, so an unmarked program pays one length test.
+export function bindMarkPush(
+  depths: i32[],
+  names: string[],
+  name: string,
+  depth: i32,
+) {
+  depths.push(depth)
+  names.push(name)
+  0
+}
+
+// Drop the rows the scope just popped retired. `T.scopes` has already shrunk, so a row recorded
+// at a depth the chain has dropped is gone with its binding.
+export function bindMarkPopTo(depths: i32[], names: string[], depth: i32) {
+  while depths.length > 0 {
+    if depths[depths.length - 1] < depth { return 0 }
+    depths.pop()
+    names.pop()
+  }
+  0
+}
+
+// Mark the binding `name` declared by `decl` at `depth` when `letDeclIsUnannotNumLit` holds.
+export function markNumLitBinding(name: string, depth: i32, decl: i32) {
+  if !letDeclIsUnannotNumLit(decl) { return 0 }
+  bindMarkPush(numLitBindDepth, numLitBindName, name, depth)
+  numLitBindDecl.push(decl)
+  0
+}
+
+// The literal bindings in scope, depth-tagged as `numLitBindDepth` is, each row naming its
+// candidate; and apart from them the ones whose type the solve wrote.
+export let lbiBindDepth: i32[] = []
+export let lbiBindName: string[] = []
+export let lbiBindCand: i32[] = []
+export let lbiBindPrev: i32[] = []
+let lbiBindSid: i32[] = []
+// The newest row per name, by the name's interned id (-1 for none).
+export let lbiBindTop: i32[] = []
+export let lbiNameSeen: boolean[] = []
+export let lbiPinnedDepth: i32[] = []
+export let lbiPinnedName: string[] = []
+// How many deliveries into a scalar destination read a binding whose type the solve wrote.
+export let lbiPinnedReads = 0
+// The candidates declared this pass, by index: the declaration, the type its literal defaults
+// to, and for an annotated one the annotation (-1 for none).
+let lbiCandOf: {[i32]: i32} = Map()
+export let lbiCands: i32[] = []
+export let lbiDef: i32[] = []
+export let lbiAnn: i32[] = []
+// The module an exported candidate is declared in, or `LBI_LOCAL`: only its own module's uses
+// give it a type (DECISIONS.md, "exported bindings").
+export let lbiExpMod: i32[] = []
+// Whether a candidate is an un-annotated `const`, which is its literal at every read and never
+// solved.
+export let lbiIsConst: boolean[] = []
+// Whether an annotated literal `const` has a read its literal would take differently: an `f64`
+// meeting an `f32` operand, or a literal tree meeting a type other than the annotation's.
+export let lbiConstUnsafe: boolean[] = []
+// Whether an annotated literal binding is read as a `??` default its bare literal would be
+// delivered into at another type: its annotation is load-bearing, `const` or `let` (D3798).
+export let lbiCoalUnsafe: boolean[] = []
+// The literal a candidate holds: its initializer, or the literal of the module `const` it copies.
+let lbiLitNode: i32[] = []
+
+export let lbiModLit: {[string]: i32} = Map()
+// Every read of a candidate, and the type it widens to where it stands when it is delivered whole
+// to a scalar destination or met whole by a scalar operand (-1 otherwise).
+export let lbiReadNode: i32[] = []
+export let lbiReadCand: i32[] = []
+export let lbiReadWide: i32[] = []
+// One row per recorded use: the candidate, the kind, the type it supplies, and its node.
+export let lbiRowCand: i32[] = []
+export let lbiKind: i32[] = []
+export let lbiTy: i32[] = []
+let lbiAt: i32[] = []
+// The solve's answer: candidates to re-check with a type, and the refusals it owes.
+export let lbiPinCand: i32[] = []
+export let lbiPinTy: i32[] = []
+export let lbiErrMsg: string[] = []
+export let lbiErrAt: i32[] = []
+// The edge rows the solve is reading.
+export let lbiEdges = 0
+// The annotations the solve wrote, by annotation node: the declaration each belongs to.
+let lbiSynth: {[i32]: i32} = Map()
+// The reads that hold a literal `const`'s literal, which a check about a literal the author wrote
+// (a shift count, a constant range, a newtype's brand) does not treat as one.
+export let lbiInlined: {[i32]: boolean} = Map()
+// The parameter default expressions: one node serves every call that omits the argument, so a
+// name there resolves in the module frame, never the caller's.
+export let lbiDefaultExpr: {[i32]: boolean} = Map()
+// The rewritten reads, by node: the name each stands for, which the editor still resolves.
+export let lbiInlinedName: {[i32]: string} = Map()
+// Each editor occurrence recorded for a rewritten read, and its node, whose type hover shows.
+export let lbiOccIx: i32[] = []
+export let lbiOccNode: i32[] = []
+// The declaration of the `const` each rewritten read names, by node, for a diagnostic's note.
+export let lbiInlinedDecl: {[i32]: i32} = Map()
+// The type a rewritten read meets where it stands, by node, for hover.
+export let lbiUseTy: {[i32]: i32} = Map()
+// The same, only where it is the type the read compiles at: a delivery into a number, or an
+// operand beside a typed one (-1 where the other operand is a literal, whose width is open).
+export let lbiSureTy: {[i32]: i32} = Map()
+// The rewritten read each editor occurrence stands for, by occurrence.
+export let lbiOccLit: {[i32]: i32} = Map()
+
+// Drop this compile's node-keyed tables; the driver calls it wherever the arena resets.
+export function lbiArenaReset() {
+  lbiSynth = Map()
+  lbiInlined = Map()
+  lbiInlinedName = Map()
+  lbiInlinedDecl = Map()
+  cexFolded = Map()
+  cexNotTree = Map()
+  0
+}
+
+// The number type a literal `const`'s read `occ` compiles at: the number it is delivered into, or
+// the typed operand beside it. -1 when `occ` is no such read or that type is not certain (a
+// union or list element, an operand beside a literal, a read folded into a larger constant).
+export function lbiConstUseTy(occ: i32): i32 {
+  const n = lbiOccLit[occ] ?? -1
+  if n < 0 { return -1 }
+  const t = lbiSureTy[n] ?? -1
+  if t == TY_I32 || t == TY_I64 || t == TY_F32 || t == TY_F64 { return t }
+  -1
+}
+
+// The literal the un-annotated literal `const` declared at `decl` stands for at every read, or -1
+// when `decl` is no such `const`: the exact constant the editor shows a value for.
+export function lbiExactConstLit(decl: i32): i32 {
+  const c = lbiCandOf[decl] ?? -1
+  if c < 0 || c >= lbiIsConst.length || !lbiIsConst[c] { return -1 }
+  lbiLitOf(c)
+}
+
+// Is node `ix` a read of a literal `const` rewritten into its literal, or under one?
+export function lbiIsInlined(ix: i32): boolean {
+  if lbiInlined.length == 0 { return false }
+  const leaves: i32[] = []
+  lbiTreeLeaves(ix, leaves, 0)
+  for l in leaves {
+    if lbiInlined[l] ?? false { return true }
+  }
+  lbiInlined[parenPeelIx(ix)] ?? false
+}
+// An annotated literal binding's initializer type, by declaration, for the redundancy question.
+export let lbiInitTy: {[i32]: i32} = Map()
+
+export function lbiReset() {
+  lbiBindDepth = []
+  lbiBindName = []
+  lbiBindCand = []
+  lbiBindPrev = []
+  lbiBindSid = []
+  lbiBindTop = []
+  lbiNameSeen = []
+  lbiPinnedDepth = []
+  lbiPinnedName = []
+  lbiCandOf = Map()
+  lbiCands = []
+  lbiDef = []
+  lbiAnn = []
+  lbiExpMod = []
+  lbiIsConst = []
+  lbiConstUnsafe = []
+  lbiCoalUnsafe = []
+  lbiLitNode = []
+  lbiInitTy = Map()
+  lbiReadNode = []
+  lbiReadCand = []
+  lbiReadWide = []
+  lbiRowCand = []
+  lbiKind = []
+  lbiTy = []
+  lbiAt = []
+  lbiPinCand = []
+  lbiPinTy = []
+  lbiErrMsg = []
+  lbiErrAt = []
+  lbiOccIx = []
+  lbiOccNode = []
+  lbiUseTy = Map()
+  lbiSureTy = Map()
+  lbiOccLit = Map()
+}
+
+// Is `ann`, the annotation of declaration `decl`, one the solve wrote rather than the author? A
+// parsed annotation precedes its declaration in the arena and a written one follows it.
+export function lbiIsSynth(ann: i32, decl: i32): boolean {
+  ann > decl && (lbiSynth[ann] ?? -1) == decl
+}
+
+// Mark `decl`, declaring `name` at `depth` with type `ty`, when its initializer is a bare
+// numeric literal, possibly negated or parenthesised, and it is a scalar number: un-annotated
+// with a default the solve may move, or annotated with one the solve may call redundant.
+export function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letInit < 0 { return 0 }
+    let lit = -1
+    if exprIsNumLit(n.letInit) { lit = parenPeelIx(n.letInit) }
+    else if depth == 0 && n.letType < 0 { lit = lbiInitLit(n.letInit) }
+    if lit < 0 { return 0 }
+    // A literal `const` is checked at each read; its declaration alone overflows nothing.
+    if n.letType < 0 && n.letKw == "const" { cexDeclLit(lit) }
+    let ann = -1
+    if n.letType >= 0 {
+      if lbiIsSynth(n.letType, decl) {
+        return bindMarkPush(lbiPinnedDepth, lbiPinnedName, name, depth)
+      }
+      if !lbiNumTy(ty) { return 0 }
+      ann = ty
+    } else if ty != TY_I32 && ty != TY_I64 && ty != TY_F64 {
+      return 0
+    }
+    if lbiNameSeen.length == 0 {
+      let k = 0
+      while k < LBI_KEYS {
+        lbiNameSeen.push(false)
+        k = k + 1
+      }
+    }
+    lbiNameSeen[lbiNameKey(name)] = true
+    let c = lbiCandOf[decl] ?? -1
+    if c < 0 {
+      c = lbiCands.length
+      lbiCandOf[decl] = c
+      lbiCands.push(decl)
+      if ann >= 0 { lbiDef.push(lbiLitDefault(lit)) } else { lbiDef.push(ty) }
+      lbiAnn.push(ann)
+      if declHasExportKw(decl) {
+        lbiExpMod.push(rcwModOf(decl))
+      } else {
+        lbiExpMod.push(LBI_LOCAL)
+      }
+      lbiIsConst.push(ann < 0 && n.letKw == "const")
+      lbiConstUnsafe.push(false)
+      lbiCoalUnsafe.push(false)
+      lbiLitNode.push(lit)
+    }
+    const sid = sidOf(name)
+    lbiBindPrev.push(sidArrGet(lbiBindTop, sid))
+    lbiBindSid.push(sid)
+    sidArrPut(lbiBindTop, sid, lbiBindName.length)
+    bindMarkPush(lbiBindDepth, lbiBindName, name, depth)
+    lbiBindCand.push(c)
+  }
+  0
+}
+
+// The literal the module-level initializer `init` holds: a numeric literal, or the bare name of a
+// module `const` holding one; -1 otherwise.
+export function lbiInitLit(init: i32): i32 {
+  if exprIsNumLit(init) { return parenPeelIx(init) }
+  const n = P.nodes[parenPeelIx(init)]
+  if n is Ident { return lbiModLit[n.identName] ?? -1 }
+  -1
+}
+
+// The literal candidate `c` holds, or -1.
+export function lbiLitOf(c: i32): i32 {
+  if c < 0 || c >= lbiLitNode.length { return -1 }
+  lbiLitNode[c]
+}
+
+// Drop the rows of the scopes at `depth` and deeper.
+export function lbiPopTo(depth: i32) {
+  const pl = lbiPinnedDepth.length
+  if pl > 0 && lbiPinnedDepth[pl - 1] >= depth {
+    bindMarkPopTo(lbiPinnedDepth, lbiPinnedName, depth)
+  }
+  while (
+    lbiBindDepth.length > 0
+    && lbiBindDepth[lbiBindDepth.length - 1] >= depth
+  ) {
+    const r = lbiBindDepth.length - 1
+    sidArrPut(lbiBindTop, lbiBindSid[r], lbiBindPrev[r])
+    lbiBindDepth.pop()
+    lbiBindName.pop()
+    lbiBindCand.pop()
+    lbiBindPrev.pop()
+    lbiBindSid.pop()
+  }
+  0
+}
+
+// The roots a fold rewrote into their value's literal.
+export let cexFolded: {[i32]: boolean} = Map()
+// The operators a walk below another found to be no constant tree, so their own check pays none.
+export let cexNotTree: {[i32]: boolean} = Map()
+// Set while a module initializer is folded before any scope exists: a name is read only as the
+// module literal `const` it names.
+export let cexModScan = false
+// How deep a fold walks before it leaves a tree to the ordinary check.
+export const CEX_DEPTH = 64
+// The integer literals past the i64 range, checked once every float destination has taken the
+// ones it holds exactly.
+export let cexWideLits: i32[] = []
+export let cexWideFloatOk: {[i32]: boolean} = Map()
+// The literals a constant refusal already named, which the wide-literal check skips.
+export let cexReported: {[i32]: boolean} = Map()
+// The operands of negations, whose literal may be 2^63.
+export let cexNegOperand: {[i32]: boolean} = Map()
+// Set when a delivery rewrote a whole float constant into its integer.
+export let cexConverted = false
+
+// A constant tree the fold leaves unfolded (radix arithmetic, a width-dependent shift or `~`, a
+// float past the double range) computes whole at its use's width, so no part of it folds on its
+// own: `(1 << 31) - 0x1` keeps its decimal half at the width the radix half is read at.
+export function cexKeepWhole(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return 0 }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    cexNotTree[ix] = true
+    cexKeepWhole(e.binLeft, depth + 1)
+    return cexKeepWhole(e.binRight, depth + 1)
+  }
+  if e is Unary {
+    cexNotTree[ix] = true
+    return cexKeepWhole(e.unArg, depth + 1)
+  }
+  if e is Paren { return cexKeepWhole(e.parInner, depth + 1) }
+  cexKeepLeaf()
+}
+
+// Whether the literal at `ix` holds a constant's value rather than digits the author wrote there.
+export function cexIsDerived(ix: i32): boolean {
+  const p = parenPeelIx(ix)
+  if p < 0 { return false }
+  if cexFolded.length > 0 && (cexFolded[p] ?? false) { return true }
+  lbiInlined.length > 0 && (lbiInlined[p] ?? false)
+}
+
+// The integer literal at `ix` meets a float destination or operand that holds it exactly.
+export function cexFloatUse(ix: i32) {
+  if cexWideLits.length == 0 { return 0 }
+  const p = cexLitPeel(ix)
+  if p >= 0 { cexWideFloatOk[p] = true }
+  0
+}
+
+// The literal of an un-annotated `const`'s declaration, when it is long enough to overflow i64:
+// the declaration alone reads it nowhere, so only its reads are graded.
+function cexDeclLit(lit: i32) {
+  const wl = cexLitPeel(lit)
+  if wl < 0 { return 0 }
+  const e = P.nodes[wl]
+  if e is NumLit {
+    if e.numText.length >= 19 { cexReported[wl] = true }
+  }
+  0
+}
+
+// The operand of a negation, when it is a literal long enough to be 2^63.
+export function cexNoteNegOperand(arg: i32) {
+  const p = parenPeelIx(arg)
+  if p < 0 { return 0 }
+  const e = P.nodes[p]
+  if e is NumLit {
+    if e.numText.length >= 19 { cexNegOperand[p] = true }
+  }
+  0
+}
+
+// An integer literal past the i64 range, recorded for `cexCheckWideLits`: a decimal past 2^63 - 1,
+// or a constant's pattern past 64 bits (a written one is refused where it stands).
+export function cexNoteWideLit(ix: i32, text: string) {
+  if text.length < 19 { return 0 }
+  const rb = numLexRadixBits(text)
+  if rb >= 0 {
+    if rb > 64 && cexIsDerived(ix) { cexWideLits.push(ix) }
+    return 0
+  }
+  const v = cexOfLexeme(text)
+  if !cexOk(v) || v.cxFloat || cexFitsSigned(v, 64) { return 0 }
+  cexWideLits.push(ix)
+  0
+}
+
+// The note `cexWideConstNote` gives for the read `at` of the constant `nm`, of value `v`.
+export function cexWideConstNoteFor(nm: string, at: i32, v: Cex): string {
+  let where = ""
+  const d = lbiInlinedDecl[at] ?? -1
+  if d >= 0 && ufcsModOfNode(d) == ufcsModOfNode(at) {
+    const ln = nodeLineOf(d)
+    if ln > 0 { where = " (line " + i32ToStr(ln) + ")" }
+  }
+  let tail = ""
+  const pat = cexPatternHex(v, 32)
+  if pat != "" { tail = "; write " + pat + " for its bit pattern" }
+  " — `"
+    + nm
+    + "`"
+    + where
+    + " is the constant "
+    + cexShown(v)
+    + ", which overflows i32, so it reads as i64 here"
+    + tail
+}
+
+// The read `ix`, when it is a candidate's, widens to `ty` where it stands, or carries the mark
+// `ty` names. A read is recorded as its operand is checked, so it is among the last few.
+export function lbiNoteDirect(ix: i32, ty: i32) {
+  if !lbiNumTy(ty) && ty != LBI_WIDE_ANY && ty != LBI_WIDE_I64 { return 0 }
+  const p = parenPeelIx(ix)
+  let i = lbiReadNode.length - 1
+  const stop = i - 16
+  while i >= 0 && i > stop {
+    if lbiReadNode[i] == p {
+      lbiReadWide[i] = ty
+      return 0
+    }
+    i = i - 1
+  }
+  0
+}
+
+export function lbiPush(c: i32, kind: i32, ty: i32, at: i32) {
+  lbiRowCand.push(c)
+  lbiKind.push(kind)
+  lbiTy.push(ty)
+  lbiAt.push(at)
+}
+
+// The edge an intrinsic operand `c` gives the store's target. A float one is capped by the target
+// as a copy is, since no answer of a float binding is widened by it; an integer one only bounds
+// the target, since its width is the intrinsic's value (`clz`).
+export function lbiIntrEdge(c: i32): i32 {
+  if lbiIntTy(lbiDef[c]) { return LBI_EDGE_FWD }
+  LBI_EDGE
+}
+
+export let lbiConstOk = true
+// The target of the assignment being checked, which is a write even when it is compound.
+export let lbiWriteTgt = -1
+// Inside a `for` range's bounds or a `match` arm, where a `const` read stays a name.
+export let lbiKeepName = 0
+// Inside a check that names no destination: an argument to a parameter whose type names a type
+// parameter, which needs no one type, or an intrinsic's operand, whose width its operands decide.
+export let lbiNoDest = false
+
+export function lbiConstFail(): i64 {
+  lbiConstOk = false
+  0 as i64
+}
+
+// `v`, clearing `lbiConstOk` when it is outside `i32`.
+export function lbiConstIn(v: i64): i64 {
+  if v < -2147483648 || v > 2147483647 { return lbiConstFail() }
+  v
+}
+
+// `a op b` over two `i32`-range values, clearing `lbiConstOk` when `i32` and `i64` disagree.
+export function lbiConstOp(op: string, a: i64, b: i64): i64 {
+  if op == "+" { return lbiConstIn(a + b) }
+  if op == "-" { return lbiConstIn(a - b) }
+  if op == "*" { return lbiConstIn(a * b) }
+  if op == "&" { return a & b }
+  if op == "|" { return a | b }
+  if op == "^" { return a ^ b }
+  if op == "/" || op == "%" {
+    if b == 0 as i64 || (a == -2147483648 && b == -1) { return lbiConstFail() }
+    if op == "/" { return a / b }
+    return a % b
+  }
+  if b < 0 || b > 31 { return lbiConstFail() }
+  if op == "<<" { return lbiConstIn(a << b) }
+  if op == ">>" { return a >> b }
+  if op == ">>>" && a >= 0 { return a >>> b }
+  lbiConstFail()
+}
+
+// Every candidate a row names, in the order of its first row: the order its uses appear in,
+// which does not depend on the order the bindings are declared in.
+export function lbiRowOrder(): i32[] {
+  const seen: boolean[] = []
+  for _ in lbiCands { seen.push(false) }
+  const out: i32[] = []
+  let r = 0
+  while r < lbiRowCand.length {
+    const a = lbiRowCand[r]
+    if !seen[a] {
+      seen[a] = true
+      out.push(a)
+    }
+    if lbiEdgeKind(lbiKind[r]) {
+      const b = lbiTy[r]
+      if !seen[b] {
+        seen[b] = true
+        out.push(b)
+      }
+    }
+    r = r + 1
+  }
+  out
+}
+
+// Settle the candidates edges join: a worklist, seeded in `order`, that re-solves a candidate's
+// edge neighbours when its answer moves, so a chain settles in one visit per link. With `fwd`,
+// only the stores' own direction is read. Answers can fall as well as rise, so visits are capped.
+export function lbiSettleEdges(
+  rowsOf: i32[][],
+  chosen: i32[],
+  order: i32[],
+  fwd: boolean,
+) {
+  const nc = lbiCands.length
+  const queued: boolean[] = []
+  for _ in lbiCands { queued.push(false) }
+  const work: i32[] = []
+  for c0 in order {
+    if lbiAnn[c0] < 0 && !lbiIsConst[c0] && rowsOf[c0].length > 0 {
+      queued[c0] = true
+      work.push(c0)
+    }
+  }
+  let c = 0
+  let head = 0
+  const cap = nc * 8
+  while head < work.length && head < cap {
+    c = work[head]
+    head = head + 1
+    queued[c] = false
+    const t = lbiSolveOne(c, rowsOf[c], chosen, false, fwd)
+    if t >= 0 && chosen[c] != t {
+      chosen[c] = t
+      for r0 in rowsOf[c] {
+        let o = -1
+        if r0 >= 0 && lbiEdgeKind(lbiKind[r0]) { o = lbiTy[r0] }
+        if r0 < 0 { o = lbiRowCand[-r0 - 1] }
+        if o >= 0 && o < nc && !queued[o] && lbiAnn[o] < 0 {
+          queued[o] = true
+          work.push(o)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Defer the redundant-annotation question for literal binding `decl`, whose initializer checked
+// as `initTy`, to the solve.
+export function lbiDeferRedundant(decl: i32, initTy: i32) {
+  if lbiInitTy.has(decl) || !lbiNumTy(initTy) { return 0 }
+  lbiInitTy[decl] = initTy
+  0
+}
+
+// The type for candidate `c` from its rows `rs` (an edge's far end read from `chosen`), or -1
+// when it has no typed use or no type satisfies them. With `report`, the latter records its
+// refusal; with `fwd`, a store's target does not yet bound the value stored into it.
+export function lbiSolveOne(
+  c: i32,
+  rs: i32[],
+  chosen: i32[],
+  report: boolean,
+  fwd: boolean,
+): i32 {
+  if c < 0 || c >= lbiCands.length { return -1 }
+  const ks: i32[] = []
+  const us: i32[] = []
+  const ats: i32[] = []
+  const vks: i32[] = []
+  const vus: i32[] = []
+  const def = lbiDef[c]
+  const intKind = def == TY_I32 || def == TY_I64
+  for r0 in rs {
+    let r = r0
+    let k = -1
+    let u = -1
+    if r >= 0 {
+      k = lbiKind[r]
+      u = lbiTy[r]
+      if k == LBI_EDGE || k == LBI_EDGE_FWD {
+        k = LBI_LO
+        u = lbiChosenOf(chosen, lbiTy[r])
+      }
+    } else if !fwd && lbiKind[-r0 - 1] == LBI_EDGE {
+      r = -r0 - 1
+      k = LBI_UP
+      u = lbiChosenOf(chosen, lbiRowCand[r])
+    }
+    if k == LBI_FLOAT || k == LBI_INT || k == LBI_NOT_F32 || k == LBI_TREE {
+      vks.push(k)
+      vus.push(u)
+    } else if k == LBI_LIT {
+      // A stored literal the binding's kind cannot hold is the store's own type error.
+      let m = u & (LBI_FIT_F32 | LBI_FIT_F64)
+      if intKind { m = u & (LBI_FIT_I32 | LBI_FIT_I64) }
+      if m != 0 {
+        ks.push(k)
+        us.push(m)
+        ats.push(lbiAt[r])
+      }
+    } else if u >= 0 && lbiIntTy(u) == intKind {
+      ks.push(k)
+      us.push(u)
+      ats.push(lbiAt[r])
+    } else if u >= 0 && k == LBI_UP {
+      // A destination of the other kind widens at that use and chooses nothing, but the binding
+      // must still widen to it: `i64` does not reach an `f64` parameter where `i32` does.
+      vks.push(k)
+      vus.push(u)
+    }
+  }
+  if us.length == 0 { return -1 }
+  const d = lbiCands[c]
+  const t = lbiChoose(d, def, ks, us, fwd)
+  if t < 0 && report { lbiRefuse(d, def, ks, us, ats) }
+  let v = 0
+  while v < vks.length {
+    if t >= 0 && !lbiRowTakes(vks[v], vus[v], t) { return def }
+    v = v + 1
+  }
+  t
+}
+
+// The refusal for literal binding `d` whose uses no type satisfies: the first use no type the
+// literal fits satisfies, else the first pair of uses no one type satisfies together.
+function lbiRefuse(d: i32, def: i32, ks: i32[], us: i32[], ats: i32[]) {
+  const n = P.nodes[d]
+  if n is LetDecl {
+    const nm = demangleName(n.letName)
+    const all = [TY_I32, TY_I64, TY_F32, TY_F64]
+    let i = 0
+    while i < us.length {
+      let one = false
+      for t in all {
+        if lbiFits(d, def, t) && lbiRowTakes(ks[i], us[i], t) { one = true }
+      }
+      if !one {
+        lbiErrMsg.push(
+          "`"
+            + nm
+            + "` takes its type from its uses, and this one needs "
+            + lbiNeeds(ks[i], us[i])
+            + ", which its literal `"
+            + numLitText(lbiLitOf(lbiCandOf[d] ?? -1))
+            + "` does not fit — annotate `"
+            + nm
+            + "` or change the literal",
+        )
+        lbiErrAt.push(ats[i])
+        return 0
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < us.length {
+      let j = i + 1
+      while j < us.length {
+        let both = false
+        for t in all {
+          if lbiFits(d, def, t) {
+            if lbiRowTakes(ks[i], us[i], t) && lbiRowTakes(ks[j], us[j], t) {
+              both = true
+            }
+          }
+        }
+        if !both {
+          lbiErrMsg.push(
+            "`"
+              + nm
+              + "` takes its type from its uses, and they conflict: the use on line "
+              + i32ToStr(nodeLineOf(ats[i]))
+              + " needs "
+              + lbiNeeds(ks[i], us[i])
+              + " and the use on line "
+              + i32ToStr(nodeLineOf(ats[j]))
+              + " needs "
+              + lbiNeeds(ks[j], us[j])
+              + " — annotate `"
+              + nm
+              + "`",
+          )
+          lbiErrAt.push(ats[j])
+          return 0
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    lbiErrMsg.push(
+      "`"
+        + nm
+        + "` takes its type from its uses, and no one type satisfies them all — annotate `"
+        + nm
+        + "`",
+    )
+    lbiErrAt.push(d)
+  }
+  0
+}
+
+// Drop the solved types no read can observe. An integer binding written only by literals, whose
+// literal means the same at `i32`, each of whose reads widens where it stands to its solved `i64`
+// or `f64` or wider, has the same values at its literal's own type: its share of a re-check is
+// elided, and only its recorded type differs (D3246).
+export function lbiDropUnobservable() {
+  if lbiPinCand.length == 0 { return 0 }
+  const pinOf: i32[] = []
+  const loud: boolean[] = []
+  let c = 0
+  while c < lbiCands.length {
+    pinOf.push(-1)
+    loud.push(false)
+    c = c + 1
+  }
+  let i = 0
+  while i < lbiPinCand.length {
+    pinOf[lbiPinCand[i]] = lbiPinTy[i]
+    i = i + 1
+  }
+  let r = 0
+  while r < lbiRowCand.length {
+    const k = lbiKind[r]
+    if k == LBI_LO || k == LBI_EDGE || k == LBI_EDGE_FWD || k == LBI_FLOAT {
+      loud[lbiRowCand[r]] = true
+    } else if k == LBI_LIT && (lbiTy[r] & LBI_FIT_SAME) == 0 {
+      loud[lbiRowCand[r]] = true
+    }
+    r = r + 1
+  }
+  i = 0
+  while i < lbiReadNode.length {
+    const t = pinOf[lbiReadCand[i]]
+    if t >= 0 && !lbiReadNeutral(lbiReadWide[i], t) {
+      loud[lbiReadCand[i]] = true
+    }
+    i = i + 1
+  }
+  const keepC: i32[] = []
+  const keepT: i32[] = []
+  i = 0
+  while i < lbiPinCand.length {
+    const pc = lbiPinCand[i]
+    const t = lbiPinTy[i]
+    if loud[pc] || (t != TY_I64 && t != TY_F64) || !lbiSameAtI32(pc) {
+      keepC.push(pc)
+      keepT.push(t)
+    }
+    i = i + 1
+  }
+  lbiPinCand = keepC
+  lbiPinTy = keepT
+  0
+}
+
+// Does candidate `c`'s integer literal have the same value at `i32` as at any wider type? A
+// decimal does; a radix literal is a bit pattern, the same only below bit 31.
+function lbiSameAtI32(c: i32): boolean {
+  const n = P.nodes[lbiCands[c]]
+  if n is LetDecl {
+    const lex = intLitLexemeOf(lbiLitOf(c))
+    if lex == "" { return false }
+    const bits = numLexRadixBits(lex)
+    return bits < 0 || bits <= 31
+  }
+  false
+}
+
+// Whether the last solve found a binding to annotate.
+export function lbiPending(): boolean { lbiPinCand.length > 0 }
+
+// Write each solved type as the declaration's annotation, so the re-check reads it as written.
+export function lbiApplyPins() {
+  let i = 0
+  while i < lbiPinCand.length {
+    const d = lbiCands[lbiPinCand[i]]
+    const n = P.nodes[d]
+    if n is LetDecl {
+      const ann = mkTypeRef(tyToStr(lbiPinTy[i]), n.pos)
+      lbiSynth[ann] = d
+      markLetRetyped(d)
+      P.nodes[d] = {
+        letKw: n.letKw,
+        letName: n.letName,
+        letType: ann,
+        letInit: n.letInit,
+        pos: n.pos,
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Queue a read's note: the diagnostic, its raw message, the note, the declaration it names, the
+// name the value read, and the annotation it suggests.
+export function numLitReadNotePush(
+  di: i32,
+  msg: string,
+  note: string,
+  decl: i32,
+  use: string,
+  ann: string,
+) {
+  nlnDiag.push(di)
+  nlnMsg.push(msg)
+  nlnText.push(note)
+  nlnDecl.push(decl)
+  nlnUse.push(use)
+  nlnSlot.push("")
+  nlnWant.push(-1)
+  nlnAnn.push(ann)
+  0
+}
+
+// Record the read the note just queued names, and the scalar type it suggests (-1 for a list).
+export function numLitReadLeafPush(leaf: i32, ty: i32) {
+  nlnLeaf.push(leaf)
+  nlnLeafTy.push(ty)
+  0
+}
+
+// The function a function-value note names (`numLitFnFits`): its declaration, the binding that
+// holds it (the declaration itself, or the `let` of a lambda), that binding's name, its type, the
+// return type the destination wants, and the literals it returns.
+export let nlFnDecl = -1
+export let nlFnBind = -1
+export let nlFnName = ""
+export let nlFnTy = -1
+export let nlFnWant = -1
+export let nlFnLits: i32[] = []
+
+// The note for the function `numLitFnFits` found, raised at `at`: the literals its return
+// defaulted from, and its declaration spelled with the return annotation `ann`.
+export function numLitFnNote(ann: string, at: i32): string {
+  let who = "the lambda on " + rcwWhere(nlFnDecl, at)
+  if nlFnName != "" { who = "`" + demangleName(nlFnName) + "`" }
+  let lits = ""
+  let i = 0
+  while i < nlFnLits.length {
+    if i > 0 && i == nlFnLits.length - 1 { lits = lits + " and " }
+    else if i > 0 { lits = lits + ", " }
+    lits = lits
+      + "`"
+      + numLitText(nlFnLits[i])
+      + "` on "
+      + rcwWhere(nlFnLits[i], at)
+    i = i + 1
+  }
+  if nlFnLits.length == 1 {
+    lits = "the literal " + lits
+  } else {
+    lits = "only the literals " + lits
+  }
+  let got = ""
+  const gt = T.tys[nlFnTy]
+  if gt is TyFunc { got = tyToStr(gt.fnRet) }
+  " — "
+    + who
+    + " returns "
+    + lits
+    + ", so its return defaulted to `"
+    + got
+    + "`; annotate it: `"
+    + numLitFnSig(ann)
+    + "`"
+}
+
+// The declaration of the function `numLitFnFits` found, spelled with the return annotation `ann`:
+// a `function` declaration, or an arrow lambda with the binding that holds it.
+function numLitFnSig(ann: string): string {
+  const f = P.nodes[nlFnDecl]
+  const b = P.nodes[nlFnBind]
+  let sig = ""
+  if f is FuncDecl {
+    let body = " { … }"
+    if f.fnBody >= 0 && f.fnBody < P.nodes.length {
+      const blk = P.nodes[f.fnBody]
+      if blk is Block {
+        if blk.pos < 0 && blk.blkStmts.length == 1 {
+          body = " " + numLitText(blk.blkStmts[0])
+        }
+      }
+    }
+    const ps = "(" + numLitFnParams(f) + "): " + ann
+    if f.fnName != "" {
+      sig = "function " + demangleName(f.fnName) + ps + body
+    } else {
+      sig = ps + " =>" + body
+    }
+    if b is LetDecl {
+      sig = b.letKw + " " + demangleName(b.letName) + " = " + sig
+    }
+  }
+  sig
+}
+
+// Function `f`'s parameter list as the note spells it: each name with its resolved type.
+function numLitFnParams(f: FuncDecl): string {
+  const ft = T.tys[nlFnTy]
+  let out = ""
+  let i = 0
+  while i < f.fnParams.length {
+    const pn = P.nodes[f.fnParams[i]]
+    if i > 0 { out = out + ", " }
+    if pn is Param {
+      if pn.parRest == 1 { out = out + "..." }
+      out = out + pn.parName
+      let pt = -1
+      if ft is TyFunc {
+        if i < ft.fnParamTypes.length { pt = ft.fnParamTypes[i] }
+      }
+      if pn.parOpt == 1 {
+        out = out + "?"
+        if pt >= 0 && nullableInnerOrNone(pt) >= 0 {
+          pt = nullableInnerOrNone(pt)
+        }
+      }
+      if pn.parType >= 0 && pt >= 0 { out = out + ": " + tyToStr(pt) }
+      if pn.parDefault >= 0 && pn.parOpt != 1 { out = out + " = …" }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Does a queued function-value note name the read `r` with the suggestion `ann`?
+export function numLitFnReadNamed(r: i32, ann: string): boolean {
+  let m = 0
+  while m < nlnLeaf.length {
+    if nlnSlot[m] == "fn" && nlnLeaf[m] == r && nlnAnn[m] == ann { return true }
+    m = m + 1
+  }
+  false
+}
+
+// Drop every note on a declaration whose notes suggest two different annotations: no single one
+// fixes all of its uses.
+export function numLitNotesDisagree(drop: boolean[]) {
+  let i = 0
+  while i < nlnDecl.length {
+    let k = i + 1
+    while nlnAnn[i] != "" && k < nlnDecl.length {
+      if nlnDecl[k] == nlnDecl[i] && nlnAnn[k] != "" && nlnAnn[k] != nlnAnn[i] {
+        drop[i] = true
+        drop[k] = true
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Drop the queued notes of diagnostics at index `mark` or later, which a caller has popped: a
+// note is matched to its diagnostic by index and message, so a later one could inherit it.
+export function numLitNotesDropFrom(mark: i32) {
+  while nlnDiag.length > 0 && nlnDiag[nlnDiag.length - 1] >= mark {
+    nlnDiag.pop()
+    nlnMsg.pop()
+    nlnText.pop()
+    nlnDecl.pop()
+    nlnUse.pop()
+    nlnSlot.pop()
+    nlnWant.pop()
+    nlnAnn.pop()
+    nlnLeaf.pop()
+    nlnLeafTy.pop()
+  }
+  0
+}
+
+export let nluAtoms = 1
