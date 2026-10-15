@@ -28164,7 +28164,8 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // plain scalar. `canonEmitName` reaches this by name, this renderer by arena index.
       const nlb = numLitUnionBaseName(ix)
       if nlb != "" { return nlb }
-      return udn
+      // …and an alias whose lists all spell one list denotes that list, rendered below.
+      if oneListUnionRender(ix) == "" { return udn }
     }
   }
   const t = T.tys[ix]
@@ -30257,6 +30258,13 @@ export function numLitUnionAliasName(name: string) {
   numLitUnionBaseName(ti)
 }
 
+// The list a declared alias denotes when its members are lists that all spell one
+// (`type A = i32[] | K[]`), or "": the alias is that list, so it registers no union row.
+export function oneListUnionAliasName(name: string): string {
+  if !cUserTypes.has(name) { return "" }
+  oneListUnionRender(cUserTypes[name] ?? -1)
+}
+
 // True if `name` is an application of a declared generic alias whose argument list closes
 // the whole name (`Box<i32>`), not `Box<i32>[]` or `Box<i32>|Tag`, whose suffix a caller
 // peels first. Checked against the generic-alias registry (`gaIndexOf`), not taken on the
@@ -30892,6 +30900,11 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   if nla != "" {
     canonAtoms = 1
     return nla
+  }
+  const ola = oneListUnionAliasName(name)
+  if ola != "" {
+    canonAtoms = 1
+    return ola
   }
   if !nameNeedsCanon(name) { return name }
   // A top-level union: canon each member and collapse duplicates (a mixed-base union keeps
@@ -60916,12 +60929,44 @@ export function nodeTyIsUnionAlias(ix: i32) {
   // | null`, matched via `nulNumLitUnionBaseName` since inline/declared forms intern differently.
   nulNumLitUnionBaseName(ty) != ""
 }
-// A `{tag, value}` value/struct union box: `TyUnion`, 2+ members, not a pure literal union.
+// The one list a union of 2+ lists renders as when every member spells it, nominally too
+// (`i32[] | K[]` over a numeric literal union `K`, not `Rec[] | Rec2[]`), else "". Such a union
+// is that list at every position, never a box: an `is` has nothing to tell its members by (D4743).
+export function oneListUnionRender(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return "" }
+  if t.uMembers.length < 2 { return "" }
+  for m in t.uMembers {
+    if m < 0 { return "" }
+    if !(T.tys[m] is TyArray) { return "" }
+  }
+  // Both renders write the renderer's globals, which a caller mid-render still reads.
+  const atoms0 = tyNameAtoms
+  const cyc0 = nomNameCycle
+  const nom0 = tyToNominalName(t.uMembers[0])
+  let same = nom0 != ""
+  for m in t.uMembers {
+    if same && tyToNominalName(m) != nom0 { same = false }
+  }
+  let r = ""
+  if same {
+    r = tyToEmitName(ty)
+    if tyNameAtoms != 1 { r = "" }
+  }
+  tyNameAtoms = atoms0
+  nomNameCycle = cyc0
+  r
+}
+
+// A `{tag, value}` value/struct union box: `TyUnion`, 2+ members, not a pure literal union, nor
+// a union of lists that all spell one list (`oneListUnionRender`).
 function isValueUnionBox(tyix: i32) {
   if tyix < 0 { return false }
   const t = T.tys[tyix]
   if t is TyUnion {
     if t.uMembers.length < 2 { return false }
+    if oneListUnionRender(tyix) != "" { return false }
     // A homogeneous literal union (all members of one base scalar) is an interned atom or that
     // scalar, not a box; a mixed-base one (`"x" | 7`, or `1 | 9000000000`) shares no one scalar,
     // so it boxes, as `softenLitTy` declines to soften it (D3491).

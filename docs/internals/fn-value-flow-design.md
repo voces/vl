@@ -848,6 +848,13 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      A field pinned at two signatures keeps the per-call rewrite of the flow reads, which now
      also reach a generic declared inside a function where the read is in its scope. This
      closes D4700, where the retired walk missed an alias call and emitted invalid wasm.
+   - Sixth PR: `monoPinGenericList` retires, with `monoFeIsSrc`, `monoCallsPerRead`,
+     `monoPinSigWithRet`, `monoListElemWrites` and `monoListElemCalls`. The element of an
+     un-annotated `const` list literal is instanced at the one signature the table pins its
+     `e` slot at, and so is each value a write `d[k] = v` stores (`d[0] = v` included); the
+     writes come from the mono write index under `e:`. An element pinned at two signatures
+     keeps the flow reads' per-call rewrite, which now re-plans a list a spread copied into.
+     This closes D4301, where a call through a non-constant index pinned nothing.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
