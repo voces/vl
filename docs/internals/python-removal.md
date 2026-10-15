@@ -1,11 +1,12 @@
 # Python removal census
 
-Owner directive 2026-10-13: no Python in the repo; tooling is written in VL. Census at
-`df4771000`: 233 tracked `.py`, 44,547 lines. After the first PR: 161 files, 27,128 lines
-(`scripts/py-budget.vl`, baseline `scripts/py-budget-baseline.json`, rows `py budget` in
-`scripts/gate.sh` and the ci-native job). Inline `python3 -` heredocs in shell
-(`bench/run.sh`, `scripts/mono-tyaram-grid.sh`, `scripts/run-lint-diff.sh`,
-`scripts/perf/seed-sections.sh`) are not `.py` files and are not counted yet.
+**Status: complete (2026-10-14).** Owner directive 2026-10-13: no Python in the repo; tooling is
+written in VL. The census at `df4771000` was 233 tracked `.py`, 44,547 lines; none remain, and
+no script invokes an interpreter. `scripts/no-python.vl` (gate row `no-python`, ci.yml step
+`No Python`) fails on any tracked `.py` file and on a `python`/`python3` word on a non-comment
+line of a tracked `.sh`, `.yml`, `.ts` or `.vl` file. The ratchet (`py-budget.vl` and its
+baseline) and the interpreter preflight (`$PYTHON`, `python-preflight.sh`) are deleted. The
+tables below are the historical census.
 
 | Class | Meaning | Files | Lines |
 | --- | --- | --- | --- |
@@ -37,7 +38,7 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/{rows,ls,split,selftest}.py` deleted, the row grammar is `scripts/lib/inventory.vl` | - |
 | 7 | `lint-self.sh` (`matrix.py`) | done: `scripts/capability-matrix.vl`, `matrix.py` deleted | - |
 | 8 | `refresh-compiler.sh` | done: `seed-provenance.vl` (via `record-seed-provenance.sh`); `seed_provenance.py` is deleted and `tests/vl_seed_provenance_test.ts` holds the VL fold to the values the Python printed on a fixed tree | - |
-| 9 | `python preflight` | none (`python-preflight.sh`) | delete the row with the last `.py` |
+| 9 | `python preflight` | none | done: the row and `python-preflight.sh` are deleted |
 | - | `plumb-shape cost`, `filed witnesses`, `capability probes`, `distilled corpus`, `baseline freshness`, `survey measurements`, `interp budget`, `sentinel-index budget` | ported on master; `plumb-shape-cost.py`, `survey-regrade.py`, `check-filed-witnesses.py` and `distilled/{regress,index,redistil}.py` (+ `gradecensus.py`) deleted | done: `distilled/cellmap.py` is deleted (`loadCells`/`dumpCells`), and `corpuscmp.py`, `grade.py` and `profile-rank.py` are deleted for their VL ports (rows below) |
 
 Rows 1-5 are done and `ratchet.py` is deleted. The four inline python heredocs in shell are
@@ -48,6 +49,10 @@ cells are byte-identical to the Python's), `scripts/perf/seed-sections.sh` calls
 `bench/report.vl`. The bench harness also lost its Python column (the `main.py` rows above are
 now unreferenced by it), so `results.json` and `summary.md` have no `python` members from the next
 sweep on.
+Rows 1-5 are done and `ratchet.py` is deleted. The inline python heredocs are gone too: the
+`mono-tyaram-grid.sh` generator is `scripts/mono-tyaram-cells.vl`, the `bench/run.sh` report is
+`bench/report.vl` (meta reading and string escaping are `jq`), `run-lint-diff.sh` splices with
+sed and awk, and `seed-sections.sh` calls `scripts/perf/seed-sections.vl`.
 
 ## Files
 
