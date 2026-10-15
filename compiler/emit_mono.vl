@@ -11319,6 +11319,19 @@ function monoNamesGenericInstance(v: i32, ctx: i32): boolean {
   o < monoGen.length && monoGen[o] == 1 && !criFnIsAnonLambda(o)
 }
 
+// The slot value node `v`, read in frame `ctx`, names by a hole lambda's own name or one of its
+// instances' names, as a delivery renames it; -1 for any other node.
+function monoLamInstanceNamed(v: i32, ctx: i32): i32 {
+  const n = P.nodes[v]
+  if !(n is Ident) { return -1 }
+  const fe = monoFnFeOfIdent(v, n.identName, ctx)
+  if fe < 0 { return -1 }
+  let o = fe
+  if fe < fnInstOrigin.length && fnInstOrigin[fe] >= 0 { o = fnInstOrigin[fe] }
+  if !criFnIsAnonLambda(o) { return -1 }
+  fe
+}
+
 // Per capture-cell value node naming a generic, the parameter list it is instanced at,
 // normalized. A node asked again at another list is one value two types want.
 let monoCellCoercedSig: {[i32]: string} = Map()
@@ -11375,6 +11388,15 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
       return monoCellConcreteTake(nodeTyIxOf(fnStmts[lfe]), tname, 0)
     }
     return 0
+  }
+  // A hole lambda that a delivery at a pin renamed to its instance holds that instance's
+  // signature, so taking the write again agrees or wants a second type (D4843).
+  const ife = monoLamInstanceNamed(x, ctx)
+  if ife >= 0 {
+    const had = monoSlotSig(ife)
+    if had == "" { return 2 }
+    if had == monoFnNameSig(tname) + ";" { return 0 }
+    return 1
   }
   // Another cell's read delivers that cell at this type (D3949).
   const src = monoCellReadName(x)
@@ -13712,16 +13734,11 @@ function monoWalk(ix: i32, ctx: i32) {
         }
       }
       // A store into an element or a field of a binding delivers at the one signature the flow
-      // table pins that slot at in this frame (D3909). A capture cell's store delivers at the cell's
-      // element pin, except a value read through another cell: that source cell's own pin
-      // already delivered it.
+      // table pins that slot at in this frame (D3909), and a capture cell's store at the cell's
+      // element pin, a value read through another cell included.
       if tgt is Index {
         let sn = monoPlacePinName(n.binLeft, "", ctx)
-        if monoIsCellRead(n.binLeft) {
-          const cp: string[] = ["e"]
-          sn = monoSlotPinName(identDeclOf(tgt.idxArr), cp, ctx)
-          if monoIsCellRead(unwrapParen(n.binRight)) { sn = "" }
-        }
+        if monoIsCellRead(n.binLeft) { sn = monoCellPinName(n.binLeft, ctx) }
         if monoDeliverAtPin(n.binRight, sn, ctx) < 0 { return -1 }
       }
       if tgt is Member {
