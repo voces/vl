@@ -7062,7 +7062,10 @@ allocates more than one 192 MiB semispace, which is where null's footprint cross
 The self-compile is +59% under copying and the gate runs it many times; its entry file is small,
 so `auto` picks null, and every self-compile script (`native-fixpoint.sh`,
 `self-compile-time.sh`, `refresh-compiler.sh`, `survey-profile.sh`) also exports
-`VL_COMPILE_GC=null`, so a change to the threshold cannot move the fixpoint's collector. The threshold reads the ENTRY file only, because the host loads imports on
+`VL_COMPILE_GC=null`, so a change to the threshold cannot move the fixpoint's collector. (The +59% and the pin are
+both superseded: those scripts now source `scripts/self-compile-gc.sh`, copying from a 2 GiB heap,
+which costs the self-compile no CPU — "The self-compile runs under copying from a 2 GiB heap"
+below.) The threshold reads the ENTRY file only, because the host loads imports on
 demand and cannot sum them first. A small entry importing large modules therefore stays null;
 `VL_COMPILE_GC=copying` is the escape.
 
@@ -7150,8 +7153,8 @@ of what is left.)
 **Supersedes the entry-file threshold above.** `vl build` and `vl run` compile under the
 copying collector from a 256 MiB first heap at EVERY entry-file size (`compile_engine`,
 `scripts/vl-host/src/main.rs`). `$VL_COMPILE_GC=null|copying` stay as overrides (`auto` is
-copying), `$VL_COMPILE_GC_HEAP` still sets the first heap, and the self-compile scripts still
-pin null.
+copying), `$VL_COMPILE_GC_HEAP` still sets the first heap. The self-compile scripts pinned null until
+2026-10-15 and now pin copying from a 2 GiB heap (the section after this one).
 
 **Why.** The threshold read the ENTRY file, so sunpa's `game.vl` — a 260 KB entry over a 2 MB
 module graph — compiled under null and held every byte the compiler allocated: 2.4 GB peak per
@@ -7181,9 +7184,8 @@ the most collections but the least memory, and keeps the engine configuration �
 `.cwasm` sidecar — that `refresh-compiler.sh` already warms. Each distinct value is a fresh
 Cranelift compile of the seed (~9 s, ~1.9 GB peak, once per host binary).
 
-**Why the self-compile stays null.** It is the one input here where null is faster (~10% wall,
-~16% CPU, against 54% less memory), and the gate runs it many times; the scripts pin it, so the
-default does not move it.
+The self-compile's own collector is the next section's: it was pinned null here and is no
+longer.
 
 **Declined.**
 * *A null start that switches to copying when the heap nears a size.* Impossible mid-instance:
@@ -7198,6 +7200,68 @@ default does not move it.
 **Rows that moved.** D2771, D2780 and D3407 filed a compiler trap that was the null heap filling
 with garbage; under copying their witnesses build in 8–10 s at about 300 MB, and the trap is
 closed while the exponential cost in their titles stays open.
+
+## The self-compile runs under copying from a 2 GiB heap (2026-10-15) — D4942
+
+**The rule.** Every script that compiles the compiler (`refresh-compiler.sh`,
+`native-fixpoint.sh`, `self-compile-time.sh`, `survey-profile.sh`) sources
+`scripts/self-compile-gc.sh`, which exports `VL_COMPILE_GC=copying` and
+`VL_COMPILE_GC_HEAP=2G`. CI's seed, publish and fuzz jobs reach the self-compile only through
+those scripts. `self-compile-time.sh` also reads the copying heap's peak live set
+(`VL_GC_STATS=1`) and fails past 75% of the 2 GiB that is the most a copying heap can hold live.
+
+**Why null had to go.** Under null the 4 GiB heap cap is a cap on TOTAL allocation, not on what
+is live, and the self-compile's total grows with every merge. Each commit's own fixpoint seed
+compiling itself, `VL_COMPILE_GC=null`, `[alloc] guest`:
+
+| commit (date) | allocated | of 4 GiB | guest fuel |
+| --- | ---: | ---: | ---: |
+| `deeedb5a8` (10-07) | 2,166,890,496 | 50.5% | 60.61e9 |
+| `1af9fe52f` (10-08) | 2,041,344,000 | 47.5% | 58.07e9 |
+| `cbda47ace` (10-13) | 3,167,567,872 | 73.7% | 71.53e9 |
+| `d3a1d199e` (10-14) | 3,445,157,888 | 80.2% | 78.67e9 |
+| `56035e845` (10-15) | 3,487,502,336 | 81.2% | 79.69e9 |
+| `479bffedb` (10-15) | 3,645,943,808 | 84.9% | 89.57e9 |
+
+That is +478 MB over the last 200 merges and ~650 MB of headroom left. #3863 (3,542,106,112 B)
+plus ONE appended generic declaration was enough: it builds and reaches its fixpoint under
+copying, and the null self-compile traps `wasm trap: allocation size too large`. A cliff that one
+ordinary declaration falls off is not headroom.
+
+**Why copying costs nothing here now.** The section above measured null ~10% faster on the
+self-compile; that reading was the 256 MiB default, and does not hold at 2 GiB. On `479bffedb`,
+four rounds in rotated order on a loaded box (load 15–70), CPU = user+sys, all four
+configurations emitting the same 5,782,219 bytes:
+
+| configuration | CPU per round (s) | peak RSS | collections | peak live |
+| --- | --- | ---: | ---: | ---: |
+| null | 19.1 / 17.1 / 19.3 / 28.1 | 3,912 MB | 0 | — |
+| copying 256 MiB (the default) | 20.4 / 25.1 / 30.0 / 40.8 | 1,114 MB | 62 | 484,078 KiB |
+| copying 1 GiB | 17.7 / 22.1 / 29.7 / 36.0 | 1,114 MB | 44 | — |
+| copying 2 GiB | 15.5 / 18.1 / 19.1 / 28.3 | 2,163 MB | 6 | 476,784 KiB |
+
+The 256 MiB default doubles to a 512 MiB semispace and stops there, with a ~480 MB live set
+inside it — the bad band the section above describes, re-collecting 62 times. 2 GiB starts past
+it: six collections, CPU level with null, 45% less RSS.
+
+**Why this removes the cliff rather than moving it.** A copying heap's limit is the live set
+against a 2 GiB semispace (half the 4 GiB cap), and the live set is 477 MB — about 4x headroom,
+and growth in garbage costs collections, not a trap. That is what the tripwire watches: a live
+set nearing the cap is a compiler that keeps too much alive across phases, and no collector
+setting fixes it.
+
+**What did not move.** Guest fuel is the same under either collector (89,567,007,365 on
+`479bffedb`), so `scripts/self-compile-baseline.json` stands. Fixpoint bytes are identical. The
+2 GiB setting is its own engine configuration, so the seed gets one more `.cwasm` sidecar, which
+`refresh-compiler.sh`'s sanity run warms.
+
+**Declined.**
+* *(b) keep null, add a headroom failure and an allocation ratchet.* The ratchet would fire on
+  ordinary growth every few hundred merges and the only response to it is this change; null's
+  cap stays a cap on everything ever allocated.
+* *Free the compiler's tables between phases.* Worth doing for the live set, but cannot help
+  null, which never frees.
+* *Copying from the 256 MiB default.* Fixes the cliff but re-collects 62 times, +20–45% CPU.
 
 ## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
 
