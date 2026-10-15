@@ -10,7 +10,6 @@
 # `--require-profile` is what makes a missing profile a failure rather than a quiet skip.
 set -u
 cd "$(dirname "$0")/.."
-export PYTHON="${PYTHON:-python3}"
 VL="${VL:-scripts/vl-host/target/release/vl}"
 # The profiled self-compile runs under the null collector by choice, as every self-compile
 # script pins it (DECISIONS.md, "The compiler's collector is copying by default").
