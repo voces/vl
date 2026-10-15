@@ -941,6 +941,23 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
+   - First PR: `monoCellCall`'s callee read moves onto the slot pin.
+     - A call through a capture cell takes the one signature the table pins the cell's `e`
+       slot at in the frame (`monoCellPinName`, which replaces `monoCellFnTyNameAt`). A cell
+       seeded with a named generic still instances at the call.
+     - A probe on the old read fired in 90 `@run` fixtures, never through an alias. The pin
+       gave the same parameters at every one of them.
+     - The pin of a zero-parameter function type made `monoCellConcreteTake` refuse
+       (`capture-by-reference`), because it read the empty parameter list as no function
+       type. It now tests for the arrow.
+     - Forcing the pin empty loses 2 fixtures, and the pin keeps both. 0 of 3,849 `@run`
+       fixtures move, and 0 of 10,210 modules differ.
+     - The two cell cases the tenth part of step 4 left wait on step 6. Each was tried alone.
+       Coercing a value read through another cell at the pin forces the source cell's hole
+       lambdas to one signature, so `binding-copied-through-uncalled-chain` is refused.
+       Delivering a hole lambda at a cell store's pin (`monoDeliverAtPin`) runs D4842, but
+       refuses that fixture too, because `monoBindingSigConflict` still holds each reassigned
+       binding at one signature.
 6. **Refusal.**
    - The remaining fall-throughs in `monoCoerceFnValueName` / `monoInstanceFor` become the
      (c) literal.
