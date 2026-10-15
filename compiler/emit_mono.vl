@@ -11173,6 +11173,7 @@ function monoDeclPathPins(lf: i32[], path: string[]): string[] {
 function monoDeclLivePathPins(lf: i32[], path: string[]): string[] {
   const dead: {[i32]: boolean} = Map()
   for f in fnFlowDeclPathPinFns(lf[1], path) {
+    // arena-tick exempt: dead is this function's local table, not the arena
     if f >= 0 && f != lf[0] && monoWriteFrameDead(f, lf[0]) { dead[f] = true }
   }
   monoDeclPathKeys(lf, path, false, dead)
@@ -14255,19 +14256,54 @@ function monoBindingsAtPin(nDecl: i32): i32 {
   const order: i32[] = []
   for k in monoWriteOrder { order.push(k) }
   for k in order {
-    for i in monoWriteListAt(k) {
-      const nd = P.nodes[i]
-      if nd is BinExpr {
-        const wf = monoTopFrameOf(i)
-        const lf = monoReadLetFrame(nd.binLeft, wf)
-        if lf[1] >= 0 && !(seen[lf[1]] ?? false) {
-          seen[lf[1]] = true
-          if monoBindingAtPin(lf, nDecl) < 0 { return -1 }
+    // Locating a write's frame walks the program, so a binding that cannot hold a lambda is
+    // passed over before any of its writes is located.
+    let kd = k
+    if k < 0 { kd = 0 - 1 - k }
+    if monoBindingMayHoldLam(kd) {
+      for i in monoWriteListAt(k) {
+        const nd = P.nodes[i]
+        if nd is BinExpr {
+          const wf = monoTopFrameOf(i)
+          const lf = monoReadLetFrame(nd.binLeft, wf)
+          if lf[1] >= 0 && !(seen[lf[1]] ?? false) {
+            // arena-tick exempt: seen is this function's local table, not the arena
+            seen[lf[1]] = true
+            if monoBindingAtPin(lf, nDecl) < 0 { return -1 }
+          }
         }
       }
     }
   }
   0
+}
+
+// Whether the binding declared at `k` may hold a hole lambda: an un-annotated `let` whose
+// initializer or some write's value is a lambda literal or a name read, the only values
+// `monoLamValueFe` resolves to one. A necessary condition, read without locating any frame.
+function monoBindingMayHoldLam(k: i32): boolean {
+  if k < 0 || k >= P.nodes.length { return false }
+  const d = P.nodes[k]
+  if !(d is LetDecl) { return false }
+  if d.letKw != "let" || d.letType >= 0 || d.letInit < 0 { return false }
+  let iv = d.letInit
+  const ce = monoGeneratedCellElem(iv)
+  if ce >= 0 { iv = ce }
+  if monoValueMayNameLam(iv) { return true }
+  for key in ["n:", "c:"] {
+    for i in monoWritesOf(key, k) {
+      const nd = P.nodes[i]
+      if nd is BinExpr && monoValueMayNameLam(nd.binRight) { return true }
+    }
+  }
+  false
+}
+
+// Whether the value at `vx` is a lambda literal or a name or capture-cell read.
+function monoValueMayNameLam(vx: i32): boolean {
+  P.nodes[vx] is FuncDecl
+    || monoIdentNameOf(vx) != ""
+    || monoCellReadName(vx) != ""
 }
 
 // `monoBindingsAtPin` for the binding `lf` (`[frame, declaration]`).
