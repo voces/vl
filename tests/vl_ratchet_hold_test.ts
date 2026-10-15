@@ -77,24 +77,28 @@ Deno.test({
 });
 
 // The control for the graph staging above: typecheck.vl reads map globals it imports
-// (`fnDeclIx` from check_write_scan.vl), which one file's text cannot tell from a list.
-// Without the graph those reads are hits the CLI's graph lint, and so the baseline, never
-// counts.
+// (`fnDeclIx` from check_write_scan.vl), which one file's text cannot tell from a list, and
+// hands ladder defaults to functions it imports (`zeroBytesBindScan` to `rcwModOf`), which
+// one file's text cannot tell from an undeclared call. Without the graph both are hits the
+// CLI's graph lint, and so the baseline, never counts.
 Deno.test({
-  name: "ratchet-hold: the editor reads an imported map global the way the CLI does",
+  name: "ratchet-hold: the editor reads an imported map global and function the way the CLI does",
   ignore: !ENABLED,
   fn: async () => {
     const src = Deno.readTextFileSync(TARGET);
     const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
-    const sentinel = (ds: { code?: unknown }[]) =>
-      ds.filter((d) => d.code === "sentinel-index-unguarded").length;
-    const alone = sentinel(checker.lint(src, REL));
-    const inGraph = sentinel(await lintFindings(src));
-    if (inGraph >= alone) {
-      throw new Error(
-        `want fewer sentinel-index-unguarded hits inside the module graph than alone; ` +
-          `alone ${alone}, in graph ${inGraph}`,
-      );
+    const aloneDs = checker.lint(src, REL);
+    const graphDs = await lintFindings(src);
+    for (const code of ["sentinel-index-unguarded", "kind-ladder-incomplete"]) {
+      const count = (ds: { code?: unknown }[]) => ds.filter((d) => d.code === code).length;
+      const alone = count(aloneDs);
+      const inGraph = count(graphDs);
+      if (inGraph >= alone) {
+        throw new Error(
+          `want fewer ${code} hits inside the module graph than alone; ` +
+            `alone ${alone}, in graph ${inGraph}`,
+        );
+      }
     }
   },
 });

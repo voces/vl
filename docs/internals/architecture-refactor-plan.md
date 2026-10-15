@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, eighth part moves the literal arms of `monoCoerceFnValueName` onto the table's per-slot pin of the literal itself. Next: the concrete half of `monoNotePushDeliveries` (hole-lambda pushes); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
+| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, tenth part moves the element store `p[k] = v` onto the slot pin (a capture cell's store reads the cell's `e` pin). Next: the other concrete reads in `monoWalk` (a call's callee type, an un-annotated local's write); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a re-made `if` link, a checker rest pack and a re-made call record their type (campaign §13.24). Next: the `d511_*` mono `ArrayLit`, the typed remainders (`_[] | null`, `d3140_*`), `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -31,7 +31,7 @@ restate measurements; follow the links.
 | L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: `expCtxReset` clears the 17 pending seeds at compile start, never-cleared 172 of 1,156 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
 | L6 registries by key | step 5 **in progress**. Last: second switch (#3661), `unionNameOfExpr/is` on the key, 12 sites. Next: `ctr/unionName` (site 42), blocked on the struct-union alias sibling (class As). | [L6 log](#l6-log) |
-| L10 the `-O` optimizer | **in progress as T4**. Last: R6a, the inline-record census (`compiler/opt_inline.vl`), runs beside the Rust. Next: R6b (walk and decision), R6c (rewrite), then R7, list flattening. | [L10 log](#l10-log) |
+| L10 the `-O` optimizer | **in progress as T4**. Last: R6b, the inline-record walk and decision (`compiler/opt_inline_scan.vl`), runs beside the Rust. Next: R6c (rewrite, default flip, Rust deletion), then R7, list flattening. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: `HOST_FLOOR` (`main.rs`) is the host floor in one table, held to the compiler by `tests/vl_host_floor_test.ts`. Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
@@ -141,7 +141,7 @@ order, subject to the one-writer rule.
 | T1 | **Done.** The host process ABI: `std:process` (`runProgram`, `exit`) and `std:env` (`getEnv`) shipped with their host imports; see ROADMAP's "Host ABI for VL scripts". | — |
 | T2 | L11 the VL way: per-file budgets run under `vl check --budget`. **Done.** See [T2 log](#t2-log). | none |
 | T3 | Dogfood the Python scripts in VL. **In progress.** Last: the last `scripts/*.py` tools ported and deleted. Remaining Python in gate rows includes the ratchets. See [T3 log](#t3-log). | T1 |
-| T4 | L10: the `-O` optimizer. **In progress:** R1–R5 landed. Next: R6b, R6c, then R7. See [T4 log](#t4-log). | owner decision 3 below |
+| T4 | L10: the `-O` optimizer. **In progress:** R1–R5 landed, R6a and R6b run beside the Rust. Next: R6c, then R7. See [T4 log](#t4-log). | owner decision 3 below |
 | T5 | L12: the remaining LSP features. **Done:** every seed-backed feature lives in `lsp/src/features.ts`; `server.ts` is transport. See [T5 log](#t5-log). | A7 |
 
 ## Concurrency
@@ -216,6 +216,8 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The sixth part retires `monoPinGenericList` (with `monoFeIsSrc`, `monoCallsPerRead`, `monoPinSigWithRet`, `monoListElemWrites`, `monoListElemCalls`): a list element and its writes, `d[0] = v` included, are pinned at the table's `e` signature, and a spread copy re-plans the list it expanded into; closes D4301.
 - The seventh part retires `monoStoreAnnName` (with `monoLocalAnnName`, `monoInstTyName`, `monoFieldAnnName`): a store `p[k] = v` / `p.f = v`, a `push` and a map `set` deliver at the one signature the table pins the place's slot at in that frame, read by declaration and path; 0 of 1,679 generic and lambda fixtures and 0 corpus classes moved.
 - The eighth part moves the list and record literal arms of `monoCoerceFnValueName` off the expected type's spelling (retiring `monoStructFieldTypes`, `monoGenAliasFieldTypes`, `monoArrElemHoldsFn`): each element or field value delivers at the table's pin of the literal's own `e` / `f.<name>` slot, with the annotated return; 0 of 3,844 `@run` fixtures differ, forcing the pin empty loses exactly the 10 the two arms' ablations lose, and difftree is byte-identical. The concrete half of `monoNotePushDeliveries` stays: reading only the slot pin loses the 5 hole-lambda push fixtures its ablation loses.
+- The ninth part retires the concrete half of `monoNotePushDeliveries`: a push or `set` delivers at the table's slot pin only. The 5 fixtures lacked a pin because `ffMethod` stored with a two-way `ffUnion`, so an element slot saw the pins of the lambda's other deliveries. A one-way `ffInto` gives each slot its one pin. 0 of 3,844 `@run` fixtures differ, and reverting the edge alone loses exactly the 5. `difftree --identity`: 2 of 10,204 modules differ, both with the same output (a removed second coerce, and a direct instance read).
+- The tenth part moves the element store `p[k] = v` in `monoWalk` off its concrete element-type read (`monoMapValTy` retires). A store delivers at the table's slot pin only (`monoDeliverAtPin`). A capture cell's store coerces at the cell's `e` pin, except a value read through another cell. The pin of a user store `fs[0] = v` had always been "": `monoPlaceRoot` refused any `name[0]` as a cell read, and the element-type read hid this. `monoIsCellRead` now requires the binding the capture rewrite declared. Forcing the pin empty loses exactly the 12 fixtures that removing both old arms loses, and 0 of 3,844 `@run` fixtures move.
 
 ### L2 log
 
@@ -305,7 +307,8 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - R4, the module writer (`compiler/wasm_write.vl`, #3703), decodes and re-encodes every module R1 reads byte for byte.
 - R5, the multi-value step (`compiler/opt_multivalue.vl`), is the default and its Rust is deleted; 0 of 15,372 programs differ from the host built before the deletion.
 - R6a, the inline-record step's census (`compiler/opt_inline.vl`, `$VL_OPT_INLINE=vl`), runs beside the Rust and decides the 8,718 of 10,293 built programs that hold no leaf record; 0 of 15,372 differ.
-- Next: R6b (the walk and decision), R6c (the rewrite), then R7, list flattening.
+- R6b, the step's walk, dataflow and decision (`compiler/opt_inline_scan.vl`, `optInlineDecide`), runs beside the Rust: the host rewrites by the compiler's decision under `vl` and `both`; 0 of 15,389 programs differ, and 1,631 of the 1,645 that reach the decision are decided by the compiler (the other 14 do not validate).
+- Next: R6c (the rewrite, the default flip and the Rust deletion), then R7, list flattening.
 
 ### L13 log
 
@@ -390,8 +393,8 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 
 - L10: the `-O` optimizer.
 - **In progress:** rungs R1, R2, R3 and R5 (the multi-value step) run in the compiler and their Rust is deleted, and R4 (a module writer) has landed.
-- R6a (the inline-record step's census) runs beside the Rust.
-- Next: R6b (its walk and decision), R6c (its rewrite), then R7 (list flattening).
+- R6a (the inline-record step's census) and R6b (its walk and decision) run beside the Rust.
+- Next: R6c (its rewrite), then R7 (list flattening).
 
 ### T5 log
 

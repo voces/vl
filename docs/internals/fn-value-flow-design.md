@@ -872,6 +872,49 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      checker leaves open takes the closed type of an argument to a bare parameter of that type.
      The concrete half of `monoNotePushDeliveries` still stays: reading only the slot pin there
      loses exactly the five hole-lambda push fixtures its ablation loses.
+   - Ninth PR: the concrete half of `monoNotePushDeliveries` retires. A push or `set` reads only
+     the table's pin of the element or value slot (`monoDeliverAtPin`), and a hole lambda it
+     names takes its per-signature instance there (`monoNoteBindDeliveryAt`). The five fixtures
+     did not need a new model. The table had no pin for them because `ffMethod` stored a pushed
+     or `set` value with `ffUnion`, so the edges ran both ways. The element slot then reached
+     the lambda's slot and, through it, every other slot the lambda went to. In `twoLists`,
+     `fs.e` saw the `i32` pin of `gs.e`. In `…-set-into-map-then-called-directly`, `ms.v` saw
+     the `string` pin of the direct call `tw("s")`. Each slot had two pins and answered "".
+     Every slot had its own single pin; the instancing per delivery was already
+     `monoNoteBindDeliveryAt`'s job. A stored value now flows into the slot only (`ffInto`),
+     as an element write and a literal element already did. With the probe on the old
+     element-type read over 15,399 files (`tests/cases` and the distilled corpus), the pin
+     and the element type now agree wherever the element type is concrete, except one
+     return. In `literal-unions/const-literal-widening`, the pin reads `() => void` where the
+     type reads `() => string`. The value there is a lambda literal, which neither delivery
+     path instances. Reverting the edge alone loses exactly the five. The element store
+     `p[k] = v` in `monoWalk` keeps its own concrete element-type read, which no ablation
+     here touched. Two modules of 10,204 built change bytes, with the same output. In
+     `generics/binding-of-generic-function-delivered-as-value` the old code coerced a push
+     twice when pin and element type agreed, and the second pass read `k` through the alias's
+     global. In `closures/hole-lambda-pushed-into-typed-list` the edge alone moves it: `c` no
+     longer shares its pushes' pin, so `fs[0] = c` reads the instance's global directly.
+   - Tenth PR: the element store `p[k] = v` in `monoWalk` stops reading the element's concrete
+     type (`monoMapValTy` retires). A store delivers at the table's pin of the place's slot only
+     (`monoDeliverAtPin`). Removing the old read exposed a defect: `monoPlaceRoot` refused
+     every `name[0]` as a capture cell's read, because `monoCellReadName` is purely syntactic,
+     so a user store `fs[0] = v` had no place root and its pin was always "". `monoIsCellRead`
+     now also requires that the binding is the one the capture rewrite declared. A capture
+     cell's own store `cell[0] = v` coerces at the cell declaration's `e` pin. Two cases stay
+     with the cell path. The per-signature instance of a hole lambda stays there: a delivery
+     there makes a reassigned binding hold calls at two argument types. A value read through
+     another cell stays there too: coercing it leaves the written binding's type unsettled.
+     Forcing the pin empty loses the same 12 fixtures as removing both old `Index` arms, and
+     0 of 3,844 `@run` fixtures move. Four modules of 10,204 change bytes, with the same
+     output:
+     - In `fn-scope-alias-same-name-two-functions` two instances swap order.
+     - In `delivered-alias-function-scope` the instance globals reorder, and one store reads
+       the instance's global directly.
+     - In `hole-lambda-binding-one-signature` the cell store `d1 = d1`, in a writer that is
+       never called, no longer coerces, so two calls through the binding become direct.
+     - In `captured-cell-unnamed-writer-two-instances` the uncalled `flip` of the `string`
+       frame stores `other`'s `string` instance. The old element-type read stored the `i32`
+       instance there.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.

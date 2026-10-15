@@ -43,7 +43,8 @@ after, on one seed.
 | R4 | a module writer: sections, types, bodies (`inline::assemble`, `type_section`, `encode_sub`, `finish_body`) (`compiler/wasm_write.vl`) | `$VL_OPT_ROUNDTRIP` (a check, not a side) | decode then encode is the identity over every module R1 reads |
 | R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) (`compiler/opt_multivalue.vl`); the default, its Rust deleted | retired (`$VL_OPT_MULTIVALUE`) | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
 | R6a | the inline-record step's census: whether any field or element holds a leaf record (`compiler/opt_inline.vl`); beside the Rust | `$VL_OPT_INLINE` | the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
-| R6b, R6c | the inline-record step's walk and decision, then its rewrite | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
+| R6b | the inline-record step's walk, validator emulation, dataflow and decision (`compiler/opt_inline_scan.vl`); beside the Rust | `$VL_OPT_INLINE` | the decision text (`inline::decision_rust`), the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
+| R6c | the inline-record step's rewrite and body moves | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
 | R7 | the list-flattening step | `$VL_OPT_FLAT` | `$VL_OPT_FLAT_DUMP` |
 
 The order is cheapest-first by what each needs: R1 and R2 only read; R3 rewrites one custom
@@ -370,3 +371,42 @@ skipped program under `vl` and `both`, the fault on each side, and an unknown se
 
 The seed grew by 4,561 bytes (0.08%). The Rust stays the default until R6c: a census alone
 deletes none of it.
+
+## R6b, the inline-record walk and decision, beside the Rust
+
+`compiler/opt_inline_scan.vl` exports `optInlineDecide(stable, rebox, valid, fault)`. It walks
+every function body of the staged module, emulating the validator's operand stack, and runs the
+step's dataflow: which locals and fields a candidate record reaches, which writes and nulls keep
+a field boxed, which exports and stable-layout types pin one. It returns 1 with the decision in
+`optOut`, or 0 when it cannot decide, and the host then decides alone. The decision is one line
+per candidate field, `r {v}[ {why}]`, and one per parameter that would carry it,
+`p {p} {j} {v} i {local} {arg}` when inlined or `p {p} {j} {v} n {why}` when not. The explain
+report is printed from that text, so the two sides' `$VL_INLINE_EXPLAIN` lines agree by
+construction once their decisions do.
+
+Under `$VL_OPT_INLINE=vl` the host rewrites by the compiler's decision. Under `both` it also
+computes its own (`inline::decision_rust`) and fails the build, printing both, when the two
+texts differ. The rewrite itself, the long-form type encoder and the body moves are still the
+host's: they are R6c. `VL_INLINE_FAULT=2` makes the compiler refuse every pair, with the reason
+`refused by $VL_INLINE_FAULT`.
+
+`VL_OPT_INLINE=rust` against `both`, on one seed, comparing module bytes, the `--source-map`
+file, the explain lines and the exit code:
+
+| population | programs | reach the decision | decided by the compiler | with candidate pairs | not decided | differ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/`, `-O` | 15,389 | 1,645 | 1,631 | 360 | 14 | 0 |
+| the 1,645, `-O3` | 1,645 | 1,645 | 1,631 | 360 | 14 | 0 |
+| the 1,645, `--stable-layout` | 1,645 | 1,645 | 1,631 | 360 | 14 | 0 |
+| the 1,645, `--names` | 1,645 | 1,645 | 1,631 | 360 | 14 | 0 |
+| the 1,645, `VL_INLINE_REBOX=1` | 1,645 | 1,645 | 1,631 | 360 | 14 | 0 |
+| the 1,645, `--source-map` (`opt-parity.sh`) | 1,645 | 1,645 | 1,631 | 360 | 14 | 0 |
+
+The 14 not decided are the `rv3310_*__isall` named cells, whose module does not validate; both
+sides fail them identically. The control, `VL_INLINE_FAULT=2` under `both`, fails the build on
+all 360 programs with candidate pairs. `tests/selfhost_native_release_inline_test.ts` runs
+seven decision shapes under `rust` and `both`, with and without `VL_INLINE_REBOX`, and the fault
+on each side.
+
+The seed grew by 86,677 bytes (1.56%). The Rust stays the default until R6c, which ports the
+rewrite and deletes the host's step.

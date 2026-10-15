@@ -6351,9 +6351,9 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
-/// Which side decides the inline-record step's census (rung R6a): `$VL_OPT_INLINE` unset or
-/// `rust` the host's scan alone, `vl` the compiler's `optInline` first, `both` the two, failing
-/// the build when the compiler leaves a module alone and the host's scan says otherwise.
+/// Which side decides the inline-record step's census and decision (rungs R6a, R6b):
+/// `$VL_OPT_INLINE` unset or `rust` the host's alone, `vl` the compiler's `optInline` and
+/// `optInlineDecide` first, `both` the two, failing the build where they disagree.
 #[derive(Clone, Copy, PartialEq)]
 enum OptInlineSide {
     Rust,
@@ -6390,13 +6390,74 @@ fn inline_vl(
                  `optInline`, which this seed predates (`$VL_OPT_INLINE=rust` runs the host's)",
             )
         })?;
-    let fault = std::env::var_os("VL_INLINE_FAULT").is_some_and(|v| !v.is_empty() && v != "0");
+    let fault = inline_fault() == 1;
     if census.call(&mut store, (explaining as i32, fault as i32))? == 1 {
         return Ok(None);
     }
     let log = String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
         .map_err(|_| Error::msg("the compiler's optInline wrote bytes that are not UTF-8"))?;
     Ok(Some(log))
+}
+
+/// `$VL_INLINE_FAULT`: 1 faults the census (`optInline`), 2 the decision (`optInlineDecide`).
+fn inline_fault() -> u32 {
+    std::env::var("VL_INLINE_FAULT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The compiler's decision of the inline-record step (`optInlineDecide`, rung R6b) on `bytes`:
+/// which candidate fields it inlines and why each other one stays a reference, as
+/// `inline::decision_rust` spells it, or `None` when the host must decide. A module that does
+/// not validate is left to the host. `$VL_INLINE_FAULT=2` refuses every field.
+fn inline_decide_vl(
+    bytes: &[u8],
+    stable_layout: bool,
+    rebox: bool,
+    engine: &Engine,
+    compiler: &CompilerSource,
+) -> Result<Option<String>> {
+    let fault = inline_fault() as i32;
+    let run = || -> Result<Option<String>> {
+        let (mut store, inst) = load_compiler(engine, compiler)?;
+        opt_stage(&mut store, &inst, bytes)?;
+        let decide = inst
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "optInlineDecide")
+            .map_err(|e| {
+                e.context(
+                    "`$VL_OPT_INLINE` runs the inline-record step's decision through the \
+                     compiler's `optInlineDecide`, which this seed predates \
+                     (`$VL_OPT_INLINE=rust` runs the host's)",
+                )
+            })?;
+        let args = (stable_layout as i32, rebox as i32, 1, fault);
+        if decide.call(&mut store, args)? == 0 {
+            return Ok(None);
+        }
+        let text =
+            String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
+                .map_err(|_| {
+                    Error::msg("the compiler's optInlineDecide wrote bytes that are not UTF-8")
+                })?;
+        Ok(Some(text))
+    };
+    // The decision runs while another thread validates the input; on one that does not
+    // validate, its answer (or trap) is discarded.
+    let (valid, decided) = std::thread::scope(|s| {
+        let check = s.spawn(|| {
+            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+                .validate_all(bytes)
+                .is_ok()
+        });
+        let decided = run();
+        (check.join().unwrap_or(false), decided)
+    });
+    if valid {
+        decided
+    } else {
+        Ok(None)
+    }
 }
 
 /// The step's answer: the rewritten module and its body moves, or `None` when it changes
@@ -10561,10 +10622,46 @@ fn build_cmd(args: &[String]) -> Result<()> {
                         }
                         None
                     }
-                    None => phase!(
-                        "opt.inline_step",
-                        inline::inline_step(&bytes, stable_layout, &scalarized)
-                    ),
+                    None => {
+                        let rebox = std::env::var_os("VL_INLINE_REBOX")
+                            .is_some_and(|v| !v.is_empty() && v != "0");
+                        let injected = if side == OptInlineSide::Rust {
+                            None
+                        } else {
+                            phase!(
+                                "opt.inline_decide",
+                                inline_decide_vl(
+                                    &bytes,
+                                    stable_layout,
+                                    rebox,
+                                    &compile_engine,
+                                    &compiler
+                                )
+                            )?
+                        };
+                        if let (OptInlineSide::Both, Some(vl)) = (side, &injected) {
+                            let host = inline::decision_rust(&bytes, stable_layout, rebox);
+                            if host.as_deref() != Some(vl.as_str()) {
+                                bail!(
+                                    "$VL_OPT_INLINE=both: the inline-record step's decision \
+                                     differs between the host and the compiler: the compiler \
+                                     says\n{}\nthe host says\n{}",
+                                    vl.trim_end(),
+                                    host.as_deref().unwrap_or("nothing (it does not decide)")
+                                        .trim_end()
+                                );
+                            }
+                        }
+                        phase!(
+                            "opt.inline_step",
+                            inline::inline_step(
+                                &bytes,
+                                stable_layout,
+                                &scalarized,
+                                injected.as_deref()
+                            )
+                        )
+                    }
                 };
                 if let Some(e) = asked.into_inner() {
                     return Err(e);
