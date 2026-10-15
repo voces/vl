@@ -1,0 +1,2365 @@
+// The `-O` inline-record step's decision, ported from the host (docs/internals/optimizer-in-vl.md,
+// rung R6b): which struct fields holding a leaf record are stored inline, and why each other one
+// stays a reference. It walks every body under an emulation of the validator's operand stack.
+// The host stages the module with `optInLoad`, calls `optInlineDecide`, and reads the decision
+// through `optOut*`; the rewrite stays the host's. A module this cannot read is left undecided.
+
+import {
+  WasmCursor,
+  wcByte,
+  wcFail,
+  wcNew,
+  wcOp,
+  wcSkipLeb,
+  wcU32,
+} from "./wasm_read"
+import { WasmModule, wmRead } from "./wasm_write"
+import { wnRead, wnTable } from "./wasm_names"
+import { optInBytes, optOutSet } from "./opt_scan"
+import { mvFieldOnlyParams, mvTableArity } from "./opt_multivalue"
+import { namesFields } from "./opt_inline"
+
+const NONE = -1
+// Operand stack entries: a number, the validator's bottom and unknown reference, or a reference
+// as `REF + heap * 2 + nullable` (an abstract heap's byte, or 0x100 + a type index).
+const NUM = 0
+const BOT = -1
+const UREF = -2
+const REF = 4
+// A holder: a type index, any record (`H_ANY`), or none.
+const H_ANY = -1
+const H_NONE = -2
+const FK_BLOCK = 0
+const FK_LOOP = 1
+const FK_IF = 2
+const FK_ELSE = 3
+const FL_GET = 0
+const FL_SET = 1
+const FL_CTL = 2
+const SM_OTHER = 0
+const SM_ASNN = 1
+const SM_GET = 2
+const SM_SET = 3
+const SM_TEE = 4
+const SM_SGET = 5
+const MAX_LOCALS = 50000
+const PAIR = 65536
+
+// The module.
+let B: u8[] = []
+let M: WasmModule = wmRead([])
+let bad = false
+let nTypes = 0
+let superOf: i32[] = []
+let hasSub: boolean[] = []
+let comp: i32[] = []
+let recOk: boolean[] = []
+let single: boolean[] = []
+let funcType: i32[] = []
+let nImports = 0
+let globals: i32[] = []
+let tables: i32[] = []
+let tags: i32[] = []
+let tableImported = false
+let tableExported = false
+let exKind: i32[] = []
+let exIdx: i32[] = []
+let exWhat: i32[] = []
+let potential: {[i32]: i32} = Map()
+let potKeys: i32[] = []
+let isParent: boolean[] = []
+let isRecord: boolean[] = []
+let constMade: boolean[] = []
+let nameW = wnRead([])
+let nameTab: i32[] = []
+
+// What crosses the boundary: per entry its holder and what it is (an index into `whats`).
+let whats: u8[][] = []
+let bndH: i32[] = []
+let bndW: i32[] = []
+let crossW: i32[] = []
+let crossAny = -1
+
+// What the walk finds, over every body.
+let writer: i32[] = []
+let defaultMade: i32[] = []
+let identH: i32[] = []
+let identF: i32[] = []
+let erasedRoot: i32[] = []
+let erasedAny = -1
+let erasedF: i32[] = []
+let rdField: {[i32]: i32} = Map()
+let rdLocal: {[i32]: i32} = Map()
+let rdArg: {[i32]: i32} = Map()
+let rdWhole: {[i32]: i32} = Map()
+let rdWholeIn: {[i32]: i32} = Map()
+let argP: i32[] = []
+let argG: i32[] = []
+let argA: i32[] = []
+let argF: i32[] = []
+// Every reachable store of a value whose type admits null into a candidate field.
+let nlDst: i32[] = []
+let nlSrc: i32[] = []
+let nlNew: boolean[] = []
+let nlOff: i32[] = []
+let nlF: i32[] = []
+
+// The body being walked: the operand stack and who pushed each slot, the control frames.
+let stk: i32[] = []
+let own: i32[] = []
+let frKind: i32[] = []
+let frBtK: i32[] = []
+let frBtV: i32[] = []
+let frHeight: i32[] = []
+let frInit: i32[] = []
+let frUnreach: boolean[] = []
+let inits: i32[] = []
+let inited: boolean[] = []
+let locT: i32[] = []
+let flipped: boolean[] = []
+let nParams = 0
+let curF = 0
+
+// Per op of the body: its height after, its kind, and what it pushed.
+let post: i32[] = []
+let smK: i32[] = []
+let smA: i32[] = []
+let smB: i32[] = []
+let newOf: i32[] = []
+let getAt: i32[] = []
+let argOfG: {[i32]: i32} = Map()
+let argOfJ: {[i32]: i32} = Map()
+let seg: i32[] = []
+let getK: i32[] = []
+let getKey: i32[] = []
+let flKind: i32[] = []
+let flK: i32[] = []
+let flL: i32[] = []
+let flNN: boolean[] = []
+let flOp: i32[] = []
+let flLo: i32[] = []
+let flHi: i32[] = []
+let flLab: i32[] = []
+let bsOff: i32[] = []
+let bsTy: i32[] = []
+let bsNew: boolean[] = []
+let bsLo: i32[] = []
+let bsHi: i32[] = []
+let boField: i32[] = []
+let boNull: boolean[] = []
+let boProd: i32[] = []
+let boFrom: i32[] = []
+
+// The immediates of the op being walked.
+let imA = 0
+let imB = 0
+let imC = 0
+let imD = 0
+let imBtK = 0
+let imBtV = 0
+let imL: i32[] = []
+
+// The step's decision on the staged module, the host's step to rewrite by it. Returns 1 with
+// the decision in `optOut`, or 0 when the host must decide. `stable` is `--stable-layout`,
+// `rebox` inlines a field whatever its whole-record reads, `valid` says the module validates,
+// and `fault` 2 refuses every field, so a parity run can show it sees this answer.
+export function optInlineDecide(
+  stable: i32,
+  rebox: i32,
+  valid: i32,
+  fault: i32,
+): i32 {
+  optOutSet([])
+  if valid == 0 { return 0 }
+  bad = false
+  const out = decide(optInBytes(), stable != 0, rebox != 0, fault == 2)
+  if bad { return 0 }
+  optOutSet(out)
+  1
+}
+
+function decide(
+  b: u8[],
+  stable: boolean,
+  rebox: boolean,
+  fault: boolean,
+): u8[] {
+  const out: u8[] = []
+  if !readModule(b) || bad { bad = true; return out }
+  findCandidates()
+  if potKeys.length == 0 && !anyRecord() { bad = true; return out }
+  findCrossing(!stable)
+  resetFound()
+  let bi = 0
+  while bi < M.bodies.length && !bad {
+    scanBody(bi)
+    bi = bi + 1
+  }
+  if bad || M.bodies.length + nImports != funcType.length {
+    bad = true; return out
+  }
+  closeErased(!stable)
+  if potKeys.length > 0 { decideFields(out, rebox, fault) }
+  out
+}
+
+// ---- Reading the module ----
+
+function readModule(b: u8[]): boolean {
+  B = b
+  M = wmRead(b)
+  if !M.ok || namesFields(M) { return false }
+  nameW = wnRead(b)
+  if !nameW.ok { return false }
+  nTypes = M.types.length
+  if nTypes >= 32768 { return false }
+  funcType = []
+  nImports = 0
+  globals = []
+  tables = []
+  tags = []
+  tableImported = false
+  tableExported = false
+  exKind = []
+  exIdx = []
+  exWhat = []
+  whats = []
+  bndH = []
+  bndW = []
+  constMade = []
+  for _ in M.types { constMade.push(false) }
+  let structGroups = 0
+  let t = 0
+  for size in M.groupSize {
+    let hasStruct = false
+    let k = 0
+    while k < size {
+      const st = M.types[t + k]
+      if st.form == 0x5f { hasStruct = true }
+      if st.form == 0x5f && st.params.length >= PAIR { return false }
+      if st.supers.length > 1 { return false }
+      k = k + 1
+    }
+    if hasStruct { structGroups = structGroups + 1 }
+    t = t + size
+  }
+  if structGroups > 1 { return false }
+  let s = 0
+  while s < M.secId.length {
+    const id = M.secId[s]
+    const c = wcNew(b, M.secStart[s], M.secEnd[s])
+    wcByte(c)
+    wcU32(c)
+    if id == 2 { readImports(c) }
+    if id == 3 {
+      for ft in M.funcTypes { funcType.push(ft) }
+    }
+    if id == 4 { readTables(c) }
+    if id == 6 { readGlobals(c) }
+    if id == 7 { readExports(c) }
+    if id == 9 { readElements(c) }
+    if id == 13 { readTags(c) }
+    if c.failed || bad { return false }
+    s = s + 1
+  }
+  nameTab = wnTable(nameW, funcType.length)
+  classify()
+  true
+}
+
+function readImports(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const w = whats.length
+    const what: u8[] = []
+    putText(what, "import ")
+    readName(c, what)
+    what.push(46)
+    readName(c, what)
+    whats.push(what)
+    const kind = wcByte(c)
+    if kind == 0 {
+      const t = wcU32(c)
+      funcType.push(t)
+      nImports = nImports + 1
+      if isFunc(t) {
+        for v in sigP(t) { boundary(v, w) }
+        for v in sigR(t) { boundary(v, w) }
+      }
+    } else if kind == 1 {
+      const rt = rdVal(c)
+      readLimits(c)
+      tableImported = true
+      tables.push(rt)
+      boundary(rt, w)
+    } else if kind == 2 {
+      readLimits(c)
+    } else if kind == 3 {
+      const vt = rdVal(c)
+      wcByte(c)
+      globals.push(vt)
+      boundary(vt, w)
+    } else if kind == 4 {
+      wcByte(c)
+      const t = wcU32(c)
+      tags.push(t)
+      if isFunc(t) {
+        for v in sigP(t) { boundary(v, w) }
+      }
+    } else {
+      wcFail(c)
+    }
+    i = i + 1
+  }
+}
+
+// Appends a name's bytes to `out`.
+function readName(c: WasmCursor, out: u8[]) {
+  const len = wcU32(c)
+  if c.failed || len < 0 || len > c.end - c.pos { wcFail(c); return }
+  let i = 0
+  while i < len {
+    out.push(c.b[c.pos + i])
+    i = i + 1
+  }
+  c.pos = c.pos + len
+}
+
+function readLimits(c: WasmCursor) {
+  const flags = wcByte(c)
+  if flags > 15 { wcFail(c); return }
+  wcSkipLeb(c)
+  if (flags & 1) != 0 { wcSkipLeb(c) }
+  if (flags & 8) != 0 { wcU32(c) }
+}
+
+function readTables(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    let init = false
+    if c.pos < c.end && c.b[c.pos] == 0x40 {
+      wcByte(c)
+      if wcByte(c) != 0 { wcFail(c) }
+      init = true
+    }
+    tables.push(rdVal(c))
+    readLimits(c)
+    if init { constScan(c) }
+    i = i + 1
+  }
+}
+
+function readGlobals(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    globals.push(rdVal(c))
+    wcByte(c)
+    constScan(c)
+    i = i + 1
+  }
+}
+
+function readExports(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const what: u8[] = []
+    putText(what, "export ")
+    readName(c, what)
+    const kind = wcByte(c)
+    const ix = wcU32(c)
+    if kind > 4 { wcFail(c) }
+    if kind == 1 { tableExported = true }
+    exKind.push(kind)
+    exIdx.push(ix)
+    exWhat.push(whats.length)
+    whats.push(what)
+    i = i + 1
+  }
+}
+
+function readElements(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const flags = wcU32(c)
+    if flags > 7 { wcFail(c); return }
+    if flags == 2 || flags == 6 { wcU32(c) }
+    if (flags & 1) == 0 { constSkip(c) }
+    if (flags & 3) != 0 {
+      if (flags & 4) != 0 { rdVal(c) } else { wcByte(c) }
+    }
+    const m = wcU32(c)
+    let k = 0
+    while k < m && !c.failed {
+      if (flags & 4) != 0 { constScan(c) } else { wcU32(c) }
+      k = k + 1
+    }
+    i = i + 1
+  }
+}
+
+function readTags(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    wcByte(c)
+    tags.push(wcU32(c))
+    i = i + 1
+  }
+}
+
+// Skips a constant expression, marking every struct type it makes.
+function constScan(c: WasmCursor) {
+  while !c.failed {
+    const op = wcOp(c)
+    if op == 0xfb0000 || op == 0xfb0001 {
+      if c.imm >= 0 && c.imm < nTypes { constMade[c.imm] = true }
+    }
+    if op == 0x0b { return }
+  }
+}
+
+// Skips an offset expression.
+function constSkip(c: WasmCursor) {
+  while !c.failed {
+    if wcOp(c) == 0x0b { return }
+  }
+}
+
+// A value type, packed as `wasm_write.vl` packs it; fails the cursor on a shared one.
+function rdVal(c: WasmCursor): i32 {
+  const lead = wcByte(c)
+  if lead != 0x63 && lead != 0x64 { return lead }
+  let exact = 0
+  if c.pos < c.end && c.b[c.pos] == 0x62 {
+    c.pos = c.pos + 1
+    exact = 1
+  }
+  if c.pos < c.end && (c.b[c.pos] & 0xc0) == 0x40 {
+    const h = wcByte(c)
+    if h == 0x65 { return wcFail(c) }
+    return lead | (h << 8)
+  }
+  const t = wcU32(c)
+  if t < 0 || t >= nTypes { return wcFail(c) }
+  lead | ((0x100 + 2 * t + exact) << 8)
+}
+
+// A heap type: an abstract heap's byte, or 0x100 + a type index.
+function rdHeap(c: WasmCursor): i32 {
+  if c.pos < c.end && c.b[c.pos] == 0x62 { c.pos = c.pos + 1 }
+  if c.pos < c.end && (c.b[c.pos] & 0xc0) == 0x40 {
+    const h = wcByte(c)
+    if h == 0x65 { return wcFail(c) }
+    return h
+  }
+  const t = wcU32(c)
+  if t < 0 || t >= nTypes { return wcFail(c) }
+  0x100 + t
+}
+
+// ---- Types ----
+
+function isFunc(t: i32): boolean {
+  t >= 0 && t < nTypes && M.types[t].form == 0x60
+}
+
+function sigP(t: i32): i32[] {
+  if !isFunc(t) {
+    bad = true
+    return []
+  }
+  M.types[t].params
+}
+
+function sigR(t: i32): i32[] {
+  if !isFunc(t) {
+    bad = true
+    return []
+  }
+  M.types[t].results
+}
+
+function fieldCount(t: i32): i32 {
+  if t >= 0 && t < nTypes && M.types[t].form == 0x5f {
+    M.types[t].params.length
+  } else {
+    0
+  }
+}
+
+// The type index a packed value type refers to, or -1.
+function refIdx(v: i32): i32 {
+  const lead = v & 0xff
+  const h = v >> 8
+  if (lead != 0x63 && lead != 0x64) || h < 0x100 { return -1 }
+  (h - 0x100) >> 1
+}
+
+// A packed value type as an operand stack entry.
+function stOf(v: i32): i32 {
+  const lead = v & 0xff
+  if lead == 0x63 || lead == 0x64 {
+    const h = v >> 8
+    const heap = if h < 0x100 { h } else { 0x100 + ((h - 0x100) >> 1) }
+    return REF + heap * 2 + (if lead == 0x63 { 1 } else { 0 })
+  }
+  if lead >= 0x69 && lead <= 0x75 { return REF + lead * 2 + 1 }
+  NUM
+}
+
+function isAnyHeap(h: i32): boolean { h == 0x6e || h == 0x6d || h == 0x6b }
+
+// What a value of packed type `v` may hold: a type index, any record, or none.
+function holderOf(v: i32): i32 {
+  const lead = v & 0xff
+  if lead == 0x63 || lead == 0x64 {
+    const h = v >> 8
+    if h < 0x100 { return if isAnyHeap(h) { H_ANY } else { H_NONE } }
+    return (h - 0x100) >> 1
+  }
+  if isAnyHeap(lead) { H_ANY } else { H_NONE }
+}
+
+// `holderOf` for an operand: a type that another rec group repeats holds any record.
+function holderOfOperand(e: i32): i32 {
+  if e < REF { return H_NONE }
+  const heap = (e - REF) >> 1
+  if heap >= 0x100 {
+    const t = heap - 0x100
+    return if t < nTypes && single[t] { t } else { H_ANY }
+  }
+  if isAnyHeap(heap) { H_ANY } else { H_NONE }
+}
+
+// Whether a value of type `v` may stand where type `t` is expected.
+function holds(t: i32, v: i32): boolean {
+  if t == H_ANY { return true }
+  let u = v
+  let guard = 0
+  while u >= 0 && u < nTypes && guard <= nTypes {
+    if u == t { return true }
+    u = superOf[u]
+    guard = guard + 1
+  }
+  false
+}
+
+// Supertypes, subtyping components, leaf records, and which types another rec group repeats.
+function classify() {
+  superOf = []
+  hasSub = []
+  comp = []
+  recOk = []
+  for st in M.types {
+    superOf.push(
+      if st.supers.length == 1 && st.supers[0] < nTypes { st.supers[0] } else { -1 },
+    )
+    hasSub.push(false)
+    comp.push(comp.length)
+    let ok = st.form == 0x5f && st.params.length > 0 && st.params.length <= 8
+    if ok {
+      for v in st.params {
+        if v < 0x7c || v > 0x7f { ok = false }
+      }
+    }
+    recOk.push(ok)
+  }
+  let t = 0
+  while t < nTypes {
+    const sup = superOf[t]
+    if sup >= 0 {
+      hasSub[sup] = true
+      const ra = root(t)
+      const rb = root(sup)
+      if ra < 0 || rb < 0 { bad = true }
+      else if ra < rb { comp[rb] = ra }
+      else { comp[ra] = rb }
+    }
+    t = t + 1
+  }
+  t = 0
+  while t < nTypes {
+    comp[t] = root(t)
+    t = t + 1
+  }
+  canon()
+}
+
+function root(t: i32): i32 {
+  let x = t
+  while comp[x] != x {
+    comp[x] = comp[comp[x]]
+    x = comp[x]
+  }
+  x
+}
+
+// `single[t]`: no other rec group canonicalizes to the one `t` is in.
+function canon() {
+  const cls: i32[] = []
+  const count: i32[] = []
+  for _ in M.types {
+    cls.push(0)
+    count.push(0)
+  }
+  const keys: i32[][] = []
+  const starts: i32[] = []
+  const next: i32[] = []
+  const head: {[i32]: i32} = Map()
+  let g0 = 0
+  for size in M.groupSize {
+    const key = groupKey(g0, size, cls)
+    let hash = 0
+    for x in key { hash = ((hash & 0xffffff) * 31 + (x & 0xffff)) & 0x7fffffff }
+    let found = -1
+    let at = head[hash] ?? -1
+    while at >= 0 && found < 0 {
+      if sameKey(keys[at], key) { found = at }
+      at = next[at]
+    }
+    const gi = keys.length
+    keys.push(key)
+    starts.push(g0)
+    next.push(head[hash] ?? -1)
+    head[hash] = gi
+    let k = 0
+    while k < size {
+      const c = if found >= 0 { starts[found] + k } else { g0 + k }
+      cls[g0 + k] = c
+      count[c] = count[c] + 1
+      k = k + 1
+    }
+    g0 = g0 + size
+  }
+  single = []
+  for c in cls { single.push(count[c] == 1) }
+}
+
+function sameKey(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+function groupKey(g0: i32, size: i32, cls: i32[]): i32[] {
+  const key: i32[] = [size]
+  let k = 0
+  while k < size {
+    const st = M.types[g0 + k]
+    key.push(if st.prefix == 0x50 { 0 } else { 1 })
+    key.push(st.supers.length)
+    for s in st.supers { keyRef(key, s, g0, size, cls) }
+    key.push(st.form)
+    if st.form == 0x5d {
+      keyRef(key, st.params[0], g0, size, cls)
+    } else {
+      key.push(st.params.length)
+      for v in st.params { keyVal(key, v, g0, size, cls) }
+      key.push(st.results.length)
+      for v in st.results { keyVal(key, v, g0, size, cls) }
+      for m in st.mutable { key.push(if m { 1 } else { 0 }) }
+    }
+    k = k + 1
+  }
+  key
+}
+
+function keyRef(key: i32[], r: i32, g0: i32, size: i32, cls: i32[]) {
+  if r >= g0 && r < g0 + size {
+    key.push(1)
+    key.push(r - g0)
+  } else if r >= 0 && r < g0 {
+    key.push(2)
+    key.push(cls[r])
+  } else {
+    bad = true
+  }
+}
+
+function keyVal(key: i32[], v: i32, g0: i32, size: i32, cls: i32[]) {
+  key.push(v & 0xff)
+  const h = v >> 8
+  if h >= 0x100 {
+    key.push((h - 0x100) & 1)
+    keyRef(key, (h - 0x100) >> 1, g0, size, cls)
+  } else {
+    key.push(h)
+  }
+}
+
+// The fields that may hold a leaf record inline, and the records lists of them may hold.
+function findCandidates() {
+  potential = Map()
+  potKeys = []
+  isParent = []
+  isRecord = []
+  for _ in M.types {
+    isParent.push(false)
+    isRecord.push(false)
+  }
+  let p = 0
+  while p < nTypes {
+    const st = M.types[p]
+    if st.form == 0x5f {
+      let j = 0
+      while j < st.params.length {
+        const v = refIdx(st.params[j])
+        if v >= 0 && v < nTypes && recOk[v] && !hasSub[v] {
+          potential[p * PAIR + j] = v
+          potKeys.push(p * PAIR + j)
+          isParent[p] = true
+          isRecord[v] = true
+        }
+        j = j + 1
+      }
+    }
+    if st.form == 0x5e && st.params.length == 1 {
+      const v = refIdx(st.params[0])
+      if v >= 0 && v < nTypes && recOk[v] && !hasSub[v] && uniform(v) {
+        isRecord[v] = true
+      }
+    }
+    p = p + 1
+  }
+}
+
+function uniform(v: i32): boolean {
+  for f in M.types[v].params {
+    if f != M.types[v].params[0] { return false }
+  }
+  true
+}
+
+function anyRecord(): boolean {
+  for r in isRecord {
+    if r { return true }
+  }
+  false
+}
+
+// ---- The module boundary ----
+
+function boundary(v: i32, w: i32) {
+  const h = holderOf(v)
+  if h != H_NONE {
+    bndH.push(h)
+    bndW.push(w)
+  }
+}
+
+// What crosses: the types a boundary signature names, and what they reach (fields and
+// elements too unless `direct`), each with the first boundary entry that reaches it.
+function findCrossing(direct: boolean) {
+  let e = 0
+  while e < exKind.length {
+    const kind = exKind[e]
+    const ix = exIdx[e]
+    const w = exWhat[e]
+    if kind == 0 && ix >= 0 && ix < funcType.length && isFunc(funcType[ix]) {
+      for v in M.types[funcType[ix]].params { boundary(v, w) }
+      for v in M.types[funcType[ix]].results { boundary(v, w) }
+    }
+    if kind == 3 && ix >= 0 && ix < globals.length { boundary(globals[ix], w) }
+    if kind == 1 && ix >= 0 && ix < tables.length { boundary(tables[ix], w) }
+    if kind == 4 && ix >= 0 && ix < tags.length && isFunc(tags[ix]) {
+      for v in M.types[tags[ix]].params { boundary(v, w) }
+    }
+    e = e + 1
+  }
+  if tableImported || tableExported {
+    const w = whats.length
+    const what: u8[] = []
+    putText(what, "a function in an exposed table")
+    whats.push(what)
+    let f = nImports
+    while f < funcType.length {
+      if isFunc(funcType[f]) {
+        for v in M.types[funcType[f]].params { boundary(v, w) }
+        for v in M.types[funcType[f]].results { boundary(v, w) }
+      }
+      f = f + 1
+    }
+  }
+  crossW = []
+  for _ in M.types { crossW.push(-1) }
+  crossAny = -1
+  const workT: i32[] = []
+  const workW: i32[] = []
+  let i = 0
+  while i < bndH.length {
+    if bndH[i] == H_ANY {
+      if crossAny < 0 { crossAny = bndW[i] }
+    } else {
+      workT.push(bndH[i])
+      workW.push(bndW[i])
+    }
+    i = i + 1
+  }
+  while workT.length > 0 {
+    const t = workT[workT.length - 1]
+    const w = workW[workW.length - 1]
+    workT.pop()
+    workW.pop()
+    if t < nTypes && crossW[t] < 0 {
+      crossW[t] = w
+      for v in innerTypes(t, direct) {
+        const h = holderOf(v)
+        if h == H_ANY {
+          if crossAny < 0 { crossAny = w }
+        } else if h >= 0 {
+          workT.push(h)
+          workW.push(w)
+        }
+      }
+    }
+  }
+}
+
+// The value types a value of type `t` carries: a signature's, and unless `direct` its
+// fields or element.
+function innerTypes(t: i32, direct: boolean): i32[] {
+  const st = M.types[t]
+  const out: i32[] = []
+  if st.form == 0x60 {
+    for v in st.params { out.push(v) }
+    for v in st.results { out.push(v) }
+  } else if (st.form == 0x5f || st.form == 0x5e) && !direct {
+    for v in st.params {
+      if v != 0x78 && v != 0x77 { out.push(v) }
+    }
+  }
+  out
+}
+
+// An erased value reaches what its type reaches; each type keeps the first function.
+function closeErased(direct: boolean) {
+  erasedF = []
+  const roots: i32[] = []
+  let t = 0
+  while t < nTypes {
+    erasedF.push(-1)
+    if erasedRoot[t] >= 0 { roots.push(t) }
+    t = t + 1
+  }
+  sortBy(roots, erasedRoot)
+  for r in roots {
+    const f = erasedRoot[r]
+    const work: i32[] = [r]
+    while work.length > 0 {
+      const u = work[work.length - 1]
+      work.pop()
+      if u < nTypes && erasedF[u] < 0 {
+        erasedF[u] = f
+        for v in innerTypes(u, direct) {
+          const h = holderOf(v)
+          if h >= 0 { work.push(h) }
+        }
+      }
+    }
+  }
+}
+
+// Sorts type indices by `by[t]`, then by index.
+function sortBy(xs: i32[], by: i32[]) {
+  let i = 1
+  while i < xs.length {
+    const x = xs[i]
+    let j = i - 1
+    while j >= 0 && (by[xs[j]] > by[x] || by[xs[j]] == by[x] && xs[j] > x) {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = x
+    i = i + 1
+  }
+}
+
+// Sorts `xs` ascending.
+function sortAsc(xs: i32[]) {
+  let i = 1
+  while i < xs.length {
+    const x = xs[i]
+    let j = i - 1
+    while j >= 0 && xs[j] > x {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = x
+    i = i + 1
+  }
+}
+
+// How a value of type `t` can cross the boundary, or empty.
+function crossing(t: i32): u8[] {
+  const out: u8[] = []
+  if crossAny >= 0 {
+    let f = erasedAny
+    let u = t
+    let guard = 0
+    while u >= 0 && u < nTypes && guard <= nTypes {
+      const g = erasedF[u]
+      if g >= 0 && (f < 0 || g < f) { f = g }
+      u = superOf[u]
+      guard = guard + 1
+    }
+    if f >= 0 {
+      putText(out, "it is stored as an abstract reference in ")
+      putName(out, f)
+      putText(out, ", and one crosses at ")
+      putBytes(out, whats[crossAny])
+      return out
+    }
+  }
+  let best = -1
+  let u = t
+  let guard = 0
+  while u >= 0 && u < nTypes && guard <= nTypes {
+    const w = crossW[u]
+    if w >= 0 && (best < 0 || less(whats[w], whats[best])) { best = w }
+    u = superOf[u]
+    guard = guard + 1
+  }
+  if best >= 0 { putBytes(out, whats[best]) }
+  out
+}
+
+function less(a: u8[], b: u8[]): boolean {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] < b[i] }
+    i = i + 1
+  }
+  a.length < b.length
+}
+
+// ---- The walk ----
+
+function resetFound() {
+  writer = []
+  defaultMade = []
+  erasedRoot = []
+  for _ in M.types {
+    writer.push(-1)
+    defaultMade.push(-1)
+    erasedRoot.push(-1)
+  }
+  identH = []
+  identF = []
+  erasedAny = -1
+  rdField = Map()
+  rdLocal = Map()
+  rdArg = Map()
+  rdWhole = Map()
+  rdWholeIn = Map()
+  argP = []
+  argG = []
+  argA = []
+  argF = []
+  nlDst = []
+  nlSrc = []
+  nlNew = []
+  nlOff = []
+  nlF = []
+}
+
+// Walks body `bi`: under its locals declared non-null when that still validates, else as
+// declared.
+function scanBody(bi: i32) {
+  const f = nImports + bi
+  curF = f
+  if f >= funcType.length || !isFunc(funcType[f]) { bad = true; return }
+  const body = M.bodies[bi]
+  const params = M.types[funcType[f]].params
+  nParams = params.length
+  locT = []
+  flipped = []
+  for v in params {
+    locT.push(v)
+    flipped.push(false)
+  }
+  let any = false
+  let k = 0
+  while k < body.localCount.length {
+    const v = body.localType[k]
+    const n = body.localCount[k]
+    if n < 0 || n > MAX_LOCALS - locT.length { bad = true; return }
+    const r = refIdx(v)
+    const flip = (v & 0xff) == 0x63 && r >= 0 && isRecord[r]
+    if flip { any = true }
+    let i = 0
+    while i < n {
+      locT.push(v)
+      flipped.push(flip)
+      i = i + 1
+    }
+    k = k + 1
+  }
+  let tight = false
+  if any {
+    const r = walk(bi, false)
+    if r == 2 { bad = true; return }
+    tight = r == 0
+  }
+  let l = 0
+  while l < locT.length {
+    if flipped[l] && tight {
+      locT[l] = (locT[l] & ~0xff) | 0x64
+    } else {
+      flipped[l] = false
+    }
+    l = l + 1
+  }
+  if walk(bi, true) != 0 { bad = true; return }
+  afterWalk(f)
+}
+
+// One pass over body `bi`: 0 when it validates, 1 when a local declared non-null fails, 2 when
+// this cannot read it. `rec` records what the decision reads.
+function walk(bi: i32, rec: boolean): i32 {
+  const body = M.bodies[bi]
+  const c = wcNew(B, body.from, body.to)
+  stk = []
+  own = []
+  frKind = []
+  frBtK = []
+  frBtV = []
+  frHeight = []
+  frInit = []
+  frUnreach = []
+  inits = []
+  inited = []
+  for _ in locT { inited.push(false) }
+  pushCtrl(FK_BLOCK, 2, funcType[curF])
+  post = []
+  smK = []
+  smA = []
+  smB = []
+  newOf = []
+  getAt = []
+  argOfG = Map()
+  argOfJ = Map()
+  seg = [0]
+  getK = []
+  getKey = []
+  flKind = []
+  flK = []
+  flL = []
+  flNN = []
+  flOp = []
+  flLo = []
+  flHi = []
+  flLab = []
+  bsOff = []
+  bsTy = []
+  bsNew = []
+  bsLo = []
+  bsHi = []
+  boField = []
+  boNull = []
+  boProd = []
+  boFrom = []
+  let k = 0
+  while c.pos < c.end {
+    if frKind.length == 0 { return 2 }
+    const off = c.pos
+    const op = wcOp(c)
+    if c.failed || !decodeImm(op, off, c.pos) { return 2 }
+    if op == 0x06 || op == 0x07 || op == 0x09 || op == 0x18 || op == 0x19 {
+      return 2
+    }
+    const hb = stk.length
+    const depth = frKind.length
+    const reach = !frUnreach[depth - 1]
+    const base = frHeight[depth - 1]
+    if rec { record(op, k, off, hb, reach, base, seg[seg.length - 1]) }
+    const arP = arity(op)
+    if arP == -2 || bad { return 2 }
+    const r = apply(op)
+    if r != 0 { return r }
+    if bad { return 2 }
+    if rec {
+      const ha = stk.length
+      let lo = 0
+      if arP >= 0 {
+        lo = max(ha - arP, 0)
+      } else {
+        lo = min(max(min(hb, ha) - 1, 0), base)
+      }
+      if frKind.length > depth { lo = min(lo, frHeight[frKind.length - 1]) }
+      while own.length < ha { own.push(NONE) }
+      let p = lo
+      while p < ha {
+        own[p] = k
+        p = p + 1
+      }
+      while own.length > ha { own.pop() }
+      post.push(ha)
+      if op == 0x02 || op == 0x03 || op == 0x04 || op == 0x1f {
+        seg.push(k + 1)
+      }
+      if op == 0x05 { seg[seg.length - 1] = k + 1 }
+      if op == 0x0b { seg.pop() }
+    }
+    k = k + 1
+  }
+  if frKind.length != 0 { return 2 }
+  0
+}
+
+// Reads the immediates of the op at `B[at, end)` into `im*`; those of an op whose immediates
+// the walk never reads are skipped to `end`, where `wcOp` left the cursor.
+function decodeImm(op: i32, at: i32, end: i32): boolean {
+  const d = wcNew(B, at, end)
+  wcByte(d)
+  if op > 0xff { wcU32(d) }
+  imL = []
+  if op == 0x02 || op == 0x03 || op == 0x04 || op == 0x1f {
+    readBt(d)
+    if op == 0x1f {
+      const n = wcU32(d)
+      let i = 0
+      while i < n && !d.failed {
+        const kind = wcByte(d)
+        if kind <= 1 { wcU32(d) }
+        imL.push(wcU32(d))
+        i = i + 1
+      }
+    }
+  } else if op == 0x0e {
+    const n = wcU32(d)
+    let i = 0
+    while i <= n && !d.failed {
+      imL.push(wcU32(d))
+      i = i + 1
+    }
+  } else if (
+    op == 0x0c
+    || op == 0x0d
+    || op == 0xd5
+    || op == 0xd6
+    || op == 0x08
+    || op == 0x10
+    || op == 0x12
+    || op == 0x14
+    || op == 0x15
+    || op == 0xd2
+    || op >= 0x20 && op <= 0x26
+  ) {
+    imA = wcU32(d)
+  } else if op == 0x11 || op == 0x13 {
+    imA = wcU32(d)
+    imB = wcU32(d)
+  } else if op == 0x1c {
+    if wcU32(d) != 1 { return false }
+    imA = rdVal(d)
+  } else if op == 0xd0 {
+    imA = rdHeap(d)
+  } else if (op >> 16) == 0xfb {
+    const sub = op & 0xffff
+    if sub <= 1 || sub == 6 || sub == 7 || sub >= 11 && sub <= 14 || sub == 16 {
+      imA = wcU32(d)
+    } else if (
+      sub >= 2 && sub <= 5
+      || sub >= 8 && sub <= 10
+      || sub >= 17 && sub <= 19
+    ) {
+      imA = wcU32(d)
+      imB = wcU32(d)
+    } else if sub >= 20 && sub <= 23 {
+      imA = rdHeap(d)
+    } else if sub == 24 || sub == 25 {
+      imC = wcByte(d)
+      imA = wcU32(d)
+      imB = rdHeap(d)
+      imD = rdHeap(d)
+    } else {
+      d.pos = end
+    }
+  } else {
+    d.pos = end
+  }
+  if (
+    (op == 0x10 || op == 0x12 || op == 0xd2)
+    && (imA < 0 || imA >= funcType.length)
+  ) {
+    return false
+  }
+  !d.failed && d.pos == end
+}
+
+// A block type: `imBtK` 0 empty, 1 one value type (`imBtV`), 2 a type index (`imBtV`).
+function readBt(d: WasmCursor) {
+  if d.pos >= d.end { wcFail(d); return }
+  const x: i32 = d.b[d.pos]
+  if x == 0x40 {
+    d.pos = d.pos + 1
+    imBtK = 0
+  } else if x >= 0x40 && x < 0x80 {
+    imBtK = 1
+    imBtV = rdVal(d)
+  } else {
+    imBtK = 2
+    imBtV = wcU32(d)
+    if !isFunc(imBtV) { wcFail(d) }
+  }
+}
+
+function btParams(k: i32, v: i32): i32[] {
+  if k == 2 { sigP(v) } else { [] }
+}
+
+function btResults(k: i32, v: i32): i32[] {
+  if k == 2 { return sigR(v) }
+  if k == 1 { [v] } else { [] }
+}
+
+// The types a branch to label `depth` carries; empty past the outermost frame.
+function labelTypes(depth: i32): i32[] {
+  const i = frKind.length - 1 - depth
+  if depth < 0 || i < 0 { return [] }
+  if frKind[i] == FK_LOOP {
+    btParams(frBtK[i], frBtV[i])
+  } else {
+    btResults(frBtK[i], frBtV[i])
+  }
+}
+
+function labelN(depth: i32): i32 {
+  if depth < 0 || depth >= frKind.length { bad = true }
+  labelTypes(depth).length
+}
+
+function pushCtrl(kind: i32, k: i32, v: i32) {
+  frKind.push(kind)
+  frBtK.push(k)
+  frBtV.push(v)
+  frHeight.push(stk.length)
+  frInit.push(inits.length)
+  frUnreach.push(false)
+  if kind != FK_BLOCK || frKind.length > 1 { pushVals(btParams(k, v)) }
+}
+
+function popCtrl() {
+  const top = frKind.length - 1
+  while inits.length > frInit[top] {
+    inited[inits[inits.length - 1]] = false
+    inits.pop()
+  }
+  while stk.length > frHeight[top] { stk.pop() }
+  frKind.pop()
+  frBtK.pop()
+  frBtV.pop()
+  frHeight.pop()
+  frInit.pop()
+  frUnreach.pop()
+}
+
+function setUnreach() {
+  const top = frKind.length - 1
+  while stk.length > frHeight[top] { stk.pop() }
+  frUnreach[top] = true
+}
+
+function pop(): i32 {
+  const top = frKind.length - 1
+  if stk.length <= frHeight[top] {
+    if !frUnreach[top] { bad = true }
+    return BOT
+  }
+  const e = stk[stk.length - 1]
+  stk.pop()
+  e
+}
+
+function popRef(): i32 {
+  const e = pop()
+  if e == BOT { UREF } else { e }
+}
+
+function popN(n: i32) {
+  let i = 0
+  while i < n {
+    pop()
+    i = i + 1
+  }
+}
+
+function pushVals(vs: i32[]) {
+  for v in vs { stk.push(stOf(v)) }
+}
+
+function asNonNull(e: i32): i32 {
+  if e >= REF { e & ~1 } else { e }
+}
+
+// The entry `d` below the top of the whole stack, or `UREF` past its bottom.
+function peek(d: i32): i32 {
+  const i = stk.length - 1 - d
+  if d < 0 || i < 0 { UREF } else { stk[i] }
+}
+
+// The pushes of the op about to run, as the validator's arity reads it: -1 when it has none,
+// -2 when this cannot say.
+function arity(op: i32): i32 {
+  const ta = mvTableArity(op)
+  if ta >= 0 { return ta & 15 }
+  if ta == -2 { return -2 }
+  const top = frKind.length - 1
+  if op == 0x02 || op == 0x03 || op == 0x04 || op == 0x1f {
+    return btParams(imBtK, imBtV).length
+  }
+  if op == 0x05 { return btParams(frBtK[top], frBtV[top]).length }
+  if op == 0x0b { return btResults(frBtK[top], frBtV[top]).length }
+  if (
+    op == 0x08
+    || op == 0x0c
+    || op == 0x0e
+    || op == 0x0f
+    || op == 0x12
+    || op == 0x13
+    || op == 0x15
+  ) {
+    return 0
+  }
+  if op == 0x0d || op == 0xfb0018 || op == 0xfb0019 { return labelN(imA) }
+  if op == 0xd5 { return labelN(imA) + 1 }
+  if op == 0xd6 {
+    const n = labelN(imA)
+    return if n == 0 { -1 } else { n - 1 }
+  }
+  if op == 0x10 { return sigR(funcType[imA]).length }
+  if op == 0x11 || op == 0x14 { return sigR(imA).length }
+  if op == 0xfb0000 || op == 0xfb0008 { return 1 }
+  -2
+}
+
+// The op's effect on the operand and control stacks: 0, 1 when a local declared non-null
+// fails, 2 when this cannot read it.
+function apply(op: i32): i32 {
+  const top = frKind.length - 1
+  if op == 0x00 || op == 0x0f { setUnreach(); return 0 }
+  if op == 0x01 { return 0 }
+  if op == 0x02 || op == 0x03 || op == 0x1f || op == 0x04 {
+    if op == 0x04 { pop() }
+    popN(btParams(imBtK, imBtV).length)
+    pushCtrl(
+      if op == 0x03 { FK_LOOP } else if op == 0x04 { FK_IF } else { FK_BLOCK },
+      imBtK,
+      imBtV,
+    )
+    return 0
+  }
+  if op == 0x05 {
+    if frKind[top] != FK_IF { return 2 }
+    const k = frBtK[top]
+    const v = frBtV[top]
+    popCtrl()
+    pushCtrl(FK_ELSE, k, v)
+    return 0
+  }
+  if op == 0x0b {
+    const k = frBtK[top]
+    const v = frBtV[top]
+    popCtrl()
+    pushVals(btResults(k, v))
+    return 0
+  }
+  if op == 0x0c { setUnreach(); return 0 }
+  if op == 0x0d {
+    pop()
+    const ts = labelTypes(imA)
+    popN(ts.length)
+    pushVals(ts)
+    return 0
+  }
+  if op == 0x0e || op == 0x0a { pop(); setUnreach(); return 0 }
+  if op == 0x08 {
+    if imA < 0 || imA >= tags.length { return 2 }
+    popN(sigP(tags[imA]).length)
+    setUnreach()
+    return 0
+  }
+  if op == 0x10 || op == 0x12 {
+    const t = funcType[imA]
+    popN(sigP(t).length)
+    if op == 0x12 { setUnreach() } else { pushVals(sigR(t)) }
+    return 0
+  }
+  if op == 0x11 || op == 0x13 || op == 0x14 || op == 0x15 {
+    pop()
+    popN(sigP(imA).length)
+    if op == 0x13 || op == 0x15 { setUnreach() } else { pushVals(sigR(imA)) }
+    return 0
+  }
+  if op == 0x1a { pop(); return 0 }
+  if op == 0x1b {
+    pop()
+    const t1 = pop()
+    const t2 = pop()
+    stk.push(if t1 == BOT { t2 } else { t1 })
+    return 0
+  }
+  if op == 0x1c {
+    popN(3)
+    stk.push(stOf(imA))
+    return 0
+  }
+  if op >= 0x20 && op <= 0x22 {
+    const l = imA
+    if l < 0 || l >= locT.length { return 2 }
+    if op == 0x20 {
+      if flipped[l] && !inited[l] { return 1 }
+      stk.push(stOf(locT[l]))
+      return 0
+    }
+    const e = pop()
+    if flipped[l] {
+      if e == UREF { return 2 }
+      if e >= REF && (e & 1) == 1 { return 1 }
+      if !inited[l] {
+        inited[l] = true
+        inits.push(l)
+      }
+    }
+    if op == 0x22 { stk.push(stOf(locT[l])) }
+    return 0
+  }
+  if op == 0x23 || op == 0x24 {
+    if imA < 0 || imA >= globals.length { return 2 }
+    if op == 0x23 { stk.push(stOf(globals[imA])) } else { pop() }
+    return 0
+  }
+  if op == 0x25 || op == 0x26 {
+    if imA < 0 || imA >= tables.length { return 2 }
+    pop()
+    if op == 0x25 { stk.push(stOf(tables[imA])) } else { pop() }
+    return 0
+  }
+  if op == 0xd0 { stk.push(REF + imA * 2 + 1); return 0 }
+  if op == 0xd1 || op == 0xd3 {
+    pop()
+    if op == 0xd3 { pop() }
+    stk.push(NUM)
+    return 0
+  }
+  if op == 0xd2 { stk.push(REF + (0x100 + funcType[imA]) * 2); return 0 }
+  if op == 0xd4 { stk.push(asNonNull(pop())); return 0 }
+  if op == 0xd5 || op == 0xd6 {
+    const e = popRef()
+    const ts = labelTypes(imA)
+    if op == 0xd5 {
+      popN(ts.length)
+      pushVals(ts)
+      stk.push(asNonNull(e))
+    } else {
+      if ts.length == 0 { return 2 }
+      popN(ts.length - 1)
+      let i = 0
+      while i < ts.length - 1 {
+        stk.push(stOf(ts[i]))
+        i = i + 1
+      }
+    }
+    return 0
+  }
+  if (op >> 16) == 0xfb { return applyGc(op & 0xffff) }
+  const ta = mvTableArity(op)
+  if ta < 0 { return 2 }
+  popN(ta >> 4)
+  let i = 0
+  while i < (ta & 15) {
+    stk.push(NUM)
+    i = i + 1
+  }
+  0
+}
+
+function applyGc(sub: i32): i32 {
+  if sub == 15 { pop(); stk.push(NUM); return 0 }
+  if sub <= 19 {
+    const t = imA
+    if t < 0 || t >= nTypes { return 2 }
+    const st = M.types[t]
+    if sub <= 5 && st.form != 0x5f || sub >= 6 && st.form != 0x5e { return 2 }
+    if sub == 0 { popN(st.params.length) }
+    if sub == 0 || sub == 1 { stk.push(REF + (0x100 + t) * 2); return 0 }
+    if sub >= 2 && sub <= 4 {
+      if imB < 0 || imB >= st.params.length { return 2 }
+      pop()
+      stk.push(if sub == 2 { stOf(st.params[imB]) } else { NUM })
+      return 0
+    }
+    if sub == 5 { popN(2); return 0 }
+    if sub >= 6 && sub <= 10 {
+      popN(if sub == 7 { 1 } else if sub == 8 { imB } else { 2 })
+      stk.push(REF + (0x100 + t) * 2)
+      return 0
+    }
+    if sub >= 11 && sub <= 13 {
+      popN(2)
+      stk.push(if sub == 11 { stOf(st.params[0]) } else { NUM })
+      return 0
+    }
+    popN(if sub == 14 { 3 } else if sub == 17 { 5 } else { 4 })
+    return 0
+  }
+  if sub == 20 || sub == 21 { pop(); stk.push(NUM); return 0 }
+  if sub == 22 || sub == 23 {
+    pop()
+    stk.push(REF + imA * 2 + (if sub == 23 { 1 } else { 0 }))
+    return 0
+  }
+  if sub == 24 || sub == 25 {
+    popRef()
+    const ts = labelTypes(imA)
+    if ts.length == 0 { return 2 }
+    popN(ts.length - 1)
+    let i = 0
+    while i < ts.length - 1 {
+      stk.push(stOf(ts[i]))
+      i = i + 1
+    }
+    const fromNull = imC & 1
+    const toNull = (imC >> 1) & 1
+    if sub == 24 {
+      stk.push(
+        REF + imB * 2 + (if fromNull == 1 && toNull == 0 { 1 } else { 0 }),
+      )
+    } else {
+      stk.push(REF + imD * 2 + toNull)
+    }
+    return 0
+  }
+  if sub == 26 || sub == 27 {
+    const e = pop()
+    const h = if sub == 26 { 0x6e } else { 0x6f }
+    stk.push(if e >= REF { REF + h * 2 + (e & 1) } else { UREF })
+    return 0
+  }
+  if sub == 28 { pop(); stk.push(REF + 0x6c * 2); return 0 }
+  if sub == 29 || sub == 30 { pop(); stk.push(NUM); return 0 }
+  2
+}
+
+// ---- What one op tells the decision, read before it runs ----
+
+function tracked(l: i32): boolean {
+  if l < nParams || l >= locT.length { return false }
+  const r = refIdx(locT[l])
+  r >= 0 && isRecord[r]
+}
+
+function nullableAt(d: i32, reach: boolean): boolean {
+  if !reach { return false }
+  const e = peek(d)
+  if e == NUM { return true }
+  e >= REF && (e & 1) == 1
+}
+
+function producer(p: i32, reach: boolean, base: i32, segLo: i32): i32 {
+  if !reach || p < base || p >= own.length { return NONE }
+  const q = own[p]
+  if q != NONE && q >= segLo && post[q] == p + 1 { q } else { NONE }
+}
+
+// Records the operand `d` below the top as stored into field `field`.
+function opnd(
+  field: i32,
+  d: i32,
+  hb: i32,
+  reach: boolean,
+  base: i32,
+  segLo: i32,
+) {
+  const q = if hb > d { producer(hb - 1 - d, reach, base, segLo) } else { NONE }
+  boField.push(field)
+  boNull.push(nullableAt(d, reach))
+  boProd.push(q)
+  boFrom.push(if q != NONE { getAt[q] } else { -1 })
+}
+
+function record(
+  op: i32,
+  k: i32,
+  off: i32,
+  hb: i32,
+  reach: boolean,
+  base: i32,
+  segLo: i32,
+) {
+  const f = curF
+  if op == 0x10 {
+    const g = imA
+    const n = if isFunc(funcType[g]) { M.types[funcType[g]].params.length } else { 0 }
+    if hb >= n && reach {
+      let j = 0
+      while j < n {
+        const q = own[hb - n + j]
+        if q != NONE && q >= segLo {
+          argOfG[q] = g
+          argOfJ[q] = j
+        }
+        j = j + 1
+      }
+    }
+  }
+  if reach { erase(op, f) }
+  const sub = if (op >> 16) == 0xfb { op & 0xffff } else { -1 }
+  if sub == 0 && isParent[imA] {
+    const m = M.types[imA].params.length
+    bsOff.push(off)
+    bsTy.push(imA)
+    bsNew.push(reach)
+    bsLo.push(boField.length)
+    let j = 0
+    while j < m {
+      if potential.has(imA * PAIR + j) {
+        opnd(j, m - 1 - j, hb, reach, base, segLo)
+      }
+      j = j + 1
+    }
+    bsHi.push(boField.length)
+  }
+  if sub == 5 {
+    if writer[imA] < 0 { writer[imA] = f }
+    if isParent[imA] && potential.has(imA * PAIR + imB) {
+      bsOff.push(off)
+      bsTy.push(imA)
+      bsNew.push(false)
+      bsLo.push(boField.length)
+      opnd(imB, 0, hb, reach, base, segLo)
+      bsHi.push(boField.length)
+      if !reach { bsOff[bsOff.length - 1] = -1 }
+    }
+  }
+  if sub == 0 && isParent[imA] && !reach { bsOff[bsOff.length - 1] = -1 }
+  if sub == 1 && defaultMade[imA] < 0 { defaultMade[imA] = f }
+  if op == 0xd3 || sub == 27 {
+    let d = 0
+    while d < (if op == 0xd3 { 2 } else { 1 }) {
+      const h = holderOfOperand(peek(d))
+      if h != H_NONE {
+        identH.push(h)
+        identF.push(f)
+      }
+      d = d + 1
+    }
+  }
+  newOf.push(if sub == 0 && recOk[imA] { imA } else { -1 })
+  if op == 0x20 && tracked(imA) { flow(FL_GET, k, imA, false, op) }
+  if (op == 0x21 || op == 0x22) && tracked(imA) {
+    flow(FL_SET, k, imA, !reach || !nullableAt(0, reach), op)
+  }
+  if (
+    op >= 0x02 && op <= 0x05
+    || op >= 0x0b && op <= 0x0f
+    || op == 0x1f
+    || op == 0xd5
+    || op == 0xd6
+    || sub == 24
+    || sub == 25
+    || op == 0x00
+    || op == 0x08
+    || op == 0x0a
+    || op == 0x12
+    || op == 0x13
+    || op == 0x15
+  ) {
+    flow(FL_CTL, k, imA, false, op)
+  }
+  let kind = SM_OTHER
+  let a = 0
+  let b = 0
+  if op == 0xd4 { kind = SM_ASNN }
+  if op == 0x20 { kind = SM_GET; a = imA }
+  if op == 0x21 { kind = SM_SET; a = imA }
+  if op == 0x22 { kind = SM_TEE; a = imA }
+  let at = -1
+  if sub == 2 {
+    kind = SM_SGET
+    a = imA
+    b = imB
+    if potential.has(imA * PAIR + imB) {
+      getK.push(k)
+      getKey.push(imA * PAIR + imB)
+      at = imA * PAIR + imB
+    }
+  }
+  getAt.push(at)
+  smK.push(kind)
+  smA.push(a)
+  smB.push(b)
+}
+
+function flow(kind: i32, k: i32, l: i32, nn: boolean, op: i32) {
+  flKind.push(kind)
+  flK.push(k)
+  flL.push(l)
+  flNN.push(nn)
+  flOp.push(op)
+  flLo.push(flLab.length)
+  for x in imL { flLab.push(x) }
+  flHi.push(flLab.length)
+}
+
+// A value handed to a place typed `any`, `eq` or `struct` forgets its type there.
+function erase(op: i32, f: i32) {
+  let want: i32[] = []
+  let above = 0
+  const sub = if (op >> 16) == 0xfb { op & 0xffff } else { -1 }
+  if op == 0x21 || op == 0x22 {
+    want = [locT[imA]]
+  } else if op == 0x24 {
+    if imA < globals.length { want = [globals[imA]] }
+  } else if op == 0x10 || op == 0x12 {
+    if isFunc(funcType[imA]) { want = M.types[funcType[imA]].params }
+  } else if op == 0x11 || op == 0x13 || op == 0x14 || op == 0x15 {
+    if isFunc(imA) { want = M.types[imA].params }
+    above = 1
+  } else if op == 0x0f {
+    want = M.types[funcType[f]].results
+  } else if op == 0x0b {
+    want = labelTypes(0)
+  } else if op == 0x0c || op == 0x0d {
+    want = labelTypes(imA)
+    if op == 0x0d { above = 1 }
+  } else if op == 0x0e {
+    want = labelTypes(imL[imL.length - 1])
+    above = 1
+  } else if op >= 0x02 && op <= 0x04 {
+    if imBtK == 2 { want = M.types[imBtV].params }
+    if op == 0x04 { above = 1 }
+  } else if op == 0x08 {
+    if imA < tags.length && isFunc(tags[imA]) {
+      want = M.types[tags[imA]].params
+    }
+  } else if op == 0x1c {
+    want = [imA, imA]
+    above = 1
+  } else if sub == 0 {
+    want = M.types[imA].params
+  } else if sub == 5 {
+    want = [M.types[imA].params[imB]]
+  } else if sub == 6 || sub == 8 || sub == 14 || sub == 16 {
+    const el = M.types[imA].params[0]
+    if sub == 8 {
+      const vs: i32[] = []
+      while vs.length < min(imB, 4096) { vs.push(el) }
+      want = vs
+    } else {
+      want = [el]
+    }
+    if sub == 6 || sub == 16 { above = 1 }
+  }
+  const n = want.length
+  let i = 0
+  while i < n {
+    if holderOf(want[i]) == H_ANY {
+      const e = peek(above + n - 1 - i)
+      const h = holderOfOperand(e)
+      if h >= 0 {
+        if erasedRoot[h] < 0 { erasedRoot[h] = f }
+      } else if h == H_ANY && !isAnyHeap((e - REF) >> 1) {
+        if erasedAny < 0 { erasedAny = f }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// ---- After the walk: which stores are of non-null values, and how each read is used ----
+
+function afterWalk(f: i32) {
+  const nonNull = nonNullGets(post.length)
+  let s = 0
+  while s < bsOff.length {
+    if bsOff[s] >= 0 {
+      let o = bsLo[s]
+      while o < bsHi[s] {
+        let nullable = boNull[o]
+        if nullable && boProd[o] != NONE && nonNull[boProd[o]] {
+          nullable = false
+        }
+        if nullable {
+          nlDst.push(bsTy[s] * PAIR + boField[o])
+          nlSrc.push(boFrom[o])
+          nlNew.push(bsNew[s])
+          nlOff.push(bsOff[s])
+          nlF.push(f)
+        }
+        o = o + 1
+      }
+    }
+    s = s + 1
+  }
+  tally(f)
+}
+
+// The op after `k`, past one `ref.as_non_null`, or -1.
+function afterCast(k: i32): i32 {
+  let n = k + 1
+  if n < smK.length && smK[n] == SM_ASNN { n = n + 1 }
+  if n < smK.length { n } else { -1 }
+}
+
+function fieldReadOf(n: i32, v: i32): boolean {
+  n >= 0 && smK[n] == SM_SGET && holds(smA[n], v) && smB[n] < fieldCount(smA[n])
+}
+
+function tally(f: i32) {
+  // The locals a candidate read is stored into: tee'd, how many sets, whether every get is
+  // read through a field, per record type asked.
+  const luIx: {[i32]: i32} = Map()
+  const luL: i32[] = []
+  for k in getK {
+    const n = afterCast(k)
+    if n >= 0 && smK[n] == SM_SET && !luIx.has(smA[n]) {
+      luIx[smA[n]] = luL.length
+      luL.push(smA[n])
+    }
+  }
+  const luTee: boolean[] = []
+  const luSets: i32[] = []
+  const luReads: i32[][] = []
+  for _ in luL {
+    luTee.push(false)
+    luSets.push(0)
+    luReads.push([])
+  }
+  if luL.length > 0 {
+    let q = 0
+    while q < smK.length {
+      const kind = smK[q]
+      if (
+        (kind == SM_TEE || kind == SM_SET || kind == SM_GET)
+        && luIx.has(smA[q])
+      ) {
+        const u = luIx[smA[q]] ?? 0
+        if kind == SM_TEE { luTee[u] = true }
+        if kind == SM_SET { luSets[u] = luSets[u] + 1 }
+        if kind == SM_GET { luReads[u].push(afterCast(q)) }
+      }
+      q = q + 1
+    }
+  }
+  let i = 0
+  while i < getK.length {
+    const k = getK[i]
+    const key = getKey[i]
+    const v = potential[key] ?? 0
+    let how = 2
+    const n = afterCast(k)
+    if fieldReadOf(n, v) {
+      how = 0
+    } else if n >= 0 && smK[n] == SM_SET && smA[n] >= nParams {
+      const u = luIx[smA[n]] ?? 0
+      if !luTee[u] && luSets[u] == 1 {
+        let all = true
+        for r in luReads[u] {
+          if !fieldReadOf(r, v) { all = false }
+        }
+        if all { how = 1 }
+      }
+    }
+    const last = if k + 1 < smK.length && smK[k + 1] == SM_ASNN { k + 1 } else { k }
+    if how == 0 {
+      rdField[key] = (rdField[key] ?? 0) + 1
+    } else if how == 1 {
+      rdLocal[key] = (rdLocal[key] ?? 0) + 1
+    } else if argOfG.has(last) {
+      argP.push(key)
+      argG.push(argOfG[last] ?? 0)
+      argA.push(argOfJ[last] ?? 0)
+      argF.push(f)
+    } else {
+      rdWhole[key] = (rdWhole[key] ?? 0) + 1
+      if !rdWholeIn.has(key) { rdWholeIn[key] = f }
+    }
+    i = i + 1
+  }
+}
+
+// Per op, whether it is a `local.get` of a tracked local that holds no null there: on every
+// path the last set of it stored a value whose type excludes null. A loop's entry state, less
+// the locals some set inside it may make null, holds at every back edge.
+function nonNullGets(nOps: i32): boolean[] {
+  const out: boolean[] = []
+  while out.length < nOps { out.push(false) }
+  const killAt: {[i32]: i32} = Map()
+  const killed: i32[][] = []
+  const open: i32[] = []
+  let e = 0
+  while e < flKind.length {
+    const op = flOp[e]
+    if flKind[e] == FL_CTL {
+      if op == 0x03 { open.push(flK[e]) }
+      if op == 0x02 || op == 0x04 || op == 0x1f { open.push(-1) }
+      if op == 0x0b && open.length > 0 { open.pop() }
+    }
+    if flKind[e] == FL_SET && !flNN[e] {
+      for lk in open {
+        if lk >= 0 {
+          if !killAt.has(lk) {
+            killAt[lk] = killed.length
+            killed.push([])
+          }
+          const ks = killed[killAt[lk] ?? 0]
+          if !hasL(ks, flL[e]) { ks.push(flL[e]) }
+        }
+      }
+    }
+    e = e + 1
+  }
+  let curLive = true
+  let cur: i32[] = []
+  const afLoop: boolean[] = [false]
+  const afIf: boolean[] = [false]
+  const afElse: boolean[] = [false]
+  const afEntL: boolean[] = [true]
+  const afEnt: i32[][] = [[]]
+  const afOutL: boolean[] = [false]
+  const afOut: i32[][] = [[]]
+  e = 0
+  while e < flKind.length {
+    const kind = flKind[e]
+    const op = flOp[e]
+    if kind == FL_GET {
+      if curLive && hasL(cur, flL[e]) { out[flK[e]] = true }
+    } else if kind == FL_SET {
+      if curLive {
+        if flNN[e] {
+          if !hasL(cur, flL[e]) { cur.push(flL[e]) }
+        } else {
+          cur = without(cur, flL[e])
+        }
+      }
+    } else if op == 0x02 || op == 0x03 || op == 0x04 || op == 0x1f {
+      if op == 0x1f {
+        let x = flLo[e]
+        while x < flHi[e] {
+          branch(afLoop, afOutL, afOut, flLab[x], curLive, cur)
+          x = x + 1
+        }
+      }
+      if op == 0x03 && curLive && killAt.has(flK[e]) {
+        for l in killed[killAt[flK[e]] ?? 0] { cur = without(cur, l) }
+      }
+      afLoop.push(op == 0x03)
+      afIf.push(op == 0x04)
+      afElse.push(false)
+      afEntL.push(curLive)
+      afEnt.push(copyL(cur))
+      afOutL.push(false)
+      afOut.push([])
+    } else if op == 0x05 {
+      const t = afLoop.length - 1
+      if t >= 0 {
+        meet(afOutL, afOut, t, curLive, cur)
+        afElse[t] = true
+        curLive = afEntL[t]
+        cur = copyL(afEnt[t])
+      }
+    } else if op == 0x0b {
+      const t = afLoop.length - 1
+      if t >= 0 {
+        if afIf[t] && !afElse[t] { meet(afOutL, afOut, t, afEntL[t], afEnt[t]) }
+        meet(afOutL, afOut, t, curLive, cur)
+        curLive = afOutL[t]
+        cur = afOut[t]
+        afLoop.pop()
+        afIf.pop()
+        afElse.pop()
+        afEntL.pop()
+        afEnt.pop()
+        afOutL.pop()
+        afOut.pop()
+      }
+    } else if op == 0x0c {
+      branch(afLoop, afOutL, afOut, flL[e], curLive, cur)
+      curLive = false
+    } else if (
+      op == 0x0d
+      || op == 0xd5
+      || op == 0xd6
+      || op == 0xfb0018
+      || op == 0xfb0019
+    ) {
+      branch(afLoop, afOutL, afOut, flL[e], curLive, cur)
+    } else if op == 0x0e {
+      let x = flLo[e]
+      while x < flHi[e] {
+        branch(afLoop, afOutL, afOut, flLab[x], curLive, cur)
+        x = x + 1
+      }
+      curLive = false
+    } else {
+      curLive = false
+    }
+    e = e + 1
+  }
+  out
+}
+
+function branch(
+  afLoop: boolean[],
+  afOutL: boolean[],
+  afOut: i32[][],
+  depth: i32,
+  live: boolean,
+  s: i32[],
+) {
+  const i = afLoop.length - 1 - depth
+  if depth >= 0 && i >= 0 && !afLoop[i] { meet(afOutL, afOut, i, live, s) }
+}
+
+function meet(outL: boolean[], out: i32[][], i: i32, live: boolean, s: i32[]) {
+  if !live { return }
+  if !outL[i] {
+    outL[i] = true
+    out[i] = copyL(s)
+    return
+  }
+  const keep: i32[] = []
+  for l in out[i] {
+    if hasL(s, l) { keep.push(l) }
+  }
+  out[i] = keep
+}
+
+function hasL(s: i32[], l: i32): boolean {
+  for x in s {
+    if x == l { return true }
+  }
+  false
+}
+
+function without(s: i32[], l: i32): i32[] {
+  const out: i32[] = []
+  for x in s {
+    if x != l { out.push(x) }
+  }
+  out
+}
+
+function copyL(s: i32[]): i32[] {
+  const out: i32[] = []
+  for x in s { out.push(x) }
+  out
+}
+
+// ---- The decision ----
+
+// Why record type `v` may not be stored inline, or empty.
+function recordRefusal(v: i32): u8[] {
+  const out: u8[] = []
+  let u = 0
+  while u < nTypes {
+    if writer[u] >= 0 && comp[u] == comp[v] {
+      if u == v {
+        putText(out, "its fields are written (struct.set ")
+      } else {
+        putText(out, "type ")
+        putDec(out, u)
+        putText(out, ", in its subtyping component, is written (struct.set ")
+      }
+      putDec(out, u)
+      putText(out, " in ")
+      putName(out, writer[u])
+      putText(out, ")")
+      return out
+    }
+    u = u + 1
+  }
+  const what = crossing(v)
+  if what.length > 0 {
+    putText(out, "a value of it can cross the module boundary (")
+    putBytes(out, what)
+    putText(out, ")")
+    return out
+  }
+  let i = 0
+  while i < identH.length {
+    if holds(identH[i], v) {
+      putText(
+        out,
+        "its identity is observable (ref.eq or extern.convert_any in ",
+      )
+      putName(out, identF[i])
+      putText(out, ")")
+      return out
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Writes the decision: per record type `r <v>[ <why>]`, then per candidate field in order
+// `p <p> <j> <v> i <local> <arg>` when inlined, `p <p> <j> <v> n <why>` when not.
+function decideFields(out: u8[], rebox: boolean, fault: boolean) {
+  sortAsc(potKeys)
+  const pairIx: {[i32]: i32} = Map()
+  let i = 0
+  while i < potKeys.length {
+    pairIx[potKeys[i]] = i
+    i = i + 1
+  }
+  const okRec: boolean[] = []
+  for _ in M.types { okRec.push(false) }
+  const records: i32[] = []
+  for key in potKeys {
+    const v = potential[key] ?? 0
+    if !hasL(records, v) { records.push(v) }
+  }
+  sortAsc(records)
+  for v in records {
+    const why = recordRefusal(v)
+    putText(out, "r ")
+    putDec(out, v)
+    if why.length > 0 {
+      out.push(32)
+      putBytes(out, why)
+    } else {
+      okRec[v] = true
+    }
+    out.push(10)
+  }
+  if argP.length > 0 {
+    const fo: {[i32]: i32} = Map()
+    for key in mvFieldOnlyParams(B, true) { fo[key] = 1 }
+    i = 0
+    while i < argP.length {
+      const key = argP[i]
+      if argA[i] < 64 && fo.has(argG[i] * 64 + argA[i]) {
+        rdArg[key] = (rdArg[key] ?? 0) + 1
+      } else {
+        rdWhole[key] = (rdWhole[key] ?? 0) + 1
+        if !rdWholeIn.has(key) { rdWholeIn[key] = argF[i] }
+      }
+      i = i + 1
+    }
+  }
+  const refused: u8[][] = []
+  const inl: i32[] = []
+  for _ in potKeys {
+    refused.push([])
+    inl.push(-1)
+  }
+  const needDst: i32[] = []
+  const needSrc: i32[] = []
+  const needWhy: u8[][] = []
+  i = 0
+  while i < nlDst.length {
+    const dst = pairIx[nlDst[i]] ?? 0
+    const why: u8[] = []
+    putText(why, "a value whose type admits null is stored into it (")
+    putText(why, if nlNew[i] { "struct.new" } else { "struct.set" })
+    putText(why, " at byte 0x")
+    putHex(why, nlOff[i])
+    putText(why, " in ")
+    putName(why, nlF[i])
+    putText(why, ")")
+    if nlSrc[i] >= 0 && nlSrc[i] != nlDst[i] {
+      needDst.push(dst)
+      needSrc.push(pairIx[nlSrc[i]] ?? 0)
+      needWhy.push(why)
+    } else if nlSrc[i] < 0 && refused[dst].length == 0 {
+      refused[dst] = why
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < potKeys.length {
+    const key = potKeys[i]
+    const p = key / PAIR
+    const v = potential[key] ?? 0
+    const why: u8[] = []
+    const what = crossing(p)
+    const whole = rdWhole[key] ?? 0
+    if fault {
+      putText(why, "refused by $VL_INLINE_FAULT")
+    } else if !okRec[v] {
+      putText(why, "its record type ")
+      putDec(why, v)
+      putText(why, " is refused (above)")
+    } else if defaultMade[p] >= 0 {
+      putText(why, "type ")
+      putDec(why, p)
+      putText(why, " is made by struct.new_default (in ")
+      putName(why, defaultMade[p])
+      putText(why, ")")
+    } else if what.length > 0 {
+      putText(why, "type ")
+      putDec(why, p)
+      putText(why, " can cross the module boundary (")
+      putBytes(why, what)
+      putText(why, "), so its layout is not ours to change")
+    } else if constMade[p] {
+      putText(why, "type ")
+      putDec(why, p)
+      putText(why, " is made in a constant expression (a global's initializer)")
+    } else if refused[i].length > 0 {
+      putBytes(why, refused[i])
+    } else if whole > 0 && !rebox {
+      putDec(why, whole)
+      putText(why, " of its ")
+      putDec(
+        why,
+        (rdField[key] ?? 0) + (rdLocal[key] ?? 0) + (rdArg[key] ?? 0) + whole,
+      )
+      putText(why, " read(s) take the whole record (first in ")
+      putName(why, rdWholeIn[key] ?? 0)
+      putText(
+        why,
+        "), and each would allocate a copy where today it shares the box",
+      )
+    }
+    if why.length == 0 { inl[i] = v } else { refused[i] = why }
+    i = i + 1
+  }
+  fixpoint(pairIx, inl, refused, needDst, needSrc, needWhy)
+  i = 0
+  while i < potKeys.length {
+    const key = potKeys[i]
+    putText(out, "p ")
+    putDec(out, key / PAIR)
+    out.push(32)
+    putDec(out, key % PAIR)
+    out.push(32)
+    putDec(out, potential[key] ?? 0)
+    if inl[i] >= 0 {
+      putText(out, " i ")
+      putDec(out, rdLocal[key] ?? 0)
+      out.push(32)
+      putDec(out, rdArg[key] ?? 0)
+    } else {
+      putText(out, " n ")
+      putBytes(out, refused[i])
+    }
+    out.push(10)
+    i = i + 1
+  }
+}
+
+// A subtype and its supertype lay a shared field out alike, and a field fed from another
+// field's read needs that field inlined: drops inlined fields until both hold.
+function fixpoint(
+  pairIx: {[i32]: i32},
+  inl: i32[],
+  refused: u8[][],
+  needDst: i32[],
+  needSrc: i32[],
+  needWhy: u8[][],
+) {
+  let changed = true
+  while changed {
+    const dropIx: i32[] = []
+    const dropWhy: u8[][] = []
+    let i = 0
+    while i < needDst.length {
+      if inl[needDst[i]] >= 0 && inl[needSrc[i]] < 0 {
+        dropIx.push(needDst[i])
+        dropWhy.push(needWhy[i])
+      }
+      i = i + 1
+    }
+    let t = 0
+    while t < nTypes {
+      const sup = superOf[t]
+      if sup >= 0 {
+        const n = min(fieldCount(t), fieldCount(sup))
+        let j = 0
+        while j < n {
+          const ta = pairIx[t * PAIR + j] ?? -1
+          const sa = pairIx[sup * PAIR + j] ?? -1
+          const a = if ta >= 0 { inl[ta] } else { -1 }
+          const b = if sa >= 0 { inl[sa] } else { -1 }
+          if a != b {
+            if a >= 0 {
+              const why: u8[] = []
+              putText(why, "its supertype ")
+              putDec(why, sup)
+              putText(why, " does not inline field ")
+              putDec(why, j)
+              dropIx.push(ta)
+              dropWhy.push(why)
+            }
+            if b >= 0 {
+              const why: u8[] = []
+              putText(why, "its subtype ")
+              putDec(why, t)
+              putText(why, " does not inline field ")
+              putDec(why, j)
+              dropIx.push(sa)
+              dropWhy.push(why)
+            }
+          }
+          j = j + 1
+        }
+      }
+      t = t + 1
+    }
+    changed = dropIx.length > 0
+    i = 0
+    while i < dropIx.length {
+      if inl[dropIx[i]] >= 0 {
+        inl[dropIx[i]] = -1
+        refused[dropIx[i]] = dropWhy[i]
+      }
+      i = i + 1
+    }
+  }
+}
+
+// ---- Text ----
+
+function putName(out: u8[], f: i32) {
+  const r = if f >= 0 && f < nameTab.length { nameTab[f] } else { -1 }
+  if r < 0 {
+    putText(out, "func ")
+    putDec(out, f)
+    return
+  }
+  let i = 0
+  while i < nameW.len[r] {
+    const x: i32 = B[nameW.at[r] + i]
+    if x == 10 { bad = true }
+    out.push(x)
+    i = i + 1
+  }
+}
+
+function putText(out: u8[], s: string) {
+  for cp in s { out.push(cp) }
+}
+
+function putBytes(out: u8[], s: u8[]) {
+  for x in s { out.push(x) }
+}
+
+function putDec(out: u8[], v: i32) {
+  if v >= 10 { putDec(out, v / 10) }
+  out.push(48 + v % 10)
+}
+
+function putHex(out: u8[], v: i32) {
+  if v >= 16 { putHex(out, v / 16) }
+  const d = v % 16
+  out.push(if d < 10 { 48 + d } else { 87 + d })
+}
+
+function min(a: i32, b: i32): i32 {
+  if a < b { a } else { b }
+}
+
+function max(a: i32, b: i32): i32 {
+  if a > b { a } else { b }
+}
