@@ -111,6 +111,9 @@ let ffDeclSlotCtx: {[i32]: i32[]} = Map()
 let pinTys: i32[][] = []
 let pinRet: i32[] = []
 let pinName: string[][] = []
+// The function each pin is taken in, -1 in module code, and the functions a query leaves out.
+let pinFn: i32[] = []
+let ffPinSkip: {[i32]: boolean} = Map()
 
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
 // binds nothing (module code, a concrete function); 1 is a generic's template walk.
@@ -177,6 +180,7 @@ export function fnFlowShadowBegin() {
   pinTys = []
   pinRet = []
   pinName = []
+  pinFn = []
   ctxKeyIx = Map()
   ctxPerFn = Map()
   ctxBN = []
@@ -432,6 +436,7 @@ function ffAddPin(s: i32, tys: i32[], ret: i32) {
   const id = pinTys.length
   pinTys.push(tys)
   pinRet.push(ret)
+  pinFn.push(ffFn)
   ufPin[r].push(id)
   dfPin[s].push(id)
   0
@@ -1282,16 +1287,39 @@ export function fnFlowDeclWritten(at: i32): boolean {
 export function fnFlowDeclFn(d: i32): i32 { ffDeclFnOf[ffOrigDecl(d)] ?? -2 }
 
 // The distinct closed parameter lists (`p1,p2,`) calls and annotated destinations pin the slot
-// `path` (steps `e`, `v`, `f.<name>`; empty is the value) of the binding or literal `d` at, in the
-// walk instance `inst` of generic `tmpl` stands for (-1, -1 outside one). `[FF_PIN_DECLINE]` with no
-// table, no walk of `d`, or walks that disagree with none picked out by the instance.
+// `path` (`e`, `v`, `f.<name>`; empty is the value) of `d` at, in walk instance `inst` of generic
+// `tmpl` (-1, -1 outside one), leaving out pins taken in a function in `dead`. `[FF_PIN_DECLINE]`
+// with no table, no walk of `d`, or walks that disagree with none picked out by the instance.
 export function fnFlowDeclPathPinSigs(
   d: i32,
   path: string[],
   inst: i32,
   tmpl: i32,
+  dead: {[i32]: boolean},
 ): string[] {
-  ffDeclPathPinKeys(d, path, inst, tmpl, false)
+  ffPinSkip = dead
+  const out = ffDeclPathPinKeys(d, path, inst, tmpl, false)
+  ffPinSkip = Map()
+  out
+}
+
+// The functions that take the pins downstream of the slot `path` of `d`, over every walk of `d`, -1
+// for module code; empty without a table.
+export function fnFlowDeclPathPinFns(d: i32, path: string[]): i32[] {
+  const out: i32[] = []
+  if !ffBuilt || d < 0 { return out }
+  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
+    let r = s
+    for k in path {
+      if r >= 0 { r = ffKidOf(ffFind(r), k) }
+    }
+    if r >= 0 {
+      for id in ffDirectedPins(r) {
+        if !i32ListHas(out, pinFn[id]) { out.push(pinFn[id]) }
+      }
+    }
+  }
+  out
 }
 
 // `fnFlowDeclPathPinSigs` answering the distinct returns annotated destinations pin the slot at
@@ -1443,7 +1471,7 @@ function ffDirectedPins(s: i32): i32[] {
 function ffPinSigsOf(ids: i32[]): string[] {
   const out: string[] = []
   for id in ids {
-    if !ffPinOpen(id) {
+    if !ffPinOpen(id) && !(ffPinSkip[pinFn[id]] ?? false) {
       let sig = ""
       for t in pinTys[id] { sig = sig + normTypeAtom(tyToStr(t)) + "," }
       if !strListHas(out, sig) { out.push(sig) }
