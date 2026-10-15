@@ -412,6 +412,22 @@ import {
   subscriptKeyTextOf,
 } from "./check_places"
 import { hoistMatchScrutinees } from "./check_match_hoist"
+import {
+  argLitAt,
+  wsAnnMentions,
+  wsBodyErr,
+  wsDecl,
+  wsIsIdent,
+  wsNoDecl,
+  wsNoteInstErr,
+  wsOrigAnn,
+  wsPassReset,
+  wsPendDecl,
+  wsPendParam,
+  wsRowOf,
+  wsSuppress,
+  wsValueRead,
+} from "./check_width"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -18749,167 +18765,12 @@ function fsbRefuse(decl: i32, rt: i32, ix: i32) {
   )
 }
 
-// D3992 — a record of a wider shape passed to a function's parameter of a declared record type
-// is legal (no field changes type, so the shared value keeps every invariant), and is lowered by
-// making that parameter generic: the function is re-checked as `f<__W0>(p: __W0)` and each
-// instance takes its argument's own layout. Every call is still held to the declared type.
-let wsDecl: i32[] = []
-let wsParam: i32[] = []
-let wsOrigAnn: i32[] = []
-// Declarations declined a rewrite, whose calls keep the width refusal.
-let wsNoDecl: i32[] = []
-let wsPendDecl: i32[] = []
-let wsPendParam: i32[] = []
-// Per pass: declarations whose body refused something, and top-level functions read as values,
-// neither of which is rewritten.
-let wsBodyErr: {[i32]: boolean} = Map()
-let wsValueRead: {[string]: boolean} = Map()
-// Set while an argument a rewrite serves is delivered, so the width refusal stays quiet.
-let wsSuppress = false
-// The argument being delivered to its parameter, parens peeled, or -1: a literal there that sets
-// a field a record parameter does not declare is passed wider, its extra initializer evaluated.
-// A union parameter has no wider arm to pass, so the literal is refused there (D4070).
-let argLitAt = -1
-// Rewritten declarations an instance refused something in this pass: the declared parameter
-// accepted it, so the refusal is the rewrite's, and the rewrite is undone.
-let wsInstErr: i32[] = []
-
-export function wsReset() {
-  wsDecl = []
-  wsParam = []
-  wsOrigAnn = []
-  wsNoDecl = []
-  wsPassReset()
-}
-
-function wsPassReset() {
-  argLitAt = -1
-  wsPendDecl = []
-  wsPendParam = []
-  wsBodyErr = Map()
-  wsValueRead = Map()
-  wsSuppress = false
-  wsInstErr = []
-  0
-}
-
 // Whether `t` is the type parameter a rewrite gave a parameter.
 function wsVarTy(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const v = T.tys[t]
   if v is TyVar { return v.tvName.length > 3 && v.tvName.slice(0, 3) == "__W" }
   false
-}
-
-// Note an instance refusal at a call of declaration `d`, when a rewrite made it generic.
-function wsNoteInstErr(d: i32) {
-  if d < 0 || i32ListHas(wsInstErr, d) { return 0 }
-  let k = 0
-  while k < wsDecl.length {
-    if wsDecl[k] == d {
-      wsInstErr.push(d)
-      return 0
-    }
-    k = k + 1
-  }
-  0
-}
-
-// Declines every rewrite still pending, whose refusal nothing will now lift, and restores the
-// parameters an instance error asked for. True when a re-check is owed to report them (D3992).
-export function wsDecline(): boolean {
-  if wsPendDecl.length == 0 && wsInstErr.length == 0 { return false }
-  for d in wsPendDecl {
-    if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
-  }
-  wsUndoInstErr()
-  true
-}
-
-// Restore the declared parameters of every declaration noted in `wsInstErr` and decline it.
-// Answers how many it restored.
-function wsUndoInstErr(): i32 {
-  let done = 0
-  for d in wsInstErr {
-    const fd = P.nodes[d]
-    let k = 0
-    while k < wsDecl.length {
-      if wsDecl[k] == d && fd is FuncDecl && wsParam[k] < fd.fnParams.length {
-        const pi = fd.fnParams[wsParam[k]]
-        const pn = P.nodes[pi]
-        if pn is Param {
-          P.nodes[pi] = {
-            parName: pn.parName,
-            parType: wsOrigAnn[k],
-            parDefault: pn.parDefault,
-            parOpt: pn.parOpt,
-            parRest: pn.parRest,
-            pos: pn.pos,
-          }
-        }
-        const nm = "__W" + i32ToStr(wsParam[k])
-        const tps: string[] = []
-        const cur = P.nodes[d]
-        if cur is FuncDecl {
-          for t in cur.fnTyParams {
-            if t != nm { tps.push(t) }
-          }
-          P.nodes[d] = {
-            fnName: cur.fnName,
-            fnTyParams: tps,
-            fnParams: cur.fnParams,
-            fnRet: cur.fnRet,
-            fnBody: cur.fnBody,
-            pos: cur.pos,
-          }
-        }
-        wsDecl[k] = -1
-        done = done + 1
-      }
-      k = k + 1
-    }
-    if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
-  }
-  wsInstErr = []
-  if done > 0 {
-    const kd: i32[] = []
-    const kp: i32[] = []
-    const ka: i32[] = []
-    let r = 0
-    while r < wsDecl.length {
-      if wsDecl[r] >= 0 {
-        kd.push(wsDecl[r])
-        kp.push(wsParam[r])
-        ka.push(wsOrigAnn[r])
-      }
-      r = r + 1
-    }
-    wsDecl = kd
-    wsParam = kp
-    wsOrigAnn = ka
-  }
-  done
-}
-
-// One rewrite step: apply the pending rewrites, or, when there are none, undo the ones an
-// instance refused. A refusal in a pass with rewrites pending may be one they serve.
-export function wsStep(): i32 {
-  const applied = wsApplyPending()
-  if applied > 0 {
-    wsInstErr = []
-    return applied
-  }
-  wsUndoInstErr()
-}
-
-// The rewrite row of parameter `i` of declaration `d`, or -1.
-function wsRowOf(d: i32, i: i32): i32 {
-  let k = 0
-  while k < wsDecl.length {
-    if wsDecl[k] == d && wsParam[k] == i { return k }
-    k = k + 1
-  }
-  -1
 }
 
 // The top-level declaration a call's callee names, or -1.
@@ -19006,38 +18867,6 @@ function wsInferredRetPrim(name: string): boolean {
   false
 }
 
-// Whether `s` is a bare identifier, the spelling of a declared type's name.
-function wsIsIdent(s: string): boolean {
-  if s.length == 0 { return false }
-  for c in s {
-    const ok = (c >= 'a' && c <= 'z')
-      || (c >= 'A' && c <= 'Z')
-      || (c >= '0' && c <= '9')
-      || c == '_'
-    if !ok { return false }
-  }
-  true
-}
-
-// Whether the annotation node `ix` spells the type name `nm`, or has no spelling to read.
-function wsAnnMentions(ix: i32, nm: string): boolean {
-  if ix < 0 { return false }
-  const a = P.nodes[ix]
-  if !(a is TypeRef) { return true }
-  const s = a.tyName
-  let i = 0
-  while i + nm.length <= s.length {
-    if s.slice(i, i + nm.length) == nm {
-      const before = i == 0 || !wsIsIdent(s.slice(i - 1, i))
-      const after = i + nm.length == s.length
-        || !wsIsIdent(s.slice(i + nm.length, i + nm.length + 1))
-      if before && after { return true }
-    }
-    i = i + 1
-  }
-  false
-}
-
 // Record parameter `i` of the declaration call `n` names for a rewrite.
 function wsNotePending(n: Call, i: i32) {
   const d = wsCalleeDecl(n)
@@ -19049,63 +18878,6 @@ function wsNotePending(n: Call, i: i32) {
   wsPendDecl.push(d)
   wsPendParam.push(i)
   0
-}
-
-// Make each pending parameter generic, unless its function's body refused something or it is read
-// as a value, which declines it. Answers how many it changed, which the caller re-checks for.
-function wsApplyPending(): i32 {
-  let done = 0
-  let k = 0
-  while k < wsPendDecl.length {
-    const d = wsPendDecl[k]
-    const i = wsPendParam[k]
-    const fd = P.nodes[d]
-    if fd is FuncDecl {
-      if (
-        !(wsBodyErr[d] ?? false)
-        && !(wsValueRead[fd.fnName] ?? false)
-        && wsRowOf(d, i) < 0
-        && i < fd.fnParams.length
-      ) {
-        const pi = fd.fnParams[i]
-        const pn = P.nodes[pi]
-        if pn is Param {
-          const nm = "__W" + i32ToStr(i)
-          const tps: string[] = []
-          for t in fd.fnTyParams { tps.push(t) }
-          tps.push(nm)
-          wsDecl.push(d)
-          wsParam.push(i)
-          wsOrigAnn.push(pn.parType)
-          P.nodes[pi] = {
-            parName: pn.parName,
-            parType: mkTypeRef(nm, pn.pos),
-            parDefault: pn.parDefault,
-            parOpt: pn.parOpt,
-            parRest: pn.parRest,
-            pos: pn.pos,
-          }
-          P.nodes[d] = {
-            fnName: fd.fnName,
-            fnTyParams: tps,
-            fnParams: fd.fnParams,
-            fnRet: fd.fnRet,
-            fnBody: fd.fnBody,
-            pos: fd.pos,
-          }
-          done = done + 1
-        }
-      } else if wsRowOf(d, i) < 0 && !i32ListHas(wsNoDecl, d) {
-        // Declined: the pass that quieted this call's refusal is re-run, and it speaks.
-        wsNoDecl.push(d)
-        done = done + 1
-      }
-    }
-    k = k + 1
-  }
-  wsPendDecl = []
-  wsPendParam = []
-  done
 }
 
 // The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
@@ -28318,6 +28090,15 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
     tErr(clash, annotDiagAt)
     return TY_ERR
   }
+  // A member that is itself `null` (`null | null`, `N | null` over `type N = null`) is the
+  // niche, not an inner type; with no other member the union is the `null` type (D4673).
+  const nonNull: i32[] = []
+  let anyNull = hasNull
+  for m in members {
+    if isNullTy(m) { anyNull = true } else { nonNull.push(m) }
+  }
+  if nonNull.length == 0 && anyNull { return TY_NULL }
+  if nonNull.length < members.length { return annUnionTy(nonNull, anyNull) }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
   // arena-tick exempt: a per-program mark on an annotation's row.
@@ -33040,6 +32821,8 @@ function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   if e is TyPrim {
     if e.primName == "i32" { return "list" }
     if e.primName == "boolean" { return "list" }
+    // `null[]` rides the i32 list with every element the same sentinel (D4671).
+    if e.primName == "null" { return "list" }
     if e.primName == "string" { return "strlist" }
     // The wide-scalar backings: `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of
     // one scalar each, exactly as `i32[]` is — lacking only a core, since
@@ -57759,6 +57542,9 @@ function fillTypeDeclAt(sx: i32) {
           let folded = -1
           if sawNull && nonNullU.length > 0 {
             folded = annUnionTy(nonNullU, true)
+          } else if sawNull {
+            // Every member is `null` (`type N = null | null`), which denotes `null` itself.
+            folded = TY_NULL
           }
           // The literal-union flatten, on the declaration side (`litUnionFlatMembers`, the
           // same transform `annUnionInnerTy` climbs): this arm builds its member list itself,
@@ -61453,6 +61239,7 @@ export function checkProgramPass(rootIx: i32) {
   nolTaken = Map()
   ulLitN = 0
   ulTaken = Map()
+  nolTakenOther = Map()
   nolOperand = Map()
   while ntz < P.nodes.length {
     nodeTyIx.push(-1)
@@ -63700,7 +63487,9 @@ export function nodeTyIsNulI32List(ix: i32) {
       if e >= 0 {
         const et = T.tys[e]
         if et is TyPrim {
-          return et.primName == "i32" || et.primName == "boolean"
+          return et.primName == "i32"
+            || et.primName == "boolean"
+            || et.primName == "null"
         }
         // A literal-union element (`K[] | null`) shares the i32-list backing exactly like
         // `i32[]` (the arena dual of `nameIsI32Array`'s litunion arm).
@@ -64947,6 +64736,13 @@ export function nodeArrayElemIsNulBool(ix: i32) {
   tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "boolean")
 }
 
+// Whether node `ix` has a recorded array type whose element is the `null` unit type (D4671), and
+// is not a null-only literal that a destination of another list type received.
+export function nodeArrayElemIsNullUnit(ix: i32): boolean {
+  if nolLitTakenOther(ix) { return false }
+  isNullTy(nodeArrayElemTyIx(ix))
+}
+
 // Whether node `ix` has a recorded array type whose element is a plain `string` — the
 // non-null twin of `nodeArrayElemIsNulStr`. Needed because `arrLitIsStr` classifies a literal
 // by its first element, so an atom-first literal under a `string[]` annotation built the atom
@@ -65198,6 +64994,15 @@ export function mapTyValIsNulBool(ty: i32) {
     }
     return sawNull && sawBool
   }
+  false
+}
+
+// Whether arena type `ty` is a map whose value is the `null` unit type: the mono i32 map, every
+// stored value the `boolean | null` sentinel `2` (D4671).
+export function mapTyValIsNullUnit(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return isNullTy(t.mVal) }
   false
 }
 
@@ -65581,6 +65386,8 @@ export function nodeTyIsNullable(ix: i32) {
 // True if node `ix`'s recorded type is the `null` type itself: the value is `null` on every path
 // that yields one, whatever its arms run first (D3355).
 export function nodeTyIsNullType(ix: i32): boolean { isNullTy(nodeTyIxOf(ix)) }
+// Whether arena type `ty` is the `null` unit type, the type-taking twin of `nodeTyIsNullType`.
+export function tyIsNullUnit(ty: i32): boolean { isNullTy(ty) }
 
 // Whether node `ix`'s recorded type provably admits no `null` — not `!nodeTyIsNullable(ix)`,
 // since an unrecorded node, an inference hole, or a `TyVar` all answer "not nullable" there
@@ -74785,9 +74592,15 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
 
 // D1832 — a list literal whose every element is `null`, those of them a typed destination
 // received, and those that sit as a `+` operand or a spread source, which no destination types.
-// `null[]` has no element rep, so `flushNullOnlyLits` refuses the untyped ones at program end.
+// An untyped one names no element type, so `flushNullOnlyLits` refuses it at program end.
 let nolLits: i32[] = []
 let nolTaken: {[i32]: boolean} = Map()
+// The null-only literals some destination other than `null[]` received: each is built at that
+// destination's list, never as a `null[]` (`nodeArrayElemIsNullUnit`).
+let nolTakenOther: {[i32]: boolean} = Map()
+export function nolLitTakenOther(ix: i32): boolean {
+  nolTakenOther[ix] ?? false
+}
 let nolOperand: {[i32]: boolean} = Map()
 
 // A list literal whose element joins to a union, and per literal what a delivery outside a
@@ -74801,9 +74614,9 @@ export function arrLitUnionDestTaken(ix: i32): boolean {
 }
 
 // Marks each null-only list literal `srcExpr` delivers into `dstTy` as typed, walking the
-// destination beside the value. A part whose own destination is `null[]`, or holds a type
-// variable that is not the enclosing generic's own, types nothing. A speculative delivery
-// under `inferQuiet` marks too: it names a destination the real check then delivers to.
+// destination beside the value. A part whose destination is a union offering only `null[]`, or
+// holds a type variable that is not the enclosing generic's own, types nothing. A speculative
+// delivery under `inferQuiet` marks too: it names a destination the real check then delivers to.
 function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
   if (nolLits.length == 0 && ulLitN == 0) || srcExpr < 0 || dstTy < 0 {
     return 0
@@ -74830,7 +74643,10 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
     if nolElemOnlyNull(dt) || (tyHasTyVar(dt) && !fsbTvsInScope(dt, 0)) {
       return 0
     }
+    // A generic parameter's `T[]` pinned at `null` by this very literal names nothing.
+    if lbiNoDest && nolIsNullList(dt) { return 0 }
     nolTaken[at] = true
+    if !nolIsNullList(dt) { nolTakenOther[at] = true }
     const dn = nonNullTy(dt)
     let elDt = dt
     if dn >= 0 {
@@ -74913,13 +74729,23 @@ function nolMarkOperand(ix: i32) {
   0
 }
 
-// Whether `ty`, through `null` and union members, offers a list only as `null[]`.
+// Whether `ty`, its `null` peeled, is `null[]` itself.
+function nolIsNullList(ty: i32): boolean {
+  const dn = nonNullTy(ty)
+  if dn < 0 { return false }
+  const t = T.tys[dn]
+  if t is TyArray { return t.aElem == TY_NULL }
+  false
+}
+
+// Whether `ty` is a union that offers a list only as `null[]`. A plain `null[]` destination names
+// the element type and types the literal (D4671); a union one does not say which arm it builds.
 function nolElemOnlyNull(ty: i32): boolean {
   const dn = nonNullTy(ty)
   if dn < 0 { return false }
   const t = T.tys[dn]
   match t {
-    TyArray => t.aElem == TY_NULL
+    TyArray => false
     TyUnion => nolMembersOnlyNull(t.uMembers)
     // None of these is a list, so a destination of one names no element type either way.
     TyErr | TyPrim | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyNullable | TyObj => false

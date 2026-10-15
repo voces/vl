@@ -65,6 +65,7 @@ import {
   mapTyValIsLitUnion,
   mapTyValIsNulBool,
   mapTyValIsNulLitUnion,
+  mapTyValIsNullUnit,
   mapTyValLitUnionTexts,
   mapUnboxTyOf,
   matchConstPatLitAt,
@@ -318,6 +319,7 @@ import {
   FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
+  FC_NUL_NONE,
   FC_NUL_REF_LIST,
   FC_NUL_STR,
   FC_REF_LIST,
@@ -747,6 +749,7 @@ import {
   anonLeafSupersedeOf,
   arrElemIsNulBoolAt,
   arrElemIsNulStrAt,
+  arrElemIsNullUnitAt,
   arrElemLitUnionTy,
   arrLitElemNameIn,
   arrLitIsF32,
@@ -1520,6 +1523,10 @@ function emitOmittedFieldNull(_body: u8[], si: i32, fi: i32, scode: i32) {
     fbRefNull(cloStructIdx)
     return 0
   }
+  if scode == FC_NUL_NONE {
+    fbRefNullNone()
+    return 0
+  }
   if scode == FC_NUL_MAP {
     fbRefNull(mapTypeIdxOf(sFieldMapShape(si, fi)))
     return 0
@@ -1693,6 +1700,10 @@ function emitStructFieldValueUnder(
     const ncCtx = expCtxHere()
     ncCtx.nulClosure = true
     if emitExprExpect(body, valIx, fnIx, ncCtx) < 0 { return -1 }
+  } else if scode == FC_NUL_NONE {
+    // The `null` unit type's slot holds only `ref.null none`; the value runs for effect (D4671).
+    if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
+    fbRefNullNone()
   } else if scode == FC_STR && exprIsLitAtom(valIx, fnIx) {
     // a literal-union atom widens to its member string here.
     if emitAtomToStr(body, valIx, fnIx) < 0 { return -1 }
@@ -2294,6 +2305,9 @@ function emitVariantFieldValueUnder(
     const ncCtx = expCtxHere()
     ncCtx.nulClosure = true
     if emitExprExpect(body, valIx, fnIx, ncCtx) < 0 { return -1 }
+  } else if vcode == FC_NUL_NONE {
+    if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
+    fbRefNullNone()
   } else if variantFieldIsLitUnionArray(vi, fj) {
     const vlaCtx = expCtxHere()
     vlaCtx.litUnion = 1
@@ -7234,6 +7248,9 @@ function variantFieldsComparable(vi: i32): boolean {
 // exist already; `i64` and `f32` are the two the struct ladder does not serve either.
 function variantFieldComparable(ufi: i32): boolean {
   const c = uFieldTypes[ufi]
+  if c == FC_NUL_NONE {
+    return true // `null` has one value: the core drops both reads and answers true
+  }
   if c == FC_I32 || c == FC_NUL_BOOL || c == FC_NUL_LIT_UNION {
     // i32 and boolean, and the two i32-sentinel niches that share the slot (D1180) — the struct
     // ladder's own rung. Their null rides in the value space, so `i32.eq` answers `null == null`
@@ -7447,6 +7464,13 @@ function emitVariantFieldEqCore(body: u8[], ufi: i32, fnIx: i32) {
 // The same ladder keyed by an EXPLICIT code — what the null guard re-enters at the niche's
 // non-null twin.
 function emitVariantFieldEqCoreAt(body: u8[], ufi: i32, fnIx: i32, c: i32) {
+  if c == FC_NUL_NONE {
+    // Both sides hold only `null`: drop the two reads, the field always agrees.
+    fbDrop()
+    fbDrop()
+    fbI32Const(1)
+    return 0
+  }
   if c == FC_I32 || c == FC_NUL_BOOL || c == FC_NUL_LIT_UNION {
     fbI32Bin(70) // 0x46 i32.eq — and the two i32-sentinel niches, see the gate
     return 0
@@ -9668,14 +9692,18 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
     if !lUsed {
       return emitFail("emitProgram: array literal but list type not collected")
     }
-    // Three element types share the i32 backing but do not lower like i32s, so each seeds the
-    // element emits: `K[]` lowers member literals as interned atom ids, `(boolean|null)[]` a
-    // `null` as the sentinel 2, and `(K|null)[]` both. The element type comes from the checker's
+    // Four element types share the i32 backing but do not lower like i32s, so each seeds the
+    // element emits: `K[]` lowers member literals as interned atom ids, `(boolean|null)[]` and
+    // `null[]` a `null` as the sentinel 2, and `(K|null)[]` both. The element type comes from the checker's
     // recorded type; the `pendingListKind == 8` and `== 9` legs catch an all-`null` `[null]`.
     const litArr = nodeArrayElemIsLitUnion(arrIx)
     const ic = expCtxHere()
     if litArr { ic.litUnion = 1 }
-    if nodeArrayElemIsNulBool(arrIx) || ic.listKind == LBK_NUL_BOOL_LIST {
+    if (
+      nodeArrayElemIsNulBool(arrIx)
+      || arrElemIsNullUnitAt(arrIx, fnIx)
+      || ic.listKind == LBK_NUL_BOOL_LIST
+    ) {
       ic.nulBool = true
     }
     if (
@@ -10299,7 +10327,7 @@ function emitMapGetOr(
   if mapTyValIsNulLitUnion(orMt) {
     nulSentinel = 0 - 1
     hasSentinel = true
-  } else if mapTyValIsNulBool(orMt) {
+  } else if mapTyValIsNulBool(orMt) || mapTyValIsNullUnit(orMt) {
     nulSentinel = 2
     hasSentinel = true
   }
@@ -10546,7 +10574,11 @@ function emitMapGetTail(body: u8[], recvIx: i32, fnIx: i32) {
   const gtMt = mapRecvTyIn(recvIx, fnIx)
   if mapTyValIsNulLitUnion(gtMt) || mapTyValIsLitUnion(gtMt) {
     fbI32Const(0 - 1)
-  } else if mapTyValIsNulBool(gtMt) || mapTyValIsBool(gtMt) {
+  } else if (
+    mapTyValIsNulBool(gtMt)
+    || mapTyValIsBool(gtMt)
+    || mapTyValIsNullUnit(gtMt)
+  ) {
     fbI32Const(2)
   } else {
     fbI32Const(0) // i32.const 0
@@ -11311,6 +11343,12 @@ function emitMapSetValExpr(
       fbI32Const(2)
       return 0
     }
+    // A `null`-typed value is that `null` too, its effects run first.
+    if exprIsNulNone(valIx, fnIx) {
+      if emitNulNoneForEffect(body, valIx, fnIx) < 0 { return -1 }
+      fbI32Const(2)
+      return 0
+    }
   }
   // A NULLABLE-value slot (`{[string]: S | null}` / `{[string]: map | null}`) stores a bare
   // `null` as `ref.null <elem>` — the vals element carries it directly and the fused read
@@ -11421,7 +11459,8 @@ function emitMapSetV(
   if mapTyValIsNulLitUnion(svMt) { atomVal = true }
   // A `boolean | null`-valued map is the MONO i32 niche too — a bare `null` store lowers as the
   // `2` sentinel (the store-side dual of the read's `mapTyValIsNulBool` coalesce).
-  const nulBoolVal = mapTyValIsNulBool(svMt)
+  // A `null`-valued map stores the same sentinel, the only value it holds (D4671).
+  const nulBoolVal = mapTyValIsNulBool(svMt) || mapTyValIsNullUnit(svMt)
   // A mono (i32/boolean-valued) map cannot store a ref value — a string / struct / list
   // ref into an i32 array is invalid wasm — so fail loudly; an mv-slot map stores such
   // values through its own typed vals list, and a constant-true Set value is always a
@@ -15716,6 +15755,11 @@ function emitStructEqFieldAt(
   // rides in the value space rather than beside it, using the same `0x7f i32` storagetype
   // code 0 does, so plain `i32.eq` already answers `null == null` true and `null == "a"`
   // false with no guard needed.
+  if code == FC_NUL_NONE {
+    // A `null`-typed field holds only `null`, so the two sides always agree.
+    fbI32Const(1)
+    return 0
+  }
   if code == FC_I32 || code == FC_NUL_BOOL || code == FC_NUL_LIT_UNION {
     // Scalar (i32 / boolean), or an i32-sentinel niche field: a native compare.
     if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
@@ -16642,6 +16686,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   if e is CharLit { return emitCharLitNode(body, e, exprIx, fnIx) }
   if e is Ident { return emitIdentNode(body, e, exprIx, fnIx) }
   if e is Paren { return emitExpr(body, e.parInner, fnIx) }
+  if (
+    (e is Member || e is Index || callIsMethodAt(exprIx))
+    && exprIsNulNone(exprIx, fnIx)
+  ) {
+    return emitNulNoneRead(body, exprIx, fnIx)
+  }
   if e is Member || e is Index {
     const pnk = placeNicheAtomKind(exprIx, fnIx)
     if pnk >= 0 {
@@ -16831,6 +16881,49 @@ function chainHasPrelude(ifIx: i32): boolean {
 // bare `null` there takes, so no arm can pick a blocktype for it (D2227).
 function emitAllNullIf(body: u8[], ifIx: i32, fnIx: i32) {
   if emitIfForEffect(body, unwrapParen(ifIx), fnIx) < 0 { return -1 }
+  emitNullBySeed(fnIx, true)
+}
+
+// Whether node `ix` is a method call `recv.m(…)`.
+function callIsMethodAt(ix: i32): boolean {
+  const c = P.nodes[ix]
+  if c is Call { return P.nodes[unwrapParen(c.callFn)] is Member }
+  false
+}
+
+// A field, element or map read, or a `null[]`'s `pop`/`get`, whose type is the `null` unit type:
+// the read runs in its own stored rep with the destination's null seeds lifted, is dropped, and
+// the value is the `null` the destination seeded, as an ident read of a `null` binding is (D4671).
+function emitNulNoneRead(body: u8[], exprIx: i32, fnIx: i32) {
+  const outer = expCtxHere()
+  const raw = expCtxHere()
+  raw.structIdx = -1
+  raw.variantIdx = -1
+  raw.nulBool = false
+  raw.nulLitUnion = false
+  raw.nulString = false
+  raw.nulClosure = false
+  raw.nulList = false
+  raw.nulNone = false
+  raw.nulRefHeap = -1
+  raw.litUnion = 0
+  expCtxApply(raw)
+  let rc = 0
+  const e = P.nodes[exprIx]
+  if e is Member {
+    rc = emitMemberNode(body, e, exprIx, fnIx)
+  } else if e is Index {
+    if exprMap(e.idxArr, fnIx) {
+      rc = emitMapGet(body, e.idxArr, e.idxIndex, fnIx)
+    } else {
+      rc = emitIndex(body, exprIx, fnIx)
+    }
+  } else if e is Call {
+    rc = emitCallNode(body, e, exprIx, fnIx)
+  }
+  expCtxApply(outer)
+  if rc < 0 { return -1 }
+  fbDrop()
   emitNullBySeed(fnIx, true)
 }
 
@@ -21666,7 +21759,10 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
         const xluCtx = expCtxHere()
         xluCtx.litUnion = 1
         if emitExprExpect(body, a.binRight, fnIx, xluCtx) < 0 { return -1 }
-      } else if nodeArrayElemIsNulBool(target.idxArr) {
+      } else if (
+        nodeArrayElemIsNulBool(target.idxArr)
+        || arrElemIsNullUnitAt(target.idxArr, fnIx)
+      ) {
         // `p[i] = null` over a `(boolean | null)[]`: the i32 cell holds 0/1 or the
         // sentinel 2 — seed `pendingNulBool` (via the ctx) so a `null` RHS emits 2 (a
         // boolean RHS is a `BoolLit`, untouched). The list analogue of the scalar niche
@@ -21919,6 +22015,10 @@ function emitAssignUnder(body: u8[], binIx: i32, fnIx: i32) {
         if emitScalarFieldStoreVal(body, a.binRight, fnIx, fscode) < 0 {
           return -1
         }
+      } else if fscode == FC_NUL_NONE {
+        // The `null` unit type's slot, the construct arm's twin (D4671).
+        if emitNulNoneForEffect(body, a.binRight, fnIx) < 0 { return -1 }
+        fbRefNullNone()
       } else if fscode == FC_STRUCT {
         // The ASSIGN half of the construct arm above (`p.g = s` after `if s is Circle`) —
         // `emitObj` and `emitAssign` are the two halves of every field code and have to be
@@ -22194,7 +22294,7 @@ function pushRunBuildCtx(recvIx: i32, fnIx: i32, kk: MfKind, row: i32): ExpCtx {
   c.listKind = pendingKindOfMf(kk, row)
   c.listSlot = row
   if arrElemLitUnionTy(recvIx, fnIx) >= 0 { c.litUnion = 1 }
-  if arrElemIsNulBoolAt(recvIx, fnIx) {
+  if arrElemIsNulBoolAt(recvIx, fnIx) || arrElemIsNullUnitAt(recvIx, fnIx) {
     c.listKind = LBK_NUL_BOOL_LIST
     c.nulBool = true
   }
@@ -22332,7 +22432,8 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
       const isLitArr = arrElemLitUnionTy(callee.memObj, fnIx) >= 0
       // a `(boolean | null)[]` push also rides the i32-list spine, but a `null` value must
       // lower as the sentinel 2 (`pendingNulBool`).
-      const isNbArr = arrElemIsNulBoolAt(callee.memObj, fnIx)
+      const isNbArr = (arrElemIsNulBoolAt(callee.memObj, fnIx)
+        || arrElemIsNullUnitAt(callee.memObj, fnIx))
       // a `(K | null)[]` push rides the same spine: a member literal lowers as its atom
       // id, a `null` as the `-1` sentinel — seed both for the value emit.
       const isNlluArr = nodeArrayElemIsNulLitUnion(callee.memObj)
@@ -24775,6 +24876,8 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
           const nvr = fRetStructIdx[fnPos]
           if nvr >= 0 && nvr < uVarHeap.length {
             ctx.nulRefHeap = uVarHeap[nvr]
+            // A `return { … }` builds the arm's own struct, as the annotated seed has it (D4668).
+            ctx.variantIdx = nvr
           }
         }
         // D937 — the nullable-map twin of the arm above: a map's null is not a struct
@@ -28132,7 +28235,12 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.fiLabel)
-  if fiHBack >= 0 && !hasPair && partialUnrollCost(s.fiBody, fnIx) >= 0 {
+  if (
+    fiHBack >= 0
+    && !hasPair
+    && ek != "nulnone"
+    && partialUnrollCost(s.fiBody, fnIx) >= 0
+  ) {
     const fiCopies: ForInCopies = {
       back: fiHBack,
       len: fiHLen,
@@ -28198,7 +28306,9 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   }
   // v = backing[cursor] (a string element recovers its non-null ref). A STRING source reads
   // its HOISTED backing at a cursor that is already a backing offset; the code unit is an i32.
-  if strSrc {
+  if ek == "nulnone" {
+    // A `null[]` element is never read: its loop var is the `null` cell, null from its default.
+  } else if strSrc {
     // pk = __utf8_dec__(backing, cursor, end) ; v = pk & 0x00ffffff
     fbLocalGet(fiSBack)
     fbRefAsNonNull() // the hoist slot is nullable so it stays defaultable;
@@ -28237,8 +28347,8 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
       if emitStaleBoxRetag(hSlot, s.fiIter) < 0 { return -1 }
     }
   }
-  fbLocalSet(vIdx)
-  if pairIsVal {
+  if ek != "nulnone" { fbLocalSet(vIdx) }
+  if pairIsVal && pairEk != "nulnone" {
     // `v = M.vals.backing[cursor]` — the value beside the key just bound, off the walk's
     // stash the tombstone skip already reads, so the receiver is evaluated once.
     cmSlot = mwShape
@@ -32763,6 +32873,8 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         if ank == "strlist" && exprNullableString(c.callArgs[1], fnIx) {
           anCtx.nulString = true
         }
+        // A `null`-typed fill is the i32 list's sentinel 2, as a `null[]` element is (D4671).
+        if exprIsNulNone(c.callArgs[1], fnIx) { anCtx.nulBool = true }
         expCtxApply(anCtx)
         arrNewFillDepth = arrNewFillDepth + 1
         const anFillRc = emitExpr(body, c.callArgs[1], fnIx)
@@ -32771,6 +32883,7 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         // stay the fill's until the success path clears them.
         const anAfter = expCtxHere()
         anAfter.nulString = anSaved.nulString
+        anAfter.nulBool = anSaved.nulBool
         anAfter.listKind = anSaved.listKind
         anAfter.listSlot = anSaved.listSlot
         expCtxApply(anAfter)
