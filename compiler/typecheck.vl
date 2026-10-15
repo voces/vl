@@ -12,10 +12,106 @@
 // as a struct parameter and recurse back through `checkNode`.
 
 import {
-  f32LitOverflows,
+  LBI_CONST_DEPTH,
+  LBI_EDGE,
+  LBI_EDGE_FWD,
+  LBI_FIT_F32,
+  LBI_FIT_F64,
+  LBI_FIT_I32,
+  LBI_FIT_I64,
+  LBI_FIT_SAME,
+  LBI_FLOAT,
+  LBI_INT,
+  LBI_KEYS,
+  LBI_LIT,
+  LBI_LO,
+  LBI_LOCAL,
+  LBI_NOT_F32,
+  LBI_OP_CMP,
+  LBI_OP_NONE,
+  LBI_TREE,
+  LBI_TREE_DEPTH,
+  LBI_UP,
+  LBI_WIDE_ANY,
+  LBI_WIDE_I64,
+  binFloatOperandPair,
+  binIntOnlyOp,
+  castConstMisfit,
+  castShiftCount,
+  cexCountBelow,
+  cexFitsAt,
+  cexIsMinI64,
+  cexKeepLeaf,
+  cexLeafNotConst,
+  cexLitPeel,
+  cexMisfitMsg,
+  cexNamesNone,
+  cexOp,
+  cexPastF64,
+  cexPosNone,
+  cexRetypeLeaf,
+  cexRootShape,
+  cexShapeNotTree,
+  cexShown,
+  cexWidePushOperands,
+  cmpF32LitAdopts,
+  dstIntWidth,
+  exprIsNumLit,
+  fillIsLitZero,
+  floatIntrWidth,
+  intLitIsNegated,
+  intLitLexemeOf,
+  isExactF64IntLitExpr,
+  isF32AdoptingLitExpr,
+  isFloatLitExpr,
+  lbiArithOp,
+  lbiChoose,
+  lbiChosenOf,
+  lbiEdgeKind,
+  lbiFits,
+  lbiIntTy,
+  lbiLitDefault,
+  lbiLitFits,
+  lbiNameKey,
+  lbiNeeds,
+  lbiNegArg,
+  lbiNumTy,
+  lbiOpClass,
+  lbiOperandFits,
+  lbiReadNeutral,
+  lbiRowTakes,
+  lbiTreeLeaves,
+  letDeclIsUnannotNumLit,
+  litTreeOps,
+  litTreeWideTy,
+  matchNegPatNum,
+  matchPatIntNumOf,
+  numCastCanFail,
+  numLitAnnotNote,
+  numLitArithOp,
+  numLitAssignedValue,
+  numLitBindCandidateTy,
+  numLitCallStoresNonLit,
+  numLitFitsStore,
+  numLitFnCallOf,
+  numLitInsertBySpan,
+  numLitIsFnTail,
+  numLitIsInt,
+  numLitListIsBytes,
+  numLitNameAt,
+  numLitPrimTy,
+  numLitReadIdent,
+  numLitText,
+  numLitValuesFit,
+  numUnionAsConverts,
+  numUnionMembersOf,
+  numUnionOp,
+  numUnionPinOk,
+  radixLeafAmong,
+  shiftCountMsg,
+} from "./check_num_lits"
+import {
   f64LitOverflows,
-  intLexemeIsExactF32,
-  intLexemeIsExactF64,
   numLexFitsI32,
   numLexIs2Pow31,
   numLexIsFloat,
@@ -30,8 +126,6 @@ import {
   cexDecText,
   cexDiv,
   cexFitsSigned,
-  cexIntExactAt,
-  cexIsWhole,
   cexLexeme,
   cexMul,
   cexNeg,
@@ -39,10 +133,8 @@ import {
   cexNotConst,
   cexOfLexeme,
   cexOk,
-  cexPatFits,
   cexPatternHex,
   cexRem,
-  cexScaleBits,
   cexShift,
 } from "./const_exact"
 // The parser's node arena: constructors, accessors and side tables.
@@ -589,6 +681,7 @@ import {
   getSiteFns,
   getSiteNodes,
   keyHasPrefix,
+  parenPeelIx,
   placeKeyOf,
   subscriptKeyTextOf,
 } from "./check_places"
@@ -697,10 +790,6 @@ import {
   weSplit,
 } from "./check_capture_walks"
 import {
-  CM_READS,
-  CM_REMOVES,
-  CM_REMOVES_ONE,
-  CM_RETURNS,
   CW_ELEM_FLD,
   CW_FR_UNKNOWN,
   CW_OCC_ASG,
@@ -724,7 +813,6 @@ import {
   CW_UP_RET,
   CW_UP_SPREAD,
   CW_UP_TAIL,
-  collMethodKind,
   covarRootFrame,
   covarRootName,
   cwAdd,
@@ -13506,50 +13594,6 @@ function collBindPopTo(depth: i32) {
   fsbPopTo(depth)
 }
 
-// Is `ix` a numeric literal, possibly negated or parenthesised?
-function exprIsNumLit(ix: i32): boolean {
-  const e = P.nodes[parenPeelIx(ix)]
-  if e is Unary { return e.unOp == "-" && exprIsNumLit(e.unArg) }
-  e is NumLit
-}
-
-// Is `ix` a `let`/`const` with no annotation whose initializer is a numeric literal, a
-// non-empty list literal of them, or a record literal with a numeric-literal field?
-function letDeclIsUnannotNumLit(ix: i32): boolean {
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    if n.letType >= 0 || n.letInit < 0 { return false }
-    const iv = P.nodes[parenPeelIx(n.letInit)]
-    if iv is ObjLit {
-      for fi in iv.objFields {
-        const f = P.nodes[fi]
-        if f is FieldInit {
-          if exprIsNumLit(f.fiValue) { return true }
-        }
-      }
-      return false
-    }
-    if iv is ArrayLit {
-      if iv.arrElems.length == 0 { return false }
-      for el in iv.arrElems {
-        if !exprIsNumLit(el) { return false }
-      }
-      return true
-    }
-    return exprIsNumLit(n.letInit)
-  }
-  false
-}
-
-// Can a binding of type `ty` hold a defaulted numeric literal: `f64`, `i32`, a list or a
-// record? The cheap test every declaration pays before the initializer is read.
-function numLitBindCandidateTy(ty: i32): boolean {
-  if ty == TY_F64 || ty == TY_I32 { return true }
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
-  t is TyArray || t is TyObj
-}
-
 // Mark the binding `name` declared by `decl` at `depth` when `letDeclIsUnannotNumLit` holds.
 function markNumLitBinding(name: string, depth: i32, decl: i32) {
   if !letDeclIsUnannotNumLit(decl) { return 0 }
@@ -13563,39 +13607,6 @@ function markNumLitBinding(name: string, depth: i32, decl: i32) {
 // such a `const` is its literal at every read (DECISIONS.md §"A literal binding takes its type
 // from its uses"). A moved `let` is re-checked with its type written as its annotation (D3246).
 
-// Use kinds: the binding flows INTO a typed destination, a typed value flows into it, or another
-// literal binding (`lbiTy` is its candidate) flows into it. An operand chooses nothing.
-const LBI_UP = 0
-const LBI_LO = 1
-const LBI_EDGE = 3
-// A candidate read inside an integer intrinsic's operand flows into the store's target, which
-// does not flow back: the operand chooses nothing (D3343, `lbiIntrEdge`).
-const LBI_EDGE_FWD = 2
-// And vetoes, which choose nothing and keep the default when the choice breaks one: a float
-// literal operand (not `i64`), a bitwise or shift operand (an integer), `==` an integer (not `f32`).
-const LBI_FLOAT = 4
-const LBI_INT = 5
-const LBI_NOT_F32 = 6
-// A binding inside an expression delivered to `lbiTy`: a veto on any type wider than that.
-const LBI_TREE = 8
-// A numeric literal stored into it: `lbiTy` is the set of types that hold the literal
-// (`LBI_FIT_*`), and `LBI_FIT_SAME` when it has one value at every width that holds it.
-const LBI_LIT = 7
-const LBI_FIT_I32 = 1
-const LBI_FIT_I64 = 2
-const LBI_FIT_F32 = 4
-const LBI_FIT_F64 = 8
-const LBI_FIT_SAME = 16
-// An un-annotated binding that is not exported, in `lbiExpMod`.
-const LBI_LOCAL = -2
-// A read's widening marks beside a type: the same at every width (compared with an `i32`
-// literal), and the same at `i32` and `i64` (inside a constant tree that never leaves `i32`).
-const LBI_WIDE_ANY = -2
-const LBI_WIDE_I64 = -3
-// How deep a tree `lbiTreeReads` and the constant evaluation look, from a start depth.
-const LBI_TREE_DEPTH = 32
-const LBI_CONST_DEPTH = 28
-
 // The literal bindings in scope, depth-tagged as `numLitBindDepth` is, each row naming its
 // candidate; and apart from them the ones whose type the solve wrote.
 let lbiBindDepth: i32[] = []
@@ -13605,8 +13616,6 @@ let lbiBindPrev: i32[] = []
 let lbiBindSid: i32[] = []
 // The newest row per name, by the name's interned id (-1 for none).
 let lbiBindTop: i32[] = []
-// A filter every literal binding's name sets (`lbiNameKey`), so most reads skip the lookup.
-const LBI_KEYS = 1024
 let lbiNameSeen: boolean[] = []
 let lbiPinnedDepth: i32[] = []
 let lbiPinnedName: string[] = []
@@ -13742,21 +13751,6 @@ function lbiNoteOperandUseTy(ix: i32, other: i32) {
   0
 }
 
-// Whether the constant literal at `ix` is of the number type `ty`'s kind, integer or float, and
-// its exact value fits `ty`.
-function lbiOperandFits(ix: i32, ty: i32): boolean {
-  const lit = cexLitPeel(ix)
-  if lit < 0 { return false }
-  const l = P.nodes[lit]
-  if !(l is NumLit) { return false }
-  let v = cexOfLexeme(l.numText)
-  if !cexOk(v) { return false }
-  if intLitIsNegated(ix) { v = cexNeg(v) }
-  const isF = ty == TY_F32 || ty == TY_F64
-  if v.cxFloat != isF { return false }
-  cexFitsAt(v, cexLexeme(v), ty)
-}
-
 // The occurrence recorded for node `ix`, or -1.
 function lbiOccOfNode(ix: i32): i32 {
   if ix < 0 || ix >= nodeToks.length { return -1 }
@@ -13858,22 +13852,6 @@ export function lbiReset() {
 // parsed annotation precedes its declaration in the arena and a written one follows it.
 function lbiIsSynth(ann: i32, decl: i32): boolean {
   ann > decl && (lbiSynth[ann] ?? -1) == decl
-}
-
-// Is `ty` one of the four scalar numbers the solve chooses between?
-function lbiNumTy(ty: i32): boolean {
-  ty >= 0 && (ty == TY_I32 || ty == TY_I64 || ty == TY_F32 || ty == TY_F64)
-}
-
-// The type the bare numeric literal `ix` has with no context: `f64` for a float, `i32` for an
-// integer that fits it (`-2147483648` does), else `i64`.
-function lbiLitDefault(ix: i32): i32 {
-  const lex = intLitLexemeOf(ix)
-  if lex == "" { return TY_F64 }
-  if numLexFitsI32(lex) { return TY_I32 }
-  const e = P.nodes[parenPeelIx(ix)]
-  if e is Unary && numLexIs2Pow31(lex) { return TY_I32 }
-  TY_I64
 }
 
 // Mark `decl`, declaring `name` at `depth` with type `ty`, when its initializer is a bare
@@ -14026,12 +14004,6 @@ function lbiCandAt(ix: i32): i32 {
   -1
 }
 
-// The filter slot of `name`: its first character and its length.
-function lbiNameKey(name: string): i32 {
-  if name.length == 0 { return 0 }
-  (name.charCodeAt(0) * 7 + name.length * 131) & (LBI_KEYS - 1)
-}
-
 // The candidate `name`, interned as `sid`, resolves to in the current scope, or -1: its newest
 // row at the depth `lookupDepth` answers, so a deeper binding that is not one shadows it.
 function lbiCandOfName(name: string, sid: i32): i32 {
@@ -14099,76 +14071,6 @@ function lbiElemsPinned(ix: i32): boolean {
     }
   }
   false
-}
-
-// Is `op` an operator whose result is its operands' number, so a literal binding inside it is
-// delivered wherever the whole expression is?
-function lbiArithOp(op: string): boolean { lbiOpClass(op) == LBI_OP_ARITH }
-
-const LBI_OP_NONE = 0
-const LBI_OP_ARITH = 1
-const LBI_OP_CMP = 2
-
-// The class of binary operator `op`: arithmetic (`+ - * / % & | ^ << >> >>>`), comparison
-// (`< > <= >= == !=`), or neither. Read from its characters: every binary operator pays this.
-function lbiOpClass(op: string): i32 {
-  const c = op.charCodeAt(0)
-  if op.length == 1 {
-    if c == 60 || c == 62 { return LBI_OP_CMP }
-    if (
-      c == 43
-      || c == 45
-      || c == 42
-      || c == 47
-      || c == 37
-      || c == 38
-      || c == 124
-      || c == 94
-    ) {
-      return LBI_OP_ARITH
-    }
-    return LBI_OP_NONE
-  }
-  const d = op.charCodeAt(1)
-  if op.length == 2 {
-    if d == 61 && (c == 60 || c == 62 || c == 61 || c == 33) {
-      return LBI_OP_CMP
-    }
-    if c == d && (c == 60 || c == 62) { return LBI_OP_ARITH }
-    return LBI_OP_NONE
-  }
-  if op.length == 3 && c == 62 && d == 62 && op.charCodeAt(2) == 62 {
-    return LBI_OP_ARITH
-  }
-  LBI_OP_NONE
-}
-
-// Push the leaves of the arithmetic tree at `ix` onto `out`: every node under it that is not a
-// parenthesis, a negation or an operator whose result is its operands' number.
-function lbiTreeLeaves(ix: i32, out: i32[], depth: i32) {
-  if ix < 0 || ix >= P.nodes.length || depth > 32 { return 0 }
-  const p = parenPeelIx(ix)
-  if p < 0 || p >= P.nodes.length { return 0 }
-  const neg = lbiNegArg(p)
-  if neg >= 0 { return lbiTreeLeaves(neg, out, depth + 1) }
-  const n = P.nodes[p]
-  if n is BinExpr {
-    if n.binCompound.length == 0 && lbiArithOp(n.binOp) {
-      lbiTreeLeaves(n.binLeft, out, depth + 1)
-      return lbiTreeLeaves(n.binRight, out, depth + 1)
-    }
-  }
-  out.push(p)
-  0
-}
-
-// The operand of the negation at `ix`, or -1 when `ix` is not one.
-function lbiNegArg(ix: i32): i32 {
-  const n = P.nodes[ix]
-  if n is Unary {
-    if n.unOp == "-" { return n.unArg }
-  }
-  -1
 }
 
 // Split the arithmetic tree at `ix` into its leaves: candidates into `cands`, and the scalar type
@@ -14314,9 +14216,6 @@ function cexEvalAt(ix: i32, depth: i32): Cex {
   cexLeafNotConst()
 }
 
-// Every other node, a call, a char or a string among them, is not a constant this fold computes.
-function cexLeafNotConst(): Cex { cexNotConst() }
-
 function cexEvalBin(e: BinExpr, depth: i32): Cex {
   if e.binCompound.length > 0 || !cexOp(e.binOp) { return cexNotConst() }
   const l = cexEvalAt(e.binLeft, depth + 1)
@@ -14333,9 +14232,6 @@ function cexEvalBin(e: BinExpr, depth: i32): Cex {
   cexShift(l, r, op)
 }
 
-// Whether `op` is an operator a constant tree is made of: `+ - * / % & | ^ << >> >>>`.
-function cexOp(op: string): boolean { lbiOpClass(op) == LBI_OP_ARITH }
-
 // A read of an un-annotated literal `const` is its literal's value.
 function cexEvalName(ix: i32, name: string, depth: i32): Cex {
   let lit = -1
@@ -14347,22 +14243,6 @@ function cexEvalName(ix: i32, name: string, depth: i32): Cex {
   if lit < 0 { return cexNotConst() }
   cexEvalAt(lit, depth + 1)
 }
-
-// Whether the node at `ix` could root a tree worth folding: an operator, or a `~` or a chain of
-// negations. A single negated literal is already the literal a fold would write.
-function cexRootShape(ix: i32): boolean {
-  const e = P.nodes[ix]
-  if e is BinExpr { return true }
-  if e is Unary {
-    if e.unOp == "~" { return true }
-    if e.unOp != "-" { return false }
-    return !(P.nodes[parenPeelIx(e.unArg)] is NumLit)
-  }
-  cexNoRoot()
-}
-
-// Every other node, a literal or a name among them, roots no tree a fold would rewrite.
-function cexNoRoot(): boolean { false }
 
 // Fold the tree at `ix` in place: 1 when it is rewritten into its value's literal, 2 when it is
 // a constant the check refuses (reported here), 0 when it is no constant tree.
@@ -14415,9 +14295,6 @@ function cexKeepWhole(ix: i32, depth: i32) {
   cexKeepLeaf()
 }
 
-// A literal or a name, the other nodes a constant tree holds, has nothing below it to keep.
-function cexKeepLeaf(): i32 { 0 }
-
 // Whether the node at `ix` has a constant tree's shape, reading no digits: 1 it has, 0 it has not,
 // -1 it is deeper than `CEX_DEPTH`. The walk stops at the first leaf that is no constant.
 function cexTreeShape(ix: i32, depth: i32): i32 {
@@ -14445,9 +14322,6 @@ function cexTreeShape(ix: i32, depth: i32): i32 {
   cexShapeNotTree()
 }
 
-// Every other node, a call, a char or a string among them, is no constant tree.
-function cexShapeNotTree(): i32 { 0 }
-
 // Whether the read `ix` of `name` is a literal `const`'s. A name no literal binding in scope
 // carries is answered from its interned id before the full lookup.
 function cexNameIsLitConst(ix: i32, name: string): boolean {
@@ -14459,17 +14333,6 @@ function cexNameIsLitConst(ix: i32, name: string): boolean {
     if r < 0 || !lbiIsConst[lbiBindCand[r]] { return false }
   }
   lbiConstLitAt(ix, name) >= 0
-}
-
-// A float constant past the largest double stays the IEEE computation written, since VL has
-// no spelling for the infinity it rounds to.
-function cexPastF64(v: Cex): boolean {
-  if !v.cxFloat { return false }
-  // A double's largest finite value is below 2^1024; only a value near it needs the encoder.
-  const b = cexScaleBits(v)
-  if b < 1020 { return false }
-  if b > 1026 { return true }
-  f64LitOverflows(cexLexeme(v))
 }
 
 // Fold the module initializer `init` before the module is checked, so its reads anywhere are
@@ -14521,9 +14384,6 @@ function cexNoteNames(ix: i32, depth: i32) {
   cexNamesNone()
 }
 
-// A literal, the one other node a constant tree holds, names nothing.
-function cexNamesNone(): i32 { 0 }
-
 // The source position of the tree at `ix`: its leftmost leaf's.
 function nodePosOf(ix: i32): i32 {
   const e = P.nodes[ix]
@@ -14535,9 +14395,6 @@ function nodePosOf(ix: i32): i32 {
   cexPosNone()
 }
 
-// A constant tree holds no other node; anything else has no position to give.
-function cexPosNone(): i32 { 0 }
-
 // Whether the literal at `ix` holds a constant's value rather than digits the author wrote there.
 function cexIsDerived(ix: i32): boolean {
   const p = parenPeelIx(ix)
@@ -14545,22 +14402,6 @@ function cexIsDerived(ix: i32): boolean {
   if cexFolded.length > 0 && (cexFolded[p] ?? false) { return true }
   lbiInlined.length > 0 && (lbiInlined[p] ?? false)
 }
-
-// The integer literal node under parentheses and negations at `ix`, or -1.
-function cexLitPeel(ix: i32): i32 {
-  if ix < 0 { return -1 }
-  const e = P.nodes[ix]
-  if e is Paren { return cexLitPeel(e.parInner) }
-  if e is Unary {
-    if e.unOp == "-" { return cexLitPeel(e.unArg) }
-    return -1
-  }
-  if e is NumLit { return ix }
-  cexNotLit()
-}
-
-// Every other node is no integer or float literal.
-function cexNotLit(): i32 { -1 }
 
 // The integer literal at `ix` meets a float destination or operand that holds it exactly.
 function cexFloatUse(ix: i32) {
@@ -14630,13 +14471,6 @@ function cexCheckWideLits() {
     i = i + 1
   }
   0
-}
-
-// Whether the decimal lexeme `t` is 2^63, which a negation makes the least i64.
-function cexIsMinI64(t: string): boolean {
-  if numLexRadixBits(t) >= 0 { return false }
-  const v = cexOfLexeme(t)
-  cexOk(v) && cexFitsSigned(cexNeg(v), 64)
 }
 
 // A constant delivered into `dstTy`, a number or a union with a number member: one the type
@@ -14762,59 +14596,6 @@ function cexDeliverUnion(v: Cex, lit: i32, srcExpr: i32, dstTy: i32): boolean {
   true
 }
 
-// Whether the number type `ty` holds the constant `v`, whose literal is `lex`: an integer type
-// a whole value in range (a pattern by its digits), a float type an integer it holds exactly or
-// a float that stays finite there.
-function cexFitsAt(v: Cex, lex: string, ty: i32): boolean {
-  if ty == TY_I32 || ty == TY_I64 {
-    if v.cxFloat && !cexIsWhole(v) { return false }
-    let bits = 32
-    if ty == TY_I64 { bits = 64 }
-    if v.cxPat { return cexPatFits(v, bits) }
-    return cexFitsSigned(v, bits)
-  }
-  if !v.cxFloat {
-    if ty == TY_F32 { return cexIntExactAt(v, 24, 128) }
-    return cexIntExactAt(v, 53, 1024)
-  }
-  if ty == TY_F32 { return !f32LitOverflows(lex) }
-  true
-}
-
-// Why `v` does not fit the type named `tyName`: past its range, a fraction at an integer, or an
-// integer a float cannot hold exactly.
-function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
-  const shown = cexShown(v)
-  if toFloat && !v.cxFloat {
-    return "constant "
-      + shown
-      + " is not exact at "
-      + tyName
-      + " — write it as a float literal to round it"
-  }
-  if !toFloat && v.cxFloat && !cexIsWhole(v) {
-    return "constant "
-      + shown
-      + " is not a whole number, so "
-      + tyName
-      + " cannot hold it"
-  }
-  let bits = 0
-  if tyName == "i32" { bits = 32 }
-  else if tyName == "i64" { bits = 64 }
-  const pat = cexPatternHex(v, bits)
-  if pat != "" {
-    return "constant "
-      + shown
-      + " overflows "
-      + tyName
-      + " — write "
-      + pat
-      + " for its bit pattern"
-  }
-  "constant " + shown + " overflows " + tyName
-}
-
 // When `at` is the name braced as a whole statement, `{ steps }`, and `want` is a one-field record
 // of that name that the name's own type does not already fit: a note that the braces are a block,
 // not the record shorthand (DV-1216).
@@ -14904,35 +14685,6 @@ function cexWideConstNote(srcExpr: i32): string {
   found
 }
 
-// Queue the integer operands of `at` for `cexWideConstNote`. True when `at` is a leaf that could
-// make the value `i64` by itself: not a literal, not an operator.
-function cexWidePushOperands(at: i32, todo: i32[]): boolean {
-  const e = P.nodes[at]
-  if e is BinExpr {
-    if (
-      binIntOnlyOp(e.binOp)
-      || e.binOp == "+"
-      || e.binOp == "-"
-      || e.binOp == "*"
-      || e.binOp == "/"
-      || e.binOp == "%"
-    ) {
-      todo.push(e.binLeft)
-      todo.push(e.binRight)
-    }
-    return false
-  }
-  if e is Unary {
-    if e.unOp == "-" || e.unOp == "~" { todo.push(e.unArg) }
-    return false
-  }
-  if e is NumLit { return false }
-  cexWideLeaf()
-}
-
-// Every other node is a leaf whose `i64` the note does not look inside.
-function cexWideLeaf(): boolean { true }
-
 // The note `cexWideConstNote` gives for the read `at` of the constant `nm`, of value `v`.
 function cexWideConstNoteFor(nm: string, at: i32, v: Cex): string {
   let where = ""
@@ -14954,26 +14706,11 @@ function cexWideConstNoteFor(nm: string, at: i32, v: Cex): string {
     + tail
 }
 
-// `v` as a diagnostic quotes it: an integer in decimal, a float by its literal when that is short.
-function cexShown(v: Cex): string {
-  if !v.cxFloat { return cexSignedDec(v) }
-  let t = cexLexeme(v)
-  if t.length > 24 { t = t.slice(0, 20) + "…" }
-  if v.cxNeg { return "-" + t }
-  t
-}
-
 // An operand typed `otherTy`, when `i64`, beside a type-parameter operand typed `holeTy` is
 // computed at the parameter's width, so a narrower pin must refuse it (D2712).
 function cexNoteHoleWidth(holeTy: i32, otherTy: i32) {
   if otherTy != TY_I64 || !tyHasHole(holeTy) || tyHasHole(otherTy) { return 0 }
   noteBinCstr(holeTy, OP_LITFIT, otherTy)
-}
-
-// The decimal spelling of the integer `v`, signed.
-function cexSignedDec(v: Cex): string {
-  if v.cxNeg { return "-" + cexDecText(v) }
-  cexDecText(v)
 }
 
 // Type every node from `ix` down to its literal as `ty`.
@@ -14985,9 +14722,6 @@ function cexRetype(ix: i32, ty: i32) {
   if e is Unary { return cexRetype(e.unArg, ty) }
   cexRetypeLeaf()
 }
-
-// The literal ends the chain `cexRetype` walks, typed above.
-function cexRetypeLeaf(): i32 { 0 }
 
 // A read `ix` of the name `name`, recorded when it is a candidate's.
 function lbiNoteRead(ix: i32, name: string) {
@@ -15180,30 +14914,6 @@ function lbiIntrArgs(ix: i32): i32[] {
     }
   }
   []
-}
-
-// The types that hold the bare numeric literal `ix` (`LBI_FIT_*`), with `LBI_FIT_SAME` when it
-// means one value at every one of them: a float, or an integer that is neither past `i32` nor a
-// radix pattern reaching bit 31, which reads `-1` at `i32` and 4294967295 at `i64`.
-function lbiLitFits(ix: i32): i32 {
-  const lex = intLitLexemeOf(ix)
-  if lex == "" { return LBI_FIT_F32 | LBI_FIT_F64 | LBI_FIT_SAME }
-  let m = LBI_FIT_I64
-  if isExactF64IntLitExpr(ix) || numLexFitsI32(lex) { m = m | LBI_FIT_F64 }
-  if isExactF32IntLitExpr(ix) { m = m | LBI_FIT_F32 }
-  if lbiLitDefault(ix) == TY_I32 {
-    m = m | LBI_FIT_I32
-    if numLexRadixBits(lex) < 32 { m = m | LBI_FIT_SAME }
-  }
-  m
-}
-
-// Is type `t` in the fit set `m`?
-function lbiFitHas(m: i32, t: i32): boolean {
-  if t == TY_I32 { return (m & LBI_FIT_I32) != 0 }
-  if t == TY_I64 { return (m & LBI_FIT_I64) != 0 }
-  if t == TY_F32 { return (m & LBI_FIT_F32) != 0 }
-  t == TY_F64 && (m & LBI_FIT_F64) != 0
 }
 
 // The subscript `idx` of an index into a value of type `recv`: a list or string takes an `i32`,
@@ -15445,120 +15155,6 @@ function lbiOperandRow(c: i32, self: i32, other: i32, at: i32) {
   lbiNoteDirect(self, t)
 }
 
-// Does `a` widen implicitly to `b`? The lattice VL admits: `i32` to `i64` and `f64`, `f32` to
-// `f64`.
-function lbiLe(a: i32, b: i32): boolean {
-  if a == b { return true }
-  if a == TY_I32 { return b == TY_I64 || b == TY_F64 }
-  a == TY_F32 && b == TY_F64
-}
-
-// The least type both widen to, or -1.
-function lbiJoin(a: i32, b: i32): i32 {
-  if a < 0 || b < 0 { return -1 }
-  if lbiLe(a, b) { return b }
-  if lbiLe(b, a) { return a }
-  if (a == TY_I32 && b == TY_F32) || (a == TY_F32 && b == TY_I32) {
-    return TY_F64
-  }
-  -1
-}
-
-// The greatest type that widens to both, or -1.
-function lbiMeet(a: i32, b: i32): i32 {
-  if a < 0 || b < 0 { return -1 }
-  if lbiLe(a, b) { return a }
-  if lbiLe(b, a) { return b }
-  if (a == TY_I64 && b == TY_F64) || (a == TY_F64 && b == TY_I64) {
-    return TY_I32
-  }
-  -1
-}
-
-// Does the initializer of `decl`, defaulting to `def`, keep its value at type `t`?
-function lbiFits(decl: i32, def: i32, t: i32): boolean {
-  const n = P.nodes[decl]
-  if n is LetDecl {
-    if def == TY_F64 { return t == TY_F32 || t == TY_F64 }
-    if t == TY_I64 { return true }
-    if t == TY_I32 { return def == TY_I32 }
-  }
-  false
-}
-
-// Does type `t` satisfy a row of kind `k` supplying `u`?
-function lbiRowTakes(k: i32, u: i32, t: i32): boolean {
-  if k == LBI_UP { return lbiLe(t, u) }
-  if k == LBI_FLOAT { return t != TY_I64 }
-  if k == LBI_INT { return t == TY_I32 || t == TY_I64 }
-  if k == LBI_NOT_F32 { return t != TY_F32 }
-  if k == LBI_TREE { return lbiLe(t, u) }
-  if k == LBI_LIT { return lbiFitHas(u, t) }
-  if k == LBI_LO { return lbiLe(u, t) }
-  lbiLe(t, u) || lbiLe(u, t)
-}
-
-function lbiTakesAll(
-  decl: i32,
-  def: i32,
-  ks: i32[],
-  us: i32[],
-  t: i32,
-): boolean {
-  if !lbiFits(decl, def, t) { return false }
-  let i = 0
-  while i < us.length {
-    if !lbiRowTakes(ks[i], us[i], t) { return false }
-    i = i + 1
-  }
-  true
-}
-
-// The type rows `ks`/`us` give `decl`, or -1 when no type satisfies them all: the join of every
-// typed use (`f64` when only float literals are), else the meet of the destinations, else the
-// narrowest type that satisfies them all and the join widens to, else the narrowest that does.
-// With `least`, the default never widens the answer: the narrowest type the rows need wins.
-function lbiChoose(
-  decl: i32,
-  def: i32,
-  ks: i32[],
-  us: i32[],
-  least: boolean,
-): i32 {
-  let j = -1
-  let typed = false
-  let m = -1
-  let i = 0
-  while i < us.length {
-    if ks[i] < LBI_FLOAT {
-      if typed { j = lbiJoin(j, us[i]) } else { j = us[i] }
-      typed = true
-    }
-    if ks[i] == LBI_UP {
-      if m < 0 { m = us[i] } else { m = lbiMeet(m, us[i]) }
-    }
-    i = i + 1
-  }
-  if !typed && !least { j = def }
-  // A store joins with the literal's own type: storing an `f32` into `let x = 0.5` keeps `f64`.
-  let stored = false
-  for k in ks {
-    if k == LBI_LO && !least { stored = true }
-  }
-  if stored && j >= 0 { j = lbiJoin(j, def) }
-  if j >= 0 && lbiTakesAll(decl, def, ks, us, j) { return j }
-  if m >= 0 && lbiTakesAll(decl, def, ks, us, m) { return m }
-  const order = [TY_I32, TY_F32, TY_I64, TY_F64]
-  let any = -1
-  for t in order {
-    if lbiTakesAll(decl, def, ks, us, t) {
-      if j >= 0 && lbiLe(j, t) { return t }
-      if any < 0 { any = t }
-    }
-  }
-  any
-}
-
 // Solve every candidate recorded this pass. An un-annotated one whose type differs from its
 // default goes to `lbiPinCand`/`lbiPinTy`, one no type satisfies to `lbiErrMsg`; an annotated one
 // the solve agrees with has its annotation reported redundant. An edge row supplies its source's
@@ -15778,29 +15374,6 @@ function lbiSolveOne(
   t
 }
 
-// Is row kind `k` a store of one candidate into another?
-function lbiEdgeKind(k: i32): boolean { k == LBI_EDGE || k == LBI_EDGE_FWD }
-
-// Is `t` an integer type?
-function lbiIntTy(t: i32): boolean { t == TY_I32 || t == TY_I64 }
-
-// The type the solve holds for candidate `c` so far, or -1.
-function lbiChosenOf(chosen: i32[], c: i32): i32 {
-  if c < 0 || c >= chosen.length { return -1 }
-  chosen[c]
-}
-
-// What a use of kind `k` supplying `u` needs, as a refusal names it.
-function lbiNeeds(k: i32, u: i32): string {
-  if k == LBI_FLOAT { return "a float type" }
-  if k == LBI_INT { return "an integer type" }
-  if k == LBI_NOT_F32 {
-    return "a type `==` compares with an integer literal, which `f32` is not"
-  }
-  if k == LBI_LIT { return "a type that holds the literal stored there" }
-  "`" + tyToStr(u) + "`"
-}
-
 // The refusal for literal binding `d` whose uses no type satisfies: the first use no type the
 // literal fits satisfies, else the first pair of uses no one type satisfies together.
 function lbiRefuse(d: i32, def: i32, ks: i32[], us: i32[], ats: i32[]) {
@@ -15930,13 +15503,6 @@ export function lbiDropUnobservable() {
   lbiPinCand = keepC
   lbiPinTy = keepT
   0
-}
-
-// Does a read carrying the widening mark `w` have the same value at `i32` as at type `t`?
-function lbiReadNeutral(w: i32, t: i32): boolean {
-  if w == LBI_WIDE_ANY { return true }
-  if w == LBI_WIDE_I64 { return t == TY_I64 }
-  w >= 0 && lbiLe(t, w)
 }
 
 // Does candidate `c`'s integer literal have the same value at `i32` as at any wider type? A
@@ -16734,45 +16300,6 @@ function bindMarkDeclOf(
   -1
 }
 
-// The name `ix` spells, through parentheses, or "".
-function numLitNameAt(ix: i32): string {
-  const p = parenPeelIx(ix)
-  if p < 0 || p >= P.nodes.length { return "" }
-  const n = P.nodes[p]
-  if n is Ident { return n.identName }
-  ""
-}
-
-// The written value of assignment `n`: its right side, or a compound assignment's operand.
-function numLitAssignedValue(n: BinExpr): i32 {
-  const inner = P.nodes[n.binRight]
-  if n.binCompound != "" && inner is BinExpr { return inner.binRight }
-  n.binRight
-}
-
-// Does call `c` pass a value to list method `prop` that is not a numeric literal? A reader or
-// remover by `collMethodKind`, or a callback-taking walk, stores nothing, so it never counts.
-function numLitCallStoresNonLit(c: Call, prop: string, from: i32): boolean {
-  const k = collMethodKind(prop)
-  if (
-    k == CM_READS
-    || k == CM_RETURNS
-    || k == CM_REMOVES
-    || k == CM_REMOVES_ONE
-  ) {
-    return false
-  }
-  if prop == "map" || prop == "filter" || prop == "slice" || prop == "length" {
-    return false
-  }
-  let i = from
-  while i < c.callArgs.length {
-    if !exprIsNumLit(c.callArgs[i]) { return true }
-    i = i + 1
-  }
-  false
-}
-
 // The subset of `names` the program can store a non-literal through: a whole-name assignment, an
 // element assignment, a storing method call on a name in `lists`, or an alias (`const b = name`,
 // `x = name`). The suggested annotation would refuse that store, so those notes are dropped. By
@@ -16839,18 +16366,6 @@ function msgNamesTy(msg: string, tok: string): boolean {
   false
 }
 
-// The binding a mismatch's value reads, directly or through one index, or -1.
-function numLitReadIdent(at: i32): i32 {
-  let v = parenPeelIx(at)
-  if v < 0 || v >= P.nodes.length { return -1 }
-  const vn = P.nodes[v]
-  if vn is Index { v = parenPeelIx(vn.idxArr) }
-  if v < 0 || v >= P.nodes.length { return -1 }
-  const id = P.nodes[v]
-  if id is Ident { return v }
-  -1
-}
-
 // The note for a mismatch `msg` at `at` whose value reads a numeric-literal binding, when the
 // message names both the literal's default type and another numeric type the literal also fits;
 // "" otherwise. The annotation it suggests is that other type.
@@ -16890,88 +16405,6 @@ function numLitDefaultNote(msg: string, at: i32, idIx: i32, decl: i32): string {
     }
   }
   ""
-}
-
-// The note naming declaration `decl` of binding `dn`, whose literal defaulted to `bt`, and the
-// annotation `ann` that fixes the mismatch raised at `at`.
-function numLitAnnotNote(
-  dn: LetDecl,
-  decl: i32,
-  at: i32,
-  bt: i32,
-  ann: string,
-): string {
-  const nm = demangleName(dn.letName)
-  " — `"
-    + nm
-    + "` on "
-    + rcwWhere(decl, at)
-    + " has no annotation, so its literal defaulted to `"
-    + tyToStr(bt)
-    + "`; annotate it: `"
-    + exportKwOf(decl)
-    + dn.letKw
-    + " "
-    + nm
-    + ": "
-    + ann
-    + " = …`"
-}
-
-// The source text of numeric literal `ix`, possibly negated once or parenthesised; `…` for any
-// other shape, which `exprIsNumLit` callers never pass.
-function numLitText(ix: i32): string {
-  const e = P.nodes[parenPeelIx(ix)]
-  let neg = ""
-  let lit = e
-  if e is Unary {
-    neg = "-"
-    lit = P.nodes[parenPeelIx(e.unArg)]
-  }
-  if lit is NumLit { return neg + lit.numText }
-  "…"
-}
-
-// Is every element of list literal `ix` a decimal literal in 0..255, so `u8[]` holds it?
-function numLitListIsBytes(ix: i32): boolean {
-  const l = P.nodes[parenPeelIx(ix)]
-  if l is ArrayLit {
-    for el in l.arrElems {
-      const e = P.nodes[parenPeelIx(el)]
-      if !(e is NumLit) { return false }
-      if e is NumLit {
-        const t = e.numText
-        if t.length == 0 || t.length > 3 { return false }
-        let v = 0
-        let k = 0
-        while k < t.length {
-          const c = t.charCodeAt(k)
-          if c < 48 || c > 57 { return false }
-          v = v * 10 + c - 48
-          k = k + 1
-        }
-        if v > 255 { return false }
-      }
-    }
-    return true
-  }
-  false
-}
-
-// Does a literal defaulted to primitive `base` also fit primitive `got`, so annotating the
-// declaration `got` fixes a refused store? `u8` only for a whole list of byte literals.
-function numLitFitsStore(
-  base: string,
-  got: string,
-  byteList: boolean,
-): boolean {
-  if base == "i32" {
-    return got == "i64"
-      || got == "f32"
-      || got == "f64"
-      || (got == "u8" && byteList)
-  }
-  base == "f64" && got == "f32"
 }
 
 // The note for the refused store into `nlAsgTgt` of a value typed `nlAsgGot`, when the target is
@@ -17136,58 +16569,6 @@ function numLitReadLeafPush(leaf: i32, ty: i32) {
   nlnLeaf.push(leaf)
   nlnLeafTy.push(ty)
   0
-}
-
-// The primitive type a scalar suggestion names: `f32`, `i64` or `f64`.
-function numLitPrimTy(c: string): i32 {
-  if c == "f32" { return TY_F32 }
-  if c == "i64" { return TY_I64 }
-  if c == "f64" { return TY_F64 }
-  -1
-}
-
-// Does every integer literal in initializer `ix` (a literal, or a list of them) keep its value as
-// primitive `ty`? An `f32` holds integers up to 2^24 exactly; every other suggestion holds an
-// `i32`. A literal this cannot read is refused.
-function numLitValuesFit(ix: i32, ty: string): boolean {
-  if ty != "f32" { return true }
-  const e = P.nodes[parenPeelIx(ix)]
-  if e is ArrayLit {
-    for el in e.arrElems {
-      if !numLitValuesFit(el, ty) { return false }
-    }
-    return true
-  }
-  if !exprIsNumLit(ix) { return true }
-  let t = numLitText(ix)
-  if t.length > 0 && t[0] == '-' { t = t.slice(1, t.length) }
-  let base = 10.0
-  let i = 0
-  if t.length > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X') {
-    base = 16.0
-    i = 2
-  }
-  let v = 0.0
-  while i < t.length {
-    const c = t.charCodeAt(i)
-    let d = -1
-    if c >= 48 && c <= 57 { d = c - 48 }
-    if base == 16.0 && c >= 97 && c <= 102 { d = c - 87 }
-    if base == 16.0 && c >= 65 && c <= 70 { d = c - 55 }
-    // A float literal's digits need no integer range: f64 to f32 is the suggestion's own rounding.
-    if base == 10.0 && (c == 46 || c == 101 || c == 69) { return true }
-    if c != 95 {
-      if d < 0 { return false }
-      v = v * base + (d as f64)
-    }
-    i = i + 1
-  }
-  v <= 16777216.0
-}
-
-// Is `op` an arithmetic operator, whose result has its operands' numeric type?
-function numLitArithOp(op: string): boolean {
-  op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
 }
 
 // Would value `v` have type `want` once every numeric-literal binding it reads is annotated
@@ -17513,30 +16894,6 @@ function numLitFnReturns(fd: i32): i32[] {
   out
 }
 
-// Insert node `ix` into `out`, kept in source order, unless it is already there.
-function numLitInsertBySpan(out: i32[], ix: i32) {
-  for o in out {
-    if o == ix { return 0 }
-  }
-  const at = nodeStartOf(ix)
-  out.push(ix)
-  let k = out.length - 1
-  while k > 0 && nodeStartOf(out[k - 1]) > at {
-    out[k] = out[k - 1]
-    out[k - 1] = ix
-    k = k - 1
-  }
-  0
-}
-
-// The source offset of node `ix`'s anchor token, or -1.
-function nodeStartOf(ix: i32): i32 {
-  if ix < 0 || ix >= nodeToks.length { return -1 }
-  const tk = nodeToks[ix]
-  if tk < 0 || tk >= P.toks.length { return -1 }
-  P.toks[tk].start
-}
-
 // The note for the function `numLitFnFits` found, raised at `at`: the literals its return
 // defaulted from, and its declaration spelled with the return annotation `ann`.
 function numLitFnNote(ann: string, at: i32): string {
@@ -17750,23 +17107,6 @@ function numLitFnCallAccepts(r: i32, s: i32, par: {[i32]: i32}): boolean {
   numLitFnArgTakes(up, p, s)
 }
 
-// The call whose callee is the read `r` (a name, or a member call by it), through parentheses;
-// -1 when `r` is not a callee.
-function numLitFnCallOf(r: i32, par: {[i32]: i32}): i32 {
-  let c = r
-  let p = par[c] ?? -1
-  while p >= 0 && P.nodes[p] is Paren {
-    c = p
-    p = par[p] ?? -1
-  }
-  if p < 0 { return -1 }
-  const call = P.nodes[p]
-  if call is Call {
-    if call.callFn == c { return p }
-  }
-  -1
-}
-
 // Is `c` an argument of call `p` that `print` takes, or whose non-generic parameter takes `s`?
 function numLitFnArgTakes(p: i32, c: i32, s: i32): boolean {
   const pn = P.nodes[p]
@@ -17811,12 +17151,6 @@ function numLitFnRetTakes(p: i32, s: i32, par: {[i32]: i32}): boolean {
     k = k + 1
   }
   false
-}
-
-// `export ` when the top-level declaration `decl` carries the keyword, else "".
-function exportKwOf(decl: i32): string {
-  if declHasExportKw(decl) { return "export " }
-  ""
 }
 
 // Would the store of `v` into a slot annotated `want` be refused? A list value is compared by
@@ -18049,25 +17383,6 @@ function numLitParamTakes(pt: i32, s: i32): boolean {
   if pt < 0 || pt >= T.tys.length || tyHasHole(pt) { return false }
   if T.tys[pt] is TyVar { return false }
   assignable(s, pt)
-}
-
-// Is primitive type `t` an integer one?
-function numLitIsInt(t: i32): boolean {
-  t == TY_I32 || t == TY_I64 || t == TY_U8
-}
-
-// Is `c` the last statement of block `p`, the body of a function?
-function numLitIsFnTail(c: i32, p: i32, par: {[i32]: i32}): boolean {
-  const b = P.nodes[p]
-  if b is Block {
-    const n = b.blkStmts.length
-    if n == 0 || b.blkStmts[n - 1] != c { return false }
-    const f = par[p] ?? -1
-    if f < 0 || f >= P.nodes.length { return false }
-    const fd = P.nodes[f]
-    if fd is FuncDecl { return fd.fnBody == p }
-  }
-  false
 }
 
 // Does the function a return at `p` leaves take `s`? A declared return type decides; an inferred
@@ -18974,90 +18289,6 @@ function exprIsBrandAdoptingLiteral(ix: i32) {
   false
 }
 
-// Is the expression at `ix`, peeling parens, a float number literal — one spelled with a `.` or
-// with a scientific exponent? A float literal is polymorphic across the float types: it types f64
-// by default but re-encodes exactly into an f32 slot, so it is accepted there and the demote a
-// general f64 value would need is never performed. Integer literals ride the widening lattice.
-function isFloatLitExpr(ix: i32) {
-  if ix < 0 { return false }
-  const e = P.nodes[ix]
-  if e is Paren { return isFloatLitExpr(e.parInner) }
-  // A unary minus over a float literal (`-1.5`) is still a float literal — negation is exact in
-  // IEEE-754, so it re-encodes at f32 and flows into any f32 position the positive literal would.
-  // Without this a leading `-` makes the value a plain f64 expression, rejected as a lossy demote.
-  if e is Unary {
-    if e.unOp == "-" { return isFloatLitExpr(e.unArg) }
-  }
-  // A literal whose magnitude overflows f32 does not re-encode at f32 — it would encode ±infinity
-  // — so it gets no f32 grant and takes the normal f64-into-f32 lossy-demote rejection at the flow
-  // site.
-  if e is NumLit {
-    if !numLexIsFloat(e.numText) { return false }
-    return !f32LitOverflows(e.numText)
-  }
-  false
-}
-
-// The lexeme of the INTEGER literal at `ix`, peeling parens and a unary sign, or "" when the
-// expression is not one. One walk for both float grants, so f32 and f64 cannot drift apart on
-// what counts as a literal. A char literal is excluded — a code point in a float slot is a
-// category confusion — and the sign is dropped because exactness is symmetric.
-function intLitLexemeOf(ix: i32): string {
-  if ix < 0 { return "" }
-  const e = P.nodes[ix]
-  if e is Paren { return intLitLexemeOf(e.parInner) }
-  if e is Unary {
-    if e.unOp == "-" { return intLitLexemeOf(e.unArg) }
-  }
-  if e is NumLit {
-    if numLexIsFloat(e.numText) { return "" }
-    return e.numText
-  }
-  ""
-}
-
-// Is the expression at `ix` an integer literal whose value f32 holds exactly? The integer half of
-// the contextual-f32-literal rule, exactness-gated where the float half is context-typed: turning
-// `16777217` into `16777216` is the lossy implicit conversion VL forbids.
-function isExactF32IntLitExpr(ix: i32) {
-  const f32Lex = intLitLexemeOf(ix)
-  if f32Lex == "" { return false }
-  intLexemeIsExactF32(f32Lex)
-}
-
-// The f64 twin, which needs no float half: a `.`-literal already TYPES f64, so only the integer
-// side has a gap. It is the literals past the i32 range — `2147483648` up to 2^53 — that type
-// `i64` and so meet the widening lattice's lossy `i64 -> f64` edge, where f64 holds every one of
-// them exactly (D1890).
-function isExactF64IntLitExpr(ix: i32) {
-  const f64Lex = intLitLexemeOf(ix)
-  if f64Lex == "" { return false }
-  intLexemeIsExactF64(f64Lex)
-}
-
-// Does the expression at `ix` adopt an f32 context as a literal — either half of the
-// contextual-f32-literal rule? The single predicate every f32 grant site asks, so the float and
-// integer halves can never drift apart position by position.
-function isF32AdoptingLitExpr(ix: i32) {
-  if isFloatLitExpr(ix) { return true }
-  isExactF32IntLitExpr(ix)
-}
-
-// Is this ordering comparison an f32 operand against an f32-adopting literal? The comparison twin
-// of `binOpType`'s literal-adopt arm: `fv > 1` / `1 > fv` compare at f32 exactly as `fv + 1`
-// computes at f32. Comparison needs its own site because it yields `TY_BOOL` and never consults
-// `widerNumeric`, so the arithmetic arm cannot cover it.
-function cmpF32LitAdopts(n: BinExpr, olt: i32, ort: i32) {
-  if primNameOf(olt) == "f32" && isF32AdoptingLitExpr(n.binRight) {
-    return true
-  }
-  if primNameOf(olt) == "f64" && isExactF64IntLitExpr(n.binRight) {
-    return true
-  }
-  if primNameOf(ort) == "f64" && isExactF64IntLitExpr(n.binLeft) { return true }
-  primNameOf(ort) == "f32" && isF32AdoptingLitExpr(n.binLeft)
-}
-
 // The refusal a join owes when it would pair a set with a map of the same rep, handed to the
 // node whose check made the join; "" when no join is pending.
 let joinClashMsg = ""
@@ -19533,20 +18764,6 @@ function paramNullJoin(a: i32, b: i32): i32 {
   res
 }
 
-// The members of `t` when it is a union of two or more numeric primitives and nothing else,
-// else an empty list: the operand an operator dispatches over, member by member.
-export function numUnionMembersOf(t: i32): i32[] {
-  const none: i32[] = []
-  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) { return none }
-  const vs: i32[] = []
-  flattenVariantsInto(t, vs)
-  if vs.length < 2 { return none }
-  for v in vs {
-    if !isNumericPrimTy(v) { return none }
-  }
-  vs
-}
-
 // The distinct base scalars of a union of integer literals and numbers, a literal among them,
 // whose members span two bases (`1 | 9000000000 | i32`), else an empty list: the box it lowers as
 // holds each member at its base, as `intLitUnionBasesOf`'s does.
@@ -19594,35 +18811,6 @@ export function numUnionConverts(src: i32, dst0: i32): boolean {
   true
 }
 
-// Whether `x as dst` over the numeric union `src` is a conversion no member can fail: `dst` is
-// a float, or `i64` over integer members.
-export function numUnionAsConverts(src: i32, dst: i32): boolean {
-  if !isNumericPrimTy(dst) { return false }
-  const ms = numUnionMembersOf(src)
-  if ms.length == 0 { return false }
-  const dn = primNameStr(primNameOf(dst))
-  for m in ms {
-    if numCastCanFail(primNameStr(primNameOf(m)), dn) { return false }
-  }
-  true
-}
-
-// Whether `lt op rt` at a pin, an operand a numeric union, has a scalar form at every member
-// pair. The pin has no operand nodes, so a literal's adoption is the instance check's to decide.
-function numUnionPinOk(op: string, lt: i32, rt: i32): boolean {
-  let ls = numUnionMembersOf(lt)
-  if ls.length == 0 { ls = [lt] }
-  let rs = numUnionMembersOf(rt)
-  if rs.length == 0 { rs = [rt] }
-  for a in ls {
-    for b in rs {
-      if !isNumeric(a) || !isNumeric(b) { return false }
-      if binIntOnlyOp(op) && binFloatOperandPair(a, b) { return false }
-    }
-  }
-  true
-}
-
 // Whether every value the `if`, `match` or block at `ix` yields is a literal (`valueIsLitOnly`).
 export function joinArmIsLit(ix: i32): boolean { valueIsLitOnly(ix) }
 
@@ -19644,22 +18832,6 @@ export function tyIsNumUnion(t: i32): boolean {
     return false
   }
   numUnionMembersOf(t).length > 0
-}
-
-// Whether binary operator `op` dispatches over a numeric union operand.
-function numUnionOp(op: string): boolean {
-  op == "+"
-    || op == "-"
-    || op == "*"
-    || op == "/"
-    || op == "%"
-    || op == "<"
-    || op == ">"
-    || op == "<="
-    || op == ">="
-    || op == "=="
-    || op == "!="
-    || binIntOnlyOp(op)
 }
 
 // Whether `lt op rt` is `==` or `!=` against `null`: a nullness test, not a numeric comparison.
@@ -22581,37 +21753,6 @@ function litWide64Of(ix: i32) {
   false
 }
 
-// The integer width a destination pins on a radix literal delivered to it: 64 for an `i64` slot,
-// 32 for an `i32` one, -1 when it has no opinion — `u8` reports through its own arm in
-// `assignableExpr`, and a float or literal-union slot leaves the literal its default width.
-// Nullable wrappers peel; a union pins 64 only when `i64` is its sole integer atom.
-function dstIntWidth(dstTy: i32, depth: i32) {
-  if dstTy < 0 || depth <= 0 { return -1 }
-  const dtix = nonNullTy(dstTy)
-  if dtix < 0 { return -1 }
-  const pn = primNameOf(dtix)
-  if pn == "i64" { return 64 }
-  if pn == "i32" { return 32 }
-  if pn != null { return -1 }
-  const d = T.tys[dtix]
-  if d is TyUnion {
-    const members: i32[] = []
-    flattenVariantsInto(dtix, members)
-    let sawI64 = false
-    let sawNarrow = false
-    let mi = 0
-    while mi < members.length {
-      const mw = dstIntWidth(members[mi], depth - 1)
-      if mw == 64 { sawI64 = true }
-      if mw == 32 { sawNarrow = true }
-      if primNameOf(members[mi]) == "u8" { sawNarrow = true }
-      mi = mi + 1
-    }
-    if sawI64 && !sawNarrow { return 64 }
-  }
-  -1
-}
-
 // The sentence a radix lexeme gets when its pattern is wider than the destination. One home so the
 // no-destination report (64 bits, the widest VL has) and the pinned one read alike.
 function radixLitTooWideMsg(lex: string, width: i32) {
@@ -22656,14 +21797,6 @@ function radixLitAdoptWidth(litIx: i32, width: i32) {
     }
   }
   0
-}
-
-// The innermost node `ix` peels to through parentheses, or `ix` itself.
-function parenPeelIx(ix: i32) {
-  if ix < 0 { return ix }
-  const e = P.nodes[ix]
-  if e is Paren { return parenPeelIx(e.parInner) }
-  ix
 }
 
 // Pin the radix literal `srcExpr` delivers into `dstTy` to the destination's width. A value
@@ -22959,137 +22092,12 @@ function f32AdoptingOperand(ix: i32, peerTy: i32): boolean {
   f32LitTailsAdopt(ix, peerTy)
 }
 
-// Whether one of the tail values `leaves` is a bare radix literal.
-function radixLeafAmong(leaves: i32[]): boolean {
-  let i = 0
-  while i < leaves.length {
-    const n = P.nodes[parenPeelIx(leaves[i])]
-    if n is NumLit {
-      if numLexRadixBits(n.numText) >= 0 { return true }
-    }
-    i = i + 1
-  }
-  false
-}
-
 // A radix literal takes the OTHER operand's width, so `x >= 0x80000000` over an `i64` compares the
 // 64-bit pattern rather than the i32 one its digits imply. Upward only: a 32-bit peer leaves a
 // wide literal alone, so `x + 0x1_0000_0000` still widens the expression to i64.
 function radixLitAdoptPeer64(exprIx: i32, peerTy: i32) {
   if dstIntWidth(peerTy, 3) != 64 { return 0 }
   radixLitAdoptDst(exprIx, peerTy)
-}
-
-// How the node at `ix` stands as an operator tree over integer literals alone: -1 when it is not
-// one, 0 for a bare (or negated) literal, 1 for a tree of arithmetic operators, 2 for one with a
-// bitwise or shift operator, which has no float form. A tree deeper than `depth` answers -1 and
-// keeps the width its literals imply, which bounds the walk every wide delivery pays.
-function litTreeOps(ix: i32, depth: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length || depth <= 0 { return -1 }
-  const e = P.nodes[ix]
-  if e is Paren { return litTreeOps(e.parInner, depth - 1) }
-  if e is NumLit {
-    if numLexIsFloat(e.numText) || numLexRadixBits(e.numText) > 64 { return -1 }
-    return 0
-  }
-  if e is Unary {
-    const u = litTreeOps(e.unArg, depth - 1)
-    if u < 0 { return -1 }
-    if e.unOp == "-" { return u }
-    if e.unOp == "~" { return 2 }
-    return -1
-  }
-  if e is BinExpr {
-    let k = -1
-    if binIntOnlyOp(e.binOp) {
-      k = 2
-    } else if (
-      e.binOp == "+"
-      || e.binOp == "-"
-      || e.binOp == "*"
-      || e.binOp == "/"
-      || e.binOp == "%"
-    ) {
-      k = 1
-    }
-    // Both operands' kinds before any digits are read: `x + 1` rejects at `x` for the price of
-    // two tag tests.
-    if k < 0 || !litTreeNodeKind(e.binLeft) || !litTreeNodeKind(e.binRight) {
-      return -1
-    }
-    const r = litTreeOps(e.binRight, depth - 1)
-    if r < 0 { return -1 }
-    const l = litTreeOps(e.binLeft, depth - 1)
-    if l < 0 { return -1 }
-    if l > k { k = l }
-    if r > k { k = r }
-    return k
-  }
-  litTreeNotOne()
-}
-
-// Whether the node at `ix` is of a kind a literal tree is made of (its digits unread).
-function litTreeNodeKind(ix: i32): boolean {
-  if ix < 0 { return false }
-  const e = P.nodes[ix]
-  e is NumLit || e is BinExpr || e is Unary || e is Paren
-}
-
-// Every other node, a name, call or float among them, is not a tree of integer literals.
-function litTreeNotOne(): i32 { -1 }
-
-// Whether every literal of the tree at `ix` holds its value exactly at the float `fty`.
-function litTreeLeavesExact(ix: i32, fty: i32): boolean {
-  const e = P.nodes[ix]
-  if e is Paren { return litTreeLeavesExact(e.parInner, fty) }
-  if e is Unary { return litTreeLeavesExact(e.unArg, fty) }
-  if e is BinExpr {
-    return litTreeLeavesExact(e.binLeft, fty)
-      && litTreeLeavesExact(e.binRight, fty)
-  }
-  if fty == TY_F32 { return isExactF32IntLitExpr(ix) }
-  numLexFitsI32(intLitLexemeOf(ix)) || isExactF64IntLitExpr(ix)
-}
-
-// The type the literal tree at `ix` computes at when delivered into `dstTy`: `i64` at a 64-bit
-// integer destination, the float at an `f64` or `f32` one when float adoption is on and every
-// operator has a float form and every literal is exact there, else -1 (the tree keeps the width
-// its literals imply).
-function litTreeWideTy(ix: i32, dstTy: i32): i32 {
-  if dstTy < 0 || ix < 0 { return -1 }
-  // A bare literal is not a tree, and is the common operand: reject it before reading its digits.
-  const top = P.nodes[parenPeelIx(ix)]
-  if !(top is BinExpr || top is Unary) { return -1 }
-  if !litTreeFloatAdopts() && dstTy != TY_I64 && !litTreeDstMayWiden(dstTy) {
-    return -1
-  }
-  // A negation chain over one literal (`k == 0` under a `-`) is a tree too: `-(-2147483648)`
-  // at an i64 destination is 2^31, as the single negation there is the literal's full value.
-  // A chain over a decimal that fits i32 never wraps, so it keeps i32 and widens after.
-  const k = litTreeOps(ix, 32)
-  if k < 0 { return -1 }
-  if k == 0 {
-    const lex = intLitLexemeOf(ix)
-    if numLexRadixBits(lex) < 0 && numLexFitsI32(lex) { return -1 }
-  }
-  if dstIntWidth(dstTy, 3) == 64 { return TY_I64 }
-  if !litTreeFloatAdopts() || k != 1 { return -1 }
-  const fty = nonNullTy(dstTy)
-  const pn = primNameOf(fty)
-  if pn != "f64" && pn != "f32" { return -1 }
-  if !litTreeLeavesExact(ix, fty) { return -1 }
-  fty
-}
-
-// Whether a literal tree adopts a float destination (`7 / 2` read as 3.5 at an `f64`). Off: an
-// integer constant's division truncates (DECISIONS.md, "Exact constant arithmetic"; D2711).
-function litTreeFloatAdopts(): boolean { false }
-
-// Whether a destination other than a bare `i64` could still be 64 bits wide (nullable or union).
-function litTreeDstMayWiden(dstTy: i32): boolean {
-  if dstTy < 0 { return false }
-  const d = T.tys[dstTy]
-  d is TyNullable || d is TyUnion
 }
 
 // Types every node of the literal tree at `ix` as `ty`, its literals through `litTreeTy` so a
@@ -34563,40 +33571,6 @@ function zeroBytesBindScan() {
   0
 }
 
-// Whether `ix` is a zero integer literal (`0`, `00`, `0x0`, `-0`), bare or converted with `as`.
-function fillIsLitZero(ix: i32): boolean {
-  const x = parenPeelIx(ix)
-  if x < 0 || x >= P.nodes.length { return false }
-  const n = P.nodes[x]
-  if n is AsExpr { return fillIsLitZero(n.asObj) }
-  if n is Unary {
-    if n.unOp == "-" || n.unOp == "+" { return fillIsLitZero(n.unArg) }
-    return false
-  }
-  numLitIsZero(x)
-}
-
-// Whether node `x` is an integer number literal whose value is zero, in any base.
-function numLitIsZero(x: i32): boolean {
-  const n = P.nodes[x]
-  if !(n is NumLit) { return false }
-  const t = n.numText
-  let i = 0
-  if t.length > 0 && t[0] == '-' { i = 1 }
-  if t.length > i + 2 && t[i] == '0' {
-    const b = t[i + 1]
-    if b == 'x' || b == 'X' || b == 'b' || b == 'B' || b == 'o' || b == 'O' {
-      i = i + 2
-    }
-  }
-  if i >= t.length { return false }
-  while i < t.length {
-    if t[i] != '0' && t[i] != '_' { return false }
-    i = i + 1
-  }
-  true
-}
-
 // Whether an accepted assignment of right side `rhs`, a `rt` value, into a place of type
 // `placeTy` yields the place's type: the two are one type in another spelling (a union's member
 // order), or `rhs` is a literal built at the place's type because a `rt` value could reach the
@@ -36003,24 +34977,6 @@ function ufcsSitePinnable(ix: i32, owner: i32): boolean {
     }
   }
   false
-}
-
-// The bitwise ops and the shifts, in one list read by both `checkBinary`'s reject and
-// `binOpDefinedFor`'s pin mirror — the two homes must agree about the operator set, so this
-// predicate is their single source. `%` is excluded: float remainder has a lowering
-// (`fmod`), and every other operator here is a pure bit-pattern operation.
-function binIntOnlyOp(op: string) {
-  op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" || op == ">>>"
-}
-
-// Is either operand a float primitive? The other half of the integer-only rule, kept in
-// one home for the same reason. Asked of the softened types at both call sites, so a float
-// literal union answers as its base scalar.
-function binFloatOperandPair(lt: i32, rt: i32) {
-  primNameOf(lt) == "f64"
-    || primNameOf(lt) == "f32"
-    || primNameOf(rt) == "f64"
-    || primNameOf(rt) == "f32"
 }
 
 // Whether an object left operand has an operator dispatch for `op` (a free `self`-function
@@ -42428,30 +41384,6 @@ function intIntrIsCompare(name: string) {
   if name == "leU" { return true }
   if name == "gtU" { return true }
   name == "geU"
-}
-
-// Does the argument at `argIx`, of type `ty`, force the whole operation to f64? A genuine f64
-// does; a bare float literal does not, since it re-encodes exactly at f32 and adapts down to
-// an f32 operand — the same rule the binary operators run on (`f32var + 1.0` stays f32,
-// `f32var + f64var` widens), so an intrinsic and an operator on the same operands agree.
-function argForcesF64(argIx: i32, ty: i32) {
-  if primNameOf(ty) != "f64" { return false }
-  !isFloatLitExpr(argIx)
-}
-
-// The WIDTH a float intrinsic call computes at: f32 when an operand is genuinely f32 and
-// none is genuinely f64, else f64. All-integer operands therefore land on f64, where they
-// widen losslessly — `sqrt(2)` is the f64 square root, as `2 / 1.0` is f64 division.
-function floatIntrWidth(argIxs: i32[], argTys: i32[]) {
-  let sawF32 = false
-  let i = 0
-  while i < argTys.length {
-    if argForcesF64(argIxs[i], argTys[i]) { return TY_F64 }
-    if primNameOf(argTys[i]) == "f32" { sawF32 = true }
-    i = i + 1
-  }
-  if sawF32 { return TY_F32 }
-  TY_F64
 }
 
 // The WIDTH an integer intrinsic call computes at: i64 when an operand is i64 (the i32
@@ -51338,50 +50270,6 @@ function checkShiftCounts() {
   0
 }
 
-// Whether the count lexeme `lex` is below the width `w`, a radix count read at its full value.
-function cexCountBelow(lex: string, w: i32): boolean {
-  if numLexRadixBits(lex) < 0 { return parseI32(lex) < w }
-  numLexRadixBits(lex) <= 6 && parseI32(lex) < w
-}
-
-// Whether the integer literal at `ix` is under an odd number of unary minuses.
-function intLitIsNegated(ix: i32): boolean {
-  const e = P.nodes[ix]
-  if e is Paren { return intLitIsNegated(e.parInner) }
-  if e is Unary {
-    if e.unOp == "-" { return !intLitIsNegated(e.unArg) }
-  }
-  intLitSignless()
-}
-
-// The literal itself, the one other node `intLitLexemeOf` admits, carries no sign.
-function intLitSignless(): boolean { false }
-
-function shiftCountMsg(op: string, lex: string, neg: boolean, w: i32): string {
-  let c = lex
-  if neg { c = "-" + lex }
-  const ws = i32ToStr(w)
-  const msg = "shift count "
-    + c
-    + " is out of range for an i"
-    + ws
-    + " operand (0 to "
-    + i32ToStr(w - 1)
-    + ") — `"
-    + op
-    + "` would take it modulo "
-    + ws
-  if w != 32 || neg || !numLexFitsI32(lex) || !cexCountBelow(lex, 64) {
-    return msg
-  }
-  msg
-    + "; widen the operand (`(x as i64) "
-    + op
-    + " "
-    + c
-    + "`) or give it an i64 destination"
-}
-
 // The module bindings whose checked type is one of the scalars a wasm global can export
 // (`i32`, `i64`, `f32`, `f64`, `boolean`), by merged name — what the emitter asks before it
 // publishes an entry module's `export let`/`export const` as a wasm global.
@@ -53723,17 +52611,6 @@ function tyHasTyVarAt(ty: i32, depth: i32) {
     return false
   }
   false
-}
-
-// The base scalar (`"i32"`/`"i64"`/`"f64"`) an array's numeric literal-union element reps as,
-// or "" when `ty` is not an array over one — the numeric twin of `tyIsLitUnionArray`, a value
-// rather than a predicate because the three bases pick three different list wrappers (unlike
-// the string family, which has one rep and so a plain yes/no answers it).
-export function numLitUnionArrayBaseName(ty: i32): string {
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyArray { return numLitUnionBaseName(t.aElem) }
-  ""
 }
 
 // The function a call runs through when its callee's pin is `ty`: `ty` itself, or the function
@@ -56470,31 +55347,6 @@ function intArmRejectMsg(st: i32) {
     + " is an integer literal, a `const` with a literal value, or the `_` wildcard"
 }
 
-// The `NumLit` an integer-literal pattern delivers — the pattern node itself, or the operand
-// of the `Unary "-"` the negative spelling mints — or -1 for any other pattern. `patIx` back
-// means positive, anything else negative, which is the `neg` flag every reader below takes.
-function matchPatIntNumOf(patIx: i32) {
-  if patIx < 0 { return -1 }
-  const pn = P.nodes[patIx]
-  if pn is NumLit { return patIx }
-  matchNegPatNum(patIx)
-}
-
-// The `NumLit` a negative integer pattern negates, or -1 when the `Unary` is not that shape.
-// `parseMatchPattern` mints a `Unary` in pattern position only as `-` over a number, so the
-// miss is a defensive floor rather than a reachable spelling — and the operand read is
-// bound-tested (an unbounded `P.nodes[...]` would trap the compiler instead of diagnosing).
-function matchNegPatNum(patIx: i32) {
-  const pn = P.nodes[patIx]
-  if pn is Unary {
-    if pn.unOp == "-" && pn.unArg >= 0 && pn.unArg < P.nodes.length {
-      const inner = P.nodes[pn.unArg]
-      if inner is NumLit { return pn.unArg }
-    }
-  }
-  -1
-}
-
 // Where arm pattern `patIx` reads its value: a `const` arm's literal, else the pattern itself.
 function matchPatValNode(patIx: i32) {
   const lit = matchConstPatLitAt(patIx)
@@ -58499,16 +57351,6 @@ function castPinNullLand(k: i32, castIx: i32, target: i32) {
 // type (D1587) — `x as u8` produces an `i32`, and what `u8` names is the range 0..255, so
 // every numeric source (i32 included) can fail it. The nine pairs are closed, matching the emitter (D965).
 
-export function numCastCanFail(src: string, tgt: string): boolean {
-  if tgt == "f64" || tgt == "f32" { return false }
-  if tgt == "u8" {
-    return src == "i32" || src == "i64" || src == "f32" || src == "f64"
-  }
-  if tgt == "i32" { return src == "f64" || src == "f32" || src == "i64" }
-  if tgt == "i64" { return src == "f64" || src == "f32" }
-  false
-}
-
 // The exactness domain a numeric cast narrows into — the target's primitive name, except
 // where the author wrote `u8` (D1587), whose value type is `i32` but this returns "u8"
 // instead. Two names for one cast: the rep target decides the conversion opcode and the box
@@ -58882,65 +57724,6 @@ function castBoundBitsOf(v: Cex): i32 {
     b = b + 1
   }
   -1
-}
-
-// A shift's count when it is an integer literal in `1 .. 63`, else -1. An `i32` operand shifts
-// by the count modulo 32, which leaves it below `2^(64-k)` too.
-function castShiftCount(ix: i32): i32 {
-  const lex = intLitLexemeOf(ix)
-  if lex == "" || intLitIsNegated(ix) || !numLexFitsI32(lex) { return -1 }
-  if !cexCountBelow(lex, 64) { return -1 }
-  parseI32(lex)
-}
-
-// Why the domain `dom` cannot hold the constant `v`, or "" when it holds it exactly. A float
-// domain rounds, so only a value past its finite range misfits there.
-function castConstMisfit(v: Cex, dom: string, p: i32): string {
-  const shown = castConstShown(v, p)
-  if dom == "f32" || dom == "f64" {
-    if dom == "f64" && !cexPastF64(v) { return "" }
-    let lex = cexDecText(v) + ".0"
-    if v.cxFloat { lex = cexLexeme(v) }
-    if dom == "f32" && !f32LitOverflows(lex) { return "" }
-    return "constant "
-      + shown
-      + " does not fit `"
-      + dom
-      + "`: it is past the largest finite "
-      + dom
-  }
-  if v.cxFloat && !cexIsWhole(v) {
-    return "constant "
-      + shown
-      + " is not a whole number, so `"
-      + dom
-      + "` cannot hold it"
-  }
-  let fits = false
-  let range = ""
-  if dom == "u8" {
-    fits = (!v.cxNeg || cexDecText(v) == "0") && cexFitsSigned(v, 9)
-    range = "0..=255"
-  } else if dom == "i32" {
-    fits = cexFitsSigned(v, 32)
-    range = "-2147483648..=2147483647"
-  } else {
-    fits = cexFitsSigned(v, 64)
-    range = "-9223372036854775808..=9223372036854775807"
-  }
-  if fits { return "" }
-  "constant " + shown + " does not fit `" + dom + "` (" + range + ")"
-}
-
-// The constant `v` at `p` as the refusal quotes it: a literal by its own spelling, a tree by value.
-function castConstShown(v: Cex, p: i32): string {
-  const e = P.nodes[p]
-  if e is NumLit { return e.numText }
-  if e is Unary {
-    const a = P.nodes[parenPeelIx(e.unArg)]
-    if e.unOp == "-" && a is NumLit { return "-" + a.numText }
-  }
-  cexShown(v)
 }
 
 // The refusal's tail, by cast mode: at an integer domain the trapping and nullable forms over a
