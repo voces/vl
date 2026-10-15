@@ -482,13 +482,15 @@ Deno.test({
   },
 });
 
-// The compiler's decision (`optInlineDecide`, rung R6b) of which fields to inline and why the
-// others stay references is the one the host rewrites by under `vl` and `both`; `both` fails a
-// build where the host decides otherwise. `$VL_INLINE_FAULT=2`, which refuses every field, is
-// the control that the decision is consulted.
+// The compiler's record-field step (`optInlineRewrite`, rungs R6b and R6c) decides which fields
+// to inline and rewrites the module; under `vl` its module is the one written, and `both` fails
+// a build where the host's decision, module bytes or body moves differ. `$VL_INLINE_FAULT=2`,
+// which refuses every field, is the control that the decision is consulted, and 3, which
+// ends each rewritten body's locals with an empty entry (a valid module with other bytes),
+// that the rewrite is.
 Deno.test({
   name:
-    "native-release: the compiler's inline-record decision agrees with the host's",
+    "native-release: the compiler's inline-record rewrite agrees with the host's",
   ignore: !ENABLED,
   fn: async () => {
     const tmp = await Deno.makeTempDir();
@@ -510,12 +512,13 @@ Deno.test({
         "kept-nullable",
         "kept-export",
         "proof-rows",
+        "width-subtyped",
         "stable-export-union-record",
         "stable-export-union-record --stable-layout",
       ];
       for (const spec of specs) {
-        for (const rebox of ["0", "1"]) {
-          const env = { VL_INLINE_REBOX: rebox };
+        for (const [rebox, spill] of [["0", "0"], ["1", "0"], ["1", "1"]]) {
+          const env = { VL_INLINE_REBOX: rebox, VL_INLINE_SPILL: spill };
           const host = await build(spec, { ...env, VL_OPT_INLINE: "rust" });
           const both = await build(spec, { ...env, VL_OPT_INLINE: "both" });
           if (
@@ -523,7 +526,7 @@ Deno.test({
             explain(host.err) !== explain(both.err)
           ) {
             throw new Error(
-              `${spec} (VL_INLINE_REBOX=${rebox}): want both sides to agree\n  host ` +
+              `${spec} (VL_INLINE_REBOX=${rebox} VL_INLINE_SPILL=${spill}): want both sides to agree\n  host ` +
                 `${host.code}: ${host.err.trim()}\n  both ${both.code}: ${both.err.trim()}`,
             );
           }
@@ -551,6 +554,35 @@ Deno.test({
       ) {
         throw new Error(
           `VL_INLINE_FAULT=2 under both: want the build refused, got ${caught.code}: ${caught.err.trim()}`,
+        );
+      }
+      const regrouped = await build("stored-fields", {
+        VL_OPT_INLINE: "vl",
+        VL_INLINE_FAULT: "3",
+      });
+      const ran = regrouped.code === 0
+        ? await vl(["run", `${tmp}/out.wasm`])
+        : undefined;
+      const logs = logsOf(Deno.readTextFileSync(`${DIR}/stored-fields.vl`));
+      if (
+        !ran || ran.code !== 0 || !/: inlined;/.test(regrouped.err) ||
+        JSON.stringify(linesOf(ran.out)) !== JSON.stringify(logs)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT=3 under vl: want the fields inlined and the @log lines, got ` +
+            `${regrouped.code}: ${regrouped.err.trim()}\n  ran: ${ran?.out}`,
+        );
+      }
+      const moved = await build("stored-fields", {
+        VL_OPT_INLINE: "both",
+        VL_INLINE_FAULT: "3",
+      });
+      if (
+        moved.code === 0 ||
+        !/rewrite differs between the host and the compiler/.test(moved.err)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT=3 under both: want the build refused, got ${moved.code}: ${moved.err.trim()}`,
         );
       }
     } finally {

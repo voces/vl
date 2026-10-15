@@ -44,7 +44,7 @@ after, on one seed.
 | R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) (`compiler/opt_multivalue.vl`); the default, its Rust deleted | retired (`$VL_OPT_MULTIVALUE`) | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
 | R6a | the inline-record step's census: whether any field or element holds a leaf record (`compiler/opt_inline.vl`); beside the Rust | `$VL_OPT_INLINE` | the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
 | R6b | the inline-record step's walk, validator emulation, dataflow and decision (`compiler/opt_inline_scan.vl`); beside the Rust | `$VL_OPT_INLINE` | the decision text (`inline::decision_rust`), the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
-| R6c | the inline-record step's rewrite and body moves | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
+| R6c | the inline-record step's rewrite: new types, bodies and body moves (`compiler/opt_inline_scan.vl`, `optInlineRewrite`); beside the Rust | `$VL_OPT_INLINE` | the step's module bytes and body moves under `both`, the `$VL_INLINE_EXPLAIN` lines, the built module, and the `--source-map` file |
 | R7 | the list-flattening step | `$VL_OPT_FLAT` | `$VL_OPT_FLAT_DUMP` |
 
 The order is cheapest-first by what each needs: R1 and R2 only read; R3 rewrites one custom
@@ -410,3 +410,43 @@ on each side.
 
 The seed grew by 86,677 bytes (1.56%). The Rust stays the default until R6c, which ports the
 rewrite and deletes the host's step.
+
+## R6c, the inline-record rewrite, beside the Rust
+
+`compiler/opt_inline_scan.vl` exports `optInlineRewrite(stable, rebox, spill, valid, fault)`.
+It decides as R6b did, then rewrites the module itself: the long-form record types, every body
+a field's stores and reads touch, and each rewritten body's locals. It returns 1 with the module
+in `optOut`, or 0 when it changes nothing. `optInlineMoves`, `optInlineExplain` and
+`optInlineSummary` then hand the host the body moves the source map needs, the
+`$VL_INLINE_EXPLAIN` lines and the summary. `optInlineDecide` and its decision text are retired,
+and with them the host's `inline::decision_rust`: the two sides now agree on bytes, not on text.
+
+Under `$VL_OPT_INLINE=vl` the host takes the compiler's module and moves. Under `both` it also
+runs its own fields step and fails the build when the decision differs, or when the module
+bytes or the body moves do. `VL_INLINE_FAULT=2` still refuses every field; `VL_INLINE_FAULT=3`
+ends each rewritten body's locals with an empty `0 x i32` entry, a module that validates with
+other bytes.
+
+`VL_OPT_INLINE=rust` against `both`, on one seed, comparing module bytes, the `--source-map`
+file, the explain lines and the exit code:
+
+| population | programs | reach the decision | with candidate pairs | rewritten | differ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/`, `-O` | 15,399 | 1,633 | 360 | 190 | 0 |
+| the 1,633, `-O3` | 1,633 | 1,633 | 360 | 190 | 0 |
+| the 1,633, `--stable-layout` | 1,633 | 1,633 | 360 | 190 | 0 |
+| the 1,633, `--names` | 1,633 | 1,633 | 360 | 190 | 0 |
+| the 1,633, `VL_INLINE_REBOX=1` | 1,633 | 1,633 | 360 | 217 | 0 |
+| the 1,633, `VL_INLINE_REBOX=1 VL_INLINE_SPILL=1` | 1,633 | 1,633 | 360 | 217 | 0 |
+| the 1,633, `--source-map` (`opt-parity.sh`) | 1,633 | 1,633 | 360 | 190 | 0 |
+
+R6b's 14 `rv3310_*__isall` cells now validate and no longer reach the step, so every program
+that reaches it is decided by the compiler. The control, `VL_INLINE_FAULT=3`, differs on 155 of
+the 190 rewritten programs; the other 35 are rewrites of types only, where every inlined field
+has no store and no read, so no body changes. `VL_INLINE_FAULT=2` fails the build with
+`decision differs`. All 25 `tests/fixtures/opt-inline` fixtures build under `both` at `-O` and
+`-O3`, with and without `--stable-layout`, `VL_INLINE_REBOX` and `VL_INLINE_SPILL`.
+`tests/selfhost_native_release_inline_test.ts` runs both faults on each side.
+
+The seed grew by 32,905 bytes (0.58%), net of the retired decision text. The Rust stays the
+default for one more PR: R6d makes `vl` the default and deletes the host's fields step.

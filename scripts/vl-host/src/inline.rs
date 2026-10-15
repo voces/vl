@@ -1977,16 +1977,39 @@ pub fn census_rust(bytes: &[u8], stable_layout: bool) -> Option<String> {
     skipped(&scan(bytes, stable_layout))
 }
 
+/// The compiler's record-field step (`optInlineRewrite`, rung R6c) on a module: what it wrote
+/// and where each body came from, or `None` when it changed nothing, beside its
+/// `$VL_INLINE_EXPLAIN` lines.
+pub struct VlFields {
+    pub out: Option<(Vec<u8>, Vec<BodyMove>)>,
+    pub log: String,
+}
+
+/// Which side inlines record fields: the host, the compiler, or both, compared.
+pub enum FieldsBy {
+    Rust,
+    Vl(VlFields),
+    Both(VlFields),
+}
+
+fn same_moves(a: &[BodyMove], b: &[BodyMove]) -> bool {
+    a.len() == b.len()
+        && a
+            .iter()
+            .zip(b)
+            .all(|(x, y)| x.from == y.from && x.to == y.to && x.pairs == y.pairs)
+}
+
 /// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
 /// changes nothing. `stable_layout` (`vl build --stable-layout`) keeps the layout of every type
-/// a crossing value reaches, not only of the types a boundary signature names. `injected` is
-/// the compiler's decision of which fields to inline (`optInlineDecide`), when it made one.
+/// a crossing value reaches, not only of the types a boundary signature names. `by` says who
+/// inlines record fields; under `FieldsBy::Both` a disagreement is the error.
 pub fn inline_step(
     bytes: &[u8],
     stable_layout: bool,
     scalarized: &dyn Fn(&[u8]) -> Option<Scalarized>,
-    injected: Option<&str>,
-) -> Option<Stepped> {
+    by: FieldsBy,
+) -> Result<Option<Stepped>, String> {
     let flag = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
     let explaining = flag("VL_INLINE_EXPLAIN");
     // `$VL_INLINE_REBOX=1`: inline a field even where a read re-boxes, so a grid can grade the
@@ -1997,16 +2020,40 @@ pub fn inline_step(
     let spill_all = flag("VL_INLINE_SPILL");
     // `$VL_OPT_NO_FLAT=1`: inline record fields but flatten no list (S2's control).
     let no_flat = flag("VL_OPT_NO_FLAT");
+    let fields_only = |fields: Option<(Vec<u8>, Vec<BodyMove>)>| {
+        fields.map(|(bytes, moved)| Stepped {
+            bytes,
+            moved,
+            fields: true,
+            flat: false,
+        })
+    };
     let mut s = match scan(bytes, stable_layout) {
         Ok(Some(s)) => s,
-        scanned => {
-            if let (true, Some(line)) = (explaining, skipped(&scanned)) {
-                eprintln!("{line}");
+        scanned => match by {
+            FieldsBy::Vl(v) => {
+                if explaining {
+                    eprint!("{}", v.log);
+                }
+                return Ok(fields_only(v.out));
             }
-            return None;
-        }
+            FieldsBy::Both(v) if v.out.is_some() || !v.log.is_empty() => {
+                return Err(format!(
+                    "$VL_OPT_INLINE=both: the inline-record step differs between the host and \
+                     the compiler: the host leaves the module alone ({}), the compiler says\n{}",
+                    skipped(&scanned).unwrap_or_default(),
+                    v.log.trim_end()
+                ));
+            }
+            _ => {
+                if let (true, Some(line)) = (explaining, skipped(&scanned)) {
+                    eprintln!("{line}");
+                }
+                return Ok(None);
+            }
+        },
     };
-    let fnames = if explaining {
+    let fnames = if explaining || matches!(by, FieldsBy::Both(_)) {
         function_names(bytes)
     } else {
         HashMap::new()
@@ -2017,18 +2064,50 @@ pub fn inline_step(
             .cloned()
             .unwrap_or_else(|| format!("func {f}"))
     };
-    let fields = if s.potential.is_empty() {
-        None
-    } else {
-        fields_step(&mut s, bytes, explaining, rebox_all, spill_all, &name, injected)
+    let fields = match by {
+        FieldsBy::Vl(v) => {
+            if explaining {
+                eprint!("{}", v.log);
+            }
+            v.out
+        }
+        by => {
+            let mut log = String::new();
+            let host = if s.potential.is_empty() {
+                None
+            } else {
+                fields_step(&mut s, bytes, rebox_all, spill_all, &name, &mut log)
+            };
+            if let FieldsBy::Both(v) = by {
+                if v.log != log {
+                    return Err(format!(
+                        "$VL_OPT_INLINE=both: the inline-record step's decision differs between \
+                         the host and the compiler: the compiler says\n{}\nthe host says\n{}",
+                        v.log.trim_end(),
+                        log.trim_end()
+                    ));
+                }
+                let agree = match (&host, &v.out) {
+                    (None, None) => true,
+                    (Some((hb, hm)), Some((vb, vm))) => hb == vb && same_moves(hm, vm),
+                    _ => false,
+                };
+                if !agree {
+                    return Err(
+                        "$VL_OPT_INLINE=both: the inline-record step's rewrite differs between \
+                         the host and the compiler (its module bytes or body moves)"
+                            .into(),
+                    );
+                }
+            }
+            if explaining {
+                eprint!("{log}");
+            }
+            host
+        }
     };
     if s.arrays.is_empty() || no_flat {
-        return fields.map(|(bytes, moved)| Stepped {
-            bytes,
-            moved,
-            fields: true,
-            flat: false,
-        });
+        return Ok(fields_only(fields));
     }
     // Slice S2 reads the field step's output, so a re-boxed field read it stores is seen.
     let flat = match &fields {
@@ -2042,7 +2121,7 @@ pub fn inline_step(
             _ => None,
         },
     };
-    match (fields, flat) {
+    Ok(match (fields, flat) {
         (None, None) => None,
         (Some((bytes, moved)), None) => Some(Stepped {
             bytes,
@@ -2070,7 +2149,7 @@ pub fn inline_step(
             fields: true,
             flat: true,
         }),
-    }
+    })
 }
 
 /// The step's output: the module, where each body came from, and which slices changed it.
@@ -2258,145 +2337,38 @@ fn decide(
     }
 }
 
-/// A decision as text, one line each: per record type `r <v>[ <why>]`, then per candidate field
-/// in order `p <p> <j> <v> i <local> <arg>` when inlined and `p <p> <j> <v> n <why>` when not.
-/// The compiler's `optInlineDecide` writes the same text.
-fn decision_text(s: &Scan, d: &Decision) -> String {
-    let mut out = String::new();
-    for (v, why) in &d.records {
-        match why {
-            None => out.push_str(&format!("r {v}\n")),
-            Some(w) => out.push_str(&format!("r {v} {w}\n")),
-        }
-    }
-    let mut pairs: Vec<(u32, u32)> = s.potential.keys().copied().collect();
-    pairs.sort_unstable();
-    for (p, j) in pairs {
-        let v = s.potential[&(p, j)];
-        match (d.inline.get(&(p, j)), d.refused.get(&(p, j))) {
-            (Some(_), _) => {
-                let (l, a) = d.reboxed.get(&(p, j)).copied().unwrap_or_default();
-                out.push_str(&format!("p {p} {j} {v} i {l} {a}\n"));
-            }
-            (None, w) => out.push_str(&format!("p {p} {j} {v} n {}\n", w.map_or("", |w| w))),
-        }
-    }
-    out
-}
-
-/// The decision `decision_text` spelled, read back against `s`; `None` when it does not name
-/// exactly `s`'s records and candidate fields, in order.
-fn decision_parse(s: &Scan, text: &str) -> Option<Decision> {
-    let mut d = Decision {
-        records: Vec::new(),
-        inline: HashMap::new(),
-        refused: HashMap::new(),
-        reboxed: HashMap::new(),
-    };
-    let mut pairs: Vec<(u32, u32)> = s.potential.keys().copied().collect();
-    pairs.sort_unstable();
-    let mut want = pairs.iter();
-    for line in text.lines() {
-        let mut it = line.splitn(2, ' ');
-        let tag = it.next()?;
-        let rest = it.next()?;
-        if tag == "r" {
-            let (v, why) = match rest.split_once(' ') {
-                Some((v, w)) => (v.parse().ok()?, Some(w.to_string())),
-                None => (rest.parse().ok()?, None),
-            };
-            d.records.push((v, why));
-            continue;
-        }
-        if tag != "p" {
-            return None;
-        }
-        let mut f = rest.splitn(5, ' ');
-        let p: u32 = f.next()?.parse().ok()?;
-        let j: u32 = f.next()?.parse().ok()?;
-        let v: u32 = f.next()?.parse().ok()?;
-        if want.next() != Some(&(p, j)) || s.potential[&(p, j)] != v {
-            return None;
-        }
-        let kind = f.next()?;
-        let tail = f.next()?;
-        match kind {
-            "i" => {
-                let (l, a) = tail.split_once(' ')?;
-                d.inline.insert((p, j), v);
-                d.reboxed.insert((p, j), (l.parse().ok()?, a.parse().ok()?));
-            }
-            "n" => {
-                d.refused.insert((p, j), tail.to_string());
-            }
-            _ => return None,
-        }
-    }
-    want.next().is_none().then_some(d)
-}
-
-/// The host's decision where the compiler's `optInlineDecide` (rung R6b) decided: its text, or
-/// `None` when the step leaves the module to the census or refuses it. `rebox` is
-/// `$VL_INLINE_REBOX`.
-pub fn decision_rust(bytes: &[u8], stable_layout: bool, rebox: bool) -> Option<String> {
-    let Ok(Some(mut s)) = scan(bytes, stable_layout) else {
-        return None;
-    };
-    if s.potential.is_empty() {
-        return Some(String::new());
-    }
-    let names = function_names(bytes);
-    let name = |f: u32| names.get(&f).cloned().unwrap_or_else(|| format!("func {f}"));
-    let d = decide(&mut s, bytes, rebox, &name);
-    Some(decision_text(&s, &d))
-}
-
-/// Slice S1: inline the record fields `s` finds that qualify, as decided by the host or, when
-/// `injected`, by the compiler's text of it.
+/// Slice S1: inline the record fields `s` finds that qualify, writing its `$VL_INLINE_EXPLAIN`
+/// lines into `log`.
 fn fields_step(
     s: &mut Scan,
     bytes: &[u8],
-    explaining: bool,
     rebox_all: bool,
     spill_all: bool,
     name: &dyn Fn(u32) -> String,
-    injected: Option<&str>,
+    log: &mut String,
 ) -> Option<(Vec<u8>, Vec<BodyMove>)> {
-    let parsed = injected.map(|t| decision_parse(s, t));
-    if let Some(None) = parsed {
-        eprintln!(
-            "$VL_OPT_INLINE: the compiler's inline-record decision does not read back; the host \
-             decides"
-        );
-    }
-    let d = match parsed.flatten() {
-        Some(d) => d,
-        None => decide(s, bytes, rebox_all, name),
-    };
+    use std::fmt::Write;
+    let d = decide(s, bytes, rebox_all, name);
     let s: &Scan = s;
-    if explaining {
-        for (v, why) in &d.records {
-            let spelled: Vec<&str> = s.rec[*v as usize]
-                .iter()
-                .flatten()
-                .map(|n| match n {
-                    Num::I32 => "i32",
-                    Num::I64 => "i64",
-                    Num::F32 => "f32",
-                    Num::F64 => "f64",
-                })
-                .collect();
-            match why {
-                None => eprintln!(
-                    "inline-explain: type {v} {{{}}}: candidate",
-                    spelled.join(", ")
-                ),
-                Some(w) => eprintln!(
-                    "inline-explain: type {v} {{{}}}: refused: {w}",
-                    spelled.join(", ")
-                ),
-            }
-        }
+    for (v, why) in &d.records {
+        let spelled: Vec<&str> = s.rec[*v as usize]
+            .iter()
+            .flatten()
+            .map(|n| match n {
+                Num::I32 => "i32",
+                Num::I64 => "i64",
+                Num::F32 => "f32",
+                Num::F64 => "f64",
+            })
+            .collect();
+        let _ = match why {
+            None => writeln!(log, "inline-explain: type {v} {{{}}}: candidate", spelled.join(", ")),
+            Some(w) => writeln!(
+                log,
+                "inline-explain: type {v} {{{}}}: refused: {w}",
+                spelled.join(", ")
+            ),
+        };
     }
     let Decision {
         inline, refused, reboxed, ..
@@ -2404,69 +2376,67 @@ fn fields_step(
     let mut pairs: Vec<(u32, u32)> = s.potential.keys().copied().collect();
     pairs.sort_unstable();
     if inline.is_empty() {
-        if explaining {
-            for &(p, j) in &pairs {
-                if let Some(w) = refused.get(&(p, j)) {
-                    eprintln!(
-                        "inline-explain: type {p} field {j} (type {}): not inlined: {w}",
-                        s.potential[&(p, j)]
-                    );
-                }
+        for &(p, j) in &pairs {
+            if let Some(w) = refused.get(&(p, j)) {
+                let _ = writeln!(
+                    log,
+                    "inline-explain: type {p} field {j} (type {}): not inlined: {w}",
+                    s.potential[&(p, j)]
+                );
             }
-            eprintln!("inline-explain: no field inlined");
         }
+        log.push_str("inline-explain: no field inlined\n");
         return None;
     }
-    let out = rewrite(s, bytes, &inline, spill_all);
-    let (out, moved, stats) = match out {
+    let (out, moved, stats) = match rewrite(s, bytes, &inline, spill_all) {
         Ok(x) => x,
         Err(why) => {
-            if explaining {
-                eprintln!("inline-explain: step abandoned: {why}");
-            }
+            let _ = writeln!(log, "inline-explain: step abandoned: {why}");
             return None;
         }
     };
-    if explaining {
-        for &(p, j) in &pairs {
-            let v = s.potential[&(p, j)];
-            match refused.get(&(p, j)) {
-                Some(w) => {
-                    eprintln!("inline-explain: type {p} field {j} (type {v}): not inlined: {w}")
-                }
-                None => {
-                    let st = stats.get(&(p, j)).copied().unwrap_or_default();
-                    let (rt_local, rt_arg) = reboxed.get(&(p, j)).copied().unwrap_or_default();
-                    eprintln!(
-                        "inline-explain: type {p} field {j} (type {v}): inlined; {} store(s) \
-                         ({} taken apart at the producer, {} spilled), {} read(s) as fields, \
-                         {} re-boxed ({} into a field-read local, {} into a field parameter)",
-                        st.stores,
-                        st.at_producer,
-                        st.spilled,
-                        st.field_reads,
-                        st.reboxed,
-                        rt_local,
-                        rt_arg
-                    );
-                }
+    for &(p, j) in &pairs {
+        let v = s.potential[&(p, j)];
+        match refused.get(&(p, j)) {
+            Some(w) => {
+                let _ = writeln!(
+                    log,
+                    "inline-explain: type {p} field {j} (type {v}): not inlined: {w}"
+                );
+            }
+            None => {
+                let st = stats.get(&(p, j)).copied().unwrap_or_default();
+                let (rt_local, rt_arg) = reboxed.get(&(p, j)).copied().unwrap_or_default();
+                let _ = writeln!(
+                    log,
+                    "inline-explain: type {p} field {j} (type {v}): inlined; {} store(s) \
+                     ({} taken apart at the producer, {} spilled), {} read(s) as fields, \
+                     {} re-boxed ({} into a field-read local, {} into a field parameter)",
+                    st.stores,
+                    st.at_producer,
+                    st.spilled,
+                    st.field_reads,
+                    st.reboxed,
+                    rt_local,
+                    rt_arg
+                );
             }
         }
     }
     if let Err(e) = Validator::new_with_features(WasmFeatures::all()).validate_all(&out) {
-        if explaining {
-            eprintln!("inline-explain: step abandoned: its output does not validate: {e}");
-        }
+        let _ = writeln!(
+            log,
+            "inline-explain: step abandoned: its output does not validate: {e}"
+        );
         return None;
     }
-    if explaining {
-        let parents: HashSet<u32> = inline.keys().map(|&(p, _)| p).collect();
-        eprintln!(
-            "inline-explain: {} field(s) of {} type(s) inlined",
-            inline.len(),
-            parents.len()
-        );
-    }
+    let parents: HashSet<u32> = inline.keys().map(|&(p, _)| p).collect();
+    let _ = writeln!(
+        log,
+        "inline-explain: {} field(s) of {} type(s) inlined",
+        inline.len(),
+        parents.len()
+    );
     Some((out, moved))
 }
 
