@@ -694,8 +694,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "building a list of compile-time-known size with push",
     // SP-056: a list index's guard branches to an out-of-line trap rather than a
     // `select` to -1, structure unchanged: `-O` 2090 -> 2401, `-O3` 2024 -> 2335 bytes.
-    O: { bytes: 2401, fns: 2, allocs: 10, indirect: 0 },
-    O3: { bytes: 2335, fns: 2, allocs: 10, indirect: 0 },
+    // D4782: the trap branch ends in `unreachable`, so `-O` drops each repeated check of one
+    // index and shares one trap block: `-O` 2401 -> 2100, `-O3` 2335 -> 2034 bytes.
+    O: { bytes: 2100, fns: 2, allocs: 10, indirect: 0 },
+    O3: { bytes: 2034, fns: 2, allocs: 10, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). The `P[]` is flattened (D3681): four
   // i32s per element in one array, so setup allocates no `P` (`allocs` 3 -> 2: the list and

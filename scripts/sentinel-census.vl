@@ -669,6 +669,74 @@ function moduleMaps(lines: string[]): Set<string> {
   out
 }
 
+// Another module's map globals, by path, read once; an unreadable path has none.
+const pathMaps: Map<string, Set<string>> = Map()
+
+function mapsOfPath(path: string): Set<string> {
+  const hit = pathMaps[path]
+  if hit != null { return hit }
+  let out: Set<string> = Set()
+  const b = readFile(path)
+  if !(b is IoError) { out = moduleMaps(strippedLines(decodeUtf8Lossy(b))) }
+  pathMaps[path] = out
+  out
+}
+
+// The locals one `{ a, b as c }` specifier list binds to a member of `maps`.
+function mapLocals(list: string, maps: Set<string>, out: Set<string>) {
+  for part in split(list, ",") {
+    const s = strip(part)
+    const e = identEnd(s, 0)
+    if e == 0 || !maps.has(s.slice(0, e)) { continue }
+    let local = s.slice(0, e)
+    const k = skipSp(s, e)
+    if startsAt(s, k, "as") && !wordAt(s, k + 2) {
+      const a = skipSp(s, k + 2)
+      local = s.slice(a, identEnd(s, a))
+    }
+    if local != "" { out.add(local) }
+  }
+  0
+}
+
+// The import locals of `src`, in directory `dir`, that bind a map global of the module they
+// come from: a subscript of one is a key read as much as the module's own. The column-0
+// `import { … } from "./x"` and `export { … } from "./x"` statements, as the driver resolves them.
+function importedMaps(src: string, dir: string): Set<string> {
+  const out: Set<string> = Set()
+  let i = 0
+  while i < src.length {
+    let p = -1
+    if startsAt(src, i, "import ") { p = skipSp(src, i + 7) }
+    else if startsAt(src, i, "export ") { p = skipSp(src, i + 7) }
+    if at(src, p) == 123 {
+      const rb = findFrom(src, "}", p)
+      const fk = skipSp(src, rb + 1)
+      if rb > p && startsAt(src, fk, "from") {
+        const q = skipSp(src, fk + 4)
+        const qe = findFrom(src, "\"", q + 1)
+        if at(src, q) == 34 && qe > q && at(src, q + 1) == 46 {
+          let path = dir + "/" + src.slice(q + 1, qe)
+          if !endsWith(path, ".vl") { path = path + ".vl" }
+          mapLocals(src.slice(p + 1, rb), mapsOfPath(path), out)
+        }
+      }
+    }
+    const nl = findFrom(src, "\n", i)
+    if nl < 0 { break }
+    i = nl + 1
+  }
+  out
+}
+
+// The directory holding `path`, or "." for a bare file name.
+function dirOf(path: string): string {
+  let k = path.length - 1
+  while k >= 0 && path[k] != 47 { k = k - 1 }
+  if k < 0 { return "." }
+  path.slice(0, k)
+}
+
 // The header's last line: the first holding the `{` that opens the body.
 function headerEnd(lines: string[], lo: i32, hi: i32): i32 {
   let i = lo
@@ -755,10 +823,12 @@ function moduleReaders(lines: string[], fns: Fn[]): Set<string> {
 
 // Every hit in one module, one linear pass per function: a guard counts only where it
 // precedes the read, and a re-binding forgets what the name was bound to.
-function hitsIn(rel: string, src: string): Hit[] {
+function hitsIn(rel: string, path: string): Hit[] {
+  const src = readSource(path)
   const lines = strippedLines(src)
   const holes = holeFields(lines)
   const maps = moduleMaps(lines)
+  for m in importedMaps(src, dirOf(path)) { maps.add(m) }
   const fns = functions(lines)
   const readersHere = moduleReaders(lines, fns)
   const out: Hit[] = []
@@ -842,7 +912,7 @@ function hitsIn(rel: string, src: string): Hit[] {
 function allHits(root: string): Hit[] {
   const out: Hit[] = []
   for src in sources(root) {
-    for h in hitsIn(src.rel, readSource(src.path)) { out.push(h) }
+    for h in hitsIn(src.rel, src.path) { out.push(h) }
   }
   out
 }
@@ -941,9 +1011,7 @@ function cmdTables(root: string): i32 {
   for src in sources(root) {
     const seen: Map<string, i32> = Map()
     const order: string[] = []
-    for h in hitsIn(src.rel, readSource(src.path)) {
-      tally(seen, order, h.table, 1)
-    }
+    for h in hitsIn(src.rel, src.path) { tally(seen, order, h.table, 1) }
     if order.length > 0 {
       print(src.rel)
       for t in byCountDesc(sortStrings(order), seen) {
@@ -973,7 +1041,7 @@ function cmdTable(root: string, limit: i32, code: string): i32 {
 function cmdGrade(path: string): i32 {
   const rows: Map<string, string[]> = Map()
   for c in CODES { rows[c] = [] }
-  for h in hitsIn(path, readSource(path)) {
+  for h in hitsIn(path, path) {
     const r = rows[h.code] ?? []
     r.push(
       "[\{toString(h.line)}, \{toString(h.col)}, \{jsonStr(h.table)}, \{jsonStr(h.idx)}]",
