@@ -32,6 +32,9 @@ case "$PWD" in */.claude/worktrees/*) [ "${GATE_IN_WORKTREE:-0}" = 1 ] || {
 # "toString is not exported" read from the main repo's pre-rename std, while the
 # same command with VL_STD pinned passed). Callers may still override.
 export VL_STD="${VL_STD:-$PWD/std}"
+# scripts/compat/ stands in for a GNU tool a host lacks (macOS has no `timeout`). It goes LAST
+# on PATH, so wherever the real tool exists (Linux, CI) it still wins and nothing changes.
+export PATH="$PATH:$PWD/scripts/compat"
 # $VL_TMP: put every row's temp files in one directory, e.g. one the virus scanner skips.
 if [ -n "${VL_TMP:-}" ]; then
   mkdir -p "$VL_TMP"
@@ -40,6 +43,11 @@ if [ -n "${VL_TMP:-}" ]; then
   else
     export TMPDIR="$VL_TMP" TMP="$VL_TMP" TEMP="$VL_TMP"
   fi
+fi
+# macOS's TMPDIR sits under the /var -> /private/var symlink, and tests that compare a path a
+# tool printed against the one they made would read two spellings of one directory.
+if ! command -v cygpath >/dev/null && [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ]; then
+  TMPDIR="$(cd "$TMPDIR" && pwd -P)"; export TMPDIR
 fi
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
@@ -75,12 +83,21 @@ FAST=0
 for a in "$@"; do [ "$a" = --fast ] && FAST=1; done
 SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|survey measurements|native-fixpoint|self-compile time|rep-fuzz|plumb-shape cost|"
 SKIPPED=()
+# bash 3.2 (macOS's /bin/bash) has no `wait -n`; there a queued row polls once a second.
+if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then
+  wait_any() { wait -n 2>/dev/null || true; }
+else
+  wait_any() { sleep 1; }
+fi
+# A BSD `date` older than macOS 26 prints `%N` literally; perl's clock stands in there.
+if [ "$(date +%N)" != N ]; then now() { date +%s.%N; }
+else now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; fi
 run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1"); return 0; fi
         if [ "$GATE_MAX_PAR" -gt 0 ]; then
-          while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait -n 2>/dev/null || true; done
+          while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait_any; done
         fi
-        local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(date +%s.%N)"); shift
-        ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; date +%s.%N > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
+        local i=${#PIDS[@]}; NAMES+=("$1"); STARTS+=("$(now)"); shift
+        ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
            for p in "$@"; do m=${p%%m*}; x=${p#*m}; x=${x%s}; tot=$(awk -v t="$tot" -v m="$m" -v x="$x" 'BEGIN { print t + m * 60 + x }'); done
@@ -111,7 +128,7 @@ CI_NATIVE=$(ls tests/selfhost_native_*_test.ts tests/vl_*_test.ts | grep -vxF "$
 LSP_CI=$(awk '/Editor features on the wasm compiler/{f=1; next} f && /- name:/{exit} f{print}' \
            .github/workflows/ci.yml | grep -oE "tests/[a-zA-Z0-9_]+\.ts" | sort -u)
 [ -n "$LSP_CI" ] || { echo "no lsp suite list extracted from ci.yml — the step name that anchors the extraction was renamed or removed; fix .github/workflows/ci.yml and scripts/gate.sh together" >&2; exit 1; }
-DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | paste -sd,)
+DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | paste -sd, -)
 
 # ROW 1 TAKES THE COMPLEMENT. `deno task test` is the row that gives way, not ci-native:
 # every `ignore:` in the 57 files reading SELFHOST_NATIVE_ALIGN is a NEGATIVE gate, so
@@ -281,7 +298,7 @@ printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
   wait "${PIDS[$i]}"; rc=$?
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
-  [ -n "$fin" ] || fin=$(date +%s.%N)
+  [ -n "$fin" ] || fin=$(now)
   el=$(awk -v f="$fin" -v s="${STARTS[$i]}" 'BEGIN { print f - s }')
   cpu=$(cpusec $(tail -1 "$LOGS/$i.cpu" 2>/dev/null))
   [ -n "$cpu" ] || cpu=0

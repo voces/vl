@@ -133,7 +133,7 @@ find compiler std scripts tests bench \
     -path scripts/silent-sweep/distilled -prune -o \
     -path scripts/capability-probes/matrix -prune -o \
     -name '*.vl' -print0 \
-  | xargs -0 -n 200 -P "$(nproc)" bash -c '
+  | xargs -0 -n 200 -P "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" bash -c '
       # One `vl fmt --check` per 200 files: it names each drifting file
       # (`<f>: not formatted`) and each unparseable one (`fmt: <f>: parse error …`).
       # A chunk with any other line, or another exit code, is redone one file at a

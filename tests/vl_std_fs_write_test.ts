@@ -58,7 +58,9 @@ const runBuilt = async (
 ): Promise<{ out: string; secs: number; rssKiB: number }> => {
   const timed = exists("/usr/bin/time");
   const cmd = timed ? "/usr/bin/time" : VL;
-  const args = timed ? ["-f", "RSSKIB %M", VL, "run", wasm] : ["run", wasm];
+  // BSD time (macOS) has no `-f`; its `-l` prints the peak in BYTES as `N  maximum resident set size`.
+  const bsd = Deno.build.os === "darwin";
+  const args = timed ? [...(bsd ? ["-l"] : ["-f", "RSSKIB %M"]), VL, "run", wasm] : ["run", wasm];
   const t0 = performance.now();
   const { code, stdout, stderr } = await new Deno.Command(cmd, {
     args,
@@ -70,8 +72,9 @@ const runBuilt = async (
   const out = dec.decode(stdout).trimEnd();
   const err = dec.decode(stderr);
   if (code !== 0) throw new Error(`\`vl run\` exited ${code}\nstdout:\n${out}\nstderr:\n${err}`);
-  const m = err.match(/RSSKIB (\d+)/);
-  return { out, secs, rssKiB: m ? Number(m[1]) : -1 };
+  const m = bsd ? err.match(/(\d+)\s+maximum resident set size/) : err.match(/RSSKIB (\d+)/);
+  const rssKiB = m ? (bsd ? Math.round(Number(m[1]) / 1024) : Number(m[1])) : -1;
+  return { out, secs, rssKiB };
 };
 
 const run = async (dir: string, name: string, src: string): Promise<string> =>
