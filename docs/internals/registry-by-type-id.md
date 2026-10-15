@@ -733,6 +733,64 @@ with 0 baselined failures. `regress.vl` loses no runs. The render-parse ratchet 
 * Sites 1, 2, 5, 6, 7, 15, 17, 26, 27 and 29 hold `differ` reaches. Sites 16, 18, 28 and 41 hold
   `name-only` reaches at strict seams. Sites 20 and 25 have no reach at all.
 
+### Step 5 — the fourth switch: a mint guard adopts the key row, 45 of 47 sites on the key
+
+**The adopt.** `unNameAdoptKeyRow(name, ty)` binds an unregistered spelling to the row its key
+finds (`unRowBySid`) and answers whether `name` now names a row. Every mint guard (sites 1, 24,
+45/`registerInlineUnionAt`, 46) skips the mint only when the key OR the spelling says a row
+exists AND the adopt succeeds. The adopt is conservative: a spelling with fewer than two members
+(a softened literal union, `i32` for a litunion's row) or one whose own key is not the row's
+stays unbound and mints exactly as before. Without the member guard two `literal-unions`
+fixtures build invalid modules, because `i32` keys to a litunion's row.
+
+**`differ` is answer-neutral at a boolean seam.** At `isUNameAB` a `differ` reach finds a row on
+both sides, so both answer true. The reaches that change an answer are `name-only` ones: a
+spelling names a row the key misses. Traced, they are nominal against structural keys: a row
+`Cat|Dog` against the arena type `{meow:i32}|{woof:i32}`, a `Json` composite against its
+expanded type, and `i32|{f:i32}`, whose record `canonUnionKeyAtomOfTy` renders nominally. So
+sites 2, 5, 6, 15, 17, 18, 20, 26, 27 and 28 switch with the FALLBACK flavour
+(`unSiteFallsBack`): true when the key finds a row, else the spelling's answer.
+
+**Site 11's two answers.** `exprIsUnionStrEq` only decides whether the string scratch frame is
+reserved; the string arm calls `gHelpStrEq`, which needs no frame. For `U = i32 | string` the key's
+`true` is the contract's answer and only over-reserves (12 unused locals); the spelling's `false`
+gives no wrong value. No row is filed.
+
+**Two sites stay on the spelling.** Each was found by a bisection over single-site exclusions:
+
+| site | what the key did | witness |
+| --- | --- | --- |
+| 7 `internShapeDeep` value-union mint | the caller's type at a generic pin can be another pin's union, so the row was minted under the wrong key | `f<T>(x: T) { print([x].map((e): T \| f64 => e)[0]) }` pinned at `i32 \| null` then `i32 \| string`: prints `null` for `"u"`. Its corpus fixture (`map-declared-return-flattens-at-pin`) ran the same, only the module changed |
+| 16 `arrLitUnionElemName` | the softened spelling `i32` keyed to a numeric litunion's row, which is no box element | `numeric-litunion-empty-list-seed`, `list-element-narrowing-map-copy-runs` (invalid wasm) and the four `d362*_numlitun_*` cells (emit refusal) |
+
+**Rows closed.** D1790: the inline-union registrar now adopts the row for an alias-arm spelling
+(`[mkU()]` with `mkU(): U | boolean`) instead of declining, and the
+`is-union-alias-arm` matrix's two skipped positions run (66 of 66). D3153: `letAnnIsUnion`
+(site 2) finds the narrowed copy's row by key, so a closure capturing it builds; the `string`
+twin and both walk spellings run too.
+
+**The 17 changed modules.** `difftree.sh --identity` against master's seed: 10,285 built, 19
+differ, 0 uncompared. Two of the 19 are this step's new fixtures, which master cannot build. The
+other 17 run the same, and all but one keep their size.
+
+| modules | change |
+| --- | --- |
+| 16: `inferred-union-element-literal`, `capture-inferred-projection-nonstruct`, `capture-ref-types`, `closure-alias-union-return-hof`, `closure-litunion-param-pin-boxed-first`, `closure-union-param-pin-litunion-first`, `closure-union-return`, `union-returning-map`, `generics/union-arg`, `arm-literal-through-a-list-conduit`, `coalesce-result-rep`, `is-inline-shape-names-a-nominal-variant`, `map-read-coalesce-other-arm`, `nullable-union-alias`, `union-annotated-local-unclaimed-twin`, `union-if-value-variant` | only `i32.const` operands: the adopted spelling no longer mints a duplicate variant slice, so `assignTags` ranks and the scalar tags after the variants fall |
+| `value-union-eq-both-sides` (2,592 → 2,622 bytes) | site 11's 12 unused string-scratch locals in the start function |
+
+**Proof.** The fixpoint holds at 5,808,655 bytes (+0.2% on the baseline), and
+difftree's fixpoint identity holds against master. rep-fuzz is exact (0 unsound, 0 reject).
+`regress.vl` loses no runs; its three `rv3310` trap_loads→trap_loads movements read the same
+under the third switch's seed. `check-filed-witnesses --strict` reports 0 MOVED. The
+render-parse ratchet goes from 98 / 378 to 98 / 379: the adopt's
+`unionMemberCount(name) < 2` guard is one new parse. It stays because the type and the row
+cannot tell a one-atom litunion alias from its expansion, and dropping the guard breaks
+`litunion-list-concat-backing` and `single-literal-type`.
+
+**What remains.** Sites 7 and 16. Making the fallback sites strict needs `canonUnionKeyOfTy` and
+the name key to agree on nominal against structural records, and site 16 needs the key to tell a
+softened literal union from its base scalar.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
