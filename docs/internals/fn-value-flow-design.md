@@ -964,6 +964,38 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
    - **`monoBindingSigConflict` is retired.** Its refusal becomes the literal's multi-pin
      form, read from the class.
    - `live-sites.json` gains the literal's row, and the shadow comparison is deleted.
+   - First PR: `monoBindingSigConflict` is retired, and the cell store delivers at its pin.
+     - `monoBindingsAtPin` replaces the signature meet. For each un-annotated `let` written
+       with a hole lambda it reads the slot's pins from the table (path `["e"]` for a
+       capture cell) and delivers the initializer at the one pin. More than one pin is the
+       old refusal, with the same sentence (`monoBindSigFail`). A binding written with a
+       named generic (the shadow test's MULTI) is now refused at its first call, by
+       `monoLetPinTake`, with the same sentence; the shadow records the two instances made
+       before it.
+     - Pins taken in a function the binding's frame never calls do not count. The table now
+       records the function each pin was taken in (`pinFn`, read by
+       `fnFlowDeclPathPinFns`), and `monoDeclLivePathPins` drops those pins. Without that
+       filter `dead-nested-call-through-binding` is refused.
+     - A capture cell's store of a hole lambda delivers at the cell's `e` pin
+       (`monoDeliverAtPin`), the second cell case of step 5. D4842 runs, in both its cell and
+       its direct-write spelling.
+     - The first cell case (a value read through another cell) still skips the pin. Coercing
+       it there refuses `binding-copied-through-uncalled-chain`: `monoCoerceWrittenCell`
+       re-takes the source cell's writes after they have been delivered, finds no concrete
+       signature and calls `monoCellValueFail`. D4842 does not need it, because the source
+       cell's own `e` pin delivers its writes. Two ways to finish it: make the cell coerce
+       idempotent over a delivered instance, or drop the coerce for a cell read and let the
+       source's pin carry it. D4843 (filed open) has the same sentence and may share the fix.
+     - Ablations: with the old call removed and nothing added, 6 `@run` fixtures are lost;
+       with the new pass doing nothing and the cell store at the pin, 4. The candidate keeps
+       all of them. 0 of 3,849 `@run` fixtures move. Of 1,432 others, one refusal now names
+       `d1` instead of `d3` (`error-cell-peer-called-at-two-types`; `d1` is the binding
+       pinned at both types). 2 of 10,210 modules differ: that fixture, and
+       `hole-lambda-binding-one-signature`, where the store `d2 = g` in the uncalled `w5` is
+       now delivered at `d2`'s `i32` pin and mints an instance of `g` that the stripped body
+       of `w5` never references.
+     - Not in this PR: the (c) literal, its `live-sites.json` row, and deleting the shadow
+       comparison.
 7. **Checker refusal.** The checker re-checks each source at its class's pins and refuses
    an ill-typed delivery with both positions named (D4010, D3975, D3923). This step depends
    only on step 1, so it can move ahead of step 3.
