@@ -10575,6 +10575,8 @@ literals, transitive `is`, nested lists and record fields: identical output.
 
 **An arm that reads the receiver reads an empty `K[]`** (D4911). Where an arm the `is`
 narrows reads the receiver as `K[]`, it reads a fresh empty `K[]` in the receiver's place, so
-`if q is f64[] { print(q.length) }` prints `0` under every default. Where no such list can be
-handed over (a push through it, D4934; a closure read, D4935), emit refuses loudly under every
-default, and a pushing arm leaves the parameter unbound rather than defaulted.
+`if q is f64[] { print(q.length) }` prints `0` under every default. A push through the arm
+pushes onto that `K[]`, which stays the receiver's place from the first test that fits on, so a
+later `q.length` reads it (D4934); the caller's own list is not pushed onto, the detach D4949
+pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
+(D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.
