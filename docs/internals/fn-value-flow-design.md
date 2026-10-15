@@ -996,6 +996,22 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
        of `w5` never references.
      - Not in this PR: the (c) literal, its `live-sites.json` row, and deleting the shadow
        comparison.
+   - Second PR: a cell's store of a value read through another cell delivers at the pin.
+     - Both ways were ablated. Making the coerce idempotent was taken. A delivery at a pin
+       renames the write's value to the lambda's lifted or instance name, and
+       `monoLamValueFe` then no longer finds a hole lambda. The re-take used to fall through
+       to the value's open type and refuse. Now `monoLamInstanceNamed` reads the instance,
+       and the take compares that slot's signature with the cell's type: equal is taken,
+       different is the one-signature refusal. The store in `monoWalk` takes
+       `monoCellPinName` for every cell, so the `sn = ""` skip and its inline pin read are
+       deleted. D4843 is closed by the same arm: its call path re-took the delivered write.
+     - Dropping the coerce for a cell read was the other way. Deleting the `Index` arm of
+       `monoCoerceFnValueName` loses `captured-cell-written-from-another-cell`. Only noting
+       the delivery at the store keeps every fixture, but D4843 stays refused. Deleting the
+       write loop in `monoCoerceWrittenCell` loses 15 `@run` fixtures.
+     - 0 of 3,854 `@run` fixtures move other than the new
+       `hole-lambda-called-through-cell-written-back`, and 0 of 1,432 others. Against the
+       first PR, 1 of 10,215 modules differs: that new fixture.
 7. **Checker refusal.** The checker re-checks each source at its class's pins and refuses
    an ill-typed delivery with both positions named (D4010, D3975, D3923). This step depends
    only on step 1, so it can move ahead of step 3.
