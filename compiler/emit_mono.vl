@@ -6437,7 +6437,7 @@ function monoBindExplicitTyArgs(
 
 // The spelling an inferred call binds a type parameter to when no parameter names it and no
 // type argument is written. Only a body local can name such a parameter and it holds no value
-// of it, so only an `is` arm reading it at another type can tell the choice (D4911;
+// of it, and an `is` arm reading it at another type reads an empty list, so no read tells (D4911;
 // DECISIONS.md §"An unbound type parameter defaults at the call").
 const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 
@@ -6460,18 +6460,7 @@ function monoDefaultUnboundTyParams(
       && !monoParamsMention(params, one)
       && !monoTyParamReachesSpelling(body, one, seen)
     ) {
-      const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
-      tvN.push(tp)
-      tvV.push(MONO_UNBOUND_TY_PARAM_DEFAULT)
-      if dt >= 0 && !strListHas(monoExplicitBN, tp) {
-        monoExplicitBN.push(tp)
-        monoExplicitBT.push(dt)
-      }
-      monoKeyExtra = monoKeyExtra
-        + tp
-        + "="
-        + MONO_UNBOUND_TY_PARAM_DEFAULT
-        + ";"
+      monoBindTyParamDefault(tp, tvN, tvV)
     }
   }
   0
@@ -6488,7 +6477,185 @@ function monoTyParamReachesSpelling(
 ): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   if monoNodeNamesTyParam(ix, names) { return true }
+  if monoListIsUnhandable(ix, names, ix) { return true }
   monoTyParamCallReaches(ix, names, seen)
+}
+
+// Whether an `is K[]` under `ix` tests a receiver whose type names one of `names` and whose arm
+// reads it where it cannot be handed an empty `K[]` in place of the default's (D4911): a field,
+// or a variable a function nested in `body` reads or `body` pushes onto.
+function monoListIsUnhandable(ix: i32, names: string[], body: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    const kTy = isVarTyIxOf(ix)
+    const rTy = nodeTyIxOf(n.isObj)
+    if (
+      kTy >= 0
+      && kTy < T.tys.length
+      && T.tys[kTy] is TyArray
+      && rTy >= 0
+      && rTy < T.tys.length
+      && monoAnnHasTyParam(tyToStr(rTy), names)
+    ) {
+      const r = P.nodes[unwrapParen(n.isObj)]
+      if r is Member && narrowRegionReads(body, ix, r.memProp, true) == 2 {
+        return true
+      }
+      if (
+        r is Ident
+        && narrowRegionReads(body, ix, r.identName, false) == 2
+        && (monoNestedFnReads(body, r.identName, false)
+          || monoPushesOnto(body, r.identName))
+      ) {
+        return true
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if monoListIsUnhandable(k, names, body) { return true }
+  }
+  false
+}
+
+// Whether a function nested under `ix` reads `name`; `inner` once the walk is inside one.
+function monoNestedFnReads(ix: i32, name: string, inner: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return monoNestedFnReads(n.fnBody, name, true) }
+  if inner && n is Ident && n.identName == name { return true }
+  for k in nodeChildren(ix) {
+    if monoNestedFnReads(k, name, inner) { return true }
+  }
+  false
+}
+
+// Whether `name.push(...)` appears under `ix`.
+function monoPushesOnto(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Member && cf.memProp == "push" {
+      const o = P.nodes[unwrapParen(cf.memObj)]
+      if o is Ident && o.identName == name { return true }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if monoPushesOnto(k, name) { return true }
+  }
+  false
+}
+
+// Where `isIx` sits under `ix`: 0 not there, 2 when a region it narrows reads `name` (an `if`
+// or `while` body or else, the right of an `&&`/`||`, and the block's later statements after an
+// `if` whose condition negates the test), 3 for that negated `if` before its block is read,
+// else 1. A later `is` over the same receiver is not a read.
+export function narrowRegionReads(
+  ix: i32,
+  isIx: i32,
+  name: string,
+  field: boolean,
+): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if ix == isIx { return 1 }
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    const c = narrowRegionReads(n.ifCond, isIx, name, field)
+    if c == 0 {
+      const t = narrowRegionReads(n.ifThen, isIx, name, field)
+      if t != 0 { return t }
+      return narrowRegionReads(n.ifElse, isIx, name, field)
+    }
+    if (
+      c == 2
+      || nodeReadsName(n.ifThen, name, field)
+      || nodeReadsName(n.ifElse, name, field)
+    ) {
+      return 2
+    }
+    return if condNegates(n.ifCond, isIx) { 3 } else { 1 }
+  }
+  if n is WhileStmt {
+    const c = narrowRegionReads(n.whileCond, isIx, name, field)
+    if c == 0 { return narrowRegionReads(n.whileBody, isIx, name, field) }
+    if c == 2 || nodeReadsName(n.whileBody, name, field) { return 2 }
+    return if condNegates(n.whileCond, isIx) { 3 } else { 1 }
+  }
+  if n is BinExpr && (n.binOp == "&&" || n.binOp == "||") {
+    const c = narrowRegionReads(n.binLeft, isIx, name, field)
+    if c == 0 { return narrowRegionReads(n.binRight, isIx, name, field) }
+    if c == 2 || nodeReadsName(n.binRight, name, field) { return 2 }
+    return c
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    const k = narrowRegionReads(kids[i], isIx, name, field)
+    if k == 3 && n is Block {
+      let j = i + 1
+      while j < kids.length {
+        if nodeReadsName(kids[j], name, field) { return 2 }
+        j = j + 1
+      }
+      return 1
+    }
+    if k != 0 { return k }
+    i = i + 1
+  }
+  0
+}
+
+// Whether the condition `ix` holds the test `isIx` under an odd number of negations, counting
+// `!` and a `!is` itself.
+function condNegates(ix: i32, isIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if ix == isIx { return n is IsExpr && n.isNeg != 0 }
+  if n is Unary && n.unOp == "!" { return !condNegates(n.unArg, isIx) }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeContains(kids[i], isIx) { return condNegates(kids[i], isIx) }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `target` is `ix` or lies under it.
+export function nodeContains(ix: i32, target: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if ix == target { return true }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeContains(kids[i], target) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `name` is read anywhere under `ix`, as an identifier or, for a `field`, a member; the
+// receiver of an `is` is not a read.
+function nodeReadsName(ix: i32, name: string, field: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if field && n is Member && n.memProp == name { return true }
+  if !field && n is Ident && n.identName == name { return true }
+  if n is IsExpr {
+    const r = P.nodes[unwrapParen(n.isObj)]
+    if !field && r is Ident && r.identName == name { return false }
+    if field && r is Member && r.memProp == name {
+      return nodeReadsName(r.memObj, name, field)
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeReadsName(kids[i], name, field) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // `monoTyParamReachesSpelling`'s walk over the generic calls in the subtree at `ix`.
@@ -6540,6 +6707,72 @@ function monoCallMayBind(callIx: i32, args: i32[], names: string[]): boolean {
     if at < 0 || tyHasTyVar(at) { return true }
   }
   false
+}
+
+// Binds each of `typarams` that `ann`, the annotation of `params[at]`, names and the argument
+// left unbound: to the checker's binding at `callIx` (`{ v: 1.5 }` for `CN<T> | null`), else to
+// the default (`V[] | string` called with a string, D4913). One another parameter names, or that
+// reaches a spelling the default would answer, stays unbound.
+function monoDefaultAnnTyParams(
+  ann: string,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  body: i32,
+  params: i32[],
+  at: i32,
+  callIx: i32,
+) {
+  const others: i32[] = []
+  let k = 0
+  while k < params.length {
+    if k != at { others.push(params[k]) }
+    k = k + 1
+  }
+  for tp in typarams {
+    const one: string[] = [tp]
+    const seen: i32[] = []
+    if (
+      monoBindOf(tvN, tvV, tp) == ""
+      && monoAnnHasTyParam(ann, one)
+      && !monoParamsMention(others, one)
+      && !monoTyParamReachesSpelling(body, one, seen)
+    ) {
+      const bt = callBindTyOf(callIx, tp)
+      const sp = if bt >= 0 && bt < T.tys.length && !tyHasTyVar(bt) { monoPinAnnSpelling(bt) } else { "" }
+      if sp == "" {
+        monoBindTyParamDefault(tp, tvN, tvV)
+      } else {
+        tvN.push(tp)
+        tvV.push(sp)
+        if !strListHas(monoExplicitBN, tp) {
+          monoExplicitBN.push(tp)
+          monoExplicitBT.push(bt)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Whether the annotation node `annIx` is typed as a union or a nullable.
+function monoAnnIsUnion(annIx: i32): boolean {
+  const t = nodeTyIxOf(annIx)
+  if t < 0 || t >= T.tys.length { return false }
+  const ty = T.tys[t]
+  (ty is TyUnion && ty.uMembers.length > 1) || ty is TyNullable
+}
+
+function monoBindTyParamDefault(tp: string, tvN: string[], tvV: string[]) {
+  const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  tvN.push(tp)
+  tvV.push(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  if dt >= 0 && !strListHas(monoExplicitBN, tp) {
+    monoExplicitBN.push(tp)
+    monoExplicitBT.push(dt)
+  }
+  monoKeyExtra = monoKeyExtra + tp + "=" + MONO_UNBOUND_TY_PARAM_DEFAULT + ";"
+  0
 }
 
 // Whether any parameter annotation in `params` names one of `typarams`.
@@ -12632,6 +12865,18 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                   tvN,
                   tvV,
                 )
+                if monoAnnIsUnion(p.parType) {
+                  monoDefaultAnnTyParams(
+                    ann,
+                    fn.fnTyParams,
+                    tvN,
+                    tvV,
+                    fn.fnBody,
+                    params,
+                    i,
+                    callIx,
+                  )
+                }
                 let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
                 if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
                   pinC = monoUnionRestPin[i]
@@ -13453,6 +13698,50 @@ function monoFrameOfNode(ix: i32, root: i32): i32 {
   }
   best
 }
+
+// The module-scope function statement holding each node (`monoProgTopOf`), banked on the arena
+// stamp and the statement count: one walk answers every query between two edits (D4942).
+let monoProgTop: i32[] = []
+let monoProgHeldStamp = 0 - 1
+
+// Per node: the first module-scope function statement whose subtree holds it, -1 when only
+// another statement does, -2 when none does; rebuilt when the arena stamp moves.
+function monoProgTopOf(ix: i32): i32 {
+  const stamp = monoArenaStamp() + monoProgStmts.length
+  if stamp != monoProgHeldStamp {
+    const top: i32[] = []
+    while top.length < P.nodes.length { top.push(-2) }
+    for st in monoProgStmts {
+      if P.nodes[st] is FuncDecl { monoProgTopMark(top, st, st) }
+    }
+    for st in monoProgStmts { monoProgTopMark(top, st, -1) }
+    monoProgTop = top
+    monoProgHeldStamp = stamp
+  }
+  if ix < 0 || ix >= monoProgTop.length { return -2 }
+  monoProgTop[ix]
+}
+
+// Marks every node `root`'s subtree reaches, entering function bodies, that no earlier walk
+// marked, as held by `owner`.
+function monoProgTopMark(top: i32[], root: i32, owner: i32) {
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur >= 0 && cur < top.length && top[cur] == -2 {
+      // arena-tick exempt: top is the caller's fresh table, not the arena
+      top[cur] = owner
+      const b = monoNestedBodyOf(cur)
+      if b >= 0 { stack.push(b) }
+      for k in nodeChildren(cur) { stack.push(k) }
+    }
+  }
+  0
+}
+
+// Whether node `ix` lies in the program, entering function bodies (`monoSubtreeHolds` over every
+// statement of `monoProgStmts`).
+function monoProgHolds(ix: i32): boolean { monoProgTopOf(ix) != -2 }
 
 // Whether node `ix` lies in the subtree at `root`, entering function bodies.
 function monoSubtreeHolds(root: i32, ix: i32): boolean {
@@ -14530,12 +14819,9 @@ function monoWriteFrameDead(wf: i32, top: i32): boolean {
 // The function node holding node `ix` that a module-scope function is, or a function lifted
 // inside one; -1 for a node of the module's own statements.
 function monoTopFrameOf(ix: i32): i32 {
-  for st in monoProgStmts {
-    if P.nodes[st] is FuncDecl && monoSubtreeHolds(st, ix) {
-      return monoFrameOfNode(ix, st)
-    }
-  }
-  -1
+  const st = monoProgTopOf(ix)
+  if st < 0 { return -1 }
+  monoFrameOfNode(ix, st)
 }
 
 // Whether module-scope function node `fx` is named by no statement of the program and is no
@@ -14552,10 +14838,50 @@ function monoTopFnUnnamed(fx: i32): boolean {
     }
     if nm == "" || monoNameIsExported(nm) { return false }
   }
-  for st in monoProgStmts {
-    if monoSubtreeNamesIdent(st, nm, 0) { return false }
+  !monoProgNamesIdent(nm)
+}
+
+// The identifiers the program's statements name (`monoSubtreeNamesIdent` over each), and whether
+// a walk passed its depth bound, which answers every name; banked like `monoProgTop` (D4942).
+let monoProgNames: {[string]: boolean} = Map()
+let monoProgNamesDeep = false
+let monoProgNamesStamp = 0 - 1
+
+// Whether some statement of the program mentions the identifier `nm`.
+function monoProgNamesIdent(nm: string): boolean {
+  const stamp = monoArenaStamp() + monoProgStmts.length
+  if stamp != monoProgNamesStamp {
+    const names: {[string]: boolean} = Map()
+    let deep = false
+    const ixs: i32[] = []
+    const depths: i32[] = []
+    for st in monoProgStmts {
+      ixs.push(st)
+      depths.push(0)
+    }
+    while ixs.length > 0 {
+      const ix = ixs.pop() ?? -1
+      const d = depths.pop() ?? 0
+      if ix >= 0 && ix < P.nodes.length {
+        const n = P.nodes[ix]
+        if d > 400 {
+          deep = true
+        } else if n is Ident {
+          // arena-tick exempt: names is this function's fresh table, not the arena
+          names[n.identName] = true
+        } else {
+          for k in nodeChildren(ix) {
+            ixs.push(k)
+            depths.push(d + 1)
+          }
+        }
+      }
+    }
+    monoProgNames = names
+    monoProgNamesDeep = deep
+    monoProgNamesStamp = stamp
   }
-  true
+  monoProgNamesDeep || (monoProgNames[nm] ?? false)
 }
 
 // Whether the binding `lf` (`[frame, declaration]`) is written, directly or through its capture
@@ -14915,12 +15241,7 @@ function monoSubtreeCallsGeneric(ix: i32, ctx: i32, depth: i32): boolean {
 // Whether node `ix` lies in the body of function node `fx` (the program, for -1), or in the
 // body of a function lifted out of it at any depth.
 function monoFrameHolds(fx: i32, ix: i32): boolean {
-  if fx < 0 {
-    for st in monoProgStmts {
-      if monoSubtreeHolds(st, ix) { return true }
-    }
-    return false
-  }
+  if fx < 0 { return monoProgHolds(ix) }
   const body = monoNestedBodyOf(fx)
   if body < 0 { return false }
   if monoSubtreeHolds(body, ix) { return true }
@@ -15030,6 +15351,11 @@ export function monomorphize(stmts: i32[]) {
   monoExactNext = 0
   monoExactLow = 0
   monoProgStmts = stmts
+  monoProgHeldStamp = 0 - 1
+  monoProgNamesStamp = 0 - 1
+  monoProgTop = []
+  monoProgNames = Map()
+  monoProgNamesDeep = false
   monoNoRename = []
   monoDeclWrites = Map()
   monoWriteOrder = []

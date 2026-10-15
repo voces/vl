@@ -10509,9 +10509,8 @@ same output. It is enforced in four places:
 probe set covering the witness, explicit bindings, `countOf`, nullable locals, closures, list
 literals, transitive `is`, nested lists and record fields: identical output.
 
-**The one residual is D4911.** Where an arm the `is` narrows reads the receiver as `K[]`, the
-value test stands down (the instance's value cannot be read at that type) and the test keeps
-its static answer from the element type, so `if q is f64[] { print(q.length) }` prints under
-an `f64` default and not under `i32`. That is a defect in every instance, not in the default:
-the explicit `opT<i32, i32>` answers the same, and so did master with the parameter unbound.
-`i32` is chosen because it is that answer.
+**An arm that reads the receiver reads an empty `K[]`** (D4911). Where an arm the `is`
+narrows reads the receiver as `K[]`, it reads a fresh empty `K[]` in the receiver's place, so
+`if q is f64[] { print(q.length) }` prints `0` under every default. Where no such list can be
+handed over (a push through it, D4934; a closure read, D4935), emit refuses loudly under every
+default, and a pushing arm leaves the parameter unbound rather than defaulted.
