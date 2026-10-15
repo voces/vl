@@ -98,6 +98,11 @@ let ufRes: i32[][] = []
 let ufTop: string[] = []
 let ufKidK: string[][] = []
 let ufKidS: i32[][] = []
+// Per class root, its source, binding and result lists as sets, so a membership test never
+// scans a list that can hold the program (D4942).
+let ufSrcAt: {[i32]: {[i32]: boolean}} = Map()
+let ufDeclAt: {[i32]: {[i32]: boolean}} = Map()
+let ufResAt: {[i32]: {[i32]: boolean}} = Map()
 // The directed half, per slot rather than per class: the slots a slot's value flows into, and
 // the pins taken at the slot itself. A merge with no direction (two derived slots) flows both
 // ways. Per pre-mono declaration or list or record literal, its slot in each context that walks
@@ -116,6 +121,12 @@ let pinName: string[][] = []
 // The function each pin is taken in, -1 in module code, and the functions a query leaves out.
 let pinFn: i32[] = []
 let ffPinSkip: {[i32]: boolean} = Map()
+// A slot's closed directed pin keys (`ffPathPinKeys`, sigs then rets), valid while no slot, edge
+// or pin has been added since (`ffKeyStamp`); a query with `ffPinSkip` set bypasses it (D4942).
+let ffSigMemo: {[i32]: string[]} = Map()
+let ffRetMemo: {[i32]: string[]} = Map()
+let ffKeyStamp: i32[] = [-1, -1, -1]
+let dfEdgeN = 0
 
 // A context is one walk of a function body: the type bindings its type variables take. Context 0
 // binds nothing (module code, a concrete function); 1 is a generic's template walk.
@@ -175,8 +186,15 @@ export function fnFlowShadowBegin() {
   ufTop = []
   ufKidK = []
   ufKidS = []
+  ufSrcAt = Map()
+  ufDeclAt = Map()
+  ufResAt = Map()
   dfTo = []
   dfPin = []
+  dfEdgeN = 0
+  ffSigMemo = Map()
+  ffRetMemo = Map()
+  ffKeyStamp = [-1, -1, -1]
   ffDeclSlots = Map()
   ffDeclSlotCtx = Map()
   pinTys = []
@@ -296,6 +314,48 @@ function ffI32Merge(into: i32[], from: i32[]) {
   0
 }
 
+// How many facts root `r`'s class holds, which decides the side a merge keeps.
+function ffClassSize(r: i32): i32 {
+  ufSrc[r].length
+    + ufPin[r].length
+    + ufDecl[r].length
+    + ufRes[r].length
+    + ufKidK[r].length
+}
+
+// Whether `x` is in root `r`'s list of the kind `sets` indexes.
+function ffFactHas(sets: {[i32]: {[i32]: boolean}}, r: i32, x: i32): boolean {
+  const s = sets[r]
+  if s == null { return false }
+  s[x] ?? false
+}
+
+// Adds `x` to root `r`'s list `xs`, of the kind `sets` indexes, unless it is there.
+function ffFactAdd(sets: {[i32]: {[i32]: boolean}}, xs: i32[], r: i32, x: i32) {
+  if ffFactHas(sets, r, x) { return 0 }
+  xs.push(x)
+  let s = sets[r]
+  if s == null {
+    const fresh: {[i32]: boolean} = Map()
+    sets[r] = fresh
+    s = fresh
+  }
+  s[x] = true
+  0
+}
+
+// Adds root `gone`'s members of `lists` to root `keep`'s, each once, before `gone` is
+// re-parented under `keep`.
+function ffFactMove(
+  sets: {[i32]: {[i32]: boolean}},
+  lists: i32[][],
+  keep: i32,
+  gone: i32,
+) {
+  for x in lists[gone] { ffFactAdd(sets, lists[keep], keep, x) }
+  0
+}
+
 // Merge the classes of `a` and `b` (either may be -1, for no flow) and return a member; the
 // value flows both ways.
 function ffUnion(a: i32, b: i32): i32 {
@@ -326,6 +386,7 @@ function ffJoin2(a: i32, b: i32): i32 {
 function ffEdge(from: i32, to: i32) {
   if from < 0 || to < 0 || from == to || from >= dfTo.length { return 0 }
   dfTo[from].push(to)
+  dfEdgeN = dfEdgeN + 1
   0
 }
 
@@ -337,25 +398,37 @@ function ffMerge(a: i32, b: i32): i32 {
   if ra < 0 || rb < 0 { return -1 }
   if ra == rb { return ra }
   ffWork = ffWork + 1
-  ufPar[rb] = ra
-  ffI32Merge(ufSrc[ra], ufSrc[rb])
-  ffI32Merge(ufPin[ra], ufPin[rb])
-  ffI32Merge(ufDecl[ra], ufDecl[rb])
-  if ufWritten[rb] { ufWritten[ra] = true }
-  ffI32Merge(ufRes[ra], ufRes[rb])
-  if ufTop[ra] == "" { ufTop[ra] = ufTop[rb] }
-  const pk = ufKidK[rb]
-  const ps = ufKidS[rb]
+  // The larger class keeps its lists and the smaller one's move into them, so a slot's facts
+  // move O(log n) times however a program chains its merges (D4942).
+  let keep = ra
+  let gone = rb
+  if ffClassSize(rb) > ffClassSize(ra) {
+    keep = rb
+    gone = ra
+  }
+  ffFactMove(ufSrcAt, ufSrc, keep, gone)
+  ffFactMove(ufDeclAt, ufDecl, keep, gone)
+  ffFactMove(ufResAt, ufRes, keep, gone)
+  for id in ufPin[gone] { ufPin[keep].push(id) }
+  ufPar[gone] = keep
+  ufWritten[keep] = ufWritten[ra] || ufWritten[rb]
+  if ufTop[ra] == "" {
+    ufTop[keep] = ufTop[rb]
+  } else {
+    ufTop[keep] = ufTop[ra]
+  }
+  const pk = ufKidK[gone]
+  const ps = ufKidS[gone]
   const noK: string[] = []
   const noS: i32[] = []
-  ufKidK[rb] = noK
-  ufKidS[rb] = noS
+  ufKidK[gone] = noK
+  ufKidS[gone] = noS
   let i = 0
   while i < pk.length {
-    const root = ffFind(ra)
+    const root = ffFind(keep)
     const mine = ffKidOf(root, pk[i])
     if root < 0 || root >= ufKidK.length || root >= ufKidS.length {
-      ffUnion(ra, ps[i])
+      ffUnion(keep, ps[i])
     } else if mine < 0 {
       ufKidK[root].push(pk[i])
       ufKidS[root].push(ps[i])
@@ -381,7 +454,7 @@ function ffMarkTop(s: i32, label: string) {
 
 function ffAddDecl(s: i32, d: i32) {
   const r = ffFind(s)
-  if r >= 0 && !i32ListHas(ufDecl[r], d) { ufDecl[r].push(d) }
+  if r >= 0 { ffFactAdd(ufDeclAt, ufDecl[r], r, d) }
   0
 }
 
@@ -510,7 +583,7 @@ function ffSrcCtx(fn: i32): i32 {
 function ffAddSrc(s: i32, fn: i32, ctx: i32) {
   const r = ffFind(s)
   if r < 0 { return 0 }
-  if !i32ListHas(ufSrc[r], fn) { ufSrc[r].push(fn) }
+  ffFactAdd(ufSrcAt, ufSrc[r], r, fn)
   ffEnsureWalked(fn, ctx)
   ffUnion(ffKid(s, "r"), ffSlot(ffRetKey(fn, ctx)))
   if fn < 0 || fn >= P.nodes.length { return 0 }
@@ -972,9 +1045,7 @@ function ffSlotCall(ix: i32, s: i32): i32 {
     if s >= 0 { ffAddPin(s, tys, -1) }
     const res = ffKid(s, "r")
     const rr = ffFind(res)
-    if rr >= 0 && !typed && !i32ListHas(ufRes[rr], ffFn) {
-      ufRes[rr].push(ffFn)
-    }
+    if rr >= 0 && !typed { ffFactAdd(ufResAt, ufRes[rr], rr, ffFn) }
     return res
   }
   -1
@@ -990,7 +1061,9 @@ function ffTyKnown(t: i32): boolean {
 // A fresh slot for the result of a call whose callee type the checker left open.
 function ffUntypedResult(): i32 {
   const s = ffNew()
-  if ffFn >= 0 && s >= 0 && s < ufRes.length { ufRes[s].push(ffFn) }
+  if ffFn >= 0 && s >= 0 && s < ufRes.length {
+    ffFactAdd(ufResAt, ufRes[s], s, ffFn)
+  }
   s
 }
 
@@ -1387,8 +1460,32 @@ function ffPathPinKeys(s: i32, path: string[], rets: boolean): string[] {
     r = ffKidOf(ffFind(r), k)
     if r < 0 { return [] }
   }
-  if rets { return ffPinRetsOf(ffDirectedPins(r)) }
-  ffPinSigsOf(ffDirectedPins(r))
+  if ffPinSkip.length > 0 {
+    if rets { return ffPinRetsOf(ffDirectedPins(r)) }
+    return ffPinSigsOf(ffDirectedPins(r))
+  }
+  if (
+    ffKeyStamp[0] != ufPar.length
+    || ffKeyStamp[1] != dfEdgeN
+    || ffKeyStamp[2] != pinTys.length
+  ) {
+    ffSigMemo = Map()
+    ffRetMemo = Map()
+    ffKeyStamp = [ufPar.length, dfEdgeN, pinTys.length]
+  }
+  const memo = if rets { ffRetMemo } else { ffSigMemo }
+  const hit = memo[r]
+  if hit != null { return ffStrCopy(hit) }
+  const keys = if rets { ffPinRetsOf(ffDirectedPins(r)) } else { ffPinSigsOf(ffDirectedPins(r)) }
+  memo[r] = keys
+  ffStrCopy(keys)
+}
+
+// A fresh copy of `xs`, so a caller that extends an answer leaves the memo alone.
+function ffStrCopy(xs: string[]): string[] {
+  const out: string[] = []
+  for x in xs { out.push(x) }
+  out
 }
 
 // The one function the derived slot `kid` (`e` an element, `f.<name>` a field) of the binding
@@ -1451,6 +1548,9 @@ function ffSameSigs(a: string[], b: string[]): boolean {
 // The pins taken at every slot `s`'s value reaches along the directed edges, `s` included.
 function ffDirectedPins(s: i32): i32[] {
   const out: i32[] = []
+  // Every edge joins one class, and every pin is its class's too: a pinless class reaches none.
+  const root = ffFind(s)
+  if root >= 0 && ufPin[root].length == 0 { return out }
   const seen: {[i32]: boolean} = Map()
   const work: i32[] = [s]
   seen[s] = true
@@ -2071,7 +2171,7 @@ function ffClassHasSrc(s: i32, fn: i32): boolean {
   let x = fn
   let depth = 0
   while x >= 0 && depth < 8 {
-    if i32ListHas(ufSrc[r], x) { return true }
+    if ffFactHas(ufSrcAt, r, x) { return true }
     let nx = ffTemplateOf(x)
     if nx == x { nx = ffOrig(x) }
     if nx == x { return false }
@@ -2300,7 +2400,7 @@ function ffSweepRet(fn: i32, fnName: string) {
   while c < ctxBN.length {
     const s = ffKeyIx[ffRetKey(t, c)] ?? -1
     const r = ffFind(s)
-    if r >= 0 && i32ListHas(ufRes[r], t) {
+    if r >= 0 && ffFactHas(ufResAt, r, t) {
       return ffRow(
         "undecided: return through a function value",
         "return",
