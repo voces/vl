@@ -423,6 +423,15 @@ import {
 } from "./check_narrow_ends"
 import { hoistMatchScrutinees } from "./check_match_hoist"
 import {
+  crLostAny,
+  crLostNote,
+  crLostPopTo,
+  crLostPush,
+  crLostReset,
+  crSpans,
+  nodeLineOf,
+} from "./check_capture_loss"
+import {
   argLitAt,
   wsAnnMentions,
   wsBodyErr,
@@ -9760,11 +9769,7 @@ function crNoteLostRead(key: string, ix: i32) {
     crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", key)
   }
   if npInvBy[slot] >= 0 { return 0 }
-  crLostKeys.push(key)
-  crLostIxs.push(ix)
-  crLostFns.push(crFnIxs[crFnIxs.length - 1])
-  crLostDepths.push(crFnBases.length)
-  crLostBare.push(false)
+  crLostPush(key, ix, crFnIxs[crFnIxs.length - 1], crFnBases.length, false)
   0
 }
 
@@ -9777,57 +9782,13 @@ function crNoteLostName(name: string, ix: i32) {
   // Only a captured binding: a local of the same name is the function's own.
   const bd = narBindDepthOf(name)
   if bd >= crFnBase() && !crWidenedAt(name, bd) { return 0 }
-  crLostKeys.push(name)
-  crLostIxs.push(ix)
-  crLostFns.push(fnIx)
-  crLostDepths.push(crFnBases.length)
-  crLostBare.push(true)
+  crLostPush(name, ix, fnIx, crFnBases.length, true)
   0
 }
 
 // The names a function body reads at the declared type because `crCaptureLosesNarrowing` said so.
 let crCapLossBank: {[i32]: string} = Map()
 let crCapLossAny = false
-let crLostBare: boolean[] = []
-let crLostKeys: string[] = []
-let crLostIxs: i32[] = []
-let crLostFns: i32[] = []
-let crLostDepths: i32[] = []
-
-// The note a diagnostic at node `at` gains when it spans a read `crNoteLostRead` recorded.
-function crLostNote(msg: string, at: i32): string {
-  let i = crLostIxs.length - 1
-  while i >= 0 {
-    const k = crLostKeys[i]
-    if (
-      crSpans(at, crLostIxs[i])
-      && msg.indexOf("'" + k + "' is not narrowed") < 0
-    ) {
-      if crLostBare[i] {
-        return " — '"
-          + k
-          + "' is not narrowed inside the function on line "
-          + i32ToStr(nodeLineOf(crLostFns[i]))
-          + ": it may run before '"
-          + k
-          + "' is narrowed, or after a write that may store null; re-test '"
-          + k
-          + "' inside it"
-      }
-      return " — '"
-        + k
-        + "' is not narrowed inside the function on line "
-        + i32ToStr(nodeLineOf(crLostFns[i]))
-        + ": it is returned, stored or handed on, so it may run after '"
-        + k
-        + "' is written through another reference to the object; re-test '"
-        + k
-        + "' inside it"
-    }
-    i = i - 1
-  }
-  ""
-}
 
 // Whether the path narrowing in overlay slot `slot` is lost to the nested function being checked:
 // the slot belongs to an enclosing function, and a function between the two escapes — it may run
@@ -10068,11 +10029,7 @@ function crReset() {
   crRhsBys = []
   crCapWidenBank = Map()
   crEscNames = Map()
-  crLostKeys = []
-  crLostIxs = []
-  crLostFns = []
-  crLostDepths = []
-  crLostBare = []
+  crLostReset()
   crCapLossBank = Map()
   crCapLossAny = false
   crWideNames = []
@@ -10181,16 +10138,7 @@ function crFnLeave() {
     crCapRecTys.pop()
     crCapRecFns.pop()
   }
-  while (
-    crLostDepths.length > 0
-    && crLostDepths[crLostDepths.length - 1] > crFnBases.length
-  ) {
-    crLostKeys.pop()
-    crLostIxs.pop()
-    crLostFns.pop()
-    crLostDepths.pop()
-    crLostBare.pop()
-  }
+  crLostPopTo(crFnBases.length)
   0
 }
 
@@ -12812,15 +12760,6 @@ function carryAsgBanks(from: i32, to: i32) {
   0
 }
 
-// Does node `outer`'s source span hold node `inner`'s first token?
-function crSpans(outer: i32, inner: i32): boolean {
-  if outer < 0 || inner < 0 { return false }
-  const t = nodeStartTok(inner)
-  const a = nodeStartTok(outer)
-  if t < 0 || a < 0 { return false }
-  t >= a && t <= nodeLastTok(outer)
-}
-
 // How a note names what ended a narrowing, after "re-test it after".
 function crAfterWord(ix: i32): string {
   if (crAliasWr[ix] ?? false) || crIsPlainAssign(ix) { return "the assignment" }
@@ -12913,15 +12852,6 @@ function crCondDropWalk(ix: i32, acc: string): string {
     cur = elseIfLink(cur)
   }
   out
-}
-
-// The source line of a node, or 0 when it has no anchor token.
-function nodeLineOf(at: i32) {
-  if at >= 0 && at < nodeToks.length {
-    const tk = nodeToks[at]
-    if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
-  }
-  0
 }
 
 // The callee's written name, for the diagnostic. `"?"` when the callee is neither a
@@ -20749,7 +20679,7 @@ function tErrPush(
       if code == "" { code = CODE_NARROWING_ENDED_BY_CALL }
     }
   }
-  if crLostIxs.length > 0 {
+  if crLostAny() {
     const lnote = crLostNote(msg, at)
     if lnote != "" { msg = msg + lnote }
   }
