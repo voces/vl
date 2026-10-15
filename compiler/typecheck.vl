@@ -951,7 +951,6 @@ import {
   isVoidTy,
   litSetBaseTy,
   luAnyTyVar,
-  membersAllOpen,
   nhOpen,
   nonNulTyOf,
   nonNullTy,
@@ -4021,6 +4020,10 @@ function nodeIsTotal(ix: i32) {
 // type parameter: an instance shared across pins holds the member unwidened, so no retag.
 let widenRetagGenArg = false
 
+// Of a body's kept-apart return join (and its null wrapper), each return value's type and whether
+// it is a list stored as built: a pin re-joins those values, not the join's members.
+let tpRetJoinTys: {[i32]: i32[]} = Map()
+let tpRetJoinFixed: {[i32]: boolean[]} = Map()
 // The joins `paramNullJoin` kept a null in (D3497): re-folding one at a call keeps the null even
 // when the bound members absorb it, as a caller's own holes do.
 let paramNullJoins: {[i32]: i32} = Map()
@@ -4994,6 +4997,8 @@ export function initChecker() {
   voidCoerceValNames = []
   T.tys = []
   tpJoinUnions = Map()
+  tpRetJoinTys = Map()
+  tpRetJoinFixed = Map()
   paramNullJoins = Map()
   annUnionTys = Map()
   holeTpJoinNames = Map()
@@ -16909,6 +16914,14 @@ function leafIsLit(ix: i32, depth: i32): boolean {
   }
   if readsLitConst(x) { return true }
   P.nodes[x] is NullLit
+}
+
+// Whether the value at `ix` is a list literal, which a join builds at its joined type as the
+// direct spelling's `listJoinWidenCheck` does. Any other list keeps its own storage.
+function listLitFresh(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const x = parenPeelIx(ix)
+  x >= 0 && x < P.nodes.length && P.nodes[x] is ArrayLit
 }
 
 // Whether `a` and `b` hold two differently named declared type parameters at one position,
@@ -34264,31 +34277,155 @@ function substElemNominal(a: i32, b: i32): boolean {
 }
 
 // The members of a union re-joined one at a time, as the join that made it would at these types.
-// `allOpen` says every member the body joined is open in a type parameter (`rejoinListApart`).
-function rejoinMembers(ms: i32[], allOpen: boolean): i32 {
+// `fixed[i]` says member `i` is a list that keeps its own storage (`joinKeepingStorage`).
+function rejoinMembers(ms: i32[], fixed: boolean[]): i32 {
   const apart = njRejoinApart
   njRejoinApart = false
   if ms.length == 0 { return -1 }
   let r = ms[0]
+  let rFixed = fixed[0]
   let i = 1
   while i < ms.length {
     njApart = apart
-    const j = joinTys(r, ms[i])
+    r = joinKeepingStorage(r, rFixed, ms[i], fixed[i])
     njApart = false
-    if allOpen { r = rejoinListApart(r, ms[i], j) } else { r = j }
+    rFixed = rFixed || fixed[i]
     i = i + 1
   }
   rejoinDropSubsumed(r)
 }
 
-// `j`, the join of `a` and `b`, unless it collapsed onto a list that one side's elements would be
-// stored differently in: then the two stay apart, as the body's join of two type parameters did.
-// Only for members all open in a type parameter: a concrete member can be a literal the join adapts.
-function rejoinListApart(a: i32, b: i32, j: i32): i32 {
-  if listJoinStorageDiffers(a, j, 8) || listJoinStorageDiffers(b, j, 8) {
+// The join of `a` and `b`, or the two apart when it collapsed onto a list that a side stored as
+// built (`aFixed`, `bFixed`) keeps differently: only a fresh list literal is built at a join (D4862).
+function joinKeepingStorage(
+  a: i32,
+  aFixed: boolean,
+  b: i32,
+  bFixed: boolean,
+): i32 {
+  const j = joinTys(a, b)
+  if (
+    (aFixed && listJoinStorageDiffers(a, j, 8))
+    || (bFixed && listJoinStorageDiffers(b, j, 8))
+  ) {
     return joinVariantTys(a, b)
   }
   j
+}
+
+// The members of the return join at row `key` at this pin, one return value at a time: each
+// value's recorded type substituted, with `fixed` saying whether it is a list stored as built
+// (not a list literal). False when the row records no return set.
+function retJoinMembersAt(
+  key: i32,
+  bNames: string[],
+  bTys: i32[],
+  ms: i32[],
+  fixed: boolean[],
+  vals: i32[],
+): boolean {
+  const tys = tpRetJoinTys.get(key) ?? []
+  const fl = tpRetJoinFixed.get(key) ?? []
+  if tys.length == 0 || fl.length != tys.length { return false }
+  let k = 0
+  while k < tys.length {
+    const s = substTyDeep(tys[k], bNames, bTys)
+    vals.push(s)
+    const one: i32[] = []
+    flattenVariantsInto(s, one)
+    for m in one {
+      ms.push(m)
+      fixed.push(fl[k])
+    }
+    k = k + 1
+  }
+  ms.length > 0
+}
+
+// A re-join `res` still open in a type parameter keeps the return set it is made from, each
+// value at its type at this pin (`vals`), for the pin that binds it.
+function carryRetJoin(res: i32, key: i32, vals: i32[]) {
+  if res < 0 || res >= T.tys.length || !tyHasTyVar(res) { return 0 }
+  noteRetJoin(res, vals, tpRetJoinFixed.get(key) ?? [])
+}
+
+// Records the return set (`tys`, `fixed`) of the join at row `ret` and its null wrapper's inner.
+function noteRetJoin(ret: i32, tys: i32[], fixed: boolean[]) {
+  // arena-tick exempt: a per-program mark on an existing arena row.
+  tpRetJoinTys[ret] = tys
+  // arena-tick exempt: a per-program mark on an existing arena row.
+  tpRetJoinFixed[ret] = fixed
+  const rt = T.tys[ret]
+  if rt is TyNullable {
+    // arena-tick exempt: a per-program mark on an existing arena row.
+    tpRetJoinTys[rt.nInner] = tys
+    // arena-tick exempt: a per-program mark on an existing arena row.
+    tpRetJoinFixed[rt.nInner] = fixed
+  }
+  0
+}
+
+// Records the return values of the body at `body` when its inferred return `ret` is a join a pin
+// re-joins (`tpJoinUnions`): each value's type, and whether it is a list stored as built.
+function noteRetJoinValues(ret: i32, body: i32) {
+  if ret < 0 || ret >= T.tys.length || tpJoinUnions.length == 0 { return 0 }
+  let inner = ret
+  const rt = T.tys[ret]
+  if rt is TyNullable { inner = rt.nInner }
+  if !tpJoinUnions.has(ret) && !tpJoinUnions.has(inner) { return 0 }
+  const rets: i32[] = []
+  collectRetValues(body, rets)
+  const tys: i32[] = []
+  const fixed: boolean[] = []
+  let i = 0
+  while i < rets.length {
+    const r = rets[i]
+    i = i + 1
+    // A value `if` yields its arms: its own node carries one arm's type, not their join.
+    const x = parenPeelIx(r)
+    if x >= 0 && x < P.nodes.length && P.nodes[x] is IfStmt {
+      a20RetWalk(x, true, rets)
+      continue
+    }
+    const t = nodeTyIxOf(r)
+    if t < 0 { return 0 }
+    // A value that is itself a recorded join (`return w(t)`) contributes that join's own values.
+    const sub = tpRetJoinTys.get(t) ?? []
+    const subFixed = tpRetJoinFixed.get(t) ?? []
+    if sub.length > 0 && subFixed.length == sub.length {
+      let k = 0
+      while k < sub.length {
+        tys.push(sub[k])
+        fixed.push(subFixed[k])
+        k = k + 1
+      }
+    } else {
+      if t == ret || t == inner { return 0 }
+      tys.push(t)
+      fixed.push(!listLitFresh(r))
+    }
+  }
+  if !retValuesCover(inner, tys) { return 0 }
+  noteRetJoin(ret, tys, fixed)
+}
+
+// Whether every non-null member of the join `inner` is a member of one of the values `tys`: a
+// value whose node type does not show what it yields leaves the join without a return set.
+function retValuesCover(inner: i32, tys: i32[]): boolean {
+  const want: i32[] = []
+  flattenVariantsInto(inner, want)
+  const have: i32[] = []
+  for t in tys { flattenVariantsInto(t, have) }
+  for w in want {
+    if !isNullTy(w) {
+      let found = false
+      for h in have {
+        if h == w || sameVariantTy(h, w) { found = true }
+      }
+      if !found { return false }
+    }
+  }
+  true
 }
 
 // `r` with each literal arm a later, wider member subsumes dropped: a left fold keeps `"a"`
@@ -34669,15 +34806,24 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       && T.tys[t.nInner] is TyUnion
     ) {
       // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
-      const nms: i32[] = []
-      flattenVariantsInto(n2, nms)
+      let key = tyIx
+      if !tpRetJoinTys.has(tyIx) { key = t.nInner }
+      let nms: i32[] = []
+      let nFixed: boolean[] = []
+      const vals: i32[] = []
+      const recorded = retJoinMembersAt(key, bNames, bTys, nms, nFixed, vals)
+      if !recorded {
+        nms = []
+        nFixed = []
+        flattenVariantsInto(n2, nms)
+        for _ in nms { nFixed.push(true) }
+      }
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
       njRejoinApart = (tpJoinUnions.get(tyIx) ?? 0) == 2
-      const oms: i32[] = []
-      flattenVariantsInto(t.nInner, oms)
-      n2 = rejoinMembers(nms, membersAllOpen(oms))
+      n2 = rejoinMembers(nms, nFixed)
       tpApartConcrete = tpSaved
+      if recorded { carryRetJoin(n2, key, vals) }
     }
     if n2 != t.nInner { res = mkNullableTy(nullableFlatInner(n2)) }
   } else if t is TyObj {
@@ -34732,11 +34878,21 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
     } else if changed3 && tpJoinUnions.has(tyIx) {
       // A union the return-set join kept apart re-joins under the same rule (D2784).
+      let ums: i32[] = []
+      let uFixed: boolean[] = []
+      const vals: i32[] = []
+      const recorded = retJoinMembersAt(tyIx, bNames, bTys, ums, uFixed, vals)
+      if !recorded {
+        ums = out3
+        uFixed = []
+        for _ in out3 { uFixed.push(true) }
+      }
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
       njRejoinApart = (tpJoinUnions.get(tyIx) ?? 0) == 2
-      res = rejoinMembers(out3, membersAllOpen(ms))
+      res = rejoinMembers(ums, uFixed)
       tpApartConcrete = tpSaved
+      if recorded { carryRetJoin(res, tyIx, vals) }
     } else if changed3 {
       // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
       // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
@@ -40980,6 +41136,7 @@ function finishInferredReturn(
   const sawCycle = cycleBreakCount > cbBefore
   if inferObserved >= 0 {
     inferred = inferObserved
+    noteRetJoinValues(inferred, n.fnBody)
   } else if sawCycle && fnSawValueRet {
     // A value return position resolved to `void` only because a recursive-cycle member
     // is still pending: defer, so the binding-group fixpoint re-infers this once the
@@ -47504,6 +47661,7 @@ export function monoInferRetSetUnionName(
   let ok = true
   // Runtime returns join apart at the pin as they do in the body (`inferRetJoin`).
   let accLit = true
+  let accFixed = false
   let i = 0
   while i < rets.length {
     const rt = checkNode(rets[i])
@@ -47512,12 +47670,15 @@ export function monoInferRetSetUnionName(
     } else if joined < 0 {
       joined = rt
       accLit = armLit(rt, rets[i])
+      accFixed = !listLitFresh(rets[i])
     } else {
       const lit = armLit(rt, rets[i])
+      const fixed = !listLitFresh(rets[i])
       njApart = !accLit && !lit && !njFnGated(declIx)
-      joined = joinTys(joined, rt)
+      joined = joinKeepingStorage(joined, accFixed, rt, fixed)
       njApart = false
       accLit = accLit && lit
+      accFixed = accFixed || fixed
     }
     i = i + 1
   }
@@ -47555,6 +47716,7 @@ export function monoInferRetSetListTy(
   let first = -1
   let differ = false
   let ok = true
+  let accFixed = false
   let i = 0
   while i < rets.length {
     // The template's recorded type read at this pin; a recheck would bank the pin's facts.
@@ -47566,9 +47728,12 @@ export function monoInferRetSetListTy(
     } else if joined < 0 {
       joined = rt
       first = rt
+      accFixed = !listLitFresh(rets[i])
     } else {
       if !tySame(rt, first) { differ = true }
-      joined = joinTys(joined, rt)
+      const fixed = !listLitFresh(rets[i])
+      joined = joinKeepingStorage(joined, accFixed, rt, fixed)
+      accFixed = accFixed || fixed
     }
     i = i + 1
   }
