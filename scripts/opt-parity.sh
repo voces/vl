@@ -18,7 +18,8 @@
 # tests/cases plus the distilled corpus. Run from the checkout root. Exits 1 when
 # any program disagrees, naming each; 2 on a usage error. `--flag` passes one more
 # build flag to both sides (repeatable), and a `--source-map` build's map must agree too,
-# as must the escape and multi-value steps' outputs (`$VL_OPT_ESCAPE_DUMP`, `$VL_OPT_MV_DUMP`).
+# as must the escape and multi-value steps' outputs (`$VL_OPT_ESCAPE_DUMP`, `$VL_OPT_MV_DUMP`)
+# and the inline-record step's `$VL_INLINE_EXPLAIN` lines.
 set -u
 
 COMPILER=build/vl-compiler.wasm
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ $# -lt 2 ]; then
-  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
 A=$1 B=$2
@@ -88,7 +89,7 @@ one() {
     [ "$side" = b ] && spec=$B
     : > "$slot/log"
     env "$(side_env "$spec")" OPT_PARITY_LOG="$slot/log" VL_WASM_OPT="$WORK/shim.sh" \
-      VL_OPT_ESCAPE_DUMP="$slot/out.escape" VL_OPT_MV_DUMP="$slot/out.mv" \
+      VL_OPT_ESCAPE_DUMP="$slot/out.escape" VL_OPT_MV_DUMP="$slot/out.mv" VL_INLINE_EXPLAIN=1 \
       timeout "$TIMEOUT" "$(side_bin "$spec")" build "$f" "$RUNG" $FLAGS -o "$slot/out.wasm" \
       --compiler "$COMPILER" > "$slot/$side.stdout" 2> "$slot/$side.stderr"
     rc=$?
@@ -98,6 +99,7 @@ one() {
       return
     fi
     echo "$rc" > "$slot/$side.rc"
+    grep '^inline-explain: ' "$slot/$side.stderr" > "$slot/$side.inline"
     mv "$slot/log" "$slot/$side.argv"
     if [ -f "$slot/out.wasm" ]; then mv "$slot/out.wasm" "$slot/$side.wasm"; fi
     if [ -f "$slot/out.wasm.map" ]; then mv "$slot/out.wasm.map" "$slot/$side.map"; fi
@@ -118,8 +120,10 @@ one() {
       echo "DIFFER $f (escape step output)"
     elif { [ -f "$slot/a.mv" ] || [ -f "$slot/b.mv" ]; } && ! cmp -s "$slot/a.mv" "$slot/b.mv"; then
       echo "DIFFER $f (multi-value step output)"
+    elif ! cmp -s "$slot/a.inline" "$slot/b.inline"; then
+      echo "DIFFER $f (inline-record step explain lines)"
     else
-      echo "AGREE $f $(grep -c -e --no-inline= -e --skip-pass= "$slot/a.argv") $([ -f "$slot/a.escape" ] && echo 1 || echo 0)"
+      echo "AGREE $f $(grep -c -e --no-inline= -e --skip-pass= "$slot/a.argv") $(grep -c '^inline-explain: step skipped: ' "$slot/a.inline") $([ -f "$slot/a.escape" ] && echo 1 || echo 0)"
     fi
   else
     echo "AGREE-FAIL $f"
@@ -133,12 +137,13 @@ xargs -a "$WORK/files" -d '\n' -P "$JOBS" -I{} bash -c 'one "$1"' _ {} > "$WORK/
 
 agree=$(grep -c '^AGREE ' "$WORK/verdicts")
 both_fail=$(grep -c '^AGREE-FAIL ' "$WORK/verdicts")
-marked=$(grep -c "^AGREE .* [1-9][0-9]* [01]\$" "$WORK/verdicts")
+marked=$(grep -c "^AGREE .* [1-9][0-9]* [01] [01]\$" "$WORK/verdicts")
+skipped=$(grep -c "^AGREE .* 1 [01]\$" "$WORK/verdicts")
 escaped=$(grep -c "^AGREE .* 1\$" "$WORK/verdicts")
 differ=$(grep -c '^DIFFER ' "$WORK/verdicts")
 uncompared=$(grep -c '^UNCOMPARED ' "$WORK/verdicts")
 grep -E '^(DIFFER|UNCOMPARED) ' "$WORK/verdicts" | sort
 echo "opt-parity $A vs $B ($RUNG$FLAGS): $total programs · $agree identical modules ·" \
   "$both_fail both refused · $marked identical carrying a --no-inline or --skip-pass mark ·" \
-  "$escaped identical through an escape step · $differ differ · $uncompared uncompared"
+  "$skipped identical skipping the inline-record step · $escaped identical through an escape step · $differ differ · $uncompared uncompared"
 [ "$differ" -eq 0 ]

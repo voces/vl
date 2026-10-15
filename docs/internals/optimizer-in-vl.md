@@ -42,7 +42,8 @@ after, on one seed.
 | R3 | the escape choice and its two renames (`compiler/opt_escape.vl`, `compiler/wasm_names.vl`); the default, its Rust deleted | retired (`$VL_OPT_ESCAPE`) | `$VL_OPT_ESCAPE_DUMP` byte-identical |
 | R4 | a module writer: sections, types, bodies (`inline::assemble`, `type_section`, `encode_sub`, `finish_body`) (`compiler/wasm_write.vl`) | `$VL_OPT_ROUNDTRIP` (a check, not a side) | decode then encode is the identity over every module R1 reads |
 | R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) (`compiler/opt_multivalue.vl`); the default, its Rust deleted | retired (`$VL_OPT_MULTIVALUE`) | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
-| R6 | the inline-record step | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
+| R6a | the inline-record step's census: whether any field or element holds a leaf record (`compiler/opt_inline.vl`); beside the Rust | `$VL_OPT_INLINE` | the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
+| R6b, R6c | the inline-record step's walk and decision, then its rewrite | `$VL_OPT_INLINE` | `$VL_OPT_INLINE_DUMP`, and the `--source-map` file |
 | R7 | the list-flattening step | `$VL_OPT_FLAT` | `$VL_OPT_FLAT_DUMP` |
 
 The order is cheapest-first by what each needs: R1 and R2 only read; R3 rewrites one custom
@@ -336,3 +337,36 @@ Retirement: the host built at #3749's head against the host with the Rust delete
 
 The control, a host whose flattening step is told the multi-value step holds nothing, differs
 on 4 of 5,243 tests/cases programs, so the question the compiler now answers changes output.
+
+## R6a, the inline-record census, beside the Rust
+
+The inline-record step is too large for one rung, so R6 lands in three: R6a the census, R6b the
+walk and the decision with their full explain report, R6c the rewrite and its body moves.
+`compiler/opt_inline.vl` exports `optInline`, which reads the staged module through `wmRead`
+and answers whether any struct field or array element refers to a leaf record (1 to
+`MV_RECORD_MAX_FIELDS` numeric fields, no subtype). When none does it writes the step's
+`step skipped` explain line through `optOut` and the host skips the step. Any other module, and
+any module the host's scan refuses before its census (a name section naming fields, struct
+types in several rec groups, a type with several supertypes, bytes `wmRead` cannot decode), is
+handed to the host's `inline_step` unchanged.
+
+`$VL_OPT_INLINE` selects the side: unset or `rust` the host's step alone, `vl` the compiler's
+census first, `both` the two, failing the build when the compiler skips a module and the host's
+census (`inline::census_rust`) does not say the same line. `opt-parity.sh` now compares the
+`$VL_INLINE_EXPLAIN` lines of both sides and counts the programs whose step was skipped.
+`VL_OPT_INLINE=rust` against `vl`, on one seed:
+
+| population | programs | identical | both refused | identical with a mark | identical skipping the step | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/` | 15,372 | 10,293 | 5,079 | 3,586 | 8,718 | 0 | 0 |
+| the same, `-O3` | 15,372 | 10,293 | 5,079 | 3,586 | 8,718 | 0 | 0 |
+| tests/cases, `--source-map` | 5,248 | 4,151 | 1,097 | 1,188 | 3,451 | 0 | 0 |
+| tests/cases, `--names` | 5,248 | 4,151 | 1,097 | 1,188 | 3,451 | 0 | 0 |
+
+The control, `VL_INLINE_FAULT=1`, makes the compiler skip every module; over tests/cases it
+differs on 700 of 5,248 (391 by explain lines alone, 277 by module bytes, 19 by argv, 7 by
+escape output, 6 by multi-value output). `tests/selfhost_native_release_inline_test.ts` runs a
+skipped program under `vl` and `both`, the fault on each side, and an unknown selector.
+
+The seed grew by 4,561 bytes (0.08%). The Rust stays the default until R6c: a census alone
+deletes none of it.
