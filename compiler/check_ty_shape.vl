@@ -3,13 +3,14 @@
 // which numeric primitive it is, whether a union holds a literal, a boolean, a wide scalar or
 // a `v128`, which union arm a literal or an arity selects, and whether a hole or a type
 // variable is reachable inside it. Only the arm a literal selects reads nodes, the literal's
-// own; nothing reads the scope chain or `tErr`, and the only state is the walks' scratch
-// lists. How a type is stored is `check_ty_rep.vl`'s question.
+// own; nothing reads the scope chain or `tErr`, and the only state is the walks' scratch lists
+// and `tyHasTyVar`'s per-call budget. How a type is stored is `check_ty_rep.vl`'s question.
 
 import { ArrayLit, FieldInit, ObjLit, P, Paren } from "./ast"
 import {
   PrimName,
   T,
+  TY_ERR,
   TY_F32,
   TY_F64,
   TY_I32,
@@ -1389,5 +1390,177 @@ export function crTyHasFn(t: i32): boolean {
       i = i + 1
     }
   }
+  false
+}
+
+// Whether any of `tys` names a type parameter or a hole.
+export function tysHaveTyVarIn(tys: i32[]): boolean {
+  let i = 0
+  while i < tys.length {
+    if tys[i] >= 0 && tyHasTyVar(tys[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `ty` is a union with a function-type member, or a function type with `null`, with no
+// type parameter in it: an un-annotated return of this shape is pinned to its own spelling by
+// the emitter, and lowers as that annotation does (D4349).
+export function tyIsFnArmUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      if t.nInner >= 0 && T.tys[t.nInner] is TyFunc { return true }
+      return tyIsFnArmUnion(t.nInner)
+    }
+    TyUnion => {
+      if t.uMembers.length < 2 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        const m = t.uMembers[i]
+        if m >= 0 && m < T.tys.length && T.tys[m] is TyFunc { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a union, and a bare function type is no union with one.
+      return false
+    }
+  }
+}
+
+// Whether `p` is a declared type parameter and `c` a type holding none, nor a hole or error.
+export function tyParamBesideConcrete(p: i32, c: i32): boolean {
+  const tp = T.tys[p]
+  if tp is TyVar {
+    if tp.tvName.length == 0 || tp.tvName[0] == "?"[0] { return false }
+    if c == TY_ERR || tyHasTyVar(c) { return false }
+    return true
+  }
+  false
+}
+
+// Whether every member of `ms` is open in a type parameter.
+export function membersAllOpen(ms: i32[]): boolean {
+  for m in ms {
+    if !tyHasTyVar(m) { return false }
+  }
+  true
+}
+
+// Whether one of `tys` still holds a type variable: a binding that leaves a demand undecided.
+export function tysHoldVar(tys: i32[]): boolean {
+  for t in tys {
+    if tyHasTyVar(t) { return true }
+  }
+  false
+}
+
+// Whether `ty` is unknown or mentions a type parameter: a value a generic body may compute on.
+export function tyOpenOrTyVar(ty: i32): boolean { ty < 0 || tyHasTyVar(ty) }
+
+// Whether `ty` still holds an unresolved `TyVar`: `substTyDeep` leaves an unbound parameter in
+// place, and a partly-substituted type recorded on an instance is a wrong type. An acyclic type
+// is read whole, each distinct part once; a cycle is cut, and only the far caps answer true.
+export function tyHasTyVar(ty: i32) {
+  tyHasTyVarBudget = 100000
+  tyHasTyVarCapped = false
+  if tyHasTyVarFreeN > 0 {
+    tyHasTyVarFree = Map()
+    tyHasTyVarFreeN = 0
+  }
+  tyHasTyVarGo(ty, 20000)
+}
+
+// Whether the last `tyHasTyVar` answered true only because it ran out of depth or budget.
+export function tyHasTyVarWasCapped(): boolean { tyHasTyVarCapped }
+
+let tyHasTyVarCapped = false
+
+// The distinct parts the walk may still visit below the shallow depth, and the parts it has
+// found free of a type variable there, so a shared part (a diamond) is read once.
+let tyHasTyVarBudget = 100000
+
+let tyHasTyVarFree: {[i32]: boolean} = Map()
+
+let tyHasTyVarFreeN = 0
+
+export function tyHasTyVarGo(ty: i32, depth: i32) {
+  if ty < 0 { return false }
+  if depth > 19988 { return tyHasTyVarAt(ty, depth) }
+  if tyHasTyVarFree.has(ty) { return false }
+  if depth <= 0 || tyHasTyVarBudget <= 0 {
+    tyHasTyVarCapped = true
+    return true
+  }
+  tyHasTyVarBudget = tyHasTyVarBudget - 1
+  if i32ListHas(tyHasTyVarDeep, ty) { return false }
+  tyHasTyVarDeep.push(ty)
+  const r = tyHasTyVarAt(ty, depth)
+  tyHasTyVarDeep.pop()
+  if !r {
+    tyHasTyVarFree.set(ty, true)
+    tyHasTyVarFreeN = tyHasTyVarFreeN + 1
+  }
+  r
+}
+
+function tyHasTyVarAt(ty: i32, depth: i32) {
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyArray { return tyHasTyVarGo(t.aElem, depth - 1) }
+  if t is TyNullable { return tyHasTyVarGo(t.nInner, depth - 1) }
+  if t is TyNeg { return tyHasTyVarGo(t.negTy, depth - 1) }
+  if t is TyMap {
+    if tyHasTyVarGo(t.mKey, depth - 1) { return true }
+    return tyHasTyVarGo(t.mVal, depth - 1)
+  }
+  if t is TyObj {
+    const fs = t.objFieldTypes
+    let i = 0
+    while i < fs.length {
+      if tyHasTyVarGo(fs[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let k = 0
+    while k < ps.length {
+      if tyHasTyVarGo(ps[k], depth - 1) { return true }
+      k = k + 1
+    }
+    return tyHasTyVarGo(t.fnRet, depth - 1)
+  }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let u = 0
+    while u < ms.length {
+      if tyHasTyVarGo(ms[u], depth - 1) { return true }
+      u = u + 1
+    }
+    return false
+  }
+  false
+}
+
+// Whether any of the members `ms` names a type parameter.
+export function luAnyTyVar(ms: i32[]): boolean {
+  let i = 0
+  while i < ms.length {
+    if tyHasTyVar(ms[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `t` is the type parameter a rewrite gave a parameter.
+export function wsVarTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const v = T.tys[t]
+  if v is TyVar { return v.tvName.length > 3 && v.tvName.slice(0, 3) == "__W" }
   false
 }

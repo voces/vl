@@ -1,0 +1,144 @@
+// `check_union_mint.vl` — minting a union type, and the numeric-union gate it raises.
+// `mkUnionTy` appends a union row and raises the mint gates its members earn: a wide-scalar
+// member, or two or more numbers outside a std body. `numUnionMinted` lets every numeric-union
+// hook (`tyIsNumUnion`, `numUnionConverts`, `softenLitOpTy`) cost one read in a program
+// that mints none.
+
+import { curFnDeclIx } from "./check_cursor"
+import { numUnionMembersOf } from "./check_num_lits"
+import { rcwModOf } from "./check_record_writes"
+import { numWidens } from "./check_ty_relate"
+import {
+  intLitUnionBasesOf,
+  isNullTy,
+  isNumericPrimTy,
+  sameNumeric,
+} from "./check_ty_shape"
+import {
+  T,
+  TY_I64,
+  TY_NULL,
+  Ty,
+  TyNullable,
+  TyPrim,
+  TyUnion,
+  addTy,
+  mkNullableTy,
+  softenLitTy,
+  tyIsWidePrim,
+  tyToStr,
+  tyWideUnionMinted,
+} from "./check_types"
+import { srcmapPathOf } from "./srcmap"
+
+// The type whose members are `ms`: the one member itself, `X | null` as the nullable, else a union.
+export function tyOfMembers(ms: i32[]): i32 {
+  if ms.length == 1 { return ms[0] }
+  if ms.length == 2 {
+    if ms[1] == TY_NULL && ms[0] != TY_NULL { return mkNullableTy(ms[0]) }
+    if ms[0] == TY_NULL && ms[1] != TY_NULL { return mkNullableTy(ms[1]) }
+  }
+  mkUnionTy(ms)
+}
+
+export function mkUnionTy(members: i32[]) {
+  noteUnionMembers(members)
+  const t: Ty = { uMembers: members }
+  addTy(t)
+}
+
+// Raises the mint gates `members` earns. A declared union's placeholder is minted empty and
+// filled in place, so its fill calls this too, or an alias would skip the hooks (D3543).
+export function noteUnionMembers(members: i32[]) {
+  let i = 0
+  while i < members.length && !tyWideUnionMinted {
+    if tyIsWidePrim(members[i]) { tyWideUnionMinted = true }
+    i = i + 1
+  }
+  if !numUnionMinted { noteNumUnionMint(members) }
+  0
+}
+
+// Set once a union every member of which is a number (or another union) is minted: the gate
+// every numeric-union hook tests first, so a program with none pays one read per site.
+export let numUnionMinted = false
+
+// Whether declaration `fnIx` sits in a `std:` module.
+function fnDeclInStd(fnIx: i32): boolean {
+  const key = srcmapPathOf(rcwModOf(fnIx))
+  key.length > 4 && key.slice(0, 4) == "std:"
+}
+
+// Sets `numUnionMinted` when `members` may be a union of numbers.
+function noteNumUnionMint(members: i32[]) {
+  if members.length < 2 { return 0 }
+  // A std body's own narrowings (`toString` over `i32 | i64 | boolean | f64`) do not count: std
+  // does no arithmetic over a numeric union, and its signatures are resolved outside its bodies.
+  if curFnDeclIx >= 0 && fnDeclInStd(curFnDeclIx) { return 0 }
+  // A `null` member leaves the numbers a union when two others remain (`i32 | i64 | null`).
+  let numbers = 0
+  for m in members {
+    if m < 0 || m >= T.tys.length { return 0 }
+    const mt = T.tys[m]
+    if !isNullTy(m) {
+      if !isNumericPrimTy(m) && !(mt is TyUnion) && !(mt is TyNullable) {
+        return 0
+      }
+      numbers = numbers + 1
+    }
+  }
+  if numbers < 2 { return 0 }
+  numUnionMinted = true
+  0
+}
+
+// `softenLitTy` for an arithmetic or ordering operand: an integer-literal union over two bases
+// also softens, to the common width `i64`, because its members are constants that adapt.
+export function softenLitOpTy(ty: i32): i32 {
+  // Nearly every operand is a primitive, which no softening reaches.
+  if ty < 0 || T.tys[ty] is TyPrim { return ty }
+  const soft = softenLitTy(ty)
+  if soft != ty || !(T.tys[ty] is TyUnion) { return soft }
+  if intLitUnionBasesOf(ty).length > 0 {
+    // Its box is then an operand the emitter's numeric-union dispatch converts out of.
+    numUnionMinted = true
+    return TY_I64
+  }
+  ty
+}
+
+// Whether a numeric union `src` delivers into the numeric primitive `dst0`, or its nullable:
+// every member is it or widens to it exactly, so the value converts at the member it holds.
+export function numUnionConverts(src: i32, dst0: i32): boolean {
+  // A nullable number takes the union the way its number does: the box re-tags each member.
+  let dst = dst0
+  if dst >= 0 && dst < T.tys.length {
+    const dt = T.tys[dst]
+    if dt is TyNullable { dst = dt.nInner }
+  }
+  if !tyIsNumUnion(src) || !isNumericPrimTy(dst) { return false }
+  for m in numUnionMembersOf(src) {
+    if !sameNumeric(m, dst) && !numWidens(m, dst) { return false }
+  }
+  true
+}
+
+// The fix a numeric union delivered into a numeric primitive it does not convert to exactly
+// owes: an explicit `as`. Empty for every other pair.
+export function numUnionLossNote(got: i32, want: i32): string {
+  if !tyIsNumUnion(got) || !isNumericPrimTy(want) { return "" }
+  " — a member does not convert to "
+    + tyToStr(want)
+    + " exactly; write `x as "
+    + tyToStr(want)
+    + "`"
+}
+
+// Whether `t` is a union of numeric primitives only: `numUnionMembersOf` without the list, for
+// the hot paths that ask it of every operand.
+export function tyIsNumUnion(t: i32): boolean {
+  if !numUnionMinted || t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) {
+    return false
+  }
+  numUnionMembersOf(t).length > 0
+}

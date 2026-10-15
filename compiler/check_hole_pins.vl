@@ -1,0 +1,391 @@
+// `check_hole_pins.vl` — where a hole came from, and what each call pinned it to.
+// A derived hole (a field, element, return or operand read off another hole) records its
+// derivation in the `hd*` columns, so a later pin can re-base it on the hole it came from.
+// The pin tables bank, per owning function and hole name, every arena type a call pinned the
+// hole to, and the value type a read off a pinned map yields; `nodeTyPinIxOf` and the
+// `nodeTyMapVal*` queries resolve a node's recorded type through them. The checker writes
+// the pins; `hdReset` clears every table per program.
+
+import { nodeTyArrayElemRepName, nodeTyIxOf } from "./check_node_tys"
+import {
+  mapTyValExcludesNull,
+  mapTyValIsBool,
+  mapTyValIsLitUnion,
+  mapTyValIsNulBool,
+  mapTyValIsNulLitUnion,
+  mapTyValIsNumLitUnion,
+  mapTyValLitUnionTexts,
+  mapTyValName,
+} from "./check_ty_rep"
+import { isNullTy, tyHasTyVar } from "./check_ty_shape"
+import {
+  T,
+  TY_NULL,
+  TY_VOID,
+  TyArray,
+  TyMap,
+  TyPrim,
+  TyVar,
+  mkNullableTy,
+  tySame,
+} from "./check_types"
+
+// A derived hole names a read off another hole — field-of, return-of, element-of,
+// guarded-alternative-of, binop-of — held as one row per derivation: `hdKind`, `hdField`
+// (the property, or the operator for `HD_BINOP`), `hdInner`/`hdAlt`, `hdBase` (the hole
+// read from) and `hdDepth` (the re-basing budget). The minted name stays the hole's identity.
+export const HD_FLD = 0
+export const HD_RET = 1
+export const HD_ELEM = 2
+export const HD_GALT = 3
+export const HD_BINOP = 4
+
+// The guard's complement: the hole minus the type an `is` tested for, which is what the
+// else arm of `if a is T` reads. `subtractTy` cannot answer at a hole — there is no member
+// list to remove from — so the remainder is deferred to the pin. D1243.
+export const HD_GNOT = 5
+
+// The `??` result over a hole left operand: the non-null face of the pin when the default
+// fits it, else the join of the two — the concrete arm's own tail, deferred because neither
+// half can be computed until the pin. `hdInner` carries the default's type. D1693.
+export const HD_COAL = 6
+
+// The VALUE of an indexed hole (`a[i]` read): `HD_ELEM`'s element at its value type, so a
+// `u8[]` pin reads `i32`. `HD_ELEM` itself stays the storage type, which a write checks (D2238).
+export const HD_ELEMV = 7
+
+// Parameter `hdInner` of calling a hole as a function: what the pinned function takes there, so
+// an argument handed to a hole callee is re-asked at the pin (D3225).
+export const HD_PARAM = 8
+
+// The `??` result over a concrete left and a hole default: `hdInner` is the left's non-null
+// face, the base is the default. Answered at the pin by the concrete `??` tail, so a default
+// that does not fit the face joins it rather than posing as it (D3252).
+export const HD_COALD = 9
+
+// A place holding a written type-parameter value: `hdInner` is the place's declared type, the
+// base is the value's parameter. Answered at the pin by the member of the declaration that pin
+// lands on, so a nullable pin reads the declaration and a `K` pin the `string` it widens to.
+export const HD_TVW = 10
+
+// A hole's place holding a written concrete value: `hdInner` is the value's type, the base the
+// place's hole. Answered at the pin by the member of the
+// pinned place the value lands on, as the direct spelling's write re-narrows it (D3233).
+export const HD_HWR = 11
+export let hdKind: i32[] = []
+export let hdField: string[] = []
+export let hdInner: i32[] = []
+export let hdAlt: i32[] = []
+export let hdBase: i32[] = []
+export let hdDepth: i32[] = []
+
+// Arena index → derivation row, grown on demand: a derived hole's arena index is dense
+// enough in practice that a sparse `i32` sidecar beats a scan. `-1` or past the end means
+// not a derived hole.
+export let hdRowOfTy: i32[] = []
+
+// D1412 — the distinct pins a hole took (first-seen order), keyed by the hole's own name: the
+// un-softened arena types the emitter's literal complement cannot re-derive. A SET so a
+// per-instance mint can read each pin; `holePinCollapsedOf` derives the one-answer view every
+// reader had before — `-2` when two calls pinned it differently, one body serving both.
+export let holePinSet: {[string]: i32[]} = Map()
+
+// The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
+// call their variable `T` cannot poison each other's row.
+export let tyVarOwner: {[i32]: string} = Map()
+
+// Per map type a hole pins to: the value or `null` a read off it yields, minted once.
+export let pinMapReadTy: {[i32]: i32} = Map()
+
+// The declaring function recorded for a `TyVar` row, or "" when unrecorded.
+export function tyVarOwnerOf(tyIx: i32): string {
+  if tyIx < 0 { return "" }
+  tyVarOwner[tyIx] ?? ""
+}
+
+// A pin rides a key that carries the OWNING function, for the reason `holeWriteKey` does: a
+// declared type parameter is named `T`, so every generic in one program would share one row
+// and a second function's pin would poison the first's. An unowned row keeps the bare name.
+export function holePinKey(owner: string, tvName: string): string {
+  if owner == "" { return tvName }
+  "!p!" + owner + "!" + tvName
+}
+
+// Whether `ty` is a read of a place whose write the pin lands (`HD_TVW`, `HD_HWR`).
+export function tyIsWriteLandRead(ty: i32): boolean {
+  const row = hdRowOf(ty)
+  row >= 0 && (hdKind[row] == HD_TVW || hdKind[row] == HD_HWR)
+}
+
+// Whether `ty` is the `HD_TVW` read of a write of `rt` into a place declared `dcl`; `rt` -1
+// accepts any value.
+export function tyIsTvWriteOf(ty: i32, dcl: i32, rt: i32): boolean {
+  const row = hdRowOf(ty)
+  if row < 0 || hdKind[row] != HD_TVW { return false }
+  (rt < 0 || hdBase[row] == rt) && tySame(hdInner[row], dcl)
+}
+
+// The hole an indexed-hole VALUE (`HD_ELEMV`) reads from, or -1 for any other type.
+export function elemValueHoleBase(tyIx: i32): i32 {
+  const row = hdRowOf(tyIx)
+  if row < 0 { return -1 }
+  if hdKind[row] != HD_ELEMV { return -1 }
+  hdBase[row]
+}
+
+// True when `tyIx` is the deferred `hole minus null` that `nonNullNarrowTy` records for a hole
+// read under a null test. Every instance of the generic body shares that node, and in each one
+// it denotes the non-null face of whatever that instance pinned the hole to.
+export function tyIsNonNullHoleRead(tyIx: i32): boolean {
+  const row = hdRowOf(tyIx)
+  if row < 0 { return false }
+  hdKind[row] == HD_GNOT && hdAlt[row] == TY_NULL
+}
+
+// The base hole a derived member-read hole reads from: a field read and a guarded alternative both
+// bottom out at the hole they read, and nest — a field of a field. Any other hole (a plain param
+// hole, an `HD_RET` or `HD_ELEM` derivation) comes back unchanged, which is how `holeMemberDeadAt`
+// tells "this member is a read off a pinned argument" from "this member is an argument".
+export function holeBaseTy(tyIx: i32) {
+  const row = hdRowOf(tyIx)
+  if row < 0 { return tyIx }
+  const k = hdKind[row]
+  if k == HD_FLD {
+    // An empty property name never bottoms out: a `?fld..<h>` from a parser error-recovery `""`
+    // member name has no first dot to cut at, so it is not a derived read.
+    if hdField[row].length == 0 { return tyIx }
+    return holeBaseTy(hdBase[row])
+  }
+  if k == HD_GALT { return holeBaseTy(hdBase[row]) }
+  if k == HD_GNOT { return holeBaseTy(hdBase[row]) }
+  if k == HD_COAL { return holeBaseTy(hdBase[row]) }
+  tyIx
+}
+
+// Whether a member read off derived-hole row `row` is re-asked at the pin for a `null` member:
+// a field, element or call result of a hole, or an `is` remainder other than the non-null face.
+export function hdReadNullAsked(row: i32): boolean {
+  if row < 0 || row >= hdKind.length { return false }
+  const k = hdKind[row]
+  if k == HD_GNOT { return hdAlt[row] != TY_NULL }
+  k == HD_FLD || k == HD_ELEM || k == HD_ELEMV || k == HD_RET
+}
+
+// Whether arena type `tyIx` is a derived hole of kind `kind`.
+export function hdKindIs(tyIx: i32, kind: i32): boolean {
+  const r = hdRowOf(tyIx)
+  r >= 0 && hdKind[r] == kind
+}
+
+// The derivation row of an arena type, or -1 when it is not a derived hole.
+export function hdRowOf(tyIx: i32) {
+  if tyIx < 0 { return -1 }
+  if tyIx >= hdRowOfTy.length { return -1 }
+  hdRowOfTy[tyIx]
+}
+
+// The hole a derivation chain bottoms out at: `tyIx` itself when it is not a derived hole.
+export function hdRootTy(tyIx: i32): i32 {
+  let t = tyIx
+  let guard = 0
+  while hdRowOf(t) >= 0 && guard <= HOLE_REBASE_MAX {
+    t = hdBase[hdRowOf(t)]
+    guard = guard + 1
+  }
+  t
+}
+
+// How many derived-read layers a hole stacks over its base param hole — a stored count,
+// computed once per mint, used only to cap the re-basing below.
+export function hdDepthOf(tyIx: i32) {
+  const r = hdRowOf(tyIx)
+  if r < 0 { return 0 }
+  hdDepth[r]
+}
+
+// Whether derived row `row`'s `??` is over a declared type parameter pinned at `pin`, a primitive.
+// A union or record pin keeps the join: its instance still lowers the `??` at that box (D2951).
+export function coalDeadAtPin(row: i32, pin: i32): boolean {
+  if pin < 0 || pin >= T.tys.length || !(T.tys[pin] is TyPrim) { return false }
+  if pin == TY_VOID || isNullTy(pin) { return false }
+  if row < 0 || row >= hdBase.length { return false }
+  const b = hdBase[row]
+  if b < 0 || b >= T.tys.length { return false }
+  const bt = T.tys[b]
+  if bt is TyVar { return bt.tvName.length > 0 && bt.tvName[0] != "?"[0] }
+  false
+}
+
+// Re-basing budget: a derived hole re-based onto an outer hole at every call hop grows its
+// name by one layer per hop, and a self-recursive generic body would grow it without bound.
+// Past this depth re-basing stops and the name stays unresolved, so the cap can only lose
+// diagnostics — an unresolved hole still records its demand and blocks nothing.
+export const HOLE_REBASE_MAX = 8
+
+// `holePinCollapsedOf`'s answer for a hole two calls pinned differently; -1 is "unpinned".
+// Distinct from every arena id, and every reader tests `< 0`.
+const HOLE_PIN_CONFLICT = -2
+
+// The one-pin view of a hole's set: -1 when unpinned, the sole pin when every note agreed
+// (`tySame` to the first), `HOLE_PIN_CONFLICT` when two disagreed. `notePinnedHole`
+// keeps the set distinct by `tySame`, so a length of two is a real clash.
+function holePinCollapsedOf(key: string): i32 {
+  const s = holePinSet[key] ?? []
+  if s.length == 0 { return -1 }
+  if s.length == 1 { return s[0] }
+  HOLE_PIN_CONFLICT
+}
+
+// The pin behind arena type `tyIx` when it is a HOLE, or -1 for a non-hole or an unpinned one;
+// `HOLE_PIN_CONFLICT` for one two calls pinned differently. The emitter's route to
+// the un-softened member set a hole parameter's own recorded type never carries (D1412).
+export function pinnedHoleTyOf(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if !(t is TyVar) { return -1 }
+  holePinCollapsedOf(holePinKey(tyVarOwnerOf(tyIx), t.tvName))
+}
+
+// One atom of that signature: a hole answers with its pin, a type still carrying one after
+// that declines, and a concrete type is already the answer.
+export function pinResolvedAtomTy(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if t is TyVar { return pinnedHoleTyOf(tyIx) }
+  if tyHasTyVar(tyIx) { return -1 }
+  tyIx
+}
+
+// The type of the expression at node `ix` at this pin: its recorded type, resolved through the
+// hole's banked pin when the recorded type is a hole exactly one call pinned, else the recorded
+// type unchanged. A LIST-level classifier may read this; a SCALAR one may not, because a
+// monomorphized callback clone shares its nodes with the generic body (D1693).
+export function nodeTyPinIxOf(ix: i32): i32 {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyVar) { return ty }
+  const p = pinnedHoleTyOf(ty)
+  if p >= 0 { return p }
+  const mr = pinnedMapReadTyOf(ty)
+  if mr >= 0 { return mr }
+  ty
+}
+
+// The type of a read `m[k]` off a hole whose banked pin is a map, or -1 for any other type.
+// `tyIx` is a hole.
+function pinnedMapReadTyOf(tyIx: i32): i32 {
+  const row = hdRowOf(tyIx)
+  if row < 0 || hdKind[row] != HD_ELEMV { return -1 }
+  mapPinReadTy(pinnedHoleTyOf(hdBase[row]))
+}
+
+// What an index read off map `pin` yields, as the concrete read types it: the value or `null`.
+// -1 for a set, which has no index, and for anything that is not a map.
+export function mapPinReadTy(pin: i32): i32 {
+  if pin < 0 || pin >= T.tys.length { return -1 }
+  const t = T.tys[pin]
+  if !(t is TyMap) { return -1 }
+  if t.mSet == 1 || t.mVal < 0 { return -1 }
+  const memo = pinMapReadTy[pin] ?? -1
+  if memo >= 0 { return memo }
+  const r = mkNullableTy(t.mVal)
+  pinMapReadTy[pin] = r
+  r
+}
+
+// `nodeTyArrayElemRepName` with a hole element resolved through its banked pin. A container
+// whose own type is not a hole can still have one for its element — `const xs = [a]` over a
+// hole parameter records `<hole>[]` — so the rep the collector must reserve is unnameable
+// until the pin is asked one level in (D1725). "" wherever the plain reader answers "".
+export function nodeTyArrayElemPinRepName(ix: i32): string {
+  const direct = nodeTyArrayElemRepName(ix)
+  if direct != "" { return direct }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyArray {
+    let e = t.aElem
+    const p = pinnedHoleTyOf(e)
+    if p >= 0 { e = p }
+    if e < 0 { return "" }
+    const et = T.tys[e]
+    if et is TyPrim {
+      if et.primName == "boolean" { return "i32" }
+      return et.primName
+    }
+    // A literal-union element is deliberately not named here. Reserving the string list for an
+    // inline set's atom element traded the emit floor for invalid wasm: the reservation is not
+    // what that shape is missing, and the floor is doing its job (D1740).
+  }
+  ""
+}
+
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a numeric literal union
+// (`{[string]: 1.5 | 2.5}`). Needed separately because `tyIsLitUnion` is string-only by
+// construction, and the kind table can't answer either — a numeric litunion reps as its base
+// scalar, interning an ordinary f64/i32 slot whose nullable is the `-1` niche, not a value box.
+export function nodeTyMapValIsNumLitUnion(ix: i32) {
+  mapTyValIsNumLitUnion(nodeTyPinIxOf(ix))
+}
+
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a literal union — the
+// atom-valued mono map (each value is the interned atom id, a plain i32). The map store /
+// `??`-default sites read this off the receiver to seed the atom context.
+export function nodeTyMapValIsLitUnion(ix: i32) {
+  mapTyValIsLitUnion(nodeTyPinIxOf(ix))
+}
+
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a nullable literal
+// union (`{[string]: K | null}`): each value is the interned atom id with the `-1` null
+// sentinel — still the mono i32 map. Admits a bare `null` alongside the member literals.
+export function nodeTyMapValIsNulLitUnion(ix: i32) {
+  mapTyValIsNulLitUnion(nodeTyPinIxOf(ix))
+}
+
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is `boolean | null`:
+// each value is 0/1 with the `2` null sentinel — still the mono i32 map. The `??`-default
+// emitter reads this to coalesce a stored null as well as a missing key.
+export function nodeTyMapValIsNulBool(ix: i32) {
+  mapTyValIsNulBool(nodeTyPinIxOf(ix))
+}
+
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a plain `boolean`, the i32
+// map with 0/1 values and the `2` niche still spare. A bare read `m[k]` types `boolean | null`
+// (a missing key is null), so its miss arm must yield that spare sentinel — the
+// non-nullable-value dual of `nodeTyMapValIsNulBool`, read beside it.
+export function nodeTyMapValIsBool(ix: i32) {
+  mapTyValIsBool(nodeTyPinIxOf(ix))
+}
+
+// The member literal texts (raw lexeme, no quotes) of the value literal union of node `ix`'s
+// map type (its pin, for a hole) — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if
+// `ix` is not an atom-valued map. The `??`-default gate checks the default literal is a member.
+export function nodeTyMapValLitUnionTexts(ix: i32) {
+  mapTyValLitUnionTexts(nodeTyPinIxOf(ix))
+}
+
+// Whether node `ix` is a map whose VALUE type provably admits no `null` (`{[K]: V}`, not
+// `{[K]: V | null}`); false for a non-map or an unknown value type.
+export function nodeTyMapValExcludesNull(ix: i32) {
+  mapTyValExcludesNull(nodeTyPinIxOf(ix))
+}
+
+// The emitter-format value type name of node `ix`'s map type, its pin for a hole (`string` for
+// `{[string]: string}`), or "" if `ix` is not a map. Renders the value type, so the emitter
+// calls it only as a map-shape fallback (`mapShapeOfExpr`), never on the hot path.
+export function nodeTyMapValName(ix: i32) { mapTyValName(nodeTyPinIxOf(ix)) }
+
+// Clears every derivation row and pin table. The derivation rows are arena-parallel, so the
+// checker calls this exactly where the arena resets: a row surviving the re-mint would
+// describe a type index the re-mint discarded.
+export function hdReset() {
+  hdKind = []
+  hdField = []
+  hdInner = []
+  hdAlt = []
+  hdBase = []
+  hdDepth = []
+  hdRowOfTy = []
+  holePinSet = Map()
+  tyVarOwner = Map()
+  pinMapReadTy = Map()
+}

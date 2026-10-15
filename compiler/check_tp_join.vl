@@ -1,0 +1,482 @@
+// `check_tp_join.vl` — joins over type parameters, and the gradual parameters they read.
+// A join of two type parameters, or of a parameter and a concrete type, is kept apart as an
+// implicit parameter rather than boxed (`tpOpenJoin`, `keptParamUnion`), and re-joins at each
+// pin; the tables here name the unions and holes kept apart. The predicates over
+// declared and gradual parameters (`tyIsNamedParamHole`, `tyIsGradualParam`,
+// `tyParamOfInnermostBody`) are what those decisions read.
+
+import { FuncDecl, P, Param, i32ToStr } from "./ast"
+import { cstrOwnerStack, lamCheckDepth, lamRefoldDepth } from "./check_cursor"
+import { tyVarOwnerOf } from "./check_hole_pins"
+import { nodeTyIxOf } from "./check_node_tys"
+import {
+  flattenVariantsInto,
+  isNullTy,
+  nonNullTy,
+  tyHasTyVar,
+  tyParamBesideConcrete,
+} from "./check_ty_shape"
+import {
+  T,
+  TY_ERR,
+  TY_VOID,
+  TyArray,
+  TyNullable,
+  TyUnion,
+  TyVar,
+  mkNullableTy,
+  tyBearsNull,
+  tyIsDeclaredParam,
+  tyIsHole,
+} from "./check_types"
+import { mkUnionTy } from "./check_union_mint"
+
+// The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
+// non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
+export let tpJoinUnions: {[i32]: i32} = Map()
+
+// The parameter holes some join kept apart as an implicit type parameter (D3333): an instance
+// binding one re-joins such a join through its holes' binding.
+export let holeTpJoinNames: {[string]: boolean} = Map()
+
+// `V | null` when one side is a declared type parameter and the other is `null`, else -1.
+// `null` is assignable to `V` only until an instance binds it, so absorbing it would type
+// `[x, null]` as `V[]` and every instance would lose the null its concrete twin keeps (D2533).
+export function joinTyParamNull(a: i32, b: i32) {
+  let tv = -1
+  if isNullTy(b) { tv = a }
+  else if isNullTy(a) { tv = b }
+  if tv < 0 || tv >= T.tys.length { return -1 }
+  const t = T.tys[tv]
+  if t is TyVar {
+    // A hole's name starts with `?`; a declared parameter's is an identifier. A parameter's
+    // hole in the body declaring it is one as well (D3303).
+    if t.tvName.length > 0 && t.tvName[0] != "?"[0] { return mkNullableTy(tv) }
+    if (
+      tyIsNamedParamHole(tv)
+      && (tyParamOfInnermostBody(tv) || lamParamOfOpenBody(tv))
+    ) {
+      noteHoleTpJoin(tv)
+      return mkNullableTy(tv)
+    }
+  }
+  -1
+}
+
+// Whether `t` is the hole of a named function's un-annotated parameter (`paramHoleName`), an
+// implicit type parameter gradual as a declared one (D3333). A derived hole, a lambda
+// parameter's and a call's fresh one are not.
+function tyIsNamedParamHole(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if tt is TyVar {
+    const nm = tt.tvName
+    if nm.length < 2 || nm[0] != "?"[0] || nm[1] == "#"[0] { return false }
+    return tyVarOwnerOf(t) == nm
+  }
+  false
+}
+
+// Whether `t` is a declared type parameter or a parameter's hole (`tyIsNamedParamHole`).
+export function tyIsGradualParam(t: i32): boolean {
+  tyIsDeclaredParam(t) || tyIsNamedParamHole(t)
+}
+
+// Records each parameter hole among `t`'s members as one a join kept apart (`holeTpJoinNames`).
+export function noteHoleTpJoin(t: i32) {
+  const ms: i32[] = []
+  flattenVariantsInto(t, ms)
+  for m in ms {
+    if tyIsNamedParamHole(m) {
+      const mt = T.tys[m]
+      if mt is TyVar { holeTpJoinNames[mt.tvName] = true }
+    }
+  }
+  0
+}
+
+// Whether one of the hole names `ns` is a parameter hole some join kept apart.
+export function holeNamesTpJoin(ns: string[]): boolean {
+  if holeTpJoinNames.length == 0 { return false }
+  for n in ns {
+    if holeTpJoinNames.get(n) ?? false { return true }
+  }
+  false
+}
+
+// Whether `name` is the hole of one of the parameters of function declaration `owner`.
+function holeNameOfDecl(name: string, owner: i32): boolean {
+  if name.length < 2 || name[0] != "?"[0] { return false }
+  if owner < 0 || owner >= P.nodes.length { return false }
+  const fd = P.nodes[owner]
+  if fd is FuncDecl {
+    if fd.fnName == "" { return false }
+    return holeNameIsParamOf(name, fd.fnName, owner, fd.fnParams.length)
+  }
+  false
+}
+
+// A union holding a declared type parameter is gradual as the bare parameter is: an operation
+// is checked in the body against its concrete members, and each pin re-checks it against the
+// whole substituted union. The concrete members' type, or `ty` when it is no such union.
+export function tpGradualView(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return ty }
+  if !unionHasDeclaredParam(t.uMembers) { return ty }
+  const keep: i32[] = []
+  let tp = false
+  let hole = -1
+  for m in t.uMembers {
+    if m < 0 || m >= T.tys.length { return ty }
+    if T.tys[m] is TyVar {
+      if tyIsGradualParam(m) { tp = true }
+      if hole < 0 { hole = m }
+    } else {
+      if tyHasTyVar(m) { return ty }
+      keep.push(m)
+    }
+  }
+  if !tp { return ty }
+  // Every member a parameter or a hole: the union is as open as a bare one.
+  if keep.length == 0 { return hole }
+  if keep.length == 1 { return keep[0] }
+  mkUnionTy(keep)
+}
+
+// Whether a `??` over non-null left type `l` with a default typed `d` joins apart: `l` is a
+// declared type parameter and `d` a concrete type, or another declared parameter.
+export function coalParamDefault(l: i32, d: i32): boolean {
+  if l < 0 || d < 0 || l == d || !tyIsDeclaredParam(l) { return false }
+  if d >= T.tys.length || isNullTy(d) { return false }
+  if tyIsDeclaredParam(d) { return !sameDeclaredTyParam(l, d) }
+  !tyHasTyVar(d)
+}
+
+// Whether a member of `ms` is a declared type parameter or a parameter hole.
+export function unionHasDeclaredParam(ms: i32[]): boolean {
+  for m in ms {
+    if tyIsGradualParam(m) { return true }
+  }
+  false
+}
+
+// Whether `a` and `b` are two rows of one declared type parameter or one parameter's hole:
+// substitution matches by name.
+export function sameDeclaredTyParam(a: i32, b: i32): boolean {
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyVar {
+    if tb is TyVar {
+      if ta.tvName != tb.tvName { return false }
+      return tyIsDeclaredParam(a) || tyIsNamedParamHole(a)
+    }
+  }
+  false
+}
+
+// Whether collapsing `o` into `u` would drop a null: `u` holds a declared type parameter, or a
+// parameter's hole in its own body, and no null, `o` bears one. The parameter accepts null only
+// until a pin binds it (D2533, D3487, D3497).
+export function paramJoinDropsNull(u: i32, o: i32): boolean {
+  if u < 0 || o < 0 || u >= T.tys.length || o >= T.tys.length { return false }
+  if !isNullTy(o) && !tyBearsNull(o) { return false }
+  if isNullTy(u) || tyBearsNull(u) { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(u, ms)
+  for m in ms {
+    if m >= 0 && m < T.tys.length {
+      if tyIsDeclaredParam(m) { return true }
+      if tyIsNamedParamHole(m) && tyParamOfInnermostBody(m) { return true }
+      if tyIsNamedParamHole(m) && lamParamOfOpenBody(m) { return true }
+    }
+  }
+  false
+}
+
+// Whether `t` is a union holding a declared type parameter, decided per instance.
+export function tyIsParamUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const u = T.tys[t]
+  u is TyUnion && unionHasDeclaredParam(u.uMembers)
+}
+
+// How many `if`/`match` arm joins are being taken: the one place `tpOpenJoin` applies.
+export let tpArmJoinDepth = 0
+
+// Whether `t` is a union, or a nullable one, holding a type variable and no join's mark.
+export function writtenTpUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length || tyIsTpJoinUnion(t) || !tyHasTyVar(t) {
+    return false
+  }
+  const u = nonNullTy(t)
+  u >= 0 && u < T.tys.length && T.tys[u] is TyUnion
+}
+
+// Marks a join kept apart over a type parameter (`tpJoinUnions`), or the union inside its
+// nullable, as one of runtime arms: a pin re-joins its members apart too (`rejoinMembers`).
+export function markTpJoinApart(j: i32) {
+  if j < 0 || j >= T.tys.length || tpJoinUnions.length == 0 { return 0 }
+  // arena-tick exempt: a per-program mark on an existing arena row.
+  if tpJoinUnions.has(j) { tpJoinUnions[j] = 2 }
+  const jt = T.tys[j]
+  if jt is TyNullable {
+    // arena-tick exempt: a per-program mark on an existing arena row.
+    if tpJoinUnions.has(jt.nInner) { tpJoinUnions[jt.nInner] = 2 }
+  }
+  0
+}
+
+// The join of `a` and `b` when every member is a declared type parameter or a null and one
+// parameter is the checked body's own: each parameter once, the null kept, re-joined at each
+// pin (D3267). -1 otherwise; a concrete member is joined by the rules above.
+export function tpOpenJoin(a: i32, b: i32): i32 {
+  if tpArmJoinDepth == 0 { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(a, ms)
+  flattenVariantsInto(b, ms)
+  const kept: i32[] = []
+  let hasNull = false
+  let open = false
+  for m in ms {
+    if m < 0 || m >= T.tys.length || m == TY_ERR || m == TY_VOID { return -1 }
+    const mt = T.tys[m]
+    if isNullTy(m) {
+      hasNull = true
+    } else if mt is TyVar {
+      if !tyIsGradualParam(m) { return -1 }
+      if tyParamOfInnermostBody(m) { open = true }
+      let dup = false
+      for k in kept {
+        if k == m || sameDeclaredTyParam(k, m) { dup = true }
+      }
+      if !dup { kept.push(m) }
+    } else {
+      // A concrete member is joined by the rules above (D2906, D3212).
+      return -1
+    }
+  }
+  if !open || kept.length == 0 { return -1 }
+  if kept.length == 1 {
+    if !hasNull { return -1 }
+    noteHoleTpJoin(kept[0])
+    return mkNullableTy(kept[0])
+  }
+  const u = mkUnionTy(kept)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[u] = 1
+  noteHoleTpJoin(u)
+  if !hasNull { return u }
+  const res = mkNullableTy(u)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[res] = 1
+  res
+}
+
+// Whether `t` is a join `joinTys` kept apart over a type parameter, re-joined at each pin.
+export function tyIsTpJoinUnion(t: i32): boolean {
+  t >= 0 && tpJoinUnions.length > 0 && tpJoinUnions.has(t)
+}
+
+// Whether `p` is a bare declared type parameter of a body being checked and `c` a concrete
+// non-null value type. Outside its body an unbound parameter is absorbed as before.
+export function tyParamBesideBare(p: i32, c: i32): boolean {
+  if p < 0 || c < 0 || p >= T.tys.length || c >= T.tys.length { return false }
+  if c == TY_VOID || isNullTy(c) { return false }
+  if tyIsNamedParamHole(p) {
+    return c != TY_ERR && !tyHasTyVar(c) && tyParamOfInnermostBody(p)
+  }
+  tyParamBesideConcrete(p, c) && tyParamOfOpenBody(p)
+}
+
+// Whether type variable `p` names a type parameter of the innermost declaration being checked,
+// whose joins keep parameters apart: not inside a lambda, and not in a body taking a list of a
+// type parameter, the two shapes whose instances do not yet build such a join (D3357, D3358).
+export function tyParamOfInnermostBody(p: i32): boolean {
+  if lamCheckDepth > 0 { return false }
+  const tp = T.tys[p]
+  if tp is TyVar {
+    const k = cstrOwnerStack.length - 1
+    if k < 0 { return false }
+    const owner = cstrOwnerStack[k]
+    if owner >= 0 && owner < P.nodes.length {
+      const fd = P.nodes[owner]
+      if fd is FuncDecl {
+        for pi in fd.fnParams {
+          const pn = P.nodes[pi]
+          if pn is Param && pn.parType >= 0 {
+            const pt = nodeTyIxOf(pn.parType)
+            if (
+              pt >= 0
+              && pt < T.tys.length
+              && T.tys[pt] is TyArray
+              && tyHasTyVar(pt)
+            ) {
+              return false
+            }
+          }
+        }
+        for nm in fd.fnTyParams {
+          if nm == tp.tvName { return true }
+        }
+        return holeNameOfDecl(tp.tvName, owner)
+      }
+    }
+  }
+  false
+}
+
+// Whether `p` is a declared type parameter, or a parameter's hole, of a declaration whose body
+// is being checked.
+function gradualParamOfOpenBody(p: i32): boolean {
+  if tyIsDeclaredParam(p) { return tyParamOfOpenBody(p) }
+  if !tyIsNamedParamHole(p) { return false }
+  const tp = T.tys[p]
+  if tp is TyVar {
+    for owner in cstrOwnerStack {
+      if holeNameOfDecl(tp.tvName, owner) { return true }
+    }
+  }
+  false
+}
+
+// Whether `p` is such a parameter seen from inside a lambda in that body, where a join keeps
+// its `null` apart as the body's own does (D3506). A call re-folding its callee's deferred
+// return is no lambda body (D3520).
+function lamParamOfOpenBody(p: i32): boolean {
+  lamCheckDepth > lamRefoldDepth && gradualParamOfOpenBody(p)
+}
+
+// Whether type variable `p` names a type parameter of a declaration whose body is being checked.
+function tyParamOfOpenBody(p: i32): boolean {
+  const tp = T.tys[p]
+  if tp is TyVar {
+    for owner in cstrOwnerStack {
+      if owner >= 0 && owner < P.nodes.length {
+        const fd = P.nodes[owner]
+        if fd is FuncDecl {
+          for nm in fd.fnTyParams {
+            if nm == tp.tvName { return true }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// A call's deferred join `tyIx` as a union each pin of the body being checked re-joins apart,
+// when `keep` (the callee joins its arms apart, or declares its return) and every member is
+// that body's own parameter; -1 for `collapseDeferredJoin` to decide.
+export function keptParamUnion(tyIx: i32, keep: boolean): i32 {
+  if tyIx < 0 || tyIx >= T.tys.length || !keep || !tpOwnParamsOnly(tyIx) {
+    return -1
+  }
+  const t = T.tys[tyIx]
+  if !(t is TyUnion) { return -1 }
+  const tc = mkUnionTy(t.uMembers)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[tc] = 2
+  noteHoleTpJoin(tc)
+  tc
+}
+
+// Whether union `t`'s members are two or more parameters of the body being checked, declared or
+// holes, and nothing else.
+function tpOwnParamsOnly(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const u = T.tys[t]
+  if !(u is TyUnion) || u.uMembers.length < 2 { return false }
+  for m in u.uMembers {
+    if !tyIsGradualParam(m) || !tyParamOfInnermostBody(m) { return false }
+  }
+  true
+}
+
+// Whether deferred join `tyIx` holds two or more type parameters, or parameter holes, of a body
+// being checked and no other hole: a lambda's join of them, which each instance builds at its pin.
+export function deferredJoinOverOpenParams(tyIx: i32): boolean {
+  if tyIx < 0 || tyIx >= T.tys.length { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(tyIx, ms)
+  const names: string[] = []
+  let hole = false
+  let nul = false
+  for m in ms {
+    if m < 0 || m >= T.tys.length { return false }
+    const mt = T.tys[m]
+    if isNullTy(m) { nul = true }
+    if mt is TyVar {
+      if !gradualParamOfOpenBody(m) { return false }
+      if !tyIsDeclaredParam(m) { hole = true }
+      let seen = false
+      for nm in names {
+        if nm == mt.tvName { seen = true }
+      }
+      if !seen { names.push(mt.tvName) }
+    }
+  }
+  // A hole instance reads a join of holes only through its null (D3616).
+  names.length >= 2 && (nul || !hole)
+}
+
+// A type that is, or wraps, a deferred join — a union still carrying a hole member. It denotes no
+// runtime shape of its own: each call site re-folds it to the single arm that site's pinned
+// argument reaches, so the codegen-support floors that reject a genuine inferred union skip it.
+export function tyIsDeferredJoin(tyIx: i32) {
+  if tyIx < 0 { return false }
+  // A declared parameter's join with a concrete type is a real union, not a placeholder.
+  if tpJoinUnions.length > 0 && tpJoinUnions.has(tyIx) { return false }
+  const t = T.tys[tyIx]
+  if t is TyNullable { return tyIsDeferredJoin(t.nInner) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tyIsHole(t.uMembers[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// A deferred join with a concrete, non-null arm beside its holes (`string | _`): every pin
+// re-folds it to a union wider than the hole alone. False for `_ | null` and for a join of
+// holes only, which a pin may fold to one of its holes (D3125, D3616).
+export function tyIsArmedDeferredJoin(tyIx: i32): boolean {
+  if !tyIsDeferredJoin(tyIx) || tyBearsNull(tyIx) { return false }
+  const t = T.tys[tyIx]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    if !tyIsHole(t.uMembers[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The hole name of parameter `pi` — the parameter's identity across the pass-1 hoist, the
+// body check, and the solve table. A named function keys on its name and position, so the
+// hoisted signature and the body bind the identical hole; an anonymous lambda keys on its
+// node index instead.
+export function paramHoleName(fnName: string, fnIx: i32, pi: i32) {
+  if fnName != "" { return "?" + fnName + "." + i32ToStr(pi) }
+  "?#L" + i32ToStr(fnIx) + "." + i32ToStr(pi)
+}
+
+// Is `name` the hole name of one of `fnIx`'s own parameters? A probe's body reaches
+// other functions' holes too (a callee's un-annotated parameter, a nested function's),
+// and those are not this declaration's to solve.
+export function holeNameIsParamOf(
+  name: string,
+  fnName: string,
+  fnIx: i32,
+  nParams: i32,
+) {
+  let k = 0
+  while k < nParams {
+    if paramHoleName(fnName, fnIx, k) == name { return true }
+    k = k + 1
+  }
+  false
+}
