@@ -1921,7 +1921,7 @@ axis(
 // `fns` functions each binding an un-annotated list `out`, beside one function that assigns
 // its own local `20 * fns` times, named `out` in the many arm and `sink` in the one. A
 // binding's store scan walked its name's occurrences in every frame rather than its own
-// (`cwIxFrHead`, compiler/typecheck.vl; D2688), so the sink's rows cost each binding.
+// (`cwIxFrHead`, compiler/check_write_scan.vl; D2688), so the sink's rows cost each binding.
 const genSharedListName = (fns: number, shared: boolean): string => {
   const o = ["type U = i32 | string"];
   for (let f = 0; f < fns; f++) {
