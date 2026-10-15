@@ -23,7 +23,7 @@
 //
 // @test-timing native
 
-import { binaryen, COMPILER, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
+import { binaryen, COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -210,26 +210,9 @@ Deno.test({
 });
 
 // A REAL pty, because the guard reads `is_terminal()` and a pipe cannot exercise it.
-// Deno has no pty API, so python drives one: it runs `vl build -o -` with stdout on the
-// pty slave and hands back the exit code and everything the terminal received.
-const PTY_DRIVER = `
-import os, pty, subprocess, sys, json
-argv = json.loads(sys.argv[1]); env = dict(os.environ, **json.loads(sys.argv[2]))
-m, s = pty.openpty()
-p = subprocess.Popen(argv, stdout=s, stderr=s, env=env)
-os.close(s)
-buf = b""
-while True:
-    try:
-        c = os.read(m, 65536)
-    except OSError:
-        break
-    if not c:
-        break
-    buf += c
-os.close(m)
-print(json.dumps({"code": p.wait(), "text": buf.decode("utf-8", "replace")}))
-`;
+// Deno has no pty API, so util-linux `script` drives one: it runs the command with stdout
+// on a pty slave, exits with the command's code (`-e`) and prints what the terminal got.
+const shQuote = (s: string): string => `'${s.replaceAll("'", `'\\''`)}'`;
 
 Deno.test({
   name: "vl-cli-build: `-o -` onto a TERMINAL is refused rather than spewed",
@@ -237,14 +220,20 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir, src) => {
       const argv = [VL, "build", src, "-o", "-", "--compiler", COMPILER];
-      const { code, stdout } = await new Deno.Command(pythonBin(), {
-        args: ["-c", PTY_DRIVER, JSON.stringify(argv), JSON.stringify(nativeEnv({ NO_COLOR: "1" }))],
-        cwd: dir,
-        stdout: "piped",
-        stderr: "piped",
-      }).output();
-      if (code !== 0) return; // no usable python — the pipe arms above still gate the feature
-      const r = JSON.parse(new TextDecoder().decode(stdout)) as { code: number; text: string };
+      let run: Deno.CommandOutput;
+      try {
+        run = await new Deno.Command("script", {
+          args: ["-qefc", argv.map(shQuote).join(" "), "/dev/null"],
+          cwd: dir,
+          env: nativeEnv({ NO_COLOR: "1" }),
+          stdin: "null",
+          stdout: "piped",
+          stderr: "piped",
+        }).output();
+      } catch {
+        return; // no `script` on this box — the pipe arms above still gate the feature
+      }
+      const r = { code: run.code, text: new TextDecoder().decode(run.stdout) };
       if (r.code !== 2) {
         throw new Error(`want rc 2 for \`-o -\` onto a tty, got ${r.code}: ${JSON.stringify(r.text)}`);
       }

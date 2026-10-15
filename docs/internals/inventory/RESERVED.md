@@ -94,4 +94,4 @@ D4120-D4129  lane-SC  2026-10-11  function-name aliases the monomorphizer does n
 D4190-D4195  lane-CK  2026-10-12  D1832 ruling (a): D4190, D4191 typed-destination emit gaps; review of #3574: D4192 `??` default, D4193 double diagnostic, D4194 alias-of-list member access (all filed open)
 D4199-D4205  lane-CK  2026-10-12  review of #3577: mixed-literal-union element rep, narrowed-arm writes, index-place compares
 D4300-D4319  lane-SC  2026-10-13  function-value flow table (§(f) step 1) disagreements on silent review witnesses: D4300-D4304 filed open
-D4750-D4753  lane-D4643  2026-10-14  closing D4643: D4750 atom-valued map `??` other-arm default refused by the checker (filed open)
+D4746-D4749  lane-D4720  2026-10-14  closing D4720/D4721 (nullable union and inline-record list literals): none filed
