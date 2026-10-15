@@ -336,6 +336,7 @@ import {
   moduleLocalLetOf,
   moduleLocalLetOfAt,
   moduleLocalLetOfUnique,
+  monoIsGenericDecl,
   nameIsBareMap,
   nameIsClosureArray,
   nameIsClosureArrayTy,
@@ -12046,7 +12047,21 @@ export function uFieldMapShape(vi: i32, fj: i32): i32 {
 // fallback, has no arena input and is not reproduced, so a caller keeps its name path for -1.
 export function rlSlotOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
-  const key = repElemId(ty)
+  const s = rlSlotOfKey(repElemId(ty))
+  if s >= 0 { return s }
+  // A record spelled by shape reads its declared struct's slot when only that one is
+  // interned: same-shape records are one type (D4930).
+  if T.tys[ty] is TyObj {
+    const nom = nominalStructNameOfTy(ty)
+    if nom != "" {
+      const d = declTyIxOfName(nom)
+      if d >= 0 && d != ty { return rlSlotOfKey(repElemId(d)) }
+    }
+  }
+  -1
+}
+
+function rlSlotOfKey(key: i32): i32 {
   if key < 0 { return -1 }
   let i = 0
   while i < rlElemKey.length {
@@ -16009,6 +16024,12 @@ export function unionEqStashSlot2() {
 // so the null test and the payload read share ONE evaluation. `anyref` rather than the
 // niche's own heap, since the box payload is `anyref` and every niche rep is a subtype of it.
 export function nulNicheBoxSlot() { scratchSlot(19, "i32", 0, SCRATCH_BY_CODE) }
+
+// The `anyref` payload stash of a narrowed list read, code 28, parked between its wrapper test
+// and its cast (D4939). Its own code: a niche box may be staged in code 19 around the read.
+export function listPayloadStashSlot() {
+  scratchSlot(28, "i32", 0, SCRATCH_BY_CODE)
+}
 
 // D974 — a struct-heap-typed stash pair, code 16, keyed by struct-table row (the right
 // operand `row + 1024`). A struct union's arm may carry a nested shape field, and that
@@ -36680,6 +36701,17 @@ export function unMemberSetPush(set: string) {
 
 export function isUName(name: string) { unRowOfName(name) >= 0 }
 
+// Names the registered row of a union structurally equal to arena union `ty` by `name` too, so a
+// record's shape spelling and its declared name read one box and one set of tags (D4930). The
+// row, or -1 when no row holds that type.
+export function unNameShareCanonRow(name: string, ty: i32): i32 {
+  if isUName(name) { return unRowOfName(name) }
+  const u = unRowOfCanon(ty)
+  if u < 0 { return -1 }
+  sidArrPut(unRowBySid, sidOf(name), u)
+  u
+}
+
 // The union alias name that owns global variant `vi` (assumes `vi` is a variant of some
 // declared union), or "" if none — interns a ref-list-of-union keyed by the specific
 // union, so `Node[]` and `Ty[]` are distinct table slots.
@@ -40305,13 +40337,16 @@ function unionRowOfTyRaw(ty: i32): i32 {
 }
 
 // The sites whose seam answers from the union KEY instead of the spelling — step 5's switch.
-// A site joins once every reach it has is classified, none is `name-only`, and its modules
-// are proven identical; the rest stay on the name. `docs/internals/registry-by-type-id.md` §5.
+// A site joins once no reach differs and its modules are proven identical; a fallback seam
+// keeps the spelling's answer where the key finds no row. `docs/internals/registry-by-type-id.md` §5.
 function unSiteOnKey(site: i32): boolean {
-  if site == 4 { return true }
-  if site == 8 || site == 9 || site == 12 || site == 21 { return true }
-  if site == 22 || site == 31 || site == 34 || site == 35 { return true }
-  site == 40 || site == 43 || site == 47
+  if site == 3 || site == 4 || site == 8 || site == 9 { return true }
+  if site == 10 || site == 12 || site == 13 || site == 14 { return true }
+  if site == 19 || site == 21 || site == 22 || site == 23 { return true }
+  if site == 30 || site == 31 || site == 32 || site == 33 { return true }
+  if site == 34 || site == 35 || site == 36 || site == 37 { return true }
+  if site == 38 || site == 39 || site == 40 || site == 43 { return true }
+  site == 47
 }
 
 // The ID side's row for `site`: a switched site and harness mode 3 key on `unKey`, anything
@@ -40391,22 +40426,23 @@ export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
   n
 }
 
-// The member-type seam. Mode 2 is an additive retry — it fills `out` from the id-keyed row
-// only where the spelling found none — because the name leg has already appended to `out`
-// by the time the id answer is known, and a seam that both fills and re-fills is measuring
-// its own double write rather than the key.
+// The member-type seam. A switched site with a type reads the key's row when it finds one and
+// the spelling otherwise. Mode 2 is an additive retry: it fills `out` from the id-keyed row
+// only where the spelling found none, since the name leg has already appended to `out` by then.
 function unionMemberTysOfAB(
   site: i32,
   name: string,
   ty: i32,
   out: i32[],
 ): boolean {
-  const r = unionMemberTysOf(name, out)
+  const k = ty >= 0 && unSiteOnKey(site)
   const m = unABOn()
-  if m == 0 { return r }
+  if m == 0 && !k { return unionMemberTysOf(name, out) }
   let d = -1
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  unABProbe(site, unRowOfName(name), d, ty)
+  if m > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if k && d >= 0 { return unionMemberTysOfRow(d, out) }
+  const r = unionMemberTysOf(name, out)
   if m == 2 && !r { return unionMemberTysOfRow(d, out) }
   r
 }
@@ -42862,6 +42898,14 @@ function instAnnTyNameOfExpr(exprIx: i32, fnIx: i32): string {
   ""
 }
 
+// The ref-list slot of a node typed as a list of records, or -1 for any other element: a
+// closure or union element keeps its own storage, which this slot does not describe (D4930).
+function recordListSlotOfNode(exprIx: i32, fnIx: i32): i32 {
+  const el = tyRefArrElemOf(nodeTyInOf(exprIx, fnIx))
+  if el < 0 || el >= T.tys.length || !(T.tys[el] is TyObj) { return -1 }
+  rlSlotOfTy(el)
+}
+
 // The ref-list ELEMENT type-NAME the expression at `exprIx` produces, or "" if it is not
 // a ref list. Mirrors `exprRefArray`'s receiver shapes, resolving the per-element-
 // type table slot (`refListSlotOfExpr`) at every push / index / `.length` / store site.
@@ -43025,7 +43069,13 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       const grs = letRefListSlot(grl, -1)
       if grs >= 0 && grs < rlElemName.length { return rlElemName[grs] }
     }
-    return globalRefArrayName(fnIx, e.identName)
+    const gra = globalRefArrayName(fnIx, e.identName)
+    if gra != "" { return gra }
+    // A box narrowed to a list arm no registered union names (`{x: i32}[]` of a field read
+    // at a pin) reads the arm's row off its narrowed type (D4930).
+    const nrs = recordListSlotOfNode(exprIx, fnIx)
+    if nrs >= 0 && nrs < rlElemName.length { return rlElemName[nrs] }
+    return ""
   }
   if e is Member {
     // The member path's own narrowing first (D1014): a narrowed ref-element arm names the
@@ -43072,6 +43122,11 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
         uk = uk + 1
       }
       return un0
+    }
+    // The field read's twin of the Ident arm's last rung (D4930).
+    if memIsNarrowed(exprIx) {
+      const mrs = recordListSlotOfNode(exprIx, fnIx)
+      if mrs >= 0 && mrs < rlElemName.length { return rlElemName[mrs] }
     }
   }
   // The `?.` twin of the field read above: the chain resolves the receiver's row, and the
@@ -47460,7 +47515,8 @@ function columnListRep(exprIx: i32, fnIx: i32): VKind | null {
 
 // The list rep a call of a named callee returns: its resolved return rep (the i64 list is left
 // to the recorded type), an annotated `f32[]` or `u8[]` return, or a closure value's signature.
-// A generic callee answers nothing: its row is the template's, not this call's instance.
+// A generic callee answers nothing, a hole function included: its row is the template's, not
+// this call's instance.
 function calleeListRep(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is Call {
@@ -47468,12 +47524,7 @@ function calleeListRep(exprIx: i32, fnIx: i32): VKind | null {
     if callee is Ident {
       const sid = sidOfNode(e.callFn)
       const cfi = fnIndexOfAt(sid, fnIx, e.callFn)
-      if cfi >= 0 {
-        const gd = P.nodes[fnStmts[cfi]]
-        if gd is FuncDecl {
-          if gd.fnTyParams.length > 0 { return null }
-        }
-      }
+      if cfi >= 0 && monoIsGenericDecl(fnStmts[cfi]) { return null }
       const rk = gatedListRep(
         repOfNameResult(sid, callee.identName, fnIx, e.callFn).rdKind,
         "callee-return",

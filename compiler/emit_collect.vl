@@ -60,7 +60,9 @@ import {
   inferRetRowOf,
   isBoolLitExpr,
   isTransparentAlias,
+  isVarTyIxOf,
   letNullHoleFilledTy,
+  listDisjointDepth,
   nameMentionsGenAliasParam,
   nodeArrayElemName,
   nodeRepTyIxOf,
@@ -321,6 +323,7 @@ import {
   cboxReadTy,
   cloLiftCapN,
   cloLiftWrReset,
+  cloLiftedFes,
   cloSigBase,
   cloSigKeys,
   cloSigRepFn,
@@ -441,6 +444,7 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  monoProgStmts,
   mvKeyKind,
   mvMapTypeIdx,
   mvRlSlot,
@@ -856,6 +860,7 @@ import {
   uVarSTwinAt,
   uVariantsPush,
   unMemberSetPush,
+  unNameShareCanonRow,
   unNamesPush,
   unRowOfCanon,
   unVarSliceAdoptKeySibling,
@@ -2482,6 +2487,7 @@ export function collectFns(stmts: i32[]) {
   fnParent = []
   fnInstOrigin = []
   cloLiftCapN = []
+  cloLiftedFes = []
   cloLiftWrReset()
   lfReset()
   globalStmts = []
@@ -5982,6 +5988,38 @@ function forceAnnLeafReps(a: string): i32 {
   0
 }
 
+// `forceAnnLeafReps` for the list type `kTy`, read off its arena element: a scalar element
+// list reserves its backing, and any other list reserves nothing here.
+function forceListLeafRepsOfTy(kTy: i32): i32 {
+  const k = T.tys[kTy]
+  if !(k is TyArray) || k.aElem < 0 || k.aElem >= T.tys.length { return 0 }
+  const e = T.tys[k.aElem]
+  if !(e is TyPrim) { return 0 }
+  match e.primName {
+    "string" => {
+      slUsed = true
+      aUsed = true
+    }
+    "f64" => {
+      fa64Used = true
+    }
+    "i64" => {
+      ia64Used = true
+    }
+    "f32" => {
+      fa32Used = true
+    }
+    "i32" | "boolean" => {
+      lUsed = true
+      aUsed = true
+    }
+    "void" | "null" | "never" | "u8" | "v128" => {
+      // Not an element `forceAnnLeafReps` reserves a backing for.
+    }
+  }
+  0
+}
+
 // Reserve the reps a generic application's type arguments need. They are invisible to every
 // branch of `collectA`'s `TypeRef` ladder, since the whole spelling `Box<string>` is one name, so
 // without this `aTypeIdx` names whatever heap type sits at an index never allocated. Flag-only
@@ -6893,6 +6931,21 @@ export function collectA(_stmts: i32[]) {
       // An if-EXPRESSION whose arms join to a value union the program declares nowhere; the
       // `TyUnion` test is what keeps a `T | null` join out, whose rep is the niche (D1745).
       markInferredJoinAtoms(nodeTyIxOf(i))
+    } else if nd is IsExpr {
+      // An `is K[]` over a list whose elements can never be `K` hands its arm an empty `K[]`
+      // (D4911), a list no annotation or literal of the program need have built.
+      const kTy = isVarTyIxOf(i)
+      const rTy = nodeTyIxOf(nd.isObj)
+      // A receiver still typed by a type parameter is an instance's, whose binding may be one,
+      // for a union or nullable receiver as well (D4912).
+      if kTy >= 0 && kTy < T.tys.length && rTy >= 0 && rTy < T.tys.length {
+        if (
+          listDisjointDepth(rTy, kTy) == 1
+          || (T.tys[kTy] is TyArray && tyHasTyVar(rTy))
+        ) {
+          forceListLeafRepsOfTy(kTy)
+        }
+      }
     }
     i = i + 1
   }
@@ -7086,6 +7139,9 @@ function internJoinedRecordRow(ix: i32) {
 
 export function collectAnnShapes() {
   const joins = recordJoinSeen()
+  if monoGradualRetPinned && emitPhaseReached("monomorphized") {
+    shareObjLitFieldUnionRows()
+  }
   let ti = 0
   while ti < P.nodes.length {
     const tn = P.nodes[ti]
@@ -7131,6 +7187,56 @@ export function collectAnnShapes() {
   0
 }
 
+// Names union field type `ft`'s spelling onto the registered row of the same union. The
+// spelling when no row holds that union, so the caller can register one, else "" (D4930).
+function shareFieldUnionRow(ft: i32): string {
+  const fun = tyToEmitName(ft)
+  if fun == "" || unNameShareCanonRow(fun, ft) >= 0 { return "" }
+  fun
+}
+
+// Names each concrete record literal's union field spelling onto the registered row of the same
+// union, ahead of any pass that codes the record's fields (D4930).
+function shareObjLitFieldUnionRows() {
+  const nLim = P.nodes.length
+  let li = 0
+  while li < nLim {
+    if P.nodes[li] is ObjLit {
+      const lt = nodeTyIxOf(li)
+      if lt >= 0 && lt < T.tys.length && !tyHasTyVar(lt) {
+        const o = T.tys[lt]
+        if o is TyObj {
+          for ft in o.objFieldTypes {
+            if (
+              ft >= 0
+              && ft < T.tys.length
+              && T.tys[ft] is TyUnion
+              && !tyIsLitUnion(ft)
+            ) {
+              shareFieldUnionRow(ft)
+            }
+          }
+        }
+      }
+    }
+    const tr = P.nodes[li]
+    if tr is TypeRef {
+      const at = nodeTyIxOf(li)
+      if (
+        at >= 0
+        && at < T.tys.length
+        && T.tys[at] is TyUnion
+        && !tyHasTyVar(at)
+        && !tyIsLitUnion(at)
+      ) {
+        if !isUName(tr.tyName) { unNameShareCanonRow(tr.tyName, at) }
+      }
+    }
+    li = li + 1
+  }
+  0
+}
+
 // Interns the row of concrete record literal `ix` when a field of its recorded type is a union,
 // whose box exists by now. A spelling that already resolves to a row is left to it (D1694).
 function mintUnionFieldObjRow(ix: i32) {
@@ -7150,7 +7256,20 @@ function mintUnionFieldObjRow(ix: i32) {
       if boxed && !tyIsLitUnion(ft) {
         if tyHasTyVar(lt) { return 0 }
         const nm = tyToEmitName(lt)
-        if structIndexOfTypeName(nm) < 0 { internShapeDeepTy(nm, lt) }
+        if structIndexOfTypeName(nm) < 0 {
+          // An instance registers its return at the pin's spelling (`P[] | i32[]`) while the
+          // record renders the same union by shape, so the shape spelling names that row, or
+          // a row of its own where no instance registered one (D4930).
+          if fu is TyUnion {
+            const fun = shareFieldUnionRow(ft)
+            if fun != "" {
+              const before = uVariants.length
+              if registerInlineUnion(monoProgStmts, fun) < 0 { return -1 }
+              if uVariants.length != before { assignTags() }
+            }
+          }
+          internShapeDeepTy(nm, lt)
+        }
         return 0
       }
     }

@@ -505,6 +505,29 @@ import {
   zeroBytesFixIx,
 } from "./check_mismatch_notes"
 import {
+  ctnLitBindPopTo,
+  ctnLitBindReset,
+  markCtnLitBinding,
+} from "./check_ctn_lit_bind"
+import {
+  LW_INFERRED,
+  callPassesList,
+  exprIsCollCtorCall,
+  fnDeclRetHasTyVar,
+  listOriginExpr,
+} from "./check_list_origin"
+import {
+  matchHeadsReset,
+  noteIntMatchHead,
+  noteMatchScrut,
+} from "./check_match_heads"
+import {
+  a20RetWalk,
+  njFnReached,
+  njGateReset,
+  njMatchDesugared,
+} from "./check_nj_gate"
+import {
   PrimName,
   RC_ELEM,
   RC_FIELD,
@@ -601,7 +624,6 @@ import {
   tyArrayElemIx,
   tyBearsNull,
   tyBuiltinIndexable,
-  tyContainsList,
   tyDeeperThan,
   tyDenotesObj,
   tyDidYouMean,
@@ -901,7 +923,6 @@ import {
   cwRootNames,
   cwSplits,
   cwUfcsDeclOf,
-  cwUseStoreNode,
   cwWriteAts,
   declFirstParamIsSelf,
   fnDeclIx,
@@ -1699,6 +1720,9 @@ import {
   callDeclFnIx,
   calleeNameOf,
   calleeReset,
+  cbPendClear,
+  cbPendNames,
+  cbPendTys,
   crIsDispatchSite,
   findFnDeclIn,
   mapMethodNames,
@@ -1713,6 +1737,7 @@ import {
   opIdxSiteNode,
   opSiteArgs,
   opSiteDecls,
+  recvTyOf,
 } from "./check_callee"
 import {
   covarRootFreshLocal,
@@ -1906,11 +1931,6 @@ export function njSetPinFn(fx: i32): i32 {
   njPinFn = fx
   was
 }
-// Names a call can reach other than directly from a concrete context (`njGateScan`), once per program.
-let njGateNames: {[string]: boolean} = Map()
-let njGateScanned = false
-// The arena prefix `njGateScan` has read.
-let njGateSeen = 0
 let njGateMemo: {[i32]: boolean} = Map()
 // The held-back call nodes `njExprHeld` answers for.
 let njHeldNodes: {[i32]: boolean} = Map()
@@ -2005,6 +2025,10 @@ let ovFnValDecl: i32[] = []
 let ovFnValName: string[] = []
 // The element type a named `map`/`filter` callback is typed by, keyed on its `Ident` node.
 let ovCbElem: {[i32]: i32} = Map()
+// The element narrowing a `map`/`filter` callback's parameter or a `for` variable starts with,
+// keyed on the callback or the loop (`elemFactFor`); a leaf of -1 is none.
+let efLeaf: {[i32]: i32} = Map()
+let efSteps: {[i32]: i32} = Map()
 // The function a local `let`/`const` is declared in, and the binding a plain `x = e` write stores
 // into, keyed on `e`: what a pin asks to tell whether a call can reach the written value.
 let letDeclFn: {[i32]: i32} = Map()
@@ -2089,11 +2113,6 @@ let collRetFnNodes: i32[] = []
 // function's binding. Depth-tagged sparse rows, read through `lookupDepth` exactly like `collBind`.
 let objLitBindDepth: i32[] = []
 let objLitBindName: string[] = []
-// The same rows for an un-annotated `const` bound to a list, object or map literal, with its
-// initializer: the readonly-only list rule follows such a name to the literal it names.
-let ctnLitBindDepth: i32[] = []
-let ctnLitBindName: string[] = []
-let ctnLitBindInit: i32[] = []
 // The same rows for an un-annotated `let`/`const` whose initializer is a lambda with no return
 // annotation: a function-value mismatch reading the name finds the lambda through them.
 let fnLitBindDepth: i32[] = []
@@ -4322,12 +4341,6 @@ let bodyChecked: {[string]: boolean} = Map()
 // Un-annotated bindings whose initializer is a `??` or an `if` join, the only ones the emitter
 // may pin to a list union (D2844). Appended per checked binding; a repeat is harmless.
 export let letJoinCandidates: i32[] = []
-// The `IfStmt` heads `desugarMatchAt` built from an INTEGER `match` (1 at the head's index),
-// the one chain shape the emitter may lower to a `br_table` (`intMatchHeadAt`).
-let intMatchHead: {[i32]: boolean} = Map()
-// The scrutinee nodes `desugarMatchAt` shared across a chain's arm tests: one node per `match`,
-// so its recorded type is the last arm's and says nothing about any one test (`matchScrutAt`).
-let matchScrutNode: {[i32]: boolean} = Map()
 // A `const` arm pattern (D3271): the pattern node, rewritten to a read of the constant, to the
 // literal node of that constant's initializer, where its value is read (`matchConstPatLitAt`).
 let matchConstPatLit: {[i32]: i32} = Map()
@@ -5056,9 +5069,7 @@ export function initChecker() {
   hdReset()
   guardAltStack = []
   joinHoleUnions = []
-  njGateNames = Map()
-  njGateScanned = false
-  njGateSeen = 0
+  njGateReset()
   njGateMemo = Map()
   njHeldNodes = Map()
   njFnIx = -1
@@ -5133,6 +5144,8 @@ export function initChecker() {
   ovFnValDecl = []
   ovFnValName = []
   ovCbElem = Map()
+  efLeaf = Map()
+  efSteps = Map()
   letDeclFn = Map()
   wrDstDecl = Map()
   ufcsMissAt = []
@@ -5201,8 +5214,7 @@ export function initChecker() {
   bodyChecked = Map()
   nodeTyIx = []
   nodeTyWrites = nodeTyWrites + 1
-  intMatchHead = Map()
-  matchScrutNode = Map()
+  matchHeadsReset()
   matchConstPatLit = Map()
   cmpConstLit = Map()
   matchPatRefused = Map()
@@ -6024,6 +6036,7 @@ function callInvalidatesReal(cn: Call, callIx: i32, key: string) {
       }
     }
   }
+  if declIx == -2 && pushKeepsElemOnly(cn, key) { return false }
   // An intrinsic writes only through its own effect on a receiver that may alias the path, and
   // through the function values it is handed and may run.
   if declIx == -2 && !ALIAS_RULE_BROAD {
@@ -6418,9 +6431,17 @@ function retireAliasedNarrowings(
     const hidden = narrowedPathIx(k) != i
     const apart = recvFresh && kRoot != recvName && !hidden
     const skip0 = kRoot != recvName && !hidden && crSoleRefBinding(kRoot)
+    const keeps = (!hidden
+      && elemOnlyStoreKeeps(
+      i,
+      subscriptDepthOf(tgtIx),
+      asgRhsIx(atIx),
+      rt,
+    ))
     const hits = !own
       && !fam
       && !apart
+      && !keeps
       && aliasWriteHitsKey(shape, recvTy, skip0, rt, k, npTys[i])
     if hits && npInvBy[i] >= 0 && i >= crFnNpBase() {
       // Already retired, typically by a sibling arm's write: the kill still ends this path,
@@ -6819,6 +6840,8 @@ function retireNarrowingsForWrite(
     const root = indexRootKeyOf(tgtIx)
     if root == "" { return 0 }
     const pfx = root + "["
+    const depth = subscriptDepthOf(tgtIx)
+    const val = asgRhsIx(atIx)
     let r = 0
     while r < npKeys.length {
       // A store through a list narrowed by name is checked against its narrowed element.
@@ -6826,6 +6849,7 @@ function retireNarrowingsForWrite(
         keyHasPrefix(npKeys[r], pfx)
         && !(keyHasPrefix(npKeys[r], root + LIST_EVERY_STEP)
           && narFitNameOf(r) != "")
+        && !(placeRootOf(npKeys[r]) == root && elemOnlyStoreKeeps(r, depth, val, rt))
       ) {
         let rprev = -1
         if npInvBy[r] < 0 { rprev = npTys[r] }
@@ -8058,24 +8082,33 @@ function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     }
     return hit
   }
-  if !(s is Ident) { return false }
-  const name = s.identName
+  // The list itself, or a row of it still a list (`b[0]` under `b is K[][]`, D4945).
+  const pfx = elemRecvPrefix(ix)
+  if pfx == "" { return false }
+  const name = placeRootOf(pfx)
+  const rows = (pfx.length - name.length) / LIST_EVERY_STEP.length
   const slot = elemEverySlotOf(name)
   if slot < 0 || npInvBy[slot] >= 0 { return false }
   const key = npKeys[slot]
   const leaf = npTys[slot]
-  const depth = (key.length - name.length) / LIST_EVERY_STEP.length
+  const depth = (key.length - name.length) / LIST_EVERY_STEP.length - rows
+  if depth <= 0 { return false }
   const byName = narFitNameOf(slot) != ""
   if byName && !assignable(srcTy, dstTy) { return false }
   if !byName && !listLeafFits(leaf, dstTy, depth) { return false }
   let decl = narDeclaredTy(name, -1)
   if decl < 0 { decl = lookup(name) }
+  let r = 0
+  while r < rows && decl >= 0 {
+    decl = placeElemTy(listUnionWidest(nonNullTy(decl)))
+    r = r + 1
+  }
   if decl < 0 || assignable(decl, dstTy) { return false }
-  let copy = "'" + name + ".map((x) => x)'"
-  if !byName { copy = "a 'map' over '" + name + "'" }
+  const text = narRowText(ix)
+  const copy = "'" + text + mapCopyText(depth) + "'"
   tErr(
     "'"
-      + name
+      + text
       + "' is narrowed by `is` only for reading its elements; it is still declared "
       + tyToStr(decl)
       + " and a later write may widen it, so it cannot be delivered as "
@@ -8085,6 +8118,45 @@ function narListDeliveryErr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     ix,
   )
   true
+}
+
+// The list `ix` reads (a name, or a subscript chain over one) as a message spells it: a literal
+// or named subscript as written, any other as `[…]`.
+function narRowText(ix: i32): string {
+  const p = peelParenIx(ix)
+  if p < 0 || p >= P.nodes.length { return "" }
+  const n = P.nodes[p]
+  if n is Ident { return n.identName }
+  if !(n is Index) { return "" }
+  const k = P.nodes[peelParenIx(n.idxIndex)]
+  const sub = if k is NumLit { k.numText } else if k is Ident { k.identName } else { "…" }
+  narRowText(n.idxArr) + "[" + sub + "]"
+}
+
+// The `.map(…)` that copies a list `depth` lists deep whose elements are narrowed: one `map` per
+// level, so no inner list of the narrowed one is shared with the copy.
+function mapCopyText(depth: i32): string {
+  const vars = ["x", "r", "q", "p"]
+  let text = ".map((x) => x)"
+  let k = 1
+  while k < depth {
+    let v = "e" + i32ToStr(k)
+    if k < vars.length { v = vars[k] }
+    text = ".map((" + v + ") => " + v + text + ")"
+    k = k + 1
+  }
+  text
+}
+
+// `[]` once per list level, `depth` of them.
+function mapBracketsText(depth: i32): string {
+  let text = ""
+  let k = 0
+  while k < depth {
+    text = text + "[]"
+    k = k + 1
+  }
+  text
 }
 
 // The innermost overlay slot holding an element entry of the bare name `name` (`name[*]…`),
@@ -8834,6 +8906,71 @@ function elemKeyStoresChecked(key: string): boolean {
   i >= 0 && narFitNameOf(i) != ""
 }
 
+// Whether a store of the value `valIx` (typed `rt` once checked, -1 before) into a cell `depth`
+// subscripts below its list's name keeps the element-only entry in `slot` (`pushElemReadFact`):
+// a store at the entry's own depth of a value its leaf admits.
+function elemOnlyStoreKeeps(
+  slot: i32,
+  depth: i32,
+  valIx: i32,
+  rt: i32,
+): boolean {
+  if slot < 0 || slot >= npKeys.length || narFitNameOf(slot) != "" {
+    return false
+  }
+  const key = npKeys[slot]
+  const leaf = npTys[slot]
+  if leaf < 0 || !keyIsListEvery(key) || key.indexOf(".") >= 0 { return false }
+  if (key.length - placeRootOf(key).length) / LIST_EVERY_STEP.length != depth {
+    return false
+  }
+  let vt = loopWritePeekTy(valIx, leaf)
+  if vt < 0 { vt = rt }
+  vt >= 0 && !tyIsHole(vt) && !tyHasTyVar(vt) && assignable(vt, leaf)
+}
+
+// Whether the call `cn` is a `push` of values the element-only entry `key` admits onto a list at
+// its depth (`elemOnlyStoreKeeps`), which keeps the entry.
+function pushKeepsElemOnly(cn: Call, key: string): boolean {
+  const cf = P.nodes[cn.callFn]
+  if !(cf is Member) || cn.callArgs.length == 0 || cf.memProp != "push" {
+    return false
+  }
+  const slot = narrowedPathIx(key)
+  const depth = subscriptDepthOf(cf.memObj)
+  if slot < 0 || depth < 0 { return false }
+  if placeRootOf(elemRecvPrefix(cf.memObj)) != placeRootOf(key) { return false }
+  for a in cn.callArgs {
+    if spreadArgOf(a) >= 0 { return false }
+    if !elemOnlyStoreKeeps(slot, depth + 1, a, nodeTyOf(a)) { return false }
+  }
+  true
+}
+
+// The value a plain `=` assignment at `atIx` stores, or -1 for any other node.
+function asgRhsIx(atIx: i32): i32 {
+  if atIx < 0 || atIx >= P.nodes.length { return -1 }
+  const an = P.nodes[atIx]
+  if an is BinExpr {
+    if an.binOp == "=" { return an.binRight }
+  }
+  -1
+}
+
+// How many subscripts the place `ix` reads below a bare name (`b[i][j]` is 2), or -1.
+function subscriptDepthOf(ix: i32): i32 {
+  let d = 0
+  let cur = peelParenIx(ix)
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Ident { return d }
+    if !(n is Index) { return -1 }
+    d = d + 1
+    cur = peelParenIx(n.idxArr)
+  }
+  -1
+}
+
 // `crFirstWritingCall` for an element entry `key`: a `push` on a list narrowed by name is
 // checked against its narrowed element, so only its arguments are asked.
 function crFirstElemWritingCall(ix: i32, key: string): i32 {
@@ -8850,6 +8987,7 @@ function crFirstElemWritingCall(ix: i32, key: string): i32 {
           && elemKeyStoresChecked(key))
       }
     }
+    if !own { own = pushKeepsElemOnly(n, key) }
   }
   if !own && (n is Call || crIsDispatchSite(ix)) {
     if callMayWrite(ix, key) { return ix }
@@ -8871,7 +9009,11 @@ function crFirstElemWritingCall(ix: i32, key: string): i32 {
 // A loop re-runs the reads before a call after it, so a narrowing live at the loop that a call
 // anywhere in the loop may end ends before the loop starts, in both halves.
 function crLoopPreRetire(loopIx: i32) {
-  if npKeys.length > 0 { crLoopPathPreRetire(loopIx) }
+  if npKeys.length > 0 {
+    cbPendForLoop(loopIx)
+    crLoopPathPreRetire(loopIx)
+    cbPendClear()
+  }
   if asgDeclKeys.length == 0 { return 0 }
   const names = crLiveNames()
   let i = 0
@@ -8888,6 +9030,49 @@ function crLoopPreRetire(loopIx: i32) {
     i = i + 1
   }
   0
+}
+
+// Before a `for` over a list is checked, gives its variable the element type the declared list
+// holds, and the callbacks in its body their parameters' (`cbPendCollect`), so a method called on
+// one resolves to the built-in rather than an opaque writer.
+function cbPendForLoop(loopIx: i32) {
+  cbPendClear()
+  const n = P.nodes[loopIx]
+  if !(n is ForIn) { return 0 }
+  const lt = placeDeclListTy(n.fiIter)
+  if lt < 0 { return 0 }
+  const la = T.tys[lt]
+  if !(la is TyArray) || la.aElem < 0 { return 0 }
+  const bound: string[] = []
+  fnBoundNames(loopIx, bound)
+  let seen = 0
+  for b in bound {
+    if b == n.fiVar { seen = seen + 1 }
+  }
+  if seen != 1 { return 0 }
+  cbPendNames.push(n.fiVar)
+  cbPendTys.push(la.aElem)
+  cbPendCollect(n.fiBody, bound)
+  0
+}
+
+// The declared, non-null list type of the place `ix` names — a binding, or a subscript chain
+// over one — before it is checked, or -1.
+function placeDeclListTy(ix: i32): i32 {
+  const p = peelParenIx(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = P.nodes[p]
+  if n is Ident {
+    const t = lookup(n.identName)
+    if t < 0 { return -1 }
+    return nonNullTy(t)
+  }
+  if !(n is Index) { return -1 }
+  const inner = placeDeclListTy(n.idxArr)
+  if inner < 0 { return -1 }
+  const it = T.tys[inner]
+  if !(it is TyArray) || it.aElem < 0 { return -1 }
+  nonNullTy(it.aElem)
 }
 
 // The path twin: a live path narrowing a write in the loop may leave ends before the loop,
@@ -9014,6 +9199,10 @@ function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
   let same = false
   if t is Member { same = last == "." + t.memProp }
   if t is Index {
+    const ks = narrowedPathIx(key)
+    if ks >= 0 && elemOnlyStoreKeeps(ks, subscriptDepthOf(tgt), val, -1) {
+      return false
+    }
     // A store through a list narrowed by name is checked against its narrowed element.
     if last == LIST_EVERY_STEP && steps.length == 1 {
       const ra = P.nodes[peelParenIx(t.idxArr)]
@@ -9400,7 +9589,17 @@ function crMisuseNote(msg: string, at: i32): string {
   let i = crRdRet.length - 1
   while i >= 0 {
     const r = crRdRet[i]
-    const nm = crRetNames[r]
+    // An element entry (`v[*]`) is named as its list narrowed whole (`v` to `K[]`).
+    let nm = crRetNames[r]
+    let narText = tyToStr(crRetNarTys[r])
+    if keyIsListEvery(nm) && nm.indexOf(".") < 0 {
+      const root = placeRootOf(nm)
+      narText = narText
+        + mapBracketsText(
+        (nm.length - root.length) / LIST_EVERY_STEP.length,
+      )
+      nm = root
+    }
     const hit = crSpans(at, crRdIx[i])
       || (crRetWideTys[r] >= 0
       && msg.indexOf(tyToStr(crRetWideTys[r])) >= 0)
@@ -9410,7 +9609,7 @@ function crMisuseNote(msg: string, at: i32): string {
       return " — '"
         + nm
         + "' is no longer narrowed to "
-        + tyToStr(crRetNarTys[r])
+        + narText
         + ": "
         + crCallDesc(crRetCalls[r], true)
         + where
@@ -10306,6 +10505,27 @@ function pushElemReadFact(
   0
 }
 
+// Whether `xs is chk` over the single list `cur` (or `cur | null`) narrows only its literal-set
+// leaf, which keeps its storage: the name keeps its list type, since narrowed by name it would be
+// delivered as `chk` while still holding what `cur` may store.
+function listNarrowsElemsOnly(cur: i32, chk: i32): boolean {
+  const d0 = nonNullTy(cur)
+  let d = d0
+  let n = chk
+  if d < 0 || n < 0 || tyHasTyVar(d) || !(T.tys[d] is TyArray) { return false }
+  while d >= 0 && n >= 0 && T.tys[d] is TyArray && T.tys[n] is TyArray {
+    const da = T.tys[d]
+    const na = T.tys[n]
+    if da is TyArray && na is TyArray {
+      d = da.aElem
+      n = na.aElem
+    }
+  }
+  if d < 0 || n < 0 || tySame(d, n) || !assignable(n, d) { return false }
+  if listFitLitLeafOf(chk, d0, []) < 0 { return false }
+  listFitNarrowKeepsRep(cur, chk)
+}
+
 function pushNarrowFact(placeIx: i32, ty: i32, names: string[], tys: i32[]) {
   if ty < 0 { return 0 }
   const key = placeKeyOf(placeIx)
@@ -10557,6 +10777,15 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
         ) {
           pushElemReadFact(isPl, isCur, tIdx, names, tys)
         }
+      } else if (
+        tIdx >= 0
+        && P.nodes[peelParenIx(isPl)] is Ident
+        && listNarrowsElemsOnly(isCur, tIdx)
+      ) {
+        // A list keeps its declared type and narrows its element reads (ruling (c), D4945).
+        const nn = nonNullNarrowTy(isCur)
+        if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
+        pushElemReadFact(isPl, isCur, tIdx, names, tys)
       } else if (
         tIdx >= 0
         && recFitNarrowKeepsRep(isCur, tIdx)
@@ -11265,9 +11494,7 @@ function isvalReset() {
   collBindName = []
   objLitBindDepth = []
   objLitBindName = []
-  ctnLitBindDepth = []
-  ctnLitBindName = []
-  ctnLitBindInit = []
+  ctnLitBindReset()
   numLitBindDepth = []
   numLitBindName = []
   numLitBindDecl = []
@@ -11324,29 +11551,6 @@ function bindingIsObjLit(name: string) {
   bindMarkHas(objLitBindDepth, objLitBindName, name)
 }
 
-// Mark an un-annotated literal `const` (see `letDeclIsUnannotCtnLit`) with its initializer.
-function markCtnLitBinding(name: string, depth: i32, init: i32) {
-  bindMarkPush(ctnLitBindDepth, ctnLitBindName, name, depth)
-  ctnLitBindInit.push(init)
-}
-
-// The initializer of the literal `const` `name` resolves to, or -1 when it resolves to anything
-// else. Paired by depth exactly as `bindMarkHas` is, so shadowing holds.
-function ctnLitInitOf(name: string): i32 {
-  if ctnLitBindName.length == 0 { return -1 }
-  const d = lookupDepth(name)
-  if d < 0 { return -1 }
-  let i = ctnLitBindName.length - 1
-  while i >= 0 {
-    if ctnLitBindName[i] == name && ctnLitBindDepth[i] == d {
-      if i < ctnLitBindInit.length { return ctnLitBindInit[i] }
-      return -1
-    }
-    i = i - 1
-  }
-  -1
-}
-
 // Is `ix` a `const` with no annotation and a list, object or `Map()`/`Set()` initializer? A
 // `let` may be re-pointed at any list, so its initializer says nothing about its value.
 function letDeclIsUnannotCtnLit(ix: i32): boolean {
@@ -11359,16 +11563,6 @@ function letDeclIsUnannotCtnLit(ix: i32): boolean {
     if iv is ArrayLit { return true }
     if iv is ObjLit { return true }
     return exprIsCollCtorCall(n.letInit)
-  }
-  false
-}
-
-// Is `ix` a bare `Map()` / `Set()` constructor call?
-function exprIsCollCtorCall(ix: i32): boolean {
-  const iv = P.nodes[ix]
-  if iv is Call {
-    const cn = P.nodes[iv.callFn]
-    if cn is Ident { return cn.identName == "Map" || cn.identName == "Set" }
   }
   false
 }
@@ -11391,8 +11585,7 @@ function collBindPopTo(depth: i32) {
   lbiPopTo(depth)
   bindMarkPopTo(collBindDepth, collBindName, depth)
   bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
-  bindMarkPopTo(ctnLitBindDepth, ctnLitBindName, depth)
-  while ctnLitBindInit.length > ctnLitBindName.length { ctnLitBindInit.pop() }
+  ctnLitBindPopTo(depth)
   // Tested inline: a module-level literal keeps this table non-empty in nearly every scope.
   const nl = numLitBindDepth.length
   if nl > 0 && numLitBindDepth[nl - 1] >= depth {
@@ -14623,17 +14816,6 @@ export function njFnGated(fx: i32): boolean {
   g
 }
 
-// Whether every join in function `fx` is master's: it is reached from a lambda body, by value,
-// recursively, or from a generic or hole body that is itself reached so (`njGateScan`).
-export function njFnReached(fx: i32): boolean {
-  if fx < 0 || fx >= P.nodes.length { return false }
-  const fn = P.nodes[fx]
-  if !(fn is FuncDecl) { return false }
-  if fn.fnName == "" { return true }
-  if !njGateScanned { njGateScan() }
-  njGateNames.get(fn.fnName) ?? false
-}
-
 // Whether expression `ix` is the result of a call `njFnGated` holds back, or a name bound
 // only from one: its members are master's widening, so an operator, conversion or delivery the
 // rule adds is refused over it, as there. A union a direct join produced is never held.
@@ -14769,165 +14951,6 @@ function njRetSetHeld(body: i32): boolean {
     }
   }
   false
-}
-
-// Records every name read other than as a call's callee or as a member, every function that
-// mentions itself, every name mentioned in a lambda body or in a gated generic or hole body, and
-// every name such an ungated body mentions other than a helper `njHelperShapeOk` admits: that
-// helper's kept-apart return each pin of the caller re-joins (D3589).
-function njGateScan() {
-  njGateScanned = true
-  const callee: {[i32]: boolean} = Map()
-  const reads: i32[] = []
-  const openNames: string[] = []
-  const openBodies: i32[] = []
-  let i = njGateSeen
-  while i < P.nodes.length {
-    const n = P.nodes[i]
-    if n is Call {
-      callee[n.callFn] = true
-    } else if n is Ident {
-      reads.push(i)
-    } else if n is Member {
-      njGateNames[n.memProp] = true
-    } else if n is FuncDecl {
-      let open = n.fnTyParams.length > 0
-      for pi in n.fnParams {
-        const pn = P.nodes[pi]
-        if pn is Param {
-          if pn.parType < 0 { open = true }
-        }
-      }
-      njGateBody(n.fnBody, n.fnName == "", n.fnName)
-      if open && n.fnName != "" {
-        openNames.push(n.fnName)
-        openBodies.push(n.fnBody)
-        njGateHelpers(n.fnBody)
-      }
-    }
-    i = i + 1
-  }
-  njGateSeen = P.nodes.length
-  for r in reads {
-    if !(callee.get(r) ?? false) {
-      const rn = P.nodes[r]
-      if rn is Ident { njGateNames[rn.identName] = true }
-    }
-  }
-  // To a fixpoint: an open body gates every name it mentions once its own function is gated.
-  const done: boolean[] = []
-  for _ in openNames { done.push(false) }
-  let grew = true
-  while grew {
-    grew = false
-    let k = 0
-    while k < openNames.length {
-      if !done[k] && (njGateNames.get(openNames[k]) ?? false) {
-        done[k] = true
-        grew = true
-        njGateBody(openBodies[k], true, openNames[k])
-      }
-      k = k + 1
-    }
-  }
-  0
-}
-
-// Records each name body `ix` mentions other than a helper `njHelperShapeOk` admits.
-function njGateHelpers(ix: i32) {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is Ident {
-        if !njHelperShapeOk(n.identName) { njGateNames[n.identName] = true }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  0
-}
-
-// Whether top-level function `name` yields only its own parameters, each through `return` or a
-// tail `if`/`else` chain, with no `match` in its body: the shape whose return a call keeps as a
-// union of the caller's parameters (`keptParamUnion`).
-function njHelperShapeOk(name: string): boolean {
-  const d = fnDeclIx[name] ?? -1
-  if d < 0 || d >= P.nodes.length { return false }
-  const fn = P.nodes[d]
-  if !(fn is FuncDecl) { return false }
-  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length || njBodyHasMatch(fn.fnBody) {
-    return false
-  }
-  const ps: string[] = []
-  for pi in fn.fnParams {
-    const pn = P.nodes[pi]
-    if pn is Param { ps.push(pn.parName) }
-  }
-  const vals: i32[] = []
-  collectValuedReturns(fn.fnBody, vals)
-  const b = P.nodes[fn.fnBody]
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  vals.push(b.blkStmts[b.blkStmts.length - 1])
-  for v in vals {
-    const leaves: i32[] = []
-    tailValueLeaves(v, leaves)
-    for l in leaves {
-      const ln = P.nodes[l]
-      if !(ln is Ident) || !strListHas(ps, ln.identName) { return false }
-    }
-  }
-  true
-}
-
-// Whether body `ix` holds a `match`, before or after `desugarMatchAt` lowered it.
-function njBodyHasMatch(ix: i32): boolean {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      if P.nodes[at] is MatchExpr || njMatchDesugared(at) { return true }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  false
-}
-
-// Whether node `at` is an `if` link `desugarMatchAt` built.
-function njMatchDesugared(at: i32): boolean {
-  if intMatchHead.get(at) ?? false { return true }
-  const n = P.nodes[at]
-  if !(n is IfStmt) { return false }
-  const c = cwPeel(n.ifCond)
-  if c < 0 || c >= P.nodes.length { return false }
-  if matchScrutNode.get(c) ?? false { return true }
-  for k in nodeChildren(c) {
-    if k >= 0 && (matchScrutNode.get(cwPeel(k)) ?? false) { return true }
-  }
-  false
-}
-
-// Walks body `ix`: every name it mentions when `open`, else only `self`.
-function njGateBody(ix: i32, open: boolean, self: string) {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is Ident {
-        if open || n.identName == self { njGateNames[n.identName] = true }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  0
 }
 
 // `joinArmTys` of an arm typed `a` beside one typed `b`, where `aLit`/`bLit` say an arm's every
@@ -18393,7 +18416,7 @@ function nameToTy(name: string) {
 function pushDistinctVariantTy(out: i32[], ty: i32) {
   let i = 0
   while i < out.length {
-    if sameVariantTy(ty, out[i]) { return 0 }
+    if sameVariantTy(ty, out[i]) && !annArmsPart(ty, out[i]) { return 0 }
     i = i + 1
   }
   out.push(ty)
@@ -18508,7 +18531,7 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
   let dj = 0
   while dj < members.length {
     const kept = members[dj]
-    if sameVariantTy(m, kept) {
+    if sameVariantTy(m, kept) && !annArmsPart(m, kept) {
       dup = true
       if m != kept { annRegisterVariantMembers([m, kept]) }
     }
@@ -18516,6 +18539,16 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
   }
   if !dup { members.push(m) }
   0
+}
+
+// Whether two written arms stay apart as a return set keeps them: `T[] | i32[]` is two arms,
+// `string[] | i32[]` at `T := string` (D4922, D2859).
+function annArmsPart(a: i32, b: i32): boolean {
+  const saved = tpApartConcrete
+  tpApartConcrete = true
+  const part = tyParamsPart(a, b, 0)
+  tpApartConcrete = saved
+  part
 }
 
 // Commits the annotation route's candidates into `cVariantMemberTyIxs`, once at the end of
@@ -25248,220 +25281,6 @@ function listElemDiffers(se: i32, de: i32): boolean {
   listElemWidens(se, de) || containerElemClassDiffers(se, de)
 }
 
-// `listOriginExpr`'s answer for a value whose type inference chose.
-const LW_INFERRED = -2
-
-// Where the list `expr` delivers comes from: a literal `const` resolves to the literal it
-// names, a `Map()`/`Set()` const or a call whose result no annotation fixes is LW_INFERRED,
-// and anything else is itself. -1 stays -1.
-function listOriginExpr(expr: i32): i32 {
-  if expr < 0 { return -1 }
-  let x = parenPeelIx(expr)
-  let hops = 0
-  while hops < 16 {
-    if x < 0 || x >= P.nodes.length { return -1 }
-    const e = P.nodes[x]
-    if e is Ident {
-      const init = ctnLitInitOf(e.identName)
-      if init < 0 { return x }
-      // A const whose contents receive an existing list holds more than its literal built.
-      if constStoresForeignList(e.identName, covarRootFrame(x)) { return x }
-      if exprIsCollCtorCall(init) { return LW_INFERRED }
-      x = parenPeelIx(init)
-      hops = hops + 1
-      continue
-    }
-    if callResultIsInferred(x) { return LW_INFERRED }
-    return x
-  }
-  x
-}
-
-// Does a store INTO the value the name (`nm`, `fr`) is bound to — an element or field store
-// (`ls[0] = v`, `o.xs = v`, `m[k] = v`) or a mutating method (`ls.push(v)`, `m.set(k, v)`), at
-// any projection depth — put there a list that is not itself fresh (`lwValueIsFresh`)?
-function constStoresForeignList(nm: string, fr: i32): boolean {
-  if nm == "" { return true }
-  if lwFreshDepth > 8 { return true }
-  lwFreshDepth = lwFreshDepth + 1
-  cwIxBuild()
-  let found = false
-  let ixA = cwIxFrHead(nm, fr)
-  let ixU = cwIxUnkHead(nm, fr)
-  while (ixA >= 0 || ixU >= 0) && !found {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
-    if cwIxKind[r] == CW_OCC_USE {
-      const st = cwUseStoreNode(cwIxNode[r])
-      if st >= 0 && lwStoreCarriesForeignList(st) { found = true }
-    }
-  }
-  lwFreshDepth = lwFreshDepth - 1
-  found
-}
-
-// The recursion bound shared by `constStoresForeignList` and `lwValueIsFresh`, which reach each
-// other through a const that stores into itself.
-let lwFreshDepth = 0
-
-// Does the store at `st` (an assignment or a mutating call) carry a list that is not fresh?
-function lwStoreCarriesForeignList(st: i32): boolean {
-  if st < 0 || st >= P.nodes.length { return true }
-  const n = P.nodes[st]
-  if n is BinExpr { return !lwValueIsFresh(n.binRight) }
-  lwCallCarriesForeignList(st)
-}
-
-// `lwStoreCarriesForeignList` for a mutating call: any argument not fresh. A store node of any
-// other shape is not one this reads, so it counts as foreign.
-function lwCallCarriesForeignList(st: i32): boolean {
-  const n = P.nodes[st]
-  if n is Call {
-    let i = 0
-    while i < n.callArgs.length {
-      if !lwValueIsFresh(n.callArgs[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  true
-}
-
-// Is the value at `v` either free of lists or built fresh: a literal whose own lists are fresh,
-// a literal const nothing foreign is stored into, or a result `callResultIsInferred` trusts?
-function lwValueIsFresh(v: i32): boolean {
-  if v < 0 || v >= P.nodes.length { return false }
-  // A value the check has not typed yet (a store after the delivery) is judged by its origin.
-  const vt = nodeTyIxOf(v)
-  if vt >= 0 && !tyContainsList(vt, 8) { return true }
-  if lwFreshDepth > 8 { return false }
-  lwFreshDepth = lwFreshDepth + 1
-  const o = listOriginExpr(v)
-  let fresh = false
-  if o == LW_INFERRED { fresh = true }
-  else if o >= 0 && o < P.nodes.length { fresh = lwLitIsFresh(o) }
-  lwFreshDepth = lwFreshDepth - 1
-  fresh
-}
-
-// Is the node `o` a list or object literal all of whose parts are fresh (`lwValueIsFresh`)? A
-// spread of a list-holding source is not.
-function lwLitIsFresh(o: i32): boolean {
-  const n = P.nodes[o]
-  if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      const el = P.nodes[n.arrElems[i]]
-      if el is Spread {
-        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return false }
-      } else if !lwValueIsFresh(n.arrElems[i]) {
-        return false
-      }
-      i = i + 1
-    }
-    return true
-  }
-  lwObjLitIsFresh(o)
-}
-
-// `lwLitIsFresh` for an object literal: every field value fresh.
-function lwObjLitIsFresh(o: i32): boolean {
-  const n = P.nodes[o]
-  if n is ObjLit {
-    let i = 0
-    while i < n.objFields.length {
-      const fi = P.nodes[n.objFields[i]]
-      if fi is FieldInit {
-        if !lwValueIsFresh(fi.fiValue) { return false }
-      }
-      i = i + 1
-    }
-    return true
-  }
-  false
-}
-
-// Does the argument at `ix` hand an EXISTING list to the call? A literal is new, so only the
-// lists inside it that come from elsewhere count.
-function argCarriesList(ix: i32): boolean {
-  const px = parenPeelIx(ix)
-  if px < 0 || px >= P.nodes.length { return false }
-  const e = P.nodes[px]
-  if e is ArrayLit {
-    let i = 0
-    while i < e.arrElems.length {
-      const el = P.nodes[e.arrElems[i]]
-      if el is Spread {
-        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return true }
-      } else if argCarriesList(e.arrElems[i]) {
-        return true
-      }
-      i = i + 1
-    }
-    return false
-  }
-  if e is ObjLit {
-    let i = 0
-    while i < e.objFields.length {
-      const fi = P.nodes[e.objFields[i]]
-      if fi is FieldInit {
-        if argCarriesList(fi.fiValue) { return true }
-      }
-      i = i + 1
-    }
-    return false
-  }
-  tyContainsList(nodeTyIxOf(px), 8)
-}
-
-// Does any argument of `c` hand in an existing list?
-function callPassesList(c: Call): boolean {
-  let i = 0
-  while i < c.callArgs.length {
-    if argCarriesList(c.callArgs[i]) { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Is `ix` a call whose result is built at the type it flows into: the fill intrinsic, a
-// function with no declared return, or a generic whose declared result names a type parameter
-// and which no existing list goes into (`filled(2, { r: 1 })`, not `id(xs)`)?
-function callResultIsInferred(ix: i32): boolean {
-  const e = P.nodes[ix]
-  if e is Call {
-    const cn = P.nodes[e.callFn]
-    if cn is Ident {
-      if cn.identName == "__array_new__" { return true }
-      const fd = lookupFnDeclNode(cn.identName)
-      if fd >= 0 {
-        const f = P.nodes[fd]
-        if f is FuncDecl {
-          if f.fnRet < 0 { return true }
-          if f.fnTyParams.length > 0 && fnDeclRetHasTyVar(fd) {
-            return !callPassesList(e)
-          }
-        }
-      }
-    }
-  }
-  false
-}
-
-// Does the declared result of the function declared at `fd` name one of its type parameters?
-function fnDeclRetHasTyVar(fd: i32): boolean {
-  const ft = nodeTyOf(fd)
-  if ft < 0 || ft >= T.tys.length { return false }
-  const f = T.tys[ft]
-  if f is TyFunc { return tyHasTyVar(f.fnRet) }
-  false
-}
-
 // `direct` — is the destination a slot a `(ref $src)` can be written into as it stands?
 // True at a value flow, where a declared WasmGC supertype makes the reference fit. False
 // wherever the pair sits under something whose own wasm type has to relate by identity — an
@@ -30369,8 +30188,8 @@ export function bindGenWalk(
 }
 
 // The union arm `bindGenWalk` lacks, into bindings of its own: a parameter `T | string` binds its
-// one open member to the argument's members no concrete member admits (`R` at `string | R`).
-// Only the call's deferred checks read them, so the pin is held to the body (D2803).
+// one open member to the argument's members no concrete member admits (`R` at `string | R`, `U`
+// of `U[] | i32[]` at `string[]`). Only the call's deferred checks read them (D2803, D4922).
 function bindGenUnionArm(expIx: i32, atIx: i32, uNames: string[], uTys: i32[]) {
   if expIx < 0 || atIx < 0 { return 0 }
   if !(T.tys[expIx] is TyUnion) { return 0 }
@@ -30386,7 +30205,6 @@ function bindGenUnionArm(expIx: i32, atIx: i32, uNames: string[], uTys: i32[]) {
     i = i + 1
   }
   if open < 0 { return 0 }
-  if !(T.tys[open] is TyVar) { return 0 }
   const pms: i32[] = []
   flattenVariantsInto(atIx, pms)
   const rest: i32[] = []
@@ -30424,6 +30242,37 @@ export function bindGenUnionArmInto(
       bTys.push(uTys[j])
     }
     j = j + 1
+  }
+  0
+}
+
+// `bindGenUnionArmInto` where the open member is not a bare type parameter (`U[]` of
+// `U[] | i32[]`): no member reads at `U` itself, so the binding is the instance's own. An
+// argument the concrete member admits whole binds `U` from that argument, the arm it never takes (D4922).
+export function bindGenUnionShapedArmInto(
+  expIx: i32,
+  atIx: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if expIx < 0 || atIx < 0 || !(T.tys[expIx] is TyUnion) { return 0 }
+  const gms: i32[] = []
+  flattenVariantsInto(expIx, gms)
+  let open = -1
+  let i = 0
+  while i < gms.length {
+    if gms[i] >= 0 && T.tys[gms[i]] is TyVar { return 0 }
+    if gms[i] >= 0 && tyHasTyVar(gms[i]) {
+      if open >= 0 { return 0 }
+      open = gms[i]
+    }
+    i = i + 1
+  }
+  if open < 0 { return 0 }
+  const before = bNames.length
+  bindGenUnionArmInto(expIx, atIx, bNames, bTys)
+  if bNames.length == before && !(T.tys[atIx] is TyUnion) && !tyHasTyVar(atIx) {
+    bindGenWalk(open, atIx, bNames, bTys)
   }
   0
 }
@@ -33852,6 +33701,7 @@ function checkMemberCallNode(
         if cbArg.fnName == "" && rt.aElem >= 0 {
           recordCbExpected(cargs[0], [rt.aElem])
         }
+        if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
       }
       const cbTy = checkNode(cargs[0])
       const cb = T.tys[cbTy]
@@ -38477,6 +38327,10 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     }
     dj = dj + 1
   }
+  if params.length == 1 {
+    const pn1 = P.nodes[params[0]]
+    if pn1 is Param { narrowFreshBinding(pn1.parName, fnIx) }
+  }
   checkParamNestedFnClash(n, params)
   const body = P.nodes[n.fnBody]
   const savedStmtBlk = chkStmtBlk
@@ -40026,7 +39880,7 @@ function desugarMatchAt(ix: i32) {
   const n = P.nodes[ix]
   if n is MatchExpr {
     const scrut = n.matchScrut
-    if scrut >= 0 { matchScrutNode[scrut] = true }
+    if scrut >= 0 { noteMatchScrut(scrut) }
     const pats = n.matchPats
     const armStart = n.matchArmStart
     const armCount = n.matchArmCount
@@ -42133,55 +41987,6 @@ function a20CollectRets(blockIx: i32, out: i32[]) {
 // Every value a function body at `blockIx` hands back: each valued `return`, and its tail.
 export function collectRetValues(blockIx: i32, out: i32[]) {
   a20RetWalk(blockIx, true, out)
-}
-
-// Every valued `return` under `blockIx` in source order, at any depth but a nested function's.
-export function collectValuedReturns(blockIx: i32, out: i32[]) {
-  a20RetWalk(blockIx, false, out)
-}
-
-// Every valued `return` under `ix` in source order, a nested function's aside, and when `tail`
-// holds the values `ix` yields as the body's tail: a block's last statement and each arm of a
-// tail `if`, an `else if` chain along its spine. A loop body's last statement is not a tail (D2745).
-function a20RetWalk(ix: i32, tail: boolean, out: i32[]) {
-  let cur = ix
-  while cur >= 0 && cur < P.nodes.length {
-    const at = cur
-    const n = P.nodes[at]
-    cur = -1
-    if n is RetStmt {
-      if n.retArg >= 0 {
-        a20RetWalk(n.retArg, false, out)
-        out.push(n.retArg)
-      }
-    } else if n is FuncDecl {
-      return 0
-    } else if n is Block {
-      const stmts = n.blkStmts
-      let i = 0
-      while i < stmts.length {
-        a20RetWalk(stmts[i], tail && i == stmts.length - 1, out)
-        i = i + 1
-      }
-    } else if n is IfStmt {
-      a20RetWalk(n.ifCond, false, out)
-      a20RetWalk(n.ifThen, tail, out)
-      if elseIfLink(at) >= 0 {
-        cur = n.ifElse
-      } else {
-        a20RetWalk(n.ifElse, tail, out)
-      }
-    } else {
-      const kids = nodeChildren(at)
-      let ki = 0
-      while ki < kids.length {
-        a20RetWalk(kids[ki], false, out)
-        ki = ki + 1
-      }
-      if tail { out.push(at) }
-    }
-  }
-  0
 }
 
 // The type `p?.f(…)` has once its receiver guard holds — the callee's own return, before the
@@ -45921,21 +45726,9 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
   if !inferQuiet {
     desugarMatchAt(ix)
-    if !sawBadPat { intMatchHead[ix] = true }
+    if !sawBadPat { noteIntMatchHead(ix) }
   }
   matchTy
-}
-
-// Whether node `ix` is the head of the if-chain an integer `match` desugared to.
-export function intMatchHeadAt(ix: i32) {
-  if ix < 0 { return false }
-  intMatchHead[ix] ?? false
-}
-
-// Whether node `ix` is a `match` scrutinee every arm test of its desugared chain reads.
-export function matchScrutAt(ix: i32) {
-  if ix < 0 { return false }
-  matchScrutNode[ix] ?? false
 }
 
 // `match` over a value union desugars to the `is`-chain `desugarMatchAt` already builds (each
@@ -52234,8 +52027,141 @@ function elemEveryReadTy(ix: i32): i32 {
   const slot = narrowedPathIx(key)
   if slot < 0 || narFitNameOf(slot) != "" { return -1 }
   const t = narrowedPathTy(key)
-  if t >= 0 { crNoteCaptureRead(key) }
+  if t >= 0 { crNoteCaptureRead(key) } else { crPathDropRead(key, ix) }
   t
+}
+
+// The key (`s[*]`, `m[*][*]`) of the element-only narrowing in force on the list `recvIx` names
+// or of a row of it still a list (`m[0]`), as `s is S[]` over a `string[]` pushes it
+// (`pushElemReadFact`), or "".
+function elemOnlyKeyOf(recvIx: i32): string {
+  const pfx = elemRecvPrefix(recvIx)
+  if pfx == "" { return "" }
+  const slot = elemEverySlotOf(placeRootOf(pfx))
+  if slot < 0 || narFitNameOf(slot) != "" { return "" }
+  const key = npKeys[slot]
+  if key.length <= pfx.length || narrowedPathTy(key) < 0 { return "" }
+  crNoteCaptureRead(key)
+  key
+}
+
+// The element key prefix of the list `ix` reads: its name, then `[*]` per subscript (`m[i]` is
+// `m[*]`), or "" when it is not a name or a subscript chain over one.
+function elemRecvPrefix(ix: i32): string {
+  const p = peelParenIx(ix)
+  if p < 0 || p >= P.nodes.length { return "" }
+  const n = P.nodes[p]
+  if n is Ident { return n.identName }
+  if !(n is Index) { return "" }
+  const inner = elemRecvPrefix(n.idxArr)
+  if inner == "" { return "" }
+  inner + LIST_EVERY_STEP
+}
+
+// The narrowing an element of `recvIx` carries into the parameter of the callback literal `cbIx`
+// handed to its `map`/`filter` (`elemOnlyKeyOf`), as `elemFactFor` banks it, or false. Only a
+// callback that runs in place and, asked as a loop body is, writes no element of the receiver
+// out of the leaf nor calls what may, is handed elements that all still fit.
+function cbElemNarrowFor(recvIx: i32, cbIx: i32): boolean {
+  const key = elemOnlyKeyOf(recvIx)
+  if key == "" { return false }
+  const pfx = elemRecvPrefix(recvIx)
+  const root = placeRootOf(pfx)
+  const fd = P.nodes[cbIx]
+  if !(fd is FuncDecl) { return false }
+  const leaf = narrowedPathTy(key)
+  const bound: string[] = []
+  fnBoundNames(cbIx, bound)
+  cbPendClear()
+  cbPendAdd(cbIx, nodeTyOf(recvIx), bound)
+  cbPendCollect(fd.fnBody, bound)
+  const writes = (!crCallbackKeeps(cbIx, root)
+    || crLoopLeavingPathWrite(fd.fnBody, key, leaf) >= 0
+    || crFirstElemWritingCall(fd.fnBody, key) >= 0)
+  cbPendClear()
+  if writes { return false }
+  elemFactFor(cbIx, pfx, key)
+}
+
+// Gives the single parameter of the callback literal `cbIx`, run over a list of type `listTy`, its
+// element type in `cbPendNames`, when the name is bound nowhere else in `bound`.
+function cbPendAdd(cbIx: i32, listTy: i32, bound: string[]) {
+  if listTy < 0 || cbIx < 0 || cbIx >= P.nodes.length { return 0 }
+  const lt = T.tys[nonNullTy(listTy)]
+  const fd = P.nodes[cbIx]
+  if !(lt is TyArray) || !(fd is FuncDecl) || fd.fnParams.length != 1 {
+    return 0
+  }
+  if lt.aElem < 0 { return 0 }
+  const p = P.nodes[fd.fnParams[0]]
+  if !(p is Param) { return 0 }
+  let seen = 0
+  let i = 0
+  while i < bound.length {
+    if bound[i] == p.parName { seen = seen + 1 }
+    i = i + 1
+  }
+  if seen != 1 { return 0 }
+  cbPendNames.push(p.parName)
+  cbPendTys.push(lt.aElem)
+  0
+}
+
+// Every callback literal in the subtree `ix` handed to `map`/`filter` on a list `recvTyOf` knows
+// gets its parameter typed by `cbPendAdd`, outer calls first.
+function cbPendCollect(ix: i32, bound: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Member && n.callArgs.length == 1 {
+      if cf.memProp == "map" || cf.memProp == "filter" {
+        const cb = peelParenIx(n.callArgs[0])
+        if cb >= 0 && P.nodes[cb] is FuncDecl {
+          cbPendAdd(cb, recvTyOf(cf.memObj), bound)
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      cbPendCollect(kids[k], bound)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Banks, under `at`, the fact an element of the list `pfx` reads (`elemRecvPrefix`) brings to a
+// fresh binding from the element key `key`: its leaf, and how many element steps it narrows.
+function elemFactFor(at: i32, pfx: string, key: string): boolean {
+  efLeaf[at] = narrowedPathTy(key)
+  efSteps[at] = (key.length - pfx.length) / LIST_EVERY_STEP.length - 1
+  true
+}
+
+// Narrow the binding `name`, just declared in the current scope, by the fact banked under `at`
+// (`elemFactFor`): the leaf itself at no steps, as a guard would, else every element so deep.
+function narrowFreshBinding(name: string, at: i32) {
+  const leaf = efLeaf[at] ?? -1
+  const steps = efSteps[at] ?? -1
+  if leaf < 0 || steps < 0 || name == "" { return 0 }
+  if steps == 0 {
+    const decl = lookup(name)
+    if decl < 0 || tySame(decl, leaf) || !assignable(leaf, decl) { return 0 }
+    return applyNarrows([name], [leaf])
+  }
+  let key = name
+  let k = 0
+  while k < steps {
+    key = key + LIST_EVERY_STEP
+    k = k + 1
+  }
+  applyNarrows([key], [leaf])
 }
 
 // ── object literal ──────────────────────────────────────────────────────────
@@ -53973,6 +53899,14 @@ function checkForInNode(n: ForIn, ix: i32) {
   pushScope(ix)
   declare(n.fiVar, elemTy)
   symDecl(n.fiVar, ix, elemTy, 0)
+  // Every element read under an element-only narrowing fits its leaf: a write in the loop that
+  // may leave it ended it before the loop (`crLoopPreRetire`).
+  efLeaf[ix] = -1
+  if it is TyArray {
+    const fk = elemOnlyKeyOf(n.fiIter)
+    if fk != "" { elemFactFor(ix, elemRecvPrefix(n.fiIter), fk) }
+    narrowFreshBinding(n.fiVar, ix)
+  }
   if n.fiVar2 != "" {
     declare(n.fiVar2, elem2Ty)
     symDecl(n.fiVar2, ix, elem2Ty, 0)

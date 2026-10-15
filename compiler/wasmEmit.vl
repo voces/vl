@@ -27,6 +27,7 @@ import {
   nodeTyRecord,
 } from "./check_node_tys"
 import { numCastCanFail, numUnionMembersOf } from "./check_num_lits"
+import { intMatchHeadAt, matchScrutAt } from "./check_match_heads"
 import {
   binPlusIsListByTy,
   condProvenTrue,
@@ -34,7 +35,6 @@ import {
   inferRetFnKey,
   inferRetNameOf,
   inferRetTyIxOf,
-  intMatchHeadAt,
   isNumIntrinsicName,
   isVarTyIxOf,
   listDisjointDepth,
@@ -46,7 +46,6 @@ import {
   mapRetagRowsOf,
   mapUnboxTyOf,
   matchConstPatLitAt,
-  matchScrutAt,
   nodeTyProvesNonNull,
   nominalStructNameOfTy,
   numPairOpTy,
@@ -67,6 +66,8 @@ import {
 import { covarRootFreshLocal, covarValueWriteState } from "./check_covar_write"
 import { EqCmpKind, eqCoreKindOfTyToken } from "./check_ty_relate"
 import {
+  T,
+  TyArray,
   listArmFitAcrossReps,
   numLitUnionBaseName,
   numLitUnionBaseTy,
@@ -356,6 +357,7 @@ import {
   cloEqScratchBase,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
+  cloLiftedFes,
   cloStructIdx,
   cmSlot,
   coalesceCallBoolSlot,
@@ -378,6 +380,10 @@ import {
   fa64TypeIdx,
   fa64Used,
   fcpSpillSlot,
+  fitShLocal,
+  fitShName,
+  fitShRecv,
+  fitShTy,
   fl32TypeIdx,
   fl64TypeIdx,
   fnListCatKinds,
@@ -990,6 +996,7 @@ import {
   listIdxWrapSlot,
   listOpKindOfBin,
   listOpSlotOfBin,
+  listPayloadStashSlot,
   listRepOfFieldCode,
   litAtomWidenTexts,
   localIndexOf,
@@ -1253,7 +1260,12 @@ import {
   widenTmpSlot,
 } from "./emit_classify"
 import { sidOfNode } from "./symbols"
-import { i32ListHas, i32ListIndexOf, i32PairIndexOf } from "./listutil"
+import {
+  i32ListHas,
+  i32ListIndexOf,
+  i32PairIndexOf,
+  strListHas,
+} from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
   atomEqOpcodeOfKind,
@@ -1279,6 +1291,8 @@ import {
   monoInstantiatedAny,
   monoIsClashLit,
   monoPinnedSigsOf,
+  narrowRegionReads,
+  nodeContains,
 } from "./emit_mono"
 import {
   armPreludeBindChain,
@@ -3489,19 +3503,33 @@ function listFitRepMiss(isIx: i32): string {
 }
 
 // `xs is K[]` where, at some list depth, the elements of `xs` and of `K[]` can never meet: true
-// exactly when every list at that depth is empty (D4910, by the D4771 ruling). 0, leaving the
-// static fold, when not that shape or when the function reads `xs` at a type it cannot have
-// (an arm the test narrowed, D4911); 1 when emitted, -1 when refused.
+// exactly when every list at that depth is empty (D4910, by the D4771 ruling). A region the
+// test narrows reads an empty `K[]` in place of `xs` (D4911). 0, leaving the static fold, when
+// not that shape; 1 when emitted, -1 when refused.
 function emitListEmptyFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   const nd = P.nodes[isIx]
   if !(nd is IsExpr) { return 0 }
-  if nd.isVariant == "null" || exprUnion(nd.isObj, fnIx) { return 0 }
-  if nodeTyIsNullable(nd.isObj) { return 0 }
+  if nd.isVariant == "null" { return 0 }
   const declTy = nodeTyIxOf(nd.isObj)
   const recvTy = if declTy < 0 || tyHasTyVar(declTy) { exactOperandTyOf(nd.isObj, fnIx) } else { declTy }
+  // An instance that left the receiver's type parameter unbound cannot hand a closure the arm's
+  // list, since nothing says whether its elements meet `K`.
+  const rv = P.nodes[unwrapParen(nd.isObj)]
+  if (
+    (recvTy < 0 || tyHasTyVar(recvTy))
+    && rv is Ident
+    && liftedFnCaptures(rv.identName, fnIx)
+  ) {
+    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+  }
+  if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) {
+    return emitListEmptyFitArms(body, isIx, fnIx, recvTy)
+  }
   const depth = listDisjointDepth(recvTy, isVarTyIxOf(isIx))
-  if depth < 1 || listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy) {
-    return 0
+  if depth < 1 { return 0 }
+  if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy) {
+    const sh = listFitShadowSet(isIx, recvTy, depth, fnIx)
+    if sh < 1 { return sh }
   }
   const slots: i32[] = []
   let kind: MfKind = "i32"
@@ -3546,9 +3574,259 @@ function emitListEmptyFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   1
 }
 
+// `is K[]` over a union or nullable receiver whose list arm `K[]` can never meet: true exactly
+// when the receiver holds such an arm and that list is empty, so the arm's tag or non-null test
+// guards the emptiness test (D4912). 0, leaving the static fold, when no arm is such a list.
+function emitListEmptyFitArms(
+  body: u8[],
+  isIx: i32,
+  fnIx: i32,
+  recvTy: i32,
+): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return 0 }
+  const kTy = isVarTyIxOf(isIx)
+  const boxed = exprUnion(nd.isObj, fnIx)
+  // A box's arms are the ones it registered, which the receiver's type need not spell.
+  const armTys: i32[] = []
+  if boxed {
+    const atoms: string[] = []
+    const nm = unionNameOfExpr(nd.isObj, fnIx)
+    if nm == "" || !unionSetArmTys(nm, atoms, armTys) { return 0 }
+  } else {
+    if recvTy < 0 { return 0 }
+    flattenVariantsInto(recvTy, armTys)
+  }
+  const fits: i32[] = []
+  let meets = false
+  for a in armTys {
+    if a >= 0 && a < T.tys.length && T.tys[a] is TyArray {
+      if listDisjointDepth(a, kTy) == 1 { fits.push(a) } else { meets = true }
+    }
+  }
+  // An arm whose elements can be `K`, or meet them below the first level, keeps its tag test.
+  if fits.length == 0 || meets { return 0 }
+  if !unionEqOperandOk(nd.isObj) { return emitFailNoMembershipRecv() }
+  if !boxed && fits.length != 1 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+  for a in fits {
+    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, a) {
+      const sh = listFitShadowSet(isIx, a, 1, fnIx)
+      if sh < 1 { return sh }
+    }
+  }
+  let i = 0
+  while i < fits.length {
+    const at = T.tys[fits[i]]
+    if !(at is TyArray) { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+    const heaps: i32[] = []
+    const kind = listFitElemKind(at.aElem, heaps)
+    if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+    if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+    if boxed {
+      const tag = isArmTagOfTy(fits[i])
+      if tag < 0 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+      fbStructGet(uBoxIdx, 0)
+      fbI32Const(tag)
+      fbI32Bin(70) // 0x46 i32.eq
+    } else {
+      fbRefIsNull()
+      fbI32Eqz()
+    }
+    // <arm test> if (result i32) { <the arm's list is empty> } else { 0 }
+    fbIf(127)
+    if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+    if boxed {
+      fbStructGet(uBoxIdx, 1)
+      fbRefCast(heaps[2])
+    } else {
+      fbRefAsNonNull()
+    }
+    emitListEmptyLoop([], 0, kind, heaps[0])
+    fbElse()
+    fbI32Const(0)
+    fbEnd()
+    if i > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    i = i + 1
+  }
+  1
+}
+
+// The frame kind of a list whose elements are `elemTy`, pushing its ref-list row (0 for a
+// scalar list), backing and wrapper heap types onto `out`; null for an element with no list row.
+function listFitElemKind(elemTy: i32, out: i32[]): MfKind | null {
+  const en = tyPrimNameOf(elemTy)
+  let kind: MfKind = "ref"
+  if en == "string" { kind = "str" }
+  else if en == "f64" { kind = "f64" }
+  else if en == "i64" { kind = "i64" }
+  else if en == "f32" { kind = "f32" }
+  else if en == "u8" { kind = "u8" }
+  else if en == "i32" || en == "boolean" { kind = "i32" }
+  if kind == "ref" {
+    const slot = rlSlotOfTy(elemTy)
+    if slot < 0 || slot >= rlWrapIdx.length { return null }
+    out.push(slot)
+    out.push(rlBackIdx[slot])
+    out.push(rlWrapIdx[slot])
+    return kind
+  }
+  const vk: VKind = if kind == "u8" { "u8list" } else { kind }
+  out.push(0)
+  out.push(scalarListBack(vk))
+  out.push(scalarListWrap(vk))
+  kind
+}
+
+const LIST_FIT_PUSH_MSG = "emitProgram: this `is` arm pushes onto an empty list built with another element type, which cannot hold the pushed value"
+
+const LIST_FIT_SHADOW_MSG = "emitProgram: this `is` arm reads an empty list at an element type it was not built with, and only a variable read directly in its own function can be handed one"
+
+// Stores a fresh empty `K[]` for the `is K[]` at `isIx` in a local the arm's reads of its
+// receiver take instead of the receiver (`listFitShadowRead`): the test is true only when the
+// list is empty, and an empty list of one element type reads as an empty list of any other.
+// 1 when stored, -1 when refused for a receiver no read can be redirected for.
+function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
+  const r = P.nodes[unwrapParen(nd.isObj)]
+  const fn = P.nodes[fnIx]
+  if !(r is Ident) || !(fn is FuncDecl) || depth != 1 {
+    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+  }
+  if (
+    nestedFnReadsDisjoint(fn.fnBody, r.identName, recvTy, false)
+    || liftedFnReadsDisjoint(r.identName, recvTy, fnIx)
+  ) {
+    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+  }
+  const kTy = isVarTyIxOf(isIx)
+  if kTy < 0 || kTy >= T.tys.length {
+    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+  }
+  const kt = T.tys[kTy]
+  if !(kt is TyArray) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
+  const heaps: i32[] = []
+  const kind = listFitElemKind(kt.aElem, heaps)
+  if kind == null { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
+  const slot = heaps[0]
+  const back = heaps[1]
+  const wrap = heaps[2]
+  const recvLoc = localIndexOf(fnIx, r.identName)
+  if recvLoc < 0 { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
+  let loc = -1
+  let i = 0
+  while i < fitShName.length {
+    if (
+      fitShName[i] == r.identName
+      && tySame(fitShTy[i], kTy)
+      && fitShRecv[i] == recvLoc
+    ) {
+      loc = fitShLocal[i]
+    }
+    i = i + 1
+  }
+  if loc < 0 {
+    loc = listFitSlot(kind, slot, 11)
+    fitShName.push(r.identName)
+    fitShTy.push(kTy)
+    fitShLocal.push(loc)
+    fitShRecv.push(recvLoc)
+  }
+  fbBacking(back, 0)
+  arrLitWrap(0, wrap)
+  fbLocalSet(loc)
+  1
+}
+
+// The local `listFitShadowSet` stored for a read of `name` at node `exprIx` typed as that
+// local's list and resolving to the same binding, or -1 to read the binding itself.
+function listFitShadowRead(name: string, exprIx: i32, fnIx: i32): i32 {
+  if fitShName.length == 0 { return -1 }
+  const t = nodeTyIxOf(exprIx)
+  if t < 0 { return -1 }
+  const recvLoc = localIndexOf(fnIx, name)
+  if recvLoc < 0 { return -1 }
+  let i = 0
+  while i < fitShName.length {
+    if (
+      fitShName[i] == name
+      && tySame(fitShTy[i], t)
+      && fitShRecv[i] == recvLoc
+    ) {
+      return fitShLocal[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether lifted slot `fe` captures `name` and is declared inside the function at `fnIx` (any
+// lifted slot, where `fnIx` is not a function): a same-named capture elsewhere is another binding.
+function liftedFnCapturesIn(fe: i32, name: string, fnIx: i32): boolean {
+  if !strListHas(captureNamesOf(fe), name) { return false }
+  const host = P.nodes[fnIx]
+  !(host is FuncDecl) || nodeContains(host.fnBody, fnStmts[fe])
+}
+
+// Whether some lifted closure inside the function at `fnIx` captures `name`.
+function liftedFnCaptures(name: string, fnIx: i32): boolean {
+  let k = 0
+  while k < cloLiftedFes.length {
+    if liftedFnCapturesIn(cloLiftedFes[k], name, fnIx) { return true }
+    k = k + 1
+  }
+  false
+}
+
+// Whether a lifted closure inside the function at `fnIx` capturing `name` reads it at a type
+// list-disjoint from `instTy`: the lifted body sits outside its frame's, so
+// `nestedFnReadsDisjoint` cannot see it.
+function liftedFnReadsDisjoint(name: string, instTy: i32, fnIx: i32): boolean {
+  let k = 0
+  while k < cloLiftedFes.length {
+    const fe = cloLiftedFes[k]
+    if liftedFnCapturesIn(fe, name, fnIx) {
+      const f = P.nodes[fnStmts[fe]]
+      if f is FuncDecl && nestedFnReadsDisjoint(f.fnBody, name, instTy, true) {
+        return true
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// Whether a function nested under `ix` reads `name` at a type list-disjoint from `instTy`; such
+// a read is a capture, which the arm's local cannot reach.
+function nestedFnReadsDisjoint(
+  ix: i32,
+  name: string,
+  instTy: i32,
+  inner: boolean,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    return nestedFnReadsDisjoint(n.fnBody, name, instTy, true)
+  }
+  if inner && n is Ident && n.identName == name {
+    const t = nodeTyIxOf(ix)
+    if t >= 0 && listDisjointDepth(instTy, t) >= 1 { return true }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nestedFnReadsDisjoint(kids[i], name, instTy, inner) { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Whether function `fnIx` may read the receiver `recv` of the `is` at `isIx` as the narrowed
-// type, which the instance's value cannot carry, so the arm is only sound folded away (D4911):
-// a read typed disjoint from `instTy`, or any read in a region the `is` narrows. A field
+// type, which the instance's value cannot carry, so the read needs an empty `K[]` in its place
+// (D4911): a read typed disjoint from `instTy`, or any read in a region the `is` narrows. A field
 // receiver counts every read of a field of the same name.
 function listNarrowReadDisjoint(
   fnIx: i32,
@@ -3579,116 +3857,6 @@ function narrowReadsName(
   if name == "" { return false }
   narrowReadDisjointUnder(body, name, field, instTy)
     || narrowRegionReads(body, isIx, name, field) == 2
-}
-
-// Where `isIx` sits under `ix`: 0 not there, 2 when a region it narrows reads `name` (an `if`
-// or `while` body or else, the right of an `&&`/`||`, and the block's later statements after an
-// `if` whose condition negates the test), 3 for that negated `if` before its block is read,
-// else 1. A later `is` over the same receiver is not a read.
-function narrowRegionReads(
-  ix: i32,
-  isIx: i32,
-  name: string,
-  field: boolean,
-): i32 {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  if ix == isIx { return 1 }
-  const n = P.nodes[ix]
-  if n is IfStmt {
-    const c = narrowRegionReads(n.ifCond, isIx, name, field)
-    if c == 0 {
-      const t = narrowRegionReads(n.ifThen, isIx, name, field)
-      if t != 0 { return t }
-      return narrowRegionReads(n.ifElse, isIx, name, field)
-    }
-    if (
-      c == 2
-      || nodeReadsName(n.ifThen, name, field)
-      || nodeReadsName(n.ifElse, name, field)
-    ) {
-      return 2
-    }
-    return if condNegates(n.ifCond, isIx) { 3 } else { 1 }
-  }
-  if n is WhileStmt {
-    const c = narrowRegionReads(n.whileCond, isIx, name, field)
-    if c == 0 { return narrowRegionReads(n.whileBody, isIx, name, field) }
-    if c == 2 || nodeReadsName(n.whileBody, name, field) { return 2 }
-    return if condNegates(n.whileCond, isIx) { 3 } else { 1 }
-  }
-  if n is BinExpr && (n.binOp == "&&" || n.binOp == "||") {
-    const c = narrowRegionReads(n.binLeft, isIx, name, field)
-    if c == 0 { return narrowRegionReads(n.binRight, isIx, name, field) }
-    if c == 2 || nodeReadsName(n.binRight, name, field) { return 2 }
-    return c
-  }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    const k = narrowRegionReads(kids[i], isIx, name, field)
-    if k == 3 && n is Block {
-      let j = i + 1
-      while j < kids.length {
-        if nodeReadsName(kids[j], name, field) { return 2 }
-        j = j + 1
-      }
-      return 1
-    }
-    if k != 0 { return k }
-    i = i + 1
-  }
-  0
-}
-
-// Whether the condition `ix` holds the test `isIx` under an odd number of negations, counting
-// `!` and a `!is` itself.
-function condNegates(ix: i32, isIx: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
-  if ix == isIx { return n is IsExpr && n.isNeg != 0 }
-  if n is Unary && n.unOp == "!" { return !condNegates(n.unArg, isIx) }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    if nodeContains(kids[i], isIx) { return condNegates(kids[i], isIx) }
-    i = i + 1
-  }
-  false
-}
-
-function nodeContains(ix: i32, target: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  if ix == target { return true }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    if nodeContains(kids[i], target) { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Whether `name` is read anywhere under `ix`, as an identifier or, for a `field`, a member; the
-// receiver of an `is` is not a read.
-function nodeReadsName(ix: i32, name: string, field: boolean): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
-  if field && n is Member && n.memProp == name { return true }
-  if !field && n is Ident && n.identName == name { return true }
-  if n is IsExpr {
-    const r = P.nodes[unwrapParen(n.isObj)]
-    if !field && r is Ident && r.identName == name { return false }
-    if field && r is Member && r.memProp == name {
-      return nodeReadsName(r.memObj, name, field)
-    }
-  }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    if nodeReadsName(kids[i], name, field) { return true }
-    i = i + 1
-  }
-  false
 }
 
 function narrowReadDisjointUnder(
@@ -4188,7 +4356,6 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const nd = P.nodes[isIx]
   if !(nd is IsExpr) { return 0 }
   if nd.isVariant == "null" || !exprUnion(nd.isObj, fnIx) { return 0 }
-  if nodeTyIsNullable(nd.isObj) { return 0 }
   const chk = isVarTyIxOf(isIx)
   const nm = unionNameOfExpr(nd.isObj, fnIx)
   if tyArrayElemIx(chk) < 0 || nm == "" { return 0 }
@@ -4256,6 +4423,15 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const slot = sharedFieldRecvSlot()
   if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
   fbLocalSet(slot)
+  // A nullable operand is false on null; the box is a null reference then (D4953).
+  const nullable = nodeTyIsNullable(nd.isObj)
+  if nullable {
+    fbLocalGet(slot)
+    fbRefIsNull()
+    fbIf(127)
+    fbI32Const(0)
+    fbElse()
+  }
   const lexes = tyLitMemberTexts(chkLeaf)
   fbI32Const(0)
   i = 0
@@ -4303,8 +4479,9 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     fbI32Bin(114) // 0x72 i32.or
     i = i + 1
   }
+  if nullable { fbEnd() }
   if empties {
-    return emitListIsRebox(nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
+    return emitListIsRebox(body, nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
   }
   1
 }
@@ -4362,9 +4539,11 @@ function listArmWrapOfTy(a: i32): i32 {
 }
 
 // With an `is L` answer on the stack, re-boxes receiver `recv` (staged in `slot`) as an empty
-// `L` when it fitted as an empty list of another arm, so the narrowed branch reads an `L`
-// payload when `recv` is a binding it can store back to.
+// `L` when it fitted as an empty list of another arm, and stores the box back into `recv`, so
+// the narrowed branch reads and writes an `L` (D4949). The place takes a new list rather than
+// the old one changing rep: a reference typed as the other arm must never hold an `L` element.
 function emitListIsRebox(
+  body: u8[],
   recv: i32,
   slot: i32,
   chk: i32,
@@ -4375,20 +4554,9 @@ function emitListIsRebox(
 ): i32 {
   const chkWrap = listArmWrapOfTy(chk)
   const chkBack = if chkWrap < 0 { -1 } else { listBackOfWrap(chkWrap) }
-  const rn = P.nodes[recv]
-  let local = -1
-  let glob = -1
-  if rn is Ident {
-    const li = localIndexOf(fnIx, rn.identName)
-    if li >= 0 && identSlotIsUnionBox(fnIx, rn.identName) { local = li }
-    if li < 0 && !capturedIsUnionBox(fnIx, rn.identName) {
-      const g = globalIndexOf(rn.identName)
-      if g >= 0 && !globalCellIsImmutable(g) { glob = g }
-    }
-  }
-  // A capture, field or element is not stored back, so its narrowed read of such an empty list
-  // traps on the cast (D4939) where the tag alone took the wrong branch.
-  if chkBack < 0 || (local < 0 && glob < 0) { return 1 }
+  const st = listIsStoreBackOf(recv, fnIx)
+  // A place with no store-back reads an empty `L` stand-in, and a push into it traps (D4939).
+  if chkBack < 0 || st.kind == LIS_NONE { return 1 }
   const res = listFitSlot("i32", 0, 4)
   fbLocalTee(res)
   fbIf(64)
@@ -4406,18 +4574,82 @@ function emitListIsRebox(
     i = i + 1
   }
   fbIf(64)
+  if st.obj >= 0 && emitExpr(body, st.obj, fnIx) < 0 { return -1 }
+  if st.kind == LIS_ELEM {
+    fbStructGet(rlWrapIdx[st.at], 0) // the backing; the read just made proved the index
+    if emitExpr(body, st.idx, fnIx) < 0 { return -1 }
+  }
   fbI32Const(chkTag)
   fbBacking(chkBack, 0)
   fbI32Const(0)
   fbI32Const(0)
   fbStructNew(chkWrap)
   fbStructNew(uBoxIdx)
-  if local >= 0 { fbLocalSet(local) }
-  else if emitUserGlobalSet(glob) < 0 { return -1 }
+  if st.kind == LIS_LOCAL {
+    fbLocalSet(st.at)
+  } else if st.kind == LIS_GLOBAL {
+    if emitUserGlobalSet(st.at) < 0 { return -1 }
+  } else if st.kind == LIS_FIELD {
+    fbStructSet(sHeapIdx[st.at], st.field)
+  } else {
+    fbArraySet(rlBackIdx[st.at])
+  }
   fbEnd()
   fbEnd()
   fbLocalGet(res)
   1
+}
+
+// Where `emitListIsRebox` stores its box: nowhere, a local, a mutable global, a field of a
+// record row, or an element of a list of boxes.
+const LIS_NONE = 0
+const LIS_LOCAL = 1
+const LIS_GLOBAL = 2
+const LIS_FIELD = 3
+const LIS_ELEM = 4
+type ListIsStore = { kind: i32, at: i32, field: i32, obj: i32, idx: i32 }
+
+function listIsStore(
+  kind: i32,
+  at: i32,
+  field: i32,
+  obj: i32,
+  idx: i32,
+): ListIsStore {
+  { kind: kind, at: at, field: field, obj: obj, idx: idx }
+}
+
+// The store-back `emitListIsRebox` can make into `recv`: `at` is the local, global, struct row
+// or ref-list slot, `field` the struct field, `obj` and `idx` the container and index to
+// re-evaluate. A capture `captureBoxRewrite` turned into a cell arrives as that cell's element.
+function listIsStoreBackOf(recv: i32, fnIx: i32): ListIsStore {
+  const rn = P.nodes[unwrapParen(recv)]
+  if rn is Ident {
+    const li = localIndexOf(fnIx, rn.identName)
+    if li >= 0 && identSlotIsUnionBox(fnIx, rn.identName) {
+      return listIsStore(LIS_LOCAL, li, -1, -1, -1)
+    }
+    const g = if li >= 0 || capturedIsUnionBox(fnIx, rn.identName) { -1 } else { globalIndexOf(rn.identName) }
+    if g >= 0 && !globalCellIsImmutable(g) {
+      return listIsStore(LIS_GLOBAL, g, -1, -1, -1)
+    }
+  } else if placeNarrowKeyOf(recv) != "" {
+    // Only a place the narrowing names is re-read, so re-evaluating its path has no effect.
+    if rn is Member {
+      const si = structIndexOfExpr(rn.memObj, fnIx)
+      const fi = if si < 0 || si >= sHeapIdx.length { -1 } else { sFieldIndex(si, rn.memProp) }
+      if fi >= 0 && sFieldTypeAt(si, fi) == FC_UNION {
+        return listIsStore(LIS_FIELD, si, fi, rn.memObj, -1)
+      }
+    } else if rn is Index {
+      const rs = if exprMap(rn.idxArr, fnIx) || !exprRefArray(rn.idxArr, fnIx) { -1 } else { refListSlotOfExpr(rn.idxArr, fnIx) }
+      if rs >= 0 && rs < rlWrapIdx.length && rlElemKindTbl[rs] == RLK_UNION {
+        return listIsStore(LIS_ELEM, rs, -1, rn.idxArr, rn.idxIndex)
+      }
+    }
+  }
+  // Any other operand, or a place whose storage is not a union box, keeps no store.
+  listIsStore(LIS_NONE, -1, -1, -1, -1)
 }
 
 // `recv is X` over an operand read at the rep the narrowing stack leaves it. Fixed,
@@ -4592,6 +4824,14 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   const ndv = P.nodes[isIx]
   if ndv is IsExpr {
+    // A list `K[]` can never meet is a fit exactly when empty, which neither a box's tag nor a
+    // non-null test can say (D4912).
+    const fitK = isVarTyIxOf(isIx)
+    if fitK >= 0 && T.tys[fitK] is TyArray {
+      const uf = emitListEmptyFitIs(body, isIx, fnIx)
+      if uf < 0 { return -1 }
+      if uf > 0 { return 0 }
+    }
     // A literal union tested against a box whose string arm is a plain `string` is membership
     // over the payload: the tag alone answers true for a non-member string (D3348).
     const smTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
@@ -5928,10 +6168,7 @@ function emitUnionUnboxTail(ak: i32) {
     return 0
   }
   const lw = listWrapHeapOfKind(ak)
-  if lw >= 0 {
-    fbRefCast(lw) // the payload IS the list WRAPPER ref
-    return 0
-  }
+  if lw >= 0 { return emitListPayloadCast(lw) }
   const vb = vbHeapIdxOfKind(ak)
   if vb < 0 {
     return emitFail("emitProgram: narrowed union atom has no value box")
@@ -5959,7 +6196,7 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
       )
     }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    fbRefCast(rlWrapIdx[slot]) // the payload IS the arm's list wrapper
+    emitListPayloadCast(rlWrapIdx[slot])
     return 1
   }
   if narrowedMapOfPlace(exprIx) != "" {
@@ -5987,7 +6224,34 @@ function emitRefArrayUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
   if slot < 0 {
     return emitFail("emitProgram: narrowed ref-array arm has no reflist slot")
   }
-  fbRefCast(rlWrapIdx[slot]) // 0xfb 0x16 <reflist wrapper> — the payload IS the wrapper ref
+  emitListPayloadCast(rlWrapIdx[slot])
+}
+
+// Set while a `.push` receiver is emitted: an append into a stand-in empty list would be lost,
+// so a push keeps the plain cast and traps loudly instead (D4949).
+let listCastForPush = false
+
+// The box's `anyref` payload on the stack, as the list wrapper `wrap` a narrowed read expects.
+// An `is L` fits an empty list of another list arm (D4771), and a capture, field or element
+// cannot be re-boxed as `L`, so a payload of another wrapper reads as an empty `L` (D4939).
+function emitListPayloadCast(wrap: i32) {
+  const back = listBackOfWrap(wrap)
+  if back < 0 || listCastForPush {
+    fbRefCast(wrap)
+    return 0
+  }
+  const st = listPayloadStashSlot()
+  fbLocalTee(st)
+  fbRefTest(wrap)
+  fbIfRef(wrap)
+  fbLocalGet(st)
+  fbRefCast(wrap)
+  fbElse()
+  fbBacking(back, 0)
+  fbI32Const(0)
+  fbI32Const(0)
+  fbStructNew(wrap)
+  fbEnd()
   0
 }
 
@@ -23221,6 +23485,13 @@ function listOpRecvLocal(
   const recv = P.nodes[objIx]
   if recv is Ident {
     if !listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
+      // An `is K[]` arm's empty list of another element (D4911): an op that only reads it
+      // reads the arm's own, and a push, which the receiver's own list cannot hold, refuses.
+      const fitSh = listFitShadowRead(recv.identName, objIx, fnIx)
+      if fitSh >= 0 && op == ".push" {
+        return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+      }
+      if fitSh >= 0 { return fitSh }
       const lIdx = localIndexOf(fnIx, recv.identName)
       if lIdx >= 0 { return lIdx }
       // A captured list ident (D1965) or a module global: the env field or global holds
@@ -23267,7 +23538,10 @@ function pushDestVKind(rslot: i32): VKind | null {
 // share. Called from two points because a push whose value stages a receiver must resolve
 // its own after that value (D1280); one function so the two cannot pass different arguments.
 function pushRecvLocal(body: u8[], objIx: i32, fnIx: i32, base: i32) {
-  listOpRecvLocal(body, objIx, fnIx, base, -1, ".push")
+  listCastForPush = true
+  const r = listOpRecvLocal(body, objIx, fnIx, base, -1, ".push")
+  listCastForPush = false
+  r
 }
 
 // The `pendingListKind` a list of element kind `k` is built at — the mapping `emitArr`'s own
@@ -23351,7 +23625,10 @@ function emitPushMany(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
       const totL = widenTmpSlot(3000 + seq)
       // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
       // restage it, which is how a hoisted receiver gets clobbered.
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      listCastForPush = true
+      const recvRc = emitExpr(body, callee.memObj, fnIx)
+      listCastForPush = false
+      if recvRc < 0 { return -1 }
       if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
       fbLocalSet(recvS)
       const lst = spreadRunLit(c.callArgs, callIx, c.pos)
@@ -31230,6 +31507,14 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   // of every nullable ref cell.
   if identCellVKind(exprIx, fnIx) == "nulnone" {
     return emitNullBySeed(fnIx, true)
+  }
+  // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
+  // unboxes, which would cast the receiver's own list to `K[]`.
+  const fitSh = listFitShadowRead(e.identName, exprIx, fnIx)
+  if fitSh >= 0 {
+    fbLocalGet(fitSh)
+    fbRefAsNonNull()
+    return 0
   }
   const isid = sidOfNode(exprIx)
   // a module-`const` parameter default reads its global, not a caller-local of the same
