@@ -18189,7 +18189,7 @@ function nameToTy(name: string) {
 function pushDistinctVariantTy(out: i32[], ty: i32) {
   let i = 0
   while i < out.length {
-    if sameVariantTy(ty, out[i]) { return 0 }
+    if sameVariantTy(ty, out[i]) && !annArmsPart(ty, out[i]) { return 0 }
     i = i + 1
   }
   out.push(ty)
@@ -18304,7 +18304,7 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
   let dj = 0
   while dj < members.length {
     const kept = members[dj]
-    if sameVariantTy(m, kept) {
+    if sameVariantTy(m, kept) && !annArmsPart(m, kept) {
       dup = true
       if m != kept { annRegisterVariantMembers([m, kept]) }
     }
@@ -18312,6 +18312,16 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
   }
   if !dup { members.push(m) }
   0
+}
+
+// Whether two written arms stay apart as a return set keeps them: `T[] | i32[]` is two arms,
+// `string[] | i32[]` at `T := string` (D4922, D2859).
+function annArmsPart(a: i32, b: i32): boolean {
+  const saved = tpApartConcrete
+  tpApartConcrete = true
+  const part = tyParamsPart(a, b, 0)
+  tpApartConcrete = saved
+  part
 }
 
 // Commits the annotation route's candidates into `cVariantMemberTyIxs`, once at the end of
@@ -29951,8 +29961,8 @@ export function bindGenWalk(
 }
 
 // The union arm `bindGenWalk` lacks, into bindings of its own: a parameter `T | string` binds its
-// one open member to the argument's members no concrete member admits (`R` at `string | R`).
-// Only the call's deferred checks read them, so the pin is held to the body (D2803).
+// one open member to the argument's members no concrete member admits (`R` at `string | R`, `U`
+// of `U[] | i32[]` at `string[]`). Only the call's deferred checks read them (D2803, D4922).
 function bindGenUnionArm(expIx: i32, atIx: i32, uNames: string[], uTys: i32[]) {
   if expIx < 0 || atIx < 0 { return 0 }
   if !(T.tys[expIx] is TyUnion) { return 0 }
@@ -29968,7 +29978,6 @@ function bindGenUnionArm(expIx: i32, atIx: i32, uNames: string[], uTys: i32[]) {
     i = i + 1
   }
   if open < 0 { return 0 }
-  if !(T.tys[open] is TyVar) { return 0 }
   const pms: i32[] = []
   flattenVariantsInto(atIx, pms)
   const rest: i32[] = []
@@ -30006,6 +30015,37 @@ export function bindGenUnionArmInto(
       bTys.push(uTys[j])
     }
     j = j + 1
+  }
+  0
+}
+
+// `bindGenUnionArmInto` where the open member is not a bare type parameter (`U[]` of
+// `U[] | i32[]`): no member reads at `U` itself, so the binding is the instance's own. An
+// argument the concrete member admits whole binds `U` from that argument, the arm it never takes (D4922).
+export function bindGenUnionShapedArmInto(
+  expIx: i32,
+  atIx: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if expIx < 0 || atIx < 0 || !(T.tys[expIx] is TyUnion) { return 0 }
+  const gms: i32[] = []
+  flattenVariantsInto(expIx, gms)
+  let open = -1
+  let i = 0
+  while i < gms.length {
+    if gms[i] >= 0 && T.tys[gms[i]] is TyVar { return 0 }
+    if gms[i] >= 0 && tyHasTyVar(gms[i]) {
+      if open >= 0 { return 0 }
+      open = gms[i]
+    }
+    i = i + 1
+  }
+  if open < 0 { return 0 }
+  const before = bNames.length
+  bindGenUnionArmInto(expIx, atIx, bNames, bTys)
+  if bNames.length == before && !(T.tys[atIx] is TyUnion) && !tyHasTyVar(atIx) {
+    bindGenWalk(open, atIx, bNames, bTys)
   }
   0
 }
