@@ -1,14 +1,16 @@
 // `check_types.vl` — the type checker's type arena and the queries that read only it.
 // `T` holds the arena `T.tys`, the scope chain and the diagnostics; the `Ty` variants are
-// its rows, every nested type an `i32` index into it. Beside the arena sit the named-type
-// registries (`cStruct*`, `cUnion*`, the generic-application rows `gaApp*`) and the
-// literal-union naming table (`lu*`), with rendering (`tyToStr`, `tyToEmitName`),
-// equality (`tyEq`) and the `ty*` predicates over them. Nothing here reads a node, the
-// scope chain's bindings or `tErr`; `typecheck.vl` resets the tables in `initChecker`.
+// its rows, every nested type an `i32` index into it, and the `mk*` constructors here
+// append them (`mkUnionTy` and `mkTyVar` read checker state, so they stay in the checker).
+// Beside the arena sit the named-type registries (`cStruct*`, `cUnion*`, the
+// generic-application rows `gaApp*`) and the literal-union naming table (`lu*`), with
+// rendering (`tyToStr`, `tyToEmitName`), equality (`tyEq`) and the `ty*` predicates over
+// them. Nothing here reads a node, the scope chain's bindings or `tErr`; `typecheck.vl`
+// resets the tables in `initChecker`.
 
-import { numLexFitsI32 } from "./emit_bignum"
+import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
 import { i32ToStr } from "./ast"
-import { nameIsBareIdent } from "./tyname"
+import { groupInnerOf, nameIsBareIdent, nameIsQuotedLeaf } from "./tyname"
 import { i32ListHas } from "./listutil"
 import {
   builtinTyNames,
@@ -3668,4 +3670,143 @@ export function tyIsCompositePat(pt: i32) {
 export function tyIsOneStrLit(ty: i32): boolean {
   if !tyIsLitUnionOrLit(ty) { return false }
   tyLitMemberTexts(ty).length == 1
+}
+
+// ── type-arena constructors ──────────────────────────────────────────────────
+// Each appends a variant to `T.tys` and returns its index — the same shape as the AST's `mk*`
+// constructors, for the parallel arena.
+
+export function addTy(t: Ty) {
+  T.tys.push(t)
+  T.tys.length - 1
+}
+
+export function mkPrim(name: PrimName) {
+  const t: Ty = { primName: name }
+  addTy(t)
+}
+
+export function mkErrTy() {
+  const t: Ty = { errKind: 0 }
+  addTy(t)
+}
+
+export function mkObjTy(names: string[], typeIxs: i32[]) {
+  const t: Ty = { objFieldNames: names, objFieldTypes: typeIxs }
+  addTy(t)
+}
+
+export function mkFuncTy(params: i32[], ret: i32) {
+  const t: Ty = { fnParamTypes: params, fnRet: ret }
+  addTy(t)
+}
+
+export function mkNullableTy(inner: i32) {
+  // D1026 — nullable is idempotent: `(T | null) | null` is `T | null`. The language has no second
+  // null, so a nested nullable is an artefact of composing an already-nullable alias (`type P =
+  // null | f64` stored as `TyNullable(f64)`, then `P | null`) — a shape no arm of the return-seed
+  // ladder recognizes. Folding at this one home makes the two spellings the same type again.
+  if inner >= 0 {
+    const innerT = T.tys[inner]
+    if innerT is TyNullable { return inner }
+  }
+  if tyIsWidePrim(inner) { tyWideUnionMinted = true }
+  const t: Ty = { nInner: inner }
+  addTy(t)
+}
+
+export function mkArrayTy(elem: i32) {
+  const t: Ty = { aElem: elem, aRead: 0 }
+  addTy(t)
+}
+
+// `ty | null`, for an emit-side rewrite that needs a box over a value with no niche (D2826).
+export function mkNullableTyOf(ty: i32) { mkNullableTy(ty) }
+
+// The read-only view over the same element (`readonly T[]`). A sibling constructor rather
+// than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
+export function mkArrayViewTy(elem: i32) {
+  const t: Ty = { aElem: elem, aRead: 1 }
+  addTy(t)
+}
+
+export function mkMapTy(key: i32, val: i32, isSet: i32) {
+  tyMapMinted = true
+  const t: Ty = { mKey: key, mVal: val, mSet: isSet }
+  addTy(t)
+}
+
+// Whether any map type has been minted in this instance. Only ever set, so a gate on it can
+// skip work, never a map (`mapDeliveryMayRecord`).
+export let tyMapMinted = false
+
+// Whether any union or `| null` with an `i64` or `f64` member has been minted: the same kind of
+// gate for a delivery a narrower member widens into (`recordWidenRetag`).
+export let tyWideUnionMinted = false
+
+// The canonical decimal form of an integer literal lexeme (`0x10` → `16`, `1_000` → `1000`,
+// `007` → `7`), so literal-type identity compares values rather than raw spellings and `0x10` is
+// a member of `16 | 32`. A lexeme whose value exceeds the i32 range keeps its raw spelling, an
+// i64-sized literal never denoting a literal-union member.
+export function canonIntLexeme(t: string) {
+  if !numLexFitsI32(t) { return t }
+  let v = 0
+  let i = 0
+  let base = 10
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else { d = c - 'A' + 10 }
+      v = v * base + d
+    }
+    i = i + 1
+  }
+  i32ToStr(v)
+}
+
+export function mkLitTy(kind: LitKind, text: string) {
+  let canon = text
+  if kind == "int" { canon = canonIntLexeme(text) }
+  const t: Ty = { litKind: kind, litText: canon }
+  addTy(t)
+}
+
+// The arena type of one literal-member lexeme — `"a"` → the `str` literal type, `0x10` → `int`
+// — or -1 when `name` is not a literal member (a float lexeme is none: `floatLitTypeMsg`). The one home for
+// that lexeme grammar, so `nameToTy`'s annotation resolver and `canonEmitName`'s literal arm both
+// ask for the type and let the renderer name it rather than each carrying the rule.
+export function litMemberTy(name: string) {
+  if name.length == 0 { return -1 }
+  // A string-literal type `"a"`: the quoted lexeme is the member, and the raw inner text is kept,
+  // since the literal expression side keeps its raw lexeme too and membership compares the same
+  // characters. The quote test (`tyname.nameIsQuotedLeaf`) stays here because the group-interior
+  // cut at its home is delimiter-blind by design; its bound is the length test two lines up.
+  if nameIsQuotedLeaf(name) { return mkLitTy("str", groupInnerOf(name)) }
+  // An integer-literal type (`0`, `0x10`). A float lexeme (`1.5`, `1e3`) names no type.
+  if name[0] >= '0' && name[0] <= '9' {
+    if numLexIsFloat(name) { return -1 }
+    return mkLitTy("int", name)
+  }
+  -1
+}
+
+export function mkNegTy(inner: i32) {
+  const t: Ty = { negTy: inner }
+  addTy(t)
 }
