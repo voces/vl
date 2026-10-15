@@ -813,6 +813,7 @@ import {
   coalMapReadForeignDefault,
   coalesceDefaultNullable,
   coalesceLitUnionFits,
+  coalesceMapReadJoins,
   coalesceNicheJoinsToBox,
   coalesceNulAtomToStr,
   coalesceNulRefNicheOperand,
@@ -10716,6 +10717,56 @@ function emitMapGetOrScalarBox(body: u8[], ak: i32, defIx: i32, fnIx: i32) {
   }
   fbEnd()
   0
+}
+
+// `m[k] ?? d` over a scalar-valued map where `d` is another arm of the result's union: a hit
+// boxes the stored scalar under its own arm's tag, a miss boxes `d`. 1 handled, 0 when the
+// value is not a boxed scalar (a ref value is the generic nullable operand), -1 (D4643).
+function emitMapGetOrScalarJoin(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  const r = P.nodes[unwrapParen(e.binLeft)]
+  let recvIx = -1
+  let keyIx = -1
+  if r is Index {
+    recvIx = r.idxArr
+    keyIx = r.idxIndex
+  } else if r is Call {
+    const callee = P.nodes[r.callFn]
+    if callee is Member {
+      if r.callArgs.length == 1 {
+        recvIx = callee.memObj
+        keyIx = r.callArgs[0]
+      }
+    }
+  }
+  if recvIx < 0 { return 0 }
+  const ak = mapRecvScalarBoxKindIn(recvIx, fnIx)
+  if ak < 0 { return 0 }
+  const joinN = coalesceResultUnionName(exprIx)
+  let joinSet = unionMemberSetOf(joinN)
+  if joinSet == "" { joinSet = joinN }
+  const vb = vbHeapIdxOfKind(ak)
+  if vb < 0 || !unionHasAtomTy(joinSet, scalarAtomNameOfKind(ak), false) {
+    return emitFailAt(
+      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
+      exprIx,
+    )
+  }
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  pushMapScr(body, 5) // entry
+  fbIfRef(uBoxIdx)    // 0x04 if, (ref $uBox) blocktype — the result's rep
+  fbI32Const(scalarTagOfKind(ak))
+  pushMapScalarHit(body)
+  fbStructNew(vb)
+  fbStructNew(uBoxIdx)
+  fbElse()            // 0x05 else — a miss → the default, boxed
+  if emitUnionBoxArg(body, joinN, e.binRight, fnIx) < 0 { return -1 }
+  fbEnd()
+  1
 }
 
 // Lower a map HAS `m.has(k)` / `k in m` onto `body`: probe, push 1 if found else 0.
@@ -29220,6 +29271,29 @@ export function expCtxApply(c: ExpCtx) {
   0
 }
 
+// Puts every pending seed back to its declared default, the first thing a compile does: an
+// earlier compile that stopped on a failure path may have left one set.
+export function expCtxReset() {
+  pendingListKind = 0
+  pendingListSlot = 0
+  pendingStructIdx = -1
+  pendingVariantIdx = -1
+  pendingMapSlot = -1
+  pendingI64 = false
+  pendingF32 = false
+  pendingF64 = false
+  pendingNulBool = false
+  pendingNulLitUnion = false
+  pendingNulString = false
+  pendingNulClosure = false
+  pendingNulList = false
+  pendingNulNone = false
+  pendingNulRefHeap = -1
+  pendingRawNullRead = false
+  pendingLitUnion = 0
+  0
+}
+
 // Restore the context `saved` and hand back `r`: the exit of a site that applied its own
 // context, on its success and its failure paths alike.
 function expCtxLeave(saved: ExpCtx, r: i32): i32 {
@@ -33762,8 +33836,16 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if popTakesElem(lhsIx) && nodeTyIxOf(lhsIx) == nodeTyIxOf(exprIx) {
     return emitExpr(body, lhsIx, fnIx)
   }
+  // A default that is another arm of the result's union reads the map as a nullable operand,
+  // through the join arms below.
+  const mapFused = !coalesceMapReadJoins(exprIx, fnIx)
+  if !mapFused {
+    const msj = emitMapGetOrScalarJoin(body, e, exprIx, fnIx)
+    if msj < 0 { return -1 }
+    if msj > 0 { return 0 }
+  }
   if lhs is Index {
-    if exprMap(lhs.idxArr, fnIx) {
+    if mapFused && exprMap(lhs.idxArr, fnIx) {
       return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
     }
   }
@@ -33778,7 +33860,7 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     const lcallee = P.nodes[lhs.callFn]
     if lcallee is Member {
       if lcallee.memProp == "get" {
-        if exprMap(lcallee.memObj, fnIx) {
+        if mapFused && exprMap(lcallee.memObj, fnIx) {
           if lhs.callArgs.length != 1 {
             return emitFail(
               "emitProgram: internal: map .get reached with the wrong argument count — the checker's arity rule refuses it",
