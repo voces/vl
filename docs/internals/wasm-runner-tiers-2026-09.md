@@ -10,7 +10,7 @@ true.
 
 ## The population is derived, because the hand-count was wrong
 
-`scripts/wasm-runner-census.py` takes every `tests/*.ts` that reaches an instantiation — an
+`scripts/wasm-runner-census.vl` takes every `tests/*.ts` that reaches an instantiation — an
 import of `runWasm` or `casesWasmOracle`, or a bare `WebAssembly.instantiate`, from CODE and
 not from a comment. Two files that merely name one in prose (`module_gate_agreement_test.ts`,
 `vl_run_args_test.ts`) are correctly excluded.
@@ -70,7 +70,7 @@ reading of two jobs both naming `tests/` is that the corpus is graded twice per 
 Not byte identity — nothing here emits bytes to compare. **The graded-cell SET**:
 
 ```
-$ python3 scripts/wasm-runner-census.py --cells | head -1
+$ vl run scripts/wasm-runner-census.vl -- --cells | head -1
 corpus cells graded by the oracle shards: 3102
 ```
 

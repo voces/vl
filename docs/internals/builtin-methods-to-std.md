@@ -590,7 +590,7 @@ splits.
 
 ### 5.2 The codemod — `scripts/codemods/builtin-to-std.py` (proposed, never committed)
 
-It follows `label-at.py`'s shape: `--check`, `PATH...`, a directory walked for `*.vl`, exit 0
+It follows `label-at.vl`'s shape: `--check`, `PATH...`, a directory walked for `*.vl`, exit 0
 when nothing needed rewriting, and comments and strings never touched. The difference is that
 **the receiver type decides, and text cannot**. `.slice(`, `.get(`, `.indexOf(` and
 `.includes(` are each shared between a moving built-in and one that stays (§2's split). So

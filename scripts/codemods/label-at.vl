@@ -1,0 +1,541 @@
+// Rewrite labels to the `@` spelling: `B: { … }` to `@B { … }`, `L: while` and `L: for` to
+// `@L while` and `@L for`, `break :B` to `break @B`, `continue :L` to `continue @L`.
+//
+//     vl run scripts/codemods/label-at.vl -- [--check] PATH...   # a directory is walked for *.vl
+//
+// Exit 0 when nothing needed rewriting, 1 otherwise. Whether `X: {` was a label is decided
+// as the parser before the `@name` ruling read it (DECISIONS.md, "A label is `@name`"): per
+// brace, outermost first, by the token before the brace and how the braces open. Comments
+// and string literals are never touched; code in a string's interpolation hole is.
+
+import { IoError, listDir, pathKind, readTextFile, writeTextFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join } from "std:str"
+import { cpAt, die } from "../lib/common"
+import { sortStrings } from "../lib/corpus"
+import { pathJoin } from "../lib/census-read"
+
+const USAGE = "Rewrite labels to the `@` spelling: `B: { … }` → `@B { … }`, `L: while` → `@L while`,
+`L: for` → `@L for`, `break :B` → `break @B`, `continue :L` → `continue @L`.
+
+Labels are one token, `@name`, at the declaration and at the jump since the 2026-09-30 ruling
+(DECISIONS.md, \"A label is `@name`\"), and `{ name: … }` is always an object literal. This
+rewrites every `break :X` / `continue :X`, and every `X: while`, `X: for` and `X: {` the old
+parser read as a label. That is decided per brace, outermost first: a `{` after a token that
+starts a value or a type (`=`, `(`, `[`, `,`, `:`, `return`, `?`, …) opened an object or a type,
+so a field there is never a label, `{ f: while … }` included; any other brace is a body, a
+block unless it opens like an object (`{ name: …`, `{ name, …`, `{ name }`, `{}`, a map type
+`{[K]: V}`, where `name: {` counts as a label when its own braces hold statements, a jump names
+it, or a statement follows its `}` on a later line). In a block, `X:` where a statement starts
+is a label; anywhere, one in value position (after `=`, `=>`, `return`, `break`, or in a
+string's interpolation hole) is too, and `break X: { … }` becomes `break (@X { … })`. Comments
+and string literals are never touched.
+
+Usage: label-at.vl [--check] PATH...   (a directory is walked for *.vl files)
+Exit status: 0 when nothing needed rewriting (or --check found nothing), 1 otherwise.
+"
+
+// Token kinds.
+const ID = 0
+const NL = 1
+const STR = 2
+const PUNCT = 3
+
+// The hole token: a string's `\{`, after which the code inside is scanned.
+const HOLE = "\\{"
+
+// Tokens after which `X: {` is a value, which the old parser always read as a label.
+const VALUE_BEFORE = ["=", "=>", "return", "break", HOLE]
+// The words that open a statement, so `{ return }` is a block and not a shorthand object.
+const KEYWORDS = [
+  "let", "const", "return", "if", "while", "for", "break", "continue", "type",
+  "function", "match",
+]
+// Tokens a line break does not end a statement after: a field or argument continues.
+const OPEN_BEFORE = [",", "{", "(", "[", "=", ":", "=>"]
+// Tokens after which a `{` opens a type or an object literal, never a block of statements.
+const VALUE_BRACE_AFTER = [
+  ":", "=", "|", "&", "<", ",", "(", "[", "return", "?",
+]
+
+function isIn(t: string, set: string[]): boolean {
+  for s in set {
+    if s == t { return true }
+  }
+  false
+}
+
+type Edit = { s: i32, e: i32, r: string }
+
+// The token stream and the per-token tables the label decision reads.
+type Ctx = {
+  kind: i32[],
+  text: string[],
+  pos: i32[],
+  n: i32,
+  close: i32[],
+  encl: i32[],
+  memo: i32[],
+  kinds: i32[],
+  labelled: boolean[],
+  jumps: Map<string, i32[]>,
+}
+
+// A string-hole frame: the brace depth its hole opened at, and its string's quote.
+type Hole = { depth: i32, q: i32 }
+
+// From just past an opening quote `q`: the index past its close, or past a `\{` hole.
+type Scan = { at: i32, closed: boolean }
+
+function scanQuoted(src: string, start: i32, q: i32): Scan {
+  let i = start
+  while i < src.length {
+    const c = src[i]
+    if c == 92 {
+      if i + 1 < src.length && src[i + 1] == 123 {
+        return { at: i + 2, closed: false }
+      }
+      i = i + 2
+    } else if c == q {
+      return { at: i + 1, closed: true }
+    } else {
+      i = i + 1
+    }
+  }
+  { at: src.length, closed: true }
+}
+
+function isAlpha(b: i32): boolean {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+}
+
+function isIdent(b: i32): boolean {
+  isAlpha(b) || (b >= 48 && b <= 57) || b == 95
+}
+
+function push(x: Ctx, k: i32, t: string, p: i32) {
+  x.kind.push(k)
+  x.text.push(t)
+  x.pos.push(p)
+}
+
+// The code tokens of `src`: identifiers, line breaks, a string's opening quote, and
+// punctuation, one character each except `=>`. Literals and comments are skipped, and
+// the code in a string's `\{…}` hole is scanned as code.
+function tokenize(x: Ctx, src: string) {
+  let i = 0
+  const n = src.length
+  let depth = 0
+  const holes: Hole[] = []
+  while i < n {
+    const c = src[i]
+    if c == 125 && holes.length > 0 && holes[holes.length - 1].depth == depth {
+      const h = holes[holes.length - 1]
+      holes.pop()
+      const sc = scanQuoted(src, i + 1, h.q)
+      i = sc.at
+      if !sc.closed {
+        holes.push(h)
+        push(x, PUNCT, HOLE, i - 2)
+      }
+      continue
+    }
+    if c == 123 { depth = depth + 1 }
+    else if c == 125 { depth = depth - 1 }
+    if c == 10 {
+      push(x, NL, "\n", i)
+      i = i + 1
+    } else if c == 32 || c == 9 || c == 13 {
+      i = i + 1
+    } else if c == 47 && i + 1 < n && src[i + 1] == 47 {
+      while i < n && src[i] != 10 { i = i + 1 }
+    } else if c == 47 && i + 1 < n && src[i + 1] == 42 {
+      let j = i + 2
+      while j + 1 < n && !(src[j] == 42 && src[j + 1] == 47) { j = j + 1 }
+      i = if j + 1 < n { j + 2 } else { n }
+    } else if c == 34 || c == 39 {
+      push(x, STR, src.slice(i, i + 1), i)
+      const sc = scanQuoted(src, i + 1, c)
+      i = sc.at
+      if !sc.closed {
+        holes.push({ depth: depth, q: c })
+        push(x, PUNCT, HOLE, i - 2)
+      }
+    } else if isAlpha(c) || c == 95 {
+      let j = i + 1
+      while j < n && isIdent(src[j]) { j = j + 1 }
+      push(x, ID, src.slice(i, j), i)
+      i = j
+    } else if c == 61 && i + 1 < n && src[i + 1] == 62 {
+      push(x, PUNCT, "=>", i)
+      i = i + 2
+    } else {
+      const w = if c < 0x80 { 1 } else { cpAt(src, i).n }
+      push(x, PUNCT, src.slice(i, i + w), i)
+      i = i + w
+    }
+  }
+  x.n = x.kind.length
+}
+
+function tx(x: Ctx, k: i32): string {
+  if k < 0 || k >= x.n { return "" }
+  x.text[k]
+}
+
+function isId(x: Ctx, k: i32): boolean { k >= 0 && k < x.n && x.kind[k] == ID }
+
+function isNl(x: Ctx, k: i32): boolean { k >= 0 && k < x.n && x.kind[k] == NL }
+
+// The token closing the `{` at `b`, or `dflt` when it never closes.
+function closeOf(x: Ctx, b: i32, dflt: i32): i32 {
+  if b < 0 || b >= x.n || x.close[b] < 0 { return dflt }
+  x.close[b]
+}
+
+// Whether a `break :X` / `continue :X` naming `X` (token `k`, in `X: {`) is inside.
+function jumpedInside(x: Ctx, k: i32): boolean {
+  const close = closeOf(x, k + 2, k + 2)
+  for q in x.jumps[x.text[k]] ?? [] {
+    if k + 2 < q && q < close { return true }
+  }
+  false
+}
+
+// Whether the braces opening at token `b` begin like an object literal or a type rather
+// than a block: `{}`, a key, a shorthand field, a method, a string key, a spread, `{[K]: V}`.
+function opensLikeObject(x: Ctx, b: i32): boolean {
+  if b >= 0 && b < x.n && x.memo[b] >= 0 { return x.memo[b] == 1 }
+  let j = b + 1
+  while j < x.n && x.kind[j] == NL { j = j + 1 }
+  const ans = opensLikeObjectAt(x, j)
+  if b >= 0 && b < x.n { x.memo[b] = if ans { 1 } else { 0 } }
+  ans
+}
+
+function opensLikeObjectAt(x: Ctx, j: i32): boolean {
+  if j >= x.n { return false }
+  const first = x.text[j]
+  if first == "}" || first == "[" || first == "\"" || first == "." {
+    return true
+  }
+  if x.kind[j] != ID || j + 1 >= x.n { return false }
+  const nk = x.text[j + 1]
+  if nk == ":" {
+    if isId(x, j + 2) && (tx(x, j + 2) == "while" || tx(x, j + 2) == "for") {
+      return false
+    }
+    if tx(x, j + 2) == "{" {
+      if (
+        jumpedInside(x, j)
+        || !opensLikeObject(x, j + 2)
+        || statementFollows(x, j + 2)
+      ) {
+        return false
+      }
+    }
+    return true
+  }
+  if isIn(first, KEYWORDS) { return false }
+  if nk == "," || nk == "}" || nk == "?" || x.kind[j + 1] == ID { return true }
+  if nk != "(" { return false }
+  // A method shorthand `{ name(…) {` or `{ name(…): T {`, not a call statement.
+  let d = 0
+  let q = j + 1
+  while q < x.n {
+    if x.text[q] == "(" {
+      d = d + 1
+    } else if x.text[q] == ")" {
+      d = d - 1
+      if d == 0 { break }
+    }
+    q = q + 1
+  }
+  q + 1 < x.n && (x.text[q + 1] == "{" || x.text[q + 1] == ":")
+}
+
+// Whether a statement follows the `}` closing the `{` at `b` on a later line or after a
+// `;`: read as an object field's value, that `}` meets a `,`, a `}` or a continuation.
+function statementFollows(x: Ctx, b: i32): boolean {
+  let i = closeOf(x, b, x.n - 1) + 1
+  if i >= x.n || (x.kind[i] != NL && x.text[i] != ";") { return false }
+  let semi = false
+  while i < x.n && (x.kind[i] == NL || x.text[i] == ";") {
+    semi = semi || x.text[i] == ";"
+    i = i + 1
+  }
+  if i >= x.n || x.text[i] == "}" || x.text[i] == "," { return false }
+  if semi { return true }
+  const t = x.text[i]
+  if (
+    isIn(t, [".", "?", "+", "-", "*", "/", "%", "^", "=", "<", ">", "&", "|"])
+  ) {
+    return false
+  }
+  if t == "!" && i + 1 < x.n && x.text[i + 1] == "=" { return false }
+  t != "is" && t != "as"
+}
+
+const BLOCK = 1
+const VALUE = 2
+
+// What the `{` at token `b` opened for the parser before the ruling: after a token that
+// starts a value or a type, an object or a type; after `X:`, a block when `X` is a label;
+// any other brace is a body, an object when it opens like one and a block when not.
+function braceKind(x: Ctx, b: i32): i32 {
+  let j = b - 1
+  while j >= 0 && x.kind[j] == NL { j = j - 1 }
+  if j >= 0 {
+    const t = x.text[j]
+    if t == ":" {
+      if j - 1 >= 0 && x.labelled[j - 1] { return BLOCK }
+      return VALUE
+    }
+    if isIn(t, VALUE_BRACE_AFTER) || t == HOLE { return VALUE }
+  }
+  if opensLikeObject(x, b) { return VALUE }
+  BLOCK
+}
+
+// The token before `k` ("\n" for a line break) and the nearest one that is not a line
+// break, "" for none.
+type Prev = { near: string, far: string }
+
+function prevOf(x: Ctx, k: i32): Prev {
+  if k == 0 { return { near: "", far: "" } }
+  let j = k - 1
+  while j >= 0 && x.kind[j] == NL { j = j - 1 }
+  const near = if x.kind[k - 1] == NL { "\n" } else { x.text[k - 1] }
+  { near: near, far: if j >= 0 { x.text[j] } else { "" } }
+}
+
+function editLess(a: Edit, b: Edit): boolean {
+  if a.s != b.s { return a.s < b.s }
+  if a.e != b.e { return a.e < b.e }
+  a.r < b.r
+}
+
+function sortEdits(xs: Edit[]): Edit[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = sortEdits(xs.slice(0, mid))
+  const b = sortEdits(xs.slice(mid, xs.length))
+  const out: Edit[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !editLess(b[j], a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// A rewrite: the new source and how many edits made it.
+type Result = { out: string, edits: i32 }
+
+function rewrite(src: string): Result {
+  const x: Ctx = {
+    kind: [],
+    text: [],
+    pos: [],
+    n: 0,
+    close: [],
+    encl: [],
+    memo: [],
+    kinds: [],
+    labelled: [],
+    jumps: Map(),
+  }
+  tokenize(x, src)
+  const n = x.n
+  const stack: i32[] = []
+  let k = 0
+  while k < n {
+    x.close.push(-1)
+    x.memo.push(-1)
+    x.kinds.push(0)
+    x.labelled.push(false)
+    x.encl.push(if stack.length > 0 { stack[stack.length - 1] } else { -1 })
+    if x.kind[k] == PUNCT && x.text[k] == "{" {
+      stack.push(k)
+    } else if x.kind[k] == PUNCT && x.text[k] == "}" && stack.length > 0 {
+      const o = stack[stack.length - 1]
+      stack.pop()
+      x.close[o] = k
+    }
+    k = k + 1
+  }
+
+  const edits: Edit[] = []
+  k = 0
+  while k < n - 2 {
+    const t = x.text[k]
+    if (
+      x.kind[k] == ID
+      && (t == "break" || t == "continue")
+      && x.text[k + 1] == ":"
+      && isId(x, k + 2)
+    ) {
+      const colon = x.pos[k + 1]
+      const name = x.text[k + 2]
+      const js = x.jumps[name] ?? []
+      js.push(k)
+      x.jumps[name] = js
+      edits.push({ s: colon, e: colon + 1, r: "@" })
+    }
+    k = k + 1
+  }
+
+  k = 0
+  while k < n {
+    const name = x.text[k]
+    const pos = x.pos[k]
+    if x.kind[k] == PUNCT && name == "{" {
+      x.kinds[k] = braceKind(x, k)
+      k = k + 1
+      continue
+    }
+    if x.kind[k] != ID || k + 2 >= n || x.text[k + 1] != ":" || isNl(x, k + 2) {
+      k = k + 1
+      continue
+    }
+    const loop = isId(x, k + 2)
+      && (x.text[k + 2] == "while" || x.text[k + 2] == "for")
+    if !loop && x.text[k + 2] != "{" {
+      k = k + 1
+      continue
+    }
+    const pv = prevOf(x, k)
+    const near = pv.near
+    const far = pv.far
+    if far == "." || far == "?" {
+      k = k + 1
+      continue
+    }
+    const e = x.encl[k]
+    const inBlock = e < 0 || x.kinds[e] == BLOCK
+    // A value position always read a label; inside an object or a type nothing else did.
+    const value = isIn(near, VALUE_BEFORE)
+      || (near == "\n" && isIn(far, VALUE_BEFORE))
+    const inside = !loop && jumpedInside(x, k)
+    // A statement starts here: first in a block, after `;` or `}`, or a line break that no
+    // `,` or opener continues.
+    const stmt = inBlock
+      && (near == ";"
+      || near == "}"
+      || far == ""
+      || far == "{"
+      || (near == "\n" && !isIn(far, OPEN_BEFORE)))
+    // In parentheses or brackets, `((B: { … }))` held a block; `f(r: { … })` holds a type.
+    const paren = inBlock
+      && (far == "(" || far == "[")
+      && (loop || !opensLikeObject(x, k + 2))
+    if !(value || inside || stmt || paren) {
+      k = k + 1
+      continue
+    }
+    x.labelled[k] = true
+    const target = x.pos[k + 2]
+    if near == "break" && !loop {
+      // `break @B { … }` would name the label: the block is the value, so parenthesize.
+      edits.push({ s: pos, e: target, r: "(@" + name + " " })
+      const end = x.pos[closeOf(x, k + 2, k + 2)] + 1
+      edits.push({ s: end, e: end, r: ")" })
+    } else {
+      edits.push({ s: pos, e: target, r: "@" + name + " " })
+    }
+    k = k + 1
+  }
+
+  const out: string[] = []
+  let last = 0
+  for ed in sortEdits(edits) {
+    if ed.s > last { out.push(src.slice(last, ed.s)) }
+    out.push(ed.r)
+    last = ed.e
+  }
+  if last < src.length { out.push(src.slice(last, src.length)) }
+  { out: join(out, ""), edits: edits.length }
+}
+
+function kindOf(p: string): string {
+  const k = pathKind(p)
+  if k is IoError { return "" }
+  if k == "dir" { return "dir" }
+  "file"
+}
+
+// The `*.vl` files under `dir` in `os.walk` order: a directory's own files sorted, then
+// each subdirectory in the order the host lists them.
+function walk(dir: string, out: string[]) {
+  const names = listDir(dir)
+  if names is IoError { return }
+  const subdirs: string[] = []
+  const files: string[] = []
+  for nm in names {
+    if kindOf(pathJoin(dir, nm)) == "dir" {
+      subdirs.push(nm)
+    } else {
+      files.push(nm)
+    }
+  }
+  for nm in sortStrings(files) {
+    if nm.length >= 3 && nm.slice(nm.length - 3, nm.length) == ".vl" {
+      out.push(pathJoin(dir, nm))
+    }
+  }
+  for d in subdirs { walk(pathJoin(dir, d), out) }
+}
+
+function main(args: readonly string[]): i32 {
+  let check = false
+  const paths: string[] = []
+  for a in args {
+    if a == "--check" { check = true } else { paths.push(a) }
+  }
+  if paths.length == 0 {
+    print(USAGE)
+    return 2
+  }
+  let total = 0
+  for p in paths {
+    const files: string[] = []
+    const k = kindOf(p)
+    if k == "dir" { walk(p, files) }
+    else if k == "file" { files.push(p) }
+    else { print("\{p}: no such file or directory") }
+    for f in files {
+      const src = readTextFile(f)
+      if src is IoError {
+        die("label-at: cannot read \{f} (\{src.msg})", 1)
+        return 1
+      }
+      const r = rewrite(src)
+      if r.edits == 0 { continue }
+      total = total + r.edits
+      const verb = if check { "to rewrite" } else { "rewritten" }
+      print("\{f}: \{toString(r.edits)} site(s) \{verb}")
+      if !check {
+        const w = writeTextFile(f, r.out)
+        if w != null { die("label-at: cannot write \{f} (\{w.msg})", 1) }
+      }
+    }
+  }
+  if total > 0 { return 1 }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("label-at: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

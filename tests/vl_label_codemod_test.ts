@@ -1,4 +1,4 @@
-// `scripts/codemods/label-at.py` MIGRATES THE RETIRED LABEL SPELLING AND ONLY IT (D3374).
+// `scripts/codemods/label-at.vl` MIGRATES THE RETIRED LABEL SPELLING AND ONLY IT (D3374).
 //
 // The owner's 2026-09-30 ruling spells a label `@B`, and `{ name: … }` is then always an object
 // literal, so the codemod has to tell a label written `B: {` from an object field written the
@@ -6,11 +6,18 @@
 // a second run must change nothing. plumb runs this on its hand-written sources, and on its
 // generated units until the generator speaks `@`.
 //
-// No compiler and no seed; no assertion library, per CLAUDE.md.
+// The codemod was a `.py` file until T3 of the architecture refactor. The port was graded
+// against it over tests/cases, std, an old-spelling copy of tests/cases and these cases, in
+// both modes: stdout, exit code and the rewritten trees were byte-identical. Where the Python
+// crashed on a non-ASCII letter in code, the port reads it as punctuation and carries on.
+//
+// No assertion library, per CLAUDE.md.
+//
+// @test-timing native
 
-import { ROOT } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
-const SCRIPT = `${ROOT}/scripts/codemods/label-at.py`;
+const SCRIPT = `${ROOT}/scripts/codemods/label-at.vl`;
 
 const CASES: [string, string, string][] = [
   [
@@ -79,38 +86,39 @@ const CASES: [string, string, string][] = [
   ],
 ];
 
-async function python(): Promise<string> {
-  for (const p of [Deno.env.get("PYTHON"), "/usr/bin/python3", "python3"]) {
-    if (p === undefined) continue;
-    try {
-      const { code } = await new Deno.Command(p, { args: ["-c", "print(1)"], stdout: "null", stderr: "null" })
-        .output();
-      if (code === 0) return p;
-    } catch { /* not on PATH — try the next */ }
-  }
-  throw new Error("no python3 to run the codemod with");
+const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
+const ENABLED = GATED && exists(VL) && exists(COMPILER);
+if (GATED && !ENABLED) {
+  console.warn("[vl-label-codemod] skipped — missing vl binary or seed wasm.");
 }
 
-async function migrate(py: string, file: string): Promise<string> {
-  const { code, stderr } = await new Deno.Command(py, { args: [SCRIPT, file], stdout: "null", stderr: "piped" })
-    .output();
-  if (code !== 0 && code !== 1) throw new Error(`codemod rc ${code}: ${new TextDecoder().decode(stderr)}`);
+async function migrate(file: string): Promise<string> {
+  const { code, stdout } = await new Deno.Command(VL, {
+    args: ["run", SCRIPT, "--", file],
+    stdout: "piped",
+    stderr: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
+  }).output();
+  if (code !== 0 && code !== 1) throw new Error(`codemod rc ${code}: ${new TextDecoder().decode(stdout)}`);
   return Deno.readTextFile(file);
 }
 
 for (const [name, before, want] of CASES) {
-  Deno.test(`label-at codemod: ${name}`, async () => {
-    const py = await python();
-    const dir = await Deno.makeTempDir({ prefix: "vl_label_at_" });
-    try {
-      const file = `${dir}/m.vl`;
-      await Deno.writeTextFile(file, before);
-      const got = await migrate(py, file);
-      if (got !== want) throw new Error(`want:\n${want}\n---\ngot:\n${got}`);
-      const again = await migrate(py, file);
-      if (again !== want) throw new Error(`a second run changed it:\n${again}`);
-    } finally {
-      await Deno.remove(dir, { recursive: true });
-    }
+  Deno.test({
+    name: `label-at codemod: ${name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const dir = await Deno.makeTempDir({ prefix: "vl_label_at_" });
+      try {
+        const file = `${dir}/m.vl`;
+        await Deno.writeTextFile(file, before);
+        const got = await migrate(file);
+        if (got !== want) throw new Error(`want:\n${want}\n---\ngot:\n${got}`);
+        const again = await migrate(file);
+        if (again !== want) throw new Error(`a second run changed it:\n${again}`);
+      } finally {
+        await Deno.remove(dir, { recursive: true });
+      }
+    },
   });
 }

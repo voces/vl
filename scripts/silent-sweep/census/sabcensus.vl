@@ -1,0 +1,143 @@
+// Grader sabotage for the census grader: a zero in an outcome column is trusted only once
+// that column has been made to fire, so every column `gradecensus.vl` prints is provoked here
+// by construction, and the counts it must reproduce are printed before the run.
+//
+//     vl run scripts/silent-sweep/census/sabcensus.vl -- <outdir>
+//
+// Writes one `<outdir>/<cell>.vl` per specimen and a `manifest.json` of `expect` and empty
+// `coords`. `compiler trap` has no specimen: no source program is known to kill the compiler,
+// so that column's zero rests on routing, and the PREDICTED line says so.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join } from "std:str"
+import { die } from "../../lib/common"
+import { spawn, writeText } from "../../lib/corpus"
+import { pathJoin } from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/sabcensus.vl -- <outdir>"
+
+type Cell = { name: string, text: string, exp: string }
+
+const MAP_SRC = "type Circle = { r: i32 }\nconst c: {[string]: Circle} = Map()\nc[\"k\"] = { r: 7 }\nprint((c[\"k\"] ?? { r: 0 }).r)\n"
+const LIST_SRC = "const xs: i32[] = [7, 8]\nprint(xs[0])\n"
+
+// `runs`, then `runs but wrong value`: three of the latter are a `runs` program under another
+// expectation, which proves the grader reads the manifest and not the output.
+const RUNS: Cell[] = [
+  { name: "ok_scalar", text: "print(7)\n", exp: "7" },
+  { name: "ok_map", text: MAP_SRC, exp: "7" },
+  { name: "ok_list", text: LIST_SRC, exp: "7" },
+  { name: "ok_zero", text: "print(0)\n", exp: "0" },
+  { name: "wv_scalar", text: "print(7)\n", exp: "999" },
+  { name: "wv_map", text: MAP_SRC, exp: "0" },
+  { name: "wv_list", text: LIST_SRC, exp: "8" },
+  { name: "wv_str", text: "print(\"seven\")\n", exp: "7" },
+]
+
+// `trap_loads`: a valid module that loads, prints, then dies.
+const TRAPS: Cell[] = [
+  {
+    name: "tl_idx",
+    text: "const xs: i32[] = [1, 2]\nprint(7)\nprint(xs[9])\n",
+    exp: "7",
+  },
+  {
+    name: "tl_idx2",
+    text: "const xs: string[] = [\"a\"]\nprint(7)\nprint(xs[5])\n",
+    exp: "7",
+  },
+  {
+    name: "tl_idx3",
+    text: "const xs: f64[] = [1.5]\nprint(7)\nprint(xs[3])\n",
+    exp: "7",
+  },
+]
+
+// `check-clean invalid wasm`: live census cells, which perish as their defects close.
+// Re-grade them with `scripts/check-filed-witnesses.vl` before trusting this column's count.
+const INVALID: Cell[] = [
+  {
+    name: "iw_nolist",
+    text: "function rd() {\n  const lv1 = [\"seven\"]\n  const c = [lv1]\n  const g0 = c\n  if g0.length > 0 {\n    const g1 = g0[0]\n    if g1.length > 0 {\n      if (g1[0]) == \"seven\" { print(7) } else { print(0) }\n    } else { print(0) }\n  } else { print(0) }\n}\nrd()\n",
+    exp: "7",
+  },
+  {
+    name: "iw_listlist",
+    text: "type Circle = { r: i32 }\ntype Dot = { r: i32 }\ntype Sq = { s: i32 }\ntype Shape = Circle | Sq\nfunction rd() {\n  const lv1 = [{ r: 7 }]\n  const c: Circle[][] = [lv1]\n  print(c[0][0].r)\n}\nrd()\n",
+    exp: "7",
+  },
+  {
+    name: "iw_stdconduit",
+    text: "import { reverse } from \"std:array\"\nfunction rd() {\n  const c = [\"seven\"]\n  const dd = reverse([c])[0]\n  let hit = 0\n  for zz in dd {\n    if zz == \"seven\" { hit = 7 }\n  }\n  print(hit)\n}\nrd()\n",
+    exp: "7",
+  },
+]
+
+// `loud emit reject`, then `loud check reject`.
+const LOUD: Cell[] = [
+  {
+    name: "le_nestedarr",
+    text: "const lv2 = [7]\nconst lv1 = [lv2]\nconst c = [lv1]\nprint(c[0][0][0])\n",
+    exp: "7",
+  },
+  {
+    name: "le_structobj",
+    text: "type Circle = { r: i32 }\ntype Sq = { s: i32 }\ntype Shape = Circle | Sq\ntype W = { f: Circle }\nconst w: W = { f: { r: 7 } }\nprint(w.f.r)\n",
+    exp: "7",
+  },
+  {
+    name: "le_nullist",
+    text: "const xs: (i32 | null)[] = [7]\nprint(xs[0] ?? 0)\n",
+    exp: "7",
+  },
+  {
+    name: "lc_type",
+    text: "const x: i32 = \"seven\"\nprint(x)\n",
+    exp: "7",
+  },
+  {
+    name: "lc_unknown",
+    text: "print(nosuchname)\n",
+    exp: "7",
+  },
+  {
+    name: "lc_arity",
+    text: "function f(a: i32) { print(a) }\nf(1, 2)\n",
+    exp: "7",
+  },
+]
+
+function main(args: string[]): i32 {
+  if args.length < 1 { die(USAGE, 1) }
+  const out = args[0]
+  const mk = spawn("mkdir", ["-p", out])
+  if mk.code != 0 { die("sabcensus: cannot create \{out}: " + mk.err, 1) }
+  const expect: string[] = []
+  const coords: string[] = []
+  for group in [RUNS, TRAPS, INVALID, LOUD] {
+    for c in group {
+      writeText(pathJoin(out, c.name + ".vl"), c.text)
+      expect.push("\"\{c.name}\": \"\{c.exp}\"")
+      coords.push("\"" + c.name + "\": {}")
+    }
+  }
+  writeText(
+    pathJoin(out, "manifest.json"),
+    "{\"expect\": {\{join(expect, ", ")}}, \"coords\": {\{join(coords, ", ")}}}",
+  )
+  print("sabotage cells: " + toString(expect.length))
+  print(
+    "PREDICTED: runs 4 / runs but wrong value 4 / trap_loads 3 / check-clean invalid wasm 3 / loud emit reject 3 / loud check reject 3 / compiler trap 0 (unprovokable — recorded)",
+  )
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("sabcensus: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

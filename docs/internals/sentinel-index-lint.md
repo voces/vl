@@ -1,7 +1,7 @@
 # `sentinel-index-unguarded` — a table read whose index nobody bounded
 
 **Landed 2026-09-03.** Rule in `compiler/lint.vl`, tree-wide census in
-`scripts/sentinel-census.py`, ratchet `vl check --budget scripts/sentinel-budget-baseline.json`, agreement pinned by
+`scripts/sentinel-census.vl`, ratchet `vl check --budget scripts/sentinel-budget-baseline.json`, agreement pinned by
 `tests/vl_sentinel_index_test.ts`.
 
 ## Why
@@ -63,7 +63,7 @@ line before the next):
 > it still has to be tested, but it is the weaker finding and gets its own code.
 
 Both derivations — hole fields and map globals — are read **per module**, from the module's own
-text, so `compiler/lint.vl` (which sees one module) and `sentinel-census.py` (which sees the
+text, so `compiler/lint.vl` (which sees one module) and `sentinel-census.vl` (which sees the
 tree) cannot disagree. Nothing is hard-coded: there is no list of tables, no list of readers, no
 list of hole fields.
 
@@ -76,7 +76,7 @@ warning.
 
 ## The reader census is REPORTING, and the rule deliberately does not filter on it
 
-`scripts/sentinel-census.py --readers` derives **842 readers** from `compiler/*.vl` by three
+`vl run scripts/sentinel-census.vl -- --readers` derives **842 readers** from `compiler/*.vl` by three
 tells, all read from the source: a literal `-1` answer on some path; being the non-strict
 sibling of a `*Strict` twin (that twin's existence *is* the record that this one clamps); and
 being a `*Strict` twin. `--readers --hits` joins it against the hit table:
@@ -103,7 +103,7 @@ because a laundered hole is still a hole.
 ## The five controls, run on both trees
 
 Each fix's parent tree was unpacked with `git archive … | tar -x` and graded with
-`sentinel-census.py --root`. Measured 2026-09-03; the pre-fix trees against master `4490423c`, the counts against master
+the census's `--root` (Python then, since ported to `scripts/sentinel-census.vl`). Measured 2026-09-03; the pre-fix trees against master `4490423c`, the counts against master
 `1fc0d8d8`.
 
 | control | pre-fix tree | fires pre-fix | quiet after |
@@ -258,10 +258,10 @@ compared position for position — **386 = 386, 0 files disagreeing**.
 ## Running it
 
 ```sh
-python3 scripts/sentinel-census.py                    # every hit: file:line, function, table[idx] <- producer
-python3 scripts/sentinel-census.py --readers --hits   # the reader census, joined against the hits
-python3 scripts/sentinel-census.py --holes            # each module's hole fields
-python3 scripts/sentinel-census.py --root <dir>       # grade another tree (a `git archive` unpack)
+vl run scripts/sentinel-census.vl                    # every hit: file:line, function, table[idx] <- producer
+vl run scripts/sentinel-census.vl -- --readers --hits # the reader census, joined against the hits
+vl run scripts/sentinel-census.vl -- --holes          # each module's hole fields
+vl run scripts/sentinel-census.vl -- --root <dir>     # grade another tree (a `git archive` unpack)
 vl check --budget scripts/sentinel-budget-baseline.json                  # the gate: a file may only go down
 vl check --budget-why scripts/sentinel-budget-baseline.json              # what LEFT and what ENTERED (stored entries)
 vl check --budget scripts/sentinel-budget-baseline.json --write-baseline # after a real fix, in the same PR

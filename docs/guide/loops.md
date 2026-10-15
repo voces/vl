@@ -40,7 +40,7 @@ const p = if flip { x: 1, y: 0 } else { x: 0, y: 1 }
 The spellings before the `@` ruling, `B: { … }`, `L: while`, `L: for`, `break :B` and
 `continue :L`, are refused with the one that replaces them
 (`` `B: { … }` is no longer a label; write `@B { … }` ``, `` `break :B` is now `break @B` ``).
-`scripts/codemods/label-at.py` rewrites a file that still uses them.
+`scripts/codemods/label-at.vl` rewrites a file that still uses them.
 
 ## Labelled blocks
 

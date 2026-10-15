@@ -1,0 +1,880 @@
+// Writes tests/cases/simd/int-*.vl: every integer SIMD intrinsic against known vectors. The
+// expected `@log` lines come from a model of the WebAssembly SIMD spec's lane semantics
+// (wrapping, saturating, signed/unsigned, the shift count taken modulo the lane width,
+// narrowing that saturates a signed input). Re-run after changing the intrinsic table, from
+// the root, after scripts/gen-conv-cases.vl (the coverage check reads its float-* cases):
+//
+//     vl run scripts/gen-simd-int-cases.vl
+//
+// `--out DIR` writes under DIR/simd instead of tests/cases.
+
+import { includes } from "std:array"
+import { IoError, readTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { toString } from "std:fmt"
+import { endsWith, join, split, startsWith } from "std:str"
+import { Utf8Error } from "std:utf8"
+import { sortStrings } from "./lib/corpus"
+import {
+  casesRoot,
+  casesText,
+  coverageDirs,
+  fail,
+  intToF32Bits,
+  litI32,
+  pow2,
+  truncSatBits,
+  wrapBits,
+  writeOrDie,
+} from "./lib/wasm-cases"
+
+// ── the reference model: a vector is its sixteen bytes, lane 0 first ────────────────
+// A 64-bit lane is held as its two's-complement i64 whatever its signedness; the only
+// unsigned 64-bit operations the table has (wrapping arithmetic, shr_u, all_true) agree.
+
+function lanes(b: readonly i32[], bits: i32, signed: boolean): i64[] {
+  const n = bits / 8
+  const out: i64[] = []
+  let i = 0
+  while i < 16 {
+    let v: i64 = 0
+    for k in 0 until n { v = v | ((b[i + k] as i64) << ((8 * k) as i64)) }
+    if signed { v = wrapBits(v, bits) }
+    out.push(v)
+    i = i + n
+  }
+  out
+}
+
+function pack(vals: readonly i64[], bits: i32): i32[] {
+  const n = bits / 8
+  const out: i32[] = []
+  for v in vals {
+    for k in 0 until n { out.push(((v >>> ((8 * k) as i64)) & 255) as% i32) }
+  }
+  out
+}
+
+function sat(v: i64, bits: i32, signed: boolean): i64 {
+  let lo: i64 = 0
+  let hi = pow2(bits) - 1
+  if signed {
+    lo = 0 - pow2(bits - 1)
+    hi = pow2(bits - 1) - 1
+  }
+  if v < lo { return lo }
+  if v > hi { return hi }
+  v
+}
+
+function concat(a: readonly i32[], b: readonly i32[]): i32[] {
+  const out: i32[] = []
+  for x in a { out.push(x) }
+  for x in b { out.push(x) }
+  out
+}
+
+function repeat(b: readonly i32[], times: i32): i32[] {
+  const out: i32[] = []
+  for _ in 0 until times {
+    for x in b { out.push(x) }
+  }
+  out
+}
+
+function zeros(n: i32): i32[] { repeat([0], n) }
+
+// One intrinsic: its VL name, the operation `kind`, the lane width and signedness it reads
+// with, and for extend/extmul which half.
+type Op = {
+  name: string,
+  kind: string,
+  bits: i32,
+  signed: boolean,
+  half: string,
+}
+
+function op(name: string, kind: string, bits: i32, signed: boolean): Op {
+  { name: name, kind: kind, bits: bits, signed: signed, half: "" }
+}
+
+function lanePair(
+  kind: string,
+  x: i64,
+  y: i64,
+  bits: i32,
+  signed: boolean,
+): i64 {
+  if kind == "add" { return x + y }
+  if kind == "sub" { return x - y }
+  if kind == "mul" { return x * y }
+  if kind == "add_sat" { return sat(x + y, bits, signed) }
+  if kind == "sub_sat" { return sat(x - y, bits, signed) }
+  if kind == "avgr" { return (x + y + 1) >> 1 }
+  if kind == "q15" { return sat((x * y + 0x4000) >> 15, 16, true) }
+  if kind == "min" {
+    if y < x { return y }
+    return x
+  }
+  if kind == "max" {
+    if y > x { return y }
+    return x
+  }
+  let t = false
+  if kind == "eq" { t = x == y }
+  else if kind == "ne" { t = x != y }
+  else if kind == "lt" { t = x < y }
+  else if kind == "gt" { t = x > y }
+  else if kind == "le" { t = x <= y }
+  else if kind == "ge" { t = x >= y }
+  else { fail("no lane model for " + kind) }
+  if t { return -1 }
+  0
+}
+
+function halfOf(xs: readonly i64[], half: string): i64[] {
+  const h = xs.length / 2
+  if half == "low" { return xs.slice(0, h) }
+  xs.slice(h, xs.length)
+}
+
+function binary(o: Op, a: readonly i32[], b: readonly i32[]): i32[] {
+  const k = o.kind
+  if k == "and" || k == "or" || k == "xor" || k == "andnot" {
+    const out: i32[] = []
+    for i in 0 until 16 {
+      let r = a[i] & (~b[i] & 255)
+      if k == "and" { r = a[i] & b[i] }
+      if k == "or" { r = a[i] | b[i] }
+      if k == "xor" { r = a[i] ^ b[i] }
+      out.push(r)
+    }
+    return out
+  }
+  if k == "swizzle" {
+    const out: i32[] = []
+    for i in b {
+      if i < 16 { out.push(a[i]) } else { out.push(0) }
+    }
+    return out
+  }
+  if k == "dot" {
+    const la = lanes(a, 16, true)
+    const lb = lanes(b, 16, true)
+    const out: i64[] = []
+    let i = 0
+    while i < 8 {
+      out.push(la[i] * lb[i] + la[i + 1] * lb[i + 1])
+      i = i + 2
+    }
+    return pack(out, 32)
+  }
+  if k == "narrow" {
+    const dst = o.bits / 2
+    const out: i64[] = []
+    for x in lanes(a, o.bits, true) { out.push(sat(x, dst, o.signed)) }
+    for x in lanes(b, o.bits, true) { out.push(sat(x, dst, o.signed)) }
+    return pack(out, dst)
+  }
+  const la = lanes(a, o.bits, o.signed)
+  const lb = lanes(b, o.bits, o.signed)
+  if k == "extmul" {
+    const ha = halfOf(la, o.half)
+    const hb = halfOf(lb, o.half)
+    const out: i64[] = []
+    for i in 0 until ha.length { out.push(ha[i] * hb[i]) }
+    return pack(out, o.bits * 2)
+  }
+  const out: i64[] = []
+  for i in 0 until la.length {
+    out.push(lanePair(k, la[i], lb[i], o.bits, o.signed))
+  }
+  pack(out, o.bits)
+}
+
+function popcount(x: i32): i32 {
+  let n = 0
+  let v = x
+  while v != 0 {
+    n = n + (v & 1)
+    v = v >> 1
+  }
+  n
+}
+
+function unary(o: Op, a: readonly i32[]): i32[] {
+  const k = o.kind
+  if k == "not" {
+    const out: i32[] = []
+    for x in a { out.push(~x & 255) }
+    return out
+  }
+  if k == "popcnt" {
+    const out: i32[] = []
+    for x in a { out.push(popcount(x)) }
+    return out
+  }
+  const ls = lanes(a, o.bits, o.signed)
+  const out: i64[] = []
+  if k == "abs" || k == "neg" {
+    for x in ls {
+      if k == "neg" || x < 0 { out.push(0 - x) } else { out.push(x) }
+    }
+    return pack(out, o.bits)
+  }
+  if k == "extend" {
+    for x in halfOf(ls, o.half) { out.push(x) }
+    return pack(out, o.bits * 2)
+  }
+  if k == "extadd" {
+    let i = 0
+    while i < ls.length {
+      out.push(ls[i] + ls[i + 1])
+      i = i + 2
+    }
+    return pack(out, o.bits * 2)
+  }
+  if k == "trunc_sat" {
+    for x in ls { out.push(truncSatBits(x, true, 32, o.signed)) }
+    return pack(out, 32)
+  }
+  if k == "convert" {
+    for x in ls { out.push(intToF32Bits(x)) }
+    return pack(out, 32)
+  }
+  fail("no unary model for " + k)
+  []
+}
+
+function reduce(o: Op, a: readonly i32[]): i64 {
+  if o.kind == "any_true" {
+    for x in a {
+      if x != 0 { return 1 }
+    }
+    return 0
+  }
+  const ls = lanes(a, o.bits, true)
+  if o.kind == "all_true" {
+    for x in ls {
+      if x == 0 { return 0 }
+    }
+    return 1
+  }
+  let m: i64 = 0
+  for i in 0 until ls.length {
+    if ls[i] < 0 { m = m | pow2(i) }
+  }
+  m
+}
+
+// `x` taken modulo `bits`, never negative, as Python's `%`.
+function countMod(n: i32, bits: i32): i64 {
+  let k = n % bits
+  if k < 0 { k = k + bits }
+  k as i64
+}
+
+function shift(kind: string, bits: i32, a: readonly i32[], n: i32): i32[] {
+  const k = countMod(n, bits)
+  const out: i64[] = []
+  if kind == "shl" {
+    for x in lanes(a, bits, false) { out.push(x << k) }
+  } else if kind == "shr_s" {
+    for x in lanes(a, bits, true) { out.push(x >> k) }
+  } else {
+    for x in lanes(a, bits, false) { out.push(x >>> k) }
+  }
+  pack(out, bits)
+}
+
+// ── the intrinsic tables, in the order the cases list them ──────────────────────────
+
+type Shape = { name: string, bits: i32 }
+
+const SHAPES: Shape[] = [
+  { name: "i8x16", bits: 8 },
+  { name: "i16x8", bits: 16 },
+  { name: "i32x4", bits: 32 },
+  { name: "i64x2", bits: 64 },
+]
+
+function bitsOf(shape: string): i32 {
+  for s in SHAPES {
+    if s.name == shape { return s.bits }
+  }
+  fail("no shape " + shape)
+  0
+}
+
+type Sign = { tag: string, signed: boolean }
+
+const SIGNS: Sign[] = [{ tag: "s", signed: true }, { tag: "u", signed: false }]
+
+function binaryTable(): Op[] {
+  const t: Op[] = []
+  for s in SHAPES {
+    const sh = s.name
+    t.push(op("__add_" + sh + "__", "add", s.bits, false))
+    t.push(op("__sub_" + sh + "__", "sub", s.bits, false))
+    t.push(op("__eq_" + sh + "__", "eq", s.bits, false))
+    t.push(op("__ne_" + sh + "__", "ne", s.bits, false))
+    for g in SIGNS {
+      if sh == "i64x2" && !g.signed { continue }
+      for c in ["lt", "gt", "le", "ge"] {
+        t.push(op("__\{c}_\{g.tag}_\{sh}__", c, s.bits, g.signed))
+      }
+    }
+  }
+  for sh in ["i16x8", "i32x4", "i64x2"] {
+    t.push(op("__mul_" + sh + "__", "mul", bitsOf(sh), false))
+  }
+  for sh in ["i8x16", "i16x8"] {
+    for g in SIGNS {
+      t.push(op("__add_sat_\{g.tag}_\{sh}__", "add_sat", bitsOf(sh), g.signed))
+      t.push(op("__sub_sat_\{g.tag}_\{sh}__", "sub_sat", bitsOf(sh), g.signed))
+    }
+    t.push(op("__avgr_u_" + sh + "__", "avgr", bitsOf(sh), false))
+  }
+  for sh in ["i8x16", "i16x8", "i32x4"] {
+    for g in SIGNS {
+      t.push(op("__min_\{g.tag}_\{sh}__", "min", bitsOf(sh), g.signed))
+      t.push(op("__max_\{g.tag}_\{sh}__", "max", bitsOf(sh), g.signed))
+    }
+  }
+  t.push(op("__q15mulr_sat_s_i16x8__", "q15", 16, true))
+  t.push(op("__dot_i16x8_s__", "dot", 16, true))
+  for src in ["i8x16", "i16x8", "i32x4"] {
+    for half in ["low", "high"] {
+      for g in SIGNS {
+        t.push(
+          {
+            name: "__extmul_\{half}_\{src}_\{g.tag}__",
+            kind: "extmul",
+            bits: bitsOf(src),
+            signed: g.signed,
+            half: half,
+          },
+        )
+      }
+    }
+  }
+  for src in ["i16x8", "i32x4"] {
+    for g in SIGNS {
+      t.push(op("__narrow_\{src}_\{g.tag}__", "narrow", bitsOf(src), g.signed))
+    }
+  }
+  for k in ["and", "or", "xor", "andnot"] {
+    t.push(op("__" + k + "_v128__", k, 8, false))
+  }
+  t.push(op("__swizzle_i8x16__", "swizzle", 8, false))
+  t
+}
+
+function unaryTable(): Op[] {
+  const t: Op[] = [
+    op("__not_v128__", "not", 8, false),
+    op("__popcnt_i8x16__", "popcnt", 8, false),
+  ]
+  for s in SHAPES {
+    t.push(op("__abs_" + s.name + "__", "abs", s.bits, true))
+    t.push(op("__neg_" + s.name + "__", "neg", s.bits, true))
+  }
+  for src in ["i8x16", "i16x8", "i32x4"] {
+    for half in ["low", "high"] {
+      for g in SIGNS {
+        t.push(
+          {
+            name: "__extend_\{half}_\{src}_\{g.tag}__",
+            kind: "extend",
+            bits: bitsOf(src),
+            signed: g.signed,
+            half: half,
+          },
+        )
+      }
+    }
+  }
+  for src in ["i8x16", "i16x8"] {
+    for g in SIGNS {
+      t.push(
+        op("__extadd_pairwise_\{src}_\{g.tag}__", "extadd", bitsOf(src), g.signed),
+      )
+    }
+  }
+  t.push(op("__trunc_sat_f32x4_s__", "trunc_sat", 32, true))
+  t.push(op("__trunc_sat_f32x4_u__", "trunc_sat", 32, false))
+  t.push(op("__convert_i32x4_s__", "convert", 32, true))
+  t.push(op("__convert_i32x4_u__", "convert", 32, false))
+  t
+}
+
+function reduceTable(): Op[] {
+  const t: Op[] = [op("__any_true_v128__", "any_true", 8, false)]
+  for s in SHAPES {
+    t.push(op("__all_true_" + s.name + "__", "all_true", s.bits, false))
+    t.push(op("__bitmask_" + s.name + "__", "bitmask", s.bits, true))
+  }
+  t
+}
+
+// ── the inputs ──────────────────────────────────────────────────────────────────────
+// Byte-lane edges (0, ±1, the i8/u8 bounds), i16, i32 and i64 edges: each pair is a
+// 128-bit pattern every shape reads its own way. f1..f3 are f32 bit patterns for the
+// truncations: fractions, out of range, NaN, ±inf, -0.
+
+type Vec = { name: string, bytes: i32[] }
+
+function vecs(): Vec[] {
+  const a16: i64[] = [
+    0x7fff, 0x8000, 0xffff, 0x0001, 0x4000, 0xc000, 0x1234, 0x8001,
+  ]
+  const b16: i64[] = [
+    0x0001, 0xffff, 0x8000, 0x7fff, 0x4000, 0x4000, 0xedcc, 0x8000,
+  ]
+  const a32: i64[] = [0x7fffffff, 0x80000000, 0xffffffff, 12345]
+  const b32: i64[] = [1, 0xffffffff, 0x80000000, -54321]
+  const a64: i64[] = [pow2(63) - 1, pow2(63)]
+  const b64: i64[] = [-1, 0x100000001]
+  const f1: i64[] = [0x3FC00000, 0xBFC00000, 0x4F32D05E, 0xCF32D05E] // 1.5, -1.5, ±3e9
+  const f2: i64[] = [0x7fc00000, 0x7f800000, 0xff800000, 0x80000000]
+  // 2147483520.0, 4294967040.0, -0.75, 0.9999
+  const f3: i64[] = [0x4EFFFFFF, 0x4F7FFFFF, 0xBF400000, 0x3F7FF972]
+  [
+    {
+      name: "a8",
+      bytes: [0, 1, 127, 128, 255, 254, 129, 126, 64, 192, 100, 200, 3, 250, 17, 240],
+    },
+    {
+      name: "b8",
+      bytes: [0, 255, 1, 128, 1, 3, 129, 130, 64, 64, 156, 100, 253, 10, 17, 16],
+    },
+    { name: "a16", bytes: pack(a16, 16) },
+    { name: "b16", bytes: pack(b16, 16) },
+    { name: "a32", bytes: pack(a32, 32) },
+    { name: "b32", bytes: pack(b32, 32) },
+    { name: "a64", bytes: pack(a64, 64) },
+    { name: "b64", bytes: pack(b64, 64) },
+    { name: "f1", bytes: pack(f1, 32) },
+    { name: "f2", bytes: pack(f2, 32) },
+    { name: "f3", bytes: pack(f3, 32) },
+    {
+      name: "sw",
+      bytes: [15, 0, 16, 255, 3, 3, 128, 1, 31, 14, 2, 17, 7, 8, 9, 200],
+    },
+  ]
+}
+
+const VECS = vecs()
+
+function V(name: string): i32[] {
+  for v in VECS {
+    if v.name == name { return v.bytes }
+  }
+  fail("no vector " + name)
+  []
+}
+
+const PAIRS: string[][] = [
+  ["a8", "b8"],
+  ["a16", "b16"],
+  ["a32", "b32"],
+  ["a64", "b64"],
+]
+
+// ── the VL program ──────────────────────────────────────────────────────────────────
+
+const PRELUDE = [
+  "// Scratch vectors live at bytes 0..63 of linear memory; a vector is built from four i32",
+  "// words stored there and read back, and shown as its four i32 words, lane 0 first.",
+  "function v(a: i32, b: i32, c: i32, d: i32): v128 {", "  __store_i32__(0, a)",
+  "  __store_i32__(4, b)", "  __store_i32__(8, c)", "  __store_i32__(12, d)",
+  "  __load_v128__(0)", "}", "", "function show(x: v128) {",
+  "  __store_v128__(16, x)", "  print(__load_i32__(16))",
+  "  print(__load_i32__(20))", "  print(__load_i32__(24))",
+  "  print(__load_i32__(28))", "}", "",
+]
+
+// `  fn(expr)` laid out the way `vl fmt` lays it out at its 80-column limit.
+function fmtCall(fn: string, expr: string): string {
+  const flat = "  \{fn}(\{expr})"
+  if flat.length <= 80 { return flat }
+  if ("    " + expr + ",").length <= 80 { return "  \{fn}(\n    \{expr},\n  )" }
+  const open = expr.indexOf("(")
+  const callee = expr.slice(0, open)
+  const args = expr.slice(open + 1, expr.length - 1).split(", ")
+  let inner = ""
+  for a in args { inner = inner + "      " + a + ",\n" }
+  "  \{fn}(\n    \{callee}(\n\{inner}    ),\n  )"
+}
+
+type Case = {
+  path: string,
+  blurb: string[],
+  body: string[],
+  logs: string[],
+  used: string[],
+}
+
+function newCase(path: string, blurb: string[]): Case {
+  { path: path, blurb: blurb, body: [], logs: [], used: [] }
+}
+
+function use(c: Case, name: string): string {
+  if !c.used.includes(name) { c.used.push(name) }
+  name
+}
+
+function show(c: Case, expr: string, b: readonly i32[]) {
+  c.body.push(fmtCall("show", expr))
+  for w in lanes(b, 32, true) { c.logs.push(toString(w)) }
+}
+
+function scalar(c: Case, expr: string, v: i64) {
+  c.body.push("  print(" + expr + ")")
+  c.logs.push(toString(v))
+}
+
+function write(c: Case) {
+  const text = ["// @run"]
+  for l in c.logs { text.push("// @log " + l) }
+  for l in c.blurb { text.push("// " + l) }
+  text.push(
+    "// Generated by scripts/gen-simd-int-cases.vl; the expected lines are its model of the",
+  )
+  text.push("// WebAssembly SIMD spec. Edit the generator, not this file.")
+  for l in PRELUDE { text.push(l) }
+  text.push("function main() {")
+  for n in sortStrings(c.used) {
+    const ws: string[] = []
+    for w in lanes(V(n), 32, true) { ws.push(litI32(w)) }
+    text.push("  const \{n} = v(\{join(ws, ", ")})")
+  }
+  for l in c.body { text.push(l) }
+  text.push("}")
+  text.push("main()")
+  text.push("")
+  writeOrDie(c.path, join(text, "\n"))
+}
+
+function genBinary(dir: string) {
+  const c = newCase(
+    dir + "/int-binary.vl",
+    [
+      "Every two-vector integer SIMD intrinsic over four input pairs whose lanes sit on the",
+      "i8, i16, i32 and i64 edges: wrapping and saturating add/sub, mul, min/max, avgr, q15mulr,",
+      "dot, extmul, narrow (a SIGNED input saturated to the target range), the v128 bitwise ops,",
+      "swizzle (an index of 16 or more gives 0) and the compares (a lane of -1 where true).",
+    ],
+  )
+  for o in binaryTable() {
+    if o.kind == "swizzle" {
+      for a in ["a8", "b16"] {
+        show(
+          c,
+          "\{o.name}(\{use(c, a)}, \{use(c, "sw")})",
+          binary(o, V(a), V("sw")),
+        )
+      }
+      continue
+    }
+    for p in PAIRS {
+      show(
+        c,
+        "\{o.name}(\{use(c, p[0])}, \{use(c, p[1])})",
+        binary(o, V(p[0]), V(p[1])),
+      )
+    }
+  }
+  write(c)
+}
+
+function genUnary(dir: string) {
+  const c = newCase(
+    dir + "/int-unary.vl",
+    [
+      "Every one-vector integer SIMD intrinsic: abs and neg (abs of the minimum wraps to itself),",
+      "not, popcnt, extend and extadd_pairwise at each signedness, the f32 truncations (NaN is 0,",
+      "out of range saturates) and conversions, and the reductions to an i32.",
+    ],
+  )
+  for o in unaryTable() {
+    let srcs = ["a8", "a16", "a32", "a64", "b8", "b16", "b32", "b64"]
+    if startsWith(o.name, "__trunc_sat") { srcs = ["f1", "f2", "f3"] }
+    for a in srcs { show(c, o.name + "(" + use(c, a) + ")", unary(o, V(a))) }
+  }
+  for o in reduceTable() {
+    for v in VECS {
+      scalar(c, o.name + "(" + use(c, v.name) + ")", reduce(o, v.bytes))
+    }
+    // the all-zero, all-ones and all-one-but-no-sign-bit edges
+    scalar(c, o.name + "(__splat_i32x4__(0))", reduce(o, zeros(16)))
+    scalar(c, o.name + "(__splat_i32x4__(-1))", reduce(o, repeat([255], 16)))
+    scalar(c, o.name + "(__splat_i16x8__(1))", reduce(o, repeat([1, 0], 8)))
+  }
+  write(c)
+}
+
+function genShift(dir: string) {
+  const c = newCase(
+    dir + "/int-shift.vl",
+    [
+      "The twelve shifts. The count is an i32 taken modulo the lane width, so a count of the",
+      "width or more shifts by the remainder and a negative count by its low bits; shr_s",
+      "copies the sign bit in, shr_u shifts zeros in. A count held in a variable is the same.",
+    ],
+  )
+  const counts = [0, 1, 7, 8, 9, 15, 16, 31, 32, 33, 63, 64, 65, -1]
+  for s in SHAPES {
+    const bits = s.bits
+    for kind in ["shl", "shr_s", "shr_u"] {
+      const name = "__\{kind}_\{s.name}__"
+      let srcs = ["a8"]
+      if bits != 8 { srcs = ["a" + toString(bits), "a8"] }
+      for a in srcs {
+        for n in counts {
+          show(
+            c,
+            "\{name}(\{use(c, a)}, \{toString(n)})",
+            shift(kind, bits, V(a), n),
+          )
+        }
+      }
+      const vn = "n_" + kind + "_" + s.name
+      const step = bits / 4 + 1
+      c.body.push("  let " + vn + " = 0")
+      c.body.push("  while \{vn} < \{toString(bits + 3)} {")
+      c.body.push("    show(\{name}(\{use(c, "b16")}, \{vn}))")
+      c.body.push("    \{vn} = \{vn} + \{toString(step)}")
+      c.body.push("  }")
+      let n = 0
+      while n < bits + 3 {
+        for w in lanes(shift(kind, bits, V("b16"), n), 32, true) {
+          c.logs.push(toString(w))
+        }
+        n = n + step
+      }
+    }
+  }
+  write(c)
+}
+
+function splatBytes(x: i64, bits: i32): i32[] {
+  const vals: i64[] = []
+  for _ in 0 until 128 / bits { vals.push(x) }
+  pack(vals, bits)
+}
+
+function genLanes(dir: string) {
+  const c = newCase(
+    dir + "/int-lanes.vl",
+    [
+      "Splat, extract_lane (signed and unsigned) and replace_lane for every integer shape, each",
+      "lane index a literal; the widening, splatting and zeroing loads; and i8x16.shuffle,",
+      "whose sixteen literal indices pick bytes 0..15 of the first vector and 16..31 of the second.",
+    ],
+  )
+  const a = V("a8")
+  for s in SHAPES {
+    const bits = s.bits
+    let signs: Sign[] = [{ tag: "", signed: true }]
+    if bits < 32 { signs = SIGNS }
+    let src = "a64"
+    if bits < 64 { src = "a8" }
+    for g in signs {
+      let nm = "__extract_lane_" + s.name + "__"
+      if g.tag != "" { nm = "__extract_lane_\{g.tag}_\{s.name}__" }
+      const ls = lanes(V(src), bits, g.signed)
+      for i in 0 until 128 / bits {
+        scalar(c, "\{nm}(\{use(c, src)}, \{toString(i)})", ls[i])
+      }
+    }
+  }
+  const splats: i64[] = [
+    0,
+    1,
+    -1,
+    127,
+    128,
+    255,
+    256,
+    32767,
+    32768,
+    65535,
+    65536,
+    0 - pow2(31),
+  ]
+  for sh in ["i8x16", "i16x8", "i32x4"] {
+    const bits = bitsOf(sh)
+    for x in splats {
+      show(c, "__splat_\{sh}__(\{litI32(x)})", splatBytes(x, bits))
+    }
+    for i in 0 until 128 / bits {
+      const ls = lanes(a, bits, false)
+      ls[i] = (-2 - i) as i64
+      const e = "__replace_lane_\{sh}__(\{use(c, "a8")}, \{toString(i)}, \{toString(-2 - i)})"
+      show(c, e, pack(ls, bits))
+    }
+  }
+  // the i64x2 lane ops take and give an i64
+  const odd: i64 = 81985529216486895
+  c.body.push("  const big = -9223372036854775807 - 1")
+  c.body.push("  const odd = 81985529216486895")
+  show(c, "__splat_i64x2__(big)", splatBytes(pow2(63), 64))
+  show(c, "__splat_i64x2__(odd)", splatBytes(odd, 64))
+  show(
+    c,
+    "__replace_lane_i64x2__(" + use(c, "a64") + ", 0, odd)",
+    pack([odd, pow2(63)], 64),
+  )
+  show(
+    c,
+    "__replace_lane_i64x2__(" + use(c, "a64") + ", 1, odd)",
+    pack([pow2(63) - 1, odd], 64),
+  )
+  scalar(c, "__extract_lane_i64x2__(__splat_i64x2__(odd), 1) + 1", odd + 1)
+  // loads: the 16 bytes of a8 at byte 32, then each load form at byte 32 (and 37, unaligned)
+  c.body.push("  __store_v128__(32, a8)")
+  use(c, "a8")
+  const mem = concat(a, zeros(16))
+  // a splat of a value read at run time, which no optimizer can fold to a constant
+  const w0 = lanes(a, 32, true)[0]
+  for sh in ["i8x16", "i16x8", "i32x4"] {
+    show(
+      c,
+      "__splat_" + sh + "__(__load_i32__(32))",
+      splatBytes(w0, bitsOf(sh)),
+    )
+  }
+  show(c, "__splat_i64x2__(__load_i64__(32))", repeat(a.slice(0, 8), 2))
+  for off in [32, 37] {
+    const m = mem.slice(off - 32, mem.length)
+    const low = concat(m.slice(0, 8), zeros(8))
+    const loads: string[] = [
+      "__load8x8_s_v128__", "__load8x8_u_v128__", "__load16x4_s_v128__",
+      "__load16x4_u_v128__", "__load32x2_s_v128__", "__load32x2_u_v128__",
+      "__load8_splat_v128__", "__load16_splat_v128__", "__load32_splat_v128__",
+      "__load64_splat_v128__", "__load32_zero_v128__", "__load64_zero_v128__",
+      "__load_v128__",
+    ]
+    const vals: i32[][] = [
+      pack(lanes(low, 8, true).slice(0, 8), 16),
+      pack(lanes(low, 8, false).slice(0, 8), 16),
+      pack(lanes(low, 16, true).slice(0, 4), 32),
+      pack(lanes(low, 16, false).slice(0, 4), 32),
+      pack(lanes(low, 32, true).slice(0, 2), 64),
+      pack(lanes(low, 32, false).slice(0, 2), 64),
+      repeat(m.slice(0, 1), 16),
+      repeat(m.slice(0, 2), 8),
+      repeat(m.slice(0, 4), 4),
+      repeat(m.slice(0, 8), 2),
+      concat(m.slice(0, 4), zeros(12)),
+      concat(m.slice(0, 8), zeros(8)),
+      m.slice(0, 16),
+    ]
+    for k in 0 until loads.length {
+      show(c, loads[k] + "(" + toString(off) + ")", vals[k])
+    }
+  }
+  // shuffles: identity, the other vector, an interleave, a reversal, one lane everywhere
+  const ab = concat(a, V("b8"))
+  const idxs: i32[][] = [[], [], [], [], [], []]
+  for i in 0 until 16 {
+    idxs[0].push(i)
+    idxs[1].push(16 + i)
+    idxs[2].push(i / 2 + 16 * (i % 2))
+    idxs[3].push(31 - i)
+    idxs[4].push(5)
+    idxs[5].push(31 * (i % 2))
+  }
+  for idx in idxs {
+    const ns: string[] = []
+    const out: i32[] = []
+    for i in idx {
+      ns.push(toString(i))
+      out.push(ab[i])
+    }
+    const e = "__shuffle_i8x16__(\{use(c, "a8")}, \{use(c, "b8")}, \{join(ns, ", ")})"
+    show(c, e, out)
+  }
+  // bitselect takes the first vector's bit where the mask bit is set
+  const sel: i32[] = []
+  const b = V("b8")
+  const mk = V("a16")
+  for i in 0 until 16 { sel.push((a[i] & mk[i]) | (b[i] & (~mk[i] & 255))) }
+  const e = "__bitselect_v128__(\{use(c, "a8")}, \{use(c, "b8")}, \{use(c, "a16")})"
+  show(c, e, sel)
+  write(c)
+}
+
+function isTableChar(b: i32): boolean {
+  (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+// Every quoted `"__name__"` in `text`, as `re.findall(r'"(__[a-z0-9_]+__)"', text)`.
+function quotedIntrinsics(text: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < text.length {
+    if text[i] != 34 {
+      i = i + 1
+      continue
+    }
+    let j = i + 1
+    while j < text.length && isTableChar(text[j]) { j = j + 1 }
+    const s = text.slice(i + 1, j)
+    if (
+      j < text.length
+      && text[j] == 34
+      && s.length >= 5
+      && startsWith(s, "__")
+      && s.endsWith("__")
+    ) {
+      if !out.includes(s) { out.push(s) }
+      i = j + 1
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Every non-f32x4 row of the compiler's intrinsic table appears in a case: the int-* files
+// written here, or the float-* ones scripts/gen-conv-cases.vl writes.
+function checkCoverage(root: string) {
+  const src = readTextFile("compiler/typecheck.vl")
+  if src is IoError {
+    fail("cannot read compiler/typecheck.vl: " + src.msg)
+    return
+  }
+  const at = src.indexOf("function simdTableBuild()")
+  if at < 0 { fail("no simdTableBuild in compiler/typecheck.vl") }
+  let body = src.slice(at, src.length)
+  const end = body.indexOf("\n}\n")
+  if end < 0 { fail("simdTableBuild has no closing brace") }
+  body = body.slice(0, end)
+  const text = casesText(coverageDirs(root, "simd"), ["int-", "float-"])
+  const missing: string[] = []
+  for n in quotedIntrinsics(body) {
+    if !n.includes("f32x4__") && !text.includes(n + "(") { missing.push(n) }
+  }
+  if missing.length > 0 {
+    fail("rows with no generated case: " + join(sortStrings(missing), ", "))
+  }
+}
+
+function main() {
+  const args = programArgs()
+  if args is Utf8Error {
+    fail("gen-simd-int-cases: an argument is not UTF-8")
+    return
+  }
+  const root = casesRoot(args)
+  const dir = root + "/simd"
+  genBinary(dir)
+  genUnary(dir)
+  genShift(dir)
+  genLanes(dir)
+  checkCoverage(root)
+}
+
+main()

@@ -147,6 +147,6 @@ the literal. A row comes OFF when its witness starts RUNNING, in the PR that clo
 `--live-sites` reds until it does, and also on a witness that drifted onto another message or
 a literal that has left `compiler/*.vl`.
 
-`python3 scripts/emit-refusal-sites.py` re-derives the population the list is a subset of:
+`vl run scripts/emit-refusal-sites.vl` re-derives the population the list is a subset of:
 sites, templates, and which ones the wording predicate misses, grouped by the verb they reach
 for. `docs/internals/emit-refusal-wording-2026-09.md` is the measurement that built the list.

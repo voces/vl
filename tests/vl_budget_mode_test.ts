@@ -181,7 +181,7 @@ Deno.test({
 });
 
 // THE SENTINEL RATCHET RIDES THE SAME MODE, WITH ITS OWN SENTENCES. Its baseline names an
-// `ok` template and a `remedy` paragraph, and the census (scripts/sentinel-census.py, an
+// `ok` template and a `remedy` paragraph, and the census (scripts/sentinel-census.vl, an
 // independent implementation) must agree with the lint's count file by file.
 Deno.test({
   name:
