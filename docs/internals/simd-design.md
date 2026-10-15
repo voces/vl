@@ -670,7 +670,7 @@ against a real kernel while S4's voxel shapes are built.
 
 ### G1. Tier 1: the raw intrinsics
 
-One table, `simdTableBuild` in `compiler/typecheck.vl`, holds every SIMD intrinsic: its name,
+One table, `simdTableBuild` in `compiler/check_intrinsics.vl`, holds every SIMD intrinsic: its name,
 its `0xFD` sub-opcode, its operand shape and, for a lane row, the highest lane. The checker's
 declarations, its definition reservation and lane-literal check, the emitter's dispatch and the
 import scan all read it, so adding an instruction is one row. Each takes and gives a bare `v128`
