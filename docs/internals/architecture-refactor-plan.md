@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, eighth part moves the literal arms of `monoCoerceFnValueName` onto the table's per-slot pin of the literal itself. Next: the concrete half of `monoNotePushDeliveries` (hole-lambda pushes); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
+| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, ninth part retires the concrete half of `monoNotePushDeliveries` (a stored value flows into its slot one way). Next: the element store's concrete read in `monoWalk`; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a call an instance re-makes records its template's type (campaign §13.22). Next: the untyped remainders by minting pass (mono `if`, `captureBoxRewrite` `Index`), the typed remainders (`_[] | null`, `d3140_*`), `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -216,6 +216,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The sixth part retires `monoPinGenericList` (with `monoFeIsSrc`, `monoCallsPerRead`, `monoPinSigWithRet`, `monoListElemWrites`, `monoListElemCalls`): a list element and its writes, `d[0] = v` included, are pinned at the table's `e` signature, and a spread copy re-plans the list it expanded into; closes D4301.
 - The seventh part retires `monoStoreAnnName` (with `monoLocalAnnName`, `monoInstTyName`, `monoFieldAnnName`): a store `p[k] = v` / `p.f = v`, a `push` and a map `set` deliver at the one signature the table pins the place's slot at in that frame, read by declaration and path; 0 of 1,679 generic and lambda fixtures and 0 corpus classes moved.
 - The eighth part moves the list and record literal arms of `monoCoerceFnValueName` off the expected type's spelling (retiring `monoStructFieldTypes`, `monoGenAliasFieldTypes`, `monoArrElemHoldsFn`): each element or field value delivers at the table's pin of the literal's own `e` / `f.<name>` slot, with the annotated return; 0 of 3,844 `@run` fixtures differ, forcing the pin empty loses exactly the 10 the two arms' ablations lose, and difftree is byte-identical. The concrete half of `monoNotePushDeliveries` stays: reading only the slot pin loses the 5 hole-lambda push fixtures its ablation loses.
+- The ninth part retires the concrete half of `monoNotePushDeliveries`: a push or `set` delivers at the table's slot pin only. The 5 fixtures lacked a pin because `ffMethod` stored with a two-way `ffUnion`, so an element slot saw the pins of the lambda's other deliveries. A one-way `ffInto` gives each slot its one pin. 0 of 3,844 `@run` fixtures differ, and reverting the edge alone loses exactly the 5. `difftree --identity`: 2 of 10,204 modules differ, both with the same output (a removed second coerce, and a direct instance read).
 
 ### L2 log
 
