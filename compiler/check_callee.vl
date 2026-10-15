@@ -15,6 +15,7 @@ import {
   OP_INDEX_GET,
   OP_INDEX_SET,
   P,
+  Paren,
   elseIfLink,
   i32ToStr,
   isBinOpFuncName,
@@ -49,7 +50,7 @@ import {
   cwLambdaDeclOf,
   fnDeclIx,
 } from "./check_write_scan"
-import { strListHas } from "./listutil"
+import { strListHas, strListIndexOf } from "./listutil"
 
 // Every `function "[]"(self: T, …)` / `function "[]="(self: T, …)` the program declares, as the
 // operator it implements and the possibly merge-mangled name it declared under, collected by the
@@ -145,6 +146,36 @@ export function callArgPlaces(cn: Call, callIx: i32) {
   out
 }
 
+// The parameters of a callback not yet checked whose type is already known, so a write check run
+// before its body (`cbElemNarrowFor`) resolves a method called on one (`cbPendCollect`).
+export let cbPendNames: string[] = []
+export let cbPendTys: i32[] = []
+
+export function cbPendClear() {
+  cbPendNames = []
+  cbPendTys = []
+  0
+}
+
+// The type recorded for the method receiver `ix`, or for a not-yet-checked callback parameter
+// it names, the type `cbPendCollect` gave it; -1 when neither is known.
+export function recvTyOf(ix: i32): i32 {
+  const t = nodeTyOf(ix)
+  if t >= 0 || cbPendNames.length == 0 { return t }
+  let px = ix
+  while px >= 0 && px < P.nodes.length && P.nodes[px] is Paren {
+    const pn = P.nodes[px]
+    if pn is Paren { px = pn.parInner }
+  }
+  if px < 0 || px >= P.nodes.length { return -1 }
+  const n = P.nodes[px]
+  if n is Ident {
+    const j = strListIndexOf(cbPendNames, n.identName)
+    if j >= 0 { return cbPendTys[j] }
+  }
+  -1
+}
+
 // The callee classification behind every invalidation decision: `>= 0` is the `FuncDecl` the call
 // resolves to statically, with a UFCS receiver at parameter 0; `-1` is opaque — a function value,
 // a struct field holding one, or an unresolved receiver — so assume it writes anything reachable;
@@ -171,7 +202,7 @@ export function callDeclFnIx(cn: Call, callIx: i32) {
   }
   if cf is Member {
     // A built-in of the receiver's type runs whatever `self`-function shares its name.
-    if builtinMethodOn(nodeTyOf(cf.memObj), cf.memProp) { return -2 }
+    if builtinMethodOn(recvTyOf(cf.memObj), cf.memProp) { return -2 }
     const d = lookupFnDeclNode(cf.memProp)
     if d >= 0 { return d }
     // A `self`-function merged from another module, by the name this site resolved to.
@@ -192,7 +223,7 @@ export function callDeclFnIx(cn: Call, callIx: i32) {
 // A non-UFCS member callee: a struct field holding a function is opaque, the value it holds not
 // being statically one body; anything else is a collection or string method.
 function memberCalleeKind(cf: Member) {
-  const rt = nodeTyOf(cf.memObj)
+  const rt = recvTyOf(cf.memObj)
   if rt < 0 {
     return -1 // receiver type unresolved → fail closed
   }
@@ -411,6 +442,7 @@ export function calleeReset() {
   opBinSiteFn = []
   weRoots = []
   weFnDecls = Map()
+  cbPendClear()
   0
 }
 
