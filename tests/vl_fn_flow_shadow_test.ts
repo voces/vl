@@ -75,9 +75,9 @@ function inc(x: i32): i32 { x + 1 }
 print(ap(inc, 2))
 `;
 
-// One binding written with a generic and called at two signatures: the table calls the class
-// multi-pin, and the monomorphizer refuses the same binding (`monoBindSigFail`) at the first
-// call through it, after instancing `id` once for the binding and once for the write.
+// One binding written with a generic and called at two signatures: the compile that builds
+// splits it into one binding per call type (D3975, `compiler/fn_split.vl`), and the table then
+// agrees with each instance of `id` at the binding and at the write.
 const MULTI = `function id<T>(x: T): T { x }
 let k = id
 k = id
@@ -109,10 +109,9 @@ const CASES: [string, string, number, string][] = [
   [
     "MULTI",
     MULTI,
-    3,
-    "disagree: one instance for a class of several pins | binding | id=1; " +
-    "disagree: one instance for a class of several pins | write | id=1; " +
-    "multi-pin: both | binding | k=1",
+    0,
+    "agree | binding | id$1=1; agree | binding | id=1; agree | write | id$1=1; " +
+    "agree | write | id=1",
   ],
   [
     "H05",
