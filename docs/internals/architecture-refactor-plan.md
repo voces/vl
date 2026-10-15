@@ -34,8 +34,8 @@ restate measurements; follow the links.
 | L10 the `-O` optimizer | **in progress as T4**. Last: R6d, the compiler's inline-record step is the default and the host's fields step is deleted; 0 of 15,406 programs differ. Next: R7, list flattening. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
-| L13 host import surface, errno once | first PR (A5) **done**. Last: `HOST_FLOOR` (`main.rs`) is the host floor in one table, held to the compiler by `tests/vl_host_floor_test.ts`. Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the capture-retire, narrowing-bank, symbol-occurrence and effect-summary tables moved into four modules that own their resets; 57,217 → 56,579 lines. Next: `fnWriteShapes`, which frees 28. | [L9 log](#l9-log) |
+| L13 host import surface, errno once | first PR (A5) **done**. Last: the host answers `EPERM` for a POSIX EPERM (`permission_errno`). Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: the callee lookup moved to `check_callee.vl` and the write-effect summaries to `check_write_effects.vl`; 56,579 → 55,507 lines. Next: the `covarWriteThrough` steps. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -338,9 +338,10 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - State on 2026-10-14: first PR (A5) **done**
 - `mod wasi` in `scripts/vl-host/src/main.rs` is the host's one statement of errno numbers; `wasi_errno`, `wasi_errno_at`, `os_path`, `os_string` and every handler name its consts.
 - `tests/vl_errno_agreement_test.ts` (#3732) holds it, `std/fs.vl` and WASI preview1's numbering in agreement, lists each one-sided code with its reason, and refuses an errno literal in `main.rs` or an errno const elsewhere in `std/`.
-- It found no wrong number; `EPERM` is named by std and never answered by the host (a POSIX EPERM reads as `PermissionDenied` and becomes `EACCES`).
+- It found no wrong number. `EPERM` was named by std and never answered by the host, because a POSIX EPERM reads as `PermissionDenied` and became `EACCES`; that is fixed below.
 - Next: the import table (the `scripts/wasmtime-host.rs` spike is deleted).
 - The host floor (17 imports under `std:fs`, `std:args`, `std:process`, `std:env`) was stated in six places with no check between them: the compiler's slot list (`fsIntrinsicNameAt`), the checker's `declare` rows, the builtin list's `blPush` rows, `register_fs_imports`' 17 hand-written blocks, the Deno stubs, and the std callers. `HOST_FLOOR` in `main.rs` is now one row per import (name, signature, handler); `tests/vl_host_floor_test.ts` holds its names to the slot list, the checker, the builtin list and the stubs, and its signatures to the checker and the builtin list; the registrar refuses an import whose declared arity differs from its row. The seed is byte-identical and output identity holds. Next: derive the compiler's per-slot predicates (`fsArgIsU8List` … `fsSlotTouchesMemory`) from one signature table.
+- Owner ruling 2026-10-15 (a): the host answers `EPERM` for raw errno 1 and `EACCES` for 13. `permission_errno` reads the raw errno under `PermissionDenied`, and every other platform answer stays `EACCES`. `STD_ONLY` in the agreement test is empty. A Rust unit test pins the mapping, and `tests/vl_std_fs_permission_test.ts` asks the OS for both: a write to `/proc/self/uid_map` gives EPERM, and a read of a mode-000 file gives EACCES.
 
 ### L9 log
 
@@ -415,6 +416,11 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - `check_capture_rows.vl` holds the 72 capture-retire tables and `crReset`. `check_nar_bank.vl` holds the narrowing bank (`asgDecl*`, `noteNarShadow`, `narDeclaredTy`) with `narBankReset` and the scope frame steps. `check_sym_occ.vl` holds `symDecl`, `symUse`, `symResolve`, the pending uses and the scope span stack, with `symOccReset`, `symScopePush`, `symSpanPush` and `symScopePop`. `check_effect_rows.vl` holds the effect-summary rows and `esReset`.
   - Each seed compiles the other tree's source to that tree's fixpoint byte for byte. Output identity holds over 15,195 files (0 differ), and the distilled corpus moved no cell. Two `kind-ladder-incomplete` findings moved with `symMem` and `symMemMethod` into `check_sym_occ.vl`.
   - Measured after these moves (2,597 declarations, 723 pure), the next roots are `fnWriteShapes` (60 declarations, 19 `let`s, 759 lines; frees 28, 594 lines) and `fnWriteFreePaths` (37, 11 `let`s, 464; frees 25, 514). `crRootCaptureWiden` (41, 6 `let`s, 554; frees 24, 520) reaches the callee lookup (`findFnDecl*`, `builtinMethod*`, `opIdx*`), which would move first as its own module.
+- The callee lookup and the write-effect summaries moved out, and `typecheck.vl` fell from 56,579 to 55,507 lines. Neither module imports `typecheck.vl`.
+  - `compiler/check_callee.vl` (34 declarations) holds `callDeclFnIx` and the `findFnDecl*` walk over the `weRoots` stack, the built-in method tables (`builtinMethod*`, `BME_*`), and the declared and resolved operator tables (`opIdx*`, `opBin*`); `calleeReset` clears them, and `emit_rewrite.vl` imports `opIdxFnAtNode` and `opBinFnAtNode` from it.
+  - `compiler/check_write_effects.vl` gained the summary engine (42 declarations): `fnWriteEffects`, `fnWriteShapes`, `fnWriteFreePaths`, their caches, the cycle cut and the provisional rows. `weReset` and `weUnresDrop` replace the checker's direct writes.
+  - Each seed compiles the other tree's source to that tree's fixpoint byte for byte, and the seed grows 16 bytes (5,735,117 to 5,735,133). Output identity holds over 15,196 files (0 differ), and the distilled corpus moved no cell. One `kind-ladder-incomplete` finding moved with `callDeclFnIx` into `check_callee.vl`.
+  - Measured after these moves (2,521 declarations), the next roots are the `covarWriteThrough` steps (19 declarations, no `let`s, 480 lines, 2 names back) and `crRootCaptureWiden` (24, 347 lines). `crRootCaptureWiden` reaches `inferQuiet`, which `constrainEmptyExpr`, `f32LitJoinOf`, `arrDefOperandElemPeek` and `asgReadElemPin` also write, so that flag moves to a state module first.
 
 ### SMALL log
 

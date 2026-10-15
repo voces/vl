@@ -4310,6 +4310,7 @@ mod wasi {
     pub const ENOTDIR: i32 = 54;
     pub const ENOTEMPTY: i32 = 55;
     pub const ENOTSUP: i32 = 58;
+    pub const EPERM: i32 = 63;
     pub const EROFS: i32 = 69;
     pub const ESPIPE: i32 = 70;
     pub const EXDEV: i32 = 75;
@@ -4334,14 +4335,15 @@ fn wasi_errno_at(e: &std::io::Error, p: &std::path::Path) -> i32 {
 ///
 /// `ErrorKind` FIRST, raw errno second. The kind is portable and stable, so the common
 /// filesystem outcomes map identically on every OS; the raw table below it is Linux
-/// numbering and only catches what no kind names. Anything unrecognized becomes `EIO`
-/// rather than passing through as a number `std:fs` cannot interpret — an
+/// numbering and only catches what no kind names. The one kind that needs the raw errno
+/// as well is `PermissionDenied`, which `permission_errno` splits. Anything unrecognized
+/// becomes `EIO` rather than passing through as a number `std:fs` cannot interpret — an
 /// unmatchable code reaches the caller as an error that looks like none of them.
 fn wasi_errno(e: &std::io::Error) -> i32 {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::NotFound => return wasi::ENOENT,
-        ErrorKind::PermissionDenied => return wasi::EACCES,
+        ErrorKind::PermissionDenied => return permission_errno(e),
         ErrorKind::AlreadyExists => return wasi::EEXIST,
         ErrorKind::IsADirectory => return wasi::EISDIR,
         ErrorKind::NotADirectory => return wasi::ENOTDIR,
@@ -4372,6 +4374,39 @@ fn wasi_errno(e: &std::io::Error) -> i32 {
         Some(40) => wasi::ELOOP,
         Some(84) => wasi::EILSEQ,
         _ => wasi::EIO, // the honest "something went wrong" of the set
+    }
+}
+
+/// `EPERM` or `EACCES` for a `PermissionDenied` error. Rust folds both POSIX errnos into
+/// that one kind; the raw errno tells them apart, and anything else (every Windows
+/// "access denied" among it) is `EACCES`.
+fn permission_errno(e: &std::io::Error) -> i32 {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::EPERM) {
+        return wasi::EPERM;
+    }
+    let _ = e;
+    wasi::EACCES
+}
+
+#[cfg(all(test, unix))]
+mod errno_tests {
+    use super::{wasi, wasi_errno};
+
+    #[test]
+    fn posix_eperm_and_eacces_stay_distinct() {
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(eperm.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(eacces.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(wasi_errno(&eperm), wasi::EPERM);
+        assert_eq!(wasi_errno(&eacces), wasi::EACCES);
+    }
+
+    #[test]
+    fn a_kind_without_a_raw_errno_is_eacces() {
+        let bare = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(wasi_errno(&bare), wasi::EACCES);
     }
 }
 
