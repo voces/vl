@@ -6351,28 +6351,9 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
-/// Which side decides the inline-record step's census and decision (rungs R6a, R6b):
-/// `$VL_OPT_INLINE` unset or `rust` the host's alone, `vl` the compiler's `optInline` and
-/// `optInlineDecide` first, `both` the two, failing the build where they disagree.
-#[derive(Clone, Copy, PartialEq)]
-enum OptInlineSide {
-    Rust,
-    Vl,
-    Both,
-}
-
-fn opt_inline_side() -> Result<OptInlineSide> {
-    match std::env::var("VL_OPT_INLINE").unwrap_or_default().as_str() {
-        "" | "rust" => Ok(OptInlineSide::Rust),
-        "vl" => Ok(OptInlineSide::Vl),
-        "both" => Ok(OptInlineSide::Both),
-        other => bail!("$VL_OPT_INLINE={other} — expected `rust`, `vl` or `both`"),
-    }
-}
-
 /// The compiler's census of the inline-record step (`optInline`, rung R6a) on `bytes`: its
-/// `$VL_INLINE_EXPLAIN` line when it leaves the module alone, or `None` when the host's step
-/// must scan it. `$VL_INLINE_FAULT=1` makes it leave every module alone, so a parity run can
+/// `$VL_INLINE_EXPLAIN` line when it leaves the module alone, or `None` when the record-field
+/// rewrite must run. `$VL_INLINE_FAULT=1` makes it leave every module alone, so a test can
 /// show it sees this answer.
 fn inline_vl(
     bytes: &[u8],
@@ -6386,8 +6367,8 @@ fn inline_vl(
         .get_typed_func::<(i32, i32), i32>(&mut store, "optInline")
         .map_err(|e| {
             e.context(
-                "`$VL_OPT_INLINE` runs the inline-record step's census through the compiler's \
-                 `optInline`, which this seed predates (`$VL_OPT_INLINE=rust` runs the host's)",
+                "`-O` runs the inline-record step's census through the compiler's \
+                 `optInline`, which this seed predates",
             )
         })?;
     let fault = inline_fault() == 1;
@@ -6399,7 +6380,8 @@ fn inline_vl(
     Ok(Some(log))
 }
 
-/// `$VL_INLINE_FAULT`: 1 faults the census (`optInline`), 2 the decision (`optInlineDecide`).
+/// `$VL_INLINE_FAULT`: 1 faults the census (`optInline`), 2 the decision and 3 the rewrite
+/// (`optInlineRewrite`).
 fn inline_fault() -> u32 {
     std::env::var("VL_INLINE_FAULT")
         .ok()
@@ -6407,57 +6389,108 @@ fn inline_fault() -> u32 {
         .unwrap_or(0)
 }
 
-/// The compiler's decision of the inline-record step (`optInlineDecide`, rung R6b) on `bytes`:
-/// which candidate fields it inlines and why each other one stays a reference, as
-/// `inline::decision_rust` spells it, or `None` when the host must decide. A module that does
-/// not validate is left to the host. `$VL_INLINE_FAULT=2` refuses every field.
-fn inline_decide_vl(
+/// The compiler's record-field step of the inline-record step (`optInlineRewrite`, rung R6c) on
+/// `bytes`: the module it wrote and its body moves, or `None` when it changes nothing, beside
+/// its `$VL_INLINE_EXPLAIN` lines. A module that does not validate is left alone, and so is a
+/// rewrite that does not. `$VL_INLINE_FAULT=2` refuses every field, and 3 ends each rewritten
+/// body's locals with an empty entry, a module that validates with other bytes.
+fn inline_rewrite_vl(
     bytes: &[u8],
     stable_layout: bool,
     rebox: bool,
+    spill: bool,
     engine: &Engine,
     compiler: &CompilerSource,
-) -> Result<Option<String>> {
+) -> Result<inline::VlFields> {
+    let validate = |b: &[u8]| {
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(b)
+            .map(|_| ())
+    };
     let fault = inline_fault() as i32;
-    let run = || -> Result<Option<String>> {
+    let run = |valid: bool| -> Result<_> {
         let (mut store, inst) = load_compiler(engine, compiler)?;
         opt_stage(&mut store, &inst, bytes)?;
-        let decide = inst
-            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "optInlineDecide")
+        let step = inst
+            .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "optInlineRewrite")
             .map_err(|e| {
                 e.context(
-                    "`$VL_OPT_INLINE` runs the inline-record step's decision through the \
-                     compiler's `optInlineDecide`, which this seed predates \
-                     (`$VL_OPT_INLINE=rust` runs the host's)",
+                    "`-O` runs the inline-record step's rewrite through the compiler's \
+                     `optInlineRewrite`, which this seed predates",
                 )
             })?;
-        let args = (stable_layout as i32, rebox as i32, 1, fault);
-        if decide.call(&mut store, args)? == 0 {
-            return Ok(None);
-        }
-        let text =
-            String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
-                .map_err(|_| {
-                    Error::msg("the compiler's optInlineDecide wrote bytes that are not UTF-8")
-                })?;
-        Ok(Some(text))
+        let args = (
+            stable_layout as i32,
+            rebox as i32,
+            spill as i32,
+            valid as i32,
+            fault,
+        );
+        let changed = step.call(&mut store, args)? == 1;
+        Ok((store, inst, changed))
     };
-    // The decision runs while another thread validates the input; on one that does not
-    // validate, its answer (or trap) is discarded.
-    let (valid, decided) = std::thread::scope(|s| {
-        let check = s.spawn(|| {
-            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
-                .validate_all(bytes)
-                .is_ok()
-        });
-        let decided = run();
-        (check.join().unwrap_or(false), decided)
+    // The step runs while another thread validates its input; on one that does not validate,
+    // its answer (or trap) is discarded and the module left alone.
+    let (valid, stepped) = std::thread::scope(|s| {
+        let check = s.spawn(|| validate(bytes).is_ok());
+        let stepped = run(true);
+        (check.join().unwrap_or(false), stepped)
     });
-    if valid {
-        decided
-    } else {
-        Ok(None)
+    if !valid {
+        return Ok(inline::VlFields {
+            out: None,
+            log: String::new(),
+        });
     }
+    let (mut store, inst, changed) = stepped?;
+    let out = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+    let moves = inst.get_typed_func::<(), i32>(&mut store, "optInlineMoves")?;
+    moves.call(&mut store, ())?;
+    let stream = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+    let utf8 = |b: Vec<u8>| {
+        String::from_utf8(b).map_err(|_| {
+            Error::msg("the compiler's inline-record step wrote explain bytes that are not UTF-8")
+        })
+    };
+    let explain = inst.get_typed_func::<(), i32>(&mut store, "optInlineExplain")?;
+    explain.call(&mut store, ())?;
+    let mut log = utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)?;
+    let summary = inst.get_typed_func::<(), i32>(&mut store, "optInlineSummary")?;
+    summary.call(&mut store, ())?;
+    let summary = utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)?;
+    if !changed {
+        return Ok(inline::VlFields { out: None, log });
+    }
+    if let Err(e) = validate(&out) {
+        log.push_str(&format!(
+            "inline-explain: step abandoned: its output does not validate: {e}\n"
+        ));
+        return Ok(inline::VlFields { out: None, log });
+    }
+    let bad = || Error::msg("the compiler's optInlineMoves wrote a stream it cannot read");
+    let mut p = 0usize;
+    let mut moved = Vec::new();
+    let n = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+    for _ in 0..n {
+        let from = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+        let to = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+        let pairs = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+        let mut v = Vec::with_capacity(pairs as usize);
+        for _ in 0..pairs {
+            let old = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+            let new = leb_u32(&stream, &mut p).ok_or_else(bad)?;
+            v.push((old, new));
+        }
+        moved.push(multivalue::BodyMove { from, to, pairs: v });
+    }
+    if p != stream.len() {
+        return Err(bad());
+    }
+    log.push_str(&summary);
+    Ok(inline::VlFields {
+        out: Some((out, moved)),
+        log,
+    })
 }
 
 /// The step's answer: the rewritten module and its body moves, or `None` when it changes
@@ -10586,80 +10619,37 @@ fn build_cmd(args: &[String]) -> Result<()> {
                         None
                     })
                 };
-                let side = opt_inline_side()?;
                 let explaining = std::env::var_os("VL_INLINE_EXPLAIN")
                     .is_some_and(|v| !v.is_empty() && v != "0");
-                let decided = if side == OptInlineSide::Rust {
-                    None
-                } else {
-                    phase!(
-                        "opt.inline_census",
-                        inline_vl(
-                            &bytes,
-                            explaining || side == OptInlineSide::Both,
-                            &compile_engine,
-                            &compiler
-                        )
-                    )?
-                };
+                let decided = phase!(
+                    "opt.inline_census",
+                    inline_vl(&bytes, explaining, &compile_engine, &compiler)
+                )?;
                 let stepped = match decided {
                     Some(log) => {
-                        if side == OptInlineSide::Both {
-                            let host = inline::census_rust(&bytes, stable_layout)
-                                .map(|l| format!("{l}\n"));
-                            if host.as_deref() != Some(log.as_str()) {
-                                bail!(
-                                    "$VL_OPT_INLINE=both: the inline-record step's census \
-                                     differs between the host and the compiler: the compiler \
-                                     says `{}`, the host `{}`",
-                                    log.trim_end(),
-                                    host.as_deref().unwrap_or("a candidate").trim_end()
-                                );
-                            }
-                        }
                         if explaining {
                             eprint!("{log}");
                         }
                         None
                     }
                     None => {
-                        let rebox = std::env::var_os("VL_INLINE_REBOX")
-                            .is_some_and(|v| !v.is_empty() && v != "0");
-                        let injected = if side == OptInlineSide::Rust {
-                            None
-                        } else {
-                            phase!(
-                                "opt.inline_decide",
-                                inline_decide_vl(
-                                    &bytes,
-                                    stable_layout,
-                                    rebox,
-                                    &compile_engine,
-                                    &compiler
-                                )
-                            )?
+                        let flag = |n: &str| {
+                            std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0")
                         };
-                        if let (OptInlineSide::Both, Some(vl)) = (side, &injected) {
-                            let host = inline::decision_rust(&bytes, stable_layout, rebox);
-                            if host.as_deref() != Some(vl.as_str()) {
-                                bail!(
-                                    "$VL_OPT_INLINE=both: the inline-record step's decision \
-                                     differs between the host and the compiler: the compiler \
-                                     says\n{}\nthe host says\n{}",
-                                    vl.trim_end(),
-                                    host.as_deref().unwrap_or("nothing (it does not decide)")
-                                        .trim_end()
-                                );
-                            }
-                        }
-                        phase!(
-                            "opt.inline_step",
-                            inline::inline_step(
+                        let fields = phase!(
+                            "opt.inline_rewrite",
+                            inline_rewrite_vl(
                                 &bytes,
                                 stable_layout,
-                                &scalarized,
-                                injected.as_deref()
+                                flag("VL_INLINE_REBOX"),
+                                flag("VL_INLINE_SPILL"),
+                                &compile_engine,
+                                &compiler
                             )
+                        )?;
+                        phase!(
+                            "opt.inline_step",
+                            inline::inline_step(&bytes, stable_layout, &scalarized, fields)
                         )
                     }
                 };
