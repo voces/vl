@@ -505,6 +505,29 @@ import {
   zeroBytesFixIx,
 } from "./check_mismatch_notes"
 import {
+  ctnLitBindPopTo,
+  ctnLitBindReset,
+  markCtnLitBinding,
+} from "./check_ctn_lit_bind"
+import {
+  LW_INFERRED,
+  callPassesList,
+  exprIsCollCtorCall,
+  fnDeclRetHasTyVar,
+  listOriginExpr,
+} from "./check_list_origin"
+import {
+  matchHeadsReset,
+  noteIntMatchHead,
+  noteMatchScrut,
+} from "./check_match_heads"
+import {
+  a20RetWalk,
+  njFnReached,
+  njGateReset,
+  njMatchDesugared,
+} from "./check_nj_gate"
+import {
   PrimName,
   RC_ELEM,
   RC_FIELD,
@@ -601,7 +624,6 @@ import {
   tyArrayElemIx,
   tyBearsNull,
   tyBuiltinIndexable,
-  tyContainsList,
   tyDeeperThan,
   tyDenotesObj,
   tyDidYouMean,
@@ -901,7 +923,6 @@ import {
   cwRootNames,
   cwSplits,
   cwUfcsDeclOf,
-  cwUseStoreNode,
   cwWriteAts,
   declFirstParamIsSelf,
   fnDeclIx,
@@ -1906,11 +1927,6 @@ export function njSetPinFn(fx: i32): i32 {
   njPinFn = fx
   was
 }
-// Names a call can reach other than directly from a concrete context (`njGateScan`), once per program.
-let njGateNames: {[string]: boolean} = Map()
-let njGateScanned = false
-// The arena prefix `njGateScan` has read.
-let njGateSeen = 0
 let njGateMemo: {[i32]: boolean} = Map()
 // The held-back call nodes `njExprHeld` answers for.
 let njHeldNodes: {[i32]: boolean} = Map()
@@ -2089,11 +2105,6 @@ let collRetFnNodes: i32[] = []
 // function's binding. Depth-tagged sparse rows, read through `lookupDepth` exactly like `collBind`.
 let objLitBindDepth: i32[] = []
 let objLitBindName: string[] = []
-// The same rows for an un-annotated `const` bound to a list, object or map literal, with its
-// initializer: the readonly-only list rule follows such a name to the literal it names.
-let ctnLitBindDepth: i32[] = []
-let ctnLitBindName: string[] = []
-let ctnLitBindInit: i32[] = []
 // The same rows for an un-annotated `let`/`const` whose initializer is a lambda with no return
 // annotation: a function-value mismatch reading the name finds the lambda through them.
 let fnLitBindDepth: i32[] = []
@@ -4322,12 +4333,6 @@ let bodyChecked: {[string]: boolean} = Map()
 // Un-annotated bindings whose initializer is a `??` or an `if` join, the only ones the emitter
 // may pin to a list union (D2844). Appended per checked binding; a repeat is harmless.
 export let letJoinCandidates: i32[] = []
-// The `IfStmt` heads `desugarMatchAt` built from an INTEGER `match` (1 at the head's index),
-// the one chain shape the emitter may lower to a `br_table` (`intMatchHeadAt`).
-let intMatchHead: {[i32]: boolean} = Map()
-// The scrutinee nodes `desugarMatchAt` shared across a chain's arm tests: one node per `match`,
-// so its recorded type is the last arm's and says nothing about any one test (`matchScrutAt`).
-let matchScrutNode: {[i32]: boolean} = Map()
 // A `const` arm pattern (D3271): the pattern node, rewritten to a read of the constant, to the
 // literal node of that constant's initializer, where its value is read (`matchConstPatLitAt`).
 let matchConstPatLit: {[i32]: i32} = Map()
@@ -5056,9 +5061,7 @@ export function initChecker() {
   hdReset()
   guardAltStack = []
   joinHoleUnions = []
-  njGateNames = Map()
-  njGateScanned = false
-  njGateSeen = 0
+  njGateReset()
   njGateMemo = Map()
   njHeldNodes = Map()
   njFnIx = -1
@@ -5201,8 +5204,7 @@ export function initChecker() {
   bodyChecked = Map()
   nodeTyIx = []
   nodeTyWrites = nodeTyWrites + 1
-  intMatchHead = Map()
-  matchScrutNode = Map()
+  matchHeadsReset()
   matchConstPatLit = Map()
   cmpConstLit = Map()
   matchPatRefused = Map()
@@ -11111,9 +11113,7 @@ function isvalReset() {
   collBindName = []
   objLitBindDepth = []
   objLitBindName = []
-  ctnLitBindDepth = []
-  ctnLitBindName = []
-  ctnLitBindInit = []
+  ctnLitBindReset()
   numLitBindDepth = []
   numLitBindName = []
   numLitBindDecl = []
@@ -11170,29 +11170,6 @@ function bindingIsObjLit(name: string) {
   bindMarkHas(objLitBindDepth, objLitBindName, name)
 }
 
-// Mark an un-annotated literal `const` (see `letDeclIsUnannotCtnLit`) with its initializer.
-function markCtnLitBinding(name: string, depth: i32, init: i32) {
-  bindMarkPush(ctnLitBindDepth, ctnLitBindName, name, depth)
-  ctnLitBindInit.push(init)
-}
-
-// The initializer of the literal `const` `name` resolves to, or -1 when it resolves to anything
-// else. Paired by depth exactly as `bindMarkHas` is, so shadowing holds.
-function ctnLitInitOf(name: string): i32 {
-  if ctnLitBindName.length == 0 { return -1 }
-  const d = lookupDepth(name)
-  if d < 0 { return -1 }
-  let i = ctnLitBindName.length - 1
-  while i >= 0 {
-    if ctnLitBindName[i] == name && ctnLitBindDepth[i] == d {
-      if i < ctnLitBindInit.length { return ctnLitBindInit[i] }
-      return -1
-    }
-    i = i - 1
-  }
-  -1
-}
-
 // Is `ix` a `const` with no annotation and a list, object or `Map()`/`Set()` initializer? A
 // `let` may be re-pointed at any list, so its initializer says nothing about its value.
 function letDeclIsUnannotCtnLit(ix: i32): boolean {
@@ -11205,16 +11182,6 @@ function letDeclIsUnannotCtnLit(ix: i32): boolean {
     if iv is ArrayLit { return true }
     if iv is ObjLit { return true }
     return exprIsCollCtorCall(n.letInit)
-  }
-  false
-}
-
-// Is `ix` a bare `Map()` / `Set()` constructor call?
-function exprIsCollCtorCall(ix: i32): boolean {
-  const iv = P.nodes[ix]
-  if iv is Call {
-    const cn = P.nodes[iv.callFn]
-    if cn is Ident { return cn.identName == "Map" || cn.identName == "Set" }
   }
   false
 }
@@ -11237,8 +11204,7 @@ function collBindPopTo(depth: i32) {
   lbiPopTo(depth)
   bindMarkPopTo(collBindDepth, collBindName, depth)
   bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
-  bindMarkPopTo(ctnLitBindDepth, ctnLitBindName, depth)
-  while ctnLitBindInit.length > ctnLitBindName.length { ctnLitBindInit.pop() }
+  ctnLitBindPopTo(depth)
   // Tested inline: a module-level literal keeps this table non-empty in nearly every scope.
   const nl = numLitBindDepth.length
   if nl > 0 && numLitBindDepth[nl - 1] >= depth {
@@ -14469,17 +14435,6 @@ export function njFnGated(fx: i32): boolean {
   g
 }
 
-// Whether every join in function `fx` is master's: it is reached from a lambda body, by value,
-// recursively, or from a generic or hole body that is itself reached so (`njGateScan`).
-export function njFnReached(fx: i32): boolean {
-  if fx < 0 || fx >= P.nodes.length { return false }
-  const fn = P.nodes[fx]
-  if !(fn is FuncDecl) { return false }
-  if fn.fnName == "" { return true }
-  if !njGateScanned { njGateScan() }
-  njGateNames.get(fn.fnName) ?? false
-}
-
 // Whether expression `ix` is the result of a call `njFnGated` holds back, or a name bound
 // only from one: its members are master's widening, so an operator, conversion or delivery the
 // rule adds is refused over it, as there. A union a direct join produced is never held.
@@ -14615,165 +14570,6 @@ function njRetSetHeld(body: i32): boolean {
     }
   }
   false
-}
-
-// Records every name read other than as a call's callee or as a member, every function that
-// mentions itself, every name mentioned in a lambda body or in a gated generic or hole body, and
-// every name such an ungated body mentions other than a helper `njHelperShapeOk` admits: that
-// helper's kept-apart return each pin of the caller re-joins (D3589).
-function njGateScan() {
-  njGateScanned = true
-  const callee: {[i32]: boolean} = Map()
-  const reads: i32[] = []
-  const openNames: string[] = []
-  const openBodies: i32[] = []
-  let i = njGateSeen
-  while i < P.nodes.length {
-    const n = P.nodes[i]
-    if n is Call {
-      callee[n.callFn] = true
-    } else if n is Ident {
-      reads.push(i)
-    } else if n is Member {
-      njGateNames[n.memProp] = true
-    } else if n is FuncDecl {
-      let open = n.fnTyParams.length > 0
-      for pi in n.fnParams {
-        const pn = P.nodes[pi]
-        if pn is Param {
-          if pn.parType < 0 { open = true }
-        }
-      }
-      njGateBody(n.fnBody, n.fnName == "", n.fnName)
-      if open && n.fnName != "" {
-        openNames.push(n.fnName)
-        openBodies.push(n.fnBody)
-        njGateHelpers(n.fnBody)
-      }
-    }
-    i = i + 1
-  }
-  njGateSeen = P.nodes.length
-  for r in reads {
-    if !(callee.get(r) ?? false) {
-      const rn = P.nodes[r]
-      if rn is Ident { njGateNames[rn.identName] = true }
-    }
-  }
-  // To a fixpoint: an open body gates every name it mentions once its own function is gated.
-  const done: boolean[] = []
-  for _ in openNames { done.push(false) }
-  let grew = true
-  while grew {
-    grew = false
-    let k = 0
-    while k < openNames.length {
-      if !done[k] && (njGateNames.get(openNames[k]) ?? false) {
-        done[k] = true
-        grew = true
-        njGateBody(openBodies[k], true, openNames[k])
-      }
-      k = k + 1
-    }
-  }
-  0
-}
-
-// Records each name body `ix` mentions other than a helper `njHelperShapeOk` admits.
-function njGateHelpers(ix: i32) {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is Ident {
-        if !njHelperShapeOk(n.identName) { njGateNames[n.identName] = true }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  0
-}
-
-// Whether top-level function `name` yields only its own parameters, each through `return` or a
-// tail `if`/`else` chain, with no `match` in its body: the shape whose return a call keeps as a
-// union of the caller's parameters (`keptParamUnion`).
-function njHelperShapeOk(name: string): boolean {
-  const d = fnDeclIx[name] ?? -1
-  if d < 0 || d >= P.nodes.length { return false }
-  const fn = P.nodes[d]
-  if !(fn is FuncDecl) { return false }
-  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length || njBodyHasMatch(fn.fnBody) {
-    return false
-  }
-  const ps: string[] = []
-  for pi in fn.fnParams {
-    const pn = P.nodes[pi]
-    if pn is Param { ps.push(pn.parName) }
-  }
-  const vals: i32[] = []
-  collectValuedReturns(fn.fnBody, vals)
-  const b = P.nodes[fn.fnBody]
-  if !(b is Block) || b.blkStmts.length == 0 { return false }
-  vals.push(b.blkStmts[b.blkStmts.length - 1])
-  for v in vals {
-    const leaves: i32[] = []
-    tailValueLeaves(v, leaves)
-    for l in leaves {
-      const ln = P.nodes[l]
-      if !(ln is Ident) || !strListHas(ps, ln.identName) { return false }
-    }
-  }
-  true
-}
-
-// Whether body `ix` holds a `match`, before or after `desugarMatchAt` lowered it.
-function njBodyHasMatch(ix: i32): boolean {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      if P.nodes[at] is MatchExpr || njMatchDesugared(at) { return true }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  false
-}
-
-// Whether node `at` is an `if` link `desugarMatchAt` built.
-function njMatchDesugared(at: i32): boolean {
-  if intMatchHead.get(at) ?? false { return true }
-  const n = P.nodes[at]
-  if !(n is IfStmt) { return false }
-  const c = cwPeel(n.ifCond)
-  if c < 0 || c >= P.nodes.length { return false }
-  if matchScrutNode.get(c) ?? false { return true }
-  for k in nodeChildren(c) {
-    if k >= 0 && (matchScrutNode.get(cwPeel(k)) ?? false) { return true }
-  }
-  false
-}
-
-// Walks body `ix`: every name it mentions when `open`, else only `self`.
-function njGateBody(ix: i32, open: boolean, self: string) {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is Ident {
-        if open || n.identName == self { njGateNames[n.identName] = true }
-      }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  0
 }
 
 // `joinArmTys` of an arm typed `a` beside one typed `b`, where `aLit`/`bLit` say an arm's every
@@ -25091,220 +24887,6 @@ function elemAdmitsNarrowerShare(de: i32): boolean {
 // different storage class?
 function listElemDiffers(se: i32, de: i32): boolean {
   listElemWidens(se, de) || containerElemClassDiffers(se, de)
-}
-
-// `listOriginExpr`'s answer for a value whose type inference chose.
-const LW_INFERRED = -2
-
-// Where the list `expr` delivers comes from: a literal `const` resolves to the literal it
-// names, a `Map()`/`Set()` const or a call whose result no annotation fixes is LW_INFERRED,
-// and anything else is itself. -1 stays -1.
-function listOriginExpr(expr: i32): i32 {
-  if expr < 0 { return -1 }
-  let x = parenPeelIx(expr)
-  let hops = 0
-  while hops < 16 {
-    if x < 0 || x >= P.nodes.length { return -1 }
-    const e = P.nodes[x]
-    if e is Ident {
-      const init = ctnLitInitOf(e.identName)
-      if init < 0 { return x }
-      // A const whose contents receive an existing list holds more than its literal built.
-      if constStoresForeignList(e.identName, covarRootFrame(x)) { return x }
-      if exprIsCollCtorCall(init) { return LW_INFERRED }
-      x = parenPeelIx(init)
-      hops = hops + 1
-      continue
-    }
-    if callResultIsInferred(x) { return LW_INFERRED }
-    return x
-  }
-  x
-}
-
-// Does a store INTO the value the name (`nm`, `fr`) is bound to — an element or field store
-// (`ls[0] = v`, `o.xs = v`, `m[k] = v`) or a mutating method (`ls.push(v)`, `m.set(k, v)`), at
-// any projection depth — put there a list that is not itself fresh (`lwValueIsFresh`)?
-function constStoresForeignList(nm: string, fr: i32): boolean {
-  if nm == "" { return true }
-  if lwFreshDepth > 8 { return true }
-  lwFreshDepth = lwFreshDepth + 1
-  cwIxBuild()
-  let found = false
-  let ixA = cwIxFrHead(nm, fr)
-  let ixU = cwIxUnkHead(nm, fr)
-  while (ixA >= 0 || ixU >= 0) && !found {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
-    if cwIxKind[r] == CW_OCC_USE {
-      const st = cwUseStoreNode(cwIxNode[r])
-      if st >= 0 && lwStoreCarriesForeignList(st) { found = true }
-    }
-  }
-  lwFreshDepth = lwFreshDepth - 1
-  found
-}
-
-// The recursion bound shared by `constStoresForeignList` and `lwValueIsFresh`, which reach each
-// other through a const that stores into itself.
-let lwFreshDepth = 0
-
-// Does the store at `st` (an assignment or a mutating call) carry a list that is not fresh?
-function lwStoreCarriesForeignList(st: i32): boolean {
-  if st < 0 || st >= P.nodes.length { return true }
-  const n = P.nodes[st]
-  if n is BinExpr { return !lwValueIsFresh(n.binRight) }
-  lwCallCarriesForeignList(st)
-}
-
-// `lwStoreCarriesForeignList` for a mutating call: any argument not fresh. A store node of any
-// other shape is not one this reads, so it counts as foreign.
-function lwCallCarriesForeignList(st: i32): boolean {
-  const n = P.nodes[st]
-  if n is Call {
-    let i = 0
-    while i < n.callArgs.length {
-      if !lwValueIsFresh(n.callArgs[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  true
-}
-
-// Is the value at `v` either free of lists or built fresh: a literal whose own lists are fresh,
-// a literal const nothing foreign is stored into, or a result `callResultIsInferred` trusts?
-function lwValueIsFresh(v: i32): boolean {
-  if v < 0 || v >= P.nodes.length { return false }
-  // A value the check has not typed yet (a store after the delivery) is judged by its origin.
-  const vt = nodeTyIxOf(v)
-  if vt >= 0 && !tyContainsList(vt, 8) { return true }
-  if lwFreshDepth > 8 { return false }
-  lwFreshDepth = lwFreshDepth + 1
-  const o = listOriginExpr(v)
-  let fresh = false
-  if o == LW_INFERRED { fresh = true }
-  else if o >= 0 && o < P.nodes.length { fresh = lwLitIsFresh(o) }
-  lwFreshDepth = lwFreshDepth - 1
-  fresh
-}
-
-// Is the node `o` a list or object literal all of whose parts are fresh (`lwValueIsFresh`)? A
-// spread of a list-holding source is not.
-function lwLitIsFresh(o: i32): boolean {
-  const n = P.nodes[o]
-  if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      const el = P.nodes[n.arrElems[i]]
-      if el is Spread {
-        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return false }
-      } else if !lwValueIsFresh(n.arrElems[i]) {
-        return false
-      }
-      i = i + 1
-    }
-    return true
-  }
-  lwObjLitIsFresh(o)
-}
-
-// `lwLitIsFresh` for an object literal: every field value fresh.
-function lwObjLitIsFresh(o: i32): boolean {
-  const n = P.nodes[o]
-  if n is ObjLit {
-    let i = 0
-    while i < n.objFields.length {
-      const fi = P.nodes[n.objFields[i]]
-      if fi is FieldInit {
-        if !lwValueIsFresh(fi.fiValue) { return false }
-      }
-      i = i + 1
-    }
-    return true
-  }
-  false
-}
-
-// Does the argument at `ix` hand an EXISTING list to the call? A literal is new, so only the
-// lists inside it that come from elsewhere count.
-function argCarriesList(ix: i32): boolean {
-  const px = parenPeelIx(ix)
-  if px < 0 || px >= P.nodes.length { return false }
-  const e = P.nodes[px]
-  if e is ArrayLit {
-    let i = 0
-    while i < e.arrElems.length {
-      const el = P.nodes[e.arrElems[i]]
-      if el is Spread {
-        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return true }
-      } else if argCarriesList(e.arrElems[i]) {
-        return true
-      }
-      i = i + 1
-    }
-    return false
-  }
-  if e is ObjLit {
-    let i = 0
-    while i < e.objFields.length {
-      const fi = P.nodes[e.objFields[i]]
-      if fi is FieldInit {
-        if argCarriesList(fi.fiValue) { return true }
-      }
-      i = i + 1
-    }
-    return false
-  }
-  tyContainsList(nodeTyIxOf(px), 8)
-}
-
-// Does any argument of `c` hand in an existing list?
-function callPassesList(c: Call): boolean {
-  let i = 0
-  while i < c.callArgs.length {
-    if argCarriesList(c.callArgs[i]) { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Is `ix` a call whose result is built at the type it flows into: the fill intrinsic, a
-// function with no declared return, or a generic whose declared result names a type parameter
-// and which no existing list goes into (`filled(2, { r: 1 })`, not `id(xs)`)?
-function callResultIsInferred(ix: i32): boolean {
-  const e = P.nodes[ix]
-  if e is Call {
-    const cn = P.nodes[e.callFn]
-    if cn is Ident {
-      if cn.identName == "__array_new__" { return true }
-      const fd = lookupFnDeclNode(cn.identName)
-      if fd >= 0 {
-        const f = P.nodes[fd]
-        if f is FuncDecl {
-          if f.fnRet < 0 { return true }
-          if f.fnTyParams.length > 0 && fnDeclRetHasTyVar(fd) {
-            return !callPassesList(e)
-          }
-        }
-      }
-    }
-  }
-  false
-}
-
-// Does the declared result of the function declared at `fd` name one of its type parameters?
-function fnDeclRetHasTyVar(fd: i32): boolean {
-  const ft = nodeTyOf(fd)
-  if ft < 0 || ft >= T.tys.length { return false }
-  const f = T.tys[ft]
-  if f is TyFunc { return tyHasTyVar(f.fnRet) }
-  false
 }
 
 // `direct` — is the destination a slot a `(ref $src)` can be written into as it stands?
@@ -39871,7 +39453,7 @@ function desugarMatchAt(ix: i32) {
   const n = P.nodes[ix]
   if n is MatchExpr {
     const scrut = n.matchScrut
-    if scrut >= 0 { matchScrutNode[scrut] = true }
+    if scrut >= 0 { noteMatchScrut(scrut) }
     const pats = n.matchPats
     const armStart = n.matchArmStart
     const armCount = n.matchArmCount
@@ -41978,55 +41560,6 @@ function a20CollectRets(blockIx: i32, out: i32[]) {
 // Every value a function body at `blockIx` hands back: each valued `return`, and its tail.
 export function collectRetValues(blockIx: i32, out: i32[]) {
   a20RetWalk(blockIx, true, out)
-}
-
-// Every valued `return` under `blockIx` in source order, at any depth but a nested function's.
-export function collectValuedReturns(blockIx: i32, out: i32[]) {
-  a20RetWalk(blockIx, false, out)
-}
-
-// Every valued `return` under `ix` in source order, a nested function's aside, and when `tail`
-// holds the values `ix` yields as the body's tail: a block's last statement and each arm of a
-// tail `if`, an `else if` chain along its spine. A loop body's last statement is not a tail (D2745).
-function a20RetWalk(ix: i32, tail: boolean, out: i32[]) {
-  let cur = ix
-  while cur >= 0 && cur < P.nodes.length {
-    const at = cur
-    const n = P.nodes[at]
-    cur = -1
-    if n is RetStmt {
-      if n.retArg >= 0 {
-        a20RetWalk(n.retArg, false, out)
-        out.push(n.retArg)
-      }
-    } else if n is FuncDecl {
-      return 0
-    } else if n is Block {
-      const stmts = n.blkStmts
-      let i = 0
-      while i < stmts.length {
-        a20RetWalk(stmts[i], tail && i == stmts.length - 1, out)
-        i = i + 1
-      }
-    } else if n is IfStmt {
-      a20RetWalk(n.ifCond, false, out)
-      a20RetWalk(n.ifThen, tail, out)
-      if elseIfLink(at) >= 0 {
-        cur = n.ifElse
-      } else {
-        a20RetWalk(n.ifElse, tail, out)
-      }
-    } else {
-      const kids = nodeChildren(at)
-      let ki = 0
-      while ki < kids.length {
-        a20RetWalk(kids[ki], false, out)
-        ki = ki + 1
-      }
-      if tail { out.push(at) }
-    }
-  }
-  0
 }
 
 // The type `p?.f(…)` has once its receiver guard holds — the callee's own return, before the
@@ -45766,21 +45299,9 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
   if !inferQuiet {
     desugarMatchAt(ix)
-    if !sawBadPat { intMatchHead[ix] = true }
+    if !sawBadPat { noteIntMatchHead(ix) }
   }
   matchTy
-}
-
-// Whether node `ix` is the head of the if-chain an integer `match` desugared to.
-export function intMatchHeadAt(ix: i32) {
-  if ix < 0 { return false }
-  intMatchHead[ix] ?? false
-}
-
-// Whether node `ix` is a `match` scrutinee every arm test of its desugared chain reads.
-export function matchScrutAt(ix: i32) {
-  if ix < 0 { return false }
-  matchScrutNode[ix] ?? false
 }
 
 // `match` over a value union desugars to the `is`-chain `desugarMatchAt` already builds (each
