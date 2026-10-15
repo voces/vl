@@ -3689,3 +3689,63 @@ union-element spellings that soften a member the row keeps.
 * `lint-self` is clean, `seed-size --check` passes, and the ladder and sentinel budgets hold.
 * `selfhost_native_align`, `lsp_undisplayable_type`, `vl_check_json`, the hover suites and
   `vl_compile_cache` pass, 5,111 steps.
+
+### 13.28 A parenthesised read and a `?.` read fall back to the column
+
+After §13.27 the largest like-for-like class in `tests/cases` is RIGHT-ONLY: the column has a
+list rep and the ladder answers none. Of its 1,476 notes, 1,438 are one node kind, a `?.` read
+of a list (`hk?.ks` in a for-in header), and 20 are a parenthesised read (`(cc)`).
+
+**Design.** `syntacticListRep` already ends its `Ident`, `Member`, `Call`, `Index` and `BinExpr`
+rungs with `columnListRep` (§13.14). The `Paren` rung asked only its inner expression, and an
+`OptMember` had no rung. Both now fall back to `columnListRep`, which answers only a node whose
+type at the instance is a `TyArray`. The `Paren` rung still asks the inner expression first.
+
+**The `if` join stays none.** The other 28 notes are an `if`-expression in
+`generics/if-join-two-list-types-union.vl`. Its recorded type is `T[]`, so at a pin the column
+reads `f64[]`, but the join the emitter builds is the union box `f64[] | string[]` (D2832). The
+ladder answers none on purpose (`ifArmsAgreeOnListRep`), and a column fallback there would
+read the box as a plain list. The witness runs today and must keep running:
+
+```vl
+function no() { false }
+function bound<T>(xs: T[], ys: string[]) {
+  const r = if no() { xs } else { ys }
+  if r is string[] { print(r.length) } else { print(0 - r.length) }
+}
+bound([1.5], ["a", "b"])
+```
+
+The checker records the gradual join of `T[]` and `string[]` as `T[]`. That record has to
+change before this rung can read the column.
+
+**Counts.** `listRep` notes, base and candidate both on `7b3bbb924` (§13.27).
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | `OptMember K[]` RIGHT-ONLY | 1,438 | 0 |
+| `tests/cases` | `Paren P[]` RIGHT-ONLY | 10 | 0 |
+| `tests/cases` | `If` RIGHT-ONLY | 28 | 28 |
+| `tests/cases` | like-for-like RIGHT-ONLY | 1,476 | 28 |
+| distilled `named/` | `Paren` RIGHT-ONLY (`d626_paren.vl`) | 10 | 0 |
+| `tests/cases` | `scope` RIGHT-ONLY | 39,138 | 39,130 |
+| distilled `named/` | `scope` RIGHT-ONLY | 8,770 | 8,762 |
+
+The `scope` falls are the same `(cc)` reads, eight in `arrays/inferred-return-empty-through-binding.vl`
+and eight in `d626_paren.vl`. LEFT-ONLY is unchanged at 69 and 128, and so is every other
+family and class. No file gains a note in either population.
+
+**Checks.** The base fixpoint is 5,705,650 bytes and the candidate 5,705,690, +40.
+
+* `difftree --identity` over 15,176 files: **10,217 built, 0 differ, 0 uncompared**. The
+  candidate compiling the base's source gives the base's fixpoint.
+* Native fixpoint holds.
+* `rep-fuzz-check` is exact. `regress.vl` loses no runs and moves no cell to silent. Its seven
+  `rv3310_*` `trap_loads` movements are the ones §13.22 recorded.
+* `lint-self` is clean, `seed-size --check` passes, and the ladder and sentinel budgets hold.
+* `selfhost_native_align` passes, 5,048 steps.
+
+**Next.** The `if` join's recorded `T[]` at a pin; the `-> none` notes, mostly `is`-narrowed
+reads whose recorded type is the un-narrowed union; the DIFF class, led by `(string | i32)[]`
+literals reading `strlist` against the column's `reflist`; the narrowed family; and the scope
+callers.
