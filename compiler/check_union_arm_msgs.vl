@@ -1,0 +1,262 @@
+// Refusals and notes about union arms: a `Set` beside a same-rep map, record arms that
+// share a field-name set, and the member that blocks an unshared-field read.
+// Does not import the checker.
+import { setMapKeysShareRep, tyIsI32SentinelNullable } from "./check_ty_rep"
+import { litSetBaseTy } from "./check_ty_shape"
+import {
+  T,
+  Ty,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  objFieldType,
+  tyHoldsRecord,
+  tyLitUnionIsI32Backed,
+  tySame,
+  tyScalarBaseIs,
+  tyToStr,
+} from "./check_types"
+
+// The noun a collection or function union member is named by in `unionFieldGapNote`, or ""
+// for any other member, which keeps the plain "is not an object".
+function nonRecordNoun(m: Ty): string {
+  match m {
+    TyMap => {
+      if m.mSet == 1 { "a set" } else { "a map" }
+    }
+    TyArray => {
+      "a list"
+    }
+    TyFunc => {
+      "a function"
+    }
+    TyPrim => {
+      ""
+    }
+    TyErr => {
+      ""
+    }
+    TyObj => {
+      ""
+    }
+    TyUnion => {
+      ""
+    }
+    TyNullable => {
+      ""
+    }
+    TyVar => {
+      ""
+    }
+    TyLit => {
+      ""
+    }
+    TyNeg => {
+      ""
+    }
+  }
+}
+
+// The parenthetical the unshared-field diagnostic appends: the first member of `u` that blocks the
+// read — a non-object member, or an object without `prop`. "" when every member carries the field
+// and the refusal came from the join instead (`{n: i32} | {n: f64}`), where there is no single
+// member to name and the loud emit reject is the next stop.
+export function unionFieldGapNote(u: TyUnion, prop: string) {
+  const members = u.uMembers
+  let i = 0
+  while i < members.length {
+    const mIx = members[i]
+    if mIx < 0 { return "" }
+    const m = T.tys[mIx]
+    if m is TyObj {
+      if objFieldType(m, prop) < 0 {
+        return " (no '" + prop + "' on " + tyToStr(mIx) + ")"
+      }
+    } else {
+      const nrn = nonRecordNoun(m)
+      if nrn != "" {
+        return " (" + tyToStr(mIx) + " is " + nrn + ", not a record)"
+      }
+      return " (" + tyToStr(mIx) + " is not an object)"
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether a map VALUE reps as one i32 cell, the cell a set stores its membership in: a boolean,
+// an i32, an i32-backed literal union, or a sentinel-nullable (`boolean | null`, `K | null`).
+export function mapValIsI32Cell(v: i32): boolean {
+  if v < 0 { return true }
+  if tyScalarBaseIs(v, "boolean") || tyScalarBaseIs(v, "i32") { return true }
+  if tyLitUnionIsI32Backed(v) { return true }
+  const t = T.tys[v]
+  if t is TyLit { return true }
+  tyIsI32SentinelNullable(v)
+}
+
+// The refusal for a union holding a `Set<K>` and a map that shares its representation: the same
+// key hash and an i32-cell value (`{[K]: boolean}`, `{[K]: i32}`, …), worded for a join or an
+// annotation. A union spells the set as that map, so the box could not tell which member it
+// holds (D2673). "" when `members` has no such pair.
+export function setMapUnionClashMsg(members: i32[], isJoin: boolean): string {
+  const rec = setMapRecordClashMsg(members, isJoin)
+  if rec != "" { return rec }
+  let i = 0
+  while i < members.length {
+    const a = members[i]
+    if a >= 0 {
+      const at = T.tys[a]
+      if at is TyMap {
+        if at.mSet == 1 {
+          let j = 0
+          while j < members.length {
+            const b = members[j]
+            if b >= 0 {
+              const bt = T.tys[b]
+              if bt is TyMap {
+                if bt.mSet == 0 && setMapKeysShareRep(at.mKey, bt.mKey) {
+                  if mapValIsI32Cell(bt.mVal) {
+                    if isJoin {
+                      return "a Set and a map do not join into one value yet: they share one representation, so `is` could not tell them apart — make every branch a Set, or every branch a map"
+                    }
+                    return "a union cannot hold both "
+                      + tyToStr(a)
+                      + " and "
+                      + tyToStr(b)
+                      + " yet: they share one representation, so `is` could not tell them apart — keep one of the two, or wrap each in a record with a discriminant field (`kind: \"set\"`)"
+                  }
+                }
+              }
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The same refusal one level down: two record arms with one field-name set whose field holds a
+// Set in one and a same-rep map in the other. The box keys an anonymous arm by that shared
+// spelling, so `is` could not tell them apart (D4056). "" when `members` has no such pair.
+function setMapRecordClashMsg(members: i32[], isJoin: boolean): string {
+  let i = 0
+  while i < members.length {
+    let j = i + 1
+    while j < members.length {
+      const f = setMapRecordClashField(members[i], members[j], isJoin)
+      if f != "" {
+        return "a union cannot hold both "
+          + tyToStr(members[i])
+          + " and "
+          + tyToStr(members[j])
+          + " yet: field `"
+          + f
+          + "` is a Set in one and a map in the other, which share one representation, so `is` could not tell them apart — rename the field in one arm"
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The first field of same-name records `a` and `b` whose two types clash as a Set and a map,
+// or "" when they are not two such records or a literal field tells them apart.
+function setMapRecordClashField(a: i32, b: i32, isJoin: boolean): string {
+  if a < 0 || b < 0 { return "" }
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  if !(at is TyObj) || !(bt is TyObj) { return "" }
+  if !objSigSame(at, bt) || !objSigSame(bt, at) { return "" }
+  if objArmsDiscriminable(at, bt) { return "" }
+  let k = 0
+  while k < at.objFieldNames.length {
+    const pair = [at.objFieldTypes[k], objFieldType(bt, at.objFieldNames[k])]
+    if setMapUnionClashMsg(pair, isJoin) != "" { return at.objFieldNames[k] }
+    k = k + 1
+  }
+  ""
+}
+
+// Whether one field's two types join without making a union of records: equal types, two
+// records of one field-name set (they join the same way, a level down), or no record at all.
+export function fieldJoinKeepsRecordsApart(fa: i32, fb: i32): boolean {
+  if fa < 0 || fb < 0 || tySame(fa, fb) { return true }
+  const ra = tyHoldsRecord(fa, 0)
+  const rb = tyHoldsRecord(fb, 0)
+  if !ra && !rb { return true }
+  const oa = T.tys[fa]
+  const ob = T.tys[fb]
+  if oa is TyObj {
+    if ob is TyObj { return objSigSame(oa, ob) }
+  }
+  false
+}
+
+// Do arms `a` and `b` carry the same field names in the same order — the checker's reading
+// of `variantSig`, which is the emitter's tag key. Order-sensitive on purpose: two arms
+// spelling fields in different orders get different tags, so nothing needs telling apart.
+export function objSigSame(a: TyObj, b: TyObj): boolean {
+  if a.objFieldNames.length != b.objFieldNames.length { return false }
+  let i = 0
+  while i < a.objFieldNames.length {
+    if objFieldType(b, a.objFieldNames[i]) < 0 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// `b`'s type for the field `a` holds at index `i`, or -1 — the by-name pairing every
+// comparison here uses, not by index: the arena keeps a `TyObj`'s fields in source order
+// while the emitter's `variantSig` (the tag key) sees them sorted, so `{v: i32, w: string}`
+// and `{w: string, v: boolean}` collide on a tag though an index-paired comparison would miss it.
+export function objPairedTy(a: TyObj, b: TyObj, i: i32): i32 {
+  objFieldType(b, a.objFieldNames[i])
+}
+
+// Is some field a comparable literal set in both arms — the discriminant the ruling requires?
+export function objArmsDiscriminable(a: TyObj, b: TyObj): boolean {
+  let i = 0
+  while i < a.objFieldTypes.length {
+    const fa = a.objFieldTypes[i]
+    const fb = objPairedTy(a, b, i)
+    const ba = litSetBaseTy(fa)
+    const bb = litSetBaseTy(fb)
+    // Both arms carry a literal set, and the sets are comparable.
+    if ba >= 0 && ba == bb { return true }
+    // A literal set beside its own base: `{kind: "x"|"y"}` beside `{kind: string}` is the
+    // overlapping-set case where the second arm's set is the whole base, so `is A` tests
+    // membership and `else` after it narrows to B — the value discriminates where the tag
+    // cannot. The base must be the one this set softens to, not merely another primitive.
+    if ba >= 0 && tySame(fb, ba) { return true }
+    if bb >= 0 && tySame(fa, bb) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Are `a` and `b` the same type — every field equal, structurally? Two declared names (or a
+// declared name beside its inline `{…}` form) reaching one type structurally are exempted:
+// the checker accepts either wherever the other is expected, the twin machinery folds them
+// onto one heap type, and there is nothing to tell apart. The checker's reading of `variantFieldTysEq`.
+export function objArmsSameType(a: TyObj, b: TyObj): boolean {
+  if a.objFieldTypes.length != b.objFieldTypes.length { return false }
+  let i = 0
+  while i < a.objFieldTypes.length {
+    if !tySame(a.objFieldTypes[i], objPairedTy(a, b, i)) { return false }
+    i = i + 1
+  }
+  true
+}

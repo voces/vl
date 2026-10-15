@@ -1,0 +1,188 @@
+// Object-shape deliveries: a destination type recorded on a literal holding a bare-`null`
+// field, and whether a width pair needs an adapter codegen lacks.
+// Does not import the checker.
+import { ArrayLit, FieldInit, ObjLit, P, Paren } from "./ast"
+import { inferQuiet } from "./check_cursor"
+import { nodeTyIx, nodeTySet } from "./check_node_tys"
+import {
+  T,
+  TyArray,
+  TyNullable,
+  TyObj,
+  objFieldType,
+  tyDeeperThan,
+  tyEq,
+  tyHasNullHole,
+} from "./check_types"
+
+// Record the destination type on an ObjLit (or ArrayLit-of-ObjLit) source whose own checked type
+// carries a bare-`null` hole: that type is covariantly assignable, so the literal-aware adoption
+// block is never reached, yet the recorded type is `structIndexOfObjCtx`'s ambiguity signal and a
+// null-hole render matches no row. Nested field values re-stamp; returns 1 when this node does.
+export function recordNullHoleObjAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  // A recursive destination (`type L = {n: L | null}`, whose `{n: null, v: 7}` tail literal is
+  // exactly a null-hole source) must not re-stamp: see `tyDeeperThan`.
+  if tyDeeperThan(dstTy, 16) { return 0 }
+  let dtix = dstTy
+  const dN = T.tys[dtix]
+  if dN is TyNullable { dtix = dN.nInner }
+  if dtix < 0 { return 0 }
+  const d = T.tys[dtix]
+  const e = P.nodes[srcExpr]
+  if e is Paren {
+    if recordNullHoleObjAdopt(e.parInner, dtix, depth) == 1 {
+      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+      nodeTySet(srcExpr, dtix)
+      return 1
+    }
+    return 0
+  }
+  if d is TyArray {
+    if e is ArrayLit {
+      let any = 0
+      let i = 0
+      while i < e.arrElems.length {
+        if recordNullHoleObjAdopt(e.arrElems[i], d.aElem, depth - 1) == 1 {
+          any = 1
+        }
+        i = i + 1
+      }
+      if any == 1 {
+        while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+        nodeTySet(srcExpr, dtix)
+      }
+      return any
+    }
+    return 0
+  }
+  if d is TyObj {
+    if e is ObjLit {
+      // Only a literal whose own recorded type carries a null hole re-stamps — a fully classified
+      // literal keeps its structural record untouched.
+      let own = -1
+      if srcExpr < nodeTyIx.length { own = nodeTyIx[srcExpr] }
+      if !tyHasNullHole(own, 6) { return 0 }
+      // Every literal field must exist on the destination, or this is not an adoption and the
+      // assignability error path owns it. Validate the full field set first, so a late miss leaves
+      // no partial re-stamp behind.
+      const dfn = d.objFieldNames
+      const djs: i32[] = []
+      let k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          let dj = -1
+          let j = 0
+          while j < dfn.length {
+            if dfn[j] == f.fiName { dj = j }
+            j = j + 1
+          }
+          if dj < 0 { return 0 }
+          djs.push(dj)
+        } else {
+          djs.push(-1)
+        }
+        k = k + 1
+      }
+      k = 0
+      while k < e.objFields.length {
+        const f = P.nodes[e.objFields[k]]
+        if f is FieldInit {
+          if djs[k] >= 0 {
+            recordNullHoleObjAdopt(
+              f.fiValue,
+              d.objFieldTypes[djs[k]],
+              depth - 1,
+            )
+          }
+        }
+        k = k + 1
+      }
+      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+      nodeTySet(srcExpr, dtix)
+      return 1
+    }
+    return 0
+  }
+  0
+}
+
+// Does reaching `dst` from `src` need an object-shape adapter that codegen does not have?
+// `assignable`'s `TyObj` arm walks the destination's field names only, so a source carrying
+// extra fields is accepted, while the emitter interns a struct's own field list — two
+// unrelated wasm types with no conversion. An object literal is exempt from a shape mismatch, but not from an excess field's dropped initializer.
+export function objWidthPrefix(src: i32, dst: i32): boolean {
+  if src < 0 || dst < 0 || src == dst { return false }
+  const s = T.tys[src]
+  if s is TyObj {
+    const d = T.tys[dst]
+    if d is TyObj {
+      const sn = s.objFieldNames
+      const dn = d.objFieldNames
+      if dn.length == 0 { return false }
+      if dn.length >= sn.length { return false }
+      const so = fieldNameOrder(sn)
+      const dord = fieldNameOrder(dn)
+      let k = 0
+      while k < dn.length {
+        if sn[so[k]] != dn[dord[k]] { return false }
+        if !tyEq(s.objFieldTypes[so[k]], d.objFieldTypes[dord[k]]) {
+          return false
+        }
+        k = k + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// The positions of `names` in field-name order: a stable insertion sort on the name alone.
+// The checker's field compare and the emitter's struct layout both read it, so they cannot drift.
+export function fieldNameOrder(names: string[]): i32[] {
+  const ord: i32[] = []
+  let i = 0
+  while i < names.length {
+    ord.push(i)
+    i = i + 1
+  }
+  let a = 1
+  while a < ord.length {
+    let b = a
+    while b > 0 && names[ord[b - 1]] > names[ord[b]] {
+      const t = ord[b - 1]
+      ord[b - 1] = ord[b]
+      ord[b] = t
+      b = b - 1
+    }
+    a = a + 1
+  }
+  ord
+}
+
+// Does some shared field name carry a width pair of object shapes? Asked only of a pair
+// whose field names already agree — whether they disagree through a field. At a `direct`
+// value position that width lift is free; inside a mutable struct field it is not available
+// at all (WasmGC field invariance), so silence here hands the validator a program it already accepted (D938).
+export function objFieldWidthPair(src: i32, dst: i32): boolean {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyObj {
+    if d is TyObj {
+      const dnames = d.objFieldNames
+      const dtys = d.objFieldTypes
+      let i = 0
+      while i < dnames.length {
+        const sft = objFieldType(s, dnames[i])
+        if sft >= 0 && dtys[i] >= 0 {
+          if !tyEq(sft, dtys[i]) {
+            if objWidthPrefix(sft, dtys[i]) { return true }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}

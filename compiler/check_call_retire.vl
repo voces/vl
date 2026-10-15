@@ -1,0 +1,253 @@
+// Calls that retire a narrowing: a parameter only ever called by name, and the note a
+// diagnostic gains when a read meets the type a call retired it to.
+// Does not import the checker.
+import {
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  IsExpr,
+  NullLit,
+  P,
+  Param,
+  elseIfLink,
+  i32ToStr,
+  nodeSpineChildren,
+} from "./ast"
+import { callArgPlaces, callDeclFnIx, calleeNameOf } from "./check_callee"
+import { crSpans, nodeLineOf } from "./check_capture_loss"
+import {
+  crAliasWr,
+  crOpCall,
+  crRdIx,
+  crRdRet,
+  crRetCalls,
+  crRetLoops,
+  crRetNames,
+  crRetNarTys,
+  crRetWideTys,
+} from "./check_capture_rows"
+import { crOpOf, crPocOpen, crSubtreeMentions } from "./check_capture_walks"
+import { readsLitConst } from "./check_num_lit_state"
+import { isFloatLitExpr, litTreeOps } from "./check_num_lits"
+import {
+  LIST_EVERY_STEP,
+  keyIsListEvery,
+  mapBracketsText,
+  parenPeelIx,
+  placeKeyOf,
+} from "./check_places"
+import { tyToStr } from "./check_types"
+import { fnBoundNames, placeRootOf } from "./check_write_effects"
+
+// Whether the nested function `fnIx` tests `name` itself (`name is T`, `name != null`), and so
+// reads it at its declared type rather than keeping the narrowing live where it is written.
+export function crBodyTests(fnIx: i32, name: string): boolean {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { return crSubtreeTests(fd.fnBody, name) }
+  false
+}
+
+function crSubtreeTests(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    if isIdentNamed(n.isObj, name) { return true }
+  } else if n is BinExpr {
+    if n.binOp == "==" || n.binOp == "!=" {
+      if isIdentNamed(n.binLeft, name) || isIdentNamed(n.binRight, name) {
+        return true
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crSubtreeTests(kids[k], name) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether the node at `ix` is an `Ident` reading `name`; false for an out-of-range index.
+export function isIdentNamed(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  false
+}
+
+// Whether parameter `pi` of the declaration `d` is only ever called by name in its body — not
+// stored, passed, returned, shadowed, or mentioned inside a nested function.
+export function crParamOnlyCalled(d: i32, pi: i32): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if pi >= fd.fnParams.length { return false }
+    const p = P.nodes[fd.fnParams[pi]]
+    if p is Param {
+      const bound: string[] = []
+      fnBoundNames(d, bound)
+      let n = 0
+      let b = 0
+      while b < bound.length {
+        if bound[b] == p.parName { n = n + 1 }
+        b = b + 1
+      }
+      if n != 1 { return false }
+      if crPocOpen.length > 16 { return false }
+      crPocOpen.push(d * 64 + pi)
+      const ok = crParamUsesOnlyCall(fd.fnBody, p.parName)
+      crPocOpen.pop()
+      return ok
+    }
+  }
+  false
+}
+
+// Whether every use of the parameter `pname` in the subtree calls it, or hands it straight to a
+// declared function whose own parameter there is only ever called — never stores, returns or
+// captures it (D2461 review, the `s1` refusal).
+function crParamUsesOnlyCall(ix: i32, pname: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName != pname }
+  if n is FuncDecl { return !crSubtreeMentions(n.fnBody, pname) }
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    let calleeOk = false
+    if cf is Ident { calleeOk = cf.identName == pname }
+    if !calleeOk && !crParamUsesOnlyCall(n.callFn, pname) { return false }
+    const d = callDeclFnIx(n, ix)
+    const places = callArgPlaces(n, ix)
+    const off = places.length - n.callArgs.length
+    let a = 0
+    while a < n.callArgs.length {
+      const an = n.callArgs[a]
+      if isIdentNamed(an, pname) {
+        if d < 0 || !crParamOnlyCalledOpen(d, a + off) { return false }
+      } else if !crParamUsesOnlyCall(an, pname) {
+        return false
+      }
+      a = a + 1
+    }
+    return true
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if !crParamUsesOnlyCall(kids[k], pname) { return false }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  true
+}
+
+function crParamOnlyCalledOpen(d: i32, pi: i32): boolean {
+  let i = 0
+  while i < crPocOpen.length {
+    if crPocOpen[i] == d * 64 + pi { return true }
+    i = i + 1
+  }
+  crParamOnlyCalled(d, pi)
+}
+
+// The note a diagnostic at node `at` gains when a statement still being checked read a name at
+// the type a call retired it to, and the diagnostic spans that read or names that type; ""
+// otherwise.
+export function crMisuseNote(msg: string, at: i32): string {
+  let i = crRdRet.length - 1
+  while i >= 0 {
+    const r = crRdRet[i]
+    // An element entry (`v[*]`) is named as its list narrowed whole (`v` to `K[]`).
+    let nm = crRetNames[r]
+    let narText = tyToStr(crRetNarTys[r])
+    if keyIsListEvery(nm) && nm.indexOf(".") < 0 {
+      const root = placeRootOf(nm)
+      narText = narText
+        + mapBracketsText(
+        (nm.length - root.length) / LIST_EVERY_STEP.length,
+      )
+      nm = root
+    }
+    const hit = crSpans(at, crRdIx[i])
+      || (crRetWideTys[r] >= 0
+      && msg.indexOf(tyToStr(crRetWideTys[r])) >= 0)
+    if hit && msg.indexOf("'" + nm + "' is no longer") < 0 {
+      let where = ""
+      if crRetLoops[r] { where = " in the loop around this read" }
+      return " — '"
+        + nm
+        + "' is no longer narrowed to "
+        + narText
+        + ": "
+        + crCallDesc(crRetCalls[r], true)
+        + where
+        + " may reassign it; re-test '"
+        + nm
+        + "' after "
+        + crAfterWord(crRetCalls[r])
+    }
+    i = i - 1
+  }
+  ""
+}
+
+// How a note names what ended a narrowing, after "re-test it after".
+function crAfterWord(ix: i32): string {
+  if (crAliasWr[ix] ?? false) || crIsPlainAssign(ix) { return "the assignment" }
+  "the call"
+}
+
+// Whether `ix` is an assignment no declared operator dispatched, so a diagnostic names it as one.
+function crIsPlainAssign(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || (crOpCall[ix] ?? false) { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr { return n.binOp == "=" }
+  false
+}
+
+// How a diagnostic names the call at `ix`, a declared operator being a call too; a callee with
+// no name (`fs[0]()`) is named by its line alone.
+export function crCallDesc(ix: i32, withLine: boolean): string {
+  if (crAliasWr[ix] ?? false) || crIsPlainAssign(ix) {
+    const an = P.nodes[ix]
+    let d = "the assignment"
+    if an is BinExpr {
+      const ak = placeKeyOf(an.binLeft)
+      if ak != "" { d = "the assignment to '" + ak + "'" }
+    }
+    if withLine { d = d + " on line " + i32ToStr(nodeLineOf(ix)) }
+    return d
+  }
+  let d = "the call"
+  const nm = calleeNameOf(ix)
+  if nm != "?" { d = "the call to '" + nm + "'" }
+  if ix >= 0 && ix < P.nodes.length {
+    if !(P.nodes[ix] is Call) {
+      const op = crOpOf(ix)
+      if op != "" { d = "the operator '" + op + "'" }
+    }
+  }
+  if withLine { d = d + " on line " + i32ToStr(nodeLineOf(ix)) }
+  d
+}
+
+// Whether the expression at `ix` adapts in a join: a number or `null` literal, an operator tree
+// of numbers, a literal `const`, or an assignment, whose arm yields no value to join.
+export function leafIsLit(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  if litTreeOps(x, depth) >= 0 || isFloatLitExpr(x) || crIsPlainAssign(x) {
+    return true
+  }
+  if readsLitConst(x) { return true }
+  P.nodes[x] is NullLit
+}

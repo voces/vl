@@ -1,0 +1,189 @@
+// Sites inside a function body a diagnostic points at: the nested function whose
+// annotation names a type parameter, and the return site of a function-literal mismatch.
+// Does not import the checker.
+import {
+  Block,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  P,
+  Param,
+  RetStmt,
+  WhileStmt,
+  annTsOf,
+  nodeChildren,
+  tsMentionsAnyName,
+} from "./ast"
+import { tyIsDeferredJoin } from "./check_tp_join"
+import { isVoidTy } from "./check_ty_shape"
+import { T, TyFunc, TyUnion, tyEq, tyIsHole } from "./check_types"
+import { peelParenIx } from "./check_write_effects"
+import { strListHas } from "./listutil"
+
+// The first value-bearing return site in a function-literal body, in source order — walking
+// blocks, if-arms and loop bodies but never descending into a nested function literal. `-1`
+// when every return is bare, so the value came from the body's tail expression instead.
+function firstValueRetIn(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is RetStmt {
+    if n.retArg >= 0 { return n.retArg }
+    return -1
+  }
+  if n is Block {
+    let i = 0
+    while i < n.blkStmts.length {
+      const hit = firstValueRetIn(n.blkStmts[i])
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    return -1
+  }
+  if n is IfStmt {
+    const hit = firstValueRetIn(n.ifThen)
+    if hit >= 0 { return hit }
+    return firstValueRetIn(n.ifElse)
+  }
+  if n is WhileStmt { return firstValueRetIn(n.whileBody) }
+  if n is ForRange { return firstValueRetIn(n.frBody) }
+  if n is ForIn { return firstValueRetIn(n.fiBody) }
+  -1
+}
+
+// The offending return site of function-literal `fn` for an `expected` vs `at`
+// function-type mismatch, or -1 when no site is provably the offender (a param
+// type also disagrees, or the inferred return is a join whose sites may
+// disagree — a union, a deferred join, a hole).
+export function fnLitRetMismatchSite(fn: FuncDecl, expected: i32, at: i32) {
+  if expected < 0 || at < 0 { return -1 }
+  const et = T.tys[expected]
+  if !(et is TyFunc) { return -1 }
+  const gt = T.tys[at]
+  if !(gt is TyFunc) { return -1 }
+  if et.fnParamTypes.length != gt.fnParamTypes.length { return -1 }
+  let i = 0
+  while i < et.fnParamTypes.length {
+    if !tyEq(et.fnParamTypes[i], gt.fnParamTypes[i]) { return -1 }
+    i = i + 1
+  }
+  if tyEq(et.fnRet, gt.fnRet) { return -1 }
+  if !isVoidTy(et.fnRet) {
+    // Not the void demand (where any value-bearing site offends): the first
+    // site is the offender only when every site agreed on one plain type.
+    if gt.fnRet < 0 { return -1 }
+    const gr = T.tys[gt.fnRet]
+    if gr is TyUnion { return -1 }
+    if tyIsDeferredJoin(gt.fnRet) { return -1 }
+    if tyIsHole(gt.fnRet) { return -1 }
+  }
+  const site = firstValueRetIn(fn.fnBody)
+  if site >= 0 { return site }
+  // No explicit value-bearing `return`: the type came from the body's tail
+  // expression — its last statement.
+  if fn.fnBody >= 0 && fn.fnBody < P.nodes.length {
+    const b = P.nodes[fn.fnBody]
+    if b is Block {
+      if b.blkStmts.length > 0 { return b.blkStmts[b.blkStmts.length - 1] }
+    }
+  }
+  -1
+}
+
+// The first function under `ix` (a nested `function` or a lambda) one of whose parameter
+// annotations names `names[0]`, and which `body` uses: a lambda written in place, or a name
+// `body` references. -1 for none. A function declaring its own type parameter of that name
+// shadows it and is not entered.
+export function bodyFnParamNaming(ix: i32, body: i32, names: string[]): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    if strListHas(n.fnTyParams, names[0]) { return -1 }
+    if anyParamMentionsTyParam(n.fnParams, names) {
+      if n.fnName != "" {
+        if subtreeNamesIdent(body, n.fnName) { return ix }
+      } else {
+        const lname = bodyFnLetName(body, ix)
+        if lname == "" { return ix }
+        if subtreeNamesIdent(body, lname) { return ix }
+      }
+    }
+  }
+  for c in nodeChildren(ix) {
+    const r = bodyFnParamNaming(c, body, names)
+    if r >= 0 { return r }
+  }
+  -1
+}
+
+// The first function under `ix` whose RETURN annotation names `names[0]` and which `body`
+// uses, or -1; the twin of `bodyFnParamNaming`, with the same shadowing and use rules (D4552).
+export function bodyFnRetNaming(ix: i32, body: i32, names: string[]): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    if strListHas(n.fnTyParams, names[0]) { return -1 }
+    if n.fnRet >= 0 && tsMentionsAnyName(annTsOf(n.fnRet), names) {
+      if n.fnName != "" {
+        if subtreeNamesIdent(body, n.fnName) { return ix }
+      } else {
+        const lname = bodyFnLetName(body, ix)
+        if lname == "" { return ix }
+        if subtreeNamesIdent(body, lname) { return ix }
+      }
+    }
+  }
+  for c in nodeChildren(ix) {
+    const r = bodyFnRetNaming(c, body, names)
+    if r >= 0 { return r }
+  }
+  -1
+}
+
+// The name of the `let`/`const` under `ix` whose initialiser is the function node `fnIx`
+// (through parentheses), or "" when `fnIx` is not bound that way.
+export function bodyFnLetName(ix: i32, fnIx: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letInit >= 0 && peelParenIx(n.letInit) == fnIx { return n.letName }
+  }
+  for c in nodeChildren(ix) {
+    const r = bodyFnLetName(c, fnIx)
+    if r != "" { return r }
+  }
+  ""
+}
+
+// Whether an identifier named `name` occurs anywhere under `ix`.
+function subtreeNamesIdent(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  for c in nodeChildren(ix) {
+    if subtreeNamesIdent(c, name) { return true }
+  }
+  false
+}
+
+// Does any parameter's written annotation mention one of `names`? An un-annotated parameter
+// mentions nothing, which is the right answer: its type is a hole the call site pins, and a
+// hole never carries the declared name a return annotation would substitute through.
+export function anyParamMentionsTyParam(
+  params: i32[],
+  names: string[],
+): boolean {
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        if tsMentionsAnyName(annTsOf(p.parType), names) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}

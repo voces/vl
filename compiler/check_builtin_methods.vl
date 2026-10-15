@@ -1,0 +1,290 @@
+// Built-in methods: the member-call order on a receiver, a built-in method's signature,
+// the receiver a string literal is, and the note for a numeric builtin called as a method.
+// Does not import the checker.
+import { MC_RUNG_BUILTIN, MC_RUNG_FIELD, Member, P } from "./ast"
+import { builtinMethodClaims } from "./check_callee"
+import { floatIntrArity, intIntrArity } from "./check_intrinsics"
+import { lookup } from "./check_scopes"
+import { nomErasedTyIx } from "./check_ty_rep"
+import { arrElemValueTy, primNameOf } from "./check_ty_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_I32,
+  TY_STR,
+  TY_U8,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  mkArrayTy,
+  mkNullableTy,
+  tyFieldTyOf,
+} from "./check_types"
+import { nodeLastTok, nodeStartTok } from "./fmt_util"
+
+// The member-call order on a receiver of `recvTy`: its built-in method `name`
+// (`MC_RUNG_BUILTIN`), then its field `name` (`MC_RUNG_FIELD`), then 0, the `self`-function.
+// The checker's pin and the emitter's per-instance rewrite read this one answer (D2517). A type
+// parameter answers 0: some instantiation may lack the member. A map and a `Set` differ here.
+export function memberRungOnTy(recvTy: i32, name: string): i32 {
+  if recvTy < 0 { return 0 }
+  const rTy = strLitRecvTy(recvTy)
+  if rTy < 0 || rTy >= T.tys.length { return 0 }
+  if T.tys[rTy] is TyVar { return 0 }
+  if builtinMethodClaims(rTy, name) { return MC_RUNG_BUILTIN }
+  if tyFieldTyOf(rTy, name) >= 0 { return MC_RUNG_FIELD }
+  0
+}
+
+// A receiver's conventional spelling in the refusal's example call, so the sentence
+// reads `m.get(…)` or `p.x(…)` rather than naming the parameter `self` back to its author.
+export function selfFnRecvSpelling(selfTy: i32): string {
+  const t = T.tys[nomErasedTyIx(strLitRecvTy(selfTy))]
+  match t {
+    TyArray => {
+      return "xs"
+    }
+    TyMap => {
+      if t.mSet == 1 { return "s" }
+      return "m"
+    }
+    TyPrim => {
+      return "s"
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+  }
+  "p"
+}
+
+// When member node `ix` calls a numeric builtin as a method of `objTy` (`x.abs()`,
+// `x.max(1.0)`), the sentence naming the call to write, spelled from the source; "" otherwise,
+// and "" when a binding of the builtin's name is in scope, since the call would reach that.
+export function builtinMethodNote(objTy: i32, prop: string, ix: i32): string {
+  const pn = primNameOf(objTy)
+  const isFloat = pn == "f32" || pn == "f64"
+  const isInt = pn == "i32" || pn == "i64"
+  let arity = 0
+  if isFloat { arity = floatIntrArity(prop) }
+  if isInt {
+    arity = intIntrArity(prop)
+    if prop == "abs" || prop == "min" || prop == "max" {
+      arity = floatIntrArity(prop)
+    }
+  }
+  if arity == 0 || lookup(prop) >= 0 { return "" }
+  let call = prop + "(x)"
+  if arity == 2 { call = prop + "(x, y)" }
+  const n = P.nodes[ix]
+  if n is Member {
+    const spelled = builtinCallSpelling(prop, n.memObj, ix)
+    if spelled != "" { call = spelled }
+  }
+  " — `"
+    + prop
+    + "` is a builtin function, not a method: call it as `"
+    + call
+    + "`"
+}
+
+// `prop(<receiver>, <args>)` spelled from the tokens of member call `recv.prop(args)` whose
+// member node is `memIx`; "" when the member is not followed by its argument list.
+function builtinCallSpelling(prop: string, recv: i32, memIx: i32): string {
+  const r0 = nodeStartTok(recv)
+  const r1 = nodeLastTok(recv)
+  const m1 = nodeLastTok(memIx)
+  if r0 < 0 || r1 < r0 || m1 < 0 || m1 + 1 >= P.toks.length { return "" }
+  if P.toks[m1 + 1].kind != "LPAREN" { return "" }
+  let depth = 0
+  let k = m1 + 1
+  let close = -1
+  while k < P.toks.length && close < 0 {
+    const kk = P.toks[k].kind
+    if kk == "LPAREN" { depth = depth + 1 }
+    if kk == "RPAREN" {
+      depth = depth - 1
+      if depth == 0 { close = k }
+    }
+    k = k + 1
+  }
+  if close < 0 { return "" }
+  // A parenthesised receiver needs no parentheses as an argument.
+  let a = r0
+  let b = r1
+  if b > a + 1 && P.toks[a].kind == "LPAREN" && P.toks[b].kind == "RPAREN" {
+    a = a + 1
+    b = b - 1
+  }
+  let out = prop + "(" + tokSpanText(a, b)
+  // A trailing comma (and the line breaks around it) is not part of the last argument.
+  let e = close - 1
+  while (
+    e > m1 + 1
+    && (P.toks[e].kind == "NEWLINE" || P.toks[e].kind == "COMMA")
+  ) {
+    e = e - 1
+  }
+  if e > m1 + 1 { out = out + ", " + tokSpanText(m1 + 2, e) }
+  out + ")"
+}
+
+// The source tokens `a..b` on one line, joined with single spaces: none inside brackets,
+// before a comma, or after a prefix `-` / `!`.
+function tokSpanText(a: i32, b: i32): string {
+  let out = ""
+  let pk = ""
+  let prefix = false
+  let i = a
+  while i <= b {
+    const t = P.toks[i]
+    if t.kind != "NEWLINE" {
+      if pk != "" {
+        const tight = prefix
+          || pk == "LPAREN"
+          || pk == "LBRACK"
+          || pk == "DOT"
+          || t.kind == "RPAREN"
+          || t.kind == "RBRACK"
+          || t.kind == "COMMA"
+          || t.kind == "DOT"
+          || t.kind == "LPAREN"
+          || t.kind == "LBRACK"
+        if !tight { out = out + " " }
+      }
+      prefix = t.kind == "BANG" || (t.kind == "MINUS" && !tokEndsValue(pk))
+      out = out + t.text
+      pk = t.kind
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Whether a token of kind `k` can end an operand, so a `-` after it is binary.
+function tokEndsValue(k: string): boolean {
+  k == "IDENT"
+    || k == "NUMBER"
+    || k == "STRING"
+    || k == "CHAR"
+    || k == "TRUE"
+    || k == "FALSE"
+    || k == "NULL"
+    || k == "RPAREN"
+    || k == "RBRACK"
+    || k == "RBRACE"
+    || k == "TEMPLATE"
+    || k == "TEMPLATE_TAIL"
+}
+
+// The built-in method `prop` of a receiver of `recv` called with `argc` arguments: its
+// parameter types into `out`, its result returned. -1 where the arity does not fit, or for a
+// callback method (`map`/`filter`), whose parameter this table cannot state (D2517).
+export function builtinSigOf(
+  recv: i32,
+  prop: string,
+  argc: i32,
+  out: i32[],
+): i32 {
+  const ix = nomErasedTyIx(strLitRecvTy(recv))
+  if ix < 0 || ix >= T.tys.length { return -1 }
+  const t = T.tys[ix]
+  let res = -1
+  let arity = 0
+  match t {
+    TyArray => {
+      if prop == "push" {
+        while out.length < argc { out.push(t.aElem) }
+        if argc > 0 { return TY_I32 }
+        return -1
+      }
+      if prop == "slice" {
+        while out.length < argc { out.push(TY_I32) }
+        if argc == 1 || argc == 2 {
+          return listBuiltResultTy(ix, t.aElem, t.aRead)
+        }
+        return -1
+      }
+      if prop == "pop" { res = mkNullableTy(arrElemValueTy(t.aElem)) }
+      if prop == "get" {
+        arity = 1
+        out.push(TY_I32)
+        res = mkNullableTy(arrElemValueTy(t.aElem))
+      }
+      if prop == "clear" { res = TY_VOID }
+    }
+    TyMap => {
+      if prop == "set" {
+        arity = 2
+        out.push(t.mKey)
+        out.push(t.mVal)
+        res = TY_VOID
+      }
+      if prop == "get" || prop == "add" || prop == "has" || prop == "delete" {
+        arity = 1
+        out.push(t.mKey)
+        res = TY_BOOL
+        if prop == "get" { res = mkNullableTy(t.mVal) }
+        if prop == "add" { res = TY_VOID }
+      }
+      if prop == "clear" { res = TY_VOID }
+      if prop == "keys" { res = mkArrayTy(t.mKey) }
+      if prop == "values" {
+        res = mkArrayTy(t.mVal)
+        if t.mSet == 1 { res = mkArrayTy(t.mKey) }
+      }
+    }
+    TyPrim => {
+      if prop == "slice" {
+        arity = 2
+        out.push(TY_I32)
+        out.push(TY_I32)
+        res = TY_STR
+      }
+      if prop == "indexOf" || prop == "includes" {
+        arity = 1
+        out.push(TY_STR)
+        res = TY_I32
+        if prop == "includes" { res = TY_BOOL }
+      }
+      if prop == "charCodeAt" || prop == "cpAt" || prop == "isCharBoundary" {
+        arity = 1
+        out.push(TY_I32)
+        res = TY_I32
+        if prop == "isCharBoundary" { res = TY_BOOL }
+      }
+      if prop == "cpLen" { res = TY_I32 }
+      if prop == "bytes" { res = mkArrayTy(TY_U8) }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+  }
+  if argc != arity { return -1 }
+  res
+}
+
+// The result of a list method that BUILDS a new list from the receiver (`.filter`,
+// `.slice`): a view receiver hands back a MUTABLE list, since the result is a fresh value
+// nobody else holds. A mutable receiver keeps its own arena index, so nothing is reminted.
+export function listBuiltResultTy(recvTy: i32, elem: i32, ro: i32): i32 {
+  if ro == 1 { return mkArrayTy(elem) }
+  recvTy
+}
+
+// Extracted from `checkNodeReal`'s `LetDecl` arm (C3: thin the dispatcher).
+// A receiver typed as one string literal is a `string` to every member, method and index: the
+// literal is one value of that type, and its rep is the string (D2159).
+export function strLitRecvTy(ty: i32): i32 {
+  if ty < 0 { return ty }
+  const t = T.tys[ty]
+  if t is TyLit {
+    if t.litKind == "str" { return TY_STR }
+  }
+  ty
+}

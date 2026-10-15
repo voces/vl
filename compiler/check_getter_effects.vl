@@ -1,0 +1,1668 @@
+// Getter resolution and the effect summary a getter body is held to: the getter
+// registry reads, the per-row cost and fact walk (`es*`, `gc*`) and the text a refusal
+// prints, the type-parameter binding and erasure that walk uses, and the sole-reference
+// and value-use tables a narrowed read consults.
+// Does not import the checker.
+import {
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  Node,
+  NumLit,
+  OptMember,
+  P,
+  Paren,
+  StrLit,
+  adoptNodeTok,
+  arenaEditBumpCount,
+  arenaEditCount,
+  arenaEditSlotAt,
+  arenaEpochBump,
+  arenaEpochNow,
+  declNameTokOf,
+  elseIfLink,
+  extGMut,
+  externGlobalLinkOfName,
+  externLinkOf,
+  getDeclExported,
+  getDeclPropOf,
+  i32ToStr,
+  mkIdent,
+  nodeSpineChildren,
+  nodeToks,
+  opDeclLabel,
+  opDeclOpOf,
+  ufcsModOfNode,
+} from "./ast"
+import {
+  BME_NONE,
+  builtinMethodEffect,
+  builtinMethodNamesOf,
+  opIdxDeclared,
+  opSiteDecls,
+} from "./check_callee"
+import { nodeLineOf } from "./check_capture_loss"
+import {
+  crFnBases,
+  crOpOpaque,
+  crProgRoot,
+  crSoleDepths,
+  crSoleNames,
+  crValUseDyn,
+  crValUseGetProps,
+  crValUseNames,
+  crValUseRoot,
+  cvuBumps,
+  cvuEpoch,
+  cvuIdxIx,
+  cvuIdxName,
+  cvuLogAt,
+  cvuMemIx,
+  cvuMemName,
+  cvuNames,
+  cvuSlotOf,
+} from "./check_capture_rows"
+import { crCurRoot } from "./check_capture_widen"
+import { inferQuiet } from "./check_cursor"
+import {
+  ES_UNBOUNDED,
+  esAlloc,
+  esAllocVia,
+  esBindCount,
+  esBindNames,
+  esBindStart,
+  esBindTys,
+  esCost,
+  esDecl,
+  esFrame,
+  esHost,
+  esHostVia,
+  esLow,
+  esOnStack,
+  esReadLet,
+  esReadLetVia,
+  esScopeBase,
+  esScopeKind,
+  esScopeNames,
+  esStack,
+  esUnknown,
+  esUnknownVia,
+  esWhy,
+  esWhyVia,
+  esWrite,
+  esWriteLocal,
+  esWriteVia,
+  gcCmpCount,
+  gcCmpSteps,
+  gcTopCount,
+  gcTopRow,
+  gcTopSteps,
+  gcTrail,
+} from "./check_effect_rows"
+import {
+  ATOMIC_SIG_LOAD,
+  ATOMIC_SIG_WAIT,
+  atomicRow,
+  atomicRowSig,
+  floatIntrArity,
+  intIntrArity,
+  nameIsEmitterIntrinsic,
+  nameIsFsIntrinsic,
+  nameIsMemBulkIntrinsic,
+  nameIsMemLoadIntrinsic,
+  nameIsMemStoreIntrinsic,
+  nameIsSimdIntrinsic,
+  truncSatOp,
+} from "./check_intrinsics"
+import {
+  nodeTyIsNulString,
+  nodeTyIx,
+  nodeTyIxOf,
+  nodeTySet,
+} from "./check_node_tys"
+import {
+  getSiteFns,
+  getSiteNodes,
+  keyHasPrefix,
+  placeKeyOf,
+} from "./check_places"
+import { recBindDeclOf } from "./check_record_origins"
+import {
+  constDeclOf,
+  isConstName,
+  lookup,
+  lookupDepth,
+  moduleFnDeclOf,
+} from "./check_scopes"
+import { demangleName } from "./check_suggest"
+import { getterNicheOk, nomErasedTyIx } from "./check_ty_rep"
+import {
+  T,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  genAppNameOfTy,
+  nomNameOfTy,
+  objFieldType,
+  structNameOfTy,
+  tyIsLitUnion,
+  tyIsOneStrLit,
+  tyLitMemberTexts,
+  tyToStr,
+  unionAliasDeclNameOfTy,
+} from "./check_types"
+import { nodeHasWideStrLit, nodeWideStrLitText } from "./check_wide_lits"
+import { peelParenIx, weInitIsFresh } from "./check_write_effects"
+import { cwPeel, declFirstParamIsSelf, fnDeclIx } from "./check_write_scan"
+import { strListHas } from "./listutil"
+import { identSet } from "./symbols"
+
+// Every `get p(self: T): R` the program declares, collected by the top-level hoist: the
+// (merge-mangled) declaration name, the plain property, the `FuncDecl` node and the resolved
+// receiver type. A getter is found through this table by the receiver's type, never by name.
+export let getFns: string[] = []
+export let getProps: string[] = []
+export let getDecls: i32[] = []
+export let getSelfTys: i32[] = []
+
+// Every top-level `let`/`const` name, hoisted in pass 1.5 so a function body — checked in pass 2
+// or pulled early by demand-inference — resolves it regardless of source order, exactly as it
+// already resolves a top-level function. Membership also drives the pass-2 redeclare-error skip,
+// the hoist owning the canonical declaration.
+export let moduleGlobals: {[string]: boolean} = Map()
+
+// The narrowing key of the receiver an index place is taken from — `"xs"` for `xs[i]`, `"o.xs"`
+// for `o.xs[i]` — or `""` when the node is not an index or the receiver is not itself a place. It
+// answers for a variable subscript too, which is the point: the write side needs to know which
+// array a `xs[i] = …` may have hit even though it cannot say which cell.
+export function indexRootKeyOf(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is Paren { return indexRootKeyOf(n.parInner) }
+  if n is Index { return placeKeyOf(n.idxArr) }
+  ""
+}
+
+// Record the `const` just declared by `n` when its object has no other holder (D2584).
+export function crNoteSoleRef(n: LetDecl) {
+  const d = lookupDepth(n.letName)
+  if d < 0 { return 0 }
+  crDropSoleAt(n.letName, d)
+  if n.letKw != "const" || !weInitIsFresh(n.letInit) { return 0 }
+  let root = crCurRoot()
+  if crFnBases.length == 0 { root = crProgRoot }
+  if root < 0 { return 0 }
+  if root != crValUseRoot {
+    crValUseEnter(root)
+    crValUseRoot = root
+  }
+  if crValUseNames[n.letName] ?? false { return 0 }
+  if crValUseDyn[n.letName] ?? false { return 0 }
+  const gps = crValUseGetProps[n.letName] ?? []
+  if gps.length > 0 {
+    const lt = lookup(n.letName)
+    let k = 0
+    while k < gps.length {
+      if crTyMayReadGetter(lt, gps[k]) { return 0 }
+      k = k + 1
+    }
+  }
+  crSoleNames.push(n.letName)
+  crSoleDepths.push(d)
+  0
+}
+
+// Whether a read `.prop` of a value typed `t` may run a getter: `t` or a member of it has one,
+// so a narrowed read does too. A field of that name wins over a getter, as `getterFnFor` says.
+function crTyMayReadGetter(t: i32, prop: string): boolean {
+  if t < 0 { return true }
+  if getterFnFor(t, prop) != "" { return true }
+  const r = T.tys[t]
+  if r is TyUnion {
+    let i = 0
+    while i < r.uMembers.length {
+      if getterFnFor(r.uMembers[i], prop) != "" { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Forget a record of `name` at depth `d`: a later declaration there binds a different object.
+function crDropSoleAt(name: string, d: i32) {
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d { crSoleNames[i] = "" }
+    i = i - 1
+  }
+  0
+}
+
+// Point `crValUseNames` and `crValUseDyn` at `root`; a site `x.p` is kept when a getter is named
+// `p`, since the root's own later sites are not banked yet (D3760). A root is walked again only
+// when the arena moved; the program's root instead adds the slots the logged edits rewrote, when
+// those made every bump since its walk.
+function crValUseEnter(root: i32) {
+  let slot = cvuSlotOf[root] ?? -1
+  if slot < 0 {
+    slot = cvuEpoch.length
+    cvuSlotOf[root] = slot
+    cvuEpoch.push(-1)
+    cvuBumps.push(0)
+    cvuLogAt.push(0)
+    cvuNames.push(Map())
+    cvuMemIx.push([])
+    cvuMemName.push([])
+    cvuIdxIx.push([])
+    cvuIdxName.push([])
+  }
+  const ep = arenaEpochNow()
+  const logged = arenaEditBumpCount() - cvuBumps[slot] == ep - cvuEpoch[slot]
+  const moved = cvuEpoch[slot] != ep && (root != crProgRoot || !logged)
+  if cvuEpoch[slot] < 0 || moved {
+    cvuNames[slot] = Map()
+    cvuMemIx[slot] = []
+    cvuMemName[slot] = []
+    cvuIdxIx[slot] = []
+    cvuIdxName[slot] = []
+    crValUseWalk(root, slot)
+  } else if cvuEpoch[slot] != ep {
+    let e = cvuLogAt[slot]
+    while e < arenaEditCount() {
+      crValUseWalk(arenaEditSlotAt(e), slot)
+      e = e + 1
+    }
+  }
+  cvuEpoch[slot] = ep
+  cvuBumps[slot] = arenaEditBumpCount()
+  cvuLogAt[slot] = arenaEditCount()
+  crValUseNames = cvuNames[slot]
+  crValUseDyn = Map()
+  crValUseGetProps = Map()
+  const mi = cvuMemIx[slot]
+  if getFns.length > 0 {
+    const props: {[string]: boolean} = Map()
+    let g = 0
+    while g < getProps.length {
+      props[getProps[g]] = true
+      g = g + 1
+    }
+    let i = 0
+    while i < mi.length {
+      const m = P.nodes[mi[i]]
+      if m is Member && (props[m.memProp] ?? false) {
+        const rn = cvuMemName[slot][i]
+        const ps = crValUseGetProps[rn] ?? []
+        if !strListHas(ps, m.memProp) { ps.push(m.memProp) }
+        crValUseGetProps[rn] = ps
+      }
+      i = i + 1
+    }
+  }
+  const xi = cvuIdxIx[slot]
+  const anyOp = opIdxDeclared()
+  let j = 0
+  while j < xi.length {
+    if (
+      (anyOp || (crOpOpaque[xi[j]] ?? false))
+      && opSiteDecls(xi[j]).length > 0
+    ) {
+      crValUseDyn[cvuIdxName[slot][j]] = true
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Collect into slot `s` every name the subtree uses other than as the receiver of a field or cell
+// access. A method call, a getter and a dispatched index hand the receiver on, so the last two
+// are kept as sites for `crValUseEnter` to grade.
+function crValUseWalk(ix: i32, s: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    cvuNames[s][n.identName] = true
+    return 0
+  }
+  if n is Member {
+    const mo = P.nodes[peelParenIx(n.memObj)]
+    if mo is Ident {
+      cvuMemIx[s].push(ix)
+      cvuMemName[s].push(mo.identName)
+      return 0
+    }
+  }
+  if n is OptMember {
+    if P.nodes[peelParenIx(n.omObj)] is Ident { return 0 }
+  }
+  if n is Index {
+    const xo = P.nodes[peelParenIx(n.idxArr)]
+    if xo is Ident {
+      cvuIdxIx[s].push(ix)
+      cvuIdxName[s].push(xo.identName)
+      crValUseWalk(n.idxIndex, s)
+      return 0
+    }
+  }
+  if n is Call {
+    const cf = P.nodes[peelParenIx(n.callFn)]
+    if cf is Member {
+      const cr = P.nodes[peelParenIx(cf.memObj)]
+      if cr is Ident { cvuNames[s][cr.identName] = true }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      crValUseWalk(kids[i], s)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// When a field an un-annotated parameter's body reads is a getter on argument type `at`, the
+// sentence that says so: the inferred record demands a field, and a getter is not one.
+export function getterDemandNote(demand: i32, at: i32): string {
+  if demand < 0 || at < 0 { return "" }
+  const d = T.tys[demand]
+  if d is TyObj {
+    let i = 0
+    while i < d.objFieldNames.length {
+      const g = getterFnFor(at, d.objFieldNames[i])
+      if g != "" {
+        return " — `"
+          + d.objFieldNames[i]
+          + "` on "
+          + tyToStr(at)
+          + " is a getter, and the parameter's inferred type is a record with a field `"
+          + d.objFieldNames[i]
+          + "`, which a getter does not satisfy; annotate the parameter as `"
+          + tyToStr(at)
+          + "`"
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// The module index in a `name$m<N>` merge-rename suffix, or -1 when `nm` carries none — an
+// unmerged single-file program's names are unmangled. Reads the FIRST `$m<digits>` run: the
+// head type's own module, ahead of any generic-application argument suffixes.
+export function modIxOfMangled(nm: string): i32 {
+  let i = 0
+  while i + 2 < nm.length {
+    if (
+      nm[i] == '$'
+      && nm[i + 1] == 'm'
+      && nm[i + 2] >= '0'
+      && nm[i + 2] <= '9'
+    ) {
+      let v = 0
+      let j = i + 2
+      while j < nm.length && nm[j] >= '0' && nm[j] <= '9' {
+        v = v * 10 + (nm[j] - '0')
+        j = j + 1
+      }
+      return v
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The module that declared the named type at arena index `recvTy`, from the `$m<N>` suffix
+// its recovered name carries (§C, docs/internals/type-bound-ufcs-design.md). -1 when the type
+// carries no declared name or the program never merged — both mean "no foreign scope to ask",
+// so the type-bound rung is skipped and the ordinary refusal stands.
+export function homeModuleOf(recvTy: i32): i32 {
+  if recvTy < 0 { return -1 }
+  let nm = nomNameOfTy(recvTy)
+  if nm == "" { nm = structNameOfTy(recvTy) }
+  if nm == "" { nm = unionAliasDeclNameOfTy(recvTy) }
+  if nm == "" { nm = genAppNameOfTy(recvTy) }
+  if nm == "" { return -1 }
+  modIxOfMangled(nm)
+}
+
+// The ARGUMENT type of the bitcast named `name`, or -1 when it is not a bitcast.
+export function bitcastArgTy(name: string) {
+  if name == "f32bits" { return TY_F32 }
+  if name == "f64bits" { return TY_F64 }
+  if name == "f32fromBits" { return TY_I32 }
+  if name == "f64fromBits" { return TY_I64 }
+  -1
+}
+
+// Is `name` one of the numeric-opcode intrinsics at all? The emitter's import scan asks
+// this: an intrinsic RESULT type appears nowhere as an annotation (`f64bits(x)` is an
+// i64, `f32fromBits(b)` an f32), so the scan that decides the `__print_*__` imports has
+// to recognize the call itself and read its recorded type.
+export function isNumIntrinsicName(name: string) {
+  if bitcastArgTy(name) >= 0 { return true }
+  if floatIntrArity(name) > 0 { return true }
+  intIntrArity(name) > 0
+}
+
+// Whether `nm` is a builtin a call reaches with nothing declared or imported: a lowered library
+// value (`print`, `Map`, `Set`, `fromCodePoint`), a numeric intrinsic or an emitter intrinsic.
+// A `__`-spelled intrinsic is the compiler's floor, std's to call, so it is not one.
+export function isBuiltinCallName(nm: string): boolean {
+  if nm.length >= 2 && nm.slice(0, 2) == "__" { return false }
+  nm == "print"
+    || nm == "Map"
+    || nm == "Set"
+    || nm == "fromCodePoint"
+    || isNumIntrinsicName(nm)
+    || nameIsEmitterIntrinsic(nm)
+}
+
+// The sentence for calling a non-function binding that hides a builtin or a module function of its
+// name, naming the binding and where it is declared; "" when the callee is not such a binding
+// (D3599).
+export function builtinShadowMsg(calleeIx: i32, fnTy: i32) {
+  // A literal `const` read is rewritten to its literal, so the name comes from the token.
+  if calleeIx < 0 || calleeIx >= nodeToks.length { return "" }
+  const ctk = nodeToks[calleeIx]
+  if ctk < 0 || ctk >= P.toks.length || P.toks[ctk].kind != "IDENT" {
+    return ""
+  }
+  const raw = P.toks[ctk].text
+  const nm = demangleName(raw)
+  const m = ufcsModOfNode(calleeIx)
+  let hidden = ""
+  const fd = moduleFnDeclOf(raw, m)
+  if fd >= 0 {
+    hidden = "the function `" + nm + "`" + tokAtSuffix(declNameTokOf(fd))
+  } else if isBuiltinCallName(nm) {
+    hidden = "the builtin `" + nm + "`"
+  }
+  if hidden == "" { return "" }
+  // A module-level binding of a merged compile is scoped under its module's mangled name.
+  let key = raw
+  if lookupDepth(raw) < 0 && m >= 0 { key = raw + "$m" + i32ToStr(m) }
+  let d = constDeclOf(key)
+  if d < 0 { d = recBindDeclOf(calleeIx, key) }
+  let tk = -1
+  if d >= 0 { tk = declNameTokOf(d) }
+  "`"
+    + nm
+    + "` here is the `"
+    + tyToStr(fnTy)
+    + "`"
+    + tokAtSuffix(tk)
+    + ", which shadows "
+    + hidden
+    + "; rename it"
+}
+
+// " declared at L:C" for token `tk`, or "" when it has none.
+function tokAtSuffix(tk: i32) {
+  if tk < 0 || tk >= P.toks.length { return "" }
+  " declared at "
+    + i32ToStr(P.toks[tk].line)
+    + ":"
+    + i32ToStr(P.toks[tk].col + 1)
+}
+
+// The row of getter declaration `fn` in the registry, or -1.
+export function getRowOf(fn: string): i32 {
+  let i = 0
+  while i < getFns.length {
+    if getFns[i] == fn { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether `ty` already answers `.prop` without a getter: a field of a struct, or a built-in
+// size member. Such a member always wins (§D3a rule 2), so a getter of that name is refused
+// at its declaration and never consulted at a read.
+export function memberHasBuiltin(ty: i32, prop: string): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyObj { return objFieldType(t, prop) >= 0 }
+  if t is TyArray { return prop == "length" }
+  if t is TyMap { return prop == "length" }
+  if t is TyPrim { return t.primName == "string" && prop == "length" }
+  // No member of any other kind is built in: an error, a function, a union, a nullable, a
+  // type variable, a literal and a negation have no `.prop` a getter could be confused with.
+  if t is TyErr { return false }
+  if t is TyFunc { return false }
+  if t is TyUnion { return false }
+  if t is TyNullable { return false }
+  if t is TyVar { return false }
+  if t is TyLit { return false }
+  if t is TyNeg { return false }
+  false
+}
+
+// The getter declaration a read `.prop` of a value typed `objTy` resolves to, or "". Only a
+// nominal receiver has getters, and the registry is keyed by that receiver type, so a getter
+// is never found by name: no import brings one in and no local shadows one (§D3a rule 1).
+export function getterFnFor(objTy: i32, prop: string): string {
+  if getFns.length == 0 { return "" }
+  if objTy < 0 { return "" }
+  const nm = nomNameOfTy(objTy)
+  if nm == "" { return "" }
+  if memberHasBuiltin(objTy, prop) { return "" }
+  let i = 0
+  while i < getFns.length {
+    if getProps[i] == prop {
+      if getSelfTys[i] == objTy || nomNameOfTy(getSelfTys[i]) == nm {
+        return getFns[i]
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether getter row `gi` may be read from member node `ix`: always within its own module,
+// and from another module only when it is declared `export get`.
+export function getterVisibleAt(gi: i32, ix: i32): boolean {
+  const callerMod = ufcsModOfNode(ix)
+  const declMod = ufcsModOfNode(getDecls[gi])
+  if callerMod < 0 || declMod < 0 || callerMod == declMod { return true }
+  getDeclExported(getDecls[gi])
+}
+
+// The bound type of every `let`/`const` checked while the program declares a getter, by node —
+// the body walk's only record of a local's type, which the declaration node does not carry.
+export let getLetNodes: i32[] = []
+export let getLetTys: i32[] = []
+
+export function getLetBank(ix: i32, ty: i32) {
+  if getFns.length == 0 || inferQuiet { return 0 }
+  getLetNodes.push(ix)
+  getLetTys.push(ty)
+  0
+}
+
+export function getLetTyOf(ix: i32): i32 {
+  let i = getLetNodes.length - 1
+  while i >= 0 {
+    if getLetNodes[i] == ix { return getLetTys[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Where a cost stops counting, so a runaway chain saturates instead of overflowing `i32`.
+export const GETTER_STEP_CAP = 1000000000
+
+// Getter row `gi`'s declared result type as a message spells it, or "" when it has none.
+function getterRetStr(gi: i32): string {
+  const fnTy = lookup(getFns[gi])
+  if fnTy < 0 { return "" }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnRet >= 0 && ft.fnRet != TY_VOID { return tyToStr(ft.fnRet) }
+  }
+  ""
+}
+
+// Getter row `gi` spelled as the method it could be instead: `function p(self: T): R`.
+function getterAsMethod(gi: i32): string {
+  let ret = getterRetStr(gi)
+  if ret != "" { ret = ": " + ret }
+  "`function "
+    + getProps[gi]
+    + "(self: "
+    + tyToStr(getSelfTys[gi])
+    + ")"
+    + ret
+    + "`"
+}
+
+// The fix every getter refusal offers: the same declaration as a method, read with `()`.
+export function getterMethodFix(gi: i32): string {
+  "make it a method: "
+    + getterAsMethod(gi)
+    + ", called as `."
+    + getProps[gi]
+    + "()`"
+}
+
+// Why getter `fn` does not answer a bound member of its name, and the two ways out; `method` is
+// whether the bound asks for `p(): R` rather than a field `p: R`.
+export function getterBoundNote(fn: string, method: boolean): string {
+  const gi = getRowOf(fn)
+  if gi < 0 { return "`" + getDeclPropOf(fn) + "` is a getter" }
+  const p = getProps[gi]
+  const recv = tyToStr(getSelfTys[gi])
+  let after = ", and bound on `{ " + p + "(): " + getterRetStr(gi) + " }`"
+  if method { after = ", which satisfies it" }
+  "`"
+    + p
+    + "` on "
+    + recv
+    + " is a getter, and a getter does not satisfy a bound yet — take a `"
+    + recv
+    + "` parameter instead, or declare `"
+    + p
+    + "` as a method, "
+    + getterAsMethod(gi)
+    + after
+}
+
+// Whether a value of type `ty` has a representation that never boxes (F9 (a)): a scalar or a
+// brand of one, a literal union, a reference to an existing struct, list or map, or a null
+// niche (a nullable struct, `string | null`, `boolean | null`). Value unions and nullable
+// scalars box, so they are refused.
+export function getterRepOk(ty: i32): boolean {
+  if ty < 0 { return true }
+  const t = T.tys[nomErasedTyIx(ty)]
+  if t is TyPrim { return true }
+  if t is TyErr { return true }
+  if t is TyLit { return true }
+  if t is TyObj { return true }
+  if t is TyArray { return true }
+  if t is TyMap { return true }
+  if t is TyNullable { return getterNicheOk(t.nInner) }
+  if t is TyUnion { return getterLitUnionOk(t.uMembers) }
+  // A function value is not an existing reference the contract names, a type variable has no
+  // rep until a pin, and a negation is a checker-only type.
+  if t is TyFunc { return false }
+  if t is TyVar { return false }
+  if t is TyNeg { return false }
+  false
+}
+
+// Whether union members `ms` are all integer literals or all string literals, the two literal
+// unions whose rep is a bare `i32` or an interned string.
+function getterLitUnionOk(ms: i32[]): boolean {
+  if ms.length == 0 { return false }
+  let kind = ""
+  let i = 0
+  while i < ms.length {
+    if ms[i] < 0 { return false }
+    const m = T.tys[ms[i]]
+    if m is TyLit {
+      if kind == "" { kind = m.litKind }
+      if kind != m.litKind { return false }
+    } else {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether `nm` names an intrinsic a getter may call: one the emitter lowers inline to
+// instructions whose only possible effect is a trap — a numeric opcode, a linear-memory load, a
+// SIMD value operation, the heap window, `__trap__`. Read off the emitter's own classifiers, so
+// a new member joins here; a result-less intrinsic (every store) is refused for having no value.
+export function getterIntrinsicName(nm: string): boolean {
+  if isNumIntrinsicName(nm) { return true }
+  if truncSatOp(nm) >= 0 { return true }
+  if nm == "__load_i32__" || nameIsMemLoadIntrinsic(nm) { return true }
+  if nameIsSimdIntrinsic(nm) {
+    const ft = lookup(nm)
+    if ft < 0 { return false }
+    const f = T.tys[ft]
+    if f is TyFunc { return f.fnRet != TY_VOID }
+    return false
+  }
+  const arow = atomicRow(nm)
+  if arow >= 0 { return atomicRowSig(arow) == ATOMIC_SIG_LOAD }
+  nm == "__trap__"
+    || nm == "__heap_base__"
+    || nm == "__heap_limit__"
+    || nm == "__memory_shared__"
+}
+
+// Whether `==` operand `ix` is a value the emitter compares as an interned atom: a string
+// literal, a value whose type is one string literal (`tyIsOneStrLit`, known at compile time),
+// or one whose type is a string literal union, which reps as the atom. The getter contract prices a
+// compare of two of these at 0 because the emitter lowers it to one `i32.eq` or a constant.
+export function nodeCmpsByTag(ix: i32): boolean {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  if P.nodes[u] is StrLit { return true }
+  if nodeHasWideStrLit(u) { return true }
+  const ty = nodeTyIxOf(u)
+  if ty < 0 { return false }
+  const e = nomErasedTyIx(ty)
+  tyIsOneStrLit(e) || tyIsLitUnion(e)
+}
+
+// Whether node `ix` holds a value an `is "lit"` test compares with `__str_eq__`: a `string`, a
+// string literal type, an undeclared string-literal union, or `string | null`.
+export function nodeTyComparesAsString(ix: i32): boolean {
+  gwErasedIs(nodeTyIxOf(ix)) == "string" || nodeTyIsNulString(ix)
+}
+
+// The length of the literal a `==`/`!=` compares a plain string against, or -1 when `n` is not
+// that compare. `__str_eq__` answers unequal lengths at once and otherwise walks at most the
+// literal's length, so this compare is bounded by it and costs that many steps (D2062).
+export function gwStrLitEqLen(n: BinExpr): i32 {
+  if n.binOp != "==" && n.binOp != "!=" { return -1 }
+  if nodeCmpsByTag(n.binLeft) && nodeCmpsByTag(n.binRight) { return 0 }
+  if gwErasedIs(nodeTyIxOf(n.binLeft)) == "string" {
+    const r = gwStrLitLenOf(n.binRight)
+    if r >= 0 { return r }
+  }
+  if gwErasedIs(nodeTyIxOf(n.binRight)) == "string" {
+    return gwStrLitLenOf(n.binLeft)
+  }
+  -1
+}
+
+// The length of the string literal expression `ix` spells, or -1: a quoted literal, or a value
+// whose type is one string literal.
+export function gwStrLitLenOf(ix: i32): i32 {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const n = P.nodes[u]
+  if n is StrLit {
+    const raw = n.strText
+    if raw.length < 2 { return -1 }
+    return gwLitLen(raw.slice(1, raw.length - 1))
+  }
+  if nodeHasWideStrLit(u) { return gwLitLen(nodeWideStrLitText(u)) }
+  gwStrLitTyLen(nodeTyIxOf(u))
+}
+
+// The length of string literal type `ty`, or -1 when it is not one: a literal, or an alias whose
+// only member is one.
+export function gwStrLitTyLen(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const e = nomErasedTyIx(ty)
+  const texts = tyLitMemberTexts(e)
+  if texts.length != 1 { return -1 }
+  const t = T.tys[e]
+  if t is TyUnion {
+    if t.uMembers.length != 1 { return -1 }
+  }
+  gwLitLen(texts[0])
+}
+
+// At least the number of code points string literal text `raw` (quotes stripped, escapes
+// unresolved) denotes: a backslash and the character after it count one, every other character
+// one. A hex escape's digits each count, which can only overstate a cost, never understate it.
+function gwLitLen(raw: string): i32 {
+  let n = 0
+  let i = 0
+  while i < raw.length {
+    if raw[i] == '\\' && i + 1 < raw.length { i = i + 2 } else { i = i + 1 }
+    n = n + 1
+  }
+  n
+}
+
+// What type `ty` erases to, for the operator rules: "string" (also a string literal type, or an
+// undeclared string-literal union, both stored as a string), "list", "map", "struct", "lit" (an
+// integer literal, or a declared literal union, whose atom compares by tag), "null", "other" (a
+// scalar, a function or an unresolved type) or "union" (a value union or a nullable of one).
+export function gwErasedIs(ty: i32): string {
+  if ty < 0 { return "other" }
+  const e = nomErasedTyIx(ty)
+  const t = T.tys[e]
+  if t is TyPrim {
+    if t.primName == "string" { return "string" }
+    if t.primName == "null" { return "null" }
+    return "other"
+  }
+  if t is TyArray { return "list" }
+  if t is TyMap { return "map" }
+  if t is TyObj { return "struct" }
+  if t is TyLit {
+    if t.litKind == "str" { return "string" }
+    return "lit"
+  }
+  if t is TyUnion {
+    if !getterLitUnionOk(t.uMembers) { return "union" }
+    if tyIsLitUnion(e) || gwErasedIs(t.uMembers[0]) == "lit" { return "lit" }
+    return "string"
+  }
+  if t is TyNullable {
+    const inner = gwErasedIs(t.nInner)
+    if inner == "other" || inner == "lit" { return inner }
+    return "union"
+  }
+  if t is TyErr { return "other" }
+  if t is TyFunc { return "other" }
+  if t is TyVar { return esTyVarErased(e) }
+  if t is TyNeg { return "other" }
+  "other"
+}
+
+// The operand of a comparison whose lowering loops (a string, list, map or struct compare), or
+// -1. A literal-typed operand compares by tag, a string literal against one does too, and a
+// compare against `null` tests the reference alone.
+export function gwLoopCmpOperand(l: i32, r: i32): i32 {
+  const lk = gwErasedIs(nodeTyIxOf(l))
+  const rk = gwErasedIs(nodeTyIxOf(r))
+  if lk == "null" || rk == "null" { return -1 }
+  if lk == "lit" || rk == "lit" {
+    if lk == "lit" && gwTagOperand(r) { return -1 }
+    if rk == "lit" && gwTagOperand(l) { return -1 }
+  }
+  if lk != "other" && lk != "lit" { return l }
+  if rk != "other" && rk != "lit" { return r }
+  -1
+}
+
+// Whether operand `ix` joins a tag comparison: a literal-typed value or a bare literal.
+function gwTagOperand(ix: i32): boolean {
+  if gwErasedIs(nodeTyIxOf(ix)) == "lit" { return true }
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = P.nodes[u]
+  if n is StrLit { return true }
+  n is NumLit
+}
+
+// `a + b` in steps: saturating at `GETTER_STEP_CAP`, and `ES_UNBOUNDED` when either is.
+export function gcAdd(a: i32, b: i32): i32 {
+  if a >= ES_UNBOUNDED || b >= ES_UNBOUNDED { return ES_UNBOUNDED }
+  if a >= GETTER_STEP_CAP - b { return GETTER_STEP_CAP }
+  a + b
+}
+
+// Pops the strongly connected component rooted at `r`; when it is a cycle, every member takes
+// every member's facts and loses its bound.
+export function esCloseCycle(r: i32) {
+  const members: i32[] = []
+  let done = false
+  while !done && esStack.length > 0 {
+    const m = esStack[esStack.length - 1]
+    esStack.pop()
+    esOnStack[m] = false
+    members.push(m)
+    if m == r { done = true }
+  }
+  if members.length < 2 { return 0 }
+  let i = 0
+  while i < members.length {
+    let j = 0
+    while j < members.length {
+      if i != j { esTakeFacts(members[i], members[j]) }
+      j = j + 1
+    }
+    esUnbound(members[i], "it recurses through " + esQuoted(r), -1)
+    i = i + 1
+  }
+  0
+}
+
+// Row `s` takes each fact row `c` has and `s` lacks, recording `c` as where it came from.
+function esTakeFacts(s: i32, c: i32) {
+  if esWrite[s] == "" && esWrite[c] != "" {
+    esWrite[s] = esWrite[c]
+    if esWriteLocal[c] { esWrite[s] = "memory reachable from its arguments" }
+    esWriteVia[s] = c
+  }
+  if esReadLet[s] == "" && esReadLet[c] != "" {
+    esReadLet[s] = esReadLet[c]
+    esReadLetVia[s] = c
+  }
+  if esAlloc[s] == "" && esAlloc[c] != "" {
+    esAlloc[s] = esAlloc[c]
+    esAllocVia[s] = c
+  }
+  if esHost[s] == "" && esHost[c] != "" {
+    esHost[s] = esHost[c]
+    esHostVia[s] = c
+  }
+  if esUnknown[s] == "" && esUnknown[c] != "" {
+    esUnknown[s] = esUnknown[c]
+    esUnknownVia[s] = c
+  }
+  0
+}
+
+// Marks row `s` unbounded for reason `why` (reached through callee row `via`, or -1), keeping
+// the first reason; answers `ES_UNBOUNDED` so a node can return it.
+export function esUnbound(s: i32, why: string, via: i32): i32 {
+  if esWhy[s] == "" {
+    esWhy[s] = why
+    esWhyVia[s] = via
+  }
+  esCost[s] = ES_UNBOUNDED
+  ES_UNBOUNDED
+}
+
+function esSetWrite(s: i32, what: string) {
+  if esWrite[s] == "" { esWrite[s] = what }
+  0
+}
+
+// Records a write into a place only the row's own body can name.
+function esSetLocalWrite(s: i32, what: string) {
+  if esWrite[s] == "" {
+    esWrite[s] = what
+    esWriteLocal[s] = true
+  }
+  0
+}
+
+export function esSetAlloc(s: i32, what: string, at: i32) {
+  if esAlloc[s] == "" { esAlloc[s] = what + esAtLine(at) }
+  0
+}
+
+function esSetHost(s: i32, what: string) {
+  if esHost[s] == "" { esHost[s] = what }
+  0
+}
+
+export function esSetUnknown(s: i32, what: string, at: i32) {
+  if esUnknown[s] == "" { esUnknown[s] = what + esAtLine(at) }
+  0
+}
+
+// " at line N" for node `at` in the entry module; "" elsewhere, where a line number would read
+// as the entry's own.
+export function esAtLine(at: i32): string {
+  if ufcsModOfNode(at) > 0 { return "" }
+  const ln = nodeLineOf(at)
+  if ln <= 0 { return "" }
+  " at line " + i32ToStr(ln)
+}
+
+// The kind of the innermost binding of `name` in the row being walked (see `esScopeNames`), or
+// -1 when the row binds no such name where the walk is.
+export function esLocalKind(name: string): i32 {
+  let k = esScopeNames.length - 1
+  while k >= esScopeBase {
+    if esScopeNames[k] == name { return esScopeKind[k] }
+    k = k - 1
+  }
+  -1
+}
+
+// The type row `r` binds type parameter `ty` to, or -1 when it binds none.
+function esBoundTy(r: i32, ty: i32): i32 {
+  if r < 0 || ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyVar {
+    let k = esBindStart[r]
+    while k < esBindStart[r] + esBindCount[r] {
+      if esBindNames[k] == t.tvName { return esBindTys[k] }
+      k = k + 1
+    }
+  }
+  -1
+}
+
+// Type `ty` as row `r` sees it: a type parameter the row binds is its binding.
+export function esShownTy(r: i32, ty: i32): i32 {
+  const b = esBoundTy(r, ty)
+  if b >= 0 { return b }
+  ty
+}
+
+// What type parameter `ty` erases to inside the summary walk: its binding's erasure, "tyvar"
+// when the walked row binds it to nothing concrete, and "other" outside a walk.
+function esTyVarErased(ty: i32): string {
+  if esFrame < 0 { return "other" }
+  const b = esBoundTy(esFrame, ty)
+  if b < 0 { return "tyvar" }
+  const bt = T.tys[b]
+  if bt is TyVar { return "tyvar" }
+  gwErasedIs(b)
+}
+
+// A name read costs nothing, but naming a declared function as a value builds a closure, and a
+// read of a module `let` or an `extern let` is the read fact. The walk never visits a callee
+// name, so every name it reaches is in value position.
+export function gcIdent(r: i32, n: Ident, ix: i32): i32 {
+  const nm = n.identName
+  if esLocalKind(nm) >= 0 { return 0 }
+  if fnDeclIx.has(nm) {
+    esSetAlloc(r, "a function value", ix)
+    return 0
+  }
+  if esReadLet[r] != "" { return 0 }
+  if esIsExternLet(nm) {
+    esReadLet[r] = "the extern `" + nm + "`"
+  } else if (moduleGlobals[nm] ?? false) && !isConstName(nm) {
+    esReadLet[r] = "the module `let` `" + nm + "`"
+  }
+  0
+}
+
+// Whether `nm` names an `extern let` binding: a mutable global the host provides.
+function esIsExternLet(nm: string): boolean {
+  const link = externGlobalLinkOfName(nm)
+  if link < 0 || link >= extGMut.length { return false }
+  extGMut[link] == 1
+}
+
+// Charges row `r` one call of row `to`: 1 plus `to`'s cost, and `to`'s facts. A callee still
+// open on the walk is recursion.
+export function gcCharge(r: i32, to: i32): i32 {
+  if esOnStack[to] {
+    if esLow[r] > esLow[to] { esLow[r] = esLow[to] }
+    gcTrail.push(to)
+    esTakeFacts(r, to)
+    return esUnbound(r, "it recurses through " + esQuoted(to), -1)
+  }
+  esTakeFacts(r, to)
+  gcTrail.push(to)
+  if esCost[to] >= ES_UNBOUNDED {
+    if keyHasPrefix(esWhy[to], "it recurses") {
+      return esUnbound(r, "it calls " + esQuoted(to) + ", which recurses", -1)
+    }
+    return esUnbound(r, esWhy[to], to)
+  }
+  gcAdd(1, esCost[to])
+}
+
+// Operator `op` over a type parameter the row binds to nothing: any lowering, a user operator
+// included, may run, so it is unbounded, may allocate and is of unknown effect.
+export function esOpenOperator(r: i32, op: string, ix: i32): i32 {
+  const what = "`" + op + "` over an unbound type parameter"
+  esSetAlloc(r, what, ix)
+  esSetUnknown(r, what, ix)
+  esUnbound(r, "it applies " + what + esAtLine(ix), -1)
+}
+
+// Records the write an assignment to place `lhs` makes: none to a local name or into a fresh
+// local's literal, else the module binding, the captured name or the heap place it reaches.
+export function esAssignWrite(r: i32, lhs: i32) {
+  const u = cwPeel(lhs)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const t = P.nodes[u]
+  if t is Ident {
+    if esLocalKind(t.identName) >= 0 { return 0 }
+    if esIsExternLet(t.identName) {
+      return esSetWrite(r, "the extern `" + t.identName + "`")
+    }
+    if moduleGlobals[t.identName] ?? false {
+      return esSetWrite(r, "the module `let` `" + t.identName + "`")
+    }
+    return esSetWrite(r, "the captured `" + t.identName + "`")
+  }
+  esPlaceWrite(r, u, "")
+}
+
+// Records a write into the heap place at `ix`, `how` naming the method that writes it or "",
+// unless the place is rooted at a fresh local (§C2). The place is spelled with the narrowing
+// key vocabulary `fnWriteEffects` uses; a place with no key is a heap place.
+function esPlaceWrite(r: i32, ix: i32, how: string) {
+  let key = placeKeyOf(ix)
+  if key == "" {
+    key = indexRootKeyOf(ix)
+    if key != "" { key = key + "[…]" }
+  }
+  const rootKind = esLocalKind(narrowKeyRoot(key))
+  if key != "" && rootKind == 2 { return 0 }
+  let what = "a heap place"
+  if key != "" { what = "`" + key + "`" }
+  if how != "" { what = what + " (`." + how + "()`)" }
+  if key != "" && rootKind >= 0 { return esSetLocalWrite(r, what) }
+  esSetWrite(r, what)
+}
+
+// The name narrowing key `key` is rooted at: `p` for `p.x.y` or `p[0]`, a name itself.
+export function narrowKeyRoot(key: string): string {
+  let i = 0
+  while i < key.length {
+    if key[i] == '.' || key[i] == '[' { return key.slice(0, i) }
+    i = i + 1
+  }
+  key
+}
+
+// Binds every type parameter in parameter type `p` to the matching part of argument type `a`,
+// resolving `a`'s own type parameters through row `r`; first binding wins.
+export function esBindWalk(
+  r: i32,
+  p: i32,
+  a: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  if p < 0 || a < 0 || depth > 8 { return 0 }
+  let at = a
+  const b = esBoundTy(r, a)
+  if b >= 0 { at = b }
+  const pt = T.tys[p]
+  if pt is TyVar {
+    let k = 0
+    while k < names.length {
+      if names[k] == pt.tvName { return 0 }
+      k = k + 1
+    }
+    names.push(pt.tvName)
+    tys.push(at)
+    return 0
+  }
+  if pt is TyArray {
+    esBindArray(r, pt.aElem, at, names, tys, depth + 1)
+  } else if pt is TyNullable {
+    esBindNullable(r, pt.nInner, at, names, tys, depth + 1)
+  } else if pt is TyMap {
+    esBindMap(r, pt, at, names, tys, depth + 1)
+  } else if pt is TyObj {
+    esBindObj(r, pt, at, names, tys, depth + 1)
+  } else if pt is TyFunc {
+    esBindFunc(r, pt, at, names, tys, depth + 1)
+  } else if (
+    pt is TyUnion
+    || pt is TyPrim
+    || pt is TyLit
+    || pt is TyErr
+    || pt is TyNeg
+  ) {
+    // A union's members bind by position nowhere else either, and the rest hold no parameter.
+    return 0
+  }
+  0
+}
+
+// `esBindWalk`'s arms, one argument kind each: the argument must be the parameter's kind for
+// its parts to bind, except that a nullable parameter binds a non-nullable argument whole.
+function esBindArray(
+  r: i32,
+  pElem: i32,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyArray { esBindWalk(r, pElem, x.aElem, names, tys, depth) }
+  0
+}
+
+function esBindNullable(
+  r: i32,
+  pInner: i32,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyNullable {
+    return esBindWalk(r, pInner, x.nInner, names, tys, depth)
+  }
+  esBindWalk(r, pInner, at, names, tys, depth)
+}
+
+function esBindMap(
+  r: i32,
+  pt: TyMap,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyMap {
+    esBindWalk(r, pt.mKey, x.mKey, names, tys, depth)
+    esBindWalk(r, pt.mVal, x.mVal, names, tys, depth)
+  }
+  0
+}
+
+function esBindObj(
+  r: i32,
+  pt: TyObj,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyObj {
+    let i = 0
+    while i < pt.objFieldNames.length {
+      const f = objFieldType(x, pt.objFieldNames[i])
+      esBindWalk(r, pt.objFieldTypes[i], f, names, tys, depth)
+      i = i + 1
+    }
+  }
+  0
+}
+
+function esBindFunc(
+  r: i32,
+  pt: TyFunc,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyFunc {
+    let i = 0
+    while i < pt.fnParamTypes.length && i < x.fnParamTypes.length {
+      esBindWalk(r, pt.fnParamTypes[i], x.fnParamTypes[i], names, tys, depth)
+      i = i + 1
+    }
+    esBindWalk(r, pt.fnRet, x.fnRet, names, tys, depth)
+  }
+  0
+}
+
+// A call of a built-in named `nm`: a host call is I/O, a store writes linear memory, and each
+// allocating or looping builtin says so; an unclassified name is of unknown effect.
+export function gcBuiltinCall(r: i32, nm: string, ix: i32): i32 {
+  if (
+    nm == "print"
+    || nm == "__log__"
+    || nameIsFsIntrinsic(nm)
+    || externLinkOf(nm) >= 0
+  ) {
+    esSetHost(r, "`" + nm + "`")
+    return esUnbound(r, "it calls the host function `" + nm + "`", -1)
+  }
+  if getterIntrinsicName(nm) { return 0 }
+  if (
+    nm == "__store_i32__"
+    || nm == "__store_v128__"
+    || nameIsMemStoreIntrinsic(nm)
+  ) {
+    esSetWrite(r, "linear memory")
+    return 0
+  }
+  if nm == "__memory_grow__" {
+    esSetWrite(r, "linear memory")
+    return 0
+  }
+  if nm == "__memory_size__" { return 0 }
+  const arow = atomicRow(nm)
+  if arow >= 0 {
+    const asig = atomicRowSig(arow)
+    if asig == ATOMIC_SIG_LOAD { return 0 }
+    esSetWrite(r, "linear memory")
+    // A wait blocks the thread; bounded by its timeout, not by the program.
+    if asig == ATOMIC_SIG_WAIT {
+      return esUnbound(r, "it waits on an address with `" + nm + "`", -1)
+    }
+    return 0
+  }
+  if nameIsMemBulkIntrinsic(nm) {
+    esSetWrite(r, "linear memory")
+    return esUnbound(r, "it copies or fills a byte range with `" + nm + "`", -1)
+  }
+  if nm == "Map" || nm == "Set" {
+    esSetAlloc(r, "a `" + nm + "()`", ix)
+    return 0
+  }
+  if nm == "fromCodePoint" {
+    esSetAlloc(r, "a string from `fromCodePoint`", ix)
+    return 0
+  }
+  if (
+    nm == "fromCodePoints"
+    || nm == "__str_from_bytes__"
+    || nm == "__array_new__"
+    || nm == "__array_new_default__"
+  ) {
+    esSetAlloc(r, "`" + nm + "`", ix)
+    return esUnbound(r, "it fills a new array with `" + nm + "`", -1)
+  }
+  if nm == "__array_copy__" {
+    esSetWrite(r, "a list, with `__array_copy__`")
+    return esUnbound(r, "it copies a list range with `__array_copy__`", -1)
+  }
+  esSetUnknown(r, "the built-in `" + nm + "`", ix)
+  esUnbound(r, "it calls the built-in `" + nm + "`", -1)
+}
+
+// A call of a built-in method on a string, list or map: every one walks its operand, the
+// mutating ones write the receiver, and the building ones allocate.
+export function gcBuiltinMethod(r: i32, cf: Member, ix: i32): i32 {
+  const m = cf.memProp
+  if esMethodMutates(m) { esPlaceWrite(r, cf.memObj, m) }
+  if esMethodBuilds(m) { esSetAlloc(r, "`." + m + "()`", ix) }
+  esUnbound(r, "it calls the built-in `." + m + "()`" + esAtLine(ix), -1)
+}
+
+function esMethodMutates(m: string): boolean {
+  builtinMethodEffect(m) != BME_NONE
+}
+
+function esMethodBuilds(m: string): boolean {
+  m == "push"
+    || m == "set"
+    || m == "add"
+    || m == "map"
+    || m == "filter"
+    || m == "slice"
+    || m == "bytes"
+    || m == "keys"
+    || m == "values"
+    || m == "toString"
+    || m == "toUpperAscii"
+    || m == "toLowerAscii"
+    || m == "concat"
+    || m == "join"
+    || m == "split"
+}
+
+// Records row `r`'s heaviest contributor from its trail, the entries past `mark`: the callee
+// whose calls cost the most in total, and the string-literal compares.
+export function gcSummarise(r: i32, mark: i32) {
+  const counts: {[i32]: i32} = Map()
+  const order: i32[] = []
+  let cmpSteps = 0
+  let cmpCount = 0
+  let i = mark
+  while i < gcTrail.length {
+    const e = gcTrail[i]
+    if e < 0 {
+      cmpSteps = gcAdd(cmpSteps, 0 - e)
+      cmpCount = cmpCount + 1
+    } else {
+      const seen = counts[e] ?? 0
+      if seen == 0 { order.push(e) }
+      counts[e] = seen + 1
+    }
+    i = i + 1
+  }
+  let best = -1
+  let bestCount = 0
+  let bestSteps = -1
+  let k = 0
+  while k < order.length {
+    const e = order[k]
+    const count = counts[e] ?? 0
+    let steps = 0
+    let m = 0
+    while m < count && steps < GETTER_STEP_CAP {
+      steps = gcAdd(steps, gcAdd(1, gcCostSoFar(e)))
+      m = m + 1
+    }
+    if steps > bestSteps {
+      best = e
+      bestCount = count
+      bestSteps = steps
+    }
+    k = k + 1
+  }
+  gcTopRow[r] = best
+  gcTopCount[r] = bestCount
+  gcTopSteps[r] = bestSteps
+  gcCmpSteps[r] = cmpSteps
+  gcCmpCount[r] = cmpCount
+  0
+}
+
+// Row `r`'s cost, reading a row not yet costed, or no row, as 0.
+export function gcCostSoFar(r: i32): i32 {
+  if r < 0 || r >= esCost.length || esCost[r] < 0 { return 0 }
+  esCost[r]
+}
+
+// How a path names row `r`: a getter by its property, a user operator as `operator "+" for P`,
+// a function by its name and `()`.
+function esLabel(r: i32): string {
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    if getDeclPropOf(d.fnName) != "" { return gcName(esDecl[r]) }
+    if opDeclOpOf(d.fnName) != "" { return "operator " + opDeclLabel(d.fnName) }
+    return d.fnName + "()"
+  }
+  "?"
+}
+
+// Row `r` named inside a sentence: `esLabel` in backticks, except an operator, whose label
+// already quotes its symbol.
+function esQuoted(r: i32): string {
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    if opDeclOpOf(d.fnName) != "" { return esLabel(r) }
+  }
+  "`" + esLabel(r) + "`"
+}
+
+// The path a refusal names for row `r`: each row's heaviest callee and how many times it is
+// called, ending at the string-literal compares that cost the most, if any.
+export function gcPath(r: i32): string {
+  let s = esLabel(r)
+  let cur = r
+  let hops = 0
+  while cur >= 0 && hops < 12 {
+    const top = gcTopRow[cur]
+    if gcCmpCount[cur] > 0 && (top < 0 || gcCmpSteps[cur] >= gcTopSteps[cur]) {
+      return s + " → " + gcCmpPhrase(cur)
+    }
+    if top < 0 { return s }
+    s = s + " → " + esLabel(top)
+    if gcTopCount[cur] > 1 { s = s + " (" + i32ToStr(gcTopCount[cur]) + "×)" }
+    // A cycle is refused on its own; stop at its first repeat.
+    if top == r { return s }
+    cur = top
+    hops = hops + 1
+  }
+  if cur >= 0 { s = s + " → …" }
+  s
+}
+
+// A getter declared at node `decl` as a path names it: its property, qualified by its receiver
+// (`B.v`) when another getter shares the property name.
+function gcName(decl: i32): string {
+  let gi = 0
+  while gi < getDecls.length && getDecls[gi] != decl { gi = gi + 1 }
+  if gi >= getDecls.length { return "?" }
+  let i = 0
+  while i < getProps.length {
+    if i != gi && getProps[i] == getProps[gi] {
+      return tyToStr(getSelfTys[gi]) + "." + getProps[gi]
+    }
+    i = i + 1
+  }
+  getProps[gi]
+}
+
+function gcCmpPhrase(r: i32): string {
+  const steps = i32ToStr(gcCmpSteps[r])
+  if gcCmpCount[r] == 1 {
+    return "a compare with a " + steps + "-character string literal"
+  }
+  i32ToStr(gcCmpCount[r])
+    + " string-literal compares totalling "
+    + steps
+    + " characters"
+}
+
+// The chain of rows a fact of row `c` came through, `via` being that fact's column, as
+// " (c → d → e)", or "" when `c`'s own body has it.
+export function esFactPath(c: i32, via: i32[]): string {
+  if via[c] < 0 { return "" }
+  let s = esLabel(c)
+  let cur = via[c]
+  let hops = 0
+  while cur >= 0 && hops < 12 {
+    s = s + " → " + esLabel(cur)
+    cur = via[cur]
+    hops = hops + 1
+  }
+  " (" + s + ")"
+}
+
+// Row `r` as one line a person reads: what it writes, the module state it reads, whether it
+// allocates, its cost in steps and its host calls, each naming the first instance and its path.
+// When an operator over an unbound type parameter is every field's cause, it is stated once.
+export function esText(r: i32): string {
+  const opAlloc = esAllocIsOperator(r)
+  const shared = esSharedWhy(r)
+  let uf = "unknown (" + esUnknown[r] + esVia(r, esUnknownVia) + ")"
+  if shared != "" { uf = "unknown" }
+  let w = "none"
+  if esWrite[r] != "" { w = esWrite[r] + esVia(r, esWriteVia) }
+  let a = "no"
+  if esAlloc[r] != "" { a = "yes (" + esAlloc[r] + esVia(r, esAllocVia) + ")" }
+  let io = "none"
+  if esHost[r] != "" { io = esHost[r] + esVia(r, esHostVia) }
+  let rd = "none"
+  if esReadLet[r] != "" { rd = esReadLet[r] + esVia(r, esReadLetVia) }
+  if esUnknown[r] != "" {
+    if esWrite[r] == "" { w = uf }
+    if esAlloc[r] == "" || opAlloc { a = uf }
+    if esHost[r] == "" { io = uf }
+    if esReadLet[r] == "" { rd = uf }
+  }
+  let cost = "1 step"
+  if esCost[r] != 1 { cost = i32ToStr(esCost[r]) + " steps" }
+  if esCost[r] >= GETTER_STEP_CAP {
+    cost = "over " + i32ToStr(GETTER_STEP_CAP) + " steps"
+  }
+  if esCost[r] >= ES_UNBOUNDED {
+    cost = "unbounded (" + esWhy[r] + esVia(r, esWhyVia) + ")"
+    if shared != "" { cost = "unbounded" }
+  }
+  let tail = ""
+  if shared != "" { tail = ", because " + shared }
+  "writes: "
+    + w
+    + " · reads: "
+    + rd
+    + " · allocates: "
+    + a
+    + " · cost: "
+    + cost
+    + " · I/O: "
+    + io
+    + tail
+}
+
+// Whether row `r`'s allocation is the one an operator over an unbound type parameter may make:
+// that site records the same text, through the same callee, as the row's unknown call.
+function esAllocIsOperator(r: i32): boolean {
+  esUnknown[r] != ""
+    && esAlloc[r] == esUnknown[r]
+    && esAllocVia[r] == esUnknownVia[r]
+}
+
+// The one cause behind every field of row `r` ("it applies `+` over …"), when an operator over
+// an unbound type parameter is it and no field has a cause of its own; "" otherwise.
+function esSharedWhy(r: i32): string {
+  if !esAllocIsOperator(r) { return "" }
+  if esWrite[r] != "" || esReadLet[r] != "" || esHost[r] != "" { return "" }
+  if (
+    esWhy[r] != "it applies " + esUnknown[r]
+    || esWhyVia[r] != esUnknownVia[r]
+  ) {
+    return ""
+  }
+  esWhy[r] + esVia(r, esWhyVia)
+}
+
+// ", via `f()`" (or ", via operator "+" for P") naming the callee a fact of row `r` came
+// through, or "".
+function esVia(r: i32, via: i32[]): string {
+  if via[r] < 0 { return "" }
+  ", via " + esQuoted(via[r])
+}
+
+// What a getter row's name would collide with as a method, or "": a built-in method of its
+// receiver's representation, or a `self`-function of the same module over the same type.
+export function getterMethodClash(gi: i32): string {
+  const prop = getProps[gi]
+  const selfTy = getSelfTys[gi]
+  const names = builtinMethodNamesOf(selfTy)
+  let i = 0
+  while i < names.length {
+    if names[i] == prop {
+      return "the built-in method `" + prop + "` of `" + tyToStr(selfTy) + "`"
+    }
+    i = i + 1
+  }
+  const own = modIxOfMangled(getFns[gi])
+  for name in fnDeclIx.keys() {
+    if getDeclPropOf(name) == "" && demangleName(name) == prop {
+      if declFirstParamIsSelf(name) && modIxOfMangled(name) == own {
+        const fnTy = lookup(name)
+        if fnTy >= 0 {
+          const ft = T.tys[fnTy]
+          if ft is TyFunc {
+            if ft.fnParamTypes.length > 0 {
+              if ft.fnParamTypes[0] == selfTy {
+                return "the method `"
+                  + prop
+                  + "(self: "
+                  + tyToStr(selfTy)
+                  + ")`"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
+// The declaration of the getter registered as `fn`, or -1 when none is.
+function getterDeclOf(fn: string) {
+  let i = 0
+  while i < getFns.length {
+    if getFns[i] == fn { return getDecls[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Replaces every banked getter read `v.p` by the call `T.p(v)`, so the emitter sees an
+// ordinary call and keeps its rule that a member read is a load. The call keeps the member's
+// node index, type and source anchor.
+export function getterRewriteSites() {
+  // The sites are rewritten in place, which the parse bank cannot undo by popping rows, so a
+  // later consumer of the banked tree (lint) re-parses instead of reading a half-rewritten one.
+  if getSiteNodes.length > 0 { arenaEpochBump() }
+  let i = 0
+  while i < getSiteNodes.length {
+    const site = getSiteNodes[i]
+    const m = P.nodes[site]
+    if m is Member {
+      const callee = mkIdent(getSiteFns[i], m.pos)
+      identSet(callee, getterDeclOf(getSiteFns[i]))
+      adoptNodeTok(callee, site)
+      while nodeTyIx.length <= callee { nodeTyIx.push(-1) }
+      nodeTySet(callee, lookup(getSiteFns[i]))
+      const args: i32[] = []
+      args.push(m.memObj)
+      const names: string[] = []
+      const c: Node = {
+        callFn: callee,
+        callArgs: args,
+        callArgNames: names,
+        pos: m.pos,
+      }
+      P.nodes[site] = c
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function getterEffectsReset() {
+  getFns = []
+  getProps = []
+  getDecls = []
+  getSelfTys = []
+  getLetNodes = []
+  getLetTys = []
+  moduleGlobals = Map()
+}

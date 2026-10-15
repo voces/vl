@@ -1,0 +1,335 @@
+// Hidden aliases for inline literal unions, the variant-member registration of inline
+// and inferred unions, and the recorded join types the emitter reads back.
+// Does not import the checker.
+import {
+  BinExpr,
+  IfStmt,
+  P,
+  Program,
+  UnionDecl,
+  i32ToStr,
+  mkUnionDecl,
+} from "./ast"
+import { litUnionArmValueUnionRetName } from "./check_ret_names"
+import { canonUnionKeyAtomOfTy } from "./check_ty_rep"
+import { nonNulTyOf } from "./check_ty_shape"
+import {
+  T,
+  TyLit,
+  TyNullable,
+  TyUnion,
+  addTy,
+  cStructNames,
+  cStructTyIxSet,
+  cStructTyIxs,
+  cTyIxSetHas,
+  cUnionNames,
+  cUnionTyIxSet,
+  cUnionTyIxs,
+  cUserTypes,
+  cUserTypesVer,
+  cVariantMemberTyIxSet,
+  cVariantMemberTyIxs,
+  inlineLitUnionPrefix,
+  mixedLitRunAliasOf,
+  nwBaseTyIxs,
+  nwDeclNames,
+  nwNames,
+  nwTyIxs,
+  structNameOfTy,
+  tyHasHole,
+  tyIsLitUnion,
+  tyIsMapJoinUnion,
+  tyIsStructBearingUnion,
+  tyLitMemberTexts,
+  unionAliasDeclNameOfTy,
+} from "./check_types"
+
+// The struct-bearing union types an inline join (a `??` or a value `if`) produced, in order and
+// once each: no declaration spells them, so without a row here an arm has no tag in any box.
+export let inferJoinTys: i32[] = []
+export let inferJoinTySet: boolean[] = []
+
+// The annotation route's candidate variant members, held until `annCommitVariantMembers` runs at
+// the end of checking — `annRegisterVariantMembers` records why the decision cannot be made at
+// the moment the annotation resolves.
+export let annPendingVariantTyIxs: i32[] = []
+export let annPendingVariantTyIxSet: boolean[] = []
+
+// `cUserTypes` gets a declaration's placeholder in pass 0a and its shape in pass 0b, so a name
+// resolved between the two answers from an empty arena entry — a wrong type, not a missing
+// diagnostic. These columns make the fill demand-ordered: `cFillStmtIx` maps a name to its
+// declaration statement (last wins), `cFillDoneAt` flags filled arena indices, `cFillActive` gates.
+export let cFillStmtIx: {[string]: i32} = Map()
+
+// Registers an inline union's declared-struct members into `cVariantMemberTyIxs` — the
+// annotation route's half of what the declaration route already fills in pass 0b. Needed
+// because the emitter's `uVariants` is fed by both spellings while the checker's registry
+// is not, so an inline union's struct member disagrees with the emitter about its own kind.
+export function annRegisterVariantMembers(ms: i32[]) {
+  let i = 0
+  while i < ms.length {
+    const m = ms[i]
+    if m >= 0 {
+      if !cTyIxSetHas(annPendingVariantTyIxSet, m) {
+        cTyIxSetAdd(annPendingVariantTyIxs, annPendingVariantTyIxSet, m)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The INFERRED route's half of the registration above: a mixed union the program only ever
+// JOINS is minted in `uVariants` by the emitter and spelled in no annotation, so its struct
+// members reached the arena rung as plain structs while the name ladder read them as arms
+// (D1746). Arity-aware, as the declaration route is: a one-member union is its member.
+export function inferRegisterVariantMembers(ty: i32) {
+  const u = nonNulTyOf(ty)
+  if u < 0 { return 0 }
+  const t = T.tys[u]
+  if t is TyUnion {
+    if t.uMembers.length >= 2 { annRegisterVariantMembers(t.uMembers) }
+  }
+  0
+}
+
+// Commits the annotation route's candidates into `cVariantMemberTyIxs`, once at the end of
+// `checkProgramNode` — the filter needs the whole program, since only a declared struct is
+// at issue (`cStructTyIxs`, the set `collectS` refuses a row to) and a forward-referenced
+// `type` fills its entry only after the annotation naming it resolves.
+export function annCommitVariantMembers() {
+  let i = 0
+  while i < annPendingVariantTyIxs.length {
+    const m = annPendingVariantTyIxs[i]
+    if cTyIxSetHas(cStructTyIxSet, m) {
+      if !cTyIxSetHas(cVariantMemberTyIxSet, m) {
+        cTyIxSetAdd(cVariantMemberTyIxs, cVariantMemberTyIxSet, m)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Registers an inline string-literal union as a hidden alias, so it takes the interned-atom
+// rep at every position exactly as `type K = "a" | "b"` does (D2150). The name starts with `#`,
+// which no identifier can, and `tyToStr` renders it back as its member set.
+export function registerInlineLitUnion(ix: i32) {
+  if luSynthDone { return 0 }
+  luHiddenTyIxs.push(ix)
+  const nm = inlineLitUnionPrefix + i32ToStr(cUnionNames.length)
+  cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, ix)
+  cUnionNames.push(nm)
+  cUserTypes[nm] = ix
+  cUserTypesVer = cUserTypesVer + 1
+  0
+}
+
+// The hidden aliases this program registered, and whether their declarations are written yet:
+// one minted after that (an emit-phase annotation) keeps the string rep, since no declaration
+// would carry it to the emitter's union tables.
+export let luHiddenTyIxs: i32[] = []
+export let luSynthDone = false
+
+// Appends one `UnionDecl` per hidden alias to the program's statements, ahead of canon, so
+// every emitter pass that walks declarations sees `#luN` exactly as it sees a written alias.
+export function synthInlineLitUnionDecls(rootIx: i32) {
+  luSynthDone = true
+  const root = P.nodes[rootIx]
+  if root is Program {
+    let i = 0
+    while i < luHiddenTyIxs.length {
+      const ix = luHiddenTyIxs[i]
+      const texts = tyLitMemberTexts(ix)
+      const vs: string[] = []
+      let k = 0
+      while k < texts.length {
+        vs.push("\"" + texts[k] + "\"")
+        k = k + 1
+      }
+      const nm = unionAliasDeclNameOfTy(ix)
+      if nm != "" {
+        const d = mkUnionDecl(nm, vs, 0, 0)
+        root.progStmts.push(d)
+        cFillStmtIx[nm] = d
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// True if `name` is declared `type N = new …`.
+function isNewtypeName(name: string) {
+  let i = 0
+  while i < nwDeclNames.length {
+    if nwDeclNames[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+export function nwBrand(name: string, base: i32) {
+  if base < 0 { return base }
+  if !isNewtypeName(name) { return base }
+  let i = 0
+  while i < nwTyIxs.length {
+    if nwNames[i] == name && nwBaseTyIxs[i] == base { return nwTyIxs[i] }
+    i = i + 1
+  }
+  const ix = addTy(T.tys[base])
+  nwTyIxs.push(ix)
+  nwNames.push(name)
+  nwBaseTyIxs.push(base)
+  const sdn = structNameOfTy(base)
+  if sdn != "" {
+    cTyIxSetAdd(cStructTyIxs, cStructTyIxSet, ix)
+    cStructNames.push(sdn)
+  }
+  const udn = unionAliasDeclNameOfTy(base)
+  if udn != "" {
+    cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, ix)
+    cUnionNames.push(udn)
+  }
+  ix
+}
+
+// The `|`-joined member spellings of the declared union alias at arena index `ty` when it is a
+// union OF string-litunion aliases (`type SU = SA | SB` → "SA|SB"), as the row records it; ""
+// otherwise. The flatten leaves no non-literal member for `mixedLitRunAliasOf` to anchor on.
+function declLitUnionAliasMembersOfTy(ty: i32): string {
+  const nm = unionAliasDeclNameOfTy(ty)
+  if nm == "" { return "" }
+  const sx = cFillStmtIx[nm] ?? (-1)
+  if sx < 0 { return "" }
+  const s = P.nodes[sx]
+  if s is UnionDecl {
+    const vs = s.udVariants
+    if vs.length < 2 { return "" }
+    let anyAlias = false
+    let out = ""
+    let i = 0
+    while i < vs.length {
+      const m = vs[i]
+      if m.length == 0 { return "" }
+      if m[0] != '"' {
+        const mi = cUserTypes[m] ?? (-1)
+        if !tyIsLitUnion(mi) { return "" }
+        anyAlias = true
+      }
+      if i > 0 { out = out + "|" }
+      out = out + m
+      i = i + 1
+    }
+    if anyAlias { return out }
+  }
+  ""
+}
+
+// The member sequence of an arena type, in the registry's ABI order —
+// `canonUnionKeyText`'s arena-side twin. Not deduped or reordered, exactly as the text side.
+// The null-fold is unwrapped with `null` first, since pass 0b folds `type J = null | A | B`
+// into a one-member `TyUnion` holding a `TyNullable`, one level down from what the row records.
+export function canonUnionKeyTextOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    if ms.length == 0 { return "" }
+    if ms.length == 1 {
+      const mt = T.tys[ms[0]]
+      if mt is TyNullable {
+        let inr = canonUnionKeyTextOfTy(mt.nInner)
+        if inr == "" { inr = canonUnionKeyAtomOfTy(mt.nInner) }
+        if inr != "" { return "null|" + inr }
+      }
+    }
+    // A run of string literals spells as the alias it regroups to, once, at the run's first
+    // member — the render's own preserve, which the per-member atoms below cannot see.
+    const rgAlias = mixedLitRunAliasOf(ms)
+    if rgAlias == "" {
+      const dl = declLitUnionAliasMembersOfTy(ty)
+      if dl != "" { return dl }
+    }
+    let rgDone = false
+    let out = ""
+    let i = 0
+    while i < ms.length {
+      const mt = T.tys[ms[i]]
+      if rgAlias != "" && mt is TyLit {
+        if !rgDone {
+          rgDone = true
+          if out != "" { out = out + "|" }
+          out = out + rgAlias
+        }
+      } else {
+        const a = canonUnionKeyAtomOfTy(ms[i])
+        if a == "" { return "" }
+        if out != "" { out = out + "|" }
+        out = out + a
+      }
+      i = i + 1
+    }
+    return out
+  }
+  if t is TyNullable {
+    // A nullable union contributes its own members before the `null` arm; a nullable scalar
+    // (`i32|null`) is one atom plus it, and reaching only the first leaves the whole
+    // nullable-scalar family of rows unrendered.
+    let inr = canonUnionKeyTextOfTy(t.nInner)
+    if inr == "" { inr = canonUnionKeyAtomOfTy(t.nInner) }
+    if inr == "" { return "" }
+    return inr + "|null"
+  }
+  ""
+}
+
+// Records the type of join node `ix` when it is a struct-bearing union or carries a literal-union
+// arm, and registers its struct members as arms, as the binding route does (D2373). Only a `??`
+// or an `if` joins two types.
+export function noteInferJoin(ix: i32, t: i32) {
+  if t < 0 { return 0 }
+  const n = P.nodes[ix]
+  let isJoin = n is IfStmt
+  if n is BinExpr { isJoin = n.binOp == "??" }
+  if !isJoin { return 0 }
+  if cTyIxSetHas(inferJoinTySet, t) { return 0 }
+  if (
+    !tyIsStructBearingUnion(t)
+    && !tyIsMapJoinUnion(t, n is IfStmt)
+    && litUnionArmValueUnionRetName(t) == ""
+  ) {
+    return 0
+  }
+  if tyHasHole(t) { return 0 }
+  inferRegisterVariantMembers(t)
+  cTyIxSetAdd(inferJoinTys, inferJoinTySet, t)
+}
+export function inferJoinCount() { inferJoinTys.length }
+export function inferJoinTyAt(i: i32) { inferJoinTys[i] }
+
+// Appends `v` to `xs` and marks it present in `xs`'s parallel dense flag array. A negative
+// `v` is appended but not flagged — it is not an arena index, and `cTyIxSetHas` refuses one
+// on the way in, so there is nowhere to record it.
+export function cTyIxSetAdd(xs: i32[], flags: boolean[], v: i32) {
+  xs.push(v)
+  if v >= 0 {
+    // Grown lazily to the largest member index, never to `T.tys.length`: the arena keeps
+    // growing long after the last member is recorded, and an out-of-range read is already right.
+    while flags.length <= v { flags.push(false) }
+    flags[v] = true
+  }
+  0
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function inlineLitUnionReset() {
+  inferJoinTys = []
+  inferJoinTySet = []
+  annPendingVariantTyIxs = []
+  annPendingVariantTyIxSet = []
+  luHiddenTyIxs = []
+  luSynthDone = false
+  cFillStmtIx = Map()
+}

@@ -1,0 +1,277 @@
+// The checker's reading of a literal-union spelling: whether a mixed union keeps its
+// literal run (`litUnionPreserve`), the flatten of a union of literal unions, and the
+// top-level separator and function-type tests over a type name.
+// Does not import the checker.
+import { nameIsLitUnionType } from "./check_ty_rep"
+import {
+  T,
+  TyLit,
+  TyUnion,
+  cUserTypes,
+  litMemberTy,
+  litUnionAliasOfLitTexts,
+  tyIsLitUnion,
+} from "./check_types"
+import {
+  groupInnerOf,
+  nameIsParenOpen,
+  nameIsParenSpanEnds,
+  tyTopIndexOf,
+  tyTopLevelSplit,
+} from "./tyname"
+
+// True if the type name contains the top-level separator `sep` — `|` for an inline-union synthetic
+// name `A|B|null`, `&` for an intersection `A&B`.
+export function nameHasSep(name: string, sep: i32) {
+  tyTopIndexOf(name, sep, 0, 0) >= 0
+}
+
+export function nameHasPipe(name: string) { nameHasSep(name, '|') }
+
+// The index of a top-level `=>` in `name`, or -1 — the function-type marker the parser emits for
+// `(params) => ret`. An arrow nested in a param or return group (`((i32) => i32) => void`) or in a
+// generic argument (`Box<(i32) => i32>`) is not the top one; `'='` is the scanner's arrow token,
+// so the `>` lookahead lives in the home.
+function topLevelArrowIndex(name: string) { tyTopIndexOf(name, '=', 0, 0) }
+
+// The top-level arrow index the last `isTopLevelFuncTypeName` call scanned for, produced by the
+// predicate instead of re-derived by a caller that needs the index as well as the answer.
+// Meaningful only when that call returned true; a false answer can come from any of the three
+// conjuncts and leaves whatever the scan found.
+export let funcArrowAt = -1
+
+// True if `name` is a top-level function type `(params)=>ret` — a top-level `=>` with the leading
+// `(...)` param group closing right before it. The `=>` binds looser than `|`/`&`, so
+// `(i32) => A | B` is a function returning a union, and this guards the union and intersection
+// splits from grabbing a separator that belongs to the return.
+export function isTopLevelFuncTypeName(name: string) {
+  const arrowAt = topLevelArrowIndex(name)
+  funcArrowAt = arrowAt
+  if arrowAt < 1 { return false }
+  // The paren grammar's open half at its home in `tyname.vl`. The close half stays inline and must:
+  // this is the arrow-relative spelling — the param list closes right before the `=>`, so the last
+  // character of the whole name belongs to the return type, and `nameIsParenSpanEnds` would answer
+  // about a different position entirely.
+  if !nameIsParenOpen(name) { return false }
+  if name[arrowAt - 1] != ')' { return false }
+  true
+}
+
+export let lupAtoms = 1
+
+// The mixed-union spelling has no position gate: the emitter holds a third copy of the
+// soften rule (`canonLitUnionArms`) that rewrites a litunion atom to `string` while the
+// union row registers under the canon'd annotation. A position gate here would mint two
+// rows for one type, since the registry is keyed by name and blind to position.
+export function litUnionPreserve(parts: string[]) {
+  const kept: string[] = []
+  let i = 0
+  while i < parts.length {
+    let dup = false
+    let j = 0
+    while j < kept.length {
+      if kept[j] == parts[i] { dup = true }
+      j = j + 1
+    }
+    if !dup { kept.push(parts[i]) }
+    i = i + 1
+  }
+  if kept.length < 2 { return "" }
+  let core = kept[0]
+  let k = 1
+  while k < kept.length {
+    core = core + "|" + kept[k]
+    k = k + 1
+  }
+  if nameIsLitUnionType(core) {
+    // A declared alias with exactly these members wins the spelling — the same preference
+    // `litUnionAliasNameOfTy` gives the structural renderer, since an intern key must be one
+    // name per type. Without it two spellings of one litunion map type mint two shape slots,
+    // invalid wasm whether preserved or softened. Member texts are recovered by dropping each kept member's quotes.
+    const texts: string[] = []
+    let q = 0
+    while q < kept.length {
+      texts.push(groupInnerOf(kept[q]))
+      q = q + 1
+    }
+    const al = litUnionAliasOfLitTexts(texts)
+    if al != "" {
+      // An alias name is one identifier — one atom.
+      lupAtoms = 1
+      return al
+    }
+    // Each kept member is a top-level member of the original split, so none carries a
+    // top-level `|` of its own and the join writes exactly `kept.length - 1` separators.
+    lupAtoms = kept.length
+    return core
+  }
+  // A union of literal unions is a literal union — the preceding leg answers only when
+  // every part is a quoted lexeme, so `K | K2` falls past it into `litUnionFlatten`.
+  litUnionFlatten(parts)
+}
+
+// —— the flatten: a union whose members are all literal unions is a literal union ——
+// `K | K2` spells the litunion union of `K`'s and `K2`'s members, or "" when some part is
+// not literal-derived — mirrors `annUnionInnerTy`'s arena rule on the string side, since
+// canon has no arena to read. A neutral (numeric) part is not enough, or the member would silently drop.
+function litUnionFlatten(parts: string[]) {
+  const texts: string[] = []
+  let i = 0
+  while i < parts.length {
+    const c = litRunPartTexts(parts[i], texts)
+    if c != LRP_LITS { return "" }
+    i = i + 1
+  }
+  const kept: string[] = []
+  let t = 0
+  while t < texts.length {
+    let dup = false
+    let j = 0
+    while j < kept.length {
+      if kept[j] == texts[t] { dup = true }
+      j = j + 1
+    }
+    if !dup { kept.push(texts[t]) }
+    t = t + 1
+  }
+  // Fewer than two distinct members has no inline spelling — `nameIsInlineLitUnion`
+  // requires 2+ quoted atoms. The identical guard sits in `litUnionPreserve` and its arena twin.
+  if kept.length < 2 { return "" }
+  const al = litUnionAliasOfLitTexts(kept)
+  if al != "" {
+    // An alias name is one identifier — one atom.
+    lupAtoms = 1
+    return al
+  }
+  let out = "\"" + kept[0] + "\""
+  let k = 1
+  while k < kept.length {
+    out = out + "|\"" + kept[k] + "\""
+    k = k + 1
+  }
+  lupAtoms = kept.length
+  out
+}
+
+// A member spelling that is not literal-derived: the member that makes a union mixed.
+const LRP_OTHER = 0
+// The `null` arm, or a numeric literal — the renderer's walk counts neither as a run text
+// nor as a mix-maker, so neither does this.
+const LRP_NEUTRAL = 1
+// A member that flattens to one or more string literals: a quoted leaf, a registered
+// litunion alias, or an inline litunion spelling.
+export const LRP_LITS = 2
+
+// Appends the string-literal member texts union-member spelling `p` contributes to the
+// enclosing union's flattened literal run, and reports which of the three classes it is in.
+// A member classifying "other" pushes nothing, so a caller's `out` holds exactly the texts of the members it counted.
+function litRunPartTexts(p: string, out: string[]): i32 {
+  if p.length == 0 { return LRP_OTHER }
+  if p == "null" { return LRP_NEUTRAL }
+  // A grouper is not a member: `("a"|"b")` contributes exactly what its interior does.
+  if nameIsParenSpanEnds(p) && !isTopLevelFuncTypeName(p) {
+    return litRunPartTexts(groupInnerOf(p), out)
+  }
+  // An inline union spelling — reached through the grouper strip, since a top-level `|`
+  // split never hands out a part that still carries one.
+  if nameHasPipe(p) && !isTopLevelFuncTypeName(p) {
+    const sub: string[] = []
+    tyTopLevelSplit(p, '|', false, sub)
+    const local: string[] = []
+    let anyLit = false
+    let si = 0
+    while si < sub.length {
+      const sc = litRunPartTexts(sub[si], local)
+      if sc == LRP_OTHER { return LRP_OTHER }
+      if sc == LRP_LITS { anyLit = true }
+      si = si + 1
+    }
+    if !anyLit { return LRP_NEUTRAL }
+    let li = 0
+    while li < local.length {
+      out.push(local[li])
+      li = li + 1
+    }
+    return LRP_LITS
+  }
+  // A literal member lexeme, through the one home for that grammar. `litMemberTy` returns
+  // -1 without allocating for every ordinary name, so this costs a `[0]` read on the
+  // members that are not literals at all.
+  const lmt = litMemberTy(p)
+  if lmt >= 0 {
+    const lt = T.tys[lmt]
+    if lt is TyLit {
+      if lt.litKind == "str" {
+        out.push(lt.litText)
+        return LRP_LITS
+      }
+    }
+    return LRP_NEUTRAL
+  }
+  // A registered litunion alias (`K0`) contributes its own members' texts — this is the
+  // member the arena has already flattened away by the time the renderer sees it, which is
+  // why the renderer needs a regroup and this needs an expansion.
+  const ai = cUserTypes[p] ?? -1
+  if ai >= 0 {
+    if tyIsLitUnion(ai) {
+      const at = T.tys[ai]
+      if at is TyUnion {
+        let mi = 0
+        while mi < at.uMembers.length {
+          const mt = T.tys[at.uMembers[mi]]
+          if mt is TyLit { out.push(mt.litText) }
+          mi = mi + 1
+        }
+        return LRP_LITS
+      }
+    }
+  }
+  LRP_OTHER
+}
+
+// Does the union-member spelling `p` denote a set of string literals and nothing else? The
+// canon-side twin of `homogLitUnionBase` over the `string` base. The union leg is not
+// decoration: `(K | K2) | string` reaches the arena as one flattened litunion, so without
+// recursing here canon would keep an arm the arena had already dropped.
+export function partIsStrLitSet(p: string): boolean {
+  if p.length == 0 { return false }
+  if nameIsParenSpanEnds(p) && !isTopLevelFuncTypeName(p) {
+    return partIsStrLitSet(groupInnerOf(p))
+  }
+  if nameIsLitUnionType(p) { return true }
+  if nameHasPipe(p) && !isTopLevelFuncTypeName(p) {
+    const sub: string[] = []
+    tyTopLevelSplit(p, '|', false, sub)
+    let si = 0
+    while si < sub.length {
+      if !partIsStrLitSet(sub[si]) { return false }
+      si = si + 1
+    }
+    return true
+  }
+  const lm = litMemberTy(p)
+  if lm >= 0 {
+    const lt = T.tys[lm]
+    if lt is TyLit { return lt.litKind == "str" }
+  }
+  false
+}
+
+// The registered litunion alias that a mixed union spelling's string-literal run regroups
+// into, or "" when the spelling isn't mixed, carries no run of 2+ literals, or matches no
+// registered alias. Fills `cls` with one class per part so the substitution doesn't
+// re-derive it — the same three guards, in the same order, as the renderer's own regroup.
+export function mixedUnionLitAliasRegroup(parts: string[], cls: i32[]) {
+  const texts: string[] = []
+  let nonLit = false
+  let i = 0
+  while i < parts.length {
+    const c = litRunPartTexts(parts[i], texts)
+    cls.push(c)
+    if c == LRP_OTHER { nonLit = true }
+    i = i + 1
+  }
+  if !nonLit { return "" }
+  if texts.length < 2 { return "" }
+  litUnionAliasOfLitTexts(texts)
+}
