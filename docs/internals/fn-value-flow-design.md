@@ -1039,8 +1039,28 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
        check errors). 1 of 10,218 modules differs: that fixture. The five `rv3487` positions
        (q03, q11–q14) go from invalid wasm to check reject, and the 68 `rv3531` witnesses and
        the ten fn-value matrices do not move.
-     - The refusal names the pin (`a(7)`: `a` prints its type parameter here), not both
-       positions. Naming the delivery as well is still owed.
+     - The refusal named the pin (`a(7)`: `a` prints its type parameter here), not both
+       positions. The second PR names the delivery as well.
+   - Second PR: the refusal at the pin names the delivery.
+     - Every deferred-constraint row (bin, print, argument, return, `let`, bound-member,
+       member, UFCS) records the delivery it was deferred through (`cvMark`, keyed by table
+       and row). `genFnValueCstrsAt` sets that delivery while it defers. Each validator
+       restores a row's delivery while it re-asks the row (`cvPick`), so a row that is
+       deferred again to an outer generic keeps it. `tErrPush` then ends a refusal raised
+       away from the delivery with `` (the demand is `show`'s, used as a function value at
+       line 14)``. The line is left out when the delivery is in another module. The
+       diagnostic ABI has one span and no related positions, so the second position goes
+       in the message text, as `crLostNote` does.
+     - Ablation: without the per-row record (`cvPick` returning the outer delivery), 0 of
+       the 9 refusals in the two fixtures name the delivery.
+     - Of 15,415 files (`tests/cases` and the distilled cells), `vl check` output differs
+       on two: the D3923 fixture's four deferred refusals, and the new
+       `error-generic-fn-value-deferred-demand-kinds`. That fixture covers `+`, `.length`,
+       a return, and a demand carried through a second generic call. A direct call in a
+       generic body (`show([x])`) gains no clause. The five `rv3487` positions (q03,
+       q11–q14) each gain it. The ten fn-value matrices: 0 `runs → not-runs`.
+     - No open row has the step-7 shape. D3975 is step 8's, and D4010 and D3923 are
+       closed.
      - Not in this PR: D3975 is a source pinned at two types, so it is step 8's. D4010 was
        already closed. The (c) literal stays blocked: the shadow histogram still shows
        undecided and disagreeing kinds in fixtures that run.
