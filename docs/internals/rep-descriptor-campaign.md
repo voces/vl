@@ -2904,3 +2904,43 @@ retried `criClassify` pass visits those expressions again. The emitted bytes are
 **Next, in order:** items 1, 2, 4 and 5 of §13.14. Then the 65 `list → reflist` in
 `gradual-type-parameter-union.vl`. D4683 and D4684 have since closed (their rows give the
 mechanisms); the union twins they surfaced are D4711 and D4712.
+
+### 13.17 A recursive-alias list element reads the column
+
+This step takes item 1 of §13.14, the `Ident` LEFT-ONLY notes over a recursive alias.
+
+**Mechanism.** A self-referential union with a `null` arm, such as
+`Json = null | boolean | f64 | string | Json[] | {[string]: Json}`, interns as a one-member
+`TyUnion` over `TyNullable(rest)`. `repOfArray` handled that one-member wrapper only over a
+`TyObj`, and `tyIsValueUnionBox` needs two members, so a `Json[]` element had no column rep.
+The registry already holds the box's row under the wrapper. `repOfArray` now answers
+`reflist`/`union` for a wrapper whose inner type is a value-union box with a registry row.
+
+**Checks.** The "before" seed is origin/master's fixpoint (dd658e26a), 5,560,414 bytes. The
+"after" seed is 5,560,479 bytes, +65.
+
+* `difftree --identity`, over 15,158 files: **10,199 built, 2 differ, 0 uncompared**.
+  `pop-union-box-element.vl` and `twice-narrowed-list-ops.vl` are each 10 bytes smaller, print
+  the same output, and drop four unread locals, the `.push` scratch frame §13.14 also removed.
+* Native fixpoint holds, `rep-fuzz-check` is exact, `regress.vl` moves no cell.
+
+**Counts.** Like-for-like `listRep` notes in `tests/cases`, by node kind and side:
+
+| kind / side | before | after |
+| --- | --- | --- |
+| `Ident` LEFT-ONLY | 3,928 | 1,186 |
+| `Call` LEFT-ONLY | 1,557 | 1,252 |
+| `ArrayLit` LEFT-ONLY | 543 | 542 |
+| `ArrayLit` different | 87 | 88 |
+| scope `Ident` LEFT-ONLY | 14 | 0 |
+| scope `Ident` RIGHT-ONLY | 39,125 | 39,133 |
+
+Like-for-like LEFT-ONLY falls 6,857 → 3,809. Every note removed is a `Json`, `Json$m1`, `J$m0`
+or `V` list. The added notes are all in `deep-is-json-shape-walk.vl`: eight scope reads the
+column now covers, and `const arr: Json[] = [mkCfg()]`, whose literal ladder answer (`list`) is
+now compared against `reflist` rather than an uncovered column. The distilled `cells/` and
+`named/` notes are identical before and after.
+
+**Next, in order:** the 1,186 `Ident` LEFT-ONLY left: 688 with no resolved type in five files,
+about 300 over a nullable literal-union element (`(N | null)[]`, `("x" | null)[]`, which
+`nulNumLitUnionBaseName` names), 42 over `_[] | null`. Then items 2, 4 and 5 of §13.14.
