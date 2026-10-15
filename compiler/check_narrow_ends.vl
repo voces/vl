@@ -1,0 +1,155 @@
+// Non-empty list facts (D3558): a `.length` test over a list place proves it non-empty for the
+// arm it guards, so the first `.pop()` of that place yields the element rather than `T | null`.
+// The checker opens a fact on entering an arm, ends the current function's facts on anything that
+// may shrink or rebind the list, and asks `nePopTakes` at each `.pop()`. The function a fact
+// belongs to is passed by the caller, so this module imports only `./ast` and `./check_places`.
+import { BinExpr, Ident, Member, NumLit, P, Paren } from "./ast"
+import { placeKeyOf } from "./check_places"
+
+// The node `ix` with enclosing parentheses removed, or `ix` itself when it is out of range.
+export function crUnParen(ix: i32): i32 {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Paren { cur = n.parInner } else { return cur }
+  }
+  cur
+}
+
+// The list places a `.length` test proved non-empty, innermost last: the key, the function whose
+// body tested it, whether it still holds, and the `.pop()` that consumed it (-1 before). The first
+// pop of a live key yields the element itself; anything that may shrink or rebind the list, run
+// again, or reorder evaluation ends every fact of the current function first.
+export const neKeys: string[] = []
+export const neFns: i32[] = []
+export const neLive: boolean[] = []
+export const neUsedBy: i32[] = []
+
+// The list place condition `cond` proves non-empty — `k.length > 0`, `!= 0`, `>= 1`, or the same
+// with the operands swapped — or "".
+function neCondKey(cond: i32): string {
+  const n = P.nodes[crUnParen(cond)]
+  if n is BinExpr {
+    const op = n.binOp
+    const lk = neLenKey(n.binLeft)
+    if lk != "" {
+      if (op == ">" || op == "!=") && neIntLit(n.binRight, "0") { return lk }
+      if op == ">=" && neIntLit(n.binRight, "1") { return lk }
+      return ""
+    }
+    const rk = neLenKey(n.binRight)
+    if rk != "" {
+      if (op == "<" || op == "!=") && neIntLit(n.binLeft, "0") { return rk }
+      if op == "<=" && neIntLit(n.binLeft, "1") { return rk }
+    }
+  }
+  ""
+}
+
+// The place key of `k` in a read `k.length`, or "".
+function neLenKey(ix: i32): string {
+  const n = P.nodes[crUnParen(ix)]
+  if n is Member {
+    if n.memProp == "length" { return placeKeyOf(n.memObj) }
+  }
+  ""
+}
+
+function neIntLit(ix: i32, text: string): boolean {
+  const n = P.nodes[crUnParen(ix)]
+  if n is NumLit { return n.numText == text }
+  false
+}
+
+// Opens the fact `cond` proves for the arm about to be checked; hands back the mark `neLeave` takes.
+// A key through an element (`a[0]`) opens none: the emitter pops only a local's or a field's list.
+export function neEnter(cond: i32, fn: i32): i32 {
+  const mark = neKeys.length
+  const k = neCondKey(cond)
+  if k != "" && k.indexOf("[") < 0 {
+    neKeys.push(k)
+    neFns.push(fn)
+    neLive.push(true)
+    neUsedBy.push(-1)
+  }
+  mark
+}
+
+export function neLeave(mark: i32) {
+  while neKeys.length > mark {
+    neKeys.pop()
+    neFns.pop()
+    neLive.pop()
+    neUsedBy.pop()
+  }
+}
+
+// Ends every fact of the current function whose key is rooted at `root`, or every one for "".
+export function neKill(root: string, fn: i32) {
+  let i = 0
+  while i < neKeys.length {
+    if neFns[i] == fn && (root == "" || neKeyRoot(neKeys[i]) == root) {
+      neLive[i] = false
+    }
+    i = i + 1
+  }
+}
+
+function neKeyRoot(k: string): string {
+  let i = 0
+  while i < k.length && k[i] != 46 && k[i] != 91 { i = i + 1 }
+  k.slice(0, i)
+}
+
+// Whether the `.pop()` at `callIx` over receiver `recvIx` takes a live fact (or took it on an
+// earlier pass), so it yields the element rather than `T | null`.
+export function nePopTakes(callIx: i32, recvIx: i32, fn: i32): boolean {
+  if neKeys.length == 0 { return false }
+  const key = placeKeyOf(recvIx)
+  if key == "" { return false }
+  let i = 0
+  while i < neKeys.length {
+    if neKeys[i] == key && neFns[i] == fn {
+      if neUsedBy[i] == callIx { return true }
+      if neLive[i] {
+        neUsedBy[i] = callIx
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// An assignment to a bare name ends the facts rooted at it or subscripted by it; any other
+// target may be reached through an alias (`p.xs = []` with `p` the same record as `o`), so it
+// ends every fact.
+export function neAssigned(n: BinExpr, fn: i32) {
+  const t = P.nodes[crUnParen(n.binLeft)]
+  if t is Ident {
+    neKill(t.identName, fn)
+    neKillSubscript(t.identName, fn)
+  } else {
+    neKill("", fn)
+  }
+}
+
+// Ends every fact of the current function whose key subscripts with the name `nm` (`a[nm]`).
+function neKillSubscript(nm: string, fn: i32) {
+  const sub = "[" + nm + "]"
+  let i = 0
+  while i < neKeys.length {
+    if neFns[i] == fn && neKeys[i].indexOf(sub) >= 0 { neLive[i] = false }
+    i = i + 1
+  }
+}
+
+// The key of the list whose first `.pop()` sits at node `callIx`, or "" when no fact applies there.
+export function nePopKeyOf(callIx: i32): string {
+  let i = 0
+  while i < neKeys.length {
+    if neUsedBy[i] == callIx && neUsedBy[i] >= 0 { return neKeys[i] }
+    i = i + 1
+  }
+  ""
+}
