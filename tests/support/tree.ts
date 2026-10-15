@@ -93,12 +93,6 @@ export const exists = (p: string): boolean => {
   }
 };
 
-/** The interpreter every python-shelling test honours: `PYTHON` first (the
- * gate's preflight row proves THAT interpreter works; a bare `python3` on
- * PATH may not), else `python3` so a plain `deno test` outside the gate
- * still runs. */
-export const pythonBin = (): string => Deno.env.get("PYTHON") ?? "python3";
-
 /** `{ VL_ISA }` when the run pins the seed engine's ISA, else `{}`. */
 export const isaEnv = (): Record<string, string> => {
   const isa = Deno.env.get("VL_ISA");
@@ -108,9 +102,7 @@ export const isaEnv = (): Record<string, string> => {
 /**
  * The environment a native `vl` spawn takes: `RUST_BACKTRACE` holds a host panic
  * to one line, and `VL_STD` / `VL_COMPILER_WASM` pin both resolutions to THIS
- * tree. `PYTHON` rides along too, because a ratchet script the spawned `vl` (or
- * a wrapping script) shells out to python needs the same pinned interpreter, not
- * whatever `python3` resolves to on PATH. `VL_ISA` (the seed engine's pinned ISA)
+ * tree. `VL_ISA` (the seed engine's pinned ISA)
  * rides along when set, so a `clearEnv` spawn reads the sidecar the run warmed
  * instead of JITing the seed. `Deno.Command` merges these over the inherited
  * environment.
@@ -128,7 +120,6 @@ export const nativeEnv = (
   RUST_BACKTRACE: "0",
   VL_STD: STD,
   VL_COMPILER_WASM: COMPILER,
-  PYTHON: pythonBin(),
   ...isaEnv(),
   ...extra,
 });
