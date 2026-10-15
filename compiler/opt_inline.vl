@@ -1,0 +1,143 @@
+// The `-O` inline-record step's census, ported from the host (docs/internals/optimizer-in-vl.md,
+// rung R6a): from the type and name sections alone it decides that a module holds nothing the
+// step could inline. The host stages the module with `optInLoad`, calls `optInline`, and reads
+// the `$VL_INLINE_EXPLAIN` line through `optOut*`. Any other module, including one this cannot
+// decode or one the host's scan refuses for another reason, is handed back to the host's step.
+
+import { wcByte, wcNew, wcU32 } from "./wasm_read"
+import { WasmModule, wmRead } from "./wasm_write"
+import { optInBytes, optOutSet } from "./opt_scan"
+import { MV_RECORD_MAX_FIELDS } from "./opt_multivalue"
+
+// The census on the staged module: 0 when the step changes nothing, with its explain line
+// (when `explain` is 1) in `optOut`; 1 when the host's step must decide. `fault` 1 answers 0
+// for every module, so a parity run can show it sees this answer.
+export function optInline(explain: i32, fault: i32): i32 {
+  optOutSet([])
+  if !nothingToInline(optInBytes()) && fault == 0 { return 1 }
+  if explain != 0 {
+    const log: u8[] = []
+    putText(
+      log,
+      "inline-explain: step skipped: no struct field or array element holds a ",
+    )
+    putText(log, "leaf record (1 to ")
+    putDec(log, MV_RECORD_MAX_FIELDS)
+    putText(log, " numeric fields)")
+    log.push(10)
+    optOutSet(log)
+  }
+  0
+}
+
+// Whether the host's scan would find no candidate. Like that scan, it first rules out a name
+// section naming struct fields and struct types in several rec groups, which it refuses.
+function nothingToInline(b: u8[]): boolean {
+  const m = wmRead(b)
+  if !m.ok || namesFields(m) { return false }
+  let structGroups = 0
+  let t = 0
+  for size in m.groupSize {
+    let hasStruct = false
+    let k = 0
+    while k < size {
+      if m.types[t + k].form == 0x5f { hasStruct = true }
+      if m.types[t + k].supers.length > 1 { return false }
+      k = k + 1
+    }
+    if hasStruct { structGroups = structGroups + 1 }
+    t = t + size
+  }
+  structGroups <= 1 && !anyCandidate(m)
+}
+
+// Whether a `name` custom section holds a field-names subsection (id 10), or does not decode.
+function namesFields(m: WasmModule): boolean {
+  let k = 0
+  while k < m.secId.length {
+    if m.secId[k] == 0 {
+      const c = wcNew(m.b, m.secStart[k], m.secEnd[k])
+      wcByte(c)
+      wcU32(c)
+      const len = wcU32(c)
+      if c.failed || len < 0 || len > c.end - c.pos { return true }
+      const named = len == 4
+        && m.b[c.pos] == 0x6e
+        && m.b[c.pos + 1] == 0x61
+        && m.b[c.pos + 2] == 0x6d
+        && m.b[c.pos + 3] == 0x65
+      c.pos = c.pos + len
+      while named && c.pos < c.end {
+        const id = wcByte(c)
+        const size = wcU32(c)
+        if c.failed || size < 0 || size > c.end - c.pos || id == 10 {
+          return true
+        }
+        c.pos = c.pos + size
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// Whether a struct field or array element refers to a leaf record: a struct of 1 to
+// `MV_RECORD_MAX_FIELDS` numeric fields with no subtype (for an array, all of one type).
+function anyCandidate(m: WasmModule): boolean {
+  const n = m.types.length
+  const hasSub: boolean[] = []
+  for _ in m.types { hasSub.push(false) }
+  for st in m.types {
+    if st.supers.length == 1 && st.supers[0] < n { hasSub[st.supers[0]] = true }
+  }
+  for st in m.types {
+    if st.form == 0x5f {
+      for v in st.params {
+        if leafRecord(m, hasSub, refTarget(v, n)) >= 0 { return true }
+      }
+    }
+    if st.form == 0x5e && st.params.length == 1 {
+      if leafRecord(m, hasSub, refTarget(st.params[0], n)) > 0 { return true }
+    }
+  }
+  false
+}
+
+// The type index a packed field type refers to, or -1 for a number or an abstract heap type.
+function refTarget(v: i32, n: i32): i32 {
+  const lead = v & 0xff
+  const h = v >> 8
+  if (lead != 0x63 && lead != 0x64) || h < 0x100 { return -1 }
+  const t = (h - 0x100) >> 1
+  if t < n { t } else { -1 }
+}
+
+// For type `v`, a leaf record: 1 when its fields share one number type, 0 when they do not,
+// -1 when `v` is no leaf record.
+function leafRecord(m: WasmModule, hasSub: boolean[], v: i32): i32 {
+  if v < 0 || hasSub[v] { return -1 }
+  const st = m.types[v]
+  if (
+    st.form != 0x5f
+    || st.params.length == 0
+    || st.params.length > MV_RECORD_MAX_FIELDS
+  ) {
+    return -1
+  }
+  for f in st.params {
+    if f < 0x7c || f > 0x7f { return -1 }
+  }
+  for f in st.params {
+    if f != st.params[0] { return 0 }
+  }
+  1
+}
+
+function putText(out: u8[], s: string) {
+  for cp in s { out.push(cp) }
+}
+
+function putDec(out: u8[], v: i32) {
+  if v >= 10 { putDec(out, v / 10) }
+  out.push(48 + v % 10)
+}
