@@ -10,6 +10,7 @@
 // `vl fmt` runs at 2,000 levels: its output is quadratic in the depth (each level is indented
 // once more), so at 10,000 the rendering is hundreds of megabytes. The editor half runs at
 // 600: V8's stack is fixed near 1 MiB, and a cold start still caps nesting near 800 (D2189).
+// Apple silicon frames are larger and overflow between 500 and 550, so darwin runs 500, loudly.
 //
 // GATING: the native half is env-gated (`SELFHOST_NATIVE_ALIGN=1`) and needs the binary; both
 // halves need the seed and register as ignored without it. No node_modules tool is used.
@@ -22,7 +23,8 @@ import { runProgram } from "../playground/src/playground.ts";
 
 const N = 10_000;
 const FMT_N = 2_000;
-const V8_N = 600;
+const V8_N = Deno.build.os === "darwin" ? 500 : 600;
+if (V8_N !== 600) console.warn(`[deep-nesting] editor half runs ${V8_N} levels, not 600: V8 overflows near 550 on ${Deno.build.os}/${Deno.build.arch}.`);
 const HAVE_SEED = exists(COMPILER);
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const NATIVE = GATED && HAVE_SEED && exists(VL);

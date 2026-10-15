@@ -121,8 +121,10 @@ fi
 
 findings=0
 known=0
-declare -A seen=()
-declare -A count=()
+# One counter variable per class: macOS's /bin/bash is 3.2, which has no `declare -A`.
+CLASSES="REJECT INVALID-WASM TRAP MISMATCH"
+seen=" "
+n_REJECT=0; n_INVALID_WASM=0; n_TRAP=0; n_MISMATCH=0
 # slurp VAR FILE: FILE's text without its trailing newlines (what `$(cat FILE)` gives), or
 # "" when it is missing — in builtins, because the loop below runs once per case and a
 # fork per read costs tens of milliseconds where `fork` is emulated (Git Bash on Windows).
@@ -170,14 +172,14 @@ for f in "$WORK"/case_*.vl; do
     continue
   fi
   findings=$((findings + 1))
-  count[$why]=$(( ${count[$why]:-0} + 1 ))
+  v=n_${why//-/_}; printf -v "$v" %d $(( ${!v} + 1 ))
   if [ -n "$KEEP" ]; then
     base="$(basename "$f" .vl)"
     cp "$f" "$KEEP/$base.vl"
     cp "$err" "$KEEP/$base.err"
   fi
-  if [ "$QUIET" -eq 0 ] && [ -z "${seen[$why]:-}" ]; then
-    seen[$why]=1
+  if [ "$QUIET" -eq 0 ] && [[ $seen != *" $why "* ]]; then
+    seen="$seen$why "
     echo; echo "✗ $why  (repro: scripts/fuzz-vl.sh --seed $SEED --count $COUNT --depth $DEPTH)"
     echo "  ── case ──"; sed 's/^/  /' "$f"; echo "  ── error ──"; sed 's/^/  /' "$err"
   fi
@@ -186,6 +188,6 @@ done
 
 echo
 summary=""
-for k in "${!count[@]}"; do summary="$summary $k=${count[$k]}"; done
+for k in $CLASSES; do v=n_${k//-/_}; [ "${!v}" -eq 0 ] || summary="$summary $k=${!v}"; done
 echo "done. $findings findings ($known known-baseline).${summary}"
 [ "$findings" -eq 0 ] || exit 1

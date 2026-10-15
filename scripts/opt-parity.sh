@@ -133,7 +133,7 @@ one() {
 export -f one side_bin side_env
 export WORK A B VL COMPILER TIMEOUT RUNG FLAGS
 
-xargs -a "$WORK/files" -d '\n' -P "$JOBS" -I{} bash -c 'one "$1"' _ {} > "$WORK/verdicts"
+tr '\n' '\0' < "$WORK/files" | xargs -0 -P "$JOBS" -I{} bash -c 'one "$1"' _ {} > "$WORK/verdicts"
 
 agree=$(grep -c '^AGREE ' "$WORK/verdicts")
 both_fail=$(grep -c '^AGREE-FAIL ' "$WORK/verdicts")

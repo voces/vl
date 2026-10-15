@@ -15,9 +15,17 @@ import { exit, runProgram } from "std:process"
 import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
 import { parseF64, parseI32, parseI64, toFixed, toString } from "std:fmt"
-import { join, padEnd, padStart, split, startsWith } from "std:str"
+import { endsWith, join, padEnd, padStart, split, startsWith } from "std:str"
 import { Json, parseJson } from "std:json"
-import { JsonMap, Proc, envOr, exists, isFile, jsonStr } from "./lib/common"
+import {
+  JsonMap,
+  Proc,
+  envOr,
+  exists,
+  isFile,
+  jsonStr,
+  mktempDirArgs,
+} from "./lib/common"
 
 const BASELINE = "scripts/plumb-shape-baseline.json"
 const GEN = "scripts/perf/gen-plumb-shape.vl"
@@ -38,6 +46,8 @@ let temps: string[] = []
 let lastBusy = 0.0
 let record = ""
 let haveTime = false
+// BSD `time` (macOS) takes no `-f`; it reports `user`/`sys` under `-p` and RSS in bytes under `-l`.
+let bsdTime = false
 
 function cleanup() {
   for t in temps { runProgram("rm", ["-rf", t]) }
@@ -220,7 +230,12 @@ function runTimed(
   const args = ["-C", cwd, "-u", "VL_FUEL"]
   for e in env { args.push(e) }
   if haveTime {
-    for a in [TIME, "-f", "%U %S %M", "-o", tfile] { args.push(a) }
+    let flags = ["-f", "%U %S %M"]
+    if bsdTime { flags = ["-p", "-l"] }
+    args.push(TIME)
+    for a in flags { args.push(a) }
+    args.push("-o")
+    args.push(tfile)
   }
   args.push("timeout")
   args.push(toString(BUILD_TIMEOUT))
@@ -248,10 +263,27 @@ function runTimed(
   let rss: f64 | null = null
   if haveTime {
     const lines = (readText(tfile) ?? "").split("\n").filter((l) => l != "")
-    const f = split(lines[lines.length - 1], " ")
-    cpu = (parseF64(f[0]) ?? 0.0) + (parseF64(f[1]) ?? 0.0)
-    rss = ((parseI64(f[2]) ?? 0) as! f64) / 1024.0
-    if traced { note("run " + pyRepr(cpu ?? 0.0) + " " + f[2]) }
+    if bsdTime {
+      let user = 0.0
+      let sys = 0.0
+      let kib = "0"
+      for l in lines {
+        const f = split(l, " ").filter((x) => x != "")
+        if f.length == 2 && f[0] == "user" { user = parseF64(f[1]) ?? 0.0 }
+        if f.length == 2 && f[0] == "sys" { sys = parseF64(f[1]) ?? 0.0 }
+        if f.length > 1 && endsWith(l, "maximum resident set size") {
+          kib = toString((parseI64(f[0]) ?? 0) / 1024)
+        }
+      }
+      cpu = user + sys
+      rss = ((parseI64(kib) ?? 0) as! f64) / 1024.0
+      if traced { note("run " + pyRepr(cpu ?? 0.0) + " " + kib) }
+    } else {
+      const f = split(lines[lines.length - 1], " ")
+      cpu = (parseF64(f[0]) ?? 0.0) + (parseF64(f[1]) ?? 0.0)
+      rss = ((parseI64(f[2]) ?? 0) as! f64) / 1024.0
+      if traced { note("run " + pyRepr(cpu ?? 0.0) + " " + f[2]) }
+    }
   }
   { cpu: cpu, rss: rss, err: p.err }
 }
@@ -266,10 +298,14 @@ done
 if [ $rung = True ]; then cp \"$1\" \"$PLUMB_SHAPE_OPT_LOG.rung\" || exit 1; fi
 cpu=\"0 0\"; code=0
 if [ -n \"$PLUMB_SHAPE_REAL_WASM_OPT\" ]; then
-  if [ -x /usr/bin/time ]; then
+  if [ -x /usr/bin/time ] && /usr/bin/time -f \"\" true 2>/dev/null; then
     /usr/bin/time -f \"%U %S\" -o \"$PLUMB_SHAPE_OPT_LOG.time\" \"$PLUMB_SHAPE_REAL_WASM_OPT\" \"$@\"
     code=$?
     cpu=$(tail -n 1 \"$PLUMB_SHAPE_OPT_LOG.time\")
+  elif [ -x /usr/bin/time ]; then
+    /usr/bin/time -p -o \"$PLUMB_SHAPE_OPT_LOG.time\" \"$PLUMB_SHAPE_REAL_WASM_OPT\" \"$@\"
+    code=$?
+    cpu=$(awk '$1 == \"user\" { u = $2 } $1 == \"sys\" { s = $2 } END { print u + 0, s + 0 }' \"$PLUMB_SHAPE_OPT_LOG.time\")
   else
     \"$PLUMB_SHAPE_REAL_WASM_OPT\" \"$@\"
     code=$?
@@ -403,7 +439,7 @@ function fuelOf(err: string): f64 | null {
 }
 
 function makeTemp(): string {
-  const p = spawn("mktemp", ["-d", "-t", "plumb-shape.XXXXXXXX"])
+  const p = spawn("mktemp", mktempDirArgs("plumb-shape."))
   if p.code != 0 { die("plumb-shape: mktemp -d failed: " + p.err, 1) }
   stripWs(p.out)
 }
@@ -809,6 +845,7 @@ function main() {
   const root = stripWs(pwd.out)
   record = envOr("PLUMB_SHAPE_RECORD", "")
   haveTime = isFile(TIME)
+  if haveTime { bsdTime = spawn(TIME, ["-f", "", "true"]).code != 0 }
   const vl = envOr("VL", root + "/scripts/vl-host/target/release/vl")
   const seed = envOr("SEED", root + "/build/vl-compiler.wasm")
   const requireFuel = args.filter((a) => a == "--require-fuel").length > 0

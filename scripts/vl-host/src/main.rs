@@ -3726,8 +3726,8 @@ fn report_guest_fuel(store: &Store<()>) {
     }
 }
 
-/// The process's resident set in bytes, from `/proc/self/statm` (on Windows the working set);
-/// 0 where that is unreadable.
+/// The process's resident set in bytes, from `/proc/self/statm` (on Windows the working set,
+/// on macOS the Mach task's resident size); 0 where that is unreadable.
 #[cfg(windows)]
 fn resident_bytes() -> u64 {
     #[repr(C)]
@@ -3762,7 +3762,37 @@ fn resident_bytes() -> u64 {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS has no `/proc`: the resident size is Mach's `MACH_TASK_BASIC_INFO` for this task.
+#[cfg(target_os = "macos")]
+fn resident_bytes() -> u64 {
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct BasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [i32; 2],
+        system_time: [i32; 2],
+        policy: i32,
+        suspend_count: i32,
+    }
+    const MACH_TASK_BASIC_INFO: i32 = 20;
+    extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(task: u32, flavor: i32, info: *mut BasicInfo, count: *mut u32) -> i32;
+    }
+    let mut info = BasicInfo::default();
+    let mut count = (std::mem::size_of::<BasicInfo>() / 4) as u32;
+    // SAFETY: this task's own port, and a buffer of the `count` words the flavor fills.
+    let kr = unsafe { task_info(mach_task_self_, MACH_TASK_BASIC_INFO, &mut info, &mut count) };
+    if kr == 0 {
+        info.resident_size
+    } else {
+        0
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn resident_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -9526,6 +9556,16 @@ fn resolve_source(dir: &std::path::Path, s: &str) -> String {
         return s.to_string();
     }
     use std::path::Component;
+    // `relative_dir` wrote `s` between CANONICAL paths, so an absolute `dir` is climbed from
+    // canonically too: through a symlinked directory (macOS's `/var` -> `/private/var`) the
+    // spelled one has a different depth, and its `..`s land above the root.
+    #[cfg(unix)]
+    let canon = dir
+        .is_absolute()
+        .then(|| std::fs::canonicalize(dir).ok())
+        .flatten();
+    #[cfg(unix)]
+    let dir = canon.as_deref().unwrap_or(dir);
     // The root is an empty first segment, so the join spells `/a` (or `C:/a` after a Windows
     // drive prefix); `roots` counts the segments a `..` cannot climb past.
     let mut parts: Vec<String> = Vec::new();
