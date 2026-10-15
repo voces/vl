@@ -37,12 +37,9 @@ const HOST_ONLY = new Set(
   ENOMEM ENOSYS ENOTEMPTY ENOTSUP EROFS ESPIPE EXDEV`.split(/\s+/),
 );
 
-// Codes std names that the native host never answers, and why that is allowed.
-const STD_ONLY = new Map([
-  // Exported (and re-exported by `std:process`) as part of the WASI vocabulary, but Rust
-  // reports a POSIX EPERM as `ErrorKind::PermissionDenied`, which the host maps to EACCES.
-  ["EPERM", "the host folds a POSIX EPERM into EACCES"],
-]);
+// Codes std names that the native host never answers, each with why that is allowed.
+// None today: every exported code is one the host can answer.
+const STD_ONLY = new Map<string, string>([]);
 
 function hostTable(
   src: string,
