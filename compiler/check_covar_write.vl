@@ -1,0 +1,595 @@
+// The type half of the covariant write scan (D821, D793): the per-value `Writable` predicate
+// `covarValueWriteState` (0 = nothing writes this value, 1 = something does, 2 = unknown), the
+// alias closure it grows over bindings, assignments, arguments, receivers and container escapes,
+// the two-storage and two-union rules, and `covarWriteThrough`, which grades a covariant list
+// delivery by them. `check_write_scan.vl` holds the syntax half and the memo rows read here;
+// the checker resets them (`covarWriteReset`) and reports through `tErr`.
+// This module imports `./ast`, `./check_node_tys`, `./check_ty_relate`, `./check_types` and
+// `./check_write_scan`.
+import { ArrayLit, BinExpr, Call, LetDecl, Member, P } from "./ast"
+import { nodeTyIxOf } from "./check_node_tys"
+import { covarNonNullArms } from "./check_ty_relate"
+import {
+  T,
+  TyArray,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  tySame,
+} from "./check_types"
+import {
+  CW_ELEM_FLD,
+  CW_OCC_BIND,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_ASG_RHS,
+  CW_UP_CALLEE,
+  CW_UP_ELEM,
+  CW_UP_FIELD,
+  CW_UP_LETINIT,
+  CW_UP_OBJ,
+  covarRootFrame,
+  covarRootName,
+  cwAdd,
+  cwAnswers,
+  cwArenaSync,
+  cwArgParamFrame,
+  cwArgParamName,
+  cwBindAnnOf,
+  cwCallNamed,
+  cwCallResultNodes,
+  cwCalleeArgOff,
+  cwCalleeDeclOf,
+  cwClaimed,
+  cwElemRead,
+  cwEscapeByLit,
+  cwEscapeByStore,
+  cwEscapeFrame,
+  cwEscapeOwner,
+  cwEscapedHandleNodes,
+  cwFieldNameOf,
+  cwFileEscape,
+  cwFrameOfDecl,
+  cwHas,
+  cwIsEscapedHandle,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwLastWriteAt,
+  cwParamAnnOfDecl,
+  cwParamFrameAt,
+  cwParamNameAt,
+  cwParamNameOfDecl,
+  cwPeel,
+  cwProgramHasWrite,
+  cwRecvDeclOf,
+  cwRetFrames,
+  cwRootFrames,
+  cwRootNames,
+  cwSetOccs,
+  cwSplits,
+  cwWriteAts,
+  cwWrites,
+} from "./check_write_scan"
+
+// Does the callee EXPRESSION `callFnIx` declare position `argIx` as a read-only view?
+function cwParamIsView(callFnIx: i32, argIx: i32): boolean {
+  cwAnnIsView(
+    cwParamAnnOfDecl(cwCalleeDeclOf(callFnIx), argIx + cwCalleeArgOff(callFnIx)),
+  )
+}
+
+// Is the annotation at `annIx` a read-only list view? Read off the ARENA type the checker
+// recorded, not off the name: `canonEmitTypeNames` rewrites a view's name into the list the
+// emitter spells, and this closure is asked on both sides of that rewrite.
+function cwAnnIsView(annIx: i32): boolean {
+  if annIx < 0 { return false }
+  const ty = nodeTyIxOf(annIx)
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aRead == 1 }
+  false
+}
+
+// Is `callFnIx` the callee of `xs.push(…)`, or of a map's `m.set(k, …)`, on a container this
+// analysis can name? The two mutators that take the value: `pop` and `clear` deliver nothing,
+// and `m.set(k, v)` is the method spelling of the index store `m[k] = v`.
+function cwPushIntoNamed(callFnIx: i32): boolean {
+  const cf = cwPeel(callFnIx)
+  if cf < 0 || cf >= P.nodes.length { return false }
+  const n = P.nodes[cf]
+  if n is Member {
+    if n.memProp == "push" { return cwEscapeOwner(cf) != "" }
+    if n.memProp == "set" && cwRecvIsMap(n.memObj) {
+      return cwEscapeOwner(cf) != ""
+    }
+  }
+  false
+}
+
+// Is the receiver at `ix` typed as a map?
+function cwRecvIsMap(ix: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length { return false }
+  const mt = T.tys[t]
+  if mt is TyMap { return true }
+  false
+}
+
+// —— the container escape edge (D852, widened to arrays, maps and stores by D1628) ——
+// Where a member of `set` goes INSIDE something — `{ xs: b }`, `[b]`, `w.f = b`, `m[k] = b`,
+// `xs.push(b)` — and comes back out under a name the closure never saw. Keyed by the
+// container's binding name plus a field name, or `CW_ELEM_FLD` for an element.
+function cwEscapedFields(
+  set: string[],
+  setFr: i32[],
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+) {
+  const uses: i32[] = []
+  cwSetOccs(set, setFr, CW_OCC_USE, uses)
+  let i = 0
+  while i < uses.length {
+    const u = uses[i]
+    const k = cwIxUpKind[u]
+    const up = cwIxUp[u]
+    if k == CW_UP_FIELD {
+      cwEscapeByLit(up, cwFieldNameOf(cwIxUpAux[u]), owners, ownerFrs, flds)
+    }
+    if k == CW_UP_ELEM {
+      cwEscapeByLit(up, CW_ELEM_FLD, owners, ownerFrs, flds)
+    }
+    if k == CW_UP_ASG_RHS { cwEscapeByStore(up, owners, ownerFrs, flds) }
+    if k == CW_UP_ARG { cwEscapeByPush(up, owners, ownerFrs, flds) }
+    i = i + 1
+  }
+  0
+}
+
+// `xs.push(b)` at `i`: an element store whose destination has no place expression of its own.
+function cwEscapeByPush(
+  i: i32,
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+) {
+  const n = P.nodes[i]
+  if n is Call {
+    const cf = cwPeel(n.callFn)
+    if cwPushIntoNamed(cf) {
+      cwFileEscape(
+        cwEscapeOwner(cf),
+        cwEscapeFrame(cf),
+        CW_ELEM_FLD,
+        owners,
+        ownerFrs,
+        flds,
+      )
+    }
+  }
+  0
+}
+
+// The alias closure: grows `set` until no new name joins, over four edges that carry a list
+// value on — a passthrough binding, an assignment to a plain identifier, a call argument
+// reaching a declared parameter, and a call result out of a function returning a member.
+// Returns 0 when the closure completed, 2 when it hit a form it does not model.
+function cwGrow(set: string[], setFr: i32[]): i32 {
+  let changed = true
+  let rounds = 0
+  while changed {
+    changed = false
+    rounds = rounds + 1
+    const fowners: string[] = []
+    const fownerFrs: i32[] = []
+    const flds: string[] = []
+    cwEscapedFields(set, setFr, fowners, fownerFrs, flds)
+    const retFrames: i32[] = []
+    cwRetFrames(set, setFr, retFrames)
+    // The set grows by at least one name per round or the loop ends, so the bound is the
+    // number of names in the program — cheaper than proving it, and turns any surprise into
+    // a decline rather than a hang.
+    if rounds > 256 { return 2 }
+    // The carrying expressions: a use of a member name, and a read back out of a container
+    // the set escaped into. A name added below is picked up by the next round, so the
+    // fixpoint is the one the whole-arena walk reached.
+    const carriers: i32[] = []
+    cwSetOccs(set, setFr, CW_OCC_USE, carriers)
+    cwEscapedHandleNodes(fowners, fownerFrs, flds, carriers)
+    let c = 0
+    while c < carriers.length {
+      const st = cwGrowAt(carriers[c], set, setFr, fowners, fownerFrs, flds)
+      if st == 2 { return 2 }
+      if st == 1 { changed = true }
+      c = c + 1
+    }
+    // A call result carries under no name, so it binds a DESTINATION and nothing else: a
+    // binding, an assignment, or the PARAMETER a call it is handed to declares (D1658).
+    const results: i32[] = []
+    cwCallResultNodes(retFrames, results)
+    let d = 0
+    while d < results.length {
+      const rk = cwIxUpKind[results[d]]
+      if rk == CW_UP_LETINIT || rk == CW_UP_ASG_RHS {
+        const st2 = cwGrowAt(results[d], set, setFr, fowners, fownerFrs, flds)
+        if st2 == 2 { return 2 }
+        if st2 == 1 { changed = true }
+      }
+      if rk == CW_UP_ARG {
+        const pn = cwArgParamName(results[d])
+        if pn != "" {
+          if cwAdd(set, setFr, pn, cwArgParamFrame(results[d])) {
+            changed = true
+          }
+        }
+      }
+      d = d + 1
+    }
+  }
+  0
+}
+
+// Grow the set across the one edge that consumes the carrying expression `x`. 0 = nothing
+// joined, 1 = a name joined, 2 = a form this analysis does not model.
+function cwGrowAt(
+  x: i32,
+  set: string[],
+  setFr: i32[],
+  fowners: string[],
+  fownerFrs: i32[],
+  flds: string[],
+): i32 {
+  const k = cwIxUpKind[x]
+  const up = cwIxUp[x]
+  if k == CW_UP_LETINIT {
+    const d = P.nodes[up]
+    if d is LetDecl {
+      if cwAdd(set, setFr, d.letName, cwFrameOfDecl(up)) { return 1 }
+    }
+    return 0
+  }
+  if k == CW_UP_ASG_RHS {
+    const n = P.nodes[up]
+    if n is BinExpr {
+      let st = 0
+      const ln = covarRootName(n.binLeft)
+      if ln == "" {
+        // `m[k] = b` / `o.f = b` — the value goes inside something. Modelled where the
+        // container roots at a once-bound name, which `cwEscapedFields` has just filed and
+        // every read back out matches as a handle; otherwise it cannot be named.
+        if cwEscapeOwner(cwPeel(n.binLeft)) == "" { return 2 }
+      } else if cwAdd(set, setFr, ln, covarRootFrame(n.binLeft)) {
+        st = 1
+      }
+      // The assignment yields its right side, so what consumes the assignment is one more
+      // edge the value crosses (D2411).
+      const vk = cwIxUpKind[up]
+      if vk == CW_UP_LETINIT || vk == CW_UP_ASG_RHS || vk == CW_UP_ARG {
+        const st2 = cwGrowAt(up, set, setFr, fowners, fownerFrs, flds)
+        if st2 != 0 { return st2 }
+      }
+      return st
+    }
+    return 0
+  }
+  if k == CW_UP_ARG {
+    return cwGrowCall(up, set, setFr, fowners, fownerFrs, flds)
+  }
+  if k == CW_UP_OBJ { return cwGrowRecv(up, set, setFr) }
+  0
+}
+
+// The receiver -> `self` edge of a UFCS call `x.f(…)`, where `mIx` is the member `x.f`: the
+// receiver binds `f`'s first parameter exactly as an argument binds its own, so a write through
+// `self` is a write through `x` (D2165). A member that is not a resolved UFCS callee adds nothing.
+function cwGrowRecv(mIx: i32, set: string[], setFr: i32[]): i32 {
+  if mIx < 0 || mIx >= cwIxUpKind.length { return 0 }
+  if cwIxUpKind[mIx] != CW_UP_CALLEE { return 0 }
+  const dIx = cwRecvDeclOf(mIx)
+  if dIx < 0 { return 0 }
+  if cwAnnIsView(cwParamAnnOfDecl(dIx, 0)) { return 0 }
+  const pn = cwParamNameOfDecl(dIx, 0)
+  if pn == "" { return 2 }
+  if cwAdd(set, setFr, pn, dIx) { return 1 }
+  0
+}
+
+// The argument -> parameter edge of the call at `ix`, whose argument list carries a member.
+// Every carrying argument binds its parameter, so the call is graded once however many of
+// them carry.
+function cwGrowCall(
+  ix: i32,
+  set: string[],
+  setFr: i32[],
+  fowners: string[],
+  fownerFrs: i32[],
+  flds: string[],
+): i32 {
+  const n = P.nodes[ix]
+  if n is Call {
+    if cwCallNamed(n.callArgNames) { return 2 }
+    const cn = covarRootName(n.callFn)
+    if cn == "" {
+      // A UFCS spelling reaches a real parameter list one slot along, and the resolvers
+      // below apply that offset themselves. Where no declaration answers, this is the
+      // container store filed above (`xs.push(b)` into a once-bound name) or a callee with
+      // no parameter list to read. D1799.
+      if cwCalleeDeclOf(n.callFn) < 0 {
+        if !cwPushIntoNamed(n.callFn) { return 2 }
+        return 0
+      }
+    }
+    const cfr = cwParamFrameAt(n.callFn)
+    let grew = 0
+    let k = 0
+    while k < n.callArgs.length {
+      const an = covarRootName(n.callArgs[k])
+      let carries = false
+      if an != "" {
+        if cwHas(set, setFr, an, covarRootFrame(n.callArgs[k])) {
+          carries = true
+        }
+      }
+      if cwIsEscapedHandle(n.callArgs[k], fowners, fownerFrs, flds) {
+        carries = true
+      }
+      if carries {
+        // A parameter declared `readonly T[]` ends the walk instead of extending it: the
+        // checker refuses every write through a view and refuses a view where a mutable
+        // list is wanted, so no write can reach the value past this edge. D1686.
+        if cwParamIsView(n.callFn, k) { carries = false }
+      }
+      if carries {
+        const pn = cwParamNameAt(n.callFn, k)
+        if pn == "" { return 2 }
+        if cwAdd(set, setFr, pn, cfr) { grew = 1 }
+      }
+      k = k + 1
+    }
+    return grew
+  }
+  0
+}
+
+// The list an annotation type declares: the type itself, or a nullable's inner list.
+function cwListOfAnnTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
+// The element storage a declared list annotation fixes: 1 = a value union's `{tag,
+// payload}` box, 2 = a plain struct row, 0 = neither, or an annotation whose type the
+// checker has not recorded yet. A nullable list (`Circle[] | null`) fixes its list's storage.
+function cwElemKindOfAnn(annIx: i32): i32 {
+  if annIx < 0 { return 0 }
+  const ty = cwListOfAnnTy(nodeTyIxOf(annIx))
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = T.tys[ty]
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 || e >= T.tys.length { return 0 }
+    const et = T.tys[e]
+    if et is TyUnion {
+      if covarNonNullArms(et.uMembers) >= 2 { return 1 }
+      return 0
+    }
+    if et is TyObj { return 2 }
+  }
+  0
+}
+
+// The element type index a declared list annotation fixes when that element is a value
+// union the emitter boxes, else -1 — the identity half of `cwElemKindOfAnn`.
+function cwUnionElemTyOfAnn(annIx: i32): i32 {
+  if annIx < 0 { return -1 }
+  const ty = cwListOfAnnTy(nodeTyIxOf(annIx))
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 || e >= T.tys.length { return -1 }
+    const et = T.tys[e]
+    if et is TyUnion {
+      if covarNonNullArms(et.uMembers) >= 2 { return e }
+    }
+  }
+  -1
+}
+
+// —— the two-different-unions rule (D853) ——
+// Do the declared handles on this value demand two different value unions, and is an
+// element read? Both want the program's one box, but a store through one puts an arm the
+// other's type does not name. Compared with `tySame`, so two aliases of one member set count as one union.
+function cwTwoUnions(set: string[], setFr: i32[]): boolean {
+  const seen: i32[] = []
+  const binds: i32[] = []
+  cwSetOccs(set, setFr, CW_OCC_BIND, binds)
+  let i = 0
+  while i < binds.length {
+    const ue = cwUnionElemTyOfAnn(cwBindAnnOf(binds[i]))
+    if ue >= 0 {
+      let found = false
+      let k = 0
+      while k < seen.length {
+        if tySame(seen[k], ue) { found = true }
+        k = k + 1
+      }
+      if !found { seen.push(ue) }
+    }
+    i = i + 1
+  }
+  if seen.length < 2 { return false }
+  cwElemRead(set, setFr)
+}
+
+function cwSplitStorage(set: string[], setFr: i32[]): boolean {
+  let sawBox = false
+  let sawRow = false
+  const binds: i32[] = []
+  cwSetOccs(set, setFr, CW_OCC_BIND, binds)
+  let i = 0
+  while i < binds.length {
+    const k = cwElemKindOfAnn(cwBindAnnOf(binds[i]))
+    if k == 1 { sawBox = true }
+    if k == 2 { sawRow = true }
+    i = i + 1
+  }
+  if sawBox { return sawRow }
+  false
+}
+
+// Does the alias set of `root` demand two element storages, or two different value unions
+// (and read an element)? Only meaningful once `covarValueWriteState` has run the closure.
+// Recomputed rather than memoised beside `cwSplits`: this runs mid-check, so the answer at
+// the first assignment cannot see a later handle's annotation — a memo would decide by check order.
+function covarValueTwoUnions(root: string, rootFr: i32): boolean {
+  if root == "" { return false }
+  const set: string[] = []
+  const setFr: i32[] = []
+  set.push(root)
+  setFr.push(rootFr)
+  cwGrow(set, setFr)
+  cwTwoUnions(set, setFr)
+}
+
+function covarValueSplitStorage(root: string, rootFr: i32): boolean {
+  let m = 0
+  while m < cwRootNames.length {
+    if cwRootNames[m] == root {
+      if cwRootFrames[m] == rootFr { return cwSplits[m] == 1 }
+    }
+    m = m + 1
+  }
+  false
+}
+
+// The frame a BINDING node declares into, for a caller holding the declaration rather than a
+// use of it — the emitter's ref-list licence asks about a `LetDecl`.
+export function covarDeclFrame(ix: i32): i32 { cwFrameOfDecl(ix) }
+
+// The predicate. 0 = nothing writes this value, 1 = something does, 2 = unknown. `rootFr` is
+// the frame `root` resolves in (`covarRootFrame` for a use, `covarDeclFrame` for a binding);
+// the pair is the value, since one name may stand for a binding in each frame that spells it.
+export function covarValueWriteState(root: string, rootFr: i32): i32 {
+  if root == "" { return 2 }
+  cwArenaSync()
+  let m = 0
+  while m < cwRootNames.length {
+    if cwRootNames[m] == root {
+      if cwRootFrames[m] == rootFr { return cwAnswers[m] }
+    }
+    m = m + 1
+  }
+  let ans = 0
+  let split = 0
+  let wAt = -1
+  if cwProgramHasWrite() {
+    const set: string[] = []
+    const setFr: i32[] = []
+    set.push(root)
+    setFr.push(rootFr)
+    ans = cwGrow(set, setFr)
+    // The write pass runs before the claim pass (D852): a write to a member of the closed
+    // set is a positive fact about this value, which the claim pass's `2` had been
+    // discarding wherever both fired. The reorder can only move a `2` to a `1`, and only
+    // where a definite write exists — such a program is already an invalid module today.
+    const wowners: string[] = []
+    const wownerFrs: i32[] = []
+    const wflds: string[] = []
+    cwEscapedFields(set, setFr, wowners, wownerFrs, wflds)
+    if ans == 0 {
+      ans = cwWrites(set, setFr, wowners, wownerFrs, wflds)
+      wAt = cwLastWriteAt
+    }
+    if ans == 0 {
+      if !cwClaimed(set, setFr) { ans = 2 }
+    }
+    if ans != 2 {
+      if cwSplitStorage(set, setFr) { split = 1 }
+    }
+  }
+  cwRootNames.push(root)
+  cwRootFrames.push(rootFr)
+  cwAnswers.push(ans)
+  cwSplits.push(split)
+  cwWriteAts.push(wAt)
+  ans
+}
+
+// The node of the write that made `covarValueWriteState` answer 1 for this value, or -1
+// when it answered anything else. Asks the predicate first, so the memo row exists.
+export function covarValueWriteAt(root: string, rootFr: i32): i32 {
+  if covarValueWriteState(root, rootFr) != 1 { return -1 }
+  let m = 0
+  while m < cwRootNames.length {
+    if cwRootNames[m] == root {
+      if cwRootFrames[m] == rootFr { return cwWriteAts[m] }
+    }
+    m = m + 1
+  }
+  -1
+}
+
+// Whether the list `ix` delivers is a `const` bound once to a list literal, the one provenance
+// `covarValueWriteState` follows every alias of. Its 0 for any other root (a parameter, or a
+// binding of a call result) says nothing of the caller's handles, so a snapshot there is unsound.
+export function covarRootFreshLocal(ix: i32): boolean {
+  const root = covarRootName(ix)
+  if root == "" { return false }
+  cwArenaSync()
+  const set: string[] = [root]
+  const setFr: i32[] = [covarRootFrame(ix)]
+  const binds: i32[] = []
+  cwSetOccs(set, setFr, CW_OCC_BIND, binds)
+  if binds.length != 1 { return false }
+  const b = P.nodes[binds[0]]
+  if b is LetDecl {
+    if b.letKw == "const" && b.letInit >= 0 {
+      return P.nodes[cwPeel(b.letInit)] is ArrayLit
+    }
+  }
+  false
+}
+
+// —— the checker's `Writable` rule (DECISIONS.md A9, D793) ——
+// A covariant list assignment is legal exactly where it is read-only: where the value is
+// written through, the two element storages cannot both be honoured, so the assignment
+// itself is illegal. A niche destination is out (D792); the source must be a named handle, since a fresh literal creates no alias.
+export function covarWriteThrough(srcExpr: i32, srcTy: i32, dstTy: i32): i32 {
+  if srcExpr < 0 { return 0 }
+  if srcTy < 0 || dstTy < 0 { return 0 }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return 0 }
+  const s = T.tys[srcTy]
+  if s is TyArray {
+    const d = T.tys[dstTy]
+    if d is TyArray {
+      const se = s.aElem
+      const de = d.aElem
+      if se < 0 || de < 0 { return 0 }
+      if se >= T.tys.length || de >= T.tys.length { return 0 }
+      const st = T.tys[se]
+      // A plain struct row on the source side — `rlElemKindTbl == 1`, the only element
+      // kind the widening reads from.
+      if st is TyObj {
+        const dt = T.tys[de]
+        if dt is TyUnion {
+          // A union the emitter boxes, not a nullable niche: one non-null member beside
+          // `null` reps as its base with a null slot (D771), not a `{tag, payload}`
+          // destination, so the widening declines it write or no write (D792).
+          if covarNonNullArms(dt.uMembers) < 2 { return 0 }
+          const root = covarRootName(srcExpr)
+          if root == "" { return 0 }
+          const rootFr = covarRootFrame(srcExpr)
+          if covarValueWriteState(root, rootFr) != 1 { return 0 }
+          if covarValueSplitStorage(root, rootFr) { return 1 }
+          if covarValueTwoUnions(root, rootFr) { return 2 }
+        }
+      }
+    }
+  }
+  0
+}
