@@ -14830,8 +14830,8 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
       const bcode = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, bvis, bfis)
       if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
         if nodeTyIsUnionRow(memIx) {
-          const bn = tyToEmitName(nodeTyPinIxOf(memIx))
-          if isValueUnionName(bn) { return bn }
+          const bn = valueUnionRenderOfTy(nodeTyPinIxOf(memIx))
+          if bn != "" { return bn }
         } else {
           // A read the checker typed at one atom of the box (a then arm over a type parameter).
           return sharedPlanBoxName(bvis, bfis)
@@ -27426,6 +27426,24 @@ export function arrLitNominalElemName(arrIx: i32): string {
   ""
 }
 
+// The scalar leaf kind of list-of-lists literal `a` (lead inner literal `e0x`): order-blind
+// over every inner literal, as `arrLitNumKind` is over a flat literal's elements, so a later
+// `[2.5]` keys `f64[]` as the checker's element join does (D4876). ALK_NONE for a mixed one.
+function arrLitNestedNumKind(a: ArrayLit, e0x: i32, fnIx: i32): i32 {
+  let anyF64 = false
+  let anyI64 = false
+  for el in a.arrElems {
+    if el == e0x || P.nodes[el] is ArrayLit {
+      const nk = arrLitNumKind(el, fnIx)
+      if nk == ALK_F64 { anyF64 = true }
+      if nk == ALK_I64 { anyI64 = true }
+    }
+  }
+  if anyF64 && !anyI64 { return ALK_F64 }
+  if anyI64 && !anyF64 { return ALK_I64 }
+  ALK_NONE
+}
+
 // The inner literal of a list-of-lists literal whose leaf keys the element: the first element,
 // unless that is an empty `[]` and a later element is a non-empty literal. The empty one has
 // no leaf to read, and the element join pinned it to its sibling's (D2209).
@@ -27471,7 +27489,7 @@ export function arrLitElemKind(arrIx: i32) {
           }
         }
         if arrLitIsStr(e0x, -1) { return RLK_STR_LIST }
-        const nk = arrLitNumKind(e0x, -1)
+        const nk = arrLitNestedNumKind(a, e0x, -1)
         if nk == ALK_F64 { return RLK_F64_LIST }
         if nk == ALK_I64 { return RLK_I64_LIST }
         return RLK_I32_LIST
@@ -27714,7 +27732,7 @@ export function arrLitFrameLeafRow(arrIx: i32, fnIx: i32): string {
     const e0x = arrLitLeadInner(a)
     if emptyArrLitIxOf(e0x) >= 0 || arrLitIsRef(e0x) { return "" }
     if arrLitIsStr(e0x, fnIx) { return "string[]" }
-    const nk = arrLitNumKind(e0x, fnIx)
+    const nk = arrLitNestedNumKind(a, e0x, fnIx)
     if nk == ALK_F64 { return "f64[]" }
     if nk == ALK_I64 { return "i64[]" }
   }
@@ -27754,7 +27772,7 @@ export function arrLitElemName(arrIx: i32) {
           if rin != "" { return rin }
         }
         if arrLitIsStr(e0x, -1) { return "string[]" }
-        const nk = arrLitNumKind(e0x, -1)
+        const nk = arrLitNestedNumKind(a, e0x, -1)
         if nk == ALK_F64 { return "f64[]" }
         if nk == ALK_I64 { return "i64[]" }
         return "i32[]"
@@ -39147,6 +39165,13 @@ export function ifJoinUnionName(ifIx: i32) {
   ""
 }
 
+// The render of `ty` when it names a value union the emitter boxes, else "".
+function valueUnionRenderOfTy(ty: i32): string {
+  const nm = tyToEmitName(ty)
+  if isValueUnionName(nm) { return nm }
+  ""
+}
+
 // Whether `t` is a union, or a nullable over one.
 export function tyIsUnionShaped(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
@@ -39200,8 +39225,8 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       tyIsNumUnion(nuTy)
       && !(e is BinExpr && (e.binOp == "=" || e.binOp == "??"))
     ) {
-      const nun = tyToEmitName(nuTy)
-      if isValueUnionName(nun) { return nun }
+      const nun = valueUnionRenderOfTy(nuTy)
+      if nun != "" { return nun }
     }
   }
   // A `??`'s desugared call-operand form still needs a name here: it drives the default's
@@ -39212,10 +39237,8 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // one does: inside a hole-parameter body the `??` result is a deferred hole, and the
       // consumers that ask this (`exprUnion`, the print ladder) would otherwise classify the
       // box the lowering just built as a scalar (D1702).
-      const ccn = tyToEmitName(nodeTyPinIxOf(unwrapParen(exprIx)))
-      if ccn != "" {
-        if isValueUnionName(ccn) { return ccn }
-      }
+      const ccn = valueUnionRenderOfTy(nodeTyPinIxOf(unwrapParen(exprIx)))
+      if ccn != "" { return ccn }
       // A MIXED result renders structurally, so the name comes off the canon index — the same
       // fallback the lowering takes. The two must agree or the destination boxes a value the
       // `??` already boxed, and the arm test then casts a box to the arm's struct (D1703). A
@@ -42756,6 +42779,9 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       if ms >= 0 && ms < rlElemName.length { return rlElemName[ms] }
       const mrn = mfStructResultRowName(exprIx, fnIx)
       if mrn != "" { return mrn }
+      // A list-returning `.map` named before `collectMapFilterUse` interns its row.
+      const mln = mfListResultElemName(exprIx, fnIx)
+      if mln != "" { return mln }
     }
     // A struct-field or indexed closure-array element call whose result is a ref list: the
     // resolved `$fnsig` result slot names the element, mirroring the Ident-callee arm above.
@@ -50764,6 +50790,8 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
       if callee.memProp == "slice" { return mfRecvKindOf(callee.memObj, fnIx) }
       if callee.memProp == "filter" { return mfRecvKindOf(callee.memObj, fnIx) }
       if c.callArgs.length == 1 {
+        // A list-returning callback maps to a ref list of that list's wrapper (D4870).
+        if mfListResultElemTy(callIx, fnIx) >= 0 { return "ref" }
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe < 0 {
           // A closure-value callback (`xs.map(f)`, `f` a function-typed param/binding) — its result
@@ -50806,6 +50834,48 @@ export function mfResultKindOf(callIx: i32, fnIx: i32): MfKind | null {
   null
 }
 
+// The element type of a `.map` whose callback returns a list, so its result is a ref list of
+// that list's wrapper; -1 when the callback returns no list or the call's element is not a
+// concrete array.
+export function mfListResultElemTy(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callFn < 0 || c.callArgs.length != 1 { return -1 }
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp != "map" { return -1 }
+      const fe = mfCallbackFe(c.callArgs[0], fnIx)
+      // A closure-value callback has no lifted function to ask; its call's type decides.
+      if fe >= 0 && !vkIsPlainList(cloRetValKind(fe)) { return -1 }
+      let et = iterElemPinTy(callIx, fnIx)
+      if et < 0 {
+        const rt = tyRefArrElemOf(nodeTyIxOf(callIx))
+        if rt >= 0 && !tyHasTyVar(rt) { et = rt }
+      }
+      if et >= 0 && et < T.tys.length && T.tys[et] is TyArray { return et }
+    }
+  }
+  -1
+}
+
+// `mfListResultElemTy` rendered as the ref-list row key; "" when it answers -1.
+export function mfListResultElemName(callIx: i32, fnIx: i32): string {
+  const lt = mfListResultElemTy(callIx, fnIx)
+  if lt < 0 { return "" }
+  tyToEmitName(lt)
+}
+
+// Is `k` the result kind of a non-nullable list?
+function vkIsPlainList(k: VKind | null): boolean {
+  k == "list"
+    || k == "f64list"
+    || k == "strlist"
+    || k == "reflist"
+    || k == "i64list"
+    || k == "f32list"
+    || k == "u8list"
+}
+
 // The `.map` result kind where callback `fe` reads as `i32`. An un-annotated callback holds that
 // kind until return inference reaches it, so the call's checked list rep answers where it names
 // another list.
@@ -50846,6 +50916,9 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
       // A STRUCT-returning `.map`: the result is a NEW ref list whose element is the
       // callback's RETURN struct — its ref-list slot (interned by `mfScan`).
       if callee.memProp == "map" && c.callArgs.length == 1 {
+        // A list-returning `.map`: the row `collectMapFilterUse` interned for that list type.
+        const lt = mfListResultElemTy(callIx, fnIx)
+        if lt >= 0 { return rlSlotOfTy(lt) }
         const fe = mfCallbackFe(c.callArgs[0], fnIx)
         if fe >= 0 && cloRetIsStructRow(fe) {
           const si = cloRetValSlot(fe)
