@@ -28,14 +28,14 @@ restate measurements; follow the links.
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
-| L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: memo module third PR (`MemoGen` generations), never-cleared 188 of 1,148 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
+| L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: `expCtxReset` clears the 17 pending seeds at compile start, never-cleared 172 of 1,156 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
 | L6 registries by key | step 5 **in progress**. Last: second switch (#3661), `unionNameOfExpr/is` on the key, 12 sites. Next: `ctr/unionName` (site 42), blocked on the struct-union alias sibling (class As). | [L6 log](#l6-log) |
 | L10 the `-O` optimizer | **in progress as T4**. Last: R6a, the inline-record census (`compiler/opt_inline.vl`), runs beside the Rust. Next: R6b (walk and decision), R6c (rewrite), then R7, list flattening. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: `tests/vl_errno_agreement_test.ts` (#3732) holds the errno numbering in agreement. Next: the import table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: `compiler/check_capture_loss.vl` (D2407, D2529), the capture-loss notes. Next: another callee-closed carve of `typecheck.vl`. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: `compiler/check_capture_walks.vl`, the syntax-only closure-capture walks. Next: another callee-closed carve of `typecheck.vl`. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -278,6 +278,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - Byte-identical over the difftree population; never-cleared **195 of 1,149**.
 - Third PR: a stamp generation is a registered `MemoGen` (`memoGenNew`, `memoGenAdvance`) that the compile reset advances and never restarts; `lrGen`, `rsQueryGen`, `msGen` and `fnPosEpoch` became generations, `scnEpoch` and `fdnEpoch` became keys (`scnGenKey`, `fdnGenKey`, plus `fnPosLenKey` restarting the position index's cursors when its epoch moves), and `capMemoGen` and `sblEpoch` were deleted: their tables are emptied at every bump, so a 1/-1 flag says the same.
 - Byte-identical over the difftree population, L2 fuel +0.04%; never-cleared **188 of 1,148**, and no hand stamp generation is left in this list.
+- Fourth PR: `expCtxReset` (beside `expCtxApply`) writes the 17 `pending*` seeds back to their declared defaults and is the second call in `emitProgram`, after `memoCompileReset`; it is in the audit's prologue list. Module identity over the difftree population (15,156 files, 10,196 built, 0 differ, fixpoint identical); the seed is 105 bytes larger (the new function); never-cleared **172 of 1,156**.
 
 ### L6 log
 
@@ -327,6 +328,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The capture-loss notes (D2407, D2529) are `compiler/check_capture_loss.vl`: the table of lost reads and the sentence a refusal gains, 12 declarations that import `./ast` and `./fmt_util`, with `crSpans` and `nodeLineOf` moved alongside; the caller passes each record's function and scope depth to `crLostPush`, and 7 names cross into the checker.
 - The `crValUse*` walk stays: `crValUseEnter` reads the arena epoch and edit log, the getter and operator tables and the program root.
 - The seed is 535 bytes smaller and differs in function order, and output identity holds.
+- The syntax-only closure-capture walks are `compiler/check_capture_walks.vl`: the writer analysis of a root (`crwEnsure`, `crwVisit`, `crs*`), the by-reference capture walk (`crCaptureByRef`, `crbrWalk`), the nulled-name walk (`crNulledWalk`) and the escape and mention walkers, 74 declarations in 696 lines that import `./ast`, `./check_narrow_ends` and `./check_places`, with 33 names crossing into the checker; none of it reads the type arena or the scope chain. It was found by a reference graph over the file: the closure of the `crw`, `crbr`, `crs`, `crNulled` and `crBy` families, widened by every `cr` function whose callees all lay inside it. The seed is 3 bytes larger (5,559,561 to 5,559,564) and differs in function order; `difftree.sh --identity` reads `15156 files · 10196 built · 0 differ · 0 uncompared` with the fixpoint holding, and `regress.vl` reads `no cell changed class`.
 
 ### SMALL log
 
