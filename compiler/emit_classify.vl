@@ -136,6 +136,7 @@ import {
   mapTyValIsLitUnion,
   mapTyValIsNulBool,
   mapTyValIsNulLitUnion,
+  mapTyValIsNullUnit,
   mapTyValIsNumLitUnion,
   mapTyValLitUnionTexts,
   mapUnboxTyOf,
@@ -158,6 +159,7 @@ import {
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
+  nodeArrayElemIsNullUnit,
   nodeArrayElemIsStr,
   nodeArrayElemName,
   nodeArrayElemTyIx,
@@ -207,6 +209,7 @@ import {
   nodeTyWrites,
   nodeUnionName,
   nodeUnwidenedTyOf,
+  nolLitTakenOther,
   nomErasedTyIx,
   nomNameOfTy,
   nominalStructNameOfTy,
@@ -251,6 +254,7 @@ import {
   tyIsNonNullHoleRead,
   tyIsNulLitUnionNiche,
   tyIsNulValueUnionBox,
+  tyIsNullUnit,
   tyIsNullableLitUnion,
   tyIsNumUnion,
   tyIsNumericBox,
@@ -494,6 +498,7 @@ import {
   FC_NUL_I64_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_MAP,
+  FC_NUL_NONE,
   FC_NUL_REF_LIST,
   FC_NUL_STR,
   FC_NUL_STR_LIST,
@@ -7670,6 +7675,7 @@ function mvValLowersTy(ty: i32): i32 {
       if p == "f64" { return 1 }
       if p == "i64" { return 1 }
       if p == "f32" { return 1 }
+      if p == "null" { return 1 }
       return 0
     }
     TyMap => {
@@ -7854,6 +7860,8 @@ function mapNodeValKindLowerable(ix: i32) {
 // `retMapFlag`, the param and return valtype gate, so the two cannot drift.
 export function mvValKindOfName(valName: string): i32 {
   if valName == "i32" || valName == "boolean" { return MVK_MONO }
+  // The `null` unit value stores the `boolean | null` sentinel, so it is the mono map too (D4671).
+  if valName == "null" { return MVK_MONO }
   // A literal-union atom value: each value is the interned atom code, a plain i32, so the map
   // is the mono i32 map. Checked before the union arm, whose member count would otherwise
   // claim the alias and box the values.
@@ -11224,11 +11232,11 @@ function arrNewFillAnnKind(callIx: i32, fnIx: i32): ArrNewKind {
 }
 
 // The `ArrNewKind` of a list over an ELEMENT of `VKind` k. The arms are the five scalar
-// backings and the two i32-sentinel niches; `"none"` only for `nulnone`, a bare `null` with no
-// rep of its own. Every remaining kind is ref-repped.
+// backings and the i32-sentinel niches, `nulnone` among them: a `null[]` rides the i32 list
+// with every element the sentinel 2. Every remaining kind is ref-repped.
 function arrNewKindOfElemVKind(k: VKind): ArrNewKind {
   match k {
-    "i32" | "nulbool" => {
+    "i32" | "nulbool" | "nulnone" => {
       return "list"
     }
     "f64" => {
@@ -11244,9 +11252,6 @@ function arrNewKindOfElemVKind(k: VKind): ArrNewKind {
       // The f32 pair is interned exactly as the i64 one is, so a generic instance's f32
       // parameter fill names its kind here rather than reaching the emitter's floor (D1673).
       return "f32list"
-    }
-    "nulnone" => {
-      return "none"
     }
     "struct" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "u8list" | "list" | "v128" => {
       return "reflist"
@@ -21315,7 +21320,11 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // and the length/element reads skip the list-wrapper `struct.get`. `forInStringSrc` flags it
   // at the temp-kind and emit sites. Checked before `exprArray` (a string is not an i32 list).
   if exprString(iterIx, fnIx) { return "i32" }
-  if exprArray(iterIx, fnIx) { return "i32" }
+  if exprArray(iterIx, fnIx) {
+    // A `null[]` walks the i32 list, but its loop var is the `null` unit cell, never written.
+    if arrElemIsNullUnitAt(iterIx, fnIx) { return "nulnone" }
+    return "i32"
+  }
   return null
 }
 
@@ -21444,6 +21453,8 @@ export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
     if mvValVariantOf(vsl) >= 0 { return "variant" }
     return "struct" // struct value
   }
+  // A `null`-valued map rides the mono map; its value is the `null` cell, never read.
+  if mapTyValIsNullUnit(mapRecvTyIn(mapObjIx, fnIx)) { return "nulnone" }
   return "i32"
 }
 
@@ -26196,6 +26207,8 @@ function fieldTypeIsDeferred(t: string): boolean { nameIsU8Array(t) }
 // (decided from the checker's recorded type) or -1 when only the spelling is available.
 function fieldCodeOfSpelling(t: string, litNode: i32) {
   if t == "i32" { return FC_I32 }
+  // The `null` unit type stores its one value in a `nullref` slot (D4671).
+  if t == "null" { return FC_NUL_NONE }
   if t == "boolean" { return FC_I32 }
   // An f64 field (`x: f64`) stores a raw f64 valtype slot — code 17. An i64 / f32 field is
   // the same idea in the other scalar valtypes — codes 23 / 24 (0x7e / 0x7d storage).
@@ -28309,6 +28322,9 @@ export function anonFieldCode(valIx: i32) {
   if tyIsU8ArrayTy(nodeRepTyIxOf(valIx)) { return FC_U8_LIST }
   const syn = anonFieldCodeSyn(valIx)
   if syn >= 0 { return syn }
+  // A field whose value is the `null` unit type stores its `nullref` slot, the code the
+  // declared twin gets (D4671).
+  if tyIsNullUnit(nodeRepTyIxOf(valIx)) { return FC_NUL_NONE }
   // A literal-union field value is the interned i32 atom, code 0 — the rule
   // `fieldCodeOfSpelling` states for the DECLARED twin, which this ladder lacked. Ahead of the
   // box rung below, since a literal union also registers as a union NAME and would otherwise
@@ -30894,11 +30910,25 @@ export function arrElemIsNulBoolAt(arrIx: i32, fnIx: i32): boolean {
   tyIsNulPrim(arrElemInstTy(arrIx, fnIx), "boolean")
 }
 
+// Whether the list at `arrIx` holds the `null` unit type as instance `fnIx` sees it. Its writes
+// store the `boolean | null` sentinel, the one value the element can hold (D4671).
+export function arrElemIsNullUnitAt(arrIx: i32, fnIx: i32): boolean {
+  if nolLitTakenOther(unwrapParen(arrIx)) { return false }
+  if nodeArrayElemIsNullUnit(arrIx) { return true }
+  tyIsNullUnit(arrElemInstTy(arrIx, fnIx))
+}
+
 // The element of the list at `arrIx` as instance `fnIx` sees it, or -1: the banked pin's, else
 // the instance's own annotation of the parameter or local, since a receiver shared with the
 // generic body records only its hole (D2524, D2899).
 function arrElemInstTy(arrIx: i32, fnIx: i32): i32 {
-  if arrIx < 0 { return -1 }
+  arrElemInstTyAt(arrIx, fnIx, 0)
+}
+
+// `arrElemInstTy` with an un-annotated local answered from its initializer, so a receiver the
+// emitter re-binds to a temporary keeps its instance element (D4671); `depth` bounds the chain.
+function arrElemInstTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
+  if arrIx < 0 || depth > 8 { return -1 }
   const pe = tyStepElem(nodeTyPinIxOf(unwrapParen(arrIx)))
   if pe >= 0 && !tyHasTyVar(pe) { return pe }
   const n = P.nodes[unwrapParen(arrIx)]
@@ -30908,6 +30938,7 @@ function arrElemInstTy(arrIx: i32, fnIx: i32): i32 {
       const d = P.nodes[di]
       if d is LetDecl {
         if d.letType >= 0 { return nodeArrayElemTyIx(d.letType) }
+        return arrElemInstTyAt(d.letInit, fnIx, depth + 1)
       }
       return -1
     }
@@ -36709,6 +36740,15 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
       const t = fnIndexOfNode(e.callFn)
       if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
     }
+    // A `null[]`'s `pop` and `get` hand back its element, and a `null`-valued map's `get` its value.
+    if cf is Member {
+      if cf.memProp != "pop" && cf.memProp != "get" { return false }
+      if exprMap(cf.memObj, fnIx) {
+        return cf.memProp == "get"
+          && mapTyValIsNullUnit(mapRecvTyIn(cf.memObj, fnIx))
+      }
+      return arrElemIsNullUnitAt(cf.memObj, fnIx)
+    }
     return false
   }
   // An if-expression whose every arm is a bare `null` or itself `null`-typed is `null`-typed:
@@ -36720,6 +36760,15 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
     if e.ifElse < 0 { return true }
     if P.nodes[e.ifElse] is IfStmt { return exprIsNulNone(e.ifElse, fnIx) }
     return armIsNulNone(ifArmValueExpr(e.ifElse), fnIx)
+  }
+  // A struct field of the `null` unit type reads its `nullref` slot (D4671).
+  if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_NONE }
+  // So does an element of a `null[]`, which rides the i32 list, and a `null`-valued map's read.
+  if e is Index {
+    if exprMap(e.idxArr, fnIx) {
+      return mapTyValIsNullUnit(mapRecvTyIn(e.idxArr, fnIx))
+    }
+    return arrElemIsNullUnitAt(e.idxArr, fnIx)
   }
   // `a ?? b` over a `null`-typed `a` is `b`, so it is `null`-typed when `b` is (D3355).
   if e is BinExpr {
