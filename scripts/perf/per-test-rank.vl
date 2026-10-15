@@ -1,0 +1,260 @@
+// Rank a `deno test` log by per-test and per-file duration.
+//
+//     vl run scripts/perf/per-test-rank.vl -- <deno.log> [top=25]
+//
+// Deno prints one line per test ending `... ok (123ms)`; under `--parallel` the line is
+// prefixed `./tests/x_test.ts => `. Both forms are parsed. The per-file column is the SUM of
+// its tests' durations, so it excludes the worker's own startup and seed load, which
+// `scripts/perf/per-file-time.sh` measures separately.
+
+import { IoError, readFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { padLeft, parseF64, parseI32, toString } from "std:fmt"
+import { endsWith, startsWith } from "std:str"
+import {
+  cpPrefix,
+  die,
+  findFrom,
+  isDigit,
+  pyFixed,
+  rstripWs,
+  stripWs,
+  univNl,
+  wsLen,
+} from "../lib/common"
+import { rankDesc } from "../lib/profile"
+
+const USAGE = "usage: vl run scripts/perf/per-test-rank.vl -- <deno.log> [top]"
+
+type Test = { ms: f64, file: string, name: string }
+
+// `line` without its `ESC [ <digits and ;> m` colour codes.
+function stripAnsi(line: string): string {
+  let out = ""
+  let from = 0
+  let i = 0
+  while i < line.length {
+    if line[i] == 27 && i + 1 < line.length && line[i + 1] == 91 {
+      let j = i + 2
+      while j < line.length && (isDigit(line[j]) || line[j] == 59) { j = j + 1 }
+      if j < line.length && line[j] == 109 {
+        out = out + line.slice(from, i)
+        i = j + 1
+        from = i
+        continue
+      }
+    }
+    i = i + 1
+  }
+  out + line.slice(from, line.length)
+}
+
+// Whether `s` is `\d+(\.\d+)?`.
+function isDecimal(s: string): boolean {
+  let i = 0
+  while i < s.length && isDigit(s[i]) { i = i + 1 }
+  if i == 0 { return false }
+  if i == s.length { return true }
+  if s[i] != 46 { return false }
+  const frac = i + 1
+  i = frac
+  while i < s.length && isDigit(s[i]) { i = i + 1 }
+  i > frac && i == s.length
+}
+
+// The duration a line ends with, `(<n><unit>)` before trailing whitespace, in ms; -1 if none.
+function durationMs(line: string): f64 {
+  const t = rstripWs(line)
+  if t.length == 0 || t[t.length - 1] != 41 { return -1.0 }
+  let lp = t.length - 2
+  while lp >= 0 && t[lp] != 40 { lp = lp - 1 }
+  if lp < 0 { return -1.0 }
+  const inner = t.slice(lp + 1, t.length - 1)
+  let unit = ""
+  let mult = 0.0
+  if inner.endsWith("µs") {
+    unit = "µs"
+    mult = 1e-3
+  } else if inner.endsWith("ms") {
+    unit = "ms"
+    mult = 1.0
+  } else if inner.endsWith("s") {
+    unit = "s"
+    mult = 1e3
+  } else if inner.endsWith("m") {
+    unit = "m"
+    mult = 6e4
+  } else {
+    return -1.0
+  }
+  const num = inner.slice(0, inner.length - unit.length)
+  if !isDecimal(num) { return -1.0 }
+  (parseF64(num) ?? 0.0) * mult
+}
+
+// The file a `running N test(s) from ./tests/…` line names, or "".
+function serialFile(line: string): string {
+  if !line.startsWith("running ") { return "" }
+  let i = 8
+  const d0 = i
+  while i < line.length && isDigit(line[i]) { i = i + 1 }
+  if i == d0 { return "" }
+  if line.slice(i, i + 5) != " test" { return "" }
+  i = i + 5
+  if i < line.length && line[i] == 115 { i = i + 1 }
+  if line.slice(i, i + 14) != " from ./tests/" { return "" }
+  nonSpaceRun(line, i + 8, 7)
+}
+
+// The run of non-whitespace starting at `at`, if it is at least `min` bytes long, else "".
+function nonSpaceRun(line: string, at: i32, min: i32): string {
+  let j = at
+  while j < line.length && wsLen(line, j) == 0 { j = j + 1 }
+  if j - at < min { return "" }
+  line.slice(at, j)
+}
+
+function main(argv: string[]): i32 {
+  if argv.length < 1 {
+    print(USAGE)
+    return 2
+  }
+  let top = 25
+  if argv.length > 1 {
+    const t = parseI32(argv[1])
+    if t == null { die("per-test-rank: top is not an integer: " + argv[1], 2) }
+    top = t ?? 25
+  }
+  const bytes = readFile(argv[0])
+  if bytes is IoError {
+    die("per-test-rank: cannot read \{argv[0]} (\{bytes.msg})", 2)
+    return 2
+  }
+  const text = univNl(decodeUtf8Lossy(bytes))
+
+  const fileIx: Map<string, i32> = Map()
+  const files: string[] = []
+  const fileMs: f64[] = []
+  const fileN: i32[] = []
+  const tests: Test[] = []
+  let cur = "?"
+  let start = 0
+  while start < text.length {
+    let end = findFrom(text, "\n", start)
+    if end < 0 { end = text.length }
+    const line = stripAnsi(text.slice(start, end))
+    start = end + 1
+    const ser = serialFile(line)
+    if ser != "" {
+      cur = ser
+      continue
+    }
+    const ms = durationMs(line)
+    const dots = findFrom(line, " ... ", 0)
+    if ms < 0.0 || dots < 0 { continue }
+    let f = cur
+    let name = line.slice(0, dots)
+    if line.startsWith("./tests/") {
+      const sp = findFrom(line, " ", 0)
+      const pf = nonSpaceRun(line, 2, 7)
+      if pf != "" && sp == 2 + pf.length && line.slice(sp, sp + 4) == " => " {
+        const nd = findFrom(line, " ... ", sp + 4)
+        if nd >= 0 {
+          f = pf
+          name = line.slice(sp + 4, nd)
+        }
+      }
+    }
+    const at = fileIx[f]
+    if at != null {
+      fileMs[at] = fileMs[at] + ms
+      fileN[at] = fileN[at] + 1
+    } else {
+      fileIx[f] = files.length
+      files.push(f)
+      fileMs.push(ms)
+      fileN.push(1)
+    }
+    tests.push({ ms: ms, file: f, name: stripWs(name) })
+  }
+
+  let tot = 0.0
+  for m in fileMs { tot = tot + m }
+  print(
+    "\{toString(tests.length)} tests in \{toString(files.length)} files, summed test time \{pyFixed(tot / 1000.0, 1)}s",
+  )
+  print("\n     sec     n      %  file")
+  const byFile: i32[] = []
+  let i = 0
+  while i < files.length {
+    byFile.push(i)
+    i = i + 1
+  }
+  const ranked = rankDesc(byFile, fileMs)
+  let k = 0
+  while k < ranked.length && k < top {
+    const r = ranked[k]
+    const sec = padLeft(pyFixed(fileMs[r] / 1000.0, 2), 8, " ")
+    const n = padLeft(toString(fileN[r]), 5, " ")
+    const pct = padLeft(pyFixed(100.0 * fileMs[r] / tot, 1), 5, " ")
+    print("\{sec} \{n} \{pct}%  \{files[r]}")
+    k = k + 1
+  }
+  print("\n     sec  file :: test")
+  const order = sortTests(tests)
+  k = 0
+  while k < order.length && k < top {
+    const t = order[k]
+    const slash = lastSlash(t.file)
+    const base = t.file.slice(slash + 1, t.file.length)
+    print(
+      "\{padLeft(pyFixed(t.ms / 1000.0, 2), 8, " ")}  \{base} :: \{cpPrefix(t.name, 90)}",
+    )
+    k = k + 1
+  }
+  0
+}
+
+function lastSlash(s: string): i32 {
+  let i = s.length - 1
+  while i >= 0 && s[i] != 47 { i = i - 1 }
+  i
+}
+
+// Python's `a > b` over `(ms, file, name)` tuples; strings compare in byte order, which for
+// UTF-8 is code-point order.
+function after(a: Test, b: Test): boolean {
+  if a.ms != b.ms { return a.ms > b.ms }
+  if a.file != b.file { return a.file > b.file }
+  a.name > b.name
+}
+
+// `sorted(tests, reverse=True)`: descending, and stable, so equal tuples keep their order.
+function sortTests(xs: Test[]): Test[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = sortTests(xs.slice(0, mid))
+  const b = sortTests(xs.slice(mid, xs.length))
+  const out: Test[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !after(b[j], a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("per-test-rank: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

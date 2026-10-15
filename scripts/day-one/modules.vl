@@ -1,0 +1,1207 @@
+// The `modules_split` axis: one program spelled as one file and as two modules. A unit
+// is a declaration or a module-scope statement group with its dependencies named; the
+// `split` face moves a dependency-closed random subset into `mod.vl` and imports what
+// the entry still uses. Both faces print the same lines. docs/internals/day-one-sampler.md.
+//
+//     import { makePair, splitFiles } from "./modules"
+
+import { toString } from "std:fmt"
+import { join, replaceAll, startsWith } from "std:str"
+import { JsonMap, rstripWs, splitLines } from "../lib/common"
+import { sortStrings } from "../lib/corpus"
+import { excluded } from "./grammar"
+import { Rng, below, randint, random, weighted } from "./rng"
+import { faceMap, jfaces, jstrs, newPair, obj, side, str, strs } from "./pairs"
+
+const NAME_SLOT = "@N@"
+const NAME_POOL = ["n", "v", "s", "k"]
+const HOT_NAME = "n"
+const COLLIDE_P = 0.55
+
+// `probe` is a print the entry makes about the unit's state; `probeWant` is its line,
+// or `@tally` / `@table` / `@tag` for one that depends on which units were drawn.
+// `writes` names the units whose global this one assigns: a writer moves with them.
+export type Unit = {
+  id: string,
+  weight: i32,
+  lines: string[],
+  exports: string[],
+  deps: string[],
+  head: string[],
+  probe: string,
+  probeWant: string,
+  names: i32,
+  features: string[],
+  writes: string[],
+}
+
+export type Report = {
+  id: string,
+  weight: i32,
+  needs: string[],
+  lines: string[],
+  want: string[],
+  features: string[],
+}
+
+// Which units, which name each slot took, which units moved to `mod.vl`.
+export type ModSpec = {
+  units: string[],
+  report: string,
+  names: Map<string, string>,
+  moved: string[],
+}
+
+function un(
+  id: string,
+  weight: i32,
+  lines: string[],
+  exports: string[],
+  deps: string[],
+): Unit {
+  {
+    id: id,
+    weight: weight,
+    lines: lines,
+    exports: exports,
+    deps: deps,
+    head: [],
+    probe: "",
+    probeWant: "",
+    names: 0,
+    features: [],
+    writes: [],
+  }
+}
+
+function feat(u: Unit, features: string[]): Unit {
+  u.features = features
+  u
+}
+
+function probed(u: Unit, probe: string, want: string): Unit {
+  u.probe = probe
+  u.probeWant = want
+  u
+}
+
+function stmt(u: Unit, writes: string[]): Unit {
+  u.names = 1
+  u.writes = writes
+  u
+}
+
+function headed(u: Unit, head: string): Unit {
+  u.head = [head]
+  u
+}
+
+// In dependency order: a unit's deps precede it.
+export const UNITS: Unit[] = [
+  feat(
+    un(
+      "ty_cell",
+      5,
+      ["type Cell = { base: i32 }"],
+      ["Cell"],
+      [],
+    ),
+    ["struct", "exported_type"],
+  ),
+  feat(
+    un(
+      "ty_bad",
+      3,
+      ["type Bad = { msg: string }"],
+      ["Bad"],
+      [],
+    ),
+    ["struct", "exported_type"],
+  ),
+  feat(
+    un(
+      "fn_mk",
+      5,
+      [
+        "function mk(n: i32): Cell { return { base: n } }",
+      ],
+      ["mk"],
+      ["ty_cell"],
+    ),
+    ["struct"],
+  ),
+  feat(
+    un(
+      "fn_ld",
+      4,
+      [
+        "function ld(self: Cell): i32 { return self.base }",
+      ],
+      ["ld"],
+      ["ty_cell"],
+    ),
+    ["ufcs"],
+  ),
+  feat(
+    un(
+      "fn_ann",
+      3,
+      [
+        "function asum(b: Cell): i32 { return b.base + b.base }",
+      ],
+      ["asum"],
+      ["ty_cell"],
+    ),
+    ["annotated_param"],
+  ),
+  feat(
+    un(
+      "fn_pick",
+      4,
+      [
+        "function pick(k: i32): Cell | Bad {",
+        "  if k < 0 { return { msg: \"neg\" } }", "  return { base: k + 7 }",
+        "}",
+      ],
+      ["pick"],
+      ["ty_cell", "ty_bad"],
+    ),
+    ["union"],
+  ),
+  feat(
+    un(
+      "fn_hole_ufcs",
+      5,
+      ["function hsum(b) { return b.ld() + b.ld() }"],
+      ["hsum"],
+      ["fn_ld"],
+    ),
+    ["hole_param", "ufcs"],
+  ),
+  feat(
+    un(
+      "fn_hole_field",
+      4,
+      ["function hbase(b) { return b.base }"],
+      ["hbase"],
+      [],
+    ),
+    ["hole_param"],
+  ),
+  feat(
+    un(
+      "fn_hole_id",
+      3,
+      ["function idOf(x) { return x }"],
+      ["idOf"],
+      [],
+    ),
+    ["hole_param"],
+  ),
+  feat(
+    un(
+      "fn_generic",
+      3,
+      ["function passv<T>(x: T): T { return x }"],
+      ["passv"],
+      [],
+    ),
+    ["generic"],
+  ),
+  feat(
+    un(
+      "ty_vec",
+      4,
+      ["type Vec = new { x: i32 }"],
+      ["Vec"],
+      [],
+    ),
+    ["struct", "exported_type", "operator_recv"],
+  ),
+  feat(
+    un(
+      "fn_mkvec",
+      4,
+      ["function mkvec(a: i32): Vec { return { x: a } }"],
+      ["mkvec"],
+      ["ty_vec"],
+    ),
+    ["struct"],
+  ),
+  feat(
+    un(
+      "op_vadd",
+      4,
+      [
+        "function \"+\"(self: Vec, other: Vec): Vec {",
+        "  const r: Vec = { x: self.x + other.x }", "  return r", "}",
+      ],
+      [],
+      ["ty_vec"],
+    ),
+    ["operator", "op_add"],
+  ),
+  feat(
+    un(
+      "op_vmul",
+      3,
+      [
+        "function \"*\"(self: Vec, k: i32): Vec {",
+        "  const r: Vec = { x: self.x * k }", "  return r", "}",
+      ],
+      [],
+      ["ty_vec"],
+    ),
+    ["operator", "op_mul"],
+  ),
+  probed(
+    feat(
+      un(
+        "g_table",
+        4,
+        ["const Tbl = __array_new__(4, 0)"],
+        ["Tbl"],
+        [],
+      ),
+      ["table"],
+    ),
+    "print(Tbl[3])",
+    "@table",
+  ),
+  probed(
+    feat(
+      un("g_tally", 4, ["let tally = 0"], ["tally"], []),
+      ["global_let"],
+    ),
+    "print(tally)",
+    "@tally",
+  ),
+  probed(
+    feat(
+      un("g_tag", 3, ["let tag = \"\""], ["tag"], []),
+      ["global_let", "string"],
+    ),
+    "print(tag.length)",
+    "@tag",
+  ),
+  probed(
+    feat(
+      un("g_base", 2, ["const BASE = 5"], ["BASE"], []),
+      ["global_const"],
+    ),
+    "print(BASE)",
+    "5",
+  ),
+  stmt(
+    feat(
+      un(
+        "st_loop_let",
+        5,
+        [
+          "for @N@ in 0 to 3 {", "  let acc = @N@", "  acc = acc + 1",
+          "  Tbl[@N@] = acc", "}",
+        ],
+        [],
+        ["g_table"],
+      ),
+      ["module_loop", "loop_let"],
+    ),
+    ["g_table"],
+  ),
+  stmt(
+    feat(
+      un(
+        "st_loop_tally",
+        3,
+        ["for @N@ in 0 to 2 { tally = tally + @N@ }"],
+        [],
+        ["g_tally"],
+      ),
+      ["module_loop"],
+    ),
+    ["g_tally"],
+  ),
+  stmt(
+    feat(
+      un(
+        "st_forin",
+        3,
+        ["for @N@ in [1, 2] { tally = tally + @N@ }"],
+        [],
+        ["g_tally"],
+      ),
+      ["module_loop", "forin"],
+    ),
+    ["g_tally"],
+  ),
+  stmt(
+    feat(
+      un(
+        "st_block_struct",
+        5,
+        [
+          "if true {", "  const @N@ = mk(3)", "  tally = tally + @N@.base", "}",
+        ],
+        [],
+        ["g_tally", "fn_mk"],
+      ),
+      ["module_block", "struct"],
+    ),
+    ["g_tally"],
+  ),
+  stmt(
+    feat(
+      un(
+        "st_block_str",
+        4,
+        [
+          "if true {", "  const @N@ = \"hi\"", "  tag = @N@ + \"!\"", "}",
+        ],
+        [],
+        ["g_tag"],
+      ),
+      ["module_block", "string_frame"],
+    ),
+    ["g_tag"],
+  ),
+  stmt(
+    feat(
+      un(
+        "st_while_block",
+        3,
+        [
+          "let step = 0", "while step < 1 {", "  const @N@ = mk(2)",
+          "  tally = tally + @N@.base", "  step = step + 1", "}",
+        ],
+        [],
+        ["g_tally", "fn_mk"],
+      ),
+      ["module_while", "struct"],
+    ),
+    ["g_tally"],
+  ),
+  probed(
+    feat(
+      un(
+        "st_push",
+        3,
+        ["const bag = [1]", "bag.push(2)"],
+        ["bag"],
+        [],
+      ),
+      ["push_frame"],
+    ),
+    "print(bag.length)",
+    "2",
+  ),
+  probed(
+    feat(
+      un(
+        "st_map",
+        3,
+        [
+          "const lut: {[string]: i32} = Map()", "lut[\"k\"] = 4",
+        ],
+        ["lut"],
+        [],
+      ),
+      ["map_frame"],
+    ),
+    "print(lut[\"k\"] ?? 0)",
+    "4",
+  ),
+  probed(
+    feat(
+      un(
+        "st_concat",
+        3,
+        ["const pad = \"a\" + \"b\""],
+        ["pad"],
+        [],
+      ),
+      ["string_frame"],
+    ),
+    "print(pad)",
+    "ab",
+  ),
+  headed(
+    probed(
+      feat(
+        un(
+          "std_str",
+          3,
+          ["const padded = trim(\"  ok  \")"],
+          ["padded"],
+          [],
+        ),
+        ["std", "std_str"],
+      ),
+      "print(padded)",
+      "ok",
+    ),
+    "import { trim } from \"std:str\"",
+  ),
+  headed(
+    probed(
+      feat(
+        un(
+          "std_array",
+          3,
+          ["const hasTwo = includes([1, 2], 2)"],
+          ["hasTwo"],
+          [],
+        ),
+        ["std", "std_array"],
+      ),
+      "print(hasTwo)",
+      "true",
+    ),
+    "import { includes } from \"std:array\"",
+  ),
+  headed(
+    probed(
+      feat(
+        un(
+          "std_buffer",
+          3,
+          [
+            "const buf = Buffer(4)", "store8(buf, 0, 65)",
+            "const byteAt = loadU8(buf, 0)",
+          ],
+          ["buf", "byteAt"],
+          [],
+        ),
+        ["std", "std_buffer"],
+      ),
+      "print(byteAt)",
+      "65",
+    ),
+    "import { Buffer, store8, loadU8 } from \"std:buffer\"",
+  ),
+]
+
+// The report is the last thing in the entry and never moves; its `@N@` is the second
+// half of every collision this axis aims at.
+export const REPORTS: Report[] = [
+  {
+    id: "rep_block_union",
+    weight: 5,
+    needs: ["fn_pick"],
+    lines: [
+      "if true {", "  const @N@ = pick(1)",
+      "  if @N@ is Bad { print(0 - 1) } else { print(@N@.base) }", "}",
+    ],
+    want: ["8"],
+    features: ["module_block", "union", "narrow_is"],
+  },
+  {
+    id: "rep_block_hole",
+    weight: 5,
+    needs: ["fn_hole_ufcs", "fn_mk"],
+    lines: [
+      "if true {", "  const @N@ = mk(4)", "  print(hsum(@N@))", "}",
+    ],
+    want: ["8"],
+    features: ["module_block", "hole_param", "argument"],
+  },
+  {
+    id: "rep_block_holefield",
+    weight: 4,
+    needs: ["fn_hole_field", "fn_mk"],
+    lines: [
+      "if true {", "  const @N@ = mk(6)", "  print(hbase(@N@))", "}",
+    ],
+    want: ["6"],
+    features: ["module_block", "hole_param", "argument"],
+  },
+  {
+    id: "rep_block_str",
+    weight: 4,
+    needs: [],
+    lines: [
+      "if true {", "  const @N@ = \"hi\"", "  print(@N@ + \"!\")", "}",
+    ],
+    want: ["hi!"],
+    features: ["module_block", "string_frame"],
+  },
+  {
+    id: "rep_while_hole",
+    weight: 4,
+    needs: ["fn_hole_ufcs", "fn_mk"],
+    lines: [
+      "let step2 = 0", "while step2 < 1 {", "  const @N@ = mk(4)",
+      "  print(hsum(@N@))", "  step2 = step2 + 1", "}",
+    ],
+    want: ["8"],
+    features: ["module_while", "hole_param", "argument"],
+  },
+  {
+    id: "rep_fn_ann",
+    weight: 3,
+    needs: ["fn_ann", "fn_mk"],
+    lines: [
+      "function report() {", "  const @N@ = mk(4)", "  print(asum(@N@))", "}",
+      "report()",
+    ],
+    want: ["8"],
+    features: ["function", "annotated_param"],
+  },
+  {
+    id: "rep_global_ann",
+    weight: 4,
+    needs: ["ty_cell", "fn_mk"],
+    lines: ["const @N@: Cell = mk(9)", "print(@N@.base)"],
+    want: ["9"],
+    features: ["global_init", "annotated", "exported_type"],
+  },
+  {
+    id: "rep_global_infer",
+    weight: 4,
+    needs: ["fn_mk"],
+    lines: ["const @N@ = mk(9)", "print(@N@.base)"],
+    want: ["9"],
+    features: ["global_init", "inferred", "struct"],
+  },
+  {
+    id: "rep_generic_pin",
+    weight: 3,
+    needs: ["fn_generic", "fn_mk"],
+    lines: [
+      "if true {", "  const @N@ = passv(mk(7))", "  print(@N@.base)", "}",
+    ],
+    want: ["7"],
+    features: ["module_block", "generic"],
+  },
+  {
+    id: "rep_shadow",
+    weight: 4,
+    needs: ["fn_mk"],
+    lines: [
+      "const shdw = mk(9)", "if true {", "  const shdw = \"hi\"",
+      "  print(shdw + \"!\")", "}", "print(shdw.base)",
+    ],
+    want: ["hi!", "9"],
+    features: ["module_block", "shadow", "string_frame"],
+  },
+  {
+    id: "rep_op_add",
+    weight: 5,
+    needs: ["op_vadd", "fn_mkvec", "ty_vec"],
+    lines: [
+      "const @N@ = mkvec(3)", "const vrhs = mkvec(4)", "print((@N@ + vrhs).x)",
+    ],
+    want: ["7"],
+    features: ["operator", "op_add"],
+  },
+  {
+    id: "rep_op_mul",
+    weight: 4,
+    needs: ["op_vmul", "fn_mkvec", "ty_vec"],
+    lines: ["const @N@ = mkvec(3)", "print((@N@ * 4).x)"],
+    want: ["12"],
+    features: ["operator", "op_mul"],
+  },
+  {
+    id: "rep_op_hole",
+    weight: 4,
+    needs: ["op_vadd", "fn_mkvec", "ty_vec"],
+    lines: [
+      "function useAdd(p) { return (p + mkvec(4)).x }", "const @N@ = mkvec(3)",
+      "print(useAdd(@N@))",
+    ],
+    want: ["7"],
+    features: ["operator", "op_add", "hole_param"],
+  },
+]
+
+export function unitOf(id: string): Unit {
+  for u in UNITS {
+    if u.id == id { return u }
+  }
+  UNITS[0]
+}
+
+function reportOf(id: string): Report {
+  for r in REPORTS {
+    if r.id == id { return r }
+  }
+  REPORTS[0]
+}
+
+function has(xs: string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+// ── draw ──────────────────────────────────────────────────────────────────────────
+
+// `ids` plus every dependency, transitively.
+function closure(ids: string[], into: Map<string, boolean>) {
+  const todo: string[] = []
+  for i in ids { todo.push(i) }
+  let at = 0
+  while at < todo.length {
+    const i = todo[at]
+    at = at + 1
+    if into[i] ?? false { continue }
+    into[i] = true
+    for d in unitOf(i).deps { todo.push(d) }
+  }
+}
+
+function names(r: Rng, order: Unit[]): Map<string, string> {
+  const slots: string[] = []
+  for u in order {
+    if u.names > 0 { slots.push(u.id) }
+  }
+  slots.push("__report__")
+  const out: Map<string, string> = Map()
+  if random(r) < COLLIDE_P {
+    for s in slots { out[s] = HOT_NAME }
+    return out
+  }
+  for s in slots { out[s] = NAME_POOL[below(r, NAME_POOL.length)] }
+  out
+}
+
+function draw(r: Rng): ModSpec | null {
+  const reps: Report[] = []
+  const rw: i32[] = []
+  for x in REPORTS {
+    if !excluded(x.id) {
+      reps.push(x)
+      rw.push(x.weight)
+    }
+  }
+  if reps.length == 0 { return null }
+  const report = reps[weighted(r, rw)]
+  const chosen: Map<string, boolean> = Map()
+  closure(report.needs, chosen)
+  const units: Unit[] = []
+  const uw: i32[] = []
+  for u in UNITS {
+    if !excluded(u.id) {
+      units.push(u)
+      uw.push(u.weight)
+    }
+  }
+  const times = randint(r, 1, 4)
+  let t = 0
+  while t < times {
+    if units.length > 0 { closure([units[weighted(r, uw)].id], chosen) }
+    t = t + 1
+  }
+  for k, _v in chosen {
+    if excluded(k) { return null }
+  }
+  const order: Unit[] = []
+  for u in UNITS {
+    if chosen[u.id] ?? false { order.push(u) }
+  }
+  const nm = names(r, order)
+  const p = [0.35, 0.5, 0.65][below(r, 3)]
+  let tries = 0
+  while tries < 24 {
+    tries = tries + 1
+    const moved: Map<string, boolean> = Map()
+    let ok = true
+    for u in order {
+      let depsOk = true
+      for d in u.deps {
+        if !(moved[d] ?? false) { depsOk = false }
+      }
+      if u.writes.length > 0 {
+        let all = true
+        for w in u.writes {
+          if !(moved[w] ?? false) { all = false }
+        }
+        if !all { continue }
+        if !depsOk {
+          ok = false
+          break
+        }
+        moved[u.id] = true
+      } else if depsOk && random(r) < p {
+        moved[u.id] = true
+      }
+    }
+    const mv: string[] = []
+    for k, _v in moved { mv.push(k) }
+    if ok && mv.length > 0 && importsOf(order, moved, nm, report).length > 0 {
+      const ids: string[] = []
+      for u in order { ids.push(u.id) }
+      return {
+        units: ids,
+        report: report.id,
+        names: nm,
+        moved: sortStrings(mv),
+      }
+    }
+  }
+  null
+}
+
+// ── render ────────────────────────────────────────────────────────────────────────
+
+function sub(lines: string[], name: string): string[] {
+  const out: string[] = []
+  for l in lines { out.push(replaceAll(l, NAME_SLOT, name)) }
+  out
+}
+
+function isWord(b: i32): boolean {
+  (b >= 48 && b <= 57)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+    || b >= 0x80
+}
+
+// The name `^(type|function|const|let) (\w+)` declares, or "".
+function declName(l: string): string {
+  for kw in ["type ", "function ", "const ", "let "] {
+    if startsWith(l, kw) {
+      let e = kw.length
+      while e < l.length && isWord(l[e]) { e = e + 1 }
+      return l.slice(kw.length, e)
+    }
+  }
+  ""
+}
+
+function unitLines(u: Unit, nm: Map<string, string>, exp: boolean): string[] {
+  const out: string[] = []
+  for l in sub(u.lines, nm[u.id] ?? HOT_NAME) {
+    const d = declName(l)
+    if exp && d != "" && has(u.exports, d) {
+      out.push("export " + l)
+    } else {
+      out.push(l)
+    }
+  }
+  out
+}
+
+function tallyWant(ids: Map<string, boolean>): string {
+  let t = 0
+  if ids["st_loop_tally"] ?? false { t = t + 3 }
+  if ids["st_forin"] ?? false { t = t + 3 }
+  if ids["st_block_struct"] ?? false { t = t + 3 }
+  if ids["st_while_block"] ?? false { t = t + 2 }
+  toString(t)
+}
+
+function probeWant(u: Unit, ids: Map<string, boolean>): string {
+  if u.probeWant == "@tally" { return tallyWant(ids) }
+  if u.probeWant == "@table" {
+    return if ids["st_loop_let"] ?? false { "4" } else { "0" }
+  }
+  if u.probeWant == "@tag" {
+    return if ids["st_block_str"] ?? false { "3" } else { "0" }
+  }
+  u.probeWant
+}
+
+type Probes = { lines: string[], want: string[] }
+
+function probes(order: Unit[], ids: Map<string, boolean>): Probes {
+  const out: Probes = { lines: [], want: [] }
+  for u in order {
+    if u.probe == "" { continue }
+    out.lines.push(u.probe)
+    out.want.push(probeWant(u, ids))
+  }
+  out
+}
+
+function idSet(order: Unit[]): Map<string, boolean> {
+  const ids: Map<string, boolean> = Map()
+  for u in order { ids[u.id] = true }
+  ids
+}
+
+// Whether `name` occurs in `text` as a whole word (`\bname\b`).
+function wordIn(text: string, name: string): boolean {
+  let at = 0
+  while at + name.length <= text.length {
+    if text.slice(at, at + name.length) == name {
+      const before = at == 0 || !isWord(text[at - 1])
+      const after = at + name.length >= text.length
+        || !isWord(text[at + name.length])
+      if before && after { return true }
+    }
+    at = at + 1
+  }
+  false
+}
+
+// The names the entry still uses that now live in the module, read off the entry's text.
+function importsOf(
+  order: Unit[],
+  moved: Map<string, boolean>,
+  nm: Map<string, string>,
+  report: Report,
+): string[] {
+  const body: string[] = []
+  for u in order {
+    if !(moved[u.id] ?? false) {
+      for l in unitLines(u, nm, false) { body.push(l) }
+    }
+  }
+  for l in probes(order, idSet(order)).lines { body.push(l) }
+  for l in sub(report.lines, nm["__report__"] ?? HOT_NAME) { body.push(l) }
+  const text = join(body, "\n")
+  const out: string[] = []
+  for u in order {
+    if moved[u.id] ?? false {
+      for n in u.exports {
+        if wordIn(text, n) { out.push(n) }
+      }
+    }
+  }
+  out
+}
+
+function orderOf(sp: ModSpec): Unit[] {
+  const out: Unit[] = []
+  for i in sp.units { out.push(unitOf(i)) }
+  out
+}
+
+function setOf(xs: string[]): Map<string, boolean> {
+  const m: Map<string, boolean> = Map()
+  for x in xs { m[x] = true }
+  m
+}
+
+// Whether the spec can be split: a module nothing imports from is a different program.
+export function renderable(sp: ModSpec): boolean {
+  sp.moved.length > 0
+    && importsOf(orderOf(sp), setOf(sp.moved), sp.names, reportOf(sp.report)).length
+    > 0
+}
+
+export type Rendered = { src: string, want: string[] }
+
+// One face; `split` carries `// file:` markers and its last section is the entry.
+export function renderModules(sp: ModSpec, face: string): Rendered {
+  const order = orderOf(sp)
+  const ids = setOf(sp.units)
+  const moved = setOf(sp.moved)
+  const report = reportOf(sp.report)
+  const pr = probes(order, ids)
+  const tail: string[] = []
+  for l in pr.lines { tail.push(l) }
+  for l in sub(report.lines, sp.names["__report__"] ?? HOT_NAME) {
+    tail.push(l)
+  }
+  const want: string[] = []
+  for w in pr.want { want.push(w) }
+  for w in report.want { want.push(w) }
+  const src: string[] = []
+  if face == "single" {
+    for u in order {
+      for h in u.head { src.push(h) }
+    }
+    for u in order {
+      for l in unitLines(u, sp.names, false) { src.push(l) }
+    }
+    for l in tail { src.push(l) }
+    return { src: join(src, "\n") + "\n", want: want }
+  }
+  const mhead: string[] = []
+  const mbody: string[] = []
+  const ehead: string[] = []
+  const ebody: string[] = []
+  for u in order {
+    const isMoved = moved[u.id] ?? false
+    for h in u.head {
+      if isMoved { mhead.push(h) } else { ehead.push(h) }
+    }
+    for l in unitLines(u, sp.names, isMoved) {
+      if isMoved { mbody.push(l) } else { ebody.push(l) }
+    }
+  }
+  ehead.push(
+    "import { "
+      + join(importsOf(order, moved, sp.names, report), ", ")
+      + " } from \"./mod\"",
+  )
+  src.push("// file: mod.vl")
+  for l in mhead { src.push(l) }
+  for l in mbody { src.push(l) }
+  src.push("// file: entry.vl")
+  for l in ehead { src.push(l) }
+  for l in ebody { src.push(l) }
+  for l in tail { src.push(l) }
+  { src: join(src, "\n") + "\n", want: want }
+}
+
+export type SrcFile = { name: string, src: string }
+
+function isSpace(b: i32): boolean {
+  b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31)
+}
+
+// The file a `// file: <name>.vl` marker line names, or "".
+export function fileMark(l: string): string {
+  if !startsWith(l, "// file: ") { return "" }
+  const name = rstripWs(l.slice(9, l.length))
+  if name.length < 4 || name.slice(name.length - 3, name.length) != ".vl" {
+    return ""
+  }
+  let i = 0
+  while i < name.length {
+    if isSpace(name[i]) { return "" }
+    i = i + 1
+  }
+  name
+}
+
+// (name, source) per `// file:` section; an unmarked source is one file, `w.vl`.
+export function splitFiles(src: string): SrcFile[] {
+  const files: SrcFile[] = []
+  let name = ""
+  let started = false
+  let body: string[] = []
+  for ln in splitLines(src) {
+    const m = fileMark(ln)
+    if m != "" {
+      if started {
+        files.push({ name: name, src: rstripWs(join(body, "\n")) + "\n" })
+      }
+      name = m
+      started = true
+      body = []
+    } else {
+      body.push(ln)
+    }
+  }
+  if !started { return [{ name: "w.vl", src: src }] }
+  files.push({ name: name, src: rstripWs(join(body, "\n")) + "\n" })
+  files
+}
+
+// ── pair ──────────────────────────────────────────────────────────────────────────
+
+export function specJson(sp: ModSpec): JsonMap {
+  const m: JsonMap = Map()
+  m["units"] = jstrs(sp.units)
+  m["report"] = sp.report
+  m["names"] = jfaces(sp.names)
+  m["moved"] = jstrs(sp.moved)
+  m
+}
+
+export function specOf(m: JsonMap): ModSpec {
+  {
+    units: strs(m, "units"),
+    report: str(m, "report"),
+    names: faceMap(obj(m, "names")),
+    moved: strs(m, "moved"),
+  }
+}
+
+function distinctNames(nm: Map<string, string>): i32 {
+  const seen: Map<string, boolean> = Map()
+  for _k, v in nm { seen[v] = true }
+  let n = 0
+  for _k, _v in seen { n = n + 1 }
+  n
+}
+
+function count(nm: Map<string, string>): i32 {
+  let n = 0
+  for _k, _v in nm { n = n + 1 }
+  n
+}
+
+function delta(sp: ModSpec): JsonMap {
+  const held: JsonMap = Map()
+  held["units"] = jstrs(sp.units)
+  held["moved"] = jstrs(sp.moved)
+  held["names"] = jfaces(sp.names)
+  held["report"] = sp.report
+  const m: JsonMap = Map()
+  m["axis"] = "modules_split"
+  m["faceA"] = "single"
+  m["faceB"] = "split"
+  m["value"] = sp.report
+  m["read"] = sp.report
+  m["position"] = "module"
+  m["scope"] = "module"
+  m["held"] = held
+  m["diff"] = jstrs(["moved: " + join(sp.moved, ", ")])
+  m
+}
+
+function features(sp: ModSpec): string[] {
+  const f: Map<string, boolean> = Map()
+  for x in reportOf(sp.report).features { f[x] = true }
+  f["modules"] = true
+  for i in sp.units {
+    for x in unitOf(i).features { f[x] = true }
+  }
+  if distinctNames(sp.names) == 1 && count(sp.names) > 1 {
+    f["name_collision"] = true
+  }
+  let stmtMoved = false
+  let opMoved = false
+  let stdMoved = false
+  for i in sp.moved {
+    if unitOf(i).names > 0 { stmtMoved = true }
+    if i == "op_vadd" || i == "op_vmul" { opMoved = true }
+    if i == "std_str" || i == "std_array" || i == "std_buffer" {
+      stdMoved = true
+    }
+  }
+  if stmtMoved { f["moved_statement"] = true }
+  if opMoved { f["operator_moved"] = true }
+  if sp.report == "rep_shadow" && stdMoved { f["shadow_x_std_moved"] = true }
+  const out: string[] = []
+  for k, _v in f { out.push(k) }
+  sortStrings(out)
+}
+
+// One sample: the same program as one file and as two modules.
+export function makePair(r: Rng): JsonMap | null {
+  const sp = draw(r)
+  if sp == null { return null }
+  const a = renderModules(sp, "single")
+  const b = renderModules(sp, "split")
+  if a.src == b.src { return null }
+  const fa: Map<string, string> = Map()
+  fa["modules_split"] = "single"
+  const fb: Map<string, string> = Map()
+  fb["modules_split"] = "split"
+  newPair(
+    "modules_split",
+    specJson(sp),
+    jfaces(fa),
+    jfaces(fb),
+    side(a.src, a.want, "single"),
+    side(b.src, b.want, "split"),
+    features(sp),
+    delta(sp),
+  )
+}
+
+export type Ablation = { label: string, spec: ModSpec }
+
+function copySpec(sp: ModSpec): ModSpec {
+  const nm: Map<string, string> = Map()
+  for k, v in sp.names { nm[k] = v }
+  {
+    units: sp.units.slice(0, sp.units.length),
+    report: sp.report,
+    names: nm,
+    moved: sp.moved.slice(0, sp.moved.length),
+  }
+}
+
+// A moved set is legal when every moved unit's deps moved too and no writer was parted
+// from the global it assigns.
+function validMoved(sp: ModSpec, moved: string[]): boolean {
+  const m = setOf(moved)
+  for i in moved {
+    for d in unitOf(i).deps {
+      if !(m[d] ?? false) { return false }
+    }
+  }
+  for i in sp.units {
+    const u = unitOf(i)
+    if u.writes.length == 0 { continue }
+    let all = true
+    for w in u.writes {
+      if !(m[w] ?? false) { all = false }
+    }
+    if all != (m[i] ?? false) { return false }
+  }
+  true
+}
+
+// One ingredient at a time: drop each unit with its dependents, un-collide the names,
+// and keep each moved unit in the entry in turn.
+export function ablations(sp: ModSpec): Ablation[] {
+  const out: Ablation[] = []
+  const report = reportOf(sp.report)
+  for uid in sp.units {
+    const drop: Map<string, boolean> = Map()
+    drop[uid] = true
+    let n = 1
+    let changed = true
+    while changed {
+      changed = false
+      for other in sp.units {
+        if drop[other] ?? false { continue }
+        for d in unitOf(other).deps {
+          if (drop[d] ?? false) && !(drop[other] ?? false) {
+            drop[other] = true
+            n = n + 1
+            changed = true
+          }
+        }
+      }
+    }
+    let needDropped = false
+    for x in report.needs {
+      if drop[x] ?? false { needDropped = true }
+    }
+    if needDropped || n == sp.units.length { continue }
+    const keep: string[] = []
+    for i in sp.units {
+      if !(drop[i] ?? false) { keep.push(i) }
+    }
+    const keepSet = setOf(keep)
+    const nm: Map<string, string> = Map()
+    for k, v in sp.names {
+      if (keepSet[k] ?? false) || k == "__report__" { nm[k] = v }
+    }
+    const mv: string[] = []
+    for i in sp.moved {
+      if keepSet[i] ?? false { mv.push(i) }
+    }
+    let trial: ModSpec = {
+      units: keep,
+      report: sp.report,
+      names: nm,
+      moved: mv,
+    }
+    if !renderable(trial) {
+      trial = {
+        units: keep,
+        report: sp.report,
+        names: nm,
+        moved: keep.slice(0, keep.length),
+      }
+    }
+    if renderable(trial) { out.push({ label: "drop " + uid, spec: trial }) }
+  }
+  if distinctNames(sp.names) == 1 {
+    const fresh = copySpec(sp)
+    const ks: string[] = []
+    for k, _v in sp.names {
+      if k != "__report__" { ks.push(k) }
+    }
+    let i = 0
+    for k in sortStrings(ks) {
+      fresh.names[k] = NAME_POOL[(i + 1) % NAME_POOL.length]
+      i = i + 1
+    }
+    out.push({ label: "un-collide the names", spec: fresh })
+  }
+  for uid in sp.moved {
+    const rest: string[] = []
+    for i in sp.moved {
+      if i != uid { rest.push(i) }
+    }
+    const trial = copySpec(sp)
+    trial.moved = rest
+    if rest.length > 0 && validMoved(sp, rest) && renderable(trial) {
+      out.push({ label: "keep " + uid + " in the entry", spec: trial })
+    }
+  }
+  out
+}

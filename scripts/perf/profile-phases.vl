@@ -1,0 +1,156 @@
+// Attribute a `VL_PROFILE_GUEST` profile to the module pipeline's PHASES.
+//
+//     scripts/perf/guest-profile.sh /tmp/p build compiler/entry.vl
+//     vl run scripts/perf/profile-phases.vl -- /tmp/p/entry.json
+//
+// `scripts/profile-rank.vl` ranks FUNCTIONS; this ranks the driver's stages. Each sample is
+// walked from the ROOT down and charged to the first frame naming a phase entry point, so a
+// phase's number is inclusive of everything it calls and the phases partition the run. That
+// separates the per-module half of a check (scan, lex, parse, rename) from the merged half
+// (`checkProgram` over every module's statements at once). Profile the command you mean:
+// a `vl check` profile reports the check's own phases, `lintGraph` included.
+
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { die, isDigit, pyFixed } from "../lib/common"
+import { Profile, loadProfile, nodeName } from "../lib/profile"
+
+const USAGE = "usage: vl run scripts/perf/profile-phases.vl -- <profile.json>"
+
+// Root-down, first match wins: the stack decides, not the order here.
+const PHASES: string[] = [
+  "stage: modScan (import/export scan)",
+  "stage: modCommit / modSrcLoad (host fetch)", "1 order+validate (modVisit)",
+  "2 lex per module (vcLoadToksMod)", "2 parse per module (parseProgram)",
+  "2b dup / builtin-decl screens", "3+4 rename + rewrite per module",
+  "4b/4c export alias tables", "5 csPreMintLocs (MERGED)",
+  "5 checkProgram (MERGED)", "5 jwSecondPass (MERGED)",
+  "6 emitProgram (MERGED, build only)", "7 lintGraph (check only)",
+]
+
+// The entry points of `PHASES[i]`, at the same index.
+const ENTRIES: string[][] = [
+  ["modScan"],
+  [
+    "modCommit", "modCommitStr", "modSrcLoad", "modKeyLoad",
+  ],
+  ["modVisit"],
+  ["vcLoadToksMod", "vcLoadToksEntry", "vcLoadToks"],
+  ["parseProgram"],
+  ["modCheckDupBindings", "modCheckReservedDecls"],
+  [
+    "modCollectSelfFns", "modBuildRename", "modBankUfcsScope",
+    "ufcsModBoundAdd", "modRwStmt", "modRwDeclBase",
+  ],
+  ["modMergedTargetOf"],
+  ["csPreMintLocs"],
+  ["checkProgram"],
+  ["jwSecondPass"],
+  ["emitProgram"],
+  ["lintGraph", "lintSrc"],
+]
+
+const UNCLAIMED = "(outside every named phase)"
+const EMIT = 11
+
+// `name` without the `$mN` suffix the module rename gave it, nor the `@file:line` a `--names`
+// seed appends after that.
+function baseName(name: string): string {
+  let i = 0
+  while i + 1 < name.length {
+    if name[i] == 36 && name[i + 1] == 109 {
+      let j = i + 2
+      while j < name.length && isDigit(name[j]) { j = j + 1 }
+      if j > i + 2 && (j == name.length || name[j] == 64) {
+        return name.slice(0, i)
+      }
+    }
+    i = i + 1
+  }
+  name
+}
+
+// The phase index of each stack node, -1 for none: its root-most frame naming an entry point.
+function phases(p: Profile): i32[] {
+  const byName: Map<string, i32> = Map()
+  let k = 0
+  while k < ENTRIES.length {
+    for n in ENTRIES[k] { byName[n] = k }
+    k = k + 1
+  }
+  // -2 is not yet computed.
+  const memo: i32[] = []
+  for _ in p.stFrame { memo.push(-2) }
+  let s = 0
+  while s < memo.length {
+    const chain: i32[] = []
+    let cur = s
+    while cur >= 0 && memo[cur] == -2 {
+      chain.push(cur)
+      cur = p.prefix[cur]
+    }
+    let acc = if cur >= 0 { memo[cur] } else { -1 }
+    let c = chain.length - 1
+    while c >= 0 {
+      const node = chain[c]
+      if acc < 0 { acc = byName[baseName(nodeName(p, node))] ?? -1 }
+      memo[node] = acc
+      c = c - 1
+    }
+    s = s + 1
+  }
+  memo
+}
+
+function main(argv: string[]): i32 {
+  if argv.length < 1 {
+    print(USAGE)
+    return 2
+  }
+  const p = loadProfile(argv[0], "profile-phases")
+  const phaseOf = phases(p)
+  // One slot per phase, then the unclaimed one.
+  const counts: i32[] = []
+  for _ in PHASES { counts.push(0) }
+  counts.push(0)
+  let total = 0
+  for s in p.stacks {
+    if s >= 0 {
+      total = total + 1
+      const ph = phaseOf[s]
+      const at = if ph >= 0 { ph } else { PHASES.length }
+      counts[at] = counts[at] + 1
+    }
+  }
+  if total == 0 {
+    print("no samples")
+    return 1
+  }
+  const check = total - counts[EMIT]
+  print(
+    "samples \{toString(total)}; check side (everything but emitProgram) \{toString(check)}",
+  )
+  print("| phase | samples | % of run | % of the check side |")
+  print("| --- | ---: | ---: | ---: |")
+  let i = 0
+  while i < counts.length {
+    const n = counts[i]
+    if n != 0 {
+      const label = if i < PHASES.length { PHASES[i] } else { UNCLAIMED }
+      const side = if i == EMIT { "—" } else { pyFixed(100.0 * (n as f64) / (check as f64), 1) + "%" }
+      const run = pyFixed(100.0 * (n as f64) / (total as f64), 2)
+      print("| \{label} | \{toString(n)} | \{run}% | \{side} |")
+    }
+    i = i + 1
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("profile-phases: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

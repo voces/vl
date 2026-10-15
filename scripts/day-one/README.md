@@ -8,13 +8,13 @@ programs found one in the first ten (D1473).
 
 This directory generates that population instead of writing it.
 
-    python3 scripts/day-one/sample.py --seed 1 --count 40
-    python3 scripts/day-one/sample.py --seed 1 --count 400 --out run.jsonl
-    python3 scripts/day-one/minimise.py run.jsonl
-    python3 scripts/day-one/file_row.py run.jsonl --index 7 --title "…"
-    python3 scripts/day-one/sample.py --replay run.jsonl     # the regression half
-    python3 scripts/day-one/sample.py --imports-report run.jsonl   # D1514's timing shape
-    python3 scripts/day-one/sample.py --control              # the controls
+    vl run scripts/day-one/sample.vl -- --seed 1 --count 40
+    vl run scripts/day-one/sample.vl -- --seed 1 --count 400 --out run.jsonl
+    vl run scripts/day-one/minimise.vl -- run.jsonl
+    vl run scripts/day-one/file_row.vl -- run.jsonl --index 7 --title "…"
+    vl run scripts/day-one/sample.vl -- --replay run.jsonl     # the regression half
+    vl run scripts/day-one/sample.vl -- --imports-report run.jsonl   # D1514's timing shape
+    vl run scripts/day-one/sample.vl -- --control              # the controls
 
 Full rationale, the axes, what it cannot sample, and the first sample's numbers:
 **`docs/internals/day-one-sampler.md`**.
@@ -22,7 +22,7 @@ Full rationale, the axes, what it cannot sample, and the first sample's numbers:
 ## The unit of generation is a PAIR
 
 Two spellings of ONE program, differing along ONE axis, both printing a value the
-generator computed in Python. The primary verdict is **agree / disagree**, not
+generator computed itself. The primary verdict is **agree / disagree**, not
 runs / refuses, and that is what makes a hit self-validating: the spelling that RUNS
 proves the other one is legal, so nobody has to judge whether the design permits it.
 
@@ -36,13 +36,13 @@ never reached.
 
 | file | what it is |
 | --- | --- |
-| `grammar.py` | the ordinary shapes, as DATA — values, reads, positions, sources, scopes, scenery, axes |
-| `modules.py` | the `modules_split` axis's OWN grammar — one program as one file and as two |
-| `imports.py` | the `imports_pair` axis's OWN grammar — one std import against two in a module |
-| `render.py` | plan + axis faces → one program; `make_pair` is the unit |
-| `sample.py` | draw, grade, tabulate, JSONL, `--replay`, `--control`, `--report`, `--imports-report` |
-| `minimise.py` | greedy line removal to a minimal witness, then ablation BY AXIS |
-| `file_row.py` | a minimal witness → an inventory row draft + a standing capability probe |
+| `grammar.vl` | the ordinary shapes, as DATA — values, reads, positions, sources, scopes, scenery, axes |
+| `modules.vl` | the `modules_split` axis's OWN grammar — one program as one file and as two |
+| `imports.vl` | the `imports_pair` axis's OWN grammar — one std import against two in a module |
+| `render.vl` | plan + axis faces → one program; `makePair` is the unit |
+| `sample.vl` | draw, grade, tabulate, JSONL, `--replay`, `--control`, `--report`, `--imports-report` |
+| `minimise.vl` | greedy line removal to a minimal witness, then ablation BY AXIS |
+| `file_row.vl` | a minimal witness → an inventory row draft + a standing capability probe |
 
 Grading is `scripts/capability-probes.vl`'s, run through its `--grade-channel` mode, so a day-one
 cell and a hand-written probe are read on one scale.
@@ -67,12 +67,12 @@ agree side; liveness belongs on something nobody can fix.
 
 ## A GENERATOR AXIS BRINGS ITS OWN GRAMMAR
 
-Most axes flip one face on a plan drawn from `grammar.py`'s tables. `modules_split` cannot:
+Most axes flip one face on a plan drawn from `grammar.vl`'s tables. `modules_split` cannot:
 its two faces differ by the NUMBER OF FILES, and the shapes worth generating there — a
 module's loop variable colliding with the importer's block `const`, a hole parameter called
 across the import, an exported `type` read annotated and un-annotated — are not a face of
-any single-file plan. So its record in `AXES` carries `"generator": "modules"`, `render.py`
-delegates to `modules.make_pair`, and its split face is one source string carrying
+any single-file plan. So its record in `AXES` carries `generator: "modules"`, `render.vl`
+delegates to `modules.vl`'s `makePair`, and its split face is one source string carrying
 `// file:` markers — the same spelling `scripts/check-filed-witnesses.vl` grades a two-file
 witness with, so a hit can be pasted into an inventory row without being re-typed.
 
@@ -84,8 +84,8 @@ sample's spec, times `vl build` on each, and flags a pair above 3× the sum.
 
 ## Adding to the grammar
 
-Add a record to `VALUES`, `SOURCES`, `POSITIONS`, `SCOPES` or `SCENERY` — or to `modules.py`'s
-`UNITS` / `REPORTS`, or to `imports.py`'s `MODULES` — nothing else needs touching, and
+Add a record to `VALUES`, `SOURCES`, `POSITIONS`, `SCOPES` or `SCENERY` — or to `modules.vl`'s
+`UNITS` / `REPORTS`, or to `imports.vl`'s `MODULES` — nothing else needs touching, and
 `tests/vl_day_one_sampler_test.ts`
 will tell you if an axis you add cannot be generated. Weight toward what a TUTORIAL would contain: the 1-in-20 rate came
 from programs written to be ordinary, and the hit was the most textbook shape in the

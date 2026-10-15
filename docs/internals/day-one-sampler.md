@@ -19,7 +19,7 @@ population. This directory turns it into an instrument.
 ## The unit of generation is a PAIR
 
 Two spellings of one program, differing along ONE axis, both printing a value the generator
-computed in Python. The verdict is **agree / disagree**, never runs / refuses.
+computed itself. The verdict is **agree / disagree**, never runs / refuses.
 
 That is not a presentational choice. **A disagreement is self-validating**: the spelling
 that RUNS proves the other one is legal, so a hit needs no judgement about whether the
@@ -109,13 +109,13 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
    literal pins the `let`'s rep and the assignment is where a differently-repped source
    disagrees with that pin.
 10. **`modules_split`** — the same program as ONE file and as TWO modules. A GENERATOR axis:
-   it has its own grammar (`modules.py`) rather than a face flipped on a plan drawn from the
+   it has its own grammar (`modules.vl`) rather than a face flipped on a plan drawn from the
    tables above, because module scope has two storage classes (wasm globals and
    start-function locals), every module's top level is lowered into ONE start function, and
    several by-name scans see only one class or only one module. D1593 / D1595 / D1596 all
    needed two files to appear and every instrument here was blind to them.
 11. **`imports_pair`** — the same program importing ONE std module and importing TWO. Also a
-    GENERATOR axis (`imports.py`), and for the same reason: what it varies is the IMPORT
+    GENERATOR axis (`imports.vl`), and for the same reason: what it varies is the IMPORT
     LIST, which no plan above has. D1514 is the shape — `std:fs` compiled in 18 ms alone,
     `std:array` in 40 ms alone, the module importing BOTH in 5,006 ms — and six sweep rows
     were two features that each worked alone.
@@ -171,7 +171,7 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
   three-module graph, a re-export, and a module that prints are all out of frame.
 * **Programs longer than ~25 lines.** The generator builds one value, delivers it once and
   reads it once. A defect that needs two interacting values is out of frame.
-* **Anything whose expected output Python cannot compute.** That is the price of grading on
+* **Anything whose expected output the generator cannot compute.** That is the price of grading on
   output rather than on rc, and it is worth paying: it is what makes `RUNS-WRONG` visible.
 * **A defect both spellings share.** By construction a pair reports `BOTH-FAIL`, which is
   the honest answer — but a gap the whole grammar shares is invisible as a *hit*.
@@ -180,7 +180,7 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
 
 ## The controls — and why none of them is a live defect any more
 
-    python3 scripts/day-one/sample.py --control
+    vl run scripts/day-one/sample.vl -- --control
 
 **A CONTROL BUILT ON A LIVE DEFECT EVAPORATES THE DAY THE DEFECT IS FIXED.** The first
 version of this suite used D1473 for exactly that job — the row that motivated the whole
@@ -404,7 +404,7 @@ the table is not one self-compile off a stale seed:
 attributed by re-rendering the spec, not by the message, which is why the two `--exclude`
 runs are in the table: they are what says the axis's whole yield at this grammar is two
 mechanisms and not a tail. The mixed run also gives the axis's natural share, **40 of 320
-pairs (12.5%)**, which is what a plain `sample.py --count N` will spend on it.
+pairs (12.5%)**, which is what a plain `sample.vl -- --count N` will spend on it.
 
 * **D1597** — a module GLOBAL and a same-named binding in a top-level BLOCK are one slot.
   Check-clean SILENTLY WRONG VALUE at a numeric or string global, check-clean invalid wasm
@@ -443,7 +443,7 @@ The TIMING half is the reason the axis exists, and it is a separate report becau
 THREE programs — `together` read against the SUM of the two alone-times, which is what D1514
 measured and what no two-program pair can express:
 
-    python3 scripts/day-one/sample.py --imports-report run.jsonl
+    vl run scripts/day-one/sample.vl -- --imports-report run.jsonl
 
 66 unordered pairs, min of 3 `vl build` runs each, at `--jobs 2` on a contended box:
 
@@ -640,7 +640,7 @@ The fourth cross, and the first to BITE. An overloaded operator is a free `self`
 resolved by receiver type and BANKED per call node for the emitter's dispatch rewrite — the
 thing D1891/D1892 turned on. That bank is written where `a + b` is checked and read where it
 is emitted, so an operator declared in the moved module and used in the entry is the one seam
-a single-file sample cannot reach. Three new `modules.py` units — `ty_vec`, `op_vadd`,
+a single-file sample cannot reach. Three new `modules.vl` units — `ty_vec`, `op_vadd`,
 `op_vmul` — and three reports that use them (`rep_op_add`, `rep_op_mul`, `rep_op_hole`) put
 the `a + b` in the entry; `operator_moved` marks the pairs where the operator crossed.
 
@@ -722,23 +722,24 @@ feature grid, which these five show composes.
 
 `--count` counts PROGRAMS, so it is twice the number of pairs.
 
-    python3 scripts/day-one/sample.py --seed 1 --count 400 --out run.jsonl
-    python3 scripts/day-one/sample.py --seed 1 --count 400 --axis named_vs_inline
-    python3 scripts/day-one/sample.py --seed 1 --count 400 --exclude hof
-    python3 scripts/day-one/minimise.py run.jsonl --both
-    python3 scripts/day-one/file_row.py run.jsonl --index 7 --title "…" --write
-    python3 scripts/day-one/sample.py --replay run.jsonl
-    python3 scripts/day-one/sample.py --report run.jsonl other.jsonl
-    python3 scripts/day-one/sample.py --imports-report run.jsonl
+    vl run scripts/day-one/sample.vl -- --seed 1 --count 400 --out run.jsonl
+    vl run scripts/day-one/sample.vl -- --seed 1 --count 400 --axis named_vs_inline
+    vl run scripts/day-one/sample.vl -- --seed 1 --count 400 --exclude hof
+    vl run scripts/day-one/minimise.vl -- run.jsonl --both
+    vl run scripts/day-one/file_row.vl -- run.jsonl --index 7 --title "…" --write
+    vl run scripts/day-one/sample.vl -- --replay run.jsonl
+    vl run scripts/day-one/sample.vl -- --report run.jsonl other.jsonl
+    vl run scripts/day-one/sample.vl -- --imports-report run.jsonl
 
 **The big sample is a DISCOVERY run, not a gate.** What is in the gate is
 `tests/vl_day_one_sampler_test.ts`: a fixed-seed 40-program sample plus the eleven controls,
-**350 ms**, reached by `gate.sh`'s ci-native row and by CI's `tests/vl_*_test.ts` glob. It
-asserts four things, none of which is a hit count — the grade vocabulary (so `sample.py`
+reached by `gate.sh`'s ci-native row and by CI's `tests/vl_*_test.ts` glob. It
+asserts four things, none of which is a hit count — the grade vocabulary (so `sample.vl`
 and `capability-probes.vl` cannot drift), that every axis the grammar declares was
 varied at least once, that every control speaks, and that at least three of them are
-SYNTHETIC disagreements. **A hit count moves every time a defect closes** — this sample's
-did, twice, within two days — and so does a control built on a live defect. Those four
+SYNTHETIC disagreements. A fifth test runs `minimise.vl` on a four-line witness and checks
+it keeps the called helper. **A hit count moves every time a defect closes** — this sample's
+did, twice, within two days — and so does a control built on a live defect. Those
 assertions do not.
 
 `--replay` is the other gate half: it re-grades a saved sample against the current seed and

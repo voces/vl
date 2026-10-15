@@ -1,0 +1,328 @@
+// Count the two O(n^2) string shapes in `compiler/*.vl` + `std/*.vl`.
+//
+//     vl run scripts/perf/string-concat-sites.vl -- [--list N]
+//
+// (a) `x = x + <expr>` where x is a string, INSIDE a while/for: quadratic in the built length,
+//     because `__str_concat__` allocates an exact-fit backing and copies both operands each step.
+// (b) a chain of 3+ string operands in one expression: each `+` is its own call, so a
+//     k-operand chain copies the prefix k-1 times.
+// `+=` desugars to `x = x + …`, so both spellings match. A binding counts as a string when an
+// earlier declaration in its file annotates `string` or initialises from a string literal.
+// Paths resolve against the working directory: run it from the checkout root.
+
+import { IoError, listDir, readFile } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { padLeft, parseI32, toString } from "std:fmt"
+import { endsWith } from "std:str"
+import {
+  cpPrefix,
+  die,
+  findFrom,
+  isDigit,
+  isFile,
+  splitLines,
+  stripWs,
+  univNl,
+  wsLen,
+} from "../lib/common"
+import { sortStrings } from "../lib/corpus"
+import { rankDesc } from "../lib/profile"
+
+const USAGE = "usage: vl run scripts/perf/string-concat-sites.vl -- [--list N]"
+
+// One self-append inside a loop: its loop depth, `path:line`, and the trimmed source line.
+type Site = { lvl: i32, at: string, text: string }
+
+// `line` without its `//` comment and with every string literal's contents dropped, its
+// quotes kept, so a `+` inside text is not counted.
+function stripCode(line: string): string {
+  let out = ""
+  let from = 0
+  let q = false
+  let i = 0
+  while i < line.length {
+    const c = line[i]
+    if !q && c == 47 && i + 1 < line.length && line[i + 1] == 47 { break }
+    if c == 34 && (i == 0 || line[i - 1] != 92) {
+      if q { from = i } else { out = out + line.slice(from, i) }
+      q = !q
+      if q {
+        out = out + "\""
+        from = i + 1
+      }
+    }
+    i = i + 1
+  }
+  if !q { out = out + line.slice(from, i) }
+  out
+}
+
+function isWord(b: i32): boolean {
+  isDigit(b) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+// The index past the whitespace starting at `i`.
+function skipWs(s: string, i: i32): i32 {
+  let j = i
+  while wsLen(s, j) > 0 { j = j + wsLen(s, j) }
+  j
+}
+
+function wordEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isWord(s[j]) { j = j + 1 }
+  j
+}
+
+// Whether `s` has the keyword `kw` at `i`, not followed by a word character.
+function keywordAt(s: string, i: i32, kw: string): boolean {
+  if s.slice(i, i + kw.length) != kw { return false }
+  i + kw.length >= s.length || !isWord(s[i + kw.length])
+}
+
+// The name a `let`/`const` declares when it annotates `string` or initialises from a string
+// literal, else "".
+function stringDecl(line: string): string {
+  let i = skipWs(line, 0)
+  if line.slice(i, i + 3) == "let" { i = i + 3 }
+  else if line.slice(i, i + 5) == "const" { i = i + 5 }
+  else { return "" }
+  const ws = skipWs(line, i)
+  if ws == i { return "" }
+  const e = wordEnd(line, ws)
+  if e == ws { return "" }
+  let j = skipWs(line, e)
+  if j >= line.length { return "" }
+  if line[j] == 58 {
+    j = skipWs(line, j + 1)
+    if keywordAt(line, j, "string") { return line.slice(ws, e) }
+    return ""
+  }
+  if line[j] == 61 {
+    j = skipWs(line, j + 1)
+    if line.slice(j, j + 2) == "\"\"" { return line.slice(ws, e) }
+  }
+  ""
+}
+
+// Whether `line` opens with `while`/`for`, optionally after a closing `}`.
+function isLoopHead(line: string): boolean {
+  let i = skipWs(line, 0)
+  if i < line.length && line[i] == 125 { i = skipWs(line, i + 1) }
+  keywordAt(line, i, "while") || keywordAt(line, i, "for")
+}
+
+// The name `x` of a line `x = x +` or `x += x +`, else "".
+function selfAppend(line: string): string {
+  const ws = skipWs(line, 0)
+  const e = wordEnd(line, ws)
+  if e == ws { return "" }
+  const name = line.slice(ws, e)
+  let j = skipWs(line, e)
+  if j < line.length && line[j] == 43 { j = j + 1 }
+  if j >= line.length || line[j] != 61 { return "" }
+  j = skipWs(line, j + 1)
+  if line.slice(j, j + name.length) != name { return "" }
+  j = skipWs(line, j + name.length)
+  if j < line.length && line[j] == 43 { return name }
+  ""
+}
+
+function count(s: string, needle: string): i32 {
+  let n = 0
+  let i = findFrom(s, needle, 0)
+  while i >= 0 {
+    n = n + 1
+    i = findFrom(s, needle, i + needle.length)
+  }
+  n
+}
+
+function countByte(s: string, b: i32): i32 {
+  let n = 0
+  let i = 0
+  while i < s.length {
+    if s[i] == b { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+// The `.vl` files directly under `dir`, sorted, as `dir/name`.
+function vlFiles(dir: string): string[] {
+  const names = listDir(dir)
+  if names is IoError {
+    die("string-concat-sites: cannot list \{dir} (\{names.msg})", 1)
+    return []
+  }
+  const out: string[] = []
+  for n in sortStrings(names) {
+    if n.endsWith(".vl") { out.push(dir + "/" + n) }
+  }
+  out
+}
+
+// Python's `a > b` over `(lvl, at, text)` tuples, strings in byte order.
+function after(a: Site, b: Site): boolean {
+  if a.lvl != b.lvl { return a.lvl > b.lvl }
+  if a.at != b.at { return a.at > b.at }
+  a.text > b.text
+}
+
+// `sorted(sites, reverse=True)`: descending and stable.
+function sortSites(xs: Site[]): Site[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = sortSites(xs.slice(0, mid))
+  const b = sortSites(xs.slice(mid, xs.length))
+  const out: Site[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    if j >= b.length || (i < a.length && !after(b[j], a[i])) {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+function main(argv: string[]): i32 {
+  let want = 0
+  let a = 0
+  while a < argv.length {
+    if argv[a] == "--list" {
+      if a + 1 >= argv.length {
+        print(USAGE)
+        return 2
+      }
+      const n = parseI32(argv[a + 1])
+      if n == null {
+        die("string-concat-sites: --list is not an integer: " + argv[a + 1], 2)
+      }
+      want = n ?? 0
+      break
+    }
+    a = a + 1
+  }
+  const files: string[] = []
+  for f in vlFiles("compiler") { files.push(f) }
+  for f in vlFiles("std") { files.push(f) }
+
+  // Per file NAME, as the Python keyed it; first-seen order breaks ties.
+  const fileIx: Map<string, i32> = Map()
+  const fileNames: string[] = []
+  const fileN: f64[] = []
+  const sites: Site[] = []
+  // chainN[k] counts the chains of k operands.
+  const chainN: i32[] = []
+  let totalSelf = 0
+  let deep = 0
+  let chainInLoop = 0
+  for path in files {
+    if !isFile(path) { continue }
+    const bytes = readFile(path)
+    if bytes is IoError {
+      die("string-concat-sites: cannot read \{path} (\{bytes.msg})", 1)
+      return 1
+    }
+    const base = path.slice(findFrom(path, "/", 0) + 1, path.length)
+    const strs: Map<string, boolean> = Map()
+    let depth = 0
+    const loopAt: i32[] = []
+    let no = 0
+    for raw in splitLines(univNl(decodeUtf8Lossy(bytes))) {
+      no = no + 1
+      const line = stripCode(raw)
+      const d = stringDecl(line)
+      if d != "" { strs[d] = true }
+      const opening = isLoopHead(line) && findFrom(line, "{", 0) >= 0
+      const m = selfAppend(line)
+      const isStr = m != "" && (strs[m] ?? false)
+      if isStr {
+        totalSelf = totalSelf + 1
+        if loopAt.length > 0 {
+          const at = fileIx[base]
+          if at != null {
+            fileN[at] = fileN[at] + 1.0
+          } else {
+            fileIx[base] = fileNames.length
+            fileNames.push(base)
+            fileN.push(1.0)
+          }
+          sites.push(
+            {
+              lvl: loopAt.length,
+              at: path + ":" + toString(no),
+              text: stripWs(raw),
+            },
+          )
+          if loopAt.length >= 2 { deep = deep + 1 }
+        }
+      }
+      // A 3+ operand chain: two `+` with a quote or a string name around.
+      const plus = count(line, " + ")
+      if plus >= 2 && (findFrom(line, "\"", 0) >= 0 || isStr) {
+        const k = plus + 1
+        while chainN.length <= k { chainN.push(0) }
+        chainN[k] = chainN[k] + 1
+        if loopAt.length > 0 { chainInLoop = chainInLoop + 1 }
+      }
+      depth = depth + countByte(line, 123) - countByte(line, 125)
+      if opening { loopAt.push(depth) }
+      while loopAt.length > 0 && depth < loopAt[loopAt.length - 1] {
+        loopAt.pop()
+      }
+    }
+  }
+  let inLoop = 0.0
+  for n in fileN { inLoop = inLoop + n }
+  print(
+    "(a) string self-append sites: \{toString(totalSelf)} total, \{toString(inLoop as! i32)} inside a loop, \{toString(deep)} at loop depth >= 2",
+  )
+  const ix: i32[] = []
+  let i = 0
+  while i < fileNames.length {
+    ix.push(i)
+    i = i + 1
+  }
+  for r in rankDesc(ix, fileN) {
+    print("    \{padLeft(toString(fileN[r] as! i32), 4, " ")}  \{fileNames[r]}")
+  }
+  let tot = 0
+  for n in chainN { tot = tot + n }
+  print(
+    "(b) chains of 3+ string operands: \{toString(tot)}, \{toString(chainInLoop)} inside a loop",
+  )
+  let shown = 0
+  let k = chainN.length - 1
+  while k >= 0 && shown < 6 {
+    if chainN[k] > 0 {
+      print(
+        "    \{padLeft(toString(chainN[k]), 4, " ")}  x \{toString(k)} operands",
+      )
+      shown = shown + 1
+    }
+    k = k - 1
+  }
+  const ranked = sortSites(sites)
+  let s = 0
+  while s < ranked.length && s < want {
+    const t = ranked[s]
+    print("    L\{toString(t.lvl)} \{t.at}  \{cpPrefix(t.text, 80)}")
+    s = s + 1
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("string-concat-sites: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

@@ -3,15 +3,14 @@
 #
 # Builds scripts/std-math/math-grid.vl at -O0 and -O3, runs both under wasmtime (`vl run`)
 # and V8 (Deno), requires all four transcripts to agree bit for bit on every RESULT, then
-# grades the -O0 transcript against mpmath (max/mean ulp per function, width and section).
-# Needs mpmath (pip install mpmath); PYTHON picks an interpreter that has it.
+# grades the -O0 transcript against a 256-bit reference (math-grade.vl: max/mean ulp per
+# function, width and section).
 #
 #   scripts/std-math/math-check.sh [out-dir]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 VL="${VL:-scripts/vl-host/target/release/vl}"
 SEED="${SEED:-build/vl-compiler.wasm}"
-PYTHON="${PYTHON:-python3}"
 OUT="${1:-$(mktemp -d)}"
 mkdir -p "$OUT"
 export VL_STD="${VL_STD:-$PWD/std}"
@@ -32,4 +31,5 @@ for t in grid.v8 grid-o3.wasmtime grid-o3.v8; do
   fi
 done
 echo "determinism: $(wc -l < "$OUT/grid.wasmtime.txt") points, results identical across wasmtime/V8 x -O0/-O3"
-"$PYTHON" scripts/std-math/math-grade.py "$OUT/grid.wasmtime.txt"
+export VL SEED
+"$VL" run scripts/std-math/math-grade.vl --compiler "$SEED" -- "$OUT/grid.wasmtime.txt"

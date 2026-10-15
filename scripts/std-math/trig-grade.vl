@@ -1,0 +1,149 @@
+// Grade a trig-grid.vl transcript against a 256-bit reference: max/mean ulp error per width,
+// function and argument range. Exits 1 if any finite point misses the documented 1-ulp bound,
+// a non-finite input does not give NaN, or sin(+-0) loses its sign. trig-check.sh runs it.
+//
+//   vl run scripts/std-math/trig-grade.vl -- <transcript>
+//
+// Run from the checkout root: a transcript past one chunk is graded by building this file.
+
+import { programArgs } from "std:args"
+import { parseI32, parseI64, toString } from "std:fmt"
+import { join, split } from "std:str"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { die } from "../lib/common"
+import { padLeft, padRight, pyRepr } from "../lib/corpus"
+import {
+  Acc,
+  gradeMain,
+  note,
+  pyFixed,
+  pyFloatRepr,
+  sortedKeys,
+  stat,
+} from "./grade-common"
+import {
+  BF,
+  absBF,
+  floorLog2,
+  fromF64,
+  ldexp,
+  roundNearest,
+  sinCos,
+  sub,
+  toF64,
+} from "./bigfloat"
+
+const SELF = "scripts/std-math/trig-grade.vl"
+const INF = 1.0 / 0.0
+
+// |y - ref| in ulps of the reference's binade, floored at the width's least normal binade.
+function ulpErr(y: f64, ref: BF, w: i32): f64 {
+  if ref.s == 0 {
+    if y == 0.0 { return 0.0 }
+    return INF
+  }
+  let e = floorLog2(ref)
+  let frac = 52
+  let least = -1022
+  if w == 32 {
+    frac = 23
+    least = -126
+  }
+  if e < least { e = least }
+  toF64(ldexp(absBF(sub(fromF64(y), ref, 4000)), frac - e))
+}
+
+function section(x: f64): string {
+  if x != x || x == INF || x == 0.0 - INF { return "nonfinite" }
+  const ax = abs(x)
+  if ax <= 0.7853981633974483 { return "|x|<=pi/4" }
+  if ax < 1647099.0 { return "pi/4<|x|<1.6e6" }
+  "|x|>=1.6e6"
+}
+
+function f32At(p: string[], i: i32): f64 {
+  f32fromBits(parseI32(p[i]) ?? 0) as f64
+}
+
+function f64At(p: string[], i: i32): f64 { f64fromBits(parseI64(p[i]) ?? 0) }
+
+function grade(ln: string, acc: Acc) {
+  const p = split(ln, " ")
+  if p.length != 4 { die("not a trig-grid line: " + ln, 2) }
+  const k = p[0]
+  let w = 64
+  let x = 0.0
+  let s = 0.0
+  let c = 0.0
+  if k == "D" {
+    x = f64At(p, 1)
+    s = f64At(p, 2)
+    c = f64At(p, 3)
+  } else {
+    w = 32
+    x = f32At(p, 1)
+    s = f32At(p, 2)
+    c = f32At(p, 3)
+  }
+  const sec = section(x)
+  let es = 0.0
+  let ec = 0.0
+  if sec == "nonfinite" {
+    if s == s || c == c {
+      es = INF
+      ec = INF
+    }
+  } else {
+    let ex = 0
+    if x != 0.0 { ex = floorLog2(fromF64(x)) + 1 }
+    if ex < 0 { ex = 0 }
+    const r = sinCos(fromF64(x), 256)
+    es = ulpErr(s, roundNearest(r.sin, ex + 200), w)
+    ec = ulpErr(c, roundNearest(r.cos, ex + 200), w)
+    if x == 0.0 && (f64bits(s) < 0) != (f64bits(x) < 0) { es = INF }
+  }
+  note(acc, join([k, "sin", sec], "\t"), es, x)
+  note(acc, join([k, "cos", sec], "\t"), ec, x)
+}
+
+function report(acc: Acc) {
+  const head = "\{padRight("w", 2)} \{padRight("fn", 3)} \{padRight("section", 16)}"
+  print(
+    "\{head} \{padLeft("points", 8)} \{padLeft("max ulp", 9)} \{padLeft("mean ulp", 9)} \{padLeft(">0.5ulp", 8)}  worst x",
+  )
+  for key in sortedKeys(acc) {
+    const kp = split(key, "\t")
+    const st = stat(acc, key)
+    const name = "\{padRight(kp[0], 2)} \{padRight(kp[1], 3)} \{padRight(kp[2], 16)}"
+    const mean = pyFixed(st.tot / (st.n as f64), 4)
+    print(
+      "\{name} \{padLeft(toString(st.n), 8)} \{padLeft(pyFixed(st.mx, 4), 9)} \{padLeft(mean, 9)} \{padLeft(toString(st.over), 8)}  \{pyFloatRepr(st.wx)}",
+    )
+  }
+  const over: string[] = []
+  for key in acc.order {
+    if stat(acc, key).mx >= 1.0 {
+      const kp = split(key, "\t")
+      over.push("(\{pyRepr(kp[0])}, \{pyRepr(kp[1])}, \{pyRepr(kp[2])})")
+    }
+  }
+  if over.length > 0 {
+    print("BOUND MISSED (>= 1 ulp): [\{join(over, ", ")}]")
+    exit(1)
+  }
+  print("all points within the documented 1-ulp bound")
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("trig-grade: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  const acc = gradeMain(
+    SELF,
+    argv,
+    "usage: vl run scripts/std-math/trig-grade.vl -- <transcript>",
+    grade,
+  )
+  if acc != null { report(acc) }
+}

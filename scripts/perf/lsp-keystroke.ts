@@ -2,7 +2,7 @@
 //
 // RAW drives the seed's driver exports the way `lsp/src/wasmChecker.ts`'s `prepare` +
 // `ensurePrepared` do, pushing every module in full, and splits the host-visible halves.
-// That is the denominator `scripts/perf/profile-phases.py` divides.
+// That is the denominator `scripts/perf/profile-phases.vl` divides.
 //
 // CHECKER runs the real `WasmChecker.check` over the same graphs with the reader
 // generation bumped between edits, exactly as `documents.onDidChangeContent` bumps it, so
