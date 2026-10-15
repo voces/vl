@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a box element the registry key reaches and a single-literal list read the column (campaign §13.26). Next: the hole list resolved in the checker (§13.26's proposal (c)), the `-> none` and DIFF classes, `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a closed hole list reads its checker-recorded `i32` default from the column, display unchanged (campaign §13.27). Next: the `-> none` and DIFF classes, `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: step 6, second part delivers a cell store of a value read through another cell at its pin, the re-take reading the delivered instance (D4843 closed). Next: the (c) literal; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -253,6 +253,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - A re-made `if` link (mono), a rest pack (checker) and a re-made call (mono) record their type: untyped `IfStmt` 92 → 0, `ArrayLit` 98 → 0, `Call` 41 → 0; `tests/cases` like-for-like LEFT-ONLY 1,376 → 1,235, `named/` 551 → 461; 1 module differs (a generic `(i32 | boolean)` rest pack is now boxed); D4830 filed and closed, D3209, D3297, D3548 and D4306 close (campaign §13.24).
 - The last untyped LEFT-ONLY nodes record their type (a re-associated `??` link at emit, a list literal three mono passes re-make) and a join of records reads the column as a struct ref list: untyped `BinExpr` 1 → 0, `ArrayLit` 24 → 0; `tests/cases` like-for-like LEFT-ONLY 544 → 535, `named/` 473 → 161; 0 modules differ; no LEFT-ONLY node is untyped now (campaign §13.25).
 - A box element whose row the registry key reaches but its canon id misses reads the column (`unRowOfKey` moves into `emit_rep.vl`), and a single-literal list `"x"[]` is a `strlist`: `tests/cases` like-for-like LEFT-ONLY 535 → 425, `named/` 161 → 161 (its `d3140_*` 128 and `tests/cases`' i64 23 are registry-key classes L′ and D, left on purpose); 0 modules differ; the hole list's 317 notes all take the ladder's i32 default, and the proposal is that the checker records that default (campaign §13.26).
+- A closed hole list (`_[]`, `_[] | null`) reads the `i32` element the checker records after the last pin (`recordClosedHoles`, a column beside `nodeTyIx`, so hover and `--json` keep `_[]` and the D16 readers still see the hole): `tests/cases` like-for-like LEFT-ONLY 365 → 69, `named/` 149 → 128; 0 modules differ (campaign §13.27).
 
 ### L3 log
 
