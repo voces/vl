@@ -684,6 +684,55 @@ this change.)
 **What the next switch needs.** Site 42 needs the class-As sibling resolved, as above. Every
 other site still holds a `name-only` or `differ` reach.
 
+### Step 5 — the third switch: fallback seams take their `name-only` reaches with them
+
+Re-measured at d55ca0e8c, armed, over 5,344 `tests/cases` files and the distilled corpus. No
+reach moved class since the second switch. The switch criterion changes: a site with no `differ`
+reach is a CANDIDATE, and `difftree.sh --identity` decides. That admits two kinds the first two
+switches excluded. A `neither` reach finds a row on neither side, so the boolean answer is the
+same. A `name-only` reach at a FALLBACK seam (`unionHasAtomAB`, `unionMemberTysOfAB`) keeps the
+spelling's answer, because the key finds no row there. `unionMemberTysOfAB` gained the switch.
+Before, it always read the spelling.
+
+**Thirteen sites join.** Reaches are agree / name-only / id-only / neither / alias.
+
+| site | seam | `tests/cases` | distilled |
+| --- | --- | --- | --- |
+| 3 `unionNameOfExpr/as` | `isUNameAB` | 0 / 0 / 6 / 24,262 / 0 | 0 / 0 / 0 / 28,088 / 0 |
+| 10 `internShapeDeep/armTys` | `unionMemberTysOfAB` | 214 / 4 / 0 / 0 / 0 | 0 |
+| 13 `memberUnionFieldName` | `unionMemberTysOfAB` | 666 / 79 / 0 / 0 / 0 | 0 |
+| 14 `writeRhsIsNullBearing` | `unionHasAtomAB` | 319 / 85 / 0 / 0 / 2 | 198 / 0 / 0 / 0 / 0 |
+| 23 `collectU/inferLetTy` | mint | 147 / 2 / 0 / 0 / 4 | 45 / 0 / 0 / 0 / 2 |
+| 19 `unionNameOfExpr/closure` | `isUNameAB` | neither 5 | 0 |
+| 30, 32, 33, 36, 37, 38, 39 (`riu/arrayAtom`, `nulRefArray`, `nulShape`, `nulCloRefArray`, `nestedArray`, `arrayShape`, `fnResult`) | `isUNameAB` / `isUNameKeyAB` | neither only: 1,144 / 159 / 305 / 4 / 210 / 44 / 11 | neither only: 63 / 39 / 256 / 0 / 140 / 0 / 0 |
+
+**Five candidates were refused by the module diff.** That puts the switched set at 24 sites.
+
+| site | why | modules changed |
+| --- | --- | --- |
+| 24 `collectU/arrLitInferElem`, 44 `riu/inferRetNominal`, 45 `riu/arrElemUnion`, 46 `riu/api` | an `id-only` reach at a mint GUARD: the key finds a row, so the sibling mint is skipped, the same shape as class As/Av | 6 (`capture-inferred-projection-nonstruct`, `closure-alias-union-return-hof`, `union-returning-map`, `arm-literal-through-a-list-conduit`, `map-read-coalesce-other-arm`, `union-if-value-variant`) |
+| 11 `exprIsUnionStrEq/l` | its 6 reaches in `value-union-eq-both-sides.vl` are `agree` on the ROW, but the answers differ. `unionHasAtom("U", "string")` reads the alias spelling and answers false, while the key row's atoms answer true | 1, which gains 12 unused locals in the start function |
+
+Site 11 is the lesson. An `agree` reach says that both sides find the same row. It does not say
+that a fallback seam's name leg reads that row: `unionHasAtom` splits the spelling and never
+looks the row up. So for a fallback seam, `agree` is evidence, and the module diff is the proof.
+
+**The proof.** `difftree.sh --identity` over 15,233 files: **10,282 modules built, 0 differ,
+0 uncompared**. The candidate compiling master's source reproduces master's fixpoint. The seed
+is still a fixpoint (5,794,849 bytes, 208 more than master's). `rep-fuzz-check.sh` reads exact
+with 0 baselined failures. `regress.vl` loses no runs. The render-parse ratchet reads 98
+`tyToEmitName` / 378 type-string parses, unchanged: a seam switch removes no parser call.
+
+**What the next switch needs.** The unswitched sites fall into four groups:
+
+* Site 42 is still blocked by class As.
+* Sites 24, 44, 45 and 46 are `id-only` mint guards of the same shape. They switch when a key
+  sibling's mint adopts the key row, which is also what unblocks site 42.
+* Site 11 needs `unionHasAtom`'s name leg to read the row for a declared alias. That is a module
+  change, so it needs its own output-identical proof.
+* Sites 1, 2, 5, 6, 7, 15, 17, 26, 27 and 29 hold `differ` reaches. Sites 16, 18, 28 and 41 hold
+  `name-only` reaches at strict seams. Sites 20 and 25 have no reach at all.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
