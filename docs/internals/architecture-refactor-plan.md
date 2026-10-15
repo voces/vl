@@ -23,8 +23,8 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 5, first part moves `monoCellCall`'s callee read onto the slot pin. Next: step 6 (retire `monoBindingSigConflict`), which the two remaining cell-store cases wait on (D4842); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a re-made `if` link, a checker rest pack and a re-made call record their type (campaign §13.24). Next: the `d511_*` mono `ArrayLit`, the typed remainders (`_[] | null`, `d3140_*`), `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
+| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, eleventh part moves a call's callee type and an un-annotated local's write onto the slot pin. Next: step 5 (capture cells, `monoCellCall`'s callee read); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: the last untyped LEFT-ONLY nodes record their type, and a join of records reads the column (campaign §13.25). Next: the column classes §13.25 lists (the hole-list decision, unregistered union elements such as `d3140_*`, numeric literal-union lists), `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
@@ -248,6 +248,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - A nullable value-union list element only a generic instance forms (`(i32 | string | null)[]`) reads the column through the inner box's row: `named/` like-for-like LEFT-ONLY 2,520 → 2,295, `tests/cases` unchanged, 0 modules differ (campaign §13.21).
 - A call a generic instance re-makes records its template's type: the 1,744 untyped `d3125_*` `Call` notes go to 0, `named/` like-for-like LEFT-ONLY 2,295 → 551, `tests/cases` 2,444 → 1,376, 3 modules differ (a re-made closure whose tail is an assignment now returns its value, as the non-generic twin does) (campaign §13.22).
 - A re-made `if` link (mono), a rest pack (checker) and a re-made call (mono) record their type: untyped `IfStmt` 92 → 0, `ArrayLit` 98 → 0, `Call` 41 → 0; `tests/cases` like-for-like LEFT-ONLY 1,376 → 1,235, `named/` 551 → 461; 1 module differs (a generic `(i32 | boolean)` rest pack is now boxed); D4830 filed and closed, D3209, D3297, D3548 and D4306 close (campaign §13.24).
+- The last untyped LEFT-ONLY nodes record their type (a re-associated `??` link at emit, a list literal three mono passes re-make) and a join of records reads the column as a struct ref list: untyped `BinExpr` 1 → 0, `ArrayLit` 24 → 0; `tests/cases` like-for-like LEFT-ONLY 544 → 535, `named/` 473 → 161; 0 modules differ; no LEFT-ONLY node is untyped now (campaign §13.25).
 
 ### L3 log
 
