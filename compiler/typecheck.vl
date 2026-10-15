@@ -19464,12 +19464,13 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   0
 }
 
-// Record the destination array type on an ArrayLit source whose element target reps differently
-// from the literal's own inference — a niche-nullable scalar element, or a plain `string` element
-// over an all-literal-union literal — peeling a nullable destination wrapper and grouping parens.
-// Runs before `assignableExpr`'s plain-assignable short-circuit, which such a literal takes.
+// Record the destination array type on an ArrayLit whose element reps differently from the
+// literal's own inference (a niche-nullable scalar, or `string` over a literal union), ahead of
+// `assignableExpr`'s plain-assignable short-circuit. A pin's re-check records nothing: its literal
+// is a generic body's node, shared by every instance (D4866).
 function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  if litPinN.length > 0 { return 0 }
   let dtix = dstTy
   const dN = T.tys[dtix]
   if dN is TyNullable { dtix = dN.nInner }
@@ -20033,6 +20034,25 @@ function radixLitAdoptTails(ix: i32, dstTy: i32) {
   rc
 }
 
+// Whether the array literal `ix`, recorded `f64[]`, is delivered element-wise into an `f32`
+// element `dElem`: its elements adopt f32 (`[if c { 0.25 } else { 1 }]`), so the list is f32's.
+function f32ElemsAdoptedOver(ix: i32, dElem: i32): boolean {
+  if primNameOf(dElem) != "f32" { return false }
+  const lt = nodeTyIxOf(ix)
+  if lt < 0 { return false }
+  primNameOf(tyArrayElemIx(lt)) == "f64"
+}
+
+// Whether paren `ix` is recorded `f64[]` over an `inner` its delivery re-recorded `f32[]`.
+function f32ListUnder(ix: i32, inner: i32): boolean {
+  if ix >= nodeTyIx.length { return false }
+  const pt = nodeTyIxOf(ix)
+  const it = nodeTyIxOf(inner)
+  if pt < 0 || it < 0 { return false }
+  primNameOf(tyArrayElemIx(pt)) == "f64"
+    && primNameOf(tyArrayElemIx(it)) == "f32"
+}
+
 // A value `if`, `match` or block every tail of which adopts `f32` as a bare literal does, at an
 // `f32` destination or its nullable. Its `if` and `match` nodes are re-typed `f32`, so the
 // emitter builds the join there and each literal re-encodes at single precision (D2619).
@@ -20414,7 +20434,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     // bare literal can match a literal-union field (`{tag: "circle", r: 5}` against
     // `{tag: "circle" | "square", r: i32}`).
     const e = P.nodes[srcExpr]
-    if e is Paren { return assignableExpr(e.parInner, srcTy, dstTy) }
+    if e is Paren {
+      const pok = assignableExpr(e.parInner, srcTy, dstTy)
+      // A wrapping paren takes the f32 list its literal adopted, so both nodes read alike.
+      if pok && !inferQuiet && f32ListUnder(srcExpr, e.parInner) {
+        nodeTySet(srcExpr, nodeTyIxOf(e.parInner))
+      }
+      return pok
+    }
     if e is ObjLit {
       const s = T.tys[srcTy]
       if s is TyObj {
@@ -20595,7 +20622,8 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           && (tyIsLitUnion(d.aElem)
             || tyIsNicheNulScalarElem(d.aElem)
             || arrLitJoinUnionElem(srcExpr, dtix)
-            || cexElem)
+            || cexElem
+            || f32ElemsAdoptedOver(srcExpr, d.aElem))
         ) {
           if srcExpr < nodeTyIx.length { nodeTySet(srcExpr, dtix) }
         }
