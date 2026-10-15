@@ -4277,3 +4277,81 @@ candidate 5,735,322, +205, as on `687f37dd5`. The native fixpoint holds.
   annotation-dedupe area (D2859).
 * The 7 `-> none` notes of the hole `ret`, the `unc` notes, the call's record ×8, the `if` join
   at a pin (D2832), the narrowed family, the scope callers.
+
+### 13.35 The hole tail and the complement record rows
+
+§13.34 left four rows, all at a pin the emitter could already see but did not read. D4900: a
+hole `w(t, b)` returning `[t]` beside the tail `[1]` was emitted with the `i32` list as its
+result at `2.5`, so the returned `f64` list was invalid wasm. D4898: a record `{ xs: v }` of
+the complement of `is i32[]` was refused at an `f64` instance when read. D4899: the same record
+over a hole parameter matched no row when the argument was the union `string[] | i32[]`, and
+over a list argument (`h(["e"])`, filed as D4923) had no struct at all. D4901: the record
+minted no row in a body returning `T[]`.
+
+**The rule.** Each reader takes the binding the instance already has.
+
+* The D1521 rung in `monoMakeInstanceGo` re-types an unannotated list return at the instance.
+  It passed only the `let` column's binding to `monoInferRetSetListTy`, which declines a type
+  holding a hole, so the D592 tail rung's `i32[]` stood. It now joins the holes' binding
+  (`monoHoleBinding`, `monoJoinBinding`), and the tail literal adapts as it does beside `T`.
+* `memberFieldListRep` maps the `f64[]` and `i64[]` field codes, and the member-field gate
+  admits them. At the `f64` instance `r.xs` still types as `T[]`, so the syntactic ladder is
+  the one that answers, and it knew only the `i32`, ref, `string` and `f32` list codes.
+* `holePinReadAt` reads an `HD_GNOT` hole with a non-null alternative as its base's pin less
+  the alternative (`subtractTy`), or the pin where nothing is less. Before, it answered `-1`,
+  so the field had no pinned type and `mintPinnedObjLit` minted nothing.
+* `instRetKeepsRecordsIn` keeps the records of a body whose return holds no record
+  (`tyHoldsObj`). The D2850 rule declined any constructor over a type parameter, `T[]`
+  included, which cannot carry a record the body built.
+
+The `<T>` face of D4899 is not this. The checker records `v: T[] | i32[]` as `T[]` and binds no
+`T` from a union argument, so the exact instance has no substitution to read. Filed as D4922.
+
+**Counts.** Plain `listRep` notes over `tests/cases`, base master `c2dbf639e`, then this change.
+Every class not listed is unchanged, `open list -> none` included. The whole change is in the
+fixture `complement-list-record-scalar-and-hole.vl`, which master cannot build. The other two
+new fixtures have 0 notes either side.
+
+| population | class | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | `open f64list -> unc` | 60 | 122 |
+| `tests/cases` | `open i64list -> unc` | 11 | 64 |
+| `tests/cases` | `open strlist -> unc` | 80 | 100 |
+
+**Probes.** Base master `c2dbf639e`, then this change.
+
+| program | before | after |
+| --- | --- | --- |
+| D4900: hole `w` returning `[t]` beside the tail `[1]`, at `2.5` | invalid wasm | runs `2.5` |
+| D4898: `{ xs: v }` over the complement at an `f64` instance, by index | emit reject, index receiver | runs `2.5` |
+| the same for `.length` | emit reject, `.length` receiver | runs `1` |
+| the same at `i64` and `f64` in a `for` | emit reject, `for-in` iterable | runs |
+| D4899: the hole face with the argument `string[] \| i32[]` | emit reject, no union variant | runs `e` |
+| D4923: the hole face at `h(["e"])` | emit reject, no struct type | runs `e` |
+| D4901: `{ xs: v }` in a `<T>(v: T[]): T[]` body | emit reject, no struct type | runs `e e` |
+| D4922: the `<T>` face with the argument `string[] \| i32[]` | emit reject, no union variant | emit reject, no union variant |
+| `hole-ret-tail-literal-adapts.vl` (new) | invalid wasm | runs |
+| `generic-record-of-list-param-list-return.vl` (new) | emit reject | runs |
+| `complement-list-record-scalar-and-hole.vl` (new) | emit reject | runs |
+
+The fixtures cover the hole tail at a binding, for its length, as an `f64[]` argument,
+reassigned, in a `for`, in either order and beside its `<T>` twin; the record at `f64`, `i64`
+and `string`, by index, for its length and in a `for`, after `else` and after `!(… is …)`; and
+the record in bodies returning `T[]`, `T[][]` and a hole's list.
+
+**Checks.** On `c2dbf639e` (#3850) the master fixpoint is 5,735,715 bytes and the candidate
+5,736,148, +433. The native fixpoint holds.
+
+* `difftree --identity`: 15,203 files, 10,244 built, 3 differ, 0 uncompared. The fixpoint holds.
+  The three are the new fixtures, which master refuses or builds invalid.
+* `regress.vl`: 0 runs lost, 0 to silent, no cell changed class.
+* `rep-fuzz-check` is exact, with 0 baselined failures.
+* `lint-self` is clean, and `seed-size --check` passes (+1.6% on its baseline).
+* `check-filed-witnesses --strict` over both inventories: 2,793 graded, 2,793 as filed, 0 moved.
+* The `tests/cases` oracle and the two inventory tests: 5,069 passed, 0 failed.
+
+**Next.**
+* D4922: a `T[] | i32[]` parameter is recorded as `T[]` and binds no `T` from a union argument.
+  Same area as the annotated `: T[] | i32[]` return that collapses to `T[]` (D2859).
+* The 7 `-> none` notes of the hole `ret`, the `unc` notes, the call's record ×8, the `if` join
+  at a pin (D2832), the narrowed family, the scope callers.
