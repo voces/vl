@@ -4102,3 +4102,95 @@ The other families moved only in how often the ladder asks. Nothing was aimed at
 * The mono-callback `Call` ×8.
 * The `unc` notes, where the column does not cover the node.
 * D3346, D4862, D3368, the `if` join at a pin (D2832), the narrowed family, the scope callers.
+
+### 13.33 A type parameter's complement records the arm it reads
+
+§13.32 left one family where the ladder was right and the record was not. In
+`if v is i32[] { … } else { … }` over a generic body's `v: T[] | i32[]`, the checker recorded
+the `else` arm as the whole union. Each instance's emitter reads it as the one list that
+remains. Six notes in `generic-body-list-union-read-ops.vl` and the 66 in
+`generic-complement-list-union-positions.vl` came from it. So did a capability gap: the
+complement reached no `T[]` or `T` destination. Returning it, binding it or passing it to a
+generic was a check reject or an emit reject (D4886).
+
+**The rule.** The `else` of an `is` test with a concrete tested type keeps that type apart from
+a type parameter's list, as a return set already does (`tpApartConcrete`). The `else` of
+`is i32[]` over `T[] | i32[]` is `T[]`. The `else` of `is T[]` keeps the whole union, because
+`T` may be `i32` at a pin (`elseRemainderTy`, `typecheck.vl`).
+
+The emitter's readers follow the record:
+
+* `exprListRepOf` loses the `identReadNarrowed` exception from §13.32, and the helper is
+  deleted.
+* `twoListValueTy` treats a read the checker recorded as one list like a name narrowed by `is`.
+* `monoNarrowedPinName` substitutes the recorded `T[]` through the instance's pin, so a generic
+  argument pins the list the instance holds.
+
+**D4887.** A record literal `{ v: xs }` with `xs: T[]` minted no row for its substituted field
+(`object literal but no struct type declared`). It surfaced once the complement could be
+delivered into a record. `mintPinnedObjLit` now interns the pin's substituted type for a field
+whose type holds a type parameter below the top. The plain `g<T>(v: T[])` spelling runs too.
+
+**Counts.** Plain `listRep` notes, base master `b8dc4604d` (§13.32), candidate this change.
+Every class not listed is unchanged, `named/` is unchanged, and the new fixture
+`generics/generic-complement-list-delivery-positions.vl` has 0 notes.
+
+| population | class | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | `listRep list -> none` | 40 | 0 |
+| `tests/cases` | `listRep strlist -> none` | 32 | 0 |
+| `tests/cases` | `open list -> unc` | 6,002 | 6,003 |
+| `tests/cases` | `open strlist -> unc` | 59 | 60 |
+| `tests/cases` | `open f64list -> unc` | 59 | 60 |
+| `tests/cases` | `scope none -> list` | 1,821 | 1,811 |
+| `tests/cases` | `scope none -> strlist` | 184 | 174 |
+| `tests/cases` | `scope none -> f64list` | 1,166 | 1,156 |
+
+The 72 `-> none` notes are the 66 of the union-positions fixture and the 6 of read-ops. The
+three new `open -> unc` notes are one `const e = v[0]` let chain asked with no function, which
+cannot read a pin. They belong to the open family.
+
+**Probes.** Base master, then this change.
+
+| program | before | after |
+| --- | --- | --- |
+| return the complement as `T[]` | check reject | runs `a 2.5 true` |
+| bind it to `const w: T[]` | check reject | runs `c 2 4.5 2` |
+| pass it to `take<U>(xs: U[])` | emit reject, two list types | runs `b 3.5` |
+| store it in `{ v: w }`, `type B<T> = { v: T[] }` | runs `d 5.5 0` | runs `d 5.5 0` |
+| `g<T>(v: T[])` builds `{ v: v }` (D4887) | emit reject, no struct type | runs `d 5.5 true` |
+| the record over a parameter `v: T[] \| i32[]` (D4888) | emit reject | emit reject |
+| the hole face, `ret(t, b)` with an un-annotated `w` (D4889) | invalid wasm | invalid wasm |
+| `generic-body-narrowed-list-read-value.vl` and five neighbours | runs | runs, same output |
+
+The new fixture is check reject on master and runs here. Its `ret` instance reads box `$3`,
+tests tag 7, and in the `else` casts the payload to the string list with no re-box. `arg` passes
+the cast payload by `return_call`. In the f64 instance the two lists join to one f64 list and
+the test folds to `i32.const 0`.
+
+**Checks.** Measured on `b8dc4604d`, the base fixpoint is 5,713,809 bytes and the candidate
+5,713,937, +128. Rebased onto `42a453e80` (#3838), they are 5,713,917 and 5,714,045, still
++128, and the native fixpoint holds.
+
+* `difftree --identity`: 15,188 files, 10,229 built, 5 differ, 0 uncompared. The fixpoint holds.
+  The five:
+  * `generic-complement-list-delivery-positions.vl` is new, and a check reject on master.
+  * `generic-complement-list-union-positions.vl` gives the same output on both seeds.
+  * `generic-body-list-union-read-ops.vl` shrinks from 6,371 to 5,945 bytes with the same
+    output. Its `if`/`else` join over the complement was built as boxes at tags 7, 3 and 10
+    and is now one `(if (result (ref $6)))` of the list itself.
+  * `named/d581_objarr_f64_i32_plain_typar.vl` and `named/d581_objarr_f64_i32_ufcs_typar.vl`
+    print `0` on both seeds. Each module gains one unused `{ v: i32[] }` row, 5 bytes, which
+    the new `mintPinnedObjLit` arm interns.
+* `regress.vl`: 0 runs lost, 0 to silent, no cell changed class.
+* `rep-fuzz-check` is exact, with 0 baselined failures.
+* `lint-self` is clean, and `seed-size --check` passes (+1.2% on its baseline).
+* `check-filed-witnesses --strict` over both inventories: 2,773 graded, 2,773 as filed, 0 moved.
+* `SELFHOST_NATIVE_ALIGN=1` over `tests/selfhost_native_*_test.ts` and the two inventory tests:
+  5,254 passed, 0 failed.
+
+**Next.**
+* D4888: the record of the complement over a parameter `v: T[] | i32[]`.
+* D4889: the hole face of the complement.
+* The `unc` notes, where the column does not cover the node, and the mono-callback `Call` ×8.
+* D3346, D4862, D3368, the `if` join at a pin (D2832), the narrowed family, the scope callers.
