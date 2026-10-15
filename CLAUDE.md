@@ -709,7 +709,7 @@ found (D1646/D1647) are `docs/internals/kind-ladder-lint.md`.
 `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
 across two functions where only one hands back. Ratchet: `vl check --budget
 scripts/ladder-budget-baseline.json` (held by `lint-self.sh`), and `vl run scripts/ladder-sets.vl` beside it
-re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
+re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.vl` is the discovery half — `--sets`, `--split`, and `--pred`
 for the form with no kind literal in it, which is the only place #2400's hole is visible.
 
 ## A TABLE READ BOUND-TESTS ITS INDEX, OR TAKES A READER WHOSE MISS CANNOT BE A REAL ROW

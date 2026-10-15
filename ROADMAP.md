@@ -156,7 +156,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   kind ladders (ONE storage-class dispatch table) are still ahead of both.
 - ✅ **8. A ladder over a closed kind set is exhaustive or names its default — DONE.**
   `kind-ladder-incomplete` / `kind-ladder-split` in `compiler/lint.vl`, the ratchet
-  `vl check --budget scripts/ladder-budget-baseline.json` (440 + 9 then), the census `scripts/ladder-census.py`.
+  `vl check --budget scripts/ladder-budget-baseline.json` (440 + 9 then), the census `scripts/ladder-census.vl`.
   See the fuller row below. **STATUS 2026-09-06: ratchet now 430 + 8** — it was 435 + 8 when this line was written
   the same day, which is how fast a quoted ratchet goes stale.
 - ✅ **8b. A table read bound-tests its index, or takes a reader whose miss cannot be a
@@ -503,7 +503,7 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   file by `vl check --budget scripts/ladder-budget-baseline.json`, and
   `scripts/ladder-sets.vl` re-derives every closed set from the `export type` that declares
   it and FAILS when the lint's copy has drifted.
-  `scripts/ladder-census.py` is the discovery instrument — `--sets`, the ladder table,
+  `scripts/ladder-census.vl` is the discovery instrument — `--sets`, the ladder table,
   `--split`, and `--pred` for the form with no kind literal in it at all (#2400's).
   Byte-identical seed. See CLAUDE.md, "A LADDER OVER A CLOSED KIND SET".
 - **Width subtyping — RULED (owner, 2026-09-01): the non-prefix refusal is a GAP, closed
@@ -1580,7 +1580,7 @@ in-language GC knobs.
      **STAGE C — "one rep per node", the CONSUMER census and conversion. OPEN, owner-approved
      2026-09-06; plan, order and numbers: `docs/internals/rep-descriptor-campaign.md`.**
      Stage B widened the PRODUCER; Stage C converts the population on the other side of the
-     seam, which nothing had counted. `scripts/rep-classifier-census.py` derives it from the
+     seam, which nothing had counted. `scripts/rep-classifier-census.vl` derives it from the
      tree: **519 rep classifiers over 2,962 call sites**, 138 reading the ARENA, 117 a NAME,
      28 a SPELLING, 132 a TABLE column and 223 a FRAME. Every conversion is graded by the
      **ladder-vs-descriptor agreement oracle** (`repABNote`/`repLadderABSweep`, riding
