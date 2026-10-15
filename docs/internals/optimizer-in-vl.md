@@ -17,7 +17,7 @@ everything VL does to the module around it.
 | --- | --- | --- |
 | strip `vl-src` | `strip_src`, which calls the compiler's `optStripSrc` | a `--source-map` build's source rows describe the emitter's bytes, which every later step rewrites; it is the only `-O` build whose module carries them |
 | opt cache | `opt_cache_action` | keyed on the stripped bytes, the rung, `--names`, `--low-memory`, `--stable-layout`, the `wasm-opt` identity, the seed's digest and every `VL_*` variable; a hit skips the rest |
-| inline step | `inline::inline_step` (with `flat::flat_step`) | a field holding a small unwritten record stores its fields in the parent; a list of such records holds them side by side; `$VL_OPT_NO_INLINE` skips it |
+| inline step | `inline::inline_step`, after the compiler's `optInline` (`compiler/opt_inline.vl`) and `optInlineRewrite` (`compiler/opt_inline_scan.vl`), runs `flat::flat_step` on their module | a field holding a small unwritten record stores its fields in the parent; a list of such records holds them side by side; `$VL_OPT_NO_INLINE` skips it |
 | multi-value step | `multivalue_step`, which calls the compiler's `optMultivalue` (`compiler/opt_multivalue.vl`) | a call site that only reads its small record result calls a twin returning the fields; `$VL_OPT_NO_MULTIVALUE` skips it |
 | source-map remap | `remap` closure | a step that moves code rebuilds the map from the rows each moved op carries |
 | escape step | `escape_inline_step`, which calls the compiler's `optEscapeChoose` / `optEscapeRestore` (`compiler/opt_escape.vl`) and runs `wasm-opt` between them | chooses callees whose struct argument never escapes, renames every function `L4c.<i>` / `L4n.<i>`, runs `wasm-opt -g --no-inline=L4n.* --always-inline-max-function-size 100000 --inlining`, restores the names |
@@ -42,9 +42,9 @@ after, on one seed.
 | R3 | the escape choice and its two renames (`compiler/opt_escape.vl`, `compiler/wasm_names.vl`); the default, its Rust deleted | retired (`$VL_OPT_ESCAPE`) | `$VL_OPT_ESCAPE_DUMP` byte-identical |
 | R4 | a module writer: sections, types, bodies (`inline::assemble`, `type_section`, `encode_sub`, `finish_body`) (`compiler/wasm_write.vl`) | `$VL_OPT_ROUNDTRIP` (a check, not a side) | decode then encode is the identity over every module R1 reads |
 | R5 | the multi-value step, with the host's last `rename_functions` (it names each twin `<name>.mv` under `--names`) (`compiler/opt_multivalue.vl`); the default, its Rust deleted | retired (`$VL_OPT_MULTIVALUE`) | `$VL_OPT_MV_DUMP` with `$VL_OPT_NO_INLINE=1`, and the moved rows a `--source-map` build remaps |
-| R6a | the inline-record step's census: whether any field or element holds a leaf record (`compiler/opt_inline.vl`); beside the Rust | `$VL_OPT_INLINE` | the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
-| R6b | the inline-record step's walk, validator emulation, dataflow and decision (`compiler/opt_inline_scan.vl`); beside the Rust | `$VL_OPT_INLINE` | the decision text (`inline::decision_rust`), the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
-| R6c | the inline-record step's rewrite: new types, bodies and body moves (`compiler/opt_inline_scan.vl`, `optInlineRewrite`); beside the Rust | `$VL_OPT_INLINE` | the step's module bytes and body moves under `both`, the `$VL_INLINE_EXPLAIN` lines, the built module, and the `--source-map` file |
+| R6a | the inline-record step's census: whether any field or element holds a leaf record (`compiler/opt_inline.vl`); the default, its Rust deleted | retired (`$VL_OPT_INLINE`) | the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
+| R6b | the inline-record step's walk, validator emulation, dataflow and decision (`compiler/opt_inline_scan.vl`); the default, its Rust deleted | retired (`$VL_OPT_INLINE`) | the decision text (`inline::decision_rust`), the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
+| R6c | the inline-record step's rewrite: new types, bodies and body moves (`compiler/opt_inline_scan.vl`, `optInlineRewrite`); the default, its Rust deleted (R6d) | retired (`$VL_OPT_INLINE`) | the step's module bytes and body moves under `both`, the `$VL_INLINE_EXPLAIN` lines, the built module, and the `--source-map` file |
 | R7 | the list-flattening step | `$VL_OPT_FLAT` | `$VL_OPT_FLAT_DUMP` |
 
 The order is cheapest-first by what each needs: R1 and R2 only read; R3 rewrites one custom
@@ -448,5 +448,48 @@ has no store and no read, so no body changes. `VL_INLINE_FAULT=2` fails the buil
 `-O3`, with and without `--stable-layout`, `VL_INLINE_REBOX` and `VL_INLINE_SPILL`.
 `tests/selfhost_native_release_inline_test.ts` runs both faults on each side.
 
-The seed grew by 32,905 bytes (0.58%), net of the retired decision text. The Rust stays the
-default for one more PR: R6d makes `vl` the default and deletes the host's fields step.
+The seed grew by 32,905 bytes (0.58%), net of the retired decision text. R6d made `vl` the
+default and deleted the host's fields step.
+
+## R6d, the default, the Rust deleted
+
+The host's fields step and the decision behind it (`decide`, `fields_step`, `rewrite`, the
+census and its read and use tallies) and the `$VL_OPT_INLINE` selector are gone.
+`inline::inline_step` takes the compiler's module from `optInlineRewrite`, prints the
+compiler's census and field lines under `$VL_INLINE_EXPLAIN`, and runs `flat::flat_step` on it.
+A seed without `optInline` or `optInlineRewrite` refuses an `-O` build by name. `inline.rs`
+keeps the scan, the qualifying rules, the non-null dataflow and the type encoders that
+`flat.rs` uses, and `multivalue.rs` keeps `field_facts`; both leave with R7.
+`VL_INLINE_FAULT` 1, 2 and 3 stay as the census, decision and rewrite controls, and
+`opt-parity.sh` refuses `VL_OPT_INLINE=` as a side.
+
+Before the deletion, `VL_OPT_INLINE=rust` against `both` on R6c's host, one seed:
+
+| population | programs | identical | both refused | with a mark | skipping the step | through an escape step | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/`, `-O` | 15,399 | 10,446 | 4,953 | 3,616 | 8,813 | 1,541 | 0 | 0 |
+
+and over the 1,658 programs that reach the step or are `tests/fixtures/opt-inline` fixtures,
+0 differ and 0 are uncompared under each of `-O3`, `--stable-layout`, `--names`,
+`--source-map`, `-O3 --stable-layout`, `VL_INLINE_REBOX=1` and `VL_INLINE_REBOX=1
+VL_INLINE_SPILL=1`.
+
+Retirement: R6c's host against the host with the Rust deleted, on one seed (R6c rebased on
+the master R6d branches from, so the population is 7 programs larger):
+
+| population | programs | identical | both refused | with a mark | skipping the step | through an escape step | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/`, `-O` | 15,406 | 10,453 | 4,953 | 3,613 | 8,820 | 1,538 | 0 | 0 |
+| the 1,633 that reach the step and the 25 fixtures, `-O3` | 1,658 | 1,658 | 0 | 714 | 1 | 293 | 0 | 0 |
+| the same, `--stable-layout`, `--names`, `--source-map` or `-O3 --stable-layout` | 1,658 | 1,658 | 0 | 714 | 1 | 293 | 0 | 0 |
+| the same, `VL_INLINE_REBOX=1`, with and without `VL_INLINE_SPILL=1` | 1,658 | 1,658 | 0 | 722 | 1 | 302 | 0 | 0 |
+
+The control, R6c's host against the new host under `VL_INLINE_FAULT=3`, differs on 36 of the
+1,633: 35 by the multi-value step's output, which reads the rewritten bodies before
+`wasm-opt`, and 1 by its explain lines. The built modules agree, because `wasm-opt` re-encodes
+the locals the fault pads.
+
+The first retirement run differed on 14 programs, the `rv3310_*__isall` named cells, by
+explain lines alone: their module does not validate, so the compiler's scan declines without a
+line, and the deleted Rust had printed its own skip line. The host now prints that line when
+the scan fails and the compiler printed nothing.

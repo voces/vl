@@ -1,55 +1,15 @@
-//! The `-O`/`-O3` inline-record step (lane IR1, sunpa SP-039; docs/internals/inline-records-design.md
-//! slice S1): a struct field that holds a small record nobody writes stores the record's fields
-//! in the parent instead, so storing one allocates nothing and reading one is a single load.
+//! The `-O`/`-O3` inline-record step's host half (docs/internals/inline-records-design.md;
+//! docs/internals/optimizer-in-vl.md, rung R6). The record-field step itself, which stores a
+//! never-written small record's fields in its parent (slice S1), is the compiler's
+//! `optInlineRewrite`: the host hands this file its output, and this file runs slice S2 on it.
 //!
-//! **What qualifies.** A record `V` is a struct type of 1 to `MV_RECORD_MAX_FIELDS` numeric
-//! fields such that, over the whole module: no `struct.set` (or atomic write) reaches its
-//! subtyping component, as the multi-value step charges writes (D3630); no `ref.eq` or
-//! `extern.convert_any` takes an operand whose static type can hold a `V`; no type declares
-//! `V` as its supertype, so a `V` slot only ever holds a `V`; and no value that crosses the
-//! module boundary (an import's or export's signature, an exposed table or a tag, the
-//! signatures those reach, and, under `--stable-layout`, every type reachable from one through
-//! fields and elements too) can hold a `V`. Under those four no expression can tell a shared
-//! box from a copy, so a read may copy the fields out and a store may copy them in.
-//!
-//! **The boundary is the signature (owner ruling 2026-10-05, inline-records-design.md §6 Q2).**
-//! A record's layout is not part of a module's boundary: only a type a boundary signature names
-//! keeps its layout and identity, because a JS host can hold that object but cannot read a
-//! struct's fields. A record nested in one (a field, a list element, a union box's payload) may
-//! be inlined. A value handed to an `any`/`eq`/`struct` place is still refused when such a
-//! reference crosses, since JS may then hold that very object. `vl build --stable-layout`
-//! selects the conservative rule, for units linked wasm to wasm or read field by field.
-//!
-//! A field `j` of a struct `P` is inlined when its type is a reference to such a `V`; every
-//! value stored into it in reachable code is non-null by its static type (a nullable record
-//! local that validates as non-null is declared so first, and a read of one that a dataflow
-//! proves holds no null there is cast) or is read from another inlined field; `P` is never made by `struct.new_default`, a constant expression or an atomic op,
-//! and cannot cross the boundary itself; every type `P` is in a subtyping relation with
-//! inlines the same field the same way; and no read of the field needs the whole record where
-//! it would cost an allocation that sharing the box does not (a read that is field-read, held
-//! in a local that is only field-read, or passed to a parameter the multi-value step takes as
-//! fields is free). The field becomes `V`'s fields, and later fields shift by `|V| - 1`.
-//!
-//! **The rewrite.** `struct.new P` takes the fields where the record was: a `struct.new V`
-//! operand is deleted (its fields are already on the stack in order), any other operand is
-//! read field by field right after the op that produced it, and an operand whose producer is
-//! not known is spilled with everything above it. `struct.set P j` holds the stored record in a
-//! local, so every source field is read from that one value, then sets the parent's fields.
-//! `struct.get P j` followed by a field read of `V` (through an optional `ref.as_non_null`) is
-//! one `struct.get`; any other read re-boxes with `struct.new V`, a copy taken at the read, as
-//! the language's value semantics require. A stored value is held in a non-null local right
-//! after its producer, so the multi-value step, which runs next, sees `call; local.set` with
-//! field reads only and gives the producer its twin.
-//!
-//! **Lists (slice S2).** The same scan finds arrays of such records, and `flat.rs` then
-//! flattens each that qualifies into one array of the records' fields, on this step's output.
-//!
-//! **Safety.** Every struct type must sit in one rec group (VL's emitter puts them there), so
-//! changing a parent's fields cannot make two types equal. The output is validated, and on any
-//! failure, or anything the step does not parse or re-encode, the input is kept unchanged.
-//! Validation cannot see a field index that shifted wrongly and still type-checks, so the
-//! fixtures grade by output. `$VL_INLINE_EXPLAIN=1` prints, per record type and per candidate
-//! field, why it was taken or not.
+//! **What stays here until rung R7.** The scan that finds the leaf records and the arrays of
+//! them (`scan`), the qualifying rules both slices share (no write, no identity op, no subtype,
+//! no boundary crossing; under `--stable-layout` every type a crossing value reaches keeps its
+//! layout), the non-null dataflow, and the type-section encoders `flat.rs` uses to flatten each
+//! qualifying list into one array of the records' fields. On any failure, or anything the scan
+//! does not parse, the step keeps its input. `$VL_INLINE_EXPLAIN=1` prints the compiler's
+//! census and field lines, then S2's per-array lines.
 
 use crate::{upos, urange};
 use std::collections::{HashMap, HashSet};
@@ -66,20 +26,14 @@ use crate::multivalue::{
 
 const NONE: u32 = u32::MAX;
 
-/// One value a parent's inlinable field is given at a `struct.new` or `struct.set`, or an
-/// element is given at an array op (`field` is then the operand's position).
+/// One value an element is given at an array op.
 #[derive(Clone, Debug)]
 pub(crate) struct Opnd {
-    pub(crate) field: u32,
     /// Its static type admits null (reachable code only; unreachable code is never run).
     pub(crate) nullable: bool,
     /// The op that pushed it, when that op's top result is exactly this value and it sits in
     /// the consumer's own block segment; `NONE` otherwise.
     pub(crate) prod: u32,
-    /// The producer is a `struct.new` of this record type.
-    prod_new: Option<u32>,
-    /// The producer reads this candidate field: non-null exactly when that field is inlined.
-    from_get: Option<(u32, u32)>,
     /// Its static type admits null, but it is read from a local the dataflow proves holds
     /// none there: a store casts it with `ref.as_non_null`, which never traps.
     pub(crate) cast: bool,
@@ -315,22 +269,6 @@ pub(crate) enum AUse {
     Whole,
 }
 
-#[derive(Clone, Debug)]
-enum SiteKind {
-    New(Vec<Opnd>),
-    Set(Opnd),
-}
-
-#[derive(Clone, Debug)]
-struct Site {
-    k: u32,
-    /// The op's offset in the module, for the explain line.
-    off: u32,
-    reach: bool,
-    ty: u32,
-    kind: SiteKind,
-}
-
 pub(crate) struct Body {
     pub(crate) range: (usize, usize),
     pub(crate) ops_start: usize,
@@ -338,9 +276,6 @@ pub(crate) struct Body {
     pub(crate) tightened: Option<Vec<u8>>,
     /// Parameters plus declared locals.
     pub(crate) n_locals: u32,
-    sites: Vec<Site>,
-    /// Some op names a candidate parent type, so its field indices may move.
-    touches: bool,
     /// The ops on candidate array types, and how each element read (by op) is used (S2).
     pub(crate) asites: Vec<ASite>,
     pub(crate) areads: HashMap<u32, AUse>,
@@ -360,22 +295,6 @@ enum Small {
     LocalTee(u32),
     StructGet(u32, u32),
     StructNew(u32),
-}
-
-/// How the reads of one candidate field use the record they get.
-#[derive(Clone, Copy, Default)]
-struct ReadTally {
-    /// Followed by a field read of the record: one `struct.get` of the parent.
-    field: u32,
-    /// Held in a local that is set once and only ever field-read: re-boxed, and the box is
-    /// scalarized by binaryen's heap2local.
-    local: u32,
-    /// Passed straight to a parameter the multi-value step takes as fields: the re-box is
-    /// deleted there.
-    arg: u32,
-    /// Anything else: the read would allocate where today it shares the box.
-    whole: u32,
-    whole_in: Option<u32>,
 }
 
 /// What can hold a value whose identity some op observes.
@@ -405,7 +324,6 @@ pub(crate) struct Scan {
     pub(crate) arr_bad: HashMap<u32, (String, u32)>,
     /// The record types of `potential` and `arrays`.
     records: HashSet<u32>,
-    parents: HashSet<u32>,
     writer: HashMap<u32, u32>,
     default_made: HashMap<u32, u32>,
     atomic_on: HashMap<u32, u32>,
@@ -424,9 +342,6 @@ pub(crate) struct Scan {
     /// Some op handed an abstract place a value whose type could not be mapped back.
     erased_any: Option<u32>,
     pub(crate) bodies: Vec<Body>,
-    reads: HashMap<(u32, u32), ReadTally>,
-    /// Reads passed straight to a call, as (parent, field, callee, argument, function).
-    arg_reads: Vec<(u32, u32, u32, u32, u32)>,
     /// The multi-value step's facts about the scanned module, made on first use.
     pub(crate) mv: std::cell::OnceCell<FieldFacts>,
 }
@@ -541,7 +456,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         arrays: HashMap::new(),
         arr_bad: HashMap::new(),
         records: HashSet::new(),
-        parents: HashSet::new(),
         writer: HashMap::new(),
         default_made: HashMap::new(),
         atomic_on: HashMap::new(),
@@ -553,8 +467,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
         erased: HashMap::new(),
         erased_any: None,
         bodies: Vec::new(),
-        reads: HashMap::new(),
-        arg_reads: Vec::new(),
         mv: std::cell::OnceCell::new(),
     };
     let mut struct_groups = 0usize;
@@ -740,7 +652,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
             };
             if s.rec.get(v as usize).is_some_and(|x| x.is_some()) && !s.has_sub[v as usize] {
                 s.potential.insert((p as u32, j as u32), v);
-                s.parents.insert(p as u32);
             }
         }
     }
@@ -968,18 +879,13 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 .as_ref()
                 .map(|pb| pb[..upos(lr.original_position()) - start].to_vec()),
             n_locals,
-            sites: Vec::new(),
-            touches: false,
             asites: Vec::new(),
             areads: HashMap::new(),
             cast_after: HashSet::new(),
         };
         let mut owner: Vec<u32> = Vec::new();
         let mut post: Vec<u32> = Vec::new();
-        let mut new_of: HashMap<u32, u32> = HashMap::new();
         let mut small: Vec<Small> = Vec::new();
-        let mut gets: Vec<(u32, u32, u32)> = Vec::new();
-        let mut get_at: HashMap<u32, (u32, u32)> = HashMap::new();
         let mut agets: Vec<(u32, u32)> = Vec::new();
         // A nullable record local holds no null where some set reaches every path and no set
         // is of a value whose type admits null: per `local.get`, its local when assigned there.
@@ -1021,14 +927,11 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                         _ => false,
                     }
             };
-            let opnd = |field: u32, d: usize| -> Opnd {
+            let opnd = |d: usize| -> Opnd {
                 let q = if hb > d { producer(hb - 1 - d) } else { NONE };
                 Opnd {
-                    field,
                     nullable: nullable_at(d),
                     prod: q,
-                    prod_new: (q != NONE).then(|| new_of.get(&q).copied()).flatten(),
-                    from_get: (q != NONE).then(|| get_at.get(&q).copied()).flatten(),
                     cast: false,
                 }
             };
@@ -1072,58 +975,11 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 }
             }
             match &op {
-                Operator::StructNew {
-                    struct_type_index: t,
-                } => {
-                    if s.parents.contains(t) {
-                        b.touches = true;
-                        let m = s.fields(*t).len();
-                        let opnds: Vec<Opnd> = (0..m as u32)
-                            .filter(|j| s.potential.contains_key(&(*t, *j)))
-                            .map(|j| opnd(j, m - 1 - j as usize))
-                            .collect();
-                        b.sites.push(Site {
-                            k,
-                            off: off as u32,
-                            reach,
-                            ty: *t,
-                            kind: SiteKind::New(opnds),
-                        });
-                    }
-                }
                 Operator::StructSet {
                     struct_type_index: t,
-                    field_index: j,
+                    ..
                 } => {
                     s.writer.entry(*t).or_insert(f);
-                    if s.parents.contains(t) {
-                        b.touches = true;
-                        if s.potential.contains_key(&(*t, *j)) {
-                            b.sites.push(Site {
-                                k,
-                                off: off as u32,
-                                reach,
-                                ty: *t,
-                                kind: SiteKind::Set(opnd(*j, 0)),
-                            });
-                        }
-                    }
-                }
-                Operator::StructGet {
-                    struct_type_index: t,
-                    ..
-                }
-                | Operator::StructGetS {
-                    struct_type_index: t,
-                    ..
-                }
-                | Operator::StructGetU {
-                    struct_type_index: t,
-                    ..
-                } => {
-                    if s.parents.contains(t) {
-                        b.touches = true;
-                    }
                 }
                 Operator::StructNewDefault {
                     struct_type_index: t,
@@ -1233,7 +1089,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                         array_type_index: a,
                         array_size: m,
                     } if s.arrays.contains_key(&a) => {
-                        let opnds = (0..m).map(|i| opnd(i, (m - 1 - i) as usize)).collect();
+                        let opnds = (0..m).map(|i| opnd((m - 1 - i) as usize)).collect();
                         asite(ArrKind::NewFixed(opnds), a)
                     }
                     Operator::ArrayGet {
@@ -1244,7 +1100,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                     }
                     Operator::ArraySet {
                         array_type_index: a,
-                    } if s.arrays.contains_key(&a) => asite(ArrKind::Set(opnd(0, 0)), a),
+                    } if s.arrays.contains_key(&a) => asite(ArrKind::Set(opnd(0)), a),
                     Operator::ArrayCopy {
                         array_type_index_dst: a,
                         array_type_index_src: c,
@@ -1317,14 +1173,6 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                     _ => {}
                 }
             }
-            if let Operator::StructNew {
-                struct_type_index: t,
-            } = op
-            {
-                if s.rec.get(t as usize).is_some_and(|r| r.is_some()) {
-                    new_of.insert(k, t);
-                }
-            }
             match op {
                 Operator::LocalGet { local_index: l } if tracked(l) => {
                     flow.push((k, Flow::Get(l)));
@@ -1370,13 +1218,7 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 Operator::StructGet {
                     struct_type_index,
                     field_index,
-                } => {
-                    if s.potential.contains_key(&(struct_type_index, field_index)) {
-                        gets.push((k, struct_type_index, field_index));
-                        get_at.insert(k, (struct_type_index, field_index));
-                    }
-                    Small::StructGet(struct_type_index, field_index)
-                }
+                } => Small::StructGet(struct_type_index, field_index),
                 Operator::StructNew { struct_type_index } => Small::StructNew(struct_type_index),
                 Operator::ArrayGet { array_type_index } => Small::ArrayGet(array_type_index),
                 Operator::Call { function_index } => Small::Call(function_index),
@@ -1424,38 +1266,11 @@ pub(crate) fn scan(bytes: &[u8], stable_layout: bool) -> Result<Option<Scan>, St
                 o.cast = true;
             }
         };
-        for site in &mut b.sites {
-            match &mut site.kind {
-                SiteKind::New(os) => os.iter_mut().for_each(refine),
-                SiteKind::Set(o) => refine(o),
-            }
-        }
         for site in &mut b.asites {
             match &mut site.kind {
                 ArrKind::Set(o) => refine(o),
                 ArrKind::NewFixed(os) => os.iter_mut().for_each(refine),
                 _ => {}
-            }
-        }
-        let uses = local_uses(&small, &gets);
-        for &(k, p, j) in &gets {
-            let v = s.potential[&(p, j)];
-            let how = classify_read(&s, &small, &uses, k as usize, v, n_params);
-            // The op whose value a call would take: the read, or the cast right after it.
-            let last = if small.get(k as usize + 1) == Some(&Small::AsNonNull) {
-                k + 1
-            } else {
-                k
-            };
-            let t = s.reads.entry((p, j)).or_default();
-            match (how, arg_of.get(&last)) {
-                (0, _) => t.field += 1,
-                (1, _) => t.local += 1,
-                (_, Some(&(g, a))) => s.arg_reads.push((p, j, g, a, f)),
-                _ => {
-                    t.whole += 1;
-                    t.whole_in.get_or_insert(f);
-                }
             }
         }
         if !agets.is_empty() {
@@ -1572,52 +1387,6 @@ fn after_cast(small: &[Small], k: usize) -> Option<(usize, Small)> {
 fn field_read_of(s: &Scan, op: Small, v: u32) -> bool {
     matches!(op, Small::StructGet(t, x)
         if s.holds(Holder::Concrete(t), v) && (x as usize) < s.fields(t).len())
-}
-
-/// How a body uses one local that a record read is stored into: whether it is ever tee'd, how
-/// many times it is set, and the field each get is read through (`None`: not field-read).
-#[derive(Default)]
-struct LocalUse {
-    tee: bool,
-    sets: u32,
-    reads: Vec<Option<(u32, u32)>>,
-}
-
-/// The uses of every local some candidate read in `gets` is stored into, in one pass.
-fn local_uses(small: &[Small], gets: &[(u32, u32, u32)]) -> HashMap<u32, LocalUse> {
-    let mut out: HashMap<u32, LocalUse> = HashMap::new();
-    for &(k, _, _) in gets {
-        if let Some((_, Small::LocalSet(l))) = after_cast(small, k as usize) {
-            out.entry(l).or_default();
-        }
-    }
-    if out.is_empty() {
-        return out;
-    }
-    for (q, &op) in small.iter().enumerate() {
-        match op {
-            Small::LocalTee(l) => {
-                if let Some(u) = out.get_mut(&l) {
-                    u.tee = true;
-                }
-            }
-            Small::LocalSet(l) => {
-                if let Some(u) = out.get_mut(&l) {
-                    u.sets += 1;
-                }
-            }
-            Small::LocalGet(l) => {
-                if let Some(u) = out.get_mut(&l) {
-                    u.reads.push(match after_cast(small, q) {
-                        Some((_, Small::StructGet(t, x))) => Some((t, x)),
-                        _ => None,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// The locals (not parameters) an element read of a candidate array type is stored into that
@@ -1738,34 +1507,6 @@ fn elem_locals<'m>(
         bad.extend(drop);
     }
     arr_of.into_keys().filter(|l| !bad.contains(l)).collect()
-}
-
-/// How the read of a record field at op `k` uses the record: 0 a field read, 1 a local that
-/// holds only this read and is only field-read, 2 anything else.
-fn classify_read(
-    s: &Scan,
-    small: &[Small],
-    uses: &HashMap<u32, LocalUse>,
-    k: usize,
-    v: u32,
-    n_params: u32,
-) -> u8 {
-    match after_cast(small, k) {
-        Some((_, op)) if field_read_of(s, op, v) => 0,
-        Some((_, Small::LocalSet(l))) if l >= n_params => match uses.get(&l) {
-            Some(u)
-                if !u.tee
-                    && u.sets == 1
-                    && u.reads.iter().all(|r| {
-                        r.is_some_and(|(t, x)| field_read_of(s, Small::StructGet(t, x), v))
-                    }) =>
-            {
-                1
-            }
-            _ => 2,
-        },
-        _ => 2,
-    }
 }
 
 /// The types `op` takes from the operand stack where its immediates fix them, bottom first,
@@ -1959,57 +1700,24 @@ pub(crate) fn record_refusal(s: &Scan, v: u32, names: &dyn Fn(u32) -> String) ->
     None
 }
 
-/// The explain line of a scan that leaves the module alone, or `None` when it found a candidate.
-fn skipped(scanned: &Result<Option<Scan>, String>) -> Option<String> {
-    match scanned {
-        Ok(Some(_)) => None,
-        Ok(None) => Some(format!(
-            "inline-explain: step skipped: no struct field or array element holds a leaf record \
-             (1 to {MV_RECORD_MAX_FIELDS} numeric fields)"
-        )),
-        Err(why) => Some(format!("inline-explain: step skipped: {why}")),
-    }
-}
-
-/// The host scan's answer where the compiler's census (`optInline`, rung R6a) decided: its
-/// explain line when it leaves `bytes` alone, `None` when it found a candidate.
-pub fn census_rust(bytes: &[u8], stable_layout: bool) -> Option<String> {
-    skipped(&scan(bytes, stable_layout))
-}
-
-/// The compiler's record-field step (`optInlineRewrite`, rung R6c) on a module: what it wrote
-/// and where each body came from, or `None` when it changed nothing, beside its
-/// `$VL_INLINE_EXPLAIN` lines.
+/// The compiler's record-field step (`optInlineRewrite`) on a module: what it wrote and where
+/// each body came from, or `None` when it changed nothing, beside its `$VL_INLINE_EXPLAIN`
+/// lines.
 pub struct VlFields {
     pub out: Option<(Vec<u8>, Vec<BodyMove>)>,
     pub log: String,
 }
 
-/// Which side inlines record fields: the host, the compiler, or both, compared.
-pub enum FieldsBy {
-    Rust,
-    Vl(VlFields),
-    Both(VlFields),
-}
-
-fn same_moves(a: &[BodyMove], b: &[BodyMove]) -> bool {
-    a.len() == b.len()
-        && a
-            .iter()
-            .zip(b)
-            .all(|(x, y)| x.from == y.from && x.to == y.to && x.pairs == y.pairs)
-}
-
-/// The step: `Some((rewritten module, where each output body came from))`, or `None` when it
-/// changes nothing. `stable_layout` (`vl build --stable-layout`) keeps the layout of every type
-/// a crossing value reaches, not only of the types a boundary signature names. `by` says who
-/// inlines record fields; under `FieldsBy::Both` a disagreement is the error.
+/// The step: the compiler's record fields (`fields`), then the lists slice S2 flattens on its
+/// output, or `None` when neither changes the module. `stable_layout` (`vl build
+/// --stable-layout`) keeps the layout of every type a crossing value reaches, not only of the
+/// types a boundary signature names.
 pub fn inline_step(
     bytes: &[u8],
     stable_layout: bool,
     scalarized: &dyn Fn(&[u8]) -> Option<Scalarized>,
-    by: FieldsBy,
-) -> Result<Option<Stepped>, String> {
+    fields: VlFields,
+) -> Option<Stepped> {
     let flag = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
     let explaining = flag("VL_INLINE_EXPLAIN");
     // `$VL_INLINE_REBOX=1`: inline a field even where a read re-boxes, so a grid can grade the
@@ -2020,6 +1728,11 @@ pub fn inline_step(
     let spill_all = flag("VL_INLINE_SPILL");
     // `$VL_OPT_NO_FLAT=1`: inline record fields but flatten no list (S2's control).
     let no_flat = flag("VL_OPT_NO_FLAT");
+    let silent = fields.log.is_empty() && fields.out.is_none();
+    if explaining {
+        eprint!("{}", fields.log);
+    }
+    let fields = fields.out;
     let fields_only = |fields: Option<(Vec<u8>, Vec<BodyMove>)>| {
         fields.map(|(bytes, moved)| Stepped {
             bytes,
@@ -2028,32 +1741,27 @@ pub fn inline_step(
             flat: false,
         })
     };
-    let mut s = match scan(bytes, stable_layout) {
+    let s = match scan(bytes, stable_layout) {
         Ok(Some(s)) => s,
-        scanned => match by {
-            FieldsBy::Vl(v) => {
-                if explaining {
-                    eprint!("{}", v.log);
+        scanned => {
+            // The compiler left alone a module the scan refuses (one that does not validate,
+            // say): the explain report still says why.
+            if explaining && silent {
+                match scanned {
+                    Err(why) => eprintln!("inline-explain: step skipped: {why}"),
+                    _ => eprintln!(
+                        "inline-explain: step skipped: no struct field or array element holds \
+                         a leaf record (1 to {MV_RECORD_MAX_FIELDS} numeric fields)"
+                    ),
                 }
-                return Ok(fields_only(v.out));
             }
-            FieldsBy::Both(v) if v.out.is_some() || !v.log.is_empty() => {
-                return Err(format!(
-                    "$VL_OPT_INLINE=both: the inline-record step differs between the host and \
-                     the compiler: the host leaves the module alone ({}), the compiler says\n{}",
-                    skipped(&scanned).unwrap_or_default(),
-                    v.log.trim_end()
-                ));
-            }
-            _ => {
-                if let (true, Some(line)) = (explaining, skipped(&scanned)) {
-                    eprintln!("{line}");
-                }
-                return Ok(None);
-            }
-        },
+            return fields_only(fields);
+        }
     };
-    let fnames = if explaining || matches!(by, FieldsBy::Both(_)) {
+    if s.arrays.is_empty() || no_flat {
+        return fields_only(fields);
+    }
+    let fnames = if explaining {
         function_names(bytes)
     } else {
         HashMap::new()
@@ -2064,51 +1772,6 @@ pub fn inline_step(
             .cloned()
             .unwrap_or_else(|| format!("func {f}"))
     };
-    let fields = match by {
-        FieldsBy::Vl(v) => {
-            if explaining {
-                eprint!("{}", v.log);
-            }
-            v.out
-        }
-        by => {
-            let mut log = String::new();
-            let host = if s.potential.is_empty() {
-                None
-            } else {
-                fields_step(&mut s, bytes, rebox_all, spill_all, &name, &mut log)
-            };
-            if let FieldsBy::Both(v) = by {
-                if v.log != log {
-                    return Err(format!(
-                        "$VL_OPT_INLINE=both: the inline-record step's decision differs between \
-                         the host and the compiler: the compiler says\n{}\nthe host says\n{}",
-                        v.log.trim_end(),
-                        log.trim_end()
-                    ));
-                }
-                let agree = match (&host, &v.out) {
-                    (None, None) => true,
-                    (Some((hb, hm)), Some((vb, vm))) => hb == vb && same_moves(hm, vm),
-                    _ => false,
-                };
-                if !agree {
-                    return Err(
-                        "$VL_OPT_INLINE=both: the inline-record step's rewrite differs between \
-                         the host and the compiler (its module bytes or body moves)"
-                            .into(),
-                    );
-                }
-            }
-            if explaining {
-                eprint!("{log}");
-            }
-            host
-        }
-    };
-    if s.arrays.is_empty() || no_flat {
-        return Ok(fields_only(fields));
-    }
     // Slice S2 reads the field step's output, so a re-boxed field read it stores is seen.
     let flat = match &fields {
         None => crate::flat::flat_step(
@@ -2121,7 +1784,7 @@ pub fn inline_step(
             _ => None,
         },
     };
-    Ok(match (fields, flat) {
+    match (fields, flat) {
         (None, None) => None,
         (Some((bytes, moved)), None) => Some(Stepped {
             bytes,
@@ -2149,7 +1812,7 @@ pub fn inline_step(
             fields: true,
             flat: true,
         }),
-    })
+    }
 }
 
 /// The step's output: the module, where each body came from, and which slices changed it.
@@ -2160,300 +1823,6 @@ pub struct Stepped {
     pub fields: bool,
     /// S2 flattened a list.
     pub flat: bool,
-}
-
-/// Slice S1's decision: per record type why it may not be copied (`None`: a candidate), per
-/// candidate field the record it inlines or why it does not, and per inlined field how many of
-/// its reads are re-boxed into a field-read local and into a field parameter.
-struct Decision {
-    records: Vec<(u32, Option<String>)>,
-    inline: HashMap<(u32, u32), u32>,
-    refused: HashMap<(u32, u32), String>,
-    reboxed: HashMap<(u32, u32), (u32, u32)>,
-}
-
-/// Decides which of the fields `s` finds qualify. `name` spells a function index in a reason.
-fn decide(
-    s: &mut Scan,
-    bytes: &[u8],
-    rebox_all: bool,
-    name: &dyn Fn(u32) -> String,
-) -> Decision {
-    // The records that may be copied, and the fields that may hold one inline.
-    let mut records: Vec<u32> = s.potential.values().copied().collect();
-    records.sort_unstable();
-    records.dedup();
-    let records: Vec<(u32, Option<String>)> = records
-        .into_iter()
-        .map(|v| (v, record_refusal(s, v, name)))
-        .collect();
-    let ok_record: HashSet<u32> = records
-        .iter()
-        .filter(|(_, why)| why.is_none())
-        .map(|&(v, _)| v)
-        .collect();
-    // A read passed to a call is free when the multi-value step takes that parameter as fields.
-    if !s.arg_reads.is_empty() {
-        let facts = s.mv.take().unwrap_or_else(|| field_facts(bytes));
-        for (p, j, g, a, f) in std::mem::take(&mut s.arg_reads) {
-            let t = s.reads.entry((p, j)).or_default();
-            if facts.fo_param.contains(&(g, a)) {
-                t.arg += 1;
-            } else {
-                t.whole += 1;
-                t.whole_in.get_or_insert(f);
-            }
-        }
-        let _ = s.mv.set(facts);
-    }
-    let s: &Scan = s;
-    let mut refused: HashMap<(u32, u32), String> = HashMap::new();
-    // A store of a value whose type admits null refuses its field, unless the value is read
-    // from a field that is itself inlined (a re-box is never null): those wait for the fixpoint.
-    let mut needs: Vec<((u32, u32), (u32, u32), String)> = Vec::new();
-    for (bi, b) in s.bodies.iter().enumerate() {
-        let f = s.n_imports + bi as u32;
-        for site in b.sites.iter().filter(|x| x.reach) {
-            let opnds: Vec<&Opnd> = match &site.kind {
-                SiteKind::New(os) => os.iter().collect(),
-                SiteKind::Set(o) => vec![o],
-            };
-            for o in opnds.into_iter().filter(|o| o.nullable) {
-                let op = if matches!(site.kind, SiteKind::New(_)) {
-                    "struct.new"
-                } else {
-                    "struct.set"
-                };
-                let why = format!(
-                    "a value whose type admits null is stored into it ({op} at byte {:#x} in {})",
-                    site.off,
-                    name(f)
-                );
-                match o.from_get {
-                    Some(src) if src != (site.ty, o.field) => {
-                        needs.push(((site.ty, o.field), src, why))
-                    }
-                    Some(_) => {}
-                    None => {
-                        refused.entry((site.ty, o.field)).or_insert(why);
-                    }
-                }
-            }
-        }
-    }
-    let mut inline: HashMap<(u32, u32), u32> = HashMap::new();
-    let mut pairs: Vec<(u32, u32)> = s.potential.keys().copied().collect();
-    pairs.sort_unstable();
-    for &(p, j) in &pairs {
-        let v = s.potential[&(p, j)];
-        let why = if !ok_record.contains(&v) {
-            Some(format!("its record type {v} is refused (above)"))
-        } else if let Some(f) = s.default_made.get(&p) {
-            Some(format!(
-                "type {p} is made by struct.new_default (in {})",
-                name(*f)
-            ))
-        } else if let Some(f) = s.atomic_on.get(&p) {
-            Some(format!("type {p} is accessed atomically (in {})", name(*f)))
-        } else if let Some(what) = crossing(s, p, name) {
-            Some(format!("type {p} can cross the module boundary ({what}), so its layout is not ours to change"))
-        } else if s.const_made.contains(&p) {
-            Some(format!(
-                "type {p} is made in a constant expression (a global's initializer)"
-            ))
-        } else if let Some(w) = refused.get(&(p, j)) {
-            Some(w.clone())
-        } else if let Some(t) = s.reads.get(&(p, j)).filter(|t| t.whole > 0 && !rebox_all) {
-            Some(format!(
-                "{} of its {} read(s) take the whole record (first in {}), and each would \
-                 allocate a copy where today it shares the box",
-                t.whole,
-                t.field + t.local + t.arg + t.whole,
-                name(t.whole_in.unwrap_or(0))
-            ))
-        } else {
-            None
-        };
-        match why {
-            None => {
-                inline.insert((p, j), v);
-            }
-            Some(w) => {
-                refused.insert((p, j), w);
-            }
-        }
-    }
-    // A subtype and its supertype must lay a shared field out the same way, and a field fed
-    // from another field's read needs that field inlined.
-    loop {
-        let mut drop: Vec<((u32, u32), String)> = Vec::new();
-        for (dst, src, why) in &needs {
-            if inline.contains_key(dst) && !inline.contains_key(src) {
-                drop.push((*dst, why.clone()));
-            }
-        }
-        for t in 0..s.subs.len() as u32 {
-            let Some(sup) = s.supertype(t) else { continue };
-            let n = s.fields(t).len().min(s.fields(sup).len()) as u32;
-            for j in 0..n {
-                let (a, b) = (inline.get(&(t, j)), inline.get(&(sup, j)));
-                if a != b {
-                    if a.is_some() {
-                        drop.push((
-                            (t, j),
-                            format!("its supertype {sup} does not inline field {j}"),
-                        ));
-                    }
-                    if b.is_some() {
-                        drop.push((
-                            (sup, j),
-                            format!("its subtype {t} does not inline field {j}"),
-                        ));
-                    }
-                }
-            }
-        }
-        if drop.is_empty() {
-            break;
-        }
-        for (key, why) in drop {
-            if inline.remove(&key).is_some() {
-                refused.insert(key, why);
-            }
-        }
-    }
-    let reboxed = inline
-        .keys()
-        .map(|k| {
-            let t = s.reads.get(k).copied().unwrap_or_default();
-            (*k, (t.local, t.arg))
-        })
-        .collect();
-    Decision {
-        records,
-        inline,
-        refused,
-        reboxed,
-    }
-}
-
-/// Slice S1: inline the record fields `s` finds that qualify, writing its `$VL_INLINE_EXPLAIN`
-/// lines into `log`.
-fn fields_step(
-    s: &mut Scan,
-    bytes: &[u8],
-    rebox_all: bool,
-    spill_all: bool,
-    name: &dyn Fn(u32) -> String,
-    log: &mut String,
-) -> Option<(Vec<u8>, Vec<BodyMove>)> {
-    use std::fmt::Write;
-    let d = decide(s, bytes, rebox_all, name);
-    let s: &Scan = s;
-    for (v, why) in &d.records {
-        let spelled: Vec<&str> = s.rec[*v as usize]
-            .iter()
-            .flatten()
-            .map(|n| match n {
-                Num::I32 => "i32",
-                Num::I64 => "i64",
-                Num::F32 => "f32",
-                Num::F64 => "f64",
-            })
-            .collect();
-        let _ = match why {
-            None => writeln!(log, "inline-explain: type {v} {{{}}}: candidate", spelled.join(", ")),
-            Some(w) => writeln!(
-                log,
-                "inline-explain: type {v} {{{}}}: refused: {w}",
-                spelled.join(", ")
-            ),
-        };
-    }
-    let Decision {
-        inline, refused, reboxed, ..
-    } = d;
-    let mut pairs: Vec<(u32, u32)> = s.potential.keys().copied().collect();
-    pairs.sort_unstable();
-    if inline.is_empty() {
-        for &(p, j) in &pairs {
-            if let Some(w) = refused.get(&(p, j)) {
-                let _ = writeln!(
-                    log,
-                    "inline-explain: type {p} field {j} (type {}): not inlined: {w}",
-                    s.potential[&(p, j)]
-                );
-            }
-        }
-        log.push_str("inline-explain: no field inlined\n");
-        return None;
-    }
-    let (out, moved, stats) = match rewrite(s, bytes, &inline, spill_all) {
-        Ok(x) => x,
-        Err(why) => {
-            let _ = writeln!(log, "inline-explain: step abandoned: {why}");
-            return None;
-        }
-    };
-    for &(p, j) in &pairs {
-        let v = s.potential[&(p, j)];
-        match refused.get(&(p, j)) {
-            Some(w) => {
-                let _ = writeln!(
-                    log,
-                    "inline-explain: type {p} field {j} (type {v}): not inlined: {w}"
-                );
-            }
-            None => {
-                let st = stats.get(&(p, j)).copied().unwrap_or_default();
-                let (rt_local, rt_arg) = reboxed.get(&(p, j)).copied().unwrap_or_default();
-                let _ = writeln!(
-                    log,
-                    "inline-explain: type {p} field {j} (type {v}): inlined; {} store(s) \
-                     ({} taken apart at the producer, {} spilled), {} read(s) as fields, \
-                     {} re-boxed ({} into a field-read local, {} into a field parameter)",
-                    st.stores,
-                    st.at_producer,
-                    st.spilled,
-                    st.field_reads,
-                    st.reboxed,
-                    rt_local,
-                    rt_arg
-                );
-            }
-        }
-    }
-    if let Err(e) = Validator::new_with_features(WasmFeatures::all()).validate_all(&out) {
-        let _ = writeln!(
-            log,
-            "inline-explain: step abandoned: its output does not validate: {e}"
-        );
-        return None;
-    }
-    let parents: HashSet<u32> = inline.keys().map(|&(p, _)| p).collect();
-    let _ = writeln!(
-        log,
-        "inline-explain: {} field(s) of {} type(s) inlined",
-        inline.len(),
-        parents.len()
-    );
-    Some((out, moved))
-}
-
-#[derive(Clone, Copy, Default)]
-struct Stats {
-    stores: u32,
-    at_producer: u32,
-    spilled: u32,
-    field_reads: u32,
-    reboxed: u32,
-}
-
-/// Per parent with an inlined field: old field index to new, and the record each inlined
-/// field holds.
-pub(crate) struct Layout {
-    start: Vec<u32>,
-    rec: Vec<Option<u32>>,
 }
 
 pub(crate) fn gc_op(out: &mut Vec<u8>, sub: u32, t: u32, field: Option<u32>) {
@@ -2479,310 +1848,6 @@ pub(crate) fn local_op(out: &mut Vec<u8>, op: u8, l: u32) {
 
 pub(crate) fn ref_ty(nullable: bool, t: u32) -> Option<ValType> {
     RefType::new(nullable, HeapType::Concrete(UnpackedIndex::Module(t))).map(ValType::Ref)
-}
-
-type Rewritten = (Vec<u8>, Vec<BodyMove>, HashMap<(u32, u32), Stats>);
-
-fn rewrite(
-    s: &Scan,
-    bytes: &[u8],
-    inline: &HashMap<(u32, u32), u32>,
-    spill_all: bool,
-) -> Result<Rewritten, String> {
-    let mut layout: HashMap<u32, Layout> = HashMap::new();
-    for &(p, _) in inline.keys() {
-        layout.entry(p).or_insert_with(|| {
-            let m = s.fields(p).len() as u32;
-            let mut start = Vec::with_capacity(m as usize + 1);
-            let mut rec = Vec::with_capacity(m as usize);
-            let mut at = 0u32;
-            for j in 0..m {
-                start.push(at);
-                let v = inline.get(&(p, j)).copied();
-                rec.push(v);
-                at += v.map_or(1, |v| {
-                    s.rec[v as usize].as_ref().map_or(1, |r| r.len() as u32)
-                });
-            }
-            start.push(at);
-            Layout { start, rec }
-        });
-    }
-    let rec_len = |v: u32| s.rec[v as usize].as_ref().map_or(0, |r| r.len() as u32);
-    let mut stats: HashMap<(u32, u32), Stats> = HashMap::new();
-    let fail = |w: &str| w.to_string();
-    let mut bodies: Vec<std::borrow::Cow<[u8]>> = Vec::with_capacity(s.bodies.len());
-    let mut body_moves: Vec<Vec<(u32, u32)>> = Vec::with_capacity(s.bodies.len());
-    for b in &s.bodies {
-        if !b.touches {
-            bodies.push(std::borrow::Cow::Borrowed(&bytes[b.range.0..b.range.1]));
-            body_moves.push(vec![(b.range.0 as u32, 0)]);
-            continue;
-        }
-        let mut extra: Vec<ValType> = Vec::new();
-        let mut next_local = b.n_locals;
-        let mut new_local = |t: ValType, extra: &mut Vec<ValType>| {
-            extra.push(t);
-            next_local += 1;
-            next_local - 1
-        };
-        let mut replace: HashMap<u32, Vec<u8>> = HashMap::new();
-        let mut after: HashMap<u32, Vec<u8>> = HashMap::new();
-        for site in &b.sites {
-            let Some(lay) = layout.get(&site.ty) else {
-                continue;
-            };
-            let p = site.ty;
-            match &site.kind {
-                SiteKind::Set(o) => {
-                    let Some(v) = lay.rec[o.field as usize] else {
-                        continue;
-                    };
-                    let st = stats.entry((p, o.field)).or_default();
-                    st.stores += 1;
-                    let tv = new_local(ref_ty(false, v).ok_or("ref type")?, &mut extra);
-                    let tp = new_local(ref_ty(true, p).ok_or("ref type")?, &mut extra);
-                    let mut code = Vec::new();
-                    if site.reach && o.prod != NONE && !spill_all {
-                        let mut a = Vec::new();
-                        cast_if(&mut a, o.cast);
-                        local_op(&mut a, 0x21, tv);
-                        if after.insert(o.prod, a).is_some() || replace.contains_key(&o.prod) {
-                            return Err(fail("two rewrites claim one producer"));
-                        }
-                        st.at_producer += 1;
-                    } else {
-                        cast_if(&mut code, o.cast);
-                        local_op(&mut code, 0x21, tv);
-                        st.spilled += 1;
-                    }
-                    local_op(&mut code, 0x21, tp);
-                    let base = lay.start[o.field as usize];
-                    for i in 0..rec_len(v) {
-                        local_op(&mut code, 0x20, tp);
-                        local_op(&mut code, 0x20, tv);
-                        gc_op(&mut code, 2, v, Some(i));
-                        gc_op(&mut code, 5, p, Some(base + i));
-                    }
-                    replace.insert(site.k, code);
-                }
-                SiteKind::New(os) => {
-                    let ins: Vec<&Opnd> = os
-                        .iter()
-                        .filter(|o| lay.rec[o.field as usize].is_some())
-                        .collect();
-                    if ins.is_empty() {
-                        continue;
-                    }
-                    let at_producers = site.reach
-                        && !spill_all
-                        && ins.iter().all(|o| {
-                            o.prod != NONE
-                                && !after.contains_key(&o.prod)
-                                && !replace.contains_key(&o.prod)
-                        });
-                    if at_producers {
-                        for o in &ins {
-                            let v = lay.rec[o.field as usize].expect("filtered");
-                            let st = stats.entry((p, o.field)).or_default();
-                            st.stores += 1;
-                            st.at_producer += 1;
-                            if o.prod_new == Some(v) {
-                                replace.insert(o.prod, Vec::new());
-                            } else {
-                                let tv = new_local(ref_ty(false, v).ok_or("ref type")?, &mut extra);
-                                let mut a = Vec::new();
-                                cast_if(&mut a, o.cast);
-                                local_op(&mut a, 0x21, tv);
-                                for i in 0..rec_len(v) {
-                                    local_op(&mut a, 0x20, tv);
-                                    gc_op(&mut a, 2, v, Some(i));
-                                }
-                                after.insert(o.prod, a);
-                            }
-                        }
-                    } else {
-                        let fields = s.fields(p);
-                        let first = ins[0].field as usize;
-                        let mut ls: Vec<u32> = Vec::new();
-                        for (j, f) in fields.iter().enumerate().skip(first) {
-                            let t = match lay.rec[j] {
-                                Some(v) => ref_ty(false, v).ok_or("ref type")?,
-                                None => match f.element_type {
-                                    StorageType::Val(v) => v,
-                                    _ => ValType::I32,
-                                },
-                            };
-                            ls.push(new_local(t, &mut extra));
-                        }
-                        let mut code = Vec::new();
-                        for (i, &l) in ls.iter().enumerate().rev() {
-                            let j = (first + i) as u32;
-                            cast_if(&mut code, ins.iter().any(|o| o.field == j && o.cast));
-                            local_op(&mut code, 0x21, l);
-                        }
-                        for (i, &l) in ls.iter().enumerate() {
-                            let j = first + i;
-                            match lay.rec[j] {
-                                Some(v) => {
-                                    let st = stats.entry((p, j as u32)).or_default();
-                                    st.stores += 1;
-                                    st.spilled += 1;
-                                    for x in 0..rec_len(v) {
-                                        local_op(&mut code, 0x20, l);
-                                        gc_op(&mut code, 2, v, Some(x));
-                                    }
-                                }
-                                None => local_op(&mut code, 0x20, l),
-                            }
-                        }
-                        gc_op(&mut code, 0, p, None);
-                        replace.insert(site.k, code);
-                    }
-                }
-            }
-        }
-        // Stream the body, with the plan, re-encoding every field index of a changed parent.
-        let mut reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
-            &bytes[b.ops_start..b.range.1],
-            b.ops_start as u64,
-        ));
-        let mut ops: Vec<(Operator, usize, usize)> = Vec::new();
-        while !reader.eof() {
-            let (op, off) = reader
-                .read_with_offset()
-                .map_err(|_| "a body does not decode")?;
-            let end = if reader.eof() {
-                b.range.1
-            } else {
-                upos(reader.original_position())
-            };
-            ops.push((op, upos(off), end));
-        }
-        let mut code: Vec<u8> = Vec::with_capacity(b.range.1 - b.ops_start + 64);
-        let mut moved: Vec<(u32, u32)> = Vec::with_capacity(ops.len());
-        let mut i = 0usize;
-        while i < ops.len() {
-            let (op, off, end) = &ops[i];
-            let k = i as u32;
-            moved.push((*off as u32, code.len() as u32));
-            let mut consumed = 1usize;
-            if let Some(r) = replace.get(&k) {
-                code.extend_from_slice(r);
-            } else {
-                match op {
-                    Operator::StructGet {
-                        struct_type_index: p,
-                        field_index: j,
-                    } if layout.contains_key(p) => {
-                        let lay = &layout[p];
-                        let nj = lay.start[*j as usize];
-                        match lay.rec[*j as usize] {
-                            None => gc_op(&mut code, 2, *p, Some(nj)),
-                            Some(v) => {
-                                // A field read of the record, through an optional non-null cast.
-                                let mut n = i + 1;
-                                if matches!(ops.get(n), Some((Operator::RefAsNonNull, _, _))) {
-                                    n += 1;
-                                }
-                                let read = match ops.get(n) {
-                                    Some((
-                                        Operator::StructGet {
-                                            struct_type_index: t,
-                                            field_index: x,
-                                        },
-                                        _,
-                                        _,
-                                    )) if s.holds(Holder::Concrete(*t), v)
-                                        && (*x as usize) < s.fields(*t).len()
-                                        && (i + 1..=n).all(|q| {
-                                            !replace.contains_key(&(q as u32))
-                                                && !after.contains_key(&(q as u32))
-                                        })
-                                        && !after.contains_key(&k) =>
-                                    {
-                                        Some(*x)
-                                    }
-                                    _ => None,
-                                };
-                                let st = stats.entry((*p, *j)).or_default();
-                                match read {
-                                    Some(x) => {
-                                        st.field_reads += 1;
-                                        gc_op(&mut code, 2, *p, Some(nj + x));
-                                        consumed = n + 1 - i;
-                                    }
-                                    None => {
-                                        st.reboxed += 1;
-                                        let n = rec_len(v);
-                                        if n == 1 {
-                                            gc_op(&mut code, 2, *p, Some(nj));
-                                        } else {
-                                            let tp = new_local(
-                                                ref_ty(true, *p).ok_or("ref type")?,
-                                                &mut extra,
-                                            );
-                                            local_op(&mut code, 0x21, tp);
-                                            for x in 0..n {
-                                                local_op(&mut code, 0x20, tp);
-                                                gc_op(&mut code, 2, *p, Some(nj + x));
-                                            }
-                                        }
-                                        gc_op(&mut code, 0, v, None);
-                                        // The box is non-null already; a cast after it would
-                                        // hide the allocation from the multi-value step.
-                                        if matches!(
-                                            ops.get(i + 1),
-                                            Some((Operator::RefAsNonNull, _, _))
-                                        ) && !replace.contains_key(&(k + 1))
-                                            && !after.contains_key(&k)
-                                        {
-                                            consumed = 2;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Operator::StructGetS {
-                        struct_type_index: p,
-                        field_index: j,
-                    } if layout.contains_key(p) => {
-                        gc_op(&mut code, 3, *p, Some(layout[p].start[*j as usize]))
-                    }
-                    Operator::StructGetU {
-                        struct_type_index: p,
-                        field_index: j,
-                    } if layout.contains_key(p) => {
-                        gc_op(&mut code, 4, *p, Some(layout[p].start[*j as usize]))
-                    }
-                    Operator::StructSet {
-                        struct_type_index: p,
-                        field_index: j,
-                    } if layout.contains_key(p) => {
-                        if layout[p].rec[*j as usize].is_some() {
-                            return Err(fail("an inlined field's store was not planned"));
-                        }
-                        gc_op(&mut code, 5, *p, Some(layout[p].start[*j as usize]))
-                    }
-                    _ => code.extend_from_slice(&bytes[*off..*end]),
-                }
-            }
-            if let Some(a) = after.get(&k) {
-                code.extend_from_slice(a);
-            }
-            for q in 1..consumed {
-                moved.push((ops[i + q].1 as u32, code.len() as u32));
-            }
-            i += consumed;
-        }
-        let (out, moves) = finish_body(bytes, b, &code, moved, extra)?;
-        bodies.push(std::borrow::Cow::Owned(out));
-        body_moves.push(moves);
-    }
-    let types = type_section(s, &|out, t| encode_sub(out, s, t, &layout, &HashMap::new()))?;
-    let (out, moved) = assemble(s, bytes, types, &bodies, &body_moves)?;
-    Ok((out, moved, stats))
 }
 
 /// A rewritten body: its locals header (the old entries, tightened when that validated, then
@@ -2923,13 +1988,12 @@ fn encode_field(out: &mut Vec<u8>, f: &FieldType) -> Option<()> {
     Some(())
 }
 
-/// Type `t` in the binary format, with a parent's inlined fields expanded and a flattened
-/// array's element (`flat`) made the number its record's fields share.
+/// Type `t` in the binary format, with a flattened array's element (`flat`) made the number its
+/// record's fields share.
 pub(crate) fn encode_sub(
     out: &mut Vec<u8>,
     s: &Scan,
     t: u32,
-    layout: &HashMap<u32, Layout>,
     flat: &HashMap<u32, Num>,
 ) -> Option<()> {
     let sub = &s.subs[t as usize];
@@ -2973,27 +2037,9 @@ pub(crate) fn encode_sub(
         }
         CompositeInnerType::Struct(st) => {
             out.push(0x5f);
-            match layout.get(&t) {
-                None => {
-                    put_uleb(out, st.fields.len() as u64);
-                    for f in st.fields.iter() {
-                        encode_field(out, f)?;
-                    }
-                }
-                Some(lay) => {
-                    put_uleb(out, *lay.start.last()? as u64);
-                    for (j, f) in st.fields.iter().enumerate() {
-                        match lay.rec[j] {
-                            None => encode_field(out, f)?,
-                            Some(v) => {
-                                for &n in s.rec[v as usize].as_ref()? {
-                                    put_val(out, n.val())?;
-                                    out.push(f.mutable as u8);
-                                }
-                            }
-                        }
-                    }
-                }
+            put_uleb(out, st.fields.len() as u64);
+            for f in st.fields.iter() {
+                encode_field(out, f)?;
             }
         }
         CompositeInnerType::Cont(_) => return None,

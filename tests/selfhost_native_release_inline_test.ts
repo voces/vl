@@ -1,8 +1,8 @@
 // `-O`/`-O3` STORE A NEVER-WRITTEN SMALL RECORD INLINE IN ITS PARENT'S FIELDS (sunpa SP-039;
 // docs/internals/inline-records-design.md, slice S1).
 //
-// The host's inline-record step replaces a struct field holding a record nobody writes with
-// the record's own fields. Pinned here, per fixture and rung, by OUTPUT: the optimized module
+// The inline-record step (the compiler's `optInlineRewrite`) replaces a struct field holding
+// a record nobody writes with the record's own fields. Pinned here, per fixture and rung, by OUTPUT: the optimized module
 // prints the unoptimized build's `@log` lines, because a field index that shifted wrongly can
 // still validate. And per fixture kind:
 //
@@ -418,13 +418,12 @@ Deno.test({
 });
 
 // The compiler's census (`optInline`, docs/internals/optimizer-in-vl.md rung R6a) decides,
-// from the type and name sections, that a module holds nothing to inline, and hands every
-// other module to the host's step. `$VL_OPT_INLINE=both` fails a build where the host's scan
-// disagrees, and `$VL_INLINE_FAULT=1`, which makes the census skip every module, is the
-// control that it is consulted: `both` then fails on a fixture the host inlines.
+// from the type and name sections, that a module holds nothing to inline. `$VL_INLINE_FAULT=1`,
+// which makes the census skip every module, is the control that it is consulted: a fixture
+// the step inlines is then left alone.
 Deno.test({
   name:
-    "native-release: the compiler's census agrees with the host's inline-record scan",
+    "native-release: the compiler's census skips a module with nothing to inline",
   ignore: !ENABLED,
   fn: async () => {
     const tmp = await Deno.makeTempDir();
@@ -437,43 +436,20 @@ Deno.test({
           ...env,
         });
       const plain = `${ROOT}/tests/cases/arith/float-remainder-f32.vl`;
-      for (const side of ["vl", "both"]) {
-        const b = await build(plain, { VL_OPT_INLINE: side });
-        if (b.code !== 0 || !skip.test(b.err)) {
-          throw new Error(
-            `VL_OPT_INLINE=${side} on ${plain}: want the census's skip line, got: ${b.err.trim()}`,
-          );
-        }
+      const b = await build(plain, {});
+      if (b.code !== 0 || !skip.test(b.err)) {
+        throw new Error(
+          `${plain}: want the census's skip line, got: ${b.err.trim()}`,
+        );
       }
       const fx = `${DIR}/stored-fields.vl`;
-      const faulted = await build(fx, {
-        VL_OPT_INLINE: "vl",
-        VL_INLINE_FAULT: "1",
-      });
+      const faulted = await build(fx, { VL_INLINE_FAULT: "1" });
       if (
         faulted.code !== 0 || !skip.test(faulted.err) ||
         /: inlined;/.test(faulted.err)
       ) {
         throw new Error(
-          `VL_INLINE_FAULT under vl: want the step skipped, got: ${faulted.err.trim()}`,
-        );
-      }
-      const caught = await build(fx, {
-        VL_OPT_INLINE: "both",
-        VL_INLINE_FAULT: "1",
-      });
-      if (
-        caught.code === 0 ||
-        !/census differs between the host and the compiler/.test(caught.err)
-      ) {
-        throw new Error(
-          `VL_INLINE_FAULT under both: want the build refused, got ${caught.code}: ${caught.err.trim()}`,
-        );
-      }
-      const bad = await build(plain, { VL_OPT_INLINE: "nope" });
-      if (bad.code === 0 || !/expected `rust`, `vl` or `both`/.test(bad.err)) {
-        throw new Error(
-          `VL_OPT_INLINE=nope: want a refusal, got ${bad.code}: ${bad.err.trim()}`,
+          `VL_INLINE_FAULT=1: want the step skipped, got: ${faulted.err.trim()}`,
         );
       }
     } finally {
@@ -482,84 +458,44 @@ Deno.test({
   },
 });
 
-// The compiler's record-field step (`optInlineRewrite`, rungs R6b and R6c) decides which fields
-// to inline and rewrites the module; under `vl` its module is the one written, and `both` fails
-// a build where the host's decision, module bytes or body moves differ. `$VL_INLINE_FAULT=2`,
-// which refuses every field, is the control that the decision is consulted, and 3, which
-// ends each rewritten body's locals with an empty entry (a valid module with other bytes),
-// that the rewrite is.
+// The compiler's record-field step (`optInlineRewrite`, rungs R6b to R6d) decides which fields
+// to inline and writes the module. `$VL_INLINE_FAULT=2`, which refuses every field, is the
+// control that the decision is consulted, and 3, which ends each rewritten body's locals with
+// an empty entry (a valid module with other bytes), that the module written is the compiler's.
 Deno.test({
   name:
-    "native-release: the compiler's inline-record rewrite agrees with the host's",
+    "native-release: the compiler's inline-record rewrite is the module written",
   ignore: !ENABLED,
   fn: async () => {
     const tmp = await Deno.makeTempDir();
-    const explain = (err: string) =>
-      err.split("\n").filter((l) => l.startsWith("inline-explain: ")).join(
-        "\n",
-      );
     try {
-      const build = (spec: string, env: Record<string, string>) => {
-        const [fx, ...flags] = spec.split(" ");
-        return vl(
-          ["build", `${DIR}/${fx}.vl`, "-O", ...flags, "-o", `${tmp}/out.wasm`],
-          { VL_INLINE_EXPLAIN: "1", ...env },
+      const build = (env: Record<string, string>, dump: string) =>
+        vl(
+          ["build", `${DIR}/stored-fields.vl`, "-O", "-o", `${tmp}/out.wasm`],
+          { VL_INLINE_EXPLAIN: "1", VL_OPT_INLINE_DUMP: dump, ...env },
         );
-      };
-      const specs = [
-        "stored-fields",
-        "kept-written",
-        "kept-nullable",
-        "kept-export",
-        "proof-rows",
-        "width-subtyped",
-        "stable-export-union-record",
-        "stable-export-union-record --stable-layout",
-      ];
-      for (const spec of specs) {
-        for (const [rebox, spill] of [["0", "0"], ["1", "0"], ["1", "1"]]) {
-          const env = { VL_INLINE_REBOX: rebox, VL_INLINE_SPILL: spill };
-          const host = await build(spec, { ...env, VL_OPT_INLINE: "rust" });
-          const both = await build(spec, { ...env, VL_OPT_INLINE: "both" });
-          if (
-            host.code !== 0 || both.code !== 0 ||
-            explain(host.err) !== explain(both.err)
-          ) {
-            throw new Error(
-              `${spec} (VL_INLINE_REBOX=${rebox} VL_INLINE_SPILL=${spill}): want both sides to agree\n  host ` +
-                `${host.code}: ${host.err.trim()}\n  both ${both.code}: ${both.err.trim()}`,
-            );
-          }
-        }
-      }
-      const faulted = await build("stored-fields", {
-        VL_OPT_INLINE: "vl",
-        VL_INLINE_FAULT: "2",
-      });
+      const faulted = await build(
+        { VL_INLINE_FAULT: "2" },
+        `${tmp}/refused.wasm`,
+      );
       if (
         faulted.code !== 0 || /: inlined;/.test(faulted.err) ||
         !/not inlined: refused by \$VL_INLINE_FAULT/.test(faulted.err)
       ) {
         throw new Error(
-          `VL_INLINE_FAULT=2 under vl: want every field refused, got: ${faulted.err.trim()}`,
+          `VL_INLINE_FAULT=2: want every field refused, got: ${faulted.err.trim()}`,
         );
       }
-      const caught = await build("stored-fields", {
-        VL_OPT_INLINE: "both",
-        VL_INLINE_FAULT: "2",
-      });
-      if (
-        caught.code === 0 ||
-        !/decision differs between the host and the compiler/.test(caught.err)
-      ) {
+      const plain = await build({}, `${tmp}/plain.wasm`);
+      if (plain.code !== 0 || !exists(`${tmp}/plain.wasm`)) {
         throw new Error(
-          `VL_INLINE_FAULT=2 under both: want the build refused, got ${caught.code}: ${caught.err.trim()}`,
+          `stored-fields: want the step's module, got: ${plain.err.trim()}`,
         );
       }
-      const regrouped = await build("stored-fields", {
-        VL_OPT_INLINE: "vl",
-        VL_INLINE_FAULT: "3",
-      });
+      const regrouped = await build(
+        { VL_INLINE_FAULT: "3" },
+        `${tmp}/regrouped.wasm`,
+      );
       const ran = regrouped.code === 0
         ? await vl(["run", `${tmp}/out.wasm`])
         : undefined;
@@ -569,20 +505,15 @@ Deno.test({
         JSON.stringify(linesOf(ran.out)) !== JSON.stringify(logs)
       ) {
         throw new Error(
-          `VL_INLINE_FAULT=3 under vl: want the fields inlined and the @log lines, got ` +
+          `VL_INLINE_FAULT=3: want the fields inlined and the @log lines, got ` +
             `${regrouped.code}: ${regrouped.err.trim()}\n  ran: ${ran?.out}`,
         );
       }
-      const moved = await build("stored-fields", {
-        VL_OPT_INLINE: "both",
-        VL_INLINE_FAULT: "3",
-      });
-      if (
-        moved.code === 0 ||
-        !/rewrite differs between the host and the compiler/.test(moved.err)
-      ) {
+      const a = Deno.readFileSync(`${tmp}/plain.wasm`);
+      const b = Deno.readFileSync(`${tmp}/regrouped.wasm`);
+      if (a.length === b.length && a.every((x, i) => x === b[i])) {
         throw new Error(
-          `VL_INLINE_FAULT=3 under both: want the build refused, got ${moved.code}: ${moved.err.trim()}`,
+          "VL_INLINE_FAULT=3: want the step's module to differ from the unfaulted one",
         );
       }
     } finally {

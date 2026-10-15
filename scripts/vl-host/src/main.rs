@@ -6351,28 +6351,9 @@ fn escape_inline_step(
     Ok(Some(restored))
 }
 
-/// Which side runs the inline-record step's census and record-field rewrite (rungs R6a–R6c):
-/// `$VL_OPT_INLINE` unset or `rust` the host's alone, `vl` the compiler's `optInline` and
-/// `optInlineRewrite`, `both` the two, failing the build where they disagree.
-#[derive(Clone, Copy, PartialEq)]
-enum OptInlineSide {
-    Rust,
-    Vl,
-    Both,
-}
-
-fn opt_inline_side() -> Result<OptInlineSide> {
-    match std::env::var("VL_OPT_INLINE").unwrap_or_default().as_str() {
-        "" | "rust" => Ok(OptInlineSide::Rust),
-        "vl" => Ok(OptInlineSide::Vl),
-        "both" => Ok(OptInlineSide::Both),
-        other => bail!("$VL_OPT_INLINE={other} — expected `rust`, `vl` or `both`"),
-    }
-}
-
 /// The compiler's census of the inline-record step (`optInline`, rung R6a) on `bytes`: its
-/// `$VL_INLINE_EXPLAIN` line when it leaves the module alone, or `None` when the host's step
-/// must scan it. `$VL_INLINE_FAULT=1` makes it leave every module alone, so a parity run can
+/// `$VL_INLINE_EXPLAIN` line when it leaves the module alone, or `None` when the record-field
+/// rewrite must run. `$VL_INLINE_FAULT=1` makes it leave every module alone, so a test can
 /// show it sees this answer.
 fn inline_vl(
     bytes: &[u8],
@@ -6386,8 +6367,8 @@ fn inline_vl(
         .get_typed_func::<(i32, i32), i32>(&mut store, "optInline")
         .map_err(|e| {
             e.context(
-                "`$VL_OPT_INLINE` runs the inline-record step's census through the compiler's \
-                 `optInline`, which this seed predates (`$VL_OPT_INLINE=rust` runs the host's)",
+                "`-O` runs the inline-record step's census through the compiler's \
+                 `optInline`, which this seed predates",
             )
         })?;
     let fault = inline_fault() == 1;
@@ -6434,9 +6415,8 @@ fn inline_rewrite_vl(
             .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "optInlineRewrite")
             .map_err(|e| {
                 e.context(
-                    "`$VL_OPT_INLINE` runs the inline-record step's rewrite through the \
-                     compiler's `optInlineRewrite`, which this seed predates \
-                     (`$VL_OPT_INLINE=rust` runs the host's)",
+                    "`-O` runs the inline-record step's rewrite through the compiler's \
+                     `optInlineRewrite`, which this seed predates",
                 )
             })?;
         let args = (
@@ -10639,37 +10619,14 @@ fn build_cmd(args: &[String]) -> Result<()> {
                         None
                     })
                 };
-                let side = opt_inline_side()?;
                 let explaining = std::env::var_os("VL_INLINE_EXPLAIN")
                     .is_some_and(|v| !v.is_empty() && v != "0");
-                let decided = if side == OptInlineSide::Rust {
-                    None
-                } else {
-                    phase!(
-                        "opt.inline_census",
-                        inline_vl(
-                            &bytes,
-                            explaining || side == OptInlineSide::Both,
-                            &compile_engine,
-                            &compiler
-                        )
-                    )?
-                };
+                let decided = phase!(
+                    "opt.inline_census",
+                    inline_vl(&bytes, explaining, &compile_engine, &compiler)
+                )?;
                 let stepped = match decided {
                     Some(log) => {
-                        if side == OptInlineSide::Both {
-                            let host = inline::census_rust(&bytes, stable_layout)
-                                .map(|l| format!("{l}\n"));
-                            if host.as_deref() != Some(log.as_str()) {
-                                bail!(
-                                    "$VL_OPT_INLINE=both: the inline-record step's census \
-                                     differs between the host and the compiler: the compiler \
-                                     says `{}`, the host `{}`",
-                                    log.trim_end(),
-                                    host.as_deref().unwrap_or("a candidate").trim_end()
-                                );
-                            }
-                        }
                         if explaining {
                             eprint!("{log}");
                         }
@@ -10679,31 +10636,21 @@ fn build_cmd(args: &[String]) -> Result<()> {
                         let flag = |n: &str| {
                             std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0")
                         };
-                        let by = if side == OptInlineSide::Rust {
-                            inline::FieldsBy::Rust
-                        } else {
-                            let vl = phase!(
-                                "opt.inline_rewrite",
-                                inline_rewrite_vl(
-                                    &bytes,
-                                    stable_layout,
-                                    flag("VL_INLINE_REBOX"),
-                                    flag("VL_INLINE_SPILL"),
-                                    &compile_engine,
-                                    &compiler
-                                )
-                            )?;
-                            if side == OptInlineSide::Both {
-                                inline::FieldsBy::Both(vl)
-                            } else {
-                                inline::FieldsBy::Vl(vl)
-                            }
-                        };
+                        let fields = phase!(
+                            "opt.inline_rewrite",
+                            inline_rewrite_vl(
+                                &bytes,
+                                stable_layout,
+                                flag("VL_INLINE_REBOX"),
+                                flag("VL_INLINE_SPILL"),
+                                &compile_engine,
+                                &compiler
+                            )
+                        )?;
                         phase!(
                             "opt.inline_step",
-                            inline::inline_step(&bytes, stable_layout, &scalarized, by)
+                            inline::inline_step(&bytes, stable_layout, &scalarized, fields)
                         )
-                        .map_err(Error::msg)?
                     }
                 };
                 if let Some(e) = asked.into_inner() {

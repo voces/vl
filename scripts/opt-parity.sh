@@ -12,14 +12,15 @@
 # of a `vl` binary: a rung's port is graded `VAR=rust VAR=vl`, its retirement
 # against a binary built before the Rust was deleted. Both sides use one seed. A
 # retired selector (`$VL_OPT_RUNG_SCAN`, `$VL_OPT_ARGV`, `$VL_OPT_ESCAPE`,
-# `$VL_OPT_MULTIVALUE`) is refused as a side, since the host ignores it and the two
-# sides would be one.
+# `$VL_OPT_MULTIVALUE`, `$VL_OPT_INLINE`) is refused as a side, since the host
+# ignores it and the two sides would be one.
 # Paths are .vl files or directories (searched for *.vl); the default is
 # tests/cases plus the distilled corpus. Run from the checkout root. Exits 1 when
 # any program disagrees, naming each; 2 on a usage error. `--flag` passes one more
 # build flag to both sides (repeatable), and a `--source-map` build's map must agree too,
 # as must the escape and multi-value steps' outputs (`$VL_OPT_ESCAPE_DUMP`, `$VL_OPT_MV_DUMP`)
-# and the inline-record step's `$VL_INLINE_EXPLAIN` lines.
+# and the inline-record step's `$VL_INLINE_EXPLAIN` lines. `$OPT_PARITY_VERDICTS=<file>`
+# keeps the per-program verdicts, so a later run can be given the programs a step reached.
 set -u
 
 COMPILER=build/vl-compiler.wasm
@@ -38,7 +39,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ $# -lt 2 ]; then
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
 A=$1 B=$2
@@ -55,7 +56,7 @@ for side in "$A" "$B"; do
   [ -x "$(side_bin "$side")" ] || { echo "opt-parity: no vl binary for side \`$side\`" >&2; exit 2; }
   # A retired rung's selector is ignored by the host, so a side set by it compares nothing.
   case "$side" in
-    VL_OPT_RUNG_SCAN=* | VL_OPT_ARGV=* | VL_OPT_ESCAPE=* | VL_OPT_MULTIVALUE=*)
+    VL_OPT_RUNG_SCAN=* | VL_OPT_ARGV=* | VL_OPT_ESCAPE=* | VL_OPT_MULTIVALUE=* | VL_OPT_INLINE=*)
       echo "opt-parity: \`${side%%=*}\` selected a rung whose Rust is deleted; the host ignores it." \
         "Grade against a vl binary built before the deletion instead" >&2
       exit 2 ;;
@@ -142,6 +143,7 @@ skipped=$(grep -c "^AGREE .* 1 [01]\$" "$WORK/verdicts")
 escaped=$(grep -c "^AGREE .* 1\$" "$WORK/verdicts")
 differ=$(grep -c '^DIFFER ' "$WORK/verdicts")
 uncompared=$(grep -c '^UNCOMPARED ' "$WORK/verdicts")
+[ -z "${OPT_PARITY_VERDICTS:-}" ] || sort "$WORK/verdicts" > "$OPT_PARITY_VERDICTS"
 grep -E '^(DIFFER|UNCOMPARED) ' "$WORK/verdicts" | sort
 echo "opt-parity $A vs $B ($RUNG$FLAGS): $total programs · $agree identical modules ·" \
   "$both_fail both refused · $marked identical carrying a --no-inline or --skip-pass mark ·" \
