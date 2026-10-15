@@ -6440,18 +6440,25 @@ function monoBindExplicitTyArgs(
 // DECISIONS.md §"An unbound type parameter defaults at the call").
 const MONO_UNBOUND_TY_PARAM_DEFAULT = "i32"
 
-// Binds each of `typarams` that is still unbound in `tvN` and that no annotation in `params`
-// names to the default, in the pin columns and the arena bindings, and keys the instance on it
-// as an explicit type argument would, so `opT(a)` and `opT<i32, i32>(a)` share one instance.
+// Binds each of `typarams` that is still unbound in `tvN`, that no annotation in `params` names
+// and that reaches no spelling the default would answer (`monoTyParamReachesSpelling`) to the
+// default, in the pin columns and the arena bindings, and keys the instance on it as an
+// explicit type argument would, so `opT(a)` and `opT<i32, i32>(a)` share one instance.
 function monoDefaultUnboundTyParams(
   typarams: string[],
   params: i32[],
   tvN: string[],
   tvV: string[],
+  body: i32,
 ) {
   for tp in typarams {
     const one: string[] = [tp]
-    if monoBindOf(tvN, tvV, tp) == "" && !monoParamsMention(params, one) {
+    const seen: i32[] = []
+    if (
+      monoBindOf(tvN, tvV, tp) == ""
+      && !monoParamsMention(params, one)
+      && !monoTyParamReachesSpelling(body, one, seen)
+    ) {
       const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
       tvN.push(tp)
       tvV.push(MONO_UNBOUND_TY_PARAM_DEFAULT)
@@ -6467,6 +6474,71 @@ function monoDefaultUnboundTyParams(
     }
   }
   0
+}
+
+// Whether a binding of `names` could reach an `is` check type or a `T.field` layout constant,
+// in the subtree at `ix` or in a generic it calls with a type argument naming them or an
+// argument whose type has a type variable. Those spellings would answer the default, so a
+// parameter that reaches one stays unbound. `seen` holds the callees already walked.
+function monoTyParamReachesSpelling(
+  ix: i32,
+  names: string[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if monoNodeNamesTyParam(ix, names) { return true }
+  monoTyParamCallReaches(ix, names, seen)
+}
+
+// `monoTyParamReachesSpelling`'s walk over the generic calls in the subtree at `ix`.
+function monoTyParamCallReaches(
+  ix: i32,
+  names: string[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      const fe = fnIndexOf(cf.identName)
+      if fe >= 0 && fe < fnStmts.length && !i32ListHas(seen, fe) {
+        const g = P.nodes[fnStmts[fe]]
+        if g is FuncDecl {
+          if g.fnTyParams.length > 0 && monoCallMayBind(ix, n.callArgs, names) {
+            seen.push(fe)
+            if monoTyParamReachesSpelling(g.fnBody, g.fnTyParams, seen) {
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoTyParamCallReaches(kids[i], names, seen) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Whether the call `callIx` can hand a binding of `names` to its callee: a written type
+// argument naming one, or an argument whose type is unknown or has a type variable.
+function monoCallMayBind(callIx: i32, args: i32[], names: string[]): boolean {
+  for ta in callTyArgsOf(callIx) {
+    if monoAnnHasTyParam(tyNameOf(ta), names) { return true }
+  }
+  for a in args {
+    const at = nodeTyIxOf(a)
+    if at < 0 || tyHasTyVar(at) { return true }
+  }
+  false
 }
 
 // Whether any parameter annotation in `params` names one of `typarams`.
@@ -12647,7 +12719,13 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames.push(monoSpecializableCallbackName(args[ci], ctx))
         ci = ci + 1
       }
-      monoDefaultUnboundTyParams(fn.fnTyParams, fn.fnParams, tvN, tvV)
+      monoDefaultUnboundTyParams(
+        fn.fnTyParams,
+        fn.fnParams,
+        tvN,
+        tvV,
+        fn.fnBody,
+      )
       callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
       monoExactPinTys(pinTys, ctx)
       const pinKinds: i32[] = []

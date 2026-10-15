@@ -10431,10 +10431,15 @@ parameter names only body locals, and those hold no value of it: nothing outside
 deliver one, and nothing inside can make one.
 
 **The invariant: the choice is not observable.** Any default must give every program the
-same output. It is enforced in three places:
+same output. It is enforced in four places:
 
 * **Scope.** Only a parameter that no parameter annotation names is defaulted. One a
   parameter names is bound by its argument or stays an inference error.
+* **No spelling reads it.** A parameter whose binding could reach an `is` check type or a
+  `T.field` layout constant, in the body (lambdas included) or in a generic the body calls with
+  a type argument naming it or an argument whose type has a type variable, is left unbound
+  (`monoTyParamReachesSpelling`). Such a program keeps the refusal it had before the default:
+  `T.size` with no binding still says `T` needs a parameter, never that `i32` is not `flat`.
 * **No values.** A local of an unbound parameter can only be empty (`[]`, `null`, a record
   over such lists), so a read of its length, its nullness or its elements agrees under every
   default.
