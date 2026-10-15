@@ -17,13 +17,13 @@ and that is what starts here.
 
 ## 1. The measured inventory
 
-`scripts/rep-classifier-census.py` derives the population from the tree. A function is a
+`scripts/rep-classifier-census.vl` derives the population from the tree. A function is a
 REP CLASSIFIER when both halves hold:
 
 * **LADDER** — its body tests one subject against ≥ 2 members of a closed rep vocabulary:
   `is Ty*` over the arena's variants, `is <NodeKind>` over the AST, a `VKind` string literal,
   a `match` over either, or the PREDICATE form (`retNulRefFlag(…)`, `nameIsMap(…)`) in which
-  no kind literal appears at all. The floor of two arms is `ladder-census.py`'s, for its
+  no kind literal appears at all. The floor of two arms is `ladder-census.vl`'s, for its
   measured reason (D1370's two-arm hole).
 * **REP-ISH** — the ANSWER is a representation: a declared `VKind`, an interned slot or
   heap-type index, a name used as a table key, or a boolean naming a rep family.
@@ -37,7 +37,7 @@ the exact shape this census exists to find and which an arm count cannot see.
 Quoted verbatim, run on `b7a666856` (the merge-base):
 
 ```
-$ python3 scripts/rep-classifier-census.py --summary
+$ vl run scripts/rep-classifier-census.vl -- --summary
 population        2949 top-level functions in scope
 classifiers       519
 call sites        2962
@@ -92,7 +92,7 @@ calls the canonical arena-vs-name classifier NAME-only. `--deep` closes the colu
 call graph, and **the answer is that it saturates**:
 
 ```
-$ python3 scripts/rep-classifier-census.py --summary --deep
+$ vl run scripts/rep-classifier-census.vl -- --summary --deep
   ARENA        420 classifiers    2484 call sites
   NAME         346 classifiers    2277 call sites
   SPELLING     339 classifiers    2262 call sites
@@ -1707,7 +1707,7 @@ recommendation. Neither is decided here.
 
 | number | instrument |
 | --- | --- |
-| 519 classifiers / 2,962 call sites / the reads columns | `scripts/rep-classifier-census.py`, on `b7a666856` |
+| 519 classifiers / 2,962 call sites / the reads columns | `scripts/rep-classifier-census.py` (since ported to `.vl`), on `b7a666856` |
 | the per-family table | the same, `--json`, grouped by name prefix |
 | every AGREE / CONTRADICT count | `VL_REP_SHADOW=1 vl build`, aggregated over the two populations |
 | byte identity | two candidate compilers from ONE seed, sha256 per emitted module |

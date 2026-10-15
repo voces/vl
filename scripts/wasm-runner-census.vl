@@ -1,0 +1,365 @@
+// Which test files EXECUTE emitted wasm, by what compile path, for what grade, in which tier.
+//
+//     vl run scripts/wasm-runner-census.vl [-- --cells]
+//
+// The population is derived from `tests/*.ts` (an import of `runWasm`/`casesWasmOracle`, or a
+// bare `WebAssembly.instantiate`, in code rather than a comment) and held to CLASSIFIED; an
+// unclassified or stale file exits 1. `--cells` prints the oracle's graded-cell SET, which a
+// corpus collapse has to hold fixed. Run from the checkout root: paths resolve against it.
+
+import { IoError, listDir } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { toString } from "std:fmt"
+import { join, split } from "std:str"
+import { findFrom, hasFlag, isDir, isFile, wsLen } from "./lib/common"
+import { padRight, readText, sortStrings } from "./lib/corpus"
+
+const TESTS = "tests"
+const CASES = "tests/cases"
+
+// One row per wasm-executing test file: its role, its compile path, and what it asserts
+// that the corpus oracle cannot. A derived file with no row fails
+// tests/vl_wasm_runner_census_test.ts until it is classified.
+type Row = { file: string, role: string, path: string, grade: string }
+
+const ORACLE_GRADE = "@log output / @trap reason / @hint text"
+
+const CLASSIFIED: Row[] = [
+  {
+    file: "cases_wasm_0_test.ts",
+    role: "oracle shard",
+    path: "seed (in-process)",
+    grade: ORACLE_GRADE,
+  },
+  {
+    file: "cases_wasm_1_test.ts",
+    role: "oracle shard",
+    path: "seed (in-process)",
+    grade: ORACLE_GRADE,
+  },
+  {
+    file: "cases_wasm_2_test.ts",
+    role: "oracle shard",
+    path: "seed (in-process)",
+    grade: ORACLE_GRADE,
+  },
+  {
+    file: "cases_wasm_3_test.ts",
+    role: "oracle shard",
+    path: "seed (in-process)",
+    grade: ORACLE_GRADE,
+  },
+  {
+    file: "vl_addr2line_test.ts",
+    role: "standalone",
+    path: "native vl build --source-map",
+    grade: "a V8 trap's wasm offset maps to the line that trapped",
+  },
+  {
+    file: "vl_exported_memory_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "host reads instance.exports.memory in place",
+  },
+  {
+    file: "vl_global_promotion_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "GLOBAL section entry count, + output through the OTHER path",
+  },
+  {
+    file: "vl_import_memory_test.ts",
+    role: "standalone",
+    path: "native vl build (+ wasm-merge)",
+    grade: "host-owned env.memory: shape, heap window, two linked units",
+  },
+  {
+    file: "vl_initial_memory_test.ts",
+    role: "standalone",
+    path: "native vl build + vl run",
+    grade: "memory limits from --initial/--max-memory; a view kept across an allocation",
+  },
+  {
+    file: "vl_instance_state_leak_test.ts",
+    role: "standalone",
+    path: "seed (in-process, shared instance)",
+    grade: "emission byte-identity vs a fresh-instance oracle",
+  },
+  {
+    file: "vl_large_output_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "a 9.6 MB module read out whole: V8 runs it and prints the sum",
+  },
+  {
+    file: "vl_reexport_abi_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "EXPORT section aliases the public name",
+  },
+  {
+    file: "vl_shared_memory_test.ts",
+    role: "standalone",
+    path: "native vl build + vl run",
+    grade: "shared memory: limits, two Workers over one memory, growth to the max",
+  },
+  {
+    file: "vl_std_process_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "std:process / std:env across both hosts",
+  },
+  {
+    file: "vl_std_fs_write_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "the V8 harness refuses both fs write slots by name",
+  },
+  {
+    file: "vl_trap_source_frames_test.ts",
+    role: "standalone",
+    path: "native vl build",
+    grade: "the trap's per-instruction source block, BOTH hosts",
+  },
+  {
+    file: "vl_seed_abi_test.ts",
+    role: "seed ABI",
+    path: "none — instantiates the SEED",
+    grade: "the seed's own export shape; not emitted user wasm",
+  },
+]
+
+function rowOf(f: string): Row | null {
+  for r in CLASSIFIED {
+    if r.file == f { return r }
+  }
+  null
+}
+
+function sortedNames(dir: string): string[] {
+  const names = listDir(dir)
+  if names is IoError {
+    print("wasm-runner-census: cannot list \{dir} (\{names.msg})")
+    exit(1)
+    return []
+  }
+  sortStrings(names)
+}
+
+function endsWith(s: string, suf: string): boolean {
+  s.length >= suf.length && s.slice(s.length - suf.length, s.length) == suf
+}
+
+// The source with every line cut at its first `//`, string content or not.
+function code(src: string): string {
+  const out: string[] = []
+  for ln in split(src, "\n") {
+    const k = findFrom(ln, "//", 0)
+    if k >= 0 { out.push(ln.slice(0, k)) } else { out.push(ln) }
+  }
+  join(out, "\n")
+}
+
+function skipWs(s: string, i: i32): i32 {
+  let k = i
+  while wsLen(s, k) > 0 { k = k + wsLen(s, k) }
+  k
+}
+
+function startsAt(s: string, i: i32, lit: string): boolean {
+  i >= 0 && i + lit.length <= s.length && s.slice(i, i + lit.length) == lit
+}
+
+// Whether some `<lead><ws><quoted>` occurs, `<ws>` at least one byte when `wsReq`.
+function importsFrom(
+  c: string,
+  lead: string,
+  wsReq: boolean,
+  quoted: string,
+): boolean {
+  let at = findFrom(c, lead, 0)
+  while at >= 0 {
+    const after = at + lead.length
+    const k = skipWs(c, after)
+    if (!wsReq || k > after) && startsAt(c, k, quoted) { return true }
+    at = findFrom(c, lead, at + 1)
+  }
+  false
+}
+
+// The files that reach an instantiation of emitted wasm.
+function executingFiles(): string[] {
+  const out: string[] = []
+  for f in sortedNames(TESTS) {
+    if !endsWith(f, ".ts") || !isFile(TESTS + "/" + f) { continue }
+    const c = code(readText(TESTS + "/" + f))
+    const oracle = importsFrom(
+      c,
+      "from",
+      true,
+      "\"./support/casesWasmOracle.ts\"",
+    )
+    const runner = importsFrom(c, "from", false, "\"./support/runWasm.ts\"")
+      || importsFrom(c, "import(", false, "\"./support/runWasm.ts\"")
+    if oracle || runner || findFrom(c, "WebAssembly.instantiate", 0) >= 0 {
+      out.push(f)
+    }
+  }
+  out
+}
+
+// The oracle's own cell set: ONE case for a directory holding `entry.vl` (the whole
+// module, written with a trailing slash), and one per `.vl` otherwise.
+function walk(d: string, out: string[]) {
+  if isFile(d + "/entry.vl") {
+    out.push(d + "/")
+    return
+  }
+  for name in sortedNames(d) {
+    const p = d + "/" + name
+    if isDir(p) { walk(p, out) }
+    else if endsWith(name, ".vl") { out.push(p) }
+  }
+}
+
+function corpusCells(): string[] {
+  const out: string[] = []
+  walk(CASES, out)
+  sortStrings(out)
+}
+
+// Every `"<head><body>.vl"` literal in `c`, the body non-empty and holding no quote.
+function quoted(c: string, head: string, out: string[]) {
+  let i = 0
+  while i < c.length {
+    if c[i] == 34 && startsAt(c, i + 1, head) {
+      const e = findFrom(c, "\"", i + 1)
+      if e >= 0 {
+        const body = c.slice(i + 1, e)
+        if body.length >= head.length + 4 && endsWith(body, ".vl") {
+          out.push(body)
+          i = e + 1
+          continue
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Every `path:<ws>"<x>.vl"` literal's `<x>.vl`, `<x>` non-empty.
+function pathLiterals(c: string): string[] {
+  const out: string[] = []
+  let at = findFrom(c, "path:", 0)
+  while at >= 0 {
+    const k = skipWs(c, at + 5)
+    let next = at + 1
+    if k < c.length && c[k] == 34 {
+      const e = findFrom(c, "\"", k + 1)
+      if e >= 0 {
+        const body = c.slice(k + 1, e)
+        if body.length >= 4 && endsWith(body, ".vl") {
+          out.push(body)
+          next = e + 1
+        }
+      }
+    }
+    at = findFrom(c, "path:", next)
+  }
+  out
+}
+
+function distinct(xs: string[]): string[] {
+  const s = sortStrings(xs)
+  const out: string[] = []
+  for x in s {
+    if out.length == 0 || out[out.length - 1] != x { out.push(x) }
+  }
+  out
+}
+
+type Named = { file: string, cells: string[] }
+
+// The `tests/cases` paths a wasm-executing standalone suite names: cells run a second time,
+// by a second compile path, which is a cross-path agreement check and not redundancy.
+function namedCells(pop: string[]): Named[] {
+  const hits: Named[] = []
+  for f in pop {
+    if f.length >= 11 && f.slice(0, 11) == "cases_wasm_" { continue }
+    const c = code(readText(TESTS + "/" + f))
+    const found: string[] = []
+    quoted(c, "tests/cases/", found)
+    const all = distinct(found)
+    // the leak harness names its programs relative to `tests/cases/`
+    for r in distinct(pathLiterals(c)) { all.push("tests/cases/" + r) }
+    if all.length > 0 { hits.push({ file: f, cells: distinct(all) }) }
+  }
+  hits
+}
+
+function main(args: string[]): i32 {
+  const pop = executingFiles()
+  if hasFlag(args, "--cells") {
+    const cells = corpusCells()
+    print("corpus cells graded by the oracle shards: \{toString(cells.length)}")
+    for c in cells { print(c) }
+    return 0
+  }
+
+  const unclassified: string[] = []
+  for f in pop {
+    if rowOf(f) == null { unclassified.push(f) }
+  }
+  const stale: string[] = []
+  for r in CLASSIFIED {
+    if !hasFlag(pop, r.file) { stale.push(r.file) }
+  }
+
+  print(
+    "\{padRight("file", 34)} \{padRight("role", 13)} \{padRight("compile path", 32)} grade",
+  )
+  for f in pop {
+    const r = rowOf(f)
+      ?? { file: f, role: "UNCLASSIFIED", path: "?", grade: "?" }
+    print(
+      "\{padRight(f, 34)} \{padRight(r.role, 13)} \{padRight(r.path, 32)} \{r.grade}",
+    )
+  }
+  print("")
+  print("files executing wasm: \{toString(pop.length)}")
+  for role in ["oracle shard", "standalone", "seed ABI"] {
+    let n = 0
+    for f in pop {
+      const r = rowOf(f)
+      if r != null && r.role == role { n = n + 1 }
+    }
+    print("  \{padRight(role, 13)} \{toString(n)}")
+  }
+  print("")
+  print("corpus cells graded by the shards: \{toString(corpusCells().length)}")
+  const named = namedCells(pop)
+  let total = 0
+  for h in named { total = total + h.cells.length }
+  print(
+    "cells a standalone suite ALSO runs: \{toString(total)}, over \{toString(named.length)} files",
+  )
+  for h in named {
+    print("  \{padRight(h.file, 34)} \{toString(h.cells.length)}")
+  }
+  if unclassified.length > 0 {
+    print("")
+    print("UNCLASSIFIED (add a row to CLASSIFIED): \{join(unclassified, ", ")}")
+  }
+  if stale.length > 0 {
+    print("")
+    print("STALE (classified but no longer executing): \{join(stale, ", ")}")
+  }
+  if unclassified.length > 0 || stale.length > 0 { return 1 }
+  0
+}
+
+const argv = programArgs()
+if argv is string[] { exit(main(argv)) }
+print("wasm-runner-census: the arguments are not UTF-8")
+exit(2)

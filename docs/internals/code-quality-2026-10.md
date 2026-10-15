@@ -192,7 +192,7 @@ ladder (`only i32, i64, f64, f32, boolean, struct, union, array, or string param
 supported`). The `checkTopLevel` row is a no-op (`passCheckTopLevel() { 0 }`, `:5895`) kept
 only for the ordering edge `collectFns` declares; it enforced the refusal D1080 retired.
 
-`scripts/emit-refusal-sites.py` reads **676** `emitFail` call sites at 5d4cd14dc
+`scripts/emit-refusal-sites.vl` reads **676** `emitFail` call sites at 5d4cd14dc
 (533 on 2026-09-05). A hand classification of each site's template at 5d4cd14dc (keyword
 rules applied by the survey and not recorded as a script, so it is not reproducible as a
 regex; a seeded sample of 30 re-read by hand agreed on 27) puts **140 of 676** in LEGALITY (names a contract about the user program), 108

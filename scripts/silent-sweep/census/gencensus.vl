@@ -1,0 +1,1340 @@
+// The census grid: one program per coordinate of the axes the silent-sweep rows were each
+// found on, crossed. Every cell prints `7` when its canonical payload is reached and `0`
+// when the probe value puts the default on the read path; the expectation is computed
+// here, never by the compiler. README.md names the axes and what each block crosses.
+//
+//     vl run scripts/silent-sweep/census/gencensus.vl -- <outdir> --block A|B|C|D|E
+//
+// Writes `<outdir>/<cell>.vl` and a `manifest.json` of `expect`, `coords`, `skips` and
+// `meta`. Cell ids are sequential over the axes and block A's covering array is drawn
+// from a fixed seed, so the same block always yields the same cells: the committed named
+// sets depend on it.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, padStart, replaceAll } from "std:str"
+import { die, jsonStr } from "../../lib/common"
+import { sortStrings, spawn, writeText } from "../../lib/corpus"
+import { byCountDesc, pathJoin, tally } from "../../lib/census-read"
+import { Rng, below, newRng } from "../../day-one/rng"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/gencensus.vl -- <outdir> --block A|B|C|D|E"
+
+// A payload rep: its field type, canonical and default field values, and the predicate
+// that holds of the canonical value, with `{X}` standing for the value read.
+type Rep = { ft: string, cv: string, dv: string, pred: string }
+
+// The `f64lit` level is a design refusal and stays: dropping it renumbers every block.
+const REP_NAMES: string[] = [
+  "i32", "i64", "f64", "f32", "bool", "str", "strlit", "numlit", "f64lit",
+  "list", "map", "obj", "arm", "nul", "scalar", "string",
+]
+const REP_ROWS: Rep[] = [
+  { ft: "i32", cv: "7", dv: "0", pred: "{X}.r == 7" },
+  { ft: "i64", cv: "7", dv: "0", pred: "{X}.r == 7" },
+  { ft: "f64", cv: "7.5", dv: "0.5", pred: "{X}.r > 7.0" },
+  { ft: "f32", cv: "7.5", dv: "0.5", pred: "{X}.r > 7.0" },
+  {
+    ft: "boolean",
+    cv: "true",
+    dv: "false",
+    pred: "{X}.r",
+  },
+  {
+    ft: "string",
+    cv: "\"seven\"",
+    dv: "\"\"",
+    pred: "{X}.r == \"seven\"",
+  },
+  {
+    ft: "K",
+    cv: "\"p\"",
+    dv: "\"q\"",
+    pred: "{X}.r == \"p\"",
+  },
+  { ft: "N", cv: "1", dv: "2", pred: "{X}.r == 1" },
+  { ft: "F", cv: "1.5", dv: "2.5", pred: "{X}.r == 1.5" },
+  {
+    ft: "i32[]",
+    cv: "[1, 2]",
+    dv: "[]",
+    pred: "{X}.r.length == 2",
+  },
+  {
+    ft: "{[string]: i32}",
+    cv: "mkI()",
+    dv: "Map()",
+    pred: "{X}.r.length == 1",
+  },
+  {
+    ft: "Inner",
+    cv: "{ q: 7 }",
+    dv: "{ q: 0 }",
+    pred: "{X}.r.q == 7",
+  },
+  {
+    ft: "Shape2",
+    cv: "{ c2: 1 }",
+    dv: "{ s2: 1 }",
+    pred: "{X}.r is Cir2",
+  },
+  {
+    ft: "i32 | null",
+    cv: "7",
+    dv: "null",
+    pred: "{X}.r != null",
+  },
+  { ft: "i32", cv: "7", dv: "0", pred: "{X} == 7" },
+  {
+    ft: "string",
+    cv: "\"seven\"",
+    dv: "\"\"",
+    pred: "{X} == \"seven\"",
+  },
+]
+
+function repOf(name: string): Rep {
+  let i = 0
+  while i < REP_NAMES.length {
+    if REP_NAMES[i] == name { return REP_ROWS[i] }
+    i = i + 1
+  }
+  die("gencensus: no rep \{name}", 1)
+  REP_ROWS[0]
+}
+
+// A payload that is not an object shape at all: the control for the nominal object.
+function isScalar(rep: string): boolean { rep == "scalar" || rep == "string" }
+
+// Only the prelude a rep needs, so a union is present exactly where `union` says.
+function preludeFor(rep: string): string[] {
+  if rep == "strlit" { return ["type K = \"p\" | \"q\""] }
+  if rep == "numlit" { return ["type N = 1 | 2"] }
+  if rep == "f64lit" { return ["type F = 1.5 | 2.5"] }
+  if rep == "obj" { return ["type Inner = { q: i32 }"] }
+  if rep == "arm" {
+    return [
+      "type Cir2 = { c2: i32 }", "type Sq2 = { s2: i32 }",
+      "type Shape2 = Cir2 | Sq2",
+    ]
+  }
+  []
+}
+
+const MKI = "function mkI(): {[string]: i32} {\n  const mi: {[string]: i32} = Map()\n  mi[\"z\"] = 1\n  return mi\n}"
+
+// Container layers, outermost first: L a list, M a map, S a named struct with field `f`.
+const CONT_NAMES: string[] = [
+  "bare", "list", "listlist", "list3", "mapval", "nestedmap", "map3", "forin",
+  "map_of_list", "list_of_map", "structfield", "structfield2",
+]
+
+function layersOf(cont: string): string[] {
+  if cont == "bare" { return [] }
+  if cont == "list" || cont == "forin" { return ["L"] }
+  if cont == "listlist" { return ["L", "L"] }
+  if cont == "list3" { return ["L", "L", "L"] }
+  if cont == "mapval" { return ["M"] }
+  if cont == "nestedmap" { return ["M", "M"] }
+  if cont == "map3" { return ["M", "M", "M"] }
+  if cont == "map_of_list" { return ["M", "L"] }
+  if cont == "list_of_map" { return ["L", "M"] }
+  if cont == "structfield" { return ["S", "M"] }
+  if cont == "structfield2" { return ["S", "S", "M"] }
+  die("gencensus: no container \{cont}", 1)
+  []
+}
+
+function levels(axis: string): string[] {
+  if axis == "store" {
+    return ["local", "global", "param", "callres", "capture"]
+  }
+  if axis == "escope" { return ["mod", "fn", "nested", "lambda"] }
+  if axis == "declness" { return ["byname", "anon", "nodecl"] }
+  if axis == "twin" { return ["none", "exact", "samearity", "armtwin", "late"] }
+  if axis == "union" { return ["nounion", "unused", "used"] }
+  if axis == "claim" { return ["0", "1", "2"] }
+  if axis == "cont" { return CONT_NAMES }
+  if axis == "annpos" {
+    return ["none", "binding", "dest", "retann", "readsite"]
+  }
+  if axis == "deliv" {
+    return [
+      "direct", "boundlocal", "closurearg", "structread", "std", "generic",
+      "calleedeliv",
+    ]
+  }
+  if axis == "pval" {
+    return ["single", "two", "mixed", "empty", "nestedempty", "nullfield"]
+  }
+  if axis == "order" { return ["norm", "rev"] }
+  if axis == "rep" { return REP_NAMES }
+  if axis == "annpat" { return ["outer", "none", "inner", "mid", "all"] }
+  die("gencensus: no axis \{axis}", 1)
+  []
+}
+
+// A cell: axis to level, in the order its manifest `coords` row lists them.
+type Cell = Map<string, string>
+
+function at(c: Cell, k: string): string { c[k] ?? "" }
+
+function cellOf(keys: string[], vals: string[]): Cell {
+  const c: Cell = Map()
+  let i = 0
+  while i < keys.length {
+    c[keys[i]] = vals[i]
+    i = i + 1
+  }
+  c
+}
+
+// ── type spelling ─────────────────────────────────────────────────────────────
+
+// How an annotation spells the payload type.
+function payloadSpelling(rep: string, declness: string): string {
+  if isScalar(rep) { return repOf(rep).ft }
+  if declness == "byname" { return "Circle" }
+  "{r: " + repOf(rep).ft + "}"
+}
+
+// Each S layer's struct name, innermost `WS1`; "" at a layer that is not S.
+function structNames(layers: string[]): string[] {
+  const names: string[] = []
+  for _ in layers { names.push("") }
+  let k = 0
+  let i = layers.length - 1
+  while i >= 0 {
+    if layers[i] == "S" {
+      k = k + 1
+      names[i] = "WS" + toString(k)
+    }
+    i = i - 1
+  }
+  names
+}
+
+// The container type at layer `i`; `i == layers.length` is the payload.
+function tyAt(layers: string[], i: i32, p: string, snames: string[]): string {
+  if i >= layers.length { return p }
+  const lay = layers[i]
+  if lay == "S" { return snames[i] }
+  const inner = tyAt(layers, i + 1, p, snames)
+  if lay == "L" { return inner + "[]" }
+  "{[string]: " + inner + "}"
+}
+
+function structDecls(layers: string[], p: string, snames: string[]): string[] {
+  const out: string[] = []
+  let i = layers.length - 1
+  while i >= 0 {
+    if snames[i] != "" {
+      out.push("type \{snames[i]} = { f: \{tyAt(layers, i + 1, p, snames)} }")
+    }
+    i = i - 1
+  }
+  out
+}
+
+function payloadLiteral(
+  rep: string,
+  canonical: boolean,
+  nullfield: boolean,
+): string {
+  const r = repOf(rep)
+  const v = if canonical { r.cv } else { r.dv }
+  if isScalar(rep) { return v }
+  if nullfield { return "{ r: null }" }
+  "{ r: " + v + " }"
+}
+
+// A default for the thing at layer `i`, used as a `??` fallback.
+function emptyOf(layers: string[], i: i32, rep: string): string {
+  if i >= layers.length { return payloadLiteral(rep, false, false) }
+  if layers[i] == "L" { return "[]" }
+  "Map()"
+}
+
+// A constructible value of the container type, for a `claim` spare.
+function emptyContainer(layers: string[], rep: string): string {
+  if layers.length == 0 { return payloadLiteral(rep, false, false) }
+  const lay = layers[0]
+  if lay == "L" { return "[]" }
+  if lay == "M" { return "Map()" }
+  "{ f: " + emptyContainer(layers.slice(1, layers.length), rep) + " }"
+}
+
+function fill(pred: string, x: string): string { replaceAll(pred, "{X}", x) }
+
+// ── the builder ───────────────────────────────────────────────────────────────
+
+// Statements constructing `cname`, annotated with `ann` (or ""). `annpat` says which
+// intermediate levels also carry an annotation: `outer` only the binding, `none`
+// nothing, `inner` the innermost level, `mid` every level but the innermost, `all` all.
+function buildStmts(
+  layers: string[],
+  p: string,
+  snames: string[],
+  rep: string,
+  pval: string,
+  ind: string,
+  cname: string,
+  ann: string,
+  annpat: string,
+): string[] {
+  const out: string[] = []
+  const n = layers.length
+  const v0 = payloadLiteral(rep, true, pval == "nullfield")
+  const v1 = payloadLiteral(rep, false, false)
+  let slots: string[] = [v0]
+  if pval == "two" { slots = [v0, v0] }
+  if pval == "mixed" { slots = [v0, v1] }
+  let innerSlots = slots
+  if pval == "nestedempty" { innerSlots = [] }
+  if n == 0 {
+    out.push(ind + "const " + cname + ann + " = " + v0)
+    return out
+  }
+  let cur = ""
+  let i = n - 1
+  while i >= 0 {
+    const outermost = i == 0
+    const nm = if outermost { cname } else { "lv" + toString(i) }
+    let a = ""
+    if outermost {
+      if annpat != "none" { a = ann }
+    } else if (
+      annpat == "all"
+      || (annpat == "inner" && i == n - 1)
+      || (annpat == "mid" && i != n - 1)
+    ) {
+      a = ": " + tyAt(layers, i, p, snames)
+    }
+    const lay = layers[i]
+    let innervals: string[] = if i == n - 1 { innerSlots } else { [cur] }
+    if outermost && pval == "empty" { innervals = [] }
+    if lay == "L" {
+      out.push("\{ind}const \{nm}\{a} = [\{join(innervals, ", ")}]")
+    } else if lay == "M" {
+      out.push(ind + "const " + nm + a + " = Map()")
+      let j = 0
+      while j < innervals.length {
+        out.push(ind + nm + "[\"k" + toString(j) + "\"] = " + innervals[j])
+        j = j + 1
+      }
+    } else {
+      // An object-literal struct binding must name its type, so every S layer is
+      // annotated whatever `annpos` says.
+      if a == "" { a = ": " + tyAt(layers, i, p, snames) }
+      out.push("\{ind}const \{nm}\{a} = { f: \{innervals[0]} }")
+    }
+    cur = nm
+    i = i - 1
+  }
+  out
+}
+
+type ReadCtx = {
+  layers: string[],
+  p: string,
+  rep: string,
+  pred: string,
+  readsite: boolean,
+}
+
+function readGo(r: ReadCtx, i: i32, e: string, ii: string): string[] {
+  const n = r.layers.length
+  if i == n {
+    if r.readsite {
+      return [
+        ii + "const gp: " + r.p + " = " + e,
+        ii + "if " + fill(r.pred, "gp") + " { print(7) } else { print(0) }",
+      ]
+    }
+    return [
+      ii
+        + "if "
+        + fill(r.pred, "(" + e + ")")
+        + " { print(7) } else { print(0) }",
+    ]
+  }
+  const lay = r.layers[i]
+  if lay == "S" { return readGo(r, i + 1, "(" + e + ").f", ii) }
+  const nm = "g" + toString(i)
+  const out: string[] = []
+  if lay == "M" {
+    const d = if r.readsite && i == n - 1 { "dfl" } else { emptyOf(r.layers, i + 1, r.rep) }
+    out.push("\{ii}const \{nm} = (\{e})[\"k0\"] ?? \{d}")
+    for s in readGo(r, i + 1, nm, ii) { out.push(s) }
+    return out
+  }
+  out.push(ii + "const " + nm + " = " + e)
+  out.push(ii + "if " + nm + ".length > 0 {")
+  for s in readGo(r, i + 1, nm + "[0]", ii + "  ") { out.push(s) }
+  out.push(ii + "} else { print(0) }")
+  out
+}
+
+// Statements printing 7 when the canonical payload is reached, 0 otherwise.
+function readStmts(
+  layers: string[],
+  p: string,
+  rep: string,
+  ind: string,
+  expr: string,
+  readsite: boolean,
+  forin: boolean,
+): string[] {
+  const pred = repOf(rep).pred
+  if forin {
+    return [
+      ind + "let hit = 0",
+      ind + "for zz in " + expr + " {",
+      ind + "  if " + fill(pred, "zz") + " { hit = 7 }",
+      ind + "}",
+      ind + "print(hit)",
+    ]
+  }
+  readGo(
+    { layers: layers, p: p, rep: rep, pred: pred, readsite: readsite },
+    0,
+    expr,
+    ind,
+  )
+}
+
+// ── structural skips ──────────────────────────────────────────────────────────
+
+function nDeclLines(c: Cell): i32 {
+  let k = 0
+  if !isScalar(at(c, "rep")) && at(c, "declness") != "nodecl" { k = k + 1 }
+  if at(c, "twin") != "none" { k = k + 1 }
+  if at(c, "twin") == "armtwin" { k = k + 2 }
+  if at(c, "union") != "nounion" { k = k + 2 }
+  const cl = at(c, "claim")
+  if cl == "1" { k = k + 1 }
+  if cl == "2" { k = k + 2 }
+  k
+}
+
+// Why a coordinate has no spelling, or "" when it has one.
+function skipReason(c: Cell): string {
+  const layers = layersOf(at(c, "cont"))
+  const n = layers.length
+  const store = at(c, "store")
+  const escope = at(c, "escope")
+  const pval = at(c, "pval")
+  if store == "local" && escope == "mod" {
+    return "a local needs a function to be local to"
+  }
+  if store == "param" && escope == "mod" {
+    return "a parameter needs a function to be a parameter of"
+  }
+  if store == "capture" && (escope == "mod" || escope == "fn") {
+    return "a capture needs an enclosing scope to capture from"
+  }
+  if isScalar(at(c, "rep")) && at(c, "declness") != "nodecl" {
+    return "a scalar payload has no object shape to declare"
+  }
+  if pval == "nullfield" && at(c, "rep") != "nul" {
+    return "only the `nul` rep has a field that can be null"
+  }
+  const multi = pval == "two" || pval == "mixed"
+  if multi && n == 0 { return "a bare binding has one slot" }
+  if multi && layers[n - 1] == "S" { return "a struct field has one slot" }
+  if pval == "empty" && (n == 0 || layers[0] == "S") {
+    return "the outermost layer cannot be empty"
+  }
+  if pval == "nestedempty" && (n < 2 || layers[n - 1] == "S") {
+    return "no inner container to empty"
+  }
+  if at(c, "order") == "rev" && nDeclLines(c) < 2 {
+    return "fewer than two reorderable declaration lines"
+  }
+  ""
+}
+
+// ── the emitter ───────────────────────────────────────────────────────────────
+
+type Ctx = {
+  c: Cell,
+  layers: string[],
+  p: string,
+  snames: string[],
+  rep: string,
+  ct: string,
+  forin: boolean,
+  readsite: boolean,
+  annBinding: string,
+  srcExpr: string,
+}
+
+type Delivered = { lines: string[], expr: string }
+
+function build(x: Ctx, ind: string, cname: string): string[] {
+  let annpat = at(x.c, "annpat")
+  if annpat == "" { annpat = "outer" }
+  buildStmts(
+    x.layers,
+    x.p,
+    x.snames,
+    x.rep,
+    at(x.c, "pval"),
+    ind,
+    cname,
+    x.annBinding,
+    annpat,
+  )
+}
+
+// Statements turning `src` into the expression the read consumes.
+function deliver(x: Ctx, ind: string, src: string): Delivered {
+  const d = at(x.c, "deliv")
+  if d == "direct" { return { lines: [], expr: src } }
+  if d == "boundlocal" {
+    return { lines: [ind + "const dd = " + src], expr: "dd" }
+  }
+  if d == "closurearg" {
+    return {
+      lines: [
+        ind + "const lamc = (x: " + x.ct + ") => x",
+        ind + "const dd = lamc(" + src + ")",
+      ],
+      expr: "dd",
+    }
+  }
+  if d == "structread" {
+    return { lines: [ind + "const wv: GW = { g: " + src + " }"], expr: "wv.g" }
+  }
+  if d == "std" {
+    return { lines: [ind + "const dd = reverse([" + src + "])[0]"], expr: "dd" }
+  }
+  if d == "generic" {
+    return { lines: [ind + "const dd = idg(" + src + ")"], expr: "dd" }
+  }
+  if d == "calleedeliv" {
+    return { lines: [ind + "const dd = thru(" + src + ")"], expr: "dd" }
+  }
+  die("gencensus: no delivery \{d}", 1)
+  { lines: [], expr: src }
+}
+
+function addAll(out: string[], xs: string[]) {
+  for s in xs { out.push(s) }
+}
+
+// Sink, delivery, the union use and the read of `src`, at one indent.
+function readonly(x: Ctx, ind: string, src: string): string[] {
+  const out: string[] = []
+  if at(x.c, "annpos") == "dest" { out.push(ind + "sink(" + src + ")") }
+  const dl = deliver(x, ind, src)
+  addAll(out, dl.lines)
+  if at(x.c, "union") == "used" {
+    out.push(ind + "if useShape(sqv) > 99 { print(0) }")
+  }
+  addAll(
+    out,
+    readStmts(x.layers, x.p, x.rep, ind, dl.expr, x.readsite, x.forin),
+  )
+  out
+}
+
+// Build `c` (or take it from the maker), then `readonly` it.
+function place(x: Ctx, ind: string): string[] {
+  const out: string[] = []
+  if x.srcExpr != "" {
+    out.push(ind + "const c = " + x.srcExpr)
+  } else {
+    addAll(out, build(x, ind, "c"))
+  }
+  addAll(out, readonly(x, ind, "c"))
+  out
+}
+
+// The read wrapped in the scope `escope` names: a function, a nested function, or a
+// lambda inside a function. `inner` produces the read at the indent it is given.
+function scoped(
+  body: string[],
+  escope: string,
+  lines: (ind: string) => string[],
+) {
+  if escope == "mod" {
+    addAll(body, lines(""))
+  } else if escope == "fn" {
+    body.push("function rd() {")
+    addAll(body, lines("  "))
+    body.push("}")
+    body.push("rd()")
+  } else if escope == "nested" {
+    body.push("function outer() {")
+    body.push("  function inner() {")
+    addAll(body, lines("    "))
+    body.push("  }")
+    body.push("  inner()")
+    body.push("}")
+    body.push("outer()")
+  } else {
+    body.push("function outer() {")
+    body.push("  const lam = () => {")
+    addAll(body, lines("    "))
+    body.push("  }")
+    body.push("  lam()")
+    body.push("}")
+    body.push("outer()")
+  }
+}
+
+type Emitted = { text: string, expected: string }
+
+function emit(c: Cell): Emitted {
+  const rep = at(c, "rep")
+  const declness = at(c, "declness")
+  const ft = repOf(rep).ft
+  const p = payloadSpelling(rep, declness)
+  const layers = layersOf(at(c, "cont"))
+  const snames = structNames(layers)
+  const ct = tyAt(layers, 0, p, snames)
+  const n = layers.length
+  const twin = at(c, "twin")
+  const union = at(c, "union")
+  const claim = if at(c, "claim") == "2" { 2 } else if at(c, "claim") == "1" { 1 } else { 0 }
+  const deliv = at(c, "deliv")
+  const annpos = at(c, "annpos")
+  const named = !isScalar(rep) && declness != "nodecl"
+
+  // The declaration block; `order=rev` reverses exactly this.
+  let decls: string[] = []
+  if named { decls.push("type Circle = { r: " + ft + " }") }
+  if twin == "exact" {
+    decls.push("type Dot = { r: " + ft + " }")
+  } else if twin == "samearity" {
+    decls.push("type Dot = { q: " + ft + " }")
+  } else if twin == "armtwin" {
+    decls.push("type Dot = { r: " + ft + " }")
+    decls.push("type DotB = { db: i32 }")
+    decls.push("type DotU = Dot | DotB")
+  }
+  if union != "nounion" {
+    decls.push("type Sq = { s: i32 }")
+    const arm = if named { "Circle" } else { "Ua" }
+    if arm == "Ua" { decls.push("type Ua = { ua: i32 }") }
+    decls.push("type Shape = " + arm + " | Sq")
+  }
+  let k = 0
+  while k < claim {
+    decls.push("type Box" + toString(k + 1) + " = " + ct)
+    k = k + 1
+  }
+  if at(c, "order") == "rev" {
+    const rev: string[] = []
+    let i = decls.length - 1
+    while i >= 0 {
+      rev.push(decls[i])
+      i = i - 1
+    }
+    decls = rev
+  }
+
+  const head: string[] = []
+  if deliv == "std" { head.push("import { reverse } from \"std:array\"") }
+  addAll(head, preludeFor(rep))
+  if rep == "map" { head.push(MKI) }
+  addAll(head, decls)
+  addAll(head, structDecls(layers, p, snames))
+  if deliv == "generic" { head.push("function idg<T>(x: T): T { return x }") }
+  if deliv == "calleedeliv" {
+    head.push("function thru(x: " + ct + ") { return x }")
+  }
+  if deliv == "structread" { head.push("type GW = { g: " + ct + " }") }
+  if annpos == "dest" { head.push("function sink(_x: " + ct + ") { }") }
+  if union == "used" {
+    head.push(
+      "function useShape(s: Shape): i32 { if s is Sq { return 1 } return 0 }",
+    )
+    head.push("const sqv: Sq = { s: 1 }")
+  }
+  k = 0
+  while k < claim {
+    const b = toString(k + 1)
+    head.push("const _sp\{b}: Box\{b} = \{emptyContainer(layers, rep)}")
+    k = k + 1
+  }
+  const readsite = annpos == "readsite"
+  if readsite {
+    head.push("const dfl: " + p + " = " + payloadLiteral(rep, false, false))
+  }
+
+  // An object-literal struct binding must name its type.
+  let annBinding = if annpos == "binding" { ": " + ct } else { "" }
+  if n > 0 && layers[0] == "S" && annBinding == "" { annBinding = ": " + ct }
+
+  const x0: Ctx = {
+    c: c,
+    layers: layers,
+    p: p,
+    snames: snames,
+    rep: rep,
+    ct: ct,
+    forin: at(c, "cont") == "forin",
+    readsite: readsite,
+    annBinding: annBinding,
+    srcExpr: "",
+  }
+  // `annpos=retann` routes the container through a maker whose result is annotated.
+  const maker: string[] = []
+  if annpos == "retann" {
+    maker.push("function mkc(): " + ct + " {")
+    addAll(maker, build(x0, "  ", "cc"))
+    maker.push("  return cc")
+    maker.push("}")
+  }
+  const x: Ctx = {
+    c: c,
+    layers: layers,
+    p: p,
+    snames: snames,
+    rep: rep,
+    ct: ct,
+    forin: x0.forin,
+    readsite: readsite,
+    annBinding: annBinding,
+    srcExpr: if annpos == "retann" { "mkc()" } else { "" },
+  }
+
+  const body: string[] = []
+  const store = at(c, "store")
+  const escope = at(c, "escope")
+  if store == "global" {
+    if x.srcExpr != "" {
+      body.push("const c = " + x.srcExpr)
+    } else {
+      addAll(body, build(x, "", "c"))
+    }
+    scoped(body, escope, (ind: string) => readonly(x, ind, "c"))
+  } else if store == "local" {
+    scoped(body, escope, (ind: string) => place(x, ind))
+  } else if store == "param" {
+    body.push("function mksrc() {")
+    if x.srcExpr != "" {
+      body.push("  const cc = " + x.srcExpr)
+    } else {
+      addAll(body, build(x, "  ", "cc"))
+    }
+    body.push("  return cc")
+    body.push("}")
+    body.push("function rd(c: " + ct + ") {")
+    if escope == "fn" {
+      addAll(body, readonly(x, "  ", "c"))
+    } else if escope == "nested" {
+      body.push("  function inner() {")
+      addAll(body, readonly(x, "    ", "c"))
+      body.push("  }")
+      body.push("  inner()")
+    } else {
+      body.push("  const lam = () => {")
+      addAll(body, readonly(x, "    ", "c"))
+      body.push("  }")
+      body.push("  lam()")
+    }
+    body.push("}")
+    body.push("rd(mksrc())")
+  } else if store == "callres" {
+    if x.srcExpr != "" {
+      body.push("function mkcall() { return " + x.srcExpr + " }")
+    } else {
+      body.push("function mkcall() {")
+      addAll(body, build(x, "  ", "cc"))
+      body.push("  return cc")
+      body.push("}")
+    }
+    scoped(body, escope, (ind: string) => readonly(x, ind, "mkcall()"))
+  } else {
+    body.push("function outer() {")
+    if x.srcExpr != "" {
+      body.push("  const c = " + x.srcExpr)
+    } else {
+      addAll(body, build(x, "  ", "c"))
+    }
+    if escope == "nested" {
+      body.push("  function inner() {")
+      addAll(body, readonly(x, "    ", "c"))
+      body.push("  }")
+      body.push("  inner()")
+    } else {
+      body.push("  const lam = () => {")
+      addAll(body, readonly(x, "    ", "c"))
+      body.push("  }")
+      body.push("  lam()")
+    }
+    body.push("}")
+    body.push("outer()")
+  }
+
+  const all: string[] = []
+  addAll(all, head)
+  addAll(all, maker)
+  addAll(all, body)
+  if twin == "late" { all.push("type Dot = { r: " + ft + " }") }
+  const pval = at(c, "pval")
+  const zero = pval == "empty" || pval == "nestedempty" || pval == "nullfield"
+  { text: join(all, "\n") + "\n", expected: if zero { "0" } else { "7" } }
+}
+
+// ── the pairwise covering array ───────────────────────────────────────────────
+
+// The constraints living entirely inside the rest axes; "" is an axis the row lacks.
+// A covering array that ignored them would spend its rows on coordinates then skipped.
+function restValid(
+  cont: string,
+  rep: string,
+  pval: string,
+  declness: string,
+): boolean {
+  const decl = if declness == "" { "nodecl" } else { declness }
+  if isScalar(rep) && decl != "nodecl" { return false }
+  if pval == "nullfield" && rep != "nul" { return false }
+  if cont != "" {
+    const layers = layersOf(cont)
+    const n = layers.length
+    if (pval == "two" || pval == "mixed") && (n == 0 || layers[n - 1] == "S") {
+      return false
+    }
+    if pval == "empty" && (n == 0 || layers[0] == "S") { return false }
+    if pval == "nestedempty" && (n < 2 || layers[n - 1] == "S") { return false }
+  }
+  true
+}
+
+// Rows of level indices over `names` (sorted), and the pairs no valid row reaches.
+type Covering = { rows: i32[][], unreachable: i32 }
+
+// Where each of `restValid`'s four axes sits in a row over `names`, or -1.
+function validPositions(names: string[]): i32[] {
+  const out: i32[] = []
+  for axis in ["cont", "rep", "pval", "declness"] {
+    let at = -1
+    let i = 0
+    while i < names.length {
+      if names[i] == axis { at = i }
+      i = i + 1
+    }
+    out.push(at)
+  }
+  out
+}
+
+function valueAt(lv: string[][], row: i32[], at: i32): string {
+  if at < 0 { return "" }
+  lv[at][row[at]]
+}
+
+function rowValid(lv: string[][], pos: i32[], row: i32[]): boolean {
+  restValid(
+    valueAt(lv, row, pos[0]),
+    valueAt(lv, row, pos[1]),
+    valueAt(lv, row, pos[2]),
+    valueAt(lv, row, pos[3]),
+  )
+}
+
+// Greedy strength-2 covering array: every pair of levels from two axes is in some row.
+// Best of `tries` candidates per row from a pool of valid rows, drawn exactly as
+// `random.Random(seed)` drew them, so the rows are the ones the census was graded on.
+function pairwise(names: string[], seed: i64, tries: i32): Covering {
+  const rnd: Rng = newRng(seed)
+  const lv: string[][] = []
+  const lens: i32[] = []
+  for nm in names {
+    lv.push(levels(nm))
+    lens.push(levels(nm).length)
+  }
+  const pos = validPositions(names)
+  const pa: i32[] = []
+  const pb: i32[] = []
+  let a = 0
+  while a < names.length {
+    let b = a + 1
+    while b < names.length {
+      pa.push(a)
+      pb.push(b)
+      b = b + 1
+    }
+    a = a + 1
+  }
+  const reach: boolean[][] = []
+  const reachN: i32[] = []
+  let q = 0
+  while q < pa.length {
+    const s: boolean[] = []
+    let z = 0
+    while z < lens[pa[q]] * lens[pb[q]] {
+      s.push(false)
+      z = z + 1
+    }
+    reach.push(s)
+    reachN.push(0)
+    q = q + 1
+  }
+  const pool: i32[][] = []
+  let t = 0
+  while t < 200000 {
+    t = t + 1
+    const row: i32[] = []
+    for ln in lens { row.push(below(rnd, ln)) }
+    if !rowValid(lv, pos, row) { continue }
+    pool.push(row)
+    q = 0
+    while q < pa.length {
+      const cell = row[pa[q]] * lens[pb[q]] + row[pb[q]]
+      if !reach[q][cell] {
+        reach[q][cell] = true
+        reachN[q] = reachN[q] + 1
+      }
+      q = q + 1
+    }
+    if pool.length >= 40000 { break }
+  }
+  const need: boolean[][] = []
+  const needN: i32[] = []
+  let unreachable = 0
+  q = 0
+  while q < pa.length {
+    need.push(reach[q].slice(0, reach[q].length))
+    needN.push(reachN[q])
+    unreachable = unreachable + lens[pa[q]] * lens[pb[q]] - reachN[q]
+    q = q + 1
+  }
+  const rows: i32[][] = []
+  while true {
+    let remaining = 0
+    for m in needN { remaining = remaining + m }
+    if remaining == 0 { break }
+    let best: i32[] = []
+    let bestcov = -1
+    let k = 0
+    while k < tries {
+      const row = pool[below(rnd, pool.length)]
+      let cov = 0
+      q = 0
+      while q < pa.length {
+        if need[q][row[pa[q]] * lens[pb[q]] + row[pb[q]]] { cov = cov + 1 }
+        q = q + 1
+      }
+      if cov > bestcov {
+        best = row
+        bestcov = cov
+        if cov == remaining { break }
+      }
+      k = k + 1
+    }
+    rows.push(best)
+    q = 0
+    while q < pa.length {
+      const cell = best[pa[q]] * lens[pb[q]] + best[pb[q]]
+      if need[q][cell] {
+        need[q][cell] = false
+        needN[q] = needN[q] - 1
+      }
+      q = q + 1
+    }
+  }
+  { rows: rows, unreachable: unreachable }
+}
+
+// "covered/total" level pairs over `names`, re-derived from the rows themselves.
+function pairsCovered(rows: i32[][], names: string[]): string {
+  let total = 0
+  let seen = 0
+  let a = 0
+  while a < names.length {
+    let b = a + 1
+    while b < names.length {
+      const lb = levels(names[b]).length
+      const n = levels(names[a]).length * lb
+      total = total + n
+      const hit: Set<i32> = Set()
+      for r in rows { hit.add(r[a] * lb + r[b]) }
+      let z = 0
+      while z < n {
+        if hit.has(z) { seen = seen + 1 }
+        z = z + 1
+      }
+      b = b + 1
+    }
+    a = a + 1
+  }
+  toString(seen) + "/" + toString(total)
+}
+
+function rowValues(names: string[], row: i32[]): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < names.length {
+    out.push(levels(names[i])[row[i]])
+    i = i + 1
+  }
+  out
+}
+
+// ── blocks ────────────────────────────────────────────────────────────────────
+
+// One `meta` entry; `num` says it prints and dumps as a number.
+type Meta = { k: string, v: string, num: boolean }
+
+type Block = { cells: Cell[], meta: Meta[] }
+
+function metaN(k: string, v: i32): Meta { { k: k, v: toString(v), num: true } }
+
+// The (store, escope) pairs with a spelling.
+function storeScope(): string[][] {
+  const out: string[][] = []
+  for s in levels("store") {
+    for e in levels("escope") {
+      if s == "local" && e == "mod" { continue }
+      if s == "param" && e == "mod" { continue }
+      if s == "capture" && (e == "mod" || e == "fn") { continue }
+      out.push([s, e])
+    }
+  }
+  out
+}
+
+const SEED: i64 = 20260827
+
+// The core (twin, union, claim, (store, escope)) fully crossed against a pairwise
+// covering array over the other seven axes.
+function blockA(): Block {
+  const names = sortStrings(
+    ["declness", "cont", "annpos", "deliv", "pval", "order", "rep"],
+  )
+  const pw = pairwise(names, SEED, 500)
+  const cov = pairsCovered(pw.rows, names)
+  const ss = storeScope()
+  const rest: string[][] = []
+  for r in pw.rows { rest.push(rowValues(names, r)) }
+  const cells: Cell[] = []
+  let core = 0
+  for t in levels("twin") {
+    for u in levels("union") {
+      for cl in levels("claim") {
+        for se in ss {
+          core = core + 1
+          for vals in rest {
+            const c = cellOf(
+              ["twin", "union", "claim", "store", "escope"],
+              [t, u, cl, se[0], se[1]],
+            )
+            let i = 0
+            while i < names.length {
+              c[names[i]] = vals[i]
+              i = i + 1
+            }
+            cells.push(c)
+          }
+        }
+      }
+    }
+  }
+  {
+    cells: cells,
+    meta: [
+      metaN("rest_rows", pw.rows.length),
+      metaN("core_rows", core),
+      { k: "rest_pairs_covered", v: cov, num: false },
+      metaN("rest_pairs_unreachable_by_construction", pw.unreachable),
+      metaN("storescope_pairs", ss.length),
+    ],
+  }
+}
+
+const SSCOPE: string[][] = [
+  ["local", "fn"],
+  ["global", "mod"],
+  ["param", "nested"],
+  ["callres", "lambda"],
+  ["capture", "nested"],
+]
+
+// cont x annpos x deliv x pval fully crossed, at three core corners and five (store,
+// escope) pairs; (declness, order, rep) rotates through a covering array of its own.
+function blockB(): Block {
+  const corners: string[][] = [
+    ["none", "nounion", "0"],
+    ["exact", "unused", "1"],
+    ["armtwin", "used", "2"],
+  ]
+  const fnames = sortStrings(["declness", "order", "rep"])
+  const fillRows = pairwise(fnames, SEED, 500).rows
+  const cells: Cell[] = []
+  let i = 0
+  for cont in levels("cont") {
+    for annpos in levels("annpos") {
+      for deliv in levels("deliv") {
+        for pval in levels("pval") {
+          let chosen: string[] = []
+          let k = 0
+          while k < fillRows.length {
+            const f = rowValues(fnames, fillRows[(i + k) % fillRows.length])
+            if restValid(cont, f[2], pval, f[0]) {
+              chosen = f
+              i = i + k + 1
+              break
+            }
+            k = k + 1
+          }
+          if chosen.length == 0 { continue }
+          for co in corners {
+            for se in SSCOPE {
+              const c = cellOf(
+                [
+                  "cont", "annpos", "deliv", "pval", "twin", "union", "claim",
+                  "store", "escope",
+                ],
+                [
+                  cont,
+                  annpos,
+                  deliv,
+                  pval,
+                  co[0],
+                  co[1],
+                  co[2],
+                  se[0],
+                  se[1],
+                ],
+              )
+              let j = 0
+              while j < fnames.length {
+                c[fnames[j]] = chosen[j]
+                j = j + 1
+              }
+              cells.push(c)
+            }
+          }
+        }
+      }
+    }
+  }
+  {
+    cells: cells,
+    meta: [
+      metaN("fill_rows", fillRows.length),
+      metaN("storescope_sample", SSCOPE.length),
+      metaN("corners", corners.length),
+    ],
+  }
+}
+
+// rep x cont fully crossed against the full core quartet, the rest axes canonical.
+function blockC(): Block {
+  const cells: Cell[] = []
+  for rep in levels("rep") {
+    for cont in levels("cont") {
+      for twin in levels("twin") {
+        for union in levels("union") {
+          for claim in levels("claim") {
+            for store in levels("store") {
+              const c = cellOf(
+                [
+                  "escope", "declness", "annpos", "deliv", "pval", "order",
+                ],
+                ["fn", "byname", "binding", "direct", "single", "norm"],
+              )
+              c["rep"] = rep
+              c["cont"] = cont
+              c["twin"] = twin
+              c["union"] = union
+              c["claim"] = claim
+              c["store"] = store
+              // A capture needs an enclosing scope; pinning `fn` would drop the level.
+              if store == "capture" { c["escope"] = "nested" }
+              if isScalar(rep) { c["declness"] = "nodecl" }
+              cells.push(c)
+            }
+          }
+        }
+      }
+    }
+  }
+  { cells: cells, meta: [] }
+}
+
+// Which intermediate level is annotated, at the coordinate with no declarations, with
+// the `declness=byname` leg beside it as the paired control.
+function blockD(): Block {
+  const cells: Cell[] = []
+  for cont in levels("cont") {
+    for annpat in levels("annpat") {
+      for rep in levels("rep") {
+        for declness in ["nodecl", "byname"] {
+          if isScalar(rep) && declness != "nodecl" { continue }
+          for se in SSCOPE {
+            cells.push(
+              cellOf(
+                [
+                  "cont", "annpat", "rep", "declness", "store", "escope",
+                  "twin", "union", "claim", "annpos", "deliv", "pval", "order",
+                ],
+                [
+                  cont,
+                  annpat,
+                  rep,
+                  declness,
+                  se[0],
+                  se[1],
+                  "none",
+                  "nounion",
+                  "0",
+                  "binding",
+                  "direct",
+                  "single",
+                  "norm",
+                ],
+              ),
+            )
+          }
+        }
+      }
+    }
+  }
+  { cells: cells, meta: [metaN("storescope_sample", SSCOPE.length)] }
+}
+
+// The order and probe-value axes crossed exhaustively against the nominal ingredients,
+// so every cell has its exact twin in each.
+function blockE(): Block {
+  const cells: Cell[] = []
+  for cont in levels("cont") {
+    for twin in levels("twin") {
+      for union in levels("union") {
+        for claim in levels("claim") {
+          for order in levels("order") {
+            for pval in levels("pval") {
+              for rep in ["i32", "arm", "str", "nul"] {
+                cells.push(
+                  cellOf(
+                    [
+                      "cont", "twin", "union", "claim", "order", "pval", "rep",
+                      "store", "escope", "declness", "annpos", "deliv",
+                      "annpat",
+                    ],
+                    [
+                      cont,
+                      twin,
+                      union,
+                      claim,
+                      order,
+                      pval,
+                      rep,
+                      "local",
+                      "fn",
+                      "byname",
+                      "binding",
+                      "direct",
+                      "outer",
+                    ],
+                  ),
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  { cells: cells, meta: [] }
+}
+
+// `jsonStr`, without its per-byte rebuild for the printable ASCII every coordinate is.
+function quoted(s: string): string {
+  let i = 0
+  while i < s.length {
+    const b = s[i]
+    if b < 32 || b > 126 || b == 34 || b == 92 { return jsonStr(s) }
+    i = i + 1
+  }
+  "\"" + s + "\""
+}
+
+function dumpStrMap(keys: string[], vals: Map<string, string>): string {
+  const parts: string[] = []
+  for k in keys { parts.push(quoted(k) + ": " + quoted(vals[k] ?? "")) }
+  "{" + join(parts, ", ") + "}"
+}
+
+function main(args: string[]): i32 {
+  let bi = -1
+  let i = 0
+  while i < args.length {
+    if args[i] == "--block" {
+      bi = i
+      break
+    }
+    i = i + 1
+  }
+  if args.length < 1 || bi < 0 || bi + 1 >= args.length { die(USAGE, 1) }
+  const out = args[0]
+  const blk = args[bi + 1]
+  const mk = spawn("mkdir", ["-p", out])
+  if mk.code != 0 { die("gencensus: cannot create \{out}: " + mk.err, 1) }
+  let b: Block = { cells: [], meta: [] }
+  if blk == "A" { b = blockA() }
+  else if blk == "B" { b = blockB() }
+  else if blk == "C" { b = blockC() }
+  else if blk == "D" { b = blockD() }
+  else if blk == "E" { b = blockE() }
+  else { die("gencensus: no block \{blk}; " + USAGE, 1) }
+  const lower = if blk == "A" { "a" } else if blk == "B" { "b" } else if blk == "C" { "c" } else if blk == "D" { "d" } else { "e" }
+  const expect: string[] = []
+  const coords: string[] = []
+  const skips: Map<string, i32> = Map()
+  const skipOrder: string[] = []
+  let n = 0
+  for c in b.cells {
+    const why = skipReason(c)
+    if why != "" {
+      tally(skips, skipOrder, why, 1)
+      continue
+    }
+    const name = lower + padStart(toString(n), 6, "0")
+    const e = emit(c)
+    writeText(pathJoin(out, name + ".vl"), e.text)
+    expect.push(quoted(name) + ": " + quoted(e.expected))
+    const keys: string[] = []
+    for k, _ in c { keys.push(k) }
+    coords.push(quoted(name) + ": " + dumpStrMap(keys, c))
+    n = n + 1
+  }
+  const sk: string[] = []
+  for k in skipOrder { sk.push(jsonStr(k) + ": " + toString(skips[k] ?? 0)) }
+  const mt: string[] = []
+  for m in b.meta {
+    mt.push(jsonStr(m.k) + ": " + (if m.num { m.v } else { jsonStr(m.v) }))
+  }
+  const man = [
+    "{\"expect\": {" + join(expect, ", ") + "}",
+    "\"coords\": {" + join(coords, ", ") + "}",
+    "\"skips\": {" + join(sk, ", ") + "}",
+    "\"block\": " + jsonStr(blk),
+    "\"meta\": {" + join(mt, ", ") + "}",
+    "\"generated\": " + toString(n),
+    "\"considered\": " + toString(b.cells.length) + "}",
+  ]
+  writeText(pathJoin(out, "manifest.json"), join(man, ", "))
+  print(
+    "block \{blk}: considered=\{toString(b.cells.length)} generated=\{toString(n)} skipped=\{toString(b.cells.length - n)}",
+  )
+  for k in byCountDesc(skipOrder, skips) {
+    print("  skip " + padStart(toString(skips[k] ?? 0), 7, " ") + "  " + k)
+  }
+  for m in b.meta { print("  meta " + m.k + " = " + m.v) }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("gencensus: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

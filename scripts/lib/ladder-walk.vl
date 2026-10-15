@@ -1,0 +1,464 @@
+// The source walk the kind-ladder tools share: `compiler/*.vl` read line by line, a line
+// cut at its comment with literal content blanked, the closed sets the tree declares, and
+// its top-level functions. Import with a relative path, e.g. `from "./lib/ladder-walk"`.
+//
+// Text is bytes: a width or a position counts bytes, not characters. Paths resolve
+// against the working directory.
+
+import { IoError, listDir, readTextFile } from "std:fs"
+import { endsWith, join, repeat, split, startsWith } from "std:str"
+import { sort } from "std:array"
+import { die } from "./common"
+
+// A `type X = a | b | c …` of at least three members, all string literals or all type
+// names. `at` is `compiler/<file>:<line>`.
+export type ClosedSet = {
+  name: string,
+  members: string[],
+  isType: boolean,
+  at: string,
+}
+
+// One top-level function: its name and its first and last line index.
+export type Fn = { name: string, lo: i32, hi: i32 }
+
+export function isWord(c: i32): boolean {
+  (c >= 'a' && c <= 'z')
+    || (c >= 'A' && c <= 'Z')
+    || (c >= '0' && c <= '9')
+    || c == '_'
+}
+export function isUpper(c: i32): boolean { c >= 'A' && c <= 'Z' }
+export function isLower(c: i32): boolean { c >= 'a' && c <= 'z' }
+export function isDigitC(c: i32): boolean { c >= '0' && c <= '9' }
+
+// A word's first character: a letter or `_`.
+export function isIdentStart(c: i32): boolean { isWord(c) && !isDigitC(c) }
+
+// The whitespace bytes: space, tab, newline, carriage return, vertical tab, form feed,
+// and the 0x1c-0x1f, 0x85 and 0xa0 separators.
+export function isWs(c: i32): boolean {
+  c == ' '
+    || (c >= 9 && c <= 13)
+    || (c >= 28 && c <= 31)
+    || c == 0x85
+    || c == 0xA0
+}
+
+export function skipWs(s: string, i: i32): i32 {
+  let k = i
+  while k < s.length && isWs(s[k]) { k = k + 1 }
+  k
+}
+
+export function lstrip(s: string): string { s.slice(skipWs(s, 0), s.length) }
+
+export function rstrip(s: string): string {
+  let b = s.length
+  while b > 0 && isWs(s[b - 1]) { b = b - 1 }
+  s.slice(0, b)
+}
+
+export function strip(s: string): string { lstrip(rstrip(s)) }
+
+// The end of the word starting at `i`, or `i` when none starts there.
+export function wordEnd(s: string, i: i32): i32 {
+  let k = i
+  while k < s.length && isWord(s[k]) { k = k + 1 }
+  k
+}
+
+// Whether a word starts at `i`: a word character with none before it.
+export function wordStart(s: string, i: i32): boolean {
+  i < s.length && isWord(s[i]) && (i == 0 || !isWord(s[i - 1]))
+}
+
+// Byte order.
+export function strLess(a: string, b: string): boolean {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] < b[i] }
+    i = i + 1
+  }
+  a.length < b.length
+}
+
+export function sortedStrs(xs: string[]): string[] {
+  const out = xs.slice(0, xs.length)
+  sort(out, strLess)
+  out
+}
+
+export function hasStr(xs: readonly string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+export function readOrDie(tool: string, path: string): string {
+  const t = readTextFile(path)
+  if t is IoError {
+    die("\{tool}: cannot read \{path} (\{t.msg})", 2)
+    return ""
+  }
+  t
+}
+
+// `compiler/*.vl` under `root`, as `[relative, path]` pairs in name order.
+export function modules(tool: string, root: string): string[][] {
+  const names = listDir("\{root}/compiler")
+  if names is IoError {
+    die("\{tool}: cannot list \{root}/compiler (\{names.msg})", 2)
+    return []
+  }
+  const vl: string[] = []
+  for n in names {
+    if endsWith(n, ".vl") { vl.push(n) }
+  }
+  sort(vl, strLess)
+  const out: string[][] = []
+  for n in vl { out.push(["compiler/\{n}", "\{root}/compiler/\{n}"]) }
+  out
+}
+
+// `ln` cut at its `//` comment; a quoted literal is kept whole, so a `//` inside one
+// does not cut it.
+export function cutComment(ln: string): string {
+  let i = 0
+  while i < ln.length {
+    const c = ln[i]
+    if c == '/' && i + 1 < ln.length && ln[i + 1] == '/' {
+      return ln.slice(0, i)
+    }
+    if c == '"' || c == '\'' {
+      i = i + 1
+      while i < ln.length && ln[i] != c {
+        if ln[i] == '\\' && i + 1 < ln.length { i = i + 1 }
+        i = i + 1
+      }
+    }
+    i = i + 1
+  }
+  ln
+}
+
+// `ln` cut at its comment with every literal's content blanked to `x`, quotes kept. The
+// length is preserved, so a `{` inside a literal never counts as a brace and a position
+// found here reads the literal's text back out of the raw line.
+export function stripLine(ln: string): string {
+  const cut = cutComment(ln)
+  const parts: string[] = []
+  let from = 0
+  let i = 0
+  while i < cut.length {
+    const c = cut[i]
+    i = i + 1
+    if c == '"' || c == '\'' {
+      const a = i
+      while i < cut.length && cut[i] != c {
+        if cut[i] == '\\' && i + 1 < cut.length { i = i + 1 }
+        i = i + 1
+      }
+      parts.push(cut.slice(from, a))
+      parts.push(repeat("x", i - a))
+      from = i
+      if i < cut.length { i = i + 1 }
+    }
+  }
+  if from == 0 { return cut }
+  parts.push(cut.slice(from, cut.length))
+  join(parts, "")
+}
+
+// The name and right-hand side of a `[export ]type NAME = RHS` line, or [] when `ln`
+// is not one.
+export function typeHead(ln: string): string[] {
+  let i = 0
+  if startsWith(ln, "export ") { i = 7 }
+  if ln.slice(i, i + 5) != "type " { return [] }
+  i = i + 5
+  const a = i
+  if i >= ln.length || !isIdentStart(ln[i]) { return [] }
+  while i < ln.length && isWord(ln[i]) { i = i + 1 }
+  if ln.slice(i, i + 3) != " = " { return [] }
+  [ln.slice(a, i), ln.slice(i + 3, ln.length)]
+}
+
+// The right-hand side of the `type` declared on `lines[n]` (head `rhs`), joined across
+// its continuation lines, and the index of the first line past it. `|` may lead the next
+// line or trail this one; blank and comment lines between continuations are skipped.
+export type TypeRhs = { rhs: string, next: i32 }
+
+export function typeRhs(
+  lines: readonly string[],
+  n: i32,
+  head: string,
+): TypeRhs {
+  let rhs = cutComment(head)
+  let j = n + 1
+  while j < lines.length {
+    const t = strip(lines[j])
+    if startsWith(t, "//") || t == "" {
+      j = j + 1
+      continue
+    }
+    if startsWith(t, "|") || endsWith(rstrip(rhs), "|") {
+      rhs = "\{rhs} \{cutComment(t)}"
+      j = j + 1
+      continue
+    }
+    break
+  }
+  { rhs: rhs, next: j }
+}
+
+export function isTypeName(p: string): boolean {
+  if p.length == 0 || !isUpper(p[0]) { return false }
+  for c in p {
+    if !isWord(c) { return false }
+  }
+  true
+}
+
+// Every closed set the compiler declares. A later declaration of the same name replaces
+// an earlier one in place.
+export function closedSets(tool: string, root: string): ClosedSet[] {
+  const out: ClosedSet[] = []
+  for m in modules(tool, root) {
+    const lines = split(readOrDie(tool, m[1]), "\n")
+    let n = 0
+    while n < lines.length {
+      const head = typeHead(lines[n])
+      if head.length == 0 {
+        n = n + 1
+        continue
+      }
+      const r = typeRhs(lines, n, head[1])
+      const lits: string[] = []
+      const tys: string[] = []
+      const parts = split(r.rhs, "|")
+      for raw in parts {
+        const p = strip(raw)
+        if p.length >= 2 && p[0] == '"' && p[p.length - 1] == '"' {
+          lits.push(p.slice(1, p.length - 1))
+        }
+        if isTypeName(p) { tys.push(p) }
+      }
+      let members: string[] = []
+      let isType = false
+      if lits.length == parts.length && parts.length >= 3 {
+        members = lits
+      } else if tys.length == parts.length && parts.length >= 3 {
+        members = tys
+        isType = true
+      }
+      if members.length > 0 {
+        const set: ClosedSet = {
+          name: head[0],
+          members: members,
+          isType: isType,
+          at: "\{m[0]}:\{n + 1}",
+        }
+        const at = findSet(out, head[0])
+        if at >= 0 { out[at] = set } else { out.push(set) }
+      }
+      n = r.next
+    }
+  }
+  out
+}
+
+export function findSet(sets: readonly ClosedSet[], name: string): i32 {
+  let i = 0
+  while i < sets.length {
+    if sets[i].name == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// `{field: set}` for every field some `type X = { f: T }` declares with a closed set as
+// its whole type, kept only when every declaration of that field names the same set.
+// Pairs are read up to the record's first `}`.
+export function fieldIndex(
+  tool: string,
+  root: string,
+  sets: readonly ClosedSet[],
+  fields: string[],
+  setOf: string[],
+) {
+  const ambiguous: string[] = []
+  for m in modules(tool, root) {
+    const src = readOrDie(tool, m[1])
+    let i = 0
+    while i < src.length {
+      const body = recordBodyAt(src, i)
+      if body < 0 {
+        i = i + 1
+        continue
+      }
+      let k = body
+      while k < src.length && src[k] != '}' {
+        if isWord(src[k]) && (k == body || !isWord(src[k - 1])) {
+          const e = wordEnd(src, k)
+          const c = skipWs(src, e)
+          if c < src.length && src[c] == ':' {
+            const t = skipWs(src, c + 1)
+            if t < src.length && isIdentStart(src[t]) {
+              const te = wordEnd(src, t)
+              const f = src.slice(k, e)
+              const ty = src.slice(t, te)
+              if findSet(sets, ty) >= 0 {
+                let at = -1
+                let q = 0
+                while q < fields.length {
+                  if fields[q] == f { at = q }
+                  q = q + 1
+                }
+                if at < 0 {
+                  fields.push(f)
+                  setOf.push(ty)
+                } else if setOf[at] != ty {
+                  ambiguous.push(f)
+                }
+              }
+              k = te
+              continue
+            }
+          }
+          k = e
+          continue
+        }
+        k = k + 1
+      }
+      i = k
+    }
+  }
+  // A field two declarations type differently names no one set.
+  let w = 0
+  let r = 0
+  while r < fields.length {
+    if !hasStr(ambiguous, fields[r]) {
+      fields[w] = fields[r]
+      setOf[w] = setOf[r]
+      w = w + 1
+    }
+    r = r + 1
+  }
+  while fields.length > w {
+    fields.pop()
+    setOf.pop()
+  }
+  0
+}
+
+// The index just past `{` when `type <word> = {` starts at `i`, else -1.
+function recordBodyAt(src: string, i: i32): i32 {
+  if src.slice(i, i + 5) != "type " { return -1 }
+  const a = i + 5
+  const k = wordEnd(src, a)
+  if k == a || src.slice(k, k + 4) != " = {" { return -1 }
+  k + 4
+}
+
+// The function name a column-0 `[export ]function NAME(` or `NAME<` header declares,
+// and the byte range of that name; `{ name: "" }` when `ln` is not one.
+export type FnHead = { name: string, a: i32, b: i32 }
+
+export function fnHead(ln: string): FnHead {
+  let i = 0
+  if startsWith(ln, "export ") { i = 7 }
+  if ln.slice(i, i + 9) != "function " { return { name: "", a: 0, b: 0 } }
+  const a = i + 9
+  if a >= ln.length || !isIdentStart(ln[a]) { return { name: "", a: 0, b: 0 } }
+  const b = wordEnd(ln, a)
+  const k = skipWs(ln, b)
+  if k < ln.length && (ln[k] == '(' || ln[k] == '<') {
+    return { name: ln.slice(a, b), a: a, b: b }
+  }
+  { name: "", a: 0, b: 0 }
+}
+
+// The line the function opening at `lo` closes on, or `hi` when its braces never
+// balance. Mirrors `klFnEnd` in compiler/lint.vl.
+export function fnEnd(lines: readonly string[], lo: i32, hi: i32): i32 {
+  let depth = 0
+  let opened = false
+  let n = lo
+  while n <= hi {
+    for ch in stripLine(lines[n]) {
+      if ch == '{' {
+        depth = depth + 1
+        opened = true
+      } else if ch == '}' {
+        depth = depth - 1
+      }
+    }
+    if opened && depth <= 0 { return n }
+    n = n + 1
+  }
+  hi
+}
+
+// Every top-level function, by column-0 headers. A body runs to the line its braces
+// close on and never past the next header, so a module's trailing statements are not
+// the last function's body (D1642).
+export function functions(lines: readonly string[]): Fn[] {
+  const heads: i32[] = []
+  const names: string[] = []
+  let i = 0
+  while i < lines.length {
+    const h = fnHead(lines[i])
+    if h.name != "" {
+      heads.push(i)
+      names.push(h.name)
+    }
+    i = i + 1
+  }
+  const out: Fn[] = []
+  let k = 0
+  while k < heads.length {
+    const lo = heads[k]
+    let end = fnEnd(lines, lo, lines.length - 1)
+    if k + 1 < heads.length && heads[k + 1] - 1 < end { end = heads[k + 1] - 1 }
+    while end > lo && strip(lines[end]) == "" { end = end - 1 }
+    out.push({ name: names[k], lo: lo, hi: end })
+    k = k + 1
+  }
+  out
+}
+
+// The names of every `name(` call in `s` whose name starts a word and, when `lower`,
+// begins with a lowercase letter.
+export function callNames(s: string, lower: boolean): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < s.length {
+    if wordStart(s, i) {
+      const e = wordEnd(s, i)
+      const first = s[i]
+      const ok = if lower { isLower(first) } else { isIdentStart(first) }
+      if ok {
+        const k = skipWs(s, e)
+        if k < s.length && s[k] == '(' { out.push(s.slice(i, e)) }
+      }
+      i = e
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+// `s` padded with spaces on the right to `w` bytes, never cut.
+export function padR(s: string, w: i32): string {
+  if s.length >= w { return s }
+  s + repeat(" ", w - s.length)
+}
+
+// `s` padded with spaces on the left to `w` bytes, never cut.
+export function padL(s: string, w: i32): string {
+  if s.length >= w { return s }
+  repeat(" ", w - s.length) + s
+}

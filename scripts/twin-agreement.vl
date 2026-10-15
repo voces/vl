@@ -1,0 +1,855 @@
+// Grades a type-taking twin against the render-then-parse call it replaces, on every arena row.
+//
+//     vl run scripts/twin-agreement.vl                        # every twin, the kind grid
+//     vl run scripts/twin-agreement.vl -- --twins vak --list my-programs.txt
+//     vl run scripts/twin-agreement.vl -- --twins vak --rev c114b836f   # the control
+//
+// It patches a copy of `compiler/` so the top of `emitProgram` asks every `T.tys` row both
+// questions, builds that probe from `--seed`, and compiles one program per type kind plus any
+// `--list` programs. A program that printed no `TWINSWEEP rows=` count never reached the emitter
+// and is UNREACHED, not clean. Exits 1 on a disagreement or an unreached kind program. Rows made
+// after the sweep (a monomorphization pin) are never compared: probe the call site for those.
+// Run from the checkout root; `--rev` must disagree on every kind.
+
+import { IoError, listDir, writeFile } from "std:fs"
+import { Utf8Error, programArgs } from "std:args"
+import { exit, runProgram } from "std:process"
+import { decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import { endsWith, join, replace, split, startsWith } from "std:str"
+import { includes } from "std:array"
+import {
+  cpAt,
+  envOr,
+  findFrom,
+  isDigit,
+  splitLines,
+  stripWs,
+  wsLen,
+} from "./lib/common"
+import {
+  cwd,
+  pyRepr,
+  readText,
+  sortStrings,
+  spawn,
+  writeText,
+} from "./lib/corpus"
+
+// One twin: its name, the compiler file the sweep is appended to, and the statements that
+// compare twin and original for row `i` whose render is `nm`, appending
+// " [<name> <render> twin=… orig=…]" to `out` when they differ.
+type Twin = { name: string, file: string, body: string }
+
+const TWINS: Twin[] = [
+  {
+    name: "vak",
+    file: "emit_classify.vl",
+    body: join(
+      [
+        "    const vak1 = valueAtomKindOfTy(i)",
+        "    const vak2 = valueAtomKind(nm)",
+        "    if vak1 != vak2 {",
+        "      out = out + \" [vak \" + nm + \" twin=\" + i32ToStr(vak1) + \" orig=\" + i32ToStr(vak2) + \"]\"",
+        "    }",
+      ],
+      "\n",
+    ),
+  },
+  // Excluded because the spelling is the wrong answer there: a function whose render ends in
+  // `[]`, and a list whose render is "" (a `T[]` over an unbound type variable). The fixtures
+  // `*-beside-fn-arm`, `map-or-list-arm-empty-literal` and
+  // `list-of-param-arm-narrow-index` pin the call site over both.
+  {
+    name: "arr",
+    file: "emit_classify.vl",
+    body: join(
+      [
+        "    if !(T.tys[i] is TyFunc && nameIsArray(nm)) && !(nm == \"\" && tyIsArray(i)) && tyIsArray(i) != nameIsArray(nm) {",
+        "      let arrT = \"0\"",
+        "      if tyIsArray(i) { arrT = \"1\" }",
+        "      let arrO = \"0\"",
+        "      if nameIsArray(nm) { arrO = \"1\" }",
+        "      out = out + \" [arr \" + nm + \" twin=\" + arrT + \" orig=\" + arrO + \"]\"",
+        "    }",
+      ],
+      "\n",
+    ),
+  },
+  {
+    name: "nsl",
+    file: "emit_classify.vl",
+    body: join(
+      [
+        "    const nsl1 = nulScalarListKindOfTy(i)",
+        "    const nsl2 = nulScalarListKind(nm + \"|null\")",
+        "    if nsl1 != nsl2 { out = out + \" [nsl \" + nm + \" twin=\" + (nsl1 ?? \"null\") + \" orig=\" + (nsl2 ?? \"null\") + \"]\" }",
+      ],
+      "\n",
+    ),
+  },
+  // The original is the render itself when it spells a primitive, else "".
+  {
+    name: "tep",
+    file: "emit_classify.vl",
+    body: join(
+      [
+        "    const tep1 = primNameStr(tyEmitPrimOf(i))",
+        "    let tep2 = \"\"",
+        "    if nm == \"i32\" || nm == \"i64\" || nm == \"f32\" || nm == \"f64\" || nm == \"boolean\" || nm == \"string\" || nm == \"void\" || nm == \"null\" || nm == \"never\" || nm == \"u8\" || nm == \"v128\" { tep2 = nm }",
+        "    if tep1 != tep2 { out = out + \" [tep \" + nm + \" twin=\" + tep1 + \" orig=\" + tep2 + \"]\" }",
+      ],
+      "\n",
+    ),
+  },
+]
+
+// [name, prelude, type, a value of it]. Every kind must reach the emitter, which is why the
+// grid has no float or boolean literal type (not types) and no `u8` (storage only).
+const KINDS: string[][] = [
+  ["i32", "", "i32", "3"],
+  ["i64", "", "i64", "3"],
+  ["f32", "", "f32", "1.5"],
+  ["f64", "", "f64", "1.5"],
+  ["bool", "", "boolean", "true"],
+  ["str", "", "string", "\"s\""],
+  ["lit_int", "", "7", "7"],
+  ["lit_str", "", "\"a\"", "\"a\""],
+  ["lu_int", "", "0 | 1", "1"],
+  ["lu_str", "", "\"a\" | \"b\"", "\"a\""],
+  ["lu_mixed", "", "1 | \"a\"", "1"],
+  ["alias_lu", "type K = 0 | 1\n", "K", "1"],
+  ["alias_alias", "type K = 0 | 1\ntype K2 = K\n", "K2", "1"],
+  ["alias_str_lu", "type S = \"a\" | \"b\"\n", "S", "\"a\""],
+  ["nul_i32", "", "i32 | null", "3"],
+  ["nul_f64", "", "f64 | null", "1.5"],
+  ["nul_str", "", "string | null", "\"s\""],
+  ["nul_lu", "", "(0 | 1) | null", "1"],
+  ["nul_lit", "", "7 | null", "7"],
+  ["nul_strlu", "", "(\"a\" | \"b\") | null", "\"a\""],
+  ["vu", "", "i32 | string", "3"],
+  ["vu3", "", "i32 | f64 | boolean", "3"],
+  ["vu_nul", "", "i32 | string | null", "3"],
+  ["fn", "", "(x: i32) => i32", "(x: i32) => x"],
+  ["fn_str", "", "(s: string) => string", "(s: string) => s"],
+  ["nul_fn", "", "((x: i32) => i32) | null", "(x: i32) => x"],
+  ["map", "", "{ [string]: i32 }", "Map()"],
+  ["map_str", "", "{ [string]: string }", "Map()"],
+  ["arr_i32", "", "i32[]", "[1]"],
+  ["arr_str", "", "string[]", "[\"a\"]"],
+  ["arr_f64", "", "f64[]", "[1.5]"],
+  ["arr_i64", "", "i64[]", "[1]"],
+  ["arr_f32", "", "f32[]", "[1.5]"],
+  ["arr_bool", "", "boolean[]", "[true]"],
+  ["arr_u8", "", "u8[]", "[1]"],
+  ["arr_lu", "", "(\"a\" | \"b\")[]", "[\"a\"]"],
+  ["arr_nulstr", "", "(string | null)[]", "[\"a\"]"],
+  ["arr_obj", "", "{ x: i32 }[]", "[{ x: 1 }]"],
+  ["arr2", "", "i32[][]", "[[1]]"],
+  ["arr_nul", "", "i32[] | null", "[1]"],
+  ["obj", "", "{ x: i32 }", "{ x: 1 }"],
+  ["obj_nul", "", "{ x: i32 } | null", "{ x: 1 }"],
+  ["neg", "", "(i32 | string) & !string", "3"],
+  ["lit_i64", "", "5000000000", "5000000000"],
+  ["nul_bool", "", "boolean | null", "true"],
+  ["lu_rg", "type S = \"a\" | \"b\"\n", "\"a\" | \"b\" | i32", "3"],
+  ["lu_alias_mem", "type S = \"a\" | \"b\"\n", "S | i32", "3"],
+  ["lu_int_str", "", "1 | 2 | \"a\" | \"b\"", "1"],
+  ["vu_fn", "", "((x: i32) => i32) | i32", "3"],
+  ["rec", "type L = { v: i32, next: L | null }\n", "L", "{ v: 1, next: null }"],
+  // Unions whose members share a kind, and lists whose element is itself a union.
+  ["fn2", "", "((x: i32) => i32) | ((s: string) => i32)", "(x: i32) => x"],
+  ["fn_ret_arr", "", "(x: i32) => i32[]", "(x: i32) => [x]"],
+  ["fn_ret_vu", "", "(x: i32) => i32 | string", "(x: i32) => x"],
+  ["arr_lu_alias", "type K = 0 | 1\n", "i32[] | K[]", "[1]"],
+  ["arr_vu_same", "", "i32[] | i32[]", "[1]"],
+  ["arr_f64_str", "", "f64[] | string[]", "[1.5]"],
+  ["arr_str_nulstr", "", "string[] | (string | null)[]", "[\"a\"]"],
+  ["arr_nulstr_rev", "", "(null | string)[]", "[\"a\"]"],
+  ["arr_nulbool", "", "(boolean | null)[]", "[true]"],
+  ["arr_nulf64", "", "(f64 | null)[]", "[1.5]"],
+  ["arr_nuli32", "", "(i32 | null)[]", "[1]"],
+  ["arr_vu", "", "(i32 | string)[]", "[1]"],
+  ["arr_fn", "", "((x: i32) => i32)[]", "[(x: i32) => x]"],
+  ["arr_map", "", "{ [string]: i32 }[]", "[Map()]"],
+  ["arr_nullu", "", "((0 | 1) | null)[]", "[1]"],
+  ["arr_luint", "", "(0 | 1)[]", "[1]"],
+  ["vu_lists", "", "i32[] | string", "[1]"],
+  ["vu_strlists", "", "string[] | string[][]", "[\"a\"]"],
+]
+
+// The kind program: the type placed as a binding, a field, a nullable field, a param, a
+// return, a list element, a union member and a generic hole.
+export function kindProgram(pre: string, ty: string, v: string): string {
+  const lines = [
+    pre + "type A = " + ty,
+    "type R = { f: A, g: A | null }",
+    "type U = A | { tag: i32 }",
+    "function id(a: A): A { return a }",
+    "function opt(r: R | null): A | null {",
+    "  if r == null { return null }",
+    "  r.g",
+    "}",
+    "const a: A = " + v,
+    "const r: R = { f: a, g: a }",
+    "const xs: A[] = [a]",
+    "const u: U = a",
+    "print(opt(r) == null)",
+    "print(id(a) == null)",
+    "print(xs.length)",
+    "if u is { tag: i32 } { print(u.tag) } else { print(0) }",
+    "function gen<T>(t: T): T[] { return [t] }",
+    "print(gen(a).length)",
+    "",
+  ]
+  join(lines, "\n")
+}
+
+const HOOK = "  emitCurFnPos = -1\n  emitCurStmtIx = -1\n"
+
+// ── the few regular expressions the instrumenter and the grader need, by hand ────────
+
+function isWord(b: i32): boolean {
+  (b >= 48 && b <= 57)
+    || (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+}
+
+function wordEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && isWord(s[j]) { j = j + 1 }
+  j
+}
+
+// `re.findall(r"\b([a-z]\w*)\(", body)`, sorted and deduplicated.
+export function calledNames(body: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < body.length {
+    const b = body[i]
+    if b >= 97 && b <= 122 && (i == 0 || !isWord(body[i - 1])) {
+      const e = wordEnd(body, i)
+      if e < body.length && body[e] == 40 {
+        const nm = body.slice(i, e)
+        if !includes(out, nm) { out.push(nm) }
+      }
+      i = e
+      continue
+    }
+    i = i + 1
+  }
+  sortStrings(out)
+}
+
+// Whether `s` begins with `head` and `head` is not followed by a word character.
+function startsWord(s: string, head: string): boolean {
+  startsWith(s, head) && (s.length == head.length || !isWord(s[head.length]))
+}
+
+// `re.search(rf"^{prefix}{name}\b", text, re.M)` for a `prefix` of literal text.
+function lineStartsWord(text: string, head: string): boolean {
+  for line in split(text, "\n") {
+    if startsWord(line, head) { return true }
+  }
+  false
+}
+
+// Whether `text` defines `name` as a function, exported or not.
+export function definesFn(text: string, name: string): boolean {
+  lineStartsWord(text, "function " + name)
+    || lineStartsWord(text, "export function " + name)
+}
+
+// Whether `name` is already imported: alone on a line of a multi-line import (an optional
+// trailing comma), or inside a one-line `import { … }` as a whole word.
+export function importsName(text: string, name: string): boolean {
+  for line in split(text, "\n") {
+    let rest = line
+    while rest.length > 0 && wsLen(rest, 0) > 0 {
+      rest = rest.slice(wsLen(rest, 0), rest.length)
+    }
+    if startsWith(rest, name) {
+      let tail = rest.slice(name.length, rest.length)
+      if startsWith(tail, ",") { tail = tail.slice(1, tail.length) }
+      if stripWs(tail) == "" { return true }
+    }
+  }
+  let at = findFrom(text, "import {", 0)
+  while at >= 0 {
+    const lo = at + 8
+    let hi = findFrom(text, "}", lo)
+    if hi < 0 { hi = text.length }
+    let p = findFrom(text, name, lo)
+    while p >= 0 && p + name.length <= hi {
+      const after = p + name.length
+      if (
+        !isWord(text[p - 1])
+        && (after >= text.length || !isWord(text[after]))
+      ) {
+        return true
+      }
+      p = findFrom(text, name, p + 1)
+    }
+    at = findFrom(text, "import {", at + 1)
+  }
+  false
+}
+
+function failed(work: string, keep: boolean, msg: string) {
+  if !keep { spawn("rm", ["-rf", work]) }
+  print(msg)
+  exit(1)
+}
+
+// Imports every function `body` calls that `fname` neither defines nor imports, from the
+// module of `src` that exports it, so a twin that has since moved between modules resolves.
+export function importCallees(src: string, fname: string, body: string) {
+  const path = src + "/" + fname
+  const text = readText(path)
+  const ls = listDir(src)
+  let others: string[] = []
+  if ls is string[] {
+    for f in ls {
+      if f != fname && endsWith(f, ".vl") { others.push(f) }
+    }
+  }
+  others = sortStrings(others)
+  let adds = ""
+  for name in calledNames(body) {
+    if definesFn(text, name) || importsName(text, name) { continue }
+    for f in others {
+      if lineStartsWord(readText(src + "/" + f), "export function " + name) {
+        const stem = f.slice(0, f.length - 3)
+        adds = adds + "import { \{name} } from \"./\{stem}\"\n"
+        break
+      }
+    }
+  }
+  if adds != "" { writeText(path, adds + text) }
+}
+
+function countOf(s: string, needle: string): i32 {
+  let n = 0
+  let at = findFrom(s, needle, 0)
+  while at >= 0 {
+    n = n + 1
+    at = findFrom(s, needle, at + needle.length)
+  }
+  n
+}
+
+function twinNamed(name: string): Twin {
+  for t in TWINS {
+    if t.name == name { return t }
+  }
+  TWINS[0]
+}
+
+// Appends one sweep per compiler file to `src` and calls them all from the top of
+// `emitProgram`, which then refuses with the row count and every disagreement. Answers "" or
+// the reason the tree could not be instrumented.
+export function instrument(src: string, twins: string[]): string {
+  const files: string[] = []
+  for t in twins {
+    const f = twinNamed(t).file
+    if !includes(files, f) { files.push(f) }
+  }
+  const calls: string[][] = []
+  let n = 0
+  for fname in sortStrings(files) {
+    const fn = "twinSweep" + toString(n)
+    const checks: string[] = []
+    for t in twins {
+      const tw = twinNamed(t)
+      if tw.file == fname { checks.push(tw.body) }
+    }
+    const body = join(checks, "\n")
+    importCallees(src, fname, body)
+    const path = src + "/" + fname
+    const sweep = [
+      "",
+      "export function " + fn + "(): string {",
+      "  let out = \"\"",
+      "  let i = 0",
+      "  while i < T.tys.length {",
+      "    const nm = tyToEmitName(i)",
+      body,
+      "    i = i + 1",
+      "  }",
+      "  out",
+      "}",
+      "export function " + fn + "Rows(): i32 { T.tys.length }",
+      "",
+    ]
+    writeText(path, readText(path) + join(sweep, "\n"))
+    calls.push([fname, fn])
+    n = n + 1
+  }
+  const es = src + "/emit_sections.vl"
+  let e = readText(es)
+  if countOf(e, HOOK) != 1 {
+    return "twin-agreement: the emitProgram reset anchor is not unique in emit_sections.vl; update HOOK"
+  }
+  let sweep = "  let twinOut = \"\"\n"
+  for c in calls {
+    sweep = sweep + "  twinOut = twinOut + " + c[1] + "()\n"
+    const mod = "./" + c[0].slice(0, c[0].length - 3)
+    e = replace(
+      e,
+      "} from \"\{mod}\"",
+      "  \{c[1]},\n  \{c[1]}Rows,\n} from \"\{mod}\"",
+    )
+  }
+  sweep = sweep
+    + "  emitFail(\"TWINSWEEP rows=\" + i32ToStr("
+    + calls[0][1]
+    + "Rows()) + twinOut)\n"
+  writeText(es, replace(e, HOOK, HOOK + sweep))
+  ""
+}
+
+// ── reading one probe build's refusal ────────────────────────────────────────────────
+
+// What the probe said about one program: `rows` is -1 when it printed no row count.
+export type Sweep = { rows: i64, keys: string[] }
+
+// A maximal run of non-whitespace starting at `i`; answers its end.
+function nonWsEnd(s: string, i: i32): i32 {
+  let j = i
+  while j < s.length && wsLen(s, j) == 0 { j = j + cpAt(s, j).n }
+  j
+}
+
+// `re.findall(r"\[(\w+ .*?) twin=(\S*) orig=(\S*)\]", tail)`, each match as the key
+// "<name render>  twin=<t> orig=<o>", first appearance first and each key once.
+export function disagreements(tail: string): string[] {
+  const keys: string[] = []
+  let s = 0
+  while s < tail.length {
+    if tail[s] != 91 {
+      s = s + 1
+      continue
+    }
+    const w = wordEnd(tail, s + 1)
+    if w == s + 1 || w >= tail.length || tail[w] != 32 {
+      s = s + 1
+      continue
+    }
+    let found = -1
+    let e = w + 1
+    while e <= tail.length && found < 0 {
+      if findFrom(tail, " twin=", e) == e {
+        const t0 = e + 6
+        const t1 = nonWsEnd(tail, t0)
+        if findFrom(tail, " orig=", t1) == t1 {
+          const o0 = t1 + 6
+          let o1 = nonWsEnd(tail, o0) - 1
+          while o1 >= o0 && tail[o1] != 93 { o1 = o1 - 1 }
+          if o1 >= o0 {
+            const key = tail.slice(s + 1, e)
+              + "  twin="
+              + tail.slice(t0, t1)
+              + " orig="
+              + tail.slice(o0, o1)
+            if !includes(keys, key) { keys.push(key) }
+            found = o1 + 1
+          }
+        }
+      }
+      if e < tail.length && tail[e] == 10 { break }
+      e = e + 1
+    }
+    if found >= 0 { s = found } else { s = s + 1 }
+  }
+  keys
+}
+
+// The `TWINSWEEP rows=<n>` refusal in one build's output, or `rows` -1 when there is none.
+export function readSweep(out: string): Sweep {
+  let at = findFrom(out, "TWINSWEEP rows=", 0)
+  while at >= 0 {
+    const d0 = at + 15
+    let d1 = d0
+    while d1 < out.length && isDigit(out[d1]) { d1 = d1 + 1 }
+    if d1 > d0 {
+      let end = findFrom(out, "\n", d1)
+      if end < 0 { end = out.length }
+      let rows: i64 = 0
+      let i = d0
+      while i < d1 {
+        rows = rows * 10 + (out[i] - 48)
+        i = i + 1
+      }
+      return { rows: rows, keys: disagreements(out.slice(d1, end)) }
+    }
+    at = findFrom(out, "TWINSWEEP rows=", at + 1)
+  }
+  { rows: -1, keys: [] }
+}
+
+// One graded program: its label, path, whether it is a kind (must reach), and its sweep.
+export type Graded = { label: string, mustReach: boolean, sweep: Sweep }
+
+// The report and exit code for a run's graded programs. Disagreements are listed most
+// programs first, ties in the order they were first seen.
+export function report(
+  twins: string,
+  graded: Graded[],
+  hasList: boolean,
+): string[] {
+  const keys: string[] = []
+  const counts: i32[] = []
+  const firsts: string[] = []
+  const unreached: string[] = []
+  let rows: i64 = 0
+  let listTotal = 0
+  let listReached = 0
+  for g in graded {
+    if !g.mustReach { listTotal = listTotal + 1 }
+    if g.sweep.rows < 0 {
+      if g.mustReach { unreached.push(g.label) }
+      continue
+    }
+    if !g.mustReach { listReached = listReached + 1 }
+    rows = rows + g.sweep.rows
+    for k in g.sweep.keys {
+      let j = 0
+      while j < keys.length && keys[j] != k { j = j + 1 }
+      if j == keys.length {
+        keys.push(k)
+        counts.push(1)
+        firsts.push(g.label)
+      } else {
+        counts[j] = counts[j] + 1
+      }
+    }
+  }
+  const reached = graded.length - unreached.length - (listTotal - listReached)
+  const out = [
+    "twin-agreement [\{twins}]: \{reached} programs reached the emitter, \{rows} arena rows compared",
+  ]
+  if hasList {
+    const stopped = listTotal - listReached
+    out.push(
+      "  --list: \{listReached} of \{listTotal} reached the emitter; \{stopped} stopped earlier (a check, parse or emit refusal) and compared nothing",
+    )
+  }
+  const done: boolean[] = []
+  while done.length < keys.length { done.push(false) }
+  let left = keys.length
+  while left > 0 {
+    let best = -1
+    let j = 0
+    while j < keys.length {
+      if !done[j] && (best < 0 || counts[j] > counts[best]) { best = j }
+      j = j + 1
+    }
+    done[best] = true
+    left = left - 1
+    out.push(
+      "  DISAGREE \{keys[best]}   (\{counts[best]} programs; first \{firsts[best]})",
+    )
+  }
+  for label in unreached {
+    out.push(
+      "  UNREACHED "
+        + label
+        + " (no row count: the program never reached the emitter)",
+    )
+  }
+  out
+}
+
+// ── arguments, read as Python argparse reads them, usage errors exiting 2 ─────────
+
+const USAGE = "usage: twin-agreement.vl [-h] [--seed SEED] [--twins TWINS] [--list LIST]\n                         [--source SOURCE] [--rev REV] [--keep]"
+
+const HELP = "\n\nGrades a type-taking TWIN against the render-then-parse call it replaces, on\nevery arena row.\n\noptions:\n  -h, --help       show this help message and exit\n  --seed SEED\n  --twins TWINS\n  --list LIST      a file of extra program paths, one per line\n  --source SOURCE  the compiler tree to instrument (a control: an older tree\n                   whose twin is known wrong)\n  --rev REV        instrument compiler/ as of this git revision instead (the\n                   control)\n  --keep           leave the scratch tree and print it"
+
+const OPTS = [
+  "--seed", "--twins", "--list", "--source", "--rev", "--keep", "--help",
+]
+
+function usageError(msg: string): i32 {
+  print(USAGE)
+  print("twin-agreement.vl: error: " + msg)
+  2
+}
+
+// Whether argparse would read `a` as an option rather than a value: it starts with `-`, is
+// not `-` alone, a negative number, or a string holding a space.
+function optionLike(a: string): boolean {
+  if !startsWith(a, "-") || a == "-" || findFrom(a, " ", 0) >= 0 {
+    return false
+  }
+  let i = 1
+  let digits = 0
+  let dots = 0
+  while i < a.length {
+    if isDigit(a[i]) { digits = digits + 1 }
+    else if a[i] == 46 { dots = dots + 1 }
+    else { return true }
+    i = i + 1
+  }
+  !(digits > 0 && dots <= 1 && (dots == 0 || a[a.length - 1] != 46))
+}
+
+// The parsed options, or `code` >= 0 when the run ends here with that exit code.
+export type Opts = {
+  code: i32,
+  seed: string,
+  twins: string,
+  list: string,
+  source: string,
+  rev: string,
+  keep: boolean,
+}
+
+export function parseArgs(args: readonly string[]): Opts {
+  const o: Opts = {
+    code: -1,
+    seed: "build/vl-compiler.wasm",
+    twins: "vak,arr,nsl,tep",
+    list: "",
+    source: "compiler",
+    rev: "",
+    keep: false,
+  }
+  const extras: string[] = []
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    let val: string | null = null
+    const eq = findFrom(a, "=", 0)
+    if startsWith(a, "--") && eq > 0 {
+      val = a.slice(eq + 1, a.length)
+      a = a.slice(0, eq)
+    }
+    let opt = ""
+    if a == "-h" {
+      opt = "--help"
+    } else if startsWith(a, "--") && a.length > 2 {
+      const hits: string[] = []
+      for c in OPTS {
+        if startsWith(c, a) { hits.push(c) }
+      }
+      if includes(OPTS, a) {
+        opt = a
+      } else if hits.length > 1 {
+        o.code = usageError(
+          "ambiguous option: "
+            + args[i]
+            + " could match "
+            + join(hits, ", "),
+        )
+        return o
+      } else if hits.length == 1 {
+        opt = hits[0]
+      }
+    }
+    if opt == "" {
+      extras.push(args[i])
+    } else if opt == "--help" || opt == "--keep" {
+      if val != null {
+        let shown = opt
+        if opt == "--help" { shown = "-h/--help" }
+        o.code = usageError(
+          "argument "
+            + shown
+            + ": ignored explicit argument "
+            + pyRepr(val ?? ""),
+        )
+        return o
+      }
+      if opt == "--help" {
+        print(USAGE + HELP)
+        o.code = 0
+        return o
+      }
+      o.keep = true
+    } else {
+      let v = ""
+      if val is string {
+        v = val
+      } else if i + 1 < args.length && !optionLike(args[i + 1]) {
+        v = args[i + 1]
+        i = i + 1
+      } else {
+        o.code = usageError("argument " + opt + ": expected one argument")
+        return o
+      }
+      if opt == "--seed" { o.seed = v }
+      if opt == "--twins" { o.twins = v }
+      if opt == "--list" { o.list = v }
+      if opt == "--source" { o.source = v }
+      if opt == "--rev" { o.rev = v }
+    }
+    i = i + 1
+  }
+  if extras.length > 0 {
+    o.code = usageError("unrecognized arguments: " + join(extras, " "))
+  }
+  o
+}
+
+// ── the run ───────────────────────────────────────────────────────────────────────────
+
+// The last `n` code points of `s`, which is what a Python slice `[-n:]` keeps.
+function cpSuffix(s: string, n: i32): string {
+  let i = s.length
+  let k = 0
+  while i > 0 && k < n {
+    i = i - 1
+    while i > 0 && (s[i] & 0xC0) == 0x80 { i = i - 1 }
+    k = k + 1
+  }
+  s.slice(i, s.length)
+}
+
+function resolve(root: string, p: string): string {
+  let full = p
+  if !startsWith(p, "/") { full = root + "/" + p }
+  stripWs(spawn("realpath", ["-m", full]).out)
+}
+
+function run(o: Opts): i32 {
+  const twins = split(o.twins, ",")
+  const names: string[] = []
+  for t in TWINS { names.push(t.name) }
+  for t in twins {
+    if !includes(names, t) {
+      print(
+        "twin-agreement: unknown twin "
+          + pyRepr(t)
+          + "; known: "
+          + join(names, ", "),
+      )
+      return 1
+    }
+  }
+  const root = cwd()
+  const vl = root + "/scripts/vl-host/target/release/vl"
+  const std = "VL_STD=" + envOr("VL_STD", root + "/std")
+  const mk = spawn("mktemp", ["-d", "-t", "twin-agreement-XXXXXXXX"])
+  if mk.code != 0 {
+    print("twin-agreement: mktemp failed: " + mk.err)
+    return 1
+  }
+  const work = stripWs(mk.out)
+  if o.rev != "" {
+    const arc = runProgram("git", ["archive", o.rev, "compiler"])
+    if arc is IoError {
+      failed(work, o.keep, "twin-agreement: cannot run git (" + arc.msg + ")")
+      return 1
+    }
+    if arc.code != 0 {
+      let from = arc.stderr.length - 300
+      if from < 0 { from = 0 }
+      failed(
+        work,
+        o.keep,
+        "twin-agreement: git archive "
+          + o.rev
+          + " failed: "
+          + decodeUtf8Lossy(arc.stderr.slice(from, arc.stderr.length)),
+      )
+    }
+    const tar = work + "/compiler.tar"
+    const w = writeFile(tar, arc.stdout)
+    if w != null {
+      failed(work, o.keep, "twin-agreement: cannot write \{tar} (\{w.msg})")
+    }
+    const x = spawn("tar", ["-x", "-f", tar, "-C", work])
+    if x.code != 0 {
+      failed(work, o.keep, "twin-agreement: tar failed: " + x.err)
+    }
+    spawn("rm", ["-f", tar])
+  } else {
+    const c = spawn("cp", ["-rL", resolve(root, o.source), work + "/compiler"])
+    if c.code != 0 {
+      failed(
+        work,
+        o.keep,
+        "twin-agreement: cannot copy " + o.source + ": " + c.err,
+      )
+    }
+  }
+  const why = instrument(work + "/compiler", twins)
+  if why != "" { failed(work, o.keep, why) }
+  const probe = work + "/probe.wasm"
+  const b = spawn(
+    "env",
+    [
+      "-C",
+      work,
+      std,
+      "timeout",
+      "300",
+      vl,
+      "build",
+      "compiler/entry.vl",
+      "-o",
+      probe,
+      "--compiler",
+      resolve(root, o.seed),
+    ],
+  )
+  if b.code != 0 {
+    print(cpSuffix(b.out + b.err, 2000))
+    failed(work, o.keep, "twin-agreement: the probe compiler did not build")
+  }
+  spawn("mkdir", [work + "/kinds"])
+  const progs: string[][] = []
+  for k in KINDS {
+    const p = work + "/kinds/" + k[0] + ".vl"
+    writeText(p, kindProgram(k[1], k[2], k[3]))
+    progs.push([k[0], p, "kind"])
+  }
+  if o.list != "" {
+    for line in splitLines(readText(o.list)) {
+      const s = stripWs(line)
+      if s != "" { progs.push([s, resolve(root, s), "list"]) }
+    }
+  }
+  const graded: Graded[] = []
+  for p in progs {
+    const r = spawn(
+      "env",
+      [
+        std,
+        vl,
+        "build",
+        p[1],
+        "-o",
+        work + "/out.wasm",
+        "--compiler",
+        probe,
+      ],
+    )
+    graded.push(
+      { label: p[0], mustReach: p[2] == "kind", sweep: readSweep(r.out + r.err) },
+    )
+  }
+  const lines = report(join(twins, ","), graded, o.list != "")
+  for l in lines { print(l) }
+  if o.keep { print("scratch: " + work) } else { spawn("rm", ["-rf", work]) }
+  let bad = false
+  for g in graded {
+    if g.sweep.keys.length > 0 || (g.mustReach && g.sweep.rows < 0) {
+      bad = true
+    }
+  }
+  if bad { return 1 }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  print("twin-agreement: an argument is not UTF-8: " + argv.msg)
+  exit(2)
+} else {
+  const o = parseArgs(argv)
+  if o.code >= 0 { exit(o.code) }
+  exit(run(o))
+}

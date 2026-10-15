@@ -19,7 +19,7 @@ Reacher is the first two reachers found, `(+n)` for more. D rules: a per-grid
 `scripts/silent-sweep/dNNN/README.md` that says "re-run with" counts as D; a mention only in
 an inventory row, `CHANGELOG.md`, `DECISIONS.md`, a dated report or a code comment does not.
 Data (`distilled/named/`, `census/*.json`, `nulvariant/*.csv`) was kept; only code was deleted.
-`scripts/twin-agreement.py` is D by activity, not by a doc: the L2 refactor lane edited it in
+`scripts/twin-agreement.py` (since ported to `.vl`) was D by activity, not by a doc: the L2 refactor lane edited it in
 #3562, #3603 and #3608.
 
 Other lanes are porting concurrently. A `.py` whose VL port is already on master stays only as
@@ -31,7 +31,7 @@ the oracle of its `tests/vl_*_port_test.ts` and goes with that test's oracle hal
 | --- | --- | --- | --- |
 | 1 | `comment budget` | done: `vl check --budget` (#3648) | - |
 | 2 | `arena-scan budget` | done: `vl check --budget` (#3648) | - |
-| 3 | `kind-ladder budget` | done: `vl check --budget` plus `ladder-sets.vl`; `ladder-census.py` stays as the discovery tool | - |
+| 3 | `kind-ladder budget` | done: `vl check --budget` plus `ladder-sets.vl`; the discovery tool is `ladder-census.vl` | - |
 | 4 | `dead-export budget` | done: `dead-exports.vl` plus `vl check --budget --findings` | - |
 | 5 | `render-parse budget` | done: `render-parse-census.vl` plus `vl check --budget --findings` | - |
 | 6 | `splice scan` | done: `inventory/splice-scan.vl`; `inventory/{rows,ls,split,selftest}.py` deleted, the row grammar is `scripts/lib/inventory.vl` | - |
@@ -59,22 +59,22 @@ heredoc and moves with its own PR.
 | File | Lines | Class | Reached by | Planned VL replacement |
 | --- | --- | --- | --- | --- |
 | `scripts/check-filed-witnesses.py` | 712 | T | tests/vl_check_codegen_test.ts tests/vl_check_filed_witnesses_test.ts (+3) | deleted: `scripts/check-filed-witnesses.vl`; its test pins the report |
-| `scripts/codemods/label-at.py` | 322 | T | tests/vl_label_codemod_test.ts | scripts/codemods/label-at.vl |
+| `scripts/codemods/label-at.py` | 322 | T | tests/vl_label_codemod_test.ts | done: `scripts/codemods/label-at.vl`, the `.py` deleted; `tests/vl_label_codemod_test.ts` runs the port |
 | `scripts/day-one/modules.py` | 552 | T | tests/vl_day_one_sampler_test.ts | done: deleted; `scripts/day-one/modules.vl`, matched by sample.vl's byte-identical runs |
 | `scripts/day-one/sample.py` | 657 | T | tests/vl_day_one_sampler_test.ts | done: deleted; `scripts/day-one/sample.vl` matched its stdout, `--json` and JSONL byte for byte (sample, `--report`, `--control`, `--replay`, `--axis`, `--exclude`), and `tests/vl_day_one_sampler_test.ts` runs it |
 | `scripts/emitter-state-audit.py` | 238 | T | tests/vl_emitter_state_audit_test.ts | done: `scripts/emitter-state-audit.vl`, output byte-identical to the Python's (default and `--names`) and now the L7 `emitter state budget` ratchet; the `.py` is deleted |
 | `scripts/goal-scoreboard.py` | 273 | T | tests/vl_invalid_module_position_test.ts tests/vl_live_sites_test.ts | done: `scripts/goal-scoreboard.vl`, pinned by `tests/vl_goal_scoreboard_test.ts`; the `.py` is deleted |
 | `scripts/inventory/ls.py` | 200 | T | tests/vl_inventory_rows_test.ts | deleted: `scripts/inventory/ls.vl`, graded beside it flag by flag |
-| `scripts/ladder-census.py` | 884 | T | tests/lsp_ratchet_hold_test.ts tests/vl_kind_ladder_test.ts | scripts/ladder-census.vl (shares the budget walk) |
+| `scripts/ladder-census.py` | 884 | T | tests/lsp_ratchet_hold_test.ts tests/vl_kind_ladder_test.ts | done: `scripts/ladder-census.vl` over `scripts/lib/ladder-walk.vl`, the `.py` deleted; `tests/vl_ladder_census_test.ts` pins the Python's output on a fixture tree |
 | `scripts/memo-generation-probe.py` | 403 | T | tests/vl_memo_generation_test.ts | done: `scripts/memo-generation-probe.vl`, rows in `scripts/memo-generation-rows.json`; the `.py` is deleted |
 | `scripts/plumb-shape-cost.py` | 397 | T | tests/vl_plumb_shape_port_test.ts | done: deleted; `scripts/plumb-shape-cost.vl` runs the gate row and the port test pins its outcomes |
-| `scripts/sentinel-census.py` | 481 | T | tests/vl_budget_mode_test.ts tests/vl_sentinel_index_test.ts | scripts/sentinel-census.vl (shares the budget walk) |
+| `scripts/sentinel-census.py` | 481 | T | tests/vl_budget_mode_test.ts tests/vl_sentinel_index_test.ts | done: `scripts/sentinel-census.vl`, the `.py` deleted; `tests/vl_sentinel_index_test.ts` runs the port |
 | `scripts/silent-sweep/census/gradecensus.py` | 217 | T | tests/vl_regress_port_test.ts | deleted: `census/gradecensus.vl`, grading shared with `regress.vl` through `scripts/lib/census-grade.vl` |
 | `scripts/silent-sweep/distilled/cellmap.py` | 35 | I | none | done: deleted; `loadCells`/`dumpCells` in `scripts/lib/corpus.vl` round-trip its files byte for byte |
 | `scripts/silent-sweep/distilled/index.py` | 157 | T | tests/vl_regress_port_test.ts | deleted: `distilled/index.vl` |
 | `scripts/silent-sweep/grade.py` | 165 | T | docs/internals/inventory/README.md (the test reach was `survey-regrade.py` matching as a substring; it is D) | done: deleted; `scripts/silent-sweep/grade.vl` matched its stdout and csv byte for byte on two real sweeps, and `tests/vl_grade_test.ts` pins every column and the two named disagreements |
 | `scripts/survey-regrade.py` | 463 | T | tests/vl_seed_provenance_test.ts tests/vl_survey_measure_test.ts (+1) | done: deleted; `scripts/survey-regrade.vl` runs the gate row, its port test holds it to the Python's frozen reports |
-| `scripts/wasm-runner-census.py` | 172 | T | tests/cases_wasm_0_test.ts tests/cases_wasm_1_test.ts (+3) | scripts/wasm-runner-census.vl (shares the budget walk) |
+| `scripts/wasm-runner-census.py` | 172 | T | tests/cases_wasm_0_test.ts tests/cases_wasm_1_test.ts (+3) | done: `scripts/wasm-runner-census.vl`, the `.py` deleted; `tests/vl_wasm_runner_census_test.ts` runs the port |
 
 ### I: imported
 
@@ -146,26 +146,26 @@ heredoc and moves with its own PR.
 | `bench/strings/token-count/main.py` | 58 | D | bench/run.sh bench/README.md | done: deleted with the CPython column (`bench/run.sh`, `bench/README.md`, `bench/results/`) |
 | `scripts/day-one/file_row.py` | 160 | D | scripts/day-one/README.md | done: deleted; `scripts/day-one/file_row.vl` matched its draft except the regenerate line now naming `sample.vl` |
 | `scripts/day-one/minimise.py` | 258 | D | scripts/day-one/README.md | done: deleted; `scripts/day-one/minimise.vl` (library `reduce.vl`) matched it on every hit kind it could run, and ablates the `imports_pair` hits it crashed on; pinned by `tests/vl_day_one_sampler_test.ts` |
-| `scripts/emit-refusal-sites.py` | 226 | D | CLAUDE.md scripts/capability-probes/README.md | port to VL or retire (decide at its turn) |
-| `scripts/gen-atomic-cases.py` | 291 | D | doc tool (+4) | scripts/gen-atomic-cases.vl (fixture generator) |
-| `scripts/gen-conv-cases.py` | 398 | D | doc tool (+4) | scripts/gen-conv-cases.vl (fixture generator) |
-| `scripts/gen-shift-mask-fold.py` | 159 | D | doc tool (+4) | scripts/gen-shift-mask-fold.vl (fixture generator) |
-| `scripts/gen-simd-int-cases.py` | 450 | D | doc tool (+4) | scripts/gen-simd-int-cases.vl (fixture generator) |
+| `scripts/emit-refusal-sites.py` | 226 | D | CLAUDE.md scripts/capability-probes/README.md | done: `scripts/emit-refusal-sites.vl`, the `.py` deleted; `tests/vl_emit_refusal_sites_test.ts` pins the Python's output on a fixture tree |
+| `scripts/gen-atomic-cases.py` | 291 | D | doc tool (+4) | done: `scripts/gen-atomic-cases.vl` over `scripts/lib/wasm-cases.vl`, the `.py` deleted; `tests/vl_gen_cases_test.ts` |
+| `scripts/gen-conv-cases.py` | 398 | D | doc tool (+4) | done: `scripts/gen-conv-cases.vl`, the `.py` deleted; `tests/vl_gen_cases_test.ts` |
+| `scripts/gen-shift-mask-fold.py` | 159 | D | doc tool (+4) | done: `scripts/gen-shift-mask-fold.vl`, the `.py` deleted; `tests/vl_gen_cases_test.ts` |
+| `scripts/gen-simd-int-cases.py` | 450 | D | doc tool (+4) | done: `scripts/gen-simd-int-cases.vl`, the `.py` deleted; `tests/vl_gen_cases_test.ts` |
 | `scripts/p7-patch.py` | 156 | D | doc tool (+4) | port to VL or retire (decide at its turn) |
 | `scripts/perf/parent-let-cache-probe.py` | 245 | D | doc tool (+4) | done: deleted; a one-shot probe whose patch anchors were stale (emitter survey row 10 is closed) |
 | `scripts/perf/per-test-rank.py` | 56 | D | doc tool (+4) | done: deleted; `scripts/perf/per-test-rank.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
 | `scripts/perf/profile-parents.py` | 59 | D | doc tool (+4) | done: deleted; `scripts/perf/profile-parents.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
 | `scripts/perf/profile-phases.py` | 104 | D | doc tool (+4) | done: deleted; `scripts/perf/profile-phases.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
 | `scripts/perf/string-concat-sites.py` | 94 | D | doc tool (+4) | done: deleted; `scripts/perf/string-concat-sites.vl` matched it on real inputs, pinned by `tests/vl_perf_tools_test.ts` |
-| `scripts/rep-classifier-census.py` | 650 | D | doc tool (+4) | port to VL or retire (decide at its turn) |
+| `scripts/rep-classifier-census.py` | 650 | D | doc tool (+4) | done: `scripts/rep-classifier-census.vl`, the `.py` deleted; `tests/vl_ladder_census_test.ts` pins the Python's output on a fixture tree |
 | `scripts/silent-sweep/census/coverage.py` | 77 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/coverage.vl`, pinned by `tests/vl_census_readers_test.ts` |
 | `scripts/silent-sweep/census/delta.py` | 117 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d243/README.md | done: deleted; `census/delta.vl`, pinned by `tests/vl_census_readers_test.ts` |
 | `scripts/silent-sweep/census/families.py` | 120 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/families.vl`, pinned by `tests/vl_census_readers_test.ts` |
-| `scripts/silent-sweep/census/gencensus.py` | 867 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d181/README.md (+2) | scripts/silent-sweep/census/gencensus.vl |
-| `scripts/silent-sweep/census/mkmatrix.py` | 233 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/mkmatrix.vl |
+| `scripts/silent-sweep/census/gencensus.py` | 867 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d181/README.md (+2) | done: `scripts/silent-sweep/census/gencensus.vl`, the `.py` deleted; `tests/vl_census_generators_test.ts` |
+| `scripts/silent-sweep/census/mkmatrix.py` | 233 | D | scripts/silent-sweep/census/README.md | done: `scripts/silent-sweep/census/mkmatrix.vl`, the `.py` deleted; `tests/vl_census_generators_test.ts` |
 | `scripts/silent-sweep/census/rescue.py` | 81 | D | scripts/silent-sweep/census/README.md scripts/silent-sweep/d181/README.md | done: deleted; `census/rescue.vl`, pinned by `tests/vl_census_readers_test.ts` |
 | `scripts/silent-sweep/census/rows.py` | 73 | D | scripts/silent-sweep/census/README.md | done: deleted; its coordinate predicates were written for D155–D158 alone |
-| `scripts/silent-sweep/census/sabcensus.py` | 141 | D | scripts/silent-sweep/census/README.md | scripts/silent-sweep/census/sabcensus.vl |
+| `scripts/silent-sweep/census/sabcensus.py` | 141 | D | scripts/silent-sweep/census/README.md | done: `scripts/silent-sweep/census/sabcensus.vl`, the `.py` deleted; `tests/vl_census_generators_test.ts` |
 | `scripts/silent-sweep/census/siblings.py` | 76 | D | scripts/silent-sweep/census/README.md | done: deleted; `census/siblings.vl`, pinned by `tests/vl_census_readers_test.ts` |
 | `scripts/silent-sweep/counts.py` | 61 | D | docs/internals/inventory/README.md scripts/silent-sweep/REPRODUCE.md | done: deleted; `REPRODUCE.md` kept as the dated record of the 2026-08 sweep |
 | `scripts/silent-sweep/d111/ablate111.py` | 117 | D | scripts/silent-sweep/d111/README.md scripts/silent-sweep/d131/README.md | done: deleted; closed grid, README kept and dated, cells in `distilled/named/` |
@@ -217,7 +217,7 @@ heredoc and moves with its own PR.
 | `scripts/std-math/math-grade.py` | 203 | D | doc tool (+4) | done: deleted; `scripts/std-math/math-grade.vl` grades against a 256-bit multiprecision reference (`bigfloat.vl`) and matched the mpmath grader's report, pinned by `tests/vl_std_math_grade_test.ts` |
 | `scripts/std-math/trig-grade.py` | 78 | D | doc tool (+4) | done: deleted; `scripts/std-math/trig-grade.vl` grades against a 256-bit multiprecision reference (`bigfloat.vl`) and matched the mpmath grader's report, pinned by `tests/vl_std_math_grade_test.ts` |
 | `scripts/std-math/trig-remez.py` | 77 | D | doc tool (+4) | done: deleted; the tables it generated are frozen in `std/math.vl` and `std-notes.md` records where they came from |
-| `scripts/twin-agreement.py` | 298 | D | L2 refactor (+6) | port to VL or retire (decide at its turn) |
+| `scripts/twin-agreement.py` | 298 | D | L2 refactor (+6) | done: `scripts/twin-agreement.vl`, the `.py` deleted; `tests/vl_twin_agreement_test.ts` |
 
 ### X: deleted in this PR
 
