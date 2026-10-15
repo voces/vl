@@ -21,6 +21,10 @@ set -u
 # Everything this gate starts is a preferred OOM victim, ahead of the session that ran it.
 [ "$(cat /proc/self/oom_score_adj 2>/dev/null || echo 1000)" -lt 300 ] && echo 300 >/proc/self/oom_score_adj 2>/dev/null
 cd "$(dirname "$0")/.."
+# A builder worktree runs preflight, not the gate: the merge queue gates every PR on the merged
+# tree, so a builder's own full run is spent twice. GATE_IN_WORKTREE=1 overrides.
+case "$PWD" in */.claude/worktrees/*) [ "${GATE_IN_WORKTREE:-0}" = 1 ] || {
+  echo "gate.sh: refusing in a builder worktree ($PWD); run ~/.claude/vl-tools/preflight.sh, or set GATE_IN_WORKTREE=1" >&2; exit 2; } ;; esac
 # Pin std: to THE TREE BEING GRADED. The host resolves std: from the BINARY's
 # checkout, and a worktree's binary is a symlink to the main repo's — so without
 # this, every gate that shells the CLI grades a std-touching branch against the

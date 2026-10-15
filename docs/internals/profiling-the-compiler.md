@@ -51,8 +51,9 @@ Notes, each of which cost something to learn:
   ~all self; a dispatcher shows up as ~all inclusive. `profile-rank.vl` prints both.
 * **`__str_eq__` high in the list is a symptom, not a site** — it is the name-keyed
   registries (`isUName`, `variantIndexOf`, `declaredSlotOf`, `__map_probe__`) doing linear
-  lookups. `python3 scripts/perf/profile-parents.py` ranks the immediate PARENT frame of every
-  sample whose leaf is a given function, to find whose loop it is.
+  lookups. `vl run scripts/perf/profile-parents.vl -- <profile.json> <func>` ranks the
+  immediate PARENT frame of every sample whose leaf is a given function, to find whose loop
+  it is.
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 
@@ -80,16 +81,15 @@ source of truth, this is a copy of it.
 | `oracle-abi-probe.ts` | Where the corpus oracle's seconds go, split by cost centre (intake, `checkSrc`, `lintSrc`, `compileSrc`, read-back, V8 run). | |
 | `oracle-shard-spike.sh` | Spikes sharding the corpus oracle's one test file across concurrent processes, to size what splitting it would buy. | |
 | `parallel-jit-storm.sh` | Whether the ci-native step pays N concurrent seed JITs at its start. | |
-| `parent-let-cache-probe.py` | How well `parentLetOf`'s single-entry block cache serves a self-compile, against an LRU ring or an unbounded cache. | |
 | `per-file-time.sh` | Per-FILE cost of the ci-native suites, one `deno test` process at a time (serial, so contention doesn't inflate it). | |
 | `per-program-cost.sh` | Per-PROGRAM cost of the compiler in lines and host phases, across three sizes and three std footprints. | |
-| `per-test-rank.py` | Ranks a `deno test` log by per-test and per-file duration. | |
-| `profile-parents.py` | Ranks the immediate PARENT frame of every sample whose leaf is a given function, to find whose loop it is. | |
-| `profile-phases.py` | Attributes a `VL_PROFILE_GUEST` profile to the module pipeline's PHASES rather than its functions. | |
+| `per-test-rank.vl` | Ranks a `deno test` log by per-test and per-file duration. | |
+| `profile-parents.vl` | Ranks the immediate PARENT frame of every sample whose leaf is a given function, to find whose loop it is. | |
+| `profile-phases.vl` | Attributes a `VL_PROFILE_GUEST` profile to the module pipeline's PHASES rather than its functions. | |
 | `seed-jit-cost.sh` | COLD vs WARM: what a `vl` process pays to get the seed executable (Cranelift JIT vs `.cwasm` deserialize). | |
 | `seed-sections.sh` | Section sizes of the seed, and its growth over the last N days of master. | |
 | `string-build-bench.sh` | What `s = s + piece` in a loop costs today against std's code-point builder; doubling N reads the complexity class. | |
-| `string-concat-sites.py` | Counts the two O(n²) string-concatenation shapes in `compiler/*.vl` + `std/*.vl`. | |
+| `string-concat-sites.vl` | Counts the two O(n²) string-concatenation shapes in `compiler/*.vl` + `std/*.vl`. | |
 | `vl-fixed-cost.sh` | The FIXED cost of one `vl` process: argv-only, a warm `.cwasm` deserialize, and a cold JIT of the seed. | |
 
 ## Measured 2026-09-02 (#2419)
@@ -219,7 +219,7 @@ over, whose `retAnnKindChain` / `retVoidAnnFlag` / `refArrElemNameIf` children a
 `vl check compiler/typecheck.vl` (32,451 lines, 0.77 s CPU unprofiled), 619 samples on a
 `--names` seed. Ranked by INCLUSIVE, the run divides into `lintGraph` **59.94%** and
 `checkProgram` **20.68%**, with `kindLadderLint` alone at 32.31% and `klSplitWalks` under it at
-31.18%. `profile-phases.py` had no row for the lint, because the phase list was derived from
+31.18%. `profile-phases` had no row for the lint, because the phase list was derived from
 `build` profiles and a `build` never runs one; it has one now, and the unclaimed remainder fell
 from 64.6% to 7.3%.
 

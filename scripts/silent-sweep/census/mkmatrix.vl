@@ -1,0 +1,332 @@
+// The census pre-flight: every payload rep crossed with every container, in the clean shape
+// (no twin, no union, annotated local, direct delivery), so a cell that does not run here is
+// a language limit or a harness spelling error the census must exclude by name.
+//
+//     vl run scripts/silent-sweep/census/mkmatrix.vl -- <outdir>
+//
+// Writes `<outdir>/<rep>__<cont>.vl` (a leading `@` spelled `at_`) and a `manifest.json` of
+// `expect`; every cell prints `7`.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { toString } from "std:fmt"
+import { join, replaceAll } from "std:str"
+import { die } from "../../lib/common"
+import { spawn, writeText } from "../../lib/corpus"
+import { pathJoin } from "../../lib/census-read"
+
+const USAGE = "usage: vl run scripts/silent-sweep/census/mkmatrix.vl -- <outdir>"
+
+// A payload rep: its field type, canonical and default field values, and the predicate
+// that holds of the canonical value, with `{X}` standing for the value read.
+type Rep = { name: string, ft: string, cv: string, dv: string, pred: string }
+
+// No `f64lit` rep: a float literal union is refused by design. The two `@` reps carry the
+// payload bare rather than in an object, the control that the object shape is load-bearing.
+const REPS: Rep[] = [
+  {
+    name: "i32",
+    ft: "i32",
+    cv: "7",
+    dv: "0",
+    pred: "{X}.r == 7",
+  },
+  {
+    name: "i64",
+    ft: "i64",
+    cv: "7",
+    dv: "0",
+    pred: "{X}.r == 7",
+  },
+  {
+    name: "f64",
+    ft: "f64",
+    cv: "7.5",
+    dv: "0.5",
+    pred: "{X}.r > 7.0",
+  },
+  {
+    name: "f32",
+    ft: "f32",
+    cv: "7.5",
+    dv: "0.5",
+    pred: "{X}.r > 7.0",
+  },
+  {
+    name: "bool",
+    ft: "boolean",
+    cv: "true",
+    dv: "false",
+    pred: "{X}.r",
+  },
+  {
+    name: "str",
+    ft: "string",
+    cv: "\"seven\"",
+    dv: "\"\"",
+    pred: "{X}.r == \"seven\"",
+  },
+  {
+    name: "strlit",
+    ft: "K",
+    cv: "\"p\"",
+    dv: "\"q\"",
+    pred: "{X}.r == \"p\"",
+  },
+  {
+    name: "numlit",
+    ft: "N",
+    cv: "1",
+    dv: "2",
+    pred: "{X}.r == 1",
+  },
+  {
+    name: "list",
+    ft: "i32[]",
+    cv: "[1, 2]",
+    dv: "[]",
+    pred: "{X}.r.length == 2",
+  },
+  {
+    name: "map",
+    ft: "{[string]: i32}",
+    cv: "mkI()",
+    dv: "Map()",
+    pred: "{X}.r.length == 1",
+  },
+  {
+    name: "obj",
+    ft: "Inner",
+    cv: "{ q: 7 }",
+    dv: "{ q: 0 }",
+    pred: "{X}.r.q == 7",
+  },
+  {
+    name: "arm",
+    ft: "Shape2",
+    cv: "{ c2: 1 }",
+    dv: "{ s2: 1 }",
+    pred: "{X}.r is Cir2",
+  },
+  {
+    name: "nul",
+    ft: "i32 | null",
+    cv: "7",
+    dv: "null",
+    pred: "{X}.r != null",
+  },
+  {
+    name: "@scalar",
+    ft: "i32",
+    cv: "7",
+    dv: "0",
+    pred: "{X} == 7",
+  },
+  {
+    name: "@string",
+    ft: "string",
+    cv: "\"seven\"",
+    dv: "\"\"",
+    pred: "{X} == \"seven\"",
+  },
+]
+
+const PRELUDE = "type K = \"p\" | \"q\"\ntype N = 1 | 2\ntype Inner = { q: i32 }\ntype Cir2 = { c2: i32 }\ntype Sq2 = { s2: i32 }\ntype Shape2 = Cir2 | Sq2\nfunction mkI(): {[string]: i32} {\n  const mi: {[string]: i32} = Map()\n  mi[\"z\"] = 1\n  return mi\n}"
+
+const CONTS: string[] = [
+  "bare", "list", "listlist", "list3", "mapval", "nestedmap", "map3", "forin",
+  "map_of_list", "list_of_map", "structfield", "structfield2",
+]
+
+function bare(r: Rep): boolean { r.name.length > 0 && r.name[0] == 64 }
+
+function payloadTy(r: Rep): string {
+  if r.name == "@scalar" { return "i32" }
+  if r.name == "@string" { return "string" }
+  "Circle"
+}
+
+function val(r: Rep, canonical: boolean): string {
+  const v = if canonical { r.cv } else { r.dv }
+  if bare(r) { return v }
+  "{ r: " + v + " }"
+}
+
+function pred(r: Rep, x: string): string { replaceAll(r.pred, "{X}", x) }
+
+function contTy(cont: string, p: string): string {
+  if cont == "bare" { return p }
+  if cont == "list" || cont == "forin" { return p + "[]" }
+  if cont == "listlist" { return p + "[][]" }
+  if cont == "list3" { return p + "[][][]" }
+  if cont == "mapval" { return "{[string]: " + p + "}" }
+  if cont == "nestedmap" { return "{[string]: {[string]: " + p + "}}" }
+  if cont == "map3" { return "{[string]: {[string]: {[string]: " + p + "}}}" }
+  if cont == "map_of_list" { return "{[string]: " + p + "[]}" }
+  if cont == "list_of_map" { return "{[string]: " + p + "}[]" }
+  if cont == "structfield" { return "WS" }
+  if cont == "structfield2" { return "WS2" }
+  die("mkmatrix: no container " + cont, 1)
+  ""
+}
+
+// Statements building the annotated local `c` holding one canonical payload.
+function build(cont: string, r: Rep, out: string[]) {
+  const p = payloadTy(r)
+  const cty = contTy(cont, p)
+  const v = val(r, true)
+  const l1 = "  const l1: {[string]: " + p + "} = Map()"
+  const k1 = "  l1[\"k\"] = " + v
+  if cont == "bare" {
+    out.push("  const c: " + cty + " = " + v)
+  } else if cont == "list" || cont == "forin" {
+    out.push("  const c: \{cty} = [\{v}]")
+  } else if cont == "listlist" {
+    out.push("  const c: \{cty} = [[\{v}]]")
+  } else if cont == "list3" {
+    out.push("  const c: \{cty} = [[[\{v}]]]")
+  } else if cont == "mapval" {
+    out.push("  const c: " + cty + " = Map()")
+    out.push("  c[\"k\"] = " + v)
+  } else if cont == "nestedmap" {
+    out.push(l1)
+    out.push(k1)
+    out.push("  const c: " + cty + " = Map()")
+    out.push("  c[\"o\"] = l1")
+  } else if cont == "map3" {
+    out.push(l1)
+    out.push(k1)
+    out.push("  const l2: {[string]: {[string]: " + p + "}} = Map()")
+    out.push("  l2[\"o\"] = l1")
+    out.push("  const c: " + cty + " = Map()")
+    out.push("  c[\"p\"] = l2")
+  } else if cont == "map_of_list" {
+    out.push("  const c: " + cty + " = Map()")
+    out.push("  c[\"k\"] = [" + v + "]")
+  } else if cont == "list_of_map" {
+    out.push(l1)
+    out.push(k1)
+    out.push("  const c: " + cty + " = [l1]")
+  } else if cont == "structfield" {
+    out.push(l1)
+    out.push(k1)
+    out.push("  const c: WS = { f: l1 }")
+  } else if cont == "structfield2" {
+    out.push(l1)
+    out.push(k1)
+    out.push("  const w1: WS = { f: l1 }")
+    out.push("  const c: WS2 = { g: w1 }")
+  } else {
+    die("mkmatrix: no container " + cont, 1)
+  }
+}
+
+// Statements printing 7 when the canonical payload is reached through `e`, else 0.
+function read(cont: string, r: Rep, e: string, out: string[]) {
+  const d = val(r, false)
+  const yes = " { print(7) } else { print(0) }"
+  if cont == "bare" {
+    out.push("  if " + pred(r, "(" + e + ")") + yes)
+  } else if cont == "list" {
+    out.push("  const c0 = " + e)
+    out.push(
+      "  if c0.length > 0 { if " + pred(r, "c0[0]") + yes + " } else { print(0) }",
+    )
+  } else if cont == "listlist" {
+    out.push("  const c0 = " + e)
+    out.push(
+      "  if c0.length > 0 { if c0[0].length > 0 { if "
+        + pred(r, "c0[0][0]")
+        + yes
+        + " } else { print(0) } } else { print(0) }",
+    )
+  } else if cont == "list3" {
+    out.push("  const c0 = " + e)
+    out.push(
+      "  if c0.length > 0 { if c0[0].length > 0 { if c0[0][0].length > 0 { if "
+        + pred(r, "c0[0][0][0]")
+        + yes
+        + " } else { print(0) } } else { print(0) } } else { print(0) }",
+    )
+  } else if cont == "mapval" {
+    out.push("  const g = (" + e + ")[\"k\"] ?? " + d)
+    out.push("  if " + pred(r, "g") + yes)
+  } else if cont == "nestedmap" {
+    out.push("  const g = (((" + e + ")[\"o\"] ?? Map())[\"k\"]) ?? " + d)
+    out.push("  if " + pred(r, "g") + yes)
+  } else if cont == "map3" {
+    out.push(
+      "  const g = ((((("
+        + e
+        + ")[\"p\"] ?? Map())[\"o\"] ?? Map())[\"k\"])) ?? "
+        + d,
+    )
+    out.push("  if " + pred(r, "g") + yes)
+  } else if cont == "forin" {
+    out.push("  let hit = 0")
+    out.push("  for zz in " + e + " {")
+    out.push("    if " + pred(r, "zz") + " { hit = 7 }")
+    out.push("  }")
+    out.push("  print(hit)")
+  } else if cont == "map_of_list" {
+    out.push("  const c0 = (" + e + ")[\"k\"] ?? []")
+    out.push(
+      "  if c0.length > 0 { if " + pred(r, "c0[0]") + yes + " } else { print(0) }",
+    )
+  } else if cont == "list_of_map" {
+    out.push("  const c0 = " + e)
+    out.push("  if c0.length > 0 { const g = c0[0][\"k\"] ?? " + d)
+    out.push("    if " + pred(r, "g") + yes + " } else { print(0) }")
+  } else if cont == "structfield" {
+    out.push("  const g = (" + e + ").f[\"k\"] ?? " + d)
+    out.push("  if " + pred(r, "g") + yes)
+  } else if cont == "structfield2" {
+    out.push("  const g = (" + e + ").g.f[\"k\"] ?? " + d)
+    out.push("  if " + pred(r, "g") + yes)
+  } else {
+    die("mkmatrix: no container " + cont, 1)
+  }
+}
+
+function main(args: string[]): i32 {
+  if args.length < 1 { die(USAGE, 1) }
+  const out = args[0]
+  const mk = spawn("mkdir", ["-p", out])
+  if mk.code != 0 { die("mkmatrix: cannot create \{out}: " + mk.err, 1) }
+  const expect: string[] = []
+  let n = 0
+  for r in REPS {
+    for cont in CONTS {
+      const p = payloadTy(r)
+      const lines: string[] = [PRELUDE]
+      if !bare(r) { lines.push("type Circle = { r: " + r.ft + " }") }
+      if cont == "structfield" || cont == "structfield2" {
+        lines.push("type WS = { f: {[string]: " + p + "} }")
+      }
+      if cont == "structfield2" { lines.push("type WS2 = { g: WS }") }
+      lines.push("function rd() {")
+      build(cont, r, lines)
+      read(cont, r, "c", lines)
+      lines.push("}")
+      lines.push("rd()")
+      const name = replaceAll(r.name, "@", "at_") + "__" + cont
+      writeText(pathJoin(out, name + ".vl"), join(lines, "\n") + "\n")
+      expect.push("\"" + name + "\": \"7\"")
+      n = n + 1
+    }
+  }
+  writeText(
+    pathJoin(out, "manifest.json"),
+    "{\"expect\": {" + join(expect, ", ") + "}}",
+  )
+  print("matrix cells: " + toString(n))
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("mkmatrix: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

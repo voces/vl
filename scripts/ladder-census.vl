@@ -1,0 +1,1105 @@
+// The kind-ladder census, the discovery half of `kind-ladder-incomplete` and
+// `kind-ladder-split` (docs/internals/kind-ladder-lint.md). A ladder is a run of `if`
+// arms testing one subject against members of one closed set read from compiler/*.vl,
+// or a `match` whose `_` arm names nothing.
+//
+//     vl run scripts/ladder-census.vl [-- --sets | --split | --pred | --list
+//                                         | --find <name> | --top N] [--min N]
+//
+// Default is the ladder table by set and by ending; `--split` is the pairs whose default
+// hands the rest to a sibling; `--pred` is the form with no kind literal in it. Paths
+// resolve against the working directory; run it from the checkout root.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
+import { parseI32 } from "std:fmt"
+import { endsWith, join, split, startsWith, toLowerAscii } from "std:str"
+import { includes, sort } from "std:array"
+import { die, findFrom } from "./lib/common"
+import {
+  ClosedSet,
+  Fn,
+  callNames,
+  closedSets,
+  fieldIndex,
+  findSet,
+  functions,
+  hasStr,
+  isDigitC,
+  isTypeName,
+  isUpper,
+  isWord,
+  lstrip,
+  modules,
+  padL,
+  padR,
+  readOrDie,
+  rstrip,
+  skipWs,
+  sortedStrs,
+  strLess,
+  strip,
+  stripLine,
+} from "./lib/ladder-walk"
+
+const TOOL = "ladder-census"
+
+// The arm floor: D1370's hole had exactly two arms. `--min N` moves it for a look; the
+// lint's own floor (`klMinArms`) has to move with it.
+let minArms = 2
+// The predicate section reports only, and #2400's ladder had two rungs.
+const MIN_PRED_ARMS = 2
+// A quoted run at least this long is a sentence: a default that said something.
+const MSG_LEN = 12
+// Refusal channels: a default reaching one has named what the ladder excludes.
+const NAMING_CALLS: string[] = [
+  "emitFail", "emitFailAt", "tErr", "tErrAt", "tErrBuiltinTyDecl",
+  "tErrUnsupported", "pErr", "lintEmit", "panic", "unreachable", "diagPush",
+  "cliFail",
+]
+
+type Ladder = {
+  rel: string,
+  fn: string,
+  subj: string,
+  set: i32,
+  arms: string[],
+  first: i32,
+  last: i32,
+  ending: string,
+  delegates: string[],
+  isMatch: boolean,
+}
+
+type Pair = {
+  rel: string,
+  set: i32,
+  x: Ladder,
+  y: Ladder,
+  gap: string[],
+  shared: string[],
+  oneway: string[],
+}
+
+type Pred = {
+  rel: string,
+  fn: string,
+  set: i32,
+  got: string[],
+  missing: string[],
+  line: i32,
+}
+
+// One source, read once: its raw lines, the same lines stripped, its functions.
+type Src = {
+  rel: string,
+  lines: string[],
+  st: string[],
+  fns: Fn[],
+  fnNames: Map<string, boolean>,
+}
+
+// The tree's closed sets, a member index per kind, and the field-to-set table.
+type World = {
+  sets: ClosedSet[],
+  litIdx: Map<string, i32[]>,
+  tyIdx: Map<string, i32[]>,
+  fieldSet: Map<string, string>,
+}
+
+function loadSrc(rel: string, path: string): Src {
+  const lines = split(readOrDie(TOOL, path), "\n")
+  const st: string[] = []
+  for ln in lines { st.push(stripLine(ln)) }
+  const fns = functions(lines)
+  const fnNames: Map<string, boolean> = Map()
+  for f in fns { fnNames[f.name] = true }
+  { rel: rel, lines: lines, st: st, fns: fns, fnNames: fnNames }
+}
+
+function world(): World {
+  const sets = closedSets(TOOL, ".")
+  const litIdx: Map<string, i32[]> = Map()
+  const tyIdx: Map<string, i32[]> = Map()
+  let si = 0
+  while si < sets.length {
+    const idx = if sets[si].isType { tyIdx } else { litIdx }
+    for m in sets[si].members {
+      const have = idx[m] ?? null
+      if have is i32[] { have.push(si) } else { idx[m] = [si] }
+    }
+    si = si + 1
+  }
+  const fields: string[] = []
+  const setOf: string[] = []
+  fieldIndex(TOOL, ".", sets, fields, setOf)
+  const fieldSet: Map<string, string> = Map()
+  let k = 0
+  while k < fields.length {
+    fieldSet[fields[k]] = setOf[k]
+    k = k + 1
+  }
+  { sets: sets, litIdx: litIdx, tyIdx: tyIdx, fieldSet: fieldSet }
+}
+
+function missingOf(w: World, l: Ladder): string[] {
+  const out: string[] = []
+  for m in w.sets[l.set].members {
+    if !hasStr(l.arms, m) { out.push(m) }
+  }
+  out
+}
+
+function allIn(xs: readonly string[], ys: readonly string[]): boolean {
+  for x in xs {
+    if !hasStr(ys, x) { return false }
+  }
+  true
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────────────
+
+function spaces(s: string, i: i32): i32 {
+  let k = i
+  while k < s.length && s[k] == ' ' { k = k + 1 }
+  k
+}
+
+// The end of the identifier starting at `i`, or -1 when none starts there.
+function identEnd(s: string, i: i32): i32 {
+  if i >= s.length || !isWord(s[i]) || isDigitC(s[i]) { return -1 }
+  let j = i
+  while j < s.length && isWord(s[j]) { j = j + 1 }
+  j
+}
+
+// The index just past the `op`…`cl` group opening at `i`, or -1.
+function closer(s: string, i: i32, op: i32, cl: i32): i32 {
+  let d = 0
+  let j = i
+  while j < s.length {
+    if s[j] == op {
+      d = d + 1
+    } else if s[j] == cl {
+      d = d - 1
+      if d == 0 { return j + 1 }
+    }
+    j = j + 1
+  }
+  -1
+}
+
+// The end of a subject starting at `i`: an identifier, then any run of `.field`, `[…]`
+// and `(…)`; -1 when no identifier starts there.
+function subjEnd(s: string, i: i32): i32 {
+  let j = identEnd(s, i)
+  if j < 0 { return -1 }
+  while j < s.length {
+    if s[j] == '.' && identEnd(s, j + 1) > 0 {
+      j = identEnd(s, j + 1)
+    } else if s[j] == '[' || s[j] == '(' {
+      const k = if s[j] == '[' { closer(s, j, '[', ']') } else { closer(s, j, '(', ')') }
+      if k < 0 { return j }
+      j = k
+    } else {
+      break
+    }
+  }
+  j
+}
+
+// Where an arm's test begins on `s`, or -1: after a leading `if `, `} else if ` or
+// `else if `. A test anywhere else is one operand of a single boolean expression.
+function armLead(s: string): i32 {
+  const t = lstrip(s)
+  const off = s.length - t.length
+  for w in ["if ", "} else if ", "else if "] {
+    if startsWith(t, w) { return off + w.length }
+  }
+  -1
+}
+
+type Test = { line: i32, subj: string, mem: string, isType: boolean }
+
+// The arm test at `k`: a subject, then `is`/`!is` and a type name or `==`/`!=` and a
+// string literal. A strict forward parse, so a compound condition's second conjunct is
+// never read as a rung. `ok` is false when the line is not an arm.
+type ArmTest = { ok: boolean, subj: string, mem: string, isType: boolean }
+
+function testAt(s: string, raw: string, k: i32): ArmTest {
+  const none: ArmTest = { ok: false, subj: "", mem: "", isType: false }
+  const p = spaces(s, k)
+  const e = subjEnd(s, p)
+  if e < 0 { return none }
+  const subj = s.slice(p, e)
+  const q = spaces(s, e)
+  for w in ["is ", "!is "] {
+    if q > e && s.slice(q, q + w.length) == w {
+      const r = spaces(s, q + w.length)
+      const me = identEnd(s, r)
+      if me > r && isUpper(s[r]) {
+        return { ok: true, subj: subj, mem: s.slice(r, me), isType: true }
+      }
+      return none
+    }
+  }
+  const op = s.slice(q, q + 2)
+  if op == "==" || op == "!=" {
+    const r = spaces(s, q + 2)
+    if r < s.length && s[r] == '"' {
+      let j = r + 1
+      while j < s.length && s[j] != '"' { j = j + 1 }
+      if j < s.length {
+        return { ok: true, subj: subj, mem: raw.slice(r + 1, j), isType: false }
+      }
+    }
+  }
+  none
+}
+
+function testsIn(src: Src, lo: i32, hi: i32): Test[] {
+  const out: Test[] = []
+  let i = lo
+  while i <= hi {
+    const s = src.st[i]
+    const lead = armLead(s)
+    if lead >= 0 {
+      const t = testAt(s, src.lines[i], lead)
+      if t.ok {
+        out.push({ line: i, subj: t.subj, mem: t.mem, isType: t.isType })
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The smallest closed set holding every tested member (ties by name), or -1 when no
+// set holds them all.
+function pickSet(w: World, members: readonly string[], isType: boolean): i32 {
+  const idx = if isType { w.tyIdx } else { w.litIdx }
+  let cands: i32[] = []
+  let first = true
+  for mem in members {
+    const holders = idx[mem] ?? null
+    const next: i32[] = []
+    if holders is i32[] {
+      for h in holders {
+        if (first || cands.includes(h)) && !next.includes(h) { next.push(h) }
+      }
+    }
+    cands = next
+    first = false
+    if cands.length == 0 { return -1 }
+  }
+  let best = -1
+  for c in cands {
+    if best < 0 {
+      best = c
+    } else {
+      const a = w.sets[c]
+      const b = w.sets[best]
+      if (
+        a.members.length < b.members.length
+        || (a.members.length == b.members.length && strLess(a.name, b.name))
+      ) {
+        best = c
+      }
+    }
+  }
+  best
+}
+
+// The function's signature, stripped and joined across a wrapped parameter list, up to
+// the line whose code ends in `{`.
+function fnHeader(src: Src, lo: i32, hi: i32): string {
+  const out: string[] = []
+  let i = lo
+  const top = if hi < lo + 40 { hi } else { lo + 40 }
+  while i <= top {
+    out.push(src.st[i])
+    if endsWith(rstrip(src.st[i]), "{") { break }
+    i = i + 1
+  }
+  join(out, " ")
+}
+
+// The type `subj`'s parameter annotation names in `header`, trimmed, or "" — the first
+// `subj: T` with an optional `| null`, closed by `,` or `)`.
+function paramAnn(header: string, subj: string): string {
+  let i = 0
+  while i + subj.length <= header.length {
+    const at = findFrom(header, subj, i)
+    if at < 0 { return "" }
+    i = at + 1
+    if at > 0 && isWord(header[at - 1]) { continue }
+    let k = skipWs(header, at + subj.length)
+    if k >= header.length || header[k] != ':' { continue }
+    k = skipWs(header, k + 1)
+    if k >= header.length || !isWord(header[k]) || isDigitC(header[k]) {
+      continue
+    }
+    const a = k
+    while k < header.length && (isWord(header[k]) || header[k] == ' ') {
+      k = k + 1
+    }
+    const name = strip(header.slice(a, k))
+    let t = skipWs(header, k)
+    if t < header.length && header[t] == '|' {
+      const n = skipWs(header, t + 1)
+      if header.slice(n, n + 4) == "null" { t = skipWs(header, n + 4) }
+    }
+    if t < header.length && (header[t] == ',' || header[t] == ')') {
+      return name
+    }
+  }
+  ""
+}
+
+// The closed set `subj`'s parameter annotation names, or -1. Declined unless the set
+// carries every tested member, which a mis-parse would not. Mirrors `klParamSetOf` in
+// compiler/lint.vl.
+function declaredSet(
+  w: World,
+  src: Src,
+  f: Fn,
+  subj: string,
+  members: readonly string[],
+  isType: boolean,
+): i32 {
+  if subj == "" || subj.includes(".") { return -1 }
+  const name = paramAnn(fnHeader(src, f.lo, f.hi), subj)
+  if name == "" { return -1 }
+  const si = findSet(w.sets, name)
+  if si < 0 || w.sets[si].isType != isType { return -1 }
+  if allIn(members, w.sets[si].members) { return si }
+  -1
+}
+
+// The closed set a field read's declaring type names, or -1, on the same condition.
+function fieldSetOf(
+  w: World,
+  subj: string,
+  members: readonly string[],
+  isType: boolean,
+): i32 {
+  if !subj.includes(".") { return -1 }
+  const parts = split(subj, ".")
+  const name = w.fieldSet[parts[parts.length - 1]] ?? ""
+  if name == "" { return -1 }
+  const si = findSet(w.sets, name)
+  if si < 0 || w.sets[si].isType != isType { return -1 }
+  if allIn(members, w.sets[si].members) { return si }
+  -1
+}
+
+// ── how a ladder ends ────────────────────────────────────────────────────────────────
+
+function countOf(s: string, c: i32): i32 {
+  let n = 0
+  for x in s {
+    if x == c { n = n + 1 }
+  }
+  n
+}
+
+// The ladder's default region, as line indices: from the last arm, skip the arm's own
+// block by brace depth; a `} else {` at the chain's depth hands the region to the else
+// body. Everything from there to the function's end is the tail.
+function tailOf(src: Src, last: i32, hi: i32): i32[] {
+  const out: i32[] = []
+  let depth = 0
+  let started = false
+  let i = last
+  while i <= hi {
+    const s = src.st[i]
+    if started {
+      out.push(i)
+    } else {
+      const t = strip(s)
+      const brace = t.indexOf("{")
+      const head = if brace < 0 { t } else { t.slice(0, brace) }
+      if depth == 1 && startsWith(t, "}") && head.includes("else") {
+        started = true
+      } else {
+        depth = depth + countOf(s, '{') - countOf(s, '}')
+        if depth <= 0 {
+          started = true
+          // A one-line `if c { … } else { … }` has its default on the arm's own line.
+          if t.includes("else") { out.push(i) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Whether the lines at `idxs` name what the ladder excludes: a refusal channel, a quoted
+// sentence, or a call to another function of the module. Reads the stripped line, so a
+// comment is never a default.
+function regionNames(src: Src, idxs: readonly i32[]): boolean {
+  for i in idxs {
+    const s = src.st[i]
+    let k = 0
+    while k < s.length {
+      if s[k] == '"' {
+        let j = k + 1
+        while j < s.length && s[j] == 'x' { j = j + 1 }
+        if j < s.length && s[j] == '"' {
+          if j - k - 1 >= MSG_LEN { return true }
+          k = j + 1
+          continue
+        }
+      }
+      k = k + 1
+    }
+    for c in callNames(s, false) {
+      if src.fnNames.has(c) || hasStr(NAMING_CALLS, c) { return true }
+    }
+  }
+  false
+}
+
+function tailCalls(src: Src, idxs: readonly i32[]): string[] {
+  const out: string[] = []
+  for i in idxs {
+    for c in callNames(src.st[i], false) {
+      if src.fnNames.has(c) && !hasStr(out, c) { out.push(c) }
+    }
+  }
+  out
+}
+
+// ── the `match` form ─────────────────────────────────────────────────────────────────
+
+// The line the brace opening on `lo` closes on, or `hi`.
+function blockEnd(src: Src, lo: i32, hi: i32): i32 {
+  let depth = 0
+  let opened = false
+  let n = lo
+  while n <= hi {
+    const s = src.st[n]
+    depth = depth + countOf(s, '{') - countOf(s, '}')
+    if depth > 0 { opened = true }
+    if opened && depth <= 0 { return n }
+    n = n + 1
+  }
+  hi
+}
+
+// A `match <subject> {` head: the subject and the arm indent, or `ind` -1.
+type MatchHead = { subj: string, ind: i32 }
+
+function matchHead(line: string): MatchHead {
+  const t = rstrip(line)
+  const ws = skipWs(t, 0)
+  if t.slice(ws, ws + 6) != "match " || !endsWith(t, " {") {
+    return { subj: "", ind: -1 }
+  }
+  const a = ws + 6
+  const b = t.length - 2
+  if b <= a || skipWs(t, a) > a { return { subj: "", ind: -1 } }
+  { subj: t.slice(a, b), ind: ws + 2 }
+}
+
+// The patterns of the arm at indent `ind` on stripped line `s`: kinds (0 `_`, 1 a string
+// literal, 2 a type name) and their text, read off the raw line. Empty when the line's
+// head is not wholly patterns.
+type Pats = { kinds: i32[], texts: string[] }
+
+function armPats(s: string, raw: string, ind: i32): Pats {
+  const none: Pats = { kinds: [], texts: [] }
+  if ind >= s.length || s[ind] == ' ' { return none }
+  let k = 0
+  while k < ind {
+    if s[k] != ' ' { return none }
+    k = k + 1
+  }
+  const cut = findFrom(s, "=>", ind)
+  if cut < 0 { return none }
+  const out: Pats = { kinds: [], texts: [] }
+  let off = ind
+  for part in split(s.slice(ind, cut), "|") {
+    const a = off + (part.length - lstrip(part).length)
+    const p = strip(part)
+    off = off + part.length + 1
+    if p == "_" {
+      out.kinds.push(0)
+      out.texts.push(p)
+    } else if p.length >= 2 && p[0] == '"' && p[p.length - 1] == '"' {
+      out.kinds.push(1)
+      out.texts.push(raw.slice(a + 1, a + p.length - 1))
+    } else if isTypeName(p) {
+      out.kinds.push(2)
+      out.texts.push(p)
+    } else {
+      return none
+    }
+  }
+  out
+}
+
+// Every `match` in `f` whose `_` arm names nothing, positioned at the `match` keyword. A
+// `_`-less match is exhaustive by the checker, and arms covering the whole set leave `_`
+// unreachable; neither is a hole.
+function matchLadders(w: World, src: Src, f: Fn, out: Ladder[]) {
+  let i = f.lo
+  while i <= f.hi {
+    const m = matchHead(src.st[i])
+    if m.ind >= 0 {
+      const end = blockEnd(src, i, f.hi)
+      const mems: string[] = []
+      let kind = 0
+      let wild = -1
+      let j = i + 1
+      while j <= end {
+        const pats = armPats(src.st[j], src.lines[j], m.ind)
+        let p = 0
+        while p < pats.kinds.length {
+          const k = pats.kinds[p]
+          if k == 0 {
+            wild = j
+          } else if kind == 0 || kind == k {
+            kind = k
+            if !hasStr(mems, pats.texts[p]) { mems.push(pats.texts[p]) }
+          }
+          p = p + 1
+        }
+        j = j + 1
+      }
+      if wild >= 0 && kind != 0 && mems.length >= minArms {
+        const si = pickSet(w, mems, kind == 2)
+        if si >= 0 && mems.length < w.sets[si].members.length {
+          const wend = if endsWith(rstrip(src.st[wild]), "{") { blockEnd(src, wild, end) } else { wild }
+          const region: i32[] = []
+          let r = wild
+          while r <= wend {
+            region.push(r)
+            r = r + 1
+          }
+          const ending = if regionNames(src, region) { "named" } else { "silent" }
+          out.push(
+            {
+              rel: src.rel,
+              fn: f.name,
+              subj: m.subj,
+              set: si,
+              arms: mems,
+              first: i,
+              last: wild,
+              ending: ending,
+              delegates: [],
+              isMatch: true,
+            },
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// ── the census ───────────────────────────────────────────────────────────────────────
+
+function laddersOf(w: World, src: Src): Ladder[] {
+  const out: Ladder[] = []
+  for f in src.fns {
+    matchLadders(w, src, f, out)
+    // Groups in first-seen order: the lint records them so, and the split rule reports
+    // at the first qualifying ladder's position.
+    const keys: string[] = []
+    const subjs: string[] = []
+    const kinds: boolean[] = []
+    const hits: Test[][] = []
+    const at: Map<string, i32> = Map()
+    for t in testsIn(src, f.lo, f.hi) {
+      const key = if t.isType { "T \{t.subj}" } else { "L \{t.subj}" }
+      const g = at[key] ?? -1
+      if g < 0 {
+        at[key] = keys.length
+        keys.push(key)
+        subjs.push(t.subj)
+        kinds.push(t.isType)
+        hits.push([t])
+      } else {
+        hits[g].push(t)
+      }
+    }
+    let g = 0
+    while g < keys.length {
+      const uniq: string[] = []
+      let first = hits[g][0].line
+      let last = first
+      for h in hits[g] {
+        if !hasStr(uniq, h.mem) { uniq.push(h.mem) }
+        if h.line < first { first = h.line }
+        if h.line > last { last = h.line }
+      }
+      if uniq.length >= minArms {
+        let si = declaredSet(w, src, f, subjs[g], uniq, kinds[g])
+        if si < 0 { si = fieldSetOf(w, subjs[g], uniq, kinds[g]) }
+        if si < 0 { si = pickSet(w, uniq, kinds[g]) }
+        if si >= 0 {
+          const tail = tailOf(src, last, f.hi)
+          let ending = "exhaustive"
+          if uniq.length != w.sets[si].members.length {
+            ending = if regionNames(src, tail) { "named" } else { "silent" }
+          }
+          out.push(
+            {
+              rel: src.rel,
+              fn: f.name,
+              subj: subjs[g],
+              set: si,
+              arms: uniq,
+              first: first,
+              last: last,
+              ending: ending,
+              delegates: tailCalls(src, tail),
+              isMatch: false,
+            },
+          )
+        }
+      }
+      g = g + 1
+    }
+  }
+  out
+}
+
+// ── split walks ──────────────────────────────────────────────────────────────────────
+
+// The D981 shape in one source: two `if` ladders over one set where x's default calls y,
+// y's default does not call back, and y's body calls x. `gap` is the members neither
+// tests; `oneway` is the members x tests and y does not, which fall out of the walk when
+// they reach y. One report per function pair, as the lint dedupes.
+function splitIn(w: World, src: Src, lads: readonly Ladder[]): Pair[] {
+  const body: Map<string, string[]> = Map()
+  for f in src.fns {
+    const calls: string[] = []
+    let i = f.lo
+    while i <= f.hi {
+      for c in callNames(src.st[i], false) {
+        if !hasStr(calls, c) { calls.push(c) }
+      }
+      i = i + 1
+    }
+    body[f.name] = calls
+  }
+  const ls: Ladder[] = []
+  for l in lads {
+    if l.ending != "exhaustive" && !l.isMatch { ls.push(l) }
+  }
+  const out: Pair[] = []
+  const seen: Map<string, boolean> = Map()
+  for x in ls {
+    for y in ls {
+      if x.fn == y.fn || x.set != y.set { continue }
+      const key = "\{x.fn} \{y.fn}"
+      if seen.has(key) { continue }
+      if !hasStr(x.delegates, y.fn) || hasStr(y.delegates, x.fn) { continue }
+      const yb = body[y.fn] ?? []
+      if !hasStr(yb, x.fn) { continue }
+      const oneway: string[] = []
+      for m in x.arms {
+        if !hasStr(y.arms, m) { oneway.push(m) }
+      }
+      if oneway.length == 0 { continue }
+      seen[key] = true
+      const gap: string[] = []
+      for m in w.sets[x.set].members {
+        if !hasStr(x.arms, m) && !hasStr(y.arms, m) { gap.push(m) }
+      }
+      const shared: string[] = []
+      for m in x.arms {
+        if hasStr(y.arms, m) && !hasStr(shared, m) { shared.push(m) }
+      }
+      out.push(
+        {
+          rel: src.rel,
+          set: x.set,
+          x: x,
+          y: y,
+          gap: gap,
+          shared: sortedStrs(shared),
+          oneway: oneway,
+        },
+      )
+    }
+  }
+  out
+}
+
+// ── the predicate form ───────────────────────────────────────────────────────────────
+
+// A ladder with no kind literal: rungs that call helpers whose names carry a `VKind`
+// member (`structIndexOfExpr`). Scoped to `VKind` and to members of six characters or
+// more, where a storage class has resolver helpers named after it; a shorter member
+// matches the tree's own vocabulary. #2400's `eqConcreteVariantRow` is this shape.
+function predLadders(w: World, srcs: readonly Src[]): Pred[] {
+  const out: Pred[] = []
+  const si = findSet(w.sets, "VKind")
+  if si < 0 { return out }
+  const mems: string[] = []
+  for m in w.sets[si].members {
+    const low = toLowerAscii(m)
+    if m.length >= 6 && !hasStr(mems, low) { mems.push(low) }
+  }
+  for src in srcs {
+    for f in src.fns {
+      const fnLow = toLowerAscii(f.name)
+      // Per call site, the longest member its name carries; on a tie, the member
+      // first seen anywhere in the function.
+      const order: string[] = []
+      const siteLine: i32[] = []
+      const siteCall: string[] = []
+      const siteMem: string[][] = []
+      let i = f.lo
+      while i <= f.hi {
+        for call in callNames(src.st[i], false) {
+          const low = toLowerAscii(call)
+          if low == fnLow { continue }
+          const here: string[] = []
+          for mem in mems {
+            if low.includes(mem) {
+              here.push(mem)
+              if !hasStr(order, mem) { order.push(mem) }
+            }
+          }
+          if here.length > 0 {
+            siteLine.push(i)
+            siteCall.push(call)
+            siteMem.push(here)
+          }
+        }
+        i = i + 1
+      }
+      const got: string[] = []
+      let line = -1
+      let s = 0
+      while s < siteLine.length {
+        let best = ""
+        for mem in order {
+          if hasStr(siteMem[s], mem) && mem.length > best.length { best = mem }
+        }
+        if !hasStr(got, best) { got.push(best) }
+        if line < 0 || siteLine[s] < line { line = siteLine[s] }
+        s = s + 1
+      }
+      if got.length < MIN_PRED_ARMS { continue }
+      const missing: string[] = []
+      for m in w.sets[si].members {
+        if !hasStr(got, m) { missing.push(m) }
+      }
+      if missing.length == 0 { continue }
+      out.push(
+        {
+          rel: src.rel,
+          fn: f.name,
+          set: si,
+          got: sortedStrs(got),
+          missing: missing,
+          line: line,
+        },
+      )
+    }
+  }
+  out
+}
+
+// ── output ───────────────────────────────────────────────────────────────────────────
+
+function n2(n: i32, w: i32): string { padL("\{n}", w) }
+
+function cmdSets(w: World) {
+  print("\{w.sets.length} closed sets declared in compiler/*.vl\n")
+  const order: i32[] = []
+  let i = 0
+  while i < w.sets.length {
+    order.push(i)
+    i = i + 1
+  }
+  sort(
+    order,
+    (a: i32, b: i32): boolean => w.sets[a].members.length > w.sets[b].members.length,
+  )
+  for k in order {
+    const s = w.sets[k]
+    const kind = if s.isType { "type" } else { "lit" }
+    print(
+      "\{padR(s.name, 14)} \{n2(s.members.length, 3)} \{padR(kind, 5)} \{s.at}",
+    )
+    print("               \{join(s.members, " ")}")
+  }
+}
+
+function site(l: Ladder): string { "\{l.rel}:\{l.first + 1} \{l.fn}" }
+
+function rankLine(w: World, k: i32, l: Ladder): string {
+  const size = w.sets[l.set].members.length
+  "\{n2(k, 3)}  \{padR(site(l), 46)}\{padR(w.sets[l.set].name, 11)}\{n2(l.arms.length, 3)}/\{padR("\{size}", 3)}\{n2(missingOf(w, l).length, 6)}"
+}
+
+function cmdTable(w: World, lads: readonly Ladder[], top: i32) {
+  let exh = 0
+  let named = 0
+  let silent = 0
+  const setOrder: i32[] = []
+  const files: string[] = []
+  for l in lads {
+    if l.ending == "exhaustive" { exh = exh + 1 }
+    if l.ending == "named" { named = named + 1 }
+    if l.ending == "silent" { silent = silent + 1 }
+    if !setOrder.includes(l.set) { setOrder.push(l.set) }
+    if !hasStr(files, l.rel) { files.push(l.rel) }
+  }
+  print(
+    "\{lads.length} ladders over \{setOrder.length} closed sets in \{files.length} files",
+  )
+  print(
+    "  exhaustive \{exh}   named default \{named}   SILENT default \{silent}\n",
+  )
+  print(
+    "\{padR("set", 14)}\{padL("ladders", 8)}\{padL("exh", 6)}\{padL("named", 7)}\{padL("silent", 8)}\{padL("members", 9)}",
+  )
+  const per: i32[] = []
+  for s in setOrder {
+    let n = 0
+    for l in lads {
+      if l.set == s { n = n + 1 }
+    }
+    per.push(n)
+  }
+  const ord: i32[] = []
+  let i = 0
+  while i < setOrder.length {
+    ord.push(i)
+    i = i + 1
+  }
+  sort(ord, (a: i32, b: i32): boolean => per[a] > per[b])
+  for k in ord {
+    const s = setOrder[k]
+    let e = 0
+    let n = 0
+    let si = 0
+    for l in lads {
+      if l.set == s {
+        if l.ending == "exhaustive" { e = e + 1 }
+        if l.ending == "named" { n = n + 1 }
+        if l.ending == "silent" { si = si + 1 }
+      }
+    }
+    print(
+      "\{padR(w.sets[s].name, 14)}\{n2(per[k], 8)}\{n2(e, 6)}\{n2(n, 7)}\{n2(si, 8)}\{n2(w.sets[s].members.length, 9)}",
+    )
+  }
+  print(
+    "\ntop \{top} incomplete ladders by members LACKED (silent default first, then named):\n",
+  )
+  const rank: Ladder[] = []
+  for l in lads {
+    if l.ending != "exhaustive" { rank.push(l) }
+  }
+  sort(rank, (a: Ladder, b: Ladder): boolean => {
+    const sa = a.ending != "silent"
+    const sb = b.ending != "silent"
+    if sa != sb { return !sa }
+    const ma = missingOf(w, a).length
+    const mb = missingOf(w, b).length
+    if ma != mb { return ma > mb }
+    if a.rel != b.rel { return strLess(a.rel, b.rel) }
+    a.first < b.first
+  })
+  print(
+    "\{padL("#", 3)}  \{padR("site", 46)}\{padR("set", 11)}\{padL("arms", 7)}\{padL("lacks", 7)}  ending",
+  )
+  let k = 0
+  while k < rank.length && k < top {
+    print("\{rankLine(w, k + 1, rank[k])}  \{rank[k].ending}")
+    k = k + 1
+  }
+  // Ranking by `lacks` is degenerate over one big set; widest-first surfaces a dispatch,
+  // which is where a hole costs something.
+  print("\ntop \{top} SILENT ladders by arms — the dispatches, widest first:\n")
+  const wide: Ladder[] = []
+  for l in lads {
+    if l.ending == "silent" { wide.push(l) }
+  }
+  sort(wide, (a: Ladder, b: Ladder): boolean => {
+    if a.arms.length != b.arms.length { return a.arms.length > b.arms.length }
+    if a.rel != b.rel { return strLess(a.rel, b.rel) }
+    a.first < b.first
+  })
+  print(
+    "\{padL("#", 3)}  \{padR("site", 46)}\{padR("set", 11)}\{padL("arms", 7)}\{padL("lacks", 7)}",
+  )
+  k = 0
+  while k < wide.length && k < top {
+    print(rankLine(w, k + 1, wide[k]))
+    k = k + 1
+  }
+}
+
+function orDash(xs: string[]): string {
+  if xs.length == 0 { return "-" }
+  join(xs, " ")
+}
+
+function cmdSplit(w: World, pairs: Pair[]) {
+  let holed = 0
+  for p in pairs {
+    if p.oneway.length > 0 { holed = holed + 1 }
+  }
+  print(
+    "\{pairs.length} split walks — a ladder whose DEFAULT hands the rest to a sibling ladder over the same set\n  \{holed} of them drop a kind the delegating half DOES test\n",
+  )
+  const ord = pairs.slice(0, pairs.length)
+  sort(ord, (a: Pair, b: Pair): boolean => a.oneway.length > b.oneway.length)
+  for p in ord {
+    print(
+      "\{p.rel}  \{w.sets[p.set].name}: `\{p.x.fn}` (\{p.x.arms.length}) delegates to `\{p.y.fn}` (\{p.y.arms.length})  shared \{orDash(p.shared)}",
+    )
+    print("    neither half handles (\{p.gap.length}): \{orDash(p.gap)}")
+    print(
+      "    one-way — falls through `\{p.y.fn}` (\{p.oneway.length}): \{orDash(p.oneway)}",
+    )
+  }
+}
+
+function cmdPred(w: World, preds: Pred[]) {
+  print("\{preds.length} predicate ladders — no kind literal appears in them\n")
+  const ord = preds.slice(0, preds.length)
+  sort(ord, (a: Pred, b: Pred): boolean => a.got.length > b.got.length)
+  for p in ord {
+    print(
+      "\{p.rel}:\{p.line + 1}  \{p.fn}  \{w.sets[p.set].name}  rungs \{join(p.got, " ")}",
+    )
+    const shown = if p.missing.length > 12 { p.missing.slice(0, 12) } else { p.missing }
+    print("    lacks \{p.missing.length}: \{join(shown, " ")}")
+  }
+}
+
+function cmdFind(
+  w: World,
+  lads: readonly Ladder[],
+  preds: readonly Pred[],
+  pairs: readonly Pair[],
+  needle: string,
+) {
+  for l in lads {
+    if l.fn.includes(needle) {
+      print(
+        "LADDER  \{l.rel}:\{l.first + 1} \{l.fn}  set \{w.sets[l.set].name}  arms \{l.arms.length}/\{w.sets[l.set].members.length}  ending \{l.ending}",
+      )
+      print("        tests   \{join(l.arms, " ")}")
+      print("        missing \{join(missingOf(w, l), " ")}")
+    }
+  }
+  for p in preds {
+    if p.fn.includes(needle) {
+      print(
+        "PRED    \{p.rel}:\{p.line + 1} \{p.fn}  set \{w.sets[p.set].name}  rungs \{join(p.got, " ")}",
+      )
+      print("        missing \{join(p.missing, " ")}")
+    }
+  }
+  for p in pairs {
+    if p.x.fn.includes(needle) || p.y.fn.includes(needle) {
+      print(
+        "SPLIT   \{p.rel}  \{w.sets[p.set].name}  `\{p.x.fn}` delegates to `\{p.y.fn}`",
+      )
+      print("        gap    \{orDash(p.gap)}")
+      print("        oneway \{orDash(p.oneway)}")
+    }
+  }
+}
+
+// The integer after the first `flag`, or `dflt` when the flag is absent.
+function intFlag(args: readonly string[], flag: string, dflt: i32): i32 {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag {
+      if i + 1 >= args.length { die("\{TOOL}: \{flag} needs a value", 2) }
+      const v = parseI32(args[i + 1])
+      if v is i32 { return v }
+      die("\{TOOL}: \{flag} needs an integer, got `\{args[i + 1]}`", 2)
+    }
+    i = i + 1
+  }
+  dflt
+}
+
+function flagValue(args: readonly string[], flag: string): string {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag {
+      if i + 1 >= args.length { die("\{TOOL}: \{flag} needs a value", 2) }
+      return args[i + 1]
+    }
+    i = i + 1
+  }
+  ""
+}
+
+function main(args: string[]) {
+  minArms = intFlag(args, "--min", 2)
+  const w = world()
+  if hasStr(args, "--sets") {
+    cmdSets(w)
+    return 0
+  }
+  const srcs: Src[] = []
+  for m in modules(TOOL, ".") { srcs.push(loadSrc(m[0], m[1])) }
+  const per: Ladder[][] = []
+  const lads: Ladder[] = []
+  for src in srcs {
+    const ls = laddersOf(w, src)
+    per.push(ls)
+    for l in ls { lads.push(l) }
+  }
+  const pairsOf = (): Pair[] => {
+    const out: Pair[] = []
+    let i = 0
+    while i < srcs.length {
+      for p in splitIn(w, srcs[i], per[i]) { out.push(p) }
+      i = i + 1
+    }
+    out
+  }
+  if hasStr(args, "--split") {
+    cmdSplit(w, pairsOf())
+    return 0
+  }
+  if hasStr(args, "--pred") {
+    cmdPred(w, predLadders(w, srcs))
+    return 0
+  }
+  if hasStr(args, "--find") {
+    cmdFind(w, lads, predLadders(w, srcs), pairsOf(), flagValue(args, "--find"))
+    return 0
+  }
+  if hasStr(args, "--list") {
+    const ord = lads.slice(0, lads.length)
+    sort(ord, (a: Ladder, b: Ladder): boolean => {
+      if a.rel != b.rel { return strLess(a.rel, b.rel) }
+      a.first < b.first
+    })
+    for l in ord {
+      print(
+        "\{l.rel}:\{l.first + 1}  \{l.fn}  \{w.sets[l.set].name}  \{l.arms.length}/\{w.sets[l.set].members.length}  \{l.ending}",
+      )
+    }
+    return 0
+  }
+  cmdTable(w, lads, intFlag(args, "--top", 20))
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("\{TOOL}: an argument is not UTF-8: \{argv.msg}", 2)
+} else {
+  exit(main(argv))
+}

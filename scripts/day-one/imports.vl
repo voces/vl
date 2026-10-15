@@ -1,0 +1,257 @@
+// The `imports_pair` axis: one std import against two in the same module. The `alone`
+// face uses the first module; `together` adds a second import and its use, so a
+// disagreement is a two-import interaction (D1514). An `import_only` record imports a
+// name and never calls it. docs/internals/day-one-sampler.md.
+//
+//     import { makePair, renderImports } from "./imports"
+
+import { join } from "std:str"
+import { JsonMap } from "../lib/common"
+import { sortStrings } from "../lib/corpus"
+import { excluded } from "./grammar"
+import { Rng, sample2 } from "./rng"
+import { jfaces, jstrs, newPair, side, str } from "./pairs"
+
+export type StdMod = {
+  id: string,
+  module: string,
+  names: string[],
+  lines: string[],
+  want: string[],
+  weight: i32,
+  features: string[],
+}
+
+function md(
+  id: string,
+  module: string,
+  names: string[],
+  lines: string[],
+  want: string[],
+  weight: i32,
+): StdMod {
+  {
+    id: id,
+    module: module,
+    names: names,
+    lines: lines,
+    want: want,
+    weight: weight,
+    features: [id],
+  }
+}
+
+function only(id: string, module: string, name: string, weight: i32): StdMod {
+  {
+    id: id,
+    module: module,
+    names: [name],
+    lines: [],
+    want: [],
+    weight: weight,
+    features: [id, "import_only"],
+  }
+}
+
+// Every use is deterministic and side-effect-free; `fs` reads a path that cannot exist.
+export const MODULES: StdMod[] = [
+  md(
+    "array",
+    "std:array",
+    ["filled"],
+    ["print(filled(3, 0).length)"],
+    ["3"],
+    5,
+  ),
+  md(
+    "str",
+    "std:str",
+    ["padStart"],
+    ["print(\"7\".padStart(3, \"0\"))"],
+    ["007"],
+    5,
+  ),
+  md(
+    "fmt",
+    "std:fmt",
+    ["toString"],
+    ["print(toString(41) + \"!\")"],
+    ["41!"],
+    5,
+  ),
+  md(
+    "utf8",
+    "std:utf8",
+    ["encodeUtf8"],
+    ["print(encodeUtf8(\"abc\").length)"],
+    ["3"],
+    4,
+  ),
+  md(
+    "bytes",
+    "std:bytes",
+    ["u16le"],
+    [
+      "const bs: u8[] = [1, 0]", "print(u16le(bs, 0))",
+    ],
+    ["1"],
+    4,
+  ),
+  md(
+    "base64",
+    "std:base64",
+    ["encodeBase64"],
+    [
+      "const b64: u8[] = [104, 105]", "print(encodeBase64(b64))",
+    ],
+    ["aGk="],
+    3,
+  ),
+  md(
+    "buffer",
+    "std:buffer",
+    ["Buffer", "storeI32", "loadI32"],
+    [
+      "const buf = Buffer(8)", "buf.storeI32(0, 42)", "print(buf.loadI32(0))",
+    ],
+    ["42"],
+    3,
+  ),
+  md(
+    "fs",
+    "std:fs",
+    ["fileSize"],
+    [
+      "const sz = fileSize(\"./no-such-file-vl-day-one\")",
+      "if sz is i64 { print(1) } else { print(0) }",
+    ],
+    ["0"],
+    5,
+  ),
+  only("json", "std:json", "parseJson", 4),
+  only("args", "std:args", "programArgs", 2),
+  only("test", "std:test", "describe", 2),
+  only("seed", "std:seed", "stdSmoke", 2),
+]
+
+export function byId(id: string): StdMod {
+  for m in MODULES {
+    if m.id == id { return m }
+  }
+  MODULES[0]
+}
+
+function pool(): StdMod[] {
+  const out: StdMod[] = []
+  for m in MODULES {
+    if !excluded(m.id) { out.push(m) }
+  }
+  out
+}
+
+export function spec(first: string, second: string): JsonMap {
+  const m: JsonMap = Map()
+  m["first"] = first
+  m["second"] = second
+  m
+}
+
+function header(m: StdMod): string {
+  "import { \{join(m.names, ", ")} } from \"\{m.module}\""
+}
+
+export type Rendered = { src: string, want: string[] }
+
+// One face: `alone` imports the first module only.
+export function renderImports(sp: JsonMap, face: string): Rendered {
+  const mods = [byId(str(sp, "first"))]
+  if face != "alone" { mods.push(byId(str(sp, "second"))) }
+  const lines: string[] = []
+  for m in mods { lines.push(header(m)) }
+  const want: string[] = []
+  for m in mods {
+    for l in m.lines { lines.push(l) }
+    for w in m.want { want.push(w) }
+  }
+  { src: join(lines, "\n") + "\n", want: want }
+}
+
+export type Labelled = { label: string, src: string }
+
+// alone(A), alone(B) and together(A, B): the three programs the timing report reads.
+export function triple(sp: JsonMap): Labelled[] {
+  const first = str(sp, "first")
+  const second = str(sp, "second")
+  [
+    { label: "alone " + byId(first).module, src: renderImports(sp, "alone").src },
+    {
+      label: "alone " + byId(second).module,
+      src: renderImports(spec(second, first), "alone").src,
+    },
+    { label: "together", src: renderImports(sp, "together").src },
+  ]
+}
+
+function features(sp: JsonMap): string[] {
+  const seen: Map<string, boolean> = Map()
+  for f in byId(str(sp, "first")).features { seen[f] = true }
+  for f in byId(str(sp, "second")).features { seen[f] = true }
+  seen["imports_pair"] = true
+  const out: string[] = []
+  for k, _v in seen { out.push(k) }
+  sortStrings(out)
+}
+
+function delta(sp: JsonMap): JsonMap {
+  const second = byId(str(sp, "second"))
+  const diff = ["+" + header(second)]
+  for l in second.lines { diff.push("+" + l) }
+  const m: JsonMap = Map()
+  m["axis"] = "imports_pair"
+  m["faceA"] = "alone"
+  m["faceB"] = "together"
+  m["first"] = byId(str(sp, "first")).module
+  m["second"] = second.module
+  m["diff"] = jstrs(diff)
+  m
+}
+
+// One sample: the same first module alone, and beside a second std import.
+export function makePair(r: Rng): JsonMap | null {
+  const p = pool()
+  if p.length < 2 { return null }
+  const ij = sample2(r, p.length)
+  const sp = spec(p[ij[0]].id, p[ij[1]].id)
+  const a = renderImports(sp, "alone")
+  const b = renderImports(sp, "together")
+  if a.src == b.src { return null }
+  const fa: Map<string, string> = Map()
+  fa["imports_pair"] = "alone"
+  const fb: Map<string, string> = Map()
+  fb["imports_pair"] = "together"
+  newPair(
+    "imports_pair",
+    sp,
+    jfaces(fa),
+    jfaces(fb),
+    side(a.src, a.want, "alone"),
+    side(b.src, b.want, "together"),
+    features(sp),
+    delta(sp),
+  )
+}
+
+export type Ablation = { label: string, spec: JsonMap }
+
+// One ingredient at a time: the swaps that keep one of the two modules, at most eight.
+export function ablations(sp: JsonMap): Ablation[] {
+  const first = str(sp, "first")
+  const second = str(sp, "second")
+  const out: Ablation[] = []
+  for o in pool() {
+    if o.id == first || o.id == second { continue }
+    out.push({ label: "second = " + o.module, spec: spec(first, o.id) })
+    out.push({ label: "first = " + o.module, spec: spec(o.id, second) })
+  }
+  out.slice(0, if out.length < 8 { out.length } else { 8 })
+}

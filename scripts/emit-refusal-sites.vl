@@ -1,0 +1,782 @@
+// Re-derive the emit-side refusal-site population, and say which sites the wording misses.
+//
+//     vl run scripts/emit-refusal-sites.vl                # the population, re-derived
+//     vl run scripts/emit-refusal-sites.vl -- --groups    # unmatched sites by the verb they use
+//     vl run scripts/emit-refusal-sites.vl -- --full      # every unmatched template, grouped
+//     vl run scripts/emit-refusal-sites.vl -- --sample N  # the seeded draw (`--seed S`)
+//     vl run scripts/emit-refusal-sites.vl -- --json OUT  # the sites, machine-readable
+//
+// The unit is the call site of `emitFail` / `emitFailAt`, the only emit-side failure channel,
+// found by balancing parentheses across lines; its first argument becomes a template, literal
+// chunks kept and every other chunk `{}`. Run from the checkout root.
+
+import { IoError, listDir } from "std:fs"
+import { exit } from "std:process"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseI32, parseI64, toString } from "std:fmt"
+import { join, repeat, startsWith, toLowerAscii } from "std:str"
+import { cpAt, cpPrefix, die, findFrom, jsonStr, stripWs } from "./lib/common"
+import {
+  padLeft,
+  padRight,
+  readText,
+  sortStrings,
+  writeText,
+} from "./lib/corpus"
+import { byCountDesc, pyFixed, tally } from "./lib/census-read"
+import { Rng, below, newRng } from "./day-one/rng"
+
+const SRC = "compiler"
+const PROG = "emit-refusal-sites.vl"
+const USAGE = "usage: emit-refusal-sites.vl [-h] [--groups] [--full] [--sample N]\n                             [--seed SEED] [--json OUT]"
+
+// One alternative of a pattern: a case-folded literal, `\b` on either side optional.
+type Alt = { lit: string, lb: boolean, rb: boolean }
+
+type Site = {
+  file: string,
+  line: i32,
+  loc: string,
+  fn: string,
+  arg: string,
+  template: string,
+  group: string,
+  concedes: boolean,
+  lits: string[],
+}
+
+type Opts = {
+  groups: boolean,
+  full: boolean,
+  sample: i32,
+  seed: i64,
+  json: string,
+}
+
+// A pattern written as `goal-scoreboard.vl`'s regex alternatives: `\b` at either end of an
+// alternative is a word boundary, everything else is literal and matched case-folded.
+function alts(spec: string[]): Alt[] {
+  const out: Alt[] = []
+  for s in spec {
+    let lit = s
+    const lb = startsWith(lit, "\\b")
+    if lb { lit = lit.slice(2, lit.length) }
+    const rb = lit.length >= 2 && lit.slice(lit.length - 2, lit.length) == "\\b"
+    if rb { lit = lit.slice(0, lit.length - 2) }
+    out.push({ lit: toLowerAscii(lit), lb: lb, rb: rb })
+  }
+  out
+}
+
+// The predicate a refusal concedes type-validity by. It is kept beside, not imported from,
+// `goal-scoreboard.vl`: this tool reports what that predicate misses, so the two must not
+// agree by construction.
+const CONCEDES: Alt[] = alts(
+  [
+    "no lowering", "not yet supported", "not supported by codegen",
+    "type-valid but cannot build", "not supported yet", "not yet implemented",
+    "not yet callable", "not yet built",
+  ],
+)
+
+type Group = { name: string, alts: Alt[] }
+
+// The verb or noun a refusal reaches for, most specific first; a template is filed under
+// the first that matches. These are strata for aiming effort, not reachability verdicts.
+const GROUPS: Group[] = [
+  {
+    name: "supports only / is supported as",
+    alts: alts(
+      [
+        "supports only", "\\bis supported as\\b", "\\bsupported for\\b",
+      ],
+    ),
+  },
+  {
+    name: "has no rep / no representation",
+    alts: alts(
+      [
+        "has no rep\\b", "no representation", "has no value rep",
+      ],
+    ),
+  },
+  {
+    name: "has no <thing>",
+    alts: alts(["\\bhas no \\b"]),
+  },
+  {
+    name: "must be / must have",
+    alts: alts(
+      [
+        "\\bmust be\\b", "\\bmust have\\b", "\\bmust carry\\b",
+        "\\bmust name\\b", "\\bmust match\\b", "\\bmust resolve\\b",
+        "\\bmust not\\b",
+      ],
+    ),
+  },
+  { name: "only … supported / allowed", alts: [] },
+  {
+    name: "unsupported <noun>",
+    alts: alts(["\\bunsupported\\b"]),
+  },
+  {
+    name: "not supported / not a supported",
+    alts: alts(["\\bnot supported\\b", "\\bnot a supported\\b"]),
+  },
+  {
+    name: "cannot",
+    alts: alts(["\\bcannot\\b", "\\bcan not\\b", "\\bcan't\\b"]),
+  },
+  {
+    name: "unknown / unresolved / not found",
+    alts: alts(
+      [
+        "\\bunknown\\b", "\\bunresolved\\b", "\\bnot found\\b",
+        "\\bnot registered\\b",
+      ],
+    ),
+  },
+  {
+    name: "not interned / no slot / no index",
+    alts: alts(
+      [
+        "\\bnot interned\\b", "\\bno slot\\b", "\\bno index\\b",
+        "\\bno such\\b",
+      ],
+    ),
+  },
+  {
+    name: "out of range / overflow / too long",
+    alts: alts(
+      [
+        "out of range", "out of bounds", "overflow", "too many", "too large",
+        "too long",
+      ],
+    ),
+  },
+  {
+    name: "expected <x>",
+    alts: alts(["\\bexpected\\b", "\\bexpects\\b"]),
+  },
+  {
+    name: "missing / empty",
+    alts: alts(
+      [
+        "\\bmissing\\b", "\\babsent\\b", "\\bis empty\\b", "\\bwas empty\\b",
+        "\\bempty \\b",
+      ],
+    ),
+  },
+  {
+    name: "requires / needs / takes",
+    alts: alts(
+      [
+        "\\brequires\\b", "\\bneeds\\b", "\\btakes exactly\\b",
+        "\\btakes at least\\b", "\\btakes an\\b", "\\bwrong number\\b",
+      ],
+    ),
+  },
+  {
+    name: "is not / are not / does not",
+    alts: alts(
+      [
+        "\\bis not\\b", "\\baren't\\b", "\\bare not\\b", "\\bwas not\\b",
+        "\\bdoes not\\b", "\\bdid not\\b", "\\bnot a \\b", "\\bnot an \\b",
+      ],
+    ),
+  },
+  {
+    name: "… but <state> (internal invariant)",
+    alts: alts(["\\bbut\\b"]),
+  },
+  { name: "bare `no <noun>`", alts: alts(["\\bno \\b"]) },
+  { name: "whole message from a helper", alts: [] },
+]
+
+// A word character as Python's `re` reads one: ASCII letters, digits and `_`, and a
+// non-ASCII code point unless it is Latin-1 punctuation or in the symbol blocks.
+function wordAt(s: string, i: i32): boolean {
+  if i < 0 || i >= s.length { return false }
+  const b = s[i]
+  if b < 0x80 {
+    return (b >= 48 && b <= 57)
+      || (b >= 65 && b <= 90)
+      || (b >= 97 && b <= 122)
+      || b == 95
+  }
+  let k = i
+  while k > 0 && (s[k] & 0xC0) == 0x80 { k = k - 1 }
+  const cp = cpAt(s, k).cp
+  if cp <= 0xBF { return cp == 0xAA || cp == 0xB5 || cp == 0xBA }
+  if cp == 0xD7 || cp == 0xF7 { return false }
+  !((cp >= 0x2000 && cp <= 0x2BFF) || (cp >= 0x3000 && cp <= 0x303F))
+}
+
+function boundary(s: string, i: i32): boolean {
+  wordAt(s, i - 1) != wordAt(s, i)
+}
+
+// Whether `lower`, a case-folded template, matches one of `as`.
+function anyAlt(lower: string, as: Alt[]): boolean {
+  for a in as {
+    let i = findFrom(lower, a.lit, 0)
+    while i >= 0 {
+      if (
+        (!a.lb || boundary(lower, i))
+        && (!a.rb || boundary(lower, i + a.lit.length))
+      ) {
+        return true
+      }
+      i = findFrom(lower, a.lit, i + 1)
+    }
+  }
+  false
+}
+
+// `\bonly\b.{0,60}(supported|allowed|permitted|is a value)`: a target starting within 60
+// code points of a whole-word `only`, with no line break between.
+function onlySupported(lower: string): boolean {
+  const targets = ["supported", "allowed", "permitted", "is a value"]
+  let i = findFrom(lower, "only", 0)
+  while i >= 0 {
+    if boundary(lower, i) && boundary(lower, i + 4) {
+      let p = i + 4
+      let seen = 0
+      while p <= lower.length && seen <= 60 {
+        for t in targets {
+          if lower.slice(p, p + t.length) == t { return true }
+        }
+        if p == lower.length || lower[p] == 10 { break }
+        p = p + cpAt(lower, p).n
+        seen = seen + 1
+      }
+    }
+    i = findFrom(lower, "only", i + 1)
+  }
+  false
+}
+
+function groupOf(t: string): string {
+  const lower = toLowerAscii(t)
+  for g in GROUPS {
+    if g.name == "only … supported / allowed" {
+      if onlySupported(lower) { return g.name }
+    } else if g.name == "whole message from a helper" {
+      if t == "{}" { return g.name }
+    } else if anyAlt(lower, g.alts) {
+      return g.name
+    }
+  }
+  "other"
+}
+
+// The end of the string literal opening at `i`, past its closing quote; a backslash
+// escapes the next byte. `text.length` when it never closes.
+function strEnd(text: string, i: i32): i32 {
+  let k = i + 1
+  while k < text.length {
+    const c = text[k]
+    if c == 92 { k = k + 2 }
+    else if c == 34 { return k + 1 }
+    else { k = k + 1 }
+  }
+  text.length
+}
+
+// `text` with every `//` comment blanked to spaces, string literals and length unchanged.
+function blankComments(text: string): string {
+  const out: string[] = []
+  let last = 0
+  let i = 0
+  while i < text.length {
+    const c = text[i]
+    if c == 34 {
+      i = strEnd(text, i)
+    } else if c == 47 && i + 1 < text.length && text[i + 1] == 47 {
+      let j = findFrom(text, "\n", i)
+      if j < 0 { j = text.length }
+      out.push(text.slice(last, i))
+      out.push(" ".repeat(j - i))
+      last = j
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+  out.push(text.slice(last, text.length))
+  join(out, "")
+}
+
+// The first argument of a call whose `(` ends at `start`, balanced across lines.
+function firstArg(text: string, start: i32): string {
+  let depth = 1
+  let i = start
+  while i < text.length && depth > 0 {
+    const c = text[i]
+    if c == 34 {
+      i = strEnd(text, i)
+      continue
+    }
+    if c == 40 || c == 91 || c == 123 { depth = depth + 1 }
+    else if c == 41 || c == 93 || c == 125 { depth = depth - 1 }
+    else if c == 44 && depth == 1 { return text.slice(start, i) }
+    i = i + 1
+  }
+  text.slice(start, i - 1)
+}
+
+// A string literal found in an argument: its body and the byte span it covers.
+type Lit = { body: string, start: i32, end: i32 }
+
+// Every complete `"…"` literal in `arg`, left to right; an unclosed quote is skipped.
+function litsOf(arg: string): Lit[] {
+  const out: Lit[] = []
+  let i = 0
+  while i < arg.length {
+    if arg[i] != 34 {
+      i = i + 1
+      continue
+    }
+    let k = i + 1
+    let closed = false
+    while k < arg.length {
+      const c = arg[k]
+      if c == 92 && k + 1 < arg.length && arg[k + 1] != 10 {
+        k = k + 2
+      } else if c == 92 || c == 34 {
+        closed = c == 34
+        break
+      } else {
+        k = k + 1
+      }
+    }
+    if closed {
+      out.push({ body: arg.slice(i + 1, k), start: i, end: k + 1 })
+      i = k + 1
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Whether a non-literal chunk is code: anything but whitespace and `+` signs at its ends.
+function isCode(chunk: string): boolean {
+  const s = stripWs(chunk)
+  let a = 0
+  let b = s.length
+  while a < b && s[a] == 43 { a = a + 1 }
+  while b > a && s[b - 1] == 43 { b = b - 1 }
+  stripWs(s.slice(a, b)) != ""
+}
+
+// The message template an argument expression produces: literals kept, holes `{}`.
+function template(arg: string, lits: Lit[]): string {
+  const out: string[] = []
+  let pos = 0
+  for m in lits {
+    if isCode(arg.slice(pos, m.start)) { out.push("{}") }
+    out.push(m.body)
+    pos = m.end
+  }
+  if isCode(arg.slice(pos, arg.length)) { out.push("{}") }
+  if out.length == 0 { return "{}" }
+  join(out, "")
+}
+
+function countNl(s: string, end: i32): i32 {
+  let n = 0
+  let i = 0
+  while i < end {
+    if s[i] == 10 { n = n + 1 }
+    i = i + 1
+  }
+  n
+}
+
+function isSpace(b: i32): boolean { b == 32 || (b >= 9 && b <= 13) }
+
+// Every `emitFail` / `emitFailAt` call site in `compiler/*.vl`, by file then line.
+function sites(): Site[] {
+  const names = listDir(SRC)
+  if names is IoError {
+    die("emit-refusal-sites: cannot list \{SRC} (\{names.msg})", 1)
+    return []
+  }
+  const found: Site[] = []
+  for fn in sortStrings(names) {
+    if fn.length < 3 || fn.slice(fn.length - 3, fn.length) != ".vl" { continue }
+    const raw = readText(SRC + "/" + fn)
+    const text = blankComments(raw)
+    let p = findFrom(text, "emitFail", 0)
+    while p >= 0 {
+      const here = p
+      p = findFrom(text, "emitFail", here + 1)
+      if wordAt(text, here - 1) { continue }
+      let k = here + 8
+      let at = false
+      if text.slice(k, k + 2) == "At" {
+        at = true
+        k = k + 2
+      }
+      while k < text.length && isSpace(text[k]) { k = k + 1 }
+      if k >= text.length || text[k] != 40 { continue }
+      let bol = here
+      while bol > 0 && text[bol - 1] != 10 { bol = bol - 1 }
+      if findFrom(text.slice(bol, here), "function", 0) >= 0 { continue }
+      const arg = stripWs(firstArg(text, k + 1))
+      if arg == "msg" { continue }
+      const lits = litsOf(arg)
+      const t = template(arg, lits)
+      const line = countNl(raw, here) + 1
+      const bodies: string[] = []
+      for l in lits { bodies.push(l.body) }
+      found.push(
+        {
+          file: fn,
+          line: line,
+          loc: fn + ":" + toString(line),
+          fn: if at { "emitFailAt" } else { "emitFail" },
+          arg: arg,
+          template: t,
+          group: groupOf(t),
+          concedes: anyAlt(toLowerAscii(t), CONCEDES),
+          lits: bodies,
+        },
+      )
+    }
+  }
+  found
+}
+
+function distinctCount(xs: string[]): i32 {
+  const seen: Set<string> = Set()
+  for x in xs { seen.add(x) }
+  seen.length
+}
+
+function templatesOf(ss: Site[]): string[] {
+  const out: string[] = []
+  for s in ss { out.push(s.template) }
+  out
+}
+
+function hasHole(t: string): boolean { findFrom(t, "{}", 0) >= 0 }
+
+// `random.Random(seed).sample(xs, k)`, CPython's pool path for a small population and
+// its set-of-indices path for a large one.
+function sampleOf(r: Rng, xs: Site[], k: i32): Site[] {
+  const n = xs.length
+  const out: Site[] = []
+  let setsize = 21
+  if k > 5 {
+    let p = 1
+    while p < k * 3 { p = p * 4 }
+    setsize = setsize + p
+  }
+  if n <= setsize {
+    const pool: Site[] = xs.slice(0, n)
+    let i = 0
+    while i < k {
+      const j = below(r, n - i)
+      out.push(pool[j])
+      pool[j] = pool[n - i - 1]
+      i = i + 1
+    }
+    return out
+  }
+  const taken: Set<i32> = Set()
+  let i = 0
+  while i < k {
+    let j = below(r, n)
+    while taken.has(j) { j = below(r, n) }
+    taken.add(j)
+    out.push(xs[j])
+    i = i + 1
+  }
+  out
+}
+
+function byLoc(xs: Site[]): Site[] {
+  if xs.length <= 1 { return xs }
+  const mid = xs.length / 2
+  const a = byLoc(xs.slice(0, mid))
+  const b = byLoc(xs.slice(mid, xs.length))
+  const out: Site[] = []
+  let i = 0
+  let j = 0
+  while i < a.length || j < b.length {
+    const takeA = j >= b.length
+      || (i < a.length
+      && (a[i].file < b[j].file
+      || (a[i].file == b[j].file && a[i].line <= b[j].line)))
+    if takeA {
+      out.push(a[i])
+      i = i + 1
+    } else {
+      out.push(b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// `json.dump(sites, indent=1)`.
+function dumpSites(ss: Site[]): string {
+  if ss.length == 0 { return "[]" }
+  const rows: string[] = []
+  for s in ss {
+    let lits = "[]"
+    if s.lits.length > 0 {
+      const ls: string[] = []
+      for l in s.lits { ls.push("   " + jsonStr(l)) }
+      lits = "[\n" + join(ls, ",\n") + "\n  ]"
+    }
+    const fields = [
+      "  \"file\": " + jsonStr(s.file),
+      "  \"line\": " + toString(s.line),
+      "  \"loc\": " + jsonStr(s.loc),
+      "  \"fn\": " + jsonStr(s.fn),
+      "  \"arg\": " + jsonStr(s.arg),
+      "  \"template\": " + jsonStr(s.template),
+      "  \"group\": " + jsonStr(s.group),
+      "  \"concedes\": "
+        + (if s.concedes { "true" } else { "false" }),
+      "  \"lits\": " + lits,
+    ]
+    rows.push(" {\n" + join(fields, ",\n") + "\n }")
+  }
+  "[\n" + join(rows, ",\n") + "\n]"
+}
+
+function usageError(msg: string) {
+  print(USAGE)
+  die(PROG + ": error: " + msg, 2)
+}
+
+const LONG = ["--help", "--groups", "--full", "--sample", "--seed", "--json"]
+
+// The long option `a` names, as argparse resolves a unique prefix; "" with the error said.
+function resolve(a: string): string {
+  if a == "-h" { return "--help" }
+  const hits: string[] = []
+  for o in LONG {
+    if o == a { return o }
+    if startsWith(o, a) { hits.push(o) }
+  }
+  if hits.length == 1 { return hits[0] }
+  if hits.length > 1 {
+    usageError("ambiguous option: " + a + " could match " + join(hits, ", "))
+  }
+  ""
+}
+
+function parse(args: readonly string[]): Opts {
+  const o: Opts = {
+    groups: false,
+    full: false,
+    sample: 0,
+    seed: 20260905,
+    json: "",
+  }
+  const extra: string[] = []
+  let i = 0
+  while i < args.length {
+    let a = args[i]
+    i = i + 1
+    let value: string | null = null
+    if startsWith(a, "--") {
+      const eq = findFrom(a, "=", 0)
+      if eq > 0 {
+        value = a.slice(eq + 1, a.length)
+        a = a.slice(0, eq)
+      }
+    }
+    const opt = if startsWith(a, "-") && a.length > 1 { resolve(a) } else { "" }
+    if opt == "" {
+      extra.push(args[i - 1])
+      continue
+    }
+    if opt == "--help" {
+      print(
+        USAGE
+          + "\n\noptions:\n  -h, --help   show this help message and exit\n  --groups\n  --full\n  --sample N\n  --seed SEED\n  --json OUT",
+      )
+      exit(0)
+    }
+    if opt == "--groups" { o.groups = true }
+    if opt == "--full" { o.full = true }
+    if opt == "--groups" || opt == "--full" {
+      if value != null {
+        usageError(
+          "argument \{opt}: ignored explicit argument '\{value ?? ""}'",
+        )
+      }
+      continue
+    }
+    if value == null {
+      if (
+        i >= args.length
+        || (startsWith(args[i], "-") && parseI64(args[i]) == null)
+      ) {
+        usageError("argument " + opt + ": expected one argument")
+      }
+      value = args[i]
+      i = i + 1
+    }
+    const v = value ?? ""
+    if opt == "--json" {
+      o.json = v
+    } else if opt == "--sample" {
+      const n = parseI32(v)
+      if n == null {
+        usageError("argument --sample: invalid int value: '" + v + "'")
+      }
+      o.sample = n ?? 0
+    } else {
+      const n = parseI64(v)
+      if n == null {
+        usageError("argument --seed: invalid int value: '" + v + "'")
+      }
+      o.seed = n ?? 0
+    }
+  }
+  if extra.length > 0 {
+    usageError("unrecognized arguments: " + join(extra, " "))
+  }
+  o
+}
+
+function row(label: string, n: i32): string {
+  padRight(label, 46) + toString(n)
+}
+
+function main(args: readonly string[]): i32 {
+  const a = parse(args)
+  const ss = sites()
+  const un: Site[] = []
+  for s in ss {
+    if !s.concedes { un.push(s) }
+  }
+  const tpl: string[] = []
+  const tseen: Set<string> = Set()
+  for s in ss {
+    if !tseen.has(s.template) {
+      tseen.add(s.template)
+      tpl.push(s.template)
+    }
+  }
+  let whole = 0
+  for t in tpl {
+    if !hasHole(t) { whole = whole + 1 }
+  }
+  const longLits: string[] = []
+  for s in ss {
+    for l in s.lits {
+      if stripWs(l).cpLen() >= 12 { longLits.push(l) }
+    }
+  }
+  print(row("emitFail / emitFailAt CALL SITES", ss.length))
+  print(row("distinct MESSAGE TEMPLATES", tpl.length))
+  print(row("  no hole — a whole message, verbatim", whole))
+  print(padRight("  at least one {} hole", 45) + toString(tpl.length - whole))
+  print(
+    row("distinct >=12-char literals in an argument", distinctCount(longLits)),
+  )
+  const per: Map<string, i32> = Map()
+  const order: string[] = []
+  for s in ss { tally(per, order, s.file, 1) }
+  const perParts: string[] = []
+  for f in byCountDesc(order, per) {
+    perParts.push(f + " " + toString(per[f] ?? 0))
+  }
+  print("per file: " + join(perParts, ", "))
+  print("")
+  print(
+    row("sites whose template CONCEDES type-validity", ss.length - un.length),
+  )
+  const pct = pyFixed(100.0 * (un.length as f64) / (ss.length as f64), 1)
+  print(
+    row("sites the wording predicate does NOT match", un.length)
+      + "   ("
+      + pct
+      + "%)",
+  )
+  print(row("  their distinct templates", distinctCount(templatesOf(un))))
+
+  if a.groups || a.full {
+    print("")
+    print(
+      "| group (the verb/noun the refusal reaches for) | sites | templates |",
+    )
+    print("| --- | ---: | ---: |")
+    const by: Map<string, Site[]> = Map()
+    for s in un {
+      const xs = by[s.group] ?? []
+      xs.push(s)
+      by[s.group] = xs
+    }
+    const names: string[] = []
+    for g in GROUPS { names.push(g.name) }
+    names.push("other")
+    for g in names {
+      const xs = by[g]
+      if xs != null {
+        print(
+          "| \{g} | \{toString(xs.length)} | \{toString(distinctCount(templatesOf(xs)))} |",
+        )
+      }
+    }
+    print(
+      "| **total** | **\{toString(un.length)}** | **\{toString(distinctCount(templatesOf(un)))}** |",
+    )
+    if a.full {
+      for g in names {
+        const xs = by[g]
+        if xs == null { continue }
+        print("\n### \{g} — \{toString(xs.length)} sites")
+        const ts: string[] = []
+        const seen: Set<string> = Set()
+        for x in xs {
+          if !seen.has(x.template) {
+            seen.add(x.template)
+            ts.push(x.template)
+          }
+        }
+        for t in sortStrings(ts) { print("* `\{t}`") }
+      }
+    }
+  }
+
+  if a.sample != 0 {
+    if a.sample < 0 || a.sample > un.length {
+      die("ValueError: Sample larger than population or is negative", 1)
+    }
+    const draw = byLoc(sampleOf(newRng(a.seed), un, a.sample))
+    print(
+      "\nseeded draw: random.Random(\{toString(a.seed)}).sample(frame, \{toString(a.sample)}) over the \{toString(un.length)} unmatched sites sorted by (file, line)",
+    )
+    let i = 1
+    for s in draw {
+      const t = cpPrefix(s.template, 88)
+      print(
+        "\{padLeft(toString(i), 3)}. \{padRight(s.loc, 24)} \{padRight(s.group, 34)} \{t}",
+      )
+      i = i + 1
+    }
+  }
+
+  if a.json != "" {
+    writeText(a.json, dumpSites(ss))
+    print("\nwrote \{a.json}")
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("emit-refusal-sites: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}

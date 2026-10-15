@@ -274,7 +274,7 @@ capability refusals — the compiler may only reject what the *design* forbids,
 never "not yet supported by codegen." Verified directly: `vl check`
 accepted the D1816 program above with **zero errors**, and `vl run` failed at
 emission. That gap is not rare or cosmetic. The project's own measurement
-(`scripts/emit-refusal-sites.py`, `scripts/capability-probes/`) finds **533**
+(`scripts/emit-refusal-sites.vl`, `scripts/capability-probes/`) finds **533**
 distinct emit-side refusal call sites, of which a witnessed sample estimates
 **≈226–302 are actually reachable by a `vl check`-clean program** — i.e.
 somewhere close to half of all emit-time refusals are live clause-2 violations,

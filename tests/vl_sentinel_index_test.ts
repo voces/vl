@@ -1,7 +1,7 @@
 // THE TWO SENTINEL-INDEX IMPLEMENTATIONS MUST AGREE.
 //
 // `compiler/lint.vl` grades one module at a time from the source the driver hands it;
-// `scripts/sentinel-census.py` grades the whole
+// `scripts/sentinel-census.vl` grades the whole
 // tree for the per-file ratchet. They carry the same table definition, the same
 // per-module hole-field and map derivations, the same reader fixpoint and the same
 // linear guard model, and nothing else ties them together — so a change to either that
@@ -26,12 +26,22 @@
 //
 // @test-timing sweep n=30
 
-import { COMPILER, ROOT, VL, exists, nativeEnv, pythonBin } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
-const SCRIPT = `${ROOT}/scripts/sentinel-census.py`;
+const SCRIPT = `${ROOT}/scripts/sentinel-census.vl`;
 const UNGUARDED = "sentinel-index-unguarded";
 const STRICT = "sentinel-index-strict-untested";
 const CODES = [UNGUARDED, STRICT] as const;
+
+// The census, run from the checkout root: it grades `compiler/*.vl` under its working directory.
+const census = (args: string[]) =>
+  new Deno.Command(VL, {
+    args: ["run", SCRIPT, "--", ...args],
+    cwd: ROOT,
+    stdout: "piped",
+    stderr: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
+  }).output();
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -265,14 +275,11 @@ function reader(n: i32): i32 {
 type Hits = { at: Record<string, string[]>; msgs: Record<string, string[]> };
 
 const script = async (path: string): Promise<Hits> => {
-  const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-    args: [SCRIPT, "--grade", path],
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
+  const { code, stdout, stderr } = await census(["--grade", path]);
   if (code !== 0) {
     throw new Error(
-      `sentinel-census.py --grade ${path} exited ${code}: ${new TextDecoder().decode(stderr)}`,
+      `sentinel-census.vl --grade ${path} exited ${code}: ` +
+        new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
     );
   }
   const raw = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, unknown[][]>;
@@ -331,7 +338,7 @@ Deno.test({
       for (const c of CODES) {
         if (!eq(s.at[c], l.at[c])) {
           throw new Error(
-            `${f.name}: ${c} disagrees — sentinel-census.py wants ` +
+            `${f.name}: ${c} disagrees — sentinel-census.vl wants ` +
               `${JSON.stringify(s.at[c])}, compiler/lint.vl got ${JSON.stringify(l.at[c])}. ` +
               `The two carry the same table definition, the same hole-field and map ` +
               `derivations and the same guard model; whichever moved has to move back, ` +
@@ -373,13 +380,12 @@ Deno.test({
   name: "sentinel-index: the committed baseline is at or above the census, per file",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, stdout, stderr } = await new Deno.Command(pythonBin(), {
-      args: [SCRIPT, "--counts"],
-      stdout: "piped",
-      stderr: "piped",
-    }).output();
+    const { code, stdout, stderr } = await census(["--counts"]);
     if (code !== 0) {
-      throw new Error(`sentinel-census.py --counts exited ${code}: ${new TextDecoder().decode(stderr)}`);
+      throw new Error(
+        `sentinel-census.vl --counts exited ${code}: ` +
+          new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
+      );
     }
     const now = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, Record<string, number>>;
     const base = JSON.parse(

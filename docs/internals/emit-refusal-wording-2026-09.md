@@ -21,7 +21,7 @@ The durable output is `scripts/capability-probes/live-sites.json`: **21 refusal 
 probe each**, all 21 invisible to the wording count. `goal-scoreboard.py` now prints that number
 beside the wording one and labels the wording one as the floor it is.
 
-Everything below is a measurement with a date on it. `python3 scripts/emit-refusal-sites.py`
+Everything below is a measurement with a date on it. `vl run scripts/emit-refusal-sites.vl`
 re-derives §1 and §2 from the tree; re-run it before quoting.
 
 ---
@@ -40,7 +40,7 @@ and the compiler is under no obligation to. Only a witness settles which sites c
 ## 1. The population, re-derived
 
 `emitFail` / `emitFailAt` (`compiler/emit_bytes.vl`) are the only emit-side failure channel.
-`scripts/emit-refusal-sites.py` extracts every call by BALANCING PARENTHESES across lines, then
+`scripts/emit-refusal-sites.vl` extracts every call by BALANCING PARENTHESES across lines, then
 reduces each call's first argument to a template — literal chunks kept, non-literal chunks
 replaced by `{}`.
 
@@ -69,7 +69,7 @@ the derivation is committed rather than described.
 
 517 sites, 453 distinct templates. Grouped by the verb or noun the refusal reaches for — most
 specific pattern first, so each template is filed once. Regenerate with
-`python3 scripts/emit-refusal-sites.py --groups`; every template is listed in the appendix.
+`vl run scripts/emit-refusal-sites.vl -- --groups`; every template is listed in the appendix.
 
 | group (the verb/noun the refusal reaches for) | sites | templates |
 | --- | ---: | ---: |
@@ -120,7 +120,7 @@ estimate answers "what share of the sites the wording count cannot see is reacha
 depletion correction.
 
 **Draw**: `random.Random(20260905).sample(frame, 48)`, reproducible with
-`python3 scripts/emit-refusal-sites.py --sample 48`.
+`vl run scripts/emit-refusal-sites.vl -- --sample 48`.
 
 **Representativeness** — the draw's group mix against the population's. The largest single
 deviation is `bare no <noun>` (2.1% drawn against 8.9%); every other stratum is within 4 points.
@@ -292,7 +292,7 @@ each was re-run independently, and each has a probe and a filed row:
 
 ## Appendix — every unmatched template, grouped
 
-Regenerate with `python3 scripts/emit-refusal-sites.py --full`. Line numbers are deliberately
+Regenerate with `vl run scripts/emit-refusal-sites.vl -- --full`. Line numbers are deliberately
 omitted: they drift with every compiler edit, and the template is the unit that reaches a user.
 
 ### supports only / is supported as — 7 sites

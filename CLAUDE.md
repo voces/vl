@@ -63,7 +63,9 @@ sparse; otherwise the `.vhdx` keeps every byte it ever held (214 GB for 132 GB o
 
 ## Gates
 
-**`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
+**`scripts/gate.sh` runs the whole ladder and is the thing to run.** It refuses inside a builder
+worktree (`.claude/worktrees/`, override `GATE_IN_WORKTREE=1`): the merge queue gates every PR on
+the merged tree, and builders running it as well spent 66 full runs in one day. Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
 time, CPU seconds and exit code. Thirty gates on master; measured 2026-10-12 at 3c2e2227a, back
 to back on one 24-thread box: **173 s** under WSL (every row at once) and **263 s** on Windows
@@ -384,7 +386,7 @@ sources of error push the estimate UP, not down: a time-boxed UNDECIDED favours
 unreachable-by-argument over live (which needs a program nobody has written), and the frame
 excludes the already-known-live sites.
 
-**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.py`.** Every hand-derivation of this
+**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.vl`.** Every hand-derivation of this
 population has been wrong, including both of the ones this paragraph used to quote: "511
 literals" came from an 8-line WINDOW grep that swept in neighbouring code, and **504 sites is
 not reproducible either** — the script reads **521** on the very tree that doc measured, with
@@ -709,7 +711,7 @@ found (D1646/D1647) are `docs/internals/kind-ladder-lint.md`.
 `kind-ladder-incomplete` is the rule; `kind-ladder-split` is one walk
 across two functions where only one hands back. Ratchet: `vl check --budget
 scripts/ladder-budget-baseline.json` (held by `lint-self.sh`), and `vl run scripts/ladder-sets.vl` beside it
-re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.py` is the discovery half — `--sets`, `--split`, and `--pred`
+re-derives every closed set from its `export type` and fails on drift. `scripts/ladder-census.vl` is the discovery half — `--sets`, `--split`, and `--pred`
 for the form with no kind literal in it, which is the only place #2400's hole is visible.
 
 ## A TABLE READ BOUND-TESTS ITS INDEX, OR TAKES A READER WHOSE MISS CANNOT BE A REAL ROW
@@ -724,7 +726,7 @@ a read `<t>[<idx>]` whose base the function did not declare and whose index is a
 HOLE FIELD (one the module itself compares `< 0` / `>= 0`), or a fall-through `i32` parameter
 of a reader, with no comparison of `<idx>` against `0`, `-1` or any `.length` before it.
 Ratchet: `vl check --budget scripts/sentinel-budget-baseline.json` (386 + 0 when it landed, #2499), census
-`scripts/sentinel-census.py`, `--why` names what left since the baseline's commit.
+`vl run scripts/sentinel-census.vl`, `--why` names what left since the baseline's commit.
 `docs/internals/sentinel-index-lint.md`.
 
 **A TRAP'S BACKTRACE IS FUNCTION INDICES UNTIL THE SEED IS BUILT WITH `--names`.** `vl build

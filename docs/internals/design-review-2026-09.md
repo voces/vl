@@ -40,7 +40,7 @@ the fix running the identical rule in both the annotated and inferred arms. The 
 population this finding is really about — CLAUDE.md's own tracked ~226–390 (95% envelope up
 to 390, per two independent witness samples) reachable clause-2 "type-valid but not yet
 supported by codegen" emit sites — is not something this PR closes or should try to: it is
-already the subject of a standing measurement program (`scripts/emit-refusal-sites.py`,
+already the subject of a standing measurement program (`scripts/emit-refusal-sites.vl`,
 `scripts/capability-probes/`, `live-sites.json`) that this review has nothing to add to
 mechanically. What *is* still open and filed below (row 37) is narrower and purely
 editorial: the guide document stating the contract has one live factual error in its own
