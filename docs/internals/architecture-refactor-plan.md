@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a type parameter's complement records the arm it reads, so the `-> none` class closes but for a call's record (campaign §13.33). Next: the `unc` notes, the call's record ×8, D4888 and D4889, the `if` join at a pin (D2832), the narrowed family, the scope callers. | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a pin re-joins a kept-apart return join from the body's return values, keeping apart each list stored as built; D4862 and D4171 close, D4882–D4885 filed. Next: the `unc` notes, the call's record ×8, D4888 and D4889, the `if` join at a pin (D2832), the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: step 7 done; its refusal names the pin and the delivery. Next: step 8, the multi-pin decision (D3975), then the (c) literal; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: `HOST_FLOOR` (`main.rs`) is the host floor in one table, held to the compiler by `tests/vl_host_floor_test.ts`. Next: the per-slot predicates from one signature table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the `tyHasTyVar`/`inferRet*` closure and the type-parameter join steps moved into six modules (`check_hole_pins`, `check_ret_names`, `check_cursor`, `check_union_mint`, `check_cstr_rows`, `check_tp_join`); 60,422 → 58,176 lines. Next: the `prb*` steps, which free 47. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: the quiet-probe rollback and the rows it truncates moved into `check_rollback`, `check_hole_rows` and `check_infer_rows`; 58,207 → 57,052 lines. Next: `crReset`, which frees 40. | [L9 log](#l9-log) |
 | L12 | not started (has A7) | |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -265,6 +265,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The `listRep -> none` class closes but for two families. Every note was the ladder misreading a box, nullable scalar or nullable struct from its declaration, initializer or join arms; the record and the column were right, and no program was wrong. `exprListRepOf` now answers no list for a recorded union or nullable type the column holds as no list, except a name the emitter holds narrowed (`identReadNarrowed`): a type parameter's complement records the whole union, and without that exception `generic-body-list-union-read-ops.vl` was invalid wasm. Counts: `tests/cases` 62 → 14 (a call's record ×8, the narrowed complement ×6), `named/` 20 → 0. 0 modules differ over master's tree. New fixture `generic-complement-list-union-positions.vl`; none filed (campaign §13.32).
 - A type parameter's complement records the arm it reads. The `else` of an `is` test with a concrete tested type keeps that type apart from a type parameter's list (`elseRemainderTy`): the `else` of `is i32[]` over `T[] | i32[]` is `T[]`. `exprListRepOf` drops §13.32's `identReadNarrowed` exception, `twoListValueTy` and `monoNarrowedPinName` read the recorded list, and `mintPinnedObjLit` interns a record field's substituted type. The complement now returns, binds and passes as `T[]` (D4886 closed), and `{ v: xs }` over `xs: T[]` mints its row (D4887 closed). Counts: `tests/cases` `-> none` 72 → 0. 5 modules differ over master's tree: the new fixture, and four whose output is unchanged. New fixture `generic-complement-list-delivery-positions.vl`; D4888 and D4889 filed open (campaign §13.33).
 - A `.map` whose callback returns a list builds a list of lists (`mfListResultElemTy`), a spread of a fresh list literal is typed and built at its destination's element (`spreadFreshDestRow`), and a list of list literals keys its leaf over every inner literal (`arrLitNestedNumKind`): D4870, D4871 close (clause 2), D4874 and D4876 filed closed (check-clean invalid wasm); four 48-cell matrices run 48 of 48 in both faces with 0 silent (`map-returning-list` from 0, `nested-list-literal-leaf-join` from 31 with 17 silent); difftree 15,188 files, 4 differ, all deliberate; D4875, D4877 filed open.
+- A pin re-joins a kept-apart return join from the body's return VALUES, recorded per value with whether it is a list stored as built (`noteRetJoinValues`, `retJoinMembersAt`), and keeps apart any such list whose storage the join would change (`joinKeepingStorage`). Only a list literal adapts. The checker's `substTyDeep` and the emitter's `monoInferRetSet*` folds use this one rule, and D3367's all-open case is one instance of it. D4862 closes (check-clean invalid wasm), and so does D4171 (loads then traps). difftree: fixpoint identity holds, 15190 files, 5 modules differ over master's tree: the three fixtures, which master fails; `if-join-two-list-types-union.vl`, whose `[2]` arm is now built as `i32[]` as the direct spelling builds it; and `union-elem-list-field-variant-arm.vl`, where one unreferenced list-of-list type in the type section changes (`f64[][]` to `i32[][]`) and every function body differs only by type renumbering. D4882–D4885 filed open.
 
 ### L3 log
 
@@ -395,6 +396,20 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   | `fnWriteShapes` | 61, 20 `let`s, 758 lines | 5 (92) |
 
   `fnWriteShapes` now frees only 5, because the join steps it shared went with them.
+- The `prb*` steps and `checkRollback` moved together, since the rollback assertion marks every table the rollback truncates. `typecheck.vl` fell from 58,207 to 57,052 lines. None of the three new modules imports `typecheck.vl`.
+  - `compiler/check_rollback.vl` holds `checkMark`, `checkRollback`, the `RB_*` site sets, `MonoSave` and the rollback assertion (`prb*`, `probeRollback*`). `checkRollback` no longer writes a table: each family's module owns its truncate.
+  - `compiler/check_hole_rows.vl` holds the hole demand, flow, `??` result and callee-write rows; `compiler/check_infer_rows.vl` holds the inferred-return and inferred-binding rows, the cycle stack and the tentative set. `check_tp_join.vl` gained the deferred, escaped and `tpIf*` join rows, and `check_cursor.vl` the type-parameter environment.
+  - `initChecker` calls `cursorReset`, `holeRowsReset`, `joinRowsReset` and `inferRowsReset` in place of the 52 per-table lines.
+  - The candidate's seed and the base's each compile the other tree's source to that tree's fixpoint byte for byte, output identity holds over 15,191 files (0 differ), and the distilled corpus moved no cell. Two `kind-ladder-incomplete` and two `sentinel-index-unguarded` findings moved with their functions into `check_hole_rows.vl`.
+- Measured on the file after those moves (2,745 declarations, 601 pure), the next moves are:
+
+  | Roots | Closure | Frees |
+  | --- | --- | --- |
+  | `crReset` (the capture-retire tables) | 73 declarations, 72 `let`s, 217 lines | 40 (544 lines) |
+  | `crRootCaptureWiden` | 59, 23 `let`s, 592 lines | 29 (506) |
+  | `symFlushPending` | 16, 9 `let`s, 100 lines | 23 (483) |
+  | `cexNoteNames` with `cexRewrite` | 22, 9 `let`s, 186 lines | 19 (414) |
+  | `fnWriteShapes` | 61, 20 `let`s, 758 lines | 5 (92) |
 
 ### SMALL log
 

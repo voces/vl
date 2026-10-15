@@ -1,0 +1,198 @@
+// `check_infer_rows.vl` — what return and binding inference banks for the emitter.
+// One row per un-annotated function's inferred return (`inferRet*`) and per un-annotated
+// binding whose inferred type is a value union or a niche nullable (`inferLet*`), with the
+// queries the emitter reads them by. The in-progress state of the inference itself (the cycle
+// stack, the witness log and the tentative set) lives here too. `inferRowsReset` clears every
+// table per program; the `*Truncate` steps roll them back for a quiet probe.
+
+import { irRungTruncate } from "./check_ret_names"
+
+// An un-annotated function's hoisted return type is the pending sentinel `-2` until its body is
+// checked, and a forward call infers its callee (found through `fnDeclIx`) on demand. `inferStack`
+// is the in-progress set for cycle detection.
+export let inferStack: string[] = []
+
+// Every witness `noteInferredRet` joined for the functions being inferred, in order, and
+// whether it is a tail `if` arm's seed. A tail `if` that yields no value replays the non-seed
+// rows from its mark, so its arms' values leave the inferred return (`dropTailIfSeeds`).
+export let inferRetLogTy: i32[] = []
+export let inferRetLogSeed: boolean[] = []
+
+// Per row of that log, whether the witness is a literal; and whether every witness joined into
+// `inferObserved` so far is one, so a runtime witness beside it joins apart (`joinArmLit`).
+export let inferRetLogLit: boolean[] = []
+
+// Parallel arrays (name → inferred concrete return-type name) for each un-annotated top-level
+// function, exported so the emitter classifies a return from the inferred type rather than
+// re-deriving it from the return expression, which misses a plain-variable return. Kept out of the
+// AST `fnRet` so `fmt` never re-adds the annotation; arrays, because a string-valued map mis-lowers.
+export let inferRetFn: string[] = []
+export let inferRetTy: string[] = []
+
+// The top-level atom count of the recorded name, parallel to `inferRetTy`: the emitter's
+// anonymous-nominal residual asks whether a recorded name spells a union, and the recorder banks
+// the answer so the consumer is a lookup. The count belongs to the name producer — how many atoms
+// it joined — not to a walk of the type it rendered, which disagrees at a litunion member.
+export let inferRetAtomCount: i32[] = []
+
+// The arena-index sibling of `inferRetTy`: the `Ty`-arena index of each recorded inferred return
+// type, so the emitter's inferred-return loop drives the structural arena walks off the resolved
+// type, covering unions and closures the rendered-name walk does not surface. `-1` when the
+// recorder had no arena index, which falls through the walks harmlessly.
+export let inferRetTyIx: i32[] = []
+
+// The binding analogue of `inferRetFn`/`inferRetTy`: an un-annotated `const`/`let` whose inferred
+// type is a value union, recorded by its LetDecl node index so the emitter classifies and lowers
+// it like an annotated value-union binding even when the initializer is one it cannot statically
+// classify. Captured during the check, with the scope still live.
+export let inferLetIx: i32[] = []
+export let inferLetTy: string[] = []
+
+// The niche analogue of `inferLetIx`: an un-annotated `const x = if c { "hi" } else null` infers
+// `string | null`, a niche ref rep rather than a value-union box, so `valueUnionRetName` renders
+// "" and `inferLetIx` skips it. Recorded by LetDecl node index so `letIsNulString` classifies the
+// slot as the kind-16 nullable-string rep and reuses the annotated lowering.
+export let inferLetNulStrIx: i32[] = []
+
+// The `boolean | null` companion of `inferLetNulStrIx` — the other niche scalar nullable, an i32
+// 0/1 with sentinel 2 for null. Same recording discipline: an un-annotated
+// `const x = if c { true } else { null }` by LetDecl node index, so the emitter classifies the
+// slot as the niche i32 rep and reuses the annotated lowering.
+export let inferLetNulBoolIx: i32[] = []
+
+// The functions whose return a recursive cycle left `void` only tentatively; the pre-pass
+// re-infers them each round until the set stops shrinking.
+export let inferTentative: string[] = []
+
+// Is `name` currently being inferred (on the in-progress stack)?
+export function onInferStack(name: string) {
+  let i = 0
+  while i < inferStack.length {
+    if inferStack[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The top-level atom count of the inferred-return name at row `i` (`inferRetTyAt`'s
+// sibling): >= 1 for every recorded row, -1 only for an out-of-range index.
+export function inferRetAtomCountAt(i: i32) {
+  if i < 0 || i >= inferRetAtomCount.length { return -1 }
+  inferRetAtomCount[i]
+}
+
+// Iteration over the inferred-return table: the emitter's `collectU` registers any value-union
+// names here so their box reps are interned even when an inferred return is the program's only
+// value union. `inferRetTyAt` is the rendered type name.
+export function inferRetCount() { inferRetFn.length }
+
+export function inferRetTyAt(i: i32) {
+  if i < 0 || i >= inferRetTy.length { return "" }
+  inferRetTy[i]
+}
+
+// The `Ty`-arena index of the `i`th recorded inferred return (`-1` if none) — the emitter's
+// `collectU` drives the structural arena walks off this so an inferred return's reachable
+// unions/closures register/intern exactly like an annotated one.
+export function inferRetTyIxAt(i: i32) {
+  if i < 0 || i >= inferRetTyIx.length { return -1 }
+  inferRetTyIx[i]
+}
+
+// The emitter reads this to classify an un-annotated binding (`const x = if c { v } else
+// null`) from its inferred value-union type name, keyed by `LetDecl` node index, rather than
+// re-deriving it from the initializer. "" when the binding is not an inferred value union.
+export function inferLetNameOf(letIx: i32) {
+  let i = 0
+  while i < inferLetIx.length {
+    if inferLetIx[i] == letIx { return inferLetTy[i] }
+    i = i + 1
+  }
+  ""
+}
+
+export function inferLetCount() { inferLetIx.length }
+
+export function inferLetIxAt(i: i32) { inferLetIx[i] }
+
+export function inferLetTyAt(i: i32) { inferLetTy[i] }
+
+// Rolls the inferred-return table back to `mark` — all five columns `recordInferRet` pushes,
+// not two. The index (`inferRetIdx`) is deliberately not rolled back: a `.delete()` would be
+// costly, and the readers are bounds-checked instead, the same defence at a fraction of the
+// cost. Unreachable from the name-keyed recorder — only the node-keyed re-check path calls it.
+export function rollbackInferRet(mark: i32) {
+  while inferRetFn.length > mark { inferRetFn.pop() }
+  while inferRetTy.length > mark { inferRetTy.pop() }
+  while inferRetTyIx.length > mark { inferRetTyIx.pop() }
+  while inferRetAtomCount.length > mark { inferRetAtomCount.pop() }
+  irRungTruncate(mark)
+  0
+}
+
+// Whether the LetDecl at `letIx` is recorded as an inferred `string | null` niche
+// if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
+// consults this so the slot classifies as kind 16 and reuses the annotated lowering.
+export function isInferLetNulStr(letIx: i32) {
+  let i = 0
+  while i < inferLetNulStrIx.length {
+    if inferLetNulStrIx[i] == letIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The `boolean | null` companion of `isInferLetNulStr`: whether the LetDecl at `letIx`
+// is recorded as an inferred `boolean | null` niche if-binding. The emitter's
+// `letNulBool` consults this so the slot classifies as the niche i32 rep.
+export function isInferLetNulBool(letIx: i32) {
+  let i = 0
+  while i < inferLetNulBoolIx.length {
+    if inferLetNulBoolIx[i] == letIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Drops the binding rows past each length: the value-union rows' two columns separately, then
+// the two niche columns.
+export function inferLetTruncate(rows: i32, nulStr: i32, nulBool: i32) {
+  while inferLetIx.length > rows { inferLetIx.pop() }
+  while inferLetTy.length > rows { inferLetTy.pop() }
+  while inferLetNulStrIx.length > nulStr { inferLetNulStrIx.pop() }
+  while inferLetNulBoolIx.length > nulBool { inferLetNulBoolIx.pop() }
+  0
+}
+
+// Drops the inferred-return rows past `rets`, and the cycle stack and tentative set past theirs.
+export function inferRetTruncate(rets: i32, stack: i32, tentative: i32) {
+  rollbackInferRet(rets)
+  while inferStack.length > stack { inferStack.pop() }
+  while inferTentative.length > tentative { inferTentative.pop() }
+  0
+}
+
+// The tentative set as it stands, leaving an empty one for the next fixpoint round.
+export function inferTentativeTake(): string[] {
+  const work = inferTentative
+  inferTentative = []
+  work
+}
+
+// Clears every table here for a new program.
+export function inferRowsReset() {
+  inferStack = []
+  inferRetLogTy = []
+  inferRetLogSeed = []
+  inferRetLogLit = []
+  inferRetFn = []
+  inferRetTy = []
+  inferRetAtomCount = []
+  inferRetTyIx = []
+  inferLetIx = []
+  inferLetTy = []
+  inferLetNulStrIx = []
+  inferLetNulBoolIx = []
+  inferTentative = []
+  0
+}
