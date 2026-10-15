@@ -3083,3 +3083,65 @@ re-swept; its 227 are the `d3125_*` and `d3140_*` notes below, which are typed n
 `(9000000000 | 1 | 9000000001)[]`; in `named/`, the `d3125_*` `(i32 | string | null)[]` 99 and
 `d3140_*` 128. These are typed nodes whose type has no column yet, not missing types. Then items
 2, 4 and 5 of §13.14.
+
+### 13.21 A nullable value-union element only an instance forms reads the column
+
+This step takes the `d3125_*` `(i32 | string | null)[]` notes of §13.19's list, the largest
+typed family left in `named/`.
+
+**Mechanism.** `repOfNulElemArray` answered a `(A | B | null)[]` element only when the union
+registry held a row for `A | B | null` itself. A generic body that forms the nullable only at an
+instance registers no such row. In the ablated witness
+
+```
+function t<T>(x: T) {
+  const n = [x].map((e) => {
+    if e != null { return e }
+    return null
+  })
+  for y in n { print(y) }
+}
+const a: i32 | string = 4
+t(a)
+```
+
+the registry holds `i32 | string` alone, so the column was uncovered at `n` while the ladder
+answered `reflist`. Both ingredients are needed: the same body over a parameter `x: i32 | string`,
+or with `n` annotated `(T | null)[]`, registers the nullable and agrees. The box over `A | B`
+already holds `null` as a member atom, which is what `repOfNullable` says for the scalar, and the
+module emits one box heap for both. The arm now also accepts the inner's row.
+
+**Not in this family.** `d3140_*`'s `(i32 | K | L | null)[]` is a different mechanism. Its element
+is a three-member union whose canon id differs from the registered `i32 | string | null` row's,
+so neither the element's row nor the inner's is found. That is a canon question, not a missing
+fallback.
+
+**Checks.** The "before" seed is origin/master's fixpoint (39a5bd855), 5,566,857 bytes. The
+"after" seed is 5,566,871 bytes, +14.
+
+* `difftree --identity` over 15,163 files: **10,204 built, 0 differ, 0 uncompared**,
+  and the candidate compiling master's source gives master's fixpoint.
+* Native fixpoint holds: two refreshes give the same seed.
+* `rep-fuzz-check` is exact, `regress.vl` moves no cell, and `seed-size --check` passes.
+
+**Counts.** `listRep` notes, measured with §13.17's probe (each note keyed by node kind and the
+node's type at its instance), on base 7e3864ba5, before §13.20 landed:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| distilled `named/` | `(i32 \| string \| null)[]`, `Ident` / `Call` / other | 99 / 108 / 18 | 0 |
+| distilled `named/` | like-for-like LEFT-ONLY | 2,520 | 2,295 |
+| `tests/cases` | like-for-like LEFT-ONLY | 2,814 | 2,814 |
+
+No note was added and no other row moved in either population. The removed notes are in six
+`d3125_gen_J1_*_P*_5` cells.
+
+**What else the probe shows.** The other `d3125_*` notes, 1,744 of them on `Call` (972 `list`,
+520 `reflist`, 252 `f64list`), are at a call node with no type at its instance, such as
+`mk(x).map(…)` inside a generic body. They are untyped nodes, so they need a producer, as §13.19's
+did, and are not a column question.
+
+**Next, in order:** in `tests/cases`, 42 `Ident` and 51 `Member` over `_[] | null`; 32 `Ident`
+and 32 `ArrayLit` over `(Rec2[] | null | Rec[] | null)[]`; 23 over
+`(9000000000 | 1 | 9000000001)[]`. In `named/`, `d3140_*` 128, and the untyped `d3125_*` `Call`
+nodes above. Then items 2, 4 and 5 of §13.14.
