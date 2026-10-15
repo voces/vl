@@ -1,0 +1,646 @@
+// The instance record of a reassigned function binding called at more than one argument type
+// (DECISIONS.md §"A written function binding called at two types"). The record is one binding
+// per slot: every write fills each slot, a call reads the slot of its argument types, and any
+// other read (a delivery by value) reads a slot of its own. The emitter refuses such a binding
+// and asks for it here; the driver then checks the program again to plan the slots, and
+// compiles a third time with the plan applied to the fresh parse. A program the emitter never
+// refuses runs none of this, so its output is unchanged.
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  BreakStmt,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  ObjLit,
+  P,
+  Program,
+  RetStmt,
+  TypeRef,
+  i32ToStr,
+  mkBinary,
+  mkIdent,
+  mkLet,
+  mkTypeRef,
+  nodeChildren,
+  nodeToks,
+} from "./ast"
+import { nodeTyIxOf } from "./check_node_tys"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyMap,
+  TyObj,
+  TyUnion,
+  objFieldType,
+  tyIsLitUnionOrLit,
+  tyToStr,
+} from "./check_types"
+import { tyHasTyVar, tyReachesHole } from "./check_ty_shape"
+import { reparseArrowLambdaAt } from "./parser"
+import { declOrigOf, identDeclOf } from "./symbols"
+
+// The pass the driver is running: an ordinary compile, the planning check, or the compile
+// that applies the plan.
+export const FS_COMPILE = 0
+export const FS_PLAN = 1
+export const FS_APPLY = 2
+let fsMode = FS_COMPILE
+
+// The refused declarations, as parse-arena indices, and whether the last compile added one.
+let fsAsks: i32[] = []
+let fsAskGrew = false
+// The parse arena's length in the current compile; a node at or past it is minted by the plan.
+let fsParseLen = 0
+
+// The plan. A new declaration goes after `pdAnchor`, a slot write after the write `pwAnchor`,
+// and identifier `prIdent` is renamed to its slot. A value is a slot's name when `*ValName`
+// is set, else a fresh copy of the parse node `*ValSrc` (an identifier or a lambda).
+let pdAnchor: i32[] = []
+let pdKw: string[] = []
+let pdName: string[] = []
+let pdTy: i32[] = []
+let pdValSrc: i32[] = []
+let pdValName: string[] = []
+let pwAnchor: i32[] = []
+let pwName: string[] = []
+let pwValSrc: i32[] = []
+let pwValName: string[] = []
+let prIdent: i32[] = []
+let prName: string[] = []
+
+function fsPlanReset(): i32 {
+  pdAnchor = []
+  pdKw = []
+  pdName = []
+  pdTy = []
+  pdValSrc = []
+  pdValName = []
+  pwAnchor = []
+  pwName = []
+  pwValSrc = []
+  pwValName = []
+  prIdent = []
+  prName = []
+  0
+}
+
+// Forgets every ask and the plan; the driver calls it once per program.
+export function fsReset(): i32 {
+  fsMode = FS_COMPILE
+  fsAsks = []
+  fsAskGrew = false
+  fsPlanReset()
+}
+
+export function fsSetMode(m: i32): i32 {
+  fsMode = m
+  fsAskGrew = false
+  0
+}
+
+export function fsModeOf(): i32 { fsMode }
+
+// Whether the compile asked for a split, and whether its asks include a new declaration.
+export function fsAsked(): boolean { fsAsks.length > 0 }
+export function fsGrew(): boolean { fsAskGrew }
+
+// The emitter refuses declaration `d` for wanting two signatures; records its parse node.
+export function fsAsk(d: i32): i32 {
+  let o = declOrigOf(d)
+  if o < 0 { o = d }
+  if o < 0 || o >= fsParseLen { return 0 }
+  for a in fsAsks {
+    if a == o { return 0 }
+  }
+  fsAsks.push(o)
+  fsAskGrew = true
+  0
+}
+
+function hasI32(xs: i32[], x: i32): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+function hasStr(xs: string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+// The declaration a parse-arena identifier resolves to when it is a `let`/`const`, else -1.
+function letDeclOfRead(ix: i32): i32 {
+  if ix < 0 || ix >= fsParseLen { return -1 }
+  if !(P.nodes[ix] is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= fsParseLen { return -1 }
+  if P.nodes[d] is LetDecl { return d }
+  -1
+}
+
+// Walk state of one planning check: each reachable node's parent, and the identifiers reached.
+let fsParent: i32[] = []
+let fsIdents: i32[] = []
+
+function fsWalk(root: i32): i32 {
+  fsParent = []
+  fsIdents = []
+  while fsParent.length < P.nodes.length { fsParent.push(-1) }
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if P.nodes[ix] is Ident { fsIdents.push(ix) }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length && fsParent[c] < 0 && c != root {
+        fsParent[c] = ix
+        stack.push(c)
+      }
+    }
+  }
+  0
+}
+
+// The slot key of a read of a split binding: its call's argument types, "eq" for an equality
+// operand (so equal reads compare one slot), or the read's own slot. "" marks a write target
+// and "=" a copy into another binding, neither of which is a read of a slot.
+function fsReadKey(r: i32): string {
+  const p = fsParent[r]
+  if p < 0 { return "u:" + i32ToStr(r) }
+  const pn = P.nodes[p]
+  if pn is Call && pn.callFn == r {
+    let k = "c:"
+    for a in pn.callArgs { k = k + tyToStr(nodeTyIxOf(a)) + "," }
+    return k
+  }
+  if pn is BinExpr {
+    if pn.binOp == "=" && pn.binLeft == r { return "" }
+    if pn.binOp == "=" && pn.binRight == r && letDeclOfRead(pn.binLeft) >= 0 {
+      return "="
+    }
+    if pn.binOp == "==" || pn.binOp == "!=" { return "eq" }
+  }
+  if pn is LetDecl && pn.letInit == r && pn.letType < 0 { return "=" }
+  "u:" + i32ToStr(r)
+}
+
+// The binding a copy read `r` flows into (`let g = r` or `g = r`).
+function fsCopyTarget(r: i32): i32 {
+  const p = fsParent[r]
+  const pn = P.nodes[p]
+  if pn is LetDecl { return p }
+  if pn is BinExpr { return letDeclOfRead(pn.binLeft) }
+  fsExcluded(-1, "a parent that copies into no binding")
+}
+
+// The type a delivery read `r` lands in: a call's parameter (a list's push, a map's set), the
+// element or field of a literal that is itself delivered, the enclosing function's return, an
+// annotated binding or an assigned place. -1 when the read has no such destination. A literal's
+// recorded type is its inferred one, so a literal is read through its own destination instead.
+function fsDestTy(r: i32): i32 {
+  const p = fsParent[r]
+  if p < 0 { return -1 }
+  const pn = P.nodes[p]
+  if pn is Call && pn.callFn != r {
+    for nm in pn.callArgNames {
+      if nm != "" { return -1 }
+    }
+    const cf = P.nodes[pn.callFn]
+    if cf is Member && nodeTyIxOf(cf.memObj) >= 0 {
+      const rv = T.tys[nodeTyIxOf(cf.memObj)]
+      if cf.memProp == "push" && rv is TyArray { return rv.aElem }
+      if (
+        cf.memProp == "set"
+        && rv is TyMap
+        && pn.callArgs.length == 2
+        && pn.callArgs[1] == r
+      ) {
+        return rv.mVal
+      }
+    }
+    const ft = nodeTyIxOf(pn.callFn)
+    if ft < 0 { return -1 }
+    const f = T.tys[ft]
+    if !(f is TyFunc) { return -1 }
+    let i = 0
+    while i < pn.callArgs.length && pn.callArgs[i] != r { i = i + 1 }
+    if i < f.fnParamTypes.length { return f.fnParamTypes[i] }
+    return -1
+  }
+  if pn is ArrayLit {
+    const at = fsDestTy(p)
+    if at < 0 { return -1 }
+    const a = T.tys[at]
+    if a is TyArray { return a.aElem }
+    return -1
+  }
+  if pn is FieldInit {
+    const o = fsParent[p]
+    if o < 0 || !(P.nodes[o] is ObjLit) { return -1 }
+    const ot = fsDestTy(o)
+    if ot < 0 { return -1 }
+    const t = T.tys[ot]
+    if t is TyObj { return objFieldType(t, pn.fiName) }
+    return -1
+  }
+  if pn is RetStmt {
+    let f = fsParent[p]
+    while f >= 0 && !(P.nodes[f] is FuncDecl) { f = fsParent[f] }
+    if f < 0 { return -1 }
+    const ft = nodeTyIxOf(f)
+    if ft < 0 { return -1 }
+    const t = T.tys[ft]
+    if t is TyFunc { return t.fnRet }
+    return -1
+  }
+  if pn is LetDecl && pn.letType >= 0 { return nodeTyIxOf(pn.letType) }
+  if pn is BinExpr && pn.binOp == "=" && pn.binRight == r {
+    const l = P.nodes[pn.binLeft]
+    if l is Index && nodeTyIxOf(l.idxArr) >= 0 {
+      const m = T.tys[nodeTyIxOf(l.idxArr)]
+      if m is TyMap { return m.mVal }
+    }
+    return nodeTyIxOf(pn.binLeft)
+  }
+  fsExcluded(-1, "a parent that delivers into no typed place")
+}
+
+// Whether a delivery read lands in a function type that fixes one instantiation.
+function fsDestFixed(r: i32): boolean {
+  const t = fsDestTy(r)
+  if t < 0 || !(T.tys[t] is TyFunc) { return false }
+  !tyHasTyVar(t) && !tyReachesHole(t, 8)
+}
+
+// The members of the split set, their slot keys, and each slot's binding name.
+let fsMem: i32[] = []
+let fsLanes: string[][] = []
+
+function memIx(d: i32): i32 {
+  let i = 0
+  while i < fsMem.length {
+    if fsMem[i] == d { return i }
+    i = i + 1
+  }
+  -1
+}
+
+function laneName(mi: i32, key: string): string {
+  const lanes = fsLanes[mi]
+  if lanes.length > 0 && lanes[0] == key {
+    const d = P.nodes[fsMem[mi]]
+    if d is LetDecl { return d.letName }
+  }
+  let k = 0
+  while k < lanes.length && lanes[k] != key { k = k + 1 }
+  const d = P.nodes[fsMem[mi]]
+  let base = ""
+  if d is LetDecl { base = d.letName }
+  const dollar = base.indexOf("$")
+  if dollar > 0 { base = base.slice(0, dollar) }
+  base + "$s" + i32ToStr(fsMem[mi]) + "_" + i32ToStr(k)
+}
+
+// A value written to a member is a copy of a peer member, a fresh name, or a lambda; anything
+// else declines the plan. Answers the peer's member index, -1 for no peer, -2 to decline.
+function fsValuePeer(v: i32): i32 {
+  if v < 0 { return -1 }
+  const n = P.nodes[v]
+  if n is Ident {
+    const d = letDeclOfRead(v)
+    if d >= 0 { return memIx(d) }
+    if fsUnionParamFn(identDeclOf(v)) { return -2 }
+    return -1
+  }
+  if n is FuncDecl && n.fnName == "" { return -1 }
+  fsExcluded(-2, "a value that is not a name or a lambda")
+}
+
+// Whether `d` is a named function with a union-typed parameter: written into a generic
+// binding, its instance is called through the wrong signature (D4892).
+function fsUnionParamFn(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length || !(P.nodes[d] is FuncDecl) { return false }
+  const ft = nodeTyIxOf(d)
+  if ft < 0 { return false }
+  const t = T.tys[ft]
+  if t is TyFunc {
+    for pt in t.fnParamTypes {
+      if pt >= 0 && T.tys[pt] is TyUnion { return true }
+    }
+  }
+  false
+}
+
+// Whether read `r` is a call with a literal-union argument (a copy then picks the wrong
+// instance, D4893).
+function fsLitUnionCall(r: i32): boolean {
+  const pn = P.nodes[fsParent[r]]
+  if pn is Call {
+    for a in pn.callArgs {
+      if tyIsLitUnionOrLit(nodeTyIxOf(a)) { return true }
+    }
+  }
+  false
+}
+
+function fsStmtParentOk(s: i32): boolean {
+  const p = fsParent[s]
+  if p < 0 { return false }
+  P.nodes[p] is Block || P.nodes[p] is Program
+}
+
+// Plans the slots of every asked declaration over the checked tree under `root`; 0 with a
+// plan, 1 when there is nothing it can split.
+export function fsPlan(root: i32): i32 {
+  fsPlanReset()
+  fsWalk(root)
+  fsMem = []
+  fsLanes = []
+  // The set: the asked declarations, closed over copies in either direction.
+  for a in fsAsks {
+    if a < P.nodes.length && P.nodes[a] is LetDecl && memIx(a) < 0 {
+      fsMem.push(a)
+    }
+  }
+  let i = 0
+  while i < fsMem.length {
+    const m = fsMem[i]
+    const d = P.nodes[m]
+    if d is LetDecl {
+      const src = letDeclOfRead(d.letInit)
+      if src >= 0 && memIx(src) < 0 { fsMem.push(src) }
+    }
+    for r in fsIdents {
+      if identDeclOf(r) == m {
+        const key = fsReadKey(r)
+        if key == "=" {
+          const t = fsCopyTarget(r)
+          if t >= 0 && memIx(t) < 0 { fsMem.push(t) }
+        } else if key == "" {
+          const w = P.nodes[fsParent[r]]
+          if w is BinExpr {
+            const src = letDeclOfRead(w.binRight)
+            if src >= 0 && memIx(src) < 0 { fsMem.push(src) }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  let copies = false
+  let litCalls = false
+  for m in fsMem {
+    const ks: string[] = []
+    for r in fsIdents {
+      if identDeclOf(r) == m {
+        const key = fsReadKey(r)
+        if key == "=" { copies = true }
+        if key.slice(0, 2) == "c:" && fsLitUnionCall(r) { litCalls = true }
+        // A delivery into a type that does not fix one instantiation keeps the refusal.
+        if key.slice(0, 2) == "u:" && !fsDestFixed(r) { return 1 }
+        if key != "" && key != "=" && !hasStr(ks, key) { ks.push(key) }
+      }
+    }
+    fsLanes.push(ks)
+  }
+  if copies && litCalls { return 1 }
+  // A member needs every slot a binding it is copied into needs.
+  let changed = true
+  while changed {
+    changed = false
+    for r in fsIdents {
+      const si = memIx(identDeclOf(r))
+      if si >= 0 && fsReadKey(r) == "=" {
+        const ti = memIx(fsCopyTarget(r))
+        if ti >= 0 {
+          for k in fsLanes[ti] {
+            if !hasStr(fsLanes[si], k) {
+              fsLanes[si].push(k)
+              changed = true
+            }
+          }
+        }
+      }
+    }
+  }
+  let split = false
+  for ks in fsLanes {
+    if ks.length > 1 { split = true }
+  }
+  if !split { return 1 }
+  let mi = 0
+  while mi < fsMem.length {
+    if fsPlanMember(mi) != 0 { return 1 }
+    mi = mi + 1
+  }
+  0
+}
+
+// One member's share of the plan: a declaration per extra slot, a slot write after each
+// write, and each read renamed to its slot. 1 declines.
+function fsPlanMember(mi: i32): i32 {
+  const m = fsMem[mi]
+  const d = P.nodes[m]
+  if !(d is LetDecl) { return 1 }
+  const lanes = fsLanes[mi]
+  if lanes.length == 0 { return 0 }
+  if d.letType >= 0 && !(P.nodes[d.letType] is TypeRef) { return 1 }
+  if !fsStmtParentOk(m) { return 1 }
+  const ip = fsValuePeer(d.letInit)
+  if ip == -2 { return 1 }
+  let k = 0
+  while k < lanes.length {
+    let vn = ""
+    if ip >= 0 { vn = laneName(ip, lanes[k]) }
+    if k == 0 {
+      if ip >= 0 { fsRename(d.letInit, vn) }
+    } else {
+      pdAnchor.push(m)
+      pdKw.push(d.letKw)
+      pdName.push(laneName(mi, lanes[k]))
+      pdTy.push(d.letType)
+      pdValSrc.push(d.letInit)
+      pdValName.push(vn)
+    }
+    k = k + 1
+  }
+  for r in fsIdents {
+    if identDeclOf(r) == m {
+      const key = fsReadKey(r)
+      if key == "" {
+        const w = fsParent[r]
+        const wn = P.nodes[w]
+        if !(wn is BinExpr) || !fsStmtParentOk(w) { return 1 }
+        const vp = fsValuePeer(wn.binRight)
+        if vp == -2 { return 1 }
+        let wk = 0
+        while wk < lanes.length {
+          let vn = ""
+          if vp >= 0 { vn = laneName(vp, lanes[wk]) }
+          if wk == 0 {
+            if vp >= 0 { fsRename(wn.binRight, vn) }
+          } else {
+            pwAnchor.push(w)
+            pwName.push(laneName(mi, lanes[wk]))
+            pwValSrc.push(wn.binRight)
+            pwValName.push(vn)
+          }
+          wk = wk + 1
+        }
+      } else if key != "=" {
+        fsRename(r, laneName(mi, key))
+      }
+    }
+  }
+  0
+}
+
+function fsRename(ix: i32, name: string): i32 {
+  const n = P.nodes[ix]
+  if n is Ident && n.identName == name { return 0 }
+  prIdent.push(ix)
+  prName.push(name)
+  0
+}
+
+// Records the parse arena's length; in the applying compile, applies the plan to the fresh
+// parse. -1 when the plan does not apply, which abandons that compile.
+export function fsAfterParse(): i32 {
+  fsParseLen = P.nodes.length
+  if fsMode != FS_APPLY { return 0 }
+  fsApply()
+}
+
+// The statements of a block or the program; empty for any other node.
+function fsStmtsOf(o: i32): i32[] {
+  const n = P.nodes[o]
+  if n is Block { return n.blkStmts }
+  if n is Program { return n.progStmts }
+  fsNoStmts("a node that holds no statement list")
+}
+
+// The statement list holding parse node `s`, as its owner's index, or -1.
+function fsListOwner(s: i32): i32 {
+  let i = 0
+  while i < fsParseLen {
+    if hasI32(fsStmtsOf(i), s) { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// `v`, the answer for the kinds a ladder does not handle, which `why` names.
+function fsExcluded(v: i32, _why: string): i32 { v }
+
+// No statements, for the node kinds a ladder does not handle, which `why` names.
+function fsNoStmts(_why: string): i32[] { [] }
+
+// Inserts `x` after `anchor` in its statement list, unless `anchor` is the value a `break`
+// carries out of the list. -1 when it cannot.
+function fsInsertAfter(anchor: i32, x: i32): i32 {
+  const o = fsListOwner(anchor)
+  if o < 0 { return -1 }
+  const on = P.nodes[o]
+  const xs = fsStmtsOf(o)
+  const out: i32[] = []
+  let i = 0
+  while i < xs.length {
+    out.push(xs[i])
+    if xs[i] == anchor {
+      if i + 1 < xs.length {
+        const nx = P.nodes[xs[i + 1]]
+        if nx is BreakStmt && nx.brkHasVal == 1 { return -1 }
+      }
+      out.push(x)
+    }
+    i = i + 1
+  }
+  if on is Block {
+    on.blkStmts = out
+    return 0
+  }
+  if on is Program {
+    on.progStmts = out
+    return 0
+  }
+  fsExcluded(-1, "a node that holds no statement list")
+}
+
+// The token a parse node starts at: scans back from its last token to the one at its offset.
+function fsFirstTok(ix: i32): i32 {
+  if ix < 0 || ix >= nodeToks.length { return -1 }
+  let t = nodeToks[ix]
+  const at = P.nodes[ix].pos
+  while t >= 0 && P.toks[t].start != at { t = t - 1 }
+  t
+}
+
+// A fresh value: slot `name` when set, else a fresh copy of parse node `src`. -2 declines.
+function fsValueNode(src: i32, name: string): i32 {
+  if src < 0 { return -1 }
+  const n = P.nodes[src]
+  if name != "" { return mkIdent(name, n.pos) }
+  if n is Ident { return mkIdent(n.identName, n.pos) }
+  if n is FuncDecl {
+    const f = reparseArrowLambdaAt(fsFirstTok(src))
+    if f < 0 { return -2 }
+    return f
+  }
+  fsExcluded(-2, "a value that is not a name or a lambda")
+}
+
+function fsApply(): i32 {
+  const savedPos = P.pos
+  let rc = 0
+  let i = 0
+  while i < prIdent.length {
+    const n = P.nodes[prIdent[i]]
+    if n is Ident { n.identName = prName[i] } else { rc = -1 }
+    i = i + 1
+  }
+  i = 0
+  while i < pdAnchor.length {
+    if rc == 0 {
+      const a = pdAnchor[i]
+      P.pos = nodeToks[a] + 1
+      const v = fsValueNode(pdValSrc[i], pdValName[i])
+      let ty = -1
+      if pdTy[i] >= 0 {
+        const tn = P.nodes[pdTy[i]]
+        if tn is TypeRef { ty = mkTypeRef(tn.tyName, tn.pos) } else { rc = -1 }
+      }
+      if v == -2 { rc = -1 }
+      if rc == 0 {
+        P.pos = nodeToks[a] + 1
+        rc = fsInsertAfter(a, mkLet(pdKw[i], pdName[i], ty, v, P.nodes[a].pos))
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < pwAnchor.length {
+    if rc == 0 {
+      const a = pwAnchor[i]
+      P.pos = nodeToks[a] + 1
+      const v = fsValueNode(pwValSrc[i], pwValName[i])
+      if v < 0 { rc = -1 }
+      if rc == 0 {
+        P.pos = nodeToks[a] + 1
+        const pos = P.nodes[a].pos
+        rc = fsInsertAfter(a, mkBinary("=", mkIdent(pwName[i], pos), v, pos))
+      }
+    }
+    i = i + 1
+  }
+  P.pos = savedPos
+  rc
+}
