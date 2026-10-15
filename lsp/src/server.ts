@@ -339,7 +339,14 @@ documents.onDidChangeContent(async (event) => {
   if (wasmChecker !== undefined) {
     try {
       const text = event.document.getText();
-      const lintDiags = wasmChecker.lint(text, lintPathFor(event.document.uri));
+      // Linted inside the document's module graph, so a rule reading an imported
+      // declaration agrees with `vl check`; the staging is the one `check` reuses.
+      const lintDiags = await wasmChecker.lintInGraph(
+        text,
+        lintPathFor(event.document.uri),
+        entryKeyOf(event.document.uri),
+        workspaceReader,
+      );
       const errors = await wasmChecker.check(
         text,
         entryKeyOf(event.document.uri),

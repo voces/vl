@@ -565,8 +565,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // this change) and 2637 -> 2639.
     // SP-056: a list index's guard branches to an out-of-line trap rather than a
     // `select` to -1, structure unchanged: `-O` 8259 -> 8896 bytes.
-    O: { bytes: 8896, fns: 15, allocs: 89, indirect: 0, refEq: 2 },
-    O3: { bytes: 2639, fns: 6, allocs: 43, indirect: 0, refEq: 2 },
+    // D4784: `std:fmt` renders an integer into one exact-size string, so the per-digit
+    // append sites and their `ref.eq` frontier test leave: allocs 89 -> 71 and 43 -> 20,
+    // refEq 2 -> 1 at both rungs, bytes 8896 -> 8549 and 2639 -> 2292.
+    O: { bytes: 8549, fns: 15, allocs: 71, indirect: 0, refEq: 1 },
+    O3: { bytes: 2292, fns: 6, allocs: 20, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -639,8 +642,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // a function: fns 15 -> 16, bytes within band. Cold path only.
     // SP-056: a list index's guard branches to an out-of-line trap rather than a
     // `select` to -1, structure unchanged: `-O` 9388 -> 9954, `-O3` 3746 -> 3861 bytes.
-    O: { bytes: 9954, fns: 16, allocs: 98, indirect: 0, refEq: 4 },
-    O3: { bytes: 3861, fns: 6, allocs: 51, indirect: 0, refEq: 4 },
+    // D4784: the same `std:fmt` integer renderer as on `collections/map-string`: allocs
+    // 98 -> 82 and 51 -> 30, refEq 4 -> 3, `-O3` fns 6 -> 5, bytes 9954 -> 9630 and 3861 -> 3562.
+    O: { bytes: 9630, fns: 16, allocs: 82, indirect: 0, refEq: 3 },
+    O3: { bytes: 3562, fns: 5, allocs: 30, indirect: 0, refEq: 3 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
@@ -694,8 +699,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     axis: "building a list of compile-time-known size with push",
     // SP-056: a list index's guard branches to an out-of-line trap rather than a
     // `select` to -1, structure unchanged: `-O` 2090 -> 2401, `-O3` 2024 -> 2335 bytes.
-    O: { bytes: 2401, fns: 2, allocs: 10, indirect: 0 },
-    O3: { bytes: 2335, fns: 2, allocs: 10, indirect: 0 },
+    // D4782: the trap branch ends in `unreachable`, so `-O` drops each repeated check of one
+    // index and shares one trap block: `-O` 2401 -> 2100, `-O3` 2335 -> 2034 bytes.
+    O: { bytes: 2100, fns: 2, allocs: 10, indirect: 0 },
+    O3: { bytes: 2034, fns: 2, allocs: 10, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). The `P[]` is flattened (D3681): four
   // i32s per element in one array, so setup allocates no `P` (`allocs` 3 -> 2: the list and

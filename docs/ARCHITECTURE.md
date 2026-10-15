@@ -87,7 +87,7 @@ Detail: `docs/internals/modules-design.md`, `docs/internals/parser-notes.md`.
 ### 2.3 Checker
 
 `compiler/typecheck.vl` (with `check_state.vl`, `check_query.vl`, `check_pins.vl`,
-`check_unconsumed.vl`, `check_places.vl`, `check_match_hoist.vl`, `check_width.vl`, `check_definite.vl`, `check_suggest.vl`, `check_narrow_ends.vl`, `check_capture_loss.vl`, `check_capture_walks.vl`, `check_write_scan.vl`, `const_exact.vl`, `tyname.vl`), `checkProgram(root)`.
+`check_unconsumed.vl`, `check_places.vl`, `check_match_hoist.vl`, `check_width.vl`, `check_definite.vl`, `check_suggest.vl`, `check_narrow_ends.vl`, `check_capture_loss.vl`, `check_capture_walks.vl`, `check_write_scan.vl`, `check_intrinsics.vl`, `check_record_writes.vl`, `check_types.vl`, `const_exact.vl`, `tyname.vl`), `checkProgram(root)`.
 
 - **In:** the arena. **Out:** a type for every expression node (in the type arena, [§3.2](#32-the-type-arena)),
   symbol tables, constraint tables, and all type diagnostics. It may also **write annotations back
@@ -232,7 +232,7 @@ part of the accessor's contract ([§4.5](#45-sentinels)).
 
 ### 3.2 The type arena
 
-`T.tys` (the `Checker` record `T`, `typecheck.vl`) holds every type the checker builds, as
+`T.tys` (the `Checker` record `T`, `check_types.vl`) holds every type the checker builds, as
 elements of the `Ty` union: primitive, error, object, function, union, nullable, array, map,
 type variable, literal, negation. A type is identified by its index. The arena is **not
 hash-consed**: two indices can hold structurally equal types, and type equality is a function,

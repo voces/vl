@@ -862,6 +862,16 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      through `monoDeclPathPins`); a slot pinned at none or two delivers nothing here, as the
      annotation read did for a non-local root. A capture cell's read is no place root, since
      the cell path delivers it. The concrete half of `monoNotePushDeliveries` stays.
+   - Eighth PR: the list and record literal arms of `monoCoerceFnValueName` stop reading the
+     expected type's spelling (`monoStructFieldTypes`, `monoGenAliasFieldTypes` and
+     `monoArrElemHoldsFn` retire). Each element or field value is delivered at the one
+     signature the table pins the literal's own `e` / `f.<name>` slot at (`monoSlotPinName`),
+     returning the annotation's return when one pins it; a nested literal reads its own slots.
+     Three table changes carry it: a literal banks its slot by declaration (a mono remake
+     records its origin), a pin keeps the return its annotation gives, and a type parameter the
+     checker leaves open takes the closed type of an argument to a bare parameter of that type.
+     The concrete half of `monoNotePushDeliveries` still stays: reading only the slot pin there
+     loses exactly the five hole-lambda push fixtures its ablation loses.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.

@@ -1,0 +1,680 @@
+// The compiler intrinsics by name: the inline-lowered memory, SIMD, atomic and saturating
+// truncation families, and the ordered host floor (files, argv, processes, environment).
+// The checker declares and reserves them, and the emitter dispatches on them, from these
+// tables, so no reader can drift from another. Nothing here reads a type or the scope chain;
+// the checker keeps the declarations and the definition refusals that report through it.
+// This module imports `./ast` and `./emit_bignum`.
+import { CALLSITE_NAME } from "./ast"
+import { numLexIsFloat } from "./emit_bignum"
+
+// The intrinsic names the emitter dispatches on at the call site, by name, before it looks up a
+// declaration: each lowers to instructions inline. A user function of one of these names never
+// runs — the call site is rewritten and the body silently discarded — so the rule is the name:
+// reject the definition, where the author can see it. Exported because `capScan` needs the set.
+export function nameIsEmitterIntrinsic(name: string) {
+  if name == "__store_i32__" { return true }
+  if name == "__load_i32__" { return true }
+  if name == "__log__" { return true }
+  if name == "__trap__" { return true }
+  if name == "__array_new__" { return true }
+  if name == "__array_new_default__" { return true }
+  if name == "__array_copy__" { return true }
+  if name == "__str_from_bytes__" { return true }
+  // The load-width matrix and the two memory-size ops, lowered inline the same way — reserved
+  // the same day they acquired an emitter arm, per this function's own rule.
+  if nameIsMemLoadIntrinsic(name) { return true }
+  // The five other store widths (three wide, two narrow), likewise reserved the day
+  // each acquired its arm.
+  if nameIsMemStoreIntrinsic(name) { return true }
+  if name == "__memory_size__" { return true }
+  if name == "__memory_grow__" { return true }
+  if name == "__heap_base__" { return true }
+  if name == "__heap_limit__" { return true }
+  if name == "__memory_shared__" { return true }
+  // The bulk pair, reserved the day they acquired their arm.
+  if nameIsMemBulkIntrinsic(name) { return true }
+  // The SIMD substrate, reserved the day it acquired its emit arm — same rule: the emitter
+  // rewrites the call site by name, so a user definition would be silently discarded.
+  if nameIsSimdIntrinsic(name) { return true }
+  if nameIsAtomicIntrinsic(name) { return true }
+  if truncSatOp(name) >= 0 { return true }
+  // The filesystem floor. These lower to a `call` of a host import rather than to instructions,
+  // but the reservation reason is identical and is about the call site, not the lowering:
+  // `emitCall` matches these names before it looks up a declaration, so a user
+  // `function __fs_read__(p: u8[]) { … }` would be discarded and every call become a syscall.
+  if nameIsFsIntrinsic(name) { return true }
+  false
+}
+
+// The bulk pair (`buffer-design.md` §C3): `__memory_copy__(dst, src, len)` → `memory.copy` and
+// `__memory_fill__(dst, byte, len)` → `memory.fill`. All six operands are i32 and both results
+// void, so unlike the store widths there is no width dispatch. Two semantics the signature does
+// not show, both the instruction's: `len` is unsigned, so a negative one traps, and copy is memmove.
+export function nameIsMemBulkIntrinsic(name: string) {
+  if name == "__memory_copy__" { return true }
+  if name == "__memory_fill__" { return true }
+  false
+}
+
+// The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to one `0xFD`-prefix
+// instruction by `emitCall`. One table, read by the checker's declarations, its definition
+// reservation and lane check, the emitter's dispatch and the import scan, so none can drift.
+// Naming: wasm `<shape>.<op>` is `__<op>_<shape>__`; an op naming its source shape drops `<shape>`.
+export function nameIsSimdIntrinsic(name: string) { simdRow(name) >= 0 }
+
+// The operand shape of a SIMD row (`V` a v128, `I` an i32, `L` an i64, `F` an f32), read by
+// the checker to type it and by the emitter to push its operands. `LANE`/`REPL` rows carry a
+// lane immediate after the vector; `LOAD`/`STORE` a memarg; `SHUF4`/`SHUF16` their lane literals.
+export const SIMD_SIG_V_V = 1
+export const SIMD_SIG_VV_V = 2
+export const SIMD_SIG_VVV_V = 3
+export const SIMD_SIG_V_I = 4
+export const SIMD_SIG_VI_V = 5
+export const SIMD_SIG_I_V = 6
+export const SIMD_SIG_L_V = 7
+export const SIMD_SIG_F_V = 8
+export const SIMD_SIG_LOAD = 9
+export const SIMD_SIG_STORE = 10
+export const SIMD_SIG_LANE_I = 11
+export const SIMD_SIG_LANE_L = 12
+export const SIMD_SIG_LANE_F = 13
+export const SIMD_SIG_REPL_I = 14
+export const SIMD_SIG_REPL_L = 15
+export const SIMD_SIG_REPL_F = 16
+export const SIMD_SIG_SHUF4 = 17
+export const SIMD_SIG_SHUF16 = 18
+
+export const simdNames: string[] = []
+const simdOps: i32[] = []
+export const simdSigs: i32[] = []
+const simdLaneMax: i32[] = []
+const simdRowOf: {[string]: i32} = Map()
+
+// The table row of SIMD intrinsic `name`, or -1 when it is not one. Built on first use.
+export function simdRow(name: string): i32 {
+  if simdNames.length == 0 { simdTableBuild() }
+  simdRowOf[name] ?? -1
+}
+export function simdRowOp(row: i32): i32 { simdOps[row] }
+export function simdRowSig(row: i32): i32 { simdSigs[row] }
+// The highest index a lane row's immediate may name; for a shuffle row, each lane literal's.
+export function simdRowLaneMax(row: i32): i32 { simdLaneMax[row] }
+
+function simdAdd(name: string, op: i32, sig: i32, laneMax: i32) {
+  simdRowOf[name] = simdNames.length
+  simdNames.push(name)
+  simdOps.push(op)
+  simdSigs.push(sig)
+  simdLaneMax.push(laneMax)
+  0
+}
+
+// Rows sharing one operand shape and no lane immediate; `ops[i]` is `names[i]`'s sub-opcode.
+function simdAddAll(names: string[], ops: i32[], sig: i32) {
+  let i = 0
+  while i < names.length {
+    simdAdd(names[i], ops[i], sig, -1)
+    i = i + 1
+  }
+  0
+}
+
+// The rows, grouped by operand shape; each opcode is the wasm SIMD spec's sub-opcode.
+export function simdTableBuild() {
+  simdAdd("__load_v128__", 0x00, SIMD_SIG_LOAD, -1)
+  simdAddAll(
+    [
+      "__load8x8_s_v128__", "__load8x8_u_v128__", "__load16x4_s_v128__",
+      "__load16x4_u_v128__", "__load32x2_s_v128__", "__load32x2_u_v128__",
+      "__load8_splat_v128__", "__load16_splat_v128__", "__load32_splat_v128__",
+      "__load64_splat_v128__", "__load32_zero_v128__", "__load64_zero_v128__",
+    ],
+    [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x5c, 0x5d],
+    SIMD_SIG_LOAD,
+  )
+  simdAdd("__store_v128__", 0x0b, SIMD_SIG_STORE, -1)
+  simdAdd("__shuffle_i8x16__", 0x0d, SIMD_SIG_SHUF16, 31)
+  simdAdd("__shuffle_f32x4__", 0x0d, SIMD_SIG_SHUF4, 7)
+  simdAddAll(
+    ["__splat_i8x16__", "__splat_i16x8__", "__splat_i32x4__"],
+    [0x0f, 0x10, 0x11],
+    SIMD_SIG_I_V,
+  )
+  simdAdd("__splat_i64x2__", 0x12, SIMD_SIG_L_V, -1)
+  simdAdd("__splat_f32x4__", 0x13, SIMD_SIG_F_V, -1)
+  simdAdd("__extract_lane_s_i8x16__", 0x15, SIMD_SIG_LANE_I, 15)
+  simdAdd("__extract_lane_u_i8x16__", 0x16, SIMD_SIG_LANE_I, 15)
+  simdAdd("__replace_lane_i8x16__", 0x17, SIMD_SIG_REPL_I, 15)
+  simdAdd("__extract_lane_s_i16x8__", 0x18, SIMD_SIG_LANE_I, 7)
+  simdAdd("__extract_lane_u_i16x8__", 0x19, SIMD_SIG_LANE_I, 7)
+  simdAdd("__replace_lane_i16x8__", 0x1a, SIMD_SIG_REPL_I, 7)
+  simdAdd("__extract_lane_i32x4__", 0x1b, SIMD_SIG_LANE_I, 3)
+  simdAdd("__replace_lane_i32x4__", 0x1c, SIMD_SIG_REPL_I, 3)
+  simdAdd("__extract_lane_i64x2__", 0x1d, SIMD_SIG_LANE_L, 1)
+  simdAdd("__replace_lane_i64x2__", 0x1e, SIMD_SIG_REPL_L, 1)
+  simdAdd("__extract_lane_f32x4__", 0x1f, SIMD_SIG_LANE_F, 3)
+  simdAdd("__replace_lane_f32x4__", 0x20, SIMD_SIG_REPL_F, 3)
+  simdAddAll(
+    [
+      "__not_v128__", "__abs_i8x16__", "__neg_i8x16__", "__popcnt_i8x16__",
+      "__abs_i16x8__", "__neg_i16x8__", "__abs_i32x4__", "__neg_i32x4__",
+      "__abs_i64x2__", "__neg_i64x2__", "__abs_f32x4__", "__sqrt_f32x4__",
+      "__extend_low_i8x16_s__", "__extend_high_i8x16_s__",
+      "__extend_low_i8x16_u__", "__extend_high_i8x16_u__",
+      "__extend_low_i16x8_s__", "__extend_high_i16x8_s__",
+      "__extend_low_i16x8_u__", "__extend_high_i16x8_u__",
+      "__extend_low_i32x4_s__", "__extend_high_i32x4_s__",
+      "__extend_low_i32x4_u__", "__extend_high_i32x4_u__",
+      "__extadd_pairwise_i8x16_s__", "__extadd_pairwise_i8x16_u__",
+      "__extadd_pairwise_i16x8_s__", "__extadd_pairwise_i16x8_u__",
+      "__trunc_sat_f32x4_s__", "__trunc_sat_f32x4_u__", "__convert_i32x4_s__",
+      "__convert_i32x4_u__",
+    ],
+    [
+      0x4d, 0x60, 0x61, 0x62, 0x80, 0x81, 0xa0, 0xa1, 0xc0, 0xc1, 0xe0, 0xe3,
+      0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7, 0xc8, 0xc9, 0xca,
+      0x7c, 0x7d, 0x7e, 0x7f, 0xf8, 0xf9, 0xfa, 0xfb,
+    ],
+    SIMD_SIG_V_V,
+  )
+  simdAddAll(
+    [
+      "__any_true_v128__", "__all_true_i8x16__", "__bitmask_i8x16__",
+      "__all_true_i16x8__", "__bitmask_i16x8__", "__all_true_i32x4__",
+      "__bitmask_i32x4__", "__all_true_i64x2__", "__bitmask_i64x2__",
+    ],
+    [0x53, 0x63, 0x64, 0x83, 0x84, 0xa3, 0xa4, 0xc3, 0xc4],
+    SIMD_SIG_V_I,
+  )
+  simdAddAll(
+    [
+      "__shl_i8x16__", "__shr_s_i8x16__", "__shr_u_i8x16__", "__shl_i16x8__",
+      "__shr_s_i16x8__", "__shr_u_i16x8__", "__shl_i32x4__", "__shr_s_i32x4__",
+      "__shr_u_i32x4__", "__shl_i64x2__", "__shr_s_i64x2__", "__shr_u_i64x2__",
+    ],
+    [0x6b, 0x6c, 0x6d, 0x8b, 0x8c, 0x8d, 0xab, 0xac, 0xad, 0xcb, 0xcc, 0xcd],
+    SIMD_SIG_VI_V,
+  )
+  simdAddAll(
+    [
+      "__swizzle_i8x16__", "__and_v128__", "__andnot_v128__", "__or_v128__",
+      "__xor_v128__", "__eq_i8x16__", "__ne_i8x16__", "__lt_s_i8x16__",
+      "__lt_u_i8x16__", "__gt_s_i8x16__", "__gt_u_i8x16__", "__le_s_i8x16__",
+      "__le_u_i8x16__", "__ge_s_i8x16__", "__ge_u_i8x16__", "__eq_i16x8__",
+      "__ne_i16x8__", "__lt_s_i16x8__", "__lt_u_i16x8__", "__gt_s_i16x8__",
+      "__gt_u_i16x8__", "__le_s_i16x8__", "__le_u_i16x8__", "__ge_s_i16x8__",
+      "__ge_u_i16x8__", "__eq_i32x4__", "__ne_i32x4__", "__lt_s_i32x4__",
+      "__lt_u_i32x4__", "__gt_s_i32x4__", "__gt_u_i32x4__", "__le_s_i32x4__",
+      "__le_u_i32x4__", "__ge_s_i32x4__", "__ge_u_i32x4__", "__eq_i64x2__",
+      "__ne_i64x2__", "__lt_s_i64x2__", "__gt_s_i64x2__", "__le_s_i64x2__",
+      "__ge_s_i64x2__", "__eq_f32x4__", "__ne_f32x4__", "__lt_f32x4__",
+      "__gt_f32x4__", "__le_f32x4__", "__ge_f32x4__",
+    ],
+    [
+      0x0e, 0x4e, 0x4f, 0x50, 0x51, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+      0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+      0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0xd6,
+      0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+    ],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__narrow_i16x8_s__", "__narrow_i16x8_u__", "__add_i8x16__",
+      "__add_sat_s_i8x16__", "__add_sat_u_i8x16__", "__sub_i8x16__",
+      "__sub_sat_s_i8x16__", "__sub_sat_u_i8x16__", "__min_s_i8x16__",
+      "__min_u_i8x16__", "__max_s_i8x16__", "__max_u_i8x16__",
+      "__avgr_u_i8x16__",
+    ],
+    [0x65, 0x66, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7b],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__q15mulr_sat_s_i16x8__", "__narrow_i32x4_s__", "__narrow_i32x4_u__",
+      "__add_i16x8__", "__add_sat_s_i16x8__", "__add_sat_u_i16x8__",
+      "__sub_i16x8__", "__sub_sat_s_i16x8__", "__sub_sat_u_i16x8__",
+      "__mul_i16x8__", "__min_s_i16x8__", "__min_u_i16x8__", "__max_s_i16x8__",
+      "__max_u_i16x8__", "__avgr_u_i16x8__", "__extmul_low_i8x16_s__",
+      "__extmul_high_i8x16_s__", "__extmul_low_i8x16_u__",
+      "__extmul_high_i8x16_u__",
+    ],
+    [
+      0x82, 0x85, 0x86, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97,
+      0x98, 0x99, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+    ],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__add_i32x4__", "__sub_i32x4__", "__mul_i32x4__", "__min_s_i32x4__",
+      "__min_u_i32x4__", "__max_s_i32x4__", "__max_u_i32x4__",
+      "__dot_i16x8_s__", "__extmul_low_i16x8_s__", "__extmul_high_i16x8_s__",
+      "__extmul_low_i16x8_u__", "__extmul_high_i16x8_u__", "__add_i64x2__",
+      "__sub_i64x2__", "__mul_i64x2__", "__extmul_low_i32x4_s__",
+      "__extmul_high_i32x4_s__", "__extmul_low_i32x4_u__",
+      "__extmul_high_i32x4_u__", "__add_f32x4__", "__sub_f32x4__",
+      "__mul_f32x4__", "__div_f32x4__", "__min_f32x4__", "__max_f32x4__",
+    ],
+    [
+      0xae, 0xb1, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbc, 0xbd, 0xbe, 0xbf,
+      0xce, 0xd1, 0xd5, 0xdc, 0xdd, 0xde, 0xdf, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
+      0xe9,
+    ],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    ["__pmin_f32x4__", "__pmax_f32x4__", "__pmin_f64x2__", "__pmax_f64x2__"],
+    [0xea, 0xeb, 0xf6, 0xf7],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__demote_f64x2_zero__", "__promote_low_f32x4__",
+      "__convert_low_i32x4_s__", "__convert_low_i32x4_u__",
+    ],
+    [0x5e, 0x5f, 0xfe, 0xff],
+    SIMD_SIG_V_V,
+  )
+  simdAdd("__bitselect_v128__", 0x52, SIMD_SIG_VVV_V, -1)
+  0
+}
+
+// The scalar saturating truncations, each one `0xFC <sub>` instruction: NaN gives 0 and an
+// out-of-range operand clamps to the result's bound, where `x as! i32` traps. The source does
+// not decide the result, so the name keeps it: `i32.trunc_sat_f64_u` is
+// `__trunc_sat_f64_u_i32__`. A name's index is its sub-opcode.
+export const TRUNC_SAT_NAMES = [
+  "__trunc_sat_f32_s_i32__", "__trunc_sat_f32_u_i32__",
+  "__trunc_sat_f64_s_i32__", "__trunc_sat_f64_u_i32__",
+  "__trunc_sat_f32_s_i64__", "__trunc_sat_f32_u_i64__",
+  "__trunc_sat_f64_s_i64__", "__trunc_sat_f64_u_i64__",
+]
+
+// The `0xFC` sub-opcode of saturating truncation `name`, or -1 when it is not one. Bit 2 of
+// the sub-opcode is an i64 result, bit 1 an f64 operand, bit 0 unsigned. Every name is 23
+// characters, so a call of any other name leaves after one length test.
+export function truncSatOp(name: string): i32 {
+  if name.length != 23 { return -1 }
+  let i = 0
+  while i < TRUNC_SAT_NAMES.length {
+    if TRUNC_SAT_NAMES[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+export function truncSatIsI64(op: i32): boolean { (op & 4) != 0 }
+export function truncSatFromF64(op: i32): boolean { (op & 2) != 0 }
+
+// The atomic intrinsics (`simd-design.md` §G1 "Atomics"), each lowered inline to one
+// `0xFE`-prefix instruction of the wasm threads proposal over linear memory. One table, read
+// by the checker's declarations, the definition reservation, the emitter and the import scan.
+// Naming: wasm `i32.atomic.rmw8.add_u` is `__atomic_rmw8_add_u_i32__`.
+export function nameIsAtomicIntrinsic(name: string) { atomicRow(name) >= 0 }
+
+// The operand shape of an atomic row, over an i32 address and `v`, the row's value width
+// (`atomicRowIsI64`): load (addr) → v; store (addr, v); rmw (addr, v) → v; cmpxchg (addr,
+// expected, replacement) → v; wait (addr, v, i64 timeout) → i32; notify (addr, i32 count) →
+// i32; fence (), with no memory operand.
+export const ATOMIC_SIG_LOAD = 1
+export const ATOMIC_SIG_STORE = 2
+export const ATOMIC_SIG_RMW = 3
+export const ATOMIC_SIG_CMPXCHG = 4
+export const ATOMIC_SIG_WAIT = 5
+export const ATOMIC_SIG_NOTIFY = 6
+export const ATOMIC_SIG_FENCE = 7
+
+export const atomicNames: string[] = []
+const atomicOps: i32[] = []
+export const atomicSigs: i32[] = []
+export const atomicI64: boolean[] = []
+const atomicAlign: i32[] = []
+const atomicRowOf: {[string]: i32} = Map()
+
+// The table row of atomic intrinsic `name`, or -1 when it is not one. Built on first use.
+export function atomicRow(name: string): i32 {
+  if atomicNames.length == 0 { atomicTableBuild() }
+  atomicRowOf[name] ?? -1
+}
+export function atomicRowOp(row: i32): i32 { atomicOps[row] }
+export function atomicRowSig(row: i32): i32 { atomicSigs[row] }
+export function atomicRowIsI64(row: i32): boolean { atomicI64[row] }
+// The memarg alignment exponent: the access's natural alignment, which an atomic must name.
+export function atomicRowAlign(row: i32): i32 { atomicAlign[row] }
+
+function atomicAdd(
+  name: string,
+  op: i32,
+  sig: i32,
+  isI64: boolean,
+  align: i32,
+) {
+  atomicRowOf[name] = atomicNames.length
+  atomicNames.push(name)
+  atomicOps.push(op)
+  atomicSigs.push(sig)
+  atomicI64.push(isI64)
+  atomicAlign.push(align)
+  0
+}
+
+// The seven access widths every load, store and rmw family has, in the spec's opcode order:
+// i32, i64, i32 8-bit, i32 16-bit, i64 8-bit, i64 16-bit, i64 32-bit. `base` is the family's
+// first sub-opcode; the name is `__atomic_<pre><bits>[_<mid>][_u]_<shape>__`, with `_u` only
+// at a narrow width of a family that has it (`narrowU`: loads and rmw, not stores).
+function atomicAddWidths(
+  pre: string,
+  mid: string,
+  narrowU: boolean,
+  base: i32,
+  sig: i32,
+) {
+  const bits = ["", "", "8", "16", "8", "16", "32"]
+  const shapes = ["i32", "i64", "i32", "i32", "i64", "i64", "i64"]
+  const aligns = [2, 3, 0, 1, 0, 1, 2]
+  let i = 0
+  while i < 7 {
+    let op = ""
+    if mid != "" { op = "_" + mid }
+    if bits[i] != "" && narrowU { op = op + "_u" }
+    const shape = "_" + shapes[i] + "__"
+    const name = "__atomic_" + pre + bits[i] + op + shape
+    atomicAdd(name, base + i, sig, shapes[i] == "i64", aligns[i])
+    i = i + 1
+  }
+  0
+}
+
+// The rows; each opcode is the threads proposal's `0xFE` sub-opcode.
+export function atomicTableBuild() {
+  atomicAdd("__atomic_notify__", 0x00, ATOMIC_SIG_NOTIFY, false, 2)
+  atomicAdd("__atomic_wait32__", 0x01, ATOMIC_SIG_WAIT, false, 2)
+  atomicAdd("__atomic_wait64__", 0x02, ATOMIC_SIG_WAIT, true, 3)
+  atomicAdd("__atomic_fence__", 0x03, ATOMIC_SIG_FENCE, false, 0)
+  atomicAddWidths("load", "", true, 0x10, ATOMIC_SIG_LOAD)
+  atomicAddWidths("store", "", false, 0x17, ATOMIC_SIG_STORE)
+  const rmws = ["add", "sub", "and", "or", "xor", "xchg", "cmpxchg"]
+  let i = 0
+  while i < rmws.length {
+    let sig = ATOMIC_SIG_RMW
+    if rmws[i] == "cmpxchg" { sig = ATOMIC_SIG_CMPXCHG }
+    atomicAddWidths("rmw", rmws[i], true, 0x1e + i * 7, sig)
+    i = i + 1
+  }
+  0
+}
+
+// Whether atomic intrinsic `name` leaves nothing on the stack: the stores and the fence.
+export function atomicIntrinsicIsVoid(name: string): boolean {
+  const row = atomicRow(name)
+  if row < 0 { return false }
+  const sig = atomicRowSig(row)
+  sig == ATOMIC_SIG_STORE || sig == ATOMIC_SIG_FENCE
+}
+
+// The ten other load widths. `__load_i32__` predates them and keeps its own arm at every call
+// site, so it is deliberately not in this set. One list, consulted by the checker's definition
+// reservation, the emitter's dispatch and the import scan, so the three cannot drift: a width
+// missing from any one of them is a silent wrong answer.
+export function nameIsMemLoadIntrinsic(name: string) {
+  if name == "__load_i8__" { return true }
+  if name == "__load_u8__" { return true }
+  if name == "__load_i16__" { return true }
+  if name == "__load_u16__" { return true }
+  if name == "__load_i64__" { return true }
+  if name == "__load_f32__" { return true }
+  if name == "__load_f64__" { return true }
+  if name == "__load_u8_i64__" { return true }
+  if name == "__load_u16_i64__" { return true }
+  if name == "__load_u32_i64__" { return true }
+  false
+}
+
+// The five store widths that are not `__store_i32__` — the three wide duals of
+// `__load_i64__`/`__load_f32__`/`__load_f64__`, and the two narrow ones, which truncate and so
+// have no signed/unsigned split. Their value operand is an i32, unlike the wide three, so it
+// takes the ordinary `emitMemIntrinArg` spine. One list, so its five consumers cannot drift.
+export function nameIsMemStoreIntrinsic(name: string) {
+  if name == "__store_i64__" { return true }
+  if name == "__store_f32__" { return true }
+  if name == "__store_f64__" { return true }
+  if name == "__store_i8__" { return true }
+  if name == "__store_i16__" { return true }
+  false
+}
+
+// The operand count of a linear-memory intrinsic that carries a memarg, WITHOUT the optional
+// offset, or -1 for a name that has none. The offset form takes one more argument, the
+// offset, always second: `__load_i64__(p, 16)`, `__store_i32__(p, 8, v)`. The fence has no memarg.
+export function memOffsetBaseArity(name: string): i32 {
+  if name == "__load_i32__" || nameIsMemLoadIntrinsic(name) { return 1 }
+  if name == "__store_i32__" || nameIsMemStoreIntrinsic(name) { return 2 }
+  const srow = simdRow(name)
+  if srow >= 0 {
+    const ssig = simdRowSig(srow)
+    if ssig == SIMD_SIG_LOAD { return 1 }
+    if ssig == SIMD_SIG_STORE { return 2 }
+    return -1
+  }
+  const arow = atomicRow(name)
+  if arow < 0 { return -1 }
+  const asig = atomicRowSig(arow)
+  if asig == ATOMIC_SIG_LOAD { return 1 }
+  if asig == ATOMIC_SIG_STORE || asig == ATOMIC_SIG_RMW { return 2 }
+  if asig == ATOMIC_SIG_NOTIFY { return 2 }
+  if asig == ATOMIC_SIG_CMPXCHG || asig == ATOMIC_SIG_WAIT { return 3 }
+  -1
+}
+
+// The largest memarg offset: wasm32's offset immediate is a u32.
+export const MEM_OFFSET_MAX: i64 = 4294967295
+
+// The value of integer lexeme `t` when it is at most `MEM_OFFSET_MAX`, else -1. Radix prefixes
+// and `_` separators are honoured; the walk stops once the value passes the bound.
+export function memOffsetLexValue(t: string): i64 {
+  if numLexIsFloat(t) { return -1 }
+  let base: i64 = 10
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  if i >= t.length { return -1 }
+  let v: i64 = 0
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      let d = -1
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      if d < 0 || (d as i64) >= base { return -1 }
+      v = v * base + (d as i64)
+      if v > MEM_OFFSET_MAX { return -1 }
+    }
+    i = i + 1
+  }
+  v
+}
+
+// ── the host floor: one ordered list, six readers ────────────────────────────
+
+// The slot is the identity of a host intrinsic everywhere downstream — files, argv, processes
+// and the environment share one table because they share one lowering — and the order below is
+// the only place it is written, so a name added here appears in all six consumers or in none.
+// Append-only: inserting a name would move every later import's wasm index. -1 for a non-member.
+export function fsIntrinsicSlot(name: string): i32 {
+  if name == "__fs_read__" { return 0 }
+  if name == "__fs_write__" { return 1 }
+  if name == "__fs_list__" { return 2 }
+  if name == "__fs_stat__" { return 3 }
+  if name == "__args_count__" { return 4 }
+  if name == "__args_get__" { return 5 }
+  if name == "__fs_errno__" { return 6 }
+  if name == "__fs_read_range__" { return 7 }
+  if name == "__fs_size__" { return 8 }
+  if name == "__fs_read_into__" { return 9 }
+  if name == "__proc_run__" { return 10 }
+  if name == "__proc_out__" { return 11 }
+  if name == "__proc_err__" { return 12 }
+  if name == "__proc_exit__" { return 13 }
+  if name == "__env_get__" { return 14 }
+  if name == "__fs_write_at__" { return 15 }
+  if name == "__fs_write_from__" { return 16 }
+  -1
+}
+
+// How many fs slots exist. Every parallel table the emitter keeps (`gFsUse`, `gFsIdx`) is exactly
+// this long, and every read of one is bound-checked against it — `emitFail` does not halt
+// emission, so an out-of-bounds read here would trap a compiler that had already decided to fail.
+export function fsIntrinsicCount(): i32 { 17 }
+
+// The name at slot `k` — the inverse of `fsIntrinsicSlot`, used by the import and name
+// sections, which iterate slots rather than spelling names. `""` for a slot out of
+// range, which every caller treats as "emit nothing" rather than writing an empty name.
+export function fsIntrinsicNameAt(k: i32): string {
+  if k == 0 { return "__fs_read__" }
+  if k == 1 { return "__fs_write__" }
+  if k == 2 { return "__fs_list__" }
+  if k == 3 { return "__fs_stat__" }
+  if k == 4 { return "__args_count__" }
+  if k == 5 { return "__args_get__" }
+  if k == 6 { return "__fs_errno__" }
+  if k == 7 { return "__fs_read_range__" }
+  if k == 8 { return "__fs_size__" }
+  if k == 9 { return "__fs_read_into__" }
+  if k == 10 { return "__proc_run__" }
+  if k == 11 { return "__proc_out__" }
+  if k == 12 { return "__proc_err__" }
+  if k == 13 { return "__proc_exit__" }
+  if k == 14 { return "__env_get__" }
+  if k == 15 { return "__fs_write_at__" }
+  if k == 16 { return "__fs_write_from__" }
+  ""
+}
+
+// True when `name` is a floor slot. A projection of `fsIntrinsicSlot`, deliberately not a
+// second `if`-chain: the two could not then disagree.
+export function nameIsFsIntrinsic(name: string) { fsIntrinsicSlot(name) >= 0 }
+
+// True when slot `k` takes a `u8[]` in argument position `a` (0-based). Drives the call lowering's
+// per-argument context seeding — a `u8[]` operand threads the packed-list build kind so an empty
+// `[]` literal argument builds the packed wrapper, while an i32 operand (`__args_get__`'s index)
+// takes the ordinary width-cleared spine.
+export function fsArgIsU8List(k: i32, a: i32) {
+  if k == 0 { return a == 0 }
+  if k == 1 { return a == 0 || a == 1 }
+  if k == 2 { return a == 0 }
+  if k == 3 { return a == 0 }
+  if k == 7 { return a == 0 }
+  if k == 8 { return a == 0 }
+  if k == 9 { return a == 0 }
+  if k == 10 { return a == 0 }
+  if k == 14 { return a == 0 }
+  if k == 15 { return a == 0 || a == 2 }
+  if k == 16 { return a == 0 }
+  false
+}
+
+// The declared arity of slot `k`. The emitter checks it before lowering, so a wrong-arity call is
+// a named diagnostic rather than a stack shape that happens to validate.
+export function fsIntrinsicArity(k: i32): i32 {
+  if k == 1 { return 2 }
+  if k == 4 { return 0 }
+  if k == 6 { return 0 }
+  if k == 5 { return 1 }
+  if k == 7 { return 3 }
+  if k == 8 { return 1 }
+  if k == 9 { return 4 }
+  if k == 10 { return 1 }
+  if k == 11 { return 0 }
+  if k == 12 { return 0 }
+  if k == 13 { return 1 }
+  if k == 14 { return 1 }
+  if k == 15 { return 4 }
+  if k == 16 { return 5 }
+  if k >= 0 && k <= 3 { return 1 }
+  -1
+}
+
+// True when slot `k` returns a `u8[]` (the packed wrapper) rather than an i32 — the split the type
+// section's functype shapes and the emitter's result classification both turn on.
+export function fsRetIsU8List(k: i32) {
+  k == 0 || k == 2 || k == 5 || k == 7 || k == 11 || k == 12 || k == 14
+}
+
+// True when slot `k` takes an i64 in argument position `a` — a byte offset into the FILE,
+// which an i32 cannot address past 2 GiB. Read beside `fsArgIsU8List` by the functype
+// writer and the call lowering, so every position is a packed list, an i64, or an i32.
+export function fsArgIsI64(k: i32, a: i32) {
+  if k == 7 { return a == 1 }
+  if k == 9 { return a == 1 }
+  if k == 15 { return a == 1 }
+  if k == 16 { return a == 1 }
+  false
+}
+
+// True when slot `k` returns an i64 rather than an i32 or the packed wrapper — a file size, for
+// the same addressing reason. Read beside `fsRetIsU8List` by the same two.
+export function fsRetIsI64(k: i32) { k == 8 }
+
+// True when slot `k` returns NOTHING — the one slot that never returns at all,
+// `__proc_exit__`. Read beside the two above by the functype writer, which otherwise
+// declares exactly one result per slot; a diverging import declared with a result would
+// oblige every host to leave a value on the stack it can never reach the code to push.
+export function fsRetIsVoid(k: i32) { k == 13 }
+
+// True when slot `k` reads or writes linear memory by address, so the module needs the memory
+// emitted and exported even when it contacts it nowhere else. Without this a program whose only
+// memory use is `__fs_read_into__` names a memory that does not exist, and the host has nowhere
+// to write. Read by the use scan beside the memory intrinsics, which force it the same way.
+export function fsSlotTouchesMemory(k: i32) { k == 9 || k == 16 }
+
+// The declared-but-unlowered memory intrinsics: names that pass `vl check` and then die at emit
+// with `emitProgram: call to unknown function`, which reads like a mistyped identifier when the
+// identifier is real and the implementation is what is missing. Two remain, `__store_string__`
+// and `__log_string__`; each needs a design, not a table entry (`memory-gc-design.md` §1.2).
+export function nameIsUnimplementedIntrinsic(name: string) {
+  if name == "__store_string__" { return true }
+  if name == "__log_string__" { return true }
+  false
+}
+
+// Whether a binding spelled `name` is refused by `checkNotIntrinsicName`.
+export function isReservedIntrinsicName(name: string): boolean {
+  intrinsicNameRefusal(name) != ""
+}
+
+// The message refusing a binding spelled `name`, or "" when the spelling is not reserved.
+export function intrinsicNameRefusal(name: string): string {
+  // `__callsite__` is reserved for the same reason by a different mechanism: it is matched by
+  // spelling in parameter-default position (`ast.paramDefaultIsCallsite`), before anything looks
+  // up a declaration, so a module `const __callsite__` would look like a legal const default
+  // while meaning the intrinsic. Not in `nameIsEmitterIntrinsic`: this name is never a callee.
+  if name == CALLSITE_NAME {
+    return "'"
+      + CALLSITE_NAME
+      + "' is a compiler intrinsic and cannot be redefined — it is matched by name as a parameter default value, so this definition would never be read there"
+  }
+  if nameIsEmitterIntrinsic(name) {
+    let how = "every call to it lowers to instructions inline"
+    if nameIsFsIntrinsic(name) {
+      how = "every call to it lowers to a host import"
+    }
+    return "'"
+      + name
+      + "' is a compiler intrinsic and cannot be redefined — "
+      + how
+      + ", so this definition would never run"
+  }
+  ""
+}

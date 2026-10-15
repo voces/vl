@@ -744,6 +744,19 @@ export type WasmChecker = {
    */
   lint: (source: string, path?: string) => VLDiagnostic[];
   /**
+   * `lint` over `source` staged as the entry of its module graph (`entryKey`, with
+   * `read` resolving its imports), so a rule that needs a sibling module's
+   * declarations sees them — `sentinel-index-unguarded` exempts a subscript of a
+   * map global the file IMPORTS. The staging is the one `check` reuses, so a
+   * caller that lints and then checks one document still stages it once.
+   */
+  lintInGraph: (
+    source: string,
+    path: string | undefined,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<VLDiagnostic[]>;
+  /**
    * Tell the checker a READER ANSWER may have moved, so the prepared-state memo
    * stops being reusable.
    *
@@ -2240,6 +2253,21 @@ export const createWasmChecker = (
     return out;
   };
 
+  // The seed's single-source lint reads the import tables of a staged graph whose entry
+  // is this same text, and of nothing else; staging first is what hands it those.
+  const lintInGraph = async (
+    source: string,
+    path: string | undefined,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<VLDiagnostic[]> => {
+    const exp = instantiate();
+    if (exp !== undefined && speaksAbi(exp)) {
+      await ensureStaged(exp, source, entryKey, read);
+    }
+    return lint(source, path);
+  };
+
   // The lexical-token exports ride the same seed as the Stage-1+ exports; an older
   // seed lacks them, so this yields [] and the host keeps its TS lexical pass.
   // Like `formatSrc`/`lint`: single-file, parse-free, no `prepare`.
@@ -2403,6 +2431,7 @@ export const createWasmChecker = (
     moduleSurface,
     formatSrc,
     lint,
+    lintInGraph,
     bumpReaderGeneration,
     graphCheckCount,
     stagingCounts,
