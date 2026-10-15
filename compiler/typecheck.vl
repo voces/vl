@@ -647,6 +647,7 @@ import {
   tyNomNameCycled,
   tyParamNamesPart,
   tyPinsEmptyHoles,
+  tyPrimNameOf,
   tyPrintsAsRef,
   tyReachesBrand,
   tyReachesEmptyHole,
@@ -5813,9 +5814,12 @@ function keySteps(key: string): string[] {
 // Whether the write shape `w` may write the key step `st`, whose container's cell tag is `tag`
 // ("" for a field step, or when unknown). A cell shape and a step whose containers are both known
 // hit only when they are the same kind and one element type is assignable to the other.
+// The step `[*]` stands for every element of a list, which an append also writes.
 function shapeHitsStep(w: string, st: string, tag: string): boolean {
   let s = w
-  if s.length > 0 && s[0] == '-' { s = s.slice(1, s.length) }
+  const appends = s.length > 0 && s[0] == '+'
+  if appends && st != LIST_EVERY_STEP { return false }
+  if s.length > 0 && (s[0] == '-' || appends) { s = s.slice(1, s.length) }
   let wtag = ""
   let h = s.length - 2
   while h >= 0 && !(s[h] == ']' && s[h + 1] == '#') { h = h - 1 }
@@ -5823,8 +5827,28 @@ function shapeHitsStep(w: string, st: string, tag: string): boolean {
     wtag = s.slice(h + 1, s.length)
     s = s.slice(0, h + 1)
   }
-  if s != st && !(s == "[]" && st.length > 0 && st[0] == '[') { return false }
+  const every = st == LIST_EVERY_STEP && s.length > 0 && s[0] == '['
+  if s != st && !every && !(s == "[]" && st.length > 0 && st[0] == '[') {
+    return false
+  }
   cellTagsMayAlias(wtag, tag)
+}
+
+// The key step a narrowing of every element of a list is entered under (`xs[*]`), which no
+// subscript spells.
+const LIST_EVERY_STEP = "[*]"
+
+// Whether the cell shape `w` stores only what the element narrowing `nar` admits: its container
+// is a list of a type every value of which is a `nar`, as the checker held each such store to.
+function shapeStoresWithin(w: string, nar: i32): boolean {
+  if nar < 0 { return false }
+  let h = w.length - 2
+  while h >= 0 && !(w[h] == ']' && w[h + 1] == '#') { h = h - 1 }
+  if h < 0 { return false }
+  const tag = w.slice(h + 1, w.length)
+  if tag.length < 3 || tag[1] != 'a' { return false }
+  const e = weDigits(tag.slice(2, tag.length))
+  e >= 0 && !tyIsHole(e) && !tyHasTyVar(e) && assignable(e, nar)
 }
 
 function cellTagsMayAlias(a: string, b: string): boolean {
@@ -5856,7 +5880,11 @@ function shapesHitKey(sum: string, key: string): boolean {
     while s < steps.length {
       if shapeHitsStep(parts[i], steps[s], tags[s]) {
         if s < steps.length - 1 || parts[i][0] == '-' { return true }
-        if lastSafe < 0 {
+        if steps[s] == LIST_EVERY_STEP {
+          if !shapeStoresWithin(parts[i], narrowedPathTyRaw(key)) {
+            return true
+          }
+        } else if lastSafe < 0 {
           lastSafe = 0
           if keyStoresNarrowedTy(key) { lastSafe = 1 }
         }
@@ -5872,6 +5900,7 @@ function shapesHitKey(sum: string, key: string): boolean {
 // Per step of `key`, the cell tag of the container a subscript step reads (`cellTagOfTy` of the
 // type its prefix holds, through the narrowings over it), "" for a field step or when unknown.
 function keyStepTags(key: string, steps: string[]): string[] {
+  if keyIsListEvery(key) { return listEveryTags(key, steps) }
   const out: string[] = []
   const pres = keyStepPrefixTys(key, steps)
   let s = 0
@@ -6479,14 +6508,18 @@ function aliasWriteHitsKey(
 ): boolean {
   const steps = keySteps(key)
   const pres = keyStepPrefixTys(key, steps)
+  const tags = keyStepTags(key, steps)
   let s = 0
   while s < steps.length {
     if (
-      shapeHitsStep(shape, steps[s], keyStepTag(steps[s], pres[s]))
+      shapeHitsStep(shape, steps[s], tags[s])
       && (steps[s][0] != '.' || objTysMayAlias(pres[s], recvTy))
       && !(s == 0 && skip0)
     ) {
       if s < steps.length - 1 { return true }
+      if steps[s] == LIST_EVERY_STEP && shapeStoresWithin(shape, npTy) {
+        return false
+      }
       if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
       // A hole admits every write, which proves nothing about the pin's value (D3197). The
       // else arm of `is T` on one holds the pin's remainder, which a write of no `T` lands in.
@@ -6788,7 +6821,11 @@ function retireNarrowingsForWrite(
     const pfx = root + "["
     let r = 0
     while r < npKeys.length {
-      if keyHasPrefix(npKeys[r], pfx) {
+      // A store through the narrowed list itself is checked against its narrowed element.
+      if (
+        keyHasPrefix(npKeys[r], pfx)
+        && !keyHasPrefix(npKeys[r], root + LIST_EVERY_STEP)
+      ) {
         let rprev = -1
         if npInvBy[r] < 0 { rprev = npTys[r] }
         narSetInv(r, atIx)
@@ -7884,16 +7921,19 @@ function crRetireAt(
 let nfSlots: i32[] = []
 let nfNames: string[] = []
 
-// Push a path entry `name.f` for each field the record `nt` stores narrower than another member of
-// the union `declTy` that contains it, so the path rules decide when a write through another place
-// ends `name` too. Members that cannot hold an `nt` cannot hold the object, and need none.
+// Push a path entry `name.f` for each field the record `nt` stores narrower than the record
+// `declTy` or another member of the union `declTy`, so the path rules decide when a write through
+// another place ends `name` too. Members that cannot hold an `nt` need none. A list narrowed by
+// its elements gets `name[*]` per nesting depth instead (`narFitElems`).
 function narFitCompanions(name: string, declTy: i32, nt: i32) {
   while nfSlots.length > 0 && nfSlots[nfSlots.length - 1] >= npKeys.length {
     nfSlots.pop()
     nfNames.pop()
   }
+  if nt < 0 || declTy < 0 { return 0 }
   const r = T.tys[nt]
   if r is TyObj { narFitFields(name, declTy, nt, r) }
+  narFitElems(name, declTy, nt)
   0
 }
 
@@ -7903,8 +7943,108 @@ function narFitFields(name: string, declTy: i32, nt: i32, r: TyObj) {
   if dt is TyNullable { wide = dt.nInner }
   if wide < 0 { return 0 }
   const u = T.tys[wide]
-  if u is TyUnion { narFitMembers(name, nt, r, u.uMembers) }
+  narFitMembers(name, nt, r, if u is TyUnion { u.uMembers } else { [wide] })
   0
+}
+
+// A list `name` declared `declTy` and narrowed to `nt` (`xs is K[]`) holds its narrowing only
+// while no element is written wider, so each nesting depth whose element `nt` narrows gets an
+// entry `name[*]…[*]` the path rules end at a store or an append through any alias (D4926).
+function narFitElems(name: string, declTy: i32, nt: i32) {
+  const d0 = nonNullTy(declTy)
+  if d0 < 0 { return 0 }
+  const du = T.tys[d0]
+  const mems = if du is TyUnion { du.uMembers } else { [d0] }
+  for m in mems {
+    if narFitElemsOf(name, m, nonNullTy(nt)) { return 0 }
+  }
+  0
+}
+
+// `narFitElems` against one declared list `d`: pushes the entries and answers true when some
+// depth of `d` holds wider elements than `n`.
+function narFitElemsOf(name: string, d0: i32, n0: i32): boolean {
+  let d = d0
+  let n = n0
+  const keys: string[] = []
+  const tys: i32[] = []
+  let key = name
+  while d >= 0 && n >= 0 && T.tys[d] is TyArray && T.tys[n] is TyArray {
+    const da = T.tys[d]
+    const na = T.tys[n]
+    if da is TyArray && na is TyArray {
+      key = key + LIST_EVERY_STEP
+      keys.push(key)
+      tys.push(na.aElem)
+      d = da.aElem
+      n = na.aElem
+    }
+  }
+  if keys.length == 0 || d < 0 || n < 0 || tySame(d, n) { return false }
+  let i = 0
+  while i < keys.length {
+    nfSlots.push(npKeys.length)
+    nfNames.push(name)
+    npKeys.push(keys[i])
+    npTys.push(tys[i])
+    npInvBy.push(-1)
+    npEpochs.push(narFnEpoch)
+    npSettle.push(-2)
+    npCapBy.push(-1)
+    npAsg.push(0)
+    i = i + 1
+  }
+  true
+}
+
+// `keyStepTags` for an element entry: the tags of the list as declared, since the narrowing
+// says what its cells hold now and not which other lists may be the same object.
+function listEveryTags(key: string, steps: string[]): string[] {
+  const root = placeRootOf(key)
+  let t = narDeclaredTy(root, -1)
+  if t < 0 { t = lookup(root) }
+  const out: string[] = []
+  for st in steps {
+    t = listUnionWidest(t)
+    out.push(keyStepTag(st, t))
+    if t >= 0 { t = placeElemTy(t) }
+  }
+  out
+}
+
+// The member of a union of lists `t` whose element every other member's element is assignable
+// to, which may alias whatever any member may; `t` itself when there is none or it is no union.
+function listUnionWidest(t: i32): i32 {
+  const n = nonNullTy(t)
+  if n < 0 { return t }
+  const u = T.tys[n]
+  if !(u is TyUnion) { return t }
+  for m in u.uMembers {
+    if m < 0 { return t }
+  }
+  for m in u.uMembers {
+    const mt = T.tys[m]
+    if mt is TyArray {
+      let all = true
+      for o in u.uMembers {
+        const ot = T.tys[o]
+        if !(ot is TyArray) || !assignable(ot.aElem, mt.aElem) { all = false }
+      }
+      if all { return m }
+    }
+  }
+  t
+}
+
+// Whether the overlay key `k` is an element entry `narFitElems` pushed.
+function keyIsListEvery(k: string): boolean {
+  k.length > LIST_EVERY_STEP.length
+    && k.slice(k.length - LIST_EVERY_STEP.length, k.length) == LIST_EVERY_STEP
+}
+
+// Whether the overlay key `k` is a companion entry of the bare name `name`: a field or an element.
+function narFitKeyOf(k: string, name: string): boolean {
+  keyHasPrefix(k, name + ".") || keyHasPrefix(k, name + LIST_EVERY_STEP)
 }
 
 // The fields of `r` (the record `nt`) a member of `mems` that holds every `nt` stores wider.
@@ -7956,7 +8096,7 @@ function narFitNameOf(slot: i32): string {
     if (
       nfSlots[j] == slot
       && slot < npKeys.length
-      && keyHasPrefix(npKeys[slot], nfNames[j] + ".")
+      && narFitKeyOf(npKeys[slot], nfNames[j])
     ) {
       return nfNames[j]
     }
@@ -7973,7 +8113,7 @@ function narFitRetire(slot: i32, atIx: i32, loopIx: i32) {
     if (
       nfSlots[j] == slot
       && slot < npKeys.length
-      && keyHasPrefix(npKeys[slot], nfNames[j] + ".")
+      && narFitKeyOf(npKeys[slot], nfNames[j])
     ) {
       if loopIx >= 0 {
         crRetire(nfNames[j], atIx, true, loopIx)
@@ -8581,6 +8721,38 @@ function crFirstWritingCall(ix: i32, name: string): i32 {
   -1
 }
 
+// `crFirstWritingCall` for an element entry `key`: a `push` on the narrowed list itself is
+// checked against its narrowed element, so only its arguments are asked.
+function crFirstElemWritingCall(ix: i32, key: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  let own = false
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Member {
+      const ro = P.nodes[peelParenIx(cf.memObj)]
+      if ro is Ident {
+        own = cf.memProp == "push" && key == ro.identName + LIST_EVERY_STEP
+      }
+    }
+  }
+  if !own && (n is Call || crIsDispatchSite(ix)) {
+    if callMayWrite(ix, key) { return ix }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const c = crFirstElemWritingCall(kids[k], key)
+      if c >= 0 { return c }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
 // A loop re-runs the reads before a call after it, so a narrowing live at the loop that a call
 // anywhere in the loop may end ends before the loop starts, in both halves.
 function crLoopPreRetire(loopIx: i32) {
@@ -8616,13 +8788,20 @@ function crLoopPathPreRetire(loopIx: i32) {
       && npEpochs[s] == narFnEpoch
       && narrowedPathIx(npKeys[s]) == s
     ) {
-      const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
+      let a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
+      // A `for` over a list reads its next element at the loop's top, after the body's calls,
+      // which no read check in the body sees; so an element narrowing a call may end ends here.
+      let byCall = false
+      if a < 0 && keyIsListEvery(npKeys[s]) {
+        a = crFirstElemWritingCall(loopIx, npKeys[s])
+        byCall = a >= 0
+      }
       if a >= 0 {
         narSetInv(s, a)
         if nfSlots.length > 0 { narFitRetire(s, a, loopIx) }
         noteKillSure(a, npKeys[s])
         npSettle[s] = -1
-        crAliasWr[a] = true
+        if !byCall { crAliasWr[a] = true }
         crLoopMapCellPresent(npKeys[s], a)
         crRetNames.push(npKeys[s])
         crRetCalls.push(a)
@@ -8720,10 +8899,18 @@ function loopWriteMayReach(tgt: i32, val: i32, key: string, pre: i32): boolean {
   let same = false
   if t is Member { same = last == "." + t.memProp }
   if t is Index {
+    // A store through the narrowed list itself is checked against its narrowed element.
+    if last == LIST_EVERY_STEP && steps.length == 1 {
+      const ra = P.nodes[peelParenIx(t.idxArr)]
+      if ra is Ident {
+        if ra.identName == placeRootOf(key) { return false }
+      }
+    }
     // A literal subscript names its cell, as the straight-line rule reads it (D3317).
     if tk != "" {
       const tsteps = keySteps(tk)
       same = tsteps.length > 0 && tsteps[tsteps.length - 1] == last
+      if last == LIST_EVERY_STEP { same = true }
     } else {
       same = last[0] == '['
     }
@@ -42900,6 +43087,35 @@ export function listFitLitLeafOf(testTy: i32, recvTy: i32, layers: i32[]): i32 {
   for g in got { layers.push(g) }
   layers.push(rt)
   tt
+}
+
+// The number of list layers `recvTy` and `testTy` share before their element types can never
+// meet: two distinct primitives, or a list against a primitive (D4910). -1 when they may meet,
+// or when either is not a list.
+export function listDisjointDepth(recvTy: i32, testTy: i32): i32 {
+  let r = recvTy
+  let t = testTy
+  let d = 0
+  while r >= 0 && t >= 0 {
+    const ra = T.tys[r]
+    const ta = T.tys[t]
+    if !(ra is TyArray) || !(ta is TyArray) { break }
+    r = ra.aElem
+    t = ta.aElem
+    d = d + 1
+  }
+  if d == 0 || r < 0 || t < 0 { return -1 }
+  // The loop left at most one side a list, so a primitive against a list is the other case.
+  const rp = tyPrimNameOf(r)
+  const tp = tyPrimNameOf(t)
+  if rp != null && tp != null && rp != tp { return d }
+  if (
+    (rp != null && T.tys[t] is TyArray)
+    || (tp != null && T.tys[r] is TyArray)
+  ) {
+    return d
+  }
+  -1
 }
 
 // The element type name of the array the checker recorded for node `ix` (e.g. `"f64"`, an

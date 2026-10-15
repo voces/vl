@@ -37,6 +37,7 @@ import {
   intMatchHeadAt,
   isNumIntrinsicName,
   isVarTyIxOf,
+  listDisjointDepth,
   listFitLitLeafOf,
   listWidenRetagAny,
   listWidenRetagRowsOf,
@@ -3487,6 +3488,339 @@ function listFitRepMiss(isIx: i32): string {
   ""
 }
 
+// `xs is K[]` where, at some list depth, the elements of `xs` and of `K[]` can never meet: true
+// exactly when every list at that depth is empty (D4910, by the D4771 ruling). 0, leaving the
+// static fold, when not that shape or when the function reads `xs` at a type it cannot have
+// (an arm the test narrowed, D4911); 1 when emitted, -1 when refused.
+function emitListEmptyFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return 0 }
+  if nd.isVariant == "null" || exprUnion(nd.isObj, fnIx) { return 0 }
+  if nodeTyIsNullable(nd.isObj) { return 0 }
+  const declTy = nodeTyIxOf(nd.isObj)
+  const recvTy = if declTy < 0 || tyHasTyVar(declTy) { exactOperandTyOf(nd.isObj, fnIx) } else { declTy }
+  const depth = listDisjointDepth(recvTy, isVarTyIxOf(isIx))
+  if depth < 1 || listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy) {
+    return 0
+  }
+  const slots: i32[] = []
+  let kind: MfKind = "i32"
+  let slot = 0
+  if exprRefArray(nd.isObj, fnIx) {
+    let s = refListSlotOfExpr(nd.isObj, fnIx)
+    let k = 1
+    kind = "ref"
+    while k < depth {
+      if s < 0 || s >= rlElemKindTbl.length || rlElemNullable[s] != 0 {
+        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+      }
+      slots.push(s)
+      const ek = rlElemKindTbl[s]
+      if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+      else if k == depth - 1 && ek == RLK_I32_LIST { kind = "i32" }
+      else if k == depth - 1 && ek == RLK_STR_LIST { kind = "str" }
+      else if k == depth - 1 && ek == RLK_F64_LIST { kind = "f64" }
+      else if k == depth - 1 && ek == RLK_I64_LIST { kind = "i64" }
+      else if k == depth - 1 && ek == RLK_F32_LIST { kind = "f32" }
+      else if k == depth - 1 && ek == RLK_U8_LIST { kind = "u8" }
+      else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+      k = k + 1
+    }
+    if kind == "ref" {
+      if s < 0 || s >= rlWrapIdx.length {
+        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+      }
+      slot = s
+    }
+  } else if depth > 1 {
+    return emitFailAt(LIST_FIT_REP_MSG, isIx)
+  } else if exprStringArray(nd.isObj, fnIx) {
+    kind = "str"
+  } else {
+    const lek = scalarListElemKind(nd.isObj, fnIx)
+    if lek == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
+    kind = listIdxKindOf(lek)
+  }
+  if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+  emitListEmptyLoop(slots, 0, kind, slot)
+  1
+}
+
+// Whether function `fnIx` may read the receiver `recv` of the `is` at `isIx` as the narrowed
+// type, which the instance's value cannot carry, so the arm is only sound folded away (D4911):
+// a read typed disjoint from `instTy`, or any read in a region the `is` narrows. A field
+// receiver counts every read of a field of the same name.
+function listNarrowReadDisjoint(
+  fnIx: i32,
+  isIx: i32,
+  recv: i32,
+  instTy: i32,
+): boolean {
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return true }
+  const r = P.nodes[unwrapParen(recv)]
+  if r is Member {
+    return narrowReadsName(fn.fnBody, isIx, r.memProp, true, instTy)
+  }
+  if r is Ident {
+    return narrowReadsName(fn.fnBody, isIx, r.identName, false, instTy)
+  }
+  // Flow narrows only an identifier or a field; any other receiver names nothing, so no read matches.
+  narrowReadsName(fn.fnBody, isIx, "", false, instTy)
+}
+
+function narrowReadsName(
+  body: i32,
+  isIx: i32,
+  name: string,
+  field: boolean,
+  instTy: i32,
+): boolean {
+  if name == "" { return false }
+  narrowReadDisjointUnder(body, name, field, instTy)
+    || narrowRegionReads(body, isIx, name, field) == 2
+}
+
+// Where `isIx` sits under `ix`: 0 not there, 2 when a region it narrows reads `name` (an `if`
+// or `while` body or else, the right of an `&&`/`||`, and the block's later statements after an
+// `if` whose condition negates the test), 3 for that negated `if` before its block is read,
+// else 1. A later `is` over the same receiver is not a read.
+function narrowRegionReads(
+  ix: i32,
+  isIx: i32,
+  name: string,
+  field: boolean,
+): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if ix == isIx { return 1 }
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    const c = narrowRegionReads(n.ifCond, isIx, name, field)
+    if c == 0 {
+      const t = narrowRegionReads(n.ifThen, isIx, name, field)
+      if t != 0 { return t }
+      return narrowRegionReads(n.ifElse, isIx, name, field)
+    }
+    if (
+      c == 2
+      || nodeReadsName(n.ifThen, name, field)
+      || nodeReadsName(n.ifElse, name, field)
+    ) {
+      return 2
+    }
+    return if condNegates(n.ifCond, isIx) { 3 } else { 1 }
+  }
+  if n is WhileStmt {
+    const c = narrowRegionReads(n.whileCond, isIx, name, field)
+    if c == 0 { return narrowRegionReads(n.whileBody, isIx, name, field) }
+    if c == 2 || nodeReadsName(n.whileBody, name, field) { return 2 }
+    return if condNegates(n.whileCond, isIx) { 3 } else { 1 }
+  }
+  if n is BinExpr && (n.binOp == "&&" || n.binOp == "||") {
+    const c = narrowRegionReads(n.binLeft, isIx, name, field)
+    if c == 0 { return narrowRegionReads(n.binRight, isIx, name, field) }
+    if c == 2 || nodeReadsName(n.binRight, name, field) { return 2 }
+    return c
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    const k = narrowRegionReads(kids[i], isIx, name, field)
+    if k == 3 && n is Block {
+      let j = i + 1
+      while j < kids.length {
+        if nodeReadsName(kids[j], name, field) { return 2 }
+        j = j + 1
+      }
+      return 1
+    }
+    if k != 0 { return k }
+    i = i + 1
+  }
+  0
+}
+
+// Whether the condition `ix` holds the test `isIx` under an odd number of negations, counting
+// `!` and a `!is` itself.
+function condNegates(ix: i32, isIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if ix == isIx { return n is IsExpr && n.isNeg != 0 }
+  if n is Unary && n.unOp == "!" { return !condNegates(n.unArg, isIx) }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeContains(kids[i], isIx) { return condNegates(kids[i], isIx) }
+    i = i + 1
+  }
+  false
+}
+
+function nodeContains(ix: i32, target: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if ix == target { return true }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeContains(kids[i], target) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `name` is read anywhere under `ix`, as an identifier or, for a `field`, a member; the
+// receiver of an `is` is not a read.
+function nodeReadsName(ix: i32, name: string, field: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if field && n is Member && n.memProp == name { return true }
+  if !field && n is Ident && n.identName == name { return true }
+  if n is IsExpr {
+    const r = P.nodes[unwrapParen(n.isObj)]
+    if !field && r is Ident && r.identName == name { return false }
+    if field && r is Member && r.memProp == name {
+      return nodeReadsName(r.memObj, name, field)
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeReadsName(kids[i], name, field) { return true }
+    i = i + 1
+  }
+  false
+}
+
+function narrowReadDisjointUnder(
+  ix: i32,
+  name: string,
+  field: boolean,
+  instTy: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  const hit = if field { n is Member && n.memProp == name } else { n is Ident && n.identName == name }
+  if hit {
+    const t = nodeTyIxOf(ix)
+    if t >= 0 && listDisjointDepth(instTy, t) >= 1 { return true }
+  }
+  const kids = nodeChildren(ix)
+  if n is Block && !field {
+    let j = 0
+    while j < kids.length {
+      if kids[j] >= 0 {
+        const s = P.nodes[kids[j]]
+        if s is LetDecl && s.letName == name { return false }
+      }
+      j = j + 1
+    }
+  }
+  let i = 0
+  while i < kids.length {
+    if narrowReadDisjointUnder(kids[i], name, field, instTy) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether every list at nesting `at` and below of the list on the stack is empty, leaving 1 or
+// 0: `slots[at]`'s ref list is walked while `at` is inside `slots`, and the innermost list, of
+// frame kind `kind` (ref-list row `slot` for a ref list), answers by its length.
+function emitListEmptyLoop(slots: i32[], at: i32, kind: MfKind, slot: i32) {
+  if at >= slots.length {
+    emitListLenOnStack(kind, slot)
+    fbI32Eqz()
+    return 0
+  }
+  const s = slots[at]
+  const wL = listFitSlot("ref", s, 11)
+  const bL = listFitSlot("ref", s, 3)
+  const nL = listFitSlot("i32", 0, 4)
+  const iL = listFitSlot("i32", 0, 4)
+  fbLocalSet(wL)
+  fbLocalGet(wL)
+  fbStructGet(rlWrapIdx[s], 0)
+  fbLocalSet(bL)
+  fbLocalGet(wL)
+  fbStructGet(rlWrapIdx[s], 1)
+  fbLocalSet(nL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block (result i32) { loop { 1 if i >= n; 0 unless list i is empty; i += 1 } }
+  fbBlock(127)
+  fbLoop(64)
+  fbI32Const(1)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbDrop()
+  fbI32Const(0)
+  fbLocalGet(bL)
+  fbLocalGet(iL)
+  fbArrayGet(rlBackIdx[s])
+  emitListEmptyLoop(slots, at + 1, kind, slot)
+  fbI32Eqz()
+  fbBrIf(1)
+  fbDrop()
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbUnreachable()
+  fbEnd()
+  0
+}
+
+// Replace the list on the stack, of frame kind `kind` (ref-list row `slot` for a ref list), by
+// its length, reading a view's length through its helper as `.length` does.
+function emitListLenOnStack(kind: MfKind, slot: i32) {
+  if kind == "ref" {
+    if rvMayView(slot) {
+      const rwL = listFitSlot("ref", slot, 11)
+      fbLocalSet(rwL)
+      rvTestView(rwL)
+      fbIf(127) // i32
+      fbLocalGet(rwL)
+      fbCall(gHelpRvLen)
+      fbElse()
+      fbLocalGet(rwL)
+      fbStructGet(rlWrapIdx[slot], 1)
+      fbEnd()
+      return 0
+    }
+    fbStructGet(rlWrapIdx[slot], 1)
+    return 0
+  }
+  if kind == "str" {
+    fbStructGet(mkListIdx, 1)
+    return 0
+  }
+  if kind == "i32" {
+    fbStructGet(lTypeIdx, 1)
+    return 0
+  }
+  const lek: VKind = if kind == "f64" { "f64" } else if kind == "i64" { "i64" } else if kind == "f32" { "f32" } else { "u8list" }
+  const sv = svDstOfKind(lek)
+  if sv >= 0 {
+    const lwL = listFitSlot(kind, 0, 11)
+    fbLocalSet(lwL)
+    svTestView(lwL, sv)
+    fbIf(127) // i32
+    fbLocalGet(lwL)
+    fbCall(gHelpSvLen[sv])
+    fbElse()
+    fbLocalGet(lwL)
+    fbStructGet(scalarListWrap(lek), 1)
+    fbEnd()
+    return 0
+  }
+  fbStructGet(scalarListWrap(lek), 1)
+  0
+}
+
 // The fit loop over the list on the stack at nesting `at`: `slots[at]`'s ref list while `at`
 // is inside `slots`, else the `scalarKind` list. Leaves 1 when every element fits, else 0.
 // A `nullable` list leaves 0 when it is null.
@@ -4523,6 +4857,11 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   if nd0 is IsExpr {
     const st = monoStaticIsResult(isIx, fnIx)
+    if st == 0 {
+      const ef = emitListEmptyFitIs(body, isIx, fnIx)
+      if ef < 0 { return -1 }
+      if ef > 0 { return 0 }
+    }
     if st >= 0 {
       fbI32Const(st)
       return 0
