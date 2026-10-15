@@ -3220,6 +3220,84 @@ the checker.
 **Next, in order:** the untyped remainders above, each by its minting pass; then the typed
 remainders of §13.21 (`_[] | null`, `d3140_*`); then items 2, 4 and 5 of §13.14.
 
+### 13.23 A capture cell's read carries the type the name read had
+
+This step takes the 751 untyped `Index` notes §13.22 left in `tests/cases`, split 365
+`reflist`, 198 `list`, 95 `i64list`, 73 `f64list` and 20 `strlist`. They are in nine files,
+not the five §13.22 named: `capture-union-list-literal-reassign.vl` 266,
+`capture-union-closure-write-member-grid.vl` 260, `capture-ref-array-assign.vl` 99,
+`capture-nullable-closure-null-write.vl` 53, `capture-mutation-init-kinds.vl` 26,
+`capture-nullable-scalar-list-tail-write.vl` 20, and 9 each in `union-copy-captured.vl`,
+`captured-inferred-union-binding-cell.vl` and `capture-by-reference.vl`.
+
+**Mechanism.** The minting-pass probe puts all 751 in `captureBoxRewrite`. The ablated witness is
+
+```
+function g() {
+  let xs = [1, 2]
+  const f = () => { xs = [3] }
+  f()
+  print(xs.length)
+}
+g()
+```
+
+A binding a closure writes becomes a one-element cell, and each read `xs` is rewritten to
+`c[0]` (`cboxWalk`). The cell `c` recorded the list type of the cell, and a store target `c[0]`
+was typed by the `BinExpr` arm. The read `c[0]` recorded nothing, so `nodeTyInOf` answered
+`-1` there. Both ingredients are needed: a binding written inside a closure, and a read of it.
+The same read without the closure write is not rewritten.
+
+A read `c[0]` now records the type the checker gave the `Ident` it replaces. That is the read's
+own type, narrowing included, so it agrees with what the classifier ladder already answers.
+Two other choices were tried and refused:
+
+* The cell's element type (`tyArrayElemIx` of the cell's type) removes the same 751 notes but
+  adds others. A union cell read where it has been narrowed asks the ladder for one member's
+  rep and the column for the union's, and nullable list cells move to the `narrowed` family.
+* Typing a function-valued read refuses `capture-by-reference.vl` at emit: "the reassigned
+  function binding `f` holds functions called at more than one argument type". The check that
+  refuses it (`monoBindSigFail`) counts a typed cell read of `f` as a call site. So a read whose
+  type is a function type stays untyped. A function read never asks a list question, so this
+  leaves no `listRep` note behind. The minimised program needs about 90 lines of the file; a
+  six-line `let f = () => 1; const gf = () => f(); f = () => 2` alone does not refuse.
+
+A literal-union read needed no exclusion once store targets are skipped: the earlier failure at
+`captured-litunion-assign.vl:38` came from typing the store target.
+
+**Checks.** The seed is 5,593,420 bytes, +122 over master's fixpoint at f854256e9 (5,593,298).
+
+* Over 15,167 files, 10,208 built, 0 differ and 0 are uncompared, and the candidate compiles
+  master's compiler source to master's fixpoint (`difftree --identity`).
+* D2413 and D3356 close; neither witness is in that population. Both refused because a cell
+  read had no type for the classifiers to read: `.length`, an index and a `for … in` over a
+  `u8[]` cell found no byte list, and `print` of an `AB | null` cell found no member texts.
+  Each now runs, plain and under a null check, pinned by
+  `captured-cell-u8-list-read.vl` and `captured-cell-nullable-litunion-print.vl`.
+* Native fixpoint holds: stage3 == stage4 byte-for-byte.
+* `rep-fuzz-check` is exact, `regress.vl` loses no runs, `lint-self` raises no budget, and
+  `seed-size --check` passes (+2.1% over its baseline).
+
+**Counts.** `listRep` notes from the same probe, keyed by node kind, minting pass and type. Both
+probe seeds were built on the same base:
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| `tests/cases` | untyped `Index`, LEFT-ONLY | 751 (9 files) | 0 |
+| `tests/cases` | like-for-like LEFT-ONLY | 1,376 | 625 |
+| distilled `named/` | every note | unchanged | unchanged |
+
+Per file and family, no other note count moved in either population.
+
+**What is left untyped.** In `tests/cases`: 98 `ArrayLit` notes minted by the checker, 41 `Call`
+notes minted by mono, 2 `IfStmt` notes minted by mono (`join-type-param-list-in-body.vl`) and 1
+`BinExpr.right` minted after the last pass. In `named/`: the 90 `d3125_*` `IfStmt` notes and 24
+`ArrayLit` notes, both minted by mono.
+
+**Next, in order:** the mono `IfStmt` notes (92 over both populations), then the checker's
+`ArrayLit` packs, then the 41 `Call` notes; then the typed remainders of §13.21 (`_[] | null`,
+`d3140_*`); then items 2, 4 and 5 of §13.14.
+
 ### 13.24 Three nodes minted untyped record their type: a re-made `if` link, a rest pack, a re-made call
 
 This step takes the untyped remainders §13.22 named, each by the pass that minted it. The
