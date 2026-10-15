@@ -438,3 +438,27 @@ Deno.test({
   const gEntry = scopeCompletionsFromBindings(okBinds).find((c) => c.name === "g");
   assertEquals(gEntry?.detail, "(i32) => i32", "healthy detail survives");
 });
+
+// An empty `[]` nothing pins closes to the `i32` element for its rep only: hover still shows the
+// blank, since the node's recorded type keeps the hole (rep-descriptor-campaign §13.27).
+Deno.test({
+  name: "undisplayable: a closed empty-list hole still shows `_[]`",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const src = `function t() { 1 == 1 }
+function mk() { return [] }
+function f() {
+  const x = if t() { [] } else { null }
+  print(x == null)
+}
+f()
+print(mk().length)
+`;
+  const hover = async (line: number, col: number) =>
+    displayableType(await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col));
+  assertEquals(await hover(3, 8), "_[] | null", "binding hover");
+  assertEquals(await hover(1, 10), "() => _[]", "function hover");
+  const diags = await checker.check(src, "/tmp/x.vl", noSiblings);
+  assertEquals(diags.map((d) => d.message), [], "no diagnostic");
+});
