@@ -292,9 +292,10 @@ Deno.test({
         await Deno.copyFile(`${ROOT}/scripts/${f}`, `${dir}/scripts/${f}`);
       }
       // Sorted order matters to the fold: a name that sorts before `a.vl` by byte but after it
-      // by locale would be hashed differently.
+      // by locale would be hashed differently. `C` differs from `b` in more than case, so a
+      // case-insensitive filesystem (macOS) keeps all three files.
       await Deno.writeTextFile(`${dir}/compiler/b.vl`, SRC);
-      await Deno.writeTextFile(`${dir}/compiler/B.vl`, SRC + "// upper\n");
+      await Deno.writeTextFile(`${dir}/compiler/C.vl`, SRC + "// upper\n");
       await Deno.writeTextFile(`${dir}/compiler/a_x.vl`, "// ünï\n" + SRC);
       await Deno.writeTextFile(`${dir}/compiler/notes.txt`, "not a source\n");
       await Deno.writeTextFile(`${dir}/survey.md`, DOC);
