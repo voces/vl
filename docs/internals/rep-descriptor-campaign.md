@@ -3829,3 +3829,109 @@ are re-asks of `vs` now that its literal answers the ref list. The `d3125_gen`/`
 * The scope callers.
 * `["p", 1] + ["q"]` refuses at emit (`the two operands of this list + do not resolve to one list
   rep`), while `["p", 1] + ["q", 2]` runs. This is a clause-2 candidate and is not yet filed.
+
+### 13.30 A join of two type parameters' lists stays apart at a pin that stores them differently
+
+After §13.29 the like-for-like DIFF class in `named/` is 24 `reflist -> list` notes in four
+cells: `rv3310_{i_in,in_i}__{chain,match}__none__arrj__isall__tp`. The receiver in each is a
+`<T>` function's join of two lists, `T0[] | T1[]`, pinned at `i32` and `i32 | null`. The column
+answers the ref list and the ladder answers `list`. **Neither is the defect.** All four cells are
+check-clean invalid wasm on master (D3367).
+
+**The cause is the pin's re-join.** The body keeps the join of `T0[]` and `T1[]` apart (D2760,
+`tpJoinUnions`), and `substTyDeep` re-joins the members at the instance through `rejoinMembers`
+→ `joinTys`. At `T0 := i32`, `T1 := i32 | null`, `joinTys` collapses `i32[] | (i32 | null)[]`
+onto `(i32 | null)[]`. The instance then builds a list of boxes and hands back the `i32` list
+where that list is wanted. The direct spelling refuses the same join (`listJoinWidenCheck`), so
+the pin was admitting a join the language does not make.
+
+**Design.** `rejoinMembers` takes `allOpen`, which says every member the body joined was open in
+a type parameter (`membersAllOpen`, over the members before substitution). With it set, each
+step goes through `rejoinListApart`. That function keeps the step's join unless the join
+collapsed onto a list that one side's elements are stored differently in
+(`listJoinStorageDiffers`). In that case the two members stay apart (`joinVariantTys`), as the
+body's join did. Both of `substTyDeep`'s re-join sites, the union and the nullable, pass the
+flag.
+
+**What it moved.** A first version had no `allOpen` gate. It made two fixtures invalid wasm:
+`generics/generic-body-list-union-read-ops.vl` and `generics/generic-body-narrowed-list-read-value.vl`.
+There, a concrete member is a `[1, 2, 3]` literal that the join must adapt to `T := f64`. Keeping
+it apart left the literal as an `i32` list beside an `f64` list. The gate restricts the change to
+joins where no member is concrete, and both fixtures run again.
+
+With the gate:
+
+* D3367's `<T>` face runs (`7`, `4`).
+* Its hole face (`ug_*`, `error-hole-…`) is now a loud check reject at each call, in D3368's
+  wording (`cannot index non-array i32[] | (i32 | null)[] (the body of `g` at the call's argument
+  types)`).
+* [D3367](inventory/D3367.md) is closed, with the fixtures
+  `generics/type-param-list-join-storage-apart.vl` and `generics/error-hole-list-join-storage-apart.vl`.
+
+The sibling with one concrete member, a type parameter's list joined with an `i32[]` parameter,
+still collapses at an `i32 | null` pin. It was invalid wasm on master too. It is filed open as
+[D4862](inventory/D4862.md), where its ablation shows the literal the gate exists for.
+
+The four cells' `reflist -> list` notes go. `rv3310_in_i__{chain,match}` now carry 4
+`reflist -> none` notes each. These have the shape `rv3310_in_b_s` already had: a join of two
+lists the column calls none, since the node's type is now the union.
+
+**The 7 `rv3310_*` `trap_loads -> trap_loads` movements are stale messages, not defects.** Each
+cell traps at the same instruction in the same function. Only the wasm backtrace offset in the
+baseline message moved (for example `0x1b1` to `0x1b3`), because master's emitter changed since
+the baseline was written. They are the same 7 cells §13.29 reported, and they are already filed:
+
+* `rv3310_{in_b_s,s_b_i,s_b_k}__match` under open D3346;
+* `rv3310_{list_scalars,list_plus_scalar}__{in_sn,is_sn}__isall` under open D3361.
+
+The baseline is rewritten through `regress.vl --write-baseline` (`dumpCells`). It changes those 7
+rows, the 4 cells that now run, and the 20 hole cells, and no others.
+
+**Counts.** `listRep` notes, base master `e2d96e401` (§13.29), candidate this change.
+
+| population | row | before | after |
+| --- | --- | --- | --- |
+| distilled `named/` | DIFF `reflist -> list` (4 cells) | 24 | 0 |
+| distilled `named/` | `reflist -> none` | 4 | 12 |
+| distilled `named/` | DIFF `reflist -> unc` (`d3140_r2_sb_*`) | 128 | 128 |
+| `tests/cases` | DIFF `reflist -> list` (the new `<T>` fixture only) | 21 | 0 |
+| `tests/cases` | DIFF, other | 12 | 12 |
+| `tests/cases` | `-> none` | 60 | 68 |
+
+The new `<T>` fixture, on the base compiler, carries 21 `reflist -> list` notes. On the
+candidate it carries 8 `reflist -> none` notes. No other (file, note) line in `tests/cases`
+changes. The narrowed, `open` and `scope` families are unchanged in both populations.
+
+**Checks.** Rebased on master `e2d96e401`. The base fixpoint is 5,710,258 bytes and the
+candidate 5,710,509, +251.
+
+* `difftree --identity` over master's 15,182 files: the candidate compiling master's source gives
+  master's fixpoint. **10,224 built, 26 differ, 0 uncompared.** The 26 are the change's own:
+  * the 2 new fixtures;
+  * the 4 `rv3310` `<T>` cells (invalid wasm → runs);
+  * D3367's 20 `ug_*` hole cells (invalid wasm → a check reject):
+    `ug_{i_in,in_i,k_s}__{chain,match}__none__arrj__{is,print,isall}__hole` and
+    `ug_rv3313_g2_{li_lf,li_lin,lin_li}__{idx,len}__bind__hole`.
+* Native fixpoint holds at 5,710,509 bytes.
+* `regress.vl`: 0 runs lost, 0 to silent. There are 31 other movements: the 4 cells now running,
+  the 20 hole cells now refused, and the 7 stale trap messages.
+* `rep-fuzz-check` is exact, with 0 baselined failures.
+* `lint-self` is clean, `seed-size --check` passes (+1.1% on its baseline), and the sentinel budget
+  holds.
+* `check-filed-witnesses --strict` over both inventories: 2,762 graded, 2,762 as filed, 0 moved.
+* `SELFHOST_NATIVE_ALIGN=1` over `tests/selfhost_native_*_test.ts`: 5,242 passed, 0 failed.
+
+**Next.**
+* The `-> none` class: 68 in `tests/cases` (8 of them the new fixture's), and in `named/` the 12
+  `rv3310_in_*` notes on a join of lists.
+* The smaller DIFF classes in `tests/cases`:
+  * `f32list -> f64list`, 3 notes, `f32-literal-tails-of-value-if.vl`;
+  * `f64list -> list`, 3 notes, `for-in-generic-call-result-at-pin.vl`;
+  * a generic call's `list -> reflist`, 6 notes: `generic-list-literal-inferred-return.vl` (5) and
+    `inferred-nullable-type-param-list.vl` (1).
+* The `unc` notes, where the column does not cover the node: `reflist -> unc` 128 in `named/` and
+  55 in `tests/cases`, and `list -> unc` 14 in `tests/cases`.
+* D4862, the one-concrete-member re-join. D3368, the wording of a refusal at a pin.
+* The `if` join recorded as `T[]` at a pin (D2832).
+* The narrowed family, and the scope callers.
+* `["p", 1] + ["q"]`, the emit refusal over two list reps.

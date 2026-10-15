@@ -288,18 +288,13 @@ import {
   opDeclOpOf,
   orderArgsByParamNames,
   ovCandText,
-  ovCandsText,
   ovDemangle,
   ovFnHead,
-  ovHeadsOverlap,
   ovInstPick,
   ovInstRecv,
   ovInstSite,
-  ovPlainSetOf,
-  ovPrimClass,
   ovSetCands,
   ovSetMod,
-  ovSetName,
   ovSiteSetOf,
   paramDefaultIsCallsite,
   recDupField,
@@ -328,7 +323,6 @@ import {
   ufcsImpSpec,
   ufcsModOfNode,
   ufcsSiteAdd,
-  ufcsSpecAlreadyImported,
   valueIfAdd,
 } from "./ast"
 // A node's source span: its first token, its last token on that first line, and a token's
@@ -415,7 +409,6 @@ import {
 import {
   annGenAppSpanEnds,
   arrElemNameRaw,
-  demangleSpelling,
   fieldNameOf,
   fieldTypeTextOf,
   fnParamsTextOf,
@@ -521,6 +514,7 @@ import {
   cVariantMemberTyIxs,
   canonIntLexeme,
   ctxKeepsLitUnion,
+  demangleMsg,
   gaAppArgCount,
   gaAppArgFlat,
   gaAppArgStart,
@@ -529,6 +523,7 @@ import {
   gaAppTyIxSet,
   gaAppTyIxs,
   genAppNameOfTy,
+  inlineLitUnionPrefix,
   litBaseTy,
   litMemberTy,
   litUnionAliasNameOfTy,
@@ -601,7 +596,6 @@ import {
   tyIsPrimNamed,
   tyIsStructBearingUnion,
   tyIsWidePrim,
-  tyIxIsFunc,
   tyIxIsView,
   tyLitMemberTexts,
   tyLitUnionIsI32Backed,
@@ -634,6 +628,7 @@ import {
   tyToStr,
   tyToStrDepth,
   tyToStrStack,
+  tyToStrUser,
   tyToStructStr,
   tyUnionAllLists,
   tyUnionHasLitUnionArrayMember,
@@ -943,6 +938,8 @@ import {
   armLiteralBaseTy,
   arrElemTyOrNone,
   arrElemValueTy,
+  crTyHasFn,
+  crTyIsScalar,
   flattenVariantsInto,
   homogLitUnionBase,
   intLitUnionBasesOf,
@@ -982,7 +979,6 @@ import {
   tyIsV128Brand,
   tyLitSetMemberLexes,
   tyMentionsVoid,
-  tyNamesNominal,
   tyNestsV128,
   tyObjFieldIsLitUnion,
   tyPeelElems,
@@ -1091,6 +1087,59 @@ import {
   widenMemberPairs,
   widerNumeric,
 } from "./check_ty_relate"
+import {
+  recAtPinnedArg,
+  recBindDeclOf,
+  recCoalesceOperands,
+  recDeclInit,
+  recIndexBase,
+  recIsJoin,
+  recKeptWhat,
+  recLeafEscapes,
+  recOwnIsPin,
+  recPassThroughArg,
+} from "./check_record_origins"
+import {
+  crArgMayBeFn,
+  crCalleeUnresolved,
+  crIsScalarRender,
+  weBoundOnce,
+  weClosed,
+  weDeclParamTys,
+  weDedupe,
+  weDigits,
+  weFreshNames,
+  weInitIsFresh,
+  weIsFreshName,
+  weNeverFn,
+  weRebindShape,
+} from "./check_write_effects"
+import {
+  arityWantText,
+  callArgNameAt,
+  declParamsAfterSelf,
+  diagDataField,
+  namedOrderFixData,
+  ovChooseMsg,
+  ovPlainHint,
+  ovRecvHeads,
+  ovRecvOpen,
+  ovRefuseMsg,
+  ovSelfCount,
+  paramIndexOfName,
+  paramNamesOfNodes,
+  paramsAfterFirst,
+  roWriteMsg,
+  ufcsImportAliasAt,
+  ufcsNotImportedData,
+  ufcsNotImportedMsg,
+  ufcsNotMethodData,
+  ufcsNotMethodMsg,
+  ufcsRecvExpr,
+  ufcsRegistryHas,
+  ufcsScopeStepsAside,
+  ufcsSiteFn,
+} from "./check_overload"
 import {
   CEX_DEPTH,
   anyArgIsLitOnly,
@@ -1233,21 +1282,6 @@ import {
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
 // AST's convention). A nested type is always an `i32` index into `T.tys`.
-
-// The data channel's encoding, documented here and nowhere else: `tdata` is a flat
-// sequence of netstrings — `<byte-length> ":" <bytes> ","` — read as alternating key and
-// value. The length is authoritative, so a value may hold any byte and nothing is escaped
-// or order-dependent; a repeated key is the list. Decoder: `compiler/diagnostics.ts`.
-function diagDataField(key: string, val: string) {
-  i32ToStr(key.length)
-    + ":"
-    + key
-    + ","
-    + i32ToStr(val.length)
-    + ":"
-    + val
-    + ","
-}
 
 // The stable category code for emitter-capability rejections: the construct is type-valid
 // but codegen cannot lower it yet. Machine-distinguishable from a type-soundness verdict
@@ -6772,24 +6806,6 @@ function fnWriteShapes(fnIx: i32) {
   "*"
 }
 
-// `sum` with each shape kept once: a summary is a set, and one that repeats a callee's shapes per
-// call grows with every path through the call graph rather than with what it holds.
-function weDedupe(sum: string): string {
-  if sum == "*" || sum == "" { return sum }
-  const parts = weSplit(sum)
-  const seen: {[string]: boolean} = Map()
-  let out = ""
-  let i = 0
-  while i < parts.length {
-    if !seen.has(parts[i]) {
-      seen[parts[i]] = true
-      out = out + parts[i] + ","
-    }
-    i = i + 1
-  }
-  out
-}
-
 // Retire the provisional summaries recorded since `mark`: the cycle they sat on closed at a frame
 // whose summary is `acc`. Every function on one cycle reaches every other, so without a parameter
 // call (`@i`) on either side each one's summary is `acc` itself; any other is dropped, to be asked
@@ -6891,14 +6907,6 @@ function weCellShape(ix: i32, fresh: string[], bound: string[]) {
   weRebindShape(ix, bound)
 }
 
-function weRebindShape(ix: i32, bound: string[]) {
-  const t = P.nodes[ix]
-  if t is Ident {
-    if !strListHas(bound, t.identName) { return "=" + t.identName + "," }
-  }
-  ""
-}
-
 // The container a cell shape writes into, from the type recorded for the node at `ix`: `#a<T>` for
 // a list of `T`, `#m<V>` for a map of `V`, "" when unknown, so the shape then hits every cell.
 function weCellTag(ix: i32): string {
@@ -6908,12 +6916,6 @@ function weCellTag(ix: i32): string {
     return ""
   }
   cellTagOfTy(t)
-}
-
-function weIsFreshName(ix: i32, fresh: string[]): boolean {
-  const n = P.nodes[ix]
-  if n is Ident { return strListHas(fresh, n.identName) }
-  false
 }
 
 // The write shapes a call contributes: its declaration's with each `@i` replaced by what argument
@@ -7037,43 +7039,6 @@ function weSlotMayHoldFn(pts: i32[], i: i32): boolean {
   pt < 0 || tyHasTyVar(pt) || crTyHasFn(pt)
 }
 
-// The declared parameter types of the function `d`, from the type its name is bound to; empty
-// when that binding is not `d`'s own.
-function weDeclParamTys(d: i32): i32[] {
-  const fd = P.nodes[d]
-  if fd is FuncDecl {
-    if fd.fnName != "" && lookupFnDeclNode(fd.fnName) == d {
-      const ft = lookup(fd.fnName)
-      if ft >= 0 {
-        const t = T.tys[ft]
-        if t is TyFunc { return t.fnParamTypes }
-      }
-    }
-  }
-  weNoTys
-}
-
-const weNoTys: i32[] = []
-
-// The non-negative integer spelled by the digits `t`, or -1.
-function weDigits(t: string): i32 {
-  if t.length == 0 { return -1 }
-  let v = 0
-  let i = 0
-  while i < t.length {
-    if t[i] < '0' || t[i] > '9' { return -1 }
-    v = v * 10 + (t[i] - '0')
-    i = i + 1
-  }
-  v
-}
-
-// A summary's own `@i` markers answered opaque: a function whose parameters no call site binds.
-function weClosed(sum: string): string {
-  if sum.indexOf("@") >= 0 { return "*" }
-  sum
-}
-
 // What a function value handed as an argument writes when called. Inside a summary, a function
 // written in place is part of the subtree walked already, and a parameter of the summary is `@i`;
 // a named function or a `const`-bound lambda is its declaration's; anything else is opaque.
@@ -7103,30 +7068,6 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
   if weNeverFn(a) { return "" }
   if crArgMayBeFn(a) { return "*" }
   ""
-}
-
-// Whether the expression at `a` can never evaluate to a function, by its form alone: a literal, a
-// record or list built in place, a test, or an operator other than `??` and assignment. Asked
-// where a callee body's types may not be recorded yet.
-function weNeverFn(a: i32): boolean {
-  const n = P.nodes[a]
-  if n is BinExpr { return n.binOp != "??" && n.binOp != "=" }
-  weNeverFnLeaf(a)
-}
-
-// `weNeverFn` for a node that is not an operator.
-function weNeverFnLeaf(a: i32): boolean {
-  const n = P.nodes[a]
-  if n is Paren { return weNeverFn(n.parInner) }
-  n is NumLit
-    || n is StrLit
-    || n is BoolLit
-    || n is NullLit
-    || n is CharLit
-    || n is Unary
-    || n is IsExpr
-    || n is ObjLit
-    || n is ArrayLit
 }
 
 // The shape a built-in method writes into its receiver, when the receiver's type has that
@@ -7169,58 +7110,6 @@ function builtinRunsNoArg(nm: string): boolean {
     || nm == "fromCodePoint"
     || nm == "fromCodePoints"
     || nm == "__str_from_bytes__"
-}
-
-// The names a body binds only by a `const` holding an object, list or map it builds there.
-function weFreshNames(ix: i32, bound: string[], out: string[]) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    if (
-      n.letKw == "const"
-      && weInitIsFresh(n.letInit)
-      && weBoundOnce(bound, n.letName)
-    ) {
-      out.push(n.letName)
-    }
-  }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      weFreshNames(kids[i], bound, out)
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  0
-}
-
-function weBoundOnce(bound: string[], name: string): boolean {
-  let c = 0
-  let i = 0
-  while i < bound.length {
-    if bound[i] == name { c = c + 1 }
-    i = i + 1
-  }
-  c == 1
-}
-
-// Whether the expression at `ix` builds a new object, list or map: a literal, or `Map()`/`Set()`.
-function weInitIsFresh(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
-  if n is Call {
-    const cf = P.nodes[n.callFn]
-    if cf is Ident {
-      if cf.identName == "Map" || cf.identName == "Set" {
-        return lookup(cf.identName) < 0 && lookupFnDeclNode(cf.identName) < 0
-      }
-    }
-    return false
-  }
-  n is ObjLit || n is ArrayLit
 }
 
 // The steps of a place key below its root, in order: `.f` for a field, `[k]` for a subscript.
@@ -8868,22 +8757,6 @@ function crPathCallRetire(slot: i32, callIx: i32) {
   0
 }
 
-// Whether the call at `callIx` counts as opaque only because its receiver's type is not known
-// yet: a method whose receiver is an inference hole, with no declaration of that name.
-function crCalleeUnresolved(callIx: i32): boolean {
-  if callIx < 0 || callIx >= P.nodes.length { return false }
-  const cn = P.nodes[callIx]
-  if cn is Call {
-    const cf = P.nodes[cn.callFn]
-    if cf is Member {
-      if lookupFnDeclNode(cf.memProp) >= 0 { return false }
-      const rt = nodeTyOf(cf.memObj)
-      return rt < 0 || tyIsHole(rt)
-    }
-  }
-  false
-}
-
 // Whether the body being checked belongs to a function with an un-annotated parameter still
 // typed as a hole. Its body is checked again at each call's argument types, which decide; a
 // declared-type read settled here would be carried into that check against types it never saw.
@@ -9605,39 +9478,6 @@ function crCallBenign(cn: Call, callIx: i32, name: string): boolean {
   true
 }
 
-// An interpolation hole's renderer over a scalar: std:fmt's `toString` of a primitive or a
-// union of them, which dispatches to no user code. A struct hole may reach a user `toString`.
-function crIsScalarRender(cn: Call): boolean {
-  if cn.callArgs.length != 1 { return false }
-  const a = cn.callArgs[0]
-  if !nodeIsTplHole(a) { return false }
-  let t = nodeTyOf(a)
-  if t < 0 {
-    const an = P.nodes[a]
-    if an is Ident { t = lookup(an.identName) }
-  }
-  crTyIsScalar(t)
-}
-
-function crTyIsScalar(t0: i32): boolean {
-  if t0 < 0 || t0 >= T.tys.length { return false }
-  const t = nonNullTy(t0)
-  if t < 0 || t >= T.tys.length { return false }
-  const tt = T.tys[t]
-  if tt is TyUnion {
-    let i = 0
-    while i < tt.uMembers.length {
-      if !crTyIsScalar(tt.uMembers[i]) { return false }
-      i = i + 1
-    }
-    return true
-  }
-  crTyIsLeafScalar(tt)
-}
-
-// A primitive or a literal type: nothing a renderer can dispatch on to user code.
-function crTyIsLeafScalar(tt: Ty): boolean { tt is TyPrim || tt is TyLit }
-
 // Whether the subtree at `ix` neither writes `name` nor makes a call `crCallBenign` refuses.
 function crSubtreeBenign(ix: i32, name: string): boolean {
   if ix < 0 || ix >= P.nodes.length { return true }
@@ -9663,41 +9503,6 @@ function crSubtreeBenign(ix: i32, name: string): boolean {
     cur = elseIfLink(cur)
   }
   true
-}
-
-// Could the argument at `a` hold a function? A literal cannot; anything whose type is not yet
-// known is assumed to.
-function crArgMayBeFn(a: i32): boolean {
-  const an = P.nodes[a]
-  if (
-    an is NumLit
-    || an is StrLit
-    || an is BoolLit
-    || an is NullLit
-    || an is CharLit
-  ) {
-    return false
-  }
-  let t = nodeTyOf(a)
-  if t < 0 {
-    if an is Ident { t = lookup(an.identName) }
-  }
-  if t < 0 { return true }
-  crTyHasFn(t)
-}
-
-function crTyHasFn(t: i32): boolean {
-  if t < 0 || t >= T.tys.length { return false }
-  if tyIxIsFunc(t) || tyIxIsFunc(nonNullTy(t)) { return true }
-  const tt = T.tys[t]
-  if tt is TyUnion {
-    let i = 0
-    while i < tt.uMembers.length {
-      if crTyHasFn(tt.uMembers[i]) { return true }
-      i = i + 1
-    }
-  }
-  false
 }
 
 // The bare names narrowed in the current function, each once.
@@ -16376,48 +16181,6 @@ function symMemMethod(ix: i32) {
   ix
 }
 
-// Strip every `$m<digits>` module-merge and `$b<digits>` block-scope mangle suffix from a free-form
-// diagnostic message: the merge renames a module's declarations and the parser renames a
-// body-scoped `type` (D1045), both internal names that must not surface. The two suffixes compose,
-// and the scan handles that by restarting after the digits. One home, in `tyname.demangleSpelling`.
-export function demangleMsg(s: string) {
-  inlineLitUnionUnhide(demangleSpelling(s))
-}
-
-// Replaces each hidden inline-literal-union alias (`#lu3`) in a message with its member set,
-// parenthesized before an array suffix, so a canon-rendered spelling reads as the source does.
-function inlineLitUnionUnhide(s: string): string {
-  let h = 0
-  while h < s.length && s[h] != '#' { h = h + 1 }
-  if h == s.length { return s }
-  let out = ""
-  let i = 0
-  while i < s.length {
-    if (
-      s[i] == '#'
-      && i + 3 < s.length
-      && s.slice(i, i + 3) == inlineLitUnionPrefix
-    ) {
-      let j = i + 3
-      while j < s.length && s[j] >= '0' && s[j] <= '9' { j = j + 1 }
-      const hit = cUserTypes[s.slice(i, j)]
-      if j > i + 3 && hit is i32 {
-        let r = tyToStructStr(hit)
-        if j < s.length && s[j] == '[' { r = "(" + r + ")" }
-        out = out + r
-        i = j
-      } else {
-        out = out + s.slice(i, i + 1)
-        i = i + 1
-      }
-    } else {
-      out = out + s.slice(i, i + 1)
-      i = i + 1
-    }
-  }
-  out
-}
-
 // Raise a diagnostic at AST node `at`, resolving its source position — the node's anchor token
 // through the `nodeToks` side table — eagerly, so the driver can render `line:col: message`. Every
 // lookup is bounds-checked: a harness that builds `P.nodes` by hand yields an out-of-range index,
@@ -22153,8 +21916,6 @@ function registerInlineLitUnion(ix: i32) {
   0
 }
 
-const inlineLitUnionPrefix = "#lu"
-
 // The hidden aliases this program registered, and whether their declarations are written yet:
 // one minted after that (an emit-phase annotation) keeps the string rep, since no declaration
 // would carry it to the emitter's union tables.
@@ -22621,13 +22382,6 @@ function checkInferredMapKey(k: i32, isSet: i32, at: i32) {
   mapKeyUnsupportedErr(tyToStr(k), ctor, at)
   0
 }
-
-// —— the user-facing render pathway (demangle → render) ——
-// Every type string a person reads is rendered here and nowhere else, since the module
-// merge renames every declaration `name` → `name$mN` and a raw render would leak it.
-// `tyToStr`/`tyToStructStr` stay raw, since those strings are spelling-dependent table keys.
-export function tyToStrUser(ix: i32) { demangleMsg(tyToStr(ix)) }
-export function tyToStructStrUser(ix: i32) { demangleMsg(tyToStructStr(ix)) }
 
 // ── emit-name canonicalization ──
 // The emitter classifies annotations by synthetic name, and the literal/intersection
@@ -27652,46 +27406,6 @@ function recOriginExpr(expr: i32): i32 {
   x
 }
 
-// The argument a call hands straight back: a generic function whose declared result is a bare
-// type parameter `T` that exactly one parameter is declared as. -1 for any other call.
-function recPassThroughArg(x: i32): i32 {
-  const c = P.nodes[x]
-  if c is Call {
-    const cn = P.nodes[c.callFn]
-    if cn is Ident {
-      const fd = recFnDeclByName(cn.identName)
-      if fd < 0 { return -1 }
-      const f = P.nodes[fd]
-      if f is FuncDecl {
-        if f.fnTyParams.length == 0 || f.fnRet < 0 { return -1 }
-        const rt = P.nodes[f.fnRet]
-        if rt is TypeRef {
-          if !strListHas(f.fnTyParams, rt.tyName) { return -1 }
-          let at = -1
-          let i = 0
-          while i < f.fnParams.length {
-            const pn = P.nodes[f.fnParams[i]]
-            if pn is Param {
-              if pn.parType >= 0 {
-                const pt = P.nodes[pn.parType]
-                if pt is TypeRef {
-                  if pt.tyName == rt.tyName {
-                    if at >= 0 { return -1 }
-                    at = i
-                  }
-                }
-              }
-            }
-            i = i + 1
-          }
-          if at >= 0 && at < c.callArgs.length { return c.callArgs[at] }
-        }
-      }
-    }
-  }
-  -1
-}
-
 // The declaration of the un-annotated `let` or `const` the read `x` names, when it holds only
 // its initializer (a `let` is assigned nothing but object literals), else -1.
 // Resolved from the occurrence index, so a walk after the check, out of scope, answers alike.
@@ -27718,82 +27432,6 @@ function recHeldLit(x: i32): i32 {
   const dn = P.nodes[d]
   if dn is LetDecl { return dn.letInit }
   -1
-}
-
-// The `let`/`const` declaration of `name` the read `x` resolves to in its frame: the latest one
-// declared before it, else the first after it (a function reading a later global). -1 for none.
-function recBindDeclOf(x: i32, name: string): i32 {
-  cwIxBuild()
-  const fr = covarRootFrame(x)
-  let before = -1
-  let after = -1
-  let ixA = cwIxFrHead(name, fr)
-  let ixU = cwIxUnkHead(name, fr)
-  while ixA >= 0 || ixU >= 0 {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
-    if cwIxKind[r] == CW_OCC_BIND {
-      const b = cwIxNode[r]
-      if b < x {
-        if b > before { before = b }
-      } else if after < 0 || b < after {
-        after = b
-      }
-    }
-  }
-  let d = before
-  if d < 0 { d = after }
-  if d < 0 || !(P.nodes[d] is LetDecl) { return -1 }
-  if recLoopShadows(x, name, d) { return -1 }
-  d
-}
-
-// Does a `for` loop binding `name` enclose the read `x` without enclosing the declaration `d`?
-// Its binder is not in the occurrence index, and it shadows `d` inside the loop.
-function recLoopShadows(x: i32, name: string, d: i32): boolean {
-  let at = x
-  let steps = 0
-  while at >= 0 && at < cwIxParent.length && steps < 256 {
-    const n = P.nodes[at]
-    if recLoopBinds(n, name) { return !recEncloses(at, d) }
-    at = cwIxParent[at]
-    steps = steps + 1
-  }
-  false
-}
-
-// Does the node `n` bind `name` as a `for` loop's variable?
-function recLoopBinds(n: Node, name: string): boolean {
-  recForInBinds(n, name) || recForRangeBinds(n, name)
-}
-
-// Does `n` bind `name` as a `for … in` loop's variable?
-function recForInBinds(n: Node, name: string): boolean {
-  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
-  false
-}
-
-// Does `n` bind `name` as a range loop's variable?
-function recForRangeBinds(n: Node, name: string): boolean {
-  if n is ForRange { return n.frVar == name }
-  false
-}
-
-// Is `outer` an ancestor of `inner`?
-function recEncloses(outer: i32, inner: i32): boolean {
-  let at = inner
-  let steps = 0
-  while at >= 0 && at < cwIxParent.length && steps < 256 {
-    if at == outer { return true }
-    at = cwIxParent[at]
-    steps = steps + 1
-  }
-  false
 }
 
 // The record storage rule at a join operand: `op`, a `t`, joined into `j`.
@@ -28152,54 +27790,6 @@ function recKeptConflicts() {
   0
 }
 
-// Is `u` an argument to a parameter that takes its type from the argument: an un-annotated one,
-// or one of a generic function? Such a parameter is specialised at the value's own row.
-function recOwnIsPin(u: i32): boolean {
-  if u < 0 || u >= cwIxUp.length || cwIxUpKind[u] != CW_UP_ARG { return false }
-  const cn = P.nodes[cwIxUp[u]]
-  if cn is Call {
-    const f = P.nodes[cn.callFn]
-    if f is Ident {
-      const fd = recFnDeclByName(f.identName)
-      if fd < 0 { return true }
-      const fn = P.nodes[fd]
-      if fn is FuncDecl {
-        if fn.fnTyParams.length > 0 { return true }
-        return recNumParamAt(cwIxUp[u], cwIxUpAux[u]) >= 0
-      }
-    }
-  }
-  false
-}
-
-// The un-annotated parameter at position `pos` of the function the call `c` names, or -1.
-function recNumParamAt(c: i32, pos: i32): i32 {
-  const cn = P.nodes[c]
-  if cn is Call {
-    const f = P.nodes[cn.callFn]
-    if f is Ident {
-      const fd = recFnDeclByName(f.identName)
-      if fd < 0 { return -1 }
-      const fn = P.nodes[fd]
-      if fn is FuncDecl {
-        if pos < 0 || pos >= fn.fnParams.length { return -1 }
-        const pn = P.nodes[fn.fnParams[pos]]
-        if pn is Param {
-          if pn.parType < 0 { return fn.fnParams[pos] }
-        }
-      }
-    }
-  }
-  -1
-}
-
-// How a refusal names the kept declaration `d`.
-function recKeptWhat(d: i32): string {
-  const n = P.nodes[d]
-  if n is LetDecl { return "`" + n.letName + "`, which holds only literals," }
-  "this value"
-}
-
 // The fresh binding or function that `x` reads, through un-annotated aliases, a call or an
 // element of a list literal binding; -1 for any other value.
 function recFreshOriginDecl(x: i32, depth: i32): i32 {
@@ -28239,58 +27829,6 @@ function recCallResultInferred(ix: i32): boolean {
     }
   }
   false
-}
-
-// The container an element read `x` reads from, or -1 when `x` is no element read.
-function recIndexBase(x: i32): i32 {
-  const n = P.nodes[x]
-  if n is Index { return n.idxArr }
-  -1
-}
-
-// The two operands of `x` when it is a `??`, else none.
-function recCoalesceOperands(x: i32): i32[] {
-  const n = P.nodes[x]
-  if n is BinExpr {
-    if n.binOp == "??" { return [n.binLeft, n.binRight] }
-  }
-  []
-}
-
-// Is the returned value `lf` a binding that is also handed to another place (an argument, a
-// store, a list or object literal, another binding), so another handle shares it?
-function recLeafEscapes(lf: i32): boolean {
-  const p = cwPeelValue(lf)
-  if p < 0 || p >= P.nodes.length { return false }
-  const e = P.nodes[p]
-  if e is Ident {
-    const fr = covarRootFrame(p)
-    let r = cwIxFrHead(e.identName, fr)
-    while r >= 0 {
-      const u = cwIxNode[r]
-      if cwIxKind[r] == CW_OCC_USE && u != p && u < cwIxUpKind.length {
-        const k = cwIxUpKind[u]
-        if (
-          k == CW_UP_ARG
-          || k == CW_UP_ASG_RHS
-          || k == CW_UP_ELEM
-          || k == CW_UP_FIELD
-          || k == CW_UP_LETINIT
-          || k == CW_UP_SPREAD
-        ) {
-          return true
-        }
-      }
-      r = cwIxFrNext(r, fr)
-    }
-  }
-  false
-}
-
-// Is `x` a value `if`, `match` or block?
-function recIsJoin(x: i32): boolean {
-  const n = P.nodes[x]
-  n is IfStmt || n is MatchExpr || n is Block
 }
 
 // A function value: its result covariant, its parameters contravariant.
@@ -28441,26 +27979,6 @@ function recHasLitLeaf(fd: i32): boolean {
   for lf in recFnValueLeaves(fd) {
     const o = recOriginExpr(lf)
     if o >= 0 && P.nodes[o] is ObjLit { return true }
-  }
-  false
-}
-
-// Is `at` an argument of a generic function or a method, whose parameter the call pins?
-function recAtPinnedArg(at: i32): boolean {
-  cwIxBuild()
-  if at < 0 || at >= cwIxUp.length || cwIxUpKind[at] != CW_UP_ARG {
-    return false
-  }
-  const cn = P.nodes[cwIxUp[at]]
-  if cn is Call {
-    const f = P.nodes[cn.callFn]
-    if f is Ident {
-      const fd = recFnDeclByName(f.identName)
-      if fd < 0 { return true }
-      const fn = P.nodes[fd]
-      if fn is FuncDecl { return fn.fnTyParams.length > 0 }
-    }
-    return true
   }
   false
 }
@@ -28651,13 +28169,6 @@ function recFreshDeclOf(at: i32): i32 {
   if init < 0 { return -1 }
   const iv = P.nodes[parenPeelIx(init)]
   if iv is ObjLit || iv is ArrayLit { return recHeldDecl(at) }
-  -1
-}
-
-// The initializer of the declaration `d`, or -1.
-function recDeclInit(d: i32): i32 {
-  const n = P.nodes[d]
-  if n is LetDecl { return n.letInit }
   -1
 }
 
@@ -32648,134 +32159,6 @@ function peelParenIx(ix: i32): i32 {
   ix
 }
 
-// The exact line to paste, appended below when there is exactly ONE candidate module —
-// with two or more the fix is a CHOICE and no one line is right, so the sentence ends
-// at "from there" unchanged. Extends the entry's own import (`ufcsSpecAlreadyImported`)
-// rather than proposing a second, colliding one.
-function ufcsImportEditSuffix(
-  prop: string,
-  specs: string,
-  alias: string,
-): string {
-  if specs == "" { return "" }
-  let i = 0
-  while i < specs.length {
-    if specs[i] == ',' { return "" }
-    i = i + 1
-  }
-  let item = prop
-  let call = ""
-  if alias != "" {
-    item = prop + " as " + alias
-    call = " and call `." + alias + "(…)`"
-  }
-  if ufcsSpecAlreadyImported(specs) {
-    return " — add `"
-      + item
-      + "` to the existing `import { … } from \""
-      + specs
-      + "\"`"
-      + call
-  }
-  " — add `import { " + item + " } from \"" + specs + "\"`" + call
-}
-
-// The import alias D1230's sentence proposes when the caller's module already binds `prop` in
-// any form (D1984, D3122): `prop` plus the receiver's type name, which an import of the plain
-// name would collide with. "" when the module binds no such name.
-function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
-  if ufcsFreeAliasAt(ix, prop) == prop { return "" }
-  if ovImportCoexists(ix, prop, objTy) { return "" }
-  const tn = demangleMsg(tyToStr(objTy))
-  let out = prop
-  let i = 0
-  while i < tn.length {
-    const c = tn[i]
-    if c == '<' { return out }
-    if (
-      (c >= 'a' && c <= 'z')
-      || (c >= 'A' && c <= 'Z')
-      || (c >= '0' && c <= '9')
-      || c == '_'
-    ) {
-      out = out + tn.slice(i, i + 1)
-    }
-    i = i + 1
-  }
-  ufcsFreeAliasAt(ix, out)
-}
-
-// Whether an import of `prop` for receiver `objTy` would coexist with the binding the module
-// at `ix` already has: that binding is a function whose first parameter's head is disjoint
-// from the receiver's (receiver overloading), so the plain name is the right import.
-function ovImportCoexists(ix: i32, prop: string, objTy: i32): boolean {
-  const heads = ovRecvHeads(objTy)
-  if heads.length == 0 { return false }
-  const fty = lookup(ufcsSiteFn(ix, prop))
-  if fty < 0 { return false }
-  const ft = T.tys[fty]
-  if ft is TyFunc {
-    let own = "none"
-    if ft.fnParamTypes.length > 0 { own = ovParamHead(ft.fnParamTypes[0]) }
-    for h in heads {
-      if ovHeadsOverlap(own, h) { return false }
-    }
-    return true
-  }
-  false
-}
-
-// `base`, or `base` with the smallest numeric suffix from 2 up, whichever the module at `ix`
-// neither declares nor imports as a `self`-function, so the proposed import cannot collide.
-function ufcsFreeAliasAt(ix: i32, base: string): string {
-  const m = ufcsModOfNode(ix)
-  let own = ""
-  if m >= 0 { own = "$m" + i32ToStr(m) }
-  let out = base
-  let n = 2
-  while n < 100 {
-    if (
-      ufcsAliasInScope(ix, out) == out
-      && lookup(out + own) < 0
-      && lookup(out) < 0
-    ) {
-      return out
-    }
-    out = base + i32ToStr(n)
-    n = n + 1
-  }
-  out
-}
-
-// D1230's sentence. The fault is the missing import, so the sentence leads with it — "no
-// field 'toEqual' on Expectation<i32>" is true and tells a reader nothing they can act on,
-// while the compiler knew `toEqual` is a free `self`-function in a module the file already
-// names. The closing clause is the rule, not a hedge: UFCS in this language is explicit by ruling.
-function ufcsNotImportedMsg(
-  prop: string,
-  specs: string,
-  objTy: i32,
-  alias: string,
-) {
-  let how = "so import `" + prop + "` from there"
-  if alias != "" {
-    how = "and this module already binds `"
-      + prop
-      + "`, so import it from there under another name"
-  }
-  "'"
-    + prop
-    + "' is not imported — a free `"
-    + prop
-    + "(self: …)` accepting "
-    + tyToStr(objTy)
-    + " is exported by "
-    + specListQuoted(specs)
-    + "; a UFCS call resolves only names in scope, "
-    + how
-    + ufcsImportEditSuffix(prop, specs, alias)
-}
-
 // D1230 at member node `memIx`, else D1570 at call node `ix`, for `recv.prop(argc args)`; false
 // when neither applies. For the string and array arms, which answer before the general one, so
 // `memberFloorErr` never sees their calls. D1230 spans the property, as the quick-fix reads it.
@@ -32812,32 +32195,6 @@ function ufcsMissRaise(
   false
 }
 
-// D1230's payload, the machine half, on the data channel `CODE_UFCS_NOT_IMPORTED` documents.
-// `specs` arrives `,`-joined and is split back into one `modules` field per specifier.
-// Demangles its own receiver, since the message is demangled downstream once for every
-// diagnostic while the data never passes through that renderer — a quick-fix would otherwise read a mangled name no source file contains.
-function ufcsNotImportedData(
-  prop: string,
-  specs: string,
-  objTy: i32,
-  alias: string,
-) {
-  let out = diagDataField("member", prop)
-  let start = 0
-  let i = 0
-  while i < specs.length {
-    if specs[i] == ',' {
-      out = out + diagDataField("modules", specs.slice(start, i))
-      start = i + 1
-    }
-    i = i + 1
-  }
-  out = out + diagDataField("modules", specs.slice(start, specs.length))
-  out = out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
-  if alias != "" { out = out + diagDataField("alias", alias) }
-  out
-}
-
 // D1570's gate classifier — which arm of the UFCS rule refused `recv.prop(argc args)`, given
 // that `prop` names a function in scope. 0 = no answer, 1 = the `self`-name rule, 2 = the
 // arity range, 3 = the receiver type. Mirrors `ufcsWouldDispatch` arm for arm, and stops
@@ -32859,148 +32216,6 @@ function ufcsNotMethodKind(name: string, recvTy: i32, argc: i32) {
     return 0
   }
   0
-}
-
-// The token spelling the first parameter's name in `name`'s declaration, or -1. The
-// identifier's own start, not the `Param` node's `nodeToks` anchor — that anchor is the
-// annotation's last token, so a rename quick-fix built on it would edit `Cursor`, not `c`.
-// Through `nodeStartTok`, which resolves inside the declaring module (D1652).
-function ufcsDeclParamTok(name: string) {
-  const dIx = fnDeclIx[name] ?? -1
-  if dIx < 0 { return -1 }
-  const d = P.nodes[dIx]
-  if d is FuncDecl {
-    if d.fnParams.length == 0 { return -1 }
-    return nodeStartTok(d.fnParams[0])
-  }
-  -1
-}
-
-function ufcsDeclParamLine(name: string) {
-  const tk = ufcsDeclParamTok(name)
-  if tk >= 0 && tk < P.toks.length { return P.toks[tk].line }
-  0
-}
-
-function ufcsDeclParamCol(name: string) {
-  const tk = ufcsDeclParamTok(name)
-  if tk >= 0 && tk < P.toks.length { return P.toks[tk].col }
-  0
-}
-
-// D1570's sentence, one per gate. The fault is never "no such field" — the function the
-// author wrote exists, in scope, and the compiler knew which rule turned it down — so each
-// sentence names the rule, the offending ingredient, and the edit that fixes it. The
-// `self`-name rule stands; only the diagnostic sent readers to hunt a nonexistent field (glean VL-021).
-function ufcsNotMethodMsg(
-  prop: string,
-  name: string,
-  recvTy: i32,
-  argc: i32,
-  kind: i32,
-) {
-  const plain = demangleMsg(name)
-  if kind == 1 {
-    const pns = fnParamNamesOf(name)
-    if pns.length == 0 {
-      return "'"
-        + prop
-        + "' is not a method — it takes no parameters, and a UFCS call `x."
-        + prop
-        + "(…)` dispatches only to a function whose FIRST parameter is named `self`; call `"
-        + plain
-        + "(…)` directly"
-    }
-    return "'"
-      + prop
-      + "' is not a method — its first parameter is named `"
-      + pns[0]
-      + "`, not `self`, and a UFCS call `x."
-      + prop
-      + "(…)` dispatches only to a `self` first parameter; rename it to `self`, or call `"
-      + plain
-      + "(…)` directly"
-  }
-  if kind == 2 {
-    const ft2 = T.tys[lookup(name)]
-    if ft2 is TyFunc {
-      const uDecl2 = declParamsAfterSelf(name)
-      let lo = ft2.fnParamTypes.length - 1
-      if uDecl2.length == ft2.fnParamTypes.length - 1 {
-        lo = fnRequiredArity(uDecl2)
-      }
-      return "`"
-        + plain
-        + "` expects "
-        + arityWantText(lo, ft2.fnParamTypes.length - 1)
-        + " arguments after `self`, got "
-        + i32ToStr(argc)
-        + " — a UFCS call `x."
-        + prop
-        + "(…)` passes the receiver as `self`"
-    }
-  }
-  const p0Str = ufcsSelfParamStr(name)
-  "no method '"
-    + prop
-    + "' for "
-    + tyToStr(recvTy)
-    + " — the free function `"
-    + plain
-    + "` takes `self: "
-    + p0Str
-    + "`"
-    + ufcsReadonlyNote(name, recvTy)
-}
-
-// D1570's receiver-type sentence's tail when a read-only list meets a growable `self` list,
-// the one refusal whose reason the two spellings do not show; "" otherwise.
-function ufcsReadonlyNote(name: string, recvTy: i32): string {
-  if recvTy < 0 { return "" }
-  const rt = T.tys[recvTy]
-  const fnTy = lookup(name)
-  if fnTy < 0 { return "" }
-  const ft = T.tys[fnTy]
-  if rt is TyArray && ft is TyFunc && ft.fnParamTypes.length > 0 {
-    const p0 = ft.fnParamTypes[0]
-    if p0 < 0 { return "" }
-    const pt = T.tys[p0]
-    if rt.aRead != 0 && pt is TyArray && pt.aRead == 0 {
-      return ", and a readonly list is not a growable one"
-    }
-  }
-  ""
-}
-
-// The rendered type of `name`'s `self` parameter — the half of the receiver-mismatch sentence
-// that says which type it is a method on. "?" only for a callee this ladder never reaches.
-function ufcsSelfParamStr(name: string) {
-  const fnTy = lookup(name)
-  if fnTy >= 0 {
-    const ft = T.tys[fnTy]
-    if ft is TyFunc {
-      if ft.fnParamTypes.length > 0 { return tyToStr(ft.fnParamTypes[0]) }
-    }
-  }
-  "?"
-}
-
-// The machine-readable payload for `CODE_UFCS_NOT_METHOD` (D1570): `reason` names which of
-// the three refusal kinds fired, so a quick-fix can offer the `self`-name rename without
-// parsing the message text; `declLine`/`declCol` locate where that rename lands.
-function ufcsNotMethodData(prop: string, name: string, recvTy: i32, kind: i32) {
-  let reason = "receiver"
-  if kind == 1 { reason = "self-name" }
-  if kind == 2 { reason = "arity" }
-  let pn = ""
-  const pns = fnParamNamesOf(name)
-  if pns.length > 0 { pn = pns[0] }
-  let out = diagDataField("member", prop)
-  out = out + diagDataField("recv", demangleMsg(tyToStr(recvTy)))
-  out = out + diagDataField("reason", reason)
-  out = out + diagDataField("param", pn)
-  out = out + diagDataField("declLine", i32ToStr(ufcsDeclParamLine(name)))
-  out + diagDataField("declCol", i32ToStr(ufcsDeclParamCol(name)))
 }
 
 // Records `memberFloorErr`'s answer, computed here because only the call site knows `argc`.
@@ -36378,7 +35593,8 @@ function substElemNominal(a: i32, b: i32): boolean {
 }
 
 // The members of a union re-joined one at a time, as the join that made it would at these types.
-function rejoinMembers(ms: i32[]): i32 {
+// `allOpen` says every member the body joined is open in a type parameter (`rejoinListApart`).
+function rejoinMembers(ms: i32[], allOpen: boolean): i32 {
   const apart = njRejoinApart
   njRejoinApart = false
   if ms.length == 0 { return -1 }
@@ -36386,11 +35602,30 @@ function rejoinMembers(ms: i32[]): i32 {
   let i = 1
   while i < ms.length {
     njApart = apart
-    r = joinTys(r, ms[i])
+    const j = joinTys(r, ms[i])
     njApart = false
+    if allOpen { r = rejoinListApart(r, ms[i], j) } else { r = j }
     i = i + 1
   }
   rejoinDropSubsumed(r)
+}
+
+// `j`, the join of `a` and `b`, unless it collapsed onto a list that one side's elements would be
+// stored differently in: then the two stay apart, as the body's join of two type parameters did.
+// Only for members all open in a type parameter: a concrete member can be a literal the join adapts.
+function rejoinListApart(a: i32, b: i32, j: i32): i32 {
+  if listJoinStorageDiffers(a, j, 8) || listJoinStorageDiffers(b, j, 8) {
+    return joinVariantTys(a, b)
+  }
+  j
+}
+
+// Whether every member of `ms` is open in a type parameter.
+function membersAllOpen(ms: i32[]): boolean {
+  for m in ms {
+    if !tyHasTyVar(m) { return false }
+  }
+  true
 }
 
 // `r` with each literal arm a later, wider member subsumes dropped: a left fold keeps `"a"`
@@ -36784,7 +36019,9 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
       njRejoinApart = (tpJoinUnions.get(tyIx) ?? 0) == 2
-      n2 = rejoinMembers(nms)
+      const oms: i32[] = []
+      flattenVariantsInto(t.nInner, oms)
+      n2 = rejoinMembers(nms, membersAllOpen(oms))
       tpApartConcrete = tpSaved
     }
     if n2 != t.nInner { res = mkNullableTy(nullableFlatInner(n2)) }
@@ -36843,7 +36080,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
       njRejoinApart = (tpJoinUnions.get(tyIx) ?? 0) == 2
-      res = rejoinMembers(out3)
+      res = rejoinMembers(out3, membersAllOpen(ms))
       tpApartConcrete = tpSaved
     } else if changed3 {
       // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
@@ -37291,55 +36528,6 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
   -1
 }
 
-// The parameter NAMES of the declaration nodes `ps`, in order, skipping any the parser did not
-// recover as a `Param`. The caller supplies the declaration it resolved, so a callee whose name
-// the scope chain answers with a binding contributes no names.
-function paramNamesOfNodes(ps: i32[]) {
-  const out: string[] = []
-  let i = 0
-  while i < ps.length {
-    const p = P.nodes[ps[i]]
-    if p is Param { out.push(p.parName) }
-    i = i + 1
-  }
-  out
-}
-
-// The declaration nodes `ps` minus the receiver — the list a UFCS call's explicit arguments
-// align with, and therefore the list its defaults are read from.
-function paramsAfterFirst(ps: i32[]) {
-  const out: i32[] = []
-  let i = 1
-  while i < ps.length {
-    out.push(ps[i])
-    i = i + 1
-  }
-  out
-}
-
-// The declared parameter NAMES of the top-level function `name`, or an empty list. By name: for
-// a diagnostic about the free function, never for a call site (`fnDeclParamsOf`).
-function fnParamNamesOf(name: string) {
-  paramNamesOfNodes(fnDeclParamsOf(name))
-}
-
-// The DECLARED parameter nodes of the free `self`-function `name`, MINUS the
-// receiver — the list a UFCS call's explicit arguments align with, and therefore
-// the list its defaults are read from. Empty when `name` is not a declared
-// function (a UFCS callee always is, by the time this is asked).
-function declParamsAfterSelf(name: string) {
-  paramsAfterFirst(fnDeclParamsOf(name))
-}
-
-// The "expected …" half of an arity diagnostic. A parameter list with no
-// defaults has `lo == hi` and renders exactly as it always did; a list with
-// defaults renders the accepted RANGE, so the reader sees which calls are legal
-// rather than only which one is not.
-function arityWantText(lo: i32, hi: i32) {
-  if lo >= hi { return i32ToStr(hi) }
-  i32ToStr(lo) + " to " + i32ToStr(hi)
-}
-
 // Why a list cannot be spread into a fixed-arity call, naming the callee when it has a name.
 // VL has no tuple type, so a list's length is never known at the call — TypeScript's own
 // condition — which is why the rest parameter is the whole of the rule and not half of it.
@@ -37632,19 +36820,6 @@ function orderNamedCallArgs(
   ordered
 }
 
-// The name argument `j` of a call carries, or "" for a positional one.
-function callArgNameAt(argNames: string[], j: i32): string {
-  if j < argNames.length { return argNames[j] }
-  ""
-}
-
-// The parameter index named `nm`, or `paramNames.length` when none is.
-function paramIndexOfName(paramNames: string[], nm: string) {
-  let k = 0
-  while k < paramNames.length && paramNames[k] != nm { k = k + 1 }
-  k
-}
-
 // ", which is `p`'s" for the parameter declared at index `at`, or "" when there is none.
 function namedOrderSlotOwner(paramNames: string[], at: i32): string {
   if at < 0 || at >= paramNames.length { return "" }
@@ -37706,46 +36881,6 @@ function namedOrderRefused(
     j = j + 1
   }
   false
-}
-
-// `check --fix`'s payload for a positional argument after the misplaced name at `from`: for each
-// one, the parameter the binder gave it and where its first token starts. Empty when one binds
-// no parameter, or when naming them all would still give a parameter twice.
-function namedOrderFixData(
-  paramNames: string[],
-  args: i32[],
-  argNames: string[],
-  ordered: i32[],
-  from: i32,
-): string {
-  if ordered.length != paramNames.length { return "" }
-  const names: string[] = []
-  let data = ""
-  let j = 0
-  while j < args.length {
-    let nm = callArgNameAt(argNames, j)
-    if j > from && nm == "" {
-      let k = 0
-      while k < ordered.length && ordered[k] != args[j] { k = k + 1 }
-      const tk = nodeStartTok(args[j])
-      if k >= paramNames.length || tk < 0 || tk >= P.toks.length { return "" }
-      nm = paramNames[k]
-      const t = P.toks[tk]
-      data = data
-        + diagDataField("name", nm)
-        + diagDataField("line", i32ToStr(t.line))
-        + diagDataField("col", i32ToStr(t.col))
-    }
-    names.push(nm)
-    j = j + 1
-  }
-  j = 0
-  while j < names.length {
-    const k = paramIndexOfName(paramNames, names[j])
-    if names[j] != "" && k < j && names[k] == "" { return "" }
-    j = j + 1
-  }
-  data
 }
 
 // —— constraints phase 1: bounds ————————————————————————————————————————————
@@ -38344,31 +37479,11 @@ function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32, ix: i32) {
   out
 }
 
-// The merged name of the function call node `ix`'s module binds as `prop`: its `self`-function,
-// else its own declaration, else `prop` itself.
-function ufcsSiteFn(ix: i32, prop: string) {
-  const nm = ufcsAliasAtSite(ix, prop)
-  const m = ufcsModOfNode(ix)
-  if (fnDeclIx[nm] ?? -1) < 0 && m >= 0 { return prop + "$m" + i32ToStr(m) }
-  nm
-}
-
 // D1570's gate kind for `ufcsSiteFn`, or 0 (D3122). A plain function (1) answers ahead of
 // every candidate module, since its author meant it as the method; any kind answers ahead of a
 // std module the author never mentioned.
 function ufcsSiteKind(ix: i32, prop: string, recvTy: i32, argc: i32) {
   ufcsNotMethodKind(ufcsSiteFn(ix, prop), recvTy, argc)
-}
-
-// Whether the graph registry holds a row for `prop` in module `spec` — in which case that
-// row's exact answer stands and the std catalog's row for the same pair is not asked.
-function ufcsRegistryHas(prop: string, spec: string) {
-  let i = 0
-  while i < ufcsImpName.length {
-    if ufcsImpName[i] == prop && ufcsImpSpec[i] == spec { return true }
-    i = i + 1
-  }
-  false
 }
 
 // D3122 — the std catalog's half of `ufcsMissingImportSpecs`: appends to `specs` each std
@@ -38498,25 +37613,6 @@ function stdRecvLeafTy(sp: string): i32 {
   if sp == "u8" { return TY_U8 }
   if sp == "void" || sp == "v128" { return -1 }
   primTyOfName(sp)
-}
-
-// The `,`-joined payload list, rendered for the SENTENCE: `a,b` → `"a", "b"`.
-// The two forms are built from the one string so the message and the code can
-// never name different modules.
-function specListQuoted(list: string) {
-  let out = ""
-  let start = 0
-  let i = 0
-  while i < list.length {
-    if list[i] == ',' {
-      if out != "" { out = out + ", " }
-      out = out + "\"" + list.slice(start, i) + "\""
-      start = i + 1
-    }
-    i = i + 1
-  }
-  if out != "" { out = out + ", " }
-  out + "\"" + list.slice(start, list.length) + "\""
 }
 
 // Bank the callee MEMBER node's missing-import answer for `memberFloorErr`.
@@ -38817,33 +37913,6 @@ function ufcsSelfAccepts(name: string, fnTy: i32, recvTy: i32): boolean {
   false
 }
 
-// Whether the scope's `self`-function `name` steps aside for the receiver's home module: only
-// when the receiver is a newtype and `self` is ANNOTATED with a concrete type that does not
-// name it. Declared names alone decide, so no field or body edit elsewhere re-routes a call
-// (DECISIONS.md §"UFCS is never implicit", D1984); every other scope binding keeps the call.
-function ufcsScopeStepsAside(name: string, fnTy: i32, recvTy: i32): boolean {
-  if fnTy < 0 { return false }
-  const nom = nomNameOfTy(recvTy)
-  if nom == "" { return false }
-  if !declFirstParamIsSelf(name) { return false }
-  const ps = fnDeclParamsOf(name)
-  if ps.length == 0 { return false }
-  const p0n = P.nodes[ps[0]]
-  if p0n is Param {
-    if p0n.parType < 0 { return false }
-  } else {
-    return false
-  }
-  const ft = T.tys[fnTy]
-  if ft is TyFunc {
-    if ft.fnParamTypes.length < 1 { return false }
-    const p0 = ft.fnParamTypes[0]
-    if p0 < 0 || tyHasHole(p0) { return false }
-    return !tyNamesNominal(p0, nom, 8)
-  }
-  false
-}
-
 // The type of `self` under the call's bindings. `substTyDeep` rebuilds a list as a mutable
 // one, so a `readonly T[]` parameter is re-wrapped as a view, or it would refuse its receiver.
 function substSelfTy(p0: i32, bNames: string[], bTys: i32[]): i32 {
@@ -38857,105 +37926,6 @@ function substSelfTy(p0: i32, bNames: string[], bTys: i32[]): i32 {
     }
   }
   sub
-}
-
-// The receiver expression of a member call `r.f(…)` or `r?.f(…)`, or -1 for any other callee.
-function ufcsRecvExpr(n: Call): i32 {
-  const c = P.nodes[n.callFn]
-  if c is Member { return c.memObj }
-  optChainRecvOf(n.callFn)
-}
-
-// The receiver of an optional-chain callee `r?.f`, or -1 for a callee that is not one.
-function optChainRecvOf(callFn: i32): i32 {
-  const c = P.nodes[callFn]
-  if c is OptMember { return c.omObj }
-  -1
-}
-
-// `Box$m1<i32>` → `Box$m1`: the declared head of a recovered type name.
-function ovNameHead(nm: string) {
-  let i = 0
-  while i < nm.length {
-    if nm[i] == '<' { return nm.slice(0, i) }
-    i = i + 1
-  }
-  nm
-}
-
-// The class of a receiver's type constructor, or "" when it has none: a nullable, a negation,
-// a record shape no declaration names, a hole, or a union whose members differ in class.
-function ovKindClass(ty: i32, depth: i32): string {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
-  const t = T.tys[ty]
-  let out = ""
-  match t {
-    TyPrim => {
-      out = ovPrimClass(t.primName)
-    }
-    TyLit => {
-      out = "num"
-      if t.litKind == "str" { out = "str" }
-    }
-    TyArray => {
-      out = "arr"
-    }
-    TyMap => {
-      out = "map"
-      if t.mSet == 1 { out = "set" }
-    }
-    TyFunc => {
-      out = "fn"
-    }
-    TyUnion => {
-      let i = 0
-      while i < t.uMembers.length {
-        const c = ovKindClass(t.uMembers[i], depth - 1)
-        if c == "" || (out != "" && c != out) { return "" }
-        out = c
-        i = i + 1
-      }
-    }
-    // None of these determines a constructor a candidate could be declared for.
-    TyErr => {}
-    TyObj => {}
-    TyNullable => {}
-    TyVar => {}
-    TyNeg => {}
-  }
-  out
-}
-
-// The head classes a receiver of `ty` is asked as: its declared names when it has any (a
-// record shape two declarations share answers to both, and then picks neither), else its
-// constructor's class. One level only, so adding a candidate never moves another call.
-function ovRecvHeads(ty: i32): string[] {
-  const out: string[] = []
-  if ty < 0 || ty >= T.tys.length { return out }
-  const nom = nomNameOfTy(ty)
-  if nom != "" {
-    out.push("rec:" + ovNameHead(nom))
-    return out
-  }
-  const t = T.tys[ty]
-  if t is TyObj {
-    let i = 0
-    while i < cStructTyIxs.length {
-      if cStructTyIxs[i] == ty {
-        const h = "rec:" + ovNameHead(cStructNames[i])
-        if !strListHas(out, h) { out.push(h) }
-      }
-      i = i + 1
-    }
-    const ga = genAppNameOfTy(ty)
-    if ga != "" && !strListHas(out, "rec:" + ovNameHead(ga)) {
-      out.push("rec:" + ovNameHead(ga))
-    }
-    return out
-  }
-  const c = ovKindClass(ty, 8)
-  if c != "" { out.push(c) }
-  out
 }
 
 // The `self`-function of set `row` a receiver of `recvTy` selects: the one whose head is the
@@ -38979,20 +37949,6 @@ export function ovPickFor(row: i32, recvTy: i32): string {
     }
   }
   found
-}
-
-// `.prop(…)` refused for set `row`: the one sentence every such refusal opens with.
-function ovChooseMsg(row: i32, prop: string, tail: string): string {
-  "`." + prop + "(…)` cannot choose between " + ovCandsText(row) + tail
-}
-
-// The head class a parameter of type `ty` declares, the arena twin of the merge's
-// `modOvHeadOfTs`: a union, a hole or an undeclared shape overlaps every class.
-function ovParamHead(ty: i32): string {
-  if ty < 0 || ty >= T.tys.length { return "any" }
-  const hs = ovRecvHeads(ty)
-  if hs.length != 1 || T.tys[ty] is TyUnion { return "any" }
-  hs[0]
 }
 
 // A member call whose receiver each instance supplies (an un-annotated or type-parameter
@@ -39127,101 +38083,6 @@ function ovPinCheck(
     }
   }
   0
-}
-
-// How many candidates of set `row` take a receiver at all (`self`-functions).
-function ovSelfCount(row: i32) {
-  let n = 0
-  for c in ovSetCands[row] {
-    if declFirstParamIsSelf(c) { n = n + 1 }
-  }
-  n
-}
-
-// Whether a list or map receiver still has an unpinned element (`[]`, `Map()`).
-function ovRecvOpen(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
-  let open = false
-  match t {
-    TyArray => {
-      open = t.aElem < 0
-    }
-    TyMap => {
-      open = t.mKey < 0 || t.mVal < 0
-    }
-    // No element slot an empty literal could leave open.
-    TyPrim => {}
-    TyErr => {}
-    TyObj => {}
-    TyFunc => {}
-    TyUnion => {}
-    TyNullable => {}
-    TyVar => {}
-    TyLit => {}
-    TyNeg => {}
-  }
-  open
-}
-
-// The tail a plain call to a local function adds when the name also has imported candidates:
-// the call reached the local one, and the imports are reached as methods. "" otherwise.
-function ovPlainHint(callIx: i32): string {
-  const row = ovPlainSetOf(callIx)
-  if row < 0 { return "" }
-  let others = ""
-  let k = 1
-  while k < ovSetCands[row].length {
-    if others != "" { others = others + ", " }
-    others = others + ovCandText(row, k)
-    k = k + 1
-  }
-  " — the plain call reaches the local `"
-    + ovSetName[row]
-    + "`; "
-    + others
-    + " is reached as a method, `x."
-    + ovSetName[row]
-    + "(…)`"
-}
-
-// The refusal for a member call `.prop(…)` on `recvTy` that set `row` cannot answer.
-function ovRefuseMsg(
-  row: i32,
-  prop: string,
-  recvTy: i32,
-  pick: string,
-): string {
-  const cands = ovCandsText(row)
-  const rs = tyToStrUser(recvTy)
-  if pick == "*" {
-    return "`."
-      + prop
-      + "(…)` on "
-      + rs
-      + " matches more than one of "
-      + cands
-      + ": the receiver's shape is declared under more than one name — rename one import with `as`"
-  }
-  if ovRecvHeads(recvTy).length == 0 {
-    let tail = "annotate the receiver with the type to call it on, or rename one import with `as`"
-    if T.tys[recvTy] is TyNullable {
-      tail = "a nullable receiver is called as `x?." + prop + "(…)`"
-    } else if T.tys[recvTy] is TyUnion {
-      tail = "its members span head classes; narrow it (`if x is …`) before the call"
-    }
-    return ovChooseMsg(
-      row,
-      prop,
-      ": the receiver's type " + rs + " does not determine one — " + tail,
-    )
-  }
-  "no `"
-    + prop
-    + "` here takes a receiver of type "
-    + rs
-    + ": the candidates are "
-    + cands
 }
 
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
@@ -39796,18 +38657,6 @@ function listMethodMutates(p: string): boolean {
 function listBuiltResultTy(recvTy: i32, elem: i32, ro: i32): i32 {
   if ro == 1 { return mkArrayTy(elem) }
   recvTy
-}
-
-// The one sentence every write refused through a view carries: which write, the view it
-// went through, and the spelling that would allow it.
-function roWriteMsg(what: string, recvTy: i32): string {
-  what
-    + " writes the list, and "
-    + tyToStrUser(recvTy)
-    + " is a read-only view — it may be read and its elements' own fields written, never "
-    + "the list itself. Declare the handle "
-    + tyToStrUser(mkArrayTy(tyArrayElemIx(recvTy)))
-    + " if it must be written through."
 }
 
 // Whether a `self`-function named `prop` is in scope at member call `ix`, so a hole receiver

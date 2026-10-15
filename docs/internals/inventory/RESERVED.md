@@ -101,4 +101,4 @@ D4842-D4845  lane-SC  2026-10-15  L1 step 5 (capture cells): D4842 filed open (a
 D4846-D4849  lane-SC  2026-10-15  L1 step 7 (a generic delivered at the enclosing generic's type parameters): none filed
 D4850-D4853  lane-L2  2026-10-15  L2 §13.27 (hole lists): none filed
 D4854-D4857  lane-L2  2026-10-15  L2 §13.29 (box-element lists): D4854 filed closed (a captured walk variable over a local box-element list literal typed from its first element)
-D4870-D4873  lane-D4861  2026-10-15  closing D4861 (a list literal joins its elements like an `if`): D4870 (`.map` returning a list), D4871 (annotated spread of a fresh nested literal) filed open
+D4862-D4865  lane-L2  2026-10-15  L2 §13.30 (a kept-apart list join re-joined at the pin): D3367 closed, D4862 filed open (a type parameter's list and a concrete list collapse at a nullable-element pin)
