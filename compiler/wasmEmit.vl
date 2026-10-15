@@ -748,6 +748,8 @@ import {
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
+  atomLeafListArmTag,
+  atomLeafListDepthOfTy,
   atomListArmTag,
   atomNarrowOp,
   bcSpineEnter,
@@ -2720,6 +2722,8 @@ function isArmTagOfTy(ity: i32): i32 {
   if unMemIsMap(ity) {
     return mapArmTagOfTy(ity, mapShapeFoldSet(mapArmShapeOfTy(ity)))
   }
+  const ad = atomLeafListArmTag(atomLeafListDepthOfTy(ity))
+  if ad >= 0 { return ad }
   // A nested boolean-leaf list shares its reflist slot with the `i32` twin, not its tag.
   const bd = boolLeafListDepthOfTy(ity)
   if bd >= 1 { return boolListArmTag(bd) }
@@ -3842,10 +3846,10 @@ function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
   placeNarrowKeyOf(recvIx)
 }
 
-// `x is L` for a list type `L` over a box union with a list arm that keeps its elements in
-// another rep yet may fit `L` (`string[]` beside a list of string literals): `L`'s own tag, or
-// each such arm's tag with its elements tested where they need not all fit (D4779). 0 when the
-// test is not that shape, 1 when emitted, -1 when refused.
+// `x is L` for a list type `L` over a box union with a list arm other than `L`: an arm fits when
+// every element does (D4771), so a `string[]` arm tests its strings against `L`'s literals
+// (D4779), an arm sharing `L`'s tag tests its atoms (D4938), and any other fits only when empty
+// (D4915). 0 when the test is not that shape, 1 when emitted, -1 when refused.
 function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const nd = P.nodes[isIx]
   if !(nd is IsExpr) { return 0 }
@@ -3857,52 +3861,107 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const atoms: string[] = []
   const arms: i32[] = []
   if !unionSetArmTys(nm, atoms, arms) { return 0 }
+  const chkTag = isArmTagOfTy(chk)
+  const chkLeaf = listLeafTyOf(chk)
+  const chkDepth = if tyIsLitUnion(chkLeaf) { atomLeafListDepthOfTy(chk) } else { -1 }
   const tags: i32[] = []
   const fits: i32[] = []
-  let across = false
+  const wraps: i32[] = []
+  const slotsAt: i32[][] = []
+  let own = false
+  let other = false
   for a in arms {
-    const own = tySame(a, chk)
-    const k = if own { 1 } else { listArmFitAcrossReps(a, chk) }
-    if k != 0 {
+    if tyArrayElemIx(a) >= 0 {
       const t = isArmTagOfTy(a)
       if t < 0 { return 0 }
-      tags.push(t)
-      fits.push(k)
-      if !own { across = true }
+      let k = if tySame(a, chk) { LIST_ARM_OWN } else { listArmFitAcrossReps(a, chk) }
+      const slots: i32[] = []
+      if k == 0 {
+        if t != chkTag {
+          k = LIST_ARM_EMPTY
+        } else if (
+          chkDepth >= 0
+          && atomLeafListDepthOfTy(a) == chkDepth
+          && atomArmSlots(a, chkDepth, slots)
+        ) {
+          k = LIST_ARM_ATOMS
+        } else {
+          return 0
+        }
+      }
+      if tySame(a, chk) { own = true } else { other = true }
+      let j = tags.length - 1
+      while j >= 0 && tags[j] != t { j = j - 1 }
+      if j < 0 {
+        tags.push(t)
+        fits.push(k)
+        wraps.push(listArmWrapOfTy(a))
+        slotsAt.push(slots)
+      } else if fits[j] != k {
+        // Only `L` itself and an arm whose atoms may fit `L` share a tag, and the atom test
+        // answers for both.
+        if k == LIST_ARM_ATOMS && fits[j] == LIST_ARM_OWN {
+          fits[j] = k
+          slotsAt[j] = slots
+        } else if !(k == LIST_ARM_OWN && fits[j] == LIST_ARM_ATOMS) {
+          return 0
+        }
+      }
     }
   }
-  if !across { return 0 }
+  if !other { return 0 }
+  let empties = false
+  let i = 0
+  while i < fits.length {
+    if fits[i] == LIST_ARM_EMPTY {
+      if !own || chkTag < 0 || wraps[i] < 0 { return 0 }
+      empties = true
+    }
+    i = i + 1
+  }
   const slot = sharedFieldRecvSlot()
   if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
   fbLocalSet(slot)
-  const lexes = tyLitMemberTexts(tyArrayElemIx(chk))
-  const noSlots: i32[] = []
+  const lexes = tyLitMemberTexts(chkLeaf)
   fbI32Const(0)
-  let i = 0
+  i = 0
   while i < tags.length {
     fbLocalGet(slot)
     fbRefAsNonNull()
     fbStructGet(uBoxIdx, 0)
     fbI32Const(tags[i])
     fbI32Bin(70) // 0x46 i32.eq
-    if fits[i] == 2 {
+    const k = fits[i]
+    if k != LIST_ARM_OWN {
       fbIf(127)
       fbLocalGet(slot)
       fbRefAsNonNull()
       fbStructGet(uBoxIdx, 1)
-      if emitUnionPayloadUnbox(body, 9) < 0 { return -1 }
-      const fit = emitListFitLoop(
-        body,
-        noSlots,
-        0,
-        false,
-        "str",
-        "str",
-        "str",
-        lexes,
-        fnIx,
-      )
-      if fit < 0 { return -1 }
+      if k == LIST_ARM_EMPTY {
+        fbRefCast(wraps[i])
+        fbStructGet(wraps[i], 1) // len
+        fbI32Eqz()
+      } else {
+        const str = k == LIST_ARM_STRS
+        const slots = slotsAt[i]
+        if slots.length > 0 {
+          fbRefCast(rlWrapIdx[slots[0]])
+        } else if emitUnionPayloadUnbox(body, if str { 9 } else { 7 }) < 0 {
+          return -1
+        }
+        const fit = emitListFitLoop(
+          body,
+          slots,
+          0,
+          false,
+          if str { "str" } else { "i32" },
+          if str { "str" } else { "i32" },
+          if str { "str" } else { "atom" },
+          lexes,
+          fnIx,
+        )
+        if fit < 0 { return -1 }
+      }
       fbElse()
       fbI32Const(0)
       fbEnd()
@@ -3910,6 +3969,120 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     fbI32Bin(114) // 0x72 i32.or
     i = i + 1
   }
+  if empties {
+    return emitListIsRebox(nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
+  }
+  1
+}
+
+// How `emitListIsAcrossReps` tests one tag: by the tag alone (`L`, or an arm every element of
+// which fits), a `string[]` arm's strings, an empty disjoint-rep arm, or an atom arm's atoms.
+const LIST_ARM_OWN = 1
+const LIST_ARM_STRS = 2
+const LIST_ARM_EMPTY = 3
+const LIST_ARM_ATOMS = 4
+
+// The innermost element type of list type `ty`, below every list layer.
+function listLeafTyOf(ty: i32): i32 {
+  let cur = ty
+  let guard = 0
+  while tyArrayElemIx(cur) >= 0 && guard < 64 {
+    cur = tyArrayElemIx(cur)
+    guard = guard + 1
+  }
+  cur
+}
+
+// Pushes onto `slots` the reflist slot of each of the `depth` outer layers of the atom-leaf list
+// arm `a`, outermost first, as `emitListFitLoop` walks them; false when a layer is not the
+// reflist its type names.
+function atomArmSlots(a: i32, depth: i32, slots: i32[]): boolean {
+  if depth == 0 { return true }
+  let s = rlSlotOfTy(tyRefArrElemOf(a))
+  let k = 0
+  while k < depth {
+    if s < 0 || s >= rlElemKindTbl.length || s >= rlWrapIdx.length {
+      return false
+    }
+    slots.push(s)
+    const ek = rlElemKindTbl[s]
+    if k < depth - 1 {
+      if ek != RLK_REF_LIST { return false }
+      s = rlElemInnerSlot(s)
+    } else if ek != RLK_I32_LIST {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+// The wrapper heap type list arm `a` rides a box's payload in, or -1.
+function listArmWrapOfTy(a: i32): i32 {
+  const lw = listWrapHeapOfKind(unMemAtomKind(a))
+  if lw >= 0 { return lw }
+  if !unMemIsRefElemArray(a) { return -1 }
+  const sl = rlSlotOfTy(tyRefArrElemOf(a))
+  if sl < 0 || sl >= rlWrapIdx.length { return -1 }
+  rlWrapIdx[sl]
+}
+
+// With an `is L` answer on the stack, re-boxes receiver `recv` (staged in `slot`) as an empty
+// `L` when it fitted as an empty list of another arm, so the narrowed branch reads an `L`
+// payload when `recv` is a binding it can store back to.
+function emitListIsRebox(
+  recv: i32,
+  slot: i32,
+  chk: i32,
+  chkTag: i32,
+  tags: i32[],
+  fits: i32[],
+  fnIx: i32,
+): i32 {
+  const chkWrap = listArmWrapOfTy(chk)
+  const chkBack = if chkWrap < 0 { -1 } else { listBackOfWrap(chkWrap) }
+  const rn = P.nodes[recv]
+  let local = -1
+  let glob = -1
+  if rn is Ident {
+    const li = localIndexOf(fnIx, rn.identName)
+    if li >= 0 && identSlotIsUnionBox(fnIx, rn.identName) { local = li }
+    if li < 0 && !capturedIsUnionBox(fnIx, rn.identName) {
+      const g = globalIndexOf(rn.identName)
+      if g >= 0 && !globalCellIsImmutable(g) { glob = g }
+    }
+  }
+  // A capture, field or element is not stored back, so its narrowed read of such an empty list
+  // traps on the cast (D4939) where the tag alone took the wrong branch.
+  if chkBack < 0 || (local < 0 && glob < 0) { return 1 }
+  const res = listFitSlot("i32", 0, 4)
+  fbLocalTee(res)
+  fbIf(64)
+  fbI32Const(0)
+  let i = 0
+  while i < tags.length {
+    if fits[i] == LIST_ARM_EMPTY {
+      fbLocalGet(slot)
+      fbRefAsNonNull()
+      fbStructGet(uBoxIdx, 0)
+      fbI32Const(tags[i])
+      fbI32Bin(70) // 0x46 i32.eq
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    i = i + 1
+  }
+  fbIf(64)
+  fbI32Const(chkTag)
+  fbBacking(chkBack, 0)
+  fbI32Const(0)
+  fbI32Const(0)
+  fbStructNew(chkWrap)
+  fbStructNew(uBoxIdx)
+  if local >= 0 { fbLocalSet(local) }
+  else if emitUserGlobalSet(glob) < 0 { return -1 }
+  fbEnd()
+  fbEnd()
+  fbLocalGet(res)
   1
 }
 

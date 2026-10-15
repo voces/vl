@@ -10282,8 +10282,12 @@ elements do.
 D4058 keeps a record's declared type. A box union's list arm is tested by its tag only where
 the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests its elements,
 and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
-string-literal atoms beside an `i32[]` arm holds its own tag (D4906). `is K[]` with a numeric
-`K` over a union with no `K[]` arm is still refused (D4778).
+string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every list depth
+(D4914), and two atom-list arms sharing a tag test their atoms (D4938). An arm in a disjoint
+rep fits when it is empty (D4915): a local or global binding it narrows is re-boxed as an empty
+list of the tested arm, so the then-branch reads that arm's rep; a capture, field or element
+receiver cannot be stored back and still traps on its narrowed read (D4939). `is K[]` with a
+numeric `K` over a union with no `K[]` arm is still refused (D4778).
 
 ## A reassigned function binding called at several types holds one closure per type (owner ruling, 2026-10-15) — D3975
 

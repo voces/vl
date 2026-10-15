@@ -759,6 +759,7 @@ import {
   unTyIx,
   unVarCount,
   unVarStart,
+  vbAtomListTop,
   vbAtomListUsed,
   vbBoolListTop,
   vbF32Used,
@@ -31034,6 +31035,8 @@ export function forInVarIsLitAtom(
   fnIx: i32,
   ek: VKind | null,
 ): boolean {
+  // A string list holds refs whatever literal-union list an `is` narrowed it to (D4916).
+  if exprListRep(iterIx, fnIx) == "strlist" { return false }
   if nodeArrayElemIsLitUnion(iterIx) || nodeArrayElemIsNulLitUnion(iterIx) {
     return true
   }
@@ -31555,6 +31558,8 @@ function declLitUnionTyAt(
 // neither is a parameter or a global, both of which reach their elements by another route.
 function idxRecvIsStrList(arrIx: i32, fnIx: i32) {
   if fnIx < 0 { return false }
+  // An instance's string-list parameter narrowed to a literal-union list by `is` (D4916).
+  if exprListRep(arrIx, fnIx) == "strlist" { return true }
   const n = P.nodes[unwrapParen(arrIx)]
   if n is Ident {
     const d = bindingDeclInScope(n.identName)
@@ -32812,6 +32817,7 @@ export function scalarTagOf(atom: string) {
 // settled before `emitModule` runs. Conditional rather than a flat 14, since a flat lift
 // would renumber every tag in a program with no `u8[]`, though any base keeps the three bands disjoint.
 export function uAtomBandTop(): i32 {
+  if vbAtomListTop >= 1 { return atomListCode() + vbAtomListTop + 1 }
   if vbAtomListUsed { return atomListCode() + 1 }
   atomListCode()
 }
@@ -32953,7 +32959,69 @@ export function refArrBoxTagOf(ix: i32, fnIx: i32, slot: i32, un: string): i32 {
   if c >= 19 && unionHasBoolLeafArm(un, c - 18) {
     return boolListArmTag(c - 18)
   }
+  if vbAtomListTop >= 1 {
+    const ad = exprAtomLeafListDepth(ix, fnIx)
+    if ad >= 1 && unionHasAtomLeafArm(un, ad) { return atomLeafListArmTag(ad) }
+  }
   refArrSlotTag(slot)
+}
+
+// How many list layers sit above a literal-union leaf, less one: 0 for `K[]`, 1 for `K[][]`;
+// -1 for any other type. A nullable literal-union leaf counts; a nullable list layer does not.
+export function atomLeafListDepthOfTy(ty: i32): i32 {
+  let cur = ty
+  let d = -1
+  while cur >= 0 && cur < T.tys.length && d < 64 {
+    const t = T.tys[cur]
+    if !(t is TyArray) {
+      if d >= 0 && (tyIsLitUnion(cur) || tyIsNullableLitUnion(cur)) { return d }
+      return -1
+    }
+    cur = t.aElem
+    d = d + 1
+  }
+  -1
+}
+
+// `atomLeafListDepthOfTy` of the value `ix` builds: its recorded type's, else its operand or
+// pinned type's, else for a list literal one more than its first element's; -1 otherwise.
+function exprAtomLeafListDepth(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const bix = unwrapParen(ix)
+  if bix < 0 || bix >= P.nodes.length { return -1 }
+  const d = atomLeafListDepthOfTy(nodeTyIxOf(bix))
+  if d >= 0 { return d }
+  const ed = atomLeafListDepthOfTy(exactOperandTyOf(bix, fnIx))
+  if ed >= 0 { return ed }
+  const pd = atomLeafListDepthOfTy(nodeTyPinIxOf(bix))
+  if pd >= 0 { return pd }
+  const init = frameLetInitOf(bix, fnIx)
+  if init >= 0 { return exprAtomLeafListDepth(init, fnIx) }
+  const n = P.nodes[bix]
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return -1 }
+  const e = n.arrElems[0]
+  if exprIsLitAtom(e, fnIx) { return 0 }
+  const sd = exprAtomLeafListDepth(e, fnIx)
+  if sd >= 0 { return sd + 1 }
+  -1
+}
+
+// Whether union `un` has the literal-union-leaf list arm of depth `d`.
+function unionHasAtomLeafArm(un: string, d: i32): boolean {
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if !unionSetArmTys(un, atoms, tys) { return false }
+  for t in tys {
+    if atomLeafListDepthOfTy(t) == d { return true }
+  }
+  false
+}
+
+// The box tag of the nested literal-union-leaf list arm of depth `d >= 1`, or -1 when no union
+// registered one that deep.
+export function atomLeafListArmTag(d: i32): i32 {
+  if d < 1 || d > vbAtomListTop { return -1 }
+  scalarTagOfKind(atomListCode() + d)
 }
 
 // Whether union `un` has the boolean-leaf list arm of depth `d`.
@@ -35133,7 +35201,29 @@ export function markRefArrayArms(name: string) {
     }
     i = i + 1
   }
+  if cov { markAtomLeafListArms(mems) }
   0
+}
+
+// Lifts `vbAtomListTop` to the depth of every nested literal-union-leaf list arm of `mems` that
+// shares its reflist slot with another arm, which would otherwise answer its tag too (D4914).
+function markAtomLeafListArms(mems: i32[]) {
+  for a in mems {
+    const d = atomLeafListDepthOfTy(a)
+    if d >= 1 && d > vbAtomListTop && unMemIsRefElemArray(a) {
+      const sl = rlSlotOfTy(tyRefArrElemOf(a))
+      for b in mems {
+        if (
+          b != a
+          && sl >= 0
+          && atomLeafListDepthOfTy(b) != d
+          && unMemIsRefElemArray(b)
+        ) {
+          if rlSlotOfTy(tyRefArrElemOf(b)) == sl { vbAtomListTop = d }
+        }
+      }
+    }
+  }
 }
 
 // Interns the map value-slot for every map arm of the union `name` — its box payload rides
