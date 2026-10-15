@@ -3935,3 +3935,81 @@ candidate 5,710,509, +251.
 * The `if` join recorded as `T[]` at a pin (D2832).
 * The narrowed family, and the scope callers.
 * `["p", 1] + ["q"]`, the emit refusal over two list reps.
+
+### 13.31 The three small DIFF classes: an f32 list, a shared generic literal, a generic callee's row
+
+After §13.30, three small `listRep` DIFF classes remain in `tests/cases`. Each was settled by
+running the program, disassembling it, and writing its un-annotated spelling and a second
+delivery position.
+
+**`f32list -> f64list`, 3 notes, `numerics/f32-literal-tails-of-value-if.vl`. The ladder is
+right.** In `const xs: f32[] = [if c { 0.25 } else { 1 }]`, each tail adopts `f32` (D2619) and
+the emitter builds an `f32` array. The literal itself stayed recorded `f64[]`, so the column
+answered the f64 list. `assignableExpr` now records the destination on the literal when its
+elements are delivered into an `f32` element over a recorded `f64` one (`f32ElemsAdoptedOver`).
+A wrapping paren takes the same record (`f32ListUnder`). Without that, `(_q0) => ([1.5])` into
+`(i32) => f32[]` (`closures/lambda-array-result-adopt.vl`) grew 6 new notes of the same class.
+The fixture's wasm loses two dead types (an `f64` array and its wrapper) and is otherwise the
+same.
+
+**`f64list -> list`, 3 notes, `generics/for-in-generic-call-result-at-pin.vl`. The program
+was wrong: [D4866](inventory/D4866.md), check-clean invalid wasm.** `validateRetCstrs` re-asks
+a generic's return constraint at each call through `litPinAssignable`. `recordElemRepArrayLit`
+then stamped one instance's `(string | null)[]` on the body's `[u]`, a node every instance
+shares. With `wrap<U>(u: U): U[] { [u] }`, a `string | null` instance next to an `i32` or `f64`
+one built an `i32` list into the string-ref list's slot. This failed at the return and binding
+positions; at the field position it was a loud emit reject. The function now records nothing
+under a pin's re-check. Disassembly shows the instances' distinct signatures,
+`(param (ref null $2)) (result (ref $5))` and `(param i32) (result (ref $3))`. The fixture
+`generics/generic-list-literal-shared-by-nullable-instance.vl` covers the return, binding,
+field and un-annotated faces. An argument delivery (`take([u])`) ran before and after.
+
+**`list -> reflist`, 6 notes, `generics/generic-list-literal-inferred-return.vl` (5) and
+`generics/inferred-nullable-type-param-list.vl` (1). The column is right.** `dispatchRewrite`
+runs before monomorphization and asks `exprListRep` of a generic call. `calleeListRep` answered
+from the template's row, which says `list`. `calleeListRep` now answers nothing for a callee
+with type parameters, and the column answers. Both files' wasm is unchanged.
+
+**Counts.** Plain `listRep` notes in `tests/cases`, base master `186dcdd16` (§13.30 and
+D4861), candidate this change.
+
+| class | before | after |
+| --- | --- | --- |
+| `f32list -> f64list` | 3 | 0 |
+| `f64list -> list` | 3 | 0 |
+| `list -> reflist` | 6 | 0 |
+| `f64list -> none` | 4 | 0 |
+| `reflist -> none` | 36 | 34 |
+| `list -> unc` | 14 | 7 |
+| every other class | 111 | 111 |
+
+The `-> none` and `-> unc` moves come from the same two rungs. Nothing was aimed at them:
+
+* `nullable-literal-slice-bound-and-returned.vl` `list -> unc` ×7, and
+  `return-join-nested-type-param-list.vl` `reflist -> none` ×2, go with the generic callee's row.
+* `globals/nullable-global-null-list-seeds.vl` `f64list -> none` ×4 goes with the f32 record. Its
+  narrowed read now notes `f32list -> none` ×8 (scope family `narrowed`).
+* In the `open` family, `return-join-{nested,own-list-before}-generic-two-lists.vl` lose
+  `f64list -> none` ×3 each, and the second gains `list -> unc` ×12.
+* The new fixture carries `open` `list -> unc` ×48.
+
+No output changes in any of these files.
+
+**Checks.** Rebased on master `186dcdd16`. The base fixpoint is 5,713,087 bytes and the
+candidate 5,713,599, +512.
+
+* `difftree --identity` over master's 15,186 files: the candidate compiling master's source gives
+  master's fixpoint. **10,227 built, 2 differ, 0 uncompared.** The 2 are the new fixture (an emit
+  reject on master) and `f32-literal-tails-of-value-if.vl` (two dead types gone).
+* Native fixpoint holds at 5,713,599 bytes.
+* `regress.vl`: 0 runs lost, 0 to silent, no cell changed class.
+* `rep-fuzz-check` is exact, with 0 baselined failures.
+* `lint-self` is clean, and `seed-size --check` passes (+1.2% on its baseline).
+* `check-filed-witnesses --strict` over both inventories: 2,769 graded, 2,769 as filed, 0 moved.
+* `SELFHOST_NATIVE_ALIGN=1` over `tests/selfhost_native_*_test.ts`: 5,246 passed, 0 failed.
+
+**Next.**
+* The `-> none` class: 34 `reflist -> none` and the rest in `tests/cases`, and the 12
+  `rv3310_in_*` notes in `named/`.
+* The `unc` notes, where the column does not cover the node.
+* D4862, D3368, the `if` join at a pin (D2832), the narrowed family, the scope callers.
