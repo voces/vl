@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a list `+` over two reps copies the narrower operand into the wider rep, D4858 (found during campaign §13.29). Next: the `-> none` class, the remaining DIFF, the `if` join at a pin (D2832), the narrowed family, the scope callers. | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a list literal joins its elements like an `if` joins its arms, so an existing inner list never widens by copy, D4861. Next: the `-> none` class, the remaining DIFF, the `if` join at a pin (D2832), the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: step 7 done; its refusal names the pin and the delivery. Next: step 8, the multi-pin decision (D3975), then the (c) literal; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -259,6 +259,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - A parenthesised read and a `?.` read of a list fall back to the column, as the `Ident`/`Member`/`Call` rungs do; the `if` join stays none because its recorded `T[]` is a union box at a pin (D2832): `tests/cases` like-for-like RIGHT-ONLY 1,476 → 28, `named/` 10 → 0, LEFT-ONLY unchanged; 0 modules differ (campaign §13.28).
 - A list whose element type is a value union the column boxes reads the ref list (`valueUnionBoxList`), and a captured walk variable over such a literal built at its destination's row binds the box: `tests/cases` like-for-like DIFF 180 → 12, `-> none` / LEFT-ONLY / RIGHT-ONLY unchanged; 0 modules differ over master's tree; D4854 (check-clean invalid wasm) filed and closed (campaign §13.29).
 - A list `+` over two reps, one assignable to the other, copies the narrower operand into the wider rep (boxed into a union row, or widened element-wise between scalar lists): D4858 closes, and three 48-cell position matrices (`list-concat-*`) go from refused to runs in both faces with 0 silent; D4859–D4861 filed open (found during campaign §13.29).
+- A list literal's elements and a spread or list `+` operand one level down go through the `if` join's container rule (`listJoinWidenCheck`, `ljwCopiedLevelCheck`): D4861 closes as a check reject (was check-clean invalid wasm; `b + a` was a loud emit reject), the `nested-list-widen-runtime` matrix goes from 19 silent to 0 and `nested-list-widen-fresh` keeps its 20 runs; difftree identity 15181 files, 0 differ; D4870, D4871 filed open.
 
 ### L3 log
 
