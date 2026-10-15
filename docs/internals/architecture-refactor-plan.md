@@ -24,7 +24,7 @@ restate measurements; follow the links.
 | item | state | where |
 | --- | --- | --- |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, seventh part retires `monoStoreAnnName` (a store, push or map set into a binding's slot delivers at the table's per-slot pin). Next: the concrete half of `monoNotePushDeliveries` and the literal arms of `monoCoerceFnValueName`; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a nullable value-union list element only an instance forms reads the column (campaign §13.21). Next: the typed remainders (`_[] | null` first, then `d3140_*`), the untyped `d3125_*` calls, `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a call an instance re-makes records its template's type (campaign §13.22). Next: the untyped remainders by minting pass (mono `if`, `captureBoxRewrite` `Index`), the typed remainders (`_[] | null`, `d3140_*`), `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
@@ -241,6 +241,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - A narrowed place read records a type at each receiver node: `Ident` LEFT-ONLY 881 → 341 in `tests/cases`, 861 → 227 in `named/`, no output changes; the 154 left at no type are mono clones (campaign §13.19).
 - A capture cell seeded from another cell's read carries that read's type: `Ident` LEFT-ONLY 341 → 187 in `tests/cases`, no output changes; the 154 nodes were minted by `captureBoxRewrite`, not mono (campaign §13.20).
 - A nullable value-union list element only a generic instance forms (`(i32 | string | null)[]`) reads the column through the inner box's row: `named/` like-for-like LEFT-ONLY 2,520 → 2,295, `tests/cases` unchanged, 0 modules differ (campaign §13.21).
+- A call a generic instance re-makes records its template's type: the 1,744 untyped `d3125_*` `Call` notes go to 0, `named/` like-for-like LEFT-ONLY 2,295 → 551, `tests/cases` 2,444 → 1,376, 3 modules differ (a re-made closure whose tail is an assignment now returns its value, as the non-generic twin does) (campaign §13.22).
 
 ### L3 log
 
