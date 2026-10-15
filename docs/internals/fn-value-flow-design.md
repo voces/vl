@@ -894,6 +894,27 @@ A step lands only with 0 `runs → not-runs` and 0 new silent cells.
      twice when pin and element type agreed, and the second pass read `k` through the alias's
      global. In `closures/hole-lambda-pushed-into-typed-list` the edge alone moves it: `c` no
      longer shares its pushes' pin, so `fs[0] = c` reads the instance's global directly.
+   - Tenth PR: the element store `p[k] = v` in `monoWalk` stops reading the element's concrete
+     type (`monoMapValTy` retires). A store delivers at the table's pin of the place's slot only
+     (`monoDeliverAtPin`). Removing the old read exposed a defect: `monoPlaceRoot` refused
+     every `name[0]` as a capture cell's read, because `monoCellReadName` is purely syntactic,
+     so a user store `fs[0] = v` had no place root and its pin was always "". `monoIsCellRead`
+     now also requires that the binding is the one the capture rewrite declared. A capture
+     cell's own store `cell[0] = v` coerces at the cell declaration's `e` pin. Two cases stay
+     with the cell path. The per-signature instance of a hole lambda stays there: a delivery
+     there makes a reassigned binding hold calls at two argument types. A value read through
+     another cell stays there too: coercing it leaves the written binding's type unsettled.
+     Forcing the pin empty loses the same 12 fixtures as removing both old `Index` arms, and
+     0 of 3,844 `@run` fixtures move. Four modules of 10,204 change bytes, with the same
+     output:
+     - In `fn-scope-alias-same-name-two-functions` two instances swap order.
+     - In `delivered-alias-function-scope` the instance globals reorder, and one store reads
+       the instance's global directly.
+     - In `hole-lambda-binding-one-signature` the cell store `d1 = d1`, in a writer that is
+       never called, no longer coerces, so two calls through the binding become direct.
+     - In `captured-cell-unnamed-writer-two-instances` the uncalled `flip` of the `string`
+       frame stores `other`'s `string` instance. The old element-type read stored the `i32`
+       instance there.
 5. **Capture cells.**
    - Retires `monoCellValueTake*`, `monoCellSeed*`, `monoCoerceWrittenCell`,
      `monoAliasCellRead`, `monoCellCall`, `monoRetypeLamCells` and the cell-fail helpers.
