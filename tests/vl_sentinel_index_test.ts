@@ -57,6 +57,8 @@ type Fixture = {
   strict: string[];
   /** A substring the ONE message of its code must contain. */
   says?: { code: string; text: string };
+  /** Sibling modules written beside the fixture before it is graded. */
+  deps?: { name: string; src: string }[];
 };
 
 // Every fixture declares its own tables and readers, so nothing here depends on the
@@ -270,6 +272,38 @@ function reader(n: i32): i32 {
     strict: ["16:3"],
     says: { code: STRICT, text: "`slotOfStrict`, which can answer in band" },
   },
+  {
+    // An IMPORTED map global is a key subscript like a module-local one, under its own name
+    // or an `as` alias; an imported LIST is still a table. Moving a map to another module
+    // (#3788's `fnDeclIx`) must not turn its reads into hits.
+    name: "imported.vl",
+    deps: [{
+      name: "imported_tables.vl",
+      src: `export let byName: {[string]: i32} = Map()
+export let tys: i32[] = []
+`,
+    }],
+    src: `import { byName, byName as named, tys } from "./imported_tables"
+
+function slotOf(n: i32): i32 {
+  if n > 3 { return n }
+  -1
+}
+
+function keyOf(n: i32): string {
+  if n > 0 { return "a" }
+  ""
+}
+
+function viaMap(n: i32): i32 {
+  const k = keyOf(n)
+  const s = slotOf(n)
+  (byName[k] ?? 0) + (named[k] ?? 0) + tys[s]
+}
+`,
+    unguarded: ["16:40"],
+    strict: [],
+  },
 ];
 
 type Hits = { at: Record<string, string[]>; msgs: Record<string, string[]> };
@@ -331,6 +365,9 @@ Deno.test({
 
     for (const f of FIXTURES) {
       const path = `${dir}/compiler/${f.name}`;
+      for (const d of f.deps ?? []) {
+        await Deno.writeTextFile(`${dir}/compiler/${d.name}`, d.src);
+      }
       await Deno.writeTextFile(path, f.src);
       const s = await script(path);
       const l = await lint(dir, f.name);
