@@ -1,0 +1,231 @@
+// The syntax steps of the write-effect summary (which cells a call may write) and the call tests
+// the narrowing kill asks (whether a call's callee is unresolved, or it may run a function it is
+// handed): the summary's set and marker helpers, the names a body binds only to a value it
+// builds, and whether an argument can be a function. The checker keeps the summaries and their
+// cycle state; nothing here reads them.
+// This module imports `./ast`, `./check_capture_walks`, `./check_node_tys`, `./check_scopes`,
+// `./check_ty_shape`, `./check_types` and `./listutil`.
+import {
+  ArrayLit,
+  BinExpr,
+  BoolLit,
+  Call,
+  CharLit,
+  FuncDecl,
+  Ident,
+  IsExpr,
+  LetDecl,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  P,
+  Paren,
+  StrLit,
+  Unary,
+  elseIfLink,
+  nodeIsTplHole,
+  nodeSpineChildren,
+} from "./ast"
+import { weSplit } from "./check_capture_walks"
+import { nodeTyOf } from "./check_node_tys"
+import { lookup, lookupFnDeclNode } from "./check_scopes"
+import { crTyHasFn, crTyIsScalar } from "./check_ty_shape"
+import { T, TyFunc, tyIsHole } from "./check_types"
+import { strListHas } from "./listutil"
+
+// `sum` with each shape kept once: a summary is a set, and one that repeats a callee's shapes per
+// call grows with every path through the call graph rather than with what it holds.
+export function weDedupe(sum: string): string {
+  if sum == "*" || sum == "" { return sum }
+  const parts = weSplit(sum)
+  const seen: {[string]: boolean} = Map()
+  let out = ""
+  let i = 0
+  while i < parts.length {
+    if !seen.has(parts[i]) {
+      seen[parts[i]] = true
+      out = out + parts[i] + ","
+    }
+    i = i + 1
+  }
+  out
+}
+
+export function weRebindShape(ix: i32, bound: string[]) {
+  const t = P.nodes[ix]
+  if t is Ident {
+    if !strListHas(bound, t.identName) { return "=" + t.identName + "," }
+  }
+  ""
+}
+
+export function weIsFreshName(ix: i32, fresh: string[]): boolean {
+  const n = P.nodes[ix]
+  if n is Ident { return strListHas(fresh, n.identName) }
+  false
+}
+
+// The declared parameter types of the function `d`, from the type its name is bound to; empty
+// when that binding is not `d`'s own.
+export function weDeclParamTys(d: i32): i32[] {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if fd.fnName != "" && lookupFnDeclNode(fd.fnName) == d {
+      const ft = lookup(fd.fnName)
+      if ft >= 0 {
+        const t = T.tys[ft]
+        if t is TyFunc { return t.fnParamTypes }
+      }
+    }
+  }
+  weNoTys
+}
+
+const weNoTys: i32[] = []
+
+// The non-negative integer spelled by the digits `t`, or -1.
+export function weDigits(t: string): i32 {
+  if t.length == 0 { return -1 }
+  let v = 0
+  let i = 0
+  while i < t.length {
+    if t[i] < '0' || t[i] > '9' { return -1 }
+    v = v * 10 + (t[i] - '0')
+    i = i + 1
+  }
+  v
+}
+
+// A summary's own `@i` markers answered opaque: a function whose parameters no call site binds.
+export function weClosed(sum: string): string {
+  if sum.indexOf("@") >= 0 { return "*" }
+  sum
+}
+
+// Whether the expression at `a` can never evaluate to a function, by its form alone: a literal, a
+// record or list built in place, a test, or an operator other than `??` and assignment. Asked
+// where a callee body's types may not be recorded yet.
+export function weNeverFn(a: i32): boolean {
+  const n = P.nodes[a]
+  if n is BinExpr { return n.binOp != "??" && n.binOp != "=" }
+  weNeverFnLeaf(a)
+}
+
+// `weNeverFn` for a node that is not an operator.
+function weNeverFnLeaf(a: i32): boolean {
+  const n = P.nodes[a]
+  if n is Paren { return weNeverFn(n.parInner) }
+  n is NumLit
+    || n is StrLit
+    || n is BoolLit
+    || n is NullLit
+    || n is CharLit
+    || n is Unary
+    || n is IsExpr
+    || n is ObjLit
+    || n is ArrayLit
+}
+
+// The names a body binds only by a `const` holding an object, list or map it builds there.
+export function weFreshNames(ix: i32, bound: string[], out: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if (
+      n.letKw == "const"
+      && weInitIsFresh(n.letInit)
+      && weBoundOnce(bound, n.letName)
+    ) {
+      out.push(n.letName)
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      weFreshNames(kids[i], bound, out)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+export function weBoundOnce(bound: string[], name: string): boolean {
+  let c = 0
+  let i = 0
+  while i < bound.length {
+    if bound[i] == name { c = c + 1 }
+    i = i + 1
+  }
+  c == 1
+}
+
+// Whether the expression at `ix` builds a new object, list or map: a literal, or `Map()`/`Set()`.
+export function weInitIsFresh(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      if cf.identName == "Map" || cf.identName == "Set" {
+        return lookup(cf.identName) < 0 && lookupFnDeclNode(cf.identName) < 0
+      }
+    }
+    return false
+  }
+  n is ObjLit || n is ArrayLit
+}
+
+// Whether the call at `callIx` counts as opaque only because its receiver's type is not known
+// yet: a method whose receiver is an inference hole, with no declaration of that name.
+export function crCalleeUnresolved(callIx: i32): boolean {
+  if callIx < 0 || callIx >= P.nodes.length { return false }
+  const cn = P.nodes[callIx]
+  if cn is Call {
+    const cf = P.nodes[cn.callFn]
+    if cf is Member {
+      if lookupFnDeclNode(cf.memProp) >= 0 { return false }
+      const rt = nodeTyOf(cf.memObj)
+      return rt < 0 || tyIsHole(rt)
+    }
+  }
+  false
+}
+
+// An interpolation hole's renderer over a scalar: std:fmt's `toString` of a primitive or a
+// union of them, which dispatches to no user code. A struct hole may reach a user `toString`.
+export function crIsScalarRender(cn: Call): boolean {
+  if cn.callArgs.length != 1 { return false }
+  const a = cn.callArgs[0]
+  if !nodeIsTplHole(a) { return false }
+  let t = nodeTyOf(a)
+  if t < 0 {
+    const an = P.nodes[a]
+    if an is Ident { t = lookup(an.identName) }
+  }
+  crTyIsScalar(t)
+}
+
+// Could the argument at `a` hold a function? A literal cannot; anything whose type is not yet
+// known is assumed to.
+export function crArgMayBeFn(a: i32): boolean {
+  const an = P.nodes[a]
+  if (
+    an is NumLit
+    || an is StrLit
+    || an is BoolLit
+    || an is NullLit
+    || an is CharLit
+  ) {
+    return false
+  }
+  let t = nodeTyOf(a)
+  if t < 0 {
+    if an is Ident { t = lookup(an.identName) }
+  }
+  if t < 0 { return true }
+  crTyHasFn(t)
+}
