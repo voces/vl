@@ -257,7 +257,6 @@ import {
   drwDispatchOp,
   gaeApplyFieldTy,
   gaeSplitArgs,
-  mapValNameOf,
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
@@ -297,6 +296,7 @@ import {
   fnFlowDeclPathPinSigs,
   fnFlowDeclPathSrcs,
   fnFlowDeclWritten,
+  fnFlowElemKind,
   fnFlowLamPin,
   fnFlowReadGenFn,
   fnFlowReadWritten,
@@ -13778,10 +13778,10 @@ function monoWalk(ix: i32, ctx: i32) {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
         }
       }
-      // A store into an element or a field of a local binding delivers at that slot's type as
-      // this instance spells it (D3909).
+      // A store into an element or a field of a binding delivers at the one signature the flow
+      // table pins that slot at in this frame (D3909).
       if tgt is Index || tgt is Member {
-        const sn = monoStoreAnnName(n.binLeft, ctx, 0)
+        const sn = monoPlacePinName(n.binLeft, "", ctx)
         if sn != "" {
           if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
         }
@@ -14162,20 +14162,17 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
   const cf = P.nodes[n.callFn]
   if !(cf is Member) { return 0 }
   if cf.memProp == "set" && n.callArgs.length == 2 {
-    const sv = mapValNameOf(monoStoreAnnName(cf.memObj, ctx, 0))
+    const sv = monoPlacePinName(cf.memObj, "v", ctx)
     if sv != "" {
-      if monoCoerceFnValueName(n.callArgs[1], normTypeAtom(sv), ctx, -1) < 0 {
-        return -1
-      }
+      if monoCoerceFnValueName(n.callArgs[1], sv, ctx, -1) < 0 { return -1 }
     }
     const vt = monoConcreteFnTyName(monoMapValTy(nodeTyIxOf(cf.memObj)))
     if vt == "" { return 0 }
     return monoNoteBindDeliveryAt(n.callArgs[1], vt, ctx)
   }
   if cf.memProp != "push" { return 0 }
-  const ln = monoStoreAnnName(cf.memObj, ctx, 0)
-  if nameIsArray(ln) {
-    const en = normTypeAtom(arrElemNameRaw(ln))
+  const en = monoPlacePinName(cf.memObj, "e", ctx)
+  if en != "" {
     for pa in n.callArgs {
       if monoCoerceFnValueName(pa, en, ctx, -1) < 0 { return -1 }
     }
@@ -14193,74 +14190,45 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
   0
 }
 
-// The type name a store into `e` (`fs[0]`, `r.f`, `fs[1][0]`) delivers at: the annotation of
-// the local binding at its root as this instance spells it, read down each index and field;
-// "" when the root is no annotated local of `ctx`.
-function monoStoreAnnName(e: i32, ctx: i32, depth: i32): string {
-  if e < 0 || ctx < 0 || depth > 16 { return "" }
+// The binding place `e` (`fs`, `fs[0]`, `r.f`, `gs[0][0]`) is rooted at, with each derived slot
+// step from it pushed onto `path` (`e` an element, `v` a map value, `f.<name>` a field); -1 when
+// the root is no name, or is a capture cell's read, which the cell path delivers.
+function monoPlaceRoot(e: i32, path: string[], depth: i32): i32 {
+  if depth > 16 { return -1 }
   const x = unwrapParen(e)
-  if x < 0 { return "" }
+  if x < 0 { return -1 }
   const n = P.nodes[x]
   if n is Index {
-    // A local narrowed from a nullable read is indexed past its `| null` (D3916).
-    const an = nonNulBaseOf(monoStoreAnnName(n.idxArr, ctx, depth + 1))
-    const mv = mapValNameOf(an)
-    if mv != "" { return normTypeAtom(mv) }
-    if !nameIsArray(an) { return "" }
-    return normTypeAtom(arrElemNameRaw(an))
+    if monoCellReadName(x) != "" { return -1 }
+    const d = monoPlaceRoot(n.idxArr, path, depth + 1)
+    path.push(fnFlowElemKind(n.idxArr))
+    return d
   }
   if n is Member {
-    return monoFieldAnnName(
-      monoStoreAnnName(n.memObj, ctx, depth + 1),
-      n.memProp,
-    )
+    const d = monoPlaceRoot(n.memObj, path, depth + 1)
+    path.push("f." + n.memProp)
+    return d
   }
-  monoLocalAnnName(x, ctx)
+  monoPlaceNameDecl(x)
 }
 
-// The type name of the local or parameter of `ctx` that `Ident` `x` reads, as this instance
-// spells it: its annotation, else an un-annotated local's inferred type at the instance's
-// bindings; "" for any other expression, or a type that still names a type variable.
-function monoLocalAnnName(x: i32, ctx: i32): string {
-  if x < 0 || ctx < 0 { return "" }
-  const n = P.nodes[x]
-  if !(n is Ident) { return "" }
-  const cf = P.nodes[ctx]
-  if !(cf is FuncDecl) { return "" }
-  const li = parentLetOfAt(cf.fnBody, sidOfNode(x), x)
-  if li >= 0 {
-    const d = P.nodes[li]
-    if d is LetDecl {
-      if d.letType >= 0 { return tyNameOf(d.letType) }
-      return monoInstTyName(nodeTyIxOf(d.letInit), ctx)
-    }
-    return ""
-  }
-  const pt = paramTypeNode(ctx, n.identName)
-  if pt < 0 { return "" }
-  tyNameOf(pt)
+// The declaration the name `x` reads; -1 for any other node, which roots no binding place.
+function monoPlaceNameDecl(x: i32): i32 {
+  if !(P.nodes[x] is Ident) { return -1 }
+  identDeclOf(x)
 }
 
-// Type `t` named at the bindings of the instance `ctx`, or "" while a type variable stays.
-function monoInstTyName(t: i32, ctx: i32): string {
-  if t < 0 { return "" }
-  const st = monoPinSubTyOf(t, ctx)
-  if st < 0 || tyHasTyVar(st) { return "" }
-  tyToEmitName(st)
-}
-
-// The type name of field `prop` of the record type `tname` names, or "".
-function monoFieldAnnName(tname: string, prop: string): string {
-  if tname == "" { return "" }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  if !monoStructFieldTypes(normTypeAtom(tname), fnames, ftexts) { return "" }
-  let k = 0
-  while k < fnames.length && k < ftexts.length {
-    if fnames[k] == prop { return normTypeAtom(ftexts[k]) }
-    k = k + 1
-  }
-  ""
+// The function type a value stored into place `e`, or into its slot `kid` when not "", delivers
+// at in frame `ctx`: the one signature the flow table pins that slot at; "" for none or two.
+function monoPlacePinName(e: i32, kid: string, ctx: i32): string {
+  const path: string[] = []
+  const d = monoPlaceRoot(e, path, 0)
+  if d < 0 { return "" }
+  if kid != "" { path.push(kid) }
+  const lf: i32[] = [ctx, d]
+  const pins = monoDeclPathPins(lf, path)
+  if pins.length != 1 { return "" }
+  monoSigFnTyName(pins[0] + ";")
 }
 
 // Whether list type `tname`'s element can hold a function value a level down: a list or a

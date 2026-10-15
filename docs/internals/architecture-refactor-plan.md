@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, sixth part retires `monoPinGenericList` (a list element pinned at the table's `e` signature, D4301). Next: the remaining step-4 retirements (`monoNotePushDeliveries`, `monoStoreAnnName`, the literal arms of `monoCoerceFnValueName`); D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
+| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 4, seventh part retires `monoStoreAnnName` (a store, push or map set into a binding's slot delivers at the table's per-slot pin). Next: the concrete half of `monoNotePushDeliveries` and the literal arms of `monoCoerceFnValueName`; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a narrowed place read records its receiver's types (campaign §13.19). Next: a type at the 154 mono-cloned `Ident` nodes, then `other` RIGHT-ONLY, the narrowed family, the scope callers. | [L2 log](#l2-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -214,6 +214,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - The other name lists stay name-keyed until a witness reaches them.
 - The fifth part retires `monoPinGenericRecord` (with `monoRecordFieldUses` and `monoMemberOfBinding`): a record field and its writes are pinned at the table's per-field signature, closing D4700.
 - The sixth part retires `monoPinGenericList` (with `monoFeIsSrc`, `monoCallsPerRead`, `monoPinSigWithRet`, `monoListElemWrites`, `monoListElemCalls`): a list element and its writes, `d[0] = v` included, are pinned at the table's `e` signature, and a spread copy re-plans the list it expanded into; closes D4301.
+- The seventh part retires `monoStoreAnnName` (with `monoLocalAnnName`, `monoInstTyName`, `monoFieldAnnName`): a store `p[k] = v` / `p.f = v`, a `push` and a map `set` deliver at the one signature the table pins the place's slot at in that frame, read by declaration and path; 0 of 1,679 generic and lambda fixtures and 0 corpus classes moved.
 
 ### L2 log
 
