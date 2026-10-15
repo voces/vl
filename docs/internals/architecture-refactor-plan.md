@@ -28,7 +28,7 @@ restate measurements; follow the links.
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
-| L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: memo module third PR (`MemoGen` generations), never-cleared 188 of 1,148 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
+| L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: `expCtxReset` clears the 17 pending seeds at compile start, never-cleared 172 of 1,156 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
 | L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
 | L6 registries by key | step 5 **in progress**. Last: second switch (#3661), `unionNameOfExpr/is` on the key, 12 sites. Next: `ctr/unionName` (site 42), blocked on the struct-union alias sibling (class As). | [L6 log](#l6-log) |
 | L10 the `-O` optimizer | **in progress as T4**. Last: R6a, the inline-record census (`compiler/opt_inline.vl`), runs beside the Rust. Next: R6b (walk and decision), R6c (rewrite), then R7, list flattening. | [L10 log](#l10-log) |
@@ -277,6 +277,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - Byte-identical over the difftree population; never-cleared **195 of 1,149**.
 - Third PR: a stamp generation is a registered `MemoGen` (`memoGenNew`, `memoGenAdvance`) that the compile reset advances and never restarts; `lrGen`, `rsQueryGen`, `msGen` and `fnPosEpoch` became generations, `scnEpoch` and `fdnEpoch` became keys (`scnGenKey`, `fdnGenKey`, plus `fnPosLenKey` restarting the position index's cursors when its epoch moves), and `capMemoGen` and `sblEpoch` were deleted: their tables are emptied at every bump, so a 1/-1 flag says the same.
 - Byte-identical over the difftree population, L2 fuel +0.04%; never-cleared **188 of 1,148**, and no hand stamp generation is left in this list.
+- Fourth PR: `expCtxReset` (beside `expCtxApply`) writes the 17 `pending*` seeds back to their declared defaults and is the second call in `emitProgram`, after `memoCompileReset`; it is in the audit's prologue list. Module identity over the difftree population (15,156 files, 10,196 built, 0 differ, fixpoint identical); the seed is 105 bytes larger (the new function); never-cleared **172 of 1,156**.
 
 ### L6 log
 
