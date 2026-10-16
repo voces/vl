@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the Deno stubs are `FS_FLOOR`'s names, read at load by `tests/support/hostFloor.ts`. Next: none in the floor; every copy reads the table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the one-slot checker hook (`checkerForceFn`) cut the operator-force back-edges, and seven `check_*.vl` modules took 17,550 lines out of `typecheck.vl` (29,495 → 11,945); L2 fuel is +2.33% over master, past the 0.6% budget. Next: decide the fuel budget for big carves, then drop the `emit_mono` re-exports once L6 lands. | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: `emit_mono.vl` imports the five names from their new homes and `typecheck.vl`'s re-exports are gone (seed byte-identical). Next: decide the fuel budget for big carves. | [L9 log](#l9-log) |
 | L12 | **in review**. Last: the playground adapter calls every `lsp/src/features.ts` function and gains references, highlights, outline and rename; playground TS 3,687 → 3,471 lines. Next: nothing; the lane is done once this merges. | [L12 log](#l12-log) |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -524,6 +524,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - L2 self-compile fuel is +2.33% over master, past the 0.6% budget. The compilers are equally fast: one source compiled by master's seed and by the candidate reads the same within 0.0003%. The cost is the source's shape: the hook alone is +0.51%, and the carve adds +1.80%.
   - The carve's cost grows with the lines moved, about 0.1% per 1,000. Measured parts: the new import names (about 900, +0.26%), the new exports (243, +0.10%) and declaration order (+0.16%); the rest was not localised. So any carve of 8,000 lines or more misses a 0.6% budget, and the budget for big carves needs deciding.
   - `plumb-shape-cost.vl --check` passes, with fuel −1.2% against its baseline on both units. The per-file ladder and sentinel baselines were re-split with their totals unchanged (ladder 341 / 6, sentinel 474).
+- The five re-exports `typecheck.vl` kept for `emit_mono.vl` are gone. `emit_mono.vl` imports `assignable`, `bindGenWalk`, `substTyDeep` and `tyProvesNonNull` from `check_relate_core.vl` and `ovPickFor` from `check_demands.vl`; `typecheck.vl` imports the ones it uses itself. No other file reached them through `typecheck.vl`. The fixpoint seed is byte-identical to master's (5,924,421 bytes, delta 0), and `difftree.sh --identity` reads 0 of 15,273 files differ (10,317 built).
 
 ### SMALL log
 
