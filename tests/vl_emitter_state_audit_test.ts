@@ -1,4 +1,4 @@
-// THE EMITTER-STATE AUDIT: ITS FRAME-BUILDER ANCHORS, ITS ASYMMETRIC SET AND ITS RATCHET.
+// THE EMITTER-STATE AUDIT: ITS FRAME-BUILDER ANCHORS, ITS ASYMMETRIC SET AND ITS INVARIANT.
 //
 // `scripts/emitter-state-audit.vl` asks which `fnUses*` frame flag one builder clears and
 // the other does not — the shape of D1006/D1007. It reaches the start-fn side through
@@ -16,9 +16,9 @@
 // tests/vl_instance_state_leak_test.ts — which measures the same two flags by compiling
 // one program after another on ONE instance — loses its entry in the same PR.
 //
-// The third test is the ratchet's control: `--check` passes on the committed baseline and
-// reds on one a single row below the count, so a detector that stopped counting cannot
-// pass quietly.
+// The third test holds the invariant and its control: `--check` passes with 0 never-cleared
+// rows, and reds naming the five rows when `classifyStateReset`'s clears are ignored, so a
+// detector that stopped counting cannot pass quietly.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) AND requires the built binary + seed.
 //
@@ -27,8 +27,11 @@
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/emitter-state-audit.vl`;
-const BASELINE = `${ROOT}/scripts/emitter-state-baseline.json`;
 const EMIT_SECTIONS = `${ROOT}/compiler/emit_sections.vl`;
+
+/** The control: a prologue reset whose clears are the only ones these variables have. */
+const CONTROL_RESET = "classifyStateReset";
+const CONTROL_NAMES = ["capFrame", "gckDepth", "irkDepth", "lrDepth", "narrowDropWin"];
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -111,32 +114,25 @@ Deno.test({
 });
 
 Deno.test({
-  name: "emitter-state-audit: --check holds the committed baseline and reds one below it",
+  name: "emitter-state-audit: --check holds at zero and reds when one reset's clears are ignored",
   ignore: !ENABLED,
   fn: async () => {
     const held = await audit(["--check"]);
     if (held.code !== 0) {
-      throw new Error(`--check on the committed baseline: want exit 0, got ${held.code}\n${held.out}`);
+      throw new Error(`--check on the tree: want exit 0, got ${held.code}\n${held.out}`);
     }
-    const m = held.out.match(/never-cleared emitter state (\d+) of \d+ mutables/);
-    if (!m) throw new Error(`no never-cleared summary line in:\n${held.out}`);
-    const now = Number(m[1]);
-    const committed = JSON.parse(Deno.readTextFileSync(BASELINE)).never;
-    if (now > committed) {
-      throw new Error(`never-cleared ${now} is above the committed baseline ${committed}`);
+    if (!/never-cleared emitter state 0 of \d+ mutables/.test(held.out)) {
+      throw new Error(`no "never-cleared emitter state 0 of N" line in:\n${held.out}`);
     }
-    const dir = Deno.makeTempDirSync({ prefix: "vl-esa-" });
-    try {
-      const low = `${dir}/baseline.json`;
-      Deno.writeTextFileSync(low, JSON.stringify({ never: now - 1, commit: "control" }) + "\n");
-      const red = await audit(["--check", "--baseline", low]);
-      if (red.code !== 1 || !red.out.includes("emitter state budget EXCEEDED")) {
-        throw new Error(
-          `--check against a baseline of ${now - 1}: want exit 1 and EXCEEDED, got ${red.code}\n${red.out}`,
-        );
-      }
-    } finally {
-      Deno.removeSync(dir, { recursive: true });
+    const red = await audit(["--check", "--without-reset", CONTROL_RESET]);
+    if (
+      red.code !== 1 || !red.out.includes("emitter state invariant BROKEN") ||
+      !CONTROL_NAMES.every((n) => red.out.includes(`  ${n} `))
+    ) {
+      throw new Error(
+        `--check --without-reset ${CONTROL_RESET}: want exit 1, BROKEN and the names ` +
+          `${CONTROL_NAMES.join(", ")}, got ${red.code}\n${red.out}`,
+      );
     }
   },
 });
