@@ -4,12 +4,12 @@
 //   - `FS_FLOOR` in compiler/check_intrinsics.vl: the slot order and signature of each import,
 //     from which the emitter's per-slot predicates, the checker's declarations and the builtin
 //     list are all derived;
-//   - `HOST_FLOOR` in scripts/vl-host/src/main.rs: the native host's name, signature and
-//     handler for each import;
+//   - `HOST_FLOOR` in scripts/vl-host/src/main.rs: the native host's name and handler for each
+//     import; its signature column is read from `FS_FLOOR` by build.rs (cargo test floor_);
 //   - tests/support/runWasm.ts: the Deno harness's stubs.
 //
-// This file holds all three to one set of names, and the two that state a signature to one
-// signature per name. It also refuses a floor name spelled by hand in the checker or the
+// This file holds all three to one set of names, and refuses a signature spelled by hand in
+// HOST_FLOOR. It also refuses a floor name spelled by hand in the checker or the
 // builtin list, which read the table instead. It reads source text and runs nothing.
 
 import { ROOT } from "./support/tree.ts";
@@ -43,14 +43,12 @@ function block(src: string, head: string, what: string): string {
   return rest.slice(0, end);
 }
 
-// `HOST_FLOOR`'s rows: name -> signature.
+// `HOST_FLOOR`'s rows: name -> handler. The host states no signature; build.rs reads it.
 function hostRows(): Map<string, string> {
   const rows = new Map<string, string>();
   const body = block(MAIN_RS, "const HOST_FLOOR:", "main.rs");
   for (
-    const m of body.matchAll(
-      /\(\s*"([^"]+)",\s*"([^"]+)",\s*floor_[a-z_]+,?\s*\)/g,
-    )
+    const m of body.matchAll(/\(\s*"([^"]+)",\s*(floor_[a-z_]+),?\s*\)/g)
   ) {
     if (rows.has(m[1])) {
       throw new Error(`main.rs HOST_FLOOR: ${m[1]} listed twice`);
@@ -101,18 +99,20 @@ Deno.test("host floor: every source names the same imports", () => {
   same("tests/support/runWasm.ts against FS_FLOOR", slots, harnessNames());
 });
 
-Deno.test("host floor: the host and the compiler's table state one signature", () => {
-  const host = hostRows();
-  const bad: string[] = [];
-  for (const [name, sig] of slotRows()) {
-    if (host.get(name) !== sig) {
-      bad.push(`${name}: FS_FLOOR ${sig}, HOST_FLOOR ${host.get(name)}`);
-    }
-  }
-  if (bad.length > 0) {
+Deno.test("host floor: the host restates no signature, build.rs reads the table", () => {
+  const sigs = [
+    ...block(MAIN_RS, "const HOST_FLOOR:", "main.rs").matchAll(
+      /"[^"]*=>[^"]*"/g,
+    ),
+  ].map((m) => m[0]);
+  if (sigs.length > 0) {
     throw new Error(
-      `main.rs HOST_FLOOR against FS_FLOOR\n  ${bad.join("\n  ")}`,
+      `main.rs HOST_FLOOR spells a signature: ${sigs.join(", ")}`,
     );
+  }
+  const build = Deno.readTextFileSync(`${ROOT}/scripts/vl-host/build.rs`);
+  if (!build.includes("compiler/check_intrinsics.vl")) {
+    throw new Error("build.rs does not read FS_FLOOR");
   }
 });
 
