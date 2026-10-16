@@ -1,0 +1,317 @@
+// Literal-binding inference: the uses a rewritten literal read meets (deliveries, operands,
+// indexes) and the solve that types or reports each candidate.
+// Does not import the checker.
+import { ArrayLit, BinExpr, FieldInit, LetDecl, ObjLit, P } from "./ast"
+import { inferQuiet } from "./check_cursor"
+import { nodeTyOf } from "./check_node_tys"
+import {
+  lbiAnn,
+  lbiBindName,
+  lbiCandAt,
+  lbiCands,
+  lbiCoalUnsafe,
+  lbiConstFits,
+  lbiConstUnsafe,
+  lbiDef,
+  lbiEdges,
+  lbiInitTy,
+  lbiInlinedName,
+  lbiIsConst,
+  lbiKind,
+  lbiLeaves,
+  lbiMarkTree,
+  lbiNoDest,
+  lbiNoteConstContext,
+  lbiNoteDirect,
+  lbiNoteNeutral,
+  lbiNoteStore,
+  lbiOperandCand,
+  lbiOperandRow,
+  lbiPinCand,
+  lbiPinTy,
+  lbiPinnedName,
+  lbiPinnedReads,
+  lbiPush,
+  lbiReadsPinned,
+  lbiRowCand,
+  lbiRowOrder,
+  lbiSettleEdges,
+  lbiSolveOne,
+  lbiSureTy,
+  lbiTreeReads,
+  lbiTy,
+  lbiUseTy,
+} from "./check_num_lit_state"
+import {
+  LBI_CONST_DEPTH,
+  LBI_INT,
+  LBI_OP_CMP,
+  LBI_OP_NONE,
+  LBI_TREE,
+  LBI_UP,
+  LBI_WIDE_I64,
+  binIntOnlyOp,
+  cexLitPeel,
+  lbiEdgeKind,
+  lbiNumTy,
+  lbiOpClass,
+  lbiOperandFits,
+} from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import { recordRedundantAnnot } from "./check_redundant_annot"
+import { symEnabled } from "./check_state"
+import { isStringTy, nonNullTy } from "./check_ty_shape"
+import {
+  T,
+  TY_I32,
+  TY_I64,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  objFieldType,
+} from "./check_types"
+
+// The rewritten read `ix`, when it is one, meets the scalar type `ty` where it stands.
+function lbiNoteUseTy(ix: i32, ty: i32) {
+  if symEnabled == 0 || inferQuiet || lbiInlinedName.length == 0 || ix < 0 {
+    return 0
+  }
+  const t = nonNullTy(ty)
+  if !lbiNumTy(t) { return 0 }
+  const p = parenPeelIx(ix)
+  if lbiInlinedName.has(p) {
+    lbiUseTy[p] = t
+    lbiSureTy[p] = t
+  }
+  0
+}
+
+// The operand `ix`, when a rewritten read, meets the operand `other`'s type. For the editor that
+// type is the read's only when `other` is no literal (whose width the operator settles later) and
+// the constant is of its kind and fits it; otherwise the operator computes wider.
+function lbiNoteOperandUseTy(ix: i32, other: i32) {
+  const t = nodeTyOf(parenPeelIx(other))
+  lbiNoteUseTy(ix, t)
+  if ix < 0 { return 0 }
+  const p = parenPeelIx(ix)
+  if !lbiSureTy.has(p) { return 0 }
+  if cexLitPeel(other) >= 0 || !lbiOperandFits(ix, nonNullTy(t)) {
+    lbiSureTy[p] = -1
+  }
+  0
+}
+
+// A delivery of `src` into a destination of type `dst`; `tgt` is the assignment target when the
+// delivery is one, else -1. Called from `assignableExpr`, which every position flows through.
+export function lbiNoteDelivery(src: i32, dst: i32, tgt: i32) {
+  lbiNoteUseTy(src, dst)
+  if lbiPinnedName.length > 0 && !inferQuiet && lbiNumTy(dst) {
+    if lbiReadsPinned(src) { lbiPinnedReads = lbiPinnedReads + 1 }
+  }
+  if lbiBindName.length == 0 || inferQuiet || src < 0 || lbiNoDest { return 0 }
+  if tgt >= 0 {
+    const tc = lbiCandAt(parenPeelIx(tgt))
+    if tc >= 0 { return lbiNoteStore(tc, src) }
+  }
+  if !lbiNumTy(dst) {
+    // A nullable number is delivered its number; a record or list literal, each part its own.
+    const inner = nonNullTy(dst)
+    if lbiNumTy(inner) { return lbiNoteDelivery(src, inner, -1) }
+    return lbiNoteParts(src, inner)
+  }
+  if !lbiTreeReads(src, 0) { return 0 }
+  // Only a binding delivered whole (through parentheses and a negation) is typed by the
+  // destination: one inside `b + 1` is an operand there, and an operand chooses nothing.
+  const whole = lbiOperandCand(src)
+  if whole >= 0 {
+    lbiPush(whole, LBI_UP, dst, src)
+  } else {
+    // A binding inside a delivered expression chooses nothing, but must not make it wider than
+    // the destination: `xs[b - 6]` keeps `b` an `i32` whatever else `b` is delivered to.
+    const cands: i32[] = []
+    const tys: i32[] = []
+    const froms: i32[] = []
+    lbiLeaves(src, cands, tys, froms)
+    for c in cands { lbiPush(c, LBI_TREE, dst, src) }
+  }
+  lbiNoteConstContext(src, dst)
+  if lbiCandAt(parenPeelIx(src)) >= 0 {
+    lbiNoteDirect(src, dst)
+  } else if lbiTreeReads(src, LBI_CONST_DEPTH) && lbiConstFits(src) {
+    lbiMarkTree(src, LBI_WIDE_I64)
+  }
+}
+
+// A record literal `src` delivered to record type `dst` delivers each field to the field's type,
+// and a list literal delivered to a list type each element to the element type.
+function lbiNoteParts(src: i32, dst: i32) {
+  if dst < 0 || dst >= T.tys.length { return 0 }
+  const t = T.tys[dst]
+  match t {
+    TyObj => lbiNoteFields(src, t)
+    TyArray => lbiNoteElems(src, t.aElem)
+    // No literal of these delivers its parts to a typed slot.
+    TyErr | TyPrim | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg | TyNullable => {}
+  }
+  0
+}
+
+// Each field of the record literal `src` delivered to its type in `o`.
+function lbiNoteFields(src: i32, o: TyObj) {
+  const n = P.nodes[parenPeelIx(src)]
+  if n is ObjLit {
+    for f in n.objFields {
+      const fi = P.nodes[f]
+      if fi is FieldInit {
+        const ft = objFieldType(o, fi.fiName)
+        if ft >= 0 { lbiNoteDelivery(fi.fiValue, ft, -1) }
+      }
+    }
+  }
+  0
+}
+
+// Each element of the list literal `src` delivered to the element type `elem`.
+function lbiNoteElems(src: i32, elem: i32) {
+  const n = P.nodes[parenPeelIx(src)]
+  if n is ArrayLit && elem >= 0 {
+    for e in n.arrElems { lbiNoteDelivery(e, elem, -1) }
+  }
+  0
+}
+
+// The subscript `idx` of an index into a value of type `recv`: a list or string takes an `i32`,
+// a map its key.
+export function lbiNoteIndex(recv: i32, idx: i32) {
+  if lbiBindName.length == 0 || recv < 0 || recv >= T.tys.length { return 0 }
+  const t = T.tys[recv]
+  match t {
+    TyMap => {
+      lbiNoteDelivery(idx, t.mKey, -1)
+    }
+    TyArray => {
+      lbiNoteDelivery(idx, TY_I32, -1)
+    }
+    TyPrim => {
+      if isStringTy(recv) { lbiNoteDelivery(idx, TY_I32, -1) }
+    }
+    // No subscript whose type is a number: an index into these is refused, or decided at a pin.
+    TyErr | TyObj | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyNullable => {}
+  }
+  0
+}
+
+// An arithmetic or comparison operator `n` at `ix`: a literal binding that is a whole operand
+// meets the other operand's type, or a float literal there. A binding nested deeper in an operand
+// is met by the operator it is a whole operand of.
+export function lbiNoteOperands(n: BinExpr, ix: i32) {
+  if lbiBindName.length == 0 || inferQuiet { return 0 }
+  const op = n.binOp
+  const cls = lbiOpClass(op)
+  if cls == LBI_OP_NONE { return 0 }
+  const cmp = cls == LBI_OP_CMP
+  const l = lbiOperandCand(n.binLeft)
+  const r = lbiOperandCand(n.binRight)
+  if l >= 0 || r >= 0 {
+    // An annotated binding is a typed operand; an un-annotated one has no type to give.
+    if l >= 0 && (r < 0 || lbiAnn[r] >= 0) {
+      lbiOperandRow(l, n.binLeft, n.binRight, ix)
+    }
+    if r >= 0 && (l < 0 || lbiAnn[l] >= 0) {
+      lbiOperandRow(r, n.binRight, n.binLeft, ix)
+    }
+    if binIntOnlyOp(op) {
+      if l >= 0 { lbiPush(l, LBI_INT, TY_I64, ix) }
+      if r >= 0 { lbiPush(r, LBI_INT, TY_I64, ix) }
+    }
+  }
+  lbiNoteConstContext(n.binLeft, nodeTyOf(parenPeelIx(n.binRight)))
+  lbiNoteConstContext(n.binRight, nodeTyOf(parenPeelIx(n.binLeft)))
+  lbiNoteOperandUseTy(n.binLeft, n.binRight)
+  lbiNoteOperandUseTy(n.binRight, n.binLeft)
+  const eq = cmp && (op == "==" || op == "!=")
+  lbiNoteNeutral(n.binLeft, n.binRight, cmp, eq, ix)
+  lbiNoteNeutral(n.binRight, n.binLeft, cmp, eq, ix)
+}
+
+// Solve every candidate recorded this pass. An un-annotated one whose type differs from its
+// default goes to `lbiPinCand`/`lbiPinTy`, one no type satisfies to `lbiErrMsg`; an annotated one
+// the solve agrees with has its annotation reported redundant. An edge row supplies its source's
+// type once that is known, so a chain settles over a few rounds.
+export function lbiSolve() {
+  lbiEdges = 0
+  const nc = lbiCands.length
+  const chosen: i32[] = []
+  const rowsOf: i32[][] = []
+  let c = 0
+  while c < nc {
+    chosen.push(lbiAnn[c])
+    rowsOf.push([])
+    c = c + 1
+  }
+  let r = 0
+  while r < lbiRowCand.length {
+    rowsOf[lbiRowCand[r]].push(r)
+    if lbiEdgeKind(lbiKind[r]) {
+      lbiEdges = lbiEdges + 1
+      // The source's type bounds the target's from below, and the target's the source's above
+      // unless the edge is forward-only; either way the source's move re-solves the target.
+      rowsOf[lbiTy[r]].push(-r - 1)
+    }
+    r = r + 1
+  }
+  // Only an edge reads another binding's answer, so without one the final sweep is the answer.
+  // Stores settle first and bound their targets from below; only then does a target's answer
+  // bound the value stored into it, so no provisional answer caps a source (D3343).
+  if lbiEdges > 0 {
+    const order = lbiRowOrder()
+    lbiSettleEdges(rowsOf, chosen, order, true)
+    lbiSettleEdges(rowsOf, chosen, order, false)
+  }
+  c = 0
+  while c < nc {
+    const a = lbiAnn[c]
+    let t = -1
+    if !lbiIsConst[c] && rowsOf[c].length > 0 {
+      t = lbiSolveOne(c, rowsOf[c], chosen, a < 0, false)
+    }
+    if a >= 0 {
+      if t < 0 { t = lbiDef[c] }
+      lbiRedundant(c, a, t)
+    } else if t >= 0 && t != lbiDef[c] {
+      lbiPinCand.push(c)
+      lbiPinTy.push(t)
+    }
+    c = c + 1
+  }
+  0
+}
+
+// The annotation `a` of candidate `c` is reported redundant as any other annotation is, from its
+// initializer's type, only when the solve gives `c` that same type `t` without it.
+function lbiRedundant(c: i32, a: i32, t: i32) {
+  if t != a { return 0 }
+  const d = lbiCands[c]
+  const it = lbiInitTy[d] ?? -1
+  const n = P.nodes[d]
+  // Without its annotation a literal `const` is its literal at every read, which differs from the
+  // annotated value only where a read met a context the literal adopts differently.
+  if n is LetDecl {
+    if (
+      it >= 0
+      && !(n.letKw == "const" && lbiConstUnsafe[c])
+      && !lbiCoalUnsafe[c]
+    ) {
+      recordRedundantAnnot(n, d, it, a)
+    }
+  }
+  0
+}

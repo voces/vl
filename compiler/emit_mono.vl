@@ -51,17 +51,13 @@ import {
   blockLastStmt,
   callBindTyOf,
   canonEmitName,
-  flatConstOfNameProp,
   holePinReadOf,
   i32TyIx,
   inferRetFnKey,
-  inferRetNameOf,
   isVarTyIxOf,
   joinArmIsLit,
   joinPinnedArmLit,
   joinPinnedArmTys,
-  litTyOfExpr,
-  memberRungOnTy,
   monoInferListElem,
   monoInferLocalScalar,
   monoInferRetExprTy,
@@ -72,7 +68,6 @@ import {
   nominalStructNameOfTy,
   nulRecListNominalName,
   nulRecNominalName,
-  numUnionResultTy,
   opSelfFnNameForRecv,
   ovPickFor,
   primTyOfName,
@@ -80,15 +75,19 @@ import {
   recordClonedIsVarTy,
   recordClonedIsVarTyIx,
   recordClonedNodeTy,
-  substNullFoldOffFor,
-  substNullFoldRestore,
   substTyDeep,
   tpIfJoinPinName,
   tpIfJoinPinTy,
   tyIsGradualUnion,
   tyProvesNonNull,
-  uniqueGenericDeclNamed,
 } from "./typecheck"
+import { flatConstOfNameProp } from "./check_flat_layout"
+import { inferRetNameOf } from "./check_infer_ret"
+import { litTyOfExpr } from "./check_match_desugar"
+import { memberRungOnTy } from "./check_builtin_methods"
+import { numUnionResultTy } from "./check_num_adopt"
+import { substNullFoldOffFor, substNullFoldRestore } from "./check_subst_fold"
+import { uniqueGenericDeclNamed } from "./check_generic_args"
 import {
   T,
   TyArray,
@@ -435,6 +434,7 @@ import {
   twoListValueTy,
   tyCanonKey,
   tyHasLitDeep,
+  tyIsListUnion,
   tyNulFuncInner,
   tyReachesFuncD,
   tyRefArrElemOf,
@@ -809,6 +809,16 @@ function monoAnnPinName(name: string) {
   monoNulAnnName(name)
 }
 
+// The pin of an instance's own list-union annotation `name` that no row holds yet: the pin
+// substituted `V[] | i32[]` to `string[] | i32[]` after `collectU` ran, so it is registered
+// here, as a pinned return is, else "". `ty` is the annotation's recorded type (D4931).
+function monoInstUnionAnnPin(name: string, ty: i32): string {
+  if !tyIsListUnion(ty) { return "" }
+  const c = monoPinUnionName(name)
+  if monoRegisterPinUnion(c) < 0 { return "" }
+  monoAnnPinName(c)
+}
+
 // A nullable annotation whose non-null base is a spelling `monoAnnPinName` already
 // claims, echoed back whole — else "". The nullability rides the pin because the pin is
 // the instance's parameter annotation, while every other channel answers about the rep,
@@ -932,6 +942,11 @@ function monoNameNarrowsFrom(narrow: string, wide: string) {
 function monoNicheNarrowsFrom(narrow: string, wide: string): boolean {
   const base = nullablePartOf(narrow)
   if base != "boolean" && base != "string" { return false }
+  monoArmsNarrowFrom(narrow, wide)
+}
+
+// Whether every arm of the union `narrow` is an arm of the wider union `wide`.
+function monoArmsNarrowFrom(narrow: string, wide: string): boolean {
   const na: string[] = []
   unionArmsOf(narrow, na)
   const wa: string[] = []
@@ -972,6 +987,11 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, wide) {
     if monoAnnPinName(n) == n { return n }
     return ""
+  }
+  // A union narrowed to a smaller union of its own arms, which no row may hold yet (D4965).
+  if monoArmsNarrowFrom(n, wide) {
+    const nu = monoInstUnionAnnPin(n, nt)
+    if nu != "" { return nu }
   }
   // The NOMINAL spelling of the same arm: the two sides of the membership test render
   // differently, since `tyToEmitName` spells a narrowed object structurally (`{r:i32}`)
@@ -1518,6 +1538,11 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
               // declines it or answers one dimension short.
               const r = monoAnnPinName(tyNameOf(ld.letType))
               if r != "" { return r }
+              const ru = monoInstUnionAnnPin(
+                tyNameOf(ld.letType),
+                nodeTyIxOf(ld.letType),
+              )
+              if ru != "" { return ru }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
               const ldp = monoDestListPinName(li, fnIx)
@@ -1559,6 +1584,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
           // shape a generic forwarder has. One home, so the two cannot drift.
           const r = monoAnnPinName(pt.tyName)
           if r != "" { return r }
+          const ru = monoInstUnionAnnPin(pt.tyName, nodeTyIxOf(ptn))
+          if ru != "" { return ru }
         }
       }
     }
@@ -6485,7 +6512,7 @@ function monoTyParamReachesSpelling(
 
 // Whether an `is K[]` under `ix` tests a receiver whose type names one of `names` and whose arm
 // reads it where it cannot be handed an empty `K[]` in place of the default's (D4911): a field,
-// or a variable a function nested in `body` reads or `body` pushes onto.
+// whose region reads it through another place of the same name.
 function monoListIsUnhandable(ix: i32, names: string[], body: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const n = P.nodes[ix]
@@ -6504,47 +6531,10 @@ function monoListIsUnhandable(ix: i32, names: string[], body: i32): boolean {
       if r is Member && narrowRegionReads(body, ix, r.memProp, true) == 2 {
         return true
       }
-      if (
-        r is Ident
-        && narrowRegionReads(body, ix, r.identName, false) == 2
-        && (monoNestedFnReads(body, r.identName, false)
-          || monoPushesOnto(body, r.identName))
-      ) {
-        return true
-      }
     }
   }
   for k in nodeChildren(ix) {
     if monoListIsUnhandable(k, names, body) { return true }
-  }
-  false
-}
-
-// Whether a function nested under `ix` reads `name`; `inner` once the walk is inside one.
-function monoNestedFnReads(ix: i32, name: string, inner: boolean): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return monoNestedFnReads(n.fnBody, name, true) }
-  if inner && n is Ident && n.identName == name { return true }
-  for k in nodeChildren(ix) {
-    if monoNestedFnReads(k, name, inner) { return true }
-  }
-  false
-}
-
-// Whether `name.push(...)` appears under `ix`.
-function monoPushesOnto(ix: i32, name: string): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
-  if n is Call {
-    const cf = P.nodes[n.callFn]
-    if cf is Member && cf.memProp == "push" {
-      const o = P.nodes[unwrapParen(cf.memObj)]
-      if o is Ident && o.identName == name { return true }
-    }
-  }
-  for k in nodeChildren(ix) {
-    if monoPushesOnto(k, name) { return true }
   }
   false
 }

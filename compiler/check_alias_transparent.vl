@@ -1,0 +1,154 @@
+// One-member alias transparency: when `type N = A` denotes its member rather than keeping
+// its own union row.
+// Does not import the checker.
+import {
+  arrSpineIsMap,
+  arrSpineIsNominal,
+  arrSpineIsObj,
+  arrSpineIsScalar,
+  arrSpineIsUnionAlias,
+} from "./check_ty_rep"
+import { unionAliasMembersFaithful } from "./check_ty_shape"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  cUserTypes,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+  tyReachesSelf,
+  unionAliasDeclNameOfTy,
+} from "./check_types"
+
+// The names of one-member `type N = A` aliases whose single variant is spelled as a bare type name
+// or a generic application, recorded syntactically in pass 0a before any variant resolves. The
+// arena cannot tell such an alias from a canonicalized object intersection, also a one-member
+// union over one `TyObj` — the intersection keeps its alias name, the plain alias is transparent.
+export let cPlainAliasNames: string[] = []
+
+// True if `name` is a one-member `type N = A` alias whose body is a plain type reference
+// (`aliasRefIsPlainRoot`, recorded syntactically in pass 0a).
+function isPlainAliasRef(name: string) {
+  let i = 0
+  while i < cPlainAliasNames.length {
+    if cPlainAliasNames[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if the one-member alias `name` (arena index `ti`, a `TyUnion`) denotes its member
+// transparently. `nameToTy` and `singleMemberAliasTyIx` must agree exactly, or the checker
+// and emitter diverge on the same annotation. Not transparent for a canonicalized object
+// intersection, which is interned as a named struct instead.
+export function singleAliasMemberTyIx(ti: i32, name: string) {
+  const t = T.tys[ti]
+  if t is TyUnion {
+    if t.uMembers.length == 1 {
+      const m0 = t.uMembers[0]
+      const mt = T.tys[m0]
+      if mt is TyPrim { return m0 }
+      if mt is TyFunc { return m0 }
+      if mt is TyArray {
+        if arrSpineIsScalar(m0) { return m0 }
+        // The nominal leaf `arrSpineIsScalar` excludes, admitted through the renderer that
+        // keeps the name: `tyToEmitName` re-renders an array's element, so `Cat[]` becomes
+        // `{n:i32}[]` and the declared name is gone, but `tyToNominalName` renders `Cat[]`
+        // character for character, so the route is kept rather than lost.
+        if arrSpineIsNominal(m0) { return m0 }
+        // The map leaf, admitted for the reason the bare `TyMap` arm is admitted with no
+        // gate (`arrSpineIsMap`): `{[K]:V}` renders as itself and the array layers on top
+        // re-render their element, so the answer cannot differ by depth.
+        if arrSpineIsMap(m0) { return m0 }
+        // The inline object-shape leaf (`arrSpineIsObj`): faithful under the same renderer
+        // as the scalar leaf for plain fields, and the nominal one for a declared struct.
+        if arrSpineIsObj(m0) { return m0 }
+        // The leaf that is itself a declared alias (`arrSpineIsNominal`) — the same gate a
+        // bare union member applies (`unionAliasDeclNameOfTy` != ""), one array constructor out.
+        if arrSpineIsUnionAlias(m0) { return m0 }
+      }
+      if mt is TyMap { return m0 }
+      if mt is TyObj {
+        if isPlainAliasRef(name) { return m0 }
+      }
+      // A union member (`type A = K` over a litunion, or `type A = U` over a declared value
+      // union): a litunion reps as an interned i32 atom, so without this the union row this
+      // alias minted made `isUName` claim the slot for a box while every read lowered the
+      // atom — invalid wasm at every position (`transparentMemberEmitName`'s legs, read backwards).
+      if unionAliasDeclNameOfTy(m0) != "" { return m0 }
+      if unionAliasMembersFaithful(m0) { return m0 }
+      // A nullable member — `type A = (K | null)` and the un-parenthesized `type A = K |
+      // null` intern as the same one-member wrapper over a `TyNullable`, since `null`
+      // normalizes into the niche. Same defect as the union case: the alias's union row
+      // would claim the slot while the read lowers the niche. Ungated in the inner, unlike the array and union arms.
+      if nulAliasMemberFaithful(m0) { return m0 }
+    }
+  }
+  aliasMemberNotTransparent()
+}
+
+// The named default of the ladder above: -1, meaning the alias keeps its own union row. A
+// multi-member `TyUnion` is a real union; a `TyLit` member is an atom the litunion arms own; a
+// `TyVar` has no member type until the monomorphizer pins it; a `TyErr` is the error hole.
+function aliasMemberNotTransparent(): i32 { -1 }
+
+// True when a one-member alias over nullable member `ty` denotes that member — no gate on
+// the inner. `type T = (S | null)` interns `TyUnion[S?]`, so the alias denotes `S?`; both the
+// checker (`declaredTyOfName`) and emitter (`singleMemberAliasTyIx`) must read that from
+// here, or the alias's union row claims a box slot while every read lowers the niche.
+function nulAliasMemberFaithful(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    // Gated in the inner, unlike the plain nullable-member arm: `type J = null | string |
+    // J[]` interns as a wrapper over `TyNullable(string | J[])`, and calling that
+    // transparent made the emitter's collection loop skip the declaration, so `J` never
+    // got variant rows (D982). A literal or non-recursive inner stays transparent.
+    const it = T.tys[t.nInner]
+    if it is TyUnion {
+      if it.uMembers.length > 1 {
+        if !tyIsLitUnion(t.nInner) {
+          if tyReachesSelf(ty) {
+            // …except through a map arm: registering a self-referential map arm walks
+            // `registerInlineUnion` → `registerMapValUnion` → `registerInlineUnion` by name
+            // with no depth bound and exhausts the wasm stack (D984). Self-referential array
+            // arms have no such loop and stay un-transparent. Lift this clause only once D984's recursion is bounded.
+            return false
+          }
+        }
+      }
+    }
+    return true
+  }
+  // The un-normalized shape — a `TyUnion` of literal members beside `null`, which a `type A
+  // = B` wrapper sees only when `B`'s own `| null` declaration kept the raw survivor list
+  // via a poisoned fold (`annUnionTy` answers -1 for an unseparable nominal pair).
+  tyIsNullableLitUnion(ty)
+}
+
+// The arena type a declared one-member union alias denotes transparently (`type Id = i32`),
+// or -1 when `name` is not such an alias — the emitter resolves it to the member's own
+// vocabulary rather than registering a one-variant union box. A type index, not a name: each
+// consumer renders the member once, at its own position, rather than re-parsing a rendered answer.
+export function singleMemberAliasTyIx(name: string) {
+  if !cUserTypes.has(name) { return -1 }
+  const ti = cUserTypes[name] ?? -1
+  if ti < 0 { return -1 }
+  singleAliasMemberTyIx(ti, name)
+}
+
+// True when the declared name `name` is a transparent one-member alias, in any arm of
+// `singleAliasMemberTyIx` — the object arm is gated on `isPlainAliasRef`, so a canonicalized
+// intersection is not claimed. Exported for `collectU`'s skip, without which the alias
+// registers as a one-variant union and the name classifies as a box for a type that denotes its member transparently.
+export function isTransparentAlias(name: string) {
+  singleMemberAliasTyIx(name) >= 0
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function aliasTransparentReset() { cPlainAliasNames = [] }

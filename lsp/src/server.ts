@@ -61,19 +61,18 @@ import {
 import {
   type Completion,
   type CompletionKind,
-  docMarkdown,
   type DocRefResolver,
   type HighlightKind,
   type OutlineNode,
   type OutlineSymbolKind,
   SEMANTIC_TOKEN_LEGEND,
-  typeLabelDetail,
 } from "./typeFeatures.ts";
 import { isStdKey, type StdSurfaceCache } from "./editorText.ts";
 import {
   codeActionsAt,
   codeLensesAt,
   codeLensLocationsAt,
+  completionPresentation,
   completionsAt,
   definitionAt,
   documentHighlightsAt,
@@ -90,7 +89,6 @@ import {
   renameAt,
   semanticTokensAt,
   signatureHelpAt,
-  VL_LANGUAGE_ID,
 } from "./features.ts";
 
 declare const process: NodeJS.Process;
@@ -661,40 +659,20 @@ const completionKind: Record<CompletionKind, CompletionItemKind> = {
   property: CompletionItemKind.Property,
 };
 
-// For items that carry a type we render it in exactly two places, never the same
-// place twice:
-//   - `labelDetails.detail` — a compact `: <type>` shown inline right after the
-//     label (less prominent, no spacing), per the LSP 3.17 field. This is the
-//     at-a-glance type on the suggestion row.
-//   - `documentation` — a markdown `MarkupContent` wrapping the type in a fenced
-//     `vital` block (`typeMarkdown`), which the client renders syntax-highlighted
-//     via the TextMate grammar (matching the hover) in the expanded detail panel.
-// We deliberately do NOT set the top-level `detail`: VS Code echoes `detail` BOTH
-// on the label row AND in the panel header, so combined with the markdown
-// `documentation` the type showed up twice (once unstyled from `detail`, once
-// highlighted from the doc). `labelDetails` gives the inline type WITHOUT
-// populating the panel body, leaving the highlighted `documentation` as the only
-// thing in the panel — type shown once inline, once highlighted, never duplicated.
-// Items without a type omit both.
-//
-// When the declaration carries a `///` doc-comment (`c.doc`), it's rendered as
-// markdown ABOVE the type block in `documentation` via `docMarkdown` — prose
-// first, type beneath. Items with neither a type nor a doc omit `documentation`.
-// `resolve` (D7): when present, `` [`Name`] `` / `[Name]` spans in the doc are
-// rewritten as clickable links to the named symbol's definition.
+// `completionPresentation` (shared with the playground) puts a typed item's type
+// inline (`labelDetails.detail`) and highlighted in the markdown `documentation`.
+// The top-level `detail` stays unset on purpose: VS Code echoes it on the label row
+// AND in the panel header, so beside `documentation` the type would show twice.
+// `resolve` (D7) turns `[Name]` spans in the doc into links to the definition.
 const toCompletionItem = (
   c: Completion,
   resolve?: DocRefResolver,
 ): CompletionItem => {
   const item: CompletionItem = { label: c.name, kind: completionKind[c.kind] };
-  if (c.detail !== undefined) {
-    item.labelDetails = { detail: c.labelDetail ?? typeLabelDetail(c.detail) };
-  }
-  if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
-    item.documentation = {
-      kind: MarkupKind.Markdown,
-      value: docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc, resolve),
-    };
+  const { labelDetail, documentation } = completionPresentation(c, resolve);
+  if (labelDetail !== undefined) item.labelDetails = { detail: labelDetail };
+  if (documentation !== undefined) {
+    item.documentation = { kind: MarkupKind.Markdown, value: documentation };
   }
   // Snippet items: set the insert text + format so the editor expands tab-stops.
   if (c.insertText !== undefined) {

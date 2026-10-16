@@ -1,0 +1,213 @@
+// The refusals for a test a literal set can never pass: a `const` literal compared against
+// a disjoint set, and an `is` over literals the operand cannot hold.
+// Does not import the checker.
+import { Ident, P } from "./ast"
+import { demangleName } from "./check_suggest"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyEq,
+  tyToStr,
+} from "./check_types"
+import { peelParenIx } from "./check_write_effects"
+
+// The message for a test that a `const` literal never passes. `wx` is the const's operand, `wty`
+// its literal set, `oty` the set it is tested against, and `what` names the always-answer; the
+// suggested declaration adds `oty`'s members to the const's own.
+export function constLitNeverMsg(
+  wx: i32,
+  wty: i32,
+  oty: i32,
+  what: string,
+): string {
+  const dom: i32[] = []
+  flattenStrLits(wty, dom)
+  const one = dom.length == 1
+  const own = strLitsSpelled(dom)
+  const extra: i32[] = []
+  flattenStrLits(oty, extra)
+  let d = 0
+  while d < extra.length {
+    let seen = false
+    let j = 0
+    while j < dom.length {
+      if tyEq(dom[j], extra[d]) { seen = true }
+      j = j + 1
+    }
+    if !seen { dom.push(extra[d]) }
+    d = d + 1
+  }
+  const domStr = strLitsSpelled(dom)
+  const nm = constOperandName(wx)
+  const subj = if nm == "" { "this value" } else { nm }
+  const isWord = if one { " is always " } else { " is only ever " }
+  let msg = subj + isWord + own + " here, so this " + what + "."
+  if nm == "" {
+    return msg
+      + " If it can take other values, declare them in the type of the const it reads: "
+      + domStr
+  }
+  msg = msg + " If " + nm + " can take other values, declare them: "
+  if one { return msg + "const " + nm + ": " + domStr + " = " + own }
+  msg + "const " + nm + ": " + domStr + " = ..."
+}
+
+// String-literal types `lits` spelled as the union a user would write, `"a" | "b"`.
+function strLitsSpelled(lits: i32[]): string {
+  let s = ""
+  let i = 0
+  while i < lits.length {
+    if i > 0 { s = s + " | " }
+    s = s + tyToStr(lits[i])
+    i = i + 1
+  }
+  s
+}
+
+// The name a compare operand reads (`MODE`, through parens), or "" for any other expression.
+function constOperandName(x: i32): string {
+  const px = peelParenIx(x)
+  if px < 0 || px >= P.nodes.length { return "" }
+  const e = P.nodes[px]
+  if e is Ident { return demangleName(e.identName) }
+  ""
+}
+
+// Appends the string-literal members of `ty` (through unions) to `out`.
+export function flattenStrLits(ty: i32, out: i32[]) {
+  if ty < 0 { return 0 }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      if t.litKind == "str" { out.push(ty) }
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        flattenStrLits(t.uMembers[i], out)
+        i = i + 1
+      }
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {}
+  }
+  0
+}
+
+// Whether a string literal of `ty` (through unions) is spelled with an escape.
+export function litSetHasEscape(ty: i32): boolean {
+  const lits: i32[] = []
+  flattenLits(ty, lits)
+  let i = 0
+  while i < lits.length {
+    const t = T.tys[lits[i]]
+    if t is TyLit {
+      if t.litKind == "str" && t.litText.indexOf("\\") >= 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `ty` is a literal or a union made only of them.
+export function allLitMembers(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      return true
+    }
+    TyUnion => {
+      if t.uMembers.length == 0 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        if !allLitMembers(t.uMembers[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Appends the literal members of `ty` (through unions) to `out`.
+export function flattenLits(ty: i32, out: i32[]) {
+  if ty < 0 { return 0 }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      out.push(ty)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        flattenLits(t.uMembers[i], out)
+        i = i + 1
+      }
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {}
+  }
+  0
+}
+
+// The refusal of an `is` whose literal set shares no value with the operand's: the same shape
+// as a `const` literal's always-false test, naming the type to declare instead.
+export function litSetNeverMsg(x: i32, obj: i32, chk: i32): string {
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  const own: i32[] = []
+  flattenLits(base, own)
+  const extra: i32[] = []
+  flattenLits(chk, extra)
+  // Spelled member by member: `tyToStr` of the whole type may name an alias of the same set.
+  let dom = ""
+  const bt = T.tys[base]
+  if bt is TyUnion {
+    let m = 0
+    while m < bt.uMembers.length {
+      if m > 0 { dom = dom + " | " }
+      dom = dom + tyToStr(bt.uMembers[m])
+      m = m + 1
+    }
+  } else {
+    dom = tyToStr(base)
+  }
+  if base != obj { dom = dom + " | null" }
+  let d = 0
+  while d < extra.length {
+    let seen = false
+    let j = 0
+    while j < own.length {
+      if tyEq(own[j], extra[d]) { seen = true }
+      j = j + 1
+    }
+    if !seen { dom = dom + " | " + tyToStr(extra[d]) }
+    d = d + 1
+  }
+  const nm = constOperandName(x)
+  const subj = if nm == "" { "this value" } else { nm }
+  let what = " holds no literal but "
+  if allLitMembers(base) {
+    what = if own.length == 1 { " is always " } else { " is only ever " }
+    if base != obj { what = " is null or " }
+  }
+  subj
+    + what
+    + strLitsSpelled(own)
+    + " here, so this test is always false. If "
+    + (if nm == "" { "it" } else { nm })
+    + " can take other values, declare them in its type: "
+    + dom
+}
