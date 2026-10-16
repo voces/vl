@@ -201,9 +201,9 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
 # No Python anywhere in the tree: a tracked .py file or a python invocation in a script fails.
 run "no-python"                "$VL" run scripts/no-python.vl
-# No `emitter state budget` row: lane L7's ratchet (`emitter-state-audit.vl --check`, baseline
-# scripts/emitter-state-baseline.json) is held by tests/vl_emitter_state_audit_test.ts, which
-# `ci-native` runs - it asserts --check exits 0 on the committed baseline and reds one below it.
+# No `emitter state` row: lane L7's invariant (`emitter-state-audit.vl --check`, 0 never-cleared)
+# is held by tests/vl_emitter_state_audit_test.ts, which `ci-native` runs - it asserts --check
+# exits 0 on the tree and reds when one reset's clears are ignored.
 # THE COST OF GENERATED CODE: guest fuel and peak RSS of one `-O` build of each of two 2 MB
 # plumb-shaped units (a median one, and a one-function tail one), against a committed
 # baseline, plus two exact facts about the rung input. Fuel is a count, so the fan-out's
