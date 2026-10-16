@@ -2234,232 +2234,13 @@ function emitStartFnCode(out: u8[]) {
       emitCurStmtIx = globalStmts[gi]
       gInitStartOrd = globalStmtOrd[gi]
       const gSpanAt = bodyExpr.length
-      if globalRunsInStartFn(gi) {
-        const g = P.nodes[globalStmts[gi]]
-        if g is LetDecl {
-          // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
-          // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
-          // the `emitExprAs*` helper inserts the lattice convert so the start-fn `global.set`
-          // matches the cell valtype. An i32 cell is untouched. (Slice 5 widening.)
-          const gck = globalCellKind(globalStmts[gi])
-          if gck == "f32" {
-            const f32Saved = expCtxHere()
-            const f32Ctx = expCtxHere()
-            f32Ctx.wantF32 = true
-            expCtxApply(f32Ctx)
-            if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
-              wTarget(exprPrev)
-              return -1
-            }
-            expCtxApply(f32Saved)
-          } else if gck == "f64" {
-            if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
-              wTarget(exprPrev)
-              return -1
-            }
-          } else if gck == "i64" {
-            if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
-              wTarget(exprPrev)
-              return -1
-            }
-          } else {
-            // A map global's start-fn init seeds the map SHAPE (mirrors the
-            // local-`let` seeding) so `Map()` builds THIS global's map struct.
-            const entryCtx = expCtxHere()
-            const sc = expCtxHere()
-            if gck == "map" { sc.mapSlot = letMapShapeOf(globalStmts[gi], -1) }
-            // A NULLABLE map global's start-fn init: seed the map SHAPE (`Map()` builds it) and
-            // the null heap (a bare `null` init lowers as `ref.null $mapStruct`).
-            if gck == "nulmap" {
-              const gnmShape = nulMapShapeOf(globalStmts[gi], -1)
-              sc.mapSlot = gnmShape
-              sc.nulRefHeap = mapTypeIdxOf(gnmShape)
-            }
-            // A struct / nullable-struct cell seeds the struct context so a bare
-            // `null` init lowers as `ref.null $S` and a literal builds THIS
-            // global's annotated struct (mirrors the const-path seeding).
-            if gck == "struct" || gck == "nulstruct" {
-              sc.structIdx = globalCellStructIdx(globalStmts[gi])
-            }
-            // The kind-8 variant twin of that seed, for the non-const init path (a variant global whose
-            // initializer is a call, another global, or any other non-constexpr): the literal — or the
-            // value the start fn stores — builds the bare variant struct the cell is declared with.
-            if gck == "nulvariant" {
-              // The promoted-binding mirror of the cell path's nullable-variant seed: a top-level
-              // `const c: Circle | null` that becomes a start-function local still needs the variant
-              // context, so an object-literal init builds `uVarHeap[vi]` and a bare `null` init lowers as that variant's own typed null.
-              const gnvi = globalCellStructIdx(globalStmts[gi])
-              sc.variantIdx = gnvi
-              if gnvi >= 0 && gnvi < uVarHeap.length {
-                sc.nulRefHeap = uVarHeap[gnvi]
-              }
-            }
-            if gck == "variant" {
-              sc.variantIdx = globalCellStructIdx(globalStmts[gi])
-            }
-            // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
-            // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
-            sc.nulBool = letIsNulBoolAnn(globalStmts[gi])
-            sc.nulString = letIsNulString(globalStmts[gi], -1)
-            // D1576 — a `nulnone` cell (a never-filled module-scope `const x = null`) lowers
-            // its init as `ref.null none`, the one value it can hold. This block, not the
-            // constexpr arm in `emitGlobalSection`, is where every `= null` global's null rep
-            // is decided (a bare `null` is not a WasmGC constexpr).
-            sc.nulNone = gck == "nulnone"
-            if letIsLitUnion(globalStmts[gi]) { sc.litUnion = 1 }
-            // A `K | null` NICHE global's start-fn init: a member literal lowers as
-            // its atom id, a bare `null` as the `-1` sentinel — the start-fn twin of
-            // the const-path seeding (a `null` init routes here; un-seeded it drew
-            // the "bare null needs a struct-typed context" loud reject).
-            if g.letType >= 0 {
-              if nodeTyIsNulLitUnion(g.letType) {
-                sc.litUnion = 1
-                sc.nulLitUnion = true
-              }
-            }
-            // A list-annotated global seeds the element kind/slot so its literal init builds the
-            // annotation's backing+wrapper, exactly as the const-path and the local-`let` path seed it (a
-            // no-op for a non-list annotation). Needed because a closure-array's function-ident elements
-            // aren't an objlit and a scalar `f64[]`/`i64[]`/`f32[]` literal of bare int elements doesn't self-identify; an un-annotated global takes its destination's kind instead (D381).
-            const gLb = letListBuild(globalStmts[gi], -1)
-            sc.listKind = gLb.lbKind
-            sc.listSlot = gLb.lbSlot
-            expCtxApply(sc)
-            // The cell's null rep and leaf list build, by kind (the local-`let` and `global.set`
-            // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
-            // `= null` global routes here and this is where its null rep is decided.
-            const cellCtx = expCtxForCell(gck)
-            // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
-            // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
-            // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
-            // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
-            if gck == "nulreflist" {
-              if cellCtx.listSlot >= 0 && cellCtx.listSlot < rlWrapIdx.length {
-                const gnraInit = P.nodes[unwrapParen(g.letInit)]
-                if gnraInit is NullLit {
-                  cellCtx.nulRefHeap = rlWrapIdx[cellCtx.listSlot]
-                }
-              }
-            }
-            expCtxApply(cellCtx)
-            // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
-            // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
-            // position: a union global's cell is always the box (unlike `buildLocals`), so a
-            // concrete-variant init must be boxed exactly as a call argument, return, or array element is, or a plain coerce would store the wrong ref into the box cell.
-            let gun = ""
-            if gck == "union" { gun = letUnionNameOf(globalStmts[gi], -1) }
-            // A module-level `let f = add` aliasing a GENERIC (un-annotated-param) named
-            // function, used only as a direct-call callee: the closure through the floor-LESS
-            // core, the start-fn twin of the const-cell arm in `emitGlobalSection`.
-            const gAliasFe = monoGenericAliasFe(globalStmts[gi])
-            // The module-scope twin of `emitLetDeclStmt`'s union-box map-read arm. A bare top-level
-            // `const t = m[k]` over a union-valued map must lower its miss as the null-tagged box,
-            // because the consuming `!= null`/`is`/`match`/`??` is a tag compare that recovers the box
-            // with `ref.as_non_null` first. Without this arm the init falls through to `emitMapGet`'s bare `ref.null` miss — check-clean, then a runtime `null reference` trap.
-            const gUmr = letNulMapReadUnionBox(globalStmts[gi], -1)
-            if gUmr {
-              const gumrN = P.nodes[unwrapParen(g.letInit)]
-              if gumrN is Index {
-                if (
-                  emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1)
-                  < 0
-                ) {
-                  wTarget(exprPrev)
-                  return -1
-                }
-              } else {
-                wTarget(exprPrev)
-                return emitFail(
-                  "emitProgram: union-valued map read binding's init is not an index read",
-                )
-              }
-            } else if gun != "" {
-              if emitUnionBoxArg(bodyExpr, gun, g.letInit, -1) < 0 {
-                wTarget(exprPrev)
-                return -1
-              }
-            } else if (
-              gck == "variant"
-              && sc.variantIdx >= 0
-              && sc.variantIdx < uVarHeap.length
-            ) {
-              // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-              if emitVariantCoerce(bodyExpr, sc.variantIdx, g.letInit, -1) < 0 {
-                wTarget(exprPrev)
-                return -1
-              }
-            } else if gAliasFe >= 0 {
-              if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
-                wTarget(exprPrev)
-                return -1
-              }
-            } else if gck == "nulnone" {
-              // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-              if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
-                wTarget(exprPrev)
-                return -1
-              }
-            } else if (
-              (gck == "str" || gck == "nulstr")
-              && globalInitIsLitAtom(g.letInit)
-            ) {
-              // A literal-union atom initializing a `string` global widens to its member string.
-              // The start fn is a real function, so the runtime widening tower runs here (unlike a
-              // CONST global, whose constexpr init has no `select`/scratch).
-              if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
-                wTarget(exprPrev)
-                return -1
-              }
-            } else {
-              if emitExpr(bodyExpr, g.letInit, -1) < 0 {
-                wTarget(exprPrev)
-                return -1
-              }
-            }
-            // Back to idle, keeping the caller's null reps for a closure and a list. The variant
-            // and ref-heap seeds must clear too: `emitNullLitNode` does not consume them, so a left
-            // armed one retypes the next global's bare `null` into the wrong cell (D1563).
-            const idle = expCtxHere()
-            idle.nulBool = false
-            idle.nulString = false
-            idle.nulNone = false
-            idle.nulClosure = entryCtx.nulClosure
-            idle.nulList = entryCtx.nulList
-            idle.mapSlot = -1
-            idle.structIdx = -1
-            idle.variantIdx = -1
-            idle.listKind = LBK_I32_LIST
-            idle.listSlot = 0
-            idle.litUnion = 0
-            idle.nulLitUnion = false
-            idle.nulRefHeap = -1
-            expCtxApply(idle)
-            // Read-only covariance at the module-global binding (D822) — the eighth delivery form,
-            // absent from `letRefListDestSlot`'s list of seven because a global is not a `let`. A const
-            // global's init is a wasm constexpr and cannot carry a loop, so the widening copy can only go
-            // here — which is where a global reading another global always runs anyway (`globalIsNonConst`).
-            if gck == "reflist" {
-              emitRefListWidenSite(
-                bodyExpr,
-                g.letInit,
-                exprEmittedRefListSlot(g.letInit, -1),
-                globalRefListSlot(globalStmts[gi]),
-              )
-            }
-            // The scalar dual (D965), and the same argument for it living here: a const global's init is
-            // a wasm constexpr and cannot carry a loop, so the copy can only go in the non-const init body — which is where a global reading another global always runs.
-            emitScalarListWidenSite(bodyExpr, g.letInit, -1, gck)
-            emitGlobalInitArmUnbox(globalStmts[gi], gck, g.letInit)
-          }
-          const setPrev = wTarget(bodyExpr)
-          if emitUserGlobalSet(gi) < 0 {
-            wTarget(setPrev)
-            wTarget(exprPrev)
-            return -1
-          }
-          wTarget(setPrev)
-        }
-      }
+      const gInitRc = emitStartGlobalInit(
+        bodyExpr,
+        exprPrev,
+        gi,
+        globalStmts[gi],
+      )
+      if gInitRc < 0 { return gInitRc }
       // A guarded global's initializer has run (a folded one, at its declaration): advance the
       // progress cell past it.
       if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
@@ -2525,6 +2306,242 @@ function emitStartFnCode(out: u8[]) {
   }
   wBytes(body)
   wTarget(outPrev)
+  0
+}
+
+// `emitStartFnCode`'s step for global `gi`, whose statement is `gst`: when its initializer runs
+// in the start function, emits it into `bodyExpr` under the cell's context, then its
+// `global.set`. On failure restores the writer to `exprPrev` and returns the failure; else 0.
+function emitStartGlobalInit(
+  bodyExpr: u8[],
+  exprPrev: u8[],
+  gi: i32,
+  gst: i32,
+) {
+  if globalRunsInStartFn(gi) {
+    const g = P.nodes[gst]
+    if g is LetDecl {
+      // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
+      // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
+      // the `emitExprAs*` helper inserts the lattice convert so the start-fn `global.set`
+      // matches the cell valtype. An i32 cell is untouched. (Slice 5 widening.)
+      const gck = globalCellKind(gst)
+      if gck == "f32" {
+        const f32Saved = expCtxHere()
+        const f32Ctx = expCtxHere()
+        f32Ctx.wantF32 = true
+        expCtxApply(f32Ctx)
+        if emitExprAsF32(bodyExpr, g.letInit, -1) < 0 {
+          wTarget(exprPrev)
+          return -1
+        }
+        expCtxApply(f32Saved)
+      } else if gck == "f64" {
+        if emitExprAsF64(bodyExpr, g.letInit, -1) < 0 {
+          wTarget(exprPrev)
+          return -1
+        }
+      } else if gck == "i64" {
+        if emitExprAsI64(bodyExpr, g.letInit, -1) < 0 {
+          wTarget(exprPrev)
+          return -1
+        }
+      } else {
+        // A map global's start-fn init seeds the map SHAPE (mirrors the
+        // local-`let` seeding) so `Map()` builds THIS global's map struct.
+        const entryCtx = expCtxHere()
+        const sc = expCtxHere()
+        if gck == "map" { sc.mapSlot = letMapShapeOf(gst, -1) }
+        // A NULLABLE map global's start-fn init: seed the map SHAPE (`Map()` builds it) and
+        // the null heap (a bare `null` init lowers as `ref.null $mapStruct`).
+        if gck == "nulmap" {
+          const gnmShape = nulMapShapeOf(gst, -1)
+          sc.mapSlot = gnmShape
+          sc.nulRefHeap = mapTypeIdxOf(gnmShape)
+        }
+        // A struct / nullable-struct cell seeds the struct context so a bare
+        // `null` init lowers as `ref.null $S` and a literal builds THIS
+        // global's annotated struct (mirrors the const-path seeding).
+        if gck == "struct" || gck == "nulstruct" {
+          sc.structIdx = globalCellStructIdx(gst)
+        }
+        // The kind-8 variant twin of that seed, for the non-const init path (a variant global whose
+        // initializer is a call, another global, or any other non-constexpr): the literal — or the
+        // value the start fn stores — builds the bare variant struct the cell is declared with.
+        if gck == "nulvariant" {
+          // The promoted-binding mirror of the cell path's nullable-variant seed: a top-level
+          // `const c: Circle | null` that becomes a start-function local still needs the variant
+          // context, so an object-literal init builds `uVarHeap[vi]` and a bare `null` init lowers as that variant's own typed null.
+          const gnvi = globalCellStructIdx(gst)
+          sc.variantIdx = gnvi
+          if gnvi >= 0 && gnvi < uVarHeap.length {
+            sc.nulRefHeap = uVarHeap[gnvi]
+          }
+        }
+        if gck == "variant" { sc.variantIdx = globalCellStructIdx(gst) }
+        // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
+        // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
+        sc.nulBool = letIsNulBoolAnn(gst)
+        sc.nulString = letIsNulString(gst, -1)
+        // D1576 — a `nulnone` cell (a never-filled module-scope `const x = null`) lowers
+        // its init as `ref.null none`, the one value it can hold. This block, not the
+        // constexpr arm in `emitGlobalSection`, is where every `= null` global's null rep
+        // is decided (a bare `null` is not a WasmGC constexpr).
+        sc.nulNone = gck == "nulnone"
+        if letIsLitUnion(gst) { sc.litUnion = 1 }
+        // A `K | null` NICHE global's start-fn init: a member literal lowers as
+        // its atom id, a bare `null` as the `-1` sentinel — the start-fn twin of
+        // the const-path seeding (a `null` init routes here; un-seeded it drew
+        // the "bare null needs a struct-typed context" loud reject).
+        if g.letType >= 0 {
+          if nodeTyIsNulLitUnion(g.letType) {
+            sc.litUnion = 1
+            sc.nulLitUnion = true
+          }
+        }
+        // A list-annotated global seeds the element kind/slot so its literal init builds the
+        // annotation's backing+wrapper, exactly as the const-path and the local-`let` path seed it (a
+        // no-op for a non-list annotation). Needed because a closure-array's function-ident elements
+        // aren't an objlit and a scalar `f64[]`/`i64[]`/`f32[]` literal of bare int elements doesn't self-identify; an un-annotated global takes its destination's kind instead (D381).
+        const gLb = letListBuild(gst, -1)
+        sc.listKind = gLb.lbKind
+        sc.listSlot = gLb.lbSlot
+        expCtxApply(sc)
+        // The cell's null rep and leaf list build, by kind (the local-`let` and `global.set`
+        // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
+        // `= null` global routes here and this is where its null rep is decided.
+        const cellCtx = expCtxForCell(gck)
+        // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
+        // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
+        // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
+        // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
+        if gck == "nulreflist" {
+          if cellCtx.listSlot >= 0 && cellCtx.listSlot < rlWrapIdx.length {
+            const gnraInit = P.nodes[unwrapParen(g.letInit)]
+            if gnraInit is NullLit {
+              cellCtx.nulRefHeap = rlWrapIdx[cellCtx.listSlot]
+            }
+          }
+        }
+        expCtxApply(cellCtx)
+        // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
+        // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
+        // position: a union global's cell is always the box (unlike `buildLocals`), so a
+        // concrete-variant init must be boxed exactly as a call argument, return, or array element is, or a plain coerce would store the wrong ref into the box cell.
+        let gun = ""
+        if gck == "union" { gun = letUnionNameOf(gst, -1) }
+        // A module-level `let f = add` aliasing a GENERIC (un-annotated-param) named
+        // function, used only as a direct-call callee: the closure through the floor-LESS
+        // core, the start-fn twin of the const-cell arm in `emitGlobalSection`.
+        const gAliasFe = monoGenericAliasFe(gst)
+        // The module-scope twin of `emitLetDeclStmt`'s union-box map-read arm. A bare top-level
+        // `const t = m[k]` over a union-valued map must lower its miss as the null-tagged box,
+        // because the consuming `!= null`/`is`/`match`/`??` is a tag compare that recovers the box
+        // with `ref.as_non_null` first. Without this arm the init falls through to `emitMapGet`'s bare `ref.null` miss — check-clean, then a runtime `null reference` trap.
+        const gUmr = letNulMapReadUnionBox(gst, -1)
+        if gUmr {
+          const gumrN = P.nodes[unwrapParen(g.letInit)]
+          if gumrN is Index {
+            if (
+              emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1)
+              < 0
+            ) {
+              wTarget(exprPrev)
+              return -1
+            }
+          } else {
+            wTarget(exprPrev)
+            return emitFail(
+              "emitProgram: union-valued map read binding's init is not an index read",
+            )
+          }
+        } else if gun != "" {
+          if emitUnionBoxArg(bodyExpr, gun, g.letInit, -1) < 0 {
+            wTarget(exprPrev)
+            return -1
+          }
+        } else if (
+          gck == "variant"
+          && sc.variantIdx >= 0
+          && sc.variantIdx < uVarHeap.length
+        ) {
+          // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
+          if emitVariantCoerce(bodyExpr, sc.variantIdx, g.letInit, -1) < 0 {
+            wTarget(exprPrev)
+            return -1
+          }
+        } else if gAliasFe >= 0 {
+          if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
+            wTarget(exprPrev)
+            return -1
+          }
+        } else if gck == "nulnone" {
+          // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
+          if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
+            wTarget(exprPrev)
+            return -1
+          }
+        } else if (
+          (gck == "str" || gck == "nulstr")
+          && globalInitIsLitAtom(g.letInit)
+        ) {
+          // A literal-union atom initializing a `string` global widens to its member string.
+          // The start fn is a real function, so the runtime widening tower runs here (unlike a
+          // CONST global, whose constexpr init has no `select`/scratch).
+          if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
+            wTarget(exprPrev)
+            return -1
+          }
+        } else {
+          if emitExpr(bodyExpr, g.letInit, -1) < 0 {
+            wTarget(exprPrev)
+            return -1
+          }
+        }
+        // Back to idle, keeping the caller's null reps for a closure and a list. The variant
+        // and ref-heap seeds must clear too: `emitNullLitNode` does not consume them, so a left
+        // armed one retypes the next global's bare `null` into the wrong cell (D1563).
+        const idle = expCtxHere()
+        idle.nulBool = false
+        idle.nulString = false
+        idle.nulNone = false
+        idle.nulClosure = entryCtx.nulClosure
+        idle.nulList = entryCtx.nulList
+        idle.mapSlot = -1
+        idle.structIdx = -1
+        idle.variantIdx = -1
+        idle.listKind = LBK_I32_LIST
+        idle.listSlot = 0
+        idle.litUnion = 0
+        idle.nulLitUnion = false
+        idle.nulRefHeap = -1
+        expCtxApply(idle)
+        // Read-only covariance at the module-global binding (D822) — the eighth delivery form,
+        // absent from `letRefListDestSlot`'s list of seven because a global is not a `let`. A const
+        // global's init is a wasm constexpr and cannot carry a loop, so the widening copy can only go
+        // here — which is where a global reading another global always runs anyway (`globalIsNonConst`).
+        if gck == "reflist" {
+          emitRefListWidenSite(
+            bodyExpr,
+            g.letInit,
+            exprEmittedRefListSlot(g.letInit, -1),
+            globalRefListSlot(gst),
+          )
+        }
+        // The scalar dual (D965), and the same argument for it living here: a const global's init is
+        // a wasm constexpr and cannot carry a loop, so the copy can only go in the non-const init body — which is where a global reading another global always runs.
+        emitScalarListWidenSite(bodyExpr, g.letInit, -1, gck)
+        emitGlobalInitArmUnbox(gst, gck, g.letInit)
+      }
+      const setPrev = wTarget(bodyExpr)
+      if emitUserGlobalSet(gi) < 0 {
+        wTarget(setPrev)
+        wTarget(exprPrev)
+        return -1
+      }
+      wTarget(setPrev)
+    }
+  }
   0
 }
 
@@ -5661,147 +5678,7 @@ function emitModule(_stmts: i32[]) {
   if memLogUsed { memFn = 1 }
   gMemLogIdx = gImports + n + hasStart
 
-  // ── shared runtime helpers (module-tail functions) ──
-  // Assigns each enabled helper the next function index after the start fn and the `__log__`
-  // decoder (so no other index shifts), in a fixed order keyed only on type-presence flags —
-  // deterministic per program, so the self-compile fixpoint converges. An enabled-but-uncalled helper costs a few dozen bytes, never correctness.
-  gHelpStrHash = -1
-  gHelpStrEq = -1
-  gHelpStrConcat = -1
-  gHelpUtf8Dec = -1
-  gHelpUtf8Enc = -1
-  gHelpUtf8CpLen = -1
-  gHelpStrBytes = -1
-  gHelpMapProbe = -1
-  gHelpMapProbeI32 = -1
-  gHelpMapResize = -1
-  gHelpMapResizeI32 = -1
-  gHelpF64Rem = -1
-  let nHelpers = 0
-  const helpBase = gImports + n + hasStart + memFn
-  if aUsed {
-    gHelpStrHash = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpStrEq = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpStrConcat = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    // The UTF-8 codec trio, AFTER the string trio so a program's existing helper indices
-    // are unmoved by Stage 2c. Same `aUsed` gate and same "enabled-but-uncalled costs a
-    // few dozen bytes, never correctness" trade the trio above documents.
-    gHelpUtf8Dec = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpUtf8Enc = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpUtf8CpLen = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    // `s.bytes()` needs the packed pair to exist, so unlike its three neighbours it is gated on
-    // `ba8Used` too — `bl8TypeIdx` is 0 when unminted, and a helper naming it would collide with heap type 0.
-    if ba8Used {
-      gHelpStrBytes = helpBase + nHelpers
-      nHelpers = nHelpers + 1
-    }
-  }
-  if mUsed {
-    gHelpMapProbe = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpMapResize = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  // The i32-KEYED probe and resize, LAST so no existing helper index moves in a program
-  // without one: the i32-keyed index is the pair layout, which neither string helper reads.
-  // The i64-keyed rep resizes over the same pairs, so it mints this pair too.
-  if mI32Used || mI64Used {
-    gHelpMapProbeI32 = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    gHelpMapResizeI32 = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  gHelpMapProbeI64 = -1
-  if mI64Used {
-    gHelpMapProbeI64 = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  // The float remainder helper (D1586), last for the reason its neighbour above gives: no
-  // existing helper index moves in a program without one. It is the first helper gated on
-  // neither `aUsed` nor a map flag — a float program touches no string and no map.
-  if gNeedsF64Rem {
-    gHelpF64Rem = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  // The delete family (D2315), last for the same reason, and only in a module that deletes: a
-  // map nothing deletes from never has a dead entry, so it never compacts and no walk resyncs.
-  // One compaction helper per map shape, since each names its shape's heap types.
-  gHelpMapResync = -1
-  gHelpMapCompact = []
-  if gMapDeletes && mUsed {
-    gHelpMapResync = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-    let ck = 0
-    while ck < mvMapTypeIdx.length + 3 {
-      if mapShapeCompactable(mapCompactRowShape(ck)) {
-        gHelpMapCompact.push(helpBase + nHelpers)
-        nHelpers = nHelpers + 1
-      } else {
-        gHelpMapCompact.push(-1)
-      }
-      ck = ck + 1
-    }
-  }
-  // The read-before-init trap (D2652), last for the same reason.
-  gHelpInitFail = -1
-  gInitGIdx = []
-  gInitGNames = []
-  gInitGLocs = []
-  gInitReaders = []
-  if gInitAny {
-    gHelpInitFail = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  // The scalar list views (D3028), last for the same reason: a maker per pair, then a sync,
-  // element and length helper per destination.
-  svReserve()
-  let svp = 0
-  while svp < 3 {
-    if svPairOn(svp) {
-      gHelpSvMk[svp] = helpBase + nHelpers
-      nHelpers = nHelpers + 1
-    }
-    svp = svp + 1
-  }
-  let svd = 0
-  while svd < 2 {
-    if svDstOn(svd) {
-      gHelpSvSync[svd] = helpBase + nHelpers
-      gHelpSvGet[svd] = helpBase + nHelpers + 1
-      gHelpSvLen[svd] = helpBase + nHelpers + 2
-      nHelpers = nHelpers + 3
-    }
-    svd = svd + 1
-  }
-  // The record-list views (D3041), after them: a sync, an element and a length helper.
-  gHelpRvSync = -1
-  gHelpRvGet = -1
-  gHelpRvLen = -1
-  if rvWanted() {
-    gHelpRvSync = helpBase + nHelpers
-    gHelpRvGet = helpBase + nHelpers + 1
-    gHelpRvLen = helpBase + nHelpers + 2
-    nHelpers = nHelpers + 3
-  }
-  // The `as!` reason (SP-056), after them.
-  gHelpAsFail = -1
-  gAsFailDoms = []
-  if gNeedsAsFail {
-    gHelpAsFail = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
-  // `__str_from_bytes__` (D4784), after them.
-  gHelpStrFromBytes = -1
-  if gNeedsStrFromBytes {
-    gHelpStrFromBytes = helpBase + nHelpers
-    nHelpers = nHelpers + 1
-  }
+  const nHelpers = assignSharedHelperIndices(gImports + n + hasStart + memFn)
 
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
   // user-global index below rides `userGlobalIdx`).
@@ -5955,6 +5832,153 @@ function emitModule(_stmts: i32[]) {
     )
   }
   0
+}
+
+// `emitModule`'s shared-helper index assignment: resets every `gHelp*` index, then gives each
+// helper the program enables the next function index from `helpBase` on. Returns how many it
+// assigned.
+function assignSharedHelperIndices(helpBase: i32) {
+  // ── shared runtime helpers (module-tail functions) ──
+  // Assigns each enabled helper the next function index after the start fn and the `__log__`
+  // decoder (so no other index shifts), in a fixed order keyed only on type-presence flags —
+  // deterministic per program, so the self-compile fixpoint converges. An enabled-but-uncalled helper costs a few dozen bytes, never correctness.
+  gHelpStrHash = -1
+  gHelpStrEq = -1
+  gHelpStrConcat = -1
+  gHelpUtf8Dec = -1
+  gHelpUtf8Enc = -1
+  gHelpUtf8CpLen = -1
+  gHelpStrBytes = -1
+  gHelpMapProbe = -1
+  gHelpMapProbeI32 = -1
+  gHelpMapResize = -1
+  gHelpMapResizeI32 = -1
+  gHelpF64Rem = -1
+  let nHelpers = 0
+  if aUsed {
+    gHelpStrHash = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpStrEq = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpStrConcat = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    // The UTF-8 codec trio, AFTER the string trio so a program's existing helper indices
+    // are unmoved by Stage 2c. Same `aUsed` gate and same "enabled-but-uncalled costs a
+    // few dozen bytes, never correctness" trade the trio above documents.
+    gHelpUtf8Dec = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpUtf8Enc = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpUtf8CpLen = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    // `s.bytes()` needs the packed pair to exist, so unlike its three neighbours it is gated on
+    // `ba8Used` too — `bl8TypeIdx` is 0 when unminted, and a helper naming it would collide with heap type 0.
+    if ba8Used {
+      gHelpStrBytes = helpBase + nHelpers
+      nHelpers = nHelpers + 1
+    }
+  }
+  if mUsed {
+    gHelpMapProbe = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpMapResize = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // The i32-KEYED probe and resize, LAST so no existing helper index moves in a program
+  // without one: the i32-keyed index is the pair layout, which neither string helper reads.
+  // The i64-keyed rep resizes over the same pairs, so it mints this pair too.
+  if mI32Used || mI64Used {
+    gHelpMapProbeI32 = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    gHelpMapResizeI32 = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  gHelpMapProbeI64 = -1
+  if mI64Used {
+    gHelpMapProbeI64 = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // The float remainder helper (D1586), last for the reason its neighbour above gives: no
+  // existing helper index moves in a program without one. It is the first helper gated on
+  // neither `aUsed` nor a map flag — a float program touches no string and no map.
+  if gNeedsF64Rem {
+    gHelpF64Rem = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // The delete family (D2315), last for the same reason, and only in a module that deletes: a
+  // map nothing deletes from never has a dead entry, so it never compacts and no walk resyncs.
+  // One compaction helper per map shape, since each names its shape's heap types.
+  gHelpMapResync = -1
+  gHelpMapCompact = []
+  if gMapDeletes && mUsed {
+    gHelpMapResync = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    let ck = 0
+    while ck < mvMapTypeIdx.length + 3 {
+      if mapShapeCompactable(mapCompactRowShape(ck)) {
+        gHelpMapCompact.push(helpBase + nHelpers)
+        nHelpers = nHelpers + 1
+      } else {
+        gHelpMapCompact.push(-1)
+      }
+      ck = ck + 1
+    }
+  }
+  // The read-before-init trap (D2652), last for the same reason.
+  gHelpInitFail = -1
+  gInitGIdx = []
+  gInitGNames = []
+  gInitGLocs = []
+  gInitReaders = []
+  if gInitAny {
+    gHelpInitFail = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // The scalar list views (D3028), last for the same reason: a maker per pair, then a sync,
+  // element and length helper per destination.
+  svReserve()
+  let svp = 0
+  while svp < 3 {
+    if svPairOn(svp) {
+      gHelpSvMk[svp] = helpBase + nHelpers
+      nHelpers = nHelpers + 1
+    }
+    svp = svp + 1
+  }
+  let svd = 0
+  while svd < 2 {
+    if svDstOn(svd) {
+      gHelpSvSync[svd] = helpBase + nHelpers
+      gHelpSvGet[svd] = helpBase + nHelpers + 1
+      gHelpSvLen[svd] = helpBase + nHelpers + 2
+      nHelpers = nHelpers + 3
+    }
+    svd = svd + 1
+  }
+  // The record-list views (D3041), after them: a sync, an element and a length helper.
+  gHelpRvSync = -1
+  gHelpRvGet = -1
+  gHelpRvLen = -1
+  if rvWanted() {
+    gHelpRvSync = helpBase + nHelpers
+    gHelpRvGet = helpBase + nHelpers + 1
+    gHelpRvLen = helpBase + nHelpers + 2
+    nHelpers = nHelpers + 3
+  }
+  // The `as!` reason (SP-056), after them.
+  gHelpAsFail = -1
+  gAsFailDoms = []
+  if gNeedsAsFail {
+    gHelpAsFail = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // `__str_from_bytes__` (D4784), after them.
+  gHelpStrFromBytes = -1
+  if gNeedsStrFromBytes {
+    gHelpStrFromBytes = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  nHelpers
 }
 
 // ── emitProgram pass manager ──
@@ -6348,127 +6372,14 @@ function scanPrintUse() {
     if pn is Call {
       const pcallee = P.nodes[pn.callFn]
       if pcallee is Ident {
-        if pcallee.identName == "print" { gImports = 4 }
-        // The linear-memory intrinsics: any store/load forces the module-defined
-        // memory; `__log__` additionally forces the synthetic decoder function,
-        // which prints through `__print_i32__` — so it pulls in the print-import
-        // family exactly as a `print(...)` call does.
-        if (
-          pcallee.identName == "__store_i32__"
-          || pcallee.identName == "__load_i32__"
-        ) {
-          memUsed = true
-        }
-        // The five other store widths force the memory exactly as `__store_i32__` does. They add
-        // nothing to the print-import scan below, and that is a decision: a store consumes a scalar
-        // and yields none, so it can never route a `print` to an undeclared import. Membership, not a spelling: a width added to `nameIsMemStoreIntrinsic` forces the memory here the same day.
-        if nameIsMemStoreIntrinsic(pcallee.identName) { memUsed = true }
-        // The load-width matrix forces the memory exactly as `__load_i32__` does, and additionally
-        // forces a `__print_*__` import when its result is a wide scalar: `print(__load_f64__(0))`
-        // routes to `__print_f64__` in a program that spells `f64` nowhere, so the annotation scan
-        // below cannot see it. Read off the name (`repMemLoadScalarMask`), which is total.
-        if nameIsMemLoadIntrinsic(pcallee.identName) {
-          memUsed = true
-          const lscal = repMemLoadScalarMask(pcallee.identName)
-          if (lscal & REP_SCAL_I64) != 0 { sawI64Ann = true }
-          if (lscal & REP_SCAL_F64) != 0 { sawF64 = true }
-          if (lscal & REP_SCAL_F32) != 0 { sawF32 = true }
-        }
-        // The bulk pair forces the memory for the same reason, generalised: `memory.copy`/
-        // `memory.fill` are instructions on the memory, so a program whose only contact with linear
-        // memory is `__memory_fill__(0, 0, 4)` still needs section 5 emitted or the instruction names
-        // a memory that does not exist. Both are void, so like the stores they add nothing to the print-import scan below.
-        if nameIsMemBulkIntrinsic(pcallee.identName) { memUsed = true }
-        // A SIMD load/store forces the module's memory exactly as `__load_i32__` does — a
-        // `v128.load`/`store` names a memory that must exist. A lane read answering an f32 or
-        // an i64 needs that width's print import even in a program that never spells it.
-        const srow = simdRow(pcallee.identName)
-        if srow >= 0 {
-          const ssig = simdRowSig(srow)
-          if ssig == SIMD_SIG_LOAD || ssig == SIMD_SIG_STORE { memUsed = true }
-          if ssig == SIMD_SIG_LANE_F { sawF32 = true }
-          if ssig == SIMD_SIG_LANE_L { sawI64Ann = true }
-        }
-        // A saturating truncation to i64 needs that width's print import.
-        const tsop = truncSatOp(pcallee.identName)
-        if tsop >= 0 && truncSatIsI64(tsop) { sawI64Ann = true }
-        // An atomic names the memory like `__load_i32__` (the fence alone does not), and one
-        // answering an i64 needs that width's print import.
-        const arow = atomicRow(pcallee.identName)
-        if arow >= 0 {
-          const asig = atomicRowSig(arow)
-          if asig != ATOMIC_SIG_FENCE { memUsed = true }
-          if (
-            atomicRowIsI64(arow)
-            && (asig == ATOMIC_SIG_LOAD
-              || asig == ATOMIC_SIG_RMW
-              || asig == ATOMIC_SIG_CMPXCHG)
-          ) {
-            sawI64Ann = true
-          }
-        }
-        // The filesystem floor. Unlike every memory intrinsic above, these are host imports, so a use
-        // here reserves a wasm function index — which is exactly why the reservation must happen in
-        // this scan rather than at the call site: an extra import shifts every user function's index,
-        // and the count cannot be discovered mid-emit. `gImports = 4` pulls in the print family first; the fs imports append after it, so the section every corpus golden pins is not rewritten.
-        const fslot = fsIntrinsicSlot(pcallee.identName)
-        if fslot >= 0 {
-          gImports = 4
-          if fslot < gFsUse.length { gFsUse[fslot] = 1 }
-          if fsRetIsU8List(fslot) || fsArgIsU8List(fslot, 0) { ba8Used = true }
-          if fsRetIsI64(fslot) { sawI64Ann = true }
-          // A slot that hands the host a linear-memory ADDRESS forces section 5 exactly as
-          // `__memory_size__` below does: a program whose only memory contact is that call
-          // would otherwise name a memory that does not exist — and the export the host
-          // looks the memory up by would not be emitted.
-          if fsSlotTouchesMemory(fslot) { memUsed = true }
-        }
-        // `memory.size` / `memory.grow` are instructions ON the memory: a program whose
-        // ONLY memory contact is `__memory_size__()` still needs section 5 emitted, or
-        // the instruction refers to a memory that does not exist and the module fails to
-        // validate. Both are i32-valued, so neither touches the print-import scan.
-        if (
-          pcallee.identName == "__memory_size__"
-          || pcallee.identName == "__memory_grow__"
-        ) {
-          memUsed = true
-        }
-        // The heap window is two globals a program pays for only when it reads one.
-        if (
-          pcallee.identName == "__heap_base__"
-          || pcallee.identName == "__heap_limit__"
-        ) {
-          gHeapUsed = true
-        }
-        if pcallee.identName == "__log__" {
-          memUsed = true
-          memLogUsed = true
-          gImports = 4
-        }
-        // `__trap__("reason")` streams its message through the same `__print_char__`/
-        // `__print_str_flush__` pair `print(<string>)` uses, so it pulls in the 4-import print
-        // family exactly as a `print(...)` call does — without an arm here the two streaming calls
-        // land on user function indices, invalid wasm with `vl check` rc 0. Arity-gated: a bare `__trap__()` lowers to `unreachable` alone and streams nothing, so reserving for it would be four unused imports.
-        if pcallee.identName == "__trap__" {
-          if pn.callArgs.length == 1 { gImports = 4 }
-        }
-        // `__str_from_bytes__` reserves its helper, and the packed pair and string types it names.
-        if pcallee.identName == "__str_from_bytes__" {
-          gNeedsStrFromBytes = true
-          ba8Used = true
-          aUsed = true
-        }
-        // A numeric-opcode intrinsic yields a scalar the annotation scan below cannot see:
-        // `f64bits(x)` is an i64 and `f32fromBits(b)` an f32 in a program that may spell neither type
-        // anywhere. Read the call's own recorded type, so the print router never routes to an undeclared import.
-        if isNumIntrinsicName(pcallee.identName) {
-          const iscal = repNodeScalarMask(pscan)
-          if iscal >= 0 {
-            if (iscal & REP_SCAL_I64) != 0 { sawI64Ann = true }
-            if (iscal & REP_SCAL_F64) != 0 { sawF64 = true }
-            if (iscal & REP_SCAL_F32) != 0 { sawF32 = true }
-          }
-        }
+        const pmask = scanPrintCallIntrinsic(
+          pscan,
+          pcallee.identName,
+          pn.callArgs.length,
+        )
+        if (pmask & REP_SCAL_I64) != 0 { sawI64Ann = true }
+        if (pmask & REP_SCAL_F64) != 0 { sawF64 = true }
+        if (pmask & REP_SCAL_F32) != 0 { sawF32 = true }
       }
       // `s.bytes()` yields a `u8[]`. It is the one producer of a packed byte list that spells no
       // `u8[]` anywhere — the annotation scan matches a type, and `for b in s.bytes()` has none — so
@@ -6619,6 +6530,120 @@ function scanPrintUse() {
     }
   }
   0
+}
+
+// `scanPrintUse`'s arm for a call at node `pscan` of the identifier `name` with `nArgs`
+// arguments: reserves the imports, memory and helpers the intrinsic it names needs. Returns the
+// `REP_SCAL_*` bits of each wide scalar the call yields that the annotation scan cannot see.
+function scanPrintCallIntrinsic(pscan: i32, name: string, nArgs: i32) {
+  let saw = 0
+  if name == "print" { gImports = 4 }
+  // The linear-memory intrinsics: any store/load forces the module-defined
+  // memory; `__log__` additionally forces the synthetic decoder function,
+  // which prints through `__print_i32__` — so it pulls in the print-import
+  // family exactly as a `print(...)` call does.
+  if (name == "__store_i32__" || name == "__load_i32__") { memUsed = true }
+  // The five other store widths force the memory exactly as `__store_i32__` does. They add
+  // nothing to the print-import scan below, and that is a decision: a store consumes a scalar
+  // and yields none, so it can never route a `print` to an undeclared import. Membership, not a spelling: a width added to `nameIsMemStoreIntrinsic` forces the memory here the same day.
+  if nameIsMemStoreIntrinsic(name) { memUsed = true }
+  // The load-width matrix forces the memory exactly as `__load_i32__` does, and additionally
+  // forces a `__print_*__` import when its result is a wide scalar: `print(__load_f64__(0))`
+  // routes to `__print_f64__` in a program that spells `f64` nowhere, so the annotation scan
+  // below cannot see it. Read off the name (`repMemLoadScalarMask`), which is total.
+  if nameIsMemLoadIntrinsic(name) {
+    memUsed = true
+    const lscal = repMemLoadScalarMask(name)
+    if (lscal & REP_SCAL_I64) != 0 { saw = saw | REP_SCAL_I64 }
+    if (lscal & REP_SCAL_F64) != 0 { saw = saw | REP_SCAL_F64 }
+    if (lscal & REP_SCAL_F32) != 0 { saw = saw | REP_SCAL_F32 }
+  }
+  // The bulk pair forces the memory for the same reason, generalised: `memory.copy`/
+  // `memory.fill` are instructions on the memory, so a program whose only contact with linear
+  // memory is `__memory_fill__(0, 0, 4)` still needs section 5 emitted or the instruction names
+  // a memory that does not exist. Both are void, so like the stores they add nothing to the print-import scan below.
+  if nameIsMemBulkIntrinsic(name) { memUsed = true }
+  // A SIMD load/store forces the module's memory exactly as `__load_i32__` does — a
+  // `v128.load`/`store` names a memory that must exist. A lane read answering an f32 or
+  // an i64 needs that width's print import even in a program that never spells it.
+  const srow = simdRow(name)
+  if srow >= 0 {
+    const ssig = simdRowSig(srow)
+    if ssig == SIMD_SIG_LOAD || ssig == SIMD_SIG_STORE { memUsed = true }
+    if ssig == SIMD_SIG_LANE_F { saw = saw | REP_SCAL_F32 }
+    if ssig == SIMD_SIG_LANE_L { saw = saw | REP_SCAL_I64 }
+  }
+  // A saturating truncation to i64 needs that width's print import.
+  const tsop = truncSatOp(name)
+  if tsop >= 0 && truncSatIsI64(tsop) { saw = saw | REP_SCAL_I64 }
+  // An atomic names the memory like `__load_i32__` (the fence alone does not), and one
+  // answering an i64 needs that width's print import.
+  const arow = atomicRow(name)
+  if arow >= 0 {
+    const asig = atomicRowSig(arow)
+    if asig != ATOMIC_SIG_FENCE { memUsed = true }
+    if (
+      atomicRowIsI64(arow)
+      && (asig == ATOMIC_SIG_LOAD
+        || asig == ATOMIC_SIG_RMW
+        || asig == ATOMIC_SIG_CMPXCHG)
+    ) {
+      saw = saw | REP_SCAL_I64
+    }
+  }
+  // The filesystem floor. Unlike every memory intrinsic above, these are host imports, so a use
+  // here reserves a wasm function index — which is exactly why the reservation must happen in
+  // this scan rather than at the call site: an extra import shifts every user function's index,
+  // and the count cannot be discovered mid-emit. `gImports = 4` pulls in the print family first; the fs imports append after it, so the section every corpus golden pins is not rewritten.
+  const fslot = fsIntrinsicSlot(name)
+  if fslot >= 0 {
+    gImports = 4
+    if fslot < gFsUse.length { gFsUse[fslot] = 1 }
+    if fsRetIsU8List(fslot) || fsArgIsU8List(fslot, 0) { ba8Used = true }
+    if fsRetIsI64(fslot) { saw = saw | REP_SCAL_I64 }
+    // A slot that hands the host a linear-memory ADDRESS forces section 5 exactly as
+    // `__memory_size__` below does: a program whose only memory contact is that call
+    // would otherwise name a memory that does not exist — and the export the host
+    // looks the memory up by would not be emitted.
+    if fsSlotTouchesMemory(fslot) { memUsed = true }
+  }
+  // `memory.size` / `memory.grow` are instructions ON the memory: a program whose
+  // ONLY memory contact is `__memory_size__()` still needs section 5 emitted, or
+  // the instruction refers to a memory that does not exist and the module fails to
+  // validate. Both are i32-valued, so neither touches the print-import scan.
+  if (name == "__memory_size__" || name == "__memory_grow__") { memUsed = true }
+  // The heap window is two globals a program pays for only when it reads one.
+  if (name == "__heap_base__" || name == "__heap_limit__") { gHeapUsed = true }
+  if name == "__log__" {
+    memUsed = true
+    memLogUsed = true
+    gImports = 4
+  }
+  // `__trap__("reason")` streams its message through the same `__print_char__`/
+  // `__print_str_flush__` pair `print(<string>)` uses, so it pulls in the 4-import print
+  // family exactly as a `print(...)` call does — without an arm here the two streaming calls
+  // land on user function indices, invalid wasm with `vl check` rc 0. Arity-gated: a bare `__trap__()` lowers to `unreachable` alone and streams nothing, so reserving for it would be four unused imports.
+  if name == "__trap__" {
+    if nArgs == 1 { gImports = 4 }
+  }
+  // `__str_from_bytes__` reserves its helper, and the packed pair and string types it names.
+  if name == "__str_from_bytes__" {
+    gNeedsStrFromBytes = true
+    ba8Used = true
+    aUsed = true
+  }
+  // A numeric-opcode intrinsic yields a scalar the annotation scan below cannot see:
+  // `f64bits(x)` is an i64 and `f32fromBits(b)` an f32 in a program that may spell neither type
+  // anywhere. Read the call's own recorded type, so the print router never routes to an undeclared import.
+  if isNumIntrinsicName(name) {
+    const iscal = repNodeScalarMask(pscan)
+    if iscal >= 0 {
+      if (iscal & REP_SCAL_I64) != 0 { saw = saw | REP_SCAL_I64 }
+      if (iscal & REP_SCAL_F64) != 0 { saw = saw | REP_SCAL_F64 }
+      if (iscal & REP_SCAL_F32) != 0 { saw = saw | REP_SCAL_F32 }
+    }
+  }
+  saw
 }
 
 // Every function's parameters must be i32 or the struct type before we commit.
