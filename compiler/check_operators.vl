@@ -474,656 +474,502 @@ function checkInOpNode(n: BinExpr, ix: i32) {
 }
 
 // Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
-function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
+// `a && b` / `a || b`: the left side's narrowings hold while checking the right (`&&`
+// narrows on true, `||` on false — the right is reached only in that branch). Answers boolean.
+function checkLogicalBinNode(n: BinExpr, ix: i32): i32 {
   const op = n.binOp
-  if op == "in" { return checkInOpNode(n, ix) }
-  // `a && b` / `a || b`: the left side's narrowings hold while checking the right (`&&`
-  // narrows on true, `||` on false — the right is reached only in that branch).
-  if op == "&&" || op == "||" {
-    const clt = checkNodeHook(n.binLeft)
-    const cnames: string[] = []
-    const ctys: i32[] = []
-    if op == "&&" {
-      collectThenNarrows(n.binLeft, cnames, ctys)
+  const clt = checkNodeHook(n.binLeft)
+  const cnames: string[] = []
+  const ctys: i32[] = []
+  if op == "&&" {
+    collectThenNarrows(n.binLeft, cnames, ctys)
+  } else {
+    collectElseNarrows(n.binLeft, cnames, ctys)
+  }
+  let cpushed = 0
+  const npBase = npKeys.length
+  if cnames.length > 0 {
+    pushScope(-1)
+    applyNarrows(cnames, ctys)
+    cpushed = 1
+  }
+  const crt = checkNodeHook(n.binRight)
+  if cpushed == 1 {
+    crNoteRhsRetired(ix, n.binRight, cnames, ctys, npBase)
+    popScope()
+  }
+  if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
+    tErr("operator '" + op + "' expects boolean operands", ix)
+  }
+  return TY_BOOL
+}
+
+// The store half of assignment `n`, once an index target has pinned what it pins: `rt` must
+// be assignable to the place's storage type (not its narrowed flow type), then the write fills
+// or retires the binding's narrowings. Answers what the expression yields: `rt`, or the place's
+// type where the value is built at it.
+function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  // Narrowing applies to READS: a place accepts its storage type, never its current flow
+  // (narrowed) type, so every write is checked against storage and may flip the variant (D1736).
+  let asgLt = lt
+  let asgBarred = false
+  const asgDcl = writeStorageTy(n.binLeft)
+  if asgDcl >= 0 {
+    asgLt = asgDcl
+  } else if elemValueHoleBase(lt) >= 0 {
+    // An index write through a hole checks the element's STORAGE, so a `u8[]` pin still
+    // refuses an out-of-range literal; the read type is the widened value (D2238).
+    asgLt = mkDerivedHole(HD_ELEM, "", -1, -1, elemValueHoleBase(lt))
+  } else {
+    asgBarred = writeBarredByLoop(n.binLeft)
+  }
+  // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
+  // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
+  constrainEmptyExpr(n.binRight, rt, asgLt)
+  mapStoreValPin(n.binLeft, asgLt)
+  noteU8StoreRhs(n.binLeft, n.binRight)
+  nlAsgTgt = n.binLeft
+  nlAsgGot = rt
+  const asgFits = assignableExpr(n.binRight, rt, asgLt)
+  nlAsgTgt = -1
+  const asgOk = asgFits
+    && !writeLeavesLoopEntry(n.binLeft, asgLitRhsTy(ix, asgLt, rt))
+  lwStoreDstSet(-1)
+  if !asgOk {
+    if asgFits || asgBarred || (asgDcl >= 0 && writeBarredByLoop(n.binLeft)) {
+      writeBarredErr(placeKeyOf(n.binLeft), ix)
     } else {
-      collectElseNarrows(n.binLeft, cnames, ctys)
+      nlAsgTgt = n.binLeft
+      nlAsgGot = rt
+      tErrWant(letAssignMsg(n.binRight, rt, asgLt, "", -1), n.binRight, asgLt)
+      nlAsgTgt = -1
     }
-    let cpushed = 0
-    const npBase = npKeys.length
-    if cnames.length > 0 {
-      pushScope(-1)
-      applyNarrows(cnames, ctys)
-      cpushed = 1
+  } else {
+    // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
+    // `xs[0] = e`) — records the pair for the pin using `asgLt`, the storage type actually asked.
+    noteLetCstr(coalPinTy(n.binRight, rt), asgLt, n.binRight, "")
+    if P.nodes[n.binLeft] is Ident {
+      wrDstDeclPut(n.binRight, identDeclOf(n.binLeft))
     }
-    const crt = checkNodeHook(n.binRight)
-    if cpushed == 1 {
-      crNoteRhsRetired(ix, n.binRight, cnames, ctys, npBase)
-      popScope()
-    }
-    if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
-      tErr("operator '" + op + "' expects boolean operands", ix)
-    }
-    return TY_BOOL
-  }
-  // Definite-assignment: a plain `=` with a bare-name target is a pure write — flag it so
-  // the `Ident` arm skips use-before-assign. A compound `x += ...` desugars, so its read isn't the target.
-  const savedWriteTarget = daWriteTarget
-  const savedGetWrite = getWriteTarget
-  if op == "=" {
-    const wtgt = P.nodes[n.binLeft]
-    if wtgt is Ident { daWriteTarget = n.binLeft }
-    if wtgt is Member { getWriteTargetSet(n.binLeft) }
-    if wtgt is Index || wtgt is Member { luWriteTgtPut(n.binLeft, true) }
-  }
-  const savedLbiTgt = lbiWriteTgt
-  if op == "=" { lbiWriteTgt = n.binLeft }
-  let lt = checkNodeHook(n.binLeft)
-  daWriteTarget = savedWriteTarget
-  getWriteTargetSet(savedGetWrite)
-  // An unpinned intrinsic element answers with the default it will get (D1566), except under
-  // `=`, whose Index case pins the element from the RHS instead — answering here would pre-empt that.
-  if op != "=" {
-    if lt < 0 {
-      const peekL = arrDefOperandElemPeek(n.binLeft)
-      if peekL >= 0 { lt = peekL }
-    }
-    // An operator reads a `const`'s literal as the `string` it is; the literal itself is
-    // `nodeWideStrLitText`'s to answer, so no operator rule changes for it (D2157). A compare
-    // decides once both sides are known (`eqKeepsWideLit`).
-    if op != "==" && op != "!=" { lt = widenLitTy(lt) }
-  }
-  ltOut.push(lt)
-  // Contextual typing for an assignment RHS: seed the LHS type so an un-annotated lambda
-  // param infers from the target, matching let-init/arg/return seeding.
-  if op == "=" { seedExpected(n.binRight, lt) }
-  // Contextual typing for a `??` default: seed it with the LHS's non-null shape so an
-  // un-annotated default-lambda param infers, mirroring the `=` seeding.
-  if op == "??" { seedExpected(n.binRight, lt) }
-  // Name the row an index store is about to pin, for the length of that store's value only, so a
-  // read of the same place inside the value can pin the element rather than answer `TY_ERR`.
-  const savedAsgRow = asgOpenElemRow
-  asgOpenElemRowSet(-1)
-  if op == "=" {
-    asgOpenElemRowSet(asgOpenElemRowOf(n.binLeft))
-    if tpEnvNames.length > 0 && P.nodes[n.binLeft] is Ident {
-      tpIfMarkOk(n.binRight)
+    // And the slots of a literal source too: an array literal whose element join dropped a
+    // hole reaches this gate hole-free, so the slots (not the pair) are the real question.
+    if !tyHasHole(rt) {
+      if !tyHasHole(asgLt) { noteLitElemCstrs(n.binRight, asgLt, 6) }
     }
   }
-  const savedCmpdInner = nlCmpdInner
-  const savedCmpdTgt = nlCmpdTgt
-  if op == "=" && n.binCompound != "" {
-    nlCmpdInner = parenPeelIx(n.binRight)
-    nlCmpdTgt = n.binLeft
-  }
-  let rt = checkNodeHook(n.binRight)
-  lbiWriteTgt = savedLbiTgt
-  nlCmpdInner = savedCmpdInner
-  nlCmpdTgt = savedCmpdTgt
-  asgOpenElemRowSet(savedAsgRow)
-  lbiNoteOperands(n, ix)
-  // The right operand takes the same answer, for the same reason: without it, an operator's
-  // annotated face runs while the un-annotated one is check-clean invalid wasm (D1566).
-  if op != "=" {
-    if rt < 0 {
-      const peekR = arrDefOperandElemPeek(n.binRight)
-      if peekR >= 0 { rt = peekR }
+  // A-infer-null: a nullable binding's open inner hole fills from the first non-null
+  // assignment in place; a straight-line non-null write narrows for the rest of the block.
+  const asgTgt = P.nodes[n.binLeft]
+  let asgPreTy = -1
+  if asgTgt is Ident {
+    if rt >= 0 && asgLt >= 0 && !tySame(asgLt, rt) {
+      while asgStoreTys.length <= ix { asgStoreTysPush(-1) }
+      asgStoreTysSetAt(ix, asgLt)
+    } else if ix < asgStoreTys.length {
+      // A re-check whose types now agree retires the earlier answer.
+      asgStoreTysSetAt(ix, -1)
     }
-    if op == "==" || op == "!=" {
-      if constLitNeverMeets(n.binLeft, lt, n.binRight, rt, op, ix) {
-        return TY_BOOL
+    const asgCur = lookup(asgTgt.identName)
+    // A re-check answers afresh (`asgStripTyOf`).
+    asgPreTy = asgCur
+    if ix < asgStripTys.length { asgStripTysSetAt(ix, -1) }
+    if asgCur >= 0 {
+      // A write to a hole binding ends the pin's jurisdiction over it: the call site pins the
+      // parameter, this write replaces the value, so a cast after it is not the pin's to adjudicate (D1342).
+      const asgHole = T.tys[asgCur]
+      if asgHole is TyVar {
+        noteCastClobber(asgHole.tvName + "." + asgTgt.identName)
       }
-      const keepL = eqKeepsWideLit(lt, rt)
-      const keepR = eqKeepsWideLit(rt, lt)
-      if !keepL {
-        lt = widenLitTy(lt)
-        ltOut[0] = lt
-      }
-      if !keepR { rt = widenLitTy(rt) }
-    } else {
-      rt = widenLitTy(rt)
-    }
-    // A store's value reading the place it writes: the value is what the program said the
-    // element is, and the read has no answer of its own until this pins one.
-    if lt < 0 {
-      const asgPin = asgReadElemPin(n.binLeft, rt)
-      if asgPin >= 0 {
-        lt = asgPin
-        ltOut[0] = asgPin // the out-column is the left operand's exact type, pin included
-      }
-    }
-  }
-  // The `??` default is the value produced when the LHS is null, so a `void` default leaves
-  // nothing to produce — the other operators reject void through their own shape-demanding arms.
-  if op == "??" {
-    if voidValueSlotErr(rt, n.binRight, "`??` default", ix) { rt = TY_ERR }
-    // The default's destination is the LHS's non-null shape — the one position where a typed
-    // slot sits on the LEFT of the operator, which is why this needed its own pin (D1591).
-    constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
-    if lt >= 0 { lbiNoteCoalDefault(n.binRight, nonNullTy(lt)) }
-  }
-  // A radix literal operand takes the other side's width (the ruled literal rule). Assignment is
-  // excluded: its destination is `assignableExpr`'s, which pins the narrowing direction too.
-  if op != "=" && op != "&&" && op != "||" {
-    if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
-    if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
-    if lt == TY_I32 && rt == TY_I64 && op != "??" {
-      const lpa = litTreeAdoptDst(n.binLeft, rt)
-      if lpa >= 0 { lt = lpa }
-    }
-    if rt == TY_I32 && lt == TY_I64 {
-      const rpa = litTreeAdoptDst(n.binRight, lt)
-      if rpa >= 0 { rt = rpa }
-    }
-  }
-  // A re-check pushes the node again; `checkShiftCounts` grades each once.
-  if binShiftOp(op) && intLitLexemeOf(n.binRight) != "" {
-    shiftCountNodes.push(ix)
-  }
-  // A binary op with a hole operand can't decide its form until the hole is bound at the call —
-  // record the deferred constraint (skipping assignment / logical, handled by their own arms).
-  if op != "=" && op != "&&" && op != "||" {
-    if tyHasHole(lt) || tyHasHole(rt) {
-      noteBinCstr(
-        eqCstrOperandTy(op, n.binLeft, lt),
-        op,
-        eqCstrOperandTy(op, n.binRight, rt),
-      )
-      cexNoteHoleWidth(lt, rt)
-      cexNoteHoleWidth(rt, lt)
-    }
-  }
-  // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the
-  // same brand — structural rules can't see it (`sameNumeric` compares `primName`, ordering skips `assignable`).
-  if op != "=" && op != "&&" && op != "||" && op != "??" {
-    if nomBinMixes(lt, rt, n.binLeft, n.binRight) {
-      if op == "==" || op == "!=" {
-        // A null test of a newtype over a base with no `null` is dead, as for any type.
-        if isNullTy(rt) && tyProvesNonNull(lt) {
-          recordDeadNullTest(ix, n.binLeft, lt, op)
-          return TY_BOOL
+      const rtT = T.tys[rt]
+      let rhsNullable = false
+      if rtT is TyNullable { rhsNullable = true }
+      const rhsNonNull = !rhsNullable && !isNullTy(rt) && rt >= 0
+      const asgCt = T.tys[asgCur]
+      if asgCt is TyNullable {
+        if rhsNonNull {
+          if asgCt.nInner < 0 {
+            // D1589 — a read typed before the fill banked the hole itself: the fill
+            // re-derives every such `??`, the moment its non-null part exists.
+            nhFillLinked(asgCur, widenLitTy(rt))
+          }
+          // Bank the declared type before shadowing it — the narrowing itself is unchanged,
+          // which is what the `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
+          // Under a guard the write re-narrows from the declaration instead, below.
+          if narGuardSlot(asgTgt.identName) < 0 {
+            noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
+            if tvPlaceWrite(asgCur, rt) {
+              declare(asgTgt.identName, tvWriteTy(asgCur, rt, -1))
+            } else {
+              declare(asgTgt.identName, nonNullTy(asgCur))
+              while asgStripTys.length <= ix { asgStripTysPush(-1) }
+              asgStripTysSetAt(ix, nonNullTy(asgCur))
+            }
+          }
+        } else if asgCt.nInner < 0 && rtT is TyNullable {
+          // A nullable write fills the hole from its non-null part and narrows nothing: the
+          // value may still be null, and an unfilled hole would type the binding `null` (D2597).
+          if rtT.nInner >= 0 {
+            nhFillLinked(asgCur, widenLitTy(rtT.nInner))
+          } else {
+            nhLink(asgCur, rt)
+          }
         }
-        if isNullTy(lt) && tyProvesNonNull(rt) {
-          recordDeadNullTest(ix, n.binRight, rt, op)
-          return TY_BOOL
+      }
+    }
+  }
+  // The narrowing is a path fact, and a falsifying write ends the path — only an accepted
+  // write retires it, since a rejected write did not happen and would cascade a second diagnostic.
+  if asgOk { retireNarrowingsForWrite(n.binLeft, rt, ix, asgPreTy) }
+  if asgOk { fsbNoteStore(n.binLeft, n.binRight, rt, ix) }
+  // Assignment is an expression yielding its right-hand side (host parity;
+  // DECISIONS: assignment-as-expression). A right side only the expression seam admits
+  // (`[3.5, 4]` into `(i32 | f64)[]`) is built at the place's type, so it yields that (D2394).
+  if asgOk && asgYieldsPlaceTy(n.binRight, rt, asgLt) { return asgLt }
+  // A function value of a wider signature is stored as the adapter at the place's, and the
+  // adapter is the value the expression yields, so it has the place's type (D3866).
+  if asgOk && (fvaDone[parenPeelIx(n.binRight)] ?? false) { return asgLt }
+  return rt
+}
+
+// Assignment `n` with left type `lt` and right type `rt`: a `const` or early top-level write,
+// an index store's pin and its write operator, then `checkAssignStore`. Answers the
+// expression's type, `TY_ERR` after an index-write refusal.
+function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  // A `const` name cannot be rebound (`x = ...`, and the `x++`/`x += ...`
+  // desugarings). Data behind it stays mutable (a Member/Index target).
+  const tgt = P.nodes[n.binLeft]
+  if tgt is Member { sharedFieldWriteRefused(tgt, n.binRight, rt, ix) }
+  if tgt is Ident {
+    if isConstName(tgt.identName) {
+      tErr("cannot reassign `const` " + tgt.identName, ix)
+    }
+    // A top-level write above the declaration would be overwritten by its initializer.
+    if daLive.length > 0 && (moduleBeforeDecl[tgt.identName] ?? -1) >= 0 {
+      if daIsUnassignedSid(sidOf(tgt.identName)) {
+        tErr(
+          "`" + tgt.identName + "` is written before its declaration",
+          n.binLeft,
+        )
+      }
+    }
+    // This write makes the binding definitely assigned on the current path.
+    daMarkAssigned(tgt.identName)
+  }
+  // An index-set into an empty `[]` pins its element type to `typeof v` in place —
+  // usage-driven inference, clearing the uninferred floor.
+  if tgt is Index {
+    // The whole left-hand side is already checked as `lt` above — read the recorded type
+    // instead of re-checking, so a diagnostic inside the receiver subtree isn't reported twice.
+    let arrTy0 = nodeTyIxOf(tgt.idxArr)
+    if arrTy0 < 0 { arrTy0 = checkNodeHook(tgt.idxArr) }
+    // An un-annotated-param hole receiver stands for its demanded map, so the map pin below
+    // is the same arm the concrete receiver takes, not a second copy of it.
+    const arrH0 = T.tys[arrTy0]
+    if arrH0 is TyVar {
+      // An index WRITE through a hole, filed like `xs.push(v)`: the read that typed the
+      // receiver noted only that the body indexes it, which a view satisfies.
+      noteArrayWriteDemand(arrH0.tvName)
+      // The write's own deferred constraint, keyed to the ASSIGNMENT node so the pin can
+      // BANK the `"[]="` operator there for the emitter — the read constraint the target
+      // records only covers `"[]"`, and `p[4] = v` needs the setter (D1892). Vacuous when
+      // the hole pins to a real array or map, which `validateMemCstrs` skips.
+      if opIdxDeclared() { noteMemCstr(arrTy0, OP_INDEX_SET, ix, false) }
+      const hmw = holeMapOf(arrH0.tvName)
+      if hmw >= 0 { arrTy0 = hmw }
+    }
+    const arrT0 = T.tys[arrTy0]
+    if arrT0 is TyArray {
+      // An index write is a write to the list's own shape, so a view refuses it. Ahead of
+      // the element pin below, which would otherwise infer a hole from a store that never
+      // happens; reported and fallen through, so no cascade follows the one diagnostic.
+      if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
+      if arrT0.aElem < 0 { calleeWritePrePin(arrTy0, rt) }
+      if arrT0.aElem < 0 {
+        arrT0.aElem = cnhPinTy(rt, ix, tgt.idxArr, false, false)
+        tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
+      } else {
+        cnhFill(arrT0.aElem, rt)
+      }
+      // A `u8[]` store checks against the element type directly: `checkIndexNode` types a
+      // `u8[]` read as `i32` (the widened value), so `lt` above can't see the out-of-range rule.
+      if primNameOf(arrT0.aElem) == "u8" {
+        assignableExpr(n.binRight, rt, arrT0.aElem)
+      }
+    }
+    // An index-set into a bare `Map()` pins its key and value holes the same way `.set(k, v)`
+    // does — the two write spellings of one program must infer identically.
+    if arrT0 is TyMap {
+      if arrT0.mKey < 0 {
+        let kt0 = nodeTyIxOf(tgt.idxIndex)
+        if kt0 < 0 { kt0 = checkNodeHook(tgt.idxIndex) }
+        if kt0 >= 0 {
+          arrT0.mKey = widenLitTy(kt0)
+          tyMutEpoch = tyMutEpoch + 1 // index-write pinned the key in place
+          checkInferredMapKey(arrT0.mKey, arrT0.mSet, ix)
         }
-        tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
-        return TY_BOOL
       }
-      tErr(
-        "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
-        ix,
-      )
-      return TY_ERR
+      if arrT0.mVal < 0 {
+        const dmd = isHoleMapDemandTy(arrTy0)
+        arrT0.mVal = cnhPinTy(rt, ix, tgt.idxArr, true, dmd)
+        tyMutEpoch = tyMutEpoch + 1 // index-write pinned the value in place
+      } else {
+        cnhFill(arrT0.mVal, rt)
+      }
     }
-  }
-  if (
-    numUnionMinted
-    && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
-    && numUnionOp(op)
-    && !nullTestOp(op, lt, rt)
-    && !njExprHeld(n.binLeft)
-    && !njExprHeld(n.binRight)
-  ) {
-    if !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt))) {
-      // Beside a type parameter the pairs are the pin's to check (`numUnionPinOk`).
-      if tyHasTyVar(lt) || tyHasTyVar(rt) {
-        noteBinCstr(lt, op, rt)
-        if numCmpOp(op) { return TY_BOOL }
-        if tyIsNumUnion(lt) { return lt }
-        return rt
-      }
-      return numUnionBinTy(n, ix, lt, rt)
-    }
-  }
-  // Assignment: RHS must be assignable to the LHS's (already-bound) type.
-  if op == "=" {
-    // A `const` name cannot be rebound (`x = ...`, and the `x++`/`x += ...`
-    // desugarings). Data behind it stays mutable (a Member/Index target).
-    const tgt = P.nodes[n.binLeft]
-    if tgt is Member { sharedFieldWriteRefused(tgt, n.binRight, rt, ix) }
-    if tgt is Ident {
-      if isConstName(tgt.identName) {
-        tErr("cannot reassign `const` " + tgt.identName, ix)
-      }
-      // A top-level write above the declaration would be overwritten by its initializer.
-      if daLive.length > 0 && (moduleBeforeDecl[tgt.identName] ?? -1) >= 0 {
-        if daIsUnassignedSid(sidOf(tgt.identName)) {
+    // Free index-write operator (B14): banked on THIS assignment node, not the target —
+    // the target keeps its read resolution, which `x[i] += v` needs (its desugaring re-reads it).
+    if opIdxDeclared() {
+      if !tyBuiltinIndexable(arrTy0) {
+        const wfn = opIdxFnFor(OP_INDEX_SET, arrTy0)
+        if wfn != "" {
+          const wbNames: string[] = []
+          const wbTys: i32[] = []
+          opIdxBindGen(wfn, arrTy0, nodeTyIxOf(tgt.idxIndex), wbNames, wbTys)
+          const vt0 = opIdxParamTy(wfn, 2)
+          let vt = vt0
+          if vt0 >= 0 {
+            if wbNames.length > 0 { vt = substTyDeep(vt0, wbNames, wbTys) }
+          }
+          if vt >= 0 {
+            if !assignableExpr(n.binRight, rt, vt) {
+              tErr(
+                "index write: expected " + tyToStr(vt) + ", got " + tyToStr(rt),
+                ix,
+              )
+            }
+          }
+          opIdxBank(ix, wfn)
+          noteCallInvalidations(ix)
+          return rt
+        }
+        // A read operator with no write one: name the missing half, exactly as
+        // the closure-field trap does below.
+        const rOnly = opIdxFnFor(OP_INDEX_GET, arrTy0)
+        if rOnly != "" {
           tErr(
-            "`" + tgt.identName + "` is written before its declaration",
-            n.binLeft,
-          )
-        }
-      }
-      // This write makes the binding definitely assigned on the current path.
-      daMarkAssigned(tgt.identName)
-    }
-    // An index-set into an empty `[]` pins its element type to `typeof v` in place —
-    // usage-driven inference, clearing the uninferred floor.
-    if tgt is Index {
-      // The whole left-hand side is already checked as `lt` above — read the recorded type
-      // instead of re-checking, so a diagnostic inside the receiver subtree isn't reported twice.
-      let arrTy0 = nodeTyIxOf(tgt.idxArr)
-      if arrTy0 < 0 { arrTy0 = checkNodeHook(tgt.idxArr) }
-      // An un-annotated-param hole receiver stands for its demanded map, so the map pin below
-      // is the same arm the concrete receiver takes, not a second copy of it.
-      const arrH0 = T.tys[arrTy0]
-      if arrH0 is TyVar {
-        // An index WRITE through a hole, filed like `xs.push(v)`: the read that typed the
-        // receiver noted only that the body indexes it, which a view satisfies.
-        noteArrayWriteDemand(arrH0.tvName)
-        // The write's own deferred constraint, keyed to the ASSIGNMENT node so the pin can
-        // BANK the `"[]="` operator there for the emitter — the read constraint the target
-        // records only covers `"[]"`, and `p[4] = v` needs the setter (D1892). Vacuous when
-        // the hole pins to a real array or map, which `validateMemCstrs` skips.
-        if opIdxDeclared() { noteMemCstr(arrTy0, OP_INDEX_SET, ix, false) }
-        const hmw = holeMapOf(arrH0.tvName)
-        if hmw >= 0 { arrTy0 = hmw }
-      }
-      const arrT0 = T.tys[arrTy0]
-      if arrT0 is TyArray {
-        // An index write is a write to the list's own shape, so a view refuses it. Ahead of
-        // the element pin below, which would otherwise infer a hole from a store that never
-        // happens; reported and fallen through, so no cascade follows the one diagnostic.
-        if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
-        if arrT0.aElem < 0 { calleeWritePrePin(arrTy0, rt) }
-        if arrT0.aElem < 0 {
-          arrT0.aElem = cnhPinTy(rt, ix, tgt.idxArr, false, false)
-          tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
-        } else {
-          cnhFill(arrT0.aElem, rt)
-        }
-        // A `u8[]` store checks against the element type directly: `checkIndexNode` types a
-        // `u8[]` read as `i32` (the widened value), so `lt` above can't see the out-of-range rule.
-        if primNameOf(arrT0.aElem) == "u8" {
-          assignableExpr(n.binRight, rt, arrT0.aElem)
-        }
-      }
-      // An index-set into a bare `Map()` pins its key and value holes the same way `.set(k, v)`
-      // does — the two write spellings of one program must infer identically.
-      if arrT0 is TyMap {
-        if arrT0.mKey < 0 {
-          let kt0 = nodeTyIxOf(tgt.idxIndex)
-          if kt0 < 0 { kt0 = checkNodeHook(tgt.idxIndex) }
-          if kt0 >= 0 {
-            arrT0.mKey = widenLitTy(kt0)
-            tyMutEpoch = tyMutEpoch + 1 // index-write pinned the key in place
-            checkInferredMapKey(arrT0.mKey, arrT0.mSet, ix)
-          }
-        }
-        if arrT0.mVal < 0 {
-          const dmd = isHoleMapDemandTy(arrTy0)
-          arrT0.mVal = cnhPinTy(rt, ix, tgt.idxArr, true, dmd)
-          tyMutEpoch = tyMutEpoch + 1 // index-write pinned the value in place
-        } else {
-          cnhFill(arrT0.mVal, rt)
-        }
-      }
-      // Free index-write operator (B14): banked on THIS assignment node, not the target —
-      // the target keeps its read resolution, which `x[i] += v` needs (its desugaring re-reads it).
-      if opIdxDeclared() {
-        if !tyBuiltinIndexable(arrTy0) {
-          const wfn = opIdxFnFor(OP_INDEX_SET, arrTy0)
-          if wfn != "" {
-            const wbNames: string[] = []
-            const wbTys: i32[] = []
-            opIdxBindGen(wfn, arrTy0, nodeTyIxOf(tgt.idxIndex), wbNames, wbTys)
-            const vt0 = opIdxParamTy(wfn, 2)
-            let vt = vt0
-            if vt0 >= 0 {
-              if wbNames.length > 0 { vt = substTyDeep(vt0, wbNames, wbTys) }
-            }
-            if vt >= 0 {
-              if !assignableExpr(n.binRight, rt, vt) {
-                tErr(
-                  "index write: expected " + tyToStr(vt) + ", got " + tyToStr(rt),
-                  ix,
-                )
-              }
-            }
-            opIdxBank(ix, wfn)
-            noteCallInvalidations(ix)
-            return rt
-          }
-          // A read operator with no write one: name the missing half, exactly as
-          // the closure-field trap does below.
-          const rOnly = opIdxFnFor(OP_INDEX_GET, arrTy0)
-          if rOnly != "" {
-            tErr(
-              "no \""
-                + OP_INDEX_SET
-                + "\" operator for index assignment on "
-                + tyToStr(arrTy0),
-              ix,
-            )
-            return TY_ERR
-          }
-        }
-      }
-      // Index write trap (B13, host `indexTrap` "[]="): an object with only a read trap
-      // rejects the write (the host's missing-method error).
-      if arrT0 is TyObj {
-        const wtrap = objFieldType(arrT0, "[]=")
-        if wtrap >= 0 {
-          const wt = T.tys[wtrap]
-          if wt is TyFunc {
-            if wt.fnParamTypes.length == 2 {
-              if !assignableExpr(n.binRight, rt, wt.fnParamTypes[1]) {
-                tErr(
-                  "index write: expected "
-                    + tyToStr(wt.fnParamTypes[1])
-                    + ", got "
-                    + tyToStr(rt),
-                  ix,
-                )
-              }
-              return rt
-            }
-          }
-        } else if objFieldType(arrT0, "[]") >= 0 {
-          tErr(
-            "no \"[]=\" method for index assignment on " + tyToStr(arrTy0),
+            "no \""
+              + OP_INDEX_SET
+              + "\" operator for index assignment on "
+              + tyToStr(arrTy0),
             ix,
           )
           return TY_ERR
         }
       }
     }
-    // Narrowing applies to READS: a place accepts its storage type, never its current flow
-    // (narrowed) type, so every write is checked against storage and may flip the variant (D1736).
-    let asgLt = lt
-    let asgBarred = false
-    const asgDcl = writeStorageTy(n.binLeft)
-    if asgDcl >= 0 {
-      asgLt = asgDcl
-    } else if elemValueHoleBase(lt) >= 0 {
-      // An index write through a hole checks the element's STORAGE, so a `u8[]` pin still
-      // refuses an out-of-range literal; the read type is the widened value (D2238).
-      asgLt = mkDerivedHole(HD_ELEM, "", -1, -1, elemValueHoleBase(lt))
-    } else {
-      asgBarred = writeBarredByLoop(n.binLeft)
-    }
-    // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
-    // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
-    constrainEmptyExpr(n.binRight, rt, asgLt)
-    mapStoreValPin(n.binLeft, asgLt)
-    noteU8StoreRhs(n.binLeft, n.binRight)
-    nlAsgTgt = n.binLeft
-    nlAsgGot = rt
-    const asgFits = assignableExpr(n.binRight, rt, asgLt)
-    nlAsgTgt = -1
-    const asgOk = asgFits
-      && !writeLeavesLoopEntry(n.binLeft, asgLitRhsTy(ix, asgLt, rt))
-    lwStoreDstSet(-1)
-    if !asgOk {
-      if asgFits || asgBarred || (asgDcl >= 0 && writeBarredByLoop(n.binLeft)) {
-        writeBarredErr(placeKeyOf(n.binLeft), ix)
-      } else {
-        nlAsgTgt = n.binLeft
-        nlAsgGot = rt
-        tErrWant(letAssignMsg(n.binRight, rt, asgLt, "", -1), n.binRight, asgLt)
-        nlAsgTgt = -1
-      }
-    } else {
-      // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
-      // `xs[0] = e`) — records the pair for the pin using `asgLt`, the storage type actually asked.
-      noteLetCstr(coalPinTy(n.binRight, rt), asgLt, n.binRight, "")
-      if P.nodes[n.binLeft] is Ident {
-        wrDstDeclPut(n.binRight, identDeclOf(n.binLeft))
-      }
-      // And the slots of a literal source too: an array literal whose element join dropped a
-      // hole reaches this gate hole-free, so the slots (not the pair) are the real question.
-      if !tyHasHole(rt) {
-        if !tyHasHole(asgLt) { noteLitElemCstrs(n.binRight, asgLt, 6) }
-      }
-    }
-    // A-infer-null: a nullable binding's open inner hole fills from the first non-null
-    // assignment in place; a straight-line non-null write narrows for the rest of the block.
-    const asgTgt = P.nodes[n.binLeft]
-    let asgPreTy = -1
-    if asgTgt is Ident {
-      if rt >= 0 && asgLt >= 0 && !tySame(asgLt, rt) {
-        while asgStoreTys.length <= ix { asgStoreTysPush(-1) }
-        asgStoreTysSetAt(ix, asgLt)
-      } else if ix < asgStoreTys.length {
-        // A re-check whose types now agree retires the earlier answer.
-        asgStoreTysSetAt(ix, -1)
-      }
-      const asgCur = lookup(asgTgt.identName)
-      // A re-check answers afresh (`asgStripTyOf`).
-      asgPreTy = asgCur
-      if ix < asgStripTys.length { asgStripTysSetAt(ix, -1) }
-      if asgCur >= 0 {
-        // A write to a hole binding ends the pin's jurisdiction over it: the call site pins the
-        // parameter, this write replaces the value, so a cast after it is not the pin's to adjudicate (D1342).
-        const asgHole = T.tys[asgCur]
-        if asgHole is TyVar {
-          noteCastClobber(asgHole.tvName + "." + asgTgt.identName)
-        }
-        const rtT = T.tys[rt]
-        let rhsNullable = false
-        if rtT is TyNullable { rhsNullable = true }
-        const rhsNonNull = !rhsNullable && !isNullTy(rt) && rt >= 0
-        const asgCt = T.tys[asgCur]
-        if asgCt is TyNullable {
-          if rhsNonNull {
-            if asgCt.nInner < 0 {
-              // D1589 — a read typed before the fill banked the hole itself: the fill
-              // re-derives every such `??`, the moment its non-null part exists.
-              nhFillLinked(asgCur, widenLitTy(rt))
-            }
-            // Bank the declared type before shadowing it — the narrowing itself is unchanged,
-            // which is what the `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
-            // Under a guard the write re-narrows from the declaration instead, below.
-            if narGuardSlot(asgTgt.identName) < 0 {
-              noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
-              if tvPlaceWrite(asgCur, rt) {
-                declare(asgTgt.identName, tvWriteTy(asgCur, rt, -1))
-              } else {
-                declare(asgTgt.identName, nonNullTy(asgCur))
-                while asgStripTys.length <= ix { asgStripTysPush(-1) }
-                asgStripTysSetAt(ix, nonNullTy(asgCur))
-              }
-            }
-          } else if asgCt.nInner < 0 && rtT is TyNullable {
-            // A nullable write fills the hole from its non-null part and narrows nothing: the
-            // value may still be null, and an unfilled hole would type the binding `null` (D2597).
-            if rtT.nInner >= 0 {
-              nhFillLinked(asgCur, widenLitTy(rtT.nInner))
-            } else {
-              nhLink(asgCur, rt)
-            }
-          }
-        }
-      }
-    }
-    // The narrowing is a path fact, and a falsifying write ends the path — only an accepted
-    // write retires it, since a rejected write did not happen and would cascade a second diagnostic.
-    if asgOk { retireNarrowingsForWrite(n.binLeft, rt, ix, asgPreTy) }
-    if asgOk { fsbNoteStore(n.binLeft, n.binRight, rt, ix) }
-    // Assignment is an expression yielding its right-hand side (host parity;
-    // DECISIONS: assignment-as-expression). A right side only the expression seam admits
-    // (`[3.5, 4]` into `(i32 | f64)[]`) is built at the place's type, so it yields that (D2394).
-    if asgOk && asgYieldsPlaceTy(n.binRight, rt, asgLt) { return asgLt }
-    // A function value of a wider signature is stored as the adapter at the place's, and the
-    // adapter is the value the expression yields, so it has the place's type (D3866).
-    if asgOk && (fvaDone[parenPeelIx(n.binRight)] ?? false) { return asgLt }
-    return rt
-  }
-  // An unpinned element hole is `-1`, and every arm below indexes `T.tys` with it — guarded
-  // here, below both the `=` arm's own pin and the operand peek, rather than trapping (D1462).
-  if lt < 0 { return TY_ERR }
-  // Nullish coalescing peels the FULL nullability of the merged type (`nonNullTy`), not one
-  // layer — a stored null in a nullable-valued map read is a double nullable, just like a miss.
-  if op == "??" {
-    // A `??` whose left operand can never be null has a dead default — recorded (a lint), not
-    // rejected, since `emit_rewrite` folds it. A narrowed place is exempt: its storage still admits null.
-    if tyExcludesNull(lt) {
-      // A parked hole cast has no answer yet: `a as? i32` inside a hole's body types `i32`
-      // until the call pins the operand, so a `??` over it looks dead here and is not (D1371).
-      if !coalNarrowedPlace(n.binLeft) && !coalParkedHoleCast(n.binLeft) {
-        recordDeadCoalesce(ix, lt)
-      }
-    }
-    // A left operand that is only ever `null` always takes the default (D2261).
-    if isNullTy(lt) { return rt }
-    const lt2 = T.tys[lt]
-    if lt2 is TyNullable {
-      // D1589 — an open hole has no non-null part yet, so `nonNullTy` hands back the nullable
-      // and the default's type is the safe answer: `fillCoalHoleNodes` re-derives it once the fill arrives.
-      if lt2.nInner < 0 {
-        if coalHoleDeferOk(rt) {
-          noteCoalHole(ix, lt, rt)
-          return rt
-        }
-      }
-      const innerFull = nonNullTy(lt)
-      // A literal default re-encodes at f32, so keep the result f32 — else `joinTys` widens
-      // `f32 + f64`/`f32 + i32` and a downstream f32 slot rejects the demote.
-      if primNameOf(innerFull) == "f32" && isF32AdoptingLitExpr(n.binRight) {
-        return innerFull
-      }
-      // A litunion inner with a member-literal default stays the union (an i32 atom) — else
-      // the bare literal types `string` and `joinTys` widens the result, divorcing it from the atom rep.
-      if isLitBearing(innerFull) {
-        const dl = litTyOfExpr(n.binRight)
-        if dl >= 0 {
-          if assignable(dl, innerFull) { return innerFull }
-        }
-        // An atom-valued map get's default must itself be an atom — a member literal or a
-        // value of the same litunion; the method spelling `m.get(k) ?? d` is rejected here too.
-        const mgRecv = fusedMapReadRecvIx(n.binLeft)
-        if mgRecv >= 0 {
-          if mapTyValIsLitUnion(nodeTyIxOf(mgRecv)) {
-            if !assignable(rt, innerFull) {
-              tErrUnsupported(
-                "`??` over an atom-valued map needs a member-literal (or atom) default",
+    // Index write trap (B13, host `indexTrap` "[]="): an object with only a read trap
+    // rejects the write (the host's missing-method error).
+    if arrT0 is TyObj {
+      const wtrap = objFieldType(arrT0, "[]=")
+      if wtrap >= 0 {
+        const wt = T.tys[wtrap]
+        if wt is TyFunc {
+          if wt.fnParamTypes.length == 2 {
+            if !assignableExpr(n.binRight, rt, wt.fnParamTypes[1]) {
+              tErr(
+                "index write: expected "
+                  + tyToStr(wt.fnParamTypes[1])
+                  + ", got "
+                  + tyToStr(rt),
                 ix,
               )
             }
+            return rt
+          }
+        }
+      } else if objFieldType(arrT0, "[]") >= 0 {
+        tErr("no \"[]=\" method for index assignment on " + tyToStr(arrTy0), ix)
+        return TY_ERR
+      }
+    }
+  }
+  checkAssignStore(n, ix, lt, rt)
+}
+
+// `lt ?? rt`, with `lt` bound. Nullish coalescing peels the full nullability of the merged
+// type (`nonNullTy`), not one layer: a stored null in a nullable-valued map read is a double
+// nullable, just like a miss. Answers the result type.
+function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  // A `??` whose left operand can never be null has a dead default — recorded (a lint), not
+  // rejected, since `emit_rewrite` folds it. A narrowed place is exempt: its storage still admits null.
+  if tyExcludesNull(lt) {
+    // A parked hole cast has no answer yet: `a as? i32` inside a hole's body types `i32`
+    // until the call pins the operand, so a `??` over it looks dead here and is not (D1371).
+    if !coalNarrowedPlace(n.binLeft) && !coalParkedHoleCast(n.binLeft) {
+      recordDeadCoalesce(ix, lt)
+    }
+  }
+  // A left operand that is only ever `null` always takes the default (D2261).
+  if isNullTy(lt) { return rt }
+  const lt2 = T.tys[lt]
+  if lt2 is TyNullable {
+    // D1589 — an open hole has no non-null part yet, so `nonNullTy` hands back the nullable
+    // and the default's type is the safe answer: `fillCoalHoleNodes` re-derives it once the fill arrives.
+    if lt2.nInner < 0 {
+      if coalHoleDeferOk(rt) {
+        noteCoalHole(ix, lt, rt)
+        return rt
+      }
+    }
+    const innerFull = nonNullTy(lt)
+    // A literal default re-encodes at f32, so keep the result f32 — else `joinTys` widens
+    // `f32 + f64`/`f32 + i32` and a downstream f32 slot rejects the demote.
+    if primNameOf(innerFull) == "f32" && isF32AdoptingLitExpr(n.binRight) {
+      return innerFull
+    }
+    // A litunion inner with a member-literal default stays the union (an i32 atom) — else
+    // the bare literal types `string` and `joinTys` widens the result, divorcing it from the atom rep.
+    if isLitBearing(innerFull) {
+      const dl = litTyOfExpr(n.binRight)
+      if dl >= 0 {
+        if assignable(dl, innerFull) { return innerFull }
+      }
+      // An atom-valued map get's default must itself be an atom — a member literal or a
+      // value of the same litunion; the method spelling `m.get(k) ?? d` is rejected here too.
+      const mgRecv = fusedMapReadRecvIx(n.binLeft)
+      if mgRecv >= 0 {
+        if mapTyValIsLitUnion(nodeTyIxOf(mgRecv)) {
+          if !assignable(rt, innerFull) {
+            tErrUnsupported(
+              "`??` over an atom-valued map needs a member-literal (or atom) default",
+              ix,
+            )
           }
         }
       }
-      if tyIsHole(rt) && !tyIsHole(innerFull) { coalDefNote(ix, innerFull, rt) }
-      // A runtime default of another number type joins apart, as the `if` it spells does.
-      const apart = coalJoinApart(n.binLeft, innerFull, rt, n.binRight)
-      if apart >= 0 { return apart }
-      // A declared parameter takes any default inside its body and its pin need not, so the
-      // operator joins as the `if` it spells and the default keeps its own type (D3580, D3619).
-      if coalParamDefault(innerFull, rt) {
-        return joinArmLit(innerFull, false, rt, armLit(rt, n.binRight))
-      }
-      // When the default fits the non-null LHS type (with contextual coercion), the `??` result
-      // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
-      if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
-      return joinTys(innerFull, rt)
     }
-    // A hole left operand defers the whole tail above to the pin (`HD_COAL`): answering `lt` kept
-    // the null `??` removed (D1693). The default is kept unwidened, so a pin whose non-null face
-    // is a literal union holding it answers that union rather than `string`.
-    let cdDft = litTyOfExpr(n.binRight)
-    if cdDft < 0 { cdDft = rt }
-    const cd = mkDerivedHole(HD_COAL, "", cdDft, -1, lt)
-    if cd >= 0 {
-      noteCoalResultHole(cd)
-      return cd
+    if tyIsHole(rt) && !tyIsHole(innerFull) { coalDefNote(ix, innerFull, rt) }
+    // A runtime default of another number type joins apart, as the `if` it spells does.
+    const apart = coalJoinApart(n.binLeft, innerFull, rt, n.binRight)
+    if apart >= 0 { return apart }
+    // A declared parameter takes any default inside its body and its pin need not, so the
+    // operator joins as the `if` it spells and the default keeps its own type (D3580, D3619).
+    if coalParamDefault(innerFull, rt) {
+      return joinArmLit(innerFull, false, rt, armLit(rt, n.binRight))
     }
-    return lt
+    // When the default fits the non-null LHS type (with contextual coercion), the `??` result
+    // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
+    if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
+    return joinTys(innerFull, rt)
   }
-  // Equality: result bool; requires mutual compatibility.
-  if op == "==" || op == "!=" {
-    noteCmpConstLit(n.binLeft)
-    noteCmpConstLit(n.binRight)
-    // A void operand leaves nothing to compare (a call to a `: void` function or extern).
-    if voidValueSlotErr(lt, n.binLeft, "`" + op + "`", n.binLeft) {
-      return TY_BOOL
-    }
-    if voidValueSlotErr(rt, n.binRight, "`" + op + "`", n.binRight) {
-      return TY_BOOL
-    }
-    // A null test asks about the storage, not the flow-narrowed type — a narrowing does not
-    // change storage, so `isAsgNarrowedName` exempts exactly the bindings an assignment narrowed.
-    if isNullTy(lt) || isNullTy(rt) {
-      if isAsgNarrowedName(n.binLeft) || isAsgNarrowedName(n.binRight) {
-        return TY_BOOL
-      }
-      // A value proved non-null makes the test dead: a warning, and the emitter folds it.
-      if isNullTy(rt) && !isNullTy(lt) && tyProvesNonNull(lt) {
-        recordDeadNullTest(ix, n.binLeft, lt, op)
-        return TY_BOOL
-      }
-      if isNullTy(lt) && !isNullTy(rt) && tyProvesNonNull(rt) {
-        recordDeadNullTest(ix, n.binRight, rt, op)
-        return TY_BOOL
-      }
-    }
-    // Closed set (literal unions): comparing a literal-union place against a literal outside
-    // its set can never be true — reject rather than compile an always-false test.
-    if isLitBearing(lt) {
-      const eqR = cmpLitTyOf(n.binRight)
-      if eqR >= 0 {
-        if !assignable(eqR, lt) {
-          tErr(
-            "cannot compare "
-              + tyToStr(lt)
-              + " with "
-              + tyToStr(eqR)
-              + " — not a member of the union",
-            ix,
-          )
-        }
-        // A member compare is always a valid discrimination (`v == 7` over `"x" | 7`) — the
-        // mixed union's softened sides aren't mutually assignable, so it must not fall through.
-        return TY_BOOL
-      }
-    } else if isLitBearing(rt) {
-      const eqL = cmpLitTyOf(n.binLeft)
-      if eqL >= 0 {
-        if !assignable(eqL, rt) {
-          tErr(
-            "cannot compare "
-              + tyToStr(eqL)
-              + " with "
-              + tyToStr(rt)
-              + " — not a member of the union",
-            ix,
-          )
-        }
-        return TY_BOOL
-      }
-    }
-    // A nominal newtype compared with a literal is compatible (`id == 0`) — the literal adopts
-    // the brand, as in every other position; the genuine-mix reject already fired above.
-    const nomEqLit = nomNameOfTy(lt) != nomNameOfTy(rt)
-      && !nomBinMixes(lt, rt, n.binLeft, n.binRight)
-    const eqMutual = assignable(lt, rt) || assignable(rt, lt) || nomEqLit
-    if !eqMutual {
-      tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
-    }
-    // Both `==` gates share one home (`eqRefusals`): structural soundness (field-by-field
-    // compare needs every component comparable) and emitter-capability (no compare core exists).
-    const eqMsgs: string[] = []
-    const eqChan: i32[] = []
-    eqRefusals(op, lt, rt, eqMutual, eqMsgs, eqChan)
-    let eqM = 0
-    while eqM < eqMsgs.length {
-      if eqChan[eqM] == 1 {
-        tErrUnsupported(eqMsgs[eqM], ix)
-      } else {
-        tErr(eqMsgs[eqM], ix)
-      }
-      eqM = eqM + 1
-    }
-    if eqMsgs.length == 0 && !isNullTy(lt) && !isNullTy(rt) {
-      let eqTy = lt
-      let eqPath = eqListFieldPath(lt, [])
-      if eqPath == "" {
-        eqTy = rt
-        eqPath = eqListFieldPath(rt, [])
-      }
-      if eqPath != "" { recordDeepRecordEq(ix, eqTy, eqPath, op) }
-    }
+  // A hole left operand defers the whole tail above to the pin (`HD_COAL`): answering `lt` kept
+  // the null `??` removed (D1693). The default is kept unwidened, so a pin whose non-null face
+  // is a literal union holding it answers that union rather than `string`.
+  let cdDft = litTyOfExpr(n.binRight)
+  if cdDft < 0 { cdDft = rt }
+  const cd = mkDerivedHole(HD_COAL, "", cdDft, -1, lt)
+  if cd >= 0 {
+    noteCoalResultHole(cd)
+    return cd
+  }
+  return lt
+}
+
+// `==` / `!=` over `lt` and `rt`: the operands must be mutually compatible and comparable.
+// Answers boolean; every refusal is reported here.
+function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  const op = n.binOp
+  noteCmpConstLit(n.binLeft)
+  noteCmpConstLit(n.binRight)
+  // A void operand leaves nothing to compare (a call to a `: void` function or extern).
+  if voidValueSlotErr(lt, n.binLeft, "`" + op + "`", n.binLeft) {
     return TY_BOOL
   }
+  if voidValueSlotErr(rt, n.binRight, "`" + op + "`", n.binRight) {
+    return TY_BOOL
+  }
+  // A null test asks about the storage, not the flow-narrowed type — a narrowing does not
+  // change storage, so `isAsgNarrowedName` exempts exactly the bindings an assignment narrowed.
+  if isNullTy(lt) || isNullTy(rt) {
+    if isAsgNarrowedName(n.binLeft) || isAsgNarrowedName(n.binRight) {
+      return TY_BOOL
+    }
+    // A value proved non-null makes the test dead: a warning, and the emitter folds it.
+    if isNullTy(rt) && !isNullTy(lt) && tyProvesNonNull(lt) {
+      recordDeadNullTest(ix, n.binLeft, lt, op)
+      return TY_BOOL
+    }
+    if isNullTy(lt) && !isNullTy(rt) && tyProvesNonNull(rt) {
+      recordDeadNullTest(ix, n.binRight, rt, op)
+      return TY_BOOL
+    }
+  }
+  // Closed set (literal unions): comparing a literal-union place against a literal outside
+  // its set can never be true — reject rather than compile an always-false test.
+  if isLitBearing(lt) {
+    const eqR = cmpLitTyOf(n.binRight)
+    if eqR >= 0 {
+      if !assignable(eqR, lt) {
+        tErr(
+          "cannot compare "
+            + tyToStr(lt)
+            + " with "
+            + tyToStr(eqR)
+            + " — not a member of the union",
+          ix,
+        )
+      }
+      // A member compare is always a valid discrimination (`v == 7` over `"x" | 7`) — the
+      // mixed union's softened sides aren't mutually assignable, so it must not fall through.
+      return TY_BOOL
+    }
+  } else if isLitBearing(rt) {
+    const eqL = cmpLitTyOf(n.binLeft)
+    if eqL >= 0 {
+      if !assignable(eqL, rt) {
+        tErr(
+          "cannot compare "
+            + tyToStr(eqL)
+            + " with "
+            + tyToStr(rt)
+            + " — not a member of the union",
+          ix,
+        )
+      }
+      return TY_BOOL
+    }
+  }
+  // A nominal newtype compared with a literal is compatible (`id == 0`) — the literal adopts
+  // the brand, as in every other position; the genuine-mix reject already fired above.
+  const nomEqLit = nomNameOfTy(lt) != nomNameOfTy(rt)
+    && !nomBinMixes(lt, rt, n.binLeft, n.binRight)
+  const eqMutual = assignable(lt, rt) || assignable(rt, lt) || nomEqLit
+  if !eqMutual {
+    tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
+  }
+  // Both `==` gates share one home (`eqRefusals`): structural soundness (field-by-field
+  // compare needs every component comparable) and emitter-capability (no compare core exists).
+  const eqMsgs: string[] = []
+  const eqChan: i32[] = []
+  eqRefusals(op, lt, rt, eqMutual, eqMsgs, eqChan)
+  let eqM = 0
+  while eqM < eqMsgs.length {
+    if eqChan[eqM] == 1 {
+      tErrUnsupported(eqMsgs[eqM], ix)
+    } else {
+      tErr(eqMsgs[eqM], ix)
+    }
+    eqM = eqM + 1
+  }
+  if eqMsgs.length == 0 && !isNullTy(lt) && !isNullTy(rt) {
+    let eqTy = lt
+    let eqPath = eqListFieldPath(lt, [])
+    if eqPath == "" {
+      eqTy = rt
+      eqPath = eqListFieldPath(rt, [])
+    }
+    if eqPath != "" { recordDeepRecordEq(ix, eqTy, eqPath, op) }
+  }
+  return TY_BOOL
+}
+
+// The operators left once logicals, assignment, `??` and equality have answered: operator
+// dispatch on a struct, ordering, `+` concatenation and arithmetic. `lt0` is bound.
+// Answers the result type, `TY_ERR` after a refusal.
+function checkBinArithTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
+  const op = n.binOp
+  let lt = lt0
+  let rt = rt0
   // A gradual union operand is checked at its concrete members; the constraint noted above
   // re-checks the whole union at each pin.
   if op != "&&" && op != "||" {
@@ -1328,6 +1174,191 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     return TY_ERR
   }
   return lt
+}
+
+// Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
+function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
+  const op = n.binOp
+  if op == "in" { return checkInOpNode(n, ix) }
+  if op == "&&" || op == "||" { return checkLogicalBinNode(n, ix) }
+  // Definite-assignment: a plain `=` with a bare-name target is a pure write — flag it so
+  // the `Ident` arm skips use-before-assign. A compound `x += ...` desugars, so its read isn't the target.
+  const savedWriteTarget = daWriteTarget
+  const savedGetWrite = getWriteTarget
+  if op == "=" {
+    const wtgt = P.nodes[n.binLeft]
+    if wtgt is Ident { daWriteTarget = n.binLeft }
+    if wtgt is Member { getWriteTargetSet(n.binLeft) }
+    if wtgt is Index || wtgt is Member { luWriteTgtPut(n.binLeft, true) }
+  }
+  const savedLbiTgt = lbiWriteTgt
+  if op == "=" { lbiWriteTgt = n.binLeft }
+  let lt = checkNodeHook(n.binLeft)
+  daWriteTarget = savedWriteTarget
+  getWriteTargetSet(savedGetWrite)
+  // An unpinned intrinsic element answers with the default it will get (D1566), except under
+  // `=`, whose Index case pins the element from the RHS instead — answering here would pre-empt that.
+  if op != "=" {
+    if lt < 0 {
+      const peekL = arrDefOperandElemPeek(n.binLeft)
+      if peekL >= 0 { lt = peekL }
+    }
+    // An operator reads a `const`'s literal as the `string` it is; the literal itself is
+    // `nodeWideStrLitText`'s to answer, so no operator rule changes for it (D2157). A compare
+    // decides once both sides are known (`eqKeepsWideLit`).
+    if op != "==" && op != "!=" { lt = widenLitTy(lt) }
+  }
+  ltOut.push(lt)
+  // Contextual typing for an assignment RHS: seed the LHS type so an un-annotated lambda
+  // param infers from the target, matching let-init/arg/return seeding.
+  if op == "=" { seedExpected(n.binRight, lt) }
+  // Contextual typing for a `??` default: seed it with the LHS's non-null shape so an
+  // un-annotated default-lambda param infers, mirroring the `=` seeding.
+  if op == "??" { seedExpected(n.binRight, lt) }
+  // Name the row an index store is about to pin, for the length of that store's value only, so a
+  // read of the same place inside the value can pin the element rather than answer `TY_ERR`.
+  const savedAsgRow = asgOpenElemRow
+  asgOpenElemRowSet(-1)
+  if op == "=" {
+    asgOpenElemRowSet(asgOpenElemRowOf(n.binLeft))
+    if tpEnvNames.length > 0 && P.nodes[n.binLeft] is Ident {
+      tpIfMarkOk(n.binRight)
+    }
+  }
+  const savedCmpdInner = nlCmpdInner
+  const savedCmpdTgt = nlCmpdTgt
+  if op == "=" && n.binCompound != "" {
+    nlCmpdInner = parenPeelIx(n.binRight)
+    nlCmpdTgt = n.binLeft
+  }
+  let rt = checkNodeHook(n.binRight)
+  lbiWriteTgt = savedLbiTgt
+  nlCmpdInner = savedCmpdInner
+  nlCmpdTgt = savedCmpdTgt
+  asgOpenElemRowSet(savedAsgRow)
+  lbiNoteOperands(n, ix)
+  // The right operand takes the same answer, for the same reason: without it, an operator's
+  // annotated face runs while the un-annotated one is check-clean invalid wasm (D1566).
+  if op != "=" {
+    if rt < 0 {
+      const peekR = arrDefOperandElemPeek(n.binRight)
+      if peekR >= 0 { rt = peekR }
+    }
+    if op == "==" || op == "!=" {
+      if constLitNeverMeets(n.binLeft, lt, n.binRight, rt, op, ix) {
+        return TY_BOOL
+      }
+      const keepL = eqKeepsWideLit(lt, rt)
+      const keepR = eqKeepsWideLit(rt, lt)
+      if !keepL {
+        lt = widenLitTy(lt)
+        ltOut[0] = lt
+      }
+      if !keepR { rt = widenLitTy(rt) }
+    } else {
+      rt = widenLitTy(rt)
+    }
+    // A store's value reading the place it writes: the value is what the program said the
+    // element is, and the read has no answer of its own until this pins one.
+    if lt < 0 {
+      const asgPin = asgReadElemPin(n.binLeft, rt)
+      if asgPin >= 0 {
+        lt = asgPin
+        ltOut[0] = asgPin // the out-column is the left operand's exact type, pin included
+      }
+    }
+  }
+  // The `??` default is the value produced when the LHS is null, so a `void` default leaves
+  // nothing to produce — the other operators reject void through their own shape-demanding arms.
+  if op == "??" {
+    if voidValueSlotErr(rt, n.binRight, "`??` default", ix) { rt = TY_ERR }
+    // The default's destination is the LHS's non-null shape — the one position where a typed
+    // slot sits on the LEFT of the operator, which is why this needed its own pin (D1591).
+    constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
+    if lt >= 0 { lbiNoteCoalDefault(n.binRight, nonNullTy(lt)) }
+  }
+  // A radix literal operand takes the other side's width (the ruled literal rule). Assignment is
+  // excluded: its destination is `assignableExpr`'s, which pins the narrowing direction too.
+  if op != "=" && op != "&&" && op != "||" {
+    if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
+    if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
+    if lt == TY_I32 && rt == TY_I64 && op != "??" {
+      const lpa = litTreeAdoptDst(n.binLeft, rt)
+      if lpa >= 0 { lt = lpa }
+    }
+    if rt == TY_I32 && lt == TY_I64 {
+      const rpa = litTreeAdoptDst(n.binRight, lt)
+      if rpa >= 0 { rt = rpa }
+    }
+  }
+  // A re-check pushes the node again; `checkShiftCounts` grades each once.
+  if binShiftOp(op) && intLitLexemeOf(n.binRight) != "" {
+    shiftCountNodes.push(ix)
+  }
+  // A binary op with a hole operand can't decide its form until the hole is bound at the call —
+  // record the deferred constraint (skipping assignment / logical, handled by their own arms).
+  if op != "=" && op != "&&" && op != "||" {
+    if tyHasHole(lt) || tyHasHole(rt) {
+      noteBinCstr(
+        eqCstrOperandTy(op, n.binLeft, lt),
+        op,
+        eqCstrOperandTy(op, n.binRight, rt),
+      )
+      cexNoteHoleWidth(lt, rt)
+      cexNoteHoleWidth(rt, lt)
+    }
+  }
+  // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the
+  // same brand — structural rules can't see it (`sameNumeric` compares `primName`, ordering skips `assignable`).
+  if op != "=" && op != "&&" && op != "||" && op != "??" {
+    if nomBinMixes(lt, rt, n.binLeft, n.binRight) {
+      if op == "==" || op == "!=" {
+        // A null test of a newtype over a base with no `null` is dead, as for any type.
+        if isNullTy(rt) && tyProvesNonNull(lt) {
+          recordDeadNullTest(ix, n.binLeft, lt, op)
+          return TY_BOOL
+        }
+        if isNullTy(lt) && tyProvesNonNull(rt) {
+          recordDeadNullTest(ix, n.binRight, rt, op)
+          return TY_BOOL
+        }
+        tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+        return TY_BOOL
+      }
+      tErr(
+        "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
+        ix,
+      )
+      return TY_ERR
+    }
+  }
+  if (
+    numUnionMinted
+    && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
+    && numUnionOp(op)
+    && !nullTestOp(op, lt, rt)
+    && !njExprHeld(n.binLeft)
+    && !njExprHeld(n.binRight)
+  ) {
+    if !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt))) {
+      // Beside a type parameter the pairs are the pin's to check (`numUnionPinOk`).
+      if tyHasTyVar(lt) || tyHasTyVar(rt) {
+        noteBinCstr(lt, op, rt)
+        if numCmpOp(op) { return TY_BOOL }
+        if tyIsNumUnion(lt) { return lt }
+        return rt
+      }
+      return numUnionBinTy(n, ix, lt, rt)
+    }
+  }
+  // Assignment: RHS must be assignable to the LHS's (already-bound) type.
+  if op == "=" { return checkAssignBinNode(n, ix, lt, rt) }
+  // An unpinned element hole is `-1`, and every arm below indexes `T.tys` with it — guarded
+  // here, below both the `=` arm's own pin and the operand peek, rather than trapping (D1462).
+  if lt < 0 { return TY_ERR }
+  if op == "??" { return checkCoalesceBinNode(n, ix, lt, rt) }
+  if op == "==" || op == "!=" { return checkEqualityBinNode(n, ix, lt, rt) }
+  checkBinArithTail(n, ix, lt, rt)
 }
 
 export function checkCastNode(n: AsExpr, ix: i32) {
