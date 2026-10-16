@@ -35,7 +35,7 @@ restate measurements; follow the links.
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the Deno stubs are `FS_FLOOR`'s names, read at load by `tests/support/hostFloor.ts`. Next: none in the floor; every copy reads the table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Last: the hook was priced at +4.37% self-compile fuel (`fnValUsed` turns on closure analysis over the compiler) and not landed. Next: gate closure analysis on a capturing frame, then land the hook and carve the core (88 declarations, 10,475 lines). | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | D1 **in progress**. Last: closure analysis is gated on a nested frame (`fnNestUsed`), and the hook now costs +0.54% self-compile fuel over master (was +10.5%). Next: land the hook and carve the core (88 declarations, 10,475 lines). | [L9 log](#l9-log) |
 | L12 | **in review**. Last: the playground adapter calls every `lsp/src/features.ts` function and gains references, highlights, outline and rename; playground TS 3,687 → 3,471 lines. Next: nothing; the lane is done once this merges. | [L12 log](#l12-log) |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
@@ -498,6 +498,23 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - The hooked seed compiling master's source spends exactly master's fuel, so the cost comes from compiling a function value, not from slower generated code. `plumb-shape-cost.vl --check` moves +22 fuel units over master's own reading.
   - What would make the hook cheap is gating closure analysis on a nested or capturing frame existing, rather than on any function value existing. The `$fnsig` type growth comes from the same flag.
   - `tests/cases/operators/overload-declared-after-use.vl` is the first fixture that reaches the two operator-force sites, `opIdxFnFor` for `[]` and `opSelfFnKeyFor` for `+`. This was checked with a compiler that traps at both sites; none of the 773 existing files that declare an operator reached either one. The hole-refill edges (`holeAssignOk`, `fillCoalHoleNodes`) are already reached by many cases.
+- The closure gates are split. `fnValUsed` still means "a function value exists", and the new `fnNestUsed` means "a lambda or nested function was lifted". Capture analysis, the closure lift and unbox, captured reads and env slots, and `capCacheBuild` are gated on `fnNestUsed`.
+  - Without a nested frame, `collectCloSigs` interns a function's own `$fnsig` only for a declared function named outside a call's callee, or for a function the emitter added.
+  - With no nested frame, a concrete higher-order function with an un-annotated return no longer opens the mono pass, because `monoSpecializeConcrete` declines it before reading an argument. That was most of the hook's cost: the setter has fn-typed parameters and no return annotation. With a lambda present the pass still runs, because it also prunes uncalled lambdas.
+  - Output identity, against the fixpoint of master: 224 modules differ, and every one runs with the same exit code and output. 219 lose 1 to 42 `$fnsig` types, 4 keep the same types in a different order, and in `modules/std-testing-fail` the trap backtrace's byte offsets move. No module grew.
+  - D4891 moves from clause 1 to clause 2. Its call `fs[0](1)` is keyed as a nullary void call; master found that key only because `main`'s own sig was interned, and called through the wrong sig. The candidate does not intern it, so the same mis-keyed call is now a loud emit reject. The row stays open.
+  - L2 self-compile fuel against master at 2026f3704:
+
+    | build | fuel | seed bytes |
+    | --- | --- | --- |
+    | master | 98,606,856,745 | 5,919,107 |
+    | master + hook | 108,985,494,771 (+10.53%) | 5,932,022 |
+    | candidate | 98,487,369,569 (−0.12%) | 5,922,614 |
+    | candidate + hook | 99,138,499,698 (+0.54%) | 5,922,995 |
+
+  - The reading moves with the compiled source alone: one compiler compiling a 40-line rewrite of `collectCloSigs` read +0.52% more fuel than on the version kept. At this resolution, a difference of half a percent is noise from the source's shape.
+  - `plumb-shape-cost.vl --check` fuel is lower than master: main 8,550,779,219 against 8,653,307,223 (−1.2%), and tail 6,176,765,037 against 6,249,247,227 (−1.2%). There was no re-baseline.
+  - If the hook's setter gets a return annotation (`: void`), it reopens the mono pass.
 
 ### SMALL log
 

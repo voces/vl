@@ -380,6 +380,7 @@ import {
   fnListEqGSlots,
   fnListEqRSlots,
   fnNames,
+  fnNestUsed,
   fnParent,
   fnPosIndexDrop,
   fnStmts,
@@ -2424,7 +2425,7 @@ export function synthGlobalEmptyListAnns() {
 // capture's initializer, and an empty `[]` has no element to classify (D613). Not a second
 // answer but the same answer earlier — the late call declines on `s.letType < 0`.
 export function synthCaptureEmptyListAnns() {
-  if !fnValUsed { return 0 }
+  if !fnNestUsed { return 0 }
   let fe = 0
   while fe < fnStmts.length {
     const caps = captureNamesOf(fe)
@@ -2556,6 +2557,7 @@ export function collectFns(stmts: i32[]) {
   lambdaCtr = 0
   fnDispNames = []
   fnValUsed = false
+  fnNestUsed = false
   fnAddrTaken = []
   let nCellsSoFar = 0
   let i = 0
@@ -2783,8 +2785,43 @@ export function collectCloSigs() {
   // same-length coincidence.
   cloSigTwin = []
   if !fnValUsed { return 0 }
+  // With no nested frame, 1 or 0 per `fnStmts` slot: whether its own `$fnsig` is interned. A
+  // declared top-level function named nowhere but a call's callee is 0; empty means every slot.
+  const valSlots: i32[] = []
+  if !fnNestUsed {
+    const callees: {[i32]: i32} = Map()
+    const idents: i32[] = []
+    let ci = 0
+    while ci < P.nodes.length {
+      const cn = P.nodes[ci]
+      if cn is Call { callees[cn.callFn] = 1 }
+      if cn is Ident { idents.push(ci) }
+      ci = ci + 1
+    }
+    const named: {[string]: i32} = Map()
+    for id in idents {
+      const nn = P.nodes[id]
+      if nn is Ident {
+        if !callees.has(id) { named[nn.identName] = 1 }
+      }
+    }
+    const declared: {[i32]: i32} = Map()
+    for tn in topFnNodes { declared[tn] = 1 }
+    for sx in fnStmts {
+      let v = 1
+      const fn = P.nodes[sx]
+      if declared.has(sx) && fn is FuncDecl {
+        if !named.has(fn.fnName) { v = 0 }
+      }
+      valSlots.push(v)
+    }
+  }
   let fe = 0
   while fe < fnStmts.length {
+    if valSlots.length > 0 && valSlots[fe] == 0 {
+      fe = fe + 1
+      continue
+    }
     let key = fnSigKeyOf(fe)
     // A void- (`>v`) or struct-returning (`>sN;`) function used as a value needs its extended
     // sig interned too — the value-eligible key above excludes both. `cloSigKeyExt` yields ""
@@ -2965,10 +3002,32 @@ export function collectCloSigs() {
   // signature. After the roots above, so every key they mint keeps its slot.
   let lf = 0
   while lf < fnStmts.length {
-    if collectTyReachCloSigs(nodeTyIxOf(fnStmts[lf]), 16) < 0 { return -1 }
+    const lfTy = nodeTyIxOf(fnStmts[lf])
+    if valSlots.length > 0 && valSlots[lf] == 0 {
+      if collectFnPartsCloSigs(lfTy) < 0 { return -1 }
+    } else if collectTyReachCloSigs(lfTy, 16) < 0 {
+      return -1
+    }
     lf = lf + 1
   }
   0
+}
+
+// The closures inside function type `tyIx`'s parameters and result, without the function's own
+// `$fnsig`: the walk for a function that is never a value. A non-function type walks whole.
+function collectFnPartsCloSigs(tyIx: i32) {
+  if tyIx < 0 { return 0 }
+  const t = T.tys[tyIx]
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if collectTyReachCloSigs(ps[i], 15) < 0 { return -1 }
+      i = i + 1
+    }
+    return collectTyReachCloSigs(t.fnRet, 15)
+  }
+  collectTyReachCloSigs(tyIx, 16)
 }
 
 // Record a directly-bound lambda's debug display name for the name section. `slot` is the
@@ -3027,6 +3086,7 @@ function liftFnsInExpr(ix: i32, parent: i32) {
     fnParent.push(parent)
     fnDispNames.push("")
     fnValUsed = true
+    fnNestUsed = true
     return 0
   }
   if n is Block {
